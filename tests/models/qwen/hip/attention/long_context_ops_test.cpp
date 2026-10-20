@@ -88,16 +88,16 @@ void TestLongContextBatchedAttention(bool fp16) {
         d_q, nullptr, nullptr, d_gate,
         fp16 ? nullptr : static_cast<float*>(d_k),
         fp16 ? nullptr : static_cast<float*>(d_v), fp16 ? d_k : nullptr,
-        fp16 ? d_v : nullptr, d_batch, 0, first, rows, capacity, heads,
-        kv_heads, dim, nullptr, true, d_bf16);
+        fp16 ? d_v : nullptr, gufo::hip::KvBlockTable{}, d_batch, 0, first,
+        rows, capacity, heads, kv_heads, dim, nullptr, true, d_bf16);
     for (std::size_t row = 0; row < rows; ++row)
       gufo::hip::LaunchAttention(
           d_q + row * width, nullptr, nullptr, d_gate + row * width,
           fp16 ? nullptr : static_cast<float*>(d_k),
           fp16 ? nullptr : static_cast<float*>(d_v), fp16 ? d_k : nullptr,
-          fp16 ? d_v : nullptr, d_scalar + row * width, 0,
-          first + static_cast<std::uint32_t>(row), capacity, heads, kv_heads,
-          dim, nullptr, nullptr, true);
+          fp16 ? d_v : nullptr, gufo::hip::KvBlockTable{},
+          d_scalar + row * width, 0, first + static_cast<std::uint32_t>(row),
+          capacity, heads, kv_heads, dim, nullptr, nullptr, true);
     HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipDeviceSynchronize());
     std::vector<float> batch(query.size()), scalar(query.size());
@@ -251,9 +251,9 @@ void TestLongContextDecodeAttention(bool fp16) {
     gufo::hip::LaunchAttention(
         d_q, d_k, d_v, d_gate, fp16 ? nullptr : static_cast<float*>(d_k_cache),
         fp16 ? nullptr : static_cast<float*>(d_v_cache),
-        fp16 ? d_k_cache : nullptr, fp16 ? d_v_cache : nullptr, d_out, 0,
-        position, max_context, num_heads, num_kv_heads, head_dim, nullptr,
-        d_split_k_scratch);
+        fp16 ? d_k_cache : nullptr, fp16 ? d_v_cache : nullptr,
+        gufo::hip::KvBlockTable{}, d_out, 0, position, max_context, num_heads,
+        num_kv_heads, head_dim, nullptr, d_split_k_scratch);
     HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipDeviceSynchronize());
     HIP_CHECK(hipMemcpy(output.data(), d_out, attention_width * sizeof(float),
@@ -401,13 +401,13 @@ void TestBaselineToTiledKvCacheTransition() {
 
   // 1. Golden sequential reference token-by-token
   for (std::size_t token = 0; token < total_batch; ++token) {
-    gufo::hip::LaunchAttention(d_q + token * attention_width,
-                               d_k + token * kv_width, d_v + token * kv_width,
-                               d_gate + token * attention_width, d_cache_seq,
-                               d_cache_seq + cache_elements, nullptr, nullptr,
-                               d_out_seq + token * attention_width, 0,
-                               static_cast<std::uint32_t>(token), max_context,
-                               num_heads, num_kv_heads, head_dim);
+    gufo::hip::LaunchAttention(
+        d_q + token * attention_width, d_k + token * kv_width,
+        d_v + token * kv_width, d_gate + token * attention_width, d_cache_seq,
+        d_cache_seq + cache_elements, nullptr, nullptr,
+        gufo::hip::KvBlockTable{}, d_out_seq + token * attention_width, 0,
+        static_cast<std::uint32_t>(token), max_context, num_heads, num_kv_heads,
+        head_dim);
   }
 
   // 2. Incremental transition:
@@ -416,8 +416,8 @@ void TestBaselineToTiledKvCacheTransition() {
       d_q, d_k, d_v, d_gate, d_cache_trans, d_cache_trans + cache_elements,
       d_cache_trans_f16,
       static_cast<std::uint16_t*>(d_cache_trans_f16) + cache_elements,
-      d_out_trans, 0, 0, chunk0_size, max_context, num_heads, num_kv_heads,
-      head_dim);
+      gufo::hip::KvBlockTable{}, d_out_trans, 0, 0, chunk0_size, max_context,
+      num_heads, num_kv_heads, head_dim);
 
   // Chunk 1 (512..1536): LaunchBatchedAttentionTile (Tiled FP16 at start_pos =
   // 512)
@@ -426,7 +426,7 @@ void TestBaselineToTiledKvCacheTransition() {
       d_v + chunk0_size * kv_width, d_gate + chunk0_size * attention_width,
       d_cache_trans, d_cache_trans + cache_elements, d_cache_trans_f16,
       static_cast<std::uint16_t*>(d_cache_trans_f16) + cache_elements,
-      d_out_trans + chunk0_size * attention_width, 0,
+      gufo::hip::KvBlockTable{}, d_out_trans + chunk0_size * attention_width, 0,
       static_cast<std::uint32_t>(chunk0_size), chunk1_size, max_context,
       num_heads, num_kv_heads, head_dim);
   gufo::test::Expect(chunk1_ok,

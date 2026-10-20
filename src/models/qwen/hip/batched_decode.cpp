@@ -314,9 +314,9 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
             OffsetIfPresent(
                 static_cast<std::uint16_t*>(state_arena.d_attention_kv_f16),
                 total_k),
-            context, attention_layer, position, state_arena.GetMaxContext(),
-            config.num_attention_heads, config.num_key_value_heads,
-            config.head_dim, arena.stream,
+            state_arena.GetKvBlockTable(), context, attention_layer, position,
+            state_arena.GetMaxContext(), config.num_attention_heads,
+            config.num_key_value_heads, config.head_dim, arena.stream,
             use_split_k ? arena.d_split_k_attention : nullptr);
       }
       LaunchProjection(layer.attn_output, scratch.ssm.out.data(),
@@ -647,11 +647,11 @@ QwenGpuExecutor::ForwardVerificationBatch(
               OffsetIfPresent(
                   static_cast<std::uint16_t*>(state_arena.d_attention_kv_f16),
                   total_k),
-              attention_layer, start_pos, sequence_size,
-              state_arena.GetMaxContext(), config.num_attention_heads,
-              config.num_key_value_heads, config.head_dim, config.rotary_dim,
-              config.rope_theta, 1e-6F, arena_.stream,
-              item.executor->vision_input_.rope());
+              state_arena.GetKvBlockTable(), attention_layer, start_pos,
+              sequence_size, state_arena.GetMaxContext(),
+              config.num_attention_heads, config.num_key_value_heads,
+              config.head_dim, config.rotary_dim, config.rope_theta, 1e-6F,
+              arena_.stream, item.executor->vision_input_.rope());
           // Exact verification projections do not use weight dequantization
           // scratch. Reuse it for independent split-K rows without allocating
           // another buffer or changing the scalar decode workspace.
@@ -671,6 +671,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
               OffsetIfPresent(
                   static_cast<std::uint16_t*>(state_arena.d_attention_kv_f16),
                   total_k),
+              state_arena.GetKvBlockTable(),
               (scratch.ssm.out.data() + offset * attention_size),
               attention_layer, start_pos, sequence_size,
               state_arena.GetMaxContext(), config.num_attention_heads,
@@ -699,6 +700,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
                 OffsetIfPresent(
                     static_cast<std::uint16_t*>(state_arena.d_attention_kv_f16),
                     total_k),
+                state_arena.GetKvBlockTable(),
                 (scratch.ssm.out.data() + offset * attention_size) +
                     row * attention_size,
                 attention_layer, position, state_arena.GetMaxContext(),

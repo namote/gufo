@@ -28,6 +28,7 @@
 #include <hipblas/hipblas.h>
 
 #include "src/core/hip/detail/hip_graph_decode_executor.hpp"
+#include "src/core/hip/kv_block_pool.hpp"
 #include "src/models/qwen/hip/execution_policy.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
@@ -309,6 +310,9 @@ private:
 
 class QwenGpuArena {
 public:
+  /// FP16 attention rows live in `kv_pool`, which may be shared with other
+  /// arenas; the arena takes the blocks its context needs. Without a pool it
+  /// makes its own, sized to the context.
   explicit QwenGpuArena(
       const core::ModelConfig& config, std::uint32_t max_context = 4096,
       QwenExecutionPolicy policy = QwenExecutionPolicy::Production(),
@@ -418,11 +422,33 @@ public:
   [[nodiscard]] std::uint32_t GetMaxContext() const noexcept {
     return max_context_;
   }
+  /// Elements of one plane (K or V) of the attention cache: the whole pool
+  /// for FP16 rows, this arena's context for the FP32 reference. The V plane
+  /// starts this many elements after K.
   [[nodiscard]] std::size_t GetAttentionKvPlaneElements() const noexcept {
     // Qwen27B reaches 2^32 elements per plane at context 262144.
+    const std::size_t rows =
+        kv_pool_ != nullptr ? KvLayerTokens() : max_context_;
     return static_cast<std::size_t>(config_.FullAttentionLayerCount()) *
-           config_.num_key_value_heads * max_context_ * config_.head_dim;
+           config_.num_key_value_heads * rows * config_.head_dim;
   }
+  /// Where this arena's FP16 rows sit in the pool; null (contiguous) for the
+  /// FP32 reference cache.
+  [[nodiscard]] KvBlockTable GetKvBlockTable() const noexcept {
+    return kv_pool_ == nullptr
+               ? KvBlockTable{}
+               : KvBlockTable{d_kv_block_table_, KvLayerTokens()};
+  }
+  [[nodiscard]] std::span<const std::uint32_t> GetKvBlocks() const noexcept {
+    return kv_blocks_;
+  }
+  /// Rows between consecutive layers of one attention KV plane (K or V),
+  /// and that plane's base. FP16 rows: the pool's layer-major plane, whose
+  /// rows the block table maps; FP32 reference: head-major rows.
+  [[nodiscard]] std::size_t KvLayerPitchRows() const noexcept {
+    return kv_pool_ != nullptr ? KvLayerTokens() : max_context_;
+  }
+  [[nodiscard]] std::uint8_t* KvPlaneBase(std::uint32_t plane) const;
   [[nodiscard]] QwenRecurrentStateStorage GetRecurrentStateStorage()
       const noexcept {
     return policy_.recurrent_state_storage;
@@ -459,6 +485,11 @@ private:
   void FreeAll() noexcept;
   friend class models::qwen::ContinuationAdapter;
   friend class QwenGpuExecutor;
+  void AllocateKvBlocks();
+  /// Token rows of one layer of the FP16 pool planes.
+  [[nodiscard]] std::uint32_t KvLayerTokens() const noexcept {
+    return kv_pool_->blocks() * kKvBlockTokens;
+  }
   void AllocateRecurrentSnapshot();
   void SyncLivePointers() noexcept;
   [[nodiscard]] bool AllocateSsmReplayLog();
@@ -469,6 +500,9 @@ private:
   std::uint32_t max_batch_;
   QwenExecutionPolicy policy_;
   std::vector<std::uint32_t> target_layer_ids_;
+  std::shared_ptr<KvBlockPool> kv_pool_;
+  std::vector<std::uint32_t> kv_blocks_;
+  std::uint32_t* d_kv_block_table_{nullptr};
   // Buffer 0 comes from the constructor; buffer 1 is allocated by the first
   // SaveState. `live_recurrent_` holds the current state, `saved_recurrent_`
   // the pinned one (meaningful while has_saved_state_), `source_recurrent_`

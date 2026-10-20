@@ -13,6 +13,42 @@
 
 namespace gufo::models::qwen {
 namespace {
+// Runs of consecutive pool rows holding the FP16 positions [first, end).
+struct KvRun {
+  cache::Rows first;
+  cache::Rows rows;
+  std::size_t pool_row;
+};
+std::vector<KvRun> KvRuns(const hip::QwenGpuArena& arena, cache::Rows first,
+                          cache::Rows end) {
+  const auto blocks = arena.GetKvBlocks();
+  std::vector<KvRun> runs;
+  while (first < end) {
+    const auto logical = first >> hip::kKvBlockShift;
+    if (logical >= blocks.size())
+      throw std::out_of_range("Qwen KV rows outside the block table");
+    const auto offset = first & (hip::kKvBlockTokens - 1);
+    const auto rows =
+        std::min<cache::Rows>(end - first, hip::kKvBlockTokens - offset);
+    const auto pool_row =
+        (std::size_t{blocks[logical]} << hip::kKvBlockShift) + offset;
+    if (!runs.empty() && runs.back().pool_row + runs.back().rows == pool_row)
+      runs.back().rows += rows;
+    else
+      runs.push_back({first, rows, pool_row});
+    first += rows;
+  }
+  return runs;
+}
+// First FP16 row of `component`'s layer and plane in the pool.
+std::byte* KvLayerBase(const hip::QwenGpuArena& arena,
+                       const ContinuationComponent& component,
+                       const core::ModelConfig& c) {
+  const auto plane = component.part == ContinuationPart::kValue ? 1U : 0U;
+  const std::size_t layer = component.layer / c.full_attention_interval;
+  return reinterpret_cast<std::byte*>(arena.KvPlaneBase(plane)) +
+         layer * arena.KvLayerPitchRows() * component.descriptor.row_bytes;
+}
 using cache::Rows;
 using cache::TransferResult;
 void Check(hipError_t result) {
@@ -799,17 +835,17 @@ std::span<const std::byte> ContinuationAdapter::BorrowRowsView(
   // canonical host representation still goes through TransferRows.
   if (!policy_.UsesFp16AttentionKv())
     return {};
-  Check(hipStreamSynchronize(state.executor->arena_.stream));
-  const auto& c = model_->GetConfig();
+  const auto& arena = state.executor->arena_;
+  const auto runs = KvRuns(arena, first, end);
+  // Rows on several runs of pool blocks have no single view.
+  if (runs.size() != 1)
+    return {};
+  Check(hipStreamSynchronize(arena.stream));
   const auto row = component.descriptor.row_bytes;
-  const auto layer = component.layer / c.full_attention_interval;
-  const auto plane = component.part == ContinuationPart::kValue
-                         ? c.FullAttentionLayerCount()
-                         : 0;
-  return {
-      static_cast<const std::byte*>(state.executor->arena_.d_attention_kv_f16) +
-          ((plane + layer) * std::size_t{context_} + first) * row,
-      (end - first) * row};
+  return {reinterpret_cast<const std::byte*>(
+              KvLayerBase(arena, component, model_->GetConfig())) +
+              runs.front().pool_row * row,
+          (end - first) * row};
 }
 cache::Completion ContinuationAdapter::TransferRows(
     State& state, const ContinuationComponent& component, bool load, Rows first,
@@ -821,21 +857,25 @@ cache::Completion ContinuationAdapter::TransferRows(
   const std::size_t plane = component.part == ContinuationPart::kValue
                                 ? c.FullAttentionLayerCount()
                                 : 0;
-  auto* native =
-      static_cast<std::byte*>(policy_.UsesFp16AttentionKv()
-                                  ? arena.d_attention_kv_f16
-                                  : static_cast<void*>(arena.d_kv_cache)) +
-      (plane + layer) * context_ * row;
+  // The FP32 reference: head-major rows of `context_` positions.
+  auto* native = policy_.UsesFp16AttentionKv()
+                     ? nullptr
+                     : reinterpret_cast<std::byte*>(arena.d_kv_cache) +
+                           (plane + layer) * context_ * row;
   return Transfer(state, load, stream, [&](hip::TransferStream& transfer) {
     if (first == end)
       return;
     const auto direction = load ? hipMemcpyDefault : hipMemcpyDeviceToHost;
     if (policy_.UsesFp16AttentionKv()) {
-      auto* device = native + first * row;
-      Check(load ? hip::CopySnapshotToDevice(device, bytes, (end - first) * row,
-                                             transfer.Native())
-                 : hip::CopySnapshotToHost(bytes, device, (end - first) * row,
-                                           transfer.Native()));
+      auto* layer_base = KvLayerBase(arena, component, model_->GetConfig());
+      for (const auto& run : KvRuns(arena, first, end)) {
+        auto* device = layer_base + run.pool_row * row;
+        auto* host = bytes + (run.first - first) * row;
+        Check(load ? hip::CopySnapshotToDevice(device, host, run.rows * row,
+                                               transfer.Native())
+                   : hip::CopySnapshotToHost(host, device, run.rows * row,
+                                             transfer.Native()));
+      }
     } else {
       const auto head_bytes = std::size_t{c.head_dim} * sizeof(float);
       for (std::uint32_t head = 0; head < c.num_key_value_heads; ++head) {

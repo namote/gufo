@@ -7,7 +7,11 @@
 
 #include <cstdint>
 
+#include "src/core/hip/kv_block_table.hpp"
+
 namespace gufo::hip::detail {
+
+using hip::KvBlockTable;
 
 // Split-K fp16 attention partials for verification rows > 1, packaged as
 // three wave64 per pair of KV heads. Requires num_heads == 6 * num_kv_heads,
@@ -16,9 +20,10 @@ namespace gufo::hip::detail {
 // per-head arithmetic, so QwenDecodeSplitKAttentionReduceKernel follows.
 void LaunchVerifySplitKAttentionHalfPartialsWave64(
     const float* q, const __half* k_cache, const __half* v_cache,
-    float* scratch, std::uint32_t layer_idx, std::uint32_t start_pos,
-    unsigned rows, std::uint32_t max_context, std::uint32_t num_heads,
-    std::uint32_t num_kv_heads, std::uint32_t splits, hipStream_t stream);
+    KvBlockTable kv_table, float* scratch, std::uint32_t layer_idx,
+    std::uint32_t start_pos, unsigned rows, std::uint32_t max_context,
+    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t splits,
+    hipStream_t stream);
 
 }  // namespace gufo::hip::detail
 #endif  // defined(ENGINE_ENABLE_HIP)

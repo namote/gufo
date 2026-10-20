@@ -450,7 +450,8 @@ gufo::bench::KernelBenchResult BenchmarkDecodeAttention(
     gufo::hip::LaunchAttention(
         query.Get(), key.Get(), value.Get(), gate.Get(), key_cache.Get(),
         value_cache.Get(), key_cache_f16.Get(), value_cache_f16.Get(),
-        output.Get(), 0, static_cast<std::uint32_t>(context - 1),
+        gufo::hip::KvBlockTable{}, output.Get(), 0,
+        static_cast<std::uint32_t>(context - 1),
         static_cast<std::uint32_t>(context), kAttentionHeads, kAttentionKvHeads,
         kAttentionHeadDim, stream, split_k_scratch.Get());
   };
@@ -715,8 +716,9 @@ gufo::bench::KernelBenchResult BenchmarkBatchedAttention(
     if (gufo::hip::LaunchQwenWmmaAttention(
             query.Get(), key.Get(), value.Get(), gate.Get(), key_cache.Get(),
             value_cache.Get(), key_cache_f16.Get(), value_cache_f16.Get(),
-            output.Get(), 0, 0, context, static_cast<std::uint32_t>(context),
-            kAttentionHeads, kAttentionKvHeads, kAttentionHeadDim, stream)) {
+            gufo::hip::KvBlockTable{}, output.Get(), 0, 0, context,
+            static_cast<std::uint32_t>(context), kAttentionHeads,
+            kAttentionKvHeads, kAttentionHeadDim, stream)) {
       selected_backend = "wmma";
       return;
     }
@@ -725,15 +727,17 @@ gufo::bench::KernelBenchResult BenchmarkBatchedAttention(
       gufo::hip::LaunchBatchedAttention(
           query.Get(), key.Get(), value.Get(), gate.Get(), key_cache.Get(),
           value_cache.Get(), key_cache_f16.Get(), value_cache_f16.Get(),
-          output.Get(), 0, 0, context, static_cast<std::uint32_t>(context),
-          kAttentionHeads, kAttentionKvHeads, kAttentionHeadDim, stream);
+          gufo::hip::KvBlockTable{}, output.Get(), 0, 0, context,
+          static_cast<std::uint32_t>(context), kAttentionHeads,
+          kAttentionKvHeads, kAttentionHeadDim, stream);
       return;
     }
     if (gufo::hip::LaunchBatchedAttentionTile(
             query.Get(), key.Get(), value.Get(), gate.Get(), key_cache.Get(),
             value_cache.Get(), key_cache_f16.Get(), value_cache_f16.Get(),
-            output.Get(), 0, 0, context, static_cast<std::uint32_t>(context),
-            kAttentionHeads, kAttentionKvHeads, kAttentionHeadDim, stream)) {
+            gufo::hip::KvBlockTable{}, output.Get(), 0, 0, context,
+            static_cast<std::uint32_t>(context), kAttentionHeads,
+            kAttentionKvHeads, kAttentionHeadDim, stream)) {
       selected_backend = "tiled";
       return;
     }
@@ -745,8 +749,9 @@ gufo::bench::KernelBenchResult BenchmarkBatchedAttention(
     gufo::hip::LaunchBatchedAttention(
         query.Get(), key.Get(), value.Get(), gate.Get(), key_cache.Get(),
         value_cache.Get(), key_cache_f16.Get(), value_cache_f16.Get(),
-        output.Get(), 0, 0, context, static_cast<std::uint32_t>(context),
-        kAttentionHeads, kAttentionKvHeads, kAttentionHeadDim, stream);
+        gufo::hip::KvBlockTable{}, output.Get(), 0, 0, context,
+        static_cast<std::uint32_t>(context), kAttentionHeads, kAttentionKvHeads,
+        kAttentionHeadDim, stream);
   };
   auto samples_us = MeasureKernel(options, marker, stream, launch);
   VerifyFiniteNonzero(output);

@@ -121,10 +121,10 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
             arena.d_attention_kv_f16,
             OffsetIfPresent(
                 static_cast<std::uint16_t*>(arena.d_attention_kv_f16), total_k),
-            attn_layer_idx, d_in_pos, arena.GetMaxContext(),
-            config.num_attention_heads, config.num_key_value_heads,
-            config.head_dim, config.rotary_dim, config.rope_theta, 1e-6F,
-            arena.stream, rope);
+            arena.GetKvBlockTable(), attn_layer_idx, d_in_pos,
+            arena.GetMaxContext(), config.num_attention_heads,
+            config.num_key_value_heads, config.head_dim, config.rotary_dim,
+            config.rope_theta, 1e-6F, arena.stream, rope);
       } else {
         if (!layer.attn_q_norm.empty()) {
           LaunchPerHeadRMSNorm(
@@ -157,10 +157,10 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
             arena.d_attention_kv_f16,
             OffsetIfPresent(
                 static_cast<std::uint16_t*>(arena.d_attention_kv_f16), total_k),
-            ssm_scratch.out.data(), attn_layer_idx, pos, arena.GetMaxContext(),
-            config.num_attention_heads, config.num_key_value_heads,
-            config.head_dim, arena.stream, attention_scratch.split_k.data(),
-            fused_qknorm_rope_kv);
+            arena.GetKvBlockTable(), ssm_scratch.out.data(), attn_layer_idx,
+            pos, arena.GetMaxContext(), config.num_attention_heads,
+            config.num_key_value_heads, config.head_dim, arena.stream,
+            attention_scratch.split_k.data(), fused_qknorm_rope_kv);
       } else {
         LaunchAttention(
             attention_scratch.q.data(), attention_scratch.k.data(),
@@ -169,8 +169,8 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
             arena.d_attention_kv_f16,
             OffsetIfPresent(
                 static_cast<std::uint16_t*>(arena.d_attention_kv_f16), total_k),
-            ssm_scratch.out.data(), attn_layer_idx, d_in_pos,
-            arena.GetMaxContext(), config.num_attention_heads,
+            arena.GetKvBlockTable(), ssm_scratch.out.data(), attn_layer_idx,
+            d_in_pos, arena.GetMaxContext(), config.num_attention_heads,
             config.num_key_value_heads, config.head_dim, arena.stream,
             fused_qknorm_rope_kv);
       }

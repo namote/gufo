@@ -15,9 +15,9 @@ __global__ void WriteKVCachePtrKernel(
     const float* __restrict__ k, const float* __restrict__ v,
     float* __restrict__ k_cache, float* __restrict__ v_cache,
     __half* __restrict__ k_cache_f16, __half* __restrict__ v_cache_f16,
-    std::uint32_t layer_idx, const std::uint32_t* __restrict__ d_pos,
-    std::uint32_t max_context, std::uint32_t num_kv_heads,
-    std::uint32_t head_dim) {
+    KvBlockTable kv_table, std::uint32_t layer_idx,
+    const std::uint32_t* __restrict__ d_pos, std::uint32_t max_context,
+    std::uint32_t num_kv_heads, std::uint32_t head_dim) {
   const std::uint32_t kv_h = blockIdx.x;
   if (kv_h >= num_kv_heads)
     return;
@@ -44,7 +44,7 @@ __global__ void WriteKVCachePtrKernel(
     const std::size_t kv_width =
         static_cast<std::size_t>(num_kv_heads) * head_dim;
     const std::size_t f16_offset =
-        ((static_cast<std::size_t>(layer_idx) * max_context + pos) * kv_width) +
+        (KvTokenRow(kv_table, layer_idx, max_context, pos) * kv_width) +
         (static_cast<std::size_t>(kv_h) * head_dim) + tid;
     if (k_cache_f16 != nullptr) {
       k_cache_f16[f16_offset] = __float2half_rn(key);
@@ -162,9 +162,10 @@ __launch_bounds__(32) __global__ void QwenDecodeOnlineAttentionPtrKernel(
 __launch_bounds__(32) __global__ void QwenDecodeOnlineAttentionHalfPtrKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
     const __half* __restrict__ k_cache, const __half* __restrict__ v_cache,
-    float* __restrict__ out_context, std::uint32_t layer_idx,
-    const std::uint32_t* __restrict__ d_pos, std::uint32_t max_context,
-    std::uint32_t num_heads, std::uint32_t num_kv_heads) {
+    KvBlockTable kv_table, float* __restrict__ out_context,
+    std::uint32_t layer_idx, const std::uint32_t* __restrict__ d_pos,
+    std::uint32_t max_context, std::uint32_t num_heads,
+    std::uint32_t num_kv_heads) {
   constexpr std::uint32_t head_dim = 256;
   constexpr std::uint32_t vector_width = head_dim / 4;
   constexpr std::uint32_t vectors_per_lane = vector_width / 32;
@@ -182,8 +183,7 @@ __launch_bounds__(32) __global__ void QwenDecodeOnlineAttentionHalfPtrKernel(
   const std::size_t kv_width =
       static_cast<std::size_t>(num_kv_heads) * head_dim;
   const std::size_t cache_head_offset =
-      (static_cast<std::size_t>(layer_idx) * max_context * kv_width) +
-      (static_cast<std::size_t>(kv_head) * head_dim);
+      static_cast<std::size_t>(kv_head) * head_dim;
   const float scale = rsqrtf(static_cast<float>(head_dim));
 
   float4 query_values[vectors_per_lane];
@@ -208,7 +208,10 @@ __launch_bounds__(32) __global__ void QwenDecodeOnlineAttentionHalfPtrKernel(
     for (std::size_t step = 0; step < positions_per_load; ++step) {
       if (position + step >= sequence_length)
         break;
-      const auto offset = cache_head_offset + ((position + step) * kv_width);
+      const auto offset =
+          cache_head_offset +
+          (KvTokenRow(kv_table, layer_idx, max_context, position + step) *
+           kv_width);
       const __half* key = k_cache + offset;
       const __half* value = v_cache + offset;
       float score = 0.0F;
@@ -293,7 +296,8 @@ __launch_bounds__(32) __global__ void QwenDecodeOnlineAttentionHalfPtrKernel(
 
 void LaunchAttention(const float* q, const float* k, const float* v,
                      const float* gate, float* k_cache, float* v_cache,
-                     void* k_cache_f16, void* v_cache_f16, float* out_context,
+                     void* k_cache_f16, void* v_cache_f16,
+                     KvBlockTable kv_table, float* out_context,
                      std::uint32_t layer_idx, const std::uint32_t* d_pos,
                      std::uint32_t max_context, std::uint32_t num_heads,
                      std::uint32_t num_kv_heads, std::uint32_t head_dim,
@@ -301,8 +305,8 @@ void LaunchAttention(const float* q, const float* k, const float* v,
   if (!skip_kv_write) {
     WriteKVCachePtrKernel<<<num_kv_heads, 256, 0, stream>>>(
         k, v, k_cache, v_cache, static_cast<__half*>(k_cache_f16),
-        static_cast<__half*>(v_cache_f16), layer_idx, d_pos, max_context,
-        num_kv_heads, head_dim);
+        static_cast<__half*>(v_cache_f16), kv_table, layer_idx, d_pos,
+        max_context, num_kv_heads, head_dim);
   }
 
   if (head_dim == 256 && num_kv_heads > 0 && (num_heads % num_kv_heads) == 0) {
@@ -315,8 +319,8 @@ void LaunchAttention(const float* q, const float* k, const float* v,
       detail::EmitAttentionDispatch("decode_online_fp16_graph", "");
       QwenDecodeOnlineAttentionHalfPtrKernel<<<num_heads, 32, 0, stream>>>(
           q, gate, static_cast<const __half*>(k_cache_f16),
-          static_cast<const __half*>(v_cache_f16), out_context, layer_idx,
-          d_pos, max_context, num_heads, num_kv_heads);
+          static_cast<const __half*>(v_cache_f16), kv_table, out_context,
+          layer_idx, d_pos, max_context, num_heads, num_kv_heads);
     }
   } else {
     detail::EmitAttentionDispatch(
