@@ -167,11 +167,14 @@ void TestCanonicalMemoryAccountingAndSnapshot() {
   const std::size_t kv_elements = 2U * config.FullAttentionLayerCount() *
                                   context * config.num_key_value_heads *
                                   config.head_dim;
-  const std::size_t duplicate_bytes =
-      kv_elements * (sizeof(float) - sizeof(std::uint16_t));
+  // FP16 rows come from the block pool in whole blocks.
+  const std::size_t fp16_kv_elements =
+      kv_elements / context *
+      (gufo::hip::KvBlockPool::BlocksFor(context) * gufo::hip::kKvBlockTokens);
   Expect(fp32_usage.request_state_bytes - fp16_usage.request_state_bytes ==
-             duplicate_bytes,
-         "FP16-only accounting must remove exactly the duplicate KV bytes");
+             kv_elements * sizeof(float) -
+                 fp16_kv_elements * sizeof(std::uint16_t),
+         "FP16-only accounting must count one block-rounded KV copy");
   Expect(
       fp32_usage.temporary_scratch_bytes == fp16_usage.temporary_scratch_bytes,
       "KV storage selection must not change shared scratch accounting");
@@ -233,8 +236,12 @@ void TestCompactPersistentSnapshotRoundTrip() {
   const std::size_t attention_layers = config.FullAttentionLayerCount();
   const std::size_t kv_width =
       static_cast<std::size_t>(config.num_key_value_heads) * config.head_dim;
+  // The FP16 plane holds whole blocks of rows per layer.
+  const std::size_t layer_rows = source.GetKvBlockTable().layer_tokens;
+  Expect(layer_rows == gufo::hip::kKvBlockTokens,
+         "a 32-token arena must own one KV block");
   const std::size_t full_kv_elements_per_plane =
-      attention_layers * context * kv_width;
+      attention_layers * layer_rows * kv_width;
   const std::size_t live_kv_elements_per_plane =
       attention_layers * valid_context * kv_width;
   std::vector<std::uint16_t> source_kv(2U * full_kv_elements_per_plane);
@@ -319,7 +326,7 @@ void TestCompactPersistentSnapshotRoundTrip() {
       for (std::size_t position = 0; position < context; ++position) {
         for (std::size_t column = 0; column < kv_width; ++column) {
           const std::size_t index = plane * full_kv_elements_per_plane +
-                                    layer * context * kv_width +
+                                    layer * layer_rows * kv_width +
                                     position * kv_width + column;
           if (position < valid_context) {
             Expect(restored_kv[index] == source_kv[index],
