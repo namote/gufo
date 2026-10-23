@@ -138,6 +138,12 @@ public:
                                        const std::function<bool()>& enough);
 
 private:
+  // Captures the idle live frontier of slot `index` (leased exactly at
+  // `location`) as a RAM checkpoint, before the caller resets the slot.
+  // Optional: a refusal or failure is logged and the caller proceeds.
+  void CaptureBeforeReset(std::size_t index, cache::BorrowedLocation location,
+                          std::vector<cache::Token> tokens,
+                          cache::Identity input) noexcept;
   std::unique_ptr<Impl> impl_;
 };
 
