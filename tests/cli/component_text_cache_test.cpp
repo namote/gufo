@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <numeric>
 #include <semaphore>
 #include <sstream>
@@ -1871,7 +1872,99 @@ void OverRamCaptureStagesPrivateStateUnderPressure(bool protect) {
   std::filesystem::remove_all(directory);
 }
 }  // namespace
+// Paged rows: admission waits while a shared row pool is short, after
+// returning the rows idle slots hold; a reservation holds blocks until the
+// request ends; a request no pool can hold is refused by name.
+constexpr std::size_t kPagedTokens = 4;  // tokens per block
+constexpr std::size_t kPagedBlocks = 6;
+void PagedRowsAdmitWaitAndReclaim() {
+  class PagedRunner final : public Runner {
+  public:
+    mutable std::vector<cache::Slot*> slots;
+    mutable std::map<cache::Slot*, std::size_t> reserved;
+    std::unique_ptr<TextRunnerState> BindComponentState(
+        cache::Adapter& adapter, cache::Slot& slot) const override {
+      if (std::ranges::find(slots, &slot) == slots.end())
+        slots.push_back(&slot);
+      return Runner::BindComponentState(adapter, slot);
+    }
+    std::size_t Mapped(cache::Slot* slot) const {
+      return (adapter->Positions(*slot).front().valid_rows + kPagedTokens - 1) /
+             kPagedTokens;
+    }
+    RowBlockPool RowBlocks() const override {
+      std::size_t used = 0;
+      for (auto* slot : slots) {
+        const auto mapped = Mapped(slot);
+        const auto it = reserved.find(slot);
+        used += it == reserved.end() ? mapped : std::max(mapped, it->second);
+      }
+      return {.total_blocks = kPagedBlocks,
+              .free_blocks = kPagedBlocks - used,
+              .block_rows = kPagedTokens};
+    }
+    void ReserveRowBlocks(TextRunnerState& state,
+                          std::size_t rows) const override {
+      auto* slot = &dynamic_cast<State&>(state).slot;
+      const auto target =
+          (rows + kPagedTokens - 1) / kPagedTokens + kRowBlockMargin;
+      const auto mapped = Mapped(slot);
+      if (target > mapped && target - mapped > RowBlocks().free_blocks)
+        throw std::length_error("row pool cannot hold this request");
+      reserved[slot] = target;
+    }
+    void ReleaseRowBlocks(TextRunnerState& state) const noexcept override {
+      reserved.erase(&dynamic_cast<State&>(state).slot);
+    }
+  };
+  auto runner = std::make_shared<PagedRunner>();
+  TextRunnerPool pool(runner, 2);
+  const std::vector<TextRunnerToken> first(8, 3), second(12, 4), third(4, 5);
+  // 8 tokens + 4 new: 3 blocks, one more for speculative rows.
+  assert(pool.AdmissionRowBlocks(12) == 4);
+  assert(pool.AdmissionReady(first, 4));
+  auto a = pool.Acquire(first);
+  a.ReserveRows(4);
+  assert(runner->RowBlocks().free_blocks == 2);
+  Prefill(a);
+  (void)Generate(a);
+  (void)a.Commit();
+  // The live frontier keeps its 3 rows' blocks; the reservation is back.
+  assert(runner->reserved.empty() && runner->RowBlocks().free_blocks == 3);
+  const auto resets = runner->adapter->Invalidations();
+  // 12 + 4 tokens need 5 blocks: the idle frontier, which this prompt does
+  // not continue, gives its rows back.
+  assert(pool.AdmissionReady(second, 4));
+  assert(runner->adapter->Invalidations() > resets &&
+         runner->RowBlocks().free_blocks == kPagedBlocks);
+  auto b = pool.Acquire(second);
+  b.ReserveRows(4);
+  assert(runner->RowBlocks().free_blocks == 1);
+  // A resident holds the rest: the next admission waits rather than fail.
+  assert(!pool.AdmissionReady(third, 4));
+  Prefill(b);
+  (void)b.Commit();
+  // A continuation of the idle frontier keeps it; the other slot is empty.
+  auto longer = second;
+  longer.push_back(6);
+  assert(pool.AdmissionReady(longer, 1));
+  auto c = pool.Acquire(longer);
+  assert(c.cached_prompt_tokens() == second.size());
+  c.Invalidate();
+  // No slot is busy and nothing else frees: admit, and refuse by name.
+  const std::vector<TextRunnerToken> huge(40, 9);
+  assert(pool.AdmissionReady(huge, 1));
+  auto d = pool.Acquire(huge);
+  bool refused = false;
+  try {
+    d.ReserveRows(1);
+  } catch (const std::length_error&) {
+    refused = true;
+  }
+  assert(refused && runner->reserved.empty());
+}
 int main() {
+  PagedRowsAdmitWaitAndReclaim();
   PublishedResidentCheckpointKeepsDiskStep();
   CancelledPrefillKeepsCompletedSteps();
   SharedPeerReusesTheCurrentStableCapture();

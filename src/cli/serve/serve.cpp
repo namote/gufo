@@ -608,6 +608,7 @@ void PrintServeHelp(std::string_view program_name,
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
     std::size_t cache_ram_bytes = 0;
+    std::size_t kv_pool_bytes = 0;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
@@ -720,6 +721,14 @@ void PrintServeHelp(std::string_view program_name,
         "", "--max-buffered-output-total", "N",
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
+    parser.AddOption(
+        "", "--kv-pool-bytes", "N",
+        "Paged attention KV (Qwen 27B): bytes of the device pool every "
+        "session shares, taking 256-token blocks as it writes; admission "
+        "waits while the pool is short (default: 0 = every session at the "
+        "full context). Must hold one full-context session; other models "
+        "refuse it",
+        "Cache", &kv_pool_bytes);
     parser.AddOption(
         "", "--cache-ram-bytes", "N",
         "Retained RAM-cache byte budget (default: 0 = auto: half of free "
@@ -1166,6 +1175,7 @@ int RunServe(std::span<const char* const> args) {
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
     std::size_t cache_ram_bytes = 0;
+    std::size_t kv_pool_bytes = 0;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
@@ -1274,6 +1284,14 @@ int RunServe(std::span<const char* const> args) {
         "", "--max-buffered-output-total", "N",
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
+    llm_parser.AddOption(
+        "", "--kv-pool-bytes", "N",
+        "Paged attention KV (Qwen 27B): bytes of the device pool every "
+        "session shares, taking 256-token blocks as it writes; admission "
+        "waits while the pool is short (default: 0 = every session at the "
+        "full context). Must hold one full-context session; other models "
+        "refuse it",
+        "Cache", &kv_pool_bytes);
     llm_parser.AddOption(
         "", "--cache-ram-bytes", "N",
         "Retained RAM-cache byte budget (default: 0 = auto: half of free "
@@ -1461,7 +1479,8 @@ int RunServe(std::span<const char* const> args) {
             .model_artifact_fingerprint = {},
         },
         vision_model_path,
-        server::TextRunnerRamCacheOptions{.capacity_bytes = cache_ram_bytes},
+        server::TextRunnerRamCacheOptions{.capacity_bytes = cache_ram_bytes,
+                                          .kv_pool_bytes = kv_pool_bytes},
         enable_yarn);
     loading.stop();
     if (!load_ok) {

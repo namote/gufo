@@ -36,8 +36,12 @@ public:
     return static_cast<std::byte*>(data_) + geometry_.plane_offset(plane);
   }
 
-  [[nodiscard]] std::vector<std::uint32_t> Allocate(std::uint32_t count) {
-    return allocator_.Allocate(count);
+  [[nodiscard]] std::vector<std::uint32_t> Allocate(
+      std::uint32_t count, KvBlockReservation* reservation = nullptr) {
+    return allocator_.Allocate(count, reservation);
+  }
+  [[nodiscard]] KvBlockReservation TryReserve(std::uint32_t count) {
+    return allocator_.TryReserve(count);
   }
   void Retain(std::span<const std::uint32_t> blocks) {
     allocator_.Retain(blocks);
@@ -48,8 +52,12 @@ public:
   [[nodiscard]] std::uint32_t references(std::uint32_t block) const {
     return allocator_.references(block);
   }
+  /// Blocks neither taken nor reserved.
   [[nodiscard]] std::uint32_t free_blocks() const {
     return allocator_.free_blocks();
+  }
+  [[nodiscard]] std::uint32_t reserved_blocks() const {
+    return allocator_.reserved_blocks();
   }
 
 private:

@@ -1,6 +1,7 @@
 #ifndef GUFO_CORE_HIP_KV_BLOCK_LAYOUT_HPP_
 #define GUFO_CORE_HIP_KV_BLOCK_LAYOUT_HPP_
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -125,6 +126,43 @@ private:
   std::size_t bytes_{0};
 };
 
+class KvBlockAllocator;
+
+/// Free blocks an allocator holds back for one owner (an admitted request),
+/// so allocations of other owners cannot take them. Destruction or Reset
+/// returns what was not allocated. The allocator must outlive it.
+class KvBlockReservation {
+public:
+  KvBlockReservation() = default;
+  ~KvBlockReservation() { Reset(); }
+  KvBlockReservation(KvBlockReservation&& other) noexcept
+      : allocator_(std::exchange(other.allocator_, nullptr)),
+        blocks_(std::exchange(other.blocks_, 0)) {}
+  KvBlockReservation& operator=(KvBlockReservation&& other) noexcept {
+    if (this != &other) {
+      Reset();
+      allocator_ = std::exchange(other.allocator_, nullptr);
+      blocks_ = std::exchange(other.blocks_, 0);
+    }
+    return *this;
+  }
+  KvBlockReservation(const KvBlockReservation&) = delete;
+  KvBlockReservation& operator=(const KvBlockReservation&) = delete;
+
+  [[nodiscard]] explicit operator bool() const noexcept {
+    return allocator_ != nullptr;
+  }
+  [[nodiscard]] std::uint32_t blocks() const noexcept { return blocks_; }
+  inline void Reset() noexcept;
+
+private:
+  friend class KvBlockAllocator;
+  KvBlockReservation(KvBlockAllocator* allocator, std::uint32_t blocks) noexcept
+      : allocator_(allocator), blocks_(blocks) {}
+  KvBlockAllocator* allocator_{nullptr};
+  std::uint32_t blocks_{0};
+};
+
 /// Which blocks of a pool are taken, with a reference count per block (a
 /// block shared by several sequences or checkpoints is freed by its last
 /// owner). Thread-safe. Allocation takes the lowest free indices, so a fresh
@@ -137,22 +175,43 @@ public:
   [[nodiscard]] std::uint32_t blocks() const noexcept {
     return static_cast<std::uint32_t>(references_.size());
   }
+  /// Blocks neither taken nor held back by a reservation.
   [[nodiscard]] std::uint32_t free_blocks() const {
     const std::lock_guard lock(mutex_);
-    return free_;
+    return free_ - reserved_;
+  }
+  [[nodiscard]] std::uint32_t reserved_blocks() const {
+    const std::lock_guard lock(mutex_);
+    return reserved_;
   }
   [[nodiscard]] std::uint32_t references(std::uint32_t block) const {
     const std::lock_guard lock(mutex_);
     return references_.at(block);
   }
-  /// `count` free blocks, lowest index first, each with one reference.
-  /// Throws std::length_error, taking nothing, when fewer are free.
-  [[nodiscard]] std::vector<std::uint32_t> Allocate(std::uint32_t count) {
+  /// `count` blocks, lowest index first, each with one reference: first from
+  /// `reservation` (when given, of this allocator), then from free blocks no
+  /// reservation holds. Throws std::length_error, taking nothing, when they
+  /// fall short.
+  [[nodiscard]] std::vector<std::uint32_t> Allocate(
+      std::uint32_t count, KvBlockReservation* reservation = nullptr) {
+    if (reservation != nullptr && reservation->allocator_ != nullptr &&
+        reservation->allocator_ != this)
+      throw std::invalid_argument("KV block reservation of another pool");
     const std::lock_guard lock(mutex_);
-    if (count > free_)
-      throw std::length_error("KV block pool has " + std::to_string(free_) +
-                              " free blocks, " + std::to_string(count) +
-                              " requested");
+    const std::uint32_t held =
+        reservation != nullptr && reservation->allocator_ == this
+            ? reservation->blocks_
+            : 0;
+    const std::uint32_t from_reservation = std::min(count, held);
+    if (count - from_reservation > free_ - reserved_)
+      throw std::length_error(
+          "KV block pool has " + std::to_string(free_ - reserved_) +
+          " free blocks and " + std::to_string(held) + " reserved, " +
+          std::to_string(count) + " requested");
+    if (from_reservation != 0) {
+      reservation->blocks_ -= from_reservation;
+      reserved_ -= from_reservation;
+    }
     std::vector<std::uint32_t> taken;
     taken.reserve(count);
     for (std::uint32_t block = 0; taken.size() < count; ++block)
@@ -162,6 +221,15 @@ public:
       }
     free_ -= count;
     return taken;
+  }
+  /// Holds back `count` free blocks; empty, holding nothing, when fewer are
+  /// free and unreserved.
+  [[nodiscard]] KvBlockReservation TryReserve(std::uint32_t count) {
+    const std::lock_guard lock(mutex_);
+    if (count > free_ - reserved_)
+      return {};
+    reserved_ += count;
+    return {this, count};
   }
   /// One more reference to each block; every block must be taken.
   void Retain(std::span<const std::uint32_t> blocks) {
@@ -183,10 +251,24 @@ public:
   }
 
 private:
+  friend class KvBlockReservation;
+  void Unreserve(std::uint32_t count) noexcept {
+    const std::lock_guard lock(mutex_);
+    reserved_ -= count;
+  }
+
   mutable std::mutex mutex_;
   std::vector<std::uint32_t> references_;
   std::uint32_t free_{0};
+  std::uint32_t reserved_{0};
 };
+
+void KvBlockReservation::Reset() noexcept {
+  if (allocator_ != nullptr && blocks_ != 0)
+    allocator_->Unreserve(blocks_);
+  allocator_ = nullptr;
+  blocks_ = 0;
+}
 
 }  // namespace gufo::hip
 

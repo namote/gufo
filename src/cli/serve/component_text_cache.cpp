@@ -10,6 +10,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
 #include <utility>
 
 #include "src/cache/disk_catalog.hpp"
@@ -932,6 +933,82 @@ ComponentTextCache::ComponentTextCache(
 ComponentTextCache::~ComponentTextCache() = default;
 std::size_t ComponentTextCache::capacity() const noexcept {
   return impl_->entries.size();
+}
+
+ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
+    std::span<const ContinuationToken> prompt,
+    const std::function<bool()>& enough) {
+  std::vector<const Impl::Entry*> visited;
+  while (!enough()) {
+    Impl::Entry* entry = nullptr;
+    std::size_t slot = 0, live_tokens = 0;
+    {
+      const std::lock_guard lock(impl_->mutex);
+      const auto continues = [&](const Impl::Entry& e) {
+        return e.live_tokens.size() <= prompt.size() &&
+               std::ranges::equal(e.live_tokens,
+                                  prompt.first(e.live_tokens.size()));
+      };
+      const auto covered = [&](const Impl::Entry& e) {
+        return impl_->index.HasCheckpoint(
+            {impl_->identity, e.live_tokens,
+             cache::InputIdentity(e.live_tokens.size(), e.live_input)},
+            e.live_tokens.size());
+      };
+      using Rank = std::tuple<bool, bool, std::uint64_t>;
+      std::optional<Rank> selected;
+      bool busy = false;
+      for (std::size_t i = 0; i < impl_->entries.size(); ++i) {
+        auto& candidate = impl_->entries[i];
+        if (candidate->busy) {
+          busy = true;
+          continue;
+        }
+        if (std::ranges::find(visited, candidate.get()) != visited.end() ||
+            (candidate->live && continues(*candidate)))
+          continue;
+        const Rank rank{bool(candidate->live),
+                        candidate->live && !covered(*candidate),
+                        candidate->used};
+        if (!selected || rank < *selected) {
+          entry = candidate.get();
+          slot = i + 1;
+          selected = rank;
+        }
+      }
+      if (!entry)
+        return busy ? RowReclaim::kWaiting : RowReclaim::kExhausted;
+      visited.push_back(entry);
+      entry->busy = true;
+      entry->branch = std::make_shared<const std::uint8_t>(0);
+      entry->durable.reset();
+      live_tokens = entry->live_tokens.size();
+      if (entry->live) {
+        impl_->index.Erase(*entry->live);
+        entry->live.reset();
+        entry->live_tokens.clear();
+      }
+    }
+    try {
+      // A cold lease resets the slot, which returns its rows; dropping the
+      // lease uncommitted leaves it empty.
+      (void)entry->slot->Acquire();
+    } catch (...) {
+      const std::lock_guard lock(impl_->mutex);
+      entry->busy = false;
+      throw;
+    }
+    {
+      const std::lock_guard lock(impl_->mutex);
+      entry->busy = false;
+    }
+    Logger::Info("cache",
+                 "event=live_frontier_dropped reason=row_capacity "
+                 "slot=" +
+                     std::to_string(slot) +
+                     " tokens=" + std::to_string(live_tokens));
+  }
+  return RowReclaim::kReady;
 }
 
 std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(

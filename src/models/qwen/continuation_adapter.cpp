@@ -175,6 +175,8 @@ public:
       if (component.descriptor.kind == cache::ComponentKind::kAppendRows &&
           first < end)
         guard.BeforeOverwrite(component.descriptor.id, first, end);
+    // Shared pool: map the rows before any submission writes them.
+    executor->arena_.EnsureKvRows(end);
   }
   void AfterWrite(std::uint32_t end, bool logits) noexcept override {
     position = end;
@@ -297,11 +299,13 @@ ContinuationAdapter::ContinuationAdapter(
     cache::Identity identity, hip::QwenExecutionPolicy policy,
     std::shared_ptr<const hip::QwenDFlashGpuModel> draft_model,
     hip::QwenDFlashGpuDraftConfig draft_config, cache::ResourceLedger* ledger,
-    std::shared_ptr<hip::QwenSharedPassScratch> pass_scratch)
+    std::shared_ptr<hip::QwenSharedPassScratch> pass_scratch,
+    std::shared_ptr<hip::KvBlockPool> kv_pool)
     : model_(std::move(model)),
       draft_model_(std::move(draft_model)),
       draft_config_(draft_config),
       pass_scratch_(std::move(pass_scratch)),
+      kv_pool_(std::move(kv_pool)),
       ledger_(ledger),
       policy_(policy),
       context_(context),
@@ -396,6 +400,19 @@ bool ContinuationAdapter::HasDecodeFrontier(const cache::Slot& slot) const {
   return state.frontier.token &&
          (state.logits_valid || !state.frontier.logits.empty());
 }
+std::uint32_t ContinuationAdapter::ReserveKvRows(cache::Slot& slot,
+                                                 std::uint32_t rows,
+                                                 std::uint32_t margin) {
+  return As(slot).executor->arena_.ReserveKvRows(rows, margin);
+}
+std::uint32_t ContinuationAdapter::ReleaseKvReservation(
+    cache::Slot& slot) noexcept {
+  return static_cast<State&>(slot).executor->arena_.ReleaseKvReservation();
+}
+std::span<const std::uint32_t> ContinuationAdapter::KvBlocks(
+    const cache::Slot& slot) const {
+  return As(slot).executor->arena_.GetKvBlocks();
+}
 void ContinuationAdapter::BeginPrefill(cache::Slot& slot) {
   auto& state = As(slot);
   state.Stable();
@@ -436,7 +453,7 @@ cache::Identity ContinuationAdapter::CompatibilityIdentity() const {
 std::unique_ptr<cache::Slot> ContinuationAdapter::CreateSlot(
     cache::MutationGuard& guard) {
   auto executor = std::make_unique<hip::QwenGpuExecutor>(
-      model_, context_, policy_, pass_scratch_);
+      model_, context_, policy_, pass_scratch_, kv_pool_);
   // Prepare the rollback pair before readiness. Pinning the current buffer
   // for a prefill pass then requires neither an allocation nor a state copy.
   executor->arena_.AllocateRecurrentSnapshot();
@@ -514,6 +531,12 @@ void ContinuationAdapter::BeginRestore(
   Check(hipStreamSynchronize(state.executor->arena_.stream));
   if (state.draft)
     Check(hipStreamSynchronize(state.draft->executor_->stream_));
+  // Shared pool: the loads below fill rows [0, target) whole. Keep the
+  // blocks already mapped there and map the rest.
+  auto& arena = state.executor->arena_;
+  const auto target = static_cast<std::uint32_t>(ordered.front().valid_rows);
+  arena.TruncateKvRows(target);
+  arena.EnsureKvRows(target);
   state.expected = std::move(ordered);
   state.coverage = std::move(coverage);
   state.metadata.fill(std::byte{});

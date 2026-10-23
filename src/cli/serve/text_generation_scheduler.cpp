@@ -1214,6 +1214,14 @@ struct TextGenerationScheduler::Impl {
           }
         }
 
+        if (!runner_pool->AdmissionReady(request->prompt,
+                                         request->token_limit)) {
+          // The row pool cannot hold this request until residents finish.
+          // Retry on a later pass so they keep decoding meanwhile.
+          waiting.push_front(std::move(request));
+          return;
+        }
+
         const std::weak_ptr<ScheduledRequest> weak_request = request;
         request->runner_request = runner_pool->Acquire(
             std::move(request->prompt), request->sampling,
@@ -1231,6 +1239,7 @@ struct TextGenerationScheduler::Impl {
           CompleteCancelled(request);
           continue;
         }
+        request->runner_request.ReserveRows(request->token_limit);
 
         request->result.component_cache =
             request->runner_request.component_cache_metrics();
