@@ -647,10 +647,12 @@ std::size_t QwenGpuArena::SnapshotPayloadBytes(
     std::uint32_t valid_context) const {
   if (valid_context > max_context_)
     throw std::length_error("Qwen snapshot exceeds the context length");
+  // The state counts whole FP16 blocks: every row past valid_context of the
+  // session's KV rows is unused.
   const auto unused = CheckedMultiply(
       CheckedMultiply(
           CheckedMultiply(config_.FullAttentionLayerCount(),
-                          max_context_ - valid_context),
+                          KvLayerPitchRows() - valid_context),
           CheckedMultiply(config_.num_key_value_heads, config_.head_dim)),
       policy_.UsesFp16AttentionKv() ? 2 * sizeof(std::uint16_t)
                                     : 2 * sizeof(float));
