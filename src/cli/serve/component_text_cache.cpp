@@ -1760,7 +1760,14 @@ bool ComponentTextCache::Lease::CaptureRefused(std::size_t boundary) const {
     return false;
   std::size_t bytes;
   try {
-    bytes = CaptureBytes(boundary);
+    const auto& adapter = *cache.resources->adapter;
+    const auto& slot = impl_->slot.Execution();
+    auto positions = adapter.PrefillCheckpointPositions(slot, boundary);
+    // An adapter without an in-pass prediction: the frontier the boundary
+    // lies past is a lower bound of the capture.
+    if (positions.empty())
+      positions = adapter.Positions(slot);
+    bytes = impl_->entry->history->NewPayloadBytes(positions);
   } catch (const std::invalid_argument&) {
     // Positions are incomplete until a restore settles: not known refused.
     return false;
