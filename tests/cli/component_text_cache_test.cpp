@@ -2080,10 +2080,67 @@ void RefusedCaptureIsKnownBeforePrefill() {
   assert(!lease->CaptureRefused(100));
   lease->Invalidate();
 }
+void WriteBackReusesPersistedChunks() {
+  // The prompt boundary goes to disk from a RAM checkpoint; the write-back of
+  // the longer frontier reuses its chunk files and writes only new ones.
+  char pattern[] = "/tmp/gufo-component-write-back-reuse-XXXXXX";
+  const std::filesystem::path directory = mkdtemp(pattern);
+  const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                        .capacity_bytes = 1 << 22,
+                                        .staging_capacity_bytes = 7};
+  const auto files = [&] {
+    std::size_t n = 0;
+    for (const auto& f :
+         std::filesystem::recursive_directory_iterator(directory))
+      n += f.is_regular_file();
+    return n;
+  };
+  auto runner = std::make_shared<Runner>();
+  ComponentTextCache cache(runner, 2, 1 << 22, disk);
+  const std::vector<TextRunnerToken> side(12, 5);
+  const auto wait = [&](std::uint64_t target) {
+    std::uint64_t completed = 0;
+    for (int i = 0; i < 500 && completed < target; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      auto peek = cache.Acquire(side, {}, {}, true, 0, true);
+      completed = peek->Metrics().persistence->completed;
+      (void)peek->Commit({}, {}, {});
+    }
+    assert(completed == target);
+  };
+  std::vector<TextRunnerToken> prompt(200);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  const std::vector<TextRunnerToken> head(prompt.begin(), prompt.begin() + 100);
+  {
+    auto lease = cache.Acquire(head, {}, {}, true, 0, true);
+    auto& state = dynamic_cast<State&>(lease->state());
+    runner->adapter->Append(state.slot, head, head);
+    assert(lease->TryReserveSnapshot(lease->CaptureBytes(), head.size(), false,
+                                     SnapshotPurpose::kContinuation, {}));
+    (void)lease->Commit(head, lease->Capture(), head);
+  }
+  wait(1);
+  const auto first = files();
+  {
+    auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+    assert(lease->cached_tokens() == head.size());
+    auto& state = dynamic_cast<State&>(lease->state());
+    const auto tail = std::span(prompt).subspan(head.size());
+    runner->adapter->Append(state.slot, tail, tail);
+    (void)lease->Commit({}, {}, prompt);
+  }
+  assert(cache.WriteBackIdle(std::chrono::milliseconds(0)) == 1);
+  wait(2);
+  // Without reuse the write-back would add at least as many files as the
+  // first checkpoint (twice the rows); with it, about as many again.
+  assert(files() - first < first + first / 2);
+  std::filesystem::remove_all(directory);
+}
 int main() {
   ColdAssignmentCapturesUncoveredFrontier();
   IdleWriteBackResumesFromLastTurn();
   RefusedCaptureIsKnownBeforePrefill();
+  WriteBackReusesPersistedChunks();
   PagedRowsAdmitWaitAndReclaim();
   PublishedResidentCheckpointKeepsDiskStep();
   CancelledPrefillKeepsCompletedSteps();

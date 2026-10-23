@@ -403,13 +403,18 @@ struct ComponentTextCache::Impl {
             }
             catalog->Track(id);
             if (const auto description = catalog->Find(id)) {
-              if (completed)
-                for (auto& entry : entries)
-                  if (entry->branch == completed->branch &&
-                      (!entry->durable ||
-                       entry->durable->Manifest().tokens.size() <
-                           description->Manifest().tokens.size()))
-                    entry->durable = description;
+              // A checkpoint persisted from RAM is the durable ancestor of the
+              // execution it came from too, so a later write-back of that
+              // slot reuses its chunk files instead of writing them again.
+              for (auto& entry : entries)
+                if ((completed ? entry->branch == completed->branch
+                               : entry->history &&
+                                     entry->history->Lineage() ==
+                                         description->Manifest().lineage) &&
+                    (!entry->durable ||
+                     entry->durable->Manifest().tokens.size() <
+                         description->Manifest().tokens.size()))
+                  entry->durable = description;
               auto found = index.Lookup(
                   {identity, description->Manifest().tokens,
                    cache::InputIdentity(description->Manifest().tokens.size(),
