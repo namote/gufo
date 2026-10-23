@@ -179,6 +179,8 @@ struct ComponentTextCache::Impl {
     // Acquisition order; cold assignment replaces the oldest live frontier.
     std::uint64_t used{};
     bool busy{};
+    // Paged rows: false once ReclaimRows emptied the slot, until it is leased.
+    bool holds_rows{};
   };
   std::shared_ptr<TextModelRunner> runner;
   cache::ResourceLedger ledger;
@@ -964,7 +966,8 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
           busy = true;
           continue;
         }
-        if (std::ranges::find(visited, candidate.get()) != visited.end() ||
+        if (!candidate->holds_rows ||
+            std::ranges::find(visited, candidate.get()) != visited.end() ||
             (candidate->live && continues(*candidate)))
           continue;
         const Rank rank{bool(candidate->live),
@@ -1001,6 +1004,7 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
     {
       const std::lock_guard lock(impl_->mutex);
       entry->busy = false;
+      entry->holds_rows = false;
     }
     Logger::Info("cache",
                  "event=live_frontier_dropped reason=row_capacity "
@@ -1134,6 +1138,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     if (!entry)
       throw cache::SlotBusy();
     entry->busy = true;
+    entry->holds_rows = true;
     entry->used = ++impl_->clock;
     if (!live) {
       entry->branch = std::make_shared<const std::uint8_t>(0);

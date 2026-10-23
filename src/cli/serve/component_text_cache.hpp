@@ -130,8 +130,9 @@ public:
   // Returns the paged rows idle slots hold until `enough()` holds: slots
   // without a live frontier first, then live frontiers that `prompt` does
   // not continue, a frontier some checkpoint covers before the only copy of
-  // its work, oldest first. Each slot is reset at most once per call; its
-  // borrowed checkpoint rows are preserved as on any cold reassignment.
+  // its work, oldest first. A slot is reset at most once per call, and not
+  // again until it is leased; its borrowed checkpoint rows are preserved as
+  // on any cold reassignment.
   // `enough` runs without the cache lock.
   [[nodiscard]] RowReclaim ReclaimRows(std::span<const ContinuationToken>,
                                        const std::function<bool()>& enough);
