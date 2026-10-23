@@ -12,6 +12,11 @@ namespace gufo::hip {
 tokenization::TokenId QwenGpuExecutor::ForwardToken(
     tokenization::TokenId token_id, std::uint32_t pos, bool compute_logits) {
   CheckReset();
+  // A captured decode graph bakes the session's own pass scratch.
+  if (arena_.IsScratchLeased())
+    throw std::logic_error(
+        "a Qwen decode step cannot run inside a pass holding the shared "
+        "pass scratch");
   if (pos >= arena_.GetMaxContext()) {
     throw std::length_error("token position exceeds the GPU context length");
   }

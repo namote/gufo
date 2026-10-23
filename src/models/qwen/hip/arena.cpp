@@ -3,6 +3,7 @@
 #include <array>
 #include <cassert>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -334,39 +335,254 @@ std::size_t QwenGpuSnapshot::SerializeCompact(
   return destination.size();
 }
 
+namespace {
+
+struct PassScratchWidths {
+  std::size_t hidden, attention, kv, intermediate, projection, ssm_qkv,
+      recurrent, bf16_width, weight_elements;
+};
+
+PassScratchWidths ScratchWidths(const core::ModelConfig& config) {
+  const std::size_t attention = config.AttentionSize();
+  const std::size_t kv =
+      static_cast<std::size_t>(config.num_key_value_heads) * config.head_dim;
+  const std::size_t q_projection = 2 * attention;
+  const std::size_t ssm_qkv = config.SsmQkvSize();
+  const std::size_t projection = std::max(q_projection, ssm_qkv);
+  const std::size_t time_step = config.ssm_time_step_rank;
+  return {
+      .hidden = config.hidden_size,
+      .attention = attention,
+      .kv = kv,
+      .intermediate = config.intermediate_size,
+      .projection = projection,
+      .ssm_qkv = ssm_qkv,
+      .recurrent = std::max<std::size_t>(attention, config.ssm_inner_size),
+      .bf16_width = std::max<std::size_t>(
+          {config.intermediate_size, config.hidden_size, projection,
+           CheckedSum(ssm_qkv, CheckedSum(config.ssm_inner_size,
+                                          CheckedMultiply(2, time_step)))}),
+      .weight_elements = CheckedMultiply(
+          config.hidden_size,
+          std::max<std::size_t>({q_projection, kv, attention,
+                                 config.intermediate_size, ssm_qkv,
+                                 config.ssm_inner_size, time_step})),
+  };
+}
+
+// The tiled Q8_1 activation layout groups 16 tokens per tile, so size for a
+// batch rounded up to a whole tile. The base layout remains 36 bytes per 32
+// elements; reserve another float per block for the K-quant activation-sum
+// sidecar without changing the Q8 payload or its stride.
+std::size_t Q8ActivationBytes(std::size_t rows, std::size_t row_elements) {
+  const std::size_t q8_rows = CheckedMultiply((rows + 15) / 16, 16);
+  const std::size_t q8_blocks =
+      (CheckedMultiply(q8_rows, row_elements) + 31) / 32;
+  return CheckedSum(
+      CheckedMultiply(CheckedMultiply(q8_blocks, sizeof(float)), 10), 4096);
+}
+
+}  // namespace
+
+std::size_t QwenPassScratchSet::Bytes(const core::ModelConfig& config,
+                                      std::size_t rows, bool weights) {
+  const auto w = ScratchWidths(config);
+  std::size_t bytes = 0;
+  for (const std::size_t width :
+       {w.hidden, w.hidden, w.attention, w.kv, w.kv, w.hidden, w.intermediate,
+        w.intermediate, w.intermediate, w.hidden, w.projection, w.ssm_qkv,
+        w.recurrent, w.recurrent})
+    AddAllocation(CheckedMultiply(rows, width), sizeof(float), &bytes);
+  AddAllocation(CheckedMultiply(rows, w.bf16_width), sizeof(hip_bfloat16),
+                &bytes);
+  CheckedAdd(Q8ActivationBytes(rows, w.bf16_width), &bytes);
+  if (weights)
+    AddAllocation(w.weight_elements, sizeof(hip_bfloat16), &bytes);
+  return bytes;
+}
+
+QwenPassScratchSet QwenPassScratchSet::Allocate(const core::ModelConfig& config,
+                                                std::size_t rows,
+                                                bool weights) {
+  const auto w = ScratchWidths(config);
+  QwenPassScratchSet set;
+  set.rows = rows;
+  try {
+    const auto floats = [&](float** buffer, std::size_t width) {
+      HIP_CHECK(hipMalloc(buffer, CheckedMultiply(CheckedMultiply(rows, width),
+                                                  sizeof(float))));
+    };
+    floats(&set.hidden, w.hidden);
+    floats(&set.normed, w.hidden);
+    floats(&set.q, w.attention);
+    floats(&set.k, w.kv);
+    floats(&set.v, w.kv);
+    floats(&set.attn_out, w.hidden);
+    floats(&set.ffn_gate, w.intermediate);
+    floats(&set.ffn_up, w.intermediate);
+    floats(&set.ffn_act, w.intermediate);
+    floats(&set.ffn_out, w.hidden);
+    floats(&set.ssm_qkv, w.projection);
+    floats(&set.conv_out, w.ssm_qkv);
+    floats(&set.ssm_gate, w.recurrent);
+    floats(&set.ssm_out, w.recurrent);
+    HIP_CHECK(hipMalloc(&set.bf16,
+                        CheckedMultiply(CheckedMultiply(rows, w.bf16_width),
+                                        sizeof(hip_bfloat16))));
+    HIP_CHECK(hipMalloc(&set.q8_act, Q8ActivationBytes(rows, w.bf16_width)));
+    if (weights)
+      HIP_CHECK(
+          hipMalloc(&set.weights_bf16,
+                    CheckedMultiply(w.weight_elements, sizeof(hip_bfloat16))));
+  } catch (...) {
+    set.Free();
+    throw;
+  }
+  return set;
+}
+
+void QwenPassScratchSet::Free() noexcept {
+  for (float** buffer :
+       {&hidden, &normed, &q, &k, &v, &attn_out, &ffn_gate, &ffn_up, &ffn_act,
+        &ffn_out, &ssm_qkv, &conv_out, &ssm_gate, &ssm_out}) {
+    if (*buffer != nullptr)
+      LogCleanupError(hipFree(*buffer));
+    *buffer = nullptr;
+  }
+  for (void** buffer : {&bf16, &q8_act}) {
+    if (*buffer != nullptr)
+      LogCleanupError(hipFree(*buffer));
+    *buffer = nullptr;
+  }
+  if (weights_bf16 != nullptr)
+    LogCleanupError(hipFree(weights_bf16));
+  weights_bf16 = nullptr;
+  rows = 0;
+}
+
+QwenSharedPassScratch::QwenSharedPassScratch(const core::ModelConfig& config,
+                                             std::uint32_t max_context)
+    : set_(QwenPassScratchSet::Allocate(
+          config,
+          std::min<std::size_t>(std::max(max_context, 1U), kMaxPromptBatch),
+          true)),
+      bytes_(QwenPassScratchSet::Bytes(config, set_.rows, true)) {
+  if (const auto error =
+          hipEventCreateWithFlags(&released_, hipEventDisableTiming);
+      error != hipSuccess) {
+    set_.Free();
+    throw std::runtime_error(std::string("hipEventCreateWithFlags: ") +
+                             hipGetErrorString(error));
+  }
+  // Touch every page now, at load: otherwise the first prompt pass after
+  // startup pays for mapping 2 GiB of fresh device memory.
+  try {
+    const auto w = ScratchWidths(config);
+    const std::size_t rows = set_.rows;
+    for (const auto& [buffer, width] :
+         std::initializer_list<std::pair<float*, std::size_t>>{
+             {set_.hidden, w.hidden},
+             {set_.normed, w.hidden},
+             {set_.q, w.attention},
+             {set_.k, w.kv},
+             {set_.v, w.kv},
+             {set_.attn_out, w.hidden},
+             {set_.ffn_gate, w.intermediate},
+             {set_.ffn_up, w.intermediate},
+             {set_.ffn_act, w.intermediate},
+             {set_.ffn_out, w.hidden},
+             {set_.ssm_qkv, w.projection},
+             {set_.conv_out, w.ssm_qkv},
+             {set_.ssm_gate, w.recurrent},
+             {set_.ssm_out, w.recurrent}})
+      HIP_CHECK(hipMemset(buffer, 0, rows * width * sizeof(float)));
+    HIP_CHECK(
+        hipMemset(set_.bf16, 0, rows * w.bf16_width * sizeof(hip_bfloat16)));
+    HIP_CHECK(hipMemset(set_.q8_act, 0, Q8ActivationBytes(rows, w.bf16_width)));
+    HIP_CHECK(hipMemset(set_.weights_bf16, 0,
+                        w.weight_elements * sizeof(hip_bfloat16)));
+  } catch (...) {
+    LogCleanupError(hipEventDestroy(released_));
+    set_.Free();
+    throw;
+  }
+}
+
+QwenSharedPassScratch::~QwenSharedPassScratch() {
+  if (released_ != nullptr) {
+    LogCleanupError(hipEventSynchronize(released_));
+    LogCleanupError(hipEventDestroy(released_));
+  }
+  set_.Free();
+}
+
+void QwenGpuArena::PointPassScratch(const QwenPassScratchSet& set) noexcept {
+  d_hidden = set.hidden;
+  d_normed = set.normed;
+  d_q = set.q;
+  d_k = set.k;
+  d_v = set.v;
+  d_attn_out = set.attn_out;
+  d_ffn_gate = set.ffn_gate;
+  d_ffn_up = set.ffn_up;
+  d_ffn_act = set.ffn_act;
+  d_ffn_out = set.ffn_out;
+  d_ssm_qkv = set.ssm_qkv;
+  d_conv_out = set.conv_out;
+  d_ssm_gate = set.ssm_gate;
+  d_ssm_out = set.ssm_out;
+  d_scratch_bf16 = set.bf16;
+  d_scratch_q8_act = set.q8_act;
+  d_weights_bf16 = set.weights_bf16;
+}
+
+bool QwenGpuArena::BeginPassScratch() {
+  if (shared_scratch_ == nullptr || scratch_leased_)
+    return false;
+  if (shared_scratch_->leased_.exchange(true))
+    throw std::logic_error(
+        "the shared Qwen pass scratch is leased by another session's pass");
+  // The previous lessee's pass may still run on its own stream.
+  if (const auto error =
+          hipStreamWaitEvent(stream, shared_scratch_->released_, 0);
+      error != hipSuccess) {
+    shared_scratch_->leased_.store(false);
+    throw std::runtime_error(std::string("hipStreamWaitEvent: ") +
+                             hipGetErrorString(error));
+  }
+  scratch_leased_ = true;
+  PointPassScratch(shared_scratch_->set_);
+  return true;
+}
+
+void QwenGpuArena::EndPassScratch() noexcept {
+  if (!scratch_leased_)
+    return;
+  LogCleanupError(hipEventRecord(shared_scratch_->released_, stream));
+  PointPassScratch(own_scratch_);
+  scratch_leased_ = false;
+  shared_scratch_->leased_.store(false);
+}
+
 QwenGpuMemoryUsage QwenGpuArena::EstimateMemoryUsage(
     const core::ModelConfig& config, std::uint32_t max_context,
-    QwenExecutionPolicy policy) {
+    QwenExecutionPolicy policy, bool shared_scratch) {
   const std::size_t context = std::max(max_context, 1U);
   const std::size_t batch = std::min<std::size_t>(context, kMaxPromptBatch);
   const std::size_t hidden = config.hidden_size;
-  const std::size_t intermediate = config.intermediate_size;
-  const std::size_t attention = config.AttentionSize();
   const std::size_t kv =
       CheckedMultiply(config.num_key_value_heads, config.head_dim);
-  const std::size_t q_projection = CheckedMultiply(2, attention);
-  const std::size_t ssm_qkv = config.SsmQkvSize();
-  const std::size_t recurrent =
-      std::max<std::size_t>(attention, config.ssm_inner_size);
-  const std::size_t projection = std::max(q_projection, ssm_qkv);
   const std::size_t time_step = config.ssm_time_step_rank;
 
   QwenGpuMemoryUsage usage;
   auto& scratch = usage.temporary_scratch_bytes;
-  AddAllocation(CheckedMultiply(batch, hidden), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, hidden), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, attention), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, kv), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, kv), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, hidden), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, intermediate), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, intermediate), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, intermediate), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, hidden), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, projection), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, ssm_qkv), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, recurrent), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, recurrent), sizeof(float), &scratch);
+  CheckedAdd(
+      QwenPassScratchSet::Bytes(
+          config,
+          shared_scratch ? std::min<std::size_t>(batch, kSessionScratchRows)
+                         : batch,
+          !shared_scratch),
+      &scratch);
   AddAllocation(CheckedMultiply(batch, time_step), sizeof(float), &scratch);
   AddAllocation(CheckedMultiply(batch, time_step), sizeof(float), &scratch);
   AddAllocation(
@@ -379,33 +595,9 @@ QwenGpuMemoryUsage QwenGpuArena::EstimateMemoryUsage(
                 &scratch);
   AddAllocation(CheckedMultiply(kMaxTargetLayerTaps, hidden), sizeof(float),
                 &scratch);
-
-  const std::size_t maximum_scratch_width = std::max<std::size_t>(
-      {intermediate, hidden, projection,
-       CheckedSum(ssm_qkv, CheckedSum(config.ssm_inner_size,
-                                      CheckedMultiply(2, time_step)))});
-  const std::size_t scratch_elements =
-      CheckedMultiply(batch, maximum_scratch_width);
-  AddAllocation(scratch_elements, sizeof(hip_bfloat16), &scratch);
-
-  const std::size_t q8_rows = CheckedMultiply((batch + 15) / 16, 16);
-  const std::size_t q8_row_elements = scratch_elements / batch;
-  const std::size_t q8_elements = CheckedMultiply(q8_rows, q8_row_elements);
-  const std::size_t q8_blocks = (q8_elements + 31) / 32;
-  CheckedAdd(CheckedMultiply(CheckedMultiply(q8_blocks, sizeof(float)), 10),
-             &scratch);
-  CheckedAdd(4096, &scratch);
-
   AddAllocation(detail::DecodeAttentionScratchElements(
                     config.num_attention_heads, config.head_dim),
                 sizeof(float), &scratch);
-
-  const std::size_t maximum_weight_width =
-      std::max<std::size_t>({q_projection, kv, attention, intermediate, ssm_qkv,
-                             config.ssm_inner_size, time_step});
-  const std::size_t maximum_weight =
-      CheckedMultiply(hidden, maximum_weight_width);
-  AddAllocation(maximum_weight, sizeof(hip_bfloat16), &scratch);
 
   auto& state = usage.request_state_bytes;
   const std::size_t total_kv = CheckedMultiply(
@@ -440,7 +632,8 @@ std::size_t QwenGpuArena::RecurrentStateBytes(const core::ModelConfig& config,
 }
 
 QwenGpuMemoryUsage QwenGpuArena::GetMemoryUsage() const {
-  auto usage = EstimateMemoryUsage(config_, max_context_, policy_);
+  auto usage = EstimateMemoryUsage(config_, max_context_, policy_,
+                                   shared_scratch_ != nullptr);
   if (d_ssm_conv_buffers_[1] && d_ssm_deltanet_buffers_[1])
     CheckedAdd(RecurrentStateBytes(config_, policy_),
                &usage.request_state_bytes);
@@ -699,13 +892,15 @@ void QwenGpuArena::RestoreCompactSnapshot(
                   "failed to synchronize compact Qwen snapshot restore");
 }
 
-QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
-                           std::uint32_t max_context,
-                           QwenExecutionPolicy policy)
+QwenGpuArena::QwenGpuArena(
+    const core::ModelConfig& config, std::uint32_t max_context,
+    QwenExecutionPolicy policy,
+    std::shared_ptr<QwenSharedPassScratch> shared_scratch)
     : config_(config),
       max_context_(std::max(max_context, 1U)),
       max_batch_(std::min(max_context_, kMaxPromptBatch)),
-      policy_(policy) {
+      policy_(policy),
+      shared_scratch_(std::move(shared_scratch)) {
   try {
     HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
     HIPBLAS_CHECK(hipblasCreate(&hipblas_handle));
@@ -713,38 +908,23 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
     hipblaslt_gemm = std::make_unique<HipblasLtGemm>();
 
     const std::size_t hidden_size = config_.hidden_size;
-    const std::size_t intermediate_size = config_.intermediate_size;
     const std::size_t vocab_size = config_.vocab_size;
     const std::size_t num_layers = config_.SsmLayerCount();
-    const std::size_t num_kv_heads = config_.num_key_value_heads;
-    const std::size_t head_dim = config_.head_dim;
     const std::size_t batch = max_batch_;
-    const std::size_t attention_size = config_.AttentionSize();
-    const std::size_t kv_size = num_kv_heads * head_dim;
-    const std::size_t q_projection_size = 2 * attention_size;
     const std::size_t ssm_qkv_size = config_.SsmQkvSize();
-    const std::size_t ssm_inner_size = config_.ssm_inner_size;
-    const std::size_t recurrent_width =
-        std::max(attention_size, ssm_inner_size);
-    const std::size_t projection_width =
-        std::max(q_projection_size, ssm_qkv_size);
     const std::size_t time_step_rank = config_.ssm_time_step_rank;
 
-    HIP_CHECK(hipMalloc(&d_hidden, batch * hidden_size * sizeof(float)));
-    HIP_CHECK(hipMalloc(&d_normed, batch * hidden_size * sizeof(float)));
-    HIP_CHECK(hipMalloc(&d_q, batch * attention_size * sizeof(float)));
-    HIP_CHECK(hipMalloc(&d_k, batch * kv_size * sizeof(float)));
-    HIP_CHECK(hipMalloc(&d_v, batch * kv_size * sizeof(float)));
-    HIP_CHECK(hipMalloc(&d_attn_out, batch * hidden_size * sizeof(float)));
-    HIP_CHECK(
-        hipMalloc(&d_ffn_gate, batch * intermediate_size * sizeof(float)));
-    HIP_CHECK(hipMalloc(&d_ffn_up, batch * intermediate_size * sizeof(float)));
-    HIP_CHECK(hipMalloc(&d_ffn_act, batch * intermediate_size * sizeof(float)));
-    HIP_CHECK(hipMalloc(&d_ffn_out, batch * hidden_size * sizeof(float)));
-    HIP_CHECK(hipMalloc(&d_ssm_qkv, batch * projection_width * sizeof(float)));
-    HIP_CHECK(hipMalloc(&d_conv_out, batch * ssm_qkv_size * sizeof(float)));
-    HIP_CHECK(hipMalloc(&d_ssm_gate, batch * recurrent_width * sizeof(float)));
-    HIP_CHECK(hipMalloc(&d_ssm_out, batch * recurrent_width * sizeof(float)));
+    if (shared_scratch_ != nullptr && shared_scratch_->rows() < batch)
+      throw std::invalid_argument(
+          "shared Qwen pass scratch holds fewer rows than a prompt pass");
+    // With a shared set, this session's own holds one decode step's rows.
+    own_scratch_ = QwenPassScratchSet::Allocate(
+        config_,
+        shared_scratch_ != nullptr
+            ? std::min<std::size_t>(batch, kSessionScratchRows)
+            : batch,
+        shared_scratch_ == nullptr);
+    PointPassScratch(own_scratch_);
     HIP_CHECK(hipMalloc(&d_alpha_buf, batch * time_step_rank * sizeof(float)));
     HIP_CHECK(hipMalloc(&d_beta_buf, batch * time_step_rank * sizeof(float)));
     HIP_CHECK(hipMalloc(&d_ssm_kq_scales,
@@ -757,37 +937,10 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
     HIP_CHECK(
         hipMalloc(&d_target_layer_features, 5 * hidden_size * sizeof(float)));
 
-    const std::size_t scratch_elements =
-        batch * std::max<std::size_t>(
-                    {intermediate_size, hidden_size, projection_width,
-                     ssm_qkv_size + ssm_inner_size + (2 * time_step_rank)});
-    HIP_CHECK(
-        hipMalloc(&d_scratch_bf16, scratch_elements * sizeof(hip_bfloat16)));
-    // The tiled Q8_1 activation layout groups 16 tokens per tile, so size for a
-    // batch rounded up to a whole tile. The base layout remains 36 bytes per 32
-    // elements; reserve another float per block for the K-quant
-    // activation-sum sidecar without changing the Q8 payload or its stride.
-    const std::size_t q8_rows = ((batch + 15) / 16) * 16;
-    const std::size_t q8_row_elements =
-        scratch_elements / std::max<std::size_t>(batch, 1);
-    const std::size_t scratch_q8_bytes =
-        ((((q8_rows * q8_row_elements) + 31) / 32) * sizeof(float) * 10) +
-        4096;  // 36-byte payload + 4-byte sidecar per 32 elems
-    HIP_CHECK(hipMalloc(&d_scratch_q8_act, scratch_q8_bytes));
     const std::size_t split_k_elements = detail::DecodeAttentionScratchElements(
         config_.num_attention_heads, config_.head_dim);
     HIP_CHECK(
         hipMalloc(&d_split_k_attention, split_k_elements * sizeof(float)));
-
-    // Weight BF16 scratch: largest per-layer matmul weight in bf16 elements,
-    // used by the prefill dequant-to-BF16 then BF16 GEMM path.
-    const std::size_t max_weight_elems =
-        hidden_size *
-        std::max<std::size_t>({q_projection_size, kv_size, attention_size,
-                               intermediate_size, ssm_qkv_size, ssm_inner_size,
-                               time_step_rank});
-    HIP_CHECK(
-        hipMalloc(&d_weights_bf16, max_weight_elems * sizeof(hip_bfloat16)));
 
     const std::size_t total_kv = GetAttentionKvPlaneElements();
     if (policy_.UsesFp16AttentionKv()) {
@@ -819,9 +972,13 @@ QwenGpuArena::~QwenGpuArena() {
   FreeAll();
 }
 
-QwenGpuScratchView QwenGpuArena::GetScratchView(
-    std::size_t batch_size) noexcept {
+QwenGpuScratchView QwenGpuArena::GetScratchView(std::size_t batch_size) {
   const std::size_t batch = std::min<std::size_t>(batch_size, max_batch_);
+  if (batch > GetScratchRows())
+    throw std::logic_error("Qwen pass needs " + std::to_string(batch) +
+                           " scratch rows; this session holds " +
+                           std::to_string(GetScratchRows()) +
+                           " until it leases the shared pass scratch");
   const std::size_t hidden = config_.hidden_size;
   const std::size_t attention = config_.AttentionSize();
   const std::size_t kv =
@@ -851,7 +1008,8 @@ QwenGpuScratchView QwenGpuArena::GetScratchView(
               .logits = {d_logits, config_.vocab_size},
               .bf16 = {static_cast<hip_bfloat16*>(d_scratch_bf16),
                        bf16_scratch},
-              .weight_bf16 = {d_weights_bf16, weight_bf16},
+              .weight_bf16 = {d_weights_bf16,
+                              d_weights_bf16 != nullptr ? weight_bf16 : 0},
               .prompt_tokens = {d_prompt_tokens,
                                 std::max<std::size_t>(batch, 2)},
               // d_alpha_buf is reused only after all SSM layers finish.
@@ -962,6 +1120,9 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   replay_captured_positions_ = other.replay_captured_positions_;
   has_saved_state_ = other.has_saved_state_;
   replay_capture_active_ = other.replay_capture_active_;
+  own_scratch_ = std::exchange(other.own_scratch_, {});
+  shared_scratch_ = std::move(other.shared_scratch_);
+  scratch_leased_ = std::exchange(other.scratch_leased_, false);
 
   other.d_hidden = nullptr;
   other.d_normed = nullptr;
@@ -1064,6 +1225,9 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     replay_captured_positions_ = other.replay_captured_positions_;
     has_saved_state_ = other.has_saved_state_;
     replay_capture_active_ = other.replay_capture_active_;
+    own_scratch_ = std::exchange(other.own_scratch_, {});
+    shared_scratch_ = std::move(other.shared_scratch_);
+    scratch_leased_ = std::exchange(other.scratch_leased_, false);
 
     other.d_hidden = nullptr;
     other.d_normed = nullptr;
@@ -1151,34 +1315,10 @@ void QwenGpuArena::Reset() {
 }
 
 void QwenGpuArena::FreeAll() noexcept {
-  if (d_hidden != nullptr)
-    LogCleanupError(hipFree(d_hidden));
-  if (d_normed != nullptr)
-    LogCleanupError(hipFree(d_normed));
-  if (d_q != nullptr)
-    LogCleanupError(hipFree(d_q));
-  if (d_k != nullptr)
-    LogCleanupError(hipFree(d_k));
-  if (d_v != nullptr)
-    LogCleanupError(hipFree(d_v));
-  if (d_attn_out != nullptr)
-    LogCleanupError(hipFree(d_attn_out));
-  if (d_ffn_gate != nullptr)
-    LogCleanupError(hipFree(d_ffn_gate));
-  if (d_ffn_up != nullptr)
-    LogCleanupError(hipFree(d_ffn_up));
-  if (d_ffn_act != nullptr)
-    LogCleanupError(hipFree(d_ffn_act));
-  if (d_ffn_out != nullptr)
-    LogCleanupError(hipFree(d_ffn_out));
-  if (d_ssm_qkv != nullptr)
-    LogCleanupError(hipFree(d_ssm_qkv));
-  if (d_conv_out != nullptr)
-    LogCleanupError(hipFree(d_conv_out));
-  if (d_ssm_gate != nullptr)
-    LogCleanupError(hipFree(d_ssm_gate));
-  if (d_ssm_out != nullptr)
-    LogCleanupError(hipFree(d_ssm_out));
+  // A pass that threw mid-lease left the shared set pointed at.
+  EndPassScratch();
+  own_scratch_.Free();
+  shared_scratch_.reset();
   if (d_alpha_buf != nullptr)
     LogCleanupError(hipFree(d_alpha_buf));
   if (d_beta_buf != nullptr)
@@ -1205,14 +1345,8 @@ void QwenGpuArena::FreeAll() noexcept {
       LogCleanupError(hipFree(buffer));
   if (d_prompt_tokens != nullptr)
     LogCleanupError(hipFree(d_prompt_tokens));
-  if (d_scratch_bf16 != nullptr)
-    LogCleanupError(hipFree(d_scratch_bf16));
-  if (d_scratch_q8_act != nullptr)
-    LogCleanupError(hipFree(d_scratch_q8_act));
   if (d_split_k_attention != nullptr)
     LogCleanupError(hipFree(d_split_k_attention));
-  if (d_weights_bf16 != nullptr)
-    LogCleanupError(hipFree(d_weights_bf16));
   if (d_ssm_replay_qkv_ != nullptr)
     LogCleanupError(hipFree(d_ssm_replay_qkv_));
   if (d_ssm_replay_alpha_ != nullptr)

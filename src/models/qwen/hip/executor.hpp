@@ -2,6 +2,7 @@
 #define GUFO_MODELS_QWEN_HIP_EXECUTOR_HPP_
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -249,11 +250,69 @@ template<typename T>
 }
 
 /// Preallocated, zero-allocation GPU execution arena on gfx1151.
+/// The buffers of one forward pass that grow with its rows: activations,
+/// projections and the BF16/Q8 GEMM inputs. Their contents live for one pass
+/// only. A session owns a set; with a QwenSharedPassScratch its own set holds
+/// only the rows of a single-token decode, and wider passes lease the shared
+/// set, which holds the widest pass's rows for every session.
+struct QwenPassScratchSet {
+  std::size_t rows{0};
+  float* hidden{nullptr};
+  float* normed{nullptr};
+  float* q{nullptr};
+  float* k{nullptr};
+  float* v{nullptr};
+  float* attn_out{nullptr};
+  float* ffn_gate{nullptr};
+  float* ffn_up{nullptr};
+  float* ffn_act{nullptr};
+  float* ffn_out{nullptr};
+  float* ssm_qkv{nullptr};
+  float* conv_out{nullptr};
+  float* ssm_gate{nullptr};
+  float* ssm_out{nullptr};
+  void* bf16{nullptr};
+  void* q8_act{nullptr};
+  /// The largest layer weight in BF16 (prefill dequantization, packed batch
+  /// FFN); rows do not change it. Null in a session set that leases.
+  hip_bfloat16* weights_bf16{nullptr};
+
+  [[nodiscard]] static QwenPassScratchSet Allocate(
+      const core::ModelConfig& config, std::size_t rows, bool weights);
+  [[nodiscard]] static std::size_t Bytes(const core::ModelConfig& config,
+                                         std::size_t rows, bool weights);
+  void Free() noexcept;
+};
+
+/// One pass scratch set for every session of a runner, leased by one pass at
+/// a time (passes run one at a time). The next lessee's stream waits for the
+/// previous pass's work on it. Leasing it while leased is a scheduling error
+/// and throws.
+class QwenSharedPassScratch {
+public:
+  QwenSharedPassScratch(const core::ModelConfig& config,
+                        std::uint32_t max_context);
+  ~QwenSharedPassScratch();
+  QwenSharedPassScratch(const QwenSharedPassScratch&) = delete;
+  QwenSharedPassScratch& operator=(const QwenSharedPassScratch&) = delete;
+
+  [[nodiscard]] std::size_t rows() const noexcept { return set_.rows; }
+  [[nodiscard]] std::size_t bytes() const noexcept { return bytes_; }
+
+private:
+  friend class QwenGpuArena;
+  QwenPassScratchSet set_;
+  std::size_t bytes_{0};
+  hipEvent_t released_{nullptr};
+  std::atomic<bool> leased_{false};
+};
+
 class QwenGpuArena {
 public:
   explicit QwenGpuArena(
       const core::ModelConfig& config, std::uint32_t max_context = 4096,
-      QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
+      QwenExecutionPolicy policy = QwenExecutionPolicy::Production(),
+      std::shared_ptr<QwenSharedPassScratch> shared_scratch = nullptr);
   ~QwenGpuArena();
 
   QwenGpuArena(const QwenGpuArena&) = delete;
@@ -330,6 +389,29 @@ public:
   hip_bfloat16* d_weights_bf16{nullptr};
   void* d_scratch_q8_act{nullptr};
 
+  /// Session pass scratch rows with a shared pass scratch: a single-token
+  /// decode; batched decode and verification lease the shared set.
+  static constexpr std::uint32_t kSessionScratchRows = 64;
+  /// Rows the current pass scratch holds: the shared set's while leased.
+  [[nodiscard]] std::size_t GetScratchRows() const noexcept {
+    return scratch_leased_ ? shared_scratch_->rows() : own_scratch_.rows;
+  }
+  [[nodiscard]] std::size_t GetOwnScratchRows() const noexcept {
+    return own_scratch_.rows;
+  }
+  [[nodiscard]] float* GetOwnHidden() const noexcept {
+    return own_scratch_.hidden;
+  }
+  [[nodiscard]] bool IsScratchLeased() const noexcept {
+    return scratch_leased_;
+  }
+  /// Points this arena's pass buffers at the shared set until
+  /// EndPassScratch. False, with nothing changed, without a shared set or
+  /// when this arena holds it already (a nested pass). Throws
+  /// std::logic_error when another arena holds it.
+  [[nodiscard]] bool BeginPassScratch();
+  void EndPassScratch() noexcept;
+
   [[nodiscard]] std::uint32_t GetMaxBatch() const noexcept {
     return max_batch_;
   }
@@ -345,9 +427,12 @@ public:
       const noexcept {
     return policy_.recurrent_state_storage;
   }
+  /// `shared_scratch`: the session's own pass scratch only
+  /// (kSessionScratchRows); the shared set is the runner's.
   [[nodiscard]] static QwenGpuMemoryUsage EstimateMemoryUsage(
       const core::ModelConfig& config, std::uint32_t max_context,
-      QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
+      QwenExecutionPolicy policy = QwenExecutionPolicy::Production(),
+      bool shared_scratch = false);
   [[nodiscard]] static std::size_t RecurrentStateBytes(
       const core::ModelConfig& config, QwenExecutionPolicy policy);
   [[nodiscard]] QwenGpuMemoryUsage GetMemoryUsage() const;
@@ -359,8 +444,9 @@ public:
   void RestoreSnapshot(const QwenGpuSnapshot& snapshot);
   void RestoreCompactSnapshot(std::span<const std::uint8_t> payload,
                               std::uint32_t expected_valid_context);
-  [[nodiscard]] QwenGpuScratchView GetScratchView(
-      std::size_t batch_size = 1) noexcept;
+  /// Throws std::logic_error past GetScratchRows(): a wide pass must lease
+  /// the shared pass scratch first.
+  [[nodiscard]] QwenGpuScratchView GetScratchView(std::size_t batch_size = 1);
   void SetTargetLayerCapture(std::span<const std::uint32_t> target_layer_ids);
   [[nodiscard]] std::span<const std::uint32_t> GetTargetLayerCapture()
       const noexcept {
@@ -376,6 +462,7 @@ private:
   void AllocateRecurrentSnapshot();
   void SyncLivePointers() noexcept;
   [[nodiscard]] bool AllocateSsmReplayLog();
+  void PointPassScratch(const QwenPassScratchSet& set) noexcept;
 
   core::ModelConfig config_;
   std::uint32_t max_context_;
@@ -400,15 +487,21 @@ private:
   std::size_t replay_captured_positions_{0};
   bool has_saved_state_{false};
   bool replay_capture_active_{false};
+  QwenPassScratchSet own_scratch_;
+  std::shared_ptr<QwenSharedPassScratch> shared_scratch_;
+  bool scratch_leased_{false};
 };
 
 /// End-to-end GPU model executor running directly on the gfx1151 RDNA 3.5 CUs.
 class QwenGpuExecutor {
 public:
+  /// `pass_scratch`: a prompt-pass scratch shared with other executors; null:
+  /// the executor owns a full set.
   explicit QwenGpuExecutor(
       std::shared_ptr<const QwenGpuModel> model,
       std::uint32_t max_context = 4096,
-      QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
+      QwenExecutionPolicy policy = QwenExecutionPolicy::Production(),
+      std::shared_ptr<QwenSharedPassScratch> pass_scratch = nullptr);
   ~QwenGpuExecutor();
 
   [[nodiscard]] static std::unique_ptr<QwenGpuExecutor> Create(
@@ -555,7 +648,8 @@ public:
   }
   [[nodiscard]] static QwenGpuMemoryUsage EstimateMemoryUsage(
       const core::ModelConfig& config, std::uint32_t max_context,
-      QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
+      QwenExecutionPolicy policy = QwenExecutionPolicy::Production(),
+      bool shared_scratch = false);
   [[nodiscard]] QwenGpuMemoryUsage GetMemoryUsage() const;
   void SetCancellationCheck(std::function<bool()> check) {
     cancellation_check_ = std::move(check);
@@ -592,6 +686,26 @@ private:
   models::qwen::ContinuationHooks* continuation_hooks_{nullptr};
   void CheckPrefillCancellation() const;
   void PrefillLayerCheckpoint(std::uint32_t layer);
+  /// Leases the shared pass scratch for one prompt, verification or batched
+  /// decode pass when the executor has one. On release the hidden rows later
+  /// calls read (the pass's last row, or a batch's first rows) move back to
+  /// the session's own set.
+  class PassScratchLease {
+  public:
+    explicit PassScratchLease(QwenGpuExecutor& executor)
+        : executor_(executor), leased_(executor.arena_.BeginPassScratch()) {}
+    ~PassScratchLease() {
+      if (leased_)
+        executor_.ReturnPassScratch();
+    }
+    PassScratchLease(const PassScratchLease&) = delete;
+    PassScratchLease& operator=(const PassScratchLease&) = delete;
+
+  private:
+    QwenGpuExecutor& executor_;
+    bool leased_;
+  };
+  void ReturnPassScratch() noexcept;
   std::function<bool()> cancellation_check_;
   std::array<hipEvent_t, 2> prefill_events_{};
   void CheckReset() const {

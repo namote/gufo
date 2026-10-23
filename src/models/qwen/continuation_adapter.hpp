@@ -29,7 +29,8 @@ public:
       hip::QwenExecutionPolicy = hip::QwenExecutionPolicy::Production(),
       std::shared_ptr<const hip::QwenDFlashGpuModel> draft_model = nullptr,
       hip::QwenDFlashGpuDraftConfig draft_config = {},
-      cache::ResourceLedger* ledger = nullptr);
+      cache::ResourceLedger* ledger = nullptr,
+      std::shared_ptr<hip::QwenSharedPassScratch> pass_scratch = nullptr);
   ~ContinuationAdapter() override;
   [[nodiscard]] hip::QwenGpuExecutor& GetExecutor(cache::Slot&);
   [[nodiscard]] hip::QwenDFlashGpuDraftBackend* GetDraftBackend(cache::Slot&);
@@ -109,6 +110,8 @@ private:
   std::shared_ptr<const hip::QwenGpuModel> model_;
   std::shared_ptr<const hip::QwenDFlashGpuModel> draft_model_;
   hip::QwenDFlashGpuDraftConfig draft_config_;
+  // One prompt-pass scratch for every slot's executor; null: each owns one.
+  std::shared_ptr<hip::QwenSharedPassScratch> pass_scratch_;
   // Charged for each slot's pinned prompt capture; outlives the slots.
   cache::ResourceLedger* ledger_;
   std::atomic<std::size_t> pinned_capture_bytes_{};

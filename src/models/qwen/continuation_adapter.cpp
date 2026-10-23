@@ -260,10 +260,12 @@ ContinuationAdapter::ContinuationAdapter(
     std::shared_ptr<const hip::QwenGpuModel> model, std::uint32_t context,
     cache::Identity identity, hip::QwenExecutionPolicy policy,
     std::shared_ptr<const hip::QwenDFlashGpuModel> draft_model,
-    hip::QwenDFlashGpuDraftConfig draft_config, cache::ResourceLedger* ledger)
+    hip::QwenDFlashGpuDraftConfig draft_config, cache::ResourceLedger* ledger,
+    std::shared_ptr<hip::QwenSharedPassScratch> pass_scratch)
     : model_(std::move(model)),
       draft_model_(std::move(draft_model)),
       draft_config_(draft_config),
+      pass_scratch_(std::move(pass_scratch)),
       ledger_(ledger),
       policy_(policy),
       context_(context),
@@ -397,8 +399,8 @@ cache::Identity ContinuationAdapter::CompatibilityIdentity() const {
 }
 std::unique_ptr<cache::Slot> ContinuationAdapter::CreateSlot(
     cache::MutationGuard& guard) {
-  auto executor =
-      std::make_unique<hip::QwenGpuExecutor>(model_, context_, policy_);
+  auto executor = std::make_unique<hip::QwenGpuExecutor>(
+      model_, context_, policy_, pass_scratch_);
   // Prepare the rollback pair before readiness. Pinning the current buffer
   // for a prefill pass then requires neither an allocation nor a state copy.
   executor->arena_.AllocateRecurrentSnapshot();
