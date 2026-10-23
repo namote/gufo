@@ -496,13 +496,14 @@ struct ComponentTextCache::Impl {
     std::copy_n(bytes.begin(), file.size(), file.begin());
     return file;
   }
-  std::size_t Persist(std::shared_ptr<const cache::Checkpoint> checkpoint) {
+  std::size_t Persist(std::shared_ptr<const cache::Checkpoint> checkpoint,
+                      bool write_back = false) {
     // Grid captures support RAM edits during prefill. Persist semantic prompt
     // and learned boundaries: an early grid must not consume the spacing
     // allowance of the first complete turn.
     if (!queue || checkpoint->Purpose() == cache::CheckpointPurpose::kGrid)
       return 0;
-    {
+    if (!write_back) {
       const std::lock_guard lock(mutex);
       auto compatible_prefix = [&](const auto& tokens, const auto& input) {
         return input == checkpoint->Input() &&
@@ -971,7 +972,16 @@ ComponentTextCache::ComponentTextCache(
     : impl_(std::make_unique<Impl>(std::move(runner), count, ram,
                                    std::max(ram, ceiling), disk,
                                    automatic_ram)) {}
-ComponentTextCache::~ComponentTextCache() = default;
+ComponentTextCache::~ComponentTextCache() {
+  // Graceful shutdown: once queued checkpoints are durable, write the live
+  // frontiers no checkpoint covers, sharing those checkpoints' chunks. A
+  // conversation stopped right after its turn otherwise resumes at its prompt
+  // boundary. ~Impl drains these writes.
+  if (!impl_->queue)
+    return;
+  impl_->queue->Drain();
+  (void)WriteBackIdle(std::chrono::milliseconds::zero());
+}
 std::size_t ComponentTextCache::capacity() const noexcept {
   return impl_->entries.size();
 }
@@ -982,10 +992,22 @@ void ComponentTextCache::CaptureBeforeReset(std::size_t index,
                                             cache::Identity input) noexcept {
   auto* entry = impl_->entries[index].get();
   const auto started = Clock::now();
+  // A write-back still queued from this slot fails once the reset retires the
+  // rows it observes: without a durable checkpoint covering the frontier, the
+  // capture goes to disk itself, as the write-back would have.
+  bool write_back;
+  {
+    const std::lock_guard lock(impl_->mutex);
+    write_back = impl_->queue &&
+                 (!entry->durable || entry->durable->Manifest().tokens.size() +
+                                             Impl::kUncoveredCaptureTokens <=
+                                         tokens.size());
+  }
   try {
     Lease lease(std::make_unique<Lease::Impl>(
         impl_.get(), entry, entry->slot->Acquire(location), tokens,
         cache::InputIdentity(tokens.size(), input), tokens.size()));
+    lease.impl_->write_back = write_back;
     // Retry priority: the copy may only displace other optional copies, and
     // is the first to go when prompt or shared checkpoints need the RAM.
     std::size_t bytes = 0;
@@ -1052,6 +1074,28 @@ std::size_t ComponentTextCache::WriteBackIdle(
           now - entry->idle_since < idle_for ||
           size < Impl::kUncoveredCaptureTokens ||
           (covered && covered + Impl::kUncoveredCaptureTokens > size))
+        continue;
+      // A frontier extending a checkpoint of its own lineage still queued
+      // would write that checkpoint's chunks again: wait until it is durable
+      // (or dropped). The cache destructor writes what is still waiting.
+      const cache::InputIdentity live(size, entry->live_input);
+      const auto extends = [&](const auto& prefix, const auto& prefix_input) {
+        return prefix.size() < size &&
+               At(live, prefix.size()) == prefix_input &&
+               std::equal(prefix.begin(), prefix.end(),
+                          entry->live_tokens.begin());
+      };
+      if (std::ranges::any_of(
+              impl_->pending,
+              [&](const auto& checkpoint) {
+                return checkpoint &&
+                       checkpoint->Lineage() == entry->history->Lineage() &&
+                       extends(checkpoint->Tokens(), checkpoint->Input());
+              }) ||
+          std::ranges::any_of(impl_->pending_durable, [&](const auto& capture) {
+            return capture && capture->branch == entry->branch &&
+                   extends(capture->manifest.tokens, capture->manifest.input);
+          }))
         continue;
       entry->busy = true;
       location = entry->live_location;
@@ -1966,7 +2010,7 @@ std::size_t ComponentTextCache::Lease::PublishSnapshot(
   try {
     const auto started = Clock::now();
     impl_->metrics.disk_queued_bytes +=
-        impl_->cache->Persist(component->checkpoint);
+        impl_->cache->Persist(component->checkpoint, impl_->write_back);
     impl_->metrics.disk_enqueue_ms +=
         std::chrono::duration<double, std::milli>(Clock::now() - started)
             .count();

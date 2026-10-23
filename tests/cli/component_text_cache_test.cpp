@@ -2002,9 +2002,10 @@ void ColdAssignmentCapturesUncoveredFrontier() {
 }
 void IdleWriteBackResumesFromLastTurn() {
   // A finished turn leaves only a live frontier (no checkpoint at its end).
-  // Without the idle write-back a restart finds nothing; with it the next
-  // turn restores the whole frontier from disk, although it lies within the
-  // disk step of nothing published, and the live frontier stays usable.
+  // The idle write-back, or else the shutdown pass of the destructor, puts
+  // it on disk: the next turn after a restart restores the whole frontier,
+  // although it lies within the disk step of nothing published, and the live
+  // frontier stays usable meanwhile.
   std::vector<TextRunnerToken> conversation(100);
   std::iota(conversation.begin(), conversation.end(), 10);
   auto next = conversation;
@@ -2055,10 +2056,7 @@ void IdleWriteBackResumesFromLastTurn() {
     auto runner = std::make_shared<Runner>();
     ComponentTextCache cache(runner, 2, 1 << 22, disk);
     const auto [cached, disk_hit] = turn(cache, *runner, next);
-    if (write_back)
-      assert(cached == conversation.size() && disk_hit);
-    else
-      assert(cached == 0);
+    assert(cached == conversation.size() && disk_hit);
     std::filesystem::remove_all(directory);
   }
 }
@@ -2136,8 +2134,129 @@ void WriteBackReusesPersistedChunks() {
   assert(files() - first < first + first / 2);
   std::filesystem::remove_all(directory);
 }
+void ShutdownWriteBackSharesQueuedCheckpoint() {
+  // A turn ends while its prompt checkpoint may still be queued; the server
+  // stops at once. The destructor drains the queue first, so the frontier's
+  // write-back reuses that checkpoint's chunk files, and a restart resumes at
+  // the frontier.
+  std::vector<TextRunnerToken> prompt(200);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  const std::vector<TextRunnerToken> head(prompt.begin(), prompt.begin() + 100);
+  const auto run = [&](bool extend) {
+    char pattern[] = "/tmp/gufo-component-shutdown-write-back-XXXXXX";
+    const std::filesystem::path directory = mkdtemp(pattern);
+    const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                          .capacity_bytes = 1 << 22,
+                                          .staging_capacity_bytes = 7};
+    {
+      auto runner = std::make_shared<Runner>();
+      ComponentTextCache cache(runner, 2, 1 << 22, disk);
+      {
+        auto lease = cache.Acquire(head, {}, {}, true, 0, true);
+        auto& state = dynamic_cast<State&>(lease->state());
+        runner->adapter->Append(state.slot, head, head);
+        assert(lease->TryReserveSnapshot(lease->CaptureBytes(), head.size(),
+                                         false, SnapshotPurpose::kContinuation,
+                                         {}));
+        (void)lease->Commit(head, lease->Capture(), head);
+      }
+      if (extend) {
+        auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+        assert(lease->cached_tokens() == head.size());
+        auto& state = dynamic_cast<State&>(lease->state());
+        const auto tail = std::span(prompt).subspan(head.size());
+        runner->adapter->Append(state.slot, tail, tail);
+        (void)lease->Commit({}, {}, prompt);
+      }
+    }
+    std::size_t files = 0;
+    for (const auto& f :
+         std::filesystem::recursive_directory_iterator(directory))
+      files += f.is_regular_file();
+    auto runner = std::make_shared<Runner>();
+    std::size_t cached;
+    bool disk_hit;
+    {
+      ComponentTextCache cache(runner, 2, 1 << 22, disk);
+      auto next = extend ? prompt : head;
+      next.push_back(7);
+      auto lease = cache.Acquire(next, {}, {}, true, 0, true);
+      cached = lease->cached_tokens();
+      disk_hit = lease->restored_from_disk();
+      lease->Invalidate();
+    }
+    std::filesystem::remove_all(directory);
+    return std::tuple{files, cached, disk_hit};
+  };
+  const auto [first, head_cached, head_hit] = run(false);
+  assert(head_cached == head.size() && head_hit);
+  const auto [files, cached, disk_hit] = run(true);
+  assert(cached == prompt.size() && disk_hit);
+  // Twice the rows: about twice the files with reuse, three times without.
+  assert(files < first * 2 + first / 2);
+}
+void ReassignmentWritesUncoveredFrontier() {
+  // The prompt boundary (100) is on disk; the next turn's 200-token frontier
+  // lies within the disk step of it. When the only slot goes to another
+  // prompt, the frontier captured there goes to disk too, so a restart
+  // resumes at 200 rather than at the prompt boundary.
+  char pattern[] = "/tmp/gufo-component-reassignment-write-XXXXXX";
+  const std::filesystem::path directory = mkdtemp(pattern);
+  const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                        .capacity_bytes = 1 << 22,
+                                        .staging_capacity_bytes = 7};
+  std::vector<TextRunnerToken> conversation(200);
+  std::iota(conversation.begin(), conversation.end(), 10);
+  const std::vector<TextRunnerToken> head(conversation.begin(),
+                                          conversation.begin() + 100);
+  const std::vector<TextRunnerToken> side(12, 5);
+  {
+    auto runner = std::make_shared<Runner>();
+    ComponentTextCache cache(runner, 1, 1 << 22, disk);
+    const auto run = [&](const std::vector<TextRunnerToken>& tokens) {
+      auto lease = cache.Acquire(tokens, {}, {}, true, 0, true);
+      const auto cached = lease->cached_tokens();
+      const auto completed = lease->Metrics().persistence->completed;
+      auto& state = dynamic_cast<State&>(lease->state());
+      const auto tail = std::span(tokens).subspan(cached);
+      runner->adapter->Append(state.slot, tail, tail);
+      (void)lease->Commit({}, {}, tokens);
+      return std::pair{cached, completed};
+    };
+    {
+      auto lease = cache.Acquire(head, {}, {}, true, 0, true);
+      auto& state = dynamic_cast<State&>(lease->state());
+      runner->adapter->Append(state.slot, head, head);
+      assert(lease->TryReserveSnapshot(lease->CaptureBytes(), head.size(),
+                                       false, SnapshotPurpose::kContinuation,
+                                       {}));
+      (void)lease->Commit(head, lease->Capture(), head);
+    }
+    std::uint64_t completed = 0;
+    for (int i = 0; i < 500 && completed == 0; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      completed = run(side).second;
+    }
+    assert(completed == 1);
+    assert(run(conversation).first == head.size());
+    (void)run(side);
+  }
+  auto runner = std::make_shared<Runner>();
+  {
+    ComponentTextCache cache(runner, 1, 1 << 22, disk);
+    auto next = conversation;
+    next.push_back(7);
+    auto lease = cache.Acquire(next, {}, {}, true, 0, true);
+    assert(lease->cached_tokens() == conversation.size() &&
+           lease->restored_from_disk());
+    lease->Invalidate();
+  }
+  std::filesystem::remove_all(directory);
+}
 int main() {
+  ReassignmentWritesUncoveredFrontier();
   ColdAssignmentCapturesUncoveredFrontier();
+  ShutdownWriteBackSharesQueuedCheckpoint();
   IdleWriteBackResumesFromLastTurn();
   RefusedCaptureIsKnownBeforePrefill();
   WriteBackReusesPersistedChunks();
