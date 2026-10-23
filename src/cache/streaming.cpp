@@ -95,9 +95,12 @@ void Accumulate(TransferTiming& destination, const TransferTiming& source) {
 }
 // Cold checkpoints are thousands of small files, and one thread hinting them
 // in turn waits on each: 0.4 GB/s on gfx1151's NVMe, against 3.2 GB/s for four
-// helpers (measured). Helpers hint whole files up to a bounded byte window
-// ahead of the reader, which still reads, checks and copies every file in
-// order.
+// helpers (measured). A WILLNEED hint (or readahead(2)) still left the reader
+// at 0.65 GB/s on cold 512 KiB chunk files: it waited on almost every file.
+// Helpers that read each file through a small scratch buffer leave it in the
+// page cache: 1.9 GB/s with four, 4.1 GB/s with eight (measured, U5). Helpers
+// warm whole files up to a bounded byte window ahead of the reader, which
+// still reads, checks and copies every file in order.
 class Prefetcher {
 public:
   struct Item {
@@ -124,8 +127,10 @@ public:
   }
 
 private:
-  static constexpr std::uint64_t kWindowBytes = 32 << 20;
+  static constexpr std::uint64_t kWindowBytes = 64 << 20;
+  static constexpr std::size_t kScratchBytes = 256 << 10;
   void Run(std::stop_token stop) {
+    std::vector<std::uint8_t> scratch(kScratchBytes);
     while (true) {
       std::size_t i;
       {
@@ -139,7 +144,8 @@ private:
       }
       try {
         disk_.PrefetchPayload(snapshot_, items_[i].private_file,
-                              *items_[i].payload, items_[i].payload->bytes);
+                              *items_[i].payload, items_[i].payload->bytes,
+                              scratch);
       } catch (...) {
         // A hint only; the reader validates every dependency it reads.
       }
@@ -152,7 +158,7 @@ private:
   std::mutex mutex_;
   std::condition_variable_any wake_;
   std::size_t next_{}, reader_{};
-  std::array<std::jthread, 4> threads_;
+  std::array<std::jthread, 8> threads_;
 };
 bool SameJob(const DiskManifest& a, const DiskManifest& b) {
   if (a.checkpoint != b.checkpoint || a.lineage != b.lineage ||

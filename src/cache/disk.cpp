@@ -1586,8 +1586,8 @@ std::optional<DiskSnapshot> DiskStore::Open(CheckpointId id) const {
   return {};
 }
 void DiskStore::PrefetchPayload(const DiskSnapshot& snapshot, bool private_file,
-                                const DiskPayload& payload,
-                                std::uint64_t bytes) const {
+                                const DiskPayload& payload, std::uint64_t bytes,
+                                std::span<std::uint8_t> scratch) const {
   if (snapshot.store_ != impl_.get() || !snapshot.pin_ ||
       !Contains(snapshot.manifest_, private_file, payload) ||
       bytes > std::uint64_t(std::numeric_limits<off_t>::max()))
@@ -1600,9 +1600,24 @@ void DiskStore::PrefetchPayload(const DiskSnapshot& snapshot, bool private_file,
   Fd file(openat(directory, DiskFileName(payload.file).c_str(),
                  O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK));
   struct stat status{};
-  if (file.Get() >= 0 && fstat(file.Get(), &status) == 0 && Regular(status))
+  if (file.Get() < 0 || fstat(file.Get(), &status) != 0 || !Regular(status))
+    return;
+  if (scratch.empty()) {
     (void)posix_fadvise(file.Get(), 0, static_cast<off_t>(bytes),
                         POSIX_FADV_WILLNEED);
+    return;
+  }
+  for (std::uint64_t offset = 0; offset < bytes;) {
+    const auto n =
+        pread(file.Get(), scratch.data(),
+              std::min<std::uint64_t>(scratch.size(), bytes - offset),
+              static_cast<off_t>(offset));
+    if (n < 0 && errno == EINTR)
+      continue;
+    if (n <= 0)
+      return;
+    offset += static_cast<std::uint64_t>(n);
+  }
 }
 DiskReadStats DiskStore::ReadPayload(
     const DiskSnapshot& snapshot, bool private_file, const DiskPayload& payload,
