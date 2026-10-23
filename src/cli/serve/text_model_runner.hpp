@@ -1,6 +1,7 @@
 #ifndef GUFO_SERVER_TEXT_MODEL_RUNNER_HPP_
 #define GUFO_SERVER_TEXT_MODEL_RUNNER_HPP_
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -673,7 +674,7 @@ public:
   [[nodiscard]] std::size_t AdmissionRowBlocks(std::size_t rows) const;
   /// Writes idle sessions' live frontiers to the disk cache (component cache
   /// with a disk cache only). Call only while no request runs.
-  std::size_t WriteBackIdle() noexcept;
+  std::size_t WriteBackIdle(std::chrono::milliseconds idle_for) noexcept;
   [[nodiscard]] TextExecutionPlan SelectDecodePlan(
       std::size_t ready_requests) const;
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
