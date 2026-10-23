@@ -852,6 +852,11 @@ struct TextRunnerPool::Request::Impl {
         stable_prefix_position = count;
       count = prefill_offset;
     }
+    // Stopping prefill at a stable boundary costs a pass over the whole
+    // context; skip it when that checkpoint could not be stored anyway.
+    if (stable_prefix_position && lease.component() &&
+        lease.CaptureRefused(stable_prefix_position))
+      stable_prefix_position = 0;
     if (lease.restored_from_disk() && prefill_offset == prompt.size())
       count = prompt.size();
     // Cancellation can leave a component live frontier past the stable
@@ -1894,6 +1899,10 @@ bool TextRunnerPool::AdmissionReady(std::span<const TextRunnerToken> prompt,
   return impl_->component_cache->ReclaimRows(prompt, [&] {
     return runner.RowBlocks().free_blocks >= need;
   }) != ComponentTextCache::RowReclaim::kWaiting;
+}
+
+std::size_t TextRunnerPool::WriteBackIdle() noexcept {
+  return impl_->component_cache ? impl_->component_cache->WriteBackIdle() : 0;
 }
 
 void TextRunnerPool::Request::ReserveRows(std::size_t max_new_tokens) {

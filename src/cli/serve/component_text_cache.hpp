@@ -88,6 +88,9 @@ public:
     void Invalidate() noexcept;
     [[nodiscard]] std::size_t CaptureBytes() const;
     [[nodiscard]] std::size_t CaptureBytes(std::size_t boundary) const;
+    // True when a capture at `boundary` exceeds the RAM budget and the disk
+    // would not take it either (no disk cache, or within the disk step).
+    [[nodiscard]] bool CaptureRefused(std::size_t boundary) const;
     [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Capture();
     void PreparePrefill(std::size_t tokens);
     [[nodiscard]] ComponentCacheMetrics Metrics() const;
@@ -136,6 +139,12 @@ public:
   // `enough` runs without the cache lock.
   [[nodiscard]] RowReclaim ReclaimRows(std::span<const ContinuationToken>,
                                        const std::function<bool()>& enough);
+  // With a disk cache, writes the live frontier of every idle slot that no
+  // disk checkpoint covers within kUncoveredCaptureTokens to disk, so a
+  // restart resumes from the last turn instead of its prompt boundary. The
+  // write shares the frontier's lineage chunks and is not limited by the
+  // disk step. Call only while no request runs; returns the slots queued.
+  std::size_t WriteBackIdle() noexcept;
 
 private:
   // Captures the idle live frontier of slot `index` (leased exactly at
@@ -184,6 +193,7 @@ public:
   void Invalidate() noexcept;
   [[nodiscard]] std::size_t CaptureBytes() const;
   [[nodiscard]] std::size_t CaptureBytes(std::size_t boundary) const;
+  [[nodiscard]] bool CaptureRefused(std::size_t boundary) const;
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Capture();
   void PreparePrefill(std::size_t tokens);
   [[nodiscard]] std::optional<ComponentCacheMetrics> Metrics() const;

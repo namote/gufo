@@ -2000,8 +2000,88 @@ void ColdAssignmentCapturesUncoveredFrontier() {
   (void)run(std::vector<TextRunnerToken>(12, 8));
   assert(runner->captures == before);
 }
+void IdleWriteBackResumesFromLastTurn() {
+  // A finished turn leaves only a live frontier (no checkpoint at its end).
+  // Without the idle write-back a restart finds nothing; with it the next
+  // turn restores the whole frontier from disk, although it lies within the
+  // disk step of nothing published, and the live frontier stays usable.
+  std::vector<TextRunnerToken> conversation(100);
+  std::iota(conversation.begin(), conversation.end(), 10);
+  auto next = conversation;
+  next.push_back(7);
+  const auto turn = [](ComponentTextCache& cache, Runner& runner,
+                       const std::vector<TextRunnerToken>& tokens) {
+    auto lease = cache.Acquire(tokens, {}, {}, true, 0, true);
+    const auto cached = lease->cached_tokens();
+    const bool disk_hit = lease->restored_from_disk();
+    auto& state = dynamic_cast<State&>(lease->state());
+    const auto tail = std::span(tokens).subspan(cached);
+    runner.adapter->Append(state.slot, tail, tail);
+    (void)lease->Commit({}, {}, tokens);
+    return std::pair{cached, disk_hit};
+  };
+  for (const bool write_back : {false, true}) {
+    char pattern[] = "/tmp/gufo-component-write-back-test-XXXXXX";
+    const std::filesystem::path directory = mkdtemp(pattern);
+    const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                          .capacity_bytes = 1 << 22,
+                                          .staging_capacity_bytes = 7};
+    {
+      auto runner = std::make_shared<Runner>();
+      ComponentTextCache cache(runner, 2, 1 << 22, disk);
+      (void)turn(cache, *runner, conversation);
+      if (write_back) {
+        assert(cache.WriteBackIdle() == 1);
+        assert(cache.WriteBackIdle() == 0);
+        // Persistence runs only while no lease is held: look in from the
+        // other slot between waits (a short side prompt, never written back).
+        const std::vector<TextRunnerToken> side(12, 5);
+        std::size_t completed = 0;
+        for (int i = 0; i < 500 && completed == 0; ++i) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          auto peek = cache.Acquire(side, {}, {}, true, 0, true);
+          completed = peek->Metrics().persistence->completed;
+          (void)peek->Commit({}, {}, {});
+        }
+        assert(completed == 1);
+        // The live frontier still serves the next turn without a restore.
+        const auto [cached, disk_hit] = turn(cache, *runner, next);
+        assert(cached == conversation.size() && !disk_hit);
+        assert(cache.WriteBackIdle() == 0);
+      }
+    }
+    auto runner = std::make_shared<Runner>();
+    ComponentTextCache cache(runner, 2, 1 << 22, disk);
+    const auto [cached, disk_hit] = turn(cache, *runner, next);
+    if (write_back)
+      assert(cached == conversation.size() && disk_hit);
+    else
+      assert(cached == 0);
+    std::filesystem::remove_all(directory);
+  }
+}
+void RefusedCaptureIsKnownBeforePrefill() {
+  // Without a disk cache a boundary larger than the RAM budget is refused
+  // (asked before prefill reaches it, as the runner does); a short one that
+  // fits is not.
+  std::vector<TextRunnerToken> prompt(200000);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  auto runner = std::make_shared<Runner>();
+  ComponentTextCache cache(runner, 1, 1 << 20, {});
+  auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+  auto& state = dynamic_cast<State&>(lease->state());
+  const auto head = std::span(prompt).first(40);
+  runner->adapter->Append(state.slot, head, head);
+  assert(lease->CaptureBytes(prompt.size()) > (1 << 20));
+  assert(lease->CaptureRefused(prompt.size()));
+  assert(lease->CaptureBytes(100) <= (1 << 20));
+  assert(!lease->CaptureRefused(100));
+  lease->Invalidate();
+}
 int main() {
   ColdAssignmentCapturesUncoveredFrontier();
+  IdleWriteBackResumesFromLastTurn();
+  RefusedCaptureIsKnownBeforePrefill();
   PagedRowsAdmitWaitAndReclaim();
   PublishedResidentCheckpointKeepsDiskStep();
   CancelledPrefillKeepsCompletedSteps();
