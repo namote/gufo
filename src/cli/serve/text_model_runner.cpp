@@ -863,6 +863,13 @@ struct TextRunnerPool::Request::Impl {
     if (lease.component() && count > prefill_offset && count < prompt.size() &&
         lease.CaptureRefused(count))
       count = prompt.size();
+    // A nearby stable boundary is not worth its stop either: once captures
+    // are cheap it is no longer refused, and the stop costs a pass over the
+    // whole context each turn, while an edit inside the gap re-prefills at
+    // most kNearbyStableTokens from the reused frontier.
+    if (nearby_stable && lease.cache_hit() && prefill_offset != 0 &&
+        count < prompt.size())
+      count = prompt.size();
     if (lease.restored_from_disk() && prefill_offset == prompt.size())
       count = prompt.size();
     // Cancellation can leave a component live frontier past the stable

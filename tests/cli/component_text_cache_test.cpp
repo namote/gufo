@@ -2437,7 +2437,32 @@ void RowReclaimDropsRetainedCheckpoints() {
          lease->Metrics().reuse == "live");
   lease->Invalidate();
 }
+void NearbyStableBoundaryDoesNotSplitAContinuation() {
+  // A stable boundary within 64 tokens of the reused frontier is not worth a
+  // second pass; one further away still stops prefill for its checkpoint.
+  for (const std::size_t gap : {10, 100}) {
+    auto runner = std::make_shared<Runner>();
+    TextRunnerPool pool(runner, 1);
+    std::vector<TextRunnerToken> prompt(40);
+    std::iota(prompt.begin(), prompt.end(), 10);
+    auto first = pool.Acquire(prompt);
+    Prefill(first);
+    prompt.push_back(Generate(first));
+    first.Commit();
+    const auto cached = prompt.size();
+    for (std::size_t i = 0; i < gap + 20; ++i)
+      prompt.push_back(static_cast<TextRunnerToken>(1000 + i));
+    auto turn = pool.Acquire(prompt, {}, {}, {}, true, cached + gap);
+    assert(turn.cached_prompt_tokens() == cached);
+    const auto step = turn.Prefill(512);
+    assert(gap < 64 ? step.consumed_tokens == prompt.size() - cached &&
+                          step.decode_ready
+                    : step.consumed_tokens == gap && !step.decode_ready);
+    turn.Invalidate();
+  }
+}
 int main() {
+  NearbyStableBoundaryDoesNotSplitAContinuation();
   RetainedChunksTakeNoRamAndRestore();
   RetainedChunksReachDisk();
   RowReclaimDropsRetainedCheckpoints();
