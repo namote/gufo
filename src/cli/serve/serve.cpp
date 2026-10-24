@@ -609,6 +609,8 @@ void PrintServeHelp(std::string_view program_name,
         server::kDefaultMaxBufferedOutputBytesTotal;
     std::size_t cache_ram_bytes = 0;
     std::size_t kv_pool_bytes = 0;
+    std::size_t cache_tail_checkpoints =
+        server::TextRunnerRamCacheOptions{}.tail_checkpoints;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
@@ -729,6 +731,13 @@ void PrintServeHelp(std::string_view program_name,
         "full context). Must hold one full-context session; other models "
         "refuse it",
         "Cache", &kv_pool_bytes);
+    parser.AddOption(
+        "", "--cache-tail-checkpoints", "K",
+        "Long prompts also keep K RAM checkpoints, one every 1024 tokens over "
+        "the prompt end, for later prompts that differ only near the end; "
+        "applied where checkpoints keep KV rows as device references (paged "
+        "KV), logged as not applied otherwise (default: 3; 0 = none)",
+        "Cache", &cache_tail_checkpoints);
     parser.AddOption(
         "", "--cache-ram-bytes", "N",
         "Retained RAM-cache byte budget (default: 0 = auto: half of free "
@@ -1176,6 +1185,8 @@ int RunServe(std::span<const char* const> args) {
         server::kDefaultMaxBufferedOutputBytesTotal;
     std::size_t cache_ram_bytes = 0;
     std::size_t kv_pool_bytes = 0;
+    std::size_t cache_tail_checkpoints =
+        server::TextRunnerRamCacheOptions{}.tail_checkpoints;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
@@ -1292,6 +1303,13 @@ int RunServe(std::span<const char* const> args) {
         "full context). Must hold one full-context session; other models "
         "refuse it",
         "Cache", &kv_pool_bytes);
+    llm_parser.AddOption(
+        "", "--cache-tail-checkpoints", "K",
+        "Long prompts also keep K RAM checkpoints, one every 1024 tokens over "
+        "the prompt end, for later prompts that differ only near the end; "
+        "applied where checkpoints keep KV rows as device references (paged "
+        "KV), logged as not applied otherwise (default: 3; 0 = none)",
+        "Cache", &cache_tail_checkpoints);
     llm_parser.AddOption(
         "", "--cache-ram-bytes", "N",
         "Retained RAM-cache byte budget (default: 0 = auto: half of free "
@@ -1479,8 +1497,10 @@ int RunServe(std::span<const char* const> args) {
             .model_artifact_fingerprint = {},
         },
         vision_model_path,
-        server::TextRunnerRamCacheOptions{.capacity_bytes = cache_ram_bytes,
-                                          .kv_pool_bytes = kv_pool_bytes},
+        server::TextRunnerRamCacheOptions{
+            .capacity_bytes = cache_ram_bytes,
+            .kv_pool_bytes = kv_pool_bytes,
+            .tail_checkpoints = cache_tail_checkpoints},
         enable_yarn);
     loading.stop();
     if (!load_ok) {

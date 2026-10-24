@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "src/cache/retention.hpp"
 #include "src/cli/serve/component_text_cache.hpp"
 #include "src/cli/serve/continuation_disk_store.hpp"
 #include "src/cli/serve/logging.hpp"
@@ -651,6 +652,15 @@ struct TextRunnerPool::Impl {
       component_cache = std::make_unique<ComponentTextCache>(
           validated.runner, state_count, std::min(requested, ceiling),
           disk_cache_options, !ram_cache_options.capacity_bytes, ceiling);
+      tail_checkpoints = ram_cache_options.tail_checkpoints;
+      // Each tail checkpoint would otherwise copy every row up to it.
+      if (tail_checkpoints != 0 && !component_cache->CapturesShareRows()) {
+        Logger::Info("cache",
+                     "event=tail_checkpoints status=not_applied "
+                     "reason=checkpoints_copy_rows requested=" +
+                         std::to_string(tail_checkpoints));
+        tail_checkpoints = 0;
+      }
       if (disk_cache_options) {
         shared_prefix_min_tokens = disk_cache_options->shared_prefix_min_tokens;
         shared_prefix_max_boundaries =
@@ -669,6 +679,11 @@ struct TextRunnerPool::Impl {
         },
         MakeSnapshotSupport(&validated, ram_cache_options),
         TextRunnerRamCacheOptions::kMaxEntries);
+    if (ram_cache_options.tail_checkpoints != 0)
+      Logger::Info("cache",
+                   "event=tail_checkpoints status=not_applied "
+                   "reason=snapshots_copy_rows requested=" +
+                       std::to_string(ram_cache_options.tail_checkpoints));
     // Entry and byte limits constrain retention independently of session count.
     if (validated.descriptor.capabilities.snapshot) {
       // Report the same post-allocation limits that selected the capacity.
@@ -716,6 +731,7 @@ struct TextRunnerPool::Impl {
   std::timed_mutex admission_mutex;
   std::shared_ptr<ContinuationDiskStore> disk_store;
   std::size_t shared_prefix_min_tokens{0};
+  std::size_t tail_checkpoints{0};
   std::size_t shared_prefix_max_boundaries{0};
 };
 
@@ -812,7 +828,8 @@ struct TextRunnerPool::Request::Impl {
        std::vector<std::size_t> shared_prefix_boundaries,
        const sampling::SamplingConfig& sampling_config,
        std::shared_ptr<const TextPromptContext> prompt_context,
-       std::size_t cache_prefix_tokens, bool overlap_snapshots)
+       std::size_t cache_prefix_tokens, bool overlap_snapshots,
+       std::size_t tail_checkpoints = 0)
       : runner(std::move(model_runner)),
         disk_store(std::move(persistent_store)),
         lease(std::move(state_lease)),
@@ -917,8 +934,12 @@ struct TextRunnerPool::Request::Impl {
           checkpoints.push_back(position);
       }
     }
-    if (lease.component())
-      checkpoints = lease.PlannedCaptures(cache_prefix_tokens);
+    if (lease.component()) {
+      auto planned =
+          lease.PlannedCaptures(cache_prefix_tokens, tail_checkpoints);
+      checkpoints = std::move(planned.boundaries);
+      tail_positions = std::move(planned.tails);
+    }
   }
 
   ~Impl() {
@@ -1253,6 +1274,24 @@ struct TextRunnerPool::Request::Impl {
   std::vector<std::size_t> checkpoints;
   /// Checkpoints shared with other requests, retained like continuations.
   std::vector<std::size_t> shared_checkpoints;
+  /// Tail points among `checkpoints` (TextRunnerRamCacheOptions).
+  std::vector<std::size_t> tail_positions;
+
+  /// A checkpoint shared with peers at `position` serves later requests that
+  /// diverge there. Tail points within cache::kTailStep of it would only
+  /// leave a short pass between the two.
+  void DropTailCheckpointsNear(std::size_t position) {
+    constexpr std::size_t step = cache::kTailStep;
+    std::erase_if(tail_positions, [&](std::size_t tail) {
+      if (tail == position || tail <= prefill_offset ||
+          tail + step <= position || position + step <= tail)
+        return false;
+      if (const auto it = std::ranges::lower_bound(checkpoints, tail);
+          it != checkpoints.end() && *it == tail)
+        checkpoints.erase(it);
+      return true;
+    });
+  }
   bool boundary_capture{false};
   std::vector<TextRunnerToken> generated;
   std::size_t prefill_offset{0};
@@ -1451,8 +1490,10 @@ std::size_t TextRunnerPool::Request::ShareCheckpoint(
   if (position == target && !std::ranges::binary_search(checkpoints, target))
     checkpoints.insert(std::ranges::upper_bound(checkpoints, target), target);
   // Prompt snapshots are retained as continuation boundaries already.
-  if (std::ranges::binary_search(checkpoints, position))
+  if (std::ranges::binary_search(checkpoints, position)) {
     impl_->shared_checkpoints.push_back(position);
+    impl_->DropTailCheckpointsNear(position);
+  }
   return position;
 }
 
@@ -2140,7 +2181,8 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
     Request request(std::make_unique<Request::Impl>(
         impl_->validated.runner, nullptr, ServingCacheLease(std::move(lease)),
         std::move(prompt), std::vector<std::size_t>{}, sampling_config,
-        std::move(context), cache_prefix_tokens, capacity() > 1));
+        std::move(context), cache_prefix_tokens, capacity() > 1,
+        impl_->tail_checkpoints));
     request.impl_->cancelled = is_cancelled;
     if (reuse_prompt) {
       const auto common = impl_->component_cache->CachedPrefixTokens(
