@@ -143,7 +143,8 @@ private:
   struct RetainedBlock;
   mutable std::mutex retained_mutex_;
   mutable std::vector<std::weak_ptr<RetainedBlock>> retained_;
-  // Charged for each slot's pinned prompt capture; outlives the slots.
+  // Charged once for the pinned prompt capture the slots share; outlives the
+  // slots.
   cache::ResourceLedger* ledger_;
   std::shared_ptr<hip::PromptHiddenPinned> prompt_pages_ =
       std::make_shared<hip::PromptHiddenPinned>();

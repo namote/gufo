@@ -188,8 +188,12 @@ struct ComponentTextCache::Impl {
     // When the live frontier was last committed.
     Clock::time_point idle_since{};
     // Length of the live frontier last queued by WriteBackIdle; reset with
-    // the lineage (durable) when the slot starts another execution.
+    // the lineage (durable) when the slot starts another execution, and when
+    // that write fails.
     std::size_t written_back{};
+    // Length of the live frontier WriteBackIdle last tried, queued or not; it
+    // retries once the frontier grows kUncoveredCaptureTokens past it.
+    std::size_t write_back_tried{};
   };
   // A live frontier this many tokens or more past every checkpoint of its
   // prompt is captured before its slot is reset for another request.
@@ -250,6 +254,8 @@ struct ComponentTextCache::Impl {
   // release their serving handles. No callback runs under the serving mutex.
   std::array<std::shared_ptr<const cache::Checkpoint>, 2 * kPersistenceDepth>
       pending;
+  // The execution (Entry::branch) each pending checkpoint was captured from.
+  std::array<std::shared_ptr<const void>, 2 * kPersistenceDepth> pending_branch;
   std::array<std::shared_ptr<DurableCapture>, 2 * kPersistenceDepth>
       pending_durable;
   std::size_t disk_capacity{}, disk_step{};
@@ -410,16 +416,26 @@ struct ComponentTextCache::Impl {
           },
           [this](cache::CheckpointId id, bool success) {
             const std::lock_guard lock(mutex);
-            for (auto& checkpoint : pending)
-              if (checkpoint && checkpoint->Id() == id)
-                checkpoint.reset();
+            std::shared_ptr<const void> branch;
+            for (std::size_t i = 0; i < pending.size(); ++i)
+              if (pending[i] && pending[i]->Id() == id) {
+                pending[i].reset();
+                branch = std::move(pending_branch[i]);
+              }
             std::shared_ptr<DurableCapture> completed;
             for (auto& capture : pending_durable)
               if (capture && capture->manifest.checkpoint == id) {
                 completed = capture;
+                branch = capture->branch;
                 capture.reset();
               }
             if (!success) {
+              // A failed write-back no longer covers its frontier.
+              if (completed && completed->write_back)
+                for (auto& entry : entries)
+                  if (entry->branch == completed->branch &&
+                      entry->written_back == completed->manifest.tokens.size())
+                    entry->written_back = 0;
               Logger::Info(
                   "cache",
                   "schema=component-cache-v1 event=persistence_incomplete "
@@ -432,15 +448,13 @@ struct ComponentTextCache::Impl {
               // A checkpoint persisted from RAM is the durable ancestor of the
               // execution it came from too, so a later write-back of that
               // slot reuses its chunk files instead of writing them again.
-              // Conversations forked from one shared checkpoint share its
-              // lineage: only a prefix of the entry's own frontier covers it
-              // (a busy entry's frontier is not known yet; see Covered).
+              // Only that execution: conversations forked from one shared
+              // checkpoint share its lineage and may share its tokens, but
+              // computed their own rows. A busy entry's frontier is not known
+              // yet (see Covered); an idle one must still extend it.
               const auto& tokens = description->Manifest().tokens;
               for (auto& entry : entries)
-                if ((completed ? entry->branch == completed->branch
-                               : entry->history &&
-                                     entry->history->Lineage() ==
-                                         description->Manifest().lineage) &&
+                if (branch && entry->branch == branch &&
                     (entry->busy || Prefixes(tokens, entry->live_tokens)) &&
                     (!entry->durable ||
                      entry->durable->Manifest().tokens.size() < tokens.size()))
@@ -527,6 +541,7 @@ struct ComponentTextCache::Impl {
     return file;
   }
   std::size_t Persist(std::shared_ptr<const cache::Checkpoint> checkpoint,
+                      std::shared_ptr<const void> branch,
                       bool write_back = false) {
     // Grid captures support RAM edits during prefill. Persist semantic prompt
     // and learned boundaries: an early grid must not consume the spacing
@@ -658,11 +673,14 @@ struct ComponentTextCache::Impl {
         return 0;
       pending_slot = position - pending.begin();
       *position = checkpoint;
+      pending_branch[pending_slot] = std::move(branch);
     }
     if (!queue->TrySubmit(std::move(job))) {
       const std::lock_guard lock(mutex);
-      if (pending[pending_slot] == checkpoint)
+      if (pending[pending_slot] == checkpoint) {
         pending[pending_slot].reset();
+        pending_branch[pending_slot].reset();
+      }
       return 0;
     }
     return bytes;
@@ -1055,51 +1073,53 @@ void ComponentTextCache::CaptureBeforeReset(std::size_t index,
         impl_->queue &&
         Impl::Durable(*entry) + Impl::kUncoveredCaptureTokens <= tokens.size();
   }
+  const auto log = [&](std::string_view event, std::string_view detail) {
+    Logger::Info("cache",
+                 std::string("event=") + std::string(event) +
+                     " reason=reassignment slot=" + std::to_string(index + 1) +
+                     " tokens=" + std::to_string(tokens.size()) +
+                     std::string(detail));
+  };
   try {
     Lease lease(std::make_unique<Lease::Impl>(
         impl_.get(), entry, entry->slot->Acquire(location), tokens,
         cache::InputIdentity(tokens.size(), input), tokens.size()));
     lease.impl_->write_back = write_back;
-    // Retry priority: the copy may only displace other optional copies, and
-    // is the first to go when prompt or shared checkpoints need the RAM.
-    std::size_t bytes = 0;
-    if (lease.TryReserveSnapshot(lease.CaptureBytes(), tokens.size(), false,
-                                 SnapshotPurpose::kRetry, tokens))
-      bytes = lease.PublishSnapshot(tokens, lease.Capture(), false);
-    // The slot stays valid; the caller's cold lease preserves the rows the
-    // new checkpoint borrows and resets it.
+    try {
+      // Retry priority: the copy may only displace other optional copies,
+      // and is the first to go when prompt or shared checkpoints need the
+      // RAM.
+      if (!lease.TryReserveSnapshot(lease.CaptureBytes(), tokens.size(), false,
+                                    SnapshotPurpose::kRetry, tokens))
+        log("live_frontier_capture_refused", " cause=byte_capacity");
+      else
+        log("live_frontier_captured",
+            " bytes=" +
+                std::to_string(
+                    lease.PublishSnapshot(tokens, lease.Capture(), false)) +
+                " ms=" +
+                std::to_string(std::chrono::duration<double, std::milli>(
+                                   Clock::now() - started)
+                                   .count()));
+    } catch (const cache::ResourceExhausted&) {
+      log("live_frontier_capture_refused", " cause=byte_capacity");
+    } catch (const std::bad_alloc&) {
+      // The capture allocator found no free backing within the RAM budget.
+      log("live_frontier_capture_refused", " cause=backing_exhausted");
+    } catch (const std::exception& error) {
+      // Optional: the request proceeds cold-reassigned, as without a capture.
+      log("live_frontier_capture_failed",
+          std::string(" error=") + error.what());
+    }
+    // The capture only reads the slot, which stays valid and busy; the
+    // caller's cold lease preserves the rows a new checkpoint borrows and
+    // resets it.
     lease.impl_->slot.Commit();
     lease.impl_->active = false;
-    Logger::Info("cache",
-                 "event=live_frontier_captured reason=reassignment slot=" +
-                     std::to_string(index + 1) +
-                     " tokens=" + std::to_string(tokens.size()) +
-                     " bytes=" + std::to_string(bytes) + " ms=" +
-                     std::to_string(std::chrono::duration<double, std::milli>(
-                                        Clock::now() - started)
-                                        .count()));
-  } catch (const cache::ResourceExhausted&) {
-    Logger::Info("cache",
-                 "event=live_frontier_capture_refused "
-                 "reason=byte_capacity slot=" +
-                     std::to_string(index + 1) +
-                     " tokens=" + std::to_string(tokens.size()));
-  } catch (const std::bad_alloc&) {
-    // The capture allocator found no free backing within the RAM budget.
-    Logger::Info("cache",
-                 "event=live_frontier_capture_refused "
-                 "reason=byte_capacity slot=" +
-                     std::to_string(index + 1) +
-                     " tokens=" + std::to_string(tokens.size()));
   } catch (const std::exception& error) {
-    // Optional: the request proceeds cold-reassigned, as without a capture.
-    Logger::Info("cache", std::string("event=live_frontier_capture_failed "
-                                      "reason=reassignment slot=") +
-                              std::to_string(index + 1) +
-                              " tokens=" + std::to_string(tokens.size()) +
-                              " error=" + error.what());
+    log("live_frontier_capture_failed", std::string(" error=") + error.what());
   }
-  // A failed lease invalidates and frees the entry; the caller still owns it.
+  // A lease that could not be taken leaves the entry to the caller.
   const std::lock_guard lock(impl_->mutex);
   entry->busy = true;
 }
@@ -1118,7 +1138,12 @@ std::size_t ComponentTextCache::WriteBackIdle(
     {
       const std::lock_guard lock(impl_->mutex);
       const auto size = entry->live_tokens.size();
-      const auto covered = Impl::Covered(*entry);
+      // Shutdown (idle_for zero) retries frontiers an earlier attempt could
+      // not queue.
+      const auto covered =
+          idle_for == std::chrono::milliseconds::zero()
+              ? Impl::Covered(*entry)
+              : std::max(Impl::Covered(*entry), entry->write_back_tried);
       if (entry->busy || !entry->live || !entry->holds_rows ||
           now - entry->idle_since < idle_for ||
           size < Impl::kUncoveredCaptureTokens ||
@@ -1152,32 +1177,44 @@ std::size_t ComponentTextCache::WriteBackIdle(
       input = entry->live_input;
     }
     const auto started = Clock::now();
-    bool submitted = false;
+    bool submitted = false, failed = false;
     try {
       Lease lease(std::make_unique<Lease::Impl>(
           impl_.get(), entry, entry->slot->Acquire(location), tokens,
           cache::InputIdentity(tokens.size(), input), tokens.size()));
       lease.impl_->write_back = true;
       lease.impl_->capture_tokens = tokens;
-      if (auto snapshot = lease.impl_->CaptureDurable()) {
-        (void)lease.PublishSnapshot(tokens, std::move(snapshot), false);
-        submitted = lease.impl_->metrics.disk_queued_bytes != 0;
+      try {
+        if (auto snapshot = lease.impl_->CaptureDurable()) {
+          (void)lease.PublishSnapshot(tokens, std::move(snapshot), false);
+          submitted = lease.impl_->metrics.disk_queued_bytes != 0;
+        }
+      } catch (const std::exception& error) {
+        failed = true;
+        Logger::Info(
+            "cache",
+            std::string("event=live_frontier_write_back_failed slot=") +
+                std::to_string(i + 1) + " tokens=" +
+                std::to_string(tokens.size()) + " error=" + error.what());
       }
-      // Capture and commit keep the slot's generation: the live frontier
-      // stays valid for the conversation's next turn.
+      // The capture only reads the slot. Committing keeps its generation, so
+      // the live frontier stays valid for the conversation's next turn
+      // whether or not it was written.
       lease.impl_->slot.Commit();
       lease.impl_->active = false;
-      Logger::Info("cache",
-                   std::string("event=live_frontier_written_back slot=") +
-                       std::to_string(i + 1) +
-                       " tokens=" + std::to_string(tokens.size()) +
-                       " queued=" + (submitted ? "true" : "false") + " ms=" +
-                       std::to_string(std::chrono::duration<double, std::milli>(
-                                          Clock::now() - started)
-                                          .count()));
+      if (!failed)
+        Logger::Info(
+            "cache",
+            std::string("event=live_frontier_written_back slot=") +
+                std::to_string(i + 1) +
+                " tokens=" + std::to_string(tokens.size()) +
+                " queued=" + (submitted ? "true" : "false") + " ms=" +
+                std::to_string(std::chrono::duration<double, std::milli>(
+                                   Clock::now() - started)
+                                   .count()));
     } catch (const std::exception& error) {
-      // Optional: the frontier stays live; it is tried again once it grows
-      // kUncoveredCaptureTokens past this attempt.
+      // Leasing the slot failed: nothing was read and the frontier is as it
+      // was.
       Logger::Info("cache",
                    std::string("event=live_frontier_write_back_failed slot=") +
                        std::to_string(i + 1) +
@@ -1185,7 +1222,10 @@ std::size_t ComponentTextCache::WriteBackIdle(
                        " error=" + error.what());
     }
     const std::lock_guard lock(impl_->mutex);
-    entry->written_back = tokens.size();
+    // Only a queued write covers the frontier; shutdown retries the rest.
+    entry->write_back_tried = tokens.size();
+    if (submitted)
+      entry->written_back = tokens.size();
     entry->busy = false;
     queued += submitted;
   }
@@ -1207,13 +1247,6 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
     return false;
   };
   while (!enough()) {
-    {
-      const std::lock_guard lock(impl_->mutex);
-      if (impl_->retention.ReclaimWhere(only_retained)) {
-        Logger::Info("cache", "event=checkpoint_dropped reason=row_capacity");
-        continue;
-      }
-    }
     Impl::Entry* entry = nullptr;
     std::size_t slot = 0, live_tokens = 0;
     std::optional<Impl::Uncovered> uncovered;
@@ -1252,11 +1285,21 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
           selected = rank;
         }
       }
+      // An emptied slot costs nothing; before resetting a live frontier,
+      // drop checkpoints that hold device rows only they use.
+      if ((!entry || entry->live) &&
+          impl_->retention.ReclaimWhere(only_retained)) {
+        Logger::Info("cache", "event=checkpoint_dropped reason=row_capacity");
+        continue;
+      }
       if (!entry)
         return busy ? RowReclaim::kWaiting : RowReclaim::kExhausted;
       visited.push_back(entry);
       entry->busy = true;
-      uncovered = impl_->UncoveredLive(slot - 1);
+      // A checkpoint of rows retained on the device would keep the very rows
+      // this reset is to return.
+      if (impl_->device_components.empty())
+        uncovered = impl_->UncoveredLive(slot - 1);
     }
     if (uncovered)
       CaptureBeforeReset(uncovered->index, uncovered->location,
@@ -1267,6 +1310,7 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
       entry->branch = std::make_shared<const std::uint8_t>(0);
       entry->durable.reset();
       entry->written_back = 0;
+      entry->write_back_tried = 0;
       live_tokens = entry->live_tokens.size();
       if (entry->live) {
         impl_->index.Erase(*entry->live);
@@ -1295,6 +1339,20 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
                      " tokens=" + std::to_string(live_tokens));
   }
   return RowReclaim::kReady;
+}
+
+std::size_t ComponentTextCache::ContinuedTokens(
+    std::span<const ContinuationToken> prompt, const TextPromptContext* context,
+    bool reuse, std::size_t stable) const {
+  const auto input = Inputs(prompt.size(), context);
+  const std::lock_guard lock(impl_->mutex);
+  const auto found =
+      impl_->index.Lookup({impl_->identity, prompt, input, stable, reuse});
+  if (!found.selected || !found.selected->live ||
+      found.selected->boundary >= prompt.size())
+    return 0;
+  const auto& entry = *impl_->entries.at(found.selected->live->slot.value - 1);
+  return entry.busy || !entry.holds_rows ? 0 : found.selected->boundary;
 }
 
 std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
@@ -1439,6 +1497,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       entry->branch = std::make_shared<const std::uint8_t>(0);
       entry->durable.reset();
       entry->written_back = 0;
+      entry->write_back_tried = 0;
     }
     if (entry->live) {
       impl_->index.Erase(*entry->live);
@@ -1471,6 +1530,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       entry->branch = std::make_shared<const std::uint8_t>(0);
       entry->durable.reset();
       entry->written_back = 0;
+      entry->write_back_tried = 0;
     }
     bool restored = bool(live);
     if (live)
@@ -2122,8 +2182,13 @@ std::size_t ComponentTextCache::Lease::PublishSnapshot(
   }
   try {
     const auto started = Clock::now();
-    impl_->metrics.disk_queued_bytes +=
-        impl_->cache->Persist(component->checkpoint, impl_->write_back);
+    std::shared_ptr<const void> branch;
+    {
+      const std::lock_guard lock(impl_->cache->mutex);
+      branch = impl_->entry->branch;
+    }
+    impl_->metrics.disk_queued_bytes += impl_->cache->Persist(
+        component->checkpoint, std::move(branch), impl_->write_back);
     impl_->metrics.disk_enqueue_ms +=
         std::chrono::duration<double, std::milli>(Clock::now() - started)
             .count();
@@ -2173,6 +2238,7 @@ void ComponentTextCache::Lease::Invalidate() noexcept {
     impl_->entry->branch.reset();
     impl_->entry->durable.reset();
     impl_->entry->written_back = 0;
+    impl_->entry->write_back_tried = 0;
     impl_->entry->busy = false;
   } catch (...) {
   }

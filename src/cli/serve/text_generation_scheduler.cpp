@@ -1215,8 +1215,10 @@ struct TextGenerationScheduler::Impl {
           }
         }
 
-        if (!runner_pool->AdmissionReady(request->prompt,
-                                         request->token_limit)) {
+        if (!runner_pool->AdmissionReady(request->prompt, request->token_limit,
+                                         request->prompt_context.get(),
+                                         request->cache_prompt,
+                                         request->cache_prefix_tokens)) {
           // The row pool cannot hold this request until residents finish.
           // Retry on a later pass so they keep decoding meanwhile.
           waiting.push_front(std::move(request));
@@ -1977,7 +1979,8 @@ struct TextGenerationScheduler::Impl {
         };
         if (capturing.empty() && waiting.empty()) {
           // Only the idle wait has a timer. Arrival interrupts it immediately;
-          // no clock checks or device polling are added to active work units.
+          // active work units add one clock read per loop (idle write-back)
+          // and no device polling.
           // The first wait of an idle period ends after the write-back delay:
           // idle sessions' live frontiers then go to the disk cache once.
           bool written_back = false;

@@ -140,17 +140,23 @@ public:
     kWaiting,    // a busy slot may still free rows
     kExhausted,  // no slot is busy and nothing is left to return
   };
-  // Returns the paged rows idle slots hold until `enough()` holds. Rows only
-  // checkpoints retain go first: their checkpoints are dropped, lowest
-  // retention priority first. Then slots
-  // without a live frontier, then live frontiers that `prompt` does
-  // not continue, a frontier some checkpoint covers before the only copy of
-  // its work, oldest first. A slot is reset at most once per call, and not
-  // again until it is leased; its borrowed checkpoint rows are preserved as
-  // on any cold reassignment.
+  // Returns the paged rows idle slots hold until `enough()` holds. Slots
+  // without a live frontier go first. Then checkpoints holding device rows
+  // only they use are dropped, lowest retention priority first. Then live
+  // frontiers that `prompt` does not continue, a frontier some checkpoint
+  // covers before the only copy of its work, oldest first; without device
+  // row retention an uncovered one is captured first. A slot is reset at
+  // most once per call, and not again until it is leased; its borrowed
+  // checkpoint rows are preserved as on any cold reassignment.
   // `enough` runs without the cache lock.
   [[nodiscard]] RowReclaim ReclaimRows(std::span<const ContinuationToken>,
                                        const std::function<bool()>& enough);
+  // Tokens of the idle live frontier that Acquire with the same arguments
+  // would continue, which its slot's rows already hold; zero when it would
+  // take a cold slot or restore a checkpoint.
+  [[nodiscard]] std::size_t ContinuedTokens(
+      std::span<const ContinuationToken> prompt,
+      const TextPromptContext* context, bool reuse, std::size_t stable) const;
   // With a disk cache, writes the live frontier of every slot idle for at
   // least `idle_for` that no disk checkpoint covers within
   // kUncoveredCaptureTokens to disk, so a restart resumes from the last turn

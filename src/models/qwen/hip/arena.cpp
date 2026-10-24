@@ -1107,9 +1107,12 @@ std::uint32_t QwenGpuArena::ReserveKvRows(std::uint32_t rows,
                                           std::uint32_t margin) {
   if (!kv_shared_)
     return 0;
+  // The margin pays for copy-on-write of shared blocks (UnshareKvRows), so
+  // it is not capped by the context: a session near it still unshares.
   const std::size_t target =
-      std::min<std::size_t>(KvBlockPool::BlocksFor(rows) + std::size_t{margin},
-                            KvBlockPool::BlocksFor(max_context_));
+      std::min<std::size_t>(KvBlockPool::BlocksFor(rows),
+                            KvBlockPool::BlocksFor(max_context_)) +
+      std::size_t{margin};
   const std::size_t need =
       target > kv_blocks_.size() ? target - kv_blocks_.size() : 0;
   kv_reservation_.Reset();
