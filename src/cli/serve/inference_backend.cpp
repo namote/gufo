@@ -3062,7 +3062,8 @@ struct InferenceBackend::Impl {
       std::shared_ptr<const TextPromptContext> context = {},
       bool cache_prompt = true, std::size_t cache_prefix_tokens = 0,
       const std::vector<std::string>& stop_sequences = {},
-      InitialOutputState initial = InitialOutputState::kContent) const {
+      InitialOutputState initial = InitialOutputState::kContent,
+      std::size_t system_prefix_tokens = 0) const {
     Result result;
     result.prompt_tokens = prompt_tokens.size();
     result.client_id = client_id.empty() ? "anonymous" : client_id;
@@ -3084,6 +3085,7 @@ struct InferenceBackend::Impl {
             .prompt_context = std::move(context),
             .cache_prompt = cache_prompt,
             .cache_prefix_tokens = cache_prefix_tokens,
+            .system_prefix_tokens = system_prefix_tokens,
             .stop_sequences = stop_sequences,
         });
     ScheduledGenerationRequest generation(std::move(current),
@@ -3900,11 +3902,16 @@ InferenceBackend::Result InferenceBackend::chat(
     effective_sampling.reasoning_budget =
         state->scheduler->runner().BuildReasoningBudget(
             *request.reasoning.budget_tokens, prompt->tokens);
+  const std::size_t system_prefix_tokens =
+      request.cache_prompt ? state->scheduler->runner().SystemPrefixTokens(
+                                 effective_request, prompt->tokens)
+                           : 0;
   return impl_->GenerateScheduled(
       state, std::move(prompt->tokens), request_start, max_tokens,
       effective_sampling, is_cancelled, on_token, request.client_id,
       std::move(prompt->context), request.cache_prompt,
-      prompt->cache_prefix_tokens, request.stop_sequences, initial);
+      prompt->cache_prefix_tokens, request.stop_sequences, initial,
+      system_prefix_tokens);
 #else
   (void)request;
   (void)max_tokens;
@@ -3997,6 +4004,11 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
           .prompt_context = std::move(prompt->context),
           .cache_prompt = request.cache_prompt,
           .cache_prefix_tokens = prompt->cache_prefix_tokens,
+          .system_prefix_tokens =
+              request.cache_prompt
+                  ? state->scheduler->runner().SystemPrefixTokens(
+                        effective_request, prompt->tokens)
+                  : 0,
           .stop_sequences = request.stop_sequences,
           .return_progress = request.return_progress,
       });
