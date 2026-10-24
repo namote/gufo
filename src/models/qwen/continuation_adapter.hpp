@@ -60,10 +60,11 @@ public:
   // Pool blocks holding the slot's FP16 rows, in position order.
   [[nodiscard]] std::span<const std::uint32_t> KvBlocks(
       const cache::Slot&) const;
-  // Prompt-capture bytes the live slots pinned and charged to the ledger.
-  // Read at startup; a later StopPinning leaves it overstated.
+  // Prompt-capture bytes the slots pinned and charged to the ledger. The
+  // slots share one capture's pages: prefill captures for one slot at a time,
+  // and the draft injects the rows before the next prefill.
   [[nodiscard]] std::size_t PinnedCaptureBytes() const noexcept {
-    return pinned_capture_bytes_.load(std::memory_order_relaxed);
+    return prompt_pages_->ChargedBytes();
   }
   [[nodiscard]] cache::Capabilities GetCapabilities() const override;
   [[nodiscard]] std::span<const cache::ComponentDescriptor> Components()
@@ -144,7 +145,8 @@ private:
   mutable std::vector<std::weak_ptr<RetainedBlock>> retained_;
   // Charged for each slot's pinned prompt capture; outlives the slots.
   cache::ResourceLedger* ledger_;
-  std::atomic<std::size_t> pinned_capture_bytes_{};
+  std::shared_ptr<hip::PromptHiddenPinned> prompt_pages_ =
+      std::make_shared<hip::PromptHiddenPinned>();
   hip::QwenExecutionPolicy policy_;
   std::uint32_t context_;
   ContinuationLayout layout_;

@@ -1,6 +1,8 @@
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <numeric>
+#include <stdexcept>
 #include <vector>
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -151,6 +153,63 @@ void TestLedgerCharge() {
   Check(ChargedBytes(small) == 0, "a failed pin must stay uncharged");
 }
 
+// Slots share one capture's pinned pages: they are allocated and charged once,
+// a later capture takes them over, and the earlier rows are then reported
+// missing instead of returned with another slot's contents.
+void TestSharedPages() {
+  constexpr std::size_t kLimit = std::size_t{1} << 20;
+  gufo::cache::ResourceLedger ledger({kLimit, kLimit, 0, kLimit});
+  auto pages = std::make_shared<gufo::hip::PromptHiddenPinned>();
+  {
+    gufo::hip::PromptHiddenBuffer first;
+    gufo::hip::PromptHiddenBuffer second;
+    first.Share(pages, nullptr);
+    second.Share(pages, nullptr);
+    first.Reserve(4096, 8192, &ledger);
+    second.Reserve(4096, 8192, &ledger);
+    Check(pages->ChargedBytes() == 4096 * sizeof(float),
+          "shared pages must be charged once");
+    Check(ChargedBytes(ledger) == 4096 * sizeof(float),
+          "the ledger must hold one capture's pages");
+
+    first.Clear();
+    first.Reserve(4096, 8192);
+    first.Resize(4096);
+    Fill(first, 0);
+    Check(IsPinned(first.Data()), "a shared capture must be pinned");
+    Check(Holds(first), "the holder must keep its rows");
+    const float* data = first.Data();
+
+    second.Clear();
+    second.Reserve(2048, 8192);
+    second.Resize(2048);
+    Fill(second, 0);
+    Check(second.Data() == data, "a later capture must reuse the pages");
+    Check(Holds(second), "the new holder must keep its rows");
+    Check(first.View().empty(), "taken-over rows must be reported missing");
+    bool refused = false;
+    try {
+      first.Resize(8192);
+    } catch (const std::logic_error&) {
+      refused = true;
+    }
+    Check(refused, "growing taken-over rows must fail");
+
+    first.Clear();
+    first.Reserve(1024, 8192);
+    first.Resize(1024);
+    Fill(first, 0);
+    Check(first.Data() == data && Holds(first),
+          "a cleared buffer must capture into the pages again");
+    second.Clear();
+    Check(second.View().empty(), "a cleared buffer holds no rows");
+  }
+  Check(pages->ChargedBytes() == 4096 * sizeof(float),
+        "the pages outlive the buffers that shared them");
+  pages.reset();
+  Check(ChargedBytes(ledger) == 0, "freeing the pages must release the charge");
+}
+
 }  // namespace
 #endif  // defined(ENGINE_ENABLE_HIP)
 
@@ -165,6 +224,7 @@ int main() {
   TestPinnedGrowth();
   TestPageableBeyondBound();
   TestLedgerCharge();
+  TestSharedPages();
   std::cout << "Prompt hidden buffer tests passed.\n";
   return EXIT_SUCCESS;
 #else

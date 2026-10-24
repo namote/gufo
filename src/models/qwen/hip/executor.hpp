@@ -699,6 +699,11 @@ public:
   /// Pins the prompt-capture bound for `layer_count` captured layers up front,
   /// so no request pays for the pinned allocation. A ledger is charged for
   /// the pinned bytes while the executor holds them.
+  /// Captures into `pinned`, shared with the other slots' executors, instead
+  /// of pages of its own. Call before ReservePromptHiddenCapture.
+  void SharePromptHiddenPages(std::shared_ptr<PromptHiddenPinned> pinned) {
+    h_prompt_hidden_.Share(std::move(pinned), arena_.stream);
+  }
   void ReservePromptHiddenCapture(std::size_t layer_count,
                                   cache::ResourceLedger* ledger = nullptr);
   [[nodiscard]] std::size_t PromptHiddenChargedBytes() const noexcept {
