@@ -38,6 +38,8 @@
 #include "src/cli/serve/audio_asr_api.hpp"
 #include "src/cli/serve/audio_tts_api.hpp"
 #include "src/cli/serve/audio_websocket.hpp"
+#include "src/cli/serve/embedding_service.hpp"
+#include "src/cli/serve/embeddings_api.hpp"
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/openai_chat.hpp"
@@ -665,6 +667,15 @@ struct CompatibilityAllowances {
   bool tools{false};
 };
 
+// The served name a validated request selected; responses echo it. A request
+// without one is answered under the primary name.
+std::string RequestedModel(const json::Value& body,
+                           const TextGenerationBackend& backend) {
+  const auto* model = body.find("model");
+  return model != nullptr && model->is_string() ? model->str()
+                                                : backend.model_id();
+}
+
 // Validate the text subset before dispatch so a client never gets an answer
 // to a different request. Responses also supports streamed output.
 std::optional<HttpResponse> ReadCompatibilityOptions(
@@ -677,7 +688,7 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
   if (const auto* model = body.find("model"); model != nullptr) {
     if (!model->is_string())
       return InvalidCompatibilityRequest("'model' must be a string");
-    if (model->str() != backend.model_id())
+    if (!backend.serves_model(model->str()))
       return Err(404, "Not Found", "requested model is not loaded",
                  "invalid_request_error", "model_not_found");
   }
@@ -771,13 +782,15 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
 HttpResponse ListModels(TextGenerationBackend* backend,
                         const VideoJobService* video_jobs,
                         const TtsService* tts, const AsrService* asr,
-                        const ImageService* images) {
+                        const ImageService* images,
+                        const EmbeddingService* embeddings) {
   json::Value resp = json::Value::object();
   resp["object"] = "list";
   json::Value data = json::Value::array();
-  if (backend != nullptr) {
+  for (const auto& id :
+       backend != nullptr ? backend->model_ids() : std::vector<std::string>{}) {
     json::Value model = json::Value::object();
-    model["id"] = backend->model_id();
+    model["id"] = id;
     model["object"] = "model";
     model["created"] = Now();
     model["owned_by"] = "gufo";
@@ -839,6 +852,15 @@ HttpResponse ListModels(TextGenerationBackend* backend,
     model["created"] = Now();
     model["owned_by"] = "operator-supplied-qwen";
     model["capability"] = "image";
+    data.push_back(std::move(model));
+  }
+  if (embeddings != nullptr && embeddings->ready()) {
+    json::Value model = json::Value::object();
+    model["id"] = embeddings->model_id();
+    model["object"] = "model";
+    model["created"] = Now();
+    model["owned_by"] = "operator-supplied-gemma";
+    model["capability"] = "embedding";
     data.push_back(std::move(model));
   }
   resp["data"] = std::move(data);
@@ -922,7 +944,7 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
       req.client_id, stop_sequences, return_progress, cache_prompt);
   const std::string id = "cmpl-" + RandomId();
   const long long created = Now();
-  const std::string model = b.model_id();
+  const std::string model = RequestedModel(body, b);
   if (stream) {
     auto stream_log = std::make_shared<HttpResponse::StreamLog>();
     return {
@@ -1127,7 +1149,8 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
   chat.client_id = req.client_id;
   return CreateOpenAiResponse(
       req, b, chat, max_tokens, sampling_config,
-      body.find("stream") != nullptr && body.find("stream")->as_bool());
+      body.find("stream") != nullptr && body.find("stream")->as_bool(),
+      RequestedModel(body, b));
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
              "context_length_exceeded");
@@ -1272,7 +1295,8 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
   chat.client_id = req.client_id;
   return CreateAnthropicMessage(
       req, b, chat, max_tokens, sampling_config,
-      body.find("stream") != nullptr && body.find("stream")->as_bool());
+      body.find("stream") != nullptr && body.find("stream")->as_bool(),
+      RequestedModel(body, b));
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
              "context_length_exceeded");
@@ -1761,6 +1785,10 @@ std::string HttpRequest::query_param(const std::string& key) const {
 
 struct HttpServer::ConnectionWorker {
   int fd{-1};  // Protected by workers_mutex_, including shutdown and close.
+  // Set after the final response is written. The server reads nothing more,
+  // so the connection only logs and closes and no longer counts toward the
+  // limit.
+  std::atomic<bool> response_sent{false};
   std::atomic<bool> done{false};
   std::jthread thread;
 };
@@ -1771,7 +1799,8 @@ HttpServer::HttpServer(std::string host, int port,
                        std::shared_ptr<TtsService> tts,
                        std::shared_ptr<AsrService> asr,
                        HttpServerOptions options,
-                       std::shared_ptr<ImageService> images)
+                       std::shared_ptr<ImageService> images,
+                       std::shared_ptr<EmbeddingService> embeddings)
     : host_(std::move(host)),
       port_(port),
       backend_(std::move(backend)),
@@ -1779,6 +1808,7 @@ HttpServer::HttpServer(std::string host, int port,
       tts_(std::move(tts)),
       asr_(std::move(asr)),
       images_(std::move(images)),
+      embeddings_(std::move(embeddings)),
       options_(std::move(options)) {
   if (options_.max_request_body_bytes == 0 || options_.max_connections == 0) {
     throw std::invalid_argument("HTTP server limits must be positive");
@@ -1964,12 +1994,16 @@ void HttpServer::run(bool handle_signals) {
     bool overloaded = false;
     {
       const std::lock_guard<std::mutex> lock(workers_mutex_);
+      const auto serving = static_cast<std::size_t>(std::ranges::count_if(
+          workers_, [](const std::unique_ptr<ConnectionWorker>& existing) {
+            return !existing->response_sent.load(std::memory_order_acquire);
+          }));
       overloaded = stopped_.load(std::memory_order_acquire) ||
-                   workers_.size() >= options_.max_connections;
+                   serving >= options_.max_connections;
       if (!overloaded) {
         worker_ptr->fd = client_fd;
         worker_ptr->thread = std::jthread([this, worker_ptr, client_fd] {
-          handle_connection(client_fd);
+          handle_connection(client_fd, worker_ptr->response_sent);
           {
             const std::lock_guard<std::mutex> lock(workers_mutex_);
             net::CloseSocket(worker_ptr->fd);
@@ -2054,7 +2088,9 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
     const bool ready = (backend_ != nullptr && backend_->ready()) ||
                        (video_jobs_ != nullptr && video_jobs_->ready()) ||
                        (tts_ != nullptr && tts_->ready()) ||
-                       (asr_ != nullptr && asr_->ready()) || images_ != nullptr;
+                       (asr_ != nullptr && asr_->ready()) ||
+                       (embeddings_ != nullptr && embeddings_->ready()) ||
+                       images_ != nullptr;
     if (!ready) {
       return Err(503, "Service Unavailable", "model service is not ready",
                  "server_error", "not_ready");
@@ -2067,6 +2103,8 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       body["model"] = asr_->model_id();
     } else if (tts_ != nullptr && tts_->ready()) {
       body["model"] = tts_->model_id();
+    } else if (embeddings_ != nullptr && embeddings_->ready()) {
+      body["model"] = embeddings_->model_id();
     } else if (images_ != nullptr) {
       body["model"] = images_->model_id();
     } else {
@@ -2077,7 +2115,7 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
   if (req.method == "GET" &&
       (req.path == "/v1/models" || req.path == "/models")) {
     return ListModels(backend_.get(), video_jobs_.get(), tts_.get(), asr_.get(),
-                      images_.get());
+                      images_.get(), embeddings_.get());
   }
   if (req.path == "/v1/images/generations" || req.path == "/v1/images/edits") {
     if (!images_)
@@ -2121,6 +2159,23 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
     }
     return HandleAudioAsrApiRequest(req, *asr_);
   }
+  // Handled before the route table. An embedding-only server has no text
+  // backend, and the stub route below must not shadow the service when a
+  // backend exists.
+  if (embeddings_ != nullptr && IsEmbeddingsApiPath(req.path)) {
+    if (device_lost())
+      return DeviceLost();
+    if (!embeddings_->ready()) {
+      return Err(503, "Service Unavailable",
+                 "EmbeddingGemma 2 service is not ready", "server_error",
+                 "embedding_service_unavailable");
+    }
+    auto response = HandleEmbeddingsApiRequest(req, *embeddings_);
+    // The request that finds the device lost runs the shutdown hook.
+    if (device_lost())
+      return DeviceLost();
+    return response;
+  }
   for (const auto& entry : routes_) {
     if (entry.first.first == req.method && entry.first.second == req.path) {
       if (req.method == "POST" && device_lost())
@@ -2133,7 +2188,9 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
 }
 
 bool HttpServer::device_lost() {
-  if (backend_ == nullptr || !backend_->device_lost())
+  const bool lost = (backend_ != nullptr && backend_->device_lost()) ||
+                    (embeddings_ != nullptr && embeddings_->device_lost());
+  if (!lost)
     return false;
   if (options_.on_device_lost &&
       !device_lost_reported_.exchange(true, std::memory_order_acq_rel)) {
@@ -2147,7 +2204,8 @@ bool HttpServer::device_lost() {
   return true;
 }
 
-void HttpServer::handle_connection(int client_fd) {
+void HttpServer::handle_connection(int client_fd,
+                                   std::atomic<bool>& response_sent) {
   (void)net::SetSocketTimeouts(client_fd, 120'000);
 
   const auto start_time = std::chrono::steady_clock::now();
@@ -2414,6 +2472,7 @@ void HttpServer::handle_connection(int client_fd) {
       response_started = true;
       connected = SendAll(client_fd, payload);
     }
+    response_sent.store(true, std::memory_order_release);
     std::string outcome = connected ? "completed" : "disconnected";
     if (resp.stream_log) {
       resp.log_details = resp.stream_log->details;
@@ -2465,6 +2524,7 @@ void HttpServer::handle_connection(int client_fd) {
     trace_failure(resp);
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
+    response_sent.store(true, std::memory_order_release);
   } catch (const std::exception& e) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - start_time)
@@ -2483,6 +2543,7 @@ void HttpServer::handle_connection(int client_fd) {
     trace_failure(resp);
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
+    response_sent.store(true, std::memory_order_release);
   } catch (...) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - start_time)
@@ -2498,6 +2559,7 @@ void HttpServer::handle_connection(int client_fd) {
     trace_failure(resp);
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
+    response_sent.store(true, std::memory_order_release);
   }
   // Act on a loss found by this request now, not at the next health probe.
   (void)device_lost();
