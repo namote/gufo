@@ -452,6 +452,18 @@ public:
   void EnsureKvRows(std::uint32_t end);
   /// Shared pool: returns the blocks past `rows` once queued passes finish.
   void TruncateKvRows(std::uint32_t rows);
+  /// Shared pool: before a write of rows [first, end), gives every mapped
+  /// block there that another owner (a checkpoint) also holds a private copy
+  /// of the whole block, so the other owner's rows never change. Throws
+  /// std::length_error when the pool has no block for a copy.
+  void UnshareKvRows(std::uint32_t first, std::uint32_t end);
+  /// Shared pool, during a restore whose earlier work on this arena has
+  /// drained: maps logical block `logical` to pool block `block` (retained)
+  /// instead of copying its rows, releasing the block it replaces, to the
+  /// reservation when no one else holds it. UploadKvTable publishes it.
+  void MapKvBlock(std::uint32_t logical, std::uint32_t block);
+  /// Shared pool: uploads the whole block table on the arena stream.
+  void UploadKvTable();
   /// Shared pool: holds back the blocks rows [0, rows) and `margin` more
   /// blocks need beyond those mapped, replacing any earlier reservation.
   /// Throws std::length_error, holding nothing, when the pool lacks them.

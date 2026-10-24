@@ -282,12 +282,28 @@ PersistenceSource::PersistenceSource(bool private_file, DiskFileId file,
                                                         std::move(completion)));
   };
 }
+PersistenceSource::PersistenceSource(bool private_file, DiskFileId file,
+                                     std::uint64_t bytes, std::size_t alignment,
+                                     std::shared_ptr<const void> owner,
+                                     Copy copy)
+    : owner_(std::move(owner)),
+      copy_(std::move(copy)),
+      private_file_(private_file),
+      file_(file),
+      bytes_(bytes),
+      alignment_(alignment) {
+  if (!owner_ || !copy_ || !alignment_ || bytes_ % alignment_)
+    throw std::invalid_argument("invalid device persistence source");
+}
 PersistencePin PersistenceSource::Pin() const {
-  return rows_ ? rows_->PinPersistence() : charge_.PinPersistence();
+  if (rows_)
+    return rows_->PinPersistence();
+  return charge_ ? charge_.PinPersistence() : PersistencePin{};
 }
 std::size_t PersistenceSource::Capacity() const {
-  return rows_ ? (rows_->HasBacking() ? rows_->Bytes() : 0)
-               : charge_.Info().bytes;
+  if (rows_)
+    return rows_->HasBacking() ? rows_->Bytes() : 0;
+  return charge_ ? charge_.Info().bytes : 0;
 }
 struct StreamedStore::Impl {
   ResourceLedger* ledger;

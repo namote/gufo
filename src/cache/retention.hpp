@@ -58,7 +58,9 @@ enum class RetentionReason : std::uint8_t {
   kCancelled,
   kInvalid,
   kExplicit,
-  kShutdown
+  kShutdown,
+  // Storage outside the RAM budget, such as device rows a pool needs back.
+  kDeviceCapacity
 };
 struct RetentionEvent {
   std::uint64_t sequence{};
@@ -147,6 +149,11 @@ public:
   // Reclaim one eligible record for a caller that captures outside its index
   // lock. The caller retries the same frozen frontier before publication.
   [[nodiscard]] bool Reclaim(const RetentionRequest&);
+  // Remove the lowest-priority, least recently used record `holds` selects,
+  // to return storage outside the RAM budget (device rows a pool needs).
+  // False when none is selected.
+  [[nodiscard]] bool ReclaimWhere(
+      const std::function<bool(const Checkpoint&)>& holds);
   void Touch(CheckpointId);
   void Remove(CheckpointId);
   [[nodiscard]] std::uint32_t Rank(CheckpointId) const;

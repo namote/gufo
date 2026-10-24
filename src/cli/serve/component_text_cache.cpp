@@ -255,7 +255,15 @@ struct ComponentTextCache::Impl {
   std::size_t disk_capacity{}, disk_step{};
   // The cache's own RAM budget. The ledger limit adds what the slots pinned.
   std::size_t budget{};
+  // Components whose completed chunks the adapter retains in device storage.
+  std::vector<cache::ComponentId> device_components;
   cache::ResourceCharge metadata;
+  // New RAM payload of a capture at `positions`.
+  [[nodiscard]] std::size_t RamPayloadBytes(
+      const cache::ExecutionHistory& history,
+      std::span<const cache::ComponentPosition> positions) const {
+    return history.NewPayloadBytes(positions, device_components);
+  }
 
   Impl(std::shared_ptr<TextModelRunner> runner, std::size_t count,
        std::size_t ram, std::size_t slot_ceiling,
@@ -274,6 +282,9 @@ struct ComponentTextCache::Impl {
         retention(ledger, index, &events) {
     metadata = ledger.Reserve(cache::ResourceCategory::kMetadata, sizeof(Impl))
                    .Convert();
+    for (const auto& d : resources->adapter->Components())
+      if (resources->adapter->RetainsRows(d.id))
+        device_components.push_back(d.id);
     crypto::Sha256Hasher hash;
     hash.Update(identity);
     digest = hash.Finish();
@@ -580,6 +591,22 @@ struct ComponentTextCache::Impl {
       auto owner = payload.Owner();
       if (!owner)
         throw std::logic_error("persistence source is not immutable");
+      if (payload.OnDevice()) {
+        // Retained device rows: read each piece into staging from the
+        // device; the owner keeps the rows unchanged through the job.
+        if (!resources->copy_observed_rows)
+          throw std::logic_error("device rows need a device read");
+        sources.emplace_back(
+            private_file, file, bytes, 1, owner,
+            [owner, copy = resources->copy_observed_rows](
+                std::uint64_t offset, std::span<std::byte> destination,
+                cache::Stream& stream) {
+              return copy({static_cast<const std::byte*>(owner.get()) + offset,
+                           destination.size()},
+                          destination, stream);
+            });
+        return cache::DiskPayload{file, bytes, 0};
+      }
       sources.emplace_back(
           private_file, file, bytes, 1, payload.CommittedCharge(), owner,
           [owner, checkpoint](std::uint64_t offset,
@@ -732,23 +759,23 @@ struct ComponentTextCache::Lease::Impl {
   cache::RetentionRequest Retain(
       std::span<const cache::Token> tokens,
       std::optional<std::size_t> new_payload_bytes = {}) const {
-    return {
-        .tokens = tokens,
-        .compatibility = cache->identity,
-        .input = At(input, std::min(tokens.size(), prompt.size())),
-        .purpose = Purpose(purpose),
-        .stable = std::min(stable, tokens.size()),
-        .source = source,
-        .preserve_source = preserve_source,
-        .new_payload_bytes =
-            new_payload_bytes
-                ? *new_payload_bytes
-                : entry->history->NewPayloadBytes(
-                      cache->resources->adapter->Positions(slot.Execution())),
-        .protected_checkpoints =
-            std::span(edit_boundaries).first(edit_boundary_count),
-        .reused = cached != 0,
-        .reused_tokens = cached};
+    return {.tokens = tokens,
+            .compatibility = cache->identity,
+            .input = At(input, std::min(tokens.size(), prompt.size())),
+            .purpose = Purpose(purpose),
+            .stable = std::min(stable, tokens.size()),
+            .source = source,
+            .preserve_source = preserve_source,
+            .new_payload_bytes =
+                new_payload_bytes
+                    ? *new_payload_bytes
+                    : cache->RamPayloadBytes(
+                          *entry->history, cache->resources->adapter->Positions(
+                                               slot.Execution())),
+            .protected_checkpoints =
+                std::span(edit_boundaries).first(edit_boundary_count),
+            .reused = cached != 0,
+            .reused_tokens = cached};
   }
   std::unique_ptr<TextRunnerSnapshot> CaptureDurable();
 };
@@ -1162,7 +1189,24 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
     std::span<const ContinuationToken> prompt,
     const std::function<bool()>& enough) {
   std::vector<const Impl::Entry*> visited;
+  // Device rows only checkpoints hold come back when those are dropped.
+  const auto only_retained = [&](const cache::Checkpoint& checkpoint) {
+    for (const auto& c : checkpoint.Components())
+      for (const auto& chunk : c.chunks)
+        if (chunk.Storage().OnDevice() &&
+            impl_->resources->adapter->OnlyRetained(
+                chunk.Storage().Owner().get()))
+          return true;
+    return false;
+  };
   while (!enough()) {
+    {
+      const std::lock_guard lock(impl_->mutex);
+      if (impl_->retention.ReclaimWhere(only_retained)) {
+        Logger::Info("cache", "event=checkpoint_dropped reason=row_capacity");
+        continue;
+      }
+    }
     Impl::Entry* entry = nullptr;
     std::size_t slot = 0, live_tokens = 0;
     std::optional<Impl::Uncovered> uncovered;
@@ -1782,7 +1826,7 @@ bool ComponentTextCache::Lease::CaptureRefused(std::size_t boundary) const {
     // lies past is a lower bound of the capture.
     if (positions.empty())
       positions = adapter.Positions(slot);
-    bytes = impl_->entry->history->NewPayloadBytes(positions);
+    bytes = cache.RamPayloadBytes(*impl_->entry->history, positions);
   } catch (const std::invalid_argument&) {
     // Positions are incomplete until a restore settles: not known refused.
     return false;
@@ -1797,12 +1841,14 @@ bool ComponentTextCache::Lease::CaptureRefused(std::size_t boundary) const {
       At(impl_->input, boundary));
 }
 std::size_t ComponentTextCache::Lease::CaptureBytes() const {
-  return impl_->entry->history->NewPayloadBytes(
+  return impl_->cache->RamPayloadBytes(
+      *impl_->entry->history,
       impl_->cache->resources->adapter->Positions(impl_->slot.Execution()));
 }
 std::size_t ComponentTextCache::Lease::CaptureBytes(
     std::size_t boundary) const {
-  return impl_->entry->history->NewPayloadBytes(
+  return impl_->cache->RamPayloadBytes(
+      *impl_->entry->history,
       impl_->cache->resources->adapter->PrefillCheckpointPositions(
           impl_->slot.Execution(), boundary));
 }
@@ -1811,7 +1857,7 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
   auto& cache = *request.cache;
   auto positions =
       cache.resources->adapter->Positions(request.slot.Execution());
-  const auto bytes = request.entry->history->NewPayloadBytes(positions);
+  const auto bytes = cache.RamPayloadBytes(*request.entry->history, positions);
   const auto retain = request.Retain(request.capture_tokens, bytes);
   const auto refused = [&] {
     Logger::Info("cache",
@@ -1842,14 +1888,18 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
   };
   std::shared_ptr<const cache::Checkpoint> checkpoint;
   std::size_t captured_capacity = 0;
-  std::size_t borrowed_capacity = 0, copied_payload = 0;
+  std::size_t borrowed_capacity = 0, copied_payload = 0, device_capacity = 0;
   while (true) {
     try {
       captured_capacity = 0;
-      borrowed_capacity = copied_payload = 0;
+      borrowed_capacity = copied_payload = device_capacity = 0;
       cache::ResourceReservation buffer_metadata;
       std::vector<ComponentCaptureBuffer> buffers;
       std::vector<std::span<const std::byte>> borrowed;
+      // Completed chunks the adapter retained in device storage; the others
+      // take RAM backing.
+      std::vector<std::optional<cache::Payload>> device;
+      std::vector<cache::PayloadRequest> ram_payloads;
       std::size_t next_buffer = 0;
       checkpoint = request.entry->history->Capture(
           {request.capture_tokens,
@@ -1862,6 +1912,12 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
            0},
           [&](const cache::PayloadRequest&) {
             const auto i = next_buffer++;
+            if (device.at(i)) {
+              auto storage = std::move(*device[i]);
+              device[i].reset();
+              device_capacity += storage.Bytes();
+              return storage;
+            }
             auto& buffer = buffers.at(i);
             auto storage = borrowed[i].empty()
                                ? buffer.finish()
@@ -1879,11 +1935,38 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
                      sizeof(std::span<const std::byte>) + sizeof(std::size_t)));
             buffers.reserve(payloads.size());
             borrowed.reserve(payloads.size());
+            device.resize(payloads.size());
+            ram_payloads.reserve(payloads.size());
+            for (std::size_t i = 0; i < payloads.size(); ++i) {
+              const auto& payload = payloads[i];
+              if (payload.category ==
+                      cache::ResourceCategory::kBackingAssigned &&
+                  std::ranges::find(cache.device_components,
+                                    payload.component) !=
+                      cache.device_components.end()) {
+                auto retained = cache.resources->adapter->RetainRows(
+                    request.slot.Execution(), payload.component, payload.first,
+                    payload.end);
+                if (retained.owner) {
+                  device[i] = cache::Payload::Device(
+                      cache.ledger
+                          .Reserve(cache::ResourceCategory::kMetadata,
+                                   sizeof(cache::Payload))
+                          .Convert(),
+                      std::move(retained.owner), retained.bytes);
+                  continue;
+                }
+              }
+              ram_payloads.push_back(payload);
+            }
             // Small row/tail allocations must not split the remaining runs
             // that larger private states require. Keep equal-size requests
             // in their original order; transfers still follow component order.
-            std::vector<std::size_t> allocation_order(payloads.size());
-            std::iota(allocation_order.begin(), allocation_order.end(), 0);
+            std::vector<std::size_t> allocation_order;
+            allocation_order.reserve(payloads.size());
+            for (std::size_t i = 0; i < payloads.size(); ++i)
+              if (!device[i])
+                allocation_order.push_back(i);
             std::ranges::sort(allocation_order, [&](auto a, auto b) {
               return payloads[a].bytes != payloads[b].bytes
                          ? payloads[a].bytes > payloads[b].bytes
@@ -1892,7 +1975,7 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
             while (true) {
               try {
                 if (cache.resources->can_capture &&
-                    !cache.resources->can_capture(payloads))
+                    !cache.resources->can_capture(ram_payloads))
                   throw cache::ResourceExhausted();
                 buffers.resize(payloads.size());
                 borrowed.resize(payloads.size());
@@ -1922,7 +2005,7 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
             }
             TransferBatch transfers(cache.resources->transfer_batch_size);
             for (std::size_t i = 0; i < payloads.size();) {
-              if (!borrowed[i].empty()) {
+              if (!borrowed[i].empty() || device[i]) {
                 ++i;
                 continue;
               }
@@ -1932,7 +2015,7 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
               auto next = i + 1;
               if (payload.category != cache::ResourceCategory::kPrivateState)
                 while (buffers[i].allocation && next < payloads.size() &&
-                       borrowed[next].empty() &&
+                       borrowed[next].empty() && !device[next] &&
                        buffers[next].allocation == buffers[i].allocation &&
                        payloads[next].component == payload.component &&
                        payloads[next].category !=
@@ -1992,6 +2075,7 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
   request.metrics.captured_bytes += captured_capacity;
   request.metrics.borrowed_capacity_bytes += borrowed_capacity;
   request.metrics.copied_payload_bytes += copied_payload;
+  request.metrics.device_payload_bytes += device_capacity;
   auto snapshot = std::make_unique<ComponentSnapshot>();
   snapshot->checkpoint = std::move(checkpoint);
   snapshot->bytes = bytes;

@@ -420,8 +420,9 @@ public:
   virtual void ReserveRowBlocks(TextRunnerState&, std::size_t) const {}
   /// Returns what ReserveRowBlocks held back and the state did not use.
   virtual void ReleaseRowBlocks(TextRunnerState&) const noexcept {}
-  /// Speculative verification writes draft rows past the last kept token.
-  static constexpr std::size_t kRowBlockMargin = 1;
+  /// Speculative verification writes draft rows past the last kept token,
+  /// and a write into a block a checkpoint still holds copies it first.
+  static constexpr std::size_t kRowBlockMargin = 2;
 
   /// Optional first-token preview without advancing model state. The caller
   /// supplies a copy of the sampler; normal decoding must reproduce the token.

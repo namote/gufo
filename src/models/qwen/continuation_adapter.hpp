@@ -2,6 +2,7 @@
 #define GUFO_MODELS_QWEN_CONTINUATION_ADAPTER_HPP_
 
 #include <atomic>
+#include <mutex>
 
 #include "src/cache/adapter.hpp"
 #include "src/core/hip/transfer_pool.hpp"
@@ -103,6 +104,15 @@ public:
   [[nodiscard]] std::span<const std::byte> BorrowRowsView(
       const cache::Slot&, cache::ComponentId, cache::Rows first,
       cache::Rows end) const override;
+  // Shared pool: a completed FP16 K/V chunk is one pool block, retained for
+  // the checkpoint instead of copied. A slot copies a block another owner
+  // holds before writing it, and a restore maps such a block instead of
+  // copying its rows.
+  [[nodiscard]] RetainedRows RetainRows(const cache::Slot&, cache::ComponentId,
+                                        cache::Rows first,
+                                        cache::Rows end) const override;
+  [[nodiscard]] bool RetainsRows(cache::ComponentId) const override;
+  [[nodiscard]] bool OnlyRetained(const void*) const override;
   [[nodiscard]] bool Validate(
       cache::Slot&, std::span<const cache::ComponentPosition>) override;
   [[nodiscard]] bool Invalidate(cache::Slot&) noexcept override;
@@ -127,6 +137,11 @@ private:
   // One prompt-pass scratch for every slot's executor; null: each owns one.
   std::shared_ptr<hip::QwenSharedPassScratch> pass_scratch_;
   std::shared_ptr<hip::KvBlockPool> kv_pool_;
+  // One pool reference per retained block, shared by every checkpoint chunk
+  // (all layers and both planes) that retains it.
+  struct RetainedBlock;
+  mutable std::mutex retained_mutex_;
+  mutable std::vector<std::weak_ptr<RetainedBlock>> retained_;
   // Charged for each slot's pinned prompt capture; outlives the slots.
   cache::ResourceLedger* ledger_;
   std::atomic<std::size_t> pinned_capture_bytes_{};

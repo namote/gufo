@@ -175,7 +175,9 @@ public:
       if (component.descriptor.kind == cache::ComponentKind::kAppendRows &&
           first < end)
         guard.BeforeOverwrite(component.descriptor.id, first, end);
-    // Shared pool: map the rows before any submission writes them.
+    // Shared pool: copy blocks a checkpoint still holds, then map the rows,
+    // before any submission writes them.
+    executor->arena_.UnshareKvRows(first, end);
     executor->arena_.EnsureKvRows(end);
   }
   void AfterWrite(std::uint32_t end, bool logits) noexcept override {
@@ -287,6 +289,10 @@ public:
   std::vector<std::shared_ptr<Job>> jobs;
   std::vector<cache::ComponentPosition> expected;
   std::vector<Coverage> coverage;
+  // Per logical KV block during a restore: rows copied in, or a retained
+  // pool block mapped (copies then go to a private copy of it).
+  enum class Restored : std::uint8_t { kNone, kCopied, kMapped };
+  std::vector<Restored> restored_blocks;
   std::array<std::byte, kContinuationMetadataBytes> metadata{};
   std::array<std::byte, kContinuationMetadataBytes> draft_metadata{};
   std::vector<std::byte> draft_features;
@@ -537,6 +543,8 @@ void ContinuationAdapter::BeginRestore(
   const auto target = static_cast<std::uint32_t>(ordered.front().valid_rows);
   arena.TruncateKvRows(target);
   arena.EnsureKvRows(target);
+  state.restored_blocks.assign(arena.GetKvBlocks().size(),
+                               State::Restored::kNone);
   state.expected = std::move(ordered);
   state.coverage = std::move(coverage);
   state.metadata.fill(std::byte{});
@@ -837,8 +845,58 @@ cache::Completion ContinuationAdapter::CopyRowsIn(
       const std::lock_guard lock(state.jobs_mutex);
       state.coverage[id.value - 1].emplace_back(first * row, end * row);
     }
-    return TransferRows(state, component, true, first, end,
-                        const_cast<std::byte*>(bytes.data()), stream);
+    if (!RetainsRows(id))
+      return TransferRows(state, component, true, first, end,
+                          const_cast<std::byte*>(bytes.data()), stream);
+    // A whole block whose source is a pool block of this layer and plane
+    // (retained by a checkpoint) is mapped, unless this restore already
+    // copied rows into the slot's block. Other rows are copied, into a
+    // private copy of a block another owner holds.
+    auto& arena = state.executor->arena_;
+    const auto* base = KvLayerBase(arena, component, model_->GetConfig());
+    const auto block_bytes = std::size_t{hip::kKvBlockTokens} * row;
+    const auto layer_bytes = arena.KvLayerPitchRows() * row;
+    std::vector<std::pair<Rows, Rows>> copies;
+    {
+      const std::lock_guard lock(state.jobs_mutex);
+      for (Rows r = first; r < end;) {
+        const auto logical =
+            static_cast<std::uint32_t>(r >> hip::kKvBlockShift);
+        const auto block_end =
+            std::min<Rows>(end, Rows{logical + 1} << hip::kKvBlockShift);
+        const auto* source = bytes.data() + (r - first) * row;
+        auto& restored = state.restored_blocks.at(logical);
+        const auto mapped = arena.GetKvBlocks()[logical];
+        std::optional<std::uint32_t> pooled;
+        if (r % hip::kKvBlockTokens == 0 &&
+            block_end - r == hip::kKvBlockTokens && source >= base &&
+            source < base + layer_bytes && (source - base) % block_bytes == 0)
+          pooled = static_cast<std::uint32_t>((source - base) / block_bytes);
+        if (pooled &&
+            (mapped == *pooled || restored == State::Restored::kNone)) {
+          arena.MapKvBlock(logical, *pooled);
+          restored = State::Restored::kMapped;
+        } else {
+          arena.UnshareKvRows(static_cast<std::uint32_t>(r),
+                              static_cast<std::uint32_t>(block_end));
+          restored = State::Restored::kCopied;
+          if (!copies.empty() && copies.back().second == r)
+            copies.back().second = block_end;
+          else
+            copies.emplace_back(r, block_end);
+        }
+        r = block_end;
+      }
+    }
+    auto* layer_base = KvLayerBase(arena, component, model_->GetConfig());
+    return Transfer(state, true, stream, [&](hip::TransferStream& transfer) {
+      for (const auto& [copy_first, copy_end] : copies)
+        for (const auto& run : KvRuns(arena, copy_first, copy_end))
+          Check(hip::CopySnapshotToDevice(
+              layer_base + run.pool_row * row,
+              bytes.data() + (run.first - first) * row, run.rows * row,
+              transfer.Native()));
+    });
   } catch (...) {
     state.failed = true;
     throw;
@@ -869,6 +927,71 @@ std::span<const std::byte> ContinuationAdapter::BorrowRowsView(
               KvLayerBase(arena, component, model_->GetConfig())) +
               runs.front().pool_row * row,
           (end - first) * row};
+}
+struct ContinuationAdapter::RetainedBlock {
+  RetainedBlock(std::shared_ptr<hip::KvBlockPool> pool, std::uint32_t block)
+      : pool(std::move(pool)), block(block) {}
+  ~RetainedBlock() { pool->Release(std::span(&block, 1)); }
+  RetainedBlock(const RetainedBlock&) = delete;
+  RetainedBlock& operator=(const RetainedBlock&) = delete;
+  std::shared_ptr<hip::KvBlockPool> pool;
+  std::uint32_t block;
+};
+bool ContinuationAdapter::RetainsRows(cache::ComponentId id) const {
+  const auto part = Component(id).part;
+  return kv_pool_ && policy_.UsesFp16AttentionKv() &&
+         (part == ContinuationPart::kKey || part == ContinuationPart::kValue);
+}
+cache::Adapter::RetainedRows ContinuationAdapter::RetainRows(
+    const cache::Slot& slot, cache::ComponentId id, Rows first,
+    Rows end) const {
+  const auto& state = As(slot);
+  if (!RetainsRows(id) || !state.IsValid() || first % hip::kKvBlockTokens ||
+      end - first != hip::kKvBlockTokens || end > state.position)
+    return {};
+  const auto& component = Component(id);
+  const auto& arena = state.executor->arena_;
+  const auto block = arena.GetKvBlocks()[first >> hip::kKvBlockShift];
+  std::shared_ptr<RetainedBlock> retained;
+  {
+    const std::lock_guard lock(retained_mutex_);
+    if (retained_.size() != kv_pool_->blocks())
+      retained_.resize(kv_pool_->blocks());
+    retained = retained_[block].lock();
+    if (!retained) {
+      // Queued passes may still write the block. Once retained, a write
+      // copies it first, so an already retained block is complete.
+      if (hipStreamQuery(arena.stream) != hipSuccess)
+        Check(hipStreamSynchronize(arena.stream));
+      // The slot holds the block, so it cannot be free here.
+      kv_pool_->Retain(std::span(&block, 1));
+      retained = std::make_shared<RetainedBlock>(kv_pool_, block);
+      retained_[block] = retained;
+    }
+  }
+  const auto row = component.descriptor.row_bytes;
+  const auto* address = KvLayerBase(arena, component, model_->GetConfig()) +
+                        (std::size_t{block} << hip::kKvBlockShift) * row;
+  return {std::shared_ptr<const void>(std::move(retained), address),
+          std::size_t{hip::kKvBlockTokens} * row};
+}
+bool ContinuationAdapter::OnlyRetained(const void* rows) const {
+  if (!kv_pool_)
+    return false;
+  const auto& geometry = kv_pool_->geometry();
+  const auto* data = static_cast<const std::byte*>(kv_pool_->data());
+  const auto* address = static_cast<const std::byte*>(rows);
+  if (address < data || address >= data + geometry.bytes())
+    return false;
+  auto offset = static_cast<std::size_t>(address - data);
+  std::size_t plane = geometry.planes().size() - 1;
+  while (plane > 0 && offset < geometry.plane_offset(plane))
+    --plane;
+  offset =
+      (offset - geometry.plane_offset(plane)) % geometry.layer_pitch(plane);
+  const auto block =
+      static_cast<std::uint32_t>(offset / geometry.block_bytes(plane));
+  return kv_pool_->references(block) == 1;
 }
 cache::Completion ContinuationAdapter::TransferRows(
     State& state, const ContinuationComponent& component, bool load, Rows first,
@@ -1033,6 +1156,8 @@ bool ContinuationAdapter::Validate(
       executor.vision_input_.Configure(nullptr, nullptr,
                                        executor.arena_.stream);
     executor.arena_.DisableSsmReplayCapture();
+    // Blocks this restore mapped instead of copying.
+    executor.arena_.UploadKvTable();
     Check(hipStreamSynchronize(executor.arena_.stream));
   } catch (...) {
     return refuse();
@@ -1057,6 +1182,7 @@ bool ContinuationAdapter::Validate(
   state.restoring = false;
   state.expected.clear();
   state.coverage.clear();
+  state.restored_blocks.clear();
   return true;
 }
 bool ContinuationAdapter::Invalidate(cache::Slot& slot) noexcept {
@@ -1081,6 +1207,7 @@ bool ContinuationAdapter::Invalidate(cache::Slot& slot) noexcept {
     state.failed = false;
     state.expected.clear();
     state.coverage.clear();
+    state.restored_blocks.clear();
     state.draft_features.clear();
     state.frontier = {};
     state.frontier_bytes.clear();

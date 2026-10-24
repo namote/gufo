@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <tuple>
 
 namespace gufo::cache {
 namespace {
@@ -272,7 +273,7 @@ std::size_t RetentionPolicy::UniqueBytes(std::size_t i) const {
       shared = std::max(shared, n);
     }
     for (std::size_t n = shared; n < c.chunks.size(); ++n)
-      bytes += c.chunks[n].Storage().Bytes();
+      bytes += c.chunks[n].Storage().RamBytes();
   }
   return bytes;
 }
@@ -310,7 +311,7 @@ std::size_t RetentionPolicy::UniquePayloadBytes(std::size_t i) const noexcept {
           break;
         }
       if (!shared)
-        bytes += chunk.Storage().Bytes();
+        bytes += chunk.Storage().RamBytes();
     }
   }
   return bytes;
@@ -501,6 +502,28 @@ bool RetentionPolicy::Reclaim(const RetentionRequest& r) {
   return true;
 }
 
+bool RetentionPolicy::ReclaimWhere(
+    const std::function<bool(const Checkpoint&)>& holds) {
+  // Lowest priority first, then least recently used. A record a disk job is
+  // writing frees nothing until the write ends, so it goes last.
+  auto victim = limit_;
+  std::tuple<bool, std::uint32_t, std::uint64_t> lowest{};
+  for (std::size_t i = 0; i < limit_; ++i) {
+    const auto& e = records_[i];
+    if (!e.checkpoint || !holds(*e.checkpoint))
+      continue;
+    const std::tuple order{Persisting(i), Priority(i), e.last_used};
+    if (victim == limit_ || order < lowest) {
+      victim = i;
+      lowest = order;
+    }
+  }
+  if (victim == limit_)
+    return false;
+  Erase(victim, RetentionReason::kDeviceCapacity, Priority(victim));
+  return true;
+}
+
 bool RetentionPolicy::Admit(const RetentionRequest& r, const Capture& capture) {
   auto purpose = r.purpose;
   const auto refuse = [&](RetentionReason reason) {
@@ -670,7 +693,7 @@ std::size_t RetentionPolicy::RetainedPayloadBytes() const noexcept {
                 return chunk.SameChunk(*previous);
               }) == end) {
             seen[seen_count++] = &chunk;
-            bytes += chunk.Storage().Bytes();
+            bytes += chunk.Storage().RamBytes();
           }
         }
       }

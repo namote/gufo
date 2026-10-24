@@ -1049,6 +1049,60 @@ void QwenGpuArena::TruncateKvRows(std::uint32_t rows) {
   kv_blocks_.resize(keep);
 }
 
+void QwenGpuArena::UnshareKvRows(std::uint32_t first, std::uint32_t end) {
+  if (!kv_shared_ || first >= end)
+    return;
+  const auto& geometry = kv_pool_->geometry();
+  const std::size_t last =
+      std::min<std::size_t>(KvBlockPool::BlocksFor(end), kv_blocks_.size());
+  for (std::size_t logical = first >> kKvBlockShift; logical < last;
+       ++logical) {
+    const auto shared = kv_blocks_[logical];
+    if (kv_pool_->references(shared) < 2)
+      continue;
+    // Table uploads in flight read the pinned host table.
+    HIP_CHECK(hipStreamSynchronize(stream));
+    const auto copy = kv_pool_->Allocate(1, &kv_reservation_).front();
+    for (std::size_t plane = 0; plane < geometry.planes().size(); ++plane) {
+      const auto pitch = geometry.layer_pitch(plane);
+      const auto width = geometry.block_bytes(plane);
+      auto* base = reinterpret_cast<std::uint8_t*>(kv_pool_->plane_data(plane));
+      HIP_CHECK(hipMemcpy2DAsync(
+          base + copy * width, pitch, base + shared * width, pitch, width,
+          geometry.planes()[plane].layers, hipMemcpyDeviceToDevice, stream));
+    }
+    h_kv_block_table_[logical] = copy;
+    kv_blocks_[logical] = copy;
+    HIP_CHECK(hipMemcpyAsync(d_kv_block_table_ + logical,
+                             h_kv_block_table_ + logical, sizeof(std::uint32_t),
+                             hipMemcpyHostToDevice, stream));
+    // Queued passes and the copy read the shared block; once its other
+    // owner lets go it may be written by another arena.
+    HIP_CHECK(hipStreamSynchronize(stream));
+    kv_pool_->Release(std::span(&shared, 1));
+  }
+}
+
+void QwenGpuArena::MapKvBlock(std::uint32_t logical, std::uint32_t block) {
+  if (!kv_shared_ || logical >= kv_blocks_.size())
+    throw std::logic_error("Qwen KV block mapping outside the table");
+  const auto replaced = kv_blocks_[logical];
+  if (replaced == block)
+    return;
+  kv_pool_->Retain(std::span(&block, 1));
+  kv_blocks_[logical] = block;
+  h_kv_block_table_[logical] = block;
+  kv_pool_->Release(std::span(&replaced, 1), kv_reservation_);
+}
+
+void QwenGpuArena::UploadKvTable() {
+  if (!kv_shared_ || kv_blocks_.empty())
+    return;
+  HIP_CHECK(hipMemcpyAsync(d_kv_block_table_, h_kv_block_table_,
+                           kv_blocks_.size() * sizeof(std::uint32_t),
+                           hipMemcpyHostToDevice, stream));
+}
+
 std::uint32_t QwenGpuArena::ReserveKvRows(std::uint32_t rows,
                                           std::uint32_t margin) {
   if (!kv_shared_)
