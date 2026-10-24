@@ -1107,14 +1107,20 @@ std::uint32_t QwenGpuArena::ReserveKvRows(std::uint32_t rows,
                                           std::uint32_t margin) {
   if (!kv_shared_)
     return 0;
-  // The margin pays for copy-on-write of shared blocks (UnshareKvRows), so
-  // it is not capped by the context: a session near it still unshares.
+  // The margin pays for draft rows past `rows`, which never pass the
+  // context. Copy-on-write (UnshareKvRows) replaces only mapped blocks
+  // another owner shares, so up to `margin` of those are charged on top,
+  // uncapped: a session near the context still unshares, and an unshared
+  // one fits a pool sized for full-context sessions.
   const std::size_t target =
-      std::min<std::size_t>(KvBlockPool::BlocksFor(rows),
-                            KvBlockPool::BlocksFor(max_context_)) +
-      std::size_t{margin};
+      std::min<std::size_t>(KvBlockPool::BlocksFor(rows) + margin,
+                            KvBlockPool::BlocksFor(max_context_));
+  std::size_t shared = 0;
+  for (const auto block : kv_blocks_)
+    if (shared < margin && kv_pool_->references(block) >= 2)
+      ++shared;
   const std::size_t need =
-      target > kv_blocks_.size() ? target - kv_blocks_.size() : 0;
+      (target > kv_blocks_.size() ? target - kv_blocks_.size() : 0) + shared;
   kv_reservation_.Reset();
   auto reservation = kv_pool_->TryReserve(static_cast<std::uint32_t>(need));
   if (!reservation)

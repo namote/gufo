@@ -1961,9 +1961,9 @@ std::size_t TextRunnerPool::AdmissionRowBlocks(std::size_t rows) const {
   if (pool.block_rows == 0)
     return 0;
   const std::size_t context = impl_->validated.descriptor.max_context;
-  return std::min((rows + pool.block_rows - 1) / pool.block_rows,
-                  (context + pool.block_rows - 1) / pool.block_rows) +
-         TextModelRunner::kRowBlockMargin;
+  return std::min((rows + pool.block_rows - 1) / pool.block_rows +
+                      TextModelRunner::kRowBlockMargin,
+                  (context + pool.block_rows - 1) / pool.block_rows);
 }
 
 bool TextRunnerPool::AdmissionReady(std::span<const TextRunnerToken> prompt,

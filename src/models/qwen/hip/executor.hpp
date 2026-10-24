@@ -465,7 +465,9 @@ public:
   /// Shared pool: uploads the whole block table on the arena stream.
   void UploadKvTable();
   /// Shared pool: holds back the blocks rows [0, rows) and `margin` more
-  /// blocks need beyond those mapped, replacing any earlier reservation.
+  /// blocks need beyond those mapped (capped at the context), plus one per
+  /// shared mapped block up to `margin` for copy-on-write, replacing any
+  /// earlier reservation.
   /// Throws std::length_error, holding nothing, when the pool lacks them.
   /// Returns the blocks reserved (zero for an own pool).
   std::uint32_t ReserveKvRows(std::uint32_t rows, std::uint32_t margin = 0);
