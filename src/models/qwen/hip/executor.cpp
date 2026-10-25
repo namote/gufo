@@ -484,17 +484,13 @@ void QwenGpuExecutor::SetPromptHiddenCapture(
 
 void QwenGpuExecutor::ReturnPassScratch() noexcept {
   const std::size_t hidden = weights_.config.hidden_size;
-  const std::size_t own_rows = arena_.GetOwnScratchRows();
-  if (last_hidden_offset_ >= own_rows * hidden) {
-    LogCleanupError(hipMemcpyAsync(
-        arena_.GetOwnHidden(), arena_.d_hidden + last_hidden_offset_,
-        hidden * sizeof(float), hipMemcpyDeviceToDevice, arena_.stream));
-    last_hidden_offset_ = 0;
-  } else {
-    LogCleanupError(hipMemcpyAsync(arena_.GetOwnHidden(), arena_.d_hidden,
-                                   own_rows * hidden * sizeof(float),
-                                   hipMemcpyDeviceToDevice, arena_.stream));
-  }
+  // Only the last row survives a pass: CopyLastHidden reads it, while the
+  // next decode or verification overwrites its own hidden rows. Normalize
+  // it to row zero before releasing the shared scratch to another session.
+  LogCleanupError(hipMemcpyAsync(
+      arena_.GetOwnHidden(), arena_.d_hidden + last_hidden_offset_,
+      hidden * sizeof(float), hipMemcpyDeviceToDevice, arena_.stream));
+  last_hidden_offset_ = 0;
   arena_.EndPassScratch();
 }
 
