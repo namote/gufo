@@ -1943,8 +1943,12 @@ void PagedRowsAdmitWaitAndReclaim() {
   auto b = pool.Acquire(second);
   b.ReserveRows(4);
   assert(runner->RowBlocks().free_blocks == 1);
-  // A resident holds the rest: the next admission waits rather than fail.
+  // A resident holds the rest: the next admission waits rather than fail,
+  // and waiting passes do not reset the emptied slot again.
+  const auto waiting_resets = runner->adapter->Invalidations();
   assert(!pool.AdmissionReady(third, 4));
+  assert(!pool.AdmissionReady(third, 4));
+  assert(runner->adapter->Invalidations() == waiting_resets);
   Prefill(b);
   (void)b.Commit();
   // A continuation of the idle frontier keeps it; the other slot is empty.
