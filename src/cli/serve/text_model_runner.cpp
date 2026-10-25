@@ -1457,11 +1457,14 @@ std::size_t TextRunnerPool::Request::ShareCheckpoint(
   // last prefill position instead so peers can start sooner.
   const auto target = std::min(common_tokens, impl_->prompt.size() - 1);
   const auto offset = impl_->prefill_offset;
-  if (target <= offset)
+  if (target < offset)
     return 0;
   // A peer can arrive while the stable-boundary copy is pending, or just
   // after it was published. Reuse that nearby frontier instead of inserting
   // another pass a few tokens later (for example, splitting framing 6 + 1).
+  // That includes a frontier at the target itself: a peer whose prompt ends
+  // one token past the leader's stable boundary arrives while the leader
+  // waits there for the copy.
   if (offset && impl_->lease.component() &&
       target - offset <= kSharedCheckpointSlack) {
     const bool capturing =
@@ -1474,6 +1477,8 @@ std::size_t TextRunnerPool::Request::ShareCheckpoint(
     if (capturing || published)
       return offset;
   }
+  if (target == offset)
+    return 0;
   // Prefill already publishes the fallback, this turn's stable boundary and
   // intermediate checkpoints before advancing past them.
   std::size_t planned = 0;
