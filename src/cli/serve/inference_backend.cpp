@@ -113,7 +113,7 @@ std::optional<std::size_t> CountQwenPromptTokens(
              tokenizer, request.messages, tools, options,
              encoder ? encoder->identity() : std::string_view{},
              std::numeric_limits<std::int32_t>::max(),
-             request.cache_prompt ? &image_cache : nullptr)
+             request.cache_prompt ? &image_cache : nullptr, false)
       .tokens.size();
 }
 
@@ -132,7 +132,14 @@ TextPreparedPrompt PrepareQwenPrompt(
               : std::span<const tokenization::ChatTool>{request.tools},
           options,
           encoder && has_images ? encoder->identity() : std::string_view{},
-          max_context, request.cache_prompt ? &image_cache : nullptr));
+          max_context, request.cache_prompt ? &image_cache : nullptr,
+          request.cache_prompt));
+  const auto method = models::qwen::vision::SystemPrefixMethodName(
+      prompt->system_prefix_method);
+  Logger::LogFormatted(LogLevel::kDebug, "cache",
+                       "event=system_prefix method=%.*s tokens=%zu",
+                       static_cast<int>(method.size()), method.data(),
+                       prompt->system_prefix_tokens);
   if (has_images && Logger::Enabled(LogLevel::kDebug)) {
     const auto stats = image_cache.GetStats();
     Logger::LogFormatted(LogLevel::kDebug, "vision",

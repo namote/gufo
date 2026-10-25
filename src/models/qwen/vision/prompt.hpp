@@ -6,6 +6,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "src/core/image.hpp"
@@ -48,13 +49,29 @@ struct PreparedImage {
   std::array<std::uint8_t, 32> prefix_identity{};
 };
 
+enum class SystemPrefixMethod { kNone, kRendered, kHoistedProbe };
+[[nodiscard]] constexpr std::string_view SystemPrefixMethodName(
+    SystemPrefixMethod method) {
+  switch (method) {
+    case SystemPrefixMethod::kRendered:
+      return "rendered";
+    case SystemPrefixMethod::kHoistedProbe:
+      return "hoisted_probe";
+    case SystemPrefixMethod::kNone:
+      return "none";
+  }
+  return "unknown";
+}
+
 struct Prompt {
   std::vector<tokenization::TokenId> tokens;
   /// Frontier unchanged when an interrupted assistant is followed by a user.
   std::size_t stable_prefix_tokens{0};
-  /// End of the rendered system turn, counted during prompt preparation.
-  /// Zero without leading system/developer messages followed by a turn.
+  /// Shared leading-instruction frontier: the rendered system turn end, or
+  /// the token-ID common prefix with a probe when later instructions hoist.
+  /// Zero when disabled or without an eligible leading instruction group.
   std::size_t system_prefix_tokens{0};
+  SystemPrefixMethod system_prefix_method{SystemPrefixMethod::kNone};
   RopeLayout rope;
   std::vector<PreparedImage> images;
   /// SHA-256 covers decoded pixels, grid placement, preprocessing version,
@@ -71,7 +88,7 @@ struct Prompt {
     std::span<const tokenization::ChatTool> tools,
     const tokenization::ChatTemplateOptions& options,
     std::string_view encoder_identity, std::uint32_t max_context,
-    ImageCache* image_cache = nullptr);
+    ImageCache* image_cache = nullptr, bool prepare_system_prefix = true);
 
 }  // namespace gufo::models::qwen::vision
 #endif

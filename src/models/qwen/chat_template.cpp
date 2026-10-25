@@ -603,7 +603,10 @@ std::optional<std::string> QwenChatTemplate::Render(
     std::span<const ChatMessage> messages, std::span<const ChatTool> tools,
     const ChatTemplateOptions& options, std::string* error_msg,
     std::vector<std::size_t>* image_offsets, std::size_t* stable_prefix_bytes,
-    std::vector<ContentSpan>* content_spans, std::size_t* system_prefix_bytes) {
+    std::vector<ContentSpan>* content_spans, std::size_t* system_prefix_bytes,
+    bool* hoisted_instructions) {
+  if (hoisted_instructions != nullptr)
+    *hoisted_instructions = false;
   if (system_prefix_bytes != nullptr)
     *system_prefix_bytes = 0;
   if (image_offsets != nullptr)
@@ -852,6 +855,8 @@ std::optional<std::string> QwenChatTemplate::Render(
 
   if (system_prefix_bytes != nullptr)
     *system_prefix_bytes = system_end;
+  if (hoisted_instructions != nullptr)
+    *hoisted_instructions = !hoisted.empty();
   return output;
 }
 

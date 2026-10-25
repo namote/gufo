@@ -46,7 +46,7 @@ struct TextPreparedPrompt {
   std::shared_ptr<const TextPromptContext> context;
   /// Snapshot before mutable assistant framing. Zero uses the complete prompt.
   std::size_t cache_prefix_tokens{0};
-  /// End of the leading system turn, supplied by prompt preparation.
+  /// Shared leading-instruction frontier, supplied by prompt preparation.
   /// Zero when the renderer cannot provide a safe token boundary.
   std::size_t system_prefix_tokens{0};
 };
