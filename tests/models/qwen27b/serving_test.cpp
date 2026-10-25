@@ -586,6 +586,23 @@ int main(int argc, const char* const* argv) {
                        .min_draft_tokens = 2}) &&
             error.find("min-draft-tokens") != std::string::npos,
         "DFlash must reject an unused adaptive draft floor");
+    // Paged KV is the default: without --kv-pool-bytes the pool holds every
+    // session's full context (the loads above and below). An explicit size
+    // is used as given and must still hold one full-context session.
+    Expect(!backend.load(model, &error, context, state_count, {}, {}, {}, {},
+                         {.kv_pool_bytes = 1}) &&
+               error.find("--kv-pool-bytes") != std::string::npos,
+           "a KV pool below one full-context session must be refused");
+    {
+      gufo::server::InferenceBackend explicit_pool;
+      Expect(explicit_pool.load(model, &error, context, state_count, {}, {}, {},
+                                {}, {.kv_pool_bytes = std::size_t{1} << 30}),
+             error);
+      const gufo::server::ChatRequest hello(
+          {{gufo::tokenization::ChatRole::kUser, "Say hello."}});
+      Expect(!explicit_pool.chat(hello, 4, {}).tokens.empty(),
+             "an explicitly sized KV pool must serve a request");
+    }
     Expect(backend.load(model, &error, context, state_count, {},
                         {.max_pending_requests_per_client = 8}),
            error);

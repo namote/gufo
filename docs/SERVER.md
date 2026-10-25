@@ -211,8 +211,9 @@ positive value sets a byte cap that may exceed the automatic budget, up to the
 available host RAM minus 4 GiB; the startup line reports both as
 `automatic_bytes` and `max_bytes`.
 Qwen27B sessions with FP16 attention KV map 256-token blocks from one device
-pool as they write. The pool holds every session's full context unless
-`--kv-pool-bytes N` sizes it; admission waits while it cannot hold a request.
+pool as they write; there is no switch to turn this off. The pool holds every
+session's full context unless `--kv-pool-bytes N` sizes it (0, the default,
+keeps that size); admission waits while it cannot hold a request.
 `--cache-tail-checkpoints K` (default 3, where checkpoints keep KV as pool
 blocks) keeps K RAM checkpoints near the end of long prompts. See
 [KV-CACHE.md](KV-CACHE.md#limits).
