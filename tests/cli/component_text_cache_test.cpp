@@ -2565,6 +2565,14 @@ void RowReclaimKeepsTheCheckpointABranchRestores() {
   assert(cache.ReclaimRows(branch, false, [&] {
     return runner->adapter->RetainedChunks() == 0;
   }) == ComponentTextCache::RowReclaim::kReady);
+  // Nor does it continue the live frontier its prompt extends.
+  (void)CapturePrompt(cache, *runner, prompt);
+  auto longer = prompt;
+  longer.push_back(7);
+  const auto before = runner->adapter->Invalidations();
+  assert(cache.ReclaimRows(longer, false, [&] {
+    return runner->adapter->Invalidations() > before;
+  }) == ComponentTextCache::RowReclaim::kReady);
 }
 void NearbyStableBoundaryDoesNotSplitAContinuation() {
   // A stable boundary within 64 tokens of the reused frontier is not worth a

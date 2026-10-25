@@ -143,15 +143,14 @@ public:
   };
   // Returns the paged rows idle slots hold until `enough()` holds. Slots
   // without a live frontier go first. Then checkpoints holding device rows
-  // only they use are dropped, lowest retention priority first, except those
-  // `prompt` may restore when `reuse` (its prefixes): their rows serve the
-  // request. Then
-  // live frontiers that `prompt` does not continue, a frontier some checkpoint
-  // covers before the only copy of its work, oldest first; without device
-  // row retention an uncovered one is captured first. A slot is reset at
-  // most once per call, and not again until it is leased; its borrowed
-  // checkpoint rows are preserved as on any cold reassignment.
-  // `enough` runs without the cache lock.
+  // only they use are dropped, lowest retention priority first. Then live
+  // frontiers, a frontier some checkpoint covers before the only copy of its
+  // work, oldest first; without device row retention an uncovered one is
+  // captured first. With `reuse` the request may restore its prefix
+  // checkpoints and continue a live frontier, so those are kept: their rows
+  // serve it. A slot is reset at most once per call, and not again until it
+  // is leased; its borrowed checkpoint rows are preserved as on any cold
+  // reassignment. `enough` runs without the cache lock.
   [[nodiscard]] RowReclaim ReclaimRows(std::span<const ContinuationToken>,
                                        bool reuse,
                                        const std::function<bool()>& enough);

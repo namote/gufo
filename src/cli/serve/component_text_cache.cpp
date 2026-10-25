@@ -1379,7 +1379,7 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
         }
         if (!candidate->holds_rows ||
             std::ranges::find(visited, candidate.get()) != visited.end() ||
-            (candidate->live && continues(*candidate)))
+            (candidate->live && reuse && continues(*candidate)))
           continue;
         const Rank rank{bool(candidate->live),
                         candidate->live && !covered(*candidate),
