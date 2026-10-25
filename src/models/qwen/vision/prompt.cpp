@@ -252,22 +252,29 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
                std::span<const tokenization::ChatTool> tools,
                const tokenization::ChatTemplateOptions& options,
                std::string_view encoder_identity, std::uint32_t max_context,
-               ImageCache* image_cache) {
+               ImageCache* image_cache, bool prepare_system_prefix) {
   std::vector<std::size_t> offsets;
   std::vector<tokenization::ContentSpan> content_spans;
   std::size_t stable_prefix_bytes = 0;
+  std::size_t system_prefix_bytes = 0;
+  bool hoisted_instructions = false;
   std::string error;
   const auto rendered = tokenization::QwenChatTemplate::Render(
       messages, tools, options, &error, &offsets, &stable_prefix_bytes,
-      &content_spans);
+      &content_spans, &system_prefix_bytes, &hoisted_instructions);
   if (!rendered)
     throw std::invalid_argument(error);
   Prompt prompt;
+  // Splitting before an actual special token preserves the full prompt's
+  // tokenization. A tokenizer without that framing cannot publish a boundary.
+  if (!prepare_system_prefix ||
+      !tokenizer.FindSpecialToken(tokenization::kImStart))
+    system_prefix_bytes = 0;
   tokenization::TokenizerOptions tok_options;
   tok_options.add_bos = false;
   tok_options.add_eos = false;
   tok_options.parse_special_tokens = true;
-  const auto append = [&](std::size_t begin, std::size_t end) {
+  const auto append_tokens = [&](std::size_t begin, std::size_t end) {
     auto tokens = tokenization::QwenChatTemplate::EncodeRendered(
         tokenizer, *rendered, begin, end, content_spans, tok_options);
     if (tokens.size() > max_context - prompt.tokens.size()) {
@@ -276,6 +283,15 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
           "-token context; increase --context or shorten the conversation");
     }
     prompt.tokens.insert(prompt.tokens.end(), tokens.begin(), tokens.end());
+  };
+  const auto append = [&](std::size_t begin, std::size_t end) {
+    if (begin < system_prefix_bytes && system_prefix_bytes <= end) {
+      append_tokens(begin, system_prefix_bytes);
+      prompt.system_prefix_tokens = prompt.tokens.size();
+      prompt.system_prefix_method = SystemPrefixMethod::kRendered;
+      begin = system_prefix_bytes;
+    }
+    append_tokens(begin, end);
   };
   crypto::Sha256Hasher identity;
   constexpr auto version = kImagePreprocessingVersion;
@@ -317,6 +333,31 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
     }
   }
   append(cursor, rendered->size());
+  // Hoisted instructions can differ after the original leading group. Select
+  // this path from the input layout, before computing its boundary. Compare
+  // complete token IDs instead of cutting plain text at an unsafe BPE boundary.
+  // A selected probe that fails is an error, never a retry of another path.
+  if (prepare_system_prefix && hoisted_instructions) {
+    const auto leading_end =
+        std::ranges::find_if_not(messages, [](const auto& m) {
+          return m.role == tokenization::ChatRole::kSystem ||
+                 m.role == tokenization::ChatRole::kDeveloper;
+        });
+    if (leading_end != messages.begin() && leading_end != messages.end()) {
+      prompt.system_prefix_method = SystemPrefixMethod::kHoistedProbe;
+      std::vector<tokenization::ChatMessage> probe(messages.begin(),
+                                                   leading_end);
+      probe.emplace_back(tokenization::ChatRole::kUser, "");
+      const auto tokens = tokenization::QwenChatTemplate::RenderAndTokenize(
+          tokenizer, probe, tools, options, &error);
+      if (!tokens)
+        throw std::invalid_argument("cannot prepare hoisted system probe: " +
+                                    error);
+      prompt.system_prefix_tokens = static_cast<std::size_t>(
+          std::ranges::mismatch(prompt.tokens, *tokens).in1 -
+          prompt.tokens.begin());
+    }
+  }
   // The boundary starts a special token (the assistant turn, or a final user
   // turn an agent replaces each request), after every image.
   // Encode only the mutable suffix; never decode or resize images twice.

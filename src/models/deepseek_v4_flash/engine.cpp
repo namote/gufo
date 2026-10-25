@@ -207,15 +207,31 @@ std::vector<int> Model::EncodeChat(std::string_view system_prompt,
 }
 
 std::vector<int> Model::EncodeChat(std::span<const ChatMessage> messages,
-                                   const ChatTemplateOptions& options) const {
-  return EncodeChat(messages, {}, options);
+                                   const ChatTemplateOptions& options,
+                                   std::size_t* system_prefix_tokens) const {
+  return EncodeChat(messages, {}, options, system_prefix_tokens);
 }
 
 std::vector<int> Model::EncodeChat(std::span<const ChatMessage> messages,
                                    std::span<const ChatTool> tools,
-                                   const ChatTemplateOptions& options) const {
-  const std::string rendered = RenderChat(messages, tools, options);
-  return Tokenize(rendered, true);
+                                   const ChatTemplateOptions& options,
+                                   std::size_t* system_prefix_tokens) const {
+  if (system_prefix_tokens)
+    *system_prefix_tokens = 0;
+  std::size_t prefix_bytes = 0;
+  const std::string rendered = RenderChat(
+      messages, tools, options, system_prefix_tokens ? &prefix_bytes : nullptr);
+  if (!system_prefix_tokens || prefix_bytes == 0)
+    return Tokenize(rendered, true);
+  // The native rendered-chat tokenizer separates User/Assistant special
+  // tokens before BPE (tokenizer.cpp:tokenize_rendered_chat_vocab), so no
+  // merge crosses this boundary. Neither segment inserts an implicit BOS.
+  const std::string_view view(rendered);
+  auto tokens = Tokenize(view.substr(0, prefix_bytes), true);
+  *system_prefix_tokens = tokens.size();
+  const auto suffix = Tokenize(view.substr(prefix_bytes), true);
+  tokens.insert(tokens.end(), suffix.begin(), suffix.end());
+  return tokens;
 }
 
 std::string Model::DecodeToken(int token) const {

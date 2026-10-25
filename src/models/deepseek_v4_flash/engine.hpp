@@ -74,10 +74,15 @@ public:
                                             std::string_view user_prompt) const;
   [[nodiscard]] std::vector<int> EncodeChat(
       std::span<const ChatMessage> messages,
-      const ChatTemplateOptions& options = {}) const;
+      const ChatTemplateOptions& options = {},
+      std::size_t* system_prefix_tokens = nullptr) const;
+  /// Renders once and tokenizes each byte once. The optional system prefix
+  /// ends before a native special token, so splitting there preserves the
+  /// full rendered conversation's token IDs.
   [[nodiscard]] std::vector<int> EncodeChat(
       std::span<const ChatMessage> messages, std::span<const ChatTool> tools,
-      const ChatTemplateOptions& options = {}) const;
+      const ChatTemplateOptions& options = {},
+      std::size_t* system_prefix_tokens = nullptr) const;
   [[nodiscard]] std::string DecodeToken(int token) const;
   [[nodiscard]] bool IsStopToken(int token) const;
   [[nodiscard]] int EosToken() const;

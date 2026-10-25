@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -1193,6 +1194,390 @@ void TestStableBoundaryPrecedesReplacedFinalUserTurn() {
          "opening turn keeps the boundary before the generation prompt");
 }
 
+std::unique_ptr<gufo::tokenization::QwenTokenizer> SystemPrefixTokenizer(
+    bool start_token = true) {
+  using namespace gufo::tokenization;
+  std::vector<std::string> vocab;
+  for (int i = 0; i < 256; ++i)
+    vocab.emplace_back(1, static_cast<char>(i));
+  std::unordered_map<std::string, TokenId> specials;
+  for (const auto token : {kImStart, kImEnd, std::string_view("<think>"),
+                           std::string_view("</think>"), kEndOfText, kImagePad,
+                           kVisionStart, kVisionEnd}) {
+    if (start_token || token != kImStart)
+      specials[std::string(token)] = static_cast<TokenId>(vocab.size());
+    vocab.emplace_back(token);
+  }
+  vocab.emplace_back(".\n");
+  const std::vector<std::string> merges{". \n"};
+  auto tokenizer = QwenTokenizer::CreateFromVocabulary(vocab, merges, specials);
+  Expect(tokenizer != nullptr, "System-prefix tokenizer initializes");
+  return tokenizer;
+}
+
+std::size_t LegacySystemPrefixProbe(
+    const gufo::tokenization::QwenTokenizer& tokenizer,
+    std::span<const gufo::tokenization::ChatMessage> messages,
+    std::span<const gufo::tokenization::ChatTool> tools,
+    const gufo::tokenization::ChatTemplateOptions& options,
+    std::span<const gufo::tokenization::TokenId> full_tokens) {
+  using namespace gufo::tokenization;
+  const auto leading_end =
+      std::ranges::find_if_not(messages, [](const auto& m) {
+        return m.role == ChatRole::kSystem || m.role == ChatRole::kDeveloper;
+      });
+  if (leading_end == messages.begin() || leading_end == messages.end())
+    return 0;
+  std::vector<ChatMessage> probe(messages.begin(), leading_end);
+  probe.emplace_back(ChatRole::kUser, "");
+  // Independent reference for the old probe contract: prepare just the
+  // leading instructions, with boundary discovery disabled, then compare IDs.
+  const auto prepared = gufo::models::qwen::vision::Prepare(
+      tokenizer, probe, tools, options, {}, 32768, nullptr, false);
+  return static_cast<std::size_t>(
+      std::ranges::mismatch(full_tokens, prepared.tokens).in1 -
+      full_tokens.begin());
+}
+
+gufo::models::qwen::vision::Prompt CheckPreparedSystemPrefix(
+    const gufo::tokenization::QwenTokenizer& tokenizer,
+    const std::vector<gufo::tokenization::ChatMessage>& messages,
+    std::span<const gufo::tokenization::ChatTool> tools,
+    const gufo::tokenization::ChatTemplateOptions& options,
+    std::string_view first_following_turn) {
+  using namespace gufo::tokenization;
+  using gufo::models::qwen::vision::SystemPrefixMethod;
+  std::vector<ContentSpan> spans;
+  std::size_t boundary = 999;
+  bool hoisted = false;
+  const auto rendered =
+      QwenChatTemplate::Render(messages, tools, options, nullptr, nullptr,
+                               nullptr, &spans, &boundary, &hoisted);
+  Expect(rendered &&
+             rendered == QwenChatTemplate::Render(messages, tools, options),
+         "Reporting the system boundary preserves rendered bytes");
+  const auto expected =
+      first_following_turn.empty() ? 0 : rendered->find(first_following_turn);
+  Expect(expected != std::string::npos && boundary == expected,
+         "System boundary ends before the first actual following turn");
+  const auto direct =
+      QwenChatTemplate::RenderAndTokenize(tokenizer, messages, tools, options);
+  const auto prepared = gufo::models::qwen::vision::Prepare(
+      tokenizer, messages, tools, options, {}, 32768);
+  Expect(direct && prepared.tokens == *direct,
+         "Counting the first-render system prefix preserves every token ID");
+  const auto bypass = gufo::models::qwen::vision::Prepare(
+      tokenizer, messages, tools, options, {}, 32768, nullptr, false);
+  Expect(bypass.tokens == prepared.tokens &&
+             bypass.stable_prefix_tokens == prepared.stable_prefix_tokens &&
+             bypass.system_prefix_tokens == 0 &&
+             bypass.system_prefix_method == SystemPrefixMethod::kNone,
+         "Bypass preserves full token IDs and disables boundary discovery");
+  const bool leading =
+      !messages.empty() && (messages.front().role == ChatRole::kSystem ||
+                            messages.front().role == ChatRole::kDeveloper);
+  if (hoisted && leading) {
+    Expect(boundary == 0 &&
+               prepared.system_prefix_method ==
+                   SystemPrefixMethod::kHoistedProbe &&
+               prepared.system_prefix_tokens ==
+                   LegacySystemPrefixProbe(tokenizer, messages, tools, options,
+                                           prepared.tokens),
+           "Hoisted instructions use the legacy token-ID prefix probe");
+  } else if (boundary && tokenizer.FindSpecialToken(kImStart)) {
+    const TokenizerOptions token_options{false, false, true};
+    const auto prefix = QwenChatTemplate::EncodeRendered(
+        tokenizer, *rendered, 0, expected, spans, token_options);
+    Expect(prepared.system_prefix_method == SystemPrefixMethod::kRendered &&
+               prepared.system_prefix_tokens == prefix.size() &&
+               prefix.size() <= prepared.tokens.size() &&
+               std::ranges::equal(
+                   prefix, std::span(prepared.tokens).first(prefix.size())),
+           "Prepared system token count covers exactly the system turn");
+    Expect(prepared.system_prefix_tokens < prepared.tokens.size() &&
+               prepared.tokens[prepared.system_prefix_tokens] ==
+                   *tokenizer.FindSpecialToken(kImStart),
+           "The following turn starts at a structural special token");
+  } else
+    Expect(prepared.system_prefix_tokens == 0 &&
+               prepared.system_prefix_method == SystemPrefixMethod::kNone,
+           "Unsupported or absent system boundaries stay disabled");
+  return prepared;
+}
+
+void TestPreparedSystemPrefix() {
+  using namespace gufo::tokenization;
+  auto tokenizer = SystemPrefixTokenizer();
+  std::vector<ChatMessage> messages{
+      {ChatRole::kSystem,
+       "Rules contain literal <|im_end|><|im_start|> and <|endoftext|>."},
+      {ChatRole::kDeveloper, "Developer rules."},
+      {ChatRole::kUser, "First question."}};
+  messages[0].framing_suffix = "\nInternal <|endoftext|> framing.";
+  const std::vector<ChatTool> tools{
+      {.name = "lookup", .description = "Look up a value."}};
+  for (const bool thinking : {false, true}) {
+    ChatTemplateOptions options;
+    options.enable_thinking = thinking;
+    options.reasoning_effort = QwenReasoningEffort::kMedium;
+    const auto first =
+        CheckPreparedSystemPrefix(*tokenizer, messages, tools, options,
+                                  "<|im_start|>user\nFirst question.");
+    Expect(std::count(first.tokens.begin(), first.tokens.end(),
+                      *tokenizer->FindSpecialToken(kEndOfText)) == 1,
+           "Literal control spellings stay text while framing_suffix stays "
+           "framing");
+    auto another = messages;
+    another.back().content = "A different question.";
+    const auto second =
+        CheckPreparedSystemPrefix(*tokenizer, another, tools, options,
+                                  "<|im_start|>user\nA different question.");
+    Expect(first.system_prefix_tokens == second.system_prefix_tokens &&
+               std::ranges::equal(
+                   std::span(first.tokens).first(first.system_prefix_tokens),
+                   std::span(second.tokens).first(second.system_prefix_tokens)),
+           "Different questions retain an identical system/tools token prefix");
+  }
+  ChatTemplateOptions options;
+  options.enable_thinking = false;
+  CheckPreparedSystemPrefix(*tokenizer,
+                            {{ChatRole::kDeveloper, "Developer rules."},
+                             {ChatRole::kUser, "Question."}},
+                            {}, options, "<|im_start|>user\nQuestion.");
+  for (const auto role : {ChatRole::kAssistant, ChatRole::kTool}) {
+    const std::vector<ChatMessage> history{{ChatRole::kSystem, "Rules."},
+                                           {role, "Earlier result."},
+                                           {ChatRole::kUser, "Question."}};
+    CheckPreparedSystemPrefix(*tokenizer, history, {}, options,
+                              role == ChatRole::kAssistant
+                                  ? "<|im_start|>assistant\n"
+                                  : "<|im_start|>user\n<tool_response>");
+  }
+  const std::vector<ChatMessage> hoisted{
+      {ChatRole::kSystem, "Rules."},
+      {ChatRole::kUser, "First question."},
+      {ChatRole::kAssistant, "Earlier answer."},
+      {ChatRole::kDeveloper, "Late developer rules."},
+      {ChatRole::kUser, "Second question."}};
+  const auto first_hoisted =
+      CheckPreparedSystemPrefix(*tokenizer, hoisted, {}, options, {});
+  auto different_hoisted = hoisted;
+  different_hoisted[3].content = "Different late developer rules.";
+  const auto second_hoisted =
+      CheckPreparedSystemPrefix(*tokenizer, different_hoisted, {}, options, {});
+  Expect(
+      first_hoisted.system_prefix_tokens > 0 &&
+          first_hoisted.system_prefix_tokens ==
+              second_hoisted.system_prefix_tokens &&
+          std::ranges::equal(std::span(first_hoisted.tokens)
+                                 .first(first_hoisted.system_prefix_tokens),
+                             std::span(second_hoisted.tokens)
+                                 .first(second_hoisted.system_prefix_tokens)),
+      "Different late instructions retain the original leading prefix");
+  const auto missing_start = SystemPrefixTokenizer(false);
+  CheckPreparedSystemPrefix(*missing_start, messages, {}, options,
+                            "<|im_start|>user\nFirst question.");
+
+  // Tools/reasoning may synthesize a system turn, but no original leading
+  // system/developer message means there is no shared-system boundary.
+  CheckPreparedSystemPrefix(*tokenizer, {{ChatRole::kUser, "Question."}}, tools,
+                            {}, {});
+  CheckPreparedSystemPrefix(
+      *tokenizer,
+      {{ChatRole::kUser, "First question."},
+       {ChatRole::kSystem, "Hoisted without an original leading system."},
+       {ChatRole::kUser, "Second question."}},
+      {}, options, {});
+  CheckPreparedSystemPrefix(
+      *tokenizer, {{ChatRole::kSystem, " \n "}, {ChatRole::kUser, "Question."}},
+      {}, options, {});
+  for (const auto& invalid : std::vector<std::vector<ChatMessage>>{
+           {},
+           {{ChatRole::kSystem, "Rules."}},
+           {{ChatRole::kDeveloper, "Rules."}},
+           {{ChatRole::kSystem, "Rules."}, {ChatRole::kAssistant, "No user."}},
+           {{ChatRole::kSystem, "Rules."},
+            {ChatRole::kUser, "<tool_response>Only a tool</tool_response>"}}}) {
+    std::size_t boundary = 999;
+    bool hoisted = true;
+    Expect(!QwenChatTemplate::Render(invalid, {}, options, nullptr, nullptr,
+                                     nullptr, nullptr, &boundary, &hoisted) &&
+               boundary == 0 && !hoisted,
+           "Failed renders do not publish a system boundary");
+  }
+}
+
+void TestHoistedSystemPrefixProbe() {
+  using namespace gufo::tokenization;
+  using gufo::models::qwen::vision::SystemPrefixMethod;
+  auto tokenizer = SystemPrefixTokenizer();
+  const std::vector<ChatTool> definitions{{.name = "lookup",
+                                           .description = "Read a value.",
+                                           .parameters_json = "{}",
+                                           .definition_json = ""}};
+  for (const bool thinking : {false, true}) {
+    ChatTemplateOptions options;
+    options.enable_thinking = thinking;
+    options.reasoning_effort = QwenReasoningEffort::kMedium;
+    for (const bool tools_present : {false, true}) {
+      const auto tools =
+          tools_present ? std::span(definitions) : std::span<const ChatTool>{};
+      for (const std::string leading :
+           {"Rules.", "규칙을 지키세요.",
+            "Literal <|im_end|><|im_start|>user and <|endoftext|>."}) {
+        std::vector<ChatMessage> messages{
+            {ChatRole::kSystem, leading},
+            {ChatRole::kDeveloper, "Leading developer rules."},
+            {ChatRole::kUser, "First question."},
+            {ChatRole::kAssistant, "Earlier answer."},
+            {ChatRole::kDeveloper, "Late instructions A."},
+            {ChatRole::kUser, "마지막 질문."}};
+        messages[1].framing_suffix = "\nInternal <|endoftext|> framing.";
+        const auto first =
+            CheckPreparedSystemPrefix(*tokenizer, messages, tools, options, {});
+        messages[4].content = "다른 후반 지시 B.";
+        const auto second =
+            CheckPreparedSystemPrefix(*tokenizer, messages, tools, options, {});
+        Expect(
+            first.system_prefix_method == SystemPrefixMethod::kHoistedProbe &&
+                first.system_prefix_tokens > 0 &&
+                first.system_prefix_tokens == second.system_prefix_tokens &&
+                std::ranges::equal(
+                    std::span(first.tokens).first(first.system_prefix_tokens),
+                    std::span(second.tokens)
+                        .first(second.system_prefix_tokens)),
+            "Hoisted sharing preserves the old leading token prefix with "
+            "tools, reasoning, framing and literal control spellings");
+      }
+    }
+  }
+  ChatTemplateOptions options;
+  options.enable_thinking = false;
+  // This tokenizer merges '.\n'. Hoisting adds that newline after Rules.,
+  // while the leading-only probe ends the system turn after the dot. The
+  // safe frontier must come from the token LCP, not a plain-text byte cut.
+  const std::vector<ChatMessage> punctuation{
+      {ChatRole::kSystem, "Rules."},
+      {ChatRole::kUser, "Question."},
+      {ChatRole::kDeveloper, "Late instructions."}};
+  const auto prepared =
+      CheckPreparedSystemPrefix(*tokenizer, punctuation, {}, options, {});
+  const auto prefix = tokenizer->Encode("<|im_start|>system\nRules",
+                                        TokenizerOptions{false, false, true});
+  Expect(prepared.system_prefix_tokens == prefix.size() &&
+             std::ranges::equal(
+                 prefix, std::span(prepared.tokens).first(prefix.size())),
+         "A punctuation merge shortens the hoisted frontier to complete IDs");
+  CheckPreparedSystemPrefix(*tokenizer,
+                            {{ChatRole::kSystem, " \n "},
+                             {ChatRole::kUser, "Question."},
+                             {ChatRole::kDeveloper, "Late instructions."}},
+                            {}, options, {});
+  const auto missing_start = SystemPrefixTokenizer(false);
+  CheckPreparedSystemPrefix(*missing_start, punctuation, {}, options, {});
+}
+
+void TestPreparedSystemPrefixBeforeImage() {
+  using namespace gufo::tokenization;
+  using gufo::models::qwen::vision::SystemPrefixMethod;
+  auto tokenizer = SystemPrefixTokenizer();
+  const auto bytes = std::make_shared<
+      const std::vector<std::uint8_t>>(gufo::core::ReadImageUrl(
+      "data:image/png;base64,"
+      "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAYklEQVR4nO3PMQ0AIADAMEAD"
+      "/jUiAREcDcmqYJtn7/GzpQNeNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWg"
+      "NaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaBdCLsBmEpLi1UAAAAASUVORK5CYII="));
+  std::vector<ChatMessage> messages{
+      {ChatRole::kSystem, "Describe the picture."},
+      {ChatRole::kUser, "Before  after."}};
+  messages.back().images.push_back({7, bytes});
+  ChatTemplateOptions options;
+  options.enable_thinking = false;
+  std::vector<ContentSpan> spans;
+  std::size_t boundary = 999;
+  const auto rendered = QwenChatTemplate::Render(
+      messages, {}, options, nullptr, nullptr, nullptr, &spans, &boundary);
+  Expect(rendered && boundary == rendered->find("<|im_start|>user\nBefore "),
+         "The rendered system boundary precedes image-bearing content");
+  const auto prepared = gufo::models::qwen::vision::Prepare(
+      *tokenizer, messages, {}, options, "cpu-test-encoder", 32768);
+  const TokenizerOptions token_options{false, false, true};
+  auto expected = QwenChatTemplate::EncodeRendered(
+      *tokenizer, *rendered, 0, rendered->size(), spans, token_options);
+  const auto image_pad = *tokenizer->FindSpecialToken(kImagePad);
+  const auto image = std::find(expected.begin(), expected.end(), image_pad);
+  Expect(image != expected.end() &&
+             std::count(expected.begin(), expected.end(), image_pad) == 1,
+         "The image fixture contains one structural placeholder");
+  const auto offset = image - expected.begin();
+  expected.erase(image);
+  expected.insert(expected.begin() + offset, 64,
+                  gufo::models::qwen::vision::kImageToken);
+  Expect(prepared.tokens == expected && prepared.images.size() == 1 &&
+             prepared.rope.images.size() == 1 &&
+             prepared.rope.images[0].height == 8 &&
+             prepared.rope.images[0].width == 8,
+         "System counting preserves full tokenization and the resized image "
+         "grid");
+  const auto prefix = QwenChatTemplate::EncodeRendered(
+      *tokenizer, *rendered, 0, boundary, spans, token_options);
+  Expect(prepared.system_prefix_method == SystemPrefixMethod::kRendered &&
+             prepared.system_prefix_tokens == prefix.size() &&
+             prefix.size() <= prepared.tokens.size() &&
+             prepared.system_prefix_tokens <= prepared.rope.images[0].offset &&
+             std::ranges::equal(
+                 prefix, std::span(prepared.tokens).first(prefix.size())),
+         "System token count excludes the user and visual tokens");
+  const auto bypass = gufo::models::qwen::vision::Prepare(
+      *tokenizer, messages, {}, options, "cpu-test-encoder", 32768, nullptr,
+      false);
+  Expect(bypass.tokens == prepared.tokens &&
+             bypass.cache_identity == prepared.cache_identity &&
+             bypass.rope.images[0].offset == prepared.rope.images[0].offset &&
+             bypass.system_prefix_tokens == 0 &&
+             bypass.system_prefix_method == SystemPrefixMethod::kNone,
+         "Image bypass preserves tokens, visual identity and placement");
+
+  messages.emplace_back(ChatRole::kAssistant, "A previous image answer.");
+  messages.emplace_back(ChatRole::kDeveloper, "Late image instructions A.");
+  messages.emplace_back(ChatRole::kUser, "A follow-up question.");
+  bool hoisted = false;
+  boundary = 999;
+  Expect(QwenChatTemplate::Render(messages, {}, options, nullptr, nullptr,
+                                  nullptr, nullptr, &boundary, &hoisted) &&
+             hoisted && boundary == 0,
+         "Hoisted image history has no first-render byte frontier");
+  const auto with_probe = gufo::models::qwen::vision::Prepare(
+      *tokenizer, messages, {}, options, "cpu-test-encoder", 32768);
+  const auto image_bypass = gufo::models::qwen::vision::Prepare(
+      *tokenizer, messages, {}, options, "cpu-test-encoder", 32768, nullptr,
+      false);
+  Expect(
+      with_probe.system_prefix_method == SystemPrefixMethod::kHoistedProbe &&
+          with_probe.system_prefix_tokens > 0 &&
+          with_probe.system_prefix_tokens ==
+              LegacySystemPrefixProbe(*tokenizer, messages, {}, options,
+                                      with_probe.tokens) &&
+          with_probe.system_prefix_tokens <= with_probe.rope.images[0].offset &&
+          image_bypass.tokens == with_probe.tokens &&
+          image_bypass.cache_identity == with_probe.cache_identity &&
+          image_bypass.rope.images[0].offset ==
+              with_probe.rope.images[0].offset &&
+          image_bypass.system_prefix_tokens == 0 &&
+          image_bypass.system_prefix_method == SystemPrefixMethod::kNone,
+      "The hoisted token probe preserves image history and bypass metadata");
+  messages[3].content = "다른 이미지 지시 B.";
+  const auto different = gufo::models::qwen::vision::Prepare(
+      *tokenizer, messages, {}, options, "cpu-test-encoder", 32768);
+  Expect(
+      different.system_prefix_tokens == with_probe.system_prefix_tokens &&
+          std::ranges::equal(
+              std::span(different.tokens).first(different.system_prefix_tokens),
+              std::span(with_probe.tokens)
+                  .first(with_probe.system_prefix_tokens)),
+      "Different late image instructions keep the leading text reusable");
+}
+
 }  // namespace
 
 int main() {
@@ -1217,6 +1602,9 @@ int main() {
   TestToolReplayPreservesGeneratedPrefix();
   TestEmptyReasoningReplayChangesThinkingSuffixTokens();
   TestStableBoundaryPrecedesReplacedFinalUserTurn();
+  TestPreparedSystemPrefix();
+  TestHoistedSystemPrefixProbe();
+  TestPreparedSystemPrefixBeforeImage();
   std::cout << "All QwenChatTemplate tests passed successfully!\n";
   return 0;
 }

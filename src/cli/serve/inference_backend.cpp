@@ -113,7 +113,7 @@ std::optional<std::size_t> CountQwenPromptTokens(
              tokenizer, request.messages, tools, options,
              encoder ? encoder->identity() : std::string_view{},
              std::numeric_limits<std::int32_t>::max(),
-             request.cache_prompt ? &image_cache : nullptr)
+             request.cache_prompt ? &image_cache : nullptr, false)
       .tokens.size();
 }
 
@@ -132,7 +132,14 @@ TextPreparedPrompt PrepareQwenPrompt(
               : std::span<const tokenization::ChatTool>{request.tools},
           options,
           encoder && has_images ? encoder->identity() : std::string_view{},
-          max_context, request.cache_prompt ? &image_cache : nullptr));
+          max_context, request.cache_prompt ? &image_cache : nullptr,
+          request.cache_prompt));
+  const auto method = models::qwen::vision::SystemPrefixMethodName(
+      prompt->system_prefix_method);
+  Logger::LogFormatted(LogLevel::kDebug, "cache",
+                       "event=system_prefix method=%.*s tokens=%zu",
+                       static_cast<int>(method.size()), method.data(),
+                       prompt->system_prefix_tokens);
   if (has_images && Logger::Enabled(LogLevel::kDebug)) {
     const auto stats = image_cache.GetStats();
     Logger::LogFormatted(LogLevel::kDebug, "vision",
@@ -144,8 +151,9 @@ TextPreparedPrompt PrepareQwenPrompt(
                          stats.misses, stats.evictions);
   }
   const auto cache_prefix = prompt->stable_prefix_tokens;
+  const auto system_prefix = prompt->system_prefix_tokens;
   if (prompt->images.empty())
-    return {std::move(prompt->tokens), {}, cache_prefix};
+    return {std::move(prompt->tokens), {}, cache_prefix, system_prefix};
   if (!encoder)
     throw std::invalid_argument(
         "image input requires a matching --mmproj BF16 sidecar");
@@ -157,7 +165,7 @@ TextPreparedPrompt PrepareQwenPrompt(
         {image.grid.offset, {identity.begin(), identity.end()}});
   }
   context->prompt = prompt;
-  return {prompt->tokens, std::move(context), cache_prefix};
+  return {prompt->tokens, std::move(context), cache_prefix, system_prefix};
 }
 
 std::shared_ptr<const models::qwen::vision::Prompt> QwenPrompt(
@@ -1825,6 +1833,15 @@ public:
 
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ChatRequest& request) const override {
+    return PrepareChatTokens(request);
+  }
+
+  [[nodiscard]] std::optional<std::vector<TextRunnerToken>> PrepareChatTokens(
+      const ChatRequest& request,
+      std::size_t* system_prefix_tokens = nullptr) const {
+    for (const auto& message : request.messages)
+      if (!message.images.empty())
+        throw std::invalid_argument("model does not support image input");
     std::vector<models::deepseek_v4_flash::ChatMessage> messages;
     messages.reserve(request.messages.size());
     for (const auto& message : request.messages) {
@@ -1875,8 +1892,8 @@ public:
     options.tools_present =
         !request.tools.empty() &&
         request.tool_choice != ChatRequest::ToolChoice::kNone;
-    auto tokens =
-        DeepSeekRunnerTokens(model_->EncodeChat(messages, tools, options));
+    auto tokens = DeepSeekRunnerTokens(
+        model_->EncodeChat(messages, tools, options, system_prefix_tokens));
     if (tokens.empty()) {
       return std::nullopt;
     }
@@ -1894,8 +1911,13 @@ public:
 
   [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
       const ChatRequest& request) const override {
-    auto prepared = TextModelRunner::PreparePrompt(request);
-    if (prepared) {
+    std::size_t system_prefix_tokens = 0;
+    auto tokens = PrepareChatTokens(request, &system_prefix_tokens);
+    if (!tokens)
+      return std::nullopt;
+    TextPreparedPrompt prepared{
+        std::move(*tokens), {}, 0, system_prefix_tokens};
+    {
       // DeepSeek joins adjacent user/tool messages into one user block.
       // A new user turn after a discarded assistant can therefore also change
       // the final BPE token before the generation suffix (e.g. ">\n\n").
@@ -1905,11 +1927,11 @@ public:
       continuation.messages.emplace_back(tokenization::ChatRole::kUser, "");
       const auto continued = RenderAndTokenize(continuation);
       if (continued) {
-        prepared->cache_prefix_tokens = static_cast<std::size_t>(
-            std::mismatch(prepared->tokens.begin(), prepared->tokens.end(),
+        prepared.cache_prefix_tokens = static_cast<std::size_t>(
+            std::mismatch(prepared.tokens.begin(), prepared.tokens.end(),
                           continued->begin(), continued->end())
                 .first -
-            prepared->tokens.begin());
+            prepared.tokens.begin());
       }
     }
     return prepared;
@@ -3920,9 +3942,7 @@ InferenceBackend::Result InferenceBackend::chat(
         state->scheduler->runner().BuildReasoningBudget(
             *request.reasoning.budget_tokens, prompt->tokens);
   const std::size_t system_prefix_tokens =
-      request.cache_prompt ? state->scheduler->runner().SystemPrefixTokens(
-                                 effective_request, prompt->tokens)
-                           : 0;
+      request.cache_prompt ? prompt->system_prefix_tokens : 0;
   return impl_->GenerateScheduled(
       state, std::move(prompt->tokens), request_start, max_tokens,
       effective_sampling, is_cancelled, on_token, request.client_id,
@@ -4013,9 +4033,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
       request.client_id.empty() ? "anonymous" : request.client_id;
   // Before Submit moves the tokens: argument evaluation order is unspecified.
   const std::size_t system_prefix_tokens =
-      request.cache_prompt ? state->scheduler->runner().SystemPrefixTokens(
-                                 effective_request, prompt->tokens)
-                           : 0;
+      request.cache_prompt ? prompt->system_prefix_tokens : 0;
   auto scheduled_request = state->scheduler->Submit(
       std::move(prompt->tokens), max_tokens, effective_sampling, is_cancelled,
       stream_output,

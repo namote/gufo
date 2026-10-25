@@ -199,6 +199,51 @@ void RunPromptReuseSmoke(
          "cached continuation must generate at least one token");
 }
 
+void CheckSystemBoundaryReuse(
+    const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
+    gufo::server::InferenceBackend& backend) {
+  using Role = gufo::tokenization::ChatRole;
+  std::string system;
+  for (int i = 0; i < 24; ++i)
+    system += "Be concise and use accurate terms. ";
+  const auto request = [&](std::string text) {
+    gufo::server::ChatRequest result(
+        {{Role::kSystem, system}, {Role::kUser, std::move(text)}});
+    result.reasoning.enabled = false;
+    return result;
+  };
+  const auto root = request("Name one primary color.");
+  const auto options =
+      gufo::tokenization::ResolveQwenChatOptions(root.reasoning);
+  std::size_t boundary = 0;
+  const auto rendered = gufo::tokenization::QwenChatTemplate::Render(
+      root.messages, {}, options, nullptr, nullptr, nullptr, nullptr,
+      &boundary);
+  Expect(rendered && boundary > 0, "system boundary was not rendered");
+  gufo::tokenization::TokenizerOptions framing;
+  framing.parse_special_tokens = true;
+  const auto system_tokens = model->GetTokenizer().Encode(
+      std::string_view(*rendered).substr(0, boundary), framing);
+  Expect(system_tokens.size() >= 128,
+         "system fixture must reach checkpoint admission threshold");
+  (void)backend.chat(root, 1, {});
+  const auto follower =
+      backend.chat(request("Name one secondary color."), 1, {});
+  Expect(follower.cache_hit &&
+             follower.cached_prompt_tokens == system_tokens.size(),
+         "chat did not use the first render's system boundary");
+  auto asynchronous = request("Name one metallic color.");
+  const auto queued = backend.start_chat(asynchronous, 1, {})->Wait();
+  Expect(
+      queued.cache_hit && queued.cached_prompt_tokens == system_tokens.size(),
+      "start_chat did not use the first render's system boundary");
+  asynchronous.cache_prompt = false;
+  const auto cold = backend.chat(asynchronous, 1, {});
+  Expect(!cold.cache_hit && cold.tokens == queued.tokens,
+         "system-only reuse changed generated tokens or ignored bypass");
+  std::cout << "First-render system boundary reuse passed.\n";
+}
+
 void CheckGeneratedFrontierReuse(
     const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
     const char* draft_path) {
@@ -1183,6 +1228,8 @@ int main(int argc, const char* const* argv) {
     Expect(concurrent_result_a.execution_plan == "batched-w2" &&
                concurrent_result_b.execution_plan == "batched-w2",
            "concurrent Qwen requests did not report the W=2 plan");
+
+    CheckSystemBoundaryReuse(model, backend);
 
     // Retaining this new prompt legitimately allocates a full checkpoint.
     // Establish that retention before measuring cancellation/error cleanup.
