@@ -747,7 +747,7 @@ void NewestPendingFrontierSurvives() {
             started = true;
             return idle.load();
           },
-          [&](CheckpointId id, bool succeeded) {
+          [&](CheckpointId id, bool succeeded, const TransferTiming&) {
             if (id == CheckpointId{2} && !succeeded) {
               // Replacement callbacks may query the queue and release serving
               // ownership; neither operation may run under the queue lock.

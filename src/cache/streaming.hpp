@@ -157,13 +157,15 @@ struct PersistenceQueueStats {
 // Keep the first pending boundary and coalesce later pending ancestors into
 // their newest descendant. Under pressure, recent jobs
 // may replace the oldest pending non-learned job; active writes are untouched.
-// Completion reports false for superseded work, outside the queue lock.
+// Completion reports false for superseded work, outside the queue lock, with
+// the job's write costs (zero for work that never started).
 class PersistenceQueue {
 public:
   PersistenceQueue(
       ResourceLedger&, StreamedStore&, std::size_t max_depth,
       std::size_t max_pinned_bytes, std::function<bool()> model_idle,
-      std::function<void(CheckpointId, bool)> completed = {},
+      std::function<void(CheckpointId, bool, const TransferTiming&)> completed =
+          {},
       std::function<bool(const DiskManifest&)> reclaim = {},
       std::chrono::milliseconds yield_limit = kPersistenceYieldLimit);
   ~PersistenceQueue();
