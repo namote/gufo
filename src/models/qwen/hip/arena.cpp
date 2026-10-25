@@ -1017,6 +1017,8 @@ void QwenGpuArena::RequireOwnKvPool() const {
 void QwenGpuArena::EnsureKvRows(std::uint32_t end) {
   if (!kv_shared_)
     return;
+  if (kv_unmapped_blocks_ != 0)
+    throw std::logic_error("Qwen KV restore has unmapped blocks");
   if (end > max_context_)
     throw std::length_error("Qwen KV rows exceed the context length");
   const std::size_t mapped = kv_blocks_.size();
@@ -1037,6 +1039,28 @@ void QwenGpuArena::EnsureKvRows(std::uint32_t end) {
       (need - mapped) * sizeof(std::uint32_t), hipMemcpyHostToDevice, stream));
 }
 
+void QwenGpuArena::PrepareKvRestoreRows(std::uint32_t end) {
+  if (!kv_shared_)
+    return;
+  if (end > max_context_)
+    throw std::length_error("Qwen KV restore exceeds the context length");
+  TruncateKvRows(end);
+  const auto previous = kv_blocks_.size();
+  kv_blocks_.resize(KvBlockPool::BlocksFor(end), kUnmappedKvBlock);
+  kv_unmapped_blocks_ += kv_blocks_.size() - previous;
+}
+
+void QwenGpuArena::EnsureKvRestoreBlock(std::uint32_t logical) {
+  if (!kv_shared_)
+    return;
+  auto& block = kv_blocks_.at(logical);
+  if (block != kUnmappedKvBlock)
+    return;
+  block = kv_pool_->Allocate(1, &kv_reservation_).front();
+  h_kv_block_table_[logical] = block;
+  --kv_unmapped_blocks_;
+}
+
 void QwenGpuArena::TruncateKvRows(std::uint32_t rows) {
   if (!kv_shared_)
     return;
@@ -1045,7 +1069,10 @@ void QwenGpuArena::TruncateKvRows(std::uint32_t rows) {
     return;
   // Passes and table uploads in flight may still use these blocks.
   HIP_CHECK(hipStreamSynchronize(stream));
-  kv_pool_->Release(std::span(kv_blocks_).subspan(keep));
+  const auto released = std::span(kv_blocks_).subspan(keep);
+  if (kv_unmapped_blocks_ != 0)
+    kv_unmapped_blocks_ -= std::ranges::count(released, kUnmappedKvBlock);
+  kv_pool_->Release(released);
   kv_blocks_.resize(keep);
 }
 
@@ -1111,12 +1138,17 @@ void QwenGpuArena::MapKvBlock(std::uint32_t logical, std::uint32_t block) {
   kv_pool_->Retain(std::span(&block, 1));
   kv_blocks_[logical] = block;
   h_kv_block_table_[logical] = block;
-  kv_pool_->Release(std::span(&replaced, 1), kv_reservation_);
+  if (replaced == kUnmappedKvBlock)
+    --kv_unmapped_blocks_;
+  else
+    kv_pool_->Release(std::span(&replaced, 1), kv_reservation_);
 }
 
 void QwenGpuArena::UploadKvTable() {
   if (!kv_shared_ || kv_blocks_.empty())
     return;
+  if (kv_unmapped_blocks_ != 0)
+    throw std::logic_error("Qwen KV restore has unmapped blocks");
   HIP_CHECK(hipMemcpyAsync(d_kv_block_table_, h_kv_block_table_,
                            kv_blocks_.size() * sizeof(std::uint32_t),
                            hipMemcpyHostToDevice, stream));
@@ -1127,6 +1159,8 @@ std::uint32_t QwenGpuArena::ReserveKvRows(std::uint32_t rows,
                                           std::uint32_t first) {
   if (!kv_shared_)
     return 0;
+  if (kv_unmapped_blocks_ != 0)
+    throw std::logic_error("Qwen KV restore has unmapped blocks");
   // The margin pays for draft rows past `rows` and for copying a shared
   // block the writes start inside (UnshareKvRows), capped at the context.
   // Writes start at row `first`: only a block it splits may be copied, and
@@ -1291,6 +1325,7 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   kv_pool_ = std::move(other.kv_pool_);
   kv_shared_ = other.kv_shared_;
   kv_blocks_ = std::move(other.kv_blocks_);
+  kv_unmapped_blocks_ = std::exchange(other.kv_unmapped_blocks_, 0);
   d_kv_block_table_ = std::exchange(other.d_kv_block_table_, nullptr);
   h_kv_block_table_ = std::exchange(other.h_kv_block_table_, nullptr);
   kv_reservation_ = std::move(other.kv_reservation_);
@@ -1402,6 +1437,7 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     kv_pool_ = std::move(other.kv_pool_);
     kv_shared_ = other.kv_shared_;
     kv_blocks_ = std::move(other.kv_blocks_);
+    kv_unmapped_blocks_ = std::exchange(other.kv_unmapped_blocks_, 0);
     d_kv_block_table_ = std::exchange(other.d_kv_block_table_, nullptr);
     h_kv_block_table_ = std::exchange(other.h_kv_block_table_, nullptr);
     kv_reservation_ = std::move(other.kv_reservation_);
@@ -1545,6 +1581,7 @@ void QwenGpuArena::FreeAll() noexcept {
   }
   kv_reservation_.Reset();
   kv_blocks_.clear();
+  kv_unmapped_blocks_ = 0;
   kv_pool_.reset();
   if (d_kv_block_table_ != nullptr)
     LogCleanupError(hipFree(d_kv_block_table_));

@@ -450,6 +450,12 @@ public:
   /// from the reservation first (ReserveKvRows). Throws std::length_error,
   /// mapping nothing, when the pool falls short. No-op for an own pool.
   void EnsureKvRows(std::uint32_t end);
+  /// Prepares logical restore entries without allocating their pool blocks.
+  /// Whole retained chunks can then be mapped directly; only copied rows
+  /// need EnsureKvRestoreBlock. No execution may use an incomplete table.
+  void PrepareKvRestoreRows(std::uint32_t end);
+  void EnsureKvRestoreBlock(std::uint32_t logical);
+  static constexpr std::uint32_t kUnmappedKvBlock = ~std::uint32_t{0};
   /// Shared pool: returns the blocks past `rows` once queued passes finish.
   void TruncateKvRows(std::uint32_t rows);
   /// Shared pool: before a write of rows [first, end), gives every mapped
@@ -544,6 +550,7 @@ private:
   std::shared_ptr<KvBlockPool> kv_pool_;
   bool kv_shared_{false};
   std::vector<std::uint32_t> kv_blocks_;
+  std::size_t kv_unmapped_blocks_{0};
   std::uint32_t* d_kv_block_table_{nullptr};
   // Pinned copy of the device table, the source of its async uploads.
   std::uint32_t* h_kv_block_table_{nullptr};
