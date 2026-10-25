@@ -2515,7 +2515,7 @@ void RowReclaimDropsRetainedCheckpoints() {
   assert(runner->adapter->RetainedChunks() == 10);
   const std::vector<TextRunnerToken> next(12, 5);
   const auto invalidations = runner->adapter->Invalidations();
-  assert(cache.ReclaimRows(next, [&] {
+  assert(cache.ReclaimRows(next, true, [&] {
     return runner->adapter->RetainedChunks() == 0;
   }) == ComponentTextCache::RowReclaim::kReady);
   assert(runner->adapter->Invalidations() == invalidations);
@@ -2553,13 +2553,18 @@ void RowReclaimKeepsTheCheckpointABranchRestores() {
   const auto held = cache.ContinuedTokens(branch, nullptr, true, 0);
   assert(held.tokens == prompt.size() && !held.live);
   const auto invalidations = runner->adapter->Invalidations();
-  assert(cache.ReclaimRows(branch, [] { return false; }) ==
+  assert(cache.ReclaimRows(branch, true, [] { return false; }) ==
          ComponentTextCache::RowReclaim::kExhausted);
   assert(runner->adapter->Invalidations() > invalidations);
   assert(runner->adapter->RetainedChunks() == 10);
   auto lease = cache.Acquire(branch, {}, {}, true, 0, true);
   assert(lease->cached_tokens() == prompt.size());
   lease->Invalidate();
+  // An uncached request restores nothing: its prefix checkpoints give their
+  // rows back like any other.
+  assert(cache.ReclaimRows(branch, false, [&] {
+    return runner->adapter->RetainedChunks() == 0;
+  }) == ComponentTextCache::RowReclaim::kReady);
 }
 void NearbyStableBoundaryDoesNotSplitAContinuation() {
   // A stable boundary within 64 tokens of the reused frontier is not worth a
@@ -2781,7 +2786,7 @@ void RowReclaimEmptiesSlotsBeforeDroppingCheckpoints() {
     const auto chunks = runner->adapter->RetainedChunks();
     const auto resets = runner->adapter->Invalidations();
     const std::vector<TextRunnerToken> next(12, 5);
-    assert(cache.ReclaimRows(next, [&] {
+    assert(cache.ReclaimRows(next, true, [&] {
       return runner->adapter->Invalidations() > resets;
     }) == ComponentTextCache::RowReclaim::kReady);
     assert(runner->adapter->RetainedChunks() == chunks);
@@ -2799,7 +2804,7 @@ void RowReclaimEmptiesSlotsBeforeDroppingCheckpoints() {
     const auto captures = runner->captures;
     const auto resets = runner->adapter->Invalidations();
     const std::vector<TextRunnerToken> next(12, 5);
-    assert(cache.ReclaimRows(next, [&] {
+    assert(cache.ReclaimRows(next, true, [&] {
       return runner->adapter->Invalidations() > resets;
     }) == ComponentTextCache::RowReclaim::kReady);
     assert((runner->captures > captures) == !retain);

@@ -1334,13 +1334,13 @@ std::size_t ComponentTextCache::WriteBackIdle(
 }
 
 ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
-    std::span<const ContinuationToken> prompt,
+    std::span<const ContinuationToken> prompt, bool reuse,
     const std::function<bool()>& enough) {
   std::vector<const Impl::Entry*> visited;
   // Device rows only checkpoints hold come back when those are dropped.
   const auto only_retained = [&](const cache::Checkpoint& checkpoint) {
     const auto tokens = checkpoint.Tokens();
-    if (tokens.size() <= prompt.size() &&
+    if (reuse && tokens.size() <= prompt.size() &&
         std::ranges::equal(tokens, prompt.first(tokens.size())))
       return false;
     for (const auto& c : checkpoint.Components())

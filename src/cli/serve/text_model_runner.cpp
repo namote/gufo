@@ -1978,7 +1978,7 @@ bool TextRunnerPool::AdmissionReady(std::span<const TextRunnerToken> prompt,
   if (runner.RowBlocks().free_blocks >= need)
     return true;
   // kExhausted: nothing more will free; admit, and ReserveRows refuses.
-  return impl_->component_cache->ReclaimRows(prompt, [&] {
+  return impl_->component_cache->ReclaimRows(prompt, reuse_prompt, [&] {
     return runner.RowBlocks().free_blocks >= need;
   }) != ComponentTextCache::RowReclaim::kWaiting;
 }
