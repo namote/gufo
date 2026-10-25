@@ -58,12 +58,14 @@ const QwenGpuModel& RequireModel(
 QwenGpuExecutor::QwenGpuExecutor(
     std::shared_ptr<const QwenGpuModel> model, std::uint32_t max_context,
     QwenExecutionPolicy policy,
-    std::shared_ptr<QwenSharedPassScratch> pass_scratch)
+    std::shared_ptr<QwenSharedPassScratch> pass_scratch,
+    std::shared_ptr<KvBlockPool> kv_pool)
     : model_(std::move(model)),
       weights_(RequireModel(model_).GetWeights()),
       tokenizer_(&model_->GetTokenizer()),
       policy_(policy),
-      arena_(weights_.config, max_context, policy_, std::move(pass_scratch)),
+      arena_(weights_.config, max_context, policy_, std::move(pass_scratch),
+             std::move(kv_pool)),
       graph_key_(BuildGraphCaptureKey(weights_, policy_, max_context)),
       h_logits_(weights_.config.vocab_size, 0.0F) {
   AllocateGpuSamplingWorkspace(&sampling_workspace_, weights_.config.vocab_size,
@@ -101,9 +103,9 @@ void QwenGpuExecutor::EnsureVerificationLogits(std::size_t batch_size) {
 
 QwenGpuMemoryUsage QwenGpuExecutor::EstimateMemoryUsage(
     const core::ModelConfig& config, std::uint32_t max_context,
-    QwenExecutionPolicy policy, bool shared_scratch) {
+    QwenExecutionPolicy policy, bool shared_scratch, bool shared_kv) {
   auto usage = QwenGpuArena::EstimateMemoryUsage(config, max_context, policy,
-                                                 shared_scratch);
+                                                 shared_scratch, shared_kv);
   usage.temporary_scratch_bytes +=
       EstimateGpuSamplingWorkspaceBytes(config.vocab_size, max_context);
   // Reserve the bounded fallback for eight requests with eight rows each.

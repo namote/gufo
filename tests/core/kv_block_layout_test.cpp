@@ -16,6 +16,7 @@ using gufo::hip::kKvBlockTokens;
 using gufo::hip::KvBlockAllocator;
 using gufo::hip::KvBlockGeometry;
 using gufo::hip::KvBlockPlane;
+using gufo::hip::KvBlockReservation;
 
 void Expect(bool condition, const std::string& message) {
   if (!condition)
@@ -149,6 +150,45 @@ void TestAllocator() {
   Expect(a.free_blocks() == 3, "releasing free or unknown blocks is ignored");
 }
 
+// Admission holds blocks back for a request; others cannot take them, and
+// what the request does not use goes back.
+void TestReservation() {
+  KvBlockAllocator a(8);
+  auto held = a.TryReserve(5);
+  Expect(bool(held) && held.blocks() == 5, "reserved five");
+  Expect(a.free_blocks() == 3 && a.reserved_blocks() == 5,
+         "reserved blocks are not free");
+  Expect(!a.TryReserve(4), "cannot reserve past the unreserved free blocks");
+  ExpectThrows([&] { (void)a.Allocate(4); },
+               "an unreserved allocation cannot take reserved blocks");
+  const auto mine = a.Allocate(2, &held);
+  Expect(mine == std::vector<std::uint32_t>{0, 1}, "allocated from reserve");
+  Expect(held.blocks() == 3 && a.reserved_blocks() == 3 && a.free_blocks() == 3,
+         "allocation draws the reservation down");
+  // Past the reservation, a holder takes unreserved free blocks.
+  const auto more = a.Allocate(5, &held);
+  Expect(more.size() == 5 && held.blocks() == 0 && a.free_blocks() == 1,
+         "reservation first, then free blocks");
+  ExpectThrows([&] { (void)a.Allocate(2, &held); },
+               "nothing reserved and one free");
+  Expect(a.free_blocks() == 1, "a refused allocation takes nothing");
+  a.Release(mine);
+  auto second = a.TryReserve(3);
+  Expect(bool(second) && a.free_blocks() == 0, "reserved the rest");
+  {
+    auto moved = std::move(second);
+    Expect(!second && moved.blocks() == 3, "moved reservation");
+  }
+  Expect(a.free_blocks() == 3 && a.reserved_blocks() == 0,
+         "a dropped reservation returns its blocks");
+  KvBlockAllocator other(4);
+  auto foreign = other.TryReserve(1);
+  ExpectThrows([&] { (void)a.Allocate(1, &foreign); },
+               "a reservation of another allocator");
+  KvBlockReservation empty;
+  Expect(a.Allocate(1, &empty).size() == 1, "an empty reservation is none");
+}
+
 }  // namespace
 
 int main() {
@@ -160,6 +200,7 @@ int main() {
     TestCompressedRows();
     TestInvalid();
     TestAllocator();
+    TestReservation();
   } catch (const std::exception& error) {
     std::cerr << "kv_block_layout_test: " << error.what() << '\n';
     return 1;

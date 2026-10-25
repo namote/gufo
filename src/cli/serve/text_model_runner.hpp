@@ -54,6 +54,11 @@ struct TextRunnerRamCacheOptions {
   /// Explicit limits may exceed that budget up to the model's ceiling, which
   /// keeps kHostSnapshotHeadroomBytes of host RAM free.
   std::size_t capacity_bytes{0};
+  /// Paged attention rows: bytes of the device KV block pool every session
+  /// shares, taking blocks as it writes. Zero sizes the pool for every
+  /// session at the full context. Runners without paged rows refuse a
+  /// nonzero value at load.
+  std::size_t kv_pool_bytes{0};
 };
 
 struct TextRunnerDiskCacheOptions {
@@ -398,6 +403,25 @@ public:
     return true;
   }
 
+  /// Paged model rows: states take fixed-size blocks of rows from one pool
+  /// shared by all states as they write, instead of a whole context each.
+  /// All zero for a runner whose states hold their whole context.
+  struct RowBlockPool {
+    std::size_t total_blocks{0};
+    /// Neither held by a state nor reserved for an admitted request.
+    std::size_t free_blocks{0};
+    std::size_t block_rows{0};
+  };
+  [[nodiscard]] virtual RowBlockPool RowBlocks() const { return {}; }
+  /// Holds back the blocks `state` needs to write rows [0, rows) beyond those
+  /// it holds, plus kRowBlockMargin. Throws std::length_error, holding
+  /// nothing, when the pool lacks them.
+  virtual void ReserveRowBlocks(TextRunnerState&, std::size_t) const {}
+  /// Returns what ReserveRowBlocks held back and the state did not use.
+  virtual void ReleaseRowBlocks(TextRunnerState&) const noexcept {}
+  /// Speculative verification writes draft rows past the last kept token.
+  static constexpr std::size_t kRowBlockMargin = 1;
+
   /// Optional first-token preview without advancing model state. The caller
   /// supplies a copy of the sampler; normal decoding must reproduce the token.
   /// This lets serving publish a token before capturing its prompt snapshot.
@@ -590,6 +614,11 @@ public:
     /// checkpoint for later requests. Shorter gaps cost less to prefill again.
     static constexpr std::size_t kSharedPrefixMinTokens = 512;
 
+    /// Holds the row blocks this request can write: its prompt and up to
+    /// `max_new_tokens` more, capped at the context. Throws
+    /// std::length_error when the row pool lacks them.
+    void ReserveRows(std::size_t max_new_tokens);
+
     void PrepareBatchExecution();
     [[nodiscard]] TextPrefillStep Prefill(std::size_t max_input_tokens);
     [[nodiscard]] TextDecodeSelection SelectNext();
@@ -633,6 +662,15 @@ public:
 
   [[nodiscard]] const TextModelRunner& runner() const noexcept;
   [[nodiscard]] std::size_t capacity() const noexcept;
+  /// With paged rows, false while the row pool cannot hold `prompt` and
+  /// `max_new_tokens` and a resident request may still free blocks, after
+  /// returning the rows of idle sessions `prompt` does not continue. Always
+  /// true without paged rows; when nothing more can free, true so that
+  /// Request::ReserveRows refuses the request by name.
+  [[nodiscard]] bool AdmissionReady(std::span<const TextRunnerToken> prompt,
+                                    std::size_t max_new_tokens);
+  /// Blocks an admission of `rows` holds; zero without paged rows.
+  [[nodiscard]] std::size_t AdmissionRowBlocks(std::size_t rows) const;
   [[nodiscard]] TextExecutionPlan SelectDecodePlan(
       std::size_t ready_requests) const;
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(

@@ -30,7 +30,8 @@ public:
       std::shared_ptr<const hip::QwenDFlashGpuModel> draft_model = nullptr,
       hip::QwenDFlashGpuDraftConfig draft_config = {},
       cache::ResourceLedger* ledger = nullptr,
-      std::shared_ptr<hip::QwenSharedPassScratch> pass_scratch = nullptr);
+      std::shared_ptr<hip::QwenSharedPassScratch> pass_scratch = nullptr,
+      std::shared_ptr<hip::KvBlockPool> kv_pool = nullptr);
   ~ContinuationAdapter() override;
   [[nodiscard]] hip::QwenGpuExecutor& GetExecutor(cache::Slot&);
   [[nodiscard]] hip::QwenDFlashGpuDraftBackend* GetDraftBackend(cache::Slot&);
@@ -45,6 +46,19 @@ public:
       std::size_t ram_bytes) const {
     return layout_.BackingPlan(ram_bytes);
   }
+  // Shared KV block pool of every slot's FP16 rows; null: each slot's
+  // executor holds its whole context.
+  [[nodiscard]] const std::shared_ptr<hip::KvBlockPool>& KvPool() const {
+    return kv_pool_;
+  }
+  // Holds back the shared-pool blocks the slot needs to write rows [0, rows)
+  // and `margin` blocks more (see QwenGpuArena::ReserveKvRows).
+  std::uint32_t ReserveKvRows(cache::Slot&, std::uint32_t rows,
+                              std::uint32_t margin);
+  std::uint32_t ReleaseKvReservation(cache::Slot&) noexcept;
+  // Pool blocks holding the slot's FP16 rows, in position order.
+  [[nodiscard]] std::span<const std::uint32_t> KvBlocks(
+      const cache::Slot&) const;
   // Prompt-capture bytes the live slots pinned and charged to the ledger.
   // Read at startup; a later StopPinning leaves it overstated.
   [[nodiscard]] std::size_t PinnedCaptureBytes() const noexcept {
@@ -112,6 +126,7 @@ private:
   hip::QwenDFlashGpuDraftConfig draft_config_;
   // One prompt-pass scratch for every slot's executor; null: each owns one.
   std::shared_ptr<hip::QwenSharedPassScratch> pass_scratch_;
+  std::shared_ptr<hip::KvBlockPool> kv_pool_;
   // Charged for each slot's pinned prompt capture; outlives the slots.
   cache::ResourceLedger* ledger_;
   std::atomic<std::size_t> pinned_capture_bytes_{};

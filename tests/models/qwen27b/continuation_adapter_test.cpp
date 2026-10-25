@@ -483,6 +483,139 @@ void CheckSharedPassScratch(
   std::cout << "shared_pass_scratch,PASS\n";
 }
 
+// Slots of one adapter take FP16 rows from one shared KV block pool as they
+// write. Interleaved sessions get scattered blocks; logits, decode tokens,
+// batched decode across block boundaries, captured bytes and a restore into
+// another slot must equal sessions holding their whole context. A pass the
+// pool cannot map is refused before it writes; reservations hold blocks back
+// and a reset returns a session's blocks.
+void CheckSharedKvPool(const std::shared_ptr<const hip::QwenGpuModel>& model) {
+  std::cout << "shared_kv_pool" << std::endl;
+  constexpr std::uint32_t kContext = 8192;
+  const auto& config = model->GetConfig();
+  const hip::KvBlockPlane rows{
+      .layers = config.FullAttentionLayerCount(),
+      .row_bytes = static_cast<std::size_t>(config.num_key_value_heads) *
+                   config.head_dim * sizeof(std::uint16_t)};
+  // Fewer blocks than two whole contexts (2 x 32).
+  constexpr std::uint32_t kPoolBlocks = 40;
+  auto kv_pool =
+      std::make_shared<hip::KvBlockPool>(std::vector{rows, rows}, kPoolBlocks);
+  qwen::ContinuationAdapter own(model, kContext, {'o', 'w', 'n'});
+  qwen::ContinuationAdapter paged(model, kContext, {'p', 'k', 'v'}, {}, nullptr,
+                                  {}, nullptr, nullptr, kv_pool);
+  hip::TransferPool pool(2);
+  Guard g1, g2, g3, g4, g5;
+  auto r1 = own.CreateSlot(g1), r2 = own.CreateSlot(g2);
+  auto p1 = paged.CreateSlot(g3), p2 = paged.CreateSlot(g4);
+  auto& ra = own.GetExecutor(*r1);
+  auto& rb = own.GetExecutor(*r2);
+  auto& pa = paged.GetExecutor(*p1);
+  auto& pb = paged.GetExecutor(*p2);
+  Require(paged.KvPool() == kv_pool && paged.KvBlocks(*p1).empty() &&
+              kv_pool->free_blocks() == kPoolBlocks,
+          "a shared-pool session starts with rows mapped");
+  Require(pa.GetMemoryUsage().request_state_bytes +
+                  hip::KvBlockGeometry({rows, rows},
+                                       hip::KvBlockPool::BlocksFor(kContext))
+                      .bytes() ==
+              ra.GetMemoryUsage().request_state_bytes,
+          "a shared-pool session still claims its whole KV");
+  const auto text = model->GetTokenizer().Encode(
+      "A page table maps virtual pages to frames. The translation buffer "
+      "caches recent mappings so most loads skip the walk.\n");
+  std::vector<Token> tokens(6000);
+  for (std::size_t i = 0; i < tokens.size(); ++i)
+    tokens[i] = text[(i * 5) % text.size()];
+  const auto other = std::span(tokens).subspan(100, 500);
+  // The second session writes first, so the first one's rows start at pool
+  // block 2 and its blocks are not where a whole-context arena puts them.
+  (void)rb.ForwardPromptBatch(other);
+  (void)pb.ForwardPromptBatch(other);
+  constexpr std::uint32_t kPrompt = 4605;
+  (void)ra.ForwardPromptBatch(std::span(tokens).first(kPrompt));
+  (void)pa.ForwardPromptBatch(std::span(tokens).first(kPrompt));
+  const auto blocks = paged.KvBlocks(*p1);
+  Require(blocks.size() == hip::KvBlockPool::BlocksFor(kPrompt) &&
+              blocks.front() == 2,
+          "interleaved sessions did not get scattered pool blocks");
+  Require(kv_pool->free_blocks() == kPoolBlocks - blocks.size() - 2,
+          "mapped blocks do not match the rows written");
+  SameLogits(ra, pa);
+  SameLogits(rb, pb);
+  // Single decode across the block boundary at 4608.
+  std::uint32_t pos = kPrompt;
+  for (; pos < kPrompt + 8; ++pos) {
+    Require(
+        pa.ForwardToken(tokens[pos], pos) == ra.ForwardToken(tokens[pos], pos),
+        "shared KV pool changed a decode token");
+    SameLogits(ra, pa);
+  }
+  // Batched decode; the second session crosses its block boundary at 512.
+  std::uint32_t other_pos = other.size();
+  for (int step = 0; step < 16; ++step, ++pos, ++other_pos) {
+    const std::array<hip::QwenGpuBatchItem, 2> expected_batch{
+        {{&ra, tokens[pos], pos}, {&rb, tokens[other_pos], other_pos}}};
+    const std::array<hip::QwenGpuBatchItem, 2> paged_batch{
+        {{&pa, tokens[pos], pos}, {&pb, tokens[other_pos], other_pos}}};
+    Require(hip::QwenGpuExecutor::ForwardTokenBatch(paged_batch) ==
+                hip::QwenGpuExecutor::ForwardTokenBatch(expected_batch),
+            "shared KV pool changed a batched decode token");
+    SameLogits(ra, pa);
+    SameLogits(rb, pb);
+  }
+  // Captured rows read through the table; a restore into the other slot maps
+  // its own blocks and continues exactly.
+  const auto expected = Capture(own, *r1, pool);
+  const auto checkpoint = Capture(paged, *p1, pool);
+  Require(checkpoint.bytes == expected.bytes,
+          "shared-pool rows read back differently");
+  Load(paged, *p2, checkpoint, pool);
+  Require(paged.Validate(*p2, checkpoint.positions),
+          "restore into a shared-pool slot rejected");
+  Require(Capture(paged, *p2, pool).bytes == expected.bytes,
+          "restored shared-pool bytes differ");
+  Require(paged.KvBlocks(*p2).size() == hip::KvBlockPool::BlocksFor(pos),
+          "restore mapped other than its rows");
+  Require(
+      pb.ForwardToken(tokens[pos], pos) == ra.ForwardToken(tokens[pos], pos),
+      "restored shared-pool session changed a decode token");
+  SameLogits(ra, pb);
+  // Two sessions of 19 blocks leave 2: a pass needing 4 is refused before
+  // it writes, and the session stays usable.
+  auto p3 = paged.CreateSlot(g5);
+  auto& pc = paged.GetExecutor(*p3);
+  const auto free = kv_pool->free_blocks();
+  Require(free == kPoolBlocks - 2 * hip::KvBlockPool::BlocksFor(pos + 1),
+          "pool accounting after restore");
+  Reject([&] { (void)pc.ForwardPromptBatch(std::span(tokens).first(1000)); });
+  Require(p3->IsValid() && kv_pool->free_blocks() == free &&
+              paged.KvBlocks(*p3).empty(),
+          "a refused pass took blocks or invalidated its session");
+  // A reservation holds blocks back from other sessions' passes.
+  Reject([&] { (void)paged.ReserveKvRows(*p3, 300, 1); });
+  Require(kv_pool->reserved_blocks() == 0 && kv_pool->free_blocks() == free,
+          "a refused reservation held blocks");
+  Require(paged.ReserveKvRows(*p3, 256, 0) == 1 &&
+              kv_pool->free_blocks() == free - 1,
+          "reservation did not hold its block");
+  Reject([&] {
+    (void)pa.ForwardPromptBatch(std::span(tokens).subspan(pos, 800), pos);
+  });
+  (void)pc.ForwardPromptBatch(std::span(tokens).first(256));
+  Require(kv_pool->reserved_blocks() == 0 && paged.KvBlocks(*p3).size() == 1 &&
+              kv_pool->free_blocks() == free - 1,
+          "a reserved session did not map from its reservation");
+  Require(paged.ReleaseKvReservation(*p3) == 0,
+          "a used reservation still held blocks");
+  // Reset returns a session's blocks.
+  Require(paged.Invalidate(*p1) && paged.KvBlocks(*p1).empty() &&
+              kv_pool->free_blocks() ==
+                  free - 1 + hip::KvBlockPool::BlocksFor(pos + 1),
+          "reset kept shared-pool blocks");
+  std::cout << "shared_kv_pool,PASS\n";
+}
+
 void CheckBatchAdmission(
     const std::shared_ptr<const hip::QwenGpuModel>& model) {
   qwen::ContinuationAdapter adapter(model, 64, {'b', 'a', 't', 'c', 'h'});
@@ -953,6 +1086,7 @@ int main(int argc, const char* const* argv) {
       Check(model, false);
       Check(model, true, true);
       CheckSharedPassScratch(model);
+      CheckSharedKvPool(model);
       CheckPrefillCancellation(model, true);
       CheckPrefillCancellation(model, false);
     }

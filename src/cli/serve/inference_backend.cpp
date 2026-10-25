@@ -415,6 +415,10 @@ public:
     executor_->SetCancellationCheck(check);
   }
   ~QwenTextRunnerState() override { executor_->SetCancellationCheck({}); }
+  [[nodiscard]] models::qwen::ContinuationAdapter& adapter() const {
+    return *adapter_;
+  }
+  [[nodiscard]] cache::Slot& slot() const { return *slot_; }
 
   class PrefillScope {
   public:
@@ -1031,7 +1035,8 @@ public:
       std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model = nullptr,
       speculative::SpeculativeOptions speculative_options = {},
       std::string artifact_fingerprint = {},
-      std::string draft_artifact_fingerprint = {})
+      std::string draft_artifact_fingerprint = {},
+      std::size_t session_count = 1, std::size_t kv_pool_bytes = 0)
       : model_(std::move(model)),
         dflash_model_(std::move(dflash_model)),
         max_context_(max_context),
@@ -1040,7 +1045,8 @@ public:
         // Allocated now, before ResourceClaim reads free memory: sessions
         // then claim only their decode-step scratch.
         pass_scratch_(std::make_shared<hip::QwenSharedPassScratch>(
-            model_->GetConfig(), max_context_)) {
+            model_->GetConfig(), max_context_)),
+        kv_pool_(MakeKvPool(session_count, kv_pool_bytes)) {
     Logger::Info("loader",
                  "event=shared_pass_scratch rows=" +
                      std::to_string(pass_scratch_->rows()) +
@@ -1078,7 +1084,7 @@ public:
                 .max_context = max_context_,
                 .max_draft_tokens = speculative_options_.max_draft_tokens,
                 .policy = speculative_options_.dflash_policy},
-            &ledger, pass_scratch_),
+            &ledger, pass_scratch_, kv_pool_),
         ledger);
     // Qwen's 256-row chunks are small. Preserve a bounded group before
     // waiting, instead of synchronizing every half-MiB range individually.
@@ -1139,9 +1145,46 @@ public:
     };
   }
 
+  [[nodiscard]] RowBlockPool RowBlocks() const override {
+    if (kv_pool_ == nullptr)
+      return {};
+    return {.total_blocks = kv_pool_->blocks(),
+            .free_blocks = kv_pool_->free_blocks(),
+            .block_rows = hip::kKvBlockTokens};
+  }
+  void ReserveRowBlocks(TextRunnerState& state,
+                        std::size_t rows) const override {
+    auto& qwen = RequireQwenState(state);
+    const auto reserved = qwen.adapter().ReserveKvRows(
+        qwen.slot(), static_cast<std::uint32_t>(rows), kRowBlockMargin);
+    Logger::Info(
+        "cache",
+        "event=kv_rows_reserved rows=" + std::to_string(rows) +
+            " blocks=" + std::to_string(reserved) + " mapped=" +
+            std::to_string(qwen.adapter().KvBlocks(qwen.slot()).size()) +
+            " free=" + std::to_string(kv_pool_->free_blocks()) +
+            " total=" + std::to_string(kv_pool_->blocks()));
+  }
+  void ReleaseRowBlocks(TextRunnerState& state) const noexcept override {
+    auto& qwen = RequireQwenState(state);
+    const auto unused = qwen.adapter().ReleaseKvReservation(qwen.slot());
+    try {
+      Logger::Info(
+          "cache",
+          "event=kv_rows_released unused=" + std::to_string(unused) +
+              " mapped=" +
+              std::to_string(qwen.adapter().KvBlocks(qwen.slot()).size()) +
+              " free=" + std::to_string(kv_pool_->free_blocks()));
+    } catch (...) {
+    }
+  }
+
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
+    // Sessions claim no FP16 KV: the shared pool, allocated at construction,
+    // holds it for all of them and is already out of the free figure below.
     auto usage = hip::QwenGpuExecutor::EstimateMemoryUsage(
-        model_->GetConfig(), max_context_, execution_policy_, true);
+        model_->GetConfig(), max_context_, execution_policy_, true,
+        kv_pool_ != nullptr);
     usage.request_state_bytes += hip::QwenGpuArena::RecurrentStateBytes(
         model_->GetConfig(), execution_policy_);
     std::size_t resident_weights = model_->GetResidentBytes();
@@ -1494,6 +1537,51 @@ private:
   hip::QwenExecutionPolicy execution_policy_;
   // One prompt-pass scratch for all sessions (passes run one at a time).
   std::shared_ptr<hip::QwenSharedPassScratch> pass_scratch_;
+  // FP16 attention rows of every session, taken in blocks as they write;
+  // null for the FP32 reference policy.
+  std::shared_ptr<hip::KvBlockPool> kv_pool_;
+
+  // `bytes` zero: every session at the full context, the memory each would
+  // otherwise hold. An explicit size is used as given.
+  [[nodiscard]] std::shared_ptr<hip::KvBlockPool> MakeKvPool(
+      std::size_t sessions, std::size_t bytes) const {
+    if (!execution_policy_.UsesFp16AttentionKv()) {
+      if (bytes != 0)
+        throw std::invalid_argument(
+            "--kv-pool-bytes needs FP16 attention KV; this policy keeps FP32");
+      return nullptr;
+    }
+    const auto& config = model_->GetConfig();
+    const hip::KvBlockPlane rows{
+        .layers = config.FullAttentionLayerCount(),
+        .row_bytes = static_cast<std::size_t>(config.num_key_value_heads) *
+                     config.head_dim * sizeof(std::uint16_t)};
+    const std::size_t block_bytes =
+        hip::KvBlockGeometry({rows, rows}, 1).bytes_per_block();
+    const std::size_t session_blocks =
+        hip::KvBlockGeometry::BlocksFor(max_context_);
+    const std::size_t blocks =
+        bytes != 0 ? bytes / block_bytes : sessions * session_blocks;
+    // One full-context session must fit.
+    if (blocks < session_blocks ||
+        blocks > std::numeric_limits<std::uint32_t>::max())
+      throw std::invalid_argument(
+          "--kv-pool-bytes " + std::to_string(bytes) + " holds " +
+          std::to_string(blocks) + " KV blocks of " +
+          std::to_string(block_bytes) + " bytes; one " +
+          std::to_string(max_context_) + "-token session needs " +
+          std::to_string(session_blocks) + " (" +
+          std::to_string(session_blocks * block_bytes) + " bytes)");
+    auto pool = std::make_shared<hip::KvBlockPool>(
+        std::vector{rows, rows}, static_cast<std::uint32_t>(blocks));
+    Logger::Info("loader",
+                 "event=kv_pool blocks=" + std::to_string(blocks) +
+                     " block_tokens=" + std::to_string(hip::kKvBlockTokens) +
+                     " block_bytes=" + std::to_string(block_bytes) +
+                     " bytes=" + std::to_string(pool->geometry().bytes()) +
+                     " sized=" + (bytes != 0 ? "explicit" : "sessions"));
+    return pool;
+  }
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
   cache::Identity component_identity_;
 };
@@ -3366,7 +3454,8 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     auto runner = std::make_shared<QwenTextRunner>(
         std::move(model), max_context, std::move(dflash_model),
         speculative_options, disk_cache_config.model_artifact_fingerprint,
-        disk_cache_config.draft_model_artifact_fingerprint);
+        disk_cache_config.draft_model_artifact_fingerprint, session_count,
+        ram_cache_config.kv_pool_bytes);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
@@ -3402,6 +3491,12 @@ bool InferenceBackend::load(
     TextSpeculativeConfig speculative_config,
     TextDiskCacheConfig disk_cache_config,
     TextRunnerRamCacheOptions ram_cache_config) {
+  if (ram_cache_config.kv_pool_bytes != 0) {
+    SetError(error,
+             "--kv-pool-bytes needs a runner with paged KV rows; "
+             "this model keeps each session's context");
+    return false;
+  }
   if (model == nullptr) {
     SetError(error, "DeepSeek model must not be null");
     return false;
@@ -3489,6 +3584,12 @@ bool InferenceBackend::load(
     TextSpeculativeConfig speculative_config,
     TextDiskCacheConfig disk_cache_config,
     TextRunnerRamCacheOptions ram_cache_config) {
+  if (ram_cache_config.kv_pool_bytes != 0) {
+    SetError(error,
+             "--kv-pool-bytes needs a runner with paged KV rows; "
+             "this model keeps each session's context");
+    return false;
+  }
   if (model == nullptr) {
     SetError(error, "Qwen3.8-Flash-Next model must not be null");
     return false;

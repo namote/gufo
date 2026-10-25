@@ -121,6 +121,20 @@ public:
       std::span<const ContinuationToken>, const TextPromptContext*,
       bool common = false) const;
   [[nodiscard]] std::size_t capacity() const noexcept;
+  // Outcome of ReclaimRows.
+  enum class RowReclaim : std::uint8_t {
+    kReady,      // enough() holds
+    kWaiting,    // a busy slot may still free rows
+    kExhausted,  // no slot is busy and nothing is left to return
+  };
+  // Returns the paged rows idle slots hold until `enough()` holds: slots
+  // without a live frontier first, then live frontiers that `prompt` does
+  // not continue, a frontier some checkpoint covers before the only copy of
+  // its work, oldest first. Each slot is reset at most once per call; its
+  // borrowed checkpoint rows are preserved as on any cold reassignment.
+  // `enough` runs without the cache lock.
+  [[nodiscard]] RowReclaim ReclaimRows(std::span<const ContinuationToken>,
+                                       const std::function<bool()>& enough);
 
 private:
   std::unique_ptr<Impl> impl_;

@@ -908,6 +908,15 @@ struct TextRunnerPool::Request::Impl {
     // destroyed.
     if (snapshot_future.valid())
       snapshot_future.wait();
+    ReleaseRows();
+  }
+
+  // Before the lease hands the state to another request.
+  void ReleaseRows() noexcept {
+    if (!rows_reserved)
+      return;
+    rows_reserved = false;
+    runner->ReleaseRowBlocks(dynamic_cast<TextRunnerState&>(lease.state()));
   }
 
   void CapturePromptSnapshot(bool wait = true) noexcept {
@@ -1245,6 +1254,8 @@ struct TextRunnerPool::Request::Impl {
   std::shared_ptr<const TextPromptContext> context;
   bool retain_fallback{false};
   bool overlap_snapshots{false};
+  // ReserveRows holds row blocks on this lease's state.
+  bool rows_reserved{false};
   std::size_t fallback_position{0};
   /// This turn's stable boundary when the reused frontier sits before it, so
   /// the boundary is checkpointed after the frozen fallback instead of being
@@ -1732,6 +1743,7 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
   impl_->CapturePromptSnapshot();
   auto& state = dynamic_cast<TextRunnerState&>(impl_->lease.state());
   state.SetCancellationCheck({});
+  impl_->ReleaseRows();
   if (!impl_->runner->Descriptor().capabilities.prefix_reuse) {
     impl_->lease.Invalidate();
     impl_.reset();
@@ -1784,6 +1796,7 @@ TextRunnerPool::Request::Cancel() noexcept {
       impl_->FinishSnapshot();
     auto& state = dynamic_cast<TextRunnerState&>(impl_->lease.state());
     state.SetCancellationCheck({});
+    impl_->ReleaseRows();
     const auto capabilities = impl_->runner->Descriptor().capabilities;
     if (!capabilities.prefix_reuse) {
       Invalidate();
@@ -1839,6 +1852,7 @@ void TextRunnerPool::Request::Invalidate() noexcept {
       impl_->snapshot_future.wait();
     dynamic_cast<TextRunnerState&>(impl_->lease.state())
         .SetCancellationCheck({});
+    impl_->ReleaseRows();
     impl_->lease.Invalidate();
     impl_.reset();
   }
@@ -1855,6 +1869,45 @@ TextRunnerPool::~TextRunnerPool() = default;
 
 const TextModelRunner& TextRunnerPool::runner() const noexcept {
   return *impl_->validated.runner;
+}
+
+std::size_t TextRunnerPool::AdmissionRowBlocks(std::size_t rows) const {
+  const auto pool = impl_->validated.runner->RowBlocks();
+  if (pool.block_rows == 0)
+    return 0;
+  const std::size_t context = impl_->validated.descriptor.max_context;
+  return std::min((rows + pool.block_rows - 1) / pool.block_rows +
+                      TextModelRunner::kRowBlockMargin,
+                  (context + pool.block_rows - 1) / pool.block_rows);
+}
+
+bool TextRunnerPool::AdmissionReady(std::span<const TextRunnerToken> prompt,
+                                    std::size_t max_new_tokens) {
+  const auto& runner = *impl_->validated.runner;
+  const std::size_t need = AdmissionRowBlocks(std::min<std::size_t>(
+      impl_->validated.descriptor.max_context, prompt.size() + max_new_tokens));
+  if (need == 0 || runner.RowBlocks().free_blocks >= need)
+    return true;
+  if (impl_->component_cache == nullptr)
+    return true;
+  // kExhausted: nothing more will free; admit, and ReserveRows refuses.
+  return impl_->component_cache->ReclaimRows(prompt, [&] {
+    return runner.RowBlocks().free_blocks >= need;
+  }) != ComponentTextCache::RowReclaim::kWaiting;
+}
+
+void TextRunnerPool::Request::ReserveRows(std::size_t max_new_tokens) {
+  if (!*this)
+    throw std::logic_error("text runner request is empty");
+  const auto& runner = *impl_->runner;
+  if (runner.RowBlocks().block_rows == 0)
+    return;
+  const std::size_t rows = std::min<std::size_t>(
+      runner.Descriptor().max_context, impl_->prompt.size() + max_new_tokens);
+  impl_->ReleaseRows();
+  runner.ReserveRowBlocks(dynamic_cast<TextRunnerState&>(impl_->lease.state()),
+                          rows);
+  impl_->rows_reserved = true;
 }
 
 std::size_t TextRunnerPool::capacity() const noexcept {

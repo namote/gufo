@@ -310,13 +310,15 @@ private:
 
 class QwenGpuArena {
 public:
-  /// FP16 attention rows live in `kv_pool`, which may be shared with other
-  /// arenas; the arena takes the blocks its context needs. Without a pool it
-  /// makes its own, sized to the context.
+  /// FP16 attention rows live in a KV block pool. Without `kv_pool` the
+  /// arena makes its own, sized to the context, and holds all of it. With a
+  /// pool shared by other arenas it starts empty and maps blocks as passes
+  /// write (EnsureKvRows), returning them on Reset.
   explicit QwenGpuArena(
       const core::ModelConfig& config, std::uint32_t max_context = 4096,
       QwenExecutionPolicy policy = QwenExecutionPolicy::Production(),
-      std::shared_ptr<QwenSharedPassScratch> shared_scratch = nullptr);
+      std::shared_ptr<QwenSharedPassScratch> shared_scratch = nullptr,
+      std::shared_ptr<KvBlockPool> kv_pool = nullptr);
   ~QwenGpuArena();
 
   QwenGpuArena(const QwenGpuArena&) = delete;
@@ -442,6 +444,28 @@ public:
   [[nodiscard]] std::span<const std::uint32_t> GetKvBlocks() const noexcept {
     return kv_blocks_;
   }
+  /// True when the FP16 rows are blocks of a pool shared with other arenas.
+  [[nodiscard]] bool SharesKvPool() const noexcept { return kv_shared_; }
+  /// Shared pool: maps blocks for rows [0, end) before a pass writes them,
+  /// from the reservation first (ReserveKvRows). Throws std::length_error,
+  /// mapping nothing, when the pool falls short. No-op for an own pool.
+  void EnsureKvRows(std::uint32_t end);
+  /// Shared pool: returns the blocks past `rows` once queued passes finish.
+  void TruncateKvRows(std::uint32_t rows);
+  /// Shared pool: holds back the blocks rows [0, rows) and `margin` more
+  /// blocks need beyond those mapped, replacing any earlier reservation.
+  /// Throws std::length_error, holding nothing, when the pool lacks them.
+  /// Returns the blocks reserved (zero for an own pool).
+  std::uint32_t ReserveKvRows(std::uint32_t rows, std::uint32_t margin = 0);
+  /// Returns the unused reserved blocks to the pool; returns their count.
+  std::uint32_t ReleaseKvReservation() noexcept {
+    const auto unused = kv_reservation_.blocks();
+    kv_reservation_.Reset();
+    return unused;
+  }
+  [[nodiscard]] std::uint32_t GetKvReservedBlocks() const noexcept {
+    return kv_reservation_.blocks();
+  }
   /// Rows between consecutive layers of one attention KV plane (K or V),
   /// and that plane's base. FP16 rows: the pool's layer-major plane, whose
   /// rows the block table maps; FP32 reference: head-major rows.
@@ -454,11 +478,12 @@ public:
     return policy_.recurrent_state_storage;
   }
   /// `shared_scratch`: the session's own pass scratch only
-  /// (kSessionScratchRows); the shared set is the runner's.
+  /// (kSessionScratchRows); the shared set is the runner's. `shared_kv`: no
+  /// FP16 KV rows; a shared pool holds them.
   [[nodiscard]] static QwenGpuMemoryUsage EstimateMemoryUsage(
       const core::ModelConfig& config, std::uint32_t max_context,
       QwenExecutionPolicy policy = QwenExecutionPolicy::Production(),
-      bool shared_scratch = false);
+      bool shared_scratch = false, bool shared_kv = false);
   [[nodiscard]] static std::size_t RecurrentStateBytes(
       const core::ModelConfig& config, QwenExecutionPolicy policy);
   [[nodiscard]] QwenGpuMemoryUsage GetMemoryUsage() const;
@@ -485,7 +510,8 @@ private:
   void FreeAll() noexcept;
   friend class models::qwen::ContinuationAdapter;
   friend class QwenGpuExecutor;
-  void AllocateKvBlocks();
+  void AllocateKvBlocks(std::shared_ptr<KvBlockPool> shared);
+  void RequireOwnKvPool() const;
   /// Token rows of one layer of the FP16 pool planes.
   [[nodiscard]] std::uint32_t KvLayerTokens() const noexcept {
     return kv_pool_->blocks() * kKvBlockTokens;
@@ -501,8 +527,12 @@ private:
   QwenExecutionPolicy policy_;
   std::vector<std::uint32_t> target_layer_ids_;
   std::shared_ptr<KvBlockPool> kv_pool_;
+  bool kv_shared_{false};
   std::vector<std::uint32_t> kv_blocks_;
   std::uint32_t* d_kv_block_table_{nullptr};
+  // Pinned copy of the device table, the source of its async uploads.
+  std::uint32_t* h_kv_block_table_{nullptr};
+  KvBlockReservation kv_reservation_;
   // Buffer 0 comes from the constructor; buffer 1 is allocated by the first
   // SaveState. `live_recurrent_` holds the current state, `saved_recurrent_`
   // the pinned one (meaningful while has_saved_state_), `source_recurrent_`
@@ -530,12 +560,15 @@ private:
 class QwenGpuExecutor {
 public:
   /// `pass_scratch`: a prompt-pass scratch shared with other executors; null:
-  /// the executor owns a full set.
+  /// the executor owns a full set. `kv_pool`: a KV block pool shared with
+  /// other executors, mapped as rows are written; null: an own pool holding
+  /// the whole context.
   explicit QwenGpuExecutor(
       std::shared_ptr<const QwenGpuModel> model,
       std::uint32_t max_context = 4096,
       QwenExecutionPolicy policy = QwenExecutionPolicy::Production(),
-      std::shared_ptr<QwenSharedPassScratch> pass_scratch = nullptr);
+      std::shared_ptr<QwenSharedPassScratch> pass_scratch = nullptr,
+      std::shared_ptr<KvBlockPool> kv_pool = nullptr);
   ~QwenGpuExecutor();
 
   [[nodiscard]] static std::unique_ptr<QwenGpuExecutor> Create(
@@ -683,7 +716,7 @@ public:
   [[nodiscard]] static QwenGpuMemoryUsage EstimateMemoryUsage(
       const core::ModelConfig& config, std::uint32_t max_context,
       QwenExecutionPolicy policy = QwenExecutionPolicy::Production(),
-      bool shared_scratch = false);
+      bool shared_scratch = false, bool shared_kv = false);
   [[nodiscard]] QwenGpuMemoryUsage GetMemoryUsage() const;
   void SetCancellationCheck(std::function<bool()> check) {
     cancellation_check_ = std::move(check);
