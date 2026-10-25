@@ -971,9 +971,11 @@ void ComponentTextCache::CaptureBeforeReset(std::size_t index,
     Lease lease(std::make_unique<Lease::Impl>(
         impl_.get(), entry, entry->slot->Acquire(location), tokens,
         cache::InputIdentity(tokens.size(), input), tokens.size()));
+    // Retry priority: the copy may only displace other optional copies, and
+    // is the first to go when prompt or shared checkpoints need the RAM.
     std::size_t bytes = 0;
     if (lease.TryReserveSnapshot(lease.CaptureBytes(), tokens.size(), false,
-                                 SnapshotPurpose::kContinuation, tokens))
+                                 SnapshotPurpose::kRetry, tokens))
       bytes = lease.PublishSnapshot(tokens, lease.Capture(), false);
     // The slot stays valid; the caller's cold lease preserves the rows the
     // new checkpoint borrows and resets it.
