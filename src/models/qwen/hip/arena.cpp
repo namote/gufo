@@ -1074,8 +1074,13 @@ void QwenGpuArena::UnshareKvRows(std::uint32_t first, std::uint32_t end) {
             geometry.planes()[plane].layers, hipMemcpyDeviceToDevice, stream));
       }
     } catch (...) {
-      // The table still maps the shared block.
-      kv_pool_->Release(std::span(&copy, 1), kv_reservation_);
+      // The table still maps the shared block. Copies already submitted may
+      // still write `copy`: return it only once they finished; a stream that
+      // cannot drain keeps it out of the pool.
+      if (hipStreamSynchronize(stream) == hipSuccess)
+        kv_pool_->Release(std::span(&copy, 1), kv_reservation_);
+      else
+        (void)hipGetLastError();
       throw;
     }
     h_kv_block_table_[logical] = copy;

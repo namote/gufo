@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <mutex>
@@ -256,6 +257,8 @@ struct ComponentTextCache::Impl {
       pending;
   // The execution (Entry::branch) each pending checkpoint was captured from.
   std::array<std::shared_ptr<const void>, 2 * kPersistenceDepth> pending_branch;
+  // The last WriteBackIdle skipped a frontier for its own pending write.
+  std::atomic<bool> write_back_deferred{false};
   std::array<std::shared_ptr<DurableCapture>, 2 * kPersistenceDepth>
       pending_durable;
   std::size_t disk_capacity{}, disk_step{};
@@ -1165,12 +1168,18 @@ void ComponentTextCache::CaptureBeforeReset(std::size_t index,
   entry->busy = true;
 }
 
+bool ComponentTextCache::WriteBackDeferred() const noexcept {
+  return impl_->write_back_deferred.load(std::memory_order_relaxed);
+}
+
 std::size_t ComponentTextCache::WriteBackIdle(
     std::chrono::milliseconds idle_for) noexcept {
+  impl_->write_back_deferred.store(false, std::memory_order_relaxed);
   if (!impl_->queue)
     return 0;
   const auto now = Clock::now();
   std::size_t queued = 0;
+  bool deferred = false;
   for (std::size_t i = 0; i < impl_->entries.size(); ++i) {
     auto* entry = impl_->entries[i].get();
     cache::BorrowedLocation location;
@@ -1211,8 +1220,11 @@ std::size_t ComponentTextCache::WriteBackIdle(
           std::ranges::any_of(impl_->pending_durable, [&](const auto& capture) {
             return capture && capture->branch == entry->branch &&
                    extends(capture->manifest.tokens, capture->manifest.input);
-          }))
+          })) {
+        // Written once that write settles: the caller tries again.
+        deferred = true;
         continue;
+      }
       entry->busy = true;
       location = entry->live_location;
       tokens = entry->live_tokens;
@@ -1270,6 +1282,7 @@ std::size_t ComponentTextCache::WriteBackIdle(
     entry->busy = false;
     queued += submitted;
   }
+  impl_->write_back_deferred.store(deferred, std::memory_order_relaxed);
   return queued;
 }
 

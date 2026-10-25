@@ -698,6 +698,9 @@ public:
   /// with a disk cache only). Other sessions may be running; call from the
   /// scheduler thread.
   std::size_t WriteBackIdle(std::chrono::milliseconds idle_for) noexcept;
+  /// The last WriteBackIdle left a frontier for its own pending write; call
+  /// it again later.
+  [[nodiscard]] bool WriteBackDeferred() const noexcept;
   [[nodiscard]] TextExecutionPlan SelectDecodePlan(
       std::size_t ready_requests) const;
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(

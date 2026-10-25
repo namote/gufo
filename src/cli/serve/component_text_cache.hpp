@@ -162,11 +162,14 @@ public:
   // least `idle_for` that no disk checkpoint covers within
   // kUncoveredCaptureTokens to disk, so a restart resumes from the last turn
   // instead of its prompt boundary. The write shares the frontier's lineage
-  // chunks and is not limited by the disk step; a frontier whose lineage
-  // checkpoint is still queued waits for it. Other slots may be running;
-  // call from the scheduler thread. Returns the slots queued. The destructor
-  // drains the queue and writes back every uncovered frontier once more.
+  // chunks and is not limited by the disk step; a frontier whose own
+  // execution's checkpoint is still queued waits for it, and
+  // WriteBackDeferred() then reports true until a later call writes it.
+  // Other slots may be running; call from the scheduler thread. Returns the
+  // slots queued. The destructor drains the queue and writes back every
+  // uncovered frontier once more.
   std::size_t WriteBackIdle(std::chrono::milliseconds idle_for) noexcept;
+  [[nodiscard]] bool WriteBackDeferred() const noexcept;
 
 private:
   // Captures the idle live frontier of slot `index` (leased exactly at

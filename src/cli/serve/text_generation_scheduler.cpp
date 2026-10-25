@@ -1984,7 +1984,7 @@ struct TextGenerationScheduler::Impl {
           // Once the idle period reaches the write-back delay, idle
           // sessions' live frontiers go to the disk cache once; device
           // probes keep their own interval before and after.
-          const auto write_back_at =
+          auto write_back_at =
               Clock::now() + scheduler_policy.idle_write_back_delay;
           bool written_back = false;
           while (!wake()) {
@@ -2002,9 +2002,12 @@ struct TextGenerationScheduler::Impl {
               break;
             lock.unlock();
             if (!written_back && Clock::now() >= write_back_at) {
-              written_back = true;
               (void)runner_pool->WriteBackIdle(
                   scheduler_policy.idle_write_back_delay);
+              // A frontier waiting on its own pending write is tried again.
+              written_back = !runner_pool->WriteBackDeferred();
+              write_back_at =
+                  Clock::now() + scheduler_policy.idle_write_back_delay / 4;
               lock.lock();
               continue;
             }

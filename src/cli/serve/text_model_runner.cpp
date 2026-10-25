@@ -2006,6 +2006,10 @@ std::size_t TextRunnerPool::WriteBackIdle(
              : 0;
 }
 
+bool TextRunnerPool::WriteBackDeferred() const noexcept {
+  return impl_->component_cache && impl_->component_cache->WriteBackDeferred();
+}
+
 void TextRunnerPool::Request::ReserveRows(std::size_t max_new_tokens) {
   if (!*this)
     throw std::logic_error("text runner request is empty");
