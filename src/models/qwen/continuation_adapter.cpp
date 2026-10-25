@@ -937,9 +937,12 @@ struct ContinuationAdapter::RetainedBlock {
   std::uint32_t block;
 };
 bool ContinuationAdapter::RetainsRows(cache::ComponentId id) const {
-  const auto part = Component(id).part;
+  const auto& component = Component(id);
+  const auto part = component.part;
+  // A retained chunk is one pool block: chunks of another size are copied.
   return kv_pool_ && policy_.UsesFp16AttentionKv() &&
-         (part == ContinuationPart::kKey || part == ContinuationPart::kValue);
+         (part == ContinuationPart::kKey || part == ContinuationPart::kValue) &&
+         component.descriptor.rows_per_chunk == hip::kKvBlockTokens;
 }
 cache::Adapter::RetainedRows ContinuationAdapter::RetainRows(
     const cache::Slot& slot, cache::ComponentId id, Rows first,

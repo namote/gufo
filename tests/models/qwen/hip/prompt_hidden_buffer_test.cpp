@@ -210,6 +210,75 @@ void TestSharedPages() {
   Check(ChargedBytes(ledger) == 0, "freeing the pages must release the charge");
 }
 
+// Taking the pages over drains the previous holder's stream, and a holder
+// destroyed with copies still queued drains its own: neither lands in the
+// next holder's rows. A refused charge makes every sharer pageable.
+void TestSharedPagesDrainStreams() {
+  constexpr std::size_t kRows = 4096;
+  constexpr std::size_t kBusyBytes = std::size_t{256} << 20;
+  hipStream_t first_stream{}, second_stream{};
+  Check(hipStreamCreate(&first_stream) == hipSuccess &&
+            hipStreamCreate(&second_stream) == hipSuccess,
+        "streams must be created");
+  void* busy = nullptr;
+  float* rows = nullptr;
+  Check(hipMalloc(&busy, kBusyBytes) == hipSuccess &&
+            hipMalloc(reinterpret_cast<void**>(&rows), kRows * sizeof(float)) ==
+                hipSuccess,
+        "device buffers must be allocated");
+  // Work long enough to still be queued, then a copy into the pages.
+  const auto queue_copy = [&](gufo::hip::PromptHiddenBuffer& buffer,
+                              hipStream_t stream) {
+    for (int i = 0; i < 8; ++i)
+      Check(hipMemsetAsync(busy, i, kBusyBytes, stream) == hipSuccess,
+            "busy work must queue");
+    Check(hipMemcpyAsync(buffer.Data(), rows, kRows * sizeof(float),
+                         hipMemcpyDeviceToHost, stream) == hipSuccess,
+          "the capture copy must queue");
+  };
+  auto pages = std::make_shared<gufo::hip::PromptHiddenPinned>();
+  {
+    gufo::hip::PromptHiddenBuffer first;
+    gufo::hip::PromptHiddenBuffer second;
+    first.Share(pages, first_stream);
+    second.Share(pages, second_stream);
+    first.Reserve(kRows, kRows);
+    first.Resize(kRows);
+    queue_copy(first, first_stream);
+    second.Reserve(kRows, kRows);
+    Check(hipStreamQuery(first_stream) == hipSuccess,
+          "taking the pages over must drain the previous holder's stream");
+    {
+      gufo::hip::PromptHiddenBuffer third;
+      third.Share(pages, first_stream);
+      third.Reserve(kRows, kRows);
+      third.Resize(kRows);
+      queue_copy(third, first_stream);
+    }
+    Check(hipStreamQuery(first_stream) == hipSuccess,
+          "a destroyed holder must drain its stream");
+  }
+  {
+    gufo::cache::ResourceLedger small({1024, 1024, 0, 1024});
+    auto refused = std::make_shared<gufo::hip::PromptHiddenPinned>();
+    gufo::hip::PromptHiddenBuffer first;
+    gufo::hip::PromptHiddenBuffer second;
+    first.Share(refused, nullptr);
+    second.Share(refused, nullptr);
+    first.Reserve(kRows, kRows, &small);
+    first.Resize(kRows);
+    second.Reserve(kRows, kRows);
+    second.Resize(kRows);
+    Check(!IsPinned(first.Data()) && !IsPinned(second.Data()),
+          "a refused charge must make every sharer pageable");
+    Check(refused->ChargedBytes() == 0, "a refused charge must hold nothing");
+  }
+  Check(hipFree(busy) == hipSuccess && hipFree(rows) == hipSuccess &&
+            hipStreamDestroy(first_stream) == hipSuccess &&
+            hipStreamDestroy(second_stream) == hipSuccess,
+        "device resources must be released");
+}
+
 }  // namespace
 #endif  // defined(ENGINE_ENABLE_HIP)
 
@@ -225,6 +294,7 @@ int main() {
   TestPageableBeyondBound();
   TestLedgerCharge();
   TestSharedPages();
+  TestSharedPagesDrainStreams();
   std::cout << "Prompt hidden buffer tests passed.\n";
   return EXIT_SUCCESS;
 #else

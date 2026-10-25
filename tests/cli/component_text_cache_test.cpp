@@ -1972,6 +1972,29 @@ void PagedRowsAdmitWaitAndReclaim() {
     refused = true;
   }
   assert(refused && runner->reserved.empty());
+  d.Invalidate();
+  // A continuation needs only the blocks past those its slot already maps:
+  // another conversation's idle frontier keeps its rows.
+  auto paged = std::make_shared<PagedRunner>();
+  TextRunnerPool rows(paged, 2);
+  const std::vector<TextRunnerToken> other(4, 7), talk(12, 8);
+  for (const auto* tokens : {&other, &talk}) {
+    auto request = rows.Acquire(*tokens);
+    request.ReserveRows(1);
+    Prefill(request);
+    (void)request.Commit();
+  }
+  assert(paged->RowBlocks().free_blocks == kPagedBlocks - 4);
+  auto more = talk;
+  more.push_back(9);
+  const auto kept = paged->adapter->Invalidations();
+  // 13 + 1 tokens: 4 blocks plus the margin, 3 of them mapped already.
+  assert(rows.AdmissionReady(more, 1));
+  assert(paged->adapter->Invalidations() == kept);
+  auto continued = rows.Acquire(more);
+  assert(continued.cached_prompt_tokens() == talk.size());
+  continued.ReserveRows(1);
+  continued.Invalidate();
 }
 // A cold assignment that replaces a live frontier no checkpoint covers first
 // captures it, so that conversation's next turn restores its whole frontier
@@ -2517,7 +2540,9 @@ void FirstFollowerRestoresTheSystemPromptCheckpoint() {
     expected = Generate(cold);
     cold.Invalidate();
   }
-  for (const std::size_t system : {0, 1500})
+  // A system prompt under the shared-prefix minimum (128) is not worth a
+  // checkpoint, also without a disk cache.
+  for (const std::size_t system : {0, 100, 1500})
     for (const bool retain : {false, true}) {
       auto runner = std::make_shared<Runner>();
       runner->retain_rows = retain;
@@ -2529,13 +2554,229 @@ void FirstFollowerRestoresTheSystemPromptCheckpoint() {
       (void)leader.Commit();
       auto follower =
           pool.Acquire(follower_prompt, {}, {}, {}, true, 0, true, system);
-      assert(follower.cached_prompt_tokens() == system);
+      assert(follower.cached_prompt_tokens() == (system >= 128 ? system : 0));
       Prefill(follower);
       assert(Generate(follower) == expected);
       follower.Invalidate();
     }
 }
+void FailedWriteBackKeepsTheLiveFrontier() {
+  // An idle write-back that fails leaves the live frontier in its slot for
+  // the next turn, and does not count it as covered: a later attempt waits
+  // until it grows (idle passes) but shutdown tries it again.
+  const TemporaryDirectory temp("gufo-component-write-back-failure");
+  const std::filesystem::path directory = temp.path();
+  const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                        .capacity_bytes = 1 << 22,
+                                        .staging_capacity_bytes = 7};
+  std::vector<TextRunnerToken> conversation(100);
+  std::iota(conversation.begin(), conversation.end(), 10);
+  auto runner = std::make_shared<Runner>();
+  ComponentTextCache cache(runner, 2, 1 << 22, disk);
+  {
+    auto lease = cache.Acquire(conversation, {}, {}, true, 0, true);
+    auto& state = dynamic_cast<State&>(lease->state());
+    runner->adapter->Append(state.slot, conversation, conversation);
+    (void)lease->Commit({}, {}, conversation);
+  }
+  const auto invalidations = runner->adapter->Invalidations();
+  runner->adapter->FailNextTransfer();
+  assert(cache.WriteBackIdle(std::chrono::milliseconds(0)) == 0);
+  assert(runner->adapter->Invalidations() == invalidations);
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  assert(cache.WriteBackIdle(std::chrono::milliseconds(1)) == 0);
+  // Shutdown ignores the idle backoff.
+  assert(cache.WriteBackIdle(std::chrono::milliseconds(0)) == 1);
+  auto next = conversation;
+  next.push_back(7);
+  {
+    auto lease = cache.Acquire(next, {}, {}, true, 0, true);
+    assert(lease->cached_tokens() == conversation.size() &&
+           lease->Metrics().reuse == "live");
+    lease->Invalidate();
+  }
+  std::filesystem::remove_all(directory);
+}
+void ScatteredRowsWriteBackChunkByChunk() {
+  // Completed rows the adapter cannot lend as one view (rows spread over
+  // device blocks) are lent chunk by chunk, not staged in RAM, and restore
+  // after a restart.
+  const TemporaryDirectory temp("gufo-component-scattered-write-back");
+  const std::filesystem::path directory = temp.path();
+  const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                        .capacity_bytes = 1 << 22,
+                                        .staging_capacity_bytes = 7};
+  std::vector<TextRunnerToken> conversation(100);
+  std::iota(conversation.begin(), conversation.end(), 10);
+  {
+    auto runner = std::make_shared<Runner>();
+    ComponentTextCache cache(runner, 1, 1 << 22, disk);
+    runner->adapter->LimitBorrowedRows(runner->rows_per_chunk);
+    {
+      auto lease = cache.Acquire(conversation, {}, {}, true, 0, true);
+      auto& state = dynamic_cast<State&>(lease->state());
+      runner->adapter->Append(state.slot, conversation, conversation);
+      (void)lease->Commit({}, {}, conversation);
+    }
+    const auto copied = runner->adapter->CopiedOutRows();
+    assert(cache.WriteBackIdle(std::chrono::milliseconds(0)) == 1);
+    assert(runner->adapter->CopiedOutRows() == copied);
+  }
+  auto runner = std::make_shared<Runner>();
+  {
+    ComponentTextCache cache(runner, 1, 1 << 22, disk);
+    auto next = conversation;
+    next.push_back(7);
+    auto lease = cache.Acquire(next, {}, {}, true, 0, true);
+    assert(lease->cached_tokens() == conversation.size() &&
+           lease->restored_from_disk());
+    lease->Invalidate();
+  }
+  std::filesystem::remove_all(directory);
+}
+void QueuedWriteBackFailureUncoversTheFrontier() {
+  // A write-back that is queued and then fails no longer covers the
+  // frontier, however soon it fails: shutdown writes it again.
+  const TemporaryDirectory temp("gufo-component-write-back-late-failure");
+  const std::filesystem::path directory = temp.path();
+  const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                        .capacity_bytes = 1,
+                                        .staging_capacity_bytes = 7};
+  std::vector<TextRunnerToken> conversation(100);
+  std::iota(conversation.begin(), conversation.end(), 10);
+  auto runner = std::make_shared<Runner>();
+  ComponentTextCache cache(runner, 1, 1 << 22, disk);
+  {
+    auto lease = cache.Acquire(conversation, {}, {}, true, 0, true);
+    auto& state = dynamic_cast<State&>(lease->state());
+    runner->adapter->Append(state.slot, conversation, conversation);
+    (void)lease->Commit({}, {}, conversation);
+  }
+  assert(cache.WriteBackIdle(std::chrono::milliseconds(0)) == 1);
+  bool retried = false;
+  for (int i = 0; i < 200 && !retried; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    retried = cache.WriteBackIdle(std::chrono::milliseconds(0)) == 1;
+  }
+  assert(retried);
+  std::filesystem::remove_all(directory);
+}
+void RowReclaimEmptiesSlotsBeforeDroppingCheckpoints() {
+  // A slot without a live frontier costs nothing to reset: it goes before
+  // checkpoints holding retained rows. A live frontier reset for rows is not
+  // captured when captures retain rows, as that would keep the very rows the
+  // reset returns; when captures copy them, an uncovered one is captured.
+  std::vector<TextRunnerToken> prompt(40), other(100);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  std::iota(other.begin(), other.end(), 3000);
+  {
+    auto runner = std::make_shared<Runner>();
+    runner->retain_rows = true;
+    ComponentTextCache cache(runner, 2, 1 << 22, std::nullopt);
+    (void)CapturePrompt(cache, *runner, prompt);
+    {
+      auto lease = cache.Acquire(other, {}, {}, true, 0, true);
+      auto& state = dynamic_cast<State&>(lease->state());
+      runner->adapter->Append(state.slot, other, other);
+      lease->Invalidate();
+    }
+    const auto chunks = runner->adapter->RetainedChunks();
+    const auto resets = runner->adapter->Invalidations();
+    const std::vector<TextRunnerToken> next(12, 5);
+    assert(cache.ReclaimRows(next, [&] {
+      return runner->adapter->Invalidations() > resets;
+    }) == ComponentTextCache::RowReclaim::kReady);
+    assert(runner->adapter->RetainedChunks() == chunks);
+  }
+  for (const bool retain : {true, false}) {
+    auto runner = std::make_shared<Runner>();
+    runner->retain_rows = retain;
+    ComponentTextCache cache(runner, 1, 1 << 22, std::nullopt);
+    {
+      auto lease = cache.Acquire(other, {}, {}, true, 0, true);
+      auto& state = dynamic_cast<State&>(lease->state());
+      runner->adapter->Append(state.slot, other, other);
+      (void)lease->Commit({}, {}, other);
+    }
+    const auto captures = runner->captures;
+    const auto resets = runner->adapter->Invalidations();
+    const std::vector<TextRunnerToken> next(12, 5);
+    assert(cache.ReclaimRows(next, [&] {
+      return runner->adapter->Invalidations() > resets;
+    }) == ComponentTextCache::RowReclaim::kReady);
+    assert((runner->captures > captures) == !retain);
+  }
+}
+void SiblingDoesNotAdoptAnotherExecutionsCheckpoint() {
+  // A and B fork from one prompt checkpoint (one lineage) and prefill the
+  // same 60 tokens past it, each in its own slot. A's checkpoint at 160
+  // reaches disk; B computed its own rows, so B's write-back writes them
+  // rather than reusing A's chunk files.
+  const TemporaryDirectory temp("gufo-component-sibling-chunks");
+  const std::filesystem::path directory = temp.path();
+  const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                        .capacity_bytes = 1 << 22,
+                                        .staging_capacity_bytes = 7,
+                                        .min_checkpoint_step_tokens = 0};
+  const auto files = [&] {
+    std::size_t n = 0;
+    for (const auto& f :
+         std::filesystem::recursive_directory_iterator(directory))
+      n += f.is_regular_file();
+    return n;
+  };
+  auto runner = std::make_shared<Runner>();
+  ComponentTextCache cache(runner, 3, 1 << 22, disk);
+  const std::vector<TextRunnerToken> side(12, 5);
+  const auto wait = [&](std::uint64_t target) {
+    std::uint64_t completed = 0;
+    for (int i = 0; i < 500 && completed < target; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      auto peek = cache.Acquire(side, {}, {}, true, 0, true);
+      completed = peek->Metrics().persistence->completed;
+      (void)peek->Commit({}, {}, {});
+    }
+    assert(completed == target);
+  };
+  std::vector<TextRunnerToken> b(200);
+  std::iota(b.begin(), b.end(), 10);
+  const std::vector<TextRunnerToken> head(b.begin(), b.begin() + 100),
+      a(b.begin(), b.begin() + 160);
+  (void)CapturePrompt(cache, *runner, head);
+  wait(1);
+  const auto before = files();
+  auto first = cache.Acquire(a, {}, {}, true, 0, true);
+  assert(first->cached_tokens() == head.size());
+  auto second = cache.Acquire(b, {}, {}, true, 0, true);
+  assert(second->cached_tokens() == head.size());
+  {
+    auto& state = dynamic_cast<State&>(first->state());
+    const auto tail = std::span(a).subspan(head.size());
+    runner->adapter->Append(state.slot, tail, tail);
+    assert(first->TryReserveSnapshot(first->CaptureBytes(), a.size(), false,
+                                     SnapshotPurpose::kContinuation, {}));
+    (void)first->Commit(a, first->Capture(), a);
+  }
+  {
+    auto& state = dynamic_cast<State&>(second->state());
+    const auto tail = std::span(b).subspan(head.size());
+    runner->adapter->Append(state.slot, tail, tail);
+    (void)second->Commit({}, {}, b);
+  }
+  wait(2);
+  const auto sibling = files() - before;
+  assert(cache.WriteBackIdle(std::chrono::milliseconds(0)) >= 1);
+  wait(3);
+  // B's rows past the shared prompt are its own: more files than A's 60.
+  assert(files() - before - sibling > sibling);
+  std::filesystem::remove_all(directory);
+}
 int main() {
+  FailedWriteBackKeepsTheLiveFrontier();
+  QueuedWriteBackFailureUncoversTheFrontier();
+  ScatteredRowsWriteBackChunkByChunk();
+  RowReclaimEmptiesSlotsBeforeDroppingCheckpoints();
+  SiblingDoesNotAdoptAnotherExecutionsCheckpoint();
   FirstFollowerRestoresTheSystemPromptCheckpoint();
   FirstFollowerRestoresATailCheckpoint();
   NearbyStableBoundaryDoesNotSplitAContinuation();

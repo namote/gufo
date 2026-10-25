@@ -210,6 +210,12 @@ movable pages, not GPU allocations. 27B also checks HIP free memory. A
 positive value sets a byte cap that may exceed the automatic budget, up to the
 available host RAM minus 4 GiB; the startup line reports both as
 `automatic_bytes` and `max_bytes`.
+Qwen27B sessions with FP16 attention KV map 256-token blocks from one device
+pool as they write. The pool holds every session's full context unless
+`--kv-pool-bytes N` sizes it; admission waits while it cannot hold a request.
+`--cache-tail-checkpoints K` (default 3, where checkpoints keep KV as pool
+blocks) keeps K RAM checkpoints near the end of long prompts. See
+[KV-CACHE.md](KV-CACHE.md#limits).
 On Qwen27B and Flash-Next, the pinned disk staging buffer comes out of that ceiling, and
 `max_bytes` excludes it. Other models' disk staging and temporary disk-save
 buffers are separate from this RAM budget.
@@ -271,7 +277,8 @@ The startup line `event=vision_prepared` reports `resident_bytes`,
 encoding scratch is still allocated per image.
 
 `SIGINT` and `SIGTERM` cancel active requests and drain accepted disk writes
-before exiting. `--cache-disk DIR` defaults to 8 GiB retained on disk.
+before exiting; Qwen27B and Flash-Next also write idle sessions' live frontiers
+no disk checkpoint covers. `--cache-disk DIR` defaults to 8 GiB retained on disk.
 
 On Qwen27B and Flash-Next, `--cache-disk-bytes` counts every file the cache manages,
 including temporary files of unfinished writes and files a crash left

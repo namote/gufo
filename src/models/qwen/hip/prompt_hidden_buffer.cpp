@@ -26,6 +26,13 @@ PromptHiddenBuffer::PromptHiddenBuffer(
 PromptHiddenBuffer::~PromptHiddenBuffer() {
   const std::lock_guard lock(pinned_->mutex_);
   if (Holds()) {
+    // Copies a failed capture left queued would land in the next holder's
+    // rows, and the next holder no longer drains this stream. Pages that
+    // may still receive them serve no sharer again.
+    if (stream_ != nullptr && hipStreamSynchronize(stream_) != hipSuccess) {
+      (void)hipGetLastError();
+      pinned_->failed_ = true;
+    }
     pinned_->holder_.store(0, std::memory_order_release);
     pinned_->holder_stream_ = nullptr;
   }

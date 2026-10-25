@@ -31,7 +31,9 @@ namespace gufo::hip {
 /// it reserves or grows a capture, after the previous holder's stream drained.
 /// Rows of a buffer whose pages were taken over are gone: View() is then empty,
 /// which callers already reject as an incomplete capture.
-/// Pinned pages shared by the PromptHiddenBuffers of one process's slots.
+///
+/// PromptHiddenPinned: pinned pages shared by the PromptHiddenBuffers of one
+/// process's slots.
 class PromptHiddenPinned {
 public:
   PromptHiddenPinned() = default;

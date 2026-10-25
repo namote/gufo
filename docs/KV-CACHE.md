@@ -353,8 +353,10 @@ for the rows it protects. A retained
 Flash-Next snapshot prefers its source execution slot when
 that slot is available, avoiding a full-prefix copy for a rewritten turn.
 A busy source never blocks a branch into another slot; other choices use LRU.
-RAM admission continues to charge the complete payload size, and the disk
-byte format is unchanged. Captures intended for disk complete all device
+RAM admission charges the complete payload size, except KV chunks a Qwen27B
+checkpoint keeps as references to paged KV blocks (`--kv-pool-bytes`): those
+stay in the device pool, and only private state, partial tails and copied
+chunks are charged as RAM. The disk byte format is unchanged. Captures intended for disk complete all device
 copies before prefill resumes, so disk serialization does not introduce a
 background K/V transfer during inference.
 
@@ -375,14 +377,36 @@ captured; RAM-retained snapshots and their captures in progress share the RAM bu
 | RAM checkpoint records | 128, independent of `--sessions` | internal safety limit |
 | Disk bytes | 8 GiB | `--cache-disk-bytes` |
 | Disk staging bytes | smaller of `MemAvailable / 8` and the disk budget | `--cache-disk-staging-bytes` |
+| Paged KV pool bytes, device (Qwen27B, FP16 attention KV) | every session's full context | `--kv-pool-bytes` |
+| Tail checkpoints per long prompt | 3, where checkpoints keep KV as pool blocks | `--cache-tail-checkpoints` |
+
+Qwen27B sessions with FP16 attention KV share one device pool of 256-token
+KV blocks instead of a full-context KV allocation each. The pool holds every
+session's full context unless `--kv-pool-bytes N` sizes it, smaller to
+overcommit or larger to retain more checkpoint blocks. A session maps blocks
+as it writes; a request is admitted once the pool holds its prompt plus
+`max_tokens`, counting the blocks a continued session already maps. While the
+pool is short, idle sessions the prompt does not continue return their
+blocks: empty slots first, then RAM checkpoints holding blocks only they use,
+then live frontiers, oldest first. Otherwise admission waits for running
+requests. The pool must hold one full-context session; other models refuse a
+nonzero value. With paged KV, RAM checkpoints keep KV chunks as block
+references, so each costs its private state and tails.
+
+`--cache-tail-checkpoints K` keeps K RAM checkpoints, one every 1024 tokens
+over the end of a long prompt, so a later prompt that differs only near its
+end restores within 1024 tokens of the difference. It applies only where
+checkpoints keep KV as pool blocks and is logged at startup as
+`event=tail_checkpoints status=not_applied` otherwise.
 
 `--cache-ram-bytes 0` selects automatic sizing. Zero does not disable reuse.
 A positive value replaces the automatic budget and may exceed it: it trades the
 free half of host RAM for retention, but always leaves 4 GiB to the OS and other
 processes. For an 8 GiB cap, use `--cache-ram-bytes 8589934592`. The startup
 line reports the selected `capacity_bytes`, the `automatic_bytes` budget and
-the `max_bytes` an explicit value may claim. With a DFlash2 draft, each
-Qwen3.8-27B session also pins about 400 MiB of prompt capture at startup,
+the `max_bytes` an explicit value may claim. With a DFlash2 draft, the
+Qwen3.8-27B sessions also pin one prompt capture of about 400 MiB at startup,
+shared by every session because prefill captures for one session at a time,
 reported as `slot_pinned_bytes`. It is charged on top of `capacity_bytes`: an
 explicit value may claim at most `max_bytes` minus `slot_pinned_bytes`, or the
 startup ceiling minus `slot_pinned_bytes` when that ceiling binds.
@@ -554,6 +578,17 @@ exactly at the previous frontier. Greedy output is unchanged. Sampled output can
 differ from the pre-restart response, because the re-prefilled gap follows
 different chunk shapes, as with any partial hit. Plain continuation from RAM is
 unaffected.
+
+**Idle and stopping sessions are written back.** With the component cache
+(Qwen27B, Flash-Next), a session idle for the write-back delay whose live
+frontier is 64 or more tokens past every disk checkpoint of its conversation
+is written to disk while other sessions run, sharing the chunk files of
+checkpoints its own execution already wrote. A slot reassigned to another
+conversation, and the server at shutdown, write uncovered frontiers the same
+way, so a restart resumes from the last turn rather than its prompt. A write
+the queue refused is retried at shutdown; a failed one keeps the frontier
+live in its slot. Logs: `event=live_frontier_written_back`,
+`event=live_frontier_write_back_failed`.
 
 Disk entries are evicted by global LRU on last access, so one active run whose
 checkpoints are all recent will displace every other conversation in age order

@@ -753,7 +753,10 @@ struct TextRunnerPool::Impl {
   // older prompt snapshot. Decode/prefill work never holds this mutex.
   std::timed_mutex admission_mutex;
   std::shared_ptr<ContinuationDiskStore> disk_store;
-  std::size_t shared_prefix_min_tokens{0};
+  // Without a disk cache this still bounds the system-prompt checkpoint:
+  // shorter system prompts prefill faster than they restore.
+  std::size_t shared_prefix_min_tokens{
+      TextRunnerDiskCacheOptions{}.shared_prefix_min_tokens};
   std::size_t tail_checkpoints{0};
   std::size_t shared_prefix_max_boundaries{0};
 };
@@ -1958,19 +1961,32 @@ std::size_t TextRunnerPool::AdmissionRowBlocks(std::size_t rows) const {
   if (pool.block_rows == 0)
     return 0;
   const std::size_t context = impl_->validated.descriptor.max_context;
-  return std::min((rows + pool.block_rows - 1) / pool.block_rows +
-                      TextModelRunner::kRowBlockMargin,
-                  (context + pool.block_rows - 1) / pool.block_rows);
+  return std::min((rows + pool.block_rows - 1) / pool.block_rows,
+                  (context + pool.block_rows - 1) / pool.block_rows) +
+         TextModelRunner::kRowBlockMargin;
 }
 
 bool TextRunnerPool::AdmissionReady(std::span<const TextRunnerToken> prompt,
-                                    std::size_t max_new_tokens) {
+                                    std::size_t max_new_tokens,
+                                    const TextPromptContext* context,
+                                    bool reuse_prompt,
+                                    std::size_t cache_prefix_tokens) {
   const auto& runner = *impl_->validated.runner;
-  const std::size_t need = AdmissionRowBlocks(std::min<std::size_t>(
+  std::size_t need = AdmissionRowBlocks(std::min<std::size_t>(
       impl_->validated.descriptor.max_context, prompt.size() + max_new_tokens));
   if (need == 0 || runner.RowBlocks().free_blocks >= need)
     return true;
   if (impl_->component_cache == nullptr)
+    return true;
+  // A continued session's slot already maps the rows of its frontier;
+  // Request::ReserveRows reserves only the blocks past them.
+  const auto block_rows = runner.RowBlocks().block_rows;
+  const auto held = (impl_->component_cache->ContinuedTokens(
+                         prompt, context, reuse_prompt, cache_prefix_tokens) +
+                     block_rows - 1) /
+                    block_rows;
+  need -= std::min(need, held);
+  if (runner.RowBlocks().free_blocks >= need)
     return true;
   // kExhausted: nothing more will free; admit, and ReserveRows refuses.
   return impl_->component_cache->ReclaimRows(prompt, [&] {
@@ -1983,6 +1999,10 @@ std::size_t TextRunnerPool::WriteBackIdle(
   return impl_->component_cache
              ? impl_->component_cache->WriteBackIdle(idle_for)
              : 0;
+}
+
+bool TextRunnerPool::WriteBackDeferred() const noexcept {
+  return impl_->component_cache && impl_->component_cache->WriteBackDeferred();
 }
 
 void TextRunnerPool::Request::ReserveRows(std::size_t max_new_tokens) {

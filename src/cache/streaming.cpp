@@ -98,7 +98,7 @@ void Accumulate(TransferTiming& destination, const TransferTiming& source) {
 // helpers (measured). A will-need hint alone still left the reader
 // at 0.65 GB/s on cold 512 KiB chunk files: it waited on almost every file.
 // Helpers that read each file through a small scratch buffer leave it in the
-// page cache: 1.9 GB/s with four, 4.1 GB/s with eight (measured, U5). Helpers
+// page cache: 1.9 GB/s with four, 4.1 GB/s with eight (measured). Helpers
 // warm whole files up to a bounded byte window ahead of the reader, which
 // still reads, checks and copies every file in order.
 class Prefetcher {

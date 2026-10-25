@@ -682,16 +682,25 @@ public:
   [[nodiscard]] std::size_t capacity() const noexcept;
   /// With paged rows, false while the row pool cannot hold `prompt` and
   /// `max_new_tokens` and a resident request may still free blocks, after
-  /// returning the rows of idle sessions `prompt` does not continue. Always
-  /// true without paged rows; when nothing more can free, true so that
-  /// Request::ReserveRows refuses the request by name.
+  /// returning the rows of idle sessions `prompt` does not continue. Rows the
+  /// idle session Acquire would continue already holds are not needed again.
+  /// Always true without paged rows; when nothing more can free, true so that
+  /// Request::ReserveRows refuses the request by name. `context`,
+  /// `reuse_prompt` and `cache_prefix_tokens` are Acquire's.
   [[nodiscard]] bool AdmissionReady(std::span<const TextRunnerToken> prompt,
-                                    std::size_t max_new_tokens);
+                                    std::size_t max_new_tokens,
+                                    const TextPromptContext* context = nullptr,
+                                    bool reuse_prompt = true,
+                                    std::size_t cache_prefix_tokens = 0);
   /// Blocks an admission of `rows` holds; zero without paged rows.
   [[nodiscard]] std::size_t AdmissionRowBlocks(std::size_t rows) const;
   /// Writes idle sessions' live frontiers to the disk cache (component cache
-  /// with a disk cache only). Call only while no request runs.
+  /// with a disk cache only). Other sessions may be running; call from the
+  /// scheduler thread.
   std::size_t WriteBackIdle(std::chrono::milliseconds idle_for) noexcept;
+  /// The last WriteBackIdle left a frontier for its own pending write; call
+  /// it again later.
+  [[nodiscard]] bool WriteBackDeferred() const noexcept;
   [[nodiscard]] TextExecutionPlan SelectDecodePlan(
       std::size_t ready_requests) const;
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
