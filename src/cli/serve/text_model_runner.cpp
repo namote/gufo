@@ -1901,8 +1901,11 @@ bool TextRunnerPool::AdmissionReady(std::span<const TextRunnerToken> prompt,
   }) != ComponentTextCache::RowReclaim::kWaiting;
 }
 
-std::size_t TextRunnerPool::WriteBackIdle() noexcept {
-  return impl_->component_cache ? impl_->component_cache->WriteBackIdle() : 0;
+std::size_t TextRunnerPool::WriteBackIdle(
+    std::chrono::milliseconds idle_for) noexcept {
+  return impl_->component_cache
+             ? impl_->component_cache->WriteBackIdle(idle_for)
+             : 0;
 }
 
 void TextRunnerPool::Request::ReserveRows(std::size_t max_new_tokens) {

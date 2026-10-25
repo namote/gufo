@@ -185,6 +185,8 @@ struct ComponentTextCache::Impl {
     bool holds_rows{};
     // Where the live frontier is, to lease it exactly for a capture.
     cache::BorrowedLocation live_location{};
+    // When the live frontier was last committed.
+    Clock::time_point idle_since{};
     // Length of the live frontier last queued by WriteBackIdle; reset with
     // the lineage (durable) when the slot starts another execution.
     std::size_t written_back{};
@@ -1024,9 +1026,11 @@ void ComponentTextCache::CaptureBeforeReset(std::size_t index,
   entry->busy = true;
 }
 
-std::size_t ComponentTextCache::WriteBackIdle() noexcept {
+std::size_t ComponentTextCache::WriteBackIdle(
+    std::chrono::milliseconds idle_for) noexcept {
   if (!impl_->queue)
     return 0;
+  const auto now = Clock::now();
   std::size_t queued = 0;
   for (std::size_t i = 0; i < impl_->entries.size(); ++i) {
     auto* entry = impl_->entries[i].get();
@@ -1041,6 +1045,7 @@ std::size_t ComponentTextCache::WriteBackIdle() noexcept {
           entry->written_back,
           entry->durable ? entry->durable->Manifest().tokens.size() : 0);
       if (entry->busy || !entry->live || !entry->holds_rows ||
+          now - entry->idle_since < idle_for ||
           size < Impl::kUncoveredCaptureTokens ||
           (covered && covered + Impl::kUncoveredCaptureTokens > size))
         continue;
@@ -1704,8 +1709,16 @@ void ComponentTextCache::Lease::PreparePrefill(std::size_t tokens) {
 
 bool ComponentTextCache::Lease::CaptureRefused(std::size_t boundary) const {
   auto& cache = *impl_->cache;
-  if (!boundary || boundary > impl_->prompt.size() ||
-      CaptureBytes(boundary) <= cache.budget)
+  if (!boundary || boundary > impl_->prompt.size())
+    return false;
+  std::size_t bytes;
+  try {
+    bytes = CaptureBytes(boundary);
+  } catch (const std::invalid_argument&) {
+    // Positions are incomplete until a restore settles: not known refused.
+    return false;
+  }
+  if (bytes <= cache.budget)
     return false;
   // Capture would fall back to CaptureDurable, which refuses the same way.
   if (!cache.queue || !cache.resources->copy_observed_rows)
@@ -1980,6 +1993,7 @@ std::size_t ComponentTextCache::Lease::Commit(
     impl_->entry->live_tokens = live;
     impl_->entry->live_input = At(impl_->input, impl_->prompt.size());
     impl_->entry->live_location = location;
+    impl_->entry->idle_since = Clock::now();
     impl_->entry->live = impl_->cache->index.Insert(cache::LiveFrontier{
         location, std::move(live), impl_->cache->identity,
         At(impl_->input, impl_->prompt.size()), std::move(positions)});

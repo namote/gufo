@@ -1930,11 +1930,19 @@ struct TextGenerationScheduler::Impl {
     std::deque<std::shared_ptr<ScheduledRequest>> capturing;
     // Cold requests waiting for a resident prefill of their shared prefix.
     std::deque<std::shared_ptr<ScheduledRequest>> waiting;
+    // Sessions idle for the write-back delay are written to disk while others
+    // run; one clock read per loop, the write-back itself a few times a delay.
+    auto write_back_check = Clock::now();
     while (!stop_token.stop_requested()) {
       if (device_lost.load(std::memory_order_acquire))
         break;
       loop_working.store(true, std::memory_order_relaxed);
       ProcessQueuedCancellations();
+      if (const auto now = Clock::now(); now >= write_back_check) {
+        (void)runner_pool->WriteBackIdle(
+            scheduler_policy.idle_write_back_delay);
+        write_back_check = now + scheduler_policy.idle_write_back_delay / 4;
+      }
 
       for (std::size_t count = capturing.size(); count != 0; --count) {
         auto request = std::move(capturing.front());
@@ -1987,7 +1995,8 @@ struct TextGenerationScheduler::Impl {
             if (!written_back) {
               // The device probe keeps its own interval after this.
               written_back = true;
-              (void)runner_pool->WriteBackIdle();
+              (void)runner_pool->WriteBackIdle(
+                  scheduler_policy.idle_write_back_delay);
               lock.lock();
               continue;
             }

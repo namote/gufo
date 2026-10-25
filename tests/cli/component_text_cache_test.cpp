@@ -2034,8 +2034,10 @@ void IdleWriteBackResumesFromLastTurn() {
       ComponentTextCache cache(runner, 2, 1 << 22, disk);
       (void)turn(cache, *runner, conversation);
       if (write_back) {
-        assert(cache.WriteBackIdle() == 1);
-        assert(cache.WriteBackIdle() == 0);
+        // Not idle long enough yet.
+        assert(cache.WriteBackIdle(std::chrono::hours(1)) == 0);
+        assert(cache.WriteBackIdle(std::chrono::milliseconds(0)) == 1);
+        assert(cache.WriteBackIdle(std::chrono::milliseconds(0)) == 0);
         // Persistence runs only while no lease is held: look in from the
         // other slot between waits (a short side prompt, never written back).
         const std::vector<TextRunnerToken> side(12, 5);
@@ -2050,7 +2052,7 @@ void IdleWriteBackResumesFromLastTurn() {
         // The live frontier still serves the next turn without a restore.
         const auto [cached, disk_hit] = turn(cache, *runner, next);
         assert(cached == conversation.size() && !disk_hit);
-        assert(cache.WriteBackIdle() == 0);
+        assert(cache.WriteBackIdle(std::chrono::milliseconds(0)) == 0);
       }
     }
     auto runner = std::make_shared<Runner>();
