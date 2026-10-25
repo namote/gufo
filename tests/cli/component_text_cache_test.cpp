@@ -1633,6 +1633,49 @@ void PublishedResidentCheckpointKeepsDiskStep() {
   lease->Invalidate();
   std::filesystem::remove_all(directory);
 }
+void LearnedBoundaryLeavesTheNextStep() {
+  // A shared (learned) boundary written to disk, such as a system prompt
+  // boundary, does not consume the spacing allowance: the conversation's own
+  // checkpoint within the step after it is still written (upstream
+  // disk-spacing: the first turn reaches disk).
+  const TemporaryDirectory temp("gufo-component-learned-step-test");
+  const std::filesystem::path directory = temp.path();
+  const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                        .capacity_bytes = 1 << 20,
+                                        .staging_capacity_bytes = 7,
+                                        .min_checkpoint_step_tokens = 16};
+  std::vector<TextRunnerToken> prompt(48);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  const std::vector<TextRunnerToken> shared(prompt.begin(),
+                                            prompt.begin() + 40);
+  auto runner = std::make_shared<Runner>();
+  ComponentTextCache cache(runner, 1, 1 << 22, disk);
+  {
+    auto lease = cache.Acquire(shared, {}, {}, true, 0, true);
+    auto& state = dynamic_cast<State&>(lease->state());
+    runner->adapter->Append(state.slot, shared, shared);
+    assert(lease->TryReserveSnapshot(lease->CaptureBytes(), shared.size(),
+                                     false, SnapshotPurpose::kBranchPoint, {}));
+    assert(lease->PublishSnapshot(shared, lease->Capture(), false));
+    assert(lease->Metrics().disk_queued_bytes > 0);
+    lease->Invalidate();
+    for (int i = 0; i < 500 && lease->Metrics().persistence->completed == 0;
+         ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    assert(lease->Metrics().persistence->completed == 1);
+  }
+  auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+  assert(lease->cached_tokens() == shared.size());
+  auto& state = dynamic_cast<State&>(lease->state());
+  const auto tail = std::span(prompt).subspan(shared.size());
+  runner->adapter->Append(state.slot, tail, tail);
+  assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(), false,
+                                   SnapshotPurpose::kContinuation, {}));
+  assert(lease->PublishSnapshot(prompt, lease->Capture(), false));
+  assert(lease->Metrics().disk_queued_bytes > 0);
+  lease->Invalidate();
+  std::filesystem::remove_all(directory);
+}
 void NearTailDiskBranchSurvivesRestart() {
   const TemporaryDirectory temp("gufo-component-branch-test");
   const std::filesystem::path directory = temp.path();
@@ -2848,6 +2891,7 @@ int main() {
   WriteBackReusesPersistedChunks();
   PagedRowsAdmitWaitAndReclaim();
   PublishedResidentCheckpointKeepsDiskStep();
+  LearnedBoundaryLeavesTheNextStep();
   CancelledPrefillKeepsCompletedSteps();
   SharedPeerReusesTheCurrentStableCapture();
   BackingPreparationFollowsCaptures();

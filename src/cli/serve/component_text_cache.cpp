@@ -108,6 +108,17 @@ bool Published(const cache::PrefixCandidate& candidate) {
          std::ranges::all_of(candidate.availability->components,
                              &cache::ComponentAvailability::durable);
 }
+// A learned (shared) boundary is written whatever its spacing. Like a grid
+// capture, it does not consume the spacing allowance of the conversation's
+// own next checkpoint.
+bool SpacingAnchor(cache::CheckpointPurpose purpose) {
+  return purpose != cache::CheckpointPurpose::kLearned;
+}
+bool SpacingAnchor(const cache::PrefixCandidate& candidate) {
+  return SpacingAnchor(candidate.checkpoint
+                           ? candidate.checkpoint->Purpose()
+                           : candidate.durable->Manifest().purpose);
+}
 // What the current exception says, for a log line in its handler.
 std::string CurrentExceptionReason() {
   try {
@@ -598,16 +609,18 @@ struct ComponentTextCache::Impl {
                                                         checkpoint->Input())});
         std::size_t prior = 0;
         for (const auto& candidate : found.candidates)
-          if (Published(candidate))
+          if (Published(candidate) && SpacingAnchor(candidate))
             prior =
                 std::max(prior, static_cast<std::size_t>(candidate.boundary));
         for (const auto& queued : pending)
-          if (queued && compatible_prefix(queued->Tokens(), queued->Input()))
+          if (queued && SpacingAnchor(queued->Purpose()) &&
+              compatible_prefix(queued->Tokens(), queued->Input()))
             prior =
                 std::max(prior, static_cast<std::size_t>(queued->Boundary()));
         for (const auto& queued : pending_durable)
-          if (queued && compatible_prefix(queued->manifest.tokens,
-                                          queued->manifest.input))
+          if (queued && SpacingAnchor(queued->manifest.purpose) &&
+              compatible_prefix(queued->manifest.tokens,
+                                queued->manifest.input))
             prior = std::max(prior, queued->manifest.tokens.size());
         if (prior && checkpoint->Boundary() - prior < disk_step) {
           Logger::Info(
@@ -728,18 +741,19 @@ struct ComponentTextCache::Impl {
         {identity, tokens, cache::InputIdentity(tokens.size(), input)});
     std::size_t prior = 0;
     for (const auto& candidate : found.candidates)
-      if (Published(candidate))
+      if (Published(candidate) && SpacingAnchor(candidate))
         prior = std::max(prior, static_cast<std::size_t>(candidate.boundary));
     const auto compatible = [&](auto prefix, const auto& prefix_input) {
       return prefix_input == input && prefix.size() <= tokens.size() &&
              std::equal(prefix.begin(), prefix.end(), tokens.begin());
     };
     for (const auto& checkpoint : pending)
-      if (checkpoint && compatible(checkpoint->Tokens(), checkpoint->Input()))
+      if (checkpoint && SpacingAnchor(checkpoint->Purpose()) &&
+          compatible(checkpoint->Tokens(), checkpoint->Input()))
         prior =
             std::max(prior, static_cast<std::size_t>(checkpoint->Boundary()));
     for (const auto& capture : pending_durable)
-      if (capture &&
+      if (capture && SpacingAnchor(capture->manifest.purpose) &&
           compatible(capture->manifest.tokens, capture->manifest.input))
         prior = std::max(prior, capture->manifest.tokens.size());
     return prior && tokens.size() - prior < disk_step;
