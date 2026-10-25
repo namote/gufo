@@ -2272,7 +2272,60 @@ void ReassignmentWritesUncoveredFrontier() {
   }
   std::filesystem::remove_all(directory);
 }
+void SharedLineageCoversOnlyItsOwnFrontier() {
+  // Conversations A and B fork from one prompt checkpoint and share its
+  // lineage. A's 200-token frontier goes to disk when its slot is reassigned;
+  // that checkpoint must not count as covering B's equally long frontier, so
+  // shutdown still writes B back and a restart resumes B at 200.
+  const TemporaryDirectory temp("gufo-component-shared-lineage");
+  const std::filesystem::path directory = temp.path();
+  const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                        .capacity_bytes = 1 << 22,
+                                        .staging_capacity_bytes = 7};
+  std::vector<TextRunnerToken> a(200), b(200);
+  std::iota(a.begin(), a.end(), 10);
+  std::iota(b.begin(), b.end(), 10);
+  std::iota(b.begin() + 100, b.end(), 5000);
+  const std::vector<TextRunnerToken> head(a.begin(), a.begin() + 100);
+  {
+    auto runner = std::make_shared<Runner>();
+    ComponentTextCache cache(runner, 2, 1 << 22, disk);
+    const auto run = [&](const std::vector<TextRunnerToken>& tokens) {
+      auto lease = cache.Acquire(tokens, {}, {}, true, 0, true);
+      const auto cached = lease->cached_tokens();
+      auto& state = dynamic_cast<State&>(lease->state());
+      const auto tail = std::span(tokens).subspan(cached);
+      runner->adapter->Append(state.slot, tail, tail);
+      (void)lease->Commit({}, {}, tokens);
+      return cached;
+    };
+    {
+      auto lease = cache.Acquire(head, {}, {}, true, 0, true);
+      auto& state = dynamic_cast<State&>(lease->state());
+      runner->adapter->Append(state.slot, head, head);
+      assert(lease->TryReserveSnapshot(lease->CaptureBytes(), head.size(),
+                                       false, SnapshotPurpose::kContinuation,
+                                       {}));
+      (void)lease->Commit(head, lease->Capture(), head);
+    }
+    assert(run(a) == head.size());
+    assert(run(b) == head.size());
+    // A third prompt takes A's slot (the older one).
+    (void)run(std::vector<TextRunnerToken>(12, 5));
+  }
+  auto runner = std::make_shared<Runner>();
+  {
+    ComponentTextCache cache(runner, 2, 1 << 22, disk);
+    auto next = b;
+    next.push_back(7);
+    auto lease = cache.Acquire(next, {}, {}, true, 0, true);
+    assert(lease->cached_tokens() == b.size() && lease->restored_from_disk());
+    lease->Invalidate();
+  }
+  std::filesystem::remove_all(directory);
+}
 int main() {
+  SharedLineageCoversOnlyItsOwnFrontier();
   ReassignmentWritesUncoveredFrontier();
   ColdAssignmentCapturesUncoveredFrontier();
   ShutdownWriteBackSharesQueuedCheckpoint();

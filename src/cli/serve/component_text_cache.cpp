@@ -194,6 +194,21 @@ struct ComponentTextCache::Impl {
   // A live frontier this many tokens or more past every checkpoint of its
   // prompt is captured before its slot is reset for another request.
   static constexpr std::size_t kUncoveredCaptureTokens = 64;
+  static bool Prefixes(std::span<const cache::Token> prefix,
+                       std::span<const cache::Token> tokens) {
+    return prefix.size() <= tokens.size() &&
+           std::equal(prefix.begin(), prefix.end(), tokens.begin());
+  }
+  // Tokens of the live frontier a durable checkpoint holds.
+  static std::size_t Durable(const Entry& e) {
+    return e.durable && Prefixes(e.durable->Manifest().tokens, e.live_tokens)
+               ? e.durable->Manifest().tokens.size()
+               : 0;
+  }
+  // Also counting a write-back still queued, as its completion will.
+  static std::size_t Covered(const Entry& e) {
+    return std::max(e.written_back, Durable(e));
+  }
   struct Uncovered {
     std::size_t index;
     cache::BorrowedLocation location;
@@ -406,14 +421,18 @@ struct ComponentTextCache::Impl {
               // A checkpoint persisted from RAM is the durable ancestor of the
               // execution it came from too, so a later write-back of that
               // slot reuses its chunk files instead of writing them again.
+              // Conversations forked from one shared checkpoint share its
+              // lineage: only a prefix of the entry's own frontier covers it
+              // (a busy entry's frontier is not known yet; see Covered).
+              const auto& tokens = description->Manifest().tokens;
               for (auto& entry : entries)
                 if ((completed ? entry->branch == completed->branch
                                : entry->history &&
                                      entry->history->Lineage() ==
                                          description->Manifest().lineage) &&
+                    (entry->busy || Prefixes(tokens, entry->live_tokens)) &&
                     (!entry->durable ||
-                     entry->durable->Manifest().tokens.size() <
-                         description->Manifest().tokens.size()))
+                     entry->durable->Manifest().tokens.size() < tokens.size()))
                   entry->durable = description;
               auto found = index.Lookup(
                   {identity, description->Manifest().tokens,
@@ -999,10 +1018,9 @@ void ComponentTextCache::CaptureBeforeReset(std::size_t index,
   bool write_back;
   {
     const std::lock_guard lock(impl_->mutex);
-    write_back = impl_->queue &&
-                 (!entry->durable || entry->durable->Manifest().tokens.size() +
-                                             Impl::kUncoveredCaptureTokens <=
-                                         tokens.size());
+    write_back =
+        impl_->queue &&
+        Impl::Durable(*entry) + Impl::kUncoveredCaptureTokens <= tokens.size();
   }
   try {
     Lease lease(std::make_unique<Lease::Impl>(
@@ -1067,10 +1085,7 @@ std::size_t ComponentTextCache::WriteBackIdle(
     {
       const std::lock_guard lock(impl_->mutex);
       const auto size = entry->live_tokens.size();
-      // A queued write-back covers the frontier as its completion will.
-      const auto covered = std::max(
-          entry->written_back,
-          entry->durable ? entry->durable->Manifest().tokens.size() : 0);
+      const auto covered = Impl::Covered(*entry);
       if (entry->busy || !entry->live || !entry->holds_rows ||
           now - entry->idle_since < idle_for ||
           size < Impl::kUncoveredCaptureTokens ||
