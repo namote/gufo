@@ -686,13 +686,17 @@ void CheckRetainedKvBlocks(
   // the tails from host bytes: it maps those blocks rather than copying.
   const auto free = kv_pool->free_blocks();
   paged.BeginRestore(*p2, expected.positions);
+  // Each transfer leases its own stream, as the cache does.
+  const auto stream = [&] {
+    auto leased = pool.TryAcquire();
+    Require(bool(leased), "restore stream unavailable");
+    return leased;
+  };
   for (std::size_t i = 0; i < components.size(); ++i) {
     const auto& d = components[i];
     const auto bytes = std::span(expected.bytes[i]);
-    auto stream = pool.TryAcquire();
-    Require(bool(stream), "restore stream unavailable");
     if (!d.row_bytes) {
-      Wait(paged.LoadPrivate(*p2, d.id, bytes, *stream));
+      Wait(paged.LoadPrivate(*p2, d.id, bytes, *stream()));
       continue;
     }
     const auto valid = expected.positions[i].valid_rows;
@@ -701,12 +705,12 @@ void CheckRetainedKvBlocks(
       Wait(paged.CopyRowsIn(
           *p2, d.id, first, first + hip::kKvBlockTokens,
           {static_cast<const std::byte*>(chunk.owner.get()), chunk.bytes},
-          *stream));
+          *stream()));
       first += hip::kKvBlockTokens;
     }
     if (first < valid)
       Wait(paged.CopyRowsIn(*p2, d.id, first, valid,
-                            bytes.subspan(first * d.row_bytes), *stream));
+                            bytes.subspan(first * d.row_bytes), *stream()));
   }
   Require(paged.Validate(*p2, expected.positions),
           "a mapped restore was rejected");
