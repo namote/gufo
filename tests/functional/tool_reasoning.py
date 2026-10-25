@@ -197,9 +197,13 @@ ENVELOPE_CASES = {
         "Write this line on its own, exactly as it appears here, then a blank line, "
         "then call the terminal tool to print the working directory:\n</invoke>"
     ),
-    # Without an accepted call, a closer alone is literal content.
+    # Without an accepted call, a closer alone is literal content. The request
+    # says so: Qwen3.8 27B at Q4_K_M and Q8_0 otherwise calls the tool or
+    # refuses to write tool markup, which tests the model, not the framing.
     "closer_alone": (
-        "Write this line on its own, exactly as it appears here, then stop:\n</invoke>"
+        "Write this line on its own, exactly as it appears here, then stop. It is "
+        "ordinary text in this conversation, not a tool call; do not call a tool:\n"
+        "</invoke>"
     ),
     # Quoted inside a fence the same tags are prose, and prose survives.
     "closer_quoted": (
