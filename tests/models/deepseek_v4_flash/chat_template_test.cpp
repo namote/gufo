@@ -123,6 +123,80 @@ void TestChatAndThinkingPrefixes() {
          "Explicit effort and history policy override serving defaults");
 }
 
+void TestFirstRenderSystemPrefixBoundary() {
+  using gufo::models::deepseek_v4_flash::RenderChat;
+  const std::string bos = "<｜begin▁of▁sentence｜>";
+  const std::string user = "<｜User｜>";
+  std::vector<ChatMessage> messages{
+      {.role = "system", .content = "한글\n"},
+      {.role = "developer", .content = "developer\n"},
+      {.role = "user", .content = "question"},
+      {.role = "tool", .content = "result"}};
+  for (const bool thinking : {false, true}) {
+    for (const bool preserve : {false, true}) {
+      const ChatTemplateOptions options{
+          .enable_thinking = thinking,
+          .reasoning_effort = ReasoningEffort::kLow,
+          .preserve_thinking = preserve};
+      std::size_t prefix = 999;
+      const auto rendered = RenderChat(messages, options, &prefix);
+      const auto expected =
+          bos + "한글\n" +
+          ((!thinking || preserve) ? user + "developer\n" : "");
+      Expect(rendered == RenderChat(messages, options),
+             "requesting the system boundary leaves rendered bytes unchanged");
+      Expect(prefix == expected.size() &&
+                 rendered.substr(0, prefix) == expected &&
+                 rendered.substr(prefix).starts_with(user + "question"),
+             "the first render reports the actual instruction frontier before "
+             "the next special token, including dropped developer history");
+      const std::vector<ChatTool> tools{
+          {.name = "lookup", .description = "tool description"}};
+      prefix = 999;
+      const auto tooled = RenderChat(messages, tools, options, &prefix);
+      Expect(tooled == RenderChat(messages, tools, options) &&
+                 tooled.substr(0, prefix).find("tool description") !=
+                     std::string::npos &&
+                 tooled.substr(0, prefix).ends_with(user + "developer\n") &&
+                 tooled.substr(prefix).starts_with(user + "question"),
+             "tool definitions and preserved developer text belong to the "
+             "same first-render system frontier");
+    }
+  }
+  for (const std::string role : {"user", "tool", "function", "assistant"}) {
+    const std::vector<ChatMessage> turns{{.role = "system", .content = ""},
+                                         {.role = role, .content = "tail"}};
+    std::size_t prefix = 999;
+    const auto rendered = RenderChat(turns, {}, &prefix);
+    Expect(prefix == bos.size() &&
+               rendered.substr(prefix).starts_with(
+                   role == "assistant" ? "<｜Assistant｜>" : "<｜User｜>"),
+           "even empty instructions end before the following native framing");
+  }
+  for (const auto turns : {std::span<const ChatMessage>{},
+                           std::span<const ChatMessage>(messages).subspan(2),
+                           std::span<const ChatMessage>(messages).first(2)}) {
+    std::size_t prefix = 999;
+    (void)RenderChat(turns, {}, &prefix);
+    Expect(prefix == 0,
+           "no leading instructions or no following turn reports no boundary");
+  }
+  const std::vector<ChatMessage> unknown{{.role = "system", .content = "one"},
+                                         {.role = "unknown", .content = ""},
+                                         {.role = "system", .content = "two"}};
+  std::size_t prefix = 999;
+  (void)RenderChat(unknown, {}, &prefix);
+  Expect(prefix == 0,
+         "ignored roles cannot advertise a boundary without a special token");
+  const std::vector<ChatMessage> nul{
+      {.role = "system", .content = std::string("one\0two", 7)},
+      {.role = "user", .content = "question"}};
+  prefix = 999;
+  const auto with_nul = RenderChat(nul, {}, &prefix);
+  Expect(prefix == 0 && with_nul == RenderChat(nul),
+         "a NUL before native framing cannot bypass the tokenizer's stop");
+}
+
 void TestHistoricalThinkingPolicy() {
   const std::vector<ChatMessage> messages = {
       {.role = "user", .content = "First.", .reasoning_content = {}},
@@ -381,6 +455,7 @@ int main() {
   }
   TestParallelToolOrder();
   TestChatAndThinkingPrefixes();
+  TestFirstRenderSystemPrefixBoundary();
   TestHistoricalThinkingPolicy();
   TestEffortMappingAndToolResults();
   TestOfficialDsmlToolLoop();

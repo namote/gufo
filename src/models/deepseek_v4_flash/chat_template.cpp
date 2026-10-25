@@ -284,13 +284,22 @@ std::string_view DeepSeekReasoningEffortName(ReasoningEffort effort) noexcept {
 }
 
 std::string RenderChat(std::span<const ChatMessage> messages,
-                       const ChatTemplateOptions& options) {
-  return RenderChat(messages, {}, options);
+                       const ChatTemplateOptions& options,
+                       std::size_t* system_prefix_bytes) {
+  return RenderChat(messages, {}, options, system_prefix_bytes);
 }
 
 std::string RenderChat(std::span<const ChatMessage> messages,
                        std::span<const ChatTool> tools,
-                       const ChatTemplateOptions& options) {
+                       const ChatTemplateOptions& options,
+                       std::size_t* system_prefix_bytes) {
+  std::size_t leading = 0;
+  if (system_prefix_bytes) {
+    *system_prefix_bytes = 0;
+    while (leading < messages.size() && (messages[leading].role == "system" ||
+                                         messages[leading].role == "developer"))
+      ++leading;
+  }
   std::string output(kBos);
   if (options.enable_thinking) {
     AppendEffortPrompt(output, options.reasoning_effort);
@@ -325,6 +334,11 @@ std::string RenderChat(std::span<const ChatMessage> messages,
   for (std::size_t index = 0; index < messages.size(); ++index) {
     const auto& message = messages[index];
     const std::string_view role = message.role;
+    if (system_prefix_bytes && leading != 0 && index == leading &&
+        output.find('\0') == std::string::npos &&
+        (role == "user" || role == "tool" || role == "function" ||
+         role == "assistant"))
+      *system_prefix_bytes = output.size();
     if (role == "system") {
       output.append(message.content);
       if (index == tool_host_index) {

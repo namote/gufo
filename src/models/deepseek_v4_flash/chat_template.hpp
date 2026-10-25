@@ -1,6 +1,7 @@
 #ifndef GUFO_MODELS_DEEPSEEK_V4_FLASH_CHAT_TEMPLATE_HPP_
 #define GUFO_MODELS_DEEPSEEK_V4_FLASH_CHAT_TEMPLATE_HPP_
 
+#include <cstddef>
 #include <span>
 #include <string>
 #include <string_view>
@@ -56,11 +57,18 @@ struct ChatTemplateOptions {
 [[nodiscard]] std::string_view GenerationPrompt(bool enable_thinking);
 
 /// Renders the pinned DeepSeek V4 Flash 0731 conversation format.
-[[nodiscard]] std::string RenderChat(std::span<const ChatMessage> messages,
-                                     const ChatTemplateOptions& options = {});
-[[nodiscard]] std::string RenderChat(std::span<const ChatMessage> messages,
-                                     std::span<const ChatTool> tools,
-                                     const ChatTemplateOptions& options = {});
+/// When requested, `system_prefix_bytes` receives the end of the leading
+/// system/developer messages, before the next User/Assistant special token.
+/// Zero means no such safe boundary (including instructions-only inputs or
+/// an embedded NUL before the boundary, where the native tokenizer stops).
+[[nodiscard]] std::string RenderChat(
+    std::span<const ChatMessage> messages,
+    const ChatTemplateOptions& options = {},
+    std::size_t* system_prefix_bytes = nullptr);
+[[nodiscard]] std::string RenderChat(
+    std::span<const ChatMessage> messages, std::span<const ChatTool> tools,
+    const ChatTemplateOptions& options = {},
+    std::size_t* system_prefix_bytes = nullptr);
 
 /// Rejects DeepSeek artifacts whose embedded template is not the pinned
 /// converter version implemented by the compiled formatter.

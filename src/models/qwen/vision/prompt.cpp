@@ -256,18 +256,23 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
   std::vector<std::size_t> offsets;
   std::vector<tokenization::ContentSpan> content_spans;
   std::size_t stable_prefix_bytes = 0;
+  std::size_t system_prefix_bytes = 0;
   std::string error;
   const auto rendered = tokenization::QwenChatTemplate::Render(
       messages, tools, options, &error, &offsets, &stable_prefix_bytes,
-      &content_spans);
+      &content_spans, &system_prefix_bytes);
   if (!rendered)
     throw std::invalid_argument(error);
   Prompt prompt;
+  // Splitting before an actual special token preserves the full prompt's
+  // tokenization. A tokenizer without that framing cannot publish a boundary.
+  if (!tokenizer.FindSpecialToken(tokenization::kImStart))
+    system_prefix_bytes = 0;
   tokenization::TokenizerOptions tok_options;
   tok_options.add_bos = false;
   tok_options.add_eos = false;
   tok_options.parse_special_tokens = true;
-  const auto append = [&](std::size_t begin, std::size_t end) {
+  const auto append_tokens = [&](std::size_t begin, std::size_t end) {
     auto tokens = tokenization::QwenChatTemplate::EncodeRendered(
         tokenizer, *rendered, begin, end, content_spans, tok_options);
     if (tokens.size() > max_context - prompt.tokens.size()) {
@@ -276,6 +281,14 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
           "-token context; increase --context or shorten the conversation");
     }
     prompt.tokens.insert(prompt.tokens.end(), tokens.begin(), tokens.end());
+  };
+  const auto append = [&](std::size_t begin, std::size_t end) {
+    if (begin < system_prefix_bytes && system_prefix_bytes <= end) {
+      append_tokens(begin, system_prefix_bytes);
+      prompt.system_prefix_tokens = prompt.tokens.size();
+      begin = system_prefix_bytes;
+    }
+    append_tokens(begin, end);
   };
   crypto::Sha256Hasher identity;
   constexpr auto version = kImagePreprocessingVersion;

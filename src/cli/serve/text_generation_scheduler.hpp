@@ -80,8 +80,7 @@ public:
     std::shared_ptr<const TextPromptContext> prompt_context;
     bool cache_prompt{true};
     std::size_t cache_prefix_tokens{0};
-    /// End of the leading system messages
-    /// (TextModelRunner::SystemPrefixTokens).
+    /// End of the leading system turn, supplied by prompt preparation.
     std::size_t system_prefix_tokens{0};
     bool stop_at_eos{true};
     std::vector<std::string> stop_sequences;

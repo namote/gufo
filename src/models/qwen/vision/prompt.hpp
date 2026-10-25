@@ -52,6 +52,9 @@ struct Prompt {
   std::vector<tokenization::TokenId> tokens;
   /// Frontier unchanged when an interrupted assistant is followed by a user.
   std::size_t stable_prefix_tokens{0};
+  /// End of the rendered system turn, counted during prompt preparation.
+  /// Zero without leading system/developer messages followed by a turn.
+  std::size_t system_prefix_tokens{0};
   RopeLayout rope;
   std::vector<PreparedImage> images;
   /// SHA-256 covers decoded pixels, grid placement, preprocessing version,

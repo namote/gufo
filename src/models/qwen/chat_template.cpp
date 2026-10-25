@@ -603,7 +603,9 @@ std::optional<std::string> QwenChatTemplate::Render(
     std::span<const ChatMessage> messages, std::span<const ChatTool> tools,
     const ChatTemplateOptions& options, std::string* error_msg,
     std::vector<std::size_t>* image_offsets, std::size_t* stable_prefix_bytes,
-    std::vector<ContentSpan>* content_spans) {
+    std::vector<ContentSpan>* content_spans, std::size_t* system_prefix_bytes) {
+  if (system_prefix_bytes != nullptr)
+    *system_prefix_bytes = 0;
   if (image_offsets != nullptr)
     image_offsets->clear();
   if (content_spans != nullptr)
@@ -622,6 +624,10 @@ std::optional<std::string> QwenChatTemplate::Render(
     return message.role == ChatRole::kSystem ||
            message.role == ChatRole::kDeveloper;
   };
+  const auto leading_end =
+      std::find_if_not(messages.begin(), messages.end(), is_system);
+  const bool has_system_prefix =
+      leading_end != messages.begin() && leading_end != messages.end();
   std::vector<ChatMessage> hoisted;
   if (std::any_of(std::find_if_not(messages.begin(), messages.end(), is_system),
                   messages.end(), is_system)) {
@@ -723,6 +729,10 @@ std::optional<std::string> QwenChatTemplate::Render(
         content_spans->push_back({prefix_offset + span.offset, span.size});
     }
   }
+  // Report the boundary while rendering the system turn. The next turn
+  // starts with a special token, so tokenization can count this prefix
+  // without rendering a second conversation or changing BPE merges.
+  const auto system_end = has_system_prefix ? output.size() : 0;
 
   std::size_t last_user_index = messages.size();
   for (std::size_t index = messages.size(); index > 0; --index) {
@@ -835,6 +845,8 @@ std::optional<std::string> QwenChatTemplate::Render(
     return std::nullopt;
   }
 
+  if (system_prefix_bytes != nullptr)
+    *system_prefix_bytes = system_end;
   return output;
 }
 

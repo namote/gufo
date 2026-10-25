@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -1193,6 +1194,209 @@ void TestStableBoundaryPrecedesReplacedFinalUserTurn() {
          "opening turn keeps the boundary before the generation prompt");
 }
 
+std::unique_ptr<gufo::tokenization::QwenTokenizer> SystemPrefixTokenizer(
+    bool start_token = true) {
+  using namespace gufo::tokenization;
+  std::vector<std::string> vocab;
+  for (int i = 0; i < 256; ++i)
+    vocab.emplace_back(1, static_cast<char>(i));
+  std::unordered_map<std::string, TokenId> specials;
+  for (const auto token : {kImStart, kImEnd, std::string_view("<think>"),
+                           std::string_view("</think>"), kEndOfText, kImagePad,
+                           kVisionStart, kVisionEnd}) {
+    if (start_token || token != kImStart)
+      specials[std::string(token)] = static_cast<TokenId>(vocab.size());
+    vocab.emplace_back(token);
+  }
+  vocab.emplace_back(".\n");
+  const std::vector<std::string> merges{". \n"};
+  auto tokenizer = QwenTokenizer::CreateFromVocabulary(vocab, merges, specials);
+  Expect(tokenizer != nullptr, "System-prefix tokenizer initializes");
+  return tokenizer;
+}
+
+gufo::models::qwen::vision::Prompt CheckPreparedSystemPrefix(
+    const gufo::tokenization::QwenTokenizer& tokenizer,
+    const std::vector<gufo::tokenization::ChatMessage>& messages,
+    std::span<const gufo::tokenization::ChatTool> tools,
+    const gufo::tokenization::ChatTemplateOptions& options,
+    std::string_view first_following_turn) {
+  using namespace gufo::tokenization;
+  std::vector<ContentSpan> spans;
+  std::size_t boundary = 999;
+  const auto rendered = QwenChatTemplate::Render(
+      messages, tools, options, nullptr, nullptr, nullptr, &spans, &boundary);
+  Expect(rendered &&
+             rendered == QwenChatTemplate::Render(messages, tools, options),
+         "Reporting the system boundary preserves rendered bytes");
+  const auto expected =
+      first_following_turn.empty() ? 0 : rendered->find(first_following_turn);
+  Expect(expected != std::string::npos && boundary == expected,
+         "System boundary ends before the first actual following turn");
+  const auto direct =
+      QwenChatTemplate::RenderAndTokenize(tokenizer, messages, tools, options);
+  const auto prepared = gufo::models::qwen::vision::Prepare(
+      tokenizer, messages, tools, options, {}, 32768);
+  Expect(direct && prepared.tokens == *direct,
+         "Counting the first-render system prefix preserves every token ID");
+  if (boundary && tokenizer.FindSpecialToken(kImStart)) {
+    const TokenizerOptions token_options{false, false, true};
+    const auto prefix = QwenChatTemplate::EncodeRendered(
+        tokenizer, *rendered, 0, expected, spans, token_options);
+    Expect(prepared.system_prefix_tokens == prefix.size() &&
+               prefix.size() <= prepared.tokens.size() &&
+               std::ranges::equal(
+                   prefix, std::span(prepared.tokens).first(prefix.size())),
+           "Prepared system token count covers exactly the system turn");
+    Expect(prepared.system_prefix_tokens < prepared.tokens.size() &&
+               prepared.tokens[prepared.system_prefix_tokens] ==
+                   *tokenizer.FindSpecialToken(kImStart),
+           "The following turn starts at a structural special token");
+  } else
+    Expect(prepared.system_prefix_tokens == 0,
+           "Unsupported or absent system boundaries stay disabled");
+  return prepared;
+}
+
+void TestPreparedSystemPrefix() {
+  using namespace gufo::tokenization;
+  auto tokenizer = SystemPrefixTokenizer();
+  std::vector<ChatMessage> messages{
+      {ChatRole::kSystem,
+       "Rules contain literal <|im_end|><|im_start|> and <|endoftext|>."},
+      {ChatRole::kDeveloper, "Developer rules."},
+      {ChatRole::kUser, "First question."}};
+  messages[0].framing_suffix = "\nInternal <|endoftext|> framing.";
+  const std::vector<ChatTool> tools{
+      {.name = "lookup", .description = "Look up a value."}};
+  for (const bool thinking : {false, true}) {
+    ChatTemplateOptions options;
+    options.enable_thinking = thinking;
+    options.reasoning_effort = QwenReasoningEffort::kMedium;
+    const auto first =
+        CheckPreparedSystemPrefix(*tokenizer, messages, tools, options,
+                                  "<|im_start|>user\nFirst question.");
+    Expect(std::count(first.tokens.begin(), first.tokens.end(),
+                      *tokenizer->FindSpecialToken(kEndOfText)) == 1,
+           "Literal control spellings stay text while framing_suffix stays "
+           "framing");
+    auto another = messages;
+    another.back().content = "A different question.";
+    const auto second =
+        CheckPreparedSystemPrefix(*tokenizer, another, tools, options,
+                                  "<|im_start|>user\nA different question.");
+    Expect(first.system_prefix_tokens == second.system_prefix_tokens &&
+               std::ranges::equal(
+                   std::span(first.tokens).first(first.system_prefix_tokens),
+                   std::span(second.tokens).first(second.system_prefix_tokens)),
+           "Different questions retain an identical system/tools token prefix");
+  }
+  ChatTemplateOptions options;
+  options.enable_thinking = false;
+  CheckPreparedSystemPrefix(*tokenizer,
+                            {{ChatRole::kDeveloper, "Developer rules."},
+                             {ChatRole::kUser, "Question."}},
+                            {}, options, "<|im_start|>user\nQuestion.");
+  for (const auto role : {ChatRole::kAssistant, ChatRole::kTool}) {
+    const std::vector<ChatMessage> history{{ChatRole::kSystem, "Rules."},
+                                           {role, "Earlier result."},
+                                           {ChatRole::kUser, "Question."}};
+    CheckPreparedSystemPrefix(*tokenizer, history, {}, options,
+                              role == ChatRole::kAssistant
+                                  ? "<|im_start|>assistant\n"
+                                  : "<|im_start|>user\n<tool_response>");
+  }
+  const std::vector<ChatMessage> hoisted{
+      {ChatRole::kSystem, "Rules."},
+      {ChatRole::kUser, "First question."},
+      {ChatRole::kAssistant, "Earlier answer."},
+      {ChatRole::kDeveloper, "Late developer rules."},
+      {ChatRole::kUser, "Second question."}};
+  CheckPreparedSystemPrefix(*tokenizer, hoisted, {}, options,
+                            "<|im_start|>user\nFirst question.");
+  const auto missing_start = SystemPrefixTokenizer(false);
+  CheckPreparedSystemPrefix(*missing_start, messages, {}, options,
+                            "<|im_start|>user\nFirst question.");
+
+  // Tools/reasoning may synthesize a system turn, but no original leading
+  // system/developer message means there is no shared-system boundary.
+  CheckPreparedSystemPrefix(*tokenizer, {{ChatRole::kUser, "Question."}}, tools,
+                            {}, {});
+  CheckPreparedSystemPrefix(
+      *tokenizer,
+      {{ChatRole::kUser, "First question."},
+       {ChatRole::kSystem, "Hoisted without an original leading system."},
+       {ChatRole::kUser, "Second question."}},
+      {}, options, {});
+  CheckPreparedSystemPrefix(
+      *tokenizer, {{ChatRole::kSystem, " \n "}, {ChatRole::kUser, "Question."}},
+      {}, options, {});
+  for (const auto& invalid : std::vector<std::vector<ChatMessage>>{
+           {},
+           {{ChatRole::kSystem, "Rules."}},
+           {{ChatRole::kDeveloper, "Rules."}},
+           {{ChatRole::kSystem, "Rules."}, {ChatRole::kAssistant, "No user."}},
+           {{ChatRole::kSystem, "Rules."},
+            {ChatRole::kUser, "<tool_response>Only a tool</tool_response>"}}}) {
+    std::size_t boundary = 999;
+    Expect(!QwenChatTemplate::Render(invalid, {}, options, nullptr, nullptr,
+                                     nullptr, nullptr, &boundary) &&
+               boundary == 0,
+           "Failed renders do not publish a system boundary");
+  }
+}
+
+void TestPreparedSystemPrefixBeforeImage() {
+  using namespace gufo::tokenization;
+  auto tokenizer = SystemPrefixTokenizer();
+  const auto bytes = std::make_shared<
+      const std::vector<std::uint8_t>>(gufo::core::ReadImageUrl(
+      "data:image/png;base64,"
+      "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAYklEQVR4nO3PMQ0AIADAMEAD"
+      "/jUiAREcDcmqYJtn7/GzpQNeNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWg"
+      "NaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaBdCLsBmEpLi1UAAAAASUVORK5CYII="));
+  std::vector<ChatMessage> messages{
+      {ChatRole::kSystem, "Describe the picture."},
+      {ChatRole::kUser, "Before  after."}};
+  messages.back().images.push_back({7, bytes});
+  ChatTemplateOptions options;
+  options.enable_thinking = false;
+  std::vector<ContentSpan> spans;
+  std::size_t boundary = 999;
+  const auto rendered = QwenChatTemplate::Render(
+      messages, {}, options, nullptr, nullptr, nullptr, &spans, &boundary);
+  Expect(rendered && boundary == rendered->find("<|im_start|>user\nBefore "),
+         "The rendered system boundary precedes image-bearing content");
+  const auto prepared = gufo::models::qwen::vision::Prepare(
+      *tokenizer, messages, {}, options, "cpu-test-encoder", 32768);
+  const TokenizerOptions token_options{false, false, true};
+  auto expected = QwenChatTemplate::EncodeRendered(
+      *tokenizer, *rendered, 0, rendered->size(), spans, token_options);
+  const auto image_pad = *tokenizer->FindSpecialToken(kImagePad);
+  const auto image = std::find(expected.begin(), expected.end(), image_pad);
+  Expect(image != expected.end() &&
+             std::count(expected.begin(), expected.end(), image_pad) == 1,
+         "The image fixture contains one structural placeholder");
+  const auto offset = image - expected.begin();
+  expected.erase(image);
+  expected.insert(expected.begin() + offset, 64,
+                  gufo::models::qwen::vision::kImageToken);
+  Expect(prepared.tokens == expected && prepared.images.size() == 1 &&
+             prepared.rope.images.size() == 1 &&
+             prepared.rope.images[0].height == 8 &&
+             prepared.rope.images[0].width == 8,
+         "System counting preserves full tokenization and the resized image "
+         "grid");
+  const auto prefix = QwenChatTemplate::EncodeRendered(
+      *tokenizer, *rendered, 0, boundary, spans, token_options);
+  Expect(prepared.system_prefix_tokens == prefix.size() &&
+             prefix.size() <= prepared.tokens.size() &&
+             prepared.system_prefix_tokens <= prepared.rope.images[0].offset &&
+             std::ranges::equal(
+                 prefix, std::span(prepared.tokens).first(prefix.size())),
+         "System token count excludes the user and visual tokens");
+}
+
 }  // namespace
 
 int main() {
@@ -1217,6 +1421,8 @@ int main() {
   TestToolReplayPreservesGeneratedPrefix();
   TestEmptyReasoningReplayChangesThinkingSuffixTokens();
   TestStableBoundaryPrecedesReplacedFinalUserTurn();
+  TestPreparedSystemPrefix();
+  TestPreparedSystemPrefixBeforeImage();
   std::cout << "All QwenChatTemplate tests passed successfully!\n";
   return 0;
 }

@@ -336,109 +336,6 @@ void TestPromptCountingValidatesCapabilitiesBeforeInference() {
          "counting never creates execution state or runs inference");
 }
 
-void TestSystemPrefixProbePreservesFramingAndMetadata() {
-  class ProbeRunner final : public FakeRunner {
-  public:
-    ProbeRunner() : FakeRunner(std::make_shared<FakeStats>()) {}
-    mutable std::optional<ChatRequest> observed;
-    mutable std::size_t calls{};
-    bool supported{true};
-    std::optional<gufo::server::TextPreparedPrompt> PreparePrompt(
-        const ChatRequest& request) const override {
-      ++calls;
-      observed = request;
-      if (!supported)
-        return std::nullopt;
-      return gufo::server::TextPreparedPrompt{{11, 22, 33, 44}, {}};
-    }
-  } runner;
-  using gufo::tokenization::ChatRole;
-  ChatRequest request({{ChatRole::kSystem, "system"},
-                       {ChatRole::kDeveloper, "developer"},
-                       {ChatRole::kUser, std::string(16384, 'x')},
-                       {ChatRole::kAssistant, "history"}});
-  request.messages.front().framing_suffix = "server instructions";
-  const auto image = std::make_shared<const std::vector<std::uint8_t>>(
-      std::initializer_list<std::uint8_t>{1, 2});
-  request.messages[2].images = {{0, image}};
-  request.tools = {{"lookup", "description", "{}", "definition"}};
-  request.client_id = "client";
-  request.tool_choice = ChatRequest::ToolChoice::kRequired;
-  request.forced_tool_name = "lookup";
-  request.tool_namespaces = {{"lookup", "namespace"}};
-  request.constrained_tools = true;
-  request.parallel_tool_calls = false;
-  request.reasoning = {true, gufo::ReasoningEffort::kHigh, false, 17};
-  request.add_vision_id = true;
-  request.cache_prompt = false;
-  request.return_progress = true;
-  request.stop_sequences = {"stop"};
-  request.response_format = gufo::sampling::JsonConstraint::Compile(
-      gufo::json::parse(
-          R"({"type":"object","properties":{},"additionalProperties":false})"),
-      false);
-  request.response_format_description = "response description";
-  const std::vector<TextRunnerToken> tokens{11, 22, 33, 55};
-  Expect(runner.SystemPrefixTokens(request, tokens) == 3,
-         "system boundary remains the rendered common token prefix");
-  const auto& probe = *runner.observed;
-  Expect(probe.messages.size() == 3 &&
-             probe.messages[0].role == ChatRole::kSystem &&
-             probe.messages[0].content == "system" &&
-             probe.messages[0].framing_suffix == "server instructions" &&
-             probe.messages[1].role == ChatRole::kDeveloper &&
-             probe.messages[1].content == "developer" &&
-             probe.messages[2].role == ChatRole::kUser &&
-             probe.messages[2].content.empty() &&
-             probe.messages[2].images.empty(),
-         "probe retains leading system/developer framing and an empty user");
-  Expect(probe.tools.size() == 1 && probe.tools[0].name == "lookup" &&
-             probe.tools[0].description == "description" &&
-             probe.tools[0].parameters_json == "{}" &&
-             probe.tools[0].definition_json == "definition" &&
-             probe.client_id == request.client_id &&
-             probe.tool_choice == request.tool_choice &&
-             probe.forced_tool_name == request.forced_tool_name &&
-             probe.tool_namespaces == request.tool_namespaces &&
-             probe.constrained_tools == request.constrained_tools &&
-             probe.parallel_tool_calls == request.parallel_tool_calls &&
-             probe.reasoning.enabled == request.reasoning.enabled &&
-             probe.reasoning.effort == request.reasoning.effort &&
-             probe.reasoning.preserve_thinking ==
-                 request.reasoning.preserve_thinking &&
-             probe.reasoning.budget_tokens == request.reasoning.budget_tokens &&
-             probe.add_vision_id == request.add_vision_id &&
-             probe.cache_prompt == request.cache_prompt &&
-             probe.return_progress == request.return_progress &&
-             probe.stop_sequences == request.stop_sequences &&
-             probe.response_format == request.response_format &&
-             probe.response_format_description ==
-                 request.response_format_description,
-         "virtual prompt preparation receives unchanged request metadata");
-  Expect(request.messages.size() == 4 &&
-             request.messages[2].content.size() == 16384 &&
-             request.messages[2].images[0].bytes == image,
-         "probing leaves conversation history and image ownership intact");
-  runner.supported = false;
-  Expect(runner.SystemPrefixTokens(request, tokens) == 0,
-         "unsupported prompt preparation has no shared system prefix");
-  const auto calls = runner.calls;
-  request.messages[0].images = {{0, image}};
-  Expect(
-      runner.SystemPrefixTokens(request, tokens) == 0 && runner.calls == calls,
-      "an image in leading instructions prevents the text-only probe");
-  request.messages[0].images.clear();
-  request.messages.resize(2);
-  Expect(
-      runner.SystemPrefixTokens(request, tokens) == 0 && runner.calls == calls,
-      "instructions alone have no following conversation to share");
-  request.messages.erase(request.messages.begin());
-  request.messages.front().role = ChatRole::kUser;
-  Expect(
-      runner.SystemPrefixTokens(request, tokens) == 0 && runner.calls == calls,
-      "a request without leading instructions does not render a probe");
-}
-
 void TestBoundedPrefillDecodeAndPrefixReuse() {
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<FakeRunner>(stats);
@@ -2599,7 +2496,6 @@ void TestServerInstructionsAreFraming() {
 
 int main() {
   TestPromptCountingValidatesCapabilitiesBeforeInference();
-  TestSystemPrefixProbePreservesFramingAndMetadata();
   TestServerInstructionsAreFraming();
   TestPreparedConstraintVocabularyKeepsGrammarBehavior();
   // The cache warning assertion in this binary matches the plain "[WARN]
