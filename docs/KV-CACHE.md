@@ -381,8 +381,10 @@ captured; RAM-retained snapshots and their captures in progress share the RAM bu
 | Tail checkpoints per long prompt | 3, where checkpoints keep KV as pool blocks | `--cache-tail-checkpoints` |
 
 Qwen27B sessions with FP16 attention KV share one device pool of 256-token
-KV blocks instead of a full-context KV allocation each. The pool holds every
-session's full context unless `--kv-pool-bytes N` sizes it, smaller to
+KV blocks instead of a full-context KV allocation each; this is always on
+for that policy. The pool holds every session's full context (sessions ×
+context, the memory full-context sessions would hold) unless
+`--kv-pool-bytes N` sizes it, smaller to
 overcommit or larger to retain more checkpoint blocks. A session maps blocks
 as it writes; a request is admitted once the pool holds its prompt plus
 `max_tokens`, counting the blocks a continued session already maps. While the
