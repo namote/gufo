@@ -1061,6 +1061,16 @@ void QwenGpuArena::EnsureKvRestoreBlock(std::uint32_t logical) {
   --kv_unmapped_blocks_;
 }
 
+void QwenGpuArena::ReleaseMappedKvBlocks(std::size_t first) noexcept {
+  // Unmapped restore entries hold no pool reference. Move them past the
+  // mapped ones (the caller drops this tail) and release only real blocks.
+  const auto tail = kv_blocks_.begin() + static_cast<std::ptrdiff_t>(first);
+  const auto mapped_end = std::remove(tail, kv_blocks_.end(), kUnmappedKvBlock);
+  kv_unmapped_blocks_ -=
+      static_cast<std::size_t>(std::distance(mapped_end, kv_blocks_.end()));
+  kv_pool_->Release(std::span(tail, mapped_end));
+}
+
 void QwenGpuArena::TruncateKvRows(std::uint32_t rows) {
   if (!kv_shared_)
     return;
@@ -1069,10 +1079,7 @@ void QwenGpuArena::TruncateKvRows(std::uint32_t rows) {
     return;
   // Passes and table uploads in flight may still use these blocks.
   HIP_CHECK(hipStreamSynchronize(stream));
-  const auto released = std::span(kv_blocks_).subspan(keep);
-  if (kv_unmapped_blocks_ != 0)
-    kv_unmapped_blocks_ -= std::ranges::count(released, kUnmappedKvBlock);
-  kv_pool_->Release(released);
+  ReleaseMappedKvBlocks(keep);
   kv_blocks_.resize(keep);
 }
 
@@ -1577,7 +1584,7 @@ void QwenGpuArena::FreeAll() noexcept {
   if (kv_pool_ != nullptr) {
     if (kv_shared_ && stream != nullptr && !kv_blocks_.empty())
       LogCleanupError(hipStreamSynchronize(stream));
-    kv_pool_->Release(kv_blocks_);
+    ReleaseMappedKvBlocks(0);
   }
   kv_reservation_.Reset();
   kv_blocks_.clear();

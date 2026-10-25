@@ -448,12 +448,19 @@ public:
   [[nodiscard]] bool SharesKvPool() const noexcept { return kv_shared_; }
   /// Shared pool: maps blocks for rows [0, end) before a pass writes them,
   /// from the reservation first (ReserveKvRows). Throws std::length_error,
-  /// mapping nothing, when the pool falls short. No-op for an own pool.
+  /// mapping nothing, when the pool falls short, and std::logic_error while
+  /// a restore left entries unmapped. No-op for an own pool.
   void EnsureKvRows(std::uint32_t end);
   /// Prepares logical restore entries without allocating their pool blocks.
   /// Whole retained chunks can then be mapped directly; only copied rows
-  /// need EnsureKvRestoreBlock. No execution may use an incomplete table.
+  /// need EnsureKvRestoreBlock. No execution may use an incomplete table:
+  /// EnsureKvRows, ReserveKvRows and UploadKvTable throw until every entry
+  /// is mapped, and TruncateKvRows or a reset drops the unmapped ones.
   void PrepareKvRestoreRows(std::uint32_t end);
+  /// Gives an unmapped restore entry its own block, from the reservation
+  /// first, for rows copied in rather than mapped. No-op for a mapped entry
+  /// or an own pool. Throws std::length_error, leaving the entry unmapped,
+  /// when the pool falls short.
   void EnsureKvRestoreBlock(std::uint32_t logical);
   static constexpr std::uint32_t kUnmappedKvBlock = ~std::uint32_t{0};
   /// Shared pool: returns the blocks past `rows` once queued passes finish.
@@ -551,6 +558,9 @@ private:
   bool kv_shared_{false};
   std::vector<std::uint32_t> kv_blocks_;
   std::size_t kv_unmapped_blocks_{0};
+  // Releases the mapped blocks of kv_blocks_[first, end) and uncounts the
+  // unmapped ones; leaves that tail unordered for the caller to drop.
+  void ReleaseMappedKvBlocks(std::size_t first) noexcept;
   std::uint32_t* d_kv_block_table_{nullptr};
   // Pinned copy of the device table, the source of its async uploads.
   std::uint32_t* h_kv_block_table_{nullptr};
