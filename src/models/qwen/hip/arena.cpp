@@ -1063,22 +1063,36 @@ void QwenGpuArena::UnshareKvRows(std::uint32_t first, std::uint32_t end) {
     // Table uploads in flight read the pinned host table.
     HIP_CHECK(hipStreamSynchronize(stream));
     const auto copy = kv_pool_->Allocate(1, &kv_reservation_).front();
-    for (std::size_t plane = 0; plane < geometry.planes().size(); ++plane) {
-      const auto pitch = geometry.layer_pitch(plane);
-      const auto width = geometry.block_bytes(plane);
-      auto* base = reinterpret_cast<std::uint8_t*>(kv_pool_->plane_data(plane));
-      HIP_CHECK(hipMemcpy2DAsync(
-          base + copy * width, pitch, base + shared * width, pitch, width,
-          geometry.planes()[plane].layers, hipMemcpyDeviceToDevice, stream));
+    try {
+      for (std::size_t plane = 0; plane < geometry.planes().size(); ++plane) {
+        const auto pitch = geometry.layer_pitch(plane);
+        const auto width = geometry.block_bytes(plane);
+        auto* base =
+            reinterpret_cast<std::uint8_t*>(kv_pool_->plane_data(plane));
+        HIP_CHECK(hipMemcpy2DAsync(
+            base + copy * width, pitch, base + shared * width, pitch, width,
+            geometry.planes()[plane].layers, hipMemcpyDeviceToDevice, stream));
+      }
+    } catch (...) {
+      // The table still maps the shared block.
+      kv_pool_->Release(std::span(&copy, 1), kv_reservation_);
+      throw;
     }
     h_kv_block_table_[logical] = copy;
     kv_blocks_[logical] = copy;
-    HIP_CHECK(hipMemcpyAsync(d_kv_block_table_ + logical,
-                             h_kv_block_table_ + logical, sizeof(std::uint32_t),
-                             hipMemcpyHostToDevice, stream));
-    // Queued passes and the copy read the shared block; once its other
-    // owner lets go it may be written by another arena.
-    HIP_CHECK(hipStreamSynchronize(stream));
+    // The table maps the copy now; this arena's reference to the shared
+    // block is returned on every path.
+    try {
+      HIP_CHECK(hipMemcpyAsync(
+          d_kv_block_table_ + logical, h_kv_block_table_ + logical,
+          sizeof(std::uint32_t), hipMemcpyHostToDevice, stream));
+      // Queued passes and the copy read the shared block; once its other
+      // owner lets go it may be written by another arena.
+      HIP_CHECK(hipStreamSynchronize(stream));
+    } catch (...) {
+      kv_pool_->Release(std::span(&shared, 1));
+      throw;
+    }
     kv_pool_->Release(std::span(&shared, 1));
   }
 }

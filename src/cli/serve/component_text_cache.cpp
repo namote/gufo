@@ -906,13 +906,28 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
         inherited = chunks * d.rows_per_chunk;
       }
     }
+    // Completed rows are lent as one view, or chunk by chunk when they lie
+    // on several runs of device blocks; only rows the slot cannot lend are
+    // staged in RAM.
     std::shared_ptr<cache::BorrowedRows> rows;
+    std::vector<std::shared_ptr<cache::BorrowedRows>> chunk_rows;
     if (completed) {
       if (inherited != completed) {
         auto view = cache->resources->adapter->BorrowRowsView(
             slot.Execution(), d.id, inherited, completed);
         if (!view.empty())
           rows = slot.Observe(d.id, inherited, completed, view);
+        else if (completed - inherited > d.rows_per_chunk) {
+          chunk_rows.resize((completed - inherited) / d.rows_per_chunk);
+          for (std::size_t i = 0; i < chunk_rows.size(); ++i) {
+            const auto first = inherited + i * d.rows_per_chunk;
+            const auto end = first + d.rows_per_chunk;
+            auto chunk = cache->resources->adapter->BorrowRowsView(
+                slot.Execution(), d.id, first, end);
+            if (!chunk.empty())
+              chunk_rows[i] = slot.Observe(d.id, first, end, chunk);
+          }
+        }
       }
       component.chunks.reserve(completed / d.rows_per_chunk);
     }
@@ -923,9 +938,16 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
                              : (end - first) * d.row_bytes;
       const auto file =
           cache->File(0, cache::ExecutionHistory::AllocateCheckpointId().value);
+      const auto chunk =
+          private_file || chunk_rows.empty()
+              ? std::shared_ptr<cache::BorrowedRows>{}
+              : chunk_rows[(first - inherited) / d.rows_per_chunk];
       if (rows && !private_file) {
         durable->sources.emplace_back(false, file, bytes, d.row_bytes, rows,
                                       (first - inherited) * d.row_bytes,
+                                      cache->resources->copy_observed_rows);
+      } else if (chunk) {
+        durable->sources.emplace_back(false, file, bytes, d.row_bytes, chunk, 0,
                                       cache->resources->copy_observed_rows);
       } else {
         const cache::PayloadRequest request{

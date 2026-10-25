@@ -970,7 +970,12 @@ cache::Adapter::RetainedRows ContinuationAdapter::RetainRows(
         Check(hipStreamSynchronize(arena.stream));
       // The slot holds the block, so it cannot be free here.
       kv_pool_->Retain(std::span(&block, 1));
-      retained = std::make_shared<RetainedBlock>(kv_pool_, block);
+      try {
+        retained = std::make_shared<RetainedBlock>(kv_pool_, block);
+      } catch (...) {
+        kv_pool_->Release(std::span(&block, 1));
+        throw;
+      }
       retained_[block] = retained;
     }
   }

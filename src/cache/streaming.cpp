@@ -136,6 +136,8 @@ private:
       {
         std::unique_lock lock(mutex_);
         if (!wake_.wait(lock, stop, [&] {
+              // Items the reader already passed need no warming.
+              next_ = std::max(next_, reader_);
               return next_ < items_.size() &&
                      offsets_[next_] - offsets_[reader_] < kWindowBytes;
             }))

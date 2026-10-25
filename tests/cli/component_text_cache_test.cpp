@@ -2597,6 +2597,43 @@ void FailedWriteBackKeepsTheLiveFrontier() {
   }
   std::filesystem::remove_all(directory);
 }
+void ScatteredRowsWriteBackChunkByChunk() {
+  // Completed rows the adapter cannot lend as one view (rows spread over
+  // device blocks) are lent chunk by chunk, not staged in RAM, and restore
+  // after a restart.
+  const TemporaryDirectory temp("gufo-component-scattered-write-back");
+  const std::filesystem::path directory = temp.path();
+  const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                        .capacity_bytes = 1 << 22,
+                                        .staging_capacity_bytes = 7};
+  std::vector<TextRunnerToken> conversation(100);
+  std::iota(conversation.begin(), conversation.end(), 10);
+  {
+    auto runner = std::make_shared<Runner>();
+    ComponentTextCache cache(runner, 1, 1 << 22, disk);
+    runner->adapter->LimitBorrowedRows(runner->rows_per_chunk);
+    {
+      auto lease = cache.Acquire(conversation, {}, {}, true, 0, true);
+      auto& state = dynamic_cast<State&>(lease->state());
+      runner->adapter->Append(state.slot, conversation, conversation);
+      (void)lease->Commit({}, {}, conversation);
+    }
+    const auto copied = runner->adapter->CopiedOutRows();
+    assert(cache.WriteBackIdle(std::chrono::milliseconds(0)) == 1);
+    assert(runner->adapter->CopiedOutRows() == copied);
+  }
+  auto runner = std::make_shared<Runner>();
+  {
+    ComponentTextCache cache(runner, 1, 1 << 22, disk);
+    auto next = conversation;
+    next.push_back(7);
+    auto lease = cache.Acquire(next, {}, {}, true, 0, true);
+    assert(lease->cached_tokens() == conversation.size() &&
+           lease->restored_from_disk());
+    lease->Invalidate();
+  }
+  std::filesystem::remove_all(directory);
+}
 void QueuedWriteBackFailureUncoversTheFrontier() {
   // A write-back that is queued and then fails no longer covers the
   // frontier, however soon it fails: shutdown writes it again.
@@ -2737,6 +2774,7 @@ void SiblingDoesNotAdoptAnotherExecutionsCheckpoint() {
 int main() {
   FailedWriteBackKeepsTheLiveFrontier();
   QueuedWriteBackFailureUncoversTheFrontier();
+  ScatteredRowsWriteBackChunkByChunk();
   RowReclaimEmptiesSlotsBeforeDroppingCheckpoints();
   SiblingDoesNotAdoptAnotherExecutionsCheckpoint();
   FirstFollowerRestoresTheSystemPromptCheckpoint();

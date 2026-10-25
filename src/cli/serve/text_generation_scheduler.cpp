@@ -1981,24 +1981,27 @@ struct TextGenerationScheduler::Impl {
           // Only the idle wait has a timer. Arrival interrupts it immediately;
           // active work units add one clock read per loop (idle write-back)
           // and no device polling.
-          // The first wait of an idle period ends after the write-back delay:
-          // idle sessions' live frontiers then go to the disk cache once.
+          // Once the idle period reaches the write-back delay, idle
+          // sessions' live frontiers go to the disk cache once; device
+          // probes keep their own interval before and after.
+          const auto write_back_at =
+              Clock::now() + scheduler_policy.idle_write_back_delay;
           bool written_back = false;
           while (!wake()) {
             loop_working.store(false, std::memory_order_relaxed);
-            const bool woken = queue_condition.wait_for(
-                lock,
-                written_back ? scheduler_policy.device_probe_interval
-                             : std::min(scheduler_policy.device_probe_interval,
-                                        scheduler_policy.idle_write_back_delay),
-                wake);
+            auto timeout = scheduler_policy.device_probe_interval;
+            if (!written_back)
+              timeout = std::min(timeout,
+                                 std::max(std::chrono::ceil<decltype(timeout)>(
+                                              write_back_at - Clock::now()),
+                                          decltype(timeout)::zero()));
+            const bool woken = queue_condition.wait_for(lock, timeout, wake);
             progress.fetch_add(1, std::memory_order_relaxed);
             loop_working.store(true, std::memory_order_relaxed);
             if (woken)
               break;
             lock.unlock();
-            if (!written_back) {
-              // The device probe keeps its own interval after this.
+            if (!written_back && Clock::now() >= write_back_at) {
               written_back = true;
               (void)runner_pool->WriteBackIdle(
                   scheduler_policy.idle_write_back_delay);

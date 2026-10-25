@@ -427,6 +427,7 @@ Completion FakeAdapter::CopyRowsOut(const Slot& slot, ComponentId id,
   const auto& rows = RowArray(state, id);
   if (end > rows.size())
     throw std::invalid_argument("cannot capture unavailable rows");
+  copied_out_rows_.fetch_add(end - first, std::memory_order_relaxed);
   return SubmitRead(slot, stream, [&rows, first, dst] {
     if (!dst.empty())
       std::memcpy(dst.data(), rows.data() + first, dst.size());
@@ -548,6 +549,8 @@ std::span<const std::byte> FakeAdapter::BorrowRowsView(const Slot& slot,
   const auto& rows = RowArray(state, component);
   if (first >= end || end > rows.size())
     throw std::invalid_argument("invalid borrowed fake range");
+  if (borrow_limit_ != 0 && end - first > borrow_limit_)
+    return {};
   // Append, restore and release guard the old allocation before replacing
   // the vector, so views stay fixed even though this fixture moves storage.
   return std::as_bytes(std::span(rows).subspan(first, end - first));
