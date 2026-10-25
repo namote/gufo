@@ -163,9 +163,9 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse,
   HIP_CHECK(hipMemset(d_out_ref, 0, q_elements * sizeof(float)));
   if (!gufo::hip::LaunchBatchedAttentionTile(
           d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16, cache_f16_v,
-          d_out_ref, /*layer_idx=*/0, start_pos, batch_size, kMaxContext,
-          kNumHeads, kNumKvHeads, kHeadDim, nullptr, lse_ref, key_begin,
-          false)) {
+          gufo::hip::KvBlockTable{}, d_out_ref, /*layer_idx=*/0, start_pos,
+          batch_size, kMaxContext, kNumHeads, kNumKvHeads, kHeadDim, nullptr,
+          lse_ref, key_begin, false)) {
     std::cerr << "tiled attention rejected the production shape\n";
     std::abort();
   }
@@ -175,8 +175,9 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse,
   HIP_CHECK(hipMemset(d_out_new, 0, q_elements * sizeof(float)));
   if (!gufo::hip::LaunchQwenWmmaAttention(
           d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16, cache_f16_v,
-          d_out_new, /*layer_idx=*/0, start_pos, batch_size, kMaxContext,
-          kNumHeads, kNumKvHeads, kHeadDim, nullptr, lse_new, key_begin,
+          gufo::hip::KvBlockTable{}, d_out_new, /*layer_idx=*/0, start_pos,
+          batch_size, kMaxContext, kNumHeads, kNumKvHeads, kHeadDim, nullptr,
+          lse_new, key_begin,
           /*skip_kv_write=*/true)) {
     std::cerr << "WMMA attention rejected the production shape\n";
     std::abort();
@@ -237,8 +238,9 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse,
   HIP_CHECK(hipMemset(d_out_new, 0, q_elements * sizeof(float)));
   if (!gufo::hip::LaunchQwenWmmaAttention(
           d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16, cache_f16_v,
-          d_out_new, /*layer_idx=*/0, start_pos, batch_size, kMaxContext,
-          kNumHeads, kNumKvHeads, kHeadDim, nullptr, lse_new, key_begin,
+          gufo::hip::KvBlockTable{}, d_out_new, /*layer_idx=*/0, start_pos,
+          batch_size, kMaxContext, kNumHeads, kNumKvHeads, kHeadDim, nullptr,
+          lse_new, key_begin,
           /*skip_kv_write=*/true)) {
     std::cerr << "WMMA attention rejected the production shape on replay\n";
     std::abort();
@@ -267,9 +269,10 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse,
         if (!gufo::hip::LaunchQwenWmmaAttention(
                 d_q + offset * attention_size, d_k, d_v,
                 d_gate + offset * attention_size, d_cache, v_cache, d_cache_f16,
-                cache_f16_v, d_out_new + offset * attention_size, 0,
-                start_pos + offset, count, kMaxContext, kNumHeads, kNumKvHeads,
-                kHeadDim, nullptr, nullptr, key_begin, true))
+                cache_f16_v, gufo::hip::KvBlockTable{},
+                d_out_new + offset * attention_size, 0, start_pos + offset,
+                count, kMaxContext, kNumHeads, kNumKvHeads, kHeadDim, nullptr,
+                nullptr, key_begin, true))
           std::abort();
       }
       HIP_CHECK(hipMemcpy(again.data(), d_out_new, q_elements * sizeof(float),
@@ -323,9 +326,9 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse,
       const auto v_work = work[1].first(sizes[1]);
       if (!gufo::hip::LaunchQwenWmmaAttention(
               d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16, cache_f16_v,
-              d_out_new, 0, start_pos, batch_size, kMaxContext, kNumHeads,
-              kNumKvHeads, kHeadDim, nullptr, lse_new, key_begin, true, k_work,
-              v_work))
+              gufo::hip::KvBlockTable{}, d_out_new, 0, start_pos, batch_size,
+              kMaxContext, kNumHeads, kNumKvHeads, kHeadDim, nullptr, lse_new,
+              key_begin, true, k_work, v_work))
         std::abort();
       HIP_CHECK(hipDeviceSynchronize());
       HIP_CHECK(hipMemcpy(again.data(), d_out_new, q_elements * sizeof(float),
@@ -351,9 +354,9 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse,
         HIP_CHECK(hipMemset(d_lse_new, 0xA5, lse_elements * sizeof(float)));
         if (!gufo::hip::LaunchQwenWmmaAttention(
                 d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16,
-                cache_f16_v, d_out_new, 0, start_pos, batch_size, kMaxContext,
-                kNumHeads, kNumKvHeads, kHeadDim, nullptr, lse_new, key_begin,
-                true, k_work, v_work, first_query))
+                cache_f16_v, gufo::hip::KvBlockTable{}, d_out_new, 0, start_pos,
+                batch_size, kMaxContext, kNumHeads, kNumKvHeads, kHeadDim,
+                nullptr, lse_new, key_begin, true, k_work, v_work, first_query))
           std::abort();
         HIP_CHECK(hipMemcpy(again.data(), d_out_new, q_elements * sizeof(float),
                             hipMemcpyDeviceToHost));

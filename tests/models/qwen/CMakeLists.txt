@@ -90,6 +90,9 @@ if (ENGINE_ENABLE_HIP)
   add_qwen_hip_test(qwen_attention_kv_storage_ops_test
     tests/models/qwen/hip/attention/kv_storage_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;decode;long-context;snapshot;opt-c0133-fp16-kv")
+  add_qwen_hip_test(qwen_attention_kv_block_table_ops_test
+    tests/models/qwen/hip/attention/kv_block_table_ops_test.cpp
+    "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;decode;prefill;kv-block-table")
   add_qwen_hip_test(qwen_attention_fusion_ops_test
     tests/models/qwen/hip/attention/qk_rope_kv_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;fusion;opt-c010-qk-rope-kv")

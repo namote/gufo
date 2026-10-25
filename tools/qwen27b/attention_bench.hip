@@ -43,8 +43,9 @@ void RunNormRoPE() {
       const auto fused = [&] {
         gufo::hip::LaunchBatchedFusedQKNormRoPEKvWrite(
             dq.data(), dk.data(), dk.data(), dw.data(), dw.data(), qb.data(),
-            kb.data(), nullptr, nullptr, nullptr, nullptr, 0, 4096, rows, 0,
-            heads, kv_heads, dim, dim, 10000000.0F);
+            kb.data(), nullptr, nullptr, nullptr, nullptr,
+            gufo::hip::KvBlockTable{}, 0, 4096, rows, 0, heads, kv_heads, dim,
+            dim, 10000000.0F);
       };
       separate();
       fused();
@@ -110,16 +111,17 @@ void RunAttention() {
                   gate ? dg.data() + row * width : nullptr,
                   fp16 ? nullptr : dc.data(), fp16 ? nullptr : dc.data(),
                   fp16 ? dh.data() : nullptr, fp16 ? dh.data() : nullptr,
-                  ref.data() + row * width, layer, start + row, ctx, heads,
-                  kvheads, dim, nullptr, scratch.data(), true);
+                  gufo::hip::KvBlockTable{}, ref.data() + row * width, layer,
+                  start + row, ctx, heads, kvheads, dim, nullptr,
+                  scratch.data(), true);
           };
           auto batched = [&] {
             gufo::hip::LaunchCausalDecodeAttention(
                 dq.data(), gate ? dg.data() : nullptr,
                 fp16 ? nullptr : dc.data(), fp16 ? nullptr : dc.data(),
                 fp16 ? dh.data() : nullptr, fp16 ? dh.data() : nullptr,
-                out.data(), layer, start, rows, ctx, heads, kvheads, dim,
-                nullptr, {scratch.data(), scratch.size()});
+                gufo::hip::KvBlockTable{}, out.data(), layer, start, rows, ctx,
+                heads, kvheads, dim, nullptr, {scratch.data(), scratch.size()});
           };
           scalar();
           batched();

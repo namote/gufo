@@ -123,7 +123,8 @@ endif()
 add_subdirectory(src/cache)
 
 if (ENGINE_ENABLE_HIP)
-  add_library(gufo_hip_host STATIC src/core/hip/host_allocations.cpp)
+  add_library(gufo_hip_host STATIC src/core/hip/host_allocations.cpp
+    src/core/hip/kv_block_pool.cpp)
   target_link_libraries(gufo_hip_host PUBLIC hip::host gufo_platform)
   target_include_directories(gufo_hip_host PUBLIC ${PROJECT_SOURCE_DIR})
   add_library(gufo_cache_hip STATIC
@@ -457,6 +458,11 @@ if (BUILD_TESTING)
   target_link_libraries(json_test PRIVATE gufo_core)
   add_test(NAME json_test COMMAND json_test)
   set_tests_properties(json_test PROPERTIES LABELS "cpu;json")
+
+  add_executable(kv_block_layout_test tests/core/kv_block_layout_test.cpp)
+  target_include_directories(kv_block_layout_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME kv_block_layout_test COMMAND kv_block_layout_test)
+  set_tests_properties(kv_block_layout_test PROPERTIES LABELS "cpu;core;cache")
 
   add_executable(heap_placement_test tests/core/heap_placement_test.cpp)
   target_link_libraries(heap_placement_test PRIVATE gufo_core)

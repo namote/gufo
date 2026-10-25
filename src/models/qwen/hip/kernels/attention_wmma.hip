@@ -77,13 +77,13 @@ __global__ void PackTiledAttentionKvKernel(
     const float* __restrict__ k, const float* __restrict__ v,
     __half* __restrict__ k_cache_f16, __half* __restrict__ v_cache_f16,
     float* __restrict__ k_cache, float* __restrict__ v_cache,
-    std::uint32_t layer_idx, std::uint32_t start_pos, std::size_t batch_size,
-    std::uint32_t max_context);
+    KvBlockTable kv_table, std::uint32_t layer_idx, std::uint32_t start_pos,
+    std::size_t batch_size, std::uint32_t max_context);
 
 __global__ void SyncTiledAttentionKvPrefixKernel(
     const float* __restrict__ k_cache, const float* __restrict__ v_cache,
     __half* __restrict__ k_cache_f16, __half* __restrict__ v_cache_f16,
-    std::uint32_t layer_idx, std::uint32_t prefix_length,
+    KvBlockTable kv_table, std::uint32_t layer_idx, std::uint32_t prefix_length,
     std::uint32_t max_context, std::uint32_t num_kv_heads,
     std::uint32_t head_dim);
 
@@ -141,16 +141,13 @@ constexpr std::uint32_t kWmmaKStride = kHeadDim + 8;
 // and shrinking kKeys in step therefore trades nothing in the tiling but halves
 // the K/V bytes each block pulls per query row -- the dominant cost.
 template<std::uint32_t kQueryRows, std::uint32_t kKeys, bool kHeadMajor = false>
-__launch_bounds__(256, 2) __global__
-    void WmmaCausalAttention(const float* __restrict__ q,
-                             const float* __restrict__ gate,
-                             const __half* __restrict__ k_cache_f16,
-                             const __half* __restrict__ v_cache_f16,
-                             float* __restrict__ out_context,
-                             std::uint32_t start_pos, std::size_t batch_size,
-                             float* __restrict__ lse_out,
-                             std::uint32_t key_begin,
-                             std::uint32_t first_query) {
+__launch_bounds__(256, 2) __global__ void WmmaCausalAttention(
+    const float* __restrict__ q, const float* __restrict__ gate,
+    const __half* __restrict__ k_cache_f16,
+    const __half* __restrict__ v_cache_f16, KvBlockTable kv_table,
+    float* __restrict__ out_context, std::uint32_t start_pos,
+    std::size_t batch_size, float* __restrict__ lse_out,
+    std::uint32_t key_begin, std::uint32_t first_query) {
   constexpr std::uint32_t kRowBlocks = (kQueryRows / 16) * kWmmaHeads;
   constexpr std::uint32_t kKeyBlocks = kKeys / 16;
   constexpr std::uint32_t kSTiles = kRowBlocks * kKeyBlocks;
@@ -256,6 +253,14 @@ __launch_bounds__(256, 2) __global__
                                   (kHeadMajor ? context_end : 1);
   const auto* v_base = v_cache_f16 + head_offset + v_slice;
   const auto* k_base = k_cache_f16 + head_offset;
+  // Canonical rows sit where kv_table places them; the packed head-major copy
+  // is contiguous.
+  const auto row_of = [&](std::uint32_t key_position) -> std::size_t {
+    if constexpr (kHeadMajor)
+      return key_position;
+    else
+      return KvRowInLayer(kv_table, key_position);
+  };
 
   using ValueFragment = std::conditional_t<kHeadMajor, v16h, uint4>;
   constexpr std::uint32_t kValueFragments = kHeadMajor ? 2 : kVRegs;
@@ -276,9 +281,9 @@ __launch_bounds__(256, 2) __global__
       }
     } else {
       const std::uint32_t key_position = key_start + v_key;
-      const auto* src =
-          v_base + (static_cast<std::size_t>(key_position) * kv_stride);
       const bool live = key_position < context_end;
+      // Rows past context_end are never looked up.
+      const auto* src = v_base + (live ? row_of(key_position) * kv_stride : 0);
 #pragma unroll
       for (std::uint32_t j = 0; j < kVRegs; ++j) {
         dst[j] = live ? *reinterpret_cast<const uint4*>(src + (j * 8))
@@ -293,12 +298,10 @@ __launch_bounds__(256, 2) __global__
       const std::uint32_t idx = tid + (n * 256);
       const std::uint32_t key_position = key_start + (idx / (kHeadDim / 8));
       const std::uint32_t d8 = (idx % (kHeadDim / 8)) * 8;
-      dst[n] =
-          (key_position < context_end)
-              ? *reinterpret_cast<const uint4*>(
-                    k_base +
-                    (static_cast<std::size_t>(key_position) * kv_stride) + d8)
-              : make_uint4(0u, 0u, 0u, 0u);
+      dst[n] = (key_position < context_end)
+                   ? *reinterpret_cast<const uint4*>(
+                         k_base + (row_of(key_position) * kv_stride) + d8)
+                   : make_uint4(0u, 0u, 0u, 0u);
     }
   };
 
@@ -593,7 +596,8 @@ __launch_bounds__(256, 2) __global__
 // FFN scratch is idle during attention. Keep K head-major and transpose each
 // 16-key V tile into the layout consumed by WMMA. Persistent KV is unchanged.
 __global__ void PackAttentionHeads(const __half* keys, const __half* values,
-                                   __half* packed_keys, __half* packed_values,
+                                   KvBlockTable kv_table, __half* packed_keys,
+                                   __half* packed_values,
                                    std::uint32_t length) {
   __shared__ __half tile[16][kHeadDim + 8];
   // Adjacent blocks read adjacent heads of the same source token tile.
@@ -604,7 +608,7 @@ __global__ void PackAttentionHeads(const __half* keys, const __half* values,
     uint4 value = make_uint4(0, 0, 0, 0);
     if (base + key < length) {
       const auto src =
-          (static_cast<std::size_t>(base + key) * kKvHeads + head) * kHeadDim +
+          (KvRowInLayer(kv_table, base + key) * kKvHeads + head) * kHeadDim +
           dim;
       const auto dst =
           (static_cast<std::size_t>(head) * length + base + key) * kHeadDim +
@@ -636,12 +640,12 @@ __global__ void PackAttentionHeads(const __half* keys, const __half* values,
 bool LaunchQwenWmmaAttention(
     const float* q, const float* k, const float* v, const float* gate,
     float* k_cache, float* v_cache, void* k_cache_f16, void* v_cache_f16,
-    float* out_context, std::uint32_t layer_idx, std::uint32_t start_pos,
-    std::size_t batch_size, std::uint32_t max_context, std::uint32_t num_heads,
-    std::uint32_t num_kv_heads, std::uint32_t head_dim, hipStream_t stream,
-    float* lse_out, std::uint32_t key_begin, bool skip_kv_write,
-    std::span<float> packed_k_workspace, std::span<float> packed_v_workspace,
-    std::size_t first_query) {
+    KvBlockTable kv_table, float* out_context, std::uint32_t layer_idx,
+    std::uint32_t start_pos, std::size_t batch_size, std::uint32_t max_context,
+    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    hipStream_t stream, float* lse_out, std::uint32_t key_begin,
+    bool skip_kv_write, std::span<float> packed_k_workspace,
+    std::span<float> packed_v_workspace, std::size_t first_query) {
   const detail::AttentionSupportParams support_params{
       .batch_size = batch_size,
       .start_pos = start_pos,
@@ -659,7 +663,7 @@ bool LaunchQwenWmmaAttention(
 
   constexpr std::size_t block_size = 256;
   const std::size_t layer_cache_offset =
-      static_cast<std::size_t>(layer_idx) * max_context * kKvWidth;
+      KvLayerRow(kv_table, layer_idx, max_context) * kKvWidth;
   auto* layer_k = static_cast<__half*>(k_cache_f16) + layer_cache_offset;
   auto* layer_v = static_cast<__half*>(v_cache_f16) + layer_cache_offset;
 
@@ -670,16 +674,16 @@ bool LaunchQwenWmmaAttention(
           static_cast<unsigned int>(start_pos));
       SyncTiledAttentionKvPrefixKernel<<<sync_grid, block_size, 0, stream>>>(
           k_cache, v_cache, static_cast<__half*>(k_cache_f16),
-          static_cast<__half*>(v_cache_f16), layer_idx, start_pos, max_context,
-          num_kv_heads, head_dim);
+          static_cast<__half*>(v_cache_f16), kv_table, layer_idx, start_pos,
+          max_context, num_kv_heads, head_dim);
     }
     const dim3 pack_grid(
         static_cast<unsigned int>((kKvWidth + block_size - 1) / block_size),
         static_cast<unsigned int>(batch_size));
     PackTiledAttentionKvKernel<<<pack_grid, block_size, 0, stream>>>(
         k, v, static_cast<__half*>(k_cache_f16),
-        static_cast<__half*>(v_cache_f16), k_cache, v_cache, layer_idx,
-        start_pos, batch_size, max_context);
+        static_cast<__half*>(v_cache_f16), k_cache, v_cache, kv_table,
+        layer_idx, start_pos, batch_size, max_context);
   }
 
   const dim3 grid(
@@ -709,13 +713,14 @@ bool LaunchQwenWmmaAttention(
           static_cast<std::size_t>(first) * kGqa * kHeadDim;
       PackAttentionHeads<<<dim3(heads, (length + 15u) / 16u), block_size, 0,
                            stream>>>(layer_k + first * kHeadDim,
-                                     layer_v + first * kHeadDim, packed_k,
-                                     packed_v, length);
+                                     layer_v + first * kHeadDim, kv_table,
+                                     packed_k, packed_v, length);
       const dim3 group_grid(grid.x, heads * (kGqa / kWmmaHeads));
       WmmaCausalAttention<kWmmaQueryRows, kWmmaKeys, true>
           <<<group_grid, block_size, 0, stream>>>(
               q + query_offset, gate ? gate + query_offset : nullptr, packed_k,
-              packed_v, out_context + query_offset, start_pos, batch_size,
+              packed_v, KvBlockTable{}, out_context + query_offset, start_pos,
+              batch_size,
               lse_out ? lse_out + first * kGqa * batch_size : nullptr,
               key_begin, static_cast<std::uint32_t>(first_query));
     }
@@ -723,8 +728,9 @@ bool LaunchQwenWmmaAttention(
   }
   WmmaCausalAttention<kWmmaQueryRows, kWmmaKeys>
       <<<grid, block_size, 0, stream>>>(
-          q, gate, layer_k, layer_v, out_context, start_pos, batch_size,
-          lse_out, key_begin, static_cast<std::uint32_t>(first_query));
+          q, gate, layer_k, layer_v, kv_table, out_context, start_pos,
+          batch_size, lse_out, key_begin,
+          static_cast<std::uint32_t>(first_query));
   return true;
 }
 

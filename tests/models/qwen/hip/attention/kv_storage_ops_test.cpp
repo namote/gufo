@@ -98,19 +98,20 @@ void TestCausalDecodeRows(unsigned kv_heads) {
           float* const cache32 = fp16 ? nullptr : kv.data();
           void* const cache16 = fp16 ? kv_half.data() : nullptr;
           for (unsigned row = 0; row < batch; ++row) {
-            gufo::hip::LaunchAttention(q.data() + row * width, nullptr, nullptr,
-                                       gated ? g.data() + row * width : nullptr,
-                                       cache32, cache32, cache16, cache16,
-                                       expected.data() + row * width, layer,
-                                       start + row, context, heads, kv_heads,
-                                       dim, nullptr, scratch.data(), true);
+            gufo::hip::LaunchAttention(
+                q.data() + row * width, nullptr, nullptr,
+                gated ? g.data() + row * width : nullptr, cache32, cache32,
+                cache16, cache16, gufo::hip::KvBlockTable{},
+                expected.data() + row * width, layer, start + row, context,
+                heads, kv_heads, dim, nullptr, scratch.data(), true);
           }
           const auto reference = expected.CopyToHost();
           for (auto capacity : {row_scratch, scratch.size()}) {
             gufo::hip::LaunchCausalDecodeAttention(
                 q.data(), gated ? g.data() : nullptr, cache32, cache32, cache16,
-                cache16, actual.data(), layer, start, batch, context, heads,
-                kv_heads, dim, nullptr, {scratch.data(), capacity});
+                cache16, gufo::hip::KvBlockTable{}, actual.data(), layer, start,
+                batch, context, heads, kv_heads, dim, nullptr,
+                {scratch.data(), capacity});
             const auto result = actual.CopyToHost();
             Expect(std::memcmp(reference.data(), result.data(),
                                batch * width * sizeof(float)) == 0,
@@ -484,17 +485,18 @@ void TestOnlineAndGraphDecodeFp16Equivalence() {
     const std::size_t attention_offset =
         static_cast<std::size_t>(position) * attention_width;
     const std::size_t kv_offset = static_cast<std::size_t>(position) * kv_width;
-    gufo::hip::LaunchAttention(
-        d_query + attention_offset, d_key + kv_offset, d_value + kv_offset,
-        d_gate + attention_offset, d_fp32_cache, d_fp32_cache + cache_elements,
-        nullptr, nullptr, d_fp32_out + attention_offset, 0, position,
-        max_context, num_heads, num_kv_heads, head_dim);
+    gufo::hip::LaunchAttention(d_query + attention_offset, d_key + kv_offset,
+                               d_value + kv_offset, d_gate + attention_offset,
+                               d_fp32_cache, d_fp32_cache + cache_elements,
+                               nullptr, nullptr, gufo::hip::KvBlockTable{},
+                               d_fp32_out + attention_offset, 0, position,
+                               max_context, num_heads, num_kv_heads, head_dim);
     gufo::hip::LaunchAttention(
         d_query + attention_offset, d_key + kv_offset, d_value + kv_offset,
         d_gate + attention_offset, nullptr, nullptr, d_fp16_cache,
         static_cast<std::uint16_t*>(d_fp16_cache) + cache_elements,
-        d_fp16_out + attention_offset, 0, position, max_context, num_heads,
-        num_kv_heads, head_dim);
+        gufo::hip::KvBlockTable{}, d_fp16_out + attention_offset, 0, position,
+        max_context, num_heads, num_kv_heads, head_dim);
   }
 
   const std::uint32_t graph_position = positions;
@@ -502,19 +504,19 @@ void TestOnlineAndGraphDecodeFp16Equivalence() {
                       hipMemcpyHostToDevice));
   const std::size_t graph_attention_offset = positions * attention_width;
   const std::size_t graph_kv_offset = positions * kv_width;
-  gufo::hip::LaunchAttention(d_query + graph_attention_offset,
-                             d_key + graph_kv_offset, d_value + graph_kv_offset,
-                             d_gate + graph_attention_offset, d_fp32_cache,
-                             d_fp32_cache + cache_elements, nullptr, nullptr,
-                             d_fp32_out + graph_attention_offset, 0, d_position,
-                             max_context, num_heads, num_kv_heads, head_dim);
+  gufo::hip::LaunchAttention(
+      d_query + graph_attention_offset, d_key + graph_kv_offset,
+      d_value + graph_kv_offset, d_gate + graph_attention_offset, d_fp32_cache,
+      d_fp32_cache + cache_elements, nullptr, nullptr,
+      gufo::hip::KvBlockTable{}, d_fp32_out + graph_attention_offset, 0,
+      d_position, max_context, num_heads, num_kv_heads, head_dim);
   gufo::hip::LaunchAttention(
       d_query + graph_attention_offset, d_key + graph_kv_offset,
       d_value + graph_kv_offset, d_gate + graph_attention_offset, nullptr,
       nullptr, d_fp16_cache,
       static_cast<std::uint16_t*>(d_fp16_cache) + cache_elements,
-      d_fp16_out + graph_attention_offset, 0, d_position, max_context,
-      num_heads, num_kv_heads, head_dim);
+      gufo::hip::KvBlockTable{}, d_fp16_out + graph_attention_offset, 0,
+      d_position, max_context, num_heads, num_kv_heads, head_dim);
   HIP_CHECK(hipDeviceSynchronize());
 
   std::vector<float> fp32((positions + 1U) * attention_width);
@@ -603,15 +605,16 @@ void TestSplitKDecodeFp16Equivalence() {
   gufo::hip::LaunchBatchedFusedQKNormRoPEKvWrite(
       d_query, d_key, d_value, d_q_weight, d_k_weight, d_query, d_key,
       d_fp32_cache, d_fp32_cache + cache_elements, d_fp16_cache,
-      static_cast<std::uint16_t*>(d_fp16_cache) + cache_elements, 0, 0,
-      positions, max_context, num_heads, num_kv_heads, head_dim, rotary_dim,
-      1000000.0F);
+      static_cast<std::uint16_t*>(d_fp16_cache) + cache_elements,
+      gufo::hip::KvBlockTable{}, 0, 0, positions, max_context, num_heads,
+      num_kv_heads, head_dim, rotary_dim, 1000000.0F);
   const std::size_t final_attention_offset = (positions - 1U) * attention_width;
   const std::size_t final_kv_offset = (positions - 1U) * kv_width;
   gufo::hip::LaunchAttention(
       d_query + final_attention_offset, d_key + final_kv_offset,
       d_value + final_kv_offset, d_gate + final_attention_offset, d_fp32_cache,
-      d_fp32_cache + cache_elements, nullptr, nullptr, d_fp32_out, 0,
+      d_fp32_cache + cache_elements, nullptr, nullptr,
+      gufo::hip::KvBlockTable{}, d_fp32_out, 0,
       static_cast<std::uint32_t>(positions - 1U), max_context, num_heads,
       num_kv_heads, head_dim, nullptr, d_fp32_scratch,
       /*skip_kv_write=*/true);
@@ -619,7 +622,8 @@ void TestSplitKDecodeFp16Equivalence() {
       d_query + final_attention_offset, d_key + final_kv_offset,
       d_value + final_kv_offset, d_gate + final_attention_offset, nullptr,
       nullptr, d_fp16_cache,
-      static_cast<std::uint16_t*>(d_fp16_cache) + cache_elements, d_fp16_out, 0,
+      static_cast<std::uint16_t*>(d_fp16_cache) + cache_elements,
+      gufo::hip::KvBlockTable{}, d_fp16_out, 0,
       static_cast<std::uint32_t>(positions - 1U), max_context, num_heads,
       num_kv_heads, head_dim, nullptr, d_fp16_scratch,
       /*skip_kv_write=*/true);

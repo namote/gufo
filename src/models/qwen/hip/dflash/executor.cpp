@@ -89,7 +89,7 @@ void NormalizeAndRotateQK(float* query, float* key, const float* query_weight,
   if (config.head_dim <= 256) {
     LaunchBatchedFusedQKNormRoPEKvWrite(
         query, key, key, query_weight, key_weight, query, key, nullptr, nullptr,
-        nullptr, nullptr, 0, position, rows, 0, query_heads,
+        nullptr, nullptr, KvBlockTable{}, 0, position, rows, 0, query_heads,
         config.num_key_value_heads, config.head_dim, config.rotary_dim,
         config.rope_theta, 1e-6F, stream);
     return;

@@ -21,10 +21,10 @@ namespace {
 __launch_bounds__(192) __global__
     void QwenVerifySplitKAttentionHalfPartialsWave64Kernel(
         const float* __restrict__ q, const __half* __restrict__ k_cache,
-        const __half* __restrict__ v_cache, float* __restrict__ scratch,
-        std::uint32_t layer_idx, std::uint32_t pos, std::uint32_t max_context,
-        std::uint32_t num_heads, std::uint32_t num_kv_heads,
-        std::uint32_t split_count) {
+        const __half* __restrict__ v_cache, KvBlockTable kv_table,
+        float* __restrict__ scratch, std::uint32_t layer_idx, std::uint32_t pos,
+        std::uint32_t max_context, std::uint32_t num_heads,
+        std::uint32_t num_kv_heads, std::uint32_t split_count) {
   constexpr std::uint32_t lanes = 16;
   // Mixed-precision FMAs take the fp16 cache operands directly instead of
   // converting first (see DotHalf4); the products are unchanged.
@@ -55,8 +55,7 @@ __launch_bounds__(192) __global__
       static_cast<std::size_t>(num_kv_heads) * head_dim;
   // The block's two KV heads are adjacent inside every token row.
   const std::size_t cache_block_offset =
-      (static_cast<std::size_t>(layer_idx) * max_context * kv_width) +
-      (static_cast<std::size_t>(blockIdx.x) * kv_heads_per_block * head_dim);
+      static_cast<std::size_t>(blockIdx.x) * kv_heads_per_block * head_dim;
   const auto [partition_begin, partition_end] =
       SplitKDecodePartition(pos, split, split_count);
   const float scale = rsqrtf(static_cast<float>(head_dim));
@@ -77,16 +76,30 @@ __launch_bounds__(192) __global__
        begin += tile) {
     const unsigned count =
         static_cast<unsigned>(min(std::size_t{tile}, partition_end - begin));
-    // Tiles are consecutive tokens: one wave-uniform base per tile keeps
-    // each thread's offset at 32 bits.
-    const std::size_t tile_offset = cache_block_offset + begin * kv_width;
-    const __half* key_tile = k_cache + tile_offset;
-    const __half* value_tile = v_cache + tile_offset;
+    // A tile's tokens are consecutive rows up to a KV block boundary and
+    // again after it: one wave-uniform base per side keeps each thread's
+    // offset at 32 bits.
+    const unsigned split_token = static_cast<unsigned>(
+        min(std::size_t{count}, KvBlockEnd(begin) - begin));
+    const std::size_t first_offset =
+        cache_block_offset +
+        KvTokenRow(kv_table, layer_idx, max_context, begin) * kv_width;
+    const std::size_t second_offset =
+        split_token < count
+            ? cache_block_offset + KvTokenRow(kv_table, layer_idx, max_context,
+                                              begin + split_token) *
+                                       kv_width
+            : first_offset;
     for (unsigned vector = threadIdx.x; vector < count * vectors_per_token;
          vector += heads_per_block * lanes) {
       const unsigned token = vector / vectors_per_token;
       const unsigned element = (vector % vectors_per_token) * 8;
-      const std::uint32_t offset = token * token_stride + element;
+      const bool second = token >= split_token;
+      const std::size_t tile_offset = second ? second_offset : first_offset;
+      const __half* key_tile = k_cache + tile_offset;
+      const __half* value_tile = v_cache + tile_offset;
+      const std::uint32_t offset =
+          (second ? token - split_token : token) * token_stride + element;
       __half* key_slot = keys[element / head_dim][token] + (element % head_dim);
       __half* value_slot =
           values[element / head_dim][token] + (element % head_dim);
@@ -109,15 +122,16 @@ __launch_bounds__(192) __global__
 
 void LaunchVerifySplitKAttentionHalfPartialsWave64(
     const float* q, const __half* k_cache, const __half* v_cache,
-    float* scratch, std::uint32_t layer_idx, std::uint32_t start_pos,
-    unsigned rows, std::uint32_t max_context, std::uint32_t num_heads,
-    std::uint32_t num_kv_heads, std::uint32_t splits, hipStream_t stream) {
+    KvBlockTable kv_table, float* scratch, std::uint32_t layer_idx,
+    std::uint32_t start_pos, unsigned rows, std::uint32_t max_context,
+    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t splits,
+    hipStream_t stream) {
   assert(num_kv_heads % 2 == 0 && "wave64 verification pairs KV heads");
   assert(num_heads == 6 * num_kv_heads && "twelve query heads per block");
   assert(rows > 1 && "single rows keep the 32-lane kernel");
   QwenVerifySplitKAttentionHalfPartialsWave64Kernel<<<
       dim3(num_kv_heads / 2, rows, splits), 192, 0, stream>>>(
-      q, k_cache, v_cache, scratch, layer_idx, start_pos, max_context,
+      q, k_cache, v_cache, kv_table, scratch, layer_idx, start_pos, max_context,
       num_heads, num_kv_heads, splits);
 }
 

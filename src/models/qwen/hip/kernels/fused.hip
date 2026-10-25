@@ -25,9 +25,9 @@ __launch_bounds__(256, 4) __global__ void FusedQKNormRoPEKvWriteKernel(
     float* __restrict__ v_cache, __half* __restrict__ k_cache_f16,
     __half* __restrict__ v_cache_f16, std::uint32_t layer_idx,
     const std::uint32_t* __restrict__ d_pos, std::uint32_t max_context,
-    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
-    std::uint32_t rotary_dim, float rope_theta, float eps,
-    const models::qwen::vision::DeviceRope* rope) {
+    KvBlockTable kv_table, std::uint32_t num_heads, std::uint32_t num_kv_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float rope_theta,
+    float eps, const models::qwen::vision::DeviceRope* rope) {
   const std::uint32_t block = blockIdx.x;
   const std::size_t tid = threadIdx.x;
   const std::uint32_t half_rot = rotary_dim / 2;
@@ -119,7 +119,7 @@ __launch_bounds__(256, 4) __global__ void FusedQKNormRoPEKvWriteKernel(
   const std::size_t kv_width =
       static_cast<std::size_t>(num_kv_heads) * head_dim;
   const std::size_t f16_offset =
-      ((static_cast<std::size_t>(layer_idx) * max_context + pos) * kv_width) +
+      (KvTokenRow(kv_table, layer_idx, max_context, pos) * kv_width) +
       head_base;
 
   for (std::size_t p = tid; p < half_rot; p += blockDim.x) {
@@ -172,7 +172,7 @@ __launch_bounds__(256, 4) __global__ void FusedQKNormRoPEKvWriteKernel(
 void LaunchFusedQKNormRoPEKvWrite(
     const float* q, const float* k, const float* v, const float* q_weight,
     const float* k_weight, float* q_out, float* k_out, float* k_cache,
-    float* v_cache, void* k_cache_f16, void* v_cache_f16,
+    float* v_cache, void* k_cache_f16, void* v_cache_f16, KvBlockTable kv_table,
     std::uint32_t layer_idx, const std::uint32_t* d_pos,
     std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim,
@@ -181,8 +181,8 @@ void LaunchFusedQKNormRoPEKvWrite(
   FusedQKNormRoPEKvWriteKernel<<<num_heads + num_kv_heads, 256, 0, stream>>>(
       q, k, v, q_weight, k_weight, q_out, k_out, k_cache, v_cache,
       static_cast<__half*>(k_cache_f16), static_cast<__half*>(v_cache_f16),
-      layer_idx, d_pos, max_context, num_heads, num_kv_heads, head_dim,
-      rotary_dim, rope_theta, eps, rope);
+      layer_idx, d_pos, max_context, kv_table, num_heads, num_kv_heads,
+      head_dim, rotary_dim, rope_theta, eps, rope);
 }
 
 }  // namespace gufo::hip

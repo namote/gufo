@@ -93,19 +93,21 @@ void TestBatchedAttentionEquivalence() {
         d_q + t * num_heads * head_dim, d_k + t * num_kv_heads * head_dim,
         d_v + t * num_kv_heads * head_dim, d_gate + t * num_heads * head_dim,
         d_cache_seq, d_cache_seq + total_k, nullptr, nullptr,
-        d_out_seq + t * num_heads * head_dim, 0, static_cast<std::uint32_t>(t),
-        max_context, num_heads, num_kv_heads, head_dim);
+        gufo::hip::KvBlockTable{}, d_out_seq + t * num_heads * head_dim, 0,
+        static_cast<std::uint32_t>(t), max_context, num_heads, num_kv_heads,
+        head_dim);
   }
 
   // Batched
-  gufo::hip::LaunchBatchedAttention(d_q, d_k, d_v, d_gate, d_cache_batch,
-                                    d_cache_batch + total_k, nullptr, nullptr,
-                                    d_out_batch, 0, 0, batch, max_context,
-                                    num_heads, num_kv_heads, head_dim);
+  gufo::hip::LaunchBatchedAttention(
+      d_q, d_k, d_v, d_gate, d_cache_batch, d_cache_batch + total_k, nullptr,
+      nullptr, gufo::hip::KvBlockTable{}, d_out_batch, 0, 0, batch, max_context,
+      num_heads, num_kv_heads, head_dim);
   gufo::hip::LaunchBatchedAttentionGemm(
       hipblas_handle, d_q, d_k, d_v, d_gate, d_cache_gemm,
-      d_cache_gemm + total_k, nullptr, nullptr, d_scores, d_out_gemm, 0, 0,
-      batch, max_context, num_heads, num_kv_heads, head_dim);
+      d_cache_gemm + total_k, nullptr, nullptr, gufo::hip::KvBlockTable{},
+      d_scores, d_out_gemm, 0, 0, batch, max_context, num_heads, num_kv_heads,
+      head_dim);
 
   HIP_CHECK(hipDeviceSynchronize());
 
@@ -214,19 +216,20 @@ void TestAttentionBackendEquivalence() {
                       2 * cache_elements * sizeof(hip_bfloat16)));
 
   for (std::size_t token = 0; token < batch; ++token) {
-    gufo::hip::LaunchAttention(d_q + token * attention_width,
-                               d_k + token * kv_width, d_v + token * kv_width,
-                               d_gate + token * attention_width, d_cache_seq,
-                               d_cache_seq + cache_elements, nullptr, nullptr,
-                               d_out_seq + token * attention_width, 0,
-                               static_cast<std::uint32_t>(token), max_context,
-                               num_heads, num_kv_heads, head_dim);
+    gufo::hip::LaunchAttention(
+        d_q + token * attention_width, d_k + token * kv_width,
+        d_v + token * kv_width, d_gate + token * attention_width, d_cache_seq,
+        d_cache_seq + cache_elements, nullptr, nullptr,
+        gufo::hip::KvBlockTable{}, d_out_seq + token * attention_width, 0,
+        static_cast<std::uint32_t>(token), max_context, num_heads, num_kv_heads,
+        head_dim);
   }
   const bool tile_launched = gufo::hip::LaunchBatchedAttentionTile(
       d_q, d_k, d_v, d_gate, d_cache_tile, d_cache_tile + cache_elements,
       d_cache_tile_f16,
       static_cast<std::uint16_t*>(d_cache_tile_f16) + cache_elements,
-      d_out_tile, 0, 0, batch, max_context, num_heads, num_kv_heads, head_dim);
+      gufo::hip::KvBlockTable{}, d_out_tile, 0, 0, batch, max_context,
+      num_heads, num_kv_heads, head_dim);
   if (!tile_launched) {
     std::cerr << "Tiled attention rejected the Qwen shape\n";
     std::abort();
@@ -235,7 +238,8 @@ void TestAttentionBackendEquivalence() {
       d_q, d_k, d_v, d_gate, d_cache_wmma, d_cache_wmma + cache_elements,
       d_cache_wmma_f16,
       static_cast<std::uint16_t*>(d_cache_wmma_f16) + cache_elements,
-      d_out_wmma, 0, 0, batch, max_context, num_heads, num_kv_heads, head_dim);
+      gufo::hip::KvBlockTable{}, d_out_wmma, 0, 0, batch, max_context,
+      num_heads, num_kv_heads, head_dim);
   if (!launched) {
     std::cerr << "Native WMMA attention rejected the Qwen shape\n";
     std::abort();
@@ -301,14 +305,14 @@ void TestAttentionBackendEquivalence() {
       d_q, d_k, d_v, d_gate, d_cache_tile, d_cache_tile + cache_elements,
       d_cache_tile_f16,
       static_cast<std::uint16_t*>(d_cache_tile_f16) + cache_elements,
-      d_out_tile, 0, 0, chunk_size, max_context, num_heads, num_kv_heads,
-      head_dim);
+      gufo::hip::KvBlockTable{}, d_out_tile, 0, 0, chunk_size, max_context,
+      num_heads, num_kv_heads, head_dim);
   const bool second_chunk_launched = gufo::hip::LaunchBatchedAttentionTile(
       d_q + chunk_size * attention_width, d_k + chunk_size * kv_width,
       d_v + chunk_size * kv_width, d_gate + chunk_size * attention_width,
       d_cache_tile, d_cache_tile + cache_elements, d_cache_tile_f16,
       static_cast<std::uint16_t*>(d_cache_tile_f16) + cache_elements,
-      d_out_tile + chunk_size * attention_width, 0,
+      gufo::hip::KvBlockTable{}, d_out_tile + chunk_size * attention_width, 0,
       static_cast<std::uint32_t>(chunk_size), chunk_size, max_context,
       num_heads, num_kv_heads, head_dim);
   if (!first_chunk_launched || !second_chunk_launched) {
