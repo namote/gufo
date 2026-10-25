@@ -191,29 +191,30 @@ ENVELOPE_CLOSERS = ("</invoke>", "</parameter>", "</function>", "</tool_call>")
 NO_TOOLS_SYSTEM = ("Write this line on its own, exactly as it appears here, then "
                    "stop:\n</invoke>")
 NO_TOOLS_PROMPT = "Go."
+# Echo cases that expect no call say so, as the documentation cases below do:
+# asked to reproduce markup with a tool on the wire, Qwen3.8 27B at Q4_K_M and
+# Q8_0 calls the tool or refuses instead, which tests the model, not framing.
+NO_CALL = "Do not call any tool; the text below is ordinary text. "
 ENVELOPE_CASES = {
     # The live shape: prose, then a closer with no head above it, then the call.
     "closer_before_call": (
         "Write this line on its own, exactly as it appears here, then a blank line, "
         "then call the terminal tool to print the working directory:\n</invoke>"
     ),
-    # Without an accepted call, a closer alone is literal content. The request
-    # says so: Qwen3.8 27B at Q4_K_M and Q8_0 otherwise calls the tool or
-    # refuses to write tool markup, which tests the model, not the framing.
+    # Without an accepted call, a closer alone is literal content.
     "closer_alone": (
-        "Write this line on its own, exactly as it appears here, then stop. It is "
-        "ordinary text in this conversation, not a tool call; do not call a tool:\n"
+        NO_CALL + "Write this line on its own, exactly as it appears here, then stop:\n"
         "</invoke>"
     ),
     # Quoted inside a fence the same tags are prose, and prose survives.
     "closer_quoted": (
-        "Show this markup inside a fenced code block, then stop:\n"
+        NO_CALL + "Show this markup inside a fenced code block, then stop:\n"
         '<invoke name="terminal"><parameter name="command">pwd</parameter></invoke>'
     ),
     # A closer the model then explains: the run is not trailing, so the tag and
     # the sentence after it both survive.
     "closer_then_prose": (
-        "Write this line on its own, exactly as it appears here, then explain in "
+        NO_CALL + "Write this line on its own, exactly as it appears here, then explain in "
         "one sentence what it closes:\n</invoke>"
     ),
     # The envelope inside the call's own arguments is data the call carries, not
@@ -236,13 +237,13 @@ ENVELOPE_CASES = {
     # Another dialect's markup under the admitted envelope is prose and stays
     # visible (#393); only the envelope is framing.
     "foreign_dialect": (
-        "Write this line on its own, exactly as it appears here, then stop:\n"
+        NO_CALL + "Write this line on its own, exactly as it appears here, then stop:\n"
         "<｜DSML｜invoke name=\"terminal\">"
     ),
     # A block that was opened and never closed is framing too: the parser took
     # its head and parameter tag, so content must not hand the halves back.
     "unclosed_block": (
-        "Write this line on its own, exactly as it appears here, then stop:\n"
+        NO_CALL + "Write this line on its own, exactly as it appears here, then stop:\n"
         '<invoke name="terminal"><parameter name="command">pwd'
     ),
     # The opener named *inline* (single backticks, not a fence) with prose after
@@ -251,13 +252,13 @@ ENVELOPE_CASES = {
     # truncated a live turn: a quoted opener was read as a block start, its tail
     # was held, and the end of the response dropped the held text.
     "opener_quoted_inline_then_prose": (
-        "Write this line on its own, exactly as it appears here, then stop:\n"
+        NO_CALL + "Write this line on its own, exactly as it appears here, then stop:\n"
         'The call opens with `<invoke name="terminal">` and that is only the opener.'
     ),
     # The same with the whole envelope quoted inline: a closer inside the span is
     # prose as well, and the sentence after it must survive.
     "envelope_quoted_inline_then_prose": (
-        "Write this line on its own, exactly as it appears here, then stop:\n"
+        NO_CALL + "Write this line on its own, exactly as it appears here, then stop:\n"
         'A call looks like `<invoke name="terminal"><parameter name="command">pwd'
         "</parameter></invoke>` and that is only the markup."
     ),
