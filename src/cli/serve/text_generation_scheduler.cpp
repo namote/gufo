@@ -1968,15 +1968,29 @@ struct TextGenerationScheduler::Impl {
         if (capturing.empty() && waiting.empty()) {
           // Only the idle wait has a timer. Arrival interrupts it immediately;
           // no clock checks or device polling are added to active work units.
+          // The first wait of an idle period ends after the write-back delay:
+          // idle sessions' live frontiers then go to the disk cache once.
+          bool written_back = false;
           while (!wake()) {
             loop_working.store(false, std::memory_order_relaxed);
             const bool woken = queue_condition.wait_for(
-                lock, scheduler_policy.device_probe_interval, wake);
+                lock,
+                written_back ? scheduler_policy.device_probe_interval
+                             : std::min(scheduler_policy.device_probe_interval,
+                                        scheduler_policy.idle_write_back_delay),
+                wake);
             progress.fetch_add(1, std::memory_order_relaxed);
             loop_working.store(true, std::memory_order_relaxed);
             if (woken)
               break;
             lock.unlock();
+            if (!written_back) {
+              // The device probe keeps its own interval after this.
+              written_back = true;
+              (void)runner_pool->WriteBackIdle();
+              lock.lock();
+              continue;
+            }
             try {
               if (runner_pool->runner().PollDevice() ==
                   TextModelRunner::DeviceProbeStatus::kLost)

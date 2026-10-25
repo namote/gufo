@@ -671,6 +671,9 @@ public:
                                     std::size_t max_new_tokens);
   /// Blocks an admission of `rows` holds; zero without paged rows.
   [[nodiscard]] std::size_t AdmissionRowBlocks(std::size_t rows) const;
+  /// Writes idle sessions' live frontiers to the disk cache (component cache
+  /// with a disk cache only). Call only while no request runs.
+  std::size_t WriteBackIdle() noexcept;
   [[nodiscard]] TextExecutionPlan SelectDecodePlan(
       std::size_t ready_requests) const;
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
