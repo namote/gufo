@@ -626,8 +626,27 @@ std::size_t TextModelRunner::SystemPrefixTokens(
   }
   if (leading == 0 || leading == request.messages.size())
     return 0;
-  auto probe = request;
-  probe.messages.resize(leading);
+  // Only the leading messages participate in this probe. Copying the full
+  // conversation first would copy and immediately discard its text/tool
+  // history on every cache-enabled chat turn. Keep the request metadata:
+  // virtual PreparePrompt implementations may use more than the template.
+  ChatRequest probe;
+  probe.messages.assign(request.messages.begin(),
+                        request.messages.begin() + leading);
+  probe.tools = request.tools;
+  probe.client_id = request.client_id;
+  probe.tool_choice = request.tool_choice;
+  probe.forced_tool_name = request.forced_tool_name;
+  probe.tool_namespaces = request.tool_namespaces;
+  probe.constrained_tools = request.constrained_tools;
+  probe.parallel_tool_calls = request.parallel_tool_calls;
+  probe.reasoning = request.reasoning;
+  probe.add_vision_id = request.add_vision_id;
+  probe.cache_prompt = request.cache_prompt;
+  probe.return_progress = request.return_progress;
+  probe.stop_sequences = request.stop_sequences;
+  probe.response_format = request.response_format;
+  probe.response_format_description = request.response_format_description;
   probe.messages.emplace_back(tokenization::ChatRole::kUser, "");
   const auto prepared = PreparePrompt(probe);
   if (!prepared)
