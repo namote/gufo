@@ -2499,7 +2499,44 @@ void FirstFollowerRestoresATailCheckpoint() {
       follower.Invalidate();
     }
 }
+void FirstFollowerRestoresTheSystemPromptCheckpoint() {
+  // The leader keeps a checkpoint where its leading system messages end, so
+  // the first follower under the same system prompt restores exactly that
+  // point, also when checkpoints copy their rows. Without it the follower
+  // starts cold (no tail checkpoints here).
+  std::vector<TextRunnerToken> leader_prompt(2100);
+  std::iota(leader_prompt.begin(), leader_prompt.end(), 10);
+  auto follower_prompt = leader_prompt;
+  std::iota(follower_prompt.begin() + 1500, follower_prompt.end(), 20000);
+  TextRunnerToken expected{};
+  {
+    auto runner = std::make_shared<Runner>();
+    TextRunnerPool pool(runner, 1);
+    auto cold = pool.Acquire(follower_prompt, {}, {}, {}, false);
+    Prefill(cold);
+    expected = Generate(cold);
+    cold.Invalidate();
+  }
+  for (const std::size_t system : {0, 1500})
+    for (const bool retain : {false, true}) {
+      auto runner = std::make_shared<Runner>();
+      runner->retain_rows = retain;
+      TextRunnerPool pool(runner, 1, std::nullopt, {.tail_checkpoints = 0});
+      auto leader =
+          pool.Acquire(leader_prompt, {}, {}, {}, true, 0, true, system);
+      Prefill(leader);
+      (void)Generate(leader);
+      (void)leader.Commit();
+      auto follower =
+          pool.Acquire(follower_prompt, {}, {}, {}, true, 0, true, system);
+      assert(follower.cached_prompt_tokens() == system);
+      Prefill(follower);
+      assert(Generate(follower) == expected);
+      follower.Invalidate();
+    }
+}
 int main() {
+  FirstFollowerRestoresTheSystemPromptCheckpoint();
   FirstFollowerRestoresATailCheckpoint();
   NearbyStableBoundaryDoesNotSplitAContinuation();
   RetainedChunksTakeNoRamAndRestore();

@@ -613,6 +613,29 @@ void TextModelRunner::RestorePersistentSnapshot(
   throw std::logic_error("text runner does not support persistent snapshots");
 }
 
+std::size_t TextModelRunner::SystemPrefixTokens(
+    const ChatRequest& request, std::span<const TextRunnerToken> tokens) const {
+  std::size_t leading = 0;
+  while (
+      leading < request.messages.size() &&
+      (request.messages[leading].role == tokenization::ChatRole::kSystem ||
+       request.messages[leading].role == tokenization::ChatRole::kDeveloper)) {
+    if (!request.messages[leading].images.empty())
+      return 0;
+    ++leading;
+  }
+  if (leading == 0 || leading == request.messages.size())
+    return 0;
+  auto probe = request;
+  probe.messages.resize(leading);
+  probe.messages.emplace_back(tokenization::ChatRole::kUser, "");
+  const auto prepared = PreparePrompt(probe);
+  if (!prepared)
+    return 0;
+  return static_cast<std::size_t>(
+      std::ranges::mismatch(tokens, prepared->tokens).in1 - tokens.begin());
+}
+
 std::unique_ptr<ComponentCacheResources>
 TextModelRunner::CreateComponentCacheResources(cache::ResourceLedger&,
                                                std::size_t) const {
@@ -2155,7 +2178,8 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
     const sampling::SamplingConfig& sampling_config,
     const CancellationCheck& is_cancelled,
     std::shared_ptr<const TextPromptContext> context, bool reuse_prompt,
-    std::size_t cache_prefix_tokens, bool stop_at_eos) {
+    std::size_t cache_prefix_tokens, bool stop_at_eos,
+    std::size_t system_prefix_tokens) {
   sampling_config.Validate();
   if (prompt.empty()) {
     throw std::invalid_argument("text runner prompt must not be empty");
@@ -2185,6 +2209,11 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
         impl_->tail_checkpoints));
     request.impl_->cancelled = is_cancelled;
     if (reuse_prompt) {
+      // The next conversation under the same system prompt restores this
+      // one's checkpoint where they diverge, from RAM or disk; shorter system
+      // prompts prefill faster than they restore.
+      if (system_prefix_tokens >= impl_->shared_prefix_min_tokens)
+        (void)request.ShareCheckpoint(system_prefix_tokens);
       const auto common = impl_->component_cache->CachedPrefixTokens(
           request.prompt(), request.impl_->context.get(), true);
       if (common >=
@@ -2322,6 +2351,10 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
       std::move(prompt), std::move(boundaries), sampling_config,
       std::move(context), cache_prefix_tokens, impl_->cache->capacity() > 1));
   request.impl_->cancelled = is_cancelled;
+  // The next conversation under the same system prompt restores this one's
+  // checkpoint where they diverge, from RAM or disk.
+  if (reuse_prompt && system_prefix_tokens >= impl_->shared_prefix_min_tokens)
+    (void)request.ShareCheckpoint(system_prefix_tokens);
   // Prompts that diverge from a retained one after a long common prefix,
   // such as new conversations under one system prompt, publish a checkpoint
   // at the divergence point. Later prompts sharing it restore it exactly

@@ -358,6 +358,14 @@ public:
   }
   [[nodiscard]] virtual std::optional<std::vector<TextRunnerToken>>
   RenderAndTokenize(const ChatRequest& request) const = 0;
+  /// Where conversations under the same leading system messages diverge in
+  /// `tokens` (the prepared prompt of `request`): the first token that a
+  /// probe with those system messages and an empty user turn renders
+  /// differently. Zero without leading system messages, with nothing after
+  /// them, or with images in them.
+  [[nodiscard]] std::size_t SystemPrefixTokens(
+      const ChatRequest& request,
+      std::span<const TextRunnerToken> tokens) const;
   [[nodiscard]] virtual std::optional<TextPreparedPrompt> PreparePrompt(
       const ChatRequest& request) const {
     for (const auto& message : request.messages) {
@@ -697,7 +705,7 @@ public:
       const CancellationCheck& is_cancelled = {},
       std::shared_ptr<const TextPromptContext> context = {},
       bool reuse_prompt = true, std::size_t cache_prefix_tokens = 0,
-      bool stop_at_eos = true);
+      bool stop_at_eos = true, std::size_t system_prefix_tokens = 0);
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
   /// Longest RAM-retained prefix of prompt that Acquire could reuse, without

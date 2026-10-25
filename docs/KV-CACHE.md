@@ -255,6 +255,13 @@ its own stable checkpoint and takes no extra copy. The same position from the sa
 once; records whose images differ from the prompt are not used to find it.
 Without disk, this needs no configuration.
 
+The system prompt is known without a second conversation. A request whose
+leading system and developer messages reach 128 tokens also keeps a checkpoint
+where they end: the first token at which its prompt and the same messages with
+an empty user turn differ. It is retained like a learned divergence point, in
+RAM and on disk, so the first conversation under the same system prompt
+restores it instead of an earlier tail checkpoint or a cold prefill.
+
 Execution and retention have separate limits. `--sessions N` allocates N
 mutable execution states and controls active request concurrency. A separate
 pool holds **128 immutable checkpoint records**, regardless of session count.
