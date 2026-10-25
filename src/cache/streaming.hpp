@@ -67,6 +67,12 @@ public:
   PersistenceSource(bool private_file, DiskFileId, std::uint64_t bytes,
                     std::size_t alignment, std::shared_ptr<BorrowedRows>,
                     std::size_t first_byte, CopyRows);
+  // Rows retained in device storage (Payload::Device). The owner keeps them
+  // unchanged through the job; copy reads each piece into staging. No RAM
+  // backing is charged or pinned.
+  PersistenceSource(bool private_file, DiskFileId, std::uint64_t bytes,
+                    std::size_t alignment, std::shared_ptr<const void> owner,
+                    Copy);
   PersistenceSource(PersistenceSource&&) noexcept = default;
   PersistenceSource& operator=(PersistenceSource&&) = delete;
   PersistenceSource(const PersistenceSource&) = delete;

@@ -70,6 +70,16 @@ public:
   [[nodiscard]] std::span<const std::byte> BorrowRowsView(const Slot&,
                                                           ComponentId, Rows,
                                                           Rows) const override;
+  // Target chunks retained as immutable copies outside any ledger, standing
+  // in for device storage a backend keeps for checkpoints.
+  void SetRetainRows(bool);
+  [[nodiscard]] RetainedRows RetainRows(const Slot&, ComponentId, Rows,
+                                        Rows) const override;
+  [[nodiscard]] bool RetainsRows(ComponentId) const override;
+  [[nodiscard]] bool OnlyRetained(const void*) const override;
+  // Retained chunks still alive.
+  [[nodiscard]] std::size_t RetainedChunks() const;
+  [[nodiscard]] std::span<const Token> TargetRows(const Slot&) const;
   [[nodiscard]] Completion CopyRowsIn(Slot&, ComponentId, Rows, Rows,
                                       std::span<const std::byte>,
                                       Stream&) override;
@@ -109,6 +119,8 @@ private:
   std::array<ComponentDescriptor, 3> components_;
   bool fail_allocation_{false};
   bool predict_checkpoints_{true};
+  bool retain_rows_{false};
+  mutable std::vector<std::weak_ptr<const void>> retained_;
   bool fail_transfer_{false};
   std::atomic<std::size_t> invalidations_{};
   Rows prefill_pass_rows_{2048};

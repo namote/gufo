@@ -49,6 +49,10 @@ public:
   void Release(std::span<const std::uint32_t> blocks) noexcept {
     allocator_.Release(blocks);
   }
+  void Release(std::span<const std::uint32_t> blocks,
+               KvBlockReservation& reservation) noexcept {
+    allocator_.Release(blocks, reservation);
+  }
   [[nodiscard]] std::uint32_t references(std::uint32_t block) const {
     return allocator_.references(block);
   }

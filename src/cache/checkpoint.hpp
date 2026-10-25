@@ -47,6 +47,16 @@ public:
   Payload& operator=(const Payload&) = delete;
   static Payload Committed(ResourceCharge, std::shared_ptr<const void> owner);
   static Payload Borrowed(std::shared_ptr<BorrowedRows>);
+  // Rows an adapter retained in device storage (Adapter::RetainRows). The
+  // charge covers only this handle's metadata; the rows take no RAM and need
+  // no preservation. Pins expose the device bytes.
+  static Payload Device(ResourceCharge metadata,
+                        std::shared_ptr<const void> owner, std::size_t bytes);
+  [[nodiscard]] bool OnDevice() const noexcept { return device_; }
+  // RAM this payload holds: zero for device rows.
+  [[nodiscard]] std::size_t RamBytes() const noexcept {
+    return device_ ? 0 : bytes_;
+  }
   // Managed borrowed rows require this pin for every source transfer. Keep it
   // until Completion settles. Owner() is available only after preservation.
   [[nodiscard]] RowPin PinRows(std::stop_token = {}) const;
@@ -74,6 +84,8 @@ public:
   [[nodiscard]] ResourceCharge CommittedCharge() const {
     if (rows_)
       throw std::logic_error("borrowed payload requires preservation");
+    if (device_)
+      throw std::logic_error("device payload holds no RAM");
     return charge_;
   }
 
@@ -88,6 +100,7 @@ private:
   ResourceCategory category_{};
   std::shared_ptr<const void> owner_;
   std::shared_ptr<BorrowedRows> rows_;
+  bool device_{};
 };
 struct ChunkReferences {
   std::size_t checkpoints{}, readers{}, persistence{};
@@ -273,6 +286,11 @@ public:
   // separately charged metadata; inherited full chunks contribute zero.
   [[nodiscard]] std::size_t NewPayloadBytes(
       std::span<const ComponentPosition>) const;
+  // The same, with new complete chunks of `device` components free: an
+  // adapter retains them in device storage (Adapter::RetainsRows).
+  [[nodiscard]] std::size_t NewPayloadBytes(
+      std::span<const ComponentPosition>,
+      std::span<const ComponentId> device) const;
   [[nodiscard]] static std::size_t ChunkMetadataBytes();
 
 private:

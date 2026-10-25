@@ -68,7 +68,9 @@ void ValidatePayload(const Payload& payload, const PayloadRequest& request) {
   if (!payload.IsValid() || (!payload.BorrowedFrom() && !payload.Owner()) ||
       payload.Bytes() < request.bytes || payload.Category() != expected ||
       (request.category == ResourceCategory::kPrivateState &&
-       payload.BorrowedFrom()))
+       payload.BorrowedFrom()) ||
+      (payload.OnDevice() &&
+       request.category != ResourceCategory::kBackingAssigned))
     throw std::invalid_argument(
         "incomplete or incompatible checkpoint payload");
 }
@@ -110,6 +112,20 @@ Payload Payload::Committed(ResourceCharge charge,
     throw std::invalid_argument("committed payload requires owned backing");
   result.bytes_ = info.bytes;
   result.category_ = info.category;
+  return result;
+}
+Payload Payload::Device(ResourceCharge metadata,
+                        std::shared_ptr<const void> owner, std::size_t bytes) {
+  Payload result;
+  result.charge_ = std::move(metadata);
+  result.owner_ = std::move(owner);
+  const auto info = result.charge_.Info();
+  if (!result.owner_ || !bytes || info.reserved ||
+      info.category != ResourceCategory::kMetadata)
+    throw std::invalid_argument("device payload requires retained rows");
+  result.bytes_ = bytes;
+  result.category_ = ResourceCategory::kBackingMaterialized;
+  result.device_ = true;
   return result;
 }
 Payload Payload::Borrowed(std::shared_ptr<BorrowedRows> rows) {
@@ -156,17 +172,21 @@ Payload& Payload::operator=(Payload&& other) noexcept {
     category_ = other.category_;
     owner_ = std::move(other.owner_);
     rows_ = std::move(other.rows_);
+    device_ = other.device_;
   }
   return *this;
 }
 bool Payload::PersistencePinned() const {
   if (rows_)
     return rows_->PersistencePinned();
-  return charge_ && charge_.Info().persistence_pinned;
+  // Device rows pin no RAM; their owner keeps them through a disk job.
+  return !device_ && charge_ && charge_.Info().persistence_pinned;
 }
 PersistencePin Payload::PinPersistence() const {
   if (rows_)
     return rows_->PinPersistence();
+  if (device_)
+    return {};
   return charge_.PinPersistence();
 }
 ChunkReference::ChunkReference(std::shared_ptr<detail::Chunk> chunk, Kind kind,
@@ -649,6 +669,11 @@ std::shared_ptr<detail::Chunk> ExecutionHistory::ChunkCursor::Find(Rows first) {
 }
 std::size_t ExecutionHistory::NewPayloadBytes(
     std::span<const ComponentPosition> positions) const {
+  return NewPayloadBytes(positions, {});
+}
+std::size_t ExecutionHistory::NewPayloadBytes(
+    std::span<const ComponentPosition> positions,
+    std::span<const ComponentId> device) const {
   if (positions.size() != descriptors_.size())
     throw std::invalid_argument("incomplete capture positions");
   std::size_t bytes = 0;
@@ -668,6 +693,8 @@ std::size_t ExecutionHistory::NewPayloadBytes(
     const auto full = p.valid_rows - p.valid_rows % d.rows_per_chunk;
     (void)Bytes(p.valid_rows, d.row_bytes);
     bytes = Add(bytes, Bytes(p.valid_rows - full, d.row_bytes));
+    if (std::ranges::find(device, d.id) != device.end())
+      continue;
     auto chunks = Chunks(d.id);
     for (Rows first = 0; first < full; first += d.rows_per_chunk) {
       const auto chunk = chunks.Find(first);

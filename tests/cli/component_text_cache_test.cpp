@@ -43,6 +43,7 @@ public:
   bool partial{};
   std::size_t private_blocks{128};
   cache::Rows rows_per_chunk{4};
+  bool retain_rows{};
   mutable std::size_t through_calls{};
   bool UsesComponentCache() const override { return true; }
   TextRunnerDescriptor Descriptor() const override {
@@ -107,6 +108,7 @@ public:
     auto resources = std::make_unique<ComponentCacheResources>();
     resources->adapter = std::make_unique<FakeAdapter>(rows_per_chunk);
     adapter = dynamic_cast<FakeAdapter*>(resources->adapter.get());
+    adapter->SetRetainRows(retain_rows);
     resources->owner = blocks;
     resources->stream = [this, foreground = std::this_thread::get_id()]()
         -> std::unique_ptr<cache::Stream> {
@@ -1879,7 +1881,7 @@ void OverRamCaptureStagesPrivateStateUnderPressure(bool protect) {
 // returning the rows idle slots hold; a reservation holds blocks until the
 // request ends; a request no pool can hold is refused by name.
 constexpr std::size_t kPagedTokens = 4;  // tokens per block
-constexpr std::size_t kPagedBlocks = 6;
+constexpr std::size_t kPagedBlocks = 7;
 void PagedRowsAdmitWaitAndReclaim() {
   class PagedRunner final : public Runner {
   public:
@@ -1923,8 +1925,9 @@ void PagedRowsAdmitWaitAndReclaim() {
   auto runner = std::make_shared<PagedRunner>();
   TextRunnerPool pool(runner, 2);
   const std::vector<TextRunnerToken> first(8, 3), second(12, 4), third(4, 5);
-  // 8 tokens + 4 new: 3 blocks, one more for speculative rows.
-  assert(pool.AdmissionRowBlocks(12) == 4);
+  // 8 tokens + 4 new: 3 blocks, one more for speculative rows and one for a
+  // copy of a block a checkpoint holds.
+  assert(pool.AdmissionRowBlocks(12) == 5);
   assert(pool.AdmissionReady(first, 4));
   auto a = pool.Acquire(first);
   a.ReserveRows(4);
@@ -1933,9 +1936,9 @@ void PagedRowsAdmitWaitAndReclaim() {
   (void)Generate(a);
   (void)a.Commit();
   // The live frontier keeps its 3 rows' blocks; the reservation is back.
-  assert(runner->reserved.empty() && runner->RowBlocks().free_blocks == 3);
+  assert(runner->reserved.empty() && runner->RowBlocks().free_blocks == 4);
   const auto resets = runner->adapter->Invalidations();
-  // 12 + 4 tokens need 5 blocks: the idle frontier, which this prompt does
+  // 12 + 4 tokens need 6 blocks: the idle frontier, which this prompt does
   // not continue, gives its rows back.
   assert(pool.AdmissionReady(second, 4));
   assert(runner->adapter->Invalidations() > resets &&
@@ -2324,7 +2327,123 @@ void SharedLineageCoversOnlyItsOwnFrontier() {
   }
   std::filesystem::remove_all(directory);
 }
+// The prompt's checkpoint, captured and committed; returns its metrics.
+ComponentCacheMetrics CapturePrompt(
+    ComponentTextCache& cache, Runner& runner,
+    const std::vector<TextRunnerToken>& prompt) {
+  auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+  auto& state = dynamic_cast<State&>(lease->state());
+  runner.adapter->Append(state.slot, prompt, prompt);
+  assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(), false,
+                                   SnapshotPurpose::kContinuation, {}));
+  (void)lease->Commit(prompt, lease->Capture(), prompt);
+  return lease->Metrics();
+}
+void RetainedChunksTakeNoRamAndRestore() {
+  // Completed target chunks the adapter retains take no RAM backing: the
+  // checkpoint keeps only draft chunks, tails and private state there. After
+  // its slot goes to another prompt, the slot restores the target rows from
+  // the retained chunks.
+  std::vector<TextRunnerToken> prompt(42);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  const std::vector<TextRunnerToken> side(12, 5);
+  std::array<std::size_t, 2> free_backing{};
+  for (const bool retain : {false, true}) {
+    auto runner = std::make_shared<Runner>();
+    runner->retain_rows = retain;
+    ComponentTextCache cache(runner, 1, 1 << 22, std::nullopt);
+    const auto metrics = CapturePrompt(cache, *runner, prompt);
+    // Ten complete four-row chunks of four-byte rows; the tail is a copy.
+    assert(metrics.device_payload_bytes == (retain ? 160 : 0));
+    assert(runner->adapter->RetainedChunks() == (retain ? 10 : 0));
+    free_backing[retain] = metrics.ledger.bytes[static_cast<std::size_t>(
+        cache::ResourceCategory::kBackingFree)];
+    {
+      auto lease = cache.Acquire(side, {}, {}, true, 0, true);
+      auto& state = dynamic_cast<State&>(lease->state());
+      runner->adapter->Append(state.slot, side, side);
+      (void)lease->Commit({}, {}, side);
+    }
+    auto next = prompt;
+    next.push_back(7);
+    auto lease = cache.Acquire(next, {}, {}, true, 0, true);
+    assert(lease->cached_tokens() == prompt.size() &&
+           !lease->restored_from_disk() && lease->Metrics().reuse == "ram");
+    auto& state = dynamic_cast<State&>(lease->state());
+    const auto rows = runner->adapter->TargetRows(state.slot);
+    assert(std::ranges::equal(rows, prompt));
+    lease->Invalidate();
+  }
+  assert(free_backing[true] == free_backing[false] + 10 * 16);
+}
+void RetainedChunksReachDisk() {
+  // A disk job reads retained chunks from their storage; a restart restores
+  // the prompt from disk.
+  const TemporaryDirectory temp("gufo-component-retained-disk");
+  const std::filesystem::path directory = temp.path();
+  const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                        .capacity_bytes = 1 << 22,
+                                        .staging_capacity_bytes = 7};
+  std::vector<TextRunnerToken> prompt(120);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  const std::vector<TextRunnerToken> side(12, 5);
+  {
+    auto runner = std::make_shared<Runner>();
+    runner->retain_rows = true;
+    ComponentTextCache cache(runner, 1, 1 << 22, disk);
+    assert(CapturePrompt(cache, *runner, prompt).device_payload_bytes ==
+           120 * sizeof(cache::Token));
+    std::uint64_t completed = 0;
+    for (int i = 0; i < 500 && completed == 0; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      auto lease = cache.Acquire(side, {}, {}, true, 0, true);
+      completed = lease->Metrics().persistence->completed;
+      lease->Invalidate();
+    }
+    assert(completed >= 1);
+  }
+  auto runner = std::make_shared<Runner>();
+  {
+    ComponentTextCache cache(runner, 1, 1 << 22, disk);
+    auto next = prompt;
+    next.push_back(7);
+    auto lease = cache.Acquire(next, {}, {}, true, 0, true);
+    assert(lease->cached_tokens() == prompt.size() &&
+           lease->restored_from_disk());
+    auto& state = dynamic_cast<State&>(lease->state());
+    assert(std::ranges::equal(runner->adapter->TargetRows(state.slot), prompt));
+    lease->Invalidate();
+  }
+  std::filesystem::remove_all(directory);
+}
+void RowReclaimDropsRetainedCheckpoints() {
+  // Rows only checkpoints retain go back first when admission needs rows:
+  // their checkpoints are dropped before any slot is reset.
+  std::vector<TextRunnerToken> prompt(40);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  auto runner = std::make_shared<Runner>();
+  runner->retain_rows = true;
+  ComponentTextCache cache(runner, 2, 1 << 22, std::nullopt);
+  (void)CapturePrompt(cache, *runner, prompt);
+  assert(runner->adapter->RetainedChunks() == 10);
+  const std::vector<TextRunnerToken> next(12, 5);
+  const auto invalidations = runner->adapter->Invalidations();
+  assert(cache.ReclaimRows(next, [&] {
+    return runner->adapter->RetainedChunks() == 0;
+  }) == ComponentTextCache::RowReclaim::kReady);
+  assert(runner->adapter->Invalidations() == invalidations);
+  // The live frontier still serves its continuation.
+  auto continued = prompt;
+  continued.push_back(7);
+  auto lease = cache.Acquire(continued, {}, {}, true, 0, true);
+  assert(lease->cached_tokens() == prompt.size() &&
+         lease->Metrics().reuse == "live");
+  lease->Invalidate();
+}
 int main() {
+  RetainedChunksTakeNoRamAndRestore();
+  RetainedChunksReachDisk();
+  RowReclaimDropsRetainedCheckpoints();
   SharedLineageCoversOnlyItsOwnFrontier();
   ReassignmentWritesUncoveredFrontier();
   ColdAssignmentCapturesUncoveredFrontier();

@@ -250,6 +250,25 @@ public:
         ++free_;
   }
 
+  /// Release, holding a block left without references back for
+  /// `reservation` (of this allocator, else plain Release) instead of
+  /// freeing it to every owner.
+  void Release(std::span<const std::uint32_t> blocks,
+               KvBlockReservation& reservation) noexcept {
+    if (reservation.allocator_ != this) {
+      Release(blocks);
+      return;
+    }
+    const std::lock_guard lock(mutex_);
+    for (const auto block : blocks)
+      if (block < references_.size() && references_[block] != 0 &&
+          --references_[block] == 0) {
+        ++free_;
+        ++reserved_;
+        ++reservation.blocks_;
+      }
+  }
+
 private:
   friend class KvBlockReservation;
   void Unreserve(std::uint32_t count) noexcept {

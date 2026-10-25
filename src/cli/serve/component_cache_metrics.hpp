@@ -19,6 +19,8 @@ struct ComponentCacheMetrics {
   std::size_t deepest_live{}, deepest_ram{}, deepest_disk{}, selected{};
   std::size_t restored_bytes{}, prefilled{}, captures{}, captured_bytes{};
   std::size_t borrowed_capacity_bytes{}, copied_payload_bytes{};
+  // Completed chunks the adapter retained in device storage, without RAM.
+  std::size_t device_payload_bytes{};
   std::vector<std::uint64_t> captured_checkpoint_ids;
   std::size_t disk_queued_bytes{};
   double disk_enqueue_ms{};
@@ -41,6 +43,7 @@ inline json::Value ComponentCacheJson(const ComponentCacheMetrics& value) {
   result["captured_capacity_bytes"] = value.captured_bytes;
   result["borrowed_capacity_bytes"] = value.borrowed_capacity_bytes;
   result["copied_payload_bytes"] = value.copied_payload_bytes;
+  result["device_payload_bytes"] = value.device_payload_bytes;
   auto checkpoints = json::Value::array();
   for (const auto id : value.captured_checkpoint_ids)
     checkpoints.push_back(id);

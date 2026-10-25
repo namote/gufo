@@ -552,6 +552,36 @@ std::span<const std::byte> FakeAdapter::BorrowRowsView(const Slot& slot,
   // the vector, so views stay fixed even though this fixture moves storage.
   return std::as_bytes(std::span(rows).subspan(first, end - first));
 }
+void FakeAdapter::SetRetainRows(bool retain) {
+  retain_rows_ = retain;
+}
+bool FakeAdapter::RetainsRows(ComponentId id) const {
+  return retain_rows_ && id == kTarget;
+}
+Adapter::RetainedRows FakeAdapter::RetainRows(const Slot& slot, ComponentId id,
+                                              Rows first, Rows end) const {
+  const auto& state = AsSlot(slot);
+  RequireCapture(state);
+  if (!RetainsRows(id) || first >= end || end > state.target.size())
+    return {};
+  auto rows = std::make_shared<const std::vector<Token>>(
+      state.target.begin() + first, state.target.begin() + end);
+  std::shared_ptr<const void> owner(rows, rows->data());
+  std::erase_if(retained_, [](const auto& r) { return r.expired(); });
+  retained_.push_back(owner);
+  return {std::move(owner), rows->size() * sizeof(Token)};
+}
+bool FakeAdapter::OnlyRetained(const void*) const {
+  // Fixture slots never hold the retained copies.
+  return retain_rows_;
+}
+std::size_t FakeAdapter::RetainedChunks() const {
+  return std::ranges::count_if(retained_,
+                               [](const auto& r) { return !r.expired(); });
+}
+std::span<const Token> FakeAdapter::TargetRows(const Slot& slot) const {
+  return AsSlot(slot).target;
+}
 void FakeAdapter::Append(Slot& slot, std::span<const Token> target,
                          std::span<const Token> draft) {
   auto& state = AsSlot(slot);

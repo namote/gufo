@@ -113,6 +113,26 @@ public:
                                                                   Rows) const {
     return {};
   }
+  // Optional retained device storage of one completed chunk: the owner keeps
+  // a backend reference on the storage holding exactly rows [first, end) and
+  // points at its first byte. The rows never change while the owner lives;
+  // the adapter copies before any slot writes storage another owner holds.
+  // CopyRowsIn must accept the bytes as a source. No RAM holds a copy. Empty
+  // means the chunk is copied as usual. Obtain it during exclusive execution.
+  struct RetainedRows {
+    std::shared_ptr<const void> owner;
+    std::size_t bytes{};
+  };
+  [[nodiscard]] virtual RetainedRows RetainRows(const Slot&, ComponentId, Rows,
+                                                Rows) const {
+    return {};
+  }
+  // Pure query: completed chunks of this component can be retained (above),
+  // so a capture needs no RAM for them.
+  [[nodiscard]] virtual bool RetainsRows(ComponentId) const { return false; }
+  // Retained rows (by their first byte) whose storage no slot holds: only
+  // checkpoints keep it, so dropping them returns it to the backend.
+  [[nodiscard]] virtual bool OnlyRetained(const void*) const { return false; }
   [[nodiscard]] virtual Completion CopyRowsIn(Slot&, ComponentId, Rows first,
                                               Rows end,
                                               std::span<const std::byte>,

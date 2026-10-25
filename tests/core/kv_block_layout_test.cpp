@@ -189,6 +189,28 @@ void TestReservation() {
   Expect(a.Allocate(1, &empty).size() == 1, "an empty reservation is none");
 }
 
+void TestReleaseIntoReservation() {
+  // A restore maps a retained block instead of the one it allocated; that
+  // block goes back to the restoring owner's reservation, not to others.
+  KvBlockAllocator a(4);
+  auto held = a.TryReserve(2);
+  const auto mine = a.Allocate(2, &held);
+  Expect(held.blocks() == 0 && a.free_blocks() == 2, "allocated the reserve");
+  auto other = a.TryReserve(2);
+  Expect(bool(other) && a.free_blocks() == 0, "another owner took the rest");
+  a.Retain(std::vector<std::uint32_t>{mine[1]});
+  a.Release(mine, held);
+  Expect(held.blocks() == 1 && a.reserved_blocks() == 3 && a.free_blocks() == 0,
+         "an unreferenced block returns to the reservation");
+  Expect(a.references(mine[1]) == 1, "a block still held is not freed");
+  Expect(a.Allocate(1, &held).front() == mine[0],
+         "the reservation hands the block out again");
+  KvBlockReservation none;
+  a.Release(std::vector<std::uint32_t>{mine[1]}, none);
+  Expect(a.free_blocks() == 1 && none.blocks() == 0,
+         "without a reservation a block is freed");
+}
+
 }  // namespace
 
 int main() {
@@ -201,6 +223,7 @@ int main() {
     TestInvalid();
     TestAllocator();
     TestReservation();
+    TestReleaseIntoReservation();
   } catch (const std::exception& error) {
     std::cerr << "kv_block_layout_test: " << error.what() << '\n';
     return 1;

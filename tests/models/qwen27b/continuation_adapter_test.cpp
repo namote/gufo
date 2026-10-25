@@ -616,6 +616,149 @@ void CheckSharedKvPool(const std::shared_ptr<const hip::QwenGpuModel>& model) {
   std::cout << "shared_kv_pool,PASS\n";
 }
 
+void CheckRetainedKvBlocks(
+    const std::shared_ptr<const hip::QwenGpuModel>& model) {
+  std::cout << "retained_kv_blocks" << std::endl;
+  constexpr std::uint32_t kContext = 8192;
+  const auto& config = model->GetConfig();
+  const hip::KvBlockPlane rows{
+      .layers = config.FullAttentionLayerCount(),
+      .row_bytes = static_cast<std::size_t>(config.num_key_value_heads) *
+                   config.head_dim * sizeof(std::uint16_t)};
+  constexpr std::uint32_t kPoolBlocks = 40;
+  auto kv_pool =
+      std::make_shared<hip::KvBlockPool>(std::vector{rows, rows}, kPoolBlocks);
+  qwen::ContinuationAdapter own(model, kContext, {'o', 'w', 'n'});
+  qwen::ContinuationAdapter paged(model, kContext, {'p', 'k', 'v'}, {}, nullptr,
+                                  {}, nullptr, nullptr, kv_pool);
+  hip::TransferPool pool(2);
+  Guard g1, g2, g3;
+  auto r1 = own.CreateSlot(g1);
+  auto p1 = paged.CreateSlot(g2), p2 = paged.CreateSlot(g3);
+  auto& ra = own.GetExecutor(*r1);
+  auto& pa = paged.GetExecutor(*p1);
+  auto& pb = paged.GetExecutor(*p2);
+  const auto text = model->GetTokenizer().Encode(
+      "A page table maps virtual pages to frames. The translation buffer "
+      "caches recent mappings so most loads skip the walk.\n");
+  std::vector<Token> tokens(4000);
+  for (std::size_t i = 0; i < tokens.size(); ++i)
+    tokens[i] = text[(i * 5) % text.size()];
+  // Five complete blocks and a 20-row tail.
+  constexpr std::uint32_t kPrompt = 1300;
+  (void)ra.ForwardPromptBatch(std::span(tokens).first(kPrompt));
+  (void)pa.ForwardPromptBatch(std::span(tokens).first(kPrompt));
+  const auto expected = Capture(own, *r1, pool);
+  // A checkpoint retains every complete K/V chunk of the first session.
+  const auto components = paged.Components();
+  std::vector<std::vector<cache::Adapter::RetainedRows>> retained(
+      components.size());
+  std::size_t key = components.size();
+  for (std::size_t i = 0; i < components.size(); ++i) {
+    const auto& d = components[i];
+    Require(!own.RetainsRows(d.id), "an own-pool session retained rows");
+    if (!paged.RetainsRows(d.id))
+      continue;
+    key = std::min(key, i);
+    for (cache::Rows first = 0;
+         first + hip::kKvBlockTokens <= expected.positions[i].valid_rows;
+         first += hip::kKvBlockTokens) {
+      auto chunk =
+          paged.RetainRows(*p1, d.id, first, first + hip::kKvBlockTokens);
+      Require(chunk.owner && chunk.bytes == hip::kKvBlockTokens * d.row_bytes,
+              "a complete K/V chunk was not retained");
+      retained[i].push_back(std::move(chunk));
+    }
+    Require(retained[i].size() == 5, "retained other than complete chunks");
+  }
+  Require(key < components.size(), "no component retains rows");
+  Require(
+      paged.RetainRows(*p1, components[key].id, 1280, 1300).owner == nullptr,
+      "a partial chunk was retained");
+  const std::vector<std::uint32_t> first_blocks(paged.KvBlocks(*p1).begin(),
+                                                paged.KvBlocks(*p1).end());
+  for (std::size_t k = 0; k < 5; ++k)
+    Require(kv_pool->references(first_blocks[k]) == 2,
+            "a retained block holds other than one reference");
+  Require(!paged.OnlyRetained(retained[key][0].owner.get()),
+          "a block its session maps counts as only retained");
+  // Another session restores complete chunks from the retained blocks and
+  // the tails from host bytes: it maps those blocks rather than copying.
+  const auto free = kv_pool->free_blocks();
+  paged.BeginRestore(*p2, expected.positions);
+  for (std::size_t i = 0; i < components.size(); ++i) {
+    const auto& d = components[i];
+    const auto bytes = std::span(expected.bytes[i]);
+    auto stream = pool.TryAcquire();
+    Require(bool(stream), "restore stream unavailable");
+    if (!d.row_bytes) {
+      Wait(paged.LoadPrivate(*p2, d.id, bytes, *stream));
+      continue;
+    }
+    const auto valid = expected.positions[i].valid_rows;
+    cache::Rows first = 0;
+    for (const auto& chunk : retained[i]) {
+      Wait(paged.CopyRowsIn(
+          *p2, d.id, first, first + hip::kKvBlockTokens,
+          {static_cast<const std::byte*>(chunk.owner.get()), chunk.bytes},
+          *stream));
+      first += hip::kKvBlockTokens;
+    }
+    if (first < valid)
+      Wait(paged.CopyRowsIn(*p2, d.id, first, valid,
+                            bytes.subspan(first * d.row_bytes), *stream));
+  }
+  Require(paged.Validate(*p2, expected.positions),
+          "a mapped restore was rejected");
+  for (std::size_t k = 0; k < 5; ++k)
+    Require(paged.KvBlocks(*p2)[k] == first_blocks[k] &&
+                kv_pool->references(first_blocks[k]) == 3,
+            "a retained block was copied instead of mapped");
+  Require(kv_pool->free_blocks() == free - 1,
+          "a mapped restore took more than its tail block");
+  Require(Capture(paged, *p2, pool).bytes == expected.bytes,
+          "mapped restore bytes differ");
+  std::uint32_t pos = kPrompt;
+  Require(
+      pb.ForwardToken(tokens[pos], pos) == ra.ForwardToken(tokens[pos], pos),
+      "a mapped restore changed a decode token");
+  SameLogits(ra, pb);
+  ++pos;
+  // Rewriting rows inside a retained block copies that block first; the
+  // first session and the checkpoint keep their rows.
+  const auto rewrite = std::span(tokens).subspan(3000, 100);
+  (void)ra.ForwardPromptBatch(rewrite, 300);
+  (void)pb.ForwardPromptBatch(rewrite, 300);
+  SameLogits(ra, pb);
+  Require(paged.KvBlocks(*p2)[1] != first_blocks[1] &&
+              kv_pool->references(first_blocks[1]) == 2,
+          "a write into a retained block did not copy it");
+  Require(paged.KvBlocks(*p2)[0] == first_blocks[0] &&
+              paged.KvBlocks(*p2)[2] == first_blocks[2],
+          "a write copied blocks it does not touch");
+  Require(Capture(paged, *p1, pool).bytes == expected.bytes,
+          "a write changed rows another session holds");
+  const auto row = components[key].row_bytes;
+  std::vector<std::byte> held(retained[key][1].bytes);
+  Require(hipMemcpy(held.data(), retained[key][1].owner.get(), held.size(),
+                    hipMemcpyDeviceToHost) == hipSuccess,
+          "retained rows unreadable");
+  Require(std::ranges::equal(held, std::span(expected.bytes[key])
+                                       .subspan(hip::kKvBlockTokens * row,
+                                                hip::kKvBlockTokens * row)),
+          "a write changed retained rows");
+  // With both sessions reset only the checkpoint holds the blocks; dropping
+  // it returns them.
+  Require(paged.Invalidate(*p1) && paged.Invalidate(*p2),
+          "reset of retaining sessions failed");
+  Require(paged.OnlyRetained(retained[key][0].owner.get()),
+          "a block no session maps is not only retained");
+  retained.clear();
+  Require(kv_pool->free_blocks() == kPoolBlocks,
+          "dropped checkpoints kept their blocks");
+  std::cout << "retained_kv_blocks,PASS\n";
+}
+
 void CheckBatchAdmission(
     const std::shared_ptr<const hip::QwenGpuModel>& model) {
   qwen::ContinuationAdapter adapter(model, 64, {'b', 'a', 't', 'c', 'h'});
@@ -1087,6 +1230,7 @@ int main(int argc, const char* const* argv) {
       Check(model, true, true);
       CheckSharedPassScratch(model);
       CheckSharedKvPool(model);
+      CheckRetainedKvBlocks(model);
       CheckPrefillCancellation(model, true);
       CheckPrefillCancellation(model, false);
     }

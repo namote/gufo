@@ -132,8 +132,10 @@ public:
     kWaiting,    // a busy slot may still free rows
     kExhausted,  // no slot is busy and nothing is left to return
   };
-  // Returns the paged rows idle slots hold until `enough()` holds: slots
-  // without a live frontier first, then live frontiers that `prompt` does
+  // Returns the paged rows idle slots hold until `enough()` holds. Rows only
+  // checkpoints retain go first: their checkpoints are dropped, lowest
+  // retention priority first. Then slots
+  // without a live frontier, then live frontiers that `prompt` does
   // not continue, a frontier some checkpoint covers before the only copy of
   // its work, oldest first. A slot is reset at most once per call, and not
   // again until it is leased; its borrowed checkpoint rows are preserved as
