@@ -450,6 +450,7 @@ gufo::bench::KernelBenchResult BenchmarkDecodeAttention(
     gufo::hip::LaunchAttention(
         query.Get(), key.Get(), value.Get(), gate.Get(), key_cache.Get(),
         value_cache.Get(), key_cache_f16.Get(), value_cache_f16.Get(),
+        gufo::hip::KvBlockTable{},
         output.Get(), 0, static_cast<std::uint32_t>(context - 1),
         static_cast<std::uint32_t>(context), kAttentionHeads, kAttentionKvHeads,
         kAttentionHeadDim, stream, split_k_scratch.Get());
@@ -715,6 +716,7 @@ gufo::bench::KernelBenchResult BenchmarkBatchedAttention(
     if (gufo::hip::LaunchQwenWmmaAttention(
             query.Get(), key.Get(), value.Get(), gate.Get(), key_cache.Get(),
             value_cache.Get(), key_cache_f16.Get(), value_cache_f16.Get(),
+        gufo::hip::KvBlockTable{},
             output.Get(), 0, 0, context, static_cast<std::uint32_t>(context),
             kAttentionHeads, kAttentionKvHeads, kAttentionHeadDim, stream)) {
       selected_backend = "wmma";
@@ -725,6 +727,7 @@ gufo::bench::KernelBenchResult BenchmarkBatchedAttention(
       gufo::hip::LaunchBatchedAttention(
           query.Get(), key.Get(), value.Get(), gate.Get(), key_cache.Get(),
           value_cache.Get(), key_cache_f16.Get(), value_cache_f16.Get(),
+        gufo::hip::KvBlockTable{},
           output.Get(), 0, 0, context, static_cast<std::uint32_t>(context),
           kAttentionHeads, kAttentionKvHeads, kAttentionHeadDim, stream);
       return;
@@ -732,6 +735,7 @@ gufo::bench::KernelBenchResult BenchmarkBatchedAttention(
     if (gufo::hip::LaunchBatchedAttentionTile(
             query.Get(), key.Get(), value.Get(), gate.Get(), key_cache.Get(),
             value_cache.Get(), key_cache_f16.Get(), value_cache_f16.Get(),
+        gufo::hip::KvBlockTable{},
             output.Get(), 0, 0, context, static_cast<std::uint32_t>(context),
             kAttentionHeads, kAttentionKvHeads, kAttentionHeadDim, stream)) {
       selected_backend = "tiled";
@@ -745,6 +749,7 @@ gufo::bench::KernelBenchResult BenchmarkBatchedAttention(
     gufo::hip::LaunchBatchedAttention(
         query.Get(), key.Get(), value.Get(), gate.Get(), key_cache.Get(),
         value_cache.Get(), key_cache_f16.Get(), value_cache_f16.Get(),
+        gufo::hip::KvBlockTable{},
         output.Get(), 0, 0, context, static_cast<std::uint32_t>(context),
         kAttentionHeads, kAttentionKvHeads, kAttentionHeadDim, stream);
   };
@@ -827,10 +832,12 @@ gufo::bench::KernelBenchResult BenchmarkDeltaNet(
                              "/val_dim=" + std::to_string(val_dim);
   auto samples_us = MeasureKernel(options, marker, stream, [&] {
     gufo::hip::LaunchBatchedSSMConvRecurrence(
-        qkv.Get(), conv_weights.Get(), conv_state.Get(), conv_output.Get(),
-        deltanet_state.Get(), alpha.Get(), beta.Get(), ssm_a.Get(),
-        ssm_dt.Get(), ssm_norm.Get(), gate.Get(), output.Get(), 0, batch_size,
-        qkv_size, num_key_heads, num_heads, key_dim, val_dim, stream);
+        qkv.Get(), conv_weights.Get(),
+        gufo::hip::QwenRecurrentStateIo::InPlace(conv_state.Get(),
+                                                 deltanet_state.Get()),
+        conv_output.Get(), alpha.Get(), beta.Get(), ssm_a.Get(), ssm_dt.Get(),
+        ssm_norm.Get(), gate.Get(), output.Get(), 0, batch_size, qkv_size,
+        num_key_heads, num_heads, key_dim, val_dim, stream);
   });
   VerifyFiniteNonzero(output);
 

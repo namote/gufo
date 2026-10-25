@@ -57,12 +57,15 @@ const QwenGpuModel& RequireModel(
 
 QwenGpuExecutor::QwenGpuExecutor(std::shared_ptr<const QwenGpuModel> model,
                                  std::uint32_t max_context,
-                                 QwenExecutionPolicy policy)
+                                 QwenExecutionPolicy policy,
+                                 QwenKvPlacement kv_placement)
     : model_(std::move(model)),
       weights_(RequireModel(model_).GetWeights()),
       tokenizer_(&model_->GetTokenizer()),
       policy_(policy),
-      arena_(weights_.config, max_context, policy_),
+      arena_(weights_.config, max_context, policy_,
+             std::move(kv_placement.pool), kv_placement.growth,
+             std::move(kv_placement.pass_scratch)),
       graph_key_(BuildGraphCaptureKey(weights_, policy_, max_context)),
       h_logits_(weights_.config.vocab_size, 0.0F) {
   AllocateGpuSamplingWorkspace(&sampling_workspace_, weights_.config.vocab_size,
@@ -98,8 +101,10 @@ void QwenGpuExecutor::EnsureVerificationLogits(std::size_t batch_size) {
 
 QwenGpuMemoryUsage QwenGpuExecutor::EstimateMemoryUsage(
     const core::ModelConfig& config, std::uint32_t max_context,
-    QwenExecutionPolicy policy) {
-  auto usage = QwenGpuArena::EstimateMemoryUsage(config, max_context, policy);
+    QwenExecutionPolicy policy, QwenGpuArena::KvGrowth kv_growth,
+    bool shared_scratch) {
+  auto usage = QwenGpuArena::EstimateMemoryUsage(config, max_context, policy,
+                                                 kv_growth, shared_scratch);
   usage.temporary_scratch_bytes +=
       EstimateGpuSamplingWorkspaceBytes(config.vocab_size, max_context);
   // Reserve the bounded fallback for eight requests with eight rows each.
@@ -153,6 +158,29 @@ std::unique_ptr<QwenGpuSnapshot> QwenGpuExecutor::SaveSnapshot(
   return snapshot;
 }
 
+std::size_t QwenGpuExecutor::LiveCompactPayloadBytes(
+    std::uint32_t valid_context, bool paged) const {
+  return QwenGpuArena::CompactSnapshotPayloadBytes(
+             weights_.config, arena_.GetMaxContext(), policy_, valid_context,
+             paged) +
+         vision_input_.layout().Prefix(valid_context).images.size() * 12;
+}
+
+void QwenGpuExecutor::StreamLiveCompact(std::uint32_t valid_context,
+                                        BounceStream& bounce,
+                                        const BounceStream::Sink& sink,
+                                        bool paged) {
+  CheckReset();
+  for (const auto& segment : arena_.LiveCompactSegments(
+           valid_context, vision_input_.layout().Prefix(valid_context),
+           paged)) {
+    if (!segment.host.empty())
+      sink(segment.host);
+    else
+      bounce.Out(segment.device, sink);
+  }
+}
+
 void QwenGpuExecutor::ConfigureVision(
     std::shared_ptr<const models::qwen::vision::Prompt> prompt,
     std::shared_ptr<models::qwen::vision::Encoder> encoder) {
@@ -198,6 +226,25 @@ void QwenGpuExecutor::RestoreCompactSnapshot(
   graph_executor_.Reset();
 }
 
+void QwenGpuExecutor::RestoreCompactSnapshotStream(
+    BounceStream& bounce, const BounceStream::Source& read,
+    std::size_t compact_bytes, std::uint32_t expected_valid_context) {
+  // Same preparation as RestoreCompactSnapshot.
+  CheckReset();
+  replaying_ssm_state_ = false;
+  next_token_.reset();
+  h_prompt_hidden_.clear();
+  h_verification_hidden_.clear();
+  h_verification_logits_.clear();
+  h_last_hidden_.clear();
+  last_verification_rows_ = 0;
+  last_hidden_offset_ = 0;
+  const auto rope = arena_.RestoreCompactSnapshotStream(
+      bounce, read, compact_bytes, expected_valid_context);
+  vision_input_.RestoreLayout(rope, arena_.stream);
+  graph_executor_.Reset();
+}
+
 void QwenGpuExecutor::SaveState(std::uint32_t valid_context) {
   CheckReset();
   replaying_ssm_state_ = false;
@@ -224,6 +271,9 @@ void QwenGpuExecutor::ReplaySsmState(std::uint32_t position,
                                      std::uint32_t count) {
   const auto& config = weights_.config;
   auto scratch = arena_.GetScratchView();
+  // The replay is one pass: it reads the restored (pinned) state and leaves it
+  // intact for a second RestoreState.
+  const auto recurrent_state = arena_.BeginRecurrentWrite();
   for (std::uint32_t layer_idx = 0; layer_idx < config.num_layers;
        ++layer_idx) {
     const auto& layer = weights_.layers[layer_idx];
@@ -232,18 +282,20 @@ void QwenGpuExecutor::ReplaySsmState(std::uint32_t position,
     }
 
     // Layers have independent recorded inputs and recurrent state. Replay each
-    // layer's committed rows together, splitting only at ring/scratch bounds.
+    // layer's committed rows together, splitting only at ring/scratch bounds;
+    // a layer's later splits continue from what its first launch wrote.
+    auto layer_state = recurrent_state;
     for (std::uint32_t offset = 0; offset < count;) {
       const auto start = position + offset;
       const auto until_wrap = static_cast<std::uint32_t>(
           kSsmReplayCapacity - (start % kSsmReplayCapacity));
       const auto rows =
-          std::min({count - offset, until_wrap, arena_.GetMaxBatch()});
+          std::min({count - offset, until_wrap,
+                    static_cast<std::uint32_t>(arena_.GetScratchRows())});
       LaunchSSMConvRecurrenceRows(
           arena_.GetReplayQkv(layer_idx, start),
-          static_cast<const float*>(layer.ssm_conv1d.data),
-          arena_.d_ssm_conv_state, scratch.ssm.conv_out.data(),
-          arena_.d_ssm_deltanet_state, arena_.GetReplayAlpha(layer_idx, start),
+          static_cast<const float*>(layer.ssm_conv1d.data), layer_state,
+          scratch.ssm.conv_out.data(), arena_.GetReplayAlpha(layer_idx, start),
           arena_.GetReplayBeta(layer_idx, start),
           static_cast<const float*>(layer.ssm_a.data),
           static_cast<const float*>(layer.ssm_dt.data), nullptr, nullptr,
@@ -252,6 +304,7 @@ void QwenGpuExecutor::ReplaySsmState(std::uint32_t position,
           config.ssm_state_size, config.SsmValueSize(), rows,
           config.ssm_time_step_rank, config.ssm_inner_size, arena_.stream, {},
           arena_.GetRecurrentStateStorage());
+      layer_state = layer_state.Continued();
       offset += rows;
     }
   }
@@ -440,6 +493,23 @@ void QwenGpuExecutor::SetPromptHiddenCapture(
                                        : std::span<const std::uint32_t>{});
 }
 
+void QwenGpuExecutor::ReturnPassScratch() noexcept {
+  const std::size_t hidden = weights_.config.hidden_size;
+  const std::size_t own_rows = arena_.GetOwnScratchRows();
+  if (last_hidden_offset_ >= own_rows * hidden) {
+    LogCleanupError(hipMemcpyAsync(arena_.GetOwnHidden(),
+                                   arena_.d_hidden + last_hidden_offset_,
+                                   hidden * sizeof(float),
+                                   hipMemcpyDeviceToDevice, arena_.stream));
+    last_hidden_offset_ = 0;
+  } else {
+    LogCleanupError(hipMemcpyAsync(arena_.GetOwnHidden(), arena_.d_hidden,
+                                   own_rows * hidden * sizeof(float),
+                                   hipMemcpyDeviceToDevice, arena_.stream));
+  }
+  arena_.EndPassScratch();
+}
+
 std::span<const float> QwenGpuExecutor::CopyLastHidden() {
   CheckReset();
   const std::size_t hidden_size = weights_.config.hidden_size;
@@ -452,7 +522,7 @@ std::span<const float> QwenGpuExecutor::CopyLastHidden() {
                              hipMemcpyDeviceToHost, arena_.stream));
   } else {
     h_last_hidden_.resize(hidden_size);
-    auto scratch = arena_.GetScratchView(arena_.GetMaxBatch());
+    auto scratch = arena_.GetScratchView(arena_.GetScratchRows());
     HIP_CHECK(hipMemcpyAsync(h_last_hidden_.data(),
                              scratch.decode.hidden.data() + last_hidden_offset_,
                              hidden_size * sizeof(float), hipMemcpyDeviceToHost,

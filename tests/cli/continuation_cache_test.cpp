@@ -1363,6 +1363,86 @@ void TestNewBranchPreservesSharedSourceUnderBytePressure() {
          "the oldest unrelated continuation yields to the shared branch point");
 }
 
+
+// Snapshot that counts its release, standing for model rows it holds.
+struct RowSnapshot final : gufo::server::ContinuationSnapshot {
+  explicit RowSnapshot(std::size_t* released) : released(released) {}
+  ~RowSnapshot() override { ++*released; }
+  [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
+    return sizeof(std::size_t);
+  }
+  std::size_t* released;
+};
+
+// Rows go back from retained snapshots first, then idle seats, oldest
+// first, sparing what the incoming prompt reuses; busy seats and frontiers
+// still being written make the caller wait.
+void TestReclaimForRowsDropsSnapshotsThenIdleSeats() {
+  using Tokens = std::vector<gufo::server::ContinuationToken>;
+  using Reclaim = gufo::server::ContinuationCache::RowReclaim;
+  std::vector<std::size_t> invalidations(2);
+  std::size_t next_id = 0;
+  std::size_t released = 0;
+  gufo::server::ContinuationCache cache(
+      2, [&] { return std::make_unique<FakeState>(next_id++, &invalidations); },
+      {.restore = [](gufo::server::ContinuationState&,
+                     const gufo::server::ContinuationSnapshot&) {},
+       .capacity_bytes = [] { return 1024; },
+       .on_event = {}});
+  const auto publish = [&](Tokens prompt, Tokens live) {
+    auto lease = cache.Acquire(prompt);
+    Expect(lease.TryReserveSnapshot(sizeof(std::size_t), prompt.size()),
+           "reserve a row snapshot");
+    (void)lease.Commit(prompt, std::make_shared<RowSnapshot>(&released),
+                       std::move(live));
+  };
+  publish({1, 2, 3}, {1, 2, 3, 9});
+  publish({5, 6}, {5, 6, 7});
+  const auto dropped = [&] {
+    return released + invalidations[0] + invalidations[1];
+  };
+  const std::size_t before = dropped();
+  const Tokens resume{5, 6, 7, 8};
+
+  Expect(cache.ReclaimForRows(resume, [&] { return dropped() >= before + 1; }) ==
+                 Reclaim::kReady &&
+             released == 1 && cache.CachedPrefixTokens(resume) >= 2,
+         "the snapshot the prompt does not reuse goes first");
+  Expect(cache.ReclaimForRows(resume, [&] { return dropped() >= before + 2; }) ==
+                 Reclaim::kReady &&
+             invalidations[0] == 1 && invalidations[1] == 0,
+         "then the idle seat the prompt does not resume");
+  Expect(cache.ReclaimForRows(resume, [&] { return dropped() >= before + 3; }) ==
+             Reclaim::kExhausted,
+         "nothing the prompt reuses is dropped, and nothing else is busy");
+  {
+    auto busy = cache.Acquire(Tokens{4});
+    Expect(cache.ReclaimForRows(resume,
+                                [&] { return dropped() >= before + 3; }) ==
+               Reclaim::kWaiting,
+           "a busy seat may still free rows");
+    busy.Invalidate();
+  }
+
+  cache.EnablePersistence();
+  publish({7, 7}, {7, 7, 1});
+  const auto unwritten = dropped();
+  // Its snapshot goes first; the frontier must reach disk before it does.
+  Expect(cache.ReclaimForRows(resume,
+                              [&] { return dropped() >= unwritten + 2; }) ==
+                 Reclaim::kWaiting &&
+             dropped() == unwritten + 1,
+         "a frontier not on disk is written before its rows go");
+  const auto seat = cache.BeginPersist(true);
+  Expect(seat.has_value() && seat->tokens == Tokens({7, 7, 1}),
+         "the reclaim marks that frontier for writing");
+  cache.EndPersist(seat->index, true);
+  Expect(cache.ReclaimForRows(resume,
+                              [&] { return dropped() >= unwritten + 2; }) ==
+             Reclaim::kReady,
+         "a written frontier's rows can go");
+}
+
 int main() {
   TestAppendedImagesReuseOnlyCompatiblePrefixes();
   TestImageIdentityIsolation();
@@ -1395,6 +1475,7 @@ int main() {
   TestReplacedSourceDoesNotEvictAnotherBranchTail();
   TestCacheCandidateDetailIsDebugTierOnly();
   TestWaitingAcquireReportsCandidateSkips();
+  TestReclaimForRowsDropsSnapshotsThenIdleSeats();
   std::cout << "All continuation cache tests passed\n";
   return 0;
 }

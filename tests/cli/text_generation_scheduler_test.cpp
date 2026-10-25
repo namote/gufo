@@ -29,6 +29,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
+#include "src/core/json.hpp"
 
 namespace {
 
@@ -49,6 +50,7 @@ using gufo::server::TextRunnerAdvance;
 using gufo::server::TextRunnerCapabilities;
 using gufo::server::TextRunnerDescriptor;
 using gufo::server::TextRunnerPool;
+using gufo::server::TextRunnerRamCacheOptions;
 using gufo::server::TextRunnerResourceClaim;
 using gufo::server::TextRunnerState;
 using gufo::server::TextRunnerToken;
@@ -191,6 +193,9 @@ struct FakeControl {
   bool release_prefill{false};
   std::atomic<std::size_t> invalidations{0};
   std::atomic<std::size_t> states_created{0};
+  bool structured_output{false};
+  bool vocabulary_failure{false};
+  std::atomic<std::size_t> vocabulary_builds{0};
   std::atomic<std::size_t> decode_calls{0};
   std::atomic<std::size_t> batch_preparations{0};
   std::atomic<std::int64_t> first_request_advance_ns{0};
@@ -309,6 +314,20 @@ public:
   [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
       std::string_view text) const override {
     return {static_cast<TextRunnerToken>(text.size())};
+  }
+
+  [[nodiscard]] std::shared_ptr<const gufo::sampling::ConstraintVocabulary>
+  BuildConstraintVocabulary() const override {
+    if (!control_->structured_output)
+      return TextModelRunner::BuildConstraintVocabulary();
+    if (control_->vocabulary_failure)
+      throw std::runtime_error("vocabulary build failed");
+    control_->vocabulary_builds.fetch_add(1, std::memory_order_relaxed);
+    return std::make_shared<gufo::sampling::ConstraintVocabulary>(
+        256, [](std::uint32_t id) {
+          return gufo::sampling::ConstraintVocabulary::Piece{
+              std::string(1, static_cast<char>(id)), false};
+        });
   }
 
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
@@ -658,6 +677,54 @@ void TestConcurrentSharedPrefixesPrefillOnce() {
   Expect(e.cached_prompt_tokens == 0 && e.prefill_tokens == 1000 &&
              e.shared_prefix_wait_ms == 0.0,
          "a short shared prefix is prefilled without waiting");
+}
+
+// A follower waits for a shared prefix of at least shared_prefix_min_tokens
+// (default 128): 200 tokens are shared at the default and prefilled again at
+// 512. With the default, a leader cancelled while its follower is parked
+// releases it to prefill alone.
+void TestSharedPrefixMinTokens() {
+  for (const std::size_t min_tokens : {std::size_t{0}, std::size_t{512}}) {
+    for (const bool cancel : {false, true}) {
+      if (cancel && min_tokens != 0)
+        continue;
+      auto control = SharedPrefixControl(true);
+      control->prefill_capacity = 64;
+      control->block_prefill_label = 1;
+      TextRunnerRamCacheOptions options;
+      if (min_tokens != 0)
+        options.shared_prefix_min_tokens = min_tokens;
+      auto pool = std::make_shared<TextRunnerPool>(
+          std::make_shared<FakeRunner>(control), 2, std::nullopt, options);
+      Expect(pool->shared_prefix_min_tokens() ==
+                 (min_tokens != 0 ? min_tokens : std::size_t{128}),
+             "the pool reports its shared prefix threshold");
+      auto scheduler = std::make_unique<TextGenerationScheduler>(
+          std::move(pool), TextPrefillPolicy{}, TextSchedulerPolicy{});
+      auto leader = scheduler->Submit(SharedPrompt(200, 7000, 100), 2, 0.0F);
+      control->WaitForPrefill(1);
+      const auto prompt = SharedPrompt(200, 8000, 100);
+      auto follower = scheduler->Submit(prompt, 2, 0.0F);
+      if (cancel)
+        leader.Cancel();
+      control->ReleasePrefill();
+      const auto a = leader.Wait();
+      const auto b = follower.Wait();
+      Expect(cancel ? a.cancelled : a.tokens == ExpectedTokens(1, 2),
+             "the leader completes unless cancelled");
+      Expect(!b.cancelled && b.tokens == ExpectedTokens(1, 2) &&
+                 b.cached_prompt_tokens + b.prefill_tokens == prompt.size(),
+             "the follower completes with exact prompt accounting");
+      if (min_tokens == 512) {
+        Expect(b.cached_prompt_tokens == 0 && b.shared_prefix_wait_ms == 0.0,
+               "a 200-token prefix under a 512 threshold is prefilled again");
+      } else if (!cancel) {
+        Expect(b.cached_prompt_tokens == 200 && b.prefill_tokens == 100 &&
+                   b.shared_prefix_wait_ms > 0.0,
+               "a 200-token prefix is restored from the leader by default");
+      }
+    }
+  }
 }
 
 // The leader is cancelled while the worker is still inside its first prefill
@@ -2612,6 +2679,62 @@ void TestShutdownCancelsRunnerAcquisition() {
   stopped.get();
 }
 
+void TestStructuredOutputIsPreparedBeforeServing() {
+  // The scheduler is created during model loading, before load_completed and
+  // before the server listens. The vocabulary is ready when
+  // construction returns, and constrained requests reuse it.
+  const auto control = std::make_shared<FakeControl>();
+  control->structured_output = true;
+  std::ostringstream output;
+  auto* previous = std::clog.rdbuf(output.rdbuf());
+  auto scheduler = MakeScheduler(control, 1);
+  std::clog.rdbuf(previous);
+  Expect(control->vocabulary_builds == 1,
+         "the vocabulary is built before the scheduler admits a request");
+  const auto log = output.str();
+  Expect(log.find("event=structured_output_prepared vocabulary_tokens=256 "
+                  "prepare_ms=") != std::string::npos &&
+             log.find(" rss_delta_kib=") != std::string::npos,
+         "preparation reports its time and memory");
+  const auto grammar = gufo::sampling::JsonConstraint::Compile(
+      gufo::json::parse(
+          R"({"type":"object","properties":{},"additionalProperties":false})"),
+      false);
+  const auto binding = scheduler->runner().BindConstraint(grammar);
+  Expect(binding->vocabulary && control->vocabulary_builds == 1,
+         "a constrained request reuses the prepared vocabulary");
+  Expect(scheduler->Submit({7, 70}, 2, 0.0F).Wait().tokens.size() == 2,
+         "a prepared scheduler serves requests");
+
+  // Runners without structured output can still serve ordinary text, but
+  // reject an explicit constrained request as before.
+  const auto plain = MakeScheduler(std::make_shared<FakeControl>(), 1);
+  Expect(plain->runner().PrepareConstraintVocabulary() == 0 &&
+             plain->Submit({7, 70}, 2, 0.0F).Wait().tokens.size() == 2,
+         "unsupported runners retain ordinary text serving");
+  std::string error;
+  try {
+    (void)plain->runner().BindConstraint(grammar);
+  } catch (const std::invalid_argument& exception) {
+    error = exception.what();
+  }
+  Expect(error.find("does not support structured output") != std::string::npos,
+         "unsupported runners still reject structured output");
+
+  // A supported runner with a broken vocabulary must fail startup.
+  const auto broken = std::make_shared<FakeControl>();
+  broken->structured_output = true;
+  broken->vocabulary_failure = true;
+  error.clear();
+  try {
+    (void)MakeScheduler(broken, 1);
+  } catch (const std::runtime_error& exception) {
+    error = exception.what();
+  }
+  Expect(error == "vocabulary build failed",
+         "vocabulary build failures stop startup");
+}
+
 void TestProgressLoggingIsOptInAndBounded() {
   auto run = [](bool enabled) {
     auto control = std::make_shared<FakeControl>();
@@ -2907,6 +3030,7 @@ int main() {
   // captured from a redirected sink; a TTY stderr would tint the level tag.
   ::setenv("NO_COLOR", "1", 1);
   TestProgressLoggingIsOptInAndBounded();
+  TestStructuredOutputIsPreparedBeforeServing();
   TestAdmissionLoggingIsDebugTierOnly();
   TestPromptProgressPrecedesStreamedTokens();
   TestStreamStartPrecedesPrefill();
@@ -2966,6 +3090,7 @@ int main() {
   TestFirstTokenPrecedesSnapshotAndPreservesBudget();
   TestIdlePrefillUsesBulkWorkUnit();
   TestConcurrentSharedPrefixesPrefillOnce();
+  TestSharedPrefixMinTokens();
   TestLeaderCancelledBeforeFollowerIsAdmitted();
   TestParkedFollowerSurvivesLeaderCancellation();
   TestSharedPrefixWaitRequiresSnapshots();

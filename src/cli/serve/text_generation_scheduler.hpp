@@ -78,6 +78,8 @@ public:
     std::shared_ptr<const TextPromptContext> prompt_context;
     bool cache_prompt{true};
     std::size_t cache_prefix_tokens{0};
+    /// End of the leading system messages (TextModelRunner::SystemPrefixTokens).
+    std::size_t system_prefix_tokens{0};
     bool stop_at_eos{true};
     std::vector<std::string> stop_sequences;
     bool return_progress{false};
@@ -126,6 +128,7 @@ public:
   TextGenerationScheduler& operator=(TextGenerationScheduler&&) = delete;
 
   [[nodiscard]] const TextModelRunner& runner() const noexcept;
+  [[nodiscard]] const TextRunnerPool& runner_pool() const noexcept;
   [[nodiscard]] std::size_t capacity() const noexcept;
   /// Set once a failed work unit finds the runner's device unusable; later
   /// submissions and failures report TextGenerationErrorCode::kDeviceLost.

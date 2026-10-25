@@ -29,6 +29,8 @@ if (ENGINE_ENABLE_HIP)
   add_qwen27b_test(qwen27b_target_test target_test.cpp
     "gpu;hip;target;external-model")
   add_qwen27b_test(qwen_mtp_gpu_test mtp_test.cpp "gpu;hip;mtp;external-model")
+  add_qwen27b_test(qwen27b_snapshot_stream_test snapshot_stream_test.cpp
+    "gpu;hip;cache;external-model")
   add_qwen27b_test(qwen_dflash_gpu_test dflash_test.cpp
     "gpu;hip;dflash;dflash2;external-model")
   add_qwen27b_test(qwen_dflash_noncausal_attention_ops_test attention_test.cpp
@@ -37,6 +39,7 @@ if (ENGINE_ENABLE_HIP)
   add_library(qwen_serving_test_support STATIC
     ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_cache.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_disk_store.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/block_disk_store.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/component_text_cache.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/text_model_runner.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/text_generation_scheduler.cpp
@@ -54,6 +57,7 @@ if (ENGINE_ENABLE_HIP)
   add_qwen27b_test(qwen_vision_prepare_test ../qwen/vision_prepare_test.cpp
     "qwen38-flash-next;gpu;hip;vision;external-model")
   target_link_libraries(qwen_vision_prepare_test PRIVATE hip::host)
+  target_link_options(qwen_vision_prepare_test PRIVATE -Wl,--wrap=hipMemcpyAsync)
   add_test(NAME inference_backend_gpu_test COMMAND inference_backend_gpu_test)
   set_tests_properties(inference_backend_gpu_test PROPERTIES
     LABELS "qwen27b;hip;gpu;server;correctness;external-model"

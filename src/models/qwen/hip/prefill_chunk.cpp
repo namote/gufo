@@ -51,6 +51,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
     std::span<const tokenization::TokenId> prompt_tokens,
     std::uint32_t start_pos, bool compute_logits) {
   CheckReset();
+  arena_.EnsureKvRows(start_pos, start_pos + static_cast<std::uint32_t>(
+                                                 prompt_tokens.size()));
   const auto& config = weights_.config;
   const std::size_t hidden_size = config.hidden_size;
   const std::size_t intermediate_size = config.intermediate_size;
@@ -169,7 +171,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
     }
   };
 
-  // 3. Layer stack
+  // 3. Layer stack. One recurrent pass per chunk.
+  const auto recurrent_state = arena_.BeginRecurrentWrite();
   for (std::uint32_t l = 0; l < config.num_layers; ++l) {
     PrefillLayerCheckpoint(l);
     const auto& layer = weights_.layers[l];
@@ -270,7 +273,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
             arena_.d_attention_kv_f16,
             OffsetIfPresent(
                 static_cast<std::uint16_t*>(arena_.d_attention_kv_f16),
-                total_k),
+                total_k), arena_.GetKvBlockTable(),
             attn_layer_idx, start_pos, batch_size, arena_.GetMaxContext(),
             config.num_attention_heads, config.num_key_value_heads,
             config.head_dim, config.rotary_dim, config.rope_theta, eps,
@@ -313,7 +316,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
           arena_.d_kv_cache, OffsetIfPresent(arena_.d_kv_cache, total_k),
           arena_.d_attention_kv_f16,
           OffsetIfPresent(
-              static_cast<std::uint16_t*>(arena_.d_attention_kv_f16), total_k),
+              static_cast<std::uint16_t*>(arena_.d_attention_kv_f16), total_k), arena_.GetKvBlockTable(),
           arena_.d_ssm_out, attn_layer_idx, start_pos, batch_size,
           arena_.GetMaxContext(), config.num_attention_heads,
           config.num_key_value_heads, config.head_dim, arena_.stream,
@@ -336,7 +339,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                   arena_.d_attention_kv_f16,
                   OffsetIfPresent(
                       static_cast<std::uint16_t*>(arena_.d_attention_kv_f16),
-                      total_k),
+                      total_k), arena_.GetKvBlockTable(),
                   arena_.d_ssm_out, attn_layer_idx, start_pos, batch_size,
                   arena_.GetMaxContext(), config.num_attention_heads,
                   config.num_key_value_heads, config.head_dim, arena_.stream);
@@ -350,7 +353,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                   arena_.d_attention_kv_f16,
                   OffsetIfPresent(
                       static_cast<std::uint16_t*>(arena_.d_attention_kv_f16),
-                      total_k),
+                      total_k), arena_.GetKvBlockTable(),
                   arena_.d_ssm_out, attn_layer_idx, start_pos, batch_size,
                   arena_.GetMaxContext(), config.num_attention_heads,
                   config.num_key_value_heads, config.head_dim, arena_.stream,
@@ -434,9 +437,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       if (ssm_row_split) {
         LaunchBatchedSSMConvRecurrenceRowSplit(
             arena_.d_ssm_qkv, static_cast<const float*>(layer.ssm_conv1d.data),
-            arena_.d_ssm_conv_state, arena_.d_conv_out,
-            arena_.d_ssm_deltanet_state, arena_.d_alpha_buf, arena_.d_beta_buf,
-            static_cast<const float*>(layer.ssm_a.data),
+            recurrent_state, arena_.d_conv_out, arena_.d_alpha_buf,
+            arena_.d_beta_buf, static_cast<const float*>(layer.ssm_a.data),
             static_cast<const float*>(layer.ssm_dt.data),
             static_cast<const float*>(layer.ssm_norm.data), arena_.d_ssm_gate,
             arena_.d_ssm_out,
@@ -450,9 +452,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       } else {
         LaunchBatchedSSMConvRecurrence(
             arena_.d_ssm_qkv, static_cast<const float*>(layer.ssm_conv1d.data),
-            arena_.d_ssm_conv_state, arena_.d_conv_out,
-            arena_.d_ssm_deltanet_state, arena_.d_alpha_buf, arena_.d_beta_buf,
-            static_cast<const float*>(layer.ssm_a.data),
+            recurrent_state, arena_.d_conv_out, arena_.d_alpha_buf,
+            arena_.d_beta_buf, static_cast<const float*>(layer.ssm_a.data),
             static_cast<const float*>(layer.ssm_dt.data),
             static_cast<const float*>(layer.ssm_norm.data), arena_.d_ssm_gate,
             arena_.d_ssm_out, config.SsmLayerIndex(l), batch_size, ssm_qkv_size,

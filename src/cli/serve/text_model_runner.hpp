@@ -16,6 +16,7 @@
 #include <string_view>
 #include <vector>
 
+#include "src/cli/serve/block_disk_store.hpp"
 #include "src/cache/adapter.hpp"
 #include "src/cache/ledger.hpp"
 #include "src/cli/serve/continuation_cache.hpp"
@@ -63,17 +64,64 @@ struct TextRunnerRamCacheOptions {
   /// Explicit limits may exceed that budget up to the model's ceiling, which
   /// keeps kHostSnapshotHeadroomBytes of host RAM free.
   std::size_t capacity_bytes{0};
+  /// Paged attention rows: one device pool of this many bytes shared by all
+  /// sessions, which take blocks as they write. Zero gives each session its
+  /// whole context up front. Runners without row blocks refuse a nonzero
+  /// value at load.
+  std::size_t kv_pool_bytes{0};
+  /// Long prompts also keep a checkpoint every this many tokens, in RAM and
+  /// on disk, so a later prompt that shares a long prefix and then differs
+  /// (a document with another question) restores the last one before the
+  /// difference. Zero: none beyond the defaults.
+  std::size_t checkpoint_grid_tokens{0};
+  /// Long prompts also keep this many RAM checkpoints, one every
+  /// kTailCheckpointTokens over the end of the prompt, so a request that
+  /// shares all but the end of a prompt already prefilled past their
+  /// divergence restores within kTailCheckpointTokens of it instead of the
+  /// nearest evenly spaced checkpoint. Each is a recurrent copy plus block
+  /// references and gives way under RAM pressure. Zero: none. Component
+  /// cache models and runners whose snapshots copy their rows
+  /// (TextRunnerCapabilities::block_sharing_snapshots) do not apply them
+  /// (logged at startup).
+  std::size_t tail_checkpoints{3};
+  static constexpr std::size_t kTailCheckpointTokens = 1024;
+  /// One pass scratch for prompt, verification and batched decode passes,
+  /// shared by every session (passes run one at a time); sessions keep only
+  /// decode-step scratch. Runners without pass scratch ignore it.
+  bool shared_pass_scratch{true};
+  /// A shared prefix must add at least this many tokens to what a request
+  /// can already restore before it waits for a peer prefilling it or a
+  /// checkpoint is captured there for later requests. A checkpoint is a
+  /// recurrent copy plus block references (a few ms); shorter gaps cost less
+  /// to prefill again. The same bound applies to shared prefixes learned
+  /// from the disk store. Must be at least one.
+  std::size_t shared_prefix_min_tokens{128};
 };
 
 struct TextRunnerDiskCacheOptions {
   static constexpr std::size_t kDefaultCapacityBytes =
       std::size_t{8} * 1024U * 1024U * 1024U;
+  static constexpr std::size_t kDefaultBlockCapacityBytes =
+      std::size_t{32} * 1024U * 1024U * 1024U;
   std::filesystem::path directory;
   std::size_t capacity_bytes{kDefaultCapacityBytes};
   /// Zero selects 1/8 of available host RAM, capped at capacity_bytes.
   std::size_t staging_capacity_bytes{0};
-  /// Shared prefixes shorter than this are cheaper to prefill than to restore.
-  std::size_t shared_prefix_min_tokens{128};
+  /// Row blocks of runners that persist rows in blocks, kept apart from the
+  /// records (capacity_bytes) under DIR/blocks.
+  std::size_t block_capacity_bytes{kDefaultBlockCapacityBytes};
+  /// Writes a released frontier's record once it has been idle this many
+  /// milliseconds, instead of only when an eviction needs its seat. Zero:
+  /// only on eviction and at shutdown.
+  std::size_t idle_write_ms{0};
+  /// Index resident row blocks by their block keys (needs the row block
+  /// store and paged rows).
+  bool resident_blocks{true};
+  /// Row blocks a restore reads and checks ahead of the one it uploads,
+  /// each on its own thread and holding one block in host memory. Zero:
+  /// one at a time. At most kMaxReadAheadBlocks.
+  std::size_t read_ahead_blocks{16};
+  static constexpr std::size_t kMaxReadAheadBlocks = 64;
   /// Bound on shared-prefix snapshots written while prefilling one request.
   std::size_t shared_prefix_max_boundaries{4};
   /// Minimum token advance before a checkpoint is worth persisting.
@@ -91,6 +139,13 @@ struct TextRunnerDiskCacheOptions {
 /// Nullopt when MemAvailable is missing.
 [[nodiscard]] std::optional<std::uint64_t> MeminfoAvailableBytes(
     std::string_view meminfo);
+/// `host_available` bounded by every cgroup v2 memory limit from the process's
+/// cgroup (named in `membership_text`, the /proc/self/cgroup contents) up to
+/// `root`. Inactive file pages in memory.stat are reclaimable page cache and
+/// are not counted as used; without that line, memory.current is used as is.
+[[nodiscard]] std::uint64_t CgroupAvailableBytes(
+    const std::filesystem::path& root, std::string_view membership_text,
+    std::uint64_t host_available);
 /// Automatic snapshot budget: half the host RAM available after loading
 /// (excluding free CMA pages), after cgroup limits.
 [[nodiscard]] std::size_t HostSnapshotBudgetBytes();
@@ -128,6 +183,10 @@ struct TextRunnerCapabilities {
   /// A completed prefill step leaves a consistent state, so a cancelled
   /// request can keep it as a live prefix for a superseding request.
   bool partial_prefill_retention{false};
+  /// Snapshots reference the state's row blocks instead of copying the
+  /// rows, so a checkpoint costs only the state outside them (tail
+  /// checkpoints are applied only then).
+  bool block_sharing_snapshots{false};
 };
 
 /// Model-owned compatibility identity for restart-safe snapshots.
@@ -149,6 +208,18 @@ struct TextRunnerDescriptor {
   std::uint32_t max_context{0};
   TextRunnerCapabilities capabilities;
   std::optional<TextRunnerPersistenceDescriptor> persistence;
+  /// Longest prompt pass one Prefill call runs; a longer budget is cut to
+  /// it. Zero: no fixed limit.
+  std::uint32_t max_prefill_pass_tokens{0};
+};
+
+/// Bytes of one checkpoint taken at the runner's maximum context.
+struct TextRunnerCheckpointBound {
+  /// SnapshotPayloadBytes() of a state at max_context (retained GPU snapshot,
+  /// budgeted by --cache-ram-bytes: device memory on unified-memory APUs).
+  std::size_t ram_snapshot_bytes{0};
+  /// PersistentSnapshotPayloadBytes() of that snapshot (disk tier).
+  std::size_t persistent_payload_bytes{0};
 };
 
 /// Optional byte claims made before state allocation.
@@ -274,10 +345,11 @@ public:
   [[nodiscard]] virtual std::vector<TextExecutionPlan> SupportedPlans()
       const = 0;
 
-  /// Lazily built only for constrained requests; normal text loads pay nothing.
+  /// Prepared before serving and shared by all constrained requests.
+  /// A null vocabulary means the runner does not support structured output.
   [[nodiscard]] virtual std::shared_ptr<const sampling::ConstraintVocabulary>
   BuildConstraintVocabulary() const {
-    throw std::invalid_argument("model does not support structured output");
+    return nullptr;
   }
   [[nodiscard]] virtual sampling::JsonConstraint::ToolFormat ToolFormat()
       const {
@@ -286,11 +358,48 @@ public:
   /// Reuse a compiled grammar bound to this runner's vocabulary.
   [[nodiscard]] std::shared_ptr<const sampling::TokenConstraint> BindConstraint(
       std::shared_ptr<const sampling::JsonConstraint> grammar) const;
+  /// Builds the vocabulary BindConstraint uses now rather than in the first
+  /// constrained request; later calls reuse it. Returns its token count.
+  /// Returns zero when the runner has no structured output. Build failures
+  /// propagate to the caller.
+  std::size_t PrepareConstraintVocabulary() const;
+
+  /// Reasoning tags for a token budget, as llama.cpp's chat format for the
+  /// model defines them: `forced_end` is emitted once the budget is spent and
+  /// any of `ends` closes reasoning early.
+  struct ReasoningTags {
+    std::string_view start;
+    std::string_view forced_end;
+    std::vector<std::string_view> ends;
+  };
+  [[nodiscard]] virtual ReasoningTags ReasoningBudgetTags() const {
+    return {"<think>", "</think>", {"</think>"}};
+  }
+  /// Zero when the vocabulary cannot be enumerated.
+  [[nodiscard]] virtual std::uint32_t VocabularySize() const { return 0; }
+  /// A budget for a prompt that opens reasoning, or null when the tags are not
+  /// single tokens in this vocabulary.
+  [[nodiscard]] std::shared_ptr<const sampling::ReasoningBudget>
+  BuildReasoningBudget(std::size_t tokens,
+                       std::span<const TextRunnerToken> prompt) const;
 
   [[nodiscard]] virtual std::vector<TextRunnerToken> Tokenize(
       std::string_view text) const = 0;
+  /// Tokenizes control text such as `</think>` as the template renders it.
+  [[nodiscard]] virtual std::vector<TextRunnerToken> TokenizeControl(
+      std::string_view text) const {
+    return Tokenize(text);
+  }
   [[nodiscard]] virtual std::optional<std::vector<TextRunnerToken>>
   RenderAndTokenize(const ChatRequest& request) const = 0;
+  /// Where conversations under the same leading system messages diverge in
+  /// `tokens` (the prepared prompt of `request`): the first token that a
+  /// probe with those system messages and an empty user turn renders
+  /// differently. Zero without leading system messages, with nothing after
+  /// them, or with images in them.
+  [[nodiscard]] std::size_t SystemPrefixTokens(
+      const ChatRequest& request, std::span<const TextRunnerToken> tokens) const;
+
   [[nodiscard]] virtual std::optional<TextPreparedPrompt> PreparePrompt(
       const ChatRequest& request) const {
     for (const auto& message : request.messages) {
@@ -451,6 +560,14 @@ public:
   [[nodiscard]] virtual std::size_t PersistentSnapshotPayloadBytes(
       const TextRunnerSnapshot& snapshot) const;
 
+  /// Checkpoint sizes at max_context, known before any state exists. The pool
+  /// refuses disk budgets that cannot hold one such checkpoint and reports a
+  /// smaller retained snapshot budget.
+  /// Missing means the runner cannot bound its checkpoints; the pool records
+  /// that the floor was not checked.
+  [[nodiscard]] virtual std::optional<TextRunnerCheckpointBound>
+  MaxContextCheckpointBytes() const;
+
   /// Serializes one immutable snapshot into exactly-sized common-store staging.
   ///
   /// Returns the number of initialized bytes. It must equal
@@ -469,12 +586,129 @@ public:
   virtual void RestorePersistentSnapshot(
       TextRunnerState& state, std::span<const std::uint8_t> payload) const;
 
+  /// Persists a live state in place, without a snapshot copy. The result
+  /// holds what is small (logits, draft state) and streams the rest from the
+  /// state, which must not change until `stream` returns. The bytes equal
+  /// SerializePersistentSnapshot(Snapshot(state)). Missing: the runner keeps
+  /// no exact boundary in place, so callers take a snapshot instead.
+  struct PersistentStateWriter {
+    std::size_t payload_bytes{0};
+    std::function<void(const SnapshotSink&)> stream;
+    /// Full row blocks the payload leaves out (PersistentRowBlockBytes), and
+    /// how to stream block i of them from the state in place.
+    std::size_t row_blocks{0};
+    std::function<void(std::size_t, const SnapshotSink&)> stream_row_block;
+  };
+  [[nodiscard]] virtual std::optional<PersistentStateWriter>
+  PreparePersistentState(const TextRunnerState&) const {
+    return std::nullopt;
+  }
+  /// True when PreparePersistentState supports every state of this runner.
+  [[nodiscard]] virtual bool PersistsStateInPlace() const { return false; }
+
+  /// Paged model rows: states take fixed-size blocks of rows from one pool
+  /// shared by all states as they write, instead of a whole context each.
+  /// All zero for a runner whose states preallocate their context.
+  struct RowBlockPool {
+    std::size_t total_blocks{0};
+    std::size_t free_blocks{0};
+    std::size_t block_rows{0};
+  };
+  [[nodiscard]] virtual RowBlockPool RowBlocks() const { return {}; }
+  /// Holds back the blocks `state` needs to write rows up to `rows` beyond
+  /// those it holds, plus copy-on-write room for shared blocks. False, with
+  /// nothing held, when the pool lacks them.
+  [[nodiscard]] virtual bool ReserveRowBlocks(TextRunnerState&,
+                                              std::size_t) const {
+    return true;
+  }
+  /// Returns what ReserveRowBlocks held back and the state has not used.
+  virtual void ReleaseRowBlocks(TextRunnerState&) const noexcept {}
+  /// Blocks one admission may take beyond its rows: copy-on-write of shared
+  /// partial blocks across its captures and restores.
+  static constexpr std::size_t kRowBlockCopyMargin = 8;
+
+  /// Fills the whole span with the next payload bytes. Throws on read errors.
+  using SnapshotSource = std::function<void(std::span<std::uint8_t>)>;
+  /// RestorePersistentSnapshot from a stream of exactly `payload_bytes`.
+  /// The caller verifies the stream's checksum afterwards and invalidates the
+  /// state on a mismatch. The default reads the whole payload first;
+  /// device-backed providers override it to avoid that host copy.
+  virtual void RestorePersistentSnapshotStream(
+      TextRunnerState& state, std::size_t payload_bytes,
+      const SnapshotSource& source) const;
+
+  /// Rows persisted in blocks: a runner whose persistent payload leaves its
+  /// full row blocks out has the store keep each block as a separate,
+  /// content-addressed file shared by every record with the same prefix.
+  /// Bytes of one block's rows and tokens per block; zero when the payload
+  /// holds every row.
+  [[nodiscard]] virtual std::size_t PersistentRowBlockBytes() const {
+    return 0;
+  }
+  [[nodiscard]] virtual std::size_t PersistentRowBlockRows() const {
+    return 0;
+  }
+  /// Full blocks the persistent form of `snapshot` leaves out.
+  [[nodiscard]] virtual std::size_t PersistentRowBlocks(
+      const TextRunnerSnapshot&) const {
+    return 0;
+  }
+  virtual void StreamPersistentRowBlock(const TextRunnerSnapshot& snapshot,
+                                        std::size_t block,
+                                        const SnapshotSink& sink) const;
+  /// Full blocks a state restored by RestorePersistentSnapshotStream still
+  /// needs; RestorePersistentRowBlock fills them in order.
+  [[nodiscard]] virtual std::size_t RestoredRowBlocks(
+      const TextRunnerState&) const {
+    return 0;
+  }
+  /// Full blocks of a released state, streamed in place (block i of
+  /// StateRowBlocks), so they reach disk before the state's record does.
+  [[nodiscard]] virtual std::size_t StateRowBlocks(
+      const TextRunnerState&) const {
+    return 0;
+  }
+  virtual void StreamStateRowBlock(const TextRunnerState& state,
+                                   std::size_t block,
+                                   const SnapshotSink& sink) const;
+  virtual void RestorePersistentRowBlock(TextRunnerState& state,
+                                         std::size_t block,
+                                         const SnapshotSource& source) const;
+
+  /// Paged rows by pool block, for the resident block index: the pool block
+  /// holding full block `block` of a state or snapshot. Nullopt when rows
+  /// are not paged.
+  [[nodiscard]] virtual std::optional<std::uint32_t> StateRowBlockId(
+      const TextRunnerState&, std::size_t) const {
+    return std::nullopt;
+  }
+  [[nodiscard]] virtual std::optional<std::uint32_t> SnapshotRowBlockId(
+      const TextRunnerSnapshot&, std::size_t) const {
+    return std::nullopt;
+  }
+  /// Points full block `block` of an idle `state` at pool block `id`, which
+  /// holds the same rows (equal chain keys), taking one reference to it and
+  /// dropping the block the state held.
+  virtual void ShareRowBlock(TextRunnerState&, std::size_t,
+                             std::uint32_t) const {
+    throw std::logic_error("text runner rows are not paged");
+  }
+  virtual void RetainRowBlock(std::uint32_t) const {
+    throw std::logic_error("text runner rows are not paged");
+  }
+  virtual void ReleaseRowBlock(std::uint32_t) const noexcept {}
+  [[nodiscard]] virtual std::size_t RowBlockReferences(std::uint32_t) const {
+    return 0;
+  }
+
 private:
   mutable std::mutex constraint_mutex_;
   mutable std::shared_ptr<const sampling::ConstraintVocabulary>
       constraint_vocabulary_;
   mutable std::vector<std::shared_ptr<const sampling::TokenConstraint>>
       constraints_;
+  mutable std::shared_ptr<const std::vector<bool>> partial_utf8_;
 };
 
 /// Bounded pool of opaque runner states with exact-prefix continuation reuse.
@@ -535,10 +769,11 @@ public:
     /// A planned checkpoint this close to the shared position is cheaper to
     /// use than capturing another one: followers prefill the gap themselves.
     static constexpr std::size_t kSharedCheckpointSlack = 64;
-    /// A shared prefix must add at least this many tokens to what a request
-    /// can already restore before it waits for a peer or captures an extra
-    /// checkpoint for later requests. Shorter gaps cost less to prefill again.
-    static constexpr std::size_t kSharedPrefixMinTokens = 512;
+
+    /// Holds the row blocks this request can write: its prompt and up to
+    /// `max_new_tokens` more, capped at the context. Throws
+    /// std::length_error when the row pool lacks them.
+    void ReserveRows(std::size_t max_new_tokens);
 
     void PrepareBatchExecution();
     [[nodiscard]] TextPrefillStep Prefill(std::size_t max_input_tokens);
@@ -586,6 +821,25 @@ public:
 
   [[nodiscard]] const TextModelRunner& runner() const noexcept;
   [[nodiscard]] std::size_t capacity() const noexcept;
+  /// TextRunnerRamCacheOptions::shared_prefix_min_tokens.
+  [[nodiscard]] std::size_t shared_prefix_min_tokens() const noexcept;
+  /// False while admitting `prompt` would overwrite another conversation's
+  /// frontier that is not on disk yet. That frontier is then being written
+  /// in place; the caller keeps the request queued and retries, so active
+  /// requests are not blocked by the write.
+  /// With paged rows, also false while the row pool cannot hold `prompt`
+  /// and `max_new_tokens`, after dropping retained rows not needed for it.
+  /// A request that does not reuse cached prompt state (`reuse_prompt`
+  /// false) is charged for every block and keeps no retained prefix.
+  [[nodiscard]] bool AdmissionReady(std::span<const TextRunnerToken> prompt,
+                                    std::size_t max_new_tokens = 0,
+                                    bool reuse_prompt = true) const;
+  /// The resident row block index; nullopt when there is none (no row
+  /// block store or no paged rows).
+  [[nodiscard]] std::optional<ResidentBlockIndex::Stats> ResidentBlockStats()
+      const;
+  /// Blocks the worst admission of `rows` can take; zero without paging.
+  [[nodiscard]] std::size_t AdmissionRowBlocks(std::size_t rows) const;
   [[nodiscard]] TextExecutionPlan SelectDecodePlan(
       std::size_t ready_requests) const;
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
@@ -599,7 +853,7 @@ public:
       const CancellationCheck& is_cancelled = {},
       std::shared_ptr<const TextPromptContext> context = {},
       bool reuse_prompt = true, std::size_t cache_prefix_tokens = 0,
-      bool stop_at_eos = true);
+      bool stop_at_eos = true, std::size_t system_prefix_tokens = 0);
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
   /// Longest RAM-retained prefix of prompt that Acquire could reuse, without

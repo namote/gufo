@@ -15,8 +15,10 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <future>
 #include <iomanip>
 #include <limits>
+#include <new>
 #include <list>
 #include <map>
 #include <mutex>
@@ -31,9 +33,12 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <tuple>
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/block_disk_store.hpp"
+#include "src/cli/serve/logging.hpp"
 #include "src/core/crypto/sha256.hpp"
 
 namespace gufo::server {
@@ -89,6 +94,9 @@ constexpr std::size_t kHeaderBytes = kChecksumOffset + kChecksumBytes;
 constexpr std::size_t kMaxIdentityBytes = std::size_t{64} * 1024U;
 constexpr std::size_t kMaxTokenCount = std::size_t{16} * 1024U * 1024U;
 constexpr std::string_view kFileSuffix = ".kvc";
+// A boundary other conversations restore (shared prefix, system prompt): a
+// deeper boundary of one conversation does not replace it.
+constexpr std::string_view kSharedFileSuffix = ".shared.kvc";
 constexpr std::string_view kTemporaryPrefix = ".tmp-";
 
 class ScopedFileDescriptor {
@@ -347,78 +355,141 @@ struct ParsedImage {
   std::size_t payload_bytes{0};
 };
 
-ParseFailure ParseAndVerifyImage(std::vector<std::uint8_t>* image,
-                                 ParsedImage* parsed) {
-  if (image == nullptr || parsed == nullptr || image->size() < kHeaderBytes ||
-      !std::equal(kMagic.begin(), kMagic.end(),
-                  image->begin() + kMagicOffset)) {
-    return ParseFailure::kCorrupt;
-  }
+// Reads one image in file order: the header, identity and tokens whole, then
+// the payload in caller-sized pieces. Every byte enters the checksum, with the
+// stored checksum field as zeros, so nothing is held at full payload size.
+class ImageReader {
+public:
+  ImageReader(int file, std::size_t file_bytes)
+      : file_(file), file_bytes_(file_bytes) {}
 
-  std::uint32_t file_version = 0;
-  std::uint32_t payload_version = 0;
-  std::uint32_t identity_bytes_u32 = 0;
-  std::uint32_t token_count_u32 = 0;
-  std::uint64_t payload_bytes_u64 = 0;
-  const std::span<const std::uint8_t> readonly(*image);
-  if (!GetLittleEndian(readonly, kFileVersionOffset, &file_version) ||
-      !GetLittleEndian(readonly, kPayloadVersionOffset, &payload_version) ||
-      !GetLittleEndian(readonly, kIdentityBytesOffset, &identity_bytes_u32) ||
-      !GetLittleEndian(readonly, kTokenCountOffset, &token_count_u32) ||
-      !GetLittleEndian(readonly, kPayloadBytesOffset, &payload_bytes_u64) ||
-      file_version != kFileVersion || payload_version == 0 ||
-      identity_bytes_u32 == 0 || identity_bytes_u32 > kMaxIdentityBytes ||
-      token_count_u32 == 0 || token_count_u32 > kMaxTokenCount ||
-      payload_bytes_u64 == 0 ||
-      payload_bytes_u64 >
-          static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-    return ParseFailure::kCorrupt;
-  }
-
-  const std::size_t identity_bytes = identity_bytes_u32;
-  const std::size_t token_count = token_count_u32;
-  const std::size_t payload_bytes = static_cast<std::size_t>(payload_bytes_u64);
-  std::size_t expected_bytes = 0;
-  try {
-    expected_bytes =
-        CheckedFileBytes(identity_bytes, token_count, payload_bytes);
-  } catch (...) {
-    return ParseFailure::kCorrupt;
-  }
-  if (expected_bytes != image->size()) {
-    return ParseFailure::kCorrupt;
-  }
-
-  const std::string stored_checksum(
-      reinterpret_cast<const char*>(image->data() + kChecksumOffset),
-      kChecksumBytes);
-  if (!IsLowerHexDigest(stored_checksum)) {
-    return ParseFailure::kCorrupt;
-  }
-  std::fill_n(image->begin() + kChecksumOffset, kChecksumBytes, 0);
-  const std::string computed_checksum = crypto::Sha256Hex(*image);
-  std::copy(stored_checksum.begin(), stored_checksum.end(),
-            image->begin() + kChecksumOffset);
-  if (computed_checksum != stored_checksum) {
-    return ParseFailure::kChecksum;
-  }
-
-  parsed->persistence.payload_version = payload_version;
-  parsed->persistence.compatibility_identity.resize(identity_bytes);
-  std::memcpy(parsed->persistence.compatibility_identity.data(),
-              image->data() + kHeaderBytes, identity_bytes);
-  parsed->tokens.resize(token_count);
-  std::size_t token_offset = kHeaderBytes + identity_bytes;
-  for (TextRunnerToken& token : parsed->tokens) {
-    if (!GetLittleEndian(readonly, token_offset, &token)) {
+  [[nodiscard]] ParseFailure ReadMetadata(ParsedImage* parsed) {
+    std::vector<std::uint8_t> header(kHeaderBytes);
+    if (file_bytes_ < kHeaderBytes || !ReadAll(file_, header))
+      return ParseFailure::kCorrupt;
+    if (!std::equal(kMagic.begin(), kMagic.end(),
+                    header.begin() + kMagicOffset))
+      return ParseFailure::kCorrupt;
+    std::uint32_t file_version = 0;
+    std::uint32_t payload_version = 0;
+    std::uint32_t identity_bytes_u32 = 0;
+    std::uint32_t token_count_u32 = 0;
+    std::uint64_t payload_bytes_u64 = 0;
+    const std::span<const std::uint8_t> readonly(header);
+    if (!GetLittleEndian(readonly, kFileVersionOffset, &file_version) ||
+        !GetLittleEndian(readonly, kPayloadVersionOffset, &payload_version) ||
+        !GetLittleEndian(readonly, kIdentityBytesOffset,
+                         &identity_bytes_u32) ||
+        !GetLittleEndian(readonly, kTokenCountOffset, &token_count_u32) ||
+        !GetLittleEndian(readonly, kPayloadBytesOffset, &payload_bytes_u64) ||
+        file_version != kFileVersion || payload_version == 0 ||
+        identity_bytes_u32 == 0 || identity_bytes_u32 > kMaxIdentityBytes ||
+        token_count_u32 == 0 || token_count_u32 > kMaxTokenCount ||
+        payload_bytes_u64 == 0 ||
+        payload_bytes_u64 > static_cast<std::uint64_t>(
+                                std::numeric_limits<std::size_t>::max())) {
       return ParseFailure::kCorrupt;
     }
-    token_offset += sizeof(std::uint32_t);
+    const std::size_t identity_bytes = identity_bytes_u32;
+    const std::size_t token_count = token_count_u32;
+    const std::size_t payload_bytes =
+        static_cast<std::size_t>(payload_bytes_u64);
+    std::size_t expected_bytes = 0;
+    try {
+      expected_bytes =
+          CheckedFileBytes(identity_bytes, token_count, payload_bytes);
+    } catch (...) {
+      return ParseFailure::kCorrupt;
+    }
+    if (expected_bytes != file_bytes_)
+      return ParseFailure::kCorrupt;
+    stored_checksum_.assign(
+        reinterpret_cast<const char*>(header.data() + kChecksumOffset),
+        kChecksumBytes);
+    if (!IsLowerHexDigest(stored_checksum_))
+      return ParseFailure::kCorrupt;
+    std::fill_n(header.begin() + kChecksumOffset, kChecksumBytes, 0);
+    hasher_.Update(header);
+
+    std::vector<std::uint8_t> metadata(identity_bytes +
+                                       token_count * sizeof(std::uint32_t));
+    if (!ReadAll(file_, metadata))
+      return ParseFailure::kCorrupt;
+    hasher_.Update(metadata);
+    parsed->persistence.payload_version = payload_version;
+    parsed->persistence.compatibility_identity.assign(
+        metadata.begin(), metadata.begin() + identity_bytes);
+    parsed->tokens.resize(token_count);
+    const std::span<const std::uint8_t> tokens(metadata);
+    std::size_t token_offset = identity_bytes;
+    for (TextRunnerToken& token : parsed->tokens) {
+      if (!GetLittleEndian(tokens, token_offset, &token))
+        return ParseFailure::kCorrupt;
+      token_offset += sizeof(std::uint32_t);
+    }
+    parsed->payload_offset = kHeaderBytes + metadata.size();
+    parsed->payload_bytes = payload_bytes;
+    payload_left_ = payload_bytes;
+    return ParseFailure::kNone;
   }
-  parsed->payload_offset = token_offset;
-  parsed->payload_bytes = payload_bytes;
-  return ParseFailure::kNone;
-}
+
+  // Throws on a short or failed read; failure() then says which.
+  void ReadPayload(std::span<std::uint8_t> bytes) {
+    if (bytes.size() > payload_left_) {
+      failure_ = ContinuationDiskEventReason::kCorrupt;
+      throw std::runtime_error("continuation image payload overrun");
+    }
+    if (!ReadAll(file_, bytes)) {
+      failure_ = ContinuationDiskEventReason::kIoFailure;
+      throw std::runtime_error("continuation image read failed");
+    }
+    hasher_.Update(bytes);
+    payload_left_ -= bytes.size();
+  }
+
+  // Consumes any unread payload (verification only), rejects trailing bytes
+  // and compares the checksum.
+  [[nodiscard]] ParseFailure Finish() {
+    std::vector<std::uint8_t> chunk(
+        std::min<std::size_t>(payload_left_, std::size_t{1} << 20));
+    while (payload_left_ != 0) {
+      const auto piece = std::span(chunk).first(
+          std::min(chunk.size(), payload_left_));
+      try {
+        ReadPayload(piece);
+      } catch (...) {
+        return ParseFailure::kCorrupt;
+      }
+    }
+    std::uint8_t trailing = 0;
+    while (true) {
+      const ssize_t count = ::read(file_, &trailing, 1);
+      if (count < 0 && errno == EINTR)
+        continue;
+      if (count != 0) {
+        failure_ = count < 0 ? ContinuationDiskEventReason::kIoFailure
+                             : ContinuationDiskEventReason::kCorrupt;
+        return ParseFailure::kCorrupt;
+      }
+      break;
+    }
+    return hasher_.FinishHex() == stored_checksum_ ? ParseFailure::kNone
+                                                    : ParseFailure::kChecksum;
+  }
+
+  [[nodiscard]] std::optional<ContinuationDiskEventReason> failure()
+      const noexcept {
+    return failure_;
+  }
+
+private:
+  int file_;
+  std::size_t file_bytes_;
+  std::size_t payload_left_{0};
+  std::string stored_checksum_;
+  crypto::Sha256Hasher hasher_;
+  std::optional<ContinuationDiskEventReason> failure_;
+};
 
 std::vector<std::uint8_t> BuildHeader(
     const TextRunnerPersistenceDescriptor& persistence,
@@ -449,6 +520,13 @@ std::vector<std::uint8_t> BuildHeader(
   return image;
 }
 
+// A restore could not get the threads or host memory to read its blocks;
+// the record itself is intact and stays.
+class RestoreResourcesUnavailable : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
 }  // namespace
 
 struct ContinuationDiskStore::Impl {
@@ -460,6 +538,7 @@ struct ContinuationDiskStore::Impl {
     std::size_t file_bytes{0};
     std::size_t payload_bytes{0};
     std::filesystem::file_time_type last_access;
+    bool shared_prefix{false};
   };
 
   using EntryIterator = std::list<Entry>::iterator;
@@ -578,6 +657,27 @@ struct ContinuationDiskStore::Impl {
         key_hash(std::move(hasher)) {
     ValidateOptions();
     InitializeDirectory();
+    if (options.row_block_bytes != 0) {
+      if (options.block_capacity_bytes == 0)
+        throw std::invalid_argument(
+            "the runner persists rows in blocks: set --cache-disk-block-bytes");
+      blocks = std::make_unique<BlockDiskStore>(BlockDiskStore::Options{
+          .directory = options.directory / "blocks",
+          .capacity_bytes = options.block_capacity_bytes,
+          .block_bytes = options.row_block_bytes,
+      });
+      const auto stats = blocks->Stats();
+      Logger::Info("cache", "event=row_block_store capacity_bytes=" +
+                                std::to_string(options.block_capacity_bytes) +
+                                " block_bytes=" +
+                                std::to_string(options.row_block_bytes) +
+                                " stored_blocks=" +
+                                std::to_string(stats.stored_blocks) +
+                                " stored_bytes=" +
+                                std::to_string(stats.stored_bytes) +
+                                " corrupt_removed=" +
+                                std::to_string(stats.corrupt_blocks));
+    }
     IndexExistingFiles();
     EvictToCapacity();
     writer = std::thread([this] { PersistQueued(); });
@@ -638,6 +738,13 @@ struct ContinuationDiskStore::Impl {
     }
     if (options.capacity_bytes == 0) {
       throw std::invalid_argument("continuation disk capacity must be nonzero");
+    }
+    if (options.read_ahead_blocks >
+        TextRunnerDiskCacheOptions::kMaxReadAheadBlocks) {
+      throw std::invalid_argument(
+          "row block read-ahead must be at most " +
+          std::to_string(TextRunnerDiskCacheOptions::kMaxReadAheadBlocks) +
+          " blocks");
     }
     if (options.staging_capacity_bytes == 0) {
       // The host snapshot budget already leaves half of available RAM free.
@@ -774,56 +881,38 @@ struct ContinuationDiskStore::Impl {
            (status->st_mode & S_IRUSR) != 0;
   }
 
-  [[nodiscard]] bool ReadImage(std::string_view filename,
-                               std::vector<std::uint8_t>* image,
-                               ContinuationDiskEventReason* failure_reason,
-                               std::size_t* file_bytes = nullptr) const {
-    if (image == nullptr || failure_reason == nullptr) {
-      return false;
-    }
+  // Opens an image for ImageReader; the caller reads it in order.
+  [[nodiscard]] ScopedFileDescriptor OpenImage(
+      std::string_view filename, ContinuationDiskEventReason* failure_reason,
+      std::size_t* file_bytes) const {
     struct stat status{};
     if (!SafeRegularFile(filename, &status)) {
       *failure_reason = ContinuationDiskEventReason::kUnsafeFile;
-      return false;
+      return ScopedFileDescriptor(-1);
     }
-    if (file_bytes != nullptr && status.st_size > 0)
+    if (status.st_size > 0)
       *file_bytes = static_cast<std::size_t>(status.st_size);
     if (status.st_size <= 0 ||
         static_cast<std::uint64_t>(status.st_size) >
             static_cast<std::uint64_t>(options.staging_capacity_bytes)) {
+      // Kept for retention accounting: a smaller staging budget must not
+      // destroy files a larger one wrote.
       *failure_reason = status.st_size > 0
                             ? ContinuationDiskEventReason::kStagingCapacity
                             : ContinuationDiskEventReason::kCorrupt;
-      return false;
+      return ScopedFileDescriptor(-1);
     }
-    const ScopedFileDescriptor file(
+    ScopedFileDescriptor file(
         ::openat(directory_fd, std::string(filename).c_str(),
                  O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
-    if (!file) {
+    if (!file)
       *failure_reason = ContinuationDiskEventReason::kIoFailure;
-      return false;
-    }
-    image->resize(static_cast<std::size_t>(status.st_size));
-    if (!ReadAll(file.get(), *image)) {
-      *failure_reason = ContinuationDiskEventReason::kIoFailure;
-      return false;
-    }
-    std::uint8_t trailing = 0;
-    while (true) {
-      const ssize_t count = ::read(file.get(), &trailing, 1);
-      if (count < 0 && errno == EINTR) {
-        continue;
-      }
-      if (count != 0) {
-        *failure_reason = count < 0 ? ContinuationDiskEventReason::kIoFailure
-                                    : ContinuationDiskEventReason::kCorrupt;
-        return false;
-      }
-      break;
-    }
-    // Restore uses the in-memory copy; drop the page-cache one.
-    (void)::posix_fadvise(file.get(), 0, 0, POSIX_FADV_DONTNEED);
-    return true;
+    return file;
+  }
+
+  // Multi-GB images must not accumulate in the page cache after a read.
+  static void DropPageCache(int file) noexcept {
+    (void)::posix_fadvise(file, 0, 0, POSIX_FADV_DONTNEED);
   }
 
   void RemoveFileOnly(std::string_view filename) const noexcept {
@@ -856,12 +945,12 @@ struct ContinuationDiskStore::Impl {
         continue;
       }
 
-      std::vector<std::uint8_t> image;
       ContinuationDiskEventReason failure_reason =
           ContinuationDiskEventReason::kCorrupt;
       ParsedImage parsed;
       std::size_t file_bytes = 0;
-      if (!ReadImage(filename, &image, &failure_reason, &file_bytes)) {
+      const auto file = OpenImage(filename, &failure_reason, &file_bytes);
+      if (!file) {
         if (failure_reason == ContinuationDiskEventReason::kStagingCapacity) {
           // A smaller RAM budget must not destroy a previously valid cache.
           // Account the file for LRU/retention, but never index unverified
@@ -887,14 +976,19 @@ struct ContinuationDiskStore::Impl {
         Emit(ContinuationDiskEventAction::kRemoved, failure_reason, 0, 0, 0);
         continue;
       }
-      const ParseFailure parse_failure = ParseAndVerifyImage(&image, &parsed);
+      // Verify the whole image in bounded pieces before indexing it.
+      ImageReader reader(file.get(), file_bytes);
+      ParseFailure parse_failure = reader.ReadMetadata(&parsed);
+      if (parse_failure == ParseFailure::kNone)
+        parse_failure = reader.Finish();
+      DropPageCache(file.get());
       if (parse_failure != ParseFailure::kNone) {
         RemoveFileOnly(filename);
         Emit(ContinuationDiskEventAction::kRemoved,
              parse_failure == ParseFailure::kChecksum
                  ? ContinuationDiskEventReason::kChecksumMismatch
                  : ContinuationDiskEventReason::kCorrupt,
-             image.size(), 0, 0);
+             file_bytes, 0, 0);
         continue;
       }
 
@@ -911,7 +1005,7 @@ struct ContinuationDiskStore::Impl {
         if (duplicate->last_access >= last_access) {
           RemoveFileOnly(filename);
           Emit(ContinuationDiskEventAction::kRemoved,
-               ContinuationDiskEventReason::kExactReplacement, image.size(),
+               ContinuationDiskEventReason::kExactReplacement, file_bytes,
                parsed.payload_bytes, parsed.tokens.size());
           continue;
         }
@@ -922,9 +1016,10 @@ struct ContinuationDiskStore::Impl {
           .key_hash = digest,
           .persistence = std::move(parsed.persistence),
           .tokens = std::move(parsed.tokens),
-          .file_bytes = image.size(),
+          .file_bytes = file_bytes,
           .payload_bytes = parsed.payload_bytes,
           .last_access = last_access,
+          .shared_prefix = HasSuffix(filename, kSharedFileSuffix),
       });
       const EntryIterator added = std::prev(entries.end());
       index.emplace(added->key_hash, added);
@@ -1038,10 +1133,12 @@ struct ContinuationDiskStore::Impl {
     return output.str();
   }
 
-  [[nodiscard]] std::string NewFinalFilename(const std::string& digest) {
+  [[nodiscard]] std::string NewFinalFilename(const std::string& digest,
+                                             bool shared_prefix) {
     for (int attempt = 0; attempt < 64; ++attempt) {
       const std::string filename =
-          digest + "-" + UniqueSuffix() + std::string(kFileSuffix);
+          digest + "-" + UniqueSuffix() +
+          std::string(shared_prefix ? kSharedFileSuffix : kFileSuffix);
       struct stat status{};
       if (::fstatat(directory_fd, filename.c_str(), &status,
                     AT_SYMLINK_NOFOLLOW) != 0 &&
@@ -1052,10 +1149,12 @@ struct ContinuationDiskStore::Impl {
     throw std::runtime_error("failed to allocate a continuation disk filename");
   }
 
+  using PayloadStream =
+      std::function<void(const TextModelRunner::SnapshotSink&)>;
+
   [[nodiscard]] bool PublishImage(std::string_view final_filename,
                                   std::span<const std::uint8_t> header,
-                                  const TextModelRunner& runner,
-                                  const TextRunnerSnapshot& snapshot,
+                                  const PayloadStream& stream,
                                   std::size_t payload_bytes) {
     // Save serializes publishers in this instance with write_mutex, and
     // startup indexing completes before its worker starts. Thus no two lock
@@ -1089,7 +1188,7 @@ struct ContinuationDiskStore::Impl {
         }
       };
       sink(header);
-      runner.StreamPersistentSnapshot(snapshot, [&](auto bytes) {
+      stream([&](auto bytes) {
         if (bytes.size() > payload_bytes - written) {
           throw std::runtime_error("snapshot serialization overflow");
         }
@@ -1136,12 +1235,305 @@ struct ContinuationDiskStore::Impl {
     return true;
   }
 
+
+  // Row blocks: a record's full blocks live in `blocks`, keyed by a chain
+  // from the record's own compatibility identity (which includes its input
+  // identity), so a save and a restore of the same prefix name the same keys
+  // and records sharing a prefix share its blocks.
+  [[nodiscard]] static BlockKey RowBlockRoot(
+      const TextRunnerPersistenceDescriptor& persistence) {
+    std::string identity(persistence.compatibility_identity.begin(),
+                         persistence.compatibility_identity.end());
+    identity += "|payload_version=" +
+                std::to_string(persistence.payload_version);
+    return ChainRootKey(identity);
+  }
+
+  [[nodiscard]] static std::vector<std::uint32_t> BlockTokens(
+      std::span<const TextRunnerToken> tokens, std::size_t block,
+      std::size_t rows) {
+    const auto block_tokens = tokens.subspan(block * rows, rows);
+    return {block_tokens.begin(), block_tokens.end()};
+  }
+
+  // Writes the record's full blocks that are not stored yet, then makes
+  // them durable by name before the record that references them is.
+  void WriteRowBlocks(
+      const TextModelRunner& runner,
+      const TextRunnerPersistenceDescriptor& persistence,
+      std::span<const TextRunnerToken> tokens, std::size_t count,
+      const std::function<void(std::size_t,
+                               const TextModelRunner::SnapshotSink&)>& produce,
+      const std::function<bool()>& cancelled,
+      const std::function<std::optional<std::uint32_t>(std::size_t)>&
+          block_id = {},
+      const std::function<void(std::size_t, std::uint32_t)>& share = {}) {
+    if (count == 0)
+      return;
+    const std::size_t rows = runner.PersistentRowBlockRows();
+    if (blocks == nullptr || rows == 0 || count > tokens.size() / rows)
+      throw std::logic_error("row blocks exceed the record's tokens");
+    const auto start = std::chrono::steady_clock::now();
+    BlockKey parent = RowBlockRoot(persistence);
+    std::vector<BlockKey> keys;
+    keys.reserve(count);
+    std::size_t written = 0;
+    std::size_t deduplicated = 0;
+    for (std::size_t block = 0; block < count; ++block) {
+      if (cancelled && cancelled())
+        throw WriteCancelled();
+      const auto block_tokens = BlockTokens(tokens, block, rows);
+      const auto key = ChainBlockKey(parent, block_tokens, {});
+      if (blocks->Put(key, parent, block_tokens,
+                      [&](const BlockDiskStore::Sink& sink) {
+                        produce(block, sink);
+                      }))
+        ++written;
+      if (const auto id = resident && block_id ? block_id(block)
+                                               : std::nullopt) {
+        if (const auto held = resident->Acquire(key)) {
+          if (*held != *id && share) {
+            share(block, *held);
+            resident->CountDeduplicated();
+            ++deduplicated;
+          }
+          resident_runner->ReleaseRowBlock(*held);
+        } else {
+          (void)resident->Insert(key, *id);
+        }
+      }
+      keys.push_back(key);
+      parent = key;
+    }
+    blocks->Flush();
+    blocks->Touch(keys);
+    const auto stats = blocks->Stats();
+    Logger::Info(
+        "cache",
+        "event=row_blocks action=write blocks=" + std::to_string(count) +
+            " written=" + std::to_string(written) +
+            " skipped=" + std::to_string(count - written) +
+            " deduplicated=" + std::to_string(deduplicated) + " ms=" +
+            std::to_string(std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - start)
+                               .count()) +
+            " stored_blocks=" + std::to_string(stats.stored_blocks) +
+            " total_written=" + std::to_string(stats.written_blocks) +
+            " total_skipped=" + std::to_string(stats.skipped_blocks) +
+            " total_evicted=" + std::to_string(stats.evicted_blocks));
+  }
+
+  // Fills the restored state's full blocks; throws BlockMissing when one is
+  // gone or corrupt, RestoreResourcesUnavailable when the read-ahead cannot
+  // start a thread or hold a block.
+  void LoadRowBlocks(const TextModelRunner& runner, TextRunnerState& state,
+                     const TextRunnerPersistenceDescriptor& persistence,
+                     std::span<const TextRunnerToken> tokens) {
+    const std::size_t count = runner.RestoredRowBlocks(state);
+    if (count == 0)
+      return;
+    const std::size_t rows = runner.PersistentRowBlockRows();
+    if (blocks == nullptr || rows == 0 || count > tokens.size() / rows)
+      throw BlockMissing("the record's row blocks are not available");
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<BlockKey> keys(count);
+    for (std::size_t block = 0; block < count; ++block)
+      keys[block] =
+          ChainBlockKey(block == 0 ? RowBlockRoot(persistence) : keys[block - 1],
+                        BlockTokens(tokens, block, rows), {});
+    const auto parent_of = [&](std::size_t block) {
+      return block == 0 ? RowBlockRoot(persistence) : keys[block - 1];
+    };
+    // Resident blocks with these rows are shared and read from nothing.
+    // Holding them up front tells the read-ahead which blocks to skip.
+    std::vector<std::optional<std::uint32_t>> held(count);
+    const auto release_held = [&](std::size_t from) noexcept {
+      for (std::size_t block = from; block < count; ++block)
+        if (held[block])
+          runner.ReleaseRowBlock(*std::exchange(held[block], std::nullopt));
+    };
+    if (resident)
+      for (std::size_t block = 0; block < count; ++block)
+        held[block] = resident->Acquire(keys[block]);
+    // `held` empties as blocks are shared; the read-ahead skips by this.
+    std::vector<bool> from_resident(count);
+    for (std::size_t block = 0; block < count; ++block)
+      from_resident[block] = held[block].has_value();
+    // The next blocks to read are read and checked on their own threads,
+    // `ahead` at a time, while this one uploads in order.
+    const std::size_t ahead = options.read_ahead_blocks;
+    // Set when the restore fails: reads not started yet skip the file, so a
+    // dropped record's blocks are not marked used and the failure returns
+    // after the reads already running.
+    std::atomic<bool> abandoned{false};
+    std::deque<std::pair<std::size_t, std::future<std::vector<std::uint8_t>>>>
+        reads;
+    std::size_t next_read = 0;
+    const auto refill = [&] {
+      while (reads.size() < ahead && next_read < count) {
+        const auto block = next_read;
+        if (from_resident[block]) {
+          ++next_read;
+          continue;
+        }
+        try {
+          reads.emplace_back(
+              block, std::async(std::launch::async, [&, block] {
+                if (abandoned.load(std::memory_order_relaxed))
+                  return std::vector<std::uint8_t>{};
+                return blocks->Read(keys[block], parent_of(block),
+                                    BlockTokens(tokens, block, rows));
+              }));
+        } catch (const std::system_error& error) {
+          throw RestoreResourcesUnavailable(
+              std::string("row block read-ahead thread: ") + error.what());
+        } catch (const std::bad_alloc&) {
+          throw RestoreResourcesUnavailable(
+              "row block read-ahead thread: out of memory");
+        }
+        ++next_read;
+      }
+    };
+    std::size_t shared = 0;
+    double get_ms = 0;
+    try {
+      for (std::size_t block = 0; block < count; ++block) {
+        if (held[block]) {
+          runner.ShareRowBlock(state, block, *held[block]);
+          runner.ReleaseRowBlock(*std::exchange(held[block], std::nullopt));
+          ++shared;
+          continue;
+        }
+        const auto get_start = std::chrono::steady_clock::now();
+        if (ahead == 0) {
+          blocks->Get(keys[block], parent_of(block),
+                      BlockTokens(tokens, block, rows),
+                      [&](const BlockDiskStore::Source& source) {
+                        runner.RestorePersistentRowBlock(state, block, source);
+                      });
+        } else {
+          refill();
+          if (reads.empty() || reads.front().first != block)
+            throw std::logic_error("row block read-ahead is out of order");
+          std::vector<std::uint8_t> read;
+          try {
+            read = reads.front().second.get();
+          } catch (const std::bad_alloc&) {
+            throw RestoreResourcesUnavailable(
+                "row block read-ahead: no host memory for a block");
+          }
+          reads.pop_front();
+          refill();
+          std::size_t offset = 0;
+          runner.RestorePersistentRowBlock(
+              state, block, [&](std::span<std::uint8_t> bytes) {
+                if (bytes.size() > read.size() - offset)
+                  throw BlockMissing("row block restore reads past its rows");
+                std::memcpy(bytes.data(), read.data() + offset, bytes.size());
+                offset += bytes.size();
+              });
+        }
+        get_ms += std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - get_start)
+                      .count();
+        if (resident)
+          if (const auto id = runner.StateRowBlockId(state, block))
+            (void)resident->Insert(keys[block], *id);
+      }
+    } catch (...) {
+      abandoned.store(true, std::memory_order_relaxed);
+      release_held(0);
+      throw;
+    }
+    if (shared != 0)
+      resident->CountRestored(shared);
+    Logger::Info(
+        "cache",
+        "event=row_blocks action=read blocks=" + std::to_string(count) +
+            " resident=" + std::to_string(shared) +
+            " read_ahead=" + std::to_string(ahead) +
+            " get_ms=" + std::to_string(get_ms) + " ms=" +
+            std::to_string(std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - start)
+                               .count()));
+  }
+
   [[nodiscard]] SaveResult Save(
       const TextModelRunner& runner,
       std::span<const TextRunnerToken> checkpoint_tokens,
       const TextRunnerSnapshot& snapshot,
       std::span<const std::uint8_t> input_identity,
       bool shared_prefix = false) {
+    return SaveFrom(
+        runner, checkpoint_tokens, input_identity,
+        shared_prefix ? SaveKind::kSharedPrefix : SaveKind::kSnapshot,
+        [&] {
+          return std::pair<std::size_t, PayloadStream>(
+              runner.PersistentSnapshotPayloadBytes(snapshot),
+              [&](const TextModelRunner::SnapshotSink& sink) {
+                WriteRowBlocks(
+                    runner,
+                    *DescriptorForInput(runner, input_identity).persistence,
+                    checkpoint_tokens, runner.PersistentRowBlocks(snapshot),
+                    [&](std::size_t block,
+                        const TextModelRunner::SnapshotSink& block_sink) {
+                      runner.StreamPersistentRowBlock(snapshot, block,
+                                                      block_sink);
+                    },
+                    {},
+                    [&](std::size_t block) {
+                      return runner.SnapshotRowBlockId(snapshot, block);
+                    });
+                runner.StreamPersistentSnapshot(snapshot, sink);
+              });
+        });
+  }
+
+  [[nodiscard]] SaveResult SaveState(
+      const TextModelRunner& runner,
+      std::span<const TextRunnerToken> checkpoint_tokens,
+      const TextRunnerState& state,
+      std::span<const std::uint8_t> input_identity,
+      const std::function<bool()>& cancelled) {
+    std::optional<TextModelRunner::PersistentStateWriter> writer;
+    return SaveFrom(
+        runner, checkpoint_tokens, input_identity, SaveKind::kWriteBack,
+        [&] {
+          writer = runner.PreparePersistentState(state);
+          if (!writer)
+            throw std::logic_error("runner cannot persist a state in place");
+          return std::pair<std::size_t, PayloadStream>(
+              writer->payload_bytes,
+              [&](const TextModelRunner::SnapshotSink& sink) {
+                WriteRowBlocks(
+                    runner,
+                    *DescriptorForInput(runner, input_identity).persistence,
+                    checkpoint_tokens, writer->row_blocks,
+                    writer->stream_row_block, cancelled,
+                    [&](std::size_t block) {
+                      return runner.StateRowBlockId(state, block);
+                    });
+                writer->stream([&](std::span<const std::uint8_t> bytes) {
+                  if (cancelled && cancelled())
+                    throw WriteCancelled();
+                  sink(bytes);
+                });
+              });
+        });
+  }
+
+  struct WriteCancelled final : std::exception {};
+  enum class SaveKind : std::uint8_t { kSnapshot, kSharedPrefix, kWriteBack };
+
+  // Common checks, publication and indexing. `prepare` sizes the payload and
+  // returns its stream; it runs only after the cheap skips.
+  [[nodiscard]] SaveResult SaveFrom(
+      const TextModelRunner& runner,
+      std::span<const TextRunnerToken> checkpoint_tokens,
+      std::span<const std::uint8_t> input_identity, SaveKind kind,
+      const std::function<std::pair<std::size_t, PayloadStream>()>& prepare) {
+    const bool shared_prefix = kind == SaveKind::kSharedPrefix;
+    const bool write_back = kind == SaveKind::kWriteBack;
     // Serialize writers, but keep existing entries readable during payload
     // serialization, hashing and filesystem durability operations.
     const std::lock_guard write_lock(write_mutex);
@@ -1171,7 +1563,7 @@ struct ContinuationDiskStore::Impl {
       Emit(ContinuationDiskEventAction::kSkipped,
            ContinuationDiskEventReason::kExactReplacement, existing->file_bytes,
            existing->payload_bytes, checkpoint_tokens.size());
-      return {};
+      return {.present = true};
     }
 
     // A continuation advances by a few hundred tokens per turn, so persisting
@@ -1182,7 +1574,7 @@ struct ContinuationDiskStore::Impl {
     // Shared prefixes are exempt: they exist to give a new conversation a place
     // to start from, and they sit only a few tokens past a deeper entry by
     // construction.
-    if (!shared_prefix &&
+    if (!shared_prefix && !write_back &&
         WithinCheckpointStep(runner, checkpoint_tokens, input_identity)) {
       Emit(ContinuationDiskEventAction::kSkipped,
            ContinuationDiskEventReason::kMinStep, 0, 0,
@@ -1194,15 +1586,17 @@ struct ContinuationDiskStore::Impl {
     const auto started = std::chrono::steady_clock::now();
     std::vector<std::uint8_t> header;
     std::size_t file_bytes = 0;
+    PayloadStream stream;
     try {
-      payload_bytes = runner.PersistentSnapshotPayloadBytes(snapshot);
+      std::tie(payload_bytes, stream) = prepare();
       if (payload_bytes == 0) {
         throw std::runtime_error("persistent snapshot payload is empty");
       }
       file_bytes = CheckedFileBytes(
           descriptor.persistence->compatibility_identity.size(),
           checkpoint_tokens.size(), payload_bytes);
-      if (file_bytes > options.staging_capacity_bytes) {
+      // An in-place write stages nothing; reads stream in bounded pieces.
+      if (!write_back && file_bytes > options.staging_capacity_bytes) {
         Emit(ContinuationDiskEventAction::kSkipped,
              ContinuationDiskEventReason::kStagingCapacity, file_bytes,
              payload_bytes, checkpoint_tokens.size());
@@ -1223,15 +1617,27 @@ struct ContinuationDiskStore::Impl {
       return {};
     }
 
-    const std::string filename = NewFinalFilename(digest);
+    const std::string filename =
+        NewFinalFilename(digest, kind == SaveKind::kSharedPrefix);
     metadata_lock.Unlock();
-    const bool published =
-        PublishImage(filename, header, runner, snapshot, payload_bytes);
+    bool cancelled_write = false;
+    const bool published = PublishImage(
+        filename, header,
+        [&](const TextModelRunner::SnapshotSink& sink) {
+          try {
+            stream(sink);
+          } catch (const WriteCancelled&) {
+            cancelled_write = true;
+            throw;
+          }
+        },
+        payload_bytes);
     metadata_lock.Lock();
     if (!published) {
       Emit(ContinuationDiskEventAction::kSkipped,
-           ContinuationDiskEventReason::kIoFailure, file_bytes, payload_bytes,
-           checkpoint_tokens.size());
+           cancelled_write ? ContinuationDiskEventReason::kCancelled
+                           : ContinuationDiskEventReason::kIoFailure,
+           file_bytes, payload_bytes, checkpoint_tokens.size());
       return {};
     }
     // No visible entry is evicted until its replacement is fully durable.
@@ -1252,15 +1658,19 @@ struct ContinuationDiskStore::Impl {
         .file_bytes = file_bytes,
         .payload_bytes = payload_bytes,
         .last_access = std::filesystem::file_time_type::clock::now(),
+        .shared_prefix = kind == SaveKind::kSharedPrefix,
     });
     const EntryIterator added = std::prev(entries.end());
     index.emplace(digest, added);
     prefixes[PrefixKey(added->persistence)].Insert(added->tokens, added);
     retained += file_bytes;
     retained_entries.fetch_add(1, std::memory_order_relaxed);
+    if (write_back)
+      RemoveReplacedPrefixes(added);
     Emit(ContinuationDiskEventAction::kStored,
-         ContinuationDiskEventReason::kSaved, file_bytes, payload_bytes,
-         checkpoint_tokens.size(),
+         write_back ? ContinuationDiskEventReason::kWriteBack
+                    : ContinuationDiskEventReason::kSaved,
+         file_bytes, payload_bytes, checkpoint_tokens.size(),
          std::chrono::duration<double, std::milli>(
              std::chrono::steady_clock::now() - started)
              .count());
@@ -1269,6 +1679,24 @@ struct ContinuationDiskStore::Impl {
         .file_bytes = file_bytes,
         .payload_bytes = payload_bytes,
     };
+  }
+
+  // The latest boundary of a conversation supersedes its shallower entries
+  // within the minimum step; deeper steps stay as restart points.
+  void RemoveReplacedPrefixes(EntryIterator added) {
+    for (auto entry = entries.begin(); entry != entries.end();) {
+      const auto next = std::next(entry);
+      if (entry != added && !entry->shared_prefix &&
+          entry->persistence == added->persistence &&
+          !entry->tokens.empty() &&
+          entry->tokens.size() < added->tokens.size() &&
+          added->tokens.size() - entry->tokens.size() <
+              options.min_checkpoint_step_tokens &&
+          std::equal(entry->tokens.begin(), entry->tokens.end(),
+                     added->tokens.begin()))
+        (void)RemoveEntry(entry, ContinuationDiskEventReason::kReplaced);
+      entry = next;
+    }
   }
 
   [[nodiscard]] EntryIterator FindLongestCandidate(
@@ -1330,56 +1758,102 @@ struct ContinuationDiskStore::Impl {
         return {};
       }
 
-      std::vector<std::uint8_t> image;
       ContinuationDiskEventReason failure_reason =
           ContinuationDiskEventReason::kCorrupt;
-      if (!ReadImage(candidate->filename, &image, &failure_reason)) {
-        const std::size_t file_bytes = candidate->file_bytes;
-        const std::size_t payload_bytes = candidate->payload_bytes;
-        const std::size_t token_count = candidate->tokens.size();
-        const bool removed = RemoveEntry(candidate, failure_reason);
-        Emit(ContinuationDiskEventAction::kMiss, failure_reason, file_bytes,
-             payload_bytes, token_count);
-        if (!removed)
-          return {};
-        continue;
-      }
-
-      ParsedImage parsed;
-      const ParseFailure parse_failure = ParseAndVerifyImage(&image, &parsed);
-      if (parse_failure != ParseFailure::kNone ||
-          parsed.persistence != candidate->persistence ||
-          parsed.tokens != candidate->tokens ||
-          parsed.payload_bytes != candidate->payload_bytes) {
-        const ContinuationDiskEventReason reason =
-            parse_failure == ParseFailure::kChecksum
-                ? ContinuationDiskEventReason::kChecksumMismatch
-                : ContinuationDiskEventReason::kCorrupt;
+      std::size_t opened_bytes = 0;
+      const auto file =
+          OpenImage(candidate->filename, &failure_reason, &opened_bytes);
+      const auto miss = [&](ContinuationDiskEventReason reason) {
         const std::size_t file_bytes = candidate->file_bytes;
         const std::size_t payload_bytes = candidate->payload_bytes;
         const std::size_t token_count = candidate->tokens.size();
         const bool removed = RemoveEntry(candidate, reason);
         Emit(ContinuationDiskEventAction::kMiss, reason, file_bytes,
              payload_bytes, token_count);
-        if (!removed)
+        return removed;
+      };
+      if (!file) {
+        if (!miss(failure_reason))
+          return {};
+        continue;
+      }
+      ImageReader reader(file.get(), opened_bytes);
+      ParsedImage parsed;
+      if (reader.ReadMetadata(&parsed) != ParseFailure::kNone ||
+          parsed.persistence != candidate->persistence ||
+          parsed.tokens != candidate->tokens ||
+          parsed.payload_bytes != candidate->payload_bytes) {
+        if (!miss(ContinuationDiskEventReason::kCorrupt))
           return {};
         continue;
       }
 
+      // The payload streams straight into the state; its checksum is known
+      // only at the end, so a mismatch invalidates the restored state.
+      ParseFailure verified = ParseFailure::kNone;
       try {
-        runner.RestorePersistentSnapshot(
-            state, std::span<const std::uint8_t>(image).subspan(
-                       parsed.payload_offset, parsed.payload_bytes));
+        runner.RestorePersistentSnapshotStream(
+            state, parsed.payload_bytes,
+            [&](std::span<std::uint8_t> bytes) { reader.ReadPayload(bytes); });
+        verified = reader.Finish();
+      } catch (const std::exception& error) {
+        state.Invalidate();
+        DropPageCache(file.get());
+        if (const auto read_failure = reader.failure()) {
+          if (!miss(*read_failure))
+            return {};
+          continue;
+        }
+        Logger::Warn("cache", std::string("event=disk_restore_failed error=") +
+                                  error.what());
+        (void)miss(ContinuationDiskEventReason::kRestoreFailure);
+        return {};
       } catch (...) {
         state.Invalidate();
-        const std::size_t file_bytes = candidate->file_bytes;
-        const std::size_t payload_bytes = candidate->payload_bytes;
-        const std::size_t token_count = candidate->tokens.size();
-        (void)RemoveEntry(candidate,
-                          ContinuationDiskEventReason::kRestoreFailure);
+        DropPageCache(file.get());
+        if (const auto read_failure = reader.failure()) {
+          if (!miss(*read_failure))
+            return {};
+          continue;
+        }
+        (void)miss(ContinuationDiskEventReason::kRestoreFailure);
+        return {};
+      }
+      DropPageCache(file.get());
+      if (verified != ParseFailure::kNone) {
+        state.Invalidate();
+        if (!miss(verified == ParseFailure::kChecksum
+                      ? ContinuationDiskEventReason::kChecksumMismatch
+                      : reader.failure().value_or(
+                            ContinuationDiskEventReason::kCorrupt)))
+          return {};
+        continue;
+      }
+      try {
+        LoadRowBlocks(runner, state, candidate->persistence,
+                      candidate->tokens);
+      } catch (const BlockMissing&) {
+        // The record is useless without its blocks: drop it, try the next.
+        state.Invalidate();
+        if (!miss(ContinuationDiskEventReason::kMissingBlock))
+          return {};
+        continue;
+      } catch (const RestoreResourcesUnavailable& error) {
+        // Nothing is wrong with the record: this restore fails, it stays.
+        state.Invalidate();
+        Logger::Warn("cache",
+                     std::string("event=disk_restore_failed record=kept error=") +
+                         error.what());
         Emit(ContinuationDiskEventAction::kMiss,
-             ContinuationDiskEventReason::kRestoreFailure, file_bytes,
-             payload_bytes, token_count);
+             ContinuationDiskEventReason::kRestoreFailure,
+             candidate->file_bytes, candidate->payload_bytes,
+             candidate->tokens.size());
+        return {};
+      } catch (const std::exception& error) {
+        state.Invalidate();
+        Logger::Warn("cache", std::string("event=disk_restore_failed error=") +
+                                  error.what());
+        (void)miss(ContinuationDiskEventReason::kRestoreFailure);
         return {};
       }
 
@@ -1470,6 +1944,11 @@ struct ContinuationDiskStore::Impl {
   }
 
   ContinuationDiskStoreOptions options;
+  // Row blocks of runners that persist rows in blocks (DIR/blocks).
+  std::unique_ptr<BlockDiskStore> blocks;
+  // Device blocks by block key (IndexResidentBlocks); the runner owns them.
+  std::shared_ptr<const TextModelRunner> resident_runner;
+  std::unique_ptr<ResidentBlockIndex> resident;
   EventSink event_sink;
   KeyHashFunction key_hash;
   int directory_fd{-1};
@@ -1582,6 +2061,15 @@ void ContinuationDiskStore::Flush() {
   impl_->queue_changed.wait(lock, [this] { return impl_->queued_bytes == 0; });
 }
 
+ContinuationDiskStore::SaveResult ContinuationDiskStore::SaveState(
+    const TextModelRunner& runner,
+    std::span<const TextRunnerToken> checkpoint_tokens,
+    const TextRunnerState& state, std::span<const std::uint8_t> input_identity,
+    const std::function<bool()>& cancelled) {
+  return impl_->SaveState(runner, checkpoint_tokens, state, input_identity,
+                          cancelled);
+}
+
 ContinuationDiskStore::SaveResult ContinuationDiskStore::Save(
     const TextModelRunner& runner,
     std::span<const TextRunnerToken> checkpoint_tokens,
@@ -1650,6 +2138,72 @@ std::size_t ContinuationDiskStore::retained_bytes() const noexcept {
 
 std::size_t ContinuationDiskStore::capacity_bytes() const noexcept {
   return impl_->options.capacity_bytes;
+}
+
+std::size_t ContinuationDiskStore::FileBytes(std::size_t identity_bytes,
+                                             std::size_t token_count,
+                                             std::size_t payload_bytes) {
+  return CheckedFileBytes(identity_bytes, token_count, payload_bytes);
+}
+
+bool ContinuationDiskStore::WriteStateRowBlocks(
+    const TextModelRunner& runner, std::span<const TextRunnerToken> tokens,
+    TextRunnerState& state, std::span<const std::uint8_t> input_identity,
+    const std::function<bool()>& stop) {
+  const std::size_t count = runner.StateRowBlocks(state);
+  if (impl_->blocks == nullptr || count == 0)
+    return true;
+  const auto descriptor = DescriptorForInput(runner, input_identity);
+  if (!descriptor.persistence)
+    return false;
+  try {
+    impl_->WriteRowBlocks(
+        runner, *descriptor.persistence, tokens, count,
+        [&](std::size_t block, const TextModelRunner::SnapshotSink& sink) {
+          runner.StreamStateRowBlock(state, block, sink);
+        },
+        stop,
+        [&](std::size_t block) { return runner.StateRowBlockId(state, block); },
+        [&](std::size_t block, std::uint32_t id) {
+          runner.ShareRowBlock(state, block, id);
+        });
+  } catch (const Impl::WriteCancelled&) {
+    return false;
+  }
+  return true;
+}
+
+void ContinuationDiskStore::IndexResidentBlocks(
+    std::shared_ptr<const TextModelRunner> runner) {
+  if (runner == nullptr || impl_->blocks == nullptr ||
+      runner->RowBlocks().block_rows == 0)
+    throw std::invalid_argument(
+        "a resident block index needs the row block store and paged rows");
+  const TextModelRunner* owner = runner.get();
+  impl_->resident = std::make_unique<ResidentBlockIndex>(
+      ResidentBlockIndex::References{
+          .retain = [owner](std::uint32_t id) { owner->RetainRowBlock(id); },
+          .release = [owner](std::uint32_t id) { owner->ReleaseRowBlock(id); },
+          .count = [owner](std::uint32_t id) {
+            return owner->RowBlockReferences(id);
+          }});
+  impl_->resident_runner = std::move(runner);
+}
+
+std::size_t ContinuationDiskStore::ReleaseUnsharedResidentBlocks(
+    std::size_t blocks) {
+  return impl_->resident ? impl_->resident->ReleaseUnshared(blocks) : 0;
+}
+
+std::optional<ResidentBlockIndex::Stats>
+ContinuationDiskStore::ResidentBlockStats() const {
+  if (!impl_->resident)
+    return std::nullopt;
+  return impl_->resident->stats();
+}
+
+std::size_t ContinuationDiskStore::block_capacity_bytes() const noexcept {
+  return impl_->blocks != nullptr ? impl_->options.block_capacity_bytes : 0;
 }
 
 std::size_t ContinuationDiskStore::staging_capacity_bytes() const noexcept {

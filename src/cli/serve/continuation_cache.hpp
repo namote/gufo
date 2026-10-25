@@ -1,10 +1,12 @@
 #ifndef GUFO_SERVER_CONTINUATION_CACHE_HPP_
 #define GUFO_SERVER_CONTINUATION_CACHE_HPP_
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -80,6 +82,8 @@ enum class SnapshotEventReason : std::uint8_t {
   kExactReplacement,
   kCaptureFailure,
   kReservationMismatch,
+  /// Dropped to free model rows (paged attention blocks) for an admission.
+  kRowCapacity,
 };
 
 /// Continuation boundaries take precedence over optional history/retry copies.
@@ -266,6 +270,58 @@ public:
       std::span<const ContinuationToken> prompt,
       std::span<const std::uint8_t> input_identity = {},
       std::span<const ContinuationInputPrefix> input_prefixes = {}) const;
+
+  /// In-place persistence of released live frontiers, on eviction only: a
+  /// frontier is written when an admission needs its seat, so conversations
+  /// that keep their seats cost no disk writes.
+  void EnablePersistence();
+  /// False while every free seat holds a frontier not yet on disk; the
+  /// oldest is then marked for writing and the caller retries the admission
+  /// later instead of blocking. True for a resuming conversation, a seat that
+  /// is free to reuse, or when persistence is off.
+  [[nodiscard]] bool SeatReadyFor(std::span<const ContinuationToken> prompt);
+  /// A released seat held for an in-place write: not reassigned, nothing
+  /// executes on it; a resuming conversation sets the cancel flag and waits
+  /// for EndPersist. `urgent_only` selects seats SeatReadyFor marked;
+  /// otherwise (shutdown) every unwritten frontier, oldest first.
+  struct PersistingSeat {
+    std::size_t index{0};
+    ContinuationState* state{nullptr};
+    std::vector<ContinuationToken> tokens;
+    std::vector<std::uint8_t> identity;
+  };
+  /// `min_idle` (not urgent_only): only frontiers released at least that
+  /// long ago, written while idle so a later eviction finds them on disk.
+  [[nodiscard]] std::optional<PersistingSeat> BeginPersist(
+      bool urgent_only,
+      std::chrono::milliseconds min_idle = std::chrono::milliseconds::zero());
+  [[nodiscard]] bool PersistCancelled(std::size_t index) const;
+  /// Holds the oldest released seat whose frontier's row blocks are not on
+  /// disk yet, as BeginPersist does, for a write of those blocks alone; its
+  /// record stays for eviction. EndBlockWrite releases it; `complete` marks
+  /// the blocks written.
+  [[nodiscard]] std::optional<PersistingSeat> BeginBlockWrite();
+  void EndBlockWrite(std::size_t index, bool complete) noexcept;
+  /// An admission waits for a frontier write (SeatReadyFor marked one).
+  [[nodiscard]] bool PersistUrgent() const;
+  /// Releases the hold; `persisted` marks the frontier as stored on disk.
+  void EndPersist(std::size_t index, bool persisted) noexcept;
+
+  /// Outcome of ReclaimForRows.
+  enum class RowReclaim : std::uint8_t {
+    kReady,      // enough() holds
+    kWaiting,    // a frontier is being written, or leased seats may free rows
+    kExhausted,  // nothing left to drop and no seat is busy
+  };
+  /// Frees model rows that retained snapshots and idle seats hold until
+  /// `enough()` holds, sparing what `prompt` would reuse. Snapshots go first,
+  /// by removal priority and age; then idle seats, oldest first. With
+  /// persistence on, a frontier not yet on disk is written before it goes:
+  /// it is marked for writing and kWaiting returned. `enough` is called
+  /// without the cache lock.
+  [[nodiscard]] RowReclaim ReclaimForRows(
+      std::span<const ContinuationToken> prompt,
+      const std::function<bool()>& enough);
 
   [[nodiscard]] std::size_t capacity() const noexcept;
   /// Immutable checkpoint records, independent of execution capacity().

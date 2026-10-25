@@ -962,7 +962,7 @@ class FunctionalRunnerTest(unittest.TestCase):
         self.assertEqual([body["messages"] for body in controls[1:]],
                          [body["messages"] for body in turns])
         self.assertEqual([row["floor"] for row in checks["bridge_evidence"]["turns"]],
-                         [4392, 4462, 4532, 4602])
+                         [4776, 4846, 4916, 4986])
 
     def test_cache_bridge_rejects_a_lost_divergence_point(self):
         with self.assertRaisesRegex(AssertionError, "restored 0 tokens"):
@@ -1734,10 +1734,11 @@ p.with_suffix(".requests.json").write_text(json.dumps({"version": 1, "requests":
             self.assertEqual(list(report["suites"]), ["tools", "tool-native-schemas"])
 
     def test_failed_or_incomplete_child_is_not_reported_as_a_pass(self):
+        hung = 'import time; time.sleep(10)'
         for child, expected in (
             ('import sys; sys.exit(7)', "failed"),
             ('pass', "failed"),
-            ('import time; time.sleep(10)', "failed"),
+            (hung, "failed"),
             ('import json,sys; from pathlib import Path; '
              'Path(sys.argv[sys.argv.index("--output")+1]).write_text('
              'json.dumps({"status":"failed"}))', "failed"),
@@ -1758,7 +1759,9 @@ p.with_suffix(".requests.json").write_text(json.dumps({"version": 1, "requests":
                 (root / "openai_sdk.py").write_text(child)
                 args = ["run.py", "--record-baseline", "--output", str(root / "report"),
                         "--sampling-preset", "qwen38", "--suite", "responses",
-                        "--suite-timeout", ".2", "--",
+                        # Only the hung child relies on the timeout; the others need time
+                        # to start Python on a loaded host.
+                        "--suite-timeout", ".2" if child == hung else "60", "--",
                         sys.executable, "serve", "llm", "--model", "fixture.gguf"]
                 with patch.object(sys, "argv", args), patch.object(functional, "TESTS", root), \
                      patch.object(functional, "server", return_value=contextlib.nullcontext()), \
@@ -1852,6 +1855,47 @@ sys.exit({exit_code})
 
 
 class PiWatchdogTest(unittest.TestCase):
+    def test_wide_tool_checks_intent_and_actual_execution(self):
+        from pi_agent import validate_task
+
+        wanted = [{"action": "update", "id": 1, "status": "completed"},
+                  {"action": "update", "id": 2, "status": "in_progress"}]
+
+        def check(arguments, *, executed=None):
+            history = []
+            for i, item in enumerate(arguments):
+                history.extend([
+                    {"role": "assistant", "content": [{
+                        "type": "toolCall", "id": str(i), "name": "todo",
+                        "arguments": item}]},
+                    {"role": "toolResult", "isError": False, "content": [{
+                        "type": "text", "text": f"Task {i + 1}: {wanted[i]['status']}"}]},
+                ])
+            history.append({"role": "assistant", "stopReason": "stop",
+                            "content": [{"type": "text", "text": "DONE"}]})
+            with tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                (work / "todo-calls.jsonl").write_text(
+                    "\n".join(json.dumps(row) for row in (
+                        arguments if executed is None else executed)) + "\n")
+                validate_task("wide-tool", work, history)
+
+        check(wanted)
+        for change in ("missing_status", "owner", "extra_default", "execution"):
+            bad = deepcopy(wanted)
+            executed = None
+            if change == "missing_status":
+                del bad[0]["status"]
+            elif change == "owner":
+                bad[0]["owner"] = "unrequested-owner"
+            elif change == "extra_default":
+                bad[0]["includeDeleted"] = False
+            else:
+                executed = deepcopy(bad)
+                executed[0]["status"] = "pending"
+            with self.subTest(change=change), self.assertRaises(AssertionError):
+                check(bad, executed=executed)
+
     def test_repeated_command_can_make_progress(self):
         from pi_agent import repeated_actions
 

@@ -438,9 +438,12 @@ SpeculativeVerifier::PreparedStep SpeculativeVerifier::PrepareStep(
   prepared.position = request.position;
   prepared.eos_id = request.eos_id;
   prepared.random_sampling = request.sampler.config().uses_random_sampling();
+  // A reasoning budget can force a token the target never predicts, so its
+  // greedy rows go through the sampler like penalties and constraints.
   prepared.sampled = prepared.random_sampling ||
                      request.sampler.config().penalties_enabled() ||
-                     request.sampler.config().constraint != nullptr;
+                     request.sampler.config().constraint != nullptr ||
+                     request.sampler.config().reasoning_budget != nullptr;
   if (prepared.sampled)
     prepared.working_sampler.emplace(request.sampler);
   prepared.max_draft_tokens =
@@ -1187,6 +1190,31 @@ std::size_t SpeculativeVerifierSnapshot::SerializePersistent(
         "draft persistent serializer returned the wrong byte count");
   }
   return destination.size();
+}
+
+std::size_t SpeculativeVerifier::MaxSnapshotPayloadBytes(
+    const SpeculativeOptions& options, std::size_t draft_bytes) {
+  // Same terms as SnapshotPayloadBytes(); the deque never exceeds the window.
+  if (options.rolling_window >
+      std::numeric_limits<std::size_t>::max() / sizeof(float)) {
+    throw std::overflow_error("speculative snapshot size overflows");
+  }
+  return CheckedPersistentAdd(
+      CheckedPersistentAdd(draft_bytes, options.rolling_window * sizeof(float)),
+      sizeof(SpeculativeStats) + sizeof(std::uint32_t));
+}
+
+std::size_t SpeculativeVerifier::MaxPersistentPayloadBytes(
+    const SpeculativeOptions& options, std::size_t draft_persistent_bytes) {
+  // Same terms as SpeculativeVerifierSnapshot::PersistentPayloadBytes().
+  if (options.rolling_window >
+      std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t)) {
+    throw std::overflow_error("speculative verifier persistent size overflows");
+  }
+  return CheckedPersistentAdd(
+      CheckedPersistentAdd(kVerifierPersistentHeaderBytes,
+                           options.rolling_window * sizeof(std::uint32_t)),
+      draft_persistent_bytes);
 }
 
 std::size_t SpeculativeVerifier::SnapshotPayloadBytes() const {

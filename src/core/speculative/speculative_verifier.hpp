@@ -357,6 +357,12 @@ public:
   }
 
   [[nodiscard]] std::size_t SnapshotPayloadBytes() const;
+  /// Bounds on SnapshotPayloadBytes() and on the persistent snapshot size
+  /// with a full rolling window, for a draft snapshot of the given size.
+  [[nodiscard]] static std::size_t MaxSnapshotPayloadBytes(
+      const SpeculativeOptions& options, std::size_t draft_bytes);
+  [[nodiscard]] static std::size_t MaxPersistentPayloadBytes(
+      const SpeculativeOptions& options, std::size_t draft_persistent_bytes);
   void Reset() noexcept;
 
 private:

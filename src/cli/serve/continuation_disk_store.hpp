@@ -7,10 +7,12 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
 
+#include "src/cli/serve/block_disk_store.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 
 namespace gufo::server {
@@ -41,6 +43,14 @@ enum class ContinuationDiskEventReason : std::uint8_t {
   kSerializationFailure,
   kRestoreFailure,
   kBusy,
+  /// Stored in place from a released live state.
+  kWriteBack,
+  /// A deeper boundary of the same conversation within the minimum step.
+  kReplaced,
+  /// The state's conversation resumed before the write finished.
+  kCancelled,
+  /// A row block the record references is gone or corrupt.
+  kMissingBlock,
 };
 
 /// Sanitized disk-cache event. Prompt contents, token values, paths, model
@@ -66,6 +76,15 @@ struct ContinuationDiskStoreOptions {
   /// Minimum token advance over the longest stored prefix that is still a
   /// prefix of the checkpoint before writing it. Zero disables the gate.
   std::size_t min_checkpoint_step_tokens{0};
+  /// Nonzero when the runner persists rows in blocks of this many bytes:
+  /// blocks go to DIR/blocks, bounded by block_capacity_bytes.
+  std::size_t row_block_bytes{0};
+  std::size_t block_capacity_bytes{0};
+  /// Row blocks a restore reads and checks ahead of the one it uploads, on
+  /// as many threads; each holds one block in host memory. Zero: one at a
+  /// time, streamed straight into the upload. At most
+  /// TextRunnerDiskCacheOptions::kMaxReadAheadBlocks.
+  std::size_t read_ahead_blocks{0};
 };
 
 /// Restart-safe, provider-neutral exact-prefix snapshot store.
@@ -84,6 +103,8 @@ public:
 
   struct SaveResult {
     bool stored{false};
+    /// An identical entry already holds these tokens.
+    bool present{false};
     std::size_t file_bytes{0};
     std::size_t payload_bytes{0};
   };
@@ -110,6 +131,20 @@ public:
       std::span<const TextRunnerToken> checkpoint_tokens,
       const TextRunnerSnapshot& snapshot,
       std::span<const std::uint8_t> input_identity = {});
+
+  /// Writes a released live state's boundary straight from the state, without
+  /// a snapshot copy, when the runner supports it (PreparePersistentState).
+  /// The caller keeps the state unchanged until this returns; `cancelled` is
+  /// polled between pieces and abandons the write. The minimum step does not
+  /// apply: this is the conversation's latest boundary. A shallower entry of
+  /// the same conversation within the minimum step is removed once the new
+  /// file is durable, so a conversation keeps one file per step.
+  [[nodiscard]] SaveResult SaveState(
+      const TextModelRunner& runner,
+      std::span<const TextRunnerToken> checkpoint_tokens,
+      const TextRunnerState& state,
+      std::span<const std::uint8_t> input_identity,
+      const std::function<bool()>& cancelled);
 
   /// Holds disk-only capture memory against the staging budget until it is
   /// queued or discarded. Reservations can safely outlive the store.
@@ -196,6 +231,35 @@ public:
   [[nodiscard]] std::size_t retained_bytes() const noexcept;
   [[nodiscard]] std::size_t capacity_bytes() const noexcept;
   [[nodiscard]] std::size_t staging_capacity_bytes() const noexcept;
+  /// Row block capacity; zero when the runner keeps every row in its records.
+  [[nodiscard]] std::size_t block_capacity_bytes() const noexcept;
+
+  /// Write-through of a released state's full row blocks ahead of its
+  /// record: blocks stored already are skipped, and a record written later
+  /// for these tokens only adds the rest. Stops between blocks once
+  /// `stop()` holds. Returns true when every block is stored.
+  /// With a resident index, each block is indexed, or the state's copy is
+  /// replaced by the indexed one (the state must be idle).
+  bool WriteStateRowBlocks(const TextModelRunner& runner,
+                           std::span<const TextRunnerToken> tokens,
+                           TextRunnerState& state,
+                           std::span<const std::uint8_t> input_identity,
+                           const std::function<bool()>& stop);
+
+  /// Indexes device row blocks by their block keys (ResidentBlockIndex):
+  /// restores share a resident block instead of reading its file, and
+  /// written blocks are indexed or replaced by a resident duplicate. Needs
+  /// the row block store and a runner with paged rows.
+  void IndexResidentBlocks(std::shared_ptr<const TextModelRunner> runner);
+  /// Frees up to `blocks` indexed blocks nothing else references.
+  std::size_t ReleaseUnsharedResidentBlocks(std::size_t blocks);
+  [[nodiscard]] std::optional<ResidentBlockIndex::Stats> ResidentBlockStats()
+      const;
+
+  /// On-disk bytes of one checkpoint, as checked against both budgets.
+  [[nodiscard]] static std::size_t FileBytes(std::size_t identity_bytes,
+                                             std::size_t token_count,
+                                             std::size_t payload_bytes);
 
 private:
   struct Impl;

@@ -77,6 +77,17 @@ struct ContinuationCache::Entry {
   bool available{true};
   bool valid{false};
   bool dirty{false};
+  // In-place persistence of a released live frontier (BeginPersist).
+  bool persisting{false};
+  bool persist_cancel{false};
+  bool live_persisted{false};
+  // One in-place write per released frontier, whether or not it stored.
+  bool live_attempted{false};
+  // An admission needs this seat; its frontier is written first.
+  bool persist_urgent{false};
+  // The released frontier's row blocks are on disk (written ahead).
+  bool live_blocks_written{false};
+  std::chrono::steady_clock::time_point live_released{};
 };
 
 struct ContinuationCache::Impl {
@@ -88,6 +99,8 @@ struct ContinuationCache::Impl {
   std::uint64_t clock{0};
   std::size_t snapshot_capacity_bytes{0};
   std::size_t retained_snapshot_bytes{0};
+  // Set once a writer persists released frontiers in place.
+  bool persistence_enabled{false};
   std::size_t reserved_snapshot_bytes{0};
 
   [[nodiscard]] bool snapshot_mode() const noexcept {
@@ -562,6 +575,14 @@ ContinuationCache::Lease ContinuationCache::Acquire(
       }
     }
     std::size_t selected = live_hit ? live_source : source;
+    // Logged after the mutex is released, like the debug records.
+    std::size_t dropped_frontier_tokens = 0;
+    if (live_hit && impl_->entries[live_source]->persisting) {
+      // The conversation resumes: its frontier stays live, so stop the write
+      // and wait for the writer to release the seat.
+      impl_->entries[live_source]->persist_cancel = true;
+      selected = no_entry;
+    }
     bool evicting = false;
     std::size_t evict_index = 0;
     std::size_t evict_tokens = 0;
@@ -569,6 +590,7 @@ ContinuationCache::Lease ContinuationCache::Acquire(
     if ((impl_->snapshot_mode() && !live_hit) || !cache_hit) {
       selected = no_entry;
       std::uint64_t oldest = std::numeric_limits<std::uint64_t>::max();
+      bool selected_keeps = false;
       for (std::size_t index = 0; index < impl_->entries.size(); ++index) {
         const auto& entry = *impl_->entries[index];
         // Borrowed rows save the restore a copy, never another
@@ -583,11 +605,26 @@ ContinuationCache::Lease ContinuationCache::Acquire(
           selected = index;
           break;
         }
-        if (entry.available && entry.state_last_used < oldest) {
-          selected = index;
-          oldest = entry.state_last_used;
+        // A seat held for a write is not reassigned. Prefer seats whose
+        // frontier is empty or already on disk over one that would be lost.
+        if (entry.available && !entry.persisting) {
+          // A failed write is not retried; its frontier is then dropped.
+          const bool keeps = entry.live_tokens.empty() ||
+                             entry.live_persisted || entry.live_attempted;
+          if (keeps && (!selected_keeps || entry.state_last_used < oldest)) {
+            selected = index;
+            oldest = entry.state_last_used;
+            selected_keeps = true;
+          } else if (!keeps && !selected_keeps &&
+                     entry.state_last_used < oldest) {
+            selected = index;
+            oldest = entry.state_last_used;
+          }
         }
       }
+      if (selected != no_entry && impl_->persistence_enabled &&
+          !impl_->entries[selected]->live_persisted)
+        dropped_frontier_tokens = impl_->entries[selected]->live_tokens.size();
       if (debug_cache && selected != no_entry &&
           impl_->entries[selected]->valid) {
         const auto& slot = *impl_->entries[selected];
@@ -606,6 +643,10 @@ ContinuationCache::Lease ContinuationCache::Acquire(
       entry.state_last_used = ++impl_->clock;
       entry.live_tokens.clear();
       entry.live_identity.clear();
+      entry.live_persisted = false;
+      entry.live_attempted = false;
+      entry.live_blocks_written = false;
+      entry.persist_urgent = false;
 
       std::shared_ptr<const ContinuationSnapshot> snapshot;
       if (impl_->snapshot_mode()) {
@@ -621,6 +662,9 @@ ContinuationCache::Lease ContinuationCache::Acquire(
         entry.tokens.clear();
       }
       lock.unlock();
+      if (dropped_frontier_tokens != 0)
+        Logger::Info("cache", "event=live_frontier_dropped tokens=" +
+                                  std::to_string(dropped_frontier_tokens));
 
       std::size_t restored_snapshot_bytes = 0;
       double restore_ms = 0.0;
@@ -1036,6 +1080,10 @@ std::size_t ContinuationCache::Commit(
       if (release_state) {
         state_entry.live_tokens = std::move(live_tokens);
         state_entry.live_identity = std::move(live_identity);
+        state_entry.live_persisted = false;
+        state_entry.live_attempted = false;
+        state_entry.live_blocks_written = false;
+        state_entry.live_released = std::chrono::steady_clock::now();
       }
       if (retain_snapshot) {
         const std::size_t no_entry = impl_->entries.size();
@@ -1211,11 +1259,233 @@ void ContinuationCache::Invalidate(std::size_t index,
     }
     entry.live_tokens.clear();
     entry.live_identity.clear();
+    entry.live_persisted = false;
+    entry.live_attempted = false;
+    entry.live_blocks_written = false;
+    entry.persist_urgent = false;
     entry.dirty = false;
     entry.available = true;
     entry.state_last_used = ++impl_->clock;
   }
   impl_->condition.notify_one();
+}
+
+ContinuationCache::RowReclaim ContinuationCache::ReclaimForRows(
+    std::span<const ContinuationToken> prompt,
+    const std::function<bool()>& enough) {
+  while (!enough()) {
+    std::shared_ptr<const ContinuationSnapshot> dropped;
+    std::vector<SnapshotEvent> events;
+    std::size_t dropped_frontier_tokens = 0;
+    {
+      const std::lock_guard<std::mutex> lock(impl_->mutex);
+      std::size_t selected = impl_->entries.size();
+      int priority = 4;
+      std::uint64_t oldest = std::numeric_limits<std::uint64_t>::max();
+      for (std::size_t index = impl_->state_count;
+           index < impl_->entries.size(); ++index) {
+        const auto& entry = *impl_->entries[index];
+        if (!entry.valid || entry.snapshot == nullptr ||
+            IsPrefix(entry.tokens, prompt))
+          continue;
+        const int rank = impl_->RemovalPriority(index);
+        if (rank < priority ||
+            (rank == priority && entry.snapshot_last_used < oldest)) {
+          selected = index;
+          priority = rank;
+          oldest = entry.snapshot_last_used;
+        }
+      }
+      if (selected < impl_->entries.size()) {
+        auto& entry = *impl_->entries[selected];
+        dropped = std::move(entry.snapshot);
+        impl_->retained_snapshot_bytes -= entry.snapshot_bytes;
+        events.push_back({
+            .action = SnapshotEventAction::kRemoved,
+            .reason = SnapshotEventReason::kRowCapacity,
+            .snapshot_bytes = entry.snapshot_bytes,
+            .token_count = entry.tokens.size(),
+            .retained_snapshot_bytes = impl_->retained_snapshot_bytes,
+            .reserved_snapshot_bytes = impl_->reserved_snapshot_bytes,
+            .capacity_bytes = impl_->snapshot_capacity_bytes,
+        });
+        entry.tokens.clear();
+        entry.snapshot_bytes = 0;
+        entry.valid = false;
+      } else {
+        std::optional<std::size_t> seat;
+        bool busy = false;
+        for (std::size_t index = 0; index < impl_->state_count; ++index) {
+          const auto& entry = *impl_->entries[index];
+          if (!entry.available || entry.persisting) {
+            busy = true;
+            continue;
+          }
+          if (!entry.dirty || (!entry.live_tokens.empty() &&
+                               IsPrefix(entry.live_tokens, prompt)))
+            continue;
+          if (!seat || entry.state_last_used <
+                           impl_->entries[*seat]->state_last_used)
+            seat = index;
+        }
+        if (!seat)
+          return busy ? RowReclaim::kWaiting : RowReclaim::kExhausted;
+        auto& entry = *impl_->entries[*seat];
+        if (impl_->persistence_enabled && !entry.live_tokens.empty() &&
+            !entry.live_persisted && !entry.live_attempted) {
+          entry.persist_urgent = true;
+          return RowReclaim::kWaiting;
+        }
+        // Idle: nothing runs on this state, so dropping it here is safe.
+        dropped_frontier_tokens = entry.live_tokens.size();
+        entry.state->Invalidate();
+        if (!impl_->snapshot_mode()) {
+          entry.tokens.clear();
+          entry.valid = false;
+        }
+        entry.live_tokens.clear();
+        entry.live_identity.clear();
+        entry.live_persisted = false;
+        entry.live_attempted = false;
+        entry.live_blocks_written = false;
+        entry.persist_urgent = false;
+        entry.dirty = false;
+      }
+    }
+    dropped.reset();
+    EmitSnapshotEvents(impl_->snapshot_support.on_event, events);
+    if (dropped_frontier_tokens != 0)
+      Logger::Info("cache", "event=live_frontier_dropped reason=row_capacity "
+                            "tokens=" +
+                                std::to_string(dropped_frontier_tokens));
+  }
+  return RowReclaim::kReady;
+}
+
+void ContinuationCache::EnablePersistence() {
+  const std::lock_guard<std::mutex> lock(impl_->mutex);
+  impl_->persistence_enabled = true;
+}
+
+bool ContinuationCache::SeatReadyFor(
+    std::span<const ContinuationToken> prompt) {
+  const std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (!impl_->persistence_enabled)
+    return true;
+  std::optional<std::size_t> oldest;
+  bool writing = false;
+  for (std::size_t index = 0; index < impl_->state_count; ++index) {
+    const auto& entry = *impl_->entries[index];
+    if (!entry.available)
+      continue;
+    // The conversation resumes on its own seat (cancelling any write).
+    if (!entry.live_tokens.empty() && IsPrefix(entry.live_tokens, prompt))
+      return true;
+    if (entry.persisting) {
+      writing = true;
+      continue;
+    }
+    if (entry.live_tokens.empty() || entry.live_persisted ||
+        entry.live_attempted)
+      return true;
+    if (!oldest || entry.state_last_used <
+                       impl_->entries[*oldest]->state_last_used)
+      oldest = index;
+  }
+  if (oldest && !writing)
+    impl_->entries[*oldest]->persist_urgent = true;
+  // No free seat at all: Acquire waits as before.
+  return !oldest && !writing;
+}
+
+std::optional<ContinuationCache::PersistingSeat>
+ContinuationCache::BeginPersist(bool urgent_only,
+                                std::chrono::milliseconds min_idle) {
+  const std::lock_guard<std::mutex> lock(impl_->mutex);
+  const auto now = std::chrono::steady_clock::now();
+  std::optional<std::size_t> oldest;
+  for (std::size_t index = 0; index < impl_->state_count; ++index) {
+    const auto& entry = *impl_->entries[index];
+    if (entry.available && !entry.persisting && !entry.live_tokens.empty() &&
+        !entry.live_attempted && (!urgent_only || entry.persist_urgent) &&
+        (urgent_only || now - entry.live_released >= min_idle) &&
+        (!oldest ||
+         entry.state_last_used < impl_->entries[*oldest]->state_last_used))
+      oldest = index;
+  }
+  if (!oldest)
+    return std::nullopt;
+  auto& entry = *impl_->entries[*oldest];
+  entry.persisting = true;
+  entry.persist_cancel = false;
+  entry.persist_urgent = false;
+  return PersistingSeat{.index = *oldest,
+                        .state = entry.state.get(),
+                        .tokens = entry.live_tokens,
+                        .identity = entry.live_identity};
+}
+
+std::optional<ContinuationCache::PersistingSeat>
+ContinuationCache::BeginBlockWrite() {
+  const std::lock_guard<std::mutex> lock(impl_->mutex);
+  std::optional<std::size_t> oldest;
+  for (std::size_t index = 0; index < impl_->state_count; ++index) {
+    const auto& entry = *impl_->entries[index];
+    if (entry.available && !entry.persisting && !entry.live_tokens.empty() &&
+        !entry.live_blocks_written && !entry.live_persisted &&
+        (!oldest ||
+         entry.state_last_used < impl_->entries[*oldest]->state_last_used))
+      oldest = index;
+  }
+  if (!oldest)
+    return std::nullopt;
+  auto& entry = *impl_->entries[*oldest];
+  entry.persisting = true;
+  entry.persist_cancel = false;
+  return PersistingSeat{.index = *oldest,
+                        .state = entry.state.get(),
+                        .tokens = entry.live_tokens,
+                        .identity = entry.live_identity};
+}
+
+void ContinuationCache::EndBlockWrite(std::size_t index,
+                                      bool complete) noexcept {
+  {
+    const std::lock_guard<std::mutex> lock(impl_->mutex);
+    auto& entry = *impl_->entries[index];
+    entry.persisting = false;
+    if (!entry.persist_cancel)
+      entry.live_blocks_written = entry.live_blocks_written || complete;
+    entry.persist_cancel = false;
+  }
+  impl_->condition.notify_all();
+}
+
+bool ContinuationCache::PersistUrgent() const {
+  const std::lock_guard<std::mutex> lock(impl_->mutex);
+  return std::ranges::any_of(impl_->entries, [](const auto& entry) {
+    return entry->persist_urgent;
+  });
+}
+
+bool ContinuationCache::PersistCancelled(std::size_t index) const {
+  const std::lock_guard<std::mutex> lock(impl_->mutex);
+  return impl_->entries[index]->persist_cancel;
+}
+
+void ContinuationCache::EndPersist(std::size_t index, bool persisted) noexcept {
+  {
+    const std::lock_guard<std::mutex> lock(impl_->mutex);
+    auto& entry = *impl_->entries[index];
+    entry.persisting = false;
+    // Still the same frontier: a resumed conversation cancels first.
+    if (!entry.persist_cancel) {
+      entry.live_attempted = true;
+      entry.live_persisted = persisted;
+    }
+    entry.persist_cancel = false;
+  }
+  impl_->condition.notify_all();
 }
 
 }  // namespace gufo::server

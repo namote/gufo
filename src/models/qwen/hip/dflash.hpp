@@ -28,6 +28,7 @@ using DFlashTrace =
     std::function<void(std::string_view, std::span<const float>)>;
 
 class QwenDFlashGpuExecutor;
+class QwenDFlashGpuModel;
 
 struct QwenDFlashContextRequest {
   QwenDFlashGpuExecutor* executor{nullptr};
@@ -62,6 +63,9 @@ public:
     return valid_context_;
   }
   [[nodiscard]] std::size_t PersistentPayloadBytes() const;
+  /// PersistentPayloadBytes() once injected history fills its capacity.
+  [[nodiscard]] static std::size_t MaxPersistentPayloadBytes(
+      const QwenDFlashGpuModel& model, std::uint32_t max_context);
   [[nodiscard]] std::size_t SerializePersistent(
       std::span<std::uint8_t> destination) const;
 
@@ -172,6 +176,9 @@ public:
   void RestorePersistentSnapshot(std::span<const std::uint8_t> payload);
   [[nodiscard]] std::size_t StateBytes() const noexcept;
   [[nodiscard]] std::size_t SnapshotPayloadBytes() const noexcept;
+  /// SnapshotPayloadBytes() once injected history fills its capacity.
+  [[nodiscard]] static std::size_t MaxSnapshotPayloadBytes(
+      const QwenDFlashGpuModel& model, std::uint32_t max_context) noexcept;
   [[nodiscard]] QwenGpuMemoryUsage GetMemoryUsage() const noexcept;
   [[nodiscard]] static QwenGpuMemoryUsage EstimateMemoryUsage(
       const QwenDFlashGpuModel& model, std::uint32_t max_context,
@@ -311,6 +318,12 @@ public:
                       tokenization::TokenId correction_token) override;
 
   [[nodiscard]] std::size_t SnapshotPayloadBytes() const override;
+  /// Snapshot sizes at the largest injected history, with one verification
+  /// (at most block_size rows) of target features not yet injected.
+  [[nodiscard]] static std::size_t MaxSnapshotPayloadBytes(
+      const QwenDFlashGpuModel& model, std::uint32_t max_context);
+  [[nodiscard]] static std::size_t MaxPersistentPayloadBytes(
+      const QwenDFlashGpuModel& model, std::uint32_t max_context);
   [[nodiscard]] std::unique_ptr<speculative::IDraftBackendSnapshot> Snapshot()
       const override;
   void RestoreSnapshot(

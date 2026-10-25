@@ -1,13 +1,18 @@
 #include "src/cli/serve/text_model_runner.hpp"
+#include "src/cli/serve/continuation_disk_store.hpp"
+
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <semaphore>
 #include <span>
@@ -28,6 +33,14 @@ using gufo::tokenization::kImEnd;
 using gufo::tokenization::kImStart;
 
 namespace {
+
+// Tests of the other checkpoint rules run without tail checkpoints, which
+// have their own tests.
+gufo::server::TextRunnerRamCacheOptions WithoutTailCheckpoints() {
+  gufo::server::TextRunnerRamCacheOptions options;
+  options.tail_checkpoints = 0;
+  return options;
+}
 
 using gufo::server::ChatRequest;
 using gufo::server::TextDecodeSelection;
@@ -336,7 +349,7 @@ void TestPromptCountingValidatesCapabilitiesBeforeInference() {
 void TestBoundedPrefillDecodeAndPrefixReuse() {
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<FakeRunner>(stats);
-  TextRunnerPool pool(runner, 1);
+  TextRunnerPool pool(runner, 1, std::nullopt, WithoutTailCheckpoints());
 
   Expect(pool.runner().Descriptor().model_id == "fake-model",
          "pool exposes the validated runner");
@@ -393,7 +406,7 @@ void TestBoundedPrefillDecodeAndPrefixReuse() {
 void TestAbandonedRequestRollsBackState() {
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<FakeRunner>(stats);
-  TextRunnerPool pool(runner, 1);
+  TextRunnerPool pool(runner, 1, std::nullopt, WithoutTailCheckpoints());
 
   {
     auto request = pool.Acquire({4, 5, 6});
@@ -410,7 +423,7 @@ void TestAbandonedRequestRollsBackState() {
 void TestRequestBindsAndClearsCancellation() {
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<FakeRunner>(stats);
-  TextRunnerPool pool(runner, 1);
+  TextRunnerPool pool(runner, 1, std::nullopt, WithoutTailCheckpoints());
 
   auto request = pool.Acquire({4, 5, 6}, [] { return false; });
   Expect(stats->cancellation_bindings == 1,
@@ -423,7 +436,7 @@ void TestRequestBindsAndClearsCancellation() {
 void TestBatchedAdvancePreservesIndependentRequests() {
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<FakeRunner>(stats);
-  TextRunnerPool pool(runner, 2);
+  TextRunnerPool pool(runner, 2, std::nullopt, WithoutTailCheckpoints());
 
   auto first = pool.Acquire({1});
   auto second = pool.Acquire({2});
@@ -454,7 +467,7 @@ void TestResourceClaimsAreValidatedBeforeAllocation() {
   bool rejected = false;
   try {
     auto runner = std::make_shared<FakeRunner>(stats, 64, 159);
-    TextRunnerPool pool(runner, 2);
+    TextRunnerPool pool(runner, 2, std::nullopt, WithoutTailCheckpoints());
   } catch (const std::invalid_argument&) {
     rejected = true;
   }
@@ -535,7 +548,7 @@ void TestSnapshotTimingEndsWhenCaptureCompletes() {
   for (const bool fail : {false, true}) {
     auto runner = std::make_shared<GatedRunner>(std::make_shared<FakeStats>());
     runner->fail = fail;
-    TextRunnerPool pool(runner, 2);
+    TextRunnerPool pool(runner, 2, std::nullopt, WithoutTailCheckpoints());
     auto request = pool.Acquire({1, 2, 3});
     Expect(request.Prefill(3).decode_ready, "prompt is ready for capture");
     const auto started = std::chrono::steady_clock::now();
@@ -620,7 +633,7 @@ public:
 
 void TestInPassStableCheckpoint() {
   auto stats = std::make_shared<FakeStats>();
-  TextRunnerPool pool(std::make_shared<InPassRunner>(stats), 1);
+  TextRunnerPool pool(std::make_shared<InPassRunner>(stats), 1, std::nullopt, WithoutTailCheckpoints());
   auto first = pool.Acquire({1, 2, 3, 40, 41}, {}, {}, {}, true, 3);
   const auto step = first.Prefill(64);
   Expect(step.consumed_tokens == 5 && step.decode_ready,
@@ -649,7 +662,7 @@ void TestInPassFailureRetainsOnlyCompletedCheckpoints() {
   // reservation. A leaked reservation would force the old fallback out.
   auto runner =
       std::make_shared<InPassRunner>(stats, 64, 256, 2 * sizeof(FakeSnapshot));
-  TextRunnerPool pool(runner, 1);
+  TextRunnerPool pool(runner, 1, std::nullopt, WithoutTailCheckpoints());
   auto seed = pool.Acquire({1, 2, 3, 40, 41}, {}, {}, {}, true, 3);
   Expect(seed.Prefill(64).decode_ready, "seed reaches its decode frontier");
   seed.Cancel();  // Retain the stable checkpoint without a full-prompt copy.
@@ -720,6 +733,38 @@ public:
       const TextRunnerSnapshot& snapshot) const override {
     (void)RequireSnapshot(snapshot);
     return 4 * sizeof(std::uint64_t);
+  }
+
+  [[nodiscard]] std::optional<gufo::server::TextRunnerCheckpointBound>
+  MaxContextCheckpointBytes() const override {
+    return checkpoint_bound;
+  }
+
+  std::optional<gufo::server::TextRunnerCheckpointBound> checkpoint_bound;
+
+  // In-place persistence writes the bytes a snapshot of the state would.
+  bool in_place{false};
+  mutable std::size_t in_place_writes{0};
+  [[nodiscard]] bool PersistsStateInPlace() const override { return in_place; }
+  [[nodiscard]] std::optional<PersistentStateWriter> PreparePersistentState(
+      const TextRunnerState& state) const override {
+    if (!in_place)
+      return std::nullopt;
+    const auto& live = RequireFakeState(state);
+    const std::array<std::uint64_t, 4> fields = {
+        live.position, live.decode_count, live.frontier.has_value() ? 1U : 0U,
+        live.frontier.value_or(0)};
+    return PersistentStateWriter{
+        .payload_bytes = 4 * sizeof(std::uint64_t),
+        .stream = [this, fields](const SnapshotSink& sink) {
+          ++in_place_writes;
+          std::array<std::uint8_t, 4 * sizeof(std::uint64_t)> bytes{};
+          for (std::size_t field = 0; field < fields.size(); ++field)
+            for (std::size_t byte = 0; byte < sizeof(std::uint64_t); ++byte)
+              bytes[field * sizeof(std::uint64_t) + byte] =
+                  static_cast<std::uint8_t>(fields[field] >> (byte * 8U));
+          sink(bytes);
+        }};
   }
 
   [[nodiscard]] std::size_t SerializePersistentSnapshot(
@@ -839,7 +884,7 @@ void TestSnapshotForkAndUnsupportedCapabilities() {
 void TestSnapshotCacheBranchesOnePrefixIntoIndependentStates() {
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<SnapshotRunner>(stats);
-  TextRunnerPool pool(runner, 2);
+  TextRunnerPool pool(runner, 2, std::nullopt, WithoutTailCheckpoints());
 
   {
     auto root = pool.Acquire({1, 2, 3, 4});
@@ -888,7 +933,7 @@ void TestSnapshotCacheBranchesOnePrefixIntoIndependentStates() {
 void TestSnapshotRetentionUsesPromptBoundary() {
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<SnapshotRunner>(stats);
-  TextRunnerPool pool(runner, 1);
+  TextRunnerPool pool(runner, 1, std::nullopt, WithoutTailCheckpoints());
 
   {
     auto root = pool.Acquire({1, 2, 3, 4});
@@ -951,7 +996,7 @@ void TestSnapshotRetentionUsesPromptBoundary() {
 void TestGeneratedFrontierForksBeforeMutation() {
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<SnapshotRunner>(stats);
-  TextRunnerPool pool(runner, 2);
+  TextRunnerPool pool(runner, 2, std::nullopt, WithoutTailCheckpoints());
   {
     auto root = pool.Acquire({1, 2, 3, 4});
     root.Prefill(4);
@@ -992,7 +1037,7 @@ void TestGeneratedFrontierPersistsForForks() {
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<PersistentSnapshotRunner>(stats, "artifact-A");
   {
-    TextRunnerPool pool(runner, 2, disk);
+    TextRunnerPool pool(runner, 2, disk, WithoutTailCheckpoints());
     auto root = pool.Acquire({1, 2, 3});
     root.Prefill(3);
     (void)root.SelectNext();
@@ -1003,7 +1048,7 @@ void TestGeneratedFrontierPersistsForForks() {
            "the live frontier includes generated output");
     continuation.Invalidate();
   }
-  TextRunnerPool restarted(runner, 1, disk);
+  TextRunnerPool restarted(runner, 1, disk, WithoutTailCheckpoints());
   auto restored = restarted.Acquire({1, 2, 3, 90, 5});
   Expect(restored.cache_disk_hit() && restored.cached_prompt_tokens() == 4,
          "disk forks restore the generated checkpoint before suffix prefill");
@@ -1017,18 +1062,91 @@ void TestGeneratedFrontierPersistsForForks() {
                                           .capacity_bytes = 4096,
                                           .staging_capacity_bytes = 4096};
   {
-    TextRunnerPool pool(runner, 2, spaced);
+    TextRunnerPool pool(runner, 2, spaced, WithoutTailCheckpoints());
     auto root = pool.Acquire({1, 2, 3});
     root.Prefill(3);
     (void)root.SelectNext();
     root.Advance();
     root.Commit();
   }
-  TextRunnerPool spaced_restart(runner, 1, spaced);
+  TextRunnerPool spaced_restart(runner, 1, spaced, WithoutTailCheckpoints());
   auto resumed = spaced_restart.Acquire({1, 2, 3, 90, 5});
   Expect(resumed.cache_disk_hit() && resumed.cached_prompt_tokens() == 3 &&
              resumed.Prefill(16).consumed_tokens == 2,
          "spaced disk checkpoints resume from the nearest stored prefix");
+}
+
+void TestReleasedFrontierIsWrittenBackInPlace() {
+  // The default step skips a frontier one token past the prompt; shutdown
+  // writes it from the seat instead and drops the shallower prompt entry.
+  TemporaryDirectory directory;
+  const TextRunnerDiskCacheOptions disk{.directory = directory.path(),
+                                        .capacity_bytes = 4096,
+                                        .staging_capacity_bytes = 4096};
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<PersistentSnapshotRunner>(stats, "artifact-A");
+  runner->in_place = true;
+  {
+    TextRunnerPool pool(runner, 1, disk, WithoutTailCheckpoints());
+    auto root = pool.Acquire({1, 2, 3});
+    root.Prefill(3);
+    (void)root.SelectNext();
+    root.Advance();
+    root.Commit();
+  }
+  Expect(runner->in_place_writes == 1,
+         "shutdown writes the released frontier from its seat once");
+  TextRunnerPool restarted(runner, 1, disk, WithoutTailCheckpoints());
+  auto resumed = restarted.Acquire({1, 2, 3, 90, 5});
+  Expect(resumed.cache_disk_hit() && resumed.cached_prompt_tokens() == 4 &&
+             resumed.Prefill(16).consumed_tokens == 1,
+         "a restart resumes from the written-back frontier");
+  resumed.Invalidate();
+  auto branch = restarted.Acquire({1, 2, 3, 7});
+  Expect(!branch.cache_disk_hit(),
+         "the frontier replaced its prompt entry within the step");
+  branch.Invalidate();
+}
+
+void TestEvictionWritesTheFrontierBeforeReuse() {
+  TemporaryDirectory directory;
+  const TextRunnerDiskCacheOptions disk{.directory = directory.path(),
+                                        .capacity_bytes = 4096,
+                                        .staging_capacity_bytes = 4096};
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<PersistentSnapshotRunner>(stats, "artifact-A");
+  runner->in_place = true;
+  {
+    TextRunnerPool pool(runner, 1, disk, WithoutTailCheckpoints());
+    auto root = pool.Acquire({1, 2, 3});
+    root.Prefill(3);
+    (void)root.SelectNext();
+    root.Advance();
+    root.Commit();
+    const std::vector<TextRunnerToken> resuming{1, 2, 3, 90, 4};
+    const std::vector<TextRunnerToken> unrelated{9, 8, 7};
+    Expect(pool.AdmissionReady(resuming) && runner->in_place_writes == 0,
+           "a resuming conversation keeps its seat without a disk write");
+    Expect(!pool.AdmissionReady(unrelated),
+           "another conversation waits while the frontier is written");
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!pool.AdmissionReady(unrelated) &&
+           std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    Expect(runner->in_place_writes == 1,
+           "the evicted frontier was written from its seat once");
+    auto other = pool.Acquire({9, 8, 7});
+    Expect(!other.cache_hit(), "the new conversation takes the freed seat");
+    other.Invalidate();
+  }
+  Expect(runner->in_place_writes == 1,
+         "shutdown has nothing left to write");
+  TextRunnerPool restarted(runner, 1, disk, WithoutTailCheckpoints());
+  auto resumed = restarted.Acquire({1, 2, 3, 90, 5});
+  Expect(resumed.cache_disk_hit() && resumed.cached_prompt_tokens() == 4,
+         "the evicted conversation resumes from its written frontier");
+  resumed.Invalidate();
 }
 
 void TestCancelledPrefillRetainsCompletedChunks() {
@@ -1039,7 +1157,7 @@ void TestCancelledPrefillRetainsCompletedChunks() {
     std::shared_ptr<TextModelRunner> runner =
         retains ? std::static_pointer_cast<TextModelRunner>(partial)
                 : std::make_shared<SnapshotRunner>(stats);
-    TextRunnerPool pool(runner, 1);
+    TextRunnerPool pool(runner, 1, std::nullopt, WithoutTailCheckpoints());
     auto request =
         pool.Acquire({1, 2, 3, 4, 5, 6}, {}, [] { return false; }, {}, true, 5);
     const auto bindings = stats->cancellation_bindings;
@@ -1069,7 +1187,7 @@ void TestCancelledPrefillRetainsCompletedChunks() {
 void TestCancellationRetainsOnlyCompletedWork() {
   for (const bool pending : {false, true}) {
     auto stats = std::make_shared<FakeStats>();
-    TextRunnerPool pool(std::make_shared<SnapshotRunner>(stats), 1);
+    TextRunnerPool pool(std::make_shared<SnapshotRunner>(stats), 1, std::nullopt, WithoutTailCheckpoints());
     auto request = pool.Acquire({1, 2});
     request.Prefill(2);
     Expect(request.SelectNext().token == 90, "first cancellation token");
@@ -1093,7 +1211,7 @@ void TestCancellationRetainsOnlyCompletedWork() {
   }
 
   auto stats = std::make_shared<FakeStats>();
-  TextRunnerPool pool(std::make_shared<SnapshotRunner>(stats), 1);
+  TextRunnerPool pool(std::make_shared<SnapshotRunner>(stats), 1, std::nullopt, WithoutTailCheckpoints());
   auto request = pool.Acquire({1, 2});
   request.Prefill(2);
   (void)request.SelectNext();
@@ -1124,7 +1242,7 @@ void TestPersistentSnapshotRestoresAcrossPools() {
     auto writer_stats = std::make_shared<FakeStats>();
     auto writer = std::make_shared<PersistentSnapshotRunner>(
         writer_stats, "artifact-A", sizeof(FakeSnapshot) - 1);
-    TextRunnerPool pool(writer, 1, disk_cache);
+    TextRunnerPool pool(writer, 1, disk_cache, WithoutTailCheckpoints());
     auto request = pool.Acquire({1, 2, 3});
     Expect(request.Prefill(3).decode_ready,
            "writer reaches persistent checkpoint");
@@ -1137,7 +1255,7 @@ void TestPersistentSnapshotRestoresAcrossPools() {
   auto reader_stats = std::make_shared<FakeStats>();
   auto reader =
       std::make_shared<PersistentSnapshotRunner>(reader_stats, "artifact-A");
-  TextRunnerPool restarted(reader, 1, disk_cache);
+  TextRunnerPool restarted(reader, 1, disk_cache, WithoutTailCheckpoints());
   {
     auto cold = restarted.Acquire({1, 2, 3, 4, 5}, {}, {}, {}, false);
     Expect(!cold.cache_hit() && !cold.cache_disk_hit() &&
@@ -1160,7 +1278,7 @@ void TestPersistentSnapshotRestoresAcrossPools() {
   auto incompatible_stats = std::make_shared<FakeStats>();
   auto incompatible = std::make_shared<PersistentSnapshotRunner>(
       incompatible_stats, "artifact-B");
-  TextRunnerPool incompatible_pool(incompatible, 1, disk_cache);
+  TextRunnerPool incompatible_pool(incompatible, 1, disk_cache, WithoutTailCheckpoints());
   auto miss = incompatible_pool.Acquire({1, 2, 3, 4});
   Expect(!miss.cache_hit() && !miss.cache_disk_hit(),
          "changed compatibility identity is a cold miss");
@@ -1169,7 +1287,7 @@ void TestPersistentSnapshotRestoresAcrossPools() {
 
 void TestPromptReuseCanBeDisabledPerRequest() {
   auto stats = std::make_shared<FakeStats>();
-  TextRunnerPool pool(std::make_shared<SnapshotRunner>(stats), 1);
+  TextRunnerPool pool(std::make_shared<SnapshotRunner>(stats), 1, std::nullopt, WithoutTailCheckpoints());
   {
     auto initial = pool.Acquire({1, 2});
     initial.Prefill(2);
@@ -1199,7 +1317,7 @@ void TestStableChatPrefixSurvivesInterruptedFraming() {
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<PersistentSnapshotRunner>(stats, "artifact-A");
   {
-    TextRunnerPool pool(runner, 1, disk_cache);
+    TextRunnerPool pool(runner, 1, disk_cache, WithoutTailCheckpoints());
     // {1,2,3} is stable history; {40,41} opens assistant reasoning.
     auto initial = pool.Acquire({1, 2, 3, 40, 41}, {}, {}, {}, true, 3);
     auto step = initial.Prefill(64);
@@ -1216,7 +1334,7 @@ void TestStableChatPrefixSurvivesInterruptedFraming() {
            "changed assistant framing retains all stable prompt tokens");
     resumed.Invalidate();
   }
-  TextRunnerPool restarted(runner, 1, disk_cache);
+  TextRunnerPool restarted(runner, 1, disk_cache, WithoutTailCheckpoints());
   auto restored = restarted.Acquire({1, 2, 3, 50, 51, 60}, {}, {}, {}, true, 5);
   Expect(restored.cache_disk_hit() && restored.cached_prompt_tokens() == 3,
          "interrupted stable chat prefix survives server restart");
@@ -1224,7 +1342,7 @@ void TestStableChatPrefixSurvivesInterruptedFraming() {
 
   // Full-prompt entries written by older servers must not prevent creating
   // the shorter, stable checkpoint on the next request.
-  TextRunnerPool legacy(runner, 1);
+  TextRunnerPool legacy(runner, 1, std::nullopt, WithoutTailCheckpoints());
   auto old = legacy.Acquire({1, 2, 3, 40, 41});
   old.Prefill(64);
   old.Commit();
@@ -1242,7 +1360,7 @@ void TestStableChatPrefixSurvivesInterruptedFraming() {
 
 void TestWarmChatCheckpointsStopAtTheStableBoundary() {
   auto stats = std::make_shared<FakeStats>();
-  TextRunnerPool pool(std::make_shared<SnapshotRunner>(stats), 1);
+  TextRunnerPool pool(std::make_shared<SnapshotRunner>(stats), 1, std::nullopt, WithoutTailCheckpoints());
   Expect(pool.capacity() == 1 && stats->states_created == 1,
          "extra checkpoint entries do not allocate execution sessions");
   auto root = pool.Acquire({1, 2, 3, 40, 41}, {}, {}, {}, true, 3);
@@ -1293,6 +1411,214 @@ void TestWarmChatCheckpointsStopAtTheStableBoundary() {
   dropped.Cancel();
 }
 
+void TestTailCheckpointsRestoreNearThePromptEnd() {
+  class LongSnapshotRunner final : public SnapshotRunner {
+  public:
+    using SnapshotRunner::SnapshotRunner;
+    TextRunnerDescriptor Descriptor() const override {
+      auto descriptor = SnapshotRunner::Descriptor();
+      descriptor.max_context = 32768;
+      descriptor.capabilities.block_sharing_snapshots = true;
+      return descriptor;
+    }
+  };
+  // 10,300 tokens: evenly spaced checkpoints at 2048, 4096 and 6144. Three
+  // tail checkpoints 1024 apart counted back from where prefill stops: the
+  // prompt end, or a prompt snapshot within its last tokens (10,297).
+  for (const std::size_t snapshot : {std::size_t{10300}, std::size_t{10297}}) {
+    std::size_t base_captures = 0;
+    for (const std::size_t tail : {std::size_t{0}, std::size_t{3}}) {
+      auto stats = std::make_shared<FakeStats>();
+      gufo::server::TextRunnerRamCacheOptions options;
+      options.tail_checkpoints = tail;
+      TextRunnerPool pool(
+          std::make_shared<LongSnapshotRunner>(stats, 64, 256, 1U << 20), 1,
+          std::nullopt, options);
+      std::vector<TextRunnerToken> prompt(10300, 1);
+      auto original = pool.Acquire(prompt, {}, {}, {}, true, snapshot);
+      while (!original.prefill_complete())
+        (void)original.Prefill(32768);
+      original.Commit();
+      const auto captures = stats->snapshot_captures;
+      if (tail == 0)
+        base_captures = captures;
+      else
+        Expect(captures == base_captures + 3,
+               "each tail checkpoint is one more capture");
+
+      auto late = prompt;
+      late[9500] = 2;
+      auto late_edit = pool.Acquire(late, {}, {}, {}, true, snapshot);
+      Expect(late_edit.cached_prompt_tokens() ==
+                 (tail != 0 ? snapshot - 1024 : 6144U),
+             "a late divergence restores the last tail checkpoint before it");
+      late_edit.Invalidate();
+      auto earlier = prompt;
+      earlier[7500] = 3;
+      auto earlier_edit = pool.Acquire(earlier, {}, {}, {}, true, snapshot);
+      Expect(earlier_edit.cached_prompt_tokens() ==
+                 (tail != 0 ? snapshot - 3072 : 6144U),
+             "tail checkpoints cover the last K x 1024 tokens");
+      earlier_edit.Invalidate();
+
+      // Continuing to 11,500 tokens, 10,476 would leave a 176-token pass
+      // after the reused frontier: no tail checkpoint there.
+      auto longer = prompt;
+      longer.resize(11500, 1);
+      auto continued = pool.Acquire(longer, {}, {}, {}, true, longer.size());
+      const auto reused = continued.cached_prompt_tokens();
+      Expect(reused >= snapshot, "the continuation reuses the retained prompt");
+      while (!continued.prefill_complete())
+        (void)continued.Prefill(32768);
+      continued.Commit();
+      longer[11300] = 4;
+      auto after_tail = pool.Acquire(longer, {}, {}, {}, true, longer.size());
+      Expect(after_tail.cached_prompt_tokens() == reused,
+             "a tail checkpoint never leaves a pass below 1024 tokens");
+      after_tail.Invalidate();
+    }
+  }
+
+  // A checkpoint shared with a peer at 9,700 replaces the tail checkpoint at
+  // 9,276 next to it; 8,252 and 7,228 stay.
+  auto stats = std::make_shared<FakeStats>();
+  gufo::server::TextRunnerRamCacheOptions options;
+  options.tail_checkpoints = 3;
+  TextRunnerPool pool(
+      std::make_shared<LongSnapshotRunner>(stats, 64, 256, 1U << 20), 1,
+      std::nullopt, options);
+  std::vector<TextRunnerToken> prompt(10300, 1);
+  auto leader = pool.Acquire(prompt, {}, {}, {}, true, prompt.size());
+  Expect(leader.ShareCheckpoint(9700) == 9700,
+         "the leader keeps a checkpoint where peers diverge");
+  while (!leader.prefill_complete())
+    (void)leader.Prefill(32768);
+  leader.Commit();
+  auto late = prompt;
+  late[9500] = 2;
+  auto late_edit = pool.Acquire(late, {}, {}, {}, true, late.size());
+  Expect(late_edit.cached_prompt_tokens() == 8252,
+         "a shared checkpoint drops the tail checkpoint within 1024 of it");
+  late_edit.Invalidate();
+  auto peer = prompt;
+  peer[9800] = 3;
+  auto peer_request = pool.Acquire(peer, {}, {}, {}, true, peer.size());
+  Expect(peer_request.cached_prompt_tokens() == 9700,
+         "peers diverging at the shared point restore it");
+  peer_request.Invalidate();
+}
+
+void TestTailCheckpointsKeepFullPrefillPasses() {
+  class PassRunner final : public SnapshotRunner {
+  public:
+    using SnapshotRunner::SnapshotRunner;
+    TextRunnerDescriptor Descriptor() const override {
+      auto descriptor = SnapshotRunner::Descriptor();
+      descriptor.max_context = 32768;
+      descriptor.capabilities.block_sharing_snapshots = true;
+      descriptor.max_prefill_pass_tokens = 4096;
+      return descriptor;
+    }
+  };
+  // 20,500 tokens: evenly spaced checkpoints at 4096, 10240 and 14336.
+  // Tail points 19,476 and 17,408 stand; 18,452 would leave a 20-token pass
+  // after the 4096-token one from 14,336, so it moves to 18,432.
+  auto stats = std::make_shared<FakeStats>();
+  gufo::server::TextRunnerRamCacheOptions options;
+  options.tail_checkpoints = 3;
+  TextRunnerPool pool(std::make_shared<PassRunner>(stats, 64, 256, 1U << 20),
+                      1, std::nullopt, options);
+  std::vector<TextRunnerToken> prompt(20500, 1);
+  auto original = pool.Acquire(prompt, {}, {}, {}, true, prompt.size());
+  while (!original.prefill_complete())
+    (void)original.Prefill(32768);
+  original.Commit();
+  for (const auto [edit, restored] :
+       {std::pair<std::size_t, std::size_t>{19600, 19476},
+        {18440, 18432},
+        {18000, 17408}}) {
+    auto edited = prompt;
+    edited[edit] = 2;
+    auto request = pool.Acquire(edited, {}, {}, {}, true, edited.size());
+    Expect(request.cached_prompt_tokens() == restored,
+           "a tail checkpoint never cuts a short piece from a full pass");
+    request.Invalidate();
+  }
+}
+
+void TestTailCheckpointsCountBackPastAnExistingStop() {
+  class LongSnapshotRunner final : public SnapshotRunner {
+  public:
+    using SnapshotRunner::SnapshotRunner;
+    TextRunnerDescriptor Descriptor() const override {
+      auto descriptor = SnapshotRunner::Descriptor();
+      descriptor.max_context = 32768;
+      descriptor.capabilities.block_sharing_snapshots = true;
+      return descriptor;
+    }
+  };
+  // 9,216 tokens: evenly spaced checkpoints at 2048, 4096, 6144 and 8192.
+  // The first tail point, 8192, is already a checkpoint; counting goes on
+  // from it to 7168 (and 6144, again a checkpoint).
+  auto stats = std::make_shared<FakeStats>();
+  gufo::server::TextRunnerRamCacheOptions options;
+  options.tail_checkpoints = 3;
+  TextRunnerPool pool(
+      std::make_shared<LongSnapshotRunner>(stats, 64, 256, 1U << 20), 1,
+      std::nullopt, options);
+  std::vector<TextRunnerToken> prompt(9216, 1);
+  auto original = pool.Acquire(prompt, {}, {}, {}, true, prompt.size());
+  while (!original.prefill_complete())
+    (void)original.Prefill(32768);
+  original.Commit();
+  for (const auto [edit, restored] :
+       {std::pair<std::size_t, std::size_t>{8500, 8192}, {7500, 7168}}) {
+    auto edited = prompt;
+    edited[edit] = 2;
+    auto request = pool.Acquire(edited, {}, {}, {}, true, edited.size());
+    Expect(request.cached_prompt_tokens() == restored,
+           "a tail point on an existing checkpoint keeps counting back");
+    request.Invalidate();
+  }
+}
+
+void TestTailCheckpointsNeedBlockSharingSnapshots() {
+  class CopyingSnapshotRunner final : public SnapshotRunner {
+  public:
+    using SnapshotRunner::SnapshotRunner;
+    TextRunnerDescriptor Descriptor() const override {
+      auto descriptor = SnapshotRunner::Descriptor();
+      descriptor.max_context = 32768;
+      return descriptor;
+    }
+  };
+  // Snapshots that copy their rows would copy every row up to each tail
+  // checkpoint: requested ones are not applied.
+  std::size_t captures[2] = {};
+  for (const std::size_t tail : {std::size_t{0}, std::size_t{3}}) {
+    auto stats = std::make_shared<FakeStats>();
+    gufo::server::TextRunnerRamCacheOptions options;
+    options.tail_checkpoints = tail;
+    TextRunnerPool pool(
+        std::make_shared<CopyingSnapshotRunner>(stats, 64, 256, 1U << 20), 1,
+        std::nullopt, options);
+    std::vector<TextRunnerToken> prompt(10300, 1);
+    auto original = pool.Acquire(prompt, {}, {}, {}, true, prompt.size());
+    while (!original.prefill_complete())
+      (void)original.Prefill(32768);
+    original.Commit();
+    captures[tail != 0] = stats->snapshot_captures;
+    auto late = prompt;
+    late[9500] = 2;
+    auto late_edit = pool.Acquire(late, {}, {}, {}, true, late.size());
+    Expect(late_edit.cached_prompt_tokens() == 6144,
+           "row-copying snapshots restore the evenly spaced checkpoint");
+    late_edit.Invalidate();
+  }
+  Expect(captures[0] == captures[1],
+         "row-copying snapshots take no tail checkpoints");
+}
+
 void TestHistoryEditsRestoreIntermediateCheckpoints() {
   class LongSnapshotRunner final : public SnapshotRunner {
   public:
@@ -1305,7 +1631,7 @@ void TestHistoryEditsRestoreIntermediateCheckpoints() {
   };
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<LongSnapshotRunner>(stats, 64, 256, 4096);
-  TextRunnerPool pool(runner, 1);
+  TextRunnerPool pool(runner, 1, std::nullopt, WithoutTailCheckpoints());
   std::vector<TextRunnerToken> prompt(10000, 1);
   auto original = pool.Acquire(prompt, {}, {}, {}, true, 9900);
   while (!original.prefill_complete())
@@ -1342,7 +1668,7 @@ void TestHistoryEditsRestoreIntermediateCheckpoints() {
   TextRunnerPool limited_pool(
       std::make_shared<LongSnapshotRunner>(limited_stats, 64, 256,
                                            3 * sizeof(FakeSnapshot)),
-      1);
+      1, std::nullopt, WithoutTailCheckpoints());
   std::vector<TextRunnerToken> root_prompt(1000, 1);
   auto root = limited_pool.Acquire(root_prompt);
   (void)root.Prefill(32768);
@@ -1360,7 +1686,7 @@ void TestHistoryEditsRestoreIntermediateCheckpoints() {
 
   auto cancel_stats = std::make_shared<FakeStats>();
   TextRunnerPool cancel_pool(
-      std::make_shared<LongSnapshotRunner>(cancel_stats, 64, 256, 4096), 1);
+      std::make_shared<LongSnapshotRunner>(cancel_stats, 64, 256, 4096), 1, std::nullopt, WithoutTailCheckpoints());
   auto interrupted =
       cancel_pool.Acquire(std::vector<TextRunnerToken>(10000, 1));
   (void)interrupted.Prefill(32768);
@@ -1373,7 +1699,7 @@ void TestHistoryEditsRestoreIntermediateCheckpoints() {
 
   auto short_stats = std::make_shared<FakeStats>();
   TextRunnerPool short_pool(
-      std::make_shared<LongSnapshotRunner>(short_stats, 64, 256, 4096), 1);
+      std::make_shared<LongSnapshotRunner>(short_stats, 64, 256, 4096), 1, std::nullopt, WithoutTailCheckpoints());
   std::vector<TextRunnerToken> short_prompt(7900, 1);
   auto short_root = short_pool.Acquire(short_prompt);
   while (!short_root.prefill_complete())
@@ -1399,7 +1725,7 @@ void TestHistoryEditsRestoreIntermediateCheckpoints() {
 
   auto aligned_stats = std::make_shared<FakeStats>();
   TextRunnerPool aligned_pool(
-      std::make_shared<LongSnapshotRunner>(aligned_stats, 64, 256, 4096), 1);
+      std::make_shared<LongSnapshotRunner>(aligned_stats, 64, 256, 4096), 1, std::nullopt, WithoutTailCheckpoints());
   auto aligned_root =
       aligned_pool.Acquire(std::vector<TextRunnerToken>(1000, 1));
   (void)aligned_root.Prefill(32768);
@@ -1421,7 +1747,7 @@ void TestHistoryEditsRestoreIntermediateCheckpoints() {
 
   auto tail_stats = std::make_shared<FakeStats>();
   TextRunnerPool tail_pool(
-      std::make_shared<LongSnapshotRunner>(tail_stats, 64, 256, 4096), 1);
+      std::make_shared<LongSnapshotRunner>(tail_stats, 64, 256, 4096), 1, std::nullopt, WithoutTailCheckpoints());
   auto near_end = tail_pool.Acquire(std::vector<TextRunnerToken>(2100, 1));
   Expect(near_end.Prefill(32768).decode_ready &&
              tail_stats->prefill_spans == std::vector<std::size_t>{2100},
@@ -1443,7 +1769,7 @@ void TestHistoryEditsRestoreIntermediateCheckpoints() {
 /// re-prefilled tail grows for the rest of the conversation.
 void TestWarmHitAdvancesTheStableCheckpoint() {
   auto stats = std::make_shared<FakeStats>();
-  TextRunnerPool pool(std::make_shared<SnapshotRunner>(stats), 1);
+  TextRunnerPool pool(std::make_shared<SnapshotRunner>(stats), 1, std::nullopt, WithoutTailCheckpoints());
 
   // Cold turn. The stable boundary is 3; 40,41 is the assistant framing.
   auto first = pool.Acquire({1, 2, 3, 40, 41}, {}, {}, {}, true, 3);
@@ -1495,7 +1821,7 @@ void TestChatFallbackSurvivesSnapshotBudgetPressure() {
   auto stats = std::make_shared<FakeStats>();
   auto runner =
       std::make_shared<SnapshotRunner>(stats, 64, 256, sizeof(FakeSnapshot));
-  TextRunnerPool pool(runner, 1);
+  TextRunnerPool pool(runner, 1, std::nullopt, WithoutTailCheckpoints());
   auto root = pool.Acquire({1, 2, 3, 40, 41}, {}, {}, {}, true, 3);
   Expect(!root.Prefill(64).decode_ready, "cold chat stops at its fallback");
   Expect(root.Prefill(64).decode_ready, "cold chat completes prefill");
@@ -1520,7 +1846,7 @@ void TestFullChatCheckpointRestoresWithoutSuffixPrefill() {
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<PersistentSnapshotRunner>(stats, "artifact-A");
   {
-    TextRunnerPool writer(runner, 1, disk_cache);
+    TextRunnerPool writer(runner, 1, disk_cache, WithoutTailCheckpoints());
     auto prompt = writer.Acquire({1, 2, 3, 40, 41}, {}, {}, {}, true, 3);
     Expect(!prompt.Prefill(64).decode_ready, "writer saves the stable prefix");
     Expect(prompt.Prefill(64).decode_ready, "writer saves the complete prompt");
@@ -1528,7 +1854,7 @@ void TestFullChatCheckpointRestoresWithoutSuffixPrefill() {
     prompt.Advance();
     prompt.Commit();
   }
-  TextRunnerPool reader(runner, 1, disk_cache);
+  TextRunnerPool reader(runner, 1, disk_cache, WithoutTailCheckpoints());
   auto exact = reader.Acquire({1, 2, 3, 40, 41}, {}, {}, {}, true, 3);
   Expect(exact.cache_disk_hit() && exact.cached_prompt_tokens() == 5 &&
              exact.prefill_complete(),
@@ -1555,13 +1881,13 @@ void TestFullChatCheckpointRestoresWithoutSuffixPrefill() {
       .staging_capacity_bytes = 4096,
       .min_checkpoint_step_tokens = 0};
   {
-    TextRunnerPool writer(runner, 1, legacy_disk);
+    TextRunnerPool writer(runner, 1, legacy_disk, WithoutTailCheckpoints());
     auto old = writer.Acquire({1, 2, 3, 40, 41});
     Expect(old.Prefill(64).decode_ready,
            "legacy writer saves only the full prompt");
     old.Commit();
   }
-  TextRunnerPool migrated(runner, 1, legacy_disk);
+  TextRunnerPool migrated(runner, 1, legacy_disk, WithoutTailCheckpoints());
   auto old = migrated.Acquire({1, 2, 3, 40, 41}, {}, {}, {}, true, 3);
   Expect(!old.cache_hit(),
          "a legacy full-prompt file without a fallback still migrates safely");
@@ -1601,7 +1927,7 @@ void TestIndivisibleInputsAreNotSplit() {
   };
   {
     auto stats = std::make_shared<FakeStats>();
-    TextRunnerPool pool(std::make_shared<ContextRunner>(stats), 1);
+    TextRunnerPool pool(std::make_shared<ContextRunner>(stats), 1, std::nullopt, WithoutTailCheckpoints());
     auto span = std::make_shared<IndivisibleSpanContext>();
     span->first = 4;
     span->end = 14;
@@ -1618,7 +1944,7 @@ void TestIndivisibleInputsAreNotSplit() {
     // The 4096-token grid checkpoint falls inside the input.
     auto stats = std::make_shared<FakeStats>();
     TextRunnerPool pool(std::make_shared<ContextRunner>(stats, 64, 256, 4096),
-                        1);
+                        1, std::nullopt, WithoutTailCheckpoints());
     auto span = std::make_shared<IndivisibleSpanContext>();
     span->first = 4000;
     span->end = 4200;
@@ -1647,7 +1973,7 @@ void TestNewImageGetsAStableCheckpoint() {
   };
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<ContextRunner>(stats, 64, 256, 1024);
-  TextRunnerPool pool(runner, 1);
+  TextRunnerPool pool(runner, 1, std::nullopt, WithoutTailCheckpoints());
   {
     auto text = pool.Acquire({1, 2, 3, 40, 41}, {}, {}, {}, true, 3);
     while (!text.prefill_complete())
@@ -1693,15 +2019,16 @@ void TestSharedPrefixIsLearnedAndRestoredAcrossConversations() {
       .directory = directory.path(),
       .capacity_bytes = 8192,
       .staging_capacity_bytes = 4096,
-      .shared_prefix_min_tokens = 2,
       .shared_prefix_max_boundaries = 4,
   };
+  auto ram_cache = WithoutTailCheckpoints();
+  ram_cache.shared_prefix_min_tokens = 2;
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<PersistentSnapshotRunner>(
       stats, "artifact-A", sizeof(FakeSnapshot) - 1);
   // Conversation A: system prefix {7, 7, 7} plus its own turn.
   {
-    TextRunnerPool pool(runner, 1, disk_cache);
+    TextRunnerPool pool(runner, 1, disk_cache, ram_cache);
     auto request = pool.Acquire({7, 7, 7, 1, 2});
     Expect(!request.cache_hit(), "first conversation is cold");
     Expect(request.Prefill(8).consumed_tokens == 5,
@@ -1714,7 +2041,7 @@ void TestSharedPrefixIsLearnedAndRestoredAcrossConversations() {
   // Conversation B shares only the system prefix. Prefill stops there so the
   // prefix is persisted for the next conversation.
   {
-    TextRunnerPool pool(runner, 1, disk_cache);
+    TextRunnerPool pool(runner, 1, disk_cache, ram_cache);
     auto request = pool.Acquire({7, 7, 7, 3, 4, 5});
     Expect(!request.cache_hit(), "second conversation still has no prefix");
     const auto first = request.Prefill(8);
@@ -1731,7 +2058,7 @@ void TestSharedPrefixIsLearnedAndRestoredAcrossConversations() {
 
   // Conversation C restores the shared prefix and prefills only its turn.
   {
-    TextRunnerPool pool(runner, 1, disk_cache);
+    TextRunnerPool pool(runner, 1, disk_cache, ram_cache);
     auto exact = pool.Acquire({7, 7, 7});
     Expect(exact.cache_disk_hit() && exact.prefill_complete() &&
                exact.SelectNext().token == 90,
@@ -1754,7 +2081,7 @@ void TestRamLearnsDivergenceBoundaries() {
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<PersistentSnapshotRunner>(
       stats, "ram-boundary", std::size_t{1} << 20, 4096);
-  TextRunnerPool pool(runner, 1);
+  TextRunnerPool pool(runner, 1, std::nullopt, WithoutTailCheckpoints());
   // Conversations share a system prompt, then each has its own tail. Below
   // 2048 tokens no grid checkpoint exists, so only learning can help.
   const auto conversation = [](std::size_t shared, TextRunnerToken tail) {
@@ -1785,8 +2112,9 @@ void TestRamLearnsDivergenceBoundaries() {
   const auto [third_cached, third_steps] = run(conversation(1000, 30000));
   Expect(third_cached == 1000 && third_steps == std::vector<std::size_t>{600},
          "later conversations restore the learned boundary exactly");
-  const auto [short_cached, short_steps] = run(conversation(300, 40000));
-  Expect(short_cached == 0 && short_steps == std::vector<std::size_t>{900},
+  // Below shared_prefix_min_tokens (128).
+  const auto [short_cached, short_steps] = run(conversation(100, 40000));
+  Expect(short_cached == 0 && short_steps == std::vector<std::size_t>{700},
          "a short shared prefix is not worth an extra checkpoint");
   // An edit near the end diverges inside this request's own final tokens;
   // its stable checkpoint covers that, so no extra copy is taken.
@@ -1814,7 +2142,7 @@ void TestLearnedBoundarySurvivesExactRepublication() {
     auto runner = std::make_shared<PersistentSnapshotRunner>(
         stats, "republished-boundary", (full ? 3 : 5) * sizeof(FakeSnapshot),
         4096);
-    TextRunnerPool pool(runner, 1);
+    TextRunnerPool pool(runner, 1, std::nullopt, WithoutTailCheckpoints());
     const std::vector<TextRunnerToken> shared(1000, 100);
     const auto run = [&](std::vector<TextRunnerToken> prompt,
                          bool reuse_prompt = true) {
@@ -1853,15 +2181,16 @@ void TestCoincidentCacheBoundariesShareOneCopy() {
         .directory = directory.path(),
         .capacity_bytes = 1024 * 1024,
         .staging_capacity_bytes = 64 * 1024,
-        .shared_prefix_min_tokens = 2048,
     };
+    auto ram_cache = WithoutTailCheckpoints();
+    ram_cache.shared_prefix_min_tokens = 2048;
     auto stats = std::make_shared<FakeStats>();
     auto runner = std::make_shared<PersistentSnapshotRunner>(
         stats, "artifact-A", 1024, 4096);
     std::vector<TextRunnerToken> prompt(2050, 7);
     prompt[2048] = 1;
     {
-      TextRunnerPool pool(runner, 1, disk_cache);
+      TextRunnerPool pool(runner, 1, disk_cache, ram_cache);
       auto source = pool.Acquire(prompt);
       while (!source.prefill_complete())
         (void)source.Prefill(4096);
@@ -1869,7 +2198,7 @@ void TestCoincidentCacheBoundariesShareOneCopy() {
     }
     prompt[2048] = 2;
     {
-      TextRunnerPool pool(runner, 1, disk_cache);
+      TextRunnerPool pool(runner, 1, disk_cache, ram_cache);
       auto branch = pool.Acquire(prompt, {}, {}, {}, true, stable ? 2048 : 0);
       const auto before = stats->snapshot_captures;
       Expect(branch.Prefill(4096).consumed_tokens == 2048,
@@ -1881,7 +2210,7 @@ void TestCoincidentCacheBoundariesShareOneCopy() {
     }
     prompt[2048] = 3;
     {
-      TextRunnerPool pool(runner, 1, disk_cache);
+      TextRunnerPool pool(runner, 1, disk_cache, ram_cache);
       auto restored = pool.Acquire(prompt);
       Expect(restored.cache_disk_hit() &&
                  restored.cached_prompt_tokens() == 2048 &&
@@ -1907,7 +2236,7 @@ void TestDiskOnlyCaptureReservesBudgetBeforeCommit() {
                           .directory = directory.path(),
                           .capacity_bytes = 4096,
                           .staging_capacity_bytes = 192,
-                      });
+                      }, WithoutTailCheckpoints());
   auto first = pool.Acquire({1, 2, 3});
   (void)first.Prefill(3);
   first.CapturePromptSnapshot();
@@ -1934,7 +2263,7 @@ void TestDiskPreflightAvoidsUnusableCapture() {
                           .directory = directory.path(),
                           .capacity_bytes = 4096,
                           .staging_capacity_bytes = 96,
-                      });
+                      }, WithoutTailCheckpoints());
   auto request = pool.Acquire({1, 2, 3});
   (void)request.Prefill(3);
   const auto commit = request.Commit();
@@ -1947,7 +2276,7 @@ void TestMeasuredStateIsReconciledWithClaim() {
   bool rejected = false;
   try {
     auto runner = std::make_shared<FakeRunner>(stats, 65, 256);
-    TextRunnerPool pool(runner, 1);
+    TextRunnerPool pool(runner, 1, std::nullopt, WithoutTailCheckpoints());
   } catch (const std::runtime_error&) {
     rejected = true;
   }
@@ -1960,7 +2289,7 @@ void TestSnapshotBudgetRefusalDoesNotFailCompletedRequest() {
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<SnapshotRunner>(stats, 64, 256,
                                                  sizeof(FakeSnapshot) - 1);
-  TextRunnerPool pool(runner, 1);
+  TextRunnerPool pool(runner, 1, std::nullopt, WithoutTailCheckpoints());
 
   auto request = pool.Acquire({1, 2, 3});
   Expect(request.Prefill(3).decode_ready,
@@ -1997,7 +2326,7 @@ public:
 void TestSnapshotCaptureFailureReleasesReservationAndKeepsRequestSuccessful() {
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<FlakySnapshotRunner>(stats);
-  TextRunnerPool pool(runner, 1);
+  TextRunnerPool pool(runner, 1, std::nullopt, WithoutTailCheckpoints());
 
   {
     auto first = pool.Acquire({1, 2, 3});
@@ -2030,7 +2359,7 @@ void TestEntryCapacityEvictionIsLogged() {
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<SnapshotRunner>(stats, 64, 256, 8192);
   // Checkpoint records are bounded independently of execution sessions.
-  TextRunnerPool pool(runner, 1);
+  TextRunnerPool pool(runner, 1, std::nullopt, WithoutTailCheckpoints());
 
   for (std::size_t i = 0;
        i <= gufo::server::TextRunnerRamCacheOptions::kMaxEntries; ++i) {
@@ -2124,6 +2453,84 @@ void TestMeminfoAvailableExcludesFreeCma() {
          "missing MemAvailable keeps the caller's fallback");
 }
 
+void TestCgroupAvailableCountsReclaimableCache() {
+  namespace fs = std::filesystem;
+  using gufo::server::CgroupAvailableBytes;
+  constexpr std::uint64_t gib = std::uint64_t{1} << 30;
+  const auto root = fs::temp_directory_path() /
+                    ("gufo_cgroup_test_" + std::to_string(::getpid()));
+  fs::remove_all(root);
+  const auto write = [&](const fs::path& dir, const char* name,
+                         const std::string& text) {
+    fs::create_directories(root / dir);
+    std::ofstream(root / dir / name) << text << "\n";
+  };
+  const auto level = [&](const fs::path& dir, const std::string& max,
+                         std::uint64_t current,
+                         std::optional<std::uint64_t> inactive_file) {
+    write(dir, "memory.max", max);
+    write(dir, "memory.current", std::to_string(current));
+    fs::remove(root / dir / "memory.stat");
+    if (inactive_file)
+      write(dir, "memory.stat",
+            "anon 1\ninactive_file " + std::to_string(*inactive_file) +
+                "\nactive_file 5");
+  };
+  const std::string member = "0::/pod/ctr\n";
+  const auto host = 500 * gib;
+
+  level("pod/ctr", std::to_string(80 * gib), 79 * gib, 32 * gib);
+  Expect(CgroupAvailableBytes(root, member, host) == 33 * gib,
+         "inactive file pages count as available");
+  Expect(CgroupAvailableBytes(root, member, 10 * gib) == 10 * gib,
+         "host MemAvailable still bounds the result");
+
+  level("pod/ctr", std::to_string(80 * gib), 79 * gib, std::nullopt);
+  Expect(CgroupAvailableBytes(root, member, host) == 1 * gib,
+         "missing memory.stat keeps memory.current as used");
+  const auto stat = [&](const std::string& text) {
+    write("pod/ctr", "memory.stat", text);
+  };
+  level("pod/ctr", std::to_string(80 * gib), 79 * gib, 32 * gib);
+  stat("anon 1\nactive_file 5\n");
+  Expect(CgroupAvailableBytes(root, member, host) == 1 * gib,
+         "memory.stat without inactive_file keeps memory.current as used");
+  stat("inactive_file " + std::to_string(32 * gib) + "\nfile_dirty lots\n");
+  Expect(CgroupAvailableBytes(root, member, host) == 1 * gib,
+         "a malformed memory.stat value is ignored");
+  stat("inactive_file notanumber\n");
+  Expect(CgroupAvailableBytes(root, member, host) == 1 * gib,
+         "a malformed inactive_file value is ignored");
+  stat("inactive_file " + std::to_string(32 * gib) + "\nfile_dirty " +
+       std::to_string(3 * gib) + "\nfile_writeback " + std::to_string(1 * gib) +
+       "\n");
+  Expect(CgroupAvailableBytes(root, member, host) == 29 * gib,
+         "dirty and writeback pages stay charged");
+  stat("inactive_file " + std::to_string(2 * gib) + "\nfile_dirty " +
+       std::to_string(5 * gib) + "\n");
+  Expect(CgroupAvailableBytes(root, member, host) == 1 * gib,
+         "dirty pages beyond inactive_file reclaim nothing");
+
+  level("pod/ctr", std::to_string(80 * gib), 10 * gib, 32 * gib);
+  Expect(CgroupAvailableBytes(root, member, host) == 80 * gib,
+         "inactive file larger than current saturates");
+
+  level("pod/ctr", std::to_string(80 * gib), 79 * gib, 32 * gib);
+  level("pod", std::to_string(40 * gib), 30 * gib, 5 * gib);
+  Expect(CgroupAvailableBytes(root, member, host) == 15 * gib,
+         "a tighter parent limit wins");
+
+  level("pod/ctr", "max", 79 * gib, 32 * gib);
+  Expect(CgroupAvailableBytes(root, member, host) == 15 * gib,
+         "an unlimited level defers to its ancestors");
+  fs::remove_all(root / "pod");
+  level("", "max", 79 * gib, 32 * gib);
+  level("pod/ctr", "max", 79 * gib, 32 * gib);
+  Expect(CgroupAvailableBytes(root, member, host) == host,
+         "unlimited cgroups leave host availability unchanged");
+  fs::remove_all(root);
+}
+
 void TestSnapshotStartupReportsSelectedLimits() {
   class ChangingHeadroomRunner final : public SnapshotRunner {
   public:
@@ -2179,6 +2586,161 @@ void TestSnapshotStartupReportsSelectedLimits() {
          "startup maximum must not be below the selected cache capacity");
   Expect(automatic == 6 * gib && maximum == 8 * gib,
          "startup limits describe the claim that selected cache capacity");
+}
+
+void TestCacheOptionBoundsAreRefused() {
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<PersistentSnapshotRunner>(stats, "artifact-A");
+  const auto refused = [&](std::optional<TextRunnerDiskCacheOptions> disk,
+                           gufo::server::TextRunnerRamCacheOptions ram) {
+    try {
+      TextRunnerPool pool(runner, 1, std::move(disk), ram);
+    } catch (const std::invalid_argument&) {
+      return true;
+    }
+    return false;
+  };
+  auto zero = WithoutTailCheckpoints();
+  zero.shared_prefix_min_tokens = 0;
+  Expect(refused(std::nullopt, zero),
+         "a zero shared prefix minimum is refused, not taken as always");
+  auto one = WithoutTailCheckpoints();
+  one.shared_prefix_min_tokens = 1;
+  Expect(!refused(std::nullopt, one), "a one-token shared prefix minimum loads");
+  TemporaryDirectory directory;
+  const auto read_ahead = [&](std::size_t blocks) {
+    return TextRunnerDiskCacheOptions{
+        .directory = directory.path(),
+        .capacity_bytes = 1024 * 1024,
+        .staging_capacity_bytes = 64 * 1024,
+        .read_ahead_blocks = blocks,
+    };
+  };
+  Expect(!refused(read_ahead(TextRunnerDiskCacheOptions::kMaxReadAheadBlocks),
+                  WithoutTailCheckpoints()),
+         "the largest row block read-ahead loads");
+  Expect(refused(read_ahead(TextRunnerDiskCacheOptions::kMaxReadAheadBlocks + 1),
+                 WithoutTailCheckpoints()),
+         "a row block read-ahead past its bound is refused");
+}
+
+void TestCacheBudgetFloorRefusesDiskBudgetsBelowOneCheckpoint() {
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<PersistentSnapshotRunner>(stats, "artifact-A");
+  runner->checkpoint_bound = gufo::server::TextRunnerCheckpointBound{
+      .ram_snapshot_bytes = 200, .persistent_payload_bytes = 1000};
+  const auto file_bytes = gufo::server::ContinuationDiskStore::FileBytes(
+      std::string_view("artifact-A").size(), 64, 1000);
+  const auto refused = [&](std::optional<TextRunnerDiskCacheOptions> disk,
+                           std::size_t ram, std::string_view option) {
+    try {
+      TextRunnerPool pool(runner, 1, std::move(disk), {.capacity_bytes = ram});
+    } catch (const std::invalid_argument& error) {
+      const std::string message = error.what();
+      return message.starts_with(option) &&
+             message.find(std::to_string(file_bytes)) != std::string::npos;
+    }
+    return false;
+  };
+  TemporaryDirectory directory;
+  const auto disk = [&](std::size_t capacity, std::size_t staging) {
+    return TextRunnerDiskCacheOptions{.directory = directory.path(),
+                                      .capacity_bytes = capacity,
+                                      .staging_capacity_bytes = staging};
+  };
+  {
+    // A smaller retained snapshot budget sends such checkpoints to disk.
+    std::ostringstream startup_log;
+    auto* previous = std::clog.rdbuf(startup_log.rdbuf());
+    {
+      TextRunnerPool pool(runner, 1, disk(file_bytes, file_bytes),
+                          {.capacity_bytes = 199});
+    }
+    std::clog.rdbuf(previous);
+    Expect(startup_log.str().find("status=snapshot_below route=disk") !=
+                   std::string::npos &&
+               startup_log.str().find("status=pass") != std::string::npos,
+           "a retained snapshot budget below one checkpoint is reported");
+  }
+  Expect(refused(disk(file_bytes - 1, file_bytes), 256, "--cache-disk-bytes"),
+         "a disk budget below one checkpoint file is refused");
+  Expect(refused(disk(file_bytes, file_bytes - 1), 256,
+                 "--cache-disk-staging-bytes"),
+         "a staging limit below one checkpoint file is refused");
+  {
+    TextRunnerPool pool(runner, 1, disk(file_bytes, file_bytes),
+                        {.capacity_bytes = 200});
+  }
+  // Automatic snapshot sizing is not checked.
+  {
+    TextRunnerPool pool(runner, 1, std::nullopt, WithoutTailCheckpoints());
+  }
+}
+
+void TestPreparedConstraintVocabularyKeepsGrammarBehavior() {
+  // Startup preparation changes when the vocabulary is built, not
+  // what it allows: one build, reused by every binding, with the same masks
+  // and accepted states as a runner that builds it for its first request.
+  class VocabularyRunner final : public FakeRunner {
+  public:
+    VocabularyRunner() : FakeRunner(std::make_shared<FakeStats>()) {}
+    std::shared_ptr<const gufo::sampling::ConstraintVocabulary>
+    BuildConstraintVocabulary() const override {
+      ++builds;
+      // Single bytes, a few multi-byte pieces and a stop token.
+      static const std::vector<std::string> extra{"{\"", "\":", "\",\"",
+                                                  "ab",  "12",  "\"}"};
+      return std::make_shared<gufo::sampling::ConstraintVocabulary>(
+          128 + extra.size() + 1, [](std::uint32_t id) {
+            if (id < 128)
+              return gufo::sampling::ConstraintVocabulary::Piece{
+                  std::string(1, static_cast<char>(id)), false};
+            if (id < 128 + extra.size())
+              return gufo::sampling::ConstraintVocabulary::Piece{
+                  extra[id - 128], false};
+            return gufo::sampling::ConstraintVocabulary::Piece{"", true};
+          });
+    }
+    mutable std::size_t builds{0};
+  };
+  const VocabularyRunner prepared;
+  const VocabularyRunner lazy;
+  const auto size = prepared.PrepareConstraintVocabulary();
+  Expect(size == 135 && prepared.PrepareConstraintVocabulary() == size &&
+             prepared.builds == 1,
+         "preparation builds the vocabulary once");
+  const auto grammar = gufo::sampling::JsonConstraint::Compile(
+      gufo::json::parse(
+          R"({"type":"object","properties":{"keyword":{"type":"string"},)"
+          R"("n":{"type":"integer"}},"required":["keyword","n"],)"
+          R"("additionalProperties":false})"),
+      false);
+  const auto other = gufo::sampling::JsonConstraint::Compile(
+      gufo::json::parse(
+          R"({"type":"object","properties":{},"additionalProperties":false})"),
+      false);
+  const auto binding = prepared.BindConstraint(grammar);
+  Expect(prepared.BindConstraint(other)->vocabulary == binding->vocabulary &&
+             prepared.builds == 1,
+         "constrained requests reuse the prepared vocabulary");
+  const auto reference = lazy.BindConstraint(grammar);
+  Expect(lazy.builds == 1, "without preparation the first binding builds it");
+  // {"keyword":"ab","n":12} in mixed single- and multi-byte pieces.
+  const std::vector<std::uint32_t> tokens{128, 'k', 'e', 'y', 'w', 'o',
+                                          'r', 'd', 129, '"', 131, 130,
+                                          'n', 129, 132, '}'};
+  auto state = grammar->Start();
+  auto expected = grammar->Start();
+  for (const auto token : tokens) {
+    const auto mask = binding->Allowed(state);
+    Expect(*mask == *reference->Allowed(expected) && (*mask)[token],
+           "a prepared vocabulary allows the same tokens");
+    state = binding->vocabulary->Accept(*grammar, state, token);
+    expected = reference->vocabulary->Accept(*grammar, expected, token);
+  }
+  Expect(grammar->Complete(state) && grammar->Complete(expected) &&
+             *binding->Allowed(state) == *reference->Allowed(expected),
+         "both bindings complete the same output");
 }
 
 void TestServerInstructionsAreFraming() {
@@ -2422,9 +2984,108 @@ void TestServerInstructionsAreFraming() {
 
 }  // namespace
 
+
+// Paged rows: a runner whose states take blocks of one shared pool.
+class RowBlockRunner final : public SnapshotRunner {
+public:
+  using SnapshotRunner::SnapshotRunner;
+  static constexpr std::size_t kTotalBlocks = 40;
+  static constexpr std::size_t kBlockRows = 4;
+
+  [[nodiscard]] RowBlockPool RowBlocks() const override {
+    const std::lock_guard lock(mutex_);
+    std::size_t held = 0;
+    for (const auto& [state, blocks] : reserved_)
+      held += blocks;
+    return {.total_blocks = kTotalBlocks,
+            .free_blocks = kTotalBlocks - held,
+            .block_rows = kBlockRows};
+  }
+  [[nodiscard]] bool ReserveRowBlocks(TextRunnerState& state,
+                                      std::size_t rows) const override {
+    const std::size_t need =
+        (rows + kBlockRows - 1) / kBlockRows + kRowBlockCopyMargin;
+    if (RowBlocks().free_blocks < need)
+      return false;
+    const std::lock_guard lock(mutex_);
+    reserved_[&state] = need;
+    return true;
+  }
+  void ReleaseRowBlocks(TextRunnerState& state) const noexcept override {
+    const std::lock_guard lock(mutex_);
+    reserved_.erase(&state);
+  }
+
+private:
+  mutable std::mutex mutex_;
+  mutable std::unordered_map<const TextRunnerState*, std::size_t> reserved_;
+};
+
+// Admission waits while the row pool is short and busy seats hold the rows;
+// a request the pool cannot hold is refused by name; released rows let the
+// waiting admission in.
+void TestRowBlockAdmissionWaitsAndRefuses() {
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<RowBlockRunner>(stats);
+  TextRunnerPool pool(runner, 2, std::nullopt, WithoutTailCheckpoints());
+  Expect(pool.AdmissionRowBlocks(60) == 15 + TextModelRunner::kRowBlockCopyMargin,
+         "admission counts the rows' blocks and the copy margin");
+  auto first = pool.Acquire({1, 2, 3});
+  first.ReserveRows(57);
+  Expect(runner->RowBlocks().free_blocks == RowBlockRunner::kTotalBlocks - 23,
+         "a request holds its prompt and max_tokens in blocks");
+  const std::vector<TextRunnerToken> waiting{9};
+  Expect(!pool.AdmissionReady(waiting, 60),
+         "an admission the pool cannot hold yet waits for busy seats");
+  auto second = pool.Acquire({9});
+  bool refused = false;
+  try {
+    second.ReserveRows(60);
+  } catch (const std::length_error& error) {
+    refused = std::string_view(error.what()).find("--kv-pool-bytes") !=
+              std::string_view::npos;
+  }
+  Expect(refused, "a request beyond the free blocks is refused by name");
+  second.Invalidate();
+  first.Invalidate();
+  Expect(runner->RowBlocks().free_blocks == RowBlockRunner::kTotalBlocks &&
+             pool.AdmissionReady(waiting, 60),
+         "released rows admit the waiting request");
+
+  // A continuation counts only the blocks past the prefix it reuses: its
+  // frontier's blocks are in the pool already.
+  std::vector<TextRunnerToken> conversation(40);
+  for (std::size_t i = 0; i < conversation.size(); ++i)
+    conversation[i] = static_cast<TextRunnerToken>(i + 1);
+  {
+    auto root = pool.Acquire(conversation);
+    (void)root.Prefill(conversation.size());
+    (void)root.SelectNext();
+    root.Advance();
+    root.Commit();
+  }
+  auto other = pool.Acquire({7});
+  other.ReserveRows(57);  // leaves 17 free blocks
+  auto continued = conversation;
+  continued.push_back(99);
+  Expect(pool.AdmissionReady(continued, 16),
+         "a continuation is not charged for the blocks it reuses");
+  // The same prompt sent without cache reuse prefills every row: it is
+  // charged in full, and the retained frontier it will not use may go.
+  Expect(pool.CachedPrefixTokens(continued, nullptr) == conversation.size(),
+         "the frontier is retained before a cold admission");
+  (void)pool.AdmissionReady(continued, 16, /*reuse_prompt=*/false);
+  Expect(pool.CachedPrefixTokens(continued, nullptr) == 0,
+         "a request that reuses nothing is charged for every block and may "
+         "drop the prefix it does not use");
+  other.Invalidate();
+}
+
 int main() {
+  TestRowBlockAdmissionWaitsAndRefuses();
   TestPromptCountingValidatesCapabilitiesBeforeInference();
   TestServerInstructionsAreFraming();
+  TestPreparedConstraintVocabularyKeepsGrammarBehavior();
   // The cache warning assertion in this binary matches the plain "[WARN]
   // [cache]" text captured from a redirected sink; a TTY stderr tints it.
   ::setenv("NO_COLOR", "1", 1);
@@ -2442,6 +3103,10 @@ int main() {
   TestWarmChatCheckpointsStopAtTheStableBoundary();
   TestWarmHitAdvancesTheStableCheckpoint();
   TestHistoryEditsRestoreIntermediateCheckpoints();
+  TestTailCheckpointsRestoreNearThePromptEnd();
+  TestTailCheckpointsKeepFullPrefillPasses();
+  TestTailCheckpointsCountBackPastAnExistingStop();
+  TestTailCheckpointsNeedBlockSharingSnapshots();
   TestChatFallbackSurvivesSnapshotBudgetPressure();
   TestFullChatCheckpointRestoresWithoutSuffixPrefill();
   TestDiskOnlyCaptureReservesBudgetBeforeCommit();
@@ -2472,7 +3137,12 @@ int main() {
 
   TestSnapshotCacheCapacityIsReportedAtStartup();
   TestMeminfoAvailableExcludesFreeCma();
+  TestCgroupAvailableCountsReclaimableCache();
   TestSnapshotStartupReportsSelectedLimits();
+  TestCacheBudgetFloorRefusesDiskBudgetsBelowOneCheckpoint();
+  TestCacheOptionBoundsAreRefused();
+  TestReleasedFrontierIsWrittenBackInPlace();
+  TestEvictionWritesTheFrontierBeforeReuse();
   TestPersistentSnapshotRestoresAcrossPools();
   TestSharedPrefixIsLearnedAndRestoredAcrossConversations();
   TestRamLearnsDivergenceBoundaries();

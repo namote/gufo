@@ -66,12 +66,14 @@ gufo::core::ModelConfig ProductionQwen27BConfig() {
 }
 
 // Verification must preserve every scalar attention bit across the online,
-// split-K and shared-KV routes, including a single-row scratch fallback.
-void TestCausalDecodeRows() {
+// split-K, shared-KV and wave64 routes, including a single-row scratch
+// fallback. Even KV head counts reach the wave64 kernel from 512 tokens;
+// four KV heads is the production 27B shape (24 query heads of 256).
+void TestCausalDecodeRows(unsigned kv_heads) {
   using gufo::test::DeviceBuffer;
-  constexpr unsigned heads = 6, kv_heads = 1, dim = 256, rows = 8;
-  constexpr unsigned context = 65544, layer = 1, width = heads * dim;
-  constexpr std::size_t cache_size = 2U * context * kv_heads * dim;
+  constexpr unsigned dim = 256, rows = 8, context = 65544, layer = 1;
+  const unsigned heads = 6 * kv_heads, width = heads * dim;
+  const std::size_t cache_size = std::size_t{2} * context * kv_heads * dim;
   std::vector<float> query(rows * width), gate(query.size()), cache(cache_size);
   std::vector<__half> cache_half(cache_size);
   for (std::size_t i = 0; i < query.size(); ++i) {
@@ -98,7 +100,7 @@ void TestCausalDecodeRows() {
           for (unsigned row = 0; row < batch; ++row) {
             gufo::hip::LaunchAttention(q.data() + row * width, nullptr, nullptr,
                                        gated ? g.data() + row * width : nullptr,
-                                       cache32, cache32, cache16, cache16,
+                                       cache32, cache32, cache16, cache16, gufo::hip::KvBlockTable{},
                                        expected.data() + row * width, layer,
                                        start + row, context, heads, kv_heads,
                                        dim, nullptr, scratch.data(), true);
@@ -107,7 +109,7 @@ void TestCausalDecodeRows() {
           for (auto capacity : {row_scratch, scratch.size()}) {
             gufo::hip::LaunchCausalDecodeAttention(
                 q.data(), gated ? g.data() : nullptr, cache32, cache32, cache16,
-                cache16, actual.data(), layer, start, batch, context, heads,
+                cache16, gufo::hip::KvBlockTable{}, actual.data(), layer, start, batch, context, heads,
                 kv_heads, dim, nullptr, {scratch.data(), capacity});
             const auto result = actual.CopyToHost();
             Expect(std::memcmp(reference.data(), result.data(),
@@ -164,11 +166,14 @@ void TestCanonicalMemoryAccountingAndSnapshot() {
   const std::size_t kv_elements = 2U * config.FullAttentionLayerCount() *
                                   context * config.num_key_value_heads *
                                   config.head_dim;
-  const std::size_t duplicate_bytes =
-      kv_elements * (sizeof(float) - sizeof(std::uint16_t));
+  // FP16 rows come from the block pool in whole blocks.
+  const std::size_t fp16_kv_elements =
+      kv_elements / context *
+      (gufo::hip::KvBlockPool::BlocksFor(context) * gufo::hip::kKvBlockTokens);
   Expect(fp32_usage.request_state_bytes - fp16_usage.request_state_bytes ==
-             duplicate_bytes,
-         "FP16-only accounting must remove exactly the duplicate KV bytes");
+             kv_elements * sizeof(float) -
+                 fp16_kv_elements * sizeof(std::uint16_t),
+         "FP16-only accounting must count one block-rounded KV copy");
   Expect(
       fp32_usage.temporary_scratch_bytes == fp16_usage.temporary_scratch_bytes,
       "KV storage selection must not change shared scratch accounting");
@@ -194,8 +199,12 @@ void TestCanonicalMemoryAccountingAndSnapshot() {
   HIP_CHECK(hipMemcpy(fp32_arena.d_kv_cache, source.data(),
                       source.size() * sizeof(float), hipMemcpyHostToDevice));
   auto saved = fp32_arena.SaveSnapshot(7);
-  std::vector<std::uint8_t> serialized(saved->CompactPayloadBytes());
+  std::vector<std::uint8_t> serialized(saved->CompactPayloadBytes(), 0xA5);
   saved->SerializeCompact(serialized);
+  std::vector<std::uint8_t> overwritten(serialized.size(), 0x5A);
+  saved->SerializeCompact(overwritten);
+  Expect(overwritten == serialized,
+         "FP32 snapshot must overwrite every destination byte");
   for (const bool disk : {false, true}) {
     HIP_CHECK(
         hipMemset(fp32_arena.d_kv_cache, 0, source.size() * sizeof(float)));
@@ -226,8 +235,12 @@ void TestCompactPersistentSnapshotRoundTrip() {
   const std::size_t attention_layers = config.FullAttentionLayerCount();
   const std::size_t kv_width =
       static_cast<std::size_t>(config.num_key_value_heads) * config.head_dim;
+  // The FP16 plane holds whole blocks of rows per layer.
+  const std::size_t layer_rows = source.GetKvBlockTable().layer_tokens;
+  Expect(layer_rows == gufo::hip::kKvBlockTokens,
+         "a 32-token arena must own one KV block");
   const std::size_t full_kv_elements_per_plane =
-      attention_layers * context * kv_width;
+      attention_layers * layer_rows * kv_width;
   const std::size_t live_kv_elements_per_plane =
       attention_layers * valid_context * kv_width;
   std::vector<std::uint16_t> source_kv(2U * full_kv_elements_per_plane);
@@ -279,9 +292,13 @@ void TestCompactPersistentSnapshotRoundTrip() {
              snapshot->PayloadBytes() + header_bytes,
          "GPU and disk snapshots must retain the same compact state");
 
-  std::vector<std::uint8_t> payload(snapshot->CompactPayloadBytes());
+  std::vector<std::uint8_t> payload(snapshot->CompactPayloadBytes(), 0xA5);
   Expect(snapshot->SerializeCompact(payload) == payload.size(),
          "compact snapshot serializer byte count");
+  std::vector<std::uint8_t> overwritten(payload.size(), 0x5A);
+  Expect(snapshot->SerializeCompact(overwritten) == overwritten.size() &&
+             overwritten == payload,
+         "compact snapshot must overwrite every destination byte");
 
   QwenGpuArena restored(config, context, policy);
   HIP_CHECK(hipMemset(restored.d_attention_kv_f16, 0xA5,
@@ -308,7 +325,7 @@ void TestCompactPersistentSnapshotRoundTrip() {
       for (std::size_t position = 0; position < context; ++position) {
         for (std::size_t column = 0; column < kv_width; ++column) {
           const std::size_t index = plane * full_kv_elements_per_plane +
-                                    layer * context * kv_width +
+                                    layer * layer_rows * kv_width +
                                     position * kv_width + column;
           if (position < valid_context) {
             Expect(restored_kv[index] == source_kv[index],
@@ -477,12 +494,12 @@ void TestOnlineAndGraphDecodeFp16Equivalence() {
     gufo::hip::LaunchAttention(
         d_query + attention_offset, d_key + kv_offset, d_value + kv_offset,
         d_gate + attention_offset, d_fp32_cache, d_fp32_cache + cache_elements,
-        nullptr, nullptr, d_fp32_out + attention_offset, 0, position,
+        nullptr, nullptr, gufo::hip::KvBlockTable{}, d_fp32_out + attention_offset, 0, position,
         max_context, num_heads, num_kv_heads, head_dim);
     gufo::hip::LaunchAttention(
         d_query + attention_offset, d_key + kv_offset, d_value + kv_offset,
         d_gate + attention_offset, nullptr, nullptr, d_fp16_cache,
-        static_cast<std::uint16_t*>(d_fp16_cache) + cache_elements,
+        static_cast<std::uint16_t*>(d_fp16_cache) + cache_elements, gufo::hip::KvBlockTable{},
         d_fp16_out + attention_offset, 0, position, max_context, num_heads,
         num_kv_heads, head_dim);
   }
@@ -495,14 +512,14 @@ void TestOnlineAndGraphDecodeFp16Equivalence() {
   gufo::hip::LaunchAttention(d_query + graph_attention_offset,
                              d_key + graph_kv_offset, d_value + graph_kv_offset,
                              d_gate + graph_attention_offset, d_fp32_cache,
-                             d_fp32_cache + cache_elements, nullptr, nullptr,
+                             d_fp32_cache + cache_elements, nullptr, nullptr, gufo::hip::KvBlockTable{},
                              d_fp32_out + graph_attention_offset, 0, d_position,
                              max_context, num_heads, num_kv_heads, head_dim);
   gufo::hip::LaunchAttention(
       d_query + graph_attention_offset, d_key + graph_kv_offset,
       d_value + graph_kv_offset, d_gate + graph_attention_offset, nullptr,
       nullptr, d_fp16_cache,
-      static_cast<std::uint16_t*>(d_fp16_cache) + cache_elements,
+      static_cast<std::uint16_t*>(d_fp16_cache) + cache_elements, gufo::hip::KvBlockTable{},
       d_fp16_out + graph_attention_offset, 0, d_position, max_context,
       num_heads, num_kv_heads, head_dim);
   HIP_CHECK(hipDeviceSynchronize());
@@ -593,7 +610,7 @@ void TestSplitKDecodeFp16Equivalence() {
   gufo::hip::LaunchBatchedFusedQKNormRoPEKvWrite(
       d_query, d_key, d_value, d_q_weight, d_k_weight, d_query, d_key,
       d_fp32_cache, d_fp32_cache + cache_elements, d_fp16_cache,
-      static_cast<std::uint16_t*>(d_fp16_cache) + cache_elements, 0, 0,
+      static_cast<std::uint16_t*>(d_fp16_cache) + cache_elements, gufo::hip::KvBlockTable{}, 0, 0,
       positions, max_context, num_heads, num_kv_heads, head_dim, rotary_dim,
       1000000.0F);
   const std::size_t final_attention_offset = (positions - 1U) * attention_width;
@@ -601,7 +618,7 @@ void TestSplitKDecodeFp16Equivalence() {
   gufo::hip::LaunchAttention(
       d_query + final_attention_offset, d_key + final_kv_offset,
       d_value + final_kv_offset, d_gate + final_attention_offset, d_fp32_cache,
-      d_fp32_cache + cache_elements, nullptr, nullptr, d_fp32_out, 0,
+      d_fp32_cache + cache_elements, nullptr, nullptr, gufo::hip::KvBlockTable{}, d_fp32_out, 0,
       static_cast<std::uint32_t>(positions - 1U), max_context, num_heads,
       num_kv_heads, head_dim, nullptr, d_fp32_scratch,
       /*skip_kv_write=*/true);
@@ -609,7 +626,7 @@ void TestSplitKDecodeFp16Equivalence() {
       d_query + final_attention_offset, d_key + final_kv_offset,
       d_value + final_kv_offset, d_gate + final_attention_offset, nullptr,
       nullptr, d_fp16_cache,
-      static_cast<std::uint16_t*>(d_fp16_cache) + cache_elements, d_fp16_out, 0,
+      static_cast<std::uint16_t*>(d_fp16_cache) + cache_elements, gufo::hip::KvBlockTable{}, d_fp16_out, 0,
       static_cast<std::uint32_t>(positions - 1U), max_context, num_heads,
       num_kv_heads, head_dim, nullptr, d_fp16_scratch,
       /*skip_kv_write=*/true);
@@ -656,7 +673,9 @@ int main() {
   if (device_status != 0) {
     return device_status;
   }
-  TestCausalDecodeRows();
+  for (const unsigned kv_heads : {1U, 2U, 4U}) {
+    TestCausalDecodeRows(kv_heads);
+  }
   TestProductionMemoryScaling();
   TestCanonicalMemoryAccountingAndSnapshot();
   TestCompactPersistentSnapshotRoundTrip();

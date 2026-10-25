@@ -587,6 +587,7 @@ void PrintServeHelp(std::string_view program_name,
     std::string reasoning_mode = "auto";
     std::string reasoning_effort = "auto";
     std::string preserve_thinking = "auto";
+    std::int64_t reasoning_budget = -1;
     std::string speculative_backend;
     std::string dflash_model_path;
     std::string draft_policy;
@@ -609,9 +610,22 @@ void PrintServeHelp(std::string_view program_name,
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
     std::size_t cache_ram_bytes = 0;
+    std::size_t kv_pool_bytes = 0;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
+    std::size_t cache_disk_block_bytes =
+        server::TextRunnerDiskCacheOptions::kDefaultBlockCapacityBytes;
+    std::size_t cache_grid_tokens = 0;
+    std::size_t cache_tail_checkpoints =
+        server::TextRunnerRamCacheOptions{}.tail_checkpoints;
+    std::size_t cache_idle_write_ms = 0;
+    bool no_cache_resident_blocks = false;
+    std::size_t cache_disk_read_ahead =
+        server::TextRunnerDiskCacheOptions{}.read_ahead_blocks;
+    bool no_shared_pass_scratch = false;
+    std::size_t shared_prefix_min_tokens =
+        server::TextRunnerRamCacheOptions{}.shared_prefix_min_tokens;
     std::size_t cache_disk_staging_bytes = 0;
     bool log_progress = false;
     std::string trace_path;
@@ -659,6 +673,11 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("", "--preserve-thinking", "MODE",
                      "Replay prior reasoning: on, off, or auto",
                      "Reasoning Defaults", &preserve_thinking);
+    parser.AddOption(
+        "", "--reasoning-budget", "N",
+        "Reasoning tokens before </think> is forced: -1 unlimited, 0 none "
+        "(default: -1)",
+        "Reasoning Defaults", &reasoning_budget);
 
     // Speculative & Hardware
     parser.AddOption("", "--speculative", "MODE",
@@ -724,6 +743,13 @@ void PrintServeHelp(std::string_view program_name,
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
     parser.AddOption(
+        "", "--kv-pool-bytes", "N",
+        "Paged attention KV (Qwen 27B): one device pool of N bytes shared by "
+        "every session, taken in 64-token blocks as they write, with shared "
+        "prefixes stored once (default: 0 = each session holds its whole "
+        "context). Must hold one full-context session; other models refuse it",
+        "Cache", &kv_pool_bytes);
+    parser.AddOption(
         "", "--cache-ram-bytes", "N",
         "Retained RAM-cache byte budget (default: 0 = auto: half of free "
         "RAM, at most 32 GiB; explicit values may use free RAM minus 4 GiB). "
@@ -737,6 +763,46 @@ void PrintServeHelp(std::string_view program_name,
                      "Retained disk-cache byte budget (default: " +
                          std::to_string(cache_disk_bytes) + ")",
                      "Cache", &cache_disk_bytes);
+    parser.AddOption("", "--cache-disk-block-bytes", "N",
+                     "Disk budget for paged KV blocks under DIR/blocks, one file "
+                     "per 64-token block shared by every record of the same prefix "
+                     "(with --kv-pool-bytes; default: " +
+                         std::to_string(cache_disk_block_bytes) + ")",
+                     "Cache", &cache_disk_block_bytes);
+    parser.AddOption("", "--cache-grid-tokens", "N",
+                     "Long prompts also keep a checkpoint every N tokens, in RAM and on "
+                     "disk, for later prompts sharing a long prefix (default: 0 = none)",
+                     "Cache", &cache_grid_tokens);
+    parser.AddOption("", "--cache-tail-checkpoints", "K",
+                     "Long prompts also keep K RAM checkpoints, one every 1024 tokens over "
+                     "the prompt end, for later prompts that differ only near the end; "
+                     "applied with paged KV (--kv-pool-bytes) only, logged as not applied "
+                     "otherwise (default: 3; 0 = none)",
+                     "Cache", &cache_tail_checkpoints);
+    parser.AddOption("", "--cache-disk-read-ahead", "N",
+                     "Restoring row blocks from disk, read and check N blocks ahead on "
+                     "their own threads (each holds one block in host memory; default: " +
+                         std::to_string(cache_disk_read_ahead) + ", 0 = one at a time, at most " +
+                             std::to_string(server::TextRunnerDiskCacheOptions::kMaxReadAheadBlocks) + ")",
+                     "Cache", &cache_disk_read_ahead);
+    parser.AddOption("", "--cache-idle-write-ms", "MS",
+                     "Write a released conversation's disk record after it has been idle "
+                     "MS milliseconds, not only when an eviction needs its session "
+                     "(default: 0 = on eviction and at shutdown only)",
+                     "Cache", &cache_idle_write_ms);
+    parser.AddFlag("", "--no-cache-resident-blocks",
+                   "Do not index resident KV blocks: disk restores read every "
+                   "block file even when a session holds the same rows",
+                   "Cache", &no_cache_resident_blocks);
+    parser.AddFlag("", "--no-shared-pass-scratch",
+                   "Give every session its own prompt-pass scratch (Qwen: about "
+                   "2 GiB each) instead of one shared by all sessions",
+                   "Scheduling", &no_shared_pass_scratch);
+    parser.AddOption("", "--shared-prefix-min-tokens", "N",
+                     "Requests sharing at least N more prompt tokens than they can "
+                     "restore wait for a peer prefilling them, and a checkpoint is kept "
+                     "where prompts diverge after a common prefix (default: 128, at least 1)",
+                     "Cache", &shared_prefix_min_tokens);
     parser.AddOption(
         "", "--cache-disk-staging-bytes", "N",
         "Flash-Next: pinned disk transfer buffer allocated at startup within "
@@ -1147,6 +1213,7 @@ int RunServe(std::span<const char* const> args) {
     std::string reasoning_mode = "auto";
     std::string reasoning_effort = "auto";
     std::string preserve_thinking = "auto";
+    std::int64_t reasoning_budget = -1;
     std::string speculative_backend;
     std::string dflash_model_path;
     std::string draft_policy;
@@ -1172,9 +1239,22 @@ int RunServe(std::span<const char* const> args) {
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
     std::size_t cache_ram_bytes = 0;
+    std::size_t kv_pool_bytes = 0;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
+    std::size_t cache_disk_block_bytes =
+        server::TextRunnerDiskCacheOptions::kDefaultBlockCapacityBytes;
+    std::size_t cache_grid_tokens = 0;
+    std::size_t cache_tail_checkpoints =
+        server::TextRunnerRamCacheOptions{}.tail_checkpoints;
+    std::size_t cache_idle_write_ms = 0;
+    bool no_cache_resident_blocks = false;
+    std::size_t cache_disk_read_ahead =
+        server::TextRunnerDiskCacheOptions{}.read_ahead_blocks;
+    bool no_shared_pass_scratch = false;
+    std::size_t shared_prefix_min_tokens =
+        server::TextRunnerRamCacheOptions{}.shared_prefix_min_tokens;
     std::size_t cache_disk_staging_bytes = 0;
     bool log_progress = false;
     std::string trace_path;
@@ -1216,6 +1296,11 @@ int RunServe(std::span<const char* const> args) {
     llm_parser.AddOption("", "--preserve-thinking", "MODE",
                          "Replay prior reasoning: on, off, or auto",
                          "Reasoning Defaults", &preserve_thinking);
+    llm_parser.AddOption(
+        "", "--reasoning-budget", "N",
+        "Reasoning tokens before </think> is forced: -1 unlimited, 0 none "
+        "(default: -1)",
+        "Reasoning Defaults", &reasoning_budget);
     llm_parser.AddOption("", "--speculative", "MODE",
                          "HTTP draft backend: dspark, dflash2, mtp, or off",
                          "Speculative", &speculative_backend);
@@ -1295,6 +1380,13 @@ int RunServe(std::span<const char* const> args) {
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
     llm_parser.AddOption(
+        "", "--kv-pool-bytes", "N",
+        "Paged attention KV (Qwen 27B): one device pool of N bytes shared by "
+        "every session, taken in 64-token blocks as they write, with shared "
+        "prefixes stored once (default: 0 = each session holds its whole "
+        "context). Must hold one full-context session; other models refuse it",
+        "Cache", &kv_pool_bytes);
+    llm_parser.AddOption(
         "", "--cache-ram-bytes", "N",
         "Retained RAM-cache byte budget (default: 0 = auto: half of free "
         "RAM, at most 32 GiB; explicit values may use free RAM minus 4 GiB). "
@@ -1308,6 +1400,46 @@ int RunServe(std::span<const char* const> args) {
                          "Retained disk-cache byte budget (default: " +
                              std::to_string(cache_disk_bytes) + ")",
                          "Cache", &cache_disk_bytes);
+    llm_parser.AddOption("", "--cache-disk-block-bytes", "N",
+                         "Disk budget for paged KV blocks under DIR/blocks, one file "
+                         "per 64-token block shared by every record of the same prefix "
+                         "(with --kv-pool-bytes; default: " +
+                             std::to_string(cache_disk_block_bytes) + ")",
+                         "Cache", &cache_disk_block_bytes);
+    llm_parser.AddOption("", "--cache-grid-tokens", "N",
+                         "Long prompts also keep a checkpoint every N tokens, in RAM and on "
+                         "disk, for later prompts sharing a long prefix (default: 0 = none)",
+                         "Cache", &cache_grid_tokens);
+    llm_parser.AddOption("", "--cache-tail-checkpoints", "K",
+                         "Long prompts also keep K RAM checkpoints, one every 1024 tokens over "
+                         "the prompt end, for later prompts that differ only near the end; "
+                         "applied with paged KV (--kv-pool-bytes) only, logged as not applied "
+                         "otherwise (default: 3; 0 = none)",
+                         "Cache", &cache_tail_checkpoints);
+    llm_parser.AddOption("", "--cache-disk-read-ahead", "N",
+                         "Restoring row blocks from disk, read and check N blocks ahead on "
+                         "their own threads (each holds one block in host memory; default: " +
+                             std::to_string(cache_disk_read_ahead) + ", 0 = one at a time, at most " +
+                             std::to_string(server::TextRunnerDiskCacheOptions::kMaxReadAheadBlocks) + ")",
+                         "Cache", &cache_disk_read_ahead);
+    llm_parser.AddOption("", "--cache-idle-write-ms", "MS",
+                         "Write a released conversation's disk record after it has been idle "
+                         "MS milliseconds, not only when an eviction needs its session "
+                         "(default: 0 = on eviction and at shutdown only)",
+                         "Cache", &cache_idle_write_ms);
+    llm_parser.AddFlag("", "--no-cache-resident-blocks",
+                       "Do not index resident KV blocks: disk restores read every "
+                       "block file even when a session holds the same rows",
+                       "Cache", &no_cache_resident_blocks);
+    llm_parser.AddFlag("", "--no-shared-pass-scratch",
+                       "Give every session its own prompt-pass scratch (Qwen: about "
+                       "2 GiB each) instead of one shared by all sessions",
+                       "Scheduling", &no_shared_pass_scratch);
+    llm_parser.AddOption("", "--shared-prefix-min-tokens", "N",
+                         "Requests sharing at least N more prompt tokens than they can "
+                         "restore wait for a peer prefilling them, and a checkpoint is kept "
+                         "where prompts diverge after a common prefix (default: 128, at least 1)",
+                         "Cache", &shared_prefix_min_tokens);
     llm_parser.AddOption(
         "", "--cache-disk-staging-bytes", "N",
         "Flash-Next: pinned disk transfer buffer allocated at startup within "
@@ -1383,12 +1515,30 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: speculative draft limits are invalid\n";
       return 2;
     }
-    const auto reasoning_defaults = ResolveReasoningDefaults(
+    auto reasoning_defaults = ResolveReasoningDefaults(
         reasoning_mode, reasoning_effort, preserve_thinking, &parse_err);
     if (!reasoning_defaults.has_value()) {
       std::cerr << "Error: " << parse_err << "\n";
       return 2;
     }
+    if (reasoning_budget < -1) {
+      std::cerr << "Error: --reasoning-budget must be -1 or nonnegative\n";
+      return 2;
+    }
+    if (shared_prefix_min_tokens == 0) {
+      std::cerr << "Error: --shared-prefix-min-tokens must be at least 1\n";
+      return 2;
+    }
+    if (cache_disk_read_ahead >
+        server::TextRunnerDiskCacheOptions::kMaxReadAheadBlocks) {
+      std::cerr << "Error: --cache-disk-read-ahead must be at most "
+                << server::TextRunnerDiskCacheOptions::kMaxReadAheadBlocks
+                << "\n";
+      return 2;
+    }
+    if (reasoning_budget >= 0)
+      reasoning_defaults->budget_tokens =
+          static_cast<std::size_t>(reasoning_budget);
 
     server::TextSpeculativeConfig speculative_config;
     if (speculative_backend.empty() && !dspark_model_path.empty()) {
@@ -1483,16 +1633,32 @@ int RunServe(std::span<const char* const> args) {
             .directory = cache_disk_directory,
             .capacity_bytes = cache_disk_bytes,
             .staging_capacity_bytes = cache_disk_staging_bytes,
+            .block_capacity_bytes = cache_disk_block_bytes,
+            .idle_write_ms = cache_idle_write_ms,
+            .resident_blocks = !no_cache_resident_blocks,
+            .read_ahead_blocks = cache_disk_read_ahead,
             .model_artifact_fingerprint = {},
         },
         vision_model_path, image_tokens,
-        server::TextRunnerRamCacheOptions{.capacity_bytes = cache_ram_bytes});
+        server::TextRunnerRamCacheOptions{.capacity_bytes = cache_ram_bytes,
+                                          .kv_pool_bytes = kv_pool_bytes,
+                                          .checkpoint_grid_tokens =
+                                              cache_grid_tokens,
+                                          .tail_checkpoints =
+                                              cache_tail_checkpoints,
+                                          .shared_pass_scratch =
+                                              !no_shared_pass_scratch,
+                                          .shared_prefix_min_tokens =
+                                              shared_prefix_min_tokens});
     loading.stop();
     if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }
     backend->set_model_id(served_model_name);
+    // As `gufo --version` prints it; CMake defines both for this target.
+    backend->set_served_artifact(model,
+                                 GUFO_RELEASE_VERSION " (" GUFO_REVISION ")");
     backend->set_sampling_defaults(
         max_tokens < 0 ? 0 : static_cast<std::size_t>(max_tokens),
         sampling_config, SamplingOptionsSupplied(llm_parser));

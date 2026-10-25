@@ -358,7 +358,9 @@ the `max_bytes` an explicit value may claim.
 
 Both are sampled after weights and execution states are allocated, then fixed
 for the server run. Flash-Next and Qwen3.8-27B use half the available
-host RAM, respecting container/cgroup limits. 27B also clamps this to HIP's free
+host RAM, respecting container/cgroup limits. Inactive page cache, such as
+recently read model files, counts as available because the kernel reclaims it
+before failing an allocation. Dirty and writeback pages do not. 27B also clamps this to HIP's free
 device memory. CPU and GPU allocations compete for the same physical RAM on
 Strix Halo, so HIP's free-memory estimate alone is not enough.
 For example, 44 GiB available at load gives a 22 GiB automatic RAM cache and
@@ -368,9 +370,11 @@ Memory that another process claims after startup is not subtracted. When
 other GPU servers share the machine, such as an image or speech server, set an
 explicit `--cache-ram-bytes` that leaves room for their peak use; starting
 them first only accounts for what they hold at that moment.
-The RAM payload budget excludes weights, execution states, token metadata
-and disk staging. It also excludes temporary host buffers used to save
-checkpoints to disk; this is not a limit on total server memory.
+The RAM payload budget excludes weights, execution states, token metadata,
+disk staging and Qwen's separate CPU image-preprocessing cache (up to 128 MiB
+of retained encoded/RGB vectors plus bounded metadata). It also excludes temporary
+host buffers used to save checkpoints to disk; this is not a limit on total
+server memory.
 
 The 32 GiB automatic cap limits default growth on a lightly loaded machine.
 It leaves room for several 27B histories: two 3.7 GB checkpoints per history

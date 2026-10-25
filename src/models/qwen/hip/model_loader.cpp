@@ -251,7 +251,8 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
 
 std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::Create(
     std::shared_ptr<const QwenGpuModel> model, std::string* error_msg,
-    std::uint32_t max_context, QwenExecutionPolicy policy) {
+    std::uint32_t max_context, QwenExecutionPolicy policy,
+    QwenKvPlacement kv_placement) {
   if (model == nullptr) {
     if (error_msg != nullptr) {
       *error_msg = "Qwen GPU model must not be null";
@@ -270,7 +271,7 @@ std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::Create(
   }
 
   return std::make_unique<QwenGpuExecutor>(std::move(model), max_context,
-                                           policy);
+                                           policy, std::move(kv_placement));
 }
 
 std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::CreateFromGguf(

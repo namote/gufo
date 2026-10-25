@@ -103,6 +103,22 @@ def main():
     keyed = run(load + ["-v", "--api-key", "super-secret-value"])
     assert "api_key=set" in keyed.stderr
     assert "super-secret-value" not in keyed.stderr
+    # Structured output is prepared automatically, without a separate option.
+    assert "--prepare-structured-output" not in help_text
+    check(["serve", "llm", "--model", "missing.gguf",
+           "--prepare-structured-output"], 2, "Unknown option")
+    # Cache bounds fail before the model loads.
+    check(["serve", "llm", "--model", "missing.gguf",
+           "--shared-prefix-min-tokens", "0"], 2,
+          "--shared-prefix-min-tokens must be at least 1")
+    check(["serve", "llm", "--model", "missing.gguf",
+           "--cache-disk-read-ahead", "65"], 2,
+          "--cache-disk-read-ahead must be at most 64")
+    check(["serve", "llm", "--model", "missing.gguf",
+           "--shared-prefix-min-tokens", "1", "--cache-disk-read-ahead", "64"],
+          1, "Error loading model")
+    text = check(["serve", "llm", "--help"], 0, "--cache-tail-checkpoints")
+    assert "paged KV (--kv-pool-bytes) only" in text
     for bad in ("trace", "Debug", "", "info,debug"):
         check(["serve", "llm", "--log-level", bad, "--model", "missing.gguf"],
               2, "--log-level must be error, warn, info or debug")

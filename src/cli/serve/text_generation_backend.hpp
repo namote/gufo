@@ -305,7 +305,26 @@ public:
     return {};
   }
   /// Whether the loaded backend accepts image inputs in chat requests.
+  /// Paged attention rows of the loaded model: blocks of a pool shared by
+  /// all sessions. All zero when sessions hold whole contexts.
+  struct RowBlockStatus {
+    std::size_t total_blocks{0};
+    std::size_t free_blocks{0};
+    std::size_t block_rows{0};
+    /// Resident block index (zero without one): blocks it holds, those only
+    /// it holds, and its lifetime counts.
+    std::size_t indexed_blocks{0};
+    std::size_t index_only_blocks{0};
+    std::size_t index_restored{0};
+    std::size_t index_deduplicated{0};
+    std::size_t index_released{0};
+  };
+  [[nodiscard]] virtual RowBlockStatus row_blocks() const { return {}; }
   [[nodiscard]] virtual bool supports_images() const { return false; }
+  /// The served model file and build revision, as llama-server's /props
+  /// reports them. Empty when unknown.
+  [[nodiscard]] virtual std::string model_path() const { return {}; }
+  [[nodiscard]] virtual std::string build_info() const { return {}; }
   [[nodiscard]] virtual SamplingDefaults sampling_defaults() const {
     return {};
   }

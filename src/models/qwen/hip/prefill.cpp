@@ -45,6 +45,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
   if (prompt_tokens.empty()) {
     return 0;
   }
+  const PassScratchLease pass_scratch(*this);
   replaying_ssm_state_ = false;
   arena_.DisableSsmReplayCapture();
   if (capture_prompt_hidden_) {

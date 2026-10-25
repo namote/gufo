@@ -162,7 +162,7 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse,
   // Reference: the tiled kernel, which also packs the FP16 cache.
   HIP_CHECK(hipMemset(d_out_ref, 0, q_elements * sizeof(float)));
   if (!gufo::hip::LaunchBatchedAttentionTile(
-          d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16, cache_f16_v,
+          d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16, cache_f16_v, gufo::hip::KvBlockTable{},
           d_out_ref, /*layer_idx=*/0, start_pos, batch_size, kMaxContext,
           kNumHeads, kNumKvHeads, kHeadDim, nullptr, lse_ref, key_begin,
           false)) {
@@ -174,7 +174,7 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse,
   // packed, so suppress the write and prove it reads the same bytes.
   HIP_CHECK(hipMemset(d_out_new, 0, q_elements * sizeof(float)));
   if (!gufo::hip::LaunchQwenWmmaAttention(
-          d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16, cache_f16_v,
+          d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16, cache_f16_v, gufo::hip::KvBlockTable{},
           d_out_new, /*layer_idx=*/0, start_pos, batch_size, kMaxContext,
           kNumHeads, kNumKvHeads, kHeadDim, nullptr, lse_new, key_begin,
           /*skip_kv_write=*/true)) {
@@ -236,7 +236,7 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse,
   // another, which would show up here as run-to-run drift.
   HIP_CHECK(hipMemset(d_out_new, 0, q_elements * sizeof(float)));
   if (!gufo::hip::LaunchQwenWmmaAttention(
-          d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16, cache_f16_v,
+          d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16, cache_f16_v, gufo::hip::KvBlockTable{},
           d_out_new, /*layer_idx=*/0, start_pos, batch_size, kMaxContext,
           kNumHeads, kNumKvHeads, kHeadDim, nullptr, lse_new, key_begin,
           /*skip_kv_write=*/true)) {
@@ -267,7 +267,7 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse,
         if (!gufo::hip::LaunchQwenWmmaAttention(
                 d_q + offset * attention_size, d_k, d_v,
                 d_gate + offset * attention_size, d_cache, v_cache, d_cache_f16,
-                cache_f16_v, d_out_new + offset * attention_size, 0,
+                cache_f16_v, gufo::hip::KvBlockTable{}, d_out_new + offset * attention_size, 0,
                 start_pos + offset, count, kMaxContext, kNumHeads, kNumKvHeads,
                 kHeadDim, nullptr, nullptr, key_begin, true))
           std::abort();
@@ -322,7 +322,7 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse,
       const auto k_work = work[0].first(sizes[0]);
       const auto v_work = work[1].first(sizes[1]);
       if (!gufo::hip::LaunchQwenWmmaAttention(
-              d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16, cache_f16_v,
+              d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16, cache_f16_v, gufo::hip::KvBlockTable{},
               d_out_new, 0, start_pos, batch_size, kMaxContext, kNumHeads,
               kNumKvHeads, kHeadDim, nullptr, lse_new, key_begin, true, k_work,
               v_work))

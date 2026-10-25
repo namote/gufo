@@ -16,8 +16,10 @@
 #include <vector>
 
 #include "src/cli/serve/inference_backend.hpp"
+#include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/hip/hip_utils.hpp"
+#include "src/core/hip/kv_block_pool.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/hip/executor.hpp"
@@ -406,6 +408,388 @@ void CheckGeneratedFrontierReuse(
 
 }  // namespace
 
+
+// Paged KV: sessions taking blocks of one shared pool give the tokens of
+// whole-context execution (AR and DFlash2), a fork restores the root's
+// blocks instead of copying them, and a pool below one full-context session
+// is refused at load.
+void CheckPagedKv(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
+                  const char* draft_model_path) {
+  constexpr std::uint32_t context = 2048;
+  constexpr std::size_t generated = 8;
+  std::string error;
+  auto direct = gufo::hip::QwenGpuExecutor::Create(model, &error, context);
+  Expect(direct != nullptr, error);
+  const auto& config = model->GetConfig();
+  const std::size_t block_bytes = gufo::hip::KvBlockPool::DeviceBytes(
+      config.FullAttentionLayerCount(),
+      std::size_t{config.num_key_value_heads} * config.head_dim *
+          sizeof(std::uint16_t),
+      1);
+  const std::size_t context_blocks =
+      gufo::hip::KvBlockPool::BlocksFor(context);
+  const std::size_t pool_bytes = (3 * context_blocks + 16) * block_bytes;
+
+  gufo::server::InferenceBackend refused;
+  Expect(!refused.load(model, &error, context, 2, {}, {}, {}, {},
+                       {.kv_pool_bytes = context_blocks * block_bytes}) &&
+             error.find("--kv-pool-bytes") != std::string::npos,
+         "a KV pool below one full-context session must be refused");
+
+  // A shared system prompt long enough to span many blocks.
+  std::string system = "You answer in one short sentence.";
+  for (int i = 0; i < 48; ++i)
+    system += " Rule " + std::to_string(i) +
+              ": stay factual, brief, and polite in every reply.";
+  const gufo::tokenization::ChatTemplateOptions cache_template{
+      .enable_thinking = false};
+  const auto request_for = [](const auto& messages) {
+    gufo::server::ChatRequest request(messages);
+    request.reasoning.enabled = false;
+    return request;
+  };
+  const auto prompt_for = [&](const auto& messages) {
+    const auto rendered =
+        gufo::tokenization::QwenChatTemplate::Render(messages, cache_template);
+    Expect(rendered.has_value(), "paged chat prompt rendering");
+    return model->GetTokenizer().Encode(*rendered);
+  };
+  const std::vector<gufo::tokenization::ChatMessage> root = {
+      {gufo::tokenization::ChatRole::kSystem, system, "", ""},
+      {gufo::tokenization::ChatRole::kUser, "Name one primary color.", "", ""},
+  };
+  const auto root_prompt = prompt_for(root);
+  const std::size_t root_blocks =
+      gufo::hip::KvBlockPool::BlocksFor(root_prompt.size());
+  Expect(root_blocks >= 8, "the paged fixture must span several blocks");
+  const auto direct_root = GenerateDirect(*direct, root_prompt, generated);
+
+  const auto run = [&](const gufo::server::TextSpeculativeConfig& speculative,
+                       std::string_view label) {
+    gufo::server::InferenceBackend paged;
+    Expect(paged.load(model, &error, context, 2, {}, {}, speculative, {},
+                      {.kv_pool_bytes = pool_bytes}),
+           error);
+    const auto start = paged.row_blocks();
+    Expect(start.block_rows == gufo::hip::kKvBlockTokens &&
+               start.total_blocks == 3 * context_blocks + 16 &&
+               start.free_blocks == start.total_blocks,
+           "paged sessions must start without blocks");
+    const auto used = [&] {
+      const auto status = paged.row_blocks();
+      return status.total_blocks - status.free_blocks;
+    };
+
+    const auto first = paged.chat(request_for(root), generated, {});
+    Expect(first.tokens == direct_root, "paged root differs from direct");
+    const std::size_t after_root = used();
+    Expect(after_root >= root_blocks &&
+               after_root <= root_blocks + gufo::server::TextModelRunner::kRowBlockCopyMargin,
+           "a paged session must hold only the blocks it wrote");
+
+    auto continued = root;
+    continued.emplace_back(gufo::tokenization::ChatRole::kAssistant,
+                           first.text);
+    continued.emplace_back(gufo::tokenization::ChatRole::kUser,
+                           "Name a different primary color.");
+    auto forked = root;
+    forked.emplace_back(gufo::tokenization::ChatRole::kAssistant, first.text);
+    forked.emplace_back(gufo::tokenization::ChatRole::kUser,
+                        "Name one warm primary color.");
+    const auto direct_continued =
+        GenerateDirect(*direct, prompt_for(continued), generated);
+    const auto direct_forked =
+        GenerateDirect(*direct, prompt_for(forked), generated);
+    auto pending_continued =
+        paged.start_chat(request_for(continued), generated, 0.0F);
+    auto pending_forked = paged.start_chat(request_for(forked), generated, 0.0F);
+    const auto continued_result = pending_continued->Wait();
+    const auto forked_result = pending_forked->Wait();
+    const std::size_t after_fork = used();
+    std::cout << "paged " << label << ": root_blocks=" << root_blocks
+              << " used_after_root=" << after_root
+              << " used_after_fork=" << after_fork
+              << " cached=" << continued_result.cached_prompt_tokens << ','
+              << forked_result.cached_prompt_tokens
+              << " restore_bytes=" << continued_result.cache_restore_bytes
+              << ',' << forked_result.cache_restore_bytes
+              << " snapshot_bytes=" << continued_result.cache_snapshot_bytes
+              << ',' << forked_result.cache_snapshot_bytes << '\n';
+    Expect(continued_result.tokens == direct_continued &&
+               forked_result.tokens == direct_forked,
+           "paged branches differ from direct execution");
+    Expect(continued_result.cached_prompt_tokens >= root_prompt.size() &&
+               forked_result.cached_prompt_tokens >= root_prompt.size(),
+           "paged branches must reuse the root");
+    // Both branches hold the root rows; stored once, they add only their
+    // own suffix blocks and copied partial blocks.
+    Expect(after_fork - after_root < root_blocks,
+           "a paged fork must share the root's blocks, not copy them");
+  };
+  // Disk: a record keeps its full blocks as block files named by a hash
+  // chain over their tokens, so a restart restores block by block and a
+  // record of the same prefix writes only its new blocks.
+  const auto block_files = [](const std::filesystem::path& directory) {
+    std::size_t files = 0;
+    std::error_code ignored;
+    for (const auto& entry :
+         std::filesystem::directory_iterator(directory / "blocks", ignored))
+      files += entry.path().extension() == ".blk";
+    return files;
+  };
+  const auto disk_run = [&](const gufo::server::TextSpeculativeConfig&
+                                speculative,
+                            std::string_view label, std::string draft_id,
+                            std::size_t read_ahead) {
+    TemporaryDirectory cache_directory;
+    const gufo::server::TextDiskCacheConfig disk{
+        .directory = cache_directory.path(),
+        .capacity_bytes = 1ULL << 30,
+        .staging_capacity_bytes = 512ULL << 20,
+        .block_capacity_bytes = 2ULL << 30,
+        .read_ahead_blocks = read_ahead,
+        .model_artifact_fingerprint = std::string(64, 'a'),
+        .draft_model_artifact_fingerprint = std::move(draft_id),
+    };
+    const auto load = [&](gufo::server::InferenceBackend& backend) {
+      Expect(backend.load(model, &error, context, 2, {}, {}, speculative,
+                          disk, {.kv_pool_bytes = pool_bytes}),
+             error);
+    };
+    std::string root_text;
+    {
+      gufo::server::InferenceBackend writer;
+      load(writer);
+      const auto first = writer.chat(request_for(root), generated, {});
+      Expect(first.tokens == direct_root, "paged disk root differs");
+      root_text = first.text;
+    }  // shutdown writes the released frontier, blocks first
+    const std::size_t after_root = block_files(cache_directory.path());
+    auto continued = root;
+    continued.emplace_back(gufo::tokenization::ChatRole::kAssistant,
+                           root_text);
+    continued.emplace_back(gufo::tokenization::ChatRole::kUser,
+                           "Name a different primary color.");
+    auto forked = root;
+    forked.emplace_back(gufo::tokenization::ChatRole::kAssistant, root_text);
+    forked.emplace_back(gufo::tokenization::ChatRole::kUser,
+                        "Name one warm primary color.");
+    const auto direct_continued =
+        GenerateDirect(*direct, prompt_for(continued), generated);
+    const auto direct_forked =
+        GenerateDirect(*direct, prompt_for(forked), generated);
+    {
+      // Both branches restore the root after a restart; at shutdown each
+      // writes its own frontier, whose root blocks are stored already.
+      gufo::server::InferenceBackend restarted;
+      load(restarted);
+      auto pending_continued =
+          restarted.start_chat(request_for(continued), generated, 0.0F);
+      auto pending_forked =
+          restarted.start_chat(request_for(forked), generated, 0.0F);
+      const auto continued_result = pending_continued->Wait();
+      const auto forked_result = pending_forked->Wait();
+      std::cout << "paged disk " << label << ": root_files=" << after_root
+                << " cached=" << continued_result.cached_prompt_tokens << ','
+                << forked_result.cached_prompt_tokens
+                << " disk_hit=" << continued_result.cache_disk_hit << ','
+                << forked_result.cache_disk_hit
+                << " restore_ms=" << continued_result.cache_restore_ms << ','
+                << forked_result.cache_restore_ms << '\n';
+      Expect((continued_result.cache_disk_hit ||
+              forked_result.cache_disk_hit) &&
+                 continued_result.cached_prompt_tokens >= root_prompt.size() &&
+                 forked_result.cached_prompt_tokens >= root_prompt.size(),
+             "a restart must restore the root from its blocks");
+      Expect(continued_result.tokens == direct_continued &&
+                 forked_result.tokens == direct_forked,
+             "a block restore changed a branch");
+      continued.emplace_back(gufo::tokenization::ChatRole::kAssistant,
+                             continued_result.text);
+      continued.emplace_back(gufo::tokenization::ChatRole::kUser,
+                             "Name one more.");
+    }
+    const auto direct_next =
+        GenerateDirect(*direct, prompt_for(continued), generated);
+    {
+      // The continued branch's next turn restores its own record, block by
+      // block, through the root blocks both branches share.
+      gufo::server::InferenceBackend restarted;
+      load(restarted);
+      const auto again = restarted.chat(request_for(continued), generated, {});
+      std::cout << "paged disk " << label
+                << ": branch_files=" << block_files(cache_directory.path())
+                << " cached=" << again.cached_prompt_tokens
+                << " disk_hit=" << again.cache_disk_hit << '\n';
+      Expect(again.cache_disk_hit &&
+                 again.cached_prompt_tokens > root_prompt.size() &&
+                 again.tokens == direct_next,
+             "a branch record must restore through the shared blocks");
+    }
+    {
+      // Resident blocks: the forked record restores after the continued one
+      // holds the root's blocks, and shares them instead of reading them.
+      gufo::server::InferenceBackend restarted;
+      load(restarted);
+      const auto next = restarted.chat(request_for(continued), generated, {});
+      const auto read = restarted.row_blocks();
+      const auto fork = restarted.chat(request_for(forked), generated, {});
+      const auto shared = restarted.row_blocks();
+      const std::size_t root_full = root_prompt.size() / gufo::hip::kKvBlockTokens;
+      std::cout << "paged disk " << label
+                << ": resident_restored=" << shared.index_restored - read.index_restored
+                << " root_full_blocks=" << root_full
+                << " indexed=" << shared.indexed_blocks
+                << " used_before_fork=" << read.total_blocks - read.free_blocks
+                << " used_after_fork=" << shared.total_blocks - shared.free_blocks
+                << " disk_hit=" << next.cache_disk_hit << ','
+                << fork.cache_disk_hit << '\n';
+      Expect(next.cache_disk_hit && fork.cache_disk_hit &&
+                 next.tokens == direct_next && fork.tokens == direct_forked,
+             "restores through resident blocks changed a branch");
+      Expect(shared.index_restored - read.index_restored >= root_full,
+             "a restore must share the root blocks another session holds");
+      Expect((shared.total_blocks - shared.free_blocks) -
+                     (read.total_blocks - read.free_blocks) <
+                 root_full,
+             "a restore sharing resident blocks must not copy the root");
+    }
+    const std::size_t after_branches = block_files(cache_directory.path());
+    // Each branch's record holds the root blocks again; on disk they are
+    // stored once.
+    Expect(after_root >= root_prompt.size() / gufo::hip::kKvBlockTokens &&
+               after_branches - after_root < root_blocks,
+           "records of one prefix must share its block files");
+  };
+
+  // Message boundary: a new conversation under the same long system prompt
+  // restores the checkpoint kept where the first one's user turn began,
+  // from RAM, and from disk after a restart.
+  const auto system_run = [&](const gufo::server::TextSpeculativeConfig&
+                                  speculative,
+                              std::string_view label, std::string draft_id) {
+    TemporaryDirectory cache_directory;
+    const gufo::server::TextDiskCacheConfig disk{
+        .directory = cache_directory.path(),
+        .capacity_bytes = 1ULL << 30,
+        .staging_capacity_bytes = 512ULL << 20,
+        .block_capacity_bytes = 2ULL << 30,
+        .model_artifact_fingerprint = std::string(64, 'a'),
+        .draft_model_artifact_fingerprint = std::move(draft_id),
+    };
+    const auto conversation = [&](std::string_view question) {
+      std::vector<gufo::tokenization::ChatMessage> messages = {
+          {gufo::tokenization::ChatRole::kSystem, system, "", ""},
+          {gufo::tokenization::ChatRole::kUser, std::string(question), "",
+           ""},
+      };
+      return messages;
+    };
+    // Where any user turn starts: the prompt with an empty one diverges
+    // there from every conversation.
+    const auto system_tokens = [&] {
+      const auto a = prompt_for(conversation("Name one primary color."));
+      const auto b = prompt_for(conversation(""));
+      return static_cast<std::size_t>(
+          std::ranges::mismatch(a, b).in1 - a.begin());
+    }();
+    const auto check = [&](gufo::server::InferenceBackend& backend,
+                           std::string_view question, bool expect_reuse,
+                           std::string_view step) {
+      const auto messages = conversation(question);
+      const auto result = backend.chat(request_for(messages), generated, {});
+      std::cout << "paged system " << label << ' ' << step
+                << ": system_tokens=" << system_tokens
+                << " cached=" << result.cached_prompt_tokens
+                << " disk_hit=" << result.cache_disk_hit
+                << " prefill_tokens=" << result.prefill_tokens << '\n';
+      Expect(result.tokens ==
+                 GenerateDirect(*direct, prompt_for(messages), generated),
+             "a system checkpoint restore changed the reply");
+      if (expect_reuse)
+        Expect(result.cached_prompt_tokens >= system_tokens &&
+                   result.cached_prompt_tokens < result.prompt_tokens,
+               "a new conversation must restore the system prompt");
+      return result;
+    };
+    {
+      gufo::server::InferenceBackend backend;
+      Expect(backend.load(model, &error, context, 2, {}, {}, speculative, disk,
+                          {.kv_pool_bytes = pool_bytes}),
+             error);
+      (void)check(backend, "Name one primary color.", false, "first");
+      (void)check(backend, "Name one warm color.", true, "second");
+    }
+    gufo::server::InferenceBackend restarted;
+    Expect(restarted.load(model, &error, context, 2, {}, {}, speculative, disk,
+                          {.kv_pool_bytes = pool_bytes}),
+           error);
+    const auto third = check(restarted, "Name one cool color.", true, "restart");
+    Expect(third.cache_disk_hit, "the system checkpoint must restore from disk");
+  };
+
+  // Grid: a long prompt keeps a checkpoint every grid step, so the same
+  // document with another question restores the last one before the change.
+  const auto grid_run = [&] {
+    std::string document = "Reference notes:";
+    for (int i = 0; i < 120; ++i)
+      document += " Note " + std::to_string(i) +
+                  ": the archive keeps every record in order.";
+    const auto ask = [&](std::string_view question) {
+      std::vector<gufo::tokenization::ChatMessage> messages = {
+          {gufo::tokenization::ChatRole::kUser,
+           document + "\n\n" + std::string(question), "", ""}};
+      return messages;
+    };
+    gufo::server::InferenceBackend backend;
+    Expect(backend.load(model, &error, context, 2, {}, {}, {}, {},
+                        {.kv_pool_bytes = pool_bytes,
+                         .checkpoint_grid_tokens = 512}),
+           error);
+    const auto first_prompt = prompt_for(ask("Name one primary color."));
+    Expect(first_prompt.size() > 1100, "the grid fixture spans grid steps");
+    (void)backend.chat(request_for(ask("Name one primary color.")), generated,
+                       {});
+    const auto messages = ask("Name one warm color.");
+    const auto second = backend.chat(request_for(messages), generated, {});
+    const auto shared = static_cast<std::size_t>(
+        std::ranges::mismatch(first_prompt, prompt_for(messages)).in1 -
+        first_prompt.begin());
+    std::cout << "paged grid: shared=" << shared
+              << " cached=" << second.cached_prompt_tokens << '\n';
+    // The last grid point before the change, skipping points within the
+    // checkpoint slack of the first prompt's end.
+    std::size_t last_point = 0;
+    for (std::size_t point = 512;
+         point <= shared &&
+         point + gufo::server::TextRunnerPool::Request::kSharedCheckpointSlack <
+             first_prompt.size();
+         point += 512)
+      last_point = point;
+    Expect(last_point >= 1024 && second.cached_prompt_tokens >= last_point,
+           "a grid checkpoint must restore the shared document");
+    Expect(second.tokens ==
+               GenerateDirect(*direct, prompt_for(messages), generated),
+           "a grid restore changed the reply");
+  };
+
+  run({}, "AR");
+  // Restores read blocks one at a time (AR) and ahead on threads (DFlash2).
+  disk_run({}, "AR", {}, 0);
+  system_run({}, "AR", {});
+  grid_run();
+  if (draft_model_path != nullptr) {
+    const gufo::server::TextSpeculativeConfig dflash{
+        .backend = gufo::server::TextSpeculativeBackend::kDFlash,
+        .draft_model_path = draft_model_path,
+        .max_draft_tokens = 7,
+        .min_draft_tokens = 1};
+    run(dflash, "DFlash2");
+    disk_run(dflash, "DFlash2", std::string(64, 'c'), 4);
+    system_run(dflash, "DFlash2", std::string(64, 'c'));
+  }
+}
+
 int main(int argc, const char* const* argv) {
   try {
     const char* model_path =
@@ -421,6 +805,7 @@ int main(int argc, const char* const* argv) {
     bool sampling_only = false;
     bool cache_only = false;
     bool continuation_only = false;
+    bool paged_only = false;
     auto sampling_policy = gufo::speculative::DFlashDraftPolicy::kAdaptive;
     for (int index = 2; index < argc; ++index) {
       const std::string_view argument = argv[index];
@@ -432,6 +817,8 @@ int main(int argc, const char* const* argv) {
         run_full_suite = cache_only = true;
       } else if (argument == "--continuation-only") {
         continuation_only = true;
+      } else if (argument == "--paged-only") {
+        paged_only = true;
       } else if (argument == "--fixed") {
         sampling_policy = gufo::speculative::DFlashDraftPolicy::kFixed;
       } else if (argument.starts_with("--")) {
@@ -454,6 +841,11 @@ int main(int argc, const char* const* argv) {
     Expect(model->GetWeightRegionCount() == reader->GetMappedRegions().size(),
            "every mapped GGUF shard must have one shared GPU region");
 
+    if (paged_only) {
+      CheckPagedKv(model, draft_model_path);
+      std::cout << "Qwen paged KV serving tests passed.\n";
+      return 0;
+    }
     if (continuation_only ||
         (run_full_suite && draft_model_path != nullptr && !sampling_only)) {
       Expect(draft_model_path != nullptr,
@@ -880,10 +1272,12 @@ int main(int argc, const char* const* argv) {
       Expect(restored_continuation.cache_hit &&
                  restored_continuation.cache_disk_hit,
              "fresh Qwen backend did not restore its disk prefix");
-      Expect(restored_continuation.cached_prompt_tokens == chat_prompt.size() &&
+      // Shutdown writes the released frontier back, so the restored prefix
+      // may run past the prompt into the reply the writer generated.
+      Expect(restored_continuation.cached_prompt_tokens >= chat_prompt.size() &&
                  restored_continuation.cached_prompt_tokens <
                      restored_continuation.prompt_tokens,
-             "Qwen disk restore did not report its exact reusable prefix");
+             "Qwen disk restore must reuse at least the written prompt");
       Expect(restored_continuation.cache_restore_bytes > 0,
              "Qwen disk restore did not report restored bytes");
       Expect(restored_continuation.tokens == direct_continuation,
@@ -954,13 +1348,14 @@ int main(int argc, const char* const* argv) {
         Expect(restored_dflash_continuation.cache_hit &&
                    restored_dflash_continuation.cache_disk_hit,
                "fresh DFlash backend did not restore its disk prefix");
-        Expect(restored_dflash_continuation.cached_prompt_tokens ==
+        // Shutdown write-back may extend the restored prefix past the prompt.
+        Expect(restored_dflash_continuation.cached_prompt_tokens >=
                        chat_prompt.size() &&
                    warm_dflash_continuation.cached_prompt_tokens >=
                        restored_dflash_continuation.cached_prompt_tokens &&
                    restored_dflash_continuation.cached_prompt_tokens <
                        restored_dflash_continuation.prompt_tokens,
-               "DFlash disk restore did not report its exact prefix");
+               "DFlash disk restore must reuse at least the written prompt");
         Expect(restored_dflash_continuation.tokens ==
                    warm_dflash_continuation.tokens,
                "DFlash disk restore changed continuation tokens");
@@ -1055,15 +1450,20 @@ int main(int argc, const char* const* argv) {
         gufo::tokenization::QwenChatTemplate::Render(concurrent_b.messages);
     Expect(rendered_a.has_value() && rendered_b.has_value(),
            "concurrent chat prompt rendering");
-    const auto direct_a =
-        GenerateDirect(*direct, model->GetTokenizer().Encode(*rendered_a), 8);
-    const auto direct_b =
-        GenerateDirect(*direct, model->GetTokenizer().Encode(*rendered_b), 8);
-    Expect(direct_a.size() == 8 && direct_b.size() == 8,
-           "concurrency fixtures must retain eight generated tokens");
+    // A must still be decoding when B's bounded prefill ends. Each 8-token
+    // chunk costs about one decode step on the 27B, so B's 82-token prompt
+    // needs 11 of A's steps: eight tokens let A finish before B decodes.
+    constexpr std::size_t concurrent_tokens = 32;
+    const auto direct_a = GenerateDirect(
+        *direct, model->GetTokenizer().Encode(*rendered_a), concurrent_tokens);
+    const auto direct_b = GenerateDirect(
+        *direct, model->GetTokenizer().Encode(*rendered_b), concurrent_tokens);
+    Expect(direct_a.size() == concurrent_tokens &&
+               direct_b.size() == concurrent_tokens,
+           "concurrency fixtures must retain every generated token");
 
-    auto pending_a = backend.start_chat(concurrent_a, 8, 0.0F);
-    auto pending_b = backend.start_chat(concurrent_b, 8, 0.0F);
+    auto pending_a = backend.start_chat(concurrent_a, concurrent_tokens, 0.0F);
+    auto pending_b = backend.start_chat(concurrent_b, concurrent_tokens, 0.0F);
     const auto concurrent_result_a = pending_a->Wait();
     const auto concurrent_result_b = pending_b->Wait();
     Expect(concurrent_result_a.tokens == direct_a,
@@ -1135,8 +1535,14 @@ int main(int argc, const char* const* argv) {
     HIP_CHECK(hipDeviceSynchronize());
     std::size_t free_after = 0;
     HIP_CHECK(hipMemGetInfo(&free_after, &total_memory));
-    ExpectStableGpuMemory(free_before, free_after);
+    // The recovered request keeps its prompt snapshot in the cache; that
+    // retained copy is not a leak.
+    ExpectStableGpuMemory(free_before,
+                          free_after + cancelled.cache_snapshot_bytes +
+                              recovered.cache_snapshot_bytes);
 
+    CheckPagedKv(model, draft_model_path);
+    std::cout << "Qwen paged KV serving tests passed.\n";
     std::cout << "HTTP HIP inference parity and cleanup tests passed.\n";
     return 0;
   } catch (const std::exception& exception) {

@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <deque>
 #include <exception>
+#include <fstream>
 #include <iomanip>
 #include <iterator>
 #include <limits>
@@ -89,6 +90,7 @@ struct ScheduledRequest {
   std::shared_ptr<const TextPromptContext> prompt_context;
   bool cache_prompt{true};
   std::size_t cache_prefix_tokens{0};
+  std::size_t system_prefix_tokens{0};
   bool stop_at_eos{true};
   std::size_t token_limit{1};
   sampling::SamplingConfig sampling;
@@ -463,6 +465,39 @@ void WriteGenerationTrace(GenerationTrace trace,
   Trace::Write(record);
 }
 
+std::size_t ResidentKiB() {
+  std::ifstream status("/proc/self/status");
+  for (std::string line; std::getline(status, line);) {
+    if (line.starts_with("VmRSS:")) {
+      std::istringstream value(line.substr(6));
+      std::size_t kib = 0;
+      if (value >> kib)
+        return kib;
+    }
+  }
+  return 0;
+}
+
+// The first constrained request would otherwise build the vocabulary inside
+// its queue time (about 30 ms for Flash-Next's 248,320 tokens).
+void PrepareStructuredOutput(const TextModelRunner& runner) {
+  const auto resident = ResidentKiB();
+  const auto started = std::chrono::steady_clock::now();
+  const auto tokens = runner.PrepareConstraintVocabulary();
+  if (tokens == 0)
+    return;
+  const std::chrono::duration<double, std::milli> elapsed =
+      std::chrono::steady_clock::now() - started;
+  std::ostringstream line;
+  line << "event=structured_output_prepared vocabulary_tokens=" << tokens
+       << " prepare_ms=" << std::fixed << std::setprecision(1)
+       << elapsed.count() << " rss_delta_kib="
+       << static_cast<long long>(ResidentKiB()) -
+              static_cast<long long>(resident)
+       << ' ' << Logger::MemoryStatus();
+  Logger::Info("loader", line.str());
+}
+
 }  // namespace
 
 struct TextGenerationScheduler::Request::Impl {
@@ -523,6 +558,7 @@ struct TextGenerationScheduler::Impl {
             .Descriptor()
             .capabilities.batched_multi_token_decode_max_width;
     device_lost_requests.reserve(runner_pool->capacity());
+    PrepareStructuredOutput(runner_pool->runner());
     worker = std::jthread(
         [this](const std::stop_token& stop_token) { Run(stop_token); });
     if (scheduler_policy.stall_timeout.count() > 0) {
@@ -983,6 +1019,7 @@ struct TextGenerationScheduler::Impl {
       return false;
     std::shared_ptr<ScheduledRequest> leader;
     std::size_t common = 0;
+    const auto min_tokens = runner_pool->shared_prefix_min_tokens();
     const std::span<const TextRunnerToken> prompt(request->prompt);
     for (const auto* list : residents) {
       for (const auto& resident : *list) {
@@ -1006,17 +1043,16 @@ struct TextGenerationScheduler::Impl {
         common = shared;
       }
     }
-    if (leader == nullptr ||
-        common < TextRunnerPool::Request::kSharedPrefixMinTokens)
+    if (leader == nullptr || common < min_tokens)
       return false;
     // A longer retained prefix, such as this conversation's previous turn,
     // already beats waiting for a peer.
     const auto cached =
         runner_pool->CachedPrefixTokens(prompt, request->prompt_context.get());
-    if (common < cached + TextRunnerPool::Request::kSharedPrefixMinTokens)
+    if (common < cached + min_tokens)
       return false;
     const auto position = leader->runner_request.ShareCheckpoint(common);
-    if (position < cached + TextRunnerPool::Request::kSharedPrefixMinTokens)
+    if (position < cached + min_tokens)
       return false;
     request->prefix_leader = std::move(leader);
     request->prefix_position = position;
@@ -1170,6 +1206,16 @@ struct TextGenerationScheduler::Impl {
           }
         }
 
+        if (!runner_pool->AdmissionReady(request->prompt,
+                                         request->token_limit,
+                                         request->cache_prompt)) {
+          // Every free seat holds another conversation's unsaved frontier
+          // (the oldest is being written to disk), or the row pool is short
+          // until residents finish. Retry on a later pass so resident
+          // requests keep decoding meanwhile.
+          waiting.push_front(std::move(request));
+          return;
+        }
         const std::weak_ptr<ScheduledRequest> weak_request = request;
         request->runner_request = runner_pool->Acquire(
             std::move(request->prompt), request->sampling,
@@ -1180,13 +1226,15 @@ struct TextGenerationScheduler::Impl {
                      DeadlineExceeded(request);
             },
             std::move(request->prompt_context), request->cache_prompt,
-            request->cache_prefix_tokens, request->stop_at_eos);
+            request->cache_prefix_tokens, request->stop_at_eos,
+            request->system_prefix_tokens);
         // Each admission may restore or capture a checkpoint of its own.
         progress.fetch_add(1, std::memory_order_relaxed);
         if (!request->runner_request) {
           CompleteCancelled(request);
           continue;
         }
+        request->runner_request.ReserveRows(request->token_limit);
 
         request->result.component_cache =
             request->runner_request.component_cache_metrics();
@@ -2284,6 +2332,10 @@ const TextModelRunner& TextGenerationScheduler::runner() const noexcept {
   return impl_->runner_pool->runner();
 }
 
+const TextRunnerPool& TextGenerationScheduler::runner_pool() const noexcept {
+  return *impl_->runner_pool;
+}
+
 std::size_t TextGenerationScheduler::capacity() const noexcept {
   return impl_->runner_pool->capacity();
 }
@@ -2355,6 +2407,7 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   request->prompt_context = std::move(metadata.prompt_context);
   request->cache_prompt = metadata.cache_prompt;
   request->cache_prefix_tokens = metadata.cache_prefix_tokens;
+  request->system_prefix_tokens = metadata.system_prefix_tokens;
   request->stop_at_eos = metadata.stop_at_eos;
   request->token_limit =
       max_tokens > 0 ? std::min(max_tokens, available) : available;

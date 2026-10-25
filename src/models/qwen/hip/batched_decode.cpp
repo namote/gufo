@@ -171,6 +171,9 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
       }
     }
   }
+  for (const auto& item : items)
+    item.executor->arena_.EnsureKvRows(item.position, item.position + 1);
+  const PassScratchLease pass_scratch(*coordinator);
   if (items.size() > coordinator->arena_.GetMaxBatch()) {
     throw std::length_error(
         "Qwen GPU decode width exceeds the coordinator arena capacity");
@@ -218,8 +221,7 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
     auto& state_arena = items[row].executor->arena_;
     auto replay = state_arena.GetSsmReplayCapture();
     replay.position = scratch.decode.prompt_tokens.data() + row;
-    ssm_sequences[row] = {state_arena.d_ssm_conv_state,
-                          state_arena.d_ssm_deltanet_state, replay,
+    ssm_sequences[row] = {state_arena.BeginRecurrentWrite(), replay,
                           static_cast<std::uint32_t>(row), 1};
   }
   HIP_CHECK(hipMemcpyAsync(
@@ -307,7 +309,7 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
             state_arena.d_attention_kv_f16,
             OffsetIfPresent(
                 static_cast<std::uint16_t*>(state_arena.d_attention_kv_f16),
-                total_k),
+                total_k), state_arena.GetKvBlockTable(),
             context, attention_layer, position, state_arena.GetMaxContext(),
             config.num_attention_heads, config.num_key_value_heads,
             config.head_dim, arena.stream,
@@ -441,6 +443,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
         "Qwen verification requires one to eight sessions");
   }
   auto& coordinator = *items.front().executor;
+  const PassScratchLease pass_scratch(coordinator);
   auto& arena_ = coordinator.arena_;
   const auto& weights_ = coordinator.weights_;
   const auto& config = weights_.config;
@@ -476,6 +479,12 @@ QwenGpuExecutor::ForwardVerificationBatch(
     throw std::length_error(
         "Qwen verification exceeds coordinator scratch capacity");
   }
+  // Rows past the committed position are written and may be discarded; they
+  // stay inside this session's own blocks.
+  for (const auto& item : items)
+    item.executor->arena_.EnsureKvRows(
+        item.position,
+        item.position + static_cast<std::uint32_t>(item.tokens.size()));
   for (const auto& item : items) {
     auto& executor = *item.executor;
     if (&executor != &coordinator)
@@ -528,8 +537,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
     auto& state_arena = item.executor->arena_;
     auto replay = state_arena.GetSsmReplayCapture();
     replay.position = scratch.decode.prompt_tokens.data() + offsets[index];
-    ssm_sequences[index] = {state_arena.d_ssm_conv_state,
-                            state_arena.d_ssm_deltanet_state, replay,
+    ssm_sequences[index] = {state_arena.BeginRecurrentWrite(), replay,
                             static_cast<std::uint32_t>(offsets[index]),
                             static_cast<std::uint32_t>(item.tokens.size())};
     for (std::size_t row = 0; row < item.tokens.size(); ++row) {
@@ -630,7 +638,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
               state_arena.d_attention_kv_f16,
               OffsetIfPresent(
                   static_cast<std::uint16_t*>(state_arena.d_attention_kv_f16),
-                  total_k),
+                  total_k), state_arena.GetKvBlockTable(),
               attention_layer, start_pos, sequence_size,
               state_arena.GetMaxContext(), config.num_attention_heads,
               config.num_key_value_heads, config.head_dim, config.rotary_dim,
@@ -654,7 +662,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
               state_arena.d_attention_kv_f16,
               OffsetIfPresent(
                   static_cast<std::uint16_t*>(state_arena.d_attention_kv_f16),
-                  total_k),
+                  total_k), state_arena.GetKvBlockTable(),
               (scratch.ssm.out.data() + offset * attention_size),
               attention_layer, start_pos, sequence_size,
               state_arena.GetMaxContext(), config.num_attention_heads,
@@ -682,7 +690,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
                 state_arena.d_attention_kv_f16,
                 OffsetIfPresent(
                     static_cast<std::uint16_t*>(state_arena.d_attention_kv_f16),
-                    total_k),
+                    total_k), state_arena.GetKvBlockTable(),
                 (scratch.ssm.out.data() + offset * attention_size) +
                     row * attention_size,
                 attention_layer, position, state_arena.GetMaxContext(),

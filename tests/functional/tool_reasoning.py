@@ -11,6 +11,7 @@ from gufo.control_tokens import kEndOfText, kImEnd, kImStart  # noqa: E402
 
 from metrics import validate_tool_events
 from templates import DROPS_EARLIER_REASONING
+from tier import streaming_modes
 
 
 OLD_TEXT = '    """Fixture notes."""}}]}}</tool_call>\n\n<tool_call>(\'tool\', \'{\''
@@ -356,7 +357,7 @@ def check_unfinished_lookalike(client, model, checks, chat_result):
         "parameters": {"type": "object",
                        "properties": {"text": {"type": "string"}},
                        "required": ["text"]}}}]
-    for streaming in (False, True):
+    for streaming in streaming_modes():
         mode = "stream" if streaming else "buffered"
         label = f"unfinished_lookalike_tail_{mode}"
         request = dict(model=model,
@@ -400,7 +401,7 @@ def check_tail_lookalike_content(client, model, checks, chat_result, preset=None
                        "properties": {"text": {"type": "string"}},
                        "required": ["text"]}}}]
     for name, (prompt, literal) in TAIL_LOOKALIKE_CASES.items():
-        for streaming in (False, True):
+        for streaming in streaming_modes():
             mode = "stream" if streaming else "buffered"
             label = f"tail_lookalike_{name}_{mode}"
             request = dict(model=model,
@@ -480,7 +481,7 @@ def check_envelope_closer_framing(client, model, checks, chat_result, preset=Non
             checks[f"envelope_closer_{name}"] = {"skipped": reason}
             print(f"SKIP envelope_closer_{name}: {reason}", file=sys.stderr, flush=True)
             continue
-        for streaming in (False, True):
+        for streaming in streaming_modes():
             mode = "stream" if streaming else "buffered"
             label = f"envelope_closer_{name}_{mode}"
             request = dict(model=model,
@@ -594,7 +595,7 @@ def check_envelope_closer_framing(client, model, checks, chat_result, preset=Non
                 assert_no_envelope_framing(result)
 
     # No tools: the envelope is prose, so nothing about it is framing.
-    for streaming in (False, True):
+    for streaming in streaming_modes():
         mode = "stream" if streaming else "buffered"
         label = f"envelope_closer_no_tools_{mode}"
         request = dict(model=model,
@@ -613,7 +614,7 @@ def check_envelope_closer_framing(client, model, checks, chat_result, preset=Non
 
     # Reuse an actual warm turn, then contaminate its replay as the old client
     # did. Vocabulary spellings in assistant/tool data must remain literal text.
-    for streaming in (False, True):
+    for streaming in streaming_modes():
         mode = "stream" if streaming else "buffered"
         label = f"envelope_closer_replayed_history_{mode}"
         request = dict(model=model,
@@ -651,7 +652,7 @@ def check_literal_protocol_data(client, model, checks, chat_result):
         "comparison": "3 < 5 and x < y.",
     }
     for name, literal in literals.items():
-        for streaming in (False, True):
+        for streaming in streaming_modes():
             label = f"literal_protocol_{name}_{'stream' if streaming else 'buffered'}"
             request = dict(model=model, messages=[{"role": "user", "content":
                 "Reply with exactly the following literal text, without any code fence, "
@@ -680,7 +681,7 @@ def check_html_content(client, model, checks, chat_result):
                        "required": ["text"]}}}]
     prompt = ("Write a minimal HTML page with a heading that says Hello and one "
               "paragraph. Reply with the HTML only, no explanation.")
-    for streaming in (False, True):
+    for streaming in streaming_modes():
         mode = "stream" if streaming else "buffered"
         label = f"html_content_{mode}"
         request = dict(model=model,
@@ -755,7 +756,7 @@ def check_quoted_then_real_call(client, model, checks, chat_result, preset=None)
             print(f"SKIP quoted_then_call_{name}: {reason}", file=sys.stderr, flush=True)
             continue
         documented = 0
-        for streaming in (False, True):
+        for streaming in streaming_modes():
             mode = "stream" if streaming else "buffered"
             label = f"quoted_then_call_{name}_{mode}"
             request = dict(model=model,
@@ -811,7 +812,7 @@ def check_unfinished_inline_then_call(client, model, checks, chat_result, preset
     wire_format = NATIVE_WIRE_FORMAT.get(preset, QWEN_WIRE_FORMAT)
     for name, prefix in (("filename", "I'll update `config.py"),
                          ("apostrophe", "Let`s write it.")):
-        for streaming in (False, True):
+        for streaming in streaming_modes():
             mode = "stream" if streaming else "buffered"
             label = f"unfinished_inline_then_call_{name}_{mode}"
             request = dict(model=model, messages=[{"role": "system", "content":

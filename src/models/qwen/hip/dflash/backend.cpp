@@ -117,7 +117,9 @@ public:
         gpu_snapshot->PersistentPayloadBytes();
     const std::size_t pending_bytes =
         pending_target_features.size() * sizeof(std::uint32_t);
-    std::fill(destination.begin(), destination.end(), std::uint8_t{0});
+    // The nested serializer and pending features overwrite the entire payload.
+    std::fill_n(destination.begin(), kDFlashDraftPersistentHeaderBytes,
+                std::uint8_t{0});
     std::copy(kDFlashDraftPersistentMagic.begin(),
               kDFlashDraftPersistentMagic.end(), destination.begin());
     PutLittleEndian<std::uint32_t>(destination, 8,
@@ -545,6 +547,34 @@ std::size_t QwenDFlashGpuDraftBackend::SnapshotPayloadBytes() const {
     throw std::overflow_error("DFlash snapshot size overflows");
   }
   return gpu_bytes + pending_target_features_.size() * sizeof(float);
+}
+
+static std::size_t MaxPendingTargetFeatures(const QwenDFlashGpuModel& model) {
+  // Pending rows come from one verification and are injected before the next
+  // proposal, so they never exceed one block.
+  return static_cast<std::size_t>(model.GetDFlashConfig().block_size) *
+         model.GetDFlashConfig().target_layer_ids.size() *
+         model.GetConfig().hidden_size;
+}
+
+std::size_t QwenDFlashGpuDraftBackend::MaxSnapshotPayloadBytes(
+    const QwenDFlashGpuModel& model, std::uint32_t max_context) {
+  // Same terms as SnapshotPayloadBytes().
+  return CheckedPersistentAdd(
+      CheckedPersistentAdd(
+          QwenDFlashGpuExecutor::MaxSnapshotPayloadBytes(model, max_context),
+          sizeof(float) + sizeof(std::uint32_t)),
+      MaxPendingTargetFeatures(model) * sizeof(float));
+}
+
+std::size_t QwenDFlashGpuDraftBackend::MaxPersistentPayloadBytes(
+    const QwenDFlashGpuModel& model, std::uint32_t max_context) {
+  // Same terms as QwenDFlashDraftSnapshot::PersistentPayloadBytes().
+  return CheckedPersistentAdd(
+      CheckedPersistentAdd(
+          kDFlashDraftPersistentHeaderBytes,
+          QwenDFlashGpuSnapshot::MaxPersistentPayloadBytes(model, max_context)),
+      MaxPendingTargetFeatures(model) * sizeof(std::uint32_t));
 }
 
 std::unique_ptr<speculative::IDraftBackendSnapshot>

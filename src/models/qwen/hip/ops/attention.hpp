@@ -13,6 +13,8 @@
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 
+#include "src/core/hip/kv_block_table.hpp"
+
 namespace gufo::hip {
 
 /// Computes Fused QKV Projections for Full Attention layers in a single kernel
@@ -31,7 +33,8 @@ void LaunchFusedQKVProjections(const void* q_w, core::GgmlType q_type,
 /// (e.g. by the fused QK norm+RoPE kernel, opt-c010-qk-rope-kv).
 void LaunchAttention(const float* q, const float* k, const float* v,
                      const float* gate, float* k_cache, float* v_cache,
-                     void* k_cache_f16, void* v_cache_f16, float* out_context,
+                     void* k_cache_f16, void* v_cache_f16,
+    KvBlockTable kv_table, float* out_context,
                      std::uint32_t layer_idx, std::uint32_t pos,
                      std::uint32_t max_context, std::uint32_t num_heads,
                      std::uint32_t num_kv_heads, std::uint32_t head_dim,
@@ -45,7 +48,8 @@ void LaunchAttention(const float* q, const float* k, const float* v,
 /// smaller span retains the scalar split-K fallback.
 void LaunchCausalDecodeAttention(
     const float* q, const float* gate, float* k_cache, float* v_cache,
-    void* k_cache_f16, void* v_cache_f16, float* out_context,
+    void* k_cache_f16, void* v_cache_f16,
+    KvBlockTable kv_table, float* out_context,
     std::uint32_t layer_idx, std::uint32_t start_pos, std::size_t batch_size,
     std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim,
@@ -54,7 +58,8 @@ void LaunchCausalDecodeAttention(
 /// Computes Grouped-Query Softmax Attention reading position from device memory
 void LaunchAttention(const float* q, const float* k, const float* v,
                      const float* gate, float* k_cache, float* v_cache,
-                     void* k_cache_f16, void* v_cache_f16, float* out_context,
+                     void* k_cache_f16, void* v_cache_f16,
+    KvBlockTable kv_table, float* out_context,
                      std::uint32_t layer_idx, const std::uint32_t* d_pos,
                      std::uint32_t max_context, std::uint32_t num_heads,
                      std::uint32_t num_kv_heads, std::uint32_t head_dim,
@@ -68,6 +73,7 @@ void LaunchFusedQKNormRoPEKvWrite(
     const float* q, const float* k, const float* v, const float* q_weight,
     const float* k_weight, float* q_out, float* k_out, float* k_cache,
     float* v_cache, void* k_cache_f16, void* v_cache_f16,
+    KvBlockTable kv_table,
     std::uint32_t layer_idx, const std::uint32_t* d_pos,
     std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim,
@@ -83,6 +89,7 @@ void LaunchFusedQKNormRoPEKvWrite(
 void LaunchBatchedAttention(const float* q, const float* k, const float* v,
                             const float* gate, float* k_cache, float* v_cache,
                             void* k_cache_f16, void* v_cache_f16,
+    KvBlockTable kv_table,
                             float* out_context, std::uint32_t layer_idx,
                             std::uint32_t start_pos, std::size_t batch_size,
                             std::uint32_t max_context, std::uint32_t num_heads,
@@ -99,6 +106,7 @@ void LaunchBatchedFusedQKNormRoPEKvWrite(
     const float* q, const float* k, const float* v, const float* q_weight,
     const float* k_weight, float* q_out, float* k_out, float* k_cache,
     float* v_cache, void* k_cache_f16, void* v_cache_f16,
+    KvBlockTable kv_table,
     std::uint32_t layer_idx, std::uint32_t start_pos, std::size_t batch_size,
     std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim,
@@ -116,6 +124,7 @@ void LaunchBatchedFusedQKNormRoPEKvWrite(
 [[nodiscard]] bool LaunchBatchedAttentionTile(
     const float* q, const float* k, const float* v, const float* gate,
     float* k_cache, float* v_cache, void* k_cache_f16, void* v_cache_f16,
+    KvBlockTable kv_table,
     float* out_context, std::uint32_t layer_idx, std::uint32_t start_pos,
     std::size_t batch_size, std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim,
@@ -134,6 +143,7 @@ void LaunchBatchedFusedQKNormRoPEKvWrite(
 [[nodiscard]] bool LaunchQwenWmmaAttention(
     const float* q, const float* k, const float* v, const float* gate,
     float* k_cache, float* v_cache, void* k_cache_f16, void* v_cache_f16,
+    KvBlockTable kv_table,
     float* out_context, std::uint32_t layer_idx, std::uint32_t start_pos,
     std::size_t batch_size, std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim,
@@ -147,7 +157,8 @@ void LaunchBatchedFusedQKNormRoPEKvWrite(
 void LaunchBatchedAttentionGemm(
     hipblasHandle_t handle, const float* q, const float* k, const float* v,
     const float* gate, float* k_cache, float* v_cache, void* k_cache_f16,
-    void* v_cache_f16, float* scores, float* out_context,
+    void* v_cache_f16,
+    KvBlockTable kv_table, float* scores, float* out_context,
     std::uint32_t layer_idx, std::uint32_t start_pos, std::size_t batch_size,
     std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim,

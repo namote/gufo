@@ -30,6 +30,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <stop_token>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -1146,8 +1147,9 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
 }
 
 // Messages selects reasoning with thinking.type; adaptive leaves the choice to
-// the server's default. budget_tokens has no native equivalent, so enabled
-// thinking keeps the server's effort unless output_config.effort sets it.
+// the server's default. With enabled thinking, budget_tokens caps the
+// reasoning tokens, as llama.cpp does; enabled thinking keeps the server's
+// effort unless output_config.effort sets it.
 // Reasoning is returned for every display, because replayed thinking blocks
 // restore the cached thought.
 std::optional<HttpResponse> ReadThinking(const json::Value& body,
@@ -1163,10 +1165,15 @@ std::optional<HttpResponse> ReadThinking(const json::Value& body,
         "'thinking.type' must be enabled, adaptive, or disabled");
   if (const auto* budget = thinking->find("budget_tokens");
       budget != nullptr &&
-      (!budget->is_number() || budget->as_double() < 1 ||
+      (!budget->is_number() || !std::isfinite(budget->as_double()) ||
+       budget->as_double() < 1 ||
+       budget->as_double() > std::numeric_limits<std::int32_t>::max() ||
        std::floor(budget->as_double()) != budget->as_double()))
     return InvalidCompatibilityRequest(
-        "'thinking.budget_tokens' must be a positive integer");
+        "'thinking.budget_tokens' must be a positive integer at most "
+        "2147483647");
+  else if (budget != nullptr && type->str() == "enabled")
+    reasoning->budget_tokens = static_cast<std::size_t>(budget->as_double());
   if (const auto* display = thinking->find("display");
       display != nullptr &&
       (!display->is_string() ||
@@ -1382,17 +1389,58 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
              "invalid_prompt");
 }
 
-HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend&) {
-  const std::string model = req.query_param("model");
-  if (model.empty()) {
-    return Err(400, "Bad Request", "'model' query parameter is required",
-               "invalid_request_error", "missing_model");
-  }
+/// llama-server props for a single-model server: what it runs, so a client
+/// can record which model, build and settings answered it. `?model=` is
+/// accepted and not required, as in llama-server outside router mode. Fields
+/// the backend does not report are omitted rather than sent as zero.
+HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
+  const std::string requested = req.query_param("model");
   json::Value resp = json::Value::object();
-  resp["model"] = model;
+  resp["model"] = requested.empty() ? b.model_id() : requested;
+  resp["model_alias"] = b.model_id();
   resp["template"] = "";
-  json::Value model_info = json::Value::object();
-  resp["model_info"] = std::move(model_info);
+  resp["model_info"] = json::Value::object();
+  if (auto path = b.model_path(); !path.empty()) {
+    resp["model_path"] = std::move(path);
+  }
+  if (auto build = b.build_info(); !build.empty()) {
+    resp["build_info"] = std::move(build);
+  }
+  if (const auto sessions = b.session_states().size(); sessions > 0) {
+    resp["total_slots"] = sessions;
+  }
+
+  // What a request without sampling fields gets.
+  const auto defaults = b.sampling_defaults();
+  const auto sampling = defaults.Resolve(b.reasoning_defaults().enabled);
+  json::Value params = json::Value::object();
+  params["temperature"] = static_cast<double>(sampling.temperature);
+  params["top_k"] = static_cast<int>(sampling.top_k);
+  params["top_p"] = static_cast<double>(sampling.top_p);
+  params["min_p"] = static_cast<double>(sampling.min_p);
+  params["seed"] = static_cast<long long>(sampling.seed);
+  params["repeat_penalty"] = static_cast<double>(sampling.repeat_penalty);
+  params["repeat_last_n"] = sampling.repeat_last_n;
+  params["frequency_penalty"] = static_cast<double>(sampling.frequency_penalty);
+  params["presence_penalty"] = static_cast<double>(sampling.presence_penalty);
+  // -1 means no default limit, as in llama-server, which reports both keys.
+  const auto n_predict = defaults.max_tokens > 0
+                             ? static_cast<std::int64_t>(defaults.max_tokens)
+                             : std::int64_t{-1};
+  params["max_tokens"] = n_predict;
+  params["n_predict"] = n_predict;
+  json::Value generation = json::Value::object();
+  if (const std::size_t context = b.max_context(); context > 0) {
+    generation["n_ctx"] = context;
+  }
+  generation["params"] = std::move(params);
+  resp["default_generation_settings"] = std::move(generation);
+
+  json::Value modalities = json::Value::object();
+  modalities["vision"] = b.supports_images();
+  modalities["video"] = false;
+  modalities["audio"] = false;
+  resp["modalities"] = std::move(modalities);
   return Ok(resp);
 }
 
@@ -1454,6 +1502,31 @@ double KvCacheUsageRatio(const TextGenerationBackend& b) {
 HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
   std::ostringstream out;
   out << std::setprecision(std::numeric_limits<double>::max_digits10);
+  if (const auto blocks = b.row_blocks(); blocks.total_blocks != 0) {
+    const auto gauge = [&](std::string_view name, std::string_view help,
+                           std::string_view type, std::size_t value) {
+      out << "# HELP " << name << ' ' << help << "\n# TYPE " << name << ' '
+          << type << '\n' << name << ' ' << value << '\n';
+    };
+    gauge("gufo_kv_blocks", "Paged KV pool blocks", "gauge",
+          blocks.total_blocks);
+    gauge("gufo_kv_blocks_free", "Paged KV pool blocks free", "gauge",
+          blocks.free_blocks);
+    gauge("gufo_kv_blocks_indexed", "Resident KV blocks in the block index",
+          "gauge", blocks.indexed_blocks);
+    gauge("gufo_kv_blocks_index_only",
+          "Indexed KV blocks nothing but the index holds", "gauge",
+          blocks.index_only_blocks);
+    gauge("gufo_kv_index_restored_total",
+          "Disk block reads replaced by a resident block", "counter",
+          blocks.index_restored);
+    gauge("gufo_kv_index_deduplicated_total",
+          "Duplicate KV blocks replaced by a resident one", "counter",
+          blocks.index_deduplicated);
+    gauge("gufo_kv_index_released_total",
+          "Index-only KV blocks freed for admissions", "counter",
+          blocks.index_released);
+  }
   out << "# HELP gufo_device_lost_total Confirmed GPU context losses\n"
       << "# TYPE gufo_device_lost_total counter\n"
       << "gufo_device_lost_total "
