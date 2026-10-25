@@ -71,7 +71,7 @@
 - 수정: `target < offset`일 때만 먼저 0을 돌려준다. `target == offset`은 복사 중·게시 분기를 거친 뒤에 판단한다.
 - 새 CPU 테스트(stable 경계 = prompt − 1)는 옛 코드에서 실패하고 수정본에서 통과한다.
 - GPU: 수정 바이너리로 `inference_backend_gpu_test` 10/10 통과(`final-f16-fork-a06`). 수정 전 HEAD 계열은 3/13 실패였다.
-- 원본에도 있는 문제라 PR 후보다.
+- 원본에도 있는 문제지만 원본 PR로 내지 않고 우리 포크에서 그대로 유지한다(2026-10-25 사용자: "ShareCheckpoint 경계 수정은 우리가 그냥 진행하자").
 
 ### 장치 행 write-back 읽기 겹치기 (`663d50c9`)
 
@@ -100,5 +100,5 @@
 ## 다음
 
 - 커밋 정리·PR 나누기·`--kv-pool-bytes` 기본값은 결정·반영했다([PR 계획](PR-PLAN.md)). D2 공개는 미정.
-- 원본에도 있는 `ShareCheckpoint` 경계 문제는 별도 PR 후보.
+- 원본에도 있는 `ShareCheckpoint` 경계 수정(`b4eec7d4`)은 원본 PR 후보에서 빼고 우리 포크에서 유지한다(2026-10-25 사용자: "ShareCheckpoint 경계 수정은 우리가 그냥 진행하자").
 - 장치 대기 추가 감소(미리 읽기 깊이·stream 우선순위)는 필요할 때 shared A/B로.

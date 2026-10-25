@@ -111,3 +111,27 @@
 합쳐진 system 턴 끝을 선제 경계로 삼은 `17163c2f`는 late instructions가 다른 대화 사이의 leading 공유 성능을 잃을 수 있다. hoisted 테스트도 그 잘못된 목표를 고정했다. 즉시 0 guard는 **손해 방지, 회귀 미해결**로 기록하고, 입력에 따른 probe 선택 후보를 세 빌드의 실제 복원 위치/prefill로 검증한다. [담당 검증 계획·결과](HOIST-PREFIX-REVIEW.md)를 따른다.
 
 `8cd5c24d`로 0 guard를 먼저 커밋한 뒤 세 빌드를 비교했다. hoisted 둘째 요청의 old/zero/probe 복원은 1186/0/1186, prefill은 64/1250/64로 두 mirror 모두 같았다. 사용자 gate 충족 후에만 조건부 probe를 `c0a68ddc`로 채택했다. 36응답·EOS 일치, CPU7/GPU2/infra432 PASS. 첫/root 요청은 선제 checkpoint 작업으로 zero보다0.16–0.17s 느리고 관련 시간 경고6건을 보존한다(기존 probe 대비 경고0). [상세 결과·한계](HOIST-PREFIX-REVIEW.md)를 참조한다.
+
+## 마무리 최종점검과 원본 suite 정리 (2026-10-26)
+
+사용자 지시: "1번 진행해줘" → "테스트 하나가 다른테스트를 커버하지 않나? ... 정리해보자" → "구지 필요없는 테스트들이 너무 커져서.. 테스트 최적화가 필요해ㅑ" → "메인에서 실패하는 테스트는 뭔지보고 테스트를 수정하던가.. 삭제하던가.. 기능확인하고 기능을 수정하던가 하자" → "오케이 그냥 유지해".
+
+### 테스트 축소
+
+- ai.tools `gufo_upstream_port_20261023/`에 `COVERAGE.json`(경로 → suite·tier·창·unit 영역, 미매핑 경로는 멈춤), `choose.py`(diff → 선택), `reuse.py`(같은 이미지·같은 harness의 COMPLETE 창과 같은 바이너리 SHA unit 재사용), `make_plan.py`(PLAN 생성·LOCKS 재생성)를 추가했다. 시간 control(ABBA, `--controls`)은 시간 영향이 있는 변경에만 돌린다.
+- F19는 HEAD unit 9/9와 long32k/long256k/mem만 새로 돌리고 나머지는 F16–F18 같은 이미지 증거를 재사용했다. 중간에 멈춘 실행에서 `fb-long256k`/`f19-long256k`의 FINAL.json 메모리 행이 빠졌다(원본 창 결과는 남음).
+
+### 원본 functional suite 실패 정리
+
+|suite|원본 main `82c62b40`|원인|처리|
+|---|---|---|---|
+|cache-depth|통과|이식 회귀: 행이 모자랄 때 분기 복원 checkpoint·prefix checkpoint·live frontier 회수 조건|`75cffde3`, `82e88bad`, `ad15b000`. F22 single-session cache-depth/cache-rotation/long-context 통과|
+|disk-spacing|통과|이식 회귀: learned 경계가 다음 checkpoint의 디스크 간격을 차지|`b76614a6`. F20 통과|
+|reasoning-budget|실패|우리 실행 설정 `--think off`|F21부터 서버 기본 thinking으로 실행, 통과|
+|conversation|실패|Q4_K_M 정밀도. Q8_0에서 통과|테스트 유지, 기록만|
+|tool-reasoning|실패|가중치에 따라 모델이 echo 지시를 따르지 않음|호출을 기대하지 않는 7경우에 "Do not call any tool" 추가(`5e982d9c`, `c4f1b9a9`). 호출+echo 경우(`closer_before_call`, `framing_between_calls`)는 그대로 둠|
+
+- `framing_between_calls` trace(`final-f22-trace-a01`, `--trace`): Q8_0은 먼저 쓰라고 한 `</invoke>` 줄을 건너뛰고 바로 native 호출을 썼다. Q4_K_M은 system 프롬프트에 적힌 클라이언트 envelope 형식으로 완전한 호출을 썼고, 파서는 선언된 도구 이름의 envelope를 framing으로 지웠다(응답 텍스트 빈 문자열, 호출 없음). 원본 `openai_chat.cpp`의 의도된 설계("Client envelope syntax is removed only when it names a declared tool")이므로 바꾸지 않았다.
+- F21 standard-full·cache-pressure 통과, units PASS. 남은 실패는 conversation(Q4_K_M)과 tool-reasoning 호출+echo 2경우이며 둘 다 원본 main에서도 실패한다.
+- **결정(2026-10-26 사용자: "오케이 그냥 유지해")**: 원본 기준 가중치(UD-Q4_K_XL) 다운로드와 Q8_0 suite 전환은 하지 않는다. suite와 시나리오 모두 운영 가중치 Q4_K_M으로 유지하고, 위 두 실패는 원본 main과 같은 알려진 실패로 기록한다. envelope 파서 설계와 해당 테스트도 그대로 둔다.
+- 증거: `tmp/test-results/gufo-upstream-port-20261023/final-f19*`, `final-f20*`, `final-f21*`, `final-f22*`. 각 창 quiet/owner/health PASS, 자동 fallback 없음.

@@ -42,7 +42,7 @@
 
 |PR|포함 커밋(port-tidy)|원본 위 충돌|빌드·테스트|
 |---|---|---|---|
-|① ShareCheckpoint 경계 수정|`5bb34847`|없음(원본 main 단독)|CPU 137/137, GPU 빌드 OK. 새 테스트는 수정 전 코드에서 실패|
+|① ShareCheckpoint 경계 수정 — **제외**(2026-10-25 사용자: "ShareCheckpoint 경계 수정은 우리가 그냥 진행하자", 포크에서 유지)|`5bb34847`|없음(원본 main 단독)|CPU 137/137, GPU 빌드 OK. 새 테스트는 수정 전 코드에서 실패|
 |② 관측 로그|`941854a0`(write-back 시간), `6324aa9f`(restore_failed)|없음(원본 main 단독)|CPU 137/137, GPU 빌드 OK|
 |③-1 공유 pass scratch|`d8a7b2aa`, `e27b74f1`(마지막 hidden 행만 보존)|없음(원본 main 단독)|CPU 137/137, GPU 빌드 OK|
 |③-2 paged KV pool|`aa4bb469`, `0e382b3f`, `2e8934f7`, `753e1cc5`, `000bcd96`|없음|CPU 138/138, GPU 빌드 OK|
