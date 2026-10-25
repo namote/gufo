@@ -1567,8 +1567,8 @@ std::optional<DiskSnapshot> DiskStore::Open(CheckpointId id) const {
   return {};
 }
 void DiskStore::PrefetchPayload(const DiskSnapshot& snapshot, bool private_file,
-                                const DiskPayload& payload,
-                                std::uint64_t bytes) const {
+                                const DiskPayload& payload, std::uint64_t bytes,
+                                std::span<std::uint8_t> scratch) const {
   if (snapshot.store_ != impl_.get() || !snapshot.pin_ ||
       !Contains(snapshot.manifest_, private_file, payload))
     throw std::invalid_argument("invalid disk prefetch dependency");
@@ -1580,9 +1580,25 @@ void DiskStore::PrefetchPayload(const DiskSnapshot& snapshot, bool private_file,
   Fd file(platform::OpenAt(directory, DiskFileName(payload.file),
                            platform::FileMode::kRead, ec));
   platform::FileInfo status{};
-  if (platform::FileValid(file.Get()) &&
-      platform::Stat(file.Get(), &status, ec) && Regular(status))
+  if (!platform::FileValid(file.Get()) ||
+      !platform::Stat(file.Get(), &status, ec) || !Regular(status))
+    return;
+  if (scratch.empty()) {
     platform::Advise(file.Get(), platform::AdviseHint::kWillNeed, 0, bytes);
+    return;
+  }
+  for (std::uint64_t offset = 0; offset < bytes;) {
+    const auto n =
+        platform::ReadAt(file.Get(), offset, scratch.data(),
+                         static_cast<std::size_t>(std::min<std::uint64_t>(
+                             scratch.size(), bytes - offset)),
+                         ec);
+    if (n == 0 && ec == std::errc::interrupted)
+      continue;
+    if (n == 0)
+      return;
+    offset += n;
+  }
 }
 DiskReadStats DiskStore::ReadPayload(
     const DiskSnapshot& snapshot, bool private_file, const DiskPayload& payload,
