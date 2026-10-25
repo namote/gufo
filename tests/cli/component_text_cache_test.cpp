@@ -2080,6 +2080,22 @@ void RefusedCaptureIsKnownBeforePrefill() {
   assert(lease->CaptureBytes(100) <= (1 << 20));
   assert(!lease->CaptureRefused(100));
   lease->Invalidate();
+  // An adapter without in-pass prediction (as the Qwen adapter): a frontier
+  // already over the budget makes any later boundary refused; a short one
+  // is not known refused.
+  runner->adapter->SetCheckpointPrediction(false);
+  auto large = cache.Acquire(prompt, {}, {}, true, 0, true);
+  auto& large_state = dynamic_cast<State&>(large->state());
+  const auto body = std::span(prompt).first(prompt.size() - 10);
+  runner->adapter->Append(large_state.slot, body, body);
+  assert(large->CaptureBytes() > (1 << 20));
+  assert(large->CaptureRefused(prompt.size()));
+  large->Invalidate();
+  auto small = cache.Acquire(prompt, {}, {}, true, 0, true);
+  auto& small_state = dynamic_cast<State&>(small->state());
+  runner->adapter->Append(small_state.slot, head, head);
+  assert(!small->CaptureRefused(prompt.size()));
+  small->Invalidate();
 }
 void WriteBackReusesPersistedChunks() {
   // The prompt boundary goes to disk from a RAM checkpoint; the write-back of

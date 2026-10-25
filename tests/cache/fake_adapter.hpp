@@ -57,6 +57,8 @@ public:
                                               Rows end) const override;
   void SetPrefillPassRows(Rows rows);
   void SetExecutionComplete(Slot&, bool);
+  // Without it the adapter offers no in-pass checkpoint prediction.
+  void SetCheckpointPrediction(bool);
   [[nodiscard]] std::vector<ComponentPosition> PrefillCheckpointPositions(
       const Slot&, Rows boundary) const override;
   void BeginRestore(Slot&, std::span<const ComponentPosition>) override;
@@ -106,6 +108,7 @@ private:
                                       std::function<TransferResult()>);
   std::array<ComponentDescriptor, 3> components_;
   bool fail_allocation_{false};
+  bool predict_checkpoints_{true};
   bool fail_transfer_{false};
   std::atomic<std::size_t> invalidations_{};
   Rows prefill_pass_rows_{2048};
