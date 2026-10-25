@@ -1312,8 +1312,10 @@ void TestPreparedSystemPrefix() {
       {ChatRole::kAssistant, "Earlier answer."},
       {ChatRole::kDeveloper, "Late developer rules."},
       {ChatRole::kUser, "Second question."}};
-  CheckPreparedSystemPrefix(*tokenizer, hoisted, {}, options,
-                            "<|im_start|>user\nFirst question.");
+  CheckPreparedSystemPrefix(*tokenizer, hoisted, {}, options, {});
+  auto different_hoisted = hoisted;
+  different_hoisted[3].content = "Different late developer rules.";
+  CheckPreparedSystemPrefix(*tokenizer, different_hoisted, {}, options, {});
   const auto missing_start = SystemPrefixTokenizer(false);
   CheckPreparedSystemPrefix(*missing_start, messages, {}, options,
                             "<|im_start|>user\nFirst question.");

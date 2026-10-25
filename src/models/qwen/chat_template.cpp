@@ -732,7 +732,12 @@ std::optional<std::string> QwenChatTemplate::Render(
   // Report the boundary while rendering the system turn. The next turn
   // starts with a special token, so tokenization can count this prefix
   // without rendering a second conversation or changing BPE merges.
-  const auto system_end = has_system_prefix ? output.size() : 0;
+  // Hoisted instructions vary between conversations with the same leading
+  // instructions. Do not publish their combined end as a shared-system
+  // frontier. This disables eager capture; it does not recover the original
+  // leading prefix inside the combined turn.
+  const auto system_end =
+      has_system_prefix && hoisted.empty() ? output.size() : 0;
 
   std::size_t last_user_index = messages.size();
   for (std::size_t index = messages.size(); index > 0; --index) {
