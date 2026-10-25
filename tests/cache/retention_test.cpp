@@ -914,7 +914,8 @@ void InvalidInventoriesPreserveReplacement() {
     assert(f.log.events.back().ledger_bytes == before);
   }
 }
-void SharedChunkAccounting() {
+enum class ChunkStorage { kHost, kDevice, kMixed };
+void SharedChunkAccounting(ChunkStorage storage) {
   for (const std::size_t chunks : {0, 1, 7, 64, 2048}) {
     constexpr std::size_t capacity = 64ULL << 20;
     ResourceLedger ledger({capacity, capacity, 0, capacity});
@@ -936,6 +937,17 @@ void SharedChunkAccounting() {
            CheckpointPurpose::kPrompt,
            3},
           [&](const PayloadRequest& r) {
+            const auto& descriptor = components[r.component.value - 1];
+            const bool device =
+                r.category == ResourceCategory::kBackingAssigned &&
+                (storage == ChunkStorage::kDevice ||
+                 (storage == ChunkStorage::kMixed &&
+                  r.first / descriptor.rows_per_chunk % 2 == 0));
+            if (device)
+              return Payload::Device(
+                  ledger.Reserve(ResourceCategory::kMetadata, sizeof(Payload))
+                      .Convert(),
+                  std::make_shared<int>(0), r.bytes);
             auto pool = ledger.Reserve(ResourceCategory::kBackingFree, r.bytes)
                             .Convert();
             return Payload::Committed(pool.ReserveBacking(r.category).Convert(),
@@ -955,7 +967,8 @@ void SharedChunkAccounting() {
           if (c.tail)
             expected += c.tail->Bytes();
           for (const auto& chunk : c.chunks)
-            if (seen.insert(chunk.Id().value).second)
+            if (!chunk.Storage().OnDevice() &&
+                seen.insert(chunk.Id().value).second)
               expected += chunk.Storage().Bytes();
         }
       assert(policy.RetainedPayloadBytes() == expected);
@@ -1048,6 +1061,16 @@ void SharedChunkAccounting() {
              retained[1]->Components()[0].chunks[0].Id());
       assert(retained[0]->Components()[0].chunks[1].Id() ==
              retained[1]->Components()[0].chunks[1].Id());
+      // Byte-pressure eviction keeps its age order and transfers the shared
+      // host bytes to the remaining owner, including a mixed device/host hole.
+      const std::vector<Token> incoming(9, 99);
+      while (!retained.empty()) {
+        const auto oldest = retained.front()->Id();
+        assert(policy.Reclaim({incoming, {1}, {}}));
+        assert(log.events.back().checkpoint == oldest);
+        retained.erase(retained.begin());
+        check();
+      }
     }
   }
 }
@@ -1151,6 +1174,8 @@ int main() {
   CapacityAndSharing();
   ImpossibleAndAllocationFailure();
   RealCapacityAndUniqueAdmission();
-  SharedChunkAccounting();
+  SharedChunkAccounting(ChunkStorage::kHost);
+  SharedChunkAccounting(ChunkStorage::kDevice);
+  SharedChunkAccounting(ChunkStorage::kMixed);
   InvalidInventoriesPreserveReplacement();
 }
