@@ -241,12 +241,20 @@ void CheckLeasedGuard(const std::shared_ptr<const hip::QwenGpuModel>& model) {
   }
   std::cout << "real_leased_guard,PASS\n";
 }
-void Check(const std::shared_ptr<const hip::QwenGpuModel>& model, bool fp16) {
-  std::cout << (fp16 ? "FP16" : "FP32") << ",boundaries" << std::endl;
+void Check(const std::shared_ptr<const hip::QwenGpuModel>& model, bool fp16,
+           bool shared_scratch = false) {
+  const std::string label = std::string(fp16 ? "FP16" : "FP32") +
+                            (shared_scratch ? "-shared-scratch" : "");
+  std::cout << label << ",boundaries" << std::endl;
   hip::QwenExecutionPolicy policy;
   policy.kv_cache_storage =
       fp16 ? hip::QwenKvCacheStorage::kFp16 : hip::QwenKvCacheStorage::kFp32;
-  qwen::ContinuationAdapter adapter(model, 12288, {'q', 'w', 'e', 'n'}, policy);
+  constexpr std::uint32_t kContext = 12288;
+  qwen::ContinuationAdapter adapter(
+      model, kContext, {'q', 'w', 'e', 'n'}, policy, nullptr, {}, nullptr,
+      shared_scratch ? std::make_shared<hip::QwenSharedPassScratch>(
+                           model->GetConfig(), kContext)
+                     : nullptr);
   hip::TransferPool pool(2);
   Guard ga, gb;
   auto source = adapter.CreateSlot(ga), destination = adapter.CreateSlot(gb);
@@ -427,7 +435,52 @@ void Check(const std::shared_ptr<const hip::QwenGpuModel>& model, bool fp16) {
   Wait(std::move(lifetime_copy));
   Require(lifetime_bytes == earlier.bytes[2],
           "slot destruction changed pending capture");
-  std::cout << (fp16 ? "FP16" : "FP32") << ",restore_edit_guard,PASS\n";
+  std::cout << label << ",restore_edit_guard,PASS\n";
+}
+// Slots of one adapter share a prompt-pass scratch: another slot's prefill
+// between a prefill and its decode must not change any logits, and each
+// session keeps only decode-step scratch rows of its own.
+void CheckSharedPassScratch(
+    const std::shared_ptr<const hip::QwenGpuModel>& model) {
+  std::cout << "shared_pass_scratch" << std::endl;
+  constexpr std::uint32_t kContext = 8192;
+  auto scratch = std::make_shared<hip::QwenSharedPassScratch>(
+      model->GetConfig(), kContext);
+  qwen::ContinuationAdapter own(model, kContext, {'o', 'w', 'n'});
+  qwen::ContinuationAdapter leased(model, kContext, {'s', 'h', 'r'}, {},
+                                   nullptr, {}, nullptr, scratch);
+  Guard gr, ga, gb;
+  auto reference = own.CreateSlot(gr);
+  auto first = leased.CreateSlot(ga), second = leased.CreateSlot(gb);
+  auto& r = own.GetExecutor(*reference);
+  auto& a = leased.GetExecutor(*first);
+  auto& b = leased.GetExecutor(*second);
+  Require(scratch->rows() == r.GetMaxPromptBatch() &&
+              a.GetMemoryUsage().temporary_scratch_bytes <
+                  r.GetMemoryUsage().temporary_scratch_bytes,
+          "sessions sharing a pass scratch still hold a whole one");
+  const auto text = model->GetTokenizer().Encode(
+      "A cache line holds bytes fetched together from memory. Eviction picks "
+      "a line to replace when the set is full.\n");
+  std::vector<Token> tokens(4600);
+  for (std::size_t i = 0; i < tokens.size(); ++i)
+    tokens[i] = text[(i * 7) % text.size()];
+  // Two prompt passes (4096 + 404 rows), then a peer's pass in between.
+  (void)r.ForwardPromptBatch(std::span(tokens).first(4500));
+  (void)a.ForwardPromptBatch(std::span(tokens).first(4500));
+  (void)b.ForwardPromptBatch(std::span(tokens).subspan(100, 333));
+  SameLogits(r, a);
+  for (std::uint32_t i = 0; i < 8; ++i) {
+    const auto expected = r.ForwardToken(tokens[4500 + i], 4500 + i);
+    Require(a.ForwardToken(tokens[4500 + i], 4500 + i) == expected,
+            "shared pass scratch changed a decode token");
+    SameLogits(r, a);
+  }
+  const auto hidden = r.CopyLastHidden();
+  const std::vector<float> expected(hidden.begin(), hidden.end());
+  Require(std::ranges::equal(expected, a.CopyLastHidden()),
+          "shared pass scratch changed the last hidden row");
+  std::cout << "shared_pass_scratch,PASS\n";
 }
 
 void CheckBatchAdmission(
@@ -898,6 +951,8 @@ int main(int argc, const char* const* argv) {
     if (!guard_only && !image_only) {
       Check(model, true);
       Check(model, false);
+      Check(model, true, true);
+      CheckSharedPassScratch(model);
       CheckPrefillCancellation(model, true);
       CheckPrefillCancellation(model, false);
     }

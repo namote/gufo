@@ -1036,7 +1036,15 @@ public:
         dflash_model_(std::move(dflash_model)),
         max_context_(max_context),
         speculative_options_(speculative_options),
-        execution_policy_(hip::QwenExecutionPolicy::Production()) {
+        execution_policy_(hip::QwenExecutionPolicy::Production()),
+        // Allocated now, before ResourceClaim reads free memory: sessions
+        // then claim only their decode-step scratch.
+        pass_scratch_(std::make_shared<hip::QwenSharedPassScratch>(
+            model_->GetConfig(), max_context_)) {
+    Logger::Info("loader",
+                 "event=shared_pass_scratch rows=" +
+                     std::to_string(pass_scratch_->rows()) +
+                     " bytes=" + std::to_string(pass_scratch_->bytes()));
     if (!artifact_fingerprint.empty()) {
       const bool speculative = dflash_model_ != nullptr;
       persistence_ = TextRunnerPersistenceDescriptor{
@@ -1070,7 +1078,7 @@ public:
                 .max_context = max_context_,
                 .max_draft_tokens = speculative_options_.max_draft_tokens,
                 .policy = speculative_options_.dflash_policy},
-            &ledger),
+            &ledger, pass_scratch_),
         ledger);
     // Qwen's 256-row chunks are small. Preserve a bounded group before
     // waiting, instead of synchronizing every half-MiB range individually.
@@ -1133,7 +1141,7 @@ public:
 
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
     auto usage = hip::QwenGpuExecutor::EstimateMemoryUsage(
-        model_->GetConfig(), max_context_, execution_policy_);
+        model_->GetConfig(), max_context_, execution_policy_, true);
     usage.request_state_bytes += hip::QwenGpuArena::RecurrentStateBytes(
         model_->GetConfig(), execution_policy_);
     std::size_t resident_weights = model_->GetResidentBytes();
@@ -1484,6 +1492,8 @@ private:
   std::uint32_t max_context_;
   speculative::SpeculativeOptions speculative_options_;
   hip::QwenExecutionPolicy execution_policy_;
+  // One prompt-pass scratch for all sessions (passes run one at a time).
+  std::shared_ptr<hip::QwenSharedPassScratch> pass_scratch_;
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
   cache::Identity component_identity_;
 };

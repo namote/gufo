@@ -171,6 +171,7 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
       }
     }
   }
+  const PassScratchLease pass_scratch(*coordinator);
   if (items.size() > coordinator->arena_.GetMaxBatch()) {
     throw std::length_error(
         "Qwen GPU decode width exceeds the coordinator arena capacity");
@@ -448,6 +449,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
         "Qwen verification requires one to eight sessions");
   }
   auto& coordinator = *items.front().executor;
+  const PassScratchLease pass_scratch(coordinator);
   auto& arena_ = coordinator.arena_;
   const auto& weights_ = coordinator.weights_;
   const auto& config = weights_.config;
