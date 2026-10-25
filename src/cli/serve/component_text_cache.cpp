@@ -989,6 +989,19 @@ void ComponentTextCache::CaptureBeforeReset(std::size_t index,
                      std::to_string(std::chrono::duration<double, std::milli>(
                                         Clock::now() - started)
                                         .count()));
+  } catch (const cache::ResourceExhausted&) {
+    Logger::Info("cache",
+                 "event=live_frontier_capture_refused "
+                 "reason=byte_capacity slot=" +
+                     std::to_string(index + 1) +
+                     " tokens=" + std::to_string(tokens.size()));
+  } catch (const std::bad_alloc&) {
+    // The capture allocator found no free backing within the RAM budget.
+    Logger::Info("cache",
+                 "event=live_frontier_capture_refused "
+                 "reason=byte_capacity slot=" +
+                     std::to_string(index + 1) +
+                     " tokens=" + std::to_string(tokens.size()));
   } catch (const std::exception& error) {
     // Optional: the request proceeds cold-reassigned, as without a capture.
     Logger::Info("cache", std::string("event=live_frontier_capture_failed "
