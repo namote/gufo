@@ -100,6 +100,16 @@ bool Published(const cache::PrefixCandidate& candidate) {
          std::ranges::all_of(candidate.availability->components,
                              &cache::ComponentAvailability::durable);
 }
+// What the current exception says, for a log line in its handler.
+std::string CurrentExceptionReason() {
+  try {
+    throw;
+  } catch (const std::exception& error) {
+    return error.what();
+  } catch (...) {
+    return "non-standard exception";
+  }
+}
 bool SameOwner(const std::shared_ptr<const void>& a,
                const std::shared_ptr<const void>& b) {
   return !a.owner_before(b) && !b.owner_before(a);
@@ -1774,6 +1784,18 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           entry->durable = candidate.durable;
         }
       } catch (...) {
+        // The next candidate is tried, so a failed restore only shortens the
+        // reuse; name it so that shorter reuse is never silent.
+        try {
+          Logger::Info("cache",
+                       std::string("schema=component-cache-v1 "
+                                   "event=restore_failed source=") +
+                           (candidate.checkpoint ? "ram" : "disk") +
+                           " tokens=" + std::to_string(candidate.boundary) +
+                           " reason=\"" + CurrentExceptionReason() + "\"");
+        } catch (...) {
+          // Logging must not keep the slot from being reset below.
+        }
         if (!impl_->resources->adapter->Invalidate(request.slot.Execution()))
           throw;
         clean = true;
