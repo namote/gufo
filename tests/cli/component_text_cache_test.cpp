@@ -2051,8 +2051,8 @@ void IdleWriteBackResumesFromLastTurn() {
     return std::pair{cached, disk_hit};
   };
   for (const bool write_back : {false, true}) {
-    char pattern[] = "/tmp/gufo-component-write-back-test-XXXXXX";
-    const std::filesystem::path directory = mkdtemp(pattern);
+    const TemporaryDirectory temp("gufo-component-write-back-test");
+    const std::filesystem::path directory = temp.path();
     const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                           .capacity_bytes = 1 << 22,
                                           .staging_capacity_bytes = 7};
@@ -2126,8 +2126,8 @@ void RefusedCaptureIsKnownBeforePrefill() {
 void WriteBackReusesPersistedChunks() {
   // The prompt boundary goes to disk from a RAM checkpoint; the write-back of
   // the longer frontier reuses its chunk files and writes only new ones.
-  char pattern[] = "/tmp/gufo-component-write-back-reuse-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp("gufo-component-write-back-reuse");
+  const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1 << 22,
                                         .staging_capacity_bytes = 7};
@@ -2188,8 +2188,8 @@ void ShutdownWriteBackSharesQueuedCheckpoint() {
   std::iota(prompt.begin(), prompt.end(), 10);
   const std::vector<TextRunnerToken> head(prompt.begin(), prompt.begin() + 100);
   const auto run = [&](bool extend) {
-    char pattern[] = "/tmp/gufo-component-shutdown-write-back-XXXXXX";
-    const std::filesystem::path directory = mkdtemp(pattern);
+    const TemporaryDirectory temp("gufo-component-shutdown-write-back");
+    const std::filesystem::path directory = temp.path();
     const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                           .capacity_bytes = 1 << 22,
                                           .staging_capacity_bytes = 7};
@@ -2245,8 +2245,8 @@ void ReassignmentWritesUncoveredFrontier() {
   // lies within the disk step of it. When the only slot goes to another
   // prompt, the frontier captured there goes to disk too, so a restart
   // resumes at 200 rather than at the prompt boundary.
-  char pattern[] = "/tmp/gufo-component-reassignment-write-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp("gufo-component-reassignment-write");
+  const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1 << 22,
                                         .staging_capacity_bytes = 7};
@@ -2303,8 +2303,8 @@ void SharedLineageCoversOnlyItsOwnFrontier() {
   // lineage. A's 200-token frontier goes to disk when its slot is reassigned;
   // that checkpoint must not count as covering B's equally long frontier, so
   // shutdown still writes B back and a restart resumes B at 200.
-  char pattern[] = "/tmp/gufo-component-shared-lineage-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp("gufo-component-shared-lineage");
+  const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1 << 22,
                                         .staging_capacity_bytes = 7};
@@ -2402,8 +2402,8 @@ void RetainedChunksTakeNoRamAndRestore() {
 void RetainedChunksReachDisk() {
   // A disk job reads retained chunks from their storage; a restart restores
   // the prompt from disk.
-  char pattern[] = "/tmp/gufo-component-retained-disk-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp("gufo-component-retained-disk");
+  const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1 << 22,
                                         .staging_capacity_bytes = 7};
@@ -2564,8 +2564,8 @@ void FailedWriteBackKeepsTheLiveFrontier() {
   // An idle write-back that fails leaves the live frontier in its slot for
   // the next turn, and does not count it as covered: a later attempt waits
   // until it grows (idle passes) but shutdown tries it again.
-  char pattern[] = "/tmp/gufo-component-write-back-failure-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp("gufo-component-write-back-failure");
+  const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1 << 22,
                                         .staging_capacity_bytes = 7};
@@ -2585,6 +2585,8 @@ void FailedWriteBackKeepsTheLiveFrontier() {
   assert(runner->adapter->Invalidations() == invalidations);
   std::this_thread::sleep_for(std::chrono::milliseconds(2));
   assert(cache.WriteBackIdle(std::chrono::milliseconds(1)) == 0);
+  // Shutdown ignores the idle backoff.
+  assert(cache.WriteBackIdle(std::chrono::milliseconds(0)) == 1);
   auto next = conversation;
   next.push_back(7);
   {
@@ -2593,14 +2595,33 @@ void FailedWriteBackKeepsTheLiveFrontier() {
            lease->Metrics().reuse == "live");
     lease->Invalidate();
   }
+  std::filesystem::remove_all(directory);
+}
+void QueuedWriteBackFailureUncoversTheFrontier() {
+  // A write-back that is queued and then fails no longer covers the
+  // frontier, however soon it fails: shutdown writes it again.
+  const TemporaryDirectory temp("gufo-component-write-back-late-failure");
+  const std::filesystem::path directory = temp.path();
+  const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                        .capacity_bytes = 1,
+                                        .staging_capacity_bytes = 7};
+  std::vector<TextRunnerToken> conversation(100);
+  std::iota(conversation.begin(), conversation.end(), 10);
+  auto runner = std::make_shared<Runner>();
+  ComponentTextCache cache(runner, 1, 1 << 22, disk);
   {
     auto lease = cache.Acquire(conversation, {}, {}, true, 0, true);
     auto& state = dynamic_cast<State&>(lease->state());
-    if (lease->cached_tokens() == 0)
-      runner->adapter->Append(state.slot, conversation, conversation);
+    runner->adapter->Append(state.slot, conversation, conversation);
     (void)lease->Commit({}, {}, conversation);
   }
   assert(cache.WriteBackIdle(std::chrono::milliseconds(0)) == 1);
+  bool retried = false;
+  for (int i = 0; i < 200 && !retried; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    retried = cache.WriteBackIdle(std::chrono::milliseconds(0)) == 1;
+  }
+  assert(retried);
   std::filesystem::remove_all(directory);
 }
 void RowReclaimEmptiesSlotsBeforeDroppingCheckpoints() {
@@ -2654,8 +2675,8 @@ void SiblingDoesNotAdoptAnotherExecutionsCheckpoint() {
   // same 60 tokens past it, each in its own slot. A's checkpoint at 160
   // reaches disk; B computed its own rows, so B's write-back writes them
   // rather than reusing A's chunk files.
-  char pattern[] = "/tmp/gufo-component-sibling-chunks-XXXXXX";
-  const std::filesystem::path directory = mkdtemp(pattern);
+  const TemporaryDirectory temp("gufo-component-sibling-chunks");
+  const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1 << 22,
                                         .staging_capacity_bytes = 7,
@@ -2715,6 +2736,7 @@ void SiblingDoesNotAdoptAnotherExecutionsCheckpoint() {
 }
 int main() {
   FailedWriteBackKeepsTheLiveFrontier();
+  QueuedWriteBackFailureUncoversTheFrontier();
   RowReclaimEmptiesSlotsBeforeDroppingCheckpoints();
   SiblingDoesNotAdoptAnotherExecutionsCheckpoint();
   FirstFollowerRestoresTheSystemPromptCheckpoint();

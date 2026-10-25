@@ -172,8 +172,8 @@ __launch_bounds__(256, 4) __global__ void FusedQKNormRoPEKvWriteKernel(
 void LaunchFusedQKNormRoPEKvWrite(
     const float* q, const float* k, const float* v, const float* q_weight,
     const float* k_weight, float* q_out, float* k_out, float* k_cache,
-    float* v_cache, void* k_cache_f16, void* v_cache_f16,
-    KvBlockTable kv_table, std::uint32_t layer_idx, const std::uint32_t* d_pos,
+    float* v_cache, void* k_cache_f16, void* v_cache_f16, KvBlockTable kv_table,
+    std::uint32_t layer_idx, const std::uint32_t* d_pos,
     std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim,
     std::uint32_t rotary_dim, float rope_theta, float eps, hipStream_t stream,

@@ -4011,6 +4011,11 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
             *request.reasoning.budget_tokens, prompt->tokens);
   const std::string client_id =
       request.client_id.empty() ? "anonymous" : request.client_id;
+  // Before Submit moves the tokens: argument evaluation order is unspecified.
+  const std::size_t system_prefix_tokens =
+      request.cache_prompt ? state->scheduler->runner().SystemPrefixTokens(
+                                 effective_request, prompt->tokens)
+                           : 0;
   auto scheduled_request = state->scheduler->Submit(
       std::move(prompt->tokens), max_tokens, effective_sampling, is_cancelled,
       stream_output,
@@ -4021,11 +4026,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
           .prompt_context = std::move(prompt->context),
           .cache_prompt = request.cache_prompt,
           .cache_prefix_tokens = prompt->cache_prefix_tokens,
-          .system_prefix_tokens =
-              request.cache_prompt
-                  ? state->scheduler->runner().SystemPrefixTokens(
-                        effective_request, prompt->tokens)
-                  : 0,
+          .system_prefix_tokens = system_prefix_tokens,
           .stop_sequences = request.stop_sequences,
           .return_progress = request.return_progress,
       });

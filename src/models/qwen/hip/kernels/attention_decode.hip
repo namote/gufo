@@ -201,8 +201,7 @@ __global__ void AttentionHalfKernel(
 
   for (std::size_t position = 0; position < sequence_length; ++position) {
     const std::size_t cache_offset =
-        (KvTokenRow(kv_table, layer_idx, max_context, position) *
-         kv_width) +
+        (KvTokenRow(kv_table, layer_idx, max_context, position) * kv_width) +
         (static_cast<std::size_t>(kv_head) * head_dim);
     const __half* key = k_cache + cache_offset;
     float dot = 0.0F;
@@ -264,8 +263,7 @@ __global__ void AttentionHalfKernel(
     float context = 0.0F;
     for (std::size_t position = 0; position < sequence_length; ++position) {
       const std::size_t cache_offset =
-          (KvTokenRow(kv_table, layer_idx, max_context, position) *
-           kv_width) +
+          (KvTokenRow(kv_table, layer_idx, max_context, position) * kv_width) +
           (static_cast<std::size_t>(kv_head) * head_dim);
       context += scores[position] * __half2float(v_cache[cache_offset + tid]);
     }
@@ -387,9 +385,8 @@ __launch_bounds__(32) __global__ void QwenDecodeOnlineAttentionHalfKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
     const __half* __restrict__ k_cache, const __half* __restrict__ v_cache,
     KvBlockTable kv_table, float* __restrict__ out_context,
-    std::uint32_t layer_idx, std::uint32_t pos,
-    std::uint32_t max_context, std::uint32_t num_heads,
-    std::uint32_t num_kv_heads) {
+    std::uint32_t layer_idx, std::uint32_t pos, std::uint32_t max_context,
+    std::uint32_t num_heads, std::uint32_t num_kv_heads) {
   constexpr std::uint32_t head_dim = 256;
   constexpr std::uint32_t vector_width = head_dim / 4;
   constexpr std::uint32_t vectors_per_lane = vector_width / 32;
@@ -793,9 +790,10 @@ __launch_bounds__(32) __global__ void QwenDecodeSplitKAttentionReduceKernel(
 
 static void LaunchSplitKAttentionHalfPartials(
     const float* q, const __half* k_cache, const __half* v_cache,
-    KvBlockTable kv_table, float* scratch, std::uint32_t layer_idx, std::uint32_t start_pos,
-    unsigned rows, std::uint32_t max_context, std::uint32_t num_heads,
-    std::uint32_t num_kv_heads, std::uint32_t splits, hipStream_t stream) {
+    KvBlockTable kv_table, float* scratch, std::uint32_t layer_idx,
+    std::uint32_t start_pos, unsigned rows, std::uint32_t max_context,
+    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t splits,
+    hipStream_t stream) {
   // Share each KV tile across its six query heads in both scalar decoding
   // and verification. Rows retain independent causal endpoints and scratch.
   if (num_heads == 6 * num_kv_heads &&
@@ -974,9 +972,8 @@ void LaunchCausalDecodeAttention(
         q + row * width, nullptr, nullptr,
         gate == nullptr ? nullptr : gate + row * width, k_cache, v_cache,
         k_cache_f16, v_cache_f16, kv_table, out_context + row * width,
-        layer_idx,
-        start_pos + static_cast<std::uint32_t>(row), max_context, num_heads,
-        num_kv_heads, head_dim, stream, split_k_scratch, true);
+        layer_idx, start_pos + static_cast<std::uint32_t>(row), max_context,
+        num_heads, num_kv_heads, head_dim, stream, split_k_scratch, true);
   }
 }
 

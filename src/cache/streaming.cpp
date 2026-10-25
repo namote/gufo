@@ -95,7 +95,7 @@ void Accumulate(TransferTiming& destination, const TransferTiming& source) {
 }
 // Cold checkpoints are thousands of small files, and one thread hinting them
 // in turn waits on each: 0.4 GB/s on gfx1151's NVMe, against 3.2 GB/s for four
-// helpers (measured). A WILLNEED hint (or readahead(2)) still left the reader
+// helpers (measured). A will-need hint alone still left the reader
 // at 0.65 GB/s on cold 512 KiB chunk files: it waited on almost every file.
 // Helpers that read each file through a small scratch buffer leave it in the
 // page cache: 1.9 GB/s with four, 4.1 GB/s with eight (measured). Helpers

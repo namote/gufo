@@ -719,6 +719,10 @@ struct ComponentTextCache::Impl {
         ledger, File(1, capture->manifest.checkpoint.value), capture->manifest,
         std::move(capture->sources));
     std::size_t pending_slot;
+    // A write-back covers its frontier from before submission: the job may
+    // fail, and its callback clear the mark, before TrySubmit returns.
+    Entry* covered = nullptr;
+    std::size_t uncovered = 0;
     {
       const std::lock_guard lock(mutex);
       const auto position =
@@ -727,11 +731,21 @@ struct ComponentTextCache::Impl {
         return 0;
       pending_slot = position - pending_durable.begin();
       *position = capture;
+      if (capture->write_back)
+        for (auto& entry : entries)
+          if (capture->branch && entry->branch == capture->branch) {
+            covered = entry.get();
+            uncovered = std::exchange(covered->written_back,
+                                      capture->manifest.tokens.size());
+          }
     }
     if (!queue->TrySubmit(std::move(job))) {
       const std::lock_guard lock(mutex);
       if (pending_durable[pending_slot] == capture)
         pending_durable[pending_slot].reset();
+      if (covered && covered->branch == capture->branch &&
+          covered->written_back == capture->manifest.tokens.size())
+        covered->written_back = uncovered;
       return 0;
     }
     return PayloadBytes(capture->manifest);
@@ -1060,7 +1074,8 @@ std::size_t ComponentTextCache::capacity() const noexcept {
 void ComponentTextCache::CaptureBeforeReset(std::size_t index,
                                             cache::BorrowedLocation location,
                                             std::vector<cache::Token> tokens,
-                                            cache::Identity input) noexcept {
+                                            cache::Identity input,
+                                            std::string_view reason) noexcept {
   auto* entry = impl_->entries[index].get();
   const auto started = Clock::now();
   // A write-back still queued from this slot fails once the reset retires the
@@ -1074,11 +1089,11 @@ void ComponentTextCache::CaptureBeforeReset(std::size_t index,
         Impl::Durable(*entry) + Impl::kUncoveredCaptureTokens <= tokens.size();
   }
   const auto log = [&](std::string_view event, std::string_view detail) {
-    Logger::Info("cache",
-                 std::string("event=") + std::string(event) +
-                     " reason=reassignment slot=" + std::to_string(index + 1) +
-                     " tokens=" + std::to_string(tokens.size()) +
-                     std::string(detail));
+    Logger::Info("cache", std::string("event=") + std::string(event) +
+                              " reason=" + std::string(reason) +
+                              " slot=" + std::to_string(index + 1) +
+                              " tokens=" + std::to_string(tokens.size()) +
+                              std::string(detail));
   };
   try {
     Lease lease(std::make_unique<Lease::Impl>(
@@ -1092,11 +1107,15 @@ void ComponentTextCache::CaptureBeforeReset(std::size_t index,
       if (!lease.TryReserveSnapshot(lease.CaptureBytes(), tokens.size(), false,
                                     SnapshotPurpose::kRetry, tokens))
         log("live_frontier_capture_refused", " cause=byte_capacity");
+      else if (const auto bytes =
+                   lease.PublishSnapshot(tokens, lease.Capture(), false);
+               bytes == 0 && lease.impl_->metrics.disk_queued_bytes == 0)
+        // Retention refused the published copy.
+        log("live_frontier_capture_refused", " cause=retention");
       else
         log("live_frontier_captured",
-            " bytes=" +
-                std::to_string(
-                    lease.PublishSnapshot(tokens, lease.Capture(), false)) +
+            " bytes=" + std::to_string(bytes) + " disk_queued_bytes=" +
+                std::to_string(lease.impl_->metrics.disk_queued_bytes) +
                 " ms=" +
                 std::to_string(std::chrono::duration<double, std::milli>(
                                    Clock::now() - started)
@@ -1159,13 +1178,14 @@ std::size_t ComponentTextCache::WriteBackIdle(
                std::equal(prefix.begin(), prefix.end(),
                           entry->live_tokens.begin());
       };
-      if (std::ranges::any_of(
-              impl_->pending,
-              [&](const auto& checkpoint) {
-                return checkpoint &&
-                       checkpoint->Lineage() == entry->history->Lineage() &&
-                       extends(checkpoint->Tokens(), checkpoint->Input());
-              }) ||
+      // Only this execution's own pending checkpoints may cover it: the
+      // persistence callback adopts no other (Persist, `pending_branch`).
+      bool own_pending = false;
+      for (std::size_t p = 0; p < impl_->pending.size(); ++p)
+        own_pending |=
+            impl_->pending[p] && impl_->pending_branch[p] == entry->branch &&
+            extends(impl_->pending[p]->Tokens(), impl_->pending[p]->Input());
+      if (own_pending ||
           std::ranges::any_of(impl_->pending_durable, [&](const auto& capture) {
             return capture && capture->branch == entry->branch &&
                    extends(capture->manifest.tokens, capture->manifest.input);
@@ -1222,10 +1242,9 @@ std::size_t ComponentTextCache::WriteBackIdle(
                        " error=" + error.what());
     }
     const std::lock_guard lock(impl_->mutex);
-    // Only a queued write covers the frontier; shutdown retries the rest.
+    // Only a queued write covers the frontier (Persist marks it); shutdown
+    // retries the rest.
     entry->write_back_tried = tokens.size();
-    if (submitted)
-      entry->written_back = tokens.size();
     entry->busy = false;
     queued += submitted;
   }
@@ -1297,14 +1316,21 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
       visited.push_back(entry);
       entry->busy = true;
       // A checkpoint of rows retained on the device would keep the very rows
-      // this reset is to return.
-      if (impl_->device_components.empty())
-        uncovered = impl_->UncoveredLive(slot - 1);
+      // this reset is to return, and a disk-only copy fails once the reset
+      // retires the rows it observes: the uncovered frontier is dropped.
+      uncovered = impl_->UncoveredLive(slot - 1);
+      if (uncovered && !impl_->device_components.empty()) {
+        Logger::Info("cache",
+                     "event=live_frontier_dropped reason=row_capacity slot=" +
+                         std::to_string(slot) +
+                         " tokens=" + std::to_string(uncovered->tokens.size()));
+        uncovered.reset();
+      }
     }
     if (uncovered)
       CaptureBeforeReset(uncovered->index, uncovered->location,
                          std::move(uncovered->tokens),
-                         std::move(uncovered->input));
+                         std::move(uncovered->input), "row_capacity");
     {
       const std::lock_guard lock(impl_->mutex);
       entry->branch = std::make_shared<const std::uint8_t>(0);
@@ -1490,7 +1516,8 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
   // the next turn of that conversation then restores an older checkpoint.
   if (evicted)
     CaptureBeforeReset(evicted->index, evicted->location,
-                       std::move(evicted->tokens), std::move(evicted->input));
+                       std::move(evicted->tokens), std::move(evicted->input),
+                       "reassignment");
   {
     const std::lock_guard lock(impl_->mutex);
     if (!live) {

@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -15,6 +16,26 @@
 
 namespace gufo::hip {
 namespace {
+
+// A batched pass writes every participant's KV rows on the coordinator's
+// stream. If it throws, a participant reset returns its pool blocks after
+// draining only its own stream; drain the coordinator's first so no other
+// session maps a block a queued kernel still writes.
+class DrainOnUnwind {
+public:
+  explicit DrainOnUnwind(hipStream_t stream) : stream_(stream) {}
+  ~DrainOnUnwind() {
+    if (std::uncaught_exceptions() > exceptions_ &&
+        hipStreamSynchronize(stream_) != hipSuccess)
+      (void)hipGetLastError();
+  }
+  DrainOnUnwind(const DrainOnUnwind&) = delete;
+  DrainOnUnwind& operator=(const DrainOnUnwind&) = delete;
+
+private:
+  hipStream_t stream_;
+  int exceptions_{std::uncaught_exceptions()};
+};
 
 constexpr std::size_t kMaxDecodeBatch = 8;
 
@@ -172,6 +193,7 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
     }
   }
   const PassScratchLease pass_scratch(*coordinator);
+  const DrainOnUnwind drain(coordinator->arena_.stream);
   if (items.size() > coordinator->arena_.GetMaxBatch()) {
     throw std::length_error(
         "Qwen GPU decode width exceeds the coordinator arena capacity");
@@ -450,6 +472,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
   }
   auto& coordinator = *items.front().executor;
   const PassScratchLease pass_scratch(coordinator);
+  const DrainOnUnwind drain(coordinator.arena_.stream);
   auto& arena_ = coordinator.arena_;
   const auto& weights_ = coordinator.weights_;
   const auto& config = weights_.config;

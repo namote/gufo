@@ -406,7 +406,10 @@ bool ContinuationAdapter::HasDecodeFrontier(const cache::Slot& slot) const {
 std::uint32_t ContinuationAdapter::ReserveKvRows(cache::Slot& slot,
                                                  std::uint32_t rows,
                                                  std::uint32_t margin) {
-  return As(slot).executor->arena_.ReserveKvRows(rows, margin);
+  auto& state = As(slot);
+  // Writes resume at the session's position.
+  return state.executor->arena_.ReserveKvRows(
+      rows, margin, static_cast<std::uint32_t>(state.position));
 }
 std::uint32_t ContinuationAdapter::ReleaseKvReservation(
     cache::Slot& slot) noexcept {

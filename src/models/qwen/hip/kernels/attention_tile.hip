@@ -17,9 +17,9 @@ namespace gufo::hip {
 __global__ void SyncTiledAttentionKvPrefixKernel(
     const float* __restrict__ k_cache, const float* __restrict__ v_cache,
     __half* __restrict__ k_cache_f16, __half* __restrict__ v_cache_f16,
-    KvBlockTable kv_table, std::uint32_t layer_idx,
-    std::uint32_t prefix_length, std::uint32_t max_context,
-    std::uint32_t num_kv_heads, std::uint32_t head_dim) {
+    KvBlockTable kv_table, std::uint32_t layer_idx, std::uint32_t prefix_length,
+    std::uint32_t max_context, std::uint32_t num_kv_heads,
+    std::uint32_t head_dim) {
   const std::size_t pos = blockIdx.y;
   const std::size_t index = (blockIdx.x * blockDim.x) + threadIdx.x;
   const std::size_t kv_width =
@@ -36,8 +36,7 @@ __global__ void SyncTiledAttentionKvPrefixKernel(
        head_dim) +
       dimension;
   const std::size_t f16_cache_offset =
-      (KvTokenRow(kv_table, layer_idx, max_context, pos) * kv_width) +
-      index;
+      (KvTokenRow(kv_table, layer_idx, max_context, pos) * kv_width) + index;
   k_cache_f16[f16_cache_offset] = __float2half_rn(k_cache[f32_cache_offset]);
   v_cache_f16[f16_cache_offset] = __float2half_rn(v_cache[f32_cache_offset]);
 }
@@ -105,8 +104,7 @@ __global__ void PackTiledAttentionKvKernel(
   const std::size_t kv_head = index / kTileAttentionHeadDim;
   const std::size_t dimension = index % kTileAttentionHeadDim;
   const std::size_t f16_cache_offset =
-      (KvTokenRow(kv_table, layer_idx, max_context, position) *
-       kv_width) +
+      (KvTokenRow(kv_table, layer_idx, max_context, position) * kv_width) +
       index;
   const std::size_t f32_cache_offset =
       (((static_cast<std::size_t>(layer_idx) * kTileAttentionKvHeads +
@@ -411,10 +409,10 @@ bool LaunchBatchedAttentionTile(
     const float* q, const float* k, const float* v, const float* gate,
     float* k_cache, float* v_cache, void* k_cache_f16, void* v_cache_f16,
     KvBlockTable kv_table, float* out_context, std::uint32_t layer_idx,
-    std::uint32_t start_pos,
-    std::size_t batch_size, std::uint32_t max_context, std::uint32_t num_heads,
-    std::uint32_t num_kv_heads, std::uint32_t head_dim, hipStream_t stream,
-    float* lse_out, std::uint32_t key_begin, bool skip_kv_write) {
+    std::uint32_t start_pos, std::size_t batch_size, std::uint32_t max_context,
+    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    hipStream_t stream, float* lse_out, std::uint32_t key_begin,
+    bool skip_kv_write) {
   const detail::AttentionSupportParams support_params{
       .batch_size = batch_size,
       .start_pos = start_pos,

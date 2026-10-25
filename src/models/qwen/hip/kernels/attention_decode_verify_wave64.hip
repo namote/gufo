@@ -86,10 +86,9 @@ __launch_bounds__(192) __global__
         KvTokenRow(kv_table, layer_idx, max_context, begin) * kv_width;
     const std::size_t second_offset =
         split_token < count
-            ? cache_block_offset +
-                  KvTokenRow(kv_table, layer_idx, max_context,
-                             begin + split_token) *
-                      kv_width
+            ? cache_block_offset + KvTokenRow(kv_table, layer_idx, max_context,
+                                              begin + split_token) *
+                                       kv_width
             : first_offset;
     for (unsigned vector = threadIdx.x; vector < count * vectors_per_token;
          vector += heads_per_block * lanes) {
@@ -124,16 +123,16 @@ __launch_bounds__(192) __global__
 void LaunchVerifySplitKAttentionHalfPartialsWave64(
     const float* q, const __half* k_cache, const __half* v_cache,
     KvBlockTable kv_table, float* scratch, std::uint32_t layer_idx,
-    std::uint32_t start_pos,
-    unsigned rows, std::uint32_t max_context, std::uint32_t num_heads,
-    std::uint32_t num_kv_heads, std::uint32_t splits, hipStream_t stream) {
+    std::uint32_t start_pos, unsigned rows, std::uint32_t max_context,
+    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t splits,
+    hipStream_t stream) {
   assert(num_kv_heads % 2 == 0 && "wave64 verification pairs KV heads");
   assert(num_heads == 6 * num_kv_heads && "twelve query heads per block");
   assert(rows > 1 && "single rows keep the 32-lane kernel");
   QwenVerifySplitKAttentionHalfPartialsWave64Kernel<<<
       dim3(num_kv_heads / 2, rows, splits), 192, 0, stream>>>(
-      q, k_cache, v_cache, kv_table, scratch, layer_idx, start_pos,
-      max_context, num_heads, num_kv_heads, splits);
+      q, k_cache, v_cache, kv_table, scratch, layer_idx, start_pos, max_context,
+      num_heads, num_kv_heads, splits);
 }
 
 }  // namespace gufo::hip::detail

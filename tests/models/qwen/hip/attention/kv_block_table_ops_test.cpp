@@ -273,6 +273,28 @@ void TestPrefill(Fixture& fixture) {
                    "WMMA attention declined the production shape");
           },
           "WMMA prefill " + where);
+      // Final-layer prefill computes only the last 32-row tile; its keys
+      // still go through the table. Packed and direct key reads.
+      if (c.batch > 32)
+        for (const bool packed : {true, false})
+          ExpectSame(
+              fixture, c.batch * kWidth,
+              [&](__half* keys, __half* values, KvBlockTable table,
+                  float* out) {
+                Expect(gufo::hip::LaunchQwenWmmaAttention(
+                           q.data(), k.data(), v.data(), gate.data(), nullptr,
+                           nullptr, keys, values, table, out, kLayer, c.start,
+                           c.batch, kContext, kHeads, kKvHeads, kDim, nullptr,
+                           nullptr, 0, !write,
+                           packed ? std::span(packed_k.data(), packed_k.size())
+                                  : std::span<float>{},
+                           packed ? std::span(packed_v.data(), packed_v.size())
+                                  : std::span<float>{},
+                           (c.batch - 1) / 32 * 32),
+                       "WMMA attention declined the last query tile");
+              },
+              "WMMA prefill last tile " + std::string(packed ? "packed " : "") +
+                  where);
       ExpectSame(
           fixture, 1,
           [&](__half* keys, __half* values, KvBlockTable table, float*) {

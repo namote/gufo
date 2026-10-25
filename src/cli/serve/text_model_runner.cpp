@@ -1961,6 +1961,11 @@ std::size_t TextRunnerPool::AdmissionRowBlocks(std::size_t rows) const {
   if (pool.block_rows == 0)
     return 0;
   const std::size_t context = impl_->validated.descriptor.max_context;
+  // The reservation's rule (QwenGpuArena::ReserveKvRows). Past the context
+  // cap it also charges a copy when writes start inside a shared block,
+  // which no admitted request does: a continued frontier ends in a block no
+  // checkpoint retains (they retain complete blocks behind their boundary),
+  // and a restore copies the rows of the block it splits.
   return std::min((rows + pool.block_rows - 1) / pool.block_rows +
                       TextModelRunner::kRowBlockMargin,
                   (context + pool.block_rows - 1) / pool.block_rows);

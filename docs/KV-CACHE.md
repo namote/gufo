@@ -209,6 +209,18 @@ complete prompt. Capture runs asynchronously while that session is frozen, so ot
 requests can continue; a single execution slot skips the extra worker. A
 request whose first token is already published decodes as soon as its capture
 finishes, before the next bounded prefill chunk of a peer.
+Where checkpoints keep KV as pool blocks a capture is cheap, so a warm
+continuation does not stop at a stable boundary within 64 tokens of its reused
+frontier: a second pass over the whole context would cost more than the few
+tokens such a boundary saves, and the complete prompt is captured instead.
+A cold assignment, or a pool reclaim, that would reset an idle slot first
+captures its live frontier as a RAM checkpoint when no checkpoint comes within
+64 tokens of it, so that conversation's next turn does not prefill its last
+reply again. The copy is retained at retry priority: it may only displace other
+optional copies and is the first to go. Logs:
+`event=live_frontier_captured`, `event=live_frontier_capture_refused`; a
+frontier a pool reclaim cannot copy without keeping the rows it frees is
+logged as `event=live_frontier_dropped`.
 Coincident RAM and disk boundaries share one copy. Admission
 remains subject to the existing byte budget, and intermediate copies preserve
 the original branching fallback. These intermediate checkpoints live in RAM;
@@ -242,6 +254,13 @@ the request's last 64 tokens, such as an edited final message, is covered by
 its own stable checkpoint and takes no extra copy. The same position from the same prefix family is captured
 once; records whose images differ from the prompt are not used to find it.
 Without disk, this needs no configuration.
+
+The system prompt is known without a second conversation. A request whose
+leading system and developer messages reach 128 tokens also keeps a checkpoint
+where they end: the first token at which its prompt and the same messages with
+an empty user turn differ. It is retained like a learned divergence point, in
+RAM and on disk, so the first conversation under the same system prompt
+restores it instead of an earlier tail checkpoint or a cold prefill.
 
 Execution and retention have separate limits. `--sessions N` allocates N
 mutable execution states and controls active request concurrency. A separate
@@ -358,12 +377,14 @@ captured; RAM-retained snapshots and their captures in progress share the RAM bu
 | RAM checkpoint records | 128, independent of `--sessions` | internal safety limit |
 | Disk bytes | 8 GiB | `--cache-disk-bytes` |
 | Disk staging bytes | smaller of `MemAvailable / 8` and the disk budget | `--cache-disk-staging-bytes` |
-| Paged KV pool bytes, device (Qwen27B) | 0: every session holds its full context | `--kv-pool-bytes` |
-| Tail checkpoints per long prompt | 3, only with paged KV | `--cache-tail-checkpoints` |
+| Paged KV pool bytes, device (Qwen27B, FP16 attention KV) | every session's full context | `--kv-pool-bytes` |
+| Tail checkpoints per long prompt | 3, where checkpoints keep KV as pool blocks | `--cache-tail-checkpoints` |
 
-`--kv-pool-bytes N` gives Qwen27B sessions one device pool of 256-token KV
-blocks instead of a full-context KV allocation each. A session maps blocks as
-it writes; a request is admitted once the pool holds its prompt plus
+Qwen27B sessions with FP16 attention KV share one device pool of 256-token
+KV blocks instead of a full-context KV allocation each. The pool holds every
+session's full context unless `--kv-pool-bytes N` sizes it, smaller to
+overcommit or larger to retain more checkpoint blocks. A session maps blocks
+as it writes; a request is admitted once the pool holds its prompt plus
 `max_tokens`, counting the blocks a continued session already maps. While the
 pool is short, idle sessions the prompt does not continue return their
 blocks: empty slots first, then RAM checkpoints holding blocks only they use,
@@ -375,7 +396,7 @@ references, so each costs its private state and tails.
 `--cache-tail-checkpoints K` keeps K RAM checkpoints, one every 1024 tokens
 over the end of a long prompt, so a later prompt that differs only near its
 end restores within 1024 tokens of the difference. It applies only where
-checkpoints keep KV as block references (paged KV) and is logged at startup as
+checkpoints keep KV as pool blocks and is logged at startup as
 `event=tail_checkpoints status=not_applied` otherwise.
 
 `--cache-ram-bytes 0` selects automatic sizing. Zero does not disable reuse.
@@ -523,11 +544,15 @@ written before a restart restored a 24,866-token prompt in 1.8 s against about
 50 s for a cold prefill **(measured)**.
 
 A Flash-Next checkpoint is thousands of files: 157K tokens are 4.45 GB in
-18,672 files, mostly 256 KiB. Four helper threads hint the files ahead of the
-restore, which still reads, checks and copies them in order. That restore took
-1.3–1.4 s with the files on disk and 0.85 s from the page cache, against
-8.7–9.9 s when one thread hinted each file in turn **(measured, NVMe under
-dm-crypt)**.
+18,672 files, mostly 256 KiB. Helper threads warm the files ahead of the
+restore, which still reads, checks and copies them in order. With four helpers
+hinting the files, that restore took 1.3–1.4 s with the files on disk and
+0.85 s from the page cache, against 8.7–9.9 s when one thread hinted each file
+in turn **(measured, NVMe under dm-crypt)**. A hint still left the reader
+waiting on almost every cold 512 KiB chunk file (0.65 GB/s); eight helpers
+that read each file through a small buffer, up to 64 MiB ahead of the reader,
+leave it in the page cache (4.1 GB/s) **(measured, host replay of a 16K
+Qwen27B checkpoint)**.
 
 It also **learns shared-prefix boundaries** that survive restarts. RAM learns a
 divergence point from the second conversation and restores it from the third

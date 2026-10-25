@@ -131,8 +131,7 @@ __launch_bounds__(256, 4) __global__ void BatchedFusedQKNormRoPEKvWriteKernel(
         cur_pos) *
        head_dim);
   const std::size_t f16_offset =
-      (KvTokenRow(kv_table, layer_idx, max_context, cur_pos) *
-       kv_total) +
+      (KvTokenRow(kv_table, layer_idx, max_context, cur_pos) * kv_total) +
       (static_cast<std::size_t>(kv_h) * head_dim);
 
   for (std::size_t p = tid; p < half_rot; p += blockDim.x) {
@@ -183,9 +182,9 @@ __launch_bounds__(256, 4) __global__ void BatchedFusedQKNormRoPEKvWriteKernel(
 void LaunchBatchedFusedQKNormRoPEKvWrite(
     const float* q, const float* k, const float* v, const float* q_weight,
     const float* k_weight, float* q_out, float* k_out, float* k_cache,
-    float* v_cache, void* k_cache_f16, void* v_cache_f16,
-    KvBlockTable kv_table, std::uint32_t layer_idx, std::uint32_t start_pos,
-    std::size_t batch_size, std::uint32_t max_context, std::uint32_t num_heads,
+    float* v_cache, void* k_cache_f16, void* v_cache_f16, KvBlockTable kv_table,
+    std::uint32_t layer_idx, std::uint32_t start_pos, std::size_t batch_size,
+    std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim,
     std::uint32_t rotary_dim, float rope_theta, float eps, hipStream_t stream,
     const models::qwen::vision::DeviceRope* rope) {

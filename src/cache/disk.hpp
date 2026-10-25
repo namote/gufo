@@ -237,8 +237,8 @@ public:
   // Optional bounded page-cache warm-up for an owned dependency. Does not
   // attest bytes or identity; ReadPayload must still validate the actual read.
   // With `scratch`, reads the first `bytes` through it, which leaves them in
-  // the page cache; otherwise only hints POSIX_FADV_WILLNEED. Errors are
-  // ignored either way.
+  // the page cache; otherwise only gives the platform's will-need hint.
+  // Errors are ignored either way.
   void PrefetchPayload(const DiskSnapshot&, bool private_file,
                        const DiskPayload&, std::uint64_t bytes,
                        std::span<std::uint8_t> scratch = {}) const;

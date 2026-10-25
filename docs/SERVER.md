@@ -210,11 +210,12 @@ movable pages, not GPU allocations. 27B also checks HIP free memory. A
 positive value sets a byte cap that may exceed the automatic budget, up to the
 available host RAM minus 4 GiB; the startup line reports both as
 `automatic_bytes` and `max_bytes`.
-`--kv-pool-bytes N` (Qwen27B) replaces each session's full-context KV with one
-device pool of 256-token blocks that sessions map as they write; admission
-waits while the pool cannot hold a request. `--cache-tail-checkpoints K`
-(default 3, paged KV only) keeps K RAM checkpoints near the end of long
-prompts. See [KV-CACHE.md](KV-CACHE.md#limits).
+Qwen27B sessions with FP16 attention KV map 256-token blocks from one device
+pool as they write. The pool holds every session's full context unless
+`--kv-pool-bytes N` sizes it; admission waits while it cannot hold a request.
+`--cache-tail-checkpoints K` (default 3, where checkpoints keep KV as pool
+blocks) keeps K RAM checkpoints near the end of long prompts. See
+[KV-CACHE.md](KV-CACHE.md#limits).
 On Qwen27B and Flash-Next, the pinned disk staging buffer comes out of that ceiling, and
 `max_bytes` excludes it. Other models' disk staging and temporary disk-save
 buffers are separate from this RAM budget.

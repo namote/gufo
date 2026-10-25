@@ -1104,23 +1104,26 @@ void QwenGpuArena::UploadKvTable() {
 }
 
 std::uint32_t QwenGpuArena::ReserveKvRows(std::uint32_t rows,
-                                          std::uint32_t margin) {
+                                          std::uint32_t margin,
+                                          std::uint32_t first) {
   if (!kv_shared_)
     return 0;
-  // The margin pays for draft rows past `rows`, which never pass the
-  // context. Copy-on-write (UnshareKvRows) replaces only mapped blocks
-  // another owner shares, so up to `margin` of those are charged on top,
-  // uncapped: a session near the context still unshares, and an unshared
-  // one fits a pool sized for full-context sessions.
-  const std::size_t target =
-      std::min<std::size_t>(KvBlockPool::BlocksFor(rows) + margin,
-                            KvBlockPool::BlocksFor(max_context_));
-  std::size_t shared = 0;
-  for (const auto block : kv_blocks_)
-    if (shared < margin && kv_pool_->references(block) >= 2)
-      ++shared;
+  // The margin pays for draft rows past `rows` and for copying a shared
+  // block the writes start inside (UnshareKvRows), capped at the context.
+  // Writes start at row `first`: only a block it splits may be copied, and
+  // one shared there costs a block past the cap too, so a session near the
+  // context still unshares while an unshared one fits a pool sized for
+  // full-context sessions. TextRunnerPool::AdmissionRowBlocks charges the
+  // same bound without that copy, which the cache never sets up: a guard.
+  const std::size_t split = first >> kKvBlockShift;
+  const bool shared_frontier =
+      margin != 0 && (first & (kKvBlockTokens - 1)) != 0 &&
+      split < kv_blocks_.size() && kv_pool_->references(kv_blocks_[split]) >= 2;
+  const std::size_t target = std::min<std::size_t>(
+      KvBlockPool::BlocksFor(rows) + margin,
+      KvBlockPool::BlocksFor(max_context_) + shared_frontier);
   const std::size_t need =
-      (target > kv_blocks_.size() ? target - kv_blocks_.size() : 0) + shared;
+      target > kv_blocks_.size() ? target - kv_blocks_.size() : 0;
   kv_reservation_.Reset();
   auto reservation = kv_pool_->TryReserve(static_cast<std::uint32_t>(need));
   if (!reservation)
