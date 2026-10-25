@@ -10,6 +10,11 @@ namespace {
 bool Prefix(std::span<const Token> a, std::span<const Token> b) {
   return a.size() <= b.size() && std::equal(a.begin(), a.end(), b.begin());
 }
+bool HasRamChunks(std::span<const CheckpointChunk> chunks) {
+  return std::ranges::any_of(chunks, [](const auto& chunk) {
+    return chunk.Storage().RamBytes() != 0;
+  });
+}
 bool Continuation(RetentionPurpose p) {
   return p == RetentionPurpose::kContinuation ||
          p == RetentionPurpose::kBranchPoint;
@@ -301,6 +306,11 @@ std::size_t RetentionPolicy::UniqueBytes(std::size_t i) const {
       bytes += c.private_state->Bytes();
     if (c.tail)
       bytes += c.tail->Bytes();
+    // Device-only chunks add nothing to RAM admission age. A mixed component
+    // still needs the original prefix relation: even a zero-RAM mismatch can
+    // end the prefix before a later host chunk.
+    if (!HasRamChunks(c.chunks))
+      continue;
     // Admission age uses the longest shared-prefix estimate. Exact retained
     // payload accounting below also handles sharing after a recreated hole.
     std::size_t shared = 0;
@@ -328,7 +338,7 @@ std::size_t RetentionPolicy::UniquePayloadBytes(std::size_t i) const noexcept {
       bytes += c.private_state->Bytes();
     if (c.tail)
       bytes += c.tail->Bytes();
-    if (c.chunks.empty())
+    if (!HasRamChunks(c.chunks))
       continue;
     std::array<const CheckpointComponent*, kRecordLimit> peers;
     std::size_t count = 0;
@@ -348,6 +358,9 @@ std::size_t RetentionPolicy::UniquePayloadBytes(std::size_t i) const noexcept {
               });
     for (std::size_t n = 0; n < c.chunks.size(); ++n) {
       const auto& chunk = c.chunks[n];
+      const auto ram = chunk.Storage().RamBytes();
+      if (ram == 0)
+        continue;
       bool shared = false;
       for (std::size_t j = 0; j < count && peers[j]->chunks.size() > n; ++j)
         if (chunk.SameChunk(peers[j]->chunks[n])) {
@@ -355,7 +368,7 @@ std::size_t RetentionPolicy::UniquePayloadBytes(std::size_t i) const noexcept {
           break;
         }
       if (!shared)
-        bytes += chunk.Storage().RamBytes();
+        bytes += ram;
     }
   }
   return bytes;
@@ -732,12 +745,15 @@ std::size_t RetentionPolicy::RetainedPayloadBytes() const noexcept {
           if (peers[peer]->chunks.size() <= n)
             continue;
           const auto& chunk = peers[peer]->chunks[n];
+          const auto ram = chunk.Storage().RamBytes();
+          if (ram == 0)
+            continue;
           const auto end = seen.begin() + seen_count;
           if (std::find_if(seen.begin(), end, [&](const auto* previous) {
                 return chunk.SameChunk(*previous);
               }) == end) {
             seen[seen_count++] = &chunk;
-            bytes += chunk.Storage().RamBytes();
+            bytes += ram;
           }
         }
       }
