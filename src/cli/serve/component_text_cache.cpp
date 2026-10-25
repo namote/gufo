@@ -181,7 +181,30 @@ struct ComponentTextCache::Impl {
     bool busy{};
     // Paged rows: false once ReclaimRows emptied the slot, until it is leased.
     bool holds_rows{};
+    // Where the live frontier is, to lease it exactly for a capture.
+    cache::BorrowedLocation live_location{};
   };
+  // A live frontier this many tokens or more past every checkpoint of its
+  // prompt is captured before its slot is reset for another request.
+  static constexpr std::size_t kUncoveredCaptureTokens = 64;
+  struct Uncovered {
+    std::size_t index;
+    cache::BorrowedLocation location;
+    std::vector<cache::Token> tokens;
+    cache::Identity input;
+  };
+  // Under the mutex: the entry's live frontier when no checkpoint comes within
+  // kUncoveredCaptureTokens of it.
+  [[nodiscard]] std::optional<Uncovered> UncoveredLive(std::size_t i) const {
+    const auto& e = *entries[i];
+    if (!e.live || e.live_tokens.size() < kUncoveredCaptureTokens ||
+        index.HasCheckpoint(
+            {identity, e.live_tokens,
+             cache::InputIdentity(e.live_tokens.size(), e.live_input)},
+            e.live_tokens.size() - kUncoveredCaptureTokens))
+      return {};
+    return Uncovered{i, e.live_location, e.live_tokens, e.live_input};
+  }
   std::shared_ptr<TextModelRunner> runner;
   cache::ResourceLedger ledger;
   std::unique_ptr<ComponentCacheResources> resources;
@@ -937,6 +960,46 @@ std::size_t ComponentTextCache::capacity() const noexcept {
   return impl_->entries.size();
 }
 
+void ComponentTextCache::CaptureBeforeReset(std::size_t index,
+                                            cache::BorrowedLocation location,
+                                            std::vector<cache::Token> tokens,
+                                            cache::Identity input,
+                                            std::string_view reason) noexcept {
+  auto* entry = impl_->entries[index].get();
+  const auto started = Clock::now();
+  try {
+    Lease lease(std::make_unique<Lease::Impl>(
+        impl_.get(), entry, entry->slot->Acquire(location), tokens,
+        cache::InputIdentity(tokens.size(), input), tokens.size()));
+    std::size_t bytes = 0;
+    if (lease.TryReserveSnapshot(lease.CaptureBytes(), tokens.size(), false,
+                                 SnapshotPurpose::kContinuation, tokens))
+      bytes = lease.PublishSnapshot(tokens, lease.Capture(), false);
+    // The slot stays valid; the caller's cold lease preserves the rows the
+    // new checkpoint borrows and resets it.
+    lease.impl_->slot.Commit();
+    lease.impl_->active = false;
+    Logger::Info("cache",
+                 "event=live_frontier_captured reason=reassignment slot=" +
+                     std::to_string(index + 1) +
+                     " tokens=" + std::to_string(tokens.size()) +
+                     " bytes=" + std::to_string(bytes) + " ms=" +
+                     std::to_string(std::chrono::duration<double, std::milli>(
+                                        Clock::now() - started)
+                                        .count()));
+  } catch (const std::exception& error) {
+    // Optional: the request proceeds cold-reassigned, as without a capture.
+    Logger::Info("cache", std::string("event=live_frontier_capture_failed "
+                                      "reason=reassignment slot=") +
+                              std::to_string(index + 1) +
+                              " tokens=" + std::to_string(tokens.size()) +
+                              " error=" + error.what());
+  }
+  // A failed lease invalidates and frees the entry; the caller still owns it.
+  const std::lock_guard lock(impl_->mutex);
+  entry->busy = true;
+}
+
 ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
     std::span<const ContinuationToken> prompt,
     const std::function<bool()>& enough) {
@@ -944,6 +1007,7 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
   while (!enough()) {
     Impl::Entry* entry = nullptr;
     std::size_t slot = 0, live_tokens = 0;
+    std::optional<Impl::Uncovered> uncovered;
     {
       const std::lock_guard lock(impl_->mutex);
       const auto continues = [&](const Impl::Entry& e) {
@@ -983,6 +1047,14 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
         return busy ? RowReclaim::kWaiting : RowReclaim::kExhausted;
       visited.push_back(entry);
       entry->busy = true;
+      uncovered = impl_->UncoveredLive(slot - 1);
+    }
+    if (uncovered)
+      CaptureBeforeReset(uncovered->index, uncovered->location,
+                         std::move(uncovered->tokens),
+                         std::move(uncovered->input), "row_capacity");
+    {
+      const std::lock_guard lock(impl_->mutex);
       entry->branch = std::make_shared<const std::uint8_t>(0);
       entry->durable.reset();
       live_tokens = entry->live_tokens.size();
@@ -1026,6 +1098,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
   cache::PrefixLookup found;
   Impl::Entry* entry = nullptr;
   std::optional<cache::BorrowedLocation> live;
+  std::optional<Impl::Uncovered> evicted;
   std::size_t common = 0;
   {
     const std::lock_guard lock(impl_->mutex);
@@ -1140,6 +1213,19 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     entry->busy = true;
     entry->holds_rows = true;
     entry->used = ++impl_->clock;
+    if (!live)
+      for (std::size_t i = 0; i < impl_->entries.size(); ++i)
+        if (impl_->entries[i].get() == entry)
+          evicted = impl_->UncoveredLive(i);
+  }
+  // The live frontier this cold assignment replaces would otherwise be lost;
+  // the next turn of that conversation then restores an older checkpoint.
+  if (evicted)
+    CaptureBeforeReset(evicted->index, evicted->location,
+                       std::move(evicted->tokens), std::move(evicted->input),
+                       "reassignment");
+  {
+    const std::lock_guard lock(impl_->mutex);
     if (!live) {
       entry->branch = std::make_shared<const std::uint8_t>(0);
       entry->durable.reset();
@@ -1788,6 +1874,7 @@ std::size_t ComponentTextCache::Lease::Commit(
     const std::lock_guard lock(impl_->cache->mutex);
     impl_->entry->live_tokens = live;
     impl_->entry->live_input = At(impl_->input, impl_->prompt.size());
+    impl_->entry->live_location = location;
     impl_->entry->live = impl_->cache->index.Insert(cache::LiveFrontier{
         location, std::move(live), impl_->cache->identity,
         At(impl_->input, impl_->prompt.size()), std::move(positions)});

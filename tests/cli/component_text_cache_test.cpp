@@ -1970,7 +1970,41 @@ void PagedRowsAdmitWaitAndReclaim() {
   }
   assert(refused && runner->reserved.empty());
 }
+// A cold assignment that replaces a live frontier no checkpoint covers first
+// captures it, so that conversation's next turn restores its whole frontier
+// instead of an older boundary; a covered frontier is not captured again.
+void ColdAssignmentCapturesUncoveredFrontier() {
+  auto runner = std::make_shared<Runner>();
+  ComponentTextCache cache(runner, 1, 1 << 22, {});
+  const auto run = [&](const std::vector<TextRunnerToken>& tokens) {
+    auto lease = cache.Acquire(tokens, {}, {}, true, 0, true);
+    const auto cached = lease->cached_tokens();
+    auto& state = dynamic_cast<State&>(lease->state());
+    const auto tail = std::span(tokens).subspan(cached);
+    runner->adapter->Append(state.slot, tail, tail);
+    (void)lease->Commit({}, {}, tokens);
+    return std::pair{cached, lease->restored_snapshot_bytes()};
+  };
+  std::vector<TextRunnerToken> conversation(100);
+  std::iota(conversation.begin(), conversation.end(), 10);
+  (void)run(conversation);
+  const auto captures = runner->captures;
+  // The only slot goes to another prompt: the 100-token frontier is captured.
+  (void)run(std::vector<TextRunnerToken>(12, 5));
+  assert(runner->captures > captures);
+  auto next = conversation;
+  next.push_back(7);
+  const auto [cached, restored] = run(next);
+  assert(cached == conversation.size() && restored != 0);
+  // The 101-token frontier is covered by that checkpoint within 64 tokens,
+  // and a 12-token frontier is too short: neither replacement captures.
+  const auto before = runner->captures;
+  (void)run(std::vector<TextRunnerToken>(12, 6));
+  (void)run(std::vector<TextRunnerToken>(12, 8));
+  assert(runner->captures == before);
+}
 int main() {
+  ColdAssignmentCapturesUncoveredFrontier();
   PagedRowsAdmitWaitAndReclaim();
   PublishedResidentCheckpointKeepsDiskStep();
   CancelledPrefillKeepsCompletedSteps();
