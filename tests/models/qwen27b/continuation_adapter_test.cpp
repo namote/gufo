@@ -722,6 +722,22 @@ void CheckRetainedKvBlocks(
           "a mapped restore took more than its tail block");
   Require(Capture(paged, *p2, pool).bytes == expected.bytes,
           "mapped restore bytes differ");
+  // Shared blocks before the frontier are never written: a reservation
+  // charges only new rows and the margin, and the context caps it.
+  Require(paged.ReserveKvRows(*p2, kPrompt + 1, 2) ==
+                  hip::KvBlockPool::BlocksFor(kPrompt + 1) + 2 -
+                      paged.KvBlocks(*p2).size() &&
+              paged.ReleaseKvReservation(*p2) ==
+                  hip::KvBlockPool::BlocksFor(kPrompt + 1) + 2 -
+                      paged.KvBlocks(*p2).size(),
+          "a reservation charged shared blocks behind the frontier");
+  Require(paged.ReserveKvRows(*p2, kContext, 2) ==
+                  hip::KvBlockPool::BlocksFor(kContext) -
+                      paged.KvBlocks(*p2).size() &&
+              paged.ReleaseKvReservation(*p2) ==
+                  hip::KvBlockPool::BlocksFor(kContext) -
+                      paged.KvBlocks(*p2).size(),
+          "a reservation passed the context without a shared frontier");
   std::uint32_t pos = kPrompt;
   Require(
       pb.ForwardToken(tokens[pos], pos) == ra.ForwardToken(tokens[pos], pos),
