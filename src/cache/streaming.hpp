@@ -15,6 +15,10 @@
 namespace gufo::cache {
 class BorrowedRows;
 inline constexpr std::size_t kDefaultDiskStagingBytes = 1ULL << 20;
+// Pinned room for device-read pieces queued ahead of a disk write. A piece
+// copied from a busy device waits behind model work; queuing several lets
+// those waits overlap instead of adding up chunk after chunk.
+inline constexpr std::size_t kPersistenceReadAheadBytes = 8ULL << 20;
 inline constexpr std::chrono::milliseconds kPersistenceYieldLimit{500};
 // Restores and observed-row captures move whole rows per staging piece; a
 // smaller staging budget can never restore a checkpoint of these components.
@@ -100,8 +104,11 @@ private:
 // The disk store, ledger and stream provider must outlive this object.
 class StreamedStore {
 public:
+  // read_ahead_bytes, when nonzero, is a second allocation for device-read
+  // pieces a write queues ahead of the one it is writing.
   StreamedStore(ResourceLedger&, DiskStore&, std::size_t staging_bytes,
-                StagingAllocator, StreamLease);
+                StagingAllocator, StreamLease,
+                std::size_t read_ahead_bytes = 0);
   StreamedStore(ResourceLedger&, DiskStore&, StagingAllocator, StreamLease);
   ~StreamedStore();
   StreamedStore(const StreamedStore&) = delete;
@@ -119,6 +126,7 @@ public:
       const std::function<void()>& fallback = {},
       const std::function<void(bool, DiskFileId)>& dependency_failed = {});
   [[nodiscard]] std::size_t StagingBytes() const;
+  [[nodiscard]] std::size_t ReadAheadBytes() const;
   [[nodiscard]] std::uint64_t StartupAllocatorNanoseconds() const;
 
 private:

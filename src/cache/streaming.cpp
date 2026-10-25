@@ -10,6 +10,7 @@
 #include <optional>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "src/cache/slot.hpp"
@@ -310,15 +311,17 @@ std::size_t PersistenceSource::Capacity() const {
 struct StreamedStore::Impl {
   ResourceLedger* ledger;
   DiskStore* disk;
-  ResourceCharge metadata, staging_charge;
-  StagingAllocation staging;
+  ResourceCharge metadata, staging_charge, read_ahead_charge;
+  StagingAllocation staging, read_ahead;
   StreamLease lease;
   std::timed_mutex mutex;
+  // Held by the one write using read_ahead; another write reads in place.
+  std::mutex read_ahead_mutex;
   std::uint64_t allocation_ns{};
 
   Impl(ResourceLedger& resources, DiskStore& store, std::size_t bytes,
        StagingAllocator allocator, StreamLease provider,
-       ResourceReservation reservation)
+       ResourceReservation reservation, std::size_t read_ahead_bytes)
       : ledger(&resources),
         disk(&store),
         metadata(reservation.Convert()),
@@ -334,8 +337,18 @@ struct StreamedStore::Impl {
         throw std::invalid_argument(
             "staging allocator returned wrong capacity");
       staging_charge = admission.Convert();
+      if (read_ahead_bytes) {
+        auto ahead = resources.Reserve(ResourceCategory::kTransferStaging,
+                                       read_ahead_bytes);
+        read_ahead = allocator(read_ahead_bytes);
+        if (!read_ahead.owner || read_ahead.bytes.size() != read_ahead_bytes)
+          throw std::invalid_argument(
+              "staging allocator returned wrong read-ahead capacity");
+        read_ahead_charge = ahead.Convert();
+      }
     } catch (...) {
       staging = {};
+      read_ahead = {};
       throw;
     }
     allocation_ns = Elapsed(start);
@@ -361,10 +374,11 @@ struct StreamedStore::Impl {
 };
 StreamedStore::StreamedStore(ResourceLedger& ledger, DiskStore& disk,
                              std::size_t bytes, StagingAllocator allocator,
-                             StreamLease lease)
+                             StreamLease lease, std::size_t read_ahead_bytes)
     : impl_(std::make_unique<Impl>(
           ledger, disk, bytes, std::move(allocator), std::move(lease),
-          ledger.Reserve(ResourceCategory::kMetadata, sizeof(Impl)))) {}
+          ledger.Reserve(ResourceCategory::kMetadata, sizeof(Impl)),
+          read_ahead_bytes)) {}
 StreamedStore::~StreamedStore() = default;
 StreamedStore::StreamedStore(ResourceLedger& ledger, DiskStore& disk,
                              StagingAllocator allocator, StreamLease lease)
@@ -372,6 +386,9 @@ StreamedStore::StreamedStore(ResourceLedger& ledger, DiskStore& disk,
                     std::move(allocator), std::move(lease)) {}
 std::size_t StreamedStore::StagingBytes() const {
   return impl_->staging.bytes.size();
+}
+std::size_t StreamedStore::ReadAheadBytes() const {
+  return impl_->read_ahead.bytes.size();
 }
 std::uint64_t StreamedStore::StartupAllocatorNanoseconds() const {
   return impl_->allocation_ns;
@@ -439,22 +456,120 @@ void StreamedStore::Write(DiskFileId file, const DiskManifest& manifest,
   pins.reserve(sources.size());
   for (auto& source : sources)
     pins.push_back(source.Pin());
+  // Pieces read from the device wait behind model work one by one. Queue the
+  // copies of the next whole-piece device sources, in the order the disk
+  // store writes files (shared before private, by file ID), so the waits
+  // overlap. Other pieces, and any the queue does not hold, read in place.
+  const auto piece_bytes = impl_->staging.bytes.size();
+  std::unique_lock read_ahead_lock(impl_->read_ahead_mutex, std::try_to_lock);
+  const std::size_t depth = read_ahead_lock.owns_lock()
+                                ? impl_->read_ahead.bytes.size() / piece_bytes
+                                : 0;
+  std::vector<std::size_t> order;
+  if (depth) {
+    for (std::size_t i = 0; i < sources.size(); ++i) {
+      const auto& source = sources[i];
+      const bool device =
+          source.rows_ ? !source.rows_->HasBacking() || source.live_reads_
+                       : source.owner_ && !source.charge_;
+      if (device &&
+          source.bytes_ <= piece_bytes / source.alignment_ * source.alignment_)
+        order.push_back(i);
+    }
+    std::ranges::sort(order, [&](auto a, auto b) {
+      return std::tie(sources[a].private_file_, sources[a].file_) <
+             std::tie(sources[b].private_file_, sources[b].file_);
+    });
+  }
+  // A queued entry holds its copy (and through it a pooled stream and the
+  // row pin); a ready one holds only the bytes, after its copy settled.
+  struct Ahead {
+    std::span<std::uint8_t> buffer;
+    std::size_t source{};
+    std::unique_ptr<Stream> stream;
+    std::optional<Completion> completion;
+    bool ready{};
+  };
+  std::vector<Ahead> ahead(order.empty() ? 0 : depth);
+  for (std::size_t i = 0; i < ahead.size(); ++i)
+    ahead[i].buffer =
+        impl_->read_ahead.bytes.subspan(i * piece_bytes, piece_bytes);
+  std::size_t next_ahead = 0;
+  const auto queue_ahead = [&] {
+    for (auto& entry : ahead) {
+      if (entry.completion || entry.ready)
+        continue;
+      if (next_ahead == order.size())
+        return;
+      // Queue only while another stream stays free for foreground restores
+      // and in-place reads; a busy pool leaves the rest to read in place.
+      auto stream = impl_->lease();
+      if (!stream || !impl_->lease())
+        return;
+      const auto index = order[next_ahead++];
+      auto& source = sources[index];
+      entry.source = index;
+      entry.completion.emplace(source.copy_(
+          0, std::as_writable_bytes(entry.buffer.first(source.bytes_)),
+          *stream));
+      entry.stream = std::move(stream);
+    }
+  };
+  // Queued copies write the read-ahead buffer and pin their rows: settle
+  // them on every path before the buffer can serve another write.
+  Finally drain_ahead{[&] {
+    for (auto& entry : ahead)
+      if (entry.completion)
+        (void)entry.completion->Wait();
+  }};
   std::vector<DiskWriteSource> writes;
   writes.reserve(sources.size());
   for (auto& source : sources) {
-    writes.push_back({source.private_file_, source.file_, source.bytes_,
-                      [&, source_ptr = &source](auto offset, auto piece) {
-                        CheckStop(stop);
-                        auto stream = impl_->Lease(timing);
-                        Settle(
-                            source_ptr->copy_(
-                                offset, std::as_writable_bytes(piece), *stream),
-                            timing);
-                        CheckStop(stop);
-                        timing.bytes += piece.size();
-                        ++timing.pieces;
-                      },
-                      source.alignment_});
+    writes.push_back(
+        {source.private_file_, source.file_, source.bytes_,
+         [&, source_ptr = &source,
+          index = static_cast<std::size_t>(&source - sources.data())](
+             auto offset, auto piece) {
+           CheckStop(stop);
+           queue_ahead();
+           const auto queued = std::ranges::find_if(ahead, [&](const auto& e) {
+             return (e.completion || e.ready) && e.source == index;
+           });
+           if (queued != ahead.end() && offset == 0 &&
+               piece.size() == source_ptr->bytes_) {
+             if (queued->completion) {
+               Settle(std::move(*queued->completion), timing);
+               queued->completion.reset();
+               queued->stream.reset();
+             }
+             queued->ready = false;
+             std::memcpy(piece.data(), queued->buffer.data(), piece.size());
+             queue_ahead();
+           } else {
+             // Queued copies may hold every pooled stream. Settle the oldest
+             // into its buffer to free one; it is still written from there.
+             auto stream = impl_->lease();
+             while (!stream) {
+               const auto oldest = std::ranges::find_if(
+                   ahead,
+                   [](const auto& e) { return e.completion.has_value(); });
+               if (oldest == ahead.end())
+                 throw ResourceExhausted();
+               Settle(std::move(*oldest->completion), timing);
+               oldest->completion.reset();
+               oldest->stream.reset();
+               oldest->ready = true;
+               stream = impl_->lease();
+             }
+             Settle(source_ptr->copy_(offset, std::as_writable_bytes(piece),
+                                      *stream),
+                    timing);
+           }
+           CheckStop(stop);
+           timing.bytes += piece.size();
+           ++timing.pieces;
+         },
+         source.alignment_});
   }
   timing.allocator_ns += Elapsed(start);
   allocation_recorded = true;
