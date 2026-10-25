@@ -417,7 +417,8 @@ struct ComponentTextCache::Impl {
             return std::ranges::none_of(
                 entries, [](const auto& entry) { return entry->busy; });
           },
-          [this](cache::CheckpointId id, bool success) {
+          [this](cache::CheckpointId id, bool success,
+                 const cache::TransferTiming& timing) {
             const std::lock_guard lock(mutex);
             std::shared_ptr<const void> branch;
             for (std::size_t i = 0; i < pending.size(); ++i)
@@ -481,7 +482,13 @@ struct ComponentTextCache::Impl {
                       std::to_string(description->Manifest().tokens.size()) +
                       " checkpoint_id=" + std::to_string(id.value) +
                       " payload_bytes=" +
-                      std::to_string(PayloadBytes(description->Manifest())));
+                      std::to_string(PayloadBytes(description->Manifest())) +
+                      " yield_ms=" + std::to_string(timing.yield_ns / 1e6) +
+                      " stream_wait_ms=" +
+                      std::to_string(timing.stream_wait_ns / 1e6) +
+                      " filesystem_ms=" +
+                      std::to_string(timing.filesystem_ns / 1e6) +
+                      " io_lock_ms=" + std::to_string(timing.io_lock_ns / 1e6));
             }
           },
           [this](const cache::DiskManifest& manifest) {

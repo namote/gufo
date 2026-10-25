@@ -652,7 +652,7 @@ struct PersistenceQueue::Impl {
   StreamedStore* store;
   std::size_t max_bytes;
   std::function<bool()> idle;
-  std::function<void(CheckpointId, bool)> completed;
+  std::function<void(CheckpointId, bool, const TransferTiming&)> completed;
   std::function<bool(const DiskManifest&)> reclaim;
   std::chrono::milliseconds yield_limit;
   mutable std::mutex mutex;
@@ -666,7 +666,8 @@ struct PersistenceQueue::Impl {
   std::jthread worker;
   Impl(ResourceReservation reservation, StreamedStore& streams,
        std::size_t depth, std::size_t bytes, std::function<bool()> model_idle,
-       std::function<void(CheckpointId, bool)> on_completed,
+       std::function<void(CheckpointId, bool, const TransferTiming&)>
+           on_completed,
        std::function<bool(const DiskManifest&)> on_reclaim,
        std::chrono::milliseconds limit)
       : metadata(reservation.Convert()),
@@ -723,7 +724,7 @@ struct PersistenceQueue::Impl {
         }
         if (completed) {
           try {
-            completed(active->manifest_.checkpoint, succeeded);
+            completed(active->manifest_.checkpoint, succeeded, timing);
           } catch (...) {
             // Publication remains durable and discoverable at restart even
             // if optional serving metadata cannot be admitted now.
@@ -746,7 +747,7 @@ struct PersistenceQueue::Impl {
 PersistenceQueue::PersistenceQueue(
     ResourceLedger& ledger, StreamedStore& store, std::size_t depth,
     std::size_t bytes, std::function<bool()> model_idle,
-    std::function<void(CheckpointId, bool)> completed,
+    std::function<void(CheckpointId, bool, const TransferTiming&)> completed,
     std::function<bool(const DiskManifest&)> reclaim,
     std::chrono::milliseconds yield_limit)
     : impl_(std::make_unique<Impl>(
@@ -845,7 +846,7 @@ bool PersistenceQueue::TrySubmit(PersistenceJob job) {
   guard.unlock();
   if (superseded && impl_->completed) {
     try {
-      impl_->completed(*superseded, false);
+      impl_->completed(*superseded, false, TransferTiming{});
     } catch (...) {
     }
   }
