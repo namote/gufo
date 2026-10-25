@@ -462,7 +462,7 @@ void CheckSharedPassScratch(
   const auto text = model->GetTokenizer().Encode(
       "A cache line holds bytes fetched together from memory. Eviction picks "
       "a line to replace when the set is full.\n");
-  std::vector<Token> tokens(4600);
+  std::vector<Token> tokens(4800);
   for (std::size_t i = 0; i < tokens.size(); ++i)
     tokens[i] = text[(i * 7) % text.size()];
   // Two prompt passes (4096 + 404 rows), then a peer's pass in between.
@@ -470,16 +470,64 @@ void CheckSharedPassScratch(
   (void)a.ForwardPromptBatch(std::span(tokens).first(4500));
   (void)b.ForwardPromptBatch(std::span(tokens).subspan(100, 333));
   SameLogits(r, a);
+  const auto same_hidden = [&] {
+    Require(std::ranges::equal(r.CopyLastHidden(), a.CopyLastHidden()),
+            "shared pass scratch changed the last hidden row");
+  };
+  same_hidden();
+  const auto overwrite_shared = [&] {
+    b.Reset();
+    (void)b.ForwardPromptBatch(std::span(tokens).subspan(100, 17));
+  };
+  std::uint32_t position = 4500;
+  // Last rows on either side of the session's 64-row scratch boundary must
+  // survive another slot taking the shared pages before CopyLastHidden.
+  for (const std::uint32_t rows : {1U, 63U, 64U, 65U}) {
+    const auto suffix = std::span(tokens).subspan(position, rows);
+    (void)r.ForwardPromptBatch(suffix, position);
+    (void)a.ForwardPromptBatch(suffix, position);
+    position += rows;
+    overwrite_shared();
+    SameLogits(r, a);
+    same_hidden();
+  }
   for (std::uint32_t i = 0; i < 8; ++i) {
-    const auto expected = r.ForwardToken(tokens[4500 + i], 4500 + i);
-    Require(a.ForwardToken(tokens[4500 + i], 4500 + i) == expected,
+    const auto expected = r.ForwardToken(tokens[position], position);
+    Require(a.ForwardToken(tokens[position], position) == expected,
             "shared pass scratch changed a decode token");
     SameLogits(r, a);
+    ++position;
   }
-  const auto hidden = r.CopyLastHidden();
-  const std::vector<float> expected(hidden.begin(), hidden.end());
-  Require(std::ranges::equal(expected, a.CopyLastHidden()),
-          "shared pass scratch changed the last hidden row");
+  same_hidden();
+  const std::array<std::uint32_t, 2> taps{0, model->GetConfig().num_layers - 1};
+  r.SetPromptHiddenCapture(true, taps);
+  a.SetPromptHiddenCapture(true, taps);
+  const auto tapped = std::span(tokens).subspan(position, 7);
+  (void)r.ForwardPromptBatch(tapped, position);
+  (void)a.ForwardPromptBatch(tapped, position);
+  position += tapped.size();
+  overwrite_shared();
+  same_hidden();
+  // Disabling layer taps makes CopyLastHidden expose the final hidden row
+  // again; the pass must retain it even while the tapped features are live.
+  r.SetPromptHiddenCapture(false);
+  a.SetPromptHiddenCapture(false);
+  same_hidden();
+  r.SetPromptHiddenCapture(true);
+  a.SetPromptHiddenCapture(true);
+  const auto verification = std::span(tokens).subspan(position, 7);
+  Require(r.ForwardVerificationChunk(verification, position, true) ==
+              a.ForwardVerificationChunk(verification, position, true),
+          "shared pass scratch changed verification predictions");
+  overwrite_shared();
+  for (std::size_t row = 0; row < verification.size(); ++row)
+    Require(std::ranges::equal(r.CopyVerificationLogits(row),
+                               a.CopyVerificationLogits(row)),
+            "shared pass scratch changed verification logits");
+  same_hidden();
+  Require(std::ranges::equal(r.GetVerificationHiddenStates(),
+                             a.GetVerificationHiddenStates()),
+          "shared pass scratch changed verification hidden rows");
   std::cout << "shared_pass_scratch,PASS\n";
 }
 
