@@ -857,6 +857,12 @@ struct TextRunnerPool::Request::Impl {
     if (stable_prefix_position && lease.component() &&
         lease.CaptureRefused(stable_prefix_position))
       stable_prefix_position = 0;
+    // So does a prompt snapshot target short of the prompt, as a stable
+    // boundary just past a reused frontier is: the complete prompt is
+    // offered after the first token instead.
+    if (lease.component() && count > prefill_offset && count < prompt.size() &&
+        lease.CaptureRefused(count))
+      count = prompt.size();
     if (lease.restored_from_disk() && prefill_offset == prompt.size())
       count = prompt.size();
     // Cancellation can leave a component live frontier past the stable
