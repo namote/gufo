@@ -1325,6 +1325,10 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
   std::vector<const Impl::Entry*> visited;
   // Device rows only checkpoints hold come back when those are dropped.
   const auto only_retained = [&](const cache::Checkpoint& checkpoint) {
+    const auto tokens = checkpoint.Tokens();
+    if (tokens.size() <= prompt.size() &&
+        std::ranges::equal(tokens, prompt.first(tokens.size())))
+      return false;
     for (const auto& c : checkpoint.Components())
       for (const auto& chunk : c.chunks)
         if (chunk.Storage().OnDevice() &&
@@ -1435,18 +1439,42 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
   return RowReclaim::kReady;
 }
 
-std::size_t ComponentTextCache::ContinuedTokens(
+ComponentTextCache::HeldRows ComponentTextCache::ContinuedTokens(
     std::span<const ContinuationToken> prompt, const TextPromptContext* context,
     bool reuse, std::size_t stable) const {
   const auto input = Inputs(prompt.size(), context);
   const std::lock_guard lock(impl_->mutex);
   const auto found =
       impl_->index.Lookup({impl_->identity, prompt, input, stable, reuse});
-  if (!found.selected || !found.selected->live ||
-      found.selected->boundary >= prompt.size())
-    return 0;
-  const auto& entry = *impl_->entries.at(found.selected->live->slot.value - 1);
-  return entry.busy || !entry.holds_rows ? 0 : found.selected->boundary;
+  if (!found.selected || found.selected->boundary >= prompt.size())
+    return {};
+  if (found.selected->live) {
+    const auto& entry =
+        *impl_->entries.at(found.selected->live->slot.value - 1);
+    if (entry.busy || !entry.holds_rows)
+      return {};
+    return {.tokens = found.selected->boundary, .live = true};
+  }
+  const auto& checkpoint = found.selected->checkpoint;
+  if (!checkpoint || impl_->device_components.empty())
+    return {};
+  // The rows every device component holds on the device from row 0.
+  std::size_t rows = found.selected->boundary;
+  for (const auto& c : checkpoint->Components()) {
+    if (std::ranges::find(impl_->device_components, c.descriptor.id) ==
+        impl_->device_components.end())
+      continue;
+    if (found.selected->UsesDisk(c.descriptor.id))
+      return {};
+    cache::Rows end = 0;
+    for (const auto& chunk : c.chunks) {
+      if (chunk.First() != end || !chunk.Storage().OnDevice())
+        break;
+      end = chunk.End();
+    }
+    rows = std::min<std::size_t>(rows, end);
+  }
+  return {.tokens = rows};
 }
 
 std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(

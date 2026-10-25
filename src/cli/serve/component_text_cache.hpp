@@ -143,8 +143,9 @@ public:
   };
   // Returns the paged rows idle slots hold until `enough()` holds. Slots
   // without a live frontier go first. Then checkpoints holding device rows
-  // only they use are dropped, lowest retention priority first. Then live
-  // frontiers that `prompt` does not continue, a frontier some checkpoint
+  // only they use are dropped, lowest retention priority first, except those
+  // `prompt` would restore (its prefixes): their rows serve the request. Then
+  // live frontiers that `prompt` does not continue, a frontier some checkpoint
   // covers before the only copy of its work, oldest first; without device
   // row retention an uncovered one is captured first. A slot is reset at
   // most once per call, and not again until it is leased; its borrowed
@@ -152,10 +153,17 @@ public:
   // `enough` runs without the cache lock.
   [[nodiscard]] RowReclaim ReclaimRows(std::span<const ContinuationToken>,
                                        const std::function<bool()>& enough);
-  // Tokens of the idle live frontier that Acquire with the same arguments
-  // would continue, which its slot's rows already hold; zero when it would
-  // take a cold slot or restore a checkpoint.
-  [[nodiscard]] std::size_t ContinuedTokens(
+  // Rows Acquire with the same arguments would not need new paged blocks
+  // for. `live`: the idle live frontier it would continue, whose slot already
+  // maps them (a partly written last block included). Otherwise the device
+  // rows of the resident checkpoint it would restore, which the restore maps
+  // instead of copying (complete blocks only). Zero for a cold slot or a disk
+  // restore.
+  struct HeldRows {
+    std::size_t tokens{};
+    bool live{};
+  };
+  [[nodiscard]] HeldRows ContinuedTokens(
       std::span<const ContinuationToken> prompt,
       const TextPromptContext* context, bool reuse, std::size_t stable) const;
   // With a disk cache, writes the live frontier of every slot idle for at

@@ -2484,6 +2484,40 @@ void RowReclaimDropsRetainedCheckpoints() {
          lease->Metrics().reuse == "live");
   lease->Invalidate();
 }
+void RowReclaimKeepsTheCheckpointABranchRestores() {
+  // A branch that rewrites the last reply restores the checkpoint behind it:
+  // admission counts the rows that checkpoint holds on the device as mapped,
+  // and reclaiming rows for that branch keeps it while the live frontier the
+  // branch does not continue is reset (upstream cache-depth, one session).
+  std::vector<TextRunnerToken> prompt(40);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  auto runner = std::make_shared<Runner>();
+  runner->retain_rows = true;
+  ComponentTextCache cache(runner, 1, 1 << 22, std::nullopt);
+  (void)CapturePrompt(cache, *runner, prompt);
+  auto reply = prompt;
+  reply.insert(reply.end(), {7, 8, 9, 10});
+  {
+    auto lease = cache.Acquire(reply, {}, {}, true, 0, true);
+    assert(lease->cached_tokens() == prompt.size());
+    auto& state = dynamic_cast<State&>(lease->state());
+    const auto tail = std::span(reply).subspan(prompt.size());
+    runner->adapter->Append(state.slot, tail, tail);
+    (void)lease->Commit({}, {}, reply);
+  }
+  auto branch = prompt;
+  branch.insert(branch.end(), {50, 51});
+  const auto held = cache.ContinuedTokens(branch, nullptr, true, 0);
+  assert(held.tokens == prompt.size() && !held.live);
+  const auto invalidations = runner->adapter->Invalidations();
+  assert(cache.ReclaimRows(branch, [] { return false; }) ==
+         ComponentTextCache::RowReclaim::kExhausted);
+  assert(runner->adapter->Invalidations() > invalidations);
+  assert(runner->adapter->RetainedChunks() == 10);
+  auto lease = cache.Acquire(branch, {}, {}, true, 0, true);
+  assert(lease->cached_tokens() == prompt.size());
+  lease->Invalidate();
+}
 void NearbyStableBoundaryDoesNotSplitAContinuation() {
   // A stable boundary within 64 tokens of the reused frontier is not worth a
   // second pass; one further away still stops prefill for its checkpoint.
@@ -2804,6 +2838,7 @@ int main() {
   RetainedChunksTakeNoRamAndRestore();
   RetainedChunksReachDisk();
   RowReclaimDropsRetainedCheckpoints();
+  RowReclaimKeepsTheCheckpointABranchRestores();
   SharedLineageCoversOnlyItsOwnFrontier();
   ReassignmentWritesUncoveredFrontier();
   ColdAssignmentCapturesUncoveredFrontier();

@@ -1965,13 +1965,15 @@ bool TextRunnerPool::AdmissionReady(std::span<const TextRunnerToken> prompt,
     return true;
   if (impl_->component_cache == nullptr)
     return true;
-  // A continued session's slot already maps the rows of its frontier;
+  // A continued session's slot already maps the rows of its frontier, and a
+  // restore maps the complete device blocks of its checkpoint;
   // Request::ReserveRows reserves only the blocks past them.
   const auto block_rows = runner.RowBlocks().block_rows;
-  const auto held = (impl_->component_cache->ContinuedTokens(
-                         prompt, context, reuse_prompt, cache_prefix_tokens) +
-                     block_rows - 1) /
-                    block_rows;
+  const auto continued = impl_->component_cache->ContinuedTokens(
+      prompt, context, reuse_prompt, cache_prefix_tokens);
+  const auto held = continued.live
+                        ? (continued.tokens + block_rows - 1) / block_rows
+                        : continued.tokens / block_rows;
   need -= std::min(need, held);
   if (runner.RowBlocks().free_blocks >= need)
     return true;
