@@ -471,6 +471,41 @@ void LiveRowsStreamWithoutWholeHistoryBacking() {
     assert(ledger.Snapshot().persistence_pinned_bytes == 0);
   }
 }
+void DeviceReadsQueueAheadOfTheWriter() {
+  // Device-read pieces are copied ahead of the one being written, so their
+  // waits overlap; every queued copy settles and the checkpoint round-trips.
+  Directory dir;
+  ResourceLedger ledger{{1 << 22, 1 << 21, 256 + 2048, 4096}};
+  DiskStore disk(ledger, dir.path, 1 << 20);
+  StreamedStore streams(ledger, disk, 256, Allocate, Lease, 2048);
+  Fixture fixture(ledger);
+  std::size_t issued = 0, settled = 0, ahead = 0;
+  std::vector<PersistenceSource> sources;
+  for (const auto& buffer : fixture.buffers) {
+    const auto* data = buffer.owner->data();
+    sources.emplace_back(buffer.private_file, buffer.file, buffer.owner->size(),
+                         buffer.alignment, buffer.owner,
+                         [&, data](auto offset, auto bytes, Stream& stream) {
+                           ahead = std::max(ahead, ++issued - settled);
+                           return dynamic_cast<FakeStream&>(stream).Submit(
+                               [&, data, offset, bytes] {
+                                 ++settled;
+                                 std::memcpy(bytes.data(), data + offset,
+                                             bytes.size());
+                                 return TransferResult::kSucceeded;
+                               });
+                         });
+  }
+  TransferTiming timing;
+  streams.Write(Id(100), fixture.manifest, sources, timing);
+  assert(ahead > 1 && "device pieces were read one at a time");
+  assert(issued == settled && issued == sources.size());
+  auto restored = fixture.adapter.CreateSlot(fixture.guard);
+  assert(streams.Restore({1}, fixture.manifest.compatibility, fixture.adapter,
+                         *restored, timing));
+  assert(fixture.adapter.RecurrentHash(*restored) == fixture.hash);
+  assert(ledger.Snapshot().persistence_pinned_bytes == 0);
+}
 void BorrowedSourcesWaitWithoutBlockingForeground() {
   Directory dir;
   ResourceLedger ledger{{1 << 22, 1 << 21, 11, 4096}};
@@ -1082,6 +1117,7 @@ int main() {
   PrefetchDoesNotValidateOrAdmitPayload();
   RestoreGroupsAdjacentFilesWithinStaging();
   LiveRowsStreamWithoutWholeHistoryBacking();
+  DeviceReadsQueueAheadOfTheWriter();
   BorrowedSourcesWaitWithoutBlockingForeground();
   LiveBorrowedSourcesPublishFromSlot();
   StopWaitingBorrowedPublication(false);

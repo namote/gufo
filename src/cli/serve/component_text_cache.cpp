@@ -22,6 +22,14 @@
 
 namespace gufo::server {
 namespace {
+// Room for device-read pieces a disk write queues ahead. It is pinned RAM
+// under the cache ceiling, so take it only when it is a small share of that
+// ceiling; smaller caches read each piece in place.
+std::size_t ReadAheadBytes(std::size_t ceiling) {
+  return ceiling / 256 >= cache::kPersistenceReadAheadBytes
+             ? cache::kPersistenceReadAheadBytes
+             : 0;
+}
 using Clock = std::chrono::steady_clock;
 class SettledSignal final : public cache::CompletionSignal {
 public:
@@ -292,8 +300,14 @@ struct ComponentTextCache::Impl {
         // Disk transfers lease one fixed pinned staging buffer. Its size does
         // not change restore or write speed (#562), and a larger one only
         // takes pinned RAM and device heap from the cache and the sessions.
-        ledger({slot_ceiling + (options ? cache::kDefaultDiskStagingBytes : 0),
-                slot_ceiling, options ? cache::kDefaultDiskStagingBytes : 0,
+        // Writes may also queue device-read pieces ahead (ReadAheadBytes).
+        ledger({slot_ceiling + (options ? cache::kDefaultDiskStagingBytes +
+                                              ReadAheadBytes(slot_ceiling)
+                                        : 0),
+                slot_ceiling,
+                options ? cache::kDefaultDiskStagingBytes +
+                              ReadAheadBytes(slot_ceiling)
+                        : 0,
                 slot_ceiling}),
         resources(this->runner->CreateComponentCacheResources(ledger, ram)),
         identity(resources->adapter->CompatibilityIdentity()),
@@ -314,7 +328,7 @@ struct ComponentTextCache::Impl {
     if (options) {
       const auto row_bytes =
           cache::MinimumStagingBytes(resources->adapter->Components());
-      if (ledger.Limits().staging_bytes < row_bytes)
+      if (cache::kDefaultDiskStagingBytes < row_bytes)
         throw std::logic_error("a " + std::to_string(row_bytes) +
                                "-byte cache row exceeds the disk staging "
                                "buffer");
@@ -393,8 +407,8 @@ struct ComponentTextCache::Impl {
                              catalog->Find(durable.Manifest().checkpoint));
       }
       streaming = std::make_unique<cache::StreamedStore>(
-          ledger, *disk, ledger.Limits().staging_bytes, resources->staging,
-          resources->stream);
+          ledger, *disk, cache::kDefaultDiskStagingBytes, resources->staging,
+          resources->stream, ReadAheadBytes(slot_ceiling));
       disk_capacity = options->capacity_bytes;
       disk_step = options->min_checkpoint_step_tokens;
       disk->ReclaimOrphans();
@@ -522,16 +536,18 @@ struct ComponentTextCache::Impl {
             return catalog->EvictOne();
           });
     }
-    Logger::Info("cache",
-                 "schema=component-cache-v1 event=configured sessions=" +
-                     std::to_string(count) +
-                     " snapshot_entries=128 capacity_bytes=" +
-                     std::to_string(ram) + " staging_capacity_bytes=" +
-                     std::to_string(ledger.Limits().staging_bytes) +
-                     " automatic_bytes=" + std::to_string(automatic_bytes) +
-                     " max_bytes=" + std::to_string(max_bytes) +
-                     " disk_capacity_bytes=" + std::to_string(disk_capacity) +
-                     " slot_pinned_bytes=" + std::to_string(slot_pinned_bytes));
+    Logger::Info(
+        "cache",
+        "schema=component-cache-v1 event=configured sessions=" +
+            std::to_string(count) + " snapshot_entries=128 capacity_bytes=" +
+            std::to_string(ram) + " staging_capacity_bytes=" +
+            std::to_string(ledger.Limits().staging_bytes) +
+            " automatic_bytes=" + std::to_string(automatic_bytes) +
+            " max_bytes=" + std::to_string(max_bytes) +
+            " disk_capacity_bytes=" + std::to_string(disk_capacity) +
+            " disk_read_ahead_bytes=" +
+            std::to_string(streaming ? streaming->ReadAheadBytes() : 0) +
+            " slot_pinned_bytes=" + std::to_string(slot_pinned_bytes));
   }
   ~Impl() {
     // Settle immutable-source readers before slots/resources/index unwind.
