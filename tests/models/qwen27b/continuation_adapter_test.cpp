@@ -732,8 +732,13 @@ void CheckRetainedKvBlocks(
           "a block its session maps counts as only retained");
   // Another session restores complete chunks from the retained blocks and
   // the tails from host bytes: it maps those blocks rather than copying.
+  // Leave just one free block: retained complete chunks need no temporary
+  // duplicates, and only the host tail needs a new block.
+  const auto occupied = kv_pool->Allocate(kv_pool->free_blocks() - 1);
   const auto free = kv_pool->free_blocks();
   paged.BeginRestore(*p2, expected.positions);
+  Require(kv_pool->free_blocks() == free,
+          "beginning a retained restore allocated temporary KV blocks");
   // Each transfer leases its own stream, as the cache does.
   const auto stream = [&] {
     auto leased = pool.TryAcquire();
@@ -768,6 +773,7 @@ void CheckRetainedKvBlocks(
             "a retained block was copied instead of mapped");
   Require(kv_pool->free_blocks() == free - 1,
           "a mapped restore took more than its tail block");
+  kv_pool->Release(occupied);
   Require(Capture(paged, *p2, pool).bytes == expected.bytes,
           "mapped restore bytes differ");
   // Shared blocks before the frontier are never written: a reservation

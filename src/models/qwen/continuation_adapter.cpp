@@ -27,6 +27,8 @@ std::vector<KvRun> KvRuns(const hip::QwenGpuArena& arena, cache::Rows first,
     const auto logical = first >> hip::kKvBlockShift;
     if (logical >= blocks.size())
       throw std::out_of_range("Qwen KV rows outside the block table");
+    if (blocks[logical] == hip::QwenGpuArena::kUnmappedKvBlock)
+      throw std::logic_error("Qwen KV restore has unmapped blocks");
     const auto offset = first & (hip::kKvBlockTokens - 1);
     const auto rows =
         std::min<cache::Rows>(end - first, hip::kKvBlockTokens - offset);
@@ -538,12 +540,11 @@ void ContinuationAdapter::BeginRestore(
   Check(hipStreamSynchronize(state.executor->arena_.stream));
   if (state.draft)
     Check(hipStreamSynchronize(state.draft->executor_->stream_));
-  // Shared pool: the loads below fill rows [0, target) whole. Keep the
-  // blocks already mapped there and map the rest.
+  // Keep existing blocks. Retained chunks fill the remaining logical
+  // entries by mapping their source, without a temporary full-size copy.
   auto& arena = state.executor->arena_;
   const auto target = static_cast<std::uint32_t>(ordered.front().valid_rows);
-  arena.TruncateKvRows(target);
-  arena.EnsureKvRows(target);
+  arena.PrepareKvRestoreRows(target);
   state.restored_blocks.assign(arena.GetKvBlocks().size(),
                                State::Restored::kNone);
   state.expected = std::move(ordered);
@@ -879,6 +880,7 @@ cache::Completion ContinuationAdapter::CopyRowsIn(
           arena.MapKvBlock(logical, *pooled);
           restored = State::Restored::kMapped;
         } else {
+          arena.EnsureKvRestoreBlock(logical);
           arena.UnshareKvRows(static_cast<std::uint32_t>(r),
                               static_cast<std::uint32_t>(block_end));
           restored = State::Restored::kCopied;
