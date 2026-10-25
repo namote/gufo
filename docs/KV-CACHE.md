@@ -209,6 +209,18 @@ complete prompt. Capture runs asynchronously while that session is frozen, so ot
 requests can continue; a single execution slot skips the extra worker. A
 request whose first token is already published decodes as soon as its capture
 finishes, before the next bounded prefill chunk of a peer.
+Where checkpoints keep KV as pool blocks a capture is cheap, so a warm
+continuation does not stop at a stable boundary within 64 tokens of its reused
+frontier: a second pass over the whole context would cost more than the few
+tokens such a boundary saves, and the complete prompt is captured instead.
+A cold assignment, or a pool reclaim, that would reset an idle slot first
+captures its live frontier as a RAM checkpoint when no checkpoint comes within
+64 tokens of it, so that conversation's next turn does not prefill its last
+reply again. The copy is retained at retry priority: it may only displace other
+optional copies and is the first to go. Logs:
+`event=live_frontier_captured`, `event=live_frontier_capture_refused`; a
+frontier a pool reclaim cannot copy without keeping the rows it frees is
+logged as `event=live_frontier_dropped`.
 Coincident RAM and disk boundaries share one copy. Admission
 remains subject to the existing byte budget, and intermediate copies preserve
 the original branching fallback. These intermediate checkpoints live in RAM;
