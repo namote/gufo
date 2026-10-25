@@ -82,6 +82,59 @@ void Planning() {
   assert(plan.size() == 2 && plan[1].boundary == 10000);
   assert(PlanCaptures(adapter, *slot, {10000, 0, 1500, 0, true, false, {}, 0})
              .size() == 2);
+  // Tail points count back kTailStep from where prefill ends.
+  const auto boundaries = [](const std::vector<CaptureCandidate>& plan) {
+    std::vector<Rows> result;
+    for (const auto& c : plan)
+      result.push_back(c.boundary);
+    return result;
+  };
+  const auto tails = [](const std::vector<CaptureCandidate>& plan) {
+    std::vector<Rows> result;
+    for (const auto& c : plan)
+      if (c.tail) {
+        assert(!c.required && c.purpose == CheckpointPurpose::kGrid);
+        result.push_back(c.boundary);
+      }
+    return result;
+  };
+  adapter.SetPrefillPassRows(4096);
+  plan = PlanCaptures(adapter, *slot,
+                      {8201, 0, 0, 0, false, false, {}, 4, std::size_t{3}});
+  assert((boundaries(plan) == std::vector<Rows>{5129, 6153, 7177, 8201}));
+  assert((tails(plan) == std::vector<Rows>{5129, 6153, 7177}));
+  assert(plan[0].splits_pass && !plan[3].splits_pass);
+  // A point leaving a pass piece shorter than the step moves to its start,
+  // where a pass ends anyway.
+  adapter.SetPrefillPassRows(1024);
+  plan = PlanCaptures(adapter, *slot, {8201, 0, 0, 0, false, false, {}, 4, 3});
+  assert((tails(plan) == std::vector<Rows>{5120, 6144, 7168}));
+  for (const auto& c : plan)
+    assert(!c.splits_pass);
+  adapter.SetPrefillPassRows(4096);
+  // A stop within 128 tokens of the end anchors the count.
+  plan =
+      PlanCaptures(adapter, *slot, {8201, 0, 8195, 0, false, false, {}, 4, 3});
+  assert((tails(plan) == std::vector<Rows>{5123, 6147, 7171}));
+  // None leaves less than the step after the reused frontier.
+  plan =
+      PlanCaptures(adapter, *slot, {8201, 6000, 0, 0, false, false, {}, 4, 3});
+  assert((boundaries(plan) == std::vector<Rows>{6000, 7177, 8201}));
+  assert((tails(plan) == std::vector<Rows>{7177}));
+  // A retained point still counts; the count goes on from it.
+  std::array<Rows, 1> retained_tail{6153};
+  plan = PlanCaptures(adapter, *slot,
+                      {8201, 0, 0, 0, false, false, retained_tail, 4, 3});
+  assert((tails(plan) == std::vector<Rows>{5129, 7177}));
+  // A grid point within the step of the end already bounds the work.
+  adapter.SetPrefillPassRows(2048);
+  plan = PlanCaptures(adapter, *slot, {10000, 0, 0, 0, true, false, {}, 4, 3});
+  assert(
+      (boundaries(plan) == std::vector<Rows>{2048, 4096, 6144, 8192, 10000}));
+  assert(tails(plan).empty());
+  assert(tails(PlanCaptures(adapter, *slot,
+                            {8201, 0, 0, 0, false, false, {}, 4, 0}))
+             .empty());
   // Flash-Next keeps about 133 MB of private state per checkpoint.
   assert(GridLimit(2ULL << 30, 133'100'000) == 1);
   assert(GridLimit(8ULL << 30, 133'100'000) == 4);

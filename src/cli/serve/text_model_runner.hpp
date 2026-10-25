@@ -60,6 +60,14 @@ struct TextRunnerRamCacheOptions {
   /// session at the full context. Runners without paged rows refuse a
   /// nonzero value at load.
   std::size_t kv_pool_bytes{0};
+  /// Long prompts also keep this many RAM checkpoints, one every
+  /// cache::kTailStep tokens over the end of the prompt, so a request that
+  /// shares all but the end of a prompt already prefilled past their
+  /// divergence restores within that step of it. Applied only where
+  /// captures keep rows as device references
+  /// (ComponentTextCache::CapturesShareRows), so each costs its private state;
+  /// otherwise logged at startup as not applied. Zero: none.
+  std::size_t tail_checkpoints{3};
 };
 
 struct TextRunnerDiskCacheOptions {

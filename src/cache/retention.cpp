@@ -89,6 +89,50 @@ std::vector<CaptureCandidate> PlanCaptures(const Adapter& adapter,
       position = planned;
     add(position, CheckpointPurpose::kLearned, false);
   }
+  if (r.tail && r.prompt) {
+    constexpr Rows gap = 128;
+    std::vector<Rows> stops;
+    for (const auto& c : result)
+      stops.push_back(c.boundary);
+    std::erase_if(stops,
+                  [&](Rows s) { return s <= r.reused || s >= r.prompt; });
+    std::ranges::sort(stops);
+    Rows anchor = r.prompt;
+    if (const auto near = std::ranges::lower_bound(
+            stops, r.prompt > gap ? r.prompt - gap : 0);
+        near != stops.end())
+      anchor = *near;
+    for (std::size_t point = 0, last = anchor;
+         point < r.tail && last > kTailStep; ++point) {
+      Rows position = last - kTailStep;
+      const auto next = std::ranges::upper_bound(stops, position);
+      // A stop already here serves; keep counting back from it.
+      if (next != stops.begin() && *std::prev(next) == position) {
+        last = position;
+        continue;
+      }
+      const Rows before = next == stops.begin() ? r.reused : *std::prev(next);
+      if (position < before + kTailStep)
+        break;
+      const auto pieces = adapter.PlanPrefill(slot, before, position);
+      if (pieces.size() > 1 &&
+          position - pieces[pieces.size() - 2] < kTailStep) {
+        position = pieces[pieces.size() - 2];
+        if (position < before + kTailStep)
+          break;
+      }
+      last = position;
+      const Rows after = next == stops.end() ? r.prompt : *next;
+      if (after < position + kTailStep)
+        continue;
+      add(position, CheckpointPurpose::kGrid, false);
+      if (auto found =
+              std::ranges::find(result, position, &CaptureCandidate::boundary);
+          found != result.end() && !found->required)
+        found->tail = true;
+      stops.insert(std::ranges::upper_bound(stops, position), position);
+    }
+  }
   std::ranges::sort(result, {}, &CaptureCandidate::boundary);
   return result;
 }

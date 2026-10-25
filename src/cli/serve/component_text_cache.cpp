@@ -1018,6 +1018,13 @@ ComponentTextCache::ComponentTextCache(
     : impl_(std::make_unique<Impl>(std::move(runner), count, ram,
                                    std::max(ram, ceiling), disk,
                                    automatic_ram)) {}
+bool ComponentTextCache::CapturesShareRows() const {
+  const auto& adapter = *impl_->resources->adapter;
+  return std::ranges::any_of(adapter.Components(), [&](const auto& d) {
+    return d.kind == cache::ComponentKind::kAppendRows &&
+           adapter.RetainsRows(d.id);
+  });
+}
 ComponentTextCache::~ComponentTextCache() {
   // Graceful shutdown: once queued checkpoints are durable, write the live
   // frontiers no checkpoint covers, sharing those checkpoints' chunks. A
@@ -2174,8 +2181,8 @@ void ComponentTextCache::Lease::Invalidate() noexcept {
   impl_->active = false;
 }
 
-std::vector<std::size_t> ComponentTextCache::Lease::PlannedCaptures(
-    std::size_t stable) const {
+PlannedCapturePoints ComponentTextCache::Lease::PlannedCaptures(
+    std::size_t stable, std::size_t tail) const {
   const auto& adapter = *impl_->cache->resources->adapter;
   std::size_t private_bytes = 0;
   for (const auto& d : adapter.Components())
@@ -2190,18 +2197,22 @@ std::vector<std::size_t> ComponentTextCache::Lease::PlannedCaptures(
        true,
        false,
        {},
-       cache::GridLimit(impl_->cache->budget, private_bytes)});
-  std::vector<std::size_t> boundaries;
+       cache::GridLimit(impl_->cache->budget, private_bytes),
+       tail});
+  PlannedCapturePoints points;
   for (const auto& capture : plan)
     if (!capture.required &&
         !HasSnapshotFor(std::span<const cache::Token>(impl_->prompt)
-                            .first(capture.boundary)))
-      boundaries.push_back(capture.boundary);
-  return boundaries;
+                            .first(capture.boundary))) {
+      points.boundaries.push_back(capture.boundary);
+      if (capture.tail)
+        points.tails.push_back(capture.boundary);
+    }
+  return points;
 }
-std::vector<std::size_t> ServingCacheLease::PlannedCaptures(
-    std::size_t stable) const {
-  return component_->PlannedCaptures(stable);
+PlannedCapturePoints ServingCacheLease::PlannedCaptures(
+    std::size_t stable, std::size_t tail) const {
+  return component_->PlannedCaptures(stable, tail);
 }
 
 ComponentCacheMetrics ComponentTextCache::Lease::Metrics() const {

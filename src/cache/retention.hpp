@@ -23,6 +23,8 @@ struct CaptureCandidate {
   CheckpointPurpose purpose{CheckpointPurpose::kPrompt};
   bool required{false};
   bool splits_pass{false};
+  // One of the request's tail points (CapturePlanRequest::tail).
+  bool tail{false};
 };
 struct CapturePlanRequest {
   Rows prompt{}, reused{}, stable{}, common{};
@@ -30,15 +32,25 @@ struct CapturePlanRequest {
   std::span<const Rows> already_retained;
   // Keeps the shallowest eligible grid points, including retained ones.
   std::size_t grid_limit{4};
+  // Optional points every kTailStep rows back from where prefill ends, so a
+  // later prompt sharing all but the end restores within kTailStep of where
+  // it differs.
+  std::size_t tail{0};
 };
+inline constexpr Rows kTailStep = 1024;
 // One optional grid point per twelve private states the RAM budget holds,
 // up to four. Speculative edit boundaries then cannot crowd out the
 // conversations a small budget is meant to keep.
 [[nodiscard]] std::size_t GridLimit(std::size_t ram_bytes,
                                     std::size_t private_bytes);
-// Queries the adapter once. Required stable/prompt/reused boundaries remain
-// exact. Optional grids reuse a preceding pass end within 128 tokens; learned
-// points coalesce with a planned capture within the existing 64-token slack.
+// Pure host queries of the adapter's pass plan. Required stable/prompt/reused
+// boundaries remain exact. Optional grids reuse a preceding pass end within
+// 128 tokens; learned points coalesce with a planned capture within the
+// existing 64-token slack. Tail points count back from a stop within 128
+// tokens of the prompt end, else the end; a point that would leave a pass
+// piece shorter than kTailStep moves back to that piece's start. None leaves
+// less than kTailStep after the previous stop or before the next: that stop
+// already bounds what a later prompt recomputes.
 [[nodiscard]] std::vector<CaptureCandidate> PlanCaptures(
     const Adapter&, const Slot&, const CapturePlanRequest&);
 

@@ -2464,7 +2464,43 @@ void NearbyStableBoundaryDoesNotSplitAContinuation() {
     turn.Invalidate();
   }
 }
+void FirstFollowerRestoresATailCheckpoint() {
+  // Conversations share a 1,500-token system prompt and then differ. The
+  // first follower arrives after the leader prefilled past the divergence,
+  // so no peer is prefilling it; with tail checkpoints it restores the
+  // leader's point 1,024 tokens before its prompt end instead of starting
+  // cold. Checkpoints copying their rows do not apply them.
+  std::vector<TextRunnerToken> leader_prompt(2100);
+  std::iota(leader_prompt.begin(), leader_prompt.end(), 10);
+  auto follower_prompt = leader_prompt;
+  std::iota(follower_prompt.begin() + 1500, follower_prompt.end(), 20000);
+  TextRunnerToken expected{};
+  {
+    auto runner = std::make_shared<Runner>();
+    TextRunnerPool pool(runner, 1);
+    auto cold = pool.Acquire(follower_prompt, {}, {}, {}, false);
+    Prefill(cold);
+    expected = Generate(cold);
+    cold.Invalidate();
+  }
+  for (const std::size_t tails : {0, 3})
+    for (const bool retain : {false, true}) {
+      auto runner = std::make_shared<Runner>();
+      runner->retain_rows = retain;
+      TextRunnerPool pool(runner, 1, std::nullopt, {.tail_checkpoints = tails});
+      auto leader = pool.Acquire(leader_prompt);
+      Prefill(leader);
+      (void)Generate(leader);
+      (void)leader.Commit();
+      auto follower = pool.Acquire(follower_prompt);
+      assert(follower.cached_prompt_tokens() == (tails && retain ? 1076 : 0));
+      Prefill(follower);
+      assert(Generate(follower) == expected);
+      follower.Invalidate();
+    }
+}
 int main() {
+  FirstFollowerRestoresATailCheckpoint();
   NearbyStableBoundaryDoesNotSplitAContinuation();
   RetainedChunksTakeNoRamAndRestore();
   RetainedChunksReachDisk();

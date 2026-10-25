@@ -59,6 +59,12 @@ struct ComponentCacheResources {
   std::size_t transfer_batch_size{1};
   std::size_t reassignment_batch_size{1};
 };
+// Optional prefill stops, ascending. Tails are the subset planned as tail
+// points; a stop shared with peers nearby makes them redundant.
+struct PlannedCapturePoints {
+  std::vector<std::size_t> boundaries;
+  std::vector<std::size_t> tails;
+};
 
 class ComponentTextCache {
 public:
@@ -96,8 +102,8 @@ public:
     [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Capture();
     void PreparePrefill(std::size_t tokens);
     [[nodiscard]] ComponentCacheMetrics Metrics() const;
-    [[nodiscard]] std::vector<std::size_t> PlannedCaptures(
-        std::size_t stable) const;
+    [[nodiscard]] PlannedCapturePoints PlannedCaptures(std::size_t stable,
+                                                       std::size_t tail) const;
 
   private:
     friend class ComponentTextCache;
@@ -111,6 +117,9 @@ public:
                      const std::optional<TextRunnerDiskCacheOptions>&,
                      bool automatic_ram = false, std::size_t ceiling_bytes = 0);
   ~ComponentTextCache();
+  // Captures keep completed rows as device references, not RAM copies, so a
+  // checkpoint costs its private state and tails (see Adapter::RetainRows).
+  [[nodiscard]] bool CapturesShareRows() const;
   [[nodiscard]] std::unique_ptr<Lease> Acquire(
       std::span<const ContinuationToken>,
       const ContinuationCache::CancellationCheck&,
@@ -206,8 +215,8 @@ public:
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Capture();
   void PreparePrefill(std::size_t tokens);
   [[nodiscard]] std::optional<ComponentCacheMetrics> Metrics() const;
-  [[nodiscard]] std::vector<std::size_t> PlannedCaptures(
-      std::size_t stable) const;
+  [[nodiscard]] PlannedCapturePoints PlannedCaptures(std::size_t stable,
+                                                     std::size_t tail) const;
 
 private:
   ContinuationCache::Lease legacy_;
