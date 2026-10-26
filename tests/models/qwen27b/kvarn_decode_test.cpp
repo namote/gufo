@@ -5,6 +5,7 @@
 // verification rows against scalar decoding of the same tokens, and the
 // refusals that stay until prefill (K1c-2) and snapshots (K2) exist.
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -14,10 +15,12 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "tests/models/qwen27b/kvarn_session.hpp"
 
 namespace {
 
@@ -106,53 +109,98 @@ void CheckStorage(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
   }
   kvarn.Reset();
 
-  // Teacher forcing: both executors read the same tokens.
-  std::vector<double> kls;
-  // KL by 128-position window: FP16 rows only below 256, then one more
-  // quantized group per window.
-  std::vector<std::vector<double>> windows(kPrompt / 128 + 1);
-  std::size_t agree = 0, compared = 0;
+  // Teacher forcing: three executors read the same tokens. `fake` is the
+  // FP16 executor of the K0 study whose K/V rows of every group that ended
+  // at or before the next position are fake-quantized in place
+  // (kvarn_fake_quant.hpp), the rule KvarnReadGroups gives the real path.
+  gufo::testing::kvarn::Session fake_session(model, kContext);
+  auto& fake = fake_session.Executor();
+  const auto config = *gufo::testing::kvarn::ParseConfig(
+      storage == QwenKvCacheStorage::kKvarnK4V2 ? "kvarn_k4v2_g128"
+                                                : "kvarn_k4v4_g128");
+  const auto& c = model->GetConfig();
+  struct Step {
+    double fp16_real, fp16_fake, fake_real;
+    bool top1_real, top1_fake, top1_real_fake;
+  };
+  std::vector<Step> steps;
   for (std::uint32_t pos = 0; pos < kPrompt; ++pos) {
+    if (pos >= 256 && pos % 128 == 0) {
+      auto state = fake_session.Capture();
+      (void)gufo::testing::kvarn::Quantize(fake_session, state, config,
+                                           c.num_key_value_heads, c.head_dim,
+                                           pos / 128 - 1, pos / 128);
+      fake_session.Restore(state);
+    }
     (void)fp16.ForwardToken(tokens[pos], pos);
     (void)kvarn.ForwardToken(tokens[pos], pos);
+    (void)fake.ForwardToken(tokens[pos], pos);
     const auto reference = Logits(fp16);
-    const auto candidate = Logits(kvarn);
-    const double kl = Kl(reference, candidate);
+    const auto real = Logits(kvarn);
+    const auto faked = Logits(fake);
     if (pos < 128) {
       // The sink alone: rotation and FP16 rounding of rotated rows only.
+      const double kl = Kl(reference, real);
       Expect(kl < 1e-3, name + ": sink-only KL too large at " +
                             std::to_string(pos) + ": " + std::to_string(kl));
       continue;
     }
-    windows[pos / 128].push_back(kl);
-    kls.push_back(kl);
-    agree += Argmax(reference) == Argmax(candidate);
-    ++compared;
+    steps.push_back({Kl(reference, real), Kl(reference, faked), Kl(faked, real),
+                     Argmax(reference) == Argmax(real),
+                     Argmax(reference) == Argmax(faked),
+                     Argmax(real) == Argmax(faked)});
+    const auto& step = steps.back();
+    std::cout << name << " step " << pos << " kl_fp16_real " << step.fp16_real
+              << " kl_fp16_fake " << step.fp16_fake << " kl_fake_real "
+              << step.fake_real << " top1_fp16_real " << step.top1_real
+              << " top1_fp16_fake " << step.top1_fake << " top1_real_fake "
+              << step.top1_real_fake << '\n';
   }
-  std::ranges::sort(kls);
-  const double median = kls[kls.size() / 2];
-  const double p95 = kls[kls.size() * 95 / 100];
-  const double worst = kls.back();
-  std::cout << name << " teacher-forced positions 128-" << kPrompt - 1
-            << ": top-1 " << agree << "/" << compared << " KL median " << median
-            << " p95 " << p95 << " max " << worst << '\n';
-  for (std::size_t w = 1; w < windows.size(); ++w) {
-    auto& window = windows[w];
-    if (window.empty())
-      continue;
-    std::ranges::sort(window);
-    std::cout << name << "   positions " << 128 * w << "-"
-              << 128 * w + window.size() - 1 << " (" << w - 1
-              << " quantized groups): KL median " << window[window.size() / 2]
-              << " max " << window.back() << '\n';
+  const auto summary = [&](auto field, std::uint32_t from, std::uint32_t to) {
+    std::vector<double> values;
+    for (std::size_t i = 0; i < steps.size(); ++i)
+      if (128 + i >= from && 128 + i < to)
+        values.push_back(steps[i].*field);
+    std::ranges::sort(values);
+    return std::array<double, 3>{values[values.size() / 2],
+                                 values[values.size() * 95 / 100],
+                                 values.back()};
+  };
+  std::size_t real_agree = 0, fake_agree = 0, real_fake_agree = 0;
+  for (const auto& step : steps) {
+    real_agree += step.top1_real;
+    fake_agree += step.top1_fake;
+    real_fake_agree += step.top1_real_fake;
   }
+  for (const auto [from, to] :
+       {std::pair{128U, 256U}, std::pair{256U, 384U}, std::pair{384U, 512U},
+        std::pair{512U, kPrompt}, std::pair{128U, kPrompt}}) {
+    const auto a = summary(&Step::fp16_real, from, to);
+    const auto b = summary(&Step::fp16_fake, from, to);
+    const auto d = summary(&Step::fake_real, from, to);
+    std::cout << name << " positions " << from << "-" << to - 1
+              << " KL median/p95/max fp16||real " << a[0] << "/" << a[1] << "/"
+              << a[2] << " fp16||fake " << b[0] << "/" << b[1] << "/" << b[2]
+              << " fake||real " << d[0] << "/" << d[1] << "/" << d[2] << '\n';
+  }
+  std::cout << name << " top-1 of " << steps.size() << ": fp16=real "
+            << real_agree << " fp16=fake " << fake_agree << " real=fake "
+            << real_fake_agree << '\n';
   // Without a quantized group the rows differ from FP16 only by the
   // rotation's rounding.
-  Expect(windows[1].back() < 1e-2, name + ": FP16-only tail KL too large");
-  Expect(agree * 100 >= compared * 95, name + ": top-1 agreement below 95 %");
-  // The quantized-window bounds are recorded, not tuned (K0 measured long
-  // prompts only; here each group carries a large share of attention).
-  Expect(median < 1e-3 && worst < 1.0, name + ": KL out of range");
+  Expect(summary(&Step::fp16_real, 128, 256)[2] < 1e-2,
+         name + ": FP16-only tail KL too large");
+  Expect(real_agree * 100 >= steps.size() * 95,
+         name + ": top-1 agreement below 95 %");
+  // Real and fake quantization store the same codes (bit-exact in the
+  // kernel test); they differ by attention arithmetic (kernel vs K0 fake
+  // quant relative error 7.5e-4) and the extra FP16 rounding of rotated
+  // rows, the same order as the rotation rounding whose KL stays below
+  // 1.5e-6 in the FP16-only window. The bound allows about 600 times that.
+  const auto real_fake = summary(&Step::fake_real, 128, kPrompt);
+  Expect(real_fake[2] < 1e-3, name + ": real KVarN departs from K0 fake quant");
+  Expect(real_fake_agree * 100 >= steps.size() * 99,
+         name + ": real and fake KVarN disagree on top-1");
 
   // Verification rows against scalar decoding of the same tokens.
   kvarn.SaveState(kPrompt);
@@ -184,10 +232,9 @@ void CheckStorage(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
   std::cout << name << " verification rows " << kPrompt << "-"
             << kPrompt + kRows - 1 << " vs scalar decode: exact=" << exact
             << " max_abs=" << max_abs << '\n';
-  // The 8-row and 1-row KVarN kernels round differently (kvarn-k1c-a04: max_abs
-  // 0.020 at k4v2, not bit-identical like the FP16 path); predictions must
-  // agree, the size of the difference is reported.
-  Expect(std::isfinite(max_abs), name + ": verification logits");
+  // Verification rows read what decode steps at their positions read
+  // (KvarnReadGroups) with the same split order: equal logits, as FP16.
+  Expect(exact, name + ": verification differs from decoding");
 
   // Decoding on past the pinned point (group 4 stays FP16 until the ring
   // needs it), then a fresh pinned point confirms and quantizes it.

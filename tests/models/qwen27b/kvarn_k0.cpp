@@ -20,17 +20,19 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
-#include "src/core/hip/transfer_pool.hpp"
 #include "src/core/json.hpp"
 #include "src/models/qwen/chat_template.hpp"
-#include "src/models/qwen/continuation_adapter.hpp"
 #include "tests/models/qwen27b/kvarn_fake_quant.hpp"
+#include "tests/models/qwen27b/kvarn_session.hpp"
 
-namespace cache = gufo::cache;
 namespace json = gufo::json;
 namespace kvarn = gufo::testing::kvarn;
-namespace qwen = gufo::models::qwen;
 using Token = gufo::tokenization::TokenId;
+using gufo::testing::kvarn::Quantize;
+using gufo::testing::kvarn::Relative;
+using gufo::testing::kvarn::Session;
+using gufo::testing::kvarn::State;
+using Error = gufo::testing::kvarn::SessionError;
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -50,86 +52,6 @@ std::string ReadFile(const std::string& path) {
   Require(bool(file), "cannot read " + path);
   return {std::istreambuf_iterator<char>(file), {}};
 }
-
-struct Guard final : cache::MutationGuard {
-  void BeforeOverwrite(cache::ComponentId, cache::Rows, cache::Rows) override {}
-  void BeforeRelease(cache::ComponentId, cache::Rows,
-                     cache::Rows) noexcept override {}
-};
-
-// The whole retained state of a slot: one host buffer per component.
-struct State {
-  std::vector<cache::ComponentPosition> positions;
-  std::vector<std::vector<std::byte>> components;
-};
-
-class Session {
-public:
-  Session(std::shared_ptr<const gufo::hip::QwenGpuModel> model,
-          std::uint32_t context)
-      : adapter_(std::move(model), context, {'k', 'v', 'a', 'r', 'n'}),
-        slot_(adapter_.CreateSlot(guard_)),
-        streams_(1) {}
-
-  gufo::hip::QwenGpuExecutor& Executor() {
-    return adapter_.GetExecutor(*slot_);
-  }
-
-  // Attention K/V components in layer order, key then value.
-  [[nodiscard]] bool IsRows(std::size_t index) const {
-    return adapter_.Components()[index].row_bytes != 0;
-  }
-
-  State Capture() {
-    State state{adapter_.Positions(*slot_), {}};
-    const auto components = adapter_.Components();
-    for (std::size_t i = 0; i < components.size(); ++i) {
-      const auto& component = components[i];
-      const auto rows = state.positions[i].valid_rows;
-      auto& bytes = state.components.emplace_back(
-          component.row_bytes ? rows * component.row_bytes
-                              : component.state_bytes);
-      auto stream = Stream();
-      Wait(component.row_bytes
-               ? adapter_.CopyRowsOut(*slot_, component.id, 0, rows, bytes,
-                                      *stream)
-               : adapter_.CapturePrivate(*slot_, component.id, bytes, *stream));
-    }
-    return state;
-  }
-
-  void Restore(const State& state) {
-    adapter_.BeginRestore(*slot_, state.positions);
-    const auto components = adapter_.Components();
-    for (std::size_t i = 0; i < components.size(); ++i) {
-      const auto& component = components[i];
-      auto stream = Stream();
-      Wait(component.row_bytes
-               ? adapter_.CopyRowsIn(*slot_, component.id, 0,
-                                     state.positions[i].valid_rows,
-                                     state.components[i], *stream)
-               : adapter_.LoadPrivate(*slot_, component.id, state.components[i],
-                                      *stream));
-    }
-    Require(adapter_.Validate(*slot_, state.positions), "restore failed");
-  }
-
-private:
-  std::unique_ptr<gufo::hip::TransferStream> Stream() {
-    auto stream = streams_.TryAcquire();
-    Require(bool(stream), "transfer stream exhausted");
-    return stream;
-  }
-  static void Wait(cache::Completion done) {
-    Require(done.Wait() == cache::TransferResult::kSucceeded,
-            "transfer failed");
-  }
-
-  qwen::ContinuationAdapter adapter_;
-  Guard guard_;
-  std::unique_ptr<cache::Slot> slot_;
-  gufo::hip::TransferPool streams_;
-};
 
 std::vector<float> LogSoftmax(std::span<const float> logits) {
   const float top = *std::ranges::max_element(logits);
@@ -171,37 +93,6 @@ json::Value Distribution(std::vector<double> values) {
   result["p95"] = at(0.95);
   result["max"] = values.back();
   return result;
-}
-
-struct Error {
-  kvarn::Error key, value;
-};
-
-// Fake-quantizes groups [first_group, end_group) of every attention K/V
-// component of `state`.
-Error Quantize(Session& session, State& state, const kvarn::Config& config,
-               std::uint32_t heads, std::uint32_t dim, std::size_t first_group,
-               std::size_t end_group) {
-  Error error;
-  bool key = true;
-  for (std::size_t i = 0; i < state.components.size(); ++i) {
-    if (!session.IsRows(i))
-      continue;
-    auto& bytes = state.components[i];
-    const std::span rows(reinterpret_cast<std::uint16_t*>(bytes.data()),
-                         bytes.size() / sizeof(std::uint16_t));
-    const auto e = kvarn::FakeQuantize(rows, heads, dim, key, config,
-                                       first_group, end_group);
-    auto& total = key ? error.key : error.value;
-    total.squared += e.squared;
-    total.reference += e.reference;
-    key = !key;
-  }
-  return error;
-}
-
-double Relative(const kvarn::Error& error) {
-  return error.reference > 0 ? std::sqrt(error.squared / error.reference) : 0;
 }
 
 }  // namespace
