@@ -115,13 +115,43 @@ void CheckStorage(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
   // (kvarn_fake_quant.hpp), the rule KvarnReadGroups gives the real path.
   gufo::testing::kvarn::Session fake_session(model, kContext);
   auto& fake = fake_session.Executor();
+  // The control: the same fake quantization of rows each moved by about one
+  // FP16 rounding first (a rotation round trip), measuring how far
+  // last-bit differences carry through the discontinuous RTN codes of later
+  // groups. Real KVarN reaches its groups' rows through the same kind of
+  // differences (rotated FP16 rows, FP16 query and P in the kernel).
+  gufo::testing::kvarn::Session control_session(model, kContext);
+  auto& control = control_session.Executor();
   const auto config = *gufo::testing::kvarn::ParseConfig(
       storage == QwenKvCacheStorage::kKvarnK4V2 ? "kvarn_k4v2_g128"
                                                 : "kvarn_k4v4_g128");
   const auto& c = model->GetConfig();
   struct Step {
-    double fp16_real, fp16_fake, fake_real;
-    bool top1_real, top1_fake, top1_real_fake;
+    double fp16_real, fp16_fake, fake_real, fake_control;
+    bool top1_real, top1_fake, top1_real_fake, top1_fake_control;
+  };
+  const auto round_trip = [&](gufo::testing::kvarn::Session& session,
+                              gufo::testing::kvarn::State& state,
+                              std::size_t group) {
+    const std::size_t width = std::size_t{c.num_key_value_heads} * c.head_dim;
+    std::vector<float> x(c.head_dim);
+    for (std::size_t i = 0; i < state.components.size(); ++i) {
+      if (!session.IsRows(i))
+        continue;
+      auto* rows = reinterpret_cast<std::uint16_t*>(state.components[i].data());
+      for (std::size_t t = group * 128; t < (group + 1) * 128; ++t)
+        for (std::size_t h = 0; h < c.num_key_value_heads; ++h) {
+          std::uint16_t* row = rows + t * width + h * c.head_dim;
+          for (std::size_t d = 0; d < c.head_dim; ++d)
+            x[d] = gufo::testing::kvarn::HalfToFloat(row[d]);
+          gufo::testing::kvarn::Hadamard(x);
+          for (auto& value : x)
+            value = gufo::testing::kvarn::RoundHalf(value);
+          gufo::testing::kvarn::Hadamard(x);
+          for (std::size_t d = 0; d < c.head_dim; ++d)
+            row[d] = gufo::testing::kvarn::FloatToHalf(x[d]);
+        }
+    }
   };
   std::vector<Step> steps;
   for (std::uint32_t pos = 0; pos < kPrompt; ++pos) {
@@ -131,13 +161,21 @@ void CheckStorage(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
                                            c.num_key_value_heads, c.head_dim,
                                            pos / 128 - 1, pos / 128);
       fake_session.Restore(state);
+      auto moved = control_session.Capture();
+      round_trip(control_session, moved, pos / 128 - 1);
+      (void)gufo::testing::kvarn::Quantize(control_session, moved, config,
+                                           c.num_key_value_heads, c.head_dim,
+                                           pos / 128 - 1, pos / 128);
+      control_session.Restore(moved);
     }
     (void)fp16.ForwardToken(tokens[pos], pos);
     (void)kvarn.ForwardToken(tokens[pos], pos);
     (void)fake.ForwardToken(tokens[pos], pos);
+    (void)control.ForwardToken(tokens[pos], pos);
     const auto reference = Logits(fp16);
     const auto real = Logits(kvarn);
     const auto faked = Logits(fake);
+    const auto controlled = Logits(control);
     if (pos < 128) {
       // The sink alone: rotation and FP16 rounding of rotated rows only.
       const double kl = Kl(reference, real);
@@ -146,15 +184,17 @@ void CheckStorage(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
       continue;
     }
     steps.push_back({Kl(reference, real), Kl(reference, faked), Kl(faked, real),
-                     Argmax(reference) == Argmax(real),
+                     Kl(faked, controlled), Argmax(reference) == Argmax(real),
                      Argmax(reference) == Argmax(faked),
-                     Argmax(real) == Argmax(faked)});
+                     Argmax(real) == Argmax(faked),
+                     Argmax(controlled) == Argmax(faked)});
     const auto& step = steps.back();
     std::cout << name << " step " << pos << " kl_fp16_real " << step.fp16_real
               << " kl_fp16_fake " << step.fp16_fake << " kl_fake_real "
               << step.fake_real << " top1_fp16_real " << step.top1_real
               << " top1_fp16_fake " << step.top1_fake << " top1_real_fake "
-              << step.top1_real_fake << '\n';
+              << step.top1_real_fake << " kl_fake_control " << step.fake_control
+              << " top1_fake_control " << step.top1_fake_control << '\n';
   }
   const auto summary = [&](auto field, std::uint32_t from, std::uint32_t to) {
     std::vector<double> values;
@@ -166,11 +206,13 @@ void CheckStorage(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
                                  values[values.size() * 95 / 100],
                                  values.back()};
   };
-  std::size_t real_agree = 0, fake_agree = 0, real_fake_agree = 0;
+  std::size_t real_agree = 0, fake_agree = 0, real_fake_agree = 0,
+              control_agree = 0;
   for (const auto& step : steps) {
     real_agree += step.top1_real;
     fake_agree += step.top1_fake;
     real_fake_agree += step.top1_real_fake;
+    control_agree += step.top1_fake_control;
   }
   for (const auto [from, to] :
        {std::pair{128U, 256U}, std::pair{256U, 384U}, std::pair{384U, 512U},
@@ -178,29 +220,42 @@ void CheckStorage(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
     const auto a = summary(&Step::fp16_real, from, to);
     const auto b = summary(&Step::fp16_fake, from, to);
     const auto d = summary(&Step::fake_real, from, to);
+    const auto e = summary(&Step::fake_control, from, to);
     std::cout << name << " positions " << from << "-" << to - 1
               << " KL median/p95/max fp16||real " << a[0] << "/" << a[1] << "/"
               << a[2] << " fp16||fake " << b[0] << "/" << b[1] << "/" << b[2]
-              << " fake||real " << d[0] << "/" << d[1] << "/" << d[2] << '\n';
+              << " fake||real " << d[0] << "/" << d[1] << "/" << d[2]
+              << " fake||control " << e[0] << "/" << e[1] << "/" << e[2]
+              << '\n';
   }
   std::cout << name << " top-1 of " << steps.size() << ": fp16=real "
             << real_agree << " fp16=fake " << fake_agree << " real=fake "
-            << real_fake_agree << '\n';
+            << real_fake_agree << " fake=control " << control_agree << '\n';
   // Without a quantized group the rows differ from FP16 only by the
   // rotation's rounding.
   Expect(summary(&Step::fp16_real, 128, 256)[2] < 1e-2,
          name + ": FP16-only tail KL too large");
   Expect(real_agree * 100 >= steps.size() * 95,
          name + ": top-1 agreement below 95 %");
-  // Real and fake quantization store the same codes (bit-exact in the
-  // kernel test); they differ by attention arithmetic (kernel vs K0 fake
-  // quant relative error 7.5e-4) and the extra FP16 rounding of rotated
-  // rows, the same order as the rotation rounding whose KL stays below
-  // 1.5e-6 in the FP16-only window. The bound allows about 600 times that.
-  const auto real_fake = summary(&Step::fake_real, 128, kPrompt);
-  Expect(real_fake[2] < 1e-3, name + ": real KVarN departs from K0 fake quant");
-  Expect(real_fake_agree * 100 >= steps.size() * 99,
-         name + ": real and fake KVarN disagree on top-1");
+  // Real and fake quantization store the same codes for the same rows
+  // (bit-exact in the kernel test); their rows differ by last bits, which
+  // later groups' RTN codes amplify. The control measures that
+  // amplification: per window, the real path may depart from the fake one
+  // by at most ten times the control's departure (p95 and max), and agree
+  // on top-1 no worse than the control by more than one step in 100.
+  for (const auto [from, to] : {std::pair{256U, 384U}, std::pair{384U, 512U},
+                                std::pair{512U, kPrompt}}) {
+    const auto real_fake = summary(&Step::fake_real, from, to);
+    const auto fake_control = summary(&Step::fake_control, from, to);
+    for (const std::size_t q : {1U, 2U})
+      Expect(real_fake[q] <= 10 * std::max(fake_control[q], 1e-6),
+             name +
+                 ": real KVarN departs from K0 fake quant beyond the "
+                 "rounding control at positions " +
+                 std::to_string(from) + "-" + std::to_string(to - 1));
+  }
+  Expect(real_fake_agree * 100 + steps.size() >= control_agree * 100,
+         name + ": real and fake KVarN disagree on top-1 beyond the control");
 
   // Verification rows against scalar decoding of the same tokens.
   kvarn.SaveState(kPrompt);
