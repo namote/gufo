@@ -138,3 +138,10 @@ K1a·K1b 결과와 감독 판정은 [KVarN](KVARN.md) "K1a·K1b 결과"에 있�
 - fp16 실행은 이전 T2 기준과 텍스트 동일이어야 한다(회귀 확인).
 - kvarn에서 cache 끈 재요청과의 텍스트 동일(같은 형식 안 동일성)도 확인한다.
 - 보고 뒤 멈춘다. 기본값 전환(K2-3)은 감독 검증 뒤 따로 지시한다.
+
+### K2-3: Qwen 27B 기본값 k4v2 (2026-10-26, K2 gate 통과, 사용자 사전 결정 "기본값은 K2 gate 통과 시 k4v2")
+
+- `DefaultKvCacheType`에서 Qwen 27B(모든 실행 경로: prompt·chat·bench·serve, DFlash2·AR)만 kvarn-k4v2로. 다른 모델과 Qwen CPU 경로는 그대로. 별칭·새 옵션 없음.
+- fp16 동일성을 보는 테스트·도구·창 계획(K1·F 계열, target·backend·continuation 테스트, `qwen27b_kvarn_k0` 기준 실행 등)은 기본값에 기대지 말고 `--kv-cache-type fp16`(또는 policy)을 명시한다. 기본값을 쓰는 테스트는 k4v2로 기대값을 바꾸되 fp16 기준과 비교하는 테스트는 fp16을 명시한다.
+- 문서(CLI.md·SERVER.md·모델 README, 출력 동일 주장)를 고친다. CHANGELOG·버전은 건드리지 않는다.
+- 확인: CPU `check-pr`, `qwen27b.cli-options`, kv-cache-type 테스트. GPU 창 하나: 옵션 없이 `gufo bench` AR·DFlash2 `-d 0,32768` 1회가 k4v2로 돌고(K1d 수치와 같은 수준), `--kv-cache-type fp16` 명시 1회가 K1d fp16 수치와 같은 수준, 옵션 없는 serve 짧은 요청 하나의 timings가 kvarn-k4v2/3인지, fp16 동일성 테스트 3종 PASS.

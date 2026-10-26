@@ -269,6 +269,13 @@ fake quant는 FP16 커널을 그대로 쓰므로 속도를 재지 못한다. 그
 - 창 `kvarn-k1e-a02/k1e-gate` COMPLETE·health PASS(decode 테스트 SHA `d2b5183f…`, 단위 `92cff458…`): k4v2 256–383 real 8.17e-5 대 control_k 7.47e-5(새 비율 p95 1.09, max 0.37; 이전 비율 10.95). 모든 창·두 형식 통과, 가장 큰 새 비율은 k4v4 512–635 max 1.59. verify = decode exact=1 max_abs 0.
 - 남은 한계: 커널 안 FP16 q·P 반올림은 `control_k`가 흉내 내지 못한다.
 
+### K2 결과 (2026-10-26, gufo `ee00b659`…`1865ef63`, 감독 검증)
+
+- 형식: 주의 층마다 row component `kKvarnRecords`(layout_version 3 = k4v2, 4 = k4v4; 토큰당 840 / 1,096 B, chunk = 풀 블록 하나의 record 바이트라 기존 블록 전송·CoW 그대로) + private `kKvarnRows`(header 64 B + 모든 층 FP16 sink·tail ring, 24 MiB). fp16 component는 버전·바이트 그대로. compact snapshot(`SerializeCompact`)은 아직 kvarn 거절(서빙·디스크는 쓰지 않음).
+- 풀: `SizeQwenKvPool`, 같은 `--kv-pool-bytes`에 k4v2 약 4.9배, k4v4 3.7배 토큰. timings `component_cache`에 `kv_cache_type`·`kv_layout_version`.
+- 창 `kvarn-k2-a01`(복원 바이트 일치·exact logits, fp16 continuation·DFlash2·backend 회귀 PASS). 첫 T2(`kvarn-k2-t2-a01`)에서 record가 블록 경계에 끝날 때 뒤 블록이 매핑되지 않아 RAM 복원 실패(D 팔로워 TTFT 12.4 s) → `1865ef63`에서 고침, 창 `kvarn-k2-a02`에 고치기 전 바이너리 실패·고친 뒤 통과 기록.
+- **T2 `kvarn-k2-t2-a02`(이미지 `1865ef63`, fp16 → k4v2 → fp16) 통과**, 감독이 RESULT.json에서 직접 대조: 세 창 COMPLETE·health PASS, 21요청 gold 정답(이미지 2건 "4827"), k4v2 텍스트가 fp16과 21/21 같음(차이 0), fp16 두 창이 `final-f20-a01`과 21/21 같음, restore_failed 0. 재사용 토큰 세 창 동일(B 1,253, C 1,499, D 4,930, F 1,499). TTFT는 같은 수준(D 리더 10.09 / 10.24 / 10.19 s, 단일 실행이라 미결). DFlash2 수락 k4v2 3,147/3,271(0.962), fp16 3,146/3,280(0.959). KV 풀 4.0 → 0.82 GiB, 디스크 cache 9.87 → 9.39 GiB, cgroup 최대 18.61 GiB 동일. RAM cache `byte_capacity` 거절 5 → 8(checkpoint마다 FP16 tail 24 MiB), 재사용 수 변화 없음.
+
 ### K0에서 정하지 않는 것
 
 - 커널·서빙·checkpoint 형식(K1·K2). 추가가 필요한 것만 적어 둔다: storage enum 값과 policy fingerprint 비트, K/V component `layout_version` 3(새 row_bytes와 128토큰 scale plane), compact snapshot 검증 완화, 블록 풀의 scale plane(`KvBlockPlane::rows_per_block` 128은 이미 표현 가능하나 arena·adapter가 같은 두 plane을 가정한다).
