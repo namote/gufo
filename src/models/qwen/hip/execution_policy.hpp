@@ -103,25 +103,12 @@ struct QwenExecutionPolicy {
 }
 
 /// Why a continuation layout (the prefix cache, checkpoints and the server
-/// built on them) cannot hold `policy`'s state; empty when it can. KVarN
-/// rows have no checkpoint format yet.
+/// built on them) cannot hold `policy`'s state; empty when it can. Every
+/// executable storage has one: KVarN keeps its group records as rows and
+/// its FP16 sink and tail as private state (continuation_layout.cpp).
 [[nodiscard]] constexpr std::string_view QwenContinuationUnsupportedReason(
     const QwenExecutionPolicy& policy) noexcept {
-  if (const auto reason = QwenExecutionPolicyUnsupportedReason(policy);
-      !reason.empty())
-    return reason;
-  switch (policy.kv_cache_storage) {
-    case QwenKvCacheStorage::kKvarnK4V2:
-      return "continuation and checkpoints of --kv-cache-type kvarn-k4v2 "
-             "(the HTTP server's prefix cache) are not implemented yet for "
-             "Qwen3.8-27B";
-    case QwenKvCacheStorage::kKvarnK4V4:
-      return "continuation and checkpoints of --kv-cache-type kvarn-k4v4 "
-             "(the HTTP server's prefix cache) are not implemented yet for "
-             "Qwen3.8-27B";
-    default:
-      return {};
-  }
+  return QwenExecutionPolicyUnsupportedReason(policy);
 }
 
 /// Resolved route decisions for one layer invocation. This record is pure data

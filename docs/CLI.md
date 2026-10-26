@@ -40,9 +40,9 @@ The supported model types are LLM, image, video, audio (TTS, ASR), and text embe
   A model takes an explicit value only when it stores KV that way. Unset,
   each model keeps its default: `fp16` on Qwen3.8-27B and Flash-Next, FP8 on
   DeepSeek V4 Flash. `kvarn-k4v2` and `kvarn-k4v4` (KVarN: 4-bit keys with
-  2- or 4-bit values) run on Qwen3.8-27B in `prompt`, `chat` and `bench`;
-  `serve llm` refuses them until KVarN checkpoints exist, because its prefix
-  cache stores continuations. Flash-Next accepts only `fp16`; DeepSeek V4
+  2- or 4-bit values) run on Qwen3.8-27B in `serve llm`, `prompt`, `chat`
+  and `bench`; the prefix cache keeps KVarN group records and the FP16 sink
+  and tail as their own component formats. Flash-Next accepts only `fp16`; DeepSeek V4
   Flash and Qwen's `--cpu` route (FP32 KV) refuse any value, naming the
   model. Nothing falls back to another type silently.
 - `prefillChunk` — prompt tokens processed between active decode steps in

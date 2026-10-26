@@ -37,12 +37,9 @@ int main() {
     assert(!kvarn.UsesFp16AttentionKv());
     assert(kvarn.Fingerprint() != production.Fingerprint());
     assert(kvarn.Fingerprint() != fp32_kv.Fingerprint());
-    // Executors run KVarN; continuations and checkpoints refuse it by name.
+    // Executors, continuations and checkpoints hold KVarN.
     assert(QwenExecutionPolicyUnsupportedReason(kvarn).empty());
-    const auto reason = QwenContinuationUnsupportedReason(kvarn);
-    assert(reason.find("not implemented yet") != std::string_view::npos);
-    assert(reason.find(QwenKvCacheStorageName(kvarn.kv_cache_storage)) !=
-           std::string_view::npos);
+    assert(QwenContinuationUnsupportedReason(kvarn).empty());
   }
   assert(k4v2.Fingerprint() != k4v4.Fingerprint());
   assert(QwenExecutionPolicyUnsupportedReason(production).empty());

@@ -139,16 +139,11 @@ void TestRefusals() {
     std::string error;
     Expect(Resolve("qwen35", type, &accepted, &error) == type && accepted,
            "Qwen3.8-27B accepts KVarN at startup");
-    // The executor runs it; the server's prefix cache refuses it by name
-    // until KVarN checkpoints exist.
+    // The executor and the server's prefix cache both hold it.
     const auto policy = gufo::cli::QwenExecutionPolicyFor(type);
-    Expect(gufo::hip::QwenExecutionPolicyUnsupportedReason(policy).empty(),
-           "the executor runs KVarN");
-    const auto reason = gufo::hip::QwenContinuationUnsupportedReason(policy);
-    Expect(reason.find("not implemented yet") != std::string_view::npos &&
-               reason.find(gufo::cli::KvCacheTypeName(type)) !=
-                   std::string_view::npos,
-           "the continuation layout refuses KVarN by name");
+    Expect(gufo::hip::QwenExecutionPolicyUnsupportedReason(policy).empty() &&
+               gufo::hip::QwenContinuationUnsupportedReason(policy).empty(),
+           "KVarN runs and continues");
   }
 }
 
