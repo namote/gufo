@@ -527,13 +527,10 @@ public:
   /// whose layers quantize their own complete groups.
   KvarnPrefillPlan PrepareKvarnPrefill(std::uint32_t start, std::uint32_t rows,
                                        hipStream_t pass_stream);
-  /// Staging for `layer` of a prompt chunk: one of two buffers whose
-  /// quantization runs on a side stream; the pass stream first waits until
-  /// the layer two before has finished with it.
-  [[nodiscard]] KvarnStaging GetKvarnStaging(std::uint32_t layer,
-                                             hipStream_t pass_stream);
-  /// After a prompt chunk: the pass stream waits for its quantization.
-  void FinishKvarnPrefill(hipStream_t pass_stream);
+  /// Per-layer staging rows of a prompt chunk (KvarnStagingRows).
+  [[nodiscard]] std::span<std::uint16_t> GetKvarnStaging() const noexcept {
+    return {kvarn_.d_staging, kvarn_.staging_elements};
+  }
   [[nodiscard]] QwenRecurrentStateStorage GetRecurrentStateStorage()
       const noexcept {
     return policy_.recurrent_state_storage;
@@ -608,9 +605,6 @@ private:
     std::uint16_t* d_staging{nullptr};
     std::size_t staging_elements{0};
     unsigned* d_counters{nullptr};
-    hipStream_t quantize_stream{nullptr};
-    std::array<hipEvent_t, 2> staged{};
-    std::array<hipEvent_t, 2> quantized{};
     KvarnTail tail;
   };
   KvarnStorage kvarn_;

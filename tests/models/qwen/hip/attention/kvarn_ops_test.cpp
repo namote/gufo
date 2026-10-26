@@ -752,18 +752,8 @@ void TestPrefill(int bits, unsigned start, unsigned rows) {
   const std::size_t padded = (length + 15U) & ~std::size_t{15};
   DeviceBuffer<float> packed_k(std::size_t{kKvHeads} * length * kDim / 2 + 64);
   DeviceBuffer<float> packed_v(std::size_t{kKvHeads} * padded * kDim / 2 + 64);
-  // One staging buffer per layer, quantized on a side stream as the arena
-  // does.
-  const std::size_t staging_elements =
-      2 * gufo::hip::KvarnStagingRows(rows) * kRowWidth;
-  DeviceBuffer<std::uint16_t> staging(kLayers * staging_elements);
-  hipStream_t side = nullptr;
-  HIP_CHECK(hipStreamCreateWithFlags(&side, hipStreamNonBlocking));
-  hipEvent_t ready[kLayers], done[kLayers];
-  for (unsigned layer = 0; layer < kLayers; ++layer) {
-    HIP_CHECK(hipEventCreateWithFlags(&ready[layer], hipEventDisableTiming));
-    HIP_CHECK(hipEventCreateWithFlags(&done[layer], hipEventDisableTiming));
-  }
+  DeviceBuffer<std::uint16_t> staging(2 * gufo::hip::KvarnStagingRows(rows) *
+                                      kRowWidth);
   // The history as the chunk reads it, captured before the chunk stores.
   HIP_CHECK(hipDeviceSynchronize());
   const auto records = prefill.records.CopyToHost();
@@ -775,21 +765,8 @@ void TestPrefill(int bits, unsigned start, unsigned rows) {
         v.data() + std::size_t{start} * kRowWidth, dgate.data(), prefill.View(),
         out.data(), layer, start, rows, plan,
         {packed_k.data(), packed_k.size()}, {packed_v.data(), packed_v.size()},
-        gufo::hip::KvarnStaging{
-            .rows = {staging.data() + layer * staging_elements,
-                     staging_elements},
-            .quantize_stream = side,
-            .ready = ready[layer],
-            .done = done[layer]},
-        0, nullptr);
-  for (unsigned layer = 0; layer < kLayers; ++layer)
-    HIP_CHECK(hipStreamWaitEvent(nullptr, done[layer], 0));
+        {staging.data(), staging.size()}, 0, nullptr);
   HIP_CHECK(hipDeviceSynchronize());
-  for (unsigned layer = 0; layer < kLayers; ++layer) {
-    HIP_CHECK(hipEventDestroy(ready[layer]));
-    HIP_CHECK(hipEventDestroy(done[layer]));
-  }
-  HIP_CHECK(hipStreamDestroy(side));
   tail.flushed_end = plan.flushed_end;
   tail.written_end = length;
 

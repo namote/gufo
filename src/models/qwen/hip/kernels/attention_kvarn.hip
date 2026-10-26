@@ -1539,12 +1539,15 @@ void LaunchKvarnPassAttention(const float* q, const float* k, const float* v,
         rows - split, plan.read_groups + 1, 0, scratch, stream);
 }
 
-void LaunchKvarnPrefillAttention(
-    const float* q, const float* k, const float* v, const float* gate,
-    const KvarnKvView& kv, float* out_context, std::uint32_t layer,
-    std::uint32_t start, std::uint32_t rows, const KvarnPrefillPlan& plan,
-    std::span<float> packed_k_workspace, std::span<float> packed_v_workspace,
-    const KvarnStaging& staging, std::size_t first_query, hipStream_t stream) {
+void LaunchKvarnPrefillAttention(const float* q, const float* k, const float* v,
+                                 const float* gate, const KvarnKvView& kv,
+                                 float* out_context, std::uint32_t layer,
+                                 std::uint32_t start, std::uint32_t rows,
+                                 const KvarnPrefillPlan& plan,
+                                 std::span<float> packed_k_workspace,
+                                 std::span<float> packed_v_workspace,
+                                 std::span<std::uint16_t> staging,
+                                 std::size_t first_query, hipStream_t stream) {
   if (rows == 0)
     return;
   const std::uint32_t length = start + rows;
@@ -1558,7 +1561,7 @@ void LaunchKvarnPrefillAttention(
        packed_v_workspace.size_bytes() / value_head_bytes}));
   if (heads_per_group == 0)
     throw std::length_error("KVarN prefill workspace holds no KV head");
-  if (staging.rows.size() < 2 * KvarnStagingRows(rows) * kRowWidth)
+  if (staging.size() < 2 * KvarnStagingRows(rows) * kRowWidth)
     throw std::length_error("KVarN prefill staging is too small");
   detail::EmitAttentionDispatch(kv.value_bits == 2 ? "prefill_wmma_kvarn_k4v2"
                                                    : "prefill_wmma_kvarn_k4v4",
@@ -1608,7 +1611,7 @@ void LaunchKvarnPrefillAttention(
   // Staging holds positions [target, end): the ring's rows before the chunk
   // (one partial group, consecutive in the ring), then the chunk's own.
   const std::uint32_t target = plan.target;
-  auto* staging_k = reinterpret_cast<__half*>(staging.rows.data());
+  auto* staging_k = reinterpret_cast<__half*>(staging.data());
   auto* staging_v = staging_k + KvarnStagingRows(rows) * kRowWidth;
   auto* ring_k = static_cast<__half*>(kv.k_rows) + layer * kFp16LayerElements;
   auto* ring_v = static_cast<__half*>(kv.v_rows) + layer * kFp16LayerElements;
@@ -1633,22 +1636,14 @@ void LaunchKvarnPrefillAttention(
     const dim3 grid(kKvHeads, (complete_end - target) >> kKvarnGroupShift, 2);
     std::uint8_t* records = kv.records + layer * kv.records_layer_pitch;
     const unsigned first_group = target >> kKvarnGroupShift;
-    hipStream_t quantize = stream;
-    if (staging.quantize_stream != nullptr) {
-      HIP_CHECK(hipEventRecord(staging.ready, stream));
-      HIP_CHECK(hipStreamWaitEvent(staging.quantize_stream, staging.ready, 0));
-      quantize = staging.quantize_stream;
-    }
     if (kv.value_bits == 2)
-      KvarnQuantizeKernel<2><<<grid, 512, 0, quantize>>>(
+      KvarnQuantizeKernel<2><<<grid, 512, 0, stream>>>(
           staging_k, staging_v, records, kv.records_layer_pitch, kv.blocks,
           first_group, 0, target);
     else
-      KvarnQuantizeKernel<4><<<grid, 512, 0, quantize>>>(
+      KvarnQuantizeKernel<4><<<grid, 512, 0, stream>>>(
           staging_k, staging_v, records, kv.records_layer_pitch, kv.blocks,
           first_group, 0, target);
-    if (staging.quantize_stream != nullptr)
-      HIP_CHECK(hipEventRecord(staging.done, staging.quantize_stream));
   }
   // The incomplete group stays FP16 in the ring.
   const std::uint32_t leftover = std::max(target, complete_end);
