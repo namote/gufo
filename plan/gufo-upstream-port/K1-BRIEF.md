@@ -82,3 +82,11 @@ K1a·K1b 결과와 감독 판정은 [KVarN](KVARN.md) "K1a·K1b 결과"에 있�
 - **저장 배치 결론 필수:** 배치를 바꿔야 하는지, 바꾸면 무엇을. K2(checkpoint 형식)와 K1c 통합 전에 반영해야 한다.
 - **GPU:** 창 실행기로만, 한 번에 하나. K1c 에이전트와 번갈아 쓴다: `docker ps`와 lock(`~/projects/ai.tools/storage/runtime/experiments/vllm-multi-selected-20261016/ABBA-OWNER.lock`)이 잡혀 있으면 기다렸다가 나중에 시작한다(시작 전 lock 거절은 실패한 실행이 아니다). 창 전에 `.gufo-revision`을 HEAD로, 창 끝에 `/bin/sleep 20`. 실패하면 자동 재시도하지 않고 기록을 남긴다.
 - **보고:** 후보별 결과(채택·기각과 이유), 추천 조합, 배치 변경 필요 여부, 정확도 표, 깊이×형식×질의 속도 표(K1b 대비), 남은 병목, 다음 후보 제안(양자화 커널 튜닝: double 분산·spill, FP16 verify 기준 커널 개선).
+
+### K1b-opt2: verify에도 K 접기 (2026-10-26 사용자: "verify에도 K 접기를 넣기 시도해보자")
+
+- 목표: `opt_latev`의 K scale 접기를 verify(질의 1–8)에도 넣고, **같은 위치의 verify 행과 1행 decode가 비트 단위로 같은 산술**이 되게 한다(greedy DFlash2 = AR, K1c 미해결 B와 같은 요구). bench에 같은 위치·같은 KV에서 AR 결과와 verify 각 행 결과의 비트 비교 check를 넣는다.
+- 지난 보고의 걸림돌(LDS에 q 두 벌 + 48행 보정)을 풀 후보: 보정을 WMMA로, q를 레지스터에 압축 유지, 행 묶음 크기 조정 등. 한 후보에 매달리지 않는다.
+- 같은 바이너리에서 비교: K1b, `opt_latev`, 새 커널, 그리고 **공통 최적화만(K 접기 없음) 쓴 AR**. 깊이 4K–256K, 질의 1·8, 바이트 하한 대비 %, 명령 구성.
+- 안 되면: 증거와 함께 보고하고, 비트 일치를 지키는 최선 조합(공통 최적화만)의 속도를 낸다.
+- 경계·GPU 규칙은 K1b-opt와 같다(K1c 에이전트가 같은 트리·GPU를 쓴다).
