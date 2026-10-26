@@ -558,6 +558,11 @@ __device__ __forceinline__ void Pin(v8f (&acc)[N]) {
 
 template<int VBits, unsigned Rows>
 __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
+  // No implicit contraction: which product of a sum the compiler fuses may
+  // differ between row-count instances, and a verification row must add
+  // exactly what a decode step at its position adds. Fused steps are
+  // explicit fmaf.
+#pragma clang fp contract(off)
   using R = Record<VBits>;
   constexpr unsigned M = kGqa * Rows, MT = (M + 15) / 16, MR = MT * 16;
   constexpr unsigned kQStride = kDim + 8, kPStride = kGroup + 8;
@@ -668,7 +673,7 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
               *reinterpret_cast<const float4*>(&wave_psum[row][4]);
           const float s =
               ((s0.x + s0.y) + (s0.z + s0.w)) + ((s1.x + s1.y) + (s1.z + s1.w));
-          row_sum[row] = row_sum[row] * row_alpha[row] + s;
+          row_sum[row] = fmaf(row_sum[row], row_alpha[row], s);
         }
   };
   // Loops over k steps, fully unrolled for register-held codes, rolled for
@@ -725,7 +730,7 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
           const float zero =
               ((z0.x + z0.y) + (z0.z + z0.w)) + ((z1.x + z1.y) + (z1.z + z1.w));
           out[mt][t][i] =
-              row_alpha[row] * out[mt][t][i] + column[t] * (g[mt][i] + zero);
+              fmaf(column[t], g[mt][i] + zero, row_alpha[row] * out[mt][t][i]);
         }
     }
   };

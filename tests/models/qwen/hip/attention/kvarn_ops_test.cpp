@@ -239,15 +239,23 @@ std::vector<double> Attention(
     const std::vector<float>& q, const std::vector<float>& gate, unsigned rows,
     unsigned length, bool rotate,
     const std::function<const float*(unsigned, unsigned)>& key,
-    const std::function<const float*(unsigned, unsigned)>& value) {
+    const std::function<const float*(unsigned, unsigned)>& value,
+    bool round_q = false) {
   std::vector<double> out(static_cast<std::size_t>(rows) * kHeads * kDim);
   ParallelFor(rows * kHeads, [&](std::size_t index) {
     const unsigned r = index / kHeads, head = index % kHeads, kv = head / kGqa;
     double qv[kDim];
     for (unsigned d = 0; d < kDim; ++d)
       qv[d] = q[index * kDim + d];
-    if (rotate)
+    if (rotate || round_q)
       HadamardDouble(qv);
+    if (round_q) {
+      // The kernel's FP16 query in the rotated frame.
+      for (unsigned d = 0; d < kDim; ++d)
+        qv[d] = kvarn::RoundHalf(static_cast<float>(qv[d]));
+      if (!rotate)
+        HadamardDouble(qv);
+    }
     const unsigned last = length - rows + r;
     std::vector<double> s(last + 1);
     double mx = -INFINITY;
@@ -520,6 +528,12 @@ void TestAttention(int bits, unsigned groups, unsigned tail, unsigned rows,
       q, gate, rows, length, true,
       [&](unsigned t, unsigned kv) { return row_of(kf, kq, t, kv); },
       [&](unsigned t, unsigned kv) { return row_of(vf, vq, t, kv); });
+  // The same with the query rounded to FP16 as the kernel holds it: how
+  // much of the kernel's error that rounding explains.
+  const auto ref_q16 = Attention(
+      q, gate, rows, length, true,
+      [&](unsigned t, unsigned kv) { return row_of(kf, kq, t, kv); },
+      [&](unsigned t, unsigned kv) { return row_of(vf, vq, t, kv); }, true);
 
   const unsigned used_splits =
       splits != 0 ? splits : gufo::hip::SelectKvarnDecodeSplits(groups, bits);
@@ -540,9 +554,10 @@ void TestAttention(int bits, unsigned groups, unsigned tail, unsigned rows,
   char line[256];
   std::snprintf(line, sizeof(line),
                 "attention k4v%d groups=%u tail=%u length=%u rows=%u "
-                "splits=%u%s rel=%.3e",
+                "splits=%u%s rel=%.3e rel_vs_q16_ref=%.3e",
                 bits, groups, tail, length, rows, used_splits,
-                device_position ? " device" : "", error);
+                device_position ? " device" : "", error,
+                RelativeError(got, ref_q16));
   Check(error < 2e-3, line);
 }
 
@@ -614,6 +629,15 @@ void TestEndToEnd(int bits, unsigned length, unsigned rows) {
       [&](unsigned t, unsigned kv) {
         return vf.data() + (std::size_t{t} * kKvHeads + kv) * kDim;
       });
+  const auto ref_q16 = Attention(
+      q, gate, rows, length, false,
+      [&](unsigned t, unsigned kv) {
+        return kf.data() + (std::size_t{t} * kKvHeads + kv) * kDim;
+      },
+      [&](unsigned t, unsigned kv) {
+        return vf.data() + (std::size_t{t} * kKvHeads + kv) * kDim;
+      },
+      true);
   DeviceBuffer<float> dq(q), dgate(gate), out(q.size());
   DeviceBuffer<float> scratch(gufo::hip::KvarnScratchElements(
       rows, gufo::hip::SelectKvarnDecodeSplits(groups, bits)));
@@ -622,12 +646,13 @@ void TestEndToEnd(int bits, unsigned length, unsigned rows) {
       length - rows, rows, groups, 0, {scratch.data(), scratch.size()},
       nullptr);
   HIP_CHECK(hipDeviceSynchronize());
-  const double error = RelativeError(out.CopyToHost(), ref);
+  const auto got = out.CopyToHost();
+  const double error = RelativeError(got, ref);
   char line[256];
   std::snprintf(line, sizeof(line),
                 "end-to-end k4v%d length=%u groups=%u rows=%u "
-                "vs_k0_fake_quant_rel=%.3e",
-                bits, length, groups, rows, error);
+                "vs_k0_fake_quant_rel=%.3e vs_q16_k0_fake_quant_rel=%.3e",
+                bits, length, groups, rows, error, RelativeError(got, ref_q16));
   Check(error < 3e-3, line);
 }
 
@@ -679,6 +704,7 @@ void TestVerifyMatchesDecode(int bits, unsigned start, unsigned rows) {
   const auto decoded = decode_out.CopyToHost();
   unsigned differing_rows = 0;
   float max_abs = 0;
+  std::string which;
   for (unsigned r = 0; r < rows; ++r) {
     bool same = true;
     for (std::size_t i = r * width; i < (r + 1) * width; ++i) {
@@ -687,12 +713,15 @@ void TestVerifyMatchesDecode(int bits, unsigned start, unsigned rows) {
       max_abs = std::max(max_abs, std::abs(verified[i] - decoded[i]));
     }
     differing_rows += !same;
+    if (!same)
+      which += " " + std::to_string(r);
   }
-  char line[256];
+  char line[320];
   std::snprintf(line, sizeof(line),
                 "verify==decode k4v%d start=%u rows=%u boundary=%u "
-                "differing_rows=%u max_abs=%.3e",
-                bits, start, rows, plan.boundary, differing_rows, max_abs);
+                "differing_rows=%u [%s ] max_abs=%.3e",
+                bits, start, rows, plan.boundary, differing_rows, which.c_str(),
+                max_abs);
   Check(differing_rows == 0, line);
 }
 
