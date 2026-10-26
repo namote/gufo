@@ -251,6 +251,17 @@ fake quant는 FP16 커널을 그대로 쓰므로 속도를 재지 못한다. 그
 - 속도(층 하나 µs, k4v2 `common`, 괄호는 K1b): AR 4K 34.3(42.4), 32K 142.4(183.6, 하한 83 %), 64K 269(329), 256K 1,009(1,238, 92 %); verify 4K 88.6(104.1), 32K 391(449), 256K 2,911(3,243). K1b 대비 AR 1.24–1.29배, verify 1.11–1.17배.
 - 운영(K1c)이 지킬 규칙: 저장 배치 그대로, tail PV 쌍 펼치기와 64토큰 tail 블록, K 접기 없음(또는 모든 행 같은 타일), 명시적 FMA, split은 그룹 수로만. 운영 FP16 verify 커널이 WMMA를 쓰면 같은 위험이 있을 수 있다(미확인, 지금 FP16 verify = decode 테스트는 통과).
 
+### K1d 결과 (2026-10-26, gufo `c3d8e116`…`a9f9fa0f`, 감독 검증)
+
+- 창 `kvarn-k1d-a06/k1d-32k` **FAILED**(health PASS): decode 테스트의 real‖fake 게이트 하나만 빨강. 나머지(단위 verify = decode 비트 일치, block table, `qwen27b_target_test`, `inference_backend_gpu_test`, K0 `--real` 32K, bench 12회)는 PASS. a01·a02 FAILED(같은 게이트), a03–a05 COMPLETE(프로파일·A/B) 기록 보존. .gufo-revision = `a9f9fa0f`, 감독이 HEAD에서 다시 빌드한 `gufo` SHA `cf45c826…`가 bench 바이너리와 같다.
+- `common` 이식: 저장 배치 그대로, K 접기 없음. 운영 차이는 sink를 64토큰 블록 둘로 펼친 것(질의가 128 안에 있을 수 있음), arena별 도착 카운터, tail 블록 수를 host 위치에서 받는 것(128 미만 graph capture 유지). K1c-1의 FP16 split 행 하나씩 우회는 제거. verify = decode: 단위 10/10, 모델 exact=1 max_abs 0(두 형식).
+- 운영 FP16 decode·verify 커널은 WMMA를 쓰지 않는 스칼라 FP32라 k 쌍 위험 해당 없음(보고만).
+- 층 하나 µs(k4v2, K1c-2 → K1d): 질의 1 4K 42.4→35.5, 32K 169→150, 64K 313→285, 256K 1,152→1,035; 질의 8 32K 477→401, 256K 3,165→2,861. k4v4 32K 질의 1 211→180.
+- 끝단 32K(2회 교대 평균, 감독이 로그에서 재계산; 괄호 K1c-2): fp16 → k4v2 AR pp512 d0 480.9 → 471.1(−2.0 %, 이전 −4.4 %), AR tg64 @32K 11.45 → 12.56(12.48), pp512 @32K 322 → 368.8, DFlash2 tg64 @32K 55.3 → 66.5(+20 %), DFlash2 pp512 d0 454 → 448.6(−1.2 %). k4v4는 k4v2와 거의 같다(DFlash2 tg @32K 66.9).
+- 짧은 prefill 원인(rocprofv3): prompt group quantizer가 층 launch당 2.6 ms, FP64(double std·log/exp) 지연. 균형 scale 갱신을 값마다 한 번으로 공유해 flush 1,168 → 656 µs/층·그룹(K0 기준 128/128 타일 비트 일치). 별도 stream 겹치기는 경합으로 더 나빠 되돌림(a05: fp16 495.1, pass stream 484.2, side stream 472.6). 남은 −2.0 %는 quantizer 자체 일; 다음 후보는 FP64 없는 정확한 reduction이나 층 묶음 launch.
+- K0 `--real` 32K: top-1 214/214, real·fake free text 동일. fp16 대비 KL max real k4v2 8.2e-3(fake 1.4e-2), k4v4 3.5e-4(fake 5.4e-4).
+- **게이트 실패 내용**: k4v2 첫 양자화 창(위치 256–383) fake‖real p95 8.17e-5, 통제(반올림 1회) 7.46e-6의 10.9배(기준 10배). K1c-2에서는 7.20e-5(9.6배)였다. 같은 창 max는 4.35e-4 → 1.73e-4로 줄었고, fp16‖real p95 1.04e-2 → 1.06e-2로 fake(1.26e-2)보다 여전히 낮다. 뒤 두 창·전체 bound·k4v4는 통과. 게이트는 넓히지 않았고 결정 대기.
+
 ### K0에서 정하지 않는 것
 
 - 커널·서빙·checkpoint 형식(K1·K2). 추가가 필요한 것만 적어 둔다: storage enum 값과 policy fingerprint 비트, K/V component `layout_version` 3(새 row_bytes와 128토큰 scale plane), compact snapshot 검증 완화, 블록 풀의 scale plane(`KvBlockPlane::rows_per_block` 128은 이미 표현 가능하나 arena·adapter가 같은 두 plane을 가정한다).
