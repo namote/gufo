@@ -276,6 +276,12 @@ fake quant는 FP16 커널을 그대로 쓰므로 속도를 재지 못한다. 그
 - 창 `kvarn-k2-a01`(복원 바이트 일치·exact logits, fp16 continuation·DFlash2·backend 회귀 PASS). 첫 T2(`kvarn-k2-t2-a01`)에서 record가 블록 경계에 끝날 때 뒤 블록이 매핑되지 않아 RAM 복원 실패(D 팔로워 TTFT 12.4 s) → `1865ef63`에서 고침, 창 `kvarn-k2-a02`에 고치기 전 바이너리 실패·고친 뒤 통과 기록.
 - **T2 `kvarn-k2-t2-a02`(이미지 `1865ef63`, fp16 → k4v2 → fp16) 통과**, 감독이 RESULT.json에서 직접 대조: 세 창 COMPLETE·health PASS, 21요청 gold 정답(이미지 2건 "4827"), k4v2 텍스트가 fp16과 21/21 같음(차이 0), fp16 두 창이 `final-f20-a01`과 21/21 같음, restore_failed 0. 재사용 토큰 세 창 동일(B 1,253, C 1,499, D 4,930, F 1,499). TTFT는 같은 수준(D 리더 10.09 / 10.24 / 10.19 s, 단일 실행이라 미결). DFlash2 수락 k4v2 3,147/3,271(0.962), fp16 3,146/3,280(0.959). KV 풀 4.0 → 0.82 GiB, 디스크 cache 9.87 → 9.39 GiB, cgroup 최대 18.61 GiB 동일. RAM cache `byte_capacity` 거절 5 → 8(checkpoint마다 FP16 tail 24 MiB), 재사용 수 변화 없음.
 
+### K2-3 결과 (2026-10-26, gufo `3e252df3`, 감독 검증)
+
+- Qwen3.8-27B 기본값 kvarn-k4v2(prompt·chat·bench·serve, AR·DFlash2). Flash-Next fp16, DeepSeek·Gemma 자기 저장, Qwen `--cpu`는 값 거절 그대로. `gufo bench`가 `KV cache: <type>`을 찍는다. fp16 동일성 GPU 테스트는 `QwenExecutionPolicy::Production()`(fp16)을 써서 기본값과 무관. 이전 revision을 고정한 F·U·K0 계획은 옵션이 없는 바이너리라 그대로(fp16), 새 계획 생성기 `make_plan.py`는 `--kv-cache-type`을 요구.
+- 창 `kvarn-k23-a01`(FAILED: serve probe 요청에 model 이름 누락, probe 버그; 나머지 PASS, 첫 bench는 창 첫 실행이라 차가움) → `kvarn-k23-a02` 해당 항목만 다시 COMPLETE·health PASS. 옵션 없는 AR: pp512 472.9, tg64 12.97, @32K 374.0 / 12.60(K1d k4v2와 같음, `KV cache: kvarn-k4v2`). fp16 명시는 K1d fp16과 같음. 옵션 없는 serve timings `kvarn-k4v2/3`. DFlash2 옵션 없음 d0 pp512 429(K1d 448–450)는 단일 실행·창 두 번째라 미결, @32K tg 66.96은 같음.
+- 동작 변화: 기본값 Qwen 27B 출력이 FP16과 다를 수 있고(T2에서는 같음), cache identity에 형식이 들어가 기존 FP16 checkpoint·디스크 cache는 기본 실행에서 복원되지 않는다(`--kv-cache-type fp16`이면 복원). 커밋은 breaking(`!`)으로 표시하지 않았다(원본 제안 없음).
+
 ### K0에서 정하지 않는 것
 
 - 커널·서빙·checkpoint 형식(K1·K2). 추가가 필요한 것만 적어 둔다: storage enum 값과 policy fingerprint 비트, K/V component `layout_version` 3(새 row_bytes와 128토큰 scale plane), compact snapshot 검증 완화, 블록 풀의 scale plane(`KvBlockPlane::rows_per_block` 128은 이미 표현 가능하나 arena·adapter가 같은 두 plane을 가정한다).
