@@ -145,3 +145,32 @@ K1a·K1b 결과와 감독 판정은 [KVarN](KVARN.md) "K1a·K1b 결과"에 있�
 - fp16 동일성을 보는 테스트·도구·창 계획(K1·F 계열, target·backend·continuation 테스트, `qwen27b_kvarn_k0` 기준 실행 등)은 기본값에 기대지 말고 `--kv-cache-type fp16`(또는 policy)을 명시한다. 기본값을 쓰는 테스트는 k4v2로 기대값을 바꾸되 fp16 기준과 비교하는 테스트는 fp16을 명시한다.
 - 문서(CLI.md·SERVER.md·모델 README, 출력 동일 주장)를 고친다. CHANGELOG·버전은 건드리지 않는다.
 - 확인: CPU `check-pr`, `qwen27b.cli-options`, kv-cache-type 테스트. GPU 창 하나: 옵션 없이 `gufo bench` AR·DFlash2 `-d 0,32768` 1회가 k4v2로 돌고(K1d 수치와 같은 수준), `--kv-cache-type fp16` 명시 1회가 K1d fp16 수치와 같은 수준, 옵션 없는 serve 짧은 요청 하나의 timings가 kvarn-k4v2/3인지, fp16 동일성 테스트 3종 PASS.
+
+## K4: 남은 한계와 개선 (2026-10-26 사용자: "남은 한계와 개선부터 진행하자", K3 전)
+
+근거는 KVARN.md "K1b-opt 결과"(남은 병목), "K1c-1 미해결 수정과 K1c-2 결과"(남은 문제), "K1d 결과", "K2 결과", "K2-3 결과". 기본값이 이미 k4v2이므로 모든 개선은 k4v2·k4v4 둘 다, fp16 경로 바이트·동작 그대로. 두 에이전트가 병행한다: **K4-P**(커널·prefill, `kernels/attention_kvarn.hip`·prefill·quantizer 쪽)와 **K4-C**(checkpoint·continuation·snapshot 쪽). 서로의 파일을 고치지 않는다. 겹쳐야 하면 감독에게 먼저 말한다. GPU 창은 번갈아(`docker ps`와 소유 lock 확인).
+
+### K4-P1: 짧은 prompt prefill 손해 (우선)
+
+- 지금 k4v2 pp512 d0가 fp16보다 −2.0 %(AR), DFlash2 d0 단일 실행 429 대 448–450(K2-3, 미결). 원인은 prompt group quantizer(FP64 지연, 층 launch 16번이 차례로).
+- 후보: 층 16개(또는 chunk 안 모든 층·그룹)를 launch 하나로 묶어 병렬도를 늘리기, FP64 없이 K0 규칙과 비트 같은 reduction, 회전 launch 합치기, 양자화 커널 spill 줄이기. 별도 stream 겹치기는 K1d에서 경합으로 기각.
+- 기준: 양자화 결과가 K0 참고와 비트 일치(128/128 타일, 두 형식), verify = decode exact 유지. pp512 d0 AR·DFlash2 fp16 대비 손해가 측정 잡음 안(10회 × 3 교대, fp16 ↔ k4v2, 같은 창). 32K 수치 퇴보 없음.
+
+### K4-P2: 얕은 깊이 decode 고정 비용
+
+- K1b-opt 남은 병목: 4K에서 sink/tail 블록·블록당 그룹 2개 지연·launch(하한 51 %), 32K 마지막 블록 combine 약 8 µs, AR WMMA padding 10/16. 먼저 `tools/bench/kvarn_decode_bench.hip`에서 시제품으로 재고(이 파일은 K4-P만 고친다), 이득이 있는 것만 운영에.
+- 기준: 커널 오차 ≤ 1e-3, verify = decode 비트 일치, 4K–256K 모든 깊이에서 퇴보 없음, % of floor 표.
+
+### K4-C1: checkpoint FP16 tail 크기
+
+- 지금 checkpoint마다 private `kKvarnRows` 24 MiB(모든 층 sink 128 + ring 256 전체). 유효 행만(sink는 position까지, tail은 flushed end부터 position까지) 담도록 바꾼다. layout_version을 올리고 이전 값은 거절(fallback 없음).
+- 기준: 복원 바이트 일치·다음 decode logits exact(경계 경우 포함: position < 128, 그룹 경계, 블록 경계, K2 버그 경우), fp16 회귀 테스트 통과. checkpoint 크기 표(짧은·긴 대화).
+- 확인 창: T2 k4v2 1회로 RAM cache `byte_capacity` 거절 수와 재사용 수를 K2(`kvarn-k2-t2-a02`, k4v2 8회·fp16 5회)와 비교, 텍스트 21/21 그대로.
+
+### K4-C2: compact snapshot
+
+- `SerializeCompact`가 kvarn을 거절한다. 지원하고 왕복 바이트 일치 테스트를 더한다(C1의 유효 행 규칙과 같게).
+
+### 이 단계에서 하지 않는 것
+
+- 256K 끝단·K3 창. 테스트 한계(FP16 q·P 반올림 통제)는 그대로 둔다. 기존 커밋 순서 문제(ee00b659 단독 bisect)는 이력을 다시 쓰지 않는다.
