@@ -290,6 +290,24 @@ fake quant는 FP16 커널을 그대로 쓰므로 속도를 재지 못한다. 그
 - 창 `kvarn-k4c2-a01`(8ec9f20a, FAILED는 `qwen_ssm_ops_test` 하나): 복원 117 component 바이트 일치·다음 decode exact(위치 70, 128, 646, 530 풀, 640, 636+거절 draft), compact 왕복 바이트 일치, fp16 continuation·draft·backend·kv_storage 통과. `qwen_ssm_ops_test`는 arena 생성에서 중단("KV block plane needs layers…", 주의 층 없는 설정) — 메시지 출처 `f8c9df17`이 KVarN 이전(663d50c9 조상)이라 이전부터의 문제로 보임(확인 지시).
 - T2 `kvarn-k4c1-t2-a02` COMPLETE·health PASS, 감독 대조: 21/21 gold·fp16과 텍스트 동일, finish_reason 모두 stop, 서버 오류·restore_failed 0, 재사용 K2와 같음. RAM `byte_capacity` 거절 k4v2 8 → 4(fp16 5), checkpoint당 약 8 MiB 감소, 디스크 cache 9.39 → 9.24 GiB.
 
+### K4-P1 결과 (2026-10-27, gufo `f547c1df`, 감독 검증)
+
+- 원인(프로파일 a01): `KvarnQuantizeKernel` 층 launch당 1,482 µs, 256 VGPR spill, double log·exp 직렬 사슬. pp512 −2 %(약 22 ms) 전부.
+- 변경(같은 thread 배치·저장): 표준편차 float-float(FP64 없음, 한 번 반올림), 나눗셈 역수 + FMA 보정(1.07e9 쌍 IEEE와 0 차이), log·exp는 float-float 급수 + Ziv 검사로 보통 FP64 없이 정확한 반올림(애매하면 double; 입력 범위 모든 float 전수 0 차이), 175 VGPR·spill 0.
+- 비트 일치: 무작위 타일 6,144개 K0 `QuantizeTileCodes`·HEAD 커널과 바이트 동일, flush 128/128, prefill record·row 차이 0, verify = decode exact.
+- quantizer µs/launch(k4v2): decode flush 650 → 222, pp512 chunk 1,207 → 282, 16층×1그룹 4,161 → 1,325, pp4096 7,869 → 2,646.
+- pp512 d0(10회 × 3교대, 감독이 a06 로그에서 평균 재계산): AR fp16 488.4 / k4v2 485.4(−0.6 %), DFlash2 456.2 / 455.2(−0.2 %). 창 a04 −0.85 %, a05(순서 반대) +0.1 %, a08 −0.4 %. 32K 퇴보 없음. **판정: 부분 달성** — AR 약 −0.4 %가 남는다(quantizer 몫 약 4.5–5.3 ms, 기준은 넓히지 않음). DFlash2는 잡음 안. 별도 stream은 다시 기각(a08 476.4).
+- 감독 확인: 에이전트 경로(`/src/build/k4p-src`)에서 `317bf58e`를 다시 빌드한 `gufo` SHA `9c5c5750…` 일치(바이너리에 소스 경로가 들어가 경로가 다르면 SHA가 달라진다).
+- 남은 후보(미측정): 1024-thread 타일 배치, 모든 층 묶은 지연 flush.
+
+### K4-P2 결과 (2026-10-27, gufo `502a7a99`·`317bf58e`, 감독 검증)
+
+- bench: combine 의존 load 줄이기(`common_fc`) 비트 일치지만 이득 ≤ 1 %라 기각. 4K AR에서 양자화 블록만 23.5 µs, FP16 sink·tail 블록만 17.8 µs, 전체 34.4 µs.
+- 운영 split 정책(sweep a12·a13, 두 형식 공통, 그룹 수로만): 그룹 < 24 → 6, < 48 → 8, < 88 → 10, 그 밖 20(이전 최대 38). 이전 후보 6/8/10/18–38은 8K·16K AR에서 느려 교체. verify = decode exact, 8→10 경계(6268) 경우 추가.
+- 층 µs(a14, 이전 → 새): 질의 1 k4v2 2K 26.5 → 24.1, 4K 35.3 → 33.2, 32K 150.2 → 142.1, 256K 1,052 → 1,019; 질의 8 k4v2 4K 94.5 → 74.5(−21 %), 32K 418 → 397, 256K 3,005 → 2,875. 모든 깊이 퇴보 없음(16K k4v4 질의 1 +0.4 %는 반복 퍼짐 안). 끝단은 잡음 수준(AR tg @32K 12.57 → 12.59, DFlash2 65.44 → 65.69).
+- 4K 고정 비용은 여전히 하한의 41–51 %(FP16 sink·tail 블록과 블록 지연, 바꾸지 않음). split 수에 따른 주기적 속도 차(12/14/22 느림, 10/20 빠름) 원인 미확인. `kKvarnMaxSplits` 38은 scratch 상한으로 그대로.
+- 창 a11·a14의 decode 테스트 FAILED는 K4-C `8ec9f20a`가 남긴 "compact snapshots must refuse" 기대 때문(K4-C 창은 continuation 모드만 돌려 놓침) — 수정 지시함. a07은 에이전트 조작 실수로 중단(INCIDENT.txt, 결과 쓰지 않음), a05·a06의 prompt 16K/32K는 `prompt` 문맥 4096 초과.
+
 ### K0에서 정하지 않는 것
 
 - 커널·서빙·checkpoint 형식(K1·K2). 추가가 필요한 것만 적어 둔다: storage enum 값과 policy fingerprint 비트, K/V component `layout_version` 3(새 row_bytes와 128토큰 scale plane), compact snapshot 검증 완화, 블록 풀의 scale plane(`KvBlockPlane::rows_per_block` 128은 이미 표현 가능하나 arena·adapter가 같은 두 plane을 가정한다).
