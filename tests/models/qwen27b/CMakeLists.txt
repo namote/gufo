@@ -17,7 +17,17 @@ add_qwen27b_test(qwen27b_continuation_layout_test continuation_layout_test.cpp
 
 add_qwen27b_test(qwen_mtp_reference_test mtp_reference_test.cpp
   "cpu;mtp;external-model")
+# KVarN K0 study: the C++ fake quantization against the NumPy reference.
+add_executable(qwen27b_kvarn_fake_quant kvarn_fake_quant_cli.cpp)
+add_test(NAME qwen27b.kvarn-reference COMMAND ${Python3_EXECUTABLE}
+  ${PROJECT_SOURCE_DIR}/tools/qwen27b/kvarn.py check
+  $<TARGET_FILE:qwen27b_kvarn_fake_quant>)
+set_tests_properties(qwen27b.kvarn-reference PROPERTIES
+  LABELS "cpu;qwen27b;tools" SKIP_RETURN_CODE 77)
 if (ENGINE_ENABLE_HIP)
+  # KVarN K0 accuracy study; needs a model and prompt files, so no CTest.
+  add_executable(qwen27b_kvarn_k0 kvarn_k0.cpp)
+  target_link_libraries(qwen27b_kvarn_k0 PRIVATE gufo_core)
   add_executable(qwen27b_continuation_adapter_test EXCLUDE_FROM_ALL
     continuation_adapter_test.cpp continuation_fault.cpp)
   target_link_libraries(qwen27b_continuation_adapter_test PRIVATE gufo_core ${CMAKE_DL_LIBS})
