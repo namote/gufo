@@ -642,7 +642,7 @@ int main() {
                Case{254, 133, 1, 0, false},  // 32K, a two-chunk tail
                Case{254, 133, 8, 0, false},
                Case{254, 133, 4, 38, false},
-               Case{254, 0, 7, 0, true},
+               Case{254, 7, 7, 0, true},      // queries start at the tail
                Case{1023, 120, 1, 0, false},  // 128K, the large split
                Case{1023, 120, 8, 0, false},
                Case{2047, 3, 6, 0, false},  // 256K

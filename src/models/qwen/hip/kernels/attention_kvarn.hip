@@ -1087,6 +1087,9 @@ void LaunchKvarnDecodeAttention(const float* q, const float* gate,
     splits = SelectKvarnDecodeSplits(groups, kv.value_bits, rows);
   if (splits > groups || (groups != 0 && splits == 0))
     throw std::invalid_argument("KVarN splits must cover the quantized groups");
+  if (d_pos == nullptr && groups != 0 && start_pos < kGroup * (1 + groups))
+    throw std::invalid_argument(
+        "KVarN queries must not precede the end of the quantized groups");
   if (scratch.size() < KvarnScratchElements(rows, splits))
     throw std::invalid_argument("KVarN attention scratch is too small");
   detail::EmitAttentionDispatch(kv.value_bits == 2
