@@ -5,18 +5,26 @@
 // binary. Head shape: 24 query heads, 4 KV heads (GQA 6), head_dim 256.
 //
 //   tools/bench/build.sh kvarn_decode_bench   # links the wave64 verify TU
-//   /tmp/kvarn_decode_bench [check] [time] [quant]
+//   /tmp/kvarn_decode_bench [check] [time] [quant] [probe]
+//
+// Kernels (kernel=): k1b, the K1b prototype; opt, the K1b-opt candidate
+// (codes ORed into FP16 halves bias + code, K scale folded into q for AR,
+// base-2 softmax, padding rows skipped, splits combined by the last block
+// in AR and by a wave-per-row launch in verification); opt_latev, opt with
+// the AR V codes loaded at the start of their own group (fewer registers,
+// AR k4v4 back to 8 waves/SIMD).
 //
 // check: the GPU quantizer is compared code by code and scale by scale with
-// an emulation of its own reduction order (bit-exact) and with the K0 rules
-// (differences are glibc logf/expf rounding, measured by a device-libm
-// probe); attention is compared with CPU double attention over the GPU's
-// codes (kernel arithmetic) and over the K0 fake-quantized FP16 KV in the
-// original frame. time: AR and eight-row verification against the
-// production FP16 path at 4K-256K, formats in rotating order, buffers
-// cycled past the 32 MiB MALL; quantized splits 18/38 fill whole rounds of
-// resident blocks (4 KV heads x (splits + 2) blocks). quant: one layer, all
-// 16 layers and a 64-group batch of tiles.
+// an emulation of its own reduction order (bit-exact) and with the K0 rules;
+// attention of every kernel is compared with CPU double attention over the
+// GPU's codes (kernel arithmetic, at most 1e-3 relative) and over the K0
+// fake-quantized FP16 KV in the original frame. time: AR and eight-row
+// verification against the production FP16 path at 4K-256K, all kernels,
+// formats and splits in rotating order, buffers cycled past the 32 MiB
+// MALL; quantized splits 18/38 fill whole rounds of resident blocks (4 KV
+// heads x (splits + 2) blocks). quant: one layer, all 16 layers and a
+// 64-group batch of tiles. probe: 4K and 32K at split 18 with the launch
+// split into partials, reduce, quantized blocks and FP16 sink/tail blocks.
 //
 // Frame. Every stored token is rotated by the normalized Sylvester Hadamard
 // H (1/16, no random signs): the FP16 sink (first 128 tokens) and FP16 tail
@@ -521,7 +529,60 @@ __launch_bounds__(512) __global__
 // dequantized K), the block runs the online softmax (P as FP16 in LDS), and
 // wave w accumulates PV for channels 16w.. and 16(w+8).. (B from dequantized
 // V; the per-channel column scale is applied to the chunk's product).
+//
+// K1b-opt (Opt = true, same storage): codes become WMMA halves with one
+// shift and one v_and_or per pair at most, and no subtraction. A code c
+// masked at mantissa bit s, ORed with the exponent of 2^(10 - s), is the
+// half 2^(10 - s) + c exactly. Every code is moved to s = 6 (bias 16) or,
+// for 2-bit codes, s = 8 (bias 4): a first version kept codes in place at
+// s = 0..8 (bias up to 1024) and lost 1e-3 of relative accuracy to the FP32
+// cancellation of the bias. The bias is a constant per token (V) or
+// channel (K), subtracted once per row in FP32: for V inside the existing
+// P * zero sum, for K (AR only) in a per-group row correction. AR keys fold
+// the per-channel K scale into the query instead of the codes (A = q *
+// scale as FP16, rebuilt per group in LDS), and the zero term sum_c q_c *
+// zero_c joins the same correction. The softmax runs in base 2 (log2 e
+// folded into the score scale, v_exp_f32 directly), the padding rows of AR
+// tiles are skipped, and the last block of each KV head combines the splits
+// (no reduce launch).
 // ---------------------------------------------------------------------------
+constexpr float kLog2e = 1.4426950408889634F;
+
+// Bias of pair j's code half (see BiasedCodes).
+template<int Bits>
+__host__ __device__ constexpr float CodeBias(unsigned pair) {
+  if constexpr (Bits == 2)
+    return (pair == 2 || pair == 4 || pair == 6) ? 4.0F : 16.0F;
+  else
+    return 16.0F;
+}
+
+// One 32-bit code word -> its pairs as packed halves bias + code. Pair j is
+// the codes of nibble (crumb) j of both 16-bit halves; the shifts never move
+// a bit of one half into the masked field of the other.
+template<int Bits>
+__device__ __forceinline__ void BiasedCodes(unsigned w, unsigned* out) {
+  if constexpr (Bits == 2) {
+    constexpr unsigned k6 = 0x00C000C0U, k8 = 0x03000300U;
+    constexpr unsigned e6 = 0x4C004C00U, e8 = 0x44004400U;  // 16 + c, 4 + c
+    const unsigned l6 = w << 6, l4 = w << 4, r4 = w >> 4, r8 = w >> 8;
+    out[0] = (l6 & k6) | e6;  // crumb 0: bits 0-1 -> 6-7
+    out[1] = (l4 & k6) | e6;  // crumb 1: 2-3 -> 6-7
+    out[2] = (l4 & k8) | e8;  // crumb 2: 4-5 -> 8-9
+    out[3] = (w & k6) | e6;   // crumb 3 in place
+    out[4] = (w & k8) | e8;   // crumb 4 in place
+    out[5] = (r4 & k6) | e6;  // crumb 5: 10-11 -> 6-7
+    out[6] = (r4 & k8) | e8;  // crumb 6: 12-13 -> 8-9
+    out[7] = (r8 & k6) | e6;  // crumb 7: 14-15 -> 6-7
+  } else {
+    constexpr unsigned k = 0x03C003C0U, e = 0x4C004C00U;  // 16 + c
+    out[0] = ((w << 6) & k) | e;
+    out[1] = ((w << 2) & k) | e;
+    out[2] = ((w >> 2) & k) | e;
+    out[3] = ((w >> 6) & k) | e;
+  }
+}
+
 struct DecodeArgs {
   const float* q;               // [rows][24][256], original frame
   const std::uint8_t* records;  // [group - 1][kv head][record]
@@ -532,7 +593,12 @@ struct DecodeArgs {
   float* scratch;   // [kv][split][row m][max, sum, 256 outputs]
   unsigned groups;  // quantized groups after the sink
   unsigned tail_tokens;
-  unsigned splits;  // quantized splits; the sink and tail add two more
+  unsigned splits;   // quantized splits; the sink and tail add two more
+  unsigned only{0};  // probe: 1 quantized blocks only, 2 sink/tail only
+  // Opt: the output [rows][24][256] and one zeroed arrival counter per KV
+  // head (left zeroed by the combining block).
+  float* out{nullptr};
+  unsigned* counters{nullptr};
 };
 
 // Barrier for LDS traffic only: global loads in flight stay in flight.
@@ -576,8 +642,87 @@ __device__ __forceinline__ void Pin(v8f (&acc)[N]) {
     asm volatile("" : "+v"(acc[0]));
 }
 
-template<int VBits, unsigned Rows>
+// Opt split combine of row m (of M) of one KV head by one wave: lane l
+// owns output channels 8l..8l+7; the maxima are in base 2.
+__device__ __forceinline__ void CombineRow(const float* scratch, float* out,
+                                           unsigned kv, unsigned m, unsigned M,
+                                           unsigned nsplit, unsigned lane) {
+  const float* base =
+      scratch +
+      (static_cast<std::size_t>(kv) * nsplit * M + m) * kPartialStride;
+  const std::size_t stride = static_cast<std::size_t>(M) * kPartialStride;
+  float mx = -INFINITY;
+  for (unsigned s = lane; s < nsplit; s += 32)
+    mx = fmaxf(mx, base[s * stride]);
+#pragma unroll
+  for (unsigned mask = 1; mask < 32; mask <<= 1)
+    mx = fmaxf(mx, __shfl_xor(mx, mask));
+  float sum = 0.0F, y[8] = {};
+  for (unsigned s0 = 0; s0 < nsplit; s0 += 32) {
+    float e = 0.0F;
+    if (s0 + lane < nsplit) {
+      const float* p = base + (s0 + lane) * stride;
+      e = p[0] == -INFINITY ? 0.0F : __builtin_amdgcn_exp2f(p[0] - mx);
+      sum += p[1] * e;
+    }
+    const unsigned count = min(32U, nsplit - s0);
+    // Eight splits' loads in flight per step.
+    for (unsigned j0 = 0; j0 < count; j0 += 8) {
+      float2 x[8][4];
+      float w[8];
+#pragma unroll
+      for (unsigned j = 0; j < 8; ++j) {
+        const unsigned jj = min(j0 + j, count - 1);
+        w[j] = j0 + j < count ? __shfl(e, jj) : 0.0F;
+        const auto* v = reinterpret_cast<const float2*>(
+            base + (s0 + jj) * stride + 2 + 8 * lane);
+#pragma unroll
+        for (unsigned k = 0; k < 4; ++k)
+          x[j][k] = v[k];
+      }
+#pragma unroll
+      for (unsigned j = 0; j < 8; ++j)
+#pragma unroll
+        for (unsigned k = 0; k < 4; ++k) {
+          y[2 * k] += w[j] * x[j][k].x;
+          y[2 * k + 1] += w[j] * x[j][k].y;
+        }
+    }
+  }
+#pragma unroll
+  for (unsigned mask = 1; mask < 32; mask <<= 1)
+    sum += __shfl_xor(sum, mask);
+#pragma unroll
+  for (unsigned k = 0; k < 8; ++k)
+    y[k] /= sum;
+  Fwht256(y, lane);
+  float* dst =
+      out +
+      (static_cast<std::size_t>(m / kGqa) * kHeads + kv * kGqa + m % kGqa) *
+          kDim +
+      8 * lane;
+  reinterpret_cast<float4*>(dst)[0] =
+      float4{y[0] * 0.0625F, y[1] * 0.0625F, y[2] * 0.0625F, y[3] * 0.0625F};
+  reinterpret_cast<float4*>(dst)[1] =
+      float4{y[4] * 0.0625F, y[5] * 0.0625F, y[6] * 0.0625F, y[7] * 0.0625F};
+}
+
+// Opt verification: one wave per (KV head, row), 8 per block.
+__launch_bounds__(256) __global__
+    void KvarnCombineKernel(const float* __restrict__ scratch,
+                            float* __restrict__ out, unsigned nsplit,
+                            unsigned rows) {
+  const unsigned M = kGqa * rows;
+  const unsigned pair = blockIdx.x * 8 + threadIdx.x / 32;
+  if (pair < kKvHeads * M)
+    CombineRow(scratch, out, pair / M, pair % M, M, nsplit, threadIdx.x % 32);
+}
+
+// Gen 0: K1b, 1: Opt, 2: Opt with AR V codes loaded at the start of their
+// own group instead of one group ahead (fewer live registers).
+template<int VBits, unsigned Rows, int Gen>
 __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
+  constexpr bool Opt = Gen >= 1;
   using R = Record<VBits>;
   constexpr unsigned M = kGqa * Rows, MT = (M + 15) / 16, MR = MT * 16;
   constexpr unsigned kQStride = kDim + 8, kPStride = kGroup + 8;
@@ -585,17 +730,34 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
   // AR prefetches the whole next group into registers; verification, with
   // three times the accumulators, only its K scale pairs.
   constexpr bool kPrefetch = Rows == 1;
+  constexpr bool kPrefetchV = kPrefetch && Gen < 2;
+  // AR folds the K scale into q (verification would need 48 correction
+  // rows and a second q copy past the LDS budget).
+  constexpr bool kFoldK = Opt && Rows == 1;
+  constexpr float kScoreScale = Opt ? 0.0625F * kLog2e : 0.0625F;
+  const auto exp_ = [](float x) {
+    if constexpr (Opt)
+      return __builtin_amdgcn_exp2f(x);
+    else
+      return expf(x);
+  };
   __shared__ __align__(16) _Float16 q16[MR * kQStride];
   __shared__ __align__(16) _Float16 p16[MR * kPStride];
   __shared__ __align__(16) float wave_max[MR][8];
   __shared__ __align__(16) float wave_psum[MR][8];  // sum of P per wave
-  __shared__ __align__(16) float wave_zsum[MR][8];  // sum of P * V zero
-  __shared__ __align__(16) unsigned key_scale[kDim / 2], key_zero[kDim / 2];
+  // Sum of P * V zero (Opt: minus FP16 P * code bias).
+  __shared__ __align__(16) float wave_zsum[MR][8];
+  __shared__ __align__(16) unsigned key_scale[kFoldK ? 1 : kDim / 2],
+      key_zero[kFoldK ? 1 : kDim / 2];
+  // kFoldK: per-wave parts of sum_c q_c zero_c - q'_c bias_c per row.
+  __shared__ __align__(16) float corr_part[kFoldK ? M : 1][8];
   // Online-softmax state per row: the max double-buffered by chunk parity,
   // the sum (wave 0 only) and the chunk's rescale factor.
   __shared__ float row_max[2][MR], row_sum[MR], row_alpha[MR];
 
   const unsigned kv = blockIdx.x, split = blockIdx.z;
+  if ((a.only == 1 && split >= a.splits) || (a.only == 2 && split < a.splits))
+    return;
   const unsigned tid = threadIdx.x, wave = tid / 32, lane = tid % 32;
   const unsigned sub = lane % 16, half = lane / 16;
   const unsigned length = kGroup * (1 + a.groups) + a.tail_tokens;
@@ -615,6 +777,18 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
       y[4] = hi.x, y[5] = hi.y, y[6] = hi.z, y[7] = hi.w;
       Fwht256(y, lane);
     }
+    if (kFoldK && split < a.splits) {
+      // Quantized AR blocks fold from float q: rows < M as [M][256] floats
+      // in the q16 storage, read back per channel below.
+      if (m < M) {
+        auto* qf = reinterpret_cast<float4*>(q16) + (m * kDim + 8 * lane) / 4;
+        qf[0] = float4{y[0] * 0.0625F, y[1] * 0.0625F, y[2] * 0.0625F,
+                       y[3] * 0.0625F};
+        qf[1] = float4{y[4] * 0.0625F, y[5] * 0.0625F, y[6] * 0.0625F,
+                       y[7] * 0.0625F};
+      }
+      continue;
+    }
     _Float16 h[8];
 #pragma unroll
     for (unsigned j = 0; j < 8; ++j)
@@ -622,6 +796,10 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
     *reinterpret_cast<uint4*>(&q16[m * kQStride + 8 * lane]) =
         *reinterpret_cast<const uint4*>(h);
   }
+  static_assert(!kFoldK || M * kDim * 4 <= sizeof(q16));
+  if constexpr (Opt)
+    for (unsigned i = tid; i < MR * kPStride / 2; i += 256)
+      reinterpret_cast<unsigned*>(p16)[i] = 0;
   if (tid < MR) {
     row_max[0][tid] = -INFINITY;
     row_sum[tid] = 0.0F;
@@ -637,12 +815,19 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
   // LDS, per-wave sums of P and P * V zero, the row state for this chunk.
   // `between` runs after the first barrier, when no wave reads scores
   // inputs any more.
+  // Opt skips the padding rows of a tile (M is even, so 2i < M - 16 mt
+  // covers both half-waves); their P stays zero and their outputs unused.
+  const auto Live = [](unsigned mt, unsigned i) {
+    return !Opt || mt * 16 + 2 * i < M;
+  };
   const auto softmax = [&](v8f(&acc)[MT], unsigned parity, float value_scale,
-                           float value_zero, auto&& between) {
+                           float value_zero, float value_bias, auto&& between) {
 #pragma unroll
     for (unsigned mt = 0; mt < MT; ++mt)
 #pragma unroll
       for (unsigned i = 0; i < 8; ++i) {
+        if (!Live(mt, i))
+          continue;
         const float v = RowMax16(acc[mt][i]);
         if (sub == 0)
           wave_max[mt * 16 + 2 * i + half][wave] = v;
@@ -653,6 +838,8 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
     for (unsigned mt = 0; mt < MT; ++mt)
 #pragma unroll
       for (unsigned i = 0; i < 8; ++i) {
+        if (!Live(mt, i))
+          continue;
         const unsigned row = mt * 16 + 2 * i + half;
         const float4 m0 = *reinterpret_cast<const float4*>(&wave_max[row][0]);
         const float4 m1 = *reinterpret_cast<const float4*>(&wave_max[row][4]);
@@ -663,13 +850,17 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
         const bool empty = next == -INFINITY;
         if (wave == 0 && sub == 0) {
           row_max[parity ^ 1][row] = next;
-          row_alpha[row] = empty ? 1.0F : expf(previous - next);
+          row_alpha[row] = empty ? 1.0F : exp_(previous - next);
         }
         const float s = acc[mt][i];
-        const float p = (empty || s == -INFINITY) ? 0.0F : expf(s - next);
-        p16[row * kPStride + token] = static_cast<_Float16>(p * value_scale);
+        const float p = (empty || s == -INFINITY) ? 0.0F : exp_(s - next);
+        const _Float16 ph = static_cast<_Float16>(p * value_scale);
+        p16[row * kPStride + token] = ph;
         const float psum = RowSum16(p);
-        const float zsum = RowSum16(p * value_zero);
+        float z = p * value_zero;
+        if constexpr (Opt)
+          z = fmaf(-static_cast<float>(ph), value_bias, z);
+        const float zsum = RowSum16(z);
         if (sub == 0) {
           wave_psum[row][wave] = psum;
           wave_zsum[row][wave] = zsum;
@@ -681,6 +872,8 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
       for (unsigned mt = 0; mt < MT; ++mt)
 #pragma unroll
         for (unsigned i = 0; i < 8; ++i) {
+          if (!Live(mt, i))
+            continue;
           const unsigned row = mt * 16 + 2 * i + half;
           const float4 s0 =
               *reinterpret_cast<const float4*>(&wave_psum[row][0]);
@@ -719,6 +912,26 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
     });
   };
   const auto values = [&](auto unroll, auto build_v, const float (&column)[2]) {
+    // AR Opt: the zero sums once per chunk, live rows only (verification
+    // would hold 24 more registers across both products).
+    constexpr bool kZerosOnce = Opt && Rows == 1;
+    float zeros[kZerosOnce ? MT : 1][8];
+    if constexpr (kZerosOnce)
+#pragma unroll
+      for (unsigned mt = 0; mt < MT; ++mt)
+#pragma unroll
+        for (unsigned i = 0; i < 8; ++i) {
+          zeros[mt][i] = 0.0F;
+          if (!Live(mt, i))
+            continue;
+          const unsigned row = mt * 16 + 2 * i + half;
+          const float4 z0 =
+              *reinterpret_cast<const float4*>(&wave_zsum[row][0]);
+          const float4 z1 =
+              *reinterpret_cast<const float4*>(&wave_zsum[row][4]);
+          zeros[mt][i] =
+              ((z0.x + z0.y) + (z0.z + z0.w)) + ((z1.x + z1.y) + (z1.z + z1.w));
+        }
 #pragma unroll
     for (unsigned t = 0; t < 2; ++t) {
       v8f g[MT];
@@ -737,13 +950,20 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
       for (unsigned mt = 0; mt < MT; ++mt)
 #pragma unroll
         for (unsigned i = 0; i < 8; ++i) {
+          if (!Live(mt, i))
+            continue;
           const unsigned row = mt * 16 + 2 * i + half;
-          const float4 z0 =
-              *reinterpret_cast<const float4*>(&wave_zsum[row][0]);
-          const float4 z1 =
-              *reinterpret_cast<const float4*>(&wave_zsum[row][4]);
-          const float zero =
-              ((z0.x + z0.y) + (z0.z + z0.w)) + ((z1.x + z1.y) + (z1.z + z1.w));
+          float zero;
+          if constexpr (kZerosOnce) {
+            zero = zeros[mt][i];
+          } else {
+            const float4 z0 =
+                *reinterpret_cast<const float4*>(&wave_zsum[row][0]);
+            const float4 z1 =
+                *reinterpret_cast<const float4*>(&wave_zsum[row][4]);
+            zero = ((z0.x + z0.y) + (z0.z + z0.w)) +
+                   ((z1.x + z1.y) + (z1.z + z1.w));
+          }
           out[mt][t][i] =
               row_alpha[row] * out[mt][t][i] + column[t] * (g[mt][i] + zero);
         }
@@ -785,7 +1005,7 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
       for (unsigned i = 0; i < 8; ++i)
         k.codes[i] = krow[i];
       const auto* scales = reinterpret_cast<const __half*>(record);
-      k.column = __half2float(scales[R::kKColumn / 2 + token]) * 0.0625F;
+      k.column = __half2float(scales[R::kKColumn / 2 + token]) * kScoreScale;
       k.value_scale = __half2float(scales[R::kVScale / 2 + token]);
       k.value_zero = __half2float(scales[R::kVZero / 2 + token]);
     };
@@ -804,31 +1024,85 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
       }
     };
     const auto stage_scales = [&](const uint4& v) {
-      if (tid < 64)
-        reinterpret_cast<uint4*>(tid < 32 ? key_scale : key_zero)[tid % 32] = v;
+      if constexpr (!kFoldK)
+        if (tid < 64)
+          reinterpret_cast<uint4*>(tid < 32 ? key_scale : key_zero)[tid % 32] =
+              v;
     };
+    // kFoldK: thread tid owns channel tid: its rotated q column, and per
+    // group its K scale (low half) and zero (high half).
+    float qcol[kFoldK ? M : 1];
+    const auto load_kscale = [&](unsigned group) {
+      const auto* h = reinterpret_cast<const unsigned short*>(record_of(group));
+      return static_cast<unsigned>(h[R::kKScale / 2 + tid]) |
+             static_cast<unsigned>(h[R::kKZero / 2 + tid]) << 16;
+    };
+    // q' = q * scale into q16 rows < M and the per-wave correction parts.
+    const auto fold = [&](unsigned sz) {
+      const float s = __half2float(__ushort_as_half(sz & 0xffff));
+      const float z = __half2float(__ushort_as_half(sz >> 16));
+      const float bias = CodeBias<4>((tid % 8) / 2);
+#pragma unroll
+      for (unsigned m = 0; m < M; ++m) {
+        const float q = qcol[m];
+        const float exact = q * s;
+        const _Float16 qp = static_cast<_Float16>(exact);
+        q16[m * kQStride + tid] = qp;
+        // The FP16 rounding of q' times the mid code 7.5 moves into the
+        // correction (exact in FP32), leaving it times (code - 7.5) only:
+        // without this, the per-group rounding offset cost 1.5x the K1b
+        // kernel error.
+        const float qpf = static_cast<float>(qp);
+        float t = fmaf(q, z, fmaf(exact - qpf, 7.5F, -qpf * bias));
+        t = RowSum16(t);
+        t += __shfl_xor(t, 16);
+        if (lane == 0)
+          corr_part[m][wave] = t;
+      }
+    };
+    if constexpr (kFoldK) {
+      LdsBarrier();
+#pragma unroll
+      for (unsigned m = 0; m < M; ++m)
+        qcol[m] = reinterpret_cast<const float*>(q16)[m * kDim + tid];
+      LdsBarrier();
+      // Zero padding rows of the folded A tile (rows < M come from fold).
+      for (unsigned i = tid; i < (MR - M) * kQStride; i += 256)
+        q16[M * kQStride + i] = static_cast<_Float16>(0.0F);
+      if (begin < end)
+        fold(load_kscale(begin));
+    }
+    // Opt: the code bias of this lane's token in the V fragments.
+    const float value_bias =
+        !Opt ? 0.0F
+             : (VBits == 2 ? CodeBias<2>(sub / 2) : CodeBias<4>((sub % 8) / 2));
     KeyPart keys{};
     ValuePart vals{};
     if (begin < end) {
       stage_scales(load_scales(begin));
-      if constexpr (kPrefetch) {
+      if constexpr (kPrefetch)
         load_keys(begin, keys);
+      if constexpr (kPrefetchV)
         load_values(begin, vals);
-      }
     }
     LdsBarrier();
     for (unsigned group = begin; group < end; ++group) {
       const bool more = group + 1 < end;
-      const uint4 next_scales = more ? load_scales(group + 1) : uint4{};
+      const uint4 next_scales =
+          (!kFoldK && more) ? load_scales(group + 1) : uint4{};
+      const unsigned next_sz = (kFoldK && more) ? load_kscale(group + 1) : 0U;
       KeyPart next_keys{};
       ValuePart next_vals{};
       if constexpr (kPrefetch) {
-        if (more) {
+        if (more)
           load_keys(group + 1, next_keys);
-          load_values(group + 1, next_vals);
-        }
       } else {
         load_keys(group, keys);
+      }
+      if constexpr (kPrefetchV) {
+        if (more)
+          load_values(group + 1, next_vals);
+      } else {
         load_values(group, vals);
       }
 
@@ -839,6 +1113,18 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
             const uint4 v = keys.codes[ks / 2];
             const unsigned w0 = (ks & 1) != 0 ? v.z : v.x;
             const unsigned w1 = (ks & 1) != 0 ? v.w : v.y;
+            if constexpr (kFoldK) {
+              u32x8 b;
+              unsigned lo[4], hi[4];
+              BiasedCodes<4>(w0, lo);
+              BiasedCodes<4>(w1, hi);
+#pragma unroll
+              for (unsigned j = 0; j < 4; ++j) {
+                b[j] = lo[j];
+                b[4 + j] = hi[j];
+              }
+              return __builtin_bit_cast(v16h, b);
+            }
             const auto* s4 = reinterpret_cast<const uint4*>(key_scale);
             const auto* z4 = reinterpret_cast<const uint4*>(key_zero);
             const uint4 s0 = s4[2 * ks], s1 = s4[2 * ks + 1];
@@ -857,20 +1143,62 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
             return __builtin_bit_cast(v16h, b);
           },
           acc);
+      if constexpr (kFoldK) {
+#pragma unroll
+        for (unsigned mt = 0; mt < MT; ++mt)
+#pragma unroll
+          for (unsigned i = 0; i < 8; ++i)
+            if (mt * 16 + 2 * i < M) {  // M even: row < M for both halves
+              const unsigned row = mt * 16 + 2 * i + half;
+              const float4 c0 =
+                  *reinterpret_cast<const float4*>(&corr_part[row][0]);
+              const float4 c1 =
+                  *reinterpret_cast<const float4*>(&corr_part[row][4]);
+              acc[mt][i] += ((c0.x + c0.y) + (c0.z + c0.w)) +
+                            ((c1.x + c1.y) + (c1.z + c1.w));
+            }
+      }
 #pragma unroll
       for (unsigned mt = 0; mt < MT; ++mt)
         acc[mt] *= keys.column;
-      // The next group's K scales replace this group's once every wave is
-      // past its scores; the second softmax barrier publishes them.
-      softmax(acc, (group - begin) & 1, keys.value_scale, keys.value_zero, [&] {
-        if (more)
-          stage_scales(next_scales);
-      });
+      // The next group's K scales (kFoldK: q') replace this group's once
+      // every wave is past its scores; the second softmax barrier publishes
+      // them.
+      softmax(acc, (group - begin) & 1, keys.value_scale, keys.value_zero,
+              value_bias, [&] {
+                if (more) {
+                  if constexpr (kFoldK)
+                    fold(next_sz);
+                  else
+                    stage_scales(next_scales);
+                }
+              });
       values(
           std::true_type{},
           [&](unsigned t, unsigned kt) {
             u32x8 b;
-            if constexpr (VBits == 2) {
+            if constexpr (Opt && VBits == 2) {
+              const uint4 v = vals.codes[t][kt / 4];
+              const unsigned w = kt % 4 == 0   ? v.x
+                                 : kt % 4 == 1 ? v.y
+                                 : kt % 4 == 2 ? v.z
+                                               : v.w;
+              unsigned o[8];
+              BiasedCodes<2>(w, o);
+#pragma unroll
+              for (unsigned j = 0; j < 8; ++j)
+                b[j] = o[j];
+            } else if constexpr (Opt) {
+              const uint4 v = vals.codes[t][kt / 2];
+              unsigned lo[4], hi[4];
+              BiasedCodes<4>((kt & 1) != 0 ? v.z : v.x, lo);
+              BiasedCodes<4>((kt & 1) != 0 ? v.w : v.y, hi);
+#pragma unroll
+              for (unsigned j = 0; j < 4; ++j) {
+                b[j] = lo[j];
+                b[4 + j] = hi[j];
+              }
+            } else if constexpr (VBits == 2) {
               const uint4 v = vals.codes[t][kt / 4];
               const unsigned w = kt % 4 == 0   ? v.x
                                  : kt % 4 == 1 ? v.y
@@ -892,10 +1220,10 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
             return __builtin_bit_cast(v16h, b);
           },
           vals.column);
-      if constexpr (kPrefetch) {
+      if constexpr (kPrefetch)
         keys = next_keys;
+      if constexpr (kPrefetchV)
         vals = next_vals;
-      }
     }
     final_parity = (end - begin) & 1;
   } else {
@@ -933,10 +1261,10 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
           const unsigned row = mt * 16 + 2 * i + half;
           const unsigned last = length - Rows + (row < M ? row / kGqa : 0);
           acc[mt][i] = (token < count && position <= last)
-                           ? acc[mt][i] * 0.0625F
+                           ? acc[mt][i] * kScoreScale
                            : -INFINITY;
         }
-      softmax(acc, (chunk / kGroup) & 1, 1.0F, 0.0F, [] {});
+      softmax(acc, (chunk / kGroup) & 1, 1.0F, 0.0F, 0.0F, [] {});
       values(
           std::false_type{},
           [&](unsigned t, unsigned kt) {
@@ -983,9 +1311,31 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
           partial[row * kPartialStride + 1] = row_sum[row];
         }
       }
+  if constexpr (Opt && Rows == 1) {
+    // The last block of this KV head to finish combines its splits.
+    if (a.only != 0)
+      return;
+    __shared__ bool last;
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+      const unsigned done = atomicAdd(&a.counters[kv], 1U);
+      last = done == nsplit - 1;
+      if (last)
+        a.counters[kv] = 0;
+    }
+    __syncthreads();
+    if (!last)
+      return;
+    __threadfence();
+    for (unsigned m = wave; m < M; m += 8)
+      CombineRow(a.scratch, a.out, kv, m, M, nsplit, lane);
+  }
 }
 
 // Combines the splits of one (query row, head), normalizes, rotates back.
+// Exp2: the partial maxima are in base 2 (Opt partials).
+template<bool Exp2>
 __launch_bounds__(256) __global__
     void KvarnReduceKernel(const float* __restrict__ scratch,
                            float* __restrict__ out, unsigned nsplit,
@@ -1004,7 +1354,9 @@ __launch_bounds__(256) __global__
   float sum = 0, value = 0;
   for (unsigned s = 0; s < nsplit; ++s) {
     const float* p = at(s);
-    const float e = p[0] == -INFINITY ? 0.0F : expf(p[0] - global_max);
+    const float e = p[0] == -INFINITY ? 0.0F
+                    : Exp2 ? __builtin_amdgcn_exp2f(p[0] - global_max)
+                           : expf(p[0] - global_max);
     sum += p[1] * e;
     value += p[2 + d] * e;
   }
@@ -1020,17 +1372,75 @@ __launch_bounds__(256) __global__
       buffer[d] * 0.0625F;
 }
 
-template<int VBits>
-void LaunchKvarn(const DecodeArgs& a, unsigned rows, float* out) {
+// parts: 1 partials, 2 reduce, 3 both.
+unsigned* ArrivalCounters() {
+  static unsigned* counters = [] {
+    unsigned* p = nullptr;
+    KV_OK(hipMalloc(&p, kKvHeads * sizeof(unsigned)));
+    KV_OK(hipMemset(p, 0, kKvHeads * sizeof(unsigned)));
+    return p;
+  }();
+  return counters;
+}
+
+// Opt AR combines the splits inside the partials launch (parts 2 empty).
+template<int VBits, int Gen>
+void LaunchKvarn(DecodeArgs a, unsigned rows, float* out, unsigned parts = 3) {
+  constexpr bool Opt = Gen >= 1;
   const dim3 grid(kKvHeads, 1, a.splits + 2);
-  if (rows == 1)
-    KvarnDecodePartialsKernel<VBits, 1><<<grid, 256>>>(a);
-  else if (rows == 8)
-    KvarnDecodePartialsKernel<VBits, 8><<<grid, 256>>>(a);
+  if constexpr (Opt) {
+    a.out = out;
+    a.counters = ArrivalCounters();
+    if ((parts & 1) != 0) {
+      if (rows == 1)
+        KvarnDecodePartialsKernel<VBits, 1, Gen><<<grid, 256>>>(a);
+      else if (rows == 8)
+        KvarnDecodePartialsKernel<VBits, 8, Gen><<<grid, 256>>>(a);
+      else
+        std::abort();
+    }
+    // AR combines inside the partials launch; verification (48 rows per
+    // KV head, too many for one block) in a wave-per-row launch.
+    if (rows > 1 && (parts & 2) != 0)
+      KvarnCombineKernel<<<(kKvHeads * kGqa * rows + 7) / 8, 256>>>(
+          a.scratch, out, a.splits + 2, rows);
+    return;
+  }
+  if ((parts & 1) != 0) {
+    if (rows == 1)
+      KvarnDecodePartialsKernel<VBits, 1, Gen><<<grid, 256>>>(a);
+    else if (rows == 8)
+      KvarnDecodePartialsKernel<VBits, 8, Gen><<<grid, 256>>>(a);
+    else
+      std::abort();
+  }
+  if ((parts & 2) != 0)
+    KvarnReduceKernel<Opt>
+        <<<dim3(kHeads, rows), 256>>>(a.scratch, out, a.splits + 2, rows);
+}
+
+// Kernel generations compared in one binary.
+enum class Kernel { kK1b, kOpt, kOptLateV };
+constexpr Kernel kKernels[] = {Kernel::kK1b, Kernel::kOpt, Kernel::kOptLateV};
+const char* KernelName(Kernel k) {
+  return k == Kernel::kK1b ? "k1b" : k == Kernel::kOpt ? "opt" : "opt_latev";
+}
+
+void LaunchKvarnAny(int bits, Kernel kernel, const DecodeArgs& a, unsigned rows,
+                    float* out, unsigned parts = 3) {
+  const auto go = [&](auto bits_c) {
+    constexpr int B = decltype(bits_c)::value;
+    if (kernel == Kernel::kK1b)
+      LaunchKvarn<B, 0>(a, rows, out, parts);
+    else if (kernel == Kernel::kOpt)
+      LaunchKvarn<B, 1>(a, rows, out, parts);
+    else
+      LaunchKvarn<B, 2>(a, rows, out, parts);
+  };
+  if (bits == 2)
+    go(std::integral_constant<int, 2>{});
   else
-    std::abort();
-  KvarnReduceKernel<<<dim3(kHeads, rows), 256>>>(a.scratch, out, a.splits + 2,
-                                                 rows);
+    go(std::integral_constant<int, 4>{});
 }
 
 template<int VBits>
@@ -1607,15 +2017,6 @@ void CheckCase(unsigned groups, unsigned tail, unsigned splits,
                     groups,
                     tail,
                     splits};
-    // Stale scratch must not leak into the result.
-    KV_OK(hipMemset(scratch.data, 0xff, scratch.size * sizeof(float)));
-    if (VBits == 2)
-      LaunchKvarn<2>(args, rows, dout.data);
-    else
-      LaunchKvarn<4>(args, rows, dout.data);
-    KV_OK(hipDeviceSynchronize());
-    const auto got = dout.Download();
-
     Device<float> s16(Fp16ScratchSize(rows));
     LaunchFp16(dq.data, reinterpret_cast<const __half*>(dk.data),
                reinterpret_cast<const __half*>(dv.data), dout16.data, s16.data,
@@ -1644,35 +2045,43 @@ void CheckCase(unsigned groups, unsigned tail, unsigned splits,
     const auto ref_fp16 = Attention(q, rows, length, row(kfl), row(vfl), false);
     const auto ref_fake = Attention(q, rows, length, row(kff), row(vff), false);
     const auto ref_codes = Attention(q, rows, length, row(krf), row(vrf), true);
-    const Diff vs_fake = Compare(got, ref_fake);
-    const Diff vs_codes = Compare(got, ref_codes);
     std::vector<double> fake_as(ref_fake);
     const Diff quant_effect = Compare(fake_as, ref_fp16);
     const Diff base = Compare(got16, ref_fp16);
     const std::size_t tiles = static_cast<std::size_t>(groups) * kKvHeads * 2;
-    // The kernel's own arithmetic (vs its codes) must stay well inside the
-    // quantization effect; the K0 reference adds the 1-ulp scale cases.
-    // Quantizer: bit-exact against the emulation of its order; against the
-    // K0 reference the libm logf/expf rounding leaves a few FP16 ulp.
-    const bool ok = vs_codes.rel < 5e-3 && vs_fake.rel < 2e-2 &&
-                    base.rel < 1e-4 && fake_mismatch == 0 &&
-                    emulation_mismatch == 0 && max_ulp <= 2 &&
-                    code_diff * 10000 <= tiles * kGroup * kDim;
-    totals.ok = totals.ok && ok;
-    std::printf(
-        "check k4v%d groups=%u tail=%u length=%u rows=%u splits=%u "
-        "tiles=%zu gpu_vs_emulation_tile_mismatch=%zu tiles_exact_vs_k0=%zu "
-        "code_diff=%zu scale_diff=%zu scale_max_ulp=%zu "
-        "ref_vs_k0_fake_mismatch=%zu "
-        "kvarn_vs_k0ref_rel=%.3e kvarn_vs_k0ref_maxabs=%.3e "
-        "kvarn_vs_gpucodes_rel=%.3e kvarn_vs_gpucodes_maxabs=%.3e "
-        "quant_effect_rel=%.3e fp16kernel_vs_fp16ref_rel=%.3e %s\n",
-        VBits, groups, tail, length, rows, splits, tiles,
-        emulation_mismatch.load(), tiles_exact.load(), code_diff.load(),
-        scale_diff.load(), max_ulp.load(), fake_mismatch.load(), vs_fake.rel,
-        vs_fake.max_abs, vs_codes.rel, vs_codes.max_abs, quant_effect.rel,
-        base.rel, ok ? "PASS" : "FAIL");
-    std::fflush(stdout);
+    for (const Kernel kernel : kKernels) {
+      // Stale scratch must not leak into the result.
+      KV_OK(hipMemset(scratch.data, 0xff, scratch.size * sizeof(float)));
+      KV_OK(hipMemset(dout.data, 0xff, dout.size * sizeof(float)));
+      LaunchKvarnAny(VBits, kernel, args, rows, dout.data);
+      KV_OK(hipDeviceSynchronize());
+      const auto got = dout.Download();
+      const Diff vs_fake = Compare(got, ref_fake);
+      const Diff vs_codes = Compare(got, ref_codes);
+      // The kernel's own arithmetic (vs its codes) within 1e-3, well inside
+      // the quantization effect; the K0 reference adds the scale-ulp cases.
+      // Quantizer: bit-exact against the emulation of its order; against
+      // the K0 reference at most 2 FP16 ulp of a scale.
+      const bool ok = vs_codes.rel <= 1e-3 && vs_fake.rel < 2e-2 &&
+                      base.rel < 1e-4 && fake_mismatch == 0 &&
+                      emulation_mismatch == 0 && max_ulp <= 2 &&
+                      code_diff * 10000 <= tiles * kGroup * kDim;
+      totals.ok = totals.ok && ok;
+      std::printf(
+          "check kernel=%s k4v%d groups=%u tail=%u length=%u rows=%u "
+          "splits=%u tiles=%zu gpu_vs_emulation_tile_mismatch=%zu "
+          "tiles_exact_vs_k0=%zu code_diff=%zu scale_diff=%zu "
+          "scale_max_ulp=%zu ref_vs_k0_fake_mismatch=%zu "
+          "kvarn_vs_k0ref_rel=%.3e kvarn_vs_k0ref_maxabs=%.3e "
+          "kvarn_vs_gpucodes_rel=%.3e kvarn_vs_gpucodes_maxabs=%.3e "
+          "quant_effect_rel=%.3e fp16kernel_vs_fp16ref_rel=%.3e %s\n",
+          KernelName(kernel), VBits, groups, tail, length, rows, splits, tiles,
+          emulation_mismatch.load(), tiles_exact.load(), code_diff.load(),
+          scale_diff.load(), max_ulp.load(), fake_mismatch.load(), vs_fake.rel,
+          vs_fake.max_abs, vs_codes.rel, vs_codes.max_abs, quant_effect.rel,
+          base.rel, ok ? "PASS" : "FAIL");
+      std::fflush(stdout);
+    }
   }
 }
 
@@ -1812,7 +2221,9 @@ double Median(std::vector<double> v) {
   return v[v.size() / 2];
 }
 
-void TimeDepth(unsigned depth, unsigned rows, Timer& timer) {
+// probe: split 18 only, the launch split into its parts (partials alone,
+// reduce alone, quantized blocks alone, sink/tail blocks alone).
+void TimeDepth(unsigned depth, unsigned rows, Timer& timer, bool probe) {
   constexpr unsigned kTail = 128;
   constexpr unsigned kReps = 7;
   const unsigned groups = depth / kGroup - 2;  // sink, groups, 128-token tail
@@ -1868,7 +2279,8 @@ void TimeDepth(unsigned depth, unsigned rows, Timer& timer) {
     LaunchFp16(dq.data, k16.data + c * fp16_layer, v16.data + c * fp16_layer,
                dout.data, s16.data, s16.size, depth, rows);
   };
-  const auto kvarn_launch = [&](unsigned f, unsigned splits, unsigned c) {
+  const auto kvarn_launch = [&](Kernel kernel, unsigned f, unsigned splits,
+                                unsigned parts, unsigned only, unsigned c) {
     const std::size_t layer =
         static_cast<std::size_t>(groups) * kKvHeads * formats[f].record;
     // [sink K][tail K][sink V][tail V] per copy.
@@ -1882,14 +2294,33 @@ void TimeDepth(unsigned depth, unsigned rows, Timer& timer) {
                     sq.data,
                     groups,
                     kTail,
-                    splits};
-    if (formats[f].bits == 2)
-      LaunchKvarn<2>(args, rows, dout.data);
-    else
-      LaunchKvarn<4>(args, rows, dout.data);
+                    splits,
+                    only};
+    LaunchKvarnAny(formats[f].bits, kernel, args, rows, dout.data, parts);
   };
-  // fp16, then k4v2 and k4v4 at every split option, in rotating order.
-  std::vector<std::vector<double>> times(1 + 2 * kSplitOptions);
+  // fp16, then every kernel x format x split option, in rotating order.
+  constexpr unsigned kKernelCount = std::size(kKernels);
+  struct Config {
+    Kernel kernel;
+    unsigned f, splits, parts{3}, only{0};
+    const char* part{"full"};
+  };
+  std::vector<Config> configs;
+  for (const Kernel kernel : kKernels)
+    for (unsigned f = 0; f < 2; ++f) {
+      if (!probe) {
+        for (unsigned s : split_options)
+          configs.push_back({kernel, f, s});
+        continue;
+      }
+      configs.push_back({kernel, f, 18, 3, 0, "full"});
+      configs.push_back({kernel, f, 18, 1, 0, "partials"});
+      configs.push_back({kernel, f, 18, 2, 0, "reduce"});
+      configs.push_back({kernel, f, 18, 1, 1, "quantized_blocks"});
+      configs.push_back({kernel, f, 18, 1, 2, "fp16_blocks"});
+    }
+  static_assert(kKernelCount == 3);
+  std::vector<std::vector<double>> times(1 + configs.size());
   for (unsigned rep = 0; rep < kReps; ++rep)
     for (unsigned j = 0; j < times.size(); ++j) {
       const unsigned which = (j + rep) % times.size();
@@ -1897,29 +2328,32 @@ void TimeDepth(unsigned depth, unsigned rows, Timer& timer) {
         times[0].push_back(
             timer.Run(fp16_launch, fp16_copies, std::max(fp16_copies, 20U)));
       } else {
-        const unsigned f = (which - 1) / kSplitOptions,
-                       splits = split_options[(which - 1) % kSplitOptions];
-        times[which].push_back(
-            timer.Run([&](unsigned c) { kvarn_launch(f, splits, c); },
-                      qcopies[f], std::max(qcopies[f], 20U)));
+        const Config& c = configs[which - 1];
+        times[which].push_back(timer.Run(
+            [&](unsigned copy) {
+              kvarn_launch(c.kernel, c.f, c.splits, c.parts, c.only, copy);
+            },
+            qcopies[c.f], std::max(qcopies[c.f], 20U)));
       }
     }
   const double fp16_us = Median(times[0]);
   std::printf(
-      "time depth=%u rows=%u fmt=fp16 splits=32 us=%.1f us_min=%.1f "
-      "MiB=%.2f GBps=%.1f copies=%u\n",
-      depth, rows, fp16_us, *std::min_element(times[0].begin(), times[0].end()),
+      "%s depth=%u rows=%u kernel=fp16 fmt=fp16 splits=32 us=%.1f "
+      "us_min=%.1f MiB=%.2f GBps=%.1f copies=%u\n",
+      probe ? "probe" : "time", depth, rows, fp16_us,
+      *std::min_element(times[0].begin(), times[0].end()),
       fp16_bytes / 1048576.0, fp16_bytes / fp16_us / 1e3, fp16_copies);
   for (unsigned which = 1; which < times.size(); ++which) {
-    const unsigned f = (which - 1) / kSplitOptions,
-                   splits = split_options[(which - 1) % kSplitOptions];
+    const Config& c = configs[which - 1];
     const double us = Median(times[which]);
     std::printf(
-        "time depth=%u rows=%u fmt=k4v%d splits=%u us=%.1f us_min=%.1f "
-        "MiB=%.2f GBps=%.1f copies=%u speedup=%.2f\n",
-        depth, rows, formats[f].bits, splits, us,
+        "%s depth=%u rows=%u kernel=%s fmt=k4v%d splits=%u part=%s us=%.1f "
+        "us_min=%.1f MiB=%.2f GBps=%.1f copies=%u speedup=%.2f\n",
+        probe ? "probe" : "time", depth, rows, KernelName(c.kernel),
+        formats[c.f].bits, c.splits, c.part, us,
         *std::min_element(times[which].begin(), times[which].end()),
-        qbytes[f] / 1048576.0, qbytes[f] / us / 1e3, qcopies[f], fp16_us / us);
+        qbytes[c.f] / 1048576.0, qbytes[c.f] / us / 1e3, qcopies[c.f],
+        fp16_us / us);
   }
   std::fflush(stdout);
 }
@@ -1968,7 +2402,7 @@ void TimeQuantize(Timer& timer) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  bool check = argc == 1, time = argc == 1, quant = argc == 1;
+  bool check = argc == 1, time = argc == 1, quant = argc == 1, probe = false;
   for (int i = 1; i < argc; ++i) {
     const std::string_view arg = argv[i];
     if (arg == "check")
@@ -1977,8 +2411,11 @@ int main(int argc, char** argv) {
       time = true;
     else if (arg == "quant")
       quant = true;
+    else if (arg == "probe")
+      probe = true;
     else {
-      std::fprintf(stderr, "usage: %s [check] [time] [quant]\n", argv[0]);
+      std::fprintf(stderr, "usage: %s [check] [time] [quant] [probe]\n",
+                   argv[0]);
       return 2;
     }
   }
@@ -2007,6 +2444,10 @@ int main(int argc, char** argv) {
   if (time)
     for (unsigned depth : {4096U, 16384U, 32768U, 65536U, 131072U, 262144U})
       for (unsigned rows : {1U, 8U})
-        TimeDepth(depth, rows, timer);
+        TimeDepth(depth, rows, timer, false);
+  if (probe)
+    for (unsigned depth : {4096U, 32768U})
+      for (unsigned rows : {1U, 8U})
+        TimeDepth(depth, rows, timer, true);
   return totals.ok ? 0 : 1;
 }
