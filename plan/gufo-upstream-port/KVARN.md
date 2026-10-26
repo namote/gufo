@@ -223,6 +223,24 @@ fake quant는 FP16 커널을 그대로 쓰므로 속도를 재지 못한다. 그
 - 남은 병목: 4K는 블록당 그룹 2개 지연·sink/tail 블록·launch(바이트 하한 51 %), 32K는 마지막 블록 combine 약 8 µs, AR WMMA의 padding 10/16, verify는 ALU/LDS(하한 약 31 %).
 - **감독 판정: 속도·정확도 gate 통과. 단 채택 전 결정 1건:** K scale 접기를 AR에만 하면 AR과 verify의 산술이 달라져, K1c에 요구한 "verify 행 = 같은 위치 1행 decode 비트 일치"(greedy DFlash2 = AR)가 구조적으로 성립하지 않는다.
 
+### K1c-1 미해결 수정과 K1c-2 결과 (2026-10-26, gufo `fc433f33`…`9d07f567`, 감독 검증)
+
+- **(A) KL 최대 0.35는 양자화 효과다.** 같은 prompt·위치에서 K0 fake 경로의 KL 최대 0.21(실제 0.33), 중앙값 4.8e-5 대 5.0e-5, top-1 500/508로 같다. 실제‖fake는 중앙값 6e-7, 최대 0.022이고 window마다 커진다(4.3e-4 → 7.7e-3 → 2.2e-2): 마지막 비트 차이가 뒤 그룹의 RTN 코드를 뒤집기 때문. 대조군(그룹 행을 FP16 반올림 하나만큼 움직인 fake)도 같은 크기로 커진다(8.9e-5 → 4.8e-3 → 3.0e-2). gate를 "실제‖fake ≤ 대조군의 10배(window별 p95·최대), top-1 차 1/100 이내"로 바꿨다. 고정 bound를 넓힌 것이 아니라 측정한 반올림 대조군에 묶은 기준이라 감독이 받아들인다. 단 첫 window p95가 9.6배로 경계에 가깝다(통계적 기준, 재실행 시 주의).
+- **(B) verify 행 = 1행 decode 비트 일치 복원**(테스트: exact=1, max_abs 0). 원인 셋: 그룹을 질의 위치 기준으로 읽기(`KvarnReadGroups`, p 이하에서 끝난 그룹은 양자화로 읽고, verify chunk 안에서 끝난 그룹은 그 층 쓰기 뒤 양자화), split 수를 그룹 수만으로 결정, FP16 sink/tail split을 블록당 한 행으로(1행 경로의 V 0 채움과 맞춤) + 축약(contraction) 고정. 비용: verify(8행) 4K 103 → 124 µs, 32K 450 → 477 µs, 256K 그대로.
+- **K1c-2:** prefill은 WMMA pack에서 양자화 그룹을 dequant·역회전하고 ring의 FP16 행을 합치며, chunk마다 다 찬 그룹을 층별 staging에서 양자화한다(ring 한계 없음). chunk 하나 prefill은 FP16과 KL 0. 메모리 snapshot은 동작(bench·DFlash2), compact snapshot·checkpoint·continuation은 계속 거절. `prompt`·`chat`·`bench`에서 kvarn 사용 가능, `serve`는 prefix cache가 continuation을 써야 해서 K2까지 거절.
+- 32K 실제 경로(`qwen27b_kvarn_k0 --real`, chunk 4096): k4v2 top-1 214/214·텍스트 동일, KL(FP16 대비) 중앙값 4.7e-6·최대 8.8e-3(fake 5.1e-6·1.4e-2), fake‖real 최대 3.4e-4; k4v4 214/214·동일, 최대 3.0e-4.
+- 창: a06–a08 FAILED(진단, 기록 보존), a09–a11 COMPLETE, 모두 health PASS. fp16 동일성은 마지막 운영 커밋(`c3c44617`) 뒤 `9d07f567`의 a10에서 kv-block-table·target·inference_backend_gpu_test PASS. CPU `check-pr` 71/71.
+- **end-to-end 32K**(release, 번갈아 2회, t/s, fp16 → k4v2 / k4v4, 감독이 로그 대조):
+
+|측정점|AR|DFlash2|
+|---|---|---|
+|tg64 @ d32K|11.45 → 12.48 / 12.39 (+9 %)|55.45 → 65.8 / 66.2 (+19 %)|
+|pp512 @ d32K|323 → 365 / 364 (+13 %)|314 → 353 / 352|
+|pp512 @ d0|482 → 461 / 465 (**−4.4 %**)|458 → 444 / 445 (−3 %)|
+|tg64 @ d0|12.96 → 12.96|30.8 → 30.8|
+
+- 남은 문제: 짧은 prompt prefill −3–4 %(pack·store 비용) — 기본값을 k4v2로 바꾸기 전에 고친다. 양자화 커널 spill, 층마다 별도 회전 launch, 256K end-to-end 미측정.
+
 ### K0에서 정하지 않는 것
 
 - 커널·서빙·checkpoint 형식(K1·K2). 추가가 필요한 것만 적어 둔다: storage enum 값과 policy fingerprint 비트, K/V component `layout_version` 3(새 row_bytes와 128토큰 scale plane), compact snapshot 검증 완화, 블록 풀의 scale plane(`KvBlockPlane::rows_per_block` 128은 이미 표현 가능하나 arena·adapter가 같은 두 plane을 가정한다).
