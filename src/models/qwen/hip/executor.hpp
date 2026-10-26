@@ -60,15 +60,6 @@ struct QwenGpuVerificationItem {
   bool capture_logits{false};
 };
 
-/// Opens KVarN storage before its prefill exists (K1c-2) to tests and
-/// tools: such an executor runs decode, verification and batched decode;
-/// prompt prefill, snapshots and continuation refuse by name. Release
-/// entry points use QwenExecutionPolicyUnsupportedReason, which still
-/// refuses KVarN.
-struct QwenKvarnDecodeOnlyAccess {
-  explicit QwenKvarnDecodeOnlyAccess() = default;
-};
-
 struct QwenSampledVerificationResult {
   tokenization::TokenId token{0};
   bool accepted{false};
@@ -189,6 +180,10 @@ private:
   std::uint32_t max_context_{0};
   std::uint32_t valid_context_{0};
   std::size_t payload_bytes_{0};
+  // KVarN: d_kv_f16_ holds the records then the FP16 rows (kvarn_bytes_).
+  std::size_t kvarn_bytes_{0};
+  std::size_t kvarn_record_bytes_{0};
+  KvarnTail kvarn_tail_;
   QwenKvCacheStorage kv_storage_{QwenKvCacheStorage::kFp32};
   QwenRecurrentStateStorage recurrent_state_storage_{
       QwenRecurrentStateStorage::kFp32};
@@ -527,6 +522,15 @@ public:
   /// std::logic_error for a pass the tail cannot hold.
   KvarnPassPlan PrepareKvarnPass(std::uint32_t start, std::uint32_t rows,
                                  hipStream_t pass_stream);
+  /// The same for a prompt chunk (PlanKvarnPrefill): quantizes the groups
+  /// that ended at or before `start` and records the tail after the chunk,
+  /// whose layers quantize their own complete groups.
+  KvarnPrefillPlan PrepareKvarnPrefill(std::uint32_t start, std::uint32_t rows,
+                                       hipStream_t pass_stream);
+  /// Per-layer staging rows of a prompt chunk (KvarnStagingRows).
+  [[nodiscard]] std::span<std::uint16_t> GetKvarnStaging() const noexcept {
+    return {kvarn_.d_staging, kvarn_.staging_elements};
+  }
   [[nodiscard]] QwenRecurrentStateStorage GetRecurrentStateStorage()
       const noexcept {
     return policy_.recurrent_state_storage;
@@ -598,6 +602,8 @@ private:
     std::size_t plane_elements{0};
     float* d_scratch{nullptr};
     std::size_t scratch_elements{0};
+    std::uint16_t* d_staging{nullptr};
+    std::size_t staging_elements{0};
     KvarnTail tail;
   };
   KvarnStorage kvarn_;
@@ -640,9 +646,6 @@ public:
       QwenExecutionPolicy policy = QwenExecutionPolicy::Production(),
       std::shared_ptr<QwenSharedPassScratch> pass_scratch = nullptr,
       std::shared_ptr<KvBlockPool> kv_pool = nullptr);
-  QwenGpuExecutor(std::shared_ptr<const QwenGpuModel> model,
-                  std::uint32_t max_context, QwenExecutionPolicy policy,
-                  QwenKvarnDecodeOnlyAccess access);
   ~QwenGpuExecutor();
 
   [[nodiscard]] static std::unique_ptr<QwenGpuExecutor> Create(
@@ -828,10 +831,6 @@ public:
   void FinishVerification();
 
 private:
-  QwenGpuExecutor(std::shared_ptr<const QwenGpuModel> model,
-                  std::uint32_t max_context, QwenExecutionPolicy policy,
-                  std::shared_ptr<QwenSharedPassScratch> pass_scratch,
-                  std::shared_ptr<KvBlockPool> kv_pool, bool kvarn_decode_only);
   friend class models::qwen::ContinuationAdapter;
   models::qwen::ContinuationHooks* continuation_hooks_{nullptr};
   void CheckPrefillCancellation() const;

@@ -236,6 +236,60 @@ struct KvarnPassPlan {
   return plan;
 }
 
+/// What a prompt chunk writing rows [start, start + rows) does to the tail.
+/// Before it, groups [first_group, first_group + groups) are quantized from
+/// the ring, so the chunk reads read_groups quantized groups (those that
+/// ended at or before `start`), FP16 rows [target, start) from the ring and
+/// its own rows. Each layer then quantizes the groups that complete inside
+/// the chunk from a staging copy and keeps the rest in the ring; flushed_end
+/// is the tail after the chunk. Prompt rows are confirmed, so the chunk's
+/// own groups are quantized at once. `error` names a chunk that cannot run.
+struct KvarnPrefillPlan {
+  std::uint32_t first_group{0};
+  std::uint32_t groups{0};
+  std::uint32_t read_groups{0};
+  std::uint32_t target{kKvarnSinkTokens};
+  std::uint32_t flushed_end{kKvarnSinkTokens};
+  std::string_view error;
+};
+
+[[nodiscard]] constexpr KvarnPrefillPlan PlanKvarnPrefill(const KvarnTail& tail,
+                                                          std::uint32_t start,
+                                                          std::uint32_t rows) {
+  const auto group_floor = [](std::uint32_t position) {
+    return std::max(kKvarnSinkTokens,
+                    position >> kKvarnGroupShift << kKvarnGroupShift);
+  };
+  KvarnPrefillPlan plan;
+  if (rows == 0) {
+    plan.error = "KVarN prompt chunks write at least one row";
+    return plan;
+  }
+  std::uint32_t flushed = tail.flushed_end;
+  if (start < flushed) {
+    const std::uint32_t reopened = group_floor(start);
+    if (reopened + kKvarnTailRingTokens < tail.written_end) {
+      plan.error =
+          "KVarN cannot rewind into a quantized group whose FP16 rows the "
+          "tail ring no longer holds";
+      return plan;
+    }
+    flushed = reopened;
+  }
+  plan.target = group_floor(start);
+  plan.first_group = flushed >> kKvarnGroupShift;
+  plan.groups = (plan.target - flushed) >> kKvarnGroupShift;
+  plan.read_groups = KvarnReadGroups(start);
+  plan.flushed_end = group_floor(start + rows);
+  return plan;
+}
+
+/// Staging rows of one layer a prompt chunk of `rows` rows can need: the
+/// ring's unquantized rows before it (fewer than one group) and its own.
+[[nodiscard]] constexpr std::size_t KvarnStagingRows(std::uint32_t rows) {
+  return std::size_t{kKvarnGroupTokens} + rows;
+}
+
 }  // namespace gufo::hip
 
 #endif  // GUFO_MODELS_QWEN_HIP_KVARN_LAYOUT_HPP_

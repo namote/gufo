@@ -15,6 +15,7 @@
 #include <type_traits>
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
+#include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/hip/ops/kvarn.hpp"
 
 namespace gufo::hip {
@@ -26,6 +27,15 @@ constexpr unsigned kGroup = kKvarnGroupTokens, kRowWidth = kKvHeads * kDim;
 constexpr unsigned kPartialStride = kDim + 2;
 constexpr std::size_t kFp16LayerElements =
     static_cast<std::size_t>(kKvarnFp16Tokens) * kRowWidth;
+
+// Rows of a position: the sink and tail ring (kRingRows), or a contiguous
+// staging buffer whose row 0 holds position `staging_first`.
+constexpr unsigned kRingRows = ~0U;
+__host__ __device__ __forceinline__ std::size_t RowOf(unsigned position,
+                                                      unsigned staging_first) {
+  return staging_first == kRingRows ? KvarnFp16Row(position)
+                                    : position - staging_first;
+}
 
 template<int VBits>
 struct Record {
@@ -119,10 +129,13 @@ __device__ __forceinline__ void Fwht256(float (&y)[8], unsigned lane) {
 // Rotating row write. One 256-thread block per row; wave w handles KV head
 // w / 2, K for even w and V for odd w, lane l elements 8l..8l+7.
 // ---------------------------------------------------------------------------
-__launch_bounds__(256) __global__ void KvarnWriteRowsKernel(
-    const float* __restrict__ k, const float* __restrict__ v,
-    __half* __restrict__ k_rows, __half* __restrict__ v_rows,
-    const std::uint32_t* __restrict__ d_pos, unsigned start_pos) {
+__launch_bounds__(256) __global__
+    void KvarnWriteRowsKernel(const float* __restrict__ k,
+                              const float* __restrict__ v,
+                              __half* __restrict__ k_rows,
+                              __half* __restrict__ v_rows,
+                              const std::uint32_t* __restrict__ d_pos,
+                              unsigned start_pos, unsigned staging_first) {
   const unsigned row = blockIdx.x;
   const unsigned wave = threadIdx.x / 32, lane = threadIdx.x % 32;
   const unsigned kv = wave / 2;
@@ -144,8 +157,8 @@ __launch_bounds__(256) __global__ void KvarnWriteRowsKernel(
   for (unsigned j = 0; j < 8; ++j)
     h[j] = static_cast<_Float16>(y[j] * 0.0625F);
   __half* dst = (key ? k_rows : v_rows) +
-                static_cast<std::size_t>(KvarnFp16Row(position)) * kRowWidth +
-                kv * kDim + 8 * lane;
+                RowOf(position, staging_first) * kRowWidth + kv * kDim +
+                8 * lane;
   *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(h);
 }
 
@@ -159,13 +172,11 @@ __launch_bounds__(256) __global__ void KvarnWriteRowsKernel(
 // (tests/models/qwen27b/kvarn_fake_quant.hpp) does.
 // ---------------------------------------------------------------------------
 template<int VBits>
-__launch_bounds__(512) __global__
-    void KvarnQuantizeKernel(const __half* __restrict__ k_rows,
-                             const __half* __restrict__ v_rows,
-                             std::uint8_t* __restrict__ records,
-                             std::size_t records_layer_pitch,
-                             const std::uint32_t* __restrict__ blocks,
-                             unsigned first_group) {
+__launch_bounds__(512) __global__ void KvarnQuantizeKernel(
+    const __half* __restrict__ k_rows, const __half* __restrict__ v_rows,
+    std::uint8_t* __restrict__ records, std::size_t records_layer_pitch,
+    const std::uint32_t* __restrict__ blocks, unsigned first_group,
+    std::size_t source_layer_elements, unsigned staging_first) {
   using R = Record<VBits>;
   constexpr unsigned kWaves = 16;
   __shared__ double channel_part[kWaves][kDim];
@@ -178,10 +189,9 @@ __launch_bounds__(512) __global__
   const unsigned layer = blockIdx.z >> 1;
   const bool key = (blockIdx.z & 1) == 0;
   const unsigned tid = threadIdx.x, wave = tid / 32, lane = tid % 32;
-  const __half* src =
-      (key ? k_rows : v_rows) + layer * kFp16LayerElements +
-      static_cast<std::size_t>(KvarnFp16Row(group * kGroup)) * kRowWidth +
-      kv * kDim;
+  const __half* src = (key ? k_rows : v_rows) + layer * source_layer_elements +
+                      RowOf(group * kGroup, staging_first) * kRowWidth +
+                      kv * kDim;
   std::uint8_t* record = records + layer * records_layer_pitch +
                          RecordOffset<VBits>(blocks, group, kv);
 
@@ -981,6 +991,138 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
       }
 }
 
+// ---------------------------------------------------------------------------
+// Prefill pack: positions [0, length) of KV heads [first_head, ...) in the
+// original frame, head-major, as the prefill WMMA attention reads them. One
+// 256-thread block per (head, 16 positions); wave w takes positions 2w and
+// 2w+1, lane l channels 8l..8l+7. Rotated sources (sink, quantized groups,
+// ring rows) are rotated back in FP32 and rounded to FP16 once; the chunk's
+// own rows [start, length) are its FP32 K/V rounded to FP16, as the FP16
+// cache stores them.
+// ---------------------------------------------------------------------------
+struct PackArgs {
+  const std::uint8_t* records;  // this layer's record plane
+  const std::uint32_t* blocks;
+  const __half* k_rows;  // this layer's FP16 plane, rotated
+  const __half* v_rows;
+  const float* k;  // the chunk's rows [row][kv][256]
+  const float* v;
+  __half* packed_k;
+  __half* packed_v;
+  unsigned start, length, groups, first_head;
+};
+
+template<int VBits>
+__launch_bounds__(256) __global__ void KvarnPackHeadsKernel(PackArgs a) {
+  using R = Record<VBits>;
+  __shared__ __half tile[16][kDim + 8];
+  const unsigned head = blockIdx.x, kv = a.first_head + head;
+  const unsigned base = blockIdx.y * 16;
+  const unsigned wave = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const unsigned quantized_end = kGroup * (1 + a.groups);
+  for (unsigned which = 0; which < 4; ++which) {
+    const unsigned key_index = 2 * wave + which / 2;
+    const bool key = (which & 1) == 0;
+    const unsigned t = base + key_index;
+    float y[8] = {};
+    bool rotated = true;
+    if (t >= a.length) {
+      rotated = false;
+    } else if (t >= a.start) {
+      const float* src =
+          (key ? a.k : a.v) +
+          (static_cast<std::size_t>(t - a.start) * kKvHeads + kv) * kDim +
+          8 * lane;
+#pragma unroll
+      for (unsigned j = 0; j < 8; ++j)
+        y[j] = __half2float(__float2half_rn(src[j]));
+      rotated = false;
+    } else if (t >= kGroup && t < quantized_end) {
+      const unsigned group = t / kGroup, u = t % kGroup;
+      const std::uint8_t* record =
+          a.records + RecordOffset<VBits>(a.blocks, group, kv);
+      const auto* halves = reinterpret_cast<const __half*>(record);
+      if (key) {
+        const unsigned word = reinterpret_cast<const unsigned*>(
+            record + R::kKCodes)[u * 32 + lane];
+        const float column = __half2float(halves[R::kKColumn / 2 + u]);
+#pragma unroll
+        for (unsigned j = 0; j < 8; ++j) {
+          const unsigned nibble = (j % 2 == 0) ? j / 2 : 4 + j / 2;
+          const float code = static_cast<float>((word >> (4 * nibble)) & 15);
+          const unsigned c = 8 * lane + j;
+          y[j] = (code * __half2float(halves[R::kKScale / 2 + c]) +
+                  __half2float(halves[R::kKZero / 2 + c])) *
+                 column;
+        }
+      } else {
+        const float scale = __half2float(halves[R::kVScale / 2 + u]);
+        const float zero = __half2float(halves[R::kVZero / 2 + u]);
+        const auto* words =
+            reinterpret_cast<const unsigned*>(record + R::kVCodes);
+#pragma unroll
+        for (unsigned j = 0; j < 8; ++j) {
+          const unsigned c = 8 * lane + j;
+          unsigned code;
+          if constexpr (VBits == 2) {
+            const unsigned w = u % 16;
+            const unsigned crumb = (w % 2 == 0) ? w / 2 : 8 + w / 2;
+            code = (words[c * 8 + u / 16] >> (2 * crumb)) & 3;
+          } else {
+            const unsigned w = u % 8;
+            const unsigned nibble = (w % 2 == 0) ? w / 2 : 4 + w / 2;
+            code = (words[c * 16 + u / 8] >> (4 * nibble)) & 15;
+          }
+          y[j] = (static_cast<float>(code) * scale + zero) *
+                 __half2float(halves[R::kVColumn / 2 + c]);
+        }
+      }
+    } else {
+      const __half* src =
+          (key ? a.k_rows : a.v_rows) +
+          static_cast<std::size_t>(KvarnFp16Row(t)) * kRowWidth + kv * kDim +
+          8 * lane;
+#pragma unroll
+      for (unsigned j = 0; j < 8; ++j)
+        y[j] = __half2float(src[j]);
+    }
+    if (rotated) {
+      Fwht256(y, lane);
+#pragma unroll
+      for (unsigned j = 0; j < 8; ++j)
+        y[j] *= 0.0625F;
+    }
+    _Float16 h[8];
+#pragma unroll
+    for (unsigned j = 0; j < 8; ++j)
+      h[j] = static_cast<_Float16>(y[j]);
+    if (key) {
+      if (t < a.length)
+        *reinterpret_cast<uint4*>(
+            a.packed_k +
+            (static_cast<std::size_t>(head) * a.length + t) * kDim + 8 * lane) =
+            *reinterpret_cast<const uint4*>(h);
+    } else {
+      *reinterpret_cast<uint4*>(&tile[key_index][8 * lane]) =
+          *reinterpret_cast<const uint4*>(h);
+    }
+  }
+  __syncthreads();
+  // V^T per 16-position tile: [dim][16 keys], as PackAttentionHeads.
+  const std::size_t padded = (a.length + 15U) & ~std::size_t{15};
+  for (unsigned i = threadIdx.x; i < 16 * kDim / 8; i += 256) {
+    const unsigned dim = i / 2, key = (i % 2) * 8;
+    __half values[8];
+#pragma unroll
+    for (unsigned j = 0; j < 8; ++j)
+      values[j] = tile[key + j][dim];
+    *reinterpret_cast<uint4*>(a.packed_v +
+                              static_cast<std::size_t>(head) * padded * kDim +
+                              static_cast<std::size_t>(base) * kDim + dim * 16 +
+                              key) = *reinterpret_cast<const uint4*>(values);
+  }
+}
+
 // Combines the splits of one (query row, head), normalizes, rotates back
 // and applies the output gate.
 __launch_bounds__(256) __global__
@@ -1090,7 +1232,7 @@ void LaunchKvarnWriteRows(const float* k, const float* v, const KvarnKvView& kv,
   auto* const v_rows =
       static_cast<__half*>(kv.v_rows) + layer * kFp16LayerElements;
   KvarnWriteRowsKernel<<<rows, 256, 0, stream>>>(k, v, k_rows, v_rows, d_pos,
-                                                 start_pos);
+                                                 start_pos, kRingRows);
 }
 
 void LaunchKvarnFlush(const KvarnKvView& kv, std::uint32_t layers,
@@ -1107,13 +1249,13 @@ void LaunchKvarnFlush(const KvarnKvView& kv, std::uint32_t layers,
       static_cast<const __half*>(kv.v_rows) + first_layer * kFp16LayerElements;
   std::uint8_t* records = kv.records + first_layer * kv.records_layer_pitch;
   if (kv.value_bits == 2)
-    KvarnQuantizeKernel<2><<<grid, 512, 0, stream>>>(k_rows, v_rows, records,
-                                                     kv.records_layer_pitch,
-                                                     kv.blocks, first_group);
+    KvarnQuantizeKernel<2><<<grid, 512, 0, stream>>>(
+        k_rows, v_rows, records, kv.records_layer_pitch, kv.blocks, first_group,
+        kFp16LayerElements, kRingRows);
   else if (kv.value_bits == 4)
-    KvarnQuantizeKernel<4><<<grid, 512, 0, stream>>>(k_rows, v_rows, records,
-                                                     kv.records_layer_pitch,
-                                                     kv.blocks, first_group);
+    KvarnQuantizeKernel<4><<<grid, 512, 0, stream>>>(
+        k_rows, v_rows, records, kv.records_layer_pitch, kv.blocks, first_group,
+        kFp16LayerElements, kRingRows);
   else
     throw std::invalid_argument("KVarN value codes are 2 or 4 bits");
 }
@@ -1186,6 +1328,127 @@ void LaunchKvarnPassAttention(const float* q, const float* k, const float* v,
         q + split * kWidth, gate == nullptr ? nullptr : gate + split * kWidth,
         kv, out_context + split * kWidth, layer, nullptr, start + split,
         rows - split, plan.read_groups + 1, 0, scratch, stream);
+}
+
+void LaunchKvarnPrefillAttention(const float* q, const float* k, const float* v,
+                                 const float* gate, const KvarnKvView& kv,
+                                 float* out_context, std::uint32_t layer,
+                                 std::uint32_t start, std::uint32_t rows,
+                                 const KvarnPrefillPlan& plan,
+                                 std::span<float> packed_k_workspace,
+                                 std::span<float> packed_v_workspace,
+                                 std::span<std::uint16_t> staging,
+                                 std::size_t first_query, hipStream_t stream) {
+  if (rows == 0)
+    return;
+  const std::uint32_t length = start + rows;
+  const std::size_t key_head_bytes =
+      static_cast<std::size_t>(length) * kDim * sizeof(__half);
+  const std::size_t value_head_bytes =
+      ((static_cast<std::size_t>(length) + 15U) & ~std::size_t{15}) * kDim *
+      sizeof(__half);
+  const auto heads_per_group = static_cast<std::uint32_t>(std::min(
+      {std::size_t{kKvHeads}, packed_k_workspace.size_bytes() / key_head_bytes,
+       packed_v_workspace.size_bytes() / value_head_bytes}));
+  if (heads_per_group == 0)
+    throw std::length_error("KVarN prefill workspace holds no KV head");
+  if (staging.size() < 2 * KvarnStagingRows(rows) * kRowWidth)
+    throw std::length_error("KVarN prefill staging is too small");
+  detail::EmitAttentionDispatch(kv.value_bits == 2 ? "prefill_wmma_kvarn_k4v2"
+                                                   : "prefill_wmma_kvarn_k4v4",
+                                "");
+  const auto* layer_k =
+      static_cast<const __half*>(kv.k_rows) + layer * kFp16LayerElements;
+  const auto* layer_v =
+      static_cast<const __half*>(kv.v_rows) + layer * kFp16LayerElements;
+  const std::uint8_t* layer_records =
+      kv.records + layer * kv.records_layer_pitch;
+  for (std::uint32_t first = 0; first < kKvHeads; first += heads_per_group) {
+    const auto heads = std::min(heads_per_group, kKvHeads - first);
+    const PackArgs args{
+        .records = layer_records,
+        .blocks = kv.blocks,
+        .k_rows = layer_k,
+        .v_rows = layer_v,
+        .k = k,
+        .v = v,
+        .packed_k = reinterpret_cast<__half*>(packed_k_workspace.data()),
+        .packed_v = reinterpret_cast<__half*>(packed_v_workspace.data()),
+        .start = start,
+        .length = length,
+        .groups = plan.read_groups,
+        .first_head = first,
+    };
+    const dim3 grid(heads, (length + 15U) / 16U);
+    if (kv.value_bits == 2)
+      KvarnPackHeadsKernel<2><<<grid, 256, 0, stream>>>(args);
+    else if (kv.value_bits == 4)
+      KvarnPackHeadsKernel<4><<<grid, 256, 0, stream>>>(args);
+    else
+      throw std::invalid_argument("KVarN value codes are 2 or 4 bits");
+    LaunchQwenWmmaPackedHeadsAttention(q, gate, args.packed_k, args.packed_v,
+                                       out_context, start, rows, first, heads,
+                                       first_query, stream);
+  }
+
+  // Store the chunk. Rows in the sink go straight there.
+  const std::uint32_t end = length;
+  const std::uint32_t sink_end = std::min(end, kKvarnSinkTokens);
+  if (start < sink_end)
+    LaunchKvarnWriteRows(k, v, kv, layer, nullptr, start, sink_end - start,
+                         stream);
+  if (end <= kKvarnSinkTokens)
+    return;
+  // Staging holds positions [target, end): the ring's rows before the chunk
+  // (one partial group, consecutive in the ring), then the chunk's own.
+  const std::uint32_t target = plan.target;
+  auto* staging_k = reinterpret_cast<__half*>(staging.data());
+  auto* staging_v = staging_k + KvarnStagingRows(rows) * kRowWidth;
+  auto* ring_k = static_cast<__half*>(kv.k_rows) + layer * kFp16LayerElements;
+  auto* ring_v = static_cast<__half*>(kv.v_rows) + layer * kFp16LayerElements;
+  const std::size_t row_bytes = kRowWidth * sizeof(__half);
+  if (start > target) {
+    const std::size_t ring_row = KvarnFp16Row(target);
+    HIP_CHECK(hipMemcpyAsync(staging_k, ring_k + ring_row * kRowWidth,
+                             (start - target) * row_bytes,
+                             hipMemcpyDeviceToDevice, stream));
+    HIP_CHECK(hipMemcpyAsync(staging_v, ring_v + ring_row * kRowWidth,
+                             (start - target) * row_bytes,
+                             hipMemcpyDeviceToDevice, stream));
+  }
+  const std::uint32_t first_row = std::max(start, kKvarnSinkTokens);
+  KvarnWriteRowsKernel<<<end - first_row, 256, 0, stream>>>(
+      k + static_cast<std::size_t>(first_row - start) * kRowWidth,
+      v + static_cast<std::size_t>(first_row - start) * kRowWidth, staging_k,
+      staging_v, nullptr, first_row, target);
+  const std::uint32_t complete_end = end >> kKvarnGroupShift
+                                                << kKvarnGroupShift;
+  if (complete_end > target) {
+    const dim3 grid(kKvHeads, (complete_end - target) >> kKvarnGroupShift, 2);
+    std::uint8_t* records = kv.records + layer * kv.records_layer_pitch;
+    const unsigned first_group = target >> kKvarnGroupShift;
+    if (kv.value_bits == 2)
+      KvarnQuantizeKernel<2><<<grid, 512, 0, stream>>>(
+          staging_k, staging_v, records, kv.records_layer_pitch, kv.blocks,
+          first_group, 0, target);
+    else
+      KvarnQuantizeKernel<4><<<grid, 512, 0, stream>>>(
+          staging_k, staging_v, records, kv.records_layer_pitch, kv.blocks,
+          first_group, 0, target);
+  }
+  // The incomplete group stays FP16 in the ring.
+  const std::uint32_t leftover = std::max(target, complete_end);
+  if (end > leftover) {
+    const std::size_t ring_row = KvarnFp16Row(leftover);
+    HIP_CHECK(hipMemcpyAsync(ring_k + ring_row * kRowWidth,
+                             staging_k + (leftover - target) * kRowWidth,
+                             (end - leftover) * row_bytes,
+                             hipMemcpyDeviceToDevice, stream));
+    HIP_CHECK(hipMemcpyAsync(ring_v + ring_row * kRowWidth,
+                             staging_v + (leftover - target) * kRowWidth,
+                             (end - leftover) * row_bytes,
+                             hipMemcpyDeviceToDevice, stream));
+  }
 }
 
 }  // namespace gufo::hip

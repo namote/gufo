@@ -68,6 +68,7 @@
 
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
+#include "src/models/qwen/hip/ops/kvarn.hpp"
 
 namespace gufo::hip {
 
@@ -732,6 +733,26 @@ bool LaunchQwenWmmaAttention(
           batch_size, lse_out, key_begin,
           static_cast<std::uint32_t>(first_query));
   return true;
+}
+
+void LaunchQwenWmmaPackedHeadsAttention(
+    const float* q, const float* gate, const void* packed_k,
+    const void* packed_v, float* out_context, std::uint32_t start_pos,
+    std::size_t batch_size, std::uint32_t first_head, std::uint32_t heads,
+    std::size_t first_query, hipStream_t stream) {
+  const std::size_t query_offset =
+      static_cast<std::size_t>(first_head) * kGqa * kHeadDim;
+  const dim3 grid(
+      static_cast<unsigned int>(
+          (batch_size - first_query + kWmmaQueryRows - 1) / kWmmaQueryRows),
+      heads * (kGqa / kWmmaHeads));
+  WmmaCausalAttention<kWmmaQueryRows, kWmmaKeys, true>
+      <<<grid, 256, 0, stream>>>(
+          q + query_offset, gate ? gate + query_offset : nullptr,
+          static_cast<const __half*>(packed_k),
+          static_cast<const __half*>(packed_v), KvBlockTable{},
+          out_context + query_offset, start_pos, batch_size, nullptr, 0,
+          static_cast<std::uint32_t>(first_query));
 }
 
 }  // namespace gufo::hip

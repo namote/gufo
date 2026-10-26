@@ -71,6 +71,36 @@ void LaunchKvarnPassAttention(const float* q, const float* k, const float* v,
                               const KvarnPassPlan& plan,
                               std::span<float> scratch, hipStream_t stream);
 
+/// One layer of a prompt chunk over rows [start, start + rows) planned by
+/// PlanKvarnPrefill. Packs the K/V of positions [0, start + rows) in the
+/// original frame into the head-major WMMA workspaces (quantized groups and
+/// rotated FP16 rows dequantized and rotated back, the chunk's own rows as
+/// the FP16 cache would hold them), in head groups that fit, runs the
+/// prefill WMMA attention on each (output rows from `first_query`), then
+/// stores the chunk: sink rows, groups completing inside the chunk
+/// quantized from `staging` (KvarnStagingRows(rows) rows of K then V), the
+/// rest into the ring. Throws std::length_error when one head does not fit
+/// the workspaces.
+void LaunchKvarnPrefillAttention(const float* q, const float* k, const float* v,
+                                 const float* gate, const KvarnKvView& kv,
+                                 float* out_context, std::uint32_t layer,
+                                 std::uint32_t start, std::uint32_t rows,
+                                 const KvarnPrefillPlan& plan,
+                                 std::span<float> packed_k_workspace,
+                                 std::span<float> packed_v_workspace,
+                                 std::span<std::uint16_t> staging,
+                                 std::size_t first_query, hipStream_t stream);
+
+/// The prefill WMMA attention (kernels/attention_wmma.hip) over KV heads
+/// [first_head, first_head + heads) already packed head-major: K
+/// [head][length][256], V [head][length / 16][256][16] (length padded to
+/// 16), FP16, length = start_pos + batch_size.
+void LaunchQwenWmmaPackedHeadsAttention(
+    const float* q, const float* gate, const void* packed_k,
+    const void* packed_v, float* out_context, std::uint32_t start_pos,
+    std::size_t batch_size, std::uint32_t first_head, std::uint32_t heads,
+    std::size_t first_query, hipStream_t stream);
+
 }  // namespace gufo::hip
 
 #endif  // defined(ENGINE_ENABLE_HIP)

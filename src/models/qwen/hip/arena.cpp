@@ -231,6 +231,9 @@ QwenGpuSnapshot::~QwenGpuSnapshot() {
 }
 
 std::size_t QwenGpuSnapshot::CompactPayloadBytes() const {
+  if (kvarn_bytes_ != 0)
+    throw std::logic_error(
+        "compact Qwen snapshots of KVarN KV are not implemented yet");
   const std::size_t recurrent_layers = num_layers_ - attention_layers_;
   return MakeCompactSnapshotLayout(
              attention_layers_, kv_width_, max_context_, valid_context_,
@@ -243,6 +246,9 @@ std::size_t QwenGpuSnapshot::CompactPayloadBytes() const {
 
 std::size_t QwenGpuSnapshot::SerializeCompact(
     std::span<std::uint8_t> destination) const {
+  if (kvarn_bytes_ != 0)
+    throw std::logic_error(
+        "compact Qwen snapshots of KVarN KV are not implemented yet");
   if (full_attention_interval_ == 0 || attention_layers_ > num_layers_ ||
       conv_elements_ != CheckedMultiply(num_layers_ - attention_layers_,
                                         conv_elements_per_layer_) ||
@@ -617,6 +623,10 @@ QwenGpuMemoryUsage QwenGpuArena::EstimateMemoryUsage(
         &state);
     AddAllocation(KvarnScratchElements(kKvarnMaxRows, kKvarnMaxSplits),
                   sizeof(float), &scratch);
+    AddAllocation(
+        CheckedMultiply(2 * KvarnStagingRows(static_cast<std::uint32_t>(batch)),
+                        kv),
+        sizeof(std::uint16_t), &scratch);
     CheckedAdd(RecurrentStateBytes(config, policy), &state);
     return usage;
   }
@@ -685,7 +695,8 @@ std::size_t QwenGpuArena::SnapshotPayloadBytes(
 
 std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
     std::uint32_t valid_context) {
-  RequireSnapshotStorage();
+  // KVarN keeps in-memory snapshots (the bench and DFlash2 prefix copies);
+  // compact payloads and checkpoints wait for a KVarN layout (K2).
   RequireOwnKvPool();
   if (valid_context > max_context_) {
     throw std::length_error("Qwen snapshot exceeds the context length");
@@ -700,9 +711,27 @@ std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
   snapshot->valid_context_ = valid_context;
   snapshot->kv_storage_ = policy_.kv_cache_storage;
   snapshot->recurrent_state_storage_ = policy_.recurrent_state_storage;
-  snapshot->kv_elements_per_plane_ = CheckedMultiply(
-      CheckedMultiply(snapshot->attention_layers_, valid_context),
-      snapshot->kv_width_);
+  snapshot->kv_elements_per_plane_ =
+      UsesKvarn() ? 0
+                  : CheckedMultiply(CheckedMultiply(snapshot->attention_layers_,
+                                                    valid_context),
+                                    snapshot->kv_width_);
+  // KVarN: the record plane's blocks below valid_context in every layer,
+  // then the whole FP16 sink and tail plane, then the tail state.
+  std::size_t kvarn_block_bytes = 0;
+  if (UsesKvarn()) {
+    kvarn_block_bytes = CheckedMultiply(KvBlockPool::BlocksFor(valid_context),
+                                        kv_pool_->geometry().block_bytes(0));
+    snapshot->kvarn_record_bytes_ =
+        CheckedMultiply(kvarn_block_bytes, snapshot->attention_layers_);
+    snapshot->kvarn_bytes_ =
+        snapshot->kvarn_record_bytes_ +
+        CheckedMultiply(2 * kvarn_.plane_elements, sizeof(std::uint16_t));
+    snapshot->kvarn_tail_ = kvarn_.tail;
+    CheckedAdd(snapshot->kvarn_bytes_, &snapshot->payload_bytes_);
+    ThrowOnHipError(hipMalloc(&snapshot->d_kv_f16_, snapshot->kvarn_bytes_),
+                    "failed to allocate Qwen KVarN snapshot KV");
+  }
   snapshot->conv_elements_per_layer_ =
       CheckedMultiply(config_.SsmQkvSize(), config_.ssm_conv_kernel);
   snapshot->conv_elements_ =
@@ -773,6 +802,16 @@ std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
                       KvPlaneBase(plane), source_pitch, target_pitch, rows,
                       hipMemcpyDeviceToDevice);
   }
+  if (UsesKvarn()) {
+    auto* destination = static_cast<std::uint8_t*>(snapshot->d_kv_f16_);
+    if (kvarn_block_bytes != 0)
+      transfer.Copy2D(destination, kvarn_block_bytes, kv_pool_->plane_data(0),
+                      kv_pool_->geometry().layer_pitch(0), kvarn_block_bytes,
+                      snapshot->attention_layers_, hipMemcpyDeviceToDevice);
+    transfer.Copy(destination + snapshot->kvarn_record_bytes_, kvarn_.d_rows,
+                  snapshot->kvarn_bytes_ - snapshot->kvarn_record_bytes_,
+                  hipMemcpyDeviceToDevice);
+  }
   transfer.Copy(snapshot->d_ssm_conv_, d_ssm_conv_state, conv_bytes,
                 hipMemcpyDeviceToDevice);
   transfer.Copy(snapshot->d_ssm_deltanet_, d_ssm_deltanet_state, deltanet_bytes,
@@ -781,7 +820,6 @@ std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
 }
 
 void QwenGpuArena::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
-  RequireSnapshotStorage();
   RequireOwnKvPool();
   const std::uint32_t attention_layers = config_.FullAttentionLayerCount();
   const std::uint32_t kv_width = config_.num_key_value_heads * config_.head_dim;
@@ -829,6 +867,24 @@ void QwenGpuArena::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
                            source + plane * source_plane, source_pitch,
                            source_pitch, rows, hipMemcpyDeviceToDevice, stream),
           "failed to restore Qwen KV snapshot");
+  }
+  if (UsesKvarn()) {
+    const auto* source = static_cast<const std::uint8_t*>(snapshot.d_kv_f16_);
+    const std::size_t block_bytes =
+        snapshot.kvarn_record_bytes_ / std::max(attention_layers, 1U);
+    if (block_bytes != 0)
+      ThrowOnHipError(
+          hipMemcpy2DAsync(kv_pool_->plane_data(0),
+                           kv_pool_->geometry().layer_pitch(0), source,
+                           block_bytes, block_bytes, attention_layers,
+                           hipMemcpyDeviceToDevice, stream),
+          "failed to restore Qwen KVarN records");
+    ThrowOnHipError(
+        hipMemcpyAsync(kvarn_.d_rows, source + snapshot.kvarn_record_bytes_,
+                       snapshot.kvarn_bytes_ - snapshot.kvarn_record_bytes_,
+                       hipMemcpyDeviceToDevice, stream),
+        "failed to restore Qwen KVarN rows");
+    kvarn_.tail = snapshot.kvarn_tail_;
   }
   ThrowOnHipError(hipMemcpyAsync(d_ssm_conv_state, snapshot.d_ssm_conv_,
                                  snapshot.conv_elements_ * sizeof(float),
@@ -1053,6 +1109,10 @@ void QwenGpuArena::AllocateKvarn() {
       KvarnScratchElements(kKvarnMaxRows, kKvarnMaxSplits);
   HIP_CHECK(
       hipMalloc(&kvarn_.d_scratch, kvarn_.scratch_elements * sizeof(float)));
+  kvarn_.staging_elements = 2 * KvarnStagingRows(max_batch_) *
+                            config_.num_key_value_heads * config_.head_dim;
+  HIP_CHECK(hipMalloc(&kvarn_.d_staging,
+                      kvarn_.staging_elements * sizeof(std::uint16_t)));
   kvarn_.tail = {};
 }
 
@@ -1077,6 +1137,28 @@ KvarnPassPlan QwenGpuArena::PrepareKvarnPass(std::uint32_t start,
   // Which groups a row reads depends on its position only (KvarnReadGroups);
   // a rewind reopens the groups past it from the ring.
   const auto plan = PlanKvarnPass(kvarn_.tail, start, rows);
+  if (!plan.error.empty())
+    throw std::logic_error(std::string(plan.error) + " (rows " +
+                           std::to_string(start) + "-" +
+                           std::to_string(start + rows) + ")");
+  EnsureKvRows(start + rows);
+  LaunchKvarnFlush(GetKvarnView(), config_.FullAttentionLayerCount(),
+                   plan.first_group, plan.groups, pass_stream);
+  kvarn_.tail.flushed_end = plan.flushed_end;
+  kvarn_.tail.written_end = std::max(kvarn_.tail.written_end, start + rows);
+  return plan;
+}
+
+KvarnPrefillPlan QwenGpuArena::PrepareKvarnPrefill(std::uint32_t start,
+                                                   std::uint32_t rows,
+                                                   hipStream_t pass_stream) {
+  if (!UsesKvarn())
+    throw std::logic_error("Qwen arena does not store KVarN attention KV");
+  if (start > max_context_ || rows > max_context_ - start)
+    throw std::length_error("KVarN prompt chunk exceeds the context length");
+  if (rows > max_batch_)
+    throw std::length_error("KVarN prompt chunk exceeds the staging rows");
+  const auto plan = PlanKvarnPrefill(kvarn_.tail, start, rows);
   if (!plan.error.empty())
     throw std::logic_error(std::string(plan.error) + " (rows " +
                            std::to_string(start) + "-" +
@@ -1700,6 +1782,8 @@ void QwenGpuArena::FreeAll() noexcept {
     LogCleanupError(hipFree(kvarn_.d_rows));
   if (kvarn_.d_scratch != nullptr)
     LogCleanupError(hipFree(kvarn_.d_scratch));
+  if (kvarn_.d_staging != nullptr)
+    LogCleanupError(hipFree(kvarn_.d_staging));
   kvarn_ = {};
   for (float* buffer : d_ssm_conv_buffers_)
     if (buffer != nullptr)
