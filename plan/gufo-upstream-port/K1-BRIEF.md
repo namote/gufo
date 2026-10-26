@@ -71,3 +71,14 @@ K1a·K1b 결과와 감독 판정은 [KVarN](KVARN.md) "K1a·K1b 결과"에 있�
 - prefill이 양자화된 앞 블록을 읽게 한다. 먼저 `PackAttentionHeads` 단계에서 dequant하는 방법을 검토하고, 속도·메모리 영향을 보고한다. 이 단계 끝에 Qwen 27B kvarn 거절을 없앤다(continuation layout·checkpoint는 K2까지 거절).
 - `qwen27b_kvarn_k0`에 실제 경로 비교 모드: kvarn policy executor로 prefill + teacher forcing + free greedy를 해서 FP16 기준과 KL·top-1·gold, 그리고 K0 fake quant 결과(`KVARN.md` K0 표)와 비교한다.
 - 32K 창: 위 비교(k4v2·k4v4), `gufo bench` AR·DFlash2 `-d 0,32768`을 fp16과 kvarn으로 번갈아. 256K는 하지 않는다.
+
+## K1b-opt: decode 커널 최적화 실험 (2026-10-26 사용자, K1c와 병행)
+
+- **파일 경계:** `tools/bench/kvarn_decode_bench.hip`만 고친다(필요하면 같은 디렉터리의 새 헤더 하나). 빌드는 `build/kvarn-opt/`(K1b의 `build/kvarn-bench/build.sh`를 복사해 경로만 바꿔 쓴다). 운영 코드·`build/cpu-test`·`build/gpu-test`·`build/kvarn-bench`는 K1c 에이전트 것이라 건드리지 않는다. 창 계획은 `PLAN-K1BOPT.json`.
+- **목표:** AR k4v2를 대역폭 하한 대비 32K 66 %·256K 79 %(K1b)에서 올리기, 4K 고정 비용 줄이기.
+- **후보(예시, 더 찾아도 됨):** int8 WMMA에 코드를 바로 넣기 / dequant를 LDS에서 한 번 해서 두 half-wave가 공유 / WMMA 대신 `v_dot*`나 packed FP16 / nibble 배치·scale 위치를 바꿔 unpack 줄이기 / wave당 토큰·head 수, 그룹 루프 구조 / 4K: launch 합치기, sink·tail 처리 통합, split 정책.
+- **진행:** 후보마다 짧은 시제품을 같은 바이너리에 넣어 비교하고, 가망 없는 후보는 일찍 접고 이유를 남긴다. 한 후보에 매달리지 않는다.
+- **판단 기준:** 정확도는 K1b check 경우에서 커널 오차 ≤ 1e-3, 양자화 결과는 K0 규칙과 비트 일치(K1b의 scale ulp 규칙). 속도는 K1b 커널·FP16 기준과 같은 바이너리에서 번갈아, 깊이 4K–256K, 질의 1·8, 대역폭 하한 대비 %와 명령 구성(`tools/prof/isa_mix.py`).
+- **저장 배치 결론 필수:** 배치를 바꿔야 하는지, 바꾸면 무엇을. K2(checkpoint 형식)와 K1c 통합 전에 반영해야 한다.
+- **GPU:** 창 실행기로만, 한 번에 하나. K1c 에이전트와 번갈아 쓴다: `docker ps`와 lock(`~/projects/ai.tools/storage/runtime/experiments/vllm-multi-selected-20261016/ABBA-OWNER.lock`)이 잡혀 있으면 기다렸다가 나중에 시작한다(시작 전 lock 거절은 실패한 실행이 아니다). 창 전에 `.gufo-revision`을 HEAD로, 창 끝에 `/bin/sleep 20`. 실패하면 자동 재시도하지 않고 기록을 남긴다.
+- **보고:** 후보별 결과(채택·기각과 이유), 추천 조합, 배치 변경 필요 여부, 정확도 표, 깊이×형식×질의 속도 표(K1b 대비), 남은 병목, 다음 후보 제안(양자화 커널 튜닝: double 분산·spill, FP16 verify 기준 커널 개선).
