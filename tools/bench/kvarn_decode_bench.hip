@@ -77,6 +77,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <random>
 #include <string_view>
@@ -663,7 +664,11 @@ __device__ __forceinline__ void Pin(v8f (&acc)[N]) {
 }
 
 // Opt split combine of row m (of M) of one KV head by one wave: lane l
-// owns output channels 8l..8l+7; the maxima are in base 2.
+// owns output channels 8l..8l+7; the maxima are in base 2. Fast (K4-P2,
+// Gen 6): the same arithmetic in the same order with fewer dependent L2
+// round trips: each split's maximum and sum load together, and the first
+// eight splits' values are in flight with them.
+template<bool Fast = false>
 __device__ __forceinline__ void CombineRow(const float* scratch, float* out,
                                            unsigned kv, unsigned m, unsigned M,
                                            unsigned nsplit, unsigned lane) {
@@ -671,9 +676,33 @@ __device__ __forceinline__ void CombineRow(const float* scratch, float* out,
       scratch +
       (static_cast<std::size_t>(kv) * nsplit * M + m) * kPartialStride;
   const std::size_t stride = static_cast<std::size_t>(M) * kPartialStride;
+  const auto load_values = [&](unsigned s0, unsigned j0, unsigned count,
+                               float2(&x)[8][4]) {
+#pragma unroll
+    for (unsigned j = 0; j < 8; ++j) {
+      const unsigned jj = min(j0 + j, count - 1);
+      const auto* v = reinterpret_cast<const float2*>(
+          base + (s0 + jj) * stride + 2 + 8 * lane);
+#pragma unroll
+      for (unsigned k = 0; k < 4; ++k)
+        x[j][k] = v[k];
+    }
+  };
+  float2 stats[2] = {{-INFINITY, 0.0F}, {-INFINITY, 0.0F}};
+  float2 first[8][4];
   float mx = -INFINITY;
-  for (unsigned s = lane; s < nsplit; s += 32)
-    mx = fmaxf(mx, base[s * stride]);
+  if constexpr (Fast) {
+#pragma unroll
+    for (unsigned c = 0; c < 2; ++c)
+      if (lane + 32 * c < nsplit)
+        stats[c] =
+            *reinterpret_cast<const float2*>(base + (lane + 32 * c) * stride);
+    load_values(0, 0, min(32U, nsplit), first);
+    mx = fmaxf(stats[0].x, stats[1].x);
+  } else {
+    for (unsigned s = lane; s < nsplit; s += 32)
+      mx = fmaxf(mx, base[s * stride]);
+  }
 #pragma unroll
   for (unsigned mask = 1; mask < 32; mask <<= 1)
     mx = fmaxf(mx, __shfl_xor(mx, mask));
@@ -681,9 +710,13 @@ __device__ __forceinline__ void CombineRow(const float* scratch, float* out,
   for (unsigned s0 = 0; s0 < nsplit; s0 += 32) {
     float e = 0.0F;
     if (s0 + lane < nsplit) {
-      const float* p = base + (s0 + lane) * stride;
-      e = p[0] == -INFINITY ? 0.0F : __builtin_amdgcn_exp2f(p[0] - mx);
-      sum = fmaf(p[1], e, sum);
+      float2 p;
+      if constexpr (Fast)
+        p = s0 == 0 ? stats[0] : stats[1];
+      else
+        p = float2{base[(s0 + lane) * stride], base[(s0 + lane) * stride + 1]};
+      e = p.x == -INFINITY ? 0.0F : __builtin_amdgcn_exp2f(p.x - mx);
+      sum = fmaf(p.y, e, sum);
     }
     const unsigned count = min(32U, nsplit - s0);
     // Eight splits' loads in flight per step.
@@ -694,11 +727,15 @@ __device__ __forceinline__ void CombineRow(const float* scratch, float* out,
       for (unsigned j = 0; j < 8; ++j) {
         const unsigned jj = min(j0 + j, count - 1);
         w[j] = j0 + j < count ? __shfl(e, jj) : 0.0F;
-        const auto* v = reinterpret_cast<const float2*>(
-            base + (s0 + jj) * stride + 2 + 8 * lane);
+      }
+      if (Fast && s0 == 0 && j0 == 0) {
 #pragma unroll
-        for (unsigned k = 0; k < 4; ++k)
-          x[j][k] = v[k];
+        for (unsigned j = 0; j < 8; ++j)
+#pragma unroll
+          for (unsigned k = 0; k < 4; ++k)
+            x[j][k] = first[j][k];
+      } else {
+        load_values(s0, j0, count, x);
       }
 #pragma unroll
       for (unsigned j = 0; j < 8; ++j)
@@ -728,6 +765,7 @@ __device__ __forceinline__ void CombineRow(const float* scratch, float* out,
 }
 
 // Opt verification: one wave per (KV head, row), 8 per block.
+template<bool Fast = false>
 __launch_bounds__(256) __global__
     void KvarnCombineKernel(const float* __restrict__ scratch,
                             float* __restrict__ out, unsigned nsplit,
@@ -735,7 +773,8 @@ __launch_bounds__(256) __global__
   const unsigned M = kGqa * rows;
   const unsigned pair = blockIdx.x * 8 + threadIdx.x / 32;
   if (pair < kKvHeads * M)
-    CombineRow(scratch, out, pair / M, pair % M, M, nsplit, threadIdx.x % 32);
+    CombineRow<Fast>(scratch, out, pair / M, pair % M, M, nsplit,
+                     threadIdx.x % 32);
 }
 
 // Gen 0: K1b, 1: Opt, 2: Opt with AR V codes loaded at the start of their
@@ -761,7 +800,7 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
   constexpr bool kPrefetchV = kPrefetch && Gen < 2;
   // AR folds the K scale into q (verification would need 48 correction
   // rows and a second q copy past the LDS budget).
-  constexpr bool kFoldK = Opt && Gen != 4 && (Rows == 1 || kTiled);
+  constexpr bool kFoldK = Opt && Gen != 4 && Gen != 6 && (Rows == 1 || kTiled);
   // The bit-identity kernels spread the FP16 PV pairs (see `values`).
   constexpr bool kSpreadTail = Gen >= 4;
   constexpr float kScoreScale = Opt ? 0.0625F * kLog2e : 0.0625F;
@@ -1427,7 +1466,7 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
       return;
     __threadfence();
     for (unsigned m = wave; m < M; m += 8)
-      CombineRow(a.scratch, a.out, kv, m, M, nsplit, lane);
+      CombineRow<Gen == 6>(a.scratch, a.out, kv, m, M, nsplit, lane);
   }
 }
 
@@ -1502,7 +1541,7 @@ void LaunchKvarn(DecodeArgs a, unsigned rows, float* out, unsigned parts = 3) {
     // AR combines inside the partials launch; verification (48 rows per
     // KV head, too many for one block) in a wave-per-row launch.
     if (rows > 1 && (parts & 2) != 0)
-      KvarnCombineKernel<<<(kKvHeads * kGqa * rows + 7) / 8, 256>>>(
+      KvarnCombineKernel<Gen == 6><<<(kKvHeads * kGqa * rows + 7) / 8, 256>>>(
           a.scratch, out, nsplit, rows);
     return;
   }
@@ -1520,14 +1559,15 @@ void LaunchKvarn(DecodeArgs a, unsigned rows, float* out, unsigned parts = 3) {
 }
 
 // Kernel generations compared in one binary.
-enum class Kernel { kK1b, kOptLateV, kCommon, kFoldTiled };
+enum class Kernel { kK1b, kOptLateV, kCommon, kFoldTiled, kCommonFastCombine };
 constexpr Kernel kKernels[] = {Kernel::kK1b, Kernel::kOptLateV, Kernel::kCommon,
-                               Kernel::kFoldTiled};
+                               Kernel::kFoldTiled, Kernel::kCommonFastCombine};
 const char* KernelName(Kernel k) {
-  return k == Kernel::kK1b        ? "k1b"
-         : k == Kernel::kOptLateV ? "opt_latev"
-         : k == Kernel::kCommon   ? "common"
-                                  : "fold_tiled";
+  return k == Kernel::kK1b         ? "k1b"
+         : k == Kernel::kOptLateV  ? "opt_latev"
+         : k == Kernel::kCommon    ? "common"
+         : k == Kernel::kFoldTiled ? "fold_tiled"
+                                   : "common_fc";
 }
 
 void LaunchKvarnAny(int bits, Kernel kernel, const DecodeArgs& a, unsigned rows,
@@ -1540,8 +1580,10 @@ void LaunchKvarnAny(int bits, Kernel kernel, const DecodeArgs& a, unsigned rows,
       LaunchKvarn<B, 2>(a, rows, out, parts);
     else if (kernel == Kernel::kCommon)
       LaunchKvarn<B, 4>(a, rows, out, parts);
-    else
+    else if (kernel == Kernel::kFoldTiled)
       LaunchKvarn<B, 5>(a, rows, out, parts);
+    else
+      LaunchKvarn<B, 6>(a, rows, out, parts);
   };
   if (bits == 2)
     go(std::integral_constant<int, 2>{});
@@ -2155,6 +2197,7 @@ void CheckCase(unsigned groups, unsigned tail, unsigned splits,
     const Diff quant_effect = Compare(fake_as, ref_fp16);
     const Diff base = Compare(got16, ref_fp16);
     const std::size_t tiles = static_cast<std::size_t>(groups) * kKvHeads * 2;
+    std::vector<float> common_out;
     for (const Kernel kernel : kKernels) {
       // Stale scratch must not leak into the result.
       KV_OK(hipMemset(scratch.data, 0xff, scratch.size * sizeof(float)));
@@ -2162,6 +2205,19 @@ void CheckCase(unsigned groups, unsigned tail, unsigned splits,
       LaunchKvarnAny(VBits, kernel, args, rows, dout.data);
       KV_OK(hipDeviceSynchronize());
       const auto got = dout.Download();
+      // common_fc changes the combine's load order only: bit for bit common.
+      if (kernel == Kernel::kCommon)
+        common_out = got;
+      bool same_as_common = true;
+      if (kernel == Kernel::kCommonFastCombine) {
+        same_as_common = std::memcmp(got.data(), common_out.data(),
+                                     got.size() * sizeof(float)) == 0;
+        std::printf(
+            "samebits kernel=common_fc vs common k4v%d groups=%u "
+            "rows=%u splits=%u %s\n",
+            VBits, groups, rows, splits, same_as_common ? "IDENTICAL" : "FAIL");
+      }
+      totals.ok = totals.ok && same_as_common;
       const Diff vs_fake = Compare(got, ref_fake);
       const Diff vs_codes = Compare(got, ref_codes);
       // The kernel's own arithmetic (vs its codes) within 1e-3, well inside
@@ -2222,8 +2278,9 @@ void CheckCase(unsigned groups, unsigned tail, unsigned splits,
           elems_differ += differ;
         }
         // The kernels built for it must match; K1b and opt_latev are shown.
-        const bool required =
-            kernel == Kernel::kCommon || kernel == Kernel::kFoldTiled;
+        const bool required = kernel == Kernel::kCommon ||
+                              kernel == Kernel::kFoldTiled ||
+                              kernel == Kernel::kCommonFastCombine;
         const bool same = rows_differ == 0;
         if (required)
           totals.ok = totals.ok && same;
@@ -2430,7 +2487,8 @@ double Median(std::vector<double> v) {
 
 // probe: split 18 only, the launch split into its parts (partials alone,
 // reduce alone, quantized blocks alone, sink/tail blocks alone).
-void TimeDepth(unsigned depth, unsigned rows, Timer& timer, bool probe) {
+void TimeDepth(unsigned depth, unsigned rows, Timer& timer, bool probe,
+               bool only_common, bool shallow_sweep = false) {
   constexpr unsigned kTail = 128;
   constexpr unsigned kReps = 7;
   const unsigned groups = depth / kGroup - 2;  // sink, groups, 128-token tail
@@ -2477,9 +2535,19 @@ void TimeDepth(unsigned depth, unsigned rows, Timer& timer, bool probe) {
   Device<float> s16(Fp16ScratchSize(rows));
   // 4 KV heads x (splits + 2) blocks: 18 and 38 fill one and two rounds of
   // 80 resident AR k4v2 blocks (20 WGPs x 4).
-  constexpr unsigned kSplitOptions = 5;
-  const unsigned split_options[kSplitOptions] = {18, 32, 38, 64, 128};
-  Device<float> sq(KvarnScratchSize(rows, 128));
+  // Split counts: the production policy's 18 and 38, more up to one group
+  // per split (K4-P2: the shallow fixed cost), never above the groups.
+  std::vector<unsigned> split_options;
+  const std::initializer_list<unsigned> deep = {8U,  12U, 18U,  24U,
+                                                38U, 64U, 128U, groups};
+  const std::initializer_list<unsigned> shallow = {4U,  6U,  8U,  10U,
+                                                   12U, 14U, 18U, 24U};
+  for (const unsigned s : shallow_sweep ? shallow : deep)
+    if (s <= groups && std::find(split_options.begin(), split_options.end(),
+                                 s) == split_options.end())
+      split_options.push_back(s);
+  Device<float> sq(KvarnScratchSize(
+      rows, *std::max_element(split_options.begin(), split_options.end())));
   KV_OK(hipDeviceSynchronize());
 
   const auto fp16_launch = [&](unsigned c) {
@@ -2515,6 +2583,9 @@ void TimeDepth(unsigned depth, unsigned rows, Timer& timer, bool probe) {
   std::vector<Config> configs;
   for (const Kernel kernel : kKernels)
     for (unsigned f = 0; f < 2; ++f) {
+      if (only_common && kernel != Kernel::kCommon &&
+          kernel != Kernel::kCommonFastCombine)
+        continue;
       if (!probe) {
         for (unsigned s : split_options)
           configs.push_back({kernel, f, s});
@@ -2526,7 +2597,7 @@ void TimeDepth(unsigned depth, unsigned rows, Timer& timer, bool probe) {
       configs.push_back({kernel, f, 18, 1, 1, "quantized_blocks"});
       configs.push_back({kernel, f, 18, 1, 2, "fp16_blocks"});
     }
-  static_assert(kKernelCount == 4);
+  static_assert(kKernelCount == 5);
   std::vector<std::vector<double>> times(1 + configs.size());
   for (unsigned rep = 0; rep < kReps; ++rep)
     for (unsigned j = 0; j < times.size(); ++j) {
@@ -2610,7 +2681,7 @@ void TimeQuantize(Timer& timer) {
 
 int main(int argc, char** argv) {
   bool check = argc == 1, time = argc == 1, quant = argc == 1, probe = false,
-       wmma = false;
+       wmma = false, only_common = false, shallow = false;
   for (int i = 1; i < argc; ++i) {
     const std::string_view arg = argv[i];
     if (arg == "check")
@@ -2623,10 +2694,16 @@ int main(int argc, char** argv) {
       probe = true;
     else if (arg == "wmmaprobe")
       wmma = true;
+    else if (arg == "common")
+      only_common = true;
+    else if (arg == "shallow")
+      shallow = true;
     else {
-      std::fprintf(stderr,
-                   "usage: %s [check] [time] [quant] [probe] [wmmaprobe]\n",
-                   argv[0]);
+      std::fprintf(
+          stderr,
+          "usage: %s [check] [time] [quant] [probe] [wmmaprobe] [common] "
+          "[shallow]\n",
+          argv[0]);
       return 2;
     }
   }
@@ -2657,10 +2734,14 @@ int main(int argc, char** argv) {
   if (time)
     for (unsigned depth : {4096U, 16384U, 32768U, 65536U, 131072U, 262144U})
       for (unsigned rows : {1U, 8U})
-        TimeDepth(depth, rows, timer, false);
+        TimeDepth(depth, rows, timer, false, only_common);
+  if (shallow)
+    for (unsigned depth : {2048U, 4096U, 6144U, 8192U, 12288U, 16384U, 24576U})
+      for (unsigned rows : {1U, 8U})
+        TimeDepth(depth, rows, timer, false, only_common, true);
   if (probe)
     for (unsigned depth : {4096U, 32768U})
       for (unsigned rows : {1U, 8U})
-        TimeDepth(depth, rows, timer, true);
+        TimeDepth(depth, rows, timer, true, only_common);
   return totals.ok ? 0 : 1;
 }
