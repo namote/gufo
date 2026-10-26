@@ -613,15 +613,93 @@ void TestEndToEnd(int bits, unsigned length, unsigned rows) {
   Check(error < 3e-3, line);
 }
 
+// `time`: microseconds per attention launch at the production split policy,
+// for comparison with the K1b prototype sweep (KVARN.md). Inputs cycle
+// through copies of at least 256 MiB, past the 32 MiB MALL, and the timed
+// loop alternates formats. Values are random; only the time is reported.
+void TimeAttention() {
+  struct Shape {
+    unsigned depth, rows;
+  };
+  constexpr Shape kShapes[] = {{4096, 1},   {4096, 8},  {32768, 1},
+                               {32768, 8},  {65536, 1}, {65536, 8},
+                               {262144, 1}, {262144, 8}};
+  for (const auto shape : kShapes) {
+    for (const int bits : {2, 4}) {
+      const unsigned groups = shape.depth / kGroup - 2;
+      const unsigned blocks = shape.depth / 256 + 1;
+      const std::size_t record_row = kKvHeads * KvarnRecord(bits).bytes;
+      const std::size_t layer_pitch = std::size_t{blocks} * 2 * record_row;
+      const std::size_t bytes = groups * record_row;
+      const unsigned copies = static_cast<unsigned>(
+          std::max<std::size_t>(1, (256ULL << 20) / bytes + 1));
+      DeviceBuffer<std::uint8_t> records(copies * layer_pitch);
+      HIP_CHECK(hipMemset(records.data(), 0x11, records.size()));
+      std::vector<std::uint32_t> table(blocks);
+      for (unsigned b = 0; b < blocks; ++b)
+        table[b] = b;
+      DeviceBuffer<std::uint32_t> dtable(table);
+      DeviceBuffer<std::uint16_t> rows_k(copies * kFp16LayerElements),
+          rows_v(copies * kFp16LayerElements);
+      HIP_CHECK(hipMemset(rows_k.data(), 0, rows_k.size() * 2));
+      HIP_CHECK(hipMemset(rows_v.data(), 0, rows_v.size() * 2));
+      const KvarnKvView view{.value_bits = bits,
+                             .records = records.data(),
+                             .records_layer_pitch = layer_pitch,
+                             .blocks = dtable.data(),
+                             .k_rows = rows_k.data(),
+                             .v_rows = rows_v.data()};
+      const auto q =
+          RandomFloats(std::size_t{shape.rows} * kHeads * kDim, 1, 1.0F);
+      DeviceBuffer<float> dq(q), out(q.size());
+      const unsigned splits =
+          gufo::hip::SelectKvarnDecodeSplits(groups, bits, shape.rows);
+      DeviceBuffer<float> scratch(
+          gufo::hip::KvarnScratchElements(shape.rows, splits));
+      const unsigned start = shape.depth - shape.rows;
+      const auto launch = [&](unsigned copy) {
+        gufo::hip::LaunchKvarnDecodeAttention(
+            dq.data(), nullptr, view, out.data(), copy, nullptr, start,
+            shape.rows, groups, 0, {scratch.data(), scratch.size()}, nullptr);
+      };
+      for (unsigned i = 0; i < copies; ++i)
+        launch(i);
+      HIP_CHECK(hipDeviceSynchronize());
+      const unsigned iterations = std::max(copies, 20U);
+      hipEvent_t begin, end;
+      HIP_CHECK(hipEventCreate(&begin));
+      HIP_CHECK(hipEventCreate(&end));
+      HIP_CHECK(hipEventRecord(begin, nullptr));
+      for (unsigned i = 0; i < iterations; ++i)
+        launch(i % copies);
+      HIP_CHECK(hipEventRecord(end, nullptr));
+      HIP_CHECK(hipEventSynchronize(end));
+      float ms = 0;
+      HIP_CHECK(hipEventElapsedTime(&ms, begin, end));
+      HIP_CHECK(hipEventDestroy(begin));
+      HIP_CHECK(hipEventDestroy(end));
+      std::printf(
+          "time depth=%u rows=%u fmt=k4v%d splits=%u us=%.1f MiB=%.2f "
+          "copies=%u\n",
+          shape.depth, shape.rows, bits, splits, 1000.0 * ms / iterations,
+          static_cast<double>(bytes) / (1 << 20), copies);
+    }
+  }
+}
+
 }  // namespace
 #endif
 
-int main() {
+int main(int argc, char** argv) {
 #if defined(ENGINE_ENABLE_HIP)
   const int device_status = gufo::test::GateHipDevice(
       gufo::test::HipDeviceRequirement::kOptional, "Qwen KVarN ops test");
   if (device_status != 0)
     return device_status;
+  if (argc > 1 && std::string_view(argv[1]) == "time") {
+    TimeAttention();
+    return 0;
+  }
   try {
     TestWrite();
     for (const int bits : {2, 4}) {
@@ -645,7 +723,7 @@ int main() {
                Case{254, 7, 7, 0, true},      // queries start at the tail
                Case{1023, 120, 1, 0, false},  // 128K, the large split
                Case{1023, 120, 8, 0, false},
-               Case{2047, 3, 6, 0, false},  // 256K
+               Case{2047, 6, 6, 0, false},  // 256K
            })
         TestAttention(bits, c.groups, c.tail, c.rows, c.splits,
                       c.device_position);
@@ -661,6 +739,9 @@ int main() {
     return 1;
   }
   std::cout << "Qwen KVarN ops tests passed.\n";
+#else
+  (void)argc;
+  (void)argv;
 #endif
   return 0;
 }
