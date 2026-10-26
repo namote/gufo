@@ -43,6 +43,8 @@ if (ENGINE_ENABLE_HIP)
     LABELS "qwen27b;gpu;hip;cli;external-model" SKIP_RETURN_CODE 77)
   add_qwen27b_test(qwen27b_target_test target_test.cpp
     "gpu;hip;target;external-model")
+  add_qwen27b_test(qwen27b_kvarn_decode_test kvarn_decode_test.cpp
+    "gpu;hip;kvarn;external-model")
   add_qwen27b_test(qwen_mtp_gpu_test mtp_test.cpp "gpu;hip;mtp;external-model")
   add_qwen27b_test(qwen_dflash_gpu_test dflash_test.cpp
     "gpu;hip;dflash;dflash2;external-model")
