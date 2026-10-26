@@ -51,3 +51,23 @@
 - 속도: 같은 바이너리 안에서 FP16 기준 커널(기존 커널을 복사해도 됨)과 번갈아, 깊이 4K·16K·32K·64K·128K·256K, AR(질의 1)과 verify(질의 8). 무작위 KV로 충분하다. 실효 대역폭과 `gfx1151_peak.hip` 상한을 함께. 양자화 커널의 그룹당 시간도.
 - 빌드: eval 이미지의 hipcc로 `build/kvarn-bench/`에(`--offload-arch=gfx1151`, `-O3`). GPU 실행은 창 계획 `PLAN-K1B.json`(unit driver, argv에 `/src/build/kvarn-bench/...`)으로만.
 - gate(감독이 판정): 깊이 32K 이상에서 FP16 대비 attention 시간이 분명히 줄고(목표는 바이트 비율 쪽), 4K에서 손해가 작을 것. 결과가 나쁘면 원인(ALU·LDS·점유율)을 `tools/prof/isa_mix.py` 등으로 보고한다.
+
+## K1c: 운영 통합 (2026-10-26 사용자: "k1c진행")
+
+K1a·K1b 결과와 감독 판정은 [KVarN](KVARN.md) "K1a·K1b 결과"에 있다. 시제품: `tools/bench/kvarn_decode_bench.hip`(저장 배치는 파일 머리 주석). 운영 코드를 바꾸므로 한 에이전트가 순서대로 한다.
+
+### K1c-1: 저장·쓰기·decode·verify
+
+- `--kv-cache-type kvarn-k4v2|kvarn-k4v4`일 때만 바뀐다. fp16 경로는 비트 단위로 그대로(코드 경로도 분기 밖에서 그대로)여야 한다.
+- 저장: 블록 풀에 K1b 배치(층·256토큰 블록마다 `[그룹 2][KV head 4][record]`)와 시퀀스별 FP16 sink·tail 평면(회전된 값). 풀 바이트·예약 계산이 새 크기를 쓰게 한다(`kv_block_layout.hpp`의 plane, arena `AllocateKvBlocks`). 공유 풀·CoW·블록 매핑이 계속 맞게 한다.
+- 쓰기: KV 쓰기 커널(decode·batched·prefill)이 kvarn일 때 회전해서 tail 평면에 쓰고, 그룹이 차면(투기 디코딩은 확정된 토큰만) flush 양자화 커널을 건다. 되감기(verify 거절)·truncate가 미flush tail과 맞게 한다.
+- 읽기: decode split-K(그래프 캡처 경로 포함)와 DFlash2 verify(폭 1–8)를 K1b 커널로. split 수는 깊이·점유율에 따른 정책 한 곳(K1b 측정 표 기준).
+- `QwenExecutionPolicyUnsupportedReason`의 kvarn 거절은 prefill(K1c-2)이 붙을 때까지 남겨 두되, 테스트·도구가 쓸 수 있는 내부 경로(예: 테스트 전용 허용)는 범위를 좁게 만든다. checkpoint·continuation layout(K2)은 계속 거절한다.
+- 작은 정리: `tests/models/qwen27b/kvarn_fake_quant.hpp`와 `tools/qwen27b/kvarn.py`의 log·exp를 정확 반올림(double로 계산해 float로 한 번)으로 바꾸고, GPU 양자화와 비트 일치를 단위 테스트로 고정한다.
+- 테스트: GPU 커널 단위 테스트를 `tests/models/qwen/hip/attention/`에(K1b check의 경우들: 그룹 0/1/30/254, tail, 질의 1·8, split 여러 개, 큰 위치), CPU 테스트(풀 크기·예약). GPU는 창으로만: 새 단위 테스트 + 기존 `qwen_attention_kv_block_table_ops_test`, `qwen27b_target_test`, `inference_backend_gpu_test`(fp16 동일성 확인).
+
+### K1c-2: prefill과 32K 실제 경로
+
+- prefill이 양자화된 앞 블록을 읽게 한다. 먼저 `PackAttentionHeads` 단계에서 dequant하는 방법을 검토하고, 속도·메모리 영향을 보고한다. 이 단계 끝에 Qwen 27B kvarn 거절을 없앤다(continuation layout·checkpoint는 K2까지 거절).
+- `qwen27b_kvarn_k0`에 실제 경로 비교 모드: kvarn policy executor로 prefill + teacher forcing + free greedy를 해서 FP16 기준과 KL·top-1·gold, 그리고 K0 fake quant 결과(`KVARN.md` K0 표)와 비교한다.
+- 32K 창: 위 비교(k4v2·k4v4), `gufo bench` AR·DFlash2 `-d 0,32768`을 fp16과 kvarn으로 번갈아. 256K는 하지 않는다.
