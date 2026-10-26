@@ -4,7 +4,8 @@
 requests across Q4/Q8 and C1/2/4/6/8.** Targets are Unsloth UD-Q4_K_XL /
 UD-Q8_K_XL; the draft is Q4_K_M. [Identities and dated evidence](artifacts/model-identities.json).
 These are execution-consistency checks; original-target and GGUF-conversion
-parity remain unqualified.
+parity remain unqualified. They ran with FP16 attention KV, then the default;
+the default is now `kvarn-k4v2`, so rerun them with `--kv-cache-type fp16`.
 
 | Check | Q4_K_XL | Q8_K_XL |
 | --- | ---: | ---: |

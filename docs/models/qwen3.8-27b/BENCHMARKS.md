@@ -2,7 +2,9 @@
 
 AMD Strix Halo `gfx1151`, 128 GB unified memory. Gufo versus llama.cpp
 `b11069`, using the same Q4_K_XL / Q8_K_XL targets and Q4_K_M DFlash2 draft.
-Gufo uses its adaptive controller. HTTP, greedy, thinking off.
+Gufo uses its adaptive controller. HTTP, greedy, thinking off. These rows
+store FP16 attention KV, the default when they were measured; the default is
+now `kvarn-k4v2`, so reproduce them with `--kv-cache-type fp16`.
 
 All Gufo rows were refreshed October 19, 2026 on `11813e51` (wave64
 verification attention, rebased on main `23fd87dc`). DFlash2 completions match

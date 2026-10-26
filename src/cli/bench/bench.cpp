@@ -1383,6 +1383,9 @@ int RunBench(std::span<const char* const> args) {
     return 1;
   }
   PrintModelLoadTime(model_load_start);
+  // The attention KV storage in effect: the model default or the option.
+  if (kv_cache_type)
+    std::cout << "KV cache: " << KvCacheTypeName(*kv_cache_type) << '\n';
 
   const auto& config = gpu_exec->GetConfig();
   std::shared_ptr<const hip::QwenMtpGpuModel> mtp_gpu_model;

@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace {
 
@@ -75,15 +76,16 @@ std::optional<KvCacheType> Resolve(std::string_view architecture,
 }
 
 void TestDefaults() {
-  // No flag works for every model: FP16 models resolve fp16, others their
-  // own storage.
-  for (const std::string_view architecture : {"qwen35", "qwen4exp"}) {
-    Expect(gufo::cli::DefaultKvCacheType(architecture) == KvCacheType::kFp16,
-           "FP16-KV models default to fp16 until a KVarN gate passes");
+  // No flag works for every model: Qwen3.8-27B resolves kvarn-k4v2,
+  // Flash-Next fp16, others their own storage.
+  for (const auto [architecture, expected] :
+       {std::pair{std::string_view{"qwen35"}, KvCacheType::kKvarnK4V2},
+        std::pair{std::string_view{"qwen4exp"}, KvCacheType::kFp16}}) {
+    Expect(gufo::cli::DefaultKvCacheType(architecture) == expected,
+           "Qwen3.8-27B defaults to kvarn-k4v2, Flash-Next to fp16");
     bool accepted = false;
     std::string error;
-    Expect(Resolve(architecture, std::nullopt, &accepted, &error) ==
-                   KvCacheType::kFp16 &&
+    Expect(Resolve(architecture, std::nullopt, &accepted, &error) == expected &&
                accepted && error.empty(),
            "absent type resolves to the default");
     Expect(Resolve(architecture, KvCacheType::kFp16, &accepted, &error) ==

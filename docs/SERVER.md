@@ -75,14 +75,14 @@ Text serving defaults match llama.cpp for context and generation length:
 | --- | --- |
 | `--context` | `0`: native context from model metadata, per session |
 | `--enable-yarn` | Off; Flash-Next requires it for `--context` above 262144 |
-| `--kv-cache-type` | Model default: `fp16` on Qwen3.8, FP8 (not selectable) on DeepSeek |
+| `--kv-cache-type` | Model default: `kvarn-k4v2` on Qwen3.8-27B, `fp16` on Flash-Next, FP8 (not selectable) on DeepSeek |
 | `--max-tokens` | `-1`: until EOS or remaining context is exhausted |
 | `--sessions` | `1` |
 | Thinking / reasoning effort | Enabled; Qwen `xhigh`, DeepSeek `high` |
 
 `--kv-cache-type fp16|kvarn-k4v2|kvarn-k4v4` selects attention KV storage; a
 model takes an explicit value only when it stores KV that way. Qwen3.8-27B
-serves the KVarN values: the prefix cache, RAM and disk checkpoints keep the
+defaults to `kvarn-k4v2` and serves the KVarN values: the prefix cache, RAM and disk checkpoints keep the
 quantized group records as rows (layout versions 3 and 4) and the FP16 sink
 and tail as private state, and `--kv-pool-bytes` holds about 4.9 (k4v2) or
 3.7 (k4v4) times the FP16 tokens. Flash-Next stores FP16 KV and accepts only `fp16`.
@@ -222,7 +222,7 @@ movable pages, not GPU allocations. 27B also checks HIP free memory. A
 positive value sets a byte cap that may exceed the automatic budget, up to the
 available host RAM minus 4 GiB; the startup line reports both as
 `automatic_bytes` and `max_bytes`.
-Qwen27B sessions with FP16 attention KV map 256-token blocks from one device
+Qwen27B sessions (FP16 rows or KVarN group records) map 256-token blocks from one device
 pool as they write; there is no switch to turn this off. The pool holds every
 session's full context unless `--kv-pool-bytes N` sizes it (0, the default,
 keeps that size); admission waits while it cannot hold a request.

@@ -38,8 +38,9 @@ The supported model types are LLM, image, video, audio (TTS, ASR), and text embe
 - `kvCacheType` (`"fp16"` / `"kvarn-k4v2"` / `"kvarn-k4v4"`) — how attention
   keys and values are stored, for `serve llm`, `prompt`, `chat` and `bench`.
   A model takes an explicit value only when it stores KV that way. Unset,
-  each model keeps its default: `fp16` on Qwen3.8-27B and Flash-Next, FP8 on
-  DeepSeek V4 Flash. `kvarn-k4v2` and `kvarn-k4v4` (KVarN: 4-bit keys with
+  each model keeps its default: `kvarn-k4v2` on Qwen3.8-27B, `fp16` on
+  Flash-Next, FP8 on DeepSeek V4 Flash; pass `fp16` to compare with FP16
+  outputs. `kvarn-k4v2` and `kvarn-k4v4` (KVarN: 4-bit keys with
   2- or 4-bit values) run on Qwen3.8-27B in `serve llm`, `prompt`, `chat`
   and `bench`; the prefix cache keeps KVarN group records and the FP16 sink
   and tail as their own component formats. Flash-Next accepts only `fp16`; DeepSeek V4

@@ -13,7 +13,8 @@ struct TextModelKv {
   bool kvarn;
 };
 
-// Qwen3.8-27B: FP16 rows by default (QwenExecutionPolicy::kv_cache_storage).
+// Qwen3.8-27B: KVarN k4v2 by default (DefaultKvCacheType); fp16 stays the
+// QwenExecutionPolicy::Production() storage that explicit fp16 selects.
 // Flash-Next: __half k_cache/v_cache (qwen38_flash_next executor.cpp).
 // DeepSeek V4 Flash: E4M3 FP8 KV (ds4_rocm_fp8_kv.hip.hpp).
 constexpr TextModelKv kTextModels[] = {
@@ -58,7 +59,8 @@ void RegisterKvCacheTypeOption(ArgParser& parser,
   parser.AddCustomOption(
       "", "--kv-cache-type", "TYPE",
       "Attention KV storage: fp16, kvarn-k4v2 or kvarn-k4v4, where the model "
-      "stores it (default: per model; fp16 on Qwen3.8-27B and Flash-Next)",
+      "stores it (default: per model; kvarn-k4v2 on Qwen3.8-27B, fp16 on "
+      "Flash-Next)",
       group,
       [target](std::string_view, std::string_view value, std::string* error) {
         const auto type = ParseKvCacheType(value);
@@ -74,8 +76,12 @@ void RegisterKvCacheTypeOption(ArgParser& parser,
 
 std::optional<KvCacheType> DefaultKvCacheType(
     std::string_view architecture) noexcept {
-  // Qwen3.8-27B moves to kvarn-k4v2 once its quality and speed gate passes.
-  if (FindTextModel(architecture).fp16)
+  // Qwen3.8-27B stores KVarN k4v2 (its K1 quality/speed and K2 serving
+  // gates passed); the other FP16-KV models keep fp16.
+  const auto model = FindTextModel(architecture);
+  if (model.kvarn)
+    return KvCacheType::kKvarnK4V2;
+  if (model.fp16)
     return KvCacheType::kFp16;
   return std::nullopt;
 }

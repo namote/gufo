@@ -38,11 +38,12 @@ sampling defaults are described in [the server guide](../../SERVER.md#reasoning-
 ## KV cache type
 
 `--kv-cache-type` selects attention KV storage in `serve llm`, `prompt`,
-`chat` and `bench`. The default is `fp16` (64 KiB per token across the 16
-full-attention layers). `kvarn-k4v2` and `kvarn-k4v4` store KVarN
-(Hadamard-rotated 4-bit keys with 2- or 4-bit values per 128-token group,
-13.1 and 17.1 KiB per token; the first 128 tokens and the unfinished last
-group stay FP16) in `serve llm`, `prompt`, `chat` and `bench`. Every query
+`chat` and `bench`, for AR and DFlash2 alike. The default is `kvarn-k4v2`:
+KVarN (Hadamard-rotated 4-bit keys with 2- or 4-bit values per 128-token
+group, 13.1 KiB per token for k4v2 and 17.1 KiB for `kvarn-k4v4`; the first
+128 tokens and the unfinished last group stay FP16). `fp16` stores 64 KiB per
+token across the 16 full-attention layers and is the reference for FP16
+output comparisons, which must pass `--kv-cache-type fp16`. Every query
 reads the groups that ended at or before its position quantized, so DFlash2
 verification matches decoding exactly. Checkpoints keep the group records
 as rows and the FP16 sink and tail as private state. The
