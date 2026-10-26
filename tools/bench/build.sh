@@ -68,7 +68,8 @@ for t in "${targets[@]}"; do
   if [[ "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ]]; then
     native_sources+=(src/models/qwen/hip/kernels/prefill_quant_wave64.hip)
   fi
-  if [[ "$src" -ef tools/qwen27b/attention_bench.hip ]]; then
+  if [[ "$src" -ef tools/qwen27b/attention_bench.hip ||
+        "$src" -ef tools/bench/kvarn_decode_bench.hip ]]; then
     native_sources+=(
       src/models/qwen/hip/kernels/attention_decode_verify_wave64.hip)
   fi
