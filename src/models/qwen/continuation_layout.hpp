@@ -39,6 +39,22 @@ inline constexpr std::size_t kContinuationFrontierMetadataBytes = 96;
 inline constexpr std::size_t kContinuationPendingTokens = 9;
 // Leads the kKvarnRows state: version, flushed_end, written_end.
 inline constexpr std::size_t kContinuationKvarnHeaderBytes = 64;
+// Layout version of the attention KV row components: FP16 K and V rows 1,
+// FP32 2, KVarN group records 3 (k4v2) and 4 (k4v4).
+[[nodiscard]] constexpr std::uint32_t ContinuationKvLayoutVersion(
+    hip::QwenKvCacheStorage storage) noexcept {
+  switch (storage) {
+    case hip::QwenKvCacheStorage::kFp16:
+      return 1;
+    case hip::QwenKvCacheStorage::kFp32:
+      return 2;
+    case hip::QwenKvCacheStorage::kKvarnK4V2:
+      return 3;
+    case hip::QwenKvCacheStorage::kKvarnK4V4:
+      return 4;
+  }
+  return 0;
+}
 
 struct ContinuationBackingClass {
   std::size_t block_bytes{}, blocks{}, metadata_bytes{};

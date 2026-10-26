@@ -1130,6 +1130,10 @@ public:
                                   execution_policy_.UsesBf16RecurrentState()) +
                      "-component-v2",
         .max_context = max_context_,
+        .kv_cache_type = std::string(
+            hip::QwenKvCacheStorageName(execution_policy_.kv_cache_storage)),
+        .kv_layout_version = models::qwen::ContinuationKvLayoutVersion(
+            execution_policy_.kv_cache_storage),
         .capabilities =
             TextRunnerCapabilities{
                 .incremental_prefill = true,

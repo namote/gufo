@@ -75,15 +75,13 @@ ContinuationLayout::ContinuationLayout(const core::ModelConfig& c,
                              : std::size_t{c.num_key_value_heads} *
                                    hip::KvarnRecord(kvarn_bits).bytes /
                                    hip::kKvarnGroupTokens;
-  const std::uint32_t kvarn_version = kvarn_bits == 2 ? 3 : 4;
+  const auto kv_version = ContinuationKvLayoutVersion(policy.kv_cache_storage);
   for (std::uint32_t layer = 0; layer < c.num_layers; ++layer) {
     if ((layer + 1) % c.full_attention_interval == 0 && kvarn_bits != 0) {
-      add(ContinuationPart::kKvarnRecords, kvarn_row, 0, layer, kvarn_version);
+      add(ContinuationPart::kKvarnRecords, kvarn_row, 0, layer, kv_version);
     } else if ((layer + 1) % c.full_attention_interval == 0) {
-      add(ContinuationPart::kKey, kv_row, 0, layer,
-          policy.UsesFp16AttentionKv() ? 1 : 2);
-      add(ContinuationPart::kValue, kv_row, 0, layer,
-          policy.UsesFp16AttentionKv() ? 1 : 2);
+      add(ContinuationPart::kKey, kv_row, 0, layer, kv_version);
+      add(ContinuationPart::kValue, kv_row, 0, layer, kv_version);
     } else {
       add(ContinuationPart::kConvolution, 0, conv, layer);
       add(ContinuationPart::kRecurrent, 0, recurrent, layer,
@@ -95,7 +93,7 @@ ContinuationLayout::ContinuationLayout(const core::ModelConfig& c,
         kContinuationKvarnHeaderBytes +
             hip::KvarnFp16Bytes(c.FullAttentionLayerCount(),
                                 c.num_key_value_heads, c.head_dim),
-        0, kvarn_version);
+        0, kv_version);
   add(ContinuationPart::kFrontier, 0,
       kContinuationFrontierMetadataBytes +
           Product({c.vocab_size, sizeof(float)}));

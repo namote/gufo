@@ -14,6 +14,10 @@
 
 namespace gufo::server {
 struct ComponentCacheMetrics {
+  // The runner's attention KV storage and its components' layout version
+  // (TextRunnerDescriptor); empty and zero when it has none.
+  std::string kv_cache_type;
+  std::uint32_t kv_layout_version{};
   std::string reuse{"none"};
   std::uint32_t selection_reason{};
   std::size_t deepest_live{}, deepest_ram{}, deepest_disk{}, selected{};
@@ -31,6 +35,10 @@ struct ComponentCacheMetrics {
 inline json::Value ComponentCacheJson(const ComponentCacheMetrics& value) {
   auto result = json::Value::object();
   result["schema"] = "component-cache-v1";
+  if (!value.kv_cache_type.empty()) {
+    result["kv_cache_type"] = value.kv_cache_type;
+    result["kv_layout_version"] = std::size_t{value.kv_layout_version};
+  }
   result["reuse"] = value.reuse;
   result["selection_reason"] = static_cast<std::size_t>(value.selection_reason);
   result["deepest_live_tokens"] = value.deepest_live;

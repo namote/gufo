@@ -262,6 +262,8 @@ struct ComponentTextCache::Impl {
     return Uncovered{i, e.live_location, e.live_tokens, e.live_input};
   }
   std::shared_ptr<TextModelRunner> runner;
+  std::string kv_cache_type = runner->Descriptor().kv_cache_type;
+  std::uint32_t kv_layout_version = runner->Descriptor().kv_layout_version;
   cache::ResourceLedger ledger;
   std::unique_ptr<ComponentCacheResources> resources;
   cache::Identity identity;
@@ -2430,6 +2432,8 @@ PlannedCapturePoints ServingCacheLease::PlannedCaptures(
 
 ComponentCacheMetrics ComponentTextCache::Lease::Metrics() const {
   auto report = impl_->metrics;
+  report.kv_cache_type = impl_->cache->kv_cache_type;
+  report.kv_layout_version = impl_->cache->kv_layout_version;
   report.ledger = impl_->cache->ledger.Snapshot();
   if (impl_->cache->queue)
     report.persistence = impl_->cache->queue->Stats();

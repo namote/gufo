@@ -165,6 +165,11 @@ struct TextRunnerDescriptor {
   std::string model_id;
   std::string state_abi;
   std::uint32_t max_context{0};
+  /// The attention KV storage (`--kv-cache-type` name) and the layout
+  /// version of its cache components; empty and zero for runners without
+  /// one. Reported in each request's component cache timings.
+  std::string kv_cache_type;
+  std::uint32_t kv_layout_version{0};
   TextRunnerCapabilities capabilities;
   std::optional<TextRunnerPersistenceDescriptor> persistence;
 };

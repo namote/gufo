@@ -56,8 +56,11 @@ void Check(bool fp16, bool bf16) {
               "component boundary differs");
       if (part.part == qwen::ContinuationPart::kKey ||
           part.part == qwen::ContinuationPart::kValue) {
-        Require(part.descriptor.layout_version == (fp16 ? 1U : 2U),
-                "KV layouts alias");
+        Require(
+            part.descriptor.layout_version == (fp16 ? 1U : 2U) &&
+                part.descriptor.layout_version ==
+                    qwen::ContinuationKvLayoutVersion(policy.kv_cache_storage),
+            "KV layouts alias");
         Require(part.descriptor.rows_per_chunk == 256,
                 "unbounded chunk geometry");
       }

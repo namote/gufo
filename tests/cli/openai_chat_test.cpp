@@ -568,6 +568,15 @@ void TestCachedPrefillMetrics() {
   Expect(component && component->member_str("schema") == "component-cache-v1" &&
              component->member_size("borrowed_capacity_bytes") == 4096,
          "Shared Chat/Responses/Messages timings retain component cache work");
+  Expect(component->find("kv_cache_type") == nullptr,
+         "Runners without attention KV report no KV format");
+  cached.component_cache->kv_cache_type = "kvarn-k4v2";
+  cached.component_cache->kv_layout_version = 3;
+  const auto kvarn_timings = gufo::server::GenerationTimings(cached);
+  const auto* kvarn = kvarn_timings.find("component_cache");
+  Expect(kvarn && kvarn->member_str("kv_cache_type") == "kvarn-k4v2" &&
+             kvarn->member_size("kv_layout_version") == 3,
+         "Timings name the KV storage and its cache layout version");
 
   backend.cache_miss_reason = "prefix_changed";
   const auto miss = gufo::server::HandleOpenAiChat(
