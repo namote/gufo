@@ -139,9 +139,10 @@ struct Storage {
         records(std::size_t{kLayers} * pool_blocks * 2 * record_row),
         k_rows(kLayers * kFp16LayerElements),
         v_rows(kLayers * kFp16LayerElements) {
-    // Out of order and offset by the spare blocks.
+    // Reversed, above the spare blocks, so a kernel that ignores the table
+    // reads the wrong records.
     for (unsigned b = 0; b < logical_blocks; ++b)
-      table.push_back((b * 7U + 3U) % pool_blocks);
+      table.push_back(pool_blocks - 1 - b);
     std::vector<std::uint32_t> sorted = table;
     std::ranges::sort(sorted);
     if (std::ranges::adjacent_find(sorted) != sorted.end())
