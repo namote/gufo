@@ -159,11 +159,18 @@ inline constexpr std::uint32_t kKvarnFp16Tokens =
   return groups > 1 ? groups - 1 : 0;
 }
 
+/// FP16 blocks of one KVarN attention launch: the sink in two halves, the
+/// tail after the quantized groups in blocks of 64 positions (fewer than
+/// one group plus the 128 rows of a pass).
+inline constexpr std::uint32_t kKvarnSinkBlocks = 2;
+inline constexpr std::uint32_t kKvarnMaxTailBlocks = 4;
+
 /// Floats of KVarN split partials for `rows` query rows and `splits`
-/// quantized splits: [KV head][split + 2][row x GQA][max, sum, head_dim].
+/// quantized splits: [KV head][split][row x GQA][max, sum, head_dim].
 [[nodiscard]] constexpr std::size_t KvarnScratchElements(std::uint32_t rows,
                                                          std::uint32_t splits) {
-  return std::size_t{kKvarnQueryHeads} * rows * (splits + 2) *
+  return std::size_t{kKvarnQueryHeads} * rows *
+         (splits + kKvarnSinkBlocks + kKvarnMaxTailBlocks) *
          (kKvarnHeadDim + 2);
 }
 

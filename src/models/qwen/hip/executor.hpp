@@ -604,6 +604,7 @@ private:
     std::size_t scratch_elements{0};
     std::uint16_t* d_staging{nullptr};
     std::size_t staging_elements{0};
+    unsigned* d_counters{nullptr};
     KvarnTail tail;
   };
   KvarnStorage kvarn_;

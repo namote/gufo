@@ -1113,6 +1113,8 @@ void QwenGpuArena::AllocateKvarn() {
                             config_.num_key_value_heads * config_.head_dim;
   HIP_CHECK(hipMalloc(&kvarn_.d_staging,
                       kvarn_.staging_elements * sizeof(std::uint16_t)));
+  HIP_CHECK(hipMalloc(&kvarn_.d_counters, kKvarnKvHeads * sizeof(unsigned)));
+  HIP_CHECK(hipMemset(kvarn_.d_counters, 0, kKvarnKvHeads * sizeof(unsigned)));
   kvarn_.tail = {};
 }
 
@@ -1124,7 +1126,8 @@ KvarnKvView QwenGpuArena::GetKvarnView() const noexcept {
           .records_layer_pitch = kv_pool_->geometry().layer_pitch(0),
           .blocks = d_kv_block_table_,
           .k_rows = kvarn_.d_rows,
-          .v_rows = kvarn_.d_rows + kvarn_.plane_elements};
+          .v_rows = kvarn_.d_rows + kvarn_.plane_elements,
+          .counters = kvarn_.d_counters};
 }
 
 KvarnPassPlan QwenGpuArena::PrepareKvarnPass(std::uint32_t start,
@@ -1784,6 +1787,8 @@ void QwenGpuArena::FreeAll() noexcept {
     LogCleanupError(hipFree(kvarn_.d_scratch));
   if (kvarn_.d_staging != nullptr)
     LogCleanupError(hipFree(kvarn_.d_staging));
+  if (kvarn_.d_counters != nullptr)
+    LogCleanupError(hipFree(kvarn_.d_counters));
   kvarn_ = {};
   for (float* buffer : d_ssm_conv_buffers_)
     if (buffer != nullptr)

@@ -160,7 +160,7 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
                              d_in_pos, 0, 1, arena.stream);
         LaunchKvarnDecodeAttention(
             attention_scratch.q.data(), ssm_scratch.gate.data(), kv,
-            ssm_scratch.out.data(), attn_layer_idx, d_in_pos, 0, 1,
+            ssm_scratch.out.data(), attn_layer_idx, d_in_pos, pos, 1,
             kvarn_groups, 0, arena.GetKvarnScratch(), arena.stream);
       } else if (use_split_k_decode) {
         LaunchAttention(

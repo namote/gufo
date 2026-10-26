@@ -65,7 +65,7 @@ void TestSizes() {
              KvarnFp16Row(384) == 128 && KvarnFp16Row(640) == 128 &&
              KvarnFp16Row(641) == 129,
          "sink then ring rows");
-  Expect(KvarnScratchElements(8, 38) == 24ULL * 8 * 40 * 258,
+  Expect(KvarnScratchElements(8, 38) == 24ULL * 8 * 44 * 258,
          "scratch elements");
 }
 

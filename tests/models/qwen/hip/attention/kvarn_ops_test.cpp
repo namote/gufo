@@ -132,6 +132,7 @@ struct Storage {
   DeviceBuffer<std::uint8_t> records;
   DeviceBuffer<std::uint32_t> blocks;
   DeviceBuffer<std::uint16_t> k_rows, v_rows;
+  DeviceBuffer<unsigned> counters;
 
   Storage(int value_bits, unsigned logical_blocks)
       : bits(value_bits),
@@ -139,7 +140,8 @@ struct Storage {
         record_row(kKvHeads * KvarnRecord(value_bits).bytes),
         records(std::size_t{kLayers} * pool_blocks * 2 * record_row),
         k_rows(kLayers * kFp16LayerElements),
-        v_rows(kLayers * kFp16LayerElements) {
+        v_rows(kLayers * kFp16LayerElements),
+        counters(std::vector<unsigned>(kKvHeads, 0)) {
     // Reversed, above the spare blocks, so a kernel that ignores the table
     // reads the wrong records.
     for (unsigned b = 0; b < logical_blocks; ++b)
@@ -159,7 +161,8 @@ struct Storage {
             .records_layer_pitch = std::size_t{pool_blocks} * 2 * record_row,
             .blocks = blocks.data(),
             .k_rows = k_rows.data(),
-            .v_rows = v_rows.data()};
+            .v_rows = v_rows.data(),
+            .counters = counters.data()};
   }
   // Host offset of a group's record in one layer.
   [[nodiscard]] std::size_t RecordOffset(unsigned layer, unsigned group,
@@ -546,9 +549,8 @@ void TestAttention(int bits, unsigned groups, unsigned tail, unsigned rows,
   DeviceBuffer<std::uint32_t> pos(std::vector<std::uint32_t>{length - rows});
   gufo::hip::LaunchKvarnDecodeAttention(
       dq.data(), dgate.data(), storage.View(), out.data(), kLayer,
-      device_position ? pos.data() : nullptr,
-      device_position ? 0 : length - rows, rows, groups, splits,
-      {scratch.data(), scratch.size()}, nullptr);
+      device_position ? pos.data() : nullptr, length - rows, rows, groups,
+      splits, {scratch.data(), scratch.size()}, nullptr);
   HIP_CHECK(hipDeviceSynchronize());
   const auto got = out.CopyToHost();
   const double error = RelativeError(got, ref);
@@ -689,57 +691,20 @@ void TestVerifyMatchesDecode(int bits, unsigned start, unsigned rows) {
         scratch_span, nullptr);
   HIP_CHECK(hipDeviceSynchronize());
   const auto verified = verify_out.CopyToHost();
-  const auto verify_partials = scratch.CopyToHost();
-  const unsigned verify_rows =
-      plan.boundary != 0 ? start + rows - plan.boundary : rows;
 
   Storage decode_storage(bits, length / 256 + 1);
   gufo::hip::KvarnTail decode_tail;
   Feed(decode_storage, decode_tail, k, v, 0, start);
   DeviceBuffer<float> decode_out(q.size());
-  std::vector<float> decode_partials;
   for (unsigned r = 0; r < rows; ++r) {
     const auto step = Pass(decode_storage, decode_tail, k, v, start + r, 1);
     gufo::hip::LaunchKvarnDecodeAttention(
         dq.data() + r * width, dgate.data() + r * width, decode_storage.View(),
         decode_out.data() + r * width, kLayer, nullptr, start + r, 1,
         step.read_groups, 0, scratch_span, nullptr);
-    if (r == 0) {
-      HIP_CHECK(hipDeviceSynchronize());
-      decode_partials = scratch.CopyToHost();
-    }
   }
   HIP_CHECK(hipDeviceSynchronize());
   const auto decoded = decode_out.CopyToHost();
-  if (plan.boundary == 0) {
-    // Where the first row's decode partials differ from its verification
-    // row's (diagnostic): [kv][split][row m][max, sum, 256 outputs].
-    const unsigned r = 0, vr = 0;
-    const unsigned groups = gufo::hip::KvarnReadGroups(start + r);
-    const unsigned nsplit =
-        gufo::hip::SelectKvarnDecodeSplits(groups, bits) + 2;
-    std::string where;
-    for (unsigned kv = 0; kv < kKvHeads && where.size() < 400; ++kv)
-      for (unsigned s = 0; s < nsplit; ++s)
-        for (unsigned h = 0; h < kGqa; ++h) {
-          const float* d =
-              decode_partials.data() + ((kv * nsplit + s) * kGqa + h) * 258;
-          const float* w =
-              verify_partials.data() +
-              ((kv * nsplit + s) * kGqa * verify_rows + vr * kGqa + h) * 258;
-          unsigned first = 258;
-          for (unsigned i = 0; i < 258; ++i)
-            if (std::memcmp(d + i, w + i, 4) != 0) {
-              first = i;
-              break;
-            }
-          if (first != 258)
-            where += " kv" + std::to_string(kv) + "/s" + std::to_string(s) +
-                     "/h" + std::to_string(h) + "@" + std::to_string(first);
-        }
-    std::cout << "partials last row k4v" << bits << " start=" << start
-              << " splits=" << nsplit - 2 << " differ:" << where << '\n';
-  }
   unsigned differing_rows = 0;
   float max_abs = 0;
   std::string which;
@@ -923,12 +888,14 @@ void TimeAttention() {
           rows_v(copies * kFp16LayerElements);
       HIP_CHECK(hipMemset(rows_k.data(), 0, rows_k.size() * 2));
       HIP_CHECK(hipMemset(rows_v.data(), 0, rows_v.size() * 2));
+      DeviceBuffer<unsigned> counters(std::vector<unsigned>(kKvHeads, 0));
       const KvarnKvView view{.value_bits = bits,
                              .records = records.data(),
                              .records_layer_pitch = layer_pitch,
                              .blocks = dtable.data(),
                              .k_rows = rows_k.data(),
-                             .v_rows = rows_v.data()};
+                             .v_rows = rows_v.data(),
+                             .counters = counters.data()};
       const auto q =
           RandomFloats(std::size_t{shape.rows} * kHeads * kDim, 1, 1.0F);
       DeviceBuffer<float> dq(q), out(q.size());

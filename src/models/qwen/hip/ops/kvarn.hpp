@@ -23,6 +23,9 @@ struct KvarnKvView {
   const std::uint32_t* blocks{nullptr};
   void* k_rows{nullptr};
   void* v_rows{nullptr};
+  /// One zeroed arrival counter per KV head: a decode step's last block
+  /// combines its splits (and leaves the counter zeroed).
+  unsigned* counters{nullptr};
 };
 
 /// Rotates the K and V rows of `rows` consecutive positions ([row][kv
@@ -49,8 +52,10 @@ void LaunchKvarnFlush(const KvarnKvView& kv, std::uint32_t layers,
 /// after it and the FP16 tail to the last row's position, gated like the
 /// FP16 decode path (out *= sigmoid(gate) when gate is non-null). Positions
 /// start at `*d_pos` when it is given, else at `start_pos`; the first query
-/// position must not precede the end of the quantized groups. `splits`
-/// zero selects SelectKvarnDecodeSplits. The scratch must hold
+/// position must not precede the end of the quantized groups. `start_pos`
+/// sets the FP16 tail blocks also with `d_pos` (a captured graph runs
+/// before the first group's end, where there are none). `splits` zero
+/// selects SelectKvarnDecodeSplits. The scratch must hold
 /// KvarnScratchElements(rows, splits).
 void LaunchKvarnDecodeAttention(const float* q, const float* gate,
                                 const KvarnKvView& kv, float* out_context,
