@@ -262,6 +262,13 @@ fake quant는 FP16 커널을 그대로 쓰므로 속도를 재지 못한다. 그
 - K0 `--real` 32K: top-1 214/214, real·fake free text 동일. fp16 대비 KL max real k4v2 8.2e-3(fake 1.4e-2), k4v4 3.5e-4(fake 5.4e-4).
 - **게이트 실패 내용**: k4v2 첫 양자화 창(위치 256–383) fake‖real p95 8.17e-5, 통제(반올림 1회) 7.46e-6의 10.9배(기준 10배). K1c-2에서는 7.20e-5(9.6배)였다. 같은 창 max는 4.35e-4 → 1.73e-4로 줄었고, fp16‖real p95 1.04e-2 → 1.06e-2로 fake(1.26e-2)보다 여전히 낮다. 뒤 두 창·전체 bound·k4v4는 통과. 게이트는 넓히지 않았고 결정 대기.
 
+### K1e 결과 (2026-10-26, gufo `595c5369`·`690943b6`, 감독 검증)
+
+- 진단 창 `kvarn-k1e-a01/k1e-diag`(FAILED는 base 게이트 그대로라 예상대로, health PASS): `common` 변경을 하나씩 되돌린 빌드 a(V 코드)·b(밑 2 softmax)·c1(sink 배치)·c2(combine 순서)가 k4v2 256–383 fake‖real p95를 4.3e-5–8.2e-5 사이로 옮길 뿐 어느 것도 일관된 원인이 아니다. 128–255 바닥은 모든 빌드에서 p95 약 1e-7, 코드는 비트 일치. 결론: 양자화·쓰기 경로 버그가 아니라 커널 산술 마지막 자리가 그룹 1 RTN 코드를 뒤집는 것.
+- 승인한 통제 `control_k`(데이터 측정 전에 정의, 감독 확인): 운영은 sink·tail도 회전 FP16으로 저장하므로 fake 경로에서 각 행이 cache에 들어갈 때 회전 왕복(H → FP16 → H → FP16)을 한 번 거치게 한다. 게이트는 창마다 p95·max에서 fake‖real ≤ 10 × max(control, control_k, 1e-6)(배수 10과 바닥 1e-6은 이전과 같음), top-1 규칙 그대로. 로그에는 이전 비율도 남는다.
+- 창 `kvarn-k1e-a02/k1e-gate` COMPLETE·health PASS(decode 테스트 SHA `d2b5183f…`, 단위 `92cff458…`): k4v2 256–383 real 8.17e-5 대 control_k 7.47e-5(새 비율 p95 1.09, max 0.37; 이전 비율 10.95). 모든 창·두 형식 통과, 가장 큰 새 비율은 k4v4 512–635 max 1.59. verify = decode exact=1 max_abs 0.
+- 남은 한계: 커널 안 FP16 q·P 반올림은 `control_k`가 흉내 내지 못한다.
+
 ### K0에서 정하지 않는 것
 
 - 커널·서빙·checkpoint 형식(K1·K2). 추가가 필요한 것만 적어 둔다: storage enum 값과 policy fingerprint 비트, K/V component `layout_version` 3(새 row_bytes와 128토큰 scale plane), compact snapshot 검증 완화, 블록 풀의 scale plane(`KvBlockPlane::rows_per_block` 128은 이미 표현 가능하나 arena·adapter가 같은 두 plane을 가정한다).
