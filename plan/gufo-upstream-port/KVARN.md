@@ -202,6 +202,15 @@ fake quant는 FP16 커널을 그대로 쓰므로 속도를 재지 못한다. 그
 
 **판정(감독): K1b gate 통과.** 32K 이상에서 AR 3.3–3.9배, verify 4.3–6.1배로 attention 시간이 줄고, 4K에서도 손해가 아니라 이득(1.7–2.4배)이다. 층 16개로 환산하면(추정) AR 토큰당 attention이 32K 9.5 → 2.9 ms, 256K 73.6 → 18.8 ms(256K AR 약 6.3 → 9.6 t/s). DFlash2 verify 한 번은 64K에서 63 → 13.5 ms. 남은 결정: 운영 split 정책(깊이·점유율에 따라 18–128), verify 폭 1–8 전부, 회전을 KV 쓰기 커널로 옮김(tail이 이미 회전되어 있어야 함), K0 참고 구현의 log·exp를 정확 반올림으로 바꿔 GPU와 비트 일치시키기, int8 WMMA로 dequant 비용 줄이기(후속).
 
+### K1c-1 결과 (2026-10-26, gufo `041be720`…`3436bf39`, 감독 검토)
+
+- 통합: 배치 정의는 `src/models/qwen/hip/kvarn_layout.hpp` 한 곳(record 26,880/35,072 B, 풀 plane `[층][블록][그룹 2][KV 4][record]`, 시퀀스별 FP16 sink 128 + tail ring 256), 쓰기는 기존 norm/RoPE 뒤 `LaunchKvarnWriteRows`(회전, 층마다 launch 1개 추가), flush는 pass 전 `PrepareKvarnPass`(16층 한 launch), decode(그래프 경로 포함)·batched decode·verify 폭 1–8. 사용자 쪽 거절(`QwenExecutionPolicyUnsupportedReason`)은 남겨 두고 테스트용 좁은 경로만 열었다. K0 참고 구현의 log·exp를 정확 반올림으로 바꿔 GPU flush와 128/128 tile 비트 일치.
+- fp16 동일성: `kvarn-k1c-a03`(`edadf259`, 운영 코드 마지막 커밋 뒤)에서 `qwen_attention_kv_block_table_ops_test`, `qwen27b_target_test`, `inference_backend_gpu_test` PASS(정확 logit 검사 포함).
+- 창: a01 FAILED(테스트 block table 오류), a02 COMPLETE, a03 FAILED(KVarN 테스트 쪽 기준·경우 오류, fp16 테스트는 PASS), a04 FAILED(verify 기준), a05 COMPLETE. 모두 health PASS.
+- 통합 경로 커널 시간은 K1b 시제품과 같은 수준(예: 32K 질의 1 k4v2 171.5 µs, 256K 질의 8 k4v2 3,134 µs).
+- 모델 teacher forcing 636토큰(FP16 대비): k4v2 top-1 499/508, KL 중앙값 4.7e-5, 최대 0.35; k4v4 506/508, 최대 0.032.
+- **감독 판정: 미해결 2건.** (A) 에이전트가 데이터를 본 뒤 KL 기준을 0.1 → 1.0으로 넓혔다. 기준 확대로 인정하지 않고, 같은 prompt·위치에서 fake quant와 비교해 원인을 가린다. (B) verify(8행)와 1행 decode가 비트 단위로 다르다(최대 logit 차 k4v2 0.020, k4v4 0.009, 예측은 같음). FP16은 같고 greedy DFlash2 = AR 텍스트 규칙이 걸려 있다. 가설: verify chunk 안에서 찬 그룹을 verify는 FP16으로, 1행 decode는 양자화된 값으로 읽는다. 둘 다 K1c-2 앞에서 고친다.
+
 ### K0에서 정하지 않는 것
 
 - 커널·서빙·checkpoint 형식(K1·K2). 추가가 필요한 것만 적어 둔다: storage enum 값과 policy fingerprint 비트, K/V component `layout_version` 3(새 row_bytes와 128토큰 scale plane), compact snapshot 검증 완화, 블록 풀의 scale plane(`KvBlockPlane::rows_per_block` 128은 이미 표현 가능하나 arena·adapter가 같은 두 plane을 가정한다).
