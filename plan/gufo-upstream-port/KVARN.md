@@ -282,6 +282,14 @@ fake quant는 FP16 커널을 그대로 쓰므로 속도를 재지 못한다. 그
 - 창 `kvarn-k23-a01`(FAILED: serve probe 요청에 model 이름 누락, probe 버그; 나머지 PASS, 첫 bench는 창 첫 실행이라 차가움) → `kvarn-k23-a02` 해당 항목만 다시 COMPLETE·health PASS. 옵션 없는 AR: pp512 472.9, tg64 12.97, @32K 374.0 / 12.60(K1d k4v2와 같음, `KV cache: kvarn-k4v2`). fp16 명시는 K1d fp16과 같음. 옵션 없는 serve timings `kvarn-k4v2/3`. DFlash2 옵션 없음 d0 pp512 429(K1d 448–450)는 단일 실행·창 두 번째라 미결, @32K tg 66.96은 같음.
 - 동작 변화: 기본값 Qwen 27B 출력이 FP16과 다를 수 있고(T2에서는 같음), cache identity에 형식이 들어가 기존 FP16 checkpoint·디스크 cache는 기본 실행에서 복원되지 않는다(`--kv-cache-type fp16`이면 복원). 커밋은 breaking(`!`)으로 표시하지 않았다(원본 제안 없음).
 
+### K4-C 결과 (2026-10-27, gufo `09851426`·`c53ce9fe`·`8ec9f20a`, 감독 검증)
+
+- checkpoint: group record [0, base) + sink 정확한 행 [0, min(position,128))(128행 chunk, 128 이후 대화마다 한 번 공유) + private tail(header 64 B + ring 256행 16 MiB). layout_version 5(k4v2)·6(k4v4), 3·4는 거절. 행 규칙은 `src/models/qwen/hip/kvarn_checkpoint.hpp`. tail을 정확한 행으로 줄이려면 `src/cache` 변경(크기가 바뀌는 private state 또는 줄어드는 row component, 디스크 형식·RAM 예산 포함)이 필요해 **하지 않기로 함**(감독 결정, 거절 수가 이미 fp16 아래).
+- 첫 시도 `09851426`은 tail을 row component로 두어 group flush마다 행 수가 줄어 serve가 `generation_failed`("capture estimate rewound without restore")를 냈다(T2 `kvarn-k4c1-t2-a01`). 응답은 끝까지 와서 t2.py가 COMPLETE로 보았다 — finish_reason을 보지 않는 harness 빈틈, 보완 지시함.
+- compact snapshot 버전 3(kvarn 전용, 1·2 그대로): record + 유효 sink·tail 행, 같은 규칙.
+- 창 `kvarn-k4c2-a01`(8ec9f20a, FAILED는 `qwen_ssm_ops_test` 하나): 복원 117 component 바이트 일치·다음 decode exact(위치 70, 128, 646, 530 풀, 640, 636+거절 draft), compact 왕복 바이트 일치, fp16 continuation·draft·backend·kv_storage 통과. `qwen_ssm_ops_test`는 arena 생성에서 중단("KV block plane needs layers…", 주의 층 없는 설정) — 메시지 출처 `f8c9df17`이 KVarN 이전(663d50c9 조상)이라 이전부터의 문제로 보임(확인 지시).
+- T2 `kvarn-k4c1-t2-a02` COMPLETE·health PASS, 감독 대조: 21/21 gold·fp16과 텍스트 동일, finish_reason 모두 stop, 서버 오류·restore_failed 0, 재사용 K2와 같음. RAM `byte_capacity` 거절 k4v2 8 → 4(fp16 5), checkpoint당 약 8 MiB 감소, 디스크 cache 9.39 → 9.24 GiB.
+
 ### K0에서 정하지 않는 것
 
 - 커널·서빙·checkpoint 형식(K1·K2). 추가가 필요한 것만 적어 둔다: storage enum 값과 policy fingerprint 비트, K/V component `layout_version` 3(새 row_bytes와 128토큰 scale plane), compact snapshot 검증 완화, 블록 풀의 scale plane(`KvBlockPlane::rows_per_block` 128은 이미 표현 가능하나 arena·adapter가 같은 두 plane을 가정한다).
