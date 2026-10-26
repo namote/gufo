@@ -513,6 +513,10 @@ struct DecodeArgs {
   unsigned start_pos;          // first query position without d_pos
   unsigned groups;             // quantized groups after the sink
   unsigned splits;  // quantized splits; the sink and tail add two more
+  // blockIdx.z + split_begin is the split; blockIdx.y the first query row
+  // of the block, within `rows` rows the scratch holds.
+  unsigned split_begin;
+  unsigned rows;
 };
 
 // Barrier for LDS traffic only: global loads in flight stay in flight.
@@ -580,10 +584,12 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
   // the sum (wave 0 only) and the chunk's rescale factor.
   __shared__ float row_max[2][MR], row_sum[MR], row_alpha[MR];
 
-  const unsigned kv = blockIdx.x, split = blockIdx.z;
+  const unsigned kv = blockIdx.x, split = blockIdx.z + a.split_begin;
+  const unsigned base_row = blockIdx.y;
   const unsigned tid = threadIdx.x, wave = tid / 32, lane = tid % 32;
   const unsigned sub = lane % 16, half = lane / 16;
-  const unsigned length = (a.d_pos != nullptr ? *a.d_pos : a.start_pos) + Rows;
+  const unsigned length =
+      (a.d_pos != nullptr ? *a.d_pos : a.start_pos) + base_row + Rows;
   const unsigned token = 16 * wave + sub;  // this lane's score column
 
   // q -> H q / 16 as FP16 rows; padding rows are zero.
@@ -592,7 +598,8 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
     if (m < M) {
       const auto* src = reinterpret_cast<const float4*>(
           a.q +
-          (static_cast<std::size_t>(m / kGqa) * kHeads + kv * kGqa + m % kGqa) *
+          (static_cast<std::size_t>(base_row + m / kGqa) * kHeads + kv * kGqa +
+           m % kGqa) *
               kDim +
           8 * lane);
       const float4 lo = src[0], hi = src[1];
@@ -945,8 +952,11 @@ __launch_bounds__(256) __global__ void KvarnDecodePartialsKernel(DecodeArgs a) {
   }
 
   const unsigned nsplit = a.splits + 2;
-  float* partial = a.scratch + (static_cast<std::size_t>(kv) * nsplit + split) *
-                                   M * kPartialStride;
+  float* partial =
+      a.scratch +
+      ((static_cast<std::size_t>(kv) * nsplit + split) * kGqa * a.rows +
+       kGqa * base_row) *
+          kPartialStride;
 #pragma unroll
   for (unsigned mt = 0; mt < MT; ++mt)
 #pragma unroll
@@ -1012,35 +1022,59 @@ __launch_bounds__(256) __global__
   out[index] = result;
 }
 
+// Quantized splits of all rows in one block per (KV head, split); the
+// FP16 sink and tail splits one row per block, as a decode step at the
+// row's position runs them. A query row's partials then come from the same
+// arithmetic at every row count: the 1-row FP16 path zero-fills value rows
+// past its own position, which a wider block cannot do for its first rows
+// (k1c-a08: those rows' PV products differed in the last bits).
 template<int VBits, unsigned Rows>
-void LaunchPartials(const DecodeArgs& args, hipStream_t stream) {
-  const dim3 grid(kKvHeads, 1, args.splits + 2);
-  KvarnDecodePartialsKernel<VBits, Rows><<<grid, 256, 0, stream>>>(args);
+void LaunchQuantizedPartials(const DecodeArgs& args, hipStream_t stream) {
+  if (args.splits == 0)
+    return;
+  auto quantized = args;
+  quantized.split_begin = 0;
+  KvarnDecodePartialsKernel<VBits, Rows>
+      <<<dim3(kKvHeads, 1, args.splits), 256, 0, stream>>>(quantized);
 }
 
 template<int VBits>
 void LaunchPartialsRows(const DecodeArgs& args, unsigned rows,
                         hipStream_t stream) {
+  if (rows == 1) {
+    KvarnDecodePartialsKernel<VBits, 1>
+        <<<dim3(kKvHeads, 1, args.splits + 2), 256, 0, stream>>>(args);
+    return;
+  }
   switch (rows) {
-    case 1:
-      return LaunchPartials<VBits, 1>(args, stream);
     case 2:
-      return LaunchPartials<VBits, 2>(args, stream);
+      LaunchQuantizedPartials<VBits, 2>(args, stream);
+      break;
     case 3:
-      return LaunchPartials<VBits, 3>(args, stream);
+      LaunchQuantizedPartials<VBits, 3>(args, stream);
+      break;
     case 4:
-      return LaunchPartials<VBits, 4>(args, stream);
+      LaunchQuantizedPartials<VBits, 4>(args, stream);
+      break;
     case 5:
-      return LaunchPartials<VBits, 5>(args, stream);
+      LaunchQuantizedPartials<VBits, 5>(args, stream);
+      break;
     case 6:
-      return LaunchPartials<VBits, 6>(args, stream);
+      LaunchQuantizedPartials<VBits, 6>(args, stream);
+      break;
     case 7:
-      return LaunchPartials<VBits, 7>(args, stream);
+      LaunchQuantizedPartials<VBits, 7>(args, stream);
+      break;
     case 8:
-      return LaunchPartials<VBits, 8>(args, stream);
+      LaunchQuantizedPartials<VBits, 8>(args, stream);
+      break;
     default:
       throw std::invalid_argument("KVarN attention takes 1 to 8 query rows");
   }
+  auto fp16 = args;
+  fp16.split_begin = args.splits;
+  KvarnDecodePartialsKernel<VBits, 1>
+      <<<dim3(kKvHeads, rows, 2), 256, 0, stream>>>(fp16);
 }
 
 }  // namespace
@@ -1118,6 +1152,8 @@ void LaunchKvarnDecodeAttention(const float* q, const float* gate,
       .start_pos = start_pos,
       .groups = groups,
       .splits = splits,
+      .split_begin = 0,
+      .rows = rows,
   };
   if (kv.value_bits == 2)
     LaunchPartialsRows<2>(args, rows, stream);
