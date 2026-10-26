@@ -2,8 +2,9 @@
 // plan/gufo-upstream-port/K1-BRIEF.md): a prompt fed token by token (the
 // first rows through the captured decode graph, then split-K with group
 // flushes) against the FP16 executor under teacher forcing, DFlash2-style
-// verification rows against scalar decoding of the same tokens, and the
-// refusals that stay until prefill (K1c-2) and snapshots (K2) exist.
+// verification rows against scalar decoding of the same tokens, in-memory
+// snapshots, prompt prefill, and the compact snapshot refusal that stays
+// until a KVarN checkpoint layout (K2) exists.
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -88,26 +89,12 @@ void CheckStorage(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
   policy.kv_cache_storage = storage;
   const std::string name(gufo::hip::QwenKvCacheStorageName(storage));
 
-  // Release entry points still refuse KVarN.
   std::string error;
-  Expect(Executor::Create(model, &error, kContext, policy) == nullptr &&
-             error.find("not implemented yet") != std::string::npos,
-         name + ": release executor creation must refuse");
-
+  auto created = Executor::Create(model, &error, kContext, policy);
+  Expect(created != nullptr, name + ": executor creation: " + error);
   Executor fp16(model, kContext);
-  Executor kvarn(model, kContext, policy,
-                 gufo::hip::QwenKvarnDecodeOnlyAccess{});
+  Executor& kvarn = *created;
   const auto tokens = Fixture(fp16, kPrompt + kRows + kTail);
-
-  try {
-    (void)kvarn.ForwardPromptBatch(std::span(tokens).first(16));
-    Expect(false, name + ": prompt prefill must refuse");
-  } catch (const std::logic_error& refusal) {
-    Expect(std::string_view(refusal.what()).find("not implemented yet") !=
-               std::string_view::npos,
-           name + ": prefill refusal names the gap");
-  }
-  kvarn.Reset();
 
   // Teacher forcing: three executors read the same tokens. `fake` is the
   // FP16 executor of the K0 study whose K/V rows of every group that ended
@@ -257,6 +244,8 @@ void CheckStorage(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
   Expect(real_fake_agree * 100 + steps.size() >= control_agree * 100,
          name + ": real and fake KVarN disagree on top-1 beyond the control");
 
+  // An in-memory snapshot of this state, restored below.
+  auto snapshot = kvarn.SaveSnapshot(kPrompt);
   // Verification rows against scalar decoding of the same tokens.
   kvarn.SaveState(kPrompt);
   const auto verify = std::span(tokens).subspan(kPrompt, kRows);
@@ -270,9 +259,12 @@ void CheckStorage(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
   kvarn.RestoreState();
   float max_abs = 0;
   bool exact = true;
+  std::vector<float> first_scalar;
   for (std::uint32_t row = 0; row < kRows; ++row) {
     (void)kvarn.ForwardToken(verify[row], kPrompt + row);
     const auto scalar = Logits(kvarn);
+    if (row == 0)
+      first_scalar = scalar;
     const auto batch = std::span(verified).subspan(
         static_cast<std::size_t>(row) * vocab, vocab);
     exact = exact && std::memcmp(scalar.data(), batch.data(),
@@ -291,20 +283,53 @@ void CheckStorage(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
   // (KvarnReadGroups) with the same split order: equal logits, as FP16.
   Expect(exact, name + ": verification differs from decoding");
 
-  // Decoding on past the pinned point (group 4 stays FP16 until the ring
-  // needs it), then a fresh pinned point confirms and quantizes it.
+  // Decoding on past group 5's end (quantized at 768).
   for (std::uint32_t pos = kPrompt + kRows; pos < kPrompt + kRows + kTail;
        ++pos) {
-    if (pos == kPrompt + kRows + kTail / 2)
-      kvarn.SaveState(pos);
     (void)kvarn.ForwardToken(tokens[pos], pos);
     (void)Logits(kvarn);
   }
 
+  // The snapshot restores the state exactly; its compact form waits for
+  // a KVarN checkpoint layout.
+  kvarn.RestoreSnapshot(*snapshot);
+  (void)kvarn.ForwardToken(verify[0], kPrompt);
+  Expect(std::memcmp(Logits(kvarn).data(), first_scalar.data(),
+                     vocab * sizeof(float)) == 0,
+         name + ": a restored snapshot decodes differently");
   try {
-    (void)kvarn.SaveSnapshot(kPrompt);
-    Expect(false, name + ": snapshots must refuse");
+    std::vector<std::uint8_t> payload(snapshot->CompactPayloadBytes());
+    Expect(false, name + ": compact snapshots must refuse");
   } catch (const std::logic_error&) {
+  }
+
+  // Prompt prefill. One chunk reads only its own FP16 rows, so it matches
+  // the FP16 prefill but for the order of the attention's sums; two chunks
+  // read the groups that ended before the second one quantized.
+  for (const std::uint32_t split : {kPrompt, 300U}) {
+    fp16.Reset();
+    kvarn.Reset();
+    for (auto* executor : {&fp16, &kvarn}) {
+      (void)executor->ForwardPromptBatch(std::span(tokens).first(split));
+      if (split < kPrompt)
+        (void)executor->ForwardPromptBatch(
+            std::span(tokens).subspan(split, kPrompt - split), split);
+    }
+    const auto reference = Logits(fp16);
+    const auto real = Logits(kvarn);
+    const double kl = Kl(reference, real);
+    std::cout << name << " prefill of " << kPrompt << " tokens in "
+              << (split < kPrompt ? 2 : 1) << " chunks: KL fp16||real " << kl
+              << " top-1 " << (Argmax(reference) == Argmax(real)) << '\n';
+    if (split == kPrompt)
+      Expect(kl < 1e-4, name + ": a one-chunk prefill departs from FP16");
+    // Decoding continues from the prefilled tail.
+    for (std::uint32_t pos = kPrompt; pos < kPrompt + 4; ++pos) {
+      (void)fp16.ForwardToken(tokens[pos], pos);
+      (void)kvarn.ForwardToken(tokens[pos], pos);
+      std::cout << name << "   decode " << pos << " after prefill: KL "
+                << Kl(Logits(fp16), Logits(kvarn)) << '\n';
+    }
   }
   // A reset starts over from the sink.
   kvarn.Reset();

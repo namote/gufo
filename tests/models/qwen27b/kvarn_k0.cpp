@@ -14,6 +14,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -99,9 +100,10 @@ json::Value Distribution(std::vector<double> values) {
 
 int main(int argc, char** argv) {
   try {
-    std::string model_path, system_path, user_path, out_path,
+    std::string model_path, system_path, user_path, out_path, real_configs,
         configs = "fp16,kvarn_k4v2_g128";
     std::uint32_t steps = 384, prefill_chunk = 0;
+    bool quantize_decode = false;
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
       const auto value = [&]() -> std::string {
@@ -120,6 +122,10 @@ int main(int argc, char** argv) {
         steps = static_cast<std::uint32_t>(std::stoul(value()));
       else if (arg == "--prefill-chunk")
         prefill_chunk = static_cast<std::uint32_t>(std::stoul(value()));
+      else if (arg == "--quantize-decode")
+        quantize_decode = true;
+      else if (arg == "--real")
+        real_configs = value();
       else if (model_path.empty() && !arg.starts_with("--"))
         model_path = arg;
       else
@@ -129,7 +135,8 @@ int main(int argc, char** argv) {
                 steps > 0,
             "Usage: qwen27b_kvarn_k0 MODEL.gguf --user FILE [--system FILE] "
             "--out FILE.jsonl [--configs fp16,kvarn_k4v2_g128,...] "
-            "[--steps N] [--prefill-chunk N]");
+            "[--steps N] [--prefill-chunk N] [--quantize-decode] "
+            "[--real kvarn_k4v2_g128,kvarn_k4v4_g128]");
     std::vector<kvarn::Config> parsed;
     for (std::stringstream list(configs); list.good();) {
       std::string name;
@@ -138,6 +145,27 @@ int main(int argc, char** argv) {
       Require(config.has_value(), "unknown configuration " + name);
       parsed.push_back(*config);
     }
+    // --real: the KVarN executor (--kv-cache-type) on the same prompt,
+    // compared with the FP16 reference and with the fake configuration of
+    // the same name when --configs has it.
+    std::vector<kvarn::Config> real;
+    for (std::stringstream list(real_configs);
+         !real_configs.empty() && list.good();) {
+      std::string name;
+      std::getline(list, name, ',');
+      const auto config = kvarn::ParseConfig(name);
+      Require(config.has_value() && config->method == kvarn::Method::kKvarn &&
+                  config->key_bits == 4 &&
+                  (config->value_bits == 2 || config->value_bits == 4) &&
+                  config->group == 128,
+              "--real takes kvarn_k4v2_g128 and kvarn_k4v4_g128, not " + name);
+      real.push_back(*config);
+    }
+    const auto is_real = [&](const std::string& name) {
+      return std::ranges::any_of(
+          real, [&](const kvarn::Config& c) { return c.name == name; });
+    };
+    std::map<std::string, std::vector<std::vector<float>>> fake_logprobs;
 
     std::string error;
     auto reader = gufo::core::GgufReader::OpenFile(model_path, &error);
@@ -231,6 +259,24 @@ int main(int argc, char** argv) {
       }
       const double prepare_ms = Ms(start);
 
+      // --quantize-decode: a group that ends during decoding is quantized
+      // before the position after it reads it, as KVarN's position rule
+      // (src/models/qwen/hip/kvarn_layout.hpp KvarnReadGroups) does.
+      const auto forward = [&](Token token, std::uint32_t position) {
+        if (quantize_decode && config.method != kvarn::Method::kFp16 &&
+            position % group == 0 && position / group >= 2) {
+          State state = session.Capture();
+          const auto t = Clock::now();
+          (void)Quantize(session, state, config, c.num_key_value_heads,
+                         c.head_dim, position / group - 1, position / group);
+          quantize_ms += Ms(t);
+          session.Restore(state);
+        }
+        (void)executor.ForwardToken(token, position);
+      };
+      auto& recorded = fake_logprobs[config.name];
+      const bool record = is_real(config.name);
+
       // Teacher forcing on the FP16 continuation.
       session.Restore(initial);
       std::vector<double> kls;
@@ -242,14 +288,16 @@ int main(int argc, char** argv) {
           max_logit_difference =
               std::max(max_logit_difference,
                        std::abs(logits[v] - reference_logits[i][v]));
-        kls.push_back(Kl(reference_logprobs[i], LogSoftmax(logits)));
+        auto logprobs = LogSoftmax(logits);
+        kls.push_back(Kl(reference_logprobs[i], logprobs));
+        if (record)
+          recorded.push_back(std::move(logprobs));
         if (Argmax(logits) == reference_tokens[i])
           ++agree;
         else if (first_disagreement == reference_tokens.size())
           first_disagreement = i;
         if (i + 1 < reference_tokens.size())
-          (void)executor.ForwardToken(reference_tokens[i],
-                                      n + static_cast<std::uint32_t>(i));
+          forward(reference_tokens[i], n + static_cast<std::uint32_t>(i));
       }
 
       // Free greedy run from the same state.
@@ -259,7 +307,7 @@ int main(int argc, char** argv) {
         tokens.push_back(Argmax(executor.CopyLastLogits()));
         if (tokenizer.IsStopToken(tokens.back()))
           break;
-        (void)executor.ForwardToken(tokens.back(), n + i);
+        forward(tokens.back(), n + i);
       }
       const auto divergence = static_cast<std::size_t>(
           std::ranges::mismatch(tokens, reference_tokens).in1 - tokens.begin());
@@ -275,6 +323,8 @@ int main(int argc, char** argv) {
       row["prompt_tokens"] = std::size_t{n};
       row["prefill_chunk"] = std::size_t{
           config.method == kvarn::Method::kFp16 ? 0U : prefill_chunk};
+      row["quantize_decode"] =
+          quantize_decode && config.method != kvarn::Method::kFp16;
       row["quantized_tokens"] =
           config.method == kvarn::Method::kFp16
               ? 0
@@ -305,6 +355,101 @@ int main(int argc, char** argv) {
                 << " kl_median=" << row["kl"].member_double("median")
                 << " top1=" << row["top1_agreement"].as_double()
                 << " free_identical=" << (tokens == reference_tokens)
+                << std::endl;
+    }
+    // The real KVarN path: its own executor, prefilled in its chunks of
+    // GetMaxPromptBatch tokens (compare with --prefill-chunk of that size).
+    for (const auto& config : real) {
+      auto policy = gufo::hip::QwenExecutionPolicy::Production();
+      policy.kv_cache_storage = config.value_bits == 2
+                                    ? gufo::hip::QwenKvCacheStorage::kKvarnK4V2
+                                    : gufo::hip::QwenKvCacheStorage::kKvarnK4V4;
+      gufo::hip::QwenGpuExecutor real_executor(model, context, policy);
+      start = Clock::now();
+      (void)real_executor.ForwardPromptBatch(prompt);
+      const double real_prefill_ms = Ms(start);
+      const auto fake = fake_logprobs.find(config.name);
+      const bool with_fake = fake != fake_logprobs.end() &&
+                             fake->second.size() == reference_tokens.size();
+      std::vector<double> kls, fake_kls;
+      std::size_t agree = 0, fake_agree = 0,
+                  first_disagreement = reference_tokens.size();
+      start = Clock::now();
+      for (std::size_t i = 0; i < reference_tokens.size(); ++i) {
+        const auto logits = real_executor.CopyLastLogits();
+        const auto logprobs = LogSoftmax(logits);
+        kls.push_back(Kl(reference_logprobs[i], logprobs));
+        const auto top = Argmax(logits);
+        if (top == reference_tokens[i])
+          ++agree;
+        else if (first_disagreement == reference_tokens.size())
+          first_disagreement = i;
+        if (with_fake) {
+          fake_kls.push_back(Kl(fake->second[i], logprobs));
+          fake_agree += top == Argmax(fake->second[i]);
+        }
+        if (i + 1 < reference_tokens.size())
+          (void)real_executor.ForwardToken(reference_tokens[i],
+                                           n + static_cast<std::uint32_t>(i));
+      }
+      const double real_decode_ms = Ms(start);
+      // Free greedy run: prefill again.
+      real_executor.Reset();
+      (void)real_executor.ForwardPromptBatch(prompt);
+      std::vector<Token> tokens;
+      for (std::uint32_t i = 0; i < steps; ++i) {
+        tokens.push_back(Argmax(real_executor.CopyLastLogits()));
+        if (tokenizer.IsStopToken(tokens.back()))
+          break;
+        (void)real_executor.ForwardToken(tokens.back(), n + i);
+      }
+      const auto divergence = static_cast<std::size_t>(
+          std::ranges::mismatch(tokens, reference_tokens).in1 - tokens.begin());
+      const auto text = [&](std::span<const Token> ids) {
+        std::vector<Token> visible(ids.begin(), ids.end());
+        if (!visible.empty() && tokenizer.IsStopToken(visible.back()))
+          visible.pop_back();
+        return tokenizer.Decode(visible);
+      };
+      auto row = json::Value::object();
+      row["config"] = "real_" + config.name;
+      row["prompt_tokens"] = std::size_t{n};
+      row["prefill_chunk"] = std::size_t{real_executor.GetMaxPromptBatch()};
+      row["steps"] = reference_tokens.size();
+      row["kl"] = Distribution(kls);
+      auto kl_steps = json::Value::array();
+      for (const double kl : kls)
+        kl_steps.push_back(kl);
+      row["kl_steps"] = std::move(kl_steps);
+      row["top1_agreement"] =
+          static_cast<double>(agree) / reference_tokens.size();
+      row["first_top1_disagreement"] = first_disagreement;
+      if (with_fake) {
+        row["kl_vs_fake"] = Distribution(fake_kls);
+        auto steps_vs_fake = json::Value::array();
+        for (const double kl : fake_kls)
+          steps_vs_fake.push_back(kl);
+        row["kl_vs_fake_steps"] = std::move(steps_vs_fake);
+        row["top1_agreement_vs_fake"] =
+            static_cast<double>(fake_agree) / reference_tokens.size();
+      }
+      row["free_tokens"] = tokens.size();
+      row["free_divergence"] = divergence;
+      row["free_identical"] = tokens == reference_tokens;
+      row["free_text"] = text(tokens);
+      row["reference_text"] = text(reference_tokens);
+      row["prefill_ms"] = real_prefill_ms;
+      row["teacher_forcing_ms"] = real_decode_ms;
+      out << row.dump() << '\n' << std::flush;
+      std::cerr << "real_" << config.name
+                << " kl_median=" << row["kl"].member_double("median")
+                << " top1=" << row["top1_agreement"].as_double()
+                << " free_identical=" << (tokens == reference_tokens)
+                << (with_fake
+                        ? " kl_vs_fake_median=" +
+                              std::to_string(
+                                  row["kl_vs_fake"].member_double("median"))
+                        : std::string())
                 << std::endl;
     }
     return 0;

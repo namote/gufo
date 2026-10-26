@@ -763,6 +763,136 @@ void TestVerifyMatchesDecode(int bits, unsigned start, unsigned rows) {
   Check(differing_rows == 0, line);
 }
 
+// Prompt chunk: attention over the history (dequantized, rotated back) and
+// the chunk's own rows against double attention, and the stored chunk
+// (records of the groups it completes, the ring's FP16 rows) bit for bit
+// against the same rows written by decode passes.
+void TestPrefill(int bits, unsigned start, unsigned rows) {
+  const unsigned length = start + rows;
+  const auto all = RandomRows(length, 51 + length + bits);
+  DeviceBuffer<float> k(all.k), v(all.v);
+  const std::size_t width = std::size_t{kHeads} * kDim;
+  const auto q = RandomFloats(std::size_t{rows} * width, 17 + start, 1.0F);
+  const auto gate = RandomFloats(q.size(), 18 + start, 1.0F);
+  DeviceBuffer<float> dq(q), dgate(gate), out(q.size());
+
+  Storage prefill(bits, length / 256 + 1);
+  gufo::hip::KvarnTail tail;
+  Feed(prefill, tail, k, v, 0, start);
+  const auto plan = gufo::hip::PlanKvarnPrefill(tail, start, rows);
+  if (!plan.error.empty())
+    throw std::logic_error(std::string(plan.error));
+  gufo::hip::LaunchKvarnFlush(prefill.View(), kLayers, plan.first_group,
+                              plan.groups, nullptr);
+  const std::size_t padded = (length + 15U) & ~std::size_t{15};
+  DeviceBuffer<float> packed_k(std::size_t{kKvHeads} * length * kDim / 2 + 64);
+  DeviceBuffer<float> packed_v(std::size_t{kKvHeads} * padded * kDim / 2 + 64);
+  DeviceBuffer<std::uint16_t> staging(2 * gufo::hip::KvarnStagingRows(rows) *
+                                      kRowWidth);
+  // The history as the chunk reads it, captured before the chunk stores.
+  HIP_CHECK(hipDeviceSynchronize());
+  const auto records = prefill.records.CopyToHost();
+  const auto ring_k = prefill.k_rows.CopyToHost();
+  const auto ring_v = prefill.v_rows.CopyToHost();
+  for (unsigned layer = 0; layer < kLayers; ++layer)
+    gufo::hip::LaunchKvarnPrefillAttention(
+        dq.data(), k.data() + std::size_t{start} * kRowWidth,
+        v.data() + std::size_t{start} * kRowWidth, dgate.data(), prefill.View(),
+        out.data(), layer, start, rows, plan,
+        {packed_k.data(), packed_k.size()}, {packed_v.data(), packed_v.size()},
+        {staging.data(), staging.size()}, 0, nullptr);
+  HIP_CHECK(hipDeviceSynchronize());
+  tail.flushed_end = plan.flushed_end;
+  tail.written_end = length;
+
+  // Reference rows in the original frame.
+  std::vector<float> kref(std::size_t{length} * kRowWidth), vref(kref.size());
+  const unsigned quantized_end = kGroup * (1 + plan.read_groups);
+  ParallelFor(std::size_t{length} * kKvHeads, [&](std::size_t index) {
+    const unsigned t = index / kKvHeads, kv = index % kKvHeads;
+    for (const bool key : {true, false}) {
+      double x[kDim];
+      if (t >= start) {
+        const auto& src = key ? all.k : all.v;
+        for (unsigned d = 0; d < kDim; ++d)
+          x[d] = kvarn::RoundHalf(src[index * kDim + d]);
+      } else {
+        if (t >= kGroup && t < quantized_end) {
+          const auto rows_kv = DequantRows(
+              records.data() + prefill.RecordOffset(kLayer, t / kGroup, kv),
+              bits, key);
+          for (unsigned d = 0; d < kDim; ++d)
+            x[d] = rows_kv[(t % kGroup) * kDim + d];
+        } else {
+          const auto& ring = key ? ring_k : ring_v;
+          for (unsigned d = 0; d < kDim; ++d)
+            x[d] = kvarn::HalfToFloat(
+                ring[kLayer * kFp16LayerElements +
+                     std::size_t{KvarnFp16Row(t)} * kRowWidth + kv * kDim + d]);
+        }
+        HadamardDouble(x);
+      }
+      auto& dst = key ? kref : vref;
+      for (unsigned d = 0; d < kDim; ++d)
+        dst[index * kDim + d] = static_cast<float>(x[d]);
+    }
+  });
+  const auto ref = Attention(
+      q, gate, rows, length, false,
+      [&](unsigned t, unsigned kv) {
+        return kref.data() + (std::size_t{t} * kKvHeads + kv) * kDim;
+      },
+      [&](unsigned t, unsigned kv) {
+        return vref.data() + (std::size_t{t} * kKvHeads + kv) * kDim;
+      });
+  const double error = RelativeError(out.CopyToHost(), ref);
+
+  // The same rows through decode passes, then the groups they complete.
+  Storage decode(bits, length / 256 + 1);
+  gufo::hip::KvarnTail decode_tail;
+  Feed(decode, decode_tail, k, v, 0, length);
+  const unsigned complete = length / kGroup * kGroup;
+  if (complete > decode_tail.flushed_end)
+    gufo::hip::LaunchKvarnFlush(
+        decode.View(), kLayers, decode_tail.flushed_end / kGroup,
+        (complete - decode_tail.flushed_end) / kGroup, nullptr);
+  HIP_CHECK(hipDeviceSynchronize());
+  std::size_t record_diff = 0, row_diff = 0;
+  const auto prefill_records = prefill.records.CopyToHost();
+  const auto decode_records = decode.records.CopyToHost();
+  const std::size_t record_bytes = KvarnRecord(bits).bytes;
+  for (unsigned layer = 0; layer < kLayers; ++layer)
+    for (unsigned g = 1; g < tail.flushed_end / kGroup; ++g)
+      for (unsigned kv = 0; kv < kKvHeads; ++kv)
+        record_diff +=
+            std::memcmp(
+                prefill_records.data() + prefill.RecordOffset(layer, g, kv),
+                decode_records.data() + decode.RecordOffset(layer, g, kv),
+                record_bytes) != 0;
+  const auto prefill_k = prefill.k_rows.CopyToHost(),
+             decode_k = decode.k_rows.CopyToHost();
+  const auto prefill_v = prefill.v_rows.CopyToHost(),
+             decode_v = decode.v_rows.CopyToHost();
+  for (unsigned layer = 0; layer < kLayers; ++layer)
+    for (unsigned t = 0; t < length; ++t) {
+      if (t >= kGroup && t < tail.flushed_end)
+        continue;
+      const std::size_t at =
+          layer * kFp16LayerElements + std::size_t{KvarnFp16Row(t)} * kRowWidth;
+      row_diff += std::memcmp(prefill_k.data() + at, decode_k.data() + at,
+                              kRowWidth * 2) != 0 ||
+                  std::memcmp(prefill_v.data() + at, decode_v.data() + at,
+                              kRowWidth * 2) != 0;
+    }
+  char line[256];
+  std::snprintf(line, sizeof(line),
+                "prefill k4v%d start=%u rows=%u read_groups=%u flushed_end=%u "
+                "rel=%.3e record_diff=%zu row_diff=%zu",
+                bits, start, rows, plan.read_groups, tail.flushed_end, error,
+                record_diff, row_diff);
+  Check(error < 2e-3 && record_diff == 0 && row_diff == 0, line);
+}
+
 // `time`: microseconds per attention launch at the production split policy,
 // for comparison with the K1b prototype sweep (KVARN.md). Inputs cycle
 // through copies of at least 256 MiB, past the 32 MiB MALL, and the timed
@@ -886,6 +1016,10 @@ int main(int argc, char** argv) {
                       c.device_position);
       TestEndToEnd(bits, 1000, 1);
       TestEndToEnd(bits, 1000, 8);
+      TestPrefill(bits, 0, 300);     // from the sink
+      TestPrefill(bits, 300, 400);   // after a quantized group
+      TestPrefill(bits, 1000, 600);  // a partial group before the chunk
+      TestPrefill(bits, 4096, 1500);
       TestVerifyMatchesDecode(bits, 100, 8);    // the sink
       TestVerifyMatchesDecode(bits, 700, 8);    // inside a group
       TestVerifyMatchesDecode(bits, 636, 8);    // across the end of group 4
