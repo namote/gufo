@@ -308,6 +308,11 @@ fake quant는 FP16 커널을 그대로 쓰므로 속도를 재지 못한다. 그
 - 4K 고정 비용은 여전히 하한의 41–51 %(FP16 sink·tail 블록과 블록 지연, 바꾸지 않음). split 수에 따른 주기적 속도 차(12/14/22 느림, 10/20 빠름) 원인 미확인. `kKvarnMaxSplits` 38은 scratch 상한으로 그대로.
 - 창 a11·a14의 decode 테스트 FAILED는 K4-C `8ec9f20a`가 남긴 "compact snapshots must refuse" 기대 때문(K4-C 창은 continuation 모드만 돌려 놓침) — 수정 지시함. a07은 에이전트 조작 실수로 중단(INCIDENT.txt, 결과 쓰지 않음), a05·a06의 prompt 16K/32K는 `prompt` 문맥 4096 초과.
 
+### K4 마무리 (2026-10-27, gufo `55e09cab`)
+
+- decode 테스트의 묵은 compact 거절 기대 제거(`55e09cab`). 창 `kvarn-k4c3-a01`(K4-P·K4-C 모두 포함한 HEAD) COMPLETE·health PASS: full decode 테스트, KVarN ops, continuation 모드, fp16 continuation adapter(plain·draft), target, backend, block table 모두 PASS.
+- 남은 것(K3 뒤 또는 필요 시): AR pp512 d0 약 −0.4 %(quantizer 몫), 4K decode FP16 sink·tail 고정 비용, checkpoint tail 16 MiB 고정(정확히 줄이려면 `src/cache` 변경), FP16 q·P 반올림 통제 없음, `qwen_ssm_ops_test` 이전부터의 중단(`f8c9df17`).
+
 ### K0에서 정하지 않는 것
 
 - 커널·서빙·checkpoint 형식(K1·K2). 추가가 필요한 것만 적어 둔다: storage enum 값과 policy fingerprint 비트, K/V component `layout_version` 3(새 row_bytes와 128토큰 scale plane), compact snapshot 검증 완화, 블록 풀의 scale plane(`KvBlockPlane::rows_per_block` 128은 이미 표현 가능하나 arena·adapter가 같은 두 plane을 가정한다).
