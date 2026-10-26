@@ -125,6 +125,56 @@ fake quant는 FP16 커널을 그대로 쓰므로 속도를 재지 못한다. 그
 - CPU 양자화 시간: 32K 토큰 component 하나 0.3 s(32스레드). 256K 설정 하나에 약 1–2분.
 - 창 계획: ai.tools `test/experiments/gufo_upstream_port_20261023/PLAN-K0.json`(`k0-32k`: 설정 7개 + chunk 4096 설정 3개 + bench·profile, `k0-256k`: 설정 5개), 입력·채점 `kvarn_k0.py`, fixture `kvarn-user-{32k,256k}.txt`·`kvarn-gold.json`.
 
+### K0 결과 (2026-10-26, gufo `b3edc894`)
+
+창: ai.tools `kvarn-k0-a01/k0-32k`(정확도·bench는 COMPLETE, 프로파일은 rocprofv3가 읽기 전용 `/src`에 임시 버퍼를 쓰려다 멈춰 900 s timeout, 창 판정 FAILED_no_fallback, health PASS), `kvarn-k0-a02/k0-prof`(`ROCPROF_TMPDIR=/receipt/run`로 프로파일만 다시, COMPLETE), `kvarn-k0-a02/k0-256k`(COMPLETE). 모든 창 health PASS, 자동 fallback 없음. 런타임 이미지 `ai-tools/gufo-eval:663d50c9f9d6`, 모델 Qwen3.8-27B UD-Q4_K_M, think off, AR greedy.
+
+**정확도.** 32K(32,770토큰)와 256K(254,880토큰) 문서, 기준 답 214토큰.
+
+|prompt|설정|K 오차|V 오차|KL 중앙값|KL p95|KL 최대|top-1|free 텍스트|gold|
+|---|---|---|---|---|---|---|---|---|---|
+|32K|fp16(왕복)|0|0|0|0|0|214/214|같음|정답|
+|32K|rtn_k4v2_g128|0.052|0.894|4.1e-6|1.2e-4|4.4e-3|214/214|같음|정답|
+|32K|hrtn_k4v2_g128|0.056|0.538|1.4e-6|9.0e-5|1.0e-3|214/214|같음|정답|
+|32K|kvarn_k4v2_g128|0.056|0.596|1.6e-6|1.0e-4|9.5e-4|214/214|같음|정답|
+|32K|kvarn_k4v4_g128|0.056|0.118|2.7e-7|1.9e-5|4.5e-4|214/214|같음|정답|
+|32K|kvarn_k8v4_g128|0.003|0.118|1.0e-7|4.7e-6|5.0e-5|214/214|같음|정답|
+|32K|kvarn_k4v2_g64|0.049|0.609|1.8e-6|8.2e-5|3.8e-3|214/214|같음|정답|
+|32K chunk 4096|rtn_k4v2_g128|0.051|0.897|5.9e-6|3.4e-4|5.5e-2|214/214|같음|정답|
+|32K chunk 4096|kvarn_k4v2_g128|0.055|0.595|4.0e-6|1.7e-4|1.8e-2|214/214|같음|정답|
+|32K chunk 4096|kvarn_k4v4_g128|0.056|0.118|1.2e-6|4.2e-5|8.6e-4|214/214|같음|정답|
+|256K|fp16(왕복)|0|0|0|0|0|214/214|같음|정답|
+|256K|rtn_k4v2_g128|0.044|0.910|3.3e-6|2.0e-4|1.1e-2|214/214|같음|정답|
+|256K|kvarn_k4v2_g128|0.048|0.563|1.6e-6|1.2e-4|6.7e-3|214/214|같음|정답|
+|256K|kvarn_k4v4_g128|0.048|0.112|1.6e-7|1.5e-5|2.1e-4|214/214|같음|정답|
+|256K|kvarn_k8v4_g128|0.003|0.112|7.2e-8|1.0e-5|7.0e-5|214/214|같음|정답|
+
+- fp16 왕복은 모든 걸음에서 logits가 비트 단위로 같다. 도구의 capture·restore가 정확하다.
+- 모든 설정이 두 길이 모두 top-1 214/214, free greedy 텍스트 동일, gold 정답이다. 단순 RTN도 마찬가지다.
+- 차이는 KL에서만 보인다. KVarN k4v2는 RTN k4v2보다 KL 중앙값이 2–2.6배, 최대가 1.6–4.6배 작다. 같은 비트에서 Hadamard만으로도 대부분의 이득이 난다(hrtn ≈ kvarn). V를 4비트로 올리면 KL이 한 자릿수 더 줄어든다. 256K가 32K보다 나쁘지 않다.
+- prefill 중에도 양자화된 앞 블록을 읽으면(chunk 4096) KL 최대가 RTN 0.055, KVarN 0.018로 늘지만 top-1은 여전히 전부 같다. KVarN이 누적에 더 강하다.
+- **한계:** 과제(JSON 목록을 그대로 옮겨 쓰기)가 쉬워 정답 여부로는 설정이 갈리지 않았다. 품질 기준(K-D3)을 정하려면 더 어려운 과제(논문의 line retrieval, 256K needle 등)가 필요하다.
+- 256K 설정 하나 준비 시간: RTN 15 s, KVarN 43 s(CPU 양자화 40 s).
+
+**속도 상한.** AR bench(측정, pp512·tg64): d0 12.95, d32K 11.45, d64K 10.24 t/s. 256K K0 기준 decode는 214토큰 34.0 s = 6.3 t/s.
+
+|decode 구간|attention 커널(토큰당)|구간 GPU 시간 중 attention|
+|---|---|---|
+|AR d0|0.4 ms|0.5 %|
+|AR d32K|10.3 ms|11.9 %|
+|AR d64K|20.3 ms|21.0 %|
+|DFlash2 d0|—|0.3 %|
+|DFlash2 d32K|—|21.2 %|
+|DFlash2 d64K|—|33.5 %|
+
+- AR decode attention은 32K마다 10.2 ms씩 선형으로 늘고, bench의 토큰당 시간 증가(10.1 ms)와 같다. 토큰당 KV 읽기(깊이 × 64 KiB)로 나누면 약 208 GB/s로, 대역폭에 묶여 있다. 그래서 바이트를 줄이면 그대로 시간이 준다.
+- 256K AR 추정(외삽, dequant 비용 0 가정): attention 82 → 17 ms, 토큰당 159 → 94 ms, 6.3 → 10.6 t/s(+69 %). 32K는 +10 %, 0에 가까운 문맥은 이득 없음.
+- 운영 구성(DFlash2)은 verify 한 번에 KV를 읽어 여러 토큰을 검증하는데도, 이미 64K에서 decode의 1/3이 attention이다. 256K로 외삽하면 2/3 이상이라 이득이 AR보다 클 수 있다(수락률이 깊이·내용에 따라 달라 수치 외삽은 하지 않는다).
+- prefill: pp512가 d0 478 → d64K 243 t/s로 깊이에 따라 떨어진다(WMMA prefill attention). 양자화 KV를 읽는 prefill 커널이 이득인지 손해인지는 K1에서 잰다.
+- 증거: ai.tools `tmp/test-results/gufo-upstream-port-20261023/kvarn-k0-a01/`, `kvarn-k0-a02/`(jsonl, `K0.json`, bench 로그, rocpd DB).
+
+**판정(추천, 사용자 확인 전).** 정확도는 이 과제에서 모든 설정이 통과했고, 속도 상한은 깊은 문맥 decode에서 크다. 다음은 K1 진입 조건인 fused dequant decode attention 시제품(`tools/bench/`)과, 품질 기준을 가를 어려운 과제 하나다. 형식 후보는 k4v2(최대 압축, 4.88배)와 k4v4(KL 한 자릿수 작음, 3.74배)다.
+
 ### K0에서 정하지 않는 것
 
 - 커널·서빙·checkpoint 형식(K1·K2). 추가가 필요한 것만 적어 둔다: storage enum 값과 policy fingerprint 비트, K/V component `layout_version` 3(새 row_bytes와 128토큰 scale plane), compact snapshot 검증 완화, 블록 풀의 scale plane(`KvBlockPlane::rows_per_block` 128은 이미 표현 가능하나 arena·adapter가 같은 두 plane을 가정한다).
