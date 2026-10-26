@@ -600,6 +600,26 @@ QwenGpuMemoryUsage QwenGpuArena::EstimateMemoryUsage(
                 sizeof(float), &scratch);
 
   auto& state = usage.request_state_bytes;
+  if (policy.UsesKvarnAttentionKv()) {
+    // Quantized groups in whole blocks of the session's pool (a shared
+    // pool's are charged once for every session), the session's FP16 sink
+    // and tail rows, and the split partials of one launch.
+    const auto layers = config.FullAttentionLayerCount();
+    if (!shared_kv)
+      CheckedAdd(KvBlockGeometry(QwenKvBlockPlanes(
+                                     layers, config.num_key_value_heads,
+                                     config.head_dim, policy.kv_cache_storage),
+                                 KvBlockPool::BlocksFor(context))
+                     .bytes(),
+                 &state);
+    CheckedAdd(
+        KvarnFp16Bytes(layers, config.num_key_value_heads, config.head_dim),
+        &state);
+    AddAllocation(KvarnScratchElements(kKvarnMaxRows, kKvarnMaxSplits),
+                  sizeof(float), &scratch);
+    CheckedAdd(RecurrentStateBytes(config, policy), &state);
+    return usage;
+  }
   // FP16 rows come from the session's block pool in whole blocks; with a
   // shared pool they are the pool's, charged once for every session.
   const std::size_t kv_rows =
@@ -647,6 +667,7 @@ QwenGpuMemoryUsage QwenGpuArena::GetMemoryUsage() const {
 
 std::size_t QwenGpuArena::SnapshotPayloadBytes(
     std::uint32_t valid_context) const {
+  RequireSnapshotStorage();
   RequireOwnKvPool();
   if (valid_context > max_context_)
     throw std::length_error("Qwen snapshot exceeds the context length");
@@ -664,6 +685,7 @@ std::size_t QwenGpuArena::SnapshotPayloadBytes(
 
 std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
     std::uint32_t valid_context) {
+  RequireSnapshotStorage();
   RequireOwnKvPool();
   if (valid_context > max_context_) {
     throw std::length_error("Qwen snapshot exceeds the context length");
@@ -759,6 +781,7 @@ std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
 }
 
 void QwenGpuArena::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
+  RequireSnapshotStorage();
   RequireOwnKvPool();
   const std::uint32_t attention_layers = config_.FullAttentionLayerCount();
   const std::uint32_t kv_width = config_.num_key_value_heads * config_.head_dim;
@@ -824,6 +847,7 @@ void QwenGpuArena::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
 void QwenGpuArena::RestoreCompactSnapshot(
     std::span<const std::uint8_t> payload,
     std::uint32_t expected_valid_context) {
+  RequireSnapshotStorage();
   RequireOwnKvPool();
   const auto layout = ParseCompactSnapshotLayout(payload);
   const std::uint32_t attention_layers = config_.FullAttentionLayerCount();
@@ -942,6 +966,9 @@ QwenGpuArena::QwenGpuArena(
 
     if (policy_.UsesFp16AttentionKv()) {
       AllocateKvBlocks(std::move(kv_pool));
+    } else if (policy_.UsesKvarnAttentionKv()) {
+      AllocateKvBlocks(std::move(kv_pool));
+      AllocateKvarn();
     } else {
       if (kv_pool != nullptr)
         throw std::invalid_argument(
@@ -973,18 +1000,16 @@ QwenGpuArena::~QwenGpuArena() {
 }
 
 void QwenGpuArena::AllocateKvBlocks(std::shared_ptr<KvBlockPool> shared) {
-  const KvBlockPlane rows{
-      .layers = config_.FullAttentionLayerCount(),
-      .row_bytes = static_cast<std::size_t>(config_.num_key_value_heads) *
-                   config_.head_dim * sizeof(std::uint16_t)};
+  // FP16: K and V row planes; KVarN: the record plane.
+  const auto planes = QwenKvBlockPlanes(
+      config_.FullAttentionLayerCount(), config_.num_key_value_heads,
+      config_.head_dim, policy_.kv_cache_storage);
   const std::uint32_t blocks = KvBlockPool::BlocksFor(max_context_);
   HIP_CHECK(hipMalloc(&d_kv_block_table_, blocks * sizeof(std::uint32_t)));
   HIP_CHECK(hipHostMalloc(&h_kv_block_table_, blocks * sizeof(std::uint32_t),
                           hipHostMallocDefault));
   if (shared != nullptr) {
-    if (shared->geometry().planes().size() != 2 ||
-        shared->geometry().planes()[0] != rows ||
-        shared->geometry().planes()[1] != rows)
+    if (!std::ranges::equal(shared->geometry().planes(), planes))
       throw std::invalid_argument(
           "shared KV block pool rows do not match the Qwen attention layout");
     // Starts empty; EnsureKvRows maps blocks as passes write. Unmapped
@@ -994,7 +1019,7 @@ void QwenGpuArena::AllocateKvBlocks(std::shared_ptr<KvBlockPool> shared) {
     std::fill_n(h_kv_block_table_, blocks, 0U);
   } else {
     // K and V planes of the session's own pool.
-    kv_pool_ = std::make_shared<KvBlockPool>(std::vector{rows, rows}, blocks);
+    kv_pool_ = std::make_shared<KvBlockPool>(planes, blocks);
     kv_blocks_ = kv_pool_->Allocate(blocks);
     for (std::uint32_t i = 0; i < blocks; ++i)
       if (kv_blocks_[i] != i)
@@ -1002,9 +1027,76 @@ void QwenGpuArena::AllocateKvBlocks(std::shared_ptr<KvBlockPool> shared) {
             "a fresh Qwen KV pool gave nonconsecutive blocks");
     std::ranges::copy(kv_blocks_, h_kv_block_table_);
   }
-  d_attention_kv_f16 = kv_pool_->data();
+  // KVarN records are read through GetKvarnView only.
+  d_attention_kv_f16 =
+      policy_.UsesFp16AttentionKv() ? kv_pool_->data() : nullptr;
   HIP_CHECK(hipMemcpy(d_kv_block_table_, h_kv_block_table_,
                       blocks * sizeof(std::uint32_t), hipMemcpyHostToDevice));
+}
+
+void QwenGpuArena::AllocateKvarn() {
+  const auto layers = config_.FullAttentionLayerCount();
+  if (config_.num_key_value_heads != kKvarnKvHeads ||
+      config_.head_dim != kKvarnHeadDim ||
+      config_.num_attention_heads != kKvarnQueryHeads)
+    throw std::invalid_argument(
+        "KVarN attention KV needs 24 query heads over 4 KV heads of 256");
+  kvarn_.value_bits = KvarnValueBits(policy_.kv_cache_storage);
+  kvarn_.plane_elements = static_cast<std::size_t>(layers) * kKvarnFp16Tokens *
+                          config_.num_key_value_heads * config_.head_dim;
+  const auto bytes =
+      KvarnFp16Bytes(layers, config_.num_key_value_heads, config_.head_dim);
+  HIP_CHECK(hipMalloc(&kvarn_.d_rows, bytes));
+  // Masked rows of a short sink are multiplied by zero: keep them finite.
+  HIP_CHECK(hipMemset(kvarn_.d_rows, 0, bytes));
+  kvarn_.scratch_elements =
+      KvarnScratchElements(kKvarnMaxRows, kKvarnMaxSplits);
+  HIP_CHECK(
+      hipMalloc(&kvarn_.d_scratch, kvarn_.scratch_elements * sizeof(float)));
+  kvarn_.tail = {};
+}
+
+KvarnKvView QwenGpuArena::GetKvarnView() const noexcept {
+  if (!UsesKvarn())
+    return {};
+  return {.value_bits = kvarn_.value_bits,
+          .records = reinterpret_cast<std::uint8_t*>(kv_pool_->plane_data(0)),
+          .records_layer_pitch = kv_pool_->geometry().layer_pitch(0),
+          .blocks = d_kv_block_table_,
+          .k_rows = kvarn_.d_rows,
+          .v_rows = kvarn_.d_rows + kvarn_.plane_elements};
+}
+
+std::uint32_t QwenGpuArena::PrepareKvarnPass(std::uint32_t start,
+                                             std::uint32_t rows,
+                                             hipStream_t pass_stream) {
+  if (!UsesKvarn())
+    throw std::logic_error("Qwen arena does not store KVarN attention KV");
+  if (start > max_context_ || rows > max_context_ - start)
+    throw std::length_error("KVarN pass exceeds the context length");
+  // Rows before a pinned rollback point are confirmed; drafts past it may
+  // still be rewound (RestoreState) and stay FP16 while the ring holds them.
+  const std::uint32_t confirmed =
+      has_saved_state_ ? std::min(start, saved_context_) : start;
+  const auto plan = PlanKvarnPass(kvarn_.tail, start, rows, confirmed);
+  if (!plan.error.empty())
+    throw std::logic_error(std::string(plan.error) + " (rows " +
+                           std::to_string(start) + "-" +
+                           std::to_string(start + rows) + ")");
+  EnsureKvRows(start + rows);
+  LaunchKvarnFlush(GetKvarnView(), config_.FullAttentionLayerCount(),
+                   plan.first_group, plan.groups, pass_stream);
+  kvarn_.tail.flushed_end = plan.flushed_end;
+  kvarn_.tail.written_end = std::max(kvarn_.tail.written_end, start + rows);
+  return (plan.flushed_end >> kKvarnGroupShift) - 1;
+}
+
+void QwenGpuArena::RequireSnapshotStorage() const {
+  if (UsesKvarn())
+    throw std::logic_error(
+        "Qwen snapshots of --kv-cache-type " +
+        std::string(QwenKvCacheStorageName(policy_.kv_cache_storage)) +
+        " are not implemented yet");
 }
 
 void QwenGpuArena::RequireOwnKvPool() const {
@@ -1336,6 +1428,7 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   d_kv_block_table_ = std::exchange(other.d_kv_block_table_, nullptr);
   h_kv_block_table_ = std::exchange(other.h_kv_block_table_, nullptr);
   kv_reservation_ = std::move(other.kv_reservation_);
+  kvarn_ = std::exchange(other.kvarn_, {});
   d_ssm_conv_state = other.d_ssm_conv_state;
   d_ssm_deltanet_state = other.d_ssm_deltanet_state;
   d_prompt_tokens = other.d_prompt_tokens;
@@ -1448,6 +1541,7 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     d_kv_block_table_ = std::exchange(other.d_kv_block_table_, nullptr);
     h_kv_block_table_ = std::exchange(other.h_kv_block_table_, nullptr);
     kv_reservation_ = std::move(other.kv_reservation_);
+    kvarn_ = std::exchange(other.kvarn_, {});
     d_ssm_conv_state = other.d_ssm_conv_state;
     d_ssm_deltanet_state = other.d_ssm_deltanet_state;
     d_prompt_tokens = other.d_prompt_tokens;
@@ -1562,6 +1656,8 @@ void QwenGpuArena::Reset() {
   replay_last_position_ = 0;
   replay_captured_positions_ = 0;
   has_saved_state_ = false;
+  // Every quantized group and FP16 row is stale; the next pass starts over.
+  kvarn_.tail = {};
 }
 
 void QwenGpuArena::FreeAll() noexcept {
@@ -1602,6 +1698,11 @@ void QwenGpuArena::FreeAll() noexcept {
   }
   if (d_kv_cache != nullptr)
     LogCleanupError(hipFree(d_kv_cache));
+  if (kvarn_.d_rows != nullptr)
+    LogCleanupError(hipFree(kvarn_.d_rows));
+  if (kvarn_.d_scratch != nullptr)
+    LogCleanupError(hipFree(kvarn_.d_scratch));
+  kvarn_ = {};
   for (float* buffer : d_ssm_conv_buffers_)
     if (buffer != nullptr)
       LogCleanupError(hipFree(buffer));

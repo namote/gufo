@@ -68,6 +68,11 @@ struct QwenExecutionPolicy {
     return recurrent_state_storage == QwenRecurrentStateStorage::kBf16;
   }
 
+  [[nodiscard]] constexpr bool UsesKvarnAttentionKv() const noexcept {
+    return kv_cache_storage == QwenKvCacheStorage::kKvarnK4V2 ||
+           kv_cache_storage == QwenKvCacheStorage::kKvarnK4V4;
+  }
+
   /// KVarN variant: 0 for FP16/FP32 rows, 1 for K4V2, 2 for K4V4.
   [[nodiscard]] constexpr std::uint64_t KvarnVariant() const noexcept {
     return kv_cache_storage == QwenKvCacheStorage::kKvarnK4V2   ? 1U

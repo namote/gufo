@@ -31,6 +31,7 @@
 #include "src/core/hip/kv_block_pool.hpp"
 #include "src/models/qwen/hip/execution_policy.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
+#include "src/models/qwen/hip/ops/kvarn.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
 #include "src/models/qwen/hip/prompt_hidden_buffer.hpp"
@@ -57,6 +58,15 @@ struct QwenGpuVerificationItem {
   std::span<const tokenization::TokenId> tokens;
   std::uint32_t position{0};
   bool capture_logits{false};
+};
+
+/// Opens KVarN storage before its prefill exists (K1c-2) to tests and
+/// tools: such an executor runs decode, verification and batched decode;
+/// prompt prefill, snapshots and continuation refuse by name. Release
+/// entry points use QwenExecutionPolicyUnsupportedReason, which still
+/// refuses KVarN.
+struct QwenKvarnDecodeOnlyAccess {
+  explicit QwenKvarnDecodeOnlyAccess() = default;
 };
 
 struct QwenSampledVerificationResult {
@@ -501,6 +511,23 @@ public:
     return kv_pool_ != nullptr ? KvLayerTokens() : max_context_;
   }
   [[nodiscard]] std::uint8_t* KvPlaneBase(std::uint32_t plane) const;
+  /// KVarN storage: quantized groups in the pool's record plane, the sink
+  /// and the unquantized tail as FP16 rows of this arena (kvarn_layout.hpp).
+  [[nodiscard]] bool UsesKvarn() const noexcept {
+    return kvarn_.value_bits != 0;
+  }
+  [[nodiscard]] KvarnKvView GetKvarnView() const noexcept;
+  /// Split partials of one KVarN attention launch of up to kKvarnMaxRows.
+  [[nodiscard]] std::span<float> GetKvarnScratch() const noexcept {
+    return {kvarn_.d_scratch, kvarn_.scratch_elements};
+  }
+  /// Before a pass writes rows [start, start + rows): quantizes, on
+  /// `pass_stream`, the complete groups before the pass that the tail plan
+  /// names (only rows before a pinned SaveState point unless the ring would
+  /// overflow), and returns the quantized group count the pass's attention
+  /// reads. Throws std::logic_error for a pass the tail cannot hold.
+  std::uint32_t PrepareKvarnPass(std::uint32_t start, std::uint32_t rows,
+                                 hipStream_t pass_stream);
   [[nodiscard]] QwenRecurrentStateStorage GetRecurrentStateStorage()
       const noexcept {
     return policy_.recurrent_state_storage;
@@ -539,7 +566,10 @@ private:
   friend class models::qwen::ContinuationAdapter;
   friend class QwenGpuExecutor;
   void AllocateKvBlocks(std::shared_ptr<KvBlockPool> shared);
+  void AllocateKvarn();
   void RequireOwnKvPool() const;
+  // KVarN rows have no snapshot format until K2.
+  void RequireSnapshotStorage() const;
   /// Token rows of one layer of the FP16 pool planes.
   [[nodiscard]] std::uint32_t KvLayerTokens() const noexcept {
     return kv_pool_->blocks() * kKvBlockTokens;
@@ -562,6 +592,16 @@ private:
   // unmapped ones; leaves that tail unordered for the caller to drop.
   void ReleaseMappedKvBlocks(std::size_t first) noexcept;
   std::uint32_t* d_kv_block_table_{nullptr};
+  struct KvarnStorage {
+    int value_bits{0};
+    // K then V: [layer][kKvarnFp16Tokens][kv head][head_dim] FP16.
+    std::uint16_t* d_rows{nullptr};
+    std::size_t plane_elements{0};
+    float* d_scratch{nullptr};
+    std::size_t scratch_elements{0};
+    KvarnTail tail;
+  };
+  KvarnStorage kvarn_;
   // Pinned copy of the device table, the source of its async uploads.
   std::uint32_t* h_kv_block_table_{nullptr};
   KvBlockReservation kv_reservation_;
@@ -601,6 +641,9 @@ public:
       QwenExecutionPolicy policy = QwenExecutionPolicy::Production(),
       std::shared_ptr<QwenSharedPassScratch> pass_scratch = nullptr,
       std::shared_ptr<KvBlockPool> kv_pool = nullptr);
+  QwenGpuExecutor(std::shared_ptr<const QwenGpuModel> model,
+                  std::uint32_t max_context, QwenExecutionPolicy policy,
+                  QwenKvarnDecodeOnlyAccess access);
   ~QwenGpuExecutor();
 
   [[nodiscard]] static std::unique_ptr<QwenGpuExecutor> Create(
@@ -786,6 +829,10 @@ public:
   void FinishVerification();
 
 private:
+  QwenGpuExecutor(std::shared_ptr<const QwenGpuModel> model,
+                  std::uint32_t max_context, QwenExecutionPolicy policy,
+                  std::shared_ptr<QwenSharedPassScratch> pass_scratch,
+                  std::shared_ptr<KvBlockPool> kv_pool, bool kvarn_decode_only);
   friend class models::qwen::ContinuationAdapter;
   models::qwen::ContinuationHooks* continuation_hooks_{nullptr};
   void CheckPrefillCancellation() const;

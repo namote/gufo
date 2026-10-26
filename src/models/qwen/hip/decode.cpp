@@ -35,6 +35,10 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
     arena_.DisableSsmReplayCapture();
   }
 
+  // KVarN quantizes the groups completed before this row first; the
+  // captured graph (rows below the first group's end) never quantizes.
+  const std::uint32_t kvarn_groups =
+      arena_.UsesKvarn() ? arena_.PrepareKvarnPass(pos, 1, arena_.stream) : 0;
   arena_.MarkSsmReplayPosition(pos);
   // One recurrent pass per step. Its buffer pair is part of the graph key below
   // because the captured launches bake the state pointers.
@@ -92,18 +96,20 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
       const bool ok =
           graph_executor_.TryCapture(arena_.stream, graph_key, [&]() {
             ExecuteDecodeStep(arena_, weights_, policy_, token_id, pos,
-                              compute_logits, recurrent_state, &vision_input_);
+                              compute_logits, recurrent_state, &vision_input_,
+                              kvarn_groups);
           });
       if (ok) {
         launch_captured_graph();
       } else {
         ExecuteDecodeStep(arena_, weights_, policy_, token_id, pos,
-                          compute_logits, recurrent_state, &vision_input_);
+                          compute_logits, recurrent_state, &vision_input_,
+                          kvarn_groups);
       }
     }
   } else {
     ExecuteDecodeStep(arena_, weights_, policy_, token_id, pos, compute_logits,
-                      recurrent_state, &vision_input_);
+                      recurrent_state, &vision_input_, kvarn_groups);
   }
 
   if (!compute_logits) {

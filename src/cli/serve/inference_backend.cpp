@@ -1550,19 +1550,20 @@ private:
   // otherwise hold. An explicit size is used as given.
   [[nodiscard]] std::shared_ptr<hip::KvBlockPool> MakeKvPool(
       std::size_t sessions, std::size_t bytes) const {
-    if (!execution_policy_.UsesFp16AttentionKv()) {
+    if (!execution_policy_.UsesFp16AttentionKv() &&
+        !execution_policy_.UsesKvarnAttentionKv()) {
       if (bytes != 0)
         throw std::invalid_argument(
             "--kv-pool-bytes needs FP16 attention KV; this policy keeps FP32");
       return nullptr;
     }
     const auto& config = model_->GetConfig();
-    const hip::KvBlockPlane rows{
-        .layers = config.FullAttentionLayerCount(),
-        .row_bytes = static_cast<std::size_t>(config.num_key_value_heads) *
-                     config.head_dim * sizeof(std::uint16_t)};
+    // FP16 K and V rows, or the KVarN record plane: the arena's planes.
+    const auto planes = hip::QwenKvBlockPlanes(
+        config.FullAttentionLayerCount(), config.num_key_value_heads,
+        config.head_dim, execution_policy_.kv_cache_storage);
     const std::size_t block_bytes =
-        hip::KvBlockGeometry({rows, rows}, 1).bytes_per_block();
+        hip::KvBlockGeometry(planes, 1).bytes_per_block();
     const std::size_t session_blocks =
         hip::KvBlockGeometry::BlocksFor(max_context_);
     const std::size_t blocks =
@@ -1578,7 +1579,7 @@ private:
           std::to_string(session_blocks) + " (" +
           std::to_string(session_blocks * block_bytes) + " bytes)");
     auto pool = std::make_shared<hip::KvBlockPool>(
-        std::vector{rows, rows}, static_cast<std::uint32_t>(blocks));
+        planes, static_cast<std::uint32_t>(blocks));
     Logger::Info("loader",
                  "event=kv_pool blocks=" + std::to_string(blocks) +
                      " block_tokens=" + std::to_string(hip::kKvBlockTokens) +

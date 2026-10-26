@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <chrono>
 #include <stdexcept>
+#include <string>
 #include <thread>
 
 #include "src/core/hip/hip_utils.hpp"
@@ -45,6 +46,11 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
   if (prompt_tokens.empty()) {
     return 0;
   }
+  if (arena_.UsesKvarn())
+    throw std::logic_error(
+        "Qwen prompt prefill of --kv-cache-type " +
+        std::string(QwenKvCacheStorageName(policy_.kv_cache_storage)) +
+        " is not implemented yet; feed the prompt with ForwardToken");
   const PassScratchLease pass_scratch(*this);
   replaying_ssm_state_ = false;
   arena_.DisableSsmReplayCapture();

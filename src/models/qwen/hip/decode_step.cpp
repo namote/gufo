@@ -33,7 +33,8 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
                        tokenization::TokenId token_id, std::uint32_t pos,
                        bool compute_logits,
                        QwenRecurrentStateIo recurrent_state,
-                       models::qwen::vision::DeviceInput* image_input) {
+                       models::qwen::vision::DeviceInput* image_input,
+                       std::uint32_t kvarn_groups) {
   const auto* rope = image_input != nullptr ? image_input->rope() : nullptr;
   (void)token_id;
   const auto& config = weights.config;
@@ -149,7 +150,19 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
       }
 
       // Softmax Attention + Gating
-      if (use_split_k_decode) {
+      if (arena.UsesKvarn()) {
+        // KVarN: the norm/RoPE step wrote no cache; rotate the rows into the
+        // FP16 tail and attend over sink, quantized groups and tail. The
+        // position comes from the device, so graph capture stays valid.
+        const auto kv = arena.GetKvarnView();
+        LaunchKvarnWriteRows(attention_scratch.k.data(),
+                             attention_scratch.v.data(), kv, attn_layer_idx,
+                             d_in_pos, 0, 1, arena.stream);
+        LaunchKvarnDecodeAttention(
+            attention_scratch.q.data(), ssm_scratch.gate.data(), kv,
+            ssm_scratch.out.data(), attn_layer_idx, d_in_pos, 0, 1,
+            kvarn_groups, 0, arena.GetKvarnScratch(), arena.stream);
+      } else if (use_split_k_decode) {
         LaunchAttention(
             attention_scratch.q.data(), attention_scratch.k.data(),
             attention_scratch.v.data(), ssm_scratch.gate.data(),

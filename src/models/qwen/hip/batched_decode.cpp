@@ -221,6 +221,12 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
     executor.arena_.MarkSsmReplayPosition(item.position);
     executor.last_hidden_offset_ = 0;
   }
+  // KVarN sessions quantize their completed groups on the pass stream.
+  std::array<std::uint32_t, kMaxDecodeBatch> kvarn_groups{};
+  for (std::size_t i = 0; i < items.size(); ++i)
+    if (auto& state = items[i].executor->arena_; state.UsesKvarn())
+      kvarn_groups[i] = state.PrepareKvarnPass(items[i].position, 1,
+                                               coordinator->arena_.stream);
 
   const std::size_t batch_size = items.size();
   const auto& weights = coordinator->weights_;
@@ -326,6 +332,16 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
                    config.num_key_value_heads, config.head_dim,
                    config.rotary_dim, position, config.rope_theta, arena.stream,
                    items[row].executor->vision_input_.rope());
+        if (state_arena.UsesKvarn()) {
+          const auto kv = state_arena.GetKvarnView();
+          LaunchKvarnWriteRows(key, value, kv, attention_layer, nullptr,
+                               position, 1, arena.stream);
+          LaunchKvarnDecodeAttention(query, gate, kv, context, attention_layer,
+                                     nullptr, position, 1, kvarn_groups[row], 0,
+                                     state_arena.GetKvarnScratch(),
+                                     arena.stream);
+          continue;
+        }
         const bool use_split_k = detail::IsSplitKDecodeAttentionSupported(
             static_cast<std::size_t>(position) + 1, config.num_attention_heads,
             config.num_key_value_heads, config.head_dim);
@@ -525,6 +541,13 @@ QwenGpuExecutor::ForwardVerificationBatch(
     executor.h_verification_hidden_.clear();
     executor.h_verification_logits_.clear();
   }
+  // KVarN sessions quantize their completed groups on the pass stream.
+  std::array<std::uint32_t, kMaxDecodeBatch> kvarn_groups{};
+  for (std::size_t i = 0; i < items.size(); ++i)
+    if (auto& state = items[i].executor->arena_; state.UsesKvarn())
+      kvarn_groups[i] = state.PrepareKvarnPass(
+          items[i].position, static_cast<std::uint32_t>(items[i].tokens.size()),
+          arena_.stream);
   const auto scratch = arena_.GetScratchView(batch_size);
   const std::size_t hidden_size = config.hidden_size;
   const std::size_t intermediate_size = config.intermediate_size;
@@ -675,6 +698,22 @@ QwenGpuExecutor::ForwardVerificationBatch(
               config.num_attention_heads, config.num_key_value_heads,
               config.head_dim, config.rotary_dim, config.rope_theta, 1e-6F,
               arena_.stream, item.executor->vision_input_.rope());
+          if (state_arena.UsesKvarn()) {
+            const auto kv = state_arena.GetKvarnView();
+            LaunchKvarnWriteRows(scratch.attention.k.data() + offset * kv_size,
+                                 scratch.attention.v.data() + offset * kv_size,
+                                 kv, attention_layer, nullptr, start_pos,
+                                 static_cast<std::uint32_t>(sequence_size),
+                                 arena_.stream);
+            LaunchKvarnDecodeAttention(
+                scratch.attention.q.data() + offset * attention_size,
+                scratch.ssm.gate.data() + offset * attention_size, kv,
+                scratch.ssm.out.data() + offset * attention_size,
+                attention_layer, nullptr, start_pos,
+                static_cast<std::uint32_t>(sequence_size), kvarn_groups[index],
+                0, state_arena.GetKvarnScratch(), arena_.stream);
+            continue;
+          }
           // Exact verification projections do not use weight dequantization
           // scratch. Reuse it for independent split-K rows without allocating
           // another buffer or changing the scalar decode workspace.
@@ -712,6 +751,8 @@ QwenGpuExecutor::ForwardVerificationBatch(
                        config.num_key_value_heads, config.head_dim,
                        config.rotary_dim, position, config.rope_theta,
                        arena_.stream, item.executor->vision_input_.rope());
+            if (state_arena.UsesKvarn())
+              continue;
             LaunchAttention(
                 query, key,
                 (scratch.attention.v.data() + offset * kv_size) + row * kv_size,
@@ -730,6 +771,22 @@ QwenGpuExecutor::ForwardVerificationBatch(
                 config.num_attention_heads, config.num_key_value_heads,
                 config.head_dim, arena_.stream,
                 state_arena.d_split_k_attention);
+          }
+          if (state_arena.UsesKvarn()) {
+            // Every row's K and V before the causal attention of all rows.
+            const auto kv = state_arena.GetKvarnView();
+            LaunchKvarnWriteRows(scratch.attention.k.data() + offset * kv_size,
+                                 scratch.attention.v.data() + offset * kv_size,
+                                 kv, attention_layer, nullptr, start_pos,
+                                 static_cast<std::uint32_t>(sequence_size),
+                                 arena_.stream);
+            LaunchKvarnDecodeAttention(
+                scratch.attention.q.data() + offset * attention_size,
+                scratch.ssm.gate.data() + offset * attention_size, kv,
+                scratch.ssm.out.data() + offset * attention_size,
+                attention_layer, nullptr, start_pos,
+                static_cast<std::uint32_t>(sequence_size), kvarn_groups[index],
+                0, state_arena.GetKvarnScratch(), arena_.stream);
           }
         }
       }

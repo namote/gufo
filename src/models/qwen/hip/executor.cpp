@@ -22,7 +22,17 @@ const QwenGpuModel& RequireModel(
 }
 
 // Refuses storage formats no kernel reads yet, before any device allocation.
-QwenExecutionPolicy RequireSupportedPolicy(QwenExecutionPolicy policy) {
+// QwenKvarnDecodeOnlyAccess opens KVarN, whose prefill does not exist yet.
+QwenExecutionPolicy RequireSupportedPolicy(QwenExecutionPolicy policy,
+                                           bool kvarn_decode_only = false) {
+  if (kvarn_decode_only && policy.UsesKvarnAttentionKv()) {
+    auto rows = policy;
+    rows.kv_cache_storage = QwenKvCacheStorage::kFp16;
+    if (const auto unsupported = QwenExecutionPolicyUnsupportedReason(rows);
+        !unsupported.empty())
+      throw std::invalid_argument(std::string(unsupported));
+    return policy;
+  }
   if (const auto unsupported = QwenExecutionPolicyUnsupportedReason(policy);
       !unsupported.empty())
     throw std::invalid_argument(std::string(unsupported));
@@ -69,10 +79,25 @@ QwenGpuExecutor::QwenGpuExecutor(
     QwenExecutionPolicy policy,
     std::shared_ptr<QwenSharedPassScratch> pass_scratch,
     std::shared_ptr<KvBlockPool> kv_pool)
+    : QwenGpuExecutor(std::move(model), max_context, policy,
+                      std::move(pass_scratch), std::move(kv_pool), false) {}
+
+QwenGpuExecutor::QwenGpuExecutor(std::shared_ptr<const QwenGpuModel> model,
+                                 std::uint32_t max_context,
+                                 QwenExecutionPolicy policy,
+                                 QwenKvarnDecodeOnlyAccess /*access*/)
+    : QwenGpuExecutor(std::move(model), max_context, policy, nullptr, nullptr,
+                      true) {}
+
+QwenGpuExecutor::QwenGpuExecutor(
+    std::shared_ptr<const QwenGpuModel> model, std::uint32_t max_context,
+    QwenExecutionPolicy policy,
+    std::shared_ptr<QwenSharedPassScratch> pass_scratch,
+    std::shared_ptr<KvBlockPool> kv_pool, bool kvarn_decode_only)
     : model_(std::move(model)),
       weights_(RequireModel(model_).GetWeights()),
       tokenizer_(&model_->GetTokenizer()),
-      policy_(RequireSupportedPolicy(policy)),
+      policy_(RequireSupportedPolicy(policy, kvarn_decode_only)),
       arena_(weights_.config, max_context, policy_, std::move(pass_scratch),
              std::move(kv_pool)),
       graph_key_(BuildGraphCaptureKey(weights_, policy_, max_context)),
