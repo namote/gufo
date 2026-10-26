@@ -55,6 +55,81 @@
 - 자동 fallback은 없다. KVarN 경로가 실패하면 FP16으로 바꿔 다시 돌리지 않고 실패를 기록한다. FP16과의 비교는 별도 창이다.
 - 출처 표기: Apache-2.0이므로 알고리즘·코드를 참고하면 NOTICE와 출처를 남긴다.
 
+## K0 설계 (2026-10-26)
+
+사용자 지시(2026-10-26): "KVarN 적용". 위 "순서와 전제"는 운영 전환 결정 뒤 시작을 적었으나, 이 지시로 KVarN을 앞당겨 K0부터 시작한다. K0은 설계까지만 했다. GPU 창은 실행 전에 사용자 확인을 받는다.
+
+### 참고 구현 기준 (저장소 코드, 논문과 다른 점)
+
+`huawei-csl/KVarN` `main`과 논문 v1을 읽었다(실행·clone 없음). 논문과 코드가 다른 곳은 **코드를 기준**으로 한다.
+
+|항목|논문|코드(기준)|
+|---|---|---|
+|scale 형식|FP8/8비트, 2/2비트|fp16 scale, k4v2|
+|정규화 clamp|분산 clamp, 0.5·log(var)|std를 [1e-3, 1e3]로 clamp, log(std), 누적 log scale은 [−0.3, 10]|
+|V Hadamard|W_V/W_O에 흡수(QuaRot식)|저장 때 V를 회전, attention 출력을 되돌림|
+|반복 횟수|곳에 따라 16|8(`KVARN_SINKHORN_ITERS`), 불균형이 가장 작은 반복의 scale 채택|
+
+- 회전: 정규화한 Sylvester Hadamard(1/√D, 무작위 부호 없음)를 head_dim 방향으로 모든 토큰(sink·tail 포함)에 곱한다. q도 같은 H로 회전하고 출력에 H를 다시 곱한다(H⁻¹ = H).
+- tile: (128토큰 블록, KV head)마다 K는 `[D, G]`(행 = 채널), V는 `[G, D]`(행 = 토큰). 정규화 뒤 행마다 비대칭 RTN이다(scale = max(범위/qmax, 1e-10), zero = 행 최솟값). 그래서 K는 128토큰에 걸친 채널별, V는 토큰별 scale이다. 다른 축 scale은 dequant에서 곱한다.
+- sink: 요청의 첫 블록(128토큰)은 끝까지 FP16. tail: 채워지지 않은 블록은 FP16이고, 블록이 차고 모든 토큰이 확정(투기 디코딩 수락)되면 양자화한다.
+- preset: `kvarn_k4v2_g128`, `kvarn_k4v4_g128`, `kvarn_k4v2_g64`, `kvarn_k4v4_g64`. 저장소에 KL·top-1 평가 도구는 없다(prefix cache·MTP on/off 답 동일 검사뿐). 논문의 평가는 pseudo-decode(prefill cache 양자화 뒤 이어서 생성), line retrieval, NIAH다.
+- ROCm 언급은 없다. head_dim은 128·256·512를 지원한다.
+- 조사 사본: `/tmp/claude-1000/-home-m2on-projects-gufo/635eb9f0-9c85-40e5-b405-740790b62b96/scratchpad/kvarn/`(임시).
+
+### Qwen 27B에 맞춘 값
+
+- full-attention 층 16개(64층 중 `(layer+1)%4==0`), Q head 24, KV head 4, head_dim 256(GQA 6:1). KV는 RoPE 뒤 FP16, 토큰당 64 KiB(`src/models/qwen/hip/arena.cpp:976`, `continuation_layout.cpp:64`).
+- head_dim 256이라 H는 256×256이고, tile은 K `[256, 128]`, V `[128, 256]`이다.
+- k4v2_g128 tile(128토큰·KV head 하나) 크기: K 16,384 + scale 1,280, V 8,192 + scale 1,024 = 26,880 B. FP16 131,072 B 대비 **4.88배**(K 4.31비트, V 2.25비트/원소). 토큰당 64 → 13.1 KiB, 256K 세션 KV 16 → 3.3 GiB, 256K 디스크 checkpoint 약 17 → 3.5 GB(계산, 측정 아님).
+- DFlash2와 MTP는 target KV를 읽지 않는다(자체 ring·KV). 그래서 K0·K1 대상은 target attention뿐이다.
+- 지금 Qwen KV dtype은 FP16/FP32뿐이고, KV·Q·logits 덤프 기능은 없다. 저장소의 양자화 KV 선례는 DeepSeek V4 FP8 KV(`src/models/deepseek_v4_flash/kernels/rocm/detail/ds4_rocm_fp8_kv*.hpp`)뿐이다.
+
+### K0 방법: 엔진 안 fake quant + teacher forcing
+
+H가 직교이므로 원래 좌표의 `K' = dequant(quant(K·H))·H`로 바꿔 넣으면 attention 점수와 출력이 회전 좌표 계산과 같다. 그래서 K0은 attention 커널을 바꾸지 않는다.
+
+1. 시험 도구(`tests/models/qwen27b/`, GPU 테스트 바이너리)가 prompt를 FP16으로 prefill한 뒤 16층 K/V plane을 파일로 내보낸다. FP16 greedy로 N=256토큰을 생성해 토큰과 logits를 기준으로 남긴다.
+2. Python 참고 구현(`tools/qwen27b/kvarn/`, NumPy, 출처·Apache-2.0 표기)이 prefill KV에 설정별 fake quant를 적용한다. sink 첫 128토큰과 마지막 미완성 블록은 FP16 그대로 둔다.
+3. 도구가 바꾼 KV를 다시 넣고 같은 N토큰을 teacher forcing으로 디코드한다(새 토큰 KV는 tail FP16, 128을 넘기지 않음). 걸음마다 logits를 기록한다. 이어서 free greedy로 같은 길이를 생성해 텍스트와 gold 답을 본다.
+4. 지표: 걸음별 KL(FP16‖양자화), top-1 일치율, 같은 위치 top-1 확률 차, free greedy 첫 분기 위치와 gold 정답. 요청이나 걸음을 평균으로 덮지 않고 분포(중앙값·p95·최대)로 기록한다. 추가로 층·head별 K/V 재구성 상대 오차를 Python에서 잰다.
+
+비교 설정(같은 KV 입력):
+
+|설정|목적|
+|---|---|
+|FP16 재주입(변화 없음)|도구 왕복 검사. KL 0, 텍스트 동일이어야 한다|
+|KIVI식 RTN(회전·정규화 없음) k4v2_g128|단순 양자화 기준|
+|Hadamard + RTN k4v2_g128|정규화 효과 분리|
+|KVarN k4v2_g128, k4v4_g128, k8v4_g128|형식 선택(K-D2)|
+|KVarN k4v2_g64|그룹 크기|
+
+prompt: 32K 대화 gold 1개, 256K 문서 gold 1개(F와 같은 입력). 256K 덤프는 16 GiB라 파일 하나로 두고 층 단위로 처리한다.
+
+예상 GPU 시간(추정): 256K prefill 약 15분 1회 + 설정 7개 × (재주입 + 256걸음 teacher forcing + free greedy), 32K는 그보다 훨씬 작다. 합쳐 1시간 안을 목표로 한 창에서 끝낸다. 디스크 임시 사용 약 40 GB.
+
+### 속도 (2026-10-26 사용자: "속도도 고려해줘")
+
+fake quant는 FP16 커널을 그대로 쓰므로 속도를 재지 못한다. 그래서 속도는 두 단계로 본다.
+
+1. **K0 상한 측정(이번 창):** 이미지의 release `gufo bench`로 AR과 DFlash2 decode를 깊이 0·32K·64K에서 재고, 같은 실행을 rocprofv3 kernel trace로 다시 돌려 decode 시간을 attention과 나머지로 나눈다. 깊이에 따른 attention 증가분이 KV 읽기 비용이다. 계산(측정 아님): 토큰 하나가 KV를 깊이 × 64 KiB 읽으므로 32K는 2 GiB, 256K는 16 GiB를 읽는다. KVarN이면 4.88배 줄어든다. 그래서 이득은 깊은 문맥 decode에 몰리고, 얕은 문맥에서는 거의 없다. DFlash2 verify는 한 번 읽어 여러 토큰을 검증하므로 AR보다 이득이 작을 수 있다. 256K는 32K·64K 기울기로 외삽하고 외삽이라고 적는다.
+2. **K1 진입 조건(정확도 통과 뒤):** `tools/bench/`에 fused dequant decode attention(head_dim 256, KV head 4, GQA 6, k4v2·g128, split-K) 시제품을 만들고, 같은 모양의 지금 FP16 split-K 커널과 깊이 32K–256K에서 비교한다. 측정한 대역폭과 `tools/bench/gfx1151_peak.hip` 상한을 함께 적는다. 양자화(그룹이 찰 때 128토큰 × 32 tile 정규화 8회)의 decode 1토큰당 분할 비용과 prefill 증가분도 잰다. 커널 속도 이득이 없으면 정확도가 좋아도 K1로 가지 않는다.
+
+### 구현 (2026-10-26, gufo 작업 트리, 커밋 전)
+
+- `tests/models/qwen27b/kvarn_fake_quant.hpp`: C++ fake quant(위 코드 기준).
+- `tests/models/qwen27b/kvarn_k0.cpp` → `qwen27b_kvarn_k0`(GPU, CTest 없음): 위 K0 방법 1–4. `--prefill-chunk N`이면 N토큰씩 prefill하면서 다 찬 그룹을 다음 chunk 전에 양자화한다. 실제 KVarN은 첫 prefill chunk 뒤 chunk들도 양자화된 앞 블록을 읽으므로, pseudo-decode보다 이것이 실제에 가깝다(chunk 크기만큼은 FP16으로 서로 본다). 32K에서만 돈다.
+- `tools/qwen27b/kvarn.py`: 독립 NumPy 참고 구현과 `check`(CTest `qwen27b.kvarn-reference`, CPU), `summarize`.
+- 교차 검사 50경우 PASS: rtn·hrtn은 FP16 비트 단위로 같고, kvarn은 정규화의 float 누적 순서 차이로 FP16 scale이 1 ulp 갈린 tile만 다르다(구현 차이 ≤ 양자화 오차의 2 %).
+- 근사(실제 KVarN과 다른 점): 원래 좌표로 되돌려 FP16에 다시 쓰는 반올림 1회가 더 있고, sink·tail 행은 회전 좌표의 FP16 반올림을 거치지 않는다.
+- CPU 양자화 시간: 32K 토큰 component 하나 0.3 s(32스레드). 256K 설정 하나에 약 1–2분.
+- 창 계획: ai.tools `test/experiments/gufo_upstream_port_20261023/PLAN-K0.json`(`k0-32k`: 설정 7개 + chunk 4096 설정 3개 + bench·profile, `k0-256k`: 설정 5개), 입력·채점 `kvarn_k0.py`, fixture `kvarn-user-{32k,256k}.txt`·`kvarn-gold.json`.
+
+### K0에서 정하지 않는 것
+
+- 커널·서빙·checkpoint 형식(K1·K2). 추가가 필요한 것만 적어 둔다: storage enum 값과 policy fingerprint 비트, K/V component `layout_version` 3(새 row_bytes와 128토큰 scale plane), compact snapshot 검증 완화, 블록 풀의 scale plane(`KvBlockPlane::rows_per_block` 128은 이미 표현 가능하나 arena·adapter가 같은 두 plane을 가정한다).
+- 품질 기준(K-D3)은 K0 오차표를 본 뒤 정한다.
+
 ## 정할 것
 
 |번호|내용|추천|
