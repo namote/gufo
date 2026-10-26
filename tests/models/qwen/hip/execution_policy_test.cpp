@@ -37,14 +37,17 @@ int main() {
     assert(!kvarn.UsesFp16AttentionKv());
     assert(kvarn.Fingerprint() != production.Fingerprint());
     assert(kvarn.Fingerprint() != fp32_kv.Fingerprint());
-    // Checkpoints from different KV formats must never share an identity.
-    const auto reason = QwenExecutionPolicyUnsupportedReason(kvarn);
+    // Executors run KVarN; continuations and checkpoints refuse it by name.
+    assert(QwenExecutionPolicyUnsupportedReason(kvarn).empty());
+    const auto reason = QwenContinuationUnsupportedReason(kvarn);
     assert(reason.find("not implemented yet") != std::string_view::npos);
     assert(reason.find(QwenKvCacheStorageName(kvarn.kv_cache_storage)) !=
            std::string_view::npos);
   }
   assert(k4v2.Fingerprint() != k4v4.Fingerprint());
   assert(QwenExecutionPolicyUnsupportedReason(production).empty());
+  assert(QwenContinuationUnsupportedReason(production).empty());
+  assert(QwenContinuationUnsupportedReason(fp32_kv).empty());
   assert(QwenExecutionPolicyUnsupportedReason(fp32_kv).empty());
   assert(QwenExecutionPolicyUnsupportedReason(bf16_recurrent).empty());
   auto invalid = production;

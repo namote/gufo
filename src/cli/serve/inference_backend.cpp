@@ -3320,11 +3320,12 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 prefill_policy, scheduler_policy, speculative_config,
                 std::move(resolved_disk_cache_config), ram_cache_config);
   }
-  // Refuse a storage the executor cannot run before mapping 27B weights.
+  // Refuse a storage the server's prefix cache cannot hold before mapping
+  // 27B weights.
   const auto execution_policy =
       cli::QwenExecutionPolicyFor(resolved_kv_cache_type);
   if (const auto unsupported =
-          hip::QwenExecutionPolicyUnsupportedReason(execution_policy);
+          hip::QwenContinuationUnsupportedReason(execution_policy);
       !unsupported.empty()) {
     SetError(error, std::string(unsupported));
     return false;
@@ -3393,7 +3394,7 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     return false;
   }
   if (const auto unsupported =
-          hip::QwenExecutionPolicyUnsupportedReason(execution_policy);
+          hip::QwenContinuationUnsupportedReason(execution_policy);
       !unsupported.empty()) {
     SetError(error, std::string(unsupported));
     return false;

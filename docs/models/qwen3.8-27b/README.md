@@ -39,10 +39,14 @@ sampling defaults are described in [the server guide](../../SERVER.md#reasoning-
 
 `--kv-cache-type` selects attention KV storage in `serve llm`, `prompt`,
 `chat` and `bench`. The default is `fp16` (64 KiB per token across the 16
-full-attention layers). `kvarn-k4v2` and `kvarn-k4v4` are reserved for KVarN
-storage (Hadamard-rotated 4-bit keys with 2- or 4-bit values). Until its
-kernels land, both are refused before weights load with
-`--kv-cache-type kvarn-k4v2 is not implemented yet for Qwen3.8-27B`. The
+full-attention layers). `kvarn-k4v2` and `kvarn-k4v4` store KVarN
+(Hadamard-rotated 4-bit keys with 2- or 4-bit values per 128-token group,
+13.1 and 17.1 KiB per token; the first 128 tokens and the unfinished last
+group stay FP16) in `prompt`, `chat` and `bench`. Every query reads the
+groups that ended at or before its position quantized, so DFlash2
+verification matches decoding exactly. `serve llm` refuses KVarN until its
+continuation checkpoints exist (`continuation and checkpoints of
+--kv-cache-type kvarn-k4v2 ... are not implemented yet`). The
 `--cpu` route keeps FP32 KV and refuses any `--kv-cache-type`. Each type has
 its own policy fingerprint and continuation identity, so cached checkpoints
 never cross types.

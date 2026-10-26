@@ -82,8 +82,9 @@ Text serving defaults match llama.cpp for context and generation length:
 
 `--kv-cache-type fp16|kvarn-k4v2|kvarn-k4v4` selects attention KV storage; a
 model takes an explicit value only when it stores KV that way. Qwen3.8-27B
-accepts the KVarN values at startup but refuses them before mapping weights as
-not implemented yet. Flash-Next stores FP16 KV and accepts only `fp16`.
+runs the KVarN values in `prompt`, `chat` and `bench`, but the server refuses
+them before mapping weights: its prefix cache stores continuations, which
+have no KVarN layout yet. Flash-Next stores FP16 KV and accepts only `fp16`.
 DeepSeek V4 Flash keeps FP8 KV and refuses any value: `DeepSeek V4 Flash does
 not take --kv-cache-type (its KV cache is FP8)`. The type is part of the Qwen
 continuation identity (`kv_storage=` and the state ABI), so checkpoints made

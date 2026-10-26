@@ -90,28 +90,38 @@ struct QwenExecutionPolicy {
   }
 };
 
-/// Why a Qwen GPU executor cannot run `policy` yet; empty when it can. Every
-/// executor, continuation layout and server load refuses through this one
-/// check, so enabling a storage format removes exactly one rejection.
+/// Why a Qwen GPU executor cannot run `policy`; empty when it can. Every
+/// executor and model load refuses through this one check.
 [[nodiscard]] constexpr std::string_view QwenExecutionPolicyUnsupportedReason(
     const QwenExecutionPolicy& policy) noexcept {
-  switch (policy.kv_cache_storage) {
-    case QwenKvCacheStorage::kFp32:
-    case QwenKvCacheStorage::kFp16:
-      break;
-    case QwenKvCacheStorage::kKvarnK4V2:
-      return "--kv-cache-type kvarn-k4v2 is not implemented yet for "
-             "Qwen3.8-27B";
-    case QwenKvCacheStorage::kKvarnK4V4:
-      return "--kv-cache-type kvarn-k4v4 is not implemented yet for "
-             "Qwen3.8-27B";
-  }
   if (policy.kv_cache_storage > QwenKvCacheStorage::kKvarnK4V4)
     return "Qwen KV cache storage is invalid";
   if (policy.recurrent_state_storage != QwenRecurrentStateStorage::kFp32 &&
       policy.recurrent_state_storage != QwenRecurrentStateStorage::kBf16)
     return "Qwen recurrent state storage is invalid";
   return {};
+}
+
+/// Why a continuation layout (the prefix cache, checkpoints and the server
+/// built on them) cannot hold `policy`'s state; empty when it can. KVarN
+/// rows have no checkpoint format yet.
+[[nodiscard]] constexpr std::string_view QwenContinuationUnsupportedReason(
+    const QwenExecutionPolicy& policy) noexcept {
+  if (const auto reason = QwenExecutionPolicyUnsupportedReason(policy);
+      !reason.empty())
+    return reason;
+  switch (policy.kv_cache_storage) {
+    case QwenKvCacheStorage::kKvarnK4V2:
+      return "continuation and checkpoints of --kv-cache-type kvarn-k4v2 "
+             "(the HTTP server's prefix cache) are not implemented yet for "
+             "Qwen3.8-27B";
+    case QwenKvCacheStorage::kKvarnK4V4:
+      return "continuation and checkpoints of --kv-cache-type kvarn-k4v4 "
+             "(the HTTP server's prefix cache) are not implemented yet for "
+             "Qwen3.8-27B";
+    default:
+      return {};
+  }
 }
 
 /// Resolved route decisions for one layer invocation. This record is pure data

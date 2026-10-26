@@ -23,8 +23,7 @@ ContinuationLayout::ContinuationLayout(const core::ModelConfig& c,
                                        std::uint32_t context)
     : context_(context) {
   // KVarN component rows have no layout until their storage is implemented.
-  if (const auto unsupported =
-          hip::QwenExecutionPolicyUnsupportedReason(policy);
+  if (const auto unsupported = hip::QwenContinuationUnsupportedReason(policy);
       !unsupported.empty())
     throw std::invalid_argument(std::string(unsupported));
   if (!c.IsValidQwen() || !context || context > c.context_length)
