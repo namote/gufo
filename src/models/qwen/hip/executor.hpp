@@ -156,6 +156,9 @@ public:
     return recurrent_state_storage_;
   }
   [[nodiscard]] std::size_t CompactPayloadBytes() const;
+  /// KVarN: the tail base of the rows a compact payload holds
+  /// (KvarnRowsAt); zero for other KV.
+  [[nodiscard]] std::uint32_t CompactKvarnBase() const;
   [[nodiscard]] std::size_t SerializeCompact(
       std::span<std::uint8_t> destination) const;
   [[nodiscard]] static models::qwen::vision::RopeLayout ReadRopeLayout(

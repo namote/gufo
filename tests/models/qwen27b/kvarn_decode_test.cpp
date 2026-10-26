@@ -479,6 +479,72 @@ void CheckContinuation(
   std::cout << name << " continuation decode after restore: exact\n";
 }
 
+// Compact snapshot (K4-C2): a KVarN slot serialized, restored into another
+// executor and serialized again gives the same bytes; the payload holds the
+// records before the tail base and only the valid FP16 rows (the
+// continuation rule); and the next decode matches exactly.
+void CheckCompact(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
+                  QwenKvCacheStorage storage, std::uint32_t kPrompt,
+                  std::uint32_t kEnd, std::uint32_t committed,
+                  std::uint32_t expected_records, std::uint32_t expected_tail) {
+  constexpr std::uint32_t kContext = 1024;
+  auto policy = gufo::hip::QwenExecutionPolicy::Production();
+  policy.kv_cache_storage = storage;
+  std::string error;
+  auto source = Executor::Create(model, &error, kContext, policy);
+  auto target = Executor::Create(model, &error, kContext, policy);
+  Expect(source && target, error);
+  const std::string name =
+      std::string(gufo::hip::QwenKvCacheStorageName(storage)) + " compact at " +
+      std::to_string(kEnd) +
+      (committed ? " + " + std::to_string(committed) + " of 8 verified" : "");
+  const auto tokens = Fixture(*source, kEnd + 9);
+  (void)source->ForwardPromptBatch(std::span(tokens).first(kPrompt));
+  for (std::uint32_t pos = kPrompt; pos < kEnd; ++pos)
+    (void)source->ForwardToken(tokens[pos], pos);
+  std::uint32_t position = kEnd;
+  if (committed != 0) {
+    (void)source->ForwardVerificationChunk(std::span(tokens).subspan(kEnd, 8),
+                                           kEnd);
+    source->CommitVerificationChunk(std::span(tokens).subspan(kEnd, committed),
+                                    kEnd);
+    position += committed;
+  }
+  const auto saved = source->SaveSnapshot(position);
+  std::vector<std::uint8_t> payload(saved->CompactPayloadBytes());
+  Expect(saved->SerializeCompact(payload) == payload.size(),
+         name + ": serialize");
+  // Header, records of 16 layers, K and V of 16 layers for the sink and
+  // tail rows, then the recurrent state (as for FP16 KV).
+  const std::size_t record_row =
+      4ULL * gufo::hip::KvarnRecord(gufo::hip::KvarnValueBits(storage)).bytes /
+      128;
+  const std::size_t kv =
+      16 * expected_records * record_row +
+      2ULL * 16 * (std::min(position, 128U) + expected_tail) * 2048;
+  const auto fp16_policy = gufo::hip::QwenExecutionPolicy::Production();
+  auto fp16 = Executor::Create(model, &error, kContext, fp16_policy);
+  Expect(fp16 != nullptr, error);
+  const auto empty = fp16->SaveSnapshot(0);
+  std::vector<std::uint8_t> state(empty->CompactPayloadBytes());
+  Expect(payload.size() == state.size() + kv,
+         name + ": payload of " + std::to_string(payload.size()) + " bytes");
+  target->RestoreCompactSnapshot(payload, position);
+  const auto again = target->SaveSnapshot(position);
+  std::vector<std::uint8_t> round(again->CompactPayloadBytes());
+  Expect(again->SerializeCompact(round) == round.size() && round == payload,
+         name + ": a restored compact snapshot differs");
+  (void)source->ForwardToken(tokens[position], position);
+  const auto expected = Logits(*source);
+  (void)target->ForwardToken(tokens[position], position);
+  const auto actual = Logits(*target);
+  Expect(std::memcmp(expected.data(), actual.data(),
+                     expected.size() * sizeof(float)) == 0,
+         name + ": a restored compact snapshot decodes differently");
+  std::cout << name << ": " << payload.size() << " bytes (" << kv
+            << " KV), round trip and decode exact\n";
+}
+
 }  // namespace
 
 int main(int argc, const char* const* argv) {
@@ -513,6 +579,10 @@ int main(int argc, const char* const* argv) {
         CheckContinuation(model, storage, 520, 530, true, 0, 512, 18);
         CheckContinuation(model, storage, 600, 640, true, 0, 512, 128);
         CheckContinuation(model, storage, 600, 636, true, 2, 512, 126);
+        CheckCompact(model, storage, 60, 70, 0, 70, 0);
+        CheckCompact(model, storage, 300, 646, 0, 640, 6);
+        CheckCompact(model, storage, 600, 640, 0, 512, 128);
+        CheckCompact(model, storage, 600, 636, 2, 512, 126);
         if (!continuation_only)
           CheckStorage(model, storage);
       } catch (const std::exception& error) {
