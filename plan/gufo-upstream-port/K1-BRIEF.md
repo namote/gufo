@@ -117,3 +117,24 @@ K1a·K1b 결과와 감독 판정은 [KVarN](KVARN.md) "K1a·K1b 결과"에 있�
 제안 통제 `control_k`(테스트 안에서 재현 가능): 지금 통제와 같은 fake 실행에, 그룹 행만이 아니라 **매 걸음 그 시점까지의 모든 K/V 행**(sink·tail 포함)을 회전 왕복(H → FP16 반올림 → H → FP16 반올림)으로 옮긴다. 실제 경로가 모든 행에 더하는 회전 반올림 1회와 같은 크기다. 게이트: 창마다 p95·max에서 fake‖real ≤ 10 × max(fake‖control, fake‖control_k), top-1은 지금과 같음. 비용: 1K 문맥에서 걸음마다 capture·restore(약 500회). 구현: 각 행은 캐시에 들어온 뒤 한 번만 왕복시키고(다음 걸음 전), 그룹 끝에서는 왕복된 행으로 fake 양자화한다.
 
 한계: FP16 q·P 반올림은 FP16 실행기에서 흉내 낼 수 없어 `control_k`에 들어가지 않는다. 그 몫까지 넣으려면 진단 빌드들의 퍼짐(위 a–c2의 최대/최소, 약 2배)을 한 번 재서 상수 배수로 두는 방법이 있지만, 테스트 밖 빌드에 기대므로 권하지 않는다.
+
+## K2: 서빙 (2026-10-26 사용자: "진행해")
+
+통과 기준(KVARN.md 단계 표): T2 경우 전부 gold 정답, FP16 대비 텍스트 차이를 수로 기록(같다고 주장하지 않음), DFlash2 수락률 변화 기록. 지금 `serve`는 kvarn을 거절한다(prefix cache가 continuation을 써야 해서, KVARN.md "K1c-1 미해결 수정과 K1c-2 결과"). 할 일 목록은 KVARN.md "K0에서 정하지 않는 것" 첫 항목.
+
+### K2-1: 형식과 serve 허용 (CPU 중심)
+
+- K/V component `layout_version` 새 값(kvarn 형식마다 구분, fp16은 지금 값·바이트 그대로). policy fingerprint가 이미 형식을 구분하므로 다른 형식의 cache·checkpoint·디스크 항목은 거절(fallback 없음).
+- compact snapshot·checkpoint chunk·디스크 형식에 양자화 record·scale·FP16 sink/tail을 담는다. 경계가 그룹 중간이면 tail은 FP16 그대로. 복원은 저장 전과 비트 단위로 같아야 한다(record·ring 바이트 비교 테스트).
+- 블록 풀 크기와 입장 예약 계산을 kvarn 바이트로(같은 `--kv-pool-bytes`에 더 많은 토큰). 계산은 host 함수로 두고 CPU 테스트.
+- `serve`의 kvarn 거절을 없앤다. DFlash2 draft 경로는 draft 모델 KV를 바꾸지 않는다(target만 kvarn)면 그대로, 바꿔야 하면 보고.
+- NOTICE에 KVarN 출처(Apache-2.0, huawei-csl/KVarN, arXiv 2606.03458)를 더한다.
+- fp16 경로는 바이트·동작 그대로: 기존 continuation·cache 테스트 통과, CPU `check-pr` 통과.
+
+### K2-2: T2 창 (GPU)
+
+- 이 브랜치의 마지막 T2 창 계획(`final-f13` 계열, `PLAN-F*.json`·`t2.py`)을 복사해 `PLAN-K2.json`에 fp16과 kvarn-k4v2를 같은 설정으로 둔다. 둘 다 같은 바이너리(HEAD)로, fp16 → k4v2 → fp16 순서.
+- 기록: 경우 A–H 별 gold 정답 여부, FP16 대비 텍스트 차이(같은 요청끼리 첫 다른 토큰 위치·다른 요청 수), 재사용 토큰 수와 TTFT, DFlash2 수락률(요청별), host 메모리·디스크 캐시 크기. 서버 timings에 cache 형식과 kv-cache-type이 찍혀 실제 형식을 확인한다.
+- fp16 실행은 이전 T2 기준과 텍스트 동일이어야 한다(회귀 확인).
+- kvarn에서 cache 끈 재요청과의 텍스트 동일(같은 형식 안 동일성)도 확인한다.
+- 보고 뒤 멈춘다. 기본값 전환(K2-3)은 감독 검증 뒤 따로 지시한다.
