@@ -211,6 +211,18 @@ fake quant는 FP16 커널을 그대로 쓰므로 속도를 재지 못한다. 그
 - 모델 teacher forcing 636토큰(FP16 대비): k4v2 top-1 499/508, KL 중앙값 4.7e-5, 최대 0.35; k4v4 506/508, 최대 0.032.
 - **감독 판정: 미해결 2건.** (A) 에이전트가 데이터를 본 뒤 KL 기준을 0.1 → 1.0으로 넓혔다. 기준 확대로 인정하지 않고, 같은 prompt·위치에서 fake quant와 비교해 원인을 가린다. (B) verify(8행)와 1행 decode가 비트 단위로 다르다(최대 logit 차 k4v2 0.020, k4v4 0.009, 예측은 같음). FP16은 같고 greedy DFlash2 = AR 텍스트 규칙이 걸려 있다. 가설: verify chunk 안에서 찬 그룹을 verify는 FP16으로, 1행 decode는 양자화된 값으로 읽는다. 둘 다 K1c-2 앞에서 고친다.
 
+### K1b-opt 결과 (2026-10-26, gufo `cf7447b0`, 감독 검증)
+
+- 창 `kvarn-k1bopt-a09/opt` COMPLETE·health PASS(a01은 계획 리비전 불일치로 시작 전 거절, a02–a07은 check FAIL 기록 보존, a08 COMPLETE는 포맷 전 바이너리). 감독 확인: `cf7447b0` 소스 + `6200e0a4` 운영 소스 snapshot으로 다시 빌드한 바이너리 SHA `20ec49f3…`가 a09에서 돈 것과 같다.
+- 추천 `opt_latev`: 코드를 FP16 지수와 OR해 16+c·4+c로 바로 만드는 biased 코드(행마다 FP32로 bias 제거), **AR만** K scale을 q에 접기(그룹마다 LDS에서 A = half(q·scale), 행별 보정에 중간 코드 7.5 항 포함), 밑 2 softmax(`v_exp_f32`), AR padding 행 10개 생략, AR은 마지막 블록이 split 합침(reduce launch 없음), verify는 행당 wave 하나 combine 커널, V 코드를 자기 그룹 시작에 읽기(AR k4v4 7 → 8 waves/SIMD).
+- 기각: int8 WMMA(A·P를 그룹마다 int8로 다시 양자화하거나 hi/lo로 WMMA 2배, 8비트 P는 1e-3 불가, 줄일 unpack이 이미 쌍당 1.5 명령 이하), dequant LDS 공유(쓰기·읽기·대기가 dequant보다 비쌈), AR `v_dot2`(그룹당 약 3,072 dot + lane 합산 대 wave당 WMMA 32개).
+- 그룹 루프 명령 수: AR k4v2 2,248 → 1,151, verify 4,463 → 3,681.
+- 정확도(최대, 커널 / K0 기준): k4v2 AR 8.1e-4 / 8.7e-4, k4v2 verify 6.4e-4 / 9.3e-4, k4v4 AR 7.2e-4 / 9.9e-4, k4v4 verify 7.1e-4 / 9.8e-4. 양자화는 그대로.
+- 속도(층 하나 µs, 같은 바이너리, 바이트 하한 대비 %): AR k4v2 4K 42.6 → 35.5(51 %), 32K 186.7 → 139.4(85 %), 64K 338 → 262(89 %), 256K 1,244 → 981(94 %); AR k4v4 32K 211 → 180(85 %), 256K 1,404 → 1,290(94 %); verify 32K 457 → 389, 256K 3,238 → 2,911. FP16 32K AR 587, verify 1,933.
+- **저장 배치: 바꾸지 않는다.** biased decode가 지금 nibble·crumb 순서와 채널별 FP16 K scale·zero에 기대므로 K1c·K2는 이것을 유지한다.
+- 남은 병목: 4K는 블록당 그룹 2개 지연·sink/tail 블록·launch(바이트 하한 51 %), 32K는 마지막 블록 combine 약 8 µs, AR WMMA의 padding 10/16, verify는 ALU/LDS(하한 약 31 %).
+- **감독 판정: 속도·정확도 gate 통과. 단 채택 전 결정 1건:** K scale 접기를 AR에만 하면 AR과 verify의 산술이 달라져, K1c에 요구한 "verify 행 = 같은 위치 1행 decode 비트 일치"(greedy DFlash2 = AR)가 구조적으로 성립하지 않는다.
+
 ### K0에서 정하지 않는 것
 
 - 커널·서빙·checkpoint 형식(K1·K2). 추가가 필요한 것만 적어 둔다: storage enum 값과 policy fingerprint 비트, K/V component `layout_version` 3(새 row_bytes와 128토큰 scale plane), compact snapshot 검증 완화, 블록 풀의 scale plane(`KvBlockPlane::rows_per_block` 128은 이미 표현 가능하나 arena·adapter가 같은 두 plane을 가정한다).
