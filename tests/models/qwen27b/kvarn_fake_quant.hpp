@@ -115,6 +115,16 @@ inline void Hadamard(std::span<float> x) {
 }
 
 namespace detail {
+// Correctly rounded float log and exp: computed in double, rounded once. The
+// GPU quantizer rounds the same way; glibc's logf/expf miss the correctly
+// rounded result for about 0.1 % of inputs, which moved a stored scale.
+[[nodiscard]] inline float Log(float x) noexcept {
+  return static_cast<float>(std::log(static_cast<double>(x)));
+}
+[[nodiscard]] inline float Exp(float x) noexcept {
+  return static_cast<float>(std::exp(static_cast<double>(x)));
+}
+
 // Unbiased standard deviation of `count` values `stride` apart.
 inline float Std(const float* values, std::size_t count, std::size_t stride) {
   double mean = 0;
@@ -164,9 +174,9 @@ inline void Balance(std::vector<float>& tile, std::size_t rows,
   std::vector<float> column(cols), row(rows);
   const auto apply = [&] {
     for (std::size_t c = 0; c < cols; ++c)
-      column[c] = std::exp(log_column[c]);
+      column[c] = detail::Exp(log_column[c]);
     for (std::size_t r = 0; r < rows; ++r)
-      row[r] = std::exp(log_row[r]);
+      row[r] = detail::Exp(log_row[r]);
     for (std::size_t r = 0; r < rows; ++r)
       for (std::size_t c = 0; c < cols; ++c)
         current[r * cols + c] = source[r * cols + c] / column[c] / row[r];
@@ -175,22 +185,23 @@ inline void Balance(std::vector<float>& tile, std::size_t rows,
     for (std::size_t c = 0; c < cols; ++c) {
       const float s = std::clamp(detail::Std(current.data() + c, rows, cols),
                                  kStdMin, kStdMax);
-      log_column[c] = std::clamp(log_column[c] + std::log(s), kLogMin, kLogMax);
+      log_column[c] =
+          std::clamp(log_column[c] + detail::Log(s), kLogMin, kLogMax);
     }
     apply();
     for (std::size_t r = 0; r < rows; ++r) {
       const float s = std::clamp(
           detail::Std(current.data() + r * cols, cols, 1), kStdMin, kStdMax);
-      log_row[r] = std::clamp(log_row[r] + std::log(s), kLogMin, kLogMax);
+      log_row[r] = std::clamp(log_row[r] + detail::Log(s), kLogMin, kLogMax);
     }
     apply();
     const float imbalance = detail::Imbalance(current, rows, cols);
     if (imbalance <= best) {
       best = imbalance;
       for (std::size_t c = 0; c < cols; ++c)
-        column_scale[c] = std::exp(log_column[c]);
+        column_scale[c] = detail::Exp(log_column[c]);
       for (std::size_t r = 0; r < rows; ++r)
-        row_scale[r] = std::exp(log_row[r]);
+        row_scale[r] = detail::Exp(log_row[r]);
     }
   }
   for (std::size_t r = 0; r < rows; ++r)
@@ -199,29 +210,55 @@ inline void Balance(std::vector<float>& tile, std::size_t rows,
           source[r * cols + c] / column_scale[c] / row_scale[r];
 }
 
+// Stored form of one quantized row-major [rows, cols] tile: codes, the FP16
+// row scale and zero with the row's balancing scale absorbed, and the FP16
+// column scale. The value is (code * scale + zero) * column.
+struct QuantizedTile {
+  std::vector<std::uint8_t> codes;         // [rows][cols]
+  std::vector<std::uint16_t> scale, zero;  // [rows]
+  std::vector<std::uint16_t> column;       // [cols]
+};
+
+// Per-row asymmetric RTN after optional balancing, in the frame the tile is
+// given; `tile` is left balanced.
+inline QuantizedTile QuantizeTileCodes(std::vector<float>& tile,
+                                       std::size_t rows, std::size_t cols,
+                                       int bits, bool balance, int iterations) {
+  std::vector<float> column_scale(cols, 1.0F), row_scale(rows, 1.0F);
+  if (balance)
+    Balance(tile, rows, cols, iterations, column_scale, row_scale);
+  const float qmax = static_cast<float>((1 << bits) - 1);
+  QuantizedTile out;
+  out.codes.resize(rows * cols);
+  for (std::size_t r = 0; r < rows; ++r) {
+    const float* row = tile.data() + r * cols;
+    const auto [lo, hi] = std::minmax_element(row, row + cols);
+    const float low = *lo;
+    const float scale = std::max((*hi - low) / qmax, 1e-10F);
+    out.scale.push_back(FloatToHalf(row_scale[r] * scale));
+    out.zero.push_back(FloatToHalf(row_scale[r] * low));
+    for (std::size_t c = 0; c < cols; ++c)
+      out.codes[r * cols + c] = static_cast<std::uint8_t>(
+          std::clamp(std::nearbyint((row[c] - low) / scale), 0.0F, qmax));
+  }
+  for (std::size_t c = 0; c < cols; ++c)
+    out.column.push_back(FloatToHalf(column_scale[c]));
+  return out;
+}
+
 // Quantizes and dequantizes a row-major [rows, cols] tile in place, in the
 // frame it is given: per-row asymmetric RTN after optional balancing, with
 // the stored FP16 scales.
 inline void QuantizeTile(std::vector<float>& tile, std::size_t rows,
                          std::size_t cols, int bits, bool balance,
                          int iterations) {
-  std::vector<float> column_scale(cols, 1.0F), row_scale(rows, 1.0F);
-  if (balance)
-    Balance(tile, rows, cols, iterations, column_scale, row_scale);
-  const float qmax = static_cast<float>((1 << bits) - 1);
-  for (std::size_t r = 0; r < rows; ++r) {
-    float* row = tile.data() + r * cols;
-    const auto [lo, hi] = std::minmax_element(row, row + cols);
-    const float low = *lo;
-    const float scale = std::max((*hi - low) / qmax, 1e-10F);
-    const float stored_scale = RoundHalf(row_scale[r] * scale);
-    const float stored_zero = RoundHalf(row_scale[r] * low);
-    for (std::size_t c = 0; c < cols; ++c) {
-      const float q =
-          std::clamp(std::nearbyint((row[c] - low) / scale), 0.0F, qmax);
-      row[c] = (q * stored_scale + stored_zero) * RoundHalf(column_scale[c]);
-    }
-  }
+  const auto q = QuantizeTileCodes(tile, rows, cols, bits, balance, iterations);
+  for (std::size_t r = 0; r < rows; ++r)
+    for (std::size_t c = 0; c < cols; ++c)
+      tile[r * cols + c] =
+          (static_cast<float>(q.codes[r * cols + c]) * HalfToFloat(q.scale[r]) +
+           HalfToFloat(q.zero[r])) *
+          HalfToFloat(q.column[c]);
 }
 
 struct Error {

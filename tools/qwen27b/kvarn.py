@@ -39,6 +39,16 @@ def hadamard(np, n):
     return (h / np.sqrt(np.float32(n))).astype(np.float32)
 
 
+def log32(np, x):
+    """Correctly rounded float32 log: double, rounded once (as the GPU)."""
+    return np.log(x.astype(np.float64)).astype(np.float32)
+
+
+def exp32(np, x):
+    """Correctly rounded float32 exp: double, rounded once (as the GPU)."""
+    return np.exp(x.astype(np.float64)).astype(np.float32)
+
+
 def balance(np, tiles, iterations):
     """Batched log-domain balancing of [N, R, C] tiles (sinkhorn.py)."""
     def imbalance(x):
@@ -55,15 +65,15 @@ def balance(np, tiles, iterations):
     current = tiles
     for _ in range(iterations):
         s = np.clip(current.std(axis=1, ddof=1, keepdims=True), STD_MIN, STD_MAX)
-        log_column = np.clip(log_column + np.log(s), LOG_MIN, LOG_MAX)
-        current = tiles / np.exp(log_column) / np.exp(log_row)
+        log_column = np.clip(log_column + log32(np, s), LOG_MIN, LOG_MAX)
+        current = tiles / exp32(np, log_column) / exp32(np, log_row)
         s = np.clip(current.std(axis=2, ddof=1, keepdims=True), STD_MIN, STD_MAX)
-        log_row = np.clip(log_row + np.log(s), LOG_MIN, LOG_MAX)
-        current = tiles / np.exp(log_column) / np.exp(log_row)
+        log_row = np.clip(log_row + log32(np, s), LOG_MIN, LOG_MAX)
+        current = tiles / exp32(np, log_column) / exp32(np, log_row)
         value = imbalance(current)
         better = value <= best
-        column_best = np.where(better[:, None, None], np.exp(log_column), column_best)
-        row_best = np.where(better[:, None, None], np.exp(log_row), row_best)
+        column_best = np.where(better[:, None, None], exp32(np, log_column), column_best)
+        row_best = np.where(better[:, None, None], exp32(np, log_row), row_best)
         best = np.where(better, value, best)
     return tiles / column_best / row_best, column_best, row_best
 
