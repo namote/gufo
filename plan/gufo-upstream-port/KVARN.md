@@ -175,6 +175,33 @@ fake quant는 FP16 커널을 그대로 쓰므로 속도를 재지 못한다. 그
 
 **판정(추천, 사용자 확인 전).** 정확도는 이 과제에서 모든 설정이 통과했고, 속도 상한은 깊은 문맥 decode에서 크다. 다음은 K1 진입 조건인 fused dequant decode attention 시제품(`tools/bench/`)과, 품질 기준을 가를 어려운 과제 하나다. 형식 후보는 k4v2(최대 압축, 4.88배)와 k4v4(KL 한 자릿수 작음, 3.74배)다.
 
+### K1a·K1b 결과 (2026-10-26, 에이전트 작업·감독 검증, [안내](K1-BRIEF.md))
+
+**K1a**(gufo `6e06a8d1`, `0d59a4e0`): `--kv-cache-type fp16|kvarn-k4v2|kvarn-k4v4`(serve·prompt·chat·bench), 모델별 기본값은 `src/cli/kv_cache_type.cpp` `DefaultKvCacheType` 한 곳(지금 Qwen 27B·Flash-Next fp16, 나머지는 자기 KV). 모델이 실제로 그 형식으로 KV를 저장할 때만 명시 값을 받는다: Qwen 27B GPU는 fp16과 kvarn(아직 `QwenExecutionPolicyUnsupportedReason`이 "not implemented yet"으로 거절), Flash-Next는 fp16만, DeepSeek(FP8)·Gemma 4(이 트리에 실행 코드 없음)·CPU Qwen(FP32)은 명시하면 거절. fp16·fp32 fingerprint는 이전 값 고정. 감독 재실행: CPU `check-pr` 71/71, `qwen27b.kvarn-reference`·`qwen27b.tools`·layout 3/3 PASS. fp16 GPU 실행 동일성은 아직 GPU 단위 테스트로 확인하지 않았다(다음 GPU 창).
+
+**K1b**(gufo `2295ef2f`, `tools/bench/kvarn_decode_bench.hip`, 운영 코드 변경 없음): 그룹 flush 양자화 커널, fused dequant split-K decode(질의 1), DFlash2 verify 변형(질의 8), FP16 기준은 운영 `LaunchCausalDecodeAttention`을 그대로 링크. 창 `kvarn-k1b-a07/k1b-final` COMPLETE·health PASS(a01–a06은 기록 보존: 종료 뒤 GPU busy 4 %가 3 % 한도를 넘은 health 실패, a01은 처음 tile 완전 일치 규칙으로 검사 FAIL). 감독 확인: 커밋에서 다시 빌드한 바이너리 SHA `46d238e9…`가 a07에서 돈 것과 같다(a07 `RESULT.json`의 `source_revision`은 갱신되지 않은 `.gufo-revision` 값 `b3edc894`라 이 SHA 대조로 출처를 확인).
+
+- 저장 배치(제안): 층·256토큰 블록마다 `[그룹 2][KV head 4][record]`, record k4v2 26,880 B·k4v4 35,072 B(FP16 131,072 B). K 코드는 토큰 우선(토큰당 128 B, nibble 교차 배치), V 코드는 채널 우선, 이어서 FP16 scale·zero·열 scale. sink·미flush tail은 시퀀스별 FP16 평면에 이미 회전된 값으로 둔다.
+- 정확도(20경우: 그룹 0/1/30/254, tail 44–133, 질의 1·8, split 32·7): 커널 산술 오차(같은 코드의 CPU attention 대비) 2.6e-4–8.3e-4, K0 fake quant 기준 대비 4.5e-4–1.0e-3, 양자화 자체의 효과는 0.11–0.64라 커널 오차는 무시할 수준. FP16 기준 커널은 CPU 대비 7e-7. 양자화 커널은 같은 누적 순서 에뮬레이션과 tile 전부 비트 일치, K0 규칙과는 99.5 % tile 일치(나머지는 scale 최대 2 ulp, 코드 약 100만 개 중 1개): glibc `logf`·`expf`가 정확히 반올림되지 않는 입력(0.14 %·0.06 %) 때문이고, GPU는 double로 계산해 한 번 반올림해 host 정확 반올림과 100만 표본에서 일치.
+- 속도(층 하나, µs, 최적 split, DRAM 읽기 상한 238.5 GB/s):
+
+|깊이|질의|FP16|k4v2|k4v4|
+|---|---|---|---|---|
+|4K|1|83.9|42.5 (1.97×)|50.3 (1.67×)|
+|4K|8|238.9|105.6 (2.26×)|100.5 (2.38×)|
+|32K|1|591|179 (3.29×)|211 (2.79×)|
+|32K|8|1947|457 (4.26×)|447 (4.36×)|
+|64K|1|1156|324 (3.56×)|392 (2.95×)|
+|64K|8|3934|845 (4.66×)|849 (4.63×)|
+|256K|1|4599|1175 (3.91×)|1406 (3.27×)|
+|256K|8|19456|3204 (6.07×)|3192 (6.09×)|
+
+- FP16 verify(질의 8)는 약 69 GB/s로 ALU에 묶여 있어 KVarN 이득이 AR보다 크다. AR k4v2는 명령 발행에 묶임(그룹·wave당 2,369 명령 중 약 900이 dequant, WMMA B fragment를 두 half-wave에 중복해야 해서 dequant 반복). 대역폭 하한 대비 32K 66 %, 256K 79 %(k4v4 86 %).
+- 양자화: tile 하나 142 µs(지연), 16층 그룹 flush 7.56 ms(128토큰마다 한 번, decode 토큰당 분할 약 59 µs), 64그룹 묶음 tile당 54 µs(prefill 128토큰당 약 7 ms, 256K 약 14 s 추정).
+- 증거: ai.tools `tmp/test-results/gufo-upstream-port-20261023/kvarn-k1b-a0{1..7}/`, 계획 `PLAN-K1B.json`.
+
+**판정(감독): K1b gate 통과.** 32K 이상에서 AR 3.3–3.9배, verify 4.3–6.1배로 attention 시간이 줄고, 4K에서도 손해가 아니라 이득(1.7–2.4배)이다. 층 16개로 환산하면(추정) AR 토큰당 attention이 32K 9.5 → 2.9 ms, 256K 73.6 → 18.8 ms(256K AR 약 6.3 → 9.6 t/s). DFlash2 verify 한 번은 64K에서 63 → 13.5 ms. 남은 결정: 운영 split 정책(깊이·점유율에 따라 18–128), verify 폭 1–8 전부, 회전을 KV 쓰기 커널로 옮김(tail이 이미 회전되어 있어야 함), K0 참고 구현의 log·exp를 정확 반올림으로 바꿔 GPU와 비트 일치시키기, int8 WMMA로 dequant 비용 줄이기(후속).
+
 ### K0에서 정하지 않는 것
 
 - 커널·서빙·checkpoint 형식(K1·K2). 추가가 필요한 것만 적어 둔다: storage enum 값과 policy fingerprint 비트, K/V component `layout_version` 3(새 row_bytes와 128토큰 scale plane), compact snapshot 검증 완화, 블록 풀의 scale plane(`KvBlockPlane::rows_per_block` 128은 이미 표현 가능하나 arena·adapter가 같은 두 plane을 가정한다).
