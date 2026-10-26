@@ -174,3 +174,13 @@ K1a·K1b 결과와 감독 판정은 [KVarN](KVARN.md) "K1a·K1b 결과"에 있�
 ### 이 단계에서 하지 않는 것
 
 - 256K 끝단·K3 창. 테스트 한계(FP16 q·P 반올림 통제)는 그대로 둔다. 기존 커밋 순서 문제(ee00b659 단독 bisect)는 이력을 다시 쓰지 않는다.
+
+## K3: 실제 길이 (2026-10-27 사용자: "ㅇㅇ 다 진행해줘")
+
+통과 기준(KVARN.md 단계 표): gold 전부 정답, 256K 문서 질문 정답, 메모리·디스크·TTFT·decode 속도 표. 이득이 없거나 품질이 떨어지면 채택하지 않고 기록(기본값을 fp16으로 되돌릴지는 감독·사용자가 정한다).
+
+- 구성: 최종점검 F(F-RESULTS.md, `final.py`·`PLAN-F.json`)와 같은 창과 운영 설정(256K × 4, 풀 40 GiB, RAM 8 GiB, 디스크 64 GiB, `max_tokens` 32768, reasoning 16384, mmproj)을 HEAD 한 바이너리로, `--kv-cache-type fp16`과 `kvarn-k4v2`를 시나리오마다 ABBA로 번갈아 돌린다. `PLAN-K3.json`(새 파일)에 둔다. 창: 32K 대화 2개(재시작 포함), 256K 문서(첫 턴·다음 턴·재시작), 256K×4 동시, 64K×8 동시, two8k·regress·boundary·shared, bench(R4 측정점: AR·DFlash2, d32768 포함; 256K 깊이 bench 한 점 추가).
+- 원본 suite는 `long-context`·`cache`만 k4v2로 한 번(continuation이 바뀌었으므로). 다른 suite·full sweep은 돌리지 않는다.
+- 기록(시나리오·요청별, 평균 내지 않음): gold, fp16 대비 텍스트 차이(다른 요청 수·첫 다른 위치; 같다고 주장하지 않음), TTFT·prefill·decode t/s, 재사용 토큰, 재시작 복원 시간과 바이트, cgroup 최대 메모리(anon·file 나눠서 가능하면), KV 풀 사용 블록, SSD 쓰기·디스크 사용, DFlash2 수락률. 요청별 시간은 5 %·3 ms 규칙으로 표시하고, 넘으면 원인을 보거나 그 시나리오만 한 번 더 번갈아 돌린다(결과는 모두 보존).
+- t2.py의 새 finish_reason 검사처럼 모든 스트림이 정상 종료했는지 확인한다(final.py·suite도 같은 빈틈이 있으면 같은 검사를 넣는다).
+- GPU 시간이 길다(F는 약 1.5–3 시간, 두 형식이면 그 두 배 안팎). 창 계획을 쓴 뒤 예상 시간을 감독에게 먼저 보고하고, 확인을 받은 뒤 시작한다. 디스크 여유가 60 GB 아래면 끝난 창의 cache-disk를 지우고 기록한다.
