@@ -35,6 +35,17 @@ but AR and speculation need not share the same-seed sequence. See the
 [quality contract](QUALITY.md). Thinking/template controls and HTTP
 sampling defaults are described in [the server guide](../../SERVER.md#reasoning-controls).
 
+## KV cache type
+
+`--kv-cache-type` selects attention KV storage in `serve llm`, `prompt`,
+`chat` and `bench`. The default is `fp16` (64 KiB per token across the 16
+full-attention layers). `kvarn-k4v2` and `kvarn-k4v4` are reserved for KVarN
+storage (Hadamard-rotated 4-bit keys with 2- or 4-bit values). Until its
+kernels land, both are refused before weights load with
+`--kv-cache-type kvarn-k4v2 is not implemented yet for Qwen3.8-27B`. The CPU
+`--cpu` route accepts only `fp16`. Each type has its own policy fingerprint
+and continuation identity, so cached checkpoints never cross types.
+
 ## Images
 
 Use the matching `mmproj-BF16.gguf` beside the target or pass `--mmproj PATH`.

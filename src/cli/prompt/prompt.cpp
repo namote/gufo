@@ -200,6 +200,7 @@ static void RegisterTextOptions(ArgParser& parser, PromptOptions& opt,
         return true;
       });
 
+  RegisterKvCacheTypeOption(parser, &opt.kv_cache_type, "Model");
   parser.AddFlag("", "--cpu",
                  "Force CPU OpenMP execution fallback instead of GPU ROCm",
                  "Hardware", &opt.force_cpu);
@@ -305,6 +306,27 @@ void ResolvePromptSampling(const core::GgufReader& reader, PromptOptions* opt) {
   opt->sampling = sampling::ResolveTextSampling(
       preset, PromptReasoningOptions(*opt).enabled, opt->sampling,
       opt->sampling_supplied);
+}
+
+// Resolves --kv-cache-type for the artifact before weights load.
+std::optional<KvCacheType> ResolvePromptKvCacheType(
+    const core::GgufReader& reader, const PromptOptions& opt) {
+  std::string error;
+  auto type = ResolveKvCacheType(
+      reader.GetMetadataString("general.architecture").value_or(""),
+      opt.kv_cache_type, &error);
+  if (!type)
+    std::cerr << "Error: " << error << '\n';
+  return type;
+}
+
+// The CPU generator keeps its own reference KV; it has no KVarN form.
+bool RequireCpuKvCacheType(KvCacheType type) {
+  if (type == KvCacheType::kFp16)
+    return true;
+  std::cerr << "Error: --kv-cache-type " << KvCacheTypeName(type)
+            << " requires the ROCm backend\n";
+  return false;
 }
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -1005,6 +1027,11 @@ int RunPrompt(std::span<const char* const> args) {
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
   ResolvePromptSampling(*reader, &opt);
+  const auto kv_cache_type = ResolvePromptKvCacheType(*reader, opt);
+  if (!kv_cache_type) {
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
 
 #if defined(ENGINE_ENABLE_HIP)
   if (IsDeepSeekV4Flash(*reader)) {
@@ -1084,7 +1111,8 @@ int RunPrompt(std::span<const char* const> args) {
   int dev_count = 0;
   if (!opt.force_cpu && hipGetDeviceCount(&dev_count) == hipSuccess &&
       dev_count > 0) {
-    auto gpu_exec = gufo::hip::QwenGpuExecutor::CreateFromGguf(reader, &err);
+    auto gpu_exec = gufo::hip::QwenGpuExecutor::CreateFromGguf(
+        reader, &err, kDefaultContext, QwenExecutionPolicyFor(*kv_cache_type));
     if (gpu_exec) {
       PrintModelLoadTime(model_load_start);
       auto prompt_tokens = encode_prompt(gpu_exec->GetTokenizer());
@@ -1144,6 +1172,8 @@ int RunPrompt(std::span<const char* const> args) {
     std::cerr << "Qwen speculative decoding requires the ROCm backend\n";
     return 1;
   }
+  if (!RequireCpuKvCacheType(*kv_cache_type))
+    return 1;
   auto generator = models::QwenGenerator::CreateFromGguf(*reader, &err);
   if (!generator) {
     std::cerr << "Error creating Qwen generator: " << err << "\n";
@@ -1228,6 +1258,11 @@ int RunChat(std::span<const char* const> args) {
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
   ResolvePromptSampling(*reader, &opt);
+  const auto kv_cache_type = ResolvePromptKvCacheType(*reader, opt);
+  if (!kv_cache_type) {
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
 
 #if defined(ENGINE_ENABLE_HIP)
   if (IsDeepSeekV4Flash(*reader)) {
@@ -1273,7 +1308,8 @@ int RunChat(std::span<const char* const> args) {
   int device_count = 0;
   if (tokenizer == nullptr && !opt.force_cpu &&
       hipGetDeviceCount(&device_count) == hipSuccess && device_count > 0) {
-    gpu_executor = hip::QwenGpuExecutor::CreateFromGguf(reader, &err);
+    gpu_executor = hip::QwenGpuExecutor::CreateFromGguf(
+        reader, &err, kDefaultContext, QwenExecutionPolicyFor(*kv_cache_type));
     if (!gpu_executor) {
       std::cerr << "Error creating Qwen GPU executor: " << err << '\n';
       PrintModelLoadTime(model_load_start, false);
@@ -1304,6 +1340,8 @@ int RunChat(std::span<const char* const> args) {
       std::cerr << "Qwen speculative decoding requires the ROCm backend\n";
       return 1;
     }
+    if (!RequireCpuKvCacheType(*kv_cache_type))
+      return 1;
     generator = models::QwenGenerator::CreateFromGguf(*reader, &err);
     if (!generator) {
       std::cerr << "Error creating Qwen generator: " << err << '\n';

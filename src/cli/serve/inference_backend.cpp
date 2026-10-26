@@ -215,24 +215,19 @@ constexpr std::string_view kDeepSeekStateAbi =
 constexpr std::uint32_t kQwenComponentPayloadVersion = 2;
 constexpr std::size_t kQwenMaxResumeTokens = 9;
 
-constexpr std::string_view QwenStateAbi(bool speculative,
-                                        bool fp16_attention_kv,
-                                        bool bf16_recurrent_state) noexcept {
-  if (bf16_recurrent_state) {
-    if (speculative) {
-      return fp16_attention_kv
-                 ? "qwen-gfx1151-dflash-state-v4-fp16-kv-bf16-recurrent"
-                 : "qwen-gfx1151-dflash-state-v4-fp32-kv-bf16-recurrent";
-    }
-    return fp16_attention_kv ? "qwen-gfx1151-state-v3-fp16-kv-bf16-recurrent"
-                             : "qwen-gfx1151-state-v3-fp32-kv-bf16-recurrent";
-  }
-  if (speculative) {
-    return fp16_attention_kv ? "qwen-gfx1151-dflash-state-v3-fp16-kv"
-                             : "qwen-gfx1151-dflash-state-v3-fp32-kv";
-  }
-  return fp16_attention_kv ? "qwen-gfx1151-state-v2-fp16-kv"
-                           : "qwen-gfx1151-state-v2-fp32-kv";
+// FP16 and FP32 names are the earlier constants; KVarN differs by name.
+std::string QwenStateAbi(bool speculative, hip::QwenKvCacheStorage kv_storage,
+                         bool bf16_recurrent_state) {
+  std::string abi = bf16_recurrent_state
+                        ? (speculative ? "qwen-gfx1151-dflash-state-v4-"
+                                       : "qwen-gfx1151-state-v3-")
+                        : (speculative ? "qwen-gfx1151-dflash-state-v3-"
+                                       : "qwen-gfx1151-state-v2-");
+  abi += hip::QwenKvCacheStorageName(kv_storage);
+  abi += "-kv";
+  if (bf16_recurrent_state)
+    abi += "-bf16-recurrent";
+  return abi;
 }
 
 bool DiskCacheEnabled(const TextDiskCacheConfig& config) noexcept {
@@ -332,8 +327,8 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
     throw std::invalid_argument(
         "Qwen DFlash disk cache requires a draft artifact fingerprint");
   }
-  const std::string_view state_abi =
-      QwenStateAbi(speculative, execution_policy.UsesFp16AttentionKv(),
+  const std::string state_abi =
+      QwenStateAbi(speculative, execution_policy.kv_cache_storage,
                    execution_policy.UsesBf16RecurrentState());
   std::ostringstream identity;
   identity << "schema=gufo-text-continuation-v2\n"
@@ -357,7 +352,8 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
            << "attention_split_count="
            << hip::detail::kSplitKDecodeAttentionMaxSplits << '\n'
            << "kv_storage="
-           << (execution_policy.UsesFp16AttentionKv() ? "fp16" : "fp32") << '\n'
+           << hip::QwenKvCacheStorageName(execution_policy.kv_cache_storage)
+           << '\n'
            << "recurrent_storage="
            << (execution_policy.UsesBf16RecurrentState() ? "bf16" : "fp32")
            << '\n'
@@ -1044,12 +1040,14 @@ public:
       speculative::SpeculativeOptions speculative_options = {},
       std::string artifact_fingerprint = {},
       std::string draft_artifact_fingerprint = {},
-      std::size_t session_count = 1, std::size_t kv_pool_bytes = 0)
+      std::size_t session_count = 1, std::size_t kv_pool_bytes = 0,
+      hip::QwenExecutionPolicy execution_policy =
+          hip::QwenExecutionPolicy::Production())
       : model_(std::move(model)),
         dflash_model_(std::move(dflash_model)),
         max_context_(max_context),
         speculative_options_(speculative_options),
-        execution_policy_(hip::QwenExecutionPolicy::Production()),
+        execution_policy_(execution_policy),
         // Allocated now, before ResourceClaim reads free memory: sessions
         // then claim only their decode-step scratch.
         pass_scratch_(std::make_shared<hip::QwenSharedPassScratch>(
@@ -1127,11 +1125,10 @@ public:
     const bool speculative_enabled = dflash_model_ != nullptr;
     return {
         .model_id = model_->GetConfig().model_name,
-        .state_abi =
-            std::string(QwenStateAbi(
-                speculative_enabled, execution_policy_.UsesFp16AttentionKv(),
-                execution_policy_.UsesBf16RecurrentState())) +
-            "-component-v2",
+        .state_abi = QwenStateAbi(speculative_enabled,
+                                  execution_policy_.kv_cache_storage,
+                                  execution_policy_.UsesBf16RecurrentState()) +
+                     "-component-v2",
         .max_context = max_context_,
         .capabilities =
             TextRunnerCapabilities{
@@ -3133,7 +3130,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             const TextDiskCacheConfig& disk_cache_config,
                             const std::string& vision_model_path,
                             TextRunnerRamCacheOptions ram_cache_config,
-                            bool enable_yarn) {
+                            bool enable_yarn,
+                            std::optional<cli::KvCacheType> kv_cache_type) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
@@ -3147,6 +3145,12 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       reader->GetMetadataString("general.architecture").value_or("");
   if (enable_yarn && architecture != "qwen4exp") {
     SetError(error, "--enable-yarn applies only to Qwen3.8-Flash-Next");
+    return false;
+  }
+  const auto resolved_kv_cache_type =
+      cli::ResolveKvCacheType(architecture, kv_cache_type, &load_error);
+  if (!resolved_kv_cache_type) {
+    SetError(error, load_error);
     return false;
   }
   // Read once, reused below to derive YaRN from --context for qwen4exp.
@@ -3315,6 +3319,15 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 prefill_policy, scheduler_policy, speculative_config,
                 std::move(resolved_disk_cache_config), ram_cache_config);
   }
+  // Refuse a storage the executor cannot run before mapping 27B weights.
+  const auto execution_policy =
+      cli::QwenExecutionPolicyFor(*resolved_kv_cache_type);
+  if (const auto unsupported =
+          hip::QwenExecutionPolicyUnsupportedReason(execution_policy);
+      !unsupported.empty()) {
+    SetError(error, std::string(unsupported));
+    return false;
+  }
   std::shared_ptr<models::qwen::vision::Encoder> vision;
   try {
     if (reader->GetMetadataUint64("qwen35.embedding_length") == 5120) {
@@ -3345,7 +3358,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   }
   return load(std::move(model), error, max_context, session_count,
               prefill_policy, scheduler_policy, speculative_config,
-              std::move(resolved_disk_cache_config), ram_cache_config);
+              std::move(resolved_disk_cache_config), ram_cache_config,
+              execution_policy);
 #else
   (void)model_path;
   (void)max_context;
@@ -3357,6 +3371,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   (void)vision_model_path;
   (void)ram_cache_config;
   (void)enable_yarn;
+  (void)kv_cache_type;
   SetError(error, "HTTP inference requires the HIP backend");
   return false;
 #endif
@@ -3370,9 +3385,16 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
                             TextSchedulerPolicy scheduler_policy,
                             TextSpeculativeConfig speculative_config,
                             TextDiskCacheConfig disk_cache_config,
-                            TextRunnerRamCacheOptions ram_cache_config) {
+                            TextRunnerRamCacheOptions ram_cache_config,
+                            hip::QwenExecutionPolicy execution_policy) {
   if (model == nullptr) {
     SetError(error, "Qwen GPU model must not be null");
+    return false;
+  }
+  if (const auto unsupported =
+          hip::QwenExecutionPolicyUnsupportedReason(execution_policy);
+      !unsupported.empty()) {
+    SetError(error, std::string(unsupported));
     return false;
   }
   if (max_context == 0)
@@ -3479,7 +3501,7 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
         std::move(model), max_context, std::move(dflash_model),
         speculative_options, disk_cache_config.model_artifact_fingerprint,
         disk_cache_config.draft_model_artifact_fingerprint, session_count,
-        ram_cache_config.kv_pool_bytes);
+        ram_cache_config.kv_pool_bytes, execution_policy);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;

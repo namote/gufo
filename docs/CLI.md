@@ -35,6 +35,13 @@ The supported model types are LLM, image, video, audio (TTS, ASR), and text embe
 - `enableYarn` — Qwen3.8-Flash-Next only: allow a `context` above the native
   262144 tokens through static YaRN, which applies to every request. Required
   above 262144 and rejected at or below it.
+- `kvCacheType` (`"fp16"` / `"kvarn-k4v2"` / `"kvarn-k4v4"`) — how attention
+  keys and values are stored, for `serve llm`, `prompt`, `chat` and `bench`.
+  Unset, each model uses its default, currently `fp16` for every model.
+  `kvarn-k4v2` and `kvarn-k4v4` (KVarN: 4-bit keys with 2- or 4-bit values)
+  are planned for Qwen3.8-27B only; they are refused at startup as not
+  implemented yet. Other models accept only `fp16` and refuse KVarN by name.
+  Nothing falls back to another type silently.
 - `prefillChunk` — prompt tokens processed between active decode steps in
   HTTP serving. Model runtimes choose their own internal prefill batch sizes.
 - `maxTokens` — maximum number of tokens a request may generate. In practice:

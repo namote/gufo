@@ -3,6 +3,7 @@
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 namespace gufo::models::qwen {
 namespace {
@@ -21,12 +22,12 @@ ContinuationLayout::ContinuationLayout(const core::ModelConfig& c,
                                        hip::QwenExecutionPolicy policy,
                                        std::uint32_t context)
     : context_(context) {
-  if (!c.IsValidQwen() || !context || context > c.context_length ||
-      (policy.kv_cache_storage != hip::QwenKvCacheStorage::kFp16 &&
-       policy.kv_cache_storage != hip::QwenKvCacheStorage::kFp32) ||
-      (policy.recurrent_state_storage !=
-           hip::QwenRecurrentStateStorage::kFp32 &&
-       policy.recurrent_state_storage != hip::QwenRecurrentStateStorage::kBf16))
+  // KVarN component rows have no layout until their storage is implemented.
+  if (const auto unsupported =
+          hip::QwenExecutionPolicyUnsupportedReason(policy);
+      !unsupported.empty())
+    throw std::invalid_argument(std::string(unsupported));
+  if (!c.IsValidQwen() || !context || context > c.context_length)
     throw std::invalid_argument("invalid Qwen continuation geometry or policy");
   std::size_t fixed_total = 0, row_total = 0;
   const auto add = [&](ContinuationPart part, std::size_t row,

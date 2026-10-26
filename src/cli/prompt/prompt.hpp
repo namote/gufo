@@ -9,6 +9,7 @@
 #include <string_view>
 #include <vector>
 
+#include "src/cli/kv_cache_type.hpp"
 #include "src/core/sampling.hpp"
 #include "src/core/text_sampling_defaults.hpp"
 
@@ -42,6 +43,8 @@ struct PromptOptions {
   std::string dspark_model_path;
   std::uint32_t draft_tokens = 7;
   std::uint32_t min_draft_tokens = 1;
+  // Empty: the model default.
+  std::optional<KvCacheType> kv_cache_type;
 };
 
 /// Prints help for `gufo prompt`.

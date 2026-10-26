@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <stdexcept>
+#include <string>
 
 namespace qwen = gufo::models::qwen;
 namespace hip = gufo::hip;
@@ -66,12 +67,40 @@ void Check(bool fp16, bool bf16) {
   c.full_attention_interval = 0;
   Reject([&] { qwen::ContinuationLayout bad(c, policy, 100000); });
 }
+// KVarN rows have no continuation layout yet; they are refused by name
+// instead of being stored as FP16 or FP32 components.
+void CheckKvarnRefused() {
+  gufo::core::ModelConfig c;
+  c.num_layers = 64;
+  c.hidden_size = 5120;
+  c.num_attention_heads = 24;
+  c.intermediate_size = 17408;
+  c.context_length = 262144;
+  c.ssm_time_step_rank = 48;
+  c.ssm_inner_size = 6144;
+  for (const auto storage : {hip::QwenKvCacheStorage::kKvarnK4V2,
+                             hip::QwenKvCacheStorage::kKvarnK4V4}) {
+    hip::QwenExecutionPolicy policy;
+    policy.kv_cache_storage = storage;
+    std::string message;
+    try {
+      qwen::ContinuationLayout layout(c, policy, 100000);
+    } catch (const std::invalid_argument& e) {
+      message = e.what();
+    }
+    Require(message.find("not implemented yet") != std::string::npos &&
+                message.find(std::string(
+                    hip::QwenKvCacheStorageName(storage))) != std::string::npos,
+            "KVarN continuation layout was not refused by name");
+  }
+}
 }  // namespace
 int main() {
   try {
     for (bool fp16 : {false, true})
       for (bool bf16 : {false, true})
         Check(fp16, bf16);
+    CheckKvarnRefused();
     std::cout << "Qwen continuation geometry: PASS\n";
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';

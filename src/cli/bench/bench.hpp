@@ -9,6 +9,7 @@
 #include <string_view>
 #include <vector>
 
+#include "src/cli/kv_cache_type.hpp"
 #include "src/core/sampling.hpp"
 #include "src/models/qwen38_flash_next/rope_scaling.hpp"
 
@@ -32,6 +33,8 @@ struct BenchOptions {
   sampling::SamplingConfig sampling{.seed = 0};
   bool enable_yarn{false};
   bool verbose{false};
+  // Empty: the model default.
+  std::optional<KvCacheType> kv_cache_type;
 };
 
 /// Context a Flash-Next benchmark reserves for its largest workload: depth

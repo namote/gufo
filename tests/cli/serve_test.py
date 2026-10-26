@@ -81,6 +81,16 @@ def main():
     # The flag is a plain switch: it must not swallow the next argument.
     check(["serve", "llm", "--enable-yarn", "--model", "missing.gguf"], 1,
           "Error loading model 'missing.gguf'")
+    # One spelling per KV type; the model check runs once the GGUF is open.
+    assert "--kv-cache-type" in help_text
+    assert "fp16, kvarn-k4v2 or kvarn-k4v4" in help_text
+    for kv_type in ("fp16", "kvarn-k4v2", "kvarn-k4v4"):
+        check(["serve", "llm", "--kv-cache-type", kv_type, "--model",
+               "missing.gguf"], 1, "Error loading model 'missing.gguf'")
+    for bad in ("fp32", "FP16", "kvarn", "q8_0"):
+        check(["serve", "llm", "--kv-cache-type", bad, "--model",
+               "missing.gguf"], 2,
+              "--kv-cache-type must be fp16, kvarn-k4v2 or kvarn-k4v4")
     # One process can answer under several names; the first is primary.
     name_help = next(line for line in help_text.splitlines()
                      if "--served-model-name" in line)

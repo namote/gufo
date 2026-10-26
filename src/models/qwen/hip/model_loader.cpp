@@ -258,6 +258,13 @@ std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::Create(
     }
     return nullptr;
   }
+  if (const auto unsupported = QwenExecutionPolicyUnsupportedReason(policy);
+      !unsupported.empty()) {
+    if (error_msg != nullptr) {
+      *error_msg = unsupported;
+    }
+    return nullptr;
+  }
 
   const auto& config = model->GetConfig();
   const std::uint32_t model_context =
@@ -276,6 +283,14 @@ std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::Create(
 std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::CreateFromGguf(
     std::shared_ptr<const core::GgufReader> reader, std::string* error_msg,
     std::uint32_t max_context, QwenExecutionPolicy policy) {
+  // Refuse before mapping weights; Create repeats the same check.
+  if (const auto unsupported = QwenExecutionPolicyUnsupportedReason(policy);
+      !unsupported.empty()) {
+    if (error_msg != nullptr) {
+      *error_msg = unsupported;
+    }
+    return nullptr;
+  }
   auto model = QwenGpuModel::CreateFromGguf(std::move(reader), error_msg);
   if (model == nullptr) {
     return nullptr;

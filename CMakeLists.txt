@@ -251,10 +251,16 @@ if (ENGINE_ENABLE_HIP)
     roc::hipblaslt roc::rocblas)
 endif()
 
+# `--kv-cache-type` parsing and per-model defaults, shared by every text
+# command and the server backend.
+add_library(gufo_kv_cache_type STATIC src/cli/kv_cache_type.cpp)
+target_include_directories(gufo_kv_cache_type PUBLIC ${CMAKE_SOURCE_DIR})
+
 add_library(gufo_llm_cli STATIC
   src/cli/bench/bench.cpp
   src/cli/prompt/prompt.cpp)
-target_link_libraries(gufo_llm_cli PUBLIC gufo_core gufo_qwen38_flash_next)
+target_link_libraries(gufo_llm_cli PUBLIC gufo_core gufo_kv_cache_type
+  gufo_qwen38_flash_next)
 if(ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_llm_cli PUBLIC gufo_deepseek_v4_flash)
 endif()
@@ -638,6 +644,11 @@ if (BUILD_TESTING)
 
   add_test(NAME bench_cli_test COMMAND bench_cli_test)
   set_tests_properties(bench_cli_test PROPERTIES LABELS "cpu;server;cli")
+
+  add_executable(kv_cache_type_test tests/cli/kv_cache_type_test.cpp)
+  target_link_libraries(kv_cache_type_test PRIVATE gufo_kv_cache_type)
+  add_test(NAME kv_cache_type_test COMMAND kv_cache_type_test)
+  set_tests_properties(kv_cache_type_test PROPERTIES LABELS "cpu;cli;kv")
 
   add_executable(video_cli_test
     tests/cli/video_test.cpp

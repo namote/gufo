@@ -201,6 +201,22 @@ void TestSamplingAndReasoningFlags() {
   assert(opt->prompt_text == "Explicit prompt text");
 }
 
+void TestKvCacheTypeFlag() {
+  const auto absent = gufo::cli::ParsePromptOptions(std::array{"Hello"});
+  assert(absent && !absent->kv_cache_type.has_value());
+  const auto kvarn = gufo::cli::ParsePromptOptions(
+      std::array{"--kv-cache-type", "kvarn-k4v2", "Hello"});
+  assert(kvarn && kvarn->kv_cache_type == gufo::cli::KvCacheType::kKvarnK4V2);
+  assert(kvarn->prompt_text == "Hello");
+  const auto fp16 =
+      gufo::cli::ParsePromptOptions(std::array{"--kv-cache-type=fp16", "Hi"});
+  assert(fp16 && fp16->kv_cache_type == gufo::cli::KvCacheType::kFp16);
+  std::string err;
+  assert(!gufo::cli::ParsePromptOptions(
+      std::array{"--kv-cache-type", "fp32", "Hi"}, &err));
+  assert(err.find("--kv-cache-type must be") != std::string::npos);
+}
+
 int main() {
   TestDefaultOptions();
   TestExplicitFlags();
@@ -208,6 +224,7 @@ int main() {
   TestFlashMtpFlags();
   TestImageFlags();
   TestInvalidFlags();
+  TestKvCacheTypeFlag();
   std::cout << "All prompt CLI tests passed.\n";
   return 0;
 }

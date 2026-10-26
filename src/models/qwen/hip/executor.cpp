@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
@@ -18,6 +19,14 @@ const QwenGpuModel& RequireModel(
     throw std::invalid_argument("Qwen GPU model must not be null");
   }
   return *model;
+}
+
+// Refuses storage formats no kernel reads yet, before any device allocation.
+QwenExecutionPolicy RequireSupportedPolicy(QwenExecutionPolicy policy) {
+  if (const auto unsupported = QwenExecutionPolicyUnsupportedReason(policy);
+      !unsupported.empty())
+    throw std::invalid_argument(std::string(unsupported));
+  return policy;
 }
 
 [[nodiscard]] detail::HipGraphCaptureKey BuildGraphCaptureKey(
@@ -63,7 +72,7 @@ QwenGpuExecutor::QwenGpuExecutor(
     : model_(std::move(model)),
       weights_(RequireModel(model_).GetWeights()),
       tokenizer_(&model_->GetTokenizer()),
-      policy_(policy),
+      policy_(RequireSupportedPolicy(policy)),
       arena_(weights_.config, max_context, policy_, std::move(pass_scratch),
              std::move(kv_pool)),
       graph_key_(BuildGraphCaptureKey(weights_, policy_, max_context)),

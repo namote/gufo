@@ -3,13 +3,34 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string_view>
 
 namespace gufo::hip {
 
+// Values are serialized in compact snapshots: append, never renumber.
 enum class QwenKvCacheStorage : std::uint8_t {
   kFp32,
   kFp16,
+  // KVarN: Hadamard-rotated, normalized 4-bit keys with 2- or 4-bit values.
+  kKvarnK4V2,
+  kKvarnK4V4,
 };
+
+/// Canonical name: `--kv-cache-type` values, plus the fp32 operator reference.
+[[nodiscard]] constexpr std::string_view QwenKvCacheStorageName(
+    QwenKvCacheStorage storage) noexcept {
+  switch (storage) {
+    case QwenKvCacheStorage::kFp32:
+      return "fp32";
+    case QwenKvCacheStorage::kFp16:
+      return "fp16";
+    case QwenKvCacheStorage::kKvarnK4V2:
+      return "kvarn-k4v2";
+    case QwenKvCacheStorage::kKvarnK4V4:
+      return "kvarn-k4v4";
+  }
+  return "invalid";
+}
 
 enum class QwenRecurrentStateStorage : std::uint8_t {
   kFp32,
@@ -47,13 +68,46 @@ struct QwenExecutionPolicy {
     return recurrent_state_storage == QwenRecurrentStateStorage::kBf16;
   }
 
+  /// KVarN variant: 0 for FP16/FP32 rows, 1 for K4V2, 2 for K4V4.
+  [[nodiscard]] constexpr std::uint64_t KvarnVariant() const noexcept {
+    return kv_cache_storage == QwenKvCacheStorage::kKvarnK4V2   ? 1U
+           : kv_cache_storage == QwenKvCacheStorage::kKvarnK4V4 ? 2U
+                                                                : 0U;
+  }
+
   /// Stable bit fingerprint suitable for telemetry and graph-cache identity.
+  /// FP16 and FP32 keep their earlier values; KVarN adds bits 10-11.
   [[nodiscard]] constexpr std::uint64_t Fingerprint() const noexcept {
     return (static_cast<std::uint64_t>(fuse_qk_norm_rope_kv) << 0U) |
            (static_cast<std::uint64_t>(UsesFp16AttentionKv()) << 8U) |
-           (static_cast<std::uint64_t>(UsesBf16RecurrentState()) << 9U);
+           (static_cast<std::uint64_t>(UsesBf16RecurrentState()) << 9U) |
+           (KvarnVariant() << 10U);
   }
 };
+
+/// Why a Qwen GPU executor cannot run `policy` yet; empty when it can. Every
+/// executor, continuation layout and server load refuses through this one
+/// check, so enabling a storage format removes exactly one rejection.
+[[nodiscard]] constexpr std::string_view QwenExecutionPolicyUnsupportedReason(
+    const QwenExecutionPolicy& policy) noexcept {
+  switch (policy.kv_cache_storage) {
+    case QwenKvCacheStorage::kFp32:
+    case QwenKvCacheStorage::kFp16:
+      break;
+    case QwenKvCacheStorage::kKvarnK4V2:
+      return "--kv-cache-type kvarn-k4v2 is not implemented yet for "
+             "Qwen3.8-27B";
+    case QwenKvCacheStorage::kKvarnK4V4:
+      return "--kv-cache-type kvarn-k4v4 is not implemented yet for "
+             "Qwen3.8-27B";
+  }
+  if (policy.kv_cache_storage > QwenKvCacheStorage::kKvarnK4V4)
+    return "Qwen KV cache storage is invalid";
+  if (policy.recurrent_state_storage != QwenRecurrentStateStorage::kFp32 &&
+      policy.recurrent_state_storage != QwenRecurrentStateStorage::kBf16)
+    return "Qwen recurrent state storage is invalid";
+  return {};
+}
 
 /// Resolved route decisions for one layer invocation. This record is pure data
 /// so policy selection can be tested independently from HIP launches.

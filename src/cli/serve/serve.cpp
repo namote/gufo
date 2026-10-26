@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
+#include "src/cli/kv_cache_type.hpp"
 #include "src/cli/sampling_options.hpp"
 #include "src/cli/serve/asr_service.hpp"
 #include "src/cli/serve/embedding_service.hpp"
@@ -638,6 +639,7 @@ void PrintServeHelp(std::string_view program_name,
     std::size_t cache_disk_staging_bytes = 0;
     bool log_progress = false;
     bool enable_yarn = false;
+    std::optional<KvCacheType> kv_cache_type;
     std::string trace_path;
 
     gufo::cli::ArgParser parser(
@@ -662,6 +664,7 @@ void PrintServeHelp(std::string_view program_name,
                    "Flash-Next: static YaRN, required for --context above the "
                    "native 262144; it applies to every request",
                    "Model", &enable_yarn);
+    RegisterKvCacheTypeOption(parser, &kv_cache_type, "Model");
 
     // Sampling Defaults
     parser.AddOption(
@@ -1261,6 +1264,7 @@ int RunServe(std::span<const char* const> args) {
     std::size_t cache_disk_staging_bytes = 0;
     bool log_progress = false;
     bool enable_yarn = false;
+    std::optional<KvCacheType> kv_cache_type;
     std::string trace_path;
 
     gufo::cli::ArgParser llm_parser(
@@ -1296,6 +1300,7 @@ int RunServe(std::span<const char* const> args) {
                        "Flash-Next: static YaRN, required for --context above "
                        "the native 262144; it applies to every request",
                        "Model", &enable_yarn);
+    RegisterKvCacheTypeOption(llm_parser, &kv_cache_type, "Model");
     llm_parser.AddOption(
         "-n", "--max-tokens", "N",
         "Default new-token limit (default: -1 = until EOS or context full)",
@@ -1582,7 +1587,7 @@ int RunServe(std::span<const char* const> args) {
             .capacity_bytes = cache_ram_bytes,
             .kv_pool_bytes = kv_pool_bytes,
             .tail_checkpoints = cache_tail_checkpoints},
-        enable_yarn);
+        enable_yarn, kv_cache_type);
     loading.stop();
     if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";

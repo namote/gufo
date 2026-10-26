@@ -247,6 +247,7 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
                  "Flash-Next: static YaRN, required when depth + prompt or "
                  "generation exceeds the native 262144",
                  "Model", &opt.enable_yarn);
+  RegisterKvCacheTypeOption(parser, &opt.kv_cache_type, "Model");
   parser.AddFlag("-v", "--verbose",
                  "Print detailed timing, latency breakdown, and tok/s metrics",
                  "General", &opt.verbose);
@@ -1306,6 +1307,14 @@ int RunBench(std::span<const char* const> args) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
+  const auto kv_cache_type = ResolveKvCacheType(
+      reader->GetMetadataString("general.architecture").value_or(""),
+      opt.kv_cache_type, &err);
+  if (!kv_cache_type) {
+    std::cerr << "Error: " << err << '\n';
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
 
 #if defined(ENGINE_ENABLE_HIP)
   if (opt.enable_yarn && !IsQwen38FlashNext(*reader)) {
@@ -1366,7 +1375,8 @@ int RunBench(std::span<const char* const> args) {
       std::max<std::size_t>(4096, max_depth + max_test_tokens);
 
   auto gpu_exec = hip::QwenGpuExecutor::CreateFromGguf(
-      reader, &err, static_cast<std::uint32_t>(required_context));
+      reader, &err, static_cast<std::uint32_t>(required_context),
+      QwenExecutionPolicyFor(*kv_cache_type));
   if (!gpu_exec) {
     std::cerr << "Error creating Qwen GPU executor: " << err << "\n";
     PrintModelLoadTime(model_load_start, false);

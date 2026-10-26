@@ -220,6 +220,19 @@ void TestFlashNextYarnRule() {
 
 }  // namespace
 
+void TestKvCacheTypeOption() {
+  const auto absent = gufo::cli::ParseBenchOptions(std::array{"model.gguf"});
+  Expect(absent && !absent->kv_cache_type, "no KV type selects the default");
+  const auto kvarn = gufo::cli::ParseBenchOptions(
+      std::array{"--kv-cache-type", "kvarn-k4v4", "model.gguf"});
+  Expect(kvarn && kvarn->kv_cache_type == gufo::cli::KvCacheType::kKvarnK4V4 &&
+             kvarn->model_path == "model.gguf",
+         "benchmark KV type parses");
+  Expect(!gufo::cli::ParseBenchOptions(
+             std::array{"--kv-cache-type", "kvarn", "model.gguf"}),
+         "benchmark KV type aliases are rejected");
+}
+
 int main() {
   TestDefaultOptions();
   TestDs4SamplingOptions();
@@ -228,6 +241,7 @@ int main() {
   TestInvalidDepth();
   TestInvalidWorkload();
   TestFlashNextYarnRule();
+  TestKvCacheTypeOption();
   std::cout << "All benchmark CLI tests passed.\n";
   return 0;
 }
