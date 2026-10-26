@@ -90,3 +90,12 @@ K1a·K1b 결과와 감독 판정은 [KVarN](KVARN.md) "K1a·K1b 결과"에 있�
 - 같은 바이너리에서 비교: K1b, `opt_latev`, 새 커널, 그리고 **공통 최적화만(K 접기 없음) 쓴 AR**. 깊이 4K–256K, 질의 1·8, 바이트 하한 대비 %, 명령 구성.
 - 안 되면: 증거와 함께 보고하고, 비트 일치를 지키는 최선 조합(공통 최적화만)의 속도를 낸다.
 - 경계·GPU 규칙은 K1b-opt와 같다(K1c 에이전트가 같은 트리·GPU를 쓴다).
+
+## K1d: `common` 커널 운영 반영과 짧은 prefill 손해 (2026-10-26 사용자: "넵 진행해주세용")
+
+결과와 규칙은 [KVarN](KVARN.md) "K1b-opt2 결과", 시제품은 `tools/bench/kvarn_decode_bench.hip` `81e3fdcd`의 `common` 커널(읽기만, 이 파일은 고치지 않는다).
+
+- 운영 decode·verify 커널을 `common`으로 바꾼다: biased FP16 코드, 밑 2 softmax(`v_exp_f32`), AR padding 행 생략, AR 마지막 블록 combine, verify combine 커널, 늦은 V, tail PV 쌍 펼치기와 64토큰 tail 블록, 명시적 FMA, split은 그룹 수로만. K 접기는 하지 않는다. 저장 배치는 그대로.
+- 지금 운영의 verify = decode 비트 일치 수정(K1c-1 B)은 `common`의 규칙으로 통일한다. 비트 일치 테스트(exact=1, max_abs 0)는 계속 통과해야 한다. 운영 FP16 verify 커널에 같은 WMMA k 쌍 위험이 있는지 확인하고 보고한다(고치지 않고 보고만, fp16 경로는 그대로).
+- 짧은 prompt prefill 손해(pp512 @ d0 fp16 482 → kvarn 461, −4.4 %)의 원인을 프로파일로 찾아 고친다. 목표: d0에서 fp16 대비 손해가 측정 잡음 수준(요청별 5 %·3 ms 규칙 안이 아니라, 원인이 남지 않게).
+- 확인(32K 창 하나): 커널 단위 테스트·decode 테스트·fp16 동일성 3종, `qwen27b_kvarn_k0 --real` 32K, `gufo bench` AR·DFlash2 `-d 0,32768` fp16·k4v2·k4v4 번갈아 2회. K1c-2 수치(KVARN.md)와 같은 표로 비교한다. 256K는 하지 않는다.
