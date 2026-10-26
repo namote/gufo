@@ -183,6 +183,7 @@ __launch_bounds__(512) __global__ void KvarnQuantizeKernel(
   __shared__ double channel_result[kDim];
   __shared__ float block_part[kWaves][4];
   __shared__ unsigned value_codes[kDim * kGroup * VBits / 32];
+  __shared__ float shared_log[kDim], shared_scale[kDim];
 
   const unsigned kv = blockIdx.x;
   const unsigned group = first_group + blockIdx.y;
@@ -344,6 +345,47 @@ __launch_bounds__(512) __global__ void KvarnQuantizeKernel(
         10.0F);
     return static_cast<float>(exp(static_cast<double>(log_scale)));
   };
+  // Every lane holds the same eight token scales and every wave the same
+  // eight channel scales per lane, so each update runs once and is shared:
+  // lane i of a wave updates its token i, wave j (< 8) channel 8l + j. The
+  // values are those every lane computed before, bit for bit; the double
+  // log and exp were most of the quantizer's time.
+  const auto update_tokens = [&](const float (&stds)[8]) {
+    float s = stds[0], l = token_log[0];
+#pragma unroll
+    for (unsigned i = 1; i < 8; ++i)
+      if ((lane & 7) == i) {
+        s = stds[i];
+        l = token_log[i];
+      }
+    const float scale = update(l, s);
+#pragma unroll
+    for (unsigned i = 0; i < 8; ++i) {
+      token_log[i] = __shfl(l, i);
+      token_scale[i] = __shfl(scale, i);
+    }
+  };
+  const auto update_channels = [&](const float (&stds)[8]) {
+    if (wave < 8) {
+      float s = stds[0], l = channel_log[0];
+#pragma unroll
+      for (unsigned j = 1; j < 8; ++j)
+        if (wave == j) {
+          s = stds[j];
+          l = channel_log[j];
+        }
+      const float scale = update(l, s);
+      shared_log[8 * lane + wave] = l;
+      shared_scale[8 * lane + wave] = scale;
+    }
+    __syncthreads();
+#pragma unroll
+    for (unsigned j = 0; j < 8; ++j) {
+      channel_log[j] = shared_log[8 * lane + j];
+      channel_scale[j] = shared_scale[8 * lane + j];
+    }
+    __syncthreads();
+  };
 
   float tstd[8], cstd[8];
   token_std(tstd);
@@ -351,24 +393,17 @@ __launch_bounds__(512) __global__ void KvarnQuantizeKernel(
   float best = imbalance(tstd, cstd);
   for (int iteration = 0; iteration < 8; ++iteration) {
     // Column step (K: tokens, V: channels) on the current tile.
-#pragma unroll
-    for (unsigned i = 0; i < 8; ++i) {
-      if (key)
-        token_scale[i] = update(token_log[i], tstd[i]);
-      else
-        channel_scale[i] = update(channel_log[i], cstd[i]);
-    }
+    if (key)
+      update_tokens(tstd);
+    else
+      update_channels(cstd);
     apply(token_scale, channel_scale);
     if (key) {
       channel_std(cstd);
-#pragma unroll
-      for (unsigned j = 0; j < 8; ++j)
-        channel_scale[j] = update(channel_log[j], cstd[j]);
+      update_channels(cstd);
     } else {
       token_std(tstd);
-#pragma unroll
-      for (unsigned i = 0; i < 8; ++i)
-        token_scale[i] = update(token_log[i], tstd[i]);
+      update_tokens(tstd);
     }
     apply(token_scale, channel_scale);
     token_std(tstd);
