@@ -82,6 +82,7 @@ std::vector<Token> Fixture(const Executor& executor, std::size_t count) {
 
 void CheckStorage(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
                   QwenKvCacheStorage storage) {
+  std::vector<std::string> deferred;
   constexpr std::uint32_t kContext = 1024;
   // Ends inside group 4; the verification rows cross into group 5.
   constexpr std::uint32_t kPrompt = 636, kRows = 8, kTail = 24;
@@ -235,14 +236,18 @@ void CheckStorage(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
     const auto real_fake = summary(&Step::fake_real, from, to);
     const auto fake_control = summary(&Step::fake_control, from, to);
     for (const std::size_t q : {1U, 2U})
-      Expect(real_fake[q] <= 10 * std::max(fake_control[q], 1e-6),
-             name +
-                 ": real KVarN departs from K0 fake quant beyond the "
-                 "rounding control at positions " +
-                 std::to_string(from) + "-" + std::to_string(to - 1));
+      if (real_fake[q] > 10 * std::max(fake_control[q], 1e-6))
+        deferred.push_back(name +
+                           ": real KVarN departs from K0 fake quant beyond the "
+                           "rounding control at positions " +
+                           std::to_string(from) + "-" + std::to_string(to - 1) +
+                           (q == 1 ? " (p95)" : " (max)"));
   }
-  Expect(real_fake_agree * 100 + steps.size() >= control_agree * 100,
-         name + ": real and fake KVarN disagree on top-1 beyond the control");
+  if (real_fake_agree * 100 + steps.size() < control_agree * 100)
+    deferred.push_back(name +
+                       ": real and fake KVarN disagree on top-1 beyond the "
+                       "control");
+  // The bound is checked after the remaining checks have run.
 
   // An in-memory snapshot of this state, restored below.
   auto snapshot = kvarn.SaveSnapshot(kPrompt);
@@ -339,6 +344,9 @@ void CheckStorage(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
     (void)kvarn.ForwardToken(tokens[pos], pos);
   }
   Expect(Kl(Logits(fp16), Logits(kvarn)) < 1e-3, name + ": reset");
+  for (const auto& failure : deferred)
+    std::cerr << "FAIL " << failure << '\n';
+  Expect(deferred.empty(), name + ": real vs fake bound failed");
 }
 
 }  // namespace
@@ -359,9 +367,18 @@ int main(int argc, const char* const* argv) {
     Expect(model != nullptr, error);
     Expect(model->GetConfig().hidden_size == 5120,
            "the KVarN check requires Qwen3.8 27B");
+    bool failed = false;
     for (const auto storage :
-         {QwenKvCacheStorage::kKvarnK4V2, QwenKvCacheStorage::kKvarnK4V4})
-      CheckStorage(model, storage);
+         {QwenKvCacheStorage::kKvarnK4V2, QwenKvCacheStorage::kKvarnK4V4}) {
+      try {
+        CheckStorage(model, storage);
+      } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        failed = true;
+      }
+    }
+    if (failed)
+      return 1;
     std::cout << "Qwen27B KVarN decode checks passed.\n";
     return 0;
   } catch (const std::exception& error) {
