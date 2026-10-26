@@ -324,18 +324,13 @@ void CheckStorage(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
     (void)Logits(kvarn);
   }
 
-  // The snapshot restores the state exactly; its compact form waits for
-  // a KVarN checkpoint layout.
+  // The snapshot restores the state exactly (CheckCompact covers its
+  // compact form).
   kvarn.RestoreSnapshot(*snapshot);
   (void)kvarn.ForwardToken(verify[0], kPrompt);
   Expect(std::memcmp(Logits(kvarn).data(), first_scalar.data(),
                      vocab * sizeof(float)) == 0,
          name + ": a restored snapshot decodes differently");
-  try {
-    std::vector<std::uint8_t> payload(snapshot->CompactPayloadBytes());
-    Expect(false, name + ": compact snapshots must refuse");
-  } catch (const std::logic_error&) {
-  }
 
   // Prompt prefill. One chunk reads only its own FP16 rows, so it matches
   // the FP16 prefill but for the order of the attention's sums; two chunks
