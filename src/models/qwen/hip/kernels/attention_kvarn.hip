@@ -7,6 +7,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -1055,20 +1056,23 @@ void LaunchKvarnWriteRows(const float* k, const float* v, const KvarnKvView& kv,
 
 void LaunchKvarnFlush(const KvarnKvView& kv, std::uint32_t layers,
                       std::uint32_t first_group, std::uint32_t groups,
-                      hipStream_t stream) {
+                      hipStream_t stream, std::uint32_t first_layer) {
   if (groups == 0 || layers == 0)
     return;
   if (first_group == 0)
     throw std::invalid_argument("KVarN group 0 is the FP16 sink");
   const dim3 grid(kKvHeads, groups, 2 * layers);
-  const auto* k_rows = static_cast<const __half*>(kv.k_rows);
-  const auto* v_rows = static_cast<const __half*>(kv.v_rows);
+  const auto* k_rows =
+      static_cast<const __half*>(kv.k_rows) + first_layer * kFp16LayerElements;
+  const auto* v_rows =
+      static_cast<const __half*>(kv.v_rows) + first_layer * kFp16LayerElements;
+  std::uint8_t* records = kv.records + first_layer * kv.records_layer_pitch;
   if (kv.value_bits == 2)
-    KvarnQuantizeKernel<2><<<grid, 512, 0, stream>>>(k_rows, v_rows, kv.records,
+    KvarnQuantizeKernel<2><<<grid, 512, 0, stream>>>(k_rows, v_rows, records,
                                                      kv.records_layer_pitch,
                                                      kv.blocks, first_group);
   else if (kv.value_bits == 4)
-    KvarnQuantizeKernel<4><<<grid, 512, 0, stream>>>(k_rows, v_rows, kv.records,
+    KvarnQuantizeKernel<4><<<grid, 512, 0, stream>>>(k_rows, v_rows, records,
                                                      kv.records_layer_pitch,
                                                      kv.blocks, first_group);
   else
@@ -1084,7 +1088,7 @@ void LaunchKvarnDecodeAttention(const float* q, const float* gate,
   if (rows == 0 || rows > kKvarnMaxRows)
     throw std::invalid_argument("KVarN attention takes 1 to 8 query rows");
   if (splits == 0)
-    splits = SelectKvarnDecodeSplits(groups, kv.value_bits, rows);
+    splits = SelectKvarnDecodeSplits(groups, kv.value_bits);
   if (splits > groups || (groups != 0 && splits == 0))
     throw std::invalid_argument("KVarN splits must cover the quantized groups");
   if (d_pos == nullptr && groups != 0 && start_pos < kGroup * (1 + groups))
@@ -1118,6 +1122,29 @@ void LaunchKvarnDecodeAttention(const float* q, const float* gate,
     throw std::invalid_argument("KVarN value codes are 2 or 4 bits");
   KvarnReduceKernel<<<dim3(kHeads, rows), 256, 0, stream>>>(
       scratch.data(), gate, out_context, splits + 2, rows);
+}
+
+void LaunchKvarnPassAttention(const float* q, const float* k, const float* v,
+                              const float* gate, const KvarnKvView& kv,
+                              float* out_context, std::uint32_t layer,
+                              std::uint32_t start, std::uint32_t rows,
+                              const KvarnPassPlan& plan,
+                              std::span<float> scratch, hipStream_t stream) {
+  LaunchKvarnWriteRows(k, v, kv, layer, nullptr, start, rows, stream);
+  const std::uint32_t split =
+      plan.boundary != 0 ? std::min(plan.boundary - start, rows) : rows;
+  if (plan.boundary != 0)
+    LaunchKvarnFlush(kv, 1, (plan.boundary >> kKvarnGroupShift) - 1, 1, stream,
+                     layer);
+  constexpr std::size_t kWidth = std::size_t{kHeads} * kDim;
+  if (split != 0)
+    LaunchKvarnDecodeAttention(q, gate, kv, out_context, layer, nullptr, start,
+                               split, plan.read_groups, 0, scratch, stream);
+  if (split != rows)
+    LaunchKvarnDecodeAttention(
+        q + split * kWidth, gate == nullptr ? nullptr : gate + split * kWidth,
+        kv, out_context + split * kWidth, layer, nullptr, start + split,
+        rows - split, plan.read_groups + 1, 0, scratch, stream);
 }
 
 }  // namespace gufo::hip

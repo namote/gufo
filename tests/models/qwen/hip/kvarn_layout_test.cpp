@@ -70,28 +70,29 @@ void TestSizes() {
 }
 
 void TestSplits() {
-  Expect(SelectKvarnDecodeSplits(0, 2, 1) == 0, "no groups, no splits");
-  Expect(SelectKvarnDecodeSplits(5, 2, 1) == 5, "splits capped by groups");
+  Expect(SelectKvarnDecodeSplits(0, 2) == 0, "no groups, no splits");
+  Expect(SelectKvarnDecodeSplits(5, 2) == 5, "splits capped by groups");
   // 4K, 32K, 64K, 128K, 256K depths (groups after the sink).
-  for (const int bits : {2, 4})
-    for (const std::uint32_t rows : {1U, 8U}) {
-      const bool v4_decode = bits == 4 && rows == 1;
-      Expect(SelectKvarnDecodeSplits(31, bits, rows) == 18, "4K splits");
-      Expect(SelectKvarnDecodeSplits(255, bits, rows) == (v4_decode ? 38 : 18),
-             "32K splits");
-      Expect(SelectKvarnDecodeSplits(511, bits, rows) == (v4_decode ? 38 : 18),
-             "64K splits");
-      Expect(SelectKvarnDecodeSplits(1023, bits, rows) == 38, "128K splits");
-      Expect(SelectKvarnDecodeSplits(2047, bits, rows) == kKvarnMaxSplits,
-             "256K splits");
-    }
+  for (const int bits : {2, 4}) {
+    Expect(SelectKvarnDecodeSplits(31, bits) == 18, "4K splits");
+    Expect(SelectKvarnDecodeSplits(255, bits) == (bits == 4 ? 38 : 18),
+           "32K splits");
+    Expect(SelectKvarnDecodeSplits(511, bits) == (bits == 4 ? 38 : 18),
+           "64K splits");
+    Expect(SelectKvarnDecodeSplits(1023, bits) == 38, "128K splits");
+    Expect(SelectKvarnDecodeSplits(2047, bits) == kKvarnMaxSplits,
+           "256K splits");
+  }
+  Expect(KvarnReadGroups(0) == 0 && KvarnReadGroups(255) == 0 &&
+             KvarnReadGroups(256) == 1 && KvarnReadGroups(383) == 1 &&
+             KvarnReadGroups(384) == 2,
+         "a query reads every group that ended at or before it");
 }
 
 void TestTail() {
   KvarnTail tail;
-  const auto apply = [&](std::uint32_t start, std::uint32_t rows,
-                         std::uint32_t confirmed) {
-    const auto plan = PlanKvarnPass(tail, start, rows, confirmed);
+  const auto apply = [&](std::uint32_t start, std::uint32_t rows) {
+    const auto plan = PlanKvarnPass(tail, start, rows);
     if (plan.error.empty()) {
       tail.flushed_end = plan.flushed_end;
       tail.written_end = std::max(tail.written_end, start + rows);
@@ -100,56 +101,64 @@ void TestTail() {
   };
   // Decode through the sink: nothing to quantize.
   for (std::uint32_t pos = 0; pos < 256; ++pos) {
-    const auto plan = apply(pos, 1, pos);
-    Expect(plan.error.empty() && plan.groups == 0 && plan.flushed_end == 128,
+    const auto plan = apply(pos, 1);
+    Expect(plan.error.empty() && plan.groups == 0 && plan.boundary == 0 &&
+               plan.read_groups == 0 && plan.flushed_end == 128,
            "no flush before the first group completes");
   }
-  // Position 256 sees group 1 complete and confirmed.
-  auto plan = apply(256, 1, 256);
+  // Position 256 reads group 1, quantized first.
+  auto plan = apply(256, 1);
   Expect(plan.error.empty() && plan.first_group == 1 && plan.groups == 1 &&
-             plan.flushed_end == 256,
+             plan.read_groups == 1 && plan.flushed_end == 256,
          "group 1 flushes at 256");
-  // A pinned rollback point at 300 keeps rows past it FP16 ...
-  for (std::uint32_t pos = 257; pos < 400; ++pos)
-    Expect(apply(pos, 1, 300).groups == 0, "speculative rows stay FP16");
-  // Confirming 400 quantizes group 2.
-  plan = apply(400, 8, 400);
-  Expect(plan.error.empty() && plan.first_group == 2 && plan.groups == 1 &&
-             plan.flushed_end == 384,
-         "group 2 flushes once confirmed");
-  // Rewinding inside the tail keeps the groups; into group 2 reopens it
-  // from the ring.
-  plan = apply(390, 8, 390);
-  Expect(plan.error.empty() && plan.groups == 0 && plan.flushed_end == 384,
+  for (std::uint32_t pos = 257; pos < 380; ++pos)
+    Expect(apply(pos, 1).groups == 0, "decode inside group 2");
+  // Verification rows 380-387 cross the end of group 2 at 384: rows from
+  // 384 read it quantized, as decode steps there do.
+  plan = apply(380, 8);
+  Expect(plan.error.empty() && plan.groups == 0 && plan.read_groups == 1 &&
+             plan.boundary == 384 && plan.flushed_end == 384,
+         "a group ending inside a pass is quantized in the pass");
+  // Rejected drafts: the next pass starts at 382, before the boundary, and
+  // reopens group 2 from the ring.
+  plan = apply(382, 8);
+  Expect(plan.error.empty() && plan.groups == 0 && plan.read_groups == 1 &&
+             plan.boundary == 384 && plan.flushed_end == 384,
+         "a rewind before a group end reopens and requantizes it");
+  // A rewind inside the tail keeps the groups.
+  plan = apply(386, 1);
+  Expect(plan.error.empty() && plan.groups == 0 && plan.read_groups == 2 &&
+             plan.boundary == 0 && plan.flushed_end == 384,
          "a rewind inside the tail keeps the groups");
-  plan = apply(300, 8, 300);
-  Expect(plan.error.empty() && plan.groups == 0 && plan.flushed_end == 256,
+  plan = apply(300, 8);
+  Expect(plan.error.empty() && plan.groups == 0 && plan.read_groups == 1 &&
+             plan.flushed_end == 256,
          "a rewind into a quantized group reopens it");
-  // A pass that would overrun the ring quantizes an unconfirmed group.
-  plan = PlanKvarnPass({.flushed_end = 256, .written_end = 400}, 400, 120, 300);
-  Expect(plan.error.empty() && plan.first_group == 2 && plan.groups == 1 &&
-             plan.flushed_end == 384,
-         "a full ring forces the flush");
   // Its FP16 rows are overwritten once the ring wraps past it.
   tail.written_end = 600;
-  plan = PlanKvarnPass(tail, 200, 1, 200);
+  plan = PlanKvarnPass(tail, 200, 1);
   Expect(!plan.error.empty(), "a rewind past the ring is refused");
-  // Verification widths up to the ring.
+  // Pass widths up to one group.
   KvarnTail fresh{.flushed_end = 1024, .written_end = 1100};
-  plan = PlanKvarnPass(fresh, 1100, 8, 1100);
+  plan = PlanKvarnPass(fresh, 1100, 8);
   Expect(plan.error.empty() && plan.first_group == 8 && plan.groups == 0 &&
-             plan.flushed_end == 1024,
+             plan.read_groups == 7 && plan.flushed_end == 1024,
          "verification after the last group");
-  plan = PlanKvarnPass(fresh, 1151, 129, 1151);
-  Expect(plan.error.empty() && plan.groups == 0, "the widest pass fits");
-  plan = PlanKvarnPass(fresh, 1151, 130, 1151);
-  Expect(!plan.error.empty(), "a pass wider than the ring is refused");
-  // Long prompts flush every complete group before the pass.
-  KvarnTail prompt;
-  plan = PlanKvarnPass(prompt, 4096, 100, 4096);
+  plan = PlanKvarnPass(fresh, 1151, 128);
+  Expect(plan.error.empty() && plan.groups == 0 && plan.boundary == 1152 &&
+             plan.flushed_end == 1152,
+         "the widest pass fits");
+  plan = PlanKvarnPass(fresh, 1151, 129);
+  Expect(!plan.error.empty(), "a pass wider than a group is refused");
+  // Every group ending before a pass is quantized first.
+  KvarnTail prompt{.flushed_end = 128, .written_end = 4096};
+  plan = PlanKvarnPass(prompt, 4096, 100);
   Expect(plan.error.empty() && plan.first_group == 1 && plan.groups == 31 &&
              plan.flushed_end == 4096,
-         "a pass flushes all complete confirmed groups");
+         "a pass flushes all complete groups before it");
+  // The sink end is not a group end.
+  plan = PlanKvarnPass(KvarnTail{}, 120, 8);
+  Expect(plan.error.empty() && plan.boundary == 0, "the sink end");
 }
 
 }  // namespace

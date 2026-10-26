@@ -36,12 +36,13 @@ void LaunchKvarnWriteRows(const float* k, const float* v, const KvarnKvView& kv,
                           std::uint32_t start_pos, std::uint32_t rows,
                           hipStream_t stream);
 
-/// Quantizes groups [first_group, first_group + groups) of every layer from
-/// the FP16 tail ring into the record plane. first_group >= 1 (group 0 is
-/// the sink) and the ring must still hold every row of those groups.
+/// Quantizes groups [first_group, first_group + groups) of layers
+/// [first_layer, first_layer + layers) from the FP16 tail ring into the
+/// record plane. first_group >= 1 (group 0 is the sink) and the ring must
+/// still hold every row of those groups.
 void LaunchKvarnFlush(const KvarnKvView& kv, std::uint32_t layers,
                       std::uint32_t first_group, std::uint32_t groups,
-                      hipStream_t stream);
+                      hipStream_t stream, std::uint32_t first_layer = 0);
 
 /// Causal attention of `rows` (1 to kKvarnMaxRows) consecutive query rows
 /// ([row][24][256] floats, roped) over the sink, `groups` quantized groups
@@ -57,6 +58,18 @@ void LaunchKvarnDecodeAttention(const float* q, const float* gate,
                                 std::uint32_t start_pos, std::uint32_t rows,
                                 std::uint32_t groups, std::uint32_t splits,
                                 std::span<float> scratch, hipStream_t stream);
+
+/// One layer of a pass over rows [start, start + rows) planned by
+/// PlanKvarnPass: writes the rows, quantizes the group ending inside the
+/// pass once its rows are written (plan.boundary), and attends rows before
+/// the boundary over plan.read_groups groups and rows from it over one
+/// more, each row as a decode step at its position does.
+void LaunchKvarnPassAttention(const float* q, const float* k, const float* v,
+                              const float* gate, const KvarnKvView& kv,
+                              float* out_context, std::uint32_t layer,
+                              std::uint32_t start, std::uint32_t rows,
+                              const KvarnPassPlan& plan,
+                              std::span<float> scratch, hipStream_t stream);
 
 }  // namespace gufo::hip
 

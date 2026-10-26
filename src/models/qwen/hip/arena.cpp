@@ -1067,18 +1067,16 @@ KvarnKvView QwenGpuArena::GetKvarnView() const noexcept {
           .v_rows = kvarn_.d_rows + kvarn_.plane_elements};
 }
 
-std::uint32_t QwenGpuArena::PrepareKvarnPass(std::uint32_t start,
+KvarnPassPlan QwenGpuArena::PrepareKvarnPass(std::uint32_t start,
                                              std::uint32_t rows,
                                              hipStream_t pass_stream) {
   if (!UsesKvarn())
     throw std::logic_error("Qwen arena does not store KVarN attention KV");
   if (start > max_context_ || rows > max_context_ - start)
     throw std::length_error("KVarN pass exceeds the context length");
-  // Rows before a pinned rollback point are confirmed; drafts past it may
-  // still be rewound (RestoreState) and stay FP16 while the ring holds them.
-  const std::uint32_t confirmed =
-      has_saved_state_ ? std::min(start, saved_context_) : start;
-  const auto plan = PlanKvarnPass(kvarn_.tail, start, rows, confirmed);
+  // Which groups a row reads depends on its position only (KvarnReadGroups);
+  // a rewind reopens the groups past it from the ring.
+  const auto plan = PlanKvarnPass(kvarn_.tail, start, rows);
   if (!plan.error.empty())
     throw std::logic_error(std::string(plan.error) + " (rows " +
                            std::to_string(start) + "-" +
@@ -1088,7 +1086,7 @@ std::uint32_t QwenGpuArena::PrepareKvarnPass(std::uint32_t start,
                    plan.first_group, plan.groups, pass_stream);
   kvarn_.tail.flushed_end = plan.flushed_end;
   kvarn_.tail.written_end = std::max(kvarn_.tail.written_end, start + rows);
-  return (plan.flushed_end >> kKvarnGroupShift) - 1;
+  return plan;
 }
 
 void QwenGpuArena::RequireSnapshotStorage() const {

@@ -38,7 +38,9 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
   // KVarN quantizes the groups completed before this row first; the
   // captured graph (rows below the first group's end) never quantizes.
   const std::uint32_t kvarn_groups =
-      arena_.UsesKvarn() ? arena_.PrepareKvarnPass(pos, 1, arena_.stream) : 0;
+      arena_.UsesKvarn()
+          ? arena_.PrepareKvarnPass(pos, 1, arena_.stream).read_groups
+          : 0;
   arena_.MarkSsmReplayPosition(pos);
   // One recurrent pass per step. Its buffer pair is part of the graph key below
   // because the captured launches bake the state pointers.

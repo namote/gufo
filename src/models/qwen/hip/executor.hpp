@@ -522,11 +522,10 @@ public:
     return {kvarn_.d_scratch, kvarn_.scratch_elements};
   }
   /// Before a pass writes rows [start, start + rows): quantizes, on
-  /// `pass_stream`, the complete groups before the pass that the tail plan
-  /// names (only rows before a pinned SaveState point unless the ring would
-  /// overflow), and returns the quantized group count the pass's attention
-  /// reads. Throws std::logic_error for a pass the tail cannot hold.
-  std::uint32_t PrepareKvarnPass(std::uint32_t start, std::uint32_t rows,
+  /// `pass_stream`, every group that ended at or before `start`, and returns
+  /// the plan the pass's layers follow (LaunchKvarnPassAttention). Throws
+  /// std::logic_error for a pass the tail cannot hold.
+  KvarnPassPlan PrepareKvarnPass(std::uint32_t start, std::uint32_t rows,
                                  hipStream_t pass_stream);
   [[nodiscard]] QwenRecurrentStateStorage GetRecurrentStateStorage()
       const noexcept {

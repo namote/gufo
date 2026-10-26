@@ -137,16 +137,26 @@ inline constexpr std::uint32_t kKvarnFp16Tokens =
 /// Quantized splits of one KVarN attention launch over `groups` quantized
 /// groups; the sink and the tail add one split each. From the K1b sweep
 /// (KVARN.md "K1a·K1b 결과", splits 18/32/38/64/128 at 4K-256K): 18 fills
-/// whole rounds of resident blocks up to 64K, 38 beyond, and K4V4 decode
-/// reads enough per group to prefer 38 from 12K.
+/// whole rounds of resident blocks up to 64K, 38 beyond, and K4V4 reads
+/// enough per group to prefer 38 from 12K. The count depends on the groups
+/// only, never on the query rows, so a verification row adds its partials
+/// in the order a decode step at its position does.
 [[nodiscard]] constexpr std::uint32_t SelectKvarnDecodeSplits(
-    std::uint32_t groups, int value_bits, std::uint32_t rows) {
+    std::uint32_t groups, int value_bits) {
   if (groups == 0)
     return 0;
   std::uint32_t splits = groups < 512 ? 18 : kKvarnMaxSplits;
-  if (value_bits == 4 && rows == 1 && groups >= 96)
+  if (value_bits == 4 && groups >= 96)
     splits = kKvarnMaxSplits;
   return std::min(splits, groups);
+}
+
+/// Quantized groups the query at `position` reads: every group that ended
+/// at or before it. The rule depends on the position only, so decode,
+/// verification and a replay after a rewind read the same values.
+[[nodiscard]] constexpr std::uint32_t KvarnReadGroups(std::uint32_t position) {
+  const std::uint32_t groups = position >> kKvarnGroupShift;
+  return groups > 1 ? groups - 1 : 0;
 }
 
 /// Floats of KVarN split partials for `rows` query rows and `splits`
@@ -165,30 +175,40 @@ struct KvarnTail {
   std::uint32_t written_end{0};
 };
 
-/// What a pass writing rows [start, start + rows) does to the tail first:
-/// quantize groups [first_group, first_group + groups), leaving flushed_end.
-/// Groups wholly before `confirmed` are quantized (speculative rows past a
-/// pinned rollback point stay FP16), more only when the pass would not fit
-/// the ring otherwise. A pass starting inside a quantized group returns it
-/// to FP16 while the ring still holds its rows. `error` names a pass that
+/// Most rows of one pass: a pass meets at most one group end.
+inline constexpr std::uint32_t kKvarnMaxPassRows = kKvarnGroupTokens;
+
+/// What a pass writing rows [start, start + rows) does to the tail. Before
+/// the pass, groups [first_group, first_group + groups) are quantized, so
+/// that the rows before `boundary` read `read_groups` groups (KvarnReadGroups
+/// of `start`). When a group ends inside the pass, at `boundary` (zero when
+/// none does), each layer quantizes it once its rows are written, and rows
+/// from `boundary` on read read_groups + 1. flushed_end is the tail after
+/// the pass. A pass starting inside a quantized group returns it to FP16
+/// first, while the ring still holds its rows. `error` names a pass that
 /// cannot run.
 struct KvarnPassPlan {
   std::uint32_t first_group{0};
   std::uint32_t groups{0};
+  std::uint32_t read_groups{0};
+  std::uint32_t boundary{0};
   std::uint32_t flushed_end{kKvarnSinkTokens};
   std::string_view error;
 };
 
 [[nodiscard]] constexpr KvarnPassPlan PlanKvarnPass(const KvarnTail& tail,
                                                     std::uint32_t start,
-                                                    std::uint32_t rows,
-                                                    std::uint32_t confirmed) {
+                                                    std::uint32_t rows) {
   constexpr std::uint32_t kRing = kKvarnTailRingTokens;
   const auto group_floor = [](std::uint32_t position) {
     return std::max(kKvarnSinkTokens,
                     position >> kKvarnGroupShift << kKvarnGroupShift);
   };
   KvarnPassPlan plan;
+  if (rows == 0 || rows > kKvarnMaxPassRows) {
+    plan.error = "KVarN passes write 1 to 128 rows";
+    return plan;
+  }
   std::uint32_t flushed = tail.flushed_end;
   if (start < flushed) {
     const std::uint32_t reopened = group_floor(start);
@@ -201,18 +221,18 @@ struct KvarnPassPlan {
     flushed = reopened;
   }
   const std::uint32_t end = start + rows;
-  std::uint32_t target =
-      std::max(flushed, group_floor(std::min(start, confirmed)));
-  const auto overflows = [&] { return end > target && end - target > kRing; };
-  if (overflows())
-    target = std::max(flushed, group_floor(start));
-  if (overflows()) {
+  const std::uint32_t target = group_floor(start);
+  if (end > target && end - target > kRing) {
     plan.error = "KVarN pass writes more rows than the FP16 tail ring holds";
     return plan;
   }
+  const std::uint32_t last_end = group_floor(end - 1);
   plan.first_group = flushed >> kKvarnGroupShift;
   plan.groups = (target - flushed) >> kKvarnGroupShift;
-  plan.flushed_end = target;
+  plan.read_groups = KvarnReadGroups(start);
+  plan.boundary =
+      last_end > start && last_end > kKvarnSinkTokens ? last_end : 0;
+  plan.flushed_end = plan.boundary != 0 ? plan.boundary : target;
   return plan;
 }
 

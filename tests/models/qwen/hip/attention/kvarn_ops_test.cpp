@@ -522,8 +522,7 @@ void TestAttention(int bits, unsigned groups, unsigned tail, unsigned rows,
       [&](unsigned t, unsigned kv) { return row_of(vf, vq, t, kv); });
 
   const unsigned used_splits =
-      splits != 0 ? splits
-                  : gufo::hip::SelectKvarnDecodeSplits(groups, bits, rows);
+      splits != 0 ? splits : gufo::hip::SelectKvarnDecodeSplits(groups, bits);
   DeviceBuffer<float> dq(q), dgate(gate), out(q.size());
   DeviceBuffer<float> scratch(
       gufo::hip::KvarnScratchElements(rows, used_splits));
@@ -547,6 +546,41 @@ void TestAttention(int bits, unsigned groups, unsigned tail, unsigned rows,
   Check(error < 2e-3, line);
 }
 
+// One pass as the arena drives it: plan, quantize the groups before it,
+// write every layer's rows, quantize a group that ends inside it.
+gufo::hip::KvarnPassPlan Pass(Storage& storage, gufo::hip::KvarnTail& tail,
+                              const DeviceBuffer<float>& k,
+                              const DeviceBuffer<float>& v, unsigned start,
+                              unsigned n) {
+  const auto plan = gufo::hip::PlanKvarnPass(tail, start, n);
+  if (!plan.error.empty())
+    throw std::logic_error(std::string(plan.error));
+  gufo::hip::LaunchKvarnFlush(storage.View(), kLayers, plan.first_group,
+                              plan.groups, nullptr);
+  tail.flushed_end = plan.flushed_end;
+  tail.written_end = std::max(tail.written_end, start + n);
+  for (unsigned layer = 0; layer < kLayers; ++layer)
+    gufo::hip::LaunchKvarnWriteRows(k.data() + std::size_t{start} * kRowWidth,
+                                    v.data() + std::size_t{start} * kRowWidth,
+                                    storage.View(), layer, nullptr, start, n,
+                                    nullptr);
+  if (plan.boundary != 0)
+    gufo::hip::LaunchKvarnFlush(storage.View(), kLayers,
+                                plan.boundary / kGroup - 1, 1, nullptr);
+  return plan;
+}
+
+// Positions [from, to) in passes of up to 100 rows.
+void Feed(Storage& storage, gufo::hip::KvarnTail& tail,
+          const DeviceBuffer<float>& k, const DeviceBuffer<float>& v,
+          unsigned from, unsigned to) {
+  for (unsigned start = from; start < to;) {
+    const unsigned n = std::min(100U, to - start);
+    (void)Pass(storage, tail, k, v, start, n);
+    start += n;
+  }
+}
+
 // Write -> flush -> attend as the arena drives it, against attention over
 // the K0 fake-quantized FP16 rows in the original frame.
 void TestEndToEnd(int bits, unsigned length, unsigned rows) {
@@ -554,28 +588,12 @@ void TestEndToEnd(int bits, unsigned length, unsigned rows) {
   Storage storage(bits, logical_blocks);
   const auto all = RandomRows(length, 77 + length + bits);
   gufo::hip::KvarnTail tail;
-  std::uint32_t groups = 0;
   DeviceBuffer<float> k(all.k), v(all.v);
-  // Prompt rows in passes of 100, then the verification rows.
-  for (unsigned start = 0; start < length;) {
-    const unsigned n = start + rows >= length
-                           ? length - start
-                           : std::min(100U, length - rows - start);
-    const auto plan = gufo::hip::PlanKvarnPass(tail, start, n, start);
-    if (!plan.error.empty())
-      throw std::logic_error(std::string(plan.error));
-    gufo::hip::LaunchKvarnFlush(storage.View(), kLayers, plan.first_group,
-                                plan.groups, nullptr);
-    tail.flushed_end = plan.flushed_end;
-    tail.written_end = std::max(tail.written_end, start + n);
-    for (unsigned layer = 0; layer < kLayers; ++layer)
-      gufo::hip::LaunchKvarnWriteRows(k.data() + std::size_t{start} * kRowWidth,
-                                      v.data() + std::size_t{start} * kRowWidth,
-                                      storage.View(), layer, nullptr, start, n,
-                                      nullptr);
-    groups = tail.flushed_end / kGroup - 1;
-    start += n;
-  }
+  Feed(storage, tail, k, v, 0, length - rows);
+  const auto plan = Pass(storage, tail, k, v, length - rows, rows);
+  if (plan.boundary != 0)
+    throw std::logic_error("end-to-end case crosses a group end");
+  const std::uint32_t groups = plan.read_groups;
   const auto config =
       *kvarn::ParseConfig(bits == 2 ? "kvarn_k4v2_g128" : "kvarn_k4v4_g128");
   auto kh = ToHalf(all.k), vh = ToHalf(all.v);
@@ -598,7 +616,7 @@ void TestEndToEnd(int bits, unsigned length, unsigned rows) {
       });
   DeviceBuffer<float> dq(q), dgate(gate), out(q.size());
   DeviceBuffer<float> scratch(gufo::hip::KvarnScratchElements(
-      rows, gufo::hip::SelectKvarnDecodeSplits(groups, bits, rows)));
+      rows, gufo::hip::SelectKvarnDecodeSplits(groups, bits)));
   gufo::hip::LaunchKvarnDecodeAttention(
       dq.data(), dgate.data(), storage.View(), out.data(), kLayer, nullptr,
       length - rows, rows, groups, 0, {scratch.data(), scratch.size()},
@@ -611,6 +629,71 @@ void TestEndToEnd(int bits, unsigned length, unsigned rows) {
                 "vs_k0_fake_quant_rel=%.3e",
                 bits, length, groups, rows, error);
   Check(error < 3e-3, line);
+}
+
+// Verification rows equal decode steps bit for bit: one pass of `rows`
+// rows after `start` history rows (LaunchKvarnPassAttention, which
+// quantizes a group ending inside the pass), against one pass per row.
+void TestVerifyMatchesDecode(int bits, unsigned start, unsigned rows) {
+  const unsigned length = start + rows;
+  const auto all = RandomRows(length, 91 + length + bits);
+  DeviceBuffer<float> k(all.k), v(all.v);
+  const std::size_t width = std::size_t{kHeads} * kDim;
+  const auto q = RandomFloats(rows * width, 13 + start, 1.0F);
+  const auto gate = RandomFloats(q.size(), 14 + start, 1.0F);
+  DeviceBuffer<float> dq(q), dgate(gate);
+  DeviceBuffer<float> scratch(
+      gufo::hip::KvarnScratchElements(rows, gufo::hip::kKvarnMaxSplits));
+  const std::span<float> scratch_span{scratch.data(), scratch.size()};
+
+  Storage verify_storage(bits, length / 256 + 1);
+  gufo::hip::KvarnTail verify_tail;
+  Feed(verify_storage, verify_tail, k, v, 0, start);
+  const auto plan = gufo::hip::PlanKvarnPass(verify_tail, start, rows);
+  if (!plan.error.empty())
+    throw std::logic_error(std::string(plan.error));
+  gufo::hip::LaunchKvarnFlush(verify_storage.View(), kLayers, plan.first_group,
+                              plan.groups, nullptr);
+  DeviceBuffer<float> verify_out(q.size());
+  for (unsigned layer = 0; layer < kLayers; ++layer)
+    gufo::hip::LaunchKvarnPassAttention(
+        dq.data(), k.data() + std::size_t{start} * kRowWidth,
+        v.data() + std::size_t{start} * kRowWidth, dgate.data(),
+        verify_storage.View(), verify_out.data(), layer, start, rows, plan,
+        scratch_span, nullptr);
+  HIP_CHECK(hipDeviceSynchronize());
+  const auto verified = verify_out.CopyToHost();
+
+  Storage decode_storage(bits, length / 256 + 1);
+  gufo::hip::KvarnTail decode_tail;
+  Feed(decode_storage, decode_tail, k, v, 0, start);
+  DeviceBuffer<float> decode_out(q.size());
+  for (unsigned r = 0; r < rows; ++r) {
+    const auto step = Pass(decode_storage, decode_tail, k, v, start + r, 1);
+    gufo::hip::LaunchKvarnDecodeAttention(
+        dq.data() + r * width, dgate.data() + r * width, decode_storage.View(),
+        decode_out.data() + r * width, kLayer, nullptr, start + r, 1,
+        step.read_groups, 0, scratch_span, nullptr);
+  }
+  HIP_CHECK(hipDeviceSynchronize());
+  const auto decoded = decode_out.CopyToHost();
+  unsigned differing_rows = 0;
+  float max_abs = 0;
+  for (unsigned r = 0; r < rows; ++r) {
+    bool same = true;
+    for (std::size_t i = r * width; i < (r + 1) * width; ++i) {
+      if (std::memcmp(&verified[i], &decoded[i], sizeof(float)) != 0)
+        same = false;
+      max_abs = std::max(max_abs, std::abs(verified[i] - decoded[i]));
+    }
+    differing_rows += !same;
+  }
+  char line[256];
+  std::snprintf(line, sizeof(line),
+                "verify==decode k4v%d start=%u rows=%u boundary=%u "
+                "differing_rows=%u max_abs=%.3e",
+                bits, start, rows, plan.boundary, differing_rows, max_abs);
+  Check(differing_rows == 0, line);
 }
 
 // `time`: microseconds per attention launch at the production split policy,
@@ -652,8 +735,7 @@ void TimeAttention() {
       const auto q =
           RandomFloats(std::size_t{shape.rows} * kHeads * kDim, 1, 1.0F);
       DeviceBuffer<float> dq(q), out(q.size());
-      const unsigned splits =
-          gufo::hip::SelectKvarnDecodeSplits(groups, bits, shape.rows);
+      const unsigned splits = gufo::hip::SelectKvarnDecodeSplits(groups, bits);
       DeviceBuffer<float> scratch(
           gufo::hip::KvarnScratchElements(shape.rows, splits));
       const unsigned start = shape.depth - shape.rows;
@@ -729,6 +811,11 @@ int main(int argc, char** argv) {
                       c.device_position);
       TestEndToEnd(bits, 1000, 1);
       TestEndToEnd(bits, 1000, 8);
+      TestVerifyMatchesDecode(bits, 100, 8);    // the sink
+      TestVerifyMatchesDecode(bits, 700, 8);    // inside a group
+      TestVerifyMatchesDecode(bits, 636, 8);    // across the end of group 4
+      TestVerifyMatchesDecode(bits, 254, 3);    // across the end of group 1
+      TestVerifyMatchesDecode(bits, 16380, 8);  // 38 splits for K4V4
     }
   } catch (const std::exception& error) {
     std::cerr << "Qwen KVarN ops test: " << error.what() << '\n';
