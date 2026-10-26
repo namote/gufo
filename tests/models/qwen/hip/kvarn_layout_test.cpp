@@ -65,6 +65,29 @@ void TestSizes() {
              KvarnFp16Row(384) == 128 && KvarnFp16Row(640) == 128 &&
              KvarnFp16Row(641) == 129,
          "sink then ring rows");
+  // The same pool bytes hold 65536 / 13440 (k4v2) and 65536 / 17536
+  // (k4v4) times the FP16 tokens.
+  {
+    const std::size_t bytes = 8ULL << 30;
+    const auto fp16_pool = SizeQwenKvPool(fp16, 32768, 0, bytes);
+    const auto k4v2_pool = SizeQwenKvPool(
+        QwenKvBlockPlanes(kLayers, kKv, kDim, QwenKvCacheStorage::kKvarnK4V2),
+        32768, 0, bytes);
+    const auto k4v4_pool = SizeQwenKvPool(
+        QwenKvBlockPlanes(kLayers, kKv, kDim, QwenKvCacheStorage::kKvarnK4V4),
+        32768, 0, bytes);
+    Expect(fp16_pool.block_bytes == 256ULL * 65536 &&
+               k4v2_pool.block_bytes == 256ULL * 13440 &&
+               k4v4_pool.block_bytes == 256ULL * 17536,
+           "pool block bytes");
+    Expect(fp16_pool.blocks == bytes / (256ULL * 65536) &&
+               k4v2_pool.blocks == bytes / (256ULL * 13440) &&
+               k4v4_pool.blocks == bytes / (256ULL * 17536),
+           "pool blocks from bytes");
+    Expect(fp16_pool.session_blocks == 128 && k4v2_pool.session_blocks == 128,
+           "blocks per session");
+    Expect(SizeQwenKvPool(fp16, 32768, 3, 0).blocks == 384, "sessions sizing");
+  }
   Expect(KvarnScratchElements(8, 38) == 24ULL * 8 * 44 * 258,
          "scratch elements");
 }

@@ -1562,12 +1562,11 @@ private:
     const auto planes = hip::QwenKvBlockPlanes(
         config.FullAttentionLayerCount(), config.num_key_value_heads,
         config.head_dim, execution_policy_.kv_cache_storage);
-    const std::size_t block_bytes =
-        hip::KvBlockGeometry(planes, 1).bytes_per_block();
-    const std::size_t session_blocks =
-        hip::KvBlockGeometry::BlocksFor(max_context_);
-    const std::size_t blocks =
-        bytes != 0 ? bytes / block_bytes : sessions * session_blocks;
+    const auto size =
+        hip::SizeQwenKvPool(planes, max_context_, sessions, bytes);
+    const std::size_t block_bytes = size.block_bytes;
+    const std::size_t session_blocks = size.session_blocks;
+    const std::size_t blocks = size.blocks;
     // One full-context session must fit.
     if (blocks < session_blocks ||
         blocks > std::numeric_limits<std::uint32_t>::max())

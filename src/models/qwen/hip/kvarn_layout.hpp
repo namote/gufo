@@ -114,6 +114,26 @@ static_assert(KvarnRecord(2).bytes == 26880 && KvarnRecord(4).bytes == 35072);
   return {rows, rows};
 }
 
+/// A shared Qwen KV block pool for `planes`: block bytes, the blocks one
+/// `max_context` session needs, and the pool's blocks: `pool_bytes` worth,
+/// or `sessions` full sessions when it is zero. The same bytes hold about
+/// 4.9 (k4v2) or 3.7 (k4v4) times the FP16 tokens.
+struct QwenKvPoolSize {
+  std::size_t block_bytes{0};
+  std::size_t session_blocks{0};
+  std::size_t blocks{0};
+};
+[[nodiscard]] inline QwenKvPoolSize SizeQwenKvPool(
+    const std::vector<KvBlockPlane>& planes, std::uint32_t max_context,
+    std::size_t sessions, std::size_t pool_bytes) {
+  QwenKvPoolSize size;
+  size.block_bytes = KvBlockGeometry(planes, 1).bytes_per_block();
+  size.session_blocks = KvBlockGeometry::BlocksFor(max_context);
+  size.blocks = pool_bytes != 0 ? pool_bytes / size.block_bytes
+                                : sessions * size.session_blocks;
+  return size;
+}
+
 /// Token rows per layer of a sequence's FP16 sink and tail plane.
 inline constexpr std::uint32_t kKvarnFp16Tokens =
     kKvarnSinkTokens + kKvarnTailRingTokens;
