@@ -885,6 +885,49 @@ void TestPrefill(int bits, unsigned start, unsigned rows) {
 // for comparison with the K1b prototype sweep (KVARN.md). Inputs cycle
 // through copies of at least 256 MiB, past the 32 MiB MALL, and the timed
 // loop alternates formats. Values are random; only the time is reported.
+// `time`: microseconds per group flush (one layer of one or two groups, all
+// sixteen layers of one group), the quantizer's latency in a prompt chunk.
+void TimeFlush() {
+  constexpr unsigned kAll = 16;
+  for (const int bits : {2, 4}) {
+    const auto random = RandomFloats(kAll * kFp16LayerElements, 7, 1.0F);
+    const auto half = ToHalf(random);
+    DeviceBuffer<std::uint16_t> rows_k(half), rows_v(half);
+    const std::size_t record_row = kKvHeads * KvarnRecord(bits).bytes;
+    const unsigned blocks = 2;
+    DeviceBuffer<std::uint8_t> records(std::size_t{kAll} * blocks * 2 *
+                                       record_row);
+    DeviceBuffer<std::uint32_t> table(std::vector<std::uint32_t>{0, 1});
+    const KvarnKvView view{
+        .value_bits = bits,
+        .records = records.data(),
+        .records_layer_pitch = std::size_t{blocks} * 2 * record_row,
+        .blocks = table.data(),
+        .k_rows = rows_k.data(),
+        .v_rows = rows_v.data()};
+    for (const auto [layers, groups] :
+         {std::pair{1U, 1U}, std::pair{1U, 2U}, std::pair{kAll, 1U}}) {
+      gufo::hip::LaunchKvarnFlush(view, layers, 1, groups, nullptr);
+      HIP_CHECK(hipDeviceSynchronize());
+      hipEvent_t begin, end;
+      HIP_CHECK(hipEventCreate(&begin));
+      HIP_CHECK(hipEventCreate(&end));
+      constexpr unsigned kIterations = 10;
+      HIP_CHECK(hipEventRecord(begin, nullptr));
+      for (unsigned i = 0; i < kIterations; ++i)
+        gufo::hip::LaunchKvarnFlush(view, layers, 1, groups, nullptr);
+      HIP_CHECK(hipEventRecord(end, nullptr));
+      HIP_CHECK(hipEventSynchronize(end));
+      float ms = 0;
+      HIP_CHECK(hipEventElapsedTime(&ms, begin, end));
+      HIP_CHECK(hipEventDestroy(begin));
+      HIP_CHECK(hipEventDestroy(end));
+      std::printf("flush k4v%d layers=%u groups=%u us=%.1f\n", bits, layers,
+                  groups, 1000.0 * ms / kIterations);
+    }
+  }
+}
+
 void TimeAttention() {
   struct Shape {
     unsigned depth, rows;
@@ -966,6 +1009,7 @@ int main(int argc, char** argv) {
   if (device_status != 0)
     return device_status;
   if (argc > 1 && std::string_view(argv[1]) == "time") {
+    TimeFlush();
     TimeAttention();
     return 0;
   }
