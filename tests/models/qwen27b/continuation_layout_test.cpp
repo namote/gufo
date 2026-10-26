@@ -3,6 +3,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 
 namespace qwen = gufo::models::qwen;
 namespace hip = gufo::hip;
@@ -67,9 +68,10 @@ void Check(bool fp16, bool bf16) {
   c.full_attention_interval = 0;
   Reject([&] { qwen::ContinuationLayout bad(c, policy, 100000); });
 }
-// KVarN rows have no continuation layout yet; they are refused by name
-// instead of being stored as FP16 or FP32 components.
-void CheckKvarnRefused() {
+// KVarN: one record row component per attention layer (layout version 3
+// for k4v2, 4 for k4v4) and one private component with the FP16 sink and
+// tail rows; FP16's components keep their versions and bytes.
+void CheckKvarn() {
   gufo::core::ModelConfig c;
   c.num_layers = 64;
   c.hidden_size = 5120;
@@ -78,20 +80,40 @@ void CheckKvarnRefused() {
   c.context_length = 262144;
   c.ssm_time_step_rank = 48;
   c.ssm_inner_size = 6144;
-  for (const auto storage : {hip::QwenKvCacheStorage::kKvarnK4V2,
-                             hip::QwenKvCacheStorage::kKvarnK4V4}) {
+  for (const auto [storage, row, version] :
+       {std::tuple{hip::QwenKvCacheStorage::kKvarnK4V2, 840U, 3U},
+        std::tuple{hip::QwenKvCacheStorage::kKvarnK4V4, 1096U, 4U}}) {
     hip::QwenExecutionPolicy policy;
     policy.kv_cache_storage = storage;
-    std::string message;
-    try {
-      qwen::ContinuationLayout layout(c, policy, 100000);
-    } catch (const std::invalid_argument& e) {
-      message = e.what();
+    qwen::ContinuationLayout layout(c, policy, 100000);
+    Require(layout.Components().size() == 116, "KVarN state inventory");
+    std::size_t records = 0, rows = 0;
+    for (const auto& part : layout.Components()) {
+      Require(part.part != qwen::ContinuationPart::kKey &&
+                  part.part != qwen::ContinuationPart::kValue,
+              "KVarN keeps FP16 K/V rows");
+      if (part.part == qwen::ContinuationPart::kKvarnRecords) {
+        ++records;
+        Require(part.descriptor.row_bytes == row &&
+                    part.descriptor.rows_per_chunk == 256 &&
+                    part.descriptor.layout_version == version &&
+                    part.descriptor.kind == cache::ComponentKind::kAppendRows,
+                "KVarN record rows");
+      }
+      if (part.part == qwen::ContinuationPart::kKvarnRows) {
+        ++rows;
+        // Header, then 2 planes x 16 layers x 384 rows x 4 heads x 256.
+        Require(part.descriptor.state_bytes == 64 + 25165824 &&
+                    part.descriptor.layout_version == version &&
+                    part.descriptor.kind == cache::ComponentKind::kPrivateState,
+                "KVarN FP16 rows");
+      }
     }
-    Require(message.find("not implemented yet") != std::string::npos &&
-                message.find(std::string(
-                    hip::QwenKvCacheStorageName(storage))) != std::string::npos,
-            "KVarN continuation layout was not refused by name");
+    Require(records == 16 && rows == 1, "KVarN components per layer");
+    Require(layout.BytesPerToken() == 16 * row, "KVarN stride per token");
+    const std::size_t fixed =
+        48 * (163840 + 786432 * 4) + 2 * 993280 + 64 + 96 + 64 + 25165824;
+    Require(layout.PrivateBytes() == fixed, "KVarN private state claim");
   }
 }
 }  // namespace
@@ -100,7 +122,7 @@ int main() {
     for (bool fp16 : {false, true})
       for (bool bf16 : {false, true})
         Check(fp16, bf16);
-    CheckKvarnRefused();
+    CheckKvarn();
     std::cout << "Qwen continuation geometry: PASS\n";
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';

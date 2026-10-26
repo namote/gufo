@@ -5,6 +5,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "src/models/qwen/hip/kvarn_layout.hpp"
+
 namespace gufo::models::qwen {
 namespace {
 std::size_t Product(std::initializer_list<std::size_t> factors) {
@@ -22,7 +24,6 @@ ContinuationLayout::ContinuationLayout(const core::ModelConfig& c,
                                        hip::QwenExecutionPolicy policy,
                                        std::uint32_t context)
     : context_(context) {
-  // KVarN component rows have no layout until their storage is implemented.
   if (const auto unsupported = hip::QwenContinuationUnsupportedReason(policy);
       !unsupported.empty())
     throw std::invalid_argument(std::string(unsupported));
@@ -61,8 +62,24 @@ ContinuationLayout::ContinuationLayout(const core::ModelConfig& c,
   const auto recurrent = Product(
       {c.ssm_time_step_rank, c.ssm_state_size, c.SsmValueSize(),
        hip::QwenRecurrentStateElementBytes(policy.recurrent_state_storage)});
+  // KVarN records: 128 token rows hold one group's records of every KV
+  // head, so a 256-row chunk is one pool block's record bytes. Layout
+  // versions 3 (k4v2) and 4 (k4v4) keep them apart from FP16 (1) and FP32
+  // (2) rows.
+  const int kvarn_bits = hip::KvarnValueBits(policy.kv_cache_storage);
+  if (kvarn_bits != 0 && (c.num_key_value_heads != hip::kKvarnKvHeads ||
+                          c.head_dim != hip::kKvarnHeadDim))
+    throw std::invalid_argument("KVarN needs 4 KV heads of 256");
+  const auto kvarn_row = kvarn_bits == 0
+                             ? 0
+                             : std::size_t{c.num_key_value_heads} *
+                                   hip::KvarnRecord(kvarn_bits).bytes /
+                                   hip::kKvarnGroupTokens;
+  const std::uint32_t kvarn_version = kvarn_bits == 2 ? 3 : 4;
   for (std::uint32_t layer = 0; layer < c.num_layers; ++layer) {
-    if ((layer + 1) % c.full_attention_interval == 0) {
+    if ((layer + 1) % c.full_attention_interval == 0 && kvarn_bits != 0) {
+      add(ContinuationPart::kKvarnRecords, kvarn_row, 0, layer, kvarn_version);
+    } else if ((layer + 1) % c.full_attention_interval == 0) {
       add(ContinuationPart::kKey, kv_row, 0, layer,
           policy.UsesFp16AttentionKv() ? 1 : 2);
       add(ContinuationPart::kValue, kv_row, 0, layer,
@@ -73,6 +90,12 @@ ContinuationLayout::ContinuationLayout(const core::ModelConfig& c,
           policy.UsesBf16RecurrentState() ? 2 : 1);
     }
   }
+  if (kvarn_bits != 0)
+    add(ContinuationPart::kKvarnRows, 0,
+        kContinuationKvarnHeaderBytes +
+            hip::KvarnFp16Bytes(c.FullAttentionLayerCount(),
+                                c.num_key_value_heads, c.head_dim),
+        0, kvarn_version);
   add(ContinuationPart::kFrontier, 0,
       kContinuationFrontierMetadataBytes +
           Product({c.vocab_size, sizeof(float)}));

@@ -88,6 +88,10 @@ struct FrontierMetadata {
   std::array<std::uint32_t, kContinuationPendingTokens> tokens{};
 };
 static_assert(sizeof(FrontierMetadata) <= kContinuationFrontierMetadataBytes);
+struct KvarnRowsHeader {
+  std::uint32_t version{1}, flushed_end{}, written_end{};
+};
+static_assert(sizeof(KvarnRowsHeader) <= kContinuationKvarnHeaderBytes);
 }  // namespace
 
 class ContinuationAdapter::State final : public cache::Slot,
@@ -174,7 +178,13 @@ public:
     for (const auto& component : adapter.layout_.Components())
       if (component.descriptor.kind == cache::ComponentKind::kAppendRows &&
           first < end)
-        guard.BeforeOverwrite(component.descriptor.id, first, end);
+        // A KVarN write reopens and requantizes the group holding `first`.
+        guard.BeforeOverwrite(
+            component.descriptor.id,
+            component.part == ContinuationPart::kKvarnRecords
+                ? first >> hip::kKvarnGroupShift << hip::kKvarnGroupShift
+                : first,
+            end);
     // Shared pool: copy blocks a checkpoint still holds, then map the rows,
     // before any submission writes them.
     executor->arena_.UnshareKvRows(first, end);
@@ -294,6 +304,7 @@ public:
   std::vector<Restored> restored_blocks;
   std::array<std::byte, kContinuationMetadataBytes> metadata{};
   std::array<std::byte, kContinuationMetadataBytes> draft_metadata{};
+  std::array<std::byte, kContinuationKvarnHeaderBytes> kvarn_header{};
   std::vector<std::byte> draft_features;
   ContinuationFrontier frontier;
   std::vector<std::byte> frontier_bytes;
@@ -485,6 +496,12 @@ std::vector<cache::ComponentPosition> ContinuationAdapter::Positions(
   if (!state.IsValid())
     throw std::logic_error("cannot query an invalid Qwen slot");
   auto positions = layout_.Positions(state.position);
+  // KVarN records are rows only once their group is quantized.
+  const auto quantized = std::min<Rows>(
+      state.position, state.executor->arena_.kvarn_.tail.flushed_end);
+  for (std::size_t i = 0; i < positions.size(); ++i)
+    if (components_[i].part == ContinuationPart::kKvarnRecords)
+      positions[i].valid_rows = quantized;
   for (std::size_t i = positions.size(); i < components_.size(); ++i) {
     const auto& component = components_[i];
     // Private components describe one coherent target checkpoint. Their
@@ -527,9 +544,19 @@ void ContinuationAdapter::BeginRestore(
                                          &cache::ComponentPosition::id));
   }
   const auto target_positions = layout_.Positions(ordered.front().valid_rows);
-  if (!std::equal(target_positions.begin(), target_positions.end(),
-                  ordered.begin()))
-    throw std::invalid_argument("inconsistent Qwen frontiers");
+  std::optional<Rows> records;
+  for (std::size_t i = 0; i < target_positions.size(); ++i) {
+    if (components_[i].part == ContinuationPart::kKvarnRecords) {
+      // Every layer's records end at the same quantized group boundary,
+      // checked against the restored tail in Validate.
+      if (ordered[i].valid_rows > target_positions[i].valid_rows ||
+          (records && *records != ordered[i].valid_rows))
+        throw std::invalid_argument("inconsistent Qwen KVarN frontiers");
+      records = ordered[i].valid_rows;
+    } else if (ordered[i] != target_positions[i]) {
+      throw std::invalid_argument("inconsistent Qwen frontiers");
+    }
+  }
   for (std::size_t i = target_positions.size(); i < ordered.size(); ++i) {
     if (ordered[i].valid_rows != ordered.front().valid_rows) {
       throw std::invalid_argument("inconsistent Qwen draft metadata frontier");
@@ -551,6 +578,7 @@ void ContinuationAdapter::BeginRestore(
   state.coverage = std::move(coverage);
   state.metadata.fill(std::byte{});
   state.draft_metadata.fill(std::byte{});
+  state.kvarn_header.fill(std::byte{});
   const auto frontier = std::ranges::find(
       components_, ContinuationPart::kFrontier, &ContinuationComponent::part);
   state.frontier_bytes.assign(frontier->descriptor.state_bytes, std::byte{});
@@ -666,6 +694,25 @@ cache::Completion ContinuationAdapter::CapturePrivatePiece(
       copy(frontier.logits.data(), kContinuationFrontierMetadataBytes,
            frontier.logits.size() * sizeof(float));
     });
+  } else if (component.part == ContinuationPart::kKvarnRows) {
+    // The tail state, then every layer's FP16 sink and tail ring (K, V).
+    KvarnRowsHeader header{.version = 1,
+                           .flushed_end = arena.kvarn_.tail.flushed_end,
+                           .written_end = arena.kvarn_.tail.written_end};
+    std::memcpy(host.data(), &header, sizeof(header));
+    const auto* rows = reinterpret_cast<const std::byte*>(arena.kvarn_.d_rows);
+    return Transfer(state, false, stream, [&](hip::TransferStream& transfer) {
+      constexpr auto kHead = kContinuationKvarnHeaderBytes;
+      const auto end = offset + bytes.size();
+      if (offset < kHead)
+        std::memcpy(bytes.data(), host.data() + offset,
+                    std::min(end, kHead) - offset);
+      const auto first = std::max(offset, kHead);
+      if (first < end)
+        Check(hip::CopySnapshotToHost(bytes.data() + (first - offset),
+                                      rows + (first - kHead), end - first,
+                                      transfer.Native()));
+    });
   } else if (component.part == ContinuationPart::kConvolution) {
     source = arena.d_ssm_conv_state +
              std::size_t{model_->GetConfig().SsmLayerIndex(component.layer)} *
@@ -763,6 +810,26 @@ cache::Completion ContinuationAdapter::LoadPrivatePiece(
         offset > total || bytes.size() > total - offset)
       throw std::invalid_argument("invalid Qwen private piece");
     auto& arena = state.executor->arena_;
+    if (component.part == ContinuationPart::kKvarnRows) {
+      {
+        const std::lock_guard lock(state.jobs_mutex);
+        state.coverage[id.value - 1].emplace_back(offset,
+                                                  offset + bytes.size());
+      }
+      auto* rows = reinterpret_cast<std::byte*>(arena.kvarn_.d_rows);
+      return Transfer(state, true, stream, [&](hip::TransferStream& transfer) {
+        constexpr auto kHead = kContinuationKvarnHeaderBytes;
+        const auto end = offset + bytes.size();
+        if (offset < kHead)
+          std::memcpy(state.kvarn_header.data() + offset, bytes.data(),
+                      std::min(end, kHead) - offset);
+        const auto first = std::max(offset, kHead);
+        if (first < end)
+          Check(hip::CopySnapshotToDevice(rows + (first - kHead),
+                                          bytes.data() + (first - offset),
+                                          end - first, transfer.Native()));
+      });
+    }
     void* target = nullptr;
     bool is_host = false;
     if (component.part == ContinuationPart::kMetadata) {
@@ -918,7 +985,8 @@ std::span<const std::byte> ContinuationAdapter::BorrowRowsView(
     throw std::invalid_argument("invalid Qwen borrowed range");
   // FP32 planes are head-major, so a token range is not contiguous. Its
   // canonical host representation still goes through TransferRows.
-  if (!policy_.UsesFp16AttentionKv())
+  if (!policy_.UsesFp16AttentionKv() &&
+      component.part != ContinuationPart::kKvarnRecords)
     return {};
   const auto& arena = state.executor->arena_;
   const auto runs = KvRuns(arena, first, end);
@@ -945,8 +1013,11 @@ bool ContinuationAdapter::RetainsRows(cache::ComponentId id) const {
   const auto& component = Component(id);
   const auto part = component.part;
   // A retained chunk is one pool block: chunks of another size are copied.
-  return kv_pool_ && policy_.UsesFp16AttentionKv() &&
-         (part == ContinuationPart::kKey || part == ContinuationPart::kValue) &&
+  return kv_pool_ &&
+         ((policy_.UsesFp16AttentionKv() &&
+           (part == ContinuationPart::kKey ||
+            part == ContinuationPart::kValue)) ||
+          part == ContinuationPart::kKvarnRecords) &&
          component.descriptor.rows_per_chunk == hip::kKvBlockTokens;
 }
 cache::Adapter::RetainedRows ContinuationAdapter::RetainRows(
@@ -1016,15 +1087,17 @@ cache::Completion ContinuationAdapter::TransferRows(
                                 ? c.FullAttentionLayerCount()
                                 : 0;
   // The FP32 reference: head-major rows of `context_` positions.
-  auto* native = policy_.UsesFp16AttentionKv()
-                     ? nullptr
-                     : reinterpret_cast<std::byte*>(arena.d_kv_cache) +
-                           (plane + layer) * context_ * row;
+  // Pool rows: FP16 K/V, or KVarN records (the record plane, block order).
+  const bool pooled = policy_.UsesFp16AttentionKv() ||
+                      component.part == ContinuationPart::kKvarnRecords;
+  auto* native = pooled ? nullptr
+                        : reinterpret_cast<std::byte*>(arena.d_kv_cache) +
+                              (plane + layer) * context_ * row;
   return Transfer(state, load, stream, [&](hip::TransferStream& transfer) {
     if (first == end)
       return;
     const auto direction = load ? hipMemcpyDefault : hipMemcpyDeviceToHost;
-    if (policy_.UsesFp16AttentionKv()) {
+    if (pooled) {
       auto* layer_base = KvLayerBase(arena, component, model_->GetConfig());
       for (const auto& run : KvRuns(arena, first, end)) {
         auto* device = layer_base + run.pool_row * row;
@@ -1175,6 +1248,26 @@ bool ContinuationAdapter::Validate(
     } else
       executor.vision_input_.Configure(nullptr, nullptr,
                                        executor.arena_.stream);
+    if (executor.arena_.UsesKvarn()) {
+      // The restored tail must end the records at the restored rows.
+      KvarnRowsHeader header{};
+      std::memcpy(&header, state.kvarn_header.data(), sizeof(header));
+      const auto records =
+          std::ranges::find(components_, ContinuationPart::kKvarnRecords,
+                            &ContinuationComponent::part);
+      const auto expected_records =
+          state.expected[records - components_.begin()].valid_rows;
+      if (header.version != 1 || header.flushed_end < hip::kKvarnSinkTokens ||
+          header.flushed_end % hip::kKvarnGroupTokens != 0 ||
+          header.flushed_end > std::max<std::uint32_t>(metadata.position,
+                                                       hip::kKvarnSinkTokens) ||
+          header.written_end < metadata.position ||
+          expected_records !=
+              std::min<Rows>(metadata.position, header.flushed_end))
+        return refuse();
+      executor.arena_.kvarn_.tail = {.flushed_end = header.flushed_end,
+                                     .written_end = header.written_end};
+    }
     executor.arena_.DisableSsmReplayCapture();
     // Blocks this restore mapped instead of copying.
     executor.arena_.UploadKvTable();

@@ -21,7 +21,12 @@ enum class ContinuationPart {
   kDraftMetadata,
   kDraftKey,
   kDraftValue,
-  kDraftFeatures
+  kDraftFeatures,
+  // KVarN: one attention layer's quantized group records as token rows (a
+  // pool block's record bytes, KvarnRecord(bits).bytes * kv heads per 128
+  // rows), and every layer's FP16 sink and tail rows with the tail state.
+  kKvarnRecords,
+  kKvarnRows
 };
 struct ContinuationComponent {
   cache::ComponentDescriptor descriptor;
@@ -32,6 +37,8 @@ struct ContinuationComponent {
 inline constexpr std::size_t kContinuationMetadataBytes = 64;
 inline constexpr std::size_t kContinuationFrontierMetadataBytes = 96;
 inline constexpr std::size_t kContinuationPendingTokens = 9;
+// Leads the kKvarnRows state: version, flushed_end, written_end.
+inline constexpr std::size_t kContinuationKvarnHeaderBytes = 64;
 
 struct ContinuationBackingClass {
   std::size_t block_bytes{}, blocks{}, metadata_bytes{};
