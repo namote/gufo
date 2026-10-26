@@ -60,6 +60,9 @@ public:
   [[nodiscard]] bool IsRows(std::size_t index) const {
     return adapter_.Components()[index].row_bytes != 0;
   }
+  [[nodiscard]] std::size_t RowBytes(std::size_t index) const {
+    return adapter_.Components()[index].row_bytes;
+  }
 
   State Capture() {
     State state{adapter_.Positions(*slot_), {}};

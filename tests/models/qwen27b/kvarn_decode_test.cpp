@@ -382,10 +382,15 @@ void CheckStorage(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
 // and restored into another slot is the same state byte for byte (records,
 // FP16 sink and tail ring, tail state) and decodes the same logits. With
 // `pooled`, both slots take blocks from one shared pool, as serving does.
+// `committed` > 0: after decoding to kEnd, verify 8 draft rows and keep
+// `committed` of them, so the tail can be flushed past the position (a group
+// ends among the rejected rows). The checkpoint holds `records` record rows
+// and `tail` FP16 tail rows (K4-C1: only the valid FP16 rows).
 void CheckContinuation(
     const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
     QwenKvCacheStorage storage, std::uint32_t kPrompt, std::uint32_t kEnd,
-    bool pooled) {
+    bool pooled, std::uint32_t committed, std::uint32_t expected_records,
+    std::uint32_t expected_tail) {
   constexpr std::uint32_t kContext = 1024;
   auto policy = gufo::hip::QwenExecutionPolicy::Production();
   policy.kv_cache_storage = storage;
@@ -399,26 +404,42 @@ void CheckContinuation(
              : nullptr;
   const std::string name =
       std::string(gufo::hip::QwenKvCacheStorageName(storage)) +
-      (pooled ? " pooled" : "") + " at " + std::to_string(kEnd);
+      (pooled ? " pooled" : "") + " at " + std::to_string(kEnd) +
+      (committed ? " + " + std::to_string(committed) + " of 8 verified" : "");
   gufo::testing::kvarn::Session source(model, kContext, policy, pool);
   auto& executor = source.Executor();
-  const auto tokens = Fixture(executor, kEnd + 1);
+  const auto tokens = Fixture(executor, kEnd + 9);
   (void)executor.ForwardPromptBatch(std::span(tokens).first(kPrompt));
   for (std::uint32_t pos = kPrompt; pos < kEnd; ++pos)
     (void)executor.ForwardToken(tokens[pos], pos);
+  std::uint32_t position = kEnd;
+  if (committed != 0) {
+    (void)executor.ForwardVerificationChunk(std::span(tokens).subspan(kEnd, 8),
+                                            kEnd);
+    executor.CommitVerificationChunk(std::span(tokens).subspan(kEnd, committed),
+                                     kEnd);
+    position += committed;
+  }
   const auto captured = source.Capture();
-  std::size_t records = 0;
-  // Records count the quantized groups: those that ended at or before the
-  // last decode step's position, not its own partial one.
-  const auto quantized = kEnd / 128 * 128;
-  for (std::size_t i = 0; i < captured.positions.size(); ++i)
-    if (source.IsRows(i)) {
-      ++records;
-      Expect(captured.positions[i].valid_rows == quantized,
-             name + ": KVarN record rows " +
-                 std::to_string(captured.positions[i].valid_rows));
+  // Records, then the FP16 sink and tail rows (one position of every layer).
+  constexpr std::size_t kFp16Row = 2ULL * 16 * 4 * 256 * 2;
+  std::size_t records = 0, fp16 = 0, fp16_bytes = 0;
+  for (std::size_t i = 0; i < captured.positions.size(); ++i) {
+    if (!source.IsRows(i))
+      continue;
+    const auto rows = captured.positions[i].valid_rows;
+    if (source.RowBytes(i) == kFp16Row) {
+      const auto want = fp16++ == 0 ? std::min(position, 128U) : expected_tail;
+      Expect(rows == want, name + ": KVarN FP16 rows " + std::to_string(rows));
+      fp16_bytes += rows * kFp16Row;
+      continue;
     }
-  Expect(records == 16, name + ": KVarN record components");
+    ++records;
+    Expect(rows == expected_records,
+           name + ": KVarN record rows " + std::to_string(rows));
+  }
+  Expect(records == 16 && fp16 == 2, name + ": KVarN components");
+  std::cout << name << ": FP16 rows " << fp16_bytes << " bytes\n";
 
   gufo::testing::kvarn::Session restored(model, kContext, policy, pool);
   restored.Restore(captured);
@@ -432,10 +453,10 @@ void CheckContinuation(
             << " components, " << differing << " differ after restore\n";
   Expect(differing == 0, name + ": a restored KVarN state differs");
 
-  (void)executor.ForwardToken(tokens[kEnd], kEnd);
+  (void)executor.ForwardToken(tokens[position], position);
   const auto expected = Logits(executor);
   auto& copy = restored.Executor();
-  (void)copy.ForwardToken(tokens[kEnd], kEnd);
+  (void)copy.ForwardToken(tokens[position], position);
   const auto actual = Logits(copy);
   Expect(std::memcmp(expected.data(), actual.data(),
                      expected.size() * sizeof(float)) == 0,
@@ -470,8 +491,16 @@ int main(int argc, const char* const* argv) {
         // 646: records end inside the last block; 530: records end at
         // the block boundary 512 and the restored rows reach into a block
         // without records.
-        CheckContinuation(model, storage, 300, 646, false);
-        CheckContinuation(model, storage, 520, 530, true);
+        // Inside the sink; at its end; inside a group; at the block boundary
+        // 512 with rows reaching into a block without records (the K2 bug);
+        // at a group end the next pass flushes (128 tail rows); and with a
+        // rejected draft whose group end the tail was flushed past.
+        CheckContinuation(model, storage, 60, 70, false, 0, 70, 0);
+        CheckContinuation(model, storage, 100, 128, true, 0, 128, 0);
+        CheckContinuation(model, storage, 300, 646, false, 0, 640, 6);
+        CheckContinuation(model, storage, 520, 530, true, 0, 512, 18);
+        CheckContinuation(model, storage, 600, 640, true, 0, 512, 128);
+        CheckContinuation(model, storage, 600, 636, true, 2, 512, 126);
         if (!continuation_only)
           CheckStorage(model, storage);
       } catch (const std::exception& error) {

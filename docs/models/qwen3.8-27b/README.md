@@ -46,7 +46,8 @@ token across the 16 full-attention layers and is the reference for FP16
 output comparisons, which must pass `--kv-cache-type fp16`. Every query
 reads the groups that ended at or before its position quantized, so DFlash2
 verification matches decoding exactly. Checkpoints keep the group records
-as rows and the FP16 sink and tail as private state. The
+and only the valid FP16 rows: the sink up to the position and the tail after
+the last quantized group (64 KiB per row). The
 `--cpu` route keeps FP32 KV and refuses any `--kv-cache-type`. Each type has
 its own policy fingerprint and continuation identity, so cached checkpoints
 never cross types.

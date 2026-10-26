@@ -83,8 +83,8 @@ Text serving defaults match llama.cpp for context and generation length:
 `--kv-cache-type fp16|kvarn-k4v2|kvarn-k4v4` selects attention KV storage; a
 model takes an explicit value only when it stores KV that way. Qwen3.8-27B
 defaults to `kvarn-k4v2` and serves the KVarN values: the prefix cache, RAM and disk checkpoints keep the
-quantized group records as rows (layout versions 3 and 4) and the FP16 sink
-and tail as private state, and `--kv-pool-bytes` holds about 4.9 (k4v2) or
+quantized group records and only the valid FP16 sink and tail rows (layout
+versions 5 and 6; checkpoints of the earlier 3 and 4 are refused), and `--kv-pool-bytes` holds about 4.9 (k4v2) or
 3.7 (k4v4) times the FP16 tokens. Flash-Next stores FP16 KV and accepts only `fp16`.
 DeepSeek V4 Flash keeps FP8 KV and refuses any value: `DeepSeek V4 Flash does
 not take --kv-cache-type (its KV cache is FP8)`. The type is part of the Qwen

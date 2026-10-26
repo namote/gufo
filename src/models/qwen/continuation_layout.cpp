@@ -44,7 +44,11 @@ ContinuationLayout::ContinuationLayout(const core::ModelConfig& c,
           row ? cache::ComponentKind::kAppendRows
               : cache::ComponentKind::kPrivateState,
           row,
-          row ? cache::Rows{256} : 0,
+          row ? cache::Rows{part == ContinuationPart::kKvarnSink ||
+                                    part == ContinuationPart::kKvarnTail
+                                ? hip::kKvarnGroupTokens
+                                : 256}
+              : 0,
           state},
          part,
          layer});
@@ -88,12 +92,15 @@ ContinuationLayout::ContinuationLayout(const core::ModelConfig& c,
           policy.UsesBf16RecurrentState() ? 2 : 1);
     }
   }
-  if (kvarn_bits != 0)
-    add(ContinuationPart::kKvarnRows, 0,
-        kContinuationKvarnHeaderBytes +
-            hip::KvarnFp16Bytes(c.FullAttentionLayerCount(),
-                                c.num_key_value_heads, c.head_dim),
-        0, kv_version);
+  if (kvarn_bits != 0) {
+    // One position of every layer's FP16 K and V; 128-row chunks, so the
+    // sink is one complete chunk from position 128 on.
+    const auto fp16_row =
+        Product({2, c.FullAttentionLayerCount(), c.num_key_value_heads,
+                 c.head_dim, sizeof(std::uint16_t)});
+    add(ContinuationPart::kKvarnSink, fp16_row, 0, 0, kv_version);
+    add(ContinuationPart::kKvarnTail, fp16_row, 0, 0, kv_version);
+  }
   add(ContinuationPart::kFrontier, 0,
       kContinuationFrontierMetadataBytes +
           Product({c.vocab_size, sizeof(float)}));
