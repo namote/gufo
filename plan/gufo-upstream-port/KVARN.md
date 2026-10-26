@@ -241,6 +241,16 @@ fake quant는 FP16 커널을 그대로 쓰므로 속도를 재지 못한다. 그
 
 - 남은 문제: 짧은 prompt prefill −3–4 %(pack·store 비용) — 기본값을 k4v2로 바꾸기 전에 고친다. 양자화 커널 spill, 층마다 별도 회전 launch, 256K end-to-end 미측정.
 
+### K1b-opt2 결과 (2026-10-26, gufo `81e3fdcd`, 감독 검증)
+
+- 창 `kvarn-k1bopt2-a07/opt2-final` COMPLETE·health PASS(a01–a03 FAILED 진단 기록 보존, a04·a05·a06 COMPLETE; 에이전트는 a04를 창 FAILED로 보고했지만 실제 WINDOW.json은 COMPLETE). 감독 확인: `81e3fdcd` + 운영 snapshot `6200e0a4`로 다시 빌드한 SHA `07d4e8a0…`가 a07과 같다.
+- **verify = 1행 decode 비트 불일치의 근본 원인은 WMMA 하드웨어 성질이다.** k 쌍 안에 살아 있는 A 원소 하나와 0 하나가 있으면, 0의 B 짝 값이 결과를 바꾼다(`wmmaprobe`: 쌍을 가르는 홀수 cut에서 출력 8–13 %가 다름, 짝수 cut 0). 1행 decode는 자기 위치 뒤 V를 0으로 채우고 verify 행은 P = 0에 V가 살아 있어서, K1b도 홀수 tail 길이에서 행 절반이 달랐다. 해결: FP16 tail PV를 "토큰 하나 + 0" 쌍으로 펼치고 tail을 64토큰 블록으로, softmax·combine 갱신을 명시적 `fmaf`로, split 수는 그룹 수로만.
+- 비트 비교(같은 KV·위치, 10경우): `common`·`fold_tiled` 10/10 동일, `k1b`·`opt_latev` 10/10 다름.
+- **추천 `common`**(K 접기 없이 AR·verify 공통 최적화). 접기를 verify에도 넣은 `fold_tiled`는 질의 8에서 25–35 % 느려 기각(48행 float q와 보정이 LDS·VGPR 예산 초과, 3블록 타일로 그룹당 명령 약 5,430 대 3,669). `common`은 AR에서 접기 대비 1.5–3 %만 손해.
+- 정확도(커널, AR / verify): k4v2 5.5e-4 / 6.4e-4, k4v4 8.3e-4 / 7.1e-4.
+- 속도(층 하나 µs, k4v2 `common`, 괄호는 K1b): AR 4K 34.3(42.4), 32K 142.4(183.6, 하한 83 %), 64K 269(329), 256K 1,009(1,238, 92 %); verify 4K 88.6(104.1), 32K 391(449), 256K 2,911(3,243). K1b 대비 AR 1.24–1.29배, verify 1.11–1.17배.
+- 운영(K1c)이 지킬 규칙: 저장 배치 그대로, tail PV 쌍 펼치기와 64토큰 tail 블록, K 접기 없음(또는 모든 행 같은 타일), 명시적 FMA, split은 그룹 수로만. 운영 FP16 verify 커널이 WMMA를 쓰면 같은 위험이 있을 수 있다(미확인, 지금 FP16 verify = decode 테스트는 통과).
+
 ### K0에서 정하지 않는 것
 
 - 커널·서빙·checkpoint 형식(K1·K2). 추가가 필요한 것만 적어 둔다: storage enum 값과 policy fingerprint 비트, K/V component `layout_version` 3(새 row_bytes와 128토큰 scale plane), compact snapshot 검증 완화, 블록 풀의 scale plane(`KvBlockPlane::rows_per_block` 128은 이미 표현 가능하나 arena·adapter가 같은 두 plane을 가정한다).
