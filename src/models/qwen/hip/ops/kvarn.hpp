@@ -1,0 +1,65 @@
+#ifndef GUFO_MODELS_QWEN_HIP_OPS_KVARN_HPP_
+#define GUFO_MODELS_QWEN_HIP_OPS_KVARN_HPP_
+
+#include <cstddef>
+#include <cstdint>
+#include <span>
+
+#include "src/models/qwen/hip/kvarn_layout.hpp"
+
+#if defined(ENGINE_ENABLE_HIP)
+#include <hip/hip_runtime.h>
+
+namespace gufo::hip {
+
+/// Device view of one sequence's KVarN attention KV (kvarn_layout.hpp). The
+/// FP16 plane holds K and V rows, already rotated, as
+/// [layer][kKvarnFp16Tokens][kv head][head_dim] (KvarnFp16Row); the record
+/// plane is the pool's, its groups found through the block table.
+struct KvarnKvView {
+  int value_bits{0};
+  std::uint8_t* records{nullptr};
+  std::size_t records_layer_pitch{0};
+  const std::uint32_t* blocks{nullptr};
+  void* k_rows{nullptr};
+  void* v_rows{nullptr};
+};
+
+/// Rotates the K and V rows of `rows` consecutive positions ([row][kv
+/// head][256] floats; K already normed and roped) by the normalized
+/// Hadamard and stores them as FP16 in the sink or tail ring of `layer`.
+/// Positions start at `*d_pos` when it is given (graph capture), else at
+/// `start_pos`. Each row is rounded to FP16 before the rotation, as the
+/// FP16 cache stores it, and the rotated row once more.
+void LaunchKvarnWriteRows(const float* k, const float* v, const KvarnKvView& kv,
+                          std::uint32_t layer, const std::uint32_t* d_pos,
+                          std::uint32_t start_pos, std::uint32_t rows,
+                          hipStream_t stream);
+
+/// Quantizes groups [first_group, first_group + groups) of every layer from
+/// the FP16 tail ring into the record plane. first_group >= 1 (group 0 is
+/// the sink) and the ring must still hold every row of those groups.
+void LaunchKvarnFlush(const KvarnKvView& kv, std::uint32_t layers,
+                      std::uint32_t first_group, std::uint32_t groups,
+                      hipStream_t stream);
+
+/// Causal attention of `rows` (1 to kKvarnMaxRows) consecutive query rows
+/// ([row][24][256] floats, roped) over the sink, `groups` quantized groups
+/// after it and the FP16 tail to the last row's position, gated like the
+/// FP16 decode path (out *= sigmoid(gate) when gate is non-null). Positions
+/// start at `*d_pos` when it is given, else at `start_pos`; the first query
+/// position must not precede the end of the quantized groups. `splits`
+/// zero selects SelectKvarnDecodeSplits. The scratch must hold
+/// KvarnScratchElements(rows, splits).
+void LaunchKvarnDecodeAttention(const float* q, const float* gate,
+                                const KvarnKvView& kv, float* out_context,
+                                std::uint32_t layer, const std::uint32_t* d_pos,
+                                std::uint32_t start_pos, std::uint32_t rows,
+                                std::uint32_t groups, std::uint32_t splits,
+                                std::span<float> scratch, hipStream_t stream);
+
+}  // namespace gufo::hip
+
+#endif  // defined(ENGINE_ENABLE_HIP)
+
+#endif  // GUFO_MODELS_QWEN_HIP_OPS_KVARN_HPP_

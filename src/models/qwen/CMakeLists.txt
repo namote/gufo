@@ -65,6 +65,7 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_decode.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_decode_verify_wave64.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_decode_graph.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_kvarn.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_tile.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_wmma.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/hipblas_gemm.hip
