@@ -44,8 +44,7 @@ ContinuationLayout::ContinuationLayout(const core::ModelConfig& c,
           row ? cache::ComponentKind::kAppendRows
               : cache::ComponentKind::kPrivateState,
           row,
-          row ? cache::Rows{part == ContinuationPart::kKvarnSink ||
-                                    part == ContinuationPart::kKvarnTail
+          row ? cache::Rows{part == ContinuationPart::kKvarnSink
                                 ? hip::kKvarnGroupTokens
                                 : 256}
               : 0,
@@ -93,13 +92,17 @@ ContinuationLayout::ContinuationLayout(const core::ModelConfig& c,
     }
   }
   if (kvarn_bits != 0) {
-    // One position of every layer's FP16 K and V; 128-row chunks, so the
-    // sink is one complete chunk from position 128 on.
+    // Sink rows: one position of every layer's FP16 K and V; one 128-row
+    // chunk, complete (and shared by later checkpoints) from position 128.
     const auto fp16_row =
         Product({2, c.FullAttentionLayerCount(), c.num_key_value_heads,
                  c.head_dim, sizeof(std::uint16_t)});
     add(ContinuationPart::kKvarnSink, fp16_row, 0, 0, kv_version);
-    add(ContinuationPart::kKvarnTail, fp16_row, 0, 0, kv_version);
+    // The tail state and every layer's FP16 tail ring.
+    add(ContinuationPart::kKvarnTail, 0,
+        kContinuationKvarnHeaderBytes +
+            Product({hip::kKvarnTailRingTokens, fp16_row}),
+        0, kv_version);
   }
   add(ContinuationPart::kFrontier, 0,
       kContinuationFrontierMetadataBytes +

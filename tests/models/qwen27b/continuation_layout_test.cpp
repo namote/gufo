@@ -71,10 +71,10 @@ void Check(bool fp16, bool bf16) {
   c.full_attention_interval = 0;
   Reject([&] { qwen::ContinuationLayout bad(c, policy, 100000); });
 }
-// KVarN: one record row component per attention layer and two FP16 row
-// components (sink, tail; one position of every layer per row), layout
-// version 5 for k4v2 and 6 for k4v4; FP16's components keep their versions
-// and bytes.
+// KVarN: one record row component per attention layer, the FP16 sink rows
+// (one position of every layer per row) and the private tail state with the
+// FP16 tail ring, layout version 5 for k4v2 and 6 for k4v4; FP16's
+// components keep their versions and bytes.
 void CheckKvarn() {
   gufo::core::ModelConfig c;
   c.num_layers = 64;
@@ -104,29 +104,36 @@ void CheckKvarn() {
                     part.descriptor.kind == cache::ComponentKind::kAppendRows,
                 "KVarN record rows");
       }
-      if (part.part == qwen::ContinuationPart::kKvarnSink ||
-          part.part == qwen::ContinuationPart::kKvarnTail) {
+      if (part.part == qwen::ContinuationPart::kKvarnSink) {
         ++rows;
         // K and V of 16 layers x 4 heads x 256 channels.
         Require(part.descriptor.row_bytes == 65536 &&
                     part.descriptor.rows_per_chunk == 128 &&
                     part.descriptor.layout_version == version &&
                     part.descriptor.kind == cache::ComponentKind::kAppendRows,
-                "KVarN FP16 rows");
+                "KVarN FP16 sink rows");
+      }
+      if (part.part == qwen::ContinuationPart::kKvarnTail) {
+        ++rows;
+        // Header, then 256 ring rows of K and V of 16 layers.
+        Require(part.descriptor.state_bytes == 64 + 256 * 65536 &&
+                    part.descriptor.layout_version == version &&
+                    part.descriptor.kind == cache::ComponentKind::kPrivateState,
+                "KVarN FP16 tail state");
       }
     }
     Require(records == 16 && rows == 2, "KVarN components per layer");
-    Require(layout.BytesPerToken() == 16 * row + 2 * 65536,
+    Require(layout.BytesPerToken() == 16 * row + 65536,
             "KVarN stride per token");
-    // No private FP16 state: only the valid rows are kept.
-    const std::size_t fixed = 48 * (163840 + 786432 * 4) + 2 * 993280 + 64 + 96;
+    // The tail ring without the sink: 16 MiB instead of 24.
+    const std::size_t fixed =
+        48 * (163840 + 786432 * 4) + 2 * 993280 + 64 + 96 + 64 + 256 * 65536;
     Require(layout.PrivateBytes() == fixed, "KVarN private state claim");
     Require(qwen::ContinuationKvLayoutVersion(storage) == version,
             "KVarN layout version");
   }
 }
-// Which rows a checkpoint holds, how a restore reads the tail back, and
-// which tail rows a write can change.
+// Which rows a checkpoint holds and how a restore reads the tail back.
 void CheckKvarnRows() {
   using qwen::KvarnCheckpointRows;
   struct Case {
@@ -162,21 +169,6 @@ void CheckKvarnRows() {
         {700, {384, 128, 316}},
         {200, {72, 128, 128}}})
     Require(!qwen::KvarnRestoredTail(position, rows), "KVarN rows refused");
-  using Range = std::pair<cache::Rows, cache::Rows>;
-  // Inside the open group: only the written rows.
-  Require(qwen::KvarnTailWrite(640, 646, 647) == Range{6, 7} &&
-              qwen::KvarnTailWrite(128, 100, 140) == Range{0, 12} &&
-              qwen::KvarnTailWrite(128, 10, 20) == Range{0, 0} &&
-              qwen::KvarnTailWrite(512, 638, 640) == Range{126, 128},
-          "KVarN tail write in the open group");
-  // A write that moves the base changes every tail row.
-  for (const auto [flushed, first, end] :
-       {std::tuple<cache::Rows, cache::Rows, cache::Rows>{640, 760, 770},
-        {512, 639, 641},
-        {640, 638, 639},
-        {128, 0, 300}})
-    Require(qwen::KvarnTailWrite(flushed, first, end) == Range{0, 256},
-            "KVarN tail write moving the base");
 }
 }  // namespace
 int main() {

@@ -384,8 +384,9 @@ void CheckStorage(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
 // `pooled`, both slots take blocks from one shared pool, as serving does.
 // `committed` > 0: after decoding to kEnd, verify 8 draft rows and keep
 // `committed` of them, so the tail can be flushed past the position (a group
-// ends among the rejected rows). The checkpoint holds `records` record rows
-// and `tail` FP16 tail rows (K4-C1: only the valid FP16 rows).
+// ends among the rejected rows). The checkpoint holds `records` record rows,
+// the valid sink rows and a tail state whose tail starts `tail` rows before
+// the position (K4-C1).
 void CheckContinuation(
     const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
     QwenKvCacheStorage storage, std::uint32_t kPrompt, std::uint32_t kEnd,
@@ -421,16 +422,29 @@ void CheckContinuation(
     position += committed;
   }
   const auto captured = source.Capture();
-  // Records, then the FP16 sink and tail rows (one position of every layer).
+  // Records, the FP16 sink rows (one position of every layer) and the tail
+  // state: version, flushed end (the tail's base), written end.
   constexpr std::size_t kFp16Row = 2ULL * 16 * 4 * 256 * 2;
-  std::size_t records = 0, fp16 = 0, fp16_bytes = 0;
+  constexpr std::size_t kTailState = 64 + 256 * kFp16Row;
+  std::size_t records = 0, sink = 0, tails = 0, fp16_bytes = 0;
   for (std::size_t i = 0; i < captured.positions.size(); ++i) {
-    if (!source.IsRows(i))
-      continue;
     const auto rows = captured.positions[i].valid_rows;
+    if (!source.IsRows(i)) {
+      if (captured.components[i].size() != kTailState)
+        continue;
+      ++tails;
+      std::array<std::uint32_t, 3> header{};
+      std::memcpy(header.data(), captured.components[i].data(), sizeof(header));
+      const auto tail = position < 128 ? 0 : position - header[1];
+      Expect(header[0] == 2 && header[2] == position && tail == expected_tail,
+             name + ": KVarN tail state " + std::to_string(header[1]));
+      fp16_bytes += kTailState;
+      continue;
+    }
     if (source.RowBytes(i) == kFp16Row) {
-      const auto want = fp16++ == 0 ? std::min(position, 128U) : expected_tail;
-      Expect(rows == want, name + ": KVarN FP16 rows " + std::to_string(rows));
+      ++sink;
+      Expect(rows == std::min(position, 128U),
+             name + ": KVarN sink rows " + std::to_string(rows));
       fp16_bytes += rows * kFp16Row;
       continue;
     }
@@ -438,8 +452,9 @@ void CheckContinuation(
     Expect(rows == expected_records,
            name + ": KVarN record rows " + std::to_string(rows));
   }
-  Expect(records == 16 && fp16 == 2, name + ": KVarN components");
-  std::cout << name << ": FP16 rows " << fp16_bytes << " bytes\n";
+  Expect(records == 16 && sink == 1 && tails == 1, name + ": KVarN components");
+  std::cout << name << ": FP16 sink rows and tail state " << fp16_bytes
+            << " bytes\n";
 
   gufo::testing::kvarn::Session restored(model, kContext, policy, pool);
   restored.Restore(captured);
@@ -488,9 +503,6 @@ int main(int argc, const char* const* argv) {
     for (const auto storage :
          {QwenKvCacheStorage::kKvarnK4V2, QwenKvCacheStorage::kKvarnK4V4}) {
       try {
-        // 646: records end inside the last block; 530: records end at
-        // the block boundary 512 and the restored rows reach into a block
-        // without records.
         // Inside the sink; at its end; inside a group; at the block boundary
         // 512 with rows reaching into a block without records (the K2 bug);
         // at a group end the next pass flushes (128 tail rows); and with a
