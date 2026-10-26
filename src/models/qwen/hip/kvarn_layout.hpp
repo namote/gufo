@@ -39,7 +39,8 @@ inline constexpr std::uint32_t kKvarnKvHeads = 4;
 inline constexpr std::uint32_t kKvarnQueryHeads = 24;
 /// Query rows of one attention launch (decode 1, DFlash2 verification 1-8).
 inline constexpr std::uint32_t kKvarnMaxRows = 8;
-/// Largest quantized split count of SelectKvarnDecodeSplits.
+/// Largest quantized split count of one launch (SelectKvarnDecodeSplits
+/// picks at most 20; scratch is sized for this bound).
 inline constexpr std::uint32_t kKvarnMaxSplits = 38;
 
 /// Value code bits of a KVarN storage; 0 for FP16/FP32 rows.
@@ -155,19 +156,22 @@ inline constexpr std::uint32_t kKvarnFp16Tokens =
 }
 
 /// Quantized splits of one KVarN attention launch over `groups` quantized
-/// groups; the sink and the tail add one split each. From the K1b sweep
-/// (KVARN.md "K1a·K1b 결과", splits 18/32/38/64/128 at 4K-256K): 18 fills
-/// whole rounds of resident blocks up to 64K, 38 beyond, and K4V4 reads
-/// enough per group to prefer 38 from 12K. The count depends on the groups
-/// only, never on the query rows, so a verification row adds its partials
-/// in the order a decode step at its position does.
+/// groups; the sink and the tail add one split each. From the K4-P2 sweep
+/// of the production kernel (KVARN.md "K4-P2 결과", splits 4-38 at 2K-256K,
+/// one and eight query rows): 20 is fastest or within noise of it from 12K
+/// to 256K in both formats; shallower, the FP16 sink and tail blocks and the
+/// combine set the time, and fewer, longer splits win. The count depends on
+/// the groups only, never on the query rows, so a verification row adds its
+/// partials in the order a decode step at its position does.
 [[nodiscard]] constexpr std::uint32_t SelectKvarnDecodeSplits(
     std::uint32_t groups, int value_bits) {
+  (void)value_bits;
   if (groups == 0)
     return 0;
-  std::uint32_t splits = groups < 512 ? 18 : kKvarnMaxSplits;
-  if (value_bits == 4 && groups >= 96)
-    splits = kKvarnMaxSplits;
+  const std::uint32_t splits = groups < 24   ? 6
+                               : groups < 48 ? 8
+                               : groups < 88 ? 10
+                                             : 20;
   return std::min(splits, groups);
 }
 

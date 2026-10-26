@@ -905,73 +905,97 @@ void TimeFlush() {
   }
 }
 
-void TimeAttention() {
+// `sweep`: the shallow depths at every split count from 4 to 24 instead
+// of the policy's; `sweep2`: the policy's thresholds and the deep depths at
+// counts up to kKvarnMaxSplits (the K4-P2 choice of SelectKvarnDecodeSplits).
+void TimeAttention(int sweep) {
   struct Shape {
     unsigned depth, rows;
   };
-  constexpr Shape kShapes[] = {{4096, 1},   {4096, 8},  {32768, 1},
-                               {32768, 8},  {65536, 1}, {65536, 8},
-                               {262144, 1}, {262144, 8}};
-  for (const auto shape : kShapes) {
+  constexpr Shape kSweepShapes[] = {
+      {2048, 1},  {2048, 8},  {4096, 1},  {4096, 8},  {6144, 1},  {6144, 8},
+      {8192, 1},  {8192, 8},  {12288, 1}, {12288, 8}, {16384, 1}, {16384, 8},
+      {24576, 1}, {24576, 8}, {32768, 1}, {32768, 8}};
+  constexpr Shape kSweep2Shapes[] = {
+      {7168, 1},  {7168, 8},   {10240, 1},  {10240, 8},  {65536, 1},
+      {65536, 8}, {131072, 1}, {131072, 8}, {262144, 1}, {262144, 8}};
+  constexpr Shape kShapes[] = {
+      {2048, 1},   {2048, 8},   {4096, 1},  {4096, 8},  {8192, 1},
+      {8192, 8},   {16384, 1},  {16384, 8}, {24576, 1}, {24576, 8},
+      {32768, 1},  {32768, 8},  {65536, 1}, {65536, 8}, {131072, 1},
+      {131072, 8}, {262144, 1}, {262144, 8}};
+  for (const auto shape : sweep == 1   ? std::span<const Shape>(kSweepShapes)
+                          : sweep == 2 ? std::span<const Shape>(kSweep2Shapes)
+                                       : std::span<const Shape>(kShapes)) {
     for (const int bits : {2, 4}) {
       const unsigned groups = shape.depth / kGroup - 2;
-      const unsigned blocks = shape.depth / 256 + 1;
-      const std::size_t record_row = kKvHeads * KvarnRecord(bits).bytes;
-      const std::size_t layer_pitch = std::size_t{blocks} * 2 * record_row;
-      const std::size_t bytes = groups * record_row;
-      const unsigned copies = static_cast<unsigned>(
-          std::max<std::size_t>(1, (256ULL << 20) / bytes + 1));
-      DeviceBuffer<std::uint8_t> records(copies * layer_pitch);
-      HIP_CHECK(hipMemset(records.data(), 0x11, records.size()));
-      std::vector<std::uint32_t> table(blocks);
-      for (unsigned b = 0; b < blocks; ++b)
-        table[b] = b;
-      DeviceBuffer<std::uint32_t> dtable(table);
-      DeviceBuffer<std::uint16_t> rows_k(copies * kFp16LayerElements),
-          rows_v(copies * kFp16LayerElements);
-      HIP_CHECK(hipMemset(rows_k.data(), 0, rows_k.size() * 2));
-      HIP_CHECK(hipMemset(rows_v.data(), 0, rows_v.size() * 2));
-      DeviceBuffer<unsigned> counters(std::vector<unsigned>(kKvHeads, 0));
-      const KvarnKvView view{.value_bits = bits,
-                             .records = records.data(),
-                             .records_layer_pitch = layer_pitch,
-                             .blocks = dtable.data(),
-                             .k_rows = rows_k.data(),
-                             .v_rows = rows_v.data(),
-                             .counters = counters.data()};
-      const auto q =
-          RandomFloats(std::size_t{shape.rows} * kHeads * kDim, 1, 1.0F);
-      DeviceBuffer<float> dq(q), out(q.size());
-      const unsigned splits = gufo::hip::SelectKvarnDecodeSplits(groups, bits);
-      DeviceBuffer<float> scratch(
-          gufo::hip::KvarnScratchElements(shape.rows, splits));
-      const unsigned start = shape.depth - shape.rows;
-      const auto launch = [&](unsigned copy) {
-        gufo::hip::LaunchKvarnDecodeAttention(
-            dq.data(), nullptr, view, out.data(), copy, nullptr, start,
-            shape.rows, groups, 0, {scratch.data(), scratch.size()}, nullptr);
-      };
-      for (unsigned i = 0; i < copies; ++i)
-        launch(i);
-      HIP_CHECK(hipDeviceSynchronize());
-      const unsigned iterations = std::max(copies, 20U);
-      hipEvent_t begin, end;
-      HIP_CHECK(hipEventCreate(&begin));
-      HIP_CHECK(hipEventCreate(&end));
-      HIP_CHECK(hipEventRecord(begin, nullptr));
-      for (unsigned i = 0; i < iterations; ++i)
-        launch(i % copies);
-      HIP_CHECK(hipEventRecord(end, nullptr));
-      HIP_CHECK(hipEventSynchronize(end));
-      float ms = 0;
-      HIP_CHECK(hipEventElapsedTime(&ms, begin, end));
-      HIP_CHECK(hipEventDestroy(begin));
-      HIP_CHECK(hipEventDestroy(end));
-      std::printf(
-          "time depth=%u rows=%u fmt=k4v%d splits=%u us=%.1f MiB=%.2f "
-          "copies=%u\n",
-          shape.depth, shape.rows, bits, splits, 1000.0 * ms / iterations,
-          static_cast<double>(bytes) / (1 << 20), copies);
+      std::vector<unsigned> split_counts{
+          gufo::hip::SelectKvarnDecodeSplits(groups, bits)};
+      if (sweep == 1)
+        split_counts = {4, 6, 8, 10, 12, 14, 16, 18, 20, 24};
+      else if (sweep == 2)
+        split_counts = {8, 10, 16, 18, 20, 22, 30, 36, 38};
+      for (const unsigned splits : split_counts) {
+        if (splits > groups || splits > gufo::hip::kKvarnMaxSplits)
+          continue;
+        const unsigned blocks = shape.depth / 256 + 1;
+        const std::size_t record_row = kKvHeads * KvarnRecord(bits).bytes;
+        const std::size_t layer_pitch = std::size_t{blocks} * 2 * record_row;
+        const std::size_t bytes = groups * record_row;
+        const unsigned copies = static_cast<unsigned>(
+            std::max<std::size_t>(1, (256ULL << 20) / bytes + 1));
+        DeviceBuffer<std::uint8_t> records(copies * layer_pitch);
+        HIP_CHECK(hipMemset(records.data(), 0x11, records.size()));
+        std::vector<std::uint32_t> table(blocks);
+        for (unsigned b = 0; b < blocks; ++b)
+          table[b] = b;
+        DeviceBuffer<std::uint32_t> dtable(table);
+        DeviceBuffer<std::uint16_t> rows_k(copies * kFp16LayerElements),
+            rows_v(copies * kFp16LayerElements);
+        HIP_CHECK(hipMemset(rows_k.data(), 0, rows_k.size() * 2));
+        HIP_CHECK(hipMemset(rows_v.data(), 0, rows_v.size() * 2));
+        DeviceBuffer<unsigned> counters(std::vector<unsigned>(kKvHeads, 0));
+        const KvarnKvView view{.value_bits = bits,
+                               .records = records.data(),
+                               .records_layer_pitch = layer_pitch,
+                               .blocks = dtable.data(),
+                               .k_rows = rows_k.data(),
+                               .v_rows = rows_v.data(),
+                               .counters = counters.data()};
+        const auto q =
+            RandomFloats(std::size_t{shape.rows} * kHeads * kDim, 1, 1.0F);
+        DeviceBuffer<float> dq(q), out(q.size());
+        DeviceBuffer<float> scratch(
+            gufo::hip::KvarnScratchElements(shape.rows, splits));
+        const unsigned start = shape.depth - shape.rows;
+        const auto launch = [&](unsigned copy) {
+          gufo::hip::LaunchKvarnDecodeAttention(
+              dq.data(), nullptr, view, out.data(), copy, nullptr, start,
+              shape.rows, groups, splits, {scratch.data(), scratch.size()},
+              nullptr);
+        };
+        for (unsigned i = 0; i < copies; ++i)
+          launch(i);
+        HIP_CHECK(hipDeviceSynchronize());
+        const unsigned iterations = std::max(copies, 20U);
+        hipEvent_t begin, end;
+        HIP_CHECK(hipEventCreate(&begin));
+        HIP_CHECK(hipEventCreate(&end));
+        HIP_CHECK(hipEventRecord(begin, nullptr));
+        for (unsigned i = 0; i < iterations; ++i)
+          launch(i % copies);
+        HIP_CHECK(hipEventRecord(end, nullptr));
+        HIP_CHECK(hipEventSynchronize(end));
+        float ms = 0;
+        HIP_CHECK(hipEventElapsedTime(&ms, begin, end));
+        HIP_CHECK(hipEventDestroy(begin));
+        HIP_CHECK(hipEventDestroy(end));
+        std::printf(
+            "time depth=%u rows=%u fmt=k4v%d splits=%u us=%.1f MiB=%.2f "
+            "copies=%u\n",
+            shape.depth, shape.rows, bits, splits, 1000.0 * ms / iterations,
+            static_cast<double>(bytes) / (1 << 20), copies);
+      }
     }
   }
 }
@@ -985,9 +1009,14 @@ int main(int argc, char** argv) {
       gufo::test::HipDeviceRequirement::kOptional, "Qwen KVarN ops test");
   if (device_status != 0)
     return device_status;
+  if (argc > 1 && (std::string_view(argv[1]) == "sweep" ||
+                   std::string_view(argv[1]) == "sweep2")) {
+    TimeAttention(std::string_view(argv[1]) == "sweep" ? 1 : 2);
+    return 0;
+  }
   if (argc > 1 && std::string_view(argv[1]) == "time") {
     TimeFlush();
-    TimeAttention();
+    TimeAttention(0);
     return 0;
   }
   if (argc > 1 && std::string_view(argv[1]) == "verify") {
@@ -1035,7 +1064,8 @@ int main(int argc, char** argv) {
       TestVerifyMatchesDecode(bits, 700, 8);    // inside a group
       TestVerifyMatchesDecode(bits, 636, 8);    // across the end of group 4
       TestVerifyMatchesDecode(bits, 254, 3);    // across the end of group 1
-      TestVerifyMatchesDecode(bits, 16380, 8);  // 38 splits for K4V4
+      TestVerifyMatchesDecode(bits, 6268, 8);   // 8 then 10 splits
+      TestVerifyMatchesDecode(bits, 16380, 8);  // 20 splits
     }
   } catch (const std::exception& error) {
     std::cerr << "Qwen KVarN ops test: " << error.what() << '\n';

@@ -95,17 +95,22 @@ void TestSizes() {
 void TestSplits() {
   Expect(SelectKvarnDecodeSplits(0, 2) == 0, "no groups, no splits");
   Expect(SelectKvarnDecodeSplits(5, 2) == 5, "splits capped by groups");
-  // 4K, 32K, 64K, 128K, 256K depths (groups after the sink).
+  // 2K to 256K depths (groups after the sink), across each change of the
+  // count; both formats alike.
   for (const int bits : {2, 4}) {
-    Expect(SelectKvarnDecodeSplits(31, bits) == 18, "4K splits");
-    Expect(SelectKvarnDecodeSplits(255, bits) == (bits == 4 ? 38 : 18),
-           "32K splits");
-    Expect(SelectKvarnDecodeSplits(511, bits) == (bits == 4 ? 38 : 18),
-           "64K splits");
-    Expect(SelectKvarnDecodeSplits(1023, bits) == 38, "128K splits");
-    Expect(SelectKvarnDecodeSplits(2047, bits) == kKvarnMaxSplits,
-           "256K splits");
+    Expect(SelectKvarnDecodeSplits(15, bits) == 6, "2K splits");
+    Expect(SelectKvarnDecodeSplits(23, bits) == 6, "3K splits");
+    Expect(SelectKvarnDecodeSplits(24, bits) == 8, "3K+ splits");
+    Expect(SelectKvarnDecodeSplits(31, bits) == 8, "4K splits");
+    Expect(SelectKvarnDecodeSplits(47, bits) == 8, "6K splits");
+    Expect(SelectKvarnDecodeSplits(48, bits) == 10, "6K+ splits");
+    Expect(SelectKvarnDecodeSplits(87, bits) == 10, "11K splits");
+    Expect(SelectKvarnDecodeSplits(88, bits) == 20, "11K+ splits");
+    Expect(SelectKvarnDecodeSplits(255, bits) == 20, "32K splits");
+    Expect(SelectKvarnDecodeSplits(2047, bits) == 20, "256K splits");
   }
+  Expect(SelectKvarnDecodeSplits(2047, 4) <= kKvarnMaxSplits,
+         "splits within the scratch bound");
   Expect(KvarnReadGroups(0) == 0 && KvarnReadGroups(255) == 0 &&
              KvarnReadGroups(256) == 1 && KvarnReadGroups(383) == 1 &&
              KvarnReadGroups(384) == 2,
