@@ -20,6 +20,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "src/models/qwen/hip/kvarn_layout.hpp"
@@ -688,20 +689,57 @@ void TestVerifyMatchesDecode(int bits, unsigned start, unsigned rows) {
         scratch_span, nullptr);
   HIP_CHECK(hipDeviceSynchronize());
   const auto verified = verify_out.CopyToHost();
+  const auto verify_partials = scratch.CopyToHost();
+  const unsigned verify_rows =
+      plan.boundary != 0 ? start + rows - plan.boundary : rows;
 
   Storage decode_storage(bits, length / 256 + 1);
   gufo::hip::KvarnTail decode_tail;
   Feed(decode_storage, decode_tail, k, v, 0, start);
   DeviceBuffer<float> decode_out(q.size());
+  std::vector<float> decode_partials;
   for (unsigned r = 0; r < rows; ++r) {
     const auto step = Pass(decode_storage, decode_tail, k, v, start + r, 1);
     gufo::hip::LaunchKvarnDecodeAttention(
         dq.data() + r * width, dgate.data() + r * width, decode_storage.View(),
         decode_out.data() + r * width, kLayer, nullptr, start + r, 1,
         step.read_groups, 0, scratch_span, nullptr);
+    if (r == 0) {
+      HIP_CHECK(hipDeviceSynchronize());
+      decode_partials = scratch.CopyToHost();
+    }
   }
   HIP_CHECK(hipDeviceSynchronize());
   const auto decoded = decode_out.CopyToHost();
+  if (plan.boundary == 0) {
+    // Where the first row's decode partials differ from its verification
+    // row's (diagnostic): [kv][split][row m][max, sum, 256 outputs].
+    const unsigned r = 0, vr = 0;
+    const unsigned groups = gufo::hip::KvarnReadGroups(start + r);
+    const unsigned nsplit =
+        gufo::hip::SelectKvarnDecodeSplits(groups, bits) + 2;
+    std::string where;
+    for (unsigned kv = 0; kv < kKvHeads && where.size() < 400; ++kv)
+      for (unsigned s = 0; s < nsplit; ++s)
+        for (unsigned h = 0; h < kGqa; ++h) {
+          const float* d =
+              decode_partials.data() + ((kv * nsplit + s) * kGqa + h) * 258;
+          const float* w =
+              verify_partials.data() +
+              ((kv * nsplit + s) * kGqa * verify_rows + vr * kGqa + h) * 258;
+          unsigned first = 258;
+          for (unsigned i = 0; i < 258; ++i)
+            if (std::memcmp(d + i, w + i, 4) != 0) {
+              first = i;
+              break;
+            }
+          if (first != 258)
+            where += " kv" + std::to_string(kv) + "/s" + std::to_string(s) +
+                     "/h" + std::to_string(h) + "@" + std::to_string(first);
+        }
+    std::cout << "partials last row k4v" << bits << " start=" << start
+              << " splits=" << nsplit - 2 << " differ:" << where << '\n';
+  }
   unsigned differing_rows = 0;
   float max_abs = 0;
   std::string which;
@@ -810,6 +848,14 @@ int main(int argc, char** argv) {
   if (argc > 1 && std::string_view(argv[1]) == "time") {
     TimeAttention();
     return 0;
+  }
+  if (argc > 1 && std::string_view(argv[1]) == "verify") {
+    for (const int bits : {2, 4})
+      for (const auto [start, rows] :
+           {std::pair{100U, 8U}, std::pair{700U, 8U}, std::pair{636U, 8U},
+            std::pair{254U, 3U}})
+        TestVerifyMatchesDecode(bits, start, rows);
+    return failures == 0 ? 0 : 1;
   }
   try {
     TestWrite();
