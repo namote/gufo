@@ -378,6 +378,58 @@ void CheckStorage(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
   Expect(deferred.empty(), name + ": real vs fake bound failed");
 }
 
+// Continuation (K2-1): a KVarN slot captured into the cache's components
+// and restored into another slot is the same state byte for byte (records,
+// FP16 sink and tail ring, tail state) and decodes the same logits.
+void CheckContinuation(
+    const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
+    QwenKvCacheStorage storage) {
+  constexpr std::uint32_t kContext = 1024, kPrompt = 300, kEnd = 646;
+  auto policy = gufo::hip::QwenExecutionPolicy::Production();
+  policy.kv_cache_storage = storage;
+  const std::string name(gufo::hip::QwenKvCacheStorageName(storage));
+  gufo::testing::kvarn::Session source(model, kContext, policy);
+  auto& executor = source.Executor();
+  const auto tokens = Fixture(executor, kEnd + 1);
+  (void)executor.ForwardPromptBatch(std::span(tokens).first(kPrompt));
+  for (std::uint32_t pos = kPrompt; pos < kEnd; ++pos)
+    (void)executor.ForwardToken(tokens[pos], pos);
+  const auto captured = source.Capture();
+  std::size_t records = 0;
+  for (std::size_t i = 0; i < captured.positions.size(); ++i)
+    if (source.IsRows(i)) {
+      ++records;
+      // Records count the quantized groups: those that ended at or before
+      // the last decode step's position (645), not its own partial one.
+      Expect(captured.positions[i].valid_rows == 640,
+             name + ": KVarN record rows " +
+                 std::to_string(captured.positions[i].valid_rows));
+    }
+  Expect(records == 16, name + ": KVarN record components");
+
+  gufo::testing::kvarn::Session restored(model, kContext, policy);
+  restored.Restore(captured);
+  const auto again = restored.Capture();
+  Expect(again.positions == captured.positions,
+         name + ": restored positions differ");
+  std::size_t differing = 0;
+  for (std::size_t i = 0; i < captured.components.size(); ++i)
+    differing += captured.components[i] != again.components[i];
+  std::cout << name << " continuation: " << captured.components.size()
+            << " components, " << differing << " differ after restore\n";
+  Expect(differing == 0, name + ": a restored KVarN state differs");
+
+  (void)executor.ForwardToken(tokens[kEnd], kEnd);
+  const auto expected = Logits(executor);
+  auto& copy = restored.Executor();
+  (void)copy.ForwardToken(tokens[kEnd], kEnd);
+  const auto actual = Logits(copy);
+  Expect(std::memcmp(expected.data(), actual.data(),
+                     expected.size() * sizeof(float)) == 0,
+         name + ": a restored KVarN slot decodes differently");
+  std::cout << name << " continuation decode after restore: exact\n";
+}
+
 }  // namespace
 
 int main(int argc, const char* const* argv) {
@@ -396,11 +448,15 @@ int main(int argc, const char* const* argv) {
     Expect(model != nullptr, error);
     Expect(model->GetConfig().hidden_size == 5120,
            "the KVarN check requires Qwen3.8 27B");
+    const bool continuation_only =
+        argc > 2 && std::string_view(argv[2]) == "--continuation-only";
     bool failed = false;
     for (const auto storage :
          {QwenKvCacheStorage::kKvarnK4V2, QwenKvCacheStorage::kKvarnK4V4}) {
       try {
-        CheckStorage(model, storage);
+        CheckContinuation(model, storage);
+        if (!continuation_only)
+          CheckStorage(model, storage);
       } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         failed = true;

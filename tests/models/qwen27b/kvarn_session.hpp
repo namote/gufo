@@ -43,8 +43,10 @@ struct State {
 class Session {
 public:
   Session(std::shared_ptr<const gufo::hip::QwenGpuModel> model,
-          std::uint32_t context)
-      : adapter_(std::move(model), context, {'k', 'v', 'a', 'r', 'n'}),
+          std::uint32_t context,
+          gufo::hip::QwenExecutionPolicy policy =
+              gufo::hip::QwenExecutionPolicy::Production())
+      : adapter_(std::move(model), context, {'k', 'v', 'a', 'r', 'n'}, policy),
         slot_(adapter_.CreateSlot(guard_)),
         streams_(1) {}
 
