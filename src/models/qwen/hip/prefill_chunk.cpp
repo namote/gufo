@@ -340,7 +340,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
             arena_.GetKvarnView(), arena_.d_ssm_out, attn_layer_idx, start_pos,
             static_cast<std::uint32_t>(batch_size), kvarn_plan,
             attention_workspace.gate, attention_workspace.up,
-            arena_.GetKvarnStaging(), output_first_row, arena_.stream);
+            arena_.GetKvarnStaging(attn_layer_idx, arena_.stream),
+            output_first_row, arena_.stream);
       } else {
         const bool kv_already_written = fused_qknorm_rope_kv;
         const bool wmma_attention = LaunchQwenWmmaAttention(
@@ -692,6 +693,10 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
     HIP_CHECK(hipStreamSynchronize(arena_.stream));
   }
   last_hidden_offset_ = (batch_size - 1) * hidden_size;
+
+  // KVarN: the chunk's groups are quantized before anything reads them.
+  if (arena_.UsesKvarn())
+    arena_.FinishKvarnPrefill(arena_.stream);
 
   if (!compute_logits) {
     write.Commit(start_pos + static_cast<std::uint32_t>(batch_size), false);

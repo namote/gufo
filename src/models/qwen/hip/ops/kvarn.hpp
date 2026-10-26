@@ -76,6 +76,19 @@ void LaunchKvarnPassAttention(const float* q, const float* k, const float* v,
                               const KvarnPassPlan& plan,
                               std::span<float> scratch, hipStream_t stream);
 
+/// Where one layer of a prompt chunk stages its rows (KvarnStagingRows(rows)
+/// rows of K then V) and quantizes the groups it completes. With a
+/// quantize stream the quantizer runs there, after `ready` (recorded on the
+/// pass stream once the rows are staged), and records `done`: it overlaps
+/// the next layers instead of stalling the pass for its latency. Without
+/// one it runs on the pass stream.
+struct KvarnStaging {
+  std::span<std::uint16_t> rows;
+  hipStream_t quantize_stream{nullptr};
+  hipEvent_t ready{nullptr};
+  hipEvent_t done{nullptr};
+};
+
 /// One layer of a prompt chunk over rows [start, start + rows) planned by
 /// PlanKvarnPrefill. Packs the K/V of positions [0, start + rows) in the
 /// original frame into the head-major WMMA workspaces (quantized groups and
@@ -86,15 +99,12 @@ void LaunchKvarnPassAttention(const float* q, const float* k, const float* v,
 /// quantized from `staging` (KvarnStagingRows(rows) rows of K then V), the
 /// rest into the ring. Throws std::length_error when one head does not fit
 /// the workspaces.
-void LaunchKvarnPrefillAttention(const float* q, const float* k, const float* v,
-                                 const float* gate, const KvarnKvView& kv,
-                                 float* out_context, std::uint32_t layer,
-                                 std::uint32_t start, std::uint32_t rows,
-                                 const KvarnPrefillPlan& plan,
-                                 std::span<float> packed_k_workspace,
-                                 std::span<float> packed_v_workspace,
-                                 std::span<std::uint16_t> staging,
-                                 std::size_t first_query, hipStream_t stream);
+void LaunchKvarnPrefillAttention(
+    const float* q, const float* k, const float* v, const float* gate,
+    const KvarnKvView& kv, float* out_context, std::uint32_t layer,
+    std::uint32_t start, std::uint32_t rows, const KvarnPrefillPlan& plan,
+    std::span<float> packed_k_workspace, std::span<float> packed_v_workspace,
+    const KvarnStaging& staging, std::size_t first_query, hipStream_t stream);
 
 /// The prefill WMMA attention (kernels/attention_wmma.hip) over KV heads
 /// [first_head, first_head + heads) already packed head-major: K

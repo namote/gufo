@@ -624,7 +624,7 @@ QwenGpuMemoryUsage QwenGpuArena::EstimateMemoryUsage(
     AddAllocation(KvarnScratchElements(kKvarnMaxRows, kKvarnMaxSplits),
                   sizeof(float), &scratch);
     AddAllocation(
-        CheckedMultiply(2 * KvarnStagingRows(static_cast<std::uint32_t>(batch)),
+        CheckedMultiply(4 * KvarnStagingRows(static_cast<std::uint32_t>(batch)),
                         kv),
         sizeof(std::uint16_t), &scratch);
     CheckedAdd(RecurrentStateBytes(config, policy), &state);
@@ -1109,8 +1109,14 @@ void QwenGpuArena::AllocateKvarn() {
       KvarnScratchElements(kKvarnMaxRows, kKvarnMaxSplits);
   HIP_CHECK(
       hipMalloc(&kvarn_.d_scratch, kvarn_.scratch_elements * sizeof(float)));
-  kvarn_.staging_elements = 2 * KvarnStagingRows(max_batch_) *
+  // Two buffers (K then V each): a layer's quantization overlaps the next.
+  kvarn_.staging_elements = 4 * KvarnStagingRows(max_batch_) *
                             config_.num_key_value_heads * config_.head_dim;
+  HIP_CHECK(
+      hipStreamCreateWithFlags(&kvarn_.quantize_stream, hipStreamNonBlocking));
+  for (auto* events : {&kvarn_.staged, &kvarn_.quantized})
+    for (auto& event : *events)
+      HIP_CHECK(hipEventCreateWithFlags(&event, hipEventDisableTiming));
   HIP_CHECK(hipMalloc(&kvarn_.d_staging,
                       kvarn_.staging_elements * sizeof(std::uint16_t)));
   HIP_CHECK(hipMalloc(&kvarn_.d_counters, kKvarnKvHeads * sizeof(unsigned)));
@@ -1150,6 +1156,22 @@ KvarnPassPlan QwenGpuArena::PrepareKvarnPass(std::uint32_t start,
   kvarn_.tail.flushed_end = plan.flushed_end;
   kvarn_.tail.written_end = std::max(kvarn_.tail.written_end, start + rows);
   return plan;
+}
+
+KvarnStaging QwenGpuArena::GetKvarnStaging(std::uint32_t layer,
+                                           hipStream_t pass_stream) {
+  const std::size_t slot = layer % 2;
+  const std::size_t half = kvarn_.staging_elements / 2;
+  HIP_CHECK(hipStreamWaitEvent(pass_stream, kvarn_.quantized[slot], 0));
+  return {.rows = {kvarn_.d_staging + slot * half, half},
+          .quantize_stream = kvarn_.quantize_stream,
+          .ready = kvarn_.staged[slot],
+          .done = kvarn_.quantized[slot]};
+}
+
+void QwenGpuArena::FinishKvarnPrefill(hipStream_t pass_stream) {
+  for (const auto event : kvarn_.quantized)
+    HIP_CHECK(hipStreamWaitEvent(pass_stream, event, 0));
 }
 
 KvarnPrefillPlan QwenGpuArena::PrepareKvarnPrefill(std::uint32_t start,
@@ -1789,6 +1811,14 @@ void QwenGpuArena::FreeAll() noexcept {
     LogCleanupError(hipFree(kvarn_.d_staging));
   if (kvarn_.d_counters != nullptr)
     LogCleanupError(hipFree(kvarn_.d_counters));
+  for (auto* events : {&kvarn_.staged, &kvarn_.quantized})
+    for (const auto event : *events)
+      if (event != nullptr)
+        LogCleanupError(hipEventDestroy(event));
+  if (kvarn_.quantize_stream != nullptr) {
+    LogCleanupError(hipStreamSynchronize(kvarn_.quantize_stream));
+    LogCleanupError(hipStreamDestroy(kvarn_.quantize_stream));
+  }
   kvarn_ = {};
   for (float* buffer : d_ssm_conv_buffers_)
     if (buffer != nullptr)
