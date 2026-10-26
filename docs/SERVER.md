@@ -75,15 +75,17 @@ Text serving defaults match llama.cpp for context and generation length:
 | --- | --- |
 | `--context` | `0`: native context from model metadata, per session |
 | `--enable-yarn` | Off; Flash-Next requires it for `--context` above 262144 |
-| `--kv-cache-type` | Model default, currently `fp16` for every model |
+| `--kv-cache-type` | Model default: `fp16` on Qwen3.8, FP8 (not selectable) on DeepSeek |
 | `--max-tokens` | `-1`: until EOS or remaining context is exhausted |
 | `--sessions` | `1` |
 | Thinking / reasoning effort | Enabled; Qwen `xhigh`, DeepSeek `high` |
 
-`--kv-cache-type fp16|kvarn-k4v2|kvarn-k4v4` selects attention KV storage.
-Qwen3.8-27B accepts the KVarN values at startup but refuses them before mapping
-weights as not implemented yet; Flash-Next and DeepSeek V4 Flash accept only
-`fp16` and refuse KVarN by model name. The type is part of the Qwen
+`--kv-cache-type fp16|kvarn-k4v2|kvarn-k4v4` selects attention KV storage; a
+model takes an explicit value only when it stores KV that way. Qwen3.8-27B
+accepts the KVarN values at startup but refuses them before mapping weights as
+not implemented yet. Flash-Next stores FP16 KV and accepts only `fp16`.
+DeepSeek V4 Flash keeps FP8 KV and refuses any value: `DeepSeek V4 Flash does
+not take --kv-cache-type (its KV cache is FP8)`. The type is part of the Qwen
 continuation identity (`kv_storage=` and the state ABI), so checkpoints made
 with one KV type are never restored into another.
 

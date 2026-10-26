@@ -42,9 +42,10 @@ sampling defaults are described in [the server guide](../../SERVER.md#reasoning-
 full-attention layers). `kvarn-k4v2` and `kvarn-k4v4` are reserved for KVarN
 storage (Hadamard-rotated 4-bit keys with 2- or 4-bit values). Until its
 kernels land, both are refused before weights load with
-`--kv-cache-type kvarn-k4v2 is not implemented yet for Qwen3.8-27B`. The CPU
-`--cpu` route accepts only `fp16`. Each type has its own policy fingerprint
-and continuation identity, so cached checkpoints never cross types.
+`--kv-cache-type kvarn-k4v2 is not implemented yet for Qwen3.8-27B`. The
+`--cpu` route keeps FP32 KV and refuses any `--kv-cache-type`. Each type has
+its own policy fingerprint and continuation identity, so cached checkpoints
+never cross types.
 
 ## Images
 

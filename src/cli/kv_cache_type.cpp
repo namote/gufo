@@ -3,22 +3,38 @@
 namespace gufo::cli {
 namespace {
 
-// Text model families by GGUF architecture, for user-facing refusals.
-std::string TextModelName(std::string_view architecture) {
-  if (architecture == "qwen35")
-    return "Qwen3.8-27B";
-  if (architecture == "qwen4exp")
-    return "Qwen3.8-Flash-Next";
-  if (architecture == "deepseek4")
-    return "DeepSeek V4 Flash";
-  if (architecture == "gemma4")
-    return "Gemma 4";
-  return "architecture '" + std::string(architecture) + "'";
+// Attention KV each text runtime stores, by GGUF architecture. A model takes
+// an explicit --kv-cache-type value only when it stores KV that way.
+struct TextModelKv {
+  std::string_view architecture;
+  std::string_view name;
+  std::string_view kv_storage;  // Empty: no text runtime in this build.
+  bool fp16;
+  bool kvarn;
+};
+
+// Qwen3.8-27B: FP16 rows by default (QwenExecutionPolicy::kv_cache_storage).
+// Flash-Next: __half k_cache/v_cache (qwen38_flash_next executor.cpp).
+// DeepSeek V4 Flash: E4M3 FP8 KV (ds4_rocm_fp8_kv.hip.hpp).
+constexpr TextModelKv kTextModels[] = {
+    {"qwen35", "Qwen3.8-27B", "FP16", true, true},
+    {"qwen4exp", "Qwen3.8-Flash-Next", "FP16", true, false},
+    {"deepseek4", "DeepSeek V4 Flash", "FP8", false, false},
+    {"gemma4", "Gemma 4", "", false, false},
+};
+
+TextModelKv FindTextModel(std::string_view architecture) {
+  for (const auto& model : kTextModels) {
+    if (model.architecture == architecture)
+      return model;
+  }
+  return {architecture, {}, {}, false, false};
 }
 
-// Only Qwen3.8-27B has a KVarN representation.
-bool SupportsKvarn(std::string_view architecture) noexcept {
-  return architecture == "qwen35";
+std::string TextModelName(const TextModelKv& model) {
+  return model.name.empty()
+             ? "architecture '" + std::string(model.architecture) + "'"
+             : std::string(model.name);
 }
 
 }  // namespace
@@ -41,8 +57,8 @@ void RegisterKvCacheTypeOption(ArgParser& parser,
                                std::string_view group) {
   parser.AddCustomOption(
       "", "--kv-cache-type", "TYPE",
-      "Attention KV storage: fp16, kvarn-k4v2 or kvarn-k4v4 (default: per "
-      "model, currently fp16)",
+      "Attention KV storage: fp16, kvarn-k4v2 or kvarn-k4v4, where the model "
+      "stores it (default: per model; fp16 on Qwen3.8-27B and Flash-Next)",
       group,
       [target](std::string_view, std::string_view value, std::string* error) {
         const auto type = ParseKvCacheType(value);
@@ -56,24 +72,42 @@ void RegisterKvCacheTypeOption(ArgParser& parser,
       });
 }
 
-KvCacheType DefaultKvCacheType(std::string_view architecture) noexcept {
+std::optional<KvCacheType> DefaultKvCacheType(
+    std::string_view architecture) noexcept {
   // Qwen3.8-27B moves to kvarn-k4v2 once its quality and speed gate passes.
-  (void)architecture;
-  return KvCacheType::kFp16;
+  if (FindTextModel(architecture).fp16)
+    return KvCacheType::kFp16;
+  return std::nullopt;
 }
 
-std::optional<KvCacheType> ResolveKvCacheType(
-    std::string_view architecture, std::optional<KvCacheType> requested,
-    std::string* error) {
-  const KvCacheType type = requested.value_or(DefaultKvCacheType(architecture));
-  if (type != KvCacheType::kFp16 && !SupportsKvarn(architecture)) {
-    if (error != nullptr)
-      *error = "--kv-cache-type " + std::string(KvCacheTypeName(type)) +
-               " is not supported by " + TextModelName(architecture) +
-               "; it accepts only fp16";
-    return std::nullopt;
+bool ResolveKvCacheType(std::string_view architecture,
+                        std::optional<KvCacheType> requested,
+                        std::optional<KvCacheType>* resolved,
+                        std::string* error) {
+  const auto model = FindTextModel(architecture);
+  if (!requested) {
+    *resolved = DefaultKvCacheType(architecture);
+    return true;
   }
-  return type;
+  const bool accepted =
+      *requested == KvCacheType::kFp16 ? model.fp16 : model.kvarn;
+  if (accepted) {
+    *resolved = requested;
+    return true;
+  }
+  if (error != nullptr) {
+    if (!model.fp16) {
+      *error = TextModelName(model) + " does not take --kv-cache-type";
+      if (!model.kv_storage.empty())
+        *error += " (its KV cache is " + std::string(model.kv_storage) + ")";
+    } else {
+      *error = "--kv-cache-type " + std::string(KvCacheTypeName(*requested)) +
+               " is not supported by " + TextModelName(model) + "; its KV " +
+               "cache is " + std::string(model.kv_storage) +
+               ", so it accepts only fp16";
+    }
+  }
+  return false;
 }
 
 hip::QwenKvCacheStorage QwenKvCacheStorageFor(KvCacheType type) noexcept {
@@ -88,9 +122,11 @@ hip::QwenKvCacheStorage QwenKvCacheStorageFor(KvCacheType type) noexcept {
   return hip::QwenKvCacheStorage::kFp16;
 }
 
-hip::QwenExecutionPolicy QwenExecutionPolicyFor(KvCacheType type) noexcept {
+hip::QwenExecutionPolicy QwenExecutionPolicyFor(
+    std::optional<KvCacheType> type) noexcept {
   auto policy = hip::QwenExecutionPolicy::Production();
-  policy.kv_cache_storage = QwenKvCacheStorageFor(type);
+  if (type)
+    policy.kv_cache_storage = QwenKvCacheStorageFor(*type);
   return policy;
 }
 

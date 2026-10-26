@@ -3147,9 +3147,9 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     SetError(error, "--enable-yarn applies only to Qwen3.8-Flash-Next");
     return false;
   }
-  const auto resolved_kv_cache_type =
-      cli::ResolveKvCacheType(architecture, kv_cache_type, &load_error);
-  if (!resolved_kv_cache_type) {
+  std::optional<cli::KvCacheType> resolved_kv_cache_type;
+  if (!cli::ResolveKvCacheType(architecture, kv_cache_type,
+                               &resolved_kv_cache_type, &load_error)) {
     SetError(error, load_error);
     return false;
   }
@@ -3321,7 +3321,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   }
   // Refuse a storage the executor cannot run before mapping 27B weights.
   const auto execution_policy =
-      cli::QwenExecutionPolicyFor(*resolved_kv_cache_type);
+      cli::QwenExecutionPolicyFor(resolved_kv_cache_type);
   if (const auto unsupported =
           hip::QwenExecutionPolicyUnsupportedReason(execution_policy);
       !unsupported.empty()) {

@@ -1307,10 +1307,10 @@ int RunBench(std::span<const char* const> args) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
-  const auto kv_cache_type = ResolveKvCacheType(
-      reader->GetMetadataString("general.architecture").value_or(""),
-      opt.kv_cache_type, &err);
-  if (!kv_cache_type) {
+  std::optional<KvCacheType> kv_cache_type;
+  if (!ResolveKvCacheType(
+          reader->GetMetadataString("general.architecture").value_or(""),
+          opt.kv_cache_type, &kv_cache_type, &err)) {
     std::cerr << "Error: " << err << '\n';
     PrintModelLoadTime(model_load_start, false);
     return 1;
@@ -1376,7 +1376,7 @@ int RunBench(std::span<const char* const> args) {
 
   auto gpu_exec = hip::QwenGpuExecutor::CreateFromGguf(
       reader, &err, static_cast<std::uint32_t>(required_context),
-      QwenExecutionPolicyFor(*kv_cache_type));
+      QwenExecutionPolicyFor(kv_cache_type));
   if (!gpu_exec) {
     std::cerr << "Error creating Qwen GPU executor: " << err << "\n";
     PrintModelLoadTime(model_load_start, false);

@@ -308,24 +308,26 @@ void ResolvePromptSampling(const core::GgufReader& reader, PromptOptions* opt) {
       opt->sampling_supplied);
 }
 
-// Resolves --kv-cache-type for the artifact before weights load.
-std::optional<KvCacheType> ResolvePromptKvCacheType(
-    const core::GgufReader& reader, const PromptOptions& opt) {
+// Resolves --kv-cache-type for the artifact before weights load. False:
+// refused, with the reason printed.
+bool ResolvePromptKvCacheType(const core::GgufReader& reader,
+                              const PromptOptions& opt,
+                              std::optional<KvCacheType>* resolved) {
   std::string error;
-  auto type = ResolveKvCacheType(
-      reader.GetMetadataString("general.architecture").value_or(""),
-      opt.kv_cache_type, &error);
-  if (!type)
-    std::cerr << "Error: " << error << '\n';
-  return type;
+  if (ResolveKvCacheType(
+          reader.GetMetadataString("general.architecture").value_or(""),
+          opt.kv_cache_type, resolved, &error))
+    return true;
+  std::cerr << "Error: " << error << '\n';
+  return false;
 }
 
-// The CPU generator keeps its own reference KV; it has no KVarN form.
-bool RequireCpuKvCacheType(KvCacheType type) {
-  if (type == KvCacheType::kFp16)
+// The CPU generator keeps FP32 KV (QwenKvCache), so it takes no type.
+bool RequireCpuKvCacheType(const PromptOptions& opt) {
+  if (!opt.kv_cache_type)
     return true;
-  std::cerr << "Error: --kv-cache-type " << KvCacheTypeName(type)
-            << " requires the ROCm backend\n";
+  std::cerr << "Error: the CPU Qwen generator does not take --kv-cache-type "
+               "(its KV cache is FP32)\n";
   return false;
 }
 
@@ -1027,8 +1029,8 @@ int RunPrompt(std::span<const char* const> args) {
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
   ResolvePromptSampling(*reader, &opt);
-  const auto kv_cache_type = ResolvePromptKvCacheType(*reader, opt);
-  if (!kv_cache_type) {
+  std::optional<KvCacheType> kv_cache_type;
+  if (!ResolvePromptKvCacheType(*reader, opt, &kv_cache_type)) {
     PrintModelLoadTime(model_load_start, false);
     return 1;
   }
@@ -1112,7 +1114,7 @@ int RunPrompt(std::span<const char* const> args) {
   if (!opt.force_cpu && hipGetDeviceCount(&dev_count) == hipSuccess &&
       dev_count > 0) {
     auto gpu_exec = gufo::hip::QwenGpuExecutor::CreateFromGguf(
-        reader, &err, kDefaultContext, QwenExecutionPolicyFor(*kv_cache_type));
+        reader, &err, kDefaultContext, QwenExecutionPolicyFor(kv_cache_type));
     if (gpu_exec) {
       PrintModelLoadTime(model_load_start);
       auto prompt_tokens = encode_prompt(gpu_exec->GetTokenizer());
@@ -1172,7 +1174,7 @@ int RunPrompt(std::span<const char* const> args) {
     std::cerr << "Qwen speculative decoding requires the ROCm backend\n";
     return 1;
   }
-  if (!RequireCpuKvCacheType(*kv_cache_type))
+  if (!RequireCpuKvCacheType(opt))
     return 1;
   auto generator = models::QwenGenerator::CreateFromGguf(*reader, &err);
   if (!generator) {
@@ -1258,8 +1260,8 @@ int RunChat(std::span<const char* const> args) {
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
   ResolvePromptSampling(*reader, &opt);
-  const auto kv_cache_type = ResolvePromptKvCacheType(*reader, opt);
-  if (!kv_cache_type) {
+  std::optional<KvCacheType> kv_cache_type;
+  if (!ResolvePromptKvCacheType(*reader, opt, &kv_cache_type)) {
     PrintModelLoadTime(model_load_start, false);
     return 1;
   }
@@ -1309,7 +1311,7 @@ int RunChat(std::span<const char* const> args) {
   if (tokenizer == nullptr && !opt.force_cpu &&
       hipGetDeviceCount(&device_count) == hipSuccess && device_count > 0) {
     gpu_executor = hip::QwenGpuExecutor::CreateFromGguf(
-        reader, &err, kDefaultContext, QwenExecutionPolicyFor(*kv_cache_type));
+        reader, &err, kDefaultContext, QwenExecutionPolicyFor(kv_cache_type));
     if (!gpu_executor) {
       std::cerr << "Error creating Qwen GPU executor: " << err << '\n';
       PrintModelLoadTime(model_load_start, false);
@@ -1340,7 +1342,7 @@ int RunChat(std::span<const char* const> args) {
       std::cerr << "Qwen speculative decoding requires the ROCm backend\n";
       return 1;
     }
-    if (!RequireCpuKvCacheType(*kv_cache_type))
+    if (!RequireCpuKvCacheType(opt))
       return 1;
     generator = models::QwenGenerator::CreateFromGguf(*reader, &err);
     if (!generator) {

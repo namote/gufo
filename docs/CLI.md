@@ -37,11 +37,13 @@ The supported model types are LLM, image, video, audio (TTS, ASR), and text embe
   above 262144 and rejected at or below it.
 - `kvCacheType` (`"fp16"` / `"kvarn-k4v2"` / `"kvarn-k4v4"`) — how attention
   keys and values are stored, for `serve llm`, `prompt`, `chat` and `bench`.
-  Unset, each model uses its default, currently `fp16` for every model.
-  `kvarn-k4v2` and `kvarn-k4v4` (KVarN: 4-bit keys with 2- or 4-bit values)
-  are planned for Qwen3.8-27B only; they are refused at startup as not
-  implemented yet. Other models accept only `fp16` and refuse KVarN by name.
-  Nothing falls back to another type silently.
+  A model takes an explicit value only when it stores KV that way. Unset,
+  each model keeps its default: `fp16` on Qwen3.8-27B and Flash-Next, FP8 on
+  DeepSeek V4 Flash. `kvarn-k4v2` and `kvarn-k4v4` (KVarN: 4-bit keys with
+  2- or 4-bit values) are planned for Qwen3.8-27B only and are refused at
+  startup as not implemented yet. Flash-Next accepts only `fp16`; DeepSeek V4
+  Flash and Qwen's `--cpu` route (FP32 KV) refuse any value, naming the
+  model. Nothing falls back to another type silently.
 - `prefillChunk` — prompt tokens processed between active decode steps in
   HTTP serving. Model runtimes choose their own internal prefill batch sizes.
 - `maxTokens` — maximum number of tokens a request may generate. In practice:
