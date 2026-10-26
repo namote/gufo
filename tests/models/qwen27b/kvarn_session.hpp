@@ -45,8 +45,10 @@ public:
   Session(std::shared_ptr<const gufo::hip::QwenGpuModel> model,
           std::uint32_t context,
           gufo::hip::QwenExecutionPolicy policy =
-              gufo::hip::QwenExecutionPolicy::Production())
-      : adapter_(std::move(model), context, {'k', 'v', 'a', 'r', 'n'}, policy),
+              gufo::hip::QwenExecutionPolicy::Production(),
+          std::shared_ptr<gufo::hip::KvBlockPool> kv_pool = nullptr)
+      : adapter_(std::move(model), context, {'k', 'v', 'a', 'r', 'n'}, policy,
+                 nullptr, {}, nullptr, nullptr, std::move(kv_pool)),
         slot_(adapter_.CreateSlot(guard_)),
         streams_(1) {}
 

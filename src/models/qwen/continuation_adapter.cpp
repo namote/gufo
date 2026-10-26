@@ -1267,6 +1267,13 @@ bool ContinuationAdapter::Validate(
         return refuse();
       executor.arena_.kvarn_.tail = {.flushed_end = header.flushed_end,
                                      .written_end = header.written_end};
+      // Records end at a group boundary, which can end a pool block before
+      // the restored rows do; the blocks past it hold no records yet.
+      auto& arena = executor.arena_;
+      for (auto logical = hip::KvBlockPool::BlocksFor(
+               static_cast<std::uint32_t>(expected_records));
+           logical < arena.GetKvBlocks().size(); ++logical)
+        arena.EnsureKvRestoreBlock(static_cast<std::uint32_t>(logical));
     }
     executor.arena_.DisableSsmReplayCapture();
     // Blocks this restore mapped instead of copying.

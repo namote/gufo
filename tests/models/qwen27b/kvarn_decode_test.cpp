@@ -380,15 +380,27 @@ void CheckStorage(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
 
 // Continuation (K2-1): a KVarN slot captured into the cache's components
 // and restored into another slot is the same state byte for byte (records,
-// FP16 sink and tail ring, tail state) and decodes the same logits.
+// FP16 sink and tail ring, tail state) and decodes the same logits. With
+// `pooled`, both slots take blocks from one shared pool, as serving does.
 void CheckContinuation(
     const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
-    QwenKvCacheStorage storage) {
-  constexpr std::uint32_t kContext = 1024, kPrompt = 300, kEnd = 646;
+    QwenKvCacheStorage storage, std::uint32_t kPrompt, std::uint32_t kEnd,
+    bool pooled) {
+  constexpr std::uint32_t kContext = 1024;
   auto policy = gufo::hip::QwenExecutionPolicy::Production();
   policy.kv_cache_storage = storage;
-  const std::string name(gufo::hip::QwenKvCacheStorageName(storage));
-  gufo::testing::kvarn::Session source(model, kContext, policy);
+  const auto& config = model->GetConfig();
+  const auto pool =
+      pooled ? std::make_shared<gufo::hip::KvBlockPool>(
+                   gufo::hip::QwenKvBlockPlanes(
+                       config.FullAttentionLayerCount(),
+                       config.num_key_value_heads, config.head_dim, storage),
+                   16)
+             : nullptr;
+  const std::string name =
+      std::string(gufo::hip::QwenKvCacheStorageName(storage)) +
+      (pooled ? " pooled" : "") + " at " + std::to_string(kEnd);
+  gufo::testing::kvarn::Session source(model, kContext, policy, pool);
   auto& executor = source.Executor();
   const auto tokens = Fixture(executor, kEnd + 1);
   (void)executor.ForwardPromptBatch(std::span(tokens).first(kPrompt));
@@ -396,18 +408,19 @@ void CheckContinuation(
     (void)executor.ForwardToken(tokens[pos], pos);
   const auto captured = source.Capture();
   std::size_t records = 0;
+  // Records count the quantized groups: those that ended at or before the
+  // last decode step's position, not its own partial one.
+  const auto quantized = kEnd / 128 * 128;
   for (std::size_t i = 0; i < captured.positions.size(); ++i)
     if (source.IsRows(i)) {
       ++records;
-      // Records count the quantized groups: those that ended at or before
-      // the last decode step's position (645), not its own partial one.
-      Expect(captured.positions[i].valid_rows == 640,
+      Expect(captured.positions[i].valid_rows == quantized,
              name + ": KVarN record rows " +
                  std::to_string(captured.positions[i].valid_rows));
     }
   Expect(records == 16, name + ": KVarN record components");
 
-  gufo::testing::kvarn::Session restored(model, kContext, policy);
+  gufo::testing::kvarn::Session restored(model, kContext, policy, pool);
   restored.Restore(captured);
   const auto again = restored.Capture();
   Expect(again.positions == captured.positions,
@@ -454,7 +467,11 @@ int main(int argc, const char* const* argv) {
     for (const auto storage :
          {QwenKvCacheStorage::kKvarnK4V2, QwenKvCacheStorage::kKvarnK4V4}) {
       try {
-        CheckContinuation(model, storage);
+        // 646: records end inside the last block; 530: records end at
+        // the block boundary 512 and the restored rows reach into a block
+        // without records.
+        CheckContinuation(model, storage, 300, 646, false);
+        CheckContinuation(model, storage, 520, 530, true);
         if (!continuation_only)
           CheckStorage(model, storage);
       } catch (const std::exception& error) {
