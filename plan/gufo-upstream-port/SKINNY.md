@@ -150,6 +150,22 @@ repetition C8: TG base 128.50 129.11 new 129.41 129.42 -> +0.5% | outputs identi
 
 판정: s-w2의 `batch_c2_greedy_short_replies_match_serial` inconclusive는 기준끼리도 같은 크기로 나오므로 이 변경의 퇴보로 볼 근거가 없다. 그대로 **inconclusive**. fn3-3-new의 실패는 동시 요청이 batched로 겹치지 않은 coverage 실패로, 같은 바이너리의 fn3-1-new에서는 겹쳤다. 원인 미확인(재실행 안 함), 기록만.
 
+## 창 `skinny-s-w4-a01/s-w4` (fn3-3 원인 확인)
+
+창 FAILED_no_fallback(fn4-0-new의 assert), health PASS, 재시도 없음. 같은 바이너리, `.gufo-revision` `8dd3b7d2`(코드는 4fc0211d와 같음). `batch`를 `--through-case batch:batch_c2_greedy_short_replies_match_serial`까지 새 server로 8번, 순서 N B B N N B B N. 판정 규칙은 데이터 전에 감독이 정함: 모든 new 값 < 모든 base 값이거나, 두 절반(NBBN, NBBN) 모두 new 평균이 낮으면 변경 탓.
+
+`batch_c2_greedy_short_replies_match_serial`의 16행 중 batched 행 수(`execution_plan` = `batched-w2`):
+
+|창|순서대로|
+|---|---|
+|s-w2|base 6, new 2|
+|s-w3|base 10, new 6, base 4, new 0(assert 실패)|
+|s-w4|new 0(assert 실패), base 6, base 4, new 4, new 8, base 2, base 4, new 8|
+
+s-w4: new {0, 4, 8, 8}, base {6, 4, 2, 4}. 모든 new < 모든 base 아님. 첫 절반 new 평균 2 < base 5, 둘째 절반 new 8 > base 3 → 규칙상 **변경 탓 아님, timing race**. base도 2/16까지 내려가고 new가 8/16까지 오른다.
+
+결론: `check_batches`의 "16행 중 하나라도 batched" assert(`openai_sdk.py:788`)는 **이전부터 있던 flaky assert**다. 두 요청이 같은 verification에서 만나는지는 scheduler timing(prefill 교차, `decode_due`, `assemble_initial_batch`)이 정하고, 첫 공동 step 전에 도는 코드(prefill GEMM, 8행 이하 verify·draft)는 이 변경이 건드리지 않는다. RAM ledger(7.87·8.14 GB, 8 GiB 아래)와 admission 이벤트도 원인이 아니다. 테스트·마진은 바꾸지 않았다.
+
 ## 상태
 
 (a)·(b) 채택. (c) 버림(위 Q6 FFN 규칙은 기록만).
