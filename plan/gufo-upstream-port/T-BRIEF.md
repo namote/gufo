@@ -20,3 +20,10 @@
 - gufo 브랜치 `ai-tools/port-u4f`에 직접 커밋, push·PR·이슈 없음. 한 줄 Conventional Commits + 감독이 준 trailer. C++ 커밋 전 format check. 자기 파일만 `git add`, 관련 없는 작업 보존.
 - GPU: ai.tools 창 실행기로만, 한 번에 하나, 창 전 `.gufo-revision` = HEAD, 창 끝 `sleep 20`, 자동 재시도 없음, 실패 포함 모든 결과 보존. GPU 창이 도는 동안 빌드 등 CPU 부하 작업 금지. 둘을 한 창에 묶어도 된다.
 - 결과는 `plan/gufo-upstream-port/T-RESULTS.md`(새 파일)에.
+
+## T1b: capture 복귀 스케줄 (2026-10-28 사용자: "스케줄러 수정")
+
+- 근거: T-RESULTS.md. 짧은 요청은 `cache_prompt: false`여도 prompt snapshot 2개(약 320–430 ms)를 찍고, capture가 끝나면 그 요청만 due가 돼 다음 decode 단계를 혼자 돈다. 앵커 테스트(`e9a0ca53`)는 이 때문에 sessions 2에서 거의 매번 실패해 되돌렸다(`386b4320`).
+- 수정: `src/cli/serve/text_generation_scheduler.cpp`의 capture drain에서, prefill이 끝난 요청이 capture에서 돌아오면 `MarkAllDecodersDue(decoding)`(prefill interleave 경로와 같은 규칙). 그다음 앵커 테스트를 다시 적용(`386b4320` 되돌리기).
+- 이 변경은 모든 서버의 스케줄을 바꾼다. 확인: 서버 단위 테스트(scheduler·backend), functional `batch`(sessions 2 ×10, sessions 4 ×2, 전체 1회), `state-edges`, `cache`, `long-context`; DFlash2 C1/C2/C4/C8 cohort를 기준(`386b4320`)과 번갈아(base/new/base/new), 출력 같음·요청별 5 %·3 ms. 창 시간 한도는 계획 단계에서 넉넉히(t-w1의 `fn-c2-full` 누락 반복 금지).
+- 결과는 T-RESULTS.md "T1b"에.
