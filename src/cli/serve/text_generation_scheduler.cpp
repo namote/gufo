@@ -1959,9 +1959,10 @@ struct TextGenerationScheduler::Impl {
         if (!CompleteIfStopped(request)) {
           if (request->runner_request.prefill_complete()) {
             // Its capture already waited through peer prefill. Resume it
-            // before another bounded chunk, as for any due decoder.
-            request->decode_due = true;
+            // before another bounded chunk, as for any due decoder, and with
+            // the resident decoders so it shares their step.
             decoding.push_back(std::move(request));
+            MarkAllDecodersDue(decoding);
           } else {
             prefilling.push_back(std::move(request));
           }
