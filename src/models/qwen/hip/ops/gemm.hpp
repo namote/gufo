@@ -130,6 +130,16 @@ namespace detail {
     std::size_t batch, std::size_t m, std::size_t k, hipStream_t stream,
     std::size_t groups = 1);
 
+/// Exact wave64 projection of 9–64 rows in one launch: groups of `width`
+/// (9–16) rows share each weight row and only the final group may be partial.
+/// Returns false without launching for other formats, widths and bounds.
+[[nodiscard]] bool TryLaunchKQuantGroupedWave64(core::GgmlType type,
+                                                const void* w, const float* x,
+                                                float* y, std::size_t rows,
+                                                std::size_t width,
+                                                std::size_t m, std::size_t k,
+                                                hipStream_t stream);
+
 [[nodiscard]] bool TryLaunchQ8SmallBatchWave64(const void* w, const float* x,
                                                float* y, std::size_t batch,
                                                std::size_t m, std::size_t k,

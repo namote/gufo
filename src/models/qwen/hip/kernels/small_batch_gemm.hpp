@@ -440,7 +440,7 @@ template<std::uint32_t WavesPerBlock, std::size_t Batch,
                                     (WType == core::GgmlType::kQ4_K ||
                                      WType == core::GgmlType::kQ5_K ||
                                      WType == core::GgmlType::kIQ4_XS))),
-         bool FusedSwiGLU = false>
+         bool FusedSwiGLU = false, bool Ragged = false>
 __launch_bounds__(WavesPerBlock * 32, (MinWaves * 32 / HardwareWaveSize > 0
                                            ? MinWaves * 32 / HardwareWaveSize
                                            : 1)) __global__
@@ -448,7 +448,8 @@ __launch_bounds__(WavesPerBlock * 32, (MinWaves * 32 / HardwareWaveSize > 0
                                              const float* __restrict__ x,
                                              float* __restrict__ y,
                                              std::size_t wide_m,
-                                             std::size_t wide_k) {
+                                             std::size_t wide_k,
+                                             std::size_t valid_rows = 0) {
   static_assert(TokensPerStep > 0 && Batch % TokensPerStep == 0);
   static_assert(HardwareWaveSize == 32 || HardwareWaveSize == 64);
   static_assert(LogicalLanes == 16 || LogicalLanes == 32);
@@ -463,6 +464,13 @@ __launch_bounds__(WavesPerBlock * 32, (MinWaves * 32 / HardwareWaveSize > 0
   x += (blockIdx.x % TokenGroups) * Batch * k;
   const Index output_rows = FusedSwiGLU ? m / 2 : m;
   y += (blockIdx.x % TokenGroups) * Batch * output_rows;
+  // A ragged launch masks the final group's missing token rows: their staged
+  // inputs are zero and their outputs are never stored. Every live row keeps
+  // the same per-lane accumulation and reduction order as a complete group.
+  const Index live_tokens =
+      Ragged ? static_cast<Index>(valid_rows) -
+                   static_cast<Index>(blockIdx.x % TokenGroups) * Batch
+             : Batch;
   constexpr Index kSubElems = 16;
   constexpr Index kPhases = 32 / LogicalLanes;
   constexpr Index kSubsPerTile = LogicalLanes * TilesPerStage;
@@ -507,7 +515,7 @@ __launch_bounds__(WavesPerBlock * 32, (MinWaves * 32 / HardwareWaveSize > 0
 #pragma unroll
         for (Index vector = 0; vector < kVectorsPerSub; ++vector) {
           float4 value = {0.0F, 0.0F, 0.0F, 0.0F};
-          if (source_sub < num_sub) {
+          if (source_sub < num_sub && (!Ragged || token < live_tokens)) {
             value = *reinterpret_cast<const float4*>(
                 x + (token * k) + (source_sub * kSubElems) + (vector * 4));
           }
@@ -677,7 +685,8 @@ __launch_bounds__(WavesPerBlock * 32, (MinWaves * 32 / HardwareWaveSize > 0
       final[r] = ReduceKQuantColumns<kColumns, LogicalLanes / 2>(values);
     }
     const Index token = lane / kLanesPerToken;
-    if (lane % kLanesPerToken == 0 && token < Batch) {
+    if (lane % kLanesPerToken == 0 && token < Batch &&
+        (!Ragged || token < live_tokens)) {
       if constexpr (FusedSwiGLU) {
 #pragma unroll
         for (Index r = 0; r < RowsPerWave / 2; ++r) {
@@ -720,7 +729,8 @@ __launch_bounds__(WavesPerBlock * 32, (MinWaves * 32 / HardwareWaveSize > 0
         }
 #pragma unroll
         for (Index token = 0; token < Batch; ++token) {
-          y[(token * m) + row] = sums[0][r][token];
+          if (!Ragged || token < live_tokens)
+            y[(token * m) + row] = sums[0][r][token];
         }
       }
     }

@@ -7,13 +7,16 @@
 namespace gufo::hip::detail {
 namespace {
 
-template<core::GgmlType Type, std::size_t Groups, bool FusedSwiGLU = false>
+template<core::GgmlType Type, std::size_t Groups, bool FusedSwiGLU = false,
+         bool Ragged = false>
 void Launch(const void* w, const float* x, float* y, std::size_t m,
-            std::size_t k, hipStream_t stream) {
+            std::size_t k, hipStream_t stream, std::size_t valid_rows = 0) {
   const auto launch = [&]<bool DistributedOutput>() {
     SmallBatchKQuantExactFp32GEMMKernel<8, 16, 6, Type, 1, 4, Groups, true, 1,
-                                        64, 32, DistributedOutput, FusedSwiGLU>
-        <<<((m + 47) / 48) * Groups, 256, 0, stream>>>(w, x, y, m, k);
+                                        64, 32, DistributedOutput, FusedSwiGLU,
+                                        Ragged>
+        <<<((m + 47) / 48) * Groups, 256, 0, stream>>>(w, x, y, m, k,
+                                                       valid_rows);
   };
   const bool ffn =
       (k == 5120 && (m == 17408 || m == 34816)) || (m == 5120 && k == 17408);
@@ -31,7 +34,24 @@ void Launch(const void* w, const float* x, float* y, std::size_t m,
 
 template<core::GgmlType Type, bool FusedSwiGLU = false>
 void LaunchGroups(const void* w, const float* x, float* y, std::size_t m,
-                  std::size_t k, hipStream_t stream, std::size_t groups) {
+                  std::size_t k, hipStream_t stream, std::size_t groups,
+                  std::size_t valid_rows = 0) {
+  if (valid_rows != 0) {
+    // Only the final group is incomplete; complete launches keep the
+    // qualified instantiations below.
+    switch (groups) {
+      case 2:
+        Launch<Type, 2, FusedSwiGLU, true>(w, x, y, m, k, stream, valid_rows);
+        break;
+      case 3:
+        Launch<Type, 3, FusedSwiGLU, true>(w, x, y, m, k, stream, valid_rows);
+        break;
+      case 4:
+        Launch<Type, 4, FusedSwiGLU, true>(w, x, y, m, k, stream, valid_rows);
+        break;
+    }
+    return;
+  }
   switch (groups) {
     case 1:
       Launch<Type, 1, FusedSwiGLU>(w, x, y, m, k, stream);
@@ -53,13 +73,17 @@ void LaunchGroups(const void* w, const float* x, float* y, std::size_t m,
 void LaunchKQuantSixteenWave64(core::GgmlType type, const void* w,
                                const float* x, float* y, std::size_t m,
                                std::size_t k, hipStream_t stream,
-                               std::size_t groups) {
+                               std::size_t groups, std::size_t valid_rows) {
   assert(groups >= 1 && groups <= 4);
+  assert(valid_rows == 0 || (groups >= 2 && valid_rows > (groups - 1) * 16 &&
+                             valid_rows < groups * 16));
   assert(type == core::GgmlType::kQ4_K || type == core::GgmlType::kQ5_K);
   if (type == core::GgmlType::kQ4_K)
-    LaunchGroups<core::GgmlType::kQ4_K>(w, x, y, m, k, stream, groups);
+    LaunchGroups<core::GgmlType::kQ4_K>(w, x, y, m, k, stream, groups,
+                                        valid_rows);
   else
-    LaunchGroups<core::GgmlType::kQ5_K>(w, x, y, m, k, stream, groups);
+    LaunchGroups<core::GgmlType::kQ5_K>(w, x, y, m, k, stream, groups,
+                                        valid_rows);
 }
 
 void LaunchPackedSwiGLUSixteenWave64(core::GgmlType type, const void* w,

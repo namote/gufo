@@ -65,8 +65,15 @@ for t in "${targets[@]}"; do
     native_sources+=(src/models/qwen/hip/kernels/small_batch_wave64.hip)
     native_sources+=(src/models/qwen/hip/kernels/small_batch_quant16_wave64.hip)
   fi
-  if [[ "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ]]; then
+  if [[ "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ||
+        "$src" -ef tools/qwen27b/dflash_gemm_bench.hip ]]; then
     native_sources+=(src/models/qwen/hip/kernels/prefill_quant_wave64.hip)
+  fi
+  wave32_sources=()
+  if [[ "$src" -ef tools/qwen27b/dflash_gemm_bench.hip ]]; then
+    # The production dispatcher, with its CMake source options.
+    wave32_sources+=(src/models/qwen/hip/kernels/prefill_quant_gemm.hip)
+    wave32_sources+=(src/models/qwen/hip/kernels/prefill_swiglu.hip)
   fi
   if [[ "$src" -ef tools/qwen27b/attention_bench.hip ||
         "$src" -ef tools/bench/kvarn_decode_bench.hip ]]; then
@@ -91,7 +98,18 @@ for t in "${targets[@]}"; do
           -c "$unit" -o "$object" || exit 1
         native_objects+=("$object")
       done
-      if [[ "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ]]; then
+      for unit in "${wave32_sources[@]}"; do
+        object="$objects/$(basename "$unit").o"
+        unit_extra=()
+        if [[ "$unit" == src/models/qwen/hip/kernels/prefill_quant_gemm.hip ]]; then
+          unit_extra+=(-fno-slp-vectorize)
+        fi
+        "${compile[@]}" -DENGINE_ENABLE_HIP=1 "${unit_extra[@]}" \
+          -c "$unit" -o "$object" || exit 1
+        native_objects+=("$object")
+      done
+      if [[ "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ||
+            "$src" -ef tools/qwen27b/dflash_gemm_bench.hip ]]; then
         "${compile[@]}" -c src/core/quant/ggml_dequant.cpp \
           -o "$objects/quant.o" || exit 1
         native_objects+=("$objects/quant.o")

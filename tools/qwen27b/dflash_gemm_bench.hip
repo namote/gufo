@@ -23,6 +23,7 @@
 
 #include "src/models/qwen/hip/kernels/small_batch_gemm.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
+#include "src/models/qwen/hip/ops/swiglu.hpp"
 // Embed the scalar implementation so ablations use its actual templates and
 // arithmetic without linking the complete model runtime.
 #include "src/models/qwen/hip/kernels/gemv_quant.hip"
@@ -704,10 +705,175 @@ void Run(const std::string& type, std::size_t rows, std::size_t columns,
   }
 }
 
+// Verification widths 9–64 through the production dispatcher, against
+// independently launched single-row decode results. Candidates must match the
+// decode bits before their timings count.
+void RunDispatch(const std::string& type, std::size_t rows, std::size_t columns,
+                 int iterations, const std::vector<std::size_t>& widths,
+                 bool swiglu) {
+  using namespace gufo;
+  using namespace gufo::hip;
+  const auto quant_type = type == "q4"    ? core::GgmlType::kQ4_K
+                          : type == "q5"  ? core::GgmlType::kQ5_K
+                          : type == "iq4" ? core::GgmlType::kIQ4_XS
+                          : type == "q6"  ? core::GgmlType::kQ6_K
+                                          : core::GgmlType::kF32;
+  if (quant_type == core::GgmlType::kF32 || rows == 0 || columns % 256 != 0 ||
+      iterations < 1 || (swiglu && (rows != 17408 || columns != 5120)))
+    throw std::invalid_argument(
+        "dispatch requires q4|q5|iq4|q6, complete blocks and positive "
+        "iterations; swiglu requires the 17408x5120 FFN");
+  const std::size_t block_bytes = type == "q4"    ? 144
+                                  : type == "q5"  ? 176
+                                  : type == "iq4" ? 136
+                                                  : 210;
+  // A packed FFN projects gate and up rows from one adjacent matrix.
+  const std::size_t projected = swiglu ? 2 * rows : rows;
+  const std::size_t bytes = projected * columns / 256 * block_bytes;
+  const std::size_t copies =
+      std::max<std::size_t>(1, (128ULL * 1024 * 1024 + bytes - 1) / bytes);
+  const std::size_t physical = bytes * copies;
+  constexpr std::size_t kMaxRows = 64;
+  Buffer<unsigned char> weights(physical);
+  Buffer<float> input(kMaxRows * columns), output(kMaxRows * projected),
+      reference(kMaxRows * rows), packed(kMaxRows * projected);
+  Buffer<unsigned> mismatch(1);
+  InitBytes<<<(physical + 255) / 256, 256>>>(weights.Get(), physical);
+  InitScales<<<(physical / block_bytes + 255) / 256, 256>>>(
+      weights.Get(), physical / block_bytes, block_bytes,
+      type == "q6" ? 208 : 0, type == "q4" || type == "q5");
+  InitValues<<<(kMaxRows * columns + 255) / 256, 256>>>(input.Get(),
+                                                        kMaxRows * columns);
+  Check(hipDeviceSynchronize());
+  MappedWeights mapped_weights(weights.Get(), physical);
+  const unsigned char* base = mapped_weights.Get();
+  // Single-row decode: the result autoregressive generation would produce.
+  for (std::size_t row = 0; row < kMaxRows; ++row) {
+    if (swiglu) {
+      LaunchFusedSwiGLUGEMV(base, quant_type, base + bytes / 2, quant_type,
+                            input.Get() + row * columns,
+                            reference.Get() + row * rows, rows, columns,
+                            nullptr);
+    } else {
+      LaunchQ8KBlockGEMV(base, quant_type, input.Get() + row * columns,
+                         reference.Get() + row * rows, rows, columns, nullptr);
+    }
+  }
+  Check(hipDeviceSynchronize());
+  const auto project = [&](const void* w, std::size_t n,
+                           const std::function<bool(const void*)>& gemm) {
+    if (!swiglu)
+      return gemm(w);
+    if (!gemm(w))
+      return false;
+    LaunchPackedSwiGLUActivation(packed.Get(), output.Get(), n, rows, nullptr);
+    return true;
+  };
+  float* const gemm_output = swiglu ? packed.Get() : output.Get();
+  Event start, stop;
+  std::puts("type,m,k,rows,round,geometry,ms,GBps,mismatches");
+  for (const std::size_t n : widths) {
+    if (n == 0 || n > kMaxRows)
+      throw std::invalid_argument("rows must be 1..64");
+    std::vector<Geometry> geometries;
+    geometries.push_back(
+        {"production", [&, n](const void* w) {
+           if (swiglu && TryLaunchPackedQuantSwiGLUFp32(
+                             quant_type, w, input.Get(), output.Get(), n, rows,
+                             columns, nullptr))
+             return;
+           (void)project(w, n, [&](const void* weights) {
+             LaunchBatchedQuantGEMMFp32(quant_type, weights, input.Get(),
+                                        gemm_output, n, projected, columns,
+                                        nullptr);
+             return true;
+           });
+         }});
+    std::vector<std::size_t> candidate_widths;
+    if (n >= 9) {
+      const std::size_t groups = (n + 15) / 16;
+      candidate_widths.push_back((n + groups - 1) / groups);
+      if (n > 16 && n % 16 != 0 && candidate_widths.front() != 16)
+        candidate_widths.push_back(16);
+    }
+    std::vector<std::string> names;
+    names.reserve(candidate_widths.size());
+    for (const std::size_t width : candidate_widths) {
+      names.push_back("grouped" + std::to_string(width));
+      geometries.push_back(
+          {names.back().c_str(), [&, n, width](const void* w) {
+             if (!project(w, n, [&](const void* weights) {
+                   return detail::TryLaunchKQuantGroupedWave64(
+                       quant_type, weights, input.Get(), gemm_output, n, width,
+                       projected, columns, nullptr);
+                 }))
+               throw std::runtime_error("grouped shape rejected");
+           }});
+    }
+    for (int round = 0; round < 4; ++round) {
+      for (std::size_t index = 0; index < geometries.size(); ++index) {
+        const auto& geometry =
+            geometries[round % 2 == 0 ? index : geometries.size() - index - 1];
+        Check(hipMemset(output.Get(), 0xFF, kMaxRows * projected * 4));
+        Check(hipMemset(mismatch.Get(), 0, sizeof(unsigned)));
+        geometry.launch(base);
+        Check(hipGetLastError());
+        Compare<<<(n * rows + 255) / 256, 256>>>(reference.Get(), output.Get(),
+                                                 n * rows, mismatch.Get());
+        unsigned bad = 0;
+        Check(hipMemcpy(&bad, mismatch.Get(), sizeof(bad),
+                        hipMemcpyDeviceToHost));
+        if (bad)
+          throw std::runtime_error(std::string(geometry.name) + " changed " +
+                                   std::to_string(bad) + " outputs at rows " +
+                                   std::to_string(n));
+        Check(hipEventRecord(start.Get()));
+        for (int iteration = 0; iteration < iterations; ++iteration)
+          geometry.launch(base + (iteration % copies) * bytes);
+        Check(hipEventRecord(stop.Get()));
+        Check(hipEventSynchronize(stop.Get()));
+        float milliseconds = 0;
+        Check(hipEventElapsedTime(&milliseconds, start.Get(), stop.Get()));
+        milliseconds /= iterations;
+        std::printf("%s%s,%zu,%zu,%zu,%d,%s,%.6f,%.2f,%u\n", type.c_str(),
+                    swiglu ? "-swiglu" : "", rows, columns, n, round,
+                    geometry.name, milliseconds, bytes / (milliseconds * 1e6),
+                    bad);
+      }
+    }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
+    if (argc >= 2 && std::string(argv[1]) == "dispatch") {
+      // dispatch q4|q5|iq4|q6 M K iterations rows[,first-last...] [swiglu]
+      if (argc < 7 || argc > 8 ||
+          (argc == 8 && std::string(argv[7]) != "swiglu"))
+        throw std::invalid_argument(
+            "usage: dflash_gemm_bench dispatch q4|q5|iq4|q6 M K iterations "
+            "rows[,first-last...] [swiglu]");
+      std::vector<std::size_t> widths;
+      const std::string list = argv[6];
+      for (std::size_t begin = 0; begin < list.size();) {
+        const auto end = std::min(list.find(',', begin), list.size());
+        const auto item = list.substr(begin, end - begin);
+        const auto dash = item.find('-');
+        if (dash == std::string::npos) {
+          widths.push_back(std::stoull(item));
+        } else {
+          for (auto n = std::stoull(item.substr(0, dash));
+               n <= std::stoull(item.substr(dash + 1)); ++n)
+            widths.push_back(n);
+        }
+        begin = end + 1;
+      }
+      RunDispatch(argv[2], std::stoull(argv[3]), std::stoull(argv[4]),
+                  std::stoi(argv[5]), widths, argc == 8);
+      return 0;
+    }
     if (argc < 4 || argc > 8)
       throw std::invalid_argument(
           "usage: dflash_gemm_bench bf16|q8|q4|q5|iq4|q6|q3|iq4-nl M K "
