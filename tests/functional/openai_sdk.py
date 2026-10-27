@@ -773,22 +773,80 @@ def check_batches(client, model, checks, width, vision=False, speculative="off")
                               "chat_template_kwargs": {"enable_thinking": False}})
              for pair in words]
     serial = [chat_result(client, body) for body in short]
-    batched, references = [], []
+
+    def same_as_serial(rows, references):
+        for row, reference in zip(rows, references, strict=True):
+            assert (row["text"], row["finish"]) == (reference["text"], reference["finish"]), (
+                row, reference)
+
+    # Simultaneous short rows meet in one step only when their arrivals line
+    # up; when they do, both may stop inside that step. Their batched count
+    # is recorded, not required.
+    paired, references = [], []
     for offset in (0, 1):
         indices = [(index + offset) % len(short) for index in range(len(short))]
         for group in range(0, len(indices) - width + 1, width):
             members = indices[group:group + width]
             barrier = threading.Barrier(width)
+
             def together(index):
                 barrier.wait(timeout=30)
                 return chat_result(client, short[index], True)
             with ThreadPoolExecutor(width) as pool:
-                batched += list(pool.map(together, members))
+                paired += list(pool.map(together, members))
             references += [serial[index] for index in members]
-    assert max(row["usage"]["gufo"]["physical_execution_width"] for row in batched) > 1, batched
-    for row, reference in zip(batched, references, strict=True):
-        assert (row["text"], row["finish"]) == (reference["text"], reference["finish"]), (
-            row, reference)
+    same_as_serial(paired, references)
+    checks[f"batch_c{width}_greedy_short_pairs_match_serial"] = {
+        "batched_rows": sum(row["usage"]["gufo"]["physical_execution_width"] > 1
+                            for row in paired),
+        "rows": paired}
+
+    # Coverage that does not depend on arrival timing: each group of width-1
+    # rows runs beside a long anchor that is already decoding, so the
+    # scheduler batches every row with it from its first decode step.
+    anchor_body = dict(model=model, temperature=0, seed=42, max_completion_tokens=4096,
+                       messages=[{"role": "user", "content":
+                                  "Count from 1 to 2000, one number per line."}],
+                       extra_body={"cache_prompt": False,
+                                   "chat_template_kwargs": {"enable_thinking": False}})
+    peers = width - 1
+    batched, references = [], []
+    for offset in (0, 1):
+        indices = [(index + offset) % len(short) for index in range(len(short))]
+        for group in range(0, len(indices) - peers + 1, peers):
+            members = indices[group:group + peers]
+            decoding, done = threading.Event(), threading.Event()
+
+            def anchor():
+                # True once its peers finished while it was still decoding.
+                with client.chat.completions.create(**anchor_body, stream=True) as stream:
+                    for chunk in stream:
+                        if done.is_set():
+                            return True
+                        if any(choice.finish_reason for choice in chunk.choices):
+                            return False
+                        if any(choice.delta.content for choice in chunk.choices):
+                            decoding.set()
+                return False
+
+            barrier = threading.Barrier(peers)
+
+            def beside_anchor(index):
+                barrier.wait(timeout=30)
+                return chat_result(client, short[index], True)
+            with ThreadPoolExecutor(width) as pool:
+                running = pool.submit(anchor)
+                try:
+                    while not decoding.wait(0.05):
+                        assert not running.done(), ("anchor ended before decoding",
+                                                    running.result())
+                    batched += list(pool.map(beside_anchor, members))
+                finally:
+                    done.set()
+                assert running.result(), "anchor finished before its batched peers"
+            references += [serial[index] for index in members]
+    assert all(row["usage"]["gufo"]["physical_execution_width"] > 1 for row in batched), batched
+    same_as_serial(batched, references)
     checks[f"batch_c{width}_greedy_short_replies_match_serial"] = batched
 
 
