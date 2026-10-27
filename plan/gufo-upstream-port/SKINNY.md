@@ -169,3 +169,112 @@ s-w4: new {0, 4, 8, 8}, base {6, 4, 2, 4}. 모든 new < 모든 base 아님. 첫 
 ## 상태
 
 (a)·(b) 채택. (c) 버림(위 Q6 FFN 규칙은 기록만).
+
+## S2: DFlash2 Q4 비용표 재측정 (측정만, 표는 아직 그대로)
+
+안내: [SKINNY-BRIEF.md](SKINNY-BRIEF.md) "S2". 기준 = 브랜치 HEAD `76b1660d`(코드는 `4fc0211d`와 같음, 그 뒤는 문서만).
+
+### 방법 (원래 표의 방법, `docs/models/qwen3.8-27b/artifacts/q4-c{2,4,6,8}-focused.json`)
+
+- 점마다 새 `gufo serve --sessions C … --draft-policy fixed --draft-tokens N`(N 1–7). speculative corpus `repetition_word`는 모두 accept되므로 매 cycle이 C·(N+1)행을 verify한다. greedy, 128 토큰, context 4096, warmup 1 + 측정 1 round, prompt cache 없음.
+- C2 표: 계측 없는 wall cycle = 요청별 decode_ms / (completion − accepted − 1)의 평균(원래 C2 방법).
+- C4·C6·C8 표: `rocprofv3 --kernel-trace`에서 측정 round의 포화 구간(dispatch 수가 같은 가장 긴 연속 cycle) 가운데 4 cycle의 span 중앙값. cycle 경계는 target verify의 `BatchedArgmaxKernel<true, false>`다. `dflash_selector_*`는 매 cycle 돌지 않고, 248320행 head GEMM은 행 수에 따라 template이 바뀌므로 경계로 쓰지 않는다.
+- 상대 비용 = cycle(N)/cycle(1). context multiplier = C·100/cycle(1)(공식 그대로).
+- 도구(추적 안 함, `build/s2-run/`): `cal.py`(창 안 driver, sha 6caa010f…), `cycles.py`(sha e7f3911b…), `analyze.py`, `choose.py`(`Choose` 재현, Python double). 요약은 `build/s2-results/`.
+- 모델은 UD-Q4_K_M(S와 같음)이다. 원래 표는 **UD-Q4_K_XL**로 쟀는데, XL은 저장소에 없다.
+
+### 창
+
+- `skinny-s2-w1-a01/s2-w1`(PLAN-S2C.json): 결과 FAILED_no_fallback, health PASS, 재시도 없음. 이미지 `4a7046b2e8ed`, `/src` = 주 checkout, `.gufo-revision` `76b1660d`.
+  - 바이너리: 기준(S 전) `build/s-src/build/s-base-release/gufo` `22e4f9cf…`, 새(HEAD) `build/s-src/build/s-release/gufo` `6e5600d3…`.
+  - 순서: base plain C2–C8, new plain C2–C8, new rocprof C2·C4.
+  - rocprof 아래 server는 SIGTERM에 db를 쓰고("tool finalization") 끝나지 않는다(rocprofv3의 chained signal handler). cal.py가 300 s 기다린 뒤 SIGKILL해서 점마다 약 5분이 더 들었다. 그래서 new-prof-c6 전에 deadline 검사에 걸렸고("1650 s left < 2400 s"), 마지막 `sleep 20`도 돌지 않았다. plain과 C2·C4 profile db는 모두 성한 상태다.
+- `skinny-s2-w1b-a01/s2-w1b`(PLAN-S2C2.json, 감독 승인 (a)): COMPLETE, health PASS. new rocprof C6·C8만 돌렸다.
+  - **cal.py 수정**: profile 모드에서 SIGTERM 뒤 5 s 안에 끝나지 않으면, server log에 `tool finalization`이 찍힌 지 2 s 뒤 SIGKILL한다. 300 s 안에 finalization이 없으면 실패로 기록한다. 그 밖의 방법은 같다.
+- 모든 점: full acceptance, `batched-wC`, 완성 hash 하나(`24d4b2ba`), 요청마다 draft 63/84/95/101/105/108/111.
+
+### cycle ms (UD-Q4_K_M, N = 1..7)
+
+```
+C2 old (Q4_K_XL)  104(N1 기준) rel 1.00 1.04 1.10 1.48 1.45 1.50 1.50
+C2 base wall      87.3  92.0  98.6 137.9 136.0 144.9 147.6
+C2 new  wall      87.1  92.4  99.3 122.0 134.7 137.7 148.2
+C2 new  prof      86.2  91.3  98.4 121.2 134.9 138.0 147.2
+C4 old            125   163   167   246   265   286   289
+C4 base wall     104.3 140.5 149.0 214.4 230.7 249.6 266.2
+C4 new  wall     104.6 137.5 149.0 213.3 230.5 249.3 265.5
+C4 new  prof     102.5 138.8 149.0 220.5 236.4 265.4 271.7
+C6 old            171   247   273   323   378   416   423
+C6 base wall     143.9 210.0 234.0 281.1 324.7 353.3 372.1
+C6 new  wall     140.3 208.3 234.1 280.8 323.9 351.9 372.0
+C6 new  prof     141.4 216.4 238.6 298.8 347.2 393.0 395.6
+C8 old            181   276   304   400   430   523   558
+C8 base wall     156.0 237.5 268.4 349.1 371.6 440.2 467.7
+C8 new  wall     155.3 235.4 267.2 342.1 370.0 438.7 465.2
+C8 new  prof     154.8 243.2 274.3 367.0 397.3 495.3 526.3
+```
+
+### 상대 표 (old / base UD-Q4_K_M / new UD-Q4_K_M, 문서 방법: C2 wall, C4–C8 profile; base는 wall만 있음)
+
+```
+C2 old  1.00 1.04 1.10 1.48 1.45 1.50 1.50  mult 1.92
+C2 base 1.00 1.05 1.13 1.58 1.56 1.66 1.69  mult 2.29 (wall)
+C2 new  1.00 1.06 1.14 1.40 1.55 1.58 1.70  mult 2.30 (wall)
+C4 old  1.00 1.30 1.33 1.97 2.12 2.29 2.32  mult 3.20
+C4 base 1.00 1.35 1.43 2.06 2.21 2.39 2.55  mult 3.84 (wall)
+C4 new  1.00 1.35 1.45 2.15 2.31 2.59 2.65  mult 3.90 (prof; wall 1.00 1.31 1.42 2.04 2.20 2.38 2.54)
+C6 old  1.00 1.44 1.59 1.89 2.21 2.43 2.47  mult 3.50
+C6 base 1.00 1.46 1.63 1.95 2.26 2.46 2.59  mult 4.17 (wall)
+C6 new  1.00 1.53 1.69 2.11 2.46 2.78 2.80  mult 4.24 (prof; wall 1.00 1.48 1.67 2.00 2.31 2.51 2.65)
+C8 old  1.00 1.52 1.68 2.21 2.38 2.89 3.08  mult 4.42
+C8 base 1.00 1.52 1.72 2.24 2.38 2.82 3.00  mult 5.13 (wall)
+C8 new  1.00 1.57 1.77 2.37 2.57 3.20 3.40  mult 5.17 (prof; wall 1.00 1.52 1.72 2.20 2.38 2.83 3.00)
+```
+
+관찰:
+- **S의 효과는 작다.** base→new wall 차이는 C2 N4(10행) −11.5 %, C2 N6(14행) −5.0 %뿐이다. C4 N2 −2.1 %, C8 N4 −2.0 %, 그 밖은 ±1 % 안이다. S의 (a)는 12·16행이 아닌 9–16 폭만 바꿨고, Q4 shape의 17행 이상은 그대로이기 때문이다.
+- **차이의 대부분은 모델이다**(Q4_K_XL → Q4_K_M). N1 cycle이 104/125/171/181 → 87/103/141/155 ms로 짧아진다. 그래서 상대 비용과 multiplier가 커지고 정책은 더 짧은 block을 고른다.
+- **방법 차이**: C4–C8에서 profile이 wall보다 최대 +12 %(C8 N7 526 vs 465) 크다. wall은 동료가 prefill하는 동안의 ramp와 요청이 끝나는 꼬리(span 82–336 ms)를 평균에 넣는다. profile은 포화 cycle만 본다. C2에서는 두 방법이 ±1.5 % 안에서 같다.
+
+### 정책이 고르는 draft 수 (old 표 → new 표, `Choose` 재현, Q4 adaptive greedy, limit 7)
+
+acceptance 평균 mean(0.5–7, 7 = full, C5–C8은 full이면 probe 7) × position 0/8192/32768:
+
+```
+mean          0.5 1 1.5 2 2.5 3 3.5 4 4.5 5 5.5 6 6.5 7
+C2 d0    old    2 3  3  3  3  3  7  7  7  7  7  7  7  7
+C2 d0    new    2 2  3  3  3  3  3  3  3  6  6  6  7  7
+C2 d8K   old    2 2  3  3  3  3  3  7  7  7  7  7  7  7
+C2 d8K   new    2 2  3  3  3  3  3  3  3  3  6  6  6  7
+C2 d32K  old    2 2  2  2  3  3  3  3  7  7  7  7  7  7
+C2 d32K  new    1 2  2  2  2  3  3  3  3  3  6  6  6  7
+C4 d0    old    1 1  3  3  3  3  3  3  3  3  3  3  3  7
+C4 d0    new    1 1  1  1  3  3  3  3  3  3  3  3  3  7
+C4 d8K   old    1 1  1  3  3  3  3  3  3  3  3  3  3  7
+C4 d8K   new    1 1  1  1  3  3  3  3  3  3  3  3  3  7
+C4 d32K  old    1 1  1  1  3  3  3  3  3  3  3  3  3  7
+C4 d32K  new    1 1  1  1  1  1  3  3  3  3  3  3  3  7
+C6 d0    old    1 1  1  1  1  1  3  3  3  3  3  3  7  7
+C6 d0    new    1 1  1  1  1  1  1  1  1  3  3  3  3  7
+C6 d8K   old    1 1  1  1  1  1  1  3  3  3  3  3  7  7
+C6 d8K   new    1 1  1  1  1  1  1  1  1  1  3  3  3  7
+C6 d32K  old    1 1  1  1  1  1  1  1  1  3  4  4  4  7
+C6 d32K  new    1 1  1  1  1  1  1  1  1  1  1  1  1  7
+C8 d0    old    1 1  1  1  1  1  1  1  1  3  3  3  3  7
+C8 d0    new    1 1  1  1  1  1  1  1  1  1  1  1  1  7
+C8 d8K   old    1 1  1  1  1  1  1  1  1  1  3  3  3  7
+C8 d8K   new    1 1  1  1  1  1  1  1  1  1  1  1  1  7
+C8 d32K  old    1 1  1  1  1  1  1  1  1  1  1  1  1  7
+C8 d32K  new    1 1  1  1  1  1  1  1  1  1  1  1  1  7
+```
+
+새 표는 모든 C에서 같거나 더 짧은 block을 고른다(C2 mean 3.5–4.5에서 7 → 3, C6·C8 높은 acceptance에서 3 → 1). `dflash_test.cpp`의 mean 3 기대값(C2–C4 3, C5–C8 1)은 두 표 모두에서 성립한다.
+
+### 대상 모델과 표의 key
+
+- 문서의 운영 Q4 target은 **UD-Q4_K_XL**이다(`docs/models/qwen3.8-27b/README.md` 3·13·18행 download, `BENCHMARKS.md` 4행, 저장소 `README.md` 표). 이 checkout에는 Q4_K_M target 안내가 없다(Q4_K_M은 DFlash2 draft).
+- 표는 quant 형식이 아니라 head 형식으로 key된다: `backend.cpp:195` `output.type == kQ8_0`이면 Q8 표, 아니면 Q4 표다. UD-Q4_K_XL과 UD-Q4_K_M은 둘 다 Q6_K head라서 **같은 Q4 표를 쓴다**. Q4_K_M에서 잰 값으로 바꾸면 문서 대상인 Q4_K_XL 사용자도 바뀐다.
+
+### 상태
+
+`dflash_policy.hpp`는 바꾸지 않았다(감독 지시: 채택은 모델 보정 결정이라 사용자와 정함). 모델 수준 확인 창은 아직 없다.
