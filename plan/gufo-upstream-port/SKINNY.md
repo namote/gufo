@@ -95,6 +95,48 @@ q6         5120x6144    | 196 146 44 | 9-16: 208->163 +27.3% (6/0) 17-32: 312->2
 
 기준(f0700122 커널) / 새 바이너리를 ABAB로, 운영 경로, Q4 10240·down·packed SwiGLU, Q6 5120×6144·head. 40칸 모두 ±1.1 % 안(Q4 SwiGLU 7행 −4.2 %는 새 쪽이 빠름, 범위 겹침). 퇴보 없음(`build/s-results/ctl.csv`).
 
+## 운영 변경 (`4fc0211d`, 감독 승인 (a)·(b))
+
+`prefill_quant_gemm.hip` `UseGroupedKQuant`: 8행 넘는 batch에서 `TryLaunchKQuantGroupedWave64`(균형 폭 W = ceil(n / ceil(n/16)))를 먼저 쓴다. 1–8행 경로는 그대로.
+
+- (a) 9–16행, Q4_K·Q5_K·IQ4_XS·Q6_K, 6144·10240·12288·17408×5120, 5120×6144, Q6_K는 34816×5120·5120×17408도. 이미 한 launch인 Q4/Q5/IQ4 down·packed 34816과 Q6 head는 그대로. s-w1 격자의 최악 칸 +0.79 %(IQ4 17408 16행)는 운영과 같은 커널을 고르는 폭이라 잡음.
+- (b) 9–64행, Q6_K 12288×5120, Q5_K·Q6_K 1024×5120: 모든 칸에서 이김(17–64 최소 이득 −37 %·−22 % 시간). Q6 5120×6144는 17–64에서 최대 +12.6 %로 져서 뺐다.
+- 비트 테스트 `TestGroupedVerificationShapes`(`q4kxl_quant_ops_test.cpp`): 바뀐 폭·shape 전부를 한 행 decode GEMV와 비교, batch 뒤 guard 행 확인.
+
+## 창 `skinny-s-w2-a01/s-w2`
+
+창 FAILED_no_fallback(원인: `fn-new`의 타이밍 비교가 inconclusive라 runner가 0이 아닌 종료), health PASS, 재시도 없음. `.gufo-revision` `4fc0211d`, 이미지 `4a7046b2e8ed`. 바이너리 SHA: 후보 gufo `6e5600d3…`, 기준 gufo `22e4f9cf…`(f0700122 snapshot `build/s-base-src`), bench `29008fc3…`, `qwen_q4kxl_quant_ops_test` `aab4473e…`, `qwen_dflash_gpu_test` `ab4fbdca…`. 요약 `build/s-results/`(cohort.txt, rule2*.txt).
+
+- **정확도**: `qwen_q4kxl_quant_ops_test` PASS(grouped 24줄 모두 OK), `qwen_dflash_gpu_test --concurrency-only` PASS(C2–C8 exact layers·logits·selector, private RNG/policy). 모델 cohort 4회(기준·후보·기준·후보) 모든 C·workload에서 완성 텍스트 hash가 네 번 같다. functional `batch`·`state-edges` 두 쪽 모두 passed, 출력·품질·coverage 변화 0.
+- **처리량**(greedy DFlash2, speculative corpus, 128 토큰, context 4096, C마다 새 server; 요청 decode rate 합의 round 평균, 기준 2회 → 후보 2회):
+
+```
+mixed      C1: TG base 35.52 35.65 new 35.57 35.58 -> -0.0% | outputs identical across 4 runs: True | matched-work requests pass 9 flag 0, unmatched samples 0, worst +0.1% (instruction_debug 5004->5010 ms)
+mixed      C2: TG base 54.24 54.53 new 55.09 55.28 -> +1.5% | outputs identical across 4 runs: True | matched-work requests pass 9 flag 0, unmatched samples 6, worst -0.4% (reasoning_train 3322->3308 ms)
+mixed      C4: TG base 69.79 69.80 new 71.45 71.69 -> +2.5% | outputs identical across 4 runs: True | matched-work requests pass 9 flag 0, unmatched samples 7, worst -1.5% (instruction_debug 8734->8605 ms)
+mixed      C8: TG base 83.42 81.80 new 83.73 84.02 -> +1.5% | outputs identical across 4 runs: True | matched-work requests pass 10 flag 1, unmatched samples 36, worst +5.5% (json_schedule 10311->10883 ms)
+repetition C1: TG base 76.02 76.69 new 76.63 76.64 -> +0.4% | outputs identical across 4 runs: True | matched-work requests pass 1 flag 0, unmatched samples 0, worst -0.4% (repetition_word 1676->1670 ms)
+repetition C2: TG base 103.75 104.46 new 108.41 108.37 -> +4.1% | outputs identical across 4 runs: True | matched-work requests pass 0 flag 0, unmatched samples 8, worst +nan% (- 0->0 ms)
+repetition C4: TG base 112.63 113.15 new 113.64 113.65 -> +0.7% | outputs identical across 4 runs: True | matched-work requests pass 1 flag 0, unmatched samples 0, worst -0.7% (repetition_word 4536->4506 ms)
+repetition C8: TG base 128.50 129.11 new 129.41 129.42 -> +0.5% | outputs identical across 4 runs: True | matched-work requests pass 2 flag 0, unmatched samples 0, worst -0.5% (repetition_word 8747->8707 ms)
+{'pass': 41, 'flag': 1, 'inconclusive_samples': 57}
+```
+
+  C1은 그대로(−0.0 %, +0.4 %). C2 mixed +1.5 %, repetitive +4.1 %; C4 +2.5 %/+0.7 %; C8 +1.5 %/+0.5 %.
+- **요청별 5 %·3 ms**: 같은 일(case, draft·accept 수, 출력 토큰이 같은 것)끼리만 비교. 41 통과, 1 표시(mixed C8 json_schedule 10311 → 10883 ms, +5.5 %)인데 같은 일의 기준 두 번이 10646·9977 ms로 서로 6.7 % 달라 잡음 범위다 → inconclusive. 일이 다른 표본 57개(scheduler 교차로 draft 수가 달라짐, 기준끼리도 다름)는 비교하지 않음.
+- **functional 타이밍**: 788 중 762 passed, 26 inconclusive, 모두 `batch_c2_greedy_short_replies_match_serial`(+ `execution_mode_probe` queue 5 ms). 같은 요청의 wall이 도착 순서에 따라 약 750/860 ms 두 값으로 갈리고(기준에서도 같은 요청이 753·858 ms), 이번 실행에서 순서가 바뀐 요청이 걸렸다. 출력 같음. 해소하려면 이 history만 기준/후보 교대 재실행 필요(미실행, 감독 판단).
+
+### (c) 17–64행 폭 규칙 검색
+
+규칙은 형식·shape class·행 수에만 의존(셀별 선택 없음). 후보 계열: 균형, 16, 짝수 올림, {12,14,16}, {14,16}, 고정 폭 9–16, 각각 16(·14)의 배수 행 제외 여부. 측정 격자 모든 칸에서 운영보다 느리지 않아야 채택.
+
+- Q4_K·Q5_K·IQ4_XS 전 shape, Q6_K 5120×6144: **깨끗한 규칙 없음**(가장 덜 나쁜 것도 최악 칸 +2.7 – +24.5 %). 운영 그대로.
+- Q6_K FFN(17408·34816×5120, 5120×17408): "짝수 폭(균형 폭을 짝수로 올림), 운영이 이미 14·16행 완전 group으로 한 번에 도는 행 수(14·16의 배수) 제외"가 42칸 모두 이김, 최악 칸 −0.48 %(34816 @62), 평균 −13 – −15 %. 같은 격자에서 고른 규칙이라 표본 안 결과다. 모델 효과는 작다: 이 층(down 2, packed 1, 개별 1)에서 걸음당 0.3–1.6 ms(200–450 ms 걸음의 0.1–0.5 %). 적용하려면 build 1회와 확인 창 1개가 필요해 감독 판단 대기.
+
+### dflash_policy 비용표
+
+바꾸지 않았다. 비용표는 고정 draft 완전 cycle 측정이 필요하고, 이번 변경은 C2(10·14행 등)의 절벽을 줄여 비용표가 보수적이 된 상태다(정책은 같은 draft 수를 고르므로 출력·draft 수 변화 없음, 위 hash 일치). 재측정은 별도 작업으로 제안.
+
 ## 상태
 
-보고 ① 뒤 감독 확인 대기. 운영 변경 없음.
+(a)·(b) 운영 반영·검증 끝. (c)는 Q6 FFN만 후보, 감독 결정 대기.
