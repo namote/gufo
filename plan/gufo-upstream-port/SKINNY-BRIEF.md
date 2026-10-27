@@ -23,3 +23,10 @@
 - GPU: ai.tools 창 실행기로만, 한 번에 하나, 창 전 `.gufo-revision`을 HEAD로, 창 끝 `sleep 20`, 자동 재시도 없음, 실패 포함 모든 결과 보존. **감독이 GPU 시작을 알리기 전에는 GPU 창을 돌리지 않는다**(K5 창이 쓰는 중). 그 전에는 코드 읽기·설계·CPU 빌드·format까지.
 - 마진은 데이터를 본 뒤 넓히지 않는다. 이득이 없으면 운영 코드는 바꾸지 않고 측정만 기록한다.
 - 보고: ① 시제품 측정표 뒤(운영 변경 전 감독 확인) ② 끝에(커밋, 창 ID·경로, 전후 표: shape × 행 수 µs·GB/s, C1/C2/C4/C8 TG). 결과는 `plan/gufo-upstream-port/SKINNY.md`(새 파일)에 기록.
+
+## S2: DFlash2 Q4 비용표 재측정 (2026-10-27 사용자: "하나씩 진행", 첫 번째)
+
+- 근거: SKINNY.md. S(`28e650b4`)로 9–64행 검증이 빨라져 `src/models/qwen/dflash_policy.hpp`의 Q4 C2·C4(·C6·C8) 상대 비용표(`kQ4PairedRelativeCost`, `kQ4FourRequestRelativeCost`, `kQ4SixRequestRelativeCost`, `kQ4EightRequestRelativeCost`)가 이제 보수적이다. 표 주석이 적은 방식(고정 draft 수 complete-cycle profile, 1–7 draft)대로 지금 HEAD에서 다시 잰다. 그 방식·도구는 git 이력(`53f8b0a1`, `e4c661e6`)과 `docs/`·`tools/`에서 찾는다.
+- 순서: ① 측정 방법을 찾아 감독에게 짧게 보고(창 계획·예상 시간) ② 측정 창 ③ 표를 잰 값으로만 바꿈(마진·보정 공식은 그대로, 주석의 ms도 갱신) ④ 정책이 고르는 draft 수가 C2·C4·C6·C8에서 어떻게 바뀌는지 표 ⑤ 모델 수준 확인: Q4 DFlash2 C1(바이트·시간 그대로)·C2·C4·C8 TG, 기준(이 HEAD)과 번갈아, 요청별 5 %·3 ms, AR 일치·private sampled replay, functional `batch`·`state-edges`(이전 타이밍 경쟁은 SKINNY.md에 기록됨). Q8 표는 S가 Q8 경로를 바꾸지 않았으므로 건드리지 않는다.
+- 이득이 없으면(새 표로도 처리량 잡음 안) 표는 잰 값으로 바꾸되 결과를 그대로 기록하고, 감독이 채택을 정한다.
+- 규칙: S와 같음(브랜치 `ai-tools/port-u4f`에 직접 커밋, push 없음, trailer, format check, 자기 파일만). GPU 창은 한 번에 하나, 창 전 `.gufo-revision` = HEAD, `sleep 20`, 자동 재시도 없음, 모든 결과 보존. **GPU 창이 도는 동안 빌드 등 CPU 부하 작업 금지**(Strix Halo 메모리 대역폭 공유). 결과는 SKINNY.md "S2" 절에.
