@@ -184,3 +184,24 @@ K1a·K1b 결과와 감독 판정은 [KVarN](KVARN.md) "K1a·K1b 결과"에 있�
 - 기록(시나리오·요청별, 평균 내지 않음): gold, fp16 대비 텍스트 차이(다른 요청 수·첫 다른 위치; 같다고 주장하지 않음), TTFT·prefill·decode t/s, 재사용 토큰, 재시작 복원 시간과 바이트, cgroup 최대 메모리(anon·file 나눠서 가능하면), KV 풀 사용 블록, SSD 쓰기·디스크 사용, DFlash2 수락률. 요청별 시간은 5 %·3 ms 규칙으로 표시하고, 넘으면 원인을 보거나 그 시나리오만 한 번 더 번갈아 돌린다(결과는 모두 보존).
 - t2.py의 새 finish_reason 검사처럼 모든 스트림이 정상 종료했는지 확인한다(final.py·suite도 같은 빈틈이 있으면 같은 검사를 넣는다).
 - GPU 시간이 길다(F는 약 1.5–3 시간, 두 형식이면 그 두 배 안팎). 창 계획을 쓴 뒤 예상 시간을 감독에게 먼저 보고하고, 확인을 받은 뒤 시작한다. 디스크 여유가 60 GB 아래면 끝난 창의 cache-disk를 지우고 기록한다.
+
+## K5: K3 뒤 prefill 비용 (2026-10-27 사용자: "오케이 가자")
+
+근거는 KVARN.md "K3 결과"(k4v2가 느린 곳)와 "K4-P1 결과". 한 에이전트가 맡는다(두 과제가 같은 prefill·quantizer 파일). k4v2·k4v4 둘 다, fp16 경로 바이트·동작 그대로. GPU는 창 실행기로만, 한 번에 하나, 창 전 `.gufo-revision`을 HEAD로, 창 끝 `sleep 20`, 자동 재시도 없음, 모든 결과 보존.
+
+### K5-1: 깊은 문맥의 짧은 prefill (우선)
+
+- K3 `k3-a01` 256K 문서 T2·T3: 33토큰 prefill이 fp16 919/1,005 ms → k4v2 1,230/1,284 ms(+0.3 s). 같은 깊이 pp512는 k4v2가 +51 % 빠르므로, 행 수가 적은 prefill(또는 그 chunk가 타는 커널·경로: 질의 행 수에 따른 decode/verify 커널 선택, 그룹 flush·quantizer, tail ring 처리) 쪽이 의심된다.
+- 먼저 원인을 잰다: 같은 깊이(32K·128K·256K)에서 prompt 행 수 1·8·16·33·64·128·512의 층 µs·끝단 ms를 fp16·k4v2로(`tools/prof/prof.py` 또는 bench). 시간 분해(attention·quantizer·회전·기타)를 표로. 원인이 확인된 뒤 고친다.
+- 기준: 양자화·커널 결과 비트 일치(K0 참고, verify = decode exact), 위 행 수·깊이 전부에서 k4v2가 fp16보다 느리지 않거나(잡음 안) 남은 차이의 원인을 표로 설명, 다른 깊이·행 수 퇴보 없음.
+
+### K5-2: d0 prefill 약 1 %
+
+- K3 bench: d0 AR pp1024 −1.3 %, pp2048 −1.3 %, DFlash2 pp1024 −1.2 %, pp2048 −0.9 %(K4-P1 pp512는 −0.4 – −0.6 %). quantizer 몫(chunk 282 µs)이 prompt 길이에 비례하는지 먼저 확인한다.
+- 후보: quantizer를 prefill attention·다른 층 작업과 같은 launch에 묶기, 회전 합치기, 남은 직렬 구간 줄이기. 별도 stream 겹치기는 K1d에서 경합으로 기각됐다(다시 하려면 근거를 먼저).
+- 기준: K4-P1과 같음(비트 일치, pp512·pp1024·pp2048 d0 AR·DFlash2 손해가 잡음 안, 10회 × 3 교대, 같은 창). 32K·256K 퇴보 없음.
+
+### 확인 창과 보고
+
+- 끝나면 짧은 확인 창: decode 테스트·KVarN ops·continuation 모드, bench(d0 pp512/1024/2048, d32768, d258048 DFlash2 pp512), 그리고 K3 `long256k` 시나리오 한 쌍(fp16·k4v2 번갈아)으로 T2·T3 prefill 재기. 그 밖의 시나리오·suite는 바뀐 파일이 건드리지 않으면 돌리지 않는다.
+- 이득이 없으면 운영 코드는 바꾸지 않고 측정과 원인만 기록한다. 마진을 넓히지 않는다.
