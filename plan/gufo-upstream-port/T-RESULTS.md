@@ -124,3 +124,14 @@
 **`replay:1` queue 5 → 10 ms**: 동시에 도착한 두 warm 요청(chat·responses)이 각자 약 5 ms 복원을 Admit에서 차례로 한다. 먼저 받은 쪽이 약 5 ms, 다음이 약 10 ms를 기다린다. 기준은 responses가 먼저(chat 9.7·9.6 ms), 새 쪽은 chat이 먼저(responses 9.6·9.9 ms)였고, 두 요청의 합(약 15 ms)과 최댓값은 같다. 이때 scheduler는 비어 있었다(앞 요청 r10 완료, 상주 0). 이 변경이 닿는 경로(상주 decoder를 due로 표시)는 돌지 않았으므로 HTTP 쪽 제출 순서 경쟁이다.
 
 **`disk-spacing-disk:1:0` 복원 +40–70 ms**: 서버 로그 `event=disk_restore`의 세부를 보면 늘어난 몫은 모두 `filesystem_ms`다. 기준 41–45 ms, 새 쪽 112 ms(A)·85 ms(B), t1b-w1의 새 쪽은 41 ms다. `stream_wait_ms`(19–22), `checksum_ms`(13.3–13.5), `staging_wait_ms`(≈0), bytes(303,403,296)·pieces(350)는 같다. 재시작 직후의 동료 없는 단일 요청이 앞서 쓴 디스크 cache 파일을 읽는 시간이라 scheduler와 무관하다(page cache·SSD 상태). 이번 창에서 new는 늘 쌍의 두 번째로 돌아 앞 쌍의 cache 파일이 page cache를 더 차지한 상태였다. 순서와 binary가 섞여 있으므로 순서를 바꾼 확인(N B B N)이 필요하다.
+
+### 창 `t1b-w3-a01/t1b-w3` (순서 균형 N B B N, 감독 승인)
+
+- FAILED_no_fallback(비교 두 개가 qualification inconclusive라 0이 아닌 종료), health PASS, 재시도 없음. `.gufo-revision` `f45a2382`, 같은 바이너리, `386b4320` harness, 계획 `PLAN-T1B3.json`. fn1-new 기록 → fn2-base 비교 → fn3-base 기록 → fn4-new 비교. 네 실행 모두 functional passed, quality/coverage 변화 0. 비교 2(base 대 new 기준): passed 1348, inconclusive 41. 비교 4(new 대 base 기준): passed 1341, inconclusive 48. failed는 둘 다 0.
+- `disk_restore` 2447토큰 `filesystem_ms`(위치 1–4): new 27.9, base 41.2, base 103.0, new 41.6. 같은 실행의 두 번째 173토큰 복원은 38.3 / 142.9 / 123.4 / 59.1. 지금까지 모든 창의 2447토큰 값: base 41, 42, 45, 41, 103 / new 41, 112, 85, 28, 42. 느린 값이 양쪽 binary에서 나오므로 page cache·SSD 상태이고 binary와 무관하다.
+- 두 비교에서 함께 flag된 것은 짧은 쌍 case(`batch_c2_greedy_short_replies_match_serial:0/1`의 wall·decode·inter-token·snapshot·queue)뿐이다. 두 비교 모두 **비교 대상(나중에 돈 쪽)이 느린** 방향이라 new 기준으로는 서로 반대 방향이다. 즉 실행 위치·이력의 두 갈래 값이지 new가 느린 것이 아니다. new가 두 비교 모두에서 느린 요청은 없다.
+- 한 비교에서만 나온 것은 비교 2에서 14개(모두 base가 느림, 예: `text-cancel-disk:1:0` 복원 54 → 159 ms), 비교 4에서 7개(new가 느림, queue·복원 +4–8 ms)다.
+
+### 판정
+
+순서를 맞추면 new는 느리지 않다. 재현됐던 flag는 이력 상태(앞 snapshot 복사의 잔여 대기), 동시 도착의 제출 순서, 디스크 읽기(page cache)로 설명되고 양쪽 binary에 모두 나타난다. 출력·품질·coverage는 모든 창에서 같고, 앵커 coverage는 sessions 2에서 10/10, sessions 4에서 2/2 결정적이다. **T1b 수정(`f53aba73` + `6e0e03f2`) 채택.**
