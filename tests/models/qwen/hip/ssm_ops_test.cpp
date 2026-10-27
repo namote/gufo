@@ -179,6 +179,11 @@ void TestRecurrentRollbackRows(bool large_state) {
       config.full_attention_interval = interval;
       auto policy = gufo::hip::QwenExecutionPolicy::Production();
       policy.recurrent_state_storage = storage;
+      // The FP16 and KVarN block pools hold attention layers, which every
+      // Qwen model has. Recurrent-only layouts keep the flat FP32 reference
+      // KV, which needs no pool.
+      if (config.FullAttentionLayerCount() == 0)
+        policy.kv_cache_storage = gufo::hip::QwenKvCacheStorage::kFp32;
       gufo::hip::QwenGpuArena arena(config, 16, policy);
       const std::size_t conv_row =
           config.SsmQkvSize() * config.ssm_conv_kernel * sizeof(float);
