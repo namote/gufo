@@ -313,6 +313,26 @@ fake quant는 FP16 커널을 그대로 쓰므로 속도를 재지 못한다. 그
 - decode 테스트의 묵은 compact 거절 기대 제거(`55e09cab`). 창 `kvarn-k4c3-a01`(K4-P·K4-C 모두 포함한 HEAD) COMPLETE·health PASS: full decode 테스트, KVarN ops, continuation 모드, fp16 continuation adapter(plain·draft), target, backend, block table 모두 PASS.
 - 남은 것(K3 뒤 또는 필요 시): AR pp512 d0 약 −0.4 %(quantizer 몫), 4K decode FP16 sink·tail 고정 비용, checkpoint tail 16 MiB 고정(정확히 줄이려면 `src/cache` 변경), FP16 q·P 반올림 통제 없음, `qwen_ssm_ops_test` 이전부터의 중단(`f8c9df17`).
 
+### K3 결과 (2026-10-27, gufo `be582a9f`, 실행 `k3-a01`, 감독 검증)
+
+- 창 19개(시나리오 8쌍 ABBA·bench 쌍·k4v2 suite) 모두 COMPLETE·health PASS, 이미지 `be582a9f9275`, 재실행 없음. 서빙 설정은 최종 점검 F와 같음(256K×4, pool 40 GiB, RAM 8 GiB, disk 64 GiB, DFlash2).
+- 품질: 비교 요청 95개 모두 두 형식 gold 정답, k4v2 텍스트가 FP16과 95/95 같음(256K 문서 질의 포함). finish 모두 `stop`, cached token 95/95 같음. 시나리오 드라이버에 스트림 오류 검사 추가(기존 결과 271개 재검사, 실패 없음).
+- suite(k4v2): `long-context` passed, `cache` 8/8 passed.
+- bench, fp16 → k4v2:
+  - d0: AR pp1024 653.9 → 645.6, pp2048 650.4 → 641.8(−1.3 %), DFlash2 pp1024 602.7 → 595.3(−1.2 %), pp2048 −0.9 %. AR tg128 12.94 → 12.97, DFlash2 tg 45.14 → 44.96.
+  - d32768: AR pp −0.7 to −1.1 %, AR tg 11.45 → 12.57(+10 %), DFlash2 tg 58.36 → 71.30(+22 %).
+  - d258048(DFlash2): pp512 97.7 → 147.5(+51 %), tg64 11.51 → 20.34(+77 %).
+- 서빙:
+  - 256K 문서: T1 866.8 → 864.5 s, decode 18.9 → 43.8 t/s, 재시작 뒤 T3 4.55 → 2.26 s(복원 3,536 → 966 ms).
+  - 32K: 재시작 뒤 T3 0.94/0.81 → 0.49/0.47 s.
+  - 64K×8 혼합 요청은 대체로 빨라짐.
+- 메모리·디스크: cgroup peak의 anon은 같고, 늘어난 0.3–1.4 GiB는 page cache. SSD 쓰기 32K 11.6 → 4.6 GB, 256K 19.0 → 5.0 GB, 디스크 캐시 256K 17.5 → 4.2 GB.
+- k4v2가 느린 곳(각 1회 실행, 미검증):
+  - 256K 깊이의 33토큰 prefill이 919 → 1,230 ms(T2 TTFT 0.93 → 1.24 s, T3 prefill 1,005 → 1,284 ms). 두 번 모두 같은 방향이라 짧은 prefill 경로의 실제 비용일 가능성이 큼(K4-P1의 quantizer 몫과 별개, 원인 미조사).
+  - 256K×4의 8K 요청 58.2 → 69.4 s는 동시 처리 순서 영향으로 보이며, 64K×8에서는 반대(103.3 → 70.2 s)라 결론 없음.
+  - 그 밖에 30–70 ms 느린 행이 몇 개 있음. TTFT 95행 중 38행이 5 %·3 ms를 넘고, 그중 10행이 k4v2가 느림.
+- 판정: 품질 손실 없고 긴 문맥 decode·복원·디스크에서 이득이 커서 k4v2 기본값 유지. 남은 비용은 d0 prefill 약 1 %, 깊은 문맥의 짧은 prefill +0.3 s/256K로, 다음 개선 후보로 둔다.
+
 ### K0에서 정하지 않는 것
 
 - 커널·서빙·checkpoint 형식(K1·K2). 추가가 필요한 것만 적어 둔다: storage enum 값과 policy fingerprint 비트, K/V component `layout_version` 3(새 row_bytes와 128토큰 scale plane), compact snapshot 검증 완화, 블록 풀의 scale plane(`KvBlockPlane::rows_per_block` 128은 이미 표현 가능하나 arena·adapter가 같은 두 plane을 가정한다).
