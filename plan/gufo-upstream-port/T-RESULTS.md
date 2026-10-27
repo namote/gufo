@@ -57,3 +57,39 @@
 ## `tests/functional/prompt_lookup.py:161`
 
 - 같은 assert 형태(`max(physical_execution_width) == cohort_size`)지만 같은 경쟁은 아니다: 행이 warm cache 위의 128토큰 반복 응답이라 여러 step 동안 겹칠 기회가 있다. 다만 capture에서 돌아온 행이 혼자 due가 되는 같은 scheduler 경로를 지나므로 cohort가 커지면 이론상 같은 원인으로 흔들릴 수 있다. 실패 기록은 찾지 못했다. 바꾸지 않았다.
+
+## T1b: capture 복귀 스케줄 (2026-10-28)
+
+### 커밋
+
+- `f53aba73` fix(serve): resume a captured request together with the resident decoders — capture drain에서 prefill이 끝난 요청을 `decoding`에 넣은 뒤 `MarkAllDecodersDue(decoding)`(그 요청만 due로 두던 `82711d8c`(#445) 규칙을 prefill 교차 경로와 같게).
+- `6e0e03f2` test(functional): batch short greedy replies beside a decoding anchor for deterministic coverage — `386b4320` 되돌리기(앵커 테스트 + 원래 짝 유지).
+- CPU: `text_generation_scheduler_test`, `text_model_runner_test`, `openai_chat_test` PASS. format check PASS.
+
+### 창 `t1b-w1-a01/t1b-w1`
+
+- 결과 FAILED_no_fallback(원인: `fn-base`·`fn-new` 아래), health PASS, 재시도 없음. 이미지 `4a7046b2e8ed`, `.gufo-revision` `6e0e03f2`. 계획 `PLAN-T1B.json`, 증거 ai.tools `tmp/test-results/gufo-upstream-port-20261023/t1b-w1-a01/t1b-w1/`. 모든 계획 항목이 돌았다(약 47분).
+- 바이너리: base `build/t1b-base/gufo` `4f1d0f8d…`(src = `386b4320`), new `build/release/gufo` `e5899f9a…`, `inference_backend_gpu_test` `e16b2f87…`.
+
+|항목|결과|
+|---|---|
+|`inference_backend_gpu_test`(new)|PASS (192 s)|
+|functional base(`--record-baseline`)|batch FAIL(앵커 assert, 기준의 알려진 경쟁), 나머지 10 suite passed|
+|functional new(`--baseline`)|11 suite 모두 passed(batch, state-edges, long-context, cache 8경우)|
+|cohort base/new/base/new|모두 완료, 출력 hash 4회 같음(모든 C·workload)|
+|앵커 sessions 2 ×10|모두 PASS, 앵커 행 batched 16/16 매번; 짝 batched 6,10,8,10,0,6,4,10,4,6/16|
+|앵커 sessions 4 ×2|PASS, 앵커 12/12, 짝 12·13/16|
+
+### functional 비교
+
+- runner의 자동 비교는 기준이 실패해 만들어지지 않았다("functional checks did not pass"). 같은 harness의 `metrics.compare(fn-base, fn-new)`를 창 뒤 호스트에서 돌렸다(결과 scratch `fn-compare.json`, 코드 변경 없음).
+- 측정 1739개: passed 1618, inconclusive 121, failed 0. quality/coverage 목록은 `batch_c2_greedy_short_replies_match_serial`의 case 변경(기준 실패·앵커 길이 차이)과 그 뒤 모든 요청의 `history_sha256` 변경뿐이다. 앵커가 취소되는 시점이 달라 서버 이력이 달라진 탓이라 batch 뒤 suite의 timing은 이력이 맞지 않는 비교다.
+- inconclusive 113개는 batch의 짧은 응답 case(짝·앵커): 새 쪽에서 행이 batched되면서 draft 일이 달라져 요청별 decode가 길어진다(예: 앵커 행 decode 104 → 150–315 ms, 기준은 혼자 한 step). 의도한 동작 변화다.
+- 그 밖 8개: `long_thinking_token_limit` decode 211 → 266 ms, `batch_c2_independent_samplers_and_grammars:0` prefill 325 → 405 ms, `cancelled_peer_isolation:3` queue/ttft +6 ms, `chat_responses_completions_replay:1` queue +4 ms, state-edges `cyclic_schema_rejected` wall 0.6 → 8.3 ms·`quoted_call_argument_stop_streamFalse` queue +7.6 ms, `disk-spacing-disk:1` snapshot +3 ms. 앞의 둘은 동료 없는 단일 요청(width 1, draft 같음)이라 이 변경이 아무것도 바꾸지 않는 경로다. 모두 한 번 실행·이력 불일치라 **inconclusive**로 둔다.
+
+### cohort (DFlash2 greedy, UD-Q4_K_M, context 4096, C마다 새 server)
+
+- 출력 hash는 모든 C·workload에서 네 번 같다.
+- TG(base base / new new): mixed C1 35.66 35.65 / 35.69 35.63, C2 55.60 55.24 / 55.35 55.14, C4 71.25 71.45 / 71.35 70.98, C8 83.26 84.64 / 82.41 82.57(−1.7 %); repetition C1–C8 ±0.4 %.
+- 요청별 gate: per-case 39 pass, 1 flag(mixed C8 `expository_pangram` 9284 → 10131 ms, base 8908/9659, new 10635/9626; base-base spread 9.9 %).
+- C8 mixed 평균 decode_ms: base 11213·10978, new 11235·11270. 차이는 주로 base 두 번째 실행이 낮은 데서 온다. **inconclusive**(잡음 크기). 확정하려면 C8 mixed만 base/new 교대 재실행.
