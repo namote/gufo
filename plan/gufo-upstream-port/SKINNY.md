@@ -123,7 +123,7 @@ repetition C8: TG base 128.50 129.11 new 129.41 129.42 -> +0.5% | outputs identi
 ```
 
   C1은 그대로(−0.0 %, +0.4 %). C2 mixed +1.5 %, repetitive +4.1 %; C4 +2.5 %/+0.7 %; C8 +1.5 %/+0.5 %.
-- **요청별 5 %·3 ms**: 같은 일(case, draft·accept 수, 출력 토큰이 같은 것)끼리만 비교. 41 통과, 1 표시(mixed C8 json_schedule 10311 → 10883 ms, +5.5 %)인데 같은 일의 기준 두 번이 10646·9977 ms로 서로 6.7 % 달라 잡음 범위다 → inconclusive. 일이 다른 표본 57개(scheduler 교차로 draft 수가 달라짐, 기준끼리도 다름)는 비교하지 않음.
+- **요청별 5 %·3 ms**: 같은 일(case, draft·accept 수, 출력 토큰이 같은 것)끼리만 비교. 41 통과, 1 표시(mixed C8 json_schedule 10311 → 10883 ms, +5.5 %). 같은 일의 기준 두 번이 10646·9977 ms로 6.7 % 달라 기준 분산이 gate(5 %)보다 크다 → **inconclusive로 남김**(퇴보로도 통과로도 판정하지 않음). 일이 다른 표본 57개(scheduler 교차로 draft 수가 달라짐, 기준끼리도 다름)는 비교하지 않음.
 - **functional 타이밍**: 788 중 762 passed, 26 inconclusive, 모두 `batch_c2_greedy_short_replies_match_serial`(+ `execution_mode_probe` queue 5 ms). 같은 요청의 wall이 도착 순서에 따라 약 750/860 ms 두 값으로 갈리고(기준에서도 같은 요청이 753·858 ms), 이번 실행에서 순서가 바뀐 요청이 걸렸다. 출력 같음. 해소하려면 이 history만 기준/후보 교대 재실행 필요(미실행, 감독 판단).
 
 ### (c) 17–64행 폭 규칙 검색
@@ -131,12 +131,25 @@ repetition C8: TG base 128.50 129.11 new 129.41 129.42 -> +0.5% | outputs identi
 규칙은 형식·shape class·행 수에만 의존(셀별 선택 없음). 후보 계열: 균형, 16, 짝수 올림, {12,14,16}, {14,16}, 고정 폭 9–16, 각각 16(·14)의 배수 행 제외 여부. 측정 격자 모든 칸에서 운영보다 느리지 않아야 채택.
 
 - Q4_K·Q5_K·IQ4_XS 전 shape, Q6_K 5120×6144: **깨끗한 규칙 없음**(가장 덜 나쁜 것도 최악 칸 +2.7 – +24.5 %). 운영 그대로.
-- Q6_K FFN(17408·34816×5120, 5120×17408): "짝수 폭(균형 폭을 짝수로 올림), 운영이 이미 14·16행 완전 group으로 한 번에 도는 행 수(14·16의 배수) 제외"가 42칸 모두 이김, 최악 칸 −0.48 %(34816 @62), 평균 −13 – −15 %. 같은 격자에서 고른 규칙이라 표본 안 결과다. 모델 효과는 작다: 이 층(down 2, packed 1, 개별 1)에서 걸음당 0.3–1.6 ms(200–450 ms 걸음의 0.1–0.5 %). 적용하려면 build 1회와 확인 창 1개가 필요해 감독 판단 대기.
+- Q6_K FFN(17408·34816×5120, 5120×17408): "짝수 폭(균형 폭을 짝수로 올림), 운영이 이미 14·16행 완전 group으로 한 번에 도는 행 수(14·16의 배수) 제외"가 42칸 모두 이김, 최악 칸 −0.48 %(34816 @62), 평균 −13 – −15 %. 같은 격자에서 고른 규칙이라 표본 안 결과다. 모델 효과는 작다: 이 층(down 2, packed 1, 개별 1)에서 걸음당 0.3–1.6 ms(200–450 ms 걸음의 0.1–0.5 %). **찾았지만 적용하지 않음**(감독 결정): 모델 효과가 걸음의 0.5 % 이하인데 build 1회와 확인 창 1개가 더 필요하고, 표본 밖 확인이 없다.
 
 ### dflash_policy 비용표
 
 바꾸지 않았다. 비용표는 고정 draft 완전 cycle 측정이 필요하고, 이번 변경은 C2(10·14행 등)의 절벽을 줄여 비용표가 보수적이 된 상태다(출력 hash는 모두 같음. draft 수는 scheduler 교차에 따라 기준끼리도 달라지고, repetitive C2는 기준 110 → 후보 111로 두 번 모두 달랐다). 재측정은 별도 작업으로 제안.
 
+## 창 `skinny-s-w3-a01/s-w3` (functional 타이밍 재확인)
+
+창 FAILED_no_fallback, health PASS, 재시도 없음. s-w2와 같은 바이너리(후보 `6e5600d3…`, 기준 `22e4f9cf…`), `.gufo-revision` `ffdc3f6b`(4fc0211d와 문서만 다름). `batch` + `state-edges`를 `--through-case state-edges:execution_mode_probe`로 같은 history째 재생, 32768×2, DFlash2, 순서 기준(record) → 후보(기준0 대비) → 기준(기준0 대비, 대조) → 후보(기준2 대비). 마진 그대로(5 %, 3 ms).
+
+|실행|비교|결과|
+|---|---|---|
+|fn3-0-base|record|passed|
+|fn3-1-new|vs base0|inconclusive: 639 중 30, 거의 모두 `batch_c2_greedy_short_replies_match_serial`(wall 742 → 854 ms, inter-token 약 2배, cache_snapshot +) + queue 몇 ms; 품질·coverage 변화 0|
+|fn3-2-base|vs base0 (기준끼리)|inconclusive: 639 중 48, **같은 case에서 같은 모양**(wall 742 → 857 ms, decode 105 → 214 ms)|
+|fn3-3-new|vs base2|**failed**: `batch` suite가 `check_batches`의 `physical_execution_width > 1` assert에서 멈춤(16개 동시 쌍이 모두 `serial-fallback`, 한 번도 겹쳐 돌지 않음). 출력 텍스트는 serial과 같음. 비교는 만들어지지 않음. `state-edges` passed|
+
+판정: s-w2의 `batch_c2_greedy_short_replies_match_serial` inconclusive는 기준끼리도 같은 크기로 나오므로 이 변경의 퇴보로 볼 근거가 없다. 그대로 **inconclusive**. fn3-3-new의 실패는 동시 요청이 batched로 겹치지 않은 coverage 실패로, 같은 바이너리의 fn3-1-new에서는 겹쳤다. 원인 미확인(재실행 안 함), 기록만.
+
 ## 상태
 
-(a)·(b) 운영 반영·검증 끝. (c)는 Q6 FFN만 후보, 감독 결정 대기.
+(a)·(b) 채택. (c) 버림(위 Q6 FFN 규칙은 기록만).
