@@ -275,6 +275,81 @@ C8 d32K  new    1 1  1  1  1  1  1  1  1  1  1  1  1  7
 - 문서의 운영 Q4 target은 **UD-Q4_K_XL**이다(`docs/models/qwen3.8-27b/README.md` 3·13·18행 download, `BENCHMARKS.md` 4행, 저장소 `README.md` 표). 이 checkout에는 Q4_K_M target 안내가 없다(Q4_K_M은 DFlash2 draft).
 - 표는 quant 형식이 아니라 head 형식으로 key된다: `backend.cpp:195` `output.type == kQ8_0`이면 Q8 표, 아니면 Q4 표다. UD-Q4_K_XL과 UD-Q4_K_M은 둘 다 Q6_K head라서 **같은 Q4 표를 쓴다**. Q4_K_M에서 잰 값으로 바꾸면 문서 대상인 Q4_K_XL 사용자도 바뀐다.
 
-### 상태
+### 상태 (Q4_K_M 측정 시점)
 
-`dflash_policy.hpp`는 바꾸지 않았다(감독 지시: 채택은 모델 보정 결정이라 사용자와 정함). 모델 수준 확인 창은 아직 없다.
+이 시점에는 `dflash_policy.hpp`를 바꾸지 않았다(채택은 모델 보정 결정). 사용자 결정에 따라 아래에서 UD-Q4_K_XL로 다시 쟀다.
+
+## S2-XL: UD-Q4_K_XL 재측정, 표 변경, 확인
+
+### 모델
+
+`unsloth/Qwen3.8-27B-GGUF@4ca720788d1e01f1bff70c033e0d0028fd02e502` `Qwen3.8-27B-UD-Q4_K_XL.gguf`(README의 고정 revision). curl로 받았다(호스트에 Nix 없음).
+- 크기 17559178144 B, sha256 `3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e`. hub LFS 값과 같다.
+- 위치: `/models/qwen`으로 mount되는 `storage/models/llm/qwen-3.8-27b-ud-q4-k-m-gguf/`, 옆에 `source-UD-Q4_K_XL.json`. 남은 디스크 233 GB.
+
+### 창 `skinny-s2-w2-a01/s2-w2` (PLAN-S2X.json)
+
+COMPLETE, health PASS, 재시도 없음. `.gufo-revision` `ea4ebf08`(코드는 HEAD와 같음). 방법은 S2와 같다(수정된 cal.py).
+- base(22e4f9cf) wall C2–C8, new(6e5600d3) wall C2–C8, new rocprof C4·C6·C8.
+- 모든 점이 full acceptance, `batched-wC`, hash 하나. 요약은 `build/s2-results/s2-summary-xl.json`.
+
+```
+XL cycle ms N=1..7          (C2 new = wall, C4–C8 new = profile, base = wall)
+C2 base 90.7  94.3  99.5 138.9 138.4 144.3 144.3 | new 90.2  94.7 100.1 120.8 133.2 136.1 145.2
+C4 base 105.1 142.3 146.2 214.7 229.0 247.1 260.9 | new 104.4 134.1 143.5 221.6 233.3 257.6 264.1
+C6 base 145.7 210.8 232.7 278.2 322.3 348.3 364.8 | new 140.2 217.6 237.4 286.7 341.0 379.2 398.8
+C8 base 153.2 235.8 263.7 344.4 365.3 433.3 457.7 | new 153.9 240.4 276.2 368.9 392.4 481.1 514.5
+상대   old                                 | XL base (wall)                       | XL new
+C2 1 1.04 1.10 1.48 1.45 1.50 1.50 m1.92 | 1 1.04 1.10 1.53 1.53 1.59 1.59 m2.21 | 1 1.05 1.11 1.34 1.48 1.51 1.61 m2.22
+C4 1 1.30 1.33 1.97 2.12 2.29 2.32 m3.20 | 1 1.35 1.39 2.04 2.18 2.35 2.48 m3.80 | 1 1.28 1.38 2.12 2.24 2.47 2.53 m3.83
+C6 1 1.44 1.59 1.89 2.21 2.43 2.47 m3.50 | 1 1.45 1.60 1.91 2.21 2.39 2.50 m4.12 | 1 1.55 1.69 2.05 2.43 2.70 2.85 m4.28
+C8 1 1.52 1.68 2.21 2.38 2.89 3.08 m4.42 | 1 1.54 1.72 2.25 2.38 2.83 2.99 m5.22 | 1 1.56 1.79 2.40 2.55 3.13 3.34 m5.20
+```
+
+- XL에서 S의 효과(base → new wall): C2 N4 −13 %, N6 −5.7 %, C4 N2 −4 %. 그 밖은 ±1.5 % 안이다.
+- XL base의 상대값은 old와 비슷하다. 다만 N1 cycle이 짧아져(C2 104 → 90, C4 125 → 105 ms) multiplier가 커진다. 원래 표를 잰 뒤 kernel이 바뀌었고, 기본 KV도 지금은 `kvarn-k4v2`다.
+- C4–C8 new 표는 profile 값이라 높은 N에서 wall보다 크다(원래 C4–C8 방법과 같음).
+
+정책 선택 replica, old → new: 대체로 같거나 짧아진다.
+- C2: mean 3.5–4에서 7 → 3. mean 4.5–5에서 d0은 7 → 6, d32K는 7 → 3.
+- C4: d0 mean 1.5에서 3 → 1, d32K mean 2.5–3.5에서 3 → 2.
+- C6: mean 3.5–4.5에서 3 → 1, mean 6.5에서 7 → 3, d32K mean 5–6.5에서 → 1.
+- C8: d0·d8K mean 5–6.5에서 3 → 1.
+
+### 운영 변경 `eb78772f` perf(qwen): recalibrate Q4 greedy DFlash2 verification costs
+
+- `dflash_policy.hpp`의 `kQ4Paired/FourRequest/SixRequest/EightRequestRelativeCost`, multiplier 1.92/3.20/3.50/4.42 → 2.22/3.83/4.28/5.20, 주석의 ms와 모델 이름만 바꿨다. 공식·마진·Q8 표는 그대로다.
+- format check PASS(693 파일).
+- 테스트 기대값은 바꾸지 않았다. replica로 본 mean 3 기대값은 그대로 성립했다. **아래 full-acceptance 기대값은 성립하지 않는다.**
+- 빌드: 이미지 컨테이너에서 `build/s2-release/gufo` `94dc3f43…`, `build/s2-gpu-test` ops test `4c03bd5d…`, dflash test `cc29e04a…`. 스크립트는 `build/s2-build.sh`.
+
+### 창 `skinny-s2-w3-a01/s2-w3` (PLAN-S2V.json, 확인)
+
+FAILED_no_fallback, health PASS, 재시도 없음. `.gufo-revision` `eb78772f`. base = old 표(`build/s-src/build/s-release/gufo` 6e5600d3, 그 밖의 코드 같음), new = `eb78772f`. 요약은 `build/s2-results/cohort-xl.txt`, `cohort-km.txt`(`build/s2-run/cohort_an.py`).
+
+- `qwen_q4kxl_quant_ops_test`: PASS.
+- `qwen_dflash_gpu_test XL --concurrency-only`: **FAIL**. 첫 단계 `TestLengthController`(`dflash_test.cpp:66`)에서 멈췄다: "batched full acceptance retains the full block at every depth".
+  - 새 표에서 C3·C4 full acceptance가 262144 위치에서 7 대신 5를 고른다(replica 확인; 131072까지는 7). old 표는 모든 깊이에서 7이다.
+  - 이 test는 처음에 멈췄으므로 **C2–C8 exact layers/logits/selector와 private RNG/sampled replay는 이 창에서 확인되지 않았다.**
+- functional `batch`+`state-edges` XL: fn-base passed(record). fn-new는 `batch`가 `check_batches`의 `physical_execution_width > 1` assert(`openai_sdk.py:788`)에서 멈췄다. 16 쌍이 모두 serial이었다. `state-edges`는 passed다. 이는 s-w3·s-w4에서 기준끼리도 나온 timing race assert와 같다. 비교는 만들어지지 않았으니 **inconclusive**다.
+- cohort XL(base/new/base/new, greedy DFlash2, mixed 9 case + repetition, 128 토큰, context 4096, C마다 새 server). 출력 hash는 모든 C·workload에서 네 번 같다(AR 경로와 같은 greedy 출력).
+
+```
+mixed      C1: base 37.18 37.04 new 37.04 37.02 -> -0.2%
+mixed      C2: base 57.03 58.08 new 56.91 57.75 -> -0.4%  drafts/acc base 1547/833 new 1433/823; per-case flag 1: reasoning_train 3141->3307 ms (+5.3%, base 3158/3124, new 3298/3317)
+mixed      C4: base 74.95 74.75 new 74.58 74.24 -> -0.6%  drafts/acc base 1463/958 new 1439/949; flag 0
+mixed      C8: base 90.91 89.72 new 90.87 90.44 -> +0.4%  drafts/acc base 1530/1094 new 1342/983; per-case flag 3:
+             cpp_ring_buffer 10591->11360 (+7.3%, base 10561/10621, new 11465/11255), reasoning_train 9536->10302 (+8.0%), json_schedule 10883->11433 (+5.1%)
+repetition C1: -0.3%  C2: base 106.88 110.85 new 107.52 108.09 -> -1.0%  C4: +0.5%  C8: +0.3% (drafts 848 -> 823)
+UD-Q4_K_M 짝(base/new 1회): mixed C2 55.40 -> 54.56 -1.5% (flag reasoning_train +5.9%, summary_gpu 1350->1647 +22%), mixed C4 71.57 -> 73.35 +2.5%, repetition C2 +0.5%, C4 +0.4%
+```
+
+  - 요청별 gate(5 %·3 ms). 같은 일(matched-work) 비교는 18 통과, 0 표시다. 하지만 표가 draft 수를 바꾸므로 표본 157개가 unmatched다.
+  - case별 비교(case의 모든 요청, base 평균 vs new 평균)는 36 통과, 4 표시다(XL). 표시된 C8 3 case와 C2 reasoning_train은 두 new 실행이 모두 두 base 실행보다 느리다.
+
+### 판정 (감독에게)
+
+- **처리량 이득 없음**(XL C2–C8 −1.0 – +0.5 %, 잡음 안).
+- **요청별 퇴보 표시**가 있다: C8 mixed 3 case +5–8 %, C2 reasoning_train +5.3 %. 새 표가 C8에서 draft를 덜 제안해 accept 토큰이 1094 → 983으로 준다.
+- dflash test의 full-acceptance 기대값이 깨지고, 이 때문에 정확도 test가 돌지 않았다.
+- 지시대로 되돌리거나 넓히지 않았다. `eb78772f`는 브랜치에 그대로 있고, 채택 여부는 감독이 정한다.
