@@ -659,9 +659,10 @@ void TestEndToEnd(int bits, unsigned length, unsigned rows) {
   Check(error < 3e-3, line);
 }
 
-// Verification rows equal decode steps bit for bit: one pass of `rows`
-// rows after `start` history rows (LaunchKvarnPassAttention, which
-// quantizes a group ending inside the pass), against one pass per row.
+// Verification rows and short prompt chunks equal decode steps bit for
+// bit: one pass of `rows` rows after `start` history rows
+// (LaunchKvarnPassAttention, which quantizes a group ending inside the pass
+// and attends in launches of at most eight rows), against one pass per row.
 void TestVerifyMatchesDecode(int bits, unsigned start, unsigned rows) {
   const unsigned length = start + rows;
   const auto all = RandomRows(length, 91 + length + bits);
@@ -862,8 +863,9 @@ void TestPrefill(int bits, unsigned start, unsigned rows) {
 // for comparison with the K1b prototype sweep (KVARN.md). Inputs cycle
 // through copies of at least 256 MiB, past the 32 MiB MALL, and the timed
 // loop alternates formats. Values are random; only the time is reported.
-// `time`: microseconds per group flush (one layer of one or two groups, all
-// sixteen layers of one group), the quantizer's latency in a prompt chunk.
+// `time`: microseconds per group flush (one layer of 1, 2, 3, 7 or 15
+// groups -- a d0 prompt chunk of 512, 1024 or 2048 rows quantizes 3, 7 or
+// 15 per layer -- and all sixteen layers of one group).
 void TimeFlush() {
   constexpr unsigned kAll = 16;
   for (const int bits : {2, 4}) {
@@ -883,7 +885,8 @@ void TimeFlush() {
         .k_rows = rows_k.data(),
         .v_rows = rows_v.data()};
     for (const auto [layers, groups] :
-         {std::pair{1U, 1U}, std::pair{1U, 2U}, std::pair{kAll, 1U}}) {
+         {std::pair{1U, 1U}, std::pair{1U, 2U}, std::pair{1U, 3U},
+          std::pair{1U, 7U}, std::pair{1U, 15U}, std::pair{kAll, 1U}}) {
       gufo::hip::LaunchKvarnFlush(view, layers, 1, groups, nullptr);
       HIP_CHECK(hipDeviceSynchronize());
       hipEvent_t begin, end;
@@ -1023,7 +1026,9 @@ int main(int argc, char** argv) {
     for (const int bits : {2, 4})
       for (const auto [start, rows] :
            {std::pair{100U, 8U}, std::pair{700U, 8U}, std::pair{636U, 8U},
-            std::pair{254U, 3U}})
+            std::pair{254U, 3U}, std::pair{0U, 33U}, std::pair{100U, 64U},
+            std::pair{479U, 33U}, std::pair{600U, 100U}, std::pair{1000U, 128U},
+            std::pair{16300U, 128U}})
         TestVerifyMatchesDecode(bits, start, rows);
     return failures == 0 ? 0 : 1;
   }
@@ -1066,6 +1071,13 @@ int main(int argc, char** argv) {
       TestVerifyMatchesDecode(bits, 254, 3);    // across the end of group 1
       TestVerifyMatchesDecode(bits, 6268, 8);   // 8 then 10 splits
       TestVerifyMatchesDecode(bits, 16380, 8);  // 20 splits
+      // Short prompt chunks run as passes in launches of eight rows.
+      TestVerifyMatchesDecode(bits, 0, 33);       // from position 0
+      TestVerifyMatchesDecode(bits, 100, 64);     // from the sink past it
+      TestVerifyMatchesDecode(bits, 479, 33);     // ending at a group end
+      TestVerifyMatchesDecode(bits, 600, 100);    // across the end of group 4
+      TestVerifyMatchesDecode(bits, 1000, 128);   // the longest pass
+      TestVerifyMatchesDecode(bits, 16300, 128);  // 20 splits, a group end
     }
   } catch (const std::exception& error) {
     std::cerr << "Qwen KVarN ops test: " << error.what() << '\n';

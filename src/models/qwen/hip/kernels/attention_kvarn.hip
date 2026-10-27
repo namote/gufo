@@ -1749,15 +1749,18 @@ void LaunchKvarnPassAttention(const float* q, const float* k, const float* v,
   if (plan.boundary != 0)
     LaunchKvarnFlush(kv, 1, (plan.boundary >> kKvarnGroupShift) - 1, 1, stream,
                      layer);
+  // Rows attend in launches of at most kKvarnMaxRows; each slice reads the
+  // groups of its side of the boundary, as a decode step at its position.
   constexpr std::size_t kWidth = std::size_t{kHeads} * kDim;
-  if (split != 0)
-    LaunchKvarnDecodeAttention(q, gate, kv, out_context, layer, nullptr, start,
-                               split, plan.read_groups, 0, scratch, stream);
-  if (split != rows)
+  for (std::uint32_t first = 0; first < rows;) {
+    const std::uint32_t side_end = first < split ? split : rows;
+    const std::uint32_t count = std::min(kKvarnMaxRows, side_end - first);
     LaunchKvarnDecodeAttention(
-        q + split * kWidth, gate == nullptr ? nullptr : gate + split * kWidth,
-        kv, out_context + split * kWidth, layer, nullptr, start + split,
-        rows - split, plan.read_groups + 1, 0, scratch, stream);
+        q + first * kWidth, gate == nullptr ? nullptr : gate + first * kWidth,
+        kv, out_context + first * kWidth, layer, nullptr, start + first, count,
+        plan.read_groups + (first < split ? 0 : 1), 0, scratch, stream);
+    first += count;
+  }
 }
 
 void LaunchKvarnPrefillAttention(const float* q, const float* k, const float* v,
@@ -1772,14 +1775,8 @@ void LaunchKvarnPrefillAttention(const float* q, const float* k, const float* v,
   if (rows == 0)
     return;
   const std::uint32_t length = start + rows;
-  const std::size_t key_head_bytes =
-      static_cast<std::size_t>(length) * kDim * sizeof(__half);
-  const std::size_t value_head_bytes =
-      ((static_cast<std::size_t>(length) + 15U) & ~std::size_t{15}) * kDim *
-      sizeof(__half);
-  const auto heads_per_group = static_cast<std::uint32_t>(std::min(
-      {std::size_t{kKvHeads}, packed_k_workspace.size_bytes() / key_head_bytes,
-       packed_v_workspace.size_bytes() / value_head_bytes}));
+  const std::uint32_t heads_per_group = KvarnPrefillHeadsPerGroup(
+      length, packed_k_workspace.size_bytes(), packed_v_workspace.size_bytes());
   if (heads_per_group == 0)
     throw std::length_error("KVarN prefill workspace holds no KV head");
   if (staging.size() < 2 * KvarnStagingRows(rows) * kRowWidth)

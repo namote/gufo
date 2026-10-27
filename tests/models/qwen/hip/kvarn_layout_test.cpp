@@ -117,6 +117,25 @@ void TestSplits() {
          "a query reads every group that ended at or before it");
 }
 
+void TestPrefillRoute() {
+  // Workspaces of 4096 rows x 17408 floats each.
+  constexpr std::size_t kWorkspace = std::size_t{4096} * 17408 * 4;
+  Expect(KvarnPrefillHeadsPerGroup(131072 + 128, kWorkspace, kWorkspace) == 4,
+         "every head fits a 128K pack");
+  Expect(KvarnPrefillHeadsPerGroup(258048 + 33, kWorkspace, kWorkspace) == 2,
+         "two heads fit a 256K pack");
+  Expect(KvarnPrefillHeadsPerGroup(15, 512 * 15, 512 * 16) == 1 &&
+             KvarnPrefillHeadsPerGroup(15, 512 * 15, 512 * 16 - 1) == 0,
+         "values pad to 16 positions");
+  Expect(UseKvarnPrefillPass(1, 4) && UseKvarnPrefillPass(64, 4),
+         "short chunks run as passes");
+  Expect(!UseKvarnPrefillPass(65, 4) && !UseKvarnPrefillPass(128, 4),
+         "longer chunks pack when every head fits");
+  Expect(UseKvarnPrefillPass(128, 2) && !UseKvarnPrefillPass(129, 2) &&
+             !UseKvarnPrefillPass(512, 2),
+         "a pass takes up to 128 rows when the heads do not fit");
+}
+
 void TestTail() {
   KvarnTail tail;
   const auto apply = [&](std::uint32_t start, std::uint32_t rows) {
@@ -194,6 +213,7 @@ void TestTail() {
 int main() {
   TestSizes();
   TestSplits();
+  TestPrefillRoute();
   TestTail();
   if (failures != 0) {
     std::cerr << failures << " KVarN layout checks failed\n";

@@ -315,6 +315,37 @@ struct KvarnPrefillPlan {
   return plan;
 }
 
+/// KV heads one prefill pack holds at a time: K [length][256] and V padded to
+/// 16 positions, FP16, per head, in workspaces of these bytes.
+[[nodiscard]] constexpr std::uint32_t KvarnPrefillHeadsPerGroup(
+    std::uint32_t length, std::size_t key_workspace_bytes,
+    std::size_t value_workspace_bytes) {
+  const std::size_t key_head_bytes =
+      std::size_t{length} * kKvarnHeadDim * sizeof(std::uint16_t);
+  const std::size_t value_head_bytes =
+      ((std::size_t{length} + 15U) & ~std::size_t{15}) * kKvarnHeadDim *
+      sizeof(std::uint16_t);
+  return static_cast<std::uint32_t>(std::min(
+      {std::size_t{kKvarnKvHeads}, key_workspace_bytes / key_head_bytes,
+       value_workspace_bytes / value_head_bytes}));
+}
+
+/// Whether a prompt chunk of `rows` rows runs as a pass (PlanKvarnPass:
+/// split-K attention over the records in launches of eight rows, each row
+/// as a decode step) instead of packing the prefix for the prefill WMMA,
+/// given the KV heads one pack holds. Below 128 rows the WMMA has too few
+/// blocks to fill the GPU, and when the heads do not all fit (about 190K
+/// positions and deeper) its launches run one head group after another.
+/// From the K5 sweep (KVARN.md "K5 결과", 1-512 rows at 0-256K, both
+/// formats): a pass is faster up to 64 rows at every depth and up to 128
+/// rows once the heads no longer fit; at 128 rows with every head in one
+/// pack the WMMA is as fast or faster (up to 8 % at 128K).
+[[nodiscard]] constexpr bool UseKvarnPrefillPass(
+    std::uint32_t rows, std::uint32_t heads_per_group) {
+  return rows <= 64 ||
+         (rows <= kKvarnMaxPassRows && heads_per_group < kKvarnKvHeads);
+}
+
 /// Staging rows of one layer a prompt chunk of `rows` rows can need: the
 /// ring's unquantized rows before it (fewer than one group) and its own.
 [[nodiscard]] constexpr std::size_t KvarnStagingRows(std::uint32_t rows) {

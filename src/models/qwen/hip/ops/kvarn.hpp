@@ -68,7 +68,8 @@ void LaunchKvarnDecodeAttention(const float* q, const float* gate,
 /// PlanKvarnPass: writes the rows, quantizes the group ending inside the
 /// pass once its rows are written (plan.boundary), and attends rows before
 /// the boundary over plan.read_groups groups and rows from it over one
-/// more, each row as a decode step at its position does.
+/// more, each row as a decode step at its position does, in launches of at
+/// most kKvarnMaxRows rows (verification rows and short prompt chunks).
 void LaunchKvarnPassAttention(const float* q, const float* k, const float* v,
                               const float* gate, const KvarnKvView& kv,
                               float* out_context, std::uint32_t layer,
@@ -84,8 +85,10 @@ void LaunchKvarnPassAttention(const float* q, const float* k, const float* v,
 /// prefill WMMA attention on each (output rows from `first_query`), then
 /// stores the chunk: sink rows, groups completing inside the chunk
 /// quantized from `staging` (KvarnStagingRows(rows) rows of K then V), the
-/// rest into the ring. Throws std::length_error when one head does not fit
-/// the workspaces.
+/// rest into the ring. Head groups run one after another, so a short chunk
+/// deep enough that the heads do not all fit pays for each; such chunks run
+/// as passes instead (UseKvarnPrefillPass). Throws std::length_error when
+/// one head does not fit the workspaces.
 void LaunchKvarnPrefillAttention(const float* q, const float* k, const float* v,
                                  const float* gate, const KvarnKvView& kv,
                                  float* out_context, std::uint32_t layer,

@@ -74,16 +74,26 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
   models::qwen::ContinuationWrite write(
       continuation_hooks_, start_pos,
       start_pos + static_cast<std::uint32_t>(batch_size));
-  // KVarN: quantize the groups that ended before the chunk first.
-  const auto kvarn_plan =
-      arena_.UsesKvarn()
-          ? arena_.PrepareKvarnPrefill(start_pos,
-                                       static_cast<std::uint32_t>(batch_size),
-                                       arena_.stream)
-          : KvarnPrefillPlan{};
   auto scratch = arena_.GetScratchView(batch_size);
   const auto attention_workspace =
       arena_.GetScratchView(arena_.GetMaxBatch()).ffn;
+  // KVarN: a short chunk runs as a pass (its rows as decode steps); a longer
+  // one packs the prefix for the prefill WMMA. Either way the groups that
+  // ended before the chunk are quantized first.
+  const auto kvarn_rows = static_cast<std::uint32_t>(batch_size);
+  const bool kvarn_pass =
+      arena_.UsesKvarn() &&
+      UseKvarnPrefillPass(kvarn_rows, KvarnPrefillHeadsPerGroup(
+                                          start_pos + kvarn_rows,
+                                          attention_workspace.gate.size_bytes(),
+                                          attention_workspace.up.size_bytes()));
+  const auto kvarn_pass_plan =
+      kvarn_pass ? arena_.PrepareKvarnPass(start_pos, kvarn_rows, arena_.stream)
+                 : KvarnPassPlan{};
+  const auto kvarn_plan =
+      arena_.UsesKvarn() && !kvarn_pass
+          ? arena_.PrepareKvarnPrefill(start_pos, kvarn_rows, arena_.stream)
+          : KvarnPrefillPlan{};
   const std::size_t target_layer_count = arena_.GetTargetLayerCapture().size();
   const std::size_t prompt_capture_offset = h_prompt_hidden_.Size();
   if (capture_prompt_hidden_ && target_layer_count > 0) {
@@ -332,7 +342,15 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       // matches -- work that grows linearly with depth. The unfused fallback
       // below only applies RoPE in place and never touches the cache, so it
       // still needs the pack.
-      if (arena_.UsesKvarn()) {
+      if (kvarn_pass) {
+        // Every row, as a decode step at its position; a chunk this short
+        // has no output tile to skip (output_first_row is zero).
+        LaunchKvarnPassAttention(arena_.d_q, arena_.d_k, arena_.d_v,
+                                 arena_.d_ssm_gate, arena_.GetKvarnView(),
+                                 arena_.d_ssm_out, attn_layer_idx, start_pos,
+                                 kvarn_rows, kvarn_pass_plan,
+                                 arena_.GetKvarnScratch(), arena_.stream);
+      } else if (arena_.UsesKvarn()) {
         // KVarN: earlier rows dequantized into the WMMA workspaces, the
         // chunk's own rows as FP16; then the chunk is stored.
         LaunchKvarnPrefillAttention(
