@@ -112,3 +112,15 @@
 - 짧은 쌍의 wall·snapshot 값은 행마다 두 방향으로 오가는 두세 개의 값(batched 여부와 snapshot 크기)이라 방향이 일정하지 않다. 일정한 쪽은 **queue_ms +4–7 ms**(A의 거의 모든 짝 행, 두 교대의 `replay:1`)와 **`disk-spacing-disk:1:0` 복원 +40–70 ms**다. 후자는 동료 없는 단일 요청이라 이 변경이 바꾸는 경로(상주 decoder를 due로 표시)가 직접 닿지 않는다. 원인 미조사.
 - 한 교대에서만 나온 flag(13): `cancelled_peer_isolation:2/3` queue·ttft +5–8 ms, `replay:0` client_ttft +8 ms, 짝 `:1` queue +6 ms, `disk-spacing-disk:0:0` 복원 +9 ms·ttft +15 ms, `disk-spacing-disk:1:0` snapshot +7 ms, server restart_ms 2816 → 3014, `execution_mode_probe` queue +5 ms.
 - 감독 지시대로 재현된 느려짐이 있어 여기서 멈춘다(수정 시도 없음).
+
+### 재현 flag 조사 (오프라인, 기존 로그·지표만)
+
+**queue +4–7 ms (짧은 쌍)**: 상주 decode step 뒤에서 기다린 것이 아니다. step은 약 105 ms인데 기다림은 5–7 ms이거나 약 190 ms다.
+- 5–7 ms는 component cache의 `global_spill.residual_wait_ms`(누적)와 같은 크기로 늘어난다. fnA-new는 그룹마다 1.4 → 42.7 ms, fnA-base는 1.7 → 2.8 ms다. 앞 쌍의 비동기 snapshot 복사(snapshot 2개, 약 500 MB)가 아직 끝나지 않았을 때, 다음 쌍의 admission이 backing을 재할당하며 그 남은 복사를 기다린 값이다.
+- 이 상태는 기준에도 있다. fnB-base는 1.8 → 29.7 ms(행 queue 2.5–5.2 ms)이고 fnB-new는 0.6 → 3.0 ms다. 같은 harness로 돈 10+10회(t-w1 fn-c2 = 기준 코드, t1b-w1 short-c2 = 새 코드)에서 짝 행 queue 중앙값은 기준 4.5 ms·새 3.0 ms, queue > 3 ms 행은 95·80/160, 실행당 residual 증가는 둘 다 0 또는 30–70 ms의 두 갈래다.
+- 약 190 ms 기다림은 두 번째로 들어온 행이 첫 행의 prompt capture(약 195 ms) 동안 막힌 경우로, 기준 4/160·새 10/160이다(우연 범위, 둘 다 있음).
+- 따라서 이 변경과 무관하게, 앞 복사가 끝나는 시점과 도착 시점이 맞물리는 이력 상태다. 도착 시 prefill을 먼저 넣는 규칙은 이 기다림을 줄이지 못하므로 제안하지 않는다.
+
+**`replay:1` queue 5 → 10 ms**: 동시에 도착한 두 warm 요청(chat·responses)이 각자 약 5 ms 복원을 Admit에서 차례로 한다. 먼저 받은 쪽이 약 5 ms, 다음이 약 10 ms를 기다린다. 기준은 responses가 먼저(chat 9.7·9.6 ms), 새 쪽은 chat이 먼저(responses 9.6·9.9 ms)였고, 두 요청의 합(약 15 ms)과 최댓값은 같다. 이때 scheduler는 비어 있었다(앞 요청 r10 완료, 상주 0). 이 변경이 닿는 경로(상주 decoder를 due로 표시)는 돌지 않았으므로 HTTP 쪽 제출 순서 경쟁이다.
+
+**`disk-spacing-disk:1:0` 복원 +40–70 ms**: 서버 로그 `event=disk_restore`의 세부를 보면 늘어난 몫은 모두 `filesystem_ms`다. 기준 41–45 ms, 새 쪽 112 ms(A)·85 ms(B), t1b-w1의 새 쪽은 41 ms다. `stream_wait_ms`(19–22), `checksum_ms`(13.3–13.5), `staging_wait_ms`(≈0), bytes(303,403,296)·pieces(350)는 같다. 재시작 직후의 동료 없는 단일 요청이 앞서 쓴 디스크 cache 파일을 읽는 시간이라 scheduler와 무관하다(page cache·SSD 상태). 이번 창에서 new는 늘 쌍의 두 번째로 돌아 앞 쌍의 cache 파일이 page cache를 더 차지한 상태였다. 순서와 binary가 섞여 있으므로 순서를 바꾼 확인(N B B N)이 필요하다.
