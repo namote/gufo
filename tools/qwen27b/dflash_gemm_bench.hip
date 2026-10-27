@@ -710,7 +710,7 @@ void Run(const std::string& type, std::size_t rows, std::size_t columns,
 // decode bits before their timings count.
 void RunDispatch(const std::string& type, std::size_t rows, std::size_t columns,
                  int iterations, const std::vector<std::size_t>& widths,
-                 bool swiglu) {
+                 bool swiglu, bool every_width = false) {
   using namespace gufo;
   using namespace gufo::hip;
   const auto quant_type = type == "q4"    ? core::GgmlType::kQ4_K
@@ -793,7 +793,15 @@ void RunDispatch(const std::string& type, std::size_t rows, std::size_t columns,
     // A baseline build compiles the production kernels of an earlier
     // revision, which has no grouped entry point.
 #if !defined(GUFO_BENCH_BASELINE)
-    if (n >= 9) {
+    if (every_width && n > 16) {
+      // Every width the grouped launcher instantiates for this row count.
+      for (std::size_t width = 9; width <= 16; ++width) {
+        const std::size_t groups = (n + width - 1) / width;
+        if (groups <= 4 && (groups < 3 || width >= 11) &&
+            (groups < 4 || width >= 13))
+          candidate_widths.push_back(width);
+      }
+    } else if (n >= 9) {
       const std::size_t groups = (n + 15) / 16;
       candidate_widths.push_back((n + groups - 1) / groups);
       if (n > 16 && n % 16 != 0 && candidate_widths.front() != 16)
@@ -854,11 +862,22 @@ int main(int argc, char** argv) {
   try {
     if (argc >= 2 && std::string(argv[1]) == "dispatch") {
       // dispatch q4|q5|iq4|q6 M K iterations rows[,first-last...] [swiglu]
-      if (argc < 7 || argc > 8 ||
-          (argc == 8 && std::string(argv[7]) != "swiglu"))
+      // [widths]: widths times every valid grouped width above 16 rows.
+      bool swiglu = false;
+      bool every_width = false;
+      for (int index = 7; index < argc; ++index) {
+        const std::string option = argv[index];
+        if (option == "swiglu")
+          swiglu = true;
+        else if (option == "widths")
+          every_width = true;
+        else
+          throw std::invalid_argument("unknown dispatch option " + option);
+      }
+      if (argc < 7)
         throw std::invalid_argument(
             "usage: dflash_gemm_bench dispatch q4|q5|iq4|q6 M K iterations "
-            "rows[,first-last...] [swiglu]");
+            "rows[,first-last...] [swiglu] [widths]");
       std::vector<std::size_t> widths;
       const std::string list = argv[6];
       for (std::size_t begin = 0; begin < list.size();) {
@@ -875,7 +894,7 @@ int main(int argc, char** argv) {
         begin = end + 1;
       }
       RunDispatch(argv[2], std::stoull(argv[3]), std::stoull(argv[4]),
-                  std::stoi(argv[5]), widths, argc == 8);
+                  std::stoi(argv[5]), widths, swiglu, every_width);
       return 0;
     }
     if (argc < 4 || argc > 8)

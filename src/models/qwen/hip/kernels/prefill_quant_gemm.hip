@@ -1703,6 +1703,40 @@ void LaunchBatchedQuantGEMMBf16(core::GgmlType type, const void* w,
       type, w, reinterpret_cast<const hip_bfloat16*>(bf16_x), y, m, k);
 }
 
+namespace {
+
+// Verification rows that one grouped launch serves faster than the routes
+// below, measured on every Qwen27B projection shape (plan SKINNY.md). Above
+// eight rows these GEMMs are compute bound, so the gain comes from removing
+// the separate launch for leftover rows. Shapes that already have a complete
+// single launch at a width keep it.
+constexpr bool UseGroupedKQuant(core::GgmlType type, std::size_t rows,
+                                std::size_t m, std::size_t k) noexcept {
+  const bool q6 = type == core::GgmlType::kQ6_K;
+  const bool supported = q6 || type == core::GgmlType::kQ4_K ||
+                         type == core::GgmlType::kQ5_K ||
+                         type == core::GgmlType::kIQ4_XS;
+  if (!supported || rows < 9 || rows > 64)
+    return false;
+  // The key/value projections fit in cache; grouping wins at every width.
+  const bool small =
+      k == 5120 && m == 1024 && (q6 || type == core::GgmlType::kQ5_K);
+  // Q6_K's attention query projection otherwise splits into eight-row
+  // launches at every width.
+  if (small || (q6 && m == 12288 && k == 5120))
+    return true;
+  if (rows > 16)
+    return false;
+  // Attention, SSM and individual FFN projections. Q6_K also replaces its
+  // eight-row split for the packed FFN and the down projection; the other
+  // formats already launch those widths once.
+  return (k == 5120 && (m == 6144 || m == 10240 || m == 12288 || m == 17408 ||
+                        (q6 && m == 34816))) ||
+         (m == 5120 && (k == 6144 || (q6 && k == 17408)));
+}
+
+}  // namespace
+
 void LaunchBatchedQuantGEMMFp32(core::GgmlType type, const void* w,
                                 const float* fp32_x, float* y,
                                 std::size_t batch, std::size_t m, std::size_t k,
@@ -1713,6 +1747,14 @@ void LaunchBatchedQuantGEMMFp32(core::GgmlType type, const void* w,
   }
 
   if (batch > 8) {
+    if (UseGroupedKQuant(type, batch, m, k)) {
+      // Balanced groups of at most sixteen rows; only the last is partial.
+      const std::size_t groups = (batch + 15) / 16;
+      if (detail::TryLaunchKQuantGroupedWave64(type, w, fp32_x, y, batch,
+                                               (batch + groups - 1) / groups, m,
+                                               k, stream))
+        return;
+    }
     // Paired seven-row blocks avoid a separate tail on these projections.
     const bool individual_up =
         m == 17408 && k == 5120 &&

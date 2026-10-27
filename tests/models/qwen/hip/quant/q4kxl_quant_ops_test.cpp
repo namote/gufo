@@ -783,6 +783,93 @@ void TestFp16Norm() {
   }
 }
 
+// Grouped verification launches serve 9-64 rows at once and mask the rows
+// missing from the final group. Every row must keep the single-row decode
+// bits, and no store may land beyond the batch. One weight matrix per shape
+// serves every width.
+void TestGroupedVerification(const FormatCase& format, std::size_t rows,
+                             std::size_t columns, std::size_t first,
+                             std::size_t last) {
+  using gufo::test::DeviceBuffer;
+  constexpr std::size_t kMaxBatch = 64;
+  constexpr std::size_t kGuardRows = 4;
+  const DeviceBuffer<std::uint8_t> weights(
+      MakeWeights(format.type, rows, columns, 0x51C0FFEEU));
+  std::vector<float> x(kMaxBatch * columns);
+  std::uint32_t state = 0x2468BDF1U;
+  for (auto& value : x) {
+    const float unit =
+        static_cast<float>(static_cast<int>(NextRandom(state) & 0xFFFFU) -
+                           32768) /
+        32768.0F;
+    value = std::ldexp(unit, static_cast<int>(NextRandom(state) % 12U) - 6);
+  }
+  const DeviceBuffer<float> input(x);
+  DeviceBuffer<float> single(kMaxBatch * rows),
+      batched((kMaxBatch + kGuardRows) * rows);
+  for (std::size_t token = 0; token < kMaxBatch; ++token) {
+    gufo::hip::LaunchQ8KBlockGEMV(
+        weights.data(), format.type, input.data() + token * columns,
+        single.data() + token * rows, rows, columns, nullptr);
+  }
+  const auto expected = single.CopyToHost();
+  std::size_t failures = 0;
+  for (std::size_t batch = first; batch <= last; ++batch) {
+    HIP_CHECK(hipMemset(batched.data(), 0xA5,
+                        (kMaxBatch + kGuardRows) * rows * sizeof(float)));
+    gufo::hip::LaunchBatchedQuantGEMMFp32(format.type, weights.data(),
+                                          input.data(), batched.data(), batch,
+                                          rows, columns, nullptr);
+    const auto actual = batched.CopyToHost();
+    std::size_t mismatches = 0;
+    for (std::size_t index = 0; index < batch * rows; ++index) {
+      if (!std::isfinite(actual[index]) ||
+          std::bit_cast<std::uint32_t>(actual[index]) !=
+              std::bit_cast<std::uint32_t>(expected[index]))
+        ++mismatches;
+    }
+    for (std::size_t index = batch * rows; index < actual.size(); ++index)
+      mismatches += std::bit_cast<std::uint32_t>(actual[index]) != 0xA5A5A5A5U;
+    if (mismatches != 0) {
+      std::cout << "[FAIL] grouped verification " << format.name << " " << rows
+                << "x" << columns << " batch " << batch << ": " << mismatches
+                << " differ\n";
+      ++failures;
+    }
+  }
+  std::cout << (failures == 0 ? "[ OK ] " : "[FAIL] ")
+            << "grouped verification " << format.name << " " << rows << "x"
+            << columns << " batches " << first << "-" << last
+            << " bit-exact vs decode GEMV\n";
+  g_failed |= failures != 0;
+}
+
+void TestGroupedVerificationShapes() {
+  using Type = gufo::core::GgmlType;
+  const FormatCase q6{Type::kQ6_K, "Q6_K"};
+  const FormatCase q5{Type::kQ5_K, "Q5_K"};
+  // Attention, SSM and individual FFN projections at nine to sixteen rows.
+  for (const auto& format : {FormatCase{Type::kQ4_K, "Q4_K"}, q5,
+                             FormatCase{Type::kIQ4_XS, "IQ4_XS"}, q6}) {
+    for (const auto& [rows, columns] :
+         {std::pair{std::size_t{6144}, std::size_t{5120}},
+          std::pair{std::size_t{10240}, std::size_t{5120}},
+          std::pair{std::size_t{17408}, std::size_t{5120}},
+          std::pair{std::size_t{5120}, std::size_t{6144}}}) {
+      TestGroupedVerification(format, rows, columns, 9, 16);
+    }
+    if (format.type != Type::kQ6_K)
+      TestGroupedVerification(format, 12288, 5120, 9, 16);
+  }
+  // Q6_K FFNs replace their eight-row split at nine to sixteen rows.
+  TestGroupedVerification(q6, 34816, 5120, 9, 16);
+  TestGroupedVerification(q6, 5120, 17408, 9, 16);
+  // Every verification width, with one to four groups.
+  TestGroupedVerification(q6, 12288, 5120, 9, 64);
+  TestGroupedVerification(q6, 1024, 5120, 9, 64);
+  TestGroupedVerification(q5, 1024, 5120, 9, 64);
+}
+
 void TestRaggedFfnProjections() {
   const FormatCase format{gufo::core::GgmlType::kIQ4_XS, "IQ4_XS"};
   for (const auto rows : {17408U, 34816U})
@@ -858,6 +945,7 @@ int main(int argc, char** argv) {
     }
   }
   TestRaggedFfnProjections();
+  TestGroupedVerificationShapes();
   for (const auto rows : {17408U, 34816U})
     TestSmallBatchExactness(q4, 4, rows, 5120);
   TestSmallBatchExactness(q4, 4, 5120, 17408);
