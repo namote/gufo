@@ -78,24 +78,24 @@ public:
     switch (greedy_batch_size) {
       case 2:
         relative_costs = &kQ4PairedRelativeCost;
-        context_multiplier = 2.22F;
+        context_multiplier = 1.92F;
         break;
       // A finishing request does not make the remaining weight reads cheap.
       // Use the next measured capacity for odd cohorts too.
       case 3:
       case 4:
         relative_costs = &kQ4FourRequestRelativeCost;
-        context_multiplier = 3.83F;
+        context_multiplier = 3.20F;
         break;
       case 5:
       case 6:
         relative_costs = &kQ4SixRequestRelativeCost;
-        context_multiplier = 4.28F;
+        context_multiplier = 3.50F;
         break;
       case 7:
       case 8:
         relative_costs = &kQ4EightRequestRelativeCost;
-        context_multiplier = 5.20F;
+        context_multiplier = 4.42F;
         break;
     }
     if (q8_target_ && greedy_batch_size == 4) {
@@ -277,28 +277,26 @@ private:
   static constexpr std::array<float, kMaxDraftTokens> kQ4RelativeCost{
       1.0F, 1.02F, 1.045F, 1.08F, 1.14F, 1.20F, 1.29F};
   // Two greedy requests verify 4–16 rows together. Crossing eight rows has a
-  // large projection cost that the C1 estimate misses. UD-Q4_K_XL
-  // complete-cycle release controls cost 90/95/100/121/133/136/145 ms; the
-  // paired context multiplier is 2 * 100 / 90, using the existing per-request
-  // attention calibration.
+  // large projection cost that the C1 estimate misses. Complete-cycle release
+  // controls normalize to 104 ms at one draft; the paired context multiplier
+  // is 2 * 100 / 104, using the existing per-request attention calibration.
   static constexpr std::array<float, kMaxDraftTokens> kQ4PairedRelativeCost{
-      1.0F, 1.05F, 1.11F, 1.34F, 1.48F, 1.51F, 1.61F};
+      1.0F, 1.04F, 1.10F, 1.48F, 1.45F, 1.50F, 1.50F};
   // Four-request cycles cross another projection cliff above sixteen rows.
-  // One UD-Q4_K_XL fixed-width profile per point gives
-  // 104/134/144/222/233/258/264 ms. The context multiplier is 4 * 100 / 104.
+  // One fixed-width profile per point gives 125/163/167/246/265/286/289 ms.
+  // The context multiplier is 4 * 100 / 125.
   static constexpr std::array<float, kMaxDraftTokens>
-      kQ4FourRequestRelativeCost{1.0F,  1.28F, 1.38F, 2.12F,
-                                 2.24F, 2.47F, 2.53F};
-  // Six requests verify 12–48 rows. Measured UD-Q4_K_XL complete cycles cost
-  // 140/218/237/287/341/379/399 ms; the context multiplier is 6 * 100 / 140.
+      kQ4FourRequestRelativeCost{1.0F,  1.30F, 1.33F, 1.97F,
+                                 2.12F, 2.29F, 2.32F};
+  // Six requests verify 12–48 rows. Measured complete cycles cost
+  // 171/247/273/323/378/416/423 ms; the context multiplier is 6 * 100 / 171.
   static constexpr std::array<float, kMaxDraftTokens> kQ4SixRequestRelativeCost{
-      1.0F, 1.55F, 1.69F, 2.05F, 2.43F, 2.70F, 2.85F};
-  // Eight requests verify 16–64 rows. Measured UD-Q4_K_XL complete cycles
-  // cost 154/240/276/369/392/481/515 ms; the context multiplier is
-  // 8 * 100 / 154.
+      1.0F, 1.44F, 1.59F, 1.89F, 2.21F, 2.43F, 2.47F};
+  // Eight requests verify 16–64 rows. Measured complete cycles cost
+  // 181/276/304/400/430/523/558 ms; the context multiplier is 8 * 100 / 181.
   static constexpr std::array<float, kMaxDraftTokens>
-      kQ4EightRequestRelativeCost{1.0F,  1.56F, 1.79F, 2.40F,
-                                  2.55F, 3.13F, 3.34F};
+      kQ4EightRequestRelativeCost{1.0F,  1.52F, 1.68F, 2.21F,
+                                  2.38F, 2.89F, 3.08F};
   // Extra cost from 2K to 32K for the target's 16 full-attention layers,
   // relative to the roughly 100 ms shallow draft/verification cycle. These
   // cold-KV measurements include the anchor plus 1–7 proposals and preserve
