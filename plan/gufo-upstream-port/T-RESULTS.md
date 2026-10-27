@@ -93,3 +93,22 @@
 - TG(base base / new new): mixed C1 35.66 35.65 / 35.69 35.63, C2 55.60 55.24 / 55.35 55.14, C4 71.25 71.45 / 71.35 70.98, C8 83.26 84.64 / 82.41 82.57(−1.7 %); repetition C1–C8 ±0.4 %.
 - 요청별 gate: per-case 39 pass, 1 flag(mixed C8 `expository_pangram` 9284 → 10131 ms, base 8908/9659, new 10635/9626; base-base spread 9.9 %).
 - C8 mixed 평균 decode_ms: base 11213·10978, new 11235·11270. 차이는 주로 base 두 번째 실행이 낮은 데서 온다. **inconclusive**(잡음 크기). 확정하려면 C8 mixed만 base/new 교대 재실행.
+
+### 창 `t1b-w2-a01/t1b-w2` (재측정, 감독 승인)
+
+- 결과 FAILED_no_fallback(`fnA-new`·`fnB-new`가 qualification inconclusive로 0이 아닌 종료), health PASS, 재시도 없음. `.gufo-revision` `686adea3`, 같은 바이너리(base `4f1d0f8d…`, new `e5899f9a…`). 계획 `PLAN-T1B2.json`. 양쪽 모두 `386b4320` harness(`build/t1b-old-src`, `git archive`)로 돌려 이력·harness hash가 맞는다. margin 그대로.
+- **mixed C8 cohort B N B N B N**: 출력 hash 6번 같음. TG base 84.77 81.62 83.77, new 83.87 83.15 85.74(+1.0 %), 요청별 flag 0(matched 14 pass, per-case 9 pass, base-base spread 7.3 %). t1b-w1의 −1.7 %는 재현되지 않았다.
+- **functional**(batch, state-edges, cache, long-context): fnA-base·fnB-base passed, fnA-new·fnB-new functional passed. 비교: A passed 1343·inconclusive 46·failed 0, B passed 1372·inconclusive 17·failed 0, quality/coverage 변화 0.
+
+두 교대에서 모두 재현된 flag(같은 case·metric):
+
+|요청|metric|A base → new|B base → new|
+|---|---|---|---|
+|`batch_c2_chat_responses_completions_replay:1`|queue_ms|5.2 → 9.6|5.3 → 9.9|
+|`batch_c2_greedy_short_replies_match_serial`(짝 행)|queue_ms|0.1–0.3 → 5–7(대부분 행)|0.1–4 → 0.2–188(섞임)|
+|같은 case|wall/server_duration·inter_token·cache_snapshot_ms|약 745 ↔ 860 ms, 136/193/240 ms 두 방향|같음(두 방향)|
+|`disk-spacing-disk:1:0`(재시작 뒤 디스크 복원, 단일 요청)|cache_restore_ms(=queue_ms)|81 → 150|85 → 127|
+
+- 짧은 쌍의 wall·snapshot 값은 행마다 두 방향으로 오가는 두세 개의 값(batched 여부와 snapshot 크기)이라 방향이 일정하지 않다. 일정한 쪽은 **queue_ms +4–7 ms**(A의 거의 모든 짝 행, 두 교대의 `replay:1`)와 **`disk-spacing-disk:1:0` 복원 +40–70 ms**다. 후자는 동료 없는 단일 요청이라 이 변경이 바꾸는 경로(상주 decoder를 due로 표시)가 직접 닿지 않는다. 원인 미조사.
+- 한 교대에서만 나온 flag(13): `cancelled_peer_isolation:2/3` queue·ttft +5–8 ms, `replay:0` client_ttft +8 ms, 짝 `:1` queue +6 ms, `disk-spacing-disk:0:0` 복원 +9 ms·ttft +15 ms, `disk-spacing-disk:1:0` snapshot +7 ms, server restart_ms 2816 → 3014, `execution_mode_probe` queue +5 ms.
+- 감독 지시대로 재현된 느려짐이 있어 여기서 멈춘다(수정 시도 없음).
