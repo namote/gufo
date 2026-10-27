@@ -333,6 +333,18 @@ fake quant는 FP16 커널을 그대로 쓰므로 속도를 재지 못한다. 그
   - 그 밖에 30–70 ms 느린 행이 몇 개 있음. TTFT 95행 중 38행이 5 %·3 ms를 넘고, 그중 10행이 k4v2가 느림.
 - 판정: 품질 손실 없고 긴 문맥 decode·복원·디스크에서 이득이 커서 k4v2 기본값 유지. 남은 비용은 d0 prefill 약 1 %, 깊은 문맥의 짧은 prefill +0.3 s/256K로, 다음 개선 후보로 둔다.
 
+### K5 결과 (2026-10-27, gufo `4a7046b2`, 창 `kvarn-k5-a01`…`a04`, 감독 검증)
+
+- 창: a01 원인 측정(K3 바이너리), a02 임계값 sweep(환경 스위치 바이너리, 커밋 안 함·후보가 늘 먼저 돌아 2–3 % 편향 → 최종 grid는 교대), a03 quantizer 점유 후보, a04(`PLAN-K5F`, 이미지 `4a7046b2e8ed`, 기준 `d75269fc` 스냅샷) unit·grid·bench·long256k 쌍·T2 쌍·d0 재측정. 모두 COMPLETE·health PASS, 재시도 없음. a04 bench의 첫 실행은 plan revision 불일치로 GPU 전 preflight 실패(기록 보존). a04 bench 3회차 d0는 다른 에이전트의 CPU 빌드와 겹쳐 무효 표시, `k5f-d0`이 깨끗한 재측정.
+- **K5-1 원인**: 258K에서는 pack workspace(약 285 MB)에 KV head 4개 중 2개만 들어가 층마다 6블록짜리 WMMA를 두 번 차례로 돌림(≤ 64행은 지연에 묶여 절반이 줄지 않음), 그리고 pack이 행 수와 무관하게 층마다 prefix 전체를 FP16으로 다시 씀(99 ms). quantizer·회전은 ≤ 7 ms.
+- **K5-1 수정**(`4a7046b2`): chunk가 64행 이하, 또는 head가 다 들어가지 않을 때(약 190K 이상) 128행 이하면 pass 경로: ring에 쓰고 그룹 경계 flush 한 번, 8행 이하 조각으로 split-K decode attention. 그 밖은 packed WMMA 그대로, verify(≤ 8행)는 같은 호출, fp16 경로 그대로. 임계값은 행 수와 heads-fit만으로(96행은 중립, head가 다 들어갈 때 128행은 65K부터 WMMA가 4–8 % 빠름).
+- 테스트: 짧은 chunk = decode 비트 일치(시작 0, 100+64 sink 넘김, 479+33 그룹 끝, 600+100·1000+128·16300+128 chunk 안 그룹 경계, 두 형식, 다른 행 0), layout 경로 테스트. unit 창 decode 테스트(두 형식)·ops·layout·continuation·fp16 adapter(plain·draft) PASS.
+- AR prefill ms(k5f-grid, 이전 → 새, k4v2; fp16은 a01): 256K 1행 1,163 → 139(fp16 917), 33행 1,223 → 399(977), 64행 1,249 → 583(991), 128행 1,363 → 1,086(2,042); 128K 33행 483 → 295(587); 32K 1행 190 → 126(217). 모든 점이 빨라지거나 5 %·3 ms 안. 196K pp512 +5.4 % 표시는 바뀌지 않은 경로였고, bench 교대 재측정(새 177.2/178.1, 기준 177.8/177.6 t/s)으로 잡음 확인.
+- 서빙 long256k(33토큰 prefill): T2 fp16 959 ms / k4v2 416 ms, T3 955 / 411 ms(K3 때 k4v2 1,230 / 1,284). 품질(prefill 수치가 바뀌었으므로): long256k gold 3/3·텍스트 fp16과 3/3 같음, T2 gold 19/19 + 이미지 2개 정답·텍스트 21/21 같음, finish 모두 `stop`.
+- **K5-2(운영 변경 없음, 기준 미달)**: quantizer 몫은 prompt 길이에 비례(d0 pp512/1024/2048에서 6.2/13.0/20.6 ms, 층당 그룹 3/7/15). 그룹 타일 하나가 약 220 µs, WGP당 2블록뿐이라 지연에 묶임. 후보: V 코드 LDS 겹치기(60.7 → 36.1 KB, 비트 일치, 이득 없음), VGPR 120 제한으로 3블록(비트 일치, 7그룹만 빨라지고 2·3·15그룹 느려짐), 층 전체 한 launch(staging 약 277 MB, 추정 이득 3–5 ms라 구현 안 함), 별도 stream은 K1d대로 기각.
+- k5f-d0(t/s, 10회 × 3 교대): AR pp512 fp16 481.5 / k4v2 475.8, pp1024 643.4 / 632.8, pp2048 636.1 / 627.9; DFlash2 pp512 454.5 / 452.3, pp1024 592.3 / 585.8, pp2048 586.5 / 580.8. 감독 확인: fp16 1회차(pp512 490.7 ± 6.75)가 튀어 평균을 키움. 2·3회차만 보면 AR 손해 −0.3 % / −0.5 % / −0.9 %(pp512/1024/2048). 남은 손해 약 0.3–1.3 %, 잡음과 가려지지 않음, 마진은 넓히지 않음.
+- 남은 것: d0 quantizer 타일 지연(약 1 %). `build/k5-*` 스냅샷은 증거로 둠(`build/k5-base`는 PLAN-K5F가 참조).
+
 ### K0에서 정하지 않는 것
 
 - 커널·서빙·checkpoint 형식(K1·K2). 추가가 필요한 것만 적어 둔다: storage enum 값과 policy fingerprint 비트, K/V component `layout_version` 3(새 row_bytes와 128토큰 scale plane), compact snapshot 검증 완화, 블록 풀의 scale plane(`KvBlockPlane::rows_per_block` 128은 이미 표현 가능하나 arena·adapter가 같은 두 plane을 가정한다).
