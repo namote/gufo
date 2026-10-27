@@ -790,6 +790,9 @@ void RunDispatch(const std::string& type, std::size_t rows, std::size_t columns,
            });
          }});
     std::vector<std::size_t> candidate_widths;
+    // A baseline build compiles the production kernels of an earlier
+    // revision, which has no grouped entry point.
+#if !defined(GUFO_BENCH_BASELINE)
     if (n >= 9) {
       const std::size_t groups = (n + 15) / 16;
       candidate_widths.push_back((n + groups - 1) / groups);
@@ -810,6 +813,7 @@ void RunDispatch(const std::string& type, std::size_t rows, std::size_t columns,
                throw std::runtime_error("grouped shape rejected");
            }});
     }
+#endif
     for (int round = 0; round < 4; ++round) {
       for (std::size_t index = 0; index < geometries.size(); ++index) {
         const auto& geometry =
