@@ -209,3 +209,72 @@
 - 운영 `210c7633`에만 있고 후보에는 없다:
   - `--cache-disk-block-bytes`, `--cache-idle-write-ms`(compose에서 씀)
   - `--cache-disk-read-ahead`, `--cache-grid-tokens`, `--draft-calibration`, `--image-tokens`, `--no-cache-resident-blocks`, `--no-shared-pass-scratch`, `--shared-prefix-min-tokens`(compose에서 안 씀)
+
+## P2: 64K×8 짧은 요청 지연 원인 가르기 (2026-10-28)
+
+브리프 [P2](P-BRIEF.md#p2-64k8-짧은-요청-지연-원인-가르기-사용자-결정-2026-10-28-b). 코드 커밋 없음. 창 계획은 ai.tools `PLAN-P2.json`(후보 `p2c-64k8`)·`PLAN-P2-K3.json`(K3 `p2k-64k8`), `final.py --set p2`(ai.tools `f6df5222`)다.
+
+### 1. 로그 분석과 가설
+
+- 짧은 요청 q0–q3의 지연은 prefill·decode 속도가 아니라 **입장 대기(`queue_ms`)** 다.
+  - `long-and-short`에서 처음 들어온 긴 요청 하나만 바로 입장한다(`queue_ms` 0.5–1). 나머지 7개는 그 요청의 첫 prefill step이 끝난 뒤 함께 입장한다.
+  - 대기: 후보 p1·p1r은 짧은 요청 5.63·5.65 s, 긴 요청 6.63·6.64 s다. K3 `k3k-64k8`은 2.45 / 3.44 s, `k3f-64k8`은 2.41 / 3.41 s다.
+  - 차이 +3.2 s가 짧은 요청 TTFT 차이(정렬 기준 +3.1 s, 예: 24.6 / 21.5 s)와 같다. 짧은 요청 `prefill_tps`(475 / 470, 412 / 411)와 decode는 같다.
+- 첫 step의 길이가 다른 원인은 코드가 아니라 **RAM 예산**으로 본다. K3 창은 RAM 8 GiB, 후보 p1은 U4d 결정대로 2 GiB였다. p1 결과의 "K3보다 느리다"는 이 설정 차이가 섞인 비교였다.
+  - `cache::GridLimit(ram, private) = min(4, ram / 12 / private)`(`src/cache/retention.cpp`)가 cold prompt의 grid capture 지점 수를 정한다. `TextRunnerPool::Request::Prefill`은 다음 checkpoint 지점에서 step을 끊는다.
+  - Qwen3.8-27B의 private state는 capture당 약 264 MB다(`private_state` 528482304 / 2 captures). 그래서 8 GiB에서는 limit 2(첫 지점 2048), 2 GiB에서는 limit 0(grid 지점 없음)이다.
+  - 혼자 도는 첫 prefill step은 budget 제한이 없다(`bounded_prefill`은 decoder나 대기 peer가 있을 때만). 그래서 2 GiB에서는 첫 step이 pass 한도(4096행, 약 6.6 s)까지 가고, 8 GiB에서는 2048(약 3.4 s)에서 끝난다. 그 사이에는 `Admit`이 돌지 않는다.
+  - K3 → 후보 사이 코드 변경(K5 `4a7046b2`, S `26e0a956`·`28e650b4`, T `f53aba73`)은 커널과 capture 재개 한 줄이다. 입장·chunk 경계를 바꾸지 않는다.
+- 운영 편차의 원인(로그):
+  - 운영은 긴 요청 셋을 바로 입장시킨다(`queue_ms` 1–3). 짧은 요청은 chunk 경계마다 하나 또는 둘씩 들어온다.
+  - 1차: 3.5 / 10.2 / 12.8 / 13.9 s, 2차: 2.4 / 3.5 / 3.5 / 10.2 s.
+  - 첫 경계(2.4 s 또는 3.5 s)에 들어온 짧은 요청만 21–25 s에 첫 토큰을 받는다. 나머지는 37–43 s다. 같은 q1이 21 s나 40 s가 되는 것은 도착 순서와 chunk 경계 시각 때문이다.
+
+### 2. 창 `p2`(64k8만, K3 `be582a9f` / 후보 `7c2c5a72` ABBA)
+
+- 두 이미지 모두 같은 서버 인수를 쓴다. 후보 p1-64k8 인수(RAM 2 GiB)에 `--kv-cache-type kvarn-k4v2`를 명시했다. 다른 것은 코드뿐이다.
+- 실행 직전 `fstrim`(2.6 GiB, `p2-a01-fstrim.log`). 창마다 끝에 20 s 쉬었다. 창 중 빌드 없음, 재시도 없음.
+
+|창|이미지|시각|결과|
+|---|---|---|---|
+|`p2k-64k8`|K3 `be582a9f9275`|10:24–10:28|COMPLETE, health PASS|
+|`p2c-64k8`|후보 `7c2c5a728270`|10:28–10:32|COMPLETE, health PASS|
+|`p2c-64k8-r2`|후보|10:33–10:37|COMPLETE, health PASS|
+|`p2k-64k8-r2`|K3|10:37–10:41|COMPLETE, health PASS|
+
+- 정확도: 4창 모두 17/17 gold다. 요청별 텍스트가 4창 모두 같다. 서버 로그에 `ERROR`·`logic_error`·`length_error`가 0건이다. 로그 `block_bytes=3440640`(k4v2), RAM `capacity_bytes=2147483648`.
+- 입장 대기: K3 짧은 요청 5.56·5.66 s, 긴 요청 6.56·6.66 s. 후보 5.64·5.66 s, 6.64·6.66 s. 같다.
+- 메모리(창 최대): anon 18.46 GiB, current 18.52–18.55 GiB로 4창이 같다.
+
+TTFT(초). 같은 출발 시각 묶음 안에서 정렬한 순위별 비교다.
+
+|단계|요청(순위)|K3 1·2|후보 1·2|판정|
+|---|---|---|---|---|
+|warm|q0|2.10, 2.12|2.11, 2.11|같음|
+|C8-short|#0|10.64, 10.87|10.91, 10.81|같음|
+|C8-short|#1–#7|19.59–21.57, 19.94–22.00|19.97–22.01, 19.88–21.93|같음(범위 겹침)|
+|long-and-short|32K|179.74, 180.36|179.24, 180.20|같음|
+|long-and-short|16K|131.33, 132.14|131.28, 132.05|같음|
+|long-and-short|8K(t=0)|75.84, 76.31|76.05, 76.45|같음|
+|long-and-short|짧은 #0|29.81, 30.25|30.16, 30.26|같음|
+|long-and-short|짧은 #1|43.18, 43.73|43.57, 43.73|같음|
+|long-and-short|짧은 #2|43.43, 43.98|43.81, 43.97|같음|
+|long-and-short|짧은 #3|43.72, 44.27|44.10, 44.25|같음|
+|long-and-short|8K(t=2 s)|106.60, 107.30|106.62, 107.24|같음|
+
+- 판정: 5 %·3 ms를 넘는 요청이 없다. 순위마다 후보 두 값이 K3 두 값의 범위 안이나 0.4 s 안에 있다. **같은 설정에서 후보는 K3보다 느리지 않다.**
+- 같은 설정의 K3도 짧은 요청이 29.8–44.3 s다. p1에서 본 후보 값(24.6–44.2 s)과 같은 범위이고, 8 GiB K3(21.5–35.5 s)보다 늦다. P1 위험 2의 지연은 K5·S·T 코드가 아니라 RAM 예산 2 GiB에서 나온다.
+
+### 3. 이분 탐색과 수정
+
+- 이분 탐색: 하지 않았다. 브리프 조건(후보가 K3보다 재현되게 느림)이 성립하지 않는다. 새 이미지도 빌드하지 않았다.
+- 수정: 하지 않았다. 원인은 정해졌지만 고치는 방법이 trade-off라 사용자 결정이 필요하다.
+  1. RAM 예산을 8 GiB로 되돌린다. 코드 변경은 없다. 대신 U4d에서 줄인 anon·RAM 사용이 다시 늘어난다(K3 64k8 ledger 8.16 GB / 2.36 GB).
+  2. 입장 경계를 capture grid와 분리하는 scheduler 수정. 예: 큐에 요청이 있으면 혼자 도는 prefill도 2048 같은 bounded step으로 끊는다. 2 GiB를 유지할 수 있다. 다만 공유 scheduler 동작이 바뀌므로 64k8·256k4 ABBA와 `batch`·`cache`·`long-context` suite가 필요하고, 혼자 도는 긴 prefill 처리량에 미치는 영향도 재야 한다.
+  3. 감수한다. 지연은 혼잡할 때 긴 prefill이 먼저 들어온 경우의 짧은 요청에서만 생긴다(+약 3.2 s, 첫 step 하나 분량). 운영도 도착 순서에 따라 21–43 s로 갈린다.
+- 256K×4 C4 첫 짧은 요청 +1.05 s: 브리프대로 로그 분석만 했고, 위 [시간](#시간) 절의 분석이 그대로다. F(RAM 8 GiB)부터 있었으므로 이 RAM 예산 효과와는 다른 문제다.
+
+### 증거
+
+- ai.tools `tmp/test-results/gufo-upstream-port-20261023/p2-a01/`(`FINAL.json`, 창별 `WINDOW.json`·`receipt/run/{RESULT.json,server-1.log}`), `p2-a01.log`, `p2-a01-fstrim.log`. cache-disk는 지우지 않았다(남은 여유 87 GiB).
+- 비교에 쓴 기존 창: `p1-a01/{p1,fb}-64k8`, `p1r-a01/{p1,fb}-64k8`, `k3-a01/{k3k,k3f}-64k8`.
