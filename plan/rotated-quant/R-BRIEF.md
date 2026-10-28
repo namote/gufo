@@ -13,6 +13,8 @@
   ```
 - **다른 세션이 같은 장비에서 GPU 창을 돌린다**(운영 전환 점검 P2). 그래서:
   - CPU 무거운 일(hipcc 빌드, 큰 numpy 계산)을 하기 전에 `docker ps`로 `gufo-port-*` 컨테이너가 도는지 본다. 돌고 있으면 끝날 때까지 기다린다(공유 LPDDR라 CPU 부하가 상대 GPU 측정을 오염시킨다).
+  - 다른 세션(`gufo-00`)과의 약속(2026-10-28): 이쪽 GPU 창을 시작하기 전에 감독이 그 세션에 알린다. 그 세션도 자기 창을 시작하기 전에 알리고, 창 시작 전에 `ABBA-OWNER.lock`을 `flock -n`으로 잡는다. 에이전트는 GPU 창을 시작하기 전에 감독에게 보고하고 허락을 받는다.
+  - 포맷 검사(nixos/nix 컨테이너), 패키지 내려받기도 CPU 작업이다. 상대 창이 도는 동안에는 하지 않는다.
   - GPU는 ai.tools 창 실행기로만 쓴다. 한 번에 창 하나. 절차는 [KVarN K1 브리프](../gufo-upstream-port/K1-BRIEF.md)의 "공통 규칙" GPU 항목을 그대로 따른다(창 계획 JSON은 `~/projects/ai.tools/test/experiments/gufo_upstream_port_20261023/`에, `driver: test.experiments.gufo_eval_20261020.unit`, 실행 뒤 `LOCKS.py`). 창 하나에 한 번만 돌리고 실패해도 자동 재시도하지 않는다.
 - **파일 경계:** 자기 단계의 파일만 만들고 `git add`한다. 다른 에이전트와 다른 세션이 같은 트리에서 일한다. push·PR·이슈 금지.
 - 커밋 트레일러(감독이 준 그대로):
