@@ -25,6 +25,10 @@ enum class TextRequestPhase : std::uint8_t {
 };
 
 inline constexpr std::size_t kDefaultDecodeActivePrefillTokens = 512;
+// Admission runs only between work units. While a session is free, a lone
+// prefill stops on this absolute interval, the cache grid's spacing, so an
+// arrival's wait does not depend on how many grid points the RAM budget keeps.
+inline constexpr std::size_t kAdmissionPrefillTokens = 2048;
 inline constexpr std::size_t kDefaultMaxOutputBytes =
     static_cast<std::size_t>(1024) * 1024;
 inline constexpr std::size_t kDefaultMaxBufferedOutputBytes =

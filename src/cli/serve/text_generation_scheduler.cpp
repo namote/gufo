@@ -1299,7 +1299,8 @@ struct TextGenerationScheduler::Impl {
   }
 
   void StepPrefill(const std::shared_ptr<ScheduledRequest>& request,
-                   bool decoder_runnable, bool peer_waiting = false) {
+                   bool decoder_runnable, bool peer_waiting = false,
+                   bool session_free = false) {
     try {
       if (CompleteIfStopped(request)) {
         return;
@@ -1309,12 +1310,17 @@ struct TextGenerationScheduler::Impl {
                            std::memory_order_release);
       last_prefill_request_id = request->id;
       // Bound work for short waiting prefills and captures as well as decoders.
-      // Long prefills alone retain the model's efficient chunk size.
+      // Long prefills alone retain the model's efficient chunk size, up to
+      // the admission interval while an arrival could take a free session.
       const bool bounded_prefill =
           incremental_prefill_supported && (decoder_runnable || peer_waiting);
-      const std::size_t budget = bounded_prefill
-                                     ? prefill_policy.decode_active_tokens
-                                     : request->runner_request.prompt_tokens();
+      std::size_t budget = bounded_prefill
+                               ? prefill_policy.decode_active_tokens
+                               : request->runner_request.prompt_tokens();
+      if (!bounded_prefill && incremental_prefill_supported && session_free)
+        budget = kAdmissionPrefillTokens -
+                 request->runner_request.prefill_position() %
+                     kAdmissionPrefillTokens;
       if ((decoder_runnable || runner_pool->capacity() > 1) &&
           !incremental_prefill_supported) {
         request->result.prefill_fallback_reason =
@@ -2113,7 +2119,11 @@ struct TextGenerationScheduler::Impl {
                        peer->runner_request.prefill_position() <=
                    prefill_policy.decode_active_tokens;
           });
-      StepPrefill(request, false, !capturing.empty() || short_peer_waiting);
+      // Requests can arrive during the step, so an empty queue does not
+      // keep the whole pass.
+      StepPrefill(
+          request, false, !capturing.empty() || short_peer_waiting,
+          prefilling.size() + capturing.size() + 1 < runner_pool->capacity());
       if (!IsTerminal(request)) {
         if (request->runner_request.SnapshotPending()) {
           capturing.push_back(std::move(request));

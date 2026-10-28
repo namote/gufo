@@ -1210,11 +1210,73 @@ void TestMultiResidentPrefillUsesBoundedWorkUnits() {
         chunks.push_back(event.count);
     }
     Expect(chunks == std::vector<std::size_t>({3, 3, 1}),
-           "idle prefill uses model geometry regardless of spare slots");
+           "idle prefill within the admission interval uses model geometry");
     Expect(
         result.prefill_chunks == 3 && result.active_decode_prefill_chunks == 0,
         "model-sized work units still yield for admission and cancellation");
   }
+}
+
+std::vector<std::size_t> PrefillChunks(const FakeControl& control,
+                                       TextRunnerToken label) {
+  std::vector<std::size_t> chunks;
+  for (const auto& event : control.Events())
+    if (event.kind == EventKind::kPrefill && event.label == label)
+      chunks.push_back(event.count);
+  return chunks;
+}
+
+void TestLonePrefillStopsOnAdmissionInterval() {
+  constexpr std::size_t interval = gufo::server::kAdmissionPrefillTokens;
+  for (const auto capacity : {1U, 2U}) {
+    auto control = std::make_shared<FakeControl>();
+    control->max_context = 4 * interval;
+    auto scheduler = MakeScheduler(control, capacity);
+    const auto result =
+        scheduler->Submit(SharedPrompt(2 * interval + 904, 7, 0), 2, 0.0F)
+            .Wait();
+    Expect(result.tokens == ExpectedTokens(1, 2),
+           "a lone long prefill keeps its trajectory");
+    const auto expected =
+        capacity == 1 ? std::vector<std::size_t>({2 * interval + 904})
+                      : std::vector<std::size_t>({interval, interval, 904});
+    Expect(PrefillChunks(*control, 1) == expected,
+           "only a free session bounds a lone prefill for admission");
+  }
+  // Model passes shorter than the interval still end on its multiples.
+  auto control = std::make_shared<FakeControl>();
+  control->max_context = 4 * interval;
+  control->prefill_capacity = 1000;
+  auto scheduler = MakeScheduler(control, 2);
+  (void)scheduler->Submit(SharedPrompt(2 * interval + 404, 7, 0), 1, 0.0F)
+      .Wait();
+  Expect(PrefillChunks(*control, 1) ==
+             std::vector<std::size_t>({1000, 1000, interval - 2000, 1000, 1000,
+                                       interval - 2000, 404}),
+         "admission boundaries are absolute prompt positions");
+}
+
+void TestArrivalDuringLonePrefillWaitsOneInterval() {
+  constexpr std::size_t interval = gufo::server::kAdmissionPrefillTokens;
+  auto control = std::make_shared<FakeControl>();
+  control->max_context = 5 * interval;
+  control->block_prefill_label = 1;
+  auto scheduler = MakeScheduler(control, 2);
+  auto long_request =
+      scheduler->Submit(SharedPrompt(4 * interval, 7, 0), 2, 0.0F);
+  // The queue was empty when the step began; the arrival comes during it.
+  control->WaitForPrefill(1);
+  auto short_request = scheduler->Submit({2}, 1, 0.0F);
+  control->ReleasePrefill();
+  Expect(short_request.Wait().tokens == ExpectedTokens(2, 1) &&
+             long_request.Wait().tokens == ExpectedTokens(1, 2),
+         "both requests keep their trajectories");
+  const auto events = control->Events();
+  Expect(events[EventIndex(events, EventKind::kPrefill, 1)].count == interval,
+         "the step running at arrival ends on the admission interval");
+  Expect(EventIndex(events, EventKind::kAdvance, 2) <
+             EventIndex(events, EventKind::kPrefill, 1, 1),
+         "the arrival's first token precedes the rest of the long prompt");
 }
 
 void TestArrivalDoesNotWaitForAnotherLongChunk() {
@@ -3058,6 +3120,8 @@ int main() {
   TestBatchFailureIsolation();
   TestBatchDeviceLossFailsSuccessfulPeers();
   TestMultiResidentPrefillUsesBoundedWorkUnits();
+  TestLonePrefillStopsOnAdmissionInterval();
+  TestArrivalDuringLonePrefillWaitsOneInterval();
   TestArrivalDoesNotWaitForAnotherLongChunk();
   TestLongPrefillsKeepWideFairTurns();
   TestShortArrivalBehindWaitingPrefill();
