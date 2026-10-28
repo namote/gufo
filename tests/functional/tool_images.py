@@ -85,13 +85,20 @@ def check_tool_images(client, model, checks, image_content, chat_result, respons
         text_history = history(transport, "red", False, image=False)
         field = "content" if transport == "chat" else "output"
         text_history[-1][field] = "Status: READY."
+        start = log_offset(server_log)
         first = record(f"tool_images_{transport}_text_string",
                        check(run(transport, text_history), "READY"))
         text_history[-1][field] = [{
             "type": "text" if transport == "chat" else "input_text", "text": "Status: READY."}]
-        replay = record(f"tool_images_{transport}_text_array",
-                        check(run(transport, text_history, True), "READY"))
-        assert replay["text"] == first["text"] and counts(replay)[0] == counts(replay)[1], replay
+        label = f"tool_images_{transport}_text_array"
+        replay = record(label, check(run(transport, text_history, True), "READY"))
+        assert replay["text"] == first["text"], (first, replay)
+        # The array renders the same prompt as the string, so it is an
+        # unchanged retry: full reuse, or the stable boundary plus the
+        # assistant opening when memory pressure refused the retry copy.
+        total, cached = counts(replay)
+        check_unchanged_retry(label, replay, total - cached, server_log,
+                              start, log_offset(server_log))
         part = image_content("red")
         user_image = [part] if transport == "chat" else [{
             "type": "input_image", "image_url": part["image_url"]["url"]}]
