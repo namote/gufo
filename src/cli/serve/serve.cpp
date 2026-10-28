@@ -1,7 +1,5 @@
 #include "src/cli/serve/serve.hpp"
 
-#include <unistd.h>
-
 #include <algorithm>
 #include <atomic>
 #include <charconv>
@@ -37,6 +35,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/core/diagnostics/gpu_queues.h"
+#include "src/core/platform/shutdown_signal.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime_api.h>
@@ -75,6 +74,10 @@ public:
         << std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now() - start_)
                .count()
+        << " monotonic_us="
+        << std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+               .count()
         << ' ' << details << ' ' << server::Logger::MemoryStatus();
 #if defined(ENGINE_ENABLE_HIP)
     std::size_t free = 0, total = 0;
@@ -94,50 +97,8 @@ private:
   bool completed_{false};
 };
 
-// Reports a fatal signal on the way out. A driver or runtime failure during a
-// load can abort the process outright, which runs no destructor and no
-// terminate handler, leaving a log that stops at event=load_started. Only
-// async-signal-safe calls are allowed here, so the line is assembled by hand
-// and written straight to the descriptor.
-extern "C" void ReportFatalSignal(int number) {
-  static constexpr char kPrefix[] =
-      "[ERROR] [server] event=fatal_signal signal=";
-  char digits[8];
-  std::size_t length = 0;
-  int value = number;
-  if (value <= 0) {
-    digits[length++] = '0';
-  } else {
-    char reversed[8];
-    std::size_t count = 0;
-    while (value > 0 && count < sizeof(reversed)) {
-      reversed[count++] = static_cast<char>('0' + (value % 10));
-      value /= 10;
-    }
-    while (count > 0) {
-      digits[length++] = reversed[--count];
-    }
-  }
-  (void)::write(STDERR_FILENO, kPrefix, sizeof(kPrefix) - 1);
-  (void)::write(STDERR_FILENO, digits, length);
-  (void)::write(STDERR_FILENO, "\n", 1);
-  // Restore the default action and re-raise, so the exit status and any core
-  // dump still describe the original fault.
-  struct sigaction restore{};
-  restore.sa_handler = SIG_DFL;
-  (void)::sigemptyset(&restore.sa_mask);
-  (void)::sigaction(number, &restore, nullptr);
-  (void)::raise(number);
-}
-
 void InstallFatalSignalReporter() {
-  struct sigaction action{};
-  action.sa_handler = ReportFatalSignal;
-  (void)::sigemptyset(&action.sa_mask);
-  action.sa_flags = SA_RESETHAND;
-  for (const int number : {SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGFPE}) {
-    (void)::sigaction(number, &action, nullptr);
-  }
+  platform::InstallFatalSignalReporter();
 }
 
 // Installs a terminate handler that names the reason before the process dies.
@@ -522,12 +483,17 @@ void AddSpeechOptions(ArgParser& parser, bool tts, SpeechOptions* options) {
 }
 
 void AddEmbeddingOptions(ArgParser& parser, std::filesystem::path* model,
-                         std::string* served_model_name) {
+                         std::string* served_model_name,
+                         std::string* default_prompt_name) {
   parser.AddOption("-m", "--model", "DIR", "EmbeddingGemma 2 model directory",
                    "Model", model);
   parser.AddOption("", "--served-model-name", "NAME",
                    "Public API model ID (default: embeddinggemma-2)", "Model",
                    served_model_name);
+  parser.AddOption("", "--default-prompt-name", "NAME",
+                   "Checkpoint prompt for text inputs without prompt_name "
+                   "(default: none)",
+                   "Model", default_prompt_name);
 }
 
 }  // namespace
@@ -551,9 +517,11 @@ void PrintServeHelp(std::string_view program_name,
   if (subcommand == "embedding") {
     std::filesystem::path model;
     std::string name = "embeddinggemma-2";
-    ArgParser parser(std::string(program_name) + " serve embedding",
-                     "Serve EmbeddingGemma 2 text and image embeddings.");
-    AddEmbeddingOptions(parser, &model, &name);
+    std::string default_prompt_name;
+    ArgParser parser(
+        std::string(program_name) + " serve embedding",
+        "Serve EmbeddingGemma 2 text, image and audio embeddings.");
+    AddEmbeddingOptions(parser, &model, &name, &default_prompt_name);
     ServerOptionHelpTargets server_help;
     AddServerOptionsForHelp(parser, &server_help, false);
     parser.PrintHelp();
@@ -810,7 +778,7 @@ void PrintServeHelp(std::string_view program_name,
       << "  tts       Serve Qwen3-TTS speech synthesis (/v1/audio/speech)\n"
       << "  asr       Serve Qwen3-ASR transcription "
          "(/v1/audio/transcriptions)\n"
-      << "  embedding Serve EmbeddingGemma 2 text and image embeddings "
+      << "  embedding Serve EmbeddingGemma 2 text, image and audio embeddings "
          "(/v1/embeddings)\n\n"
       << "Server:\n"
       << "  -i, --host <IP>        Bind address (default: 127.0.0.1)\n"
@@ -1002,9 +970,11 @@ int RunServe(std::span<const char* const> args) {
   if (subcommand == "embedding") {
     std::filesystem::path model;
     std::string name = "embeddinggemma-2";
-    ArgParser parser("gufo serve embedding",
-                     "Serve EmbeddingGemma 2 text and image embeddings.");
-    AddEmbeddingOptions(parser, &model, &name);
+    std::string default_prompt_name;
+    ArgParser parser(
+        "gufo serve embedding",
+        "Serve EmbeddingGemma 2 text, image and audio embeddings.");
+    AddEmbeddingOptions(parser, &model, &name, &default_prompt_name);
     add_server_options(parser, false);
     if (!parser.Parse(sub_args, &parse_err)) {
       std::cerr << "Error: " << parse_err << '\n';
@@ -1021,12 +991,21 @@ int RunServe(std::span<const char* const> args) {
       return 2;
     }
     ModelLoadLog load_log("embedding_gemma2", model);
+    std::map<std::string, std::string> prompts;
+    std::string prompts_error;
+    if (!server::LoadSentenceTransformerPrompts(model, &prompts,
+                                                &prompts_error)) {
+      std::cerr << "Error: " << prompts_error << '\n';
+      return 1;
+    }
     try {
       embeddings = std::make_shared<server::EmbeddingService>(
           server::EmbeddingServiceOptions{
               .model_root = model,
               .validate_model = true,
               .model_id = name,
+              .prompts = std::move(prompts),
+              .default_prompt_name = default_prompt_name,
               .runner = {},
           });
     } catch (const std::exception& error) {

@@ -142,13 +142,16 @@ constexpr std::uint32_t kWmmaKStride = kHeadDim + 8;
 // and shrinking kKeys in step therefore trades nothing in the tiling but halves
 // the K/V bytes each block pulls per query row -- the dominant cost.
 template<std::uint32_t kQueryRows, std::uint32_t kKeys, bool kHeadMajor = false>
-__launch_bounds__(256, 2) __global__ void WmmaCausalAttention(
-    const float* __restrict__ q, const float* __restrict__ gate,
-    const __half* __restrict__ k_cache_f16,
-    const __half* __restrict__ v_cache_f16, KvBlockTable kv_table,
-    float* __restrict__ out_context, std::uint32_t start_pos,
-    std::size_t batch_size, float* __restrict__ lse_out,
-    std::uint32_t key_begin, std::uint32_t first_query) {
+// LLVM 24 otherwise uses 241 VGPRs for packed V, crossing the six-wave
+// allocation boundary. Keep six waves resident without changing the tiling.
+__launch_bounds__(256, (__clang_major__ >= 24 && kHeadMajor) ? 6 : 2) __global__
+    void WmmaCausalAttention(
+        const float* __restrict__ q, const float* __restrict__ gate,
+        const __half* __restrict__ k_cache_f16,
+        const __half* __restrict__ v_cache_f16, KvBlockTable kv_table,
+        float* __restrict__ out_context, std::uint32_t start_pos,
+        std::size_t batch_size, float* __restrict__ lse_out,
+        std::uint32_t key_begin, std::uint32_t first_query) {
   constexpr std::uint32_t kRowBlocks = (kQueryRows / 16) * kWmmaHeads;
   constexpr std::uint32_t kKeyBlocks = kKeys / 16;
   constexpr std::uint32_t kSTiles = kRowBlocks * kKeyBlocks;
@@ -523,6 +526,12 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttention(
                 next[i] = tail[i];
           }
           o_acc[rb][t] = next;
+#if __clang_major__ >= 24
+          // Bound overlapping LDS fragments in the unpacked tail. LLVM 24
+          // otherwise spills them across the unrolled row/dimension tiles.
+          if constexpr (!kHeadMajor)
+            __builtin_amdgcn_sched_barrier(0);
+#endif
         }
       }
     }
