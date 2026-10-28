@@ -278,3 +278,52 @@ TTFT(초). 같은 출발 시각 묶음 안에서 정렬한 순위별 비교다.
 
 - ai.tools `tmp/test-results/gufo-upstream-port-20261023/p2-a01/`(`FINAL.json`, 창별 `WINDOW.json`·`receipt/run/{RESULT.json,server-1.log}`), `p2-a01.log`, `p2-a01-fstrim.log`. cache-disk는 지우지 않았다(남은 여유 87 GiB).
 - 비교에 쓴 기존 창: `p1-a01/{p1,fb}-64k8`, `p1r-a01/{p1,fb}-64k8`, `k3-a01/{k3k,k3f}-64k8`.
+
+## P3: 입장 경계를 capture grid와 분리 (2026-10-28)
+
+브리프 [P3](P-BRIEF.md#p3-입장-경계를-capture-grid와-분리-사용자-결정-2026-10-28-오케이-그렇게-가자-일단-수정만-해). 수정과 CPU 검증만 했다. GPU 창·이미지 빌드는 하지 않았다.
+
+### 설계
+
+- 원인(코드): `Impl::Run`의 마지막 분기(decoder 없음)는 `StepPrefill(request, false, peer_waiting)`을 부른다. 짧은 peer나 capture가 없으면 budget이 `prompt_tokens()`라 step이 model pass 한도(Qwen `kMaxPromptBatch` 4096)나 다음 checkpoint까지 간다. `Admit`은 step 사이에만 돈다. checkpoint는 `PlannedCaptures` → `cache::PlanCaptures(grid_limit = GridLimit(ram, private))`가 정하므로 혼자 도는 prefill의 입장 경계가 RAM 예산(2 GiB → grid 0개, 8 GiB → 2048·4096)에 따라 달라졌다.
+- 수정(`src/cli/serve/text_generation_scheduler.{hpp,cpp}`):
+  - 상수 `kAdmissionPrefillTokens = 2048`(cache grid 간격과 같음)을 추가했다. 옵션·스위치는 없다.
+  - 마지막 분기에서 세션이 비어 있으면(`prefilling + capturing + 1 < capacity`) 혼자 도는 prefill의 budget을 `2048 - prefill_position % 2048`로 한다. 즉 step이 절대 위치 2048의 배수에서 끝난다. 8 GiB grid 지점(2048 배수)과 같은 경계이고, cache hit로 중간 위치에서 시작해도 grid checkpoint와 어긋난 짧은 조각이 생기지 않는다.
+  - 큐가 비어 있어도 적용한다. P2의 64k8처럼 요청은 step 도중에 도착하므로 "큐가 있을 때만"은 이 경우를 놓친다.
+  - 세션이 꽉 찼거나 capacity 1이면 입장할 수 없으므로 기존 동작(model pass 전체)을 유지한다. decoder가 있거나 짧은 peer·capture가 기다릴 때의 `decode_active_tokens`(512) 분기는 그대로다.
+- 바뀌지 않는 것:
+  - capture 지점: `PlanCaptures`는 adapter의 `PlanPrefill`(4096 pass 계획)만 읽고 scheduler budget을 읽지 않는다. `Request::Prefill`은 budget과 무관하게 checkpoint·shared boundary·snapshot 위치에서 멈춘다. 지점 목록과 개수는 같다.
+  - checkpoint 내용: step 크기만 달라진다(이미 decoder가 있을 때 512, 8 GiB grid에서 2048로 끊는 경로와 같은 종류). Qwen 27B prefill은 chunk 크기와 무관하게 같은 값을 내도록 만들어져 있다(`docs/models/qwen3.8-27b/EXPERIMENTS.md`: "Fixed per-row FP32 order retained for chunk/cache/continued-image equivalence", "Q8 full logits/features match at 8K across scheduling budgets"). flash-next도 2048/4096/8192에서 byte-identical이다(`47b63915`). GPU에서 출력 hash·텍스트 동일을 확인해야 한다(아래 계획).
+  - `publication_prefill.Observe`는 여전히 혼자 도는 step만 관측한다(token당 속도라 step 크기와 무관).
+- 원본 의도와 다른 점: 원본 `47b63915`(qwen-flash 4096 chunk)는 "Long prefills alone retain the model's efficient chunk size"로 빈 세션이 있어도 혼자 도는 prefill을 끊지 않았다. 이번 수정은 빈 세션이 있을 때 그 효율 일부를 입장 지연과 바꾼다. 아래 비용이 그 대가다.
+
+### 처리량 비용 추정(측정 아님)
+
+- 경계 하나당 비용 = pass 하나 추가분(64층 launch chain, weight 재스트리밍 중 compute에 가려지지 않는 부분, host 준비·`Admit` 한 번). attention 작업량은 행 수로 정해지므로 늘지 않는다.
+- Qwen 27B Q4: pp2048 약 695 t/s(EXPERIMENTS.md)라 2048행 step이 약 2.9 s다. 경계당 30–80 ms로 보면:
+  - 8K 혼자 prefill: step 2개 → 4개, +2경계, 약 0.06–0.16 s(0.5–1.4 %).
+  - 256K 혼자 prefill(k3k-long256k 864 s, 294.9 t/s): 63 → 125 step, +62경계, 약 2–5 s(0.2–0.6 %).
+- 로그 근거(통제되지 않음): P2에서 같은 첫 step이 8 GiB(2048행)에서 입장 대기 2.41–2.45 s, 2 GiB(4096행)에서 5.56–5.66 s였다. 2048행 두 번(약 4.9 s)이 4096행 한 번보다 느리다는 신호는 없다.
+- 위험 상한: flash-next는 2048 → 4096 chunk로 pp4096 +5.3 %, 24K–102K 프롬프트 +6–11 %였다(`47b63915`, chunk마다 n-gram gather 겹침 포함). 이 scheduler 변경은 모든 모델에 적용되므로 flash-next 다중 세션 서버의 혼자 도는 prefill은 그 이득 일부를 잃을 수 있다. 운영 모델(27B)은 n-gram gather가 없어 이보다 작을 것으로 보지만 측정 전까지는 추정이다.
+- 기대 이득: 2 GiB 64k8 `long-and-short`의 짧은 요청 입장 대기 5.6 s → 약 2.4 s(8 GiB K3 수준, P2 기준 −3.2 s). 긴 prefill 중 도착한 요청의 최악 대기가 RAM 예산과 무관하게 2048행 step 하나(깊은 위치에서는 attention 때문에 더 김)로 묶인다.
+
+### CPU 검증
+
+- 단위 테스트(`tests/cli/text_generation_scheduler_test.cpp`):
+  - 추가 `TestLonePrefillStopsOnAdmissionInterval`: 5000행 혼자 prefill이 capacity 2에서 `{2048, 2048, 904}`로 끊기고, capacity 1에서는 한 step(5000)이다. model pass가 1000행이면 `{1000, 1000, 48, 1000, 1000, 48, 404}`로 2048 배수에서 끝난다.
+  - 추가 `TestArrivalDuringLonePrefillWaitsOneInterval`: 큐가 빈 채 시작한 8192행 prefill 도중 도착한 짧은 요청이 첫 2048행 step 뒤 입장해 긴 요청의 다음 step 전에 첫 토큰을 낸다. 두 요청 출력 유지.
+  - `TestMultiResidentPrefillUsesBoundedWorkUnits`는 기대값이 그대로이고 메시지만 고쳤다(경계 안에서는 model geometry).
+- 빌드·실행: gpu-eval 컨테이너가 없을 때 후보 이미지 `ai-tools/gufo-eval:7c2c5a728270` 안에서 `build/cpu-test`의 `text_generation_scheduler_test` 타깃만 `-j 2`로 빌드했다(TU 2개). `All text generation scheduler tests passed`, ctest PASS. 처음 실행은 fake 기본 context 128 때문에 새 테스트가 `length_error`로 멈춰 테스트에 `max_context`를 넣고 다시 돌렸다. cpu-test 안에서 이 scheduler를 링크하는 다른 단위 테스트는 없다(남은 것은 `gufo` 바이너리뿐, 빌드하지 않음).
+- `tools/ci/check-format.py`(nixos/nix 컨테이너 clang-format 21.1.8): PASS, 693 files.
+
+### GPU 검증 계획(실행하지 않음)
+
+규칙은 P·P2와 같다(창 실행기, 한 번에 하나, 창 전 `.gufo-revision`=HEAD, 끝에 `sleep 20`, 창 중 빌드 금지, 재시도 없음, 실행 직전 fstrim, 증거 보존).
+
+1. 이미지: 수정 커밋으로 후보 이미지를 창 **전에** 빌드한다. 대조군은 후보 `7c2c5a728270`(같은 RAM 2 GiB 인수).
+2. `p3-64k8` ABBA(4창, 약 16분): 수정본 / `7c2c5a72`, p2와 같은 인수. 판정: `long-and-short` 짧은 요청 `queue_ms` 약 2.4 s, TTFT 순위별 개선, 나머지 요청·phase는 5 %·3 ms 안. 텍스트 4창 동일, gold 17/17, ERROR·logic_error·length_error 0.
+3. `p3-256k4` ABBA(4창): 256K×4 운영 인수. C4·T2 순위별 5 %·3 ms, 텍스트 동일.
+4. 혼자 도는 prefill 처리량: 256K 단일 요청(`long256k`)과 8K·32K 단일 요청을 세션 4개 서버에서 ABBA. 요청별 `prefill_ms`·`prefill_chunks`(256K: 63 → 약 125)·`max_prefill_chunk_tokens`(4096 → 2048). 판정 5 %·3 ms. 위 추정(0.2–1.4 %)을 넘으면 기록하고 사용자에게 올린다(margin 넓히지 않음).
+5. checkpoint 내용: cache 재사용 시나리오(`shared`·`regress`)에서 capture 지점 목록과 checkpoint/출력 hash가 `7c2c5a72`와 같은지 비교한다.
+6. functional suite `batch`·`cache`·`long-context`를 수정본에서 한 번.
+7. flash-next를 운영에 쓰게 되면 그 모델의 혼자 도는 prefill도 같은 방식으로 잰다(이번 범위 밖).
