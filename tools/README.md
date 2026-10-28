@@ -14,6 +14,7 @@ benchmark/tuning executables; Python tools run from this source tree.
 | `ds4/` | DeepSeek-specific validation and experiments |
 | `qwen27b/` | Qwen27B/DFlash2 kernels, reference checks, and vision validation |
 | `qwen-flash/` | Flash-Next projection and MoE microbenchmarks |
+| `rotquant/` | Input-side Hadamard rotation converter for GGUF weights (model input groups live beside each model, e.g. `qwen27b/rotquant_groups.py`) |
 | `h3/` | MiniMax inventory and quality-artifact commands |
 | `audio/` | Audio reference and quality tools |
 | `ci/` | Repository, dependency, and documentation checks |
