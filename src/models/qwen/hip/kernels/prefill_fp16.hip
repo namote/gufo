@@ -18,7 +18,12 @@ using v16bf = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
 using v8f = __attribute__((__vector_size__(8 * sizeof(float)))) float;
 
 __device__ __forceinline__ v8f WmmaHalf(v16bf a, v16bf b, v8f c) {
+#if __clang_major__ >= 24
+  asm("v_wmma_f32_16x16x16_f16 %0, %1, %2, %0" : "+v"(c) : "v"(a), "v"(b));
+  return c;
+#else
   return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+#endif
 }
 
 // Permute 16-byte halves and the LDS row to avoid repeated bank conflicts.
