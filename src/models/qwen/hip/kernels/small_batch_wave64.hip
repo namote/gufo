@@ -9,6 +9,20 @@
 namespace gufo::hip::detail {
 namespace {
 
+// Clang 24 allocates more registers than Clang 22 for some token steps: the
+// sixteen-lane IQ4 verification kernels spill at single-token steps (IQ4_NL
+// also at two), and batch-five IQ4_XS and batch-six Q4_K lose occupancy.
+// Those launches use the Clang 24 step instead. A step only groups
+// independent token dots; every output keeps its products, accumulation and
+// reduction order.
+template<std::size_t Step, std::size_t Clang24Step>
+constexpr std::size_t kLaneStep =
+#if __clang_major__ >= 24
+    Clang24Step;
+#else
+    Step;
+#endif
+
 template<core::GgmlType Type>
 void LaunchWideFfn(const void* w, const float* x, float* y, std::size_t batch,
                    std::size_t groups, hipStream_t stream) {
@@ -18,8 +32,10 @@ void LaunchWideFfn(const void* w, const float* x, float* y, std::size_t batch,
     constexpr unsigned kLanes = Type == core::GgmlType::kIQ4_NL ? 16 : 32;
     constexpr unsigned kRows = Type == core::GgmlType::kIQ4_NL ? 4 : 6;
     constexpr unsigned kRowsPerBlock = 8 * kRows * (32 / kLanes);
+    constexpr std::size_t kStep =
+        Type == core::GgmlType::kIQ4_NL ? kLaneStep<1, Batch> : 1;
     SmallBatchKQuantExactFp32GEMMKernel<8, Batch, kRows, Type, 1, 4, Groups,
-                                        true, 1, 64, kLanes>
+                                        true, kStep, 64, kLanes>
         <<<((17408 + kRowsPerBlock - 1) / kRowsPerBlock) * Groups, 256, 0,
            stream>>>(w, x, y, 17408, 5120);
   };
@@ -81,8 +97,8 @@ void Launch(const void* w, const float* x, float* y, std::size_t m,
     // Keep the scalar partials and use the eight-column reduction for five
     // live tokens. Empty columns stay zero and never write output.
     constexpr std::size_t kRowsPerBlock = 16 * 4 * 2;
-    SmallBatchKQuantExactFp32GEMMKernel<16, 5, 4, Type, 1, 4, Groups, true, 1,
-                                        64, 16, true>
+    SmallBatchKQuantExactFp32GEMMKernel<16, 5, 4, Type, 1, 4, Groups, true,
+                                        kLaneStep<1, 5>, 64, 16, true>
         <<<((m + kRowsPerBlock - 1) / kRowsPerBlock) * Groups, 512, 0,
            stream>>>(w, x, y, m, k);
     return;
@@ -96,11 +112,12 @@ void Launch(const void* w, const float* x, float* y, std::size_t m,
     }
     if constexpr (Type == core::GgmlType::kIQ4_XS && Batch == 16) {
       if (down) {
-        launch.template operator()<8, 4, 1, 4, Groups == 1 ? 2 : 1, true, 16>();
+        launch.template
+        operator()<8, 4, 1, 4, kLaneStep<Groups == 1 ? 2 : 1, 2>, true, 16>();
         return;
       }
       if (k == 5120 && (m == 17408 || m == 34816)) {
-        launch.template operator()<8, 4, 1, 4, 1, true, 16>();
+        launch.template operator()<8, 4, 1, 4, kLaneStep<1, 2>, true, 16>();
         return;
       }
     }
@@ -108,7 +125,7 @@ void Launch(const void* w, const float* x, float* y, std::size_t m,
                   (Batch == 12 || Batch == 14)) {
       if ((m == 34816 && k == 5120) || (Batch == 14 && Groups > 1 && down)) {
         constexpr std::size_t kRows = Batch == 12 ? 3 : 4;
-        launch.template operator()<8, kRows, 1, 4, 1, true, 16>();
+        launch.template operator()<8, kRows, 1, 4, kLaneStep<1, 2>, true, 16>();
         return;
       }
     }
@@ -142,7 +159,8 @@ void Launch(const void* w, const float* x, float* y, std::size_t m,
     if constexpr (Batch >= 5) {
       if (k == 5120 && (m == 6144 || m == 10240 || m == 12288)) {
         constexpr std::uint32_t kMinWaves = Batch == 6 ? 8 : 12;
-        launch.template operator()<16, 3, 1, kMinWaves>();
+        constexpr std::size_t kStep = Batch == 6 ? kLaneStep<6, 3> : Batch;
+        launch.template operator()<16, 3, 1, kMinWaves, kStep>();
         return;
       }
     }
@@ -719,8 +737,10 @@ bool TryLaunchPackedQuantSwiGLUFp32(core::GgmlType type, const void* gate_up,
         constexpr unsigned kLanes = Type == core::GgmlType::kIQ4_XS ? 16 : 32;
         constexpr std::size_t kRows = Type == core::GgmlType::kIQ4_XS ? 4 : 6;
         constexpr std::size_t kRowsPerBlock = 8 * kRows * (32 / kLanes);
+        constexpr std::size_t kStep =
+            Type == core::GgmlType::kIQ4_XS ? detail::kLaneStep<1, 2> : 1;
         SmallBatchKQuantExactFp32GEMMKernel<8, Batch, kRows, Type, 1, 4, Groups,
-                                            true, 1, 64, kLanes, true, true>
+                                            true, kStep, 64, kLanes, true, true>
             <<<((34816 + kRowsPerBlock - 1) / kRowsPerBlock) * Groups, 256, 0,
                stream>>>(gate_up, input, output, 34816, 5120);
       };
