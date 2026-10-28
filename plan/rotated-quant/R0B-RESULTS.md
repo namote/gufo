@@ -261,3 +261,10 @@ echo built
 - 2비트 prefill 커널이 없어 prefill 칸이 비었다.
 - FWHT는 FP32 제자리 독립 커널이다. 운영 prefill 입력(BF16)과 융합 비용은 R2에서 잰다.
 - 작업 중 규칙 위반 1건: 포맷 검사(nixos/nix 컨테이너에서 nix 패키지 내려받기 + clang-format)를 다른 세션의 `gufo-port-bfe3783c15` 창이 도는 동안 실행했다(`docker ps` 출력에 그 컨테이너가 있었는데 멈추지 않았다). 빌드(hipcc)는 창이 없을 때만 했다. 그 창의 측정이 오염되었을 수 있으니 감독이 확인해야 한다.
+
+## 감독 확인과 기록 (2026-10-28)
+
+- 감독이 창 `rq0b-a03`의 `WINDOW.json`(COMPLETE, health_PASS), `check.log`(`CHECK PASS`), `peak.log`(DRAM read 240.07 GB/s), `time.log` RESULT 줄 일부(`ffn_down` AR: Q4_K 260.5 µs, IQ4_XS 217.8 µs, Q3_K 295.0 µs)를 원본과 대조했다.
+- **커밋 경계:** `d19126df`에는 이 단계의 벤치 파일 외에 R1a 컨버터 파일 9개도 들어 있다(두 에이전트가 같은 트리에서 거의 동시에 커밋). 이력은 고치지 않았다(사용자 결정 2026-10-28).
+- **규칙 위반 1건의 영향 범위:** 겹친 다른 세션 창은 `gufo-upstream-port-20261023/um2-a01/um2b-long32k`이다. 그 세션에 알려 타이밍 재확인 여부를 정하게 한다.
+- 계획 반영: [계획](PLAN.md)의 "R0b 결과가 계획에 주는 것", E3 전제 수정, E9(3비트 커널 최적화) 추가, E7b 범위.

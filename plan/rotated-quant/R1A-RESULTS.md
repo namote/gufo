@@ -188,3 +188,9 @@ $D --entrypoint python3 $I -I tests/models/qwen27b/rotquant_groups_test.py  # Ra
 
 - CTest 등록(`CMakeLists.txt`)과 `tools/README.md`의 `rotquant/` 행 추가는 공유 파일이라 하지 않았다. 등록하려면 NumPy·PyYAML이 있는 환경에서만 돌게 해야 한다. Nix 개발 셸의 Python에는 `ps.numpy`가 있고 PyYAML은 `transformers` 의존성으로 들어올 것이다(짐작, 확인 안 함).
 - 정식 표시 규칙 문서(`docs/`)는 R2에서 로더와 함께 쓴다.
+
+## 감독 확인과 기록 (2026-10-28)
+
+- 감독이 GPU 창이 빈 상태에서 eval 이미지(`7c2c5a728270`)로 두 테스트를 다시 돌렸다: `tests/tools/rotquant_test.py` 20/20, `tests/models/qwen27b/rotquant_groups_test.py` 2/2 통과. 회전 수학(`hadamard.py`)을 읽어 `W' = W·D·H`가 K 축에 적용되고 BF16 반올림이 round-to-nearest-even인 것을 확인했다.
+- **커밋 경계:** 이 단계의 코드와 테스트 9개 파일은 R0b 커밋 `d19126df`(`feat(bench): …`)에 함께 들어갔다. 다른 세션이 같은 브랜치에서 작업 중이고 결과 문서와 창 기록이 `d19126df`를 가리키므로 이력을 고치지 않았다(사용자 결정 2026-10-28).
+- **CTest 등록은 R1b로 미룬다.** 저장소의 Python 테스트는 `CMakeLists.txt`에 `add_test`로 등록하지만, Nix 검사 환경(`flake.nix` `mkTestCheck`)의 Python에는 PR 검사에 NumPy가 없고 전체 검사에도 PyYAML이 없다. 등록 전에 레시피 형식을 JSON으로 바꿀지(PyYAML 의존 제거), 검사 환경에 패키지를 더할지 정한다.
