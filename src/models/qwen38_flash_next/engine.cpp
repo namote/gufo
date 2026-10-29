@@ -666,6 +666,59 @@ bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
   return true;
 }
 
+bool Session::ProbeDraftChain(std::int32_t anchor, std::uint32_t depth,
+                              DraftProbe* probe, std::string* error_msg) {
+  if (continuation_hooks_)
+    continuation_hooks_->BeforeExecution();
+  if (!valid_ || probe == nullptr || !MtpEnabled() || tokens_.empty() ||
+      depth == 0 || depth > kMaxMtpDraftTokens) {
+    AssignError(error_msg,
+                "draft probe needs a synced MTP session and 1..7 drafts");
+    return false;
+  }
+  *probe = {};
+  rocm::Executor& exec = *model_->executor_;
+  const auto base = static_cast<std::uint32_t>(tokens_.size());
+  valid_ = false;
+  // The head choice of a greedy single-session cycle (PrepareDecode with
+  // MtpDraftSubsetAllowed true and no lookup bypass).
+  if (!SyncDraftVocab(error_msg))
+    return false;
+  probe->small_head = model_->draft_subset_ &&
+                      draft_vocab_.Fits(anchor, [&](std::int32_t token) {
+                        return model_->InDraftSubset(token);
+                      });
+  // DraftCatchUp(anchor, true, ...), also reporting candidates.
+  std::vector<std::int32_t> replay;
+  std::int32_t hidden_row = 0;
+  if (!DraftReplay(anchor, &replay, &hidden_row, error_msg))
+    return false;
+  if (replay.empty()) {
+    AssignError(error_msg, "draft probe has nothing to catch up");
+    return false;
+  }
+  for (std::uint32_t d = 0; d < depth; ++d) {
+    std::int32_t token = 0;
+    const bool first = d == 0;
+    const std::span<const std::int32_t> input =
+        first ? std::span<const std::int32_t>(replay)
+              : std::span<const std::int32_t>(&probe->tokens[d - 1], 1);
+    if (!exec.MtpForward(*session_, input, first ? hidden_row : -1,
+                         {.token = &token,
+                          .candidates = &probe->candidates[d],
+                          .draft_subset = probe->small_head},
+                         error_msg)) {
+      return false;
+    }
+    probe->tokens[d] = token;
+  }
+  probe->depth = depth;
+  // FinishDecode's rewind: the committed catch-up rows stay, drafts go.
+  exec.MtpRewind(*session_, base);
+  valid_ = true;
+  return true;
+}
+
 bool Session::DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
                                 std::string* error_msg,
                                 std::span<const std::uint8_t> propose) {

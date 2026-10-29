@@ -84,7 +84,7 @@ if (ENGINE_ENABLE_HIP)
     gufo_qwen38_flash_next hip::host)
 
   add_executable(qwen38_flash_next_gpu_probe EXCLUDE_FROM_ALL gpu_probe.cpp
-    mtp_audit.cpp)
+    mtp_audit.cpp mtp_trace.cpp)
   target_link_libraries(qwen38_flash_next_gpu_probe PRIVATE
     gufo_qwen38_flash_next_reference)
 endif()

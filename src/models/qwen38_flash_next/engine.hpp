@@ -1,6 +1,7 @@
 #ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_ENGINE_HPP_
 #define GUFO_MODELS_QWEN38_FLASH_NEXT_ENGINE_HPP_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -20,6 +21,7 @@
 #include "src/models/qwen38_flash_next/config.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
+#include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 
 namespace gufo::core {
@@ -218,6 +220,22 @@ public:
   void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt);
   /// A new request reusing cached context starts its own acceptance history.
   void ResetDraftPolicy();
+
+  /// Diagnostic for draft-policy studies: the greedy MTP chain a speculative
+  /// cycle anchored on `anchor` would propose, without verifying or
+  /// committing anything. It runs the same catch-up, head choice and
+  /// recursive draft steps as the greedy single-session cycle (no prompt
+  /// lookup), then rewinds the draft block to the committed position. Each
+  /// depth reports the draft token and its top candidate logits.
+  struct DraftProbe {
+    std::array<std::int32_t, kMaxMtpDraftTokens> tokens{};
+    std::array<MtpCandidateLogits, kMaxMtpDraftTokens> candidates{};
+    std::uint32_t depth{0};
+    bool small_head{false};
+  };
+  [[nodiscard]] bool ProbeDraftChain(std::int32_t anchor, std::uint32_t depth,
+                                     DraftProbe* probe,
+                                     std::string* error_msg = nullptr);
 
   struct SpeculativeStats {
     std::uint64_t cycles{0};

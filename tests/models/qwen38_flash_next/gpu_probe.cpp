@@ -11,6 +11,9 @@
 // Independent predictor oracle: --mtp-model MTP.gguf --mtp-audit
 // MTP cost calibration: --mtp-model MTP.gguf --cost-audit C (0 = all)
 //                      [--depth N] (default: 0, 4096, 32768)
+// Greedy MTP chain trace: --mtp-model MTP.gguf --mtp-trace SUITE.json
+//                         --out TRACE.jsonl [--context N] [--max-tokens N]
+//                         (mtp_trace.cpp; uses the production Session)
 // Matched-token decode: --prompt-file P --decode-file C --dump rows.bin
 //                       [--decode-ids ids.bin] (prefill P, then feed C's
 //                       tokens one at a time; row i predicts the token
@@ -37,6 +40,7 @@
 #include "src/models/qwen38_flash_next/ngram.hpp"
 #include "src/models/qwen38_flash_next/reference.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
+#include "tests/models/qwen38_flash_next/mtp_trace.hpp"
 
 namespace q = gufo::models::qwen38_flash_next;
 
@@ -105,6 +109,10 @@ int main(int argc, char** argv) {
   std::optional<std::uint32_t> cost_depth;
   std::uint32_t batch = 512;
   std::uint32_t context = 4096;
+  bool context_given = false;
+  std::string trace_suite;
+  std::string trace_out;
+  std::uint32_t trace_max_tokens = 256;
   float yarn_factor = 1.0F;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -115,6 +123,19 @@ int main(int argc, char** argv) {
       model_path = next();
     } else if (arg == "--mtp-model") {
       mtp_path = next();
+    } else if (arg == "--mtp-trace") {
+      trace_suite = next();
+    } else if (arg == "--out") {
+      trace_out = next();
+    } else if (arg == "--max-tokens") {
+      const auto value = next();
+      const auto [end, ec] = std::from_chars(
+          value.data(), value.data() + value.size(), trace_max_tokens);
+      if (ec != std::errc{} || end != value.data() + value.size() ||
+          trace_max_tokens == 0) {
+        std::fprintf(stderr, "--max-tokens requires a positive integer\n");
+        return 2;
+      }
     } else if (arg == "--mtp-audit") {
       mtp_audit = true;
     } else if (arg == "--sampled-head") {
@@ -175,6 +196,7 @@ int main(int argc, char** argv) {
     } else if (arg == "--batch" || arg == "--context") {
       const auto value = next();
       auto& count = arg == "--batch" ? batch : context;
+      context_given |= arg == "--context";
       const auto [end, ec] =
           std::from_chars(value.data(), value.data() + value.size(), count);
       if (ec != std::errc{} || end != value.data() + value.size() ||
@@ -214,6 +236,29 @@ int main(int argc, char** argv) {
   if (model_path.empty()) {
     std::fprintf(stderr, "--model is required\n");
     return 2;
+  }
+  if (!trace_suite.empty() || !trace_out.empty()) {
+    if (trace_suite.empty() || trace_out.empty() || mtp_path.empty() ||
+        mtp_audit || cost_audit || reference || decode || !dump_path.empty() ||
+        !nll_path.empty()) {
+      std::fprintf(stderr,
+                   "--mtp-trace requires --mtp-model and --out and cannot be "
+                   "combined with other probes\n");
+      return 2;
+    }
+    try {
+      MtpTraceOptions trace{.model_path = model_path,
+                            .mtp_path = mtp_path,
+                            .suite_path = trace_suite,
+                            .out_path = trace_out,
+                            .max_tokens = trace_max_tokens};
+      if (context_given)
+        trace.context = context;
+      return RunMtpTrace(trace);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "MTP trace failed: %s\n", e.what());
+      return 1;
+    }
   }
   if ((decode &&
        (decode_text.empty() || reference || mtp_audit || cost_audit)) ||
