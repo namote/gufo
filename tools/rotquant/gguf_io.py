@@ -107,7 +107,7 @@ class GgufFile:
         self.close()
 
 
-def _parse_header(data, path, keep_raw: bool):
+def _parse_header(data, path, keep_raw: bool, layout_alignment=None):
     if data[0:4] != b"GGUF":
         raise ValueError(f"{path} is not a GGUF file")
     r = Reader(data)
@@ -138,7 +138,9 @@ def _parse_header(data, path, keep_raw: bool):
         if type_id not in GGML_TYPE_NAME or type_id not in GGML_TYPE_BLOCK:
             raise ValueError(f"{path}: tensor {name} has unsupported type {type_id}")
         tensors.append(TensorInfo(name, ne, GGML_TYPE_NAME[type_id], offset))
-    alignment = int(kv.get("general.alignment", DEFAULT_ALIGNMENT))
+    # `layout_alignment` reads a file whose data was laid out with a different
+    # alignment than its general.alignment key claims (llama-quantize).
+    alignment = layout_alignment or int(kv.get("general.alignment", DEFAULT_ALIGNMENT))
     data_offset = (r.pos + alignment - 1) // alignment * alignment
     return kv, kv_raw, tensors, alignment, data_offset
 
@@ -152,11 +154,11 @@ def _shard_paths(path: Path, count: int) -> list:
             for i in range(count)]
 
 
-def open_gguf(path, header_only: bool = False) -> GgufFile:
+def open_gguf(path, header_only: bool = False, layout_alignment: int | None = None) -> GgufFile:
     """Open a GGUF file; a split set is opened from any of its shards."""
     path = Path(path)
     paths = [path]
-    first = _open_one(path)
+    first = _open_one(path, layout_alignment)
     try:
         kv = first[1]
         count = int(kv.get("split.count", 1))
@@ -171,7 +173,7 @@ def open_gguf(path, header_only: bool = False) -> GgufFile:
     kv0 = kv_raw0 = alignment0 = None
     try:
         for index, shard_path in enumerate(paths):
-            opened = first if shard_path == path else _open_one(shard_path)
+            opened = first if shard_path == path else _open_one(shard_path, layout_alignment)
             shard, skv, skv_raw, stensors, alignment = opened
             shards.append(shard)
             if count > 1 and (int(skv.get("split.no", -1)) != index or
@@ -197,7 +199,7 @@ def open_gguf(path, header_only: bool = False) -> GgufFile:
     return model
 
 
-def _open_one(path: Path):
+def _open_one(path: Path, layout_alignment=None):
     source = path.open("rb")
     try:
         data = mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_READ)
@@ -205,7 +207,8 @@ def _open_one(path: Path):
         source.close()
         raise
     try:
-        kv, kv_raw, tensors, alignment, data_offset = _parse_header(data, path, keep_raw=True)
+        kv, kv_raw, tensors, alignment, data_offset = _parse_header(data, path, keep_raw=True,
+                                                                    layout_alignment=layout_alignment)
     except Exception:
         data.close(); source.close()
         raise
@@ -260,19 +263,23 @@ class OutTensor:
         return type_size(self.type_name, count, self.ne[0])
 
 
-def write_gguf(path, kv_raw: list, tensors: list, alignment: int = WRITE_ALIGNMENT) -> None:
+def write_gguf(path, kv_raw: list, tensors: list, alignment: int = WRITE_ALIGNMENT, *,
+               recorded_alignment: int | None = None) -> None:
     """Write a single-file GGUF v3; tensor payloads are streamed by callbacks.
 
     The data section and every tensor start on an `alignment` boundary of the
     file (256 bytes by default); `general.alignment` records it whenever it
     differs from the GGUF default. Any incoming `general.alignment` is
-    replaced. Test fixtures pass 32 to produce default-aligned inputs.
+    replaced. Test fixtures pass 32 to produce default-aligned inputs, and
+    `recorded_alignment` to mimic llama-quantize, which copies the input's
+    general.alignment but lays the data out at 32 (llama-quant.cpp `align`).
     """
     if alignment < DEFAULT_ALIGNMENT or alignment & (alignment - 1):
         raise ValueError(f"alignment {alignment} must be a power of two >= {DEFAULT_ALIGNMENT}")
     kv_raw = [(key, raw) for key, raw in kv_raw if key != ALIGNMENT_KEY]
-    if alignment != DEFAULT_ALIGNMENT:
-        kv_raw.append((ALIGNMENT_KEY, encode_value(U32(alignment))))
+    recorded = alignment if recorded_alignment is None else recorded_alignment
+    if recorded != DEFAULT_ALIGNMENT:
+        kv_raw.append((ALIGNMENT_KEY, encode_value(U32(recorded))))
     header = bytearray(b"GGUF")
     header += struct.pack("<IQQ", GGUF_VERSION, len(tensors), len(kv_raw))
     for key, raw in kv_raw:
@@ -298,6 +305,17 @@ def write_gguf(path, kv_raw: list, tensors: list, alignment: int = WRITE_ALIGNME
             if written != tensor.nbytes:
                 raise AssertionError(f"{tensor.name}: wrote {written} bytes, expected {tensor.nbytes}")
             out.write(b"\0" * (-written % alignment))
+
+
+def layout_is_packed(model: GgufFile, alignment: int) -> bool:
+    """True when every shard's tensor offsets follow GGUF packing at `alignment`."""
+    expected = {}
+    for tensor in model.tensors:
+        offset = expected.get(tensor.shard, 0)
+        if tensor.offset != offset:
+            return False
+        expected[tensor.shard] = offset + (tensor.nbytes + alignment - 1) // alignment * alignment
+    return all(shard.data_offset % alignment == 0 for shard in model.shards)
 
 
 def as_float32(model: GgufFile, tensor: TensorInfo, rows: slice | None = None) -> np.ndarray:

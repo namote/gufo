@@ -154,7 +154,8 @@ for t in model.tensors:
 kv = [(k, raw) for k, raw in model.kv_raw if k not in SPLIT_KEYS and k not in overrides
       and not ({drop_prism!r} and k == "prism.hadamard.sign_values")]
 kv += [(k, encode_value(v)) for k, v in overrides.items()]
-write_gguf(output, kv, tensors, model.alignment)
+# Like llama-quantize: keep the input's general.alignment, pack the data at 32.
+write_gguf(output, kv, tensors, 32, recorded_alignment=model.alignment)
 """
 
 
@@ -641,7 +642,9 @@ class ConverterTest(unittest.TestCase):
         code, stdout, err = run_cli("--groups", "qwen27b", "--input", rot, "--recipe", recipe,
                                     "--llama-quantize", script, "--output", out)
         self.assertEqual(code, 0, err)
-        self.assertNotIn("realigned", stdout)  # the rotated input is already 256-aligned
+        # llama-quantize packs at 32 even under a 256 key; the converter rewrites it.
+        self.assertIn("realigned", stdout)
+        self.assertFalse((self.dir / "aligned.unaligned.gguf").exists())
         with open_gguf(rot) as source:
             plan = build_plan(source, GROUPS, ALL_GROUPS, seed=None, rotate_only=False,
                               rules=parse_recipe(recipe.read_text(), ALL_GROUPS, GROUPS.recipe_types()).rules)
@@ -732,6 +735,27 @@ class ConverterTest(unittest.TestCase):
             self.assertEqual(sum(key == "general.alignment" for key, _ in model.kv_raw), 1)
         with self.assertRaises(ValueError):
             write_gguf(self.dir / "bad.gguf", [], [], 48)
+
+    def test_llama_quantize_layout_is_read_at_32(self):
+        # A 256 general.alignment over 32-byte packing (what llama-quantize writes
+        # for a 256-aligned input) is refused as is and realigned when read at 32.
+        with open_gguf(self.split[0]) as source:
+            tensors = [OutTensor(t.name, t.ne, t.type_name, lambda f, b=bytes(source.tensor_bytes(t)): f.write(b))
+                       for t in source.tensors]
+            kv = [(k, v) for k, v in source.kv_raw if not k.startswith("split.")]
+        mixed = self.dir / "mixed.gguf"
+        write_gguf(mixed, kv, tensors, 32, recorded_alignment=256)
+        self.assertEqual(shared_gguf.parse_gguf(mixed)["metadata"]["general.alignment"], 256)
+        with self.assertRaisesRegex(ValueError, "do not follow 256-byte packing"):
+            realign.realign(mixed, self.dir / "bad.gguf")
+        out = self.dir / "fixed.gguf"
+        summary = realign.realign(mixed, out, layout_alignment=32)
+        self.assertEqual((summary["input_alignment"], summary["alignment"]), (32, 256))
+        with open_gguf(out) as model, open_gguf(self.split[0]) as source:
+            for tensor in model.tensors:
+                self.assertEqual((model.shards[0].data_offset + tensor.offset) % 256, 0)
+                self.assertEqual(bytes(model.tensor_bytes(tensor)),
+                                 bytes(source.tensor_bytes(source.by_name[tensor.name])), tensor.name)
 
     def test_realign_keeps_bytes(self):
         out = self.dir / "realigned.gguf"

@@ -34,7 +34,7 @@ import numpy as np  # noqa: E402
 from rotquant import CONVERTER_VERSION  # noqa: E402
 from rotquant import prism  # noqa: E402
 from rotquant.gguf_io import (SPLIT_KEYS, WRITE_ALIGNMENT, OutTensor, as_float32,  # noqa: E402
-                              encode_value, open_gguf, write_gguf)
+                              encode_value, layout_is_packed, open_gguf, write_gguf)
 from rotquant.hadamard import f32_to_bf16_bits, rotate_last_axis, signs  # noqa: E402
 from rotquant.hadamard import BLOCK_SIZE  # noqa: E402
 from rotquant.plan import (PlanError, build_plan, copied_recipe, dry_run_table,  # noqa: E402
@@ -44,6 +44,7 @@ from rotquant.realign import realign  # noqa: E402
 from rotquant.verify import verify_output  # noqa: E402
 
 CHUNK_BYTES = 64 << 20
+QUANTIZE_LAYOUT = 32  # llama-quantize's data alignment, whatever general.alignment says
 
 
 def file_sha256(paths) -> str:
@@ -216,14 +217,21 @@ def run(args) -> int:
                                imatrix=args.imatrix, provenance=overrides)
     print(" ".join(command), flush=True)
     subprocess.run(command, check=True)
-    # llama-quantize keeps its input's alignment. A 32-aligned original
-    # (quantized without rotation) is rewritten so rotated and unrotated
-    # outputs share the 256-byte layout; tensor bytes do not change.
-    with open_gguf(args.output, header_only=True) as written:
-        aligned = written.alignment == WRITE_ALIGNMENT
+    # llama-quantize copies general.alignment from its input but always lays
+    # the data out at 32 bytes (llama.cpp src/llama-quant.cpp `const size_t
+    # align = GGUF_DEFAULT_ALIGNMENT`, b11069:979, 8ab29fae:1059). A 256 key
+    # over 32-byte packing is inconsistent (llama.cpp's reader refuses the
+    # offsets), so the output is read at 32 and rewritten at 256; tensor
+    # bytes do not change.
+    with open_gguf(args.output, layout_alignment=QUANTIZE_LAYOUT) as written:
+        if not layout_is_packed(written, QUANTIZE_LAYOUT):
+            raise PlanError(f"{args.output}: llama-quantize output is not packed at {QUANTIZE_LAYOUT} bytes")
+        base = written.shards[0].data_offset
+        aligned = (written.kv.get("general.alignment") == WRITE_ALIGNMENT and base % WRITE_ALIGNMENT == 0
+                   and all(t.offset % WRITE_ALIGNMENT == 0 for t in written.tensors))
     if not aligned:
         args.output.rename(paths["unaligned"])
-        result = realign(paths["unaligned"], args.output)
+        result = realign(paths["unaligned"], args.output, layout_alignment=QUANTIZE_LAYOUT)
         paths["unaligned"].unlink()
         print(f"realigned {args.output}: alignment {result['input_alignment']} -> {result['alignment']}, "
               f"tensor bytes unchanged", flush=True)

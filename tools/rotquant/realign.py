@@ -17,8 +17,8 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from rotquant.gguf_io import (SPLIT_KEYS, WRITE_ALIGNMENT, OutTensor, open_gguf,  # noqa: E402
-                              write_gguf)
+from rotquant.gguf_io import (SPLIT_KEYS, WRITE_ALIGNMENT, OutTensor, layout_is_packed,  # noqa: E402
+                              open_gguf, write_gguf)
 
 CHUNK_BYTES = 64 << 20
 
@@ -31,10 +31,14 @@ def _copy(model, tensor):
     return write
 
 
-def realign(source: Path, output: Path) -> dict:
+def realign(source: Path, output: Path, layout_alignment: int | None = None) -> dict:
+    """`layout_alignment` reads a source laid out at that alignment whatever
+    its general.alignment says (llama-quantize output); the packing is checked."""
     if output.exists():
         raise ValueError(f"refusing to overwrite {output}")
-    with open_gguf(source) as model:
+    with open_gguf(source, layout_alignment=layout_alignment) as model:
+        if not layout_is_packed(model, model.alignment):
+            raise ValueError(f"{source}: tensor offsets do not follow {model.alignment}-byte packing")
         tensors = [OutTensor(t.name, t.ne, t.type_name, _copy(model, t)) for t in model.tensors]
         kv_raw = [(key, raw) for key, raw in model.kv_raw if key not in SPLIT_KEYS]
         write_gguf(output, kv_raw, tensors)
