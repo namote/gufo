@@ -25,7 +25,7 @@ y = W·x = (W·D·H)·(H·D·x)          # H·H = I, D·D = I
 
 - **행렬 출력은 바뀌지 않는다**(정확한 산술 기준). 따라서 residual stream, KV, DeltaNet 상태, DFlash2가 받는 타깃 hidden이 모두 그대로다. 회전은 matmul 안에 갇힌 국소 변환이다.
 - **예외: 가중치를 공유하는 다른 소비자.** DFlash2 드래프터는 타깃의 임베딩과 `output` 헤드를 그대로 쓴다(`src/models/qwen/dflash_weights.cpp:299`). `output`을 회전하면 드래프터의 헤드 경로에서도 입력을 회전해야 한다. 빠뜨리면 품질 테스트는 통과하고 드래프트 수락률만 떨어진다. 임베딩은 회전하지 않으므로 영향이 없다.
-- **새 matmul 커널이 필요 없다.** 바뀌는 곳은 활성화를 만드는 커널뿐이다. 27B는 활성화를 matmul 전에 Q8_1로 양자화한다(`LaunchBatchedFusedRMSNormQuantizeQ8_1`, `ops/gemm.hpp:238`). 회전은 이 양자화 앞, 같은 패스 안에 넣는다. 회전은 활성화 이상치도 펴 주므로 Q8_1 오차도 줄어들 수 있다(측정으로 확인).
+- **새 matmul 커널이 필요 없다.** 바뀌는 곳은 활성화를 만드는 커널뿐이다. 27B prefill은 활성화를 matmul 전에 Q8_1로 양자화한다(`LaunchBatchedFusedRMSNormQuantizeQ8_1`, `ops/gemm.hpp:238`). **정정(W3 경로 조사, 2026-10-29):** decode GEMV(`LaunchQ8KBlockGEMV`)와 DFlash2 verify(`LaunchBatchedQuantGEMMFp32`, ExactBf16 small batch)는 FP32 활성화를 그대로 읽는다. 그래서 decode·verify는 FP32 활성화 회전이고, Q8_1 융합은 prefill에만 해당한다. 경로 표는 `R2-RESULTS.md`에 있다. 회전은 이 양자화 앞, 같은 패스 안에 넣는다. 회전은 활성화 이상치도 펴 주므로 Q8_1 오차도 줄어들 수 있다(측정으로 확인).
 - **입력을 공유하는 행렬은 같은 `D`를 쓴다.** 그래야 입력을 한 번만 회전한다. 회전 여부는 텐서 단위가 아니라 **입력 그룹 단위**로 정한다.
 
 ### GGUF 블록 구조와 회전 블록
@@ -261,6 +261,10 @@ K는 모두 128의 배수다. `token_embd`는 행 조회라 회전 대상이 아
   - tool-call 형식: `tests/functional/tool_*.py`(tool_choice, tool_streaming, tool_parameter_order 등)
   - 긴 문맥: `tests/functional/test_long_context.py`
   - 한국어: **기존 suite가 없다.** 한국어 프롬프트 세트(지시 따르기, 요약, 코드 설명, tool-call)를 새로 만든다. R0 평가 코퍼스, R3 보정 코퍼스와 겹치지 않게 한다
+
+- **D5 컨버터 테스트 CTest 등록 (결정 2026-10-29):** 레시피 형식을 JSON으로 바꿔 PyYAML 의존을 없애고, Nix 점검 환경(`mkTestCheck`) Python에 numpy를 더해 `tools/rotquant` 테스트를 CTest에 등록한다(W1).
+
+- **D6 MTP nextn 층 (감독 결정 2026-10-29, W1):** 27B GGUF의 `blk.64`(nextn, `block_count - nextn_predict_layers` 이상)는 회전 그룹에서 빼고 원래대로 둔다. 로더는 그 층의 `.rot`을 거부하고, `head_in`이 회전된 파일에서는 MTP 경로를 이름을 들어 거부한다(v1, 운영 27B는 DFlash2).
 
 ## 위험
 
