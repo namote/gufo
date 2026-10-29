@@ -417,3 +417,15 @@
 - **감독 결정 (b):** NVMe 복사 뒤 ABBA 전에 single-session 그룹만 다시 돈다.
   - 계획: `PLAN-W9-I1F2.json`(NVMe 모델 마운트, mmproj는 외장 읽기 전용, `runner_args: ["--startup-timeout", "1800"]`). `suite.py`의 고정 600 뒤에 붙으므로 마지막 값이 쓰인다.
   - LOCKS 반영은 W8 SPEED가 끝난 뒤에 한다.
+
+### NVMe 복사와 I1F2 (2026-10-30)
+
+- **NVMe 복사:** `build/w9-copy-flash-next.sh`(로그 `build/w9-copy-flash-next.log`). UD-Q4_K_XL 4분할 + MTP shared-Q8_0, 106.3 GiB를 `~/projects/ai.tools/storage/models/llm/qwen-3.8-flash-next-ud-q4-k-xl-gguf/`로 옮겼다.
+  - 파일마다 복사 뒤 sha256이 외장 `EXPECTED-SHA256.txt`(HF LFS oid)와 같다(`SHA256SUMS`, `PROVENANCE.md`).
+  - [짐작] 쓰기 직후에 해시했으므로 일부는 page cache에서 읽었을 수 있다.
+  - 복사 뒤 루트 여유는 158 GiB다.
+- **I1F2** (`PLAN-W9-I1F2.json`, sha256 `051085fc…`, LOCKS 반영): COMPLETE, 재시도 없음. NVMe에서 서버 로드는 71 s였다.
+  - **single-session(`--sessions 1`, I1 활성): 통과.** 13개 사례가 모두 통과했다: `long-context`, text/thinking-tool/legacy-tool/image/image-thinking cancel(RAM과 disk), disk-spacing(RAM과 disk).
+  - 결과 위치: `~/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/w9-i1f2/w9-i1f2-suite/receipt/run/`
+- **3단계 결론:** greedy 동일성 89/89(I1V)와 기능 suite(I1 활성 그룹 I1F2, I1 비활성 그룹 I1F standard-cache)가 모두 통과했다.
+- **다음:** I1 ABBA(W8 SPEED2 뒤, 감독 "start").
