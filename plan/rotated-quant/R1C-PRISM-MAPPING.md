@@ -334,3 +334,47 @@
   - 유효 레시피 JSON에 `"signs": "none"`이 있는지, 거부 2종
   - 결과: `rotquant_test` 30/30, groups 3/3
 - **실제 27B 헤더 dry-run:** 회전 401개, 부호 벡터 3개로 seeded와 같다.
+
+## E10 0단계: 부호 변형 4종의 BF16 KL과 Q4 (2026-10-29)
+
+PLAN E10(`b361d116`) 0단계다. 회전 BF16 자체의 부호 분산을 본다. 감독이 v1 회전 BF16과 seed 1 rot-prism BF16을 지운 뒤 시작했고, 시작할 때 여유는 300 GiB였다.
+
+- 순서: 부호마다 BF16 → `check_rotated` → upstream KL → UD 복사 Q4 → upstream 로드 → 기록 → BF16 삭제, 이 순서로 하나씩 했다.
+- 도구는 `build/rq-llama/e10/run.sh`(커밋하지 않음)다. 로그는 `build/rq-llama/logs/e10-*`에 있다.
+- W2의 GPU 품질 창과 CPU perplexity가 같은 시간에 돌았다. 그래서 회전 단계가 466–496 s로 seed 1(298.9 s)보다 길었다. KL 결과에는 영향이 없다(CPU 계산은 결정적이다).
+- **KL 조건(4종 공통):**
+  - upstream `8ab29fae` `llama-perplexity -c 512 --chunks 16 -t 8 -b 512`
+  - 기준: 원본 BF16 logits `build/rq-llama/kl/bf16-base-16.kld`, PPL(base) 7.273658
+  - 코퍼스: gufo `docs/*.md`와 `README.md`, 223 KB
+  - 채점 토큰은 16 × 256 = 4096개다.
+  - seed 1 행은 앞에서 한 측정(같은 실행 조건)이다.
+
+| 부호 | Mean KLD | Median KLD | 99% KLD | Max KLD | RMS Δp | Same top p | PPL(Q)/PPL(base) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| seed 1 | 1.01e-4 ± 0.16e-4 | 3.3e-5 | 8.59e-4 | 0.0499 | 0.226 ± 0.030 % | 99.510 ± 0.109 % | 0.999669 ± 0.000209 |
+| seed 2 | 5.8e-5 ± 0.2e-5 | 3.3e-5 | 3.98e-4 | 0.0044 | 0.188 ± 0.007 % | 99.657 ± 0.092 % | 0.999671 ± 0.000183 |
+| seed 3 | 1.03e-4 ± 0.17e-4 | 3.3e-5 | 9.26e-4 | 0.0523 | 0.220 ± 0.028 % | 99.706 ± 0.085 % | 0.999848 ± 0.000206 |
+| 부호 없음(D = I) | 6.9e-5 ± 0.3e-5 | 3.4e-5 | 5.99e-4 | 0.0037 | 0.195 ± 0.007 % | 99.632 ± 0.095 % | 0.999813 ± 0.000201 |
+
+- **읽는 법(짐작):**
+  - 중앙값은 네 변형 모두 3.3e-5–3.4e-5로 같다. same top p와 PPL 비도 서로의 오차 범위 안에 있다.
+  - 평균 차이는 꼬리에서 나온다. seed 1과 seed 3은 Max KLD가 약 0.05인 토큰을 하나씩 가지고 있고, 그 때문에 평균과 표준오차가 커졌다. seed 2와 부호 없음은 Max가 0.004 수준이다.
+  - 4096개 토큰 표본으로는 BF16 단계에서 부호의 효과를 꼬리 사건 하나 이상으로 가를 수 없다.
+  - 부호가 품질에 주는 차이는 양자화 뒤(Q4나 2비트대)에 더 크게 드러날 것이다. 이것은 W2 품질 창의 Q4 비교로 판단한다.
+  - 꼬리 토큰이 seed 1과 seed 3에서 같은 위치인지는 확인하지 않았다(chunk별 출력은 로그에 있다).
+- **Q4(UD 복사 레시피, imatrix 없음):** `qwen-3.8-27b-rot-prism-q4-test-gguf/`
+
+| 파일 | `source_signs` | 크기 | sha256 |
+|---|---|---:|---|
+| `Qwen3.8-27B-rot-prism-UDcopy-Q4.gguf` | (seed 1, 키 기록 전) | 17621161216 | `107e9b1114c9010f87e384be2b8e86219a4335be31125299a0f9e8b05de25d71` |
+| `Qwen3.8-27B-rot-prism-s2-UDcopy-Q4.gguf` | `random seed=2` | 17621161216 | `f1bb438782c058ce5be33f73ca4f3563e42079de73a4b312e06086aa21cd2572` |
+| `Qwen3.8-27B-rot-prism-s3-UDcopy-Q4.gguf` | `random seed=3` | 17621161216 | `19ac8fb9fcf6ed95f9814983efb4ce848f1ea23597c7591738ff19cc839b5486` |
+| `Qwen3.8-27B-rot-prism-nosign-UDcopy-Q4.gguf` | `none` | 17621161216 | `f7a4de03775fae7cd0189e1198ea1b282ab3d955f074a77f3bb51a74665df818` |
+
+  - 세 새 Q4 모두 다음을 통과했다:
+    - `verify`(866/505/361, 접힌 텐서 401개, prism/gufo KV 보존, 256 정렬, override 315회, fallback 0회)
+    - upstream 로드("401 Hadamard-folded weight(s) … 6 sign vector(s)"), 생성 결과 "Paris"
+    - BF16 `check_rotated`: 비트와 부호 일치, 최대 상대 L2 오차 1.90e-3–2.01e-3
+  - 중간 BF16 sha256(지움): nosign `d128bb29…e05d`, s2 `70605f08…ed9d`, s3 `e4aab6a2…ce41`(전체 값은 `build/rq-llama/logs/e10-bf16.sha256`)
+  - 중간 BF16은 KL을 잰 뒤 지웠다. 쉘 안전 검사 때문에 스크립트에서는 지우지 못하고 리터럴 경로로 하나씩 지웠다.
+  - 루트 여유 공간은 300 GiB에서 237 GiB가 됐다(Q4 3개, 49 GiB 증가와 기타).
