@@ -242,6 +242,55 @@ PLAN은 "27B는 matmul 전에 활성화를 Q8_1로 양자화한다"고 적었지
   - (b)는 ③에서 수락률을 직접 재서 가린다. 회전 파일로 `qwen_dflash_gpu_test`와 수락 통계를 보는 방식이다.
   - 2단계(decode 융합)에 들어가기 전에 이것부터 확인해야 한다.
 
+## DFlash2 감속 진단 (창 `rq2d-a01`, 후보 v3, timing 판정용 아님)
+
+- `rq2d-units`(COMPLETE): `qwen_dflash_gpu_test`가 회전 타깃으로 통과했다.
+  - 회전 UD-copy Q4: 7.5 s
+  - 회전 BF16: 47.7 s
+- `rq2d-bench`(COMPLETE): DFlash2, `gufo bench -v -p 512 -n 128 -r 3`. 수락률은 bench가 출력한 `acceptance`(accepted/proposed)다.
+
+| 순서 | 타깃 | pp512 t/s | tg128-dflash2 t/s | 수락률 |
+|---|---|---:|---:|---:|
+| 1 | BF16 | 78.70 | 13.88 | 0.533 |
+| 2 | rot-BF16 | 65.45 | 7.50 | 0.354 |
+| 3 | plain UD-copy Q4 | 468.65 | 46.23 | 0.714 |
+| 4 | rot UD-copy Q4 | 466.86 | 41.60 | 0.627 |
+| 5 | rot-BF16 | 64.94 | 7.49 | 0.354 |
+| 6 | BF16 | 78.27 | 13.90 | 0.533 |
+
+- **판정: (b) 쪽.**
+  - 회전 BF16은 원본 BF16과 BF16 반올림만큼만 다르다. 그런데 수락률이 0.533에서 0.354로 떨어졌고, 반복해도 같다(결정적).
+  - 따라서 회전 실행 경로 어딘가에 오류가 있다.
+- 위치는 아직 모른다. 후보는 둘이다.
+  - 드래프터 head 회전
+  - 타깃 쪽(특히 BF16 가중치 경로)
+- `qwen27b_target_test`의 smoke는 회전 경로들끼리 서로 같다는 것만 확인했다. 원본 대비 정확성은 확인하지 않았다.
+- 회전 BF16의 pp512가 −17 %, tg가 −46 %인 것도 수락률만으로는 다 설명되지 않는다. 같이 조사한다.
+
+### 진단 2 (창 `rq2d-a02`)
+
+- **타깃 logits(`rq2d-trace`, `qwen27b_target_test rot-BF16 BF16`):**
+  - 27행 기준: top1 27/27, mean KL 5.0e-6, mean TV 9.6e-4, NLL 차이 −0.00036.
+  - row 0은 prefill 경로, row 1–8은 decode 경로다. Q8_0 대 BF16 수준(약 1e-3)보다 두 자릿수 작다.
+  - **회전 타깃의 prefill·decode는 정확하다.** verify는 이 비교에 들어 있지 않다. 다만 회전 Q4에서는 target_test가 verify = decode를 확인했다.
+- **드래프터(`qwen_dflash_gpu_test --trace`, BF16 대 rot-BF16, 같은 24토큰 prompt):**
+  - 타깃 features: relL2 2.1e-3
+  - 드래프터 층 텐서: relL2 1e-4–4e-3
+  - `normalized`: 2.7e-3
+  - 회전된 head를 거친 `logits`: relL2 7.1e-3, 최대 절대 차이 0.11
+  - 7개 draft 위치의 argmax가 모두 같고, top-2 간격도 비슷하다.
+  - `probabilities`/`proposed` 차이는 trace가 temperature 0.8 샘플링이라 생긴 것이다(후보 목록은 거의 같다).
+  - **드래프터 head 회전은 맞다.**
+- **AR(`rq2d-arbench`, `-p 512 -n 128 -r 1`):**
+  - BF16: pp512 79.90, tg128 4.14 t/s
+  - rot-BF16: pp512 66.22, tg128 3.86 t/s
+  - decode가 토큰당 +17.5 ms(+7.2 %)로, Q4의 회전 비용(+0.75 ms)보다 20배 넘게 크다. prefill은 +1.3 s(+21 %)다.
+  - 두 파일의 텐서 타입은 같다(BF16 506, F32 360, alignment 32).
+  - 다른 점은 회전 파일이 단일 51 GB 파일이고(원본은 46.6+4.7 GB 두 조각), `.rot` 텐서 때문에 tensor offset이 바뀐 것이다.
+- **판단(짐작):**
+  - 수락률 차이(0.533 대 0.354)는 회전 오류가 아니다. 회전 BF16 타깃이 느려지면서 시간 기반 adaptive 길이 제어기가 다른 draft 길이를 고른 결과로 보인다. Q4의 0.714 대 0.627도 같은 영향이거나 양자화 차이일 수 있다.
+  - 남은 문제는 회전 BF16 실행이 크게 느린 원인이다. 회전 연산(Q4에서 0.75 ms) 때문인지, 파일 배치·가중치 placement 때문인지 가려야 한다.
+
 ## 알려진 제한과 최적화 후보
 
 - decode 단독 회전은 토큰당 128 launch다(attn_out 16, ssm_out 48, ffn_down 64). 1 %를 넘으면 2단계로 간다(ssm_out을 decode 에필로그에 융합 등).
