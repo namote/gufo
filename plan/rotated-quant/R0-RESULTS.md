@@ -44,6 +44,50 @@
   - `logits_io.py same OLD NEW`: 새 run의 레코드가 옛 run의 같은 위치 레코드와 바이트 단위로 같은지 본다.
   - `metrics.py score`의 `kl_tail`: 평균, 최대 위치 하나를 뺀 평균, 중앙값, top-1 뒤집힘 수, 그중 KL > 1인 수, 상위 위치를 낸다. W3 RQ2B 표의 값(prefill 4.86e-4 / 5.86e-5 / 1.17e-5 / 132 / 1)을 그대로 재현했다.
 
+## RQ2B-prism: rot-prism BF16 대 BF16 (2026-10-29, 창 `rq2bp-a01`, W2 측정)
+
+R2 ② 판정은 W3/감독이 [R2 결과](R2-RESULTS.md)에서 한다. 여기에는 측정 값만 적는다.
+
+- **창:** `~/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/rq2bp-a01/`. 계획 `PLAN-RQ2B-PRISM.json`, 수집기 `b5219f1b…`, 이미지 `64849ca6ec7b`.
+  - `rq2bp-same`: 19:50–19:57, COMPLETE, health_PASS. 새 수집기의 BF16 출력이 `rq0-a01` 기록과 **바이트 단위로 같다.** prefill 4095/4095, verify 4095/4095, decode 64/64(`logits_io.py same`). 그래서 BF16 기준 `rq0-bf16`을 그대로 쓴다.
+  - `rq2bp-rotprism`: 19:57–20:51, COMPLETE, health_PASS. 실행 시간은 prefill 809 s, verify 1140 s, decode 1197 s다. 헤드 재생 검사는 8/8 통과했다. HIP 최대 사용량은 51.3–51.5 GB다.
+- **파일:** `qwen-3.8-27b-rot-prism-bf16-gguf/Qwen3.8-27B-rot-prism-BF16.gguf`, sha256 `1f0f3f8b…`.
+- **지표:** `metrics.py score`(bootstrap 2000, seed 20261029, 블록 256, `kl_tail` 포함). 보고는 `~/projects/ai.tools/storage/evaluations/rq-r0-20261029/metrics-rq2bp/rotprism-<path>.json`에 있다.
+
+| 경로 | n | KL 평균 [토큰 95 %] | 최대 1개 제외 평균 | 중앙값 | top-1 [95 %] | top-1 뒤집힘(비율) | 그중 KL > 1 | ΔNLL [95 %] |
+|---|---:|---|---:|---:|---|---:|---:|---|
+| prefill | 32760 | 1.29e-4 [0.48e-4, 2.49e-4] | 8.56e-5 | 1.20e-5 | 0.99591 [0.99521, 0.99655] | 134 (0.41 %) | 1 | −0.0002 [−0.0007, +0.0002] |
+| verify | 32760 | 1.26e-4 [0.48e-4, 2.38e-4] | 8.54e-5 | 1.19e-5 | 0.99594 [0.99524, 0.99655] | 133 (0.41 %) | 1 | −0.0002 [−0.0006, +0.0003] |
+| decode | 4096 | 3.13e-4 [0.44e-4, 8.38e-4] | 5.69e-5 | 1.35e-5 | 0.99780 [0.99634, 0.99902] | 9 (0.22 %) | 0 | +0.0005 [−0.0003, +0.0018] |
+| 참고: upstream llama.cpp CPU | gufo docs 코퍼스 | 1.01e-4 | — | 3.3e-5 | 0.9951 | — | — | — |
+
+- **llama.cpp 참고값의 출처:** 감독 제공(2026-10-29)이다. 코퍼스, 엔진, 경로가 달라 직접 비교값이 아니다. 같은 차수인지 볼 때만 쓴다.
+- **v1 파일(rq2b-a01)과 비교:**
+
+| 경로 | 파일 | KL 평균 | 최대 1개 제외 평균 | 중앙값 | 뒤집힘 |
+|---|---|---:|---:|---:|---:|
+| prefill | v1 | 4.86e-4 | 5.86e-5 | 1.17e-5 | 132 |
+| prefill | prism | 1.29e-4 | 8.56e-5 | 1.20e-5 | 134 |
+
+  - 중앙값, 뒤집힘 수, 상위 2개를 뺀 평균(v1 5.05e-5, prism 5.38e-5)은 거의 같다.
+  - 평균의 차이는 소수 위치 몇 개에서 나온다.
+- **꼬리 위치**(prefill, KL):
+
+| 위치 | v1 | prism |
+|---|---|---|
+| window 7 pos 3017 | 13.99(뒤집힘) | 0.0001 |
+| window 7 pos 2537 | 0.27 | 1.04 |
+| window 7 pos 3493 | 0.001 | 1.44(뒤집힘) |
+
+  - v1의 붕괴 위치(3017)는 prism에서 사라졌다. 대신 다른 chat 위치(3493)가 뒤집혔다.
+  - pos 2537(`<|im_start|>user\n` 뒤)은 두 부호 집합에서 모두 크다.
+  - 짐작: 큰 KL 한두 개는 부호 집합에 민감한 위치(혼돈형)에서 나온다. pos 2537은 부호와 상관없이 민감한 위치다. 층별 확인은 하지 않았다.
+- **카테고리**(prefill KL 평균): chat 4.1e-4, code 4.8e-5, ko_prose 3.3e-5, en_prose 2.4e-5다. chat이 다른 카테고리보다 한 차수 크고, 상위 위치도 대부분 chat window(6, 7)에 있다.
+- **PLAN R2 ② 기준과 대조(값만, 판정은 W3/감독):** 기준은 KL ≤ Q8_0 KL/10이다(prefill 2.13e-4, verify 0.57e-4, decode 0.88e-4).
+  - prefill 평균은 기준 아래다.
+  - verify와 decode 평균은 기준보다 크다. decode 평균은 pos 2537 하나가 대부분이다.
+  - top-1은 세 경로 모두 Q8_0(0.9795/0.9870/0.9827)보다 높다.
+
 ## 평가 코퍼스 a01
 
 - 위치: `~/projects/ai.tools/storage/evaluations/rq-r0-20261029/corpus-a01/`(`SHA256SUMS` 포함). manifest 사본: `tools/qwen27b/rq_quality/corpus_manifest.json`. 빌더 `tools/qwen27b/rq_quality/corpus.py`, 소스 리비전 `f95d1302`, tokenizer는 HF `tokenizer.json`(sha256은 manifest). 두 번 빌드해 바이트 단위로 같았다.
