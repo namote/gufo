@@ -220,8 +220,13 @@ def run(argv=None) -> int:
             continue
         recs = np.concatenate(parts[i])
         kept = set(int(x) for x in np.unique(recs["window"]))
-        logits_io.write(out, recs, reference=reference,
-                        **dict(common, windows=[m for m in common["windows"] if m["index"] in kept]))
+        meta = dict(common, windows=[m for m in common["windows"] if m["index"] in kept])
+        decode_prefix = meta.pop("prefix")  # logits_io.write's first parameter is named prefix
+        logits_io.write(out, recs, reference=reference, **meta)
+        meta_path = Path(out + ".json")
+        written = json.loads(meta_path.read_text())
+        written["prefix"] = decode_prefix  # same key as the gufo collector's metadata
+        meta_path.write_text(json.dumps(written, indent=1) + "\n")
         print(f"wrote {out}", flush=True)
     return 0
 
