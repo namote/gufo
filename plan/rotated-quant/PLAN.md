@@ -258,6 +258,7 @@ K는 모두 128의 배수다. `token_embd`는 행 조회라 회전 대상이 아
   - E2: 회전 후 `ssm_out`이 4비트를 견디는지. Flash-Next에서 `ssm_out`을 8비트로 남겨야 하는지 판단하는 직접 근거다.
   - E6: 1단 포맷과 2단 포맷 비교. Flash-Next `down_exps`는 K = 640으로 256의 배수가 아니어서 1단 포맷만 쓸 수 있다.
   - E7: 2비트대 결과는 Flash-Next 전문가 가중치를 더 내릴지 판단하는 참고로 쓴다. 다만 #474는 전문가 바이트가 decode 속도의 주된 제약이 아니라고 보고했으므로, Flash-Next에서는 dense 4비트 전환을 우선하고 전문가 2비트는 후순위로 둔다.
+- **외부 기준과 목표 (사용자 2026-10-29):** 같은 Strix Halo에서 EXL3(QTIP 기반, Hadamard + trellis) 엔진 [Kyojin](https://github.com/Yamz-Labs/kyojin)이 Flash-Next를 95 GB 팩으로 투기 디코드 52.2/51.1 tok/s(8K/32K), prefill 8K 1621 tok/s로 보고했다. 같은 문서가 잰 gufo v0.8.0(UD-Q4_K_XL 111.3 GB)은 35.3/31.9, 1250이었다. 품질(FP8 대비 KL)은 gufo 0.0156, Kyojin 0.0216이다(모두 Kyojin 자체 측정, [benchmarks.md](https://github.com/Yamz-Labs/kyojin/blob/main/doc/benchmarks.md)). **목표: gufo 품질을 유지하면서 Kyojin 속도 이상.** 회전 + k-quant 경로의 결과(R4, Flash-Next 1차)와 속도 측정을 보고 **EXL3 이식**(EXL3 포맷과 RDNA 커널을 gufo로 가져오기)이 더 나은지 사용자와 정한다. 그 판단을 위해 W7이 이식 타당성(라이선스, 커널 구조, 포맷, 27B/Flash-Next 팩)을 읽기 전용으로 조사한다.
 - **Flash-Next에만 있는 일:** hyper-connection, gated residual, n-gram 테이블, MTP 헤드의 입력 그룹 정의와 4비트 dense 커널이 필요하다. 이건 확장 단계에서 따로 계획한다.
 
 ## 결정이 필요한 것
