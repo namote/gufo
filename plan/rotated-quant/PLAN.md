@@ -277,6 +277,8 @@ K는 모두 128의 배수다. `token_embd`는 행 조회라 회전 대상이 아
 
 - **D6 MTP nextn 층 (감독 결정 2026-10-29, W1):** 27B GGUF의 `blk.64`(nextn, `block_count - nextn_predict_layers` 이상)는 회전 그룹에서 빼고 원래대로 둔다. 로더는 그 층의 `.rot`을 거부하고, `head_in`이 회전된 파일에서는 MTP 경로를 이름을 들어 거부한다(v1, 운영 27B는 DFlash2).
 
+- **D7 GGUF 텐서 정렬 (사용자 결정 2026-10-29, "컨버터 정렬 + 로더 조사"):** W3 진단에서 BF16 decode GEMV가 텐서의 절대 offset 정렬에 민감했다. 정렬이 나쁜 단일 파일이 분할 원본보다 3–15 % 느렸다. 모든 GGUF(운영 UD 파일과 llama-quantize 출력 포함)는 `general.alignment` 32이고 data 시작 ≡ 32 mod 128이라, 큰 텐서가 128B 정렬이 아니다. 대응: 컨버터 writer는 alignment 256으로 쓴다(W1). llama-quantize가 이 정렬을 유지하는지 확인한다. 운영 UD-Q4_K_M을 alignment 256으로 repack한 사본과 원본을 timing A/B로 비교한다. 이득이 확인되면 로더 재정렬 구현을 사용자에게 묻는다(W3 설계 메모).
+
 ## 위험
 
 - 4비트 이상에서는 회전의 품질 이득이 작을 수 있다(회전 계열 연구의 큰 이득은 주로 4비트 미만). 그 경우 E3(바이트 절감)이 주된 가치가 된다.
