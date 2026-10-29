@@ -32,6 +32,10 @@ if (ENGINE_ENABLE_HIP)
   # KVarN K0 accuracy study; needs a model and prompt files, so no CTest.
   add_executable(qwen27b_kvarn_k0 kvarn_k0.cpp)
   target_link_libraries(qwen27b_kvarn_k0 PRIVATE gufo_core)
+  # RQ R0 quality harness collector (tools/qwen27b/rq_quality); needs a model
+  # and corpus windows, so no CTest.
+  add_executable(qwen27b_rq_logits EXCLUDE_FROM_ALL rq_logits.cpp)
+  target_link_libraries(qwen27b_rq_logits PRIVATE gufo_core hip::host)
   add_executable(qwen27b_continuation_adapter_test EXCLUDE_FROM_ALL
     continuation_adapter_test.cpp continuation_fault.cpp)
   target_link_libraries(qwen27b_continuation_adapter_test PRIVATE gufo_core ${CMAKE_DL_LIBS})
