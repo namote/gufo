@@ -7,9 +7,13 @@
 //
 // Prefills tokens [offset, offset + position - rows] without capture, then
 // the last `rows` tokens up to and including `position` with every layer's
-// residual output captured. Writes <out>.hidden.f32 ([rows][layers][hidden]
-// floats), <out>.logits.f32 (the last row's logits) and <out>.txt (shape).
+// residual output captured. The arena taps five layers per pass, so the
+// probe reruns the prompt from a reset state once per five layers and
+// requires byte-equal logits across passes. Writes <out>.hidden.f32
+// ([rows][layers][hidden] floats), <out>.logits.f32 (the last row's logits) and
+// <out>.txt (shape).
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -77,31 +81,60 @@ int main(int argc, char** argv) {
     Require(executor != nullptr, error);
     const auto& config = executor->GetConfig();
 
+    // The arena taps at most a few layers per pass, so every chunk of
+    // layers reruns the whole prefix from a reset state. Prefill is
+    // deterministic: the logits of every pass must be byte-equal.
+    constexpr std::size_t kTapsPerPass = 5;
     const std::size_t prefix = position + 1 - rows;
-    executor->SetPromptHiddenCapture(false);
-    if (prefix != 0) {
-      (void)executor->ForwardPromptBatch(std::span(tokens).first(prefix), 0,
-                                         false);
+    const std::size_t layer_count = config.num_layers;
+    const std::size_t hidden_size = config.hidden_size;
+    std::vector<float> hidden(rows * layer_count * hidden_size);
+    std::vector<float> logits;
+    std::size_t passes = 0;
+    for (std::size_t first = 0; first < layer_count; first += kTapsPerPass) {
+      const std::size_t count = std::min(kTapsPerPass, layer_count - first);
+      std::vector<std::uint32_t> layers(count);
+      std::iota(layers.begin(), layers.end(),
+                static_cast<std::uint32_t>(first));
+      executor->Reset();
+      executor->SetPromptHiddenCapture(false);
+      if (prefix != 0) {
+        (void)executor->ForwardPromptBatch(std::span(tokens).first(prefix), 0,
+                                           false);
+      }
+      executor->SetPromptHiddenCapture(true, layers);
+      (void)executor->ForwardPromptBatch(std::span(tokens).subspan(prefix),
+                                         static_cast<std::uint32_t>(prefix));
+      const auto taps = executor->GetPromptHiddenStates();
+      Require(taps.size() == rows * count * hidden_size,
+              "unexpected hidden capture size");
+      for (std::size_t row = 0; row < rows; ++row) {
+        std::memcpy(hidden.data() + ((row * layer_count) + first) * hidden_size,
+                    taps.data() + (row * count * hidden_size),
+                    count * hidden_size * sizeof(float));
+      }
+      const auto pass_logits = executor->CopyLastLogits();
+      if (passes == 0) {
+        logits.assign(pass_logits.begin(), pass_logits.end());
+      } else {
+        Require(std::equal(logits.begin(), logits.end(), pass_logits.begin(),
+                           pass_logits.end()),
+                "logits differ between capture passes");
+      }
+      ++passes;
     }
-    std::vector<std::uint32_t> layers(config.num_layers);
-    std::iota(layers.begin(), layers.end(), 0U);
-    executor->SetPromptHiddenCapture(true, layers);
-    (void)executor->ForwardPromptBatch(std::span(tokens).subspan(prefix),
-                                       static_cast<std::uint32_t>(prefix));
-    const auto hidden = executor->GetPromptHiddenStates();
-    Require(hidden.size() == rows * layers.size() * config.hidden_size,
-            "unexpected hidden capture size");
     WriteFloats(out + ".hidden.f32", hidden);
-    WriteFloats(out + ".logits.f32", executor->CopyLastLogits());
+    WriteFloats(out + ".logits.f32", logits);
     std::ofstream meta(out + ".txt");
     meta << "model " << model_path << "\nrows " << rows << "\nlayers "
-         << layers.size() << "\nhidden " << config.hidden_size << "\nvocab "
-         << config.vocab_size << "\nfirst_position " << prefix
-         << "\nlast_position " << position << "\n";
+         << layer_count << "\nhidden " << config.hidden_size << "\nvocab "
+         << config.vocab_size << "\nfirst_position " << prefix << "\npasses "
+         << passes << "\nlast_position " << position << "\n";
     const auto& weights = executor->GetModel().GetWeights();
     std::cout << "RESULT rq_hidden_probe rows=" << rows
-              << " layers=" << layers.size() << " position=" << position
-              << " rotated_groups=\"" << weights.rotated_groups
+              << " layers=" << layer_count << " passes=" << passes
+              << " position=" << position << " rotated_groups=\""
+              << weights.rotated_groups
               << "\" folded_bytes=" << weights.folded_bytes
               << " fold_seconds=" << weights.fold_seconds << "\n";
     return 0;
