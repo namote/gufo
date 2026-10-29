@@ -100,6 +100,7 @@ K는 모두 128의 배수다. `token_embd`는 행 조회라 회전 대상이 아
 
 ### R3 보정 코퍼스 (gufo-00 세션 작성, 2026-10-29, 감독 해시 확인)
 
+- 빌더는 `tools/rotquant/calibration.py`(커밋 `ecd583f0`, 테스트 `rotquant_calibration_test`)다. 사용자 지시(2026-10-29)에 따라 27B와 Flash-Next 양자화 모두 이 코퍼스를 쓴다.
 - 최종본은 c02이고 위치는 `~/projects/ai.tools/storage/evaluations/rq-r3-calib-20261029/c02/`이다. 512토큰 청크 3,906개, 약 200만 토큰이다. 해시: `chunks.bin` `40d5d653…`, MANIFEST `3aa11b8a…`.
 - 앞 833청크는 c01(`chunks.bin` `0489a8fc…`)과 바이트 단위로 같다. 감독이 `cmp`로 확인했다. 27B는 먼저 c01 부분(청크 0–832)으로 수집하고, 필요하면 c02 전체로 넓힌다. Flash-Next는 드물게 라우팅되는 전문가까지 덮기 위해 c02 전체를 쓴다.
 - 한국어는 토큰 기준 약 19.6 %(사용자 기준 약 20 %)이고, `<tool_call>`이 든 청크는 약 35 %다.
