@@ -8,7 +8,7 @@
   - KL 기준으로 EXL3 b bpw는 UD k-quant 약 b + 0.7 bpw와 비슷하다. 예: EXL3 4.00(4.11 bpw) KL 18.8×10⁻³ ≈ UD-Q4_K_M(4.80 bpw) 17.5×10⁻³(차이 구분 안 됨).
 - **엔진 차이는 작다.** 같은 ExLlamaV3 런타임으로 돌린 BF16 원본과 gufo BF16의 KL은 6.9×10⁻⁴(중앙값 2×10⁻⁵)다. EXL3 수치는 거의 전부 양자화 오차다.
 - **판단: 3번 갈래는 "QTIP 형식 도입" 쪽이다(품질 기준).** 조건이 둘 있다.
-  1. 속도 창에서 바이트 절감이 gufo급 대역폭 효율로 이어질 수 있는지 봐야 한다(FLASH-NEXT 13.3: 공개 커널은 피크의 55–65 %). 이 측정 전에는 "품질 우위는 확인, 속도는 미확인"이다.
+  1. 속도: 깊이 0 decode에서는 확인됐다. 두 엔진 모두 약 200 GB/s로 대역폭에 묶이고, 같은 KL에서 EXL3 4.00이 UD-Q4_K_M보다 tg가 약 20 % 빠르다. 다만 prefill은 약 33 % 느리고, 깊이 32K prefill은 upstream 런타임이 gfx1151에서 돌지 않는다. MTP 투기 디코드와 깊이 32K tg는 SPEED2에서 잰다(아래 "속도").
   2. 비교한 k-quant는 unsloth UD 레시피다. 회전 k-quant나 GPTQ식 오차 보정 k-quant(3번 갈래 (a)(b))는 아직 없다. 이들이 약 0.7 bpw의 격차를 얼마나 줄이는지는 R4/E3 결과로 판단한다[짐작: 회전 이득은 3비트대에서 크다고 알려져 있으나 이 하네스로는 아직 재지 않았다].
 - **주의(꼬리):** truncated KL_256은 복사 실패를 숨길 수 있다. 정답 토큰이 기준 top-256 밖이면 KL에는 거의 안 잡히고 NLL에만 잡힌다. 그래서 **KL과 함께 ΔNLL, 위치별 NLL 꼬리를 반드시 같이 본다.** EXL3 3.50에서 실제로 일어났다(아래 "EXL3 3.50 ΔNLL 이상").
 
@@ -150,16 +150,41 @@
 - EXL3 런 사실: 로드(USB) 11–127 s(첫 로드는 Triton JIT 포함), BF16 289–356 s. torch 최대 할당은 3.00 14.9 GB, 3.50 16.5, 4.00 18.0, 5.00 21.1, BF16 55.9 GB(prefill, 4,096×248,320 logits 포함). prefill forward는 창당 약 9 s.
 - gufo fake-quant 런: prefill 약 18분, decode 약 23분, HIP 최대 51.3 GB(BF16 경로).
 
-## 속도 (예정)
+## 속도 (깊이 0, 창 `w8sp-a01/w8sp-pptg`)
 
-- 계획: `PLAN-EXL3-SPEED.json`(승인됨, RQ2F 뒤). `exl3/bench.py`(커밋 `9ea56a95`).
-  - `w8sp-kernels`: `rocprofv3 --kernel-trace`로 실행 커널 목록(RDNA exl3 GEMV/GEMM인지).
-  - `w8sp-pptg`: pp2048, tg128, 깊이 0과 32K, 3.00→5.00→역순 ABBA.
-  - `w8sp-chat-{4.00,5.00}-{mtp,none}`: R0 수락률 64프롬프트, greedy, think off, 256토큰. MTP 투기 디코드 대 gufo DFlash2(UD-Q4_K_M 29.50, UD-Q4_K_XL 29.16 tok/s), AR 대조(12.95, 12.33).
+- **측정:** `exl3/bench.py pptg`(커밋 `9ea56a95`), 이미지 `ai-tools/exl3-eval:1.6.5-rocm100`. a01 토큰, fp16 캐시, chunk 2048. pp2048은 빈 캐시에서 prefill 한 번, tg128은 한 토큰씩 forward 하고 토큰마다 argmax로 호스트 동기화한다. warm-up 1회 뒤 3회 반복의 평균이다.
+- **순서(ABBA):** 3.00, 3.50, 4.00, 5.00, 5.00, 4.00, 3.50, 3.00. 창 전 점검: 컨테이너 0, 1분 부하 0.43, LOCKS 일치.
+- **창 상태:** FAILED_no_fallback(health_PASS true). 여덟 항목 모두 깊이 0을 잰 뒤 깊이 32K 문맥을 채우다 실패했다(아래 "깊이 32K"). 깊이 0 값은 로그(`receipt/run/pptg-*.log`)에 남아 있고 측정 자체는 유효하다(감독 확인 2026-10-30).
+
+| 설정 | bpw | pp2048 A / B (tok/s) | tg128 A / B (tok/s) | 토큰당 읽는 바이트 [짐작] | 실효 대역폭 [짐작] |
+|---|---:|---|---|---:|---:|
+| EXL3 3.00 | 3.165 | 421.2 / 418.9 | 18.79 / 18.78 | 10.14 GB | 190 GB/s |
+| EXL3 3.50 | 3.639 | 425.4 / 431.8 | 17.07 / 17.06 | 11.66 GB | 199 GB/s |
+| EXL3 4.00 | 4.115 | 432.7 / 434.2 | 15.56 / 15.55 | 13.18 GB | 205 GB/s |
+| EXL3 5.00 | 5.064 | 433.0 / 411.0 | 12.37 / 12.37 | 16.22 GB | 201 GB/s |
+| gufo UD-Q4_K_M(R0, `rq0-speed-a01`) | 4.803 | 635.5 / 661.0 | 12.94 / 12.92 | 15.38 GB | 199 GB/s |
+| gufo UD-Q4_K_XL(R0) | 5.145 | 639.8 / 639.5 | 12.32 / 12.32 | 16.48 GB | 203 GB/s |
+
+- 바이트는 W2 정의의 2차원 가중치 바이트다(임베딩 한 행, MTP, KV, 활성화는 넣지 않았다). 그래서 실효 대역폭은 근사다[짐작].
+- 잡음: 같은 설정의 두 표본 차이는 tg 0.1 % 미만, pp 최대 5.1 %(5.00: 433.0 대 411.0)다. **5.00의 pp 칸만 5 % 기준을 넘어 결론 없음**이고, 나머지는 기준 안이다.
+- 같은 이미지, 같은 장비이지만 엔진이 다르다. gufo 값은 R0 속도 창(`gufo bench`, 바이너리 `rqw3-base-rocm101`, kvarn-k4v2 KV)이고, EXL3 값은 fp16 KV다. 깊이 0에서 KV 차이의 영향은 작다고 본다[짐작].
+
+**읽은 것:**
+- **decode는 두 엔진 모두 대역폭에 묶여 있다.** 실효 대역폭은 둘 다 약 190–205 GB/s다. FLASH-NEXT 13.3의 "EXL3 dense GEMV는 피크의 55–65 %" 짐작은 upstream 1.6.5 + gfx1151에서는 맞지 않았다.
+- **같은 품질에서 EXL3가 decode가 빠르다.** EXL3 4.00은 UD-Q4_K_M과 KL이 구분되지 않는데(18.8 대 17.5×10⁻³) tg가 15.56 대 12.93 tok/s로 약 +20 %다. EXL3 5.00은 KL이 UD-Q4_K_XL의 절반인데 tg가 같다(12.37 대 12.32).
+- **prefill은 EXL3가 약 33 % 느리다**(pp2048 약 430 대 640–660 tok/s).
+- 실행된 커널 목록은 아직 없다(`w8sp-kernels` 실패. 원인: `rocprofv3`의 `#!/usr/bin/env python3`에 컨테이너 PATH가 python3을 찾지 못함). SPEED2에서 다시 잰다.
+
+**깊이 32K:**
+- upstream 1.6.5의 Triton `_paged_attn_prefill_kernel`(캐시에 과거 문맥이 있는 prefill, head_dim 256, fp16 캐시)이 gfx1151에서 LDS 131,072 B를 요구한다. 장치 한도는 65,536 B라 `OutOfResources`로 실패한다. 위치 0부터의 prefill은 된다(품질 측정, decode prefix, 깊이 0 pp).
+- 그래서 **이 런타임으로는 깊이 32K의 pp를 잴 수 없다.** 실제 서빙에서 여러 chunk로 나뉘는 긴 프롬프트나 다회 대화도 같은 경로를 탈 수 있다[짐작, 확인하지 않음].
+- tg 깊이 32K는 문맥을 위치 0부터 한 번에 채우는 방식(`--fill-single`)으로 SPEED2에서 잰다.
+
+**남은 속도 측정(`PLAN-EXL3-SPEED2.json`, 승인됨):** 커널 목록(`rocprofv3`), tg128 깊이 32K(4.00, 5.00 ABBA), 64프롬프트 chat의 MTP 투기 디코드와 plain(4.00, 5.00). 비교 대상은 gufo DFlash2(UD-Q4_K_M 29.50, UD-Q4_K_XL 29.16 tok/s)와 AR(12.95, 12.33)이다. 실패 원인 셋(rocprofv3 PATH, chat 프롬프트의 transformers 의존, 32K 채우기)은 `3b96a10e`에서 고쳤고 CPU stub으로 확인했다.
 
 ## 남은 문제
 
-- 속도와 커널 목록(위 계획).
+- 커널 목록, 깊이 32K tg, MTP 투기 디코드(SPEED2).
 - 회전/GPTQ식 k-quant가 같은 bpw에서 이 격차를 얼마나 줄이는지(R4/E3, 3번 갈래 (a)(b)).
 - EXL3 3.50 복사 실패의 텐서별 원인, decode 경로 확인(선택).
 - 이 결과는 turboderp 공개 차트(4.00bpw가 UD-Q4_K_XL보다 낮은 KL)와 다르다. 이 하네스에서는 4.00이 UD-Q4_K_XL보다 KL이 높다(+3.7×10⁻³, 구분됨). 코퍼스(기술 문서·코드·한국어), 기준(BF16 gufo), 지표(KL_256)가 다르기 때문으로 본다[짐작].
