@@ -325,6 +325,51 @@ PLAN은 "27B는 matmul 전에 활성화를 Q8_1로 양자화한다"고 적었지
 
 **프로파일(`rq2d3-prof`): 실패.** 이미지의 `/opt/rocm/bin/rocprofv3`가 nix bash로 실행되면서 `libsqlite3.so.0`을 찾지 못했다(rc 127, 측정 없음).
 
+### 진단 4 (창 `rq2d-a04`)
+
+**DFlash2 고정 정책 수락률(`rq2d4-fixed`)**
+
+| 순서 | 파일 | tg t/s | 수락률 | 생성 128토큰 sha256 |
+|---|---|---:|---:|---|
+| 1 | plain-single | 10.39 | 0.432 | `6971f2de…` |
+| 2 | BF16 (분할) | 13.64 | 0.432 | `6971f2de…` |
+| 3 | BF16 (분할) | 14.14 | 0.432 | `6971f2de…` |
+| 4 | plain-single | 10.27 | 0.432 | `6971f2de…` |
+| (a03) | rot-BF16 | 7.98–8.11 | 0.311 | `3baef7d3…` |
+
+**verify·prefill logits 직접 비교(W2 수집기, corpus a01 window 1, 256 위치, BF16이 기준)**
+
+| 경로 | KL | top1 | NLL 차이 |
+|---|---:|---:|---:|
+| prefill | 2.3e-5 [1.7e-5, 3.1e-5] | 1.000 | +0.00057 |
+| verify | 2.3e-5 [1.7e-5, 3.1e-5] | 1.000 | +0.00057 |
+
+- verify KL은 prefill과 같다. **회전 verify 경로는 정확하다.**
+- 코드로도 확인했다. verify·batched 경로가 드래프터에 넘기는 features는 잔차 hidden(`scratch.decode.hidden`)에서 복사하고, 회전 커널은 이 버퍼에 쓰지 않는다.
+
+**결론: 회전 경로 버그가 아니다.**
+
+- 대조 파일 plain-single은 회전 없이 배치만 다르다. 생성한 128토큰이 BF16(분할)과 비트 단위로 같고, 수락률도 0.432로 같다.
+- 회전 BF16은 logits가 KL 2e-5 정도 다르다. 그 결과 greedy 생성 궤적이 어느 동률 근처에서 갈렸다(출력 sha256이 다르다).
+- `gufo bench`의 수락률은 합성 prompt 하나에서 나온 128토큰 궤적 하나의 값이다. 궤적이 바뀌면 수락률도 크게 바뀐다(0.432 대 0.311).
+- 앞서 본 회전 Q4의 차이(0.714 대 0.627)도 같은 단일 궤적 효과로 본다.
+- ③(수락률이 같은지)은 bench의 단일 궤적으로 판정할 수 없다. 많은 prompt나 위치에서 수락률을 모아 신뢰구간으로 판정해야 한다.
+
+**BF16 단일 파일 감속(파일 배치)의 프로파일**
+
+- 방법: ROCm 7.2.4 gpu-test `gufo bench -p 64 -n 16`의 rocprofv3 kernel trace. 첫 패스까지 들어간 전체 합계다.
+- decode GEMV 커널 평균(µs):
+
+| 커널 | BF16 분할 | plain-single | rot-BF16 |
+|---|---:|---:|---:|
+| Wave32FusedSwiGLUGEMVKernel_2Rows | 1746 | 2010 | 1931 |
+| FastGEMVBlockKernel | 750 | 779 | 785 |
+| Wave32GEMVKernel_1Row | 600 | 620 | 622 |
+| Wave32FusedSSMInputProjectionsKernel_1Row | 735 | 745 | 748 |
+
+- 단일 파일 두 개(plain, rot)는 서로 비슷하고, 분할 원본보다 3–15 % 느리다. 회전 커널(단독 회전과 회전 norm)은 run 전체에서 약 13 ms다.
+- prefill의 `BatchedExactBf16GEMMFp32VecKernel` 합계는 첫 패스(page fault) 영향이 커서 파일별 비교에 쓰지 않았다.
+
 ## 알려진 제한과 최적화 후보
 
 - decode 단독 회전은 토큰당 128 launch다(attn_out 16, ssm_out 48, ffn_down 64). 1 %를 넘으면 2단계로 간다(ssm_out을 decode 에필로그에 융합 등).
