@@ -309,10 +309,13 @@ private:
                            std::string* error_msg);
   /// Trunk rows the draft block may still read: [hidden_base_, size).
   [[nodiscard]] std::uint32_t KeptHiddenRows() const noexcept;
+  /// With `candidates`, a proposing catch-up reports them instead of the
+  /// greedy token unless `token_with_candidates` asks for both.
   bool DraftCatchUp(std::int32_t next_token, bool propose,
                     std::string* error_msg,
                     MtpCandidateLogits* candidates = nullptr,
-                    bool draft_subset = false);
+                    bool draft_subset = false,
+                    bool token_with_candidates = false);
   bool DraftReplay(std::int32_t next_token, std::vector<std::int32_t>* replay,
                    std::int32_t* hidden_row, std::string* error_msg) const;
   static bool DraftCatchUpBatch(std::span<const AdvanceRequest> requests,

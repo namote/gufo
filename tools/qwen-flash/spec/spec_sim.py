@@ -268,6 +268,22 @@ class TierPolicy(Policy):
         pass
 
 
+class TierBackoffPolicy(TierPolicy):
+    """I1 (engine.cpp PrepareDecode, C1 greedy): TierRule chains, while the production length controller still observes
+    every cycle and keeps its AR backoff (a zero Choose means an AR step); its chosen width is not used."""
+    name = "I1-tier-backoff"
+
+    def width(self, budget, context):
+        chosen = self.ctl.choose(budget, context)
+        return min(budget, self.ctl.limit) if chosen else 0
+
+    def observe(self, accepted, drafted, context, chain, mtp_drafts):
+        self.ctl.observe(accepted, drafted, context)
+
+    def observe_ar(self):
+        self.ctl.observe_ar()
+
+
 class CostConfidencePolicy(Policy):
     """P2: draft one token at a time; keep it while the expected tokens per cost improve. The acceptance of a
     draft with probability p is estimated from committed history: decayed accepted/tested counts per p bin (prior
@@ -455,9 +471,12 @@ def run(cases, header, policy_factory) -> dict:
     return {c["case"]: simulate(c, stops, policy_factory(), header["max_tokens"]) for c in cases}
 
 
-def validate(trace: Path, pairs: list) -> dict:
+POLICIES = {"P0": Policy, "I1": TierBackoffPolicy}
+
+
+def validate(trace: Path, pairs: list, policy: str = "P0") -> dict:
     header, cases = load_trace(trace)
-    sim = run(cases, header, Policy)
+    sim = run(cases, header, POLICIES[policy])
     report = {"cases": 0, "exact": 0, "completion_tokens_match": 0, "prompt_tokens_match": 0, "mismatches": []}
     for responses, suite in pairs:
         counts = spec_stats.record_counts(responses, spec_stats.load_suite_texts([suite]))
@@ -480,7 +499,7 @@ def validate(trace: Path, pairs: list) -> dict:
 
 def compare(trace: Path) -> dict:
     header, cases = load_trace(trace)
-    policies = [Policy, TierPolicy, CostConfidencePolicy, OraclePolicy]
+    policies = [Policy, TierPolicy, TierBackoffPolicy, CostConfidencePolicy, OraclePolicy]
     out = {"note": "modeled time from the C1 cycle-cost table (mtp_costs.hpp); a dropped draft adds 2 ms",
            "policies": {}}
     for factory in policies:
@@ -510,6 +529,8 @@ def main(argv=None) -> int:
     v.add_argument("--responses", type=Path, action="append", required=True)
     v.add_argument("--suite", type=Path, action="append", required=True)
     v.add_argument("--out", type=Path)
+    v.add_argument("--policy", choices=sorted(POLICIES), default="P0",
+                   help="policy the server ran (P0: c94572b3 controller, I1: confidence rule)")
     c = sub.add_parser("compare")
     c.add_argument("trace", type=Path)
     c.add_argument("--out", type=Path)
@@ -517,7 +538,7 @@ def main(argv=None) -> int:
     if a.command == "validate":
         if len(a.responses) != len(a.suite):
             ap.error("give one --suite per --responses")
-        result = validate(a.trace, list(zip(a.responses, a.suite)))
+        result = validate(a.trace, list(zip(a.responses, a.suite)), a.policy)
     else:
         result = compare(a.trace)
     text = json.dumps(result, indent=1) + "\n"

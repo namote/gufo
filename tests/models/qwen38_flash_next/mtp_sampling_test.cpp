@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -482,8 +483,54 @@ void CheckVerificationBoundaries() {
   }
 }
 
+void CheckConfidenceRule() {
+  // Kyojin TierRule: three shallow depths continue at 0.6 and keep at 0.3,
+  // deeper ones 0.95 / 0.85; the first draft is always kept.
+  using Rule = qfn::MtpConfidenceRule;
+  const auto run = [](std::initializer_list<double> probabilities) {
+    Rule rule;
+    std::uint32_t kept = 0;
+    std::uint32_t depth = 0;
+    for (const double p : probabilities) {
+      const auto step = rule.Step(depth++, p);
+      if (!step.keep)
+        break;
+      ++kept;
+      if (!step.more)
+        break;
+    }
+    return kept;
+  };
+  Require(run({0.1}) == 1, "the first draft must always be kept");
+  Require(run({0.5, 0.9}) == 1, "a first draft below 0.6 must end the chain");
+  Require(run({0.9, 0.5, 0.9}) == 2,
+          "reach 0.45 keeps the second draft and stops drafting");
+  Require(run({0.9, 0.3, 0.9}) == 1, "reach 0.27 must drop the second draft");
+  // 0.99^5 = 0.951 continues; 0.99^6 = 0.941 is kept but stops the chain.
+  Require(run({0.99, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99}) == 6,
+          "deep drafts need reach 0.95 to continue");
+  Require(run({1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0}) == 7,
+          "certain drafts fill the chain");
+  Require(run({1.0, 1.0, 1.0, 0.9}) == 4 && run({1.0, 1.0, 1.0, 0.8}) == 3,
+          "a fourth draft is kept at reach 0.85");
+  Require(run({-1.0, 1.0}) == 1, "an unscored first draft stops the chain");
+
+  qfn::MtpCandidateLogits c;
+  c.size = 3;
+  c.ids = {7, 4, 9};
+  c.logits = {2.0F, 1.0F, 0.0F};
+  const double total = 1.0 + std::exp(-1.0) + std::exp(-2.0);
+  Require(
+      std::abs(qfn::DraftConfidence(c, 7) - 1.0 / total) < 1e-12 &&
+          std::abs(qfn::DraftConfidence(c, 4) - std::exp(-1.0) / total) < 1e-12,
+      "draft confidence is the candidate softmax");
+  Require(qfn::DraftConfidence(c, 5) == -1.0,
+          "a token outside the candidates has no confidence");
+}
+
 int main() {
   try {
+    CheckConfidenceRule();
     CheckVerificationBoundaries();
     CheckLengthController();
     CheckOccupancyOverride();

@@ -646,7 +646,8 @@ bool Session::DraftReplay(std::int32_t next_token,
 
 bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
                            std::string* error_msg,
-                           MtpCandidateLogits* candidates, bool draft_subset) {
+                           MtpCandidateLogits* candidates, bool draft_subset,
+                           bool token_with_candidates) {
   std::vector<std::int32_t> replay;
   std::int32_t hidden_row = 0;
   if (!DraftReplay(next_token, &replay, &hidden_row, error_msg))
@@ -656,7 +657,9 @@ bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
   auto& exec = *model_->executor_;
   if (!exec.MtpForward(
           *session_, replay, hidden_row,
-          {.token = propose && candidates == nullptr ? &draft_token_ : nullptr,
+          {.token = propose && (candidates == nullptr || token_with_candidates)
+                        ? &draft_token_
+                        : nullptr,
            .candidates = candidates,
            .kv_only = !propose,
            .draft_subset = draft_subset},
@@ -1038,13 +1041,26 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   pending->policy_concurrency = MtpPolicyConcurrency(
       sampler.config().uses_random_sampling(), sampler.config().seed >= 0,
       batch_drafts.has_value(), occupancy);
+  // A lone greedy request on a single-session model stops its chain by draft
+  // confidence (MtpConfidenceRule). The length controller still observes
+  // every cycle and decides its AR backoff; its chosen width is not used.
+  const bool confidence_rule = !sampler.config().uses_random_sampling() &&
+                               !batch_drafts && !defer_head && occupancy == 1 &&
+                               model_->DecodeConcurrency() == 1;
+  const auto choose = [&] {
+    const auto chosen =
+        draft_length_.Choose(static_cast<std::uint32_t>(cap - 1),
+                             static_cast<std::uint32_t>(tokens_.size()),
+                             pending->policy_concurrency);
+    return confidence_rule && chosen != 0
+               ? std::min<std::uint32_t>(static_cast<std::uint32_t>(cap - 1),
+                                         draft_length_.Limit())
+               : chosen;
+  };
   const std::size_t width =
       MtpEnabled() && cap > 1
           ? 1 + (batch_drafts ? std::min<std::uint32_t>(*batch_drafts, cap - 1)
-                              : draft_length_.Choose(
-                                    static_cast<std::uint32_t>(cap - 1),
-                                    static_cast<std::uint32_t>(tokens_.size()),
-                                    pending->policy_concurrency))
+                              : choose())
           : cap;
   if (width == 0) {
     result->stop = true;
@@ -1123,14 +1139,27 @@ bool Session::PrepareDecode(const DecodeRequest& request,
         1 + draft_length_.Choose(static_cast<std::uint32_t>(cap - 1), base,
                                  pending->policy_concurrency, true);
   }
+  const bool candidates = sampled || confidence_rule;
   if (!defer_head && !DraftCatchUp(anchor, true, error_msg,
-                                   sampled ? &pending->candidates : nullptr,
-                                   pending->draft_subset)) {
+                                   candidates ? &pending->candidates : nullptr,
+                                   pending->draft_subset, confidence_rule)) {
     return false;
   }
   pending->draft = draft_token_;
   if (!defer_head) {
+    MtpConfidenceRule rule;
     while (pending->chain.size() < pending->width) {
+      bool more = true;
+      if (confidence_rule) {
+        const auto step =
+            rule.Step(static_cast<std::uint32_t>(pending->chain.size() - 1),
+                      DraftConfidence(pending->candidates, pending->draft));
+        if (!step.keep) {
+          pending->width = pending->chain.size();
+          break;
+        }
+        more = step.more;
+      }
       AppendDraft(*pending);
       if (stop_at_eos && model_->IsStopToken(pending->chain.back())) {
         pending->width = pending->chain.size();
@@ -1139,11 +1168,15 @@ bool Session::PrepareDecode(const DecodeRequest& request,
       if (AppendLookup(*pending, stop_at_eos)) {
         break;
       }
+      if (!more) {
+        pending->width = pending->chain.size();
+        break;
+      }
       if (pending->chain.size() < pending->width &&
           !exec.MtpForward(
               *session_, std::span<const std::int32_t>(&pending->draft, 1), -1,
               {.token = sampled ? nullptr : &pending->draft,
-               .candidates = sampled ? &pending->candidates : nullptr,
+               .candidates = candidates ? &pending->candidates : nullptr,
                .draft_subset = pending->draft_subset},
               error_msg)) {
         return false;

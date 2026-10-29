@@ -9,6 +9,7 @@
 #include <span>
 
 #include "src/models/qwen38_flash_next/mtp_costs.hpp"
+#include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 
 namespace gufo::models::qwen38_flash_next {
 
@@ -125,6 +126,8 @@ public:
     state_.failed_depths = 0;
   }
 
+  [[nodiscard]] std::uint32_t Limit() const noexcept { return limit_; }
+
   [[nodiscard]] MtpLengthState State() const noexcept { return state_; }
 
   [[nodiscard]] bool Restore(const MtpLengthState& state) noexcept {
@@ -183,6 +186,61 @@ private:
   std::uint32_t limit_;
   std::uint32_t concurrency_;
   MtpLengthState state_{};
+};
+
+/// Softmax probability of a drafted `token` over the head's reported top
+/// candidates, or -1 when the token is not among them (the draft is their
+/// argmax, so this is not expected). qwen38_flash_next_gpu_probe --mtp-trace
+/// reports the same value; tools/qwen-flash/spec/spec_sim.py replays it.
+[[nodiscard]] inline double DraftConfidence(const MtpCandidateLogits& c,
+                                            std::int32_t token) noexcept {
+  std::size_t self = c.size;
+  float peak = -INFINITY;
+  for (std::size_t i = 0; i < c.size; ++i) {
+    peak = std::max(peak, c.logits[i]);
+    if (static_cast<std::int32_t>(c.ids[i]) == token && self == c.size)
+      self = i;
+  }
+  if (self == c.size)
+    return -1.0;
+  double sum = 0.0;
+  for (std::size_t i = 0; i < c.size; ++i)
+    sum += std::exp(static_cast<double>(c.logits[i]) - peak);
+  return std::exp(static_cast<double>(c.logits[self]) - peak) / sum;
+}
+
+/// Single-session greedy chain length by draft confidence (TierRule of
+/// Yamz-Labs/kyojin tools/qwen/spec_policy.py at 2132bd24, MIT): the reach is
+/// the product of the drafts' probabilities. The first three depths continue
+/// while it is at least 0.6 and keep a draft at 0.3; deeper drafts need 0.95
+/// and 0.85. The first draft is always kept. A dropped draft was computed but
+/// is not verified. Offline replay of the M0 serving prompts (plan W9 M1)
+/// models +9 % decode over choosing the length before drafting.
+struct MtpDraftStep {
+  bool keep;  ///< verify this draft
+  bool more;  ///< draft another one after it
+};
+class MtpConfidenceRule {
+public:
+  static constexpr double kContinue = 0.6;
+  static constexpr double kKeep = 0.3;
+  static constexpr double kDeepContinue = 0.95;
+  static constexpr double kDeepKeep = 0.85;
+  static constexpr std::uint32_t kShallowDepths = 3;
+
+  /// `depth` counts drafts from 0; `probability` is DraftConfidence.
+  [[nodiscard]] MtpDraftStep Step(std::uint32_t depth,
+                                  double probability) noexcept {
+    reach_ *= probability;
+    const std::uint32_t drafts = depth + 1;
+    if (depth > 0 && reach_ < (drafts <= kShallowDepths ? kKeep : kDeepKeep))
+      return {false, false};
+    return {true,
+            !(reach_ < (drafts < kShallowDepths ? kContinue : kDeepContinue))};
+  }
+
+private:
+  double reach_{1.0};
 };
 
 // Runtime costs belong to a physical batch, not an individual sequence.
