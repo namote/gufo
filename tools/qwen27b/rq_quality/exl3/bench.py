@@ -59,20 +59,27 @@ def mode_pptg(a, torch) -> dict:
     config = Config.from_directory(a.model_dir)
     model = Model.from_config(config)
     cache = Cache(model, max_num_tokens=cap, layer_type=CacheLayer_fp16, max_batch_size=1)
-    model.load(progressbar=False, max_chunk_size=a.chunk, max_batch_size=1)
+    # --fill-single prefills the depth context in one chunk from an empty cache: upstream 1.6.5's
+    # paged prefill kernel with cached past context asks for 128 KB of LDS at head_dim 256 on
+    # gfx1151 (64 KB) and fails (w8sp-a01), while a prefill from position 0 runs.
+    load_chunk = max(a.chunk, max(depths)) if a.fill_single else a.chunk
+    model.load(progressbar=False, max_chunk_size=load_chunk, max_batch_size=1)
     load_s = time.perf_counter() - t0
     ids = torch.as_tensor(need_tokens(toks, cap)[None])
-    out = dict(mode="pptg", load_s=load_s, cache_tokens=cap, pp=a.pp, tg=a.tg, chunk=a.chunk, results=[])
+    kinds = a.kinds.split(",")
+    out = dict(mode="pptg", load_s=load_s, cache_tokens=cap, pp=a.pp, tg=a.tg, chunk=a.chunk,
+               fill_single=bool(a.fill_single), kinds=kinds, results=[])
 
     def fill(state, depth):
         base = {"attn_mode": "flash_attn", "cache": cache, "batch_shape": (1, cap), "recurrent_states": [state]}
-        for s in range(0, depth, a.chunk):
-            e = min(depth, s + a.chunk)
+        step = depth if a.fill_single else a.chunk
+        for s in range(0, depth, max(step, 1)):
+            e = min(depth, s + step)
             model.prefill(ids[:, s:e], dict(base, past_len=s))
         return base
 
     for depth in depths:
-        for kind in ("pp", "tg"):
+        for kind in kinds:
             rates = []
             for rep in range(a.reps + 1):  # first is warm-up
                 state = cache.get_new_state()
@@ -126,8 +133,11 @@ def mode_chat(a, torch) -> dict:
     prompts = json.loads(a.prompts.read_text())["prompts"]
 
     def one(text):
-        ids = tokenizer.hf_chat_template(messages=[{"role": "user", "content": text}],
-                                         add_generation_prompt=True, enable_thinking=False)
+        # The pack's chat_template.jinja for one user turn, add_generation_prompt, enable_thinking false
+        # (no system block without tools or reasoning instructions). hf_chat_template needs transformers,
+        # which the image does not carry (w8sp-a01).
+        prompt = f"<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        ids = tokenizer.encode(prompt, add_bos=False, encode_special_tokens=True)
         job = Job(input_ids=ids, max_new_tokens=a.max_tokens, stop_conditions=config.eos_token_id_list,
                   sampler=GreedySampler())
         gen.enqueue(job)
@@ -204,6 +214,8 @@ def main(argv=None) -> int:
     ap.add_argument("--depths", default="0,32768")
     ap.add_argument("--chunk", type=int, default=2048)
     ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--kinds", default="pp,tg", help="pptg: which of pp,tg to run at every depth")
+    ap.add_argument("--fill-single", action="store_true", help="pptg: prefill the depth context in one chunk")
     ap.add_argument("--prompts", type=Path, default=Path("/src/tools/qwen27b/rq_quality/accept_prompts.json"))
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--draft", choices=("none", "mtp"), default="none")
