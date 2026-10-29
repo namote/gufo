@@ -88,6 +88,28 @@ R2 ② 판정은 W3/감독이 [R2 결과](R2-RESULTS.md)에서 한다. 여기에
   - verify와 decode 평균은 기준보다 크다. decode 평균은 pos 2537 하나가 대부분이다.
   - top-1은 세 경로 모두 Q8_0(0.9795/0.9870/0.9827)보다 높다.
 
+## RQ2I: gufo 대 llama.cpp 로더 교차 확인 (설계, 2026-10-29, W2 담당)
+
+- **목적:** 같은 prism Q4 파일과 같은 토큰으로 gufo와 upstream llama.cpp의 logits를 비교한다. 회전 파일의 KL이 비회전 파일과 같은 차수면 gufo 로더가 맞다. 로더 오류는 KL 0.1 이상으로 드러난다(감독 기준).
+- **실행 파일:** `qwen27b_rq_kld_base`(`tests/models/qwen27b/rq_kld_base.cpp`, 커밋 `526c4e71`). sha256 `11400fc820b635a65eda512cfdf9ecd2f273ce59ebe41a9e4df955236096d09f`이고, `build/rq-w2-prism-gpu-test`에서 빌드했다.
+  - 소스 스냅샷은 HEAD `5c3422ff`의 `src`와 같다. 이후 `src` 변경이 없다.
+  - 같은 트리의 `qwen27b_rq_logits`는 `b5219f1b…`로 바뀌지 않았다.
+- **동작:** upstream `8ab29fae` `tools/perplexity/perplexity.cpp`의 `--kl-divergence-base` 파일을 쓴다.
+  - 헤더 `_logits_`, n_ctx, n_vocab, n_chunk, tokens.
+  - 위치 n_ctx/2 … n_ctx−2의 행. 행은 llama `log_softmax` uint16 인코딩이다.
+  - chunk c는 코퍼스 a01 window (c % 8)의 토큰 [512·(c/8), +512)이다. chunk마다 executor를 새로 시작하고, logits는 운영 prefill 헤드(`LaunchQwenOutputHead`)로 낸다.
+- **CPU 테스트:** `--encode-rows` 모드(GPU 없음)의 C++ 인코딩을 Python `logits_io.llama_encode_row`와 비교한다(`rq_quality_test.py`, `GUFO_RQ_KLD_BASE`).
+  - 행 4개를 썼다: 일반, 범위 > 16, scale 0, 동률이 많은 행. q 값과 scale은 같고, min_log_prob는 4 ulp 안이다.
+  - 통과했다(25개, 1개는 환경 변수가 없어 건너뜀).
+- **GPU 창(`PLAN-RQ2I.json`, model `rq2i-gufo`, 약 5분):**
+  - 대상: rot-prism UD-copy Q4(`107e9b11…`)와 plain-prism UD-copy Q4(`b1a830cc…`).
+  - 설정: n_ctx 512, 16 chunk. 파일마다 2.03 GB(`llama_kld_base_bytes`)이고 receipt 아래에 쓴다.
+- **CPU 단계(창 뒤):** W1의 `build/rq-llama-prism/build/bin/llama-perplexity`(upstream `8ab29fae`, CPU)를 eval 이미지에서 파일마다 돌린다.
+  - 명령: `-m <같은 GGUF> --kl-divergence-base <gufo 파일> --kl-divergence -c 512 -b 512 --chunks 16 -t 16`
+  - 토큰: llama.cpp는 KL 모드에서 토큰을 base 파일에서 읽는다(토큰화하지 않음). Qwen3.8 GGUF에는 `tokenizer.ggml.add_bos_token` 키가 없어 BPE 기본값(add_bos false)이 적용된다. 그래서 gufo가 쓴 토큰을 그대로 쓴다.
+  - 예상 시간: 파일마다 약 3–6분이다(W1의 BF16 실적 342 s보다 짧을 것, 짐작). 최대 RSS 약 20 GB다.
+- **판정:** llama의 Mean/Median KLD와 Same top p를 rot 파일과 plain 파일에서 비교한다.
+
 ## 평가 코퍼스 a01
 
 - 위치: `~/projects/ai.tools/storage/evaluations/rq-r0-20261029/corpus-a01/`(`SHA256SUMS` 포함). manifest 사본: `tools/qwen27b/rq_quality/corpus_manifest.json`. 빌더 `tools/qwen27b/rq_quality/corpus.py`, 소스 리비전 `f95d1302`, tokenizer는 HF `tokenizer.json`(sha256은 manifest). 두 번 빌드해 바이트 단위로 같았다.
