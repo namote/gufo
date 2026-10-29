@@ -21,7 +21,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 import numpy as np  # noqa: E402
 
 from gufo import gguf as shared_gguf  # noqa: E402
-from rotquant import check_rotated, convert  # noqa: E402
+from rotquant import check_rotated, convert, realign  # noqa: E402
 from rotquant.gguf_io import OutTensor, U32, as_float32, encode_value, open_gguf, write_gguf  # noqa: E402
 from rotquant.hadamard import (BLOCK_SIZE, bf16_bits_to_f32, f32_to_bf16_bits,  # noqa: E402
                                rotate_last_axis, signs, sylvester)
@@ -653,6 +653,62 @@ class ConverterTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(check_rotated.main(["--groups", "qwen27b", "--seed", "12", "--source",
                                                  str(self.split[0]), "--rotated", str(rot)]), 1)
+
+    def test_output_is_256_byte_aligned(self):
+        # Inputs use the GGUF default of 32; the converter writes 256.
+        with open_gguf(self.split[0]) as model:
+            self.assertEqual(model.alignment, 32)
+        for groups, seed in (("all", ["--seed", 3]), ("none", [])):
+            with self.subTest(groups=groups):
+                out = self.dir / f"aligned-{groups}.gguf"
+                code, _, err = run_cli("--groups", "qwen27b", "--input", self.split[0], "--rotate-groups", groups,
+                                       *seed, "--rotate-only", "--output", out)
+                self.assertEqual(code, 0, err)
+                state = shared_gguf.parse_gguf(out)
+                self.assertEqual(state["metadata"]["general.alignment"], 256)
+                self.assertEqual(state["data_offset"] % 256, 0)
+                raw = out.read_bytes()
+                with open_gguf(out) as model, open_gguf(self.split[0]) as source:
+                    self.assertEqual(model.shards[0].data_offset, state["data_offset"])
+                    for tensor in model.tensors:
+                        start = state["data_offset"] + tensor.offset
+                        self.assertEqual(start % 256, 0, tensor.name)
+                        self.assertEqual(raw[start:start + tensor.nbytes], bytes(model.tensor_bytes(tensor)))
+                        if groups == "none":
+                            self.assertEqual(bytes(model.tensor_bytes(tensor)),
+                                             bytes(source.tensor_bytes(source.by_name[tensor.name])), tensor.name)
+                    self.assertEqual(sum(key == "general.alignment" for key, _ in model.kv_raw), 1)
+        # An input that already records an alignment is rewritten, not duplicated.
+        aligned = self.dir / "a64.gguf"
+        write_gguf(aligned, kv_entries(), out_tensors(self.tensors), 64)
+        with open_gguf(aligned) as model:
+            self.assertEqual(model.alignment, 64)
+        out = self.dir / "from-a64.gguf"
+        code, _, err = run_cli("--groups", "qwen27b", "--input", aligned, "--rotate-groups", "none",
+                               "--rotate-only", "--output", out)
+        self.assertEqual(code, 0, err)
+        with open_gguf(out) as model:
+            self.assertEqual(model.alignment, 256)
+            self.assertEqual(sum(key == "general.alignment" for key, _ in model.kv_raw), 1)
+        with self.assertRaises(ValueError):
+            write_gguf(self.dir / "bad.gguf", [], [], 48)
+
+    def test_realign_keeps_bytes(self):
+        out = self.dir / "realigned.gguf"
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(realign.main(["--input", str(self.split[1]), "--output", str(out)]), 0)
+        state = shared_gguf.parse_gguf(out)
+        self.assertEqual(state["metadata"]["general.alignment"], 256)
+        self.assertNotIn("split.count", state["metadata"])
+        with open_gguf(out) as model, open_gguf(self.split[0]) as source:
+            self.assertEqual([t.name for t in model.tensors], [t.name for t in source.tensors])
+            for tensor in model.tensors:
+                self.assertEqual((model.shards[0].data_offset + tensor.offset) % 256, 0)
+                self.assertEqual(bytes(model.tensor_bytes(tensor)),
+                                 bytes(source.tensor_bytes(source.by_name[tensor.name])))
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(realign.main(["--input", str(self.split[0]), "--output", str(out)]), 2)
+        self.assertIn("refusing to overwrite", err.getvalue())
 
     def test_nextn_blocks_are_not_rotated(self):
         tensors = dict(self.tensors)

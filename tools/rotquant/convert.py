@@ -110,7 +110,7 @@ def rotate_file(model, plan, output, source_sha256: str) -> None:
     added.update(provenance(plan, with_types=False, source_sha256=source_sha256,
                             source_file=Path(model.paths[0]).name))
     kv_raw += [(key, encode_value(value)) for key, value in added.items()]
-    write_gguf(output, kv_raw, tensors, model.alignment)
+    write_gguf(output, kv_raw, tensors)
 
 
 def provenance(plan, *, with_types: bool, source_sha256=None, source_file=None) -> dict:

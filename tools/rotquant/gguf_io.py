@@ -21,6 +21,11 @@ SPLIT_KEYS = ("split.no", "split.count", "split.tensors.count")
 SPLIT_NAME = re.compile(r"^(.*)-([0-9]+)-of-([0-9]+)\.gguf$")
 GGUF_VERSION = 3
 DEFAULT_ALIGNMENT = 32
+# Written files align the data section and every tensor to 256 bytes. With
+# the GGUF default of 32 the data section starts at 32 mod 128 in practice,
+# and unaligned weight rows slow the decode GEMV (R2 results).
+WRITE_ALIGNMENT = 256
+ALIGNMENT_KEY = "general.alignment"
 
 # GGUF metadata value tags.
 T_U32, T_I32, T_F32, T_BOOL, T_STRING, T_ARRAY, T_U64 = 4, 5, 6, 7, 8, 9, 10
@@ -249,8 +254,19 @@ class OutTensor:
         return type_size(self.type_name, count, self.ne[0])
 
 
-def write_gguf(path, kv_raw: list, tensors: list, alignment: int) -> None:
-    """Write a single-file GGUF v3; tensor payloads are streamed by callbacks."""
+def write_gguf(path, kv_raw: list, tensors: list, alignment: int = WRITE_ALIGNMENT) -> None:
+    """Write a single-file GGUF v3; tensor payloads are streamed by callbacks.
+
+    The data section and every tensor start on an `alignment` boundary of the
+    file (256 bytes by default); `general.alignment` records it whenever it
+    differs from the GGUF default. Any incoming `general.alignment` is
+    replaced. Test fixtures pass 32 to produce default-aligned inputs.
+    """
+    if alignment < DEFAULT_ALIGNMENT or alignment & (alignment - 1):
+        raise ValueError(f"alignment {alignment} must be a power of two >= {DEFAULT_ALIGNMENT}")
+    kv_raw = [(key, raw) for key, raw in kv_raw if key != ALIGNMENT_KEY]
+    if alignment != DEFAULT_ALIGNMENT:
+        kv_raw.append((ALIGNMENT_KEY, encode_value(U32(alignment))))
     header = bytearray(b"GGUF")
     header += struct.pack("<IQQ", GGUF_VERSION, len(tensors), len(kv_raw))
     for key, raw in kv_raw:
