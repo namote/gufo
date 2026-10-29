@@ -690,6 +690,14 @@ if (BUILD_TESTING)
   set_tests_properties(kernel_resources_parser_test PROPERTIES
     LABELS "cpu;kernels" TIMEOUT 30)
 
+  # Rotated-weight converter on synthetic tensors; needs NumPy, so it stays
+  # out of the hosted check-pr set (see cmake/Checks.cmake).
+  add_test(NAME rotquant_test
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/rotquant_test.py)
+  set_tests_properties(rotquant_test PROPERTIES
+    LABELS "cpu;tools;quantization" TIMEOUT 60)
+
   add_test(NAME check_docs_test
     COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/check_docs_test.py)

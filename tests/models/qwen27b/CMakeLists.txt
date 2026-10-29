@@ -2,6 +2,10 @@
 add_test(NAME qwen27b.tools
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools_test.py)
 set_tests_properties(qwen27b.tools PROPERTIES LABELS "cpu;qwen27b;tools")
+add_test(NAME qwen27b.rotquant-groups
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/rotquant_groups_test.py)
+set_tests_properties(qwen27b.rotquant-groups PROPERTIES
+  LABELS "cpu;qwen27b;tools;quantization" TIMEOUT 30)
 
 function(add_qwen27b_test target source labels)
   add_executable(${target} ${CMAKE_CURRENT_SOURCE_DIR}/${source})
