@@ -289,6 +289,7 @@ K는 모두 128의 배수다. `token_embd`는 행 조회라 회전 대상이 아
   - **명세 대응 결과(W1, [R1C-PRISM-MAPPING.md](R1C-PRISM-MAPPING.md)):** upstream은 부호 벡터를 입력 폭마다 하나 둔다(27B는 s₅₁₂₀: attn_in·ffn_in·head_in, s₆₁₄₄: ssm_out_in·attn_out_in, s₁₇₄₀₈: ffn_down_in). v1 파일(그룹·층별 부호)은 바이트를 보존한 채 옮길 수 없으므로 원본에서 다시 변환한다(회전 BF16 약 160 s, 회전 Q4 약 142 s). R2 ③(RQ2E)은 새 파일로 잰다. R2 ②(RQ2B, v1)는 회전·융합 커널 수학의 검증으로 남기고, 새 파일에서 다시 확인한다.
   - **`ssm_alpha`/`ssm_beta` (사용자 결정 2026-10-29):** upstream 허용 목록에 없으므로 회전하지 않는다. gufo는 DeltaNet 층의 이 경로에 원래 기저 활성화를 넘긴다(W3).
   - 출처 KV는 `gufo.rotation.source_*`를 유지한다. 교차 검증용 upstream 고정 리비전은 `8ab29fae`(master, `a9d27ac6` 이후)다.
+  - **부호 없는 회전 대조 (사용자 결정 2026-10-29, "우리도 그거 써보자"):** KVarN(`attention_kvarn.hip:108`)은 부호 없이 정규화 Hadamard만 쓴다. volta-hadamard는 무작위 부호가 Q2_K에서 더 나빴다고 보고했다. 그래서 D = I(모든 부호 +1, explicit 모드로 기록) 회전 파일을 만든다. 쓰는 곳은 R2 ② 꼬리 진단(v1 부호, prism 부호, 부호 없음 셋을 비교)과 E1 대조(무작위 부호 대 부호 없음)다. 컨버터 옵션은 W1이 만든다.
   - 위험: 이 지원이 없는 llama.cpp(우리 기준 b11069 포함)는 이 파일을 평범한 `qwen35`로 읽어 조용히 틀린 출력을 낸다. 지금의 "llama.cpp 거부" 보호가 사라진다. 배포 문서에 최소 llama.cpp 버전을 적는다.
 
 ## 위험
