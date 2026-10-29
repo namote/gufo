@@ -84,6 +84,14 @@ class Reference:
 
 
 def main(argv=None) -> int:
+    import torch
+    # ExLlamaV3 allocates its cache and recurrent-state tensors as inference tensors; creating or
+    # clearing a recurrent state outside InferenceMode raises (w8s-a02), so the whole run is inside it.
+    with torch.inference_mode():
+        return run(argv)
+
+
+def run(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("model_dir")
     ap.add_argument("--windows", required=True, type=Path)
@@ -144,8 +152,8 @@ def main(argv=None) -> int:
         tw = time.perf_counter()
         if a.path == "prefill":
             positions = np.arange(len(tok) - 1)
-            with torch.inference_mode():
-                logits = model.forward(torch.as_tensor(tok[None]), {"attn_mode": "flash_attn_nc"})[0]
+            # The forward returns logits for every token; the last one predicts past the window.
+            logits = model.forward(torch.as_tensor(tok[None]), {"attn_mode": "flash_attn_nc"})[0][:len(positions)]
             torch.cuda.synchronize()
             forward_ms = (time.perf_counter() - tw) * 1e3
             rows = [(logits[s:s + a.row_chunk], positions[s:s + a.row_chunk])
@@ -161,7 +169,7 @@ def main(argv=None) -> int:
                 model.prefill(torch.as_tensor(tok[None, :a.prefix]), dict(base, past_len=0))
                 for p in positions:
                     params = dict(base, past_len=int(p), recurrent_states=[state])
-                    outs.append(model.forward(torch.as_tensor(tok[None, p:p + 1]), params)[0, -1:].float())
+                    outs.append(model.forward(torch.as_tensor(tok[None, p:p + 1]), params)[0, -1:])
                     state = params["recurrent_states"][0]
             cache.release_state(state)
             torch.cuda.synchronize()

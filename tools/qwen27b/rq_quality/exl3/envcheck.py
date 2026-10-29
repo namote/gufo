@@ -31,6 +31,12 @@ def kernel_table(prof) -> list[dict]:
 
 
 def main(argv=None) -> int:
+    import torch
+    with torch.inference_mode():  # ExLlamaV3 cache / recurrent-state tensors are inference tensors
+        return run(argv)
+
+
+def run(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("model_dir")
     ap.add_argument("--windows", required=True, type=Path)
@@ -72,18 +78,23 @@ def main(argv=None) -> int:
         state = cache.get_new_state()
         base["recurrent_states"] = [state]
         torch.cuda.synchronize()
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-            model.prefill(torch.as_tensor(tokens[None, :n]), dict(base, past_len=0))
-            torch.cuda.synchronize()
-        report["prefill_kernels"] = kernel_table(prof)
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-            for i in range(a.decode_steps):
-                logits = model.forward(torch.as_tensor(tokens[None, n + i:n + i + 1]),
-                                       dict(base, past_len=n + i, recurrent_states=[state]))
-            torch.cuda.synchronize()
-        report["decode_kernels"] = kernel_table(prof)
-        report["decode_logits_shape"] = list(logits.shape)
-        report["decode_logits_dtype"] = str(logits.dtype)
+        try:
+            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+                model.prefill(torch.as_tensor(tokens[None, :n]), dict(base, past_len=0))
+                torch.cuda.synchronize()
+            report["prefill_kernels"] = kernel_table(prof)
+            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+                for i in range(a.decode_steps):
+                    logits = model.forward(torch.as_tensor(tokens[None, n + i:n + i + 1]),
+                                           dict(base, past_len=n + i, recurrent_states=[state]))
+                torch.cuda.synchronize()
+            report["decode_kernels"] = kernel_table(prof)
+            report["decode_logits_shape"] = list(logits.shape)
+            report["decode_logits_dtype"] = str(logits.dtype)
+        except Exception as exc:  # keep the versions and load facts even if profiling fails
+            report["profile_error"] = repr(exc)
+            report.setdefault("prefill_kernels", []); report.setdefault("decode_kernels", [])
+        report["torch_peak_allocated_bytes"] = int(torch.cuda.max_memory_allocated())
     cache.release_state(state)
     a.out.write_text(json.dumps(report, indent=1) + "\n")
     for key in ("prefill_kernels", "decode_kernels"):
