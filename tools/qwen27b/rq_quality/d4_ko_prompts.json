@@ -1,0 +1,113 @@
+{
+ "schema": "gufo.rq-d4-ko-prompts.v1",
+ "status": "draft 2026-10-29 (W2). Judging thresholds are set by the user after R0; `checks` are proposed automatic checks only.",
+ "source": "Written for this set by the W2 agent on 2026-10-29 (MIT, this repository). No text is taken from the R0 evaluation corpus (tools/qwen27b/rq_quality/corpus_manifest.json) or from repository documents, so it cannot overlap the R0 corpus or an R3 calibration corpus built from other sources.",
+ "request_defaults": {"temperature": 0, "max_tokens": 768, "chat_template_kwargs": {"enable_thinking": false}},
+ "prompts": [
+  {
+   "id": "ko-instr-01", "category": "instruction",
+   "messages": [{"role": "user", "content": "다음 조건을 모두 지켜서 동네 도서관의 주말 독서 모임 안내문을 써 줘. 1) 정확히 세 문단 2) 각 문단은 두 문장 3) 존댓말 4) 날짜는 11월 7일 토요일 오후 2시로 적을 것 5) 마지막 문장은 질문으로 끝낼 것."}],
+   "checks": {"language": "ko", "paragraphs": 3, "sentences_per_paragraph": 2, "must_contain": ["11월 7일", "오후 2시"], "ends_with": "?"}
+  },
+  {
+   "id": "ko-instr-02", "category": "instruction",
+   "messages": [{"role": "system", "content": "모든 답은 JSON 객체 하나로만 한다. 설명 문장은 쓰지 않는다."}, {"role": "user", "content": "김밥 재료 다섯 가지를 골라 이름(name)과 손질 방법(prep, 한 문장)을 담은 배열 ingredients로 돌려줘."}],
+   "checks": {"json": true, "json_path_len": {"ingredients": 5}, "json_keys_each": {"ingredients": ["name", "prep"]}}
+  },
+  {
+   "id": "ko-instr-03", "category": "instruction",
+   "messages": [{"role": "user", "content": "아래 문장을 초등학교 3학년이 이해할 수 있게 한 문장으로 바꿔 줘. 원래 뜻은 유지하고 영어 단어는 쓰지 마.\n\n\"기온이 급격히 하강하면 수도 배관 내부의 물이 동결·팽창하여 관이 파열될 수 있으므로, 외출 시에는 수도꼭지를 약하게 열어 두는 것이 권장된다.\""}],
+   "checks": {"language": "ko", "sentences": 1, "no_latin": true}
+  },
+  {
+   "id": "ko-instr-04", "category": "instruction",
+   "messages": [{"role": "user", "content": "1부터 20까지의 수 가운데 3의 배수이면서 짝수인 수를 쉼표로 구분해 한 줄로만 써 줘. 다른 말은 붙이지 마."}],
+   "checks": {"exact": "6, 12, 18", "exact_normalize": "remove_spaces"}
+  },
+  {
+   "id": "ko-instr-05", "category": "instruction",
+   "messages": [{"role": "user", "content": "회사 동료에게 보낼 회의 일정 변경 메일을 써 줘. 제목 줄은 '제목:'으로 시작하고, 본문은 다섯 줄 이내, 변경된 시간은 목요일 오전 10시 30분, 장소는 3층 작은 회의실이야."}],
+   "checks": {"language": "ko", "starts_with": "제목:", "max_body_lines": 5, "must_contain": ["목요일", "10시 30분", "3층"]}
+  },
+  {
+   "id": "ko-sum-01", "category": "summary",
+   "messages": [{"role": "user", "content": "다음 글을 두 문장으로 요약해 줘.\n\n올해 가을, 한 지방 소도시의 시립 수영장은 운영 시간을 저녁 9시에서 10시로 한 시간 늘렸다. 시는 퇴근 뒤 운동하려는 직장인이 늘었다는 설문 결과를 근거로 들었다. 연장 첫 달 저녁 이용자는 하루 평균 140명에서 190명으로 늘었지만, 인건비와 난방비가 함께 올라 월 운영 적자도 약 800만 원 커졌다. 시의회 일부 의원은 요금을 올리지 말고 오전 이른 시간대를 줄여 비용을 맞추자고 제안했다. 시는 석 달 동안 시간대별 이용자를 더 모은 뒤 내년 예산에 반영하겠다고 밝혔다."}],
+   "checks": {"language": "ko", "sentences": 2, "must_contain_any": [["190", "늘"], ["적자", "비용"]]}
+  },
+  {
+   "id": "ko-sum-02", "category": "summary",
+   "messages": [{"role": "user", "content": "아래 회의 메모에서 결정된 사항만 글머리표로 뽑아 줘. 논의만 하고 결정하지 않은 것은 빼.\n\n- 신규 앱 출시일: 12월 1일로 확정\n- 로그인 화면 색상: 파랑과 초록 중 다음 주에 다시 논의\n- 베타 테스터 모집 인원: 200명으로 결정\n- 고객센터 운영 시간 연장: 비용 검토 후 결정 예정\n- 출시 전 보안 점검: 외부 업체에 맡기기로 함"}],
+   "checks": {"bullets": 3, "must_contain": ["12월 1일", "200명", "보안"], "must_not_contain": ["색상", "고객센터"]}
+  },
+  {
+   "id": "ko-sum-03", "category": "summary",
+   "messages": [{"role": "user", "content": "Summarize the following Korean customer review in one English sentence, then give its sentiment as positive, negative or mixed on a second line.\n\n배송은 예정보다 이틀 빨랐고 포장도 꼼꼼했어요. 그런데 의자 높이 조절 레버가 처음부터 뻑뻑해서 고객센터에 문의했더니, 사흘째 답이 없네요. 앉았을 때 편한 건 마음에 들어요."}],
+   "checks": {"lines": 2, "line2_in": ["mixed"]}
+  },
+  {
+   "id": "ko-sum-04", "category": "summary",
+   "messages": [{"role": "user", "content": "다음 대화를 읽고, 민지가 결국 무엇을 하기로 했는지 한 문장으로 답해 줘.\n\n준호: 이번 주말에 등산 갈래?\n민지: 토요일은 동생 이사 도와줘야 해.\n준호: 그럼 일요일은?\n민지: 일요일 오전엔 비 온대. 오후에 근처 공원 산책은 어때?\n준호: 좋아, 3시에 공원 입구에서 보자.\n민지: 응, 그때 봐."}],
+   "checks": {"language": "ko", "sentences": 1, "must_contain_any": [["일요일"], ["공원", "산책"], ["3시"]]}
+  },
+  {
+   "id": "ko-sum-05", "category": "summary",
+   "messages": [{"role": "user", "content": "아래 공지에서 신청 마감일, 신청 방법, 대상만 표로 정리해 줘.\n\n[구민 텃밭 분양 안내] 내년 봄 구민 텃밭 120구획을 분양합니다. 구에 1년 이상 거주한 세대주만 신청할 수 있으며, 한 세대에 한 구획만 배정합니다. 신청은 구청 누리집 온라인 접수로만 받고, 마감은 12월 15일 오후 6시입니다. 신청자가 많으면 공개 추첨으로 정하며, 결과는 12월 22일에 문자로 알려 드립니다."}],
+   "checks": {"markdown_table": true, "must_contain": ["12월 15일", "온라인", "1년"]}
+  },
+  {
+   "id": "ko-code-01", "category": "code_explain",
+   "messages": [{"role": "user", "content": "이 파이썬 함수가 무엇을 하는지 한국어로 세 문장 이내로 설명하고, 빈 리스트를 넣으면 어떻게 되는지도 알려 줘.\n\n```python\ndef f(xs):\n    best = xs[0]\n    for x in xs[1:]:\n        if x > best:\n            best = x\n    return best\n```"}],
+   "checks": {"language": "ko", "max_sentences": 4, "must_contain_any": [["최댓값", "가장 큰"], ["IndexError", "오류", "에러"]]}
+  },
+  {
+   "id": "ko-code-02", "category": "code_explain",
+   "messages": [{"role": "user", "content": "다음 C 코드의 버그를 찾아 한국어로 설명하고, 고친 코드를 보여 줘.\n\n```c\nint sum(const int *a, int n) {\n    int s = 0;\n    for (int i = 0; i <= n; i++)\n        s += a[i];\n    return s;\n}\n```"}],
+   "checks": {"language": "ko", "must_contain_any": [["i < n"], ["범위", "넘", "초과"]], "code_block": true}
+  },
+  {
+   "id": "ko-code-03", "category": "code_explain",
+   "messages": [{"role": "user", "content": "SQL 문을 한국어로 풀어서 설명해 줘. 각 절(SELECT, FROM, WHERE, GROUP BY, HAVING)을 한 줄씩.\n\nSELECT city, COUNT(*) AS n FROM orders WHERE status = 'paid' GROUP BY city HAVING COUNT(*) >= 10;"}],
+   "checks": {"language": "ko", "lines_at_least": 5, "must_contain": ["SELECT", "FROM", "WHERE", "GROUP BY", "HAVING"]}
+  },
+  {
+   "id": "ko-code-04", "category": "code_explain",
+   "messages": [{"role": "user", "content": "자바스크립트에서 아래 두 줄의 출력이 왜 다른지 한국어로 짧게 설명해 줘.\n\n```js\nconsole.log([10, 9, 1].sort());\nconsole.log([10, 9, 1].sort((a, b) => a - b));\n```"}],
+   "checks": {"language": "ko", "must_contain_any": [["문자열", "사전"], ["1, 10, 9", "[1, 10, 9]"]]}
+  },
+  {
+   "id": "ko-code-05", "category": "code_explain",
+   "messages": [{"role": "user", "content": "아래 셸 명령이 하는 일을 단계별로 한국어 번호 목록으로 설명해 줘.\n\nfind . -name '*.log' -mtime +7 -print0 | xargs -0 gzip"}],
+   "checks": {"language": "ko", "numbered_items_at_least": 3, "must_contain_any": [["7일"], ["압축", "gzip"]]}
+  },
+  {
+   "id": "ko-tool-01", "category": "tool_call",
+   "messages": [{"role": "user", "content": "내일 부산 날씨 알려 줘."}],
+   "tools": [{"type": "function", "function": {"name": "get_weather", "description": "도시의 날씨 예보를 조회한다", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "도시 이름"}, "day": {"type": "string", "enum": ["today", "tomorrow"]}}, "required": ["city", "day"]}}}],
+   "checks": {"tool_call": {"name": "get_weather", "arguments": {"city": ["부산", "Busan"], "day": "tomorrow"}}}
+  },
+  {
+   "id": "ko-tool-02", "category": "tool_call",
+   "messages": [{"role": "user", "content": "엄마한테 '오늘 저녁 7시에 도착해요'라고 문자 보내 줘. 번호는 010-1234-5678이야."}],
+   "tools": [{"type": "function", "function": {"name": "send_sms", "description": "문자 메시지를 보낸다", "parameters": {"type": "object", "properties": {"to": {"type": "string"}, "text": {"type": "string"}}, "required": ["to", "text"]}}}],
+   "checks": {"tool_call": {"name": "send_sms", "arguments": {"to": ["010-1234-5678", "01012345678"], "text_contains": "7시"}}}
+  },
+  {
+   "id": "ko-tool-03", "category": "tool_call",
+   "messages": [{"role": "user", "content": "1달러가 지금 몇 원인지 확인해서, 250달러면 얼마인지 알려 줘."}],
+   "tools": [{"type": "function", "function": {"name": "get_exchange_rate", "description": "두 통화 사이 환율을 조회한다", "parameters": {"type": "object", "properties": {"base": {"type": "string", "description": "ISO 4217 코드"}, "quote": {"type": "string", "description": "ISO 4217 코드"}}, "required": ["base", "quote"]}}}],
+   "checks": {"tool_call": {"name": "get_exchange_rate", "arguments": {"base": "USD", "quote": "KRW"}}}
+  },
+  {
+   "id": "ko-tool-04", "category": "tool_call",
+   "messages": [{"role": "user", "content": "다음 주 화요일 오후 3시에 '치과 예약' 일정을 한 시간짜리로 잡아 줘. 오늘은 2026년 10월 29일 목요일이야."}],
+   "tools": [{"type": "function", "function": {"name": "create_event", "description": "캘린더 일정을 만든다", "parameters": {"type": "object", "properties": {"title": {"type": "string"}, "start": {"type": "string", "description": "ISO 8601 날짜와 시각"}, "duration_minutes": {"type": "integer"}}, "required": ["title", "start", "duration_minutes"]}}}],
+   "checks": {"tool_call": {"name": "create_event", "arguments": {"title_contains": "치과", "start_prefix": "2026-11-03T15:00", "duration_minutes": 60}}}
+  },
+  {
+   "id": "ko-tool-05", "category": "tool_call",
+   "messages": [{"role": "user", "content": "안녕! 오늘 기분이 좀 좋아."}],
+   "tools": [{"type": "function", "function": {"name": "get_weather", "description": "도시의 날씨 예보를 조회한다", "parameters": {"type": "object", "properties": {"city": {"type": "string"}, "day": {"type": "string", "enum": ["today", "tomorrow"]}}, "required": ["city", "day"]}}}],
+   "checks": {"tool_call": null, "language": "ko"}
+  }
+ ]
+}
