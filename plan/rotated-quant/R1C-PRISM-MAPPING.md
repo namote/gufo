@@ -209,3 +209,32 @@
 2. 기존 v1 회전 파일 처리: 원본에서 다시 변환(제안)하고 R2 ②③을 다시 잰다. v1 파일은 새 파일이 검증된 뒤 지운다.
 3. 출처 KV 이름: `gufo.rotation.source_*`를 유지할지, `gufo.rotquant.source_*`로 바꿀지(작은 일)
 4. upstream 고정 리비전(교차 검증과 문서의 최소 버전)
+
+## 2단계 결과: 컨버터 (`b4486e95`, 2026-10-29)
+
+결정(PLAN D8, `8e926fcd`)을 반영했다: `ssm_alpha`/`ssm_beta`는 회전하지 않는다(A), v1 파일은 원본에서 다시 만든다, `gufo.rotation.source_*` KV는 유지한다, upstream 고정 리비전은 `8ab29fae`다.
+
+- **`tools/rotquant/prism.py`(새 파일):**
+  - `read_prism`은 upstream 로더(`load_hparams_hadamard`, `load_tensors_hadamard`)의 거부를 같은 순서로 재현한다. 거부 메시지에는 upstream 줄 번호를 붙인다. 키의 GGUF 타입도 upstream getter와 같게 검사한다.
+  - `prism_kv`는 untied, explicit, version 1 메타데이터를 쓴다.
+- **`hadamard.signs` 키:** 그룹 인스턴스 대신 `width:<K>`를 쓴다. 폭마다 부호 벡터는 하나다.
+- **`rotquant_groups.py`:** `attn_in`에서 `ssm_alpha`와 `ssm_beta`를 뺐다.
+- **`plan.check_rotation`:** upstream 규칙 다음에 컨버터와 gufo가 지원하는 부분집합 규칙을 검사한다. 거부하는 것:
+  - version 2 또는 tied
+  - block ≠ 128
+  - explicit가 아닌 부호 모드
+  - `inverse_weight_names`, `gdn_v_grouped`
+  - 그룹에 없는 가중치
+  - 그룹 인스턴스 안이나 층 사이에서 일부만 회전한 경우
+  - 쓰이지 않는 부호 폭
+  - version 키 없이 남은 `prism.*` 키
+- **dry-run 표:** `.rot` 줄을 "prism.hadamard sign vectors" 줄로 바꿨다.
+- **`verify`:** `prism.hadamard.*` 키의 바이트가 보존되는지, 출력이 upstream 규칙을 통과하는지 검사한다.
+- **`check_rotated`:** 부호를 KV에서 폭마다 읽는다.
+- **`gguf_io`:** int32 배열(`I32Array`)을 쓸 수 있게 했다.
+- **`realign`:** 바꿀 필요가 없었다. KV를 바이트 그대로 복사한다.
+- **테스트:** `rotquant_test` 28/28, `rotquant_groups_test` 3/3, `rotquant_calibration_test` OK
+  - 새 `PrismUpstreamRulesTest`는 upstream 거부 25가지를 줄 번호와 함께 확인한다: 2078, 2082, 2085, 2224, 2101, 2104, 2107, 2110, 2113, 2123, 2128, 2131, 2137, 2143, 2159, 2199(두 가지), 2203, 2213, 2217, 2228, 2232, 2271, 2274, 2348.
+  - 키 타입 검사와 identity 모드 허용도 확인한다.
+  - 그룹 테스트는 그룹의 모든 텐서가 upstream 허용 종류인지, 회전하지 않는 projection이 alpha와 beta뿐인지 확인한다.
+- **실제 27B 헤더 dry-run:** 회전 텐서 401개(v1은 497개, alpha와 beta 96개가 빠졌다), 부호 벡터 3개(5120, 6144, 17408, int32 값 28672개), 데이터 50.894 GiB(`.rot` 없음)
