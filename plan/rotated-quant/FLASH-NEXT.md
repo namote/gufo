@@ -382,6 +382,203 @@ v1 규칙(PLAN "GGUF 표시 규칙"): 회전 블록 128, 입력 쪽만 회전, �
 - 모델 로드(약 111 GB)에 창마다 몇 분이 든다.
 - 모든 창은 ai.tools 플랫폼을 끈 상태에서만 한다. 모델이 약 111 GB라 플랫폼이 켜져 있으면 메모리가 모자란다.
 
+## 13. EXL3 이식 타당성 (W7 추가 조사, 2026-10-29)
+
+배경: PLAN "외부 기준과 목표"(`76b5daee`). 이 절은 읽기만 하고 조사한 것이다.
+
+- GitHub는 `gh`로 읽었고, HF는 API 메타데이터와 모델 카드, 카드에 실린 차트 이미지만 봤다.
+- 가중치는 받지 않았고, 코드를 빌드하거나 실행하지 않았다.
+- 표기는 앞 절과 같다([확인] / [짐작]).
+
+### 13.0 요약
+
+- **라이선스 [확인]:** 세 저장소 모두 MIT다. gufo(MIT)로 가져오는 데 법적인 걸림은 없다. 저작권 고지를 남기면 된다. 다만 팩 가중치(Yamz, turboderp Flash-Next)는 Qwen Community License 1.0이다.
+- **Yamz 팩은 우리 손으로 다시 만들 수 없다 [확인].** Kyojin이 쓰는 Yamz 팩의 변환 도구는 공개되지 않았다. 우리가 직접 만들 수 있는 것은 upstream `convert.py`(PyTorch, GPU 양자화기)로 만든 팩이다.
+- **속도 차이의 출처 [짐작, 근거는 13.4절].**
+  - Kyojin 자체 기록에서 Flash-Next plain decode는 27.3 tok/s다(3.47 bpw 팩). 지금 gufo AR은 28.3 tok/s다. 둘은 비슷하다.
+  - 바이트는 EXL3이 대략 절반이다. 그런데 커널 실효 대역폭도 gufo의 절반 정도다(EXL3 dense GEMV는 피크의 55–65 %, "실용 단일 커널 상한" 약 135 GB/s. gufo는 27B R0b에서 80–91 %).
+  - 그러니 52 대 35의 차이는 주로 **투기 디코드**(MTP + n-gram "mix" 규칙 + 2단 draft head)에서 온다. 그리고 비교에 쓰인 gufo 숫자 35는 v0.8.0 기준이다.
+- **품질 [확인: turboderp 차트].** 같은 bpw에서 EXL3의 KL이 GGUF보다 확실히 낮다. Flash-Next에서는 EXL3 4.05 bpw(KL 0.0066)가 UD-Q4_K_XL(약 5.2 bpw, 0.0084)보다 낮다.
+  - Kyojin 자체 측정(Yamz 95 GB 0.0216 대 gufo 0.0156)과 순위가 반대다. Yamz 팩이 더 낮은 bpw 쪽이거나 레시피가 다른 것으로 보인다[짐작].
+  - 그래서 "gufo 품질 유지 + 바이트 감소"는 EXL3 형식으로 가능해 보인다.
+- **이식 규모 [짐작]:** 형식 리더, 커널(trellis 디코드 GEMV/다중 행/MoE/GEMM, 입출력 Hadamard), 두 모델의 바인딩과 실행 경로, 그리고 양자화기 운용(GPU, HF safetensors 원본 필요)까지다. 회전 + k-quant 경로보다 한 자릿수 크다.
+  - 바이트 감소만 보면 회전 + 3–4비트 k-quant로도 상당 부분을 얻을 수 있다(R4 결과 대기).
+  - 투기 디코드 개선은 형식과 독립이다. 그래서 먼저 그쪽(드래프트 정책, n-gram 혼합, verify 비용)을 따로 보는 것이 맞다고 본다.
+
+### 13.1 출처와 라이선스 [확인]
+
+| 저장소 | 커밋 / 릴리스 | 라이선스 | 내용 | gufo로 가져오기 |
+|---|---|---|---|---|
+| [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3) | v1.6.5 `cdc785db`(2026-10-25). 릴리스 자산에 `exllamav3-1.6.5+rocm10.0.torch2.13.0-cp31{2,3,4}` wheel이 있다 | MIT (Copyright 2025 Turboderp) | EXL3 형식, 양자화기 `convert.py`, CUDA 커널 `exllamav3_ext/quant/*`, ROCm 커널 `exllamav3_ext/rocm/*` | 가능(MIT 고지 유지). ROCm 쪽은 vendored `rocm/vendor/rocm_wmma_gemm`(MIT, Copyright 2024 Adel Johar)도 포함한다 |
+| [Yamz-Labs/kyojin](https://github.com/Yamz-Labs/kyojin) | 1.8.3 `2132bd24`(2026-10-29). 벤치 수치는 1.5.10 `db6103b`(`doc/figures.json`) | MIT. `LICENSE`는 Turboderp 것 그대로이고, 추가분도 MIT라고 `doc/credits.md`에 적혀 있다. `exllamav3/vendor/fla`도 MIT | exllamav3 포크(Python + `exllamav3_ext/` 전체). gfx1151 커널, Qwen/GLM/MiMo 서버, 벤치 도구. **팩을 만든 양자화 파이프라인은 저장소에 없다**(credits.md, 팩 카드 "The conversion tooling is not published") | 코드는 가능(MIT). 팩 레시피는 재현할 수 없다 |
+| [vcruz305/exllamav3-amd](https://github.com/vcruz305/exllamav3-amd) | `e0ec553b`(2026-10-07) | MIT (Turboderp 고지) | 첫 gfx1151 이식. 기반은 [sdougbrown/exllamav3](https://github.com/sdougbrown/exllamav3)(MIT, upstream 포크, gfx12 WMMA decode). RDNA3.5 WMMA GEMV, 그룹 MoE, `v_sad_u8` trellis 디코드, int8 mixer, LDS bank conflict 수정 | 가능. Kyojin `README.strix-halo.md`에 같은 내용이 들어가 있다 |
+
+- 세 저장소 모두 PyTorch C++ 확장(`bindings.cpp`, `libtorch/`)이다. 커널 본문은 HIP로 옮길 수 있지만, 호스트 쪽(텐서 할당, 디스패치, 그래프)은 torch에 묶여 있어 그대로 쓸 수 없다[짐작: 파일 구성 기준].
+- gufo에 넣을 때는 출처 URL, 커밋, 라이선스 고지를 `THIRD_PARTY` 또는 해당 파일 머리에 남긴다(gufo 기존 vendored mmq와 같은 방식, `mmq/VENDOR.md`).
+
+### 13.2 EXL3 형식 [확인: `exllamav3/modules/quant/exl3.py`, `doc/convert.md`, README]
+
+- **기반:** QTIP(Cornell RelaxML)의 간소화판이다. 가중치를 16×16 타일 단위로 trellis 부호화하고, 타일 하나는 `16·K`개의 uint16이다(K = 비트/가중치). half-integer K(예 4.5)는 `mul1` 코드북에서만 된다.
+- **코드북:** `mul1`(기본), `mcg`, `3inst`. 모두 표를 읽지 않고 계산하는 procedural 코드북이다. int8 GEMV와 CPU 전문가 오프로드는 `mul1`을 요구한다.
+- **회전:** **입력 쪽과 출력 쪽 모두** Hadamard를 쓴다.
+  - `suh`(입력 부호, fp16)와 `svh`(출력 부호와 스케일, fp16)를 텐서마다 저장한다. 실행은 `had_r_128`(128점)이다.
+  - `in_features`와 `out_features`가 모두 128의 배수여야 한다.
+  - 실행 시 입력을 회전하고(`x' = H·diag(suh)·x`), 출력에도 역회전(`H`, `svh`)을 적용한다. 그래서 GEMV 앞뒤에 Hadamard 커널이 붙는다(RDNA에서는 3 launch, 또는 프롤로그와 에필로그에 융합).
+- **비트 선택:** K는 1–8(정수, mul1이면 반정수도)이다.
+  - `--bits`로 평균 bpw를 정하고, 텐서별 배분은 측정(Hessian, calibration) 기반 예산이다. `--hq`는 attention과 공유 전문가를 올린다.
+  - `--recipe`로 텐서별 비트를 정할 수 있다. 헤드는 `--head_bits`(기본 6), MTP는 `--mtp_bits`(기본 4, 보정 없음), n-gram 표는 `--ngram_bits`다.
+  - 임베딩은 기본이 비양자화이고, 256 그룹으로 회전·부호화하는 선택지도 있다.
+  - 출력 채널 스케일(`--out_scales`)도 있다.
+- **양자화 방식:** 층별 calibration forward로 입력 Hessian을 즉석 계산하고, LDLQ와 Viterbi trellis 부호화를 한다. 보정은 250행 × 2048토큰이 기본이다.
+- **저장:** HF 구조 그대로 safetensors 분할(`model.safetensors.index.json`) + `config.json`의 `quantization_config` + 텐서별 `trellis`/`suh`/`svh`/(`mcg`|`mul1`)이다.
+  - Flash-Next는 `ngram_embedding.safetensors`를 따로 둔다(팩 사이에 바꿔 쓸 수 있고, 보통 디스크에서 스트리밍한다).
+  - Yamz 팩에는 추가로 `hc_gs_sidecar.safetensors`(633 MB, HC mixer int8로 보인다 — 짐작), `draft2s.st`(2단 draft head, 331 MB), `quantization_config.json`(97 MB, 텐서별 설정)이 있다.
+
+**우리 회전과 `prism.hadamard` 비교:**
+
+| 항목 | EXL3 | 우리 v1 (`gufo.rotation.*`) | upstream `prism.hadamard` (D8) |
+|---|---|---|---|
+| 회전 블록 | 128 | 128 | 128 |
+| 위치 | 입력 + 출력 양쪽 (`suh`, `svh`) | 입력만 | 입력만. `y = W'·(H·(s·P·x))`, GDN 순열 P 포함 |
+| 부호 | 텐서마다 따로 (fp16, 스케일 포함) | 입력 그룹이 공유 (±1) | 입력 폭마다 (W1이 확인 중) |
+| 양자화 | trellis(QTIP), 16×16 타일, 1–8 비트 | 기존 GGUF 타입(K-quant, IQ) | 기존 GGUF 타입 |
+| 실행 비용 | 행렬마다 입력 회전과 출력 역회전 | 그룹마다 입력 회전 한 번(생산 커널에 융합) | 우리와 같음 |
+| 컨테이너 | safetensors + config | GGUF | GGUF |
+
+- EXL3 회전은 행렬마다 독립이다. 출력 쪽 회전 때문에 matmul 출력 형식이 바뀌지 않는 대신, 행렬마다 추가 Hadamard가 붙는다.
+- 우리 방식은 "그룹 공유 + 입력만"이라 activation 생산 커널에 한 번만 융합하면 된다.
+- 두 방식을 같은 파일에 섞을 수는 없다. 형식 변환도 불가능하다. EXL3 가중치를 GGUF 타입으로 다시 양자화하면 이중 양자화가 된다.
+
+### 13.3 커널 [확인: 파일 머리 주석과 문서 / 짐작: 비교]
+
+| 커널 | upstream 1.6.5 `exllamav3_ext/rocm/quant/` | gfx1151 튜닝 상태 | gufo 대응 |
+|---|---|---|---|
+| decode GEMV (m = 1) | `exl3_gemv_rdna.cu`(+`exl3_gemv_kernel_rdna.cuh`, `exl3_gemv_tiles_rdna.cuh`): fp16 활성화 × trellis 디코드, `fdot2` 누적. CUDA의 cooperative 융합 대신 입력 Hadamard / GEMV / 출력 Hadamard 3 launch(일부 형태는 프롤로그·에필로그 융합). K 1–8, 세 코드북 모두 지원 | vcruz/Kyojin: WMMA GEMV(`v_wmma_f16_16x16x16_f16`), `v_sad_u8` trellis 디코드(−3–4 %), LDS bank conflict 수정 `EXL3_HIP_STG_PAD`(+10 %). **dense GEMV는 DRAM 피크(236 GB/s)의 55–65 %, lm_head 약 200 GB/s.** "단일 커널 실용 스트리밍 상한 약 135 GB/s"(`read_bw_vs_size.py`) | 27B: `gemv_quant.hip` FP32 활성화, R0b에서 IQ4_XS 89 %, Q4_K 82 %(DRAM read 240 GB/s 기준). Flash-Next: Q8_1 mmvq. **vcruz/Kyojin의 "135 GB/s 실용 상한" 주장은 우리 측정과 맞지 않는다.** 우리 커널은 200 GB/s 이상을 낸다 |
+| verify 다중 행 (m = 2–8) | `exl3_gemv_multirow_rdna.cu`: 가중치를 한 번 읽어 M ∈ {2,4,8}행에 쓴다. 행 결과는 m = 1과 비트 동일. 입력 회전 1 launch + split-K dot 1 launch | Kyojin: "ms/forward = 32.4 + 9.04 × rows". 행이 늘 때 비용 대부분은 고유 전문가 수 증가에서 온다 | 27B small-batch wave64(27B shape 전용), Flash-Next Q8 mmvq 1–8행. R0b에서 27B verify 8행 Q8_0은 212 GB/s |
+| MoE decode | `exl3_mgemv_rdna.cu`: (전문가 × N 타일) 단위 warp, 입력 회전은 프롤로그에, 출력 회전과 가중 합은 에필로그에 융합 | vcruz: grouped MoE prefill GEMV 131–135 GB/s(고유 전문가 바이트 기준). Kyojin: K6/K8 fused MoE(`tools/qwen/K6K8.md`, 실험) | Flash-Next `qfn_mmq_moe_gated_vec`(Q4_K, Q5_K), `mmvq` moe |
+| prefill GEMM | `exl3_gemm_inner_rdna.cuh`: WMMA(`wmma_f32_16x16x16_f16`)로 재구성, 3단 파이프라인, split-K. dense GEMM 튜너(첫 실행 때, `EXL3_DENSE_GEMM_TUNE`). `exl3_moe_inner_rdna.cuh` 파이프라인 MoE | Kyojin Flash-Next prefill 8K 1621 tok/s | gufo `fec4759d` pp2048 1,801(d0)과 1,721(d8K)이 이미 이보다 높다(측정 방법은 다르다). prefill은 이식 이유가 아니다 |
+| 기타 | HC mixer(`hc_mix.cu`, int8 `hc_mix_q8r.cuh`), GatedResidual `gr_mix`, GDN, PLE, n-gram | — | Flash-Next에 다 있다 |
+
+- 정리 [짐작]: EXL3 커널의 강점은 **바이트당 품질**(trellis + 양쪽 회전)이다. 바이트를 읽는 효율은 gufo 커널이 높다.
+- 그래서 EXL3 형식을 가져올 때 커널을 그대로 가져오면 gufo의 대역폭 효율을 잃을 수 있다. trellis 디코드를 gufo 커널 구조(FP32/Q8_1 활성화, 행 공유) 안에 다시 짜야 할 가능성이 크다.
+
+### 13.4 속도는 어디서 오는가 (Kyojin 52 대 gufo 35) [짐작, 근거 표시]
+
+| 요소 | Kyojin (Yamz 팩) | gufo | 근거 |
+|---|---|---|---|
+| 팩 크기 | 95.37 GB (n-gram 표 26.24 GB 포함, 표는 디스크 스트리밍) | 111.33 GB (PLE 표 IQ4_NL 약 28.8 GB, 디스크) | HF API sizes [확인]. gufo PLE 크기는 [짐작: 7.1절] |
+| trunk 평균 bpw | 약 4 bpw[짐작: 비-n-gram 68 GB ÷ 약 1,290억 개]. 카드의 다른 문서에는 "qwen38-yamz-v1, 3.47 bpw"라는 기록도 있어(`tools/qwen/SERVE.md`) 버전마다 다를 수 있다 | 약 5.1 bpw (dense Q8_0 많음) | [짐작] |
+| decode 토큰당 읽는 바이트 | 약 3–3.5 GB[짐작: 활성 약 66억 개 × 약 4 bpw + 헤드 6비트 + HC int8] | 약 6.1 GB (3절) | [짐작] |
+| plain decode | 27.3 tok/s (3.47 bpw 팩, 1행 36.6 ms → 약 85–95 GB/s 실효) | AR 28.3 tok/s (`fec4759d`, 35.3 ms → 약 173 GB/s) | Kyojin `tools/qwen/SERVE.md` [확인], gufo BENCHMARKS.md [확인]. 실효 GB/s는 [짐작] |
+| 투기 decode | 52.2(8K), card chat/prose/code 52.8/47.5/73.2. MTP + n-gram mix 규칙 + `draft2s` 2단 draft head, `--ndt 7`(대부분 3까지) | v0.8.0 35.3(8K, Kyojin 측정). 우리 `fec4759d` 측정 mixed 36.9(d8K)–40.5 | 둘 다 [확인]. 측정 방법이 달라 직접 비교는 안 된다 |
+| 실효 증가율 (투기/plain) | 약 1.7–1.9× (chat 42.2/27.3 등, SERVE.md) | 약 1.3–1.4× (36.9/28.3) | [짐작: 위 수치에서 계산] |
+
+해석 [짐작]:
+
+1. plain decode는 거의 같다. 바이트는 EXL3이 약 절반이고, 커널 효율은 gufo가 약 2배라 서로 상쇄된다.
+2. 투기 decode의 차이(약 1.4×)는 **드래프트 정책과 verify 비용**에서 온다. Kyojin은 n-gram을 MTP와 섞고 2단 draft head를 쓴다. gufo도 컨텍스트 복사를 하지만 조건이 보수적이다(README: greedy 12, sampled 24토큰 일치).
+3. verify 행 비용: Kyojin은 행마다 9 ms가 늘고 기본 32 ms다. #474의 gufo verify 1 step은 약 57.5 ms였다(3.15 토큰/step). 같은 단위로 재지 않으면 비교가 안 된다.
+4. 따라서 "EXL3 형식 이식"만으로 52에 닿는다는 보장은 없다. 바이트가 절반이 되더라도 gufo 커널 효율을 유지해야 plain 약 45 tok/s 이상이 나온다(이론상). 그 위에 드래프트 개선이 따로 필요하다.
+
+### 13.5 품질 (fidelity) [확인: 공개 차트와 표 / 짐작: 해석]
+
+- **Kyojin 측정** ([benchmarks.md](https://github.com/Yamz-Labs/kyojin/blob/main/doc/benchmarks.md)): FP8 공식판 대비 200개 중립 텍스트, 3,084 위치.
+
+  | 엔진 | 팩 | top-1 | KL | 반복 간 KL |
+  |---|---|---|---|---|
+  | Kyojin | 95 GB | 93.81 % | 0.0216 | 0.0008 |
+  | Strata | 93.7 GB | 93.64 % | 0.0316 | 0.0074 |
+  | gufo v0.8.0 | 111.3 GB | 95.36 % | 0.0156 | 0.0000 |
+
+- **turboderp 공개 bpw–KL 차트.** Flash-Next 카드 `qb_kld.png`(HF `turboderp/Qwen3.8-Flash-Next-exl3` `8e1af104`). 자체 생성 in-domain trace(입력 14,496 + 출력 45,588 토큰), 원본 대비 KL. x축은 임베딩과 헤드를 뺀 bpw다.
+
+  | 형식 | bpw | KL |
+  |---|---:|---:|
+  | EXL3 3.05 (H5 NG5) | 3.05 | 0.0174 |
+  | EXL3-SC 3.18 | 3.2 | 0.0138 |
+  | EXL3-SC 3.68 | 3.7 | 0.0087 |
+  | **EXL3 4.05 (H6 NG6)** | 4.05 | **0.0066** |
+  | EXL3-SC 4.18 | 4.2 | 0.0061 |
+  | EXL3 5.05 | 5.05 | 0.0040 |
+  | EXL3 6.05 | 6.05 | 0.0031 (노이즈 바닥 0.0026) |
+  | UD-IQ4_XS | 약 4.05 | 0.0162 |
+  | **UD-Q4_K_XL** | 약 5.2 | **0.0084** |
+  | NVFP4 W4A16 | 약 4.8 | 0.0102 |
+
+  - 이 차트로는 **EXL3 약 3.7–4 bpw가 UD-Q4_K_XL 품질과 같거나 낫다.** 27B 차트(`turboderp/Qwen3.8-27B-exl3` `d23340a1`)도 같은 경향이다: EXL3 5.00 bpw 0.0023, SC 4.00 H5 0.0062, 4.00 bpw 0.0082 대 UD-Q4_K_XL 0.0051, IQ4_XS 0.0101.
+- **두 측정이 서로 반대인 이유 [짐작]:**
+  - (1) Yamz 팩이 turboderp 4.05보다 낮은 bpw이거나 레시피가 다르다. 비-n-gram 크기는 비슷하지만 SERVE.md에는 3.47 bpw 기록도 있다.
+  - (2) 기준(FP8 대 원본 BF16), 코퍼스(중립 텍스트 대 자체 생성 trace), 지표(top-20 절단 대 전체)가 다르다.
+  - (3) Kyojin의 int8 HC mixer 같은 추가 근사가 있다.
+- **고-bpw 팩으로 gufo 품질을 맞출 수 있나 [짐작]:**
+  - 차트상 turboderp 4.05 bpw(팩 107.3 GB, n-gram 39 GB 포함)는 이미 UD-Q4_K_XL보다 KL이 낮다.
+  - n-gram 표를 NG4(약 26 GB)로 바꾸면 약 95 GB가 된다. n-gram 표는 팩끼리 바꿔 쓸 수 있다고 카드에 적혀 있다.
+  - 즉 **같은 95 GB 안에서 gufo 이상의 품질이 가능해 보인다.** 우리 하네스로 확인해야 한다.
+- 메모리: 5.05 bpw(123 GB, n-gram 39 GB)는 trunk가 약 84 GB다. n-gram 표를 스트리밍하면 128 GB 장비에 들어갈 수도 있다[짐작: Yamz 95 GB 팩이 113 GiB를 쓴다고 했으므로 여유가 작다].
+
+### 13.6 이식 범위와 위험 [짐작]
+
+| 부분 | 내용 | 규모 | 위험 |
+|---|---|---|---|
+| 형식 리더 | safetensors 분할 + `quantization_config`(텐서별 K, 코드북) + `trellis`/`suh`/`svh` 텐서. 모델별 이름 대응(HF → gufo 역할)이 27B와 Flash-Next 각각 필요하다. gufo에는 safetensors 로더 선례가 있다(`src/models/qwen3_tts/loader.hpp`, `minimax_h3`) | 중 | 중. 팩마다 부가 파일이 다르다(Yamz `hc_gs_sidecar`, `draft2s.st`는 Kyojin 전용) |
+| 양자화기 | upstream `convert.py`(PyTorch, GPU). README는 "70B+ 수 시간(고성능 소비자 GPU)"이라고 한다. **입력은 HF safetensors**(Flash-Next 360 GB, 우리가 받는 BF16 GGUF는 못 쓴다). ROCm 양자화: Kyojin 트리에 `quantize_tiles_rdna.cuh`가 있지만 gfx1151 양자화 경로가 검증됐는지는 확인하지 못했다. `doc/roc_hip_decode.md`는 "the quantizer"를 범위 밖으로 둔다 | 대 | **대.** gfx1151에서 Flash-Next(1,800억 개) 양자화 시간을 알 수 없다(수십 시간 가능). 디스크도 360 GB 원본 + work dir(출력 1벌). 외부 팩을 쓰면 이 단계를 건너뛸 수 있다(turboderp 팩은 레시피 공개, Yamz는 비공개) |
+| 커널 | trellis 디코드(K 1–8, mul1), m = 1 GEMV, m = 2–8 verify, MoE gated/down decode, prefill GEMM과 MoE GEMM, 입출력 128점 Hadamard. 활성화는 fp16 | 대 (수천 줄, upstream rocm만 수십 KB 파일 10여 개) | 대. torch 의존 제거. gufo 대역폭 효율(80–90 %)에 맞추려면 재설계가 필요하다. 그래프 캡처와 결정성 기준(bit 동일 fixture)도 다시 세워야 한다 |
+| 통합 (27B) | `src/models/qwen/` 바인딩, decode/verify(DFlash2)/prefill 경로에 새 weight 타입, 출력 쪽 Hadamard 에필로그 | 중–대 | 중. DFlash2 드래프터 헤드 공유 문제는 회전과 같다 |
+| 통합 (Flash-Next) | 13개 계열(4절) 전부, 3차원 전문가, PLE/n-gram 표, MTP 사이드카 | 대 | 대. 현재 fused prefill 커널(Q8_0 shape 전용)을 모두 대체해야 한다 |
+| 검증 | 형식 오라클(CPU 디코드), op 테스트, 품질 하네스, 속도 A/B | 중 | 중 |
+
+**회전 + k-quant 경로와 비교:**
+
+| 기준 | 회전 + k-quant | EXL3 이식 |
+|---|---|---|
+| 새 코드 | 컨버터(Python, 대부분 완료), 생산 커널에 FWHT 융합, 일부 4비트 dense 커널 | 형식, 양자화기 운용, 커널 일체, 두 모델 통합 |
+| 양자화 | llama-quantize/ggml(CPU, 분 단위) | PyTorch GPU 양자화기(시간 단위), HF 원본 필요 |
+| 바이트당 품질 | 4비트 이상에서 회전 이득은 작을 수 있다(PLAN 위험). 3비트 이하는 E3/E7 결과를 봐야 안다 | 공개 차트상 같은 KL에서 약 1–1.5 bpw 적다 |
+| 커널 효율 | 기존 gufo 커널(80–91 %) | 지금 공개 커널은 55–65 %. 끌어올리려면 별도 작업 |
+| 외부 호환 | llama.cpp `prism.hadamard`(D8) | exllamav3/TabbyAPI/Kyojin 팩 |
+
+판단 [짐작]: 결정은 R4(E3: 3–3.5 bpw 회전)의 품질과 속도를 본 뒤에 내린다.
+
+- 회전 k-quant 약 3.5 bpw가 UD-Q4_K_XL 품질에 근접하면, 이식의 품질 이득은 작고 비용만 크다.
+- 근접하지 못하면 EXL3의 바이트당 품질 우위가 결정적이다. 그때는 "27B에서 형식 리더 + m = 1 GEMV 하나"의 작은 시범으로 gufo 커널 효율 안에서 trellis 디코드가 대역폭에 묶이는지부터 확인하자고 제안한다.
+- 드래프트 정책 개선(n-gram 혼합, 2단 draft head)은 형식과 무관하므로 별도 작업으로 먼저 검토할 가치가 있다.
+
+### 13.7 공개 Qwen3.8-27B EXL3 팩 [확인: HF API]
+
+- **Kyojin/Yamz 27B 팩은 없다.** `yamz-labs` 작성자의 모델은 GLM, MiMo, Qwen3.8-Flash-Next, DeepSeek-V4.1, Flint, Nanbeige뿐이다.
+  - Kyojin README의 "Qwen3.8-27B (EXL3 4.0 bpw, MTP + n-gram)" 측정(RTX 3090)은 팩 출처를 적지 않았다.
+  - 테스트 코드 기본 경로는 `~/Models/Qwen3.8-27B-exl3`(`tests/hip_gemv_logits_oracle.py`)이다. turboderp 팩으로 보인다[짐작].
+- **turboderp/Qwen3.8-27B-exl3** (Apache-2.0, main `d23340a1`, 브랜치별 분기):
+
+  | 브랜치 | 커밋 | safetensors 합계 |
+  |---|---|---:|
+  | `3.50bpw` | `8351c54e` | 15.34 GB |
+  | `4.00bpw` | `113cf7ab` | 16.86 GB |
+  | `5.00bpw` | `a35e75a7` | 19.90 GB |
+  | `6.00bpw` | `d32ba0bb` | 22.94 GB |
+  | `SC_4.00bpw_H5` | `4acd9ad5` | 16.71 GB |
+  | `SC_5.00bpw_H6` | `dfe2f4fd` | 19.91 GB |
+  | `SC_6.00bpw_H6` | `9e4c23cf` | 22.95 GB |
+
+  - 2.00, 2.50, 3.00과 SC 1.40–3.00, `_V*`(비전 양자화)도 있다.
+  - main에는 `kld_table.json`, `recipe_*.yaml`, `cal_trace.*`, `measurement.json`이 있다.
+- **turboderp/Qwen3.8-Flash-Next-exl3** (Qwen Community 1.0, main `8e1af104`):
+
+  | 브랜치 | 크기 (n-gram 표) |
+  |---|---|
+  | `3.05bpw_h5_ng5` | 85.0 GB (32.6) |
+  | `4.05bpw_h6_ng6` | 107.3 GB (39.0) |
+  | `5.05bpw_h6_ng6` | 123.1 GB (39.0) |
+  | `6.05bpw_h6_ng6` | 138.9 GB |
+  | `4.18bpw_h6_ng8` | 121.8 GB (51.8) |
+
+  - SC 1.66–3.68 브랜치도 있다.
+- **Yamz Flash-Next 팩:** `yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz` main `247ef39b`, 95,371,323,041 B. Qwen Community 1.0.
+- **우리 하네스로 같은 27B를 잴 수 있나:** 가능하다. turboderp 4.00/5.00 bpw(16.9/19.9 GB)를 받아 Kyojin이나 upstream exllamav3(ROCm wheel)으로 돌리고, 우리 W2 코퍼스 위치별 top-k logits를 뽑아 BF16 기준과 비교하면 된다.
+  - 실행 환경(PyTorch ROCm, Kyojin 빌드)이 따로 필요하다.
+  - logits dump 훅이 있는지 확인해야 한다. Kyojin `eval/model_diff.py`, `eval/glm_kld.py`가 있지만 아직 읽지 않았다.
+  - 내려받기와 GPU 창은 감독이 정한다.
+
 ## 참고
 
 - 이슈: [gufo-org/gufo#474](https://github.com/gufo-org/gufo/issues/474) (2026-10-07, 닫힘. 관리자가 Discussions로 안내했다)
