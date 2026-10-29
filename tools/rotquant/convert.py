@@ -31,12 +31,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np  # noqa: E402
 
 from rotquant import CONVERTER_VERSION  # noqa: E402
-from rotquant.gguf_io import SPLIT_KEYS, OutTensor, U32, as_float32, encode_value, open_gguf, write_gguf  # noqa: E402
+from rotquant.gguf_io import (SPLIT_KEYS, WRITE_ALIGNMENT, OutTensor, U32, as_float32,  # noqa: E402
+                              encode_value, open_gguf, write_gguf)
 from rotquant.hadamard import f32_to_bf16_bits, rotate_last_axis, signs  # noqa: E402
 from rotquant.plan import (F16_MINUS_ONE, F16_PLUS_ONE, ROT_SUFFIX, ROT_TYPE,  # noqa: E402
                            ROTATION_KV, PlanError, build_plan, copied_recipe, dry_run_table,
                            load_groups, quantize_command, tensor_type_lines)
 from rotquant.recipe import RecipeError, load_recipe, parse_rotate_selection  # noqa: E402
+from rotquant.realign import realign  # noqa: E402
 from rotquant.verify import verify_output  # noqa: E402
 
 CHUNK_BYTES = 64 << 20
@@ -183,7 +185,8 @@ def sidecars(output: Path) -> dict:
     stem = output.with_suffix("")
     return {"rotated": Path(f"{stem}.rotated.gguf"),
             "tensor_types": Path(f"{stem}.tensor-types.txt"),
-            "recipe": Path(f"{stem}.recipe.json")}
+            "recipe": Path(f"{stem}.recipe.json"),
+            "unaligned": Path(f"{stem}.unaligned.gguf")}
 
 
 def run(args) -> int:
@@ -219,10 +222,21 @@ def run(args) -> int:
                                imatrix=args.imatrix, provenance=overrides)
     print(" ".join(command), flush=True)
     subprocess.run(command, check=True)
+    # llama-quantize keeps its input's alignment. A 32-aligned original
+    # (quantized without rotation) is rewritten so rotated and unrotated
+    # outputs share the 256-byte layout; tensor bytes do not change.
+    with open_gguf(args.output, header_only=True) as written:
+        aligned = written.alignment == WRITE_ALIGNMENT
+    if not aligned:
+        args.output.rename(paths["unaligned"])
+        result = realign(paths["unaligned"], args.output)
+        paths["unaligned"].unlink()
+        print(f"realigned {args.output}: alignment {result['input_alignment']} -> {result['alignment']}, "
+              f"tensor bytes unchanged", flush=True)
     summary = verify_output(source, args.output, plan, overrides)
     print(f"verified {summary['output']}: {summary['tensors']} tensors, {summary['quantized']} quantized, "
           f"{summary['byte_identical']} byte-identical ({summary['rot']} .rot), types match the plan, "
-          f"gufo.* metadata kept", flush=True)
+          f"gufo.* metadata kept, {WRITE_ALIGNMENT}-byte aligned", flush=True)
     return 0
 
 

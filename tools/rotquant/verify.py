@@ -10,13 +10,15 @@ converter therefore reads the output back and refuses it unless:
 - every tensor whose type did not change, `.rot` included, is byte-identical
   to the source;
 - every `gufo.*` key of the source is still present with the same bytes, and
-  each `--override-kv` value reads back exactly.
+  each `--override-kv` value reads back exactly;
+- `general.alignment` is 256 and the data section and every tensor start on
+  a 256-byte boundary of the file.
 """
 from __future__ import annotations
 
 from pathlib import Path
 
-from rotquant.gguf_io import encode_value, open_gguf
+from rotquant.gguf_io import WRITE_ALIGNMENT, encode_value, open_gguf
 from rotquant.plan import ROT_SUFFIX, ROT_TYPE, PlanError
 
 
@@ -24,6 +26,11 @@ def verify_output(source, output, plan, overrides: dict) -> dict:
     """Raise PlanError on the first class of mismatch; return a summary."""
     expected = {e.name: e.target_type for e in plan.entries}
     with open_gguf(source) as src, open_gguf(output) as out:
+        base = out.shards[0].data_offset
+        unaligned = [t.name for t in out.tensors if (base + t.offset) % WRITE_ALIGNMENT]
+        if out.alignment != WRITE_ALIGNMENT or unaligned:
+            raise PlanError(f"{output}: general.alignment {out.alignment}, data at {base}; "
+                            f"{len(unaligned)} tensor(s) are not {WRITE_ALIGNMENT}-byte aligned")
         src_names = [t.name for t in src.tensors]
         out_by_name = out.by_name
         missing = sorted(set(src_names) - set(out_by_name))

@@ -28,6 +28,7 @@ from rotquant.hadamard import (BLOCK_SIZE, bf16_bits_to_f32, f32_to_bf16_bits,  
 from rotquant.plan import (ROTATION_KV, PlanError, build_plan, check_rotation,  # noqa: E402
                            load_groups, quantize_command, read_rot_signs, tensor_type_lines)
 from rotquant.recipe import RecipeError, parse_recipe, parse_rotate_selection  # noqa: E402
+from rotquant.verify import verify_output  # noqa: E402
 
 GROUPS = load_groups("qwen27b")
 ALL_GROUPS = GROUPS.names
@@ -598,13 +599,21 @@ class ConverterTest(unittest.TestCase):
         recipe = self.recipe({"version": 1, "rotate": "none", "types": [{"match": ".", "type": "Q8_0"}]},
                              "none.json")
         out = self.dir / "plain.gguf"
-        code, _, err = run_cli("--groups", "qwen27b", "--input", self.split[0], "--recipe", recipe,
-                               "--llama-quantize", script, "--output", out)
+        code, stdout, err = run_cli("--groups", "qwen27b", "--input", self.split[0], "--recipe", recipe,
+                                    "--llama-quantize", script, "--output", out)
         self.assertEqual(code, 0, err)
         argv = json.loads(log.read_text())
         self.assertEqual(argv[-3:], [str(self.split[0]), str(out), "Q8_0"])
         self.assertIn(f"gufo.rotation.source_sha256=str:{convert.file_sha256(self.split)}", argv)
         self.assertFalse((self.dir / "plain.rotated.gguf").exists())
+        # llama-quantize keeps the original's 32-byte alignment; the converter
+        # rewrites the output at 256 bytes and removes the intermediate.
+        self.assertIn("realigned", stdout)
+        self.assertIn("256-byte aligned", stdout)
+        self.assertFalse((self.dir / "plain.unaligned.gguf").exists())
+        with open_gguf(out) as model:
+            self.assertEqual(model.alignment, 256)
+            self.assertTrue(all((model.shards[0].data_offset + t.offset) % 256 == 0 for t in model.tensors))
 
     def test_quantize_command_rejects_float_only_recipe(self):
         with open_gguf(self.split[0]) as model:
@@ -614,6 +623,27 @@ class ConverterTest(unittest.TestCase):
         self.assertEqual(len(tensor_type_lines(plan)), sum(len(ne) >= 2 for _, ne, _ in self.tensors.values()))
         with self.assertRaisesRegex(PlanError, "quantizes no tensor"):
             quantize_command(plan, "q", "in.gguf", "out.gguf", "t.txt")
+
+    def test_unaligned_output_is_refused(self):
+        rot = self.rotate_all()
+        recipe = self.recipe({"version": 1, "rotate": "all", "types": [{"match": r"\.weight$", "type": "Q8_0"}]})
+        script, _ = self.fake_quantize()
+        out = self.dir / "aligned.gguf"
+        code, stdout, err = run_cli("--groups", "qwen27b", "--input", rot, "--recipe", recipe,
+                                    "--llama-quantize", script, "--output", out)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("realigned", stdout)  # the rotated input is already 256-aligned
+        with open_gguf(rot) as source:
+            plan = build_plan(source, GROUPS, ALL_GROUPS, seed=None, rotate_only=False,
+                              rules=parse_recipe(recipe.read_text(), ALL_GROUPS, GROUPS.recipe_types()).rules)
+        with open_gguf(out) as quantized:
+            tensors = [OutTensor(t.name, t.ne, t.type_name, lambda f, b=bytes(quantized.tensor_bytes(t)): f.write(b))
+                       for t in quantized.tensors]
+            kv = list(quantized.kv_raw)
+        narrow = self.dir / "narrow.gguf"
+        write_gguf(narrow, kv, tensors, 32)
+        with self.assertRaisesRegex(PlanError, "not 256-byte aligned"):
+            verify_output(rot, narrow, plan, {})
 
     def test_quantized_output_is_checked(self):
         rot = self.rotate_all()
