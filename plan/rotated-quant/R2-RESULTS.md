@@ -127,6 +127,7 @@ PLAN은 "27B는 matmul 전에 활성화를 Q8_1로 양자화한다"고 적었지
 | 쪽 | 소스 | nix 결과 | 이미지 (revision 라벨) |
 |---|---|---|---|
 | 후보 v3 | `git archive c94572b3` + `build/rq-release/w3-v3.patch`(sha256 `ff55997a5733bf717681d82032118278ad1dd26858a4585411857f9b4b9f6690`; 이 문서의 v3 이후 기록 전 상태를 포함) → `build/rq-release/src-v3` | `/nix/store/w4ww3qrqmhhnilaim6ypialfnm6r18ar-gufo-0-unstable-dirty` | `ai-tools/gufo-eval:rqw3-cand-rocm101` (`c94572b3…+w3-ff55997a`, id `dba40ef0`) |
+| 후보 2(prism) | `git archive 5c3422ff`(HEAD, 패치 없음) → `build/rq-release-cand2/src`; `nix build --cores 8` | `/nix/store/p2h3m55nfakjx86bz8igav8kw94kvzr0-gufo-0-unstable-dirty` | `ai-tools/gufo-eval:rqw3-cand2-rocm101` (`5c3422ff2f69fc9a7de016db7d6a2fa3449704b3`, id `b950d7e6`); RQ2E-prism과 RQ2F(양쪽 같은 바이너리)에 쓴다 |
 | 후보 v2(폐기) | `git archive c94572b3` + `build/rq-release/w3-v2.patch`(W3 파일만, sha256 `7d8f53ffe9ff8bf5a16b201d3c8817c51ec62c3d93f4bf2bc49c1406acf5d68e`) → `build/rq-release/src-v2` | `/nix/store/na579jxnqsrh99lpsydxssbrz71nc4nj-gufo-0-unstable-dirty` | `ai-tools/gufo-eval:rqw3-cand-v2-rocm101` (`c94572b3…+w3-7d8f53ff`, id `578aebea`; v3의 FP32 반올림 장벽이 없음) |
 | 후보 v1(폐기) | 같은 방식, `w3.patch` sha256 `d7616048…`(기존 `.hip` 5개가 통째로 재포맷되었고 SwiGLU FP16 명시 반올림이 없음) | `/nix/store/fcqjgim118vh4kzvr402qdi2dn7hnv9g-gufo-0-unstable-dirty` | `ai-tools/gufo-eval:rqw3-cand-v1-rocm101` (id `f550f259`, 예전 태그 `rqw3-cand-rocm101`) |
 | 기준 | `git archive c94572b3` → `build/rq-release-base/src` | `/nix/store/c5nqyy4z36zpnz0b8wb84nkd5wz245ja-gufo-0-unstable-dirty` | `ai-tools/gufo-eval:rqw3-base-rocm101` (`c94572b3…`, id `0afd4cea`) |
@@ -461,6 +462,7 @@ PLAN은 "27B는 matmul 전에 활성화를 Q8_1로 양자화한다"고 적었지
   | Q8_0 | 5.81e-4 | 3.55e-4 |
 
   - Q8_0의 접기 오차는 원래 Q8_0 양자화 오차와 같은 차수다(재양자화). ②의 전체 KL로 함께 본다.
+  - **열린 위험(감독 2026-10-29):** Q8_0에서는 접기 오차(5.8e-4)가 저장 오차(3.6e-4)보다 커서, 두 텐서의 전체 오차가 약 1.9배가 된다. 텐서가 작아 받아들이지만, RQ2B-prism과 E1에서 다시 확인한다.
 - **접기 시간과 메모리:** 27B Q8_0 alpha·beta 96개(48층 × 2, 각 48×5120)는 25.1 MB다. 시간은 첫 GPU 창에서 `qwen27b_rq_hidden_probe`의 `RESULT … fold_seconds=`로 기록한다.
 - **CPU 테스트(`build/rq-cpu-test`, 이미지 `gufo-eval-deps:7c2c5a72-audio`):** `quant_rotation_test`와 `qwen27b_rotation_binding_test` 통과.
   - 처음 실행에서 binding 테스트가 segfault로 실패했다. 원인은 `BindRotation`이 부호 저장소를 `weights`로 옮긴(move) 다음에 그 저장소를 참조한 것이다. 옮기기 전에 포인터를 잡도록 고쳤다.
