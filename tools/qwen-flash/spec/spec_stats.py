@@ -14,6 +14,7 @@ estimators):
   acceptance              sum(accepted) / sum(drafted)
   accepted_per_token      sum(accepted) / sum(completion tokens)
   tokens_per_cycle        (sum(accepted) + sum(rounds)) / sum(rounds)        [needs a record]
+  drafts_per_cycle        sum(drafted) / sum(rounds)                         [needs a record]
   ar_token_share          1 - (sum(accepted) + sum(rounds)) / sum(tokens)    [tokens from non-speculative steps]
   lookup_share            sum(lookup_n) / sum(drafted)                       [needs a record]
   lookup_acceptance       sum(lookup_n_accepted) / sum(lookup_n)             [needs a record]
@@ -70,6 +71,7 @@ def request_text(body: str | None) -> str | None:
 def record_counts(path: Path, texts: dict[str, str]) -> dict[str, dict]:
     """Per-case server counts from a proxy record; `texts` maps prompt text to case id."""
     out: dict[str, dict] = {}
+    records = []
     for line in path.read_text(encoding="utf-8").splitlines():
         rec = json.loads(line)
         if rec.get("method") != "POST" or not str(rec.get("path", "")).endswith("/chat/completions"):
@@ -77,6 +79,14 @@ def record_counts(path: Path, texts: dict[str, str]) -> dict[str, dict]:
         case = texts.get(request_text(rec.get("request")))
         if case is None:
             continue  # not a suite prompt (for example a model probe)
+        records.append((case, rec, json.loads(rec["request"]).get("max_tokens")))
+    # serving_bench warms up with a shorter budget (16 tokens); keep the measured requests' budget only.
+    budgets = [b for _, _, b in records]
+    budget = max(set(budgets), key=budgets.count) if budgets else None
+    for case, rec, b in records:
+        if b != budget:
+            out.setdefault("_skipped_other_budget", {"records": 0})["records"] += 1
+            continue
         timings = stream_timings(rec.get("response", ""))
         if timings is None:
             raise ValueError(f"case {case}: response without timings (status {rec.get('status')})")
@@ -112,6 +122,7 @@ def stats(cases: dict, counts: dict | None, order: list[str], idx: np.ndarray) -
 
         acc, tok = a["accepted"], a["first_tokens"]
         out["tokens_per_cycle"] = ratio(lambda s: (s(acc) + s(rounds)) / s(rounds))
+        out["drafts_per_cycle"] = ratio(lambda s: s(a["drafted"]) / s(rounds))
         out["ar_token_share"] = ratio(lambda s: 1.0 - (s(acc) + s(rounds)) / s(tok))
         out["lookup_share"] = ratio(lambda s: s(lookup) / s(a["drafted"]))
         out["lookup_acceptance"] = ratio(lambda s: s(lookup_acc) / s(lookup))
@@ -137,6 +148,9 @@ def summary(report: dict, responses: Path | None, suites: list[Path], ar: dict |
     for c in sorted(cases):
         groups.setdefault(str(categories.get(c)), []).append(c)
     out = {"prompts": len(cases), "bootstrap": resamples, "seed": seed, "groups": {}}
+    if counts is not None:
+        out["records_per_case"] = sorted({counts[c]["records"] for c in cases})
+        out["skipped_records_other_budget"] = counts.get("_skipped_other_budget", {"records": 0})["records"]
     for name, order in groups.items():
         idx = accept.draws(len(order), resamples, seed)
         g = {"prompts": len(order), **stats(cases, counts, order, idx)}
