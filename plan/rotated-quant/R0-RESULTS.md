@@ -22,6 +22,7 @@
 - k = 64: 레코드가 작고(run당 약 26 MB), 절단 오차를 `coverage`로 직접 확인할 수 있다. 64가 충분한지는 BF16 run의 coverage로 판단한다.
 - 회전 파일도 같은 명령으로 돈다(모델 경로만 다름).
 - 툴체인(감독 결정 2026-10-29): R0, R2 ②, R4 품질 비교는 모두 같은 수집기 바이너리로 한다. ROCm 7.2.4 gpu-test 빌드, 이미지 `ai-tools/gufo-eval:64849ca6ec7b`(ROCm 7.2.4, libsndfile 포함. `7c2c5a728270`은 현재 트리가 요구하는 sndfile이 없어 configure가 실패했다). 메타데이터에 `toolchain`, `compiler`, `hip_version`을 기록한다. 속도는 따로 rocm101 측정 빌드로 잰다.
+- 고정 바이너리(감독 2026-10-29): `build/rq-w2-gpu-test/tests/models/qwen27b/qwen27b_rq_logits` sha256 `c680cb883f0eae904312d04b5f82fc3c982d8833932dd87348c624af4eaea3e1`. 소스는 작업 트리 스냅샷 `build/rq-w2-src`(HEAD `1243f22a` + W3 미커밋 변경, `git diff HEAD` sha256 `62e56da336ed2626aefbbeeafdb2addfe16e7813dd323f313b2d07eb532da8bb`, untracked 목록 sha256 `77711a78…`, 기록 `build/rq-w2-src.provenance`)다. 수집기 소스는 커밋 `976f351e`와 같다. 앞선 바이너리 `479a2a91…`은 W3이 운영 `.hip`를 다시 만들기 전 트리여서 쓰지 않는다.
 
 ## 평가 코퍼스 a01
 
