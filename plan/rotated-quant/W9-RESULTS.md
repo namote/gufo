@@ -298,3 +298,63 @@
   - (3) 89개 완성 sha256이 M0 AR과 같은지 본다.
   - D 비교에는 M1b가 먼저 필요하다.
 - functional `long-context`/`cache`: `run.py`로 c94572b3 기준선을 기록한 뒤 후보를 돌린다(F23 `suite` 드라이버 방식). 창 계획은 (2)·(3) 뒤에 쓴다.
+
+### M1b와 2·3단계 창 (2026-10-30)
+
+#### 창 실행 [확인]
+
+- M1b(`PLAN-W9-M1B.json`)와 I1V(`PLAN-W9-I1V.json`)를 감독의 "start" 뒤에 이어서 돌렸다. 둘 다 COMPLETE, 재시도 없음이다.
+  - 첫 실행 시도는 내 사전 검사가 다른 W의 짧은 CPU 컨테이너를 보고 시작을 거부했다. 창은 돌지 않았다. 검사가 최대 15분 기다리도록 고쳐서 다시 실행했다.
+- **M1b:** 529 s. 출력 `w9-m1b/w9-m1b-trace-d/receipt/run/trace-d.jsonl`(sha256 `30148eeb…`).
+- **I1V:** 서버 준비 283 s, bench 460/164/302 s. 출력은 `w9-i1v/w9-i1v-fn-mtp/receipt/run/`이다.
+- **분석:** `~/projects/ai.tools/storage/evaluations/w9-i1v-20261030/`(`validate_i1_a.json`, `validate_i1_ak.json`, `i1v_stats.json`, `cmp.py`, `trace_ak.jsonl`)
+
+#### D 재생은 아직 서버와 맞지 않는다 [확인, 원인 미확인]
+
+- M1b의 D 완성은 M1(4096 청크)과 **바이트 단위로 같다.** 그런데 서버와는 여전히 7/8이 다르다.
+- 그래서 앞의 "2048 pass 경계" 설명은 **틀렸다.** prefill pass 경계는 출력을 바꾸지 않는다.
+- **차이의 모양:** 생성 중간의 near-tie 지점에서 갈린다(13–782자째). 서버 AR도 서버 MTP와 같고 trace와는 다르다. 그래서 decode 경로 문제가 아니라, 긴 문맥에서 서버 쪽 상태(prefill 또는 캐시 경로)가 `Session::Sync`와 조금 다르다.
+- Flash-Next KV는 FP16 하나뿐이라(`kv_cache_type.cpp:22`) KV 양자화도 원인이 아니다.
+- **[짐작] 남은 후보:** 서버 component-cache의 in-pass checkpoint(프롬프트 끝 7토큰 앞)나 pass 끝 캡처(2048 배수)가 sparse attention/indexer 상태에 영향을 주고, 그 영향이 sparse 임계값을 넘는 긴 문맥에서만 드러나는 경우다. 확인하지 않았다.
+- **영향:** 정책 재생 검증(구현 = 모델)은 A+K 81개로 했다. D는 서버 실측(draft 수, 동일성)만 쓴다.
+- **해결 방안(감독 결정):** trace가 서버와 같은 `SyncThroughComponents`/`SyncThrough` 캡처 경계를 쓰게 고쳐 다시 빌드하고 trace를 다시 돈다(약 10분 창). 또는 D 재생 일치를 범위에서 뺀다.
+
+#### 2단계: I1 재생과 서버의 정확한 일치 [확인]
+
+- `spec_sim.py validate --policy I1`(M1 A+K trace) 대 I1V 서버 기록: **81/81 정확히 일치**(cycles, drafted, accepted, lookup, lookup_accepted). 프롬프트 토큰 수도 81/81 같다.
+- 그래서 구현이 TierRule + 기존 백오프 모델과 같게 동작한다.
+
+#### 3a단계: greedy 출력 동일성 [확인]
+
+- I1V의 89개 프롬프트, 모든 반복의 완성 sha256이 M0 AR과 같다: **89/89**.
+- 반복 사이 draft 수도 같다(결정성).
+
+#### I1 대 M0 (같은 외장 디스크 조건. tok/s는 참고용이고, 판정은 NVMe ABBA로 한다)
+
+| 세트 | I1/M0 decode tok/s (paired 95 %) | 수락률 차이 | I1 tok/s | I1 AR 대비 | 사이클당 드래프트 / 토큰 |
+|---|---|---|---|---|---|
+| A 64 | **1.126 [1.090, 1.175]** | +0.072 [0.055, 0.090] | 51.0 | 1.89× | 2.83 / 3.10 |
+| K 17 | **1.117 [1.093, 1.146]** | +0.006 [−0.018, 0.033] | 49.9 | 1.79× | 2.67 / 2.86 |
+| D 8 | **1.138 [1.070, 1.231]** | −0.004 [−0.053, 0.045] | 44.8 | 1.68× | 2.43 / 2.54 |
+
+- **시뮬레이터 예측(A+K +8.8 %)보다 실측이 조금 크다.** [짐작] 비용표가 2026-09-20 값이라 실제 행당 비용이 더 작을 수 있다.
+
+종류별 I1 tok/s (참고). Kyojin 카드 1.5.10 값은 괄호에 적었다.
+
+| 종류 | M0 → I1 | Kyojin |
+|---|---|---|
+| chat | 40.5 → 47.0 | (52.8) |
+| prose | 38.6 → 42.3 | (47.5) |
+| code | 56.4 → 66.2 | (73.2) |
+| multi | 38.3 → 41.5 | |
+| copy | 69.6 → 75.7 | |
+| 8K | 39.0 → 46.5 | (52.2) |
+| 32K | 39.8 → 43.3 | (51.1) |
+
+- Kyojin과의 격차는 M0의 1.23–1.34×에서 **1.11–1.18×**로 줄었다(측정 방법은 서로 다르다).
+- AR 대비 배율: chat 1.65×, prose 1.55×, code 2.39×. Kyojin SERVE.md의 1.42–1.91×와 비슷하거나 높다.
+
+#### 다음
+
+- I1F(기능 suite, `PLAN-W9-I1F.json`)는 W8 FAKEQ 뒤에 돈다.
+- 그 뒤 RQ2F → W8 speed → NVMe 복사 → I1 ABBA(MAIN/I1/GRID, `PLAN-W9-ABBA-*.json`, 판정 `tools/qwen-flash/spec/abba.py`).
