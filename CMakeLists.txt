@@ -328,6 +328,7 @@ add_library(gufo_core STATIC
   src/core/hip/hipblaslt_plan_database.cpp
   src/core/quant/ggml_dequant.cpp
   src/core/quant/ggml_gemm.cpp
+  src/core/quant/rotation.cpp
 )
 target_include_directories(gufo_core PUBLIC ${CMAKE_SOURCE_DIR})
 target_compile_definitions(gufo_core PRIVATE
@@ -1076,6 +1077,12 @@ if (BUILD_TESTING)
 
   add_test(NAME ggml_dequant_test COMMAND ggml_dequant_test)
   set_tests_properties(ggml_dequant_test PROPERTIES LABELS "cpu;core;quant")
+
+  add_executable(quant_rotation_test tests/core/quant/rotation_test.cpp)
+  target_link_libraries(quant_rotation_test PRIVATE gufo_core)
+  add_test(NAME quant_rotation_test COMMAND quant_rotation_test)
+  set_tests_properties(quant_rotation_test PROPERTIES
+    LABELS "cpu;core;quant;rotation")
 
   add_executable(ggml_gemm_parity_test tests/core/ggml_gemm_parity_test.cpp)
   target_link_libraries(ggml_gemm_parity_test PRIVATE gufo_core)
