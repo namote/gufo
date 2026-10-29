@@ -256,3 +256,45 @@
   - `spec_sim`을 새 정책으로 다시 돌려 서버 draft 수와 정확히 맞추기(구현과 모델의 동일성)
   - greedy 출력 동일성(M0 세트 89개 sha, `tests/functional`의 `long-context`와 `cache`)
   - 속도: main과 짝지은 대조. 요청·단계별 5 %·10 ms, ABBA. NVMe에 모델 복사가 필요하다(디스크 결정 필요).
+
+## I1 구현 (2026-10-30, 감독 승인: Kyojin TierRule 기본값, C1 greedy만, AR 백오프 유지)
+
+### 코드 (`f1cf33ac`)
+
+- `mtp_policy.hpp`:
+  - `DraftConfidence`: top-64 후보 위의 softmax. trace(`gpu_probe --mtp-trace`)와 같은 계산이다.
+  - `MtpConfidenceRule`: TierRule 0.6/0.3/0.95/0.85, 얕은 깊이 3.
+  - `MtpLengthController::Limit()`
+- `engine.cpp` `PrepareDecode`:
+  - 적용 조건은 greedy, 계획 배치 아님, `defer_head` 아님, occupancy 1, `DecodeConcurrency() == 1`이다(서버 `--sessions 1`의 단일 요청).
+  - 길이 컨트롤러의 `Choose`가 0이면 AR 백오프를 그대로 한다. 아니면 상한 `min(cap - 1, Limit())`까지 드래프트하고, 매 드래프트의 확신도로 남길지와 계속할지를 정한다.
+  - catch-up과 재귀 MtpForward가 토큰과 함께 top-64 후보를 낸다. 스텝마다 이미 호스트로 토큰을 읽고 있으므로 동기화는 늘지 않는다.
+  - `Observe`는 그대로 둔다. 그래서 백오프 판단은 유지된다.
+  - verify, 수락, lookup, sampled 경로, C>1은 바꾸지 않았다.
+- `spec_sim.py`: `TierBackoffPolicy`(I1), `validate --policy I1`
+- `mtp_sampling_test.cpp`: `CheckConfidenceRule`(경계값과 DraftConfidence)
+
+### 시뮬레이터: AR 백오프 유무 (A+K 81개, P0 대비 모델 tok/s)
+
+| 정책 | 전체 | chat | prose | creative | multi | code | copy | instruction |
+|---|---|---|---|---|---|---|---|---|
+| TierRule, 백오프 없음 | 1.104 | 1.113 | 1.056 | 1.135 | 1.109 | 1.100 | 1.039 | 1.116 |
+| **I1 = TierRule + 기존 백오프** | **1.088** | 1.113 | 1.041 | 1.094 | 1.089 | 1.100 | 1.039 | 1.086 |
+
+- 백오프를 유지하면 전체 1.6 %, creative 4 %를 잃는다(모델 기준).
+- 백오프를 빼는 것은 감독 결정대로 별도 커밋으로 제안한다. 지금은 유지한다.
+
+### 1단계: 단위 테스트 [확인]
+
+- 빌드: `build/w9-nix-i1-tests.nix`. 운영 derivation override이고, 소스는 c94572b3 + `build/w9-i1.patch`(sha256 `90dfc545…`)다.
+- `qwen38_flash_next_{mtp_sampling,prompt_lookup,draft_vocab}_test` 모두 PASS(`build/w9-nix-i1.log`).
+- 포맷 검사 PASS.
+
+### 다음 단계 준비
+
+- 후보 운영 빌드: `nix build path:/src/build/w9-i1-src#default` → `/nix/store/4fn3q3gs…-gufo-0-unstable-dirty`. 이미지 `ai-tools/gufo-eval:w9-i1-rocm101`(R2 방식으로 묶음).
+- **2·3단계 창 `PLAN-W9-I1V.json`(sha256 `806d85e7…`, LOCKS 반영):** M0 mtp와 같은 인자, 세트, 기록을 쓴다.
+  - (2) `spec_sim.py validate --policy I1`(M1 A+K trace와 M1b D trace)로 서버 draft 수와 프롬프트별 정확히 일치하는지 본다.
+  - (3) 89개 완성 sha256이 M0 AR과 같은지 본다.
+  - D 비교에는 M1b가 먼저 필요하다.
+- functional `long-context`/`cache`: `run.py`로 c94572b3 기준선을 기록한 뒤 후보를 돌린다(F23 `suite` 드라이버 방식). 창 계획은 (2)·(3) 뒤에 쓴다.
