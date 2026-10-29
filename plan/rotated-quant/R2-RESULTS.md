@@ -503,6 +503,29 @@ PLAN은 "27B는 matmul 전에 활성화를 Q8_1로 양자화한다"고 적었지
 - **3493:** 감독 결정으로 돌리지 않는다. 회전 BF16 두 파일(v1, prism seed 1)은 지웠다.
 - **위험(감독 2026-10-29):** 저비트 실험(E 계열)에서는 바닥 오차가 커서 이 칼날형 위치가 더 많이, 더 크게 뒤집힐 수 있다. E 계열의 KL은 평균과 함께 top1 제외 평균, 중앙값, 뒤집힘 비율로 읽는다.
 
+## R2 ③ DFlash2 텍스트 수락률, 회전 대 plain prism Q4 (창 `rq2e-prism`, 2026-10-29)
+
+- **창:** `~/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/rq2e-prism/rq2e-{plainq4,rotq4}-dflash2/`. 둘 다 COMPLETE, health_PASS true, pre/post busy 0 %, 재시도 없음.
+  - rot 창의 첫 시작은 `window.py`가 거부했다. 다른 세션의 `PLAN-EXL3-SMOKE.json`이 lock 뒤에 바뀌어 해시가 맞지 않았기 때문이다(컨테이너는 돌지 않았다). 감독 허락으로 `LOCKS.py`를 다시 돌리고 한 번 시작했다.
+- **설정:** 이미지 `rqw3-cand2-rocm101`(`5c3422ff`). 파일은 W1 prism UD-copy Q4 쌍(rot `107e9b11…`, plain `b1a830cc…`)이다. 드래프터 DFlash2 Q4_K_M(adaptive), 프롬프트 64개, C=1, 최대 256토큰, greedy, think off, 프롬프트 캐시 꺼짐, 반복 3회(세 반복의 draft 수 일치 검사 통과).
+- **분석:** `accept.py summary`와 `compare plain rot`, 프롬프트 단위 paired bootstrap 2000회. 보고는 `~/projects/ai.tools/storage/evaluations/rq-r0-20261029/rq2e-prism/`에 있다.
+
+| 대상 | 수락률 Σacc/Σdraft | 출력 토큰당 수락 토큰 | decode tok/s(참고용, CPU 오염) |
+|---|---|---|---|
+| plain prism Q4 | 0.4529 [0.4093, 0.5019] | 0.6611 [0.6218, 0.6986] | 18.76 [16.08, 21.86] |
+| rot prism Q4 | 0.4542 [0.4100, 0.5056] | 0.6623 [0.6236, 0.6986] | 22.42 [19.69, 25.85] |
+
+| paired 비교(rot − plain) | 값 [95 % 구간] |
+|---|---|
+| 수락률 차이 | +0.0014 [−0.0088, +0.0115] (구분 안 됨) |
+| 토큰당 수락 차이 | +0.0012 [−0.0073, +0.0096] (구분 안 됨) |
+| decode tok/s 비율 plain ÷ rot | 0.837 [0.698, 0.983] (참고용) |
+| 같은 완성 출력 | 9/64 |
+
+- **판정: 같다.** 두 지표 모두 paired 95 % 구간이 0을 포함한다. 구간 폭(약 ±0.01)은 R0의 UD 두 파일 비교와 같은 수준이다. 회전은 DFlash2 드래프터와의 일치를 떨어뜨리지 않는다.
+  - v1 파일 BF16 단일 궤적에서 본 수락 차이(진단 1–4)는 이 64 프롬프트 측정에서 보이지 않는다.
+- **tok/s는 판정에 쓰지 않는다:** 두 창이 도는 동안 W1 재변환과 W2 llama-perplexity가 CPU에서 돌았다. plain 18.8 tok/s는 R0 UD-Q4_K_M 29.5 tok/s보다 훨씬 낮다. 오염 정도가 두 창에서 달랐을 수 있으므로 비율 0.837도 의미가 없다.
+
 ## 로더 재정렬 설계 메모 (2026-10-29, 코드는 쓰지 않음)
 
 사용자 결정은 "컨버터 정렬 + 로더 조사"다. A/B 창 초안은 `PLAN-RQ2F.json`(원본 UD-Q4_K_M 대 W1의 align256 repack, 같은 v3 바이너리, ABBA, 5 %·10 ms, rocprofv3)이다.
