@@ -154,6 +154,7 @@ def score(reference: logits_io.Run, candidate: logits_io.Run, resamples: int,
         "seed": seed,
         "nll_ref": float(paired.nll_ref.mean()), "nll_cand": float(paired.nll_cand.mean()),
         "coverage": {"mean": float(paired.coverage.mean()),
+                     "p05": float(np.percentile(paired.coverage, 5)),
                      "p01": float(np.percentile(paired.coverage, 1)),
                      "min": float(paired.coverage.min())},
         **summarize(paired.values, paired.window, paired.position, resamples, block_tokens, seed),
@@ -193,7 +194,7 @@ def format_score(report: dict) -> str:
     lines = [f"{report['label'] or report['model']} [{report['path']}] vs "
              f"{report['reference_label']} [{report['reference_path']}]: n={report['n']} "
              f"windows={report['windows']} top-k mass mean={report['coverage']['mean']:.4f} "
-             f"min={report['coverage']['min']:.4f}"]
+             f"p5={report['coverage']['p05']:.4f} min={report['coverage']['min']:.4f}"]
     for name in METRICS:
         m = report[name]
         lines.append(f"  {name:9s} {m['mean']:+.6f}  token {fmt(m['token_ci'])}  "
