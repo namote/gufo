@@ -467,6 +467,20 @@ PLAN은 "27B는 matmul 전에 활성화를 Q8_1로 양자화한다"고 적었지
 - **CPU 테스트(`build/rq-cpu-test`, 이미지 `gufo-eval-deps:7c2c5a72-audio`):** `quant_rotation_test`와 `qwen27b_rotation_binding_test` 통과.
   - 처음 실행에서 binding 테스트가 segfault로 실패했다. 원인은 `BindRotation`이 부호 저장소를 `weights`로 옮긴(move) 다음에 그 저장소를 참조한 것이다. 옮기기 전에 포인터를 잡도록 고쳤다.
 
+## prism 로더 첫 GPU 창 (창 `rq2h`, `rq2g`, 2026-10-29)
+
+결과 위치: `~/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/rq2h/units/`와 `.../rq2g/probe/`. 파일 해시: rot prism Q4 `107e9b11…`, plain prism Q4 `b1a830cc…`(W1 `fe77eaa4` 재생성분), prism BF16 `1f0f3f8b…`.
+
+**`rq2h/units` (COMPLETE, pre/post busy 0 %, gpu-test HEAD `5c3422ff`, 이미지 `64849ca6ec7b`):** 일곱 단위가 모두 통과했다.
+- `qwen27b_rotation_kernels_test`, `quant_rotation_test`, `qwen27b_rotation_binding_test`가 통과했다. 접기 오차는 CPU 기록과 같다(BF16 1.61e-4, Q8_0 5.81e-4).
+- 비회전 UD-Q4_K_M 지문 27줄은 `rq2c-a01`, `rq2c-a02`와 바이트가 같다. prism 전환은 비회전 출력을 바꾸지 않는다.
+- 회전 prism UD-copy Q4(적재 시 alpha·beta 접기 포함)의 `qwen27b_target_test`가 통과했다(100.6 s). decode, prefill 128/257/2048, depth 8192의 1025, continuation, final output tile, C8/4/2/1 verify가 모두 일치한다.
+- 회전 대 plain prism Q4 기준 비교(27행): top1 27/27, mean KL 0.00881, mean TV 0.0379, mean NLL 차이 −0.0090. v1 파일(`rq2a-a05`)은 top1 26/27, KL 0.0086, NLL +0.0094였다. 같은 바이트의 다른 양자화이므로 ②는 아니다.
+- `qwen_dflash_gpu_test`도 회전 prism Q4로 통과했다.
+
+**`rq2g/probe` (FAILED, 재시도하지 않음):** 여섯 탐침이 모두 `too many target hidden-layer taps`로 끝났다. arena는 한 패스에 층 다섯 개까지만 탭한다(`kMaxTargetLayerTaps = 5`, `src/models/qwen/hip/arena.cpp`). 탐침이 64층을 한 번에 요청한 것이 원인이다. 모델과 로더의 문제가 아니다.
+- 고친 탐침은 다섯 층마다 상태를 리셋하고 프롬프트를 다시 돌린다(64층이면 13패스). 모든 패스의 logits가 바이트로 같아야 한다. HEAD 트리와 `build/rq-probe-v3-src`에 같은 수정을 넣었다. 빌드와 창 재실행은 허락을 기다린다.
+
 ## 로더 재정렬 설계 메모 (2026-10-29, 코드는 쓰지 않음)
 
 사용자 결정은 "컨버터 정렬 + 로더 조사"다. A/B 창 초안은 `PLAN-RQ2F.json`(원본 UD-Q4_K_M 대 W1의 align256 repack, 같은 v3 바이너리, ABBA, 5 %·10 ms, rocprofv3)이다.
