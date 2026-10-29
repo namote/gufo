@@ -358,3 +358,44 @@
 
 - I1F(기능 suite, `PLAN-W9-I1F.json`)는 W8 FAKEQ 뒤에 돈다.
 - 그 뒤 RQ2F → W8 speed → NVMe 복사 → I1 ABBA(MAIN/I1/GRID, `PLAN-W9-ABBA-*.json`, 판정 `tools/qwen-flash/spec/abba.py`).
+
+## 열린 관찰: 긴 문맥에서 HTTP 서버와 `Session::Sync`의 greedy 출력이 다르다 (2026-10-30)
+
+감독 결정(2026-10-30):
+- D의 정확한 재생 일치는 범위에서 뺀다. I1의 D 판정은 서버 측정(draft 수, 동일성, ABBA)만으로 한다.
+- 이 차이는 I1과 무관하다. 엔진의 기존 실행 경로 사이의 차이로 보고, 정확성 문제로 다루지 않는다. 다른 W에 넘길 수 있도록 기록만 남긴다.
+
+### 무엇이 다른가 [확인]
+
+- **같은 것:** 같은 리비전(c94572b3 기반), 같은 nix ROCm 10.1 / Clang 24, 같은 가중치(UD-Q4_K_XL + shared-Q8_0 MTP, sha256 확인), 같은 Model 옵션(context 49152, draft 7, decode concurrency 1), 같은 chat template(think off), 같은 프롬프트 토큰 수.
+- **(1) HTTP 서버:** `gufo serve llm --sessions 1`, `--speculative off` 또는 `mtp`, 요청 `cache_prompt: false`, greedy.
+- **(2) 엔진 직접 호출:** `Session::Sync`(한 번에, 또는 2048 prefix씩. 둘의 결과는 바이트 단위로 같다) 뒤에 `Session::Evaluate`로 greedy decode. 경로는 `qwen38_flash_next_gpu_probe --mtp-trace`이고, 이미지는 `w9-trace-rocm101`과 `w9-trace2-rocm101`이다.
+- **결과:**
+  - 2048토큰보다 짧은 프롬프트 81개는 (1)과 (2)가 바이트 단위로 같다.
+  - 약 7.3K–39K토큰 프롬프트 8개 중 7개는 생성 도중 갈린다.
+  - (1)의 AR과 MTP는 서로 같다(8/8). 그래서 decode 경로 차이가 아니라, prefill이나 상태 경로의 차이다.
+- KV 타입 차이는 아니다. Flash-Next는 FP16 KV 하나뿐이다(`src/cli/kv_cache_type.cpp:22`).
+
+### 재현 방법
+
+- **프롬프트:** `tools/qwen-flash/spec/suite_d.json`(sha256 `82929a75…`)의 8개. 저장소 docs를 `git show c94572b3:` 기준으로 잘랐다.
+- **서버 출력:** `~/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/w9-m0/w9-m0-fn-ar/receipt/run/responses-2.jsonl`(SSE 원문)
+- **엔진 직접 출력:** `…/w9-m1b/w9-m1b-trace-d/receipt/run/trace-d.jsonl`의 case 줄(`completion` ids, `text`)
+- **처음 갈리는 위치** (완성 텍스트 문자 위치, trace / 서버):
+
+| 프롬프트 | 프롬프트 토큰 | 처음 갈리는 문자 | trace | 서버 |
+|---|---:|---:|---|---|
+| d8k_0 | 7,369 | 274 | "climbed the spiral staircase…" | "climbed the final spiral…" |
+| d8k_1 | 7,274 | 782 | "that require more than just…" | "that contain not just…" |
+| d8k_2 | 7,355 | 같음 | — | — |
+| d8k_3 | 7,509 | 13 | "Based on the documentation provided" | "Based on the provided documentation" |
+| d32k_0 | 27,158 | 171 | "the keeper, moved through…" | "the keeper, had long since…" |
+| d32k_1 | 31,180 | 614 | "Retain immutable **shared chunks**" | "Retain immutable, shared prefix chunks" |
+| d32k_2 | 39,256 | 124 | "tearing the old stone tower" | "tearing the lighthouse" |
+| d32k_3 | 29,817 | 572 | "**Dependencies:**" | "**Model Weights:**" |
+
+### 짐작 (확인 안 됨)
+
+- 서버는 `cache_prompt: false`여도 component cache 캡처를 한다. M0 서버 로그(`w9-m0-fn-mtp/receipt/run/server-1.log`)에 2048 배수 위치와 프롬프트 끝 7토큰 앞(in-pass checkpoint, `SyncThrough`/`SyncThroughComponents`)의 retention 기록이 있다.
+- 이 캡처 경로가 sparse attention/indexer(압축 블록) 상태를 `Session::Sync`와 조금 다르게 남기고, 그 차이가 sparse 임계값을 넘는 긴 문맥에서만 near-tie를 뒤집는 것으로 보인다.
+- **확인 방법:** trace가 같은 경계에서 `SyncThrough(prompt, len − 7, &checkpoint)`와 component 캡처를 쓰게 하고 결과를 비교한다. 또는 서버에서 component cache를 끈 상태(가능하다면)로 비교한다.
