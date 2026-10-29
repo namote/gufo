@@ -139,6 +139,18 @@ R2 ② 판정은 W3/감독이 [R2 결과](R2-RESULTS.md)에서 한다. 여기에
 - **판정(감독 기준):** rot 파일의 KL이 plain 파일과 같은 차수이거나 그보다 작다. top-1도 plain보다 높다. 로더 오류의 신호(KL ≥ 0.1)는 없다. 그래서 **gufo의 prism 로더는 llama.cpp와 같은 모델을 계산한다.**
 - **plain이 rot보다 큰 이유(짐작, 확인하지 않음):** 남는 차이는 두 엔진의 산술 차이다(gufo GPU의 Q8_1/FP16 활성화 경로 대 llama.cpp CPU). 비회전 파일에서는 활성화 이상치가 활성화 양자화 오차를 키운다. 회전이 이상치를 펴 주므로 rot 파일에서 엔진 간 차이가 더 작게 보인다.
 
+## E10 0단계: 부호 변이 폭 (계획, 2026-10-29)
+
+- **창 계획:** `PLAN-RQ0-E10.json`(초안, 실행하지 않음). 모델 키는 `e10-{plain,seed1,seed2,seed3,nosign}`이고 파일마다 창 하나다.
+  - 대상: `qwen-3.8-27b-rot-prism-q4-test-gguf/`의 UD 복사 레시피 Q4(imatrix 없음). plain-prism(`b1a830cc…`), rot-prism seed 1(`107e9b11…`), seed 2, seed 3, 부호 없음(D = I).
+  - seed 2, seed 3, 부호 없음 파일은 W1이 만들고 있다. 파일 이름은 `…-rot-prism-{seed2,seed3,nosign}-UDcopy-Q4.gguf`로 가정했다. W1이 끝나면 `SHA256SUMS`에서 이름과 sha를 읽어 계획을 다시 만든다(생성 스크립트가 없는 파일을 PENDING으로 표시한다).
+- **설정:** R0와 같다. 코퍼스 a01, prefill·verify는 8창 전체, decode는 prefix 2048 × 512, top-k 256이다. 기준은 `rq0-a01/rq0-bf16`(이 수집기에서 바이트 동일, `rq2bp-same`)이고 수집기는 `b5219f1b`다.
+- **시간(짐작):** 파일마다 약 20분이다(R0 UD-Q4_K_XL 실적 5.0 + 8.1 + 6.2분에 로드 시간). 5개 합계 약 1시간 45분이다. 창마다 `--seconds` 6000이다.
+- **분석:**
+  - `metrics.py score`(`kl_tail` 포함).
+  - `metrics.py compare`: seed − plain, seed − seed, nosign − seed. 토큰·블록·창 구간을 낸다. 같은 레시피에서 부호만 바꿨을 때 결과가 얼마나 움직이는지를 구간 폭으로 본다.
+  - `metrics.py flips`(새로 추가): 변이별 top-1 뒤집힘 위치, 쌍마다 공유 수와 Jaccard, 모든 변이에서 뒤집힌 위치를 낸다.
+
 ## 평가 코퍼스 a01
 
 - 위치: `~/projects/ai.tools/storage/evaluations/rq-r0-20261029/corpus-a01/`(`SHA256SUMS` 포함). manifest 사본: `tools/qwen27b/rq_quality/corpus_manifest.json`. 빌더 `tools/qwen27b/rq_quality/corpus.py`, 소스 리비전 `f95d1302`, tokenizer는 HF `tokenizer.json`(sha256은 manifest). 두 번 빌드해 바이트 단위로 같았다.

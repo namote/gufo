@@ -150,6 +150,33 @@ def kl_tail(paired: Paired, top: int = 10) -> dict:
                          "kl": float(kl[i]), "top1_flip": bool(flips[i])} for i in order[:top]]}
 
 
+def flip_sets(reference: logits_io.Run, candidates: dict[str, logits_io.Run]) -> dict:
+    """Top-1 flip positions of several candidates on the same positions, and their overlaps.
+
+    For sign variants of one recipe (E10): which positions flip, how many each pair shares
+    (count and Jaccard), and how many flip in every variant."""
+    sets, keys = {}, None
+    for name, run in candidates.items():
+        p = Paired(reference, run)
+        k = list(zip(p.window.tolist(), p.position.tolist()))
+        if keys is None:
+            keys = k
+        elif k != keys:
+            raise ValueError(f"{name} scores different positions")
+        sets[name] = {k[i] for i in np.flatnonzero(p.top1 == 0)}
+    names = list(sets)
+    pairs = {}
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            shared = len(sets[a] & sets[b])
+            union = len(sets[a] | sets[b])
+            pairs[f"{a}|{b}"] = {"shared": shared, "jaccard": shared / union if union else 1.0}
+    common = set.intersection(*sets.values()) if sets else set()
+    return {"positions": len(keys or []), "flips": {n: len(v) for n, v in sets.items()}, "pairs": pairs,
+            "in_all": sorted([list(x) for x in common]),
+            "per_variant": {n: sorted([list(x) for x in v]) for n, v in sets.items()}}
+
+
 def categories_of(run: logits_io.Run) -> dict[int, str]:
     return {int(w["index"]): w.get("category", "") for w in run.meta.get("windows", [])}
 
@@ -233,10 +260,27 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--block-tokens", type=int, default=DEFAULT_BLOCK_TOKENS)
         p.add_argument("--seed", type=int, default=DEFAULT_SEED)
         p.add_argument("--out", type=Path, help="write the JSON report")
+    f = sub.add_parser("flips")
+    f.add_argument("--reference", required=True, help="reference run prefix")
+    f.add_argument("--out", type=Path)
+    f.add_argument("candidates", nargs="+", help="name=prefix of candidate runs on the same positions")
     sub.choices["score"].add_argument("candidates", nargs="+", help="candidate run prefixes")
     sub.choices["compare"].add_argument("first")
     sub.choices["compare"].add_argument("second")
     args = parser.parse_args(argv)
+    if args.command == "flips":
+        reference = logits_io.load(args.reference)
+        runs = {}
+        for item in args.candidates:
+            name, _, prefix = item.partition("=")
+            runs[name] = logits_io.load(prefix)
+        result = flip_sets(reference, runs)
+        result["schema"] = "gufo.rq-quality-flips.v1"
+        print(json.dumps({k: result[k] for k in ("positions", "flips", "pairs")}, indent=1))
+        print("in all:", len(result["in_all"]))
+        if args.out:
+            args.out.write_text(json.dumps(result, indent=1) + "\n")
+        return 0
     if args.bootstrap < 100 or args.block_tokens < 1:
         parser.error("--bootstrap must be >= 100 and --block-tokens >= 1")
     reference = logits_io.load(args.reference)

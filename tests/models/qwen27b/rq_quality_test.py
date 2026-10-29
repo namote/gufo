@@ -270,6 +270,18 @@ class MetricTest(unittest.TestCase):
         self.assertAlmostEqual(tail["largest"][0]["kl"], kl[0])
         self.assertEqual(len(tail["largest"]), 3)
 
+    def test_flip_sets(self):
+        runs = Runs(self.dir, self.ref, self.window, self.position, self.target, 8)
+        a = runs.candidate("a", self.cand)
+        far = (self.ref + self.rng.normal(0, 1.0, size=self.ref.shape)).astype(np.float32)
+        b = runs.candidate("b", far)
+        r = metrics.flip_sets(runs.ref, {"a": a, "b": b, "a2": runs.candidate("a2", self.cand)})
+        fa = {tuple(x) for x in r["per_variant"]["a"]}
+        self.assertEqual(r["flips"]["a"], int((self.cand.argmax(1) != self.ref.argmax(1)).sum()))
+        self.assertEqual(r["pairs"]["a|a2"]["jaccard"], 1.0)
+        self.assertEqual(r["pairs"]["a|b"]["shared"], len(fa & {tuple(x) for x in r["per_variant"]["b"]}))
+        self.assertTrue({tuple(x) for x in r["in_all"]} <= fa)
+
     def test_rejects_a_candidate_of_another_reference(self):
         runs = Runs(self.dir, self.ref, self.window, self.position, self.target, 8)
         records = logits_io.records_from_logits(self.cand, self.target, self.window,
