@@ -223,3 +223,15 @@
 - `ai-tools/gufo-eval:7c2c5a728270`에는 libsndfile 개발 파일이 없어 gufo CTest configure가 안 된다. CTest 확인은 `05e527d2cae5-rocm101` 이미지로 했다.
 - `R1A-RESULTS.md`의 YAML 레시피 예시는 이제 맞지 않는다(JSON으로 바뀜). 그 문서는 R1a 기록이라 고치지 않았다. 레시피 형식의 기준은 `tools/rotquant/recipe.py`의 docstring이다.
 - imatrix 범위 검사(항목 10의 주의)를 R3에서 정해야 한다.
+
+## 감독 확인 (2026-10-29)
+
+- 테스트를 eval 이미지 `7c2c5a728270`에서 다시 돌렸다: `tests/tools/rotquant_test.py` 23/23, `tests/models/qwen27b/rotquant_groups_test.py` 3/3 통과.
+- 해시를 감독이 따로 다시 계산했고, 둘 다 `SHA256SUMS`와 같았다.
+  - 회전 BF16: `7b4edef7…02e0`
+  - 회전 Q4: `76555d9a…3602`
+- 원시 로그를 표본으로 확인했다.
+  - llama.cpp는 회전 BF16과 회전 Q4를 모두 `wrong number of tensors; expected 1363, got 866`으로 거부했다. 비회전 Q4는 로드되어 "The capital of France is Paris."를 생성했다.
+  - 두 양자화 로그에 `not divisible`과 `fallback`이 0건이다.
+  - `check-rotated.json` 표본(`blk.0.ssm_alpha`)은 `bit_mismatches` 0이고 부호가 시드와 일치한다. 무작위 x의 상대 L2 오차는 1.7e-3–2.1e-3이다.
+- 커밋 `e91e30a2`의 CMake hunk는 W1 등록 두 건뿐이다. 다른 W의 변경은 섞이지 않았다.
