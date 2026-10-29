@@ -286,6 +286,9 @@ K는 모두 128의 배수다. `token_embd`는 행 조회라 회전 대상이 아
   1. W1이 upstream 명세를 우리 그룹 표에 대응시킨다(읽기만 함). 확인할 것: 부호 벡터 단위(입력 폭마다 하나인지), `head_in`, nextn 제외, GDN 순열 `P`, 허용 아키텍처와 텐서 종류, block 128, llama-quantize의 KV 보존. 대응이 안 되는 것이 있으면 사용자에게 묻는다.
   2. 컨버터(W1)와 로더(W3)를 바꾼다. 가중치 바이트는 그대로 두고 표시만 바꾸는 이전 도구로 기존 회전 파일을 옮겨서, R2 ②③ 결과를 그대로 쓸 수 있게 한다(부호 단위가 같을 때).
   3. upstream llama.cpp(`a9d27ac6` 이후)를 따로 빌드해 회전 Q4의 logits를 gufo와 비교한다.
+  - **명세 대응 결과(W1, [R1C-PRISM-MAPPING.md](R1C-PRISM-MAPPING.md)):** upstream은 부호 벡터를 입력 폭마다 하나 둔다(27B는 s₅₁₂₀: attn_in·ffn_in·head_in, s₆₁₄₄: ssm_out_in·attn_out_in, s₁₇₄₀₈: ffn_down_in). v1 파일(그룹·층별 부호)은 바이트를 보존한 채 옮길 수 없으므로 원본에서 다시 변환한다(회전 BF16 약 160 s, 회전 Q4 약 142 s). R2 ③(RQ2E)은 새 파일로 잰다. R2 ②(RQ2B, v1)는 회전·융합 커널 수학의 검증으로 남기고, 새 파일에서 다시 확인한다.
+  - **`ssm_alpha`/`ssm_beta` (사용자 결정 2026-10-29):** upstream 허용 목록에 없으므로 회전하지 않는다. gufo는 DeltaNet 층의 이 경로에 원래 기저 활성화를 넘긴다(W3).
+  - 출처 KV는 `gufo.rotation.source_*`를 유지한다. 교차 검증용 upstream 고정 리비전은 `8ab29fae`(master, `a9d27ac6` 이후)다.
   - 위험: 이 지원이 없는 llama.cpp(우리 기준 b11069 포함)는 이 파일을 평범한 `qwen35`로 읽어 조용히 틀린 출력을 낸다. 지금의 "llama.cpp 거부" 보호가 사라진다. 배포 문서에 최소 llama.cpp 버전을 적는다.
 
 ## 위험
