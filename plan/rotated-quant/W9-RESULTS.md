@@ -399,3 +399,21 @@
 - 서버는 `cache_prompt: false`여도 component cache 캡처를 한다. M0 서버 로그(`w9-m0-fn-mtp/receipt/run/server-1.log`)에 2048 배수 위치와 프롬프트 끝 7토큰 앞(in-pass checkpoint, `SyncThrough`/`SyncThroughComponents`)의 retention 기록이 있다.
 - 이 캡처 경로가 sparse attention/indexer(압축 블록) 상태를 `Session::Sync`와 조금 다르게 남기고, 그 차이가 sparse 임계값을 넘는 긴 문맥에서만 near-tie를 뒤집는 것으로 보인다.
 - **확인 방법:** trace가 같은 경계에서 `SyncThrough(prompt, len − 7, &checkpoint)`와 component 캡처를 쓰게 하고 결과를 비교한다. 또는 서버에서 component cache를 끈 상태(가능하다면)로 비교한다.
+
+### 3b단계: 기능 suite (I1F, 2026-10-30)
+
+- **창:** `PLAN-W9-I1F.json`, `w9-i1f-suite`. 한 번 돌렸고 재시도는 없다. 결과는 FAILED_no_fallback이다. 위치는 `~/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/w9-i1f/w9-i1f-suite/receipt/run/`.
+
+| 그룹 | 구성 | 결과 |
+|---|---|---|
+| standard-cache (`cache`) | `--sessions 2`, I1 비활성(회귀 확인) | **통과**(816 s). text/thinking/tool/image cancel, disk spacing, disk restore 사례가 모두 통과했다 |
+| single-session (`long-context` + `cache`) | `--sessions 1`, I1 활성 | **시험을 돌리지 못했다**: `server startup timed out` |
+
+- **원인 [확인: server.log].**
+  - 기능 runner에서는 디스크 캐시가 켜진다. 그래서 서버가 로드할 때 모델 artifact fingerprint를 만들면서 104 GB를 외장 USB에서 읽는다(`artifact_identity` 4분 43초).
+  - `suite.py`가 고정으로 넘기는 `--startup-timeout 600`을 넘겼다.
+  - 두 번째 그룹은 498 s로 간신히 통과했다. [짐작] 첫 시도 덕분에 page cache가 따뜻했다.
+  - I1과는 무관하다.
+- **감독 결정 (b):** NVMe 복사 뒤 ABBA 전에 single-session 그룹만 다시 돈다.
+  - 계획: `PLAN-W9-I1F2.json`(NVMe 모델 마운트, mmproj는 외장 읽기 전용, `runner_args: ["--startup-timeout", "1800"]`). `suite.py`의 고정 600 뒤에 붙으므로 마지막 값이 쓰인다.
+  - LOCKS 반영은 W8 SPEED가 끝난 뒤에 한다.
