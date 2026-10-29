@@ -11,7 +11,10 @@
     - ai.tools `rq_serving.py`의 `record_responses` 옵션(커밋하지 않음, sha256 `c0f1b5eacd2c5e9b83d370cade0e4950f893d26dd0b27070e1f4b7ddb58e4274`, 원본 `92a79dc7…` 백업은 W9 세션 scratchpad에 있음)
   - 27B R0 종류별 재집계.
   - **M0 창 2개(mtp, ar).**
-- 다음: M1(trace 도구 + 시뮬레이터). 빌드와 창 승인이 필요하다(아래 "M1 계획").
+- 완료(2026-10-30): M1 trace 도구와 시뮬레이터(`ba85850b`, 수정 `09b10ccd`), 빌드, M1 창. A+K 81/81 재생 일치. 정책 비교 결과가 아래 "M1 결과"에 있다.
+- 다음:
+  - M1b(D 8개 다시 trace, 창 약 15분)
+  - I1 구현 승인
 
 ## 도구 검증 [확인]
 
@@ -175,3 +178,81 @@
 
 - P0 재생이 M0와 맞고, 최선 후보(P1/P2)의 예상 이득이 A와 K 전체에서 **+3 % 이상**이면 I1 구현으로 간다.
 - 깊이 1 조건부 수락이 Kyojin 수치(ndt 2에서 87.6 %, 유리한 프롬프트)보다 확실히 낮으면, `--full-head`와 BF16 사이드카 trace로 I5(드래프트 품질 원인)를 먼저 본다.
+
+## M1 결과 (2026-10-30)
+
+### 빌드와 창 [확인]
+
+- **코드:** `ba85850b`, `09b10ccd`.
+  - `Session::ProbeDraftChain`(진단 메서드만 추가했고, 운영 경로는 그대로다)
+  - `gpu_probe --mtp-trace`
+  - `tools/qwen-flash/spec/spec_sim.py`
+- **빌드:**
+  - **첫 시도 실패:** `nix develop` gpu-test devShell은 torch, aotriton, rocmlir 같은 개발 도구를 소스부터 빌드하기 시작했다. 90분 timeout에 걸려 중단했다(`build/w9-nix-gpu-test.log`).
+  - **대신 운영 nix derivation을 override했다(`build/w9-nix-probe.nix`).** 같은 nixpkgs, ROCm 10.1, HIP Clang 24, RelWithDebInfo를 쓰고, `BUILD_TESTING=ON`(-UNDEBUG)으로 `qwen38_flash_next_gpu_probe`만 빌드했다.
+  - 소스는 `git archive c94572b3`(M0 바이너리와 같은 리비전) + `build/w9-trace.patch`(sha256 `a18b6df6…`)이고, `build/w9-src-snap`에 있다.
+  - 이미지 `ai-tools/gufo-eval:w9-trace-rocm101`(id `1ffe6c47`). `FROM 64849ca6ec7b` + runtime closure이고, 운영과 같은 patched ROCr wrapper가 붙는다.
+  - 빌드 중에 E10 창(품질 창)이 돌고 있었다. 감독 규칙상 허용되는 겹침이다.
+- **창:** `PLAN-W9-M1.json`, `w9-m1-trace`. COMPLETE, 1,369 s, 재시도 없음.
+  - 출력 `tmp/test-results/gufo-upstream-port-20261023/w9-m1/w9-m1-trace/receipt/run/trace.jsonl`(sha256 `923330bc6bb04cc179fbaa874c52c9aab87a10fc24bb75cf2337a91a60fc31a3`, 89개 프롬프트)
+
+### 검증: P0 재생 대 M0 서버
+
+| 세트 | 프롬프트 토큰 수 일치 | 완성 sha256 일치 | P0의 사이클/드래프트/수락/lookup 정확히 일치 |
+|---|---|---|---|
+| A | 64/64 | 64/64 | **64/64** |
+| K | 17/17 | 17/17 | **17/17** |
+| D | 8/8 | **1/8** | 1/8 |
+
+- **D가 어긋난 원인 [확인].**
+  - trace는 `Session::Sync` 한 번으로 prefill했다. 그래서 엔진 청크 4096 단위로 나뉘었다(`kPrefillChunkTokens`).
+  - HTTP 서버는 단일 세션 프롬프트를 2048 단위 pass로 넣는다(`kAdmissionPrefillTokens`, `text_generation_scheduler.hpp:31`). M0 서버 로그의 component-cache 캡처도 2048/4096/6144/…에 있다.
+  - pass 경계가 다르면 prefill 산술이 달라진다. 그래서 greedy 출력이 바뀌었다. d8k_2는 우연히 같았다.
+  - A/K 프롬프트는 모두 2048토큰보다 짧아서 영향이 없다.
+- **수정 `09b10ccd`:** `--prefill-step 2048`(기본값)으로 서버와 같은 prefix를 차례로 Sync한다.
+  - 같은 방식으로 다시 빌드해 `/nix/store/wib32lyl…`, 이미지 `w9-trace2-rocm101`(id `864dbcbf`)를 만들었다.
+  - D만 다시 도는 창 `PLAN-W9-M1B.json`(LOCKS 반영)이 승인을 기다린다.
+- 정책 비교는 **정확히 재생되는 A+K 81개**로만 했다. D는 M1b 뒤에 더한다.
+
+### 정책 비교 (A로 고르고, K로 따로 확인. C1 비용표 모델)
+
+- **스크립트:** `tools/qwen-flash/spec/{spec_sim.py, spec_sweep.py, spec_sensitivity.py}`
+- **결과 파일:** `~/projects/ai.tools/storage/evaluations/w9-m1-20261030/{validate.json, sweep_ak.json, sensitivity_ak.json}`
+- **모델 검증:** P0의 모델 tok/s는 A 43.4, K 41.8이다. M0 실측은 A 45.3, K 44.7이다(USB 참고값). 수 % 안에서 맞는다.
+
+| 정책 | A (고르는 데 씀) | K (따로 확인) |
+|---|---|---|
+| P0 현재 | 1.000 | 1.000 |
+| P1 Kyojin TierRule 기본값(0.6/0.3/0.95/0.85, 3) | 1.109 | **1.090** |
+| P1 격자에서 고른 값(thf 0.7, thv 0.4, thfd 0.8, thvd 0.4, dsplit 3) | 1.120 | **1.103** |
+| P2 비용 인식 확신도(decay 0.995, prior 8) | 1.082 | 1.064 |
+| P3 사후 최적(상한) | 1.341 | 1.326 |
+
+종류별 모델 tok/s (P0 → P1 고른 값 → P3):
+
+| chat | prose | creative | multi | code | copy | reasoning | structured |
+|---|---|---|---|---|---|---|---|
+| 37.7 → 42.5 → 51.2 | 36.1 → 38.6 → 47.5 | 32.7 → 36.6 → 45.6 | 36.9 → 41.2 → 51.1 | 49.8 → 55.4 → 65.4 | 61.5 → 64.5 → 70.7 | 51.3 → 57.5 → 67.7 | 48.9 → 56.9 → 63.2 |
+
+- **민감도 (A+K):** 계산하고 버린 드래프트 비용을 1–6 ms, 확률을 만드는 추가 비용을 드래프트마다 0–0.3 ms로 바꿔도 P1 고른 값은 +8.9 %에서 +11.8 % 사이, Kyojin 기본값은 +7.8 %에서 +10.7 % 사이다.
+- **[짐작] 해석:**
+  - 지금 컨트롤러는 드래프트 전에 길이를 정한다. 그래서 확신이 높은 구간에서는 짧게 끊고, 낮은 토큰에서는 정해진 길이를 다 쓴다.
+  - 토큰별 확률 누적곱으로 계속/정지를 정하면, 수락이 0.67에서 0.74로 오르면서 사이클당 드래프트도 늘어난다.
+  - 사후 최적과의 남은 거리(+33 %)는 확신도 신호의 한계(top-64 softmax)와 드래프트 품질에 있다.
+- **판단점(+3 % 이상)을 넘었다. I1 구현을 제안한다.**
+
+### I1 구현 제안 (승인 대기)
+
+- **정책:** C1 greedy와 sampled 요청의 MTP 사슬 길이를 토큰별 확률 누적곱(TierRule, 고른 값 또는 Kyojin 기본값. 감독이 고른다)으로 정한다. 상한은 7 그대로다.
+  - lookup, verify, 수락, 샘플링은 바꾸지 않는다. 그래서 greedy 출력은 바이트 단위로 같다.
+  - C>1 계획 배치(`MtpBatchController`)는 1단계에서 바꾸지 않는다.
+  - sampled는 제안 분포가 바뀌므로 seeded 재현은 달라지지만, 분포는 정확하다. 적용 범위는 감독이 정한다.
+- **확률 신호:** greedy 드래프트 스텝에서 지금은 `.token`만 요청한다. 같은 헤드 logits로 max softmax를 내는 작은 커널(argmax와 logsumexp)을 더하거나, 기존 top-64 후보 경로를 쓴다.
+  - 스텝마다 이미 토큰을 호스트로 읽으므로 동기화는 늘지 않는다(`executor.cpp:4411`).
+  - 추가 비용은 민감도 0.3 ms 안에 들어야 한다(op 테스트와 profile로 확인).
+- **AR 백오프:** TierRule에는 백오프가 없다. 기존 `retry_tokens` 구조를 유지할지는 시뮬레이터로 따로 비교한다.
+- **검증:**
+  - 컨트롤러 단위 테스트
+  - `spec_sim`을 새 정책으로 다시 돌려 서버 draft 수와 정확히 맞추기(구현과 모델의 동일성)
+  - greedy 출력 동일성(M0 세트 89개 sha, `tests/functional`의 `long-context`와 `cache`)
+  - 속도: main과 짝지은 대조. 요청·단계별 5 %·10 ms, ABBA. NVMe에 모델 복사가 필요하다(디스크 결정 필요).
