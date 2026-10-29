@@ -135,6 +135,21 @@ def summarize(values: dict[str, np.ndarray], window: np.ndarray, position: np.nd
     return out
 
 
+def kl_tail(paired: Paired, top: int = 10) -> dict:
+    """Tail view of the KL beside its mean (R2 (2)): mean without the largest position, median,
+    top-1 flips and how many flips have KL > 1, and the largest positions."""
+    kl = paired.kl
+    order = np.argsort(-kl, kind="stable")
+    flips = paired.top1 == 0
+    return {"mean": float(kl.mean()),
+            "mean_without_top1": float(np.delete(kl, order[0]).mean()) if len(kl) > 1 else 0.0,
+            "median": float(np.median(kl)),
+            "top1_flips": int(flips.sum()), "flip_rate": float(flips.mean()),
+            "flips_with_kl_gt_1": int((flips & (kl > 1)).sum()),
+            "largest": [{"window": int(paired.window[i]), "position": int(paired.position[i]),
+                         "kl": float(kl[i]), "top1_flip": bool(flips[i])} for i in order[:top]]}
+
+
 def categories_of(run: logits_io.Run) -> dict[int, str]:
     return {int(w["index"]): w.get("category", "") for w in run.meta.get("windows", [])}
 
@@ -158,6 +173,7 @@ def score(reference: logits_io.Run, candidate: logits_io.Run, resamples: int,
                      "p01": float(np.percentile(paired.coverage, 1)),
                      "min": float(paired.coverage.min())},
         **summarize(paired.values, paired.window, paired.position, resamples, block_tokens, seed),
+        "kl_tail": kl_tail(paired),
     }
     names = categories_of(candidate)
     by_category = {}

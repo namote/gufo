@@ -113,3 +113,33 @@ def records_from_logits(logits: np.ndarray, targets: np.ndarray, windows: np.nda
     ref_ids = ids if reference_ids is None else reference_ids
     out["ref_logits"] = np.take_along_axis(logits, ref_ids, axis=1)
     return out
+
+
+def same_records(old: Run, new: Run) -> dict:
+    """Whether every record of `new` is byte-identical to the record of `old` at the same
+    (window, position). Used to show a rebuilt collector reproduces an earlier reference run."""
+    if old.top_k != new.top_k:
+        raise ValueError("top-k differs")
+    if old.meta.get("windows_tokens_sha256") != new.meta.get("windows_tokens_sha256"):
+        raise ValueError("corpus windows differ")
+    okeys, nkeys = old.keys(), new.keys()
+    index = np.searchsorted(okeys, nkeys)
+    present = (index < len(okeys)) & (okeys[np.minimum(index, len(okeys) - 1)] == nkeys)
+    if not present.all():
+        raise ValueError(f"{int((~present).sum())} records of the new run are not in the old run")
+    a = old.records[index].tobytes()
+    b = new.records.tobytes()
+    size = new.records.dtype.itemsize
+    differ = [i for i in range(len(new.records)) if a[i * size:(i + 1) * size] != b[i * size:(i + 1) * size]]
+    return {"records": len(new.records), "identical": len(new.records) - len(differ),
+            "first_differences": [{"window": int(new.records[i]["window"]),
+                                   "position": int(new.records[i]["position"])} for i in differ[:10]]}
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) != 4 or sys.argv[1] != "same":
+        raise SystemExit("usage: logits_io.py same OLD_PREFIX NEW_PREFIX")
+    result = same_records(load(sys.argv[2]), load(sys.argv[3]))
+    print(json.dumps(result))
+    raise SystemExit(0 if result["identical"] == result["records"] else 1)

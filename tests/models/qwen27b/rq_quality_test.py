@@ -109,6 +109,25 @@ class RecordTest(unittest.TestCase):
                 logits_io.load(Path(d) / "dup")
 
 
+class SameRecordsTest(unittest.TestCase):
+    def test_subset_identity_and_difference(self):
+        rng = np.random.default_rng(9)
+        ref, cand, window, position, target = synthetic(rng, windows=2, length=16)
+        with tempfile.TemporaryDirectory() as d:
+            full = logits_io.records_from_logits(ref, target, window, position, 8)
+            logits_io.write(Path(d) / "old", full, windows_tokens_sha256="t")
+            part = full[(window == 1) & (position < 5)]
+            logits_io.write(Path(d) / "new", part, windows_tokens_sha256="t")
+            r = logits_io.same_records(logits_io.load(Path(d) / "old"), logits_io.load(Path(d) / "new"))
+            self.assertEqual((r["records"], r["identical"]), (5, 5))
+            changed = part.copy()
+            changed["logits"][2, 0] = np.nextafter(changed["logits"][2, 0], np.float32(10))
+            logits_io.write(Path(d) / "chg", changed, windows_tokens_sha256="t")
+            r = logits_io.same_records(logits_io.load(Path(d) / "old"), logits_io.load(Path(d) / "chg"))
+            self.assertEqual(r["identical"], 4)
+            self.assertEqual(r["first_differences"], [{"window": 1, "position": 2}])
+
+
 class MetricTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -175,6 +194,17 @@ class MetricTest(unittest.TestCase):
         self.assertLess(diff["kl"]["token_ci"][1], 0)
         self.assertEqual(set(a["categories"]), {"even", "odd"})
         self.assertEqual(sum(c["n"] for c in a["categories"].values()), a["n"])
+
+    def test_kl_tail(self):
+        runs = Runs(self.dir, self.ref, self.window, self.position, self.target, 16)
+        paired = metrics.Paired(runs.ref, runs.candidate("c", self.cand))
+        tail = metrics.kl_tail(paired, top=3)
+        kl = np.sort(paired.kl)[::-1]
+        self.assertAlmostEqual(tail["mean_without_top1"], kl[1:].mean())
+        self.assertAlmostEqual(tail["median"], float(np.median(kl)))
+        self.assertEqual(tail["top1_flips"], int((paired.top1 == 0).sum()))
+        self.assertAlmostEqual(tail["largest"][0]["kl"], kl[0])
+        self.assertEqual(len(tail["largest"]), 3)
 
     def test_rejects_a_candidate_of_another_reference(self):
         runs = Runs(self.dir, self.ref, self.window, self.position, self.target, 8)

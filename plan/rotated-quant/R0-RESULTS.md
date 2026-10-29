@@ -28,6 +28,22 @@
 - 고정 바이너리(감독 2026-10-29, v3 트리): `build/rq-w2-gpu-test/tests/models/qwen27b/qwen27b_rq_logits` sha256 `5ed601662b7b195885d8bb0ef83a94f9159396e9f6486a5cc86e0e6d6f73d0c0`. 소스는 작업 트리 스냅샷 `build/rq-w2-src`다(HEAD `32dbf0fc` + W3 미커밋 v3 변경, `git diff HEAD` sha256 `916bfef7726bdb594e6f727564739fb7e0109f22911229fda61343d8dd9a567e`, untracked 목록 sha256 `20bf604d…`, 기록 `build/rq-w2-src.provenance`). 수집기 소스는 커밋 `976f351e`과 같다. smoke 창(`rq0-smoke-a01`)은 그 전 바이너리 `c680cb88…`로 돌렸고 smoke 전용이다. `479a2a91…`은 쓰지 않았다.
 - top-k(감독 2026-10-29): 256으로 R0, R2 ②, R4 전체에 고정한다. smoke에서 top-64 기준 질량이 평균 0.84, 최소 0.275였기 때문이다. 결과 표에는 기준 top-k 질량의 평균, p5, 최소를 모델·경로별로 낸다. 전체 창 평균이 0.95보다 낮으면 1024로 올릴지 감독이 정한다.
 
+## prism 로더용 수집기 재빌드 (2026-10-29)
+
+- 로더가 upstream `prism.hadamard.*`로 바뀌었다(PLAN D8, W3 `d23a9be5`, `e8a1eeb7`, `5c3422ff`). `5ed60166`은 v1 로더 트리라 prism 파일을 읽지 못하므로 수집기를 다시 빌드했다.
+- 새 바이너리: `build/rq-w2-prism-gpu-test/tests/models/qwen27b/qwen27b_rq_logits` sha256 `b5219f1b64387a45177eb77570cf352dd7e476bf2bcbd04618806094d9deb65e`.
+  - 소스: `build/rq-w2-prism-src`. HEAD는 `5c3422ff2f69fc9a7de016db7d6a2fa3449704b3`이다.
+  - `git diff HEAD` sha256은 `430e37acf782…`(1,307바이트, `plan/rotated-quant/R2-RESULTS.md`만)이다. untracked는 `.dockerignore`와 `.gufo-revision`이다. 기록 파일은 `build/rq-w2-prism-src.provenance`다.
+  - 수집기 소스는 커밋 `976f351e`과 같다.
+  - 툴체인은 이전과 같다(ROCm 7.2.4 gpu-test, 이미지 `ai-tools/gufo-eval:64849ca6ec7b`, `-j8`).
+  - 이전 바이너리 `5ed60166`(`build/rq-w2-gpu-test`)은 그대로 둔다.
+- **BF16 기준 재사용 조건:** 새 수집기의 비회전 출력이 `5ed60166`과 바이트 단위로 같아야 한다. W3 RQ2H는 UD-Q4_K_M fingerprint를 `rq-gpu-test` 빌드로 본다. BF16 가중치 경로와 이 바이너리는 그 범위 밖이다.
+  - 그래서 `PLAN-RQ2B-PRISM.json`의 `rq2bp-same` 창(약 10분)을 먼저 돌린다. BF16 창 0의 prefill·verify(각 4,095위치)와 decode(prefix 2048, 64위치)를 `logits_io.py same`으로 `rq0-a01` 기록과 레코드 단위로 대조한다.
+  - 하나라도 다르면 BF16 기준을 새 바이너리로 다시 수집해야 한다.
+- 도구 추가:
+  - `logits_io.py same OLD NEW`: 새 run의 레코드가 옛 run의 같은 위치 레코드와 바이트 단위로 같은지 본다.
+  - `metrics.py score`의 `kl_tail`: 평균, 최대 위치 하나를 뺀 평균, 중앙값, top-1 뒤집힘 수, 그중 KL > 1인 수, 상위 위치를 낸다. W3 RQ2B 표의 값(prefill 4.86e-4 / 5.86e-5 / 1.17e-5 / 132 / 1)을 그대로 재현했다.
+
 ## 평가 코퍼스 a01
 
 - 위치: `~/projects/ai.tools/storage/evaluations/rq-r0-20261029/corpus-a01/`(`SHA256SUMS` 포함). manifest 사본: `tools/qwen27b/rq_quality/corpus_manifest.json`. 빌더 `tools/qwen27b/rq_quality/corpus.py`, 소스 리비전 `f95d1302`, tokenizer는 HF `tokenizer.json`(sha256은 manifest). 두 번 빌드해 바이트 단위로 같았다.
