@@ -21,7 +21,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 import numpy as np  # noqa: E402
 
 from gufo import gguf as shared_gguf  # noqa: E402
-from rotquant import convert  # noqa: E402
+from rotquant import check_rotated, convert  # noqa: E402
 from rotquant.gguf_io import OutTensor, U32, as_float32, encode_value, open_gguf, write_gguf  # noqa: E402
 from rotquant.hadamard import (BLOCK_SIZE, bf16_bits_to_f32, f32_to_bf16_bits,  # noqa: E402
                                rotate_last_axis, signs, sylvester)
@@ -633,6 +633,26 @@ class ConverterTest(unittest.TestCase):
                                        "--llama-quantize", script, "--output", self.dir / f"bad-{name}.gguf")
                 self.assertEqual(code, 2)
                 self.assertIn(message, err)
+
+    def test_check_rotated_on_a_converted_file(self):
+        rot = self.rotate_all(seed=11)
+        report = self.dir / "check.json"
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = check_rotated.main(["--groups", "qwen27b", "--seed", "11", "--source", str(self.split[0]),
+                                       "--rotated", str(rot), "--rows", "0", "--json", str(report)])
+        self.assertEqual(code, 0, out.getvalue())
+        summary = json.loads(report.read_text())
+        self.assertEqual(summary["rotated_groups"], list(ALL_GROUPS))
+        self.assertEqual({r["group"] for r in summary["tensors"]}, set(ALL_GROUPS))
+        for r in summary["tensors"]:
+            self.assertEqual(r["bit_mismatches"], 0, r["tensor"])
+            self.assertTrue(r["signs_match_seed"], r["tensor"])
+            self.assertLess(max(r["random"]["rel_l2"] + r["outlier"]["rel_l2"]), 4e-3, r["tensor"])
+            self.assertLessEqual(r["weight_rel_rounding_max"], 2.0 ** -8 * (1 + 1e-3), r["tensor"])
+        # The wrong seed is reported.
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(check_rotated.main(["--groups", "qwen27b", "--seed", "12", "--source",
+                                                 str(self.split[0]), "--rotated", str(rot)]), 1)
 
     def test_nextn_blocks_are_not_rotated(self):
         tensors = dict(self.tensors)
