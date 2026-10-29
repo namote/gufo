@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Synthetic-tensor checks for tools/rotquant (no model files, no GPU).
 
-Run with NumPy and PyYAML: python3 -I tests/tools/rotquant_test.py
+Run with NumPy: python3 -I tests/tools/rotquant_test.py
 """
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from pathlib import Path
 import struct
 import sys
 import tempfile
-import textwrap
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -181,40 +180,44 @@ class HadamardTest(unittest.TestCase):
 class RecipeTest(unittest.TestCase):
     allowed = GROUPS.recipe_types()
 
-    def parse(self, text):
-        return parse_recipe(textwrap.dedent(text), ALL_GROUPS, self.allowed)
+    def parse(self, data):
+        text = data if isinstance(data, str) else json.dumps(data)
+        return parse_recipe(text, ALL_GROUPS, self.allowed)
 
     def test_parse(self):
         recipe = self.parse(r"""
-            version: 1
-            rotate: [ffn_in, attn_in]
-            types:
-              - match: '^blk\.\d+\.ssm_out\.weight$'
-                type: Q6_K
-              - match: '\.weight$'
-                type: Q4_K
+            {"version": 1,
+             "rotate": ["ffn_in", "attn_in"],
+             "types": [{"match": "^blk\\.\\d+\\.ssm_out\\.weight$", "type": "Q6_K"},
+                       {"match": "\\.weight$", "type": "Q4_K"}]}
             """)
         self.assertEqual(recipe.rotate, ("attn_in", "ffn_in"))  # definition order
+        self.assertEqual([r.match for r in recipe.rules], [r"^blk\.\d+\.ssm_out\.weight$", r"\.weight$"])
         self.assertEqual([r.type_name for r in recipe.rules], ["Q6_K", "Q4_K"])
-        self.assertEqual(self.parse("version: 1\nrotate: all\n").rotate, ALL_GROUPS)
-        self.assertEqual(self.parse("version: 1\nrotate: none\n").rotate, ())
-        self.assertIsNone(self.parse("version: 1\n").rotate)
+        self.assertEqual(self.parse({"version": 1, "rotate": "all"}).rotate, ALL_GROUPS)
+        self.assertEqual(self.parse({"version": 1, "rotate": "none"}).rotate, ())
+        self.assertIsNone(self.parse({"version": 1}).rotate)
 
     def test_rejects(self):
         cases = {
-            "version: 2\n": "version",
-            "version: 1\nextra: 1\n": "unknown recipe key",
-            "version: 1\nrotate: [attn_in, nope]\n": "unknown input group",
-            "version: 1\nrotate: [attn_in, attn_in]\n": "repeats",
-            "version: 1\nrotate: no\n": "rotate must be",
-            "version: 1\ntypes: [{match: x, type: Q2_K}]\n": "not supported",
-            "version: 1\ntypes: [{match: x, type: Q8_K}]\n": "not supported",
-            "version: 1\ntypes: [{match: x, type: q4_k}]\n": "not supported",
-            "version: 1\ntypes: [{match: '(', type: Q4_K}]\n": "invalid pattern",
-            "version: 1\ntypes: [{match: x}]\n": "exactly the keys",
-            "version: 1\ntypes: {a: b}\n": "must be a list",
-            "[1, 2]\n": "mapping",
-            "version: 1\n  bad: [\n": "not valid YAML",
+            '{"version": 2}': "version",
+            '{"version": 1.0}': "version",
+            '{"version": true}': "version",
+            '{"version": 1, "extra": 1}': "unknown recipe key",
+            '{"version": 1, "rotate": ["attn_in", "nope"]}': "unknown input group",
+            '{"version": 1, "rotate": ["attn_in", "attn_in"]}': "repeats",
+            '{"version": 1, "rotate": false}': "rotate must be",
+            '{"version": 1, "types": [{"match": "x", "type": "Q2_K"}]}': "not supported",
+            '{"version": 1, "types": [{"match": "x", "type": "Q8_K"}]}': "not supported",
+            '{"version": 1, "types": [{"match": "x", "type": "q4_k"}]}': "not supported",
+            '{"version": 1, "types": [{"match": "(", "type": "Q4_K"}]}': "invalid pattern",
+            '{"version": 1, "types": [{"match": "x"}]}': "exactly the keys",
+            '{"version": 1, "types": [{"match": "x", "type": "Q4_K", "type": "Q8_0"}]}': "repeats the key",
+            '{"version": 1, "version": 1}': "repeats the key",
+            '{"version": 1, "types": {"a": "b"}}': "must be a list",
+            "[1, 2]": "JSON object",
+            "version: 1\n": "not valid JSON",
+            '{"version": 1,}': "not valid JSON",
         }
         for text, message in cases.items():
             with self.subTest(text=text), self.assertRaisesRegex(RecipeError, message):
@@ -248,9 +251,9 @@ class ConverterTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         return out
 
-    def recipe(self, text, name="r.yaml"):
+    def recipe(self, data, name="r.json"):
         path = self.dir / name
-        path.write_text(textwrap.dedent(text))
+        path.write_text(json.dumps(data))
         return path
 
     def test_split_input_is_read_as_one_model(self):
@@ -383,10 +386,10 @@ class ConverterTest(unittest.TestCase):
         tied = write_single(self.dir / "tied.gguf", toy_tensors(np.random.default_rng(1), tied=True))
         other_arch = write_single(self.dir / "llama.gguf", self.tensors,
                                   kv=[("general.architecture", encode_value("llama"))])
-        q4 = self.recipe("version: 1\ntypes: [{match: '\\.weight$', type: Q4_K}]\n", "q4.yaml")
-        unused = self.recipe("version: 1\ntypes: [{match: '\\.weight$', type: Q8_0}, "
-                             "{match: 'nothing', type: Q4_K}]\n", "unused.yaml")
-        partial = self.recipe("version: 1\ntypes: [{match: 'ffn', type: Q8_0}]\n", "partial.yaml")
+        q4 = self.recipe({"version": 1, "types": [{"match": r"\.weight$", "type": "Q4_K"}]}, "q4.json")
+        unused = self.recipe({"version": 1, "types": [{"match": r"\.weight$", "type": "Q8_0"},
+                                                      {"match": "nothing", "type": "Q4_K"}]}, "unused.json")
+        partial = self.recipe({"version": 1, "types": [{"match": "ffn", "type": "Q8_0"}]}, "partial.json")
         rot = self.rotate_all()
         cases = [
             ("tied to token_embd.weight", ["--input", tied, "--rotate-groups", "head_in", "--seed", 1,
@@ -434,19 +437,11 @@ class ConverterTest(unittest.TestCase):
         self.assertIn("output_norm.weight: rotated type BF16 is not supported for the norm role", err)
 
     def test_dry_run_table(self):
-        recipe = self.recipe(r"""
-            version: 1
-            rotate: [attn_in, ffn_in, ffn_down_in]
-            types:
-              - match: 'attn_output|ssm_alpha|ssm_beta'
-                type: Q8_0
-              - match: 'ssm_out'
-                type: Q6_K
-              - match: '^token_embd'
-                type: Q8_0
-              - match: '\.weight$'
-                type: Q4_K
-            """)
+        recipe = self.recipe({"version": 1, "rotate": ["attn_in", "ffn_in", "ffn_down_in"], "types": [
+            {"match": "attn_output|ssm_alpha|ssm_beta", "type": "Q8_0"},
+            {"match": "ssm_out", "type": "Q6_K"},
+            {"match": "^token_embd", "type": "Q8_0"},
+            {"match": r"\.weight$", "type": "Q4_K"}]})
         code, out, err = run_cli("--groups", "qwen27b", "--input", self.split[0], "--recipe", recipe,
                                  "--seed", 3, "--dry-run")
         self.assertEqual(code, 0, err)
@@ -486,7 +481,7 @@ class ConverterTest(unittest.TestCase):
             parts = line.split()
             if parts and parts[0] in quantized:
                 self.assertEqual(parts[6], quantized[parts[0]][0], parts[0])
-        recipe = self.recipe("version: 1\ntypes: [{match: '.', type: Q8_0}]\n")
+        recipe = self.recipe({"version": 1, "types": [{"match": ".", "type": "Q8_0"}]})
         code, _, err = run_cli("--groups", "qwen27b", "--input", self.split[0], "--rotate-groups", "all",
                                "--seed", 1, "--copy-recipe-from", header, "--recipe", recipe, "--dry-run")
         self.assertEqual(code, 2)
@@ -508,15 +503,9 @@ class ConverterTest(unittest.TestCase):
 
     def test_quantize_command_from_rotated_file(self):
         rot = self.rotate_all()
-        recipe = self.recipe(r"""
-            version: 1
-            rotate: all
-            types:
-              - match: 'attn_output'
-                type: Q8_0
-              - match: '\.weight$'
-                type: IQ4_XS
-            """)
+        recipe = self.recipe({"version": 1, "rotate": "all", "types": [
+            {"match": "attn_output", "type": "Q8_0"},
+            {"match": r"\.weight$", "type": "IQ4_XS"}]})
         script, log = self.fake_quantize()
         imatrix = self.dir / "rot.imatrix"
         imatrix.write_bytes(b"x")
@@ -552,7 +541,8 @@ class ConverterTest(unittest.TestCase):
 
     def test_quantize_from_bf16_rotates_first(self):
         script, log = self.fake_quantize()
-        recipe = self.recipe("version: 1\nrotate: [ffn_down_in]\ntypes: [{match: '.', type: Q8_0}]\n")
+        recipe = self.recipe({"version": 1, "rotate": ["ffn_down_in"],
+                              "types": [{"match": ".", "type": "Q8_0"}]})
         out = self.dir / "q8.gguf"
         code, _, err = run_cli("--groups", "qwen27b", "--input", self.split[0], "--recipe", recipe,
                                "--seed", 4, "--llama-quantize", script, "--output", out)
@@ -565,7 +555,8 @@ class ConverterTest(unittest.TestCase):
             self.assertNotEqual(model.kv["gufo.rotation.source_recipe_sha256"],
                                 argv[argv.index("--override-kv") + 3].split("str:")[1])
         # Without rotation the input is quantized directly and keeps its provenance.
-        recipe = self.recipe("version: 1\nrotate: none\ntypes: [{match: '.', type: Q8_0}]\n", "none.yaml")
+        recipe = self.recipe({"version": 1, "rotate": "none", "types": [{"match": ".", "type": "Q8_0"}]},
+                             "none.json")
         out = self.dir / "plain.gguf"
         code, _, err = run_cli("--groups", "qwen27b", "--input", self.split[0], "--recipe", recipe,
                                "--llama-quantize", script, "--output", out)
@@ -578,7 +569,7 @@ class ConverterTest(unittest.TestCase):
     def test_quantize_command_rejects_float_only_recipe(self):
         with open_gguf(self.split[0]) as model:
             plan = build_plan(model, GROUPS, (), seed=None, rotate_only=False,
-                              rules=parse_recipe("version: 1\ntypes: [{match: '.', type: BF16}]\n",
+                              rules=parse_recipe('{"version": 1, "types": [{"match": ".", "type": "BF16"}]}',
                                                  ALL_GROUPS, GROUPS.recipe_types()).rules)
         self.assertEqual(len(tensor_type_lines(plan)), sum(len(ne) >= 2 for _, ne, _ in self.tensors.values()))
         with self.assertRaisesRegex(PlanError, "quantizes no tensor"):

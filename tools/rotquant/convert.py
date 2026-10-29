@@ -12,7 +12,7 @@ Examples (see plan/rotated-quant/R1A-RESULTS.md):
   convert.py --groups qwen27b --input BF16-00001-of-00002.gguf --rotate-groups all \\
       --seed 1 --rotate-only --output rot-bf16.gguf
   convert.py --groups qwen27b --input rot-bf16.gguf --rotate-groups all \\
-      --recipe q4.yaml --llama-quantize llama-quantize --output rot-q4.gguf
+      --recipe q4.json --llama-quantize llama-quantize --output rot-q4.gguf
   convert.py --groups qwen27b --input BF16-00001-of-00002.gguf --rotate-groups all \\
       --copy-recipe-from UD-Q4_K_XL.gguf --dry-run
 """
@@ -125,7 +125,7 @@ def parse_args(argv):
     parser.add_argument("--input", required=True, type=Path, help="BF16 GGUF (any shard of a split set) "
                         "or a rotated GGUF from --rotate-only")
     parser.add_argument("--output", type=Path, help="output GGUF (not overwritten)")
-    parser.add_argument("--recipe", type=Path, help="YAML recipe: rotate groups and type rules")
+    parser.add_argument("--recipe", type=Path, help="JSON recipe: rotate groups and type rules")
     parser.add_argument("--rotate-groups", help="all, none, or comma-separated groups; overrides the recipe")
     parser.add_argument("--seed", type=int, help="sign seed for newly rotated groups (stored in the file)")
     parser.add_argument("--imatrix", type=Path, help="importance matrix for llama-quantize")

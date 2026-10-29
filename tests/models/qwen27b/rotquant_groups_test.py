@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The Qwen3.8 27B rotation group table matches the plan and the loader.
 
-Run with NumPy and PyYAML: python3 -I tests/models/qwen27b/rotquant_groups_test.py
+Run with NumPy: python3 -I tests/models/qwen27b/rotquant_groups_test.py
 """
 from pathlib import Path
 import re

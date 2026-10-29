@@ -1,14 +1,19 @@
 """Recipe files: per-tensor quantization types and per-group rotation.
 
-```yaml
-version: 1
-rotate: [attn_in, ffn_in]        # group names, or all / none
-types:                           # first matching rule wins (Python re.search)
-  - match: '^blk\\.\\d+\\.ssm_out\\.weight$'
-    type: Q6_K
-  - match: '\\.weight$'
-    type: Q4_K
+```json
+{
+  "version": 1,
+  "rotate": ["attn_in", "ffn_in"],
+  "types": [
+    {"match": "^blk\\\\.\\\\d+\\\\.ssm_out\\\\.weight$", "type": "Q6_K"},
+    {"match": "\\\\.weight$", "type": "Q4_K"}
+  ]
+}
 ```
+
+`rotate` is a list of group names, or "all" / "none". The first rule whose
+`match` (Python re.search) finds the tensor name wins. Duplicate keys are
+refused.
 
 Rules apply only to tensors whose model role takes a recipe type
 (embeddings and projections). Every such tensor must match a rule unless the
@@ -18,9 +23,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import json
 import re
-
-import yaml
 
 RECIPE_VERSION = 1
 RECIPE_KEYS = {"version", "rotate", "types"}
@@ -47,7 +51,7 @@ class Recipe:
 
 
 def parse_rotate_selection(value, known_groups) -> tuple:
-    """Parse `all`, `none`, a comma list, or a YAML list into group names."""
+    """Parse `all`, `none`, a comma list, or a JSON list into group names."""
     if isinstance(value, str):
         if value == "all":
             return tuple(known_groups)
@@ -70,17 +74,27 @@ def parse_rotate_selection(value, known_groups) -> tuple:
     return tuple(group for group in known_groups if group in items)
 
 
+def _unique_keys(pairs) -> dict:
+    data = {}
+    for key, value in pairs:
+        if key in data:
+            raise RecipeError(f"recipe repeats the key {key!r}")
+        data[key] = value
+    return data
+
+
 def parse_recipe(text: str, known_groups, allowed_types) -> Recipe:
     try:
-        data = yaml.safe_load(text)
-    except yaml.YAMLError as error:
-        raise RecipeError(f"recipe is not valid YAML: {error}") from None
+        data = json.loads(text, object_pairs_hook=_unique_keys)
+    except json.JSONDecodeError as error:
+        raise RecipeError(f"recipe is not valid JSON: {error}") from None
     if not isinstance(data, dict):
-        raise RecipeError("recipe must be a mapping")
+        raise RecipeError("recipe must be a JSON object")
     unknown = set(data) - RECIPE_KEYS
     if unknown:
         raise RecipeError(f"unknown recipe key(s): {', '.join(sorted(map(str, unknown)))}")
-    if data.get("version") != RECIPE_VERSION:
+    version = data.get("version")
+    if type(version) is not int or version != RECIPE_VERSION:
         raise RecipeError(f"recipe version must be {RECIPE_VERSION}, got {data.get('version')!r}")
     rotate = None
     if "rotate" in data:
