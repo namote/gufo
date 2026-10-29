@@ -303,3 +303,40 @@ W3 진단에서 회전 BF16이 원본보다 AR +7 %, prefill +21 % 느렸다. �
 ### 4. 하지 않은 것
 - 회전 BF16을 다시 쓰는 일은 감독의 결정을 기다린다. 다시 쓴다면 `realign.py --input Qwen3.8-27B-rot-BF16.gguf`로 바이트를 그대로 두고 정렬만 바꿀 수 있다. 회전을 다시 할 필요는 없다.
 - `build/rq-llama/align-test/`(드래프터 시험 파일 2개)는 아직 지우지 않았다(지우기 전에 감독 확인).
+
+## 추가: 정렬 결정 반영과 정리 (감독 결정, 2026-10-29)
+
+- **(a) 반영 (`f20daf4f`):**
+  - 컨버터의 quantize 단계에서 llama-quantize 출력이 256 정렬이 아니면, 출력을 `<이름>.unaligned.gguf`로 옮긴다. 그다음 `realign`으로 다시 쓰고(바이트 그대로) 중간 파일을 지운다.
+  - 회전 경로에서는 입력이 우리 writer의 256 정렬 파일이라 아무것도 하지 않는다. 테스트로 확인했다.
+  - `verify.py`가 `general.alignment = 256`인지, 데이터 시작과 모든 텐서가 256B 경계인지 검사한다. 어긋나면 거부한다.
+  - 새 테스트: 원본에서 비회전으로 양자화하면 realign되고 중간 파일이 남지 않는지, 32 정렬 출력을 거부하는지
+  - 결과: `rotquant_test` 26/26, calibration OK, groups 3/3
+- **주의:** 이 결정 전에 만든 파일은 모두 32 정렬이다. `qwen-3.8-27b-rot-bf16-gguf/`, `qwen-3.8-27b-rot-q4-test-gguf/`의 두 Q4가 그렇다(회전 쪽 텐서는 절대 offset 64B 정렬, 비회전 Q4는 원본과 같은 배치). 지금 `verify.py`로 다시 검사하면 정렬 항목에서 거부된다. 감독 결정에 따라 회전 BF16은 그대로 둔다.
+- **삭제한 파일:**
+  - `build/rq-llama/align-test/`(5.6 GB, 드래프터 정렬 시험)
+  - 배치 대조 파일 `qwen-3.8-27b-plain-bf16-single-gguf/`(55 GB). 진단은 끝났다(R2-RESULTS). 지우기 전의 기록:
+    - `Qwen3.8-27B-plain-BF16-single.gguf`, 54657735776 B, sha256 `a3141e4bda3780c1775028623030fb804288daa2db8d8c393ff063d46260fcfa`
+    - 원본: `qwen-3.8-27b-bf16-gguf/` 분할 2개(조각을 이은 sha256 `ac6d62ca419d94045f04adf3fb95a3cba1f9b18651048addc9c898605f827d3c`)
+    - 명령: `convert.py --groups qwen27b --input Qwen3.8-27B-BF16-00001-of-00002.gguf --rotate-groups none --rotate-only --output Qwen3.8-27B-plain-BF16-single.gguf`
+    - writer `28b8c180`(정렬 변경 전, alignment 32). 2026-10-29T02:29:26Z 시작, 146.9 s, 최대 RSS 50.4 GB
+    - 텐서 866개, 원본과 바이트가 같다(전수 비교). `.rot`과 표시 KV는 없다. 출처 KV 4개는 있다. 데이터 시작 10996832. 텐서 절대 offset은 모두 ≡ 32 mod 64다.
+    - PROVENANCE.md 원문:
+      > # Qwen3.8-27B plain BF16, single file (RQ W1 layout control, 2026-10-29)
+      > 
+      > - 파일: `Qwen3.8-27B-plain-BF16-single.gguf`, 54657735776 B, sha256 `a3141e4bda3780c1775028623030fb804288daa2db8d8c393ff063d46260fcfa`
+      > - 목적: W3 진단에서 회전 BF16이 원본보다 느렸다. 그 원인이 파일 배치인지 회전 비용인지 가르기 위한 대조 파일이다. 회전은 하지 않았고, 회전 파일과 같은 writer로 단일 파일을 썼다.
+      > - 원본: `../qwen-3.8-27b-bf16-gguf/` 분할 2개(PROVENANCE 참고). 두 조각을 이은 sha256은 `ac6d62ca419d94045f04adf3fb95a3cba1f9b18651048addc9c898605f827d3c`다.
+      > - 컨버터: gufo `tools/rotquant`. writer는 `28b8c180`과 같다. 실행 시점 HEAD의 마지막 rotquant 변경은 `ecd583f0`인데, calibration만 추가한 것이다.
+      > - 명령줄:
+      >   ```
+      >   python3 -I tools/rotquant/convert.py --groups qwen27b --input Qwen3.8-27B-BF16-00001-of-00002.gguf \
+      >       --rotate-groups none --rotate-only --output Qwen3.8-27B-plain-BF16-single.gguf
+      >   ```
+      > - 시간: 시작 2026-10-29T02:29:26Z, 146.9 s(입력 sha256 포함). 최대 RSS 50.4 GB(mmap 페이지 포함).
+      > - 내용:
+      >   - 텐서 866개는 원본 순서 그대로이고, 866개 모두 원본과 바이트가 같다(전수 비교).
+      >   - `.rot`은 없다. 표시 KV(`gufo.rotation.version/kind/block_size/side`)도 없다.
+      >   - 출처 KV 4개(`gufo.rotation.source_converter`, `source_recipe_sha256`, `source_sha256`, `source_file`)는 있다.
+      >   - `split.*` 키는 뺐다. 나머지 KV는 원래 바이트 그대로다.
+      > - 배치: alignment 32, 데이터 시작 10996832. 텐서 절대 offset은 모두 32의 배수지만, 64의 배수는 하나도 없다(회전 파일은 866개 모두 64의 배수이고, 원본은 866개 모두 64의 배수이며 그중 256의 배수가 362개다).
