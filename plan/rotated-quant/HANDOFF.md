@@ -14,12 +14,15 @@
 | 항목 | 상태 | 근거 |
 |---|---|---|
 | 계획 | 리뷰와 보강 완료 | `PLAN.md` |
+| R0 기준선 | 완료 (2026-10-29) | [R0-RESULTS.md](R0-RESULTS.md), [RESULTS.md](RESULTS.md). 품질(32K 토큰, BF16 대비 prefill/verify/decode), AR 속도(ABBA), DFlash2 텍스트 수락률(64문항). GSQ와 d32K DFlash2는 미측정 |
+| R1b 컨버터(실모델) | 완료 | [R1B-RESULTS.md](R1B-RESULTS.md). 회전 BF16 GGUF와 256B 정렬(D7) |
+| R2 로더와 실행 | 진행 중 | [R2-RESULTS.md](R2-RESULTS.md). ①④⑤ 통과, ②③과 정렬 A/B 남음 |
 | R0b 타입별 실효 대역폭 | 완료 | [R0B-RESULTS.md](R0B-RESULTS.md). 4비트는 IQ4_XS가 가장 좋다(27B 토큰당 64.0 ms, 상한의 89%). Q3_K와 IQ3_S는 연산에 묶여 상한의 54%로 Q4_K보다 느리다. FWHT는 AR 토큰당 2%다 |
 | R1a 컨버터(합성 텐서) | 완료 | [R1A-RESULTS.md](R1A-RESULTS.md). `tools/rotquant/`, `tools/qwen27b/rotquant_groups.py`. 테스트 20/20, 병합 뒤 `05e527d2`에서도 통과. `.rot`은 F16 |
 | BF16 원본 | 받음 | `~/projects/ai.tools/storage/models/llm/qwen-3.8-27b-bf16-gguf/`(리비전 `4ca72078`, sha256 검증, `PROVENANCE.md`) |
 | upstream 병합 | 완료 | `05e527d2`(upstream main `c92b19c5`). CLAUDE.md도 upstream 것으로 바뀌어 timing 기준이 **5 %·10 ms**다. PLAN의 "5% 또는 3 ms" 문구는 이 기준으로 읽는다 |
 | 운영 | 전환 완료 | 다른 세션이 `1d7b729e`(ROCm 10.1)로 운영을 전환했다. ai.tools 플랫폼은 지금 정지 상태다 |
-| Flash-Next 모델 파일 | 로컬에 없음 | `storage/models/llm`에 없다. W7에서 디스크 계획과 함께 정한다 |
+| Flash-Next 모델 파일 | 외장 디스크로 받는 중 | `/run/media/m2on/T5 EVO/AI/model/originals-flash-next-20261029/`(rev `766911a6`). 계획은 [FLASH-NEXT.md](FLASH-NEXT.md) |
 
 커밋 `d19126df`에는 R0b와 R1a 파일이 섞여 있다. 결과 문서에 기록해 두었고, 히스토리는 고쳐 쓰지 않는다(사용자 결정).
 
