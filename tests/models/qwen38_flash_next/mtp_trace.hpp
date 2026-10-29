@@ -15,6 +15,11 @@ struct MtpTraceOptions {
   std::uint32_t context = 49152;
   std::uint32_t max_tokens = 256;
   std::uint32_t depth = gufo::models::qwen38_flash_next::kMaxMtpDraftTokens;
+  /// The HTTP scheduler admits a single-session prompt in passes ending at
+  /// multiples of kAdmissionPrefillTokens (text_generation_scheduler.hpp);
+  /// pass boundaries change prefill arithmetic, so the trace syncs the same
+  /// prefixes. 0 syncs the whole prompt at once.
+  std::uint32_t prefill_step = 2048;
 };
 
 int RunMtpTrace(const MtpTraceOptions& options);

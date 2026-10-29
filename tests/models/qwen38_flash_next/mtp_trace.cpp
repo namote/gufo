@@ -126,10 +126,16 @@ int RunMtpTrace(const MtpTraceOptions& o) {
     }
     const std::vector<std::int32_t> prompt(rendered->begin(), rendered->end());
     session->ResetDraftPolicy();
-    if (!session->Sync(prompt, &error)) {
-      std::fprintf(stderr, "%s: prefill failed: %s\n", id.c_str(),
-                   error.c_str());
-      return 1;
+    const std::size_t step = o.prefill_step ? o.prefill_step : prompt.size();
+    for (std::size_t end = std::min(step, prompt.size());;
+         end = std::min(end + step, prompt.size())) {
+      if (!session->Sync(std::span(prompt).first(end), &error)) {
+        std::fprintf(stderr, "%s: prefill failed: %s\n", id.c_str(),
+                     error.c_str());
+        return 1;
+      }
+      if (end == prompt.size())
+        break;
     }
     gufo::sampling::SamplerState sampler;  // greedy, no penalties
     std::vector<std::int32_t> completion;
@@ -177,7 +183,8 @@ int RunMtpTrace(const MtpTraceOptions& o) {
     const auto ids = join(completion);
     out << "{\"case\":" << JsonString(id) << ",\"index\":" << index
         << ",\"category\":" << JsonString(category)
-        << ",\"prompt_tokens\":" << prompt.size() << ",\"prompt\":["
+        << ",\"prompt_tokens\":" << prompt.size()
+        << ",\"prefill_step\":" << o.prefill_step << ",\"prompt\":["
         << join(prompt) << "],\"stop\":" << (stop ? "true" : "false")
         << ",\"completion\":[" << ids
         << "],\"text\":" << JsonString(model->Decode(completion)) << "}\n";

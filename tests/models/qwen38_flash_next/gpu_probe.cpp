@@ -13,6 +13,8 @@
 //                      [--depth N] (default: 0, 4096, 32768)
 // Greedy MTP chain trace: --mtp-model MTP.gguf --mtp-trace SUITE.json
 //                         --out TRACE.jsonl [--context N] [--max-tokens N]
+//                         [--prefill-step N] (default 2048, the HTTP
+//                         scheduler's single-session admission passes)
 //                         (mtp_trace.cpp; uses the production Session)
 // Matched-token decode: --prompt-file P --decode-file C --dump rows.bin
 //                       [--decode-ids ids.bin] (prefill P, then feed C's
@@ -113,6 +115,7 @@ int main(int argc, char** argv) {
   std::string trace_suite;
   std::string trace_out;
   std::uint32_t trace_max_tokens = 256;
+  std::uint32_t trace_prefill_step = 2048;
   float yarn_factor = 1.0F;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -127,6 +130,14 @@ int main(int argc, char** argv) {
       trace_suite = next();
     } else if (arg == "--out") {
       trace_out = next();
+    } else if (arg == "--prefill-step") {
+      const auto value = next();
+      const auto [end, ec] = std::from_chars(
+          value.data(), value.data() + value.size(), trace_prefill_step);
+      if (ec != std::errc{} || end != value.data() + value.size()) {
+        std::fprintf(stderr, "--prefill-step requires a nonnegative integer\n");
+        return 2;
+      }
     } else if (arg == "--max-tokens") {
       const auto value = next();
       const auto [end, ec] = std::from_chars(
@@ -251,7 +262,8 @@ int main(int argc, char** argv) {
                             .mtp_path = mtp_path,
                             .suite_path = trace_suite,
                             .out_path = trace_out,
-                            .max_tokens = trace_max_tokens};
+                            .max_tokens = trace_max_tokens,
+                            .prefill_step = trace_prefill_step};
       if (context_given)
         trace.context = context;
       return RunMtpTrace(trace);
