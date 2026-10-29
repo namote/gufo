@@ -3368,7 +3368,7 @@ struct InferenceBackend::Impl {
       bool cache_prompt = true, std::size_t cache_prefix_tokens = 0,
       const std::vector<std::string>& stop_sequences = {},
       InitialOutputState initial = InitialOutputState::kContent,
-      std::size_t system_prefix_tokens = 0) const {
+      std::size_t system_prefix_tokens = 0, bool cache_persist = true) const {
     Result result;
     result.prompt_tokens = prompt_tokens.size();
     result.client_id = client_id.empty() ? "anonymous" : client_id;
@@ -3389,6 +3389,7 @@ struct InferenceBackend::Impl {
             .request_start = request_start,
             .prompt_context = std::move(context),
             .cache_prompt = cache_prompt,
+            .cache_persist = cache_persist,
             .cache_prefix_tokens = cache_prefix_tokens,
             .system_prefix_tokens = system_prefix_tokens,
             .stop_sequences = stop_sequences,
@@ -4199,7 +4200,7 @@ InferenceBackend::Result InferenceBackend::complete(
     const sampling::SamplingConfig& sampling_config,
     const CancellationCheck& is_cancelled, const TokenCallback& on_token,
     std::string_view client_id, const std::vector<std::string>& stop_sequences,
-    bool cache_prompt) {
+    bool cache_prompt, bool cache_persist) {
 #if defined(ENGINE_ENABLE_HIP)
   const auto request_start = Clock::now();
   const auto state = impl_->Snapshot();
@@ -4210,9 +4211,11 @@ InferenceBackend::Result InferenceBackend::complete(
   return impl_->GenerateScheduled(
       state, std::move(prompt_tokens), request_start, max_tokens,
       sampling_config, is_cancelled, on_token, std::string(client_id), {},
-      cache_prompt, 0, stop_sequences);
+      cache_prompt, 0, stop_sequences, InitialOutputState::kContent,
+      /*system_prefix_tokens=*/0, cache_persist);
 #else
   (void)cache_prompt;
+  (void)cache_persist;
   (void)client_id;
   (void)stop_sequences;
   (void)prompt;
@@ -4256,7 +4259,7 @@ InferenceBackend::Result InferenceBackend::chat(
       effective_sampling, is_cancelled, on_token, request.client_id,
       std::move(prompt->context), request.cache_prompt,
       prompt->cache_prefix_tokens, request.stop_sequences, initial,
-      system_prefix_tokens);
+      system_prefix_tokens, request.cache_persist);
 #else
   (void)request;
   (void)max_tokens;
@@ -4273,14 +4276,15 @@ InferenceBackend::start_complete(
     const sampling::SamplingConfig& sampling_config,
     const CancellationCheck& is_cancelled, bool stream_output, bool ignore_eos,
     std::string_view client_id, const std::vector<std::string>& stop_sequences,
-    bool return_progress, bool cache_prompt) {
+    bool return_progress, bool cache_prompt, bool cache_persist) {
 #if defined(ENGINE_ENABLE_HIP)
   const auto request_start = Clock::now();
   const auto state = impl_->Snapshot();
   if (state == nullptr) {
     return TextGenerationBackend::start_complete(
         prompt, max_tokens, sampling_config, is_cancelled, stream_output,
-        ignore_eos, client_id, stop_sequences, return_progress, cache_prompt);
+        ignore_eos, client_id, stop_sequences, return_progress, cache_prompt,
+        cache_persist);
   }
   auto prompt_tokens = state->scheduler->runner().Tokenize(prompt);
   auto scheduled_request = state->scheduler->Submit(
@@ -4292,6 +4296,7 @@ InferenceBackend::start_complete(
           .request_start = request_start,
           .prompt_context = {},
           .cache_prompt = cache_prompt,
+          .cache_persist = cache_persist,
           .cache_prefix_tokens = 0,
           .stop_at_eos = !ignore_eos,
           .stop_sequences = stop_sequences,
@@ -4302,7 +4307,8 @@ InferenceBackend::start_complete(
 #else
   return TextGenerationBackend::start_complete(
       prompt, max_tokens, sampling_config, is_cancelled, stream_output,
-      ignore_eos, client_id, stop_sequences, return_progress, cache_prompt);
+      ignore_eos, client_id, stop_sequences, return_progress, cache_prompt,
+      cache_persist);
 #endif
 }
 
@@ -4351,6 +4357,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
           .request_start = request_start,
           .prompt_context = std::move(prompt->context),
           .cache_prompt = request.cache_prompt,
+          .cache_persist = request.cache_persist,
           .cache_prefix_tokens = prompt->cache_prefix_tokens,
           .system_prefix_tokens = system_prefix_tokens,
           .stop_sequences = request.stop_sequences,

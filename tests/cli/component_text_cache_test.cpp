@@ -1416,6 +1416,114 @@ std::uintmax_t ManagedBytes(const std::filesystem::path& directory) {
       bytes += file.file_size();
   return bytes;
 }
+void UnpersistedRequestStaysOffDisk() {
+  const TemporaryDirectory temp("gufo-component-unpersisted-test");
+  const std::filesystem::path directory = temp.path();
+  const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                        .capacity_bytes = 1 << 20,
+                                        .min_checkpoint_step_tokens = 1};
+  const std::vector<TextRunnerToken> prompt{10, 11, 12, 13, 14, 15, 16, 17, 18};
+  const auto acquire = [&](TextRunnerPool& pool, bool persist) {
+    return pool.Acquire(prompt, {}, {}, {}, true, 0, true, 0, persist);
+  };
+  TextRunnerToken token;
+  {
+    auto runner = std::make_shared<Runner>();
+    TextRunnerPool pool(runner, 1, disk);
+    auto first = acquire(pool, false);
+    Prefill(first);
+    token = Generate(first);
+    assert(first.Commit().disk_queued_bytes == 0);
+    // The RAM cache still serves the prompt within this process.
+    auto again = acquire(pool, false);
+    assert(again.cache_hit() && !again.cache_disk_hit());
+    assert(again.cached_prompt_tokens() == prompt.size());
+    again.Invalidate();
+  }
+  assert(ManagedBytes(directory) == 0);
+  {
+    auto runner = std::make_shared<Runner>();
+    TextRunnerPool pool(runner, 1, disk);
+    auto cold = acquire(pool, true);
+    assert(!cold.cache_hit());
+    Prefill(cold);
+    assert(Generate(cold) == token);
+    assert(cold.Commit().disk_queued_bytes > 0);
+  }
+  assert(ManagedBytes(directory) > 0);
+  {
+    // Reading what other requests stored is allowed.
+    auto runner = std::make_shared<Runner>();
+    TextRunnerPool pool(runner, 1, disk);
+    auto reader = acquire(pool, false);
+    assert(reader.cache_disk_hit());
+    assert(reader.cached_prompt_tokens() == prompt.size());
+    reader.Invalidate();
+  }
+  std::filesystem::remove_all(directory);
+}
+// The live frontier of a cache_persist=false request is not written back:
+// neither by the idle write-back nor by the capture before its slot is reset.
+void UnpersistedLiveFrontierStaysOffDisk() {
+  const TemporaryDirectory temp("gufo-component-unpersisted-live-test");
+  const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
+                                        .capacity_bytes = 1 << 22,
+                                        .staging_capacity_bytes = 7};
+  std::vector<TextRunnerToken> conversation(100);
+  std::iota(conversation.begin(), conversation.end(), 10);
+  {
+    auto runner = std::make_shared<Runner>();
+    ComponentTextCache cache(runner, 1, 1 << 22, disk);
+    const auto turn = [&](const std::vector<TextRunnerToken>& tokens,
+                          bool persist) {
+      auto lease = cache.Acquire(tokens, {}, {}, true, 0, true, persist);
+      auto& state = dynamic_cast<State&>(lease->state());
+      const auto tail = std::span(tokens).subspan(lease->cached_tokens());
+      runner->adapter->Append(state.slot, tail, tail);
+      (void)lease->Commit({}, {}, tokens);
+    };
+    turn(conversation, false);
+    assert(cache.WriteBackIdle(std::chrono::milliseconds(0)) == 0);
+    // The only slot goes to another prompt: the frontier stays in RAM only.
+    turn(std::vector<TextRunnerToken>(12, 5), true);
+  }
+  assert(ManagedBytes(temp.path()) == 0);
+}
+void UnpersistedOverRamCaptureIsRefused() {
+  // A checkpoint larger than the RAM budget would be staged for disk only.
+  // A request that stays off disk refuses it instead.
+  const TemporaryDirectory temp("gufo-component-unpersisted-over-ram-test");
+  const std::filesystem::path directory = temp.path();
+  const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                        .capacity_bytes = 1 << 20,
+                                        .min_checkpoint_step_tokens = 1};
+  auto runner = std::make_shared<Runner>();
+  runner->private_blocks = 2;
+  runner->rows_per_chunk = 4096;
+  constexpr std::size_t kRam = 448 << 10;
+  {
+    ComponentTextCache cache(runner, 1, kRam, disk);
+    std::vector<TextRunnerToken> prompt(65536);
+    std::iota(prompt.begin(), prompt.end(), 10);
+    auto lease = cache.Acquire(prompt, {}, {}, true, 0, true, false);
+    auto& state = dynamic_cast<State&>(lease->state());
+    runner->adapter->Append(state.slot, prompt, prompt);
+    const auto bytes = lease->CaptureBytes();
+    assert(bytes > kRam);
+    assert(lease->TryReserveSnapshot(bytes, prompt.size(), false,
+                                     SnapshotPurpose::kContinuation, prompt));
+    bool refused = false;
+    try {
+      (void)lease->Capture();
+    } catch (const cache::ResourceExhausted&) {
+      refused = true;
+    }
+    assert(refused);
+    lease->Invalidate();
+  }
+  assert(ManagedBytes(directory) == 0);
+  std::filesystem::remove_all(directory);
+}
 void LoweredDiskBudgetEvictsOldestAtStartup() {
   const TemporaryDirectory temp("gufo-component-lowered-budget-test");
   const std::filesystem::path directory = temp.path();
@@ -3216,6 +3324,9 @@ int main() {
   FragmentedBackingKeepsCompletePrompt();
   DiskBudgetEvictsAnUnpinnedConversation();
   LoweredDiskBudgetEvictsOldestAtStartup();
+  UnpersistedRequestStaysOffDisk();
+  UnpersistedLiveFrontierStaysOffDisk();
+  UnpersistedOverRamCaptureIsRefused();
   OrphansLeaveBeforeCheckpoints();
   StagingIsInternal();
   StagingCountsAgainstRamCeiling();

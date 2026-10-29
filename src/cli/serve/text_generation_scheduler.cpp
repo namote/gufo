@@ -91,6 +91,7 @@ struct ScheduledRequest {
   std::vector<TextRunnerToken> prompt;
   std::shared_ptr<const TextPromptContext> prompt_context;
   bool cache_prompt{true};
+  bool cache_persist{true};
   std::size_t cache_prefix_tokens{0};
   std::size_t system_prefix_tokens{0};
   bool stop_at_eos{true};
@@ -1257,7 +1258,7 @@ struct TextGenerationScheduler::Impl {
             },
             std::move(request->prompt_context), request->cache_prompt,
             request->cache_prefix_tokens, request->stop_at_eos,
-            request->system_prefix_tokens);
+            request->system_prefix_tokens, request->cache_persist);
         // Each admission may restore or capture a checkpoint of its own.
         progress.fetch_add(1, std::memory_order_relaxed);
         if (!request->runner_request) {
@@ -2584,6 +2585,7 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   request->prompt = std::move(prompt);
   request->prompt_context = std::move(metadata.prompt_context);
   request->cache_prompt = metadata.cache_prompt;
+  request->cache_persist = metadata.cache_persist;
   request->cache_prefix_tokens = metadata.cache_prefix_tokens;
   request->system_prefix_tokens = metadata.system_prefix_tokens;
   request->stop_at_eos = metadata.stop_at_eos;

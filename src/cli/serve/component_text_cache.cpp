@@ -231,6 +231,9 @@ struct ComponentTextCache::Impl {
     // Length of the live frontier WriteBackIdle last tried, queued or not; it
     // retries once the frontier grows kUncoveredCaptureTokens past it.
     std::size_t write_back_tried{};
+    // False when the request that left the live frontier asked to keep its
+    // prompt off the disk (cache_persist=false): its copies stay in RAM.
+    bool live_persist{true};
   };
   // A live frontier this many tokens or more past every checkpoint of its
   // prompt is captured before its slot is reset for another request.
@@ -820,6 +823,8 @@ struct ComponentTextCache::Lease::Impl {
   std::size_t cached{}, restored{}, stable{}, capture_boundary{};
   double restore_time{};
   bool disk_hit{}, active{true}, preserve_source{};
+  // False keeps every checkpoint this lease captures in RAM only.
+  bool persist{true};
   cache::CheckpointId source{};
   std::array<cache::CheckpointId, cache::RetentionPolicy::kRecordLimit>
       edit_boundaries{};
@@ -875,7 +880,7 @@ struct ComponentTextCache::Lease::Impl {
 
 std::unique_ptr<TextRunnerSnapshot>
 ComponentTextCache::Lease::Impl::CaptureDurable() {
-  if (!cache->queue || !cache->resources->copy_observed_rows ||
+  if (!persist || !cache->queue || !cache->resources->copy_observed_rows ||
       purpose == SnapshotPurpose::kHistory)
     throw cache::ResourceExhausted();
   const auto capture_input = At(input, capture_tokens.size());
@@ -1165,11 +1170,12 @@ void ComponentTextCache::CaptureBeforeReset(std::size_t index,
   // A write-back still queued from this slot fails once the reset retires the
   // rows it observes: without a durable checkpoint covering the frontier, the
   // capture goes to disk itself, as the write-back would have.
-  bool write_back;
+  bool write_back, persist;
   {
     const std::lock_guard lock(impl_->mutex);
+    persist = entry->live_persist;
     write_back =
-        impl_->queue &&
+        persist && impl_->queue &&
         Impl::Durable(*entry) + Impl::kUncoveredCaptureTokens <= tokens.size();
   }
   const auto log = [&](std::string_view event, std::string_view detail) {
@@ -1185,6 +1191,7 @@ void ComponentTextCache::CaptureBeforeReset(std::size_t index,
         cache::InputIdentity(tokens.size(), input), tokens.size()));
     lease.impl_->write_back = write_back;
     lease.impl_->live_frontier = true;
+    lease.impl_->persist = persist;
     try {
       // Retry priority: the copy may only displace other optional copies,
       // and is the first to go when prompt or shared checkpoints need the
@@ -1255,7 +1262,7 @@ std::size_t ComponentTextCache::WriteBackIdle(
               ? Impl::Covered(*entry)
               : std::max(Impl::Covered(*entry), entry->write_back_tried);
       if (entry->busy || !entry->live || !entry->holds_rows ||
-          now - entry->idle_since < idle_for ||
+          !entry->live_persist || now - entry->idle_since < idle_for ||
           size < Impl::kUncoveredCaptureTokens ||
           (covered && covered + Impl::kUncoveredCaptureTokens > size))
         continue;
@@ -1555,7 +1562,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     std::span<const ContinuationToken> prompt,
     const ContinuationCache::CancellationCheck& cancelled,
     std::shared_ptr<const TextPromptContext> context, bool reuse,
-    std::size_t stable, bool stop_at_eos) {
+    std::size_t stable, bool stop_at_eos, bool persist) {
   if (cancelled && cancelled())
     return {};
   auto input = Inputs(prompt.size(), context.get());
@@ -1708,6 +1715,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     lease = std::make_unique<Lease>(std::make_unique<Lease::Impl>(
         impl_.get(), entry, std::move(slot), prompt, input, stable));
     auto& request = *lease->impl_;
+    request.persist = persist;
     request.state->SetCancellationCheck(cancelled);
     request.state->SetStopAtEos(stop_at_eos);
     impl_->runner->SetPromptContext(*request.state, context);
@@ -2122,8 +2130,9 @@ bool ComponentTextCache::Lease::CaptureRefused(std::size_t boundary) const {
   }
   if (bytes <= cache.budget)
     return false;
-  // Capture would fall back to CaptureDurable, which refuses the same way.
-  if (!cache.queue || !cache.resources->copy_observed_rows)
+  // Capture would fall back to CaptureDurable, which refuses the same way
+  // (also for a request that keeps its prompt off the disk).
+  if (!impl_->persist || !cache.queue || !cache.resources->copy_observed_rows)
     return true;
   return cache.WithinDiskStep(
       std::span<const cache::Token>(impl_->prompt).first(boundary),
@@ -2403,6 +2412,8 @@ std::size_t ComponentTextCache::Lease::PublishSnapshot(
     impl_->edit_boundaries[impl_->edit_boundary_count++] =
         component->checkpoint->Id();
   }
+  if (!impl_->persist)
+    return component->bytes;
   try {
     const auto started = Clock::now();
     std::shared_ptr<const void> branch;
@@ -2439,6 +2450,7 @@ std::size_t ComponentTextCache::Lease::Commit(
   {
     const std::lock_guard lock(impl_->cache->mutex);
     impl_->entry->live_tokens = live;
+    impl_->entry->live_persist = impl_->persist;
     impl_->entry->live_input = At(impl_->input, impl_->prompt.size());
     impl_->entry->live_location = location;
     impl_->entry->idle_since = Clock::now();
