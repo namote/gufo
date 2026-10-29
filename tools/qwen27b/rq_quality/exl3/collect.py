@@ -127,7 +127,9 @@ def main(argv=None) -> int:
     cache = None
     cap = 0
     if a.path == "decode":
-        cap = -(-(a.prefix + a.positions_limit + 1) // PAGE) * PAGE
+        # Model.load runs its autosplit dummy forward at max_chunk_size (4096) against the attached
+        # cache, so the cache must hold at least that many tokens.
+        cap = max(-(-(a.prefix + a.positions_limit + 1) // PAGE) * PAGE, 4096)
         cache = Cache(model, max_num_tokens=cap, layer_type=CacheLayer_fp16, max_batch_size=1)
     model.load(progressbar=False, max_chunk_size=4096, max_batch_size=1)
     load_ms = (time.perf_counter() - t0) * 1e3
