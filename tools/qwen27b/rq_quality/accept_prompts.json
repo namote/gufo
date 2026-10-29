@@ -1,0 +1,412 @@
+{
+ "schema": "gufo.speculative-corpus.v1",
+ "version": "rq-accept-prompts 1",
+ "note": "RQ DFlash2 text acceptance suite (W2 2026-10-29); built by accept_prompts_src.py; manifest.overlap is written by accept.py check-overlap.",
+ "prompts": [
+  {
+   "id": "expository_pangram",
+   "category": "expository",
+   "text": "The quick brown fox jumps over the lazy dog. Explain why this sentence is commonly used.",
+   "source": "docs/models/qwen3.8-27b/artifacts/speculative-corpus.json"
+  },
+  {
+   "id": "cpp_ring_buffer",
+   "category": "code",
+   "text": "Write a concise C++20 implementation of a fixed-capacity ring buffer with push, pop, front, and size. Explain the invariants.",
+   "source": "docs/models/qwen3.8-27b/artifacts/speculative-corpus.json"
+  },
+  {
+   "id": "reasoning_train",
+   "category": "reasoning",
+   "text": "A train travels 120 km at 80 km/h and then 180 km at 60 km/h. Compute its average speed for the whole trip and show the reasoning.",
+   "source": "docs/models/qwen3.8-27b/artifacts/speculative-corpus.json"
+  },
+  {
+   "id": "summary_gpu",
+   "category": "summarization",
+   "text": "Summarize this in two sentences: An integrated processor shares memory between CPU and GPU. Avoiding copies can reduce latency, but bandwidth contention and synchronization still determine real application performance.",
+   "source": "docs/models/qwen3.8-27b/artifacts/speculative-corpus.json"
+  },
+  {
+   "id": "italian_explanation",
+   "category": "multilingual",
+   "text": "Spiega in italiano, con un esempio semplice, la differenza tra latenza e throughput in un sistema di calcolo.",
+   "source": "docs/models/qwen3.8-27b/artifacts/speculative-corpus.json"
+  },
+  {
+   "id": "chinese_explanation",
+   "category": "multilingual",
+   "text": "请用简洁的中文解释什么是推测解码，以及为什么草稿模型的接受率会影响性能。",
+   "source": "docs/models/qwen3.8-27b/artifacts/speculative-corpus.json"
+  },
+  {
+   "id": "json_schedule",
+   "category": "structured",
+   "text": "Return only JSON for a three-day study plan. Each day must contain a topic, minutes, and one measurable goal.",
+   "source": "docs/models/qwen3.8-27b/artifacts/speculative-corpus.json"
+  },
+  {
+   "id": "creative_station",
+   "category": "creative",
+   "text": "Write the opening paragraph of a science-fiction story set in a silent railway station orbiting Jupiter.",
+   "source": "docs/models/qwen3.8-27b/artifacts/speculative-corpus.json"
+  },
+  {
+   "id": "repetition_sequence",
+   "category": "repetitive",
+   "text": "Continue the pattern for twenty more terms and briefly state the rule: red, blue, blue, red, blue, blue, red,",
+   "source": "docs/models/qwen3.8-27b/artifacts/speculative-corpus.json"
+  },
+  {
+   "id": "instruction_debug",
+   "category": "instruction",
+   "text": "A service becomes slow only after several hours. Give a prioritized debugging checklist that distinguishes memory growth, lock contention, thermal throttling, and external dependency latency.",
+   "source": "docs/models/qwen3.8-27b/artifacts/speculative-corpus.json"
+  },
+  {
+   "id": "repetition_word",
+   "category": "repetitive",
+   "text": "Write the word red exactly 1000 times, separated by spaces. Output only the words without any introduction or explanation.",
+   "source": "docs/models/qwen3.8-27b/artifacts/speculative-corpus.json"
+  },
+  {
+   "id": "d4_ko_instr_01",
+   "category": "d4_instruction",
+   "text": "다음 조건을 모두 지켜서 동네 도서관의 주말 독서 모임 안내문을 써 줘. 1) 정확히 세 문단 2) 각 문단은 두 문장 3) 존댓말 4) 날짜는 11월 7일 토요일 오후 2시로 적을 것 5) 마지막 문장은 질문으로 끝낼 것.",
+   "source": "tools/qwen27b/rq_quality/d4_ko_prompts.json (W2-authored)"
+  },
+  {
+   "id": "d4_ko_instr_02",
+   "category": "d4_instruction",
+   "text": "모든 답은 JSON 객체 하나로만 한다. 설명 문장은 쓰지 않는다.\n\n김밥 재료 다섯 가지를 골라 이름(name)과 손질 방법(prep, 한 문장)을 담은 배열 ingredients로 돌려줘.",
+   "source": "tools/qwen27b/rq_quality/d4_ko_prompts.json (W2-authored)"
+  },
+  {
+   "id": "d4_ko_instr_03",
+   "category": "d4_instruction",
+   "text": "아래 문장을 초등학교 3학년이 이해할 수 있게 한 문장으로 바꿔 줘. 원래 뜻은 유지하고 영어 단어는 쓰지 마.\n\n\"기온이 급격히 하강하면 수도 배관 내부의 물이 동결·팽창하여 관이 파열될 수 있으므로, 외출 시에는 수도꼭지를 약하게 열어 두는 것이 권장된다.\"",
+   "source": "tools/qwen27b/rq_quality/d4_ko_prompts.json (W2-authored)"
+  },
+  {
+   "id": "d4_ko_instr_04",
+   "category": "d4_instruction",
+   "text": "1부터 20까지의 수 가운데 3의 배수이면서 짝수인 수를 쉼표로 구분해 한 줄로만 써 줘. 다른 말은 붙이지 마.",
+   "source": "tools/qwen27b/rq_quality/d4_ko_prompts.json (W2-authored)"
+  },
+  {
+   "id": "d4_ko_instr_05",
+   "category": "d4_instruction",
+   "text": "회사 동료에게 보낼 회의 일정 변경 메일을 써 줘. 제목 줄은 '제목:'으로 시작하고, 본문은 다섯 줄 이내, 변경된 시간은 목요일 오전 10시 30분, 장소는 3층 작은 회의실이야.",
+   "source": "tools/qwen27b/rq_quality/d4_ko_prompts.json (W2-authored)"
+  },
+  {
+   "id": "d4_ko_sum_01",
+   "category": "d4_summary",
+   "text": "다음 글을 두 문장으로 요약해 줘.\n\n올해 가을, 한 지방 소도시의 시립 수영장은 운영 시간을 저녁 9시에서 10시로 한 시간 늘렸다. 시는 퇴근 뒤 운동하려는 직장인이 늘었다는 설문 결과를 근거로 들었다. 연장 첫 달 저녁 이용자는 하루 평균 140명에서 190명으로 늘었지만, 인건비와 난방비가 함께 올라 월 운영 적자도 약 800만 원 커졌다. 시의회 일부 의원은 요금을 올리지 말고 오전 이른 시간대를 줄여 비용을 맞추자고 제안했다. 시는 석 달 동안 시간대별 이용자를 더 모은 뒤 내년 예산에 반영하겠다고 밝혔다.",
+   "source": "tools/qwen27b/rq_quality/d4_ko_prompts.json (W2-authored)"
+  },
+  {
+   "id": "d4_ko_sum_02",
+   "category": "d4_summary",
+   "text": "아래 회의 메모에서 결정된 사항만 글머리표로 뽑아 줘. 논의만 하고 결정하지 않은 것은 빼.\n\n- 신규 앱 출시일: 12월 1일로 확정\n- 로그인 화면 색상: 파랑과 초록 중 다음 주에 다시 논의\n- 베타 테스터 모집 인원: 200명으로 결정\n- 고객센터 운영 시간 연장: 비용 검토 후 결정 예정\n- 출시 전 보안 점검: 외부 업체에 맡기기로 함",
+   "source": "tools/qwen27b/rq_quality/d4_ko_prompts.json (W2-authored)"
+  },
+  {
+   "id": "d4_ko_sum_03",
+   "category": "d4_summary",
+   "text": "Summarize the following Korean customer review in one English sentence, then give its sentiment as positive, negative or mixed on a second line.\n\n배송은 예정보다 이틀 빨랐고 포장도 꼼꼼했어요. 그런데 의자 높이 조절 레버가 처음부터 뻑뻑해서 고객센터에 문의했더니, 사흘째 답이 없네요. 앉았을 때 편한 건 마음에 들어요.",
+   "source": "tools/qwen27b/rq_quality/d4_ko_prompts.json (W2-authored)"
+  },
+  {
+   "id": "d4_ko_sum_04",
+   "category": "d4_summary",
+   "text": "다음 대화를 읽고, 민지가 결국 무엇을 하기로 했는지 한 문장으로 답해 줘.\n\n준호: 이번 주말에 등산 갈래?\n민지: 토요일은 동생 이사 도와줘야 해.\n준호: 그럼 일요일은?\n민지: 일요일 오전엔 비 온대. 오후에 근처 공원 산책은 어때?\n준호: 좋아, 3시에 공원 입구에서 보자.\n민지: 응, 그때 봐.",
+   "source": "tools/qwen27b/rq_quality/d4_ko_prompts.json (W2-authored)"
+  },
+  {
+   "id": "d4_ko_sum_05",
+   "category": "d4_summary",
+   "text": "아래 공지에서 신청 마감일, 신청 방법, 대상만 표로 정리해 줘.\n\n[구민 텃밭 분양 안내] 내년 봄 구민 텃밭 120구획을 분양합니다. 구에 1년 이상 거주한 세대주만 신청할 수 있으며, 한 세대에 한 구획만 배정합니다. 신청은 구청 누리집 온라인 접수로만 받고, 마감은 12월 15일 오후 6시입니다. 신청자가 많으면 공개 추첨으로 정하며, 결과는 12월 22일에 문자로 알려 드립니다.",
+   "source": "tools/qwen27b/rq_quality/d4_ko_prompts.json (W2-authored)"
+  },
+  {
+   "id": "d4_ko_code_01",
+   "category": "d4_code_explain",
+   "text": "이 파이썬 함수가 무엇을 하는지 한국어로 세 문장 이내로 설명하고, 빈 리스트를 넣으면 어떻게 되는지도 알려 줘.\n\n```python\ndef f(xs):\n    best = xs[0]\n    for x in xs[1:]:\n        if x > best:\n            best = x\n    return best\n```",
+   "source": "tools/qwen27b/rq_quality/d4_ko_prompts.json (W2-authored)"
+  },
+  {
+   "id": "d4_ko_code_02",
+   "category": "d4_code_explain",
+   "text": "다음 C 코드의 버그를 찾아 한국어로 설명하고, 고친 코드를 보여 줘.\n\n```c\nint sum(const int *a, int n) {\n    int s = 0;\n    for (int i = 0; i <= n; i++)\n        s += a[i];\n    return s;\n}\n```",
+   "source": "tools/qwen27b/rq_quality/d4_ko_prompts.json (W2-authored)"
+  },
+  {
+   "id": "d4_ko_code_03",
+   "category": "d4_code_explain",
+   "text": "SQL 문을 한국어로 풀어서 설명해 줘. 각 절(SELECT, FROM, WHERE, GROUP BY, HAVING)을 한 줄씩.\n\nSELECT city, COUNT(*) AS n FROM orders WHERE status = 'paid' GROUP BY city HAVING COUNT(*) >= 10;",
+   "source": "tools/qwen27b/rq_quality/d4_ko_prompts.json (W2-authored)"
+  },
+  {
+   "id": "d4_ko_code_04",
+   "category": "d4_code_explain",
+   "text": "자바스크립트에서 아래 두 줄의 출력이 왜 다른지 한국어로 짧게 설명해 줘.\n\n```js\nconsole.log([10, 9, 1].sort());\nconsole.log([10, 9, 1].sort((a, b) => a - b));\n```",
+   "source": "tools/qwen27b/rq_quality/d4_ko_prompts.json (W2-authored)"
+  },
+  {
+   "id": "d4_ko_code_05",
+   "category": "d4_code_explain",
+   "text": "아래 셸 명령이 하는 일을 단계별로 한국어 번호 목록으로 설명해 줘.\n\nfind . -name '*.log' -mtime +7 -print0 | xargs -0 gzip",
+   "source": "tools/qwen27b/rq_quality/d4_ko_prompts.json (W2-authored)"
+  },
+  {
+   "id": "en_explain_cache",
+   "category": "expository",
+   "text": "Explain to a new engineer what a CPU cache line is, why false sharing slows down multithreaded code, and how padding fixes it.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "en_explain_tides",
+   "category": "expository",
+   "text": "Explain why most coasts see two high tides a day, and why the times shift by about fifty minutes each day.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "en_explain_bloom",
+   "category": "expository",
+   "text": "Describe how a Bloom filter works, what a false positive is, and how the number of hash functions affects it.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "en_summary_bakery",
+   "category": "summarization",
+   "text": "Summarize in three bullet points: A neighborhood bakery switched from paper order slips to a tablet queue. Morning wait times fell from twelve to seven minutes, but two older regulars said they found the screen confusing, so the owner kept one paper pad by the register for anyone who asks.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "en_summary_meeting",
+   "category": "summarization",
+   "text": "Turn these notes into a short status update for a manager: build server disk at 91 percent; nightly job failed twice this week because of it; Ana is moving old artifacts to cold storage on Thursday; no customer impact so far.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "en_code_python_lru",
+   "category": "code",
+   "text": "Write a small Python LRU cache class with get and put in O(1) time using an OrderedDict, then show a three-line usage example.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "en_code_sql_window",
+   "category": "code",
+   "text": "Write a SQL query that returns, for each customer, their three most recent orders, using a window function. Assume a table orders(customer_id, order_id, created_at).",
+   "source": "W2-authored"
+  },
+  {
+   "id": "en_code_rust_err",
+   "category": "code",
+   "text": "Show a short Rust function that reads a file to a string and returns a custom error enum covering not-found and permission-denied, using the ? operator.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "en_code_review",
+   "category": "code",
+   "text": "Review this JavaScript and list the bugs: function avg(xs) { let s; for (let i = 1; i < xs.length; i++) s += xs[i]; return s / xs.length; }",
+   "source": "W2-authored"
+  },
+  {
+   "id": "en_creative_lighthouse",
+   "category": "creative",
+   "text": "Write a short poem of eight lines about a lighthouse keeper who has never seen a ship.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "en_creative_letter",
+   "category": "creative",
+   "text": "Write a friendly letter from a houseplant to the person who keeps forgetting to water it.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "en_reason_ages",
+   "category": "reasoning",
+   "text": "Mia is twice as old as Leo was when Mia was as old as Leo is now. Leo is 24. How old is Mia? Show your steps.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "en_reason_schedule",
+   "category": "reasoning",
+   "text": "Three meetings of 40, 25 and 50 minutes must fit between 9:00 and 11:00 with at least 5 minutes between them. Is it possible? Give one valid schedule or explain why not.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "en_struct_recipe",
+   "category": "structured",
+   "text": "Return only JSON describing a pancake recipe with fields: name, servings, ingredients (array of {item, quantity}), and steps (array of strings).",
+   "source": "W2-authored"
+  },
+  {
+   "id": "en_struct_yaml",
+   "category": "structured",
+   "text": "Write a YAML configuration for a web service with three environments (dev, staging, prod), each with a replica count, a log level and a database URL placeholder.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "en_repeat_list",
+   "category": "repetitive",
+   "text": "Copy the following list exactly, then copy it again in reverse order: apple, river, candle, mirror, violin, harbor, pencil, garden.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "en_repeat_table",
+   "category": "repetitive",
+   "text": "Print a multiplication table for 7 from 7 x 1 to 7 x 20, one line per entry, in the form '7 x n = result'.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "en_instr_email",
+   "category": "instruction",
+   "text": "Write a polite two-paragraph email declining a meeting invitation for Friday and proposing two alternative times next week.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "en_instr_steps",
+   "category": "instruction",
+   "text": "Give step-by-step instructions to replace a bicycle inner tube, in at most ten numbered steps.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "ko_explain_inflation",
+   "category": "expository",
+   "text": "물가 상승률과 기준금리가 어떻게 연결되는지 고등학생이 이해할 수 있게 설명해 줘.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "ko_explain_tls",
+   "category": "expository",
+   "text": "웹사이트에 접속할 때 HTTPS가 어떤 순서로 연결을 안전하게 만드는지 단계별로 설명해 줘.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "ko_explain_fermentation",
+   "category": "expository",
+   "text": "김치가 익어 가면서 맛이 시어지는 이유를 미생물의 관점에서 설명해 줘.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "ko_summary_policy",
+   "category": "summarization",
+   "text": "다음 내용을 세 문장으로 요약해 줘: 한 회사가 주 4일 근무를 여섯 달 동안 시범 운영했다. 직원 만족도 설문 점수는 크게 올랐고 이직 신청은 줄었다. 다만 고객 응대 부서는 금요일 문의를 처리하려고 교대 근무를 새로 짜야 했고, 일부 팀장은 회의 시간이 부족하다고 답했다. 회사는 내년에 고객 응대 부서만 다른 방식으로 운영하는 안을 검토하고 있다.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "ko_summary_news",
+   "category": "summarization",
+   "text": "아래 기사 내용을 한 문장 제목과 두 줄 요약으로 정리해 줘: 지역 도서관이 다음 달부터 밤 10시까지 문을 연다. 시험 기간마다 열람실 자리가 부족하다는 민원이 이어졌기 때문이다. 연장 운영에 필요한 인력은 자원봉사자와 시간제 직원으로 채운다.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "ko_code_python_dedup",
+   "category": "code",
+   "text": "파이썬에서 리스트의 순서를 유지하면서 중복을 제거하는 함수를 작성하고, 시간 복잡도를 한국어로 설명해 줘.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "ko_code_regex",
+   "category": "code",
+   "text": "한국 휴대전화 번호(010-1234-5678 형식)를 찾는 정규식을 만들고, 각 부분이 무엇을 뜻하는지 설명해 줘.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "ko_code_git",
+   "category": "code",
+   "text": "실수로 main 브랜치에 커밋한 변경을 새 브랜치로 옮기고 main은 원래대로 되돌리는 git 명령을 순서대로 알려 줘.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "ko_code_explain_c",
+   "category": "code",
+   "text": "다음 C 코드가 출력하는 값을 예측하고 이유를 설명해 줘: int x = 5; int y = x++ + ++x; printf(\"%d %d\\n\", x, y);",
+   "source": "W2-authored"
+  },
+  {
+   "id": "ko_creative_poem",
+   "category": "creative",
+   "text": "가을 저녁 버스 정류장을 배경으로 여섯 줄짜리 짧은 시를 써 줘.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "ko_creative_story",
+   "category": "creative",
+   "text": "말을 할 줄 아는 고양이가 처음으로 편의점에 가는 이야기의 첫 문단을 써 줘.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "ko_reason_coins",
+   "category": "reasoning",
+   "text": "500원, 100원, 50원 동전으로 1,000원을 만드는 방법은 모두 몇 가지인지 구하고 풀이를 보여 줘.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "ko_reason_calendar",
+   "category": "reasoning",
+   "text": "2026년 3월 1일이 일요일이라면 같은 해 5월 5일은 무슨 요일인지 계산 과정을 보여 줘.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "ko_struct_json",
+   "category": "structured",
+   "text": "한 주 식단표를 JSON으로만 출력해 줘. 각 날짜에 아침, 점심, 저녁 메뉴를 넣어.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "ko_struct_table",
+   "category": "structured",
+   "text": "서울, 부산, 대구, 광주의 특징을 도시 이름, 대표 음식, 유명한 장소 열이 있는 마크다운 표로 정리해 줘.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "ko_repeat_count",
+   "category": "repetitive",
+   "text": "1부터 40까지의 숫자를 한글로 쓴 다음(일, 이, 삼 ...), 같은 목록을 아라비아 숫자로 한 번 더 써 줘.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "ko_repeat_copy",
+   "category": "repetitive",
+   "text": "다음 문장을 다섯 번 그대로 따라 쓰고, 마지막에 문장의 글자 수를 세어 줘: 오늘도 천천히 그러나 꾸준히 걷는다.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "ko_instr_rules",
+   "category": "instruction",
+   "text": "동아리 첫 모임에서 쓸 규칙 다섯 가지를 존댓말로 써 줘. 각 규칙은 한 문장으로 끝내.",
+   "source": "W2-authored"
+  },
+  {
+   "id": "ko_instr_travel",
+   "category": "instruction",
+   "text": "부모님과 함께하는 1박 2일 경주 여행 일정을 시간대별로 짜 줘. 이동 거리가 너무 길지 않게 해 줘.",
+   "source": "W2-authored"
+  }
+ ],
+ "manifest": {
+  "overlap": {
+   "method": "40-character fragments every 20 characters, exact substring",
+   "against": {
+    "r0_a01": {
+     "sha256": "f076441e8425cc024bcbe9c2e56fd409e0b2538946f237e51c7a7f0a76d5b95e",
+     "hits": {}
+    },
+    "r3_c01": {
+     "sha256": "614b020e14c5733e3154f0c2692b4ab6e4adbd4d4f246dea42849edeabafe21f",
+     "hits": {}
+    },
+    "r3_c02": {
+     "sha256": "186e6767edcb8b6d18ef8c2dbf3d656be583cd52aa68f0440960a8417a29823e",
+     "hits": {
+      "expository_pangram": 1
+     }
+    }
+   }
+  }
+ }
+}
