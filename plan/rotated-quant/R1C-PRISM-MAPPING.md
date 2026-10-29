@@ -316,3 +316,21 @@
   - 시간: base 291.5 s, rot 342.0 s(각각 모델 로드 포함), 최대 RSS 53 GB
   - 해석(짐작): 회전 가중치를 BF16으로 다시 반올림한 효과(텐서마다 출력 상대 오차 약 1.7e-3)가 64층에 걸쳐 쌓인 수준이다. W3의 gufo 측정(KL 5e-6)과는 코퍼스, 평가 방식, 파일(v1 대 prism)이 달라 직접 비교할 수 없다. 같은 조건의 gufo 대 llama.cpp logits 비교는 W3 로더 전환 뒤에 한다.
   - 로그: `build/rq-llama/logs/kl-{base-4,base-16,rot-16}.log`
+
+## 추가: 부호 없는 회전 `--signs none` (`5026c995`, 2026-10-29)
+
+사용자 결정에 따라 D = I(Hadamard만) 회전을 시험할 수 있게 했다. 배경은 두 가지다. KVarN(`attention_kvarn.hip:108`)이 부호 없이 정규화 Hadamard만 쓰고, volta-hadamard가 무작위 부호로 Q2_K가 나빠졌다고 보고했다.
+
+- **옵션:** `--signs random|none`. 기본값은 `random`(지금처럼 `--seed`로 폭마다 ±1을 뽑는다)이다.
+  - `none`이면 폭마다 부호 벡터가 모두 +1이다. `--seed`와 함께 쓰면 거부한다. 이미 회전된 입력에 `--signs`를 주면 거부한다.
+- **KV:** `none`도 upstream `identity`가 아니라 **explicit** 모드로 쓴다(`sign_values` 모두 +1). W3 gufo 로더는 explicit만 받으므로 로더 변경은 없다.
+- **출처 표시:** 회전한 파일에는 `gufo.rotation.source_signs`를 쓴다. 값은 `"none"` 또는 `"random seed=<n>"`이다. `none`이면 유효 레시피 JSON에도 `"signs": "none"`이 들어가므로, `source_recipe_sha256`이 seeded 파일과 달라진다. seeded 파일의 레시피 JSON은 전과 같다.
+- **`check_rotated`:** 모드를 파일의 `source_signs`에서 읽는다. `none`이면 +1 벡터와 비교하고, `--seed`를 주면 거부한다. seeded 파일은 기록된 시드를 쓰므로 `--seed`가 없어도 된다. 이 키가 없는 이전 파일(`b4486e95` 이전에 만든 prism 파일 포함)은 `--seed`가 필요하다.
+- **테스트 `test_sign_free_rotation`:**
+  - explicit 모드이고 값이 모두 +1인지, `source_signs = none`인지
+  - 저장값이 BF16-RNE(W·H)와 비트 단위로 같은지
+  - `check_rotation`과 `check_rotated`(`--seed` 없이)가 통과하는지, `--seed`를 주면 거부하는지
+  - seeded 파일에 `random seed=11`이 기록되는지
+  - 유효 레시피 JSON에 `"signs": "none"`이 있는지, 거부 2종
+  - 결과: `rotquant_test` 30/30, groups 3/3
+- **실제 27B 헤더 dry-run:** 회전 401개, 부호 벡터 3개로 seeded와 같다.
