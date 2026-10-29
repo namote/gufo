@@ -38,6 +38,9 @@ if (ENGINE_ENABLE_HIP)
   # and corpus windows, so no CTest.
   add_executable(qwen27b_rq_logits EXCLUDE_FROM_ALL rq_logits.cpp)
   target_link_libraries(qwen27b_rq_logits PRIVATE gufo_core hip::host)
+  # RQ R2 loader check: llama.cpp --kl-divergence-base files from gufo logits.
+  add_executable(qwen27b_rq_kld_base EXCLUDE_FROM_ALL rq_kld_base.cpp)
+  target_link_libraries(qwen27b_rq_kld_base PRIVATE gufo_core hip::host)
   add_executable(qwen27b_continuation_adapter_test EXCLUDE_FROM_ALL
     continuation_adapter_test.cpp continuation_fault.cpp)
   target_link_libraries(qwen27b_continuation_adapter_test PRIVATE gufo_core ${CMAKE_DL_LIBS})

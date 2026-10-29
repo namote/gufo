@@ -161,6 +161,28 @@ class LlamaKldBaseTest(unittest.TestCase):
         true = (np.exp(exact) * (exact - logq)).sum(-1)
         np.testing.assert_allclose(kl, true, rtol=2e-3, atol=1e-5)
 
+    @unittest.skipUnless(os.environ.get("GUFO_RQ_KLD_BASE"), "GUFO_RQ_KLD_BASE (qwen27b_rq_kld_base) not set")
+    def test_cpp_row_encoding_matches_python(self):
+        import subprocess
+        rng = np.random.default_rng(17)
+        n_vocab = 1001
+        rows = [rng.normal(0, 3, n_vocab), rng.normal(0, 20, n_vocab),  # range wider than 16
+                np.full(n_vocab, 2.5),  # scale 0
+                np.round(rng.normal(0, 2, n_vocab) * 4) / 4]  # many ties
+        rows = np.array(rows, dtype=np.float32)
+        with tempfile.TemporaryDirectory() as d:
+            src, dst = Path(d) / "rows.bin", Path(d) / "enc.bin"
+            src.write_bytes(np.array([n_vocab], "<i4").tobytes() + rows.astype("<f4").tobytes())
+            subprocess.run([os.environ["GUFO_RQ_KLD_BASE"], "--encode-rows", str(src), str(dst)], check=True)
+            got = np.frombuffer(dst.read_bytes(), "<u2").reshape(len(rows), -1)
+        for r, row in enumerate(rows):
+            want = logits_io.llama_encode_row(row)
+            np.testing.assert_array_equal(got[r, 4:], want[4:])  # quantized log-probs and padding
+            np.testing.assert_array_equal(got[r, :2], want[:2])  # scale
+            gm, wm = (np.frombuffer(x[2:4].tobytes(), "<f4")[0] for x in (got[r], want))
+            # min_log_prob goes through libm expf/log; allow a few float32 ulps.
+            self.assertLessEqual(abs(int(np.float32(gm).view(np.int32)) - int(np.float32(wm).view(np.int32))), 4)
+
     def test_rejects_wrong_shapes_and_magic(self):
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaisesRegex(ValueError, "tokens must be"):
