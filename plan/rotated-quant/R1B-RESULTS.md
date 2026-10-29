@@ -340,3 +340,12 @@ W3 진단에서 회전 BF16이 원본보다 AR +7 %, prefill +21 % 느렸다. �
       >   - 출처 KV 4개(`gufo.rotation.source_converter`, `source_recipe_sha256`, `source_sha256`, `source_file`)는 있다.
       >   - `split.*` 키는 뺐다. 나머지 KV는 원래 바이트 그대로다.
       > - 배치: alignment 32, 데이터 시작 10996832. 텐서 절대 offset은 모두 32의 배수지만, 64의 배수는 하나도 없다(회전 파일은 866개 모두 64의 배수이고, 원본은 866개 모두 64의 배수이며 그중 256의 배수가 362개다).
+
+## 정정 (2026-10-29, W1c)
+
+"256B 정렬" 절 2번에서 "입력이 256 정렬이면 양자화 출력도 256 정렬이다"라고 한 결론은 **틀렸다**.
+
+- llama-quantize는 `general.alignment` 키를 복사하지만, 데이터는 항상 32로 배치한다(`llama-quant.cpp` `align = GGUF_DEFAULT_ALIGNMENT`). 그래서 키(256)와 배치(32)가 어긋난 파일이 나온다.
+- 드래프터 시험이 맞아 보인 것은 텐서 크기가 모두 256의 배수였기 때문이다.
+- 컨버터는 `fe77eaa4`부터 llama-quantize 출력을 32 배치로 읽어 다시 정렬한다.
+- 자세한 내용은 [R1C-PRISM-MAPPING.md](R1C-PRISM-MAPPING.md) "3단계 결과"에 있다.

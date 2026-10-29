@@ -238,3 +238,81 @@
   - 키 타입 검사와 identity 모드 허용도 확인한다.
   - 그룹 테스트는 그룹의 모든 텐서가 upstream 허용 종류인지, 회전하지 않는 projection이 alpha와 beta뿐인지 확인한다.
 - **실제 27B 헤더 dry-run:** 회전 텐서 401개(v1은 497개, alpha와 beta 96개가 빠졌다), 부호 벡터 3개(5120, 6144, 17408, int32 값 28672개), 데이터 50.894 GiB(`.rot` 없음)
+
+## 3단계 결과: 재변환과 upstream 교차 검증 (CPU 단계, 2026-10-29)
+
+감독이 허락한 CPU 단계에서 했다(lock은 감독이 잡았다). 루트 여유 공간은 262 GB에서 169 GB가 됐다(150 GiB 위).
+
+### 산출물
+
+모델 루트는 `~/projects/ai.tools/storage/models/llm/`다. 각 폴더에 `PROVENANCE.md`와 `SHA256SUMS`가 있다. v1 파일은 지우지 않았다.
+
+| 파일 | 크기 | sha256 | 시간 |
+|---|---:|---|---:|
+| `qwen-3.8-27b-rot-prism-bf16-gguf/Qwen3.8-27B-rot-prism-BF16.gguf` | 54657869056 | `1f0f3f8b15c199c2a48cdc77c520c8d92c328b3d4b328a9582d07cb918df21dd` | 298.9 s |
+| `qwen-3.8-27b-rot-prism-q4-test-gguf/Qwen3.8-27B-rot-prism-UDcopy-Q4.gguf` | 17621161216 | `107e9b1114c9010f87e384be2b8e86219a4335be31125299a0f9e8b05de25d71` | 190.0 s |
+| `qwen-3.8-27b-rot-prism-q4-test-gguf/Qwen3.8-27B-plain-prism-UDcopy-Q4.gguf` | 17621034240 | `b1a830ccbbf16a0af6e4da0c4e74bda29bd148879676be2c737990d8342711fa` | 199.0 s |
+
+- 회전 BF16 시간에는 입력 sha256이 들어 있다. 이 시간에 다른 컨테이너가 하나 돌고 있었다. R1b의 v1 변환은 159.5 s였다.
+- 회전 BF16 검사는 `check_rotated.py --rows 0`으로 했다(로그 `build/rq-llama/logs/prism-check-rotated.{log,json}`).
+  - 표본: 6개 그룹에서 층 앞·중간·끝, 16개 텐서
+  - 비트 불일치 0, 부호는 시드와 일치
+  - `W'·(H·D·x)` 대 `W·x` 상대 L2 오차: 최대 1.92e-3, 중앙값 약 1.7e-3(BF16 반올림 수준, R1b와 같음)
+- 두 Q4 모두 컨버터 `verify`를 통과했다.
+  - 텐서 866개, 양자화 505개, 바이트가 같은 텐서 361개
+  - 접힌 텐서: 회전 파일 401개, 비회전 파일 0개
+  - 타입이 레시피와 같고, prism/gufo KV가 보존됐고, upstream 규칙을 통과하고, 256 정렬이다.
+  - override 315회, fallback 0회
+
+### 발견: llama-quantize는 `general.alignment`를 복사하지만 데이터는 32로 배치한다 (`fe77eaa4`에서 수정)
+
+- 처음 만든 회전 Q4는 컨버터 `verify`가 거부했다: "520 tensor(s) are not 256-byte aligned".
+- 원인(확인):
+  - `llama-quant.cpp`는 `const size_t align = GGUF_DEFAULT_ALIGNMENT`(b11069 `:979`, upstream `8ab29fae` `:1059`)로 텐서마다 32로 padding한다.
+  - 출력 gguf context의 `alignment`는 읽을 때만 설정된다(`gguf.cpp:629`). 그래서 header offset도 32 기준이 된다.
+  - 그런데 KV `general.alignment = 256`은 입력에서 그대로 복사된다.
+  - 결과는 **키와 배치가 어긋난 파일**이다. llama.cpp reader는 offset이 `general.alignment` 기준 배치와 다르면 거부한다(`gguf.cpp:787`, "tensor has offset …, expected …"). 그러므로 이 파일은 llama.cpp에서도 로드되지 않았을 것이다(짐작, 실행 안 함).
+- **R1B "256B 정렬" 절의 정정:** 거기서 "llama-quantize가 정렬을 유지한다"고 한 결론은 틀렸다. 드래프터 Q8_0은 텐서 크기가 모두 256의 배수였고, 데이터 시작도 우연히 맞아서 그렇게 보였다.
+- **수정(`fe77eaa4`):**
+  - 컨버터는 llama-quantize 출력을 항상 32 배치(`QUANTIZE_LAYOUT`)로 읽는다. offset이 32 packing을 따르는지 검사한다.
+  - 256 정렬이 아니면 `realign(..., layout_alignment=32)`로 바이트를 그대로 두고 256으로 다시 쓴다.
+  - `gguf_io.open_gguf(layout_alignment=)`와 `layout_is_packed`를 더했다.
+  - 가짜 llama-quantize도 같은 배치를 흉내 낸다. 새 테스트 `test_llama_quantize_layout_is_read_at_32`를 더했다.
+  - 테스트 결과: `rotquant_test` 29/29, groups 3/3
+- 처음 만든 잘못된 회전 Q4(키와 배치가 어긋난 파일)는 지우고, 수정한 컨버터로 다시 만들었다(위 표의 파일).
+
+### upstream llama.cpp `8ab29fae` 교차 검증
+
+- 빌드: `build/rq-llama-prism/build`(eval 이미지, CPU, `-DGGML_HIP=OFF -DGGML_NATIVE=ON -DLLAMA_OPENSSL=OFF`). 대상은 `llama-completion`, `llama-perplexity`, `llama-quantize`, `llama-imatrix`이고 32.6 s 걸렸다. 소스는 `build/rq-llama/upstream-src`(shallow clone)다.
+- **로드와 생성:** `llama-completion -p "The capital of France is" -n 12 --temp 0 -t 16`
+
+| 파일 | llama.cpp | 결과 | sign vector 로그(`-v`) |
+|---|---|---|---|
+| 회전 prism BF16 | upstream | "Paris. / The capital of Germany is Berlin.", 2.02 tok/s | `load_tensors_hadamard: loaded 401 Hadamard-folded weight(s) (0 inverse-lookup) using 1 rotation(s) and 3 sign vector(s)` |
+| 회전 prism Q4 | upstream | 같은 출력, 5.34 tok/s | `… loaded 401 … using 2 rotation(s) and 6 sign vector(s)` |
+| 비회전 Q4(대조) | upstream | 같은 출력, 5.28 tok/s | Hadamard 로그 없음 |
+| 회전 prism Q4 | **b11069**(음성 대조) | 로드는 됐지만 **쓰레기**: "ipleempl่อง Condiv {?}aut署ellis秉apsed…" | — |
+
+  - Q4에서 회전 행렬 2개, 부호 6개가 나온 것은 가중치가 두 버퍼 타입에 나뉘어 있어서다. upstream은 (block, 버퍼 타입)마다 하나씩 만든다(`llama-model.cpp:2289-2340`).
+  - 로그: `build/rq-llama/logs/prism-load-*.log`, `prism-loadv-*.log`
+
+- **KL(회전 prism BF16 대 원본 BF16):**
+  - 실행: `llama-perplexity -c 512 --chunks 16 -t 8 -b 512`
+  - 코퍼스는 gufo `docs/*.md`와 `README.md`를 이은 것이다(커밋 `2901e830`, 223005 B, sha256 `4a24cd23…9a08`, `build/rq-llama/kl/corpus.txt`). W2 평가 코퍼스는 아니다.
+  - 기준 logits는 `build/rq-llama/kl/bf16-base-16.kld`(2.0 GB)에 있다. 4 chunk로 먼저 시간을 쟀다(pass당 18.3 s).
+
+| 지표 | 값 |
+|---|---|
+| PPL(base) | 7.273658 ± 0.291466 |
+| PPL(rot) | 7.271247 ± 0.291346 |
+| PPL 비 | 0.999669 ± 0.000209 |
+| Mean KLD | 0.000101 ± 0.000016 |
+| Median KLD | 0.000033 |
+| 99% KLD | 0.000859 |
+| Max KLD | 0.049875 |
+| RMS Δp | 0.226 ± 0.030 % |
+| Same top p | 99.510 ± 0.109 % |
+
+  - 시간: base 291.5 s, rot 342.0 s(각각 모델 로드 포함), 최대 RSS 53 GB
+  - 해석(짐작): 회전 가중치를 BF16으로 다시 반올림한 효과(텐서마다 출력 상대 오차 약 1.7e-3)가 64층에 걸쳐 쌓인 수준이다. W3의 gufo 측정(KL 5e-6)과는 코퍼스, 평가 방식, 파일(v1 대 prism)이 달라 직접 비교할 수 없다. 같은 조건의 gufo 대 llama.cpp logits 비교는 W3 로더 전환 뒤에 한다.
+  - 로그: `build/rq-llama/logs/kl-{base-4,base-16,rot-16}.log`
