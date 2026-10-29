@@ -16,7 +16,7 @@
 | 계획 | 리뷰와 보강 완료 | `PLAN.md` |
 | R0 기준선 | 완료 (2026-10-29) | [R0-RESULTS.md](R0-RESULTS.md), [RESULTS.md](RESULTS.md). 품질(32K 토큰, BF16 대비 prefill/verify/decode), AR 속도(ABBA), DFlash2 텍스트 수락률(64문항). GSQ와 d32K DFlash2는 미측정 |
 | R1b 컨버터(실모델) | 완료 | [R1B-RESULTS.md](R1B-RESULTS.md). 회전 BF16 GGUF와 256B 정렬(D7) |
-| R2 로더와 실행 | 진행 중 | [R2-RESULTS.md](R2-RESULTS.md). ①④⑤ 통과, ②③과 정렬 A/B 남음 |
+| R2 로더와 실행 | 완료 (2026-10-30) | [R2-RESULTS.md](R2-RESULTS.md). ①③④⑤ 통과. ② 로더 정확성은 llama.cpp 직접 대조(RQ2I)와 층별 진단(RQ2G)으로 확인. 남은 KL은 BF16 파일 한계와 부호 민감 경계 위치. 형식은 prism.hadamard(D8). 정렬 A/B: 차이 없음, 로더 옵션 A 불필요 |
 | R0b 타입별 실효 대역폭 | 완료 | [R0B-RESULTS.md](R0B-RESULTS.md). 4비트는 IQ4_XS가 가장 좋다(27B 토큰당 64.0 ms, 상한의 89%). Q3_K와 IQ3_S는 연산에 묶여 상한의 54%로 Q4_K보다 느리다. FWHT는 AR 토큰당 2%다 |
 | R1a 컨버터(합성 텐서) | 완료 | [R1A-RESULTS.md](R1A-RESULTS.md). `tools/rotquant/`, `tools/qwen27b/rotquant_groups.py`. 테스트 20/20, 병합 뒤 `05e527d2`에서도 통과. `.rot`은 F16 |
 | BF16 원본 | 받음 | `~/projects/ai.tools/storage/models/llm/qwen-3.8-27b-bf16-gguf/`(리비전 `4ca72078`, sha256 검증, `PROVENANCE.md`) |
