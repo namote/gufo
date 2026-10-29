@@ -63,7 +63,10 @@ def load_corpus(index_path: Path) -> dict:
 
 class Reference:
     def __init__(self, name: str, prefix: str):
-        self.name = name
+        # A trailing "?" on the name marks a partial reference (e.g. the ExLlamaV3 BF16 decode run
+        # over fewer windows): windows it lacks are left out of that output only.
+        self.partial = name.endswith("?")
+        self.name = name.rstrip("?")
         self.run = None if prefix == "-" else logits_io.load(prefix)
         if self.run is not None:
             self.keys = self.run.keys()
@@ -74,6 +77,8 @@ class Reference:
         keys = (np.int64(window) << 32) | positions.astype(np.int64)
         index = np.searchsorted(self.keys, keys)
         if np.any(index >= len(self.keys)) or np.any(self.keys[np.minimum(index, len(self.keys) - 1)] != keys):
+            if self.partial:
+                return "absent"
             raise SystemExit(f"reference {self.name} lacks window {window} positions")
         return self.run.records["ids"][index]
 
@@ -90,6 +95,7 @@ def main(argv=None) -> int:
     ap.add_argument("--prefix", type=int, default=2048)
     ap.add_argument("--positions-limit", type=int, default=512)
     ap.add_argument("--window-limit", type=int, default=0, help="only the first N windows (0: all)")
+    ap.add_argument("--window-ids", default="", help="comma-separated window indices (default: all)")
     ap.add_argument("--row-chunk", type=int, default=512, help="logits rows per record batch")
     ap.add_argument("--toolchain", default="")
     a = ap.parse_args(argv)
@@ -101,6 +107,9 @@ def main(argv=None) -> int:
 
     corpus = load_corpus(a.windows)
     windows = corpus["windows"][:a.window_limit or None]
+    if a.window_ids:
+        keep = {int(x) for x in a.window_ids.split(",")}
+        windows = [w for w in windows if w["index"] in keep]
     refs = []
     for spec in a.reference:
         name, _, prefix = spec.partition("=")
@@ -164,9 +173,13 @@ def main(argv=None) -> int:
         for chunk, pos in rows:
             chunk = chunk[:, :vocab]
             ref_ids = [r.ids(w["index"], pos) for r in refs]
+            present = [not (isinstance(x, str) and x == "absent") for x in ref_ids]
+            ref_ids = [x if ok else None for x, ok in zip(ref_ids, present)]
             base_rec, ref_logits = records.records_torch(
                 chunk, tok[pos + 1], np.full(len(pos), w["index"]), pos, a.top_k, ref_ids)
             for i, rl in enumerate(ref_logits):
+                if not present[i]:
+                    continue
                 rec = base_rec.copy()
                 rec["ref_logits"] = rl
                 parts[i].append(rec)
@@ -192,7 +205,13 @@ def main(argv=None) -> int:
         out = a.out if i == 0 else f"{a.out}.vs-{r.name}"
         reference = None if r.run is None else dict(meta=r.run.prefix + ".json", bin_sha256=r.run.meta["bin_sha256"],
                                                     name=r.name)
-        logits_io.write(out, np.concatenate(parts[i]), reference=reference, **common)
+        if not parts[i]:
+            print(f"no records for reference {r.name}; {out} not written", flush=True)
+            continue
+        recs = np.concatenate(parts[i])
+        kept = set(int(x) for x in np.unique(recs["window"]))
+        logits_io.write(out, recs, reference=reference,
+                        **dict(common, windows=[m for m in common["windows"] if m["index"] in kept]))
         print(f"wrote {out}", flush=True)
     return 0
 
