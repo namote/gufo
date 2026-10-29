@@ -10,6 +10,7 @@ path ran.
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import sys
 import time
@@ -47,7 +48,7 @@ def main(argv=None) -> int:
 
     index = json.loads(a.windows.read_text())
     tokens = np.fromfile(a.windows.parent / index["tokens_file"], dtype="<i4").astype(np.int64)
-    report = dict(torch=torch.__version__, hip=torch.version.hip, exllamav3=getattr(exllamav3, "__version__", "?"),
+    report = dict(torch=torch.__version__, hip=torch.version.hip, exllamav3=importlib.metadata.version("exllamav3"),
                   exllamav3_path=exllamav3.__file__, ext_path=getattr(exllamav3_ext, "__file__", "?"),
                   device=torch.cuda.get_device_properties(0).gcnArchName,
                   device_name=torch.cuda.get_device_name(0), model_dir=a.model_dir)

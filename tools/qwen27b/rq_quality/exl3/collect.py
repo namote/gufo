@@ -19,6 +19,7 @@ self-referenced run (the ExLlamaV3 BF16 control that later runs pair against).
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import hashlib
 import json
 import sys
@@ -177,7 +178,7 @@ def main(argv=None) -> int:
 
     model_files = sorted(Path(a.model_dir).glob("*.safetensors"))
     common = dict(
-        label=a.label, engine=f"exllamav3 {getattr(exllamav3, '__version__', '?')}",
+        label=a.label, engine="exllamav3 " + importlib.metadata.version("exllamav3"),
         toolchain=a.toolchain, torch=torch.__version__, hip_version=torch.version.hip,
         device=torch.cuda.get_device_properties(0).gcnArchName if torch.version.hip else torch.cuda.get_device_name(0),
         logits_dtype=",".join(sorted(dtype_seen)), model=a.model_dir,
