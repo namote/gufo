@@ -51,6 +51,8 @@ K는 모두 128의 배수다. `token_embd`는 행 조회라 회전 대상이 아
 
 ## GGUF 표시 규칙 (v1)
 
+> D8(2026-10-29)에 따라 upstream `prism.hadamard.*` 형식으로 바꾸는 중이다. 전환이 끝나면 이 절을 새 규칙으로 대체한다.
+
 - 전역 KV:
   - `gufo.rotation.version = 1`
   - `gufo.rotation.kind = "hadamard"`
@@ -278,6 +280,12 @@ K는 모두 128의 배수다. `token_embd`는 행 조회라 회전 대상이 아
 - **D6 MTP nextn 층 (감독 결정 2026-10-29, W1):** 27B GGUF의 `blk.64`(nextn, `block_count - nextn_predict_layers` 이상)는 회전 그룹에서 빼고 원래대로 둔다. 로더는 그 층의 `.rot`을 거부하고, `head_in`이 회전된 파일에서는 MTP 경로를 이름을 들어 거부한다(v1, 운영 27B는 DFlash2).
 
 - **D7 GGUF 텐서 정렬 (사용자 결정 2026-10-29, "컨버터 정렬 + 로더 조사"):** W3 진단에서 BF16 decode GEMV가 텐서의 절대 offset 정렬에 민감했다. 정렬이 나쁜 단일 파일이 분할 원본보다 3–15 % 느렸다. 모든 GGUF(운영 UD 파일과 llama-quantize 출력 포함)는 `general.alignment` 32이고 data 시작 ≡ 32 mod 128이라, 큰 텐서가 128B 정렬이 아니다. 대응: 컨버터 writer는 alignment 256으로 쓴다(W1). llama-quantize가 이 정렬을 유지하는지 확인한다. 운영 UD-Q4_K_M을 alignment 256으로 repack한 사본과 원본을 timing A/B로 비교한다. 이득이 확인되면 로더 재정렬 구현을 사용자에게 묻는다(W3 설계 메모).
+
+- **D8 GGUF 표시 규칙을 upstream `prism.hadamard.*`로 맞춤 (사용자 결정 2026-10-29, "정식판 형식으로 맞추자"):** llama.cpp upstream이 2026-10-11에 Hadamard 접힘 가중치 실행을 병합했다([#29600](https://github.com/ggml-org/llama.cpp/pull/29600), merge `a9d27ac6`, 설계 [#29077](https://github.com/ggml-org/llama.cpp/pull/29077)). 모델 정의는 `y = W'·(H·(s·P·x))`로 우리 `W' = W·D·H`와 같다. 그래서 `gufo.rotation.*`·`.rot` 짝 텐서(v1) 대신 그 형식을 쓴다. 기대 효과는 최신 llama.cpp로 교차 검증하는 것과 외부 호환이다. 위의 "GGUF 표시 규칙 (v1)" 절은 이 전환이 끝나면 대체한다. 진행:
+  1. W1이 upstream 명세를 우리 그룹 표에 대응시킨다(읽기만 함). 확인할 것: 부호 벡터 단위(입력 폭마다 하나인지), `head_in`, nextn 제외, GDN 순열 `P`, 허용 아키텍처와 텐서 종류, block 128, llama-quantize의 KV 보존. 대응이 안 되는 것이 있으면 사용자에게 묻는다.
+  2. 컨버터(W1)와 로더(W3)를 바꾼다. 가중치 바이트는 그대로 두고 표시만 바꾸는 이전 도구로 기존 회전 파일을 옮겨서, R2 ②③ 결과를 그대로 쓸 수 있게 한다(부호 단위가 같을 때).
+  3. upstream llama.cpp(`a9d27ac6` 이후)를 따로 빌드해 회전 Q4의 logits를 gufo와 비교한다.
+  - 위험: 이 지원이 없는 llama.cpp(우리 기준 b11069 포함)는 이 파일을 평범한 `qwen35`로 읽어 조용히 틀린 출력을 낸다. 지금의 "llama.cpp 거부" 보호가 사라진다. 배포 문서에 최소 llama.cpp 버전을 적는다.
 
 ## 위험
 
