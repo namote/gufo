@@ -66,6 +66,27 @@
 
 (창 뒤에 채운다.)
 
+## 속도 측정 계획 (초안, 실행 전)
+
+- **바이너리:** W3이 만든 이미지 `ai-tools/gufo-eval:rqw3-base-rocm101`에 든 release `gufo`.
+  - 이미지 라벨: `org.opencontainers.image.revision` `c94572b3`, `ai.tools.toolchain` `nix-rocm-10.1`.
+  - `/opt/gufo/src/build/release/gufo`는 nix store의 정적 바이너리다(`gufo-0-unstable-dirty`, ROCm 10.1 / Clang 24 운영 툴체인).
+  - W3의 회전 변경이 없는 HEAD로 만들었으므로 **R0 비회전 기준선 속도에 쓸 수 있다.**
+  - 조건 1: W3 (다)에서 W3 코드가 비회전 경로의 성능을 바꾸지 않는다고 확인돼야, 이 기준선을 R2·R4 이후 바이너리와 비교할 수 있다.
+  - 조건 2: R4에서 회전 파일과 비교할 때는 같은 W3 바이너리로 비회전 대조군을 다시 잰다. 리비전이 다른 수치를 섞지 않는다.
+- **창 계획:** `~/projects/ai.tools/test/experiments/gufo_upstream_port_20261023/PLAN-RQ0-SPEED.json`(초안, 실행하지 않음).
+  - driver `gufo_eval_20261020.bench`가 이미지의 `gufo bench`를 차례로 부른다.
+  - 측정: `-p 2048 -n 128 -d 0,32768 -r 3 --temperature 0 --seed 314159`를 AR(`--speculative off`)과 DFlash2(`--speculative dflash2 --dflash-model …DFlash2-Q4_K_M.gguf -v`, 수락률 출력)로 잰다. 기본 KV는 kvarn-k4v2다.
+  - 순서: Q8_0, Q6_K, UD-Q4_K_XL, Q4_K_M, UD-Q4_K_M, BF16을 돈 뒤, BF16을 뺀 역순으로 한 번 더 돈다(ABBA). 양자화 파일마다 떨어진 두 표본으로 잡음 폭을 낸다.
+  - 시간: 22회, 약 3시간 이내(짐작, `seconds` 12600).
+- **한계:** `gufo bench`는 합성 토큰 id(`(pos % 1000) + 100`)를 넣는다. 그래서 여기서 나오는 DFlash2 수락률과 실효 tok/s는 텍스트 수락률이 아니다. pp/tg AR 처리량은 타입 간 비교에 쓸 수 있다.
+- **텍스트 수락률:** `tools/gufo/serving_bench.py --suite docs/models/qwen3.8-27b/artifacts/speculative-corpus.json --corpus-layout distinct --concurrency 1 --max-tokens 128`로 `gufo serve llm … --speculative dflash2`에 HTTP로 보낸다.
+  - 이 도구는 응답 usage의 `draft_tokens`, `draft_tokens_accepted`로 수락률을 낸다. prefill, decode, TTFT는 따로 보고한다.
+  - 지금 창 driver 가운데 "서버를 띄우고 serving_bench를 돌리는" 것이 없다. 그래서 ai.tools에 작은 driver가 필요하다. W2 파일 경계 밖이므로 감독이 정한다.
+  - 대안은 `benchmark-model` 스킬의 `tools/gufo/model_bench`(HTTP, 깊이별 캐시 확인)다.
+- **상주 메모리:** `gufo bench`는 최대 메모리를 내지 않는다. 품질 수집기의 `model_resident_bytes`와 `hip_peak_used_bytes`를 쓴다.
+- **판정:** 요청·단계별 5 %·10 ms 기준으로 본다. 두 표본의 차이가 그보다 크면 결론 없음으로 둔다.
+
 ## 속도 표
 
 (창 뒤에 채운다.)
