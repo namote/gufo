@@ -136,6 +136,98 @@ def same_records(old: Run, new: Run) -> dict:
                                    "position": int(new.records[i]["position"])} for i in differ[:10]]}
 
 
+# ---------------------------------------------------------------- llama.cpp --kl-divergence-base
+# Mirrors upstream llama.cpp 8ab29fae tools/perplexity/perplexity.cpp: the file perplexity writes
+# with --kl-divergence-base and kl_divergence() reads back.
+#   "_logits_" | uint32 n_ctx | int32 n_vocab | int32 n_chunk | int32 tokens[n_chunk * n_ctx]
+#   then per chunk, rows for positions first .. n_ctx - 2 (first = n_ctx / 2), position p predicting
+#   token p + 1, each row nv = 2 * ((n_vocab + 1) / 2) + 4 uint16:
+#   float32 scale, float32 min_log_prob, uint16 q[n_vocab] (log p = scale * q + min_log_prob,
+#   0 for logits at or below max - 16), zero padding to nv.
+# llama.cpp replaces the first token of each chunk with BOS when the vocabulary adds one; Qwen3.8
+# does not (tokenizer add_bos_token false), so tokens are written unchanged.
+LLAMA_KLD_MAGIC = b"_logits_"
+
+
+def llama_nearest_int(x: np.ndarray) -> np.ndarray:
+    """perplexity.cpp nearest_int: float32 round half to even (valid below 2**22)."""
+    return np.rint(np.asarray(x, dtype=np.float32)).astype(np.int64)
+
+
+def llama_row_width(n_vocab: int) -> int:
+    return 2 * ((n_vocab + 1) // 2) + 4
+
+
+def llama_encode_row(logits: np.ndarray) -> np.ndarray:
+    """One base row, as perplexity.cpp log_softmax(n_vocab, logits, uint16 *log_prob, tok)."""
+    x = np.asarray(logits, dtype=np.float32)
+    n_vocab = len(x)
+    max_logit = np.float32(x.max())
+    min_logit = np.float32(max(np.float32(x.min()), np.float32(max_logit - np.float32(16))))
+    sum_exp = float(np.exp(x - max_logit, dtype=np.float32).astype(np.float64).sum())
+    log_sum_exp = np.float32(np.log(sum_exp))
+    min_log_prob = np.float32(np.float32(min_logit - max_logit) - log_sum_exp)
+    scale = np.float32(np.float32(max_logit - min_logit) / np.float32(65535))
+    row = np.zeros(llama_row_width(n_vocab), dtype=np.uint16)
+    row[:4] = np.frombuffer(np.array([scale, min_log_prob], dtype="<f4").tobytes(), dtype="<u2")
+    if scale:
+        inv = np.float32(np.float32(1) / scale)
+        q = llama_nearest_int(np.float32(inv) * (x - min_logit))
+        row[4:4 + n_vocab] = np.where(x > min_logit, q, 0).astype(np.uint16)
+    return row
+
+
+def write_llama_kld_base(path, n_ctx: int, tokens: np.ndarray, logits: np.ndarray) -> int:
+    """tokens [n_chunk, n_ctx] int32; logits [n_chunk, n_ctx - 1 - n_ctx // 2, n_vocab] for
+    positions n_ctx // 2 .. n_ctx - 2. Returns the file size in bytes."""
+    tokens = np.asarray(tokens, dtype="<i4")
+    n_chunk, n_vocab = tokens.shape[0], logits.shape[2]
+    rows = n_ctx - 1 - n_ctx // 2
+    if tokens.shape != (n_chunk, n_ctx) or logits.shape[:2] != (n_chunk, rows):
+        raise ValueError("tokens must be [n_chunk, n_ctx] and logits [n_chunk, n_ctx - 1 - n_ctx/2, n_vocab]")
+    with open(path, "wb") as out:
+        out.write(LLAMA_KLD_MAGIC)
+        out.write(np.array([n_ctx], dtype="<u4").tobytes())
+        out.write(np.array([n_vocab, n_chunk], dtype="<i4").tobytes())
+        out.write(tokens.tobytes())
+        for c in range(n_chunk):
+            for r in range(rows):
+                out.write(llama_encode_row(logits[c, r]).astype("<u2").tobytes())
+    return Path(path).stat().st_size
+
+
+def llama_kld_base_bytes(n_ctx: int, n_vocab: int, n_chunk: int) -> int:
+    return 20 + 4 * n_ctx * n_chunk + 2 * llama_row_width(n_vocab) * (n_ctx - 1 - n_ctx // 2) * n_chunk
+
+
+def read_llama_kld_base(path) -> dict:
+    """Header, tokens and the decoded base log-probabilities [n_chunk, rows, n_vocab] (float32)."""
+    raw = Path(path).read_bytes()
+    if raw[:8] != LLAMA_KLD_MAGIC:
+        raise ValueError("not a llama.cpp --kl-divergence-base file")
+    n_ctx = int(np.frombuffer(raw, "<u4", 1, 8)[0])
+    n_vocab, n_chunk = (int(v) for v in np.frombuffer(raw, "<i4", 2, 12))
+    offset = 20
+    tokens = np.frombuffer(raw, "<i4", n_chunk * n_ctx, offset).reshape(n_chunk, n_ctx)
+    offset += 4 * n_chunk * n_ctx
+    nv, rows = llama_row_width(n_vocab), n_ctx - 1 - n_ctx // 2
+    data = np.frombuffer(raw, "<u2", n_chunk * rows * nv, offset).reshape(n_chunk, rows, nv)
+    if offset + data.nbytes != len(raw):
+        raise ValueError("file size does not match its header")
+    head = np.frombuffer(data[:, :, :4].copy().tobytes(), "<f4").reshape(n_chunk, rows, 2)
+    logp = head[:, :, :1] * data[:, :, 4:4 + n_vocab].astype(np.float32) + head[:, :, 1:2]
+    return {"n_ctx": n_ctx, "n_vocab": n_vocab, "n_chunk": n_chunk, "tokens": tokens, "log_probs": logp}
+
+
+def llama_kld(base_log_probs: np.ndarray, logits: np.ndarray) -> np.ndarray:
+    """Per-row KL(base || candidate) as kl_divergence() sums it: base terms with log p > -16 only."""
+    x = np.asarray(logits, dtype=np.float32)
+    top = x.max(axis=-1, keepdims=True)
+    logq = x - top - np.log(np.exp((x - top).astype(np.float64)).sum(axis=-1, keepdims=True))
+    keep = base_log_probs > -16
+    p = np.where(keep, np.exp(base_log_probs.astype(np.float64)), 0.0)
+    return (p * (base_log_probs - logq)).sum(axis=-1)
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) != 4 or sys.argv[1] != "same":

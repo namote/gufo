@@ -128,6 +128,48 @@ class SameRecordsTest(unittest.TestCase):
             self.assertEqual(r["first_differences"], [{"window": 1, "position": 2}])
 
 
+class LlamaKldBaseTest(unittest.TestCase):
+    def test_nearest_int_matches_the_magic_number_trick(self):
+        import struct
+        def magic(f):
+            i = struct.unpack("<i", struct.pack("<f", np.float32(np.float32(f) + np.float32(12582912.0))))[0]
+            return (i & 0x007FFFFF) - 0x00400000
+        values = np.array([0.0, 0.5, 1.5, 2.5, 3.49, 65534.5, 65535.0, 12.5000005, 7.75], dtype=np.float32)
+        self.assertEqual(logits_io.llama_nearest_int(values).tolist(), [magic(v) for v in values])
+
+    def test_round_trip_and_kl(self):
+        rng = np.random.default_rng(13)
+        n_ctx, n_vocab, n_chunk = 16, 1001, 2  # odd vocabulary exercises the padding
+        rows = n_ctx - 1 - n_ctx // 2
+        tokens = rng.integers(0, n_vocab, size=(n_chunk, n_ctx))
+        base = rng.normal(0, 3, size=(n_chunk, rows, n_vocab)).astype(np.float32)
+        cand = (base + rng.normal(0, 0.2, size=base.shape)).astype(np.float32)
+        with tempfile.TemporaryDirectory() as d:
+            size = logits_io.write_llama_kld_base(Path(d) / "base.kld", n_ctx, tokens, base)
+            self.assertEqual(size, logits_io.llama_kld_base_bytes(n_ctx, n_vocab, n_chunk))
+            got = logits_io.read_llama_kld_base(Path(d) / "base.kld")
+        self.assertEqual((got["n_ctx"], got["n_vocab"], got["n_chunk"]), (n_ctx, n_vocab, n_chunk))
+        np.testing.assert_array_equal(got["tokens"], tokens)
+        exact = log_softmax(base.reshape(-1, n_vocab)).reshape(base.shape)
+        top = base.max(axis=-1, keepdims=True)
+        live = base > top - 16
+        scale = (top - np.maximum(base.min(axis=-1, keepdims=True), top - 16)) / 65535
+        err = np.abs(got["log_probs"] - exact)
+        self.assertTrue(np.all(err[live] <= (scale * 0.51 + 1e-5).repeat(n_vocab, -1)[live]))
+        kl = logits_io.llama_kld(got["log_probs"], cand)
+        logq = log_softmax(cand.reshape(-1, n_vocab)).reshape(cand.shape)
+        true = (np.exp(exact) * (exact - logq)).sum(-1)
+        np.testing.assert_allclose(kl, true, rtol=2e-3, atol=1e-5)
+
+    def test_rejects_wrong_shapes_and_magic(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaisesRegex(ValueError, "tokens must be"):
+                logits_io.write_llama_kld_base(Path(d) / "x", 8, np.zeros((1, 7)), np.zeros((1, 3, 4)))
+            (Path(d) / "y").write_bytes(b"notlogit" + bytes(12))
+            with self.assertRaisesRegex(ValueError, "not a llama.cpp"):
+                logits_io.read_llama_kld_base(Path(d) / "y")
+
+
 class MetricTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
