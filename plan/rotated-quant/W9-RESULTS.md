@@ -1,0 +1,177 @@
+# W9 결과: 투기 디코딩 개선 (2026-10-29)
+
+상위 문서: [SPEC-DECODE.md](SPEC-DECODE.md)(설계), [W9-BRIEF.md](W9-BRIEF.md). 표기: **[확인]**은 측정이나 코드에서 확인한 것, **[짐작]**은 추론이다.
+
+## 상태
+
+- 완료:
+  - 1단계 설계(`adf9c5d3`).
+  - 도구(`f7fc9aa9`, `8d227e90`):
+    - `tools/qwen-flash/spec/{build_suites.py, spec_stats.py, suite_k.json, suite_d.json}`
+    - ai.tools `rq_serving.py`의 `record_responses` 옵션(커밋하지 않음, sha256 `c0f1b5eacd2c5e9b83d370cade0e4950f893d26dd0b27070e1f4b7ddb58e4274`, 원본 `92a79dc7…` 백업은 W9 세션 scratchpad에 있음)
+  - 27B R0 종류별 재집계.
+  - **M0 창 2개(mtp, ar).**
+- 다음: M1(trace 도구 + 시뮬레이터). 빌드와 창 승인이 필요하다(아래 "M1 계획").
+
+## 도구 검증 [확인]
+
+- **suite_k:** Kyojin 원문과 같다. `build/w9-src/kyojin`의 `tools/bench.py`, `tools/qwen/spec_prompts.py`를 AST로 읽어 17/17이 바이트 단위로 같았다.
+- **프록시 자체 시험:** 가짜 SSE 서버(0.2 s 간격 3 이벤트)로 시험했다. 클라이언트 도착 시각이 0.0/0.2/0.4 s였으므로 버퍼링 없이 흘려보낸다. 기록과 `/metrics` 저장도 확인했다.
+- **spec_stats:**
+  - 합성 기록 2건으로 사이클당 토큰, AR 비율, lookup 비율을 손계산과 대조해 같았다.
+  - R0 27B 보고서의 "all" 행이 R0-RESULTS 값(0.453, 0.663, 29.5, 2.28×)과 같다.
+- **M0 첫 분석 실패와 수정:** serving_bench warmup 요청(`max_tokens` 16)이 기록에 섞여 결정성 검사가 실패했다. 측정 요청과 예산이 다른 기록은 건너뛰도록 고쳤다(`8d227e90`, 건너뛴 수를 출력에 남김. A와 K에서 각 1건).
+
+## 27B R0 종류별 재집계 (CPU, 기존 `rq0-accept-a01`, UD-Q4_K_M DFlash2 대 AR)
+
+| 종류 | n | 수락률 | 토큰당 수락 | DFlash2 tok/s | AR 대비 |
+|---|---:|---|---|---:|---|
+| repetitive | 6 | 0.822 [0.703, 0.946] | 0.837 | 58.8 | 4.54× [3.79, 5.50] |
+| reasoning | 5 | 0.560 | 0.745 | 38.1 | 2.94× [2.32, 4.02] |
+| code | 9 | 0.544 | 0.729 | 36.0 | 2.79× [2.27, 3.69] |
+| d4_summary | 5 | 0.501 | 0.712 | 33.5 | 2.60× |
+| structured | 5 | 0.477 | 0.678 | 30.7 | 2.38× |
+| **all** | 64 | 0.453 [0.409, 0.503] | 0.663 | 29.5 | 2.28× [2.07, 2.53] |
+| summarization | 5 | 0.382 | 0.633 | 26.9 | 2.10× |
+| expository | 7 | 0.409 | 0.634 | 27.2 | 2.09× |
+| d4_code_explain | 5 | 0.386 | 0.624 | 26.7 | 2.06× |
+| multilingual | 2 | 0.367 | 0.604 | 25.6 | 1.97× |
+| instruction | 5 | 0.347 | 0.562 | 23.2 | 1.79× [1.42, 2.32] |
+| creative | 5 | 0.285 | 0.489 | 20.0 | 1.55× [1.19, 1.86] |
+| d4_instruction | 5 | 0.269 | 0.465 | 19.1 | 1.47× [1.32, 1.66] |
+
+- 64/64 완성이 AR과 바이트 단위로 같다(greedy 동일성).
+- 약한 곳은 창작과 지시문(1.5–1.8×)이다. 27B는 이미 Kyojin 27B(3090, 1.55–1.59×)보다 배율이 높다.
+- 보고서: `~/projects/ai.tools/storage/evaluations/w9-m0-20261029/r0_udq4km_categories.json`(`spec_stats.py summary <dflash2 bench-0> --ar <ar bench-0>`).
+
+## M0: Flash-Next 기준선 (2026-10-29)
+
+### 창 [확인]
+
+- **계획:** `~/projects/ai.tools/test/experiments/gufo_upstream_port_20261023/PLAN-W9-M0.json`(sha256 `1860e7fc…`, LOCKS.json에 포함).
+- **이미지:** `ai-tools/gufo-eval:rqw3-base-rocm101`(id `0afd4cea`, gufo `c94572b3`, nix ROCm 10.1 / Clang 24 release). c94572b3에서 HEAD 사이에 Flash-Next, speculative, serve 소스 변경이 없다.
+- **모델:** 외장 exFAT(`/run/media/m2on/T5 EVO/…/unsloth-Qwen3.8-Flash-Next-GGUF/`, 읽기 전용). UD-Q4_K_XL 4분할 + `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`이고, 감독이 sha256 17/17을 확인했다(외장 `PROVENANCE.md`, `VERIFY-SHA256.log`).
+- **서버:** `--think off --context 49152 --sessions 1`. mtp는 `--speculative mtp --mtp-model …`(draft-tokens 기본 7), ar는 `--speculative off`다.
+- **bench:** C=1, `--max-tokens 256`, greedy, `--no-cache-prompt`.
+  - A(`accept_prompts.json` 64개)와 K(`suite_k.json` 17개): warmup 1, 반복 mtp 2 / ar 1.
+  - D(`suite_d.json` 8개, 실제 prompt 7,274–7,509 / 27,158–39,256 토큰): warmup 0, 반복 mtp 2 / ar 1.
+- **결과 폴더:** `~/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/w9-m0/{w9-m0-fn-mtp, w9-m0-fn-ar}/`. 두 창 모두 COMPLETE, health_PASS, 재시도 없음.
+  - 서버 준비: mtp 285 s, ar 328 s. **OOM 없음.**
+  - bench 시간: mtp 516/183/333 s, ar 425/144/191 s.
+- **첫 실행 시도:** `window.py`를 스크립트로 불러 import 오류로 preflight 전에 멈췄다(컨테이너 없음, GPU 사용 없음). 빈 출력 폴더는 지웠고, 로그는 `w9-m0.launch-error-1.log`로 남겼다. 모듈로 다시 불렀다(`python3 -m test.experiments.gufo_upstream_port_20261023.window`).
+- **분석:** `spec_stats.py summary`. 결과는 `~/projects/ai.tools/storage/evaluations/w9-m0-20261029/summary-{0,1,2}.json`(sha256 `2340d4cd…`, `6d173d31…`, `0ed0dee7…`).
+- **원시 파일 sha256:**
+  - mtp bench `7d2701f3…`/`113a1fbd…`/`b23386ae…`, responses `7e98be9a…`/`3b2a913f…`/`640e013d…`
+  - ar bench `87605f46…`/`f205c5da…`/`9eb75343…`
+- **tok/s는 참고용이다.** PLE 표를 USB에서 읽는다. 다만 AR tg는 27.0–28.9로, 공개값 28.29(NVMe)와 차이가 작다 [짐작: 오염은 수 % 안].
+
+### 결과 (bootstrap 2000회, 프롬프트 단위 95 % 구간)
+
+**세트 K (Kyojin 비교 프롬프트):**
+
+| 종류 | n | 수락률 | 사이클당 드래프트 | 사이클당 토큰 | lookup 비율 / 수락 | MTP tok/s (참고) | AR tok/s (참고) | AR 대비 | AR과 동일 |
+|---|---:|---|---:|---|---|---:|---:|---|---|
+| chat | 3 | 0.659 | 1.39 | 1.92 [1.80, 2.04] | 0 | 40.5 | 28.6 | 1.42× [1.35, 1.46] | 3/3 |
+| prose | 3 | 0.602 | 1.51 | 1.91 [1.83, 2.03] | 0 | 38.6 | 27.3 | 1.41× [1.28, 1.58] | 3/3 |
+| code | 3 | 0.791 | 3.18 | 3.52 [3.32, 3.86] | 0.016 / 0.45 | 56.4 | 27.7 | 2.04× [1.97, 2.12] | 3/3 |
+| multi | 4 | 0.615 | 1.60 | 1.99 [1.75, 2.30] | 0 | 38.3 | 27.6 | 1.39× [1.30, 1.46] | 4/4 |
+| copy | 4 | 0.790 | 5.23 | 5.13 [4.70, 5.91] | 0.413 / 0.79 | 69.6 | 28.9 | 2.41× [2.28, 2.64] | 4/4 |
+| **all** | 17 | 0.691 [0.647, 0.734] | 2.00 | 2.38 [2.08, 2.83] | 0.080 / 0.78 | 44.7 | 27.9 | 1.60× [1.47, 1.77] | 17/17 |
+
+**세트 A (64개) 전체:**
+
+- 수락률 0.667 [0.638, 0.698], 사이클당 드래프트 2.54, 사이클당 토큰 2.70 [2.48, 2.96]
+- AR 토큰 비율 0.031, lookup 0.039/0.64
+- tok/s 45.3(AR 27.0), **1.67× [1.53, 1.85]**, AR과 동일 64/64
+
+종류별 AR 대비:
+
+| repetitive | reasoning | code | structured | d4_summary | expository | summarization | d4_code_explain | instruction | d4_instruction | creative | multilingual |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 2.38× | 2.00× | 2.17× | 1.70× | 1.65× | 1.54× | 1.53× | 1.51× | 1.49× | 1.43× | **1.21×** | **1.09×** |
+
+- creative는 사이클당 드래프트 1.46개이고, AR 토큰 비율이 0.189다(백오프).
+
+**세트 D (문맥 깊이):**
+
+| 깊이 | n | 수락률 | 사이클당 드래프트 | 사이클당 토큰 | MTP tok/s (참고) | AR tok/s (참고) | AR 대비 | 동일 |
+|---|---:|---|---:|---|---:|---:|---|---|
+| 약 7.4K | 4 | 0.637 | 1.71 | 2.09 [1.83, 2.54] | 39.0 | 27.1 | 1.44× [1.28, 1.68] | 4/4 |
+| 27–39K | 4 | 0.636 | 1.63 | 2.04 [1.77, 2.45] | 39.8 | 26.4 | 1.51× [1.44, 1.58] | 4/4 |
+
+### Kyojin과 비교 [Kyojin 수치는 공개 문서, 측정 조건이 다름]
+
+| 종류 | gufo HEAD MTP (USB, 참고) | gufo v0.8.0 (Kyojin 측정) | Kyojin 카드 1.5.10 | Kyojin SERVE.md (구 팩, plain 27.3) |
+|---|---:|---:|---:|---:|
+| chat | 40.5 (1.42×) | 37.3 | 52.8 | 42.2 (1.55×) |
+| prose | 38.6 (1.41×) | 32.5 | 47.5 | 38.7 (1.42×) |
+| code | 56.4 (2.04×) | 52.3 | 73.2 | 52.2 (1.91×) |
+| multi | 38.3 (1.39×) | — | — | 42.6 (1.56×) |
+| copy | 69.6 (2.41×) | — | — | 54.7 (2.01×) |
+| 8K / 32K 문맥 | 39.0 / 39.8 | 35.3 / 31.9 | 52.2 / 51.1 | — |
+
+- 같은 카드 프롬프트(K의 chat/prose/code = Kyojin `DECODE_PROMPTS`)에서 HEAD는 Kyojin이 잰 v0.8.0보다 9 %, 19 %, 8 % 빠르다. 32K 문맥에서는 25 % 빠르다 [확인: 같은 프롬프트, 측정 방법은 다름. Kyojin은 클라이언트 시간 중앙값이고 우리는 서버 decode_ms 합이다].
+- **그래도 Kyojin 1.5.10 카드보다 1.23–1.34× 느리다(8K 1.34, 32K 1.28).** 배율만 보면 구 팩 SERVE.md(plain 27.3)와 chat/prose/multi에서 비슷하거나 약간 낮고, code/copy는 높다. Kyojin 1.5.10 카드의 plain 기준은 공개되지 않았다.
+- [짐작] 따라서 남은 격차는 (1) Kyojin 쪽 plain decode 향상(1.5.10 팩과 커널), (2) chat/prose/multi/creative에서 짧은 드래프트(사이클당 1.4–1.6개)다.
+
+### 읽은 것
+
+1. **[확인] greedy 출력 동일성:** 89/89 프롬프트(A 64, K 17, D 8)에서 MTP 완성이 AR과 바이트 단위로 같다. 반복 사이 드래프트 수도 모두 같다(기록 2건/프롬프트, 결정성).
+2. **[확인] 약점은 chat/prose/multi/creative/긴 문맥이다.**
+   - 수락률은 0.60–0.66으로 나쁘지 않다. 그런데 컨트롤러가 **사이클당 1.4–1.7개만** 드래프트한다. 사이클당 토큰은 1.9–2.1이다.
+   - code/copy/reasoning/structured는 3–5개를 드래프트하고, 사이클당 토큰이 3.2–5.1이다.
+   - [짐작] 깊이별 EMA는 "이 요청의 평균"만 보므로 확신이 높은 구간(관용구, 반복 표현)에서도 길이를 늘리지 못한다. 반대로 확신이 낮은 토큰에서도 정해진 길이를 다 쓴다. 토큰별 확신도 정지(I1)가 겨냥하는 바로 그 경우다. 이득의 크기는 M1에서 잰다.
+3. **[확인] lookup은 copy에서만 크다**(드래프트의 41 %, 수락 0.79). A 전체는 3.9 %다. I2의 기대 이득은 작다.
+4. **[확인] 백오프:** creative는 출력 토큰의 18.9 %를 AR로 냈다. 다른 종류는 0–6 %다.
+
+## M1 계획 (승인 대기)
+
+### 목적
+
+토큰별로 MTP 사슬 깊이 7의 예측과 확신도를 teacher forcing으로 기록한다. 그 기록으로 길이 정책과 lookup 정책을 **GPU 없이** 비교한다.
+
+### 도구 (승인된 경계 `tests/models/qwen38_flash_next/`, `tools/qwen-flash/`)
+
+1. **`qwen38_flash_next_gpu_probe --mtp-trace`**(새 모드, 운영 소스는 바꾸지 않음):
+   - suite JSON의 각 프롬프트를 서버와 같은 Qwen chat template(think off)로 토큰화하고 prefill한 뒤, greedy AR로 최대 256토큰을 낸다.
+   - 위치 t마다 다음을 한다.
+     - Session과 같은 catch-up(`engine.cpp:623-667` `DraftReplay`/`DraftCatchUp`과 같은 행 선택)을 한다.
+     - 그 위에서 `MtpForward(-1)`를 6번 재귀 호출해 깊이 1..7의 후보 top-64 logits를 받는다(`MtpOutput.candidates`, 이미 있는 출력이라 커널 변경 없음).
+     - 깊이마다 (argmax id, top-64 softmax p, top-2 차이)를 기록한다.
+     - `MtpRewind`로 되돌린다.
+   - 헤드 선택은 운영 `MtpDraftVocab` 규칙(`draft_vocab.hpp`)을 그대로 쓴다. `--full-head` 진단 선택지도 둔다.
+   - 출력: 프롬프트별 토큰열, 프롬프트 토큰 수, 위치별 7깊이 기록(바이너리 + JSON 머리).
+2. **`tools/qwen-flash/spec/spec_sim.py`(새 파일):**
+   - `prompt_lookup.hpp`(Find/Observe/resume)와 `MtpLengthController`(`mtp_policy.hpp`)를 Python으로 옮긴다.
+   - 비용은 `kMtpCycleMilliseconds`(C1, 문맥 보간)를 쓴다.
+   - 정책을 재생해 프롬프트별 draft_n, accepted, rounds, lookup_n과 예상 ms를 낸다.
+   - 후보 정책:
+     - P0: 현재 정책
+     - P1: Kyojin `TierRule`(0.6/0.3/0.95/0.85, dsplit 3)
+     - P2: 비용 인식 확신도 규칙. 커밋된 이력으로 p를 수락 확률로 보정하는 bin을 만들고(시간 비의존), 한계 기대 토큰 대 한계 ms로 계속할지 정한다.
+     - P3: 사후 최적 길이(상한)
+3. **검증 (합격 기준):**
+   - (a) trace 토큰열과 프롬프트 토큰 수가 M0 서버 완성 sha256, `prompt_n`과 같다.
+   - (b) **P0 재생이 M0 기록의 프롬프트별 `draft_n`, `draft_n_accepted`, `draft_rounds`, `lookup_n`과 정확히 같다.**
+   - 다르면 그 수와 위치를 보고하고 원인을 찾는다. [짐작] 가능한 원인은 MTP catch-up 행 수(배치 1 대 k+1)에 따른 near-tie argmax, 빌드 플래그 차이다.
+
+### 빌드 (무거운 CPU 작업, 허락 필요)
+
+- 운영과 같은 ROCm 10.1 / Clang 24 툴체인이 필요하다. 다른 툴체인이면 logits가 달라 (a)와 (b) 비교가 어긋난다(`docs/models/qwen3.8-flash-next/ROCM.md` "Numerical differences").
+- 방법: `git archive HEAD` → `build/w9-src-snap/`, nixos/nix 컨테이너(volume `gufo-nix`, `--cores 8`)에서 `nix develop -c cmake --preset gpu-test -B build/w9-nix-gpu-test` 뒤 `--target qwen38_flash_next_gpu_probe`만 빌드한다.
+- gpu-test 프리셋(RelWithDebInfo + assert)과 운영 release의 최적화 플래그 차이는 (b)로 확인한다. 어긋나면 release 플래그 + 테스트 타깃 구성을 감독과 정한다.
+- 포맷 검사(`tools/ci/check-format.py`, nixos/nix)도 같은 단계에서 한다.
+- 예상 [짐작]: 첫 nix develop 환경 준비 + 타깃 하나 빌드에 20–40분.
+
+### 창 `PLAN-W9-M1.json` (1개)
+
+- **이미지:** 위 빌드 결과를 F23 방식으로 `FROM ai-tools/gufo-eval:64849ca6ec7b` + closure로 묶거나, 빌드 트리를 `/src`로 읽기 전용 마운트해 unit 드라이버로 부른다(RQ2G/unit.py 선례). 방식은 빌드 결과를 보고 고른다.
+- **모델:** M0와 같이 외장을 `:ro`로 쓴다. trace 결과는 디스크 속도와 무관하다.
+- **입력:** A, K, D(완성 약 16.5K 위치 [짐작: M0 사이클 수 × 사이클당 토큰]).
+- **예상 시간 [짐작]:** 위치마다 AR 약 36 ms + MTP 7회 약 2–3 ms ≈ 57 ms이므로 약 16분. 여기에 D prefill 약 3분과 USB 로드 약 5분을 더해 약 25분이다. seconds는 3600으로 잡는다.
+- **산출물:** receipt에 trace 파일(약 16.5K × 7 × 16 B ≈ 2 MB + 토큰열)을 남긴다. 분석 결과는 이 문서에 적는다.
+
+### 판단점
+
+- P0 재생이 M0와 맞고, 최선 후보(P1/P2)의 예상 이득이 A와 K 전체에서 **+3 % 이상**이면 I1 구현으로 간다.
+- 깊이 1 조건부 수락이 Kyojin 수치(ndt 2에서 87.6 %, 유리한 프롬프트)보다 확실히 낮으면, `--full-head`와 BF16 사이드카 trace로 I5(드래프트 품질 원인)를 먼저 본다.
