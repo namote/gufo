@@ -84,6 +84,12 @@
   - 이 도구는 응답 usage의 `draft_tokens`, `draft_tokens_accepted`로 수락률을 낸다. prefill, decode, TTFT는 따로 보고한다.
   - 지금 창 driver 가운데 "서버를 띄우고 serving_bench를 돌리는" 것이 없다. 그래서 ai.tools에 작은 driver가 필요하다. W2 파일 경계 밖이므로 감독이 정한다.
   - 대안은 `benchmark-model` 스킬의 `tools/gufo/model_bench`(HTTP, 깊이별 캐시 확인)다.
+- **텍스트 수락률 창(감독 결정 2026-10-29: 얇은 driver):**
+  - driver: `~/projects/ai.tools/test/experiments/gufo_upstream_port_20261023/rq_serving.py`. 새 측정 로직은 없다. 하는 일은 이미지 `gufo diagnose --fingerprint`, `gufo serve llm` 시작과 `/ready` 대기, `/src/tools/gufo/serving_bench.py` 실행(결과는 `/receipt/run`), 서버 종료다. ai.tools 저장소에는 커밋하지 않는다.
+  - 창 계획: `PLAN-RQ0-ACCEPT.json`(초안). 대상마다 dflash2와 ar 두 항목(ar은 실효 속도 대조군)으로 모두 12개다. 설정: `--context 8192 --sessions 1 --think off`, speculative corpus(11문항), C=1, tg128, warmup 1, 반복 3, `--no-cache-prompt`.
+  - R2 ③과 E5에서는 모델 경로만 바꿔 그대로 쓴다.
+  - 확인한 것(GPU 없이): driver import, read-only 컨테이너 안에서 `/src`의 git source identity와 `gufo diagnose --fingerprint`. 서버와 bench 실행은 아직 확인하지 않았다.
+  - 겹침 확인: `docs/models/qwen3.8-27b/artifacts/speculative-corpus.json` 11문항의 40자 조각(20자 간격)을 찾아봤다. R0 코퍼스 a01과 R3 c01에는 없다. R3 c02에 `expository_pangram` 조각 1개("The quick brown fox…" 문장)가 있다. 수락률은 품질 지표가 아니므로 기록만 한다.
 - **상주 메모리:** `gufo bench`는 최대 메모리를 내지 않는다. 품질 수집기의 `model_resident_bytes`와 `hip_peak_used_bytes`를 쓴다.
 - **판정:** 요청·단계별 5 %·10 ms 기준으로 본다. 두 표본의 차이가 그보다 크면 결론 없음으로 둔다.
 
