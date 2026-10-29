@@ -698,6 +698,13 @@ if (BUILD_TESTING)
   set_tests_properties(rotquant_test PROPERTIES
     LABELS "cpu;tools;quantization" TIMEOUT 60)
 
+  # imatrix calibration corpus builder on synthetic rows.
+  add_test(NAME rotquant_calibration_test
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/rotquant_calibration_test.py)
+  set_tests_properties(rotquant_calibration_test PROPERTIES
+    LABELS "cpu;tools;quantization" TIMEOUT 30)
+
   add_test(NAME check_docs_test
     COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/check_docs_test.py)
