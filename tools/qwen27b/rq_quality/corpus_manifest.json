@@ -1,0 +1,454 @@
+{
+ "schema": "gufo.rq-corpus-manifest.v1",
+ "corpus_version": "rq-r0-corpus 1",
+ "repository_revision": "f95d1302080c5f893dfd1293312b1245fd362c60",
+ "tokenizer": {
+  "file": "tokenizer.json",
+  "sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+ },
+ "window_tokens": 4096,
+ "overlap_tokens": 0,
+ "windows_per_category": 2,
+ "doc_tokens_cap": 1536,
+ "answer_tokens_cap": 512,
+ "total_tokens": 32768,
+ "tokens_per_category": {
+  "en_prose": 8192,
+  "ko_prose": 8192,
+  "code": 8192,
+  "chat": 8192
+ },
+ "scored_positions": 32760,
+ "outputs": {
+  "windows.bin": "ee0d9ba3963bcc6c1e27b02d1e41e60712a28d343dd300788a6ea8d16779791c",
+  "windows.json": "51413ceb583989ac9c8e3adea74092aef56e9615f3f20369cfd2a4fecc3515ab",
+  "windows_text.jsonl": "61434898d599492f883c42406c0d5e0a54492c670366c494f33ec10542278062"
+ },
+ "novelty": "Every source was added to this repository on or after 2026-09-16 (first_added per source); the repository starts on 2026-08-11, after the Qwen3.8 27B training data. Domain: engineering documents and code.",
+ "calibration_exclusion": "R3 imatrix calibration must not use any listed path.",
+ "windows": [
+  {
+   "id": "en_prose-0",
+   "category": "en_prose",
+   "offset": 0,
+   "length": 4096,
+   "sources": [
+    "docs/cache-redesign/cards/07-retention-policy.md",
+    "docs/cache-redesign/cards/09-idle-spill.md",
+    "docs/cache-redesign/cards/11-publication-and-crash-safety.md"
+   ]
+  },
+  {
+   "id": "en_prose-1",
+   "category": "en_prose",
+   "offset": 4096,
+   "length": 4096,
+   "sources": [
+    "docs/cache-redesign/cards/12-streamed-transfers.md",
+    "docs/models/qwen3.8-27b/CONTINUATION-ADAPTER.md",
+    "docs/cache-redesign/cards/13-tiered-lookup-and-eviction.md"
+   ]
+  },
+  {
+   "id": "ko_prose-0",
+   "category": "ko_prose",
+   "offset": 8192,
+   "length": 4096,
+   "sources": [
+    "plan/gufo-upstream-port/KVARN.md",
+    "plan/gufo-upstream-port/SKINNY.md",
+    "plan/v11-gufo/V11-GUFO-EVAL-20261020.md"
+   ]
+  },
+  {
+   "id": "ko_prose-1",
+   "category": "ko_prose",
+   "offset": 12288,
+   "length": 4096,
+   "sources": [
+    "plan/gufo-upstream-port/R10-RESEARCH.md",
+    "plan/v11-gufo/V11-GUFO-SEAT-DISK-PLAN-20261020.md",
+    "plan/gufo-upstream-port/T-RESULTS.md"
+   ]
+  },
+  {
+   "id": "code-0",
+   "category": "code",
+   "offset": 16384,
+   "length": 4096,
+   "sources": [
+    "src/models/qwen/continuation_layout.cpp",
+    "src/models/qwen/hip/kvarn_layout.hpp",
+    "tools/qwen27b/drafts.py"
+   ]
+  },
+  {
+   "id": "code-1",
+   "category": "code",
+   "offset": 20480,
+   "length": 4096,
+   "sources": [
+    "src/models/qwen/hip/kernels/attention_kvarn.hip",
+    "tools/qwen27b/kvarn.py",
+    "src/models/qwen/dflash_policy.hpp"
+   ]
+  },
+  {
+   "id": "chat-0",
+   "category": "chat",
+   "offset": 24576,
+   "length": 4096,
+   "sources": [
+    "docs/cache-redesign/cards/03-resource-ledger.md",
+    "plan/gufo-upstream-port/P-RESULTS.md",
+    "docs/cache-redesign/cards/05-prefix-index-and-lookup.md",
+    "plan/gufo-upstream-port/U4F-RESULTS.md"
+   ]
+  },
+  {
+   "id": "chat-1",
+   "category": "chat",
+   "offset": 28672,
+   "length": 4096,
+   "sources": [
+    "docs/cache-redesign/cards/06-slot-leases-and-mutation.md",
+    "plan/v11-gufo/V11-GUFO-CACHE-DESIGN-20261020.md",
+    "docs/cache-redesign/cards/08-committed-backing-and-streams.md"
+   ]
+  }
+ ],
+ "sources": [
+  {
+   "category": "en_prose",
+   "path": "docs/cache-redesign/cards/07-retention-policy.md",
+   "blob": "01bb6618d1d1f285f22d63e3514081e2f04122cb",
+   "first_added": "2026-10-09",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "markdown prose without fences and tables",
+   "language": "en",
+   "tokens_available": 3549,
+   "tokens_used": 1536,
+   "window": "en_prose-0",
+   "window_offset": 0
+  },
+  {
+   "category": "en_prose",
+   "path": "docs/cache-redesign/cards/09-idle-spill.md",
+   "blob": "af9438ea20dd14439eaae99adb7608a8b15065b1",
+   "first_added": "2026-10-09",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "markdown prose without fences and tables",
+   "language": "en",
+   "tokens_available": 2586,
+   "tokens_used": 1536,
+   "window": "en_prose-0",
+   "window_offset": 1536
+  },
+  {
+   "category": "en_prose",
+   "path": "docs/cache-redesign/cards/11-publication-and-crash-safety.md",
+   "blob": "9f84fe13bcd6c4123be7039bcc47349b1e39baa6",
+   "first_added": "2026-10-09",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "markdown prose without fences and tables",
+   "language": "en",
+   "tokens_available": 2472,
+   "tokens_used": 1024,
+   "window": "en_prose-0",
+   "window_offset": 3072
+  },
+  {
+   "category": "en_prose",
+   "path": "docs/cache-redesign/cards/12-streamed-transfers.md",
+   "blob": "e9ea8c492672cf65ab7e1eb1d078597e15878ae5",
+   "first_added": "2026-10-09",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "markdown prose without fences and tables",
+   "language": "en",
+   "tokens_available": 2436,
+   "tokens_used": 1536,
+   "window": "en_prose-1",
+   "window_offset": 0
+  },
+  {
+   "category": "en_prose",
+   "path": "docs/models/qwen3.8-27b/CONTINUATION-ADAPTER.md",
+   "blob": "6daf9b41413fd951c46bc09428adc7ab991553f9",
+   "first_added": "2026-10-21",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "markdown prose without fences and tables",
+   "language": "en",
+   "tokens_available": 1312,
+   "tokens_used": 1312,
+   "window": "en_prose-1",
+   "window_offset": 1536
+  },
+  {
+   "category": "en_prose",
+   "path": "docs/cache-redesign/cards/13-tiered-lookup-and-eviction.md",
+   "blob": "54a29e7dece5173f8331a0dde3ac84a156fda130",
+   "first_added": "2026-10-09",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "markdown prose without fences and tables",
+   "language": "en",
+   "tokens_available": 1970,
+   "tokens_used": 1248,
+   "window": "en_prose-1",
+   "window_offset": 2848
+  },
+  {
+   "category": "ko_prose",
+   "path": "plan/gufo-upstream-port/KVARN.md",
+   "blob": "81d5c0b1527e8cba47aaecde0611285004b4a20d",
+   "first_added": "2026-10-25",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "markdown prose without fences and tables",
+   "language": "ko",
+   "tokens_available": 17886,
+   "tokens_used": 1536,
+   "window": "ko_prose-0",
+   "window_offset": 0
+  },
+  {
+   "category": "ko_prose",
+   "path": "plan/gufo-upstream-port/SKINNY.md",
+   "blob": "76fbda80168343ee7dbf7c884c0d211ba9d631de",
+   "first_added": "2026-10-27",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "markdown prose without fences and tables",
+   "language": "ko",
+   "tokens_available": 7254,
+   "tokens_used": 1536,
+   "window": "ko_prose-0",
+   "window_offset": 1536
+  },
+  {
+   "category": "ko_prose",
+   "path": "plan/v11-gufo/V11-GUFO-EVAL-20261020.md",
+   "blob": "d874119206548eb512f91408a09db965efcd0316",
+   "first_added": "2026-10-25",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "markdown prose without fences and tables",
+   "language": "ko",
+   "tokens_available": 5654,
+   "tokens_used": 1024,
+   "window": "ko_prose-0",
+   "window_offset": 3072
+  },
+  {
+   "category": "ko_prose",
+   "path": "plan/gufo-upstream-port/R10-RESEARCH.md",
+   "blob": "5d986aa3aa88a59e899b61e07b13851b527b419d",
+   "first_added": "2026-10-28",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "markdown prose without fences and tables",
+   "language": "ko",
+   "tokens_available": 3709,
+   "tokens_used": 1536,
+   "window": "ko_prose-1",
+   "window_offset": 0
+  },
+  {
+   "category": "ko_prose",
+   "path": "plan/v11-gufo/V11-GUFO-SEAT-DISK-PLAN-20261020.md",
+   "blob": "9caadfd7e9c07b806dfbb5abe6057413a58e0c53",
+   "first_added": "2026-10-25",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "markdown prose without fences and tables",
+   "language": "ko",
+   "tokens_available": 2977,
+   "tokens_used": 1536,
+   "window": "ko_prose-1",
+   "window_offset": 1536
+  },
+  {
+   "category": "ko_prose",
+   "path": "plan/gufo-upstream-port/T-RESULTS.md",
+   "blob": "aa675572ae92b0234f0783acde48225d22e5845b",
+   "first_added": "2026-10-28",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "markdown prose without fences and tables",
+   "language": "ko",
+   "tokens_available": 4814,
+   "tokens_used": 1024,
+   "window": "ko_prose-1",
+   "window_offset": 3072
+  },
+  {
+   "category": "code",
+   "path": "src/models/qwen/continuation_layout.cpp",
+   "blob": "9c14e63c7c875c66a1677ac74a11a94b38165908",
+   "first_added": "2026-10-21",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "verbatim",
+   "language": "en",
+   "tokens_available": 1956,
+   "tokens_used": 1536,
+   "window": "code-0",
+   "window_offset": 0
+  },
+  {
+   "category": "code",
+   "path": "src/models/qwen/hip/kvarn_layout.hpp",
+   "blob": "438ef3bec19a16b9e6b5704b3dcb9e83935d5bc3",
+   "first_added": "2026-10-26",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "verbatim",
+   "language": "en",
+   "tokens_available": 4961,
+   "tokens_used": 1536,
+   "window": "code-0",
+   "window_offset": 1536
+  },
+  {
+   "category": "code",
+   "path": "tools/qwen27b/drafts.py",
+   "blob": "d3a91a3594623d6ec249b14924a789247b52a790",
+   "first_added": "2026-09-16",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "verbatim",
+   "language": "en",
+   "tokens_available": 1689,
+   "tokens_used": 1024,
+   "window": "code-0",
+   "window_offset": 3072
+  },
+  {
+   "category": "code",
+   "path": "src/models/qwen/hip/kernels/attention_kvarn.hip",
+   "blob": "6bd9f53accbfe2d507af9b66e2a8741dc2cfad68",
+   "first_added": "2026-10-26",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "verbatim",
+   "language": "en",
+   "tokens_available": 25751,
+   "tokens_used": 1536,
+   "window": "code-1",
+   "window_offset": 0
+  },
+  {
+   "category": "code",
+   "path": "tools/qwen27b/kvarn.py",
+   "blob": "75fcf7fdf4fe16216f869f0f1dd7358e59ec112f",
+   "first_added": "2026-10-26",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "verbatim",
+   "language": "en",
+   "tokens_available": 2747,
+   "tokens_used": 1536,
+   "window": "code-1",
+   "window_offset": 1536
+  },
+  {
+   "category": "code",
+   "path": "src/models/qwen/dflash_policy.hpp",
+   "blob": "2482563842149a2eb472f5239909973922464a2f",
+   "first_added": "2026-09-16",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "verbatim",
+   "language": "en",
+   "tokens_available": 4348,
+   "tokens_used": 1024,
+   "window": "code-1",
+   "window_offset": 3072
+  },
+  {
+   "category": "chat",
+   "path": "docs/cache-redesign/cards/03-resource-ledger.md",
+   "blob": "9bb8cf45b9330121b2c63a9cff2589645ad68d2d",
+   "first_added": "2026-10-09",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "chat sections",
+   "turns": 7,
+   "language": "en",
+   "tokens_available": 1188,
+   "tokens_used": 1188,
+   "window": "chat-0",
+   "window_offset": 0
+  },
+  {
+   "category": "chat",
+   "path": "plan/gufo-upstream-port/P-RESULTS.md",
+   "blob": "c1072ddcfc1014c7760d648621b89248ca4ad69d",
+   "first_added": "2026-10-28",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "chat sections",
+   "turns": 3,
+   "language": "ko",
+   "tokens_available": 1283,
+   "tokens_used": 1283,
+   "window": "chat-0",
+   "window_offset": 1188
+  },
+  {
+   "category": "chat",
+   "path": "docs/cache-redesign/cards/05-prefix-index-and-lookup.md",
+   "blob": "e314b2252ed39758f6d5229bfbc86254e875ad7f",
+   "first_added": "2026-10-09",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "chat sections",
+   "turns": 7,
+   "language": "en",
+   "tokens_available": 1379,
+   "tokens_used": 1379,
+   "window": "chat-0",
+   "window_offset": 2471
+  },
+  {
+   "category": "chat",
+   "path": "plan/gufo-upstream-port/U4F-RESULTS.md",
+   "blob": "b30b5bdec96fb8a96d04943014d13cc1eb75e02c",
+   "first_added": "2026-10-25",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "chat sections",
+   "turns": 3,
+   "language": "ko",
+   "tokens_available": 1389,
+   "tokens_used": 246,
+   "window": "chat-0",
+   "window_offset": 3850
+  },
+  {
+   "category": "chat",
+   "path": "docs/cache-redesign/cards/06-slot-leases-and-mutation.md",
+   "blob": "229a2982f811189c649db4975a8d80e531198c9e",
+   "first_added": "2026-10-09",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "chat sections",
+   "turns": 10,
+   "language": "en",
+   "tokens_available": 1522,
+   "tokens_used": 1522,
+   "window": "chat-1",
+   "window_offset": 0
+  },
+  {
+   "category": "chat",
+   "path": "plan/v11-gufo/V11-GUFO-CACHE-DESIGN-20261020.md",
+   "blob": "490a84357b358f40fc38b2b47f83d09e0797ca86",
+   "first_added": "2026-10-25",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "chat sections",
+   "turns": 4,
+   "language": "ko",
+   "tokens_available": 1477,
+   "tokens_used": 1477,
+   "window": "chat-1",
+   "window_offset": 1522
+  },
+  {
+   "category": "chat",
+   "path": "docs/cache-redesign/cards/08-committed-backing-and-streams.md",
+   "blob": "a7c06e98771dbebd4f3d9c0ad8e4fde7d2edce6d",
+   "first_added": "2026-10-09",
+   "license": "MIT (gufo repository LICENSE, Copyright (c) 2026 gufo contributors)",
+   "transform": "chat sections",
+   "turns": 7,
+   "language": "en",
+   "tokens_available": 1144,
+   "tokens_used": 1097,
+   "window": "chat-1",
+   "window_offset": 2999
+  }
+ ]
+}

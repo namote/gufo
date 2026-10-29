@@ -1,0 +1,115 @@
+"""Read and write qwen27b_rq_logits runs (tests/models/qwen27b/rq_logits.cpp).
+
+A run is `<prefix>.json` (metadata, schema gufo.rq-logits.v1) plus
+`<prefix>.bin`: one packed little-endian record per scored position,
+
+    int32 window, int32 position, int32 target, float32 target_logit,
+    float64 logsumexp, int32 ids[k], float32 logits[k], float32 ref_logits[k]
+
+`position` p holds the logits after window token p, predicting token p + 1
+(`target`). `ids`/`logits` are the run's own top-k, descending, ties to the
+lower id; `logsumexp` covers the full vocabulary. `ref_logits[i]` is this
+run's logit at the reference run's `ids[i]` (its own `ids[i]` without a
+reference), which makes the truncated KL computable without full logits.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+
+import numpy as np
+
+SCHEMA = "gufo.rq-logits.v1"
+
+
+def record_dtype(k: int) -> np.dtype:
+    return np.dtype([
+        ("window", "<i4"), ("position", "<i4"), ("target", "<i4"),
+        ("target_logit", "<f4"), ("logsumexp", "<f8"),
+        ("ids", "<i4", (k,)), ("logits", "<f4", (k,)),
+        ("ref_logits", "<f4", (k,)),
+    ])
+
+
+class Run:
+    """One collector run: metadata and records sorted by (window, position)."""
+
+    def __init__(self, meta: dict, records: np.ndarray, prefix: str):
+        self.meta = meta
+        self.records = records
+        self.prefix = prefix
+
+    @property
+    def top_k(self) -> int:
+        return int(self.meta["top_k"])
+
+    def keys(self) -> np.ndarray:
+        return (self.records["window"].astype(np.int64) << 32) | self.records["position"]
+
+
+def load(prefix: str | Path) -> Run:
+    prefix = str(prefix)
+    meta = json.loads(Path(prefix + ".json").read_text())
+    if meta.get("schema") != SCHEMA:
+        raise ValueError(f"{prefix}.json: schema {meta.get('schema')!r}, expected {SCHEMA}")
+    payload = Path(prefix + ".bin").read_bytes()
+    if hashlib.sha256(payload).hexdigest() != meta["bin_sha256"]:
+        raise ValueError(f"{prefix}.bin: sha256 differs from its metadata")
+    dtype = record_dtype(int(meta["top_k"]))
+    if dtype.itemsize != int(meta["record_bytes"]) or len(payload) % dtype.itemsize:
+        raise ValueError(f"{prefix}.bin: record size mismatch")
+    records = np.frombuffer(payload, dtype=dtype)
+    if len(records) != int(meta["records"]):
+        raise ValueError(f"{prefix}.bin: {len(records)} records, metadata says {meta['records']}")
+    order = np.lexsort((records["position"], records["window"]))
+    records = records[order]
+    keys = (records["window"].astype(np.int64) << 32) | records["position"]
+    if len(keys) > 1 and np.any(keys[1:] == keys[:-1]):
+        raise ValueError(f"{prefix}.bin: duplicate (window, position) records")
+    return Run(meta, records, prefix)
+
+
+def write(prefix: str | Path, records: np.ndarray, **meta) -> dict:
+    """Write a run with the collector's layout (synthetic tests and tools)."""
+    prefix = str(prefix)
+    k = records.dtype["ids"].shape[0]
+    payload = records.astype(record_dtype(k)).tobytes()
+    Path(prefix + ".bin").write_bytes(payload)
+    full = {
+        "schema": SCHEMA, "top_k": k, "record_bytes": record_dtype(k).itemsize,
+        "records": len(records), "bin_sha256": hashlib.sha256(payload).hexdigest(),
+        "reference": None,
+    }
+    full.update(meta)
+    Path(prefix + ".json").write_text(json.dumps(full, indent=1) + "\n")
+    return full
+
+
+def records_from_logits(logits: np.ndarray, targets: np.ndarray, windows: np.ndarray,
+                        positions: np.ndarray, k: int,
+                        reference_ids: np.ndarray | None = None) -> np.ndarray:
+    """Build records from full logits [n, vocab] exactly as the collector does.
+
+    This is the Python mirror of rq_logits.cpp Writer::Add, used by the
+    synthetic tests; the collector itself never stores full logits.
+    """
+    logits = np.asarray(logits, dtype=np.float32)
+    n, vocab = logits.shape
+    if not 1 <= k <= vocab:
+        raise ValueError("k outside the vocabulary")
+    out = np.zeros(n, dtype=record_dtype(k))
+    top = logits.max(axis=1).astype(np.float64)
+    lse = top + np.log(np.exp(logits.astype(np.float64) - top[:, None]).sum(axis=1))
+    # Descending logit, ties to the lower id: a stable sort of -logit.
+    ids = np.argsort(-logits, axis=1, kind="stable")[:, :k].astype(np.int32)
+    out["window"] = windows
+    out["position"] = positions
+    out["target"] = targets
+    out["target_logit"] = logits[np.arange(n), targets]
+    out["logsumexp"] = lse
+    out["ids"] = ids
+    out["logits"] = np.take_along_axis(logits, ids, axis=1)
+    ref_ids = ids if reference_ids is None else reference_ids
+    out["ref_logits"] = np.take_along_axis(logits, ref_ids, axis=1)
+    return out
