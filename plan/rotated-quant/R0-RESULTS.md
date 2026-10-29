@@ -110,6 +110,35 @@ R2 ② 판정은 W3/감독이 [R2 결과](R2-RESULTS.md)에서 한다. 여기에
   - 예상 시간: 파일마다 약 3–6분이다(W1의 BF16 실적 342 s보다 짧을 것, 짐작). 최대 RSS 약 20 GB다.
 - **판정:** llama의 Mean/Median KLD와 Same top p를 rot 파일과 plain 파일에서 비교한다.
 
+## RQ2I 결과: gufo 대 llama.cpp (2026-10-29, 창 `rq2i-a01`)
+
+- **gufo 쪽 GPU 창:** `~/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/rq2i-a01/rq2i-gufo/`. COMPLETE, health_PASS, 재시도 없음, 21:42–21:44 KST.
+  - 실행 파일은 `qwen27b_rq_kld_base` `11400fc8…`이다. 파일마다 헤드 재생 검사 16/16 통과, 크기 2,026,356,628 B(`llama_kld_base_bytes`와 같음).
+  - base 파일 sha256: rot `19b51642…7def`, plain `094bc731…d309`. `read_llama_kld_base`로 다시 읽어 헤더(512, 248320, 16)와 행 확률 합(≈1.002, 양자화 범위)을 확인했다.
+- **llama.cpp 쪽 CPU 단계:**
+  - W1 빌드 `build/rq-llama-prism/build/bin/llama-perplexity`(upstream `8ab29fae`, CPU)를 eval 이미지 `7c2c5a728270`에서 돌렸다. `LD_LIBRARY_PATH`는 `build/bin`이다.
+  - 명령: `-m <같은 GGUF> --kl-divergence-base <gufo 파일> --kl-divergence -c 512 -b 512 --chunks 16 -t 8`
+  - 파일마다 187 s. 로그는 `build/rq-llama/logs/rq2i-{rot,plain}.log`다.
+  - rot 파일 로드 로그: `load_tensors_hadamard: loaded 401 Hadamard-folded weight(s) (0 inverse-lookup) using 2 rotation(s) and 6 sign vector(s)`(1 chunk 상세 로그 `rq2i-rot-verbose-1chunk.log`).
+- **BOS:** 로그에는 `print_info: BOS token = 248044 '<|endoftext|>'`만 나온다. 이 줄은 BOS 토큰 id만 보여 주고, 실제로 붙이는지는 알려 주지 않는다.
+  - GGUF에 `tokenizer.ggml.add_bos_token` 키가 없다. `tokenizer.ggml.model`이 `gpt2`(BPE), `pre`가 `qwen35`이라 llama.cpp 기본값 add_bos false가 적용된다(`llama-vocab.cpp`).
+  - KL 모드는 토큰을 base 파일에서 읽는다. 그래서 gufo와 같은 토큰을 쓴다(코드와 메타데이터 근거).
+- **판정 표**(KL(gufo ‖ llama.cpp), gufo가 base이고 같은 파일·같은 토큰, 16 × 512, 채점 위치 256–510):
+
+| 지표 | rot-prism Q4 | plain-prism Q4 |
+|---|---:|---:|
+| Mean KLD | 0.002421 ± 0.001121 | 0.007274 ± 0.003015 |
+| Median KLD | 0.000200 | 0.001777 |
+| 99.0 % KLD | 0.007852 | 0.048561 |
+| 99.9 % KLD | 0.283756 | 0.267865 |
+| Max KLD | 4.124 | 12.244 |
+| Same top p | 98.652 ± 0.181 % | 96.176 ± 0.300 % |
+| RMS Δp | 2.175 ± 0.639 % | 2.437 ± 0.413 % |
+| PPL(llama) / PPL(gufo base) | 10.384 / 10.307 | 10.815 / 10.629 |
+
+- **판정(감독 기준):** rot 파일의 KL이 plain 파일과 같은 차수이거나 그보다 작다. top-1도 plain보다 높다. 로더 오류의 신호(KL ≥ 0.1)는 없다. 그래서 **gufo의 prism 로더는 llama.cpp와 같은 모델을 계산한다.**
+- **plain이 rot보다 큰 이유(짐작, 확인하지 않음):** 남는 차이는 두 엔진의 산술 차이다(gufo GPU의 Q8_1/FP16 활성화 경로 대 llama.cpp CPU). 비회전 파일에서는 활성화 이상치가 활성화 양자화 오차를 키운다. 회전이 이상치를 펴 주므로 rot 파일에서 엔진 간 차이가 더 작게 보인다.
+
 ## 평가 코퍼스 a01
 
 - 위치: `~/projects/ai.tools/storage/evaluations/rq-r0-20261029/corpus-a01/`(`SHA256SUMS` 포함). manifest 사본: `tools/qwen27b/rq_quality/corpus_manifest.json`. 빌더 `tools/qwen27b/rq_quality/corpus.py`, 소스 리비전 `f95d1302`, tokenizer는 HF `tokenizer.json`(sha256은 manifest). 두 번 빌드해 바이트 단위로 같았다.
