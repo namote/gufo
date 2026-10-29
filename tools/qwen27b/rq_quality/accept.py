@@ -121,6 +121,9 @@ def compare(first: dict, second: dict, resamples: int = DEFAULT_BOOTSTRAP,
            "identical_completions": int(sum(ca[c]["completion_sha256"] == cb[c]["completion_sha256"]
                                             for c in order))}
     for k in ("acceptance", "accepted_per_token"):
+        if a["drafted"].sum() == 0 or b["drafted"].sum() == 0:
+            out[k + "_difference"] = None  # an AR run has no drafts
+            continue
         ci = interval(ba[k] - bb[k])
         out[k + "_difference"] = {"value": float(pa[k] - pb[k]), "ci": ci,
                                   "resolved": bool(ci[0] > 0 or ci[1] < 0)}

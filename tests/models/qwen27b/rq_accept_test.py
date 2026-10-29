@@ -104,6 +104,12 @@ class BootstrapTest(unittest.TestCase):
         self.assertAlmostEqual(s["speedup_over_ar"]["value"], 30.0 / 12.0, places=6)
         self.assertEqual(s["prompts_with_drafts"], 32)
 
+    def test_compare_ar_runs_has_no_acceptance(self):
+        ar = {"a": (0, 0, 256, 20000.0), "b": (0, 0, 256, 21000.0)}
+        c = accept.compare(report(ar), report(ar), resamples=100)
+        self.assertIsNone(c["acceptance_difference"])
+        self.assertAlmostEqual(c["decode_tok_s_ratio"]["value"], 1.0)
+
     def test_compare_rejects_different_prompts(self):
         with self.assertRaisesRegex(ValueError, "differ in prompts"):
             accept.compare(report({"a": (1, 1, 1, 1.0)}), report({"b": (1, 1, 1, 1.0)}), resamples=100)
