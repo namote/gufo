@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "src/core/quant/ggml_dequant.hpp"
+#include "src/core/quant/rotation.hpp"
 #include "src/models/qwen/forward.hpp"
 
 namespace gufo::speculative {
@@ -82,7 +83,10 @@ std::optional<QwenMtpWeights> QwenMtpWeights::LoadFromGguf(
     return std::nullopt;
   }
 
-  if (reader.FindTensor("output.weight.rot") != nullptr) {
+  const auto folded =
+      reader.GetMetadataStringArray(::gufo::quant::rotation::kWeightNamesKey);
+  if (std::find(folded.begin(), folded.end(), "output.weight") !=
+      folded.end()) {
     if (error_msg != nullptr) {
       *error_msg = kMtpRotatedHeadError;
     }

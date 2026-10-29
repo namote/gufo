@@ -168,8 +168,9 @@ struct QwenLayerWeights {
   QwenTensorRef ffn_down;
 
   // Packed input-rotation signs per input group (src/core/quant/rotation.hpp),
-  // null when the group is not rotated. Host pointers after LoadFromGguf;
-  // the HIP model rebinds them to its device copy.
+  // null when the group is not rotated. Groups of the same input width share
+  // one vector (prism.hadamard). Host pointers after LoadFromGguf; the HIP
+  // model rebinds them to its device copy.
   QwenLayerRotation rotation;
 };
 
@@ -186,6 +187,11 @@ struct QwenModelWeights {
   std::shared_ptr<const std::vector<std::uint32_t>> rotation_signs;
   /// Rotated input groups, e.g. "attn_in, ffn_in"; empty when unrotated.
   std::string rotated_groups;
+  /// Host copies of ssm_alpha/ssm_beta folded into the rotated attn_in basis
+  /// at load (the file keeps them unrotated); the layer refs point into it.
+  std::shared_ptr<const std::vector<std::uint8_t>> folded_weights;
+  std::size_t folded_bytes = 0;
+  double fold_seconds = 0.0;
 
   [[nodiscard]] bool IsRotated() const noexcept {
     return !rotated_groups.empty();

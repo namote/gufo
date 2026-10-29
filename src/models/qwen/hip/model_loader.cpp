@@ -230,9 +230,21 @@ void ReleaseWeightRegions(std::vector<QwenGpuWeightRegion>& regions) noexcept {
   return false;
 }
 
-// Copies the packed rotation signs to device memory once, at load time, and
-// rebinds every layer pointer to the copy. Graph capture then sees fixed
-// device pointers and no allocation happens during decode.
+// True when `tensor` is one of the alpha/beta copies folded at load.
+bool IsFolded(const models::QwenModelWeights& weights,
+              const models::QwenTensorRef& tensor) noexcept {
+  if (weights.folded_weights == nullptr || tensor.data == nullptr) {
+    return false;
+  }
+  const auto* begin = weights.folded_weights->data();
+  const auto* pointer = static_cast<const std::uint8_t*>(tensor.data);
+  return pointer >= begin && pointer < begin + weights.folded_weights->size();
+}
+
+// Copies the packed rotation signs and the alpha/beta matrices folded at
+// load to device memory once and rebinds every pointer to the copy. Graph
+// capture then sees fixed device pointers and no allocation happens during
+// decode.
 bool UploadRotationSigns(models::QwenModelWeights& weights, void** device,
                          std::string* error_msg) {
   *device = nullptr;
@@ -240,11 +252,22 @@ bool UploadRotationSigns(models::QwenModelWeights& weights, void** device,
     return true;
   }
   const auto& host = *weights.rotation_signs;
-  const std::size_t bytes = host.size() * sizeof(std::uint32_t);
+  const std::size_t sign_bytes = host.size() * sizeof(std::uint32_t);
+  // Folded matrices start on a 256-byte boundary like the GEMV kernels'
+  // other weights in a well-aligned file.
+  const std::size_t folded_offset = (sign_bytes + 255) / 256 * 256;
+  const std::size_t folded_bytes =
+      weights.folded_weights != nullptr ? weights.folded_weights->size() : 0;
+  const std::size_t bytes = folded_offset + folded_bytes;
   void* buffer = nullptr;
   hipError_t status = hipMalloc(&buffer, bytes);
   if (status == hipSuccess) {
-    status = hipMemcpy(buffer, host.data(), bytes, hipMemcpyHostToDevice);
+    status = hipMemcpy(buffer, host.data(), sign_bytes, hipMemcpyHostToDevice);
+  }
+  if (status == hipSuccess && folded_bytes != 0) {
+    status = hipMemcpy(static_cast<std::uint8_t*>(buffer) + folded_offset,
+                       weights.folded_weights->data(), folded_bytes,
+                       hipMemcpyHostToDevice);
   }
   if (status != hipSuccess) {
     if (buffer != nullptr) {
@@ -271,6 +294,20 @@ bool UploadRotationSigns(models::QwenModelWeights& weights, void** device,
     rebind(layer.rotation.ffn_down_in);
   }
   rebind(weights.head_in_rotation);
+  if (folded_bytes != 0) {
+    const auto* folded_base = weights.folded_weights->data();
+    auto* device_folded = static_cast<std::uint8_t*>(buffer) + folded_offset;
+    for (auto& layer : weights.layers) {
+      for (auto* tensor : {&layer.ssm_alpha, &layer.ssm_beta}) {
+        if (IsFolded(weights, *tensor)) {
+          const auto offset =
+              static_cast<const std::uint8_t*>(tensor->data) - folded_base;
+          tensor->data = device_folded + offset;
+          tensor->available_bytes = folded_bytes - offset;
+        }
+      }
+    }
+  }
   *device = buffer;
   return true;
 }
@@ -339,7 +376,9 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
   }
 
   const auto remap = [&](models::QwenTensorRef& tensor) {
-    return RemapTensor(tensor, weight_regions);
+    // Folded alpha/beta live in host memory until UploadRotationSigns.
+    return IsFolded(*weights_opt, tensor) ||
+           RemapTensor(tensor, weight_regions);
   };
   bool remapped = remap(weights_opt->token_embd) &&
                   remap(weights_opt->output_norm) && remap(weights_opt->output);

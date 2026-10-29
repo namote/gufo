@@ -1,8 +1,13 @@
 #include <algorithm>
+#include <bit>
+#include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <initializer_list>
 #include <memory>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -154,8 +159,11 @@ std::string PresentName(const core::GgufReader& reader,
 
 // Qwen 27B input groups (plan/rotated-quant/PLAN.md, "27B 입력 그룹"); the
 // converter's tools/qwen27b/rotquant_groups.py defines the same groups. Only
-// layers of the main stack are listed, so a `.rot` on an embedded MTP (nextn)
-// layer is refused and never counts toward "rotated in some layers only".
+// layers of the main stack are listed, so a folded weight of an embedded MTP
+// (nextn) layer is refused and never counts toward "rotated in some layers
+// only". ssm_alpha and ssm_beta read the attn_in activation but are not
+// foldable upstream; they stay unrotated in the file and are folded at load
+// (FoldAlphaBeta) so every DeltaNet input projection reads one rotated row.
 gufo::quant::rotation::GroupTable BuildRotationGroups(
     const core::GgufReader& reader, const QwenModelWeights& weights) {
   gufo::quant::rotation::GroupTable table;
@@ -190,8 +198,7 @@ gufo::quant::rotation::GroupTable BuildRotationGroups(
     } else {
       add("attn_in", "attn_in" + l,
           {name({"attn_qkv.weight", "wqkv.weight"}),
-           name({"attn_gate.weight", "wqkv_gate.weight"}),
-           name({"ssm_alpha.weight"}), name({"ssm_beta.weight"})});
+           name({"attn_gate.weight", "wqkv_gate.weight"})});
       add("ssm_out_in", "ssm_out_in" + l, {name({"ssm_out.weight"})});
     }
     add("ffn_in", "ffn_in" + l,
@@ -199,16 +206,170 @@ gufo::quant::rotation::GroupTable BuildRotationGroups(
     add("ffn_down_in", "ffn_down_in" + l, {name({"ffn_down.weight"})});
   }
   const std::string head = PresentName(reader, {"output.weight"});
-  if (head.empty()) {
-    // The head falls back to the token embedding.
-    table.tied_tensors.emplace_back("token_embd.weight");
-  } else {
+  if (!head.empty()) {
     add("head_in", "head_in", {head});
   }
   return table;
 }
 
-// Reads the rotation markers and binds each rotated group's packed signs.
+// float -> IEEE binary16 bits, round to nearest even.
+std::uint16_t FloatToHalf(float value) noexcept {
+  const std::uint32_t bits = std::bit_cast<std::uint32_t>(value);
+  const std::uint32_t sign = (bits >> 16) & 0x8000U;
+  const std::uint32_t magnitude = bits & 0x7FFFFFFFU;
+  if (magnitude >= 0x7F800000U) {
+    return static_cast<std::uint16_t>(sign | 0x7C00U |
+                                      (magnitude > 0x7F800000U ? 0x200U : 0U));
+  }
+  if (magnitude >= 0x477FF000U) {  // rounds to beyond the largest half
+    return static_cast<std::uint16_t>(sign | 0x7C00U);
+  }
+  if (magnitude < 0x38800000U) {  // subnormal half (or zero)
+    const float scaled = std::bit_cast<float>(magnitude) * 16777216.0F;
+    return static_cast<std::uint16_t>(
+        sign | static_cast<std::uint32_t>(std::nearbyint(scaled)));
+  }
+  const std::uint32_t rounded =
+      magnitude + 0xFFFU + ((magnitude >> 13) & 1U) - (112U << 23);
+  return static_cast<std::uint16_t>(sign | (rounded >> 13));
+}
+
+// float -> BF16 bits, round to nearest even (finite input).
+std::uint16_t FloatToBf16(float value) noexcept {
+  const std::uint32_t bits = std::bit_cast<std::uint32_t>(value);
+  return static_cast<std::uint16_t>((bits + 0x7FFFU + ((bits >> 16) & 1U)) >>
+                                    16);
+}
+
+// One row of `tensor` (K elements) as FP32.
+void DecodeRow(const QwenTensorRef& tensor, std::size_t row, std::size_t k,
+               std::span<float> out) {
+  const auto* base = static_cast<const std::uint8_t*>(tensor.data);
+  switch (tensor.type) {
+    case core::GgmlType::kF32:
+      std::memcpy(out.data(), base + row * k * sizeof(float),
+                  k * sizeof(float));
+      return;
+    case core::GgmlType::kBF16:
+      for (std::size_t i = 0; i < k; ++i) {
+        std::uint16_t half = 0;
+        std::memcpy(&half, base + (row * k + i) * sizeof(half), sizeof(half));
+        out[i] = std::bit_cast<float>(static_cast<std::uint32_t>(half) << 16);
+      }
+      return;
+    case core::GgmlType::kQ8_0:
+      gufo::quant::DequantizeQ8_0(
+          base + row * gufo::quant::QuantizedRowBytes(tensor.type, k),
+          out.data(), k);
+      return;
+    default:
+      return;
+  }
+}
+
+// One FP32 row encoded back to `type`, with the reference rounding of each
+// format (ggml quantize_row_q8_0_ref for Q8_0).
+void EncodeRow(core::GgmlType type, std::span<const float> row,
+               std::uint8_t* out) {
+  switch (type) {
+    case core::GgmlType::kF32:
+      std::memcpy(out, row.data(), row.size() * sizeof(float));
+      return;
+    case core::GgmlType::kBF16:
+      for (std::size_t i = 0; i < row.size(); ++i) {
+        const std::uint16_t half = FloatToBf16(row[i]);
+        std::memcpy(out + i * sizeof(half), &half, sizeof(half));
+      }
+      return;
+    case core::GgmlType::kQ8_0: {
+      constexpr std::size_t kBlock = 32;
+      for (std::size_t b = 0; b < row.size() / kBlock; ++b) {
+        float amax = 0.0F;
+        for (std::size_t j = 0; j < kBlock; ++j) {
+          amax = std::max(amax, std::abs(row[b * kBlock + j]));
+        }
+        const float d = amax / 127.0F;
+        const float id = d != 0.0F ? 1.0F / d : 0.0F;
+        gufo::quant::block_q8_0 block{};
+        block.d = FloatToHalf(d);
+        for (std::size_t j = 0; j < kBlock; ++j) {
+          block.qs[j] =
+              static_cast<std::int8_t>(std::round(row[b * kBlock + j] * id));
+        }
+        std::memcpy(out + b * sizeof(block), &block, sizeof(block));
+      }
+      return;
+    }
+    default:
+      return;
+  }
+}
+
+// Folds ssm_alpha and ssm_beta of every DeltaNet layer into the rotated
+// basis, W' = W·D·H with the attn_in (hidden-width) signs, re-encoded in
+// their own type so every prefill and decode route selection is unchanged.
+// Each layer's alpha and beta stay adjacent for the packed verification
+// path. The file keeps them unrotated (upstream llama.cpp cannot fold them).
+bool FoldAlphaBeta(QwenModelWeights& weights, const std::uint32_t* bits,
+                   std::string* error_msg) {
+  const auto start = std::chrono::steady_clock::now();
+  const std::size_t k = weights.config.hidden_size;
+  std::size_t total = 0;
+  for (std::size_t i = 0; i < weights.layers.size(); ++i) {
+    auto& layer = weights.layers[i];
+    if (layer.is_full_attention) {
+      continue;
+    }
+    for (const auto* tensor : {&layer.ssm_alpha, &layer.ssm_beta}) {
+      if (tensor->type != core::GgmlType::kF32 &&
+          tensor->type != core::GgmlType::kBF16 &&
+          tensor->type != core::GgmlType::kQ8_0) {
+        if (error_msg != nullptr) {
+          *error_msg = "Rotated GGUF refused: blk." + std::to_string(i) +
+                       " ssm_alpha/ssm_beta type " +
+                       std::string(core::ToString(tensor->type)) +
+                       " cannot be folded into the rotated attn_in basis "
+                       "(F32, BF16 and Q8_0 are supported)";
+        }
+        return false;
+      }
+      total += tensor->EncodedSizeBytes();
+    }
+  }
+  auto storage = std::make_shared<std::vector<std::uint8_t>>(total);
+  const std::span<const std::uint32_t> signs(
+      bits, gufo::quant::rotation::PackedSignWords(k));
+  std::vector<float> row(k);
+  std::size_t offset = 0;
+  for (auto& layer : weights.layers) {
+    if (layer.is_full_attention) {
+      continue;
+    }
+    for (auto* tensor : {&layer.ssm_alpha, &layer.ssm_beta}) {
+      const std::size_t rows = tensor->num_elements / k;
+      const std::size_t row_bytes = tensor->EncodedSizeBytes() / rows;
+      std::uint8_t* destination = storage->data() + offset;
+      for (std::size_t r = 0; r < rows; ++r) {
+        DecodeRow(*tensor, r, k, row);
+        gufo::quant::rotation::RotateRow(row, signs);
+        EncodeRow(tensor->type, row, destination + r * row_bytes);
+      }
+      tensor->data = destination;
+      tensor->available_bytes = total - offset;
+      offset += rows * row_bytes;
+    }
+  }
+  weights.folded_weights = std::move(storage);
+  weights.folded_bytes = total;
+  weights.fold_seconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+          .count();
+  return true;
+}
+
+// Reads the prism.hadamard metadata, binds one sign vector per input width
+// to every rotated group (5120: attn_in, ffn_in, head_in; 6144: ssm_out_in,
+// attn_out_in; 17408: ffn_down_in) and folds alpha/beta.
 bool BindRotation(const core::GgufReader& reader, QwenModelWeights& weights,
                   std::string* error_msg) {
   const auto info = gufo::quant::rotation::ReadRotation(
@@ -221,35 +382,49 @@ bool BindRotation(const core::GgufReader& reader, QwenModelWeights& weights,
   }
   auto storage = std::make_shared<std::vector<std::uint32_t>>();
   std::size_t words = 0;
-  for (const auto& instance : info->instances) {
-    words += instance.bits.size();
+  for (const auto& width : info->widths) {
+    words += width.bits.size();
   }
   storage->reserve(words);
-  std::vector<std::pair<std::string_view, std::size_t>> offsets;
-  for (const auto& instance : info->instances) {
-    offsets.emplace_back(instance.key, storage->size());
-    storage->insert(storage->end(), instance.bits.begin(), instance.bits.end());
+  std::vector<std::pair<std::size_t, std::size_t>> offsets;
+  for (const auto& width : info->widths) {
+    offsets.emplace_back(width.k, storage->size());
+    storage->insert(storage->end(), width.bits.begin(), width.bits.end());
   }
-  const auto signs = [&](const std::string& key) -> const std::uint32_t* {
-    for (const auto& [name, offset] : offsets) {
-      if (name == key) {
+  const auto signs = [&](std::string_view group,
+                         std::size_t k) -> const std::uint32_t* {
+    if (!info->IsGroupRotated(group)) {
+      return nullptr;
+    }
+    for (const auto& [width, offset] : offsets) {
+      if (width == k) {
         return storage->data() + offset;
       }
     }
     return nullptr;
   };
-  for (std::uint32_t i = 0; i < weights.config.num_layers; ++i) {
-    const std::string l = ":" + std::to_string(i);
-    auto& rotation = weights.layers[i].rotation;
-    rotation.attn_in = signs("attn_in" + l);
-    rotation.ssm_out_in = signs("ssm_out_in" + l);
-    rotation.attn_out_in = signs("attn_out_in" + l);
-    rotation.ffn_in = signs("ffn_in" + l);
-    rotation.ffn_down_in = signs("ffn_down_in" + l);
+  const std::size_t hidden = weights.config.hidden_size;
+  const std::size_t attention = weights.config.AttentionSize();
+  const std::size_t inner = weights.config.ssm_inner_size;
+  const std::size_t intermediate = weights.config.intermediate_size;
+  for (auto& layer : weights.layers) {
+    auto& rotation = layer.rotation;
+    rotation.attn_in = signs("attn_in", hidden);
+    rotation.ffn_in = signs("ffn_in", hidden);
+    rotation.ffn_down_in = signs("ffn_down_in", intermediate);
+    if (layer.is_full_attention) {
+      rotation.attn_out_in = signs("attn_out_in", attention);
+    } else {
+      rotation.ssm_out_in = signs("ssm_out_in", inner);
+    }
   }
-  weights.head_in_rotation = signs("head_in");
+  weights.head_in_rotation = signs("head_in", hidden);
+  const auto* attn_in = signs("attn_in", hidden);
   weights.rotation_signs = std::move(storage);
   weights.rotated_groups = info->GroupList();
+  if (attn_in != nullptr) {
+    return FoldAlphaBeta(weights, attn_in, error_msg);
+  }
   return true;
 }
 
