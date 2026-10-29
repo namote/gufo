@@ -1,0 +1,109 @@
+{
+ "schema": "gufo.speculative-corpus.v1",
+ "version": "w9-kyojin-1",
+ "note": "W9 Kyojin comparison suite, verbatim from Yamz-Labs/kyojin@2132bd248e3bfe07258a408669608f3d2cfdda79 (MIT); built by tools/qwen-flash/spec/build_suites.py.",
+ "prompts": [
+  {
+   "id": "k_prose_0",
+   "category": "prose",
+   "text": "Write a 300-word story about a lighthouse.",
+   "source": "Yamz-Labs/kyojin@2132bd248e3bfe07258a408669608f3d2cfdda79 tools/bench.py DECODE_PROMPTS['prose'][0]"
+  },
+  {
+   "id": "k_prose_1",
+   "category": "prose",
+   "text": "Write a 300-word story about a lighthouse. Use a different keeper and a different coast.",
+   "source": "Yamz-Labs/kyojin@2132bd248e3bfe07258a408669608f3d2cfdda79 tools/bench.py DECODE_PROMPTS['prose'][1]"
+  },
+  {
+   "id": "k_prose_2",
+   "category": "prose",
+   "text": "Tell a 300-word story set in a lighthouse during a winter storm, with a different ending.",
+   "source": "Yamz-Labs/kyojin@2132bd248e3bfe07258a408669608f3d2cfdda79 tools/bench.py DECODE_PROMPTS['prose'][2]"
+  },
+  {
+   "id": "k_chat_0",
+   "category": "chat",
+   "text": "Explain how a hash map works, with its time complexity, in about 300 words.",
+   "source": "Yamz-Labs/kyojin@2132bd248e3bfe07258a408669608f3d2cfdda79 tools/bench.py DECODE_PROMPTS['chat'][0]"
+  },
+  {
+   "id": "k_chat_1",
+   "category": "chat",
+   "text": "Explain how a hash map works and where it degrades, in about 300 words.",
+   "source": "Yamz-Labs/kyojin@2132bd248e3bfe07258a408669608f3d2cfdda79 tools/bench.py DECODE_PROMPTS['chat'][1]"
+  },
+  {
+   "id": "k_chat_2",
+   "category": "chat",
+   "text": "Explain hash maps to a backend engineer: buckets, collisions, resizing. About 300 words.",
+   "source": "Yamz-Labs/kyojin@2132bd248e3bfe07258a408669608f3d2cfdda79 tools/bench.py DECODE_PROMPTS['chat'][2]"
+  },
+  {
+   "id": "k_code_0",
+   "category": "code",
+   "text": "Write a Python function that parses an ISO-8601 duration string into seconds, with tests.",
+   "source": "Yamz-Labs/kyojin@2132bd248e3bfe07258a408669608f3d2cfdda79 tools/bench.py DECODE_PROMPTS['code'][0]"
+  },
+  {
+   "id": "k_code_1",
+   "category": "code",
+   "text": "Write a Python function that parses an ISO-8601 duration into seconds, handling negative durations, with unit tests.",
+   "source": "Yamz-Labs/kyojin@2132bd248e3bfe07258a408669608f3d2cfdda79 tools/bench.py DECODE_PROMPTS['code'][1]"
+  },
+  {
+   "id": "k_code_2",
+   "category": "code",
+   "text": "Write a Python function parsing ISO-8601 durations (P[n]Y[n]M[n]DT[n]H[n]M[n]S) into a timedelta, with tests for every unit.",
+   "source": "Yamz-Labs/kyojin@2132bd248e3bfe07258a408669608f3d2cfdda79 tools/bench.py DECODE_PROMPTS['code'][2]"
+  },
+  {
+   "id": "k_multi_0",
+   "category": "multi",
+   "text": "Explique-moi en detail comment fonctionne une pompe a chaleur et pourquoi elle est plus efficace qu'un radiateur electrique.",
+   "source": "Yamz-Labs/kyojin@2132bd248e3bfe07258a408669608f3d2cfdda79 tools/qwen/spec_prompts.py EXTRA['multi'][0]"
+  },
+  {
+   "id": "k_multi_1",
+   "category": "multi",
+   "text": "Escribe un cuento corto sobre un pescador que encuentra una lampara magica en la playa.",
+   "source": "Yamz-Labs/kyojin@2132bd248e3bfe07258a408669608f3d2cfdda79 tools/qwen/spec_prompts.py EXTRA['multi'][1]"
+  },
+  {
+   "id": "k_multi_2",
+   "category": "multi",
+   "text": "Erklaere mir ausfuehrlich den Unterschied zwischen einer GmbH und einer AG in Deutschland.",
+   "source": "Yamz-Labs/kyojin@2132bd248e3bfe07258a408669608f3d2cfdda79 tools/qwen/spec_prompts.py EXTRA['multi'][2]"
+  },
+  {
+   "id": "k_multi_3",
+   "category": "multi",
+   "text": "请详细介绍一下如何准备一次长途徒步旅行，包括装备、路线和安全注意事项。",
+   "source": "Yamz-Labs/kyojin@2132bd248e3bfe07258a408669608f3d2cfdda79 tools/qwen/spec_prompts.py EXTRA['multi'][3]"
+  },
+  {
+   "id": "k_copy_0",
+   "category": "copy",
+   "text": "Here is a Python module:\n\n```python\ndef moving_average(values, window):\n    if window <= 0:\n        raise ValueError(\"window must be positive\")\n    result = []\n    total = 0.0\n    for i, v in enumerate(values):\n        total += v\n        if i >= window:\n            total -= values[i - window]\n        if i >= window - 1:\n            result.append(total / window)\n    return result\n\ndef median(values):\n    s = sorted(values)\n    n = len(s)\n    mid = n // 2\n    if n % 2:\n        return s[mid]\n    return (s[mid - 1] + s[mid]) / 2\n```\n\nRewrite the whole module with type hints and docstrings, keeping the logic identical.",
+   "source": "Yamz-Labs/kyojin@2132bd248e3bfe07258a408669608f3d2cfdda79 tools/qwen/spec_prompts.py EXTRA['copy'][0]"
+  },
+  {
+   "id": "k_copy_1",
+   "category": "copy",
+   "text": "Here is a Python module:\n\n```python\ndef moving_average(values, window):\n    if window <= 0:\n        raise ValueError(\"window must be positive\")\n    result = []\n    total = 0.0\n    for i, v in enumerate(values):\n        total += v\n        if i >= window:\n            total -= values[i - window]\n        if i >= window - 1:\n            result.append(total / window)\n    return result\n\ndef median(values):\n    s = sorted(values)\n    n = len(s)\n    mid = n // 2\n    if n % 2:\n        return s[mid]\n    return (s[mid - 1] + s[mid]) / 2\n```\n\nRename `values` to `data` everywhere and print the full updated module.",
+   "source": "Yamz-Labs/kyojin@2132bd248e3bfe07258a408669608f3d2cfdda79 tools/qwen/spec_prompts.py EXTRA['copy'][1]"
+  },
+  {
+   "id": "k_copy_2",
+   "category": "copy",
+   "text": "Quote the following passage word for word, then summarize it in two sentences.\n\nThe committee noted that the proposed regulation would require all operators of automated vehicles to maintain a continuous audit log of sensor inputs, control decisions and manual overrides, retained for no fewer than twenty-four months and made available to the supervisory authority within five working days of a written request. Operators who fail to comply may be subject to a fine of up to two percent of annual turnover.",
+   "source": "Yamz-Labs/kyojin@2132bd248e3bfe07258a408669608f3d2cfdda79 tools/qwen/spec_prompts.py EXTRA['copy'][2]"
+  },
+  {
+   "id": "k_copy_3",
+   "category": "copy",
+   "text": "Here is a passage:\n\nThe committee noted that the proposed regulation would require all operators of automated vehicles to maintain a continuous audit log of sensor inputs, control decisions and manual overrides, retained for no fewer than twenty-four months and made available to the supervisory authority within five working days of a written request. Operators who fail to comply may be subject to a fine of up to two percent of annual turnover.\n\nExtract every obligation as a bullet list, reusing the exact wording of the passage.",
+   "source": "Yamz-Labs/kyojin@2132bd248e3bfe07258a408669608f3d2cfdda79 tools/qwen/spec_prompts.py EXTRA['copy'][3]"
+  }
+ ]
+}
