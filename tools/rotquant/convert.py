@@ -37,8 +37,9 @@ from rotquant.gguf_io import (SPLIT_KEYS, WRITE_ALIGNMENT, OutTensor, as_float32
                               encode_value, layout_is_packed, open_gguf, write_gguf)
 from rotquant.hadamard import f32_to_bf16_bits, rotate_last_axis, signs  # noqa: E402
 from rotquant.hadamard import BLOCK_SIZE  # noqa: E402
-from rotquant.plan import (PlanError, build_plan, copied_recipe, dry_run_table,  # noqa: E402
-                           load_groups, quantize_command, sign_key, tensor_type_lines)
+from rotquant.plan import (SIGN_MODES, SIGNS_KEY, PlanError, build_plan, copied_recipe,  # noqa: E402
+                           dry_run_table, load_groups, quantize_command, sign_key, signs_label,
+                           tensor_type_lines)
 from rotquant.recipe import RecipeError, load_recipe, parse_rotate_selection  # noqa: E402
 from rotquant.realign import realign  # noqa: E402
 from rotquant.verify import verify_output  # noqa: E402
@@ -98,7 +99,10 @@ def rotate_file(model, plan, output, source_sha256: str) -> None:
         k = tensor.ne[0]
         if not prism.FOLDABLE.fullmatch(entry.name):
             raise PlanError(f"{entry.name}: upstream prism.hadamard cannot fold this tensor kind")
-        sign = sign_by_width.setdefault(k, signs(plan.seed, sign_key(k), k))
+        if k not in sign_by_width:
+            sign_by_width[k] = (np.ones(k, dtype=np.float32) if plan.sign_mode == "none"
+                                else signs(plan.seed, sign_key(k), k))
+        sign = sign_by_width[k]
         folded.append(entry.name)
         tensors.append(OutTensor(entry.name, tensor.ne, tensor.type_name, _rotate_writer(model, tensor, sign)))
     kv_raw = [(key, raw) for key, raw in model.kv_raw if key not in SPLIT_KEYS]
@@ -106,6 +110,8 @@ def rotate_file(model, plan, output, source_sha256: str) -> None:
         kv_raw += prism.prism_kv(BLOCK_SIZE, folded, sign_by_width)
     added = provenance(plan, with_types=False, source_sha256=source_sha256,
                        source_file=Path(model.paths[0]).name)
+    if folded:
+        added[SIGNS_KEY] = signs_label(plan.sign_mode, plan.seed)
     kv_raw += [(key, encode_value(value)) for key, value in added.items()]
     write_gguf(output, kv_raw, tensors)
 
@@ -128,6 +134,8 @@ def parse_args(argv):
     parser.add_argument("--recipe", type=Path, help="JSON recipe: rotate groups and type rules")
     parser.add_argument("--rotate-groups", help="all, none, or comma-separated groups; overrides the recipe")
     parser.add_argument("--seed", type=int, help="sign seed for newly rotated groups (stored in the file)")
+    parser.add_argument("--signs", choices=SIGN_MODES, help="sign vectors D: random (default, from --seed) "
+                        "or none (D = I, Hadamard only); both are stored as explicit signs")
     parser.add_argument("--imatrix", type=Path, help="importance matrix for llama-quantize")
     parser.add_argument("--rotate-only", action="store_true", help="write the rotated float GGUF only")
     parser.add_argument("--copy-recipe-from", type=Path, help="take per-tensor types from this GGUF's header")
@@ -169,6 +177,7 @@ def prepare(args):
     model = open_gguf(args.input)
     try:
         plan = build_plan(model, groups, rotate, seed=args.seed, rotate_only=args.rotate_only,
+                          sign_mode=args.signs,
                           rules=recipe.rules if recipe else (), copied_types=copied)
     except Exception:
         model.close()

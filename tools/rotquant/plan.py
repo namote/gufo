@@ -19,7 +19,16 @@ TOOLS = Path(__file__).resolve().parents[1]
 FLOAT_TYPES = ("F32", "F16", "BF16")
 KV_PREFIX = "gufo.rotation."
 SOURCE_KEYS = ("gufo.rotation.source_converter", "gufo.rotation.source_recipe_sha256",
-               "gufo.rotation.source_sha256", "gufo.rotation.source_file")
+               "gufo.rotation.source_sha256", "gufo.rotation.source_file", "gufo.rotation.source_signs")
+# Sign vectors D: "random" draws ±1 per input width from --seed; "none" uses
+# D = I (Hadamard only). Both are written as explicit prism.hadamard signs.
+SIGN_MODES = ("random", "none")
+SIGNS_KEY = "gufo.rotation.source_signs"
+
+
+def signs_label(sign_mode: str, seed) -> str:
+    """Value of gufo.rotation.source_signs: "random seed=<n>" or "none"."""
+    return "none" if sign_mode == "none" else f"random seed={seed}"
 
 
 def sign_key(k: int) -> str:
@@ -200,10 +209,13 @@ class Plan:
     seed: int | None
     rotate_only: bool
     entries: list             # tensors, input order
+    sign_mode: str = "random"  # "random" (seeded) or "none" (D = I)
 
     def effective(self, with_types: bool) -> dict:
         data = {"converter": CONVERTER_VERSION, "model": self.groups.name,
                 "rotate": list(self.rotate), "seed": self.seed}
+        if self.sign_mode != "random":
+            data["signs"] = self.sign_mode
         if with_types:
             data["types"] = {e.name: e.target_type for e in self.entries}
         return data
@@ -220,7 +232,7 @@ class Plan:
 
 
 def build_plan(model: GgufFile, groups: Groups, rotate: tuple, *, seed, rotate_only: bool,
-               rules=(), copied_types: dict | None = None) -> Plan:
+               rules=(), copied_types: dict | None = None, sign_mode: str | None = None) -> Plan:
     arch = model.kv.get("general.architecture")
     if arch != groups.architecture:
         raise PlanError(f"input architecture {arch!r} does not match the {groups.name} "
@@ -234,8 +246,15 @@ def build_plan(model: GgufFile, groups: Groups, rotate: tuple, *, seed, rotate_o
                             f"requested {', '.join(rotate) or 'none'}")
         if seed is not None:
             raise PlanError("--seed cannot change an already rotated input")
+        if sign_mode is not None:
+            raise PlanError("--signs cannot change an already rotated input")
         if rotate_only:
             raise PlanError("input is already rotated; --rotate-only has nothing to do")
+    elif sign_mode not in (None, *SIGN_MODES):
+        raise PlanError(f"--signs must be one of {', '.join(SIGN_MODES)}")
+    elif sign_mode == "none":
+        if seed is not None:
+            raise PlanError("--seed does not apply to --signs none")
     elif rotate and seed is None:
         raise PlanError("rotation requires --seed")
     if any(key.startswith(KV_PREFIX) for key in model.kv) and not input_rotated:
@@ -302,7 +321,7 @@ def build_plan(model: GgufFile, groups: Groups, rotate: tuple, *, seed, rotate_o
             entry.nbytes(entry.target_type)
         except ValueError as error:
             raise PlanError(f"{entry.name}: {error}") from None
-    return Plan(groups, tuple(rotate), input_rotated, seed, rotate_only, entries)
+    return Plan(groups, tuple(rotate), input_rotated, seed, rotate_only, entries, sign_mode or "random")
 
 
 def copied_recipe(path, groups: Groups) -> dict:

@@ -774,6 +774,55 @@ class ConverterTest(unittest.TestCase):
             self.assertEqual(realign.main(["--input", str(self.split[0]), "--output", str(out)]), 2)
         self.assertIn("refusing to overwrite", err.getvalue())
 
+    def test_sign_free_rotation(self):
+        out = self.dir / "nosign.gguf"
+        code, _, err = run_cli("--groups", "qwen27b", "--input", self.split[0], "--rotate-groups", "all",
+                               "--signs", "none", "--rotate-only", "--output", out)
+        self.assertEqual(code, 0, err)
+        with open_gguf(out) as model, open_gguf(self.split[0]) as source:
+            self.assertEqual(check_rotation(model, GROUPS), ALL_GROUPS)
+            # Written as explicit signs (gufo accepts explicit only), all +1.
+            self.assertEqual(model.kv["prism.hadamard.sign_mode"], "explicit")
+            self.assertEqual(model.kv["prism.hadamard.sign_widths"], list(WIDTHS))
+            self.assertEqual(set(model.kv["prism.hadamard.sign_values"]), {1})
+            self.assertEqual(model.kv["gufo.rotation.source_signs"], "none")
+            # W' = W·H: each 128-block of a row times the normalized Hadamard matrix.
+            h = sylvester(BLOCK_SIZE, np.float32)
+            for name in model.kv["prism.hadamard.weight_names"]:
+                w = as_float32(source, source.by_name[name])
+                n, k = w.shape
+                expected = f32_to_bf16_bits((w.reshape(n, k // 128, 128) @ h).reshape(n, k))
+                stored = np.frombuffer(bytes(model.tensor_bytes(model.by_name[name])), "<u2").reshape(n, k)
+                np.testing.assert_array_equal(stored, expected, name)
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            self.assertEqual(check_rotated.main(["--groups", "qwen27b", "--source", str(self.split[0]),
+                                                 "--rotated", str(out), "--rows", "0"]), 0, log.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            check_rotated.main(["--groups", "qwen27b", "--seed", "1", "--source", str(self.split[0]),
+                                "--rotated", str(out)])
+        # A seeded file records its seed, so check_rotated can verify it without --seed.
+        seeded = self.rotate_all(seed=11)
+        with open_gguf(seeded) as model:
+            self.assertEqual(model.kv["gufo.rotation.source_signs"], "random seed=11")
+            self.assertGreater(len(set(model.kv["prism.hadamard.sign_values"])), 1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(check_rotated.main(["--groups", "qwen27b", "--source", str(self.split[0]),
+                                                 "--rotated", str(seeded)]), 0)
+        # The effective recipe records the mode; refusals.
+        with open_gguf(self.split[0]) as model:
+            plan = build_plan(model, GROUPS, ALL_GROUPS, seed=None, rotate_only=True, sign_mode="none")
+        self.assertEqual(json.loads(plan.recipe_json(False))["signs"], "none")
+        cases = [("does not apply to --signs none", ["--input", self.split[0], "--rotate-groups", "all",
+                                                    "--signs", "none", "--seed", 1, "--rotate-only",
+                                                    "--output", self.dir / "x.gguf"]),
+                 ("--signs cannot change an already rotated", ["--input", out, "--rotate-groups", "all",
+                                                               "--signs", "none", "--dry-run"])]
+        for message, args in cases:
+            with self.subTest(message=message):
+                code, _, err = run_cli("--groups", "qwen27b", *args)
+                self.assertEqual(code, 2, err)
+                self.assertIn(message, err)
+
     def test_nextn_blocks_are_not_rotated(self):
         tensors = dict(self.tensors)
         rng = np.random.default_rng(9)
