@@ -67,6 +67,10 @@ struct QwenDFlashWeights {
   models::QwenTensorRef token_embedding;
   models::QwenTensorRef output_norm;
   models::QwenTensorRef output;
+  /// The target's head_in rotation signs when `output` is a rotated target
+  /// head (device pointer once bound to a GPU target), else null. The draft
+  /// rotates its normed rows before `output` and after `selector_hidden`.
+  const std::uint32_t* output_rotation = nullptr;
 
   // Draft transformer decoder layers and layer-local dynamic convolutions.
   std::vector<QwenDFlashLayerWeights> layers;

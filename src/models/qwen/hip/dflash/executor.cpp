@@ -1144,6 +1144,12 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
   TraceTensor(trace, "selector_hidden", d_selector_hidden_,
               draft_count * df_cfg.selector_rank, stream_);
 
+  // A rotated target head reads x' = H·D·x; the selector above read the
+  // unrotated rows, which are not needed again.
+  if (weights.output_rotation != nullptr) {
+    LaunchRotateRowsFp32(d_block_normed_ + hidden_size, weights.output_rotation,
+                         draft_count, hidden_size, stream_);
+  }
   RunBlockGemm(weights.output, d_block_normed_ + hidden_size, d_logits_,
                draft_count, vocab_size, hidden_size);
   TraceTensor(trace, "logits", d_logits_, draft_count * vocab_size, stream_);

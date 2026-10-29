@@ -360,6 +360,7 @@ std::shared_ptr<const QwenDFlashGpuModel> QwenDFlashGpuModel::Create(
     // weights
     weights.token_embedding = target_model->GetWeights().token_embd;
     weights.output = target_model->GetWeights().output;
+    weights.output_rotation = target_model->GetWeights().head_in_rotation;
     if (weights.output.type == core::GgmlType::kBF16 &&
         weights.output.num_elements %
                 quant::QuantizedBlockElements(core::GgmlType::kQ8_0) ==

@@ -491,6 +491,12 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
   ProjectBlock(weights.selector_hidden, scratch.hidden, scratch.selector,
                proposal_rows, draft.selector_rank, hidden_size, stream);
   emit("selector_hidden", scratch.selector, draft.selector_rank, true);
+  // A rotated target head reads x' = H·D·x; the selector above read the
+  // unrotated rows, which are not needed again.
+  if (weights.output_rotation != nullptr) {
+    LaunchRotateRowsFp32(scratch.hidden, weights.output_rotation, proposal_rows,
+                         hidden_size, stream);
+  }
   ProjectBlock(weights.output, scratch.hidden, scratch.logits, proposal_rows,
                config.vocab_size, hidden_size, stream);
   emit("logits", scratch.logits, config.vocab_size, true);
