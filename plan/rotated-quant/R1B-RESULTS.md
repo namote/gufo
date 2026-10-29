@@ -264,3 +264,42 @@ W3 진단에서 회전 BF16이 원본보다 AR +7 %, prefill +21 % 느렸다. �
   - 이 파일은 회전 파일보다 정렬이 더 나쁘다. 배치(정렬) 효과가 있다면 이 파일이 회전 파일만큼, 또는 더 느릴 것이다.
   - 원본만큼 빠르면, 느려진 원인은 배치가 아니라 회전 경로 비용이다.
   - 정렬만 정확히 맞춘 대조가 필요하면 방법이 있다. writer가 데이터 시작과 텐서를 256B(또는 4096B) 경계에 두도록 `general.alignment`를 키우거나 header를 padding한 다음, 회전 파일과 이 파일을 둘 다 다시 쓴다. 회전 파일은 W3–W5가 공유하므로 감독의 결정이 필요하다.
+
+## 추가: 256B 정렬 (사용자 결정 "컨버터 정렬 + 로더 조사", 2026-10-29)
+
+배경(W3, R2-RESULTS `5c56238e`): 지금까지의 GGUF는 모두 `general.alignment`가 32이고 데이터 시작이 32 mod 128에 온다. 그래서 큰 텐서가 128B 경계에 있지 않고, BF16 decode GEMV가 3–15 % 느렸다.
+
+### 1. writer 정렬 (`00edb413`)
+- `tools/rotquant/gguf_io.write_gguf`가 이제 데이터 시작과 모든 텐서를 **256B** 경계에 쓴다(`WRITE_ALIGNMENT`). `general.alignment = 256`(u32)을 기록하고, 들어온 `general.alignment`는 덮어쓴다(중복 없음).
+- CLI 옵션은 추가하지 않았다. 함수 인자 `alignment`는 테스트 fixture가 기본 32 입력을 만들 때만 쓴다.
+- 테스트 `test_output_is_256_byte_aligned`가 확인하는 것:
+  - 32 정렬 입력에서 rotate-only(all, none)로 쓴 출력의 `general.alignment`가 256인지, 데이터 시작과 텐서 절대 offset이 모두 %256 = 0인지
+  - 공유 reader(`tools/gufo/gguf.py`)가 같은 데이터 시작을 계산하는지
+  - none 출력의 바이트가 원본과 같은지
+  - alignment 64 입력에서 키가 중복되지 않는지
+  - 2의 거듭제곱이 아닌 정렬을 거부하는지
+- 결과: `rotquant_test` 25/25, `rotquant_groups_test` 3/3, `rotquant_calibration_test` OK
+
+### 2. llama-quantize의 정렬 유지
+- 확인 방법: DFlash2 드래프터 BF16(`dflash-Qwen3.8-27B-BF16.gguf`, 81 텐서, 원래 32 정렬, 128B 경계 텐서 0개)을 `realign.py`로 256 정렬로 다시 썼다(`build/rq-llama/align-test/`). 그것을 `llama-quantize … Q8_0`(`68d9053a`)에 넣었다.
+- 결과: 출력도 `general.alignment = 256`, 데이터 시작 10949120(%256 = 0), 텐서 81/81이 256B 경계였다. llama.cpp gguf writer는 입력의 `general.alignment`를 복사해 그대로 적용한다.
+- **결론:** 입력이 256 정렬이면 양자화 출력도 256 정렬이다. 회전 경로(입력 = 우리 writer가 쓴 회전 파일)에는 repack 단계가 필요 없다.
+- 남는 경우는 `--rotate-groups none`으로 **원본에서 바로** 양자화하는 경로 하나다. 이때 컨버터는 원본(32 정렬)을 llama-quantize에 그대로 넘기므로 출력이 32 정렬이 된다.
+  - `--override-kv`로는 고칠 수 없다. `general.alignment`는 u32여야 하는데 override의 정수는 i64라 맞지 않는다(짐작, 실행 안 함).
+  - 선택지:
+    - (a) 양자화 뒤 `realign`으로 다시 쓴다(바이트는 그대로, 출력 크기만큼 쓰기 한 번 더)
+    - (b) 원본을 먼저 `realign`해 입력으로 쓴다(BF16 55 GB 쓰기)
+  - (a)가 싸다. 다만 아직 구현하지 않았다(결정 필요).
+
+### 3. 운영 파일 실험용 repack
+- 파일: `qwen-3.8-27b-ud-q4-k-m-align256-gguf/Qwen3.8-27B-UD-Q4_K_M.gguf`
+  - 16464446464 B, sha256 `2a8144765937550c89d052ddf741a980b66565d020897f56a55dc62a35ea611d`
+  - 원본은 16464440224 B, sha256 `322e194f…3482`다.
+- 도구: `tools/rotquant/realign.py`. 출력을 다시 읽어 텐서 866개의 순서, 타입, 모양, 바이트를 원본과 전수 비교하고, 메타데이터 원래 바이트도 비교한다. 43.2 s 걸렸다.
+- 정렬: 원본은 데이터 시작 10996640, 128B 경계 텐서 0/866이다. 이 파일은 데이터 시작 10996736, 256B 경계 텐서 866/866이다(공유 reader로도 확인).
+- llama.cpp `llama-completion`은 두 파일에서 같은 출력을 냈다(`build/rq-llama/logs/load-udq4km-{orig,align}.log`).
+- 같은 폴더에 `PROVENANCE.md`와 `SHA256SUMS`가 있다.
+
+### 4. 하지 않은 것
+- 회전 BF16을 다시 쓰는 일은 감독의 결정을 기다린다. 다시 쓴다면 `realign.py --input Qwen3.8-27B-rot-BF16.gguf`로 바이트를 그대로 두고 정렬만 바꿀 수 있다. 회전을 다시 할 필요는 없다.
+- `build/rq-llama/align-test/`(드래프터 시험 파일 2개)는 아직 지우지 않았다(지우기 전에 감독 확인).
