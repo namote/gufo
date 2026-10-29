@@ -29,6 +29,22 @@ GROUPS = {
     "head_in": r"output\.weight",
 }
 
+
+
+def rotated_layers(kv: dict) -> int:
+    """Number of leading blocks whose groups rotate.
+
+    The trailing NextN (MTP) blocks keep their original weights: the 27B
+    runtime has no rotation path for them, and their attn_norm input is not
+    the trunk activation.
+    """
+    blocks = kv["qwen35.block_count"]
+    nextn = kv.get("qwen35.nextn_predict_layers", 0)
+    if not 0 <= nextn < blocks:
+        raise ValueError(f"nextn_predict_layers {nextn} does not fit block_count {blocks}")
+    return blocks - nextn
+
+
 # Rotating a head that is tied to the embedding would change the lookup.
 # The loader falls back to token_embd when output.weight is absent.
 TIED_HEADS = {"head_in": "token_embd.weight"}

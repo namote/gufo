@@ -2,7 +2,7 @@
 the llama-quantize command line."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import importlib.util
 import json
@@ -48,6 +48,16 @@ class Groups:
     supported: dict           # role -> set of type names
     recipe_roles: tuple
     role: object              # callable(name) -> role or None
+    rotated_layers: object    # callable(kv) -> blocks [0, n) that rotate
+    layer_limit: int | None = None  # set by for_model
+
+    def for_model(self, kv: dict) -> "Groups":
+        """Bind the rotated block range read from a model header."""
+        try:
+            limit = int(self.rotated_layers(kv))
+        except (KeyError, TypeError, ValueError) as error:
+            raise PlanError(f"cannot read the rotated block range from the header: {error!r}") from None
+        return replace(self, layer_limit=limit)
 
     @property
     def names(self) -> tuple:
@@ -65,6 +75,8 @@ class Groups:
             match = pattern.fullmatch(tensor_name)
             if match:
                 layer = match.groupdict().get("layer")
+                if layer is not None and self.layer_limit is not None and int(layer) >= self.layer_limit:
+                    return None, None
                 return group, group if layer is None else f"{group}:{layer}"
         return None, None
 
@@ -83,7 +95,7 @@ def load_groups(name: str) -> Groups:
         return Groups(name, module.ARCHITECTURE,
                       {g: re.compile(p) for g, p in module.GROUPS.items()},
                       dict(module.TIED_HEADS), dict(module.SUPPORTED_TYPES),
-                      tuple(module.RECIPE_ROLES), module.role)
+                      tuple(module.RECIPE_ROLES), module.role, module.rotated_layers)
     except AttributeError as error:
         raise PlanError(f"{path} is incomplete: {error}") from None
 
@@ -110,6 +122,7 @@ def check_rotation(model: GgufFile, groups: Groups) -> tuple:
     or different signs inside one group instance, and a group rotated in
     some layers only.
     """
+    groups = groups.for_model(model.kv)
     by_name = model.by_name
     rot = {t.name[:-len(ROT_SUFFIX)]: t for t in model.tensors if t.name.endswith(ROT_SUFFIX)}
     markers = {key: model.kv[key] for key in ROTATION_KV if key in model.kv}
@@ -224,6 +237,7 @@ def build_plan(model: GgufFile, groups: Groups, rotate: tuple, *, seed, rotate_o
     if arch != groups.architecture:
         raise PlanError(f"input architecture {arch!r} does not match the {groups.name} "
                         f"definition ({groups.architecture!r})")
+    groups = groups.for_model(model.kv)
     existing = check_rotation(model, groups)
     input_rotated = bool(existing) or any(key in model.kv for key in ROTATION_KV)
     if input_rotated:

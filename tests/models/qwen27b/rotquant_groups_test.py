@@ -11,7 +11,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "tools"))
 
-from rotquant.plan import load_groups  # noqa: E402
+from rotquant.plan import PlanError, load_groups  # noqa: E402
 
 GROUPS = load_groups("qwen27b")
 
@@ -67,6 +67,20 @@ class GroupTableTest(unittest.TestCase):
         self.assertEqual(GROUPS.role("blk.3.ssm_conv1d.weight"), "ssm_parameter")
         self.assertEqual(GROUPS.role("blk.3.ffn_norm.weight"), "norm")
         self.assertIsNone(GROUPS.role("blk.0.attn_qkv.weight.rot"))
+
+    def test_nextn_block_is_not_grouped(self):
+        # The released file: 64 trunk blocks plus one NextN (MTP) block.
+        bound = GROUPS.for_model({"qwen35.block_count": 65, "qwen35.nextn_predict_layers": 1})
+        self.assertEqual(bound.layer_limit, 64)
+        self.assertEqual(bound.instance("blk.63.attn_q.weight"), ("attn_in", "attn_in:63"))
+        for name in ("blk.64.attn_q.weight", "blk.64.ffn_down.weight", "blk.64.attn_output.weight"):
+            self.assertEqual(bound.instance(name), (None, None), name)
+            self.assertEqual(bound.role(name), "projection", name)
+        self.assertEqual(bound.instance("output.weight"), ("head_in", "head_in"))
+        self.assertEqual(GROUPS.for_model({"qwen35.block_count": 64}).layer_limit, 64)
+        for kv in ({}, {"qwen35.block_count": 1, "qwen35.nextn_predict_layers": 1}):
+            with self.subTest(kv=kv), self.assertRaisesRegex(PlanError, "rotated block range"):
+                GROUPS.for_model(kv)
 
     def test_supported_types_follow_the_loader(self):
         source = (ROOT / "src/models/qwen/weights.cpp").read_text()

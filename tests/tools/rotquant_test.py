@@ -25,8 +25,8 @@ from rotquant import convert  # noqa: E402
 from rotquant.gguf_io import OutTensor, U32, as_float32, encode_value, open_gguf, write_gguf  # noqa: E402
 from rotquant.hadamard import (BLOCK_SIZE, bf16_bits_to_f32, f32_to_bf16_bits,  # noqa: E402
                                rotate_last_axis, signs, sylvester)
-from rotquant.plan import (PlanError, build_plan, check_rotation, load_groups,  # noqa: E402
-                           quantize_command, read_rot_signs, tensor_type_lines)
+from rotquant.plan import (ROTATION_KV, PlanError, build_plan, check_rotation,  # noqa: E402
+                           load_groups, quantize_command, read_rot_signs, tensor_type_lines)
 from rotquant.recipe import RecipeError, parse_recipe, parse_rotate_selection  # noqa: E402
 
 GROUPS = load_groups("qwen27b")
@@ -112,6 +112,44 @@ def write_split(directory, tensors, shards=2, extra_kv=()):
 def write_single(path, tensors, extra_kv=(), kv=None):
     write_gguf(path, kv if kv is not None else kv_entries(extra_kv), out_tensors(tensors), 32)
     return Path(path)
+
+
+FAKE_QUANTIZE = """#!{python}
+import json, re, sys
+sys.path.insert(0, {tools!r})
+from rotquant.gguf_io import SPLIT_KEYS, OutTensor, encode_value, open_gguf, type_size, write_gguf
+args = sys.argv[1:]
+open({log!r}, "w").write(json.dumps(args))
+rules, overrides = [], {{}}
+i = 0
+while i < len(args) - 3:
+    if args[i] == "--tensor-type-file":
+        rules = [line.rsplit("=", 1) for line in open(args[i + 1]).read().split()]
+    elif args[i] == "--override-kv":
+        key, value = args[i + 1].split("=str:", 1)
+        overrides[key] = value
+    i += 2 if args[i] != "--pure" else 1
+source, output = args[-3], args[-2]
+model = open_gguf(source)
+tensors = []
+for t in model.tensors:
+    new = next((typ for pattern, typ in rules if re.search(pattern, t.name)), t.type_name)
+    if t.name == {wrong!r}:
+        new = "Q4_K"
+    if new == t.type_name:
+        payload = bytes(model.tensor_bytes(t))
+        if {change_rot!r} and t.name.endswith(".rot"):
+            payload = payload[:-2] + bytes([payload[-2], payload[-1] ^ 0x80])
+    else:
+        n = 1
+        for d in t.ne:
+            n *= d
+        payload = bytes(type_size(new, n, t.ne[0]))
+    tensors.append(OutTensor(t.name, t.ne, new, lambda f, b=payload: f.write(b)))
+kv = [(k, raw) for k, raw in model.kv_raw if k not in SPLIT_KEYS and k not in overrides]
+kv += [(k, encode_value(v)) for k, v in overrides.items()]
+write_gguf(output, kv, tensors, model.alignment)
+"""
 
 
 def run_cli(*args):
@@ -493,11 +531,13 @@ class ConverterTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("1 tensor(s) have no type in the --copy-recipe-from file: blk.1.ffn_up.weight", err)
 
-    def fake_quantize(self):
+    def fake_quantize(self, wrong_type=None, change_rot=False):
+        """A stand-in llama-quantize: records argv and writes an output GGUF
+        with the requested types (zero payloads for converted tensors)."""
         log = self.dir / "argv.json"
         script = self.dir / "fake-llama-quantize"
-        script.write_text(f"#!{sys.executable}\nimport json, sys\n"
-                          f"open({str(log)!r}, 'w').write(json.dumps(sys.argv[1:]))\n")
+        script.write_text(FAKE_QUANTIZE.format(python=sys.executable, tools=str(ROOT / "tools"), log=str(log),
+                                               wrong=wrong_type, change_rot=change_rot))
         script.chmod(0o755)
         return script, log
 
@@ -574,6 +614,64 @@ class ConverterTest(unittest.TestCase):
         self.assertEqual(len(tensor_type_lines(plan)), sum(len(ne) >= 2 for _, ne, _ in self.tensors.values()))
         with self.assertRaisesRegex(PlanError, "quantizes no tensor"):
             quantize_command(plan, "q", "in.gguf", "out.gguf", "t.txt")
+
+    def test_quantized_output_is_checked(self):
+        rot = self.rotate_all()
+        recipe = self.recipe({"version": 1, "rotate": "all", "types": [{"match": r"\.weight$", "type": "Q8_0"}]})
+        script, _ = self.fake_quantize()
+        code, stdout, err = run_cli("--groups", "qwen27b", "--input", rot, "--recipe", recipe,
+                                    "--llama-quantize", script, "--output", self.dir / "ok.gguf")
+        self.assertEqual(code, 0, err)
+        self.assertIn("types match the plan", stdout)
+        self.assertIn("(16 .rot)", stdout)
+        cases = [("wrong", dict(wrong_type="blk.0.ffn_gate.weight"), "blk.0.ffn_gate.weight Q4_K != Q8_0"),
+                 ("rot", dict(change_rot=True), "unquantized tensor(s) changed bytes")]
+        for name, kwargs, message in cases:
+            with self.subTest(name=name):
+                script, _ = self.fake_quantize(**kwargs)
+                code, _, err = run_cli("--groups", "qwen27b", "--input", rot, "--recipe", recipe,
+                                       "--llama-quantize", script, "--output", self.dir / f"bad-{name}.gguf")
+                self.assertEqual(code, 2)
+                self.assertIn(message, err)
+
+    def test_nextn_blocks_are_not_rotated(self):
+        tensors = dict(self.tensors)
+        rng = np.random.default_rng(9)
+        for short, (n, k) in {"attn_q": (512, HIDDEN), "attn_k": (128, HIDDEN), "attn_v": (128, HIDDEN),
+                              "attn_output": (HIDDEN, 384), "ffn_gate": (512, HIDDEN),
+                              "ffn_up": (512, HIDDEN), "ffn_down": (HIDDEN, 512)}.items():
+            tensors[f"blk.2.{short}.weight"] = (
+                "BF16", (k, n), f32_to_bf16_bits(rng.standard_normal((n, k)).astype(np.float32)))
+        tensors["blk.2.nextn.eh_proj.weight"] = (
+            "BF16", (2 * HIDDEN, HIDDEN), f32_to_bf16_bits(rng.standard_normal((HIDDEN, 2 * HIDDEN)).astype(np.float32)))
+        kv = [e for e in kv_entries() if e[0] != "qwen35.block_count"]
+        kv += [("qwen35.block_count", encode_value(U32(3))),
+               ("qwen35.nextn_predict_layers", encode_value(U32(1)))]
+        path = write_single(self.dir / "mtp.gguf", tensors, kv=kv)
+        out = self.dir / "mtp-rot.gguf"
+        code, _, err = run_cli("--groups", "qwen27b", "--input", path, "--rotate-groups", "all", "--seed", 1,
+                               "--rotate-only", "--output", out)
+        self.assertEqual(code, 0, err)
+        with open_gguf(out) as model, open_gguf(path) as source:
+            names = {t.name for t in model.tensors}
+            self.assertNotIn("blk.2.attn_q.weight.rot", names)
+            self.assertIn("blk.1.attn_q.weight.rot", names)
+            self.assertEqual(bytes(model.tensor_bytes(model.by_name["blk.2.ffn_down.weight"])),
+                             bytes(source.tensor_bytes(source.by_name["blk.2.ffn_down.weight"])))
+            self.assertEqual(check_rotation(model, GROUPS), ALL_GROUPS)
+        # A .rot on a NextN block names the tensor and is refused.
+        tensors["blk.2.ffn_down.weight.rot"] = ("F16", (512,), np.full(512, 0x3C00, "<u2"))
+        bad = write_single(self.dir / "mtp-bad.gguf", tensors,
+                           kv=kv + [(k, encode_value(U32(v)) if isinstance(v, int) else encode_value(v))
+                                    for k, v in ROTATION_KV.items()])
+        with open_gguf(bad) as model, self.assertRaisesRegex(PlanError, "blk.2.ffn_down.weight is rotated"):
+            check_rotation(model, GROUPS)
+        missing = write_single(self.dir / "noblocks.gguf", self.tensors,
+                               kv=[e for e in kv_entries() if e[0] != "qwen35.block_count"])
+        code, _, err = run_cli("--groups", "qwen27b", "--input", missing, "--rotate-groups", "none",
+                               "--rotate-only", "--dry-run")
+        self.assertEqual(code, 2)
+        self.assertIn("rotated block range", err)
 
 
 if __name__ == "__main__":

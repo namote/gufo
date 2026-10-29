@@ -4,9 +4,11 @@
 Stage 1 (rotate) streams a BF16 GGUF (single or split) one tensor at a time
 and writes W' = W·D·H for every tensor in a rotated input group, its
 `<name>.rot` sign tensor (F16 ±1) and the gufo.rotation metadata.
-Stage 2 (quantize) writes exact per-tensor --tensor-type rules and runs the
-reference llama-quantize on the rotated file. An already rotated input skips
-stage 1, so one rotated BF16 file serves many recipes.
+Stage 2 (quantize) writes exact per-tensor --tensor-type rules, runs the
+reference llama-quantize on the rotated file and reads the output back
+(rotquant/verify.py): types, .rot bytes and gufo.* metadata must match.
+An already rotated input skips stage 1, so one rotated BF16 file serves
+many recipes. NextN (MTP) blocks are never rotated.
 
 Examples (see plan/rotated-quant/R1A-RESULTS.md):
   convert.py --groups qwen27b --input BF16-00001-of-00002.gguf --rotate-groups all \\
@@ -35,6 +37,7 @@ from rotquant.plan import (F16_MINUS_ONE, F16_PLUS_ONE, ROT_SUFFIX, ROT_TYPE,  #
                            ROTATION_KV, PlanError, build_plan, copied_recipe, dry_run_table,
                            load_groups, quantize_command, tensor_type_lines)
 from rotquant.recipe import RecipeError, load_recipe, parse_rotate_selection  # noqa: E402
+from rotquant.verify import verify_output  # noqa: E402
 
 CHUNK_BYTES = 64 << 20
 
@@ -216,6 +219,10 @@ def run(args) -> int:
                                imatrix=args.imatrix, provenance=overrides)
     print(" ".join(command), flush=True)
     subprocess.run(command, check=True)
+    summary = verify_output(source, args.output, plan, overrides)
+    print(f"verified {summary['output']}: {summary['tensors']} tensors, {summary['quantized']} quantized, "
+          f"{summary['byte_identical']} byte-identical ({summary['rot']} .rot), types match the plan, "
+          f"gufo.* metadata kept", flush=True)
     return 0
 
 
