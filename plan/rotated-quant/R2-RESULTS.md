@@ -390,6 +390,75 @@ PLAN은 "27B는 matmul 전에 활성화를 Q8_1로 양자화한다"고 적었지
 - `llama-quantize` 출력도 같다. 정렬은 헤더 길이에 따라 우연히 정해진다.
 - 정렬을 맞추면 운영 양자화 파일의 decode도 빨라질 수 있다(짐작). BF16에서는 단일 파일 GEMV가 3–15 % 느렸다. 양자화 GEMV에서 얼마나 효과가 있는지는 재 봐야 한다.
 
+## 로더 재정렬 설계 메모 (2026-10-29, 코드는 쓰지 않음)
+
+사용자 결정은 "컨버터 정렬 + 로더 조사"다. A/B 창 초안은 `PLAN-RQ2F.json`(원본 UD-Q4_K_M 대 W1의 align256 repack, 같은 v3 바이너리, ABBA, 5 %·10 ms, rocprofv3)이다.
+
+### 지금 로드 경로 (Qwen27B, `src/models/qwen/hip/model_loader.cpp`)
+
+1. `GgufReader`의 `GetMappedRegions()`는 **파일 전체**(offset 0부터)를 region 하나로 준다. 분할 GGUF는 조각마다 region이 하나다. 텐서 포인터는 이 매핑 안을 가리킨다.
+2. `CreateWeightRegions`는 region마다 다음을 한다.
+   - `MapRegisteredRegion`:
+     - `platform::CloneMappedWeightsToAnonymousPages`로 region 전체를 페이지 정렬된 익명 메모리(MADV_HUGEPAGE)에 복사한다. 병렬 16 MiB 청크이고, 원본 PTE는 `MADV_DONTNEED`로 버린다.
+     - 그다음 `hipHostRegister(Mapped|ReadOnly)`와 `hipHostGetDevicePointer`를 한다.
+   - 실패하면 `AllocateDeviceRegion`(hipMalloc)으로 가고, `CopyMappedRegion`이나 `WeightUpload`로 region 전체를 offset 0부터 올린다.
+3. `RemapTensor`는 텐서 포인터를 `device_data + (tensor − region.host_data)`로 바꾼다.
+
+**따라서 device 주소의 정렬 = 파일 안 절대 offset의 정렬이다.**
+
+- 운영 UD-Q4_K_M/XL은 data 구간이 ≡ 32 (mod 128)에서 시작한다. 그래서 큰 텐서 410개 중 128 B 정렬이 0개다.
+- 상대 offset은 410/410이 128의 배수이고, 210/410이 256의 배수다.
+
+### 후보
+
+**A. region 이동(권장안)**
+
+- region마다 `delta = (−data_offset) mod 256`(최대 255 B)을 정한다.
+  - `size + delta`를 할당한다(익명 mmap 또는 hipMalloc).
+  - 파일 바이트를 `base + delta`에 복사한다.
+  - `device_data = base_device + delta`로 둔다. `RemapTensor`는 그대로 쓴다(device_data만 이동).
+  - `hipHostRegister`와 해제는 `base`와 `size + delta`로 한다.
+- 비용:
+  - 메모리는 조각마다 ≤ 255 B 늘어난다.
+  - 복사는 지금도 하는 clone 복사 한 번 그대로다(추가 복사 없음). 로드 시간도 같다.
+  - huge page, 병렬 clone, 등록 방식도 바뀌지 않는다.
+- 효과:
+  - 상대 offset이 128의 배수인 텐서(조사한 모든 파일의 큰 텐서 전부)가 128 B 정렬이 된다.
+  - 256 B 정렬은 상대 offset이 256의 배수인 텐서(약 절반)만 된다. 256을 보장하려면 W1이 컨버터를 alignment 256으로 바꾼 파일이 필요하다.
+- 필요한 변경:
+  - `core::GgufMappedRegion`에 data 구간 시작 offset 필드를 더한다. 공유 파일 `src/core/gguf_reader.*`이고, 필드를 더하기만 한다.
+  - `model_loader.cpp`의 세 경로(registered clone, device copy, WeightUpload)에 delta를 넣는다.
+  - `GetResidentBytes`에 delta를 반영한다.
+
+**B. 텐서별 재배치**
+
+- 텐서마다 정렬된 위치로 복사하고, 텐서별 주소 표를 둔다. Flash-Next uploader와 같은 방식이다.
+- 정렬은 완전히 보장된다(256 이상도 가능).
+- 단점:
+  - region이 연속이라는 가정에 기대는 코드(DFlash2 드래프터가 타깃 `token_embd`/`output`을 참조하는 것, `RemapTensor`, 진단·스냅샷 경로)를 고쳐야 한다.
+  - 패딩만큼 메모리가 늘어난다(텐서 866개 × ≤ 255 B, 무시할 만하다).
+  - 구현과 검증 범위가 A보다 훨씬 크다.
+
+**C. 커널이 비정렬에 덜 민감하게 만들기**
+
+- 행 시작 정렬 prologue 등을 넣는다. 형식마다 GEMV/GEMM 커널을 고쳐야 해서 범위가 가장 크다.
+
+### 규칙과 다른 모델
+
+- CLAUDE.md(AGENTS.md)에는 weight placement를 따로 정한 규칙이 없다. 관련 지침은 optimize-kernel 스킬의 UMA placement 항목이다.
+  - 익명 huge page가 Q4 AR을 약 2 % 높였다.
+  - 병렬 bounded copy로 warm readiness를 1초 안에 유지했다.
+  - 매핑된 가중치와 복사된 가중치의 비용이 다르다.
+- A는 이 성질을 모두 그대로 둔다. Windows는 `CloneMappedWeightsToAnonymousPages`가 없어 device-resident 경로를 쓰는데, 같은 delta로 처리한다. `pages_windows.cpp`는 바꾸지 않는다.
+- 영향 범위:
+  - Flash-Next(`kernels/rocm/device_model.cpp`)와 DeepSeek V4 Flash는 `WeightUpload`로 **텐서마다** 자기 할당에 복사한다. 그래서 이 문제의 영향을 받지 않고 변경도 필요 없다(할당 정렬은 확인이 필요하다).
+  - DFlash2 드래프터와 MTP 전용 가중치도 자기 할당에 pack한다. 다만 드래프터가 쓰는 타깃 `output`/`token_embd`는 A의 이득을 함께 받는다.
+  - `gguf_identity.cpp`는 region을 읽기만 하므로, 필드가 더해져도 영향이 없다.
+- 판단 순서:
+  1. `PLAN-RQ2F` A/B로 align256 파일의 이득(decode GEMV, AR, DFlash2)을 잰다.
+  2. 이득이 있으면 A를 구현한다. A는 컨버터가 고친 파일과 이미 배포된 파일(운영 UD 포함)에 모두 효과가 있다.
+  3. A의 정확성은 바이트 비교로 확인한다. 정렬만 바뀌므로 logits fingerprint가 같아야 한다.
+
 ## 알려진 제한과 최적화 후보
 
 - decode 단독 회전은 토큰당 128 launch다(attn_out 16, ssm_out 48, ffn_down 64). 1 %를 넘으면 2단계로 간다(ssm_out을 decode 에필로그에 융합 등).
