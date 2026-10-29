@@ -22,11 +22,12 @@ import numpy as np  # noqa: E402
 
 from gufo import gguf as shared_gguf  # noqa: E402
 from rotquant import check_rotated, convert, realign  # noqa: E402
-from rotquant.gguf_io import OutTensor, U32, as_float32, encode_value, open_gguf, write_gguf  # noqa: E402
+from rotquant import prism  # noqa: E402
+from rotquant.gguf_io import I32Array, OutTensor, U32, as_float32, encode_value, open_gguf, write_gguf  # noqa: E402
 from rotquant.hadamard import (BLOCK_SIZE, bf16_bits_to_f32, f32_to_bf16_bits,  # noqa: E402
                                rotate_last_axis, signs, sylvester)
-from rotquant.plan import (ROTATION_KV, PlanError, build_plan, check_rotation,  # noqa: E402
-                           load_groups, quantize_command, read_rot_signs, tensor_type_lines)
+from rotquant.plan import (PlanError, build_plan, check_rotation, file_signs,  # noqa: E402
+                           load_groups, quantize_command, sign_key, tensor_type_lines)
 from rotquant.recipe import RecipeError, parse_recipe, parse_rotate_selection  # noqa: E402
 from rotquant.verify import verify_output  # noqa: E402
 
@@ -34,6 +35,9 @@ GROUPS = load_groups("qwen27b")
 ALL_GROUPS = GROUPS.names
 HIDDEN = 256
 TOKENS = ["<a>", "<b>", "한글"]
+# Toy input widths: HIDDEN (attn_in, ffn_in, head_in, ssm_out), 384
+# (attn_output) and 512 (ffn_down). One sign vector per width.
+WIDTHS = (256, 384, 512)
 
 
 def kv_entries(extra=()):
@@ -139,15 +143,16 @@ for t in model.tensors:
         new = "Q4_K"
     if new == t.type_name:
         payload = bytes(model.tensor_bytes(t))
-        if {change_rot!r} and t.name.endswith(".rot"):
-            payload = payload[:-2] + bytes([payload[-2], payload[-1] ^ 0x80])
+        if {change_copy!r} and t.name == "output_norm.weight":
+            payload = payload[:-1] + bytes([payload[-1] ^ 0x80])
     else:
         n = 1
         for d in t.ne:
             n *= d
         payload = bytes(type_size(new, n, t.ne[0]))
     tensors.append(OutTensor(t.name, t.ne, new, lambda f, b=payload: f.write(b)))
-kv = [(k, raw) for k, raw in model.kv_raw if k not in SPLIT_KEYS and k not in overrides]
+kv = [(k, raw) for k, raw in model.kv_raw if k not in SPLIT_KEYS and k not in overrides
+      and not ({drop_prism!r} and k == "prism.hadamard.sign_values")]
 kv += [(k, encode_value(v)) for k, v in overrides.items()]
 write_gguf(output, kv, tensors, model.alignment)
 """
@@ -306,24 +311,31 @@ class ConverterTest(unittest.TestCase):
 
     def test_rotate_only_roundtrip(self):
         out = self.rotate_all()
-        # Independent reader (tools/gufo/gguf.py) sees the markers and shapes.
+        # Independent reader (tools/gufo/gguf.py) sees the prism.hadamard metadata.
         state = shared_gguf.parse_gguf(out)
         kv = {**state["metadata"], **state["user_kv"]}
-        self.assertEqual(kv["gufo.rotation.version"], 1)
-        self.assertEqual(kv["gufo.rotation.kind"], "hadamard")
-        self.assertEqual(kv["gufo.rotation.block_size"], 128)
-        self.assertEqual(kv["gufo.rotation.side"], "input")
+        folded = [n for n in self.tensors if GROUPS.instance(n)[0] is not None]
+        self.assertNotIn("blk.0.ssm_alpha.weight", folded)
+        self.assertEqual(kv["prism.hadamard.version"], 1)
+        self.assertEqual(kv["prism.hadamard.block_size"], 128)
+        self.assertEqual(kv["prism.hadamard.transform"], "normalized-sylvester-walsh-hadamard")
+        self.assertEqual(kv["prism.hadamard.axis"], "input-last-dimension")
+        self.assertEqual(kv["prism.hadamard.sign_mode"], "explicit")
+        self.assertEqual(kv["prism.hadamard.sign_widths"], list(WIDTHS))
+        self.assertEqual(len(kv["prism.hadamard.sign_values"]), sum(WIDTHS))
+        self.assertEqual(kv["prism.hadamard.weight_names"], folded)  # file order
+        for key in ("tied_output", "inverse_weight_names", "gdn_v_grouped"):
+            self.assertNotIn("prism.hadamard." + key, kv)
         self.assertEqual(kv["gufo.rotation.source_converter"], "rotquant 1")
         self.assertEqual(kv["gufo.rotation.source_file"], self.split[0].name)
         self.assertEqual(kv["gufo.rotation.source_sha256"], convert.file_sha256(self.split))
         self.assertEqual(len(kv["gufo.rotation.source_recipe_sha256"]), 64)
-        self.assertFalse(any(key.startswith("split.") for key in kv))
-        rot = {t["name"]: t for t in state["tensors"] if t["name"].endswith(".rot")}
-        projections = [n for n in self.tensors if GROUPS.instance(n)[0] is not None]
-        self.assertEqual(set(rot), {n + ".rot" for n in projections})
-        for name in projections:
-            self.assertEqual(rot[name + ".rot"]["type_name"], "F16")
-            self.assertEqual(rot[name + ".rot"]["shape"], [self.tensors[name][1][0]])
+        self.assertFalse(any(key.startswith("split.") or key == "gufo.rotation.version" for key in kv))
+        # No extra tensors: the file has exactly the source tensors.
+        self.assertEqual([t["name"] for t in state["tensors"]], list(self.tensors))
+        # The sign values are int32 (the upstream loader reads int32/uint32 arrays).
+        raw = dict(open_gguf(out, header_only=True).kv_raw)["prism.hadamard.sign_values"]
+        self.assertEqual(struct.unpack_from("<II", raw), (9, 5))
 
         with open_gguf(out) as model, open_gguf(self.split[0]) as source:
             self.assertEqual(check_rotation(model, GROUPS), ALL_GROUPS)
@@ -331,35 +343,33 @@ class ConverterTest(unittest.TestCase):
             self.assertEqual(dict(model.kv_raw)["tokenizer.ggml.tokens"],
                              dict(source.kv_raw)["tokenizer.ggml.tokens"])
             by_name = model.by_name
-            sign = {n: read_rot_signs(model, by_name[n + ".rot"]) for n in projections}
-            group0 = ["blk.0.attn_qkv.weight", "blk.0.attn_gate.weight", "blk.0.ssm_alpha.weight",
-                      "blk.0.ssm_beta.weight"]
-            for name in group0[1:]:
-                np.testing.assert_array_equal(sign[name], sign[group0[0]])
-            np.testing.assert_array_equal(sign["blk.1.attn_q.weight"], sign["blk.1.attn_v.weight"])
-            np.testing.assert_array_equal(sign["blk.0.ffn_gate.weight"], sign["blk.0.ffn_up.weight"])
-            self.assertFalse(np.array_equal(sign["blk.0.ffn_gate.weight"], sign["blk.1.ffn_gate.weight"]))
-            np.testing.assert_array_equal(sign["blk.0.attn_qkv.weight"], signs(11, "attn_in:0", HIDDEN))
+            table = file_signs(model)
+            self.assertEqual(sorted(table), list(WIDTHS))
+            for k in WIDTHS:
+                np.testing.assert_array_equal(table[k], signs(11, sign_key(k), k))
+            self.assertFalse(np.array_equal(table[256][:128], table[384][:128]))
 
             rng = np.random.default_rng(9)
-            for name in projections:
+            for name in folded:
+                sign = table[by_name[name].ne[0]]
                 w = as_float32(source, source.by_name[name]).astype(np.float64)
                 w_rot = as_float32(model, by_name[name]).astype(np.float64)
                 x = rng.standard_normal(w.shape[1])
                 y_ref = w @ x
-                y = w_rot @ rotate_last_axis(x, sign[name])
+                y = w_rot @ rotate_last_axis(x, sign)
                 rel = np.linalg.norm(y - y_ref) / np.linalg.norm(y_ref)
                 self.assertLess(rel, 4e-3, name)
                 # Stored values are the BF16 rounding of the exact rotation (half an ulp,
                 # plus FP32 accumulation error), and match the FP32 path bit for bit.
-                exact = rotate_last_axis(w, sign[name])
+                exact = rotate_last_axis(w, sign)
                 bound = np.abs(exact) * 2.0 ** -8 + 1e-6 * np.abs(exact).max()
                 self.assertTrue((np.abs(w_rot - exact) <= bound).all(), name)
                 stored = np.frombuffer(bytes(model.tensor_bytes(by_name[name])), "<u2")
-                expected = f32_to_bf16_bits(rotate_last_axis(w.astype(np.float32), sign[name]))
+                expected = f32_to_bf16_bits(rotate_last_axis(w.astype(np.float32), sign))
                 np.testing.assert_array_equal(stored, expected.reshape(-1), name)
+            # Everything else, the DeltaNet ssm_alpha/ssm_beta included, is copied.
             for name in self.tensors:
-                if name not in projections:
+                if name not in folded:
                     self.assertEqual(bytes(model.tensor_bytes(by_name[name])),
                                      bytes(source.tensor_bytes(source.by_name[name])), name)
 
@@ -367,59 +377,57 @@ class ConverterTest(unittest.TestCase):
         out = self.rotate_all(groups="ffn_in,head_in", name="partial.gguf")
         with open_gguf(out) as model:
             self.assertEqual(check_rotation(model, GROUPS), ("ffn_in", "head_in"))
-            names = {t.name for t in model.tensors}
-            self.assertIn("output.weight.rot", names)
-            self.assertNotIn("blk.0.ffn_down.weight.rot", names)
+            self.assertEqual(model.kv["prism.hadamard.weight_names"],
+                             ["output.weight", "blk.0.ffn_gate.weight", "blk.0.ffn_up.weight",
+                              "blk.1.ffn_gate.weight", "blk.1.ffn_up.weight"])
+            self.assertEqual(model.kv["prism.hadamard.sign_widths"], [256])
         out = self.rotate_all(groups="none", name="none.gguf")
         with open_gguf(out) as model:
             self.assertEqual(check_rotation(model, GROUPS), ())
-            self.assertNotIn("gufo.rotation.version", model.kv)
+            self.assertFalse(any(key.startswith("prism.") for key in model.kv))
             self.assertIn("gufo.rotation.source_sha256", model.kv)
 
+    def rotated_variant(self, name, set_kv=None, drop=(), tensors=None, kv=None):
+        """The rotate_all() file with some metadata replaced, dropped or added."""
+        rot = self.dir / "rot.gguf"
+        if not rot.exists():
+            self.rotate_all()
+        with open_gguf(rot) as model:
+            raw = list(model.kv_raw) if kv is None else kv
+            data = {t.name: (t.type_name, t.ne, np.frombuffer(bytes(model.tensor_bytes(t)), np.uint8))
+                    for t in model.tensors}
+        replaced = {key: encode_value(value) for key, value in (set_kv or {}).items()}
+        raw = [(k, replaced.pop(k, v)) for k, v in raw if k not in drop]
+        raw += list(replaced.items())
+        return write_single(self.dir / name, tensors if tensors is not None else data, kv=raw)
+
     def test_rotation_metadata_rejections(self):
-        out = self.rotate_all()
-        with open_gguf(out) as model:
-            kv_raw = list(model.kv_raw)
-            tensors = {t.name: (t.type_name, t.ne, np.frombuffer(bytes(model.tensor_bytes(t)), np.uint8))
-                       for t in model.tensors}
-
-        def variant(name, kv=kv_raw, tensors=tensors):
-            return write_single(self.dir / name, tensors, kv=kv)
-
-        flipped = dict(tensors)
-        bits = flipped["blk.0.attn_gate.weight.rot"][2].view("<u2").copy()
-        bits[0] ^= 0x8000
-        flipped["blk.0.attn_gate.weight.rot"] = ("F16", (HIDDEN,), bits)
-        no_version = [(k, v) for k, v in kv_raw if k != "gufo.rotation.version"]
-        bad_block = [(k, encode_value(U32(64)) if k == "gufo.rotation.block_size" else v) for k, v in kv_raw]
-        embd_rot = dict(tensors)
-        embd_rot["token_embd.weight.rot"] = tensors["output.weight.rot"]
-        mixed = {k: v for k, v in tensors.items() if k != "blk.0.ssm_beta.weight.rot"}
-        layer_only = {k: v for k, v in tensors.items() if not k.startswith("blk.1.ffn_down.weight.rot")}
-        not_pm1 = dict(tensors)
-        not_pm1["blk.0.ffn_down.weight.rot"] = ("F16", (512,), np.full(512, 0x4000, "<u2"))
-        wrong_len = dict(tensors)
-        wrong_len["output.weight.rot"] = ("F16", (128,), np.full(128, 0x3C00, "<u2"))
-        markers_only = {k: v for k, v in tensors.items() if not k.endswith(".rot")}
+        with open_gguf(self.rotate_all()) as model:
+            names = list(model.kv["prism.hadamard.weight_names"])
+            widths = list(model.kv["prism.hadamard.sign_widths"])
+            values = list(model.kv["prism.hadamard.sign_values"])
+        without = lambda *drop: [n for n in names if n not in drop]  # noqa: E731
         cases = {
-            "different sign vector": variant("flip.gguf", tensors=flipped),
-            "missing gufo.rotation.version": variant("nover.gguf", kv=no_version),
-            "unsupported gufo.rotation.block_size": variant("block.gguf", kv=bad_block),
-            "no rotation path": variant("embd.gguf", tensors=embd_rot),
-            "mixes rotated and unrotated": variant("mixed.gguf", tensors=mixed),
-            "some layers only": variant("layer.gguf", tensors=layer_only),
-            "other than": variant("pm1.gguf", tensors=not_pm1),
-            "128 values": variant("len.gguf", tensors=wrong_len),
-            "no .rot tensors": variant("markers.gguf", tensors=markers_only),
+            # The converter/gufo subset (the upstream loader accepts these).
+            "mixes rotated and unrotated": {"prism.hadamard.weight_names": without("blk.0.attn_gate.weight")},
+            "some layers only": {"prism.hadamard.weight_names": without("blk.1.ffn_down.weight")},
+            "unsupported prism.hadamard.block_size": {"prism.hadamard.block_size": U32(64)},
+            "unsupported prism.hadamard.sign_mode": {"prism.hadamard.sign_mode": "identity"},
+            "gdn_v_grouped is not supported": {"prism.hadamard.gdn_v_grouped": True},
+            "inverse_weight_names is not supported": {"prism.hadamard.inverse_weight_names": ["token_embd.weight"]},
+            "no folded weight uses": {"prism.hadamard.sign_widths": I32Array(widths + [1024]),
+                                      "prism.hadamard.sign_values": I32Array(values + [1] * 1024)},
+            # Upstream loader rules surface through check_rotation too.
+            "not on a verified Hadamard-aware matmul path": {
+                "prism.hadamard.weight_names": names + ["blk.0.ssm_alpha.weight"]},
         }
-        for message, path in cases.items():
-            with self.subTest(message=message), open_gguf(path) as model:
+        for index, (message, set_kv) in enumerate(cases.items()):
+            with self.subTest(message=message), open_gguf(self.rotated_variant(f"v{index}.gguf", set_kv)) as model:
                 with self.assertRaisesRegex(PlanError, message):
                     check_rotation(model, GROUPS)
-        rot_only = [(k, v) for k, v in kv_raw if not k.startswith("gufo.rotation.")]
-        with open_gguf(variant("nokv.gguf", kv=rot_only)) as model:
-            with self.assertRaisesRegex(PlanError, "no gufo.rotation metadata"):
-                check_rotation(model, GROUPS)
+        stray = self.rotated_variant("stray.gguf", drop=("prism.hadamard.version",))
+        with open_gguf(stray) as model, self.assertRaisesRegex(PlanError, "without prism.hadamard.version"):
+            check_rotation(model, GROUPS)
 
     def test_plan_rejections(self):
         tied = write_single(self.dir / "tied.gguf", toy_tensors(np.random.default_rng(1), tied=True))
@@ -493,7 +501,7 @@ class ConverterTest(unittest.TestCase):
         self.assertEqual(rows["blk.0.ssm_conv1d.weight"][2:7], ["ssm_parameter", "-", "no", "F32", "F32"])
         self.assertEqual(rows["token_embd.weight"][3:7], ["-", "no", "BF16", "Q8_0"])
         self.assertIn("rotated groups: attn_in, ffn_in, ffn_down_in", out)
-        self.assertIn(".rot sign tensors (F16): 13,", out)
+        self.assertIn("prism.hadamard sign vectors: 2 (widths 256, 512; 768 int32 values)", out)
         self.assertIn("llama-quantize base type: Q4_K", out)
         # Rotate-only dry runs keep the source types.
         code, out, err = run_cli("--groups", "qwen27b", "--input", self.split[0], "--recipe", recipe,
@@ -532,13 +540,14 @@ class ConverterTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("1 tensor(s) have no type in the --copy-recipe-from file: blk.1.ffn_up.weight", err)
 
-    def fake_quantize(self, wrong_type=None, change_rot=False):
+    def fake_quantize(self, wrong_type=None, change_copy=False, drop_prism=False):
         """A stand-in llama-quantize: records argv and writes an output GGUF
         with the requested types (zero payloads for converted tensors)."""
         log = self.dir / "argv.json"
         script = self.dir / "fake-llama-quantize"
         script.write_text(FAKE_QUANTIZE.format(python=sys.executable, tools=str(ROOT / "tools"), log=str(log),
-                                               wrong=wrong_type, change_rot=change_rot))
+                                               wrong=wrong_type, change_copy=change_copy,
+                                               drop_prism=drop_prism))
         script.chmod(0o755)
         return script, log
 
@@ -653,9 +662,10 @@ class ConverterTest(unittest.TestCase):
                                     "--llama-quantize", script, "--output", self.dir / "ok.gguf")
         self.assertEqual(code, 0, err)
         self.assertIn("types match the plan", stdout)
-        self.assertIn("(16 .rot)", stdout)
+        self.assertIn("14 folded", stdout)
         cases = [("wrong", dict(wrong_type="blk.0.ffn_gate.weight"), "blk.0.ffn_gate.weight Q4_K != Q8_0"),
-                 ("rot", dict(change_rot=True), "unquantized tensor(s) changed bytes")]
+                 ("copy", dict(change_copy=True), "unquantized tensor(s) changed bytes"),
+                 ("kv", dict(drop_prism=True), "prism.hadamard.sign_values changed or missing")]
         for name, kwargs, message in cases:
             with self.subTest(name=name):
                 script, _ = self.fake_quantize(**kwargs)
@@ -759,17 +769,17 @@ class ConverterTest(unittest.TestCase):
                                "--rotate-only", "--output", out)
         self.assertEqual(code, 0, err)
         with open_gguf(out) as model, open_gguf(path) as source:
-            names = {t.name for t in model.tensors}
-            self.assertNotIn("blk.2.attn_q.weight.rot", names)
-            self.assertIn("blk.1.attn_q.weight.rot", names)
+            folded = model.kv["prism.hadamard.weight_names"]
+            self.assertNotIn("blk.2.attn_q.weight", folded)
+            self.assertIn("blk.1.attn_q.weight", folded)
             self.assertEqual(bytes(model.tensor_bytes(model.by_name["blk.2.ffn_down.weight"])),
                              bytes(source.tensor_bytes(source.by_name["blk.2.ffn_down.weight"])))
             self.assertEqual(check_rotation(model, GROUPS), ALL_GROUPS)
-        # A .rot on a NextN block names the tensor and is refused.
-        tensors["blk.2.ffn_down.weight.rot"] = ("F16", (512,), np.full(512, 0x3C00, "<u2"))
-        bad = write_single(self.dir / "mtp-bad.gguf", tensors,
-                           kv=kv + [(k, encode_value(U32(v)) if isinstance(v, int) else encode_value(v))
-                                    for k, v in ROTATION_KV.items()])
+        # A NextN weight listed as folded names the tensor and is refused.
+        with open_gguf(out) as model:
+            raw = [(k, encode_value(model.kv["prism.hadamard.weight_names"] + ["blk.2.ffn_down.weight"])
+                    if k == "prism.hadamard.weight_names" else v) for k, v in model.kv_raw]
+        bad = write_single(self.dir / "mtp-bad.gguf", tensors, kv=raw)
         with open_gguf(bad) as model, self.assertRaisesRegex(PlanError, "blk.2.ffn_down.weight is rotated"):
             check_rotation(model, GROUPS)
         missing = write_single(self.dir / "noblocks.gguf", self.tensors,
@@ -778,6 +788,100 @@ class ConverterTest(unittest.TestCase):
                                "--rotate-only", "--dry-run")
         self.assertEqual(code, 2)
         self.assertIn("rotated block range", err)
+
+
+
+class PrismUpstreamRulesTest(unittest.TestCase):
+    """rotquant/prism.read_prism refuses what the upstream loader refuses.
+
+    Each case names the line of ggml-org/llama.cpp 8ab29fae
+    src/llama-model.cpp (load_hparams_hadamard / load_tensors_hadamard)
+    whose refusal it mirrors; the message must carry that line.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        split = write_split(self.dir, toy_tensors(np.random.default_rng(5)))
+        self.rot = self.dir / "rot.gguf"
+        code, _, err = run_cli("--groups", "qwen27b", "--input", split[0], "--rotate-groups", "all",
+                               "--seed", 11, "--rotate-only", "--output", self.rot)
+        self.assertEqual(code, 0, err)
+        with open_gguf(self.rot) as model:
+            self.kv_raw = list(model.kv_raw)
+            self.names = list(model.kv["prism.hadamard.weight_names"])
+            self.widths = list(model.kv["prism.hadamard.sign_widths"])
+            self.values = list(model.kv["prism.hadamard.sign_values"])
+            self.data = {t.name: (t.type_name, t.ne, np.frombuffer(bytes(model.tensor_bytes(t)), np.uint8))
+                         for t in model.tensors}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def variant(self, name, set_kv=(), drop=(), raw=(), untied_output=True):
+        encoded = {k: encode_value(v) for k, v in dict(set_kv).items()}
+        encoded.update(dict(raw))
+        kv = [(k, encoded.pop(k, v)) for k, v in self.kv_raw if k not in drop]
+        kv += list(encoded.items())
+        data = self.data if untied_output else {k: v for k, v in self.data.items() if k != "output.weight"}
+        return write_single(self.dir / name, data, kv=kv)
+
+    def test_converter_output_passes(self):
+        with open_gguf(self.rot) as model:
+            info = prism.read_prism(model)
+        self.assertEqual((info.version, info.block_size, info.sign_mode), (1, 128, "explicit"))
+        self.assertEqual(sorted(info.signs), list(WIDTHS))
+        self.assertEqual(info.weight_names, tuple(self.names))
+
+    def test_refusals_match_upstream_lines(self):
+        widths, values, names = self.widths, self.values, self.names
+        no_head = [n for n in names if n != "output.weight"]
+        cases = [
+            (2078, dict(set_kv={prism.VERSION: U32(3)})),
+            (2082, dict(set_kv={prism.VERSION: U32(2)})),
+            (2085, dict(set_kv={prism.VERSION: U32(2), prism.TIED_OUTPUT: True})),
+            (2224, dict(set_kv={prism.TIED_OUTPUT: True}, drop=(prism.VERSION,))),
+            (2101, dict(set_kv={prism.BLOCK_SIZE: U32(96)})),
+            (2104, dict(set_kv={prism.TRANSFORM: "walsh"})),
+            (2107, dict(set_kv={prism.AXIS: "output"})),
+            (2110, dict(set_kv={prism.SIGN_MODE: "random"})),
+            (2113, dict(set_kv={prism.WEIGHT_NAMES: []})),
+            (2123, dict(set_kv={prism.SIGN_WIDTHS: I32Array(), prism.SIGN_VALUES: I32Array()})),
+            (2128, dict(set_kv={prism.SIGN_WIDTHS: I32Array(widths + [200]),
+                                prism.SIGN_VALUES: I32Array(values + [1] * 200)})),
+            (2131, dict(set_kv={prism.SIGN_WIDTHS: I32Array([256] + widths),
+                                prism.SIGN_VALUES: I32Array([1] * 256 + values)})),
+            (2137, dict(set_kv={prism.SIGN_VALUES: I32Array([2] + values[1:])})),
+            (2143, dict(set_kv={prism.SIGN_VALUES: I32Array(values + [1])})),
+            (2159, dict(set_kv={"general.architecture": "gemma3"})),
+            (2199, dict(set_kv={prism.WEIGHT_NAMES: names + ["blk.0.ssm_beta.weight"]})),
+            (2199, dict(set_kv={prism.WEIGHT_NAMES: names + ["token_embd.weight"]})),
+            (2203, dict(set_kv={prism.WEIGHT_NAMES: names + names[:1]})),
+            (2213, dict(set_kv={prism.INVERSE_WEIGHT_NAMES: ["output.weight"]})),
+            (2217, dict(set_kv={prism.INVERSE_WEIGHT_NAMES: ["token_embd.weight", "token_embd.weight"]})),
+            (2228, dict(set_kv={prism.VERSION: U32(2), prism.TIED_OUTPUT: True, prism.WEIGHT_NAMES: no_head},
+                        untied_output=False)),
+            (2232, dict(set_kv={prism.INVERSE_WEIGHT_NAMES: ["token_embd.weight"], prism.WEIGHT_NAMES: no_head},
+                        untied_output=False)),
+            (2271, dict(set_kv={prism.WEIGHT_NAMES: names + ["blk.5.ffn_up.weight"]})),
+            (2274, dict(set_kv={prism.SIGN_MODE: "identity", prism.BLOCK_SIZE: U32(512)})),
+            (2348, dict(set_kv={prism.SIGN_WIDTHS: I32Array([256, 512]),
+                                prism.SIGN_VALUES: I32Array(values[:256] + values[256 + 384:])})),
+        ]
+        for index, (line, spec) in enumerate(cases):
+            with self.subTest(line=line, case=index):
+                with open_gguf(self.variant(f"u{index}.gguf", **spec)) as model:
+                    with self.assertRaisesRegex(prism.PrismError, f"llama-model.cpp:{line}\\)$"):
+                        prism.read_prism(model)
+        # Keys must carry the GGUF type the upstream getters accept.
+        bad_type = self.variant("type.gguf", raw={prism.VERSION: struct.pack("<Ii", 5, 1)})
+        with open_gguf(bad_type) as model, self.assertRaisesRegex(prism.PrismError, "wrong GGUF type"):
+            prism.read_prism(model)
+        # Identity mode needs no sign table; the upstream loader accepts it.
+        identity = self.variant("identity.gguf", set_kv={prism.SIGN_MODE: "identity"},
+                                drop=(prism.SIGN_WIDTHS, prism.SIGN_VALUES))
+        with open_gguf(identity) as model:
+            self.assertEqual(prism.read_prism(model).signs, {})
 
 
 if __name__ == "__main__":

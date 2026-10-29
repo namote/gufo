@@ -4,13 +4,14 @@ llama-quantize can change a tensor type on its own (name heuristics, the
 `tensor_type_fallback` for rows a block does not tile) and only warns. The
 converter therefore reads the output back and refuses it unless:
 
-- it holds exactly the source tensors, `.rot` sign tensors included;
+- it holds exactly the source tensors;
 - every tensor has the planned type (`.tensor-types.txt` for matrices, the
   source type for everything llama-quantize leaves alone);
-- every tensor whose type did not change, `.rot` included, is byte-identical
-  to the source;
-- every `gufo.*` key of the source is still present with the same bytes, and
+- every tensor whose type did not change is byte-identical to the source;
+- every `prism.hadamard.*` and `gufo.*` key of the source is still present
+  with the same bytes (the fold and its signs survive quantization), and
   each `--override-kv` value reads back exactly;
+- the output still passes the upstream prism.hadamard loader rules;
 - `general.alignment` is 256 and the data section and every tensor start on
   a 256-byte boundary of the file.
 """
@@ -19,7 +20,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from rotquant.gguf_io import WRITE_ALIGNMENT, encode_value, open_gguf
-from rotquant.plan import ROT_SUFFIX, ROT_TYPE, PlanError
+from rotquant.plan import PlanError
+from rotquant.prism import PREFIX as PRISM_PREFIX, PrismError, read_prism
 
 
 def verify_output(source, output, plan, overrides: dict) -> dict:
@@ -46,12 +48,9 @@ def verify_output(source, output, plan, overrides: dict) -> dict:
             if tuple(got.ne) != tuple(tensor.ne):
                 wrong.append(f"{tensor.name} shape {list(got.ne)} != {list(tensor.ne)}")
                 continue
-            if tensor.name.endswith(ROT_SUFFIX):
-                want = ROT_TYPE
-            else:
-                want = expected.get(tensor.name)
-                if want is None:
-                    raise PlanError(f"{tensor.name} is not in the plan")
+            want = expected.get(tensor.name)
+            if want is None:
+                raise PlanError(f"{tensor.name} is not in the plan")
             if got.type_name != want:
                 wrong.append(f"{tensor.name} {got.type_name} != {want}")
                 continue
@@ -68,13 +67,17 @@ def verify_output(source, output, plan, overrides: dict) -> dict:
         out_kv = dict(out.kv_raw)
         kv_errors = []
         for key, raw in src.kv_raw:
-            if key.startswith("gufo.") and key not in overrides and out_kv.get(key) != raw:
+            if key.startswith(("gufo.", PRISM_PREFIX)) and key not in overrides and out_kv.get(key) != raw:
                 kv_errors.append(f"{key} changed or missing")
         for key, value in overrides.items():
             if out_kv.get(key) != encode_value(value):
                 kv_errors.append(f"{key} != {value!r}")
         if kv_errors:
             raise PlanError(f"{output}: metadata check failed: " + "; ".join(kv_errors))
-        rot = sum(name.endswith(ROT_SUFFIX) for name in src_names)
-    return {"tensors": len(src_names), "rot": rot, "byte_identical": copied,
+        try:
+            read_prism(out)
+        except PrismError as error:
+            raise PlanError(f"{output}: {error}") from None
+        folded = len(dict(src.kv).get(f"{PRISM_PREFIX}weight_names", []))
+    return {"tensors": len(src_names), "folded": folded, "byte_identical": copied,
             "quantized": len(src_names) - copied, "output": str(Path(output))}

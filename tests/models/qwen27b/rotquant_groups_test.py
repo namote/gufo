@@ -11,6 +11,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "tools"))
 
+from rotquant import prism  # noqa: E402
 from rotquant.plan import PlanError, load_groups  # noqa: E402
 
 GROUPS = load_groups("qwen27b")
@@ -33,7 +34,7 @@ def layer_names(layer: int, attention: bool) -> list:
 class GroupTableTest(unittest.TestCase):
     def test_plan_table(self):
         expected = {
-            "attn_in": {"attn_qkv", "attn_gate", "ssm_alpha", "ssm_beta", "attn_q", "attn_k", "attn_v"},
+            "attn_in": {"attn_qkv", "attn_gate", "attn_q", "attn_k", "attn_v"},
             "ssm_out_in": {"ssm_out"},
             "attn_out_in": {"attn_output"},
             "ffn_in": {"ffn_gate", "ffn_up"},
@@ -51,8 +52,13 @@ class GroupTableTest(unittest.TestCase):
             role = GROUPS.role(name)
             self.assertIsNotNone(role, name)
             if group is None:
-                self.assertNotEqual(role, "projection", name)
+                # Only the DeltaNet ssm_alpha/ssm_beta projections stay unrotated
+                # (upstream prism.hadamard cannot fold them; PLAN D8).
+                if role == "projection":
+                    self.assertRegex(name, r"^blk\.\d+\.ssm_(alpha|beta)\.weight$")
                 continue
+            # Every grouped tensor is a kind the upstream loader folds.
+            self.assertTrue(prism.FOLDABLE.fullmatch(name), name)
             self.assertEqual(role, "projection", name)
             if group == "head_in":
                 self.assertEqual((name, instance), ("output.weight", "head_in"))

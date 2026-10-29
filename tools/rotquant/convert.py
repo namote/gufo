@@ -2,11 +2,12 @@
 """Rotated-weight converter: Hadamard-rotate input groups, then quantize.
 
 Stage 1 (rotate) streams a BF16 GGUF (single or split) one tensor at a time
-and writes W' = W·D·H for every tensor in a rotated input group, its
-`<name>.rot` sign tensor (F16 ±1) and the gufo.rotation metadata.
+and writes W' = W·D·H for every tensor in a rotated input group, with the
+upstream llama.cpp prism.hadamard metadata: one ±1 sign vector D per input
+width K and the list of folded weights (rotquant/prism.py).
 Stage 2 (quantize) writes exact per-tensor --tensor-type rules, runs the
 reference llama-quantize on the rotated file and reads the output back
-(rotquant/verify.py): types, .rot bytes and gufo.* metadata must match.
+(rotquant/verify.py): types, unchanged bytes and prism/gufo metadata must match.
 An already rotated input skips stage 1, so one rotated BF16 file serves
 many recipes. NextN (MTP) blocks are never rotated.
 
@@ -31,12 +32,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np  # noqa: E402
 
 from rotquant import CONVERTER_VERSION  # noqa: E402
-from rotquant.gguf_io import (SPLIT_KEYS, WRITE_ALIGNMENT, OutTensor, U32, as_float32,  # noqa: E402
+from rotquant import prism  # noqa: E402
+from rotquant.gguf_io import (SPLIT_KEYS, WRITE_ALIGNMENT, OutTensor, as_float32,  # noqa: E402
                               encode_value, open_gguf, write_gguf)
 from rotquant.hadamard import f32_to_bf16_bits, rotate_last_axis, signs  # noqa: E402
-from rotquant.plan import (F16_MINUS_ONE, F16_PLUS_ONE, ROT_SUFFIX, ROT_TYPE,  # noqa: E402
-                           ROTATION_KV, PlanError, build_plan, copied_recipe, dry_run_table,
-                           load_groups, quantize_command, tensor_type_lines)
+from rotquant.hadamard import BLOCK_SIZE  # noqa: E402
+from rotquant.plan import (PlanError, build_plan, copied_recipe, dry_run_table,  # noqa: E402
+                           load_groups, quantize_command, sign_key, tensor_type_lines)
 from rotquant.recipe import RecipeError, load_recipe, parse_rotate_selection  # noqa: E402
 from rotquant.realign import realign  # noqa: E402
 from rotquant.verify import verify_output  # noqa: E402
@@ -81,17 +83,10 @@ def _rotate_writer(model, tensor, sign):
     return write
 
 
-def _sign_writer(sign):
-    bits = np.where(sign > 0, F16_PLUS_ONE, F16_MINUS_ONE).astype("<u2")
-
-    def write(out):
-        out.write(bits.tobytes())
-    return write
-
-
 def rotate_file(model, plan, output, source_sha256: str) -> None:
     """Write the rotated float GGUF for a plan whose input is not rotated."""
-    sign_cache = {}
+    sign_by_width = {}
+    folded = []
     tensors = []
     by_name = model.by_name
     for entry in plan.entries:
@@ -99,18 +94,17 @@ def rotate_file(model, plan, output, source_sha256: str) -> None:
         if not entry.rotate:
             tensors.append(OutTensor(entry.name, tensor.ne, tensor.type_name, _copy_writer(model, tensor)))
             continue
-        sign = sign_cache.setdefault(entry.instance, signs(plan.seed, entry.instance, tensor.ne[0]))
-        if sign.shape[0] != tensor.ne[0]:
-            raise PlanError(f"group instance {entry.instance} mixes input sizes")
+        k = tensor.ne[0]
+        if not prism.FOLDABLE.fullmatch(entry.name):
+            raise PlanError(f"{entry.name}: upstream prism.hadamard cannot fold this tensor kind")
+        sign = sign_by_width.setdefault(k, signs(plan.seed, sign_key(k), k))
+        folded.append(entry.name)
         tensors.append(OutTensor(entry.name, tensor.ne, tensor.type_name, _rotate_writer(model, tensor, sign)))
-        tensors.append(OutTensor(entry.name + ROT_SUFFIX, (tensor.ne[0],), ROT_TYPE, _sign_writer(sign)))
     kv_raw = [(key, raw) for key, raw in model.kv_raw if key not in SPLIT_KEYS]
-    added = {}
-    if plan.rotate:
-        added.update({key: U32(value) if isinstance(value, int) else value
-                      for key, value in ROTATION_KV.items()})
-    added.update(provenance(plan, with_types=False, source_sha256=source_sha256,
-                            source_file=Path(model.paths[0]).name))
+    if folded:
+        kv_raw += prism.prism_kv(BLOCK_SIZE, folded, sign_by_width)
+    added = provenance(plan, with_types=False, source_sha256=source_sha256,
+                       source_file=Path(model.paths[0]).name)
     kv_raw += [(key, encode_value(value)) for key, value in added.items()]
     write_gguf(output, kv_raw, tensors)
 
@@ -235,8 +229,8 @@ def run(args) -> int:
               f"tensor bytes unchanged", flush=True)
     summary = verify_output(source, args.output, plan, overrides)
     print(f"verified {summary['output']}: {summary['tensors']} tensors, {summary['quantized']} quantized, "
-          f"{summary['byte_identical']} byte-identical ({summary['rot']} .rot), types match the plan, "
-          f"gufo.* metadata kept, {WRITE_ALIGNMENT}-byte aligned", flush=True)
+          f"{summary['byte_identical']} byte-identical, {summary['folded']} folded, types match the plan, "
+          f"prism/gufo metadata kept, {WRITE_ALIGNMENT}-byte aligned", flush=True)
     return 0
 
 

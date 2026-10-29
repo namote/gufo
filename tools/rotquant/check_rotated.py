@@ -4,8 +4,8 @@
 For sampled tensors (every rotated group; first, middle and last layer of
 each) this verifies:
 
-- the stored `.rot` is ±1, shared by the group instance, and equals the
-  converter's sign derivation for the given seed;
+- the prism.hadamard sign vector for the tensor's input width equals the
+  converter's derivation for the given seed;
 - the stored weights are bit-identical to BF16-RNE(W·D·H) recomputed in FP32
   (rows sampled with --rows; 0 = all rows);
 - W'·(H·D·x) ≈ W·x for random x and for x with a few large outlier channels,
@@ -29,7 +29,8 @@ import numpy as np  # noqa: E402
 
 from rotquant.gguf_io import as_float32, open_gguf  # noqa: E402
 from rotquant.hadamard import f32_to_bf16_bits, rotate_last_axis, signs  # noqa: E402
-from rotquant.plan import ROT_SUFFIX, check_rotation, load_groups, read_rot_signs  # noqa: E402
+from rotquant.plan import check_rotation, file_signs, load_groups, sign_key  # noqa: E402
+from rotquant.prism import read_prism  # noqa: E402
 
 BF16_HALF_ULP = 2.0 ** -8  # BF16 keeps 8 significant bits
 
@@ -37,12 +38,11 @@ BF16_HALF_ULP = 2.0 ** -8  # BF16 keeps 8 significant bits
 def pick_samples(model, groups) -> list:
     """(group, instance, tensor name): first, middle and last layer per group,
     cycling through the group's member tensors."""
+    folded = set(read_prism(model).weight_names)
     by_group = {}
     for tensor in model.tensors:
-        if tensor.name.endswith(ROT_SUFFIX):
-            continue
         group, instance = groups.instance(tensor.name)
-        if group is not None and tensor.name + ROT_SUFFIX in model.by_name:
+        if group is not None and tensor.name in folded:
             by_group.setdefault(group, {}).setdefault(instance, []).append(tensor.name)
     samples = []
     for group, instances in by_group.items():
@@ -75,12 +75,12 @@ def rel_errors(reference: np.ndarray, got: np.ndarray) -> dict:
             "elem_max": float(per_element.max())}
 
 
-def check_tensor(src, rot, groups, seed, group, instance, name, rng, columns, row_sample):
+def check_tensor(src, rot, sign_table, seed, group, instance, name, rng, columns, row_sample):
     started = time.time()
     tensor, rotated = src.by_name[name], rot.by_name[name]
     k = tensor.ne[0]
-    sign = read_rot_signs(rot, rot.by_name[name + ROT_SUFFIX])
-    derived = signs(seed, instance, k)
+    sign = sign_table[k]
+    derived = signs(seed, sign_key(k), k)
     w = as_float32(src, tensor)
     w_rot = as_float32(rot, rotated)
     n = w.shape[0]
@@ -122,17 +122,21 @@ def main(argv=None) -> int:
     rng = np.random.default_rng(20261029)
     with open_gguf(args.source) as src, open_gguf(args.rotated) as rot:
         rotated_groups = check_rotation(rot, groups)
+        if not rotated_groups:
+            parser.error(f"{args.rotated} has no prism.hadamard folding")
         bound = groups.for_model(rot.kv)
+        sign_table = file_signs(rot)
+        folded = set(read_prism(rot).weight_names)
         results = []
         if args.tensors:
             samples = [(*bound.instance(name), name) for name in args.tensors.split(",")]
-            unrotated = [name for group, _, name in samples if group is None or name + ROT_SUFFIX not in rot.by_name]
+            unrotated = [name for group, _, name in samples if group is None or name not in folded]
             if unrotated:
                 parser.error(f"not rotated in this file: {', '.join(unrotated)}")
         else:
             samples = pick_samples(rot, bound)
         for group, instance, name in samples:
-            result = check_tensor(src, rot, bound, args.seed, group, instance, name, rng,
+            result = check_tensor(src, rot, sign_table, args.seed, group, instance, name, rng,
                                   args.columns, args.rows)
             results.append(result)
             print(f"{name:<32} {instance:<15} bits {result['bit_mismatches']}/{result['bit_identical_rows']} rows "

@@ -226,6 +226,8 @@ def encode_value(value) -> bytes:
         return struct.pack("<IB", T_BOOL, int(value))
     if isinstance(value, U32):
         return struct.pack("<II", T_U32, int(value))
+    if isinstance(value, I32Array):
+        return struct.pack("<IIQ", T_ARRAY, T_I32, len(value)) + struct.pack(f"<{len(value)}i", *value)
     if isinstance(value, int):
         return struct.pack("<IQ", T_U64, value)
     if isinstance(value, str):
@@ -237,6 +239,10 @@ def encode_value(value) -> bytes:
 
 class U32(int):
     """Marks an integer metadata value to be written as uint32."""
+
+
+class I32Array(tuple):
+    """Marks a sequence of integers to be written as an int32 array."""
 
 
 @dataclass

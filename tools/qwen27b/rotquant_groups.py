@@ -1,7 +1,9 @@
 """Qwen3.8 27B input groups and tensor roles for tools/rotquant.
 
-Matrices that consume the same activation share one sign vector so the
-activation is rotated once. A group instance is one group in one layer.
+A group is the set of matrices that read one activation; the converter
+rotates a group in every trunk layer or not at all. Signs follow the
+upstream prism.hadamard rule: one sign vector per input width K, shared by
+all groups and layers with that K. A group instance is one group in one layer.
 Groups follow the UD-Q4_K_XL header (hidden 5120); see
 plan/rotated-quant/PLAN.md, "27B 입력 그룹".
 """
@@ -13,9 +15,11 @@ ARCHITECTURE = "qwen35"
 
 # Group name -> full-match tensor-name pattern. `layer` names the instance.
 GROUPS = {
-    # attn_norm output: DeltaNet attn_qkv/attn_gate/ssm_alpha/ssm_beta and
-    # full-attention attn_q/attn_k/attn_v.
-    "attn_in": r"blk\.(?P<layer>\d+)\.(attn_qkv|attn_gate|ssm_alpha|ssm_beta|attn_q|attn_k|attn_v)\.weight",
+    # attn_norm output: DeltaNet attn_qkv/attn_gate and full-attention
+    # attn_q/attn_k/attn_v. The DeltaNet ssm_alpha/ssm_beta read the same
+    # activation but stay unrotated: upstream prism.hadamard folding does not
+    # accept them (llama.cpp 8ab29fae src/llama-model.cpp:2166-2199; PLAN D8).
+    "attn_in": r"blk\.(?P<layer>\d+)\.(attn_qkv|attn_gate|attn_q|attn_k|attn_v)\.weight",
     # SSM per-head norm and SiLU gate output.
     "ssm_out_in": r"blk\.(?P<layer>\d+)\.ssm_out\.weight",
     # Attention output after its gate.
