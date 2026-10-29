@@ -143,7 +143,7 @@ R2 ② 판정은 W3/감독이 [R2 결과](R2-RESULTS.md)에서 한다. 여기에
 
 - **창 계획:** `PLAN-RQ0-E10.json`(초안, 실행하지 않음). 모델 키는 `e10-{plain,seed1,seed2,seed3,nosign}`이고 파일마다 창 하나다.
   - 대상: `qwen-3.8-27b-rot-prism-q4-test-gguf/`의 UD 복사 레시피 Q4(imatrix 없음). plain-prism(`b1a830cc…`), rot-prism seed 1(`107e9b11…`), seed 2, seed 3, 부호 없음(D = I).
-  - seed 2, seed 3, 부호 없음 파일은 W1이 만들고 있다. 파일 이름은 `…-rot-prism-{seed2,seed3,nosign}-UDcopy-Q4.gguf`로 가정했다. W1이 끝나면 `SHA256SUMS`에서 이름과 sha를 읽어 계획을 다시 만든다(생성 스크립트가 없는 파일을 PENDING으로 표시한다).
+  - seed 2, seed 3, 부호 없음 파일은 W1이 만들고 있다. 파일 이름은 `…-rot-prism-{s2,s3,nosign}-UDcopy-Q4.gguf`다(감독 확인). W1이 끝나면 `SHA256SUMS`에서 이름과 sha를 읽어 계획을 다시 만든다(생성 스크립트가 없는 파일을 PENDING으로 표시한다).
 - **설정:** R0와 같다. 코퍼스 a01, prefill·verify는 8창 전체, decode는 prefix 2048 × 512, top-k 256이다. 기준은 `rq0-a01/rq0-bf16`(이 수집기에서 바이트 동일, `rq2bp-same`)이고 수집기는 `b5219f1b`다.
 - **시간(짐작):** 파일마다 약 20분이다(R0 UD-Q4_K_XL 실적 5.0 + 8.1 + 6.2분에 로드 시간). 5개 합계 약 1시간 45분이다. 창마다 `--seconds` 6000이다.
 - **분석:**
