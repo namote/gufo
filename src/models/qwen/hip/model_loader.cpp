@@ -230,6 +230,51 @@ void ReleaseWeightRegions(std::vector<QwenGpuWeightRegion>& regions) noexcept {
   return false;
 }
 
+// Copies the packed rotation signs to device memory once, at load time, and
+// rebinds every layer pointer to the copy. Graph capture then sees fixed
+// device pointers and no allocation happens during decode.
+bool UploadRotationSigns(models::QwenModelWeights& weights, void** device,
+                         std::string* error_msg) {
+  *device = nullptr;
+  if (!weights.IsRotated() || weights.rotation_signs == nullptr) {
+    return true;
+  }
+  const auto& host = *weights.rotation_signs;
+  const std::size_t bytes = host.size() * sizeof(std::uint32_t);
+  void* buffer = nullptr;
+  hipError_t status = hipMalloc(&buffer, bytes);
+  if (status == hipSuccess) {
+    status = hipMemcpy(buffer, host.data(), bytes, hipMemcpyHostToDevice);
+  }
+  if (status != hipSuccess) {
+    if (buffer != nullptr) {
+      (void)hipFree(buffer);
+    }
+    if (error_msg != nullptr) {
+      *error_msg = std::string("Failed to upload rotation signs: ") +
+                   hipGetErrorString(status);
+    }
+    return false;
+  }
+  const auto* base = host.data();
+  auto* device_base = static_cast<const std::uint32_t*>(buffer);
+  const auto rebind = [&](const std::uint32_t*& pointer) {
+    if (pointer != nullptr) {
+      pointer = device_base + (pointer - base);
+    }
+  };
+  for (auto& layer : weights.layers) {
+    rebind(layer.rotation.attn_in);
+    rebind(layer.rotation.ssm_out_in);
+    rebind(layer.rotation.attn_out_in);
+    rebind(layer.rotation.ffn_in);
+    rebind(layer.rotation.ffn_down_in);
+  }
+  rebind(weights.head_in_rotation);
+  *device = buffer;
+  return true;
+}
+
 }  // namespace
 
 QwenGpuModel::QwenGpuModel(
@@ -237,14 +282,18 @@ QwenGpuModel::QwenGpuModel(
     models::QwenModelWeights weights,
     std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
     std::vector<QwenGpuWeightRegion> weight_regions,
-    std::shared_ptr<models::qwen::vision::Encoder> vision)
+    std::shared_ptr<models::qwen::vision::Encoder> vision, void* rotation_signs)
     : reader_(std::move(reader)),
       weights_(std::move(weights)),
       tokenizer_(std::move(tokenizer)),
       weight_regions_(std::move(weight_regions)),
-      vision_(std::move(vision)) {}
+      vision_(std::move(vision)),
+      rotation_signs_(rotation_signs) {}
 
 QwenGpuModel::~QwenGpuModel() {
+  if (rotation_signs_ != nullptr) {
+    (void)hipFree(rotation_signs_);
+  }
   ReleaseWeightRegions(weight_regions_);
 }
 
@@ -314,11 +363,17 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
     return nullptr;
   }
 
+  void* rotation_signs = nullptr;
+  if (!UploadRotationSigns(*weights_opt, &rotation_signs, error_msg)) {
+    ReleaseWeightRegions(weight_regions);
+    return nullptr;
+  }
+
   std::shared_ptr<const tokenization::QwenTokenizer> shared_tokenizer(
       std::move(tokenizer));
   return std::make_shared<const QwenGpuModel>(
       std::move(reader), std::move(*weights_opt), std::move(shared_tokenizer),
-      std::move(weight_regions), std::move(vision));
+      std::move(weight_regions), std::move(vision), rotation_signs);
 }
 
 std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::Create(

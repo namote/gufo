@@ -123,6 +123,17 @@ struct QwenTensorRef {
   }
 };
 
+/// Sign vectors of one layer's rotated input groups. Bit j of word w set
+/// means element 32·w + j of the group input is negated before the 128-point
+/// Hadamard transform. Null means the group is not rotated.
+struct QwenLayerRotation {
+  const std::uint32_t* attn_in = nullptr;      // attn_norm output
+  const std::uint32_t* ssm_out_in = nullptr;   // SSM norm + gate output
+  const std::uint32_t* attn_out_in = nullptr;  // gated attention output
+  const std::uint32_t* ffn_in = nullptr;       // post_attention_norm output
+  const std::uint32_t* ffn_down_in = nullptr;  // SwiGLU output
+};
+
 /// Tensor weight references for a single transformer layer block (Linear SSM or
 /// Full Attention).
 struct QwenLayerWeights {
@@ -155,6 +166,11 @@ struct QwenLayerWeights {
   QwenTensorRef ffn_gate;
   QwenTensorRef ffn_up;
   QwenTensorRef ffn_down;
+
+  // Packed input-rotation signs per input group (src/core/quant/rotation.hpp),
+  // null when the group is not rotated. Host pointers after LoadFromGguf;
+  // the HIP model rebinds them to its device copy.
+  QwenLayerRotation rotation;
 };
 
 /// Full model tensor references mapped directly from GGUF storage.
@@ -164,6 +180,16 @@ struct QwenModelWeights {
   std::vector<QwenLayerWeights> layers;
   QwenTensorRef output_norm;
   QwenTensorRef output;
+  /// Rotation signs of the output head input (output_norm output), or null.
+  const std::uint32_t* head_in_rotation = nullptr;
+  /// Owns the host copy of every packed sign vector the layer pointers use.
+  std::shared_ptr<const std::vector<std::uint32_t>> rotation_signs;
+  /// Rotated input groups, e.g. "attn_in, ffn_in"; empty when unrotated.
+  std::string rotated_groups;
+
+  [[nodiscard]] bool IsRotated() const noexcept {
+    return !rotated_groups.empty();
+  }
 
   /// Loads and binds weights from a GgufReader.
   [[nodiscard]] static std::optional<QwenModelWeights> LoadFromGguf(

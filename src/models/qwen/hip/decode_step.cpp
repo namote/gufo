@@ -6,9 +6,26 @@
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops.hpp"
+#include "src/models/qwen/hip/ops/hadamard.hpp"
+#include "src/models/qwen/hip/output_head.hpp"
 #include "src/models/qwen/modules/modules.hpp"
 
 namespace gufo::hip {
+
+void LaunchQwenOutputHead(const models::QwenModelWeights& weights,
+                          const float* hidden, float* normed, float* logits,
+                          hipStream_t stream) {
+  const std::size_t hidden_size = weights.config.hidden_size;
+  const auto* norm = static_cast<const float*>(weights.output_norm.data);
+  if (weights.head_in_rotation != nullptr) {
+    LaunchRMSNormRotated(hidden, norm, normed, hidden_size, 1e-6F,
+                         weights.head_in_rotation, stream);
+  } else {
+    LaunchRMSNorm(hidden, norm, normed, hidden_size, 1e-6F, stream);
+  }
+  LaunchGEMV(weights.output.data, weights.output.type, normed, logits,
+             weights.config.vocab_size, hidden_size, stream);
+}
 
 void EmitDecodeRouteTelemetry(const models::QwenModelWeights& weights,
                               const QwenExecutionPolicy& policy) {
@@ -79,7 +96,13 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
     const gufo::models::qwen::HipModuleContext module_ctx(
         static_cast<void*>(arena.stream), l, pos);
 
-    {
+    const auto& rotation = layer.rotation;
+    if (rotation.attn_in != nullptr) {
+      LaunchRMSNormRotated(decode_scratch.hidden.data(),
+                           static_cast<const float*>(layer.attn_norm.data),
+                           decode_scratch.normed.data(), hidden_size, 1e-6F,
+                           rotation.attn_in, arena.stream);
+    } else {
       // Pre-RMSNorm, routed through the norm module (HIP backend). Same
       // kernel, same args, same arena slices (d_hidden in, d_normed out);
       // behavior identical to the former inline `LaunchRMSNorm` call.
@@ -188,6 +211,10 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
             fused_qknorm_rope_kv);
       }
 
+      if (rotation.attn_out_in != nullptr) {
+        LaunchRotateRowsFp32(ssm_scratch.out.data(), rotation.attn_out_in, 1,
+                             attention_size, arena.stream);
+      }
       // Output projection, routed through the quant_gemm module (HIP
       // backend). Same kernel, same args, same arena slices (d_ssm_out in,
       // d_attn_out out); behavior-identical to the former inline `LaunchGEMV`.
@@ -218,6 +245,10 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
           config.SsmValueSize(), arena.stream, arena.GetSsmReplayCapture(),
           arena.GetRecurrentStateStorage());
 
+      if (rotation.ssm_out_in != nullptr) {
+        LaunchRotateRowsFp32(ssm_scratch.out.data(), rotation.ssm_out_in, 1,
+                             ssm_inner_size, arena.stream);
+      }
       LaunchGEMV(layer.ssm_out.data, layer.ssm_out.type, ssm_scratch.out.data(),
                  attention_scratch.output.data(), hidden_size, ssm_inner_size,
                  arena.stream);
@@ -229,15 +260,35 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
 
       {
         // FFN Pre-RMSNorm
-        LaunchRMSNorm(decode_scratch.hidden.data(),
-                      static_cast<const float*>(layer.ffn_norm.data),
-                      decode_scratch.normed.data(), hidden_size, 1e-6F,
-                      arena.stream);
+        if (rotation.ffn_in != nullptr) {
+          LaunchRMSNormRotated(decode_scratch.hidden.data(),
+                               static_cast<const float*>(layer.ffn_norm.data),
+                               decode_scratch.normed.data(), hidden_size, 1e-6F,
+                               rotation.ffn_in, arena.stream);
+        } else {
+          LaunchRMSNorm(decode_scratch.hidden.data(),
+                        static_cast<const float*>(layer.ffn_norm.data),
+                        decode_scratch.normed.data(), hidden_size, 1e-6F,
+                        arena.stream);
+        }
       }
     }
 
     // Fused SwiGLU FFN
-    {
+    if (rotation.ffn_down_in != nullptr) {
+      // The module's two launches with the SwiGLU row rotated in between.
+      const std::size_t intermediate_size = config.intermediate_size;
+      LaunchFusedSwiGLUGEMV(layer.ffn_gate.data, layer.ffn_gate.type,
+                            layer.ffn_up.data, layer.ffn_up.type,
+                            decode_scratch.normed.data(),
+                            ffn_scratch.activation.data(), intermediate_size,
+                            hidden_size, arena.stream);
+      LaunchRotateRowsFp32(ffn_scratch.activation.data(), rotation.ffn_down_in,
+                           1, intermediate_size, arena.stream);
+      LaunchGEMV(layer.ffn_down.data, layer.ffn_down.type,
+                 ffn_scratch.activation.data(), ffn_scratch.out.data(),
+                 hidden_size, intermediate_size, arena.stream);
+    } else {
       // Non-fused FFN, routed through the module. Same fused SwiGLU kernel +
       // same down GEMV as the former inline calls; behavior identical. The
       // module reads the arena device spans (x = d_normed, act_scratch =
@@ -262,16 +313,10 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
   }
 
   if (compute_logits) {
-    // 3. Final Output Norm
-    LaunchRMSNorm(decode_scratch.hidden.data(),
-                  static_cast<const float*>(weights.output_norm.data),
-                  decode_scratch.normed.data(), hidden_size, 1e-6F,
-                  arena.stream);
-
-    // 4. LM Head Logits GEMV on final token
-    LaunchGEMV(weights.output.data, weights.output.type,
-               decode_scratch.normed.data(), decode_scratch.logits.data(),
-               vocab_size, hidden_size, arena.stream);
+    // 3-4. Final output norm and LM head GEMV
+    LaunchQwenOutputHead(weights, decode_scratch.hidden.data(),
+                         decode_scratch.normed.data(),
+                         decode_scratch.logits.data(), arena.stream);
 
     // 5. Parallel GPU Argmax
     LaunchBatchedGPUArgmax(decode_scratch.logits.data(), d_out_token, 1,

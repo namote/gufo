@@ -1,7 +1,9 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <stdexcept>
 
+#include "src/core/hip/detail/hadamard.hpp"
 #include "src/models/qwen/hip/kernels/prefill_quant_gemm.hpp"
+#include "src/models/qwen/hip/ops/hadamard.hpp"
 #include "src/models/qwen/hip/ops/prefill_fp16.hpp"
 namespace gufo::hip {
 namespace {
@@ -703,6 +705,80 @@ __global__ void HalfNorm5120(const float* __restrict__ x,
   }
 }
 
+// Rotated FP16 RMSNorm for a rotated attn_in/ffn_in group. The normed value
+// follows HalfNorm5120 (Dim == 5120) or HalfNorm (no residual) exactly; the
+// row is then staged in dynamic LDS, rotated and rounded to FP16 once.
+template<unsigned Dim>
+__global__ void HalfNormRotated(const float* __restrict__ x,
+                                const float* __restrict__ weight,
+                                __half* __restrict__ out, std::size_t dim,
+                                float eps,
+                                const std::uint32_t* __restrict__ signs) {
+  extern __shared__ float s_row[];
+  const unsigned row = blockIdx.x, tid = threadIdx.x;
+  const std::size_t base = std::size_t(row) * dim;
+  float sum_sq = 0;
+  if constexpr (Dim != 0) {
+#pragma unroll
+    for (unsigned j = 0; j < Dim / 256; ++j) {
+      const float v = x[base + j * 256 + tid];
+      sum_sq = __fmaf_rn(v, v, sum_sq);
+    }
+  } else {
+    for (std::size_t i = tid; i < dim; i += 256) {
+      const float v = x[base + i];
+      sum_sq += v * v;
+    }
+  }
+  __shared__ float sums[256];
+  sums[tid] = sum_sq;
+  __syncthreads();
+  for (unsigned stride = 128; stride; stride /= 2) {
+    if (tid < stride)
+      sums[tid] += sums[tid + stride];
+    __syncthreads();
+  }
+  const float inv = rsqrtf(sums[0] / static_cast<float>(dim) + eps);
+  for (std::size_t i = tid; i < dim; i += 256) {
+    s_row[i] = __fmul_rn(x[base + i] * inv, weight[i]);
+  }
+  __syncthreads();
+  hadamard::RotateRowSegments<32>(s_row, dim, signs, tid, 256);
+  __syncthreads();
+  for (std::size_t i = tid; i < dim; i += 256) {
+    out[base + i] = __float2half_rn(s_row[i]);
+  }
+}
+
+// SiLU(gate) * up in FP32, rotated per 128-element segment by one wave, then
+// rounded to FP16. Lane l owns elements 4l..4l+3 of its segment.
+__launch_bounds__(256) __global__
+    void SwiGLURotateFp16(const float* __restrict__ gate,
+                          const float* __restrict__ up, __half* __restrict__ out,
+                          std::size_t segments, std::size_t row_segments,
+                          const std::uint32_t* __restrict__ signs) {
+  const std::size_t segment = std::size_t(blockIdx.x) * 8 + threadIdx.x / 32;
+  if (segment >= segments) {
+    return;
+  }
+  const unsigned lane = threadIdx.x % 32;
+  const std::size_t first = segment * hadamard::kSegment + lane * 4;
+  float v[4];
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j) {
+    const float g = gate[first + j];
+    const float sig = 1.0F / (1.0F + expf(-g));
+    v[j] = __fmul_rn(g * sig, up[first + j]);
+  }
+  hadamard::RotateSegmentLanes<4>(
+      v, signs + (segment % row_segments) * hadamard::kSignWordsPerSegment,
+      lane);
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j) {
+    out[first + j] = __float2half_rn(v[j]);
+  }
+}
+
 __global__ void HalfCast(const float* x, __half* y, std::size_t n) {
   auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i < n)
@@ -720,6 +796,33 @@ void LaunchBatchedRMSNormFp16(const float* x, const float* residual,
   }
   HalfNorm<<<batch, 256, 0, stream>>>(x, residual, weight, sum_out,
                                       static_cast<__half*>(out), dim, eps);
+}
+void LaunchBatchedRMSNormRotatedFp16(const float* x, const float* weight,
+                                     void* out, std::size_t batch,
+                                     std::size_t dim, float eps,
+                                     const std::uint32_t* signs,
+                                     hipStream_t stream) {
+  const std::size_t lds = dim * sizeof(float);
+  if (dim == 5120) {
+    HalfNormRotated<5120><<<batch, 256, lds, stream>>>(
+        x, weight, static_cast<__half*>(out), dim, eps, signs);
+    return;
+  }
+  HalfNormRotated<0><<<batch, 256, lds, stream>>>(
+      x, weight, static_cast<__half*>(out), dim, eps, signs);
+}
+void LaunchBatchedSwiGLURotateFp16(const float* gate, const float* up,
+                                   void* out_fp16, std::size_t batch,
+                                   std::size_t k, const std::uint32_t* signs,
+                                   hipStream_t stream) {
+  const std::size_t row_segments = k / hadamard::kSegment;
+  const std::size_t segments = batch * row_segments;
+  if (segments == 0) {
+    return;
+  }
+  SwiGLURotateFp16<<<static_cast<unsigned>((segments + 7) / 8), 256, 0,
+                     stream>>>(gate, up, static_cast<__half*>(out_fp16),
+                               segments, row_segments, signs);
 }
 void LaunchFloatToFp16(const float* x, void* y, std::size_t n,
                        hipStream_t stream) {

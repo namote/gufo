@@ -13,7 +13,9 @@
 #include <cstdint>
 #include <stdexcept>
 
+#include "src/core/hip/detail/hadamard.hpp"
 #include "src/models/qwen/hip/detail/recurrent_state.hpp"
+#include "src/models/qwen/hip/ops/hadamard.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
 
@@ -330,10 +332,14 @@ namespace {
 // One wave per head retains the four independent reductions from the FP32
 // epilogue. Writing FP16 directly avoids materializing and rereading its FP32
 // output; the recurrence still computes and stores FP32.
-__global__ void BatchedSSMPostNormGateFp16Kernel(const float* raw,
-                                                 const float* weight,
-                                                 const float* gate, __half* out,
-                                                 std::size_t head_count) {
+//
+// With Rotate each gated 128-element head (one rotation segment) is rotated
+// in registers before the FP16 conversion.
+template<bool Rotate = false>
+__global__ void BatchedSSMPostNormGateFp16Kernel(
+    const float* raw, const float* weight, const float* gate, __half* out,
+    std::size_t head_count, std::size_t heads_per_row,
+    const std::uint32_t* __restrict__ signs) {
 #pragma clang fp reassociate(off) contract(off)
   const unsigned lane = threadIdx.x & 31U;
   const std::size_t head = std::size_t(blockIdx.x) * 8 + threadIdx.x / 32;
@@ -366,6 +372,7 @@ __global__ void BatchedSSMPostNormGateFp16Kernel(const float* raw,
              0);
   const float inv =
       rsqrtf(__fadd_rn(__fmul_rn(sum, 1.0F / kRowSplitDim), 1e-6F));
+  float results[4];
 #pragma unroll
   for (unsigned j = 0; j < 4; ++j) {
     const unsigned column = lane + j * 32;
@@ -377,7 +384,20 @@ __global__ void BatchedSSMPostNormGateFp16Kernel(const float* raw,
     }
     // Preserve the standalone FP32 producer's rounding before conversion.
     asm volatile("" : "+v"(result));
-    out[base + column] = __float2half_rn(result);
+    if constexpr (Rotate) {
+      results[j] = result;
+    } else {
+      out[base + column] = __float2half_rn(result);
+    }
+  }
+  if constexpr (Rotate) {
+    hadamard::RotateSegmentStrided<4>(
+        results,
+        signs + (head % heads_per_row) * hadamard::kSignWordsPerSegment, lane);
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) {
+      out[base + lane + j * 32] = __float2half_rn(results[j]);
+    }
   }
 }
 }  // namespace
@@ -390,7 +410,8 @@ void LaunchBatchedSSMConvRecurrenceRowSplit(
     float* alpha_beta, std::uint32_t layer_idx, std::size_t batch_size,
     std::size_t qkv_size, std::uint32_t num_key_heads, std::uint32_t num_heads,
     std::uint32_t key_dim, std::uint32_t val_dim, hipStream_t stream,
-    QwenRecurrentStateStorage state_storage, void* fp16_out) {
+    QwenRecurrentStateStorage state_storage, void* fp16_out,
+    const std::uint32_t* out_signs) {
   if (!IsDeltaNetRowSplitSupported(key_dim, val_dim)) {
     throw std::invalid_argument(
         "row-split Qwen recurrent state requires 128x128 matrices");
@@ -465,18 +486,31 @@ void LaunchBatchedSSMConvRecurrenceRowSplit(
 
   // Emit the activation consumed by ssm_out directly. Other callers retain the
   // FP32 in-place epilogue.
+  // With `out_signs` (a rotated ssm_out input, val_dim 128 == one rotation
+  // segment per head) every destination receives the rotated row.
   if (fp16_out != nullptr) {
-    BatchedSSMPostNormGateFp16Kernel<<<(ab_count + 7) / 8, 256, 0, stream>>>(
-        out_buf, ssm_norm, gate, static_cast<__half*>(fp16_out), ab_count);
+    if (out_signs != nullptr) {
+      BatchedSSMPostNormGateFp16Kernel<true>
+          <<<(ab_count + 7) / 8, 256, 0, stream>>>(
+              out_buf, ssm_norm, gate, static_cast<__half*>(fp16_out),
+              ab_count, num_heads, out_signs);
+    } else {
+      BatchedSSMPostNormGateFp16Kernel<<<(ab_count + 7) / 8, 256, 0, stream>>>(
+          out_buf, ssm_norm, gate, static_cast<__half*>(fp16_out), ab_count,
+          num_heads, nullptr);
+    }
   } else if (q8_out != nullptr) {
     LaunchBatchedFusedSSMPostNormGateQuantizeQ8_1(
         out_buf, ssm_norm, gate, q8_out, batch_size, inner_size, num_heads,
-        val_dim, stream);
+        val_dim, stream, out_signs);
   } else {
     const dim3 post_grid(num_heads, static_cast<unsigned int>(batch_size));
     BatchedSSMPostNormGateKernel<<<post_grid, 128, 0, stream>>>(
         out_buf, ssm_norm, gate, out_buf, batch_size, inner_size, num_heads,
         val_dim);
+    if (out_signs != nullptr) {
+      LaunchRotateRowsFp32(out_buf, out_signs, batch_size, inner_size, stream);
+    }
   }
 }
 

@@ -94,7 +94,8 @@ public:
                models::QwenModelWeights weights,
                std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
                std::vector<QwenGpuWeightRegion> weight_regions,
-               std::shared_ptr<models::qwen::vision::Encoder> vision = {});
+               std::shared_ptr<models::qwen::vision::Encoder> vision = {},
+               void* rotation_signs = nullptr);
   ~QwenGpuModel();
 
   QwenGpuModel(const QwenGpuModel&) = delete;
@@ -134,6 +135,8 @@ private:
   std::shared_ptr<const tokenization::QwenTokenizer> tokenizer_;
   std::vector<QwenGpuWeightRegion> weight_regions_;
   std::shared_ptr<models::qwen::vision::Encoder> vision_;
+  // Device copy of the packed rotation signs the weight layers point at.
+  void* rotation_signs_{nullptr};
 };
 
 class QwenGpuSnapshot final {

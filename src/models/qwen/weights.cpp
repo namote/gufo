@@ -1,9 +1,13 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "src/core/quant/rotation.hpp"
 #include "src/models/qwen/state.hpp"
 
 namespace gufo::models {
@@ -133,6 +137,119 @@ bool ValidateTensor(const QwenTensorRef& tensor, std::size_t expected_elements,
     }
     return false;
   }
+  return true;
+}
+
+// First of `names` present in the file, or empty. Mirrors the alias order of
+// the tensor binding below.
+std::string PresentName(const core::GgufReader& reader,
+                        std::initializer_list<std::string_view> names) {
+  for (const auto name : names) {
+    if (reader.FindTensor(name) != nullptr) {
+      return std::string(name);
+    }
+  }
+  return {};
+}
+
+// Qwen 27B input groups (plan/rotated-quant/PLAN.md, "27B 입력 그룹"); the
+// converter's tools/qwen27b/rotquant_groups.py defines the same groups. Only
+// layers of the main stack are listed, so a `.rot` on an embedded MTP (nextn)
+// layer is refused and never counts toward "rotated in some layers only".
+gufo::quant::rotation::GroupTable BuildRotationGroups(
+    const core::GgufReader& reader, const QwenModelWeights& weights) {
+  gufo::quant::rotation::GroupTable table;
+  const auto add = [&](std::string group, std::string key,
+                       std::vector<std::string> names) {
+    std::erase(names, std::string{});
+    table.instances.push_back(
+        {std::move(group), std::move(key), std::move(names)});
+  };
+  for (std::uint32_t i = 0; i < weights.config.num_layers; ++i) {
+    const std::string p = "blk." + std::to_string(i) + ".";
+    const std::string l = ":" + std::to_string(i);
+    const auto name = [&](std::initializer_list<std::string_view> suffixes) {
+      std::vector<std::string> full;
+      for (const auto suffix : suffixes) {
+        full.push_back(p + std::string(suffix));
+      }
+      for (const auto& candidate : full) {
+        if (reader.FindTensor(candidate) != nullptr) {
+          return candidate;
+        }
+      }
+      return std::string{};
+    };
+    if (weights.layers[i].is_full_attention) {
+      add("attn_in", "attn_in" + l,
+          {name({"attn_q.weight", "wq.weight"}),
+           name({"attn_k.weight", "wk.weight"}),
+           name({"attn_v.weight", "wv.weight"})});
+      add("attn_out_in", "attn_out_in" + l,
+          {name({"attn_output.weight", "attn_out.weight", "wo.weight"})});
+    } else {
+      add("attn_in", "attn_in" + l,
+          {name({"attn_qkv.weight", "wqkv.weight"}),
+           name({"attn_gate.weight", "wqkv_gate.weight"}),
+           name({"ssm_alpha.weight"}), name({"ssm_beta.weight"})});
+      add("ssm_out_in", "ssm_out_in" + l, {name({"ssm_out.weight"})});
+    }
+    add("ffn_in", "ffn_in" + l,
+        {name({"ffn_gate.weight"}), name({"ffn_up.weight"})});
+    add("ffn_down_in", "ffn_down_in" + l, {name({"ffn_down.weight"})});
+  }
+  const std::string head = PresentName(reader, {"output.weight"});
+  if (head.empty()) {
+    // The head falls back to the token embedding.
+    table.tied_tensors.emplace_back("token_embd.weight");
+  } else {
+    add("head_in", "head_in", {head});
+  }
+  return table;
+}
+
+// Reads the rotation markers and binds each rotated group's packed signs.
+bool BindRotation(const core::GgufReader& reader, QwenModelWeights& weights,
+                  std::string* error_msg) {
+  const auto info = gufo::quant::rotation::ReadRotation(
+      reader, BuildRotationGroups(reader, weights), error_msg);
+  if (!info.has_value()) {
+    return false;
+  }
+  if (!info->Any()) {
+    return true;
+  }
+  auto storage = std::make_shared<std::vector<std::uint32_t>>();
+  std::size_t words = 0;
+  for (const auto& instance : info->instances) {
+    words += instance.bits.size();
+  }
+  storage->reserve(words);
+  std::vector<std::pair<std::string_view, std::size_t>> offsets;
+  for (const auto& instance : info->instances) {
+    offsets.emplace_back(instance.key, storage->size());
+    storage->insert(storage->end(), instance.bits.begin(), instance.bits.end());
+  }
+  const auto signs = [&](const std::string& key) -> const std::uint32_t* {
+    for (const auto& [name, offset] : offsets) {
+      if (name == key) {
+        return storage->data() + offset;
+      }
+    }
+    return nullptr;
+  };
+  for (std::uint32_t i = 0; i < weights.config.num_layers; ++i) {
+    const std::string l = ":" + std::to_string(i);
+    auto& rotation = weights.layers[i].rotation;
+    rotation.attn_in = signs("attn_in" + l);
+    rotation.ssm_out_in = signs("ssm_out_in" + l);
+    rotation.attn_out_in = signs("attn_out_in" + l);
+    rotation.ffn_in = signs("ffn_in" + l);
+    rotation.ffn_down_in = signs("ffn_down_in" + l);
+  }
+  weights.head_in_rotation = signs("head_in");
+  weights.rotation_signs = std::move(storage);
+  weights.rotated_groups = info->GroupList();
   return true;
 }
 
@@ -337,6 +454,9 @@ std::optional<QwenModelWeights> QwenModelWeights::LoadFromGguf(
     }
   }
 
+  if (!BindRotation(reader, weights, error_msg)) {
+    return std::nullopt;
+  }
   return weights;
 }
 

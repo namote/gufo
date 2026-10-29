@@ -34,6 +34,17 @@ std::unique_ptr<QwenGenerator> QwenGenerator::CreateFromGguf(
   if (!weights_opt.has_value()) {
     return nullptr;
   }
+  if (weights_opt->IsRotated()) {
+    // The CPU forward has no input-rotation path; refuse instead of
+    // computing W'·x with unrotated activations.
+    if (error_msg != nullptr) {
+      *error_msg =
+          "Rotated GGUF refused: the Qwen CPU backend (--cpu) does not "
+          "support rotated input groups (" +
+          weights_opt->rotated_groups + ")";
+    }
+    return nullptr;
+  }
 
   auto tokenizer =
       tokenization::QwenTokenizer::CreateFromGguf(reader, error_msg);

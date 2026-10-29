@@ -82,6 +82,13 @@ std::optional<QwenMtpWeights> QwenMtpWeights::LoadFromGguf(
     return std::nullopt;
   }
 
+  if (reader.FindTensor("output.weight.rot") != nullptr) {
+    if (error_msg != nullptr) {
+      *error_msg = kMtpRotatedHeadError;
+    }
+    return std::nullopt;
+  }
+
   QwenMtpWeights weights;
   weights.config = *config;
   const std::size_t hidden = weights.config.hidden_size;
@@ -195,6 +202,12 @@ std::unique_ptr<QwenMtpReference> QwenMtpReference::CreateWithTiedWeights(
   auto tied_weights =
       models::QwenModelWeights::LoadFromGguf(*tied_reader, error_msg);
   if (!weights.has_value() || !tied_weights.has_value()) {
+    return nullptr;
+  }
+  if (tied_weights->head_in_rotation != nullptr) {
+    if (error_msg != nullptr) {
+      *error_msg = kMtpRotatedHeadError;
+    }
     return nullptr;
   }
   if (weights->config.hidden_size != tied_weights->config.hidden_size ||

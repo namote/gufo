@@ -5,6 +5,7 @@
 // family they use.
 #include "src/models/qwen/hip/ops/attention.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
+#include "src/models/qwen/hip/ops/hadamard.hpp"
 #include "src/models/qwen/hip/ops/norm_residual.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
 #include "src/models/qwen/hip/ops/swiglu.hpp"

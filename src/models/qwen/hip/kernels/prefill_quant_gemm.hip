@@ -1,6 +1,11 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include "src/models/qwen/hip/kernels/prefill_quant_gemm.hpp"
 
+#include <stdexcept>
+
+#include "src/core/hip/detail/hadamard.hpp"
+#include "src/models/qwen/hip/ops/hadamard.hpp"
+
 namespace gufo::hip {
 
 template<bool StoreActivationSum, typename T>
@@ -54,12 +59,15 @@ __global__ void QuantizeActivationToQ8_1Kernel(const T* __restrict__ x,
 // changes, from BF16 to the FP32 value it was rounded from, which strictly
 // narrows the quantization error -- the same trade `opt-c164-swiglu-quant` and
 // `opt-c172-fp32-quant` made.
-template<bool StoreActivationSum>
+//
+// With Rotate the staged normed row is rotated in LDS (x' = H·D·x per
+// 128-element segment) before the unchanged quantization loop.
+template<bool StoreActivationSum, bool Rotate = false>
 __global__ void BatchedFusedRMSNormQuantizeQ8_1Kernel(
     const float* __restrict__ x, const float* __restrict__ residual,
     const float* __restrict__ weight, float* __restrict__ sum_out,
     void* __restrict__ q8_out, std::size_t batch_size, std::size_t dim,
-    float eps) {
+    float eps, const std::uint32_t* __restrict__ signs) {
   extern __shared__ float s_row[];
   const std::size_t b = blockIdx.x;
   if (b >= batch_size) {
@@ -105,6 +113,12 @@ __global__ void BatchedFusedRMSNormQuantizeQ8_1Kernel(
     s_row[i] = (s_row[i] * inv_rms) * w;
   }
   __syncthreads();
+  if constexpr (Rotate) {
+    hadamard::RotateRowSegments<32>(s_row, dim, signs,
+                                    static_cast<unsigned>(tid),
+                                    static_cast<unsigned>(block_size));
+    __syncthreads();
+  }
 
   // One wave per 32-element quantization block, matching
   // QuantizeActivationToQ8_1Kernel's per-block scale and rounding exactly.
@@ -140,12 +154,15 @@ __global__ void BatchedFusedRMSNormQuantizeQ8_1Kernel(
 // so every gated value is bit-identical to that kernel; only the quantization
 // input changes from a re-read FP32 store to the register it came from, which
 // is the same value.
-template<bool StoreActivationSum>
+//
+// With Rotate (val_dim == 128, so a head is one rotation segment) the gated
+// head is rotated in LDS before the unchanged quantization.
+template<bool StoreActivationSum, bool Rotate = false>
 __global__ void BatchedFusedSSMPostNormGateQuantizeQ8_1Kernel(
     const float* __restrict__ raw_out, const float* __restrict__ ssm_norm,
     const float* __restrict__ gate, void* __restrict__ q8_out,
     std::size_t batch_size, std::size_t inner_size, std::uint32_t num_heads,
-    std::uint32_t val_dim) {
+    std::uint32_t val_dim, const std::uint32_t* __restrict__ signs) {
   const std::size_t h = blockIdx.x;
   const std::size_t t = blockIdx.y;
   if (h >= num_heads || t >= batch_size) {
@@ -189,6 +206,17 @@ __global__ void BatchedFusedSSMPostNormGateQuantizeQ8_1Kernel(
     const float g = (gate + (t * inner_size))[(h * val_dim) + tid];
     const float sig = 1.0F / (1.0F + expf(-g));
     val *= (g * sig);
+  }
+  if constexpr (Rotate) {
+    // Every thread is live: val_dim == blockDim.x == 128.
+    __shared__ float s_head[hadamard::kSegment];
+    s_head[tid] = val;
+    __syncthreads();
+    hadamard::RotateRowSegments<32>(
+        s_head, hadamard::kSegment, signs + (h * val_dim) / 32,
+        static_cast<unsigned>(tid), hadamard::kSegment);
+    __syncthreads();
+    val = s_head[tid];
   }
 
   // Each wave of the block owns one whole 32-element quantization block.
@@ -267,6 +295,65 @@ __global__ void BatchedFusedSwiGLUQuantizeQ8_1Kernel(
 
   StoreQ8ActLane<StoreActivationSum>(y, batch, num_blocks, tok, blk, lane_id, d,
                                      q);
+}
+
+// SwiGLU, rotation and tiled Q8_1 quantization for a rotated ffn_down input.
+// One wave owns one 128-element segment: lane l computes SwiGLU for elements
+// 4l..4l+3 with BatchedFusedSwiGLUQuantizeQ8_1Kernel's arithmetic, the wave
+// rotates the segment, stages it in LDS and then quantizes its four
+// 32-element blocks with the unrotated kernel's per-block code.
+template<bool StoreActivationSum>
+__launch_bounds__(256) __global__ void BatchedFusedSwiGLURotateQuantizeQ8_1Kernel(
+    const float* __restrict__ gate, const float* __restrict__ up,
+    void* __restrict__ y, std::size_t batch, std::size_t k,
+    const std::uint32_t* __restrict__ signs) {
+  __shared__ float s_segment[8][hadamard::kSegment];
+  const std::size_t row_segments = k / hadamard::kSegment;
+  const std::size_t wave = threadIdx.x >> 5u;
+  const std::size_t segment = (blockIdx.x * (blockDim.x >> 5u)) + wave;
+  const std::size_t lane_id = threadIdx.x & 31u;
+  // Waves past the end stay for the barrier below.
+  const bool active = segment < batch * row_segments;
+  const std::size_t tok = segment / row_segments;
+  const std::size_t seg = segment % row_segments;
+  const std::size_t base = (tok * k) + (seg * hadamard::kSegment);
+  float* staged = s_segment[wave];
+  if (active) {
+    float v[4];
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) {
+      const std::size_t elem_idx = base + (lane_id * 4) + j;
+      const float g = gate[elem_idx];
+      const float u = up[elem_idx];
+      const float silu_g = g / (1.0F + expf(-g));
+      v[j] = silu_g * u;
+    }
+    hadamard::RotateSegmentLanes<4>(
+        v, signs + seg * hadamard::kSignWordsPerSegment,
+        static_cast<unsigned>(lane_id));
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) {
+      staged[(lane_id * 4) + j] = v[j];
+    }
+  }
+  __syncthreads();
+  if (!active) {
+    return;
+  }
+  const std::size_t num_blocks = k / 32;
+#pragma unroll
+  for (unsigned b = 0; b < 4; ++b) {
+    const float val = staged[(b * 32) + lane_id];
+    float max_abs = fabsf(val);
+    for (int off = 16; off > 0; off >>= 1) {
+      max_abs = fmaxf(max_abs, __shfl_xor(max_abs, off));
+    }
+    const float d = max_abs / 127.0F;
+    const float id = (d != 0.0F) ? (1.0F / d) : 0.0F;
+    const int8_t q = static_cast<int8_t>(roundf(val * id));
+    StoreQ8ActLane<StoreActivationSum>(y, batch, num_blocks, tok,
+                                       (seg * 4) + b, lane_id, d, q);
+  }
 }
 
 // opt-c192-swiglu-epilogue: SwiGLU + tiled Q8_1 quantization straight out of a
@@ -976,14 +1063,27 @@ bool IsFusedSSMEpilogueQuantizeQ8_1Supported(std::uint32_t val_dim,
 void LaunchBatchedFusedSSMPostNormGateQuantizeQ8_1(
     const float* raw_out, const float* ssm_norm, const float* gate,
     void* q8_1_out, std::size_t batch_size, std::size_t inner_size,
-    std::uint32_t num_heads, std::uint32_t val_dim, hipStream_t stream) {
+    std::uint32_t num_heads, std::uint32_t val_dim, hipStream_t stream,
+    const std::uint32_t* signs) {
   if (batch_size == 0 || num_heads == 0 || val_dim == 0) {
     return;
   }
   const dim3 grid(num_heads, static_cast<unsigned int>(batch_size));
-  BatchedFusedSSMPostNormGateQuantizeQ8_1Kernel<true>
-      <<<grid, 128, 0, stream>>>(raw_out, ssm_norm, gate, q8_1_out, batch_size,
-                                 inner_size, num_heads, val_dim);
+  if (signs != nullptr) {
+    if (val_dim != hadamard::kSegment) {
+      throw std::invalid_argument(
+          "rotated SSM epilogue requires a 128-element value head");
+    }
+    BatchedFusedSSMPostNormGateQuantizeQ8_1Kernel<true, true>
+        <<<grid, 128, 0, stream>>>(raw_out, ssm_norm, gate, q8_1_out,
+                                   batch_size, inner_size, num_heads, val_dim,
+                                   signs);
+  } else {
+    BatchedFusedSSMPostNormGateQuantizeQ8_1Kernel<true>
+        <<<grid, 128, 0, stream>>>(raw_out, ssm_norm, gate, q8_1_out,
+                                   batch_size, inner_size, num_heads, val_dim,
+                                   nullptr);
+  }
   LaunchZeroQ8ActTail<true>(q8_1_out, batch_size, inner_size, stream);
 }
 
@@ -1004,7 +1104,22 @@ void LaunchBatchedFusedRMSNormQuantizeQ8_1(
   const unsigned int lds_bytes = static_cast<unsigned int>(dim * sizeof(float));
   BatchedFusedRMSNormQuantizeQ8_1Kernel<true>
       <<<static_cast<unsigned int>(batch_size), 256, lds_bytes, stream>>>(
-          x, residual, weight, sum_out, q8_1_out, batch_size, dim, eps);
+          x, residual, weight, sum_out, q8_1_out, batch_size, dim, eps,
+          nullptr);
+  LaunchZeroQ8ActTail<true>(q8_1_out, batch_size, dim, stream);
+}
+
+void LaunchBatchedFusedRMSNormRotateQuantizeQ8_1(
+    const float* x, const float* residual, const float* weight, float* sum_out,
+    void* q8_1_out, std::size_t batch_size, std::size_t dim, float eps,
+    const std::uint32_t* signs, hipStream_t stream) {
+  if (batch_size == 0 || dim == 0) {
+    return;
+  }
+  const unsigned int lds_bytes = static_cast<unsigned int>(dim * sizeof(float));
+  BatchedFusedRMSNormQuantizeQ8_1Kernel<true, true>
+      <<<static_cast<unsigned int>(batch_size), 256, lds_bytes, stream>>>(
+          x, residual, weight, sum_out, q8_1_out, batch_size, dim, eps, signs);
   LaunchZeroQ8ActTail<true>(q8_1_out, batch_size, dim, stream);
 }
 
@@ -1041,6 +1156,22 @@ void LaunchBatchedFusedSwiGLUQuantizeQ8_1(const float* gate, const float* up,
   BatchedFusedSwiGLUQuantizeQ8_1Kernel<true>
       <<<static_cast<unsigned int>(quant_grid), quant_threads, 0, stream>>>(
           gate, up, q8_1_out, batch, k);
+  LaunchZeroQ8ActTail<true>(q8_1_out, batch, k, stream);
+}
+
+void LaunchBatchedFusedSwiGLURotateQuantizeQ8_1(
+    const float* gate, const float* up, void* q8_1_out, std::size_t batch,
+    std::size_t k, const std::uint32_t* signs, hipStream_t stream) {
+  if (batch == 0 || k == 0) {
+    return;
+  }
+  const std::size_t segments = batch * (k / hadamard::kSegment);
+  constexpr unsigned int quant_threads = 256;
+  constexpr unsigned int waves_per_tb = quant_threads / 32;
+  BatchedFusedSwiGLURotateQuantizeQ8_1Kernel<true>
+      <<<static_cast<unsigned int>((segments + waves_per_tb - 1) /
+                                   waves_per_tb),
+         quant_threads, 0, stream>>>(gate, up, q8_1_out, batch, k, signs);
   LaunchZeroQ8ActTail<true>(q8_1_out, batch, k, stream);
 }
 

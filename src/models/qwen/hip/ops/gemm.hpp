@@ -224,12 +224,13 @@ void LaunchQuantizeActivationQ8_1(const void* bf16_x, void* q8_1_out,
 /// SSM per-head post-RMSNorm + SiLU gate writing the tiled Q8_1 activation
 /// directly (opt-c174-ssm-epilogue-quant). Use when `ssm_out` is Q8_0, so the
 /// FP32 gated row has no other consumer. Bit-identical to
-/// BatchedSSMPostNormGateKernel followed by an FP32 quantize.
+/// BatchedSSMPostNormGateKernel followed by an FP32 quantize. Non-null `signs`
+/// (val_dim 128) rotates each gated head before quantization.
 void LaunchBatchedFusedSSMPostNormGateQuantizeQ8_1(
     const float* raw_out, const float* ssm_norm, const float* gate,
     void* q8_1_out, std::size_t batch_size, std::size_t inner_size,
     std::uint32_t num_heads, std::uint32_t val_dim,
-    hipStream_t stream = nullptr);
+    hipStream_t stream = nullptr, const std::uint32_t* signs = nullptr);
 
 /// True when the fused RMSNorm + Q8_1 quantize kernel can take this row length.
 [[nodiscard]] bool IsFusedRMSNormQuantizeQ8_1Supported(

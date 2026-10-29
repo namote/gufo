@@ -9,7 +9,9 @@
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops.hpp"
+#include "src/models/qwen/hip/ops/hadamard.hpp"
 #include "src/models/qwen/hip/ops/prefill_fp16.hpp"
+#include "src/models/qwen/hip/output_head.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -194,6 +196,9 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
   for (std::uint32_t l = 0; l < config.num_layers; ++l) {
     PrefillLayerCheckpoint(l);
     const auto& layer = weights_.layers[l];
+    // Rotated input groups (null when unrotated). Every producer below
+    // writes the rotated row in each format its consumers read.
+    const auto& rotation = layer.rotation;
     // Cache updates retain every row. The final layer's query/FFN outputs
     // only feed the last token unless this layer is explicitly captured.
     // Keep its original 256-token GEMM tile, including the original tail mask
@@ -247,15 +252,36 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
 
     // Pre-layer RMSNorm (generates BF16 into d_scratch_bf16 directly)
     if (half_prefill) {
-      LaunchBatchedRMSNormFp16(arena_.d_hidden, nullptr,
-                               static_cast<const float*>(layer.attn_norm.data),
-                               nullptr, arena_.d_scratch_bf16, batch_size,
-                               hidden_size, eps, arena_.stream);
+      if (rotation.attn_in != nullptr) {
+        LaunchBatchedRMSNormRotatedFp16(
+            arena_.d_hidden, static_cast<const float*>(layer.attn_norm.data),
+            arena_.d_scratch_bf16, batch_size, hidden_size, eps,
+            rotation.attn_in, arena_.stream);
+      } else {
+        LaunchBatchedRMSNormFp16(
+            arena_.d_hidden, nullptr,
+            static_cast<const float*>(layer.attn_norm.data), nullptr,
+            arena_.d_scratch_bf16, batch_size, hidden_size, eps, arena_.stream);
+      }
     } else if (norm_feeds_q8_only) {
-      LaunchBatchedFusedRMSNormQuantizeQ8_1(
-          arena_.d_hidden, /*residual=*/nullptr,
-          static_cast<const float*>(layer.attn_norm.data), /*sum_out=*/nullptr,
-          arena_.d_scratch_q8_act, batch_size, hidden_size, eps, arena_.stream);
+      if (rotation.attn_in != nullptr) {
+        LaunchBatchedFusedRMSNormRotateQuantizeQ8_1(
+            arena_.d_hidden, /*residual=*/nullptr,
+            static_cast<const float*>(layer.attn_norm.data),
+            /*sum_out=*/nullptr, arena_.d_scratch_q8_act, batch_size,
+            hidden_size, eps, rotation.attn_in, arena_.stream);
+      } else {
+        LaunchBatchedFusedRMSNormQuantizeQ8_1(
+            arena_.d_hidden, /*residual=*/nullptr,
+            static_cast<const float*>(layer.attn_norm.data),
+            /*sum_out=*/nullptr, arena_.d_scratch_q8_act, batch_size,
+            hidden_size, eps, arena_.stream);
+      }
+    } else if (rotation.attn_in != nullptr) {
+      LaunchBatchedRMSNormRotated(
+          arena_.d_hidden, static_cast<const float*>(layer.attn_norm.data),
+          arena_.d_normed, arena_.d_scratch_bf16, batch_size, hidden_size, eps,
+          rotation.attn_in, arena_.stream);
     } else {
       LaunchBatchedRMSNorm(arena_.d_hidden,
                            static_cast<const float*>(layer.attn_norm.data),
@@ -429,6 +455,14 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
         }
       }
 
+      // A rotated attn_output input: rotate the FP32 attention rows in place;
+      // every conversion below then encodes the rotated row.
+      if (rotation.attn_out_in != nullptr) {
+        LaunchRotateRowsFp32(
+            arena_.d_ssm_out + output_first_row * attention_size,
+            rotation.attn_out_in, output_rows, attention_size, arena_.stream);
+      }
+
       // opt-c172-fp32-quant: the Q8_0 route reads only the quantized
       // activation, so the BF16 staging buffer is dead. Quantizing straight
       // from FP32 drops one launch and one round trip (about 75 MB per layer
@@ -508,7 +542,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
             config.ssm_group_count, config.ssm_time_step_rank,
             config.ssm_state_size, config.SsmValueSize(), arena_.stream,
             arena_.GetRecurrentStateStorage(),
-            half_prefill ? arena_.d_scratch_bf16 : nullptr);
+            half_prefill ? arena_.d_scratch_bf16 : nullptr,
+            rotation.ssm_out_in);
       } else {
         LaunchBatchedSSMConvRecurrence(
             arena_.d_ssm_qkv, static_cast<const float*>(layer.ssm_conv1d.data),
@@ -520,6 +555,10 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
             config.ssm_group_count, config.ssm_time_step_rank,
             config.ssm_state_size, config.SsmValueSize(), arena_.stream,
             arena_.GetRecurrentStateStorage());
+        if (rotation.ssm_out_in != nullptr) {
+          LaunchRotateRowsFp32(arena_.d_ssm_out, rotation.ssm_out_in,
+                               batch_size, ssm_inner_size, arena_.stream);
+        }
       }
 
       if (half_prefill) {
@@ -553,28 +592,51 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
     }
 
     if (half_prefill) {
-      LaunchBatchedRMSNormFp16(output_hidden, nullptr,
-                               static_cast<const float*>(layer.ffn_norm.data),
-                               nullptr, arena_.d_scratch_bf16, output_rows,
-                               hidden_size, eps, arena_.stream);
+      if (rotation.ffn_in != nullptr) {
+        LaunchBatchedRMSNormRotatedFp16(
+            output_hidden, static_cast<const float*>(layer.ffn_norm.data),
+            arena_.d_scratch_bf16, output_rows, hidden_size, eps,
+            rotation.ffn_in, arena_.stream);
+      } else {
+        LaunchBatchedRMSNormFp16(output_hidden, nullptr,
+                                 static_cast<const float*>(layer.ffn_norm.data),
+                                 nullptr, arena_.d_scratch_bf16, output_rows,
+                                 hidden_size, eps, arena_.stream);
+      }
     } else if (ffn_feeds_q8_only) {
       // The post-attention residual add folds into the norm: one pass reads the
       // hidden state and the attention output, writes the updated hidden state
       // for the next residual link, and emits the Q8_1 activation.
-      LaunchBatchedFusedRMSNormQuantizeQ8_1(
-          arena_.d_hidden, arena_.d_attn_out,
-          static_cast<const float*>(layer.ffn_norm.data), arena_.d_hidden,
-          arena_.d_scratch_q8_act, batch_size, hidden_size, eps, arena_.stream);
+      if (rotation.ffn_in != nullptr) {
+        LaunchBatchedFusedRMSNormRotateQuantizeQ8_1(
+            arena_.d_hidden, arena_.d_attn_out,
+            static_cast<const float*>(layer.ffn_norm.data), arena_.d_hidden,
+            arena_.d_scratch_q8_act, batch_size, hidden_size, eps,
+            rotation.ffn_in, arena_.stream);
+      } else {
+        LaunchBatchedFusedRMSNormQuantizeQ8_1(
+            arena_.d_hidden, arena_.d_attn_out,
+            static_cast<const float*>(layer.ffn_norm.data), arena_.d_hidden,
+            arena_.d_scratch_q8_act, batch_size, hidden_size, eps,
+            arena_.stream);
+      }
     } else {
       LaunchBatchedResidualAdd(arena_.d_hidden, arena_.d_attn_out,
                                arena_.d_hidden, batch_size, hidden_size,
                                arena_.stream);
 
       // FFN RMSNorm (generates BF16 into d_scratch_bf16 directly)
-      LaunchBatchedRMSNorm(arena_.d_hidden,
-                           static_cast<const float*>(layer.ffn_norm.data),
-                           arena_.d_normed, arena_.d_scratch_bf16, batch_size,
-                           hidden_size, eps, arena_.stream);
+      if (rotation.ffn_in != nullptr) {
+        LaunchBatchedRMSNormRotated(
+            arena_.d_hidden, static_cast<const float*>(layer.ffn_norm.data),
+            arena_.d_normed, arena_.d_scratch_bf16, batch_size, hidden_size,
+            eps, rotation.ffn_in, arena_.stream);
+      } else {
+        LaunchBatchedRMSNorm(arena_.d_hidden,
+                             static_cast<const float*>(layer.ffn_norm.data),
+                             arena_.d_normed, arena_.d_scratch_bf16, batch_size,
+                             hidden_size, eps, arena_.stream);
+      }
     }
 
     // Which buffer holds the Q8_1 form of the SwiGLU output ffn_down consumes.
@@ -596,14 +658,33 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       // is where the Q8_1 result goes -- reusing it keeps resident memory flat
       // and avoids writing the [batch, k] activation the same kernel is
       // reading.
+      // A rotated ffn_down input needs the whole SwiGLU row, which these
+      // GEMM epilogues never hold, so rotated layers keep SwiGLU separate.
+      const bool rotate_ffn_down = rotation.ffn_down_in != nullptr;
       const bool fused_dual_swiglu =
-          reads_q8_act(layer.ffn_gate) && reads_q8_act(layer.ffn_up) &&
+          !rotate_ffn_down && reads_q8_act(layer.ffn_gate) &&
+          reads_q8_act(layer.ffn_up) &&
           layer.ffn_gate.type == layer.ffn_up.type &&
           reads_q8_act(layer.ffn_down) &&
           IsFusedSwiGluGemmEpilogueSupported(
               layer.ffn_gate.type, batch_size, intermediate_size,
               batch_size * intermediate_size * sizeof(float));
-      if (half_prefill) {
+      if (half_prefill && rotate_ffn_down) {
+        LaunchBatchedQuantGEMMFp16(layer.ffn_gate.type, layer.ffn_gate.data,
+                                   arena_.d_scratch_bf16, arena_.d_ffn_gate,
+                                   output_rows, intermediate_size, hidden_size,
+                                   arena_.stream);
+        LaunchBatchedQuantGEMMFp16(layer.ffn_up.type, layer.ffn_up.data,
+                                   arena_.d_scratch_bf16, arena_.d_ffn_up,
+                                   output_rows, intermediate_size, hidden_size,
+                                   arena_.stream);
+        // The FFN input in d_scratch_bf16 is dead after the up projection.
+        LaunchBatchedSwiGLURotateFp16(arena_.d_ffn_gate, arena_.d_ffn_up,
+                                      arena_.d_scratch_bf16, output_rows,
+                                      intermediate_size, rotation.ffn_down_in,
+                                      arena_.stream);
+        ffn_down_input = arena_.d_scratch_bf16;
+      } else if (half_prefill) {
         const bool paired = TryLaunchBatchedDualQuantGEMMSwiGLUFp16(
             layer.ffn_gate.type, layer.ffn_up.type, layer.ffn_gate.data,
             layer.ffn_up.data, arena_.d_scratch_bf16, arena_.d_ffn_up,
@@ -648,11 +729,29 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       // ffn_down formats still need the FP32/BF16 forms, so they keep the
       // unfused chain.
       if (half_prefill || fused_dual_swiglu) {
-        // The up projection's epilogue already wrote the quantized activation.
+        // The up projection's epilogue (or the rotated half SwiGLU above)
+        // already wrote the activation.
+      } else if (reads_q8_act(layer.ffn_down) && rotate_ffn_down) {
+        LaunchBatchedFusedSwiGLURotateQuantizeQ8_1(
+            arena_.d_ffn_gate, arena_.d_ffn_up, arena_.d_scratch_q8_act,
+            batch_size, intermediate_size, rotation.ffn_down_in, arena_.stream);
       } else if (reads_q8_act(layer.ffn_down)) {
         LaunchBatchedFusedSwiGLUQuantizeQ8_1(
             arena_.d_ffn_gate, arena_.d_ffn_up, arena_.d_scratch_q8_act,
             batch_size, intermediate_size, arena_.stream);
+      } else if (rotate_ffn_down) {
+        // FP32 SwiGLU, rotated in place, then the same BF16 and Q8_1 forms
+        // the unrotated branch below writes.
+        LaunchBatchedSwiGLUActivation(
+            arena_.d_ffn_gate, arena_.d_ffn_up, arena_.d_ffn_act, nullptr,
+            batch_size * intermediate_size, arena_.stream);
+        LaunchRotateRowsFp32(arena_.d_ffn_act, rotation.ffn_down_in, batch_size,
+                             intermediate_size, arena_.stream);
+        LaunchFloatToBfloat16(arena_.d_ffn_act, arena_.d_scratch_bf16,
+                              batch_size * intermediate_size, arena_.stream);
+        LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
+                                     arena_.d_scratch_q8_act, batch_size,
+                                     intermediate_size, arena_.stream);
       } else {
         LaunchBatchedSwiGLUActivation(arena_.d_ffn_gate, arena_.d_ffn_up,
                                       arena_.d_ffn_act, arena_.d_scratch_bf16,
@@ -716,17 +815,11 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
     return 0;
   }
 
-  // 4. Output Norm for final token
+  // 4-5. Output norm and LM head on the final token
   const float* final_hidden =
       scratch.decode.hidden.data() + ((batch_size - 1) * hidden_size);
-  LaunchRMSNorm(final_hidden,
-                static_cast<const float*>(weights_.output_norm.data),
-                scratch.decode.normed.data(), hidden_size, eps, arena_.stream);
-
-  // 5. LM Head Logits GEMV on final token
-  LaunchGEMV(weights_.output.data, weights_.output.type,
-             scratch.decode.normed.data(), scratch.decode.logits.data(),
-             vocab_size, hidden_size, arena_.stream);
+  LaunchQwenOutputHead(weights_, final_hidden, scratch.decode.normed.data(),
+                       scratch.decode.logits.data(), arena_.stream);
 
   // 6. GPU Argmax. The sampled-token view enters its documented alias epoch
   // only after all SSM layer uses of alpha have completed.

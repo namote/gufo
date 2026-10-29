@@ -7,6 +7,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
@@ -15,6 +16,12 @@
 #include "src/models/qwen/tokenizer.hpp"
 
 namespace gufo::speculative {
+
+/// MTP drafting reads the target output head with its own hidden state and
+/// has no head_in rotation path (src/core/quant/rotation.hpp).
+inline constexpr std::string_view kMtpRotatedHeadError =
+    "Rotated GGUF refused: MTP drafting does not support a rotated output "
+    "head (head_in); use --speculative dflash2 or off";
 
 struct QwenMtpWeights {
   core::ModelConfig config;

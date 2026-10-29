@@ -5,15 +5,21 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "src/core/hip/detail/hadamard.hpp"
+#include "src/models/qwen/hip/ops/hadamard.hpp"
 #include "src/models/qwen/hip/ops/norm_residual.hpp"
 
 namespace gufo::hip {
 
-template<std::size_t CachedDim = 0>
+// With Rotate the normed row is staged in dynamic LDS (dim floats), rotated
+// per 128-element segment and then stored; the normed values themselves are
+// computed exactly as without rotation.
+template<std::size_t CachedDim = 0, bool Rotate = false>
 __global__ void RMSNormKernel(const float* __restrict__ x,
                               const float* __restrict__ weight,
                               float* __restrict__ out, std::size_t dim,
-                              float eps) {
+                              float eps,
+                              const std::uint32_t* __restrict__ signs) {
   __shared__ float s_sum[256];
   const std::size_t tid = threadIdx.x;
   static_assert(CachedDim % 256 == 0);
@@ -50,7 +56,26 @@ __global__ void RMSNormKernel(const float* __restrict__ x,
   const float mean_sq = s_sum[0] / static_cast<float>(dim);
   const float inv_rms = rsqrtf(mean_sq + eps);
 
-  if constexpr (CachedDim != 0) {
+  if constexpr (Rotate) {
+    extern __shared__ float s_row[];
+    if constexpr (CachedDim != 0) {
+#pragma unroll
+      for (std::size_t item = 0; item < cached_items; ++item) {
+        s_row[tid + item * 256] = (values[item] * inv_rms) * weights[item];
+      }
+    } else {
+      for (std::size_t i = tid; i < dim; i += blockDim.x) {
+        const float w = (weight != nullptr) ? weight[i] : 1.0F;
+        s_row[i] = (x[i] * inv_rms) * w;
+      }
+    }
+    __syncthreads();
+    hadamard::RotateRowSegments<32>(s_row, dim, signs, tid, blockDim.x);
+    __syncthreads();
+    for (std::size_t i = tid; i < dim; i += blockDim.x) {
+      out[i] = s_row[i];
+    }
+  } else if constexpr (CachedDim != 0) {
 #pragma unroll
     for (std::size_t item = 0; item < cached_items; ++item) {
       out[tid + item * 256] = (values[item] * inv_rms) * weights[item];
@@ -105,9 +130,22 @@ void LaunchRMSNorm(const float* x, const float* weight, float* out,
   // Qwen27B decode reuses this complete row after the reduction. Retain it
   // in registers, including its weights, without changing the sum tree.
   if (dim == 5120) {
-    RMSNormKernel<5120><<<1, 256, 0, stream>>>(x, weight, out, dim, eps);
+    RMSNormKernel<5120>
+        <<<1, 256, 0, stream>>>(x, weight, out, dim, eps, nullptr);
   } else {
-    RMSNormKernel<><<<1, 256, 0, stream>>>(x, weight, out, dim, eps);
+    RMSNormKernel<><<<1, 256, 0, stream>>>(x, weight, out, dim, eps, nullptr);
+  }
+}
+void LaunchRMSNormRotated(const float* x, const float* weight, float* out,
+                          std::size_t dim, float eps,
+                          const std::uint32_t* signs, hipStream_t stream) {
+  const std::size_t lds = dim * sizeof(float);
+  if (dim == 5120) {
+    RMSNormKernel<5120, true>
+        <<<1, 256, lds, stream>>>(x, weight, out, dim, eps, signs);
+  } else {
+    RMSNormKernel<0, true>
+        <<<1, 256, lds, stream>>>(x, weight, out, dim, eps, signs);
   }
 }
 void LaunchPerHeadRMSNorm(const float* x, const float* weight, float* out,

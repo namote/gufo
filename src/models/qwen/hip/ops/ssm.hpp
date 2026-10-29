@@ -149,6 +149,8 @@ void LaunchBatchedSSMConvRecurrence(
 /// writes the tiled Q8_1 activation there instead of the FP32 row, which is
 /// valid only when nothing else reads the FP32 form. Alternatively, `fp16_out`
 /// receives the gated row as FP16. Only one activation destination may be set.
+/// Non-null `out_signs` (val_dim 128) rotates the gated row for a rotated
+/// ssm_out input before it reaches any destination.
 void LaunchBatchedSSMConvRecurrenceRowSplit(
     const float* qkv_in, const float* conv_weights, QwenRecurrentStateIo state,
     float* conv_out, const float* alpha_buf, const float* beta_buf,
@@ -158,7 +160,7 @@ void LaunchBatchedSSMConvRecurrenceRowSplit(
     std::size_t qkv_size, std::uint32_t num_key_heads, std::uint32_t num_heads,
     std::uint32_t key_dim, std::uint32_t val_dim, hipStream_t stream = nullptr,
     QwenRecurrentStateStorage state_storage = QwenRecurrentStateStorage::kFp32,
-    void* fp16_out = nullptr);
+    void* fp16_out = nullptr, const std::uint32_t* out_signs = nullptr);
 
 }  // namespace gufo::hip
 

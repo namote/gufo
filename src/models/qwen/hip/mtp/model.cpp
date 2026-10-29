@@ -223,6 +223,12 @@ std::shared_ptr<const QwenMtpGpuModel> QwenMtpGpuModel::Create(
     return nullptr;
   }
   const auto& target_weights = target_model->GetWeights();
+  if (target_weights.head_in_rotation != nullptr) {
+    if (error_msg != nullptr) {
+      *error_msg = speculative::kMtpRotatedHeadError;
+    }
+    return nullptr;
+  }
   if (target_weights.config.hidden_size != weights->config.hidden_size ||
       target_weights.config.vocab_size != weights->config.vocab_size ||
       target_weights.token_embd.empty() || target_weights.output.empty()) {

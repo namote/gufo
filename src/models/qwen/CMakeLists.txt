@@ -48,6 +48,7 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_unpack.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/embed.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/residual.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/rotation.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/unpack.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/rope.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/sample.hip
