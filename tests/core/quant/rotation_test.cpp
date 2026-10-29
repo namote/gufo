@@ -1,5 +1,7 @@
-// Rotated-GGUF marker checks (src/core/quant/rotation.hpp) and the CPU
-// rotation reference (tests/core/quant/rotation_reference.hpp).
+// prism.hadamard rotation metadata checks (src/core/quant/rotation.hpp):
+// upstream llama.cpp refusals with their line numbers, gufo's subset rules,
+// the retired v1 format, and the CPU rotation reference
+// (tests/core/quant/rotation_reference.hpp) against the library RotateRow.
 
 #include "src/core/quant/rotation.hpp"
 
@@ -7,9 +9,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <string_view>
@@ -21,8 +25,6 @@
 
 namespace {
 
-using gufo::core::GgmlType;
-using gufo::quant::rotation::GroupInstance;
 using gufo::quant::rotation::GroupTable;
 using gufo::quant::rotation::ReadRotation;
 using gufo::test::rotation::GgufImage;
@@ -36,58 +38,84 @@ void Expect(bool condition, std::string_view message) {
   }
 }
 
-std::vector<float> Signs(std::size_t k, std::uint32_t seed) {
+std::vector<std::int32_t> Signs(std::size_t k, std::uint32_t seed) {
   std::mt19937 rng(seed);
-  std::vector<float> signs(k);
+  std::vector<std::int32_t> signs(k);
   for (auto& sign : signs) {
-    sign = (rng() & 1U) != 0 ? -1.0F : 1.0F;
+    sign = (rng() & 1U) != 0 ? -1 : 1;
   }
   return signs;
 }
 
-// Two layers, each with groups "in" (a, b: K = 256) and "down" (c: K = 384),
-// plus an embedding "emb" outside every group.
+// Two layers with groups "in" (ffn_gate, ffn_up: K = 256) and "down"
+// (ffn_down: K = 384), plus token_embd and output (K = 256, group "head").
+// Every prism key is set to a valid untied, explicit, version 1 value and
+// can be overridden or removed per test.
 struct Fixture {
-  GgufImage image;
-  std::map<std::string, std::vector<float>> signs;
-  bool markers = true;
+  bool with_output = true;
+  std::vector<std::string> weights = {
+      "blk.0.ffn_gate.weight", "blk.0.ffn_up.weight", "blk.0.ffn_down.weight",
+      "blk.1.ffn_gate.weight", "blk.1.ffn_up.weight", "blk.1.ffn_down.weight"};
+  std::map<std::string, std::function<void(GgufImage&)>> keys;
+  std::map<std::int32_t, std::vector<std::int32_t>> signs = {
+      {256, Signs(256, 1)}, {384, Signs(384, 2)}};
+  std::string architecture = "qwen35";
 
   Fixture() {
-    for (int layer = 0; layer < 2; ++layer) {
-      const std::string p = "blk." + std::to_string(layer) + ".";
-      image.AddTensorF32(p + "a.weight", {256, 4});
-      image.AddTensorF32(p + "b.weight", {256, 2});
-      image.AddTensorF32(p + "c.weight", {384, 4});
-    }
-    image.AddTensorF32("emb.weight", {256, 8});
+    Set("prism.hadamard.version",
+        [](GgufImage& g) { g.AddUint32("prism.hadamard.version", 1); });
+    Set("prism.hadamard.block_size",
+        [](GgufImage& g) { g.AddUint32("prism.hadamard.block_size", 128); });
+    Set("prism.hadamard.transform", [](GgufImage& g) {
+      g.AddString("prism.hadamard.transform",
+                  "normalized-sylvester-walsh-hadamard");
+    });
+    Set("prism.hadamard.axis", [](GgufImage& g) {
+      g.AddString("prism.hadamard.axis", "input-last-dimension");
+    });
+    Set("prism.hadamard.sign_mode", [](GgufImage& g) {
+      g.AddString("prism.hadamard.sign_mode", "explicit");
+    });
+    Set("prism.hadamard.sign_widths", [this](GgufImage& g) {
+      std::vector<std::int32_t> widths;
+      for (const auto& [width, unused] : signs) {
+        widths.push_back(width);
+      }
+      g.AddInt32Array("prism.hadamard.sign_widths", widths);
+    });
+    Set("prism.hadamard.sign_values", [this](GgufImage& g) {
+      std::vector<std::int32_t> values;
+      for (const auto& [unused, vector] : signs) {
+        values.insert(values.end(), vector.begin(), vector.end());
+      }
+      g.AddInt32Array("prism.hadamard.sign_values", values);
+    });
+    Set("prism.hadamard.weight_names", [this](GgufImage& g) {
+      g.AddStringArray("prism.hadamard.weight_names", weights);
+    });
   }
 
-  void RotateAll() {
-    for (int layer = 0; layer < 2; ++layer) {
-      const std::string p = "blk." + std::to_string(layer) + ".";
-      const auto in = Signs(256, 10 + layer);
-      signs[p + "a.weight"] = in;
-      signs[p + "b.weight"] = in;
-      signs[p + "c.weight"] = Signs(384, 20 + layer);
-    }
-  }
-
-  void AddMarkers(GgufImage& out) const {
-    out.AddUint32("gufo.rotation.version", 1);
-    out.AddString("gufo.rotation.kind", "hadamard");
-    out.AddUint32("gufo.rotation.block_size", 128);
-    out.AddString("gufo.rotation.side", "input");
+  void Set(const std::string& key, std::function<void(GgufImage&)> add) {
+    keys[key] = std::move(add);
   }
 
   [[nodiscard]] std::vector<std::uint8_t> Build() const {
-    GgufImage out = image;
-    if (markers) {
-      AddMarkers(out);
+    GgufImage image;
+    image.AddString("general.architecture", architecture);
+    for (int layer = 0; layer < 2; ++layer) {
+      const std::string p = "blk." + std::to_string(layer) + ".";
+      image.AddTensorF32(p + "ffn_gate.weight", {256, 4});
+      image.AddTensorF32(p + "ffn_up.weight", {256, 4});
+      image.AddTensorF32(p + "ffn_down.weight", {384, 4});
     }
-    for (const auto& [name, values] : signs) {
-      out.AddTensorF16(name + ".rot", values);
+    image.AddTensorF32("token_embd.weight", {256, 8});
+    if (with_output) {
+      image.AddTensorF32("output.weight", {256, 8});
     }
-    return out.Build();
+    for (const auto& [key, add] : keys) {
+      add(image);
+    }
+    return image.Build();
   }
 };
 
@@ -97,9 +125,10 @@ GroupTable Table() {
     const std::string p = "blk." + std::to_string(layer) + ".";
     const std::string l = std::to_string(layer);
     table.instances.push_back(
-        {"in", "in:" + l, {p + "a.weight", p + "b.weight"}});
-    table.instances.push_back({"down", "down:" + l, {p + "c.weight"}});
+        {"in", "in:" + l, {p + "ffn_gate.weight", p + "ffn_up.weight"}});
+    table.instances.push_back({"down", "down:" + l, {p + "ffn_down.weight"}});
   }
+  table.instances.push_back({"head", "head", {"output.weight"}});
   return table;
 }
 
@@ -124,10 +153,9 @@ Outcome Read(const std::vector<std::uint8_t>& bytes,
   return {.ok = true, .error = {}, .info = std::move(*info)};
 }
 
-void ExpectRefusal(const std::vector<std::uint8_t>& bytes,
-                   std::string_view fragment, std::string_view label,
-                   const GroupTable& table = Table()) {
-  const auto outcome = Read(bytes, table);
+void ExpectRefusal(const Fixture& fixture, std::string_view fragment,
+                   std::string_view label, const GroupTable& table = Table()) {
+  const auto outcome = Read(fixture.Build(), table);
   if (outcome.ok) {
     Expect(false, std::string(label) + ": accepted");
     return;
@@ -139,304 +167,384 @@ void ExpectRefusal(const std::vector<std::uint8_t>& bytes,
          std::string(label) + ": message prefix");
 }
 
+// Upstream refusal: the message must carry the upstream line.
+void ExpectUpstream(const Fixture& fixture, int line, std::string_view label) {
+  ExpectRefusal(
+      fixture,
+      "(llama.cpp 8ab29fae src/llama-model.cpp:" + std::to_string(line) + ")",
+      label);
+}
+
 void TestUnrotated() {
   Fixture fixture;
-  fixture.markers = false;
+  fixture.keys.clear();
   const auto outcome = Read(fixture.Build());
   Expect(outcome.ok && !outcome.info.Any(), "unrotated file has no rotation");
 
-  // Provenance keys alone are not markers; the converter writes them for
-  // unrotated outputs as well.
-  GgufImage image = fixture.image;
-  image.AddString("gufo.rotation.source_converter", "rotquant 1");
-  image.AddString("gufo.rotation.source_recipe_sha256", "00");
-  const auto provenance = Read(image.Build());
+  // Converter provenance keys are not rotation metadata.
+  fixture.Set("gufo.rotation.source_converter", [](GgufImage& g) {
+    g.AddString("gufo.rotation.source_converter", "rotquant 2");
+  });
+  const auto provenance = Read(fixture.Build());
   Expect(provenance.ok && !provenance.info.Any(),
          "source_* keys are not rotation markers");
 }
 
+void TestV1Refused() {
+  {
+    Fixture fixture;
+    fixture.keys.clear();
+    fixture.Set("gufo.rotation.version",
+                [](GgufImage& g) { g.AddUint32("gufo.rotation.version", 1); });
+    ExpectRefusal(fixture, "v1 rotation format", "v1 marker key");
+  }
+  {
+    Fixture fixture;
+    fixture.Set("v1 tensor", [](GgufImage& g) {
+      g.AddTensorF16("blk.0.ffn_gate.weight.rot",
+                     std::vector<float>(256, 1.0F));
+    });
+    ExpectRefusal(fixture, "reconvert the model with tools/rotquant",
+                  "v1 .rot tensor");
+  }
+}
+
 void TestAccepted() {
   Fixture fixture;
-  fixture.RotateAll();
+  fixture.weights.push_back("output.weight");
   const auto outcome = Read(fixture.Build());
-  Expect(outcome.ok, "rotated file accepted: " + outcome.error);
+  Expect(outcome.ok, "prism file accepted: " + outcome.error);
   if (!outcome.ok) {
     return;
   }
   const auto& info = outcome.info;
   Expect(info.Any(), "rotation present");
-  Expect(info.rotated_groups == std::vector<std::string>{"in", "down"},
-         "rotated groups in table order");
-  Expect(info.GroupList() == "in, down", "group list text");
-  Expect(info.instances.size() == 4, "four rotated instances");
-  for (int layer = 0; layer < 2; ++layer) {
-    const auto l = std::to_string(layer);
-    const auto* in = info.Find("in:" + l);
-    const auto* down = info.Find("down:" + l);
-    Expect(in != nullptr && down != nullptr, "instances found");
-    if (in == nullptr || down == nullptr) {
+  Expect(info.rotated_groups == std::vector<std::string>{"in", "down", "head"},
+         "rotated groups in table order: " + info.GroupList());
+  Expect(info.widths.size() == 2, "one sign vector per width");
+  for (const auto& [width, values] : fixture.signs) {
+    const auto* signs = info.ForWidth(static_cast<std::size_t>(width));
+    Expect(signs != nullptr &&
+               signs->bits.size() == static_cast<std::size_t>(width) / 32,
+           "width present and packed");
+    if (signs == nullptr) {
       continue;
     }
-    Expect(in->k == 256 && in->bits.size() == 8, "in: K and words");
-    Expect(down->k == 384 && down->bits.size() == 12, "down: K and words");
-    const auto& want = fixture.signs.at("blk." + l + ".c.weight");
     bool same = true;
-    for (std::size_t i = 0; i < want.size(); ++i) {
+    for (std::size_t i = 0; i < values.size(); ++i) {
       same = same &&
-             gufo::test::rotation::SignBit(down->bits, i) == (want[i] < 0.0F);
+             gufo::test::rotation::SignBit(signs->bits, i) == (values[i] < 0);
     }
-    Expect(same, "packed signs match the .rot values");
+    Expect(same, "packed bits match sign_values");
   }
 
-  // Rotating only some groups is fine as long as each group is complete.
+  // One complete group is enough; its width alone is declared.
   Fixture partial;
-  partial.RotateAll();
-  partial.signs.erase("blk.0.c.weight");
-  partial.signs.erase("blk.1.c.weight");
-  const auto only_in = Read(partial.Build());
-  Expect(only_in.ok &&
-             only_in.info.rotated_groups == std::vector<std::string>{"in"},
-         "one complete group rotated");
+  partial.weights = {"blk.0.ffn_down.weight", "blk.1.ffn_down.weight"};
+  partial.signs.erase(256);
+  const auto only_down = Read(partial.Build());
+  Expect(only_down.ok &&
+             only_down.info.rotated_groups == std::vector<std::string>{"down"},
+         "one complete group rotated: " + only_down.error);
 }
 
-void TestMarkerRefusals() {
+void TestUpstreamRules() {
   {
-    Fixture fixture;
-    fixture.RotateAll();
-    fixture.markers = false;
-    ExpectRefusal(fixture.Build(), "no gufo.rotation metadata",
-                  ".rot without markers");
+    Fixture f;
+    f.keys.erase("prism.hadamard.version");
+    f.Set("prism.hadamard.tied_output",
+          [](GgufImage& g) { g.AddBool("prism.hadamard.tied_output", true); });
+    ExpectUpstream(f, 2224, "tied_output without version");
   }
   {
-    Fixture fixture;
-    GgufImage image = fixture.image;
-    fixture.AddMarkers(image);
-    ExpectRefusal(image.Build(), "no .rot tensors", "markers without .rot");
+    Fixture f;
+    f.Set("prism.hadamard.version",
+          [](GgufImage& g) { g.AddUint32("prism.hadamard.version", 3); });
+    ExpectUpstream(f, 2078, "version 3");
   }
-  const auto with_markers = [](std::string_view skip, std::string_view key,
-                               auto add) {
-    Fixture fixture;
-    fixture.RotateAll();
-    fixture.markers = false;
-    GgufImage image = fixture.image;
-    const std::vector<std::pair<std::string_view, int>> keys = {
-        {"gufo.rotation.version", 0},
-        {"gufo.rotation.kind", 1},
-        {"gufo.rotation.block_size", 2},
-        {"gufo.rotation.side", 3}};
-    for (const auto& [name, index] : keys) {
-      if (name == skip) {
-        continue;
-      }
-      if (name == key) {
-        add(image);
-        continue;
-      }
-      if (index == 0) {
-        image.AddUint32(name, 1);
-      } else if (index == 1) {
-        image.AddString(name, "hadamard");
-      } else if (index == 2) {
-        image.AddUint32(name, 128);
-      } else {
-        image.AddString(name, "input");
-      }
-    }
-    for (const auto& [name, values] : fixture.signs) {
-      image.AddTensorF16(name + ".rot", values);
-    }
-    return image.Build();
-  };
-  const auto none = [](GgufImage&) {};
-  for (const auto key : {"gufo.rotation.version", "gufo.rotation.kind",
-                         "gufo.rotation.block_size", "gufo.rotation.side"}) {
-    ExpectRefusal(with_markers(key, "", none), "missing " + std::string(key),
-                  key);
+  {
+    Fixture f;
+    f.Set("prism.hadamard.version",
+          [](GgufImage& g) { g.AddUint32("prism.hadamard.version", 2); });
+    ExpectUpstream(f, 2082, "version 2 untied");
   }
-  ExpectRefusal(with_markers("", "gufo.rotation.version",
-                             [](GgufImage& image) {
-                               image.AddUint32("gufo.rotation.version", 2);
-                             }),
-                "unsupported gufo.rotation.version = 2", "version 2");
-  ExpectRefusal(with_markers("", "gufo.rotation.version",
-                             [](GgufImage& image) {
-                               image.AddString("gufo.rotation.version", "1");
-                             }),
-                "unsupported gufo.rotation.version", "string version");
-  ExpectRefusal(with_markers("", "gufo.rotation.kind",
-                             [](GgufImage& image) {
-                               image.AddString("gufo.rotation.kind", "dct");
-                             }),
-                "unsupported gufo.rotation.kind = \"dct\"", "kind");
-  ExpectRefusal(with_markers("", "gufo.rotation.block_size",
-                             [](GgufImage& image) {
-                               image.AddUint32("gufo.rotation.block_size", 64);
-                             }),
-                "unsupported gufo.rotation.block_size = 64", "block size");
-  ExpectRefusal(with_markers("", "gufo.rotation.side",
-                             [](GgufImage& image) {
-                               image.AddString("gufo.rotation.side", "output");
-                             }),
-                "unsupported gufo.rotation.side = \"output\"", "side");
+  {
+    Fixture f;
+    f.Set("prism.hadamard.version",
+          [](GgufImage& g) { g.AddUint32("prism.hadamard.version", 2); });
+    f.Set("prism.hadamard.tied_output",
+          [](GgufImage& g) { g.AddBool("prism.hadamard.tied_output", true); });
+    ExpectUpstream(f, 2085, "tied with output.weight");
+  }
+  {
+    Fixture f;
+    f.keys.erase("prism.hadamard.block_size");
+    ExpectRefusal(f, "key not found in model: prism.hadamard.block_size",
+                  "missing block size");
+  }
+  {
+    Fixture f;
+    f.Set("prism.hadamard.version",
+          [](GgufImage& g) { g.AddString("prism.hadamard.version", "1"); });
+    ExpectRefusal(f, "prism.hadamard.version has the wrong GGUF type",
+                  "string version");
+  }
+  {
+    Fixture f;
+    f.Set("prism.hadamard.block_size",
+          [](GgufImage& g) { g.AddUint32("prism.hadamard.block_size", 96); });
+    ExpectUpstream(f, 2101, "block 96");
+  }
+  {
+    Fixture f;
+    f.Set("prism.hadamard.transform",
+          [](GgufImage& g) { g.AddString("prism.hadamard.transform", "dct"); });
+    ExpectUpstream(f, 2104, "transform");
+  }
+  {
+    Fixture f;
+    f.Set("prism.hadamard.axis",
+          [](GgufImage& g) { g.AddString("prism.hadamard.axis", "output"); });
+    ExpectUpstream(f, 2107, "axis");
+  }
+  {
+    Fixture f;
+    f.Set("prism.hadamard.sign_mode", [](GgufImage& g) {
+      g.AddString("prism.hadamard.sign_mode", "random");
+    });
+    ExpectUpstream(f, 2110, "sign mode");
+  }
+  {
+    Fixture f;
+    f.weights.clear();
+    ExpectUpstream(f, 2113, "empty weight names");
+  }
+  {
+    Fixture f;
+    f.signs.clear();
+    ExpectUpstream(f, 2123, "empty sign widths");
+  }
+  {
+    Fixture f;
+    f.Set("prism.hadamard.sign_widths", [](GgufImage& g) {
+      g.AddInt32Array("prism.hadamard.sign_widths", {256, 200});
+    });
+    ExpectUpstream(f, 2128, "width not a block multiple");
+  }
+  {
+    Fixture f;
+    f.Set("prism.hadamard.sign_widths", [](GgufImage& g) {
+      g.AddInt32Array("prism.hadamard.sign_widths", {256, 256});
+    });
+    f.Set("prism.hadamard.sign_values", [](GgufImage& g) {
+      g.AddInt32Array("prism.hadamard.sign_values",
+                      std::vector<std::int32_t>(512, 1));
+    });
+    ExpectUpstream(f, 2131, "duplicate width");
+  }
+  {
+    Fixture f;
+    f.signs[256][9] = 2;
+    ExpectUpstream(f, 2137, "sign value 2");
+  }
+  {
+    Fixture f;
+    f.Set("prism.hadamard.sign_values", [](GgufImage& g) {
+      g.AddInt32Array("prism.hadamard.sign_values",
+                      std::vector<std::int32_t>(256 + 384 + 1, 1));
+    });
+    ExpectUpstream(f, 2143, "sign values too long");
+  }
+  {
+    Fixture f;
+    f.architecture = "gemma3";
+    ExpectUpstream(f, 2159, "architecture");
+  }
+  {
+    Fixture f;
+    f.weights.push_back("blk.0.ssm_alpha.weight");
+    ExpectUpstream(f, 2199, "ssm_alpha is not foldable upstream");
+  }
+  {
+    Fixture f;
+    f.weights.push_back("blk.0.ffn_gate.weight");
+    ExpectUpstream(f, 2203, "duplicate weight name");
+  }
+  {
+    Fixture f;
+    f.Set("prism.hadamard.inverse_weight_names", [](GgufImage& g) {
+      g.AddStringArray("prism.hadamard.inverse_weight_names",
+                       {"output.weight"});
+    });
+    ExpectUpstream(f, 2213, "inverse name other than token_embd");
+  }
+  {
+    Fixture f;
+    f.Set("prism.hadamard.inverse_weight_names", [](GgufImage& g) {
+      g.AddStringArray("prism.hadamard.inverse_weight_names",
+                       {"token_embd.weight", "token_embd.weight"});
+    });
+    ExpectUpstream(f, 2217, "duplicate inverse name");
+  }
+  {
+    Fixture f;
+    f.with_output = false;
+    f.Set("prism.hadamard.version",
+          [](GgufImage& g) { g.AddUint32("prism.hadamard.version", 2); });
+    f.Set("prism.hadamard.tied_output",
+          [](GgufImage& g) { g.AddBool("prism.hadamard.tied_output", true); });
+    ExpectUpstream(f, 2228, "tied without latent embedding");
+  }
+  {
+    Fixture f;
+    f.with_output = false;
+    f.Set("prism.hadamard.inverse_weight_names", [](GgufImage& g) {
+      g.AddStringArray("prism.hadamard.inverse_weight_names",
+                       {"token_embd.weight"});
+    });
+    ExpectUpstream(f, 2232, "untied inverse table without output");
+  }
+  {
+    Fixture f;
+    f.weights.push_back("blk.7.ffn_up.weight");
+    ExpectUpstream(f, 2271, "weight not in the file");
+  }
+  {
+    Fixture f;
+    f.Set("prism.hadamard.block_size",
+          [](GgufImage& g) { g.AddUint32("prism.hadamard.block_size", 512); });
+    f.Set("prism.hadamard.sign_widths", [](GgufImage& g) {
+      g.AddInt32Array("prism.hadamard.sign_widths", {512});
+    });
+    f.Set("prism.hadamard.sign_values", [](GgufImage& g) {
+      g.AddInt32Array("prism.hadamard.sign_values",
+                      std::vector<std::int32_t>(512, 1));
+    });
+    ExpectUpstream(f, 2274, "block does not divide K");
+  }
+  {
+    Fixture f;
+    f.signs.erase(384);
+    ExpectUpstream(f, 2348, "no sign vector for a width");
+  }
 }
 
-void TestTensorRefusals() {
+void TestGufoSubset() {
   {
-    Fixture fixture;
-    fixture.RotateAll();
-    fixture.signs["emb.weight"] = Signs(256, 3);
-    ExpectRefusal(fixture.Build(),
-                  "emb.weight is rotated but its role has no rotation path",
-                  "tensor outside every group");
+    Fixture f;
+    f.with_output = false;
+    f.Set("prism.hadamard.version",
+          [](GgufImage& g) { g.AddUint32("prism.hadamard.version", 2); });
+    f.Set("prism.hadamard.tied_output",
+          [](GgufImage& g) { g.AddBool("prism.hadamard.tied_output", true); });
+    f.Set("prism.hadamard.inverse_weight_names", [](GgufImage& g) {
+      g.AddStringArray("prism.hadamard.inverse_weight_names",
+                       {"token_embd.weight"});
+    });
+    ExpectRefusal(f, "only untied prism.hadamard version 1", "tied file");
   }
   {
-    Fixture fixture;
-    fixture.RotateAll();
-    fixture.signs["missing.weight"] = Signs(256, 3);
-    ExpectRefusal(fixture.Build(),
-                  "missing.weight.rot has no matching tensor missing.weight",
-                  "orphan .rot");
+    Fixture f;
+    f.Set("prism.hadamard.block_size",
+          [](GgufImage& g) { g.AddUint32("prism.hadamard.block_size", 64); });
+    ExpectRefusal(f, "unsupported prism.hadamard.block_size = 64", "block 64");
   }
   {
-    Fixture fixture;
-    fixture.RotateAll();
-    fixture.signs["emb.weight"] = Signs(256, 3);
-    auto table = Table();
-    table.tied_tensors.push_back("emb.weight");
-    ExpectRefusal(fixture.Build(), "tied to the token embedding", "tied head",
-                  table);
+    Fixture f;
+    f.Set("prism.hadamard.sign_mode", [](GgufImage& g) {
+      g.AddString("prism.hadamard.sign_mode", "identity");
+    });
+    ExpectRefusal(f, "unsupported prism.hadamard.sign_mode = 'identity'",
+                  "identity mode");
   }
   {
-    Fixture fixture;
-    fixture.RotateAll();
-    auto table = Table();
+    Fixture f;
+    f.Set("prism.hadamard.inverse_weight_names", [](GgufImage& g) {
+      g.AddStringArray("prism.hadamard.inverse_weight_names",
+                       {"token_embd.weight"});
+    });
+    ExpectRefusal(f, "prism.hadamard.inverse_weight_names is not supported",
+                  "inverse table");
+  }
+  {
+    Fixture f;
+    f.Set("prism.hadamard.gdn_v_grouped", [](GgufImage& g) {
+      g.AddBool("prism.hadamard.gdn_v_grouped", true);
+    });
+    ExpectRefusal(f, "prism.hadamard.gdn_v_grouped is not supported",
+                  "GDN permutation");
+  }
+  {
+    Fixture f;
+    f.weights.push_back("output.weight");
+    GroupTable table = Table();
+    table.instances.pop_back();
+    ExpectRefusal(f, "output.weight is rotated but its role has no rotation",
+                  "weight outside the table", table);
+  }
+  {
+    Fixture f;
+    GroupTable table = Table();
     table.unsupported_groups.push_back("down");
-    ExpectRefusal(fixture.Build(),
-                  "group down has no rotation path in this runtime",
+    ExpectRefusal(f, "group down has no rotation path in this runtime",
                   "unsupported group", table);
   }
   {
-    Fixture fixture;
-    fixture.RotateAll();
-    fixture.signs.erase("blk.1.b.weight");
-    ExpectRefusal(fixture.Build(),
-                  "group instance in:1 mixes rotated and unrotated tensors",
+    Fixture f;
+    std::erase(f.weights, std::string("blk.1.ffn_up.weight"));
+    ExpectRefusal(f, "group instance in:1 mixes rotated and unrotated",
                   "mixed instance");
   }
   {
-    Fixture fixture;
-    fixture.RotateAll();
-    fixture.signs["blk.0.b.weight"][7] *= -1.0F;
-    ExpectRefusal(fixture.Build(),
-                  "group instance in:0: blk.0.b.weight uses a different sign "
-                  "vector",
-                  "different signs");
-  }
-  {
-    Fixture fixture;
-    fixture.RotateAll();
-    fixture.signs.erase("blk.1.c.weight");
-    ExpectRefusal(fixture.Build(),
-                  "group down is rotated in some layers only (1 of 2; down:1",
+    Fixture f;
+    std::erase(f.weights, std::string("blk.1.ffn_down.weight"));
+    ExpectRefusal(f, "group down is rotated in some layers only (1 of 2",
                   "partial layers");
   }
   {
-    Fixture fixture;
-    fixture.RotateAll();
-    fixture.signs["blk.0.c.weight"][5] = 0.5F;
-    ExpectRefusal(fixture.Build(),
-                  "blk.0.c.weight.rot holds values other than +1 and -1",
-                  "non-sign value");
+    Fixture f;
+    f.weights = {"blk.0.ffn_down.weight", "blk.1.ffn_down.weight"};
+    ExpectRefusal(f, "lists a width no folded weight uses: 256",
+                  "unused width");
   }
   {
-    Fixture fixture;
-    fixture.RotateAll();
-    fixture.signs["blk.0.c.weight"].resize(256);
-    ExpectRefusal(fixture.Build(),
-                  "blk.0.c.weight.rot has 256 values, but blk.0.c.weight has "
-                  "K = 384",
-                  "wrong length");
-  }
-  {
-    Fixture fixture;
-    fixture.RotateAll();
-    fixture.markers = false;
-    GgufImage image = fixture.image;
-    fixture.AddMarkers(image);
-    for (const auto& [name, values] : fixture.signs) {
-      if (name == "blk.0.c.weight") {
-        image.AddTensorF32Values(name + ".rot", {384}, values);
-      } else {
-        image.AddTensorF16(name + ".rot", values);
-      }
-    }
-    ExpectRefusal(image.Build(),
-                  "blk.0.c.weight.rot must be a one-dimensional F16 tensor",
-                  "F32 signs");
-  }
-  {
-    // K = 96 is not a whole rotation block.
-    GgufImage image;
-    image.AddTensorF32("blk.0.a.weight", {96, 2});
-    image.AddUint32("gufo.rotation.version", 1);
-    image.AddString("gufo.rotation.kind", "hadamard");
-    image.AddUint32("gufo.rotation.block_size", 128);
-    image.AddString("gufo.rotation.side", "input");
-    image.AddTensorF16("blk.0.a.weight.rot", Signs(96, 4));
-    GroupTable table;
-    table.instances.push_back({"in", "in:0", {"blk.0.a.weight"}});
-    ExpectRefusal(image.Build(), "not a multiple of 128", "K = 96", table);
+    Fixture f;
+    f.keys.erase("prism.hadamard.version");
+    ExpectRefusal(f, "without prism.hadamard.version", "stray keys");
   }
 }
 
-void TestReference() {
-  using gufo::test::rotation::RotateRow;
-  using gufo::test::rotation::RotateRowFp64;
+void TestRotateRow() {
   std::mt19937 rng(7);
   std::normal_distribution<float> normal(0.0F, 1.0F);
-  for (const std::size_t k : {128U, 640U, 5120U, 6144U, 17408U}) {
+  for (const std::size_t k : {128U, 640U, 5120U, 17408U}) {
     std::vector<float> row(k);
     for (auto& value : row) {
       value = normal(rng);
     }
-    row[3] = 300.0F;  // an activation outlier
+    row[3] = 300.0F;
     std::vector<std::uint32_t> bits(k / 32);
     for (auto& word : bits) {
       word = rng();
     }
-    auto rotated = row;
-    RotateRow(rotated, bits);
-    const auto exact = RotateRowFp64(row, bits);
+    auto library = row;
+    gufo::quant::rotation::RotateRow(library, bits);
+    auto reference = row;
+    gufo::test::rotation::RotateRow(reference, bits);
+    Expect(
+        std::memcmp(library.data(), reference.data(), k * sizeof(float)) == 0,
+        "library RotateRow equals the test reference, K = " +
+            std::to_string(k));
+    const auto exact = gufo::test::rotation::RotateRowFp64(row, bits);
     double max_error = 0.0;
     double max_value = 0.0;
-    double norm_in = 0.0;
-    double norm_out = 0.0;
     for (std::size_t i = 0; i < k; ++i) {
-      max_error = std::max(max_error, std::abs(rotated[i] - exact[i]));
+      max_error = std::max(max_error, std::abs(reference[i] - exact[i]));
       max_value = std::max(max_value, std::abs(exact[i]));
-      norm_in += static_cast<double>(row[i]) * row[i];
-      norm_out += exact[i] * exact[i];
     }
     Expect(max_error <= 1e-5 * std::max(1.0, max_value),
-           "FP32 reference matches the FP64 product, K = " + std::to_string(k) +
-               " (error " + std::to_string(max_error) + ")");
-    Expect(std::abs(norm_in - norm_out) <= 1e-9 * norm_in,
-           "rotation preserves the norm");
-    // H·D is orthogonal: rotating the FP64 result back with H, then D,
-    // recovers the input. With D = I, applying the FP32 rotation twice is
-    // the identity up to rounding.
-    std::vector<std::uint32_t> plus(k / 32, 0U);
-    auto twice = row;
-    RotateRow(twice, plus);
-    RotateRow(twice, plus);
-    double round_trip = 0.0;
-    for (std::size_t i = 0; i < k; ++i) {
-      round_trip = std::max(round_trip,
-                            static_cast<double>(std::abs(twice[i] - row[i])));
-    }
-    Expect(round_trip <= 1e-4, "H·H = I in FP32");
+           "FP32 reference matches the FP64 product, K = " + std::to_string(k));
   }
-  // The scale constant is the correctly rounded float of 1 / sqrt(128).
   Expect(gufo::hip::hadamard::kHadamard128Scale ==
              static_cast<float>(1.0 / std::sqrt(128.0)),
          "scale constant");
@@ -446,10 +554,11 @@ void TestReference() {
 
 int main() {
   TestUnrotated();
+  TestV1Refused();
   TestAccepted();
-  TestMarkerRefusals();
-  TestTensorRefusals();
-  TestReference();
+  TestUpstreamRules();
+  TestGufoSubset();
+  TestRotateRow();
   if (failures != 0) {
     std::cerr << failures << " rotation check(s) failed\n";
     return 1;

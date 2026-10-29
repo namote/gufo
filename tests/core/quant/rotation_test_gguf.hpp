@@ -1,8 +1,8 @@
 #ifndef GUFO_TESTS_CORE_QUANT_ROTATION_TEST_GGUF_HPP_
 #define GUFO_TESTS_CORE_QUANT_ROTATION_TEST_GGUF_HPP_
 
-// Minimal in-memory GGUF v3 writer for rotation tests: string and uint32
-// metadata, F32 and F16 tensors with real payloads.
+// Minimal in-memory GGUF v3 writer for rotation tests: string, bool, uint32,
+// string-array and int32-array metadata, F32, F16 and BF16/Q8_0 payloads.
 
 #include <bit>
 #include <cmath>
@@ -43,6 +43,34 @@ public:
     ++metadata_count_;
   }
 
+  void AddBool(std::string_view key, bool value) {
+    Key(key, core::GgufValueType::kBool);
+    meta_.push_back(value ? 1 : 0);
+    ++metadata_count_;
+  }
+
+  void AddStringArray(std::string_view key,
+                      const std::vector<std::string>& values) {
+    Key(key, core::GgufValueType::kArray);
+    Pod(meta_, static_cast<std::uint32_t>(core::GgufValueType::kString));
+    Pod(meta_, static_cast<std::uint64_t>(values.size()));
+    for (const auto& value : values) {
+      String(meta_, value);
+    }
+    ++metadata_count_;
+  }
+
+  void AddInt32Array(std::string_view key,
+                     const std::vector<std::int32_t>& values) {
+    Key(key, core::GgufValueType::kArray);
+    Pod(meta_, static_cast<std::uint32_t>(core::GgufValueType::kInt32));
+    Pod(meta_, static_cast<std::uint64_t>(values.size()));
+    for (const auto value : values) {
+      Pod(meta_, value);
+    }
+    ++metadata_count_;
+  }
+
   void AddUint32(std::string_view key, std::uint32_t value) {
     Key(key, core::GgufValueType::kUint32);
     Pod(meta_, value);
@@ -70,6 +98,13 @@ public:
     std::memcpy(payload.data(), values.data(), payload.size());
     tensors_.push_back({std::string(name), std::move(dims),
                         core::GgmlType::kF32, std::move(payload)});
+  }
+
+  /// Raw payload of any type; `dims` in GGUF ne order.
+  void AddTensorRaw(std::string_view name, std::vector<std::uint64_t> dims,
+                    core::GgmlType type, std::vector<std::uint8_t> payload) {
+    tensors_.push_back(
+        {std::string(name), std::move(dims), type, std::move(payload)});
   }
 
   void AddTensorF16(std::string_view name, const std::vector<float>& values) {

@@ -44,6 +44,10 @@ if (ENGINE_ENABLE_HIP)
   add_qwen27b_test(qwen_sampling_hip_test sampling_test.hip
     "hip;gpu;sampling;correctness")
   target_link_libraries(qwen_sampling_hip_test PRIVATE hip::host)
+  # RQ R2 diagnosis probe: per-layer hidden states at a corpus position; needs
+  # a model and the corpus token file, so no CTest.
+  add_executable(qwen27b_rq_hidden_probe EXCLUDE_FROM_ALL rq_hidden_probe.cpp)
+  target_link_libraries(qwen27b_rq_hidden_probe PRIVATE gufo_core hip::host)
   add_qwen27b_test(qwen27b_rotation_kernels_test rotation_kernels_test.hip
     "hip;gpu;rotation;kernels;correctness")
   target_link_libraries(qwen27b_rotation_kernels_test PRIVATE hip::host)
