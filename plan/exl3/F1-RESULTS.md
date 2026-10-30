@@ -6,7 +6,7 @@
 
 - 감독 결정(2026-10-30): F0은 측정만, n-gram 표는 F2 범위에서 뺀다, 이미지 선점은 P2에 별도 커밋, MTP 층은 같은 plane, KVarN V 배치는 K0-FN 뒤에 정한다.
 - **F0:** 창 계획 완료, GPU 순서(XQ → X-A 참조 덤프 → F1 F0)에서 감독의 "start"를 기다린다.
-- **P1, K0-FN:** 코드와 빌드 완료. GPU 창은 아직 돌리지 않았다. 이미지를 만들 디스크 여유가 필요하다(아래 "디스크").
+- **P1, K0-FN:** 코드, 빌드, 이미지 완료. GPU 창은 아직 돌리지 않았다. 순서는 X-A xa-ref → F1 F0 → W9 3개 → X-A X1 → P1T/K0이다.
 
 ## 브랜치와 커밋 [확인]
 
@@ -37,8 +37,8 @@
 | 계획 | 내용 | 이미지 | 상태 |
 |---|---|---|---|
 | `PLAN-F1-F0.json` `f1-f0` | 메모리 점유 7개 경우 + n-gram cold/warm, 드라이버 `f1_f0.py` | `rqw3-base-rocm101`(c94572b3) | "start" 대기 |
-| `PLAN-F1-P1T.json` `f1-p1-unit` / `f1-p1-greedy` / `f1-p1-suite` | 페이지 행 op 테스트와 모델 테스트, greedy 89개 sha(I1V/M0 AR 대조), 기능 `long-context`+`cache` | `f1-cand-rocm101`(만들 예정, 라벨 `766a593e…`) | 이미지와 승인 대기 |
-| `PLAN-F1-K0.json` `f1-k0-32k` / `f1-k0-long` | K0-FN: 27B K0 fixture(32K, 256K 문서) + 새 needle(32K, 200K, 깊이 10/50/90 %) | 같음 | 이미지와 승인 대기 |
+| `PLAN-F1-P1T.json` `f1-p1-unit` / `f1-p1-greedy` / `f1-p1-suite` | 페이지 행 op 테스트와 모델 테스트, greedy 89개 sha(I1V/M0 AR 대조), 기능 `long-context`+`cache` | `f1-cand-rocm101`(id `65ed13bc`) | 승인 대기(순서: X-A X1 뒤) |
+| `PLAN-F1-K0.json` `f1-k0-32k` / `f1-k0-long` | K0-FN: 27B K0 fixture(32K, 256K 문서) + 새 needle(32K, 200K, 깊이 10/50/90 %) | 같음 | 승인 대기(순서: X-A X1 뒤) |
 
 - 새 fixture: `fixtures/f1-needle-{32k,200k}.txt`, `f1-needle-gold.json`(생성 방법·sha256은 gold 파일 manifest).
 - P1 타이밍(ABBA, 기준 이미지 `d2b751a9`)은 정확성 창 뒤에 따로 계획한다.
@@ -46,7 +46,11 @@
 ## 디스크 [확인]
 
 - 빌드 세 번과 closure tar로 루트 여유가 146.8 GiB까지 내려갔다(창 시작 하한 150 GiB). 내 tar와 임시 빌드 디렉터리를 지워 149.8 GiB가 되었고, 감독에게 알렸다.
-- 이미지 두 개(후보, 기준)에 약 3.2 GB가 더 든다. 공유 nix store GC나 다른 세션의 이미지는 건드리지 않았다.
+- 공유 nix store GC나 다른 세션의 이미지는 건드리지 않았다. 감독이 사용자 승인을 받아 docker build cache만 정리했다(루트 177 GiB).
+- 이미지(2026-10-30, 감독 승인, closure tar는 빌드 직후 지움, 뒤 여유 166.1 GiB):
+  - 후보 `ai-tools/gufo-eval:f1-cand-rocm101`, id `65ed13bc`, 라벨 `766a593e9834382cb7a304655acf04de1ab2034b`. 운영 gufo `7lcxjf2g…`와 F1 테스트 `r5zpiajz…`의 closure를 담는다.
+  - 기준 `ai-tools/gufo-eval:f1-base-rocm101`, id `8b33a7a6`, 라벨 `d2b751a90502d5cb37cceb66d40947ea830638fd`, 운영 gufo `vvvrxigm…`.
+  - 둘 다 `FROM ai-tools/gufo-eval:64849ca6ec7b`(F23/R2 방식, `build/f1-img-{cand,base}/Dockerfile`, closure 목록 `closure.txt`). 컨테이너 안에서 바이너리 경로와 revision 파일만 확인했다(GPU 사용 없음).
 
 ## 남은 문제
 
