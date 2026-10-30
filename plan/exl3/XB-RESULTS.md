@@ -214,3 +214,14 @@ M = 8 열에는 행 우선(row-major)과 lane 우선(lane-major) 입력의 최�
 - **확인:**
   - 고친 시험은 `build/rq-gpu-test`에 빌드했다.
   - GPU 실행은 다음 창에서 한다.
+
+## 창 `xb4` (2026-10-31, `PLAN-XB4.json`, 고친 커널 시험)
+
+- **창:** `…/xb4/units/`
+  - COMPLETE, health_PASS, 재시도 없음.
+  - 이미지 `64849ca6ec7b`. 바이너리는 `build/rq-gpu-test`의 HEAD `c90bedea`(rounding fix `c0da594e` + DPP 감소)다.
+- **`qwen27b_exl3_kernel_test`:** 모두 통과했다. 7개 문제(K 1–6), 행 수 1–64, stride 포함이다.
+  - 커널의 FP16 회전 입력을 받은 FP64 대비: **1.4e-7–3.4e-7**(기준 1e-5)
+  - 정확한 값 대비: 2.07e-4–2.19e-4(기준 1e-3)
+  - 출력 창 밖에 쓰지 않음, 카운터 0 복귀, 8행 패스와 1행 호출의 비트 동일성, 그래프 재생 일치
+  - 남은 차이는 bench와 같은 크기의 FP32 누적뿐이다. 원인 분석(위 절)이 맞았다.
