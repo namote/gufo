@@ -266,8 +266,8 @@ private:
   float* d_confidences_{nullptr};
   std::uint32_t* d_out_token_{nullptr};
   hip_bfloat16* d_bf16_input_{nullptr};
-  // Workspace of the target's EXL3 output head (X2a reference path); null
-  // pointers when the head is not EXL3.
+  // Workspace of the target's EXL3 output head (reference path, and the X2b
+  // fast path for up to 64 rows); null pointers when the head is not EXL3.
   quant::exl3::ReferenceScratch exl3_scratch_{};
   std::size_t scratch_bytes_{0};
   void* d_batch_scratch_{nullptr};

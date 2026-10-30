@@ -326,6 +326,20 @@ void QwenDFlashGpuExecutor::Allocate() {
                         exl3_scratch_.rotated_elements * sizeof(float)));
     HIP_CHECK(hipMalloc(&exl3_scratch_.weight,
                         exl3_scratch_.weight_elements * sizeof(float)));
+    // X2b fast path for up to 64 rows (src/models/qwen/hip/exl3_dispatch.hpp):
+    // an 8-row FP16 rotated-input slab and one counter per 128 head columns,
+    // zero once here; every launch leaves them zero.
+    exl3_scratch_.fast_input_elements = 8 * hidden_size;
+    HIP_CHECK(
+        hipMalloc(&exl3_scratch_.fast_input,
+                  exl3_scratch_.fast_input_elements * sizeof(std::uint16_t)));
+    exl3_scratch_.fast_counter_count = (cfg.vocab_size + 127) / 128;
+    HIP_CHECK(
+        hipMalloc(&exl3_scratch_.fast_counters,
+                  exl3_scratch_.fast_counter_count * sizeof(std::uint32_t)));
+    HIP_CHECK(
+        hipMemset(exl3_scratch_.fast_counters, 0,
+                  exl3_scratch_.fast_counter_count * sizeof(std::uint32_t)));
   }
 
   PrewarmBlockGemms();
@@ -501,6 +515,14 @@ void QwenDFlashGpuExecutor::Free() noexcept {
       (void)hipFree(*ptr);
       *ptr = nullptr;
     }
+  }
+  if (exl3_scratch_.fast_input != nullptr) {
+    (void)hipFree(exl3_scratch_.fast_input);
+    exl3_scratch_.fast_input = nullptr;
+  }
+  if (exl3_scratch_.fast_counters != nullptr) {
+    (void)hipFree(exl3_scratch_.fast_counters);
+    exl3_scratch_.fast_counters = nullptr;
   }
   for (auto*& ptr : d_injected_k_) {
     if (ptr != nullptr) {
