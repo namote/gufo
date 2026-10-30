@@ -2,7 +2,8 @@
 // (src/models/qwen/hip/kernels/exl3_gemv.hpp) against FP64 references:
 //   - the exact projection (src/core/quant/exl3/format.hpp GemvReference):
 //     relative L2 below 1e-3, the FP16 rounding of the rotated input;
-//   - the same projection fed the FP16-rounded rotated input: below 1e-5;
+//   - the same projection fed the kernel's FP16 rotated input (FP32 rotation
+//     arithmetic replicated on the CPU): below 1e-5, FP32 accumulation;
 // plus every row count 1..64 (passes of 8, padded row tiles), input and
 // output strides, the self-resetting segment counters and graph replay.
 
@@ -115,13 +116,29 @@ void TestProblem(const Problem& p, std::mt19937& rng) {
     std::vector<double> yr(p.n);
     GemvReference(xr, inner.data(), suh.data(), svh.data(), p.k, p.n, yr);
     std::copy(yr.begin(), yr.end(), exact.begin() + r * p.n);
-    // The fast path rounds H(suh * x) to FP16 before the products.
+    // The rotated FP16 input exactly as the kernel makes it
+    // (src/core/hip/detail/exl3_gemv.hpp "Input rotation arithmetic"): FP32
+    // product, FP32 butterflies in reference order, one FP32 scale, FP16.
+    // An FP64 rotation rounded to FP16 lands on the other side of an FP16
+    // rounding boundary for about 1 element in 2000, which alone moves the
+    // output by 2e-6 to 2e-5 (relative L2).
     std::vector<double> rot(p.k);
-    for (std::size_t i = 0; i < p.k; ++i)
-      rot[i] = xr[i] * HalfToDouble(suh[i]);
-    HadamardBlocks(std::span<double>(rot));
-    for (auto& v : rot)
-      v = HalfToDouble(HalfFromDouble(v));
+    for (std::size_t s = 0; s < p.k; s += 128) {
+      float seg[128];
+      for (std::size_t i = 0; i < 128; ++i)
+        seg[i] = x[r * x_stride + s + i] *
+                 static_cast<float>(HalfToDouble(suh[s + i]));
+      for (std::size_t len = 1; len < 128; len <<= 1)
+        for (std::size_t i = 0; i < 128; i += len << 1)
+          for (std::size_t j = i; j < i + len; ++j) {
+            const float a = seg[j];
+            const float b = seg[j + len];
+            seg[j] = a + b;
+            seg[j + len] = a - b;
+          }
+      for (std::size_t i = 0; i < 128; ++i)
+        rot[s + i] = HalfToDouble(HalfFromDouble(seg[i] * 0.0883883461356163F));
+    }
     std::vector<double> t(p.n, 0.0);
     for (std::size_t i = 0; i < p.k; ++i)
       for (std::size_t j = 0; j < p.n; ++j)

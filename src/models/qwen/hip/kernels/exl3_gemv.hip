@@ -40,6 +40,9 @@ __global__ __launch_bounds__(kRotateWaves * 32) void Exl3RotateInputKernel(
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       v[j] = x[row * x_stride + first + j] * static_cast<float>(suh[first + j]);
+      // Pin the FP32 rounding of the product: without it LLVM fuses it into
+      // the first butterfly add (v_fma_mix_f32 with the FP16 suh operand).
+      asm volatile("" : "+v"(v[j]));
     }
     exl3::Butterfly128(v, lane);
 #pragma unroll

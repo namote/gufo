@@ -21,6 +21,12 @@
 // exl3_gemv_tiles_rdna.cuh (MIT License, Copyright (c) 2025 Turboderp); the
 // code is written anew.
 //
+// Input rotation arithmetic (the producer side, FP32): x * suh rounded once,
+// the unnormalized butterflies of Butterfly128 (lengths 1, 2, ..., 64, one
+// rounded add or subtract per pair), one multiply by kHadamardScale, then FP16
+// round to nearest even. Each product is pinned by a register barrier so it
+// cannot fuse with a neighbouring add or conversion.
+//
 // Rotated input layout ("lane-major"). For an M-row input of width k, each
 // 16-element k tile kt occupies 16 * M halves at kt * 16 * M: four groups
 // q = 0..3 (the lanes with r0 = 2q), each [M rows][x[2q], x[2q+1], x[2q+8],
