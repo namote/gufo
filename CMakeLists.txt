@@ -329,6 +329,8 @@ add_library(gufo_core STATIC
   src/core/quant/ggml_dequant.cpp
   src/core/quant/ggml_gemm.cpp
   src/core/quant/rotation.cpp
+  src/core/quant/exl3/format.cpp
+  src/core/quant/exl3/checkpoint.cpp
 )
 target_include_directories(gufo_core PUBLIC ${CMAKE_SOURCE_DIR})
 target_compile_definitions(gufo_core PRIVATE
@@ -1083,6 +1085,23 @@ if (BUILD_TESTING)
   add_test(NAME quant_rotation_test COMMAND quant_rotation_test)
   set_tests_properties(quant_rotation_test PROPERTIES
     LABELS "cpu;core;quant;rotation")
+
+  add_executable(quant_exl3_format_test tests/core/quant/exl3_format_test.cpp)
+  target_link_libraries(quant_exl3_format_test PRIVATE gufo_core)
+  add_test(NAME quant_exl3_format_test COMMAND quant_exl3_format_test)
+  set_tests_properties(quant_exl3_format_test PROPERTIES
+    LABELS "cpu;core;quant;exl3")
+
+  # Upstream ExLlamaV3 comparison (tools/qwen27b/rq_quality/exl3/dump_ref.py).
+  add_executable(quant_exl3_upstream_test
+    tests/core/quant/exl3_upstream_test.cpp)
+  target_link_libraries(quant_exl3_upstream_test PRIVATE gufo_core)
+  if(EXISTS ${CMAKE_SOURCE_DIR}/tests/core/quant/exl3_upstream_synth.json)
+    add_test(NAME quant_exl3_upstream_test COMMAND quant_exl3_upstream_test
+      ${CMAKE_SOURCE_DIR}/tests/core/quant/exl3_upstream_synth.json)
+    set_tests_properties(quant_exl3_upstream_test PROPERTIES
+      LABELS "cpu;core;quant;exl3")
+  endif()
 
   add_executable(ggml_gemm_parity_test tests/core/ggml_gemm_parity_test.cpp)
   target_link_libraries(ggml_gemm_parity_test PRIVATE gufo_core)
