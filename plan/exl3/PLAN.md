@@ -94,7 +94,7 @@
 - **대상:** 전문가(MoE) trellis GEMV와 그룹 GEMM, dense 트렁크, MTP, n-gram 표다.
 - **bpw: 전문가 EXL3 5.0 (사용자 결정 2026-10-30, F0 측정 뒤).** 상주 약 77.9 GiB로 지금(UD-Q4_K_XL 79.3 GiB)과 비슷하다. 품질은 지금보다 높을 것으로 보고(27B 환산), decode 속도는 지금과 비슷하다. KVarN이 있으면 262K MTP 세션 8개가 가능하다. F0 결과: [F1-RESULTS.md](F1-RESULTS.md)(`01cf33e0`), HIP 전체 112 GiB. 직접 양자화하려면 Flash-Next HF safetensors 원본이 필요하다(지금은 BF16 GGUF만 있음). 받을지는 F2 시작 전에 정한다. 전문가 bpw b에 대해 상주 약 14.06·b + 7.6 GiB(F1 계산, F0-M으로 확인).
 - **n-gram 표는 F2 범위에서 뺀다.** 디스크에 있으므로 EXL3로 바꿔도 메모리 이득이 없다.
-- **팩:** turboderp `Qwen3.8-Flash-Next-exl3`(3.05 bpw 등, Qwen Community License)를 먼저 쓴다. 직접 양자화하려면 HF safetensors 원본이 필요한데, 지금 받은 것은 BF16 GGUF다.
+- **팩: 직접 양자화하지 않고 turboderp `5.05bpw_h6_ng6` 팩을 받아 쓴다 (사용자 결정 2026-10-31).** 직접 양자화는 GPU 26–33시간이 들고, 창마다 작업 디렉터리를 복사하면 외장 디스크가 모자란다. 이 팩의 비트 배분은 전문가 5, 트렁크·attention·공유 전문가 7, 헤드 6, MTP 5, n-gram K6이다. 조사 근거: [F2-PLAN.md](F2-PLAN.md)(`511d7bbc`). HF safetensors 원본(외장, sha256 확인)은 필요하면 직접 양자화할 때 쓴다.
 - **통과 기준:** 품질은 gufo 지금 UD-Q4_K_XL 수준 이상이고, 속도는 Kyojin 카드(52.8/47.5/73.2, 8K/32K 52.2/51.1) 이상이다.
 
 ### 병행: 투기 디코딩 (W9)
