@@ -8,7 +8,7 @@
   - KL 기준으로 EXL3 b bpw는 UD k-quant 약 b + 0.7 bpw와 비슷하다. 예: EXL3 4.00(4.11 bpw) KL 18.8×10⁻³ ≈ UD-Q4_K_M(4.80 bpw) 17.5×10⁻³(차이 구분 안 됨).
 - **엔진 차이는 작다.** 같은 ExLlamaV3 런타임으로 돌린 BF16 원본과 gufo BF16의 KL은 6.9×10⁻⁴(중앙값 2×10⁻⁵)다. EXL3 수치는 거의 전부 양자화 오차다.
 - **판단: 3번 갈래는 "QTIP 형식 도입" 쪽이다(품질 기준).** 조건이 둘 있다.
-  1. 속도: 깊이 0 decode에서는 확인됐다. 두 엔진 모두 약 200 GB/s로 대역폭에 묶이고, 같은 KL에서 EXL3 4.00이 UD-Q4_K_M보다 tg가 약 20 % 빠르다. 다만 prefill은 약 33 % 느리고, 깊이 32K prefill은 upstream 런타임이 gfx1151에서 돌지 않는다. MTP 투기 디코드와 깊이 32K tg는 SPEED2에서 잰다(아래 "속도").
+  1. 속도: 같은 KL에서 EXL3 4.00이 UD-Q4_K_M보다 decode가 빠르다(tg d0 +20 %, d32K +8 %, MTP 투기 decode 31.7 대 gufo DFlash2 29.5 tok/s, +8 %). 두 엔진 모두 decode는 약 200 GB/s로 대역폭에 묶인다. 다만 upstream 런타임은 prefill이 약 33 % 느리고, 깊이 32K prefill이 gfx1151에서 돌지 않는다. 그래서 형식은 들이고 커널은 gufo 쪽에서 구현하는 방향이다(아래 "속도 요약").
   2. 비교한 k-quant는 unsloth UD 레시피다. 회전 k-quant나 GPTQ식 오차 보정 k-quant(3번 갈래 (a)(b))는 아직 없다. 이들이 약 0.7 bpw의 격차를 얼마나 줄이는지는 R4/E3 결과로 판단한다[짐작: 회전 이득은 3비트대에서 크다고 알려져 있으나 이 하네스로는 아직 재지 않았다].
 - **주의(꼬리):** truncated KL_256은 복사 실패를 숨길 수 있다. 정답 토큰이 기준 top-256 밖이면 KL에는 거의 안 잡히고 NLL에만 잡힌다. 그래서 **KL과 함께 ΔNLL, 위치별 NLL 꼬리를 반드시 같이 본다.** EXL3 3.50에서 실제로 일어났다(아래 "EXL3 3.50 ΔNLL 이상").
 
@@ -180,11 +180,54 @@
 - 그래서 **이 런타임으로는 깊이 32K의 pp를 잴 수 없다.** 실제 서빙에서 여러 chunk로 나뉘는 긴 프롬프트나 다회 대화도 같은 경로를 탈 수 있다[짐작, 확인하지 않음].
 - tg 깊이 32K는 문맥을 위치 0부터 한 번에 채우는 방식(`--fill-single`)으로 SPEED2에서 잰다.
 
-**남은 속도 측정(`PLAN-EXL3-SPEED2.json`, 승인됨):** 커널 목록(`rocprofv3`), tg128 깊이 32K(4.00, 5.00 ABBA), 64프롬프트 chat의 MTP 투기 디코드와 plain(4.00, 5.00). 비교 대상은 gufo DFlash2(UD-Q4_K_M 29.50, UD-Q4_K_XL 29.16 tok/s)와 AR(12.95, 12.33)이다. 실패 원인 셋(rocprofv3 PATH, chat 프롬프트의 transformers 의존, 32K 채우기)은 `3b96a10e`에서 고쳤고 CPU stub으로 확인했다.
+## 속도 (SPEED2, 창 `w8sp2-a01`, 2026-10-30 08:59–11:17)
+
+- 바이너리: `exl3/bench.py` 커밋 `3b96a10e`, 이미지 `ai-tools/exl3-eval:1.6.5-rocm100`(id `03a29041b45d`). 창마다 점검: 컨테이너 0, 1분 부하 0.61–1.86, LOCKS 일치, 루트 여유 157–158 GB. 모든 창은 한 번씩만 돌렸다.
+- `w8sp2-kernels`: FAILED_no_fallback. 측정 작업 자체(`kernels-exl3-4.json`)는 끝났지만, `rocprofv3`가 작업 디렉터리(`/src`, 읽기 전용)에 `.rocprofv3`를 쓰려다 abort한 뒤 timeout(1,200 s)까지 멈췄다. **커널 목록은 여전히 없다.** 고칠 방법: `sh -c "cd /receipt/run && exec rocprofv3 …"`(짧은 창 하나, 약 5분).
+
+### tg128 깊이 32K (`--fill-single`, 문맥을 위치 0부터 한 번에 채움, 3회 평균, ABBA 4.00 → 5.00 → 5.00 → 4.00)
+
+| 설정 | tg128 d32K A / B (tok/s) | gufo 대응(R0 `rq0-speed-a01`, A / B) | 비율 |
+|---|---|---|---:|
+| EXL3 4.00 | 13.65 / 13.66 | UD-Q4_K_M 12.58 / 12.67 | +8 % |
+| EXL3 5.00 | 11.14 / 11.14 | UD-Q4_K_XL 12.03 / 11.99 | −7 % |
+
+- 깊이 0 대비 감소: EXL3 4.00 −12 %, 5.00 −10 %. gufo는 −2–3 %다(R0). 긴 문맥의 decode 비용(attention, fp16 KV를 읽는 양)이 EXL3 쪽에서 더 크다[짐작: gufo는 kvarn-k4v2 압축 KV라 KV 바이트가 적다].
+- 두 표본 차이는 0.1 % 미만이다.
+
+### 64프롬프트 chat: MTP 투기 디코드 대 gufo DFlash2
+
+- 설정: R0 수락률 프롬프트 64개(`accept_prompts.json`), greedy, thinking off, 최대 256토큰, ExLlamaV3 `Generator`. 프롬프트는 팩의 chat template(한 사용자 턴)으로 만들었다. MTP는 팩 자체 MTP 헤드, 기본 draft 길이다(`-mtp`, `num_draft_tokens` 미지정). mtp는 3회, none은 1회 돌렸다. 반복 사이 출력 토큰 sha가 모두 같다.
+- decode tok/s = Σ출력 토큰 / Σgenerate 시간(prefill 제외)이다. gufo 쪽은 R0 `rq0-accept-a01`(serving_bench, `gufo serve`, DFlash2 Q4_K_M adaptive)의 같은 정의 값이다.
+
+| 설정 | 투기 decode tok/s (패스별) | AR tok/s(같은 프롬프트) | AR 대비 | 수락률 Σacc/Σdraft | 출력 토큰당 수락 토큰 |
+|---|---|---:|---:|---:|---:|
+| EXL3 4.00 + MTP | **31.73** (31.79, 31.71, 31.68) | 15.50 | 2.05× | 0.517 | 0.674 |
+| gufo UD-Q4_K_M + DFlash2 | 29.50 [26.78, 32.81] | 12.95 | 2.28× | 0.453 | 0.663 |
+| EXL3 5.00 + MTP | **27.51** (27.58, 27.49, 27.47) | 12.33 | 2.23× | 0.521 | 0.676 |
+| gufo UD-Q4_K_XL + DFlash2 | 29.16 [26.38, 32.50] | 12.33 | 2.36× | 0.457 | 0.664 |
+
+- **EXL3 4.00 + MTP가 gufo 운영(UD-Q4_K_M + DFlash2)보다 약 8 % 빠르다(31.7 대 29.5 tok/s).** 품질은 KL이 구분되지 않는다(18.8 대 17.5×10⁻³, top-1은 EXL3가 0.006 낮다). 이 차이는 거의 전부 AR 속도(바이트 감소)에서 나온다. 투기 배율은 gufo DFlash2가 더 크다(2.28× 대 2.05×).
+- EXL3 5.00 + MTP는 gufo UD-Q4_K_XL + DFlash2보다 약 6 % 느리다(27.5 대 29.2). 같은 AR 속도에서 DFlash2의 배율이 MTP보다 높다.
+- **비교 한계:** 두 엔진의 출력 텍스트가 다르다(엔진·양자화가 달라 greedy 경로가 갈림). 그래서 프롬프트별 paired 비교가 아니다. gufo 구간은 프롬프트 bootstrap 95 %이고, EXL3는 패스별 값만 있다(결정적이라 패스 간 차이는 0.4 % 이내). EXL3 출력 토큰 합계(4.00 11,236, 5.00 11,312)는 64 × 256의 69 %로, 33–34개 프롬프트가 256토큰 전에 끝났다.
+- 투기 배율의 차이는 수락 방식이 아니라 draft 비용과 verify 비용에서 오는 것으로 보인다[짐작]. 출력 토큰당 수락 토큰은 두 엔진이 같다(0.674 대 0.663).
+
+### 속도 요약
+
+| 항목 | EXL3 4.00 대 UD-Q4_K_M(같은 KL) | EXL3 5.00 대 UD-Q4_K_XL(KL 절반) |
+|---|---|---|
+| tg128 d0 | +20 % | ±0 % |
+| tg128 d32K | +8 % | −7 % |
+| pp2048 d0 | −33 % | −32 % |
+| pp d32K | 잴 수 없음(upstream LDS 초과) | 잴 수 없음 |
+| chat 투기 decode | +8 %(MTP 대 DFlash2) | −6 % |
+
+- **판단(속도):** 같은 품질에서 EXL3 형식은 decode를 빠르게 한다(바이트가 적고, 커널이 대역폭에 묶임). 그러나 upstream 런타임은 prefill이 느리고 긴 문맥 prefill이 gfx1151에서 돌지 않으며, 긴 문맥 decode의 감소폭이 크다. **결론은 "형식(QTIP) 도입 + 커널은 gufo 쪽 구현"이다.** EXL3 커널·런타임을 그대로 쓰는 것이 아니다. trellis 디코드를 gufo GEMV/verify/prefill 커널 구조와 kvarn KV, DFlash2 위에 얹는 것이 목표다[짐작: gufo의 prefill 효율과 KV 압축을 유지하면 EXL3 4.00급 바이트로 decode +20 % 수준을 기대].
 
 ## 남은 문제
 
-- 커널 목록, 깊이 32K tg, MTP 투기 디코드(SPEED2).
+- 커널 목록(`rocprofv3` 작업 디렉터리 문제로 두 번 실패, 짧은 창 하나로 재측정 제안).
+- EXL3 MTP와 gufo DFlash2의 프롬프트별 paired 비교는 출력이 달라 불가능하다. 필요하면 같은 출력 길이를 강제하는 방식(EOS 무시)으로 다시 잰다.
 - 회전/GPTQ식 k-quant가 같은 bpw에서 이 격차를 얼마나 줄이는지(R4/E3, 3번 갈래 (a)(b)).
 - EXL3 3.50 복사 실패의 텐서별 원인, decode 경로 확인(선택).
 - 이 결과는 turboderp 공개 차트(4.00bpw가 UD-Q4_K_XL보다 낮은 KL)와 다르다. 이 하네스에서는 4.00이 UD-Q4_K_XL보다 KL이 높다(+3.7×10⁻³, 구분됨). 코퍼스(기술 문서·코드·한국어), 기준(BF16 gufo), 지표(KL_256)가 다르기 때문으로 본다[짐작].
