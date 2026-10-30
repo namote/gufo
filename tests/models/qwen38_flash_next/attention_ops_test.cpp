@@ -886,9 +886,15 @@ struct PagedLayout {
   std::uint32_t pool{0};    ///< physical blocks of the pool
   std::vector<std::uint32_t> table;
 
+  /// The smallest pool of at least `minimum` blocks that the stride-7 walk
+  /// below visits without repeating: not a multiple of 7.
+  static std::uint32_t CoprimePool(std::uint32_t minimum) {
+    return minimum % 7 == 0 ? minimum + 1 : minimum;
+  }
+
   explicit PagedLayout(std::uint32_t tokens)
       : blocks((tokens + kBlockTokens - 1) / kBlockTokens),
-        pool(2 * blocks + 3),
+        pool(CoprimePool(2 * blocks + 3)),
         table(blocks) {
     for (std::uint32_t b = 0; b < blocks; ++b)
       table[b] = (pool - 1) - (b * 7) % pool;
