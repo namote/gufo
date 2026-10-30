@@ -6,7 +6,7 @@
 
 - 감독 결정(2026-10-30): F0은 측정만, n-gram 표는 F2 범위에서 뺀다, 이미지 선점은 P2에 별도 커밋, MTP 층은 같은 plane, KVarN V 배치는 K0-FN 뒤에 정한다.
 - **F0:** 완료(아래 "F0 결과").
-- **P1 정확성, K0-FN:** 완료(아래). 다음은 P1 ABBA 타이밍이다(감독 "start" 대기).
+- **P1 정확성, K0-FN, P1 ABBA:** 완료(아래). ABBA는 slower 0, inconclusive 1. KVarN K1a 커밋, K1b 코드 작성 중이다.
 
 ## 브랜치와 커밋 [확인]
 
@@ -195,6 +195,27 @@ cold는 새 프로세스의 첫 요청(빈 행 캐시), warm은 같은 요청의
 - **Hadamard와 balancing:** 회전은 V 오차를 0.62에서 0.54로 줄이고, KL 꼬리(p95, 최대)를 rtn 대비 2–4배 줄인다. balancing(kvarn 대 hrtn)은 이 입력에서 차이가 작다.
 - **chunked prefill:** k4v2의 중앙값이 약 3배 커지지만 최대는 비슷하다. rtn_k4v2는 청크에서 최대 0.23으로 튄다.
 - **판정 기준은 사용자와 정한다**(설계 3.2). 이 결과만 보면 k4v4가 27B k4v2 수준(최대 1e-3대)이다. k4v2는 답은 유지하지만 KL 꼬리가 10배다. V 배치 결정(channel-major / token-major)에 이 결과를 쓴다.
+
+## P1 ABBA 타이밍 (2026-10-30 23:16 – 10-31 00:42) [확인]
+
+- **실행:** 감독의 조건부 "start" 뒤 돌렸다. 조건은 내 빌드 중지, EXL3SAME 종료, `docker ps` 비어 있음, 1분 load < 2이고, 23:16에 충족되었다. 창마다 사전 검사(빈 `docker ps`, LOCKS 일치, 153 GiB)를 했다.
+- **순서:** BASE-mtp a1 → CAND-mtp b1 → CAND-mtp b2 → BASE-mtp a2 → BASE-ar a1 → CAND-ar b1 → CAND-ar b2 → BASE-ar a2. 8개 모두 COMPLETE, health_PASS, 재시도 없음.
+- **이미지:** BASE `f1-base-rocm101`(d2b751a9, id `8b33a7a6`), CAND `f1-cand-rocm101`(83d90aaa 라벨, 운영 gufo `7lcxjf2g` = P1 b75a0051, id `99c908e2`).
+  - CAND 계획의 `gufo_revision`을 이미지 라벨(83d90aaa)에 맞춰 고쳤다. LOCKS는 `ac9f15e4…`다.
+- **결과 위치:** `~/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/f1-abba/`
+- **판정:** `tools/qwen-flash/spec/abba.py`, 요청·단계별 5 %·10 ms. 출력은 `~/projects/ai.tools/storage/evaluations/f1-abba-20261031/{mtp-0,mtp-1,mtp-2,ar-0}.json`(sha256 `3e1f5306…`, `ae9e2e9c…`, `cbd54721…`, `8afb98a4…`)이다.
+- **load:** 창 시작 직전 1분 load가 9.65, 18.12로 높은 때가 있었다. 직전 창 서버의 로드·종료(n-gram reader의 I/O 대기)가 1분 평균에 남은 것이다. 창 실행 중 확인했을 때 외부 부하는 없었다(승인된 외장 HF 다운로드 `curl` 3.6 % CPU만).
+
+| 서버 | 세트 | 프롬프트 | pass | slower | faster | inconclusive | decode tok/s BASE / CAND(참고) |
+|---|---|---:|---:|---:|---:|---:|---|
+| MTP | A | 64 | 127 | 0 | 0 | 1 | 53.17 / 52.85 (0.994) |
+| MTP | K | 17 | 34 | 0 | 0 | 0 | 51.43 / 51.42 (1.000) |
+| MTP | D (8K/32K) | 8 | 16 | 0 | 0 | 0 | 45.79 / 45.55 (0.995) |
+| AR | D (8K/32K) | 8 | 16 | 0 | 0 | 0 | 28.48 / 28.18 (0.990) |
+
+- **동일성:** 97개 프롬프트 × 4회(두 팔 × 2반복)에서 완성 sha256, draft, accepted, prompt 토큰 수가 모두 같다(97/97). P1이 draft 정책 경로를 바꾸지 않았다는 것이 BASE 팔로 확인되었다.
+- **inconclusive 1건:** MTP A `repetition_sequence` decode다. BASE 1,583–2,183 ms(중앙값 1,666), CAND 1,587–2,300 ms(중앙값 1,828)이다. 두 팔 모두 1.6 s대와 2.0–2.3 s대로 갈리는 쌍봉이고, 범위가 겹친다. 규칙대로 확대하거나 평균 내지 않고 inconclusive로 둔다. 확인하려면 이 history만 번갈아 다시 돌린다(감독 결정).
+- **slower 판정은 0건이다.** decode tok/s 비율 0.990–1.000은 참고값이다(판정은 요청별).
 
 ## ABBA 계획 초안 (P1 정확성 통과 뒤)
 
