@@ -429,3 +429,57 @@
   - 결과 위치: `~/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/w9-i1f2/w9-i1f2-suite/receipt/run/`
 - **3단계 결론:** greedy 동일성 89/89(I1V)와 기능 suite(I1 활성 그룹 I1F2, I1 비활성 그룹 I1F standard-cache)가 모두 통과했다.
 - **다음:** I1 ABBA(W8 SPEED2 뒤, 감독 "start").
+
+## I1 ABBA 속도 판정 (2026-10-30)
+
+### 창 [확인]
+
+- **순서:** MAIN a1 → I1 b1 → GRID c1 → GRID c2 → I1 b2 → MAIN a2. 모두 COMPLETE, health_PASS, 재시도 없음. 11:22–12:59에 돌렸다.
+- **창마다 사전 검사:** `docker ps` 비어 있음, LOCKS, 디스크, 1분 load < 4(시작 때 0.6–3.8).
+- **조건:** NVMe 모델(sha256 확인), 서버 준비 22–23 s. 세 arm 모두 같은 nix ROCm 10.1 / Clang 24이고, A/K/D 세트, C=1 greedy, think off, 프롬프트 캐시 꺼짐, warmup 1(D 0) + 반복 2를 썼다.
+- **결과 위치:** `~/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/w9-abba/<tag>/`
+- **판정:** `tools/qwen-flash/spec/abba.py`(프롬프트·단계별, t = max(10 ms, 5 %), 요청끼리 평균하지 않음). 결과는 `~/projects/ai.tools/storage/evaluations/w9-abba-20261030/abba-{i1,grid,grid_vs_i1}-{0,1,2}.json`에 있다.
+
+### 결과
+
+| 비교 | 세트 | decode tok/s (참고, 반복 합) | pass / faster / slower / inconclusive (프롬프트 × 단계) | 완성 동일 |
+|---|---|---|---|---|
+| **I1 대 MAIN** | A 64 | 49.36 → 53.53 (**1.085**) | 85 / 38 / **2** / 3 | 64/64 |
+| | K 17 | 47.82 → 51.92 (**1.086**) | 22 / 10 / 0 / 2 | 17/17 |
+| | D 8 | 42.01 → 45.97 (**1.094**) | 10 / 6 / 0 / 0 | 8/8 |
+| GRID 대 MAIN | A | 49.36 → 53.80 (1.090) | 81 / 40 / 2 / 5 | 64/64 |
+| | K | 47.82 → 52.46 (1.097) | 20 / 13 / 0 / 1 | 17/17 |
+| | D | 42.01 → 46.56 (1.108) | 9 / 7 / 0 / 0 | 8/8 |
+| GRID 대 I1 | A / K / D | 1.005 / 1.010 / 1.013 | A 123 / 1 / 2 / 2, K 34 / 0 / 0 / 0, D 15 / 1 / 0 / 0 | 전부 같음 |
+
+- **prefill:** 모든 비교에서 pass다. inconclusive는 I1 대 MAIN의 `d4_ko_instr_01` prefill 하나이고, MAIN 쪽에 310 ms 이상치가 있다.
+- **각 arm 안의 일관성:** 반복과 창 사이의 완성 sha와 draft 수가 모두 같다.
+
+### 판정에 걸린 것 (I1 대 MAIN, A)
+
+| 프롬프트 | 단계 | MAIN (ms, 4표본) | I1 (ms, 4표본) | 상태 | 원인 |
+|---|---|---|---|---|---|
+| `d4_ko_instr_04` | decode | 139.7–140.6 | 152.3–153.3 | **slower** (+12.9, 기준 10) | 9토큰 답. I1이 첫 사이클부터 넓게 드래프트한다(draft 9 대 8, 수락 7 대 7). 운영 컨트롤러는 "수락을 보기 전 첫 사이클은 보수적 폭"으로 이 짧은 답 문제를 이미 막고 있었다(QUALITY.md "Sampled draft-head costs") |
+| `en_code_rust_err` | decode | 1912.0–1914.8 | 2067.2–2073.2 | **slower** (+155.8, 기준 95.7, +8.1 %) | 확신도 정지가 이 프롬프트에서 너무 일찍 끊는다(draft 167 → 155, 수락 146 → 141, 사이클이 늘어남) |
+| `d4_ko_code_02` | decode | 5035–5503 | 4623–5237 | inconclusive | 양쪽에 이상치가 하나씩 있다. 중앙값은 I1이 412 ms 빠르다 |
+| `ko_explain_fermentation` | decode | 6399–6449 | 6065–6100 | inconclusive | I1이 337 ms 빠르지만 범위 간격이 기준 320 ms에 조금 못 미친다 |
+| `d4_ko_instr_01` | prefill | 198–311 | 200–265 | inconclusive | 양쪽 prefill이 흔들린다(I1과 무관한 단계) |
+
+- K와 D에는 slower가 없다. inconclusive 2개(`k_copy_2`, `k_prose_0` decode)는 그대로 남긴다.
+- **시뮬레이터 확인:** 정확히 재생되는 A+K trace에서 두 slower 프롬프트는 I1이 P0보다 각각 1.057배 느리다. 실측(+9 %, +8 %)과 방향과 크기가 맞는다. 그래서 잡음이 아니라 정책 탓이다.
+
+### 수정안 (시뮬레이터, A+K 81개, 승인 대기)
+
+- 스크립트: `~/projects/ai.tools/storage/evaluations/w9-abba-20261030/{variants.py, sweep_v1.py}`
+
+| 변형 | 전체 대 P0 | `d4_ko_instr_04` | `en_code_rust_err` | 5 %·10 ms보다 느린 프롬프트 |
+|---|---|---|---|---|
+| I1 (지금) | 1.088 | 1.057 | 1.057 | 1(+모델 경계 1) |
+| V1: 첫 사이클(`explored_depth == 0`)은 운영 컨트롤러 폭을 쓰고, 그다음부터 확신도 규칙 | 1.087 | 1.000 | 1.070 | 1 |
+| V2: 운영 컨트롤러 길이를 아래 한계로 | 1.033 | 1.057 | 1.009 | 2 |
+| **V1 + 깊은 임계값 0.9/0.4** (얕은 0.6/0.3/3은 Kyojin 그대로) | **1.093** | 1.000 | ≤ 1.015 | **0** |
+| V1 + 격자 최선 0.7/0.3/0.9/0.4/3 | 1.095 | 1.000 | ≤ 1.03 | 0 |
+
+- [짐작] V1은 운영 컨트롤러가 이미 쓰는 첫 사이클 보수성을 되살리는 것이라 근거가 명확하다.
+- 깊은 임계값을 바꾸는 것은 81개 프롬프트로 고른 값이라 과적합 위험이 있다. 바꾸면 다시 ABBA로 확인해야 한다.
+- **제안:** V1 + 깊은 임계값 0.9/0.4(자유 파라미터 2개)로 고치고, 다시 빌드하고, I1 대 MAIN ABBA를 다시 한다(MAIN 표본은 재사용하지 않고 새로 번갈아 잰다). 또는 V1만 넣고 깊은 임계값은 Kyojin 그대로 둔다.
