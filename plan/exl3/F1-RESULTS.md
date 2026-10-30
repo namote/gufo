@@ -6,7 +6,7 @@
 
 - 감독 결정(2026-10-30): F0은 측정만, n-gram 표는 F2 범위에서 뺀다, 이미지 선점은 P2에 별도 커밋, MTP 층은 같은 plane, KVarN V 배치는 K0-FN 뒤에 정한다.
 - **F0:** 완료(아래 "F0 결과").
-- **P1, K0-FN:** 코드, 빌드, 이미지 완료. GPU 창은 아직 돌리지 않았다. 순서는 X-A xa-ref → F1 F0 → W9 3개 → X-A X1 → P1T/K0이다.
+- **P1 정확성, K0-FN:** 완료(아래). 다음은 P1 ABBA 타이밍이다(감독 "start" 대기).
 
 ## 브랜치와 커밋 [확인]
 
@@ -140,6 +140,61 @@ cold는 새 프로세스의 첫 요청(빈 행 캐시), warm은 같은 요청의
   - 후보 이미지를 다시 만들었다: `f1-cand-rocm101` id `99c908e2`, 라벨 `83d90aaa…`. 운영 gufo `7lcxjf2g`는 그대로다(운영 소스가 바뀌지 않았다). closure tar는 바로 지웠다.
   - 계획 경로와 라벨을 갱신하고 LOCKS를 반영했다(`7692cbe4…`).
 - 디스크가 다시 148.3 GiB로 내려갔다(새 이미지 층 + nix store). 감독이 build cache를 정리해 154 GiB가 되었다.
+
+## P1 정확성 (2026-10-30, 세 번째 시도, 이미지 `f1-cand-rocm101` id `99c908e2`) [확인]
+
+창마다 사전 검사를 하고 한 번씩 돌렸다. 세 창 모두 COMPLETE, health_PASS, 재시도 없음이다. 결과는 `~/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/f1-p1/`에 있다.
+
+- **`f1-p1-unit`:**
+  - attention_ops(48 s) 통과.
+    - 페이지 행 4개 형상(20/43, 36/75, 17/37, 2/8 블록)이 모두 비트 단위로 같다.
+    - 기존 검사도 모두 통과했다: chunk 경계 동일, WMMA live extent, list 대 walk 비트 동일, structured FP64 오차 1.5e-7 이하, WMMA 2e-2 이하.
+  - snapshot(163 s, exact round trips), session(445 s), continuation adapter(215 s) 통과.
+  - 이 모델 테스트들은 identity 표 뒤 블록 span 저장소로 돈다.
+- **`f1-p1-greedy`:** A 64, K 17, D 8 = 89개 완성 sha256이 I1V와 같고 M0 AR과도 같다(89/89).
+  - draft 수는 I1V와 87/89가 다르다. 기준 `d2b751a9`에 W9 `92fcaf37`("keep the first-cycle MTP width and relax deep confidence thresholds")이 들어 있어 정책이 I1V와 다르기 때문이다.
+  - 같은 정책으로 돈 기록이 없으므로, draft 수가 정확히 같은지는 ABBA의 BASE(d2b751a9) 팔과 비교한다.
+  - 후보의 drafted / accepted 합은 15,850 / 11,115다(I1V는 15,332 / 10,982).
+- **`f1-p1-suite`:**
+  - single-session(`--sessions 1`, `long-context` + `cache`): 13개 사례가 모두 통과했다.
+  - standard-cache(`--sessions 2`, `cache`): 12개 사례가 모두 통과했다.
+  - 모델은 NVMe에 있고, mmproj는 같은 디렉터리로 마운트했다. 테스트는 이미지 runner(W9 I1F/I1F2와 같다)를 썼다.
+
+## K0-FN: Flash-Next KVarN fake quant 품질 (2026-10-30) [확인]
+
+- **창:** `f1-k0-32k`(6.5분), `f1-k0-long`(8.5분). 둘 다 COMPLETE, health_PASS다.
+- **원시 기록:** `f1-p1/f1-k0-*/receipt/run/*.jsonl`
+- **채점:** 27B 문서 과제는 `kvarn-gold.json`과 JSON 일치로, needle은 세 코드가 모두 들어 있는지로 본다.
+- **fp16 행:** 스냅샷 왕복에서 KL이 0이고 top-1이 1.0이다. 하네스(payload 영역 계산과 복원)가 정확하다는 뜻이다.
+- **모든 설정에서** teacher forcing top-1이 1.0000이고, free greedy가 FP16과 같으며(갈림 없음), gold/needle을 모두 맞혔다. 그래서 차이는 KL에만 있다.
+
+| 입력 | 토큰 | 설정 | K 상대오차 | V 상대오차 | KL 중앙값 | KL p95 | KL 최대 |
+|---|---:|---|---:|---:|---:|---:|---:|
+| 27B 32K 과제 | 32,770 | rtn_k4v2 | 0.041 | 0.624 | 5.8e-6 | 2.6e-3 | 2.2e-2 |
+| | | hrtn_k4v2 | 0.046 | 0.541 | 5.2e-6 | 6.9e-4 | 6.6e-3 |
+| | | **kvarn_k4v2** | 0.046 | 0.541 | 4.4e-6 | 6.0e-4 | 1.0e-2 |
+| | | kvarn_k4v2_g64 | 0.040 | 0.541 | 4.6e-6 | 8.3e-4 | 9.8e-3 |
+| | | **kvarn_k4v4** | 0.046 | 0.108 | 1.2e-6 | 8.3e-5 | 1.7e-3 |
+| | | kvarn_k8v4 | 0.003 | 0.108 | 1.3e-6 | 3.0e-5 | 6.1e-4 |
+| 같은 과제, prefill 4096 청크 | 32,770 | rtn_k4v2 | | | 6.9e-6 | 1.7e-3 | 2.3e-1 |
+| | | kvarn_k4v2 | | | 1.3e-5 | 1.1e-3 | 8.8e-3 |
+| | | kvarn_k4v4 | | | 1.6e-6 | 1.7e-4 | 1.3e-3 |
+| 27B "256K" 문서 | 254,880 | rtn_k4v2 | 0.042 | 0.619 | 1.2e-5 | 1.3e-3 | 3.0e-2 |
+| | | kvarn_k4v2 | 0.047 | 0.541 | 1.0e-5 | 7.6e-4 | 1.3e-2 |
+| | | kvarn_k4v4 | 0.047 | 0.108 | 1.8e-6 | 8.8e-5 | 9.6e-3 |
+| | | kvarn_k8v4 | 0.003 | 0.108 | 1.9e-6 | 7.9e-5 | 3.0e-3 |
+| needle 32K (docs) | 27,567 | rtn_k4v2 | 0.075 | 0.590 | 3.7e-5 | 8.5e-4 | 3.7e-3 |
+| | | kvarn_k4v2 | 0.075 | 0.542 | 1.9e-5 | 2.5e-4 | 9.6e-4 |
+| | | kvarn_k4v4 | 0.075 | 0.108 | 4.1e-6 | 6.3e-5 | 1.7e-4 |
+| needle 200K (docs) | 195,049 | kvarn_k4v2 | 0.074 | 0.542 | **2.7e-4** | 5.4e-3 | 3.2e-2 |
+| | | kvarn_k4v4 | 0.074 | 0.108 | 3.8e-5 | 4.9e-4 | 1.8e-3 |
+
+읽은 것:
+- **27B K0 대비:** 27B kvarn_k4v2의 KL 최대는 32K에서 9.5e-4, 256K에서 6.7e-3이었다(`plan/gufo-upstream-port/KVARN.md:128-157`). Flash-Next k4v2는 1.0e-2 / 1.3e-2로 32K에서 약 10배 크다. [짐작] KV 헤드가 2개이고 GQA가 12라 KV 행 하나의 오차가 더 많은 query 헤드에 퍼진다. 확인하지 않았다.
+- **긴 자연어 문맥(needle 200K)에서 k4v2의 KL 중앙값이 2.7e-4로 커진다**(27B 과제 문서 1.0e-5). 그래도 top-1과 답은 그대로다. k4v4는 중앙값 3.8e-5, 최대 1.8e-3이다.
+- **Hadamard와 balancing:** 회전은 V 오차를 0.62에서 0.54로 줄이고, KL 꼬리(p95, 최대)를 rtn 대비 2–4배 줄인다. balancing(kvarn 대 hrtn)은 이 입력에서 차이가 작다.
+- **chunked prefill:** k4v2의 중앙값이 약 3배 커지지만 최대는 비슷하다. rtn_k4v2는 청크에서 최대 0.23으로 튄다.
+- **판정 기준은 사용자와 정한다**(설계 3.2). 이 결과만 보면 k4v4가 27B k4v2 수준(최대 1e-3대)이다. k4v2는 답은 유지하지만 KL 꼬리가 10배다. V 배치 결정(channel-major / token-major)에 이 결과를 쓴다.
 
 ## ABBA 계획 초안 (P1 정확성 통과 뒤)
 
