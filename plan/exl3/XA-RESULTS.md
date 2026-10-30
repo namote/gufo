@@ -225,3 +225,26 @@ struct DeviceLinear {                 // one EXL3 projection y = x W, W [k][n]
   3. 기준 커널과 GPU 단위 시험
   4. 투영 분기(기준 경로)
   5. 품질 창
+
+## X2a 배선 (a72c89b0, 2026-10-30)
+
+- 기준 GPU 경로: `src/core/quant/exl3/reference.{hpp,hip}`
+- 분기점 하나: `src/models/qwen/hip/exl3_dispatch.hpp`의 `LaunchExl3Projection`. X2b 빠른 커널은 이 함수 뒤에 붙는다.
+- 분기 지점 다섯 곳:
+  - 디코드: `decode_step.cpp`
+  - 배치 디코드와 검증: `batched_decode.cpp`의 `LaunchProjection`
+  - prefill: `prefill_chunk.cpp`의 `gemm_weight`
+  - `LaunchQwenOutputHead`
+  - DFlash2 공유 헤드: `RunBlockGemm`, `ProjectBlock`
+- arena: `QwenGpuArena::AllocateExl3` / `Exl3Scratch`. 세션마다 약 540 MB(기준 경로). X2b slab 크기는 W3와 합의한다.
+- 로더 사이드카 분기:
+  - 임베딩은 기본 Q8_0이다. 사이드카 키 `gufo.exl3.embedding="bf16"`이면 BF16으로 둔다(비교용).
+  - EXL3 텐서는 장치 할당 하나에 256 B 정렬로 올린다.
+  - `GetResidentBytes`에 EXL3 바이트를 포함한다.
+- GPU 창: `PLAN-EXL3-X2A.json`(단위 시험, 사이드카 target_test, X1 BF16과 비교, UD fingerprint). 결과는 여기에 적는다.
+
+### 후속 작업 (X2/X4)
+
+- **MTP를 쓸 수 없다.** 사이드카 이미지에 blk.64(nextn) 텐서가 없다. EXL3 팩의 `mtp.*`를 이미지에 넣거나 EXL3 투영으로 연결해야 한다.
+- **DFlash 비용 선택이 EXL3 헤드를 비-Q8로 본다.** `QwenDFlashGpuDraftBackend`는 `output.type == kQ8_0`으로 Q8/Q4 검증 비용을 고른다. EXL3 참조는 type이 기본값 `kF32`라서 Q4 쪽으로 분류된다. EXL3용 비용 기준을 정해야 한다.
+- **`rq_logits`/`rq_kld_base`가 헤드 scratch를 넘기지 않는다.** 이 상태로 EXL3 모델을 넣으면 `logic_error`로 멈춘다. W2가 고친다(supervisor 배정).
