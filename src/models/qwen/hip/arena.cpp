@@ -1208,6 +1208,8 @@ struct QwenGpuArena::Exl3Workspace {
       (void)hipFree(scratch.fast_input);
     if (scratch.fast_counters != nullptr)
       (void)hipFree(scratch.fast_counters);
+    if (scratch.fast_down_input != nullptr)
+      (void)hipFree(scratch.fast_down_input);
   }
 };
 
@@ -1243,6 +1245,11 @@ void QwenGpuArena::AllocateExl3(std::size_t max_input_width) {
                       scratch.fast_counter_count * sizeof(std::uint32_t)));
   HIP_CHECK(hipMemset(scratch.fast_counters, 0,
                       scratch.fast_counter_count * sizeof(std::uint32_t)));
+  // The fused MLP writes the down projection's 8-row rotated input here.
+  scratch.fast_down_input_elements = 8 * config_.intermediate_size;
+  HIP_CHECK(
+      hipMalloc(&scratch.fast_down_input,
+                scratch.fast_down_input_elements * sizeof(std::uint16_t)));
   exl3_ = std::move(workspace);
 }
 

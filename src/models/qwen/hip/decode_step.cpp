@@ -320,18 +320,11 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
 
     // Fused SwiGLU FFN
     if (IsExl3(layer.ffn_gate)) {
-      const std::size_t intermediate_size = config.intermediate_size;
-      const Exl3GroupOutput gate_up[] = {
-          {&layer.ffn_gate, ffn_scratch.gate.data()},
-          {&layer.ffn_up, ffn_scratch.up.data()}};
-      LaunchExl3Projections(gate_up, decode_scratch.normed.data(), 1, exl3,
-                            arena.stream);
-      LaunchBatchedSwiGLUActivation(ffn_scratch.gate.data(),
-                                    ffn_scratch.up.data(),
-                                    ffn_scratch.activation.data(), nullptr,
-                                    intermediate_size, arena.stream);
-      LaunchExl3Projection(layer.ffn_down, ffn_scratch.activation.data(), 1,
-                           ffn_scratch.out.data(), exl3, arena.stream);
+      LaunchExl3SwiGLUMlp(layer.ffn_gate, layer.ffn_up, layer.ffn_down,
+                          decode_scratch.normed.data(), 1,
+                          ffn_scratch.gate.data(), ffn_scratch.up.data(),
+                          ffn_scratch.activation.data(), ffn_scratch.out.data(),
+                          exl3, arena.stream);
     } else if (rotation.ffn_down_in != nullptr) {
       // The module's two launches with the SwiGLU row rotated in between.
       const std::size_t intermediate_size = config.intermediate_size;

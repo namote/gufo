@@ -21,6 +21,7 @@
 
 #include "src/core/quant/exl3/reference.hpp"
 #include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
+#include "src/models/qwen/hip/ops/swiglu.hpp"
 
 namespace gufo::hip {
 
@@ -47,8 +48,9 @@ inline void LaunchExl3Projection(const models::QwenTensorRef& weight,
   if (scratch->fast_input != nullptr && rows <= kExl3FastMaxRows &&
       Exl3FastSupported(linear)) {
     const Exl3FastWorkspace workspace{
-        scratch->fast_input, scratch->fast_input_elements,
-        scratch->fast_counters, scratch->fast_counter_count};
+        scratch->fast_input,      scratch->fast_input_elements,
+        scratch->fast_counters,   scratch->fast_counter_count,
+        scratch->fast_down_input, scratch->fast_down_input_elements};
     LaunchExl3FastProjection(linear, x, x_stride != 0 ? x_stride : linear.k,
                              rows, y, y_stride != 0 ? y_stride : linear.n,
                              workspace, stream);
@@ -92,8 +94,9 @@ inline void LaunchExl3Projections(std::span<const Exl3GroupOutput> outputs,
                     outputs[i].y_stride != 0 ? outputs[i].y_stride : linear->n};
     }
     const Exl3FastWorkspace workspace{
-        scratch->fast_input, scratch->fast_input_elements,
-        scratch->fast_counters, scratch->fast_counter_count};
+        scratch->fast_input,      scratch->fast_input_elements,
+        scratch->fast_counters,   scratch->fast_counter_count,
+        scratch->fast_down_input, scratch->fast_down_input_elements};
     const std::span<const Exl3FastTarget> group(targets.data(), outputs.size());
     if (all_exl3 && Exl3FastGroupSupported(group, workspace)) {
       LaunchExl3FastProjections(group, x,
@@ -106,6 +109,41 @@ inline void LaunchExl3Projections(std::span<const Exl3GroupOutput> outputs,
     LaunchExl3Projection(*output.weight, x, rows, output.y, scratch, stream,
                          x_stride, output.y_stride);
   }
+}
+
+/// The FFN of `rows` rows: out = down(silu(x gate) * (x up)). Decode and
+/// verify rows run the fused MLP (two GEMV launches per 8 rows, no FP32
+/// activation); otherwise gate/up, SwiGLU into `activation`, then down.
+/// gate_y, up_y and activation are rows x intermediate FP32 scratch; out has
+/// rows of hidden floats.
+inline void LaunchExl3SwiGLUMlp(const models::QwenTensorRef& gate,
+                                const models::QwenTensorRef& up,
+                                const models::QwenTensorRef& down,
+                                const float* x, std::size_t rows, float* gate_y,
+                                float* up_y, float* activation, float* out,
+                                const quant::exl3::ReferenceScratch* scratch,
+                                hipStream_t stream) {
+  if (scratch == nullptr || gate.exl3 == nullptr || up.exl3 == nullptr ||
+      down.exl3 == nullptr) {
+    throw std::logic_error("EXL3 MLP without descriptors or workspace");
+  }
+  if (scratch->fast_input != nullptr && rows <= kExl3FastMaxRows) {
+    const Exl3FastWorkspace workspace{
+        scratch->fast_input,      scratch->fast_input_elements,
+        scratch->fast_counters,   scratch->fast_counter_count,
+        scratch->fast_down_input, scratch->fast_down_input_elements};
+    const Exl3FastMlp mlp{gate.exl3, up.exl3, down.exl3,   gate_y,
+                          up_y,      out,     down.exl3->n};
+    if (Exl3FastMlpSupported(mlp, workspace)) {
+      LaunchExl3FastMlp(mlp, x, gate.exl3->k, rows, workspace, stream);
+      return;
+    }
+  }
+  const Exl3GroupOutput gate_up[] = {{&gate, gate_y}, {&up, up_y}};
+  LaunchExl3Projections(gate_up, x, rows, scratch, stream);
+  LaunchBatchedSwiGLUActivation(gate_y, up_y, activation, nullptr,
+                                rows * gate.exl3->n, stream);
+  LaunchExl3Projection(down, activation, rows, out, scratch, stream);
 }
 
 /// The largest input width of the model's projections (workspace sizing).

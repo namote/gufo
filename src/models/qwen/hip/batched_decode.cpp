@@ -102,17 +102,6 @@ void LaunchFfnActivation(const models::QwenLayerWeights& layer,
                          const quant::exl3::ReferenceScratch* exl3) {
   const auto& gate = layer.ffn_gate;
   const auto& up = layer.ffn_up;
-  if (IsExl3(gate)) {
-    const Exl3GroupOutput gate_up[] = {{&gate, scratch.ffn.gate.data()},
-                                       {&up, scratch.ffn.up.data()}};
-    LaunchExl3Projections(gate_up, scratch.decode.normed.data(), batch_size,
-                          exl3, stream);
-    LaunchBatchedSwiGLUActivation(scratch.ffn.gate.data(),
-                                  scratch.ffn.up.data(),
-                                  scratch.ffn.activation.data(), nullptr,
-                                  batch_size * intermediate_size, stream);
-    return;
-  }
   const bool packed_format = gate.type == core::GgmlType::kQ4_K ||
                              gate.type == core::GgmlType::kQ5_K ||
                              gate.type == core::GgmlType::kQ6_K ||
@@ -462,13 +451,22 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
                     scratch.decode.normed.data(), batch_size, hidden_size,
                     layer.rotation.ffn_in, arena.stream);
 
-    LaunchFfnActivation(layer, scratch, batch_size, intermediate_size,
-                        hidden_size, arena.stream, arena.Exl3Scratch());
-    RotateGroupInput(scratch.ffn.activation.data(), layer.rotation.ffn_down_in,
-                     batch_size, intermediate_size, arena.stream);
-    LaunchProjection(layer.ffn_down, scratch.ffn.activation.data(),
-                     scratch.ffn.out.data(), batch_size, hidden_size,
-                     intermediate_size, arena.stream, arena.Exl3Scratch());
+    if (IsExl3(layer.ffn_gate)) {
+      LaunchExl3SwiGLUMlp(layer.ffn_gate, layer.ffn_up, layer.ffn_down,
+                          scratch.decode.normed.data(), batch_size,
+                          scratch.ffn.gate.data(), scratch.ffn.up.data(),
+                          scratch.ffn.activation.data(), scratch.ffn.out.data(),
+                          arena.Exl3Scratch(), arena.stream);
+    } else {
+      LaunchFfnActivation(layer, scratch, batch_size, intermediate_size,
+                          hidden_size, arena.stream, arena.Exl3Scratch());
+      RotateGroupInput(scratch.ffn.activation.data(),
+                       layer.rotation.ffn_down_in, batch_size,
+                       intermediate_size, arena.stream);
+      LaunchProjection(layer.ffn_down, scratch.ffn.activation.data(),
+                       scratch.ffn.out.data(), batch_size, hidden_size,
+                       intermediate_size, arena.stream, arena.Exl3Scratch());
+    }
     LaunchBatchedResidualAdd(
         scratch.decode.hidden.data(), scratch.ffn.out.data(),
         scratch.decode.hidden.data(), batch_size, hidden_size, arena.stream);
@@ -912,13 +910,22 @@ QwenGpuExecutor::ForwardVerificationBatch(
                     scratch.decode.normed.data(), batch_size, hidden_size,
                     layer.rotation.ffn_in, arena_.stream);
 
-    LaunchFfnActivation(layer, scratch, batch_size, intermediate_size,
-                        hidden_size, arena_.stream, arena_.Exl3Scratch());
-    RotateGroupInput(scratch.ffn.activation.data(), layer.rotation.ffn_down_in,
-                     batch_size, intermediate_size, arena_.stream);
-    LaunchProjection(layer.ffn_down, scratch.ffn.activation.data(),
-                     scratch.ffn.out.data(), batch_size, hidden_size,
-                     intermediate_size, arena_.stream, arena_.Exl3Scratch());
+    if (IsExl3(layer.ffn_gate)) {
+      LaunchExl3SwiGLUMlp(layer.ffn_gate, layer.ffn_up, layer.ffn_down,
+                          scratch.decode.normed.data(), batch_size,
+                          scratch.ffn.gate.data(), scratch.ffn.up.data(),
+                          scratch.ffn.activation.data(), scratch.ffn.out.data(),
+                          arena_.Exl3Scratch(), arena_.stream);
+    } else {
+      LaunchFfnActivation(layer, scratch, batch_size, intermediate_size,
+                          hidden_size, arena_.stream, arena_.Exl3Scratch());
+      RotateGroupInput(scratch.ffn.activation.data(),
+                       layer.rotation.ffn_down_in, batch_size,
+                       intermediate_size, arena_.stream);
+      LaunchProjection(layer.ffn_down, scratch.ffn.activation.data(),
+                       scratch.ffn.out.data(), batch_size, hidden_size,
+                       intermediate_size, arena_.stream, arena_.Exl3Scratch());
+    }
     LaunchBatchedResidualAdd(
         scratch.decode.hidden.data(), scratch.ffn.out.data(),
         scratch.decode.hidden.data(), batch_size, hidden_size, arena_.stream);

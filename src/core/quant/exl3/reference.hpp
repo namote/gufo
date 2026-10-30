@@ -36,6 +36,10 @@ struct ReferenceScratch {
   std::size_t fast_input_elements = 0;
   std::uint32_t* fast_counters = nullptr;
   std::size_t fast_counter_count = 0;
+  /// The fused MLP's down-projection input slab (FP16); null keeps gate/up,
+  /// SwiGLU and down as separate launches.
+  std::uint16_t* fast_down_input = nullptr;
+  std::size_t fast_down_input_elements = 0;
 };
 
 /// Decodes columns [n_begin, n_begin + n_count) of W' into out[n_count][k]

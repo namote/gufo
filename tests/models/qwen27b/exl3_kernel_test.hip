@@ -5,8 +5,9 @@
 //   - the same projection fed the kernel's FP16 rotated input (FP32 rotation
 //     arithmetic replicated on the CPU): below 1e-5, FP32 accumulation;
 // plus every row count 1..64 (passes of 8, padded row tiles), input and
-// output strides, the self-resetting segment counters, graph replay, and
-// shared-input groups of two and three matrices in one launch.
+// output strides, the self-resetting segment counters, graph replay,
+// shared-input groups of two and three matrices in one launch, and the fused
+// SwiGLU MLP against its unfused launches (bits).
 
 #include <hip/hip_runtime.h>
 
@@ -22,6 +23,7 @@
 
 #include "src/core/quant/exl3/format.hpp"
 #include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
+#include "src/models/qwen/hip/ops/swiglu.hpp"
 
 namespace {
 
@@ -391,6 +393,89 @@ void TestGroup(std::size_t k, std::vector<std::size_t> ns, int bits,
     Check(hipFree(ptr));
 }
 
+// The fused MLP (gate/up epilogue writes the down input) against the same
+// three projections with the SwiGLU kernel in between: bit-identical outputs.
+void TestMlp(std::size_t hidden, std::size_t inter, int bits,
+             std::mt19937& rng) {
+  constexpr std::size_t kRows = 17;
+  const BitRate rate{bits, false};
+  auto make = [&](std::size_t k, std::size_t n, std::vector<void*>& owned) {
+    std::vector<std::uint16_t> trellis((k / 16) * (n / 16) * rate.TileWords());
+    for (auto& w : trellis)
+      w = static_cast<std::uint16_t>(rng());
+    auto* t = Upload(trellis);
+    auto* su = Upload(RandomScales(rng, k, 0x3800));
+    auto* sv = Upload(RandomScales(rng, n, 0x2000));
+    owned.insert(owned.end(), {t, su, sv});
+    return DeviceLinear{t,
+                        su,
+                        sv,
+                        static_cast<std::uint32_t>(k),
+                        static_cast<std::uint32_t>(n),
+                        rate,
+                        Codebook::kMul1};
+  };
+  std::vector<void*> owned;
+  const DeviceLinear gate = make(hidden, inter, owned);
+  const DeviceLinear up = make(hidden, inter, owned);
+  const DeviceLinear down = make(inter, hidden, owned);
+  std::normal_distribution<float> normal;
+  std::vector<float> x(kRows * hidden);
+  for (auto& v : x)
+    v = normal(rng);
+  auto* d_x = Upload(x);
+  float *d_gate = nullptr, *d_up = nullptr, *d_act = nullptr;
+  float *d_fused = nullptr, *d_plain = nullptr;
+  for (float** p : {&d_gate, &d_up, &d_act})
+    Check(hipMalloc(p, kRows * inter * sizeof(float)));
+  for (float** p : {&d_fused, &d_plain})
+    Check(hipMalloc(p, kRows * hidden * sizeof(float)));
+  gufo::hip::Exl3FastWorkspace ws;
+  ws.input_elements = 2 * 8 * std::max(hidden, inter);
+  Check(hipMalloc(&ws.input, ws.input_elements * sizeof(std::uint16_t)));
+  ws.counter_count = std::max(hidden, inter) / 128;
+  Check(hipMalloc(&ws.counters, ws.counter_count * sizeof(std::uint32_t)));
+  Check(hipMemset(ws.counters, 0, ws.counter_count * sizeof(std::uint32_t)));
+  ws.down_input_elements = 8 * inter;
+  Check(hipMalloc(&ws.down_input,
+                  ws.down_input_elements * sizeof(std::uint16_t)));
+  const gufo::hip::Exl3FastMlp mlp{&gate, &up,     &down, d_gate,
+                                   d_up,  d_fused, hidden};
+  Expect(gufo::hip::Exl3FastMlpSupported(mlp, ws), "fused MLP supported");
+  const std::string name = "mlp hidden=" + std::to_string(hidden) +
+                           " inter=" + std::to_string(inter) +
+                           " K=" + std::to_string(bits);
+  bool same = true;
+  for (std::size_t rows : {1, 3, 8, 17}) {
+    gufo::hip::LaunchExl3FastMlp(mlp, d_x, hidden, rows, ws, nullptr);
+    const gufo::hip::Exl3FastTarget pair[] = {{&gate, d_gate, inter},
+                                              {&up, d_up, inter}};
+    gufo::hip::LaunchExl3FastProjections(pair, d_x, hidden, rows, ws, nullptr);
+    gufo::hip::LaunchBatchedSwiGLUActivation(d_gate, d_up, d_act, nullptr,
+                                             rows * inter, nullptr);
+    gufo::hip::LaunchExl3FastProjection(down, d_act, inter, rows, d_plain,
+                                        hidden, ws, nullptr);
+    Check(hipDeviceSynchronize());
+    const auto fused = Download(d_fused, rows * hidden);
+    const auto plain = Download(d_plain, rows * hidden);
+    const bool rows_same =
+        std::memcmp(fused.data(), plain.data(), fused.size() * 4) == 0;
+    Expect(rows_same, name + " rows=" + std::to_string(rows) +
+                          ": fused MLP differs from the unfused launches");
+    same = same && rows_same;
+  }
+  std::cout << name << ": fused "
+            << (same ? "bit-identical to" : "DIFFERS from") << " unfused\n";
+  for (void* p : owned)
+    Check(hipFree(p));
+  for (void* p : {static_cast<void*>(d_x), static_cast<void*>(d_gate),
+                  static_cast<void*>(d_up), static_cast<void*>(d_act),
+                  static_cast<void*>(d_fused), static_cast<void*>(d_plain),
+                  static_cast<void*>(ws.input), static_cast<void*>(ws.counters),
+                  static_cast<void*>(ws.down_input)})
+    Check(hipFree(p));
+}
+
 }  // namespace
 
 int main() {
@@ -405,6 +490,8 @@ int main() {
   TestGroup(512, {12288, 1024, 1024}, 5, rng);
   TestGroup(512, {4096, 4096}, 4, rng);
   TestGroup(1024, {2048, 1024}, 6, rng);
+  TestMlp(512, 1024, 5, rng);
+  TestMlp(1024, 2048, 4, rng);
   if (failures != 0) {
     std::cerr << failures << " failure(s)\n";
     return 1;

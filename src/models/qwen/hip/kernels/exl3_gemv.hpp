@@ -28,6 +28,11 @@ struct Exl3FastWorkspace {
   /// when allocated, and each launch leaves them zero.
   std::uint32_t* counters = nullptr;
   std::size_t counter_count = 0;
+  /// The down projection's FP16 lane-major input written by the fused
+  /// gate/up epilogue, >= 8 * intermediate halves; null disables the fused
+  /// MLP.
+  std::uint16_t* down_input = nullptr;
+  std::size_t down_input_elements = 0;
 };
 
 /// Rows above this run the reference path (prefill).
@@ -63,6 +68,30 @@ void LaunchExl3FastProjections(std::span<const Exl3FastTarget> targets,
                                std::size_t rows,
                                const Exl3FastWorkspace& workspace,
                                hipStream_t stream);
+
+/// A SwiGLU MLP: out = down(silu(x gate) * (x up)). gate_y and up_y are
+/// [8][gate.n] FP32 scratch rows (the pre-activation sums).
+struct Exl3FastMlp {
+  const quant::exl3::DeviceLinear* gate;
+  const quant::exl3::DeviceLinear* up;
+  const quant::exl3::DeviceLinear* down;
+  float* gate_y;
+  float* up_y;
+  float* out;
+  std::size_t out_stride;
+};
+
+/// Whether LaunchExl3FastMlp takes `mlp` with `workspace`.
+[[nodiscard]] bool Exl3FastMlpSupported(
+    const Exl3FastMlp& mlp, const Exl3FastWorkspace& workspace) noexcept;
+
+/// The whole MLP of 1..kExl3FastMaxRows rows, two GEMV launches per pass of 8
+/// rows: gate and up together, whose epilogue applies SwiGLU and writes the
+/// down projection's rotated input, then down. The activation never reaches
+/// memory in FP32; the values are those of the unfused launches.
+void LaunchExl3FastMlp(const Exl3FastMlp& mlp, const float* x,
+                       std::size_t x_stride, std::size_t rows,
+                       const Exl3FastWorkspace& workspace, hipStream_t stream);
 
 /// y[r][0..n) = x[r][0..k) W for 1 <= rows <= kExl3FastMaxRows, in passes of
 /// up to 8 rows. Strides in floats.
