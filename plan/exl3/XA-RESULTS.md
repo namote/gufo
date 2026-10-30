@@ -4,7 +4,7 @@
 
 ## 상태
 
-- X0 CPU 부분 완료(`f26f800d`). upstream 비트 대조는 GPU 창 `xa-ref`(`PLAN-EXL3-REF.json`) 대기.
+- **X0 완료.** CPU 부분 `f26f800d`, upstream 비트 대조 창 `xa-ref-a01` 통과(2026-10-30).
 - X1 매핑 완료(`04ca9c54`), BF16 GGUF 변환 완료(4.00, 5.00). 정확성 창 `PLAN-EXL3-X1.json` 초안(GPU 순서상 W9 뒤).
 
 ## X0: 형식 명세와 CPU 참조
@@ -28,10 +28,18 @@
 | 5.00 | 5 | 0.037 | 0.9993 |
 
   - 비트가 하나 늘 때마다 오차가 절반이 된다. 그래서 비트 순서, 타일 순열, 코드북, suh/svh 쪽, Hadamard 순서가 맞다. 배치가 틀리면 오차가 1 근처가 된다.
-- **upstream 비트 대조(대기):** `tools/qwen27b/rq_quality/exl3/dump_ref.py` + `tests/core/quant/exl3_upstream_test.cpp`.
-  - 합성: K 1–8 × 3 코드북, 반정수 1.5/2.5/3.5(mul1), 27경우. 입력은 양쪽이 같은 splitmix64 흐름으로 만들어 fixture가 작은 JSON이다.
-  - 실제 텐서 8개: 3.00, 3.50(K3·K4), 4.00(본문, lm_head K6, mtp.fc K4), 5.00.
-  - 창 `xa-ref` 뒤에 합성 JSON을 fixture로 커밋하면 CTest `quant_exl3_upstream_test`가 켜진다.
+- **upstream 비트 대조(창 `xa-ref-a01/xa-ref`, 2026-10-30 14:45, COMPLETE, health_PASS):**
+  - 덤프: `dump_ref.py`(이미지 `exl3-eval:1.6.5-rocm100`, 라벨 `f26f800d`, gfx1151, exllamav3 1.6.5). `synth` 2 s, `pack` 11 s.
+  - 대조: CPU에서 `quant_exl3_upstream_test`.
+  - 원시 JSON: `…/xa-ref-a01/xa-ref/receipt/run/exl3_upstream_{synth,pack}.json`(sha256 `016611e2a609…`, `21957d0465df…`).
+
+| 대상 | 결과 |
+|---|---|
+| 합성 27경우: K 1–8 × 3INST/mcg/mul1, K 1.5/2.5/3.5 mul1(256 × 128) | inner W' FP16 비트 **27/27 동일**(sha256). FP64 forward 대 upstream FP64 상대 오차 4e-16–1.1e-15. upstream FP16 런타임(`LinearEXL3.forward`) 대 FP64 오차 3.5e-4–8.3e-4(FP16 반올림 수준) |
+| 실제 텐서 8개 | 비트 **8/8 동일**: 3.00 k_proj(K3), 3.50 k_proj(K4), 3.50 layers.10 down_proj(K3), 4.00 k_proj와 layers.0 down_proj(K4), 4.00 lm_head(K6, 5120 × 248320), 4.00 mtp.fc(K4), 5.00 k_proj(K5) |
+
+  - 합성 JSON을 fixture `tests/core/quant/exl3_upstream_synth.json`으로 넣었다. 이제 CTest `quant_exl3_upstream_test`(`cpu;core;quant;exl3`)가 돈다. `quant_exl3_format_test`와 함께 2/2 통과다.
+  - mcg와 3INST는 실제 팩이 없다. 합성 비트 대조로만 확인했다(XQ가 다른 코드북 팩을 만들면 추가).
 
 ## X1: 27B 정확성 경로
 
