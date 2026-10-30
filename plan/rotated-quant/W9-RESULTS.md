@@ -577,3 +577,18 @@
 - C1 greedy decode는 **+8.9 %에서 +10.4 %**다(held-out 포함).
 - inconclusive는 첫 반복의 일회성 멈춤 2건이다. 판정 정책에 따라 결론 없음으로 남긴다.
 - 채택 여부와 PR 순서는 감독이 정한다. 후속 후보: 백오프 없는 변형(+1.6 %, 별도 커밋), sampled/C>1 확장, 첫 반복 멈춤의 원인 확인.
+
+### 수정판 기능 suite (I1F3, 2026-10-30)
+
+- **창:** `PLAN-W9-I1F3.json`(sha256 `3f6f9f22…`, LOCKS 반영). I1F2와 같고 이미지만 `w9-i1b-rocm101`(수정판)이다. COMPLETE, 재시도 없음. NVMe 로드 73 s.
+- **결과:** single-session 그룹(`--sessions 1`, I1 활성) **통과, 13/13 사례**. `long-context`, text/thinking-tool/legacy-tool/image/image-thinking cancel(RAM과 disk), disk-spacing(RAM과 disk)이 모두 통과했다.
+- 결과 위치: `~/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/w9-i1f3/w9-i1f3-suite/receipt/run/`
+- **채택 전 검증 끝:** 단위 테스트, 재생 일치 113/113, greedy 동일성 89/89 + 32/32, 기능 suite, ABBA2 slower 0(held-out 포함). push와 PR은 하지 않았다. 감독이 사용자에게 묻는다.
+
+## 다음 후보 (채택 뒤, 감독 2026-10-30)
+
+1. **백오프 없는 변형:** TierRule만 쓰고 AR 백오프를 뺀다. 시뮬레이터 기준 처음 판에서 약 +1.6 %, creative에서 약 +4 %다. 별도 커밋으로 하고, 수정판 기준으로 다시 모델링하고 ABBA로 확인한다.
+2. **sampled 요청과 C>1로 확장:** sampled는 p/q 제안 분포가 바뀌어 seeded 재현이 달라진다. C>1은 `MtpBatchController`의 공유 폭과 확신도 정지를 함께 설계해야 한다.
+3. **첫 반복의 일회성 멈춤:** ABBA2의 inconclusive 2건(`d4_ko_code_03`, `repetition_sequence`)은 첫 반복에서 최대 약 0.6 s 멈춘다. 프로파일 1회로 graph capture나 첫 사용 비용의 위치를 찾고, readiness 단계에서 미리 준비할지 정한다.
+4. **열린 관찰(다른 W에 넘길 수 있음):** 긴 문맥에서 HTTP 서버와 `Session::Sync`의 출력이 다르다(위 "열린 관찰" 절).
+5. **27B DFlash2:** 비용표가 평평해 확신도 정지의 이득은 작을 것으로 본다[짐작]. 범주 분석상 약한 곳은 creative와 instruction이다.
