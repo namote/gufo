@@ -296,6 +296,16 @@ cold는 새 프로세스의 첫 요청(빈 행 캐시), warm은 같은 요청의
 | C | GPU 합을 FP64로 한다 | 경계 사례의 양자화 KV가 바뀐다(참조에 더 가까워지지만, 합 순서가 달라 비트 동일은 보장되지 않는다). 재검증이 필요하다 | gfx1151 FP64 처리율이 낮다. flush와 prefill 비용이 늘어난다 [짐작] |
 
 - **추천: A.** 공통 산술을 그대로 두어 27B 운영 출력이 바뀌지 않는다. Flash-Next의 실제 정확성은 K3의 real‖fake KL 기준(27B와 같다)으로 판정한다.
+
+**결정(사용자 2026-10-31): A안. 테스트만 고친다. 커널과 공통 산술은 그대로이고, 27B 운영 출력도 그대로다.**
+- 비트 동일성 검사는 27B식 데이터로 한다: key는 Gaussian에 채널별 gain/offset, 37채널마다 outlier, value는 Gaussian(27B `RandomRows`와 같은 식, 행 폭 512). 모든 tile이 비트 단위로 같아야 한다.
+- 균일 데이터(늘린 것과 늘리지 않은 것)는 별도 허용 검사로 둔다. tile이 다음 중 하나를 만족하면 통과다.
+  - 정확히 같다.
+  - 참조가 고른 단계, 또는 그 단계와 imbalance가 float 1 ulp 안에서 동률인 단계를 같은 RTN으로 다시 계산한 기록과 비교해 코드 차이가 3개 이하(32,768개 중 약 1e-4)이고, 모든 FP16 scale/zero/column이 1 ulp 이내다.
+  - 통과 tile은 exact, tie, boundary로 나누어 센다. 단계별 재계산이 참조와 같아야 한다는 자체 검사(`mirror_mismatch` 0)도 함께 본다.
+- **구현:** `f1333e24` test(qwen38_flash_next): check KVarN records bitwise on 27B-style rows and within a tie tolerance on uniform rows. 테스트 파일만 바꿨다. 포맷 PASS, hipcc syntax 검사 PASS.
+- **빌드:** 테스트 `/nix/store/hc66ick8ppp2avw5q0nz1wk1z7m5xqvy-gufo-f1-k1b-tests-0-unstable-dirty`. 이미지 `f1-k1-tests-rocm101` id `3eba25ca`, 라벨 `f1333e24…`(이전 이미지는 지웠다).
+- **창 계획:** `PLAN-F1-K1T.json`(sha `0e214322…`), LOCKS `3771bbec…`. 감독 "start"를 기다린다. 이전 결과는 `f1-k1/f1-k1-unit.attempt-2-diagnosis/`에 있다.
 - **P1 inconclusive 재측정 계획:** `PLAN-F1-REP-{BASE,CAND}.json`. `repetition_sequence`만 대상으로 ABBA × 2, 반복 5, 팔마다 20표본이다. 감독 "start"를 기다린다.
 
 ## ABBA 계획 초안 (P1 정확성 통과 뒤)
