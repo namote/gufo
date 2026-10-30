@@ -190,6 +190,24 @@ decode(4,096위치)는 모든 변이의 구간이 겹친다. 예: KL 18.3–25.1
 - 부호 없음(D = I)은 KL·ΔNLL에서 seed 평균보다 약간 나쁘지만 구분되지 않는다.
 - E10의 다음 단계(부호 선택이나 여러 seed 평균)를 판단하려면, 이 폭(ΔNLL 약 ±13×10⁻³, top-1 약 ±0.2 %p)보다 큰 효과가 필요하다.
 
+## EXL3 대응 수집기 재빌드 (2026-10-30)
+
+- **배경:** EXL3 직접 로드(`a72c89b0`) 뒤 `LaunchQwenOutputHead`가 EXL3 head에 작업 공간을 요구한다. 두 도구가 작업 공간 없이 부르고 있어서, EXL3 모델(`gufo.gguf` sidecar)에서 `std::logic_error`가 났다.
+- **수정:** 커밋 `32d5d562`. `rq_logits.cpp`와 `rq_kld_base.cpp`가 `IsExl3(weights.output)`일 때만 `quant::exl3::ReferenceScratch`를 할당해 넘긴다.
+  - 크기는 DFlash2 executor와 같은 방식이다: rotated는 hidden, weight는 64 Mi float.
+  - executor는 모델 안쪽 작업 공간을 스스로 잡는다(arena). 도구는 head 한 줄만 직접 부르므로 자기 작업 공간을 둔다.
+  - GGUF head는 이전처럼 null을 넘긴다.
+- **새 바이너리:** `build/rq-w2-exl3-gpu-test`. 이미지 `64849ca6ec7b`, `-j8`, 새 디렉터리에서 처음부터 빌드했다.
+  - `qwen27b_rq_logits` sha256 `84811b4e7d9adc51e483f3509b7ce5238642e6f14dc49e5586267524ca46b147`
+  - `qwen27b_rq_kld_base` sha256 `63ccf60848148d25f20dbd623cf60db93b6062d6ad090a2b69955e6b9de1427b`
+  - 소스는 `build/rq-w2-exl3-src`다. HEAD는 `77920e05`이고, 도구 소스는 `32d5d562`과 같다. 기록은 `build/rq-w2-exl3-src.provenance`에 있다.
+  - 포맷 PASS, CPU 테스트(`--encode-rows` 비교 포함) 26/26 통과.
+- **GGUF 경로가 그대로인지 확인(계획, 실행 전):** `PLAN-RQ0-EXL3SAME.json`, 약 12분.
+  - BF16 창 0의 prefill·verify(각 4,095위치)와 decode(prefix 2048, 64위치), UD-Q4_K_M prefill 창 0을 `rq0-a01` 기록과 레코드 단위로 대조한다(`logits_io.py same`).
+  - `kld_base` plain-prism Q4 출력(16 × 512)을 `rq2i-a01` 파일과 `cmp`로 바이트 대조한다.
+  - 첫 차이에서 창이 실패한다.
+  - 고정 기준은 `b5219f1b`(수집기)와 `11400fc8`(kld)다. 이 창이 통과하기 전까지 품질 비교에는 `b5219f1b`를 그대로 쓴다.
+
 ## 평가 코퍼스 a01
 
 - 위치: `~/projects/ai.tools/storage/evaluations/rq-r0-20261029/corpus-a01/`(`SHA256SUMS` 포함). manifest 사본: `tools/qwen27b/rq_quality/corpus_manifest.json`. 빌더 `tools/qwen27b/rq_quality/corpus.py`, 소스 리비전 `f95d1302`, tokenizer는 HF `tokenizer.json`(sha256은 manifest). 두 번 빌드해 바이트 단위로 같았다.
