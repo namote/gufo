@@ -20,6 +20,15 @@ using exl3::Half4;
 using exl3::kHadamardScale;
 
 constexpr unsigned kRotateWaves = 8;
+
+// DPP quad_perm move: 0xB1 = [1,0,3,2] (lane ^ 1), 0x4E = [2,3,0,1]
+// (lane ^ 2). Full-rate VALU instead of ds_bpermute, the same additions as a
+// __shfl_xor reduction (bit-identical, xb3).
+template<int kCtrl>
+__device__ __forceinline__ float QuadMove(float v) {
+  return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), kCtrl,
+                                                    0xF, 0xF, false));
+}
 constexpr int kTilesPerWave = 2;
 
 // out (lane-major, M rows) = FP16(H(suh * x)) per 128-element segment. Rows
@@ -134,10 +143,10 @@ __global__ __launch_bounds__(W * 32) void Exl3GemvKernel(
     for (unsigned r = 0; r < M; ++r) {
       float va = acc_a[t][r];
       float vb = acc_b[t][r];
-      va += __shfl_xor(va, 1, 32);
-      vb += __shfl_xor(vb, 1, 32);
-      va += __shfl_xor(va, 2, 32);
-      vb += __shfl_xor(vb, 2, 32);
+      va += QuadMove<0xB1>(va);
+      vb += QuadMove<0xB1>(vb);
+      va += QuadMove<0x4E>(va);
+      vb += QuadMove<0x4E>(vb);
       if (lane % 4 == 0) {
         red[warp][t][r][lane / 4] = va;
         red[warp][t][r][lane / 4 + 8] = vb;
