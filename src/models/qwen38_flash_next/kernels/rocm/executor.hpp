@@ -156,6 +156,9 @@ private:
     __half* v_cache{nullptr};  ///< [max_context][kv_heads*d]
     float* index_k{nullptr};   ///< [index_capacity_][indexer_dim] raw ring
     __half* block_k{nullptr};  ///< [max_context/ratio][indexer_dim]
+    /// Block table of k_cache, v_cache and block_k (kernels.hpp
+    /// kKvPooledRatio); null for contiguous rows.
+    const std::uint32_t* kv_blocks{nullptr};
   };
   /// Per-launch values the kernels read from device memory, so a captured
   /// graph replays at any position.
@@ -171,6 +174,7 @@ private:
     __half* v_cache{nullptr};
     float* index_k{nullptr};
     __half* block_k{nullptr};
+    const std::uint32_t* kv_blocks{nullptr};  ///< the session's block table
     std::uint32_t blocks{0};
     float* h{nullptr};  ///< [hc_dim] wide residual handed to the next draft
     float* target_hidden{nullptr};  ///< last max_speculative trunk rows

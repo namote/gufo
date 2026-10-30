@@ -17,6 +17,13 @@
 /// pointers in their GGUF encoding.
 namespace gufo::models::qwen38_flash_next::rocm {
 
+/// Tokens per pooled indexer key row. K/V rows (one per token) and pooled rows
+/// share a session's block table (src/core/hip/kv_block_table.hpp): logical
+/// block b holds tokens [256 b, 256 b + 256) and pooled rows [64 b, 64 b + 64).
+/// Every `kv_blocks` argument below is that table, or null for contiguous
+/// rows indexed by position.
+inline constexpr std::uint32_t kKvPooledRatio = 4;
+
 /// Stable per-prefix rollback addresses. Growing the depth does not move
 /// existing buffers or invalidate graphs captured for a smaller batch.
 struct RollbackRows {
@@ -215,7 +222,8 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                       std::uint32_t n_tokens, const std::uint32_t* position,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr,
-                      const YarnRope& yarn = {});
+                      const YarnRope& yarn = {},
+                      const std::uint32_t* kv_blocks = nullptr);
 
 /// Exact Q8_0 HC up projection and F16-input mixer for the Flash Next
 /// 2560-hidden, rank-320 geometry. Returns false below 96 tokens or for other
@@ -426,7 +434,8 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
                       std::uint32_t rotary_dim, const std::uint32_t* start_pos,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr,
-                      bool prefill = false, const YarnRope& yarn = {});
+                      bool prefill = false, const YarnRope& yarn = {},
+                      const std::uint32_t* kv_blocks = nullptr);
 
 /// NEOX partial rotary on x [t][heads][d] at positions start_pos + t.
 /// Positions are read from device memory (`start_pos` points at the
@@ -443,7 +452,7 @@ void Rope(float* x, std::uint32_t n_tokens, std::uint32_t heads,
 /// cache[(start_pos + t)][row_dim].
 void StoreKv(const float* src, __half* cache, std::uint32_t n_tokens,
              std::uint32_t row_dim, const std::uint32_t* start_pos,
-             hipStream_t stream);
+             hipStream_t stream, const std::uint32_t* kv_blocks = nullptr);
 /// Stores raw indexer rows in a power-of-two ring of `capacity` rows.
 void StoreRows(const float* src, float* dst, std::uint32_t n_tokens,
                std::uint32_t row_dim, const std::uint32_t* start_pos,
@@ -463,7 +472,8 @@ void PoolIndexerBlocks(const float* raw_keys, const float* gamma,
                        std::uint32_t dim, std::uint32_t rotary_dim, float theta,
                        float eps, std::uint32_t capacity, hipStream_t stream,
                        const qwen::vision::DeviceRope* rope = nullptr,
-                       const YarnRope& yarn = {});
+                       const YarnRope& yarn = {},
+                       const std::uint32_t* kv_blocks = nullptr);
 
 /// Per query t (position *start_pos + first_token + t): scores every
 /// complete block below its own tail, keeps the `budget` highest, and
@@ -479,7 +489,8 @@ void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
                   std::uint32_t heads, std::uint32_t dim, std::uint32_t ratio,
                   std::uint32_t budget, std::uint32_t mask_words,
                   std::uint32_t max_blocks, hipStream_t stream,
-                  std::uint32_t live_blocks = 0);
+                  std::uint32_t live_blocks = 0,
+                  const std::uint32_t* kv_blocks = nullptr);
 
 /// Per-token attention (decode and narrow batches). With `partials`
 /// (n_tokens * heads * splits * (d + 2) floats) the key tiles are split
@@ -494,8 +505,8 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                const std::uint32_t* start_pos, std::uint32_t heads,
                std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
                hipStream_t stream, std::uint32_t* lists = nullptr,
-               std::uint32_t* counts = nullptr,
-               std::uint32_t list_capacity = 0);
+               std::uint32_t* counts = nullptr, std::uint32_t list_capacity = 0,
+               const std::uint32_t* kv_blocks = nullptr);
 
 /// Maximum visible sparse context for this WMMA geometry, or zero when the
 /// geometry is unsupported. Checkpoint planning uses the same dispatch limit.
@@ -518,7 +529,8 @@ bool WmmaCausalAttention(const float* q, const float* gate,
                          std::uint32_t start_pos, std::uint32_t heads,
                          std::uint32_t kv_heads, std::uint32_t d,
                          std::uint32_t ratio, hipStream_t stream,
-                         bool last_only = false);
+                         bool last_only = false,
+                         const std::uint32_t* kv_blocks = nullptr);
 
 /// counts[e] = number of (token, slot) pairs routed to expert e.
 void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,

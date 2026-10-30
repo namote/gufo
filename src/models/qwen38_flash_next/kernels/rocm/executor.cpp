@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "qfn_mmq.h"
+#include "src/core/hip/kv_block_layout.hpp"
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/core/platform/pages.hpp"
@@ -146,6 +147,25 @@ std::uint32_t IndexerCapacity(const Config& c, std::uint32_t batch,
                               std::uint32_t context) {
   return static_cast<std::uint32_t>(std::bit_ceil(std::min<std::uint64_t>(
       context, std::uint64_t{c.indexer_top_k} + batch)));
+}
+
+/// K, V and pooled indexer keys of every attention layer, then the draft
+/// block's, as KV block planes (kernels.hpp kKvPooledRatio). The blocks cover
+/// `max_context` tokens and max_context / ratio + 1 pooled rows, the pooled
+/// capacity the snapshot and continuation guards address.
+enum SessionKvPlane : std::size_t { kKeyPlane, kValuePlane, kPooledPlane };
+hip::KvBlockGeometry SessionKvGeometry(const Config& c, bool mtp,
+                                       std::uint32_t max_context) {
+  const std::uint32_t layers =
+      c.num_layers / c.full_attention_interval + (mtp ? 1 : 0);
+  const std::size_t kv_row = std::size_t{c.AttentionKvDim()} * sizeof(__half);
+  return hip::KvBlockGeometry(
+      {{layers, kv_row, hip::kKvBlockTokens},
+       {layers, kv_row, hip::kKvBlockTokens},
+       {layers, std::size_t{c.indexer_head_dim} * sizeof(__half),
+        hip::kKvBlockTokens / kKvPooledRatio}},
+      hip::KvBlockGeometry::BlocksFor(std::size_t{max_context} +
+                                      kKvPooledRatio));
 }
 
 void PopulateSnapshotPrefix(std::uint8_t* data, std::uint64_t bytes,
@@ -1277,7 +1297,35 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   s->linear_.resize(c.num_layers);
   s->attention_.resize(c.num_layers);
   auto& a = s->allocations_;
-  const std::size_t kv_row = c.AttentionKvDim();
+  if (c.compress_ratio != kKvPooledRatio) {
+    AssignError(error_msg, "pooled indexer keys need a ratio of 4");
+    return nullptr;
+  }
+  // One private span of KV blocks behind an identity block table: every
+  // layer's rows stay contiguous in position order, which snapshots,
+  // checkpoints and the continuation adapter read as plain regions, while
+  // the kernels already address rows through the table.
+  const auto kv = SessionKvGeometry(c, s->mtp_enabled_, max_context);
+  auto* kv_rows =
+      Alloc<std::byte>(a, kv.bytes(), error_msg, &s->allocated_bytes_);
+  auto* kv_table =
+      Alloc<std::uint32_t>(a, kv.blocks(), error_msg, &s->allocated_bytes_);
+  if (kv_rows == nullptr || kv_table == nullptr)
+    return nullptr;
+  {
+    std::vector<std::uint32_t> identity(kv.blocks());
+    for (std::uint32_t b = 0; b < kv.blocks(); ++b)
+      identity[b] = b;
+    if (!Check(hipMemcpy(kv_table, identity.data(),
+                         identity.size() * sizeof(std::uint32_t),
+                         hipMemcpyHostToDevice),
+               "KV block table", error_msg))
+      return nullptr;
+  }
+  const auto plane_layer = [&](SessionKvPlane plane, std::uint32_t slot) {
+    return kv_rows + kv.plane_offset(plane) + slot * kv.layer_pitch(plane);
+  };
+  std::uint32_t kv_slot = 0;
   const std::size_t conv_elems =
       static_cast<std::size_t>(c.ssm_conv_kernel - 1) * c.SsmConvChannels();
   const std::size_t state_elems = static_cast<std::size_t>(c.ssm_num_v_heads) *
@@ -1290,19 +1338,14 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
       l.state = Alloc<float>(a, state_elems, error_msg, &s->allocated_bytes_);
     } else {
       auto& at = s->attention_[il];
-      at.k_cache =
-          Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
-                        error_msg, &s->allocated_bytes_);
-      at.v_cache =
-          Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
-                        error_msg, &s->allocated_bytes_);
+      at.k_cache = reinterpret_cast<__half*>(plane_layer(kKeyPlane, kv_slot));
+      at.v_cache = reinterpret_cast<__half*>(plane_layer(kValuePlane, kv_slot));
+      at.block_k =
+          reinterpret_cast<__half*>(plane_layer(kPooledPlane, kv_slot));
+      at.kv_blocks = kv_table;
+      ++kv_slot;
       at.index_k = Alloc<float>(
           a, static_cast<std::size_t>(s->index_capacity_) * c.indexer_head_dim,
-          error_msg, &s->allocated_bytes_);
-      at.block_k = Alloc<__half>(
-          a,
-          static_cast<std::size_t>(max_context / c.compress_ratio + 1) *
-              c.indexer_head_dim,
           error_msg, &s->allocated_bytes_);
     }
   }
@@ -1317,17 +1360,15 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
         a, static_cast<std::size_t>(options_.max_speculative) * c.HcDim(),
         error_msg, &s->allocated_bytes_);
     s->mtp_.k_cache =
-        Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
-                      error_msg, &s->allocated_bytes_);
+        reinterpret_cast<__half*>(plane_layer(kKeyPlane, kv_slot));
     s->mtp_.v_cache =
-        Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
-                      error_msg, &s->allocated_bytes_);
+        reinterpret_cast<__half*>(plane_layer(kValuePlane, kv_slot));
+    s->mtp_.block_k =
+        reinterpret_cast<__half*>(plane_layer(kPooledPlane, kv_slot));
+    s->mtp_.kv_blocks = kv_table;
     s->mtp_.index_k =
         Alloc<float>(a, std::size_t{s->index_capacity_} * c.indexer_head_dim,
                      error_msg, &s->allocated_bytes_);
-    s->mtp_.block_k = Alloc<__half>(
-        a, std::size_t{max_context / c.compress_ratio + 1} * c.indexer_head_dim,
-        error_msg, &s->allocated_bytes_);
     s->mtp_.h = Alloc<float>(a, c.HcDim(), error_msg, &s->allocated_bytes_);
     if (!model_->draft_output().empty()) {
       s->mtp_.draft_rows = Alloc<std::uint8_t>(
@@ -1482,13 +1523,16 @@ std::size_t Executor::SessionBytes(
       std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
   const std::size_t ple =
       c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
-  const std::size_t kv =
-      2 * std::size_t{max_context} * c.AttentionKvDim() * sizeof(__half);
+  // K/V/pooled rows and the block table (CreateSession); the raw indexer
+  // rings stay per layer.
+  const auto kv_geometry = SessionKvGeometry(
+      c, mode == core::SessionMode::kSpeculative, max_context);
+  const std::size_t kv_blocks =
+      kv_geometry.bytes() +
+      std::size_t{kv_geometry.blocks()} * sizeof(std::uint32_t);
   const std::size_t index =
       std::size_t{IndexerCapacity(c, options_.max_batch, max_context)} *
-          c.indexer_head_dim * sizeof(float) +
-      std::size_t{max_context / c.compress_ratio + 1} * c.indexer_head_dim *
-          sizeof(__half);
+      c.indexer_head_dim * sizeof(float);
   const auto rollback_state =
       rollback_depth == 0
           ? 0
@@ -1498,9 +1542,9 @@ std::size_t Executor::SessionBytes(
   return ((linear * conv + ple) * (rollback_depth + 1) +
           linear * (state + rollback_state)) *
              sizeof(float) +
-         attention * (kv + index) + sizeof(Session::Control) +
+         kv_blocks + attention * index + sizeof(Session::Control) +
          (mode == core::SessionMode::kSpeculative
-              ? kv + index +
+              ? index +
                     std::size_t{options_.max_speculative + 1} * c.HcDim() *
                         sizeof(float) +
                     (model_->draft_output().empty()
@@ -2498,7 +2542,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
           l.attn_qkv.data, static_cast<const __half*>(s_.x_half),
           l.attn_q_norm.f32(), l.attn_k_norm.f32(), s_.q, s_.attn_gate,
           s.k_cache, s.v_cache, n_tokens, pos, c.rope_theta, c.rms_eps, stream_,
-          s.rope, yarn_);
+          s.rope, yarn_, s.kv_blocks);
       if (!prepared) {
         AssignError(error_msg, "fused attention projection failed");
         return false;
@@ -2512,7 +2556,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
           s_.qg, l.attn_qkv.rows, l.attn_q_norm.f32(), l.attn_k_norm.f32(),
           s_.q, s_.attn_gate, s.k_cache, s.v_cache, n_tokens, c.num_heads,
           c.num_kv_heads, c.head_dim, c.rotary_dim, pos, c.rope_theta,
-          c.rms_eps, stream_, s.rope, prefill_phase, yarn_);
+          c.rms_eps, stream_, s.rope, prefill_phase, yarn_, s.kv_blocks);
       if (!prepared) {
         UnpackQGate(s_.qg, l.attn_qkv.rows, s_.q, s_.attn_gate, s_.k, s_.v,
                     n_tokens, c.num_heads, c.head_dim, kv_row, stream_);
@@ -2539,8 +2583,8 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
          c.rope_theta, stream_, s.rope, yarn_);
     Rope(s_.k, n_tokens, c.num_kv_heads, c.head_dim, c.rotary_dim, pos,
          c.rope_theta, stream_, s.rope, yarn_);
-    StoreKv(s_.k, s.k_cache, n_tokens, kv_row, pos, stream_);
-    StoreKv(s_.v, s.v_cache, n_tokens, kv_row, pos, stream_);
+    StoreKv(s_.k, s.k_cache, n_tokens, kv_row, pos, stream_, s.kv_blocks);
+    StoreKv(s_.v, s.v_cache, n_tokens, kv_row, pos, stream_, s.kv_blocks);
   }
 
   // Raw keys survive only until pooling. The ring holds the initial
@@ -2567,7 +2611,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     PoolIndexerBlocks(s.index_k, l.indexer_k_norm.f32(), s.block_k, first_block,
                       pos, n_tokens, pool_grid, c.compress_ratio,
                       c.indexer_head_dim, c.rotary_dim, c.rope_theta, c.rms_eps,
-                      index_capacity, stream_, s.rope, yarn_);
+                      index_capacity, stream_, s.rope, yarn_, s.kv_blocks);
     // Align score rows to full cache lines. The selector still considers
     // only complete causal blocks, so padding cannot change the ranking.
     // Wide prefill is never captured: compact score rows to the populated
@@ -2597,7 +2641,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                    s_.mask + static_cast<std::size_t>(t0) * mask_words_,
                    s_.scores, n, pos, t0, c.indexer_heads, c.indexer_head_dim,
                    c.compress_ratio, c.indexer_top_k / c.compress_ratio,
-                   mask_words_, max_blocks, stream_, live);
+                   mask_words_, max_blocks, stream_, live, s.kv_blocks);
     }
     mask = s_.mask;
   }
@@ -2632,12 +2676,13 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                      : nullptr,
                 mask_words_, s_.ctx + at(dense_rows), rows - dense_rows,
                 pos + dense_rows, c.num_heads, c.num_kv_heads, c.head_dim,
-                c.compress_ratio, stream_, last)) &&
+                c.compress_ratio, stream_, last, s.kv_blocks)) &&
            (dense_rows == 0 || (last && dense_rows != rows) ||
             WmmaCausalAttention(s_.q + at(0), s_.attn_gate + at(0), s.k_cache,
                                 s.v_cache, nullptr, mask_words_, s_.ctx + at(0),
                                 dense_rows, pos, c.num_heads, c.num_kv_heads,
-                                c.head_dim, c.compress_ratio, stream_, last));
+                                c.head_dim, c.compress_ratio, stream_, last,
+                                s.kv_blocks));
   };
   if (checkpoint_tokens != 0 && checkpoint_tokens < n_tokens) {
     // Sparse tiles compact the union of their queries' selected keys.
@@ -2657,12 +2702,13 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   // Narrow batches split each row's key tiles over kAttnSplits blocks so a
   // decode step at depth fills the device.
   const bool split = !MatrixRows(n_tokens);
-  rocm::Attention(
-      s_.q, s.k_cache, s.v_cache, mask, mask_words_, s_.ctx,
-      split ? s_.attn_partials : nullptr, kAttnSplits, n_tokens, pos,
-      c.num_heads, c.num_kv_heads, c.head_dim, c.compress_ratio, stream_,
-      split ? s_.attn_lists : nullptr, split ? s_.attn_counts : nullptr,
-      c.compress_ratio > 0 ? c.indexer_top_k / c.compress_ratio : 0);
+  rocm::Attention(s_.q, s.k_cache, s.v_cache, mask, mask_words_, s_.ctx,
+                  split ? s_.attn_partials : nullptr, kAttnSplits, n_tokens,
+                  pos, c.num_heads, c.num_kv_heads, c.head_dim,
+                  c.compress_ratio, stream_, split ? s_.attn_lists : nullptr,
+                  split ? s_.attn_counts : nullptr,
+                  c.compress_ratio > 0 ? c.indexer_top_k / c.compress_ratio : 0,
+                  s.kv_blocks);
   const std::uint32_t q_dim = c.AttentionQDim();
   const std::size_t ctx_count = static_cast<std::size_t>(n_tokens) * q_dim;
   // A decode batch's output projection reads the gate's Q8_1 rows.
@@ -4490,6 +4536,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
   attn.v_cache = session.mtp_.v_cache;
   attn.index_k = session.mtp_.index_k;
   attn.block_k = session.mtp_.block_k;
+  attn.kv_blocks = session.mtp_.kv_blocks;
   // The draft block's attention runs at its own position.
   // Catch-up exports KV for every row but only carries its final residual.
   // Preserve that row's original query tile; earlier attention results
@@ -4521,11 +4568,11 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
               std::size_t{2} * c.AttentionQDim() * layout.RowBytes();
     kv.rows = 2 * c.AttentionKvDim();
     if (!DenseBatch(kv, s_.mixed, s_.qg, n, error_msg) ||
-        !PrepareAttention(s_.qg, kv.rows, nullptr, l.attn_k_norm.f32(), nullptr,
-                          nullptr, attn.k_cache, attn.v_cache, n, 0,
-                          c.num_kv_heads, c.head_dim, c.rotary_dim,
-                          &session.control_->mtp_position, c.rope_theta,
-                          c.rms_eps, stream_, attn.rope, false, yarn_)) {
+        !PrepareAttention(
+            s_.qg, kv.rows, nullptr, l.attn_k_norm.f32(), nullptr, nullptr,
+            attn.k_cache, attn.v_cache, n, 0, c.num_kv_heads, c.head_dim,
+            c.rotary_dim, &session.control_->mtp_position, c.rope_theta,
+            c.rms_eps, stream_, attn.rope, false, yarn_, attn.kv_blocks)) {
       AssignError(error_msg, "MTP cache projection failed");
       return false;
     }
@@ -4536,11 +4583,12 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     StoreRows(s_.ik, attn.index_k, n, c.indexer_head_dim,
               &session.control_->mtp_position, capacity, stream_);
     if (pos + n > c.indexer_top_k) {
-      PoolIndexerBlocks(
-          attn.index_k, l.indexer_k_norm.f32(), attn.block_k,
-          &session.control_->mtp_blocks, &session.control_->mtp_position, n,
-          pool_grid, c.compress_ratio, c.indexer_head_dim, c.rotary_dim,
-          c.rope_theta, c.rms_eps, capacity, stream_, attn.rope, yarn_);
+      PoolIndexerBlocks(attn.index_k, l.indexer_k_norm.f32(), attn.block_k,
+                        &session.control_->mtp_blocks,
+                        &session.control_->mtp_position, n, pool_grid,
+                        c.compress_ratio, c.indexer_head_dim, c.rotary_dim,
+                        c.rope_theta, c.rms_eps, capacity, stream_, attn.rope,
+                        yarn_, attn.kv_blocks);
     }
     return true;
   }

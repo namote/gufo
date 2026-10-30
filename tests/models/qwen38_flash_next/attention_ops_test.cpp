@@ -2,6 +2,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -11,6 +12,7 @@
 #include <numbers>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 
@@ -873,10 +875,292 @@ void CheckWmmaLiveExtent() {
   std::cout << "WMMA live extent: rejects past 262,144 visible tokens\n";
 }
 
+/// A session's K/V and pooled indexer rows behind a scrambled block table
+/// (kernels.hpp kKvPooledRatio): 256-token blocks of a pool larger than the
+/// sequence, mapped in reverse odd-stride order, so neighbouring logical
+/// blocks are never physical neighbours and block 0 is not the first row.
+struct PagedLayout {
+  static constexpr std::uint32_t kBlockTokens = 256;
+  static constexpr std::uint32_t kPooledRows = kBlockTokens / q::kKvPooledRatio;
+  std::uint32_t blocks{0};  ///< logical blocks of the sequence
+  std::uint32_t pool{0};    ///< physical blocks of the pool
+  std::vector<std::uint32_t> table;
+
+  explicit PagedLayout(std::uint32_t tokens)
+      : blocks((tokens + kBlockTokens - 1) / kBlockTokens),
+        pool(2 * blocks + 3),
+        table(blocks) {
+    for (std::uint32_t b = 0; b < blocks; ++b)
+      table[b] = (pool - 1) - (b * 7) % pool;
+    std::vector<std::uint32_t> sorted = table;
+    std::sort(sorted.begin(), sorted.end());
+    if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end())
+      throw std::runtime_error("paged test table repeats a block");
+  }
+  [[nodiscard]] std::size_t Row(std::uint32_t pos) const {
+    return std::size_t{table[pos / kBlockTokens]} * kBlockTokens +
+           pos % kBlockTokens;
+  }
+  [[nodiscard]] std::size_t PooledRow(std::uint32_t b) const {
+    return std::size_t{table[b / kPooledRows]} * kPooledRows + b % kPooledRows;
+  }
+  /// Contiguous rows [pos][width] scattered into the paged layout.
+  template<typename T>
+  [[nodiscard]] std::vector<T> Scatter(const std::vector<T>& rows,
+                                       std::size_t width, bool pooled) const {
+    std::vector<T> out(std::size_t{pool} *
+                       (pooled ? kPooledRows : kBlockTokens) * width);
+    for (std::size_t r = 0; r < rows.size() / width; ++r) {
+      const auto at = pooled ? PooledRow(static_cast<std::uint32_t>(r))
+                             : Row(static_cast<std::uint32_t>(r));
+      std::copy_n(rows.begin() + r * width, width, out.begin() + at * width);
+    }
+    return out;
+  }
+  /// Paged rows gathered back in position order.
+  template<typename T>
+  [[nodiscard]] std::vector<T> Gather(const std::vector<T>& paged,
+                                      std::size_t rows, std::size_t width,
+                                      bool pooled) const {
+    std::vector<T> out(rows * width);
+    for (std::size_t r = 0; r < rows; ++r) {
+      const auto at = pooled ? PooledRow(static_cast<std::uint32_t>(r))
+                             : Row(static_cast<std::uint32_t>(r));
+      std::copy_n(paged.begin() + at * width, width, out.begin() + r * width);
+    }
+    return out;
+  }
+};
+
+template<typename T>
+std::vector<T> DownloadAs(HipBuffer<T>* source, std::size_t count) {
+  std::vector<T> values(count);
+  CheckHip(hipMemcpy(values.data(), source->get(), count * sizeof(T),
+                     hipMemcpyDeviceToHost),
+           "download");
+  return values;
+}
+
+void RequireSame(const void* a, const void* b, std::size_t bytes,
+                 const std::string& what) {
+  if (std::memcmp(a, b, bytes) != 0)
+    throw std::runtime_error("paged " + what + " differs from contiguous rows");
+}
+
+/// Every kernel that reads or writes K/V or pooled indexer rows, run once on
+/// contiguous rows and once through a scrambled block table: the outputs
+/// (and the rows written) must be bitwise equal.
+void CheckPagedRows(std::uint32_t n_tokens, std::uint32_t start_pos,
+                    std::uint32_t seed) {
+  const std::uint32_t n_kv = start_pos + n_tokens;
+  const PagedLayout layout(n_kv);
+  const std::size_t q_count = std::size_t{n_tokens} * kQWidth;
+  const std::size_t kv_count = std::size_t{n_kv} * kKvWidth;
+  const std::size_t paged_count =
+      std::size_t{layout.pool} * PagedLayout::kBlockTokens * kKvWidth;
+  std::vector<__half> kh(kv_count), vh(kv_count);
+  {
+    const auto kf = MakeValues(kv_count, seed ^ 0xAAAAU, 1.0F);
+    const auto vf = MakeValues(kv_count, seed ^ 0x3333U, 1.0F);
+    for (std::size_t i = 0; i < kv_count; ++i) {
+      kh[i] = __float2half(kf[i]);
+      vh[i] = __float2half(vf[i]);
+    }
+  }
+  const std::uint32_t max_blocks = (n_kv + kRatio - 1) / kRatio;
+  const std::uint32_t mask_words = (max_blocks + 31) / 32;
+  std::vector<std::uint32_t> mask(std::size_t{n_tokens} * mask_words);
+  std::uint32_t state = seed ^ 0x77777777U;
+  for (std::uint32_t t = 0; t < n_tokens; ++t) {
+    const std::uint32_t complete = (start_pos + t + 1) / kRatio;
+    std::uint32_t* row = mask.data() + std::size_t{t} * mask_words;
+    for (std::uint32_t selected = 0; selected < std::min(512U, complete);) {
+      const auto block = NextRandom(&state) % complete;
+      if ((row[block / 32] & (1U << (block % 32))) == 0) {
+        row[block / 32] |= 1U << (block % 32);
+        ++selected;
+      }
+    }
+  }
+  HipBuffer<float> d_q(q_count), d_gate(q_count);
+  HipBuffer<__half> d_k(kv_count), d_v(kv_count);
+  HipBuffer<__half> p_k(paged_count), p_v(paged_count);
+  HipBuffer<std::uint32_t> d_table(layout.blocks), d_mask(mask.size()),
+      d_pos(1);
+  Upload(&d_q, MakeValues(q_count, seed, 4.0F));
+  Upload(&d_gate, MakeValues(q_count, seed ^ 0x5555U, 3.0F));
+  Upload(&d_k, kh);
+  Upload(&d_v, vh);
+  Upload(&p_k, layout.Scatter(kh, kKvWidth, false));
+  Upload(&p_v, layout.Scatter(vh, kKvWidth, false));
+  Upload(&d_table, layout.table);
+  Upload(&d_mask, mask);
+  Upload(&d_pos, std::vector<std::uint32_t>{start_pos});
+  const std::uint32_t* table = d_table.get();
+
+  // Per-token attention: mask walk and compacted lists, single and split.
+  constexpr std::uint32_t kBudget = 512;
+  HipBuffer<std::uint32_t> d_lists(std::size_t{n_tokens} * kBudget),
+      d_counts(n_tokens);
+  for (const std::uint32_t splits : {0U, 8U}) {
+    HipBuffer<float> partials(std::size_t{n_tokens} * kHeads *
+                              std::max(splits, 1U) * (kDim + 2));
+    for (const bool lists : {false, true}) {
+      HipBuffer<float> a(q_count), b(q_count);
+      for (auto [out, k, v, blocks] :
+           {std::tuple{&a, d_k.get(), d_v.get(),
+                       static_cast<const std::uint32_t*>(nullptr)},
+            std::tuple{&b, p_k.get(), p_v.get(), table}}) {
+        q::Attention(d_q.get(), k, v, d_mask.get(), mask_words, out->get(),
+                     splits == 0 ? nullptr : partials.get(), splits, n_tokens,
+                     d_pos.get(), kHeads, kKvHeads, kDim, kRatio, nullptr,
+                     lists ? d_lists.get() : nullptr,
+                     lists ? d_counts.get() : nullptr, lists ? kBudget : 0,
+                     blocks);
+      }
+      CheckHip(hipDeviceSynchronize(), "paged attention");
+      RequireSame(Download(&a, q_count).data(), Download(&b, q_count).data(),
+                  q_count * sizeof(float),
+                  std::string("attention") + (lists ? " lists" : " walk") +
+                      " split" + std::to_string(splits));
+    }
+  }
+
+  // Fused WMMA attention: the dense window, then the sparse window.
+  for (const bool sparse : {false, true}) {
+    HipBuffer<float> a(q_count), b(q_count);
+    bool accepted = true;
+    for (auto [out, k, v, blocks] :
+         {std::tuple{&a, d_k.get(), d_v.get(),
+                     static_cast<const std::uint32_t*>(nullptr)},
+          std::tuple{&b, p_k.get(), p_v.get(), table}}) {
+      accepted = q::WmmaCausalAttention(d_q.get(), d_gate.get(), k, v,
+                                        sparse ? d_mask.get() : nullptr,
+                                        mask_words, out->get(), n_tokens,
+                                        start_pos, kHeads, kKvHeads, kDim,
+                                        kRatio, nullptr, false, blocks) &&
+                 accepted;
+    }
+    if (!accepted)
+      throw std::runtime_error("paged WMMA attention rejected its geometry");
+    CheckHip(hipDeviceSynchronize(), "paged WMMA attention");
+    RequireSame(Download(&a, q_count).data(), Download(&b, q_count).data(),
+                q_count * sizeof(float),
+                sparse ? "sparse WMMA attention" : "dense WMMA attention");
+  }
+
+  // Writers: StoreKv and PrepareAttention land on the table's rows.
+  {
+    constexpr std::uint32_t stride = 2 * (kQWidth + kKvWidth);
+    const auto packed =
+        MakeValues(std::size_t{n_tokens} * stride, seed ^ 99U, 2.0F);
+    const auto gamma = MakeValues(2 * kDim, seed ^ 7U, 1.0F);
+    HipBuffer<float> d_packed(packed.size()), d_gamma(gamma.size()),
+        d_src(std::size_t{n_tokens} * kKvWidth), qa(q_count), ga(q_count),
+        qb(q_count), gb(q_count);
+    Upload(&d_packed, packed);
+    Upload(&d_gamma, gamma);
+    Upload(&d_src,
+           MakeValues(std::size_t{n_tokens} * kKvWidth, seed ^ 5U, 1.0F));
+    HipBuffer<__half> ck(kv_count), cv(kv_count), pk(paged_count),
+        pv(paged_count), cs(kv_count), ps(paged_count);
+    for (const bool prefill : {false, true}) {
+      if (!q::PrepareAttention(d_packed.get(), stride, d_gamma.get(),
+                               d_gamma.get() + kDim, qa.get(), ga.get(),
+                               ck.get(), cv.get(), n_tokens, kHeads, kKvHeads,
+                               kDim, 64, d_pos.get(), 1e7F, 1e-6F, nullptr,
+                               nullptr, prefill) ||
+          !q::PrepareAttention(d_packed.get(), stride, d_gamma.get(),
+                               d_gamma.get() + kDim, qb.get(), gb.get(),
+                               pk.get(), pv.get(), n_tokens, kHeads, kKvHeads,
+                               kDim, 64, d_pos.get(), 1e7F, 1e-6F, nullptr,
+                               nullptr, prefill, {}, table))
+        throw std::runtime_error("paged preparation rejected its geometry");
+      q::StoreKv(d_src.get(), cs.get(), n_tokens, kKvWidth, d_pos.get(),
+                 nullptr);
+      q::StoreKv(d_src.get(), ps.get(), n_tokens, kKvWidth, d_pos.get(),
+                 nullptr, table);
+      CheckHip(hipDeviceSynchronize(), "paged writers");
+      RequireSame(Download(&qa, q_count).data(), Download(&qb, q_count).data(),
+                  q_count * sizeof(float), "prepared queries");
+      for (auto [c, p, what] : {std::tuple{&ck, &pk, "prepared keys"},
+                                std::tuple{&cv, &pv, "prepared values"},
+                                std::tuple{&cs, &ps, "stored rows"}}) {
+        const auto contiguous = DownloadAs(c, kv_count);
+        const auto gathered =
+            layout.Gather(DownloadAs(p, paged_count), n_kv, kKvWidth, false);
+        RequireSame(contiguous.data() + std::size_t{start_pos} * kKvWidth,
+                    gathered.data() + std::size_t{start_pos} * kKvWidth,
+                    std::size_t{n_tokens} * kKvWidth * sizeof(__half),
+                    std::string(what) + (prefill ? " (prefill)" : ""));
+      }
+    }
+  }
+
+  // Pooled indexer keys: pool every complete block of the sequence, then
+  // score and select through the same table.
+  {
+    constexpr std::uint32_t kIndexDim = 128, kIndexHeads = 4;
+    const std::uint32_t capacity = std::bit_ceil(n_kv);
+    const std::uint32_t pooled = n_kv / kRatio;
+    const std::size_t paged_pooled =
+        std::size_t{layout.pool} * PagedLayout::kPooledRows * kIndexDim;
+    HipBuffer<float> raw(std::size_t{capacity} * kIndexDim), gamma(kIndexDim);
+    Upload(&raw,
+           MakeValues(std::size_t{capacity} * kIndexDim, seed ^ 11U, 1.0F));
+    Upload(&gamma, MakeValues(kIndexDim, seed ^ 13U, 1.0F));
+    HipBuffer<std::uint32_t> first(1), zero(1);
+    Upload(&first, std::vector<std::uint32_t>{0});
+    Upload(&zero, std::vector<std::uint32_t>{0});
+    HipBuffer<__half> cb(std::size_t{max_blocks + 1} * kIndexDim),
+        pb(paged_pooled);
+    q::PoolIndexerBlocks(raw.get(), gamma.get(), cb.get(), first.get(),
+                         zero.get(), n_kv, pooled, kRatio, kIndexDim, 64, 1e7F,
+                         1e-6F, capacity, nullptr);
+    q::PoolIndexerBlocks(raw.get(), gamma.get(), pb.get(), first.get(),
+                         zero.get(), n_kv, pooled, kRatio, kIndexDim, 64, 1e7F,
+                         1e-6F, capacity, nullptr, nullptr, {}, table);
+    CheckHip(hipDeviceSynchronize(), "paged pooling");
+    const auto contiguous = DownloadAs(&cb, std::size_t{pooled} * kIndexDim);
+    const auto gathered =
+        layout.Gather(DownloadAs(&pb, paged_pooled), pooled, kIndexDim, true);
+    RequireSame(contiguous.data(), gathered.data(),
+                contiguous.size() * sizeof(__half), "pooled indexer keys");
+    const std::uint32_t select_blocks = (max_blocks + 31) / 32 * 32;
+    const std::size_t iq_count =
+        std::size_t{n_tokens} * kIndexHeads * kIndexDim;
+    HipBuffer<float> iq(iq_count),
+        scores(std::size_t{n_tokens} * select_blocks);
+    Upload(&iq, MakeValues(iq_count, seed ^ 17U, 2.0F));
+    HipBuffer<std::uint32_t> ma(std::size_t{n_tokens} * mask_words),
+        mb(std::size_t{n_tokens} * mask_words);
+    q::SelectBlocks(iq.get(), cb.get(), ma.get(), scores.get(), n_tokens,
+                    d_pos.get(), 0, kIndexHeads, kIndexDim, kRatio, kBudget,
+                    mask_words, select_blocks, nullptr);
+    CheckHip(hipDeviceSynchronize(), "contiguous selection");
+    q::SelectBlocks(iq.get(), pb.get(), mb.get(), scores.get(), n_tokens,
+                    d_pos.get(), 0, kIndexHeads, kIndexDim, kRatio, kBudget,
+                    mask_words, select_blocks, nullptr, 0, table);
+    CheckHip(hipDeviceSynchronize(), "paged selection");
+    const auto sa = DownloadAs(&ma, std::size_t{n_tokens} * mask_words);
+    const auto sb = DownloadAs(&mb, std::size_t{n_tokens} * mask_words);
+    RequireSame(sa.data(), sb.data(), sa.size() * sizeof(std::uint32_t),
+                "block selection");
+  }
+  std::cout << "paged rows n=" << n_tokens << " start=" << start_pos
+            << " blocks=" << layout.blocks << "/" << layout.pool
+            << " bitwise-equal\n";
+}
+
 }  // namespace
 
 int main() {
   try {
+    for (const auto& [n, start, seed] : {std::tuple{1U, 5000U, 0xB10C0001U},
+                                         std::tuple{8U, 9000U, 0xB10C0002U},
+                                         std::tuple{64U, 4093U, 0xB10C0003U},
+                                         std::tuple{300U, 0U, 0xB10C0004U}})
+      CheckPagedRows(n, start, seed);
     CheckChunks(136, 94);
     CheckChunks(2048, 1025);
     CheckWmmaLiveExtent();
