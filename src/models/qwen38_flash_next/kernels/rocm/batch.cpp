@@ -317,7 +317,8 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
                 l.attn_k_norm.f32(), nullptr, nullptr, session.mtp_.k_cache,
                 session.mtp_.v_cache, n, 0, c.num_kv_heads, c.head_dim,
                 c.rotary_dim, &session.control_->mtp_position, c.rope_theta,
-                c.rms_eps, stream_, session.vision_input_.rope()))
+                c.rms_eps, stream_, session.vision_input_.rope(), false, {},
+                session.mtp_.kv_blocks))
           return Fail(error, "batched MTP cache projection failed");
         StoreRows(base.ik + std::size_t{offsets[i]} * c.indexer_head_dim,
                   session.mtp_.index_k, n, c.indexer_head_dim,
@@ -330,7 +331,8 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
                             &session.control_->mtp_position, n, pool,
                             c.compress_ratio, c.indexer_head_dim, c.rotary_dim,
                             c.rope_theta, c.rms_eps, capacity, stream_,
-                            session.vision_input_.rope());
+                            session.vision_input_.rope(), {},
+                            session.mtp_.kv_blocks);
         }
       }
       return true;
@@ -367,6 +369,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
       attention.v_cache = session.mtp_.v_cache;
       attention.index_k = session.mtp_.index_k;
       attention.block_k = session.mtp_.block_k;
+      attention.kv_blocks = session.mtp_.kv_blocks;
       const bool sparse = session.mtp_.position + n > c.indexer_top_k;
       const auto complete = (session.mtp_.position + n) / c.compress_ratio;
       const auto pool = sparse ? complete - session.mtp_.blocks : 0;
