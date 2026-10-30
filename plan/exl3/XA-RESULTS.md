@@ -260,3 +260,16 @@ struct DeviceLinear {                 // one EXL3 projection y = x W, W [k][n]
 - 창 2(`PLAN-EXL3-X2A2.json`)는 F1 ABBA 뒤에 돈다.
 - 빌드는 W3 08bba6ed(빠른 decode/verify 커널)를 포함해 다시 한다. 23:05 빌드에는 08bba6ed가 없다(빌드 23:05:57, 커밋 23:08:42, exl3_gemv 오브젝트 없음).
 - 시험 순서: kernel_test → reference_test → sidecar 둘 → fingerprints.
+
+### X2A 창 2 (2026-10-31, `x2a2-unit/x2a2`, 1e47ca44 바이너리 = W3 08bba6ed 포함, FAILED: W3 kernel test만 실패)
+
+| 시험 | 결과 | 비고 |
+|---|---|---|
+| `qwen27b_exl3_kernel_test` (W3) | FAIL 5/10 | FP16 반올림 입력 대비 상대 L2가 0.9e-5~4.1e-5로 한계 1e-5를 넘는다. 정확값 대비는 2.1e-4~2.2e-4(FP16 활성 반올림 수준)다. W3가 판단한다. |
+| `exl3_reference_test` | PASS | rotation 1.4e-7, projection 4.3e-7, dequant bit-exact |
+| 5.00 사이드카 target 검사 | PASS (1055 s) | replay/검증/동시성/prefill 연속 검사를 EXL3 경로로 모두 통과했다. decode/verify는 빠른 경로다. |
+| 사이드카 vs X1 5.00 BF16 GGUF | PASS (199 s) | 27행, top1 27/27, mean KL 4.9e-6, mean TV 9.2e-4, mean ΔNLL -9.1e-4. 측정값이다. 차이는 BF16 재반올림, Q8_0 임베딩, FP16 활성(빠른 경로)에서 온다. |
+| UD-Q4_K_M fingerprints | PASS | rq2h와 byte-equal이다. |
+
+- 빠른 경로를 끄는 스위치 없이 엔진 수준 결과가 나왔다.
+- 기준 경로만 쓰는 대조 빌드(08bba6ed 이전)는 엔진 시험이 통과했으므로 필요하지 않다.
