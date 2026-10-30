@@ -1,6 +1,6 @@
 # EXL3(QTIP) 형식 도입 계획 초안 (2026-10-30, 감독 gufo-06)
 
-상태: **초안**이며 사용자 검토를 기다린다. 근거는 [RQ PLAN "방향 전환"](../rotated-quant/PLAN.md), [EXL3-RESULTS.md](../rotated-quant/EXL3-RESULTS.md)(W8), [FLASH-NEXT.md 13절](../rotated-quant/FLASH-NEXT.md)(W7), [W9-RESULTS.md](../rotated-quant/W9-RESULTS.md)다.
+상태: **확정 (사용자 결정 2026-10-30)**. 결정 내용은 아래 "결정" 절에 있다. 근거는 [RQ PLAN "방향 전환"](../rotated-quant/PLAN.md), [EXL3-RESULTS.md](../rotated-quant/EXL3-RESULTS.md)(W8), [FLASH-NEXT.md 13절](../rotated-quant/FLASH-NEXT.md)(W7), [W9-RESULTS.md](../rotated-quant/W9-RESULTS.md)다.
 
 ## 목표
 
@@ -80,9 +80,17 @@
   - 기능 테스트(`long-context`, `cache`)를 통과한다.
   - main과 짝지은 타이밍을 본다.
 
+### F0 Flash-Next n-gram 표 디스크 배치와 메모리 점유 측정 (사용자 지시 2026-10-30, F1과 함께)
+
+- n-gram 표를 GPU 상주 메모리에서 빼서 디스크(mmap, 필요한 행만 읽기)로 둔다. Kyojin과 upstream EXL3는 `ngram_embedding.safetensors`(32.6 GB)를 따로 두고 파일에서 읽는다.
+- 그다음 전체 메모리 점유(가중치, KV, MTP, 작업 버퍼, 세션 수별)를 측정한다.
+- **이 점유 결과를 보고 Flash-Next EXL3의 bpw를 정한다**(F2의 선행 조건).
+- 통과 기준: greedy 출력이 바이트 단위로 같다. decode와 prefill이 main 대비 5 %·10 ms 안이다(n-gram 조회가 디스크로 가도 속도를 해치지 않아야 한다). 페이지 캐시 상태(cold/warm)를 기록한다.
+
 ### F2 Flash-Next EXL3
 
 - **대상:** 전문가(MoE) trellis GEMV와 그룹 GEMM, dense 트렁크, MTP, n-gram 표다.
+- **bpw:** F0의 메모리 점유 측정 뒤에 정한다(사용자 지시 2026-10-30).
 - **팩:** turboderp `Qwen3.8-Flash-Next-exl3`(3.05 bpw 등, Qwen Community License)를 먼저 쓴다. 직접 양자화하려면 HF safetensors 원본이 필요한데, 지금 받은 것은 BF16 GGUF다.
 - **통과 기준:** 품질은 gufo 지금 UD-Q4_K_XL 수준 이상이고, 속도는 Kyojin 카드(52.8/47.5/73.2, 8K/32K 52.2/51.1) 이상이다.
 
@@ -108,7 +116,14 @@
 
 GPU 창, 빌드, 디스크 규칙은 [W-COMMON.md](../rotated-quant/W-COMMON.md)를 그대로 따른다.
 
-## 사용자 결정이 필요한 것
+## 결정 (사용자 2026-10-30)
+
+1. **27B 목표: EXL3 5.0급.** 같은 바이트로 더 좋은 품질을 낸다. 비교 기준은 UD-Q4_K_XL(5.15 bpw)이고, KL 절반 수준(EXL3 5.00: 7.6×10⁻³)이 목표다. 속도는 X2·X3에서 gufo 런타임으로 UD-Q4_K_XL 이상을 낸다.
+2. **직접 양자화한다.** upstream `convert.py`를 오프라인으로 쓴다(W8 이미지). 보정 코퍼스는 사용자 지시(2026-10-29)대로 c02를 쓴다. turboderp 5.00 팩은 품질 대조군으로만 쓴다.
+3. **R3 imatrix와 E 실험을 멈춘다.**
+4. **X0·X1(형식과 리더), XQ(양자화), F1(Flash-Next 페이지 KV + KVarN)을 동시에 시작한다.** X2·X3은 X1 뒤에 시작한다. 담당은 X-A = W8(이어서), XQ = 새 에이전트, F1 = 새 에이전트다.
+
+## (처음) 사용자 결정이 필요했던 것
 
 1. **27B 목표:** "같은 품질, 더 적은 바이트(EXL3 4.0 수준)"와 "같은 바이트, 더 좋은 품질(EXL3 5.0 수준)" 중 어느 쪽인가?
 2. **팩 출처:** 공개 팩(turboderp)을 쓸지, 직접 양자화할지
