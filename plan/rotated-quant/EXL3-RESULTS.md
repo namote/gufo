@@ -173,7 +173,7 @@
 - **decode는 두 엔진 모두 대역폭에 묶여 있다.** 실효 대역폭은 둘 다 약 190–205 GB/s다. FLASH-NEXT 13.3의 "EXL3 dense GEMV는 피크의 55–65 %" 짐작은 upstream 1.6.5 + gfx1151에서는 맞지 않았다.
 - **같은 품질에서 EXL3가 decode가 빠르다.** EXL3 4.00은 UD-Q4_K_M과 KL이 구분되지 않는데(18.8 대 17.5×10⁻³) tg가 15.56 대 12.93 tok/s로 약 +20 %다. EXL3 5.00은 KL이 UD-Q4_K_XL의 절반인데 tg가 같다(12.37 대 12.32).
 - **prefill은 EXL3가 약 33 % 느리다**(pp2048 약 430 대 640–660 tok/s).
-- 실행된 커널 목록은 아직 없다(`w8sp-kernels` 실패. 원인: `rocprofv3`의 `#!/usr/bin/env python3`에 컨테이너 PATH가 python3을 찾지 못함). SPEED2에서 다시 잰다.
+- 실행된 커널 목록은 이 창에서 얻지 못했다(`w8sp-kernels` 실패. 원인: `rocprofv3`의 `#!/usr/bin/env python3`에 컨테이너 PATH가 python3을 찾지 못함). 아래 "실행 커널" 절(`w8k-a01`)에 있다.
 
 **깊이 32K:**
 - upstream 1.6.5의 Triton `_paged_attn_prefill_kernel`(캐시에 과거 문맥이 있는 prefill, head_dim 256, fp16 캐시)이 gfx1151에서 LDS 131,072 B를 요구한다. 장치 한도는 65,536 B라 `OutOfResources`로 실패한다. 위치 0부터의 prefill은 된다(품질 측정, decode prefix, 깊이 0 pp).
@@ -183,7 +183,27 @@
 ## 속도 (SPEED2, 창 `w8sp2-a01`, 2026-10-30 08:59–11:17)
 
 - 바이너리: `exl3/bench.py` 커밋 `3b96a10e`, 이미지 `ai-tools/exl3-eval:1.6.5-rocm100`(id `03a29041b45d`). 창마다 점검: 컨테이너 0, 1분 부하 0.61–1.86, LOCKS 일치, 루트 여유 157–158 GB. 모든 창은 한 번씩만 돌렸다.
-- `w8sp2-kernels`: FAILED_no_fallback. 측정 작업 자체(`kernels-exl3-4.json`)는 끝났지만, `rocprofv3`가 작업 디렉터리(`/src`, 읽기 전용)에 `.rocprofv3`를 쓰려다 abort한 뒤 timeout(1,200 s)까지 멈췄다. **커널 목록은 여전히 없다.** 고칠 방법: `sh -c "cd /receipt/run && exec rocprofv3 …"`(짧은 창 하나, 약 5분).
+- `w8sp2-kernels`: FAILED_no_fallback. 측정 작업 자체(`kernels-exl3-4.json`)는 끝났지만, `rocprofv3`가 작업 디렉터리(`/src`, 읽기 전용)에 `.rocprofv3`를 쓰려다 abort한 뒤 timeout(1,200 s)까지 멈췄다. 커널 목록은 아래 `w8k-a01`에서 다시 쟀다.
+
+### 실행 커널 (창 `w8k-a01/w8k-kernels`, `PLAN-EXL3-KERNELS.json`, COMPLETE)
+
+- `rocprofv3 --kernel-trace --stats`, EXL3 4.00, `bench.py kernels`(prefill 512 + decode 16단계, 두 번). `/receipt/run`에서 시작하고 모델 경로는 env로 넘겼다. 결과: `…/w8k-a01/w8k-kernels/receipt/run/rocprof-exl3-4/trace_kernel_{trace,stats}.csv`.
+- 두 번째 패스의 decode 16단계만 떼어 보았다(launch 18,829개, 커널 시간 1,035 ms, wall 1,080 ms = 토큰당 67.5 ms, 14.8 tok/s. 프로파일러 없이 잰 15.56 tok/s와 비슷하다).
+
+| decode 커널 | 비율 | 토큰당 ms | 역할 [짐작] |
+|---|---:|---:|---|
+| `exl3_gemv_mr_dot_multi<4, false, 2, 4, 1>` | 40.0 % | 25.9 | 묶음 GEMV(K=4 trellis): MLP gate+up 등 |
+| `exl3_gemv_mr_dot_single<4, true, 2, 8, 1>` | 21.6 % | 14.0 | 단일 GEMV(출력 Hadamard 융합) |
+| `exl3_gemv_mr_dot_single<4, true, 2, 16, 1>` | 19.8 % | 12.8 | 단일 GEMV: MLP down 등 |
+| `exl3_gemv_dot_kernel<6, false, 2, 4>` | 6.5 % | 4.2 | lm_head(K=6) |
+| `exl3_gemv_mr_dot_single<4, false, 2, 8, 1>` | 3.5 % | 2.3 | 기타 투영 |
+| `_paged_attn_decode_split_kernel`(Triton) | 1.3 % | 0.9 | full attention 16층 |
+| `cuda_recurrent_gated_delta_rule_kernel_128` | 1.3 % | 0.8 | DeltaNet 48층 |
+| 그 밖(rms_norm, `exl3_gemv_mr_had_in_*`, conv, gdn_ba 등) | 약 6 % | 약 4 | |
+
+- **decode는 RDNA용 EXL3 trellis GEMV(`exl3_gemv_mr_*`)가 직접 돈다.** reconstruct(fp16로 풀기) + hipBLAS 같은 대체 경로는 decode에 거의 없다(`reconstruct_kernel` 8회, 0.4 %). 입력 Hadamard는 별도 작은 커널(`exl3_gemv_mr_had_in_*`, 0.7 %)이고 출력 Hadamard는 GEMV에 융합된다.
+- 커널 단위 대역폭[짐작]: lm_head 0.95 GB / 4.2 ms ≈ 226 GB/s. MLP 세 행렬(층당 약 134 MB, 64층 8.6 GB)이 가장 큰 GEMV 세 종류(합 52.7 ms/토큰, 다른 투영 포함)에 들어 있다고 보면 약 200–220 GB/s다. 같은 장비의 gufo 4비트 GEMV(R0b: IQ4_XS 89 %, Q4_K 82 %, 약 200–215 GB/s)와 같은 수준이다.
+- prefill(512토큰)은 trellis를 fp16으로 푸는 `reconstruct_kernel`/`reconstruct_had_kernel`과 hipBLASLt Tensile GEMM(`Cijk_…HHS…`), EXL3 WMMA GEMM(`exl3_wmma_gemm_kernel*`), fla Triton 커널(`chunk_*`, `recompute_w_u_fwd_kernel`)을 쓴다. 이 구간은 두 패스의 경계를 깔끔히 자르지 못해 비율은 싣지 않는다. 큰 m에서 reconstruct + GEMM은 upstream의 정상 경로다(대체 경로가 아님)[짐작: `exllamav3` ROCm 소스의 경로 선택을 읽지는 않았다].
 
 ### tg128 깊이 32K (`--fill-single`, 문맥을 위치 0부터 한 번에 채움, 3회 평균, ABBA 4.00 → 5.00 → 5.00 → 4.00)
 
@@ -226,7 +246,6 @@
 
 ## 남은 문제
 
-- 커널 목록(`rocprofv3` 작업 디렉터리 문제로 두 번 실패, 짧은 창 하나로 재측정 제안).
 - EXL3 MTP와 gufo DFlash2의 프롬프트별 paired 비교는 출력이 달라 불가능하다. 필요하면 같은 출력 길이를 강제하는 방식(EOS 무시)으로 다시 잰다.
 - 회전/GPTQ식 k-quant가 같은 bpw에서 이 격차를 얼마나 줄이는지(R4/E3, 3번 갈래 (a)(b)).
 - EXL3 3.50 복사 실패의 텐서별 원인, decode 경로 확인(선택).
