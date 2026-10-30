@@ -255,6 +255,22 @@ cold는 새 프로세스의 첫 요청(빈 행 캐시), warm은 같은 요청의
   - 운영 바이너리 바이트 비교는 증명이 되지 못한다. 같은 운영 소스(`766a593e`와 `83d90aaa`)의 두 빌드도 `.text`와 `.hip_fatbin`이 다르기 때문이다(경로와 줄 위치가 박힌다).
   - 그래서 설계대로 27B KVarN op 테스트로 증명한다. 이 테스트는 flush된 모든 tile이 CPU 참조와 비트 단위로 같아야 통과한다.
 - **창 계획:** `PLAN-F1-K1T.json`(`f1-k1-unit`, sha `a53b8d29…`). 대상은 core/27B layout, 27B KVarN op, Flash-Next KVarN op, Flash-Next attention op 테스트다. LOCKS `e9bf9ac4…`. 감독 "start"를 기다린다.
+### K1T 창 (2026-10-31, `PLAN-F1-K1T.json` `f1-k1-unit`, 한 번) [확인]
+
+- **결과:** FAILED, health_PASS, 재시도 없음. 위치는 `tmp/test-results/gufo-upstream-port-20261023/f1-k1/f1-k1-unit/`.
+- **통과:**
+  - core `kvarn_layout_test`
+  - 27B `qwen_kvarn_layout_test`
+  - **27B `qwen_attention_kvarn_ops_test`(20 s):** flush tile이 CPU 참조와 비트 단위로 같다. verify==decode도 차이 0이다. **K1a/K1b 공통화 뒤 27B 동일성이 증명되었다.**
+  - Flash-Next `attention_ops`(48 s, P1 페이지 행과 writer 변경 포함)
+- **실패: Flash-Next `kvarn_ops`**
+  - writer ring 행: 통과(2개 경우).
+  - 회전 행: 통과(sink와 ring 모두 비트 동일).
+  - k4v4 token-major 레코드: 32 tile 중 21개가 정확하다. 코드는 32 tile 모두 같다(code_diff 0). FP16 scale/zero/column은 11 tile에서 4,355개가 다르다.
+- **[짐작] 원인 후보:**
+  1. 코드가 모두 같고 scale만 다르다. 그래서 balancing이 고른 행·열 scale(최선 반복의 상태)이 참조와 약간 달라, 반올림한 코드는 같지만 저장한 곱이 다른 경우다. 27B 테스트 데이터에서는 드러나지 않은 경로(채널별로 1–5.5배 범위를 준 이 테스트 데이터)일 수 있다.
+  2. 레코드 필드를 덮어쓰는 경합이나 오프셋 오류. 코드 영역은 맞으므로 가능성은 낮다고 본다.
+- **확인하지 않았다.** 어떤 tile(K/V, 그룹, 층, 헤드)이 다른지, 첫 차이 값이 무엇인지 테스트가 출력하지 않는다.
 - **P1 inconclusive 재측정 계획:** `PLAN-F1-REP-{BASE,CAND}.json`. `repetition_sequence`만 대상으로 ABBA × 2, 반복 5, 팔마다 20표본이다. 감독 "start"를 기다린다.
 
 ## ABBA 계획 초안 (P1 정확성 통과 뒤)
