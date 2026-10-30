@@ -18,6 +18,8 @@
 | 4 | **바이트를 속도로** | 3비트 커널(E9)을 대역폭에 묶이게, 비트 배분(E8)으로 민감한 텐서에만 비트를 더 준다 | 3 뒤 |
 | 5 (항상) | **견고한 판정** | 평균 KL과 함께 중앙값, 뒤집힘 비율, 부호 시드 변이 폭(E10 0단계)을 본다. 채택 전에 D4 실제 작업 게이트(tool-call, 한국어, 긴 문맥)를 통과해야 한다 | 모두 |
 
+**다음 계획 초안 방향 (사용자 2026-10-30, W8 속도 결과 뒤 확정):** (1) EXL3 형식 선택 (2) gufo에 EXL3 도입(형식 리더, trellis 디코드 GEMV/GEMM/verify, Hadamard 융합) 후 속도·커널 최적화 (3) Flash-Next에 KVarN·EXL3 도입. (3)에는 **페이지 KV**를 함께 넣는다: 공통 `src/core/hip/kv_block_pool`/`kv_block_table`은 지금 27B만 쓰고, Flash-Next는 세션별 연속 `ContinuationLayout`(FP16, 용량 선점)이다. KVarN과 같은 attention·KV 경로를 고치므로 한 묶음으로 한다. 참고 코드: turboderp-org/exllamav3 v1.6.5 `cdc785db`(기준), Yamz-Labs/kyojin `2132bd24`, vcruz305/exllamav3-amd `e0ec553b`(모두 MIT, 고지 유지).
+
 진행 중인 R2 일(RQ2G 진단, RQ2I gufo 대 llama.cpp, E10 0단계 부호 변이 파일, RQ2E 수락률, RQ2F 정렬 A/B)은 싸고 위 판단에 쓰이므로 그대로 마친다.
 
 ## 배경 (조사 요약)
