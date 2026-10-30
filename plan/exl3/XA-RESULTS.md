@@ -102,3 +102,126 @@
   - 결과는 `rq2h/units`의 같은 로그와 **바이트 단위로 같다**(`cmp`). EXL3 코드가 기존 GGUF 경로 출력을 바꾸지 않았다.
 
 **판정: X1 통과.** 4.00과 5.00 모두 엔진 차이가 기준 안이고, BF16 기준 KL이 W8과 같으며, GGUF 경로 fingerprint가 그대로다. 다음은 X2(직접 로드와 trellis 커널, X-B)와 토크나이저 메타데이터 결정이다.
+
+## X2a 설계 메모 (2026-10-30, 읽기만 하고 쓴 초안, X2b와 합의 전)
+
+목표([XB-BRIEF.md](XB-BRIEF.md) X2a): gufo 27B가 EXL3 팩을 BF16으로 풀지 않고 읽는다. `trellis`/`suh`/`svh`는 압축된 채로 GPU에 둔다. 정확성용 기준 경로(단순 dequant 커널 + 기존 GEMM)를 만들고, 이를 X2b 커널의 비교 기준으로 쓴다.
+
+### 1. 메타데이터: (b) GGUF 사이드카를 고른다
+
+**방식:**
+- 팩 디렉터리 안에 텐서 없는 GGUF `gufo.gguf`를 둔다.
+- 내용은 같은 모델 GGUF의 KV 전부(`split.*` 제외: 하이퍼파라미터, `tokenizer.ggml.*`, `tokenizer.chat_template`)와 새 키 `gufo.exl3.checkpoint = "."`(팩 디렉터리, 사이드카 기준 상대 경로)다.
+- 텐서는 0개다.
+
+**이유:**
+- **토큰 id 동일성이 구성상 보장된다.** 지금 gufo의 토크나이저(`QwenTokenizer::CreateFromGguf`), 채팅 템플릿 검사(`QwenChatTemplate::ValidateGgufTemplate`), 설정(`GgufReader::ExtractModelConfig`)은 모두 GGUF 메타데이터에서 만들어진다. 같은 KV 바이트를 쓰면 GGUF 경로와 토크나이저 출력이 같을 수밖에 없다.
+- 반면 (a) HF `tokenizer.json` 경로는 BPE 어휘·merges·token_type·pre-tokenizer(`qwen35`)·특수 토큰을 다시 구현해야 하고 동일성 검사가 따로 필요하다. 이는 별도 작업으로 미룬다.
+- **CLI를 바꾸지 않는다.**
+  - 지금 CLI 진입점(`src/cli/{prompt,bench,serve}`, `rq_logits`)은 모두 "GGUF 경로 → `GgufReader` → `QwenGpuModel/Executor::CreateFromGguf`"다.
+  - 사이드카 경로를 `--model`로 주면 `CreateFromGguf`가 `gufo.exl3.checkpoint` 키를 보고 EXL3 로드로 가지를 친다. 파일 형식은 로더가 판단한다. 옵션은 더하지 않는다.
+- **만들기:** `qwen27b_exl3_to_gguf metadata EXL3_DIR OUT.gguf TEMPLATE.gguf`(X1 도구에 모드 추가)로 만든다.
+  - 템플릿 KV를 복사하고 키 하나를 더한다.
+  - 일관성 검사:
+    - config.json(text_config) 대 GGUF 하이퍼파라미터: layers, hidden, heads, ssm 크기, vocab
+    - tokenizer.json 어휘 대 `tokenizer.ggml.tokens`: 같은 토큰열
+  - 틀리면 이름을 들어 거부한다.
+- **단점:** 새 모델마다 같은 모델의 GGUF(메타데이터만)가 필요하다. 27B에는 이미 있다. Flash-Next도 unsloth GGUF가 있다.
+
+### 2. 디바이스 텐서 구조 (X2b와 맞출 인터페이스)
+
+```cpp
+// src/core/quant/exl3/device.hpp (X2a)
+namespace gufo::quant::exl3 {
+struct DeviceLinear {                 // one EXL3 projection y = x W, W [k][n]
+  const std::uint16_t* trellis;       // device; [k/16][n/16][rate.TileWords()] uint16, file order
+  const std::uint16_t* suh;           // device FP16 [k]
+  const std::uint16_t* svh;           // device FP16 [n]
+  std::uint32_t k, n;                 // in_features, out_features (multiples of 128)
+  BitRate rate;                       // bits 1..8, half (1.5/2.5/3.5)
+  Codebook codebook;                  // kMul1 for the turboderp packs
+};
+}
+```
+
+- **배치:** 파일 그대로다. 타일 순서는 [k/16][n/16]이고 타일 안은 `16·K` uint16 연속이다. upstream RDNA 커널(`exl3_gemv_*`, `reconstruct`)이 읽는 순서와 같다.
+- **정렬 (측정):** safetensors의 텐서 오프셋은 정렬되지 않는다. 5.00 팩의 trellis 409개 모두 16 B 정렬이 아니다. 그래서 mmap 주소를 그대로 쓰지 않는다.
+  - 모든 trellis/suh/svh를 장치 arena 하나에 256 B 정렬로 복사한다.
+  - 호스트 쪽은 로드 동안만 mmap을 쓴다.
+- **gufo 바인딩:**
+  - `QwenTensorRef`에 `const quant::exl3::DeviceLinear* exl3 = nullptr`을 더한다. `exl3 != nullptr`이면 EXL3 투영이다.
+  - `data`는 trellis, `num_elements`는 k·n, `type`은 바꾸지 않는다(검사·분기 시 `exl3`를 먼저 본다).
+  - DeviceLinear 배열은 `QwenModelWeights`가 소유한다(지금 `rotation_signs`, `folded_weights`처럼 shared_ptr).
+- **분기 지점(X2b와 함께 손댈 곳, 감독에게 순서 요청):**
+  - decode GEMV(`quant_ops.hpp`의 type switch)
+  - small-batch verify(`LaunchBatchedQuantGEMMFp32`)
+  - prefill GEMM 경로(`gemm_route.hpp`의 `QwenGemmRoute`)
+  - 출력 헤드(`LaunchQwenOutputHead`)
+  - DFlash2 드래프터가 공유하는 타깃 헤드·임베딩(`dflash_weights.cpp:299`)
+- **수치 계약(커널 공통):**
+  - `y = svh ⊙ H_n((H_k(suh ⊙ x)) · W')`. H는 128점 자연순 Sylvester / √128이다. W'는 trellis의 FP16 값이다.
+  - 활성화 x는 FP32, 출력 y는 FP32다. 가중치를 BF16 등으로 다시 반올림하지 않는다.
+  - 커널 단위 정답은 X0 CPU 참조(`GemvReference`)다.
+- **입력 공유 문제:** suh가 텐서마다 달라, 같은 입력(qkv/gate/alpha/beta, q/k/v, gate/up)이라도 `H(suh ⊙ x)`를 공유할 수 없다.
+  - 기준 경로는 텐서마다 회전 커널을 한 번씩 부른다.
+  - 융합 방식(GEMV 프롤로그에서 블록마다 128점 FWHT 계산 등)은 X2b가 정한다.
+
+### 3. 양자화되지 않은 텐서
+
+- **변환:** X1 매핑(`exl3_weights`)이 GGUF 배치대로 만든다. 임베딩 BF16, norm(+1) F32, conv1d/A_log/dt_bias(V 재배열) F32, `in_proj_a/b` → `ssm_alpha/beta` BF16.
+- **업로드:** 호스트 버퍼 하나에 모아 weight region 하나로 올린다(`folded_weights` 패턴). 그 밖의 바인딩은 `LoadFromGguf`의 이름 대응을 그대로 쓴다.
+- **mtp.\*:** 27B 대상 forward가 쓰지 않으므로 X2a에서는 올리지 않는다.
+- **메모리 (5.00, 결정 필요):**
+  - trellis + suh/svh(본문 + lm_head)는 16.22 GB다. 임베딩 BF16 2.54 GB를 더하면 약 18.8 GB로, 목표인 UD-Q4_K_XL 상주 17.56 GB를 넘는다.
+  - 로드 때 임베딩을 Q8_0(1.35 GB)이나 Q6_K(약 1.04 GB)로 바꾸면 약 17.6/17.3 GB가 된다. gufo 임베딩 커널은 둘 다 받는다(`weights.cpp` `SupportsTensorType`).
+  - 임베딩 양자화는 품질에 영향이 거의 없다고 본다[짐작]. 하지만 KL로 확인해야 한다. 하기로 하면 X2a 통과 기준에 BF16 임베딩과 Q8_0 임베딩 두 경우를 넣는다.
+
+### 4. 정확성 기준 경로 (X2a, 속도는 보지 않음)
+
+`src/core/quant/exl3/reference.hip`에 커널 셋을 둔다.
+
+1. **`DequantInnerF32`:** trellis 열 구간 → W'를 FP32 [n_chunk][k](GGUF 행 배치, 전치)로 쓴다.
+   - 위치 하나당 스레드 하나: 상태를 추출하고 코드북 디코드(정수 연산, FP16 `__hfma`/`__hadd`).
+   - X0 CPU 참조와 FP16 비트가 같은지 테스트한다(FP32는 FP16 값을 그대로 담는다).
+2. **`RotateInput`:** `x' = H_k(suh ⊙ x)`, 행마다 FP32. 128점 FWHT, 공유 메모리.
+3. **`RotateOutput`:** `y = svh ⊙ H_n(t)`, FP32.
+4. **GEMM:** 기존 F32 가중치 경로(F32 GEMV / hipBLAS F32 GEMM)에 스크래치 W'를 넘긴다.
+   - n 구간 단위로 한다. 스크래치는 k × n_chunk × 4 B ≤ 256 MB.
+   - W'를 FP32로 쓰므로 가중치 재반올림이 없다. 그래서 X1의 ΔNLL 차이(1–2e-3, BF16 재반올림 짐작)를 바로 검증할 수 있다.
+
+**비용(짐작):**
+- decode는 토큰마다 전체 가중치를 FP32로 다시 푼다(약 100 GB 쓰기). 토큰당 약 0.5–1 s이므로 decode 4,096위치는 팩당 약 1시간이다.
+- prefill은 창(4,096토큰)당 한 번 풀기라 R0와 비슷하다.
+- 품질 창은 prefill 전부와 decode 일부(예: 창 2개, 1,024위치)로 제안한다.
+
+### 5. 시험
+
+- **CPU(CTest):**
+  - 사이드카 생성과 검사(합성 GGUF, 불일치 거부)
+  - `DeviceLinear` 바인딩 검사(shape·rate·codebook, su/sv 거부)
+- **GPU(`tests/models/qwen27b/exl3_*`):**
+  - `DequantInnerF32` 대 CPU W'(비트 동일, 합성 27경우 fixture 재사용)
+  - `RotateInput/Output` 대 CPU `HadamardBlocks`(상대 1e-6)
+  - 투영 하나 대 `GemvReference`
+- **품질 창:**
+  - 수집기를 다시 빌드한다(직접 로드 경로).
+  - 기준 둘: ExLlamaV3 같은 팩, gufo BF16.
+  - GGUF fingerprint(RQ2H 방식).
+  - 상주 메모리 기록.
+
+### 6. 파일과 순서 (제안)
+
+- **X2a:**
+  - `src/core/quant/exl3/{device.hpp,reference.hip,…}`
+  - `src/models/qwen/exl3_weights.*`(로더 함수 `LoadFromExl3`)
+  - `src/models/qwen/hip/model_loader.cpp`의 `CreateFromGguf` 분기
+  - `tests/models/qwen27b/exl3_*`
+- **공동(X2b와 순서 협의):**
+  - `QwenTensorRef` 필드 추가(`state.hpp`)
+  - 투영 분기 지점 다섯 곳
+- **순서:**
+  1. 인터페이스 합의(이 메모 2절)
+  2. 사이드카와 로더(CPU)
+  3. 기준 커널과 GPU 단위 시험
+  4. 투영 분기(기준 경로)
+  5. 품질 창
