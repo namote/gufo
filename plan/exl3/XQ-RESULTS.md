@@ -2,7 +2,7 @@
 
 상위 문서: [XQ 브리프](XQ-BRIEF.md), [PLAN](PLAN.md), [W-COMMON](../rotated-quant/W-COMMON.md), [W8 결과](../rotated-quant/EXL3-RESULTS.md). 이 문서는 XQ가 쓴다.
 
-상태: **1단계(조사)만 끝났다.** 컨테이너, 빌드, 큰 파일 해시, 복사는 하지 않았다(W9 I1 ABBA 창이 도는 중). 2단계(시험 양자화)는 감독 허락을 기다린다.
+상태: **1단계(조사)와 2단계(시험 양자화 창 `xq-t01`)가 끝났다.** 결과는 아래 "8. 시험 양자화 결과"에 있다. 3단계(본 양자화)는 감독 허락을 기다린다.
 
 기준 소스: upstream `turboderp-org/exllamav3` v1.6.5 `cdc785db89e263e65e5849cb53e1ada156411414`. 얕은 클론 `/home/m2on/projects/gufo/build/w9-src/exllamav3/`을 읽었다. 아래 `convert_model.py:N`은 `exllamav3/conversion/convert_model.py`의 줄 번호다.
 
@@ -141,8 +141,9 @@ python3 -I -m exllamav3.conversion.convert_model \
   -i /src_model -o /xq/qwen-3.8-27b-exl3-5.00-c02 -w /xq/work/qwen-3.8-27b-exl3-5.00-c02 \
   -b 5.0 -hb 6 -mb 4 -vb 16 --out_scales always -cb mul1 \
   -cd /xq/cal/c02-250x2048.safetensors -cr 250 -cc 2048 -cpi 1200 -d 0
-# 재개
-python3 -I -m exllamav3.conversion.convert_model -w /xq/work/qwen-3.8-27b-exl3-5.00-c02 -r
+# 재개: --out_scales always와 -cpi를 반드시 다시 준다(8절 "재개 함정")
+python3 -I -m exllamav3.conversion.convert_model -w /xq/work/qwen-3.8-27b-exl3-5.00-c02 -r \
+  --out_scales always -cpi 1200
 ```
 
 - 출력 위치: 외장 `/run/media/m2on/T5 EVO/AI/model/xq-exl3-20261030/`
@@ -176,9 +177,90 @@ python3 -I -m exllamav3.conversion.convert_model -w /xq/work/qwen-3.8-27b-exl3-5
 - **선택 대조:** v1.6.5 + 내장 기본 코퍼스로 한 번 더 양자화하면, "보정(c02)"과 "도구 버전(1.4.2→1.6.5)"의 효과를 나눌 수 있다. 본 양자화와 같은 시간과 디스크가 든다. 우리 팩이 turboderp와 다를 때만 제안한다.
   - `--out_scales auto`(1.6.5 기본) 변형도 원인 후보로 남겨 둔다.
 
+## 8. 시험 양자화 결과 (창 `xq-t01`, 2026-10-30 13:05–13:23 KST)
+
+- **도구:** gufo `e2517c88`의 `tools/exl3_quant/`
+  - `c02_to_caldata.py`(+ `test_c02_to_caldata.py`)
+  - `run_convert.py`(변환기 실행, 메모리 표본)
+  - `compare_qtensors.py`(헤더 비교)
+- **창 계획:** `~/projects/ai.tools/test/experiments/gufo_upstream_port_20261023/PLAN-XQ-TRIAL.json`(LOCKS.py 다시 실행함)
+  - 이미지: `ai-tools/exl3-eval:1.6.5-rocm100` `sha256:03a29041b45d`
+  - 마운트: 원본, `cal`, turboderp 5.00. 모두 ro다.
+- **보정 파일:** `/run/media/m2on/T5 EVO/AI/model/xq-exl3-20261030/cal/c02-250x2048.safetensors`
+  - sha256 `46bed24c4a379a2c07b2c675aeffb4941d729a4de848d90c42a235cf07a3b4f1`, 4,096,136 B
+  - manifest `c02-250x2048.json`에 행별 청크 id, 할당, 입력 sha가 있다. c02 `chunks.bin` sha 검사를 통과했다. 최대 토큰 id는 248,069다.
+- **창 출력은 외장 디스크에 있다:**
+  - 실제 위치: `/run/media/m2on/T5 EVO/AI/model/xq-exl3-20261030/windows/xq-t01/`
+  - `window.py`는 출력이 `tmp/test-results/gufo-upstream-port-20261023/` 아래여야 하고, `/receipt` 말고는 쓸 수 있는 마운트가 없다. 그래서 `…/gufo-upstream-port-20261023/xq-ext`를 외장으로 가는 symlink로 두었다.
+  - 루트 디스크에는 창 로그 `xq-t01.xq-trial.window.log`만 있다.
+- **창 상태: `FAILED_no_fallback`(health), `RESULT` = COMPLETE.** 세 단계는 모두 exit 0으로 끝났다.
+  - health가 실패한 이유는 커널 로그에 GPU 오류가 새로 생겼기 때문이다. 13:10:02와 13:10:07에 `ring gfx_0.0.0 timeout`이 났고, 각각 `Ring gfx_0.0.0 reset succeeded`와 "device wedged, but recovered through reset"가 따랐다.
+  - 두 번 모두 해당 프로세스는 **`kwin_wayland` pid 3289**(데스크톱 compositor)다. 리셋된 것은 그래픽 링뿐이고 compute 링이 아니다.
+  - 시각은 층 0 양자화 도중(13:05:55–13:10:33)이다. 변환은 멈추지 않았고, 층 0의 오차가 다른 층과 같은 수준이다.
+  - [짐작] trellis 인코딩 커널이 GPU를 오래 점유하는 동안 compositor의 gfx 제출이 2 s 제한을 넘은 것으로 보인다. 같은 일이 본 양자화(약 5시간) 내내 날 수 있다. 판단은 감독에게 맡긴다.
+  - 원 기록: `KERNEL-DELTA-0001.txt`, `FENCE-000{1,2}.*`, `WINDOW.json`
+
+### 층별 결과
+
+| 모듈 | 종류 | 시간 (s) | bpw | rfn | sqnr (dB) | proxy_err 범위 | RSS (converter 표시) |
+|---|---|---:|---:|---:|---:|---|---:|
+| embed_tokens | 비양자화 | 15.5 | 16 | — | — | — | 13.0 GB |
+| layers.0 | DeltaNet | 283.2 | 5.02 | 0.00320 | 51.71 | 6e-6–1.9e-4 | 14.4 GB |
+| layers.1 | DeltaNet | 230.5 | 5.02 | 0.00234 | 54.51 | 7.6e-5–3.1e-4 | 14.4 GB |
+| layers.2 (재개) | DeltaNet | 255.2 | 5.02 | 0.00347 | 51.97 | 1.0e-4–4.8e-4 | 14.2 GB |
+| layers.3 (재개) | full attention | 235.8 | 5.00 | 0.00245 | 54.17 | 1.0e-5–6.4e-4 | 14.4 GB |
+
+- 비유한(non-finite) 행은 0개다. `Calibration data: /models/cal/c02-250x2048.safetensors`로 250 × 2048이 로드됐다.
+- **전략 출력이 turboderp 5.00과 같다.** 본체 400개 선형이 5 bpw, lm_head가 6 bpw, MTP 8개가 4 bpw이고, `Final bitrate (excluding head): 5.00`이다.
+- 체크포인트 저장(상태 9.8 GB, exFAT 외장)은 한 번에 7–12 s다.
+- **헤더 비교** `compare-td5.json`: **PASS**
+  - 대상: embed와 층 0–3, 텐서 129개
+  - 키, 모양, dtype이 turboderp 5.00과 모두 같다.
+  - 층별 바이트 합도 같다: 층 0–2는 각 240,503,256 B, 층 3은 232,891,420 B, embed는 2,542,796,800 B.
+  - trellis K는 모두 5다.
+
+### 메모리 (`trial-a.summary.json`, `trial-b.summary.json`, 2 s 표본)
+
+| 항목 | trial-a (새 작업) | trial-b (재개) |
+|---|---:|---:|
+| 변환기 프로세스 트리 RSS 최대 | 18.2 GB | 18.2 GB |
+| GPU GTT 사용 최대(장치 전체) | 14.9 GB | 14.7 GB |
+| GPU VRAM 사용 최대(장치 전체, 4 GiB carve-out) | 0.70 GB | 0.69 GB |
+| 컨테이너 cgroup `memory.peak` | 63.3 GB | 65.0 GB |
+
+- cgroup 값에는 원본 safetensors를 읽고 체크포인트를 쓴 페이지 캐시가 들어 있다. 실제 점유는 RSS + GTT ≈ **33 GB**다.
+- `MALLOC_MMAP_THRESHOLD_=1048576`을 준 상태에서 층마다 RSS가 늘지 않았다(14.2–14.4 GB). 그래서 issue #460의 RSS 증가는 막힌 것으로 본다.
+- 창 앞뒤 호스트 가용 메모리는 119.8 / 118.7 GB다. X-A의 nix 컨테이너가 함께 돌았다.
+
+### 재개 함정 (본 양자화 명령에 반영)
+
+- **`--out_scales`는 재개할 때 저장값으로 복원되지 않는다.** 이 값은 일시 인자다(`convert_model.py:316`, 명령줄에서 매번 다시 읽는다).
+  - trial-b는 `--out_scales` 없이 재개해서 기본값 `auto`로 돌았다.
+  - 그 결과 층 2의 `mlp.up_proj`/`gate_proj`는 출력 스케일 없이(`..` 표시) 양자화됐다. 층 3은 auto가 스케일을 켰다(`o.`).
+  - 모양과 바이트 수는 같다. 그래서 헤더 비교로는 이 차이를 잡을 수 없다.
+  - 따라서 이 작업 디렉터리의 층 2는 turboderp 설정과 다르다. 시험 결과로만 쓰고 본 양자화에는 이어 쓰지 않는다.
+- `-cpi`도 argparse 기본값이 120이라, 재개하면 저장값(0)을 덮어쓴다(`convert_model.py:90`, 경고가 출력됨).
+- 그래서 재개 명령에는 항상 `--out_scales always -cpi <값>`을 붙인다(6절 명령을 고쳤다).
+
+### 본 양자화 추정 (측정 기반, 일부 짐작)
+
+- **층당 시간:** 평균 251 s(230–283 s)다. DeltaNet과 attention 층의 차이는 작다.
+- **64층:** 약 4.5시간이다.
+  - 그 밖에 lm_head(K=6, 1.27 G 가중치로 층 하나의 약 3배)가 약 15–25분이다[짐작].
+  - MTP(보정 없음)는 약 5분, compile(외장에 19 GB 쓰기)은 약 10분이다[짐작].
+  - **합계 약 5–5.5시간**이다. 1단계 추정 4–8시간의 아래쪽이다.
+- **창 나누기:** 재개 비용은 상태 로드 약 10 s다. 그래서 2시간 창 3개(층 약 28개씩, 마지막 창에 lm_head, MTP, compile) 또는 3시간 창 2개로 나눌 수 있다.
+- **메모리:** 최대 약 33 GB(RSS 18 + GTT 15)다. lm_head 단계에서는 +5–8 GB를 예상한다[짐작].
+- **디스크(외장):**
+  - 작업 디렉터리: 상태 2벌 19.6 GB + qtensors 약 19 GB
+  - 출력: 약 19 GB
+  - **합계 약 60 GB**다(외장 가용 525 GB). 루트에는 창 로그만 쓴다.
+- **시험 산출물:** `…/windows/xq-t01/receipt/work/`(22.9 GB: `ckpt` 9.8, `ckpt_old` 9.8, `qtensors` 3.3)이다. 지우지 않았다. 감독이 정한다.
+
 ## 남은 문제와 위험
 
-- gfx1151에서 변환을 검증한 기록이 없다. 시험 창에서 확인한다.
+- gfx1151에서 층 0–3 변환은 동작했다(8절). 다만 같은 창에서 compositor(`kwin_wayland`)의 gfx 링이 두 번 timeout으로 리셋됐다. 본 양자화 중에 이 일이 반복될지, window.py의 health 판정을 어떻게 볼지는 감독이 정한다.
+- lm_head(hipBLASLt #458 경로)는 아직 확인하지 않았다. 본 양자화에서 sqnr가 10 dB 아래면 실패로 본다.
 - turboderp 팩(1.4.2)과 우리 팩(1.6.5)은 도구 버전이 다르다. 품질 차이를 보정 데이터 때문이라고 단정하려면 위 선택 대조가 필요하다.
-- 상태 dtype(fp32)은 소스를 보고 짐작했다. 시험 창의 RSS로 확인한다.
-- 시간 추정은 다른 GPU의 수치에서 비율로 옮긴 것이라 오차가 크다.
+- 상태 크기는 체크포인트 9.8 GB로 확인했다(fp32 250 × 2048 × 5120 = 10.5 GB, 즉 9.8 GiB).
+- `run_convert.py`의 버전 조회가 비어 있었다. `exllamav3.__version__`이 없어서다. 그래서 `importlib.metadata`로 고쳤다. 이번 창의 버전은 이미지 provenance(v1.6.5 wheel)로 확인한다.

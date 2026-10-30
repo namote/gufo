@@ -91,10 +91,12 @@ def main() -> int:
         "TORCH_BLAS_PREFER_HIPBLASLT", "PYTORCH_HIP_ALLOC_CONF")}}
     try:
         ver = subprocess.run([sys.executable, "-I", "-c",
-                              "import torch, exllamav3; print(exllamav3.__version__); print(torch.__version__); "
+                              "import importlib.metadata as m, torch; print(m.version('exllamav3')); print(torch.__version__); "
                               "print(torch.version.hip); print(torch.cuda.get_device_properties(0).gcnArchName)"],
                              capture_output=True, text=True, timeout=300).stdout.split("\n")
         s["versions"] = dict(zip(("exllamav3", "torch", "hip", "gcn_arch"), ver))
+        if len(ver) < 4:
+            s["versions"]["probe_failed"] = True
     except Exception as exc:  # recorded, not fatal
         s["versions"] = {"error": repr(exc)}
     s["sha256"] = {p: sha256(p) for p in a.sha}
