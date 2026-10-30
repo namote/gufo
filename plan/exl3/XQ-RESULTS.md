@@ -2,7 +2,9 @@
 
 상위 문서: [XQ 브리프](XQ-BRIEF.md), [PLAN](PLAN.md), [W-COMMON](../rotated-quant/W-COMMON.md), [W8 결과](../rotated-quant/EXL3-RESULTS.md). 이 문서는 XQ가 쓴다.
 
-상태: **1단계(조사)와 2단계(시험 양자화 창 `xq-t01`)가 끝났다.** 결과는 아래 "8. 시험 양자화 결과"에 있다. 3단계(본 양자화)는 감독 허락을 기다린다.
+상태: **1단계(조사)와 2단계(시험 양자화 창 `xq-t01`)가 끝났다.** 결과는 아래 "8. 시험 양자화 결과"에 있다. 3단계(본 양자화)는 계획 `PLAN-XQ-FULL.json`까지 준비했다(9절).
+
+사용자 결정(2026-10-30): **본 양자화는 데스크톱을 쓰지 않는 시간에만 돌린다.** gfx 링 리셋이 데스크톱에 영향을 주기 때문이다. 시작 시각은 감독이 정해 준다.
 
 기준 소스: upstream `turboderp-org/exllamav3` v1.6.5 `cdc785db89e263e65e5849cb53e1ada156411414`. 얕은 클론 `/home/m2on/projects/gufo/build/w9-src/exllamav3/`을 읽었다. 아래 `convert_model.py:N`은 `exllamav3/conversion/convert_model.py`의 줄 번호다.
 
@@ -141,9 +143,9 @@ python3 -I -m exllamav3.conversion.convert_model \
   -i /src_model -o /xq/qwen-3.8-27b-exl3-5.00-c02 -w /xq/work/qwen-3.8-27b-exl3-5.00-c02 \
   -b 5.0 -hb 6 -mb 4 -vb 16 --out_scales always -cb mul1 \
   -cd /xq/cal/c02-250x2048.safetensors -cr 250 -cc 2048 -cpi 1200 -d 0
-# 재개: --out_scales always와 -cpi를 반드시 다시 준다(8절 "재개 함정")
+# 재개: --out_scales always와 -cpi를 반드시 다시 준다(8절 "재개 함정"). 9절 창 계획은 -cpi 0을 쓴다
 python3 -I -m exllamav3.conversion.convert_model -w /xq/work/qwen-3.8-27b-exl3-5.00-c02 -r \
-  --out_scales always -cpi 1200
+  --out_scales always -cpi 0
 ```
 
 - 출력 위치: 외장 `/run/media/m2on/T5 EVO/AI/model/xq-exl3-20261030/`
@@ -256,6 +258,51 @@ python3 -I -m exllamav3.conversion.convert_model -w /xq/work/qwen-3.8-27b-exl3-5
   - 출력: 약 19 GB
   - **합계 약 60 GB**다(외장 가용 525 GB). 루트에는 창 로그만 쓴다.
 - **시험 산출물:** `…/windows/xq-t01/receipt/work/`(22.9 GB: `ckpt` 9.8, `ckpt_old` 9.8, `qtensors` 3.3)이다. 지우지 않았다. 감독이 정한다.
+
+## 9. 본 양자화 계획 (3단계, 준비 완료, 시작 대기)
+
+- **창 계획:** `~/projects/ai.tools/test/experiments/gufo_upstream_port_20261023/PLAN-XQ-FULL.json`(초안, LOCKS.py 다시 실행함)
+  - 도구: gufo `be695dd0`의 `tools/exl3_quant/`
+    - `run_convert.py --copy-work`
+    - `check_pack.py`
+    - `provenance.py`
+  - 이미지와 설정은 시험 창과 같다: `-b 5.0 -hb 6 -mb 4 -vb 16 --out_scales always -cb mul1`, c02 250 × 2048
+- **작업 디렉터리:** 새로 만든다. 시험 창의 작업 디렉터리는 층 2가 `auto`로 오염됐으므로 이어 쓰지 않는다.
+- **재개 규칙:** 재개할 때마다 `-w /receipt/work -r --out_scales always -cpi 0`을 준다.
+  - `-cpi 0`은 모듈마다 체크포인트를 남긴다(모듈당 약 10 s, 64층이면 약 10분).
+  - 그러면 `--max_module`로 멈출 때 잃는 작업이 없다.
+- **창 사이 작업 디렉터리 전달:**
+  - window.py 창이 쓸 수 있는 곳은 각자의 `/receipt`뿐이다. 그래서 재개 창은 앞 창의 `args.json`, `ckpt/`, `qtensors/`를 읽기 전용 마운트에서 자기 `/receipt/work`로 복사한 뒤 시작한다.
+  - `run_convert.py --copy-work`가 크기를 검사하고, 복사한 바이트와 시간을 기록한다.
+  - 공유 파일(`window.py`)은 고치지 않았다.
+- **외장 출력 경로(xq-ext symlink, 감독 승인 2026-10-30):** `~/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/xq-ext`는 `/run/media/m2on/T5 EVO/AI/model/xq-exl3-20261030/windows`를 가리키는 symlink다.
+  - 창의 `--out`은 `…/xq-ext/<창 이름>`으로 준다. 그러면 receipt 전체가 외장에 생기고, 루트 디스크에는 창 로그 `<창>.<model>.window.log`만 남는다.
+  - `window.py`의 디스크 하한(150 GiB)은 여전히 루트 기준으로 검사된다.
+  - 창 이름은 계획의 마운트 경로에 고정돼 있다(`xq-f1`, `xq-f2`, `xq-f3`). 다른 이름으로 돌리면 계획을 고쳐야 한다.
+
+| 창 (`--model`, `--out …/xq-ext/<이름>`) | 범위 | 예상 시간 | 창 seconds | 쓰는 양(외장) |
+|---|---|---:|---:|---:|
+| `xq-f1` | 새 작업. 임베딩과 층 0–27(`--max_module 28`) | 약 2.0 h | 9,600 | 작업 디렉터리 약 29 GB |
+| `xq-f2` | xq-f1 작업 복사(약 19 GB, 1–3분) → 층 28–55(`--max_module 56`) | 약 2.1 h | 10,200 | 약 36 GB |
+| `xq-f3` | xq-f2 작업 복사(약 26 GB) → 층 56–63, norm, lm_head(K=6), MTP(K=4), compile → `check_pack.py` → `provenance.py`(원본 52 GB와 출력 19 GB 해시) | 약 1.5–2 h | 12,000 | 약 46 GB + 팩 19 GB |
+| 대안 `xq-fall` | 한 창에서 전부 실행하고 점검과 provenance까지 | 약 5.5–6 h | 27,000 | 약 58 GB |
+
+- 시간은 시험 창의 층당 평균 251 s를 바탕으로 했다. lm_head와 MTP 시간은 짐작이다.
+- 외장 최대 사용은 세 창의 작업 디렉터리가 함께 있을 때 약 140 GB다(시험 23 GB 포함). 외장 가용은 525 GB다.
+- **사후 점검** `check_pack.py`(xq-f3 안에서 실행, 결과 `receipt/run/check-pack.json`). 모두 통과해야 한다:
+  1. 헤더: turboderp 5.00의 모든 텐서(2,426개: 본체, lm_head, MTP, 비전 BF16, 임베딩)가 우리 팩에 같은 dtype과 모양으로 있고, 그 반대도 성립해야 한다.
+  2. out_scales: 선형 409개(본체 400, lm_head, MTP 8) 각각에서 출력 스케일이 있는지가 turboderp와 같아야 한다(turboderp는 모두 있음).
+     - 판정 기준: `svh` 크기의 max/min > 1.01이면 스케일이 있다. 스케일이 없으면 `svh`는 부호뿐이라 |svh| ≈ 1이다.
+     - 이 판정이 시험 작업의 층 2 `up_proj`/`gate_proj` 두 개만 정확히 잡아내는 것을 확인했다.
+  3. `config.json`의 `quantization_config`: exl3, bits 5.0, head 6, mtp 4, out_scales always, mul1, calibration 250 × 2048
+  4. sqnr: lm_head가 10 dB 이상이고(#458 증상 기준), sqnr가 10 dB 아래인 모듈이 하나도 없어야 한다.
+  - 같은 스크립트를 turboderp 대 turboderp로 돌려 보니 헤더 2,426개, out_scales 409/409, config가 모두 통과했다(sqnr는 요약이 없어 해당 없음).
+- **창 뒤(가벼움):**
+  - 팩을 `…/windows/xq-f3/receipt/out`에서 `/run/media/m2on/T5 EVO/AI/model/xq-exl3-20261030/qwen-3.8-27b-exl3-5.00-c02/`로 옮긴다. 같은 파일 시스템 안의 rename이라 복사가 아니다.
+  - 그다음 4단계(품질 대조) 창 계획을 쓴다.
+- **정리:**
+  - 시험 작업 디렉터리 `…/windows/xq-t01/receipt/work/`(22.9 GB)는 본 양자화가 끝난 뒤 지운다(감독 승인 2026-10-30).
+  - `xq-f1`/`xq-f2`의 작업 디렉터리는 xq-f3이 통과하면 필요 없다. 그래도 지우기 전에 감독에게 묻는다.
 
 ## 남은 문제와 위험
 
