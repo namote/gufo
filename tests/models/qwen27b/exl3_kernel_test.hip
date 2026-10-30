@@ -434,7 +434,9 @@ void TestMlp(std::size_t hidden, std::size_t inter, int bits,
   gufo::hip::Exl3FastWorkspace ws;
   ws.input_elements = 2 * 8 * std::max(hidden, inter);
   Check(hipMalloc(&ws.input, ws.input_elements * sizeof(std::uint16_t)));
-  ws.counter_count = std::max(hidden, inter) / 128;
+  // The unfused comparison launches gate and up as one group: counters for
+  // both outputs.
+  ws.counter_count = 2 * std::max(hidden, inter) / 128;
   Check(hipMalloc(&ws.counters, ws.counter_count * sizeof(std::uint32_t)));
   Check(hipMemset(ws.counters, 0, ws.counter_count * sizeof(std::uint32_t)));
   ws.down_input_elements = 8 * inter;
@@ -591,6 +593,8 @@ void TestNormFusion(std::mt19937& rng) {
 }  // namespace
 
 int main() {
+  // Flush every line, so a later abort keeps the earlier results.
+  std::cout << std::unitbuf;
   std::mt19937 rng(20261030);
   // Narrow and wide outputs cover the 16-, 8- and 4-wave launch shapes.
   const Problem problems[] = {{1024, 2048, 5}, {6144, 1024, 5}, {512, 16384, 6},
