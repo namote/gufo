@@ -248,3 +248,17 @@ M = 8 열에는 행 우선(row-major)과 lane 우선(lane-major) 입력의 최�
   - UD-Q4_K_XL과는 같은 바이너리로 ABBA 짝 비교한다. 요청·단계별 5 %·10 ms 기준이고, tg d0과 d32K를 판정한다.
   - pp는 X3 전까지 판정하지 않는다(EXL3 prefill은 X2a 기준 경로다).
   - 4.00 팩 tg도 함께 잰다. 참고값은 ExLlamaV3 15.56(d0)과 13.65(d32K)다.
+
+## 창 `xb5`, `xb5b` (2026-10-31, 단계별 커널 시험)
+
+- **`xb5`(FAILED_no_fallback, health_PASS, 재시도 없음):**
+  - 단계 2(`4e040f65`)는 통과했다. 단일 행렬 1.4e-7–3.4e-7, 묶음 세 가지 1.6e-7–2.6e-7(기준 1e-5)이다.
+  - 3a(`2beae8f2`)와 3b(`0c09450c`)는 시험 버그로 중단됐다. `TestMlp`가 비교용으로 gate/up을 묶음 launch로 돌리는데, 작업 공간 카운터를 출력 하나분만 잡았다. 그래서 `Exl3FastGroupSupported`가 거부했고 예외가 났다.
+  - 커널 결함은 아니다. 시험만 고쳤다(`656ac368`): 카운터 2배, `std::unitbuf`.
+- **`xb5b`(COMPLETE, health_PASS, 재시도 없음):**
+  - 3a: 바이너리는 `git archive 2beae8f2`에 시험 두 줄만 고쳐 새로 configure한 빌드다(`build/xb-bins/2beae8f2-testfix`).
+  - 3b: HEAD `656ac368`이다(커널은 `0c09450c`).
+  - 두 바이너리 모두 모든 검사를 통과했다.
+    - 융합 MLP는 융합하지 않은 launch와 **비트 단위로 같다**(K5와 K4, 행 1/3/8/17).
+    - 융합 decode RMSNorm(3b)도 normed 행, 미리 회전한 q + k + v, MLP 출력이 모두 **비트 단위로 같다**.
+    - 단계 2 항목들은 xb5와 같은 값이다.
