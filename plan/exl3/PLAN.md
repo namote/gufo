@@ -87,6 +87,8 @@
 - **이 점유 결과를 보고 Flash-Next EXL3의 bpw를 정한다**(F2의 선행 조건).
 - 통과 기준: greedy 출력이 바이트 단위로 같다. decode와 prefill이 main 대비 5 %·10 ms 안이다(n-gram 조회가 디스크로 가도 속도를 해치지 않아야 한다). 페이지 캐시 상태(cold/warm)를 기록한다.
 
+**F1 KVarN 결정 (사용자 2026-10-30, K0-FN 결과 뒤):** Flash-Next KV는 **k4v4**. K0-FN에서 모든 설정이 top-1 1.0000, greedy 동일, needle 통과였지만 k4v2는 KL 꼬리가 27B k4v2의 약 10배(32K 최대 1.0e-2, 200K needle 3.2e-2)였고, k4v4는 27B k4v2 수준(1.7e-3 / 1.8e-3)이다. 근거: [F1-RESULTS.md](F1-RESULTS.md)(`97315880`).
+
 ### F2 Flash-Next EXL3
 
 - **대상:** 전문가(MoE) trellis GEMV와 그룹 GEMM, dense 트렁크, MTP, n-gram 표다.
