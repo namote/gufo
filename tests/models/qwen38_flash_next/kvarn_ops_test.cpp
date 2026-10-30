@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -81,16 +82,19 @@ std::uint32_t NextRandom(std::uint32_t* state) {
   return *state;
 }
 
-/// Rows [token][kv head][256] with a per-channel spread, so balancing has
-/// work to do: channel c scaled by 1 + (c % 37) / 8.
-std::vector<float> MakeRows(std::size_t tokens, std::uint32_t seed) {
+/// Rows [token][kv head][256], uniform in [-1, 1). With `stretch`, channel c
+/// is scaled by 1 + (c % 37) / 8, so balancing has more work to do; without
+/// it the rows look like the Qwen3.8-27B KVarN test's.
+std::vector<float> MakeRows(std::size_t tokens, std::uint32_t seed,
+                            bool stretch = true) {
   std::vector<float> rows(tokens * kRow);
   for (std::size_t i = 0; i < rows.size(); ++i) {
     const float unit =
         static_cast<float>(static_cast<int>(NextRandom(&seed) & 0xFFFFU) -
                            32768) /
         32768.0F;
-    rows[i] = unit * (1.0F + static_cast<float>(i % kDim % 37) / 8.0F);
+    rows[i] = stretch ? unit * (1.0F + static_cast<float>(i % kDim % 37) / 8.0F)
+                      : unit;
   }
   return rows;
 }
@@ -141,6 +145,71 @@ kvarn::QuantizedTile Unpack(const std::uint8_t* record, bool key) {
     out.column = halves(kRecord.v_column, kDim);
   }
   return out;
+}
+
+/// The reference balancing (kvarn_fake_quant.hpp Balance), recording every
+/// candidate: the initial state, then each iteration's imbalance and FP16
+/// column and row scales. Balance keeps the last candidate whose imbalance
+/// is <= the best so far.
+struct BalanceStep {
+  float imbalance{0};
+  std::vector<std::uint16_t> column, row;
+};
+std::vector<BalanceStep> TraceBalance(const std::vector<float>& source,
+                                      std::size_t rows, std::size_t cols) {
+  namespace d = kvarn::detail;
+  constexpr float kStdMin = 1e-3F, kStdMax = 1e3F, kLogMin = -0.3F,
+                  kLogMax = 10.0F;
+  std::vector<float> log_column(cols, 0.0F), log_row(rows, 0.0F);
+  std::vector<float> current = source, column(cols), row(rows);
+  std::vector<BalanceStep> steps;
+  const auto record = [&] {
+    BalanceStep step;
+    step.imbalance = d::Imbalance(current, rows, cols);
+    for (std::size_t c = 0; c < cols; ++c)
+      step.column.push_back(kvarn::FloatToHalf(d::Exp(log_column[c])));
+    for (std::size_t r = 0; r < rows; ++r)
+      step.row.push_back(kvarn::FloatToHalf(d::Exp(log_row[r])));
+    steps.push_back(std::move(step));
+  };
+  const auto apply = [&] {
+    for (std::size_t c = 0; c < cols; ++c)
+      column[c] = d::Exp(log_column[c]);
+    for (std::size_t r = 0; r < rows; ++r)
+      row[r] = d::Exp(log_row[r]);
+    for (std::size_t r = 0; r < rows; ++r)
+      for (std::size_t c = 0; c < cols; ++c)
+        current[r * cols + c] = source[r * cols + c] / column[c] / row[r];
+  };
+  record();
+  for (int iteration = 0; iteration < 8; ++iteration) {
+    for (std::size_t c = 0; c < cols; ++c) {
+      const float s =
+          std::clamp(d::Std(current.data() + c, rows, cols), kStdMin, kStdMax);
+      log_column[c] = std::clamp(log_column[c] + d::Log(s), kLogMin, kLogMax);
+    }
+    apply();
+    for (std::size_t r = 0; r < rows; ++r) {
+      const float s = std::clamp(d::Std(current.data() + r * cols, cols, 1),
+                                 kStdMin, kStdMax);
+      log_row[r] = std::clamp(log_row[r] + d::Log(s), kLogMin, kLogMax);
+    }
+    apply();
+    record();
+  }
+  return steps;
+}
+
+/// The candidate Balance keeps.
+std::size_t ChosenStep(const std::vector<BalanceStep>& steps) {
+  std::size_t chosen = 0;
+  float best = steps[0].imbalance;
+  for (std::size_t i = 1; i < steps.size(); ++i)
+    if (steps[i].imbalance <= best) {
+      best = steps[i].imbalance;
+      chosen = i;
+    }
+  return chosen;
 }
 
 int failures = 0;
@@ -199,7 +268,7 @@ void CheckWriterRows() {
 /// Sink plus groups 1..4 written in two phases (the ring holds two groups),
 /// rotated, quantized into scrambled-table records, compared with the
 /// reference tile by tile.
-void CheckRotateAndQuantize() {
+void CheckRotateAndQuantize(bool stretch) {
   constexpr std::uint32_t kTokens = 5 * kGroup;  // sink + groups 1..4
   constexpr std::uint32_t kBlocks = (kTokens + 255) / 256;  // 3
   constexpr std::uint32_t kPool = 2 * kBlocks + 4;          // 10
@@ -215,8 +284,8 @@ void CheckRotateAndQuantize() {
       v_rows(kLayers * kLayerElements);
   std::vector<std::vector<float>> k_src(kLayers), v_src(kLayers);
   for (std::uint32_t l = 0; l < kLayers; ++l) {
-    k_src[l] = MakeRows(kTokens, 100 + l);
-    v_src[l] = MakeRows(kTokens, 200 + l);
+    k_src[l] = MakeRows(kTokens, 100 + l, stretch);
+    v_src[l] = MakeRows(kTokens, 200 + l, stretch);
   }
   std::size_t sink_differ = 0, ring_differ = 0;
   // Phase 1 writes the sink and groups 1-2, phase 2 groups 3-4 over them.
@@ -285,6 +354,7 @@ void CheckRotateAndQuantize() {
                        : std::size_t{t} * kDim + d] =
                   kvarn::HalfToFloat(rotated[d]);
           }
+          const std::vector<float> source_tile = tile;
           const auto ref = kvarn::QuantizeTileCodes(
               tile, key ? kDim : kGroup, key ? kGroup : kDim, 4, true, 8);
           const std::size_t plane_row =
@@ -308,12 +378,42 @@ void CheckRotateAndQuantize() {
           count(ref.column, got.column);
           ++tiles;
           exact += codes == 0 && scales == 0;
+          if (codes != 0 || scales != 0) {
+            // Which reference balancing candidate the stored columns match.
+            const auto steps = TraceBalance(source_tile, key ? kDim : kGroup,
+                                            key ? kGroup : kDim);
+            const std::size_t chosen = ChosenStep(steps);
+            std::string matches;
+            for (std::size_t i = 0; i < steps.size(); ++i)
+              if (steps[i].column == got.column)
+                matches += (matches.empty() ? "" : ",") + std::to_string(i);
+            std::size_t first = 0;
+            while (first < ref.scale.size() &&
+                   ref.scale[first] == got.scale[first])
+              ++first;
+            std::cout << "  tile layer=" << l << " group=" << g << " head=" << h
+                      << (key ? " K" : " V") << " codes_differ=" << codes
+                      << " scales_differ=" << scales
+                      << " reference_step=" << chosen
+                      << " gpu_column_matches_step="
+                      << (matches.empty() ? "none" : matches)
+                      << " first_scale=" << first;
+            if (first < ref.scale.size())
+              std::cout << " ref=" << kvarn::HalfToFloat(ref.scale[first])
+                        << " gpu=" << kvarn::HalfToFloat(got.scale[first]);
+            std::cout << " imbalance:" << std::setprecision(9);
+            for (const auto& step : steps)
+              std::cout << ' ' << step.imbalance;
+            std::cout << std::setprecision(6) << '\n';
+          }
           code_diff += codes;
           scale_diff += scales;
         }
   Check(exact == tiles,
-        "k4v4 token-major records tiles=" + std::to_string(tiles) + " exact=" +
-            std::to_string(exact) + " code_diff=" + std::to_string(code_diff) +
+        std::string(stretch ? "stretched" : "27B-like") +
+            " k4v4 token-major records tiles=" + std::to_string(tiles) +
+            " exact=" + std::to_string(exact) +
+            " code_diff=" + std::to_string(code_diff) +
             " scale_diff=" + std::to_string(scale_diff));
 }
 
@@ -322,7 +422,8 @@ void CheckRotateAndQuantize() {
 int main() {
   try {
     CheckWriterRows();
-    CheckRotateAndQuantize();
+    CheckRotateAndQuantize(false);
+    CheckRotateAndQuantize(true);
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';
     return 1;
