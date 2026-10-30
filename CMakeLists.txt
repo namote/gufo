@@ -628,6 +628,11 @@ if (BUILD_TESTING)
   add_test(NAME kv_block_layout_test COMMAND kv_block_layout_test)
   set_tests_properties(kv_block_layout_test PROPERTIES LABELS "cpu;core;cache")
 
+  add_executable(kvarn_layout_test tests/core/kvarn_layout_test.cpp)
+  target_include_directories(kvarn_layout_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME kvarn_layout_test COMMAND kvarn_layout_test)
+  set_tests_properties(kvarn_layout_test PROPERTIES LABELS "cpu;core;cache")
+
   add_executable(heap_placement_test tests/core/heap_placement_test.cpp)
   target_link_libraries(heap_placement_test PRIVATE gufo_core)
   add_test(NAME heap_placement_test COMMAND heap_placement_test)
