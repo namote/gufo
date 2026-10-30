@@ -441,3 +441,8 @@ paired 비교(같은 64개 프롬프트, 95 % 구간):
 - **GGUF 경로 동일성:** `PLAN-EXL3-X2AQ.json`의 4.00 창에서 확인한다.
   - BF16 prefill 창 0을 `rq0-a01`과 `logits_io.py same`으로 대조한다.
   - UD-Q4_K_M fingerprints를 rq2h와 대조한다.
+- **수집기 head 작업 공간 수정(2026-10-31, `f007ede2`):** X2AQ 창 a01(4.00)의 prefill에서 "head replay differs from the prefill last-row logits"가 났다.
+  - 원인: production prefill head(1행, arena 작업 공간)는 X2b 빠른 경로를 탔고, 수집기 `Head` 작업 공간에는 fast slab이 없어 재생이 기준 경로로 갔다. 엔진 결함은 아니다.
+  - 수정: `rq_logits`/`rq_kld_base`의 `Head` 작업 공간에 arena(`AllocateExl3`)와 같은 slab을 넣었다. FP16 입력 8×최대폭, 128열마다 0으로 시작하는 카운터 하나, down 입력 8×intermediate.
+  - 새 바이너리(`build/xa-q-gpu-test`, HEAD `f007ede2`): `qwen27b_rq_logits` `26f9b96a9c49878ed6ea22a177d3fc8ad8b9dbbfe22edae8a5f80da73b56f539`, `qwen27b_rq_kld_base` `7745d67509d802794d344ae46feeb2d785daf1fda095f55d916c1acecf87e318`. `qwen27b_target_test`는 `f112de3a…`로 바뀌지 않았다.
+  - GGUF head는 작업 공간을 null로 받으므로 GGUF 경로는 그대로다(X2AQ 4.00 창에서 다시 확인).

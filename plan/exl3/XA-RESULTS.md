@@ -285,3 +285,12 @@ struct DeviceLinear {                 // one EXL3 projection y = x W, W [k][n]
   - BF16 임베딩 사이드카의 prefill(두 기준).
   - EXL3 fingerprints, GGUF 동일성 확인.
   - 창 뒤에 `metrics.py score`/`compare`로 임베딩 짝 비교를 하고, `model_resident_bytes`를 적는다.
+
+### X2AQ 창 a01 (2026-10-31, 중단)
+
+- 4.00 창 결과:
+  - 통과: UD fingerprints, GGUF 동일성(BF16 prefill 창 0, 4095/4095), EXL3 4.00 fingerprints, decode-vs-exl3(4096 레코드).
+  - prefill-vs-exl3: 수집기 head replay 검사에서 실패했다(R0-RESULTS 같은 날 절). 남은 prefill이 모두 같은 이유로 실패하므로 감독 승인으로 창을 멈췄다. receipt와 decode 기록은 남겼다.
+  - 5.00 창은 시작 전에 막았다.
+- **내 실수:** sidecar 전체 경로 검사가 계획에 들어가지 않았다. 편집 스크립트의 변수 재사용 때문이다. 이번에 다시 넣고 읽어서 확인했다.
+- 수집기는 `f007ede2`로 고쳤다(`26f9b96a…`). 다시 돌리는 창은 a02다.
