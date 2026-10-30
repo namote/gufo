@@ -515,3 +515,65 @@
    - `validate --policy I1`: A+K는 M1 trace, H는 HTRACE와 프롬프트별로 정확히 맞아야 한다.
    - 완성 동일성: A/K/D는 M0 AR, H는 trace와 비교한다.
 3. **`PLAN-W9-ABBA2-{MAIN,I1}.json`**(sha256 `95327218…`, `732e0619…`): MAIN a1 → I1 b1 → I1 b2 → MAIN a2. MAIN은 새로 잰다. A/K/D/H를 따로 판정한다. 창마다 약 20분.
+
+## I1 수정판 검증과 ABBA2 판정 (2026-10-30)
+
+### 창 [확인]
+
+- `run_final.sh`로 HTRACE → I1V2 → ABBA2 MAIN a1 → I1 b1 → I1 b2 → MAIN a2를 15:06–16:53에 돌렸다. 모두 COMPLETE, 재시도 없음이다.
+- 창마다 사전 검사를 했다: `docker ps` 비어 있음, 1분 load < 4(시작 때 1.0–1.4), 디스크, LOCKS.
+- 결과 위치: `~/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/w9-final/<tag>/`
+- 분석 위치: `~/projects/ai.tools/storage/evaluations/w9-final-20261030/`
+  - `trace-h.jsonl`(sha256 `c5d76661…`), `trace_akh.jsonl`, `compare_h.json`, `h_regress.py`
+  - `validate_i1v2.json`, `validate_p0_h.json`, `abba2-{0..3}.json`
+
+### held-out 시뮬레이터 확인 (ABBA 전, H 32개)
+
+| 정책 | 전체 대 P0 | 종류별 범위 | 5 %·10 ms보다 느린 프롬프트 |
+|---|---|---|---|
+| I1 (수정판) | **1.092** | story 1.025 – structured 1.139 | 0개(최대 `h_story_ko_2` 1.041) |
+| I1a (처음 판) | 1.095 | | 0개 |
+| P3 사후 최적 | 1.361 | | — |
+
+- 튜닝 세트(A+K)의 1.093과 거의 같다. 과적합 징후는 없다.
+
+### 2단계: 재생 일치 [확인]
+
+- `validate --policy I1`(A+K는 M1 trace, H는 HTRACE) 대 I1V2 서버: **113/113 정확히 일치**. 프롬프트 토큰 수도 113/113이다.
+- `validate --policy P0`(HTRACE) 대 ABBA2 MAIN의 H 기록: **32/32**. held-out에서도 trace가 서버 경로를 정확히 재현한다.
+
+### 3단계: greedy 동일성 [확인]
+
+- I1V2 대 M0 AR: A/K/D **89/89**(모든 반복). H 대 trace: **32/32**.
+- ABBA2 안에서 MAIN과 I1 완성이 A 64/64, K 17/17, D 8/8, H 32/32 같다.
+- 각 arm 안에서 반복과 창 사이의 sha와 draft 수도 모두 같다.
+
+### ABBA2 판정 (`abba.py`, 프롬프트·단계별 t = max(10 ms, 5 %), 요청끼리 평균하지 않음)
+
+| 세트 | decode tok/s MAIN → I1 (참고, 반복 합) | pass / faster / **slower** / inconclusive (프롬프트 × 단계) |
+|---|---|---|
+| A 64 | 49.17 → 53.81 (**1.094**) | 83 / 43 / **0** / 2 |
+| K 17 | 47.77 → 52.03 (**1.089**) | 23 / 11 / **0** / 0 |
+| D 8 | 41.96 → 46.33 (**1.104**) | 10 / 6 / **0** / 0 |
+| H 32 (held-out) | 46.98 → 51.37 (**1.093**) | 39 / 25 / **0** / 0 |
+
+- prefill은 모든 세트에서 pass다.
+- 첫 ABBA의 slower 두 개(`d4_ko_instr_04`, `en_code_rust_err`)는 이번에 둘 다 pass나 faster다.
+
+#### inconclusive 2개 (그대로 둔다)
+
+| 프롬프트 | 단계 | MAIN (ms) | I1 (ms) | 원인 |
+|---|---|---|---|---|
+| `d4_ko_code_03` | decode | 3063.6–3070.2 | 3539.4, 3013.2, 3554.9, 3012.9 | 두 I1 창 모두 **첫 반복**에만 한 번 멈춘다(server max inter-token 578/575 ms, 둘째 반복은 99 ms). 둘째 반복은 MAIN보다 빠르다(3013 대 3068). draft 수는 같다 |
+| `repetition_sequence` | decode | 1729.6–2327.6 | 1575.2–2207.1 | 두 arm 모두 첫 반복에 같은 멈춤이 있다(MAIN 623/699 ms, I1 708/671 ms). 정상 상태는 I1이 빠르다(1577 대 1730) |
+
+- [짐작] 프로세스 안에서 처음 나오는 모양의 일회성 비용(예: warmup에서 다루지 않은 draft/verify 모양의 graph capture)이다. I1은 후보 출력을 함께 요청하므로 graph key가 하나 더 생긴다. 확인하지 않았다.
+- 같은 서버에서 그 요청을 다시 보내면 사라진다. 정상 상태 회귀는 아니다.
+- **후속 후보:** 해당 graph key를 준비 단계(readiness)에서 미리 잡는다. 확인하려면 프로파일 1회가 필요하다.
+
+### 결론
+
+- 수정판 I1의 상태: 모든 세트에서 slower 0, 출력 동일, 재생 일치, 기능 suite 통과(I1F와 I1F2는 같은 정책 계열이다. 수정판은 첫 사이클만 운영 경로로 돌린다).
+- C1 greedy decode는 **+8.9 %에서 +10.4 %**다(held-out 포함).
+- inconclusive는 첫 반복의 일회성 멈춤 2건이다. 판정 정책에 따라 결론 없음으로 남긴다.
+- 채택 여부와 PR 순서는 감독이 정한다. 후속 후보: 백오프 없는 변형(+1.6 %, 별도 커밋), sampled/C>1 확장, 첫 반복 멈춤의 원인 확인.
