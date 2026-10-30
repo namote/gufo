@@ -248,3 +248,15 @@ struct DeviceLinear {                 // one EXL3 projection y = x W, W [k][n]
 - **MTP를 쓸 수 없다.** 사이드카 이미지에 blk.64(nextn) 텐서가 없다. EXL3 팩의 `mtp.*`를 이미지에 넣거나 EXL3 투영으로 연결해야 한다.
 - **DFlash 비용 선택이 EXL3 헤드를 비-Q8로 본다.** `QwenDFlashGpuDraftBackend`는 `output.type == kQ8_0`으로 Q8/Q4 검증 비용을 고른다. EXL3 참조는 type이 기본값 `kF32`라서 Q4 쪽으로 분류된다. EXL3용 비용 기준을 정해야 한다.
 - **`rq_logits`/`rq_kld_base`가 헤드 scratch를 넘기지 않는다.** 이 상태로 EXL3 모델을 넣으면 `logic_error`로 멈춘다. W2가 고친다(supervisor 배정).
+
+### X2A 창 1 (2026-10-30, `x2a-unit/x2a`, a72c89b0 바이너리, FAILED)
+
+| 시험 | 결과 | 비고 |
+|---|---|---|
+| `exl3_reference_test` | FAIL | dequant는 모든 K/codebook/half-K에서 bit-exact다. projection 최대 상대오차는 4.3e-7이다. rotation 검사가 5.4e-5로 떨어졌는데, 원소마다 \|기대값\|+1e-3으로 나누는 척도 탓이다. 행 최대값 기준으로 고쳤다. |
+| sidecar checks / vs X1 | FAIL | `CreateWeightRegions`가 메모리 이미지(힙)를 `CloneMappedWeightsToAnonymousPages`로 보냈고, 정렬되지 않은 `MADV_POPULATE_READ`가 EINVAL을 냈다. 성공했다면 `MADV_DONTNEED`가 힙을 지웠을 것이다. 파일 없는 영역은 장치 할당 후 `CopyMappedRegion`으로 올리게 고쳤다. |
+| UD-Q4_K_M fingerprints | PASS | rq2h와 byte-equal이다. 비-EXL3 경로는 바뀌지 않았다. |
+
+- 창 2(`PLAN-EXL3-X2A2.json`)는 F1 ABBA 뒤에 돈다.
+- 빌드는 W3 08bba6ed(빠른 decode/verify 커널)를 포함해 다시 한다. 23:05 빌드에는 08bba6ed가 없다(빌드 23:05:57, 커밋 23:08:42, exl3_gemv 오브젝트 없음).
+- 시험 순서: kernel_test → reference_test → sidecar 둘 → fingerprints.
