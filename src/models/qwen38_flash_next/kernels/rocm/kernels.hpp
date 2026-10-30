@@ -24,6 +24,37 @@ namespace gufo::models::qwen38_flash_next::rocm {
 /// rows indexed by position.
 inline constexpr std::uint32_t kKvPooledRatio = 4;
 
+/// A `kv_blocks` value for the K/V writers (PrepareAttention,
+/// AttentionF16Gemm, StoreKv) of a KVarN session: position p goes to row
+/// hip::KvarnFp16Row(p) of the session's FP16 sink and tail ring
+/// ([kKvarnFp16Tokens][kv row] per layer) instead of a block-table row.
+/// Readers never take it.
+inline constexpr std::uintptr_t kKvarnFp16RowTag = 1;
+inline const std::uint32_t* KvarnFp16Rows() noexcept {
+  return reinterpret_cast<const std::uint32_t*>(kKvarnFp16RowTag);
+}
+
+/// Rotates the K and V rows of positions [*start_pos, *start_pos + n_tokens)
+/// in a KVarN FP16 sink/tail ring (hip::KvarnFp16Row, rows of kv_heads x 256
+/// halves) in place by the normalized 256-point Hadamard, as the KVarN
+/// store writes them (src/core/hip/detail/kvarn_device.hpp Fwht256).
+void RotateKvRows(__half* k_rows, __half* v_rows, std::uint32_t n_tokens,
+                  std::uint32_t kv_heads, const std::uint32_t* start_pos,
+                  hipStream_t stream);
+
+/// Quantizes groups [first_group, first_group + groups) of `layers` layers
+/// from the rotated FP16 tail ring (`fp16_layer_elements` halves per layer
+/// and K or V) into KVarN k4v4 records with token-major values
+/// (hip::KvarnRecord(4, kTokenMajor)), plane row kv_blocks[g / 2] * 2 + g % 2
+/// of `records` (`records_layer_pitch` bytes per layer; group g itself when
+/// kv_blocks is null). first_group >= 1; the ring must hold every row.
+void KvarnQuantizeGroups(const __half* k_rows, const __half* v_rows,
+                         std::size_t fp16_layer_elements, std::uint8_t* records,
+                         std::size_t records_layer_pitch,
+                         const std::uint32_t* kv_blocks, std::uint32_t kv_heads,
+                         std::uint32_t layers, std::uint32_t first_group,
+                         std::uint32_t groups, hipStream_t stream);
+
 /// Stable per-prefix rollback addresses. Growing the depth does not move
 /// existing buffers or invalidate graphs captured for a smaller batch.
 struct RollbackRows {

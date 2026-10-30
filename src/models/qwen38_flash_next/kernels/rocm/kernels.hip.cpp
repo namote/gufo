@@ -9,7 +9,9 @@
 #include <stdexcept>
 #include <type_traits>
 
+#include "src/core/hip/detail/kvarn_device.hpp"
 #include "src/core/hip/kv_block_table.hpp"
+#include "src/core/hip/kvarn_layout.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 
 // HIP kernels follow the layouts and operator formulas in reference.cpp.
@@ -24,6 +26,15 @@ constexpr unsigned kThreads = 256;
 __device__ __forceinline__ std::size_t KvRow(const std::uint32_t* kv_blocks,
                                              std::uint32_t pos) {
   return hip::KvRowInLayer(hip::KvBlockTable{kv_blocks, 0}, pos);
+}
+
+/// Row a K/V writer stores position `pos` at: KvRow, or the KVarN FP16 sink
+/// and tail ring row for kKvarnFp16RowTag (kernels.hpp).
+__device__ __forceinline__ std::size_t KvWriteRow(
+    const std::uint32_t* kv_blocks, std::uint32_t pos) {
+  if (reinterpret_cast<std::uintptr_t>(kv_blocks) == kKvarnFp16RowTag)
+    return hip::KvarnFp16Row(pos);
+  return KvRow(kv_blocks, pos);
 }
 
 /// Row of pooled indexer block `b` (one row per kKvPooledRatio tokens) in one
@@ -2357,7 +2368,7 @@ __global__ void PrepareAttentionKernel(
   const std::size_t width = std::size_t(heads) * d,
                     kv_width = std::size_t(kv_heads) * d;
   const float* row = packed + std::size_t(t) * stride;
-  const std::size_t kv_row = KvRow(kv_blocks, *start_pos + t);
+  const std::size_t kv_row = KvWriteRow(kv_blocks, *start_pos + t);
   float values[kHeadsPerBlock];
 #pragma unroll
   for (std::uint32_t j = 0; j < kHeadsPerBlock; ++j) {
@@ -2480,11 +2491,69 @@ __global__ void StoreKvKernel(const float* src, __half* cache,
                               const std::uint32_t* start_pos,
                               const std::uint32_t* kv_blocks) {
   const std::uint32_t t = blockIdx.x;
-  const std::size_t row = KvRow(kv_blocks, *start_pos + t);
+  const std::size_t row = KvWriteRow(kv_blocks, *start_pos + t);
   for (std::uint32_t i = threadIdx.x; i < row_dim; i += blockDim.x) {
     cache[row * row_dim + i] =
         __float2half(src[static_cast<std::size_t>(t) * row_dim + i]);
   }
+}
+
+/// KVarN store rotation, in place: one block of 64 x kv_heads threads per
+/// position, wave 2h + 0 rotating head h's K row and 2h + 1 its V row, lane l
+/// elements 8l..8l+7. The rows already hold the FP16 values (the writers'
+/// rounding), so this is the KVarN write kernel's FP16 round, rotation and
+/// FP16 store, bit for bit.
+__launch_bounds__(256) __global__
+    void RotateKvRowsKernel(__half* __restrict__ k_rows,
+                            __half* __restrict__ v_rows, std::uint32_t kv_heads,
+                            const std::uint32_t* __restrict__ start_pos) {
+  const std::uint32_t wave = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const std::uint32_t head = wave / 2;
+  const bool key = (wave & 1) == 0;
+  const std::size_t row = hip::KvarnFp16Row(*start_pos + blockIdx.x);
+  __half* p = (key ? k_rows : v_rows) +
+              (row * kv_heads + head) * hip::kKvarnHeadDim + 8 * lane;
+  const uint4 raw = *reinterpret_cast<const uint4*>(p);
+  const auto* in = reinterpret_cast<const __half*>(&raw);
+  float y[8];
+#pragma unroll
+  for (std::uint32_t j = 0; j < 8; ++j)
+    y[j] = __half2float(in[j]);
+  hip::kvarn_detail::Fwht256(y, lane);
+  _Float16 h[8];
+#pragma unroll
+  for (std::uint32_t j = 0; j < 8; ++j)
+    h[j] = static_cast<_Float16>(y[j] * 0.0625F);
+  *reinterpret_cast<uint4*>(p) = *reinterpret_cast<const uint4*>(h);
+}
+
+/// One k4v4 token-major record tile per block: (KV head, group, layer, K or
+/// V), from the rotated FP16 tail ring (hip::kvarn_detail::KvarnQuantizeTile).
+__launch_bounds__(512) __global__ void KvarnQuantizeGroupsKernel(
+    const __half* __restrict__ k_rows, const __half* __restrict__ v_rows,
+    std::size_t fp16_layer_elements, std::uint8_t* __restrict__ records,
+    std::size_t records_layer_pitch, const std::uint32_t* kv_blocks,
+    std::uint32_t kv_heads, std::uint32_t first_group) {
+  constexpr auto kOrder = hip::KvarnValueOrder::kTokenMajor;
+  constexpr std::size_t kRecord = hip::KvarnRecord(4, kOrder).bytes;
+  const std::uint32_t kv = blockIdx.x;
+  const std::uint32_t group = first_group + blockIdx.y;
+  const std::uint32_t layer = blockIdx.z >> 1;
+  const bool key = (blockIdx.z & 1) == 0;
+  const std::size_t row_width = std::size_t{kv_heads} * hip::kKvarnHeadDim;
+  const __half* src =
+      (key ? k_rows : v_rows) + layer * fp16_layer_elements +
+      hip::KvarnFp16Row(group * hip::kKvarnGroupTokens) * row_width +
+      kv * hip::kKvarnHeadDim;
+  const std::size_t plane_row =
+      kv_blocks == nullptr
+          ? group
+          : std::size_t{kv_blocks[group / hip::kKvarnGroupsPerBlock]} *
+                    hip::kKvarnGroupsPerBlock +
+                group % hip::kKvarnGroupsPerBlock;
+  std::uint8_t* record = records + layer * records_layer_pitch +
+                         (plane_row * kv_heads + kv) * kRecord;
+  hip::kvarn_detail::KvarnQuantizeTile<4, kOrder>(src, row_width, record, key);
 }
 
 __global__ void StoreRowsKernel(const float* src, float* dst,
@@ -6909,13 +6978,13 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
             else if (gate)
               attention.gate[tok * width + head * dim + col] = v[c];
             else if (key)
-              attention
-                  .keys[KvRow(attention.kv_blocks, *attention.position + tok) *
-                            kvwidth +
-                        head * dim + col] = __float2half_rn(v[c]);
+              attention.keys[KvWriteRow(attention.kv_blocks,
+                                        *attention.position + tok) *
+                                 kvwidth +
+                             head * dim + col] = __float2half_rn(v[c]);
             else
-              attention.values[KvRow(attention.kv_blocks,
-                                     *attention.position + tok) *
+              attention.values[KvWriteRow(attention.kv_blocks,
+                                          *attention.position + tok) *
                                    kvwidth +
                                head * dim + col] = __float2half_rn(v[c]);
           }
@@ -7672,6 +7741,31 @@ void StoreKv(const float* src, __half* cache, std::uint32_t n_tokens,
              hipStream_t stream, const std::uint32_t* kv_blocks) {
   hipLaunchKernelGGL(StoreKvKernel, dim3(n_tokens), dim3(kThreads), 0, stream,
                      src, cache, row_dim, start_pos, kv_blocks);
+}
+
+void RotateKvRows(__half* k_rows, __half* v_rows, std::uint32_t n_tokens,
+                  std::uint32_t kv_heads, const std::uint32_t* start_pos,
+                  hipStream_t stream) {
+  if (n_tokens == 0 || kv_heads == 0 || kv_heads > 4)
+    return;
+  hipLaunchKernelGGL(RotateKvRowsKernel, dim3(n_tokens), dim3(64 * kv_heads), 0,
+                     stream, k_rows, v_rows, kv_heads, start_pos);
+}
+
+void KvarnQuantizeGroups(const __half* k_rows, const __half* v_rows,
+                         std::size_t fp16_layer_elements, std::uint8_t* records,
+                         std::size_t records_layer_pitch,
+                         const std::uint32_t* kv_blocks, std::uint32_t kv_heads,
+                         std::uint32_t layers, std::uint32_t first_group,
+                         std::uint32_t groups, hipStream_t stream) {
+  if (groups == 0 || layers == 0)
+    return;
+  if (first_group == 0)
+    throw std::invalid_argument("KVarN group 0 is the FP16 sink");
+  hipLaunchKernelGGL(KvarnQuantizeGroupsKernel,
+                     dim3(kv_heads, groups, 2 * layers), dim3(512), 0, stream,
+                     k_rows, v_rows, fp16_layer_elements, records,
+                     records_layer_pitch, kv_blocks, kv_heads, first_group);
 }
 
 void StoreRows(const float* src, float* dst, std::uint32_t n_tokens,
