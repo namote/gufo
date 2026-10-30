@@ -5,7 +5,7 @@
 ## 상태
 
 - **X0 완료.** CPU 부분 `f26f800d`, upstream 비트 대조 창 `xa-ref-a01` 통과(2026-10-30).
-- X1 매핑 완료(`04ca9c54`), BF16 GGUF 변환 완료(4.00, 5.00). 정확성 창 `PLAN-EXL3-X1.json` 초안(GPU 순서상 W9 뒤).
+- **X1 완료(통과).** 매핑 `04ca9c54`, BF16 GGUF 4.00/5.00, 정확성 창 `xa-x1-a01` 통과(2026-10-30).
 
 ## X0: 형식 명세와 CPU 참조
 
@@ -71,7 +71,34 @@
 
   - 8스레드, 이미지 64849ca6ec7b, 도구 `04ca9c54`.
   - 확인: 쓴 4.00 파일을 gufo `GgufReader`로 다시 열어 `compare`로 대조했다(blk.3 11개 텐서 EXACT).
-- **정확성 창 `PLAN-EXL3-X1.json`(초안):** 고정 수집기 `b5219f1b`(이미지 64849ca6ec7b)로 팩마다 창 하나.
-  - vs-exl3: `--reference` = 같은 팩의 ExLlamaV3 run(`w8q-a01`). KL(ExLlamaV3 ‖ gufo-EXL3)이 엔진 차이이고, 목표는 중앙값 1e-4 이하, 평균 1e-3 이하다. prefill과 decode 둘 다 잰다.
-  - vs-bf16: prefill만 `rq0-bf16` 기준으로 잰다. W8 값과 구간 안에서 같은지 본다.
-  - GGUF fingerprint(RQ2H 방식): `build/xa-gpu-test`(HEAD `c913b069`에서 빌드, `src`는 `04ca9c54`와 같음, 바이너리 sha256 `53cdd1f8949113d9…`)의 `qwen27b_target_test --fingerprints-only`를 UD-Q4_K_M으로 돌리고, 창 뒤에 `rq2h/rq2h-units`와 바이트 대조한다. `5c3422ff` 이후 `src/` 변경은 Flash-Next와 EXL3 신규 파일뿐이다.
+- **정확성 창(`PLAN-EXL3-X1.json`, `xa-x1-a01/xa-x1-4.00` 17:00–17:51, `xa-x1-5.00` 17:51–18:44, 둘 다 COMPLETE, health_PASS, 한 번씩):**
+  - 수집기는 고정 `b5219f1b`(이미지 64849ca6ec7b)다. R0, FAKEQ와 같다.
+  - 지표는 `metrics.py score`/`compare`(bootstrap 2000, seed 20261029, 블록 256)로 냈다. 보고는 `storage/evaluations/rq-r0-20261029/metrics-w8/x1-*.json`, `compare-x1-*.json`에 있다.
+
+**엔진 차이: KL(ExLlamaV3 같은 팩 ‖ gufo-EXL3). 기준은 중앙값 ≤ 1e-4, 평균 ≤ 1e-3.**
+
+| 팩 | 경로 | n | KL 평균 [토큰 95 %] | 중앙값 | 최대 1개 제외 | top-1 | 뒤집힘, KL > 1 | 판정 |
+|---|---|---:|---|---:|---:|---:|---|---|
+| 4.00 | prefill | 32,760 | 2.38e-4 [1.40e-4, 3.79e-4] | 2.98e-5 | 1.82e-4 | 0.9937 | 208, 0 | 통과 |
+| 4.00 | decode | 4,096 | 1.18e-4 [0.86e-4, 1.62e-4] | 3.16e-5 | 1.05e-4 | 0.9949 | 21, 0 | 통과 |
+| 5.00 | prefill | 32,760 | 4.28e-4 [1.70e-4, 8.27e-4] | 2.94e-5 | 2.61e-4 | 0.9929 | 233, 3 | 통과 |
+| 5.00 | decode | 4,096 | 0.99e-4 [0.74e-4, 1.34e-4] | 3.17e-5 | 0.84e-4 | 0.9941 | 24, 0 | 통과 |
+
+  - 참고로, 같은 엔진끼리의 바닥(ExLlamaV3 BF16 대 gufo BF16, W8)은 평균 6.9e-4, 중앙값 2e-5였다. X1 값은 이와 같은 크기다. 엔진 차이의 원인은 gufo의 BF16 반올림 유효 가중치 대 ExLlamaV3의 FP16 활성화와 FP16 logits로 본다[짐작].
+  - 5.00 prefill의 KL > 1 세 위치는 chat 창 6이다(예: 위치 405, KL 5.5, 뒤집힘). 위치에 민감한 chat 위치라는 RQ2B 관찰과 같은 유형이다[짐작].
+
+**BF16 기준 KL(prefill, `rq0-bf16` 대비)이 W8 ExLlamaV3 값과 같은지**
+
+| 팩 | gufo-EXL3 KL | W8 ExLlamaV3 KL | paired 차이(gufo − ExLlamaV3) [토큰 95 % / 블록 95 %] | top-1 차이 | ΔNLL 차이 |
+|---|---|---|---|---|---|
+| 4.00 | 18.86e-3 [17.33, 20.54] | 18.84e-3 | +0.02e-3 [−0.51, +0.65] / [−0.54, +0.65], 구분 안 됨 | −0.0006, 구분 안 됨 | +2.3e-3 [+1.6, +3.2] |
+| 5.00 | 7.79e-3 [6.23, 9.85] | 7.64e-3 | +0.14e-3 [−0.08, +0.38] / [−0.07, +0.41], 구분 안 됨 | −0.0002, 구분 안 됨 | +1.4e-3 [+0.5, +2.2] |
+
+  - KL과 top-1은 W8 값과 신뢰구간 안에서 같다. 통과다.
+  - ΔNLL만 gufo 쪽이 1.4–2.3e-3 nats/token 크다(구분됨). 같은 크기의 엔진 차이(BF16 대 FP16 경로)로 보이며 양자화 차이보다 한 자릿수 작다[짐작]. X2 커널(FP16/FP32 활성화, 가중치를 BF16로 다시 반올림하지 않음)에서 다시 본다.
+
+**GGUF fingerprint(RQ2H 방식):**
+  - `build/xa-gpu-test`의 `qwen27b_target_test --fingerprints-only`를 UD-Q4_K_M으로 돌렸다(27줄).
+  - 결과는 `rq2h/units`의 같은 로그와 **바이트 단위로 같다**(`cmp`). EXL3 코드가 기존 GGUF 경로 출력을 바꾸지 않았다.
+
+**판정: X1 통과.** 4.00과 5.00 모두 엔진 차이가 기준 안이고, BF16 기준 KL이 W8과 같으며, GGUF 경로 fingerprint가 그대로다. 다음은 X2(직접 로드와 trellis 커널, X-B)와 토크나이저 메타데이터 결정이다.
