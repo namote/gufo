@@ -1,0 +1,154 @@
+#ifndef GUFO_CORE_HIP_DETAIL_EXL3_GEMV_HPP_
+#define GUFO_CORE_HIP_DETAIL_EXL3_GEMV_HPP_
+
+// Device helpers of the EXL3 trellis decode GEMV (plan/exl3/XB-DESIGN.md
+// section 3.1, measured in plan/exl3/XB-RESULTS.md windows xb1 and xb2).
+// Header-only, model independent.
+//
+// Tile decode. Lane L of a wave decodes the positions 8L .. 8L + 7 of a 16 x
+// 16 tile. The tensor-core permutation of the format (docs/EXL3-FORMAT.md
+// "Tile layout") puts them at rows (r0, r0+1, r0+8, r0+9), r0 = (L % 4) * 2,
+// of columns L / 4 (positions 0-3) and L / 4 + 8 (positions 4-7). For
+// K <= 6 the lane's eight 16-bit states lie in one 64-bit window of the tile
+// bit string, cut out of three dwords with two v_alignbit_b32; each state is
+// then a constant shift of the window. The decode is exact integer arithmetic
+// plus one fused FP16 FMA, bit for bit the CPU reference
+// (src/core/quant/exl3/format.hpp DequantTile).
+//
+// The lane layout and the mul1 pair decode (v_sad_u8 / v_sad_hi_u8 byte sums
+// packed straight into an FP16 pair) follow upstream exllamav3 v1.6.5
+// exllamav3_ext/rocm/quant/exl3_gemv_kernel_rdna.cuh and
+// exl3_gemv_tiles_rdna.cuh (MIT License, Copyright (c) 2025 Turboderp); the
+// code is written anew.
+//
+// Rotated input layout ("lane-major"). For an M-row input of width k, each
+// 16-element k tile kt occupies 16 * M halves at kt * 16 * M: four groups
+// q = 0..3 (the lanes with r0 = 2q), each [M rows][x[2q], x[2q+1], x[2q+8],
+// x[2q+9]], so a lane reads its M rows of a tile as one contiguous 8M bytes.
+
+#include <cstddef>
+#include <cstdint>
+
+namespace gufo::hip::exl3 {
+
+/// Rows of one GEMV pass (the verify width of DFlash2: anchor + 7 drafts).
+inline constexpr unsigned kMaxRows = 8;
+/// Output columns per Hadamard segment and per counter.
+inline constexpr unsigned kSegment = 128;
+/// float(1 / sqrt(128)), correctly rounded.
+inline constexpr float kHadamardScale = 0.0883883461356163F;
+
+/// Offset of element `i` of row `r` in an M-row lane-major input.
+constexpr std::size_t LaneMajorOffset(std::size_t i, unsigned r, unsigned m) {
+  const std::size_t kt = i / 16;
+  const unsigned w = static_cast<unsigned>(i % 16);
+  const unsigned q = (w & 7U) >> 1;
+  const unsigned pos = (w & 1U) + ((w >> 3) << 1);
+  return kt * 16 * m + q * 4 * m + r * 4 + pos;
+}
+
+}  // namespace gufo::hip::exl3
+
+#if defined(__HIPCC__)
+#include <hip/hip_runtime.h>
+
+namespace gufo::hip::exl3 {
+
+using Half2 = _Float16 __attribute__((ext_vector_type(2)));
+using Half4 = _Float16 __attribute__((ext_vector_type(4)));
+
+inline constexpr std::uint32_t kMul1Multiplier = 0x83DCD12DU;
+
+/// Lane-constant placement of the lane's 64-bit state window in a tile of
+/// 8 * K dwords: the three source dwords and 32 minus the bit offset of the
+/// first state (that offset is never 0 for K = 1..6).
+struct LaneWindow {
+  unsigned o0, o1, o2;
+  unsigned shift;
+};
+
+template<int K>
+__device__ __forceinline__ LaneWindow MakeLaneWindow(unsigned lane) {
+  static_assert(K >= 1 && K <= 6, "one 64-bit window holds K <= 6 only");
+  constexpr int kTileBits = 256 * K;
+  constexpr unsigned kWords = 8 * K;
+  const int start =
+      ((8 * static_cast<int>(lane) + 1) * K - 16 + kTileBits) % kTileBits;
+  const unsigned i0 = static_cast<unsigned>(start) / 32;
+  LaneWindow w;
+  w.o0 = i0;
+  w.o1 = (i0 + 1) % kWords;
+  w.o2 = (i0 + 2) % kWords;
+  w.shift = 32U - static_cast<unsigned>(start) % 32;
+  return w;
+}
+
+/// Two mul1-hashed states -> the decoded FP16 pair (lo = first state):
+/// fma(1024 + bytesum, 0x1eee, 0xc931) rounded once.
+__device__ __forceinline__ Half2 DecodePairMul1(std::uint32_t p0,
+                                                std::uint32_t p1) {
+  std::uint32_t s = __builtin_amdgcn_sad_u8(p0, 0U, 0x64006400U);
+  s = __builtin_amdgcn_sad_hi_u8(p1, 0U, s);
+  const Half2 u = __builtin_bit_cast(Half2, s);
+  const Half2 inv = __builtin_bit_cast(Half2, 0x1eee1eeeU);
+  const Half2 bias = __builtin_bit_cast(Half2, 0xc931c931U);
+  return __builtin_elementwise_fma(u, inv, bias);
+}
+
+/// The lane's eight decoded weights as four pairs: w[0] rows (r0, r0+1) and
+/// w[1] rows (r0+8, r0+9) of column L / 4; w[2], w[3] the same rows of
+/// column L / 4 + 8.
+template<int K>
+__device__ __forceinline__ void DecodeLaneMul1(
+    const std::uint32_t* __restrict__ tile, const LaneWindow& lw,
+    Half2 (&w)[4]) {
+  const std::uint32_t d0 = tile[lw.o0];
+  const std::uint32_t d1 = tile[lw.o1];
+  const std::uint32_t d2 = tile[lw.o2];
+  const std::uint32_t hi = __builtin_amdgcn_alignbit(d0, d1, lw.shift);
+  const std::uint32_t lo = __builtin_amdgcn_alignbit(d1, d2, lw.shift);
+  const std::uint64_t window = (static_cast<std::uint64_t>(hi) << 32) | lo;
+  std::uint32_t p[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const std::uint32_t state =
+        static_cast<std::uint32_t>(window >> (48 - K * j)) & 0xffffU;
+    p[j] = state * kMul1Multiplier;
+  }
+#pragma unroll
+  for (int q = 0; q < 4; ++q) {
+    w[q] = DecodePairMul1(p[2 * q], p[2 * q + 1]);
+  }
+}
+
+/// In-place unnormalized 128-point Walsh-Hadamard butterflies of one segment
+/// held four consecutive elements per lane (lane l owns 4l .. 4l + 3), in the
+/// CPU reference order: lengths 1, 2 in the lane, then 4 .. 64 across lanes.
+__device__ __forceinline__ void Butterfly128(float (&v)[4], unsigned lane) {
+#pragma unroll
+  for (unsigned length = 1; length < 4; length <<= 1) {
+#pragma unroll
+    for (unsigned i = 0; i < 4; i += length << 1) {
+#pragma unroll
+      for (unsigned j = i; j < i + length; ++j) {
+        const float a = v[j];
+        const float b = v[j + length];
+        v[j] = a + b;
+        v[j + length] = a - b;
+      }
+    }
+  }
+#pragma unroll
+  for (unsigned mask = 1; mask < 32; mask <<= 1) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float other = __shfl_xor(v[j], static_cast<int>(mask), 32);
+      v[j] = (lane & mask) != 0 ? other - v[j] : v[j] + other;
+    }
+  }
+}
+
+}  // namespace gufo::hip::exl3
+#endif  // defined(__HIPCC__)
+
+#endif  // GUFO_CORE_HIP_DETAIL_EXL3_GEMV_HPP_

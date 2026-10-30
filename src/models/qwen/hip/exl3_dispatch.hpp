@@ -18,6 +18,7 @@
 #include <hip/hip_runtime.h>
 
 #include "src/core/quant/exl3/reference.hpp"
+#include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
 
 namespace gufo::hip {
 
@@ -39,6 +40,18 @@ inline void LaunchExl3Projection(const models::QwenTensorRef& weight,
         "EXL3 projection without a descriptor or session workspace");
   }
   const auto& linear = *weight.exl3;
+  // Decode and verify rows take the X2b trellis GEMV; prefill batches and
+  // formats it does not cover stay on the reference path.
+  if (scratch->fast_input != nullptr && rows <= kExl3FastMaxRows &&
+      Exl3FastSupported(linear)) {
+    const Exl3FastWorkspace workspace{
+        scratch->fast_input, scratch->fast_input_elements,
+        scratch->fast_counters, scratch->fast_counter_count};
+    LaunchExl3FastProjection(linear, x, x_stride != 0 ? x_stride : linear.k,
+                             rows, y, y_stride != 0 ? y_stride : linear.n,
+                             workspace, stream);
+    return;
+  }
   quant::exl3::LaunchReferenceProjection(
       linear, x, x_stride != 0 ? x_stride : linear.k, rows, y,
       y_stride != 0 ? y_stride : linear.n, *scratch, stream);

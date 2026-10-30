@@ -1204,6 +1204,10 @@ struct QwenGpuArena::Exl3Workspace {
       (void)hipFree(scratch.rotated);
     if (scratch.weight != nullptr)
       (void)hipFree(scratch.weight);
+    if (scratch.fast_input != nullptr)
+      (void)hipFree(scratch.fast_input);
+    if (scratch.fast_counters != nullptr)
+      (void)hipFree(scratch.fast_counters);
   }
 };
 
@@ -1224,6 +1228,21 @@ void QwenGpuArena::AllocateExl3(std::size_t max_input_width) {
                       workspace->scratch.rotated_elements * sizeof(float)));
   HIP_CHECK(hipMalloc(&workspace->scratch.weight,
                       workspace->scratch.weight_elements * sizeof(float)));
+  // X2b fast path (plan/exl3/XB-RESULTS.md "X-A arena"): an 8-row FP16
+  // rotated-input slab of the widest input and one arrival counter per
+  // 128-column segment of the widest output (the head). The counters start
+  // at zero and every launch returns them to zero.
+  auto& scratch = workspace->scratch;
+  scratch.fast_input_elements = 8 * max_input_width;
+  HIP_CHECK(hipMalloc(&scratch.fast_input,
+                      scratch.fast_input_elements * sizeof(std::uint16_t)));
+  const std::size_t widest_output =
+      std::max<std::size_t>(config_.vocab_size, max_input_width);
+  scratch.fast_counter_count = (widest_output + 127) / 128;
+  HIP_CHECK(hipMalloc(&scratch.fast_counters,
+                      scratch.fast_counter_count * sizeof(std::uint32_t)));
+  HIP_CHECK(hipMemset(scratch.fast_counters, 0,
+                      scratch.fast_counter_count * sizeof(std::uint32_t)));
   exl3_ = std::move(workspace);
 }
 
