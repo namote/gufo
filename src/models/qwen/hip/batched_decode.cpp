@@ -102,6 +102,17 @@ void LaunchFfnActivation(const models::QwenLayerWeights& layer,
                          const quant::exl3::ReferenceScratch* exl3) {
   const auto& gate = layer.ffn_gate;
   const auto& up = layer.ffn_up;
+  if (IsExl3(gate)) {
+    const Exl3GroupOutput gate_up[] = {{&gate, scratch.ffn.gate.data()},
+                                       {&up, scratch.ffn.up.data()}};
+    LaunchExl3Projections(gate_up, scratch.decode.normed.data(), batch_size,
+                          exl3, stream);
+    LaunchBatchedSwiGLUActivation(scratch.ffn.gate.data(),
+                                  scratch.ffn.up.data(),
+                                  scratch.ffn.activation.data(), nullptr,
+                                  batch_size * intermediate_size, stream);
+    return;
+  }
   const bool packed_format = gate.type == core::GgmlType::kQ4_K ||
                              gate.type == core::GgmlType::kQ5_K ||
                              gate.type == core::GgmlType::kQ6_K ||
@@ -318,15 +329,24 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
                     layer.rotation.attn_in, arena.stream);
 
     if (layer.is_full_attention) {
-      LaunchProjection(layer.attn_q, scratch.decode.normed.data(),
-                       scratch.ssm.qkv.data(), batch_size, q_projection_size,
-                       hidden_size, arena.stream, arena.Exl3Scratch());
-      LaunchProjection(layer.attn_k, scratch.decode.normed.data(),
-                       scratch.attention.k.data(), batch_size, kv_size,
-                       hidden_size, arena.stream, arena.Exl3Scratch());
-      LaunchProjection(layer.attn_v, scratch.decode.normed.data(),
-                       scratch.attention.v.data(), batch_size, kv_size,
-                       hidden_size, arena.stream, arena.Exl3Scratch());
+      if (IsExl3(layer.attn_q)) {
+        const Exl3GroupOutput qkv[] = {
+            {&layer.attn_q, scratch.ssm.qkv.data()},
+            {&layer.attn_k, scratch.attention.k.data()},
+            {&layer.attn_v, scratch.attention.v.data()}};
+        LaunchExl3Projections(qkv, scratch.decode.normed.data(), batch_size,
+                              arena.Exl3Scratch(), arena.stream);
+      } else {
+        LaunchProjection(layer.attn_q, scratch.decode.normed.data(),
+                         scratch.ssm.qkv.data(), batch_size, q_projection_size,
+                         hidden_size, arena.stream, arena.Exl3Scratch());
+        LaunchProjection(layer.attn_k, scratch.decode.normed.data(),
+                         scratch.attention.k.data(), batch_size, kv_size,
+                         hidden_size, arena.stream, arena.Exl3Scratch());
+        LaunchProjection(layer.attn_v, scratch.decode.normed.data(),
+                         scratch.attention.v.data(), batch_size, kv_size,
+                         hidden_size, arena.stream, arena.Exl3Scratch());
+      }
       LaunchBatchedUnpackQG(scratch.ssm.qkv.data(), scratch.attention.q.data(),
                             scratch.ssm.gate.data(), batch_size,
                             config.num_attention_heads, config.head_dim,
@@ -394,12 +414,20 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
                        scratch.attention.output.data(), batch_size, hidden_size,
                        attention_size, arena.stream, arena.Exl3Scratch());
     } else {
-      LaunchProjection(layer.attn_qkv, scratch.decode.normed.data(),
-                       scratch.ssm.qkv.data(), batch_size, ssm_qkv_size,
-                       hidden_size, arena.stream, arena.Exl3Scratch());
-      LaunchProjection(layer.attn_gate, scratch.decode.normed.data(),
-                       scratch.ssm.gate.data(), batch_size, ssm_inner_size,
-                       hidden_size, arena.stream, arena.Exl3Scratch());
+      if (IsExl3(layer.attn_qkv)) {
+        const Exl3GroupOutput qkvz[] = {
+            {&layer.attn_qkv, scratch.ssm.qkv.data()},
+            {&layer.attn_gate, scratch.ssm.gate.data()}};
+        LaunchExl3Projections(qkvz, scratch.decode.normed.data(), batch_size,
+                              arena.Exl3Scratch(), arena.stream);
+      } else {
+        LaunchProjection(layer.attn_qkv, scratch.decode.normed.data(),
+                         scratch.ssm.qkv.data(), batch_size, ssm_qkv_size,
+                         hidden_size, arena.stream, arena.Exl3Scratch());
+        LaunchProjection(layer.attn_gate, scratch.decode.normed.data(),
+                         scratch.ssm.gate.data(), batch_size, ssm_inner_size,
+                         hidden_size, arena.stream, arena.Exl3Scratch());
+      }
       const auto controls =
           LaunchSsmControls(layer, scratch, batch_size, time_step_rank,
                             hidden_size, arena.stream);
@@ -671,15 +699,24 @@ QwenGpuExecutor::ForwardVerificationBatch(
                     layer.rotation.attn_in, arena_.stream);
 
     if (layer.is_full_attention) {
-      LaunchProjection(layer.attn_q, scratch.decode.normed.data(),
-                       scratch.ssm.qkv.data(), batch_size, q_projection_size,
-                       hidden_size, arena_.stream, arena_.Exl3Scratch());
-      LaunchProjection(layer.attn_k, scratch.decode.normed.data(),
-                       scratch.attention.k.data(), batch_size, kv_size,
-                       hidden_size, arena_.stream, arena_.Exl3Scratch());
-      LaunchProjection(layer.attn_v, scratch.decode.normed.data(),
-                       scratch.attention.v.data(), batch_size, kv_size,
-                       hidden_size, arena_.stream, arena_.Exl3Scratch());
+      if (IsExl3(layer.attn_q)) {
+        const Exl3GroupOutput qkv[] = {
+            {&layer.attn_q, scratch.ssm.qkv.data()},
+            {&layer.attn_k, scratch.attention.k.data()},
+            {&layer.attn_v, scratch.attention.v.data()}};
+        LaunchExl3Projections(qkv, scratch.decode.normed.data(), batch_size,
+                              arena_.Exl3Scratch(), arena_.stream);
+      } else {
+        LaunchProjection(layer.attn_q, scratch.decode.normed.data(),
+                         scratch.ssm.qkv.data(), batch_size, q_projection_size,
+                         hidden_size, arena_.stream, arena_.Exl3Scratch());
+        LaunchProjection(layer.attn_k, scratch.decode.normed.data(),
+                         scratch.attention.k.data(), batch_size, kv_size,
+                         hidden_size, arena_.stream, arena_.Exl3Scratch());
+        LaunchProjection(layer.attn_v, scratch.decode.normed.data(),
+                         scratch.attention.v.data(), batch_size, kv_size,
+                         hidden_size, arena_.stream, arena_.Exl3Scratch());
+      }
       LaunchBatchedUnpackQG(scratch.ssm.qkv.data(), scratch.attention.q.data(),
                             scratch.ssm.gate.data(), batch_size,
                             config.num_attention_heads, config.head_dim,
@@ -828,12 +865,20 @@ QwenGpuExecutor::ForwardVerificationBatch(
                        scratch.attention.output.data(), batch_size, hidden_size,
                        attention_size, arena_.stream, arena_.Exl3Scratch());
     } else {
-      LaunchProjection(layer.attn_qkv, scratch.decode.normed.data(),
-                       scratch.ssm.qkv.data(), batch_size, ssm_qkv_size,
-                       hidden_size, arena_.stream, arena_.Exl3Scratch());
-      LaunchProjection(layer.attn_gate, scratch.decode.normed.data(),
-                       scratch.ssm.gate.data(), batch_size, ssm_inner_size,
-                       hidden_size, arena_.stream, arena_.Exl3Scratch());
+      if (IsExl3(layer.attn_qkv)) {
+        const Exl3GroupOutput qkvz[] = {
+            {&layer.attn_qkv, scratch.ssm.qkv.data()},
+            {&layer.attn_gate, scratch.ssm.gate.data()}};
+        LaunchExl3Projections(qkvz, scratch.decode.normed.data(), batch_size,
+                              arena_.Exl3Scratch(), arena_.stream);
+      } else {
+        LaunchProjection(layer.attn_qkv, scratch.decode.normed.data(),
+                         scratch.ssm.qkv.data(), batch_size, ssm_qkv_size,
+                         hidden_size, arena_.stream, arena_.Exl3Scratch());
+        LaunchProjection(layer.attn_gate, scratch.decode.normed.data(),
+                         scratch.ssm.gate.data(), batch_size, ssm_inner_size,
+                         hidden_size, arena_.stream, arena_.Exl3Scratch());
+      }
       const auto controls =
           LaunchSsmControls(layer, scratch, batch_size, time_step_rank,
                             hidden_size, arena_.stream);

@@ -20,6 +20,7 @@ using exl3::Half4;
 using exl3::kHadamardScale;
 
 constexpr unsigned kRotateWaves = 8;
+constexpr unsigned kMaxSlots = kExl3FastMaxGroup;
 
 // DPP quad_perm move: 0xB1 = [1,0,3,2] (lane ^ 1), 0x4E = [2,3,0,1]
 // (lane ^ 2). Full-rate VALU instead of ds_bpermute, the same additions as a
@@ -29,19 +30,32 @@ __device__ __forceinline__ float QuadMove(float v) {
   return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), kCtrl,
                                                     0xF, 0xF, false));
 }
-constexpr int kTilesPerWave = 2;
 
-// out (lane-major, M rows) = FP16(H(suh * x)) per 128-element segment. Rows
-// m .. M - 1 of the pass are written as zeros.
+struct RotateArgs {
+  const _Float16* suh[kMaxSlots];
+  _Float16* out[kMaxSlots];
+};
+
+// out[slot] (lane-major, M rows) = FP16(H(suh[slot] * x)) per 128-element
+// segment; blockIdx.z is the slot. Rows m .. M - 1 of the pass are zeros.
 template<unsigned M>
 __global__ __launch_bounds__(kRotateWaves * 32) void Exl3RotateInputKernel(
     const float* __restrict__ x, std::size_t x_stride, unsigned rows,
-    unsigned k, const _Float16* __restrict__ suh, _Float16* __restrict__ out) {
+    unsigned k, RotateArgs args) {
   const unsigned lane = threadIdx.x % 32;
   const unsigned segment = blockIdx.x * kRotateWaves + threadIdx.x / 32;
   const unsigned row = blockIdx.y;
   if (segment >= k / exl3::kSegment) {
     return;
+  }
+  const _Float16* suh = args.suh[0];
+  _Float16* out = args.out[0];
+  if (blockIdx.z == 1) {
+    suh = args.suh[1];
+    out = args.out[1];
+  } else if (blockIdx.z == 2) {
+    suh = args.suh[2];
+    out = args.out[2];
   }
   const unsigned first = segment * exl3::kSegment + lane * 4;
   float v[4];
@@ -72,25 +86,50 @@ __global__ __launch_bounds__(kRotateWaves * 32) void Exl3RotateInputKernel(
   }
 }
 
+// One matrix of a launch: its trellis, rotated input, output and counters.
+// Blocks [block_begin, next slot's block_begin) work it.
+struct GemvSlot {
+  const std::uint16_t* trellis;
+  const _Float16* a;
+  const _Float16* svh;
+  float* y;
+  std::size_t y_stride;
+  std::uint32_t* counters;
+  unsigned n;
+  unsigned block_begin;
+};
+
+struct GemvArgs {
+  GemvSlot slot[kMaxSlots];
+  unsigned slots;
+  unsigned k;
+  unsigned rows;
+};
+
 // y[r][n] = svh * H(sum_k a[r][k] W'[k][n]) for r < rows, M >= rows padded
-// rows. Blocks of W waves own kTilesPerWave adjacent N tiles and split K;
-// the block that completes a 128-column segment rotates it in place.
-template<int K, unsigned M, unsigned W>
-__global__ __launch_bounds__(W * 32) void Exl3GemvKernel(
-    const std::uint16_t* __restrict__ trellis, const _Float16* __restrict__ a,
-    const _Float16* __restrict__ svh, float* __restrict__ y,
-    std::size_t y_stride, std::uint32_t* __restrict__ counters, unsigned k,
-    unsigned n, unsigned rows) {
+// rows, for every slot. Blocks of W waves own TN adjacent N tiles of one
+// slot and split K; the block that completes a 128-column segment rotates it
+// in place.
+template<int K, unsigned M, unsigned W, unsigned TN>
+__global__ __launch_bounds__(W * 32) void Exl3GemvKernel(GemvArgs args) {
   constexpr unsigned kTileDwords = 8 * K;
-  constexpr int TN = kTilesPerWave;
   __shared__ float red[W][TN][M][16];
   __shared__ unsigned last_block;
 
+  // Wave-uniform slot selection (no dynamic indexing of the argument block).
+  GemvSlot sl = args.slot[0];
+  if (args.slots > 1 && blockIdx.x >= args.slot[1].block_begin) {
+    sl = args.slot[1];
+  }
+  if (args.slots > 2 && blockIdx.x >= args.slot[2].block_begin) {
+    sl = args.slot[2];
+  }
+
   const unsigned lane = threadIdx.x % 32;
   const unsigned warp = threadIdx.x / 32;
-  const unsigned n_tiles = n / 16;
-  const unsigned k_tiles = k / 16;
-  const unsigned nt0 = blockIdx.x * TN;
+  const unsigned n_tiles = sl.n / 16;
+  const unsigned k_tiles = args.k / 16;
+  const unsigned nt0 = (blockIdx.x - sl.block_begin) * TN;
   const unsigned kb0 = k_tiles * warp / W;
   const unsigned kb1 = k_tiles * (warp + 1) / W;
   const exl3::LaneWindow lw = exl3::MakeLaneWindow<K>(lane);
@@ -99,7 +138,7 @@ __global__ __launch_bounds__(W * 32) void Exl3GemvKernel(
   float acc_a[TN][M];
   float acc_b[TN][M];
 #pragma unroll
-  for (int t = 0; t < TN; ++t) {
+  for (unsigned t = 0; t < TN; ++t) {
 #pragma unroll
     for (unsigned r = 0; r < M; ++r) {
       acc_a[t][r] = 0.0F;
@@ -107,12 +146,13 @@ __global__ __launch_bounds__(W * 32) void Exl3GemvKernel(
     }
   }
 
-  const std::uint32_t* base = reinterpret_cast<const std::uint32_t*>(trellis);
+  const std::uint32_t* base =
+      reinterpret_cast<const std::uint32_t*>(sl.trellis);
   for (unsigned kt = kb0; kt < kb1; ++kt) {
     Half2 a01[M];
     Half2 a89[M];
     const Half4* group = reinterpret_cast<const Half4*>(
-        a + (static_cast<std::size_t>(kt) * 16 + r0 * 2) * M);
+        sl.a + (static_cast<std::size_t>(kt) * 16 + r0 * 2) * M);
 #pragma unroll
     for (unsigned r = 0; r < M; ++r) {
       const Half4 v = group[r];
@@ -120,7 +160,7 @@ __global__ __launch_bounds__(W * 32) void Exl3GemvKernel(
       a89[r] = Half2{v.z, v.w};
     }
 #pragma unroll
-    for (int t = 0; t < TN; ++t) {
+    for (unsigned t = 0; t < TN; ++t) {
       const std::uint32_t* tile =
           base +
           (static_cast<std::size_t>(kt) * n_tiles + nt0 + t) * kTileDwords;
@@ -138,7 +178,7 @@ __global__ __launch_bounds__(W * 32) void Exl3GemvKernel(
 
   // Quad reduction: lanes 4c .. 4c + 3 hold columns c and c + 8.
 #pragma unroll
-  for (int t = 0; t < TN; ++t) {
+  for (unsigned t = 0; t < TN; ++t) {
 #pragma unroll
     for (unsigned r = 0; r < M; ++r) {
       float va = acc_a[t][r];
@@ -158,16 +198,16 @@ __global__ __launch_bounds__(W * 32) void Exl3GemvKernel(
   if (warp == 0) {
     if (lane < 16) {
 #pragma unroll
-      for (int t = 0; t < TN; ++t) {
+      for (unsigned t = 0; t < TN; ++t) {
 #pragma unroll
         for (unsigned r = 0; r < M; ++r) {
-          if (r < rows) {
+          if (r < args.rows) {
             float sum = red[0][t][r][lane];
 #pragma unroll
             for (unsigned v = 1; v < W; ++v) {
               sum += red[v][t][r][lane];
             }
-            y[r * y_stride + (nt0 + t) * 16 + lane] = sum;
+            sl.y[r * sl.y_stride + (nt0 + t) * 16 + lane] = sum;
           }
         }
       }
@@ -177,10 +217,10 @@ __global__ __launch_bounds__(W * 32) void Exl3GemvKernel(
     const unsigned segment = nt0 / 8;
     if (lane == 0) {
       constexpr unsigned kArrivals = 8 / TN;
-      const unsigned old = atomicAdd(&counters[segment], 1U);
+      const unsigned old = atomicAdd(&sl.counters[segment], 1U);
       last = old == kArrivals - 1 ? 1U : 0U;
       if (last != 0) {
-        counters[segment] = 0;
+        sl.counters[segment] = 0;
       }
     }
     last_block = __shfl(last, 0, 32);
@@ -193,8 +233,8 @@ __global__ __launch_bounds__(W * 32) void Exl3GemvKernel(
 
   // The segment is complete: rotate it in place, one wave per row.
   const unsigned seg_base = (nt0 / 8) * exl3::kSegment;
-  for (unsigned r = warp; r < rows; r += W) {
-    float* row = y + r * y_stride + seg_base + lane * 4;
+  for (unsigned r = warp; r < args.rows; r += W) {
+    float* row = sl.y + r * sl.y_stride + seg_base + lane * 4;
     float v[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
@@ -205,89 +245,125 @@ __global__ __launch_bounds__(W * 32) void Exl3GemvKernel(
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       row[j] = (v[j] * kHadamardScale) *
-               static_cast<float>(svh[seg_base + lane * 4 + j]);
+               static_cast<float>(sl.svh[seg_base + lane * 4 + j]);
     }
   }
 }
 
-// Split-K waves per block for kTilesPerWave = 2, from the xb2 sweep
-// (plan/exl3/XB-RESULTS.md): narrow outputs need more waves, long K and the
-// 384-512-block shapes run best at 8, the rest at 4.
-unsigned SplitWaves(unsigned k_tiles, unsigned blocks) {
-  if (blocks < 64) {
-    return 16;
+struct LaunchShape {
+  unsigned tiles_per_wave;
+  unsigned waves;
+};
+
+// From the xb2/xb3 sweeps (plan/exl3/XB-RESULTS.md): launches of 352 to 511
+// two-tile blocks (q, q + k + v) run best with four tiles per wave and four
+// waves; otherwise two tiles per wave, with more waves for narrow outputs
+// and long K.
+LaunchShape PickShape(unsigned k_tiles, unsigned blocks_two_tiles) {
+  if (blocks_two_tiles >= 352 && blocks_two_tiles < 512) {
+    return {4, 4};
   }
-  if (k_tiles >= 384 || (blocks >= 352 && blocks < 512)) {
-    return 8;
+  if (blocks_two_tiles < 64) {
+    return {2, 16};
   }
-  return 4;
+  if (k_tiles >= 384) {
+    return {2, 8};
+  }
+  return {2, 4};
+}
+
+template<int K, unsigned M, unsigned W, unsigned TN>
+void LaunchGemvKernel(GemvArgs args, hipStream_t stream) {
+  unsigned blocks = 0;
+  for (unsigned i = 0; i < args.slots; ++i) {
+    args.slot[i].block_begin = blocks;
+    blocks += args.slot[i].n / 16 / TN;
+  }
+  hipLaunchKernelGGL((Exl3GemvKernel<K, M, W, TN>), dim3(blocks), dim3(W * 32),
+                     0, stream, args);
 }
 
 template<int K, unsigned M>
-void LaunchGemvRows(const quant::exl3::DeviceLinear& linear,
-                    const _Float16* input, float* y, std::size_t y_stride,
-                    std::uint32_t* counters, unsigned rows,
+void LaunchGemvRows(const GemvArgs& args, const LaunchShape& shape,
                     hipStream_t stream) {
-  const unsigned blocks = linear.n / 16 / kTilesPerWave;
-  const unsigned waves = SplitWaves(linear.k / 16, blocks);
-  const auto* svh = reinterpret_cast<const _Float16*>(linear.svh);
-  switch (waves) {
+  if (shape.tiles_per_wave == 4) {
+    LaunchGemvKernel<K, M, 4, 4>(args, stream);
+    return;
+  }
+  switch (shape.waves) {
     case 4:
-      hipLaunchKernelGGL((Exl3GemvKernel<K, M, 4>), dim3(blocks), dim3(128), 0,
-                         stream, linear.trellis, input, svh, y, y_stride,
-                         counters, linear.k, linear.n, rows);
+      LaunchGemvKernel<K, M, 4, 2>(args, stream);
       break;
     case 8:
-      hipLaunchKernelGGL((Exl3GemvKernel<K, M, 8>), dim3(blocks), dim3(256), 0,
-                         stream, linear.trellis, input, svh, y, y_stride,
-                         counters, linear.k, linear.n, rows);
+      LaunchGemvKernel<K, M, 8, 2>(args, stream);
       break;
     default:
-      hipLaunchKernelGGL((Exl3GemvKernel<K, M, 16>), dim3(blocks), dim3(512), 0,
-                         stream, linear.trellis, input, svh, y, y_stride,
-                         counters, linear.k, linear.n, rows);
+      LaunchGemvKernel<K, M, 16, 2>(args, stream);
       break;
   }
 }
 
 template<unsigned M>
-void LaunchPass(const quant::exl3::DeviceLinear& linear, const float* x,
-                std::size_t x_stride, unsigned rows, float* y,
-                std::size_t y_stride, const Exl3FastWorkspace& ws,
-                hipStream_t stream) {
-  auto* input = reinterpret_cast<_Float16*>(ws.input);
-  const unsigned segments = linear.k / exl3::kSegment;
-  hipLaunchKernelGGL(Exl3RotateInputKernel<M>,
-                     dim3((segments + kRotateWaves - 1) / kRotateWaves, M),
-                     dim3(kRotateWaves * 32), 0, stream, x, x_stride, rows,
-                     linear.k, reinterpret_cast<const _Float16*>(linear.suh),
-                     input);
-  switch (linear.rate.bits) {
+void LaunchGemvBits(int bits, const GemvArgs& args, const LaunchShape& shape,
+                    hipStream_t stream) {
+  switch (bits) {
     case 1:
-      LaunchGemvRows<1, M>(linear, input, y, y_stride, ws.counters, rows,
-                           stream);
+      LaunchGemvRows<1, M>(args, shape, stream);
       break;
     case 2:
-      LaunchGemvRows<2, M>(linear, input, y, y_stride, ws.counters, rows,
-                           stream);
+      LaunchGemvRows<2, M>(args, shape, stream);
       break;
     case 3:
-      LaunchGemvRows<3, M>(linear, input, y, y_stride, ws.counters, rows,
-                           stream);
+      LaunchGemvRows<3, M>(args, shape, stream);
       break;
     case 4:
-      LaunchGemvRows<4, M>(linear, input, y, y_stride, ws.counters, rows,
-                           stream);
+      LaunchGemvRows<4, M>(args, shape, stream);
       break;
     case 5:
-      LaunchGemvRows<5, M>(linear, input, y, y_stride, ws.counters, rows,
-                           stream);
+      LaunchGemvRows<5, M>(args, shape, stream);
       break;
     default:
-      LaunchGemvRows<6, M>(linear, input, y, y_stride, ws.counters, rows,
-                           stream);
+      LaunchGemvRows<6, M>(args, shape, stream);
       break;
   }
+}
+
+template<unsigned M>
+void LaunchPass(std::span<const Exl3FastTarget> targets, const float* x,
+                std::size_t x_stride, unsigned rows, std::size_t first_row,
+                const Exl3FastWorkspace& ws, hipStream_t stream) {
+  const auto& first = *targets[0].linear;
+  auto* slab = reinterpret_cast<_Float16*>(ws.input);
+  RotateArgs rotate{};
+  GemvArgs gemv{};
+  gemv.slots = static_cast<unsigned>(targets.size());
+  gemv.k = first.k;
+  gemv.rows = rows;
+  std::size_t counter = 0;
+  unsigned blocks_two_tiles = 0;
+  for (std::size_t s = 0; s < targets.size(); ++s) {
+    const auto& linear = *targets[s].linear;
+    _Float16* input = slab + s * exl3::kMaxRows * first.k;
+    rotate.suh[s] = reinterpret_cast<const _Float16*>(linear.suh);
+    rotate.out[s] = input;
+    GemvSlot& slot = gemv.slot[s];
+    slot.trellis = linear.trellis;
+    slot.a = input;
+    slot.svh = reinterpret_cast<const _Float16*>(linear.svh);
+    slot.y_stride = targets[s].y_stride;
+    slot.y = targets[s].y + first_row * slot.y_stride;
+    slot.counters = ws.counters + counter;
+    slot.n = linear.n;
+    counter += linear.n / exl3::kSegment;
+    blocks_two_tiles += linear.n / 32;
+  }
+  const unsigned segments = first.k / exl3::kSegment;
+  hipLaunchKernelGGL(
+      Exl3RotateInputKernel<M>,
+      dim3((segments + kRotateWaves - 1) / kRotateWaves, M, gemv.slots),
+      dim3(kRotateWaves * 32), 0, stream, x, x_stride, rows, first.k, rotate);
+  LaunchGemvBits<M>(first.rate.bits, gemv,
+                    PickShape(first.k / 16, blocks_two_tiles), stream);
   HIP_CHECK(hipGetLastError());
 }
 
@@ -299,38 +375,58 @@ bool Exl3FastSupported(const quant::exl3::DeviceLinear& linear) noexcept {
          linear.k % exl3::kSegment == 0 && linear.n % exl3::kSegment == 0;
 }
 
-void LaunchExl3FastProjection(const quant::exl3::DeviceLinear& linear,
-                              const float* x, std::size_t x_stride,
-                              std::size_t rows, float* y, std::size_t y_stride,
-                              const Exl3FastWorkspace& workspace,
-                              hipStream_t stream) {
-  if (!Exl3FastSupported(linear) || rows == 0 || rows > kExl3FastMaxRows) {
-    throw std::invalid_argument("EXL3 fast projection: unsupported call");
+bool Exl3FastGroupSupported(std::span<const Exl3FastTarget> targets,
+                            const Exl3FastWorkspace& workspace) noexcept {
+  if (targets.empty() || targets.size() > kExl3FastMaxGroup) {
+    return false;
   }
-  if (workspace.input_elements <
-          static_cast<std::size_t>(exl3::kMaxRows) * linear.k ||
-      workspace.counter_count < linear.n / exl3::kSegment) {
-    throw std::invalid_argument("EXL3 fast projection: workspace too small");
+  const auto& first = *targets[0].linear;
+  std::size_t counters = 0;
+  for (const Exl3FastTarget& t : targets) {
+    if (!Exl3FastSupported(*t.linear) || t.linear->k != first.k ||
+        !(t.linear->rate == first.rate)) {
+      return false;
+    }
+    counters += t.linear->n / exl3::kSegment;
+  }
+  return workspace.input_elements >= targets.size() * exl3::kMaxRows *
+                                         static_cast<std::size_t>(first.k) &&
+         workspace.counter_count >= counters;
+}
+
+void LaunchExl3FastProjections(std::span<const Exl3FastTarget> targets,
+                               const float* x, std::size_t x_stride,
+                               std::size_t rows,
+                               const Exl3FastWorkspace& workspace,
+                               hipStream_t stream) {
+  if (!Exl3FastGroupSupported(targets, workspace) || rows == 0 ||
+      rows > kExl3FastMaxRows) {
+    throw std::invalid_argument("EXL3 fast projection: unsupported call");
   }
   for (std::size_t first = 0; first < rows; first += exl3::kMaxRows) {
     const auto pass = static_cast<unsigned>(
         std::min<std::size_t>(exl3::kMaxRows, rows - first));
     const float* xp = x + first * x_stride;
-    float* yp = y + first * y_stride;
     if (pass == 1) {
-      LaunchPass<1>(linear, xp, x_stride, pass, yp, y_stride, workspace,
-                    stream);
+      LaunchPass<1>(targets, xp, x_stride, pass, first, workspace, stream);
     } else if (pass == 2) {
-      LaunchPass<2>(linear, xp, x_stride, pass, yp, y_stride, workspace,
-                    stream);
+      LaunchPass<2>(targets, xp, x_stride, pass, first, workspace, stream);
     } else if (pass <= 4) {
-      LaunchPass<4>(linear, xp, x_stride, pass, yp, y_stride, workspace,
-                    stream);
+      LaunchPass<4>(targets, xp, x_stride, pass, first, workspace, stream);
     } else {
-      LaunchPass<8>(linear, xp, x_stride, pass, yp, y_stride, workspace,
-                    stream);
+      LaunchPass<8>(targets, xp, x_stride, pass, first, workspace, stream);
     }
   }
+}
+
+void LaunchExl3FastProjection(const quant::exl3::DeviceLinear& linear,
+                              const float* x, std::size_t x_stride,
+                              std::size_t rows, float* y, std::size_t y_stride,
+                              const Exl3FastWorkspace& workspace,
+                              hipStream_t stream) {
+  const Exl3FastTarget target{&linear, y, y_stride};
+  LaunchExl3FastProjections(std::span(&target, 1), x, x_stride, rows, workspace,
+                            stream);
 }
 
 }  // namespace gufo::hip

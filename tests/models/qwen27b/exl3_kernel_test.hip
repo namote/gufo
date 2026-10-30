@@ -5,7 +5,8 @@
 //   - the same projection fed the kernel's FP16 rotated input (FP32 rotation
 //     arithmetic replicated on the CPU): below 1e-5, FP32 accumulation;
 // plus every row count 1..64 (passes of 8, padded row tiles), input and
-// output strides, the self-resetting segment counters and graph replay.
+// output strides, the self-resetting segment counters, graph replay, and
+// shared-input groups of two and three matrices in one launch.
 
 #include <hip/hip_runtime.h>
 
@@ -88,6 +89,48 @@ double RelL2(const std::vector<double>& want, const std::vector<float>& got,
   return std::sqrt(num / den);
 }
 
+// The rotated FP16 input exactly as the kernel makes it
+// (src/core/hip/detail/exl3_gemv.hpp "Input rotation arithmetic"): FP32
+// product, FP32 butterflies in reference order, one FP32 scale, FP16. An FP64
+// rotation rounded to FP16 lands on the other side of an FP16 rounding
+// boundary for about 1 element in 2000, which alone moves the output by 2e-6
+// to 2e-5 (relative L2).
+std::vector<double> KernelRotatedInput(const float* x, const std::uint16_t* suh,
+                                       std::size_t k) {
+  std::vector<double> rot(k);
+  for (std::size_t s = 0; s < k; s += 128) {
+    float seg[128];
+    for (std::size_t i = 0; i < 128; ++i)
+      seg[i] = x[s + i] * static_cast<float>(HalfToDouble(suh[s + i]));
+    for (std::size_t len = 1; len < 128; len <<= 1)
+      for (std::size_t i = 0; i < 128; i += len << 1)
+        for (std::size_t j = i; j < i + len; ++j) {
+          const float a = seg[j];
+          const float b = seg[j + len];
+          seg[j] = a + b;
+          seg[j + len] = a - b;
+        }
+    for (std::size_t i = 0; i < 128; ++i)
+      rot[s + i] = HalfToDouble(HalfFromDouble(seg[i] * 0.0883883461356163F));
+  }
+  return rot;
+}
+
+// svh * H(rot W') in FP64 for one row.
+std::vector<double> ProjectRotated(const std::vector<double>& rot,
+                                   const std::vector<std::uint16_t>& inner,
+                                   const std::vector<std::uint16_t>& svh,
+                                   std::size_t k, std::size_t n) {
+  std::vector<double> t(n, 0.0);
+  for (std::size_t i = 0; i < k; ++i)
+    for (std::size_t j = 0; j < n; ++j)
+      t[j] += rot[i] * HalfToDouble(inner[i * n + j]);
+  HadamardBlocks(std::span<double>(t));
+  for (std::size_t j = 0; j < n; ++j)
+    t[j] *= HalfToDouble(svh[j]);
+  return t;
+}
+
 void TestProblem(const Problem& p, std::mt19937& rng) {
   constexpr std::size_t kMaxRowsTested = 64;
   const BitRate rate{p.bits, false};
@@ -116,29 +159,8 @@ void TestProblem(const Problem& p, std::mt19937& rng) {
     std::vector<double> yr(p.n);
     GemvReference(xr, inner.data(), suh.data(), svh.data(), p.k, p.n, yr);
     std::copy(yr.begin(), yr.end(), exact.begin() + r * p.n);
-    // The rotated FP16 input exactly as the kernel makes it
-    // (src/core/hip/detail/exl3_gemv.hpp "Input rotation arithmetic"): FP32
-    // product, FP32 butterflies in reference order, one FP32 scale, FP16.
-    // An FP64 rotation rounded to FP16 lands on the other side of an FP16
-    // rounding boundary for about 1 element in 2000, which alone moves the
-    // output by 2e-6 to 2e-5 (relative L2).
-    std::vector<double> rot(p.k);
-    for (std::size_t s = 0; s < p.k; s += 128) {
-      float seg[128];
-      for (std::size_t i = 0; i < 128; ++i)
-        seg[i] = x[r * x_stride + s + i] *
-                 static_cast<float>(HalfToDouble(suh[s + i]));
-      for (std::size_t len = 1; len < 128; len <<= 1)
-        for (std::size_t i = 0; i < 128; i += len << 1)
-          for (std::size_t j = i; j < i + len; ++j) {
-            const float a = seg[j];
-            const float b = seg[j + len];
-            seg[j] = a + b;
-            seg[j + len] = a - b;
-          }
-      for (std::size_t i = 0; i < 128; ++i)
-        rot[s + i] = HalfToDouble(HalfFromDouble(seg[i] * 0.0883883461356163F));
-    }
+    const std::vector<double> rot =
+        KernelRotatedInput(&x[r * x_stride], suh.data(), p.k);
     std::vector<double> t(p.n, 0.0);
     for (std::size_t i = 0; i < p.k; ++i)
       for (std::size_t j = 0; j < p.n; ++j)
@@ -259,6 +281,116 @@ void TestProblem(const Problem& p, std::mt19937& rng) {
     Check(hipFree(ptr));
 }
 
+// Shared-input groups (q + k + v, gate + up shapes): one launch per pass,
+// every slot against its FP64 reference fed the kernel's rotated input, and
+// nothing written outside any slot's window.
+void TestGroup(std::size_t k, std::vector<std::size_t> ns, int bits,
+               std::mt19937& rng) {
+  constexpr std::size_t kRows = 17;
+  const BitRate rate{bits, false};
+  const std::size_t x_stride = k + 64;
+  std::normal_distribution<float> normal;
+  std::vector<float> x(kRows * x_stride);
+  for (auto& v : x)
+    v = normal(rng);
+  auto* d_x = Upload(x);
+  struct Slot {
+    std::vector<std::uint16_t> trellis, suh, svh, inner;
+    std::uint16_t *d_trellis, *d_suh, *d_svh;
+    float* d_y;
+    std::size_t y_stride;
+    DeviceLinear lin;
+  };
+  std::vector<Slot> slots(ns.size());
+  std::size_t counters = 0;
+  for (std::size_t s = 0; s < ns.size(); ++s) {
+    Slot& sl = slots[s];
+    const std::size_t n = ns[s];
+    sl.trellis.resize((k / 16) * (n / 16) * rate.TileWords());
+    for (auto& w : sl.trellis)
+      w = static_cast<std::uint16_t>(rng());
+    sl.suh = RandomScales(rng, k, 0x3800);
+    sl.svh = RandomScales(rng, n, 0x2000);
+    sl.inner.resize(k * n);
+    DequantInner(sl.trellis.data(), k, n, rate, Codebook::kMul1,
+                 sl.inner.data());
+    sl.d_trellis = Upload(sl.trellis);
+    sl.d_suh = Upload(sl.suh);
+    sl.d_svh = Upload(sl.svh);
+    sl.y_stride = n + 128;
+    Check(hipMalloc(&sl.d_y, kRows * sl.y_stride * sizeof(float)));
+    sl.lin = DeviceLinear{sl.d_trellis,
+                          sl.d_suh,
+                          sl.d_svh,
+                          static_cast<std::uint32_t>(k),
+                          static_cast<std::uint32_t>(n),
+                          rate,
+                          Codebook::kMul1};
+    counters += n / 128;
+  }
+  gufo::hip::Exl3FastWorkspace ws;
+  ws.input_elements = ns.size() * 8 * k;
+  Check(hipMalloc(&ws.input, ws.input_elements * sizeof(std::uint16_t)));
+  ws.counter_count = counters;
+  Check(hipMalloc(&ws.counters, ws.counter_count * sizeof(std::uint32_t)));
+  Check(hipMemset(ws.counters, 0, ws.counter_count * sizeof(std::uint32_t)));
+  std::vector<gufo::hip::Exl3FastTarget> targets;
+  for (Slot& sl : slots)
+    targets.push_back({&sl.lin, sl.d_y, sl.y_stride});
+  Expect(gufo::hip::Exl3FastGroupSupported(targets, ws),
+         "group supported by the fast path");
+
+  std::string name = "group k=" + std::to_string(k) + " n=";
+  for (std::size_t n : ns)
+    name += std::to_string(n) + "/";
+  name += " K=" + std::to_string(bits);
+  double worst = 0.0;
+  for (std::size_t rows : {1, 3, 8, 17}) {
+    for (Slot& sl : slots)
+      Check(hipMemset(sl.d_y, 0xff, kRows * sl.y_stride * sizeof(float)));
+    gufo::hip::LaunchExl3FastProjections(targets, d_x, x_stride, rows, ws,
+                                         nullptr);
+    Check(hipDeviceSynchronize());
+    for (std::size_t s = 0; s < slots.size(); ++s) {
+      const Slot& sl = slots[s];
+      const std::size_t n = ns[s];
+      const auto y = Download(sl.d_y, kRows * sl.y_stride);
+      std::vector<double> want(rows * n);
+      for (std::size_t r = 0; r < rows; ++r) {
+        const auto row = ProjectRotated(
+            KernelRotatedInput(&x[r * x_stride], sl.suh.data(), k), sl.inner,
+            sl.svh, k, n);
+        std::copy(row.begin(), row.end(), want.begin() + r * n);
+      }
+      worst = std::max(worst, RelL2(want, y, rows, n, sl.y_stride));
+      bool untouched = true;
+      for (std::size_t r = 0; r < kRows && untouched; ++r)
+        for (std::size_t j = 0; j < sl.y_stride && untouched; ++j) {
+          if (r < rows && j < n)
+            continue;
+          std::uint32_t b = 0;
+          std::memcpy(&b, &y[r * sl.y_stride + j], 4);
+          untouched = b == 0xffffffffU;
+        }
+      Expect(untouched, name + ": writes outside a slot window");
+    }
+    const auto c = Download(ws.counters, ws.counter_count);
+    Expect(
+        std::all_of(c.begin(), c.end(), [](std::uint32_t v) { return v == 0; }),
+        name + ": counters not back to zero");
+  }
+  Expect(worst < 1e-5, name + " relative L2 " + std::to_string(worst));
+  std::cout << name << ": relative L2 vs FP16-rounded input " << worst << "\n";
+  for (Slot& sl : slots)
+    for (void* ptr :
+         {static_cast<void*>(sl.d_trellis), static_cast<void*>(sl.d_suh),
+          static_cast<void*>(sl.d_svh), static_cast<void*>(sl.d_y)})
+      Check(hipFree(ptr));
+  for (void* ptr : {static_cast<void*>(d_x), static_cast<void*>(ws.input),
+                    static_cast<void*>(ws.counters)})
+    Check(hipFree(ptr));
+}
+
 }  // namespace
 
 int main() {
@@ -269,6 +401,10 @@ int main() {
                               {256, 384, 1}};
   for (const Problem& p : problems)
     TestProblem(p, rng);
+  // q + k + v (four tiles per wave) and gate + up shapes at small k.
+  TestGroup(512, {12288, 1024, 1024}, 5, rng);
+  TestGroup(512, {4096, 4096}, 4, rng);
+  TestGroup(1024, {2048, 1024}, 6, rng);
   if (failures != 0) {
     std::cerr << failures << " failure(s)\n";
     return 1;

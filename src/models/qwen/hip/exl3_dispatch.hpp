@@ -9,7 +9,9 @@
 // same function.
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
+#include <span>
 #include <stdexcept>
 
 #include "src/models/qwen/state.hpp"
@@ -55,6 +57,55 @@ inline void LaunchExl3Projection(const models::QwenTensorRef& weight,
   quant::exl3::LaunchReferenceProjection(
       linear, x, x_stride != 0 ? x_stride : linear.k, rows, y,
       y_stride != 0 ? y_stride : linear.n, *scratch, stream);
+}
+
+/// One projection of a shared-input group (q/k/v, qkv/z, gate/up): its
+/// weight, output rows and output stride in floats (0: dense, n).
+struct Exl3GroupOutput {
+  const models::QwenTensorRef* weight;
+  float* y;
+  std::size_t y_stride = 0;
+};
+
+/// Every output's projection of the same input rows. Decode and verify rows
+/// of a group the fast path takes run as one launch per pass of 8 rows; any
+/// other group runs projection by projection through LaunchExl3Projection.
+inline void LaunchExl3Projections(std::span<const Exl3GroupOutput> outputs,
+                                  const float* x, std::size_t rows,
+                                  const quant::exl3::ReferenceScratch* scratch,
+                                  hipStream_t stream,
+                                  std::size_t x_stride = 0) {
+  if (scratch == nullptr || outputs.empty()) {
+    throw std::logic_error(
+        "EXL3 projection group without outputs or workspace");
+  }
+  if (scratch->fast_input != nullptr && rows <= kExl3FastMaxRows &&
+      outputs.size() <= kExl3FastMaxGroup) {
+    std::array<Exl3FastTarget, kExl3FastMaxGroup> targets{};
+    bool all_exl3 = true;
+    for (std::size_t i = 0; i < outputs.size(); ++i) {
+      const auto* linear = outputs[i].weight->exl3;
+      all_exl3 = all_exl3 && linear != nullptr;
+      if (!all_exl3)
+        break;
+      targets[i] = {linear, outputs[i].y,
+                    outputs[i].y_stride != 0 ? outputs[i].y_stride : linear->n};
+    }
+    const Exl3FastWorkspace workspace{
+        scratch->fast_input, scratch->fast_input_elements,
+        scratch->fast_counters, scratch->fast_counter_count};
+    const std::span<const Exl3FastTarget> group(targets.data(), outputs.size());
+    if (all_exl3 && Exl3FastGroupSupported(group, workspace)) {
+      LaunchExl3FastProjections(group, x,
+                                x_stride != 0 ? x_stride : targets[0].linear->k,
+                                rows, workspace, stream);
+      return;
+    }
+  }
+  for (const Exl3GroupOutput& output : outputs) {
+    LaunchExl3Projection(*output.weight, x, rows, output.y, scratch, stream,
+                         x_stride, output.y_stride);
+  }
 }
 
 /// The largest input width of the model's projections (workspace sizing).

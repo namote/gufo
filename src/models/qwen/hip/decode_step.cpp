@@ -125,12 +125,12 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
       const std::uint32_t attn_layer_idx = l / config.full_attention_interval;
 
       if (IsExl3(layer.attn_q)) {
-        LaunchExl3Projection(layer.attn_q, decode_scratch.normed.data(), 1,
-                             ssm_scratch.qkv.data(), exl3, arena.stream);
-        LaunchExl3Projection(layer.attn_k, decode_scratch.normed.data(), 1,
-                             attention_scratch.k.data(), exl3, arena.stream);
-        LaunchExl3Projection(layer.attn_v, decode_scratch.normed.data(), 1,
-                             attention_scratch.v.data(), exl3, arena.stream);
+        const Exl3GroupOutput qkv[] = {
+            {&layer.attn_q, ssm_scratch.qkv.data()},
+            {&layer.attn_k, attention_scratch.k.data()},
+            {&layer.attn_v, attention_scratch.v.data()}};
+        LaunchExl3Projections(qkv, decode_scratch.normed.data(), 1, exl3,
+                              arena.stream);
       } else {
         LaunchFusedQKVProjections(
             layer.attn_q.data, layer.attn_q.type, layer.attn_k.data,
@@ -249,10 +249,11 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
 
       if (IsExl3(layer.attn_qkv)) {
         // EXL3 qkv and z; alpha and beta stay unquantized GGUF tensors.
-        LaunchExl3Projection(layer.attn_qkv, decode_scratch.normed.data(), 1,
-                             ssm_scratch.qkv.data(), exl3, arena.stream);
-        LaunchExl3Projection(layer.attn_gate, decode_scratch.normed.data(), 1,
-                             ssm_scratch.gate.data(), exl3, arena.stream);
+        const Exl3GroupOutput qkvz[] = {
+            {&layer.attn_qkv, ssm_scratch.qkv.data()},
+            {&layer.attn_gate, ssm_scratch.gate.data()}};
+        LaunchExl3Projections(qkvz, decode_scratch.normed.data(), 1, exl3,
+                              arena.stream);
         LaunchGEMV(layer.ssm_alpha.data, layer.ssm_alpha.type,
                    decode_scratch.normed.data(), ssm_scratch.alpha.data(),
                    time_step_rank, hidden_size, arena.stream);
@@ -320,10 +321,11 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
     // Fused SwiGLU FFN
     if (IsExl3(layer.ffn_gate)) {
       const std::size_t intermediate_size = config.intermediate_size;
-      LaunchExl3Projection(layer.ffn_gate, decode_scratch.normed.data(), 1,
-                           ffn_scratch.gate.data(), exl3, arena.stream);
-      LaunchExl3Projection(layer.ffn_up, decode_scratch.normed.data(), 1,
-                           ffn_scratch.up.data(), exl3, arena.stream);
+      const Exl3GroupOutput gate_up[] = {
+          {&layer.ffn_gate, ffn_scratch.gate.data()},
+          {&layer.ffn_up, ffn_scratch.up.data()}};
+      LaunchExl3Projections(gate_up, decode_scratch.normed.data(), 1, exl3,
+                            arena.stream);
       LaunchBatchedSwiGLUActivation(ffn_scratch.gate.data(),
                                     ffn_scratch.up.data(),
                                     ffn_scratch.activation.data(), nullptr,
