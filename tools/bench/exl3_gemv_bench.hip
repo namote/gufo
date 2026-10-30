@@ -35,7 +35,9 @@
 //          against an FP64 reference fed the same FP16 input, every M, input
 //          layout and N tiles per wave against M = 1 (bits), and every slot
 //          of a multi-matrix launch against its own launch (bits).
-//   time   case x M x warps x N tiles per wave x input layout, then a plain
+//   time   case x M x warps x N tiles per wave (1, 2, 4) x variant (1:
+//          lane-major input with shuffle quad reduction, 2: lane-major with
+//          DPP quad reduction; 0 = row-major is checked only), then a plain
 //          read of the same buffers as the bandwidth ceiling.
 // Build: plan/exl3/XB-RESULTS.md.
 #include <hip/hip_fp16.h>
@@ -152,6 +154,12 @@ __device__ __forceinline__ void DecodeLane(
   }
 }
 
+template<int kCtrl>
+__device__ __forceinline__ float QuadMove(float v) {
+  return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), kCtrl,
+                                                    0xF, 0xF, false));
+}
+
 // ---------------------------------------------------------------------------
 // GEMV kernel
 // ---------------------------------------------------------------------------
@@ -184,7 +192,9 @@ struct GemvArgs {
 constexpr int kRowMajor = 0;
 constexpr int kLaneMajor = 1;
 
-template<int K, int M, int W, int TN, int kHash, int kLayout>
+// kReduce 0: the quad reduction through __shfl_xor; 1: through DPP
+// quad_perm moves (full-rate VALU, no LDS); the same additions either way.
+template<int K, int M, int W, int TN, int kReduce, int kLayout>
 __global__ __launch_bounds__(W * 32) void Exl3GemvKernel(GemvArgs args) {
   constexpr unsigned kTileDwords = 8 * K;
   __shared__ float red[W][TN][M][16];
@@ -250,7 +260,7 @@ __global__ __launch_bounds__(W * 32) void Exl3GemvKernel(GemvArgs args) {
           base +
           (static_cast<std::size_t>(kt) * n_tiles + nt0 + t) * kTileDwords;
       half2_t w[4];
-      DecodeLane<K, kHash>(tile, lw, w);
+      DecodeLane<K, 0>(tile, lw, w);
 #pragma unroll
       for (int r = 0; r < M; ++r) {
         acc_a[t][r] = __builtin_amdgcn_fdot2(w[0], a01[r], acc_a[t][r], false);
@@ -268,10 +278,18 @@ __global__ __launch_bounds__(W * 32) void Exl3GemvKernel(GemvArgs args) {
     for (int r = 0; r < M; ++r) {
       float va = acc_a[t][r];
       float vb = acc_b[t][r];
-      va += __shfl_xor(va, 1, 32);
-      vb += __shfl_xor(vb, 1, 32);
-      va += __shfl_xor(va, 2, 32);
-      vb += __shfl_xor(vb, 2, 32);
+      if constexpr (kReduce == 0) {
+        va += __shfl_xor(va, 1, 32);
+        vb += __shfl_xor(vb, 1, 32);
+        va += __shfl_xor(va, 2, 32);
+        vb += __shfl_xor(vb, 2, 32);
+      } else {
+        // quad_perm [1,0,3,2] = lane ^ 1, [2,3,0,1] = lane ^ 2.
+        va += QuadMove<0xB1>(va);
+        vb += QuadMove<0xB1>(vb);
+        va += QuadMove<0x4E>(va);
+        vb += QuadMove<0x4E>(vb);
+      }
       if (lane % 4 == 0) {
         red[warp][t][r][lane / 4] = va;
         red[warp][t][r][lane / 4 + 8] = vb;
@@ -456,37 +474,55 @@ unsigned SplitWarps(unsigned k_tiles, unsigned blocks) {
 
 using Launcher = void (*)(GemvArgs, hipStream_t);
 
-template<int K, int M, int W, int TN, int kLayout>
+// Variants: 0 row-major input + shuffle reduction, 1 lane-major + shuffle,
+// 2 lane-major + DPP reduction.
+template<int K, int M, int W, int TN, int kVariant>
 void LaunchGemv(GemvArgs args, hipStream_t stream) {
+  constexpr int kLayout = kVariant == 0 ? kRowMajor : kLaneMajor;
+  constexpr int kReduce = kVariant == 2 ? 1 : 0;
   unsigned blocks = 0;
   for (unsigned i = 0; i < args.slots; ++i) {
     args.slot[i].block_begin = blocks;
     blocks += args.slot[i].n / 16 / TN;
   }
-  hipLaunchKernelGGL((Exl3GemvKernel<K, M, W, TN, 0, kLayout>), dim3(blocks),
-                     dim3(W * 32), 0, stream, args);
+  hipLaunchKernelGGL((Exl3GemvKernel<K, M, W, TN, kReduce, kLayout>),
+                     dim3(blocks), dim3(W * 32), 0, stream, args);
 }
 
-template<int K, int M, int TN, int kLayout>
+template<int K, int M, int TN, int kVariant>
 Launcher PickWarps(unsigned w) {
   switch (w) {
     case 4:
-      return LaunchGemv<K, M, 4, TN, kLayout>;
+      return LaunchGemv<K, M, 4, TN, kVariant>;
     case 8:
-      return LaunchGemv<K, M, 8, TN, kLayout>;
+      return LaunchGemv<K, M, 8, TN, kVariant>;
     default:
-      return LaunchGemv<K, M, 16, TN, kLayout>;
+      return LaunchGemv<K, M, 16, TN, kVariant>;
+  }
+}
+
+template<int K, int M, int TN>
+Launcher PickVariant(unsigned w, int variant) {
+  switch (variant) {
+    case 0:
+      return PickWarps<K, M, TN, 0>(w);
+    case 1:
+      return PickWarps<K, M, TN, 1>(w);
+    default:
+      return PickWarps<K, M, TN, 2>(w);
   }
 }
 
 template<int K, int M>
-Launcher PickForm(unsigned w, int tn, int layout) {
-  if (tn == 1) {
-    return layout == 0 ? PickWarps<K, M, 1, kRowMajor>(w)
-                       : PickWarps<K, M, 1, kLaneMajor>(w);
+Launcher PickForm(unsigned w, int tn, int variant) {
+  switch (tn) {
+    case 1:
+      return PickVariant<K, M, 1>(w, variant);
+    case 2:
+      return PickVariant<K, M, 2>(w, variant);
+    default:
+      return PickVariant<K, M, 4>(w, variant);
   }
-  return layout == 0 ? PickWarps<K, M, 2, kRowMajor>(w)
-                     : PickWarps<K, M, 2, kLaneMajor>(w);
 }
 
 template<int K>
@@ -747,7 +783,7 @@ int CheckSingles(std::mt19937& rng) {
     double rel = 0.0;
     int differ = 0;
     int runs = 0;
-    for (int tn : {1, 2}) {
+    for (int tn : {1, 2, 4}) {
       const unsigned w = SplitWarps(k_tiles, Blocks(c, tn));
       std::vector<float> rows1(static_cast<std::size_t>(8) * n);
       for (int r = 0; r < 8; ++r) {
@@ -765,7 +801,7 @@ int CheckSingles(std::mt19937& rng) {
         den += ref[i] * ref[i];
       }
       rel = std::max(rel, std::sqrt(num / den));
-      for (int layout : {0, 1}) {
+      for (int layout : {0, 1, 2}) {
         for (int m : {1, 2, 4, 8}) {
           Pick(c.bits, m, w, tn, layout)(Args(c, d, 0, m, layout), nullptr);
           const std::vector<float> got = ReadY(d.slots[0], n, m);
@@ -793,8 +829,8 @@ int CheckMulti(std::mt19937& rng) {
   Device d = Allocate(c, 1, rng, &hosts);
   int differ = 0;
   int runs = 0;
-  for (int tn : {1, 2}) {
-    for (int layout : {0, 1}) {
+  for (int tn : {1, 2, 4}) {
+    for (int layout : {0, 1, 2}) {
       for (int m : {1, 8}) {
         const unsigned w = SplitWarps(c.k / 16, Blocks(c, tn));
         std::vector<std::vector<float>> single;
@@ -887,7 +923,7 @@ float TimeRead(const Device& d, const Case& c, int reps) {
 
 int Time(int reps) {
   std::mt19937 rng(7);
-  std::printf("case\tk\tn\tK\tM\twarps\ttn\tlayout\tmedian_us\tGB_s\n");
+  std::printf("case\tk\tn\tK\tM\twarps\ttn\tvariant\tmedian_us\tGB_s\n");
   for (const Case& c : TimeCases()) {
     const std::size_t bytes = CaseBytes(c);
     const int copies =
@@ -898,9 +934,9 @@ int Time(int reps) {
     for (unsigned n : c.ns)
       n_total += n;
     for (int m : {1, 2, 4, 8}) {
-      for (int tn : {1, 2}) {
+      for (int tn : {1, 2, 4}) {
         for (unsigned w : {4U, 8U, 16U}) {
-          for (int layout : {0, 1}) {
+          for (int layout : {1, 2}) {
             const float ms = TimeLaunch(c, d, Pick(c.bits, m, w, tn, layout), m,
                                         layout, reps);
             std::printf("%s\t%u\t%u\t%d\t%d\t%u\t%d\t%d\t%.1f\t%.1f\n", c.name,
