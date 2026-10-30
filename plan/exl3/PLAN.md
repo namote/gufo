@@ -90,7 +90,7 @@
 ### F2 Flash-Next EXL3
 
 - **대상:** 전문가(MoE) trellis GEMV와 그룹 GEMM, dense 트렁크, MTP, n-gram 표다.
-- **bpw:** F0의 메모리 점유 측정 뒤에 정한다(사용자 지시 2026-10-30). 전문가 bpw b에 대해 상주 약 14.06·b + 7.6 GiB(F1 계산, F0-M으로 확인).
+- **bpw: 전문가 EXL3 5.0 (사용자 결정 2026-10-30, F0 측정 뒤).** 상주 약 77.9 GiB로 지금(UD-Q4_K_XL 79.3 GiB)과 비슷하다. 품질은 지금보다 높을 것으로 보고(27B 환산), decode 속도는 지금과 비슷하다. KVarN이 있으면 262K MTP 세션 8개가 가능하다. F0 결과: [F1-RESULTS.md](F1-RESULTS.md)(`01cf33e0`), HIP 전체 112 GiB. 직접 양자화하려면 Flash-Next HF safetensors 원본이 필요하다(지금은 BF16 GGUF만 있음). 받을지는 F2 시작 전에 정한다. 전문가 bpw b에 대해 상주 약 14.06·b + 7.6 GiB(F1 계산, F0-M으로 확인).
 - **n-gram 표는 F2 범위에서 뺀다.** 디스크에 있으므로 EXL3로 바꿔도 메모리 이득이 없다.
 - **팩:** turboderp `Qwen3.8-Flash-Next-exl3`(3.05 bpw 등, Qwen Community License)를 먼저 쓴다. 직접 양자화하려면 HF safetensors 원본이 필요한데, 지금 받은 것은 BF16 GGUF다.
 - **통과 기준:** 품질은 gufo 지금 UD-Q4_K_XL 수준 이상이고, 속도는 Kyojin 카드(52.8/47.5/73.2, 8K/32K 52.2/51.1) 이상이다.
