@@ -2,7 +2,7 @@
 
 상위 문서: [XQ 브리프](XQ-BRIEF.md), [PLAN](PLAN.md), [W-COMMON](../rotated-quant/W-COMMON.md), [W8 결과](../rotated-quant/EXL3-RESULTS.md). 이 문서는 XQ가 쓴다.
 
-상태: **1단계(조사)와 2단계(시험 양자화 창 `xq-t01`)가 끝났다.** 결과는 아래 "8. 시험 양자화 결과"에 있다. 3단계(본 양자화)는 계획 `PLAN-XQ-FULL.json`까지 준비했다(9절).
+상태: **1단계(조사)와 2단계(시험 양자화 창 `xq-t01`)가 끝났다.** 결과는 아래 "8. 시험 양자화 결과"에 있다. **3단계(본 양자화)도 끝났다(2026-10-31, 10절).** 팩은 `/run/media/m2on/T5 EVO/AI/model/xq-exl3-20261030/qwen-3.8-27b-exl3-5.00-c02/`에 있고, `check_pack` 네 검사를 모두 통과했다. 4단계(품질 대조)는 감독 허락을 기다린다.
 
 사용자 결정(2026-10-30): **본 양자화는 데스크톱을 쓰지 않는 시간에만 돌린다.** gfx 링 리셋이 데스크톱에 영향을 주기 때문이다. 시작 시각은 감독이 정해 준다.
 
@@ -316,10 +316,69 @@ python3 -I -m exllamav3.conversion.convert_model -w /xq/work/qwen-3.8-27b-exl3-5
   - 시험 작업 디렉터리 `…/windows/xq-t01/receipt/work/`(22.9 GB)는 본 양자화가 끝난 뒤 지운다(감독 승인 2026-10-30).
   - `xq-f1`/`xq-f2`의 작업 디렉터리는 xq-f3이 통과하면 필요 없다. 그래도 지우기 전에 감독에게 묻는다.
 
+## 10. 본 양자화 결과 (2026-10-31 01:55–06:40 KST)
+
+- **창 세 개를 이어서 돌렸다.** 계획은 `PLAN-XQ-FULL.json`이다.
+  - 출발 전에 이미지 태그 `ai-tools/exl3-eval:1.6.5-rocm100`이 바뀌어 있었다. X-A가 같은 이미지를 라벨만 바꿔 다시 빌드해서, 지금은 `sha256:10ccf4b7b405`, 라벨 `f26f800d`다.
+  - `docker history`로 보면 레이어는 시험 이미지 `03a29041b45d`와 같은 2026-10-29 캐시 레이어다. 다른 것은 `GUFO_REVISION` ARG/LABEL뿐이다.
+  - 그래서 계획의 `gufo_revision`을 `f26f800d`로 바꾸고 LOCKS를 다시 만들었다.
+  - 첫 xq-f1 실행은 라벨 검사에서 멈췄다. 컨테이너도 출력도 없었고, 로그는 `xq-f1-preflight-label-mismatch.window.log`로 남겼다.
+
+| 창 | 범위 | wall | 작업 복사 | 상태 | GPU 커널 로그 |
+|---|---|---:|---|---|---|
+| `xq-f1` | 새 작업, 임베딩과 층 0–27 | 6,742 s | — | `FAILED_no_fallback`(health), RESULT COMPLETE, rc 0 | `kwin_wayland` pid 3289의 `gfx_0.0.0` 링 timeout과 reset 두 번(epoch 1793381102, 1793385422). 둘 다 "reset succeeded / recovered through reset" |
+| `xq-f2` | 층 28–55 | 6,909 s | 19.7 GB, 110 s | COMPLETE, health PASS | 오류 없음 |
+| `xq-f3` | 층 56–63, norm, lm_head, MTP, compile, check_pack, provenance | 2,937 s(변환) + 9 s + 288 s | 26.4 GB, 208 s | COMPLETE, health PASS | 오류 없음 |
+
+- **판정:** xq-f1의 health FAILED는 감독이 정한 규칙(9절)에 따라 **"통과(데스크톱 링 리셋 있음)"**으로 본다.
+  - 원인은 compute가 아닌 프로세스(kwin)의 gfx 링 리셋뿐이었다. compute 링과 우리 프로세스는 리셋되지 않았고, 장치는 복구됐다.
+  - 변환기는 rc 0으로 끝났고, check_pack은 4/4 통과했다.
+  - 원 기록은 `…/windows/xq-f1/KERNEL-DELTA-0001.txt`와 `FENCE-*`다.
+- **결정성:** xq-f1의 층 0–1 값(rfn 0.003198/0.002336, sqnr 51.709194/54.507862)이 시험 창과 소수점 끝자리까지 같다.
+- **층별 품질:** sqnr는 층이 깊어질수록 내려간다(층 0 51.7 dB → 층 20 45.3 → 층 27 43.3 → 층 63 40.9). 가장 낮은 것은 층 51의 39.18 dB다.
+  - lm_head(K=6): 565 s, rfn 0.006647, **sqnr 43.24 dB**. #458 증상은 없다.
+  - MTP 1층(K=4, 보정 없음): 48 s
+- **변환 시간 합계:** 16,587 s(4.6 h). 작업 복사 5.3분과 provenance 해시 4.8분은 별도다. 층당 평균은 약 235 s였고, 재개 직후 첫 층만 약 350 s였다(캐시가 차 있지 않은 상태로 보인다[짐작]).
+- **메모리 최대:**
+  - 층 단계: 변환기 RSS 18.5 GB, GTT 14.9 GB
+  - lm_head 단계(xq-f3): **RSS 36.4 GB, GTT 38.2 GB**, cgroup peak 79.7 GB(페이지 캐시 포함)
+  - 호스트 가용은 창마다 시작 때 111 GB였다.
+- **check_pack** `…/windows/xq-f3/receipt/run/check-pack.json`: **PASS**
+  - headers: 텐서 2,426개(그룹 239)가 turboderp 5.00과 dtype, 모양이 모두 같다.
+  - out_scales: 409/409. turboderp와 같이 모두 출력 스케일이 있다. 재개 오염은 없다.
+  - config: `{"quant_method": "exl3", "version": "1.6.5", "bits": 5.0, "head_bits": 6, "calibration": {"rows": 250, "cols": 2048}, "out_scales": "always", "codebook": "mul1", "mtp_bits": 4}`
+  - sqnr: lm_head 43.24 dB. 10 dB 아래인 모듈은 없다(65개 중 최소는 층 51의 39.18 dB).
+- **팩:** `/run/media/m2on/T5 EVO/AI/model/xq-exl3-20261030/qwen-3.8-27b-exl3-5.00-c02/`(19 GB, 파일 20개)
+  - xq-f3 receipt/out에서 같은 디스크 안에서 rename으로 옮겼다.
+  - 샤드 세 개의 바이트 크기는 turboderp 5.00과 같다(8,509,808,537 / 8,589,756,567 / 2,802,114,925).
+  - sha256 앞 12자리: `334301cf5e9c`, `176a9b9e2fea`, `f4c4bf536b15`(전체 값은 PROVENANCE.json)
+  - `PROVENANCE.json`에 원본 파일 33개의 sha256, 보정 파일, 세 실행의 argv/env/버전(exllamav3 1.6.5+rocm10.0.torch2.13.0, torch 2.13.0+rocm10.0.0, HIP 7.15.26333, gfx1151)/peak, 이미지 wheel 목록이 있다. `CALIBRATION.json`도 함께 있다.
+  - PROVENANCE의 `output.dir`은 옮기기 전 경로(`/receipt/out`)로 적혀 있다.
+- **정리:**
+  - 시험 작업 디렉터리 `…/windows/xq-t01/receipt/work/`(22.9 GB)는 지웠다(감독 승인).
+  - 남은 작업 디렉터리: xq-f1 29 GB, xq-f2 35 GB, xq-f3 33 GB, 합계 97 GB. 팩이 완성됐으니 필요 없지만, 지우기 전에 감독에게 묻는다.
+  - 외장 가용은 326 GB다.
+
+## 11. 품질 대조 계획 (4단계, 감독 허락 필요)
+
+- **수집기:** W8과 같은 `tools/qwen27b/rq_quality/exl3/collect.py`를 쓴다(마지막 변경 `43425c9f`, 이후 바뀌지 않음). 이미지는 같은 레이어다(라벨 `f26f800d`).
+- **코퍼스와 기준:** R0와 같다. a01 8창, prefill 32,760 위치와 decode 4,096 위치(prefix 2048, 창마다 512)를 gufo BF16 `rq0-bf16`에 대고 잰다. 같은 위치를 EXL3-BF16 대조(`w8q-bf16`)에도 대고 잰다.
+- **창 하나 `PLAN-XQ-QUALITY.json`(약 25–30분):**
+  1. `xq-5.00-c02`: 우리 팩의 prefill(약 210 s)과 decode(약 390 s)
+  2. `td5-rerun`: turboderp 5.00을 같은 창에서 prefill과 decode로 다시 잰다. W8의 `w8q-a01/w8q-5.00` 기록과 레코드가 같은지 보는 재현 확인이고, 같은 조건의 paired 대조군이다.
+- **지표**(`metrics.py score/compare`, CPU, 창 뒤):
+  - KL(토큰과 블록 95 % 구간), ΔNLL, top-1, 뒤집힘(KL > 1 포함), 위치별 NLL 꼬리, 카테고리별(en_prose, ko_prose, code, chat 등)
+  - 우리 팩과 turboderp는 같은 위치에서 paired 차이를 낸다. 판정은 "같거나 낫다"가 신뢰구간으로 보이는지다.
+  - KL_256이 복사 실패를 숨길 수 있으므로(W8 3.50) ΔNLL과 꼬리를 반드시 같이 본다.
+- **나쁘게 나오면 볼 원인 후보:**
+  - 보정 데이터(c02의 en_tool 비중 36 %, 한국어 20 %)
+  - 도구 버전(1.4.2 → 1.6.5). 분리하려면 1.6.5 + 내장 코퍼스로 다시 양자화하는 선택 대조가 필요하다(약 4.6 h).
+  - 카테고리별 결과로 어느 쪽인지 좁힌다.
+
 ## 남은 문제와 위험
 
 - gfx1151에서 층 0–3 변환은 동작했다(8절). 다만 같은 창에서 compositor(`kwin_wayland`)의 gfx 링이 두 번 timeout으로 리셋됐다. 본 양자화 중에 이 일이 반복될지, window.py의 health 판정을 어떻게 볼지는 감독이 정한다.
-- lm_head(hipBLASLt #458 경로)는 아직 확인하지 않았다. 본 양자화에서 sqnr가 10 dB 아래면 실패로 본다.
+- lm_head(hipBLASLt #458 경로)는 본 양자화에서 sqnr 43.24 dB로 정상이었다(10절).
 - turboderp 팩(1.4.2)과 우리 팩(1.6.5)은 도구 버전이 다르다. 품질 차이를 보정 데이터 때문이라고 단정하려면 위 선택 대조가 필요하다.
 - 상태 크기는 체크포인트 9.8 GB로 확인했다(fp32 250 × 2048 × 5120 = 10.5 GB, 즉 9.8 GiB).
 - `run_convert.py`의 버전 조회가 비어 있었다. `exllamav3.__version__`이 없어서다. 그래서 `importlib.metadata`로 고쳤다. 이번 창의 버전은 이미지 provenance(v1.6.5 wheel)로 확인한다.
