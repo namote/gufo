@@ -217,6 +217,22 @@ cold는 새 프로세스의 첫 요청(빈 행 캐시), warm은 같은 요청의
 - **inconclusive 1건:** MTP A `repetition_sequence` decode다. BASE 1,583–2,183 ms(중앙값 1,666), CAND 1,587–2,300 ms(중앙값 1,828)이다. 두 팔 모두 1.6 s대와 2.0–2.3 s대로 갈리는 쌍봉이고, 범위가 겹친다. 규칙대로 확대하거나 평균 내지 않고 inconclusive로 둔다. 확인하려면 이 history만 번갈아 다시 돌린다(감독 결정).
 - **slower 판정은 0건이다.** decode tok/s 비율 0.990–1.000은 참고값이다(판정은 요청별).
 
+## P1 inconclusive 재측정: `repetition_sequence` (2026-10-31 01:35–01:48) [확인]
+
+- **실행:** `PLAN-F1-REP-{BASE,CAND}.json`, 순서 B C C B B C C B, 창 8개 모두 COMPLETE, 재시도 없음.
+  - 창마다 `docker ps`가 비고 1분 load < 2가 될 때까지 기다렸다(실제 0.18–1.86). 158 GiB, LOCKS 일치.
+  - 요청은 ABBA와 같고, warmup 1 + 반복 5라 팔마다 20표본이다.
+- **판정**(`abba.py`, 출력 `storage/evaluations/f1-abba-20261031/rep-repetition_sequence.json`, sha256 `71de0a57…`):
+
+| 단계 | 판정 | BASE 중앙값 | CAND 중앙값 | 차이 | 기준 |
+|---|---|---:|---:|---:|---:|
+| prefill | pass | 145.6 ms | 146.0 ms | +0.3 ms | 10 ms |
+| decode | **pass** | 1,578.8 ms | 1,585.0 ms | +6.2 ms (0.4 %) | 78.9 ms |
+
+- 두 팔 모두 20개 중 4개가 1.67–1.88 s의 느린 표본이다(BASE 1,716–1,883, CAND 1,670–1,783). ABBA에서 보인 쌍봉은 두 팔에 공통인 잡음이다.
+- 완성 sha256(`2a606f9f…`)과 draft 110 / accepted 92가 REP 8회와 ABBA 4회에서 모두 같다.
+- **결론: P1 ABBA의 inconclusive가 해소되었다. P1 타이밍은 slower 0, inconclusive 0이다.**
+
 ## KVarN K1a / K1b (2026-10-31, 설계 [F1-KVARN-DESIGN.md](F1-KVARN-DESIGN.md), 감독 승인)
 
 - **커밋(브랜치 `ai-tools/f1-paged-kv`):**
