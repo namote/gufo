@@ -276,7 +276,7 @@ struct DeviceLinear {                 // one EXL3 projection y = x W, W [k][n]
 
 ### X2a 품질 창 준비 (2026-10-31)
 
-- 수집기 `dc8863627a9e…`(`build/xa-q-gpu-test`, HEAD `316b9f64`, W3 `c0da594e`/`c90bedea` 포함)를 쓴다. 자세한 내용은 R0-RESULTS 같은 절에 있다.
+- 수집기 `e49424919532…`(`build/xa-q-gpu-test`, HEAD `30f32907`, W3 stage 2/3a/3b 포함)를 쓴다. 처음 빌드한 `dc886362…`(316b9f64)는 대체됐다. 자세한 내용은 R0-RESULTS 같은 절에 있다.
 - 사이드카:
   - `gufo.gguf`(sha256 `28fbeb69…`, 두 팩이 같다)를 BF16 shard 1 템플릿으로 다시 써서 byte-equal을 확인했다.
   - `gufo-bf16emb.gguf`(sha256 `cb044d6c…`, 49키, `gufo.exl3.embedding="bf16"`)는 `metadata --bf16-embedding`(316b9f64)으로 썼다.

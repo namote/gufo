@@ -435,6 +435,9 @@ paired 비교(같은 64개 프롬프트, 95 % 구간):
   - 소스는 `build/xa-q-src`다. `git archive` HEAD `316b9f64`이고, 기록은 `build/xa-q-src.provenance`에 있다. 수집기 소스는 바꾸지 않았다(`32d5d562`와 같다).
   - `qwen27b_rq_logits` sha256 `dc8863627a9ed9796da2507b7f5ed0c0c40ba6c1d1969680525aca86da16e35a`
   - `qwen27b_target_test` sha256 `ef004a3c09b45b832f1f577735f9ed7ee0e8d13f55a8863b93a3f0455b9e256b`
-- **GGUF 경로 동일성:** `PLAN-EXL3-X2AQ.json`의 4.00 창에서 확인한다(실행 전).
+- **다시 빌드(2026-10-31 06:49):** HEAD `30f32907`에서 다시 빌드했다. 감독 요청으로 W3 stage 3b `0c09450c`를 넣었고, 위 바이너리는 대체됐다.
+  - `qwen27b_rq_logits` sha256 `e49424919532d8a8025708dd49a6b4137418b3d1264e2726199722db26b24cbd`
+  - `qwen27b_target_test` sha256 `f112de3ad1bb2e6909c4e112591f331fb91786202ae4c7d3faf589b43fb9e9b5`
+- **GGUF 경로 동일성:** `PLAN-EXL3-X2AQ.json`의 4.00 창에서 확인한다.
   - BF16 prefill 창 0을 `rq0-a01`과 `logits_io.py same`으로 대조한다.
   - UD-Q4_K_M fingerprints를 rq2h와 대조한다.
