@@ -742,31 +742,30 @@ int CheckSingles(std::mt19937& rng) {
     const unsigned n = c.ns[0];
     const std::vector<double> ref = Reference(c.k, n, c.bits, hosts[0], 8);
     const unsigned k_tiles = c.k / 16;
-    std::vector<float> rows1(static_cast<std::size_t>(8) * n);
-    {
-      const unsigned w = SplitWarps(k_tiles, Blocks(c, 1));
+    // The split-K warp count sets the summation order, so the M = 1
+    // baseline is taken per N tiles per wave (each picks its own count).
+    double rel = 0.0;
+    int differ = 0;
+    int runs = 0;
+    for (int tn : {1, 2}) {
+      const unsigned w = SplitWarps(k_tiles, Blocks(c, tn));
+      std::vector<float> rows1(static_cast<std::size_t>(8) * n);
       for (int r = 0; r < 8; ++r) {
         GemvArgs args = Args(c, d, 0, 1, 0);
         args.slot[0].a = d.slots[0].a_row + static_cast<std::size_t>(r) * c.k;
-        Pick(c.bits, 1, w, 1, 0)(args, nullptr);
+        Pick(c.bits, 1, w, tn, 0)(args, nullptr);
         const std::vector<float> y = ReadY(d.slots[0], n, 1);
         std::copy(y.begin(), y.end(),
                   rows1.begin() + static_cast<std::ptrdiff_t>(r) * n);
       }
-    }
-    double num = 0.0;
-    double den = 0.0;
-    for (std::size_t i = 0; i < rows1.size(); ++i) {
-      num += (rows1[i] - ref[i]) * (rows1[i] - ref[i]);
-      den += ref[i] * ref[i];
-    }
-    const double rel = std::sqrt(num / den);
-    failures += !(rel < 1e-5);
-    int differ = 0;
-    int runs = 0;
-    for (int tn : {1, 2}) {
+      double num = 0.0;
+      double den = 0.0;
+      for (std::size_t i = 0; i < rows1.size(); ++i) {
+        num += (rows1[i] - ref[i]) * (rows1[i] - ref[i]);
+        den += ref[i] * ref[i];
+      }
+      rel = std::max(rel, std::sqrt(num / den));
       for (int layout : {0, 1}) {
-        const unsigned w = SplitWarps(k_tiles, Blocks(c, tn));
         for (int m : {1, 2, 4, 8}) {
           Pick(c.bits, m, w, tn, layout)(Args(c, d, 0, m, layout), nullptr);
           const std::vector<float> got = ReadY(d.slots[0], n, m);
@@ -775,10 +774,11 @@ int CheckSingles(std::mt19937& rng) {
         }
       }
     }
+    failures += !(rel < 1e-5);
     failures += differ != 0;
     std::printf(
-        "check %s K=%d: rel L2 vs FP64 %.3e; %d/%d (tn, layout, M) runs "
-        "differ from M=1 row-major\n",
+        "check %s K=%d: max rel L2 vs FP64 %.3e; %d/%d (tn, layout, M) "
+        "runs differ from M=1 row-major of the same tn\n",
         c.name, c.bits, rel, differ, runs);
     Free(d);
   }
