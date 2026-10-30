@@ -44,6 +44,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/core/json.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/hip/exl3_dispatch.hpp"
 #include "src/models/qwen/hip/output_head.hpp"
 
 namespace json = gufo::json;
@@ -267,11 +268,24 @@ public:
     HipCheck(hipMalloc(&d_hidden_, hidden * sizeof(float)), "hipMalloc");
     HipCheck(hipMalloc(&d_normed_, hidden * sizeof(float)), "hipMalloc");
     HipCheck(hipMalloc(&d_logits_, vocab * sizeof(float)), "hipMalloc");
+    // An EXL3 head (gufo.gguf sidecar) needs a projection workspace, sized
+    // like the DFlash2 executor's; GGUF heads keep the null workspace.
+    if (gufo::hip::IsExl3(weights.output)) {
+      exl3_.rotated_elements = hidden;
+      exl3_.weight_elements = std::size_t{64} << 20U;
+      HipCheck(
+          hipMalloc(&exl3_.rotated, exl3_.rotated_elements * sizeof(float)),
+          "hipMalloc");
+      HipCheck(hipMalloc(&exl3_.weight, exl3_.weight_elements * sizeof(float)),
+               "hipMalloc");
+    }
   }
   ~Head() {
     (void)hipFree(d_hidden_);
     (void)hipFree(d_normed_);
     (void)hipFree(d_logits_);
+    (void)hipFree(exl3_.rotated);
+    (void)hipFree(exl3_.weight);
     (void)hipStreamDestroy(stream_);
   }
   Head(const Head&) = delete;
@@ -284,7 +298,8 @@ public:
                        hipMemcpyHostToDevice, stream_),
         "upload hidden");
     gufo::hip::LaunchQwenOutputHead(weights_, d_hidden_, d_normed_, d_logits_,
-                                    stream_);
+                                    stream_,
+                                    exl3_.weight != nullptr ? &exl3_ : nullptr);
     HipCheck(hipMemcpyAsync(logits_.data(), d_logits_, vocab_ * sizeof(float),
                             hipMemcpyDeviceToHost, stream_),
              "download logits");
@@ -300,6 +315,7 @@ private:
   float* d_hidden_{nullptr};
   float* d_normed_{nullptr};
   float* d_logits_{nullptr};
+  gufo::quant::exl3::ReferenceScratch exl3_{};
 };
 
 struct DeviceMemory {

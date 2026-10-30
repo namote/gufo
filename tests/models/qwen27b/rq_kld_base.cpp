@@ -33,6 +33,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/core/json.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/hip/exl3_dispatch.hpp"
 #include "src/models/qwen/hip/output_head.hpp"
 
 namespace json = gufo::json;
@@ -207,6 +208,17 @@ int main(int argc, char** argv) {
     HipCheck(hipMalloc(&d_hidden, hidden * sizeof(float)), "hipMalloc");
     HipCheck(hipMalloc(&d_normed, hidden * sizeof(float)), "hipMalloc");
     HipCheck(hipMalloc(&d_logits, n_vocab * sizeof(float)), "hipMalloc");
+    // An EXL3 head (gufo.gguf sidecar) needs a projection workspace, sized
+    // like the DFlash2 executor's; GGUF heads keep the null workspace.
+    gufo::quant::exl3::ReferenceScratch exl3{};
+    if (gufo::hip::IsExl3(model->GetWeights().output)) {
+      exl3.rotated_elements = hidden;
+      exl3.weight_elements = std::size_t{64} << 20U;
+      HipCheck(hipMalloc(&exl3.rotated, exl3.rotated_elements * sizeof(float)),
+               "hipMalloc");
+      HipCheck(hipMalloc(&exl3.weight, exl3.weight_elements * sizeof(float)),
+               "hipMalloc");
+    }
     std::vector<float> logits(n_vocab);
     std::vector<std::uint16_t> row(RowWidth(n_vocab));
 
@@ -239,8 +251,9 @@ int main(int argc, char** argv) {
                                 hidden * sizeof(float), hipMemcpyHostToDevice,
                                 stream),
                  "upload hidden");
-        gufo::hip::LaunchQwenOutputHead(model->GetWeights(), d_hidden, d_normed,
-                                        d_logits, stream);
+        gufo::hip::LaunchQwenOutputHead(
+            model->GetWeights(), d_hidden, d_normed, d_logits, stream,
+            exl3.weight != nullptr ? &exl3 : nullptr);
         HipCheck(
             hipMemcpyAsync(logits.data(), d_logits, n_vocab * sizeof(float),
                            hipMemcpyDeviceToHost, stream),
@@ -263,6 +276,8 @@ int main(int argc, char** argv) {
     (void)hipFree(d_hidden);
     (void)hipFree(d_normed);
     (void)hipFree(d_logits);
+    (void)hipFree(exl3.rotated);
+    (void)hipFree(exl3.weight);
     (void)hipStreamDestroy(stream);
     std::cout << "RESULT rq_kld_base chunks=" << chunks << " n_ctx=" << n_ctx
               << " head_replay_checks=" << checks
