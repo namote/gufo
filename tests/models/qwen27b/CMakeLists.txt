@@ -30,6 +30,11 @@ add_test(NAME qwen27b.kvarn-reference COMMAND ${Python3_EXECUTABLE}
   $<TARGET_FILE:qwen27b_kvarn_fake_quant>)
 set_tests_properties(qwen27b.kvarn-reference PROPERTIES
   LABELS "cpu;qwen27b;tools" SKIP_RETURN_CODE 77)
+# X1 EXL3 correctness path: qwen35 GGUF tensors from an EXL3 checkpoint
+# (compare against the BF16 GGUF, or write a BF16 GGUF); needs the
+# checkpoints, so no CTest.
+add_executable(qwen27b_exl3_to_gguf EXCLUDE_FROM_ALL exl3_to_gguf.cpp)
+target_link_libraries(qwen27b_exl3_to_gguf PRIVATE gufo_core)
 if (ENGINE_ENABLE_HIP)
   # KVarN K0 accuracy study; needs a model and prompt files, so no CTest.
   add_executable(qwen27b_kvarn_k0 kvarn_k0.cpp)

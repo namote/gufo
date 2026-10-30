@@ -7,6 +7,7 @@ target_sources(gufo_core PRIVATE
   ${PROJECT_SOURCE_DIR}/src/models/qwen/oracles.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/state.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/weights.cpp
+  ${PROJECT_SOURCE_DIR}/src/models/qwen/exl3_weights.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/ssm.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/forward.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/modules/attention.cpp
