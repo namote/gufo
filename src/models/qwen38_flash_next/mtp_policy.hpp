@@ -212,10 +212,12 @@ private:
 /// Single-session greedy chain length by draft confidence (TierRule of
 /// Yamz-Labs/kyojin tools/qwen/spec_policy.py at 2132bd24, MIT): the reach is
 /// the product of the drafts' probabilities. The first three depths continue
-/// while it is at least 0.6 and keep a draft at 0.3; deeper drafts need 0.95
-/// and 0.85. The first draft is always kept. A dropped draft was computed but
-/// is not verified. Offline replay of the M0 serving prompts (plan W9 M1)
-/// models +9 % decode over choosing the length before drafting.
+/// while it is at least 0.6 and keep a draft at 0.3 (Kyojin's values); deeper
+/// drafts continue at 0.9 and are kept at 0.4. Kyojin's 0.95 / 0.85 cut a
+/// long code answer's accepted chains short (plan W9 I1 ABBA: 8 % slower).
+/// The first draft is always kept. A dropped draft was computed but is not
+/// verified. Offline replay of the W9 serving prompts models +9 % decode over
+/// choosing the length before drafting.
 struct MtpDraftStep {
   bool keep;  ///< verify this draft
   bool more;  ///< draft another one after it
@@ -224,8 +226,8 @@ class MtpConfidenceRule {
 public:
   static constexpr double kContinue = 0.6;
   static constexpr double kKeep = 0.3;
-  static constexpr double kDeepContinue = 0.95;
-  static constexpr double kDeepKeep = 0.85;
+  static constexpr double kDeepContinue = 0.9;
+  static constexpr double kDeepKeep = 0.4;
   static constexpr std::uint32_t kShallowDepths = 3;
 
   /// `depth` counts drafts from 0; `probability` is DraftConfidence.

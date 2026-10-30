@@ -1042,11 +1042,15 @@ bool Session::PrepareDecode(const DecodeRequest& request,
       sampler.config().uses_random_sampling(), sampler.config().seed >= 0,
       batch_drafts.has_value(), occupancy);
   // A lone greedy request on a single-session model stops its chain by draft
-  // confidence (MtpConfidenceRule). The length controller still observes
-  // every cycle and decides its AR backoff; its chosen width is not used.
+  // confidence (MtpConfidenceRule) once the request has observed acceptance.
+  // Until then the length controller's conservative first width applies, as
+  // for every other request: widening a short reply's first cycle slowed it.
+  // The controller observes every cycle and decides its AR backoff; after the
+  // first observation its chosen width is not used.
   const bool confidence_rule = !sampler.config().uses_random_sampling() &&
                                !batch_drafts && !defer_head && occupancy == 1 &&
-                               model_->DecodeConcurrency() == 1;
+                               model_->DecodeConcurrency() == 1 &&
+                               draft_length_.State().explored_depth != 0;
   const auto choose = [&] {
     const auto chosen =
         draft_length_.Choose(static_cast<std::uint32_t>(cap - 1),

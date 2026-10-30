@@ -269,9 +269,10 @@ class TierPolicy(Policy):
 
 
 class TierBackoffPolicy(TierPolicy):
-    """I1 (engine.cpp PrepareDecode, C1 greedy): TierRule chains, while the production length controller still observes
-    every cycle and keeps its AR backoff (a zero Choose means an AR step); its chosen width is not used."""
-    name = "I1-tier-backoff"
+    """I1a (f1cf33ac, W9 I1V and the first ABBA): TierRule chains with Kyojin's thresholds, while the production length
+    controller still observes every cycle and keeps its AR backoff (a zero Choose means an AR step); its chosen width
+    is not used."""
+    name = "I1a-tier-backoff"
 
     def width(self, budget, context):
         chosen = self.ctl.choose(budget, context)
@@ -282,6 +283,27 @@ class TierBackoffPolicy(TierPolicy):
 
     def observe_ar(self):
         self.ctl.observe_ar()
+
+
+class ConfidencePolicy(TierBackoffPolicy):
+    """I1 (engine.cpp PrepareDecode, C1 greedy, after the first ABBA): like I1a, but a request's cycles keep the
+    production controller's width and full chain until it has observed acceptance (explored depth 0), and deep drafts
+    continue at 0.9 and are kept at 0.4 (shallow 0.6 / 0.3 / 3 stay Kyojin's)."""
+    name = "I1-confidence"
+
+    def __init__(self):
+        super().__init__(0.6, 0.3, 0.9, 0.4, 3)
+        self.first = False
+
+    def width(self, budget, context):
+        chosen = self.ctl.choose(budget, context)
+        self.first = self.ctl.explored == 0
+        if not chosen:
+            return 0
+        return chosen if self.first else min(budget, self.ctl.limit)
+
+    def keep_drafting(self, depth, chain):
+        return (True, True) if self.first else super().keep_drafting(depth, chain)
 
 
 class CostConfidencePolicy(Policy):
@@ -471,7 +493,7 @@ def run(cases, header, policy_factory) -> dict:
     return {c["case"]: simulate(c, stops, policy_factory(), header["max_tokens"]) for c in cases}
 
 
-POLICIES = {"P0": Policy, "I1": TierBackoffPolicy}
+POLICIES = {"P0": Policy, "I1a": TierBackoffPolicy, "I1": ConfidencePolicy}
 
 
 def validate(trace: Path, pairs: list, policy: str = "P0") -> dict:
@@ -499,7 +521,7 @@ def validate(trace: Path, pairs: list, policy: str = "P0") -> dict:
 
 def compare(trace: Path) -> dict:
     header, cases = load_trace(trace)
-    policies = [Policy, TierPolicy, TierBackoffPolicy, CostConfidencePolicy, OraclePolicy]
+    policies = [Policy, TierPolicy, TierBackoffPolicy, ConfidencePolicy, CostConfidencePolicy, OraclePolicy]
     out = {"note": "modeled time from the C1 cycle-cost table (mtp_costs.hpp); a dropped draft adds 2 ms",
            "policies": {}}
     for factory in policies:
@@ -530,7 +552,7 @@ def main(argv=None) -> int:
     v.add_argument("--suite", type=Path, action="append", required=True)
     v.add_argument("--out", type=Path)
     v.add_argument("--policy", choices=sorted(POLICIES), default="P0",
-                   help="policy the server ran (P0: c94572b3 controller, I1: confidence rule)")
+                   help="policy the server ran (P0: c94572b3 controller, I1a: f1cf33ac, I1: current confidence rule)")
     c = sub.add_parser("compare")
     c.add_argument("trace", type=Path)
     c.add_argument("--out", type=Path)

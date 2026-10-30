@@ -484,8 +484,9 @@ void CheckVerificationBoundaries() {
 }
 
 void CheckConfidenceRule() {
-  // Kyojin TierRule: three shallow depths continue at 0.6 and keep at 0.3,
-  // deeper ones 0.95 / 0.85; the first draft is always kept.
+  // Three shallow depths continue at 0.6 and keep at 0.3 (Kyojin TierRule),
+  // deeper ones continue at 0.9 and keep at 0.4; the first draft is always
+  // kept.
   using Rule = qfn::MtpConfidenceRule;
   const auto run = [](std::initializer_list<double> probabilities) {
     Rule rule;
@@ -506,13 +507,15 @@ void CheckConfidenceRule() {
   Require(run({0.9, 0.5, 0.9}) == 2,
           "reach 0.45 keeps the second draft and stops drafting");
   Require(run({0.9, 0.3, 0.9}) == 1, "reach 0.27 must drop the second draft");
-  // 0.99^5 = 0.951 continues; 0.99^6 = 0.941 is kept but stops the chain.
-  Require(run({0.99, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99}) == 6,
-          "deep drafts need reach 0.95 to continue");
+  // 0.99^7 = 0.932 still continues past 0.9: the whole chain is drafted.
+  Require(run({0.99, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99}) == 7,
+          "deep drafts continue at reach 0.9");
+  Require(run({1.0, 1.0, 1.0, 0.85, 1.0}) == 4,
+          "a deep reach below 0.9 keeps the draft and stops");
   Require(run({1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0}) == 7,
           "certain drafts fill the chain");
-  Require(run({1.0, 1.0, 1.0, 0.9}) == 4 && run({1.0, 1.0, 1.0, 0.8}) == 3,
-          "a fourth draft is kept at reach 0.85");
+  Require(run({1.0, 1.0, 1.0, 0.4}) == 4 && run({1.0, 1.0, 1.0, 0.3}) == 3,
+          "a fourth draft is kept at reach 0.4");
   Require(run({-1.0, 1.0}) == 1, "an unscored first draft stops the chain");
 
   qfn::MtpCandidateLogits c;

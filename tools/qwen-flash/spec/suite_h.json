@@ -1,0 +1,223 @@
+{
+ "schema": "gufo.speculative-corpus.v1",
+ "version": "w9-heldout-1",
+ "note": "W9 held-out prompts (supervisor 2026-10-30): 32 prompts written for W9 after the confidence-rule thresholds were chosen, never used for tuning. 8 categories x (2 English + 2 Korean). Overlap with the tuning suites (accept_prompts.json, suite_k.json, suite_d.json) is recorded in manifest.overlap by tools/qwen-flash/spec/check_heldout.py.",
+ "prompts": [
+  {
+   "id": "h_explain_en_1",
+   "category": "explain",
+   "text": "Explain how a refrigerator moves heat from its cold interior to the warmer kitchen, covering the compressor, condenser, expansion valve and evaporator in order.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_explain_en_2",
+   "category": "explain",
+   "text": "Why do airplanes cruise at around ten kilometres of altitude instead of much lower or much higher? Discuss air density, engine efficiency and weather.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_explain_ko_1",
+   "category": "explain",
+   "text": "전기차 배터리가 겨울철에 주행 거리가 줄어드는 이유를 화학 반응, 난방 에너지, 회생 제동의 관점에서 자세히 설명해 주세요.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_explain_ko_2",
+   "category": "explain",
+   "text": "중앙은행이 기준금리를 올리면 대출 이자, 환율, 주식 시장에 각각 어떤 경로로 영향이 가는지 단계적으로 설명해 주세요.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_story_en_1",
+   "category": "story",
+   "text": "Write a short story about a night-shift baker who finds an unsigned thank-you note taped to the shop door every morning for a week.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_story_en_2",
+   "category": "story",
+   "text": "Write a short story told from the point of view of an old wooden bridge that is about to be replaced by a concrete one.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_story_ko_1",
+   "category": "story",
+   "text": "폭설로 산장에 고립된 등산객 세 사람이 정전된 밤을 보내며 서로의 비밀을 하나씩 털어놓는 짧은 이야기를 써 주세요.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_story_ko_2",
+   "category": "story",
+   "text": "은퇴를 하루 앞둔 시골 우체부가 마지막 배달 길에 만나는 사람들에 대한 따뜻한 단편 소설을 써 주세요.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_code_en_1",
+   "category": "code",
+   "text": "Write a Python function that merges overlapping intervals given as a list of (start, end) tuples and returns them sorted, with a few pytest test cases.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_code_en_2",
+   "category": "code",
+   "text": "Write a TypeScript function that debounces another function, supporting a leading-edge option and a cancel method, and show a short usage example.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_code_ko_1",
+   "category": "code",
+   "text": "주어진 문자열에서 가장 긴 회문 부분 문자열을 찾는 Go 함수를 작성하고, 시간 복잡도를 한국어 주석으로 설명해 주세요.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_code_ko_2",
+   "category": "code",
+   "text": "SQLite 데이터베이스에서 월별 매출 합계를 구하는 SQL 쿼리와, 그 쿼리를 실행해 결과를 출력하는 짧은 Python 스크립트를 작성해 주세요.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_howto_en_1",
+   "category": "howto",
+   "text": "Give step-by-step instructions for replacing a bicycle inner tube on the road, including what tools to carry and how to find the puncture.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_howto_en_2",
+   "category": "howto",
+   "text": "Describe how to set up a weekly backup of a home photo folder to an external drive on Linux using rsync and a systemd timer.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_howto_ko_1",
+   "category": "howto",
+   "text": "처음 김치를 담그는 사람을 위해 배추 절이기부터 양념 만들기, 보관까지의 과정을 순서대로 안내해 주세요.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_howto_ko_2",
+   "category": "howto",
+   "text": "회사에서 처음으로 발표를 맡은 신입 사원이 일주일 동안 준비하는 방법을 날짜별 계획으로 정리해 주세요.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_summary_en_1",
+   "category": "summary",
+   "text": "Summarize the following in three bullet points:\n\nThe city council voted on Tuesday to convert two downtown parking garages into mixed-use buildings with ground-floor shops and affordable apartments above. Supporters argued the garages were rarely more than half full since the new tram line opened, while opponents worried about delivery access for nearby restaurants. The plan includes a loading zone on each block and a review after two years.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_summary_en_2",
+   "category": "summary",
+   "text": "Summarize this support ticket for an engineer in two sentences:\n\nCustomer reports that the mobile app logs them out roughly every ten minutes since Monday's update. It happens on both Wi-Fi and cellular. Reinstalling did not help. Their colleague on an older phone does not see the problem. They need a fix before the end-of-month reporting deadline.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_summary_ko_1",
+   "category": "summary",
+   "text": "다음 글을 세 문장으로 요약해 주세요:\n\n지역 도서관은 다음 달부터 평일 운영 시간을 밤 10시까지 연장한다고 밝혔다. 직장인 이용자들의 요청이 꾸준히 늘었고, 시험 기간에는 열람실 좌석이 부족했기 때문이다. 대신 월요일 오전에는 서가 정리를 위해 문을 닫으며, 연장 운영의 효과는 6개월 뒤 이용 통계를 보고 다시 판단할 예정이다.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_summary_ko_2",
+   "category": "summary",
+   "text": "다음 회의 내용을 결정 사항과 할 일로 나누어 정리해 주세요:\n\n신제품 출시는 디자인 수정 때문에 2주 미루기로 했다. 마케팅팀은 새 일정에 맞춰 광고 소재를 다시 준비하고, 개발팀은 다음 주 금요일까지 결제 오류를 고친다. 고객 지원팀은 출시 지연 안내 문구를 작성해 내일까지 공유하기로 했다.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_reason_en_1",
+   "category": "reasoning",
+   "text": "A train leaves at 9:40 and travels 210 km at an average of 84 km/h, then waits 15 minutes and travels another 96 km at 72 km/h. When does it arrive? Show your reasoning.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_reason_en_2",
+   "category": "reasoning",
+   "text": "Four friends each ordered a different drink: tea, coffee, juice and water. Ana did not order a hot drink. Ben ordered coffee. Chloe did not order water. Who ordered what? Explain each step.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_reason_ko_1",
+   "category": "reasoning",
+   "text": "어떤 상품을 정가에서 20% 할인한 뒤 다시 10% 할인했더니 21,600원이 되었습니다. 정가는 얼마이며, 두 번 할인한 것이 한 번에 30% 할인한 것과 왜 다른지 설명해 주세요.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_reason_ko_2",
+   "category": "reasoning",
+   "text": "물 탱크에 A 관만 열면 6시간, B 관만 열면 9시간 만에 가득 찹니다. 두 관을 함께 열면 몇 시간이 걸리는지 풀이 과정을 단계별로 보여 주세요.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_struct_en_1",
+   "category": "structured",
+   "text": "Return a JSON array of five fictional library books, each with title, author, year, genre and a boolean available field. Output only the JSON.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_struct_en_2",
+   "category": "structured",
+   "text": "Create a Markdown table comparing three home coffee brewing methods (French press, pour-over, moka pot) by brew time, grind size, strength and cleanup effort.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_struct_ko_1",
+   "category": "structured",
+   "text": "서울, 부산, 제주의 여름 여행 정보를 도시 이름, 추천 장소 두 곳, 평균 기온, 이동 수단을 키로 가지는 JSON 객체 배열로만 출력해 주세요.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_struct_ko_2",
+   "category": "structured",
+   "text": "주간 운동 계획을 요일, 운동 종류, 시간(분), 강도 열을 가진 마크다운 표로 만들어 주세요. 월요일부터 일요일까지 모두 채워 주세요.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_rewrite_en_1",
+   "category": "rewrite",
+   "text": "Rewrite this email to sound polite but firm, keeping every fact:\n\nHey, the invoice from March still isn't paid. We sent it twice. If it's not paid by Friday we'll stop the service. Let us know.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_rewrite_en_2",
+   "category": "rewrite",
+   "text": "Correct the grammar and spelling in this paragraph and return the corrected text only:\n\nThe team have decide to moved the meeting to thursday because several member was traveling, and the room we booked were also not avalable on wednesday.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_rewrite_ko_1",
+   "category": "rewrite",
+   "text": "다음 문장을 공손한 존댓말 안내문으로 바꿔 주세요. 내용은 그대로 유지해 주세요:\n\n내일 오전 9시부터 12시까지 엘리베이터 점검함. 그동안 계단 써야 함. 짐 많은 사람은 미리 옮겨 둘 것.",
+   "source": "W9-authored"
+  },
+  {
+   "id": "h_rewrite_ko_2",
+   "category": "rewrite",
+   "text": "다음 한국어 문단을 영어로 자연스럽게 번역해 주세요:\n\n이번 주말에는 비가 많이 온다고 해서 캠핑 계획을 다음 달로 미뤘다. 대신 집에서 오래 미뤄 둔 책을 읽고, 친구들과 저녁을 함께 하기로 했다.",
+   "source": "W9-authored"
+  }
+ ],
+ "manifest": {
+  "overlap": {
+   "method": "40-character fragments every 20 characters, exact substring",
+   "against": {
+    "accept_prompts": {
+     "sha256": "a008edabcde9395f2df7c043db55134a46267701300626537335cadbc5d16675",
+     "hits": {}
+    },
+    "suite_k": {
+     "sha256": "c6767eaf32748fe040aebf1c1dfacc11bc5ef002e2d3413792684217188f467f",
+     "hits": {}
+    },
+    "suite_d": {
+     "sha256": "8ff92515b112d4c256fdac2fa3c6820c34b01674ed6d0322cf2a2dbaed21eb4f",
+     "hits": {}
+    },
+    "d4_ko_prompts": {
+     "sha256": "282907848a166f9340ad80c5110c207c5816c0009fd229659a4523f943eff880",
+     "hits": {}
+    }
+   },
+   "within_set_hits": {}
+  }
+ }
+}
