@@ -114,6 +114,24 @@ cold는 새 프로세스의 첫 요청(빈 행 캐시), warm은 같은 요청의
 | 5.00 | 77.9 | 31.3 | 4 / 8 | 8 |
 | 6.00 | 92.0 | 17.2 | 2 / 8 | 8 |
 
+## P1T 첫 시도 (2026-10-30, `f1-p1-unit`) [확인]
+
+- **감독 "start"(P1T 세 개 → K0 두 개) 뒤 첫 창 `f1-p1-unit`이 4초 만에 FAILED가 되었다.** health_PASS였고, 테스트는 하나도 실행되지 않았다.
+  - 다섯 바이너리 모두 로드 단계에서 `libelf.so.1: cannot open shared object file`(rc 127)로 멈췄다.
+  - 원인: `build/f1-nix-tests.nix`가 테스트를 감싸지 않고 그대로 설치했다(`postFixup = "true"`). 운영 `gufo`는 wrapper가 `LD_LIBRARY_PATH=/nix/store/88jjsz00…-rocm-runtime-10.1/lib`를 넣는다. W9 probe 빌드는 `wrapProgram`으로 같은 일을 했다.
+- 지시("P1T 정확성 창이 실패하면 멈추고 보고")대로 그 뒤 창(greedy, suite, K0)은 돌리지 않았다.
+- 결과는 `f1-p1/f1-p1-unit.attempt-1-libelf/`에 남겼다.
+- **고침(재빌드 없음):** 두 계획의 모든 테스트에 같은 런타임 경로를 `env.LD_LIBRARY_PATH`로 넣었다. 이미지 안에서 `ldd`로 다섯 바이너리 모두 빠진 라이브러리가 0개임을 확인했다(GPU 사용 없음). LOCKS를 반영했다.
+- 다시 돌릴지는 감독이 승인한다.
+
+## ABBA 계획 초안 (P1 정확성 통과 뒤)
+
+- **계획:** `PLAN-F1-ABBA-BASE.json`(이미지 `f1-base-rocm101`, d2b751a9)와 `PLAN-F1-ABBA-CAND.json`(`f1-cand-rocm101`, 766a593e)이다.
+- **항목:** 팔마다 `-mtp`(W9 I1 ABBA와 같은 서버 인자, A 64 / K 17 / D 8, 반복 2)와 `-ar`(D 8만, 깊은 문맥 일반 decode)가 있다.
+- **순서:** BASE-mtp → CAND-mtp → CAND-mtp → BASE-mtp, 그다음 BASE-ar → CAND-ar → CAND-ar → BASE-ar다.
+- **판정:** `tools/qwen-flash/spec/abba.py`로 요청·단계별 5 %·10 ms를 보고, 완성과 draft 수가 같아야 한다.
+- **예상 시간 [짐작]:** mtp 창 하나에 약 20분, ar 창 하나에 약 8분이라 합계 약 2시간이다. 창 사이에 CPU 빌드는 하지 않는다.
+
 ## 남은 문제
 
 - [짐작] P1의 표 간접 참조 비용(decode attention 행마다 표 한 번 읽기)은 ABBA로 확인해야 한다.
