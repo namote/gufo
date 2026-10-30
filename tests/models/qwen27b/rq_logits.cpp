@@ -259,6 +259,32 @@ private:
 };
 
 // Production head over captured prefill hidden rows.
+// The X2b fast-path slabs of QwenGpuArena::AllocateExl3 for a model whose
+// widest projection input is the FFN width: an 8-row FP16 rotated input, one
+// zeroed arrival counter per 128 outputs of the widest output (the head) and
+// the fused MLP's 8-row down input.
+void AllocateFastSlabs(const gufo::core::ModelConfig& config,
+                       gufo::quant::exl3::ReferenceScratch& scratch) {
+  const std::size_t width = gufo::hip::MaxExl3InputWidth(config);
+  scratch.fast_input_elements = 8 * width;
+  HipCheck(hipMalloc(&scratch.fast_input,
+                     scratch.fast_input_elements * sizeof(std::uint16_t)),
+           "hipMalloc");
+  const std::size_t widest_output =
+      std::max<std::size_t>(config.vocab_size, width);
+  scratch.fast_counter_count = (widest_output + 127) / 128;
+  HipCheck(hipMalloc(&scratch.fast_counters,
+                     scratch.fast_counter_count * sizeof(std::uint32_t)),
+           "hipMalloc");
+  HipCheck(hipMemset(scratch.fast_counters, 0,
+                     scratch.fast_counter_count * sizeof(std::uint32_t)),
+           "hipMemset");
+  scratch.fast_down_input_elements = 8 * config.intermediate_size;
+  HipCheck(hipMalloc(&scratch.fast_down_input,
+                     scratch.fast_down_input_elements * sizeof(std::uint16_t)),
+           "hipMalloc");
+}
+
 class Head {
 public:
   Head(const gufo::models::QwenModelWeights& weights, std::size_t hidden,
@@ -268,8 +294,10 @@ public:
     HipCheck(hipMalloc(&d_hidden_, hidden * sizeof(float)), "hipMalloc");
     HipCheck(hipMalloc(&d_normed_, hidden * sizeof(float)), "hipMalloc");
     HipCheck(hipMalloc(&d_logits_, vocab * sizeof(float)), "hipMalloc");
-    // An EXL3 head (gufo.gguf sidecar) needs a projection workspace, sized
-    // like the DFlash2 executor's; GGUF heads keep the null workspace.
+    // An EXL3 head (gufo.gguf sidecar) needs a projection workspace; GGUF
+    // heads keep the null workspace. It carries the same X2b fast-path slabs
+    // as the session arena (QwenGpuArena::AllocateExl3), so the replayed
+    // head takes the production head's path and reproduces its logits.
     if (gufo::hip::IsExl3(weights.output)) {
       exl3_.rotated_elements = hidden;
       exl3_.weight_elements = std::size_t{64} << 20U;
@@ -278,6 +306,7 @@ public:
           "hipMalloc");
       HipCheck(hipMalloc(&exl3_.weight, exl3_.weight_elements * sizeof(float)),
                "hipMalloc");
+      AllocateFastSlabs(weights.config, exl3_);
     }
   }
   ~Head() {
@@ -286,6 +315,9 @@ public:
     (void)hipFree(d_logits_);
     (void)hipFree(exl3_.rotated);
     (void)hipFree(exl3_.weight);
+    (void)hipFree(exl3_.fast_input);
+    (void)hipFree(exl3_.fast_counters);
+    (void)hipFree(exl3_.fast_down_input);
     (void)hipStreamDestroy(stream_);
   }
   Head(const Head&) = delete;

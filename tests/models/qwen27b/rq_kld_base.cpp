@@ -208,8 +208,10 @@ int main(int argc, char** argv) {
     HipCheck(hipMalloc(&d_hidden, hidden * sizeof(float)), "hipMalloc");
     HipCheck(hipMalloc(&d_normed, hidden * sizeof(float)), "hipMalloc");
     HipCheck(hipMalloc(&d_logits, n_vocab * sizeof(float)), "hipMalloc");
-    // An EXL3 head (gufo.gguf sidecar) needs a projection workspace, sized
-    // like the DFlash2 executor's; GGUF heads keep the null workspace.
+    // An EXL3 head (gufo.gguf sidecar) needs a projection workspace; GGUF
+    // heads keep the null workspace. It carries the same X2b fast-path slabs
+    // as the session arena (QwenGpuArena::AllocateExl3), so the replayed
+    // head takes the production head's path and reproduces its logits.
     gufo::quant::exl3::ReferenceScratch exl3{};
     if (gufo::hip::IsExl3(model->GetWeights().output)) {
       exl3.rotated_elements = hidden;
@@ -217,6 +219,24 @@ int main(int argc, char** argv) {
       HipCheck(hipMalloc(&exl3.rotated, exl3.rotated_elements * sizeof(float)),
                "hipMalloc");
       HipCheck(hipMalloc(&exl3.weight, exl3.weight_elements * sizeof(float)),
+               "hipMalloc");
+      const auto& config = model->GetConfig();
+      const std::size_t width = gufo::hip::MaxExl3InputWidth(config);
+      exl3.fast_input_elements = 8 * width;
+      HipCheck(hipMalloc(&exl3.fast_input,
+                         exl3.fast_input_elements * sizeof(std::uint16_t)),
+               "hipMalloc");
+      exl3.fast_counter_count =
+          (std::max<std::size_t>(config.vocab_size, width) + 127) / 128;
+      HipCheck(hipMalloc(&exl3.fast_counters,
+                         exl3.fast_counter_count * sizeof(std::uint32_t)),
+               "hipMalloc");
+      HipCheck(hipMemset(exl3.fast_counters, 0,
+                         exl3.fast_counter_count * sizeof(std::uint32_t)),
+               "hipMemset");
+      exl3.fast_down_input_elements = 8 * config.intermediate_size;
+      HipCheck(hipMalloc(&exl3.fast_down_input,
+                         exl3.fast_down_input_elements * sizeof(std::uint16_t)),
                "hipMalloc");
     }
     std::vector<float> logits(n_vocab);
@@ -278,6 +298,9 @@ int main(int argc, char** argv) {
     (void)hipFree(d_logits);
     (void)hipFree(exl3.rotated);
     (void)hipFree(exl3.weight);
+    (void)hipFree(exl3.fast_input);
+    (void)hipFree(exl3.fast_counters);
+    (void)hipFree(exl3.fast_down_input);
     (void)hipStreamDestroy(stream);
     std::cout << "RESULT rq_kld_base chunks=" << chunks << " n_ctx=" << n_ctx
               << " head_replay_checks=" << checks
