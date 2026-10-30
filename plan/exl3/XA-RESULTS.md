@@ -273,3 +273,15 @@ struct DeviceLinear {                 // one EXL3 projection y = x W, W [k][n]
 
 - 빠른 경로를 끄는 스위치 없이 엔진 수준 결과가 나왔다.
 - 기준 경로만 쓰는 대조 빌드(08bba6ed 이전)는 엔진 시험이 통과했으므로 필요하지 않다.
+
+### X2a 품질 창 준비 (2026-10-31)
+
+- 수집기 `dc8863627a9e…`(`build/xa-q-gpu-test`, HEAD `316b9f64`, W3 `c0da594e`/`c90bedea` 포함)를 쓴다. 자세한 내용은 R0-RESULTS 같은 절에 있다.
+- 사이드카:
+  - `gufo.gguf`(sha256 `28fbeb69…`, 두 팩이 같다)를 BF16 shard 1 템플릿으로 다시 써서 byte-equal을 확인했다.
+  - `gufo-bf16emb.gguf`(sha256 `cb044d6c…`, 49키, `gufo.exl3.embedding="bf16"`)는 `metadata --bf16-embedding`(316b9f64)으로 썼다.
+- 계획: `PLAN-EXL3-X2AQ.json`, 팩마다 창 하나.
+  - ExLlamaV3 같은 팩 대비 prefill/decode, gufo BF16 대비 prefill.
+  - BF16 임베딩 사이드카의 prefill(두 기준).
+  - EXL3 fingerprints, GGUF 동일성 확인.
+  - 창 뒤에 `metrics.py score`/`compare`로 임베딩 짝 비교를 하고, `model_resident_bytes`를 적는다.

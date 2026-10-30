@@ -427,3 +427,14 @@ paired 비교(같은 64개 프롬프트, 95 % 구간):
 - **잡음:** 같은 파일의 떨어진 두 표본 사이에서 pp는 최대 4.0 %, tg는 최대 0.5 % 차이가 났다. 예외는 plain Q4_K_M의 tg d0(5.2 %)로, 반복 사이 편차가 컸다. 단계별 5 %·10 ms 기준에서 이 칸만 결론 없음이다.
 - **상주 메모리:** 품질 표의 "크기, 메모리, 수집 시간"을 쓴다.
 - **조건:** 이 수치는 W3 회전 변경이 없는 바이너리의 값이다. R4에서 회전 파일과 비교할 때는 같은 W3 바이너리로 비회전 대조군을 다시 잰다.
+
+## EXL3 품질 창용 수집기 재빌드 (X-A, 2026-10-31)
+
+- **이유:** `84811b4e`(`rq-w2-exl3`)는 HEAD `77920e05`로 빌드됐다. 사이드카 이미지 업로드 수정 `1e47ca44` 이전이라 EXL3 사이드카 로드가 EINVAL로 실패한다(X2A 창 1과 같은 원인). W3 빠른 GEMV(`08bba6ed`, `c0da594e`, `c90bedea`)도 없다.
+- **새 바이너리:** `build/xa-q-gpu-test`. 이미지 `64849ca6ec7b`, `-j8`, 새 configure.
+  - 소스는 `build/xa-q-src`다. `git archive` HEAD `316b9f64`이고, 기록은 `build/xa-q-src.provenance`에 있다. 수집기 소스는 바꾸지 않았다(`32d5d562`와 같다).
+  - `qwen27b_rq_logits` sha256 `dc8863627a9ed9796da2507b7f5ed0c0c40ba6c1d1969680525aca86da16e35a`
+  - `qwen27b_target_test` sha256 `ef004a3c09b45b832f1f577735f9ed7ee0e8d13f55a8863b93a3f0455b9e256b`
+- **GGUF 경로 동일성:** `PLAN-EXL3-X2AQ.json`의 4.00 창에서 확인한다(실행 전).
+  - BF16 prefill 창 0을 `rq0-a01`과 `logits_io.py same`으로 대조한다.
+  - UD-Q4_K_M fingerprints를 rq2h와 대조한다.
