@@ -25,12 +25,18 @@
 // over copies well beyond the 32 MiB MALL. Times are per launch (hipEvent
 // pairs) after warm-up; GB/s counts trellis bytes only.
 //
+// A launch may carry up to three matrices of the same k (the production
+// groups q + k + v, gate + up, qkv + z), each with its own rotated input.
+// The input is row-major [M][k] or lane-major (each lane's M rows of one k
+// tile contiguous, written that way by the producer kernel).
+//
 // Modes: check | time [reps]
 //   check  decoded tiles against the CPU reference (FP16 bits), GEMV outputs
-//          against an FP64 reference fed the same FP16 input, and row r of an
-//          M-row call against an M = 1 call (bits).
-//   time   shape x M x warps x N tiles per wave x hash form, then a plain read
-//          of the same buffers as the bandwidth ceiling.
+//          against an FP64 reference fed the same FP16 input, every M, input
+//          layout and N tiles per wave against M = 1 (bits), and every slot
+//          of a multi-matrix launch against its own launch (bits).
+//   time   case x M x warps x N tiles per wave x input layout, then a plain
+//          read of the same buffers as the bandwidth ceiling.
 // Build: plan/exl3/XB-RESULTS.md.
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -63,6 +69,7 @@ namespace {
 namespace exl3 = gufo::quant::exl3;
 
 using half2_t = _Float16 __attribute__((ext_vector_type(2)));
+using half4_t = _Float16 __attribute__((ext_vector_type(4)));
 
 constexpr float kHadamardScale = 0.0883883461356163F;
 constexpr std::uint32_t kMul1 = 0x83DCD12DU;
@@ -149,27 +156,54 @@ __device__ __forceinline__ void DecodeLane(
 // GEMV kernel
 // ---------------------------------------------------------------------------
 
-struct GemvArgs {
+// One matrix of a launch. Matrices sharing a launch share k, M and the
+// launch shape; each has its own rotated input (its own suh), output and
+// counters. Blocks [block_begin, next block_begin) work this matrix.
+struct Slot {
   const std::uint16_t* trellis;  // [k/16][n/16][16K]
-  const _Float16* a;             // [M][k], rotated input
+  const _Float16* a;             // rotated input, layout per kLayout
   const _Float16* svh;           // [n]
   float* partial;                // [M][n], pre-rotation sums
   float* y;                      // [M][n]
   unsigned* counters;            // [n / 128], zero between launches
-  unsigned k, n;
+  unsigned n;
+  unsigned block_begin;
 };
 
-template<int K, int M, int W, int TN, int kHash>
+constexpr int kMaxSlots = 3;
+
+struct GemvArgs {
+  Slot slot[kMaxSlots];
+  unsigned slots;
+  unsigned k;
+};
+
+// Input layouts. kRowMajor: [M][k]. kLaneMajor: per 16-element k tile, four
+// groups q = 0..3 (lanes with r0 = 2q), each [M rows][a[2q], a[2q+1],
+// a[2q+8], a[2q+9]], so a lane reads its M rows as one contiguous 8M bytes.
+constexpr int kRowMajor = 0;
+constexpr int kLaneMajor = 1;
+
+template<int K, int M, int W, int TN, int kHash, int kLayout>
 __global__ __launch_bounds__(W * 32) void Exl3GemvKernel(GemvArgs args) {
   constexpr unsigned kTileDwords = 8 * K;
   __shared__ float red[W][TN][M][16];
   __shared__ unsigned last_block;
 
+  // Wave-uniform slot selection (no dynamic indexing of the argument block).
+  Slot sl = args.slot[0];
+  if (args.slots > 1 && blockIdx.x >= args.slot[1].block_begin) {
+    sl = args.slot[1];
+  }
+  if (args.slots > 2 && blockIdx.x >= args.slot[2].block_begin) {
+    sl = args.slot[2];
+  }
+
   const unsigned lane = threadIdx.x % 32;
   const unsigned warp = threadIdx.x / 32;
-  const unsigned n_tiles = args.n / 16;
+  const unsigned n_tiles = sl.n / 16;
   const unsigned k_tiles = args.k / 16;
-  const unsigned nt0 = blockIdx.x * TN;
+  const unsigned nt0 = (blockIdx.x - sl.block_begin) * TN;
   const unsigned kb0 = k_tiles * warp / W;
   const unsigned kb1 = k_tiles * (warp + 1) / W;
 
@@ -188,16 +222,27 @@ __global__ __launch_bounds__(W * 32) void Exl3GemvKernel(GemvArgs args) {
   }
 
   const std::uint32_t* base =
-      reinterpret_cast<const std::uint32_t*>(args.trellis);
+      reinterpret_cast<const std::uint32_t*>(sl.trellis);
   for (unsigned kt = kb0; kt < kb1; ++kt) {
     half2_t a01[M];
     half2_t a89[M];
+    if constexpr (kLayout == kRowMajor) {
 #pragma unroll
-    for (int r = 0; r < M; ++r) {
-      const _Float16* row =
-          args.a + static_cast<std::size_t>(r) * args.k + kt * 16 + r0;
-      a01[r] = *reinterpret_cast<const half2_t*>(row);
-      a89[r] = *reinterpret_cast<const half2_t*>(row + 8);
+      for (int r = 0; r < M; ++r) {
+        const _Float16* row =
+            sl.a + static_cast<std::size_t>(r) * args.k + kt * 16 + r0;
+        a01[r] = *reinterpret_cast<const half2_t*>(row);
+        a89[r] = *reinterpret_cast<const half2_t*>(row + 8);
+      }
+    } else {
+      const half4_t* group = reinterpret_cast<const half4_t*>(
+          sl.a + (static_cast<std::size_t>(kt) * 16 + r0 * 2) * M);
+#pragma unroll
+      for (int r = 0; r < M; ++r) {
+        const half4_t v = group[r];
+        a01[r] = half2_t{v.x, v.y};
+        a89[r] = half2_t{v.z, v.w};
+      }
     }
 #pragma unroll
     for (int t = 0; t < TN; ++t) {
@@ -246,8 +291,8 @@ __global__ __launch_bounds__(W * 32) void Exl3GemvKernel(GemvArgs args) {
           for (int v = 1; v < W; ++v) {
             sum += red[v][t][r][lane];
           }
-          args.partial[static_cast<std::size_t>(r) * args.n + (nt0 + t) * 16 +
-                       lane] = sum;
+          sl.partial[static_cast<std::size_t>(r) * sl.n + (nt0 + t) * 16 +
+                     lane] = sum;
         }
       }
     }
@@ -256,10 +301,10 @@ __global__ __launch_bounds__(W * 32) void Exl3GemvKernel(GemvArgs args) {
     const unsigned segment = nt0 / 8;
     if (lane == 0) {
       constexpr unsigned kArrivals = 8 / TN;
-      const unsigned old = atomicAdd(&args.counters[segment], 1U);
+      const unsigned old = atomicAdd(&sl.counters[segment], 1U);
       last = old == kArrivals - 1 ? 1U : 0U;
       if (last != 0) {
-        args.counters[segment] = 0;
+        sl.counters[segment] = 0;
       }
     }
     last_block = __shfl(last, 0, 32);
@@ -274,8 +319,8 @@ __global__ __launch_bounds__(W * 32) void Exl3GemvKernel(GemvArgs args) {
   const unsigned seg_base = (nt0 / 8) * 128;
   for (unsigned r = warp; r < M; r += W) {
     float v[4];
-    const float* src = args.partial + static_cast<std::size_t>(r) * args.n +
-                       seg_base + lane * 4;
+    const float* src =
+        sl.partial + static_cast<std::size_t>(r) * sl.n + seg_base + lane * 4;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       v[j] = __hip_atomic_load(src + j, __ATOMIC_RELAXED,
@@ -303,11 +348,11 @@ __global__ __launch_bounds__(W * 32) void Exl3GemvKernel(GemvArgs args) {
       }
     }
     float* dst =
-        args.y + static_cast<std::size_t>(r) * args.n + seg_base + lane * 4;
+        sl.y + static_cast<std::size_t>(r) * sl.n + seg_base + lane * 4;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       const float scaled = v[j] * kHadamardScale;
-      dst[j] = scaled * static_cast<float>(args.svh[seg_base + lane * 4 + j]);
+      dst[j] = scaled * static_cast<float>(sl.svh[seg_base + lane * 4 + j]);
     }
   }
 }
@@ -360,22 +405,43 @@ __global__ void ReadKernel(const uint4* __restrict__ data, std::size_t count,
 // Host
 // ---------------------------------------------------------------------------
 
-struct Shape {
+// One launch: matrices of the same k and K that read different rotated
+// copies of one activation (one matrix, or a production group).
+struct Case {
   const char* name;
-  unsigned k, n;
+  unsigned k;
   int bits;
+  std::vector<unsigned> ns;
 };
 
-constexpr Shape kShapes[] = {
-    {"qkv", 5120, 10240, 5},        {"z", 5120, 6144, 5},
-    {"q", 5120, 12288, 5},          {"kv", 5120, 1024, 5},
-    {"gate_up", 5120, 17408, 5},    {"o_out", 6144, 5120, 5},
-    {"down", 17408, 5120, 5},       {"lm_head", 5120, 248320, 6},
-    {"gate_up_k4", 5120, 17408, 4}, {"down_k4", 17408, 5120, 4},
-};
+const std::vector<Case>& TimeCases() {
+  static const std::vector<Case> cases = {
+      {"qkv", 5120, 5, {10240}},
+      {"z", 5120, 5, {6144}},
+      {"q", 5120, 5, {12288}},
+      {"kv", 5120, 5, {1024}},
+      {"gate_up", 5120, 5, {17408}},
+      {"o_out", 6144, 5, {5120}},
+      {"down", 17408, 5, {5120}},
+      {"lm_head", 5120, 6, {248320}},
+      {"gate_up_k4", 5120, 4, {17408}},
+      {"down_k4", 17408, 4, {5120}},
+      {"qkv+z", 5120, 5, {10240, 6144}},
+      {"q+k+v", 5120, 5, {12288, 1024, 1024}},
+      {"gate+up", 5120, 5, {17408, 17408}},
+  };
+  return cases;
+}
 
-std::size_t TrellisBytes(const Shape& s) {
-  return static_cast<std::size_t>(s.k / 16) * (s.n / 16) * 32 * s.bits;
+std::size_t TrellisBytes(unsigned k, unsigned n, int bits) {
+  return static_cast<std::size_t>(k / 16) * (n / 16) * 32 * bits;
+}
+
+std::size_t CaseBytes(const Case& c) {
+  std::size_t total = 0;
+  for (unsigned n : c.ns)
+    total += TrellisBytes(c.k, n, c.bits);
+  return total;
 }
 
 unsigned SplitWarps(unsigned k_tiles, unsigned blocks) {
@@ -388,57 +454,63 @@ unsigned SplitWarps(unsigned k_tiles, unsigned blocks) {
   return 8;
 }
 
-using Launcher = void (*)(const GemvArgs&, hipStream_t);
+using Launcher = void (*)(GemvArgs, hipStream_t);
 
-template<int K, int M, int W, int TN, int kHash>
-void LaunchGemv(const GemvArgs& args, hipStream_t stream) {
-  const unsigned blocks = args.n / 16 / TN;
-  hipLaunchKernelGGL((Exl3GemvKernel<K, M, W, TN, kHash>), dim3(blocks),
+template<int K, int M, int W, int TN, int kLayout>
+void LaunchGemv(GemvArgs args, hipStream_t stream) {
+  unsigned blocks = 0;
+  for (unsigned i = 0; i < args.slots; ++i) {
+    args.slot[i].block_begin = blocks;
+    blocks += args.slot[i].n / 16 / TN;
+  }
+  hipLaunchKernelGGL((Exl3GemvKernel<K, M, W, TN, 0, kLayout>), dim3(blocks),
                      dim3(W * 32), 0, stream, args);
 }
 
-template<int K, int M, int TN, int kHash>
+template<int K, int M, int TN, int kLayout>
 Launcher PickWarps(unsigned w) {
   switch (w) {
     case 4:
-      return LaunchGemv<K, M, 4, TN, kHash>;
+      return LaunchGemv<K, M, 4, TN, kLayout>;
     case 8:
-      return LaunchGemv<K, M, 8, TN, kHash>;
+      return LaunchGemv<K, M, 8, TN, kLayout>;
     default:
-      return LaunchGemv<K, M, 16, TN, kHash>;
+      return LaunchGemv<K, M, 16, TN, kLayout>;
   }
 }
 
 template<int K, int M>
-Launcher PickForm(unsigned w, int tn, int hash) {
+Launcher PickForm(unsigned w, int tn, int layout) {
   if (tn == 1) {
-    return hash == 0 ? PickWarps<K, M, 1, 0>(w) : PickWarps<K, M, 1, 1>(w);
+    return layout == 0 ? PickWarps<K, M, 1, kRowMajor>(w)
+                       : PickWarps<K, M, 1, kLaneMajor>(w);
   }
-  return hash == 0 ? PickWarps<K, M, 2, 0>(w) : PickWarps<K, M, 2, 1>(w);
+  return layout == 0 ? PickWarps<K, M, 2, kRowMajor>(w)
+                     : PickWarps<K, M, 2, kLaneMajor>(w);
 }
 
 template<int K>
-Launcher PickRows(int m, unsigned w, int tn, int hash) {
+Launcher PickRows(int m, unsigned w, int tn, int layout) {
   switch (m) {
     case 1:
-      return PickForm<K, 1>(w, tn, hash);
+      return PickForm<K, 1>(w, tn, layout);
     case 2:
-      return PickForm<K, 2>(w, tn, hash);
+      return PickForm<K, 2>(w, tn, layout);
     case 4:
-      return PickForm<K, 4>(w, tn, hash);
+      return PickForm<K, 4>(w, tn, layout);
     default:
-      return PickForm<K, 8>(w, tn, hash);
+      return PickForm<K, 8>(w, tn, layout);
   }
 }
 
-Launcher Pick(int bits, int m, unsigned w, int tn, int hash) {
+Launcher Pick(int bits, int m, unsigned w, int tn, int layout) {
   switch (bits) {
     case 4:
-      return PickRows<4>(m, w, tn, hash);
+      return PickRows<4>(m, w, tn, layout);
     case 5:
-      return PickRows<5>(m, w, tn, hash);
+      return PickRows<5>(m, w, tn, layout);
     default:
-      return PickRows<6>(m, w, tn, hash);
+      return PickRows<6>(m, w, tn, layout);
   }
 }
 
@@ -447,134 +519,203 @@ std::uint16_t RandomHalf(std::mt19937& rng, float lo, float hi) {
   return exl3::HalfFromDouble(dist(rng));
 }
 
-struct Buffers {
+// The lane-major copy of an [m][k] row-major input (see kLaneMajor).
+std::vector<std::uint16_t> LaneMajor(const std::vector<std::uint16_t>& a,
+                                     unsigned k, int m) {
+  std::vector<std::uint16_t> out(static_cast<std::size_t>(m) * k);
+  std::size_t o = 0;
+  for (unsigned kt = 0; kt < k / 16; ++kt) {
+    for (unsigned q = 0; q < 4; ++q) {
+      for (int r = 0; r < m; ++r) {
+        const std::uint16_t* row =
+            a.data() + static_cast<std::size_t>(r) * k + kt * 16 + 2 * q;
+        out[o++] = row[0];
+        out[o++] = row[1];
+        out[o++] = row[8];
+        out[o++] = row[9];
+      }
+    }
+  }
+  return out;
+}
+
+struct SlotHost {
+  std::vector<std::uint16_t> trellis;
+  std::vector<std::uint16_t> a;  // [8][k] row-major
+  std::vector<std::uint16_t> svh;
+};
+
+struct SlotDevice {
   std::uint16_t* trellis = nullptr;  // copies * words
   std::size_t copy_words = 0;
-  int copies = 1;
-  _Float16* a = nullptr;
+  _Float16* a_row = nullptr;  // [8][k]
+  _Float16* a_lane[9] = {};   // lane-major per M (1, 2, 4, 8)
   _Float16* svh = nullptr;
   float* partial = nullptr;
   float* y = nullptr;
   unsigned* counters = nullptr;
 };
 
-Buffers Allocate(const Shape& s, int copies, std::mt19937& rng,
-                 std::vector<std::uint16_t>* host_trellis,
-                 std::vector<std::uint16_t>* host_a,
-                 std::vector<std::uint16_t>* host_svh) {
-  Buffers b;
-  b.copies = copies;
-  b.copy_words = TrellisBytes(s) / 2;
-  host_trellis->resize(b.copy_words);
-  for (auto& w : *host_trellis) {
-    w = static_cast<std::uint16_t>(rng());
-  }
-  HIP_OK(hipMalloc(&b.trellis, b.copy_words * 2 * copies));
-  for (int c = 0; c < copies; ++c) {
-    HIP_OK(hipMemcpy(b.trellis + b.copy_words * c, host_trellis->data(),
-                     b.copy_words * 2, hipMemcpyHostToDevice));
-  }
-  host_a->resize(static_cast<std::size_t>(8) * s.k);
-  for (auto& v : *host_a) {
-    v = RandomHalf(rng, -2.0F, 2.0F);
-  }
-  host_svh->resize(s.n);
-  for (auto& v : *host_svh) {
-    v = RandomHalf(rng, 0.002F, 0.02F);
-    if ((rng() & 1U) != 0U)
-      v ^= 0x8000U;
-  }
-  HIP_OK(hipMalloc(&b.a, host_a->size() * 2));
-  HIP_OK(hipMemcpy(b.a, host_a->data(), host_a->size() * 2,
-                   hipMemcpyHostToDevice));
-  HIP_OK(hipMalloc(&b.svh, s.n * 2));
-  HIP_OK(hipMemcpy(b.svh, host_svh->data(), s.n * 2, hipMemcpyHostToDevice));
-  HIP_OK(hipMalloc(&b.partial, sizeof(float) * 8 * s.n));
-  HIP_OK(hipMalloc(&b.y, sizeof(float) * 8 * s.n));
-  HIP_OK(hipMalloc(&b.counters, sizeof(unsigned) * kMaxSegments));
-  HIP_OK(hipMemset(b.counters, 0, sizeof(unsigned) * kMaxSegments));
-  return b;
+struct Device {
+  std::vector<SlotDevice> slots;
+  int copies = 1;
+};
+
+template<typename T>
+T* Upload(const std::vector<std::uint16_t>& host) {
+  T* d = nullptr;
+  HIP_OK(hipMalloc(&d, host.size() * 2));
+  HIP_OK(hipMemcpy(d, host.data(), host.size() * 2, hipMemcpyHostToDevice));
+  return d;
 }
 
-void Free(Buffers& b) {
-  HIP_OK(hipFree(b.trellis));
-  HIP_OK(hipFree(b.a));
-  HIP_OK(hipFree(b.svh));
-  HIP_OK(hipFree(b.partial));
-  HIP_OK(hipFree(b.y));
-  HIP_OK(hipFree(b.counters));
+Device Allocate(const Case& c, int copies, std::mt19937& rng,
+                std::vector<SlotHost>* hosts) {
+  Device d;
+  d.copies = copies;
+  hosts->clear();
+  for (unsigned n : c.ns) {
+    SlotHost h;
+    h.trellis.resize(TrellisBytes(c.k, n, c.bits) / 2);
+    for (auto& w : h.trellis)
+      w = static_cast<std::uint16_t>(rng());
+    h.a.resize(static_cast<std::size_t>(8) * c.k);
+    for (auto& v : h.a)
+      v = RandomHalf(rng, -2.0F, 2.0F);
+    h.svh.resize(n);
+    for (auto& v : h.svh) {
+      v = RandomHalf(rng, 0.002F, 0.02F);
+      if ((rng() & 1U) != 0U)
+        v ^= 0x8000U;
+    }
+    SlotDevice sd;
+    sd.copy_words = h.trellis.size();
+    HIP_OK(hipMalloc(&sd.trellis, sd.copy_words * 2 * copies));
+    for (int i = 0; i < copies; ++i) {
+      HIP_OK(hipMemcpy(sd.trellis + sd.copy_words * i, h.trellis.data(),
+                       sd.copy_words * 2, hipMemcpyHostToDevice));
+    }
+    sd.a_row = Upload<_Float16>(h.a);
+    for (int m : {1, 2, 4, 8}) {
+      std::vector<std::uint16_t> first(
+          h.a.begin(), h.a.begin() + static_cast<std::ptrdiff_t>(m) * c.k);
+      sd.a_lane[m] = Upload<_Float16>(LaneMajor(first, c.k, m));
+    }
+    sd.svh = Upload<_Float16>(h.svh);
+    HIP_OK(hipMalloc(&sd.partial, sizeof(float) * 8 * n));
+    HIP_OK(hipMalloc(&sd.y, sizeof(float) * 8 * n));
+    HIP_OK(hipMalloc(&sd.counters, sizeof(unsigned) * kMaxSegments));
+    HIP_OK(hipMemset(sd.counters, 0, sizeof(unsigned) * kMaxSegments));
+    d.slots.push_back(sd);
+    hosts->push_back(std::move(h));
+  }
+  return d;
 }
 
-GemvArgs Args(const Shape& s, const Buffers& b, int copy) {
+void Free(Device& d) {
+  for (SlotDevice& sd : d.slots) {
+    HIP_OK(hipFree(sd.trellis));
+    HIP_OK(hipFree(sd.a_row));
+    for (int m : {1, 2, 4, 8})
+      HIP_OK(hipFree(sd.a_lane[m]));
+    HIP_OK(hipFree(sd.svh));
+    HIP_OK(hipFree(sd.partial));
+    HIP_OK(hipFree(sd.y));
+    HIP_OK(hipFree(sd.counters));
+  }
+}
+
+// Arguments for slots [first, first + count) of `c`, rows m, input layout.
+GemvArgs Args(const Case& c, const Device& d, int copy, int m, int layout,
+              unsigned first = 0, unsigned count = 0) {
+  if (count == 0)
+    count = static_cast<unsigned>(c.ns.size());
   GemvArgs a{};
-  a.trellis = b.trellis + b.copy_words * copy;
-  a.a = b.a;
-  a.svh = b.svh;
-  a.partial = b.partial;
-  a.y = b.y;
-  a.counters = b.counters;
-  a.k = s.k;
-  a.n = s.n;
+  a.slots = count;
+  a.k = c.k;
+  for (unsigned i = 0; i < count; ++i) {
+    const SlotDevice& sd = d.slots[first + i];
+    Slot& s = a.slot[i];
+    s.trellis = sd.trellis + sd.copy_words * copy;
+    s.a = layout == 0 ? sd.a_row : sd.a_lane[m];
+    s.svh = sd.svh;
+    s.partial = sd.partial;
+    s.y = sd.y;
+    s.counters = sd.counters;
+    s.n = c.ns[first + i];
+  }
   return a;
 }
 
+unsigned Blocks(const Case& c, int tn) {
+  unsigned blocks = 0;
+  for (unsigned n : c.ns)
+    blocks += n / 16 / tn;
+  return blocks;
+}
+
+std::vector<float> ReadY(const SlotDevice& sd, unsigned n, int m) {
+  std::vector<float> y(static_cast<std::size_t>(m) * n);
+  HIP_OK(hipMemcpy(y.data(), sd.y, y.size() * 4, hipMemcpyDeviceToHost));
+  return y;
+}
+
 // FP64 reference: y = svh * H(A W') per row, A the FP16 input as given.
-std::vector<double> Reference(const Shape& s,
-                              const std::vector<std::uint16_t>& trellis,
-                              const std::vector<std::uint16_t>& a,
-                              const std::vector<std::uint16_t>& svh, int m) {
-  const exl3::BitRate rate{s.bits, false};
-  std::vector<std::uint16_t> inner(static_cast<std::size_t>(s.k) * s.n);
-  exl3::DequantInner(trellis.data(), s.k, s.n, rate, exl3::Codebook::kMul1,
+std::vector<double> Reference(unsigned k, unsigned n, int bits,
+                              const SlotHost& h, int m) {
+  const exl3::BitRate rate{bits, false};
+  std::vector<std::uint16_t> inner(static_cast<std::size_t>(k) * n);
+  exl3::DequantInner(h.trellis.data(), k, n, rate, exl3::Codebook::kMul1,
                      inner.data());
   std::vector<double> wd(inner.size());
   for (std::size_t i = 0; i < inner.size(); ++i) {
     wd[i] = exl3::HalfToDouble(inner[i]);
   }
-  std::vector<double> y(static_cast<std::size_t>(m) * s.n, 0.0);
+  std::vector<double> y(static_cast<std::size_t>(m) * n, 0.0);
   for (int r = 0; r < m; ++r) {
-    double* yr = y.data() + static_cast<std::size_t>(r) * s.n;
-    for (unsigned i = 0; i < s.k; ++i) {
+    double* yr = y.data() + static_cast<std::size_t>(r) * n;
+    for (unsigned i = 0; i < k; ++i) {
       const double x =
-          exl3::HalfToDouble(a[static_cast<std::size_t>(r) * s.k + i]);
-      const double* wr = wd.data() + static_cast<std::size_t>(i) * s.n;
-      for (unsigned j = 0; j < s.n; ++j)
+          exl3::HalfToDouble(h.a[static_cast<std::size_t>(r) * k + i]);
+      const double* wr = wd.data() + static_cast<std::size_t>(i) * n;
+      for (unsigned j = 0; j < n; ++j)
         yr[j] += x * wr[j];
     }
-    exl3::HadamardBlocks(std::span<double>(yr, s.n));
-    for (unsigned j = 0; j < s.n; ++j)
-      yr[j] *= exl3::HalfToDouble(svh[j]);
+    exl3::HadamardBlocks(std::span<double>(yr, n));
+    for (unsigned j = 0; j < n; ++j)
+      yr[j] *= exl3::HalfToDouble(h.svh[j]);
   }
   return y;
 }
 
-int Check() {
-  std::mt19937 rng(20261030);
+int CheckDecode(std::mt19937& rng) {
   int failures = 0;
-  // Decode bits for every K the kernels instantiate.
   for (int bits : {4, 5, 6}) {
-    const Shape s{"decode", 256, 512, bits};
-    std::vector<std::uint16_t> ht, ha, hs;
-    Buffers b = Allocate(s, 1, rng, &ht, &ha, &hs);
+    const Case c{"decode", 256, bits, {512}};
+    std::vector<SlotHost> hosts;
+    Device d = Allocate(c, 1, rng, &hosts);
+    const unsigned n = c.ns[0];
     _Float16* out = nullptr;
-    HIP_OK(hipMalloc(&out, sizeof(_Float16) * s.k * s.n));
-    const unsigned tiles = (s.k / 16) * (s.n / 16);
+    HIP_OK(hipMalloc(&out, sizeof(_Float16) * c.k * n));
+    const unsigned tiles = (c.k / 16) * (n / 16);
+    const std::uint16_t* t = d.slots[0].trellis;
     if (bits == 4) {
-      hipLaunchKernelGGL(Exl3DecodeKernel<4>, dim3(tiles), dim3(32), 0, 0,
-                         b.trellis, s.k, s.n, out);
+      hipLaunchKernelGGL(Exl3DecodeKernel<4>, dim3(tiles), dim3(32), 0, 0, t,
+                         c.k, n, out);
     } else if (bits == 5) {
-      hipLaunchKernelGGL(Exl3DecodeKernel<5>, dim3(tiles), dim3(32), 0, 0,
-                         b.trellis, s.k, s.n, out);
+      hipLaunchKernelGGL(Exl3DecodeKernel<5>, dim3(tiles), dim3(32), 0, 0, t,
+                         c.k, n, out);
     } else {
-      hipLaunchKernelGGL(Exl3DecodeKernel<6>, dim3(tiles), dim3(32), 0, 0,
-                         b.trellis, s.k, s.n, out);
+      hipLaunchKernelGGL(Exl3DecodeKernel<6>, dim3(tiles), dim3(32), 0, 0, t,
+                         c.k, n, out);
     }
     HIP_OK(hipDeviceSynchronize());
-    std::vector<std::uint16_t> got(static_cast<std::size_t>(s.k) * s.n);
+    std::vector<std::uint16_t> got(static_cast<std::size_t>(c.k) * n);
     HIP_OK(hipMemcpy(got.data(), out, got.size() * 2, hipMemcpyDeviceToHost));
     std::vector<std::uint16_t> want(got.size());
-    exl3::DequantInner(ht.data(), s.k, s.n, exl3::BitRate{bits, false},
-                       exl3::Codebook::kMul1, want.data());
+    exl3::DequantInner(hosts[0].trellis.data(), c.k, n,
+                       exl3::BitRate{bits, false}, exl3::Codebook::kMul1,
+                       want.data());
     std::size_t diff = 0;
     for (std::size_t i = 0; i < got.size(); ++i)
       diff += got[i] != want[i];
@@ -582,73 +723,125 @@ int Check() {
                 got.size());
     failures += diff != 0;
     HIP_OK(hipFree(out));
-    Free(b);
+    Free(d);
   }
-  // GEMV against FP64, and M-row bit identity with M = 1.
-  const Shape shapes[] = {{"kv", 5120, 1024, 5},
-                          {"o_out", 6144, 5120, 5},
-                          {"head_part", 5120, 2048, 6},
-                          {"down_k4", 17408, 1024, 4}};
-  for (const Shape& s : shapes) {
-    std::vector<std::uint16_t> ht, ha, hs;
-    Buffers b = Allocate(s, 1, rng, &ht, &ha, &hs);
-    const std::vector<double> ref = Reference(s, ht, ha, hs, 8);
-    const unsigned k_tiles = s.k / 16;
+  return failures;
+}
+
+// Single matrices: M = 1 per row (row-major) against FP64; every M, layout
+// and N tiles per wave bit-identical to that.
+int CheckSingles(std::mt19937& rng) {
+  int failures = 0;
+  const Case cases[] = {{"kv", 5120, 5, {1024}},
+                        {"o_out", 6144, 5, {5120}},
+                        {"head_part", 5120, 6, {2048}},
+                        {"down_k4", 17408, 4, {1024}}};
+  for (const Case& c : cases) {
+    std::vector<SlotHost> hosts;
+    Device d = Allocate(c, 1, rng, &hosts);
+    const unsigned n = c.ns[0];
+    const std::vector<double> ref = Reference(c.k, n, c.bits, hosts[0], 8);
+    const unsigned k_tiles = c.k / 16;
+    std::vector<float> rows1(static_cast<std::size_t>(8) * n);
+    {
+      const unsigned w = SplitWarps(k_tiles, Blocks(c, 1));
+      for (int r = 0; r < 8; ++r) {
+        GemvArgs args = Args(c, d, 0, 1, 0);
+        args.slot[0].a = d.slots[0].a_row + static_cast<std::size_t>(r) * c.k;
+        Pick(c.bits, 1, w, 1, 0)(args, nullptr);
+        const std::vector<float> y = ReadY(d.slots[0], n, 1);
+        std::copy(y.begin(), y.end(),
+                  rows1.begin() + static_cast<std::ptrdiff_t>(r) * n);
+      }
+    }
+    double num = 0.0;
+    double den = 0.0;
+    for (std::size_t i = 0; i < rows1.size(); ++i) {
+      num += (rows1[i] - ref[i]) * (rows1[i] - ref[i]);
+      den += ref[i] * ref[i];
+    }
+    const double rel = std::sqrt(num / den);
+    failures += !(rel < 1e-5);
+    int differ = 0;
+    int runs = 0;
     for (int tn : {1, 2}) {
-      for (int hash : {0, 1}) {
-        const unsigned w = SplitWarps(k_tiles, s.n / 16 / tn);
-        std::vector<float> rows1(static_cast<std::size_t>(8) * s.n);
-        for (int r = 0; r < 8; ++r) {
-          // M = 1 on row r: point the input at row r.
-          GemvArgs args = Args(s, b, 0);
-          args.a = b.a + static_cast<std::size_t>(r) * s.k;
-          Pick(s.bits, 1, w, tn, hash)(args, nullptr);
-          HIP_OK(hipMemcpy(rows1.data() + static_cast<std::size_t>(r) * s.n,
-                           b.y, sizeof(float) * s.n, hipMemcpyDeviceToHost));
-        }
-        double num = 0.0;
-        double den = 0.0;
-        for (std::size_t i = 0; i < rows1.size(); ++i) {
-          num += (rows1[i] - ref[i]) * (rows1[i] - ref[i]);
-          den += ref[i] * ref[i];
-        }
-        const double rel = std::sqrt(num / den);
-        failures += !(rel < 1e-5);
-        for (int m : {2, 4, 8}) {
-          Pick(s.bits, m, w, tn, hash)(Args(s, b, 0), nullptr);
-          std::vector<float> got(static_cast<std::size_t>(m) * s.n);
-          HIP_OK(hipMemcpy(got.data(), b.y, got.size() * 4,
-                           hipMemcpyDeviceToHost));
-          const bool same =
-              std::memcmp(got.data(), rows1.data(), got.size() * 4) == 0;
-          failures += !same;
-          std::printf(
-              "check %s K=%d tn=%d hash=%d warps=%u: rel L2 vs FP64 %.3e, "
-              "M=%d rows %s M=1\n",
-              s.name, s.bits, tn, hash, w, rel, m,
-              same ? "bit-identical to" : "DIFFER from");
+      for (int layout : {0, 1}) {
+        const unsigned w = SplitWarps(k_tiles, Blocks(c, tn));
+        for (int m : {1, 2, 4, 8}) {
+          Pick(c.bits, m, w, tn, layout)(Args(c, d, 0, m, layout), nullptr);
+          const std::vector<float> got = ReadY(d.slots[0], n, m);
+          ++runs;
+          differ += std::memcmp(got.data(), rows1.data(), got.size() * 4) != 0;
         }
       }
     }
-    Free(b);
+    failures += differ != 0;
+    std::printf(
+        "check %s K=%d: rel L2 vs FP64 %.3e; %d/%d (tn, layout, M) runs "
+        "differ from M=1 row-major\n",
+        c.name, c.bits, rel, differ, runs);
+    Free(d);
   }
+  return failures;
+}
+
+// Multi-matrix launches: every slot bit-identical to its own single launch.
+int CheckMulti(std::mt19937& rng) {
+  int failures = 0;
+  const Case c{"q+k+v small", 5120, 5, {2048, 1024, 1024}};
+  std::vector<SlotHost> hosts;
+  Device d = Allocate(c, 1, rng, &hosts);
+  int differ = 0;
+  int runs = 0;
+  for (int tn : {1, 2}) {
+    for (int layout : {0, 1}) {
+      for (int m : {1, 8}) {
+        const unsigned w = SplitWarps(c.k / 16, Blocks(c, tn));
+        std::vector<std::vector<float>> single;
+        for (unsigned s = 0; s < c.ns.size(); ++s) {
+          Pick(c.bits, m, w, tn, layout)(Args(c, d, 0, m, layout, s, 1),
+                                         nullptr);
+          single.push_back(ReadY(d.slots[s], c.ns[s], m));
+        }
+        Pick(c.bits, m, w, tn, layout)(Args(c, d, 0, m, layout), nullptr);
+        for (unsigned s = 0; s < c.ns.size(); ++s) {
+          const std::vector<float> got = ReadY(d.slots[s], c.ns[s], m);
+          ++runs;
+          differ +=
+              std::memcmp(got.data(), single[s].data(), got.size() * 4) != 0;
+        }
+      }
+    }
+  }
+  failures += differ != 0;
+  std::printf("check %s: %d/%d slot outputs differ from single launches\n",
+              c.name, differ, runs);
+  Free(d);
+  return failures;
+}
+
+int Check() {
+  std::mt19937 rng(20261030);
+  int failures = CheckDecode(rng);
+  failures += CheckSingles(rng);
+  failures += CheckMulti(rng);
   std::printf("check: %s\n", failures == 0 ? "all passed" : "FAILED");
   return failures == 0 ? 0 : 1;
 }
 
-float TimeLaunches(const Shape& s, const Buffers& b, Launcher launch,
-                   int reps) {
+float TimeLaunch(const Case& c, const Device& d, Launcher launch, int m,
+                 int layout, int reps) {
   hipEvent_t e0;
   hipEvent_t e1;
   HIP_OK(hipEventCreate(&e0));
   HIP_OK(hipEventCreate(&e1));
   for (int i = 0; i < 3; ++i)
-    launch(Args(s, b, i % b.copies), nullptr);
+    launch(Args(c, d, i % d.copies, m, layout), nullptr);
   HIP_OK(hipDeviceSynchronize());
   std::vector<float> times;
   for (int i = 0; i < reps; ++i) {
     HIP_OK(hipEventRecord(e0, nullptr));
-    launch(Args(s, b, i % b.copies), nullptr);
+    launch(Args(c, d, i % d.copies, m, layout), nullptr);
     HIP_OK(hipEventRecord(e1, nullptr));
     HIP_OK(hipEventSynchronize(e1));
     float ms = 0.0F;
@@ -661,61 +854,66 @@ float TimeLaunches(const Shape& s, const Buffers& b, Launcher launch,
   return times[times.size() / 2];
 }
 
+float TimeRead(const Device& d, const Case& c, int reps) {
+  unsigned* sink = nullptr;
+  HIP_OK(hipMalloc(&sink, 4));
+  hipEvent_t e0;
+  hipEvent_t e1;
+  HIP_OK(hipEventCreate(&e0));
+  HIP_OK(hipEventCreate(&e1));
+  std::vector<float> times;
+  for (int i = 0; i < reps + 3; ++i) {
+    HIP_OK(hipEventRecord(e0, nullptr));
+    for (std::size_t s = 0; s < d.slots.size(); ++s) {
+      const SlotDevice& sd = d.slots[s];
+      const uint4* data = reinterpret_cast<const uint4*>(
+          sd.trellis + sd.copy_words * (i % d.copies));
+      hipLaunchKernelGGL(ReadKernel, dim3(2048), dim3(256), 0, 0, data,
+                         TrellisBytes(c.k, c.ns[s], c.bits) / 16, sink);
+    }
+    HIP_OK(hipEventRecord(e1, nullptr));
+    HIP_OK(hipEventSynchronize(e1));
+    float ms = 0.0F;
+    HIP_OK(hipEventElapsedTime(&ms, e0, e1));
+    if (i >= 3)
+      times.push_back(ms);
+  }
+  std::sort(times.begin(), times.end());
+  HIP_OK(hipEventDestroy(e0));
+  HIP_OK(hipEventDestroy(e1));
+  HIP_OK(hipFree(sink));
+  return times[times.size() / 2];
+}
+
 int Time(int reps) {
   std::mt19937 rng(7);
-  std::printf("shape\tk\tn\tK\tM\twarps\ttn\thash\tmedian_us\tGB_s\n");
-  for (const Shape& s : kShapes) {
-    const std::size_t bytes = TrellisBytes(s);
+  std::printf("case\tk\tn\tK\tM\twarps\ttn\tlayout\tmedian_us\tGB_s\n");
+  for (const Case& c : TimeCases()) {
+    const std::size_t bytes = CaseBytes(c);
     const int copies =
         static_cast<int>(std::max<std::size_t>(1, (256U << 20) / bytes + 1));
-    std::vector<std::uint16_t> ht, ha, hs;
-    Buffers b = Allocate(s, copies, rng, &ht, &ha, &hs);
-    const unsigned k_tiles = s.k / 16;
+    std::vector<SlotHost> hosts;
+    Device d = Allocate(c, copies, rng, &hosts);
+    unsigned n_total = 0;
+    for (unsigned n : c.ns)
+      n_total += n;
     for (int m : {1, 2, 4, 8}) {
       for (int tn : {1, 2}) {
         for (unsigned w : {4U, 8U, 16U}) {
-          for (int hash : {0, 1}) {
-            const float ms =
-                TimeLaunches(s, b, Pick(s.bits, m, w, tn, hash), reps);
-            std::printf("%s\t%u\t%u\t%d\t%d\t%u\t%d\t%d\t%.1f\t%.1f\n", s.name,
-                        s.k, s.n, s.bits, m, w, tn, hash, ms * 1000.0F,
+          for (int layout : {0, 1}) {
+            const float ms = TimeLaunch(c, d, Pick(c.bits, m, w, tn, layout), m,
+                                        layout, reps);
+            std::printf("%s\t%u\t%u\t%d\t%d\t%u\t%d\t%d\t%.1f\t%.1f\n", c.name,
+                        c.k, n_total, c.bits, m, w, tn, layout, ms * 1000.0F,
                         bytes / (ms * 1e-3) / 1e9);
           }
         }
       }
     }
-    (void)k_tiles;
-    // Read ceiling over the same copies.
-    unsigned* sink = nullptr;
-    HIP_OK(hipMalloc(&sink, 4));
-    Launcher dummy = nullptr;
-    (void)dummy;
-    hipEvent_t e0;
-    hipEvent_t e1;
-    HIP_OK(hipEventCreate(&e0));
-    HIP_OK(hipEventCreate(&e1));
-    std::vector<float> times;
-    for (int i = 0; i < reps + 3; ++i) {
-      const uint4* data = reinterpret_cast<const uint4*>(
-          b.trellis + b.copy_words * (i % copies));
-      HIP_OK(hipEventRecord(e0, nullptr));
-      hipLaunchKernelGGL(ReadKernel, dim3(2048), dim3(256), 0, 0, data,
-                         bytes / 16, sink);
-      HIP_OK(hipEventRecord(e1, nullptr));
-      HIP_OK(hipEventSynchronize(e1));
-      float ms = 0.0F;
-      HIP_OK(hipEventElapsedTime(&ms, e0, e1));
-      if (i >= 3)
-        times.push_back(ms);
-    }
-    std::sort(times.begin(), times.end());
-    const float ms = times[times.size() / 2];
-    std::printf("%s\t%u\t%u\t%d\tread\t-\t-\t-\t%.1f\t%.1f\n", s.name, s.k, s.n,
-                s.bits, ms * 1000.0F, bytes / (ms * 1e-3) / 1e9);
-    HIP_OK(hipEventDestroy(e0));
-    HIP_OK(hipEventDestroy(e1));
-    HIP_OK(hipFree(sink));
-    Free(b);
+    const float ms = TimeRead(d, c, reps);
+    std::printf("%s\t%u\t%u\t%d\tread\t-\t-\t-\t%.1f\t%.1f\n", c.name, c.k,
+                n_total, c.bits, ms * 1000.0F, bytes / (ms * 1e-3) / 1e9);
+    Free(d);
   }
   return 0;
 }
