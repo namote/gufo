@@ -483,3 +483,35 @@
 - [짐작] V1은 운영 컨트롤러가 이미 쓰는 첫 사이클 보수성을 되살리는 것이라 근거가 명확하다.
 - 깊은 임계값을 바꾸는 것은 81개 프롬프트로 고른 값이라 과적합 위험이 있다. 바꾸면 다시 ABBA로 확인해야 한다.
 - **제안:** V1 + 깊은 임계값 0.9/0.4(자유 파라미터 2개)로 고치고, 다시 빌드하고, I1 대 MAIN ABBA를 다시 한다(MAIN 표본은 재사용하지 않고 새로 번갈아 잰다). 또는 V1만 넣고 깊은 임계값은 Kyojin 그대로 둔다.
+
+## I1 수정판 (2026-10-30, 감독 승인: V1 + 깊은 임계값 0.9/0.4, held-out 세트 추가)
+
+### 코드 (`92fcaf37`)
+
+- **`engine.cpp`:** 확신도 규칙을 요청이 수락을 한 번이라도 관찰한 뒤(`explored_depth != 0`)에만 쓴다. 첫 사이클은 운영 컨트롤러의 폭과 사슬을 그대로 쓴다.
+- **`mtp_policy.hpp`:** 깊은 깊이의 계속 임계값 0.9, 남김 임계값 0.4. 얕은 깊이는 0.6/0.3/3 그대로(Kyojin 값)다.
+- **단위 테스트:** 새 경계를 넣었다(0.99 사슬 7개, 깊은 0.85는 남기고 멈춤, 0.4 남김, 0.3 버림).
+- **`spec_sim.py`:** `ConfidencePolicy` = I1(수정판). 처음 판은 `I1a`로 남겼다. I1a는 기존 I1V 기록과 여전히 81/81 맞는다.
+- **시뮬레이터 (A+K 81개, P0 대비):** I1 1.093, I1a 1.088. 5 %·10 ms보다 느린 프롬프트는 0개다.
+- **포맷:** 내 파일은 clang-format PASS다. 전체 검사는 다른 W의 추적되지 않는 EXL3 작업 파일(`tests/core/quant/exl3_upstream_test.cpp`) 때문에 실패한다. 내 범위 밖이라 손대지 않았다.
+
+### held-out 세트 (`tools/qwen-flash/spec/suite_h.json`, sha256 `a15ebc28…`)
+
+- 32개 프롬프트, 8개 종류(explain, story, code, howto, summary, reasoning, structured, rewrite) × (영문 2 + 한글 2)이다.
+- 임계값을 정한 **뒤에** W9가 새로 썼다. 튜닝에는 쓰지 않았다.
+- **겹침 검사:** `check_heldout.py`(W2 `accept.check_overlap`, 40자 조각을 20자 간격으로). accept_prompts(D4 포함), suite_k, suite_d, d4_ko_prompts, 세트 안 중복을 봤고 모두 **0건**이다. 결과는 manifest에 기록했다.
+- R0/R3 품질 코퍼스는 token window로만 저장돼 있어 이번 검사에서 뺐다.
+
+### 1단계와 빌드 [확인]
+
+- c94572b3 + `build/w9-i1b.patch`(sha256 `5a98e238…`, = ba85850b 09b10ccd f1cf33ac 92fcaf37 src/tests)
+- `qwen38_flash_next_{mtp_sampling,prompt_lookup,draft_vocab}_test` 모두 PASS(`build/w9-nix-i1b.log`). 빌드는 메모리 24 GB, 4코어로 제한했다(XQ가 돌고 있었다).
+- 운영 빌드 `/nix/store/dq89jrza…`, 이미지 `ai-tools/gufo-eval:w9-i1b-rocm101`(label `c94572b3…+w9-5a98e238`)
+
+### 준비한 창 (LOCKS 반영)
+
+1. **`PLAN-W9-HTRACE.json`**(sha256 `fe522388…`): held-out trace. trace 이미지는 `w9-trace2`를 그대로 쓰고, 모델은 NVMe다. 약 10분 [짐작]. 결과로 시뮬레이터의 held-out 검사(I1 대 P0)를 ABBA 전에 한다.
+2. **`PLAN-W9-I1V2.json`**(sha256 `5bd7542e…`): 수정판 I1 서버, A/K/D/H, 기록 포함. 약 25분 [짐작].
+   - `validate --policy I1`: A+K는 M1 trace, H는 HTRACE와 프롬프트별로 정확히 맞아야 한다.
+   - 완성 동일성: A/K/D는 M0 AR, H는 trace와 비교한다.
+3. **`PLAN-W9-ABBA2-{MAIN,I1}.json`**(sha256 `95327218…`, `732e0619…`): MAIN a1 → I1 b1 → I1 b2 → MAIN a2. MAIN은 새로 잰다. A/K/D/H를 따로 판정한다. 창마다 약 20분.
