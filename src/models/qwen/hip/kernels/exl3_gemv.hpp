@@ -63,11 +63,13 @@ struct Exl3FastTarget {
 /// Every target's projection of the shared input x (rows of x_stride floats),
 /// one rotation launch and one GEMV launch per pass of up to 8 rows. The
 /// group must pass Exl3FastGroupSupported; 1 <= rows <= kExl3FastMaxRows.
+/// With input_rotated (rows == 1 only) the slabs already hold the rotated
+/// row (LaunchExl3FastRmsNorm) and x is not read.
 void LaunchExl3FastProjections(std::span<const Exl3FastTarget> targets,
                                const float* x, std::size_t x_stride,
                                std::size_t rows,
                                const Exl3FastWorkspace& workspace,
-                               hipStream_t stream);
+                               hipStream_t stream, bool input_rotated = false);
 
 /// A SwiGLU MLP: out = down(silu(x gate) * (x up)). gate_y and up_y are
 /// [8][gate.n] FP32 scratch rows (the pre-activation sums).
@@ -91,7 +93,19 @@ struct Exl3FastMlp {
 /// memory in FP32; the values are those of the unfused launches.
 void LaunchExl3FastMlp(const Exl3FastMlp& mlp, const float* x,
                        std::size_t x_stride, std::size_t rows,
-                       const Exl3FastWorkspace& workspace, hipStream_t stream);
+                       const Exl3FastWorkspace& workspace, hipStream_t stream,
+                       bool input_rotated = false);
+
+/// RMSNorm of one row of width 5120 (the arithmetic of LaunchRMSNorm) into
+/// `normed`, fused with the rotation of the normed row into the FP16 slab of
+/// every consumer (slab region c for consumer c: the order of a following
+/// LaunchExl3FastProjections / LaunchExl3FastMlp with input_rotated).
+/// Returns false and launches nothing when it does not apply (other widths,
+/// consumers the fast path does not take).
+[[nodiscard]] bool LaunchExl3FastRmsNorm(
+    const float* x, const float* weight, float* normed, std::size_t dim,
+    float eps, std::span<const quant::exl3::DeviceLinear* const> consumers,
+    const Exl3FastWorkspace& workspace, hipStream_t stream);
 
 /// y[r][0..n) = x[r][0..k) W for 1 <= rows <= kExl3FastMaxRows, in passes of
 /// up to 8 rows. Strides in floats.

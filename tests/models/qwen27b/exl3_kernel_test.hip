@@ -23,6 +23,7 @@
 
 #include "src/core/quant/exl3/format.hpp"
 #include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
+#include "src/models/qwen/hip/ops/norm_residual.hpp"
 #include "src/models/qwen/hip/ops/swiglu.hpp"
 
 namespace {
@@ -476,6 +477,117 @@ void TestMlp(std::size_t hidden, std::size_t inter, int bits,
     Check(hipFree(p));
 }
 
+// The fused decode RMSNorm (normed row plus each consumer's rotated slab)
+// followed by the pre-rotated group and MLP launches, against LaunchRMSNorm
+// and the same launches rotating the normed row themselves: bits.
+void TestNormFusion(std::mt19937& rng) {
+  constexpr std::size_t kHidden = 5120;
+  constexpr std::size_t kInter = 1024;
+  const BitRate rate{5, false};
+  std::vector<void*> owned;
+  auto make = [&](std::size_t k, std::size_t n) {
+    std::vector<std::uint16_t> trellis((k / 16) * (n / 16) * rate.TileWords());
+    for (auto& w : trellis)
+      w = static_cast<std::uint16_t>(rng());
+    auto* t = Upload(trellis);
+    auto* su = Upload(RandomScales(rng, k, 0x3800));
+    auto* sv = Upload(RandomScales(rng, n, 0x2000));
+    owned.insert(owned.end(), {t, su, sv});
+    return DeviceLinear{t,
+                        su,
+                        sv,
+                        static_cast<std::uint32_t>(k),
+                        static_cast<std::uint32_t>(n),
+                        rate,
+                        Codebook::kMul1};
+  };
+  const DeviceLinear q = make(kHidden, 2048);
+  const DeviceLinear k = make(kHidden, 1024);
+  const DeviceLinear v = make(kHidden, 1024);
+  const DeviceLinear gate = make(kHidden, kInter);
+  const DeviceLinear up = make(kHidden, kInter);
+  const DeviceLinear down = make(kInter, kHidden);
+  std::normal_distribution<float> normal;
+  std::vector<float> hidden(kHidden), norm_w(kHidden);
+  for (auto& x : hidden)
+    x = 3.0F * normal(rng);
+  for (auto& x : norm_w)
+    x = 1.0F + 0.1F * normal(rng);
+  auto* d_hidden = Upload(hidden);
+  auto* d_norm_w = Upload(norm_w);
+  std::vector<float*> buffers;
+  auto alloc = [&](std::size_t n) {
+    float* p = nullptr;
+    Check(hipMalloc(&p, n * sizeof(float)));
+    buffers.push_back(p);
+    return p;
+  };
+  float* normed_a = alloc(kHidden);
+  float* normed_b = alloc(kHidden);
+  float* ya[3] = {alloc(2048), alloc(1024), alloc(1024)};
+  float* yb[3] = {alloc(2048), alloc(1024), alloc(1024)};
+  float *g = alloc(kInter), *u = alloc(kInter), *act = alloc(kInter);
+  float *out_a = alloc(kHidden), *out_b = alloc(kHidden);
+  gufo::hip::Exl3FastWorkspace ws;
+  ws.input_elements = 3 * 8 * kHidden;
+  Check(hipMalloc(&ws.input, ws.input_elements * sizeof(std::uint16_t)));
+  ws.counter_count = kHidden / 128;
+  Check(hipMalloc(&ws.counters, ws.counter_count * sizeof(std::uint32_t)));
+  Check(hipMemset(ws.counters, 0, ws.counter_count * sizeof(std::uint32_t)));
+  ws.down_input_elements = 8 * kInter;
+  Check(hipMalloc(&ws.down_input,
+                  ws.down_input_elements * sizeof(std::uint16_t)));
+
+  // q + k + v.
+  const DeviceLinear* qkv[] = {&q, &k, &v};
+  const gufo::hip::Exl3FastTarget ta[] = {
+      {&q, ya[0], 2048}, {&k, ya[1], 1024}, {&v, ya[2], 1024}};
+  const gufo::hip::Exl3FastTarget tb[] = {
+      {&q, yb[0], 2048}, {&k, yb[1], 1024}, {&v, yb[2], 1024}};
+  const bool fused = gufo::hip::LaunchExl3FastRmsNorm(
+      d_hidden, d_norm_w, normed_a, kHidden, 1e-6F, qkv, ws, nullptr);
+  Expect(fused, "fused norm applies to the q + k + v group");
+  gufo::hip::LaunchExl3FastProjections(ta, normed_a, kHidden, 1, ws, nullptr,
+                                       true);
+  gufo::hip::LaunchRMSNorm(d_hidden, d_norm_w, normed_b, kHidden, 1e-6F,
+                           nullptr);
+  gufo::hip::LaunchExl3FastProjections(tb, normed_b, kHidden, 1, ws, nullptr);
+  Check(hipDeviceSynchronize());
+  bool same = Download(normed_a, kHidden) == Download(normed_b, kHidden);
+  Expect(same, "fused norm row differs from LaunchRMSNorm");
+  for (int i = 0; i < 3; ++i) {
+    const std::size_t n = i == 0 ? 2048 : 1024;
+    const bool slot_same = Download(ya[i], n) == Download(yb[i], n);
+    Expect(slot_same, "pre-rotated group slot differs");
+    same = same && slot_same;
+  }
+
+  // gate + up + down.
+  const DeviceLinear* gu[] = {&gate, &up};
+  Expect(gufo::hip::LaunchExl3FastRmsNorm(d_hidden, d_norm_w, normed_a, kHidden,
+                                          1e-6F, gu, ws, nullptr),
+         "fused norm applies to the MLP");
+  const gufo::hip::Exl3FastMlp mlp_a{&gate, &up, &down, g, u, out_a, kHidden};
+  gufo::hip::LaunchExl3FastMlp(mlp_a, normed_a, kHidden, 1, ws, nullptr, true);
+  const gufo::hip::Exl3FastMlp mlp_b{&gate, &up, &down, g, u, out_b, kHidden};
+  gufo::hip::LaunchExl3FastMlp(mlp_b, normed_b, kHidden, 1, ws, nullptr);
+  Check(hipDeviceSynchronize());
+  const bool mlp_same = Download(out_a, kHidden) == Download(out_b, kHidden);
+  Expect(mlp_same, "pre-rotated MLP differs");
+  same = same && mlp_same;
+  std::cout << "norm fusion: " << (same ? "bit-identical to" : "DIFFERS from")
+            << " the unfused launches\n";
+  (void)act;
+  for (void* p : owned)
+    Check(hipFree(p));
+  for (float* p : buffers)
+    Check(hipFree(p));
+  for (void* p : {static_cast<void*>(d_hidden), static_cast<void*>(d_norm_w),
+                  static_cast<void*>(ws.input), static_cast<void*>(ws.counters),
+                  static_cast<void*>(ws.down_input)})
+    Check(hipFree(p));
+}
+
 }  // namespace
 
 int main() {
@@ -492,6 +604,7 @@ int main() {
   TestGroup(1024, {2048, 1024}, 6, rng);
   TestMlp(512, 1024, 5, rng);
   TestMlp(1024, 2048, 4, rng);
+  TestNormFusion(rng);
   if (failures != 0) {
     std::cerr << failures << " failure(s)\n";
     return 1;

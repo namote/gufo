@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <initializer_list>
 #include <span>
 #include <stdexcept>
 
@@ -72,11 +73,13 @@ struct Exl3GroupOutput {
 /// Every output's projection of the same input rows. Decode and verify rows
 /// of a group the fast path takes run as one launch per pass of 8 rows; any
 /// other group runs projection by projection through LaunchExl3Projection.
+/// `input_rotated`: LaunchExl3NormForConsumers wrote this group's rotated
+/// input (rows == 1); x still holds the unrotated rows for any fallback.
 inline void LaunchExl3Projections(std::span<const Exl3GroupOutput> outputs,
                                   const float* x, std::size_t rows,
                                   const quant::exl3::ReferenceScratch* scratch,
-                                  hipStream_t stream,
-                                  std::size_t x_stride = 0) {
+                                  hipStream_t stream, std::size_t x_stride = 0,
+                                  bool input_rotated = false) {
   if (scratch == nullptr || outputs.empty()) {
     throw std::logic_error(
         "EXL3 projection group without outputs or workspace");
@@ -99,9 +102,9 @@ inline void LaunchExl3Projections(std::span<const Exl3GroupOutput> outputs,
         scratch->fast_down_input, scratch->fast_down_input_elements};
     const std::span<const Exl3FastTarget> group(targets.data(), outputs.size());
     if (all_exl3 && Exl3FastGroupSupported(group, workspace)) {
-      LaunchExl3FastProjections(group, x,
-                                x_stride != 0 ? x_stride : targets[0].linear->k,
-                                rows, workspace, stream);
+      LaunchExl3FastProjections(
+          group, x, x_stride != 0 ? x_stride : targets[0].linear->k, rows,
+          workspace, stream, input_rotated && rows == 1);
       return;
     }
   }
@@ -122,7 +125,8 @@ inline void LaunchExl3SwiGLUMlp(const models::QwenTensorRef& gate,
                                 const float* x, std::size_t rows, float* gate_y,
                                 float* up_y, float* activation, float* out,
                                 const quant::exl3::ReferenceScratch* scratch,
-                                hipStream_t stream) {
+                                hipStream_t stream,
+                                bool input_rotated = false) {
   if (scratch == nullptr || gate.exl3 == nullptr || up.exl3 == nullptr ||
       down.exl3 == nullptr) {
     throw std::logic_error("EXL3 MLP without descriptors or workspace");
@@ -135,7 +139,8 @@ inline void LaunchExl3SwiGLUMlp(const models::QwenTensorRef& gate,
     const Exl3FastMlp mlp{gate.exl3, up.exl3, down.exl3,   gate_y,
                           up_y,      out,     down.exl3->n};
     if (Exl3FastMlpSupported(mlp, workspace)) {
-      LaunchExl3FastMlp(mlp, x, gate.exl3->k, rows, workspace, stream);
+      LaunchExl3FastMlp(mlp, x, gate.exl3->k, rows, workspace, stream,
+                        input_rotated && rows == 1);
       return;
     }
   }
@@ -144,6 +149,36 @@ inline void LaunchExl3SwiGLUMlp(const models::QwenTensorRef& gate,
   LaunchBatchedSwiGLUActivation(gate_y, up_y, activation, nullptr,
                                 rows * gate.exl3->n, stream);
   LaunchExl3Projection(down, activation, rows, out, scratch, stream);
+}
+
+/// Decode RMSNorm (one row) of `x` into `normed`, fused with the rotation of
+/// the normed row into the fast-path slabs of `consumers` (in the order of
+/// the following group or MLP call, which then passes input_rotated). Returns
+/// false, launching nothing, when the fast path does not apply; the caller
+/// then runs its usual norm.
+inline bool LaunchExl3NormForConsumers(
+    const float* x, const float* weight, float* normed, std::size_t dim,
+    float eps, std::initializer_list<const models::QwenTensorRef*> consumers,
+    const quant::exl3::ReferenceScratch* scratch, hipStream_t stream) {
+  if (scratch == nullptr || scratch->fast_input == nullptr ||
+      consumers.size() > kExl3FastMaxGroup) {
+    return false;
+  }
+  std::array<const quant::exl3::DeviceLinear*, kExl3FastMaxGroup> linears{};
+  std::size_t count = 0;
+  for (const auto* weight_ref : consumers) {
+    if (weight_ref->exl3 == nullptr) {
+      return false;
+    }
+    linears[count++] = weight_ref->exl3;
+  }
+  const Exl3FastWorkspace workspace{
+      scratch->fast_input,      scratch->fast_input_elements,
+      scratch->fast_counters,   scratch->fast_counter_count,
+      scratch->fast_down_input, scratch->fast_down_input_elements};
+  return LaunchExl3FastRmsNorm(x, weight, normed, dim, eps,
+                               std::span(linears.data(), count), workspace,
+                               stream);
 }
 
 /// The largest input width of the model's projections (workspace sizing).

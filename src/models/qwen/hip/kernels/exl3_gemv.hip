@@ -86,6 +86,80 @@ __global__ __launch_bounds__(kRotateWaves * 32) void Exl3RotateInputKernel(
   }
 }
 
+// RMSNorm of one 5120-wide row, the arithmetic of norm.hip RMSNormKernel
+// <5120> (cached row, FMA sum, the same tree), stored as FP32 and, for every
+// consumer, rotated with its suh into its FP16 slab (M = 1 lane-major), with
+// the input-rotation arithmetic of Exl3RotateInputKernel.
+constexpr std::size_t kNormDim = 5120;
+
+__global__ __launch_bounds__(256) void Exl3RmsNormRotateKernel(
+    const float* __restrict__ x, const float* __restrict__ weight,
+    float* __restrict__ out, float eps, RotateArgs rotate, unsigned consumers) {
+  __shared__ float s_sum[256];
+  __shared__ float s_row[kNormDim];
+  const std::size_t tid = threadIdx.x;
+  constexpr std::size_t kItems = kNormDim / 256;
+  float values[kItems];
+  float weights[kItems];
+  float sum_sq = 0.0F;
+#pragma unroll
+  for (std::size_t item = 0; item < kItems; ++item) {
+    const std::size_t i = tid + item * 256;
+    const float val = x[i];
+    values[item] = val;
+    weights[item] = weight != nullptr ? weight[i] : 1.0F;
+    sum_sq = __fmaf_rn(val, val, sum_sq);
+  }
+  s_sum[tid] = sum_sq;
+  __syncthreads();
+  for (std::size_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (tid < stride) {
+      s_sum[tid] += s_sum[tid + stride];
+    }
+    __syncthreads();
+  }
+  const float mean_sq = s_sum[0] / static_cast<float>(kNormDim);
+  const float inv_rms = rsqrtf(mean_sq + eps);
+#pragma unroll
+  for (std::size_t item = 0; item < kItems; ++item) {
+    const float normed = (values[item] * inv_rms) * weights[item];
+    out[tid + item * 256] = normed;
+    s_row[tid + item * 256] = normed;
+  }
+  __syncthreads();
+  const unsigned lane = tid % 32;
+  const unsigned wave = tid / 32;
+  constexpr unsigned kSegments = kNormDim / exl3::kSegment;
+  for (unsigned c = 0; c < consumers; ++c) {
+    const _Float16* suh = rotate.suh[0];
+    _Float16* slab = rotate.out[0];
+    if (c == 1) {
+      suh = rotate.suh[1];
+      slab = rotate.out[1];
+    } else if (c == 2) {
+      suh = rotate.suh[2];
+      slab = rotate.out[2];
+    }
+    for (unsigned segment = wave; segment < kSegments; segment += 8) {
+      const unsigned first = segment * exl3::kSegment + lane * 4;
+      float v[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        v[j] = s_row[first + j] * static_cast<float>(suh[first + j]);
+        asm volatile("" : "+v"(v[j]));
+      }
+      exl3::Butterfly128(v, lane);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        v[j] *= kHadamardScale;
+        asm volatile("" : "+v"(v[j]));
+        slab[exl3::LaneMajorOffset(first + j, 0, 1)] =
+            static_cast<_Float16>(v[j]);
+      }
+    }
+  }
+}
+
 // One matrix of a launch: its trellis, rotated input, output and counters.
 // Blocks [block_begin, next slot's block_begin) work it.
 struct GemvSlot {
@@ -389,7 +463,8 @@ void LaunchGemvBits(int bits, const GemvArgs& args, const LaunchShape& shape,
 template<unsigned M>
 void LaunchPass(std::span<const Exl3FastTarget> targets, const float* x,
                 std::size_t x_stride, unsigned rows, std::size_t first_row,
-                const Exl3FastWorkspace& ws, hipStream_t stream) {
+                const Exl3FastWorkspace& ws, hipStream_t stream,
+                bool input_rotated) {
   const auto& first = *targets[0].linear;
   auto* slab = reinterpret_cast<_Float16*>(ws.input);
   RotateArgs rotate{};
@@ -416,10 +491,12 @@ void LaunchPass(std::span<const Exl3FastTarget> targets, const float* x,
     blocks_two_tiles += linear.n / 32;
   }
   const unsigned segments = first.k / exl3::kSegment;
-  hipLaunchKernelGGL(
-      Exl3RotateInputKernel<M>,
-      dim3((segments + kRotateWaves - 1) / kRotateWaves, M, gemv.slots),
-      dim3(kRotateWaves * 32), 0, stream, x, x_stride, rows, first.k, rotate);
+  if (!input_rotated) {
+    hipLaunchKernelGGL(
+        Exl3RotateInputKernel<M>,
+        dim3((segments + kRotateWaves - 1) / kRotateWaves, M, gemv.slots),
+        dim3(kRotateWaves * 32), 0, stream, x, x_stride, rows, first.k, rotate);
+  }
   LaunchGemvBits<M>(first.rate.bits, gemv,
                     PickShape(first.k / 16, blocks_two_tiles), stream);
   HIP_CHECK(hipGetLastError());
@@ -430,7 +507,8 @@ void LaunchPass(std::span<const Exl3FastTarget> targets, const float* x,
 template<unsigned M>
 void LaunchMlpPass(const Exl3FastMlp& mlp, const float* x, std::size_t x_stride,
                    unsigned rows, std::size_t first_row,
-                   const Exl3FastWorkspace& ws, hipStream_t stream) {
+                   const Exl3FastWorkspace& ws, hipStream_t stream,
+                   bool input_rotated) {
   const auto& gate = *mlp.gate;
   const auto& up = *mlp.up;
   const auto& down = *mlp.down;
@@ -459,10 +537,12 @@ void LaunchMlpPass(const Exl3FastMlp& mlp, const float* x, std::size_t x_stride,
     slot.n = gate.n;
   }
   const unsigned segments = gate.k / exl3::kSegment;
-  hipLaunchKernelGGL(Exl3RotateInputKernel<M>,
-                     dim3((segments + kRotateWaves - 1) / kRotateWaves, M, 2),
-                     dim3(kRotateWaves * 32), 0, stream, x, x_stride, rows,
-                     gate.k, rotate);
+  if (!input_rotated) {
+    hipLaunchKernelGGL(Exl3RotateInputKernel<M>,
+                       dim3((segments + kRotateWaves - 1) / kRotateWaves, M, 2),
+                       dim3(kRotateWaves * 32), 0, stream, x, x_stride, rows,
+                       gate.k, rotate);
+  }
   LaunchGemvBits<M, kSwiGLUDown>(
       gate.rate.bits, gemv, PickShape(gate.k / 16, 2 * (gate.n / 32)), stream);
   GemvArgs down_args{};
@@ -513,23 +593,31 @@ void LaunchExl3FastProjections(std::span<const Exl3FastTarget> targets,
                                const float* x, std::size_t x_stride,
                                std::size_t rows,
                                const Exl3FastWorkspace& workspace,
-                               hipStream_t stream) {
+                               hipStream_t stream, bool input_rotated) {
   if (!Exl3FastGroupSupported(targets, workspace) || rows == 0 ||
-      rows > kExl3FastMaxRows) {
+      rows > kExl3FastMaxRows || (input_rotated && rows != 1)) {
     throw std::invalid_argument("EXL3 fast projection: unsupported call");
+  }
+  if (input_rotated) {
+    LaunchPass<1>(targets, x, x_stride, 1, 0, workspace, stream, true);
+    return;
   }
   for (std::size_t first = 0; first < rows; first += exl3::kMaxRows) {
     const auto pass = static_cast<unsigned>(
         std::min<std::size_t>(exl3::kMaxRows, rows - first));
     const float* xp = x + first * x_stride;
     if (pass == 1) {
-      LaunchPass<1>(targets, xp, x_stride, pass, first, workspace, stream);
+      LaunchPass<1>(targets, xp, x_stride, pass, first, workspace, stream,
+                    false);
     } else if (pass == 2) {
-      LaunchPass<2>(targets, xp, x_stride, pass, first, workspace, stream);
+      LaunchPass<2>(targets, xp, x_stride, pass, first, workspace, stream,
+                    false);
     } else if (pass <= 4) {
-      LaunchPass<4>(targets, xp, x_stride, pass, first, workspace, stream);
+      LaunchPass<4>(targets, xp, x_stride, pass, first, workspace, stream,
+                    false);
     } else {
-      LaunchPass<8>(targets, xp, x_stride, pass, first, workspace, stream);
+      LaunchPass<8>(targets, xp, x_stride, pass, first, workspace, stream,
+                    false);
     }
   }
 }
@@ -553,23 +641,32 @@ bool Exl3FastMlpSupported(const Exl3FastMlp& mlp,
 
 void LaunchExl3FastMlp(const Exl3FastMlp& mlp, const float* x,
                        std::size_t x_stride, std::size_t rows,
-                       const Exl3FastWorkspace& workspace, hipStream_t stream) {
+                       const Exl3FastWorkspace& workspace, hipStream_t stream,
+                       bool input_rotated) {
   if (!Exl3FastMlpSupported(mlp, workspace) || rows == 0 ||
-      rows > kExl3FastMaxRows) {
+      rows > kExl3FastMaxRows || (input_rotated && rows != 1)) {
     throw std::invalid_argument("EXL3 fast MLP: unsupported call");
+  }
+  if (input_rotated) {
+    LaunchMlpPass<1>(mlp, x, x_stride, 1, 0, workspace, stream, true);
+    return;
   }
   for (std::size_t first = 0; first < rows; first += exl3::kMaxRows) {
     const auto pass = static_cast<unsigned>(
         std::min<std::size_t>(exl3::kMaxRows, rows - first));
     const float* xp = x + first * x_stride;
     if (pass == 1) {
-      LaunchMlpPass<1>(mlp, xp, x_stride, pass, first, workspace, stream);
+      LaunchMlpPass<1>(mlp, xp, x_stride, pass, first, workspace, stream,
+                       false);
     } else if (pass == 2) {
-      LaunchMlpPass<2>(mlp, xp, x_stride, pass, first, workspace, stream);
+      LaunchMlpPass<2>(mlp, xp, x_stride, pass, first, workspace, stream,
+                       false);
     } else if (pass <= 4) {
-      LaunchMlpPass<4>(mlp, xp, x_stride, pass, first, workspace, stream);
+      LaunchMlpPass<4>(mlp, xp, x_stride, pass, first, workspace, stream,
+                       false);
     } else {
-      LaunchMlpPass<8>(mlp, xp, x_stride, pass, first, workspace, stream);
+      LaunchMlpPass<8>(mlp, xp, x_stride, pass, first, workspace, stream,
+                       false);
     }
   }
 }
@@ -581,7 +678,32 @@ void LaunchExl3FastProjection(const quant::exl3::DeviceLinear& linear,
                               hipStream_t stream) {
   const Exl3FastTarget target{&linear, y, y_stride};
   LaunchExl3FastProjections(std::span(&target, 1), x, x_stride, rows, workspace,
-                            stream);
+                            stream, false);
+}
+
+bool LaunchExl3FastRmsNorm(
+    const float* x, const float* weight, float* normed, std::size_t dim,
+    float eps, std::span<const quant::exl3::DeviceLinear* const> consumers,
+    const Exl3FastWorkspace& workspace, hipStream_t stream) {
+  if (dim != kNormDim || consumers.empty() ||
+      consumers.size() > kExl3FastMaxGroup ||
+      workspace.input_elements < consumers.size() * exl3::kMaxRows * dim) {
+    return false;
+  }
+  RotateArgs rotate{};
+  auto* slab = reinterpret_cast<_Float16*>(workspace.input);
+  for (std::size_t c = 0; c < consumers.size(); ++c) {
+    if (!Exl3FastSupported(*consumers[c]) || consumers[c]->k != dim) {
+      return false;
+    }
+    rotate.suh[c] = reinterpret_cast<const _Float16*>(consumers[c]->suh);
+    rotate.out[c] = slab + c * exl3::kMaxRows * dim;
+  }
+  hipLaunchKernelGGL(Exl3RmsNormRotateKernel, dim3(1), dim3(256), 0, stream, x,
+                     weight, normed, eps, rotate,
+                     static_cast<unsigned>(consumers.size()));
+  HIP_CHECK(hipGetLastError());
+  return true;
 }
 
 }  // namespace gufo::hip

@@ -104,7 +104,26 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
         static_cast<void*>(arena.stream), l, pos);
 
     const auto& rotation = layer.rotation;
-    if (rotation.attn_in != nullptr) {
+    // EXL3 layers norm and rotate the row for their input group in one
+    // launch (false: the usual norm below).
+    const bool attn_rotated =
+        layer.is_full_attention
+            ? IsExl3(layer.attn_q) &&
+                  LaunchExl3NormForConsumers(
+                      decode_scratch.hidden.data(),
+                      static_cast<const float*>(layer.attn_norm.data),
+                      decode_scratch.normed.data(), hidden_size, 1e-6F,
+                      {&layer.attn_q, &layer.attn_k, &layer.attn_v}, exl3,
+                      arena.stream)
+            : IsExl3(layer.attn_qkv) &&
+                  LaunchExl3NormForConsumers(
+                      decode_scratch.hidden.data(),
+                      static_cast<const float*>(layer.attn_norm.data),
+                      decode_scratch.normed.data(), hidden_size, 1e-6F,
+                      {&layer.attn_qkv, &layer.attn_gate}, exl3, arena.stream);
+    if (attn_rotated) {
+      // Normed and rotated above.
+    } else if (rotation.attn_in != nullptr) {
       LaunchRMSNormRotated(decode_scratch.hidden.data(),
                            static_cast<const float*>(layer.attn_norm.data),
                            decode_scratch.normed.data(), hidden_size, 1e-6F,
@@ -130,7 +149,7 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
             {&layer.attn_k, attention_scratch.k.data()},
             {&layer.attn_v, attention_scratch.v.data()}};
         LaunchExl3Projections(qkv, decode_scratch.normed.data(), 1, exl3,
-                              arena.stream);
+                              arena.stream, 0, attn_rotated);
       } else {
         LaunchFusedQKVProjections(
             layer.attn_q.data, layer.attn_q.type, layer.attn_k.data,
@@ -253,7 +272,7 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
             {&layer.attn_qkv, ssm_scratch.qkv.data()},
             {&layer.attn_gate, ssm_scratch.gate.data()}};
         LaunchExl3Projections(qkvz, decode_scratch.normed.data(), 1, exl3,
-                              arena.stream);
+                              arena.stream, 0, attn_rotated);
         LaunchGEMV(layer.ssm_alpha.data, layer.ssm_alpha.type,
                    decode_scratch.normed.data(), ssm_scratch.alpha.data(),
                    time_step_rank, hidden_size, arena.stream);
@@ -298,13 +317,22 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
       }
     }
 
+    bool ffn_rotated = false;
     {
       gufo::models::qwen::ResidualAdd(module_ctx, decode_scratch.hidden,
                                       attention_scratch.output);
 
       {
-        // FFN Pre-RMSNorm
-        if (rotation.ffn_in != nullptr) {
+        // FFN Pre-RMSNorm (EXL3: fused with the gate/up input rotation).
+        ffn_rotated = IsExl3(layer.ffn_gate) &&
+                      LaunchExl3NormForConsumers(
+                          decode_scratch.hidden.data(),
+                          static_cast<const float*>(layer.ffn_norm.data),
+                          decode_scratch.normed.data(), hidden_size, 1e-6F,
+                          {&layer.ffn_gate, &layer.ffn_up}, exl3, arena.stream);
+        if (ffn_rotated) {
+          // Normed and rotated above.
+        } else if (rotation.ffn_in != nullptr) {
           LaunchRMSNormRotated(decode_scratch.hidden.data(),
                                static_cast<const float*>(layer.ffn_norm.data),
                                decode_scratch.normed.data(), hidden_size, 1e-6F,
@@ -324,7 +352,7 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
                           decode_scratch.normed.data(), 1,
                           ffn_scratch.gate.data(), ffn_scratch.up.data(),
                           ffn_scratch.activation.data(), ffn_scratch.out.data(),
-                          exl3, arena.stream);
+                          exl3, arena.stream, ffn_rotated);
     } else if (rotation.ffn_down_in != nullptr) {
       // The module's two launches with the SwiGLU row rotated in between.
       const std::size_t intermediate_size = config.intermediate_size;
