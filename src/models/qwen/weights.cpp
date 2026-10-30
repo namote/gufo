@@ -18,9 +18,21 @@
 namespace gufo::models {
 namespace {
 
+// EXL3 projections (QwenModelWeights::LoadFromGguf `projections`), consulted
+// when the reader does not hold a tensor. Set only while LoadFromGguf runs.
+thread_local const std::vector<std::pair<std::string, QwenTensorRef>>*
+    g_projections = nullptr;
+
 QwenTensorRef ExtractTensorRef(const core::GgufReader& reader,
                                std::string_view name) {
   const auto* tensor = reader.FindTensor(name);
+  if (tensor == nullptr && g_projections != nullptr) {
+    for (const auto& [projection_name, ref] : *g_projections) {
+      if (projection_name == name) {
+        return ref;
+      }
+    }
+  }
   if (tensor == nullptr || tensor->data == nullptr) {
     return {};
   }
@@ -106,6 +118,21 @@ bool ValidateTensor(const QwenTensorRef& tensor, std::size_t expected_elements,
       *error_msg = "Missing required Qwen tensor: " + std::string(name);
     }
     return false;
+  }
+  if (tensor.exl3 != nullptr) {
+    // EXL3 projection: W [in][out] with in = row_elements.
+    const auto& linear = *tensor.exl3;
+    const std::size_t elements = static_cast<std::size_t>(linear.k) * linear.n;
+    if (role != TensorRole::kProjection || elements != expected_elements ||
+        (row_elements != 0 && linear.k != row_elements)) {
+      if (error_msg != nullptr) {
+        *error_msg = "EXL3 tensor shape or role mismatch for " +
+                     std::string(name) + ": " + std::to_string(linear.k) +
+                     " x " + std::to_string(linear.n);
+      }
+      return false;
+    }
+    return true;
   }
   if (!SupportsTensorType(tensor.type, role)) {
     if (error_msg != nullptr) {
@@ -431,7 +458,12 @@ bool BindRotation(const core::GgufReader& reader, QwenModelWeights& weights,
 }  // namespace
 
 std::optional<QwenModelWeights> QwenModelWeights::LoadFromGguf(
-    const core::GgufReader& reader, std::string* error_msg) {
+    const core::GgufReader& reader, std::string* error_msg,
+    const std::vector<std::pair<std::string, QwenTensorRef>>* projections) {
+  g_projections = projections;
+  struct Reset {
+    ~Reset() { g_projections = nullptr; }
+  } reset;
   const auto config_opt = reader.ExtractModelConfig(error_msg);
   if (!config_opt.has_value()) {
     return std::nullopt;

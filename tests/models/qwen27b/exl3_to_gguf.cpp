@@ -8,6 +8,12 @@
 //     tensors must match exactly; quantized projections report the relative
 //     error and correlation against the BF16 original (the EXL3 quantization
 //     error, about 0.04-0.14 at 5-3 bits; a layout error shows as ~1 or more).
+//   exl3_to_gguf metadata EXL3_DIR OUT.gguf GGUF_SHARD
+//     Writes the X2a metadata sidecar: every key of the GGUF except split.*,
+//     plus gufo.exl3.checkpoint (EXL3_DIR relative to OUT's directory), no
+//     tensors; refuses when config.json or tokenizer.json disagree with it.
+//   exl3_to_gguf load SIDECAR [--q8-embedding] [--threads N]
+//     Runs the X2a host loader (LoadFromSidecar) and prints what it bound.
 //   exl3_to_gguf write EXL3_DIR OUT.gguf GGUF_SHARD... [--threads N]
 //     Writes a single-file BF16 GGUF: the metadata of the given (template)
 //     GGUF without split.* keys, and every template tensor built from the
@@ -18,6 +24,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -37,70 +44,8 @@ using gufo::core::GgmlType;
 using gufo::core::GgufReader;
 namespace qe = gufo::models::qwen_exl3;
 
-struct RawKv {
-  std::string key;
-  std::vector<std::uint8_t> bytes;  // key + type + value, as stored
-};
-
-// Minimal GGUF v3 metadata scanner (key/value byte ranges of the first file).
-std::vector<RawKv> ReadRawMetadata(const std::string& path) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in)
-    throw std::runtime_error("cannot open " + path);
-  auto read = [&](void* p, std::size_t n) {
-    if (!in.read(static_cast<char*>(p), static_cast<std::streamsize>(n)))
-      throw std::runtime_error("truncated GGUF " + path);
-  };
-  char magic[4];
-  read(magic, 4);
-  if (std::memcmp(magic, "GGUF", 4) != 0)
-    throw std::runtime_error("not GGUF");
-  std::uint32_t version;
-  std::uint64_t tensors, kvs;
-  read(&version, 4);
-  read(&tensors, 8);
-  read(&kvs, 8);
-  std::vector<RawKv> out;
-  std::function<void(std::uint32_t)> skip = [&](std::uint32_t type) {
-    static const int sizes[] = {1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8};
-    if (type == 8) {
-      std::uint64_t n;
-      read(&n, 8);
-      in.seekg(static_cast<std::streamoff>(n), std::ios::cur);
-    } else if (type == 9) {
-      std::uint32_t et;
-      std::uint64_t n;
-      read(&et, 4);
-      read(&n, 8);
-      if (et != 8 && et != 9) {
-        in.seekg(static_cast<std::streamoff>(n * sizes[et]), std::ios::cur);
-      } else {
-        for (std::uint64_t i = 0; i < n; ++i)
-          skip(et);
-      }
-    } else {
-      in.seekg(sizes[type], std::ios::cur);
-    }
-  };
-  for (std::uint64_t i = 0; i < kvs; ++i) {
-    const auto start = in.tellg();
-    std::uint64_t len;
-    read(&len, 8);
-    std::string key(len, '\0');
-    read(key.data(), len);
-    std::uint32_t type;
-    read(&type, 4);
-    skip(type);
-    const auto end = in.tellg();
-    RawKv kv;
-    kv.key = key;
-    kv.bytes.resize(static_cast<std::size_t>(end - start));
-    in.seekg(start);
-    read(kv.bytes.data(), kv.bytes.size());
-    out.push_back(std::move(kv));
-  }
-  return out;
-}
+using qe::RawKv;
+using qe::ReadRawMetadata;
 
 struct Template {
   std::vector<std::unique_ptr<GgufReader>> shards;
@@ -312,6 +257,124 @@ int Write(const std::string& exl3_dir, const std::string& out_path,
   return 0;
 }
 
+int Metadata(const std::string& exl3_dir, const std::string& out_path,
+             const std::string& template_path) {
+  std::vector<RawKv> kvs;
+  for (auto& kv : ReadRawMetadata(template_path)) {
+    if (!kv.key.starts_with("split.") && kv.key != qe::kCheckpointKey)
+      kvs.push_back(std::move(kv));
+  }
+  const auto out_dir = std::filesystem::absolute(out_path).parent_path();
+  const auto relative =
+      std::filesystem::relative(std::filesystem::absolute(exl3_dir), out_dir);
+  kvs.push_back(qe::StringKv(qe::kCheckpointKey, relative.generic_string()));
+  std::vector<std::uint8_t> image;
+  auto put = [&](const void* p, std::size_t n) {
+    const auto* b = static_cast<const std::uint8_t*>(p);
+    image.insert(image.end(), b, b + n);
+  };
+  const std::uint32_t version = 3;
+  const std::uint64_t tensors = 0, count = kvs.size();
+  put("GGUF", 4);
+  put(&version, 4);
+  put(&tensors, 8);
+  put(&count, 8);
+  for (const auto& kv : kvs)
+    put(kv.bytes.data(), kv.bytes.size());
+  image.resize((image.size() + 31) / 32 * 32, 0);
+  std::string error;
+  auto reader = GgufReader::OpenMemory(image.data(), image.size(), &error);
+  if (!reader)
+    throw std::runtime_error("sidecar does not parse: " + error);
+  if (auto mismatch = qe::CheckSidecar(exl3_dir, *reader); !mismatch.empty())
+    throw std::runtime_error("refused: " + mismatch);
+  std::ofstream out(out_path, std::ios::binary);
+  out.write(reinterpret_cast<const char*>(image.data()),
+            static_cast<std::streamsize>(image.size()));
+  out.close();
+  if (!out)
+    throw std::runtime_error("write failed: " + out_path);
+  std::cout << "wrote " << out_path << " (" << image.size() << " bytes, "
+            << kvs.size() << " keys, checkpoint " << relative.generic_string()
+            << ")\n";
+  return 0;
+}
+
+int Load(const std::string& sidecar_path, bool q8_embedding, int threads) {
+  std::string error;
+  auto sidecar = GgufReader::OpenFile(sidecar_path, &error);
+  if (!sidecar)
+    throw std::runtime_error(error);
+  const auto t0 = std::chrono::steady_clock::now();
+  auto loaded = qe::LoadFromSidecar(
+      sidecar_path, *sidecar,
+      q8_embedding ? qe::EmbeddingFormat::kQ8_0 : qe::EmbeddingFormat::kBf16,
+      &error, threads);
+  if (!loaded)
+    throw std::runtime_error(error);
+  const double secs =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+          .count();
+  std::size_t exl3 = 0, other = 0;
+  auto count = [&](const gufo::models::QwenTensorRef& t) {
+    if (t.empty())
+      return;
+    (t.exl3 != nullptr ? exl3 : other) += 1;
+  };
+  const auto& w = loaded->weights;
+  count(w.token_embd);
+  count(w.output_norm);
+  count(w.output);
+  for (const auto& l : w.layers) {
+    for (const auto* t :
+         {&l.attn_norm, &l.ffn_norm,    &l.attn_q,      &l.attn_k,
+          &l.attn_v,    &l.attn_output, &l.attn_q_norm, &l.attn_k_norm,
+          &l.attn_qkv,  &l.attn_gate,   &l.ssm_a,       &l.ssm_conv1d,
+          &l.ssm_dt,    &l.ssm_alpha,   &l.ssm_beta,    &l.ssm_norm,
+          &l.ssm_out,   &l.ffn_gate,    &l.ffn_up,      &l.ffn_down})
+      count(*t);
+  }
+  // Host copies (block-permuted trellis) against the X1 tensors, for every
+  // reorder kind: qkv (V rows), gate (all rows), ssm_out (input columns),
+  // plus a full-attention q and the head.
+  {
+    const auto checkpoint_dir =
+        std::filesystem::path(sidecar_path).parent_path() /
+        std::string(*sidecar->GetMetadataString(qe::kCheckpointKey));
+    const auto checkpoint = gufo::quant::exl3::Checkpoint::Open(checkpoint_dir);
+    const auto geometry = qe::GeometryFromGguf(*sidecar, &error);
+    const qe::Source source(checkpoint, *geometry);
+    const auto& l0 = loaded->weights.layers[0];
+    const auto& l3 = loaded->weights.layers[3];
+    const std::pair<const char*, const gufo::models::QwenTensorRef*> checks[] =
+        {{"blk.0.attn_qkv.weight", &l0.attn_qkv},
+         {"blk.0.attn_gate.weight", &l0.attn_gate},
+         {"blk.0.ssm_out.weight", &l0.ssm_out},
+         {"blk.3.attn_q.weight", &l3.attn_q},
+         {"blk.3.ffn_down.weight", &l3.ffn_down}};
+    for (const auto& [name, ref] : checks) {
+      const auto plan = source.Plan(name, &error);
+      std::vector<std::uint8_t> expect(plan->bytes);
+      source.Produce(*plan, expect, threads);
+      std::vector<std::uint16_t> got(plan->bytes / 2);
+      qe::EffectiveBf16(*ref->exl3, got.data(), threads);
+      const bool same =
+          std::memcmp(expect.data(), got.data(), plan->bytes) == 0;
+      std::cout << "host copy " << name << (same ? " equals" : " DIFFERS FROM")
+                << " the X1 tensor\n";
+      if (!same)
+        return 1;
+    }
+  }
+  std::cout << "loaded in " << secs << " s: layers " << w.layers.size()
+            << ", EXL3 projections " << exl3 << ", other tensors " << other
+            << ", embedding type " << static_cast<int>(w.token_embd.type)
+            << ", output EXL3 " << (w.output.exl3 != nullptr) << ", image "
+            << loaded->image_bytes << " B, projections "
+            << loaded->projection_bytes << " B\n";
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -320,10 +383,13 @@ int main(int argc, char** argv) {
     int threads =
         static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
     std::string only;
+    bool q8_embedding = false;
     std::vector<std::string> positional;
     for (std::size_t i = 0; i < args.size(); ++i) {
       if (args[i] == "--threads" && i + 1 < args.size()) {
         threads = std::stoi(args[++i]);
+      } else if (args[i] == "--q8-embedding") {
+        q8_embedding = true;
       } else if (args[i] == "--only" && i + 1 < args.size()) {
         only = args[++i];
       } else {
@@ -333,6 +399,12 @@ int main(int argc, char** argv) {
     if (positional.size() >= 3 && positional[0] == "compare") {
       return Compare(positional[1], {positional.begin() + 2, positional.end()},
                      only, threads);
+    }
+    if (positional.size() == 4 && positional[0] == "metadata") {
+      return Metadata(positional[1], positional[2], positional[3]);
+    }
+    if (positional.size() == 2 && positional[0] == "load") {
+      return Load(positional[1], q8_embedding, threads);
     }
     if (positional.size() >= 4 && positional[0] == "write") {
       return Write(positional[1], positional[2],

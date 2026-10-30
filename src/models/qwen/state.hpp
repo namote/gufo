@@ -15,6 +15,7 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/core/model_config.hpp"
+#include "src/core/quant/exl3/device.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
 
 namespace gufo::models {
@@ -28,6 +29,10 @@ struct QwenTensorRef {
   /// Bytes available from `data` to the end of its mapped storage region.
   /// Synthetic/in-process tensors default to unbounded trusted storage.
   std::size_t available_bytes = std::numeric_limits<std::size_t>::max();
+  /// Set for an EXL3 projection (src/models/qwen/exl3_weights.hpp): `data`
+  /// is then its trellis and `type` carries no meaning; consumers branch on
+  /// this before looking at `type`.
+  const quant::exl3::DeviceLinear* exl3 = nullptr;
 
   [[nodiscard]] bool empty() const noexcept {
     return data == nullptr || num_elements == 0;
@@ -191,15 +196,21 @@ struct QwenModelWeights {
   /// at load (the file keeps them unrotated); the layer refs point into it.
   std::shared_ptr<const std::vector<std::uint8_t>> folded_weights;
   std::size_t folded_bytes = 0;
+  /// Owns the EXL3 projection descriptors and host copies the layer refs'
+  /// `exl3` pointers use (null for GGUF checkpoints).
+  std::shared_ptr<const void> exl3_storage;
   double fold_seconds = 0.0;
 
   [[nodiscard]] bool IsRotated() const noexcept {
     return !rotated_groups.empty();
   }
 
-  /// Loads and binds weights from a GgufReader.
+  /// Loads and binds weights from a GgufReader. `projections` (EXL3 loading)
+  /// supplies tensors the reader does not hold, by GGUF name.
   [[nodiscard]] static std::optional<QwenModelWeights> LoadFromGguf(
-      const core::GgufReader& reader, std::string* error_msg = nullptr);
+      const core::GgufReader& reader, std::string* error_msg = nullptr,
+      const std::vector<std::pair<std::string, QwenTensorRef>>* projections =
+          nullptr);
 };
 
 /// Contiguous Key-Value Cache for auto-regressive generation.

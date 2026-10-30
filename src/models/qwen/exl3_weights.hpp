@@ -20,6 +20,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -28,6 +30,8 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/core/quant/exl3/checkpoint.hpp"
+#include "src/core/quant/exl3/device.hpp"
+#include "src/models/qwen/state.hpp"
 
 namespace gufo::models::qwen_exl3 {
 
@@ -53,6 +57,46 @@ struct TensorPlan {
   std::size_t bytes = 0;
 };
 
+/// One raw GGUF key/value entry (key, type and value bytes as stored).
+struct RawKv {
+  std::string key;
+  std::vector<std::uint8_t> bytes;
+};
+
+/// The key/value entries of a GGUF file, in order.
+[[nodiscard]] std::vector<RawKv> ReadRawMetadata(
+    const std::filesystem::path& path);
+
+/// A GGUF string key/value entry.
+[[nodiscard]] RawKv StringKv(std::string_view key, std::string_view value);
+
+/// GGUF key naming the EXL3 checkpoint directory of a sidecar (relative to
+/// the sidecar's directory).
+inline constexpr std::string_view kCheckpointKey = "gufo.exl3.checkpoint";
+
+/// The projection host copy of one EXL3 linear in GGUF orientation: the
+/// linear-attention V-head reorders become permutations of whole 128-wide
+/// tile blocks (exact: H acts within those blocks).
+struct HostLinear {
+  std::string gguf_name;
+  std::vector<std::uint16_t> trellis;
+  std::vector<std::uint16_t> suh;
+  std::vector<std::uint16_t> svh;
+  quant::exl3::DeviceLinear view;  // pointers into the vectors above
+};
+
+/// Embedding storage of a directly loaded checkpoint.
+enum class EmbeddingFormat : std::uint8_t { kBf16, kQ8_0 };
+
+/// The tensor names the 27B target forward binds (no MTP block), in GGUF
+/// naming.
+[[nodiscard]] std::vector<std::string> TargetTensorNames(
+    const core::ModelConfig& config);
+
+/// Q8_0 blocks of `values` (llama.cpp quantize_row_q8_0_ref); values.size()
+/// must be a multiple of 32.
+void QuantizeQ8_0(std::span<const float> values, std::uint8_t* out);
+
 class Source {
 public:
   Source(const quant::exl3::Checkpoint& checkpoint, Geometry geometry)
@@ -68,10 +112,51 @@ public:
   void Produce(const TensorPlan& plan, std::span<std::uint8_t> out,
                int threads) const;
 
+  /// Whether `gguf_name` is an EXL3 projection.
+  [[nodiscard]] bool IsProjection(std::string_view gguf_name) const;
+
+  /// Host copy of the EXL3 projection `gguf_name` (block-permuted).
+  [[nodiscard]] HostLinear PrepareLinear(std::string_view gguf_name) const;
+
+  /// A GGUF image holding `metadata` and every tensor of `names` that is not
+  /// an EXL3 projection, with the embedding stored as `embedding`.
+  [[nodiscard]] std::vector<std::uint8_t> BuildImage(
+      const std::vector<RawKv>& metadata, const std::vector<std::string>& names,
+      EmbeddingFormat embedding, int threads) const;
+
 private:
   const quant::exl3::Checkpoint& checkpoint_;
   Geometry geometry_;
 };
+
+/// Checks a metadata sidecar against the checkpoint it names: config.json
+/// hyperparameters and tokenizer.json vocabulary against the GGUF keys and
+/// `tokenizer.ggml.tokens`. Returns an empty string when consistent, or the
+/// first mismatch by name.
+[[nodiscard]] std::string CheckSidecar(const std::filesystem::path& checkpoint,
+                                       const core::GgufReader& sidecar);
+
+/// Direct EXL3 loading (X2a): the sidecar's metadata plus an in-memory GGUF
+/// of the unquantized tensors (the returned reader owns its bytes), and the
+/// target weights with EXL3 projections (QwenTensorRef::exl3, host
+/// pointers owned by weights.exl3_storage).
+struct LoadedExl3 {
+  std::shared_ptr<const core::GgufReader> reader;
+  QwenModelWeights weights;
+  std::size_t image_bytes = 0;
+  std::size_t projection_bytes = 0;  // trellis + suh + svh
+};
+
+/// Loads the checkpoint named by `sidecar_path`'s kCheckpointKey. Returns
+/// nullopt with `error` set on any problem.
+[[nodiscard]] std::optional<LoadedExl3> LoadFromSidecar(
+    const std::filesystem::path& sidecar_path, const core::GgufReader& sidecar,
+    EmbeddingFormat embedding, std::string* error, int threads = 8);
+
+/// The effective weight of `linear` as BF16 [n][k] (no reorders), the X1
+/// computation; used to check host copies against Source::Produce.
+void EffectiveBf16(const quant::exl3::DeviceLinear& linear, std::uint16_t* out,
+                   int threads);
 
 /// BF16 of `value`, round to nearest even (NaN stays NaN).
 [[nodiscard]] std::uint16_t FloatToBf16(float value) noexcept;
