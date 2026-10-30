@@ -124,13 +124,19 @@ void TestRotate() {
     for (std::size_t i = 0; i < width; ++i)
       v[i] = x[r * width + i] * HalfToDouble(pre[i]);
     HadamardBlocks(std::span<double>(v));
+    // Relative to the row's largest output, as for projections: an FP32
+    // butterfly's error is absolute (~1e-7 of the row scale), so a
+    // per-element ratio would grade near-zero outputs on noise.
+    double scale = 0.0;
+    for (std::size_t i = 0; i < width; ++i)
+      scale = std::max(scale, std::fabs(v[i] * HalfToDouble(post[i])));
     for (std::size_t i = 0; i < width; ++i) {
       const double expect = v[i] * HalfToDouble(post[i]);
-      worst = std::max(worst, std::fabs(out[r * width + i] - expect) /
-                                  (std::fabs(expect) + 1e-3));
+      worst = std::max(worst, std::fabs(out[r * width + i] - expect) / scale);
     }
   }
   Expect(worst < 1e-5, "rotation relative error " + std::to_string(worst));
+  std::cout << "rotation max relative error " << worst << "\n";
   for (auto* p : {static_cast<void*>(dx), static_cast<void*>(dpre),
                   static_cast<void*>(dpost), static_cast<void*>(dout)})
     (void)hipFree(p);

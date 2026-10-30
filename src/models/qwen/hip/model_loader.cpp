@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "src/core/hip/weight_upload.hpp"
+#include "src/core/platform/mapped_file.hpp"
 #include "src/core/platform/pages.hpp"
 #include "src/core/platform/prefault.hpp"
 #include "src/models/qwen/chat_template.hpp"
@@ -167,6 +168,22 @@ void ReleaseWeightRegions(std::vector<QwenGpuWeightRegion>& regions) noexcept {
     auto& destination = weight_regions[i];
     hipError_t map_error;
     try {
+      if (source.file_descriptor == platform::kInvalidFile) {
+        // A memory image (the EXL3 sidecar's GGUF image) lives on the heap:
+        // it is neither page aligned nor a mapping that may be dropped, so
+        // it is copied to device memory instead of cloned and registered.
+        map_error = AllocateDeviceRegion(source, destination);
+        if (map_error == hipSuccess)
+          map_error = CopyMappedRegion(source, destination.device_data);
+        if (map_error != hipSuccess) {
+          ReleaseWeightRegions(weight_regions);
+          if (error_msg != nullptr)
+            *error_msg = std::string("Failed to upload a GGUF memory image: ") +
+                         hipGetErrorString(map_error);
+          return false;
+        }
+        continue;
+      }
       bool source_was_read = false;
       map_error = MapRegisteredRegion(source, destination, source_was_read);
       if (map_error != hipSuccess) {
