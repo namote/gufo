@@ -8,10 +8,12 @@
 //     tensors must match exactly; quantized projections report the relative
 //     error and correlation against the BF16 original (the EXL3 quantization
 //     error, about 0.04-0.14 at 5-3 bits; a layout error shows as ~1 or more).
-//   exl3_to_gguf metadata EXL3_DIR OUT.gguf GGUF_SHARD
+//   exl3_to_gguf metadata EXL3_DIR OUT.gguf GGUF_SHARD [--bf16-embedding]
 //     Writes the X2a metadata sidecar: every key of the GGUF except split.*,
 //     plus gufo.exl3.checkpoint (EXL3_DIR relative to OUT's directory), no
 //     tensors; refuses when config.json or tokenizer.json disagree with it.
+//     --bf16-embedding adds gufo.exl3.embedding = "bf16" (the loader then
+//     keeps the token embedding in BF16 instead of Q8_0).
 //   exl3_to_gguf load SIDECAR [--q8-embedding] [--threads N]
 //     Runs the X2a host loader (LoadFromSidecar) and prints what it bound.
 //   exl3_to_gguf write EXL3_DIR OUT.gguf GGUF_SHARD... [--threads N]
@@ -258,12 +260,15 @@ int Write(const std::string& exl3_dir, const std::string& out_path,
 }
 
 int Metadata(const std::string& exl3_dir, const std::string& out_path,
-             const std::string& template_path) {
+             const std::string& template_path, bool bf16_embedding) {
   std::vector<RawKv> kvs;
   for (auto& kv : ReadRawMetadata(template_path)) {
-    if (!kv.key.starts_with("split.") && kv.key != qe::kCheckpointKey)
+    if (!kv.key.starts_with("split.") && kv.key != qe::kCheckpointKey &&
+        kv.key != qe::kEmbeddingKey)
       kvs.push_back(std::move(kv));
   }
+  if (bf16_embedding)
+    kvs.push_back(qe::StringKv(qe::kEmbeddingKey, "bf16"));
   const auto out_dir = std::filesystem::absolute(out_path).parent_path();
   const auto relative =
       std::filesystem::relative(std::filesystem::absolute(exl3_dir), out_dir);
@@ -384,12 +389,15 @@ int main(int argc, char** argv) {
         static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
     std::string only;
     bool q8_embedding = false;
+    bool bf16_embedding = false;
     std::vector<std::string> positional;
     for (std::size_t i = 0; i < args.size(); ++i) {
       if (args[i] == "--threads" && i + 1 < args.size()) {
         threads = std::stoi(args[++i]);
       } else if (args[i] == "--q8-embedding") {
         q8_embedding = true;
+      } else if (args[i] == "--bf16-embedding") {
+        bf16_embedding = true;
       } else if (args[i] == "--only" && i + 1 < args.size()) {
         only = args[++i];
       } else {
@@ -401,7 +409,8 @@ int main(int argc, char** argv) {
                      only, threads);
     }
     if (positional.size() == 4 && positional[0] == "metadata") {
-      return Metadata(positional[1], positional[2], positional[3]);
+      return Metadata(positional[1], positional[2], positional[3],
+                      bf16_embedding);
     }
     if (positional.size() == 2 && positional[0] == "load") {
       return Load(positional[1], q8_embedding, threads);
