@@ -353,17 +353,17 @@ python3 -I -m exllamav3.conversion.convert_model -w /xq/work/qwen-3.8-27b-exl3-5
   - 샤드 세 개의 바이트 크기는 turboderp 5.00과 같다(8,509,808,537 / 8,589,756,567 / 2,802,114,925).
   - sha256 앞 12자리: `334301cf5e9c`, `176a9b9e2fea`, `f4c4bf536b15`(전체 값은 PROVENANCE.json)
   - `PROVENANCE.json`에 원본 파일 33개의 sha256, 보정 파일, 세 실행의 argv/env/버전(exllamav3 1.6.5+rocm10.0.torch2.13.0, torch 2.13.0+rocm10.0.0, HIP 7.15.26333, gfx1151)/peak, 이미지 wheel 목록이 있다. `CALIBRATION.json`도 함께 있다.
-  - PROVENANCE의 `output.dir`은 옮기기 전 경로(`/receipt/out`)로 적혀 있다.
+  - PROVENANCE의 `output.dir`은 옮기기 전 경로(`/receipt/out`)로 적혀 있다. 이 값은 고치지 않았다(감독 지시). 대신 팩 안의 `MOVED.md`에 최종 경로와 옮긴 시각을 적었다(2026-10-31 06:40:50 KST, 같은 exFAT 안의 rename).
 - **정리:**
   - 시험 작업 디렉터리 `…/windows/xq-t01/receipt/work/`(22.9 GB)는 지웠다(감독 승인).
-  - 남은 작업 디렉터리: xq-f1 29 GB, xq-f2 35 GB, xq-f3 33 GB, 합계 97 GB. 팩이 완성됐으니 필요 없지만, 지우기 전에 감독에게 묻는다.
-  - 외장 가용은 326 GB다.
+  - xq-f1/f2/f3 작업 디렉터리(97 GB)도 지웠다(감독 승인 2026-10-31). 창 receipt(`run/`, 로그, WINDOW.json, KERNEL/FENCE 기록)는 남겼다.
+  - 외장 가용은 420 GB다.
 
 ## 11. 품질 대조 계획 (4단계, 감독 허락 필요)
 
 - **수집기:** W8과 같은 `tools/qwen27b/rq_quality/exl3/collect.py`를 쓴다(마지막 변경 `43425c9f`, 이후 바뀌지 않음). 이미지는 같은 레이어다(라벨 `f26f800d`).
 - **코퍼스와 기준:** R0와 같다. a01 8창, prefill 32,760 위치와 decode 4,096 위치(prefix 2048, 창마다 512)를 gufo BF16 `rq0-bf16`에 대고 잰다. 같은 위치를 EXL3-BF16 대조(`w8q-bf16`)에도 대고 잰다.
-- **창 하나 `PLAN-XQ-QUALITY.json`(약 25–30분):**
+- **창 하나** `~/projects/ai.tools/test/experiments/gufo_upstream_port_20261023/PLAN-XQ-QUALITY.json`(작성 완료, LOCKS 다시 만듦, model `xq-quality`, 출력은 루트의 `tmp/test-results/gufo-upstream-port-20261023/xq-q01`, 레코드 약 0.45 GB, 약 25–30분):
   1. `xq-5.00-c02`: 우리 팩의 prefill(약 210 s)과 decode(약 390 s)
   2. `td5-rerun`: turboderp 5.00을 같은 창에서 prefill과 decode로 다시 잰다. W8의 `w8q-a01/w8q-5.00` 기록과 레코드가 같은지 보는 재현 확인이고, 같은 조건의 paired 대조군이다.
 - **지표**(`metrics.py score/compare`, CPU, 창 뒤):
