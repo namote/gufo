@@ -217,6 +217,30 @@ cold는 새 프로세스의 첫 요청(빈 행 캐시), warm은 같은 요청의
 - **inconclusive 1건:** MTP A `repetition_sequence` decode다. BASE 1,583–2,183 ms(중앙값 1,666), CAND 1,587–2,300 ms(중앙값 1,828)이다. 두 팔 모두 1.6 s대와 2.0–2.3 s대로 갈리는 쌍봉이고, 범위가 겹친다. 규칙대로 확대하거나 평균 내지 않고 inconclusive로 둔다. 확인하려면 이 history만 번갈아 다시 돌린다(감독 결정).
 - **slower 판정은 0건이다.** decode tok/s 비율 0.990–1.000은 참고값이다(판정은 요청별).
 
+## KVarN K1a / K1b (2026-10-31, 설계 [F1-KVARN-DESIGN.md](F1-KVARN-DESIGN.md), 감독 승인)
+
+- **커밋(브랜치 `ai-tools/f1-paged-kv`):**
+  - `db7aa9ac` refactor(core): share the KVarN record layout and tail planners across models
+    - `src/core/hip/kvarn_layout.hpp`(새 파일)와 `kvarn_checkpoint.hpp`(이동)에 공통 부분을 둔다: 그룹, sink, ring, 레코드(V 배치 인자 `KvarnValueOrder`), FP16 행, read groups, pass/prefill/checkpoint planner.
+    - 27B 헤더에는 모델 모양과 조정된 정책만 남긴다. 이름과 값은 그대로다.
+    - core 테스트 `kvarn_layout_test`를 추가했다.
+  - `b17b5868` feat(qwen38_flash_next): rotate and quantize KVarN k4v4 token-major records
+    - `src/core/hip/detail/kvarn_device.hpp`: FWHT256, float-float 합, 정확히 반올림한 log/exp, `KvarnQuantizeTile<VBits, Order>`. 27B 커널은 이 tile을 같은 상수로 부른다.
+    - Flash-Next: `RotateKvRows`, `KvarnQuantizeGroups`(2헤드, k4v4 token-major, P1 블록 표), writer 전용 FP16 sink/ring 행 map(`kKvarnFp16RowTag`, 읽기 경로는 그대로다).
+    - 테스트 `qwen38_flash_next_kvarn_ops_test`를 추가했다.
+- **검사 [확인]:**
+  - 포맷 PASS.
+  - eval 이미지 g++로 core와 27B layout 테스트 PASS.
+  - hipcc 7.2.4로 27B `attention_kvarn.hip` 컴파일 성공.
+  - nix 테스트 빌드 `/nix/store/6azsdm5z5rvxgsx1nxqxjcs629nl0gb6-gufo-f1-k1b-tests-0-unstable-dirty`.
+  - 테스트 이미지 `ai-tools/gufo-eval:f1-k1-tests-rocm101` id `d07be443`, 라벨 `b17b5868…`.
+- **27B 동일성 증명 방법 [확인]:**
+  - ISA는 바뀌었다(스케줄과 dual-issue 묶음).
+  - 운영 바이너리 바이트 비교는 증명이 되지 못한다. 같은 운영 소스(`766a593e`와 `83d90aaa`)의 두 빌드도 `.text`와 `.hip_fatbin`이 다르기 때문이다(경로와 줄 위치가 박힌다).
+  - 그래서 설계대로 27B KVarN op 테스트로 증명한다. 이 테스트는 flush된 모든 tile이 CPU 참조와 비트 단위로 같아야 통과한다.
+- **창 계획:** `PLAN-F1-K1T.json`(`f1-k1-unit`, sha `a53b8d29…`). 대상은 core/27B layout, 27B KVarN op, Flash-Next KVarN op, Flash-Next attention op 테스트다. LOCKS `e9bf9ac4…`. 감독 "start"를 기다린다.
+- **P1 inconclusive 재측정 계획:** `PLAN-F1-REP-{BASE,CAND}.json`. `repetition_sequence`만 대상으로 ABBA × 2, 반복 5, 팔마다 20표본이다. 감독 "start"를 기다린다.
+
 ## ABBA 계획 초안 (P1 정확성 통과 뒤)
 
 - **계획:** `PLAN-F1-ABBA-BASE.json`(이미지 `f1-base-rocm101`, d2b751a9)와 `PLAN-F1-ABBA-CAND.json`(`f1-cand-rocm101`, 766a593e)이다.
