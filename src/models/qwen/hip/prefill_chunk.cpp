@@ -8,6 +8,7 @@
 #include "src/models/qwen/gemm_route.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/hip/exl3_dispatch.hpp"
 #include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen/hip/ops/hadamard.hpp"
 #include "src/models/qwen/hip/ops/prefill_fp16.hpp"
@@ -125,6 +126,13 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                                const void* bf16_input, const float* fp32_input,
                                float* output, std::size_t m, std::size_t k,
                                const void* q8_act = nullptr) {
+    if (IsExl3(w)) {
+      // EXL3 projections read the FP32 activation (no EXL3 tensor is Q8 or
+      // FP16-prefill eligible, so every producer wrote it).
+      LaunchExl3Projection(w, fp32_input, batch_size, output,
+                           arena_.Exl3Scratch(), arena_.stream);
+      return;
+    }
     if (half_prefill) {
       LaunchBatchedQuantGEMMFp16(w.type, w.data, bf16_input, output, batch_size,
                                  m, k, arena_.stream);
@@ -819,7 +827,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
   const float* final_hidden =
       scratch.decode.hidden.data() + ((batch_size - 1) * hidden_size);
   LaunchQwenOutputHead(weights_, final_hidden, scratch.decode.normed.data(),
-                       scratch.decode.logits.data(), arena_.stream);
+                       scratch.decode.logits.data(), arena_.stream,
+                       arena_.Exl3Scratch());
 
   // 6. GPU Argmax. The sampled-token view enters its documented alias epoch
   // only after all SSM layer uses of alpha have completed.

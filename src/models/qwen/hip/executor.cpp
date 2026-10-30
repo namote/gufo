@@ -9,6 +9,7 @@
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/hip_utils.hpp"
+#include "src/models/qwen/hip/exl3_dispatch.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -79,6 +80,8 @@ QwenGpuExecutor::QwenGpuExecutor(
       h_logits_(weights_.config.vocab_size, 0.0F) {
   AllocateGpuSamplingWorkspace(&sampling_workspace_, weights_.config.vocab_size,
                                max_context);
+  if (weights_.exl3_storage != nullptr)
+    arena_.AllocateExl3(MaxExl3InputWidth(weights_.config));
   detail::EmitQwenExecutionPolicy(policy_.Fingerprint());
 }
 

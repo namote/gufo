@@ -3,14 +3,19 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "src/core/hip/weight_upload.hpp"
 #include "src/core/platform/pages.hpp"
 #include "src/core/platform/prefault.hpp"
 #include "src/models/qwen/chat_template.hpp"
+#include "src/models/qwen/exl3_weights.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 
@@ -312,6 +317,85 @@ bool UploadRotationSigns(models::QwenModelWeights& weights, void** device,
   return true;
 }
 
+// Device copies of the EXL3 projections (X2a): one allocation, every trellis
+// and scale vector 256-byte aligned, and the descriptors the kernels read.
+struct Exl3DeviceStorage {
+  void* buffer{nullptr};
+  std::size_t bytes{0};
+  std::vector<quant::exl3::DeviceLinear> linears;
+  ~Exl3DeviceStorage() {
+    if (buffer != nullptr)
+      (void)hipFree(buffer);
+  }
+};
+
+std::vector<models::QwenTensorRef*> Exl3Refs(models::QwenModelWeights& w) {
+  std::vector<models::QwenTensorRef*> refs;
+  const auto add = [&](models::QwenTensorRef& t) {
+    if (t.exl3 != nullptr)
+      refs.push_back(&t);
+  };
+  add(w.output);
+  for (auto& l : w.layers)
+    for (auto* t : {&l.attn_q, &l.attn_k, &l.attn_v, &l.attn_output,
+                    &l.attn_qkv, &l.attn_gate, &l.ssm_out, &l.ssm_alpha,
+                    &l.ssm_beta, &l.ffn_gate, &l.ffn_up, &l.ffn_down})
+      add(*t);
+  return refs;
+}
+
+// Uploads every EXL3 projection, rebinds the references to the device views
+// and drops the host copies. Returns the device bytes, or 0 on failure.
+std::size_t UploadExl3(models::QwenModelWeights& weights,
+                       std::string* error_msg) {
+  constexpr std::size_t kAlign = 256;
+  const auto align = [](std::size_t v) {
+    return (v + kAlign - 1) / kAlign * kAlign;
+  };
+  const auto refs = Exl3Refs(weights);
+  auto storage = std::make_shared<Exl3DeviceStorage>();
+  for (const auto* ref : refs) {
+    const auto& h = *ref->exl3;
+    storage->bytes +=
+        align(h.TrellisBytes()) + align(h.k * 2U) + align(h.n * 2U);
+  }
+  if (const auto status = hipMalloc(&storage->buffer, storage->bytes);
+      status != hipSuccess) {
+    if (error_msg != nullptr)
+      *error_msg =
+          std::string("EXL3 projection upload: ") + hipGetErrorString(status);
+    return 0;
+  }
+  storage->linears.reserve(refs.size());  // views must not move
+  auto* base = static_cast<std::uint8_t*>(storage->buffer);
+  std::size_t offset = 0;
+  const auto copy = [&](const void* src, std::size_t bytes) {
+    auto* dst = base + offset;
+    offset += align(bytes);
+    if (hipMemcpy(dst, src, bytes, hipMemcpyHostToDevice) != hipSuccess)
+      throw std::runtime_error("EXL3 projection upload copy failed");
+    return reinterpret_cast<const std::uint16_t*>(dst);
+  };
+  try {
+    for (auto* ref : refs) {
+      auto view = *ref->exl3;
+      view.trellis = copy(view.trellis, view.TrellisBytes());
+      view.suh = copy(view.suh, view.k * 2U);
+      view.svh = copy(view.svh, view.n * 2U);
+      storage->linears.push_back(view);
+      ref->exl3 = &storage->linears.back();
+      ref->data = view.trellis;
+      ref->available_bytes = view.TrellisBytes();
+    }
+  } catch (const std::exception& e) {
+    if (error_msg != nullptr)
+      *error_msg = e.what();
+    return 0;
+  }
+  weights.exl3_storage = storage;  // releases the host copies
+  return storage->bytes;
+}
+
 }  // namespace
 
 QwenGpuModel::QwenGpuModel(
@@ -319,13 +403,15 @@ QwenGpuModel::QwenGpuModel(
     models::QwenModelWeights weights,
     std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
     std::vector<QwenGpuWeightRegion> weight_regions,
-    std::shared_ptr<models::qwen::vision::Encoder> vision, void* rotation_signs)
+    std::shared_ptr<models::qwen::vision::Encoder> vision, void* rotation_signs,
+    std::size_t exl3_bytes)
     : reader_(std::move(reader)),
       weights_(std::move(weights)),
       tokenizer_(std::move(tokenizer)),
       weight_regions_(std::move(weight_regions)),
       vision_(std::move(vision)),
-      rotation_signs_(rotation_signs) {}
+      rotation_signs_(rotation_signs),
+      exl3_bytes_(exl3_bytes) {}
 
 QwenGpuModel::~QwenGpuModel() {
   if (rotation_signs_ != nullptr) {
@@ -335,7 +421,7 @@ QwenGpuModel::~QwenGpuModel() {
 }
 
 std::size_t QwenGpuModel::GetResidentBytes() const noexcept {
-  std::size_t total = vision_ ? vision_->ResidentBytes() : 0;
+  std::size_t total = (vision_ ? vision_->ResidentBytes() : 0) + exl3_bytes_;
   for (const auto& region : weight_regions_) {
     if (region.size > std::numeric_limits<std::size_t>::max() - total) {
       return std::numeric_limits<std::size_t>::max();
@@ -360,7 +446,30 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
     return nullptr;
   }
 
-  auto weights_opt = models::QwenModelWeights::LoadFromGguf(*reader, error_msg);
+  std::optional<models::QwenModelWeights> weights_opt;
+  if (reader->GetMetadataString(models::qwen_exl3::kCheckpointKey)) {
+    // An EXL3 checkpoint through its GGUF sidecar (plan/exl3/XA-RESULTS.md):
+    // the projections stay EXL3, the rest becomes an in-memory GGUF image.
+    const auto regions = reader->GetMappedRegions();
+    if (regions.empty() || regions.front().source_path.empty()) {
+      if (error_msg != nullptr)
+        *error_msg = "EXL3 sidecar has no file path";
+      return nullptr;
+    }
+    const auto embedding =
+        reader->GetMetadataString(models::qwen_exl3::kEmbeddingKey) ==
+                std::optional<std::string_view>("bf16")
+            ? models::qwen_exl3::EmbeddingFormat::kBf16
+            : models::qwen_exl3::EmbeddingFormat::kQ8_0;
+    auto loaded = models::qwen_exl3::LoadFromSidecar(
+        regions.front().source_path, *reader, embedding, error_msg);
+    if (!loaded)
+      return nullptr;
+    reader = std::move(loaded->reader);
+    weights_opt = std::move(loaded->weights);
+  } else {
+    weights_opt = models::QwenModelWeights::LoadFromGguf(*reader, error_msg);
+  }
   if (!weights_opt.has_value()) {
     return nullptr;
   }
@@ -376,8 +485,9 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
   }
 
   const auto remap = [&](models::QwenTensorRef& tensor) {
-    // Folded alpha/beta live in host memory until UploadRotationSigns.
-    return IsFolded(*weights_opt, tensor) ||
+    // Folded alpha/beta live in host memory until UploadRotationSigns; EXL3
+    // projections are uploaded by UploadExl3.
+    return tensor.exl3 != nullptr || IsFolded(*weights_opt, tensor) ||
            RemapTensor(tensor, weight_regions);
   };
   bool remapped = remap(weights_opt->token_embd) &&
@@ -402,6 +512,15 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
     return nullptr;
   }
 
+  std::size_t exl3_bytes = 0;
+  if (weights_opt->exl3_storage != nullptr) {
+    exl3_bytes = UploadExl3(*weights_opt, error_msg);
+    if (exl3_bytes == 0) {
+      ReleaseWeightRegions(weight_regions);
+      return nullptr;
+    }
+  }
+
   void* rotation_signs = nullptr;
   if (!UploadRotationSigns(*weights_opt, &rotation_signs, error_msg)) {
     ReleaseWeightRegions(weight_regions);
@@ -412,7 +531,7 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
       std::move(tokenizer));
   return std::make_shared<const QwenGpuModel>(
       std::move(reader), std::move(*weights_opt), std::move(shared_tokenizer),
-      std::move(weight_regions), std::move(vision), rotation_signs);
+      std::move(weight_regions), std::move(vision), rotation_signs, exl3_bytes);
 }
 
 std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::Create(

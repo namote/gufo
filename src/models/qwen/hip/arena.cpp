@@ -1197,6 +1197,36 @@ QwenGpuArena::QwenGpuArena(
   }
 }
 
+struct QwenGpuArena::Exl3Workspace {
+  quant::exl3::ReferenceScratch scratch;
+  ~Exl3Workspace() {
+    if (scratch.rotated != nullptr)
+      (void)hipFree(scratch.rotated);
+    if (scratch.weight != nullptr)
+      (void)hipFree(scratch.weight);
+  }
+};
+
+const quant::exl3::ReferenceScratch* QwenGpuArena::Exl3Scratch()
+    const noexcept {
+  return exl3_ != nullptr ? &exl3_->scratch : nullptr;
+}
+
+void QwenGpuArena::AllocateExl3(std::size_t max_input_width) {
+  auto workspace = std::make_unique<Exl3Workspace>();
+  // Rotated inputs of the widest pass; the dequantized weight chunk is
+  // 256 MiB (whole multiples of 128 columns of the widest input).
+  const std::size_t rows = std::max<std::size_t>(max_batch_, 8);
+  workspace->scratch.rotated_elements = rows * max_input_width;
+  workspace->scratch.weight_elements =
+      std::max<std::size_t>(64U << 20U, 128 * max_input_width);
+  HIP_CHECK(hipMalloc(&workspace->scratch.rotated,
+                      workspace->scratch.rotated_elements * sizeof(float)));
+  HIP_CHECK(hipMalloc(&workspace->scratch.weight,
+                      workspace->scratch.weight_elements * sizeof(float)));
+  exl3_ = std::move(workspace);
+}
+
 QwenGpuArena::~QwenGpuArena() {
   FreeAll();
 }
@@ -1684,6 +1714,7 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   has_saved_state_ = other.has_saved_state_;
   replay_capture_active_ = other.replay_capture_active_;
   own_scratch_ = std::exchange(other.own_scratch_, {});
+  exl3_ = std::move(other.exl3_);
   shared_scratch_ = std::move(other.shared_scratch_);
   scratch_leased_ = std::exchange(other.scratch_leased_, false);
 
@@ -1797,6 +1828,7 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     has_saved_state_ = other.has_saved_state_;
     replay_capture_active_ = other.replay_capture_active_;
     own_scratch_ = std::exchange(other.own_scratch_, {});
+    exl3_ = std::move(other.exl3_);
     shared_scratch_ = std::move(other.shared_scratch_);
     scratch_leased_ = std::exchange(other.scratch_leased_, false);
 

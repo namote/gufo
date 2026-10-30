@@ -16,6 +16,7 @@
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/models/qwen/dflash_weights.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
+#include "src/models/qwen/hip/exl3_dispatch.hpp"
 #include "src/models/qwen/hip/kernels/dflash_kernels.hpp"
 #include "src/models/qwen/hip/mtp/detail/allocation.hpp"
 #include "src/models/qwen/hip/ops.hpp"
@@ -317,6 +318,15 @@ void QwenDFlashGpuExecutor::Allocate() {
   allocate_scratch(d_out_token_, block_size);
   if (block_size > kDFlashMaxSharedBatch)
     allocate_scratch(d_bf16_input_, block_size * intermediate_size);
+  if (IsExl3(model_->GetWeights().output)) {
+    // The target's EXL3 head: rows of up to eight sessions' blocks.
+    exl3_scratch_.rotated_elements = 8 * block_size * hidden_size;
+    exl3_scratch_.weight_elements = 64U << 20U;
+    HIP_CHECK(hipMalloc(&exl3_scratch_.rotated,
+                        exl3_scratch_.rotated_elements * sizeof(float)));
+    HIP_CHECK(hipMalloc(&exl3_scratch_.weight,
+                        exl3_scratch_.weight_elements * sizeof(float)));
+  }
 
   PrewarmBlockGemms();
 }
@@ -396,6 +406,11 @@ void QwenDFlashGpuExecutor::RunBlockGemm(const models::QwenTensorRef& weight,
                                          std::size_t batch_size,
                                          std::size_t output_size,
                                          std::size_t input_size) {
+  if (IsExl3(weight)) {
+    LaunchExl3Projection(weight, input, batch_size, output, &exl3_scratch_,
+                         stream_);
+    return;
+  }
   // opt-q4kxl: the Q4_K_M DFlash-2 companion keeps its K-quant weights packed
   // (PackBlockMatrix), so they must take a quant-aware route. The dense
   // LaunchBatchedGEMM below reads its operand as F32 or BF16 and would walk far
@@ -481,6 +496,12 @@ void QwenDFlashGpuExecutor::RunInjectGemm(const models::QwenTensorRef& weight,
 }
 
 void QwenDFlashGpuExecutor::Free() noexcept {
+  for (float** ptr : {&exl3_scratch_.rotated, &exl3_scratch_.weight}) {
+    if (*ptr != nullptr) {
+      (void)hipFree(*ptr);
+      *ptr = nullptr;
+    }
+  }
   for (auto*& ptr : d_injected_k_) {
     if (ptr != nullptr) {
       (void)hipFree(ptr);

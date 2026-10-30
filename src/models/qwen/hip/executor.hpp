@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "src/core/model_config.hpp"
+#include "src/core/quant/exl3/reference.hpp"
 #include "src/models/qwen/continuation_hooks.hpp"
 #include "src/models/qwen/forward.hpp"
 #include "src/models/qwen/generator.hpp"
@@ -95,7 +96,7 @@ public:
                std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
                std::vector<QwenGpuWeightRegion> weight_regions,
                std::shared_ptr<models::qwen::vision::Encoder> vision = {},
-               void* rotation_signs = nullptr);
+               void* rotation_signs = nullptr, std::size_t exl3_bytes = 0);
   ~QwenGpuModel();
 
   QwenGpuModel(const QwenGpuModel&) = delete;
@@ -137,6 +138,8 @@ private:
   std::shared_ptr<models::qwen::vision::Encoder> vision_;
   // Device copy of the packed rotation signs the weight layers point at.
   void* rotation_signs_{nullptr};
+  // Device bytes of the EXL3 projections (QwenModelWeights::exl3_storage).
+  std::size_t exl3_bytes_{0};
 };
 
 class QwenGpuSnapshot final {
@@ -407,6 +410,15 @@ public:
   std::unique_ptr<HipblasLtGemm> hipblaslt_gemm;
   void* d_scratch_bf16{nullptr};
   float* d_split_k_attention{nullptr};
+
+  /// EXL3 projection workspace of this session (X2a reference path), or
+  /// null for GGUF weights. Allocated once by AllocateExl3, before any
+  /// graph capture.
+  [[nodiscard]] const quant::exl3::ReferenceScratch* Exl3Scratch()
+      const noexcept;
+  /// Allocates the EXL3 workspace for `max_input_width` (the widest
+  /// projection input) and this arena's widest pass.
+  void AllocateExl3(std::size_t max_input_width);
   hip_bfloat16* d_weights_bf16{nullptr};
   void* d_scratch_q8_act{nullptr};
 
@@ -640,6 +652,8 @@ private:
   bool has_saved_state_{false};
   bool replay_capture_active_{false};
   QwenPassScratchSet own_scratch_;
+  struct Exl3Workspace;
+  std::unique_ptr<Exl3Workspace> exl3_;
   std::shared_ptr<QwenSharedPassScratch> shared_scratch_;
   bool scratch_leased_{false};
 };

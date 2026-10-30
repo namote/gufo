@@ -5,6 +5,7 @@
 #include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/hip/exl3_dispatch.hpp"
 #include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen/hip/ops/hadamard.hpp"
 #include "src/models/qwen/hip/output_head.hpp"
@@ -14,7 +15,8 @@ namespace gufo::hip {
 
 void LaunchQwenOutputHead(const models::QwenModelWeights& weights,
                           const float* hidden, float* normed, float* logits,
-                          hipStream_t stream) {
+                          hipStream_t stream,
+                          const quant::exl3::ReferenceScratch* exl3) {
   const std::size_t hidden_size = weights.config.hidden_size;
   const auto* norm = static_cast<const float*>(weights.output_norm.data);
   if (weights.head_in_rotation != nullptr) {
@@ -22,6 +24,10 @@ void LaunchQwenOutputHead(const models::QwenModelWeights& weights,
                          weights.head_in_rotation, stream);
   } else {
     LaunchRMSNorm(hidden, norm, normed, hidden_size, 1e-6F, stream);
+  }
+  if (IsExl3(weights.output)) {
+    LaunchExl3Projection(weights.output, normed, 1, logits, exl3, stream);
+    return;
   }
   LaunchGEMV(weights.output.data, weights.output.type, normed, logits,
              weights.config.vocab_size, hidden_size, stream);
@@ -65,6 +71,7 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
   const std::size_t ssm_inner_size = config.ssm_inner_size;
   const std::size_t time_step_rank = config.ssm_time_step_rank;
   auto scratch = arena.GetScratchView();
+  const auto* exl3 = arena.Exl3Scratch();
   auto& decode_scratch = scratch.decode;
   auto& attention_scratch = scratch.attention;
   auto& ssm_scratch = scratch.ssm;
@@ -117,12 +124,21 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
       const std::size_t total_k = arena.GetAttentionKvPlaneElements();
       const std::uint32_t attn_layer_idx = l / config.full_attention_interval;
 
-      LaunchFusedQKVProjections(
-          layer.attn_q.data, layer.attn_q.type, layer.attn_k.data,
-          layer.attn_k.type, layer.attn_v.data, layer.attn_v.type,
-          decode_scratch.normed.data(), ssm_scratch.qkv.data(),
-          attention_scratch.k.data(), attention_scratch.v.data(),
-          q_projection_size, kv_size, hidden_size, arena.stream);
+      if (IsExl3(layer.attn_q)) {
+        LaunchExl3Projection(layer.attn_q, decode_scratch.normed.data(), 1,
+                             ssm_scratch.qkv.data(), exl3, arena.stream);
+        LaunchExl3Projection(layer.attn_k, decode_scratch.normed.data(), 1,
+                             attention_scratch.k.data(), exl3, arena.stream);
+        LaunchExl3Projection(layer.attn_v, decode_scratch.normed.data(), 1,
+                             attention_scratch.v.data(), exl3, arena.stream);
+      } else {
+        LaunchFusedQKVProjections(
+            layer.attn_q.data, layer.attn_q.type, layer.attn_k.data,
+            layer.attn_k.type, layer.attn_v.data, layer.attn_v.type,
+            decode_scratch.normed.data(), ssm_scratch.qkv.data(),
+            attention_scratch.k.data(), attention_scratch.v.data(),
+            q_projection_size, kv_size, hidden_size, arena.stream);
+      }
       // De-interleave Q and Gate from attn_q projection
       LaunchUnpackQG(ssm_scratch.qkv.data(), attention_scratch.q.data(),
                      ssm_scratch.gate.data(), config.num_attention_heads,
@@ -218,20 +234,41 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
       // Output projection, routed through the quant_gemm module (HIP
       // backend). Same kernel, same args, same arena slices (d_ssm_out in,
       // d_attn_out out); behavior-identical to the former inline `LaunchGEMV`.
-      gufo::models::qwen::QuantGemm(
-          module_ctx, layer.attn_output, ssm_scratch.out.first(attention_size),
-          hidden_size, attention_size, attention_scratch.output);
+      if (IsExl3(layer.attn_output)) {
+        LaunchExl3Projection(layer.attn_output, ssm_scratch.out.data(), 1,
+                             attention_scratch.output.data(), exl3,
+                             arena.stream);
+      } else {
+        gufo::models::qwen::QuantGemm(module_ctx, layer.attn_output,
+                                      ssm_scratch.out.first(attention_size),
+                                      hidden_size, attention_size,
+                                      attention_scratch.output);
+      }
     } else {
       // SSM path
 
-      LaunchFusedSSMInputProjections(
-          layer.attn_qkv.data, layer.attn_qkv.type, layer.attn_gate.data,
-          layer.attn_gate.type, layer.ssm_alpha.data, layer.ssm_alpha.type,
-          layer.ssm_beta.data, layer.ssm_beta.type,
-          decode_scratch.normed.data(), ssm_scratch.qkv.data(),
-          ssm_scratch.gate.data(), ssm_scratch.alpha.data(),
-          ssm_scratch.beta.data(), hidden_size, ssm_qkv_size, ssm_inner_size,
-          time_step_rank, arena.stream);
+      if (IsExl3(layer.attn_qkv)) {
+        // EXL3 qkv and z; alpha and beta stay unquantized GGUF tensors.
+        LaunchExl3Projection(layer.attn_qkv, decode_scratch.normed.data(), 1,
+                             ssm_scratch.qkv.data(), exl3, arena.stream);
+        LaunchExl3Projection(layer.attn_gate, decode_scratch.normed.data(), 1,
+                             ssm_scratch.gate.data(), exl3, arena.stream);
+        LaunchGEMV(layer.ssm_alpha.data, layer.ssm_alpha.type,
+                   decode_scratch.normed.data(), ssm_scratch.alpha.data(),
+                   time_step_rank, hidden_size, arena.stream);
+        LaunchGEMV(layer.ssm_beta.data, layer.ssm_beta.type,
+                   decode_scratch.normed.data(), ssm_scratch.beta.data(),
+                   time_step_rank, hidden_size, arena.stream);
+      } else {
+        LaunchFusedSSMInputProjections(
+            layer.attn_qkv.data, layer.attn_qkv.type, layer.attn_gate.data,
+            layer.attn_gate.type, layer.ssm_alpha.data, layer.ssm_alpha.type,
+            layer.ssm_beta.data, layer.ssm_beta.type,
+            decode_scratch.normed.data(), ssm_scratch.qkv.data(),
+            ssm_scratch.gate.data(), ssm_scratch.alpha.data(),
+            ssm_scratch.beta.data(), hidden_size, ssm_qkv_size, ssm_inner_size,
+            time_step_rank, arena.stream);
+      }
       LaunchSSMConvRecurrence(
           ssm_scratch.qkv.data(),
           static_cast<const float*>(layer.ssm_conv1d.data), recurrent_state,
@@ -249,9 +286,15 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
         LaunchRotateRowsFp32(ssm_scratch.out.data(), rotation.ssm_out_in, 1,
                              ssm_inner_size, arena.stream);
       }
-      LaunchGEMV(layer.ssm_out.data, layer.ssm_out.type, ssm_scratch.out.data(),
-                 attention_scratch.output.data(), hidden_size, ssm_inner_size,
-                 arena.stream);
+      if (IsExl3(layer.ssm_out)) {
+        LaunchExl3Projection(layer.ssm_out, ssm_scratch.out.data(), 1,
+                             attention_scratch.output.data(), exl3,
+                             arena.stream);
+      } else {
+        LaunchGEMV(layer.ssm_out.data, layer.ssm_out.type,
+                   ssm_scratch.out.data(), attention_scratch.output.data(),
+                   hidden_size, ssm_inner_size, arena.stream);
+      }
     }
 
     {
@@ -275,7 +318,19 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
     }
 
     // Fused SwiGLU FFN
-    if (rotation.ffn_down_in != nullptr) {
+    if (IsExl3(layer.ffn_gate)) {
+      const std::size_t intermediate_size = config.intermediate_size;
+      LaunchExl3Projection(layer.ffn_gate, decode_scratch.normed.data(), 1,
+                           ffn_scratch.gate.data(), exl3, arena.stream);
+      LaunchExl3Projection(layer.ffn_up, decode_scratch.normed.data(), 1,
+                           ffn_scratch.up.data(), exl3, arena.stream);
+      LaunchBatchedSwiGLUActivation(ffn_scratch.gate.data(),
+                                    ffn_scratch.up.data(),
+                                    ffn_scratch.activation.data(), nullptr,
+                                    intermediate_size, arena.stream);
+      LaunchExl3Projection(layer.ffn_down, ffn_scratch.activation.data(), 1,
+                           ffn_scratch.out.data(), exl3, arena.stream);
+    } else if (rotation.ffn_down_in != nullptr) {
       // The module's two launches with the SwiGLU row rotated in between.
       const std::size_t intermediate_size = config.intermediate_size;
       LaunchFusedSwiGLUGEMV(layer.ffn_gate.data, layer.ffn_gate.type,
@@ -316,7 +371,7 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
     // 3-4. Final output norm and LM head GEMV
     LaunchQwenOutputHead(weights, decode_scratch.hidden.data(),
                          decode_scratch.normed.data(),
-                         decode_scratch.logits.data(), arena.stream);
+                         decode_scratch.logits.data(), arena.stream, exl3);
 
     // 5. Parallel GPU Argmax
     LaunchBatchedGPUArgmax(decode_scratch.logits.data(), d_out_token, 1,

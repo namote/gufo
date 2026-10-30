@@ -12,6 +12,7 @@
 
 #include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
+#include "src/models/qwen/hip/exl3_dispatch.hpp"
 #include "src/models/qwen/hip/kernels/dflash_kernels.hpp"
 #include "src/models/qwen/hip/mtp/detail/allocation.hpp"
 #include "src/models/qwen/hip/ops.hpp"
@@ -100,7 +101,12 @@ void TraceBlock(const DFlashTrace& trace, std::string_view name,
 
 void ProjectBlock(const models::QwenTensorRef& weight, const float* input,
                   float* output, std::size_t rows, std::size_t output_size,
-                  std::size_t input_size, hipStream_t stream) {
+                  std::size_t input_size, hipStream_t stream,
+                  const quant::exl3::ReferenceScratch* exl3 = nullptr) {
+  if (IsExl3(weight)) {
+    LaunchExl3Projection(weight, input, rows, output, exl3, stream);
+    return;
+  }
   if (weight.type == core::GgmlType::kBF16) {
     LaunchExactBf16GEMMFp32SmallBatch(weight.data, input, output, rows,
                                       output_size, input_size, stream);
@@ -498,7 +504,8 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
                          hidden_size, stream);
   }
   ProjectBlock(weights.output, scratch.hidden, scratch.logits, proposal_rows,
-               config.vocab_size, hidden_size, stream);
+               config.vocab_size, hidden_size, stream,
+               &coordinator.exl3_scratch_);
   emit("logits", scratch.logits, config.vocab_size, true);
   std::array<kernels::DFlashSelectorSequence, 8> sequences{};
   for (std::size_t index = 0; index < requests.size(); ++index)

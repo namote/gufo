@@ -59,6 +59,9 @@ if (ENGINE_ENABLE_HIP)
   add_qwen27b_test(qwen27b_rotation_kernels_test rotation_kernels_test.hip
     "hip;gpu;rotation;kernels;correctness")
   target_link_libraries(qwen27b_rotation_kernels_test PRIVATE hip::host)
+  add_qwen27b_test(qwen27b_exl3_reference_test exl3_reference_test.hip
+    "hip;gpu;exl3;correctness")
+  target_link_libraries(qwen27b_exl3_reference_test PRIVATE hip::host)
   # The CLI tests drive the gufo binary, which Windows does not build yet.
   if (TARGET gufo)
     add_test(NAME qwen27b.cli-options COMMAND ${Python3_EXECUTABLE}
