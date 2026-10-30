@@ -268,7 +268,8 @@ python3 -I -m exllamav3.conversion.convert_model -w /xq/work/qwen-3.8-27b-exl3-5
     - `provenance.py`
   - 이미지와 설정은 시험 창과 같다: `-b 5.0 -hb 6 -mb 4 -vb 16 --out_scales always -cb mul1`, c02 250 × 2048
 - **작업 디렉터리:** 새로 만든다. 시험 창의 작업 디렉터리는 층 2가 `auto`로 오염됐으므로 이어 쓰지 않는다.
-- **재개 규칙:** 재개할 때마다 `-w /receipt/work -r --out_scales always -cpi 0`을 준다.
+- **재개 규칙:** 재개할 때마다 `-i /models/hfbf16/ -w /receipt/work -r --out_scales always -cpi 0`을 준다.
+  - `-i`는 `args.json`과 같은 값이다. 넣는 이유는 window.py가 argv에 나오는 `/models/<키>/` 경로만 마운트하기 때문이다. 이게 없으면 분할 창에 원본이 마운트되지 않는다.
   - `-cpi 0`은 모듈마다 체크포인트를 남긴다(모듈당 약 10 s, 64층이면 약 10분).
   - 그러면 `--max_module`로 멈출 때 잃는 작업이 없다.
 - **창 사이 작업 디렉터리 전달:**
