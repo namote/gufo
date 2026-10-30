@@ -124,6 +124,23 @@ cold는 새 프로세스의 첫 요청(빈 행 캐시), warm은 같은 요청의
 - **고침(재빌드 없음):** 두 계획의 모든 테스트에 같은 런타임 경로를 `env.LD_LIBRARY_PATH`로 넣었다. 이미지 안에서 `ldd`로 다섯 바이너리 모두 빠진 라이브러리가 0개임을 확인했다(GPU 사용 없음). LOCKS를 반영했다.
 - 다시 돌릴지는 감독이 승인한다.
 
+## P1T 두 번째 시도 (2026-10-30, `f1-p1-unit`) [확인]
+
+- 감독 재승인 뒤 다시 돌렸다. 창마다 사전 검사(창 컨테이너 없음, LOCKS 일치, 디스크 150 GiB 이상)를 했다. 결과는 FAILED, health_PASS다.
+  - **통과:**
+    - snapshot test(exact round trips, 164 s)
+    - session test(450 s)
+    - continuation adapter test(214 s)
+    - 페이지 행 op 검사 3개 형상(n=1/5000, 8/9000, 64/4093): decode walk/list split 0/8, WMMA dense/sparse, 쓰기 커널, pooling, selection이 모두 비트 단위로 같다.
+  - **실패:** 4번째 형상(n=300, start=0, 2블록)이다. 내 테스트 표 생성기가 보폭 7로 풀 2 b + 3 = 7 블록을 돌아 같은 블록을 반복했고, 테스트 자체의 검사가 "paged test table repeats a block"를 던졌다. 그 뒤의 기존 attention_ops 검사는 이 창에서 돌지 않았다.
+- 지시대로 멈췄다. greedy, suite, K0은 돌지 않았다. 결과는 `f1-p1/f1-p1-unit.attempt-2-testtable/`이다.
+- **고침:**
+  - `83d90aaa` test(qwen38_flash_next): keep the paged-row test table a permutation for two-block sequences. 풀이 7의 배수이면 1을 더한다. 1–199 블록에서 순열임을 확인했고, 포맷 검사도 통과했다.
+  - 테스트 재빌드 결과는 `/nix/store/nr6f886qfcmwaw7mqqgxzn2h86djai55-gufo-f1-tests-0-unstable-dirty`다.
+  - 후보 이미지를 다시 만들었다: `f1-cand-rocm101` id `99c908e2`, 라벨 `83d90aaa…`. 운영 gufo `7lcxjf2g`는 그대로다(운영 소스가 바뀌지 않았다). closure tar는 바로 지웠다.
+  - 계획 경로와 라벨을 갱신하고 LOCKS를 반영했다(`7692cbe4…`).
+- 디스크가 다시 148.3 GiB로 내려갔다(새 이미지 층 + nix store). 감독이 build cache를 정리해 154 GiB가 되었다.
+
 ## ABBA 계획 초안 (P1 정확성 통과 뒤)
 
 - **계획:** `PLAN-F1-ABBA-BASE.json`(이미지 `f1-base-rocm101`, d2b751a9)와 `PLAN-F1-ABBA-CAND.json`(`f1-cand-rocm101`, 766a593e)이다.
