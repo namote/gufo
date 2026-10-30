@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """Run the ExLlamaV3 converter inside a window and record time and memory (XQ, 2026-10-30).
 
-  python3 -I run_convert.py --summary <json> [--sha FILE ...] -- <convert_model arguments>
+  python3 -I run_convert.py --summary <json> [--sha FILE ...] [--copy-work SRC DST] -- <convert_model arguments>
+
+`--copy-work SRC DST` first copies a previous window's work directory (args.json, ckpt/, qtensors/;
+not ckpt_old/ or images/) into DST, which must not exist, and records bytes and seconds. Windows
+cannot share a writable directory, so a resumed job continues from a copy of the last window's
+work directory (read-only mount) inside the new window's receipt.
 
 Runs `<this python> -I -m exllamav3.conversion.convert_model <arguments>` (the installed wheel,
 never a source tree next to a convert.py), passing its output through, and samples every
@@ -20,6 +25,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -81,6 +87,7 @@ def main() -> int:
     ap.add_argument("--summary", type=Path, required=True)
     ap.add_argument("--sha", action="append", default=[])
     ap.add_argument("--interval", type=float, default=2.0)
+    ap.add_argument("--copy-work", nargs=2, type=Path, metavar=("SRC", "DST"))
     ap.add_argument("convert_args", nargs=argparse.REMAINDER)
     a = ap.parse_args()
     args = a.convert_args[1:] if a.convert_args[:1] == ["--"] else a.convert_args
@@ -100,6 +107,23 @@ def main() -> int:
     except Exception as exc:  # recorded, not fatal
         s["versions"] = {"error": repr(exc)}
     s["sha256"] = {p: sha256(p) for p in a.sha}
+    if a.copy_work:
+        src, dst = a.copy_work
+        if dst.exists():
+            raise SystemExit(f"{dst} exists")
+        t = time.monotonic()
+        dst.mkdir(parents=True)
+        shutil.copy2(src / "args.json", dst / "args.json")
+        for sub in ("ckpt", "qtensors"):
+            shutil.copytree(src / sub, dst / sub)
+        files = [f for f in dst.rglob("*") if f.is_file()]
+        for f in files:
+            if f.stat().st_size != (src / f.relative_to(dst)).stat().st_size:
+                raise SystemExit(f"copy size differs: {f}")
+        s["copy_work"] = {"src": str(src), "dst": str(dst), "files": len(files),
+                          "bytes": sum(f.stat().st_size for f in files), "seconds": round(time.monotonic() - t, 1),
+                          "next_module_idx": json.loads((dst / "ckpt/job.json").read_text())["next_module_idx"]}
+        print(json.dumps({"copy_work": s["copy_work"]}), flush=True)
 
     peaks = {"cgroup_current": 0, "tree_rss": 0, "vram": 0, "gtt": 0}
     stop = threading.Event()
