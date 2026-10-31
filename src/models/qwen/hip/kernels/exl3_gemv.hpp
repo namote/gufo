@@ -48,7 +48,7 @@ struct Exl3FastTarget {
   std::size_t y_stride;
 };
 
-/// Whether the fast path takes `linear` (mul1 codebook, integer K 1..6).
+/// Whether the fast path takes `linear` (mul1 codebook, integer K 1..7).
 [[nodiscard]] bool Exl3FastSupported(
     const quant::exl3::DeviceLinear& linear) noexcept;
 

@@ -16,6 +16,7 @@
 #include <string_view>
 #include <vector>
 
+#include "src/core/gguf_reader.hpp"
 #include "src/core/quant/exl3/format.hpp"
 
 namespace gufo::quant::exl3 {
@@ -30,6 +31,8 @@ struct Tensor {
   std::vector<std::int64_t> shape;
   const std::uint8_t* data = nullptr;
   std::size_t bytes = 0;
+  std::uint32_t shard = 0;
+  std::uint64_t file_offset = 0;
 
   [[nodiscard]] std::int64_t Elements() const noexcept;
 };
@@ -68,7 +71,11 @@ public:
 
   /// Opens `directory`: config.json, then model.safetensors.index.json (or a
   /// single model.safetensors). Throws std::runtime_error naming the problem.
-  static Checkpoint Open(const std::filesystem::path& directory);
+  static Checkpoint Open(
+      const std::filesystem::path& directory,
+      std::span<const std::filesystem::path> supplementary = {});
+
+  [[nodiscard]] std::vector<core::GgufMappedRegion> GetMappedRegions() const;
 
   /// Whether `config.json` at `directory` declares quant_method "exl3".
   static bool IsExl3(const std::filesystem::path& directory);
