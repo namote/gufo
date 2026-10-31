@@ -34,16 +34,17 @@ struct ExecutorTestAccess {
     if (status != hipSuccess)
       throw std::runtime_error(hipGetErrorString(status));
   }
-  static std::unique_ptr<DeviceModel> Model(const Config& config,
-                                            const DeviceLayer& layer,
-                                            DeviceTensor embedding,
-                                            DeviceTensor output,
-                                            DeviceMixer head) {
+  static std::unique_ptr<DeviceModel> Model(
+      const Config& config, const DeviceLayer& layer, DeviceTensor embedding,
+      DeviceTensor output, DeviceMixer head,
+      const DeviceLayer* linear = nullptr) {
     std::unique_ptr<DeviceModel> model(new DeviceModel);
     model->config_ = config;
     model->token_embd_ = embedding;
     model->output_ = output;
     model->hc_head_ = head;
+    if (linear != nullptr)
+      model->layers_.push_back(*linear);
     model->layers_.push_back(layer);
     model->mtp_ = layer;
     model->has_mtp_ = true;
@@ -98,6 +99,14 @@ struct ExecutorTestAccess {
   static std::vector<float> PrefillResiduals(const Executor& exec,
                                              unsigned rows) {
     return Read<float>(exec.s_.res, std::size_t{rows} * exec.config().HcDim());
+  }
+  static auto GdnState(const Session& session, const Config& c) {
+    const auto& state = session.linear_[0];
+    return std::pair{
+        Read<float>(state.conv_state,
+                    std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels()),
+        Read<float>(state.state, std::size_t{c.ssm_num_v_heads} *
+                                     c.ssm_head_dim * c.ssm_head_dim)};
   }
   static State ReadState(const Session& session, const Config& config) {
     const auto& m = session.mtp_;
@@ -891,15 +900,15 @@ struct MtpExecutorFixture {
                    : gpu::DeviceTensor{}};
   }
   explicit MtpExecutorFixture(unsigned max_batch = 16, unsigned expert_ff = 128,
-                              int shared_bits = 6) {
-    config.num_layers = 1;
-    config.num_layers_all = 2;
+                              int shared_bits = 6, bool linear_prefix = false) {
+    config.num_layers = linear_prefix ? 2 : 1;
+    config.num_layers_all = config.num_layers + 1;
     config.hidden_size = 128;
     config.vocab_size = 256;
     config.context_length = 64;
     config.hc_count = 4;
     config.hc_low_rank = 32;
-    config.full_attention_interval = 1;
+    config.full_attention_interval = linear_prefix ? 2 : 1;
     config.num_heads = 4;
     config.num_kv_heads = 1;
     config.head_dim = 256;
@@ -952,8 +961,26 @@ struct MtpExecutorFixture {
         Compressed(config.expert_ff, config.hidden_size, 5, config.num_experts);
     const auto embedding = Plain(config.vocab_size, config.hidden_size);
     const auto output = Compressed(config.hidden_size, config.vocab_size, 6);
+    auto linear = l;
+    if (linear_prefix) {
+      linear.linear = true;
+      linear.ssm_qkv = Compressed(config.hidden_size, config.SsmConvChannels());
+      linear.ssm_gate = Compressed(config.hidden_size, config.SsmValueDim());
+      linear.ssm_out = Compressed(config.SsmValueDim(), config.hidden_size);
+      linear.ssm_alpha_beta =
+          Plain(2 * config.ssm_num_v_heads, config.hidden_size, true);
+      linear.ssm_conv1d =
+          Plain(config.SsmConvChannels(), config.ssm_conv_kernel, true);
+      linear.ssm_a = Plain(config.ssm_num_v_heads, 1, true);
+      const std::vector<float> decay(config.ssm_num_v_heads, -0.5F);
+      Check(hipMemcpy(linear.ssm_a.data, decay.data(),
+                      decay.size() * sizeof(float), hipMemcpyHostToDevice));
+      linear.ssm_dt = Plain(config.ssm_num_v_heads, 1, true);
+      linear.ssm_norm = Plain(config.ssm_head_dim, 1, true, true);
+    }
     model = gpu::ExecutorTestAccess::Model(config, l, embedding, output,
-                                           Mixer(false));
+                                           Mixer(false),
+                                           linear_prefix ? &linear : nullptr);
     std::string error;
     exec = gpu::Executor::Create(*model, nullptr,
                                  {.max_batch = max_batch,
@@ -1479,6 +1506,87 @@ void ExecutorPrefillExperts() {
   }
 }
 
+void ExecutorGdnPrefill() {
+  BeginCase("executor linear GDN dense X3 wiring and 1/64/65 chunk bits");
+  constexpr unsigned rows = 65;
+  // A genuine linear layer followed by attention keeps the resident model
+  // geometry valid and observes the GDN output through its downstream consumer.
+  MtpExecutorFixture f(rows, 640, 7, true);
+  auto& exec = *f.exec;
+  const auto& c = f.config;
+  using Access = gpu::ExecutorTestAccess;
+  Require(c.IsLinearLayer(0) && f.model->layers()[0].linear &&
+              !f.model->layers()[1].linear,
+          "GDN fixture must execute a linear layer before attention");
+  std::vector<std::int32_t> tokens(rows);
+  for (unsigned r = 0; r < rows; ++r)
+    tokens[r] = 1 + (r * 17) % (c.vocab_size - 1);
+  std::string error;
+  struct Result {
+    std::vector<float> hidden, logits, conv, recurrent;
+  };
+  const auto run = [&](unsigned chunk) {
+    auto session = exec.CreateSession(gufo::core::SessionMode::kAutoregressive,
+                                      128, &error);
+    Require(session != nullptr, error);
+    Result result{std::vector<float>(std::size_t{rows} * c.HcDim()),
+                  std::vector<float>(c.vocab_size),
+                  {},
+                  {}};
+    std::uint64_t dense_rows = 0, rotations = 0, gemms = 0;
+    Require(exec.BeginMtpCycleDiagnostics(&error), error);
+    for (unsigned first = 0; first < rows; first += chunk) {
+      const auto count = std::min(chunk, rows - first);
+      const bool sparse = first + count > c.indexer_top_k;
+      // GDN: QKV/Z grouped rotation (two unequal-N GEMMs), output,
+      // shared gate/up and shared down = 6 projection rows, 4 rotations,
+      // 5 GEMMs. Add the existing attention layer's exact totals.
+      dense_rows += (std::uint64_t{14} + sparse) * count;
+      rotations += 9 + sparse;
+      gemms += 11 + sparse;
+      Require(
+          exec.Forward(*session, std::span(tokens).subspan(first, count), 0,
+                       nullptr, gpu::Executor::ForwardMode::kPrefill, &error),
+          error);
+      // Disable final-query pruning (n_logits=0); all65 rows fit below the
+      // final FFN skip. Preserve every row before scratch is reused.
+      const auto hidden = Access::PrefillResiduals(exec, count);
+      std::copy(hidden.begin(), hidden.end(),
+                result.hidden.begin() + std::size_t{first} * c.HcDim());
+      Require(exec.ReplayOutputHead(count, result.logits, &error), error);
+    }
+    gpu::Executor::MtpCycleDiagnostics d;
+    Require(exec.EndMtpCycleDiagnostics(0, 0, &d, &error), error);
+    Require(d.prefill_dense_rows == dense_rows &&
+                d.prefill_dense_rotation_groups == rotations &&
+                d.prefill_dense_gemm_groups == gemms,
+            "GDN QKV/Z grouping or output X3 dispatch was reverted");
+    Require(d.prefill_expert_rows == rows * c.num_layers &&
+                d.prefill_plain_rows != 0 && d.scaled_down_rows == 0,
+            "GDN fixture must retain the prefill phase through both layers");
+    auto state = Access::GdnState(*session, c);
+    result.conv = std::move(state.first);
+    result.recurrent = std::move(state.second);
+    for (const auto* values :
+         {&result.hidden, &result.logits, &result.conv, &result.recurrent})
+      Require(std::ranges::all_of(*values,
+                                  [](float v) { return std::isfinite(v); }),
+              "GDN prefill fixture produced nonfinite values");
+    Require(
+        std::ranges::any_of(result.recurrent, [](float v) { return v != 0; }),
+        "GDN recurrent state must actually be updated");
+    return result;
+  };
+  const auto bulk = run(rows);
+  for (unsigned chunk : {1U, 64U, 65U}) {
+    const auto split = run(chunk);
+    SameBits(bulk.hidden, split.hidden, "GDN every residual row");
+    SameBits(bulk.logits, split.logits, "GDN downstream full logits");
+    SameBits(bulk.conv, split.conv, "GDN convolution history");
+    SameBits(bulk.recurrent, split.recurrent, "GDN recurrent state");
+  }
+}
+
 void MtpKvGroup() {
   namespace fast = gufo::hip;
   constexpr unsigned k = 256, q_width = 1024, kv_width = 512;
@@ -1541,6 +1649,10 @@ void MtpKvGroup() {
 int main(int argc, char** argv) {
   std::cout << std::unitbuf;
   try {
+    if (argc == 2 && std::string(argv[1]) == "--gdn-prefill-only") {
+      ExecutorGdnPrefill();
+      return 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--dense-prefill-only") {
       DensePrefillProjection();
       PlainOperandPrecision();
