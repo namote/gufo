@@ -21,6 +21,21 @@ namespace {
 
 constexpr unsigned kThreads = 256;
 
+struct Exl3DensePrefillArguments {
+  Exl3DensePrefillProblem problems[3];
+  unsigned count;
+};
+__global__ void PrepareExl3DensePrefillKernel(
+    Exl3DensePrefillArguments args, gufo::hip::Exl3RotateProblem* rotations,
+    gufo::hip::Exl3GemmProblem* gemms) {
+  const auto i = threadIdx.x;
+  if (i >= args.count)
+    return;
+  const auto p = args.problems[i];
+  rotations[i] = {p.x, p.x_stride, nullptr, p.suh, p.rotated, p.rows, 0};
+  gemms[i] = {p.trellis, p.svh, p.rotated, p.y, p.rows, 0};
+}
+
 /// Row of token position `pos` in one layer of a K/V plane: through the
 /// session's block table, or `pos` itself when `kv_blocks` is null.
 __device__ __forceinline__ std::size_t KvRow(const std::uint32_t* kv_blocks,
@@ -1342,9 +1357,10 @@ __global__ void NarrowKernel(const float* x, T* out, std::size_t count) {
 /// tokens accumulate in registers, then a wave reduction per token.
 constexpr unsigned kSmallGemmRows = 4;
 template<WeightType type, unsigned tokens, bool grouped = false,
-         bool kWhole = false>
+         bool kWhole = false, bool stable = false, bool kHcDown = false>
 __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
                                 std::uint32_t m, std::uint32_t k) {
+  static_assert(!kHcDown || (stable && type == WeightType::kF16));
   if constexpr (grouped) {
     x += std::size_t{blockIdx.y} * tokens * k;
     out += std::size_t{blockIdx.y} * tokens * m;
@@ -1360,7 +1376,7 @@ __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
   // A lane's steps are loaded kSteps at a time so their reads overlap (one
   // step at a time leaves a decode-sized projection latency-bound); the
   // steps still accumulate one after another, in order.
-  constexpr unsigned kSteps = kWhole || tokens <= 2 ? 4 : 2;
+  constexpr unsigned kSteps = stable || kWhole || tokens <= 2 ? 4 : 2;
   const std::uint32_t stride = warpSize * 4;
   float acc[tokens] = {};
   for (std::uint32_t i_base = lane * 4; i_base < k; i_base += stride * kSteps) {
@@ -1428,6 +1444,19 @@ __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
       }
 #pragma unroll
       for (unsigned j = 0; j < tokens; ++j) {
+        if constexpr (stable) {
+          // EXL3's unquantized operands keep FP32 inputs and an explicit
+          // FMA chain in every phase, including ragged HC mixer widths.
+          float a = acc[j];
+#pragma unroll
+          for (unsigned r = 0; r < 4; ++r) {
+            const float w32 = Materialize(wv[st][r]);
+            const float x32 = Materialize(xv[st][j][r]);
+            a = Materialize(__builtin_fmaf(w32, x32, a));
+          }
+          acc[j] = a;
+          continue;
+        }
         if constexpr (kWhole) {
           // The bounds-checked path compiles acc + dot to one FMA chain
           // from acc in element order; spelled out so it cannot reassociate.
@@ -1452,7 +1481,10 @@ __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
   for (unsigned j = 0; j < tokens; ++j) {
     const float total = WaveSum(acc[j]);
     if (lane == 0) {
-      out[static_cast<std::size_t>(j) * m + row] = total;
+      // Preserve the F32 store boundary of SmallGemmStable + SiluScale. The
+      // reduction and every input product above are shared with that path.
+      out[static_cast<std::size_t>(j) * m + row] =
+          kHcDown ? SiluF(Materialize(total) * 0.25F) : total;
     }
   }
 }
@@ -7544,7 +7576,8 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
   return true;
 }
 
-template<WeightType type, unsigned tokens>
+template<WeightType type, unsigned tokens, bool stable = false,
+         bool kHcDown = false>
 void LaunchSmallGemm(const void* w, const float* x, float* out, std::uint32_t m,
                      std::uint32_t k, hipStream_t stream) {
   if constexpr (type != WeightType::kQ8_0) {
@@ -7556,24 +7589,26 @@ void LaunchSmallGemm(const void* w, const float* x, float* out, std::uint32_t m,
                              16 ==
                          0;
     if (aligned && k % (32 * 4 * 4) == 0) {
-      hipLaunchKernelGGL((SmallGemmKernel<type, tokens, false, true>),
-                         dim3((m + kSmallGemmRows - 1) / kSmallGemmRows),
-                         dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m, k);
+      hipLaunchKernelGGL(
+          (SmallGemmKernel<type, tokens, false, true, stable, kHcDown>),
+          dim3((m + kSmallGemmRows - 1) / kSmallGemmRows),
+          dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m, k);
       return;
     }
   }
-  hipLaunchKernelGGL((SmallGemmKernel<type, tokens>),
-                     dim3((m + kSmallGemmRows - 1) / kSmallGemmRows),
-                     dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m, k);
+  hipLaunchKernelGGL(
+      (SmallGemmKernel<type, tokens, false, false, stable, kHcDown>),
+      dim3((m + kSmallGemmRows - 1) / kSmallGemmRows),
+      dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m, k);
 }
 
-template<WeightType type>
+template<WeightType type, bool stable = false, bool kHcDown = false>
 void SmallGemmForType(const void* w, const float* x, float* out,
                       std::uint32_t tokens, std::uint32_t m, std::uint32_t k,
                       hipStream_t stream) {
   if (tokens > 8) {
     const auto groups = tokens / 8;
-    hipLaunchKernelGGL((SmallGemmKernel<type, 8, true>),
+    hipLaunchKernelGGL((SmallGemmKernel<type, 8, true, false, stable, kHcDown>),
                        dim3((m + kSmallGemmRows - 1) / kSmallGemmRows, groups),
                        dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m, k);
     const auto consumed = groups * 8;
@@ -7585,24 +7620,44 @@ void SmallGemmForType(const void* w, const float* x, float* out,
   }
   switch (tokens) {
     case 1:
-      return LaunchSmallGemm<type, 1>(w, x, out, m, k, stream);
+      return LaunchSmallGemm<type, 1, stable, kHcDown>(w, x, out, m, k, stream);
     case 2:
-      return LaunchSmallGemm<type, 2>(w, x, out, m, k, stream);
+      return LaunchSmallGemm<type, 2, stable, kHcDown>(w, x, out, m, k, stream);
     case 3:
-      return LaunchSmallGemm<type, 3>(w, x, out, m, k, stream);
+      return LaunchSmallGemm<type, 3, stable, kHcDown>(w, x, out, m, k, stream);
     case 4:
-      return LaunchSmallGemm<type, 4>(w, x, out, m, k, stream);
+      return LaunchSmallGemm<type, 4, stable, kHcDown>(w, x, out, m, k, stream);
     case 5:
-      return LaunchSmallGemm<type, 5>(w, x, out, m, k, stream);
+      return LaunchSmallGemm<type, 5, stable, kHcDown>(w, x, out, m, k, stream);
     case 6:
-      return LaunchSmallGemm<type, 6>(w, x, out, m, k, stream);
+      return LaunchSmallGemm<type, 6, stable, kHcDown>(w, x, out, m, k, stream);
     case 7:
-      return LaunchSmallGemm<type, 7>(w, x, out, m, k, stream);
+      return LaunchSmallGemm<type, 7, stable, kHcDown>(w, x, out, m, k, stream);
     case 8:
-      return LaunchSmallGemm<type, 8>(w, x, out, m, k, stream);
+      return LaunchSmallGemm<type, 8, stable, kHcDown>(w, x, out, m, k, stream);
     default:
       throw std::logic_error("small projection requires 1-8 token rows");
   }
+}
+
+void PrepareExl3DensePrefill(std::span<const Exl3DensePrefillProblem> problems,
+                             gufo::hip::Exl3RotateProblem* rotations,
+                             gufo::hip::Exl3GemmProblem* gemms,
+                             hipStream_t stream) {
+  if (problems.empty() || problems.size() > 3)
+    throw std::invalid_argument("EXL3 dense prefill requires 1..3 projections");
+  Exl3DensePrefillArguments args{};
+  args.count = static_cast<unsigned>(problems.size());
+  for (unsigned i = 0; i < args.count; ++i)
+    args.problems[i] = problems[i];
+  hipLaunchKernelGGL(PrepareExl3DensePrefillKernel, dim3(1), dim3(32), 0,
+                     stream, args, rotations, gemms);
+}
+
+void HcDownSiluF16(const void* w, const float* x, float* out,
+                   std::uint32_t n_tokens, hipStream_t stream) {
+  SmallGemmForType<WeightType::kF16, true, true>(w, x, out, n_tokens, 320,
+                                                 10240, stream);
 }
 
 void SmallGemm(const void* w, WeightType type, const float* x, float* out,
@@ -7618,6 +7673,24 @@ void SmallGemm(const void* w, WeightType type, const float* x, float* out,
     case WeightType::kF16:
       return SmallGemmForType<WeightType::kF16>(w, x, out, n_tokens, m, k,
                                                 stream);
+    default:
+      throw std::logic_error("unsupported small projection format");
+  }
+}
+
+void SmallGemmStable(const void* w, WeightType type, const float* x, float* out,
+                     std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
+                     hipStream_t stream) {
+  switch (type) {
+    case WeightType::kF32:
+      return SmallGemmForType<WeightType::kF32, true>(w, x, out, n_tokens, m, k,
+                                                      stream);
+    case WeightType::kBF16:
+      return SmallGemmForType<WeightType::kBF16, true>(w, x, out, n_tokens, m,
+                                                       k, stream);
+    case WeightType::kF16:
+      return SmallGemmForType<WeightType::kF16, true>(w, x, out, n_tokens, m, k,
+                                                      stream);
     default:
       throw std::logic_error("unsupported small projection format");
   }
@@ -7863,6 +7936,21 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
     }
   }
   return true;
+}
+
+void PrepareAttentionKv(float* k, const float* v, const float* k_gamma,
+                        __half* k_cache, __half* v_cache,
+                        std::uint32_t n_tokens, std::uint32_t kv_heads,
+                        std::uint32_t d, std::uint32_t rotary_dim,
+                        const std::uint32_t* start_pos, float theta, float eps,
+                        hipStream_t stream,
+                        const qwen::vision::DeviceRope* rope,
+                        const YarnRope& yarn, const std::uint32_t* kv_blocks) {
+  RmsNormRows(k, k_gamma, k, n_tokens * kv_heads, d, 1, eps, stream);
+  Rope(k, n_tokens, kv_heads, d, rotary_dim, start_pos, theta, stream, rope,
+       yarn);
+  StoreKv(k, k_cache, n_tokens, kv_heads * d, start_pos, stream, kv_blocks);
+  StoreKv(v, v_cache, n_tokens, kv_heads * d, start_pos, stream, kv_blocks);
 }
 
 void Rope(float* x, std::uint32_t n_tokens, std::uint32_t heads,

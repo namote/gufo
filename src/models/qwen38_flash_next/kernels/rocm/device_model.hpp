@@ -120,6 +120,7 @@ public:
 
 private:
   DeviceModel() = default;
+  friend struct ExecutorTestAccess;
 
   Config config_;
   DeviceTensor token_embd_;

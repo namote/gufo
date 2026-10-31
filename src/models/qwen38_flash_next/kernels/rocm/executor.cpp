@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
@@ -22,6 +23,7 @@
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/core/platform/pages.hpp"
 #include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
+#include "src/models/qwen/hip/ops/plain_prefill_stable.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
@@ -81,6 +83,52 @@ WeightType SmallType(GgmlType type) {
 // The tier's tiled kernels compute whole column tiles; below this width the
 // matrix-vector kernels read each weight once per row and win outright.
 constexpr std::uint32_t kVecBatch = 8;
+constexpr std::uint32_t kExl3PrefillTileRows = 64;
+
+struct Exl3PrefillLayout {
+  std::uint32_t assignments{0}, buckets{0};
+  std::size_t bytes{0};
+};
+
+bool PlanExl3Prefill(const Config& c, std::uint32_t rows,
+                     Exl3PrefillLayout* layout, std::string* error) {
+  if (rows == 0 || c.num_experts_used == 0 ||
+      c.num_experts_used > c.num_experts || c.hidden_size == 0 ||
+      c.expert_ff == 0) {
+    AssignError(error, "invalid EXL3 prefill scratch geometry");
+    return false;
+  }
+  const std::uint64_t assignments = std::uint64_t{rows} * c.num_experts_used;
+  const auto buckets =
+      std::min(assignments, std::uint64_t{c.num_experts} +
+                                assignments / kExl3PrefillTileRows);
+  if (assignments > std::numeric_limits<std::uint32_t>::max() ||
+      buckets > 65535) {
+    AssignError(error, "EXL3 prefill scratch exceeds device descriptor limits");
+    return false;
+  }
+  std::size_t bytes = 0;
+  const auto add = [&](std::uint64_t count, std::size_t element) {
+    if (count > (std::numeric_limits<std::size_t>::max() - bytes) / element)
+      return false;
+    bytes += static_cast<std::size_t>(count) * element;
+    return true;
+  };
+  if (!add(std::uint64_t{c.num_experts} + 1, sizeof(std::uint32_t)) ||
+      !add(assignments, sizeof(std::int32_t)) ||
+      !add(buckets, sizeof(Exl3ExpertBucket)) ||
+      !add(1, sizeof(std::uint32_t)) ||
+      !add(assignments * std::max(c.hidden_size, c.expert_ff),
+           sizeof(std::uint16_t)) ||
+      !add(assignments * c.hidden_size, sizeof(float)) ||
+      !add(assignments, sizeof(std::int32_t))) {
+    AssignError(error, "EXL3 prefill scratch byte size overflows size_t");
+    return false;
+  }
+  *layout = {static_cast<std::uint32_t>(assignments),
+             static_cast<std::uint32_t>(buckets), bytes};
+  return true;
+}
 // Keep prompt arithmetic independent of chunk width. A scoped, per-thread
 // policy also lets the output head retain its existing logits-row arithmetic.
 thread_local bool prefill_phase = false;
@@ -1079,18 +1127,40 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     ex.slice_elements = std::max(T, std::size_t{64}) * (c.indexer_heads + 1) *
                         c.indexer_head_dim;
     ex.slice = f32(ex.slice_elements);
-    ex.gather = f32(T * c.hidden_size);
-    ex.gate = f32(T * c.expert_ff);
-    ex.up = f32(T * c.expert_ff);
-    ex.out = f32(T * c.hidden_size);
     const auto assignments = std::size_t{64} * c.num_experts_used;
-    ex.routed_input =
-        Alloc<std::uint16_t>(a, 2 * assignments * c.hidden_size, error_msg);
+    ex.routed_input = Alloc<std::uint16_t>(
+        a,
+        assignments *
+            std::max(std::size_t{2} * c.hidden_size, std::size_t{c.expert_ff}),
+        error_msg);
     ex.tiles = Alloc<Exl3RouteTile>(a, assignments, error_msg);
     ex.tile_count = Alloc<std::uint32_t>(a, 1, error_msg);
+    ex.down_exponents = Alloc<std::int32_t>(a, assignments, error_msg);
+    e->exl3_dense_rotations_ =
+        Alloc<gufo::hip::Exl3RotateProblem>(a, 3, error_msg);
+    e->exl3_dense_gemms_ = Alloc<gufo::hip::Exl3GemmProblem>(a, 3, error_msg);
     ex.head_segments =
         Alloc<std::uint32_t>(a, kMtpDraftExtraRows + 1, error_msg);
     ex.head_values = f32(c.vocab_size + std::size_t{kMtpDraftExtraRows} * 128);
+    Exl3PrefillLayout layout;
+    if (!PlanExl3Prefill(c, e->options_.max_batch, &layout, error_msg))
+      return nullptr;
+    auto& pp = e->exl3_prefill_;
+    pp.max_assignments = layout.assignments;
+    pp.max_buckets = layout.buckets;
+    const std::size_t A = layout.assignments;
+    pp.offsets =
+        Alloc<std::uint32_t>(a, std::size_t{c.num_experts} + 1, error_msg);
+    pp.slots = Alloc<std::int32_t>(a, A, error_msg);
+    pp.buckets = Alloc<Exl3ExpertBucket>(a, layout.buckets, error_msg);
+    pp.bucket_count = Alloc<std::uint32_t>(a, 1, error_msg);
+    pp.input = Alloc<std::uint16_t>(a, A * std::max(c.hidden_size, c.expert_ff),
+                                    error_msg);
+    // Gate/up borrow the current stage view at dispatch. Packed out must
+    // remain separate from stage down_e, which receives the scattered rows.
+    pp.out = f32(A * c.hidden_size);
+    pp.down_exponents = Alloc<std::int32_t>(a, A, error_msg);
+    e->exl3_prefill_scratch_bytes_ = layout.bytes;
   }
   s.tokens = Alloc<std::int32_t>(a, T, error_msg);
   s.x_half = Alloc<std::uint16_t>(a, T * model.max_half_cols(), error_msg);
@@ -1574,6 +1644,12 @@ bool Executor::DraftLogits(const Session& session, const float* x,
   if (model_->output().exl3 != nullptr) {
     Exl3DraftHead(model_->output(), x, logits, prefix.rows,
                   session.mtp_.draft_ids, kMtpDraftExtraRows, exl3_, stream_);
+    if (diagnostics_active_) {
+      cycle_diagnostics_.head_segments += (prefix.rows + 127) / 128;
+      if (!DiagnosticCount(exl3_.head_segments,
+                           &cycle_diagnostics_.head_segments, error_msg))
+        return false;
+    }
     return true;
   }
   if (!Dense(prefix, x, logits, 1, error_msg) ||
@@ -1843,6 +1919,14 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
                           const float* x, float* out, std::uint32_t n_tokens,
                           const DeviceTensor* down,
                           std::string* error_msg) const {
+  if (prefill_phase && gate.exl3 != nullptr && up.exl3 != nullptr &&
+      gate.cols == up.cols) {
+    if (!Exl3DensePrefill({&gate, &up}, {out, s_.shexp_gate}, x, n_tokens,
+                          error_msg))
+      return false;
+    Swiglu(out, s_.shexp_gate, std::size_t{n_tokens} * gate.rows, stream_);
+    return true;
+  }
   // Decode and verification use the same fused projections and activation.
   // A different SwiGLU rounding can change later activation quantization.
   if (!MatrixRows(n_tokens) && up.type == GgmlType::kQ8_0 &&
@@ -1914,9 +1998,126 @@ bool Executor::DenseF16Route(const DeviceTensor& w,
          w.cols <= model_->max_half_cols();
 }
 
+bool Executor::Exl3DensePrefill(
+    std::initializer_list<const DeviceTensor*> weights,
+    std::initializer_list<float*> outputs, const float* x, std::uint32_t rows,
+    std::string* error) const {
+  try {
+    if (weights.size() == 0 || weights.size() != outputs.size() ||
+        weights.size() > 3)
+      throw std::invalid_argument(
+          "EXL3 dense prefill requires 1..3 matching outputs");
+    struct Target {
+      const DeviceTensor* weight;
+      float* output;
+    };
+    std::array<Target, 3> targets{};
+    const auto count = weights.size();
+    const auto k = (*weights.begin())->cols;
+    auto output = outputs.begin();
+    bool sliced = false;
+    for (std::size_t i = 0; const auto* w : weights) {
+      if (w->exl3 == nullptr || w->experts != 1 || w->cols != k ||
+          w->exl3->k != k || !gufo::hip::Exl3PrefillSupported(*w->exl3) ||
+          std::uint64_t{w->output_begin} + w->rows > w->exl3->n)
+        throw std::invalid_argument(
+            "unsupported EXL3 dense prefill projection");
+      sliced |= w->output_begin != 0 || w->rows != w->exl3->n;
+      targets[i++] = {w, *output++};
+    }
+    if (sliced && count != 1)
+      throw std::invalid_argument(
+          "EXL3 dense slices require an individual projection");
+    if (rows == 0)
+      return true;
+    // q/k/v have different N; K/V and gate/up can share a GEMM launch.
+    // All three still rotate together, each with its own checkpoint suh.
+    std::sort(targets.begin(), targets.begin() + count, [](auto a, auto b) {
+      return std::pair{a.weight->exl3->n, a.weight->exl3->rate.bits} <
+             std::pair{b.weight->exl3->n, b.weight->exl3->rate.bits};
+    });
+    // Routed prefill and dense projections never overlap. Reuse the larger
+    // of their existing FP16 slabs; even tiny configured batches retain the
+    // decode slab (24 * widest K). No second chunk-sized activation allocation.
+    auto* rotated = exl3_prefill_.input;
+    std::size_t capacity = std::size_t{exl3_prefill_.max_assignments} *
+                           std::max(config().hidden_size, config().expert_ff);
+    if (exl3_.projection.fast_input_elements > capacity) {
+      rotated = exl3_.projection.fast_input;
+      capacity = exl3_.projection.fast_input_elements;
+    }
+    const auto piece = static_cast<std::uint32_t>(
+        std::min<std::size_t>(options_.max_batch, capacity / (count * k)));
+    if (rotated == nullptr || piece == 0 || exl3_dense_rotations_ == nullptr ||
+        exl3_dense_gemms_ == nullptr)
+      throw std::runtime_error("EXL3 dense prefill exceeds rotation scratch");
+    for (std::uint32_t first = 0; first < rows; first += piece) {
+      const auto n = std::min(piece, rows - first);
+      std::array<Exl3DensePrefillProblem, 3> problems{};
+      for (std::size_t i = 0; i < count; ++i) {
+        const auto& t = targets[i];
+        const auto& l = *t.weight->exl3;
+        if (sliced && exl3_.slice_elements < std::size_t{n} * l.n)
+          throw std::runtime_error("EXL3 dense prefill slice exceeds scratch");
+        problems[i] = {l.trellis,
+                       l.suh,
+                       l.svh,
+                       x + std::size_t{first} * k,
+                       k,
+                       rotated + i * std::size_t{n} * k,
+                       sliced ? exl3_.slice
+                              : t.output + std::size_t{first} * t.weight->rows,
+                       n};
+      }
+      PrepareExl3DensePrefill(std::span(problems.data(), count),
+                              exl3_dense_rotations_, exl3_dense_gemms_,
+                              stream_);
+      gufo::hip::LaunchExl3RotateRowsGrouped(exl3_dense_rotations_, count, n, k,
+                                             stream_);
+      for (std::size_t begin = 0; begin < count;) {
+        const auto& l = *targets[begin].weight->exl3;
+        auto end = begin + 1;
+        while (end < count && targets[end].weight->exl3->n == l.n &&
+               targets[end].weight->exl3->rate == l.rate)
+          ++end;
+        // Always X3, including a singleton/tail; a GEMV row threshold would
+        // change the reduction tree when a prompt/checkpoint chunk moves.
+        gufo::hip::LaunchExl3PrefillGemmGrouped(exl3_dense_gemms_ + begin,
+                                                end - begin, n, k, l.n, l.rate,
+                                                false, stream_);
+        if (diagnostics_active_)
+          ++cycle_diagnostics_.prefill_dense_gemm_groups;
+        begin = end;
+      }
+      if (sliced) {
+        const auto& t = targets[0];
+        if (!Check(
+                hipMemcpy2DAsync(t.output + std::size_t{first} * t.weight->rows,
+                                 t.weight->rows * sizeof(float),
+                                 exl3_.slice + t.weight->output_begin,
+                                 t.weight->exl3->n * sizeof(float),
+                                 t.weight->rows * sizeof(float), n,
+                                 hipMemcpyDeviceToDevice, stream_),
+                "EXL3 dense prefill slice", error))
+          return false;
+      }
+      if (diagnostics_active_) {
+        cycle_diagnostics_.prefill_dense_rows += std::uint64_t{n} * count;
+        ++cycle_diagnostics_.prefill_dense_rotation_groups;
+      }
+    }
+    return true;
+  } catch (const std::exception& e) {
+    AssignError(error, e.what());
+    return false;
+  }
+}
+
 bool Executor::Exl3Group(std::initializer_list<const DeviceTensor*> weights,
                          std::initializer_list<float*> outputs, const float* x,
                          std::uint32_t rows, std::string* error) const {
+  if (prefill_phase)
+    return Exl3DensePrefill(weights, outputs, x, rows, error);
   try {
     if (weights.size() != outputs.size() || weights.size() > 3)
       throw std::logic_error("invalid EXL3 projection group");
@@ -1936,10 +2137,19 @@ bool Executor::Exl3Group(std::initializer_list<const DeviceTensor*> weights,
         p.fast_down_input, p.fast_down_input_elements};
     const std::span<const gufo::hip::Exl3FastTarget> group(targets.data(),
                                                            count);
-    if (!prefill_phase && rows <= 64 &&
-        gufo::hip::Exl3FastGroupSupported(group, ws)) {
-      gufo::hip::LaunchExl3FastProjections(group, x, (*weights.begin())->cols,
-                                           rows, ws, stream_);
+    if (!prefill_phase && gufo::hip::Exl3FastGroupSupported(group, ws)) {
+      for (std::uint32_t first = 0; first < rows;
+           first += gufo::hip::kExl3FastMaxRows) {
+        auto pass = targets;
+        for (std::size_t i = 0; i < count; ++i)
+          pass[i].y += std::size_t{first} * pass[i].y_stride;
+        const auto n =
+            std::min<std::uint32_t>(gufo::hip::kExl3FastMaxRows, rows - first);
+        gufo::hip::LaunchExl3FastProjections(
+            std::span(pass.data(), count),
+            x + std::size_t{first} * (*weights.begin())->cols,
+            (*weights.begin())->cols, n, ws, stream_);
+      }
       return true;
     }
     output = outputs.begin();
@@ -1953,10 +2163,65 @@ bool Executor::Exl3Group(std::initializer_list<const DeviceTensor*> weights,
   }
 }
 
+bool Executor::MtpKvProjection(const DeviceLayer& l, const float* x,
+                               std::uint32_t rows,
+                               std::string* error_msg) const {
+  if (l.attn_qkv.empty())
+    return Exl3Group({&l.attn_k, &l.attn_v}, {s_.k, s_.v}, x, rows, error_msg);
+  auto kv = l.attn_qkv;
+  const TensorRef layout{.type = kv.type, .cols = kv.cols};
+  kv.data = static_cast<std::uint8_t*>(kv.data) +
+            std::size_t{2} * config().AttentionQDim() * layout.RowBytes();
+  kv.rows = 2 * config().AttentionKvDim();
+  return DenseBatch(kv, x, s_.qg, rows, error_msg);
+}
+
+bool Executor::StoreMtpKv(const DeviceLayer& l, const Session& session,
+                          std::uint32_t rows, const YarnRope& yarn,
+                          std::string* error_msg) const {
+  const auto& c = config();
+  if (l.attn_qkv.empty()) {
+    PrepareAttentionKv(
+        s_.k, s_.v, l.attn_k_norm.f32(), session.mtp_.k_cache,
+        session.mtp_.v_cache, rows, c.num_kv_heads, c.head_dim, c.rotary_dim,
+        &session.control_->mtp_position, c.rope_theta, c.rms_eps, stream_,
+        session.vision_input_.rope(), yarn, session.mtp_.kv_blocks);
+    return true;
+  }
+  if (PrepareAttention(
+          s_.qg, 2 * c.AttentionKvDim(), nullptr, l.attn_k_norm.f32(), nullptr,
+          nullptr, session.mtp_.k_cache, session.mtp_.v_cache, rows, 0,
+          c.num_kv_heads, c.head_dim, c.rotary_dim,
+          &session.control_->mtp_position, c.rope_theta, c.rms_eps, stream_,
+          session.vision_input_.rope(), false, yarn, session.mtp_.kv_blocks))
+    return true;
+  AssignError(error_msg, "MTP cache projection failed");
+  return false;
+}
+
 bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
                      std::uint32_t n_tokens, std::string* error_msg) const {
-  if (w.exl3 != nullptr) {
+  if (prefill_phase && w.exl3 != nullptr)
+    return Exl3DensePrefill({&w}, {out}, x, n_tokens, error_msg);
+  if (diagnostics_active_ && prefill_phase && model_->output().exl3 != nullptr)
+    cycle_diagnostics_.prefill_plain_rows += n_tokens;
+  // The EXL3 pack retains plain HC/router/GDN operands. Their FP32 input
+  // precision and reduction must not change with phase or cohort width.
+  if (w.exl3 != nullptr || model_->output().exl3 != nullptr) {
     try {
+      // Both kernels keep FP32 inputs, exact weight widening, the same four
+      // FMAs per lane per 128-element step, and the xor 16..1 reduction.
+      // Use LDS reuse beyond the small GEMM's eight-row register tile;
+      // crossing this threshold must preserve every output bit.
+      if (prefill_phase && w.exl3 == nullptr && n_tokens > 8 &&
+          (w.type == GgmlType::kF16 || w.type == GgmlType::kBF16 ||
+           w.type == GgmlType::kF32)) {
+        gufo::hip::LaunchPlainPrefillStable(w.type, w.data, x, out, n_tokens,
+                                            w.rows, w.cols, stream_);
+        if (diagnostics_active_)
+          cycle_diagnostics_.prefill_plain_tiled_rows += n_tokens;
+        return true;
+      }
       const auto piece = std::max<std::uint32_t>(1, options_.max_batch);
       for (std::uint32_t first = 0; first < n_tokens; first += piece) {
         const auto count = std::min(piece, n_tokens - first);
@@ -2332,6 +2597,11 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       c.hidden_size == 2560 && c.hc_low_rank == 320 &&
       m.up.type == GgmlType::kQ8_0 && m.up.rows == c.HcDim() &&
       m.up.cols == c.hc_low_rank;
+  const bool fused_down =
+      model_->output().exl3 != nullptr && !xn_half_ && !MatrixRows(n_tokens) &&
+      m.down.type == GgmlType::kF16 && m.up.type == GgmlType::kF16 &&
+      m.down.rows == 320 && m.down.cols == 10240 && c.hc_count == 4 &&
+      c.hc_low_rank == 320;
   if (fused_projection) {
     // The up projection writes x_half; keep its input in the gate buffer.
     if (!HcDownF16Gemm(m.down.data, s_.xn_q8t,
@@ -2347,6 +2617,8 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
         AssignError(error_msg, "W8A8 mixer down projection failed");
         return false;
       }
+    } else if (fused_down) {
+      HcDownSiluF16(m.down.data, s_.xn, s_.lo, n_tokens, stream_);
     } else if (!Dense(m.down, s_.xn, s_.lo, n_tokens, error_msg)) {
       return false;
     }
@@ -2362,8 +2634,9 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
         return false;
       }
     } else {
-      SiluScale(s_.lo, scale,
-                static_cast<std::size_t>(n_tokens) * c.hc_low_rank, stream_);
+      if (!fused_down)
+        SiluScale(s_.lo, scale,
+                  static_cast<std::size_t>(n_tokens) * c.hc_low_rank, stream_);
       if (!Dense(m.up, s_.lo, s_.hc_gate, n_tokens, error_msg)) {
         return false;
       }
@@ -3196,21 +3469,10 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   }
   const auto shared_expert = [&] {
     shexp_half_ready_ = false;
-    if (l.shexp_gate.exl3 != nullptr && !prefill_phase && n_tokens <= 64) {
-      const auto& p = exl3_.projection;
-      const gufo::hip::Exl3FastWorkspace ws{
-          p.fast_input,      p.fast_input_elements,
-          p.fast_counters,   p.fast_counter_count,
-          p.fast_down_input, p.fast_down_input_elements};
-      const gufo::hip::Exl3FastMlp mlp{
-          l.shexp_gate.exl3, l.shexp_up.exl3, l.shexp_down.exl3, s_.shexp_gate,
-          s_.shexp_up,       s_.shexp_out,    c.hidden_size};
-      if (gufo::hip::Exl3FastMlpSupported(mlp, ws)) {
-        gufo::hip::LaunchExl3FastMlp(mlp, x, c.hidden_size, n_tokens, ws,
-                                     stream_);
-        return true;
-      }
-    }
+    if (l.shexp_gate.exl3 != nullptr && !prefill_phase &&
+        Exl3SharedMlp(l, x, s_.shexp_gate, s_.shexp_up, s_.shexp_out, n_tokens,
+                      exl3_, stream_))
+      return true;
     if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
                     &l.shexp_down, error_msg)) {
       return false;
@@ -3401,48 +3663,54 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
   return true;
 }
 
+Exl3PrefillScratch Executor::Exl3PrefillView() const {
+  auto view = exl3_prefill_;
+  // Attention intermediates are dead. Resolve these pointers after any
+  // RowScratch narrowing, rather than retaining the arena's base addresses.
+  view.gate = s_.gate_e;
+  view.up = s_.up_e;
+  return view;
+}
+
 bool Executor::Exl3Experts(const DeviceLayer& l, const float* x, float* out,
                            std::uint32_t rows, std::string* error) const {
   const auto& c = config();
   try {
-    if (!prefill_phase && rows <= 64) {
-      Exl3RoutedMlp(l, x, s_.ids, s_.gate_e, s_.up_e, s_.down_e, rows,
-                    c.num_experts_used, exl3_, stream_);
+    if (!prefill_phase) {
+      for (std::uint32_t first = 0; first < rows; first += 64) {
+        const auto count = std::min(64U, rows - first);
+        const auto assignment = std::size_t{first} * c.num_experts_used;
+        Exl3RoutedMlp(l, x + std::size_t{first} * c.hidden_size,
+                      s_.ids + assignment, s_.gate_e, s_.up_e,
+                      s_.down_e + assignment * c.hidden_size, count,
+                      c.num_experts_used, exl3_, stream_);
+        if (diagnostics_active_) {
+          if (exl3_.down_exponents != nullptr)
+            cycle_diagnostics_.scaled_down_rows +=
+                std::uint64_t{count} * c.num_experts_used;
+          if (!DiagnosticCount(exl3_.tile_count,
+                               &cycle_diagnostics_.expert_tile_reads, error))
+            return false;
+        }
+      }
     } else {
-      ExpertCounts(s_.ids, s_.expert_counts, rows, c.num_experts,
-                   c.num_experts_used, stream_);
-      RoutedCompact(s_.ids, s_.expert_counts, s_.routed_bounds,
-                    s_.routed_cursors, s_.rows_token, s_.rows_slot, rows,
-                    c.num_experts_used, c.num_experts, stream_);
-      if (!Check(hipMemcpyAsync(counts_host_, s_.expert_counts,
-                                c.num_experts * sizeof(std::uint32_t),
-                                hipMemcpyDeviceToHost, stream_),
-                 "EXL3 expert counts", error) ||
-          !Check(hipStreamSynchronize(stream_), "EXL3 expert buckets", error))
-        return false;
-      std::size_t base = 0;
-      for (std::uint32_t expert = 0; expert < c.num_experts; ++expert) {
-        const auto count = counts_host_[expert];
-        if (count == 0)
-          continue;
-        Exl3Gather(x, s_.rows_token + base, exl3_.gather, count, c.hidden_size,
-                   stream_);
-        const auto projection = [&](const DeviceTensor& bank,
-                                    const float* input, float* output) {
-          auto weight = bank;
-          weight.exl3 += expert;
-          weight.experts = 1;
-          Exl3Projection(weight, input, output, count, exl3_, stream_, false);
-        };
-        projection(l.ffn_gate_exps, exl3_.gather, exl3_.gate);
-        projection(l.ffn_up_exps, exl3_.gather, exl3_.up);
-        Swiglu(exl3_.gate, exl3_.up, std::size_t{count} * c.expert_ff, stream_);
-        projection(l.ffn_down_exps, exl3_.gate, exl3_.out);
-        Exl3Scatter(exl3_.out, s_.rows_slot + base, s_.down_e, count,
-                    c.hidden_size, stream_);
-        base += (count + 15) / 16 * 16;
+      // Keep this route for EVERY kPrefill row, including singleton tails.
+      // Selecting decode GEMV by token/bucket width changes the reduction
+      // tree when a Sync/checkpoint boundary moves. X3 is a phase contract,
+      // not a minimum-row heuristic; its 64-row tile never changes here.
+      const auto scratch = Exl3PrefillView();
+      Exl3PrefillExperts(l, x, s_.ids, s_.down_e, rows, c.num_experts_used,
+                         kExl3PrefillTileRows, scratch, stream_);
+      if (diagnostics_active_) {
+        cycle_diagnostics_.prefill_expert_rows += rows;
+        cycle_diagnostics_.expert_tile_reads_complete = false;
+        if (!DiagnosticCount(exl3_prefill_.bucket_count,
+                             &cycle_diagnostics_.prefill_expert_buckets, error))
+          return false;
       }
     }
+    if (!JoinSide(error))
+      return false;
     MoeEpilogue(s_.down_e, s_.weights, s_.shexp_out, s_.router + c.num_experts,
                 c.num_experts + 1, out, rows, c.num_experts_used, c.hidden_size,
                 stream_);
@@ -3470,12 +3738,120 @@ bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
          Check(hipStreamSynchronize(stream_), "trunk hidden", error_msg);
 }
 
+std::size_t Executor::EstimateExl3PrefillScratchBytes(const Config& config,
+                                                      std::uint32_t rows,
+                                                      std::string* error_msg) {
+  Exl3PrefillLayout layout;
+  return PlanExl3Prefill(config, rows, &layout, error_msg) ? layout.bytes : 0;
+}
+
+std::uint32_t Executor::PrefillChunkRows(
+    std::uint32_t requested, std::uint32_t until_checkpoint) const noexcept {
+  auto limit = options_.max_batch;
+  if (model_->output().exl3 != nullptr && options_.exl3_prefill_chunk_rows != 0)
+    limit = std::min(limit, options_.exl3_prefill_chunk_rows);
+  return std::min({requested, until_checkpoint, limit});
+}
+
+bool Executor::BeginMtpCycleDiagnostics(std::string* error_msg) const {
+  if (diagnostics_active_ || model_->output().exl3 == nullptr) {
+    AssignError(error_msg, "MTP cycle diagnostics require idle EXL3 executor");
+    return false;
+  }
+  if (!Check(hipStreamSynchronize(stream_), "diagnostic cycle start",
+             error_msg))
+    return false;
+  cycle_diagnostics_ = {};
+  diagnostic_depth_ = 0;
+  diagnostic_phase_ = nullptr;
+  diagnostic_started_ = std::chrono::steady_clock::now();
+  diagnostics_active_ = true;
+  return true;
+}
+
+bool Executor::EndMtpCycleDiagnostics(std::uint64_t committed_tokens,
+                                      std::uint64_t drafts,
+                                      MtpCycleDiagnostics* output,
+                                      std::string* error_msg) const {
+  if (!diagnostics_active_ || diagnostic_depth_ != 0 || output == nullptr) {
+    AssignError(error_msg, "invalid MTP diagnostic cycle end");
+    return false;
+  }
+  // Always release the diagnostic scope, including a failed GPU cycle.
+  diagnostics_active_ = false;
+  if (!Check(hipStreamSynchronize(stream_), "diagnostic cycle end", error_msg))
+    return false;
+  cycle_diagnostics_.committed_tokens = committed_tokens;
+  cycle_diagnostics_.drafts = drafts;
+  cycle_diagnostics_.wall_ms =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - diagnostic_started_)
+          .count();
+  *output = cycle_diagnostics_;
+  return true;
+}
+
+Executor::DiagnosticPhase::DiagnosticPhase(const Executor& e, DiagnosticStage s)
+    : executor(e), stage(s), active(e.diagnostics_active_) {
+  if (active) {
+    ++executor.diagnostic_depth_;
+    parent = executor.diagnostic_phase_;
+    executor.diagnostic_phase_ = this;
+    started = std::chrono::steady_clock::now();
+  }
+}
+
+Executor::DiagnosticPhase::~DiagnosticPhase() {
+  if (!active)
+    return;
+  --executor.diagnostic_depth_;
+  executor.diagnostic_phase_ = parent;
+  const auto elapsed = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - started)
+                           .count();
+  if (parent != nullptr)
+    parent->children_ms += elapsed;
+  const auto ms = elapsed - children_ms;
+  auto& d = executor.cycle_diagnostics_;
+  switch (stage) {
+    case DiagnosticStage::kTarget:
+      d.target_ms += ms;
+      break;
+    case DiagnosticStage::kDraft:
+      d.draft_ms += ms;
+      break;
+    case DiagnosticStage::kHead:
+      d.head_ms += ms;
+      break;
+    case DiagnosticStage::kCatchUp:
+      d.catch_up_ms += ms;
+      break;
+  }
+}
+
+bool Executor::DiagnosticCount(const std::uint32_t* device,
+                               std::uint64_t* total,
+                               std::string* error_msg) const {
+  std::uint32_t count = 0;
+  if (!Check(hipMemcpyAsync(&count, device, sizeof(count),
+                            hipMemcpyDeviceToHost, stream_),
+             "diagnostic count", error_msg) ||
+      !Check(hipStreamSynchronize(stream_), "diagnostic count ready",
+             error_msg))
+    return false;
+  *total += count;
+  return true;
+}
+
 bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
                        bool candidates, const Session* draft,
                        std::string* error_msg) const {
   const std::uint32_t prefix = model_->draft_output().rows;
   const std::uint32_t rows =
       draft != nullptr ? prefix + kMtpDraftExtraRows : model_->output().rows;
+  if (diagnostics_active_ && draft == nullptr &&
+      model_->output().exl3 != nullptr)
+    cycle_diagnostics_.head_segments += (rows + 127) / 128;
   if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg) ||
       !(draft != nullptr
             ? DraftLogits(*draft, s_.mixed, s_.logits, error_msg)
@@ -3518,6 +3894,9 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
 bool Executor::Run(Session& session, std::uint64_t key, bool graph,
                    const std::function<bool()>& body, std::string* error_msg,
                    bool synchronize) const {
+  // Host counters must observe each executed operation. Captured/replayed
+  // bodies would either duplicate or omit them, as with MtpTrace copies.
+  graph = graph && !diagnostics_active_;
   // A batch shape runs eagerly once before it is captured: the first pass
   // grows the GEMM tier's arena, which capture forbids.
   if (graph && session.warmed_.contains(key)) {
@@ -3591,6 +3970,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
                        std::uint32_t n_logits, float* logits, ForwardMode mode,
                        std::string* error_msg, PrefillCheckpoint* checkpoint,
                        std::span<const std::int32_t> next) const {
+  DiagnosticPhase diagnostic(*this, DiagnosticStage::kTarget);
   // Only this call's PLE layer may start the prefetch of `next`.
   struct NextHint {
     std::span<const std::int32_t>& hint;
@@ -3708,7 +4088,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   // Decode-sized batches replay as graphs; a pooling backlog (the first
   // batch past the budget) needs the wider eager grid.
   const std::uint32_t graph_pool_grid = n / std::max(c.compress_ratio, 1u) + 1;
-  const bool graph = !prefill_phase && n <= kVecBatch &&
+  const bool graph = !diagnostics_active_ && !prefill_phase && n <= kVecBatch &&
                      pool_grid <= graph_pool_grid &&
                      session.position_ >= session.VisionLayout().PrefixLength();
   const std::uint64_t key = static_cast<std::uint64_t>(n) |
@@ -3750,6 +4130,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   }
 
   session.position_ += n;
+  if (diagnostics_active_ && speculative)
+    cycle_diagnostics_.verify_rows += n;
   if (sparse) {
     session.blocks_ = complete;
   }
@@ -4771,6 +5153,32 @@ bool Executor::RestoreSnapshot(Session& session,
   return true;
 }
 
+bool Executor::ReplayOutputHead(std::uint32_t batch_rows,
+                                std::span<float> logits,
+                                std::string* error_msg) const {
+  const auto& c = config();
+  const auto rows = logits.size() / c.vocab_size;
+  if (batch_rows == 0 || batch_rows > options_.max_batch || rows == 0 ||
+      rows > batch_rows || rows > options_.max_logit_rows ||
+      logits.size() % c.vocab_size != 0) {
+    AssignError(error_msg, "invalid output head replay rows");
+    return false;
+  }
+  DropReadyQ8();
+  q8t_src_ = nullptr;
+  half_src_ = nullptr;
+  PrefillPhase head_phase(false);
+  return HcMix(model_->hc_head(), s_.res + (batch_rows - rows) * c.HcDim(),
+               false, s_.mixed, nullptr, static_cast<std::uint32_t>(rows),
+               error_msg) &&
+         Dense(model_->output(), s_.mixed, s_.logits,
+               static_cast<std::uint32_t>(rows), error_msg) &&
+         Check(hipMemcpyAsync(logits.data(), s_.logits, logits.size_bytes(),
+                              hipMemcpyDeviceToHost, stream_),
+               "output head replay download", error_msg) &&
+         Check(hipStreamSynchronize(stream_), "output head replay", error_msg);
+}
+
 bool Executor::ReadVerificationRows(std::uint32_t row, std::span<float> logits,
                                     std::string* error_msg) const {
   const auto vocab = config().vocab_size;
@@ -4925,6 +5333,8 @@ bool Executor::MtpForward(Session& session,
                           std::int32_t hidden_row, MtpOutput output,
                           std::string* error_msg,
                           const float* hidden_source) const {
+  DiagnosticPhase diagnostic(*this, hidden_row >= 0 ? DiagnosticStage::kCatchUp
+                                                    : DiagnosticStage::kDraft);
   DropReadyQ8();
   const auto n = static_cast<std::uint32_t>(tokens.size());
   if (session.owner_ != this ||
@@ -4984,8 +5394,9 @@ bool Executor::MtpForward(Session& session,
   const auto complete = (pos + n) / c.compress_ratio;
   const auto pool = sparse ? complete - session.mtp_.blocks : 0;
   const auto graph_pool = n / c.compress_ratio + 1;
-  const bool graph = output.trace == nullptr && hidden_source == nullptr &&
-                     n <= kVecBatch && pool <= graph_pool &&
+  const bool graph = !diagnostics_active_ && output.trace == nullptr &&
+                     hidden_source == nullptr && n <= kVecBatch &&
+                     pool <= graph_pool &&
                      pos + 1 >= session.VisionLayout().PrefixLength();
   // Captured graphs bake in the head; key on the one this draft reads.
   const bool subset = UseDraftSubset(session, output.draft_subset) &&
@@ -5014,6 +5425,8 @@ bool Executor::MtpForward(Session& session,
     *output.candidates = *mtp_candidates_host_;
   }
   session.mtp_.position = pos + n;
+  if (diagnostics_active_ && hidden_row >= 0)
+    cycle_diagnostics_.catch_up_rows += n;
   session.mtp_.residual_valid = !output.kv_only;
   if (sparse)
     session.mtp_.blocks = complete;
@@ -5106,27 +5519,20 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
       control_host_->hidden_row >= 0 && n > 2 && n <= kVecBatch
           ? n - 2
           : (last_only && n >= 224 ? (n - 96) / 128 * 128 : 0U);
-  const bool cache_only = kv_only && !l.attn_qkv.empty();
+  const bool cache_only =
+      kv_only && (!l.attn_qkv.empty() ||
+                  (l.attn_k.exl3 != nullptr && l.attn_v.exl3 != nullptr));
   if (!HcMixBatch(l.hc_attn, s_.mtp_res, false, s_.mixed,
                   cache_only ? nullptr : s_.inject, n, error_msg)) {
     return false;
   }
   if (cache_only) {
+    if (diagnostics_active_)
+      cycle_diagnostics_.cache_only_rows += n;
     // Known trunk rows replace the predictor residual on the next forward.
-    // Only K/V and pooled indexer keys survive this catch-up. Slice the
-    // packed Q/gate/K/V weight without copying or changing its arithmetic.
-    auto kv = l.attn_qkv;
-    const TensorRef layout{.type = kv.type, .cols = kv.cols};
-    kv.data = static_cast<std::uint8_t*>(kv.data) +
-              std::size_t{2} * c.AttentionQDim() * layout.RowBytes();
-    kv.rows = 2 * c.AttentionKvDim();
-    if (!DenseBatch(kv, s_.mixed, s_.qg, n, error_msg) ||
-        !PrepareAttention(
-            s_.qg, kv.rows, nullptr, l.attn_k_norm.f32(), nullptr, nullptr,
-            attn.k_cache, attn.v_cache, n, 0, c.num_kv_heads, c.head_dim,
-            c.rotary_dim, &session.control_->mtp_position, c.rope_theta,
-            c.rms_eps, stream_, attn.rope, false, yarn_, attn.kv_blocks)) {
-      AssignError(error_msg, "MTP cache projection failed");
+    // Only K/V and pooled indexer keys survive this catch-up.
+    if (!MtpKvProjection(l, s_.mixed, n, error_msg) ||
+        !StoreMtpKv(l, session, n, yarn_, error_msg)) {
       return false;
     }
     const auto capacity =

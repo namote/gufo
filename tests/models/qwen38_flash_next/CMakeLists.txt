@@ -38,13 +38,55 @@ target_link_libraries(qwen38_flash_next_reference_probe PRIVATE
 set_source_files_properties(reference_probe.cpp PROPERTIES COMPILE_OPTIONS "-O2")
 
 if (ENGINE_ENABLE_HIP)
+  add_executable(qwen38_flash_next_rq_logits EXCLUDE_FROM_ALL fn_rq_logits.cpp)
+  target_link_libraries(qwen38_flash_next_rq_logits PRIVATE
+    gufo_qwen38_flash_next hip::host)
+
   add_qwen38_flash_next_test(exl3_ops gufo_qwen38_flash_next_reference "hip;gpu;gfx1151;exl3")
   set_source_files_properties(exl3_ops_test.cpp PROPERTIES LANGUAGE HIP)
+  add_qwen38_flash_next_test(exl3_moe_kernel gufo_qwen38_flash_next "hip;gpu;gfx1151;exl3")
+  set_source_files_properties(exl3_moe_kernel_test.cpp PROPERTIES LANGUAGE HIP)
+  # Match production device arithmetic while keeping CPU oracles strict.
+  set_source_files_properties(exl3_moe_kernel_test.cpp PROPERTIES
+    COMPILE_OPTIONS "-O3;-Xarch_device;-ffast-math;-fno-finite-math-only")
+  add_test(NAME qwen38_flash_next.exl3_shared_invariance
+    COMMAND qwen38_flash_next_exl3_ops_test --shared-invariance-only)
+  set_tests_properties(qwen38_flash_next.exl3_shared_invariance PROPERTIES
+    LABELS "qwen38_flash_next;hip;gpu;gfx1151;exl3")
+  add_qwen38_flash_next_test(exl3_invariance gufo_qwen38_flash_next "hip;gpu;gfx1151;exl3")
+  set_source_files_properties(exl3_invariance_test.cpp PROPERTIES LANGUAGE HIP)
   foreach(name IN ITEMS mtp_ops blaslt_ops hc_mix_ops gdn_ops
       attention_ops moe_epilogue_ops moe_ids_ops projection_ops routed_wmma_ops
       select_ops snapshot_copy verification_sampling kvarn_ops)
     add_qwen38_flash_next_test(${name} gufo_qwen38_flash_next "hip;gpu;gfx1151")
   endforeach()
+  add_test(NAME qwen38_flash_next.mtp_kv
+    COMMAND qwen38_flash_next_attention_ops_test --mtp-kv)
+  add_test(NAME qwen38_flash_next.mtp_kv_group
+    COMMAND qwen38_flash_next_exl3_ops_test --mtp-kv-group)
+  add_test(NAME qwen38_flash_next.mtp_kv_executor
+    COMMAND qwen38_flash_next_exl3_ops_test --mtp-kv-executor)
+  add_test(NAME qwen38_flash_next.exl3_prefill_executor
+    COMMAND qwen38_flash_next_exl3_ops_test --prefill-experts-only)
+  add_test(NAME qwen38_flash_next.exl3_dense_prefill
+    COMMAND qwen38_flash_next_exl3_ops_test --dense-prefill-only)
+  add_test(NAME qwen38_flash_next.exl3_plain_prefill
+    COMMAND qwen38_flash_next_exl3_ops_test --plain-prefill-only)
+  add_test(NAME qwen38_flash_next.exl3_gdn_prefill
+    COMMAND qwen38_flash_next_exl3_ops_test --gdn-prefill-only)
+  add_test(NAME qwen38_flash_next.exl3_prefill_scratch
+    COMMAND qwen38_flash_next_exl3_ops_test --prefill-scratch-only)
+  set_tests_properties(qwen38_flash_next.exl3_prefill_scratch PROPERTIES
+    LABELS "qwen38_flash_next;cpu;exl3")
+  add_test(NAME qwen38_flash_next.hc_down_f16
+    COMMAND qwen38_flash_next_projection_ops_test --hc-down-f16)
+  set_tests_properties(qwen38_flash_next.mtp_kv qwen38_flash_next.mtp_kv_group
+    qwen38_flash_next.mtp_kv_executor qwen38_flash_next.hc_down_f16
+    qwen38_flash_next.exl3_prefill_executor
+    qwen38_flash_next.exl3_dense_prefill
+    qwen38_flash_next.exl3_plain_prefill
+    qwen38_flash_next.exl3_gdn_prefill
+    PROPERTIES LABELS "qwen38_flash_next;hip;gpu;gfx1151;exl3")
   # The rope phase and RMS checks compare against the scalar CPU oracle.
   target_link_libraries(qwen38_flash_next_attention_ops_test PRIVATE
     gufo_qwen38_flash_next_reference)

@@ -264,3 +264,59 @@ git add -- \
   tests/models/qwen38_flash_next/reference_probe.cpp \
   plan/exl3/F2-IMPLEMENTATION.md
 ```
+
+## Session invariance follow-up (GPU qualification pending)
+
+The integration logs report `CheckBatchedSessions` at C6/cycle 0 and
+`CheckPrefillChunks` at length 136/boundary 94/step 0. Both use
+`RequireExact` (`session_test.cpp:29`), a byte comparison, with no tolerance.
+The logs contain no intermediate tensors; they cannot establish which
+operator first differed. The following numerical dispatch defects are
+verified from source and addressed together:
+
+- `MoeBatch` used the generic shared expert above eight total rows, with
+  separate Flash-Next `Swiglu` (`__expf`). Serial `Moe` used the shared Qwen
+  fused EXL3 MLP (`expf`, followed by its specified FP16 down-input slab).
+  The built shared kernel confirms the exp/division correction sequence.
+  EXL3 cohorts now enter `Moe`, using the common `Exl3SharedMlp` helper.
+- The pack retains F16 HC down/up/router and F32 GDN operands. `Dense`
+  switched them from `SmallGemm` to BLAS during prefill, including activation
+  narrowing for F16/BF16, while `DenseBatch` used the small kernel. BLAS
+  solution/reduction selection depends on shape. EXL3 plain operands now use
+  pinned widened FP32 FMAs and the same wave reduction at every phase and
+  width. Existing GGUF calls keep the original kernel specialization.
+- Non-prefill compressed projections/groups/shared MLPs and routed experts
+  previously switched to the different reference arithmetic above 64 rows.
+  MTP catch-up can exceed that width even though each decode cohort is
+  bounded. Such calls now use bounded fast passes with unchanged arithmetic.
+  Trunk prefill keeps its reference route. The two reported trunk prefill
+  calls both requested reference arithmetic; the 64-row cutoff alone does
+  not explain their differing target logits.
+
+27B is not evidence that arbitrary EXL3 prefill/fast histories are exact:
+`exl3_dispatch.hpp` also switches at 64 rows. Its kernel test compares eight
+fast rows against scalar calls exactly (`exl3_kernel_test.hip:236`), whereas
+`target_test.cpp:95` limits scheduled chunk equality to Q8 weights. There is
+no `Exl3Pass` symbol or `F3-PLAN.md` in this worktree revision.
+
+Build `qwen38_flash_next_exl3_invariance_test` and
+`qwen38_flash_next_exl3_ops_test`. Focused CTests:
+`qwen38_flash_next.exl3_invariance` (plain HC/router/GDN, C6 and 136-row
+chunk boundaries, plus independent FP64 checks) and
+`qwen38_flash_next.exl3_shared_invariance` (shared MLP scalar/cohort bits,
+former unfused numerical control, and compressed 136-row splits in each
+phase, including the former 64-row fast cutoff).
+Then rerun the full `qwen38_flash_next.exl3_ops`, existing
+`qwen38_flash_next.projection_ops` for the unchanged GGUF specialization,
+and the same model session `--batch-only` / `--prefill-only` checks.
+No GPU/compiler runs or timing claims were made locally; Nix is absent.
+Actual first-divergence attribution and the full-session fix remain subject
+to that rerun. All equality checks and numerical limits remain unchanged.
+
+F3's grouped compressed prefill GEMM and decode union can still replace the
+respective compressed implementations. Keep the fused shared activation and
+its down-input boundary across serial/cohort calls, and preserve the plain
+operand FP32 contract. This does not force trunk prefill through GEMV; plain
+HC prefill now uses a fixed reduction instead of BLAS, whose performance
+impact has not been measured. F3 needs the new equality tests when changing
+those arithmetic boundaries.

@@ -309,3 +309,57 @@ struct DeviceLinear {                 // one EXL3 projection y = x W, W [k][n]
 - 시간 초과가 나면 창 드라이버가 남은 시험을 돌리지 않는다.
 - 끝난 창 7개는 head replay 검사를 모두 통과했다(오류 없음). 수집기 수정(`f007ede2`)이 맞다.
 - 사용자 지시(단계별 창 없음)에 따라 다시 돌리지 않는다. 품질 측정은 `PLAN-FINAL-27B`에서 한다. prefill 한계는 3600 s, 창은 12600 s로 고쳤다.
+
+## 최종 27B 품질 창 (PLAN-FINAL-27B, c97d555d, 2026-10-31)
+
+- **이미지:** `final-c97d555d-tests-rocm101`(id a42ab0c0)과 release `final-c97d555d-rocm101`(id e797855d). 둘 다 라벨 c97d555d다.
+  - `git archive c97d555d`(ai-tools/integ)에서 운영 nix derivation으로 빌드했다(ROCm 10.1, `build/final-c97d555d/`).
+  - 테스트 실행 파일은 206개다. deepseek_v4_flash HIP 테스트 3개는 운영 툴체인에서 링크가 실패해 넣지 않았다.
+- 창 4개(`final-27b-a01/`)가 모두 COMPLETE, health_PASS였다. 재시도는 없었다.
+  - final-units 32/32 PASS: EXL3, KVarN(K1T 5개 포함), Qwen·FN attention, FN CPU, kv_cache_type.
+  - 품질 창 셋은 모든 시험이 PASS였다: UD fingerprints(rq2h와 byte-equal), GGUF 동일성 4095/4095, 팩마다 sidecar 전체 경로 검사, collector head replay.
+- **품질**(a01 코퍼스, top-k 256, bootstrap 2000, seed 20261029; `final-27b-a01/analysis/`):
+
+| 팩 | 경로 | 기준 | KL 평균 | ΔNLL | top-1 |
+|---|---|---|---|---|---|
+| 4.00 | prefill | ExLlamaV3 같은 팩 | 1.90e-4 | +2.17e-3 | 99.42 % |
+| 4.00 | decode | ExLlamaV3 같은 팩 | 0.80e-4 | +0.89e-3 | 99.49 % |
+| 4.00 | prefill | gufo BF16 | 1.90e-2 | +1.38e-2 | 93.50 % |
+| 5.00 | prefill | ExLlamaV3 같은 팩 | 4.23e-4 | +1.71e-3 | 99.37 % |
+| 5.00 | decode | ExLlamaV3 같은 팩 | 0.66e-4 | +0.21e-3 | 99.49 % |
+| 5.00 | prefill | gufo BF16 | 7.69e-3 | +0.10e-3 | 96.11 % |
+| c02 | prefill | ExLlamaV3 c02(xq-q01) | 2.92e-4 | +0.93e-3 | 99.42 % |
+| c02 | decode | ExLlamaV3 c02 | 1.26e-4 | +0.54e-3 | 99.32 % |
+| c02 | prefill | gufo BF16 | 6.54e-3 | −2.80e-3 | 96.25 % |
+
+- **엔진 차이**(gufo 직접 로드 vs ExLlamaV3, 같은 팩):
+  - KL 평균은 0.7–4.2e-4, ΔNLL은 +0.2–2.2e-3이다. X1(BF16 GGUF 경로)과 같은 크기다.
+  - BF16 대비 품질 순서는 W8/XQ와 같다: c02 ≈ 5.00 > 4.00.
+- **임베딩 짝 비교**(Q8_0 − BF16, 같은 위치, ExLlamaV3 기준):
+  - 4.00: ΔKL +0.9e-5, ΔNLL +1.9e-4, top-1 −0.02 %p.
+  - 5.00: ΔKL +1.7e-4(token CI [−0.0e-4, +4.5e-4]), ΔNLL +1.8e-4(CI가 0을 포함), top-1 −0.04 %p(CI [−0.064, −0.012] %p로 구분됨).
+  - gufo BF16 기준이면 4.00, 5.00 모두 KL ±1e-4 이하, ΔNLL ≤ 1.9e-4이고 CI가 0을 포함한다.
+  - 판정: Q8_0 임베딩의 영향은 ΔNLL로 엔진 차이의 1/10 이하다. 5.00의 KL 평균에서는 엔진 차이(2.6e-4)와 같은 크기의 꼬리 기여(+1.7e-4)가 보이고, top-1이 0.04 %p 떨어진다. 감독이 판단한다.
+- **상주 메모리**(`model_resident_bytes`): 4.00 13.55 GiB(BF16 임베딩 14.66), 5.00과 c02 16.38 GiB(BF16 임베딩 17.49). Q8_0 임베딩은 BF16보다 1.11 GiB 작다.
+
+### 결정: 토큰 임베딩은 BF16 (감독, 2026-10-31)
+
+- **이유:**
+  - 품질 유지가 목표다.
+  - 5.00에서 Q8_0의 top-1 −0.04 %p가 구분됐다.
+  - 임베딩 조회는 토큰마다 한 행이라 속도 영향이 없다.
+  - 1.11 GiB는 128 GB 장비에서 문제가 아니다.
+- **적용:**
+  - c02 팩에 `gufo-bf16emb.gguf`(sha256 `cb044d6c…`, 4.00/5.00과 같은 파일)를 기본으로 두었다.
+  - `PLAN-FINAL-27B`의 타이밍 창(XB6)은 EXL3 4.00과 c02를 모두 이 sidecar로 불러온다(4곳).
+  - 로더의 키 없는 기본값(Q8_0)은 바꾸지 않았다. 바꾸려면 코드 변경과 이미지 재빌드가 필요하다.
+
+### 최종 이미지 재빌드 b6e3ff82 (2026-10-31, gufo-06 요청)
+
+- **소스:** integ `b6e3ff82` = c97d555d + 3712dbe7(BF16 임베딩 기본값) + efc396ba(FN tensorless shard digest, `gguf_reader`에 `data_offset` 기록).
+  - 같은 방법으로 빌드했다(`build/final-b6e3ff82/`). 테스트 실행 파일은 207개다.
+- **이미지:**
+  - release `ai-tools/gufo-eval:final-b6e3ff82-rocm101` id `08fcc2b23cea`
+  - tests `final-b6e3ff82-tests-rocm101` id `4db07a5bff24`
+  - 둘 다 라벨 `b6e3ff827801febf5fd5ca83c3ba5042f9a02452`이다. c97d555d 이미지는 남겼다.
+- **sanity 창**(`PLAN-FINAL-B6E3-SANITY.json`, `final-b6e3-sanity/`): final-units 32/32 PASS. UD fingerprints는 rq2h와 byte-equal이고, BF16 prefill 창 0은 rq0-a01과 4095/4095 같다. 둘 다 COMPLETE, health_PASS다.

@@ -6,8 +6,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 #include "src/core/sampling.hpp"
+#include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
+#include "src/models/qwen/hip/ops/prefill_fp16.hpp"
 #include "src/models/qwen/vision/rope.hpp"
 #include "src/models/qwen38_flash_next/rope_scaling.hpp"
 
@@ -16,6 +19,24 @@
 /// launch is asynchronous on `stream`. Weights referenced here are device
 /// pointers in their GGUF encoding.
 namespace gufo::models::qwen38_flash_next::rocm {
+
+/// Host launch values, copied into kernel arguments before returning. The
+/// device descriptor tables may be reused on the same stream after GEMM;
+/// no mapped host descriptor is overwritten while the GPU still reads it.
+struct Exl3DensePrefillProblem {
+  const std::uint16_t* trellis;
+  const std::uint16_t* suh;
+  const std::uint16_t* svh;
+  const float* x;
+  std::size_t x_stride;
+  std::uint16_t* rotated;
+  float* y;
+  std::uint32_t rows;
+};
+void PrepareExl3DensePrefill(std::span<const Exl3DensePrefillProblem> problems,
+                             gufo::hip::Exl3RotateProblem* rotations,
+                             gufo::hip::Exl3GemmProblem* gemms,
+                             hipStream_t stream);
 
 /// Tokens per pooled indexer key row. K/V rows (one per token) and pooled rows
 /// share a session's block table (src/core/hip/kv_block_table.hpp): logical
@@ -380,11 +401,21 @@ bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
                         const std::int32_t* rows_out, __half* out,
                         std::size_t m, std::size_t k, hipStream_t stream);
 
+/// Exact F16 320 x 10240 HC down projection followed by SiLU(x / 4).
+/// Uses SmallGemmStable's explicit FMA chain and F32 boundary at every width.
+void HcDownSiluF16(const void* w, const float* x, float* out,
+                   std::uint32_t n_tokens, hipStream_t stream);
+
 /// F32/BF16/F16 projection in groups of up to eight token rows. Each token
 /// keeps the same accumulation order at every batch width.
 void SmallGemm(const void* w, WeightType type, const float* x, float* out,
                std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
                hipStream_t stream);
+
+/// EXL3 plain operands: pinned widened FP32 FMAs, also during prefill.
+void SmallGemmStable(const void* w, WeightType type, const float* x, float* out,
+                     std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
+                     hipStream_t stream);
 
 /// PLE gate: for every stream s, sc = dot(key_n[t][s], query_n[t][s]) /
 /// sqrt(hidden); gated[t][s][i] = value[t][i] * sigmoid(sgn(sc) *
@@ -508,6 +539,19 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
                       const qwen::vision::DeviceRope* rope = nullptr,
                       bool prefill = false, const YarnRope& yarn = {},
                       const std::uint32_t* kv_blocks = nullptr);
+
+/// Separate K/V catch-up, with exactly the unfused attention path's F32
+/// normalization and RoPE boundaries. K is normalized/rotated in place;
+/// V is read-only. No query, gate or attention output is computed.
+void PrepareAttentionKv(float* k, const float* v, const float* k_gamma,
+                        __half* k_cache, __half* v_cache,
+                        std::uint32_t n_tokens, std::uint32_t kv_heads,
+                        std::uint32_t d, std::uint32_t rotary_dim,
+                        const std::uint32_t* start_pos, float theta, float eps,
+                        hipStream_t stream,
+                        const qwen::vision::DeviceRope* rope = nullptr,
+                        const YarnRope& yarn = {},
+                        const std::uint32_t* kv_blocks = nullptr);
 
 /// NEOX partial rotary on x [t][heads][d] at positions start_pos + t.
 /// Positions are read from device memory (`start_pos` points at the

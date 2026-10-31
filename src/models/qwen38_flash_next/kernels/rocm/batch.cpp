@@ -143,10 +143,18 @@ bool Executor::HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
   if (!normed)
     RmsNormRows(res, m.norm.f32(), s_.xn, rows, c.HcDim(), c.hc_count,
                 c.rms_eps, stream_);
-  if (!DenseBatch(m.down, s_.xn, s_.lo, rows, error))
-    return false;
-  SiluScale(s_.lo, 1.0F / static_cast<float>(c.hc_count),
-            std::size_t{rows} * c.hc_low_rank, stream_);
+  const bool fused_down = model_->output().exl3 != nullptr &&
+                          m.down.type == core::GgmlType::kF16 &&
+                          m.down.rows == 320 && m.down.cols == 10240 &&
+                          c.hc_count == 4 && c.hc_low_rank == 320;
+  if (fused_down) {
+    HcDownSiluF16(m.down.data, s_.xn, s_.lo, rows, stream_);
+  } else {
+    if (!DenseBatch(m.down, s_.xn, s_.lo, rows, error))
+      return false;
+    SiluScale(s_.lo, 1.0F / static_cast<float>(c.hc_count),
+              std::size_t{rows} * c.hc_low_rank, stream_);
+  }
   if (!DenseBatch(m.up, s_.lo, s_.hc_gate, rows, error))
     return false;
   const bool fused_inject = inject != nullptr && !m.inject.empty() &&
@@ -175,6 +183,13 @@ void Executor::CombineBatch(float* res, const float* gamma,
 
 bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
                                std::string* error) const {
+  DiagnosticPhase diagnostic(
+      *this,
+      diagnostics_active_ &&
+              std::ranges::all_of(
+                  items, [](const auto& item) { return item.hidden_row >= 0; })
+          ? DiagnosticStage::kCatchUp
+          : DiagnosticStage::kDraft);
   const Config& c = config();
   DropReadyQ8();
   if (!has_mtp() || items.empty() || items.size() > kBatchSessions) {
@@ -250,7 +265,8 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
   const Scratch base = s_;
   const auto& l = model_->mtp();
   const bool cache_only =
-      !l.attn_qkv.empty() &&
+      (!l.attn_qkv.empty() ||
+       (l.attn_k.exl3 != nullptr && l.attn_v.exl3 != nullptr)) &&
       std::ranges::all_of(items, [](const auto& item) { return item.kv_only; });
   const auto body = [&]() {
     if (!AnyActive(items))
@@ -296,43 +312,40 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
       // A copy or ordinary target step needs only predictor KV. Batch the
       // same invariant projections, then stop before queries, attention,
       // the output projection and FFN whose residual would be discarded.
-      auto kv = l.attn_qkv;
-      const TensorRef layout{.type = kv.type, .cols = kv.cols};
-      kv.data = static_cast<std::uint8_t*>(kv.data) +
-                std::size_t{2} * c.AttentionQDim() * layout.RowBytes();
-      kv.rows = 2 * c.AttentionKvDim();
-      if (!DenseBatch(kv, base.mixed, base.qg, rows, error) ||
+      if (!MtpKvProjection(l, base.mixed, rows, error) ||
           !DenseBatch(l.indexer_k, base.mixed, base.ik, rows, error))
         return false;
       for (std::size_t i = 0; i < items.size(); ++i) {
         auto& session = *items[i].session;
         if (!session.CheckCancellation(nullptr))
           continue;
+        if (diagnostics_active_)
+          cycle_diagnostics_.cache_only_rows += items[i].tokens.size();
         ++session.mutation_epoch_;
         session.mtp_.residual_valid = false;
         const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
         const auto capacity = session.index_capacity_;
-        if (!PrepareAttention(
-                base.qg + std::size_t{offsets[i]} * kv.rows, kv.rows, nullptr,
-                l.attn_k_norm.f32(), nullptr, nullptr, session.mtp_.k_cache,
-                session.mtp_.v_cache, n, 0, c.num_kv_heads, c.head_dim,
-                c.rotary_dim, &session.control_->mtp_position, c.rope_theta,
-                c.rms_eps, stream_, session.vision_input_.rope(), false, {},
-                session.mtp_.kv_blocks))
-          return Fail(error, "batched MTP cache projection failed");
+        auto view = RowScratch(base, offsets[i]);
+        // Packed K/V has a narrower row stride than the full Q/gate/K/V
+        // scratch; separate EXL3 K/V already use RowScratch's strides.
+        view.qg = base.qg + std::size_t{offsets[i]} * 2 * c.AttentionKvDim();
+        UseScratch(view);
+        if (!StoreMtpKv(l, session, n, l.attn_qkv.empty() ? yarn_ : YarnRope{},
+                        error))
+          return false;
         StoreRows(base.ik + std::size_t{offsets[i]} * c.indexer_head_dim,
                   session.mtp_.index_k, n, c.indexer_head_dim,
                   &session.control_->mtp_position, capacity, stream_);
         if (session.mtp_.position + n > c.indexer_top_k) {
           const auto pool = (session.mtp_.position + n) / c.compress_ratio -
                             session.mtp_.blocks;
-          PoolIndexerBlocks(session.mtp_.index_k, l.indexer_k_norm.f32(),
-                            session.mtp_.block_k, &session.control_->mtp_blocks,
-                            &session.control_->mtp_position, n, pool,
-                            c.compress_ratio, c.indexer_head_dim, c.rotary_dim,
-                            c.rope_theta, c.rms_eps, capacity, stream_,
-                            session.vision_input_.rope(), {},
-                            session.mtp_.kv_blocks);
+          PoolIndexerBlocks(
+              session.mtp_.index_k, l.indexer_k_norm.f32(),
+              session.mtp_.block_k, &session.control_->mtp_blocks,
+              &session.control_->mtp_position, n, pool, c.compress_ratio,
+              c.indexer_head_dim, c.rotary_dim, c.rope_theta, c.rms_eps,
+              capacity, stream_, session.vision_input_.rope(),
+              l.attn_qkv.empty() ? yarn_ : YarnRope{}, session.mtp_.kv_blocks);
         }
       }
       return true;
@@ -450,6 +463,8 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
     if (item.session->Cancelled())
       continue;
     item.session->mtp_.position += item.tokens.size();
+    if (diagnostics_active_ && item.hidden_row >= 0)
+      cycle_diagnostics_.catch_up_rows += item.tokens.size();
     item.session->mtp_.residual_valid = !item.kv_only;
     if (item.session->mtp_.position > c.indexer_top_k)
       item.session->mtp_.blocks =
@@ -460,6 +475,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
 
 bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
                         std::string* error) const {
+  DiagnosticPhase diagnostic(*this, DiagnosticStage::kHead);
   selected_logits_ = nullptr;
   if (!has_mtp() || items.empty() || items.size() > kBatchSessions ||
       items.size() > options_.max_batch) {
@@ -553,6 +569,9 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
                                  : batch_logits_ + subset_rows * kSmall +
                                        (slot[i] - subset_rows) * vocab;
   };
+  if (diagnostics_active_ && full_head.exl3 != nullptr &&
+      (mixed || subset_rows == 0))
+    cycle_diagnostics_.head_segments += (vocab + 127) / 128;
   const Scratch base = s_;
   const auto body = [&]() {
     if (!AnyActive(items))
@@ -691,7 +710,8 @@ bool Executor::QuantizeBatch(const float* x, std::uint32_t rows,
 
 bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
                           std::uint32_t rows, std::string* error) const {
-  if (w.exl3 != nullptr || rows <= kDecodeRows)
+  if (w.exl3 != nullptr || model_->output().exl3 != nullptr ||
+      rows <= kDecodeRows)
     return Dense(w, x, out, rows, error);
   if (w.type != core::GgmlType::kQ8_0) {
     SmallGemm(w.data, EmbeddingType(w.type), x, out, rows, w.rows, w.cols,
@@ -764,7 +784,9 @@ bool Executor::GatedDenseBatch(const DeviceTensor& up, const DeviceTensor& gate,
 
 bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
                         std::uint32_t rows, std::string* error) const {
-  if (rows <= kDecodeRows)
+  // EXL3 retains the serial fused shared MLP (expf and its FP16 down
+  // boundary). The generic batch path uses a separate __expf SwiGLU.
+  if (l.ffn_gate_exps.exl3 != nullptr || rows <= kDecodeRows)
     return Moe(l, x, out, rows, error);
   const auto& c = config();
   const Scratch base = s_;
@@ -776,8 +798,6 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
                        error) ||
       !DenseBatch(l.shexp_down, base.shexp_up, base.shexp_out, rows, error))
     return false;
-  if (l.ffn_gate_exps.exl3 != nullptr)
-    return Exl3Experts(l, x, out, rows, error);
   if (l.ffn_gate_exps.type == core::GgmlType::kQ4_K &&
       l.ffn_up_exps.type == core::GgmlType::kQ4_K) {
     // Share expert weights across request boundaries while retaining the
@@ -811,6 +831,7 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
 
 bool Executor::ForwardBatch(std::span<const BatchItem> items,
                             std::string* error) const {
+  DiagnosticPhase diagnostic(*this, DiagnosticStage::kTarget);
   selected_logits_ = nullptr;
   DropReadyQ8();
   const Config& c = config();
@@ -1141,6 +1162,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     return false;
   }
   for (std::size_t i = 0; i < items.size(); ++i) {
+    if (diagnostics_active_ && items[i].speculative)
+      cycle_diagnostics_.verify_rows += items[i].tokens.size();
     if (items[i].session->Cancelled())
       continue;
     items[i].session->position_ += items[i].tokens.size();

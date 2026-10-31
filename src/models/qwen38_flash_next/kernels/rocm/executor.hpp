@@ -5,6 +5,7 @@
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -160,6 +161,7 @@ public:
 
 private:
   friend class Executor;
+  friend struct ExecutorTestAccess;
   friend struct PrefillCheckpoint;
   friend class gufo::models::qwen38_flash_next::ContinuationAdapter;
   Session() = default;
@@ -291,6 +293,10 @@ public:
     /// Trunk attention K/V as KVarN k4v4 records with token-major values
     /// (plan/exl3/F1-KVARN-DESIGN.md); the MTP layer stays FP16.
     bool kvarn{false};
+    /// Diagnostic chunk-policy hook for EXL3. Zero preserves the caller's
+    /// existing policy; a nonzero limit is bounded by max_batch. The caller
+    /// still supplies checkpoint/cancellation boundaries to PrefillChunkRows.
+    std::uint32_t exl3_prefill_chunk_rows{0};
   };
 
   ~Executor();
@@ -345,6 +351,14 @@ public:
                              ForwardMode mode, std::string* error_msg,
                              PrefillCheckpoint* checkpoint = nullptr,
                              std::span<const std::int32_t> next = {}) const;
+
+  /// Quality-probe replay of the last Forward's output head, with the same
+  /// batch width and requested tail. Call immediately after an AR Forward,
+  /// before any other executor operation reuses scratch. Does not advance
+  /// session state. `logits` must have n_logits * vocab elements.
+  [[nodiscard]] bool ReplayOutputHead(std::uint32_t batch_rows,
+                                      std::span<float> logits,
+                                      std::string* error_msg) const;
 
   struct BatchItem {
     Session* session;
@@ -494,8 +508,76 @@ public:
   /// Whether trunk K/V are KVarN k4v4 (Options::kvarn).
   [[nodiscard]] bool kvarn() const noexcept { return options_.kvarn; }
 
+  [[nodiscard]] std::uint32_t PrefillChunkRows(
+      std::uint32_t requested, std::uint32_t until_checkpoint) const noexcept;
+  /// Host-only estimate of the disjoint persistent bucket slabs. Zero means
+  /// invalid geometry (error_msg explains); excludes existing stage gate/up,
+  /// s_.down_e and the decode path's 64 * used exponents. Uses a 64-row tile.
+  [[nodiscard]] static std::size_t EstimateExl3PrefillScratchBytes(
+      const Config& config, std::uint32_t rows,
+      std::string* error_msg = nullptr);
+  [[nodiscard]] std::size_t exl3_prefill_scratch_bytes() const noexcept {
+    return exl3_prefill_scratch_bytes_;
+  }
+
+  /// Opt-in operator/profiling diagnostics, following MtpTrace's eager path.
+  /// No production caller enables this implicitly. Counts cover the whole
+  /// executor/cohort; the engine supplies actual committed/proposed tokens
+  /// after acceptance, stops and cancellation, including copied proposals.
+  struct MtpCycleDiagnostics {
+    std::uint64_t committed_tokens{0}, drafts{0}, verify_rows{0};
+    /// One routed MLP tile (all three projections), summed over layers.
+    std::uint64_t expert_tile_reads{0};
+    /// False if a reference/bucket-prefill route ran without eight-row tiles.
+    bool expert_tile_reads_complete{true};
+    /// 128-column draft-head segments actually projected, including prefix.
+    std::uint64_t head_segments{0}, catch_up_rows{0};
+    /// Rows that entered the cache-only branch, rather than a full body.
+    std::uint64_t cache_only_rows{0};
+    /// Routed prefill rows and actual 64-row expert buckets, across layers.
+    std::uint64_t prefill_expert_rows{0}, prefill_expert_buckets{0};
+    /// Decode/verify assignments sent through the allocated scaled-down path
+    /// (which can still select widened fallback for an unsafe row).
+    std::uint64_t scaled_down_rows{0};
+    /// Dense compressed prefill input rows (summed over projections), and
+    /// actual grouped rotation/GEMM calls. Plain rows retain FP32 arithmetic.
+    std::uint64_t prefill_dense_rows{0}, prefill_dense_rotation_groups{0},
+        prefill_dense_gemm_groups{0}, prefill_plain_rows{0};
+    /// Plain prefill rows using LDS weight reuse instead of SmallGemmStable.
+    std::uint64_t prefill_plain_tiled_rows{0};
+    /// Exclusive call wall times. draft_ms/catch_up_ms include inline heads;
+    /// head_ms covers standalone MtpHeads. Diagnostic count downloads and
+    /// synchronization are included; use an uninstrumented run for speed.
+    double target_ms{0}, draft_ms{0}, head_ms{0}, catch_up_ms{0}, wall_ms{0};
+  };
+  [[nodiscard]] bool BeginMtpCycleDiagnostics(std::string* error_msg) const;
+  [[nodiscard]] bool EndMtpCycleDiagnostics(std::uint64_t committed_tokens,
+                                            std::uint64_t drafts,
+                                            MtpCycleDiagnostics* output,
+                                            std::string* error_msg) const;
+
 private:
   Executor() = default;
+  friend struct ExecutorTestAccess;
+
+  enum class DiagnosticStage { kTarget, kDraft, kHead, kCatchUp };
+  struct DiagnosticPhase {
+    const Executor& executor;
+    DiagnosticStage stage;
+    std::chrono::steady_clock::time_point started{};
+    DiagnosticPhase* parent{nullptr};
+    double children_ms{0};
+    bool active{false};
+    DiagnosticPhase(const Executor& e, DiagnosticStage s);
+    ~DiagnosticPhase();
+  };
+  mutable bool diagnostics_active_{false};
+  mutable std::uint32_t diagnostic_depth_{0};
+  mutable DiagnosticPhase* diagnostic_phase_{nullptr};
+  mutable std::chrono::steady_clock::time_point diagnostic_started_{};
+  mutable MtpCycleDiagnostics cycle_diagnostics_{};
+  bool DiagnosticCount(const std::uint32_t* device, std::uint64_t* total,
+                       std::string* error_msg) const;
 
   /// Visits every device region of a snapshot in payload order with
   /// (device pointer or null when sizing, payload offset, bytes, name).
@@ -524,6 +606,13 @@ private:
              std::string* error_msg) const;
   bool Dense(const DeviceTensor& w, const float* x, float* out,
              std::uint32_t n_tokens, std::string* error_msg) const;
+  /// Cache-only MTP uses the packed GGUF slice or the separate EXL3 K/V
+  /// group. Separate outputs retain the full attention path's arithmetic.
+  bool MtpKvProjection(const DeviceLayer& layer, const float* x,
+                       std::uint32_t rows, std::string* error_msg) const;
+  bool StoreMtpKv(const DeviceLayer& layer, const Session& session,
+                  std::uint32_t rows, const YarnRope& yarn,
+                  std::string* error_msg) const;
   /// out = (up . x) * silu(gate . x); s_.shexp_gate is scratch.
   /// With `down` (the projection that consumes the result), a wide batch
   /// leaves only that projection's staged input form (F16 rows in
@@ -765,6 +854,14 @@ private:
   };
   mutable Scratch s_{};
   Exl3Scratch exl3_{};
+  gufo::hip::Exl3RotateProblem* exl3_dense_rotations_{nullptr};
+  gufo::hip::Exl3GemmProblem* exl3_dense_gemms_{nullptr};
+  bool Exl3DensePrefill(std::initializer_list<const DeviceTensor*> weights,
+                        std::initializer_list<float*> outputs, const float* x,
+                        std::uint32_t rows, std::string* error) const;
+  Exl3PrefillScratch exl3_prefill_{};
+  std::size_t exl3_prefill_scratch_bytes_{0};
+  [[nodiscard]] Exl3PrefillScratch Exl3PrefillView() const;
   bool Exl3Group(std::initializer_list<const DeviceTensor*> weights,
                  std::initializer_list<float*> outputs, const float* x,
                  std::uint32_t rows, std::string* error) const;

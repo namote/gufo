@@ -7,11 +7,20 @@ Checks (all must pass; headers only, no tensor data is read):
   config      config.json quantization_config equals the values recorded in plan/exl3/F2-PLAN.md section 2.
   storage     every tensor listed in quantization_config.json tensor_storage exists in the safetensors
               files (shards plus ngram_embedding.safetensors) with the recorded shape, dtype and byte size,
-              and every stored tensor is listed (MTP, vision and the patch file are reported, not required).
+              and every stored tensor is listed, except the parameters of non-leaf modules that upstream
+              does not list (quant_config.py lists leaf modules only: GDN A_log, dt_bias, conv1d and the
+              PLE conv1d) and the MTP, vision and patch-file tensors, which are checked by `side` instead.
+  side        trellis K (= last dim / 16): MTP experts and indexer 5 (1,537 tensors), MTP attention and
+              shared expert 7 (-hq, 7), MTP fc_embedding/fc_hidden 6 (2); vision 6 (164).
   bits        EXL3 bits per category match F2-PLAN.md: experts 5, GDN/attention/shared expert 7,
               indexer 5, lm_head 6; router, in_proj_a/b, hyper-connections, PLE projections not EXL3;
               73,728 expert tensors; n-gram trellis int16 [320001536, 61].
   index       model.safetensors.index.json maps every shard tensor to the file that holds it.
+
+--survey (for packs without recorded expectations, e.g. other bitrates or other quantizers): config, bits
+and side only report what the pack holds (bits per category, MTP/vision K, n-gram trellis shape) and do
+not fail; storage and index stay strict. --extra FILE adds the headers of a safetensors file kept outside
+the pack (e.g. an n-gram table shared with another pack) to the storage check.
 Standard library only.
 """
 from __future__ import annotations
@@ -43,9 +52,9 @@ BITS = [  # (pattern on the module key, expected bits or None = not EXL3)
 ]
 
 
-def headers(directory: Path) -> dict:
+def headers(directory: Path, extra: list[Path] = ()) -> dict:
     out = {}
-    for f in sorted(directory.glob("*.safetensors")):
+    for f in sorted(directory.glob("*.safetensors")) + list(extra):
         with f.open("rb") as fh:
             n = struct.unpack("<Q", fh.read(8))[0]
             h = json.loads(fh.read(n))
@@ -59,14 +68,16 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("pack", type=Path)
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--survey", action="store_true")
+    ap.add_argument("--extra", type=Path, action="append", default=[])
     a = ap.parse_args()
     rep: dict = {"pack": str(a.pack), "checks": {}}
 
     qc = json.loads((a.pack / "config.json").read_text()).get("quantization_config", {})
-    rep["checks"]["config"] = {"PASS": qc == EXPECT_QC, "quantization_config": qc,
+    rep["checks"]["config"] = {"PASS": a.survey or qc == EXPECT_QC, "quantization_config": qc,
                                "differs": {k: qc.get(k) for k in set(EXPECT_QC) | set(qc) if qc.get(k) != EXPECT_QC.get(k)}}
 
-    hdr = headers(a.pack)
+    hdr = headers(a.pack, a.extra)
     q = json.loads((a.pack / "quantization_config.json").read_text())
     storage = q["tensor_storage"]
     listed, bad, missing = set(), [], []
@@ -79,10 +90,19 @@ def main() -> int:
             elif (h["shape"], h["dtype"], h["bytes"]) != (t["shape"], DTYPE.get(t["dtype"], t["dtype"]), t["n_bytes"]):
                 bad.append({"tensor": name, "header": [h["shape"], h["dtype"], h["bytes"]], "listed": [t["shape"], t["dtype"], t["n_bytes"]]})
     unlisted = sorted(k for k in hdr if k not in listed)
-    unlisted_main = [k for k in unlisted if not (k.startswith("mtp.") or k.startswith("model.visual.") or hdr[k]["file"].startswith("mtp_"))]
+    side = [k for k in unlisted if k.startswith("mtp.") or k.startswith("model.visual.") or hdr[k]["file"].startswith("mtp_")]
+    nonleaf = re.compile(r"\.(linear_attn\.(A_log|dt_bias|conv1d\.weight)|ple\.conv1d\.weight)$")
+    unlisted_nonleaf = [k for k in unlisted if k not in side and nonleaf.search(k)]
+    unlisted_main = [k for k in unlisted if k not in side and k not in unlisted_nonleaf]
     rep["checks"]["storage"] = {"PASS": not (bad or missing or unlisted_main), "listed": len(listed), "header_tensors": len(hdr),
                                 "mismatch": bad[:20], "missing": missing[:20], "unlisted_main": unlisted_main[:20],
-                                "unlisted_mtp_vision_patch": len(unlisted) - len(unlisted_main)}
+                                "unlisted_nonleaf": len(unlisted_nonleaf), "unlisted_mtp_vision_patch": len(side)}
+    ks = collections.defaultdict(collections.Counter)
+    for k in side:
+        if k.endswith(".trellis"):
+            ks["mtp" if k.startswith("mtp.") else "vision"][hdr[k]["shape"][-1] // 16] += 1
+    rep["checks"]["side"] = {"PASS": a.survey or (dict(ks["mtp"]) == {5: 1537, 7: 7, 6: 2} and dict(ks["vision"]) == {6: 164}),
+                             "trellis_K": {g: {str(k): n for k, n in c.items()} for g, c in ks.items()}}
 
     cats = collections.defaultdict(collections.Counter)
     wrong = []
@@ -99,7 +119,15 @@ def main() -> int:
                 break
     ng = {k: v for k, v in hdr.items() if k.endswith("ngram_embedding.trellis")}
     ng_ok = len(ng) == 1 and next(iter(ng.values()))["shape"] == [320001536, 61] and next(iter(ng.values()))["dtype"] == "I16"
-    rep["checks"]["bits"] = {"PASS": not wrong and experts == 73728 and ng_ok, "expert_tensors": experts,
+    if a.survey:
+        cats = collections.defaultdict(collections.Counter)
+        for mod, v in storage.items():
+            bits = v.get("bits_per_weight") if v.get("quant_format") == "exl3" else None
+            for pat, _ in BITS:
+                if re.search(pat, mod):
+                    cats[pat][bits] += 1
+                    break
+    rep["checks"]["bits"] = {"PASS": a.survey or (not wrong and experts == 73728 and ng_ok), "expert_tensors": experts,
                              "categories": {p: {str(k): n for k, n in c.items()} for p, c in cats.items()},
                              "wrong": wrong[:20], "ngram_trellis": ng}
 
@@ -111,7 +139,7 @@ def main() -> int:
     a.out.parent.mkdir(parents=True, exist_ok=True)
     a.out.write_text(json.dumps(rep, indent=1) + "\n")
     print(json.dumps({"PASS": rep["PASS"], **{k: {kk: vv for kk, vv in v.items() if kk in ("PASS", "differs", "listed", "header_tensors",
-          "mismatch", "missing", "unlisted_main", "unlisted_mtp_vision_patch", "expert_tensors", "categories", "wrong", "entries", "bad")}
+          "mismatch", "missing", "unlisted_main", "unlisted_nonleaf", "unlisted_mtp_vision_patch", "trellis_K", "expert_tensors", "categories", "wrong", "entries", "bad")}
           for k, v in rep["checks"].items()}}, indent=1))
     return 0 if rep["PASS"] else 1
 
