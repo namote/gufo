@@ -475,9 +475,9 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
     }
     const auto embedding =
         reader->GetMetadataString(models::qwen_exl3::kEmbeddingKey) ==
-                std::optional<std::string_view>("bf16")
-            ? models::qwen_exl3::EmbeddingFormat::kBf16
-            : models::qwen_exl3::EmbeddingFormat::kQ8_0;
+                std::optional<std::string_view>("q8_0")
+            ? models::qwen_exl3::EmbeddingFormat::kQ8_0
+            : models::qwen_exl3::EmbeddingFormat::kBf16;
     auto loaded = models::qwen_exl3::LoadFromSidecar(
         regions.front().source_path, *reader, embedding, error_msg);
     if (!loaded)
