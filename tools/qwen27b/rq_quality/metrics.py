@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Paired quality metrics of qwen27b_rq_logits runs against a reference run.
+"""Paired quality metrics of gufo.rq-logits.v1 runs against a reference run.
+
+Shared by Qwen27B and Flash-Next; the record schema has no vocabulary-size
+or model-architecture constant. KL is truncated, not full-vocabulary KL.
 
 Per scored position (window w, position p, predicting corpus token p + 1):
 
@@ -150,6 +153,30 @@ def kl_tail(paired: Paired, top: int = 10) -> dict:
                          "kl": float(kl[i]), "top1_flip": bool(flips[i])} for i in order[:top]]}
 
 
+def nll_tail(paired: Paired, top: int = 10) -> dict:
+    """Expose copy failures that can fall outside the reference top-k KL support.
+
+    Shares use positive excess NLL only, so negative deltas cannot cancel the
+    denominator. Signed sums remain available separately.
+    """
+    delta = paired.values["delta_nll"]
+    order = np.argsort(-delta, kind="stable")
+    positive = np.maximum(delta, 0)
+    total = float(positive.sum())
+    return {"median": float(np.median(delta)),
+            "positive_positions": int((delta > 0).sum()),
+            "delta_nll_sum": float(delta.sum()),
+            "positive_delta_nll_sum": total,
+            "top_positive_shares": {
+                str(n): float(positive[order[:n]].sum() / total) if total else 0.0
+                for n in (1, 10, 100, 300)},
+            "largest": [{"window": int(paired.window[i]), "position": int(paired.position[i]),
+                         "nll_ref": float(paired.nll_ref[i]),
+                         "nll_cand": float(paired.nll_cand[i]),
+                         "delta_nll": float(delta[i]), "kl": float(paired.kl[i])}
+                        for i in order[:top]]}
+
+
 def flip_sets(reference: logits_io.Run, candidates: dict[str, logits_io.Run]) -> dict:
     """Top-1 flip positions of several candidates on the same positions, and their overlaps.
 
@@ -201,6 +228,7 @@ def score(reference: logits_io.Run, candidate: logits_io.Run, resamples: int,
                      "min": float(paired.coverage.min())},
         **summarize(paired.values, paired.window, paired.position, resamples, block_tokens, seed),
         "kl_tail": kl_tail(paired),
+        "nll_tail": nll_tail(paired),
     }
     names = categories_of(candidate)
     by_category = {}
@@ -211,6 +239,7 @@ def score(reference: logits_io.Run, candidate: logits_io.Run, resamples: int,
         entry = summarize(values, paired.window[mask], paired.position[mask], resamples,
                           block_tokens, seed)
         entry["nll_ref"] = float(paired.nll_ref[mask].mean())
+        entry["nll_cand"] = float(paired.nll_cand[mask].mean())
         by_category[category] = entry
     report["categories"] = by_category
     return report

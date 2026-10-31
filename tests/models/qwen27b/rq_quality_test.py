@@ -236,6 +236,27 @@ class MetricTest(unittest.TestCase):
         top1 = (self.cand.argmax(1) == self.ref.argmax(1)).astype(float)
         np.testing.assert_array_equal(paired.top1, top1)
 
+    def test_nll_tail_exposes_failure_outside_top_k(self):
+        # Target id 2 is outside top-1. Moving its already tiny probability
+        # barely affects coarse KL, but loses twenty nats on that target.
+        ref = np.array([[10, 0, -10], [10, 0, -10]], dtype=np.float32)
+        cand = ref.copy()
+        cand[0, 2] -= 20
+        runs = Runs(self.dir, ref, np.array([0, 0]), np.array([0, 1]),
+                    np.array([2, 2]), 1)
+        paired = metrics.Paired(runs.ref, runs.candidate("tail", cand))
+        tail = metrics.nll_tail(paired)
+        self.assertLess(paired.kl[0], 1e-5)
+        self.assertAlmostEqual(tail["largest"][0]["delta_nll"], 20, places=5)
+        self.assertEqual(tail["top_positive_shares"]["1"], 1.0)
+        self.assertEqual(tail["largest"][0]["position"], 0)
+
+    def test_nll_tail_self_has_no_positive_mass(self):
+        runs = Runs(self.dir, self.ref, self.window, self.position, self.target, 8)
+        tail = metrics.nll_tail(metrics.Paired(runs.ref, runs.ref))
+        self.assertEqual(tail["positive_delta_nll_sum"], 0)
+        self.assertEqual(tail["top_positive_shares"]["300"], 0)
+
     def test_reference_against_itself_is_exact(self):
         runs = Runs(self.dir, self.ref, self.window, self.position, self.target, 8)
         report = metrics.score(runs.ref, runs.ref, 200, 16, 1)
