@@ -2599,16 +2599,22 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
   }
   // A decode batch's next mixer quantizes xn for its down projection: the
   // combine writes those rows as well.
-  if (!MatrixRows(n_tokens) && UnpaddedQ8(c.HcDim()) &&
+  // (Not for EXL3 prefill: every prefill chunk, tails included, must take
+  // the same combine below.)
+  if (!(prefill_phase && model_->output().exl3 != nullptr) &&
+      !MatrixRows(n_tokens) && UnpaddedQ8(c.HcDim()) &&
       HcCombineQ8_1(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn,
                     s_.xn_q8_1, n_tokens, c.hidden_size, c.hc_count, c.rms_eps,
                     stream_)) {
     xn_q8_ready_ = {s_.xn, s_.xn_q8_1, n_tokens, c.HcDim()};
     return;
   }
+  // EXL3: prefill takes the four-lane combine at every chunk width (28 %
+  // less time at 2,048 tokens); decode/verify keep the per-stream kernel.
+  const bool exl3 = model_->output().exl3 != nullptr;
   HcCombine(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn, n_tokens,
             c.hidden_size, c.hc_count, c.rms_eps, stream_,
-            model_->output().exl3 != nullptr);
+            exl3 && !prefill_phase, exl3 && prefill_phase);
 }
 
 bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,

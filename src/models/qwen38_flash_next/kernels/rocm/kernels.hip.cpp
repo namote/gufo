@@ -6261,11 +6261,11 @@ void HcCombine(float* res, const float* block_out, const float* inject,
                std::uint32_t inject_parts, const float* gamma, float* xn,
                std::uint32_t n_tokens, std::uint32_t hidden,
                std::uint32_t streams, float eps, hipStream_t stream,
-               bool decode) {
+               bool decode, bool any_width) {
   // One block per token wants a batch: a decode step keeps the
   // one-block-per-stream kernel's parallelism.
-  if (!decode && n_tokens >= 16 && streams == 4 && hidden % 128 == 0 &&
-      hidden <= 2560) {
+  if (!decode && (n_tokens >= 16 || any_width) && streams == 4 &&
+      hidden % 128 == 0 && hidden <= 2560) {
     hipLaunchKernelGGL(HcCombineVec4Kernel<float>, dim3(n_tokens),
                        dim3(kThreads), 0, stream, res, block_out, inject,
                        inject_parts, gamma, xn, nullptr, hidden, eps, nullptr);
