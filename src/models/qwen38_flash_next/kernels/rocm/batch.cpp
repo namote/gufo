@@ -319,6 +319,8 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
         auto& session = *items[i].session;
         if (!session.CheckCancellation(nullptr))
           continue;
+        if (diagnostics_active_)
+          cycle_diagnostics_.cache_only_rows += items[i].tokens.size();
         ++session.mutation_epoch_;
         session.mtp_.residual_valid = false;
         const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
@@ -337,13 +339,13 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
         if (session.mtp_.position + n > c.indexer_top_k) {
           const auto pool = (session.mtp_.position + n) / c.compress_ratio -
                             session.mtp_.blocks;
-          PoolIndexerBlocks(session.mtp_.index_k, l.indexer_k_norm.f32(),
-                            session.mtp_.block_k, &session.control_->mtp_blocks,
-                            &session.control_->mtp_position, n, pool,
-                            c.compress_ratio, c.indexer_head_dim, c.rotary_dim,
-                            c.rope_theta, c.rms_eps, capacity, stream_,
-                            session.vision_input_.rope(), {},
-                            session.mtp_.kv_blocks);
+          PoolIndexerBlocks(
+              session.mtp_.index_k, l.indexer_k_norm.f32(),
+              session.mtp_.block_k, &session.control_->mtp_blocks,
+              &session.control_->mtp_position, n, pool, c.compress_ratio,
+              c.indexer_head_dim, c.rotary_dim, c.rope_theta, c.rms_eps,
+              capacity, stream_, session.vision_input_.rope(),
+              l.attn_qkv.empty() ? yarn_ : YarnRope{}, session.mtp_.kv_blocks);
         }
       }
       return true;
@@ -708,7 +710,8 @@ bool Executor::QuantizeBatch(const float* x, std::uint32_t rows,
 
 bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
                           std::uint32_t rows, std::string* error) const {
-  if (w.exl3 != nullptr || rows <= kDecodeRows)
+  if (w.exl3 != nullptr || model_->output().exl3 != nullptr ||
+      rows <= kDecodeRows)
     return Dense(w, x, out, rows, error);
   if (w.type != core::GgmlType::kQ8_0) {
     SmallGemm(w.data, EmbeddingType(w.type), x, out, rows, w.rows, w.cols,
@@ -781,7 +784,9 @@ bool Executor::GatedDenseBatch(const DeviceTensor& up, const DeviceTensor& gate,
 
 bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
                         std::uint32_t rows, std::string* error) const {
-  if (rows <= kDecodeRows)
+  // EXL3 retains the serial fused shared MLP (expf and its FP16 down
+  // boundary). The generic batch path uses a separate __expf SwiGLU.
+  if (l.ffn_gate_exps.exl3 != nullptr || rows <= kDecodeRows)
     return Moe(l, x, out, rows, error);
   const auto& c = config();
   const Scratch base = s_;
@@ -793,8 +798,6 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
                        error) ||
       !DenseBatch(l.shexp_down, base.shexp_up, base.shexp_out, rows, error))
     return false;
-  if (l.ffn_gate_exps.exl3 != nullptr)
-    return Exl3Experts(l, x, out, rows, error);
   if (l.ffn_gate_exps.type == core::GgmlType::kQ4_K &&
       l.ffn_up_exps.type == core::GgmlType::kQ4_K) {
     // Share expert weights across request boundaries while retaining the

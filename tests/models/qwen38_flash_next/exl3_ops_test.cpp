@@ -8,16 +8,143 @@
 #include <initializer_list>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <vector>
 
 #include "src/core/hip/detail/exl3_gemv.hpp"
 #include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
 #include "src/models/qwen38_flash_next/exl3_weights.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+
+namespace gufo::models::qwen38_flash_next::rocm {
+
+// No alternate executor implementation: this access supplies a small resident
+// model, seeds the known trunk hidden rows and reads the surviving state of
+// real public MtpForward/MtpForwardBatch calls. Production owns no test
+// buffers.
+struct ExecutorTestAccess {
+  static void Hip(hipError_t status) {
+    if (status != hipSuccess)
+      throw std::runtime_error(hipGetErrorString(status));
+  }
+  static std::unique_ptr<DeviceModel> Model(const Config& config,
+                                            const DeviceLayer& layer,
+                                            DeviceTensor embedding,
+                                            DeviceTensor output,
+                                            DeviceMixer head) {
+    std::unique_ptr<DeviceModel> model(new DeviceModel);
+    model->config_ = config;
+    model->token_embd_ = embedding;
+    model->output_ = output;
+    model->hc_head_ = head;
+    model->layers_.push_back(layer);
+    model->mtp_ = layer;
+    model->has_mtp_ = true;
+    model->max_half_cols_ = config.AttentionQDim();
+    model->max_q8_cols_ = config.AttentionQDim();
+    return model;
+  }
+  static void Hidden(Session& session, std::span<const float> hidden) {
+    Hip(hipMemcpy(session.mtp_.target_hidden, hidden.data(),
+                  hidden.size_bytes(), hipMemcpyHostToDevice));
+  }
+  struct State {
+    std::vector<std::uint16_t> k, v, pooled;
+    std::vector<float> raw;
+    unsigned position, blocks;
+    bool residual_valid;
+  };
+  template<class T>
+  static std::vector<T> Read(const void* device, std::size_t count) {
+    std::vector<T> values(count);
+    if (count != 0)
+      Hip(hipMemcpy(values.data(), device, count * sizeof(T),
+                    hipMemcpyDeviceToHost));
+    return values;
+  }
+  static State ReadState(const Session& session, const Config& config) {
+    const auto& m = session.mtp_;
+    return {Read<std::uint16_t>(
+                m.k_cache, std::size_t{m.position} * config.AttentionKvDim()),
+            Read<std::uint16_t>(
+                m.v_cache, std::size_t{m.position} * config.AttentionKvDim()),
+            Read<std::uint16_t>(
+                m.block_k, std::size_t{m.blocks} * config.indexer_head_dim),
+            Read<float>(m.index_k, std::size_t{session.index_capacity_} *
+                                       config.indexer_head_dim),
+            m.position,
+            m.blocks,
+            m.residual_valid};
+  }
+  static std::size_t Graphs(const Session& session) {
+    // MtpForward's cache-only graph-key bit; ignore unrelated full-body graphs.
+    return std::ranges::count_if(session.graphs_, [](const auto& entry) {
+      return (entry.first & (std::uint64_t{1} << 45)) != 0;
+    });
+  }
+  static void PoisonSelection(const Executor& exec) {
+    Hip(hipMemsetAsync(exec.s_.mask, 0xFF,
+                       exec.mask_words_ * sizeof(std::uint32_t),
+                       exec.stream()));
+  }
+  static bool HasExpectedSparseSelection(const Executor& exec,
+                                         const Session& session) {
+    const auto& c = exec.config();
+    const auto complete = session.mtp_.position / c.compress_ratio;
+    const auto budget = c.indexer_top_k / c.compress_ratio;
+    if (budget == 0 || complete <= budget)
+      return false;  // Require actual ranking, beyond the select-all prefix.
+    const auto mask = Read<std::uint32_t>(exec.s_.mask, exec.mask_words_);
+    unsigned selected = 0;
+    for (std::size_t w = 0; w < mask.size(); ++w) {
+      selected += std::popcount(mask[w]);
+      for (unsigned bit = 0; bit < 32; ++bit)
+        if ((mask[w] & (1U << bit)) != 0 && w * 32 + bit >= complete)
+          return false;
+    }
+    return selected == budget;
+  }
+  static std::vector<float> FullLogits(const Executor& exec,
+                                       const Session& session) {
+    std::string error;
+    if (!exec.MtpHead(exec.model_->mtp().nextn_head, session.mtp_.h, false,
+                      false, nullptr, &error))
+      throw std::runtime_error(error);
+    Hip(hipStreamSynchronize(exec.stream()));
+    return Read<float>(exec.s_.logits, exec.config().vocab_size);
+  }
+  static bool YarnWitness(const Executor& exec, const Session& session) {
+    const auto& c = exec.config();
+    const auto& m = session.mtp_;
+    if (m.blocks == 0 || m.position > session.index_capacity_)
+      throw std::runtime_error("YaRN witness requires live raw prefix");
+    std::uint32_t* zero = nullptr;
+    __half* unscaled = nullptr;
+    Hip(hipMalloc(&zero, sizeof(*zero)));
+    Hip(hipMemset(zero, 0, sizeof(*zero)));
+    const auto count = std::size_t{m.blocks} * c.indexer_head_dim;
+    Hip(hipMalloc(&unscaled, count * sizeof(__half)));
+    PoolIndexerBlocks(m.index_k, exec.model_->mtp().indexer_k_norm.f32(),
+                      unscaled, zero, zero, m.position, m.blocks,
+                      c.compress_ratio, c.indexer_head_dim, c.rotary_dim,
+                      c.rope_theta, c.rms_eps, session.index_capacity_,
+                      exec.stream());
+    Hip(hipStreamSynchronize(exec.stream()));
+    const auto control = Read<std::uint16_t>(unscaled, count);
+    const auto actual = Read<std::uint16_t>(m.block_k, count);
+    Hip(hipFree(unscaled));
+    Hip(hipFree(zero));
+    return actual != control;
+  }
+};
+}  // namespace gufo::models::qwen38_flash_next::rocm
 
 namespace q = gufo::models::qwen38_flash_next;
 namespace gpu = q::rocm;
@@ -308,8 +435,7 @@ void Projection(unsigned k, unsigned n, int bits,
   auto* y = buffers.Make<float>(65 * n + 16);
   auto scratch = Scratch(buffers, 65, std::max(k, n), n);
   for (unsigned rows : sizes) {
-    BeginCase(Shape(rows <= 64 ? "projection fast" : "projection reference", k,
-                    n, bits, rows));
+    BeginCase(Shape("projection fast", k, n, bits, rows));
     Check(hipMemset(y, 0x7F, (65 * n + 16) * sizeof(float)));
     gpu::Exl3Projection(weight.weight, dx, y, rows, scratch, nullptr);
     std::vector<float> actual(rows * n), expected, legacy;
@@ -317,9 +443,9 @@ void Projection(unsigned k, unsigned n, int bits,
     Check(hipMemcpy(actual.data(), y, actual.size() * sizeof(float),
                     hipMemcpyDeviceToHost));
     for (unsigned r = 0; r < rows; ++r) {
-      const auto input = weight.RotatedInput(0, x.data() + r * k, rows <= 64);
+      const auto input = weight.RotatedInput(0, x.data() + r * k, true);
       const auto old_input =
-          weight.LegacyRotatedInput(0, x.data() + r * k, rows <= 64);
+          weight.LegacyRotatedInput(0, x.data() + r * k, true);
       for (unsigned i = 0; i < k; ++i)
         legacy_changes += input[i] != old_input[i];
       const auto reference = weight.ProjectRotated(0, input);
@@ -575,6 +701,89 @@ void Routed(bool shared, unsigned rows, unsigned k = 128, unsigned ff = 128,
   }
 }
 
+void CompressedPrefillChunks() {
+  constexpr unsigned k = 256, n = 640, rows = 136;
+  BeginCase(Shape("compressed prefill chunks", k, n, 7, rows));
+  Buffers buffers;
+  Bank weight(buffers, k, n, 7);
+  const auto x = Input(rows * k);
+  const auto* dx = buffers.Copy(x);
+  auto* y = buffers.Make<float>(rows * n);
+  auto scratch = Scratch(buffers, rows, std::max(k, n), n);
+  bool fast = false;
+  const auto project = [&](unsigned first, unsigned count) {
+    gpu::Exl3Projection(weight.weight, dx + first * k, y + first * n, count,
+                        scratch, nullptr, fast);
+  };
+  const auto download = [&] {
+    std::vector<float> result(rows * n);
+    Check(hipMemcpy(result.data(), y, result.size() * sizeof(float),
+                    hipMemcpyDeviceToHost));
+    return result;
+  };
+  for (bool mode : {false, true}) {
+    fast = mode;
+    project(0, rows);
+    const auto bulk = download();
+    for (unsigned boundary : {94U, 103U, 104U, 127U, 128U, 135U}) {
+      project(0, boundary);
+      project(boundary, rows - boundary);
+      const auto split = download();
+      Require(std::memcmp(bulk.data(), split.data(), bulk.size() * 4) == 0,
+              std::string(fast ? "fast catch-up" : "reference prefill") +
+                  " differs at boundary " + std::to_string(boundary));
+    }
+  }
+}
+
+void SharedMlpInvariance() {
+  constexpr unsigned k = 2560, ff = 640, rows = 65;
+  BeginCase(Shape("shared MLP scalar/cohort", k, ff, 7, rows));
+  Buffers buffers;
+  Bank gate(buffers, k, ff, 7, 1, 4), up(buffers, k, ff, 7, 1, 5),
+      down(buffers, ff, k, 7, 1, 6);
+  gpu::DeviceLayer layer;
+  layer.shexp_gate = gate.weight;
+  layer.shexp_up = up.weight;
+  layer.shexp_down = down.weight;
+  auto x = Input(rows * k);
+  for (auto& value : x)
+    value *= 32.0F;
+  const auto* dx = buffers.Copy(x);
+  auto* g = buffers.Make<float>(rows * ff);
+  auto* u = buffers.Make<float>(rows * ff);
+  auto* y = buffers.Make<float>(rows * k);
+  auto scratch = Scratch(buffers, rows, k, k);
+  const auto download = [&] {
+    std::vector<float> result(rows * k);
+    Check(hipMemcpy(result.data(), y, result.size() * sizeof(float),
+                    hipMemcpyDeviceToHost));
+    return result;
+  };
+  for (unsigned r = 0; r < rows; ++r)
+    Require(gpu::Exl3SharedMlp(layer, dx + r * k, g, u, y + r * k, 1, scratch,
+                               nullptr),
+            "serial shared MLP was not dispatched");
+  const auto serial = download();
+  // Reproduce the former MoeBatch path as a diagnostic: its native __expf
+  // activation differs from the serial fused MLP's expf/division contract.
+  gpu::Exl3Projection(gate.weight, dx, g, rows, scratch, nullptr);
+  gpu::Exl3Projection(up.weight, dx, u, rows, scratch, nullptr);
+  gpu::Swiglu(g, u, std::size_t{rows} * ff, nullptr);
+  gpu::Exl3Projection(down.weight, g, y, rows, scratch, nullptr);
+  std::cout << "CONTROL " << current_case << " : former_unfused_vs_serial_L2="
+            << RelativeL2(download(), serial) << '\n';
+  for (unsigned count : {2U, 4U, 6U, 8U, 9U, 18U, 29U, rows}) {
+    Require(gpu::Exl3SharedMlp(layer, dx, g, u, y, count, scratch, nullptr),
+            "cohort shared MLP was not dispatched");
+    const auto actual = download();
+    Require(
+        std::memcmp(actual.data(), serial.data(),
+                    std::size_t{count} * k * sizeof(float)) == 0,
+        "shared MLP scalar/cohort bits differ rows=" + std::to_string(count));
+  }
+}
+
 void SelectedHead() {
   BeginCase(Shape("selected head prefix=128 extras=8", 256, 640, 6, 1));
   Buffers buffers;
@@ -604,6 +813,257 @@ void SelectedHead() {
   unsigned count;
   Check(hipMemcpy(&count, s.head_segments, 4, hipMemcpyDeviceToHost));
   Require(count == 3, "selected head did not deduplicate Hadamard segments");
+}
+
+// Small deterministic resident EXL3 model: real 256-wide attention and
+// 128-wide indexer arithmetic, without a downloaded checkpoint or test skip.
+struct MtpExecutorFixture {
+  Buffers buffers;
+  std::vector<std::unique_ptr<Bank>> banks;
+  q::Config config;
+  std::unique_ptr<gpu::DeviceModel> model;
+  std::unique_ptr<gpu::Executor> exec;
+  unsigned seed{9001};
+
+  gpu::DeviceTensor Plain(unsigned rows, unsigned cols, bool f32 = false,
+                          bool norm = false) {
+    std::mt19937 rng(seed++);
+    std::vector<float> values(std::size_t{rows} * cols);
+    for (auto& value : values)
+      value = (norm ? 1.0F : 0.0F) + (static_cast<int>(rng() % 2000) - 1000) *
+                                         (norm ? 0.0001F : 0.00003F);
+    gpu::DeviceTensor t;
+    t.rows = rows;
+    t.cols = cols;
+    t.type = f32 ? gufo::core::GgmlType::kF32 : gufo::core::GgmlType::kF16;
+    if (f32) {
+      t.data = buffers.Copy(values);
+    } else {
+      std::vector<std::uint16_t> halves(values.size());
+      for (std::size_t i = 0; i < values.size(); ++i)
+        halves[i] = ex::HalfFromDouble(values[i]);
+      t.data = buffers.Copy(halves);
+    }
+    return t;
+  }
+  gpu::DeviceTensor Compressed(unsigned k, unsigned n, int bits = 7,
+                               unsigned experts = 1) {
+    banks.push_back(
+        std::make_unique<Bank>(buffers, k, n, bits, experts, seed++));
+    return banks.back()->weight;
+  }
+  gpu::DeviceMixer Mixer(bool inject = true) {
+    return {Plain(config.HcDim(), 1, true, true),
+            Plain(config.hc_low_rank, config.HcDim()),
+            Plain(config.HcDim(), config.hc_low_rank),
+            inject ? Plain(config.hc_count, config.HcDim(), true)
+                   : gpu::DeviceTensor{}};
+  }
+  MtpExecutorFixture() {
+    config.num_layers = 1;
+    config.num_layers_all = 2;
+    config.hidden_size = 128;
+    config.vocab_size = 256;
+    config.context_length = 64;
+    config.hc_count = 4;
+    config.hc_low_rank = 32;
+    config.full_attention_interval = 1;
+    config.num_heads = 4;
+    config.num_kv_heads = 1;
+    config.head_dim = 256;
+    config.rotary_dim = 64;
+    config.rope_theta = 10000;
+    config.rope_scaling = {.factor = 2.0F, .original_context = 64};
+    config.indexer_heads = 4;
+    config.indexer_head_dim = 128;
+    config.indexer_top_k = 8;
+    config.compress_ratio = 4;
+    config.ssm_conv_kernel = 4;
+    config.ssm_head_dim = 128;
+    config.ssm_num_k_heads = config.ssm_num_v_heads = 1;
+    config.ssm_inner_size = 128;
+    config.num_experts = 4;
+    config.num_experts_used = 2;
+    config.expert_ff = config.shared_expert_ff = 128;
+    config.nextn_layers = 1;
+    gpu::DeviceLayer l;
+    l.hc_attn = Mixer();
+    l.hc_ffn = Mixer();
+    l.nextn_head = Mixer(false);
+    l.nextn_enorm = Plain(config.hidden_size, 1, true, true);
+    l.nextn_hnorm = Plain(config.HcDim(), 1, true, true);
+    l.nextn_fc_embedding = Compressed(config.hidden_size, config.hidden_size);
+    l.nextn_fc_hidden = Compressed(config.hidden_size, config.hidden_size);
+    l.attn_q = Compressed(config.hidden_size, 2 * config.AttentionQDim());
+    l.attn_k = Compressed(config.hidden_size, config.AttentionKvDim());
+    l.attn_v = Compressed(config.hidden_size, config.AttentionKvDim());
+    l.attn_out = Compressed(config.AttentionQDim(), config.hidden_size);
+    l.attn_q_norm = Plain(config.head_dim, 1, true, true);
+    l.attn_k_norm = Plain(config.head_dim, 1, true, true);
+    l.indexer_k = Compressed(config.hidden_size, config.indexer_head_dim);
+    l.indexer_q = Compressed(config.hidden_size,
+                             config.indexer_heads * config.indexer_head_dim);
+    l.indexer_k_norm = Plain(config.indexer_head_dim, 1, true, true);
+    l.indexer_q_norm = Plain(config.indexer_head_dim, 1, true, true);
+    l.router = Plain(config.num_experts + 1, config.hidden_size);
+    l.shexp_gate = Compressed(config.hidden_size, config.shared_expert_ff, 6);
+    l.shexp_up = Compressed(config.hidden_size, config.shared_expert_ff, 6);
+    l.shexp_down = Compressed(config.shared_expert_ff, config.hidden_size, 6);
+    l.ffn_gate_exps =
+        Compressed(config.hidden_size, config.expert_ff, 5, config.num_experts);
+    l.ffn_up_exps =
+        Compressed(config.hidden_size, config.expert_ff, 5, config.num_experts);
+    l.ffn_down_exps =
+        Compressed(config.expert_ff, config.hidden_size, 5, config.num_experts);
+    const auto embedding = Plain(config.vocab_size, config.hidden_size);
+    const auto output = Compressed(config.hidden_size, config.vocab_size, 6);
+    model = gpu::ExecutorTestAccess::Model(config, l, embedding, output,
+                                           Mixer(false));
+    std::string error;
+    exec = gpu::Executor::Create(*model, nullptr,
+                                 {.max_batch = 16,
+                                  .max_logit_rows = 8,
+                                  .max_speculative = 8,
+                                  .max_context = 128},
+                                 &error);
+    Require(exec != nullptr, error);
+    Require(q::MakeYarnRope(config.rope_scaling, config.rotary_dim,
+                            config.rope_theta)
+                    .enabled != 0,
+            "executor fixture must exercise enabled YaRN");
+  }
+};
+
+template<class T>
+void SameBits(const std::vector<T>& a, const std::vector<T>& b,
+              const std::string& name) {
+  Require(a.size() == b.size() &&
+              (a.empty() ||
+               std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0),
+          name + " differs bitwise");
+}
+
+void MtpExecutorCatchUp(bool batched) {
+  BeginCase(batched ? "executor EXL3 ragged batch cache-only YaRN"
+                    : "executor EXL3 scalar cache-only YaRN");
+  MtpExecutorFixture f;
+  auto& exec = *f.exec;
+  using Access = gpu::ExecutorTestAccess;
+  const unsigned sessions = batched ? 3 : 1;
+  std::vector<std::unique_ptr<gpu::Session>> reference(sessions),
+      cached(sessions);
+  const std::array<unsigned, 3> prefix_rows{6, 7, 5}, hidden_rows{2, 0, 4};
+  const std::array<std::vector<std::int32_t>, 3> tokens{
+      {{11, 12, 13}, {21, 22}, {31}}};
+  std::string error;
+  const auto state_equal = [&](unsigned i, const std::string& stage) {
+    const auto a = Access::ReadState(*reference[i], f.config);
+    const auto b = Access::ReadState(*cached[i], f.config);
+    Require(a.position == b.position && a.blocks == b.blocks,
+            stage + " position/block shadows differ");
+    SameBits(a.k, b.k, stage + " K cache");
+    SameBits(a.v, b.v, stage + " V cache");
+    SameBits(a.raw, b.raw,
+             stage + " raw indexer ring including untouched rows");
+    SameBits(a.pooled, b.pooled, stage + " pooled indexer keys");
+  };
+  std::vector<gpu::Executor::MtpBatchItem> items;
+  unsigned expected_rows = 0;
+  for (unsigned i = 0; i < sessions; ++i) {
+    reference[i] =
+        exec.CreateSession(gufo::core::SessionMode::kSpeculative, 128, &error);
+    cached[i] =
+        exec.CreateSession(gufo::core::SessionMode::kSpeculative, 128, &error);
+    Require(reference[i] && cached[i], error);
+    auto hidden = Input(8 * f.config.HcDim());
+    for (std::size_t j = 0; j < hidden.size(); ++j)
+      hidden[j] += 0.001F * static_cast<float>((j + 7 * i) % 17);
+    for (auto* session : {reference[i].get(), cached[i].get()}) {
+      Access::Hidden(*session, hidden);
+      std::vector<std::int32_t> prefix(prefix_rows[i]);
+      for (unsigned r = 0; r < prefix.size(); ++r)
+        prefix[r] = 40 + i * 10 + r;
+      Require(exec.MtpForward(*session, prefix, 0, {}, &error), error);
+    }
+    Require(
+        exec.MtpForward(*reference[i], tokens[i], hidden_rows[i], {}, &error),
+        error);
+    items.push_back({cached[i].get(), tokens[i],
+                     static_cast<std::int32_t>(hidden_rows[i]), true});
+    expected_rows += tokens[i].size();
+  }
+  Require(exec.BeginMtpCycleDiagnostics(&error), error);
+  if (batched)
+    Require(exec.MtpForwardBatch(items, &error), error);
+  else
+    Require(exec.MtpForward(*cached[0], tokens[0], hidden_rows[0],
+                            {.kv_only = true}, &error),
+            error);
+  gpu::Executor::MtpCycleDiagnostics diagnostic;
+  Require(exec.EndMtpCycleDiagnostics(0, 0, &diagnostic, &error), error);
+  Require(diagnostic.cache_only_rows == expected_rows,
+          "EXL3 cache-only dispatch did not execute every requested row");
+  Require(diagnostic.expert_tile_reads == 0,
+          "cache-only catch-up unexpectedly executed experts");
+  for (unsigned i = 0; i < sessions; ++i) {
+    state_equal(i, "ragged catch-up session=" + std::to_string(i));
+    Require(!Access::ReadState(*cached[i], f.config).residual_valid,
+            "cache-only catch-up exposed a carried residual");
+  }
+  // The first two ragged sessions cross the sparse threshold and finish
+  // pooling blocks. Prove the fixture distinguishes the formerly buggy
+  // unscaled pooling kernel, rather than merely comparing two equal zeros.
+  Require(Access::ReadState(*cached[0], f.config).blocks >= 2,
+          "fixture did not pool blocks across sparse threshold");
+  Require(Access::YarnWitness(exec, *reference[0]),
+          "fixture cannot distinguish scaled and unscaled pooled keys");
+  // Eager -> capture -> replay of the same scalar cache-only shape, at new
+  // positions with changed tokens. The ragged batch above remains a real
+  // MtpForwardBatch call; none of these checks substitutes projection helpers.
+  std::size_t captured_graphs = 0;
+  for (unsigned pass = 0; pass < 3; ++pass) {
+    const std::array<std::int32_t, 3> more{
+        static_cast<std::int32_t>(70 + pass),
+        static_cast<std::int32_t>(80 + pass),
+        static_cast<std::int32_t>(90 + pass)};
+    Require(exec.MtpForward(*reference[0], more, 2, {}, &error), error);
+    Require(exec.MtpForward(*cached[0], more, 2, {.kv_only = true}, &error),
+            error);
+    state_equal(0, "graph catch-up pass=" + std::to_string(pass));
+    if (pass == 1) {
+      captured_graphs = Access::Graphs(*cached[0]);
+      Require(captured_graphs != 0, "cache-only graph was not captured");
+    }
+    if (pass == 2)
+      Require(Access::Graphs(*cached[0]) == captured_graphs,
+              "cache-only replay created another graph instead of reusing it");
+  }
+  for (unsigned i = 0; i < sessions; ++i) {
+    const std::int32_t next = 101 + i;
+    for (auto* session : {reference[i].get(), cached[i].get()}) {
+      if (i == 0)
+        Access::PoisonSelection(exec);
+      Require(exec.MtpForward(*session, std::span(&next, 1), 1, {}, &error),
+              error);
+      if (i == 0)
+        Require(Access::HasExpectedSparseSelection(exec, *session),
+                "sparse selector must replace poison with exactly the nonempty "
+                "causal budget");
+    }
+    state_equal(i, "known-hidden continuation");
+    const auto a = Access::FullLogits(exec, *reference[i]);
+    const auto b = Access::FullLogits(exec, *cached[i]);
+    Require(std::ranges::all_of(a, [](float v) { return std::isfinite(v); }),
+            "continuation logits are nonfinite");
+    SameBits(a, b, "subsequent full-vocabulary logits");
+    for (auto* session : {reference[i].get(), cached[i].get()})
+      Require(exec.MtpForward(*session, std::span(&next, 1), -1, {}, &error),
+              error);
+    state_equal(i, "recursive continuation");
+    SameBits(Access::FullLogits(exec, *reference[i]),
+             Access::FullLogits(exec, *cached[i]),
+             "recursive full-vocabulary logits");
+  }
 }
 
 void MtpKvGroup() {
@@ -668,10 +1128,25 @@ void MtpKvGroup() {
 int main(int argc, char** argv) {
   std::cout << std::unitbuf;
   try {
+    if (argc == 2 && std::string(argv[1]) == "--mtp-kv-executor") {
+      MtpExecutorCatchUp(false);
+      MtpExecutorCatchUp(true);
+      return 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--mtp-kv-group") {
       MtpKvGroup();
       return 0;
     }
+    if (argc == 2) {
+      Require(std::string_view(argv[1]) == "--shared-invariance-only",
+              "unknown operator test argument");
+      SharedMlpInvariance();
+      CompressedPrefillChunks();
+      return 0;
+    }
+    Require(argc == 1, "unexpected operator test arguments");
+    SharedMlpInvariance();
+    CompressedPrefillChunks();
     InputRoundingControl();
     DecodeK7();
     for (int bits : {5, 6, 7})

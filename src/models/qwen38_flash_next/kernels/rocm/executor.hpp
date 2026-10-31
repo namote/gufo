@@ -161,6 +161,7 @@ public:
 
 private:
   friend class Executor;
+  friend struct ExecutorTestAccess;
   friend struct PrefillCheckpoint;
   friend class gufo::models::qwen38_flash_next::ContinuationAdapter;
   Session() = default;
@@ -522,6 +523,8 @@ public:
     bool expert_tile_reads_complete{true};
     /// 128-column draft-head segments actually projected, including prefix.
     std::uint64_t head_segments{0}, catch_up_rows{0};
+    /// Rows that entered the cache-only branch, rather than a full body.
+    std::uint64_t cache_only_rows{0};
     /// Exclusive call wall times. draft_ms/catch_up_ms include inline heads;
     /// head_ms covers standalone MtpHeads. Diagnostic count downloads and
     /// synchronization are included; use an uninstrumented run for speed.
@@ -535,6 +538,7 @@ public:
 
 private:
   Executor() = default;
+  friend struct ExecutorTestAccess;
 
   enum class DiagnosticStage { kTarget, kDraft, kHead, kCatchUp };
   struct DiagnosticPhase {

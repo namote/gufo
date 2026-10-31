@@ -4,6 +4,7 @@
 #include "src/core/hip/detail/exl3_gemv.hpp"
 #include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
@@ -326,6 +327,25 @@ __global__ void GatherHead(const float* values, float* logits, unsigned prefix,
 void Exl3Projection(const DeviceTensor& w, const float* x, float* out,
                     std::uint32_t rows, const Exl3Scratch& scratch,
                     hipStream_t stream, bool fast) {
+  if (w.exl3 == nullptr) {
+    WeightType type;
+    switch (w.type) {
+      case core::GgmlType::kF32:
+        type = WeightType::kF32;
+        break;
+      case core::GgmlType::kF16:
+        type = WeightType::kF16;
+        break;
+      case core::GgmlType::kBF16:
+        type = WeightType::kBF16;
+        break;
+      default:
+        throw std::invalid_argument("unsupported EXL3 plain operand");
+    }
+    SmallGemmStable(w.data, type, x, out, rows, w.rows, w.cols, stream);
+    Check();
+    return;
+  }
   const auto& l = *w.exl3;
   const bool slice = w.output_begin != 0 || w.rows != l.n;
   if (slice && (scratch.slice == nullptr ||
@@ -337,11 +357,19 @@ void Exl3Projection(const DeviceTensor& w, const float* x, float* out,
       s.fast_input,         s.fast_input_elements, s.fast_counters,
       s.fast_counter_count, s.fast_down_input,     s.fast_down_input_elements};
   const gufo::hip::Exl3FastTarget t{&l, target, l.n};
-  if (fast && rows <= gufo::hip::kExl3FastMaxRows &&
-      gufo::hip::Exl3FastGroupSupported({&t, 1}, ws))
-    gufo::hip::LaunchExl3FastProjections({&t, 1}, x, l.k, rows, ws, stream);
-  else
+  if (fast && gufo::hip::Exl3FastGroupSupported({&t, 1}, ws)) {
+    for (std::uint32_t first = 0; first < rows;
+         first += gufo::hip::kExl3FastMaxRows) {
+      const auto count =
+          std::min<std::uint32_t>(gufo::hip::kExl3FastMaxRows, rows - first);
+      const gufo::hip::Exl3FastTarget pass{
+          &l, target + std::size_t{first} * l.n, l.n};
+      gufo::hip::LaunchExl3FastProjections(
+          {&pass, 1}, x + std::size_t{first} * l.k, l.k, count, ws, stream);
+    }
+  } else {
     ex::LaunchReferenceProjection(l, x, l.k, rows, target, l.n, s, stream);
+  }
   if (slice)
     hipLaunchKernelGGL(
         CopyColumns, dim3((std::size_t{rows} * w.rows + 255) / 256), dim3(256),
@@ -362,6 +390,33 @@ void Exl3Scatter(const float* x, const std::int32_t* slots, float* out,
                      dim3((std::size_t{count} * width + 255) / 256), dim3(256),
                      0, stream, x, slots, out, count, width);
   Check();
+}
+
+bool Exl3SharedMlp(const DeviceLayer& l, const float* x, float* gate, float* up,
+                   float* out, std::uint32_t rows, const Exl3Scratch& scratch,
+                   hipStream_t stream) {
+  if (rows == 0)
+    return false;
+  const auto& p = scratch.projection;
+  const gufo::hip::Exl3FastWorkspace ws{
+      p.fast_input,         p.fast_input_elements, p.fast_counters,
+      p.fast_counter_count, p.fast_down_input,     p.fast_down_input_elements};
+  const gufo::hip::Exl3FastMlp mlp{
+      l.shexp_gate.exl3, l.shexp_up.exl3, l.shexp_down.exl3, gate, up, out,
+      l.shexp_down.rows};
+  if (!gufo::hip::Exl3FastMlpSupported(mlp, ws))
+    return false;
+  for (std::uint32_t first = 0; first < rows;
+       first += gufo::hip::kExl3FastMaxRows) {
+    auto pass = mlp;
+    pass.out += std::size_t{first} * mlp.out_stride;
+    const auto count =
+        std::min<std::uint32_t>(gufo::hip::kExl3FastMaxRows, rows - first);
+    gufo::hip::LaunchExl3FastMlp(pass,
+                                 x + std::size_t{first} * l.shexp_gate.cols,
+                                 l.shexp_gate.cols, count, ws, stream);
+  }
+  return true;
 }
 
 void Exl3RoutedMlp(const DeviceLayer& l, const float* x,

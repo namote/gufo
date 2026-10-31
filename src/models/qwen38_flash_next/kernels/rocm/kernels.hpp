@@ -381,7 +381,7 @@ bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
                         std::size_t m, std::size_t k, hipStream_t stream);
 
 /// Exact F16 320 x 10240 HC down projection followed by SiLU(x / 4).
-/// Uses SmallGemm's original row specialization and F32 boundary.
+/// Uses SmallGemmStable's explicit FMA chain and F32 boundary at every width.
 void HcDownSiluF16(const void* w, const float* x, float* out,
                    std::uint32_t n_tokens, hipStream_t stream);
 
@@ -390,6 +390,11 @@ void HcDownSiluF16(const void* w, const float* x, float* out,
 void SmallGemm(const void* w, WeightType type, const float* x, float* out,
                std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
                hipStream_t stream);
+
+/// EXL3 plain operands: pinned widened FP32 FMAs, also during prefill.
+void SmallGemmStable(const void* w, WeightType type, const float* x, float* out,
+                     std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
+                     hipStream_t stream);
 
 /// PLE gate: for every stream s, sc = dot(key_n[t][s], query_n[t][s]) /
 /// sqrt(hidden); gated[t][s][i] = value[t][i] * sigmoid(sgn(sc) *

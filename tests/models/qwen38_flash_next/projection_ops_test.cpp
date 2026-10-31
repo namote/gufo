@@ -1026,86 +1026,130 @@ void CheckMtpOutputHead(float input_scale) {
 }
 
 void CheckHcDownSilu() {
-  constexpr unsigned m = 320, k = 10240;
+  constexpr unsigned m = 320, k = 10240, total_rows = 65;
   std::uint32_t seed = 0xF316320U;
   std::vector<__half> weights(std::size_t{m} * k);
   for (auto& value : weights)
     value = __float2half(Uniform(&seed, 0.125F));
+  // One fixed history is reused across every width, chunk and graph replay.
+  std::vector<float> history(std::size_t{total_rows} * k);
+  for (auto& value : history)
+    value = Uniform(&seed, 1.0F);
   void* dw = nullptr;
   CheckHip(hipMalloc(&dw, weights.size() * sizeof(__half)), "HC F16 weights");
   CheckHip(hipMemcpy(dw, weights.data(), weights.size() * sizeof(__half),
                      hipMemcpyHostToDevice),
            "HC F16 upload");
-  for (const unsigned rows :
-       {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U, 16U, 31U, 32U, 33U}) {
-    std::vector<float> input(std::size_t{rows} * k);
-    const std::size_t count = std::size_t{rows} * m;
-    float *dx = nullptr, *reference = nullptr, *fused = nullptr;
-    CheckHip(hipMalloc(&dx, input.size() * sizeof(float)), "HC input");
-    CheckHip(hipMalloc(&reference, count * sizeof(float)), "HC reference");
-    CheckHip(hipMalloc(&fused, (count + 8) * sizeof(float)), "HC fused");
-    hipStream_t stream = nullptr;
-    hipGraph_t graph = nullptr;
-    hipGraphExec_t replay = nullptr;
-    CheckHip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
-             "HC stream");
-    CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal),
-             "HC capture");
-    q::HcDownSiluF16(dw, dx, fused, rows, stream);
-    CheckHip(hipStreamEndCapture(stream, &graph), "HC capture end");
-    CheckHip(hipGraphInstantiate(&replay, graph, nullptr, nullptr, 0),
-             "HC instantiate");
-    for (const float scale : {1.7F, 0.0001F}) {
-      for (auto& value : input)
-        value = Uniform(&seed, scale);
-      CheckHip(hipMemcpy(dx, input.data(), input.size() * sizeof(float),
-                         hipMemcpyHostToDevice),
-               "HC input upload");
-      q::SmallGemm(dw, q::WeightType::kF16, dx, reference, rows, m, k, nullptr);
+  for (const float scale : {1.7F, 0.0001F}) {
+    auto input = history;
+    for (auto& value : input)
+      value *= scale;
+    float *all_x = nullptr, *all_y = nullptr;
+    CheckHip(hipMalloc(&all_x, input.size() * sizeof(float)), "HC history");
+    CheckHip(hipMalloc(&all_y, total_rows * m * sizeof(float)), "HC scalar");
+    CheckHip(hipMemcpy(all_x, input.data(), input.size() * sizeof(float),
+                       hipMemcpyHostToDevice),
+             "HC history upload");
+    // 66b2d89c's fixed plain-operand arithmetic is the baseline, independently
+    // of the fused entry point and of the requested batch width.
+    for (unsigned row = 0; row < total_rows; ++row)
+      q::SmallGemmStable(dw, q::WeightType::kF16, all_x + row * k,
+                         all_y + row * m, 1, m, k, nullptr);
+    q::SiluScale(all_y, 0.25F, total_rows * m, nullptr);
+    std::vector<float> scalar(total_rows * m);
+    CheckHip(hipMemcpy(scalar.data(), all_y, scalar.size() * sizeof(float),
+                       hipMemcpyDeviceToHost),
+             "HC scalar download");
+    for (const unsigned rows : {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U, 16U, 31U,
+                                32U, 33U, 63U, 64U, 65U}) {
+      const std::size_t count = std::size_t{rows} * m;
+      float *dx = nullptr, *reference = nullptr, *fused = nullptr;
+      // Each input allocation ends exactly at this width's final row.
+      CheckHip(hipMalloc(&dx, std::size_t{rows} * k * sizeof(float)),
+               "HC input");
+      CheckHip(hipMalloc(&reference, count * sizeof(float)), "HC reference");
+      CheckHip(hipMalloc(&fused, (count + 8) * sizeof(float)), "HC fused");
+      CheckHip(
+          hipMemcpy(dx, input.data(), std::size_t{rows} * k * sizeof(float),
+                    hipMemcpyHostToDevice),
+          "HC input upload");
+      q::SmallGemmStable(dw, q::WeightType::kF16, dx, reference, rows, m, k,
+                         nullptr);
       q::SiluScale(reference, 0.25F, count, nullptr);
-      CheckHip(hipDeviceSynchronize(), "HC reference ready");
-      CheckHip(hipMemset(fused, 0xA5, (count + 8) * sizeof(float)), "HC guard");
-      CheckHip(hipGraphLaunch(replay, stream), "HC replay");
-      CheckHip(hipStreamSynchronize(stream), "HC ready");
       std::vector<float> expected(count), actual(count + 8);
       CheckHip(hipMemcpy(expected.data(), reference, count * sizeof(float),
                          hipMemcpyDeviceToHost),
                "HC reference download");
-      CheckHip(hipMemcpy(actual.data(), fused, actual.size() * sizeof(float),
-                         hipMemcpyDeviceToHost),
-               "HC fused download");
-      if (std::memcmp(expected.data(), actual.data(), count * sizeof(float)))
-        throw std::runtime_error(
-            "HC F16 fusion changes projection/SiLU bits: " +
-            std::to_string(rows));
-      for (std::size_t i = count; i < actual.size(); ++i)
-        if (std::bit_cast<std::uint32_t>(actual[i]) != 0xA5A5A5A5U)
-          throw std::runtime_error("HC F16 fusion overwrote guard");
-      // Independent F64 dot/SiLU check on both ends of each row. Small
-      // activations prevent saturated SiLU from concealing producer drift.
-      for (unsigned token = 0; token < rows; ++token)
-        for (const unsigned out : {0U, m - 1}) {
-          double dot = 0;
-          for (unsigned col = 0; col < k; ++col)
-            dot += double(__half2float(weights[std::size_t{out} * k + col])) *
-                   input[std::size_t{token} * k + col];
-          const double x = dot * 0.25;
-          const double oracle = x / (1.0 + std::exp(-x));
-          if (!std::isfinite(actual[token * m + out]) ||
-              std::abs(actual[token * m + out] - oracle) >
-                  2e-5 * (scale + std::abs(oracle)))
-            throw std::runtime_error("HC F16 fusion differs from F64 oracle");
-        }
+      if (std::memcmp(scalar.data(), expected.data(), count * sizeof(float)))
+        throw std::runtime_error("HC stable baseline changes with width");
+      hipStream_t stream = nullptr;
+      hipGraph_t graph = nullptr;
+      hipGraphExec_t replay = nullptr;
+      CheckHip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+               "HC stream");
+      CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal),
+               "HC capture");
+      q::HcDownSiluF16(dw, dx, fused, rows, stream);
+      CheckHip(hipStreamEndCapture(stream, &graph), "HC capture end");
+      CheckHip(hipGraphInstantiate(&replay, graph, nullptr, nullptr, 0),
+               "HC instantiate");
+      for (unsigned pass = 0; pass < 2; ++pass) {
+        CheckHip(hipMemset(fused, 0xA5, (count + 8) * sizeof(float)),
+                 "HC guard");
+        CheckHip(hipGraphLaunch(replay, stream), "HC replay");
+        CheckHip(hipStreamSynchronize(stream), "HC ready");
+        CheckHip(hipMemcpy(actual.data(), fused, actual.size() * sizeof(float),
+                           hipMemcpyDeviceToHost),
+                 "HC fused download");
+        if (std::memcmp(scalar.data(), actual.data(), count * sizeof(float)))
+          throw std::runtime_error(
+              "HC fusion differs from stable scalar bits: " +
+              std::to_string(rows));
+        for (std::size_t i = count; i < actual.size(); ++i)
+          if (std::bit_cast<std::uint32_t>(actual[i]) != 0xA5A5A5A5U)
+            throw std::runtime_error("HC F16 fusion overwrote guard");
+      }
+      CheckHip(hipGraphExecDestroy(replay), "HC replay free");
+      CheckHip(hipGraphDestroy(graph), "HC graph free");
+      CheckHip(hipStreamDestroy(stream), "HC stream free");
+      for (auto* pointer : {dx, reference, fused})
+        CheckHip(hipFree(pointer), "HC buffer free");
     }
-    CheckHip(hipGraphExecDestroy(replay), "HC replay free");
-    CheckHip(hipGraphDestroy(graph), "HC graph free");
-    CheckHip(hipStreamDestroy(stream), "HC stream free");
-    for (auto* pointer : {dx, reference, fused})
-      CheckHip(hipFree(pointer), "HC buffer free");
+    for (unsigned chunk : {1U, 3U, 8U, 9U, 32U, 33U, 64U}) {
+      CheckHip(hipMemset(all_y, 0xA5, scalar.size() * sizeof(float)),
+               "HC chunk poison");
+      for (unsigned first = 0; first < total_rows; first += chunk)
+        q::HcDownSiluF16(dw, all_x + first * k, all_y + first * m,
+                         std::min(chunk, total_rows - first), nullptr);
+      std::vector<float> actual(scalar.size());
+      CheckHip(hipMemcpy(actual.data(), all_y, actual.size() * sizeof(float),
+                         hipMemcpyDeviceToHost),
+               "HC chunk download");
+      if (std::memcmp(scalar.data(), actual.data(),
+                      scalar.size() * sizeof(float)))
+        throw std::runtime_error("HC fusion changes across chunk boundary " +
+                                 std::to_string(chunk));
+    }
+    // Retain the independent numerical oracle, including unsaturated inputs.
+    for (unsigned token = 0; token < total_rows; ++token)
+      for (const unsigned out : {0U, m - 1}) {
+        double dot = 0;
+        for (unsigned col = 0; col < k; ++col)
+          dot += double(__half2float(weights[std::size_t{out} * k + col])) *
+                 input[std::size_t{token} * k + col];
+        const double x = dot * 0.25;
+        const double oracle = x / (1.0 + std::exp(-x));
+        if (!std::isfinite(scalar[token * m + out]) ||
+            std::abs(scalar[token * m + out] - oracle) >
+                2e-5 * (scale + std::abs(oracle)))
+          throw std::runtime_error("HC F16 differs from F64 oracle");
+      }
+    CheckHip(hipFree(all_y), "HC scalar free");
+    CheckHip(hipFree(all_x), "HC history free");
   }
   CheckHip(hipFree(dw), "HC weights free");
-  std::cout
-      << "HC F16 down/SiLU exact at widths 1..9/16/31/32/33, graph replay\n";
+  std::cout << "HC F16 down/SiLU stable scalar/batch/chunk/graph bits, widths "
+               "through 65\n";
 }
 
 }  // namespace
