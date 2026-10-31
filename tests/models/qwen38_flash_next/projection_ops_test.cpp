@@ -1124,8 +1124,11 @@ void CheckHcDownSilu() {
       CheckHip(hipGraphInstantiate(&replay, graph, nullptr, nullptr, 0),
                "HC instantiate");
       for (unsigned pass = 0; pass < 2; ++pass) {
-        CheckHip(hipMemset(fused, 0xA5, (count + 8) * sizeof(float)),
-                 "HC guard");
+        // The graph uses a nonblocking stream, so a default-stream memset
+        // can race its GEMM and overwrite totals before the separate SiLU.
+        CheckHip(
+            hipMemsetAsync(fused, 0xA5, (count + 8) * sizeof(float), stream),
+            "HC guard");
         CheckHip(hipGraphLaunch(replay, stream), "HC replay");
         CheckHip(hipStreamSynchronize(stream), "HC ready");
         CheckHip(hipMemcpy(actual.data(), fused, actual.size() * sizeof(float),
