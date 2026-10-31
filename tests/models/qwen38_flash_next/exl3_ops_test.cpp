@@ -55,6 +55,13 @@ struct ExecutorTestAccess {
     Hip(hipMemcpy(session.mtp_.target_hidden, hidden.data(),
                   hidden.size_bytes(), hipMemcpyHostToDevice));
   }
+  static const Exl3PrefillScratch& PrefillScratch(const Executor& exec) {
+    return exec.exl3_prefill_;
+  }
+  static const Exl3Scratch& RoutedScratch(const Executor& exec) {
+    return exec.exl3_;
+  }
+  static float* RoutedOutput(const Executor& exec) { return exec.s_.down_e; }
   struct State {
     std::vector<std::uint16_t> k, v, pooled;
     std::vector<float> raw;
@@ -68,6 +75,10 @@ struct ExecutorTestAccess {
       Hip(hipMemcpy(values.data(), device, count * sizeof(T),
                     hipMemcpyDeviceToHost));
     return values;
+  }
+  static std::vector<float> PrefillResiduals(const Executor& exec,
+                                             unsigned rows) {
+    return Read<float>(exec.s_.res, std::size_t{rows} * exec.config().HcDim());
   }
   static State ReadState(const Session& session, const Config& config) {
     const auto& m = session.mtp_;
@@ -860,7 +871,8 @@ struct MtpExecutorFixture {
             inject ? Plain(config.hc_count, config.HcDim(), true)
                    : gpu::DeviceTensor{}};
   }
-  MtpExecutorFixture() {
+  explicit MtpExecutorFixture(unsigned max_batch = 16,
+                              unsigned expert_ff = 128) {
     config.num_layers = 1;
     config.num_layers_all = 2;
     config.hidden_size = 128;
@@ -885,7 +897,7 @@ struct MtpExecutorFixture {
     config.ssm_inner_size = 128;
     config.num_experts = 4;
     config.num_experts_used = 2;
-    config.expert_ff = config.shared_expert_ff = 128;
+    config.expert_ff = config.shared_expert_ff = expert_ff;
     config.nextn_layers = 1;
     gpu::DeviceLayer l;
     l.hc_attn = Mixer();
@@ -922,7 +934,7 @@ struct MtpExecutorFixture {
                                            Mixer(false));
     std::string error;
     exec = gpu::Executor::Create(*model, nullptr,
-                                 {.max_batch = 16,
+                                 {.max_batch = max_batch,
                                   .max_logit_rows = 8,
                                   .max_speculative = 8,
                                   .max_context = 128},
@@ -1067,6 +1079,198 @@ void MtpExecutorCatchUp(bool batched) {
   }
 }
 
+void PrefillScratchEstimate() {
+  BeginCase("host EXL3 prefill scratch estimate");
+  q::Config c;
+  c.num_experts = 512;
+  c.num_experts_used = 10;
+  c.hidden_size = 2560;
+  c.expert_ff = 640;
+  std::string error;
+  const auto chunk =
+      gpu::Executor::EstimateExl3PrefillScratchBytes(c, 4096, &error);
+  const auto through =
+      gpu::Executor::EstimateExl3PrefillScratchBytes(c, 4224, &error);
+  Require(chunk == 839204360, "4096-row disjoint scratch byte count");
+  Require(through == 865429240, "4224-row tail-capacity scratch byte count");
+  std::cout << "MEMORY EXL3 prefill P4096=" << chunk << " bytes (800.328 MiB)"
+            << " P4224=" << through << " bytes (825.338 MiB)\n";
+  Require(gpu::Executor::EstimateExl3PrefillScratchBytes(c, 0, &error) == 0 &&
+              !error.empty(),
+          "zero-row scratch must be rejected");
+  Require(
+      gpu::Executor::EstimateExl3PrefillScratchBytes(c, 1000000, &error) == 0,
+      "device bucket grid limit must be enforced");
+  Require(gpu::Executor::EstimateExl3PrefillScratchBytes(c, 0xFFFFFFFFU,
+                                                         &error) == 0,
+          "assignment counter overflow must be rejected");
+  c.num_experts_used = c.num_experts + 1;
+  Require(gpu::Executor::EstimateExl3PrefillScratchBytes(c, 1, &error) == 0,
+          "invalid used-expert count must be rejected");
+}
+
+void ExecutorPrefillExperts() {
+  BeginCase("executor X3 prefill dispatch and chunk bits, F=640");
+  constexpr unsigned rows = 65;
+  MtpExecutorFixture f(rows, 640);
+  auto& exec = *f.exec;
+  const auto& c = f.config;
+  using Access = gpu::ExecutorTestAccess;
+  const auto& pp = Access::PrefillScratch(exec);
+  const auto assignments = rows * c.num_experts_used;
+  Require(pp.max_assignments == assignments &&
+              pp.max_buckets ==
+                  std::min(assignments, c.num_experts + assignments / 64),
+          "executor bucket capacities differ from production 64-row plan");
+  Require(exec.exl3_prefill_scratch_bytes() ==
+              gpu::Executor::EstimateExl3PrefillScratchBytes(c, rows),
+          "allocated prefill bytes differ from host estimate");
+  // Check all persistent slabs, including the caller's assignment output.
+  // An alias can appear to work for a single expert, then fail under scatter.
+  const std::vector<std::pair<const void*, std::size_t>> slabs{
+      {pp.offsets, (c.num_experts + 1) * sizeof(std::uint32_t)},
+      {pp.slots, assignments * sizeof(std::int32_t)},
+      {pp.buckets, pp.max_buckets * sizeof(gpu::Exl3ExpertBucket)},
+      {pp.bucket_count, sizeof(std::uint32_t)},
+      {pp.input, assignments * std::max(c.hidden_size, c.expert_ff) *
+                     sizeof(std::uint16_t)},
+      {pp.gate, assignments * c.expert_ff * sizeof(float)},
+      {pp.up, assignments * c.expert_ff * sizeof(float)},
+      {pp.out, assignments * c.hidden_size * sizeof(float)},
+      {pp.down_exponents, assignments * sizeof(std::int32_t)},
+      {Access::RoutedOutput(exec),
+       assignments * c.hidden_size * sizeof(float)}};
+  for (std::size_t i = 0; i < slabs.size(); ++i) {
+    Require(slabs[i].first != nullptr, "executor omitted a prefill slab");
+    const auto a = reinterpret_cast<std::uintptr_t>(slabs[i].first);
+    for (std::size_t j = 0; j < i; ++j) {
+      const auto b = reinterpret_cast<std::uintptr_t>(slabs[j].first);
+      Require(a + slabs[i].second <= b || b + slabs[j].second <= a,
+              "executor prefill scratch slabs overlap");
+    }
+  }
+  std::vector<std::int32_t> tokens(rows);
+  for (unsigned r = 0; r < rows; ++r)
+    tokens[r] = 1 + (r * 17) % (c.vocab_size - 1);
+  std::string error;
+  const auto prefill = [&](unsigned chunk) {
+    auto session = exec.CreateSession(gufo::core::SessionMode::kAutoregressive,
+                                      128, &error);
+    Require(session != nullptr, error);
+    std::vector<float> logits(c.vocab_size);
+    std::vector<float> hidden(std::size_t{rows} * c.HcDim());
+    Require(exec.BeginMtpCycleDiagnostics(&error), error);
+    for (unsigned first = 0; first < rows; first += chunk) {
+      const auto count = std::min(chunk, rows - first);
+      Require(
+          exec.Forward(*session, std::span(tokens).subspan(first, count), 0,
+                       nullptr, gpu::Executor::ForwardMode::kPrefill, &error),
+          error);
+      // n_logits=0 disables final-query attention pruning; fewer than 128
+      // rows disables the FFN skip. Compare every fully computed residual,
+      // then replay the one-row head without changing those residuals.
+      const auto residual = Access::PrefillResiduals(exec, count);
+      std::copy(residual.begin(), residual.end(),
+                hidden.begin() + std::size_t{first} * c.HcDim());
+      Require(exec.ReplayOutputHead(count, logits, &error), error);
+    }
+    gpu::Executor::MtpCycleDiagnostics d;
+    Require(exec.EndMtpCycleDiagnostics(0, 0, &d, &error), error);
+    Require(d.prefill_expert_rows == rows * c.num_layers &&
+                d.prefill_expert_buckets != 0 && d.scaled_down_rows == 0,
+            "kPrefill did not dispatch bucketed experts for every row, "
+            "including tails");
+    Require(std::ranges::all_of(
+                logits, [](float value) { return std::isfinite(value); }),
+            "prefill logits are not finite");
+    return std::pair{logits, hidden};
+  };
+  const auto bulk = prefill(rows);
+  for (unsigned chunk : {1U, 3U, 8U, 9U, 32U, 33U, 64U}) {
+    const auto split = prefill(chunk);
+    SameBits(bulk.first, split.first,
+             "executor prefill chunks=" + std::to_string(chunk));
+    SameBits(bulk.second, split.second,
+             "every prefill residual row chunks=" + std::to_string(chunk));
+  }
+
+  // Exercise the allocated scaled-down path through a real decode forward,
+  // including the executor's 64+1 partition and expert_ff > 2 * hidden.
+  const auto& routed = Access::RoutedScratch(exec);
+  Require(routed.down_exponents != nullptr,
+          "executor omitted decode down exponents");
+  Check(hipMemset(routed.down_exponents, 0x7F,
+                  64 * c.num_experts_used * sizeof(std::int32_t)));
+  auto decode =
+      exec.CreateSession(gufo::core::SessionMode::kAutoregressive, 128, &error);
+  Require(decode != nullptr, error);
+  std::vector<float> logits(c.vocab_size);
+  Require(exec.BeginMtpCycleDiagnostics(&error), error);
+  Require(exec.Forward(*decode, tokens, 1, logits.data(),
+                       gpu::Executor::ForwardMode::kDecode, &error),
+          error);
+  gpu::Executor::MtpCycleDiagnostics d;
+  Require(exec.EndMtpCycleDiagnostics(0, 0, &d, &error), error);
+  Require(d.scaled_down_rows == assignments && d.prefill_expert_rows == 0,
+          "decode did not dispatch scaled routed down across 64+1 rows");
+  const auto exponents = Access::Read<std::int32_t>(routed.down_exponents,
+                                                    64 * c.num_experts_used);
+  Require(
+      std::ranges::all_of(exponents, [](auto e) { return e >= -1 && e <= 10; }),
+      "scaled-down dispatch did not overwrite poisoned exponents");
+
+  // Isolate the actual production X3 operator from the other transformer
+  // stages, using the very same persistent executor allocations and tile.
+  auto input = Input(rows * c.hidden_size);
+  auto* x = f.buffers.Copy(input);
+  auto* y = f.buffers.Make<float>(std::size_t{assignments} * c.hidden_size + 8);
+  for (bool shared : {false, true}) {
+    std::vector<std::int32_t> ids(assignments);
+    for (unsigned r = 0; r < rows; ++r)
+      for (unsigned j = 0; j < c.num_experts_used; ++j)
+        ids[r * c.num_experts_used + j] = shared ? j : (r + j) % c.num_experts;
+    auto* id = f.buffers.Copy(ids);
+    const auto project = [&](unsigned chunk) {
+      // NaN payload poison catches omitted writes; the separate finite
+      // bit-pattern guard detects writes past the assignment allocation.
+      Check(hipMemset(
+          y, 0xFF, std::size_t{assignments} * c.hidden_size * sizeof(float)));
+      Check(hipMemset(y + std::size_t{assignments} * c.hidden_size, 0x7F,
+                      8 * sizeof(float)));
+      for (unsigned first = 0; first < rows; first += chunk)
+        gpu::Exl3PrefillExperts(
+            f.model->layers()[0], x + first * c.hidden_size,
+            id + first * c.num_experts_used,
+            y + std::size_t{first} * c.num_experts_used * c.hidden_size,
+            std::min(chunk, rows - first), c.num_experts_used, 64, pp,
+            exec.stream());
+      Check(hipStreamSynchronize(exec.stream()));
+      const auto output =
+          Access::Read<float>(y, std::size_t{assignments} * c.hidden_size);
+      Require(std::ranges::all_of(
+                  output, [](float value) { return std::isfinite(value); }),
+              "X3 assignment output is not finite");
+      Require(
+          std::ranges::any_of(output, [](float value) { return value != 0; }),
+          "X3 assignment fixture must produce nonzero output");
+      Require(Access::Read<std::uint32_t>(
+                  y + std::size_t{assignments} * c.hidden_size, 1)[0] ==
+                  0x7F7F7F7FU,
+              "X3 assignment output overwrote its guard");
+      return output;
+    };
+    const auto reference = project(rows);
+    if (shared)
+      Require(
+          Access::Read<std::uint32_t>(pp.bucket_count, 1)[0] ==
+              2 * c.num_experts_used,
+          "shared history must create 64+1 buckets for each selected expert");
+    for (unsigned chunk : {1U, 3U, 8U, 9U, 32U, 33U, 64U})
+      SameBits(reference, project(chunk),
+               "X3 expert operator chunks=" + std::to_string(chunk));
+  }
+}
+
 void MtpKvGroup() {
   namespace fast = gufo::hip;
   constexpr unsigned k = 256, q_width = 1024, kv_width = 512;
@@ -1129,6 +1333,14 @@ void MtpKvGroup() {
 int main(int argc, char** argv) {
   std::cout << std::unitbuf;
   try {
+    if (argc == 2 && std::string(argv[1]) == "--prefill-scratch-only") {
+      PrefillScratchEstimate();
+      return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--prefill-experts-only") {
+      ExecutorPrefillExperts();
+      return 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--mtp-kv-executor") {
       MtpExecutorCatchUp(false);
       MtpExecutorCatchUp(true);

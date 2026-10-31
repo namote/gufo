@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
@@ -81,6 +82,54 @@ WeightType SmallType(GgmlType type) {
 // The tier's tiled kernels compute whole column tiles; below this width the
 // matrix-vector kernels read each weight once per row and win outright.
 constexpr std::uint32_t kVecBatch = 8;
+constexpr std::uint32_t kExl3PrefillTileRows = 64;
+
+struct Exl3PrefillLayout {
+  std::uint32_t assignments{0}, buckets{0};
+  std::size_t bytes{0};
+};
+
+bool PlanExl3Prefill(const Config& c, std::uint32_t rows,
+                     Exl3PrefillLayout* layout, std::string* error) {
+  if (rows == 0 || c.num_experts_used == 0 ||
+      c.num_experts_used > c.num_experts || c.hidden_size == 0 ||
+      c.expert_ff == 0) {
+    AssignError(error, "invalid EXL3 prefill scratch geometry");
+    return false;
+  }
+  const std::uint64_t assignments = std::uint64_t{rows} * c.num_experts_used;
+  const auto buckets =
+      std::min(assignments, std::uint64_t{c.num_experts} +
+                                assignments / kExl3PrefillTileRows);
+  if (assignments > std::numeric_limits<std::uint32_t>::max() ||
+      buckets > 65535) {
+    AssignError(error, "EXL3 prefill scratch exceeds device descriptor limits");
+    return false;
+  }
+  std::size_t bytes = 0;
+  const auto add = [&](std::uint64_t count, std::size_t element) {
+    if (count > (std::numeric_limits<std::size_t>::max() - bytes) / element)
+      return false;
+    bytes += static_cast<std::size_t>(count) * element;
+    return true;
+  };
+  if (!add(std::uint64_t{c.num_experts} + 1, sizeof(std::uint32_t)) ||
+      !add(assignments, sizeof(std::int32_t)) ||
+      !add(buckets, sizeof(Exl3ExpertBucket)) ||
+      !add(1, sizeof(std::uint32_t)) ||
+      !add(assignments * std::max(c.hidden_size, c.expert_ff),
+           sizeof(std::uint16_t)) ||
+      !add(assignments * c.expert_ff, sizeof(float)) ||
+      !add(assignments * c.expert_ff, sizeof(float)) ||
+      !add(assignments * c.hidden_size, sizeof(float)) ||
+      !add(assignments, sizeof(std::int32_t))) {
+    AssignError(error, "EXL3 prefill scratch byte size overflows size_t");
+    return false;
+  }
+  *layout = {static_cast<std::uint32_t>(assignments),
+             static_cast<std::uint32_t>(buckets), bytes};
+  return true;
+}
 // Keep prompt arithmetic independent of chunk width. A scoped, per-thread
 // policy also lets the output head retain its existing logits-row arithmetic.
 thread_local bool prefill_phase = false;
@@ -1079,18 +1128,39 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     ex.slice_elements = std::max(T, std::size_t{64}) * (c.indexer_heads + 1) *
                         c.indexer_head_dim;
     ex.slice = f32(ex.slice_elements);
-    ex.gather = f32(T * c.hidden_size);
-    ex.gate = f32(T * c.expert_ff);
-    ex.up = f32(T * c.expert_ff);
-    ex.out = f32(T * c.hidden_size);
     const auto assignments = std::size_t{64} * c.num_experts_used;
-    ex.routed_input =
-        Alloc<std::uint16_t>(a, 2 * assignments * c.hidden_size, error_msg);
+    ex.routed_input = Alloc<std::uint16_t>(
+        a,
+        assignments *
+            std::max(std::size_t{2} * c.hidden_size, std::size_t{c.expert_ff}),
+        error_msg);
     ex.tiles = Alloc<Exl3RouteTile>(a, assignments, error_msg);
     ex.tile_count = Alloc<std::uint32_t>(a, 1, error_msg);
+    ex.down_exponents = Alloc<std::int32_t>(a, assignments, error_msg);
     ex.head_segments =
         Alloc<std::uint32_t>(a, kMtpDraftExtraRows + 1, error_msg);
     ex.head_values = f32(c.vocab_size + std::size_t{kMtpDraftExtraRows} * 128);
+    Exl3PrefillLayout layout;
+    if (!PlanExl3Prefill(c, e->options_.max_batch, &layout, error_msg))
+      return nullptr;
+    auto& pp = e->exl3_prefill_;
+    pp.max_assignments = layout.assignments;
+    pp.max_buckets = layout.buckets;
+    const std::size_t A = layout.assignments;
+    pp.offsets =
+        Alloc<std::uint32_t>(a, std::size_t{c.num_experts} + 1, error_msg);
+    pp.slots = Alloc<std::int32_t>(a, A, error_msg);
+    pp.buckets = Alloc<Exl3ExpertBucket>(a, layout.buckets, error_msg);
+    pp.bucket_count = Alloc<std::uint32_t>(a, 1, error_msg);
+    pp.input = Alloc<std::uint16_t>(a, A * std::max(c.hidden_size, c.expert_ff),
+                                    error_msg);
+    pp.gate = f32(A * c.expert_ff);
+    pp.up = f32(A * c.expert_ff);
+    // Each slab, including packed out, has its own allocation. s.down_e
+    // remains in the separate stage arena and receives the scattered rows.
+    pp.out = f32(A * c.hidden_size);
+    pp.down_exponents = Alloc<std::int32_t>(a, A, error_msg);
+    e->exl3_prefill_scratch_bytes_ = layout.bytes;
   }
   s.tokens = Alloc<std::int32_t>(a, T, error_msg);
   s.x_half = Alloc<std::uint16_t>(a, T * model.max_half_cols(), error_msg);
@@ -3463,48 +3533,32 @@ bool Executor::Exl3Experts(const DeviceLayer& l, const float* x, float* out,
                       s_.ids + assignment, s_.gate_e, s_.up_e,
                       s_.down_e + assignment * c.hidden_size, count,
                       c.num_experts_used, exl3_, stream_);
-        if (diagnostics_active_ &&
-            !DiagnosticCount(exl3_.tile_count,
-                             &cycle_diagnostics_.expert_tile_reads, error))
-          return false;
+        if (diagnostics_active_) {
+          if (exl3_.down_exponents != nullptr)
+            cycle_diagnostics_.scaled_down_rows +=
+                std::uint64_t{count} * c.num_experts_used;
+          if (!DiagnosticCount(exl3_.tile_count,
+                               &cycle_diagnostics_.expert_tile_reads, error))
+            return false;
+        }
       }
     } else {
-      if (diagnostics_active_)
+      // Keep this route for EVERY kPrefill row, including singleton tails.
+      // Selecting decode GEMV by token/bucket width changes the reduction
+      // tree when a Sync/checkpoint boundary moves. X3 is a phase contract,
+      // not a minimum-row heuristic; its 64-row tile never changes here.
+      Exl3PrefillExperts(l, x, s_.ids, s_.down_e, rows, c.num_experts_used,
+                         kExl3PrefillTileRows, exl3_prefill_, stream_);
+      if (diagnostics_active_) {
+        cycle_diagnostics_.prefill_expert_rows += rows;
         cycle_diagnostics_.expert_tile_reads_complete = false;
-      ExpertCounts(s_.ids, s_.expert_counts, rows, c.num_experts,
-                   c.num_experts_used, stream_);
-      RoutedCompact(s_.ids, s_.expert_counts, s_.routed_bounds,
-                    s_.routed_cursors, s_.rows_token, s_.rows_slot, rows,
-                    c.num_experts_used, c.num_experts, stream_);
-      if (!Check(hipMemcpyAsync(counts_host_, s_.expert_counts,
-                                c.num_experts * sizeof(std::uint32_t),
-                                hipMemcpyDeviceToHost, stream_),
-                 "EXL3 expert counts", error) ||
-          !Check(hipStreamSynchronize(stream_), "EXL3 expert buckets", error))
-        return false;
-      std::size_t base = 0;
-      for (std::uint32_t expert = 0; expert < c.num_experts; ++expert) {
-        const auto count = counts_host_[expert];
-        if (count == 0)
-          continue;
-        Exl3Gather(x, s_.rows_token + base, exl3_.gather, count, c.hidden_size,
-                   stream_);
-        const auto projection = [&](const DeviceTensor& bank,
-                                    const float* input, float* output) {
-          auto weight = bank;
-          weight.exl3 += expert;
-          weight.experts = 1;
-          Exl3Projection(weight, input, output, count, exl3_, stream_, false);
-        };
-        projection(l.ffn_gate_exps, exl3_.gather, exl3_.gate);
-        projection(l.ffn_up_exps, exl3_.gather, exl3_.up);
-        Swiglu(exl3_.gate, exl3_.up, std::size_t{count} * c.expert_ff, stream_);
-        projection(l.ffn_down_exps, exl3_.gate, exl3_.out);
-        Exl3Scatter(exl3_.out, s_.rows_slot + base, s_.down_e, count,
-                    c.hidden_size, stream_);
-        base += (count + 15) / 16 * 16;
+        if (!DiagnosticCount(exl3_prefill_.bucket_count,
+                             &cycle_diagnostics_.prefill_expert_buckets, error))
+          return false;
       }
     }
+    if (!JoinSide(error))
+      return false;
     MoeEpilogue(s_.down_e, s_.weights, s_.shexp_out, s_.router + c.num_experts,
                 c.num_experts + 1, out, rows, c.num_experts_used, c.hidden_size,
                 stream_);
@@ -3530,6 +3584,13 @@ bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
                               stream_),
                "trunk hidden download", error_msg) &&
          Check(hipStreamSynchronize(stream_), "trunk hidden", error_msg);
+}
+
+std::size_t Executor::EstimateExl3PrefillScratchBytes(const Config& config,
+                                                      std::uint32_t rows,
+                                                      std::string* error_msg) {
+  Exl3PrefillLayout layout;
+  return PlanExl3Prefill(config, rows, &layout, error_msg) ? layout.bytes : 0;
 }
 
 std::uint32_t Executor::PrefillChunkRows(

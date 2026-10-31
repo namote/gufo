@@ -510,6 +510,15 @@ public:
 
   [[nodiscard]] std::uint32_t PrefillChunkRows(
       std::uint32_t requested, std::uint32_t until_checkpoint) const noexcept;
+  /// Host-only estimate of the disjoint persistent bucket slabs. Zero means
+  /// invalid geometry (error_msg explains); excludes existing s_.down_e and
+  /// the decode path's 64 * used exponents. Uses the production 64-row tile.
+  [[nodiscard]] static std::size_t EstimateExl3PrefillScratchBytes(
+      const Config& config, std::uint32_t rows,
+      std::string* error_msg = nullptr);
+  [[nodiscard]] std::size_t exl3_prefill_scratch_bytes() const noexcept {
+    return exl3_prefill_scratch_bytes_;
+  }
 
   /// Opt-in operator/profiling diagnostics, following MtpTrace's eager path.
   /// No production caller enables this implicitly. Counts cover the whole
@@ -525,6 +534,11 @@ public:
     std::uint64_t head_segments{0}, catch_up_rows{0};
     /// Rows that entered the cache-only branch, rather than a full body.
     std::uint64_t cache_only_rows{0};
+    /// Routed prefill rows and actual 64-row expert buckets, across layers.
+    std::uint64_t prefill_expert_rows{0}, prefill_expert_buckets{0};
+    /// Decode/verify assignments sent through the allocated scaled-down path
+    /// (which can still select widened fallback for an unsafe row).
+    std::uint64_t scaled_down_rows{0};
     /// Exclusive call wall times. draft_ms/catch_up_ms include inline heads;
     /// head_ms covers standalone MtpHeads. Diagnostic count downloads and
     /// synchronization are included; use an uninstrumented run for speed.
@@ -834,6 +848,8 @@ private:
   };
   mutable Scratch s_{};
   Exl3Scratch exl3_{};
+  Exl3PrefillScratch exl3_prefill_{};
+  std::size_t exl3_prefill_scratch_bytes_{0};
   bool Exl3Group(std::initializer_list<const DeviceTensor*> weights,
                  std::initializer_list<float*> outputs, const float* x,
                  std::uint32_t rows, std::string* error) const;
