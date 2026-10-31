@@ -130,7 +130,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       // EXL3 projections read the FP32 activation (no EXL3 tensor is Q8 or
       // FP16-prefill eligible, so every producer wrote it).
       LaunchExl3Projection(w, fp32_input, batch_size, output,
-                           arena_.Exl3Scratch(), arena_.stream);
+                           arena_.Exl3Scratch(), arena_.stream, 0, 0,
+                           Exl3Pass::kPrefill);
       return;
     }
     if (half_prefill) {

@@ -15,7 +15,7 @@ void LaunchFloatToFp16(const float* input, void* output, std::size_t elements,
 // the trellis decode producer. x is the FP16 rotated input [batch][k]
 // (H(suh * x) per 128 elements, row-major); y [batch][n] FP32 receives
 // svh * H(x W') (residual: added to y). Supported: mul1, integer K 1..6,
-// n % 256 == 0, k % 64 == 0.
+// n and k positive, n % 256 == 0, k % 128 == 0.
 [[nodiscard]] bool Exl3PrefillSupported(
     const quant::exl3::DeviceLinear& linear) noexcept;
 void LaunchExl3PrefillGemm(const quant::exl3::DeviceLinear& linear,

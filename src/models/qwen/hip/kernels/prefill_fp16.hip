@@ -242,8 +242,9 @@ __launch_bounds__(WM * WN * 32) __global__
                                const short* __restrict__ x,
                                float* __restrict__ y, int batch, int m, int k,
                                const float* __restrict__ gate,
-                               const void* __restrict__ up = nullptr,
-                               const _Float16* __restrict__ svh = nullptr) {
+                               const void* __restrict__ up = nullptr) {
+  // EXL3 instances read svh (FP16) through `gate`, unused by their kStore and
+  // kResidual epilogues, so the GGUF instances keep their signature.
   constexpr bool Trellis = TrellisBits > 0;
   constexpr bool Paired = Epilogue == HalfEpilogue::kGateUp;
   constexpr bool Mixed = Paired && Type != UpType;
@@ -343,7 +344,12 @@ __launch_bounds__(WM * WN * 32) __global__
   constexpr int kTrellisK = Trellis ? TrellisBits : 1;
   constexpr int TPW = (BK * RS) / (WM * WN);
   static_assert(!Trellis || ((BK * RS) % (WM * WN) == 0 && !Paired));
-  const exl3::LaneWindow lw = exl3::MakeLaneWindow<kTrellisK>(lane);
+  [[maybe_unused]] const exl3::LaneWindow lw = [&] {
+    if constexpr (Trellis)
+      return exl3::MakeLaneWindow<kTrellisK>(lane);
+    else
+      return exl3::LaneWindow{};
+  }();
   struct TrellisRaw {
     std::uint32_t d0, d1, d2;
   };
@@ -672,7 +678,8 @@ __launch_bounds__(WM * WN * 32) __global__
 #pragma unroll
           for (int j = 0; j < 4; ++j) {
             const float value = (v[j] * exl3::kHadamardScale) *
-                                static_cast<float>(svh[row + j]);
+                                static_cast<float>(
+                                    reinterpret_cast<const _Float16*>(gate)[row + j]);
             if constexpr (Epilogue == HalfEpilogue::kResidual)
               dst[j] = __fadd_rn(dst[j], value);
             else
@@ -1021,7 +1028,8 @@ void DirectGemm(gufo::core::GgmlType type, const void* w, const void* x,
 bool Exl3PrefillSupported(const quant::exl3::DeviceLinear& linear) noexcept {
   return linear.codebook == quant::exl3::Codebook::kMul1 && !linear.rate.half &&
          linear.rate.bits >= 1 && linear.rate.bits <= 6 &&
-         linear.n % 256 == 0 && linear.k % 64 == 0;
+         linear.n > 0 && linear.k > 0 && linear.n % 256 == 0 &&
+         linear.k % 128 == 0;
 }
 
 void LaunchExl3PrefillGemm(const quant::exl3::DeviceLinear& linear,
@@ -1040,8 +1048,8 @@ void LaunchExl3PrefillGemm(const quant::exl3::DeviceLinear& linear,
           <<<dim3((batch + 63) / 64, linear.n / 128), 256, 0, stream>>>(
               linear.trellis, static_cast<const short*>(x), y,
               static_cast<int>(batch), static_cast<int>(linear.n),
-              static_cast<int>(linear.k), nullptr, nullptr,
-              reinterpret_cast<const _Float16*>(linear.svh));
+              static_cast<int>(linear.k),
+              reinterpret_cast<const float*>(linear.svh));
       return;
     }
     HalfPrefillGemmKernel<256, 256, 8, 4, gufo::core::GgmlType::kQ8_0, Epilogue,
@@ -1049,8 +1057,8 @@ void LaunchExl3PrefillGemm(const quant::exl3::DeviceLinear& linear,
         <<<dim3((batch + 255) / 256, linear.n / 256), 1024, 0, stream>>>(
             linear.trellis, static_cast<const short*>(x), y,
             static_cast<int>(batch), static_cast<int>(linear.n),
-            static_cast<int>(linear.k), nullptr, nullptr,
-            reinterpret_cast<const _Float16*>(linear.svh));
+            static_cast<int>(linear.k),
+            reinterpret_cast<const float*>(linear.svh));
   };
   const auto bits = [&]<HalfEpilogue Epilogue>() {
     switch (linear.rate.bits) {

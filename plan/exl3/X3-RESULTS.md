@@ -58,3 +58,23 @@
   - `x3u3`(COMPLETE): prefill 기준을 같은 k·같은 활성화에서 운영 GGUF FP16 WMMA GEMM(Q8_0)이 낸 FP64 대비 오차의 1.25배로 바꿨다.
     - 결과: EXL3 오차가 GGUF 오차와 같은 크기다. 비율은 모두 0.80(= 1/1.25)이다. 예: k = 17408에서 5.45e-5 대 GGUF 5.42e-5, k = 1024에서 3.25e-6 대 3.20e-6.
     - **모든 검사를 통과했다.**
+
+### Codex 검토(9d5c937b/f73b2b3f) 반영 (2026-10-31)
+
+1. **시험 기준:**
+   - prefill 기준을 고정 상한으로 바꿨다. K16 단계마다 FP32 1 ulp의 상대 오차를 쌓은 값, **(k / 16) × 2⁻²³**이다(k = 1024에서 7.6e-6, 17408에서 1.30e-4). 누적기가 단계마다 1 ulp까지 잃는 경우의 상한이다.
+   - GGUF FP16 WMMA 오차는 진단으로만 찍는다. 같은 FP16 회전 입력 행을 쓰고(가중치는 Q8_0, 타일은 GGUF 쪽 선택), 유한성을 검사한다.
+   - `x3u4`에서 EXL3 대 GGUF 비율은 0.998–1.019였다.
+2. **verify dispatch 분리:**
+   - `LaunchExl3Projection`에 `Exl3Pass`를 더했다. WMMA는 `kPrefill`(`prefill_chunk.cpp` `gemm_weight`)일 때만 쓴다.
+   - decode와 verify는 다중 세션의 행 합(최대 64)이라도 GEMV다. 묶음과 MLP는 64행까지 GEMV다.
+   - dispatch 수준 시험(16/17행)을 더했다: 묶음, MLP, 단일 투영이 직접 GEMV launch와 비트 단위로 같다. prefill 투영은 16행에서 GEMV, 17행에서 WMMA이고, 각각 직접 launch와 비트 단위로 같다.
+3. **GGUF 코드 생성:**
+   - EXL3 인스턴스는 svh를 `gate` 인자로 받게 해 GGUF 커널 시그니처를 되돌렸다.
+   - `MakeLaneWindow`는 `if constexpr` 안으로 옮겼다.
+   - `9d5c937b^`와 비교했다: GGUF `HalfPrefillGemmKernel` 인스턴스 **79/79가 자원(VGPR, SGPR, LDS, scratch, occupancy)과 명령문 전체(레이블 정규화)에서 같다.** 타이밍은 마지막 ABBA에서 확인한다.
+4. **지원 조건:** `Exl3PrefillSupported`가 n, k > 0, n % 256, k % 128을 요구한다.
+
+- **단위 창:**
+  - `x3u4`: reference_test 통과, UD-Q4_K_M 지문이 rq2h와 바이트 동일, prefill 여섯 경우가 새 기준을 통과했다. dispatch 시험은 시험 자체의 작업 공간 크기 오류로 중단됐다(q + k + v 묶음에 슬랩 3개가 필요).
+  - `x3u5`: 고친 뒤 kernel test 전체 통과.

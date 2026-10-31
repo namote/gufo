@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <span>
 #include <string>
@@ -23,6 +24,7 @@
 
 #include "src/core/hip/detail/exl3_gemv.hpp"
 #include "src/core/quant/exl3/format.hpp"
+#include "src/models/qwen/hip/exl3_dispatch.hpp"
 #include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
 #include "src/models/qwen/hip/ops/norm_residual.hpp"
 #include "src/models/qwen/hip/ops/prefill_fp16.hpp"
@@ -627,7 +629,7 @@ void TestPackedHash() {
 // (LaunchBatchedQuantGEMMFp16, Q8_0 weights, 256 output rows) on the FP16
 // rounding of rows x k FP32 activations: the reference error of the WMMA FP16
 // GEMM frame both formats share.
-double GgufWmmaError(std::size_t k, const std::vector<float>& x,
+double GgufWmmaError(std::size_t k, const std::vector<std::uint16_t>& xh,
                      std::size_t rows) {
   constexpr std::size_t kRows = 256;
   std::mt19937 rng(static_cast<unsigned>(k * 7 + rows));
@@ -648,9 +650,6 @@ double GgufWmmaError(std::size_t k, const std::vector<float>& x,
         w[r * k + b * 32 + j] = HalfToDouble(HalfFromDouble(v));
       }
     }
-  std::vector<std::uint16_t> xh(rows * k);
-  for (std::size_t i = 0; i < xh.size(); ++i)
-    xh[i] = HalfFromDouble(x[i]);
   auto* d_w = Upload(blocks);
   auto* d_x = Upload(xh);
   float* d_y = nullptr;
@@ -665,6 +664,8 @@ double GgufWmmaError(std::size_t k, const std::vector<float>& x,
       double want = 0.0;
       for (std::size_t i = 0; i < k; ++i)
         want += HalfToDouble(xh[t * k + i]) * w[r * k + i];
+      if (!std::isfinite(y[t * kRows + r]))
+        num = std::numeric_limits<double>::infinity();
       num += (y[t * kRows + r] - want) * (y[t * kRows + r] - want);
       den += want * want;
     }
@@ -676,8 +677,7 @@ double GgufWmmaError(std::size_t k, const std::vector<float>& x,
 
 // X3 prefill (and X3b narrow) trellis WMMA GEMM: the row rotation against the
 // FP32 contract (FP16 bytes), then store and residual GEMMs against FP64 fed
-// that rotated input (relative L2 within 1.25 x the GGUF WMMA GEMM's error on
-// the same k, finite).
+// that rotated input (relative L2 within (k / 16) * 2^-23, finite).
 void TestPrefill(std::size_t k, std::size_t n, int bits, std::size_t rows,
                  std::mt19937& rng) {
   const BitRate rate{bits, false};
@@ -746,21 +746,168 @@ void TestPrefill(std::size_t k, std::size_t n, int bits, std::size_t rows,
                             ": rotated rows differ from the FP32 contract in " +
                             std::to_string(rot_diff) + " values");
   Expect(finite, name + ": non-finite output");
-  // The WMMA FP16 GEMM accumulates less exactly than FP32 FMAs: its error
-  // grows with k (x3u2: about 3.1e-9 * k, also above a K16-step round-toward-
-  // zero emulation). The bar is the production GGUF FP16 prefill GEMM's error
-  // on the same k and activations (GgufWmmaError), x 1.25.
-  const double bar = 1.25 * GgufWmmaError(k, x, rows);
+  // The WMMA FP16 GEMM does not accumulate like FP32 FMAs: its error grows
+  // linearly with k (x3u2: about 3.1e-9 * k, above even a K16-step
+  // round-toward-zero emulation). Fixed bar: one FP32 ulp of relative error
+  // per K16 step, (k / 16) * 2^-23, the bound of an accumulator that loses up
+  // to one ulp per step. The production GGUF FP16 GEMM's error on the same k
+  // and the same FP16 input rows (Q8_0 weights, its own tile) is printed as a
+  // diagnostic only.
+  const double bar = static_cast<double>(k) / 16.0 * std::ldexp(1.0, -23);
+  const double gguf = GgufWmmaError(k, rot_got, rows);
+  Expect(std::isfinite(gguf), name + ": GGUF diagnostic not finite");
   Expect(rel < bar, name + " relative L2 " + std::to_string(rel) + " (bar " +
                         std::to_string(bar) + ")");
   Expect(rel_res < bar,
          name + " residual relative L2 " + std::to_string(rel_res));
   std::cout << name << ": relative L2 " << rel << ", residual " << rel_res
-            << " (GGUF WMMA bar " << bar << "), rotation diffs " << rot_diff
-            << "\n";
+            << " (bar " << bar << ", GGUF WMMA " << gguf << ", ratio "
+            << rel / gguf << "), rotation diffs " << rot_diff << "\n";
   for (void* p : {static_cast<void*>(d_x), static_cast<void*>(d_suh),
                   static_cast<void*>(d_rot), static_cast<void*>(d_t),
                   static_cast<void*>(d_svh), static_cast<void*>(d_y)})
+    Check(hipFree(p));
+}
+
+// Dispatch level (src/models/qwen/hip/exl3_dispatch.hpp) at 16 and 17 rows:
+// decode/verify groups, MLPs and single projections stay on the GEMV at any
+// row count (bit-identical to the direct GEMV launches); a prefill projection
+// switches to the WMMA GEMM at kExl3WmmaMinRows (bit-identical to the direct
+// rotation + WMMA launches).
+void TestDispatch(std::mt19937& rng) {
+  constexpr std::size_t kHidden = 1024, kInter = 2048, kRows = 17;
+  const BitRate rate{5, false};
+  std::vector<void*> owned;
+  auto make = [&](std::size_t k, std::size_t n) {
+    std::vector<std::uint16_t> trellis((k / 16) * (n / 16) * rate.TileWords());
+    for (auto& w : trellis)
+      w = static_cast<std::uint16_t>(rng());
+    auto* t = Upload(trellis);
+    auto* su = Upload(RandomScales(rng, k, 0x3800));
+    auto* sv = Upload(RandomScales(rng, n, 0x2000));
+    owned.insert(owned.end(), {t, su, sv});
+    return DeviceLinear{t,
+                        su,
+                        sv,
+                        static_cast<std::uint32_t>(k),
+                        static_cast<std::uint32_t>(n),
+                        rate,
+                        Codebook::kMul1};
+  };
+  const DeviceLinear q = make(kHidden, 1024), kk = make(kHidden, 256),
+                     v = make(kHidden, 256), gate = make(kHidden, kInter),
+                     up = make(kHidden, kInter), down = make(kInter, kHidden);
+  const auto ref = [](const DeviceLinear& lin) {
+    gufo::models::QwenTensorRef r;
+    r.data = lin.trellis;
+    r.num_elements = static_cast<std::size_t>(lin.k) * lin.n;
+    r.exl3 = &lin;
+    return r;
+  };
+  const auto rq = ref(q), rk = ref(kk), rv = ref(v), rg = ref(gate),
+             ru = ref(up), rd = ref(down);
+  std::normal_distribution<float> normal;
+  std::vector<float> x(kRows * kHidden);
+  for (auto& e : x)
+    e = normal(rng);
+  auto* d_x = Upload(x);
+  gufo::quant::exl3::ReferenceScratch scratch;
+  scratch.rotated_elements = kRows * kInter;
+  scratch.weight_elements = 128 * kInter;
+  Check(hipMalloc(&scratch.rotated, scratch.rotated_elements * 4));
+  Check(hipMalloc(&scratch.weight, scratch.weight_elements * 4));
+  // One 8-row slab per matrix of the widest group (q + k + v).
+  scratch.fast_input_elements = 3 * 8 * kInter;
+  Check(hipMalloc(&scratch.fast_input, scratch.fast_input_elements * 2));
+  scratch.fast_counter_count = 2 * kInter / 128;
+  Check(hipMalloc(&scratch.fast_counters, scratch.fast_counter_count * 4));
+  Check(hipMemset(scratch.fast_counters, 0, scratch.fast_counter_count * 4));
+  scratch.fast_down_input_elements = 8 * kInter;
+  Check(hipMalloc(&scratch.fast_down_input,
+                  scratch.fast_down_input_elements * 2));
+  scratch.fast_prefill_input_elements = kRows * kInter;
+  Check(hipMalloc(&scratch.fast_prefill_input,
+                  scratch.fast_prefill_input_elements * 2));
+  const gufo::hip::Exl3FastWorkspace ws{
+      scratch.fast_input,      scratch.fast_input_elements,
+      scratch.fast_counters,   scratch.fast_counter_count,
+      scratch.fast_down_input, scratch.fast_down_input_elements};
+  std::vector<float*> bufs;
+  auto alloc = [&](std::size_t n) {
+    float* p = nullptr;
+    Check(hipMalloc(&p, n * 4));
+    bufs.push_back(p);
+    return p;
+  };
+  float* a[3] = {alloc(kRows * 1024), alloc(kRows * 256), alloc(kRows * 256)};
+  float* b[3] = {alloc(kRows * 1024), alloc(kRows * 256), alloc(kRows * 256)};
+  float *g = alloc(kRows * kInter), *u = alloc(kRows * kInter),
+        *act = alloc(kRows * kInter), *out_a = alloc(kRows * kHidden),
+        *out_b = alloc(kRows * kHidden);
+  for (std::size_t rows : {16, 17}) {
+    const std::string tag = "dispatch rows=" + std::to_string(rows);
+    // Decode/verify group vs the direct GEMV group.
+    const gufo::hip::Exl3GroupOutput group[] = {
+        {&rq, a[0]}, {&rk, a[1]}, {&rv, a[2]}};
+    gufo::hip::LaunchExl3Projections(group, d_x, rows, &scratch, nullptr);
+    const gufo::hip::Exl3FastTarget direct[] = {
+        {&q, b[0], 1024}, {&kk, b[1], 256}, {&v, b[2], 256}};
+    gufo::hip::LaunchExl3FastProjections(direct, d_x, kHidden, rows, ws,
+                                         nullptr);
+    Check(hipDeviceSynchronize());
+    bool same = true;
+    for (int i = 0; i < 3; ++i) {
+      const std::size_t n = i == 0 ? 1024 : 256;
+      same = same && Download(a[i], rows * n) == Download(b[i], rows * n);
+    }
+    Expect(same, tag + ": decode/verify group left the GEMV");
+    // Decode/verify MLP vs the direct fused GEMV MLP.
+    gufo::hip::LaunchExl3SwiGLUMlp(rg, ru, rd, d_x, rows, g, u, act, out_a,
+                                   &scratch, nullptr);
+    const gufo::hip::Exl3FastMlp mlp{&gate, &up, &down, g, u, out_b, kHidden};
+    gufo::hip::LaunchExl3FastMlp(mlp, d_x, kHidden, rows, ws, nullptr);
+    Check(hipDeviceSynchronize());
+    Expect(Download(out_a, rows * kHidden) == Download(out_b, rows * kHidden),
+           tag + ": decode/verify MLP left the fused GEMV");
+    // Single decode/verify projection vs the direct GEMV.
+    gufo::hip::LaunchExl3Projection(rq, d_x, rows, a[0], &scratch, nullptr);
+    gufo::hip::LaunchExl3FastProjection(q, d_x, kHidden, rows, b[0], 1024, ws,
+                                        nullptr);
+    Check(hipDeviceSynchronize());
+    Expect(Download(a[0], rows * 1024) == Download(b[0], rows * 1024),
+           tag + ": decode/verify projection left the GEMV");
+    // Prefill projection: GEMV below kExl3WmmaMinRows, WMMA from it.
+    gufo::hip::LaunchExl3Projection(rq, d_x, rows, a[0], &scratch, nullptr, 0,
+                                    0, gufo::hip::Exl3Pass::kPrefill);
+    if (rows >= gufo::hip::kExl3WmmaMinRows) {
+      std::uint16_t* rot = nullptr;
+      Check(hipMalloc(&rot, rows * kHidden * 2));
+      gufo::hip::LaunchExl3RotateRows(d_x, kHidden, rows, kHidden, q.suh, rot,
+                                      nullptr);
+      gufo::hip::LaunchExl3PrefillGemm(q, rot, b[0], rows, false, nullptr);
+      Check(hipDeviceSynchronize());
+      Check(hipFree(rot));
+    } else {
+      gufo::hip::LaunchExl3FastProjection(q, d_x, kHidden, rows, b[0], 1024, ws,
+                                          nullptr);
+      Check(hipDeviceSynchronize());
+    }
+    Expect(Download(a[0], rows * 1024) == Download(b[0], rows * 1024),
+           tag + ": prefill projection took the wrong path");
+    std::cout << tag << ": decode/verify on the GEMV, prefill on the "
+              << (rows >= gufo::hip::kExl3WmmaMinRows ? "WMMA" : "GEMV")
+              << " path\n";
+  }
+  for (void* p : owned)
+    Check(hipFree(p));
+  for (float* p : bufs)
+    Check(hipFree(p));
+  for (void* p : {static_cast<void*>(d_x), static_cast<void*>(scratch.rotated),
+                  static_cast<void*>(scratch.weight),
+                  static_cast<void*>(scratch.fast_input),
+                  static_cast<void*>(scratch.fast_counters),
+                  static_cast<void*>(scratch.fast_down_input),
+                  static_cast<void*>(scratch.fast_prefill_input)})
     Check(hipFree(p));
 }
 
@@ -791,6 +938,7 @@ int main() {
   TestPrefill(512, 256, 4, 65, rng);
   TestPrefill(17408, 256, 5, 33, rng);
   TestPrefill(5120, 256, 6, 520, rng);
+  TestDispatch(rng);
   if (failures != 0) {
     std::cerr << failures << " failure(s)\n";
     return 1;
