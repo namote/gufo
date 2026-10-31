@@ -201,3 +201,27 @@ All take `quant::exl3::DeviceLinear` or raw device pointers in checkpoint layout
   - descriptors past the count are ignored
   - K6 entry poisoning
 - **Status:** built; the GPU run waits for the combined pass.
+
+### F3-API: byte-stable plain prefill GEMM (W3, 2026-10-31)
+
+- **API:** `gufo::hip::LaunchPlainPrefillStable(core::GgmlType type, weights, input, output, rows, n, k, stream)`. Header: `src/models/qwen/hip/ops/plain_prefill_stable.hpp`. Kernel: `src/models/qwen/hip/kernels/plain_prefill_stable.hip`.
+  - Weights: F16, BF16 or F32, row-major `[n][k]`. Input and output: FP32, packed `[rows][k]` and `[rows][n]`.
+  - Ragged rows, n and k are masked. Rows are split across launches in chunks of 65535×16.
+- **Arithmetic:** the output is byte-equal to Flash-Next `SmallGemmStable` (f3-integ 03a6afba) for every row count and tile position. It reproduces the same per-output reduction:
+  - Lane class L keeps an fmaf chain from +0, in element order, over elements 4L..4L+3 of every 128-element step. A step starting at or past k runs no FMA (the reference's `break`), which preserves underflowed −0 chains. A partially valid step runs all four FMAs with zeros.
+  - The xor butterfly (16, 8, 4, 2, 1) follows, and lane 0's sum is stored.
+- **Not included:** the fused HC-down SiLU. Apply the existing `SiluScale(…, 0.25F)` kernel after this GEMM; it matches the fused epilogue byte for byte.
+- **Tiling:**
+  - Blocks: 16 tokens × 32 weight rows, 8 waves.
+  - LDS: one 128-element step of the block's inputs and widened weights, double-buffered (48 KiB).
+  - Registers: each lane extends the chains of an 8 tokens × 8 rows tile.
+- **ISA:** no spills, 140 VGPRs, occupancy 4. Per step: 256 `v_fmac_f32` (including dual issue). Reduction: 320 `v_add_f32`. No `v_mul_f32`, so no other contraction. FP32 denorm mode 3, the same as the reference.
+- **Test:** `qwen27b_plain_prefill_stable_test`.
+  - Reference: a verbatim extraction of the pinned SmallGemmStable code (`tests/models/qwen27b/small_gemm_stable_reference.hip`), built with Flash-Next's `-O3 -ffast-math -fno-finite-math-only`.
+  - Shapes: F16 320×10240, BF16 67×2597, F32 40×300 and F16 512×2560, at rows 1/8/9/64/65/2048 with offsets 0 and 1.
+  - Checks: byte equality, finite outputs, no writes past the rows, an FP64 oracle at (k/32 + 5)·2⁻²³ Σ|wx|, and −0 chains.
+  - Status: built; the GPU run waits for the combined pass.
+- **Speed estimate** (unmeasured) at 2048×320×10240, 6.7 G FMA:
+  - The FP32 VALU ceiling is about 7–15 T FMA/s. With LDS reuse the kernel is compute-bound, about 1–2 ms.
+  - SmallGemmStable re-reads the weight row for every 8-token group (about 1.7 GB of weights) and the input slab for every 4-row block (about 6.7 GB). That is cache-bound, about 8–15 ms.
+  - Estimated speedup: about 5–10×. The combined pass measures it.
