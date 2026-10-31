@@ -5,10 +5,12 @@
 #include <algorithm>
 #include <cassert>
 #include <initializer_list>
+#include <map>
 #include <utility>
 
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/weight_upload.hpp"
+#include "src/models/qwen38_flash_next/exl3_weights.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
@@ -49,6 +51,9 @@ struct Uploader {
   std::size_t& max_half_cols;
   std::size_t& max_q8_cols;
   std::string* error;
+  std::deque<std::vector<quant::exl3::DeviceLinear>>& descriptors;
+  std::map<const Exl3HostLinear*, DeviceTensor> linear_cache;
+  std::uint32_t checkpoint_base{0}, mtp_checkpoint_base{0};
   bool ok{true};
   std::uint32_t shard_base{0};
   std::uint64_t requested{0};
@@ -70,11 +75,113 @@ struct Uploader {
     return weights->Allocate(pointer, size);
   }
 
+  DeviceTensor CopyExl3(const TensorRef& t) {
+    const auto found = linear_cache.find(t.exl3.data());
+    if (found != linear_cache.end()) {
+      auto result = found->second;
+      result.rows = static_cast<std::uint32_t>(t.rows);
+      result.output_begin = t.output_begin;
+      return result;
+    }
+    const auto align = [](std::size_t bytes) {
+      return (bytes + 255) / 256 * 256;
+    };
+    std::size_t size = 0;
+    for (const auto& h : t.exl3)
+      size += align(h.view.TrellisBytes()) + align(h.view.k * 2) +
+              align(h.view.n * 2);
+    const auto descriptor_offset = size;
+    size += align(t.exl3.size() * sizeof(quant::exl3::DeviceLinear));
+    void* slab = nullptr;
+    if (Allocate(&slab, size) != hipSuccess) {
+      Fail("EXL3 weight slab allocation failed");
+      return {};
+    }
+    DeviceTensor d;
+    d.cols = static_cast<std::uint32_t>(t.cols);
+    d.rows = static_cast<std::uint32_t>(t.rows);
+    d.experts = static_cast<std::uint32_t>(t.experts);
+    d.output_begin = t.output_begin;
+    if (Measuring()) {
+      linear_cache.emplace(t.exl3.data(), d);
+      return d;
+    }
+    allocations.push_back(slab);
+    bytes += size;
+    descriptors.emplace_back();
+    auto& linears = descriptors.back();
+    linears.reserve(t.exl3.size());
+    std::size_t offset = 0;
+    for (const auto& h : t.exl3) {
+      auto l = h.view;
+      auto* base = static_cast<std::uint8_t*>(slab);
+      const auto copy = [&](std::uint64_t source, std::size_t count,
+                            std::size_t dest) {
+        if (ok && !stager.Copy(checkpoint_base + h.shard, source, count,
+                               base + dest, error))
+          Fail("EXL3 slab upload failed");
+      };
+      l.trellis = reinterpret_cast<const std::uint16_t*>(base + offset);
+      if (h.input_blocks.empty() && h.output_blocks.empty()) {
+        copy(h.trellis_offset, l.TrellisBytes(), offset);
+      } else {
+        const auto tile_bytes =
+            static_cast<std::size_t>(l.rate.TileWords()) * 2;
+        const auto tiles_n = l.n / 16;
+        for (std::uint32_t tk = 0; tk < l.k / 16; ++tk) {
+          const auto dk =
+              h.input_blocks.empty() ? tk : h.input_blocks[tk / 8] * 8 + tk % 8;
+          if (h.output_blocks.empty()) {
+            copy(h.trellis_offset + std::size_t{tk} * tiles_n * tile_bytes,
+                 tiles_n * tile_bytes,
+                 offset + std::size_t{dk} * tiles_n * tile_bytes);
+          } else {
+            for (std::uint32_t bn = 0; bn < l.n / 128; ++bn)
+              copy(h.trellis_offset +
+                       (std::size_t{tk} * tiles_n + bn * 8) * tile_bytes,
+                   8 * tile_bytes,
+                   offset +
+                       (std::size_t{dk} * tiles_n + h.output_blocks[bn] * 8) *
+                           tile_bytes);
+          }
+        }
+      }
+      offset += align(l.TrellisBytes());
+      const auto scales = [&](std::uint64_t source, std::uint32_t width,
+                              const std::vector<std::uint32_t>& blocks) {
+        if (blocks.empty())
+          copy(source, width * 2, offset);
+        else
+          for (std::uint32_t b = 0; b < width / 128; ++b)
+            copy(source + b * 256, 256, offset + blocks[b] * 256);
+        const auto* pointer =
+            reinterpret_cast<const std::uint16_t*>(base + offset);
+        offset += align(width * 2);
+        return pointer;
+      };
+      l.suh = scales(h.suh_offset, l.k, h.input_blocks);
+      l.svh = scales(h.svh_offset, l.n, h.output_blocks);
+      linears.push_back(l);
+    }
+    d.data = const_cast<std::uint16_t*>(linears[0].trellis);
+    d.exl3 = linears.data();
+    d.device_exl3 = reinterpret_cast<const quant::exl3::DeviceLinear*>(
+        static_cast<std::uint8_t*>(slab) + descriptor_offset);
+    if (hipMemcpyAsync(const_cast<quant::exl3::DeviceLinear*>(d.device_exl3),
+                       linears.data(), linears.size() * sizeof(linears[0]),
+                       hipMemcpyHostToDevice, nullptr) != hipSuccess)
+      Fail("EXL3 descriptor upload failed");
+    linear_cache.emplace(t.exl3.data(), d);
+    return d;
+  }
+
   DeviceTensor Copy(const TensorRef& t) {
     DeviceTensor d;
     if (t.empty() || !ok) {
       return d;
     }
+    if (!t.exl3.empty())
+      return CopyExl3(t);
     const std::size_t size = t.SizeBytes();
     void* ptr = nullptr;
     if (Allocate(&ptr, size + kTailMargin) != hipSuccess) {
@@ -87,7 +194,14 @@ struct Uploader {
     }
     allocations.push_back(ptr);
     bytes += size + kTailMargin;
-    if (!stager.Copy(shard_base + t.shard, t.file_offset, size, ptr, error)) {
+    const bool copied =
+        t.memory_owned
+            ? hipMemcpyAsync(ptr, t.data, size, hipMemcpyHostToDevice,
+                             nullptr) == hipSuccess
+            : stager.Copy(
+                  (t.safetensors ? checkpoint_base : shard_base) + t.shard,
+                  t.file_offset, size, ptr, error);
+    if (!copied) {
       Fail("upload failed for " + std::string(t.name) +
            (error != nullptr ? ": " + *error : std::string()));
       return d;
@@ -167,8 +281,9 @@ struct Uploader {
     const core::GgmlType type = (*parts.begin())->type;
     for (const TensorRef* t : parts) {
       if (t->empty() || t->type != type || t->cols != (*parts.begin())->cols ||
-          (type != core::GgmlType::kF32 && type != core::GgmlType::kQ8_0)) {
-        Fail("stacked upload needs F32 or Q8_0 tensors of one shape");
+          (type != core::GgmlType::kF32 && type != core::GgmlType::kQ8_0 &&
+           type != core::GgmlType::kF16)) {
+        Fail("stacked upload needs F32, F16 or Q8_0 tensors of one shape");
         return d;
       }
       rows += t->rows;
@@ -184,15 +299,23 @@ struct Uploader {
       bytes += size + kTailMargin;
       std::size_t offset = 0;
       for (const TensorRef* t : parts) {
-        if (!stager.Copy(shard_base + t->shard, t->file_offset, t->SizeBytes(),
-                         static_cast<std::uint8_t*>(ptr) + offset, error)) {
+        const bool copied =
+            t->memory_owned
+                ? hipMemcpyAsync(static_cast<std::uint8_t*>(ptr) + offset,
+                                 t->data, t->SizeBytes(), hipMemcpyHostToDevice,
+                                 nullptr) == hipSuccess
+                : stager.Copy((t->safetensors ? checkpoint_base : shard_base) +
+                                  t->shard,
+                              t->file_offset, t->SizeBytes(),
+                              static_cast<std::uint8_t*>(ptr) + offset, error);
+        if (!copied) {
           Fail("upload failed for " + std::string(t->name));
           return d;
         }
         offset += t->SizeBytes();
       }
     }
-    if (type == core::GgmlType::kQ8_0) {
+    if (type == core::GgmlType::kQ8_0 || type == core::GgmlType::kF16) {
       if (Measuring()) {
         return d;
       }
@@ -202,7 +325,10 @@ struct Uploader {
       d.type = type;
       d.cols = static_cast<std::uint32_t>((*parts.begin())->cols);
       d.rows = static_cast<std::uint32_t>(rows);
-      max_q8_cols = std::max<std::size_t>(max_q8_cols, d.cols);
+      if (type == core::GgmlType::kQ8_0)
+        max_q8_cols = std::max<std::size_t>(max_q8_cols, d.cols);
+      else
+        max_half_cols = std::max<std::size_t>(max_half_cols, d.cols);
       return d;
     }
     const std::size_t count = size / sizeof(float);
@@ -293,8 +419,13 @@ struct Uploader {
     d.shexp_down = Copy(l.shexp_down);
     d.nextn_enorm = Copy(l.nextn_enorm);
     d.nextn_hnorm = Copy(l.nextn_hnorm);
-    SplitMtpProjection(l.nextn_eh_proj, d.nextn_fc_embedding,
-                       d.nextn_fc_hidden);
+    if (!l.nextn_fc_embedding.empty()) {
+      d.nextn_fc_embedding = Copy(l.nextn_fc_embedding);
+      d.nextn_fc_hidden = Copy(l.nextn_fc_hidden);
+    } else {
+      SplitMtpProjection(l.nextn_eh_proj, d.nextn_fc_embedding,
+                         d.nextn_fc_hidden);
+    }
     d.nextn_head = Mixer(l.nextn_head);
     return d;
   }
@@ -315,6 +446,7 @@ struct Uploader {
     }
     if (mtp != nullptr) {
       shard_base = trunk_shards;
+      checkpoint_base = mtp_checkpoint_base;
       u.mtp = Layer(mtp->block);
     }
     return u;
@@ -337,10 +469,13 @@ bool DeviceModel::SetDraftVocab(std::uint32_t prefix_rows,
       *error_msg = message;
     return false;
   };
-  if (output_.empty() || output_.rows == 0 || output_bytes_ % output_.rows != 0)
+  if (output_.empty() || output_.rows == 0 ||
+      (output_.exl3 == nullptr && output_bytes_ % output_.rows != 0))
     return fail("draft vocabulary needs a row-addressable output head");
   if (prefix_rows == 0 || prefix_rows >= output_.rows)
     return fail("draft vocabulary prefix must leave rows out");
+  if (output_.exl3 != nullptr && prefix_rows % 128 != 0)
+    return fail("EXL3 draft prefix must cover complete Hadamard segments");
   for (const auto id : specials) {
     if (id < static_cast<std::int32_t>(prefix_rows) ||
         static_cast<std::uint32_t>(id) >= output_.rows)
@@ -389,6 +524,16 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     const auto extra = mtp_reader->GetMappedRegions();
     shards.insert(shards.end(), extra.begin(), extra.end());
   }
+  const auto checkpoint_base = static_cast<std::uint32_t>(shards.size());
+  if (w.exl3_storage) {
+    const auto extra = w.exl3_storage->checkpoint->GetMappedRegions();
+    shards.insert(shards.end(), extra.begin(), extra.end());
+  }
+  const auto mtp_checkpoint_base = static_cast<std::uint32_t>(shards.size());
+  if (mtp != nullptr && mtp->exl3_storage) {
+    const auto extra = mtp->exl3_storage->checkpoint->GetMappedRegions();
+    shards.insert(shards.end(), extra.begin(), extra.end());
+  }
   auto stager = hip::WeightUpload::Create(shards, error_msg);
   if (!stager) {
     return nullptr;
@@ -402,8 +547,12 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     std::size_t bytes = 0;
     std::size_t max_half_cols = 1;
     std::size_t max_q8_cols = 32;
-    Uploader measure{*stager, nullptr,       conversions, allocations,
-                     bytes,   max_half_cols, max_q8_cols, error_msg};
+    std::deque<std::vector<quant::exl3::DeviceLinear>> descriptors;
+    Uploader measure{*stager,     nullptr,   conversions,
+                     allocations, bytes,     max_half_cols,
+                     max_q8_cols, error_msg, descriptors};
+    measure.checkpoint_base = checkpoint_base;
+    measure.mtp_checkpoint_base = mtp_checkpoint_base;
     (void)measure.Model(w, mtp, shard_count);
     if (!measure.ok) {
       return nullptr;
@@ -412,8 +561,11 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   }
   const hip::WeightAllocator weights(measured);
   std::vector<Conversion> conversions;
-  Uploader up{*stager,   &weights,          conversions,     m->allocations_,
-              m->bytes_, m->max_half_cols_, m->max_q8_cols_, error_msg};
+  Uploader up{*stager,         &weights,  conversions,
+              m->allocations_, m->bytes_, m->max_half_cols_,
+              m->max_q8_cols_, error_msg, m->exl3_linears_};
+  up.checkpoint_base = checkpoint_base;
+  up.mtp_checkpoint_base = mtp_checkpoint_base;
   Uploaded uploaded = up.Model(w, mtp, shard_count);
   if (!up.ok || !stager->Finish(error_msg)) {
     return nullptr;

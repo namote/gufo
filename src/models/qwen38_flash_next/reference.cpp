@@ -49,6 +49,11 @@ std::vector<float> QuantizedInput(std::span<const float> input) {
 void ReferenceModel::MatVec(const TensorRef& weight, std::uint64_t expert,
                             std::span<const float> x, std::span<float> out,
                             bool narrow_weights) {
+  if (!weight.exl3.empty()) {
+    cpu::MatVec(weight, expert, x, out);
+    return;
+  }
+
   if (storage_ == Storage::kFloat32) {
     cpu::MatVec(weight, expert, x, out);
     return;
@@ -659,16 +664,27 @@ bool ReferenceModel::MtpStep(const MtpWeights& mtp, std::int32_t token,
   // Read the original combined GGUF rows, independently of GPU repacking.
   // Separate double accumulators implement fc_embedding + fc_hidden.
   std::vector<float> res(D), row(2 * H);
-  for (std::uint32_t r = 0; r < H; ++r) {
-    cpu::DequantizeRow(l.nextn_eh_proj, 0, r, row.data());
-    double ep = 0;
-    for (std::uint32_t j = 0; j < H; ++j)
-      ep += static_cast<double>(row[j]) * embedding[j];
-    for (std::uint32_t s = 0; s < c_.hc_count; ++s) {
-      double hp = 0;
+  if (!l.nextn_fc_embedding.empty()) {
+    std::vector<float> ep(H), hp(H);
+    cpu::MatVec(l.nextn_fc_embedding, 0, embedding, ep);
+    for (std::uint32_t stream = 0; stream < c_.hc_count; ++stream) {
+      cpu::MatVec(l.nextn_fc_hidden, 0, std::span(norm).subspan(stream * H, H),
+                  hp);
+      for (std::uint32_t r = 0; r < H; ++r)
+        res[stream * H + r] = ep[r] + hp[r];
+    }
+  } else {
+    for (std::uint32_t r = 0; r < H; ++r) {
+      cpu::DequantizeRow(l.nextn_eh_proj, 0, r, row.data());
+      double ep = 0;
       for (std::uint32_t j = 0; j < H; ++j)
-        hp += static_cast<double>(row[H + j]) * norm[s * H + j];
-      res[s * H + r] = static_cast<float>(ep) + static_cast<float>(hp);
+        ep += static_cast<double>(row[j]) * embedding[j];
+      for (std::uint32_t s = 0; s < c_.hc_count; ++s) {
+        double hp = 0;
+        for (std::uint32_t j = 0; j < H; ++j)
+          hp += static_cast<double>(row[H + j]) * norm[s * H + j];
+        res[s * H + r] = static_cast<float>(ep) + static_cast<float>(hp);
+      }
     }
   }
   if (trace)

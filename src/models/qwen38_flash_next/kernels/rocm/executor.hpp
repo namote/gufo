@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -23,6 +24,7 @@
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
@@ -703,6 +705,12 @@ private:
     float* mtp_scores;
   };
   mutable Scratch s_{};
+  Exl3Scratch exl3_{};
+  bool Exl3Group(std::initializer_list<const DeviceTensor*> weights,
+                 std::initializer_list<float*> outputs, const float* x,
+                 std::uint32_t rows, std::string* error) const;
+  bool Exl3Experts(const DeviceLayer& layer, const float* x, float* out,
+                   std::uint32_t rows, std::string* error) const;
   [[nodiscard]] Scratch RowScratch(const Scratch& base,
                                    std::uint32_t offset) const;
   void UseScratch(const Scratch& scratch) const;

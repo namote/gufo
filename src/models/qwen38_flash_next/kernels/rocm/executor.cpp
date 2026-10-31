@@ -21,6 +21,7 @@
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/core/platform/pages.hpp"
+#include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
@@ -1022,6 +1023,42 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   auto& a = e->allocations_;
   Scratch& s = e->s_;
   auto f32 = [&](std::size_t n) { return Alloc<float>(a, n, error_msg); };
+  if (model.output().exl3 != nullptr) {
+    auto& ex = e->exl3_;
+    auto& projection = ex.projection;
+    const auto width = std::max(
+        {c.hidden_size, c.SsmValueDim(), c.AttentionQDim(), c.expert_ff});
+    projection.rotated_elements = std::max(T, std::size_t{64}) * width;
+    projection.rotated = f32(projection.rotated_elements);
+    projection.weight_elements = std::size_t{128} * width;
+    projection.weight = f32(projection.weight_elements);
+    projection.fast_input_elements = std::size_t{3 * 8} * width;
+    projection.fast_input =
+        Alloc<std::uint16_t>(a, projection.fast_input_elements, error_msg);
+    projection.fast_counter_count =
+        std::max(c.vocab_size / 128, 3 * c.AttentionQDim() / 128);
+    projection.fast_counters =
+        Alloc<std::uint32_t>(a, projection.fast_counter_count, error_msg);
+    projection.fast_down_input_elements =
+        std::size_t{8} * std::max(c.expert_ff, c.shared_expert_ff);
+    projection.fast_down_input =
+        Alloc<std::uint16_t>(a, projection.fast_down_input_elements, error_msg);
+    ex.slice_elements = std::max(T, std::size_t{64}) * (c.indexer_heads + 1) *
+                        c.indexer_head_dim;
+    ex.slice = f32(ex.slice_elements);
+    ex.gather = f32(T * c.hidden_size);
+    ex.gate = f32(T * c.expert_ff);
+    ex.up = f32(T * c.expert_ff);
+    ex.out = f32(T * c.hidden_size);
+    const auto assignments = std::size_t{64} * c.num_experts_used;
+    ex.routed_input =
+        Alloc<std::uint16_t>(a, 2 * assignments * c.hidden_size, error_msg);
+    ex.tiles = Alloc<Exl3RouteTile>(a, assignments, error_msg);
+    ex.tile_count = Alloc<std::uint32_t>(a, 1, error_msg);
+    ex.head_segments =
+        Alloc<std::uint32_t>(a, kMtpDraftExtraRows + 1, error_msg);
+    ex.head_values = f32(c.vocab_size + std::size_t{kMtpDraftExtraRows} * 128);
+  }
   s.tokens = Alloc<std::int32_t>(a, T, error_msg);
   s.x_half = Alloc<std::uint16_t>(a, T * model.max_half_cols(), error_msg);
   for (void*& slot : s.x_q8) {
@@ -1417,11 +1454,13 @@ bool Executor::AppendDraftRows(Session& session, std::uint32_t first,
       return false;
     }
     // The ID goes by value, so no host buffer has to outlive the call.
-    if (!Check(hipMemcpyAsync(session.mtp_.draft_rows + (first + i) * row_bytes,
-                              static_cast<const std::uint8_t*>(output.data) +
-                                  static_cast<std::size_t>(ids[i]) * row_bytes,
-                              row_bytes, hipMemcpyDeviceToDevice, stream_),
-               "draft table row", error_msg) ||
+    if ((output.exl3 == nullptr &&
+         !Check(
+             hipMemcpyAsync(session.mtp_.draft_rows + (first + i) * row_bytes,
+                            static_cast<const std::uint8_t*>(output.data) +
+                                static_cast<std::size_t>(ids[i]) * row_bytes,
+                            row_bytes, hipMemcpyDeviceToDevice, stream_),
+             "draft table row", error_msg)) ||
         !Check(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(
                                      session.mtp_.draft_ids + first + i),
                                  ids[i], 1, stream_),
@@ -1457,6 +1496,11 @@ DeviceTensor Executor::DraftTable(const Session& session) const noexcept {
 bool Executor::DraftLogits(const Session& session, const float* x,
                            float* logits, std::string* error_msg) const {
   const auto& prefix = model_->draft_output();
+  if (model_->output().exl3 != nullptr) {
+    Exl3DraftHead(model_->output(), x, logits, prefix.rows,
+                  session.mtp_.draft_ids, kMtpDraftExtraRows, exl3_, stream_);
+    return true;
+  }
   if (!Dense(prefix, x, logits, 1, error_msg) ||
       !Dense(DraftTable(session), x, logits + prefix.rows, 1, error_msg))
     return false;
@@ -1615,8 +1659,9 @@ bool Executor::Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
   q->data = nullptr;
   q->n = n_tokens;
   q->k = k;
-  if (MatrixRows(n_tokens)) {
-    return true;  // the tiled path quantizes per call
+  if (model_->output().exl3 != nullptr || MatrixRows(n_tokens)) {
+    return true;  // EXL3 consumes the original FP32 rows; wide Q8 stages per
+                  // call
   }
   if (const void* ready = ReadyQ8(x, n_tokens, k)) {
     q->data = ready;
@@ -1728,8 +1773,62 @@ bool Executor::DenseF16Route(const DeviceTensor& w,
          w.cols <= model_->max_half_cols();
 }
 
+bool Executor::Exl3Group(std::initializer_list<const DeviceTensor*> weights,
+                         std::initializer_list<float*> outputs, const float* x,
+                         std::uint32_t rows, std::string* error) const {
+  try {
+    if (weights.size() != outputs.size() || weights.size() > 3)
+      throw std::logic_error("invalid EXL3 projection group");
+    std::array<gufo::hip::Exl3FastTarget, 3> targets{};
+    auto output = outputs.begin();
+    std::size_t count = 0;
+    for (const auto* weight : weights) {
+      if (weight->exl3 == nullptr || weight->output_begin != 0 ||
+          weight->rows != weight->exl3->n)
+        throw std::logic_error("EXL3 group requires complete projections");
+      targets[count++] = {weight->exl3, *output++, weight->rows};
+    }
+    const auto& p = exl3_.projection;
+    const gufo::hip::Exl3FastWorkspace ws{
+        p.fast_input,      p.fast_input_elements,
+        p.fast_counters,   p.fast_counter_count,
+        p.fast_down_input, p.fast_down_input_elements};
+    const std::span<const gufo::hip::Exl3FastTarget> group(targets.data(),
+                                                           count);
+    if (!prefill_phase && rows <= 64 &&
+        gufo::hip::Exl3FastGroupSupported(group, ws)) {
+      gufo::hip::LaunchExl3FastProjections(group, x, (*weights.begin())->cols,
+                                           rows, ws, stream_);
+      return true;
+    }
+    output = outputs.begin();
+    for (const auto* weight : weights)
+      if (!Dense(*weight, x, *output++, rows, error))
+        return false;
+    return true;
+  } catch (const std::exception& e) {
+    AssignError(error, e.what());
+    return false;
+  }
+}
+
 bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
                      std::uint32_t n_tokens, std::string* error_msg) const {
+  if (w.exl3 != nullptr) {
+    try {
+      const auto piece = std::max<std::uint32_t>(1, options_.max_batch);
+      for (std::uint32_t first = 0; first < n_tokens; first += piece) {
+        const auto count = std::min(piece, n_tokens - first);
+        Exl3Projection(w, x + std::size_t{first} * w.cols,
+                       out + std::size_t{first} * w.rows, count, exl3_, stream_,
+                       !prefill_phase);
+      }
+      return true;
+    } catch (const std::exception& error) {
+      AssignError(error_msg, error.what());
+      return false;
+    }
+  }
   if (w.type == GgmlType::kQ8_0) {
     if (!MatrixRows(n_tokens)) {
       Q8Input q;
@@ -2440,6 +2539,10 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
     qkv = s_.qkvz;
     z = s_.qkvz + channels;
     qkv_stride = z_stride = l.ssm_in.rows;
+  } else if (!projections_ready && l.ssm_qkv.exl3 != nullptr) {
+    if (!Exl3Group({&l.ssm_qkv, &l.ssm_gate}, {s_.qkv, s_.z}, x, n_tokens,
+                   error_msg))
+      return false;
   } else if (!projections_ready) {
     Q8Input xq;
     if (!Quantize(x, n_tokens, c.hidden_size, &xq, error_msg) ||
@@ -2564,11 +2667,15 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     }
   } else {
     Q8Input xq;
-    if (!projections_ready &&
-        (!Quantize(x, n_tokens, c.hidden_size, &xq, error_msg) ||
-         !Dense(l.attn_q, xq, s_.qg, error_msg) ||
-         !Dense(l.attn_k, xq, s_.k, error_msg) ||
-         !Dense(l.attn_v, xq, s_.v, error_msg))) {
+    if (!projections_ready && l.attn_q.exl3 != nullptr) {
+      if (!Exl3Group({&l.attn_q, &l.attn_k, &l.attn_v}, {s_.qg, s_.k, s_.v}, x,
+                     n_tokens, error_msg))
+        return false;
+    } else if (!projections_ready &&
+               (!Quantize(x, n_tokens, c.hidden_size, &xq, error_msg) ||
+                !Dense(l.attn_q, xq, s_.qg, error_msg) ||
+                !Dense(l.attn_k, xq, s_.k, error_msg) ||
+                !Dense(l.attn_v, xq, s_.v, error_msg))) {
       return false;
     }
     UnpackQGate(s_.qg, 2 * c.AttentionQDim(), s_.q, s_.attn_gate, nullptr,
@@ -2733,7 +2840,7 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   }
   RouterTopK(s_.router, c.num_experts + 1, s_.ids, s_.weights, n_tokens,
              c.num_experts, used, stream_);
-  if (ExpertMatrixRows(n_tokens)) {
+  if (l.ffn_gate_exps.exl3 == nullptr && ExpertMatrixRows(n_tokens)) {
     ExpertCounts(s_.ids, s_.expert_counts, n_tokens, c.num_experts, used,
                  stream_);
     if (!Check(hipMemcpyAsync(counts_host_, s_.expert_counts,
@@ -2771,6 +2878,21 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   }
   const auto shared_expert = [&] {
     shexp_half_ready_ = false;
+    if (l.shexp_gate.exl3 != nullptr && !prefill_phase && n_tokens <= 64) {
+      const auto& p = exl3_.projection;
+      const gufo::hip::Exl3FastWorkspace ws{
+          p.fast_input,      p.fast_input_elements,
+          p.fast_counters,   p.fast_counter_count,
+          p.fast_down_input, p.fast_down_input_elements};
+      const gufo::hip::Exl3FastMlp mlp{
+          l.shexp_gate.exl3, l.shexp_up.exl3, l.shexp_down.exl3, s_.shexp_gate,
+          s_.shexp_up,       s_.shexp_out,    c.hidden_size};
+      if (gufo::hip::Exl3FastMlpSupported(mlp, ws)) {
+        gufo::hip::LaunchExl3FastMlp(mlp, x, c.hidden_size, n_tokens, ws,
+                                     stream_);
+        return true;
+      }
+    }
     if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
                     &l.shexp_down, error_msg)) {
       return false;
@@ -2855,6 +2977,8 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
   const Config& c = config();
   const std::uint32_t used = c.num_experts_used;
   const std::uint32_t slots = n_tokens * used;
+  if (l.ffn_gate_exps.exl3 != nullptr)
+    return Exl3Experts(l, x, out, n_tokens, error_msg);
   if (!RouteHints(n_tokens, error_msg)) {
     return false;
   }
@@ -2957,6 +3081,58 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
                 c.num_experts + 1, out, n_tokens, used, c.hidden_size, stream_);
   }
   return true;
+}
+
+bool Executor::Exl3Experts(const DeviceLayer& l, const float* x, float* out,
+                           std::uint32_t rows, std::string* error) const {
+  const auto& c = config();
+  try {
+    if (!prefill_phase && rows <= 64) {
+      Exl3RoutedMlp(l, x, s_.ids, s_.gate_e, s_.up_e, s_.down_e, rows,
+                    c.num_experts_used, exl3_, stream_);
+    } else {
+      ExpertCounts(s_.ids, s_.expert_counts, rows, c.num_experts,
+                   c.num_experts_used, stream_);
+      RoutedCompact(s_.ids, s_.expert_counts, s_.routed_bounds,
+                    s_.routed_cursors, s_.rows_token, s_.rows_slot, rows,
+                    c.num_experts_used, c.num_experts, stream_);
+      if (!Check(hipMemcpyAsync(counts_host_, s_.expert_counts,
+                                c.num_experts * sizeof(std::uint32_t),
+                                hipMemcpyDeviceToHost, stream_),
+                 "EXL3 expert counts", error) ||
+          !Check(hipStreamSynchronize(stream_), "EXL3 expert buckets", error))
+        return false;
+      std::size_t base = 0;
+      for (std::uint32_t expert = 0; expert < c.num_experts; ++expert) {
+        const auto count = counts_host_[expert];
+        if (count == 0)
+          continue;
+        Exl3Gather(x, s_.rows_token + base, exl3_.gather, count, c.hidden_size,
+                   stream_);
+        const auto projection = [&](const DeviceTensor& bank,
+                                    const float* input, float* output) {
+          auto weight = bank;
+          weight.exl3 += expert;
+          weight.experts = 1;
+          Exl3Projection(weight, input, output, count, exl3_, stream_, false);
+        };
+        projection(l.ffn_gate_exps, exl3_.gather, exl3_.gate);
+        projection(l.ffn_up_exps, exl3_.gather, exl3_.up);
+        Swiglu(exl3_.gate, exl3_.up, std::size_t{count} * c.expert_ff, stream_);
+        projection(l.ffn_down_exps, exl3_.gate, exl3_.out);
+        Exl3Scatter(exl3_.out, s_.rows_slot + base, s_.down_e, count,
+                    c.hidden_size, stream_);
+        base += (count + 15) / 16 * 16;
+      }
+    }
+    MoeEpilogue(s_.down_e, s_.weights, s_.shexp_out, s_.router + c.num_experts,
+                c.num_experts + 1, out, rows, c.num_experts_used, c.hidden_size,
+                stream_);
+    return true;
+  } catch (const std::exception& e) {
+    AssignError(error, e.what());
+    return false;
+  }
 }
 
 bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
@@ -4594,6 +4770,10 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
   }
   if (!l.attn_qkv.empty()) {
     if (!DenseBatch(l.attn_qkv, s_.mixed, s_.qg, n, error_msg))
+      return false;
+  } else if (l.attn_q.exl3 != nullptr) {
+    if (!Exl3Group({&l.attn_q, &l.attn_k, &l.attn_v}, {s_.qg, s_.k, s_.v},
+                   s_.mixed, n, error_msg))
       return false;
   } else if (!DenseBatch(l.attn_q, s_.mixed, s_.qg, n, error_msg) ||
              !DenseBatch(l.attn_k, s_.mixed, s_.k, n, error_msg) ||
