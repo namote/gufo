@@ -1248,9 +1248,13 @@ void LaunchExl3PrefillBucketInner(const quant::exl3::DeviceLinear* device_bank,
                                GgmlType::kQ8_0, 5, 2>,
          256);
   else
-    args(HalfPrefillGemmKernel<128, 64, 4, 2, GgmlType::kQ8_0, kStore, false,
+    // Four waves (2 x 2), each decoding eight tiles per stage: 15-17 % less
+    // time than eight waves at Flash-Next's 2560 -> 640 and 640 -> 2560
+    // expert shapes (188 vs 218 VGPRs; tools/bench/exl3_x3_tiles_bench.hip),
+    // bit-identical (the same K order per output).
+    args(HalfPrefillGemmKernel<128, 64, 2, 2, GgmlType::kQ8_0, kStore, false,
                                GgmlType::kQ8_0, 5, 2>,
-         256);
+         128);
   HIP_CHECK(hipGetLastError());
 }
 
