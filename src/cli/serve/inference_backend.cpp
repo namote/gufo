@@ -2475,10 +2475,18 @@ public:
   QwenFlashNextTextRunnerState(QwenFlashNextSession& session,
                                cache::Adapter& adapter, cache::Slot& slot)
       : session_(&session), adapter_(&adapter), slot_(&slot) {}
+  /// A state owning its session, for runners without a component cache
+  /// (KVarN K/V): the session pool's slots, invalidated by a session reset.
+  explicit QwenFlashNextTextRunnerState(
+      std::unique_ptr<QwenFlashNextSession> session)
+      : owned_(std::move(session)), session_(owned_.get()) {}
 
   void Invalidate() noexcept override {
     session_->SetCancellationCheck({});
-    (void)adapter_->Invalidate(*slot_);
+    if (adapter_ != nullptr)
+      (void)adapter_->Invalidate(*slot_);
+    else
+      session_->Reset();
     position_ = 0;
   }
   void SetCancellationCheck(const CancellationCheck& check) override {
@@ -2493,6 +2501,8 @@ public:
   [[nodiscard]] QwenFlashNextSession& session() const { return *session_; }
   [[nodiscard]] models::qwen38_flash_next::ContinuationAdapter& adapter()
       const {
+    if (adapter_ == nullptr)
+      throw std::logic_error("Flash-Next state has no continuation adapter");
     return dynamic_cast<models::qwen38_flash_next::ContinuationAdapter&>(
         *adapter_);
   }
@@ -2501,6 +2511,7 @@ public:
   void set_position(std::size_t position) noexcept { position_ = position; }
 
 private:
+  std::unique_ptr<QwenFlashNextSession> owned_;
   QwenFlashNextSession* session_{};
   cache::Adapter* adapter_{};
   cache::Slot* slot_{};
@@ -2731,8 +2742,19 @@ public:
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
-    throw std::logic_error(
-        "Flash-Next execution slots are owned by the component cache");
+    if (UsesComponentCache())
+      throw std::logic_error(
+          "Flash-Next execution slots are owned by the component cache");
+    // KVarN sessions: the plain session pool owns each slot's session.
+    std::string error;
+    auto session =
+        model_->CreateSession(use_mtp_ ? core::SessionMode::kSpeculative
+                                       : core::SessionMode::kAutoregressive,
+                              max_context_, &error);
+    if (!session)
+      throw std::runtime_error("Flash-Next session allocation failed: " +
+                               error);
+    return std::make_unique<QwenFlashNextTextRunnerState>(std::move(session));
   }
 
   void PreparePrefixReuse(

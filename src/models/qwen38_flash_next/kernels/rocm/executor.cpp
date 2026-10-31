@@ -1598,6 +1598,9 @@ bool Executor::FinishKvarn(Session& session, std::string* error_msg) const {
       end > hip::kKvarnSinkTokens && pass.flushed_end < end) {
     FlushKvarnGroups(session, (end >> hip::kKvarnGroupShift) - 1, 1);
     session.kvarn_tail_.flushed_end = end;
+    // The forward already synchronized; a snapshot capture right after it
+    // copies these records on its own stream, so they must be complete.
+    return Check(hipStreamSynchronize(stream_), "KVarN flush", error_msg);
   }
   return Check(hipGetLastError(), "KVarN flush", error_msg);
 }
