@@ -40,6 +40,12 @@ set_source_files_properties(reference_probe.cpp PROPERTIES COMPILE_OPTIONS "-O2"
 if (ENGINE_ENABLE_HIP)
   add_qwen38_flash_next_test(exl3_ops gufo_qwen38_flash_next_reference "hip;gpu;gfx1151;exl3")
   set_source_files_properties(exl3_ops_test.cpp PROPERTIES LANGUAGE HIP)
+  add_test(NAME qwen38_flash_next.exl3_shared_invariance
+    COMMAND qwen38_flash_next_exl3_ops_test --shared-invariance-only)
+  set_tests_properties(qwen38_flash_next.exl3_shared_invariance PROPERTIES
+    LABELS "qwen38_flash_next;hip;gpu;gfx1151;exl3")
+  add_qwen38_flash_next_test(exl3_invariance gufo_qwen38_flash_next "hip;gpu;gfx1151;exl3")
+  set_source_files_properties(exl3_invariance_test.cpp PROPERTIES LANGUAGE HIP)
   foreach(name IN ITEMS mtp_ops blaslt_ops hc_mix_ops gdn_ops
       attention_ops moe_epilogue_ops moe_ids_ops projection_ops routed_wmma_ops
       select_ops snapshot_copy verification_sampling)

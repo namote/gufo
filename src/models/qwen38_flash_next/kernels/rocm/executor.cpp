@@ -1795,10 +1795,19 @@ bool Executor::Exl3Group(std::initializer_list<const DeviceTensor*> weights,
         p.fast_down_input, p.fast_down_input_elements};
     const std::span<const gufo::hip::Exl3FastTarget> group(targets.data(),
                                                            count);
-    if (!prefill_phase && rows <= 64 &&
-        gufo::hip::Exl3FastGroupSupported(group, ws)) {
-      gufo::hip::LaunchExl3FastProjections(group, x, (*weights.begin())->cols,
-                                           rows, ws, stream_);
+    if (!prefill_phase && gufo::hip::Exl3FastGroupSupported(group, ws)) {
+      for (std::uint32_t first = 0; first < rows;
+           first += gufo::hip::kExl3FastMaxRows) {
+        auto pass = targets;
+        for (std::size_t i = 0; i < count; ++i)
+          pass[i].y += std::size_t{first} * pass[i].y_stride;
+        const auto n =
+            std::min<std::uint32_t>(gufo::hip::kExl3FastMaxRows, rows - first);
+        gufo::hip::LaunchExl3FastProjections(
+            std::span(pass.data(), count),
+            x + std::size_t{first} * (*weights.begin())->cols,
+            (*weights.begin())->cols, n, ws, stream_);
+      }
       return true;
     }
     output = outputs.begin();
@@ -1814,7 +1823,9 @@ bool Executor::Exl3Group(std::initializer_list<const DeviceTensor*> weights,
 
 bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
                      std::uint32_t n_tokens, std::string* error_msg) const {
-  if (w.exl3 != nullptr) {
+  // The EXL3 pack retains plain HC/router/GDN operands. Their FP32 input
+  // precision and reduction must not change with phase or cohort width.
+  if (w.exl3 != nullptr || model_->output().exl3 != nullptr) {
     try {
       const auto piece = std::max<std::uint32_t>(1, options_.max_batch);
       for (std::uint32_t first = 0; first < n_tokens; first += piece) {
@@ -2878,21 +2889,10 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   }
   const auto shared_expert = [&] {
     shexp_half_ready_ = false;
-    if (l.shexp_gate.exl3 != nullptr && !prefill_phase && n_tokens <= 64) {
-      const auto& p = exl3_.projection;
-      const gufo::hip::Exl3FastWorkspace ws{
-          p.fast_input,      p.fast_input_elements,
-          p.fast_counters,   p.fast_counter_count,
-          p.fast_down_input, p.fast_down_input_elements};
-      const gufo::hip::Exl3FastMlp mlp{
-          l.shexp_gate.exl3, l.shexp_up.exl3, l.shexp_down.exl3, s_.shexp_gate,
-          s_.shexp_up,       s_.shexp_out,    c.hidden_size};
-      if (gufo::hip::Exl3FastMlpSupported(mlp, ws)) {
-        gufo::hip::LaunchExl3FastMlp(mlp, x, c.hidden_size, n_tokens, ws,
-                                     stream_);
-        return true;
-      }
-    }
+    if (l.shexp_gate.exl3 != nullptr && !prefill_phase &&
+        Exl3SharedMlp(l, x, s_.shexp_gate, s_.shexp_up, s_.shexp_out, n_tokens,
+                      exl3_, stream_))
+      return true;
     if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
                     &l.shexp_down, error_msg)) {
       return false;
@@ -3087,9 +3087,15 @@ bool Executor::Exl3Experts(const DeviceLayer& l, const float* x, float* out,
                            std::uint32_t rows, std::string* error) const {
   const auto& c = config();
   try {
-    if (!prefill_phase && rows <= 64) {
-      Exl3RoutedMlp(l, x, s_.ids, s_.gate_e, s_.up_e, s_.down_e, rows,
-                    c.num_experts_used, exl3_, stream_);
+    if (!prefill_phase) {
+      for (std::uint32_t first = 0; first < rows; first += 64) {
+        const auto count = std::min(64U, rows - first);
+        const auto assignment = std::size_t{first} * c.num_experts_used;
+        Exl3RoutedMlp(l, x + std::size_t{first} * c.hidden_size,
+                      s_.ids + assignment, s_.gate_e, s_.up_e,
+                      s_.down_e + assignment * c.hidden_size, count,
+                      c.num_experts_used, exl3_, stream_);
+      }
     } else {
       ExpertCounts(s_.ids, s_.expert_counts, rows, c.num_experts,
                    c.num_experts_used, stream_);

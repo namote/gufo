@@ -28,6 +28,7 @@ struct Exl3Scratch {
   float* head_values{nullptr};
 };
 
+/// Compressed projections, or the pack's plain operands with fixed FP32 math.
 void Exl3Projection(const DeviceTensor& weight, const float* x, float* out,
                     std::uint32_t rows, const Exl3Scratch& scratch,
                     hipStream_t stream, bool fast = true);
@@ -46,6 +47,12 @@ struct Exl3RoutedTrace {
   float* down_inner{nullptr};             ///< [rows * used][hidden]
   float* down_packed_inner{nullptr};      ///< Same input, original packed dot.
 };
+
+/// Shared expert's decode/verify contract, common to serial and cohort calls.
+/// Returns false without launches when the fused fast MLP cannot apply.
+bool Exl3SharedMlp(const DeviceLayer& layer, const float* x, float* gate,
+                   float* up, float* out, std::uint32_t rows,
+                   const Exl3Scratch& scratch, hipStream_t stream);
 
 /// Groups actual assignments by expert into 1..8-row tiles on device. Every
 /// slot keeps its own rotation and output; the caller performs ordered MoE sum.

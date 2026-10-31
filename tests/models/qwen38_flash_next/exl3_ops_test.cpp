@@ -15,6 +15,7 @@
 #include "src/core/hip/detail/exl3_gemv.hpp"
 #include "src/models/qwen38_flash_next/exl3_weights.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
 namespace q = gufo::models::qwen38_flash_next;
 namespace gpu = q::rocm;
@@ -305,8 +306,7 @@ void Projection(unsigned k, unsigned n, int bits,
   auto* y = buffers.Make<float>(65 * n + 16);
   auto scratch = Scratch(buffers, 65, std::max(k, n), n);
   for (unsigned rows : sizes) {
-    BeginCase(Shape(rows <= 64 ? "projection fast" : "projection reference", k,
-                    n, bits, rows));
+    BeginCase(Shape("projection fast", k, n, bits, rows));
     Check(hipMemset(y, 0x7F, (65 * n + 16) * sizeof(float)));
     gpu::Exl3Projection(weight.weight, dx, y, rows, scratch, nullptr);
     std::vector<float> actual(rows * n), expected, legacy;
@@ -314,9 +314,9 @@ void Projection(unsigned k, unsigned n, int bits,
     Check(hipMemcpy(actual.data(), y, actual.size() * sizeof(float),
                     hipMemcpyDeviceToHost));
     for (unsigned r = 0; r < rows; ++r) {
-      const auto input = weight.RotatedInput(0, x.data() + r * k, rows <= 64);
+      const auto input = weight.RotatedInput(0, x.data() + r * k, true);
       const auto old_input =
-          weight.LegacyRotatedInput(0, x.data() + r * k, rows <= 64);
+          weight.LegacyRotatedInput(0, x.data() + r * k, true);
       for (unsigned i = 0; i < k; ++i)
         legacy_changes += input[i] != old_input[i];
       const auto reference = weight.ProjectRotated(0, input);
@@ -572,6 +572,89 @@ void Routed(bool shared, unsigned rows, unsigned k = 128, unsigned ff = 128,
   }
 }
 
+void CompressedPrefillChunks() {
+  constexpr unsigned k = 256, n = 640, rows = 136;
+  BeginCase(Shape("compressed prefill chunks", k, n, 7, rows));
+  Buffers buffers;
+  Bank weight(buffers, k, n, 7);
+  const auto x = Input(rows * k);
+  const auto* dx = buffers.Copy(x);
+  auto* y = buffers.Make<float>(rows * n);
+  auto scratch = Scratch(buffers, rows, std::max(k, n), n);
+  bool fast = false;
+  const auto project = [&](unsigned first, unsigned count) {
+    gpu::Exl3Projection(weight.weight, dx + first * k, y + first * n, count,
+                        scratch, nullptr, fast);
+  };
+  const auto download = [&] {
+    std::vector<float> result(rows * n);
+    Check(hipMemcpy(result.data(), y, result.size() * sizeof(float),
+                    hipMemcpyDeviceToHost));
+    return result;
+  };
+  for (bool mode : {false, true}) {
+    fast = mode;
+    project(0, rows);
+    const auto bulk = download();
+    for (unsigned boundary : {94U, 103U, 104U, 127U, 128U, 135U}) {
+      project(0, boundary);
+      project(boundary, rows - boundary);
+      const auto split = download();
+      Require(std::memcmp(bulk.data(), split.data(), bulk.size() * 4) == 0,
+              std::string(fast ? "fast catch-up" : "reference prefill") +
+                  " differs at boundary " + std::to_string(boundary));
+    }
+  }
+}
+
+void SharedMlpInvariance() {
+  constexpr unsigned k = 2560, ff = 640, rows = 65;
+  BeginCase(Shape("shared MLP scalar/cohort", k, ff, 7, rows));
+  Buffers buffers;
+  Bank gate(buffers, k, ff, 7, 1, 4), up(buffers, k, ff, 7, 1, 5),
+      down(buffers, ff, k, 7, 1, 6);
+  gpu::DeviceLayer layer;
+  layer.shexp_gate = gate.weight;
+  layer.shexp_up = up.weight;
+  layer.shexp_down = down.weight;
+  auto x = Input(rows * k);
+  for (auto& value : x)
+    value *= 32.0F;
+  const auto* dx = buffers.Copy(x);
+  auto* g = buffers.Make<float>(rows * ff);
+  auto* u = buffers.Make<float>(rows * ff);
+  auto* y = buffers.Make<float>(rows * k);
+  auto scratch = Scratch(buffers, rows, k, k);
+  const auto download = [&] {
+    std::vector<float> result(rows * k);
+    Check(hipMemcpy(result.data(), y, result.size() * sizeof(float),
+                    hipMemcpyDeviceToHost));
+    return result;
+  };
+  for (unsigned r = 0; r < rows; ++r)
+    Require(gpu::Exl3SharedMlp(layer, dx + r * k, g, u, y + r * k, 1, scratch,
+                               nullptr),
+            "serial shared MLP was not dispatched");
+  const auto serial = download();
+  // Reproduce the former MoeBatch path as a diagnostic: its native __expf
+  // activation differs from the serial fused MLP's expf/division contract.
+  gpu::Exl3Projection(gate.weight, dx, g, rows, scratch, nullptr);
+  gpu::Exl3Projection(up.weight, dx, u, rows, scratch, nullptr);
+  gpu::Swiglu(g, u, std::size_t{rows} * ff, nullptr);
+  gpu::Exl3Projection(down.weight, g, y, rows, scratch, nullptr);
+  std::cout << "CONTROL " << current_case << " : former_unfused_vs_serial_L2="
+            << RelativeL2(download(), serial) << '\n';
+  for (unsigned count : {2U, 4U, 6U, 8U, 9U, 18U, 29U, rows}) {
+    Require(gpu::Exl3SharedMlp(layer, dx, g, u, y, count, scratch, nullptr),
+            "cohort shared MLP was not dispatched");
+    const auto actual = download();
+    Require(
+        std::memcmp(actual.data(), serial.data(),
+                    std::size_t{count} * k * sizeof(float)) == 0,
+        "shared MLP scalar/cohort bits differ rows=" + std::to_string(count));
+  }
+}
+
 void SelectedHead() {
   BeginCase(Shape("selected head prefix=128 extras=8", 256, 640, 6, 1));
   Buffers buffers;
@@ -604,9 +687,19 @@ void SelectedHead() {
 }
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   std::cout << std::unitbuf;
   try {
+    if (argc == 2) {
+      Require(std::string_view(argv[1]) == "--shared-invariance-only",
+              "unknown operator test argument");
+      SharedMlpInvariance();
+      CompressedPrefillChunks();
+      return 0;
+    }
+    Require(argc == 1, "unexpected operator test arguments");
+    SharedMlpInvariance();
+    CompressedPrefillChunks();
     InputRoundingControl();
     DecodeK7();
     for (int bits : {5, 6, 7})
