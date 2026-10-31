@@ -2115,7 +2115,8 @@ bool Executor::Exl3DensePrefill(
 
 bool Executor::Exl3Group(std::initializer_list<const DeviceTensor*> weights,
                          std::initializer_list<float*> outputs, const float* x,
-                         std::uint32_t rows, std::string* error) const {
+                         std::uint32_t rows, std::string* error,
+                         std::size_t shape_basis_n) const {
   if (prefill_phase)
     return Exl3DensePrefill(weights, outputs, x, rows, error);
   try {
@@ -2148,7 +2149,7 @@ bool Executor::Exl3Group(std::initializer_list<const DeviceTensor*> weights,
         gufo::hip::LaunchExl3FastProjections(
             std::span(pass.data(), count),
             x + std::size_t{first} * (*weights.begin())->cols,
-            (*weights.begin())->cols, n, ws, stream_);
+            (*weights.begin())->cols, n, ws, stream_, false, shape_basis_n);
       }
       return true;
     }
@@ -2167,10 +2168,12 @@ bool Executor::MtpKvProjection(const DeviceLayer& l, const float* x,
                                std::uint32_t rows,
                                std::string* error_msg) const {
   if (l.attn_qkv.empty() && model_->output().exl3 != nullptr) {
-    // TODO(W3): omit Q with the full-QKV W/TN geometry override. Selecting
-    // geometry from K/V alone changes their K reduction and persistent KV.
-    return Exl3Group({&l.attn_q, &l.attn_k, &l.attn_v}, {s_.qg, s_.k, s_.v}, x,
-                     rows, error_msg);
+    // Omit Q while retaining the full group's W/TN launch geometry and
+    // therefore exactly the K/V reduction used by full MTP execution.
+    const auto basis =
+        std::size_t{l.attn_q.rows} + l.attn_k.rows + l.attn_v.rows;
+    return Exl3Group({&l.attn_k, &l.attn_v}, {s_.k, s_.v}, x, rows, error_msg,
+                     basis);
   }
   if (l.attn_qkv.empty())
     return Exl3Group({&l.attn_k, &l.attn_v}, {s_.k, s_.v}, x, rows, error_msg);

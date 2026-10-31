@@ -1913,7 +1913,8 @@ void MtpKvGroup() {
     Check(hipMemset(k_only, 0x7F, (rows * kv_width + 8) * sizeof(float)));
     Check(hipMemset(v_only, 0x7F, (rows * kv_width + 8) * sizeof(float)));
     fast::LaunchExl3FastProjections(full, x, k, rows, ws, nullptr);
-    fast::LaunchExl3FastProjections(kv, x, k, rows, ws, nullptr);
+    fast::LaunchExl3FastProjections(kv, x, k, rows, ws, nullptr, false,
+                                    std::size_t{q_width} + 2 * kv_width);
     for (const auto& [bank, a, b] : {std::tuple{&key, k_full, k_only},
                                      std::tuple{&value, v_full, v_only}}) {
       std::vector<float> expected(rows * kv_width), actual(expected.size());

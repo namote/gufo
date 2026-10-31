@@ -864,7 +864,8 @@ private:
   [[nodiscard]] Exl3PrefillScratch Exl3PrefillView() const;
   bool Exl3Group(std::initializer_list<const DeviceTensor*> weights,
                  std::initializer_list<float*> outputs, const float* x,
-                 std::uint32_t rows, std::string* error) const;
+                 std::uint32_t rows, std::string* error,
+                 std::size_t shape_basis_n = 0) const;
   bool Exl3Experts(const DeviceLayer& layer, const float* x, float* out,
                    std::uint32_t rows, std::string* error) const;
   [[nodiscard]] Scratch RowScratch(const Scratch& base,
