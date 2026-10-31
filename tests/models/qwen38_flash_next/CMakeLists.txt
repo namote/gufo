@@ -48,6 +48,15 @@ if (ENGINE_ENABLE_HIP)
       select_ops snapshot_copy verification_sampling kvarn_ops)
     add_qwen38_flash_next_test(${name} gufo_qwen38_flash_next "hip;gpu;gfx1151")
   endforeach()
+  add_test(NAME qwen38_flash_next.mtp_kv
+    COMMAND qwen38_flash_next_attention_ops_test --mtp-kv)
+  add_test(NAME qwen38_flash_next.mtp_kv_group
+    COMMAND qwen38_flash_next_exl3_ops_test --mtp-kv-group)
+  add_test(NAME qwen38_flash_next.hc_down_f16
+    COMMAND qwen38_flash_next_projection_ops_test --hc-down-f16)
+  set_tests_properties(qwen38_flash_next.mtp_kv qwen38_flash_next.mtp_kv_group
+    qwen38_flash_next.hc_down_f16
+    PROPERTIES LABELS "qwen38_flash_next;hip;gpu;gfx1151;exl3")
   # The rope phase and RMS checks compare against the scalar CPU oracle.
   target_link_libraries(qwen38_flash_next_attention_ops_test PRIVATE
     gufo_qwen38_flash_next_reference)

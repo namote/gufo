@@ -1574,6 +1574,12 @@ bool Executor::DraftLogits(const Session& session, const float* x,
   if (model_->output().exl3 != nullptr) {
     Exl3DraftHead(model_->output(), x, logits, prefix.rows,
                   session.mtp_.draft_ids, kMtpDraftExtraRows, exl3_, stream_);
+    if (diagnostics_active_) {
+      cycle_diagnostics_.head_segments += (prefix.rows + 127) / 128;
+      if (!DiagnosticCount(exl3_.head_segments,
+                           &cycle_diagnostics_.head_segments, error_msg))
+        return false;
+    }
     return true;
   }
   if (!Dense(prefix, x, logits, 1, error_msg) ||
@@ -1951,6 +1957,42 @@ bool Executor::Exl3Group(std::initializer_list<const DeviceTensor*> weights,
     AssignError(error, e.what());
     return false;
   }
+}
+
+bool Executor::MtpKvProjection(const DeviceLayer& l, const float* x,
+                               std::uint32_t rows,
+                               std::string* error_msg) const {
+  if (l.attn_qkv.empty())
+    return Exl3Group({&l.attn_k, &l.attn_v}, {s_.k, s_.v}, x, rows, error_msg);
+  auto kv = l.attn_qkv;
+  const TensorRef layout{.type = kv.type, .cols = kv.cols};
+  kv.data = static_cast<std::uint8_t*>(kv.data) +
+            std::size_t{2} * config().AttentionQDim() * layout.RowBytes();
+  kv.rows = 2 * config().AttentionKvDim();
+  return DenseBatch(kv, x, s_.qg, rows, error_msg);
+}
+
+bool Executor::StoreMtpKv(const DeviceLayer& l, const Session& session,
+                          std::uint32_t rows, const YarnRope& yarn,
+                          std::string* error_msg) const {
+  const auto& c = config();
+  if (l.attn_qkv.empty()) {
+    PrepareAttentionKv(
+        s_.k, s_.v, l.attn_k_norm.f32(), session.mtp_.k_cache,
+        session.mtp_.v_cache, rows, c.num_kv_heads, c.head_dim, c.rotary_dim,
+        &session.control_->mtp_position, c.rope_theta, c.rms_eps, stream_,
+        session.vision_input_.rope(), yarn, session.mtp_.kv_blocks);
+    return true;
+  }
+  if (PrepareAttention(
+          s_.qg, 2 * c.AttentionKvDim(), nullptr, l.attn_k_norm.f32(), nullptr,
+          nullptr, session.mtp_.k_cache, session.mtp_.v_cache, rows, 0,
+          c.num_kv_heads, c.head_dim, c.rotary_dim,
+          &session.control_->mtp_position, c.rope_theta, c.rms_eps, stream_,
+          session.vision_input_.rope(), false, yarn, session.mtp_.kv_blocks))
+    return true;
+  AssignError(error_msg, "MTP cache projection failed");
+  return false;
 }
 
 bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
@@ -2332,6 +2374,11 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       c.hidden_size == 2560 && c.hc_low_rank == 320 &&
       m.up.type == GgmlType::kQ8_0 && m.up.rows == c.HcDim() &&
       m.up.cols == c.hc_low_rank;
+  const bool fused_down =
+      model_->output().exl3 != nullptr && !xn_half_ && !MatrixRows(n_tokens) &&
+      m.down.type == GgmlType::kF16 && m.up.type == GgmlType::kF16 &&
+      m.down.rows == 320 && m.down.cols == 10240 && c.hc_count == 4 &&
+      c.hc_low_rank == 320;
   if (fused_projection) {
     // The up projection writes x_half; keep its input in the gate buffer.
     if (!HcDownF16Gemm(m.down.data, s_.xn_q8t,
@@ -2347,6 +2394,8 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
         AssignError(error_msg, "W8A8 mixer down projection failed");
         return false;
       }
+    } else if (fused_down) {
+      HcDownSiluF16(m.down.data, s_.xn, s_.lo, n_tokens, stream_);
     } else if (!Dense(m.down, s_.xn, s_.lo, n_tokens, error_msg)) {
       return false;
     }
@@ -2362,8 +2411,9 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
         return false;
       }
     } else {
-      SiluScale(s_.lo, scale,
-                static_cast<std::size_t>(n_tokens) * c.hc_low_rank, stream_);
+      if (!fused_down)
+        SiluScale(s_.lo, scale,
+                  static_cast<std::size_t>(n_tokens) * c.hc_low_rank, stream_);
       if (!Dense(m.up, s_.lo, s_.hc_gate, n_tokens, error_msg)) {
         return false;
       }
@@ -3408,7 +3458,13 @@ bool Executor::Exl3Experts(const DeviceLayer& l, const float* x, float* out,
     if (!prefill_phase && rows <= 64) {
       Exl3RoutedMlp(l, x, s_.ids, s_.gate_e, s_.up_e, s_.down_e, rows,
                     c.num_experts_used, exl3_, stream_);
+      if (diagnostics_active_ &&
+          !DiagnosticCount(exl3_.tile_count,
+                           &cycle_diagnostics_.expert_tile_reads, error))
+        return false;
     } else {
+      if (diagnostics_active_)
+        cycle_diagnostics_.expert_tile_reads_complete = false;
       ExpertCounts(s_.ids, s_.expert_counts, rows, c.num_experts,
                    c.num_experts_used, stream_);
       RoutedCompact(s_.ids, s_.expert_counts, s_.routed_bounds,
@@ -3470,12 +3526,113 @@ bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
          Check(hipStreamSynchronize(stream_), "trunk hidden", error_msg);
 }
 
+std::uint32_t Executor::PrefillChunkRows(
+    std::uint32_t requested, std::uint32_t until_checkpoint) const noexcept {
+  auto limit = options_.max_batch;
+  if (model_->output().exl3 != nullptr && options_.exl3_prefill_chunk_rows != 0)
+    limit = std::min(limit, options_.exl3_prefill_chunk_rows);
+  return std::min({requested, until_checkpoint, limit});
+}
+
+bool Executor::BeginMtpCycleDiagnostics(std::string* error_msg) const {
+  if (diagnostics_active_ || model_->output().exl3 == nullptr) {
+    AssignError(error_msg, "MTP cycle diagnostics require idle EXL3 executor");
+    return false;
+  }
+  if (!Check(hipStreamSynchronize(stream_), "diagnostic cycle start",
+             error_msg))
+    return false;
+  cycle_diagnostics_ = {};
+  diagnostic_depth_ = 0;
+  diagnostic_phase_ = nullptr;
+  diagnostic_started_ = std::chrono::steady_clock::now();
+  diagnostics_active_ = true;
+  return true;
+}
+
+bool Executor::EndMtpCycleDiagnostics(std::uint64_t committed_tokens,
+                                      std::uint64_t drafts,
+                                      MtpCycleDiagnostics* output,
+                                      std::string* error_msg) const {
+  if (!diagnostics_active_ || diagnostic_depth_ != 0 || output == nullptr) {
+    AssignError(error_msg, "invalid MTP diagnostic cycle end");
+    return false;
+  }
+  // Always release the diagnostic scope, including a failed GPU cycle.
+  diagnostics_active_ = false;
+  if (!Check(hipStreamSynchronize(stream_), "diagnostic cycle end", error_msg))
+    return false;
+  cycle_diagnostics_.committed_tokens = committed_tokens;
+  cycle_diagnostics_.drafts = drafts;
+  cycle_diagnostics_.wall_ms =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - diagnostic_started_)
+          .count();
+  *output = cycle_diagnostics_;
+  return true;
+}
+
+Executor::DiagnosticPhase::DiagnosticPhase(const Executor& e, DiagnosticStage s)
+    : executor(e), stage(s), active(e.diagnostics_active_) {
+  if (active) {
+    ++executor.diagnostic_depth_;
+    parent = executor.diagnostic_phase_;
+    executor.diagnostic_phase_ = this;
+    started = std::chrono::steady_clock::now();
+  }
+}
+
+Executor::DiagnosticPhase::~DiagnosticPhase() {
+  if (!active)
+    return;
+  --executor.diagnostic_depth_;
+  executor.diagnostic_phase_ = parent;
+  const auto elapsed = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - started)
+                           .count();
+  if (parent != nullptr)
+    parent->children_ms += elapsed;
+  const auto ms = elapsed - children_ms;
+  auto& d = executor.cycle_diagnostics_;
+  switch (stage) {
+    case DiagnosticStage::kTarget:
+      d.target_ms += ms;
+      break;
+    case DiagnosticStage::kDraft:
+      d.draft_ms += ms;
+      break;
+    case DiagnosticStage::kHead:
+      d.head_ms += ms;
+      break;
+    case DiagnosticStage::kCatchUp:
+      d.catch_up_ms += ms;
+      break;
+  }
+}
+
+bool Executor::DiagnosticCount(const std::uint32_t* device,
+                               std::uint64_t* total,
+                               std::string* error_msg) const {
+  std::uint32_t count = 0;
+  if (!Check(hipMemcpyAsync(&count, device, sizeof(count),
+                            hipMemcpyDeviceToHost, stream_),
+             "diagnostic count", error_msg) ||
+      !Check(hipStreamSynchronize(stream_), "diagnostic count ready",
+             error_msg))
+    return false;
+  *total += count;
+  return true;
+}
+
 bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
                        bool candidates, const Session* draft,
                        std::string* error_msg) const {
   const std::uint32_t prefix = model_->draft_output().rows;
   const std::uint32_t rows =
       draft != nullptr ? prefix + kMtpDraftExtraRows : model_->output().rows;
+  if (diagnostics_active_ && draft == nullptr &&
+      model_->output().exl3 != nullptr)
+    cycle_diagnostics_.head_segments += (rows + 127) / 128;
   if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg) ||
       !(draft != nullptr
             ? DraftLogits(*draft, s_.mixed, s_.logits, error_msg)
@@ -3518,6 +3675,9 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
 bool Executor::Run(Session& session, std::uint64_t key, bool graph,
                    const std::function<bool()>& body, std::string* error_msg,
                    bool synchronize) const {
+  // Host counters must observe each executed operation. Captured/replayed
+  // bodies would either duplicate or omit them, as with MtpTrace copies.
+  graph = graph && !diagnostics_active_;
   // A batch shape runs eagerly once before it is captured: the first pass
   // grows the GEMM tier's arena, which capture forbids.
   if (graph && session.warmed_.contains(key)) {
@@ -3591,6 +3751,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
                        std::uint32_t n_logits, float* logits, ForwardMode mode,
                        std::string* error_msg, PrefillCheckpoint* checkpoint,
                        std::span<const std::int32_t> next) const {
+  DiagnosticPhase diagnostic(*this, DiagnosticStage::kTarget);
   // Only this call's PLE layer may start the prefetch of `next`.
   struct NextHint {
     std::span<const std::int32_t>& hint;
@@ -3708,7 +3869,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   // Decode-sized batches replay as graphs; a pooling backlog (the first
   // batch past the budget) needs the wider eager grid.
   const std::uint32_t graph_pool_grid = n / std::max(c.compress_ratio, 1u) + 1;
-  const bool graph = !prefill_phase && n <= kVecBatch &&
+  const bool graph = !diagnostics_active_ && !prefill_phase && n <= kVecBatch &&
                      pool_grid <= graph_pool_grid &&
                      session.position_ >= session.VisionLayout().PrefixLength();
   const std::uint64_t key = static_cast<std::uint64_t>(n) |
@@ -3750,6 +3911,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   }
 
   session.position_ += n;
+  if (diagnostics_active_ && speculative)
+    cycle_diagnostics_.verify_rows += n;
   if (sparse) {
     session.blocks_ = complete;
   }
@@ -4951,6 +5114,8 @@ bool Executor::MtpForward(Session& session,
                           std::int32_t hidden_row, MtpOutput output,
                           std::string* error_msg,
                           const float* hidden_source) const {
+  DiagnosticPhase diagnostic(*this, hidden_row >= 0 ? DiagnosticStage::kCatchUp
+                                                    : DiagnosticStage::kDraft);
   DropReadyQ8();
   const auto n = static_cast<std::uint32_t>(tokens.size());
   if (session.owner_ != this ||
@@ -5010,8 +5175,9 @@ bool Executor::MtpForward(Session& session,
   const auto complete = (pos + n) / c.compress_ratio;
   const auto pool = sparse ? complete - session.mtp_.blocks : 0;
   const auto graph_pool = n / c.compress_ratio + 1;
-  const bool graph = output.trace == nullptr && hidden_source == nullptr &&
-                     n <= kVecBatch && pool <= graph_pool &&
+  const bool graph = !diagnostics_active_ && output.trace == nullptr &&
+                     hidden_source == nullptr && n <= kVecBatch &&
+                     pool <= graph_pool &&
                      pos + 1 >= session.VisionLayout().PrefixLength();
   // Captured graphs bake in the head; key on the one this draft reads.
   const bool subset = UseDraftSubset(session, output.draft_subset) &&
@@ -5040,6 +5206,8 @@ bool Executor::MtpForward(Session& session,
     *output.candidates = *mtp_candidates_host_;
   }
   session.mtp_.position = pos + n;
+  if (diagnostics_active_ && hidden_row >= 0)
+    cycle_diagnostics_.catch_up_rows += n;
   session.mtp_.residual_valid = !output.kv_only;
   if (sparse)
     session.mtp_.blocks = complete;
@@ -5132,27 +5300,18 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
       control_host_->hidden_row >= 0 && n > 2 && n <= kVecBatch
           ? n - 2
           : (last_only && n >= 224 ? (n - 96) / 128 * 128 : 0U);
-  const bool cache_only = kv_only && !l.attn_qkv.empty();
+  const bool cache_only =
+      kv_only && (!l.attn_qkv.empty() ||
+                  (l.attn_k.exl3 != nullptr && l.attn_v.exl3 != nullptr));
   if (!HcMixBatch(l.hc_attn, s_.mtp_res, false, s_.mixed,
                   cache_only ? nullptr : s_.inject, n, error_msg)) {
     return false;
   }
   if (cache_only) {
     // Known trunk rows replace the predictor residual on the next forward.
-    // Only K/V and pooled indexer keys survive this catch-up. Slice the
-    // packed Q/gate/K/V weight without copying or changing its arithmetic.
-    auto kv = l.attn_qkv;
-    const TensorRef layout{.type = kv.type, .cols = kv.cols};
-    kv.data = static_cast<std::uint8_t*>(kv.data) +
-              std::size_t{2} * c.AttentionQDim() * layout.RowBytes();
-    kv.rows = 2 * c.AttentionKvDim();
-    if (!DenseBatch(kv, s_.mixed, s_.qg, n, error_msg) ||
-        !PrepareAttention(
-            s_.qg, kv.rows, nullptr, l.attn_k_norm.f32(), nullptr, nullptr,
-            attn.k_cache, attn.v_cache, n, 0, c.num_kv_heads, c.head_dim,
-            c.rotary_dim, &session.control_->mtp_position, c.rope_theta,
-            c.rms_eps, stream_, attn.rope, false, yarn_, attn.kv_blocks)) {
-      AssignError(error_msg, "MTP cache projection failed");
+    // Only K/V and pooled indexer keys survive this catch-up.
+    if (!MtpKvProjection(l, s_.mixed, n, error_msg) ||
+        !StoreMtpKv(l, session, n, yarn_, error_msg)) {
       return false;
     }
     const auto capacity =

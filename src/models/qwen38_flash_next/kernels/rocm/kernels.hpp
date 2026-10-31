@@ -380,6 +380,11 @@ bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
                         const std::int32_t* rows_out, __half* out,
                         std::size_t m, std::size_t k, hipStream_t stream);
 
+/// Exact F16 320 x 10240 HC down projection followed by SiLU(x / 4).
+/// Uses SmallGemm's original row specialization and F32 boundary.
+void HcDownSiluF16(const void* w, const float* x, float* out,
+                   std::uint32_t n_tokens, hipStream_t stream);
+
 /// F32/BF16/F16 projection in groups of up to eight token rows. Each token
 /// keeps the same accumulation order at every batch width.
 void SmallGemm(const void* w, WeightType type, const float* x, float* out,
@@ -508,6 +513,19 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
                       const qwen::vision::DeviceRope* rope = nullptr,
                       bool prefill = false, const YarnRope& yarn = {},
                       const std::uint32_t* kv_blocks = nullptr);
+
+/// Separate K/V catch-up, with exactly the unfused attention path's F32
+/// normalization and RoPE boundaries. K is normalized/rotated in place;
+/// V is read-only. No query, gate or attention output is computed.
+void PrepareAttentionKv(float* k, const float* v, const float* k_gamma,
+                        __half* k_cache, __half* v_cache,
+                        std::uint32_t n_tokens, std::uint32_t kv_heads,
+                        std::uint32_t d, std::uint32_t rotary_dim,
+                        const std::uint32_t* start_pos, float theta, float eps,
+                        hipStream_t stream,
+                        const qwen::vision::DeviceRope* rope = nullptr,
+                        const YarnRope& yarn = {},
+                        const std::uint32_t* kv_blocks = nullptr);
 
 /// NEOX partial rotary on x [t][heads][d] at positions start_pos + t.
 /// Positions are read from device memory (`start_pos` points at the

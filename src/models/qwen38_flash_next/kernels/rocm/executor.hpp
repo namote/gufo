@@ -5,6 +5,7 @@
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -291,6 +292,10 @@ public:
     /// Trunk attention K/V as KVarN k4v4 records with token-major values
     /// (plan/exl3/F1-KVARN-DESIGN.md); the MTP layer stays FP16.
     bool kvarn{false};
+    /// Diagnostic chunk-policy hook for EXL3. Zero preserves the caller's
+    /// existing policy; a nonzero limit is bounded by max_batch. The caller
+    /// still supplies checkpoint/cancellation boundaries to PrefillChunkRows.
+    std::uint32_t exl3_prefill_chunk_rows{0};
   };
 
   ~Executor();
@@ -502,8 +507,53 @@ public:
   /// Whether trunk K/V are KVarN k4v4 (Options::kvarn).
   [[nodiscard]] bool kvarn() const noexcept { return options_.kvarn; }
 
+  [[nodiscard]] std::uint32_t PrefillChunkRows(
+      std::uint32_t requested, std::uint32_t until_checkpoint) const noexcept;
+
+  /// Opt-in operator/profiling diagnostics, following MtpTrace's eager path.
+  /// No production caller enables this implicitly. Counts cover the whole
+  /// executor/cohort; the engine supplies actual committed/proposed tokens
+  /// after acceptance, stops and cancellation, including copied proposals.
+  struct MtpCycleDiagnostics {
+    std::uint64_t committed_tokens{0}, drafts{0}, verify_rows{0};
+    /// One routed MLP tile (all three projections), summed over layers.
+    std::uint64_t expert_tile_reads{0};
+    /// False if a reference/bucket-prefill route ran without eight-row tiles.
+    bool expert_tile_reads_complete{true};
+    /// 128-column draft-head segments actually projected, including prefix.
+    std::uint64_t head_segments{0}, catch_up_rows{0};
+    /// Exclusive call wall times. draft_ms/catch_up_ms include inline heads;
+    /// head_ms covers standalone MtpHeads. Diagnostic count downloads and
+    /// synchronization are included; use an uninstrumented run for speed.
+    double target_ms{0}, draft_ms{0}, head_ms{0}, catch_up_ms{0}, wall_ms{0};
+  };
+  [[nodiscard]] bool BeginMtpCycleDiagnostics(std::string* error_msg) const;
+  [[nodiscard]] bool EndMtpCycleDiagnostics(std::uint64_t committed_tokens,
+                                            std::uint64_t drafts,
+                                            MtpCycleDiagnostics* output,
+                                            std::string* error_msg) const;
+
 private:
   Executor() = default;
+
+  enum class DiagnosticStage { kTarget, kDraft, kHead, kCatchUp };
+  struct DiagnosticPhase {
+    const Executor& executor;
+    DiagnosticStage stage;
+    std::chrono::steady_clock::time_point started{};
+    DiagnosticPhase* parent{nullptr};
+    double children_ms{0};
+    bool active{false};
+    DiagnosticPhase(const Executor& e, DiagnosticStage s);
+    ~DiagnosticPhase();
+  };
+  mutable bool diagnostics_active_{false};
+  mutable std::uint32_t diagnostic_depth_{0};
+  mutable DiagnosticPhase* diagnostic_phase_{nullptr};
+  mutable std::chrono::steady_clock::time_point diagnostic_started_{};
+  mutable MtpCycleDiagnostics cycle_diagnostics_{};
+  bool DiagnosticCount(const std::uint32_t* device, std::uint64_t* total,
+                       std::string* error_msg) const;
 
   /// Visits every device region of a snapshot in payload order with
   /// (device pointer or null when sizing, payload offset, bytes, name).
@@ -532,6 +582,13 @@ private:
              std::string* error_msg) const;
   bool Dense(const DeviceTensor& w, const float* x, float* out,
              std::uint32_t n_tokens, std::string* error_msg) const;
+  /// Cache-only MTP uses the packed GGUF slice or the separate EXL3 K/V
+  /// group. Separate outputs retain the full attention path's arithmetic.
+  bool MtpKvProjection(const DeviceLayer& layer, const float* x,
+                       std::uint32_t rows, std::string* error_msg) const;
+  bool StoreMtpKv(const DeviceLayer& layer, const Session& session,
+                  std::uint32_t rows, const YarnRope& yarn,
+                  std::string* error_msg) const;
   /// out = (up . x) * silu(gate . x); s_.shexp_gate is scratch.
   /// With `down` (the projection that consumes the result), a wide batch
   /// leaves only that projection's staged input form (F16 rows in

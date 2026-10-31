@@ -1,6 +1,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -10,9 +11,11 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "src/core/hip/detail/exl3_gemv.hpp"
+#include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
 #include "src/models/qwen38_flash_next/exl3_weights.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hpp"
 
@@ -602,11 +605,73 @@ void SelectedHead() {
   Check(hipMemcpy(&count, s.head_segments, 4, hipMemcpyDeviceToHost));
   Require(count == 3, "selected head did not deduplicate Hadamard segments");
 }
+
+void MtpKvGroup() {
+  namespace fast = gufo::hip;
+  constexpr unsigned k = 256, q_width = 1024, kv_width = 512;
+  Buffers buffers;
+  Bank q(buffers, k, q_width, 7, 1, 17);
+  Bank key(buffers, k, kv_width, 7, 1, 71);
+  Bank value(buffers, k, kv_width, 7, 1, 137);
+  auto scratch = Scratch(buffers, 64, k, q_width);
+  const auto& p = scratch.projection;
+  const fast::Exl3FastWorkspace ws{
+      p.fast_input,         p.fast_input_elements, p.fast_counters,
+      p.fast_counter_count, p.fast_down_input,     p.fast_down_input_elements};
+  for (const unsigned rows : {1U, 2U, 3U, 7U, 8U, 9U, 32U, 33U, 64U}) {
+    BeginCase("MTP K7 QKV vs KV group rows=" + std::to_string(rows));
+    const auto input = Input(rows * k);
+    auto* x = buffers.Copy(input);  // ends at the last row's allocation
+    auto* query = buffers.Make<float>(rows * q_width);
+    auto* k_full = buffers.Make<float>(rows * kv_width);
+    auto* v_full = buffers.Make<float>(rows * kv_width);
+    auto* k_only = buffers.Make<float>(rows * kv_width + 8);
+    auto* v_only = buffers.Make<float>(rows * kv_width + 8);
+    const std::array<fast::Exl3FastTarget, 3> full{
+        {{q.weight.exl3, query, q_width},
+         {key.weight.exl3, k_full, kv_width},
+         {value.weight.exl3, v_full, kv_width}}};
+    const std::array<fast::Exl3FastTarget, 2> kv{
+        {{key.weight.exl3, k_only, kv_width},
+         {value.weight.exl3, v_only, kv_width}}};
+    Require(fast::Exl3FastGroupSupported(full, ws) &&
+                fast::Exl3FastGroupSupported(kv, ws),
+            "K7 full and K/V groups supported");
+    Check(hipMemset(k_only, 0x7F, (rows * kv_width + 8) * sizeof(float)));
+    Check(hipMemset(v_only, 0x7F, (rows * kv_width + 8) * sizeof(float)));
+    fast::LaunchExl3FastProjections(full, x, k, rows, ws, nullptr);
+    fast::LaunchExl3FastProjections(kv, x, k, rows, ws, nullptr);
+    for (const auto& [bank, a, b] : {std::tuple{&key, k_full, k_only},
+                                     std::tuple{&value, v_full, v_only}}) {
+      std::vector<float> expected(rows * kv_width), actual(expected.size());
+      Check(hipMemcpy(expected.data(), a, expected.size() * sizeof(float),
+                      hipMemcpyDeviceToHost));
+      Check(hipMemcpy(actual.data(), b, actual.size() * sizeof(float),
+                      hipMemcpyDeviceToHost));
+      Require(std::memcmp(expected.data(), actual.data(),
+                          actual.size() * sizeof(float)) == 0,
+              "removing Q preserves every K/V projection bit");
+      for (const unsigned row : {0U, rows - 1})
+        Near(std::span(actual).subspan(row * kv_width, kv_width),
+             bank->Reference(0, input.data() + row * k, true), 1e-5,
+             "K/V group vs independent FP64 projection");
+      std::uint32_t guard;
+      Check(hipMemcpy(&guard, b + rows * kv_width, sizeof(guard),
+                      hipMemcpyDeviceToHost));
+      Require(guard == 0x7F7F7F7FU, "K/V group preserves output guard");
+    }
+  }
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   std::cout << std::unitbuf;
   try {
+    if (argc == 2 && std::string(argv[1]) == "--mtp-kv-group") {
+      MtpKvGroup();
+      return 0;
+    }
     InputRoundingControl();
     DecodeK7();
     for (int bits : {5, 6, 7})

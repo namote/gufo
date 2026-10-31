@@ -1025,10 +1025,97 @@ void CheckMtpOutputHead(float input_scale) {
     CheckHip(hipFree(p), "MTP free");
 }
 
+void CheckHcDownSilu() {
+  constexpr unsigned m = 320, k = 10240;
+  std::uint32_t seed = 0xF316320U;
+  std::vector<__half> weights(std::size_t{m} * k);
+  for (auto& value : weights)
+    value = __float2half(Uniform(&seed, 0.125F));
+  void* dw = nullptr;
+  CheckHip(hipMalloc(&dw, weights.size() * sizeof(__half)), "HC F16 weights");
+  CheckHip(hipMemcpy(dw, weights.data(), weights.size() * sizeof(__half),
+                     hipMemcpyHostToDevice),
+           "HC F16 upload");
+  for (const unsigned rows :
+       {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U, 16U, 31U, 32U, 33U}) {
+    std::vector<float> input(std::size_t{rows} * k);
+    const std::size_t count = std::size_t{rows} * m;
+    float *dx = nullptr, *reference = nullptr, *fused = nullptr;
+    CheckHip(hipMalloc(&dx, input.size() * sizeof(float)), "HC input");
+    CheckHip(hipMalloc(&reference, count * sizeof(float)), "HC reference");
+    CheckHip(hipMalloc(&fused, (count + 8) * sizeof(float)), "HC fused");
+    hipStream_t stream = nullptr;
+    hipGraph_t graph = nullptr;
+    hipGraphExec_t replay = nullptr;
+    CheckHip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+             "HC stream");
+    CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal),
+             "HC capture");
+    q::HcDownSiluF16(dw, dx, fused, rows, stream);
+    CheckHip(hipStreamEndCapture(stream, &graph), "HC capture end");
+    CheckHip(hipGraphInstantiate(&replay, graph, nullptr, nullptr, 0),
+             "HC instantiate");
+    for (const float scale : {1.7F, 0.0001F}) {
+      for (auto& value : input)
+        value = Uniform(&seed, scale);
+      CheckHip(hipMemcpy(dx, input.data(), input.size() * sizeof(float),
+                         hipMemcpyHostToDevice),
+               "HC input upload");
+      q::SmallGemm(dw, q::WeightType::kF16, dx, reference, rows, m, k, nullptr);
+      q::SiluScale(reference, 0.25F, count, nullptr);
+      CheckHip(hipDeviceSynchronize(), "HC reference ready");
+      CheckHip(hipMemset(fused, 0xA5, (count + 8) * sizeof(float)), "HC guard");
+      CheckHip(hipGraphLaunch(replay, stream), "HC replay");
+      CheckHip(hipStreamSynchronize(stream), "HC ready");
+      std::vector<float> expected(count), actual(count + 8);
+      CheckHip(hipMemcpy(expected.data(), reference, count * sizeof(float),
+                         hipMemcpyDeviceToHost),
+               "HC reference download");
+      CheckHip(hipMemcpy(actual.data(), fused, actual.size() * sizeof(float),
+                         hipMemcpyDeviceToHost),
+               "HC fused download");
+      if (std::memcmp(expected.data(), actual.data(), count * sizeof(float)))
+        throw std::runtime_error(
+            "HC F16 fusion changes projection/SiLU bits: " +
+            std::to_string(rows));
+      for (std::size_t i = count; i < actual.size(); ++i)
+        if (std::bit_cast<std::uint32_t>(actual[i]) != 0xA5A5A5A5U)
+          throw std::runtime_error("HC F16 fusion overwrote guard");
+      // Independent F64 dot/SiLU check on both ends of each row. Small
+      // activations prevent saturated SiLU from concealing producer drift.
+      for (unsigned token = 0; token < rows; ++token)
+        for (const unsigned out : {0U, m - 1}) {
+          double dot = 0;
+          for (unsigned col = 0; col < k; ++col)
+            dot += double(__half2float(weights[std::size_t{out} * k + col])) *
+                   input[std::size_t{token} * k + col];
+          const double x = dot * 0.25;
+          const double oracle = x / (1.0 + std::exp(-x));
+          if (!std::isfinite(actual[token * m + out]) ||
+              std::abs(actual[token * m + out] - oracle) >
+                  2e-5 * (scale + std::abs(oracle)))
+            throw std::runtime_error("HC F16 fusion differs from F64 oracle");
+        }
+    }
+    CheckHip(hipGraphExecDestroy(replay), "HC replay free");
+    CheckHip(hipGraphDestroy(graph), "HC graph free");
+    CheckHip(hipStreamDestroy(stream), "HC stream free");
+    for (auto* pointer : {dx, reference, fused})
+      CheckHip(hipFree(pointer), "HC buffer free");
+  }
+  CheckHip(hipFree(dw), "HC weights free");
+  std::cout
+      << "HC F16 down/SiLU exact at widths 1..9/16/31/32/33, graph replay\n";
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::string(argv[1]) == "--hc-down-f16") {
+      CheckHcDownSilu();
+      return 0;
+    }
     CheckHip(q::PrepareW8A8GemmWave64(), "prepare wide Q8 projection");
     if (qfn_mmq_init(0) != 0)
       throw std::runtime_error("prepare quantized decode projections");
