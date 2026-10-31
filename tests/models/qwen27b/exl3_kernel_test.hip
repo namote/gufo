@@ -623,9 +623,61 @@ void TestPackedHash() {
   Check(hipFree(d));
 }
 
+// Relative L2 error against FP64 of the production GGUF FP16 prefill GEMM
+// (LaunchBatchedQuantGEMMFp16, Q8_0 weights, 256 output rows) on the FP16
+// rounding of rows x k FP32 activations: the reference error of the WMMA FP16
+// GEMM frame both formats share.
+double GgufWmmaError(std::size_t k, const std::vector<float>& x,
+                     std::size_t rows) {
+  constexpr std::size_t kRows = 256;
+  std::mt19937 rng(static_cast<unsigned>(k * 7 + rows));
+  std::vector<std::uint8_t> blocks(kRows * (k / 32) * 34);
+  std::vector<double> w(kRows * k);
+  for (std::size_t r = 0; r < kRows; ++r)
+    for (std::size_t b = 0; b < k / 32; ++b) {
+      std::uint8_t* block = &blocks[(r * (k / 32) + b) * 34];
+      const std::uint16_t d = HalfFromDouble(
+          0.002 + 0.001 * static_cast<double>(rng() % 1000) / 1000.0);
+      std::memcpy(block, &d, 2);
+      for (int j = 0; j < 32; ++j) {
+        const auto q = static_cast<std::int8_t>(rng());
+        block[2 + j] = static_cast<std::uint8_t>(q);
+        // The kernel's FP16 weight: FP32 product, rounded to FP16 once.
+        const float v =
+            static_cast<float>(HalfToDouble(d)) * static_cast<float>(q);
+        w[r * k + b * 32 + j] = HalfToDouble(HalfFromDouble(v));
+      }
+    }
+  std::vector<std::uint16_t> xh(rows * k);
+  for (std::size_t i = 0; i < xh.size(); ++i)
+    xh[i] = HalfFromDouble(x[i]);
+  auto* d_w = Upload(blocks);
+  auto* d_x = Upload(xh);
+  float* d_y = nullptr;
+  Check(hipMalloc(&d_y, rows * kRows * 4));
+  gufo::hip::LaunchBatchedQuantGEMMFp16(gufo::core::GgmlType::kQ8_0, d_w, d_x,
+                                        d_y, rows, kRows, k, nullptr);
+  Check(hipDeviceSynchronize());
+  const auto y = Download(d_y, rows * kRows);
+  double num = 0.0, den = 0.0;
+  for (std::size_t t = 0; t < rows; ++t)
+    for (std::size_t r = 0; r < kRows; ++r) {
+      double want = 0.0;
+      for (std::size_t i = 0; i < k; ++i)
+        want += HalfToDouble(xh[t * k + i]) * w[r * k + i];
+      num += (y[t * kRows + r] - want) * (y[t * kRows + r] - want);
+      den += want * want;
+    }
+  for (void* p : {static_cast<void*>(d_w), static_cast<void*>(d_x),
+                  static_cast<void*>(d_y)})
+    Check(hipFree(p));
+  return std::sqrt(num / den);
+}
+
 // X3 prefill (and X3b narrow) trellis WMMA GEMM: the row rotation against the
 // FP32 contract (FP16 bytes), then store and residual GEMMs against FP64 fed
-// that rotated input (relative L2 < 1e-5, finite).
+// that rotated input (relative L2 within 1.25 x the GGUF WMMA GEMM's error on
+// the same k, finite).
 void TestPrefill(std::size_t k, std::size_t n, int bits, std::size_t rows,
                  std::mt19937& rng) {
   const BitRate rate{bits, false};
@@ -694,11 +746,18 @@ void TestPrefill(std::size_t k, std::size_t n, int bits, std::size_t rows,
                             ": rotated rows differ from the FP32 contract in " +
                             std::to_string(rot_diff) + " values");
   Expect(finite, name + ": non-finite output");
-  Expect(rel < 1e-5, name + " relative L2 " + std::to_string(rel));
-  Expect(rel_res < 1e-5,
+  // The WMMA FP16 GEMM accumulates less exactly than FP32 FMAs: its error
+  // grows with k (x3u2: about 3.1e-9 * k, also above a K16-step round-toward-
+  // zero emulation). The bar is the production GGUF FP16 prefill GEMM's error
+  // on the same k and activations (GgufWmmaError), x 1.25.
+  const double bar = 1.25 * GgufWmmaError(k, x, rows);
+  Expect(rel < bar, name + " relative L2 " + std::to_string(rel) + " (bar " +
+                        std::to_string(bar) + ")");
+  Expect(rel_res < bar,
          name + " residual relative L2 " + std::to_string(rel_res));
   std::cout << name << ": relative L2 " << rel << ", residual " << rel_res
-            << ", rotation diffs " << rot_diff << "\n";
+            << " (GGUF WMMA bar " << bar << "), rotation diffs " << rot_diff
+            << "\n";
   for (void* p : {static_cast<void*>(d_x), static_cast<void*>(d_suh),
                   static_cast<void*>(d_rot), static_cast<void*>(d_t),
                   static_cast<void*>(d_svh), static_cast<void*>(d_y)})

@@ -32,3 +32,29 @@
     - 65,536상태 전수 디코드 대 `DecodeState`
   - 빌드: 바이너리 sha256 `45552647e4177477df4cbdf068c177913e517e2622265562a417e4f2a60a91b1`, 소스 sha256 `f18d6d9692aece387055aaecb9c0fbe91ec8936449ff69509ad1b074e2c02c23`. scratch와 spill은 0이다. VGPR은 FP16 대조 155, trellis 138–151이다.
 - **창 계획:** `PLAN-X3B1.json`(check, time 10, peak, idle). F1 단위 창 뒤에 돈다.
+
+## 운영 구현 (사용자 2026-10-31: 먼저 다 만들고 끝에 한 번에 비교한다)
+
+- bench 창 X3B1과 bench 다듬기는 멈췄다. 검토 반영 항목은 위 기록으로만 남긴다.
+- **커밋 `9d5c937b`:**
+  - `prefill_fp16.hip` `HalfPrefillGemmKernel`에 템플릿 인자 `TrellisBits`를 더했다. trellis 생산자(pk 해시, `HashMul1Packed`)와 svh 출력 회전 epilogue(죽은 s_a 재사용, store/residual)다. GGUF 인스턴스는 버려지는 `if constexpr` 가지만 늘었다. 지문은 같다(아래).
+  - `LaunchExl3PrefillGemm`: prefill은 256 채널 × 256 토큰 타일이고, 64행 이하(X3b)는 128 채널 × 64 토큰 타일이다.
+  - `LaunchExl3RotateRows`: 행 우선 FP16 입력 회전(X2b 산술)이다.
+  - arena에 `fast_prefill_input`(max batch × 가장 넓은 입력, 142.6 MB)을 두었다. EXL3 모델일 때만 잡는다.
+  - dispatch:
+    - 17행 이상: WMMA GEMM
+    - 16행 이하: X2b GEMV
+    - 나머지: 기준 경로
+    - 경계 17은 잠정값이다. 마지막 창에서 9–64행을 비교한다.
+    - 묶음과 MLP 호출은 17행 이상이면 투영마다 WMMA로 간다.
+- **단위 창(짧은 GPU 창, 사용자 허락):**
+  - `x3u1`(FAILED):
+    - 커널 시험의 prefill 두 경우가 FP64 1e-5 기준을 넘었다: k = 17408에서 5.4e-5, k = 5120에서 1.6e-5.
+    - 나머지는 통과했다: 디코드 경로 전부, pk 해시 65,536상태, 행 회전 FP16 바이트 동일, k ≤ 1024 prefill 3.2e-6.
+    - `exl3_reference_test`가 통과했고, **UD-Q4_K_M 지문 27줄이 rq2h와 바이트 단위로 같다.**
+  - `x3u2`(진단): GPU의 회전 전 합을 K16 단계 에뮬레이션과 비교했다.
+    - 최근접 반올림 에뮬레이션과는 FP64와 같은 차이가 났다. 0 방향 내림 에뮬레이션과는 그 절반이었다.
+    - **오차는 WMMA FP16 누적의 성질이다.** k에 비례해 대략 3.1e-9 × k다. 디코드 오류가 아니다(행 회전은 바이트 동일이고, k ≤ 256에서는 1e-5 안).
+  - `x3u3`(COMPLETE): prefill 기준을 같은 k·같은 활성화에서 운영 GGUF FP16 WMMA GEMM(Q8_0)이 낸 FP64 대비 오차의 1.25배로 바꿨다.
+    - 결과: EXL3 오차가 GGUF 오차와 같은 크기다. 비율은 모두 0.80(= 1/1.25)이다. 예: k = 17408에서 5.45e-5 대 GGUF 5.42e-5, k = 1024에서 3.25e-6 대 3.20e-6.
+    - **모든 검사를 통과했다.**
