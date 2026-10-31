@@ -636,6 +636,13 @@ __launch_bounds__(WM * WN * 32) __global__
       }
 #pragma unroll
       for (int j = 0; j < WTS; ++j) {
+        // Expert buckets: 16-token subtiles wholly past the bucket's rows
+        // hold only padding; skip their WMMAs (wave-uniform; no live
+        // output's reduction changes).
+        if constexpr (Batching == 2) {
+          if (t_block + (wt * WTS + j) * 16 >= batch)
+            continue;
+        }
         const v16bf b =
             LoadSwizzled(&s_b[ks][(wt * WTS) + j][sl ^ (ks & 3)][0]);
 #pragma unroll
