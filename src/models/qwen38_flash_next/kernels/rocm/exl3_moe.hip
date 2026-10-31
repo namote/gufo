@@ -110,7 +110,8 @@ __device__ __forceinline__ float DotPairF32(Half2 w, Half2 x, float acc) {
 
 // One wave owns one output tile and up to eight actual rows of one expert.
 // No floating-point atomics or masked reads from absent assignment rows.
-template<bool FullPrecision, unsigned MaxRows = 8, bool Scaled = false>
+template<int Bits, bool FullPrecision, unsigned MaxRows = 8,
+         bool Scaled = false>
 __global__ void RoutedGemv(const ex::DeviceLinear* gate,
                            const ex::DeviceLinear* up,
                            const Exl3RouteTile* tiles, const unsigned* count,
@@ -127,14 +128,14 @@ __global__ void RoutedGemv(const ex::DeviceLinear* gate,
   const unsigned r0 = (lane % 4) * 2;
   const unsigned nt = blockIdx.x;
   float a[MaxRows]{}, b[MaxRows]{};
-  const auto lw = arithmetic::MakeLaneWindow<5>(lane);
+  const auto lw = arithmetic::MakeLaneWindow<Bits>(lane);
   const auto* trellis = reinterpret_cast<const std::uint32_t*>(l.trellis);
   const auto* x = reinterpret_cast<const _Float16*>(input) +
                   std::size_t{projection} * assignments * k;
   for (unsigned kt = 0; kt < k / 16; ++kt) {
     Half2 w[4];
-    arithmetic::DecodeLaneMul1<5>(
-        trellis + (std::size_t{kt} * (n / 16) + nt) * 40, lw, w);
+    arithmetic::DecodeLaneMul1<Bits>(
+        trellis + (std::size_t{kt} * (n / 16) + nt) * (8 * Bits), lw, w);
     for (unsigned r = 0; r < MaxRows; ++r) {
       if (r >= tile_rows.count)
         break;
@@ -441,6 +442,7 @@ __global__ void RestoreActivateRotateBuckets(
 // A bounded block grid checks each row before assigning its output tiles to
 // the block's eight waves. The all-safe case launches <= 256 blocks, rather
 // than one block for every (assignment, output tile) pair.
+template<int Bits>
 __global__ void BucketDownFallback(const ex::DeviceLinear* bank,
                                    const unsigned* offsets, unsigned experts,
                                    const std::int32_t* exponents,
@@ -450,7 +452,7 @@ __global__ void BucketDownFallback(const ex::DeviceLinear* bank,
   if (counts != nullptr && threadIdx.x == 0)
     atomicAdd(counts, 1U);
   const unsigned lane = threadIdx.x % 32, r0 = (lane % 4) * 2;
-  const auto lw = arithmetic::MakeLaneWindow<5>(lane);
+  const auto lw = arithmetic::MakeLaneWindow<Bits>(lane);
   for (unsigned row = blockIdx.x; row < assignments; row += gridDim.x) {
     if (row >= offsets[experts] || exponents[row] >= 0)
       continue;
@@ -465,8 +467,8 @@ __global__ void BucketDownFallback(const ex::DeviceLinear* bank,
       float a = 0, b = 0;
       for (unsigned kt = 0; kt < k / 16; ++kt) {
         Half2 w[4];
-        arithmetic::DecodeLaneMul1<5>(
-            trellis + (std::size_t{kt} * (n / 16) + nt) * 40, lw, w);
+        arithmetic::DecodeLaneMul1<Bits>(
+            trellis + (std::size_t{kt} * (n / 16) + nt) * (8 * Bits), lw, w);
         const auto* group = x + kt * 16 + r0;
         const Half2 v01{group[0], group[1]}, v89{group[8], group[9]};
         a = DotPairF32(w[0], v01, a);
@@ -482,6 +484,57 @@ __global__ void BucketDownFallback(const ex::DeviceLinear* bank,
         output[std::size_t{row} * n + nt * 16 + lane / 4] = a;
         output[std::size_t{row} * n + nt * 16 + lane / 4 + 8] = b;
       }
+    }
+  }
+}
+
+template<int Bits>
+__global__ void BucketInnerGemv(const ex::DeviceLinear* bank,
+                                const Exl3ExpertBucket* buckets,
+                                const unsigned* bucket_count,
+                                const std::uint16_t* input, float* output,
+                                unsigned k, unsigned n) {
+  if (blockIdx.y >= *bucket_count)
+    return;
+  const auto bucket = buckets[blockIdx.y];
+  const unsigned first_row = blockIdx.z * 8;
+  if (first_row >= bucket.count)
+    return;
+  const auto& l = bank[bucket.expert];
+  const unsigned rows = min(8U, bucket.count - first_row);
+  const unsigned lane = threadIdx.x, r0 = (lane % 4) * 2, nt = blockIdx.x;
+  const bool valid = l.rate.bits == Bits && !l.rate.half &&
+                     l.codebook == ex::Codebook::kMul1 && l.k == k && l.n == n;
+  float a[8]{}, b[8]{};
+  if (valid) {
+    const auto lw = arithmetic::MakeLaneWindow<Bits>(lane);
+    const auto* trellis = reinterpret_cast<const std::uint32_t*>(l.trellis);
+    const auto* x = reinterpret_cast<const _Float16*>(input);
+    for (unsigned kt = 0; kt < k / 16; ++kt) {
+      Half2 w[4];
+      arithmetic::DecodeLaneMul1<Bits>(
+          trellis + (std::size_t{kt} * (n / 16) + nt) * (8 * Bits), lw, w);
+      for (unsigned r = 0; r < rows; ++r) {
+        const auto* row =
+            x + std::size_t{bucket.first + first_row + r} * k + kt * 16 + r0;
+        const Half2 v01{row[0], row[1]}, v89{row[8], row[9]};
+        a[r] = __builtin_amdgcn_fdot2(w[0], v01, a[r], false);
+        a[r] = __builtin_amdgcn_fdot2(w[1], v89, a[r], false);
+        b[r] = __builtin_amdgcn_fdot2(w[2], v01, b[r], false);
+        b[r] = __builtin_amdgcn_fdot2(w[3], v89, b[r], false);
+      }
+    }
+  }
+  for (unsigned r = 0; r < rows; ++r) {
+    a[r] += __shfl_xor(a[r], 1, 32);
+    b[r] += __shfl_xor(b[r], 1, 32);
+    a[r] += __shfl_xor(a[r], 2, 32);
+    b[r] += __shfl_xor(b[r], 2, 32);
+    if (lane % 4 == 0) {
+      auto* y =
+          output + std::size_t{bucket.first + first_row + r} * n + nt * 16;
+      y[lane / 4] = valid ? a[r] : __builtin_nanf("");
+      y[lane / 4 + 8] = valid ? b[r] : __builtin_nanf("");
     }
   }
 }
@@ -557,6 +610,7 @@ __global__ void SelectSegments(const std::int32_t* ids, unsigned extras,
 
 // Prefix and selected segments use the original N stride. Segment grid is
 // bounded by extras, and its inactive blocks read neither weights nor input.
+template<int Bits>
 __global__ void HeadGemv(ex::DeviceLinear l, const std::uint16_t* input,
                          float* output, unsigned prefix_segments,
                          const unsigned* selected) {
@@ -570,12 +624,12 @@ __global__ void HeadGemv(ex::DeviceLinear l, const std::uint16_t* input,
   const unsigned nt = segment * 8 + blockIdx.x;
   const auto* trellis = reinterpret_cast<const std::uint32_t*>(l.trellis);
   const auto* x = reinterpret_cast<const _Float16*>(input);
-  const auto lw = arithmetic::MakeLaneWindow<6>(lane);
+  const auto lw = arithmetic::MakeLaneWindow<Bits>(lane);
   float a = 0, b = 0;
   for (unsigned kt = 0; kt < l.k / 16; ++kt) {
     Half2 w[4];
-    arithmetic::DecodeLaneMul1<6>(
-        trellis + (std::size_t{kt} * (l.n / 16) + nt) * 48, lw, w);
+    arithmetic::DecodeLaneMul1<Bits>(
+        trellis + (std::size_t{kt} * (l.n / 16) + nt) * (8 * Bits), lw, w);
     const auto offset = arithmetic::LaneMajorOffset(kt * 16 + r0, 0, 1);
     const auto* group = x + offset;
     const Half2 v01{group[0], group[1]}, v89{group[2], group[3]};
@@ -711,6 +765,36 @@ void Exl3Scatter(const float* x, const std::int32_t* slots, float* out,
 }
 
 namespace {
+template<class F>
+void WithRate(ex::BitRate rate, F&& f) {
+  if (rate.half)
+    throw std::invalid_argument("Flash-Next experts need integer K3..K7");
+  switch (rate.bits) {
+    case 3:
+      f.template operator()<3>();
+      break;
+    case 4:
+      f.template operator()<4>();
+      break;
+    case 5:
+      f.template operator()<5>();
+      break;
+    case 6:
+      f.template operator()<6>();
+      break;
+    case 7:
+      f.template operator()<7>();
+      break;
+    default:
+      throw std::invalid_argument("Flash-Next experts need K3..K7");
+  }
+}
+ex::BitRate BankRate(const DeviceTensor& bank) {
+  if (bank.exl3 == nullptr || bank.experts == 0)
+    throw std::invalid_argument("missing Flash-Next expert host descriptors");
+  return bank.exl3[0].rate;
+}
+
 // The tile builder uses the same cap. In particular R=3 does not carry
 // eight independent accumulator pairs through the complete K loop.
 unsigned TileRows(unsigned rows) {
@@ -722,31 +806,34 @@ void LaunchRouted(const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
                   const std::uint16_t* input, float* gate_y, float* up_y,
                   unsigned k, unsigned n, unsigned assignments,
                   unsigned projections, unsigned tile_rows,
-                  const Exl3Scratch& scratch, hipStream_t stream) {
-  const auto launch = [&]<unsigned R>() {
-    hipLaunchKernelGGL((RoutedGemv<FullPrecision, R, Scaled>),
-                       dim3(n / 16, assignments, projections), dim3(32), 0,
-                       stream, gate, up, scratch.tiles, scratch.tile_count,
-                       input, gate_y, up_y, k, n, assignments,
-                       scratch.down_exponents);
-  };
-  switch (tile_rows) {
-    case 1:
-      launch.template operator()<1>();
-      break;
-    case 2:
-      launch.template operator()<2>();
-      break;
-    case 3:
-      launch.template operator()<3>();
-      break;
-    case 4:
-      launch.template operator()<4>();
-      break;
-    default:
-      launch.template operator()<8>();
-      break;
-  }
+                  const Exl3Scratch& scratch, hipStream_t stream,
+                  ex::BitRate rate) {
+  WithRate(rate, [&]<int Bits>() {
+    const auto launch = [&]<unsigned R>() {
+      hipLaunchKernelGGL((RoutedGemv<Bits, FullPrecision, R, Scaled>),
+                         dim3(n / 16, assignments, projections), dim3(32), 0,
+                         stream, gate, up, scratch.tiles, scratch.tile_count,
+                         input, gate_y, up_y, k, n, assignments,
+                         scratch.down_exponents);
+    };
+    switch (tile_rows) {
+      case 1:
+        launch.template operator()<1>();
+        break;
+      case 2:
+        launch.template operator()<2>();
+        break;
+      case 3:
+        launch.template operator()<3>();
+        break;
+      case 4:
+        launch.template operator()<4>();
+        break;
+      default:
+        launch.template operator()<8>();
+        break;
+    }
+  });
 }
 }  // namespace
 
@@ -762,11 +849,13 @@ void Exl3RoutedDown(const DeviceTensor& down, std::uint16_t* input, float* out,
                        input, scratch.down_exponents, down.cols);
     LaunchRouted<false, true>(down.device_exl3, down.device_exl3, input, out,
                               out, down.cols, down.rows, assignments, 1,
-                              TileRows(max_tile_rows), scratch, stream);
+                              TileRows(max_tile_rows), scratch, stream,
+                              BankRate(down));
   } else {
     LaunchRouted<true>(down.device_exl3, down.device_exl3, input, out, out,
                        down.cols, down.rows, assignments, 1,
-                       TileRows(max_tile_rows), scratch, stream);
+                       TileRows(max_tile_rows), scratch, stream,
+                       BankRate(down));
   }
   Check();
 }
@@ -831,11 +920,25 @@ void Exl3PrefillBucketInner(const ex::DeviceLinear* bank,
                             const std::uint32_t* bucket_count,
                             std::uint32_t max_buckets, std::uint32_t tile_rows,
                             const std::uint16_t* input, float* inner,
-                            std::uint32_t k, std::uint32_t n,
+                            std::uint32_t k, std::uint32_t n, ex::BitRate rate,
                             hipStream_t stream) {
-  gufo::hip::LaunchExl3PrefillBucketInner(bank, buckets, bucket_count,
-                                          max_buckets, tile_rows, input, inner,
-                                          k, n, stream);
+  if (max_buckets > 65535 || k == 0 || n == 0 || k % 128 || n % 128 ||
+      bank == nullptr || buckets == nullptr || bucket_count == nullptr ||
+      input == nullptr || inner == nullptr ||
+      (tile_rows != 16 && tile_rows != 32 && tile_rows != 64))
+    throw std::invalid_argument("invalid Flash-Next bucket shape");
+  WithRate(rate, [&]<int Bits>() {
+    if constexpr (Bits == 5) {
+      gufo::hip::LaunchExl3PrefillBucketInner(bank, buckets, bucket_count,
+                                              max_buckets, tile_rows, input,
+                                              inner, k, n, stream);
+    } else if (max_buckets != 0) {
+      hipLaunchKernelGGL((BucketInnerGemv<Bits>),
+                         dim3(n / 16, max_buckets, (tile_rows + 7) / 8),
+                         dim3(32), 0, stream, bank, buckets, bucket_count,
+                         input, inner, k, n);
+    }
+  });
   Check();
 }
 
@@ -869,15 +972,18 @@ void Exl3PrefillDown(const DeviceTensor& down, std::uint32_t assignments,
                      scratch.input, scratch.down_exponents, down.cols);
   gemm(down.device_exl3, scratch.buckets, scratch.bucket_count,
        scratch.max_buckets, tile_rows, scratch.input, scratch.out, down.cols,
-       down.rows, stream);
+       down.rows, BankRate(down), stream);
   auto* counts = trace == nullptr ? nullptr : trace->fallback_counts;
   if (counts != nullptr &&
       hipMemsetAsync(counts, 0, 2 * sizeof(unsigned), stream) != hipSuccess)
     throw std::runtime_error("EXL3 fallback trace reset failed");
-  hipLaunchKernelGGL(BucketDownFallback, dim3(std::min(assignments, 256U)),
-                     dim3(256), 0, stream, down.device_exl3, scratch.offsets,
-                     down.experts, scratch.down_exponents, scratch.input,
-                     scratch.out, down.cols, down.rows, assignments, counts);
+  WithRate(BankRate(down), [&]<int Bits>() {
+    hipLaunchKernelGGL((BucketDownFallback<Bits>),
+                       dim3(std::min(assignments, 256U)), dim3(256), 0, stream,
+                       down.device_exl3, scratch.offsets, down.experts,
+                       scratch.down_exponents, scratch.input, scratch.out,
+                       down.cols, down.rows, assignments, counts);
+  });
   hipLaunchKernelGGL(RestoreDownBuckets, dim3(down.rows / 128, assignments),
                      dim3(32), 0, stream, down.device_exl3, scratch.offsets,
                      down.experts, scratch.down_exponents, scratch.out,
@@ -910,7 +1016,7 @@ void Exl3PrefillExperts(const DeviceLayer& layer, const float* x,
   const auto projection = [&](const DeviceTensor& bank, float* target) {
     gemm(bank.device_exl3, scratch.buckets, scratch.bucket_count,
          scratch.max_buckets, tile_rows, scratch.input, target, bank.cols,
-         bank.rows, stream);
+         bank.rows, BankRate(bank), stream);
   };
   Exl3RotateExpertBuckets(g.device_exl3, x, scratch.input, scratch.offsets,
                           scratch.slots, g.experts, assignments, g.cols, used,
@@ -1003,8 +1109,19 @@ void Exl3RoutedMlp(const DeviceLayer& l, const float* x,
   if (trace != nullptr)
     snapshot(trace->gate_up_input, s.routed_input,
              std::size_t{2} * assignments * g.cols * sizeof(std::uint16_t));
-  LaunchRouted<false>(g.device_exl3, u.device_exl3, s.routed_input, gate, up,
-                      g.cols, g.rows, assignments, 2, tile_rows, s, stream);
+  if (BankRate(g) == BankRate(u)) {
+    LaunchRouted<false>(g.device_exl3, u.device_exl3, s.routed_input, gate, up,
+                        g.cols, g.rows, assignments, 2, tile_rows, s, stream,
+                        BankRate(g));
+  } else {
+    LaunchRouted<false>(g.device_exl3, g.device_exl3, s.routed_input, gate,
+                        gate, g.cols, g.rows, assignments, 1, tile_rows, s,
+                        stream, BankRate(g));
+    LaunchRouted<false>(u.device_exl3, u.device_exl3,
+                        s.routed_input + std::size_t{assignments} * g.cols, up,
+                        up, u.cols, u.rows, assignments, 1, tile_rows, s,
+                        stream, BankRate(u));
+  }
   if (trace != nullptr) {
     snapshot(trace->gate_inner, gate,
              std::size_t{assignments} * g.rows * sizeof(float));
@@ -1023,12 +1140,14 @@ void Exl3RoutedMlp(const DeviceLayer& l, const float* x,
   if (trace != nullptr && trace->down_packed_inner != nullptr) {
     LaunchRouted<false>(d.device_exl3, d.device_exl3, s.routed_input,
                         trace->down_packed_inner, trace->down_packed_inner,
-                        d.cols, d.rows, assignments, 1, tile_rows, s, stream);
+                        d.cols, d.rows, assignments, 1, tile_rows, s, stream,
+                        BankRate(d));
   }
   if (trace != nullptr && trace->down_widened_inner != nullptr)
     LaunchRouted<true>(d.device_exl3, d.device_exl3, s.routed_input,
                        trace->down_widened_inner, trace->down_widened_inner,
-                       d.cols, d.rows, assignments, 1, tile_rows, s, stream);
+                       d.cols, d.rows, assignments, 1, tile_rows, s, stream,
+                       BankRate(d));
   Exl3RoutedDown(d, s.routed_input, out, assignments, tile_rows, s, stream);
   if (trace != nullptr)
     snapshot(trace->down_inner, out,
@@ -1043,15 +1162,18 @@ void Exl3DraftHead(const DeviceTensor& head, const float* x, float* logits,
                    std::uint32_t extras, const Exl3Scratch& s,
                    hipStream_t stream) {
   const auto& l = *head.exl3;
-  if (prefix % 128 != 0 || l.rate != ex::BitRate{6, false})
-    throw std::runtime_error("EXL3 draft head needs a complete K6 prefix");
+  if (prefix % 128 != 0 || prefix > l.n || l.rate.half || l.rate.bits < 3 ||
+      l.rate.bits > 7 || l.codebook != ex::Codebook::kMul1)
+    throw std::runtime_error("EXL3 draft head needs a complete K3..K7 prefix");
   hipLaunchKernelGGL(SelectSegments, dim3(1), dim3(1), 0, stream, ids, extras,
                      prefix, l.n, s.head_segments);
   hipLaunchKernelGGL(HeadInput, dim3(l.k / 128), dim3(32), 0, stream, l, x,
                      s.projection.fast_input);
-  hipLaunchKernelGGL(HeadGemv, dim3(8, prefix / 128 + extras), dim3(32), 0,
-                     stream, l, s.projection.fast_input, s.head_values,
-                     prefix / 128, s.head_segments);
+  WithRate(l.rate, [&]<int Bits>() {
+    hipLaunchKernelGGL((HeadGemv<Bits>), dim3(8, prefix / 128 + extras),
+                       dim3(32), 0, stream, l, s.projection.fast_input,
+                       s.head_values, prefix / 128, s.head_segments);
+  });
   hipLaunchKernelGGL(RestoreHead, dim3(prefix / 128 + extras), dim3(32), 0,
                      stream, l, s.head_values, logits, prefix, s.head_segments);
   hipLaunchKernelGGL(GatherHead, dim3((extras + 255) / 256), dim3(256), 0,

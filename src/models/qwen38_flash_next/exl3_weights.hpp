@@ -3,6 +3,7 @@
 
 #include <deque>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <span>
 #include <string>
@@ -33,7 +34,22 @@ struct Exl3Storage {
   std::deque<std::vector<Exl3HostLinear>> linears;
   std::deque<std::vector<std::uint8_t>> converted;
   std::deque<std::string> names;
+  /// Only missing in-shard MTP mixer tensors; bytes live in converted.
+  std::map<std::string, quant::exl3::Tensor, std::less<>> supplementary;
 };
+
+/// Bind actual per-tensor integer K3..K7 rates. Every expert in this bank
+/// must agree; different banks/projections may use different rates.
+[[nodiscard]] TensorRef BindExl3LinearBank(Exl3Storage& storage,
+                                           const std::string& module,
+                                           std::uint32_t k, std::uint32_t n,
+                                           std::uint32_t experts = 1);
+/// Prefer in-shard MTP mixer operands. A patch supplies missing tensors;
+/// overlapping operands must have identical dtype, shape and payload bytes.
+/// Returns the header identity of the checkpoint and any supplied patch.
+[[nodiscard]] std::string PrepareExl3MtpMixer(
+    Exl3Storage& storage, const Config& config,
+    const std::filesystem::path& patch = {});
 
 /// Identity of retained GGUF shard filenames, sizes and aligned headers.
 [[nodiscard]] std::string Exl3PleHeadersDigest(const core::GgufReader& reader);

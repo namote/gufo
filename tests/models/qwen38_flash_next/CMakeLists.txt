@@ -20,6 +20,15 @@ endfunction()
 add_qwen38_flash_next_test(exl3_reference gufo_qwen38_flash_next_reference "cpu;exl3")
 add_qwen38_flash_next_test(exl3_ple_digest gufo_qwen38_flash_next "cpu;exl3")
 
+# Compile the dedicated fixture source without GPU code for loader checks.
+add_executable(qwen38_flash_next_exl3_loader_test exl3_moe_kernel_test.cpp)
+target_compile_definitions(qwen38_flash_next_exl3_loader_test PRIVATE
+  GUFO_EXL3_LOADER_TEST_ONLY=1)
+target_link_libraries(qwen38_flash_next_exl3_loader_test PRIVATE gufo_qwen38_flash_next)
+add_test(NAME qwen38_flash_next.exl3_loader COMMAND qwen38_flash_next_exl3_loader_test)
+set_tests_properties(qwen38_flash_next.exl3_loader PROPERTIES LABELS "cpu;qwen38_flash_next;exl3")
+add_dependencies(qwen38_flash_next_tests qwen38_flash_next_exl3_loader_test)
+
 add_qwen38_flash_next_test(config gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(continuation_layout gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(ngram gufo_qwen38_flash_next "cpu")

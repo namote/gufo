@@ -113,20 +113,24 @@ void Exl3ScatterExpertBuckets(const float* packed, const std::int32_t* slots,
 /// FP32 inner dot, without H/svh. This model owns restoration, down-row
 /// unscaling and widened fallback. Reads/stores must mask ragged row and
 /// output tails (notably n=640); no slab padding is required.
-using Exl3BucketGemm = void (*)(
-    const quant::exl3::DeviceLinear* bank, const Exl3ExpertBucket* buckets,
-    const std::uint32_t* bucket_count, std::uint32_t max_buckets,
-    std::uint32_t tile_rows, const std::uint16_t* input, float* output,
-    std::uint32_t k, std::uint32_t n, hipStream_t stream);
+using Exl3BucketGemm = void (*)(const quant::exl3::DeviceLinear* bank,
+                                const Exl3ExpertBucket* buckets,
+                                const std::uint32_t* bucket_count,
+                                std::uint32_t max_buckets,
+                                std::uint32_t tile_rows,
+                                const std::uint16_t* input, float* output,
+                                std::uint32_t k, std::uint32_t n,
+                                quant::exl3::BitRate rate, hipStream_t stream);
 
-/// Production adapter: shared X3 WMMA, with no function-pointer casts.
+/// Production adapter: shared X3 WMMA for K5; packed GEMV fallback for
+/// K3/K4/K6/K7 until the shared bucket WMMA accepts a rate argument.
 void Exl3PrefillBucketInner(const quant::exl3::DeviceLinear* bank,
                             const Exl3ExpertBucket* buckets,
                             const std::uint32_t* bucket_count,
                             std::uint32_t max_buckets, std::uint32_t tile_rows,
                             const std::uint16_t* input, float* inner,
                             std::uint32_t k, std::uint32_t n,
-                            hipStream_t stream);
+                            quant::exl3::BitRate rate, hipStream_t stream);
 
 struct Exl3PrefillScratch {
   std::uint32_t* offsets{nullptr};        ///< [experts + 1]
