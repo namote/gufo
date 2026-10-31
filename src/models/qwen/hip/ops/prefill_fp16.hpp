@@ -5,6 +5,7 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/core/quant/exl3/device.hpp"
+#include "src/models/qwen/hip/ops/exl3_prefill_bucket.hpp"
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 namespace gufo::hip {
@@ -42,6 +43,25 @@ void LaunchExl3PrefillGemmGrouped(const Exl3GemmProblem* problems,
                                   std::size_t count, std::size_t max_rows,
                                   std::uint32_t k, std::uint32_t n,
                                   quant::exl3::BitRate rate, bool residual,
+                                  hipStream_t stream);
+// Raw inner products of expert buckets (Flash-Next routed prefill): for
+// every active descriptor b < min(*device_bucket_count, max_buckets) and
+// row r < count, inner[(first + r) * n + j] = sum_i input[(first + r) * k +
+// i] * W'[i][j] in FP32 for the bank's expert (its trellis only; no output
+// Hadamard, svh or suh). input is the FP16 rotated slab [rows][k], inner
+// [rows][n], both packed; rows past count are neither read nor written. The
+// count is read on the device (graph-replay safe). Each value depends only
+// on its own input row and expert, never on the partition into buckets,
+// tile_rows or its position in a tile. Bank entries must be mul1 K5 with
+// this k and n (checked on the device: a mismatching bucket writes NaN);
+// k and n multiples of 128, tile_rows 1..64 (16/32/64 are the tuned tiles).
+void LaunchExl3PrefillBucketInner(const quant::exl3::DeviceLinear* device_bank,
+                                  const Exl3PrefillBucket* device_buckets,
+                                  const std::uint32_t* device_bucket_count,
+                                  std::uint32_t max_buckets,
+                                  std::uint32_t tile_rows,
+                                  const std::uint16_t* input, float* inner,
+                                  std::uint32_t k, std::uint32_t n,
                                   hipStream_t stream);
 // Optional residual and sum_out preserve the FP32 residual link; sum_out may
 // alias input. The normalization reduction matches LaunchBatchedRMSNorm.

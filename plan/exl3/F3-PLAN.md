@@ -183,3 +183,21 @@ All take `quant::exl3::DeviceLinear` or raw device pointers in checkpoint layout
 - **Remaining #2 work goes to the combined pass:**
   - FN-shape timing with `tools/bench/exl3_k7_bench.hip`: GEMV vs WMMA at R=1..8, and the 2×4 / 2×8 / 2×16 / 4×4 shape sweep with checks against production output.
   - Tuning `PickShape` from those results. With few blocks (o, shared down: 80 blocks), wider waves are the candidate.
+
+### F3-API: expert bucket raw inner GEMM (W3, 2026-10-31)
+
+- **Header** `src/models/qwen/hip/ops/exl3_prefill_bucket.hpp`, HIP-free: `gufo::hip::Exl3PrefillBucket {expert, count, first}` (12 B). The expert worker aliases its `Exl3ExpertBucket` to this type with `using Exl3ExpertBucket = gufo::hip::Exl3PrefillBucket;` so the `Exl3BucketGemm` function pointer matches without a cast.
+- **Entry point** `LaunchExl3PrefillBucketInner(bank, buckets, bucket_count, max_buckets, tile_rows, input, inner, k, n, stream)` in `ops/prefill_fp16.hpp`:
+  - Bank: mul1 K5; k and n multiples of 128.
+  - Input: FP16 rotated, packed `[rows][k]`. Output: raw FP32 inner products, packed `[rows][n]`, with no H, svh or suh.
+  - Masking: descriptors at or past the device count (`*bucket_count`, read on the device) are ignored; rows past `count` are neither read nor written; nothing is padded.
+  - Bank-entry check on the device: an entry with the wrong rate, k, n or codebook writes NaN to that bucket's rows.
+- **Tiles:** 128 channels × 16, 32 or 64 tokens, the smallest that holds `tile_rows`. The grid is `(1, n/128, max_buckets)`. No spills. VGPRs are 129, 170 and 218, for occupancy of 10, 8 and 6.
+- **Arithmetic:** every tile accumulates each element over k in the same WMMA order, so values do not depend on the bucket partition or the position in a tile. The test checks this bit for bit.
+- **Test:** `qwen27b_exl3_kernel_test` `TestBuckets`, for 2560→640 and 640→2560. Experts have 1, 37, 0 and 70 rows, with partitions of 16, 32, 64 and 7 rows. Checks:
+  - bit identity across partitions
+  - FP64 at the (k/16)·2⁻²³ bar
+  - rows outside every bucket stay untouched
+  - descriptors past the count are ignored
+  - K6 entry poisoning
+- **Status:** built; the GPU run waits for the combined pass.

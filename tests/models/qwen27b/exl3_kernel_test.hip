@@ -1095,6 +1095,155 @@ void TestGrouped(std::mt19937& rng, const std::size_t (&rows)[4],
     Check(hipFree(p));
 }
 
+// Bucketed raw inner products (Flash-Next routed prefill): an expert bank
+// with ragged per-expert rows split into 16/32/64-row tiles. Every
+// partition gives bit-identical values; each against the FP64 inner product
+// at the WMMA bound; rows outside every bucket and descriptors past the
+// device count stay untouched; a bank entry of the wrong rate writes NaN.
+void TestBuckets(std::size_t k, std::size_t n, std::mt19937& rng) {
+  constexpr std::size_t kExperts = 4;
+  const BitRate rate{5, false};
+  const std::size_t expert_rows[kExperts] = {1, 37, 0, 70};
+  std::size_t total = 1;  // row 0 belongs to no bucket (sentinel)
+  for (std::size_t e : expert_rows)
+    total += e;
+  std::vector<std::vector<std::uint16_t>> inner(kExperts);
+  std::vector<DeviceLinear> bank(kExperts + 1);
+  std::vector<void*> owned;
+  for (std::size_t e = 0; e <= kExperts; ++e) {
+    // Entry kExperts: K6, a contract violation.
+    const BitRate r = e < kExperts ? rate : BitRate{6, false};
+    std::vector<std::uint16_t> trellis((k / 16) * (n / 16) * r.TileWords());
+    for (auto& w : trellis)
+      w = static_cast<std::uint16_t>(rng());
+    if (e < kExperts) {
+      inner[e].resize(k * n);
+      DequantInner(trellis.data(), k, n, rate, Codebook::kMul1,
+                   inner[e].data());
+    }
+    auto* d_t = Upload(trellis);
+    owned.push_back(d_t);
+    bank[e].trellis = d_t;
+    bank[e].k = static_cast<std::uint32_t>(k);
+    bank[e].n = static_cast<std::uint32_t>(n);
+    bank[e].rate = r;
+    bank[e].codebook = Codebook::kMul1;
+  }
+  std::normal_distribution<double> normal;
+  std::vector<std::uint16_t> input(total * k);
+  for (auto& v : input)
+    v = HalfFromDouble(normal(rng));
+  auto* d_bank = Upload(bank);
+  auto* d_input = Upload(input);
+  constexpr std::uint32_t kSentinel = 0x7fc0beefU;
+  const std::vector<float> sentinel(total * n, std::bit_cast<float>(kSentinel));
+  float* d_inner = nullptr;
+  Check(hipMalloc(&d_inner, total * n * 4));
+  const double bar = static_cast<double>(k) / 16.0 * std::ldexp(1.0, -23);
+  std::vector<float> first_result;
+  for (std::uint32_t tile_rows : {16U, 32U, 64U, 7U}) {
+    std::vector<gufo::hip::Exl3PrefillBucket> buckets;
+    std::uint32_t row = 1;
+    for (std::uint32_t e = 0; e < kExperts; ++e) {
+      for (std::uint32_t r = 0; r < expert_rows[e]; r += tile_rows)
+        buckets.push_back(
+            {e, std::min<std::uint32_t>(tile_rows, expert_rows[e] - r),
+             row + r});
+      row += static_cast<std::uint32_t>(expert_rows[e]);
+    }
+    const auto active = static_cast<std::uint32_t>(buckets.size());
+    // Past the device count: would overwrite row 0 if read.
+    buckets.push_back({0, 1, 0});
+    buckets.push_back({1, 1, 0});
+    auto* d_buckets = Upload(buckets);
+    auto* d_count = Upload(std::vector<std::uint32_t>{active});
+    Check(hipMemcpy(d_inner, sentinel.data(), sentinel.size() * 4,
+                    hipMemcpyHostToDevice));
+    gufo::hip::LaunchExl3PrefillBucketInner(
+        d_bank, d_buckets, d_count, static_cast<std::uint32_t>(buckets.size()),
+        tile_rows, d_input, d_inner, static_cast<std::uint32_t>(k),
+        static_cast<std::uint32_t>(n), nullptr);
+    Check(hipDeviceSynchronize());
+    const auto got = Download(d_inner, total * n);
+    const std::string name = "bucket k=" + std::to_string(k) +
+                             " n=" + std::to_string(n) +
+                             " tile_rows=" + std::to_string(tile_rows);
+    bool untouched = true;
+    for (std::size_t j = 0; j < n; ++j)
+      untouched =
+          untouched && std::bit_cast<std::uint32_t>(got[j]) == kSentinel;
+    Expect(untouched, name + ": row outside every bucket written");
+    double num = 0.0, den = 0.0;
+    bool finite = true;
+    row = 1;
+    for (std::size_t e = 0; e < kExperts; ++e) {
+      for (std::size_t r = 0; r < expert_rows[e]; ++r, ++row) {
+        std::vector<double> want(n, 0.0);
+        for (std::size_t i = 0; i < k; ++i) {
+          const double xi = HalfToDouble(input[row * k + i]);
+          for (std::size_t j = 0; j < n; ++j)
+            want[j] += xi * HalfToDouble(inner[e][i * n + j]);
+        }
+        for (std::size_t j = 0; j < n; ++j) {
+          const double g = got[row * n + j];
+          finite = finite && std::isfinite(g);
+          num += (g - want[j]) * (g - want[j]);
+          den += want[j] * want[j];
+        }
+      }
+    }
+    const double rel = std::sqrt(num / den);
+    Expect(finite, name + ": non-finite output");
+    Expect(rel < bar, name + " relative L2 " + std::to_string(rel));
+    std::size_t partition_diffs = 0;
+    if (first_result.empty())
+      first_result = got;
+    else
+      for (std::size_t i = 0; i < got.size(); ++i)
+        partition_diffs += std::bit_cast<std::uint32_t>(got[i]) !=
+                           std::bit_cast<std::uint32_t>(first_result[i]);
+    Expect(partition_diffs == 0,
+           name + ": " + std::to_string(partition_diffs) +
+               " values differ from the 16-row partition");
+    std::cout << name << ": relative L2 " << rel << " (bar " << bar
+              << "), bits differing from 16-row partition " << partition_diffs
+              << "\n";
+    Check(hipFree(d_buckets));
+    Check(hipFree(d_count));
+  }
+  {
+    // A K6 bank entry under the K5 entry point poisons its rows only.
+    std::vector<gufo::hip::Exl3PrefillBucket> buckets{
+        {static_cast<std::uint32_t>(kExperts), 3, 1}};
+    auto* d_buckets = Upload(buckets);
+    auto* d_count = Upload(std::vector<std::uint32_t>{1});
+    Check(hipMemcpy(d_inner, sentinel.data(), sentinel.size() * 4,
+                    hipMemcpyHostToDevice));
+    gufo::hip::LaunchExl3PrefillBucketInner(
+        d_bank, d_buckets, d_count, 1, 16, d_input, d_inner,
+        static_cast<std::uint32_t>(k), static_cast<std::uint32_t>(n), nullptr);
+    Check(hipDeviceSynchronize());
+    const auto got = Download(d_inner, total * n);
+    bool poisoned = true, rest = true;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+      const bool in = i >= n && i < 4 * n;
+      if (in)
+        poisoned = poisoned && std::isnan(got[i]) &&
+                   std::bit_cast<std::uint32_t>(got[i]) != kSentinel;
+      else
+        rest = rest && std::bit_cast<std::uint32_t>(got[i]) == kSentinel;
+    }
+    Expect(poisoned && rest, "bucket rate mismatch: rows not poisoned alone");
+    Check(hipFree(d_buckets));
+    Check(hipFree(d_count));
+  }
+  for (void* p : owned)
+    Check(hipFree(p));
+  Check(hipFree(d_bank));
+  Check(hipFree(d_input));
+  Check(hipFree(d_inner));
+}
+
 }  // namespace
 
 int main() {
@@ -1140,6 +1289,8 @@ int main() {
   TestDecodeTiles(rng);
   TestGrouped(rng, {0, 7, 33, 300}, 300, false);
   TestGrouped(rng, {5, 0, 64, 1}, 64, true);
+  TestBuckets(2560, 640, rng);
+  TestBuckets(640, 2560, rng);
   TestDispatch(rng);
   if (failures != 0) {
     std::cerr << failures << " failure(s)\n";
