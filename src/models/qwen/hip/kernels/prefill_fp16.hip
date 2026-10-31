@@ -3,6 +3,7 @@
 
 #include "src/core/hip/detail/exl3_gemv.hpp"
 #include "src/core/hip/detail/hadamard.hpp"
+#include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/hip/kernels/prefill_quant_gemm.hpp"
 #include "src/models/qwen/hip/ops/hadamard.hpp"
 #include "src/models/qwen/hip/ops/prefill_fp16.hpp"
@@ -235,7 +236,8 @@ enum class HalfEpilogue { kStore, kSwiGLU, kGateUp, kResidual };
 // through the dead s_a tile. Type is unused then.
 template<int BM, int BN, int WM, int WN, gufo::core::GgmlType Type,
          HalfEpilogue Epilogue, bool Complete = false,
-         gufo::core::GgmlType UpType = Type, int TrellisBits = 0>
+         gufo::core::GgmlType UpType = Type, int TrellisBits = 0,
+         bool Grouped = false>
 
 __launch_bounds__(WM * WN * 32) __global__
     void HalfPrefillGemmKernel(const void* __restrict__ w,
@@ -317,6 +319,20 @@ __launch_bounds__(WM * WN * 32) __global__
   }
   const int r_block = row_tile * (Paired ? BM / 2 : BM),
             t_block = token_tile * BN;
+  if constexpr (Grouped) {
+    // One problem per blockIdx.z (an expert bucket): its trellis, svh (read
+    // through gate), FP16 rows and output; blocks past its rows exit.
+    static_assert(TrellisBits > 0, "grouped problems are EXL3 only");
+    const auto& problem =
+        static_cast<const Exl3GemmProblem*>(up)[blockIdx.z];
+    w = problem.trellis;
+    x = static_cast<const short*>(problem.x);
+    y = problem.y;
+    gate = reinterpret_cast<const float*>(problem.svh);
+    batch = static_cast<int>(problem.rows);
+    if (t_block >= batch)
+      return;
+  }
   const int ksteps = k / 16;
 
   v8f acc[WRS][WTS] = {};
@@ -518,17 +534,12 @@ __launch_bounds__(WM * WN * 32) __global__
 #pragma unroll
       for (int i = 0; i < TPW; ++i) {
         const int t = wave * TPW + i, ks = t / RS, rt = t % RS;
-        const std::uint32_t hi =
-            __builtin_amdgcn_alignbit(traw[i].d0, traw[i].d1, lw.shift);
-        const std::uint32_t lo =
-            __builtin_amdgcn_alignbit(traw[i].d1, traw[i].d2, lw.shift);
-        const std::uint64_t window =
-            (static_cast<std::uint64_t>(hi) << 32) | lo;
         std::uint32_t hashed[8];
+        exl3::LaneStates<kTrellisK>(traw[i].d0, traw[i].d1, traw[i].d2,
+                                    lw.shift, hashed);
 #pragma unroll
         for (int j = 0; j < 8; ++j)
-          hashed[j] = exl3::HashMul1Packed(
-              static_cast<std::uint32_t>(window >> (48 - kTrellisK * j)));
+          hashed[j] = exl3::HashMul1Packed(hashed[j]);
         // Column c of the tile is weight row rt * 16 + c; rows r0, r0 + 1
         // (16-byte group 0) and r0 + 8, r0 + 9 (group 1) are k positions.
 #pragma unroll
@@ -1026,11 +1037,104 @@ void DirectGemm(gufo::core::GgmlType type, const void* w, const void* x,
   }
 }
 bool Exl3PrefillSupported(const quant::exl3::DeviceLinear& linear) noexcept {
-  return linear.codebook == quant::exl3::Codebook::kMul1 && !linear.rate.half &&
-         linear.rate.bits >= 1 && linear.rate.bits <= 6 &&
-         linear.n > 0 && linear.k > 0 && linear.n % 256 == 0 &&
-         linear.k % 128 == 0;
+  return Exl3GemmShapeSupported(linear.k, linear.n, linear.rate,
+                                linear.codebook);
 }
+
+bool Exl3GemmShapeSupported(std::uint32_t k, std::uint32_t n,
+                            quant::exl3::BitRate rate,
+                            quant::exl3::Codebook codebook) noexcept {
+  return codebook == quant::exl3::Codebook::kMul1 && !rate.half &&
+         rate.bits >= 1 && rate.bits <= 7 && n > 0 && k > 0 && n % 128 == 0 &&
+         k % 128 == 0;
+}
+
+namespace {
+
+// Tiles (weight rows x tokens): narrow batches (<= 64 rows, X3b) 128 x 64,
+// so one token block reads the weights once; prefill 256 x 256, or 128 x 256
+// when n is not a multiple of 256 (Flash-Next's 640-wide expert outputs).
+enum class Exl3Tile { kNarrow, kWide, kWideHalf };
+
+Exl3Tile PickExl3Tile(std::size_t rows, std::uint32_t n) {
+  if (rows <= 64)
+    return Exl3Tile::kNarrow;
+  return n % 256 == 0 ? Exl3Tile::kWide : Exl3Tile::kWideHalf;
+}
+
+template<int Bits, HalfEpilogue Epilogue, bool Grouped>
+void LaunchExl3Tile(Exl3Tile tile, const void* w, const void* x, float* y,
+                    std::size_t rows, std::uint32_t n, std::uint32_t k,
+                    const void* svh, const void* problems, unsigned count,
+                    hipStream_t stream) {
+  using gufo::core::GgmlType;
+  const auto args = [&](auto kernel, unsigned tokens, unsigned channels,
+                        unsigned threads) {
+    kernel<<<dim3(static_cast<unsigned>((rows + tokens - 1) / tokens),
+                  n / channels, count),
+             threads, 0, stream>>>(w, static_cast<const short*>(x), y,
+                                   static_cast<int>(rows), static_cast<int>(n),
+                                   static_cast<int>(k),
+                                   static_cast<const float*>(svh), problems);
+  };
+  switch (tile) {
+    case Exl3Tile::kNarrow:
+      args(HalfPrefillGemmKernel<128, 64, 4, 2, GgmlType::kQ8_0, Epilogue,
+                                 false, GgmlType::kQ8_0, Bits, Grouped>,
+           64, 128, 256);
+      break;
+    case Exl3Tile::kWide:
+      args(HalfPrefillGemmKernel<256, 256, 8, 4, GgmlType::kQ8_0, Epilogue,
+                                 false, GgmlType::kQ8_0, Bits, Grouped>,
+           256, 256, 1024);
+      break;
+    case Exl3Tile::kWideHalf:
+      args(HalfPrefillGemmKernel<128, 256, 4, 8, GgmlType::kQ8_0, Epilogue,
+                                 false, GgmlType::kQ8_0, Bits, Grouped>,
+           256, 128, 1024);
+      break;
+  }
+}
+
+template<bool Grouped>
+void LaunchExl3Bits(int bits, bool residual, Exl3Tile tile, const void* w,
+                    const void* x, float* y, std::size_t rows, std::uint32_t n,
+                    std::uint32_t k, const void* svh, const void* problems,
+                    unsigned count, hipStream_t stream) {
+  const auto epilogue = [&]<int Bits>() {
+    if (residual)
+      LaunchExl3Tile<Bits, HalfEpilogue::kResidual, Grouped>(
+          tile, w, x, y, rows, n, k, svh, problems, count, stream);
+    else
+      LaunchExl3Tile<Bits, HalfEpilogue::kStore, Grouped>(
+          tile, w, x, y, rows, n, k, svh, problems, count, stream);
+  };
+  switch (bits) {
+    case 1:
+      epilogue.template operator()<1>();
+      break;
+    case 2:
+      epilogue.template operator()<2>();
+      break;
+    case 3:
+      epilogue.template operator()<3>();
+      break;
+    case 4:
+      epilogue.template operator()<4>();
+      break;
+    case 5:
+      epilogue.template operator()<5>();
+      break;
+    case 6:
+      epilogue.template operator()<6>();
+      break;
+    default:
+      epilogue.template operator()<7>();
+      break;
+  }
+}
+
+}  // namespace
 
 void LaunchExl3PrefillGemm(const quant::exl3::DeviceLinear& linear,
                            const void* x, float* y, std::size_t batch,
@@ -1038,54 +1142,28 @@ void LaunchExl3PrefillGemm(const quant::exl3::DeviceLinear& linear,
   if (!Exl3PrefillSupported(linear) || batch == 0) {
     throw std::invalid_argument("EXL3 prefill GEMM: unsupported projection");
   }
-  // Prefill: 256 channels x 256 tokens. Narrow batches (X3b, <= 64 rows):
-  // 128 channels x 64 tokens, so one token block reads the weights once.
-  const bool narrow = batch <= 64;
-  const auto launch = [&]<int Bits, HalfEpilogue Epilogue>() {
-    if (narrow) {
-      HalfPrefillGemmKernel<128, 64, 4, 2, gufo::core::GgmlType::kQ8_0,
-                            Epilogue, false, gufo::core::GgmlType::kQ8_0, Bits>
-          <<<dim3((batch + 63) / 64, linear.n / 128), 256, 0, stream>>>(
-              linear.trellis, static_cast<const short*>(x), y,
-              static_cast<int>(batch), static_cast<int>(linear.n),
-              static_cast<int>(linear.k),
-              reinterpret_cast<const float*>(linear.svh));
-      return;
-    }
-    HalfPrefillGemmKernel<256, 256, 8, 4, gufo::core::GgmlType::kQ8_0, Epilogue,
-                          false, gufo::core::GgmlType::kQ8_0, Bits>
-        <<<dim3((batch + 255) / 256, linear.n / 256), 1024, 0, stream>>>(
-            linear.trellis, static_cast<const short*>(x), y,
-            static_cast<int>(batch), static_cast<int>(linear.n),
-            static_cast<int>(linear.k),
-            reinterpret_cast<const float*>(linear.svh));
-  };
-  const auto bits = [&]<HalfEpilogue Epilogue>() {
-    switch (linear.rate.bits) {
-      case 1:
-        launch.template operator()<1, Epilogue>();
-        break;
-      case 2:
-        launch.template operator()<2, Epilogue>();
-        break;
-      case 3:
-        launch.template operator()<3, Epilogue>();
-        break;
-      case 4:
-        launch.template operator()<4, Epilogue>();
-        break;
-      case 5:
-        launch.template operator()<5, Epilogue>();
-        break;
-      default:
-        launch.template operator()<6, Epilogue>();
-        break;
-    }
-  };
-  if (residual)
-    bits.template operator()<HalfEpilogue::kResidual>();
-  else
-    bits.template operator()<HalfEpilogue::kStore>();
+  LaunchExl3Bits<false>(linear.rate.bits, residual,
+                        PickExl3Tile(batch, linear.n), linear.trellis, x, y,
+                        batch, linear.n, linear.k, linear.svh, nullptr, 1,
+                        stream);
+  HIP_CHECK(hipGetLastError());
+}
+
+void LaunchExl3PrefillGemmGrouped(const Exl3GemmProblem* problems,
+                                  std::size_t count, std::size_t max_rows,
+                                  std::uint32_t k, std::uint32_t n,
+                                  quant::exl3::BitRate rate, bool residual,
+                                  hipStream_t stream) {
+  if (!Exl3GemmShapeSupported(k, n, rate, quant::exl3::Codebook::kMul1) ||
+      count == 0 || count > 65535) {
+    throw std::invalid_argument("EXL3 grouped GEMM: unsupported problem set");
+  }
+  if (max_rows == 0)
+    return;
+  LaunchExl3Bits<true>(rate.bits, residual, PickExl3Tile(max_rows, n), nullptr,
+                       nullptr, nullptr, max_rows, n, k, nullptr, problems,
+                       static_cast<unsigned>(count), stream);
+  HIP_CHECK(hipGetLastError());
 }
 
 void LaunchBatchedQuantGEMMFp16(gufo::core::GgmlType type, const void* w,

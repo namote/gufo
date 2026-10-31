@@ -48,6 +48,25 @@ struct Exl3FastTarget {
   std::size_t y_stride;
 };
 
+/// One problem of a grouped prefill rotation (an expert bucket). Device
+/// memory.
+struct Exl3RotateProblem {
+  const float* x;                  ///< FP32 source rows
+  std::size_t x_stride;            ///< floats between source rows
+  const std::uint32_t* row_index;  ///< gathered source row per output row, or
+                                   ///< null for rows 0 .. rows-1
+  const std::uint16_t* suh;        ///< FP16 [k]
+  std::uint16_t* out;              ///< FP16 [rows][k]
+  std::uint32_t rows;              ///< 0 skips the problem
+  std::uint32_t reserved;
+};
+
+/// Every problem's rows rotated as LaunchExl3RotateRows, in one launch
+/// (count <= 65535; max_rows bounds every problem's rows).
+void LaunchExl3RotateRowsGrouped(const Exl3RotateProblem* problems,
+                                 std::size_t count, std::size_t max_rows,
+                                 std::size_t k, hipStream_t stream);
+
 /// Prefill input rotation: out[r][i] = FP16(H(suh * x[r])) per 128
 /// elements, row-major [rows][k] (the decode path's input-rotation
 /// arithmetic).

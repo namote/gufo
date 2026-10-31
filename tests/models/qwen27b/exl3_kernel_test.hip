@@ -911,6 +911,157 @@ void TestDispatch(std::mt19937& rng) {
     Check(hipFree(p));
 }
 
+// Every K's lane decode (DecodeLaneMul1, the GEMV producer; K7 through the
+// shared 65-bit lane window) against the CPU dequant, FP16 bits.
+template<int K>
+__global__ void DecodeTilesKernel(const std::uint16_t* trellis, unsigned,
+                                  unsigned n, std::uint16_t* out) {
+  const unsigned lane = threadIdx.x;
+  const unsigned tile = blockIdx.x, n_tiles = n / 16;
+  const unsigned kt = tile / n_tiles, nt = tile % n_tiles;
+  const auto lw = gufo::hip::exl3::MakeLaneWindow<K>(lane);
+  gufo::hip::exl3::Half2 w[4];
+  gufo::hip::exl3::DecodeLaneMul1<K>(
+      reinterpret_cast<const std::uint32_t*>(trellis) +
+          std::size_t(tile) * 8 * K,
+      lw, w);
+  const unsigned r0 = (lane % 4) * 2, c0 = lane / 4;
+  for (int q = 0; q < 4; ++q) {
+    const unsigned col = nt * 16 + c0 + 8 * (q / 2);
+    const unsigned row = kt * 16 + r0 + 8 * (q % 2);
+    out[std::size_t(row) * n + col] = __builtin_bit_cast(std::uint16_t, w[q].x);
+    out[std::size_t(row + 1) * n + col] =
+        __builtin_bit_cast(std::uint16_t, w[q].y);
+  }
+}
+
+template<int K>
+std::size_t DecodeTilesDiff(std::mt19937& rng) {
+  constexpr unsigned k = 256, n = 512;
+  const BitRate rate{K, false};
+  std::vector<std::uint16_t> trellis((k / 16) * (n / 16) * rate.TileWords());
+  for (auto& w : trellis)
+    w = static_cast<std::uint16_t>(rng());
+  std::vector<std::uint16_t> want(k * n);
+  DequantInner(trellis.data(), k, n, rate, Codebook::kMul1, want.data());
+  auto* d_t = Upload(trellis);
+  std::uint16_t* d_out = nullptr;
+  Check(hipMalloc(&d_out, k * n * 2));
+  hipLaunchKernelGGL(DecodeTilesKernel<K>, dim3((k / 16) * (n / 16)), dim3(32),
+                     0, 0, d_t, k, n, d_out);
+  const auto got = Download(d_out, k * n);
+  std::size_t diff = 0;
+  for (std::size_t i = 0; i < got.size(); ++i)
+    diff += got[i] != want[i];
+  Check(hipFree(d_t));
+  Check(hipFree(d_out));
+  return diff;
+}
+
+void TestDecodeTiles(std::mt19937& rng) {
+  const std::size_t diffs[] = {DecodeTilesDiff<1>(rng), DecodeTilesDiff<2>(rng),
+                               DecodeTilesDiff<3>(rng), DecodeTilesDiff<4>(rng),
+                               DecodeTilesDiff<5>(rng), DecodeTilesDiff<6>(rng),
+                               DecodeTilesDiff<7>(rng)};
+  for (int b = 0; b < 7; ++b)
+    Expect(diffs[b] == 0, "lane decode K" + std::to_string(b + 1) + ": " +
+                              std::to_string(diffs[b]) + " FP16 values differ");
+  std::cout << "lane decode K1..K7 vs CPU: ";
+  for (int b = 0; b < 7; ++b)
+    std::cout << diffs[b] << (b < 6 ? "/" : " values differ\n");
+}
+
+// Grouped rotation (gathered rows) and grouped GEMM over expert-like buckets
+// with ragged rows (0, 7, 33, 300): every problem against its FP64 reference
+// at the WMMA bound, finite, and rotated rows against the FP32 contract.
+void TestGrouped(std::mt19937& rng) {
+  constexpr std::size_t k = 2560, n = 640, source_rows = 400;
+  const BitRate rate{5, false};
+  const std::size_t rows[] = {0, 7, 33, 300};
+  constexpr std::size_t count = 4, max_rows = 300;
+  std::normal_distribution<float> normal;
+  std::vector<float> x(source_rows * k);
+  for (auto& v : x)
+    v = normal(rng);
+  auto* d_x = Upload(x);
+  std::vector<void*> owned;
+  std::vector<gufo::hip::Exl3RotateProblem> rot(count);
+  std::vector<gufo::hip::Exl3GemmProblem> gemm(count);
+  struct Host {
+    std::vector<std::uint16_t> trellis, suh, svh, inner;
+    std::vector<std::uint32_t> index;
+  };
+  std::vector<Host> host(count);
+  for (std::size_t p = 0; p < count; ++p) {
+    Host& h = host[p];
+    h.trellis.resize((k / 16) * (n / 16) * rate.TileWords());
+    for (auto& w : h.trellis)
+      w = static_cast<std::uint16_t>(rng());
+    h.suh = RandomScales(rng, k, 0x3800);
+    h.svh = RandomScales(rng, n, 0x2000);
+    h.inner.resize(k * n);
+    DequantInner(h.trellis.data(), k, n, rate, Codebook::kMul1, h.inner.data());
+    for (std::size_t r = 0; r < rows[p]; ++r)
+      h.index.push_back(static_cast<std::uint32_t>(rng() % source_rows));
+    if (h.index.empty())
+      h.index.push_back(0);
+    auto* d_t = Upload(h.trellis);
+    auto* d_suh = Upload(h.suh);
+    auto* d_svh = Upload(h.svh);
+    auto* d_index = Upload(h.index);
+    std::uint16_t* d_slab = nullptr;
+    float* d_y = nullptr;
+    Check(hipMalloc(&d_slab, std::max<std::size_t>(rows[p], 1) * k * 2));
+    Check(hipMalloc(&d_y, std::max<std::size_t>(rows[p], 1) * n * 4));
+    owned.insert(owned.end(), {d_t, d_suh, d_svh, d_index, d_slab, d_y});
+    rot[p] = {
+        d_x, k, d_index, d_suh, d_slab, static_cast<std::uint32_t>(rows[p]), 0};
+    gemm[p] = {d_t, d_svh, d_slab, d_y, static_cast<std::uint32_t>(rows[p]), 0};
+  }
+  auto* d_rot = Upload(rot);
+  auto* d_gemm = Upload(gemm);
+  gufo::hip::LaunchExl3RotateRowsGrouped(d_rot, count, max_rows, k, nullptr);
+  gufo::hip::LaunchExl3PrefillGemmGrouped(d_gemm, count, max_rows, k, n, rate,
+                                          false, nullptr);
+  Check(hipDeviceSynchronize());
+  const double bar = static_cast<double>(k) / 16.0 * std::ldexp(1.0, -23);
+  for (std::size_t p = 0; p < count; ++p) {
+    if (rows[p] == 0)
+      continue;
+    const Host& h = host[p];
+    const auto slab =
+        Download(static_cast<const std::uint16_t*>(rot[p].out), rows[p] * k);
+    const auto y = Download(gemm[p].y, rows[p] * n);
+    std::size_t rot_diff = 0;
+    double num = 0.0, den = 0.0;
+    bool finite = true;
+    for (std::size_t r = 0; r < rows[p]; ++r) {
+      const auto rr = KernelRotatedInput(&x[h.index[r] * k], h.suh.data(), k);
+      for (std::size_t i = 0; i < k; ++i)
+        rot_diff += slab[r * k + i] != HalfFromDouble(rr[i]);
+      const auto want = ProjectRotated(rr, h.inner, h.svh, k, n);
+      for (std::size_t j = 0; j < n; ++j) {
+        finite = finite && std::isfinite(y[r * n + j]);
+        num += (y[r * n + j] - want[j]) * (y[r * n + j] - want[j]);
+        den += want[j] * want[j];
+      }
+    }
+    const double rel = std::sqrt(num / den);
+    const std::string name = "grouped problem " + std::to_string(p) +
+                             " rows=" + std::to_string(rows[p]);
+    Expect(rot_diff == 0, name + ": gathered rotation differs");
+    Expect(finite, name + ": non-finite output");
+    Expect(rel < bar, name + " relative L2 " + std::to_string(rel));
+    std::cout << name << ": relative L2 " << rel << " (bar " << bar
+              << "), rotation diffs " << rot_diff << "\n";
+  }
+  for (void* p : owned)
+    Check(hipFree(p));
+  for (void* p : {static_cast<void*>(d_x), static_cast<void*>(d_rot),
+                  static_cast<void*>(d_gemm)})
+    Check(hipFree(p));
+}
+
 }  // namespace
 
 int main() {
@@ -918,9 +1069,18 @@ int main() {
   std::cout << std::unitbuf;
   std::mt19937 rng(20261030);
   // Narrow and wide outputs cover the 16-, 8- and 4-wave launch shapes.
-  const Problem problems[] = {{1024, 2048, 5}, {6144, 1024, 5}, {512, 16384, 6},
-                              {2048, 1024, 4}, {384, 256, 3},   {256, 512, 2},
-                              {256, 384, 1}};
+  const Problem problems[] = {{1024, 2048, 5},
+                              {6144, 1024, 5},
+                              {512, 16384, 6},
+                              {2048, 1024, 4},
+                              {384, 256, 3},
+                              {256, 512, 2},
+                              {256, 384, 1},
+                              // Flash-Next: K7 trunk, K5 experts (640 wide).
+                              {2560, 512, 7},
+                              {2560, 640, 5},
+                              {640, 2560, 5},
+                              {6144, 2560, 7}};
   for (const Problem& p : problems)
     TestProblem(p, rng);
   // q + k + v (four tiles per wave) and gate + up shapes at small k.
@@ -938,6 +1098,14 @@ int main() {
   TestPrefill(512, 256, 4, 65, rng);
   TestPrefill(17408, 256, 5, 33, rng);
   TestPrefill(5120, 256, 6, 520, rng);
+  // Flash-Next shapes: K7 trunk (prefill and narrow), 640-wide experts
+  // (the 128 x 256 tile), 640 -> 2560 down.
+  TestPrefill(2560, 512, 7, 300, rng);
+  TestPrefill(2560, 512, 7, 33, rng);
+  TestPrefill(2560, 640, 5, 300, rng);
+  TestPrefill(640, 2560, 5, 65, rng);
+  TestDecodeTiles(rng);
+  TestGrouped(rng);
   TestDispatch(rng);
   if (failures != 0) {
     std::cerr << failures << " failure(s)\n";
