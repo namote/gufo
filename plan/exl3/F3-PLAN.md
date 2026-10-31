@@ -168,3 +168,18 @@ All take `quant::exl3::DeviceLinear` or raw device pointers in checkpoint layout
 
 - The GGUF `HalfPrefillGemmKernel` instances are unchanged in resources and instruction text (ISA comparison).
 - The 27B GEMV/prefill kernels changed only in instruction scheduling of the integer decode (same ops), so the results are the same. The 27B kernel test values and fingerprints are reconfirmed in the next unit window.
+
+### F3-API status (W3, 2026-10-31 17:50)
+
+- **#1:** done. The GPU unit window f3u1 (45462f43) passed every production check:
+  - K7 2560→512 and 6144→2560 GEMV
+  - K7 prefill at 300 and 33 rows
+  - K5 640-wide (128×256 tile)
+  - 640→2560
+  - grouped 7/33/300
+  - 27B fingerprints identical to rq2h
+- **The new lane-decode test failed** because of a compiler miscompile, which is a warning for workers. hipcc 7.2 (gfx1151, true16) compiles `__builtin_bit_cast(std::uint16_t, half2.y)` to a `global_store_b16` of the low half. Verified in the ISA. Split the pair as a dword (`bit_cast<uint32_t>(pair) >> 16`) instead. The fixed test stores correctly (`global_store_d16_hi_b16`); it will be confirmed in the combined pass.
+- **#2 code:** the shared K7 lane window takes the K7 GEMV kernel (M8 W4 TN2) from 1379 to 1015 instructions, the same as K6 (1010). Neither has spills. VGPRs: 84 for K7 vs 81 for K6.
+- **Remaining #2 work goes to the combined pass:**
+  - FN-shape timing with `tools/bench/exl3_k7_bench.hip`: GEMV vs WMMA at R=1..8, and the 2×4 / 2×8 / 2×16 / 4×4 shape sweep with checks against production output.
+  - Tuning `PickShape` from those results. With few blocks (o, shared down: 80 blocks), wider waves are the candidate.

@@ -12,6 +12,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -929,9 +930,12 @@ __global__ void DecodeTilesKernel(const std::uint16_t* trellis, unsigned,
   for (int q = 0; q < 4; ++q) {
     const unsigned col = nt * 16 + c0 + 8 * (q / 2);
     const unsigned row = kt * 16 + r0 + 8 * (q % 2);
-    out[std::size_t(row) * n + col] = __builtin_bit_cast(std::uint16_t, w[q].x);
+    // Split the pair as a dword: hipcc 7.2 stores the low half for both
+    // elements of __builtin_bit_cast(std::uint16_t, w[q].y) (true16).
+    const auto pair = __builtin_bit_cast(std::uint32_t, w[q]);
+    out[std::size_t(row) * n + col] = static_cast<std::uint16_t>(pair);
     out[std::size_t(row + 1) * n + col] =
-        __builtin_bit_cast(std::uint16_t, w[q].y);
+        static_cast<std::uint16_t>(pair >> 16);
   }
 }
 
@@ -949,6 +953,8 @@ std::size_t DecodeTilesDiff(std::mt19937& rng) {
   Check(hipMalloc(&d_out, k * n * 2));
   hipLaunchKernelGGL(DecodeTilesKernel<K>, dim3((k / 16) * (n / 16)), dim3(32),
                      0, 0, d_t, k, n, d_out);
+  Check(hipGetLastError());
+  Check(hipDeviceSynchronize());
   const auto got = Download(d_out, k * n);
   std::size_t diff = 0;
   for (std::size_t i = 0; i < got.size(); ++i)
@@ -972,13 +978,16 @@ void TestDecodeTiles(std::mt19937& rng) {
 }
 
 // Grouped rotation (gathered rows) and grouped GEMM over expert-like buckets
-// with ragged rows (0, 7, 33, 300): every problem against its FP64 reference
-// at the WMMA bound, finite, and rotated rows against the FP32 contract.
-void TestGrouped(std::mt19937& rng) {
+// with ragged rows: every problem against its FP64 reference at the WMMA
+// bound, finite, and rotated rows against the FP32 contract. With residual
+// the outputs start from a known prior; the zero-row problem's output must
+// stay untouched (sentinel). max_rows picks the tile (<= 64: narrow).
+void TestGrouped(std::mt19937& rng, const std::size_t (&rows)[4],
+                 std::size_t max_rows, bool residual) {
   constexpr std::size_t k = 2560, n = 640, source_rows = 400;
   const BitRate rate{5, false};
-  const std::size_t rows[] = {0, 7, 33, 300};
-  constexpr std::size_t count = 4, max_rows = 300;
+  constexpr std::size_t count = 4;
+  constexpr std::uint32_t kSentinel = 0x7fc0beefU;
   std::normal_distribution<float> normal;
   std::vector<float> x(source_rows * k);
   for (auto& v : x)
@@ -990,6 +999,7 @@ void TestGrouped(std::mt19937& rng) {
   struct Host {
     std::vector<std::uint16_t> trellis, suh, svh, inner;
     std::vector<std::uint32_t> index;
+    std::vector<float> prior;
   };
   std::vector<Host> host(count);
   for (std::size_t p = 0; p < count; ++p) {
@@ -1013,6 +1023,16 @@ void TestGrouped(std::mt19937& rng) {
     float* d_y = nullptr;
     Check(hipMalloc(&d_slab, std::max<std::size_t>(rows[p], 1) * k * 2));
     Check(hipMalloc(&d_y, std::max<std::size_t>(rows[p], 1) * n * 4));
+    {
+      // Prior: a sentinel for the zero-row problem, values for residual.
+      std::vector<float> prior(std::max<std::size_t>(rows[p], 1) * n);
+      for (std::size_t i = 0; i < prior.size(); ++i)
+        prior[i] = rows[p] == 0 ? std::bit_cast<float>(kSentinel)
+                                : (static_cast<float>(i % 7) - 3.0F) * 0x1p-8F;
+      h.prior = prior;
+      Check(hipMemcpy(d_y, prior.data(), prior.size() * 4,
+                      hipMemcpyHostToDevice));
+    }
     owned.insert(owned.end(), {d_t, d_suh, d_svh, d_index, d_slab, d_y});
     rot[p] = {
         d_x, k, d_index, d_suh, d_slab, static_cast<std::uint32_t>(rows[p]), 0};
@@ -1022,13 +1042,19 @@ void TestGrouped(std::mt19937& rng) {
   auto* d_gemm = Upload(gemm);
   gufo::hip::LaunchExl3RotateRowsGrouped(d_rot, count, max_rows, k, nullptr);
   gufo::hip::LaunchExl3PrefillGemmGrouped(d_gemm, count, max_rows, k, n, rate,
-                                          false, nullptr);
+                                          residual, nullptr);
   Check(hipDeviceSynchronize());
   const double bar = static_cast<double>(k) / 16.0 * std::ldexp(1.0, -23);
   for (std::size_t p = 0; p < count; ++p) {
-    if (rows[p] == 0)
-      continue;
     const Host& h = host[p];
+    if (rows[p] == 0) {
+      const auto y = Download(gemm[p].y, n);
+      bool untouched = true;
+      for (float v : y)
+        untouched = untouched && std::bit_cast<std::uint32_t>(v) == kSentinel;
+      Expect(untouched, "grouped zero-row problem: output written");
+      continue;
+    }
     const auto slab =
         Download(static_cast<const std::uint16_t*>(rot[p].out), rows[p] * k);
     const auto y = Download(gemm[p].y, rows[p] * n);
@@ -1042,13 +1068,20 @@ void TestGrouped(std::mt19937& rng) {
       const auto want = ProjectRotated(rr, h.inner, h.svh, k, n);
       for (std::size_t j = 0; j < n; ++j) {
         finite = finite && std::isfinite(y[r * n + j]);
-        num += (y[r * n + j] - want[j]) * (y[r * n + j] - want[j]);
+        // Residual: compare the added part (the prior is exact in FP32
+        // only up to the final rounding, which the bar covers).
+        const double got =
+            static_cast<double>(y[r * n + j]) -
+            (residual ? static_cast<double>(h.prior[r * n + j]) : 0.0);
+        num += (got - want[j]) * (got - want[j]);
         den += want[j] * want[j];
       }
     }
     const double rel = std::sqrt(num / den);
-    const std::string name = "grouped problem " + std::to_string(p) +
-                             " rows=" + std::to_string(rows[p]);
+    const std::string name =
+        std::string("grouped ") + (max_rows <= 64 ? "narrow" : "wide") +
+        (residual ? " residual" : "") + " problem " + std::to_string(p) +
+        " rows=" + std::to_string(rows[p]);
     Expect(rot_diff == 0, name + ": gathered rotation differs");
     Expect(finite, name + ": non-finite output");
     Expect(rel < bar, name + " relative L2 " + std::to_string(rel));
@@ -1105,7 +1138,8 @@ int main() {
   TestPrefill(2560, 640, 5, 300, rng);
   TestPrefill(640, 2560, 5, 65, rng);
   TestDecodeTiles(rng);
-  TestGrouped(rng);
+  TestGrouped(rng, {0, 7, 33, 300}, 300, false);
+  TestGrouped(rng, {5, 0, 64, 1}, 64, true);
   TestDispatch(rng);
   if (failures != 0) {
     std::cerr << failures << " failure(s)\n";
