@@ -20,7 +20,9 @@ Checks (all must pass; headers only, no tensor data is read):
 --survey (for packs without recorded expectations, e.g. other bitrates or other quantizers): config, bits
 and side only report what the pack holds (bits per category, MTP/vision K, n-gram trellis shape) and do
 not fail; storage and index stay strict. --extra FILE adds the headers of a safetensors file kept outside
-the pack (e.g. an n-gram table shared with another pack) to the storage check.
+the pack (e.g. an n-gram table shared with another pack) to the storage check. --ignore-file NAME reports
+the tensors of an engine-specific sidecar file (e.g. Kyojin's hc_gs_sidecar.safetensors) instead of
+requiring them in tensor_storage.
 Standard library only.
 """
 from __future__ import annotations
@@ -70,6 +72,8 @@ def main() -> int:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--survey", action="store_true")
     ap.add_argument("--extra", type=Path, action="append", default=[])
+    ap.add_argument("--ignore-file", action="append", default=[],
+                    help="engine-specific sidecar file whose tensors are reported, not required in tensor_storage")
     a = ap.parse_args()
     rep: dict = {"pack": str(a.pack), "checks": {}}
 
@@ -91,7 +95,10 @@ def main() -> int:
                 bad.append({"tensor": name, "header": [h["shape"], h["dtype"], h["bytes"]], "listed": [t["shape"], t["dtype"], t["n_bytes"]]})
     unlisted = sorted(k for k in hdr if k not in listed)
     side = [k for k in unlisted if k.startswith("mtp.") or k.startswith("model.visual.") or hdr[k]["file"].startswith("mtp_")]
-    nonleaf = re.compile(r"\.(linear_attn\.(A_log|dt_bias|conv1d\.weight)|ple\.conv1d\.weight)$")
+    # Parameters upstream may leave out of tensor_storage: non-leaf GDN/PLE parameters, and the PLE norms
+    # (listed by the 5.05 pack, not by the 4.05 pack of the same repository)
+    nonleaf = re.compile(r"\.(linear_attn\.(A_log|dt_bias|conv1d\.weight)|ple\.(conv1d|norm_conv|norm_key|norm_query)\.weight)$")
+    side += [k for k in unlisted if hdr[k]["file"] in a.ignore_file and k not in side]
     unlisted_nonleaf = [k for k in unlisted if k not in side and nonleaf.search(k)]
     unlisted_main = [k for k in unlisted if k not in side and k not in unlisted_nonleaf]
     rep["checks"]["storage"] = {"PASS": not (bad or missing or unlisted_main), "listed": len(listed), "header_tensors": len(hdr),
