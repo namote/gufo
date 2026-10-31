@@ -343,6 +343,17 @@ cold는 새 프로세스의 첫 요청(빈 행 캐시), warm은 같은 요청의
     - **읽기 경로:** chunk 2개(sink에서 시작, ring 행 staging), pass 9종(in-pass 경계, rewind 뒤 재양자화, 그룹 끝 flush)의 14회 실행이 모두 연속 FP16 참조와 **비트 단위로 같다**(max abs 0).
   - Flash-Next `attention_ops` PASS(49 s, FP16 kernel이 템플릿 분리 뒤에도 그대로임을 확인).
 
+### Codex 리뷰 수정 (2026-10-31, `cdbe0563`) [확인]
+
+- **리뷰(감독 전달, `fa5ba8af`):** rewind, 재양자화, graph replay, batch 계획, 262K 산술에는 결함이 없다고 했다. 고친 세 가지는 다음과 같다.
+  1. **(P1) KVarN HTTP 서버가 뜨지 않았다:** component cache를 끄면 일반 session pool이 `CreateState()`를 부르는데, Flash-Next는 거기서 무조건 throw했다. 이제 세션을 소유하는 상태를 만든다. adapter가 없을 때 무효화는 세션 `Reset()`이다.
+  2. **(P2) 그룹 끝 flush와 snapshot capture 경합:** `FinishKvarn`이 forward의 마지막 synchronize 뒤에 양자화를 띄우고 기다리지 않았다. 이제 그 flush 뒤에 stream을 synchronize한다(128 토큰마다 한 번).
+  3. **(P2) prompt/bench가 kvarn-k4v4를 조용히 무시했다:** 이제 `ModelOptions::kvarn`을 넘긴다. bench는 `KV cache:` 줄을 출력한다.
+- **창 `PLAN-F1-K2S.json` `f1-k2-smoke`(이미지 id `9119e062`, 라벨 `cdbe0563`):** COMPLETE.
+  - `kv_cache_type_test`와 Flash-Next `kvarn_ops`(K2T와 같은 결과, 읽기 경로 14회 비트 동일) PASS.
+  - **서버 기동 smoke(`f1_smoke.py`, 품질·타이밍 검사가 아니다):** `--kv-cache-type kvarn-k4v4 --context 8192 --sessions 2`로 AR과 MTP 각각 서버가 뜬다. 340토큰 prompt(chunk > 128)에 300토큰 decode(그룹 끝 384/512/640 통과), 동시 2요청(batched decode)과 반복 1요청이 모두 일관된 답을 냈다. 반복 응답은 같다.
+  - 첫 시도는 smoke 스크립트의 model 이름 오류(404)였다. 서버는 그때도 떴다(`f1-k2-smoke.attempt-1-model-name/`).
+
 ### Codex F2(fn-exl3)와 충돌 지점
 
 - `Executor::Attention`의 fused `AttentionF16Gemm` / `Dense(attn_qkv)` + `PrepareAttention` 호출(F2-DESIGN.md:240-266의 projection 호출 지점). F1은 이 호출들에서 K/V writer 인자(`write_k`, `write_v`, `write_rows`)만 바꿨다. F2가 이 호출을 EXL3 projection으로 바꾸면 merge 때 writer 인자 세 개를 새 호출에 옮겨야 한다.
