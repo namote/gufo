@@ -23,7 +23,6 @@
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/core/platform/pages.hpp"
 #include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
-#include "src/models/qwen/hip/ops/plain_prefill_stable.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
@@ -1163,7 +1162,17 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     e->exl3_prefill_scratch_bytes_ = layout.bytes;
   }
   s.tokens = Alloc<std::int32_t>(a, T, error_msg);
-  s.x_half = Alloc<std::uint16_t>(a, T * model.max_half_cols(), error_msg);
+  // F32 plain weights do not contribute to max_half_cols during upload.
+  // EXL3 prefill nevertheless narrows their inputs, including F32 HC/PLE.
+  e->half_input_cols_ =
+      model.output().exl3 != nullptr
+          ? std::max(
+                {model.max_half_cols(), hc_dim, hidden,
+                 std::size_t{c.PleEmbeddingDim()}, std::size_t{c.SsmValueDim()},
+                 std::size_t{c.AttentionQDim()}, std::size_t{c.hc_low_rank},
+                 std::size_t{c.expert_ff}, std::size_t{c.shared_expert_ff}})
+          : model.max_half_cols();
+  s.x_half = Alloc<std::uint16_t>(a, T * e->half_input_cols_, error_msg);
   for (void*& slot : s.x_q8) {
     slot = Alloc<std::uint8_t>(
         a,
@@ -2208,29 +2217,46 @@ bool Executor::StoreMtpKv(const DeviceLayer& l, const Session& session,
   return false;
 }
 
+bool Executor::PlainDensePrefill(const DeviceTensor& w, const float* x,
+                                 float* out, std::uint32_t rows,
+                                 std::string* error) const {
+  if ((w.type != GgmlType::kF16 && w.type != GgmlType::kBF16 &&
+       w.type != GgmlType::kF32) ||
+      w.cols > half_input_cols_ || w.cols % 32 != 0) {
+    AssignError(error, "unsupported plain half prefill geometry/type");
+    return false;
+  }
+  const auto piece = std::max<std::uint32_t>(1, options_.max_batch);
+  for (std::uint32_t first = 0; first < rows; first += piece) {
+    const auto count = std::min(piece, rows - first);
+    PrepareHalfInput(x + std::size_t{first} * w.cols, count, w.cols);
+    if (!PlainPrefillGemm(w.data, SmallType(w.type),
+                          static_cast<const __half*>(s_.x_half),
+                          out + std::size_t{first} * w.rows, count, w.rows,
+                          w.cols, stream_)) {
+      AssignError(error, "plain half prefill GEMM failed");
+      return false;
+    }
+  }
+  if (diagnostics_active_)
+    cycle_diagnostics_.prefill_plain_half_rows += rows;
+  return true;
+}
+
 bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
                      std::uint32_t n_tokens, std::string* error_msg) const {
   if (prefill_phase && w.exl3 != nullptr)
     return Exl3DensePrefill({&w}, {out}, x, n_tokens, error_msg);
   if (diagnostics_active_ && prefill_phase && model_->output().exl3 != nullptr)
     cycle_diagnostics_.prefill_plain_rows += n_tokens;
-  // The EXL3 pack retains plain HC/router/GDN operands. Their FP32 input
-  // precision and reduction must not change with phase or cohort width.
+  // Prefill plain operands use the accepted FP16 activation boundary
+  // at every width. Decode/verify retain the established FP32-input path.
   if (w.exl3 != nullptr || model_->output().exl3 != nullptr) {
     try {
-      // Both kernels keep FP32 inputs, exact weight widening, the same four
-      // FMAs per lane per 128-element step, and the xor 16..1 reduction.
-      // Use LDS reuse beyond the small GEMM's eight-row register tile;
-      // crossing this threshold must preserve every output bit.
-      if (prefill_phase && w.exl3 == nullptr && n_tokens > 8 &&
+      if (prefill_phase && w.exl3 == nullptr &&
           (w.type == GgmlType::kF16 || w.type == GgmlType::kBF16 ||
-           w.type == GgmlType::kF32)) {
-        gufo::hip::LaunchPlainPrefillStable(w.type, w.data, x, out, n_tokens,
-                                            w.rows, w.cols, stream_);
-        if (diagnostics_active_)
-          cycle_diagnostics_.prefill_plain_tiled_rows += n_tokens;
-        return true;
-      }
+           w.type == GgmlType::kF32))
+        return PlainDensePrefill(w, x, out, n_tokens, error_msg);
       const auto piece = std::max<std::uint32_t>(1, options_.max_batch);
       for (std::uint32_t first = 0; first < n_tokens; first += piece) {
         const auto count = std::min(piece, n_tokens - first);

@@ -78,11 +78,19 @@ struct ExecutorTestAccess {
     return exec.exl3_;
   }
   static float* RoutedOutput(const Executor& exec) { return exec.s_.down_e; }
+  static void HalfWeightCols(DeviceModel& model, unsigned cols) {
+    model.max_half_cols_ = cols;
+  }
   static bool DensePrefill(const Executor& exec,
                            std::initializer_list<const DeviceTensor*> weights,
                            std::initializer_list<float*> outputs,
                            const float* x, unsigned rows, std::string* error) {
     return exec.Exl3DensePrefill(weights, outputs, x, rows, error);
+  }
+  static bool PlainPrefill(const Executor& exec, const DeviceTensor& weight,
+                           const float* x, float* out, unsigned rows,
+                           std::string* error) {
+    return exec.PlainDensePrefill(weight, x, out, rows, error);
   }
   struct State {
     std::vector<std::uint16_t> k, v, pooled;
@@ -918,7 +926,8 @@ struct MtpExecutorFixture {
                    : gpu::DeviceTensor{}};
   }
   explicit MtpExecutorFixture(unsigned max_batch = 16, unsigned expert_ff = 128,
-                              int shared_bits = 6, bool linear_prefix = false) {
+                              int shared_bits = 6, bool linear_prefix = false,
+                              unsigned half_weight_cols = 0) {
     config.num_layers = linear_prefix ? 2 : 1;
     config.num_layers_all = config.num_layers + 1;
     config.hidden_size = 128;
@@ -999,6 +1008,8 @@ struct MtpExecutorFixture {
     model = gpu::ExecutorTestAccess::Model(config, l, embedding, output,
                                            Mixer(false),
                                            linear_prefix ? &linear : nullptr);
+    if (half_weight_cols != 0)
+      gpu::ExecutorTestAccess::HalfWeightCols(*model, half_weight_cols);
     std::string error;
     exec = gpu::Executor::Create(*model, nullptr,
                                  {.max_batch = max_batch,
@@ -1314,9 +1325,11 @@ void DensePrefillProjection() {
 }
 
 void PlainOperandPrecision() {
-  BeginCase(
-      "plain operands retain FP32 inputs: half-WMMA cancellation witness");
+  BeginCase("plain prefill rounds to FP16; decode retains FP32 cancellation");
   constexpr unsigned rows = 65, k = 128, n = 128;
+  MtpExecutorFixture fixture(rows, 128, 6, false, k);
+  auto& exec = *fixture.exec;
+  std::string error;
   Buffers buffers;
   std::vector<float> input(rows * k), expected(rows * n);
   for (unsigned row = 0; row < rows; ++row) {
@@ -1356,13 +1369,19 @@ void PlainOperandPrecision() {
                             std::min(chunk, rows - first), {}, nullptr, false);
       SameBits(expected, gpu::ExecutorTestAccess::Read<float>(y, rows * n),
                "plain projection vs exact FP64 cancellation result");
-      Check(hipMemset(y, 0xFF, rows * n * sizeof(float)));
+      // Approved prefill contract returns to the pre-66b2d89c FP16 input
+      // boundary. These two inputs become identical halves, so their exact
+      // dot product is zero; decode above must retain the nonzero FP32 dot.
+      Check(hipMemsetAsync(y, 0xFF, rows * n * sizeof(float), exec.stream()));
       for (unsigned first = 0; first < rows; first += chunk)
-        gufo::hip::LaunchPlainPrefillStable(
-            type, plain.data, x + first * k, y + first * n,
-            std::min(chunk, rows - first), n, k, nullptr);
-      SameBits(expected, gpu::ExecutorTestAccess::Read<float>(y, rows * n),
-               "tiled plain prefill retains FP32 cancellation result");
+        Require(gpu::ExecutorTestAccess::PlainPrefill(
+                    exec, plain, x + first * k, y + first * n,
+                    std::min(chunk, rows - first), &error),
+                error);
+      Check(hipStreamSynchronize(exec.stream()));
+      SameBits(std::vector<float>(rows * n),
+               gpu::ExecutorTestAccess::Read<float>(y, rows * n),
+               "prefill vs exact FP16 cancellation oracle");
     }
     auto rounded = input;
     for (auto& v : rounded)
@@ -1373,6 +1392,106 @@ void PlainOperandPrecision() {
     Require(std::ranges::all_of(narrowed, [](float v) { return v == 0; }),
             "witness must expose FP16 input's loss of the nonzero dot product");
   }
+  // F32 weights are omitted from the uploader's half-weight width bound.
+  // A valid wide F32 HC input still needs narrowing scratch from the model
+  // geometry, rather than rejecting it against that narrower metadata.
+  const unsigned wide_k = fixture.config.HcDim();
+  gpu::DeviceTensor wide;
+  wide.type = gufo::core::GgmlType::kF32;
+  wide.rows = n;
+  wide.cols = wide_k;
+  wide.data = buffers.Copy(std::vector<float>(n * wide_k, 0.25F));
+  auto* wide_x = buffers.Copy(std::vector<float>(rows * wide_k, 0.25F));
+  Require(wide_k > fixture.model->max_half_cols(), "F32 HC capacity witness");
+  Require(gpu::ExecutorTestAccess::PlainPrefill(exec, wide, wide_x, y, rows,
+                                                &error),
+          error);
+  Check(hipStreamSynchronize(exec.stream()));
+  SameBits(std::vector<float>(rows * n, wide_k * 0.0625F),
+           gpu::ExecutorTestAccess::Read<float>(y, rows * n),
+           "wide F32 HC prefill scratch and exact FP16 oracle", n);
+}
+
+void PlainPrefillHalf() {
+  BeginCase("plain FP16 WMMA fixed reduction: chunk bytes and rounded FP64");
+  using gufo::core::GgmlType;
+  using Access = gpu::ExecutorTestAccess;
+  constexpr unsigned rows = 129;
+  std::mt19937 rng(0xF316A11U);
+  std::uniform_real_distribution<float> random(-0.125F, 0.125F);
+  for (const auto [k, n] : {std::pair{128U, 33U}, std::pair{320U, 128U},
+                            std::pair{10240U, 320U}, std::pair{320U, 10240U}})
+    for (auto type : {GgmlType::kF16, GgmlType::kBF16, GgmlType::kF32}) {
+      if (type != GgmlType::kF16 && (k == 10240 || n == 10240))
+        continue;
+      BeginCase("plain FP16 WMMA k=" + std::to_string(k) +
+                " n=" + std::to_string(n) +
+                " type=" + std::to_string(static_cast<unsigned>(type)));
+      Buffers buffers;
+      std::vector<float> input(rows * k), weights(n * k);
+      for (auto& v : input)
+        v = random(rng);
+      for (auto& v : weights)
+        v = random(rng);
+      const void* w = nullptr;
+      const auto wt = type == GgmlType::kF16    ? gpu::WeightType::kF16
+                      : type == GgmlType::kBF16 ? gpu::WeightType::kBF16
+                                                : gpu::WeightType::kF32;
+      if (type == GgmlType::kF32) {
+        w = buffers.Copy(weights);
+      } else {
+        std::vector<std::uint16_t> bits(weights.size());
+        for (std::size_t i = 0; i < bits.size(); ++i) {
+          bits[i] = type == GgmlType::kF16
+                        ? ex::HalfFromDouble(weights[i])
+                        : std::bit_cast<std::uint32_t>(weights[i]) >> 16;
+          weights[i] = type == GgmlType::kF16
+                           ? float(ex::HalfToDouble(bits[i]))
+                           : std::bit_cast<float>(std::uint32_t{bits[i]} << 16);
+        }
+        w = buffers.Copy(bits);
+      }
+      // WMMA consumes these rounded operands. The F64 oracle includes both
+      // FP16 boundaries; its 1e-5 bar measures accumulation, not input loss.
+      for (auto& v : weights)
+        v = float(ex::HalfToDouble(ex::HalfFromDouble(v)));
+      auto rounded = input;
+      for (auto& v : rounded)
+        v = float(ex::HalfToDouble(ex::HalfFromDouble(v)));
+      auto* x = buffers.Copy(input);
+      auto* half = buffers.Make<std::uint16_t>(input.size());
+      gpu::NarrowActivations(x, half, false, input.size(), nullptr);
+      auto* y = buffers.Make<float>(rows * n + 8);
+      const auto project = [&](unsigned chunk) {
+        Check(hipMemset(y, 0xA5, (rows * n + 8) * sizeof(float)));
+        for (unsigned first = 0; first < rows; first += chunk)
+          Require(
+              gpu::PlainPrefillGemm(
+                  w, wt, reinterpret_cast<const __half*>(half + first * k),
+                  y + first * n, std::min(chunk, rows - first), n, k, nullptr),
+              "plain FP16 WMMA shape supported");
+        const auto guard = Access::Read<std::uint32_t>(y + rows * n, 8);
+        Require(
+            std::ranges::all_of(guard, [](auto v) { return v == 0xA5A5A5A5U; }),
+            "plain FP16 WMMA preserves ragged output guard");
+        return Access::Read<float>(y, rows * n);
+      };
+      const auto bulk = project(rows);
+      for (unsigned chunk : {1U, 8U, 9U, 32U, 33U, 64U, 65U, 128U})
+        SameBits(bulk, project(chunk),
+                 "plain FP16 WMMA chunk=" + std::to_string(chunk), n);
+      for (unsigned r : {0U, rows - 1}) {
+        std::vector<float> oracle(n);
+        for (unsigned j = 0; j < n; ++j) {
+          double dot = 0;
+          for (unsigned i = 0; i < k; ++i)
+            dot += double(weights[j * k + i]) * rounded[r * k + i];
+          oracle[j] = float(dot);
+        }
+        Near(std::span(bulk).subspan(r * n, n), oracle, 1e-5,
+             "plain WMMA vs FP64 of rounded FP16 operands");
+      }
+    }
 }
 
 void PlainPrefillStable() {
@@ -1661,12 +1780,10 @@ void ExecutorPrefillExperts() {
                 d.prefill_dense_gemm_groups == gemms &&
                 d.prefill_plain_rows != 0,
             "real prefill must group Q/K/V and gate/up, dispatch dense X3, and "
-            "retain FP32 plain operands");
-    Require(d.prefill_plain_tiled_rows <= d.prefill_plain_rows &&
-                (chunk <= 8 || d.prefill_plain_tiled_rows != 0) &&
-                (chunk != rows ||
-                 d.prefill_plain_tiled_rows == d.prefill_plain_rows),
-            "wide EXL3 prefill must dispatch tiled stable plain operands");
+            "dispatch plain operands through FP16 WMMA");
+    Require(d.prefill_plain_half_rows == d.prefill_plain_rows &&
+                d.prefill_plain_half_rows != 0,
+            "every EXL3 plain prefill row must dispatch FP16 WMMA");
     Require(std::ranges::all_of(
                 logits, [](float value) { return std::isfinite(value); }),
             "prefill logits are not finite");
@@ -1708,7 +1825,7 @@ void ExecutorPrefillExperts() {
   Require(d.scaled_down_rows == assignments && d.prefill_expert_rows == 0,
           "decode did not dispatch scaled routed down across 64+1 rows");
   Require(d.prefill_dense_rows == 0 && d.prefill_plain_rows == 0 &&
-              d.prefill_plain_tiled_rows == 0,
+              d.prefill_plain_half_rows == 0,
           "decode incorrectly entered prefill dense dispatch");
   const auto exponents = Access::Read<std::int32_t>(routed.down_exponents,
                                                     64 * c.num_experts_used);
@@ -1832,10 +1949,9 @@ bool ExecutorGdnPrefillCase(bool linear_only) {
     Require(d.prefill_expert_rows == rows * (linear_only ? 1 : c.num_layers) &&
                 d.prefill_plain_rows != 0 && d.scaled_down_rows == 0,
             "GDN fixture must retain the prefill phase through both layers");
-    Require((chunk <= 8 || d.prefill_plain_tiled_rows != 0) &&
-                (chunk != rows ||
-                 d.prefill_plain_tiled_rows == d.prefill_plain_rows),
-            "wide GDN prefill omitted tiled stable plain projections");
+    Require(d.prefill_plain_half_rows == d.prefill_plain_rows &&
+                d.prefill_plain_half_rows != 0,
+            "GDN plain prefill rows must all dispatch FP16 WMMA");
     auto state = Access::GdnState(*session, c);
     result.conv = std::move(state.first);
     result.recurrent = std::move(state.second);
@@ -1955,6 +2071,7 @@ int main(int argc, char** argv) {
       return 0;
     }
     if (argc == 2 && std::string(argv[1]) == "--plain-prefill-only") {
+      PlainPrefillHalf();
       PlainPrefillStable();
       PlainOperandPrecision();
       return 0;

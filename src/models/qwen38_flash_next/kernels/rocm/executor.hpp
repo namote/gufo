@@ -540,11 +540,12 @@ public:
     /// (which can still select widened fallback for an unsafe row).
     std::uint64_t scaled_down_rows{0};
     /// Dense compressed prefill input rows (summed over projections), and
-    /// actual grouped rotation/GEMM calls. Plain rows retain FP32 arithmetic.
+    /// actual grouped rotation/GEMM calls. Plain prefill rows counted
+    /// separately.
     std::uint64_t prefill_dense_rows{0}, prefill_dense_rotation_groups{0},
         prefill_dense_gemm_groups{0}, prefill_plain_rows{0};
-    /// Plain prefill rows using LDS weight reuse instead of SmallGemmStable.
-    std::uint64_t prefill_plain_tiled_rows{0};
+    /// Plain prefill rows using FP16 WMMA, including singleton/tail chunks.
+    std::uint64_t prefill_plain_half_rows{0};
     /// Exclusive call wall times. draft_ms/catch_up_ms include inline heads;
     /// head_ms covers standalone MtpHeads. Diagnostic count downloads and
     /// synchronization are included; use an uninstrumented run for speed.
@@ -853,6 +854,7 @@ private:
     float* mtp_scores;
   };
   mutable Scratch s_{};
+  std::size_t half_input_cols_{0};
   Exl3Scratch exl3_{};
   gufo::hip::Exl3RotateProblem* exl3_dense_rotations_{nullptr};
   gufo::hip::Exl3GemmProblem* exl3_dense_gemms_{nullptr};
@@ -866,6 +868,8 @@ private:
                  std::initializer_list<float*> outputs, const float* x,
                  std::uint32_t rows, std::string* error,
                  std::size_t shape_basis_n = 0) const;
+  bool PlainDensePrefill(const DeviceTensor& weight, const float* x, float* out,
+                         std::uint32_t rows, std::string* error) const;
   bool Exl3Experts(const DeviceLayer& layer, const float* x, float* out,
                    std::uint32_t rows, std::string* error) const;
   [[nodiscard]] Scratch RowScratch(const Scratch& base,

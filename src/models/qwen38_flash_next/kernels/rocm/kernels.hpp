@@ -326,11 +326,18 @@ bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
                   void* mixed_q8, float* inject, std::uint32_t n_tokens,
                   std::uint32_t hidden, std::uint32_t rank, hipStream_t stream);
 
-/// F16 activation rows [batch][k], Q8_0 weights dequantized to F16 in LDS,
-/// F32 accumulation. out is [batch][m]. Unsupported shapes launch nothing.
+/// F16 activation rows [batch][k] and F16 weights [m][k], F32 accumulation.
+/// out is [batch][m]. Unsupported shapes launch nothing.
 bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
                         std::size_t batch, std::size_t m, std::size_t k,
                         hipStream_t stream);
+/// EXL3 plain prefill: fixed tile and two K16 chains for every row count.
+/// FP16 activation rows; F16/BF16/F32 weights rounded to FP16 in LDS. FP32
+/// output. K is a multiple of 32. Other model dispatch remains unchanged.
+bool PlainPrefillGemm(const void* w, WeightType type, const __half* x,
+                      float* out, std::size_t batch, std::size_t m,
+                      std::size_t k, hipStream_t stream);
+/// Q8_0 weights dequantized to F16 in LDS and F16 activation rows.
 /// input_stride is in half elements; zero means k. Padded rows are supported
 /// by the wide SSM output projection (batch >= 1024, m=2560, k=6144).
 bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,

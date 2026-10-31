@@ -6780,7 +6780,8 @@ struct AttentionProjectionOutput {
 template<int BM, int BN, int BK, int WM, int WN, int kRowGroup = 1,
          bool kHcMix = false, bool kSsmConv = false, bool kAttention = false,
          bool kHalfWeights = false, bool kBf16 = false, bool kStrided = false,
-         bool kYarn = false>
+         bool kYarn = false, WeightType kPlainType = WeightType::kF16,
+         bool kPlainPrefill = false>
 __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
     const void* __restrict__ w, const __half* __restrict__ x,
     float* __restrict__ y, std::size_t batch, std::size_t m, std::size_t k,
@@ -6795,6 +6796,10 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
   // 16-bit weight rows staged as they are: F16, or BF16 with BF16
   // activations.
   constexpr bool kRawWeights = kHalfWeights || kBf16;
+  constexpr int kWeightBlockBytes =
+      kHalfWeights && kPlainType == WeightType::kF32 ? 128
+      : kRawWeights                                  ? 64
+                                                     : 34;
   constexpr bool kRegisterWeights = kSsmConv;
   static_assert(!kRegisterWeights ||
                 (BM == 256 && BK == 2 && WM == 8 && WN == 1));
@@ -6857,9 +6862,9 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
     // Interleave the four gate streams within the tile, without repacking
     // weights. Each group of four rows produces one mixed hidden element.
     const int weight_row = kHcMix ? (r % 4) * (m_i / 4) + r / 4 : r;
-    a_ptr[p] = w_bytes +
-               static_cast<std::size_t>(a_live[p] ? weight_row : (m_i - 1)) *
-                   static_cast<std::size_t>(num_kb) * (kRawWeights ? 64 : 34);
+    a_ptr[p] =
+        w_bytes + static_cast<std::size_t>(a_live[p] ? weight_row : (m_i - 1)) *
+                      static_cast<std::size_t>(num_kb) * kWeightBlockBytes;
   }
   const __half* b_ptr[kBPer];
 #pragma unroll
@@ -6881,7 +6886,18 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
     for (int p = 0; p < kAPer; ++p) {
       const int kb = kb0 + (kRegisterWeights ? p : (((p * 256) + tid) % BK));
       const bool live = a_live[p] && kb < num_kb;
-      if constexpr (kRawWeights) {
+      if constexpr (kHalfWeights && kPlainType != WeightType::kF16) {
+        const auto* src = a_ptr[p] + std::size_t{kb} * kWeightBlockBytes;
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+          std::uint16_t h[8];
+#pragma unroll
+          for (int i = 0; i < 8; ++i)
+            h[i] = __half_as_ushort(__float2half_rn(
+                live ? RowElement(src, kPlainType, c * 8 + i) : 0.0F));
+          __builtin_memcpy(&a_half[p][c], h, sizeof(uint4));
+        }
+      } else if constexpr (kRawWeights) {
         const auto* src = reinterpret_cast<const uint4*>(
             a_ptr[p] + static_cast<std::size_t>(kb) * 64);
 #pragma unroll
@@ -7363,7 +7379,9 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
             }
           }
         } else {
-          if (tok < batch && r0 + 32 <= m && ((tok * m) % 4 == 0)) {
+          if (tok < batch && r0 + 32 <= m && ((tok * m) % 4 == 0) &&
+              (!kPlainPrefill ||
+               reinterpret_cast<std::uintptr_t>(y) % 16 == 0)) {
             auto* dst = reinterpret_cast<float4*>(
                 y + (tok * m) + r0 + static_cast<std::size_t>(row_l));
 #pragma unroll
@@ -7466,6 +7484,37 @@ bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
       (DenseF16GEMMKernel<64, 64, 2, 2, 4, 1, false, false, false, true>),
       dim3((batch + 63) / 64, (m + 63) / 64), dim3(kThreads), 0, stream, w, x,
       out, batch, m, k);
+  return true;
+}
+
+bool PlainPrefillGemm(const void* w, WeightType type, const __half* x,
+                      float* out, std::size_t batch, std::size_t m,
+                      std::size_t k, hipStream_t stream) {
+  if (m == 0 || batch == 0 || k == 0 || k % 32 != 0)
+    return false;
+  // Fixed at every M, including singleton/tail chunks: each output keeps
+  // one K16 chain for each half of a K32 block, then adds the two totals.
+  // Row/token tile coordinates only select operands, never rotate K.
+  const auto launch = [&]<WeightType plain>() {
+    hipLaunchKernelGGL(
+        (DenseF16GEMMKernel<128, 128, 2, 2, 4, 1, false, false, false, true,
+                            false, false, false, plain, true>),
+        dim3((batch + 127) / 128, (m + 127) / 128), dim3(kThreads), 0, stream,
+        w, x, out, batch, m, k);
+  };
+  switch (type) {
+    case WeightType::kF16:
+      launch.template operator()<WeightType::kF16>();
+      break;
+    case WeightType::kBF16:
+      launch.template operator()<WeightType::kBF16>();
+      break;
+    case WeightType::kF32:
+      launch.template operator()<WeightType::kF32>();
+      break;
+    default:
+      return false;
+  }
   return true;
 }
 
