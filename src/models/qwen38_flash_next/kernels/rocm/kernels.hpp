@@ -6,8 +6,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 #include "src/core/sampling.hpp"
+#include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
+#include "src/models/qwen/hip/ops/prefill_fp16.hpp"
 #include "src/models/qwen/vision/rope.hpp"
 #include "src/models/qwen38_flash_next/rope_scaling.hpp"
 
@@ -16,6 +19,24 @@
 /// launch is asynchronous on `stream`. Weights referenced here are device
 /// pointers in their GGUF encoding.
 namespace gufo::models::qwen38_flash_next::rocm {
+
+/// Host launch values, copied into kernel arguments before returning. The
+/// device descriptor tables may be reused on the same stream after GEMM;
+/// no mapped host descriptor is overwritten while the GPU still reads it.
+struct Exl3DensePrefillProblem {
+  const std::uint16_t* trellis;
+  const std::uint16_t* suh;
+  const std::uint16_t* svh;
+  const float* x;
+  std::size_t x_stride;
+  std::uint16_t* rotated;
+  float* y;
+  std::uint32_t rows;
+};
+void PrepareExl3DensePrefill(std::span<const Exl3DensePrefillProblem> problems,
+                             gufo::hip::Exl3RotateProblem* rotations,
+                             gufo::hip::Exl3GemmProblem* gemms,
+                             hipStream_t stream);
 
 /// Tokens per pooled indexer key row. K/V rows (one per token) and pooled rows
 /// share a session's block table (src/core/hip/kv_block_table.hpp): logical

@@ -539,6 +539,10 @@ public:
     /// Decode/verify assignments sent through the allocated scaled-down path
     /// (which can still select widened fallback for an unsafe row).
     std::uint64_t scaled_down_rows{0};
+    /// Dense compressed prefill input rows (summed over projections), and
+    /// actual grouped rotation/GEMM calls. Plain rows retain FP32 arithmetic.
+    std::uint64_t prefill_dense_rows{0}, prefill_dense_rotation_groups{0},
+        prefill_dense_gemm_groups{0}, prefill_plain_rows{0};
     /// Exclusive call wall times. draft_ms/catch_up_ms include inline heads;
     /// head_ms covers standalone MtpHeads. Diagnostic count downloads and
     /// synchronization are included; use an uninstrumented run for speed.
@@ -848,6 +852,11 @@ private:
   };
   mutable Scratch s_{};
   Exl3Scratch exl3_{};
+  gufo::hip::Exl3RotateProblem* exl3_dense_rotations_{nullptr};
+  gufo::hip::Exl3GemmProblem* exl3_dense_gemms_{nullptr};
+  bool Exl3DensePrefill(std::initializer_list<const DeviceTensor*> weights,
+                        std::initializer_list<float*> outputs, const float* x,
+                        std::uint32_t rows, std::string* error) const;
   Exl3PrefillScratch exl3_prefill_{};
   std::size_t exl3_prefill_scratch_bytes_{0};
   [[nodiscard]] Exl3PrefillScratch Exl3PrefillView() const;

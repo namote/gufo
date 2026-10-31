@@ -1135,6 +1135,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     ex.tiles = Alloc<Exl3RouteTile>(a, assignments, error_msg);
     ex.tile_count = Alloc<std::uint32_t>(a, 1, error_msg);
     ex.down_exponents = Alloc<std::int32_t>(a, assignments, error_msg);
+    e->exl3_dense_rotations_ =
+        Alloc<gufo::hip::Exl3RotateProblem>(a, 3, error_msg);
+    e->exl3_dense_gemms_ = Alloc<gufo::hip::Exl3GemmProblem>(a, 3, error_msg);
     ex.head_segments =
         Alloc<std::uint32_t>(a, kMtpDraftExtraRows + 1, error_msg);
     ex.head_values = f32(c.vocab_size + std::size_t{kMtpDraftExtraRows} * 128);
@@ -1915,6 +1918,14 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
                           const float* x, float* out, std::uint32_t n_tokens,
                           const DeviceTensor* down,
                           std::string* error_msg) const {
+  if (prefill_phase && gate.exl3 != nullptr && up.exl3 != nullptr &&
+      gate.cols == up.cols) {
+    if (!Exl3DensePrefill({&gate, &up}, {out, s_.shexp_gate}, x, n_tokens,
+                          error_msg))
+      return false;
+    Swiglu(out, s_.shexp_gate, std::size_t{n_tokens} * gate.rows, stream_);
+    return true;
+  }
   // Decode and verification use the same fused projections and activation.
   // A different SwiGLU rounding can change later activation quantization.
   if (!MatrixRows(n_tokens) && up.type == GgmlType::kQ8_0 &&
@@ -1986,9 +1997,126 @@ bool Executor::DenseF16Route(const DeviceTensor& w,
          w.cols <= model_->max_half_cols();
 }
 
+bool Executor::Exl3DensePrefill(
+    std::initializer_list<const DeviceTensor*> weights,
+    std::initializer_list<float*> outputs, const float* x, std::uint32_t rows,
+    std::string* error) const {
+  try {
+    if (weights.size() == 0 || weights.size() != outputs.size() ||
+        weights.size() > 3)
+      throw std::invalid_argument(
+          "EXL3 dense prefill requires 1..3 matching outputs");
+    struct Target {
+      const DeviceTensor* weight;
+      float* output;
+    };
+    std::array<Target, 3> targets{};
+    const auto count = weights.size();
+    const auto k = (*weights.begin())->cols;
+    auto output = outputs.begin();
+    bool sliced = false;
+    for (std::size_t i = 0; const auto* w : weights) {
+      if (w->exl3 == nullptr || w->experts != 1 || w->cols != k ||
+          w->exl3->k != k || !gufo::hip::Exl3PrefillSupported(*w->exl3) ||
+          std::uint64_t{w->output_begin} + w->rows > w->exl3->n)
+        throw std::invalid_argument(
+            "unsupported EXL3 dense prefill projection");
+      sliced |= w->output_begin != 0 || w->rows != w->exl3->n;
+      targets[i++] = {w, *output++};
+    }
+    if (sliced && count != 1)
+      throw std::invalid_argument(
+          "EXL3 dense slices require an individual projection");
+    if (rows == 0)
+      return true;
+    // q/k/v have different N; K/V and gate/up can share a GEMM launch.
+    // All three still rotate together, each with its own checkpoint suh.
+    std::sort(targets.begin(), targets.begin() + count, [](auto a, auto b) {
+      return std::pair{a.weight->exl3->n, a.weight->exl3->rate.bits} <
+             std::pair{b.weight->exl3->n, b.weight->exl3->rate.bits};
+    });
+    // Routed prefill and dense projections never overlap. Reuse the larger
+    // of their existing FP16 slabs; even tiny configured batches retain the
+    // decode slab (24 * widest K). No second chunk-sized activation allocation.
+    auto* rotated = exl3_prefill_.input;
+    std::size_t capacity = std::size_t{exl3_prefill_.max_assignments} *
+                           std::max(config().hidden_size, config().expert_ff);
+    if (exl3_.projection.fast_input_elements > capacity) {
+      rotated = exl3_.projection.fast_input;
+      capacity = exl3_.projection.fast_input_elements;
+    }
+    const auto piece = static_cast<std::uint32_t>(
+        std::min<std::size_t>(options_.max_batch, capacity / (count * k)));
+    if (rotated == nullptr || piece == 0 || exl3_dense_rotations_ == nullptr ||
+        exl3_dense_gemms_ == nullptr)
+      throw std::runtime_error("EXL3 dense prefill exceeds rotation scratch");
+    for (std::uint32_t first = 0; first < rows; first += piece) {
+      const auto n = std::min(piece, rows - first);
+      std::array<Exl3DensePrefillProblem, 3> problems{};
+      for (std::size_t i = 0; i < count; ++i) {
+        const auto& t = targets[i];
+        const auto& l = *t.weight->exl3;
+        if (sliced && exl3_.slice_elements < std::size_t{n} * l.n)
+          throw std::runtime_error("EXL3 dense prefill slice exceeds scratch");
+        problems[i] = {l.trellis,
+                       l.suh,
+                       l.svh,
+                       x + std::size_t{first} * k,
+                       k,
+                       rotated + i * std::size_t{n} * k,
+                       sliced ? exl3_.slice
+                              : t.output + std::size_t{first} * t.weight->rows,
+                       n};
+      }
+      PrepareExl3DensePrefill(std::span(problems.data(), count),
+                              exl3_dense_rotations_, exl3_dense_gemms_,
+                              stream_);
+      gufo::hip::LaunchExl3RotateRowsGrouped(exl3_dense_rotations_, count, n, k,
+                                             stream_);
+      for (std::size_t begin = 0; begin < count;) {
+        const auto& l = *targets[begin].weight->exl3;
+        auto end = begin + 1;
+        while (end < count && targets[end].weight->exl3->n == l.n &&
+               targets[end].weight->exl3->rate == l.rate)
+          ++end;
+        // Always X3, including a singleton/tail; a GEMV row threshold would
+        // change the reduction tree when a prompt/checkpoint chunk moves.
+        gufo::hip::LaunchExl3PrefillGemmGrouped(exl3_dense_gemms_ + begin,
+                                                end - begin, n, k, l.n, l.rate,
+                                                false, stream_);
+        if (diagnostics_active_)
+          ++cycle_diagnostics_.prefill_dense_gemm_groups;
+        begin = end;
+      }
+      if (sliced) {
+        const auto& t = targets[0];
+        if (!Check(
+                hipMemcpy2DAsync(t.output + std::size_t{first} * t.weight->rows,
+                                 t.weight->rows * sizeof(float),
+                                 exl3_.slice + t.weight->output_begin,
+                                 t.weight->exl3->n * sizeof(float),
+                                 t.weight->rows * sizeof(float), n,
+                                 hipMemcpyDeviceToDevice, stream_),
+                "EXL3 dense prefill slice", error))
+          return false;
+      }
+      if (diagnostics_active_) {
+        cycle_diagnostics_.prefill_dense_rows += std::uint64_t{n} * count;
+        ++cycle_diagnostics_.prefill_dense_rotation_groups;
+      }
+    }
+    return true;
+  } catch (const std::exception& e) {
+    AssignError(error, e.what());
+    return false;
+  }
+}
+
 bool Executor::Exl3Group(std::initializer_list<const DeviceTensor*> weights,
                          std::initializer_list<float*> outputs, const float* x,
                          std::uint32_t rows, std::string* error) const {
+  if (prefill_phase)
+    return Exl3DensePrefill(weights, outputs, x, rows, error);
   try {
     if (weights.size() != outputs.size() || weights.size() > 3)
       throw std::logic_error("invalid EXL3 projection group");
@@ -2072,6 +2200,10 @@ bool Executor::StoreMtpKv(const DeviceLayer& l, const Session& session,
 
 bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
                      std::uint32_t n_tokens, std::string* error_msg) const {
+  if (prefill_phase && w.exl3 != nullptr)
+    return Exl3DensePrefill({&w}, {out}, x, n_tokens, error_msg);
+  if (diagnostics_active_ && prefill_phase && model_->output().exl3 != nullptr)
+    cycle_diagnostics_.prefill_plain_rows += n_tokens;
   // The EXL3 pack retains plain HC/router/GDN operands. Their FP32 input
   // precision and reduction must not change with phase or cohort width.
   if (w.exl3 != nullptr || model_->output().exl3 != nullptr) {

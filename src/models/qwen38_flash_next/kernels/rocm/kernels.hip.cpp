@@ -21,6 +21,21 @@ namespace {
 
 constexpr unsigned kThreads = 256;
 
+struct Exl3DensePrefillArguments {
+  Exl3DensePrefillProblem problems[3];
+  unsigned count;
+};
+__global__ void PrepareExl3DensePrefillKernel(
+    Exl3DensePrefillArguments args, gufo::hip::Exl3RotateProblem* rotations,
+    gufo::hip::Exl3GemmProblem* gemms) {
+  const auto i = threadIdx.x;
+  if (i >= args.count)
+    return;
+  const auto p = args.problems[i];
+  rotations[i] = {p.x, p.x_stride, nullptr, p.suh, p.rotated, p.rows, 0};
+  gemms[i] = {p.trellis, p.svh, p.rotated, p.y, p.rows, 0};
+}
+
 /// Row of token position `pos` in one layer of a K/V plane: through the
 /// session's block table, or `pos` itself when `kv_blocks` is null.
 __device__ __forceinline__ std::size_t KvRow(const std::uint32_t* kv_blocks,
@@ -7623,6 +7638,20 @@ void SmallGemmForType(const void* w, const float* x, float* out,
     default:
       throw std::logic_error("small projection requires 1-8 token rows");
   }
+}
+
+void PrepareExl3DensePrefill(std::span<const Exl3DensePrefillProblem> problems,
+                             gufo::hip::Exl3RotateProblem* rotations,
+                             gufo::hip::Exl3GemmProblem* gemms,
+                             hipStream_t stream) {
+  if (problems.empty() || problems.size() > 3)
+    throw std::invalid_argument("EXL3 dense prefill requires 1..3 projections");
+  Exl3DensePrefillArguments args{};
+  args.count = static_cast<unsigned>(problems.size());
+  for (unsigned i = 0; i < args.count; ++i)
+    args.problems[i] = problems[i];
+  hipLaunchKernelGGL(PrepareExl3DensePrefillKernel, dim3(1), dim3(32), 0,
+                     stream, args, rotations, gemms);
 }
 
 void HcDownSiluF16(const void* w, const float* x, float* out,

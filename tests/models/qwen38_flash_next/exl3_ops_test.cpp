@@ -75,6 +75,12 @@ struct ExecutorTestAccess {
     return exec.exl3_;
   }
   static float* RoutedOutput(const Executor& exec) { return exec.s_.down_e; }
+  static bool DensePrefill(const Executor& exec,
+                           std::initializer_list<const DeviceTensor*> weights,
+                           std::initializer_list<float*> outputs,
+                           const float* x, unsigned rows, std::string* error) {
+    return exec.Exl3DensePrefill(weights, outputs, x, rows, error);
+  }
   struct State {
     std::vector<std::uint16_t> k, v, pooled;
     std::vector<float> raw;
@@ -884,8 +890,8 @@ struct MtpExecutorFixture {
             inject ? Plain(config.hc_count, config.HcDim(), true)
                    : gpu::DeviceTensor{}};
   }
-  explicit MtpExecutorFixture(unsigned max_batch = 16,
-                              unsigned expert_ff = 128) {
+  explicit MtpExecutorFixture(unsigned max_batch = 16, unsigned expert_ff = 128,
+                              int shared_bits = 6) {
     config.num_layers = 1;
     config.num_layers_all = 2;
     config.hidden_size = 128;
@@ -932,9 +938,12 @@ struct MtpExecutorFixture {
     l.indexer_k_norm = Plain(config.indexer_head_dim, 1, true, true);
     l.indexer_q_norm = Plain(config.indexer_head_dim, 1, true, true);
     l.router = Plain(config.num_experts + 1, config.hidden_size);
-    l.shexp_gate = Compressed(config.hidden_size, config.shared_expert_ff, 6);
-    l.shexp_up = Compressed(config.hidden_size, config.shared_expert_ff, 6);
-    l.shexp_down = Compressed(config.shared_expert_ff, config.hidden_size, 6);
+    l.shexp_gate =
+        Compressed(config.hidden_size, config.shared_expert_ff, shared_bits);
+    l.shexp_up =
+        Compressed(config.hidden_size, config.shared_expert_ff, shared_bits);
+    l.shexp_down =
+        Compressed(config.shared_expert_ff, config.hidden_size, shared_bits);
     l.ffn_gate_exps =
         Compressed(config.hidden_size, config.expert_ff, 5, config.num_experts);
     l.ffn_up_exps =
@@ -1092,6 +1101,172 @@ void MtpExecutorCatchUp(bool batched) {
   }
 }
 
+void DensePrefillProjection() {
+  BeginCase("executor grouped K7 dense X3, slices and chunk bits");
+  constexpr unsigned rows = 65, k = 256;
+  MtpExecutorFixture f(rows, 640);
+  auto& exec = *f.exec;
+  using Access = gpu::ExecutorTestAccess;
+  Bank q(f.buffers, k, 128, 7, 1, 17);
+  Bank key(f.buffers, k, 640, 7, 1, 23);
+  Bank value(f.buffers, k, 640, 7, 1, 71);
+  const std::array<Bank*, 3> banks{&q, &key, &value};
+  const auto input = Input(rows * k);
+  auto* x = f.buffers.Copy(input);
+  std::array<float*, 3> output{}, second{};
+  for (unsigned i = 0; i < banks.size(); ++i) {
+    output[i] = f.buffers.Make<float>(rows * banks[i]->n + 8);
+    second[i] = f.buffers.Make<float>(rows * banks[i]->n + 8);
+  }
+  std::string error;
+  const auto queue = [&](unsigned first, unsigned count, const auto& dst) {
+    Require(Access::DensePrefill(exec, {&q.weight, &key.weight, &value.weight},
+                                 {dst[0] + first * q.n, dst[1] + first * key.n,
+                                  dst[2] + first * value.n},
+                                 x + first * k, count, &error),
+            error);
+  };
+  const auto download = [&](const auto& dst) {
+    std::array<std::vector<float>, 3> result;
+    Check(hipStreamSynchronize(exec.stream()));
+    for (unsigned i = 0; i < banks.size(); ++i) {
+      result[i] = Access::Read<float>(dst[i], rows * banks[i]->n);
+      Require(std::ranges::all_of(result[i],
+                                  [](float v) { return std::isfinite(v); }),
+              "dense X3 left unwritten or nonfinite outputs");
+      Require(Access::Read<std::uint32_t>(dst[i] + rows * banks[i]->n, 1)[0] ==
+                  0x7F7F7F7FU,
+              "dense X3 overwrote its output guard");
+    }
+    return result;
+  };
+  const auto poison = [&](const auto& dst) {
+    for (unsigned i = 0; i < banks.size(); ++i) {
+      Check(hipMemset(dst[i], 0xFF, rows * banks[i]->n * sizeof(float)));
+      Check(hipMemset(dst[i] + rows * banks[i]->n, 0x7F, 8 * sizeof(float)));
+    }
+  };
+  const auto project = [&](unsigned chunk) {
+    poison(output);
+    Require(exec.BeginMtpCycleDiagnostics(&error), error);
+    for (unsigned first = 0; first < rows; first += chunk)
+      queue(first, std::min(chunk, rows - first), output);
+    gpu::Executor::MtpCycleDiagnostics d;
+    Require(exec.EndMtpCycleDiagnostics(0, 0, &d, &error), error);
+    const auto groups = (rows + chunk - 1) / chunk;
+    Require(d.prefill_dense_rows == 3 * rows &&
+                d.prefill_dense_rotation_groups == groups &&
+                d.prefill_dense_gemm_groups == 2 * groups,
+            "shared-input rotations or equal-N GEMMs were not grouped");
+    return download(output);
+  };
+  const auto bulk = project(rows);
+  for (unsigned chunk : {1U, 3U, 8U, 9U, 32U, 33U, 64U}) {
+    const auto split = project(chunk);
+    for (unsigned i = 0; i < banks.size(); ++i)
+      SameBits(bulk[i], split[i], "dense X3 chunk=" + std::to_string(chunk));
+  }
+  // Independent FP64 formula after exactly the specified FP16 input boundary;
+  // use W3's existing X3 accumulation bar, not the looser decode tolerance.
+  const double bound = std::ldexp(double(k / 16), -23);
+  for (unsigned i = 0; i < banks.size(); ++i)
+    for (unsigned row : {0U, rows - 1})
+      Near(std::span(bulk[i]).subspan(row * banks[i]->n, banks[i]->n),
+           banks[i]->Reference(0, input.data() + row * k, true), bound,
+           "dense X3 vs FP64 with rounded input");
+  // Two descriptor uploads are queued before either GEMM completes. Host
+  // mapped tables reused without stream ordering would leave output poisoned.
+  poison(output);
+  poison(second);
+  queue(0, rows, output);
+  queue(0, rows, second);
+  const auto a = download(output), b = download(second);
+  for (unsigned i = 0; i < banks.size(); ++i) {
+    SameBits(bulk[i], a[i], "first queued descriptor group");
+    SameBits(bulk[i], b[i], "second queued descriptor group");
+  }
+  // Production indexer Q/K are views of a 640-column parent. Require exact
+  // extraction from full X3 output at the allocation boundary, for all tails.
+  auto slice = key.weight;
+  slice.output_begin = 512;
+  slice.rows = 128;
+  auto* sliced = f.buffers.Make<float>(rows * slice.rows + 8);
+  for (unsigned chunk : {1U, 9U, 33U, 64U, 65U}) {
+    Check(hipMemset(sliced, 0xFF, rows * slice.rows * sizeof(float)));
+    Check(hipMemset(sliced + rows * slice.rows, 0x7F, 8 * sizeof(float)));
+    for (unsigned first = 0; first < rows; first += chunk)
+      Require(Access::DensePrefill(exec, {&slice},
+                                   {sliced + first * slice.rows}, x + first * k,
+                                   std::min(chunk, rows - first), &error),
+              error);
+    Check(hipStreamSynchronize(exec.stream()));
+    const auto actual = Access::Read<float>(sliced, rows * slice.rows);
+    for (unsigned row = 0; row < rows; ++row)
+      Require(std::memcmp(actual.data() + row * slice.rows,
+                          bulk[1].data() + row * key.n + slice.output_begin,
+                          slice.rows * sizeof(float)) == 0,
+              "dense X3 output slice differs from full parent bytes");
+    Require(Access::Read<std::uint32_t>(sliced + rows * slice.rows, 1)[0] ==
+                0x7F7F7F7FU,
+            "dense X3 slice overwrote its guard");
+  }
+}
+
+void PlainOperandPrecision() {
+  BeginCase(
+      "plain operands retain FP32 inputs: half-WMMA cancellation witness");
+  constexpr unsigned rows = 65, k = 128, n = 128;
+  Buffers buffers;
+  std::vector<float> input(rows * k), expected(rows * n);
+  for (unsigned row = 0; row < rows; ++row) {
+    const float difference = std::ldexp(float(1 + row % 7), -17);
+    input[row * k] = 1.0F + difference;
+    input[row * k + 1] = 1.0F;
+    std::fill_n(expected.data() + row * n, n, difference);
+  }
+  auto* x = buffers.Copy(input);
+  auto* y = buffers.Make<float>(rows * n);
+  gpu::DeviceTensor plain;
+  plain.rows = n;
+  plain.cols = k;
+  for (auto type : {gufo::core::GgmlType::kF16, gufo::core::GgmlType::kBF16,
+                    gufo::core::GgmlType::kF32}) {
+    plain.type = type;
+    std::vector<float> weights(n * k);
+    for (unsigned j = 0; j < n; ++j) {
+      weights[j * k] = 1;
+      weights[j * k + 1] = -1;
+    }
+    if (type == gufo::core::GgmlType::kF32) {
+      plain.data = buffers.Copy(weights);
+    } else {
+      std::vector<std::uint16_t> bits(weights.size());
+      for (std::size_t j = 0; j < bits.size(); ++j)
+        bits[j] = type == gufo::core::GgmlType::kF16
+                      ? ex::HalfFromDouble(weights[j])
+                      : static_cast<std::uint16_t>(
+                            std::bit_cast<std::uint32_t>(weights[j]) >> 16);
+      plain.data = buffers.Copy(bits);
+    }
+    for (unsigned chunk : {1U, 8U, 9U, 32U, 33U, 64U, 65U}) {
+      Check(hipMemset(y, 0xFF, rows * n * sizeof(float)));
+      for (unsigned first = 0; first < rows; first += chunk)
+        gpu::Exl3Projection(plain, x + first * k, y + first * n,
+                            std::min(chunk, rows - first), {}, nullptr, false);
+      SameBits(expected, gpu::ExecutorTestAccess::Read<float>(y, rows * n),
+               "plain projection vs exact FP64 cancellation result");
+    }
+    auto rounded = input;
+    for (auto& v : rounded)
+      v = float(ex::HalfToDouble(ex::HalfFromDouble(v)));
+    auto* hx = buffers.Copy(rounded);
+    gpu::Exl3Projection(plain, hx, y, rows, {}, nullptr, false);
+    const auto narrowed = gpu::ExecutorTestAccess::Read<float>(y, rows * n);
+    Require(std::ranges::all_of(narrowed, [](float v) { return v == 0; }),
+            "witness must expose FP16 input's loss of the nonzero dot product");
+  }
+}
+
 void PrefillScratchEstimate() {
   BeginCase("host EXL3 prefill scratch estimate");
   q::Config c;
@@ -1125,7 +1300,7 @@ void PrefillScratchEstimate() {
 void ExecutorPrefillExperts() {
   BeginCase("executor X3 prefill dispatch and chunk bits, F=640");
   constexpr unsigned rows = 65;
-  MtpExecutorFixture f(rows, 640);
+  MtpExecutorFixture f(rows, 640, 7);
   auto& exec = *f.exec;
   const auto& c = f.config;
   using Access = gpu::ExecutorTestAccess;
@@ -1176,9 +1351,17 @@ void ExecutorPrefillExperts() {
     Require(session != nullptr, error);
     std::vector<float> logits(c.vocab_size);
     std::vector<float> hidden(std::size_t{rows} * c.HcDim());
+    std::uint64_t dense_rows = 0, rotations = 0, gemms = 0;
     Require(exec.BeginMtpCycleDiagnostics(&error), error);
     for (unsigned first = 0; first < rows; first += chunk) {
       const auto count = std::min(chunk, rows - first);
+      const bool sparse = first + count > c.indexer_top_k;
+      // Q/K/V rotate together, K/V share one GEMM; shared gate/up share
+      // both. Indexer Q runs for every row of a sparse call. This exact
+      // count catches reverting either caller grouping to separate Dense.
+      dense_rows += (std::uint64_t{8} + sparse) * count;
+      rotations += 5 + sparse;
+      gemms += 6 + sparse;
       Require(
           exec.Forward(*session, std::span(tokens).subspan(first, count), 0,
                        nullptr, gpu::Executor::ForwardMode::kPrefill, &error),
@@ -1197,6 +1380,12 @@ void ExecutorPrefillExperts() {
                 d.prefill_expert_buckets != 0 && d.scaled_down_rows == 0,
             "kPrefill did not dispatch bucketed experts for every row, "
             "including tails");
+    Require(d.prefill_dense_rows == dense_rows &&
+                d.prefill_dense_rotation_groups == rotations &&
+                d.prefill_dense_gemm_groups == gemms &&
+                d.prefill_plain_rows != 0,
+            "real prefill must group Q/K/V and gate/up, dispatch dense X3, and "
+            "retain FP32 plain operands");
     Require(std::ranges::all_of(
                 logits, [](float value) { return std::isfinite(value); }),
             "prefill logits are not finite");
@@ -1230,6 +1419,8 @@ void ExecutorPrefillExperts() {
   Require(exec.EndMtpCycleDiagnostics(0, 0, &d, &error), error);
   Require(d.scaled_down_rows == assignments && d.prefill_expert_rows == 0,
           "decode did not dispatch scaled routed down across 64+1 rows");
+  Require(d.prefill_dense_rows == 0 && d.prefill_plain_rows == 0,
+          "decode incorrectly entered prefill dense dispatch");
   const auto exponents = Access::Read<std::int32_t>(routed.down_exponents,
                                                     64 * c.num_experts_used);
   Require(
@@ -1350,6 +1541,11 @@ void MtpKvGroup() {
 int main(int argc, char** argv) {
   std::cout << std::unitbuf;
   try {
+    if (argc == 2 && std::string(argv[1]) == "--dense-prefill-only") {
+      DensePrefillProjection();
+      PlainOperandPrecision();
+      return 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--prefill-scratch-only") {
       PrefillScratchEstimate();
       return 0;
