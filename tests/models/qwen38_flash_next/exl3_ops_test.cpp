@@ -1386,6 +1386,88 @@ void PlainPrefillStable() {
                                       nullptr);
   SameBits(Access::Read<float>(baseline, rows * n),
            Access::Read<float>(y, rows * n), "underflowed signed-zero chains");
+
+  // Exercise the two translation units' different optimization flags with
+  // explicit zero signs and exactly representable subnormal results. Width8
+  // uses vector loads at aligned k; width9 uses the grouped masked path.
+  constexpr unsigned special_rows = 9, special_n = 8;
+  constexpr std::array<float, 4> zero_operands{0.0F, -0.0F, 1.0F, -1.0F};
+  for (unsigned special_k : {133U, 512U})
+    for (auto type : {GgmlType::kF16, GgmlType::kBF16, GgmlType::kF32})
+      for (unsigned mode = 0; mode < 3; ++mode) {
+        Buffers special;
+        std::vector<float> weights(special_n * special_k);
+        std::vector<float> input(special_rows * special_k);
+        std::vector<float> expected(special_rows * special_n);
+        for (unsigned j = 0; j < special_n; ++j) {
+          if (mode == 0) {
+            std::fill_n(weights.data() + j * special_k, special_k,
+                        zero_operands[j % zero_operands.size()]);
+          } else {
+            // Normal * normal = 2^-130, then subnormal * 1 = 2^-130.
+            // Only the final K element contributes, so the result stays
+            // subnormal even after the wave reduction, with an exact oracle.
+            weights[(j + 1) * special_k - 1] =
+                (j % 2 ? -1.0F : 1.0F) * (mode == 1 ? 0x1p-12F : 1.0F);
+          }
+        }
+        for (unsigned r = 0; r < special_rows; ++r) {
+          const float value = mode == 0
+                                  ? zero_operands[r % zero_operands.size()]
+                                  : (r % 2 ? -1.0F : 1.0F) *
+                                        (mode == 1 ? 0x1p-118F : 0x1p-130F);
+          std::fill_n(input.data() + r * special_k, special_k, value);
+          if (mode != 0)
+            for (unsigned j = 0; j < special_n; ++j)
+              expected[r * special_n + j] =
+                  (r % 2 == j % 2 ? 1.0F : -1.0F) * 0x1p-130F;
+        }
+        const void* sw = nullptr;
+        const auto wt = type == GgmlType::kF16    ? gpu::WeightType::kF16
+                        : type == GgmlType::kBF16 ? gpu::WeightType::kBF16
+                                                  : gpu::WeightType::kF32;
+        if (type == GgmlType::kF32) {
+          sw = special.Copy(weights);
+        } else {
+          std::vector<std::uint16_t> bits(weights.size());
+          for (std::size_t i = 0; i < bits.size(); ++i)
+            bits[i] = type == GgmlType::kF16
+                          ? ex::HalfFromDouble(weights[i])
+                          : std::bit_cast<std::uint32_t>(weights[i]) >> 16;
+          sw = special.Copy(bits);
+        }
+        auto* sx = special.Copy(input);
+        auto* reference = special.Make<float>(special_rows * special_n);
+        auto* tiled = special.Make<float>(special_rows * special_n);
+        std::vector<float> width8;
+        for (unsigned width : {8U, 9U}) {
+          Check(hipMemset(reference, 0xA5,
+                          special_rows * special_n * sizeof(float)));
+          Check(
+              hipMemset(tiled, 0xA5, special_rows * special_n * sizeof(float)));
+          gpu::SmallGemmStable(sw, wt, sx, reference, width, special_n,
+                               special_k, nullptr);
+          gufo::hip::LaunchPlainPrefillStable(type, sw, sx, tiled, width,
+                                              special_n, special_k, nullptr);
+          const auto actual = Access::Read<float>(tiled, width * special_n);
+          const auto label = "plain special mode=" + std::to_string(mode) +
+                             " k=" + std::to_string(special_k) +
+                             " width=" + std::to_string(width);
+          SameBits(Access::Read<float>(reference, width * special_n), actual,
+                   label);
+          if (width == 8)
+            width8 = actual;
+          else
+            SameBits(width8,
+                     std::vector<float>(actual.begin(),
+                                        actual.begin() + 8 * special_n),
+                     label + " width8/9 prefix bytes");
+          if (mode != 0)
+            SameBits(std::vector<float>(expected.begin(),
+                                        expected.begin() + width * special_n),
+                     actual, label + " exact subnormal oracle");
+        }
+      }
 }
 
 void PrefillScratchEstimate() {
