@@ -381,6 +381,42 @@ cold는 새 프로세스의 첫 요청(빈 행 캐시), warm은 같은 요청의
 | q7 MTP 수락(UD-Q4) | K/A/D greedy trace 완료 |
 | q3, q4b, q5b, q5c, q6/q7 EXL3 절반 | BLOCKED-loader |
 
+### b6e3ff82에서 다시 돌린 EXL3 부분 (2026-10-31, loader 수정 efc396ba) [확인]
+
+- **이미지:** `final-b6e3ff82-tests-rocm101`(4db07a5b), `final-b6e3ff82-fn-tests-rocm101`(ca11e0e4), q6용 `final-b6e3ff82-fn-q-rocm101`(2ed9523d). q6 수집기는 0dc0a457에서 운영 toolchain으로 다시 빌드했다(0dc0a457 = b6e3ff82 + fn-quality-bf16fix, sha256 b569ac49…). 48451349의 수집기는 loader 수정 전 코드라 sidecar를 거절했다.
+
+| 창 | 결과 |
+|---|---|
+| q3 EXL3 session | **FAIL-pending-fix(Codex fn-exl3-impl 담당).** `--batch-only`: C6 row 0 cycle 0에서 batched MTP frontier가 다르다(C2/C4는 정확). `--prefill-only`: chunk 분할이 logit을 바꾼다(length 136, boundary 94). MTP audit은 scalar oracle 허용치를 넘는다(recursive-carry rms 2.1e-4, split-fusion 2.2e-4, attention-state 4.2e-4; GGUF는 1e-7 수준). sampling과 execution-32k는 PASS. engine floor는 889 토큰 prompt를 써서 끝날 수 없었다(plan 오류, 중단). 다음 통합 패스에서 짧은 prompt로 다시 돈다 |
+| q4b EXL3+KVarN K0 32K | PASS. real median 1.09e-6, p99 1.9e-4, max 9.9e-4. chunk 맞춘 fake는 1.02e-6, 2.7e-4, 9.3e-4. top-1 1.0, 자유 생성 동일 |
+| q5c EXL3 FP16 KV long-context + cache | COMPLETE(통과) |
+| q5b EXL3+KVarN suite | q5와 같은 expected-fail. 6개 suite가 같은 cache 재사용 assertion에서 멈췄다 |
+| q6 BF16 대비 prefill(32,760행) | 아래 |
+| q7b EXL3 MTP trace | COMPLETE |
+
+**q6: EXL3 5.05와 UD-Q4_K_XL을 BF16과 비교(FP16 KV, MTP 없음, a01 prefill, 3중 CI)**
+
+| | KL_256 | ΔNLL | top-1 | flip(KL>1) | KL median |
+|---|---:|---:|---:|---:|---:|
+| UD-Q4_K_XL | 0.0391 [0.0377, 0.0405] | +0.0061 | 0.9098 | 2,955 (56) | 0.0135 |
+| EXL3 5.05 | 0.0269 [0.0259, 0.0279] | −0.0064 | 0.9209 | 2,591 (26) | 0.0092 |
+| EXL3 − UD | −0.0122 (window CI [−0.0146, −0.0102]) | −0.0125 (window CI [−0.039, +0.005]) | +0.0111 (window CI [+0.0085, +0.0137]) | | |
+
+- 범주별 KL(UD → EXL3): chat 0.0374 → 0.0265, code 0.0290 → 0.0198, en_prose 0.0388 → 0.0269, ko_prose 0.0513 → 0.0342. 모든 범주에서 EXL3가 낫다. top-1도 모든 범주에서 높다.
+- top-256 질량 평균은 0.970이다(p5 0.852). KL_256은 full KL의 하한이다.
+- decode는 하지 않았다(CPU BF16 decode는 며칠이 걸린다). 27B에서는 prefill과 decode가 같은 경향이었다.
+- 4.05와 Kyojin 3.05는 XQ 확인 뒤 통합 패스에서 한다.
+
+**q7: MTP greedy chain 수락 길이(depth 7, 위치마다 앞에서부터 맞은 draft 수, 정책 없음)**
+
+| 범주 | UD | EXL3 |
+|---|---:|---:|
+| chat / prose / code (suite K) | 1.97 / 1.41 / 4.58 | 2.04 / 1.45 / 4.54 |
+| multi / copy | 1.99 / 5.43 | 2.11 / 5.44 |
+| 8K / 32K (suite D) | 2.35 / 2.07 | 2.28 / 2.19 |
+
+- A suite도 비슷하다(예: creative 1.37 → 1.20, d4_instruction 2.74 → 3.25). 수락은 양자화에 따라 크게 달라지지 않는다.
+
 ### KVarN K0 기준 바로잡기 (감독 수락 2026-10-31)
 
 - **처음 기준(fake-after):** FP16으로 prefill한 뒤 양자화한다. 이 기준으로 보면 needle의 max KL이 10× 막대를 넘었다.
