@@ -2,6 +2,53 @@
 
 상위 문서: [PLAN.md](PLAN.md) X3(사용자 2026-10-31: prefill도 속도 목표), [XB-DESIGN.md](XB-DESIGN.md), [XB-RESULTS.md](XB-RESULTS.md). 읽기만 하고 쓴 설계다. 코드, 빌드, GPU 창은 아직 없다.
 
+## 0. 외부 검토 반영 (2026-10-31, Codex gpt-6-astra, 소스만 읽음; 감독이 일부 확인)
+
+아래 1–9절의 본문보다 이 절이 우선한다.
+
+- **축 이름 정정:** 코드(`prefill_fp16.hip` `HalfPrefillGemmKernel`)에서는 **BM = 가중치 행(출력 채널), BN = 토큰**이다.
+  - 3.1절과 5절은 이를 반대로 적었다. 디코드 재사용은 BM이 아니라 **BN / 16 토큰 타일**이다. 디코드는 토큰 블록(BN)마다 다시 한다.
+  - 지금 커널은 32 wave, K16 단계 BK = 4(단계당 K64)이고, LDS는 64 KiB(s_a 32 KiB + s_b 32 KiB)다.
+- **자원:** "토큰 512 타일 + 16 wave"는 누적기만 lane당 VGPR 256개라 불가능하다. 5절 2번(BM 512 / BN 512)은 버린다.
+  - 32 wave를 유지하고 K32 단계(BK = 2)를 따로 본다.
+  - bench 빌드 기록(`build/x3-bench/res.txt`): 모든 변형에서 scratch 0, spill 0이다.
+
+| 변형 | VGPR | occupancy(waves/SIMD) | LDS |
+|---|---:|---:|---:|
+| FP16 미리 디코드 대조 | 155 | 9 | 64 KiB |
+| trellis K5, `v_mul_lo_u32` 해시 | 138 | 10 | 64 KiB |
+| trellis K5, pk 해시 | 138 | 10 | 64 KiB |
+| trellis K5, pk 해시, K32 단계 | 151 | 9 | 32 KiB |
+| trellis K5, pk 해시 + 출력 회전 | 139 | 10 | 64 KiB(GEMM LDS 재사용) |
+
+- **"3–5 %"는 근거가 없다(철회).**
+  - 2절의 3.15 s는 요청 전체 시간이다. 순수 GEMM은 1.80 s다.
+  - lane당 44 VALU도 quarter-rate 곱을 세면 약 68 issue 사이클이다.
+  - 판정은 bench에서 "256 가중치당 생산자 전체(디코드 → LDS)"를 Q4_K, Q6_K, IQ4_XS 생산자와 디스어셈블리와 측정으로 비교해 내린다.
+  - 정적 명령 수(`tools/prof/isa_mix.py`, 커널 전체): FP16 대조 643, trellis pk 802다. 단계(K64)당 wave 타일 2개이므로, 차이 159는 256 가중치당 약 80 명령이다. GGUF FP16 커널은 Q4_K 1,428, Q6_K 1,454, IQ4_XS 1,439로 꼬리 처리를 포함한 전체 수다. 루프만 따로 비교하지는 못했다. 측정으로 판정한다.
+- **우선순위:**
+  1. 해시 교체: pk 해시의 65,536상태 전수 비트 검사(위쪽 16비트에 쓰레기 값을 넣음)를 bench check에 넣었다.
+  2. 정정한 타일(32 wave, K64/K32)
+  3. wave 역할 나누기: VALU/WMMA 겹침은 공짜로 치지 않는다. 마이크로벤치로 확인한 뒤 쓴다.
+  4. MALL: 마지막
+- **gate + up 융합:** gate와 up은 suh가 달라 입력 x 타일을 공유할 수 없다(`prefill_fp16.hip:442`의 x 타일 공유가 성립하지 않음).
+  - 처음에는 gate와 up을 따로 GEMM하고, 융합 생산자(회전/SwiGLU/down 입력)를 둔다.
+  - 두 타일 융합은 LDS 예산(K64에서 96 KiB)을 정리한 뒤로 미룬다. 3.3절의 "BN = 256을 gate 128 + up 128로" 안은 그때까지 보류한다.
+- **epilogue:** 출력 회전(svh)은 죽은 GEMM LDS를 재사용해 한다(bench `v2+out`: 토큰 64개씩 4번).
+  - 반올림 순서(FP32 butterfly → scale → svh)와 배리어는 X2b와 같다.
+- **슬랩 최대치 정정:**
+  - down 입력은 4096 × 17408 × 2 B = 142.6 MB다.
+  - gate/up 입력과 down 입력의 수명이 겹치는 최대치는 226.5 MB다.
+  - 배치는 행 우선(row-major, [토큰][k])이다. 3.2절의 "약 126 MB"를 대체한다. EXL3 모델일 때만 잡는다(감독).
+- **bench 첫 측정 순서(PLAN-X3B1):** gate/up, down, k/v × 512/2048행.
+  - 순서: FP16 미리 디코드 대조 → trellis 생산자 → 출력 회전 → 전체 파이프라인(입력 회전 포함)
+  - 비교 기준은 실제 GGUF 경로다. pp512는 활성화 양자화(Q8_1) 경로이고(`prefill_chunk.cpp:24,161`), 1024행 이상은 FP16 경로다. 각각 활성화 생산자 시간을 포함한다.
+  - 가중치는 256 MB가 넘는 사본을 돌려 MALL을 넘긴다.
+- **감독 결정(2026-10-31):**
+  - `prefill_fp16.hip`에 템플릿 선택지로 넣는다(공유). 조건은 GGUF 지문 바이트 동일, ABBA에서 GGUF prefill 회귀 없음이다.
+  - 슬랩은 EXL3 모델일 때만 둔다.
+  - 9–64행 skinny WMMA는 X3b(prefill 통과 뒤)로 뺀다.
+
 ## 1. 목표와 기준
 
 - **통과 기준(PLAN X3):** 같은 운영 바이너리의 UD-Q4_K_XL과 ABBA로 짝지어 비교한다. pp512, pp2048, pp8192와 깊이 32K prefill이 모두 요청·단계별 5 %·10 ms 안이거나 더 빠르다.
