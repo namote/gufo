@@ -6887,7 +6887,8 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
       const int kb = kb0 + (kRegisterWeights ? p : (((p * 256) + tid) % BK));
       const bool live = a_live[p] && kb < num_kb;
       if constexpr (kHalfWeights && kPlainType != WeightType::kF16) {
-        const auto* src = a_ptr[p] + std::size_t{kb} * kWeightBlockBytes;
+        const auto* src =
+            a_ptr[p] + static_cast<std::size_t>(kb) * kWeightBlockBytes;
 #pragma unroll
         for (int c = 0; c < 4; ++c) {
           std::uint16_t h[8];

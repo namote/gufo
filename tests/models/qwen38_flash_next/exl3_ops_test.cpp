@@ -1362,6 +1362,7 @@ void PlainOperandPrecision() {
                             std::bit_cast<std::uint32_t>(weights[j]) >> 16);
       plain.data = buffers.Copy(bits);
     }
+    std::vector<float> cancel_bits;
     for (unsigned chunk : {1U, 8U, 9U, 32U, 33U, 64U, 65U}) {
       Check(hipMemset(y, 0xFF, rows * n * sizeof(float)));
       for (unsigned first = 0; first < rows; first += chunk)
@@ -1372,6 +1373,11 @@ void PlainOperandPrecision() {
       // Approved prefill contract returns to the pre-66b2d89c FP16 input
       // boundary. These two inputs become identical halves, so their exact
       // dot product is zero; decode above must retain the nonzero FP32 dot.
+      // gfx1151 WMMA (f32_16x16x16_f16) does not cancel exactly: 1*1 +
+      // (-1)*1 returns -2^-24 (probe: a=(1,-1), b=(1,1) -> -0x1p-24; scaled
+      // operands give the same -2^-24 relative residue). Bound the residue
+      // by 2^-23 of the absolute product sum (2 here) and keep it chunk
+      // invariant; the nonzero FP32 dot (2^-17..7*2^-17) stays excluded.
       Check(hipMemsetAsync(y, 0xFF, rows * n * sizeof(float), exec.stream()));
       for (unsigned first = 0; first < rows; first += chunk)
         Require(gpu::ExecutorTestAccess::PlainPrefill(
@@ -1379,9 +1385,16 @@ void PlainOperandPrecision() {
                     std::min(chunk, rows - first), &error),
                 error);
       Check(hipStreamSynchronize(exec.stream()));
-      SameBits(std::vector<float>(rows * n),
-               gpu::ExecutorTestAccess::Read<float>(y, rows * n),
-               "prefill vs exact FP16 cancellation oracle");
+      const auto cancelled = gpu::ExecutorTestAccess::Read<float>(y, rows * n);
+      Require(std::ranges::all_of(
+                  cancelled,
+                  [](float v) { return std::fabs(v) <= std::ldexp(2.0, -23); }),
+              "prefill vs FP16 cancellation oracle within the WMMA residue");
+      if (chunk == 1)
+        cancel_bits = cancelled;
+      else
+        SameBits(cancel_bits, cancelled,
+                 "prefill FP16 cancellation chunk=" + std::to_string(chunk));
     }
     auto rounded = input;
     for (auto& v : rounded)
@@ -1488,7 +1501,11 @@ void PlainPrefillHalf() {
             dot += double(weights[j * k + i]) * rounded[r * k + i];
           oracle[j] = float(dot);
         }
-        Near(std::span(bulk).subspan(r * n, n), oracle, 1e-5,
+        // WMMA accumulation error grows with k (plan/exl3/X3-RESULTS.md:
+        // ~3.1e-9 k relative L2; the non-cancelling residue above), so the
+        // bar is the X3 contract's (k/16) 2^-23, at least 1e-5.
+        Near(std::span(bulk).subspan(r * n, n), oracle,
+             std::max(1e-5, double(k) / 16.0 * std::ldexp(1.0, -23)),
              "plain WMMA vs FP64 of rounded FP16 operands");
       }
     }
