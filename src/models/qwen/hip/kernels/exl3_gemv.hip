@@ -86,6 +86,36 @@ __global__ __launch_bounds__(kRotateWaves * 32) void Exl3RotateInputKernel(
   }
 }
 
+// Prefill rows: out[r][i] = FP16(H(suh * x[r])) per 128 elements,
+// row-major, with the input-rotation arithmetic of Exl3RotateInputKernel.
+// One wave per (row, segment).
+__global__ __launch_bounds__(256) void Exl3RotateRowsKernel(
+    const float* __restrict__ x, std::size_t x_stride, unsigned rows,
+    unsigned k, const _Float16* __restrict__ suh, _Float16* __restrict__ out) {
+  const unsigned lane = threadIdx.x % 32;
+  const unsigned segments = k / exl3::kSegment;
+  const std::size_t item = std::size_t(blockIdx.x) * 8 + threadIdx.x / 32;
+  if (item >= std::size_t(rows) * segments) {
+    return;
+  }
+  const std::size_t row = item / segments;
+  const unsigned first =
+      static_cast<unsigned>(item % segments) * exl3::kSegment + lane * 4;
+  float v[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    v[j] = x[row * x_stride + first + j] * static_cast<float>(suh[first + j]);
+    asm volatile("" : "+v"(v[j]));
+  }
+  exl3::Butterfly128(v, lane);
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    v[j] *= kHadamardScale;
+    asm volatile("" : "+v"(v[j]));
+    out[row * k + first + j] = static_cast<_Float16>(v[j]);
+  }
+}
+
 // RMSNorm of one 5120-wide row, the arithmetic of norm.hip RMSNormKernel
 // <5120> (cached row, FMA sum, the same tree), stored as FP32 and, for every
 // consumer, rotated with its suh into its FP16 slab (M = 1 lane-major), with
@@ -563,6 +593,19 @@ void LaunchMlpPass(const Exl3FastMlp& mlp, const float* x, std::size_t x_stride,
 }
 
 }  // namespace
+
+void LaunchExl3RotateRows(const float* x, std::size_t x_stride,
+                          std::size_t rows, std::size_t k,
+                          const std::uint16_t* suh, std::uint16_t* out,
+                          hipStream_t stream) {
+  const std::size_t items = rows * (k / exl3::kSegment);
+  hipLaunchKernelGGL(
+      Exl3RotateRowsKernel, dim3(static_cast<unsigned>((items + 7) / 8)),
+      dim3(256), 0, stream, x, x_stride, static_cast<unsigned>(rows),
+      static_cast<unsigned>(k), reinterpret_cast<const _Float16*>(suh),
+      reinterpret_cast<_Float16*>(out));
+  HIP_CHECK(hipGetLastError());
+}
 
 bool Exl3FastSupported(const quant::exl3::DeviceLinear& linear) noexcept {
   return linear.codebook == quant::exl3::Codebook::kMul1 && !linear.rate.half &&

@@ -40,6 +40,10 @@ struct ReferenceScratch {
   /// SwiGLU and down as separate launches.
   std::uint16_t* fast_down_input = nullptr;
   std::size_t fast_down_input_elements = 0;
+  /// X3 prefill: FP16 rotated input rows [max batch][widest input]; null keeps
+  /// prefill on the reference path.
+  std::uint16_t* fast_prefill_input = nullptr;
+  std::size_t fast_prefill_input_elements = 0;
 };
 
 /// Decodes columns [n_begin, n_begin + n_count) of W' into out[n_count][k]

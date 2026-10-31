@@ -3,6 +3,7 @@
 #include <cstddef>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/core/quant/exl3/device.hpp"
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 namespace gufo::hip {
@@ -10,6 +11,16 @@ namespace gufo::hip {
 // scratch allocations after their BF16 contents are no longer live.
 void LaunchFloatToFp16(const float* input, void* output, std::size_t elements,
                        hipStream_t stream);
+// EXL3 prefill projection (plan/exl3/X3-DESIGN.md): the FP16 GEMM frame with
+// the trellis decode producer. x is the FP16 rotated input [batch][k]
+// (H(suh * x) per 128 elements, row-major); y [batch][n] FP32 receives
+// svh * H(x W') (residual: added to y). Supported: mul1, integer K 1..6,
+// n % 256 == 0, k % 64 == 0.
+[[nodiscard]] bool Exl3PrefillSupported(
+    const quant::exl3::DeviceLinear& linear) noexcept;
+void LaunchExl3PrefillGemm(const quant::exl3::DeviceLinear& linear,
+                           const void* x, float* y, std::size_t batch,
+                           bool residual, hipStream_t stream);
 // Optional residual and sum_out preserve the FP32 residual link; sum_out may
 // alias input. The normalization reduction matches LaunchBatchedRMSNorm.
 // The FP16 output must be disjoint from the FP32 inputs and weights.

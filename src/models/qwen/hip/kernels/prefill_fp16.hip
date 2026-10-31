@@ -1,6 +1,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <stdexcept>
 
+#include "src/core/hip/detail/exl3_gemv.hpp"
 #include "src/core/hip/detail/hadamard.hpp"
 #include "src/models/qwen/hip/kernels/prefill_quant_gemm.hpp"
 #include "src/models/qwen/hip/ops/hadamard.hpp"
@@ -225,15 +226,25 @@ __device__ __forceinline__ gufo::hip::QuantSub16 DecodeRaw(
 enum class HalfEpilogue { kStore, kSwiGLU, kGateUp, kResidual };
 
 // Fully scaled FP16 weights and activations; FP32 accumulation in K16 order.
+// TrellisBits > 0 (EXL3, plan/exl3/X3-DESIGN.md) replaces the GGUF weight
+// producer by the trellis decode (mul1 codebook, K = TrellisBits): w is the
+// trellis [k/16][m/16][16K], each 16 x 16 tile one weight sub-tile of s_a,
+// decoded bit for bit as src/core/quant/exl3 DequantTile. The activations,
+// the WMMA loop and the K16 order are unchanged; the epilogue then rotates
+// every 128-channel segment, y = svh * H(acc) (kStore or kResidual), staged
+// through the dead s_a tile. Type is unused then.
 template<int BM, int BN, int WM, int WN, gufo::core::GgmlType Type,
          HalfEpilogue Epilogue, bool Complete = false,
-         gufo::core::GgmlType UpType = Type>
+         gufo::core::GgmlType UpType = Type, int TrellisBits = 0>
+
 __launch_bounds__(WM * WN * 32) __global__
     void HalfPrefillGemmKernel(const void* __restrict__ w,
                                const short* __restrict__ x,
                                float* __restrict__ y, int batch, int m, int k,
                                const float* __restrict__ gate,
-                               const void* __restrict__ up = nullptr) {
+                               const void* __restrict__ up = nullptr,
+                               const _Float16* __restrict__ svh = nullptr) {
+  constexpr bool Trellis = TrellisBits > 0;
   constexpr bool Paired = Epilogue == HalfEpilogue::kGateUp;
   constexpr bool Mixed = Paired && Type != UpType;
   constexpr bool UpRaw = UpType == gufo::core::GgmlType::kQ4_K ||
@@ -314,6 +325,7 @@ __launch_bounds__(WM * WN * 32) __global__
   const std::uint8_t* w_row[PFA];
   const std::size_t row_bytes = gufo::hip::QuantRowBytes(Type, k);
   const std::size_t up_row_bytes = gufo::hip::QuantRowBytes(UpType, k);
+  if constexpr (!Trellis) {
 #pragma unroll
   for (int p = 0; p < PFA; ++p) {
     const int physical_row = ((p * kThreads) + tid) / BK;
@@ -325,6 +337,17 @@ __launch_bounds__(WM * WN * 32) __global__
                (static_cast<std::size_t>((Complete || r < m) ? r : (m - 1)) *
                 (Mixed && physical_row % 32 >= 16 ? up_row_bytes : row_bytes));
   }
+  }
+  // Trellis producer: lane L decodes positions 8L .. 8L + 7 of a tile
+  // (src/core/hip/detail/exl3_gemv.hpp), TPW tiles per wave and stage.
+  constexpr int kTrellisK = Trellis ? TrellisBits : 1;
+  constexpr int TPW = (BK * RS) / (WM * WN);
+  static_assert(!Trellis || ((BK * RS) % (WM * WN) == 0 && !Paired));
+  const exl3::LaneWindow lw = exl3::MakeLaneWindow<kTrellisK>(lane);
+  struct TrellisRaw {
+    std::uint32_t d0, d1, d2;
+  };
+  TrellisRaw traw[Trellis ? TPW : 1];
   const short* x_row[PFB];
 #pragma unroll
   for (int p = 0; p < PFB; ++p) {
@@ -386,6 +409,18 @@ __launch_bounds__(WM * WN * 32) __global__
     }
   };
   const auto fetch = [&](int ks0) {
+    if constexpr (Trellis) {
+      const auto* base = static_cast<const std::uint32_t*>(w);
+#pragma unroll
+      for (int i = 0; i < TPW; ++i) {
+        const int t = wave * TPW + i, ks = t / RS, rt = t % RS;
+        const std::uint32_t* tile =
+            base + (static_cast<std::size_t>(ks0 + ks) * (m / 16) +
+                    (r_block / 16) + rt) *
+                       (8 * kTrellisK);
+        traw[i] = {tile[lw.o0], tile[lw.o1], tile[lw.o2]};
+      }
+    } else {
 #pragma unroll
     for (int p = 0; p < PFA; ++p) {
       const int idx = p * kThreads + tid, kk = ks0 + idx % BK;
@@ -438,6 +473,7 @@ __launch_bounds__(WM * WN * 32) __global__
           raw_up[p] = {};
       }
     }
+    }
 #pragma unroll
     for (int p = 0; p < PFB; ++p) {
       const int idx = p * kThreads + tid, kk = ks0 + idx % BK;
@@ -471,6 +507,38 @@ __launch_bounds__(WM * WN * 32) __global__
     }
   };
   const auto commit = [&]() {
+    if constexpr (Trellis) {
+      const unsigned r0 = (lane % 4) * 2, c0 = lane / 4;
+#pragma unroll
+      for (int i = 0; i < TPW; ++i) {
+        const int t = wave * TPW + i, ks = t / RS, rt = t % RS;
+        const std::uint32_t hi =
+            __builtin_amdgcn_alignbit(traw[i].d0, traw[i].d1, lw.shift);
+        const std::uint32_t lo =
+            __builtin_amdgcn_alignbit(traw[i].d1, traw[i].d2, lw.shift);
+        const std::uint64_t window =
+            (static_cast<std::uint64_t>(hi) << 32) | lo;
+        std::uint32_t hashed[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+          hashed[j] = exl3::HashMul1Packed(
+              static_cast<std::uint32_t>(window >> (48 - kTrellisK * j)));
+        // Column c of the tile is weight row rt * 16 + c; rows r0, r0 + 1
+        // (16-byte group 0) and r0 + 8, r0 + 9 (group 1) are k positions.
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+          const unsigned row = rt * 16 + c0 + 8 * half;
+          const unsigned placed = row ^ (ks & 3);
+          const unsigned shift = (row ^ (row >> 2)) & 1;
+          auto* pairs = reinterpret_cast<exl3::Half2*>(
+              &s_a[ks][placed / 16][placed % 16][0]);
+          pairs[((0 ^ shift) * 8 + r0) / 2] =
+              exl3::DecodePairMul1(hashed[4 * half], hashed[4 * half + 1]);
+          pairs[((1 ^ shift) * 8 + r0) / 2] =
+              exl3::DecodePairMul1(hashed[4 * half + 2], hashed[4 * half + 3]);
+        }
+      }
+    } else {
 #pragma unroll
     for (int p = 0; p < PFA; ++p) {
       const int idx = p * kThreads + tid, row = idx / BK, ks = idx % BK;
@@ -497,6 +565,7 @@ __launch_bounds__(WM * WN * 32) __global__
         } else
           StoreSwizzled(dst, ra[p][0], ra[p][1], row);
       }
+    }
     }
 #pragma unroll
     for (int p = 0; p < PFB; ++p) {
@@ -562,6 +631,59 @@ __launch_bounds__(WM * WN * 32) __global__
       y[index] = value;
   };
   const int hi = lane / 16;
+  if constexpr (Trellis) {
+    // y = svh * H(acc) per 128-channel segment (src/core/hip/detail/
+    // exl3_gemv.hpp, the decode epilogue's arithmetic). The block owns whole
+    // segments; tokens are staged in the dead s_a tile, Stage at a time.
+    static_assert(BM % 128 == 0 && WTS % 2 == 0);
+    constexpr int Stage = static_cast<int>(sizeof(s_a) / sizeof(float)) / BM;
+    constexpr int TilesPerStage = Stage / 16;
+    static_assert(Stage % 16 == 0 && (WTS * 16) % Stage == 0);
+    float* c = reinterpret_cast<float*>(&s_a[0][0][0][0]);
+    for (int pass = 0; pass < BN / Stage; ++pass) {
+      const int owner = pass / (WTS / TilesPerStage);
+      const int j0 = (pass % (WTS / TilesPerStage)) * TilesPerStage;
+      if (wt == owner) {
+#pragma unroll
+        for (int i = 0; i < WRS; ++i) {
+#pragma unroll
+          for (int j = 0; j < WTS; ++j) {
+            if (j < j0 || j >= j0 + TilesPerStage)
+              continue;
+            const int row = (wr * WRS + i) * 16 + sl;
+#pragma unroll
+            for (int l = 0; l < 8; ++l)
+              c[((j - j0) * 16 + 2 * l + hi) * BM + row] = acc[i][j][l];
+          }
+        }
+      }
+      __syncthreads();
+      for (int item = wave; item < Stage * (BM / 128); item += WM * WN) {
+        const int t = item / (BM / 128), seg = item % (BM / 128);
+        const int token = t_block + pass * Stage + t;
+        float v[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+          v[j] = c[t * BM + seg * 128 + lane * 4 + j];
+        exl3::Butterfly128(v, static_cast<unsigned>(lane));
+        if (Complete || token < batch) {
+          const int row = r_block + seg * 128 + lane * 4;
+          float* dst = y + static_cast<std::size_t>(token) * m + row;
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            const float value = (v[j] * exl3::kHadamardScale) *
+                                static_cast<float>(svh[row + j]);
+            if constexpr (Epilogue == HalfEpilogue::kResidual)
+              dst[j] = __fadd_rn(dst[j], value);
+            else
+              dst[j] = value;
+          }
+        }
+      }
+      __syncthreads();
+    }
+    return;
+  }
   if constexpr (Paired) {
     static_assert(WRS % 2 == 0 && Type != gufo::core::GgmlType::kIQ3_S);
     // Adjacent 16-row fragments hold gate and up for the same logical rows.
@@ -896,6 +1018,68 @@ void DirectGemm(gufo::core::GgmlType type, const void* w, const void* x,
       throw std::runtime_error("unexpected half prefill weight format");
   }
 }
+bool Exl3PrefillSupported(const quant::exl3::DeviceLinear& linear) noexcept {
+  return linear.codebook == quant::exl3::Codebook::kMul1 && !linear.rate.half &&
+         linear.rate.bits >= 1 && linear.rate.bits <= 6 &&
+         linear.n % 256 == 0 && linear.k % 64 == 0;
+}
+
+void LaunchExl3PrefillGemm(const quant::exl3::DeviceLinear& linear,
+                           const void* x, float* y, std::size_t batch,
+                           bool residual, hipStream_t stream) {
+  if (!Exl3PrefillSupported(linear) || batch == 0) {
+    throw std::invalid_argument("EXL3 prefill GEMM: unsupported projection");
+  }
+  // Prefill: 256 channels x 256 tokens. Narrow batches (X3b, <= 64 rows):
+  // 128 channels x 64 tokens, so one token block reads the weights once.
+  const bool narrow = batch <= 64;
+  const auto launch = [&]<int Bits, HalfEpilogue Epilogue>() {
+    if (narrow) {
+      HalfPrefillGemmKernel<128, 64, 4, 2, gufo::core::GgmlType::kQ8_0,
+                            Epilogue, false, gufo::core::GgmlType::kQ8_0, Bits>
+          <<<dim3((batch + 63) / 64, linear.n / 128), 256, 0, stream>>>(
+              linear.trellis, static_cast<const short*>(x), y,
+              static_cast<int>(batch), static_cast<int>(linear.n),
+              static_cast<int>(linear.k), nullptr, nullptr,
+              reinterpret_cast<const _Float16*>(linear.svh));
+      return;
+    }
+    HalfPrefillGemmKernel<256, 256, 8, 4, gufo::core::GgmlType::kQ8_0, Epilogue,
+                          false, gufo::core::GgmlType::kQ8_0, Bits>
+        <<<dim3((batch + 255) / 256, linear.n / 256), 1024, 0, stream>>>(
+            linear.trellis, static_cast<const short*>(x), y,
+            static_cast<int>(batch), static_cast<int>(linear.n),
+            static_cast<int>(linear.k), nullptr, nullptr,
+            reinterpret_cast<const _Float16*>(linear.svh));
+  };
+  const auto bits = [&]<HalfEpilogue Epilogue>() {
+    switch (linear.rate.bits) {
+      case 1:
+        launch.template operator()<1, Epilogue>();
+        break;
+      case 2:
+        launch.template operator()<2, Epilogue>();
+        break;
+      case 3:
+        launch.template operator()<3, Epilogue>();
+        break;
+      case 4:
+        launch.template operator()<4, Epilogue>();
+        break;
+      case 5:
+        launch.template operator()<5, Epilogue>();
+        break;
+      default:
+        launch.template operator()<6, Epilogue>();
+        break;
+    }
+  };
+  if (residual)
+    bits.template operator()<HalfEpilogue::kResidual>();
+  else
+    bits.template operator()<HalfEpilogue::kStore>();
+}
+
 void LaunchBatchedQuantGEMMFp16(gufo::core::GgmlType type, const void* w,
                                 const void* x, float* y, std::size_t batch,
                                 std::size_t m, std::size_t k,

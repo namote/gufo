@@ -22,9 +22,15 @@
 
 #include "src/core/quant/exl3/reference.hpp"
 #include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
+#include "src/models/qwen/hip/ops/prefill_fp16.hpp"
 #include "src/models/qwen/hip/ops/swiglu.hpp"
 
 namespace gufo::hip {
+
+/// From this many rows a session with the prefill slab uses the trellis WMMA
+/// GEMM (X3b narrow tile, X3 prefill tile) instead of 8-row GEMV passes;
+/// provisional until the final window compares the two at 9-64 rows.
+inline constexpr std::size_t kExl3WmmaMinRows = 17;
 
 /// Whether `weight` is an EXL3 projection.
 [[nodiscard]] inline bool IsExl3(const models::QwenTensorRef& weight) noexcept {
@@ -44,8 +50,21 @@ inline void LaunchExl3Projection(const models::QwenTensorRef& weight,
         "EXL3 projection without a descriptor or session workspace");
   }
   const auto& linear = *weight.exl3;
-  // Decode and verify rows take the X2b trellis GEMV; prefill batches and
-  // formats it does not cover stay on the reference path.
+  // Batches from kExl3WmmaMinRows rows take the X3 trellis WMMA GEMM (the
+  // X3b narrow tile up to 64 rows): rotate the rows into the FP16 slab, then
+  // GEMM with the svh epilogue. Decode and verify rows take the X2b trellis
+  // GEMV. Anything else stays on the reference path.
+  const bool wmma = scratch->fast_prefill_input != nullptr &&
+                    rows >= kExl3WmmaMinRows && Exl3PrefillSupported(linear) &&
+                    scratch->fast_prefill_input_elements >= rows * linear.k &&
+                    (y_stride == 0 || y_stride == linear.n);
+  if (wmma) {
+    LaunchExl3RotateRows(x, x_stride != 0 ? x_stride : linear.k, rows, linear.k,
+                         linear.suh, scratch->fast_prefill_input, stream);
+    LaunchExl3PrefillGemm(linear, scratch->fast_prefill_input, y, rows, false,
+                          stream);
+    return;
+  }
   if (scratch->fast_input != nullptr && rows <= kExl3FastMaxRows &&
       Exl3FastSupported(linear)) {
     const Exl3FastWorkspace workspace{
@@ -85,6 +104,7 @@ inline void LaunchExl3Projections(std::span<const Exl3GroupOutput> outputs,
         "EXL3 projection group without outputs or workspace");
   }
   if (scratch->fast_input != nullptr && rows <= kExl3FastMaxRows &&
+      (rows < kExl3WmmaMinRows || scratch->fast_prefill_input == nullptr) &&
       outputs.size() <= kExl3FastMaxGroup) {
     std::array<Exl3FastTarget, kExl3FastMaxGroup> targets{};
     bool all_exl3 = true;
@@ -131,7 +151,8 @@ inline void LaunchExl3SwiGLUMlp(const models::QwenTensorRef& gate,
       down.exl3 == nullptr) {
     throw std::logic_error("EXL3 MLP without descriptors or workspace");
   }
-  if (scratch->fast_input != nullptr && rows <= kExl3FastMaxRows) {
+  if (scratch->fast_input != nullptr && rows <= kExl3FastMaxRows &&
+      (rows < kExl3WmmaMinRows || scratch->fast_prefill_input == nullptr)) {
     const Exl3FastWorkspace workspace{
         scratch->fast_input,      scratch->fast_input_elements,
         scratch->fast_counters,   scratch->fast_counter_count,

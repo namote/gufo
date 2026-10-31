@@ -48,6 +48,14 @@ struct Exl3FastTarget {
   std::size_t y_stride;
 };
 
+/// Prefill input rotation: out[r][i] = FP16(H(suh * x[r])) per 128
+/// elements, row-major [rows][k] (the decode path's input-rotation
+/// arithmetic).
+void LaunchExl3RotateRows(const float* x, std::size_t x_stride,
+                          std::size_t rows, std::size_t k,
+                          const std::uint16_t* suh, std::uint16_t* out,
+                          hipStream_t stream);
+
 /// Whether the fast path takes `linear` (mul1 codebook, integer K 1..6).
 [[nodiscard]] bool Exl3FastSupported(
     const quant::exl3::DeviceLinear& linear) noexcept;

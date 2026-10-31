@@ -1210,6 +1210,8 @@ struct QwenGpuArena::Exl3Workspace {
       (void)hipFree(scratch.fast_counters);
     if (scratch.fast_down_input != nullptr)
       (void)hipFree(scratch.fast_down_input);
+    if (scratch.fast_prefill_input != nullptr)
+      (void)hipFree(scratch.fast_prefill_input);
   }
 };
 
@@ -1250,6 +1252,12 @@ void QwenGpuArena::AllocateExl3(std::size_t max_input_width) {
   HIP_CHECK(
       hipMalloc(&scratch.fast_down_input,
                 scratch.fast_down_input_elements * sizeof(std::uint16_t)));
+  // X3 prefill: the rotated FP16 input rows of the widest projection
+  // (4096 x 17408 halves, 142.6 MB at the largest batch); EXL3 models only.
+  scratch.fast_prefill_input_elements = max_batch_ * max_input_width;
+  HIP_CHECK(
+      hipMalloc(&scratch.fast_prefill_input,
+                scratch.fast_prefill_input_elements * sizeof(std::uint16_t)));
   exl3_ = std::move(workspace);
 }
 

@@ -89,6 +89,23 @@ __device__ __forceinline__ LaneWindow MakeLaneWindow(unsigned lane) {
   return w;
 }
 
+/// x * kMul1Multiplier mod 2^32 for the 16-bit state in the low half of
+/// src, as two full-rate ops (v_pk_mul_lo_u16 + v_mad_u32_u16, after upstream
+/// exllamav3 exl3_gemv_tiles_rdna.cuh); the upper half of src is ignored.
+/// Equal to (src & 0xffff) * kMul1Multiplier for every state (checked over
+/// all 65,536 states by tools/bench/exl3_prefill_bench and the kernel test).
+__device__ __forceinline__ std::uint32_t HashMul1Packed(std::uint32_t src) {
+  constexpr std::uint32_t k_hi = kMul1Multiplier & 0xffff0000U;
+  constexpr std::uint32_t c_lo = kMul1Multiplier & 0xffffU;
+  std::uint32_t r;
+  std::uint32_t p;
+  asm("v_pk_mul_lo_u16 %0, %1, %2 op_sel_hi:[0,1]"
+      : "=v"(r)
+      : "v"(src), "s"(k_hi));
+  asm("v_mad_u32_u16 %0, %1, %2, %3" : "=v"(p) : "v"(src), "s"(c_lo), "v"(r));
+  return p;
+}
+
 /// Two mul1-hashed states -> the decoded FP16 pair (lo = first state):
 /// fma(1024 + bytesum, 0x1eee, 0xc931) rounded once.
 __device__ __forceinline__ Half2 DecodePairMul1(std::uint32_t p0,

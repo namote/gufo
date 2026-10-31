@@ -21,9 +21,11 @@
 #include <string>
 #include <vector>
 
+#include "src/core/hip/detail/exl3_gemv.hpp"
 #include "src/core/quant/exl3/format.hpp"
 #include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
 #include "src/models/qwen/hip/ops/norm_residual.hpp"
+#include "src/models/qwen/hip/ops/prefill_fp16.hpp"
 #include "src/models/qwen/hip/ops/swiglu.hpp"
 
 namespace {
@@ -590,6 +592,119 @@ void TestNormFusion(std::mt19937& rng) {
     Check(hipFree(p));
 }
 
+// Every 16-bit state through the packed hash and the pair decode (lo = s, hi =
+// a permutation of s) against the CPU codebook (DecodeState).
+__global__ void DecodeAllStates(std::uint32_t* out) {
+  const unsigned s = blockIdx.x * blockDim.x + threadIdx.x;
+  if (s >= 65536)
+    return;
+  const unsigned s2 = (s * 40503U + 12345U) & 0xffffU;
+  // Garbage in the upper halves, as the window shift leaves it.
+  const auto v = gufo::hip::exl3::DecodePairMul1(
+      gufo::hip::exl3::HashMul1Packed(s | (s2 << 16)),
+      gufo::hip::exl3::HashMul1Packed(s2 | (s << 16)));
+  out[s] = __builtin_bit_cast(std::uint32_t, v);
+}
+
+void TestPackedHash() {
+  std::uint32_t* d = nullptr;
+  Check(hipMalloc(&d, 65536 * 4));
+  hipLaunchKernelGGL(DecodeAllStates, dim3(256), dim3(256), 0, 0, d);
+  const auto got = Download(d, 65536);
+  std::size_t diff = 0;
+  for (std::uint32_t s = 0; s < 65536; ++s) {
+    const std::uint32_t s2 = (s * 40503U + 12345U) & 0xffffU;
+    diff += (got[s] & 0xffffU) != DecodeState(s, Codebook::kMul1) ||
+            (got[s] >> 16) != DecodeState(s2, Codebook::kMul1);
+  }
+  Expect(diff == 0,
+         "packed hash decode differs in " + std::to_string(diff) + " states");
+  std::cout << "packed hash: " << diff << " / 65536 states differ\n";
+  Check(hipFree(d));
+}
+
+// X3 prefill (and X3b narrow) trellis WMMA GEMM: the row rotation against the
+// FP32 contract (FP16 bytes), then store and residual GEMMs against FP64 fed
+// that rotated input (relative L2 < 1e-5, finite).
+void TestPrefill(std::size_t k, std::size_t n, int bits, std::size_t rows,
+                 std::mt19937& rng) {
+  const BitRate rate{bits, false};
+  std::vector<std::uint16_t> trellis((k / 16) * (n / 16) * rate.TileWords());
+  for (auto& w : trellis)
+    w = static_cast<std::uint16_t>(rng());
+  const auto suh = RandomScales(rng, k, 0x3800);
+  const auto svh = RandomScales(rng, n, 0x2000);
+  std::normal_distribution<float> normal;
+  std::vector<float> x(rows * k), y0(rows * n);
+  for (auto& v : x)
+    v = normal(rng);
+  for (auto& v : y0)
+    v = normal(rng);
+  std::vector<std::uint16_t> inner(k * n);
+  DequantInner(trellis.data(), k, n, rate, Codebook::kMul1, inner.data());
+  std::vector<double> want(rows * n);
+  std::size_t rot_diff = 0;
+  auto* d_x = Upload(x);
+  auto* d_suh = Upload(suh);
+  std::uint16_t* d_rot = nullptr;
+  Check(hipMalloc(&d_rot, rows * k * 2));
+  gufo::hip::LaunchExl3RotateRows(d_x, k, rows, k, d_suh, d_rot, nullptr);
+  Check(hipDeviceSynchronize());
+  const auto rot_got = Download(d_rot, rows * k);
+  for (std::size_t r = 0; r < rows; ++r) {
+    const auto rot = KernelRotatedInput(&x[r * k], suh.data(), k);
+    for (std::size_t i = 0; i < k; ++i)
+      rot_diff += rot_got[r * k + i] != HalfFromDouble(rot[i]);
+    const auto yr = ProjectRotated(rot, inner, svh, k, n);
+    std::copy(yr.begin(), yr.end(), want.begin() + r * n);
+  }
+  auto* d_t = Upload(trellis);
+  auto* d_svh = Upload(svh);
+  const DeviceLinear lin{d_t,
+                         d_suh,
+                         d_svh,
+                         static_cast<std::uint32_t>(k),
+                         static_cast<std::uint32_t>(n),
+                         rate,
+                         Codebook::kMul1};
+  const std::string name =
+      "prefill k=" + std::to_string(k) + " n=" + std::to_string(n) +
+      " K=" + std::to_string(bits) + " rows=" + std::to_string(rows);
+  Expect(gufo::hip::Exl3PrefillSupported(lin), name + ": supported");
+  auto* d_y = Upload(y0);
+  gufo::hip::LaunchExl3PrefillGemm(lin, d_rot, d_y, rows, false, nullptr);
+  Check(hipDeviceSynchronize());
+  const auto y = Download(d_y, rows * n);
+  // Residual form: y0 + the same projection.
+  Check(hipMemcpy(d_y, y0.data(), y0.size() * 4, hipMemcpyHostToDevice));
+  gufo::hip::LaunchExl3PrefillGemm(lin, d_rot, d_y, rows, true, nullptr);
+  Check(hipDeviceSynchronize());
+  const auto yres = Download(d_y, rows * n);
+  double num = 0.0, den = 0.0, rnum = 0.0;
+  bool finite = true;
+  for (std::size_t i = 0; i < want.size(); ++i) {
+    finite = finite && std::isfinite(y[i]) && std::isfinite(yres[i]);
+    num += (y[i] - want[i]) * (y[i] - want[i]);
+    den += want[i] * want[i];
+    const double r = yres[i] - (static_cast<double>(y0[i]) + want[i]);
+    rnum += r * r;
+  }
+  const double rel = std::sqrt(num / den), rel_res = std::sqrt(rnum / den);
+  Expect(rot_diff == 0, name +
+                            ": rotated rows differ from the FP32 contract in " +
+                            std::to_string(rot_diff) + " values");
+  Expect(finite, name + ": non-finite output");
+  Expect(rel < 1e-5, name + " relative L2 " + std::to_string(rel));
+  Expect(rel_res < 1e-5,
+         name + " residual relative L2 " + std::to_string(rel_res));
+  std::cout << name << ": relative L2 " << rel << ", residual " << rel_res
+            << ", rotation diffs " << rot_diff << "\n";
+  for (void* p : {static_cast<void*>(d_x), static_cast<void*>(d_suh),
+                  static_cast<void*>(d_rot), static_cast<void*>(d_t),
+                  static_cast<void*>(d_svh), static_cast<void*>(d_y)})
+    Check(hipFree(p));
+}
+
 }  // namespace
 
 int main() {
@@ -609,6 +724,14 @@ int main() {
   TestMlp(512, 1024, 5, rng);
   TestMlp(1024, 2048, 4, rng);
   TestNormFusion(rng);
+  TestPackedHash();
+  // X3b narrow tile (17..64 rows) and the X3 prefill tile, k up to 17408.
+  TestPrefill(1024, 512, 5, 17, rng);
+  TestPrefill(1024, 512, 5, 64, rng);
+  TestPrefill(1024, 1024, 5, 300, rng);
+  TestPrefill(512, 256, 4, 65, rng);
+  TestPrefill(17408, 256, 5, 33, rng);
+  TestPrefill(5120, 256, 6, 520, rng);
   if (failures != 0) {
     std::cerr << failures << " failure(s)\n";
     return 1;
