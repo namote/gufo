@@ -1,15 +1,16 @@
-#ifndef GUFO_MODELS_QWEN_HIP_KVARN_CHECKPOINT_HPP_
-#define GUFO_MODELS_QWEN_HIP_KVARN_CHECKPOINT_HPP_
+#ifndef GUFO_CORE_HIP_KVARN_CHECKPOINT_HPP_
+#define GUFO_CORE_HIP_KVARN_CHECKPOINT_HPP_
 
 // Which KVarN rows a checkpoint or compact snapshot holds (K4-C): records of
 // the quantized groups, then only the valid FP16 rows of the sink and the
-// tail. Host-only arithmetic shared by the continuation layout and the arena.
+// tail. Host-only arithmetic shared by the continuation layouts and the
+// executors of the models that use KVarN.
 
 #include <algorithm>
 #include <cstdint>
 #include <optional>
 
-#include "src/models/qwen/hip/kvarn_layout.hpp"
+#include "src/core/hip/kvarn_layout.hpp"
 
 namespace gufo::hip {
 
@@ -51,4 +52,4 @@ struct KvarnCheckpointRows {
 }
 }  // namespace gufo::hip
 
-#endif  // GUFO_MODELS_QWEN_HIP_KVARN_CHECKPOINT_HPP_
+#endif  // GUFO_CORE_HIP_KVARN_CHECKPOINT_HPP_

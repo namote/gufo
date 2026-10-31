@@ -694,7 +694,9 @@ std::shared_ptr<models::qwen38_flash_next::Model> LoadFlashNextModel(
        .mtp_model_path =
            opt.speculative_backend == "mtp" ? opt.mtp_model_path : "",
        .max_draft_tokens = opt.draft_tokens,
-       .vision_model_path = opt.vision_model_path},
+       .vision_model_path = opt.vision_model_path,
+       // ResolvePromptKvCacheType accepted the request before the load.
+       .kvarn = opt.kv_cache_type == KvCacheType::kKvarnK4V4},
       &error);
   PrintModelLoadTime(load_start, model != nullptr);
   if (!model)

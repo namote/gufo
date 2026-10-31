@@ -207,10 +207,123 @@ QuantError QuantizePayload(std::vector<std::uint8_t>& payload,
 
 }  // namespace
 
+// FP16 reference of --dump-reference: u32 steps, u32 vocabulary, the
+// greedy tokens (i32) and every step's logits (f32), host byte order.
+void WriteReference(const std::string& path, std::span<const Token> tokens,
+                    const std::vector<std::vector<float>>& logits) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  Require(bool(out), "cannot write " + path);
+  const std::uint32_t head[2] = {
+      static_cast<std::uint32_t>(tokens.size()),
+      static_cast<std::uint32_t>(logits.empty() ? 0 : logits[0].size())};
+  out.write(reinterpret_cast<const char*>(head), sizeof(head));
+  for (const Token token : tokens) {
+    const auto id = static_cast<std::int32_t>(token);
+    out.write(reinterpret_cast<const char*>(&id), sizeof(id));
+  }
+  for (const auto& step : logits)
+    out.write(reinterpret_cast<const char*>(step.data()),
+              static_cast<std::streamsize>(step.size() * sizeof(float)));
+  Require(bool(out), "cannot write " + path);
+}
+
+// Teacher-forced KL and top-1 of the loaded (KVarN) model against the dumped
+// FP16 reference, then a free greedy run from a fresh prefill.
+int RunReal(qfn::Model& model, std::span<const Token> prompt,
+            std::uint32_t session_context, const std::string& reference_path,
+            const std::string& out_path, std::uint32_t steps) {
+  std::ifstream in(reference_path, std::ios::binary);
+  Require(bool(in), "cannot read " + reference_path);
+  std::uint32_t head[2]{};
+  in.read(reinterpret_cast<char*>(head), sizeof(head));
+  std::vector<Token> reference_tokens(head[0]);
+  for (auto& token : reference_tokens) {
+    std::int32_t id = 0;
+    in.read(reinterpret_cast<char*>(&id), sizeof(id));
+    token = static_cast<Token>(id);
+  }
+  std::vector<std::vector<float>> reference_logits(head[0],
+                                                   std::vector<float>(head[1]));
+  for (auto& step : reference_logits)
+    in.read(reinterpret_cast<char*>(step.data()),
+            static_cast<std::streamsize>(step.size() * sizeof(float)));
+  Require(bool(in) && head[0] != 0, "truncated reference " + reference_path);
+
+  std::string error;
+  const auto prefilled = [&]() {
+    auto session = model.CreateSession(gufo::core::SessionMode::kAutoregressive,
+                                       session_context, &error);
+    Require(bool(session), "session failed: " + error);
+    Require(session->Sync(prompt, &error), "prefill failed: " + error);
+    return session;
+  };
+  auto start = Clock::now();
+  auto session = prefilled();
+  const double prefill_ms = Ms(start);
+  std::vector<double> kls;
+  std::size_t agree = 0, first_disagreement = reference_tokens.size();
+  float max_logit_difference = 0;
+  for (std::size_t i = 0; i < reference_tokens.size(); ++i) {
+    const auto logits = session->Logits();
+    Require(logits.size() == head[1], "vocabulary differs from the reference");
+    for (std::size_t v = 0; v < logits.size(); ++v)
+      max_logit_difference = std::max(
+          max_logit_difference, std::abs(logits[v] - reference_logits[i][v]));
+    kls.push_back(Kl(LogSoftmax(reference_logits[i]), LogSoftmax(logits)));
+    if (Argmax(logits) == reference_tokens[i])
+      ++agree;
+    else if (first_disagreement == reference_tokens.size())
+      first_disagreement = i;
+    if (i + 1 < reference_tokens.size())
+      Require(session->Evaluate(reference_tokens[i], &error),
+              "evaluate failed: " + error);
+  }
+  session.reset();
+  session = prefilled();
+  std::vector<Token> tokens;
+  start = Clock::now();
+  for (std::uint32_t i = 0; i < steps; ++i) {
+    tokens.push_back(Argmax(session->Logits()));
+    if (model.IsStopToken(tokens.back()))
+      break;
+    Require(session->Evaluate(tokens.back(), &error),
+            "evaluate failed: " + error);
+  }
+  const double decode_ms = Ms(start);
+  const auto divergence = static_cast<std::size_t>(
+      std::ranges::mismatch(tokens, reference_tokens).in1 - tokens.begin());
+  auto row = json::Value::object();
+  row["model"] = "qwen3.8-flash-next";
+  row["config"] = "kvarn_k4v4_real";
+  row["prompt_tokens"] = prompt.size();
+  row["context"] = std::size_t{session_context};
+  row["steps"] = reference_tokens.size();
+  row["kl"] = Distribution(kls);
+  auto kl_steps = json::Value::array();
+  for (const double kl : kls)
+    kl_steps.push_back(kl);
+  row["kl_steps"] = std::move(kl_steps);
+  row["top1_agreement"] = static_cast<double>(agree) / reference_tokens.size();
+  row["first_top1_disagreement"] = first_disagreement;
+  row["max_abs_logit_difference"] = max_logit_difference;
+  row["free_tokens"] = tokens.size();
+  row["free_divergence"] = divergence;
+  row["free_identical"] = tokens == reference_tokens;
+  row["prefill_ms"] = prefill_ms;
+  row["free_decode_ms"] = decode_ms;
+  std::ofstream out(out_path, std::ios::app);
+  Require(bool(out), "cannot write " + out_path);
+  out << row.dump() << '\n' << std::flush;
+  std::cerr << "kvarn_k4v4_real kl_median=" << row["kl"].member_double("median")
+            << " top1=" << row["top1_agreement"].as_double()
+            << " free_identical=" << (tokens == reference_tokens) << std::endl;
+  return 0;
+}
+
 int main(int argc, char** argv) {
   try {
     std::string model_path, system_path, user_path, out_path,
-        configs = "fp16,kvarn_k4v2_g128";
+        configs = "fp16,kvarn_k4v2_g128", dump_path, real_path;
     std::uint32_t steps = 384, prefill_chunk = 0, context = 0;
     bool quantize_decode = false;
     for (int i = 1; i < argc; ++i) {
@@ -235,6 +348,10 @@ int main(int argc, char** argv) {
         context = static_cast<std::uint32_t>(std::stoul(value()));
       else if (arg == "--quantize-decode")
         quantize_decode = true;
+      else if (arg == "--dump-reference")
+        dump_path = value();
+      else if (arg == "--real")
+        real_path = value();
       else if (model_path.empty() && !arg.starts_with("--"))
         model_path = arg;
       else
@@ -245,7 +362,8 @@ int main(int argc, char** argv) {
             "Usage: qwen38_flash_next_kvarn_k0 MODEL.gguf --user FILE "
             "[--system FILE] --out FILE.jsonl "
             "[--configs fp16,kvarn_k4v2_g128,...] [--steps N] [--context N] "
-            "[--prefill-chunk N] [--quantize-decode]");
+            "[--prefill-chunk N] [--quantize-decode] "
+            "[--dump-reference FILE | --real FILE]");
     std::vector<kvarn::Config> parsed;
     for (std::stringstream list(configs); list.good();) {
       std::string name;
@@ -265,6 +383,9 @@ int main(int argc, char** argv) {
     qfn::ModelOptions options;
     options.max_context = context != 0 ? context : 262144;
     options.decode_concurrency = 1;
+    // --real runs the production KVarN k4v4 executor against the FP16
+    // reference a --dump-reference run wrote (one model per process).
+    options.kvarn = !real_path.empty();
     auto model = qfn::Model::Load(model_path, options, &error);
     Require(bool(model), "model load failed: " + error);
     tok::ChatTemplateOptions chat;
@@ -303,6 +424,10 @@ int main(int argc, char** argv) {
       Require(session->Evaluate(token, &error), "evaluate failed: " + error);
     };
 
+    if (!real_path.empty())
+      return RunReal(*model, prompt, session_context, real_path, out_path,
+                     steps);
+
     // FP16 reference: the prefilled state, the greedy continuation and the
     // log-probabilities at every step.
     auto start = Clock::now();
@@ -326,6 +451,9 @@ int main(int argc, char** argv) {
     std::cerr << "reference prefill_ms=" << prefill_ms
               << " decode_tokens=" << reference_tokens.size()
               << " decode_ms=" << decode_ms << std::endl;
+
+    if (!dump_path.empty())
+      WriteReference(dump_path, reference_tokens, reference_logits);
 
     std::ofstream out(out_path, std::ios::app);
     Require(bool(out), "cannot write " + out_path);

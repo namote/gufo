@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "src/core/hip/host_allocations.hpp"
+#include "src/core/hip/kvarn_layout.hpp"
 #include "src/core/session_mode.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
 #include "src/models/qwen/vision/device_input.hpp"
@@ -97,6 +98,21 @@ private:
 
 /// Per-sequence state on the device: recurrent SSM state, KV and indexer
 /// caches, PLE conv history, plus the host-side n-gram window. A
+/// The KVarN plan of one forward over rows [start, start + rows): passes of
+/// at most 128 rows quantize a group that ends inside the pass in each layer
+/// (hip::PlanKvarnPass), wider prompt chunks write a staging buffer and
+/// quantize their completed groups after attention (hip::PlanKvarnPrefill).
+struct KvarnPass {
+  bool prefill{false};
+  std::uint32_t start{0};
+  std::uint32_t rows{0};
+  /// Prefill: staging row 0's position, and the end of the record rows the
+  /// chunk reads.
+  std::uint32_t staging_first{0};
+  std::uint32_t quant_end{0};
+  std::uint32_t flushed_end{hip::kKvarnSinkTokens};
+};
+
 /// speculative forward additionally keeps per-token snapshots of every
 /// recurrent buffer so the batch can be cut back to its accepted prefix.
 class Session {
@@ -106,6 +122,8 @@ public:
   Session& operator=(const Session&) = delete;
 
   [[nodiscard]] bool mtp_enabled() const noexcept { return mtp_enabled_; }
+  /// Trunk attention K/V are KVarN k4v4 records (Executor::Options::kvarn).
+  [[nodiscard]] bool kvarn() const noexcept { return kvarn_; }
   [[nodiscard]] std::uint32_t position() const noexcept { return position_; }
   [[nodiscard]] std::uint32_t max_context() const noexcept {
     return max_context_;
@@ -159,6 +177,13 @@ private:
     /// Block table of k_cache, v_cache and block_k (kernels.hpp
     /// kKvPooledRatio); null for contiguous rows.
     const std::uint32_t* kv_blocks{nullptr};
+    /// KVarN layers (Options::kvarn): this layer's FP16 sink and tail ring
+    /// and record plane, and the session's pass plan. Null for FP16 K/V,
+    /// where k_cache/v_cache hold the rows.
+    __half* kvarn_k{nullptr};
+    __half* kvarn_v{nullptr};
+    std::uint8_t* kvarn_records{nullptr};
+    const KvarnPass* kvarn_pass{nullptr};
   };
   /// Per-launch values the kernels read from device memory, so a captured
   /// graph replays at any position.
@@ -198,7 +223,17 @@ private:
   std::vector<LinearState> linear_;
   std::vector<AttentionState> attention_;
   float* ple_history_{nullptr};  ///< [PleConvHistory()][hc_dim]
-  RollbackRows ple_snapshots_;   ///< [max_spec-1][PleConvHistory()][hc_dim]
+  /// KVarN trunk K/V (plan/exl3/F1-KVARN-DESIGN.md): which rows are
+  /// quantized, the current forward's plan and the FP16 sink/tail rows
+  /// ([K|V][attention layer][kKvarnFp16Tokens][kv row]).
+  bool kvarn_{false};
+  hip::KvarnTail kvarn_tail_{};
+  KvarnPass kvarn_pass_{};
+  __half* kvarn_fp16_{nullptr};
+  std::uint8_t* kvarn_records_{nullptr};  ///< record plane, attention layer 0
+  std::size_t kvarn_records_pitch_{0};    ///< bytes per layer of that plane
+  const std::uint32_t* kv_table_{nullptr};
+  RollbackRows ple_snapshots_;  ///< [max_spec-1][PleConvHistory()][hc_dim]
   NgramHistory ngram_;
   std::vector<NgramHistory> ngram_snapshots_;
   // Prefetches count against the const session that will consume them.
@@ -251,6 +286,9 @@ public:
     /// Largest session context. Zero selects the native context; values
     /// above it require YaRN (Config::MaxContextLength()).
     std::uint32_t max_context{0};
+    /// Trunk attention K/V as KVarN k4v4 records with token-major values
+    /// (plan/exl3/F1-KVARN-DESIGN.md); the MTP layer stays FP16.
+    bool kvarn{false};
   };
 
   ~Executor();
@@ -265,6 +303,18 @@ public:
   [[nodiscard]] std::unique_ptr<Session> CreateSession(
       core::SessionMode mode, std::uint32_t max_context,
       std::string* error_msg = nullptr) const;
+  /// KVarN sessions: plans a forward over rows [start, start + n) and
+  /// quantizes the groups it needs before running (KvarnPass), then records
+  /// the tail after it, quantizing a group that ends exactly at the new
+  /// position so a snapshot's records always end at the group floor.
+  [[nodiscard]] bool PlanKvarn(Session& session, std::uint32_t start,
+                               std::uint32_t n, std::string* error_msg) const;
+  [[nodiscard]] bool FinishKvarn(Session& session,
+                                 std::string* error_msg) const;
+  /// Quantizes groups [first, first + groups) of every attention layer from
+  /// the session's FP16 tail ring.
+  void FlushKvarnGroups(const Session& session, std::uint32_t first,
+                        std::uint32_t groups) const;
   [[nodiscard]] bool EnsureRollback(Session& session, std::uint32_t depth,
                                     std::string* error_msg) const;
   [[nodiscard]] std::size_t SessionBytes(
@@ -439,6 +489,8 @@ public:
     return options_.max_speculative;
   }
   [[nodiscard]] bool has_mtp() const noexcept { return model_->has_mtp(); }
+  /// Whether trunk K/V are KVarN k4v4 (Options::kvarn).
+  [[nodiscard]] bool kvarn() const noexcept { return options_.kvarn; }
 
 private:
   Executor() = default;
@@ -545,6 +597,13 @@ private:
                  bool last_only = false, bool projections_ready = false,
                  bool project_output = true,
                  std::uint32_t checkpoint_tokens = 0) const;
+  /// The attention, KVarN chunk bookkeeping and output projection of a
+  /// KVarN layer after its rows are written (Attention).
+  bool KvarnAttention(const DeviceLayer& l, const Session::AttentionState& s,
+                      std::uint32_t n_tokens, const std::uint32_t* pos,
+                      std::uint32_t start_pos, const std::uint32_t* mask,
+                      bool last_only, bool project_output, float* out,
+                      std::string* error_msg) const;
   /// Orders the main stream after the work queued on side_stream_.
   bool JoinSide(std::string* error_msg) const;
   bool Moe(const DeviceLayer& l, const float* x, float* out,
@@ -749,6 +808,10 @@ private:
   /// Reused only after the preceding forward has drained its stream.
   mutable hip::HostAllocations host_allocations_;
   float* host_emb_{nullptr};
+  /// KVarN prompt-chunk staging, one layer at a time: K and V rows of
+  /// hip::KvarnStagingRows(max_batch) positions.
+  __half* kvarn_staging_k_{nullptr};
+  __half* kvarn_staging_v_{nullptr};
   mutable std::vector<std::uint32_t> host_rows_;
   mutable std::vector<NgramGatherOwner> ngram_owners_;
   mutable bool ple_pending_{false};

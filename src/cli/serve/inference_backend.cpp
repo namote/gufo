@@ -2475,10 +2475,18 @@ public:
   QwenFlashNextTextRunnerState(QwenFlashNextSession& session,
                                cache::Adapter& adapter, cache::Slot& slot)
       : session_(&session), adapter_(&adapter), slot_(&slot) {}
+  /// A state owning its session, for runners without a component cache
+  /// (KVarN K/V): the session pool's slots, invalidated by a session reset.
+  explicit QwenFlashNextTextRunnerState(
+      std::unique_ptr<QwenFlashNextSession> session)
+      : owned_(std::move(session)), session_(owned_.get()) {}
 
   void Invalidate() noexcept override {
     session_->SetCancellationCheck({});
-    (void)adapter_->Invalidate(*slot_);
+    if (adapter_ != nullptr)
+      (void)adapter_->Invalidate(*slot_);
+    else
+      session_->Reset();
     position_ = 0;
   }
   void SetCancellationCheck(const CancellationCheck& check) override {
@@ -2493,6 +2501,8 @@ public:
   [[nodiscard]] QwenFlashNextSession& session() const { return *session_; }
   [[nodiscard]] models::qwen38_flash_next::ContinuationAdapter& adapter()
       const {
+    if (adapter_ == nullptr)
+      throw std::logic_error("Flash-Next state has no continuation adapter");
     return dynamic_cast<models::qwen38_flash_next::ContinuationAdapter&>(
         *adapter_);
   }
@@ -2501,6 +2511,7 @@ public:
   void set_position(std::size_t position) noexcept { position_ = position; }
 
 private:
+  std::unique_ptr<QwenFlashNextSession> owned_;
   QwenFlashNextSession* session_{};
   cache::Adapter* adapter_{};
   cache::Slot* slot_{};
@@ -2543,7 +2554,9 @@ public:
     // supply file fingerprints when disk caching is disabled. Its model
     // lifetime is an exact process-local identity; durable caches still
     // require the validated full artifact fingerprints below.
-    if (!artifact_fingerprint.empty()) {
+    // KVarN K/V have no continuation components yet: such a server keeps no
+    // prefix cache, snapshots or persistence (plan/exl3/F1-RESULTS.md).
+    if (!artifact_fingerprint.empty() && !model_->Kvarn()) {
       persistence_ = TextRunnerPersistenceDescriptor{
           .compatibility_identity = QwenFlashNextCompatibilityIdentity(
               artifact_fingerprint, use_mtp_ ? mtp_fingerprint : std::string{},
@@ -2569,7 +2582,9 @@ public:
     }
   }
 
-  [[nodiscard]] bool UsesComponentCache() const override { return true; }
+  [[nodiscard]] bool UsesComponentCache() const override {
+    return !model_->Kvarn();
+  }
   [[nodiscard]] std::unique_ptr<ComponentCacheResources>
   CreateComponentCacheResources(cache::ResourceLedger& ledger,
                                 std::size_t ram) const override {
@@ -2597,21 +2612,22 @@ public:
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
     return {
         .model_id = model_->ModelName(),
-        .state_abi = std::string(kQwenFlashNextStateAbi),
+        .state_abi = std::string(kQwenFlashNextStateAbi) +
+                     (model_->Kvarn() ? "+kvarn-k4v4" : ""),
         .max_context = max_context_,
         .capabilities =
             TextRunnerCapabilities{
                 .incremental_prefill = true,
-                .snapshot = true,
-                .fork = true,
+                .snapshot = !model_->Kvarn(),
+                .fork = !model_->Kvarn(),
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
                 .multi_token_decode = use_mtp_,
                 .batched_multi_token_decode = use_mtp_,
                 .batched_multi_token_decode_max_width = use_mtp_ ? 8u : 0u,
-                .prefix_reuse = true,
-                .in_pass_checkpoint = true,
-                .partial_prefill_retention = true,
+                .prefix_reuse = !model_->Kvarn(),
+                .in_pass_checkpoint = !model_->Kvarn(),
+                .partial_prefill_retention = !model_->Kvarn(),
             },
         .persistence = persistence_,
     };
@@ -2726,8 +2742,19 @@ public:
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
-    throw std::logic_error(
-        "Flash-Next execution slots are owned by the component cache");
+    if (UsesComponentCache())
+      throw std::logic_error(
+          "Flash-Next execution slots are owned by the component cache");
+    // KVarN sessions: the plain session pool owns each slot's session.
+    std::string error;
+    auto session =
+        model_->CreateSession(use_mtp_ ? core::SessionMode::kSpeculative
+                                       : core::SessionMode::kAutoregressive,
+                              max_context_, &error);
+    if (!session)
+      throw std::runtime_error("Flash-Next session allocation failed: " +
+                               error);
+    return std::make_unique<QwenFlashNextTextRunnerState>(std::move(session));
   }
 
   void PreparePrefixReuse(
@@ -3327,6 +3354,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .decode_concurrency = static_cast<std::uint32_t>(
                 std::clamp<std::size_t>(session_count, 1, 8)),
             .rope_scaling = rope_scaling,
+            .kvarn = resolved_kv_cache_type == cli::KvCacheType::kKvarnK4V4,
         },
         &load_error);
     if (model == nullptr) {

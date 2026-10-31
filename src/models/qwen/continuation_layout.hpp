@@ -5,9 +5,9 @@
 #include <vector>
 
 #include "src/cache/types.hpp"
+#include "src/core/hip/kvarn_checkpoint.hpp"
 #include "src/core/model_config.hpp"
 #include "src/models/qwen/hip/execution_policy.hpp"
-#include "src/models/qwen/hip/kvarn_checkpoint.hpp"
 
 namespace gufo::models::qwen {
 

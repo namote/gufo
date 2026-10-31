@@ -859,6 +859,10 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     if (item.speculative &&
         !EnsureRollback(*item.session, item.tokens.size() - 1, error))
       return false;
+    if (item.session->kvarn_ && !item.session->Cancelled() &&
+        !PlanKvarn(*item.session, item.session->position_,
+                   static_cast<std::uint32_t>(item.tokens.size()), error))
+      return false;
   }
   if (!AllocateBatch(error)) {
     return false;
@@ -1120,6 +1124,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     if (sparse[i]) {
       items[i].session->blocks_ = complete[i];
     }
+    if (items[i].session->kvarn_ && !FinishKvarn(*items[i].session, error))
+      return false;
   }
   batch_rows_ = rows;
   return true;
