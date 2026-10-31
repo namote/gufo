@@ -2,7 +2,7 @@
 
 상위 문서: [PLAN.md](PLAN.md) F2, [XQ-RESULTS.md](XQ-RESULTS.md)(27B에서 같은 도구로 해 본 경험), [W-COMMON](../rotated-quant/W-COMMON.md).
 
-상태: **조사만 했다.** GPU, 컨테이너, 큰 파일 해시는 쓰지 않았다. 소스 읽기, safetensors 헤더 읽기, HF API로 작은 JSON 받기만 했다. 시험 창은 감독 허락을 기다린다.
+상태: **계획 변경(사용자 결정 2026-10-31): 직접 양자화하지 않는다.** turboderp가 미리 만든 `5.05bpw_h6_ng6` 팩을 받아 쓴다. 받기, 검증, 헤더 검사는 끝났다(맨 아래 "계획 변경" 절). 아래 1–5절은 조사 기록으로 남긴다.
 
 기준 소스: upstream `exllamav3` v1.6.5 `cdc785db`(`/home/m2on/projects/gufo/build/w9-src/exllamav3/`). 파일 경로는 그 아래 `exllamav3/`를 기준으로 쓴다.
 
@@ -165,3 +165,31 @@
 2. n-gram 표: A안(직접 양자화, 약 10 h 추가)과 B안(turboderp 파일 39 GB 받기) 중 어느 것인지
 3. 비트: turboderp 5.05와 같게 갈지(`-hq`로 trunk 7, MTP 5, NG6). 사용자 결정 "experts 5.0"은 이 설정에서 만족된다.
 4. 시험 창 순서와 시각
+
+## 계획 변경 (사용자 결정 2026-10-31)
+
+- **결정:** Flash-Next는 직접 양자화하지 않는다. turboderp `Qwen3.8-Flash-Next-exl3`의 `5.05bpw_h6_ng6`을 그대로 쓴다.
+  - 같이 취소된 것: 시험 창, `window.py` 변경, n-gram 양자화
+  - 이 팩은 2절의 1.6.5 대응 설정과 같다(experts 5, trunk 7, indexer 5, head 6, MTP 5, 비전 6, NG6). 그래서 위 "결정이 필요한 것" 1–4는 모두 해당이 없어졌다.
+- **팩 위치:** `/run/media/m2on/T5 EVO/AI/model/flash-next-exl3-5.05-h6-ng6/`(외장, 루트는 쓰지 않음)
+  - 고정 리비전: commit `7cef615f7fd3681295b68848018876dfabc336c7`. 모든 파일을 `resolve/<commit>/…`에서 받았다.
+  - 파일 29개(LFS 16개), 123,252,697,337 B(ngram 39.0 GB, 본체 샤드 11개 83.6 GB)
+  - 라이선스: `qwen-community-1.0`(other). 로컬 사용만 한다.
+- **받기:** 2026-10-31 08:23–11:27 KST(약 11 MB/s).
+  - 이어받기가 되는 curl(`-C -`, `.part`를 크기가 맞으면 rename)로 받았다. 중단은 없었다(모든 파일 tries=1).
+  - 시작 전에 외장 가용 420 GB를 확인했고, gufo-00에 큰 디스크 쓰기를 한 줄로 알렸다.
+- **검증:** 11:27–11:34 KST, `nice 19`/`ionice -c3`, timing 창이 없는 시간(창 컨테이너 없음을 확인)
+  - 도구: `tools/exl3_quant/verify_hf_download.py`(`db9797d4`)
+  - LFS 파일은 sha256을 HF `lfs.oid`와, 작은 파일은 git blob sha1을 `oid`와 비교했다. **29/29 OK, 실패 0**
+  - 로그: 팩 안 `VERIFY-SHA256.log`
+- **PROVENANCE:** 팩 안 `PROVENANCE.md`(리비전, 라이선스, 파일 수와 크기, 받기와 검증 기록), `HF-TREE.json`(API 목록, oid 포함)
+- **헤더와 설정 검사:** `tools/exl3_quant/check_fn_pack.py`(`cb594358`) **PASS 5/5**. 결과는 `.xq/check-fn-pack.json`이다. 데이터는 읽지 않았다.
+  - config: 2절에 적은 값 `{"version": "1.4.4", "bits": 5.05, "head_bits": 6, "mtp_bits": 5, "vision_bits": 6, "out_scales": "always", "codebook": "mul1", "calibration": 250 × 2048}`과 같다.
+  - storage: `quantization_config.json`의 텐서 296,814개가 헤더의 모양, dtype, 바이트와 모두 같다.
+    - 목록에 없는 본체 텐서 109개는 leaf가 아닌 모듈의 파라미터다(GDN `A_log`/`dt_bias`/`conv1d`, PLE `conv1d`). upstream `quant_config.py`가 leaf만 적기 때문이다.
+    - MTP, 비전, `mtp_hyper_connection_mixer_patch.safetensors` 텐서 7,190개는 side 검사로 본다.
+  - bits: experts 5 × 73,728, GDN/attention/shared expert 7(108 + 48 + 144), indexer 5(12), lm_head 6. router, `in_proj_a/b`, hyper-connection, PLE projection은 EXL3가 아니다. n-gram trellis는 int16 [320001536, 61](K=6)이다.
+  - side: MTP experts와 indexer 5(1,537), MTP attention과 shared expert 7(7), MTP `fc_embedding`/`fc_hidden` 6(2), 비전 6(164)
+  - index: `model.safetensors.index.json` 304,105개가 실제 파일과 맞는다.
+- **외장 디스크:** 받은 뒤 가용 306 GB
+- **다음:** 감독이 정한다. 예를 들어 F0(n-gram 디스크 배치, 메모리 점유)과 F2 커널 작업에서 이 팩을 수치 기준으로 쓰는 것.
