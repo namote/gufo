@@ -15,6 +15,7 @@ namespace gufo::quant::exl3 {
 
 struct Checkpoint::Shard {
   platform::ReadOnlyMappedFile file;
+  std::filesystem::path path;
 };
 
 namespace {
@@ -117,6 +118,8 @@ const std::uint16_t* U16(const Tensor& tensor) {
 std::int64_t Tensor::Elements() const noexcept {
   std::int64_t count = 1;
   for (const auto dim : shape) {
+    if (dim == 0 || count > std::numeric_limits<std::int64_t>::max() / dim)
+      return 0;
     count *= dim;
   }
   return count;
@@ -141,12 +144,15 @@ bool Checkpoint::IsExl3(const std::filesystem::path& directory) {
   }
 }
 
-Checkpoint Checkpoint::Open(const std::filesystem::path& directory) {
+Checkpoint Checkpoint::Open(
+    const std::filesystem::path& directory,
+    std::span<const std::filesystem::path> supplementary) {
   Checkpoint checkpoint;
   checkpoint.config_ = ParseConfig(ReadJson(directory / "config.json"),
                                    directory / "config.json");
 
-  std::set<std::string> shard_names;
+  std::set<std::filesystem::path> shard_names;
+  std::map<std::string, std::string> indexed;
   const auto index_path = directory / "model.safetensors.index.json";
   std::error_code ec;
   if (std::filesystem::is_regular_file(index_path, ec)) {
@@ -160,15 +166,20 @@ Checkpoint Checkpoint::Open(const std::filesystem::path& directory) {
           file.str().find("..") != std::string::npos) {
         Fail("invalid shard name for " + name);
       }
-      shard_names.insert(file.str());
+      shard_names.insert(directory / file.str());
+      indexed.emplace(name, file.str());
     }
   } else {
-    shard_names.insert("model.safetensors");
+    shard_names.insert(directory / "model.safetensors");
   }
 
-  for (const auto& shard_name : shard_names) {
-    const auto path = directory / shard_name;
+  for (const auto& path : supplementary) {
+    if (!shard_names.insert(path).second)
+      Fail("duplicate supplementary shard " + path.string());
+  }
+  for (const auto& path : shard_names) {
     auto shard = std::make_unique<Shard>();
+    shard->path = path;
     std::string error;
     shard->file = platform::ReadOnlyMappedFile::Open(path, &error);
     if (!shard->file.valid() || shard->file.size() < 8) {
@@ -218,7 +229,17 @@ Checkpoint Checkpoint::Open(const std::filesystem::path& directory) {
       }
       tensor.data = payload_base + begin;
       tensor.bytes = static_cast<std::size_t>(end - begin);
+      tensor.shard = static_cast<std::uint32_t>(checkpoint.shards_.size());
+      tensor.file_offset = 8 + header_size + begin;
+      const auto expected = indexed.find(name);
+      if (expected != indexed.end() && expected->second != path.filename())
+        Fail("tensor " + name + " is in the wrong indexed shard");
+      if (tensor.Elements() == 0)
+        Fail(path.string() + ": invalid/overflowed shape " + name);
       const std::size_t element = ElementBytes(tensor.dtype);
+      if (element != 0 && static_cast<std::uint64_t>(tensor.Elements()) >
+                              std::numeric_limits<std::size_t>::max() / element)
+        Fail(path.string() + ": overflowed tensor bytes " + name);
       if (element != 0 &&
           tensor.bytes !=
               static_cast<std::size_t>(tensor.Elements()) * element) {
@@ -230,7 +251,20 @@ Checkpoint Checkpoint::Open(const std::filesystem::path& directory) {
     }
     checkpoint.shards_.push_back(std::move(shard));
   }
+  for (const auto& [name, file] : indexed) {
+    if (checkpoint.Find(name) == nullptr)
+      Fail("indexed tensor " + name + " is missing from " + file);
+  }
   return checkpoint;
+}
+
+std::vector<core::GgufMappedRegion> Checkpoint::GetMappedRegions() const {
+  std::vector<core::GgufMappedRegion> regions;
+  regions.reserve(shards_.size());
+  for (const auto& shard : shards_)
+    regions.push_back({shard->file.data(), shard->file.size(),
+                       shard->file.PlatformHandle(), shard->path});
+  return regions;
 }
 
 const Tensor* Checkpoint::Find(std::string_view name) const noexcept {
@@ -269,6 +303,11 @@ Linear Checkpoint::GetLinear(std::string_view module) const {
   const bool mul1 = Find(m + ".mul1") != nullptr;
   if (mcg && mul1) {
     Fail(m + ": both mcg and mul1 markers are present");
+  }
+  for (const auto* marker : {Find(m + ".mcg"), Find(m + ".mul1")}) {
+    if (marker != nullptr && (marker->dtype != DType::kI32 ||
+                              !marker->shape.empty() || marker->bytes != 4))
+      Fail(m + ": codebook marker must be an I32 scalar");
   }
   linear.codebook =
       mul1 ? Codebook::kMul1 : (mcg ? Codebook::kMcg : Codebook::k3Inst);

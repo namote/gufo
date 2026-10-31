@@ -484,6 +484,9 @@ void LaunchGemvBits(int bits, const GemvArgs& args, const LaunchShape& shape,
     case 5:
       LaunchGemvRows<5, M, kEpilogue>(args, shape, stream);
       break;
+    case 7:
+      LaunchGemvRows<7, M, kEpilogue>(args, shape, stream);
+      break;
     default:
       LaunchGemvRows<6, M, kEpilogue>(args, shape, stream);
       break;
@@ -609,7 +612,7 @@ void LaunchExl3RotateRows(const float* x, std::size_t x_stride,
 
 bool Exl3FastSupported(const quant::exl3::DeviceLinear& linear) noexcept {
   return linear.codebook == quant::exl3::Codebook::kMul1 && !linear.rate.half &&
-         linear.rate.bits >= 1 && linear.rate.bits <= 6 &&
+         linear.rate.bits >= 1 && linear.rate.bits <= 7 &&
          linear.k % exl3::kSegment == 0 && linear.n % exl3::kSegment == 0;
 }
 

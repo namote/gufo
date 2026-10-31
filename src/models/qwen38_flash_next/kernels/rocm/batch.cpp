@@ -340,6 +340,10 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
     if (!l.attn_qkv.empty()) {
       if (!DenseBatch(l.attn_qkv, base.mixed, base.qg, rows, error))
         return false;
+    } else if (l.attn_q.exl3 != nullptr) {
+      if (!Exl3Group({&l.attn_q, &l.attn_k, &l.attn_v},
+                     {base.qg, base.k, base.v}, base.mixed, rows, error))
+        return false;
     } else if (!DenseBatch(l.attn_q, base.mixed, base.qg, rows, error) ||
                !DenseBatch(l.attn_k, base.mixed, base.k, rows, error) ||
                !DenseBatch(l.attn_v, base.mixed, base.v, rows, error)) {
@@ -574,6 +578,13 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
                             static_cast<std::uint32_t>(prefix),
                             kMtpDraftExtraRows, stream_);
       }
+    } else if (subset_rows != 0 && full_head.exl3 != nullptr) {
+      for (std::uint32_t i = 0; i < n; ++i)
+        if (!DraftLogits(
+                *items[i].session,
+                base.mixed + std::size_t{slot[i]} * config().hidden_size,
+                logits_of(i), error))
+          return false;
     } else if (subset_rows != 0) {
       float* staged = batch_logits_ + kBatchSessions * vocab -
                       std::size_t{subset_rows} * prefix;
@@ -680,7 +691,7 @@ bool Executor::QuantizeBatch(const float* x, std::uint32_t rows,
 
 bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
                           std::uint32_t rows, std::string* error) const {
-  if (rows <= kDecodeRows)
+  if (w.exl3 != nullptr || rows <= kDecodeRows)
     return Dense(w, x, out, rows, error);
   if (w.type != core::GgmlType::kQ8_0) {
     SmallGemm(w.data, EmbeddingType(w.type), x, out, rows, w.rows, w.cols,
@@ -765,6 +776,8 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
                        error) ||
       !DenseBatch(l.shexp_down, base.shexp_up, base.shexp_out, rows, error))
     return false;
+  if (l.ffn_gate_exps.exl3 != nullptr)
+    return Exl3Experts(l, x, out, rows, error);
   if (l.ffn_gate_exps.type == core::GgmlType::kQ4_K &&
       l.ffn_up_exps.type == core::GgmlType::kQ4_K) {
     // Share expert weights across request boundaries while retaining the
@@ -979,7 +992,13 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
       if (!HcMixBatch(l.hc_attn, base.res, normed, base.mixed, base.inject,
                       rows, error))
         return false;
-      if (l.linear) {
+      if (l.linear && l.ssm_qkv.exl3 != nullptr) {
+        if (!Exl3Group({&l.ssm_qkv, &l.ssm_gate}, {base.qkv, base.z},
+                       base.mixed, rows, error) ||
+            !DenseBatch(l.ssm_alpha_beta, base.mixed, base.alpha_beta, rows,
+                        error))
+          return false;
+      } else if (l.linear) {
         if ((!l.ssm_in.empty()
                  ? !DenseBatch(l.ssm_in, base.mixed, base.qkvz, rows, error)
                  : (!DenseBatch(l.ssm_qkv, base.mixed, base.qkv, rows, error) ||
@@ -993,6 +1012,10 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
         if (!DenseBatch(l.attn_qkv, base.mixed, base.qg, rows, error)) {
           return false;
         }
+      } else if (l.attn_q.exl3 != nullptr) {
+        if (!Exl3Group({&l.attn_q, &l.attn_k, &l.attn_v},
+                       {base.qg, base.k, base.v}, base.mixed, rows, error))
+          return false;
       } else {
         // Separate Q/gate has a shorter row stride than the stacked buffer.
         // This model normally stacks QKV; keep the separate shape explicit.

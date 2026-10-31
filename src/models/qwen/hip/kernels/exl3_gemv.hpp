@@ -56,7 +56,7 @@ void LaunchExl3RotateRows(const float* x, std::size_t x_stride,
                           const std::uint16_t* suh, std::uint16_t* out,
                           hipStream_t stream);
 
-/// Whether the fast path takes `linear` (mul1 codebook, integer K 1..6).
+/// Whether the fast path takes `linear` (mul1 codebook, integer K 1..7).
 [[nodiscard]] bool Exl3FastSupported(
     const quant::exl3::DeviceLinear& linear) noexcept;
 
