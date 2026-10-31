@@ -2261,7 +2261,7 @@ __global__ void SsmConvKernel(const float* qkv, std::uint32_t qkv_stride,
 /// loads. Lanes run along channels, so every access is a contiguous row.
 constexpr std::uint32_t kSsmConvTaps = 4;
 constexpr std::uint32_t kSsmConvTokensPerThread = 8;
-template<bool kSaveHistory, bool kBatch>
+template<bool kSaveHistory, bool kBatch, bool stable = false>
 __global__ void SsmConv4Kernel(const float* qkv, std::uint32_t qkv_stride,
                                const float* w, float* conv_state, float* out,
                                std::uint32_t n_tokens, std::uint32_t channels,
@@ -2303,8 +2303,21 @@ __global__ void SsmConv4Kernel(const float* qkv, std::uint32_t qkv_stride,
       break;
     }
     const float v = qkv[static_cast<std::size_t>(t) * qkv_stride + c];
-    const float acc = taps.x * window[0] + taps.y * window[1] +
-                      taps.z * window[2] + taps.w * v;
+    float acc;
+    if constexpr (stable) {
+      // EXL3 keeps the same multiply then three FMA boundaries for every
+      // token tile, independent of history-saving and chunk width.
+      acc = Materialize(Materialize(taps.x) * Materialize(window[0]));
+      acc = Materialize(
+          __builtin_fmaf(Materialize(taps.y), Materialize(window[1]), acc));
+      acc = Materialize(
+          __builtin_fmaf(Materialize(taps.z), Materialize(window[2]), acc));
+      acc =
+          Materialize(__builtin_fmaf(Materialize(taps.w), Materialize(v), acc));
+    } else {
+      acc = taps.x * window[0] + taps.y * window[1] + taps.z * window[2] +
+            taps.w * v;
+    }
     out[static_cast<std::size_t>(t) * channels + c] = SiluF(acc);
     window[0] = window[1];
     window[1] = window[2];
@@ -3212,8 +3225,8 @@ __global__ void AttentionKernel(
     float* partials, const std::uint32_t* start_pos, std::uint32_t heads,
     std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
     const std::uint32_t* lists, const std::uint32_t* counts,
-    std::uint32_t capacity, const std::uint32_t* kv_blocks,
-    KvarnReadView kvarn) {
+    std::uint32_t capacity, const std::uint32_t* kv_blocks, KvarnReadView kvarn,
+    std::uint32_t dense_prefix) {
   constexpr std::uint32_t kTile = 256;
   constexpr std::uint32_t kWindow = 1024;  // blocks compacted per pass
   const std::uint32_t split = blockIdx.z;
@@ -3456,7 +3469,7 @@ __global__ void AttentionKernel(
     __syncthreads();
   };
 
-  if (words == nullptr) {
+  if (words == nullptr || pos < dense_prefix) {
     for (std::uint32_t tile = split * kTile; tile < n_kv;
          tile += kTile * splits) {
       keys[i] = tile + i < n_kv ? tile + i : n_kv;
@@ -7656,8 +7669,10 @@ void PrepareExl3DensePrefill(std::span<const Exl3DensePrefillProblem> problems,
 
 void HcDownSiluF16(const void* w, const float* x, float* out,
                    std::uint32_t n_tokens, hipStream_t stream) {
-  SmallGemmForType<WeightType::kF16, true, true>(w, x, out, n_tokens, 320,
-                                                 10240, stream);
+  // The fused SiLU compiled differently for some rows despite nominally
+  // identical source expressions. Keep the established F32 store boundary.
+  SmallGemmStable(w, WeightType::kF16, x, out, n_tokens, 320, 10240, stream);
+  SiluScale(out, 0.25F, std::size_t{n_tokens} * 320, stream);
 }
 
 void SmallGemm(const void* w, WeightType type, const float* x, float* out,
@@ -7764,16 +7779,26 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    bool convolved, float eps, hipStream_t stream,
                    __half* out_half, GdnCheckpoint checkpoint,
                    std::uint32_t out_half_stride, void* out_q8_1,
-                   hipEvent_t z_ready) {
+                   hipEvent_t z_ready, bool stable_conv) {
   const std::uint32_t channels = 2 * k_heads * d + v_heads * d;
   const std::size_t count = static_cast<std::size_t>(n_tokens) * channels;
-  const bool saved_history = !convolved && kernel == kSsmConvTaps &&
+  const bool saved_history = !stable_conv && !convolved &&
+                             kernel == kSsmConvTaps &&
                              n_tokens <= kSsmConvTokensPerThread;
   if (checkpoint.history != nullptr)
     HistoryPrefix(qkv, qkv_stride, conv_state, checkpoint.history,
                   checkpoint.tokens, channels, kernel - 1, stream);
   if (!convolved) {
-    if (saved_history) {
+    if (stable_conv && kernel == kSsmConvTaps) {
+      // One specialization at every EXL3 width; history updates below use
+      // the same stream-ordered shift, including singleton calls.
+      hipLaunchKernelGGL(
+          (SsmConv4Kernel<false, false, true>),
+          dim3(Blocks(channels), (n_tokens + kSsmConvTokensPerThread - 1) /
+                                     kSsmConvTokensPerThread),
+          dim3(kThreads), 0, stream, qkv, qkv_stride, conv_w, conv_state,
+          conv_scratch, n_tokens, channels, RollbackRows{}, nullptr, 0);
+    } else if (saved_history) {
       hipLaunchKernelGGL((SsmConv4Kernel<true, false>), dim3(Blocks(channels)),
                          dim3(kThreads), 0, stream, qkv, qkv_stride, conv_w,
                          conv_state, conv_scratch, n_tokens, channels,
@@ -7852,14 +7877,16 @@ bool GatedDeltaNetBatch(const GdnBatchItem* items, std::uint32_t count,
                         std::uint32_t qkv_stride, std::uint32_t z_stride,
                         const float* conv_w, const float* a, const float* dt,
                         const float* norm_w, std::uint32_t k_heads,
-                        std::uint32_t v_heads, float eps, hipStream_t stream) {
+                        std::uint32_t v_heads, float eps, hipStream_t stream,
+                        bool stable_conv) {
   if (items == nullptr || count == 0 || count > 8 || max_tokens == 0 ||
       max_tokens > kSsmConvTokensPerThread)
     return false;
   const auto channels = (2 * k_heads + v_heads) * kGdnDim;
   constexpr auto waves = kThreads / 32;
-  hipLaunchKernelGGL((SsmConv4Kernel<true, true>),
-                     dim3(Blocks(channels), 1, count), dim3(kThreads), 0,
+  const auto conv = stable_conv ? SsmConv4Kernel<true, true, true>
+                                : SsmConv4Kernel<true, true, false>;
+  hipLaunchKernelGGL(conv, dim3(Blocks(channels), 1, count), dim3(kThreads), 0,
                      stream, nullptr, qkv_stride, conv_w, nullptr, nullptr,
                      max_tokens, channels, RollbackRows{}, items, active);
   hipLaunchKernelGGL(GdnPrepKernel<true>,
@@ -8086,7 +8113,7 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
                hipStream_t stream, std::uint32_t* lists, std::uint32_t* counts,
                std::uint32_t list_capacity, const std::uint32_t* kv_blocks,
-               const KvarnReadView* kvarn) {
+               const KvarnReadView* kvarn, std::uint32_t dense_prefix) {
   if (d != 256) {
     return;  // the kernel is written for the model's 256-wide heads
   }
@@ -8121,7 +8148,7 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
     hipLaunchKernelGGL(kernel, dim3(heads / group, n_tokens, z), dim3(kThreads),
                        0, stream, q, k_cache, v_cache, mask, mask_words, out,
                        partials, start_pos, heads, kv_heads, d, ratio, lists,
-                       counts, list_capacity, kv_blocks, view);
+                       counts, list_capacity, kv_blocks, view, dense_prefix);
   };
   if (kvarn != nullptr) {
     if (n_tokens <= 2)

@@ -487,7 +487,7 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    bool convolved, float eps, hipStream_t stream,
                    __half* out_half = nullptr, GdnCheckpoint checkpoint = {},
                    std::uint32_t out_half_stride = 0, void* out_q8_1 = nullptr,
-                   hipEvent_t z_ready = nullptr);
+                   hipEvent_t z_ready = nullptr, bool stable_conv = false);
 
 /// Private rows for one request in a decode batch. Scratch regions and all
 /// recurrent/history/rollback buffers must be disjoint between requests.
@@ -515,7 +515,8 @@ bool GatedDeltaNetBatch(const GdnBatchItem* items, std::uint32_t count,
                         std::uint32_t qkv_stride, std::uint32_t z_stride,
                         const float* conv_w, const float* a, const float* dt,
                         const float* norm_w, std::uint32_t k_heads,
-                        std::uint32_t v_heads, float eps, hipStream_t stream);
+                        std::uint32_t v_heads, float eps, hipStream_t stream,
+                        bool stable_conv = false);
 
 /// Splits the interleaved [q|gate] projection (rows `qg_stride` apart) into
 /// q [t][heads][d] and gate [t][heads*d]. With non-null `k`, the row
@@ -615,6 +616,8 @@ void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
 /// mask at ratio 4, each row's selected blocks are first compacted once into
 /// `lists`; `list_capacity` is the selection budget (blocks per row). The
 /// output is bitwise identical to the mask walk. Null lists use the mask walk.
+/// Nonzero dense_prefix forces queries at earlier absolute positions through
+/// the dense sweep even if this chunk also contains sparse queries (EXL3).
 void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                const std::uint32_t* mask, std::uint32_t mask_words, float* out,
                float* partials, std::uint32_t splits, std::uint32_t n_tokens,
@@ -623,7 +626,8 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                hipStream_t stream, std::uint32_t* lists = nullptr,
                std::uint32_t* counts = nullptr, std::uint32_t list_capacity = 0,
                const std::uint32_t* kv_blocks = nullptr,
-               const KvarnReadView* kvarn = nullptr);
+               const KvarnReadView* kvarn = nullptr,
+               std::uint32_t dense_prefix = 0);
 
 /// Maximum visible sparse context for this WMMA geometry, or zero when the
 /// geometry is unsupported. Checkpoint planning uses the same dispatch limit.

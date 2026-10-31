@@ -2166,6 +2166,12 @@ bool Executor::Exl3Group(std::initializer_list<const DeviceTensor*> weights,
 bool Executor::MtpKvProjection(const DeviceLayer& l, const float* x,
                                std::uint32_t rows,
                                std::string* error_msg) const {
+  if (l.attn_qkv.empty() && model_->output().exl3 != nullptr) {
+    // TODO(W3): omit Q with the full-QKV W/TN geometry override. Selecting
+    // geometry from K/V alone changes their K reduction and persistent KV.
+    return Exl3Group({&l.attn_q, &l.attn_k, &l.attn_v}, {s_.qg, s_.k, s_.v}, x,
+                     rows, error_msg);
+  }
   if (l.attn_qkv.empty())
     return Exl3Group({&l.attn_k, &l.attn_v}, {s_.k, s_.v}, x, rows, error_msg);
   auto kv = l.attn_qkv;
@@ -2572,7 +2578,8 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
     return;
   }
   HcCombine(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn, n_tokens,
-            c.hidden_size, c.hc_count, c.rms_eps, stream_);
+            c.hidden_size, c.hc_count, c.rms_eps, stream_,
+            model_->output().exl3 != nullptr);
 }
 
 bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
@@ -2999,7 +3006,8 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                      c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim,
                      c.ssm_conv_kernel, MatrixRows(n_tokens) && !speculative,
                      convolved, c.rms_eps, stream_, out_half, checkpoint,
-                     half_stride, out_q8_1 ? s_.gdn_q8_1 : nullptr, z_ready)) {
+                     half_stride, out_q8_1 ? s_.gdn_q8_1 : nullptr, z_ready,
+                     model_->output().exl3 != nullptr)) {
     AssignError(error_msg, "DeltaNet launch failed");
     return false;
   }
@@ -3284,7 +3292,8 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                   c.compress_ratio, stream_, split ? s_.attn_lists : nullptr,
                   split ? s_.attn_counts : nullptr,
                   c.compress_ratio > 0 ? c.indexer_top_k / c.compress_ratio : 0,
-                  s.kv_blocks);
+                  s.kv_blocks, nullptr,
+                  model_->output().exl3 != nullptr ? c.indexer_top_k : 0);
   const std::uint32_t q_dim = c.AttentionQDim();
   const std::size_t ctx_count = static_cast<std::size_t>(n_tokens) * q_dim;
   // A decode batch's output projection reads the gate's Q8_1 rows.
@@ -3358,7 +3367,8 @@ bool Executor::KvarnAttention(const DeviceLayer& l,
         c.num_heads, c.num_kv_heads, c.head_dim, c.compress_ratio, stream_,
         split ? s_.attn_lists : nullptr, split ? s_.attn_counts : nullptr,
         c.compress_ratio > 0 ? c.indexer_top_k / c.compress_ratio : 0,
-        s.kv_blocks, &view);
+        s.kv_blocks, &view,
+        model_->output().exl3 != nullptr ? c.indexer_top_k : 0);
   }
   RotateHeadRows(s_.ctx, n_tokens * c.num_heads, stream_);
   if (pass.prefill) {

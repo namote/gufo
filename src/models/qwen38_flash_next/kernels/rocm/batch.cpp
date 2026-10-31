@@ -1107,7 +1107,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
                 l.ssm_in.empty() ? c.SsmValueDim() : l.ssm_in.rows,
                 l.ssm_conv1d.f32(), l.ssm_a.f32(), l.ssm_dt.f32(),
                 l.ssm_norm.f32(), c.ssm_num_k_heads, c.ssm_num_v_heads,
-                c.rms_eps, stream_))
+                c.rms_eps, stream_, model_->output().exl3 != nullptr))
           return Fail(error, "batched GatedDeltaNet launch failed");
       }
       UseScratch(base);

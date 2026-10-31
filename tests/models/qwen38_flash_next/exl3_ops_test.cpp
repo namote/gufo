@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 #include "src/core/hip/detail/exl3_gemv.hpp"
@@ -100,6 +101,22 @@ struct ExecutorTestAccess {
   static std::vector<float> PrefillResiduals(const Executor& exec,
                                              unsigned rows) {
     return Read<float>(exec.s_.res, std::size_t{rows} * exec.config().HcDim());
+  }
+  static bool PrefillLinearOnly(Executor& exec, Session& session,
+                                std::span<const std::int32_t> tokens,
+                                std::string* error) {
+    // CreateSession saw the valid two-layer geometry and allocated its KV
+    // plane. Stop this test's public prefill after layer0 to observe GDN
+    // before attention; all production dispatch/phase handling stays active.
+    auto& model = const_cast<DeviceModel&>(*exec.model_);
+    struct Restore {
+      std::uint32_t& layers;
+      std::uint32_t value;
+      ~Restore() { layers = value; }
+    } restore{model.config_.num_layers, model.config_.num_layers};
+    model.config_.num_layers = 1;
+    return exec.Forward(session, tokens, 0, nullptr,
+                        Executor::ForwardMode::kPrefill, error);
   }
   static auto GdnState(const Session& session, const Config& c) {
     const auto& state = session.linear_[0];
@@ -998,12 +1015,50 @@ struct MtpExecutorFixture {
 };
 
 template<class T>
+bool CompareBits(const std::vector<T>& a, const std::vector<T>& b,
+                 const std::string& name, std::size_t columns = 0) {
+  if (a.size() != b.size()) {
+    std::cerr << "FAIL " << name << " sizes=" << a.size() << '/' << b.size()
+              << '\n';
+    return false;
+  }
+  using Bits = std::conditional_t<sizeof(T) == 4, std::uint32_t, std::uint16_t>;
+  static_assert(sizeof(T) == sizeof(Bits));
+  constexpr std::uint64_t sign = std::uint64_t{1} << (sizeof(T) * 8 - 1);
+  const auto ordered = [&](Bits v) {
+    return (v & sign) ? ((2 * sign - 1) ^ v) : (std::uint64_t{v} | sign);
+  };
+  const auto value = [](T v) {
+    if constexpr (std::is_same_v<T, float>)
+      return double(v);
+    else if constexpr (sizeof(T) == 2)
+      return ex::HalfToDouble(std::bit_cast<std::uint16_t>(v));
+    else
+      return double(v);
+  };
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    const auto av = std::bit_cast<Bits>(a[i]), bv = std::bit_cast<Bits>(b[i]);
+    if (av == bv)
+      continue;
+    const auto ao = ordered(av), bo = ordered(bv);
+    std::cerr << "FAIL " << name << " first index=" << i;
+    if (columns != 0)
+      std::cerr << " row=" << i / columns << " col=" << i % columns;
+    std::cerr << " expected=" << std::setprecision(10) << value(a[i])
+              << " actual=" << value(b[i]) << " bits=0x" << std::hex << av
+              << "/0x" << bv << std::dec
+              << " ulps=" << (ao > bo ? ao - bo : bo - ao) << '\n';
+    return false;
+  }
+  std::cout << "PASS " << name << " matches bitwise\n";
+  return true;
+}
+
+template<class T>
 void SameBits(const std::vector<T>& a, const std::vector<T>& b,
-              const std::string& name) {
-  Require(a.size() == b.size() &&
-              (a.empty() ||
-               std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0),
-          name + " differs bitwise");
+              const std::string& name, std::size_t columns = 0) {
+  if (!CompareBits(a, b, name, columns))
+    throw std::runtime_error(current_case + " : " + name + " differs bitwise");
 }
 
 void MtpExecutorCatchUp(bool batched) {
@@ -1022,13 +1077,23 @@ void MtpExecutorCatchUp(bool batched) {
   const auto state_equal = [&](unsigned i, const std::string& stage) {
     const auto a = Access::ReadState(*reference[i], f.config);
     const auto b = Access::ReadState(*cached[i], f.config);
-    Require(a.position == b.position && a.blocks == b.blocks,
-            stage + " position/block shadows differ");
-    SameBits(a.k, b.k, stage + " K cache");
-    SameBits(a.v, b.v, stage + " V cache");
-    SameBits(a.raw, b.raw,
-             stage + " raw indexer ring including untouched rows");
-    SameBits(a.pooled, b.pooled, stage + " pooled indexer keys");
+    bool equal = a.position == b.position && a.blocks == b.blocks;
+    std::cout << (equal ? "PASS " : "FAIL ") << stage
+              << " position/block shadows\n";
+    equal =
+        CompareBits(a.k, b.k, stage + " K cache", f.config.AttentionKvDim()) &&
+        equal;
+    equal =
+        CompareBits(a.v, b.v, stage + " V cache", f.config.AttentionKvDim()) &&
+        equal;
+    equal = CompareBits(a.raw, b.raw,
+                        stage + " raw indexer ring including untouched rows",
+                        f.config.indexer_head_dim) &&
+            equal;
+    equal = CompareBits(a.pooled, b.pooled, stage + " pooled indexer keys",
+                        f.config.indexer_head_dim) &&
+            equal;
+    return equal;
   };
   std::vector<gpu::Executor::MtpBatchItem> items;
   unsigned expected_rows = 0;
@@ -1068,8 +1133,10 @@ void MtpExecutorCatchUp(bool batched) {
           "EXL3 cache-only dispatch did not execute every requested row");
   Require(diagnostic.expert_tile_reads == 0,
           "cache-only catch-up unexpectedly executed experts");
+  bool equal = true;
   for (unsigned i = 0; i < sessions; ++i) {
-    state_equal(i, "ragged catch-up session=" + std::to_string(i));
+    equal =
+        state_equal(i, "ragged catch-up session=" + std::to_string(i)) && equal;
     Require(!Access::ReadState(*cached[i], f.config).residual_valid,
             "cache-only catch-up exposed a carried residual");
   }
@@ -1092,7 +1159,8 @@ void MtpExecutorCatchUp(bool batched) {
     Require(exec.MtpForward(*reference[0], more, 2, {}, &error), error);
     Require(exec.MtpForward(*cached[0], more, 2, {.kv_only = true}, &error),
             error);
-    state_equal(0, "graph catch-up pass=" + std::to_string(pass));
+    equal =
+        state_equal(0, "graph catch-up pass=" + std::to_string(pass)) && equal;
     if (pass == 1) {
       captured_graphs = Access::Graphs(*cached[0]);
       Require(captured_graphs != 0, "cache-only graph was not captured");
@@ -1113,20 +1181,25 @@ void MtpExecutorCatchUp(bool batched) {
                 "sparse selector must replace poison with exactly the nonempty "
                 "causal budget");
     }
-    state_equal(i, "known-hidden continuation");
+    equal = state_equal(i, "known-hidden continuation") && equal;
     const auto a = Access::FullLogits(exec, *reference[i]);
     const auto b = Access::FullLogits(exec, *cached[i]);
     Require(std::ranges::all_of(a, [](float v) { return std::isfinite(v); }),
             "continuation logits are nonfinite");
-    SameBits(a, b, "subsequent full-vocabulary logits");
+    equal = CompareBits(a, b, "subsequent full-vocabulary logits",
+                        f.config.vocab_size) &&
+            equal;
     for (auto* session : {reference[i].get(), cached[i].get()})
       Require(exec.MtpForward(*session, std::span(&next, 1), -1, {}, &error),
               error);
-    state_equal(i, "recursive continuation");
-    SameBits(Access::FullLogits(exec, *reference[i]),
-             Access::FullLogits(exec, *cached[i]),
-             "recursive full-vocabulary logits");
+    equal = state_equal(i, "recursive continuation") && equal;
+    equal =
+        CompareBits(Access::FullLogits(exec, *reference[i]),
+                    Access::FullLogits(exec, *cached[i]),
+                    "recursive full-vocabulary logits", f.config.vocab_size) &&
+        equal;
   }
+  Require(equal, "all MTP states and continuation logits match bitwise");
 }
 
 void DensePrefillProjection() {
@@ -1600,13 +1673,20 @@ void ExecutorPrefillExperts() {
     return std::pair{logits, hidden};
   };
   const auto bulk = prefill(rows);
+  bool equal = true;
   for (unsigned chunk : {1U, 3U, 8U, 9U, 32U, 33U, 64U}) {
     const auto split = prefill(chunk);
-    SameBits(bulk.first, split.first,
-             "executor prefill chunks=" + std::to_string(chunk));
-    SameBits(bulk.second, split.second,
-             "every prefill residual row chunks=" + std::to_string(chunk));
+    equal = CompareBits(bulk.first, split.first,
+                        "executor prefill chunks=" + std::to_string(chunk),
+                        c.vocab_size) &&
+            equal;
+    equal = CompareBits(
+                bulk.second, split.second,
+                "every prefill residual row chunks=" + std::to_string(chunk),
+                c.HcDim()) &&
+            equal;
   }
+  Require(equal, "all prefill residuals and logits match bitwise");
 
   // Exercise the allocated scaled-down path through a real decode forward,
   // including the executor's 64+1 partition and expert_ff > 2 * hidden.
@@ -1688,8 +1768,10 @@ void ExecutorPrefillExperts() {
   }
 }
 
-void ExecutorGdnPrefill() {
-  BeginCase("executor linear GDN dense X3 wiring and 1/64/65 chunk bits");
+bool ExecutorGdnPrefillCase(bool linear_only) {
+  BeginCase(linear_only
+                ? "isolated GDN output and state before attention"
+                : "executor linear GDN dense X3 wiring and 1/64/65 chunk bits");
   constexpr unsigned rows = 65;
   // A genuine linear layer followed by attention keeps the resident model
   // geometry valid and observes the GDN output through its downstream consumer.
@@ -1698,8 +1780,8 @@ void ExecutorGdnPrefill() {
   const auto& c = f.config;
   using Access = gpu::ExecutorTestAccess;
   Require(c.IsLinearLayer(0) && f.model->layers()[0].linear &&
-              !f.model->layers()[1].linear,
-          "GDN fixture must execute a linear layer before attention");
+              (linear_only || !f.model->layers()[1].linear),
+          "GDN fixture must execute its real linear layer");
   std::vector<std::int32_t> tokens(rows);
   for (unsigned r = 0; r < rows; ++r)
     tokens[r] = 1 + (r * 17) % (c.vocab_size - 1);
@@ -1723,13 +1805,17 @@ void ExecutorGdnPrefill() {
       // GDN: QKV/Z grouped rotation (two unequal-N GEMMs), output,
       // shared gate/up and shared down = 6 projection rows, 4 rotations,
       // 5 GEMMs. Add the existing attention layer's exact totals.
-      dense_rows += (std::uint64_t{14} + sparse) * count;
-      rotations += 9 + sparse;
-      gemms += 11 + sparse;
-      Require(
-          exec.Forward(*session, std::span(tokens).subspan(first, count), 0,
-                       nullptr, gpu::Executor::ForwardMode::kPrefill, &error),
-          error);
+      dense_rows += (linear_only ? 6 : std::uint64_t{14} + sparse) * count;
+      rotations += linear_only ? 4 : 9 + sparse;
+      gemms += linear_only ? 5 : 11 + sparse;
+      Require(linear_only
+                  ? Access::PrefillLinearOnly(
+                        exec, *session, std::span(tokens).subspan(first, count),
+                        &error)
+                  : exec.Forward(
+                        *session, std::span(tokens).subspan(first, count), 0,
+                        nullptr, gpu::Executor::ForwardMode::kPrefill, &error),
+              error);
       // Disable final-query pruning (n_logits=0); all65 rows fit below the
       // final FFN skip. Preserve every row before scratch is reused.
       const auto hidden = Access::PrefillResiduals(exec, count);
@@ -1743,7 +1829,7 @@ void ExecutorGdnPrefill() {
                 d.prefill_dense_rotation_groups == rotations &&
                 d.prefill_dense_gemm_groups == gemms,
             "GDN QKV/Z grouping or output X3 dispatch was reverted");
-    Require(d.prefill_expert_rows == rows * c.num_layers &&
+    Require(d.prefill_expert_rows == rows * (linear_only ? 1 : c.num_layers) &&
                 d.prefill_plain_rows != 0 && d.scaled_down_rows == 0,
             "GDN fixture must retain the prefill phase through both layers");
     Require((chunk <= 8 || d.prefill_plain_tiled_rows != 0) &&
@@ -1764,13 +1850,32 @@ void ExecutorGdnPrefill() {
     return result;
   };
   const auto bulk = run(rows);
+  bool equal = true;
   for (unsigned chunk : {1U, 64U, 65U}) {
     const auto split = run(chunk);
-    SameBits(bulk.hidden, split.hidden, "GDN every residual row");
-    SameBits(bulk.logits, split.logits, "GDN downstream full logits");
-    SameBits(bulk.conv, split.conv, "GDN convolution history");
-    SameBits(bulk.recurrent, split.recurrent, "GDN recurrent state");
+    const auto suffix = " chunks=" + std::to_string(chunk);
+    equal = CompareBits(bulk.hidden, split.hidden,
+                        "GDN every residual row" + suffix, c.HcDim()) &&
+            equal;
+    equal = CompareBits(bulk.logits, split.logits,
+                        "GDN downstream full logits" + suffix, c.vocab_size) &&
+            equal;
+    equal =
+        CompareBits(bulk.conv, split.conv, "GDN convolution history" + suffix,
+                    c.SsmConvChannels()) &&
+        equal;
+    equal = CompareBits(bulk.recurrent, split.recurrent,
+                        "GDN recurrent state" + suffix, c.ssm_head_dim) &&
+            equal;
   }
+  return equal;
+}
+
+void ExecutorGdnPrefill() {
+  bool equal = ExecutorGdnPrefillCase(true);
+  equal = ExecutorGdnPrefillCase(false) && equal;
+  Require(equal,
+          "all isolated/downstream GDN outputs and states match bitwise");
 }
 
 void MtpKvGroup() {
@@ -1785,6 +1890,7 @@ void MtpKvGroup() {
   const fast::Exl3FastWorkspace ws{
       p.fast_input,         p.fast_input_elements, p.fast_counters,
       p.fast_counter_count, p.fast_down_input,     p.fast_down_input_elements};
+  bool equal = true;
   for (const unsigned rows : {1U, 2U, 3U, 7U, 8U, 9U, 32U, 33U, 64U}) {
     BeginCase("MTP K7 QKV vs KV group rows=" + std::to_string(rows));
     const auto input = Input(rows * k);
@@ -1815,9 +1921,11 @@ void MtpKvGroup() {
                       hipMemcpyDeviceToHost));
       Check(hipMemcpy(actual.data(), b, actual.size() * sizeof(float),
                       hipMemcpyDeviceToHost));
-      Require(std::memcmp(expected.data(), actual.data(),
-                          actual.size() * sizeof(float)) == 0,
-              "removing Q preserves every K/V projection bit");
+      equal = CompareBits(expected, actual,
+                          std::string(bank == &key ? "K" : "V") +
+                              " removing Q, rows=" + std::to_string(rows),
+                          kv_width) &&
+              equal;
       for (const unsigned row : {0U, rows - 1})
         Near(std::span(actual).subspan(row * kv_width, kv_width),
              bank->Reference(0, input.data() + row * k, true), 1e-5,
@@ -1828,6 +1936,7 @@ void MtpKvGroup() {
       Require(guard == 0x7F7F7F7FU, "K/V group preserves output guard");
     }
   }
+  Require(equal, "all K/V group projections preserve full-QKV bits");
 }
 
 }  // namespace
