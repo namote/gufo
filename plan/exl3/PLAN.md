@@ -127,6 +127,7 @@ GPU 창, 빌드, 디스크 규칙은 [W-COMMON.md](../rotated-quant/W-COMMON.md)
 3. **R3 imatrix와 E 실험을 멈춘다.**
 4. **X0·X1(형식과 리더), XQ(양자화), F1(Flash-Next 페이지 KV + KVarN)을 동시에 시작한다.** X2·X3은 X1 뒤에 시작한다. 담당은 X-A = W8(이어서), XQ = 새 에이전트, F1 = 새 에이전트다.
 5. **오래 걸리는 양자화는 하지 않고, 이미 만들어진 공개 팩을 받는다 (사용자 2026-10-31, 27B와 Flash-Next 모두).** 27B c02 5.00 팩은 이미 끝났으므로 목표 팩으로 쓴다(품질 판정: [XQ-RESULTS.md](XQ-RESULTS.md) `eeaad672`). 다른 bpw나 변형이 필요하면 turboderp 등 공개 팩을 먼저 찾아 받는다. 직접 양자화는 공개 팩이 없을 때만 감독이 사용자에게 묻는다.
+6. **단계별 GPU 시험을 하지 않는다 (사용자 2026-10-31).** X3(27B prefill)과 F2(Flash-Next EXL3: Codex 작업자 `fn-exl3-impl`, 작업 트리 `../gufo-fn-exl3`, 브랜치 `ai-tools/fn-exl3`), F1 K2를 모두 구현한 뒤 마지막에 묶음 창(정확성·품질 창, 그다음 ABBA timing 창)으로 한 번에 비교한다. Flash-Next 팩은 5.05를 그대로 쓴다. 토큰당 가중치는 6.03 GB로 UD-Q4_K_XL의 6.19 GB와 비슷하므로(Codex 헤더 계산), 속도 이득은 커널과 MTP에서 내야 한다.
 
 ## (처음) 사용자 결정이 필요했던 것
 
