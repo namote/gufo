@@ -18,6 +18,7 @@ function(add_qwen38_flash_next_test name library labels)
 endfunction()
 
 add_qwen38_flash_next_test(exl3_reference gufo_qwen38_flash_next_reference "cpu;exl3")
+add_qwen38_flash_next_test(exl3_ple_digest gufo_qwen38_flash_next "cpu;exl3")
 
 add_qwen38_flash_next_test(config gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(continuation_layout gufo_qwen38_flash_next "cpu")
@@ -48,6 +49,12 @@ if (ENGINE_ENABLE_HIP)
   # Match production device arithmetic while keeping CPU oracles strict.
   set_source_files_properties(exl3_moe_kernel_test.cpp PROPERTIES
     COMPILE_OPTIONS "-O3;-Xarch_device;-ffast-math;-fno-finite-math-only")
+  add_test(NAME qwen38_flash_next.exl3_shared_invariance
+    COMMAND qwen38_flash_next_exl3_ops_test --shared-invariance-only)
+  set_tests_properties(qwen38_flash_next.exl3_shared_invariance PROPERTIES
+    LABELS "qwen38_flash_next;hip;gpu;gfx1151;exl3")
+  add_qwen38_flash_next_test(exl3_invariance gufo_qwen38_flash_next "hip;gpu;gfx1151;exl3")
+  set_source_files_properties(exl3_invariance_test.cpp PROPERTIES LANGUAGE HIP)
   foreach(name IN ITEMS mtp_ops blaslt_ops hc_mix_ops gdn_ops
       attention_ops moe_epilogue_ops moe_ids_ops projection_ops routed_wmma_ops
       select_ops snapshot_copy verification_sampling kvarn_ops)

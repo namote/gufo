@@ -35,6 +35,9 @@ struct Exl3Storage {
   std::deque<std::string> names;
 };
 
+/// Identity of retained GGUF shard filenames, sizes and aligned headers.
+[[nodiscard]] std::string Exl3PleHeadersDigest(const core::GgufReader& reader);
+
 /// Header/metadata validation only; projection payloads remain demand mapped.
 [[nodiscard]] std::optional<ModelWeights> LoadExl3Model(
     const std::filesystem::path& path, const core::GgufReader& sidecar,

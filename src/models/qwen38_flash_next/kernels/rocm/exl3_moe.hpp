@@ -33,6 +33,7 @@ struct Exl3Scratch {
   float* head_values{nullptr};
 };
 
+/// Compressed projections, or the pack's plain operands with fixed FP32 math.
 void Exl3Projection(const DeviceTensor& weight, const float* x, float* out,
                     std::uint32_t rows, const Exl3Scratch& scratch,
                     hipStream_t stream, bool fast = true);
@@ -52,6 +53,12 @@ struct Exl3RoutedTrace {
   float* down_packed_inner{nullptr};      ///< Same input, original packed dot.
   float* down_widened_inner{nullptr};     ///< Same input, widened-FMA control.
 };
+
+/// Shared expert's decode/verify contract, common to serial and cohort calls.
+/// Returns false without launches when the fused fast MLP cannot apply.
+bool Exl3SharedMlp(const DeviceLayer& layer, const float* x, float* gate,
+                   float* up, float* out, std::uint32_t rows,
+                   const Exl3Scratch& scratch, hipStream_t stream);
 
 /// Groups actual assignments by expert into 1..8-row tiles on device. Every
 /// slot keeps its own rotation and output; the caller performs ordered MoE sum.
@@ -127,6 +134,25 @@ struct Exl3PrefillScratch {
   std::uint32_t max_assignments{0}, max_buckets{0};
 };
 
+/// Optional qualification snapshots in packed bucket order. Counters report
+/// actual launched fallback blocks and unsafe rows processed, respectively.
+struct Exl3PrefillTrace {
+  std::uint16_t* gate_up_input{nullptr};
+  float* gate_inner{nullptr};
+  float* up_inner{nullptr};
+  float* activation{nullptr};
+  std::uint16_t* down_input{nullptr};
+  std::uint32_t* fallback_counts{nullptr};  ///< [2], reset on each invocation
+};
+
+/// Consume scratch.input as already-rounded, packed FP16 down rows. This is
+/// also the down stage of Exl3PrefillExperts, including scaling, widened
+/// fallback and restoration. scratch.out receives packed restored output.
+void Exl3PrefillDown(const DeviceTensor& down, std::uint32_t assignments,
+                     std::uint32_t tile_rows, const Exl3PrefillScratch& scratch,
+                     Exl3BucketGemm gemm, hipStream_t stream,
+                     const Exl3PrefillTrace* trace = nullptr);
+
 /// Complete bucketed prefill dispatch, ready for the shared X3 adapter.
 /// Valid, distinct expert IDs per token are required. The caller retains
 /// scratch until all launches finish and performs the ordered MoE sum.
@@ -135,7 +161,8 @@ void Exl3PrefillExperts(const DeviceLayer& layer, const float* x,
                         const std::int32_t* ids, float* out, std::uint32_t rows,
                         std::uint32_t used, std::uint32_t tile_rows,
                         const Exl3PrefillScratch& scratch, Exl3BucketGemm gemm,
-                        hipStream_t stream);
+                        hipStream_t stream,
+                        const Exl3PrefillTrace* trace = nullptr);
 
 /// Prefix plus unique complete 128-column segments for the dynamic IDs.
 /// Original trellis N stride is retained, and only final logits are gathered.

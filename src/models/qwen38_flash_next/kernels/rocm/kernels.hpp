@@ -386,6 +386,11 @@ void SmallGemm(const void* w, WeightType type, const float* x, float* out,
                std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
                hipStream_t stream);
 
+/// EXL3 plain operands: pinned widened FP32 FMAs, also during prefill.
+void SmallGemmStable(const void* w, WeightType type, const float* x, float* out,
+                     std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
+                     hipStream_t stream);
+
 /// PLE gate: for every stream s, sc = dot(key_n[t][s], query_n[t][s]) /
 /// sqrt(hidden); gated[t][s][i] = value[t][i] * sigmoid(sgn(sc) *
 /// sqrt(max(|sc|, 1e-6))).

@@ -4,6 +4,7 @@
 #include "src/core/hip/detail/exl3_gemv.hpp"
 #include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
@@ -436,41 +437,51 @@ __global__ void RestoreActivateRotateBuckets(
 
 // WMMA returns raw inner dots. Rows with no safe normal FP16 scaling are
 // overwritten by the same widened FMA/reduction order as routed decode.
+// A bounded block grid checks each row before assigning its output tiles to
+// the block's eight waves. The all-safe case launches <= 256 blocks, rather
+// than one block for every (assignment, output tile) pair.
 __global__ void BucketDownFallback(const ex::DeviceLinear* bank,
                                    const unsigned* offsets, unsigned experts,
                                    const std::int32_t* exponents,
                                    const std::uint16_t* input, float* output,
-                                   unsigned k, unsigned n) {
-  const unsigned row = blockIdx.y;
-  if (row >= offsets[experts] || exponents[row] >= 0)
-    return;
-  const unsigned lo = BucketExpert(offsets, experts, row);
-  const auto& l = bank[lo];
-  const unsigned lane = threadIdx.x, r0 = (lane % 4) * 2;
-  const unsigned nt = blockIdx.x;
-  const auto* x =
-      reinterpret_cast<const _Float16*>(input) + std::size_t{row} * k;
-  const auto* trellis = reinterpret_cast<const std::uint32_t*>(l.trellis);
+                                   unsigned k, unsigned n, unsigned assignments,
+                                   unsigned* counts) {
+  if (counts != nullptr && threadIdx.x == 0)
+    atomicAdd(counts, 1U);
+  const unsigned lane = threadIdx.x % 32, r0 = (lane % 4) * 2;
   const auto lw = arithmetic::MakeLaneWindow<5>(lane);
-  float a = 0, b = 0;
-  for (unsigned kt = 0; kt < k / 16; ++kt) {
-    Half2 w[4];
-    arithmetic::DecodeLaneMul1<5>(
-        trellis + (std::size_t{kt} * (n / 16) + nt) * 40, lw, w);
-    const auto* group = x + kt * 16 + r0;
-    const Half2 v01{group[0], group[1]}, v89{group[8], group[9]};
-    a = DotPairF32(w[0], v01, a);
-    a = DotPairF32(w[1], v89, a);
-    b = DotPairF32(w[2], v01, b);
-    b = DotPairF32(w[3], v89, b);
-  }
-  a += __shfl_xor(a, 1, 32);
-  b += __shfl_xor(b, 1, 32);
-  a += __shfl_xor(a, 2, 32);
-  b += __shfl_xor(b, 2, 32);
-  if (lane % 4 == 0) {
-    output[std::size_t{row} * n + nt * 16 + lane / 4] = a;
-    output[std::size_t{row} * n + nt * 16 + lane / 4 + 8] = b;
+  for (unsigned row = blockIdx.x; row < assignments; row += gridDim.x) {
+    if (row >= offsets[experts] || exponents[row] >= 0)
+      continue;
+    if (counts != nullptr && threadIdx.x == 0)
+      atomicAdd(counts + 1, 1U);
+    const unsigned expert = BucketExpert(offsets, experts, row);
+    const auto& l = bank[expert];
+    const auto* x =
+        reinterpret_cast<const _Float16*>(input) + std::size_t{row} * k;
+    const auto* trellis = reinterpret_cast<const std::uint32_t*>(l.trellis);
+    for (unsigned nt = threadIdx.x / 32; nt < n / 16; nt += blockDim.x / 32) {
+      float a = 0, b = 0;
+      for (unsigned kt = 0; kt < k / 16; ++kt) {
+        Half2 w[4];
+        arithmetic::DecodeLaneMul1<5>(
+            trellis + (std::size_t{kt} * (n / 16) + nt) * 40, lw, w);
+        const auto* group = x + kt * 16 + r0;
+        const Half2 v01{group[0], group[1]}, v89{group[8], group[9]};
+        a = DotPairF32(w[0], v01, a);
+        a = DotPairF32(w[1], v89, a);
+        b = DotPairF32(w[2], v01, b);
+        b = DotPairF32(w[3], v89, b);
+      }
+      a += __shfl_xor(a, 1, 32);
+      b += __shfl_xor(b, 1, 32);
+      a += __shfl_xor(a, 2, 32);
+      b += __shfl_xor(b, 2, 32);
+      if (lane % 4 == 0) {
+        output[std::size_t{row} * n + nt * 16 + lane / 4] = a;
+        output[std::size_t{row} * n + nt * 16 + lane / 4 + 8] = b;
+      }
+    }
   }
 }
 
@@ -633,6 +644,25 @@ __global__ void GatherHead(const float* values, float* logits, unsigned prefix,
 void Exl3Projection(const DeviceTensor& w, const float* x, float* out,
                     std::uint32_t rows, const Exl3Scratch& scratch,
                     hipStream_t stream, bool fast) {
+  if (w.exl3 == nullptr) {
+    WeightType type;
+    switch (w.type) {
+      case core::GgmlType::kF32:
+        type = WeightType::kF32;
+        break;
+      case core::GgmlType::kF16:
+        type = WeightType::kF16;
+        break;
+      case core::GgmlType::kBF16:
+        type = WeightType::kBF16;
+        break;
+      default:
+        throw std::invalid_argument("unsupported EXL3 plain operand");
+    }
+    SmallGemmStable(w.data, type, x, out, rows, w.rows, w.cols, stream);
+    Check();
+    return;
+  }
   const auto& l = *w.exl3;
   const bool slice = w.output_begin != 0 || w.rows != l.n;
   if (slice && (scratch.slice == nullptr ||
@@ -644,11 +674,19 @@ void Exl3Projection(const DeviceTensor& w, const float* x, float* out,
       s.fast_input,         s.fast_input_elements, s.fast_counters,
       s.fast_counter_count, s.fast_down_input,     s.fast_down_input_elements};
   const gufo::hip::Exl3FastTarget t{&l, target, l.n};
-  if (fast && rows <= gufo::hip::kExl3FastMaxRows &&
-      gufo::hip::Exl3FastGroupSupported({&t, 1}, ws))
-    gufo::hip::LaunchExl3FastProjections({&t, 1}, x, l.k, rows, ws, stream);
-  else
+  if (fast && gufo::hip::Exl3FastGroupSupported({&t, 1}, ws)) {
+    for (std::uint32_t first = 0; first < rows;
+         first += gufo::hip::kExl3FastMaxRows) {
+      const auto count =
+          std::min<std::uint32_t>(gufo::hip::kExl3FastMaxRows, rows - first);
+      const gufo::hip::Exl3FastTarget pass{
+          &l, target + std::size_t{first} * l.n, l.n};
+      gufo::hip::LaunchExl3FastProjections(
+          {&pass, 1}, x + std::size_t{first} * l.k, l.k, count, ws, stream);
+    }
+  } else {
     ex::LaunchReferenceProjection(l, x, l.k, rows, target, l.n, s, stream);
+  }
   if (slice)
     hipLaunchKernelGGL(
         CopyColumns, dim3((std::size_t{rows} * w.rows + 255) / 256), dim3(256),
@@ -777,11 +815,58 @@ void Exl3ScatterExpertBuckets(const float* packed, const std::int32_t* slots,
     Exl3Scatter(packed, slots, out, assignments, width, stream);
 }
 
+namespace {
+void PrefillSnapshot(void* destination, const void* source, std::size_t bytes,
+                     hipStream_t stream) {
+  if (destination != nullptr &&
+      hipMemcpyAsync(destination, source, bytes, hipMemcpyDeviceToDevice,
+                     stream) != hipSuccess)
+    throw std::runtime_error("EXL3 prefill trace copy failed");
+}
+}  // namespace
+
+void Exl3PrefillDown(const DeviceTensor& down, std::uint32_t assignments,
+                     std::uint32_t tile_rows, const Exl3PrefillScratch& scratch,
+                     Exl3BucketGemm gemm, hipStream_t stream,
+                     const Exl3PrefillTrace* trace) {
+  if (assignments == 0)
+    return;
+  if (assignments > scratch.max_assignments || gemm == nullptr ||
+      scratch.input == nullptr || scratch.out == nullptr ||
+      scratch.down_exponents == nullptr || scratch.offsets == nullptr ||
+      scratch.buckets == nullptr || scratch.bucket_count == nullptr ||
+      (tile_rows != 16 && tile_rows != 32 && tile_rows != 64))
+    throw std::invalid_argument(
+        "EXL3 prefill down needs bucket scratch and adapter");
+  if (trace != nullptr)
+    PrefillSnapshot(
+        trace->down_input, scratch.input,
+        std::size_t{assignments} * down.cols * sizeof(std::uint16_t), stream);
+  hipLaunchKernelGGL(ScaleDownRows, dim3(assignments), dim3(256), 0, stream,
+                     scratch.input, scratch.down_exponents, down.cols);
+  gemm(down.device_exl3, scratch.buckets, scratch.bucket_count,
+       scratch.max_buckets, tile_rows, scratch.input, scratch.out, down.cols,
+       down.rows, stream);
+  auto* counts = trace == nullptr ? nullptr : trace->fallback_counts;
+  if (counts != nullptr &&
+      hipMemsetAsync(counts, 0, 2 * sizeof(unsigned), stream) != hipSuccess)
+    throw std::runtime_error("EXL3 fallback trace reset failed");
+  hipLaunchKernelGGL(BucketDownFallback, dim3(std::min(assignments, 256U)),
+                     dim3(256), 0, stream, down.device_exl3, scratch.offsets,
+                     down.experts, scratch.down_exponents, scratch.input,
+                     scratch.out, down.cols, down.rows, assignments, counts);
+  hipLaunchKernelGGL(RestoreDownBuckets, dim3(down.rows / 128, assignments),
+                     dim3(32), 0, stream, down.device_exl3, scratch.offsets,
+                     down.experts, scratch.down_exponents, scratch.out,
+                     down.rows);
+  Check();
+}
+
 void Exl3PrefillExperts(const DeviceLayer& layer, const float* x,
                         const std::int32_t* ids, float* out, std::uint32_t rows,
                         std::uint32_t used, std::uint32_t tile_rows,
                         const Exl3PrefillScratch& scratch, Exl3BucketGemm gemm,
-                        hipStream_t stream) {
+                        hipStream_t stream, const Exl3PrefillTrace* trace) {
   const std::uint64_t assignments = std::uint64_t{rows} * used;
   if (assignments == 0)
     return;
@@ -807,28 +892,63 @@ void Exl3PrefillExperts(const DeviceLayer& layer, const float* x,
   Exl3RotateExpertBuckets(g.device_exl3, x, scratch.input, scratch.offsets,
                           scratch.slots, g.experts, assignments, g.cols, used,
                           false, stream);
+  if (trace != nullptr)
+    PrefillSnapshot(trace->gate_up_input, scratch.input,
+                    std::size_t{assignments} * g.cols * sizeof(std::uint16_t),
+                    stream);
   projection(g, scratch.gate);
+  if (trace != nullptr)
+    PrefillSnapshot(trace->gate_inner, scratch.gate,
+                    std::size_t{assignments} * g.rows * sizeof(float), stream);
   Exl3RotateExpertBuckets(u.device_exl3, x, scratch.input, scratch.offsets,
                           scratch.slots, u.experts, assignments, u.cols, used,
                           false, stream);
+  if (trace != nullptr && trace->gate_up_input != nullptr)
+    PrefillSnapshot(trace->gate_up_input + assignments * g.cols, scratch.input,
+                    std::size_t{assignments} * u.cols * sizeof(std::uint16_t),
+                    stream);
   projection(u, scratch.up);
+  if (trace != nullptr)
+    PrefillSnapshot(trace->up_inner, scratch.up,
+                    std::size_t{assignments} * u.rows * sizeof(float), stream);
   hipLaunchKernelGGL(
       RestoreActivateRotateBuckets, dim3(d.cols / 128, assignments), dim3(32),
       0, stream, g.device_exl3, u.device_exl3, d.device_exl3, scratch.offsets,
       d.experts, scratch.gate, scratch.up, scratch.input, d.cols);
-  hipLaunchKernelGGL(ScaleDownRows, dim3(assignments), dim3(256), 0, stream,
-                     scratch.input, scratch.down_exponents, d.cols);
-  projection(d, scratch.out);
-  hipLaunchKernelGGL(BucketDownFallback, dim3(d.rows / 16, assignments),
-                     dim3(32), 0, stream, d.device_exl3, scratch.offsets,
-                     d.experts, scratch.down_exponents, scratch.input,
-                     scratch.out, d.cols, d.rows);
-  hipLaunchKernelGGL(RestoreDownBuckets, dim3(d.rows / 128, assignments),
-                     dim3(32), 0, stream, d.device_exl3, scratch.offsets,
-                     d.experts, scratch.down_exponents, scratch.out, d.rows);
+  if (trace != nullptr)
+    PrefillSnapshot(trace->activation, scratch.gate,
+                    std::size_t{assignments} * g.rows * sizeof(float), stream);
+  Exl3PrefillDown(d, assignments, tile_rows, scratch, gemm, stream, trace);
   Exl3ScatterExpertBuckets(scratch.out, scratch.slots, out, assignments, d.rows,
                            stream);
   Check();
+}
+
+bool Exl3SharedMlp(const DeviceLayer& l, const float* x, float* gate, float* up,
+                   float* out, std::uint32_t rows, const Exl3Scratch& scratch,
+                   hipStream_t stream) {
+  if (rows == 0)
+    return false;
+  const auto& p = scratch.projection;
+  const gufo::hip::Exl3FastWorkspace ws{
+      p.fast_input,         p.fast_input_elements, p.fast_counters,
+      p.fast_counter_count, p.fast_down_input,     p.fast_down_input_elements};
+  const gufo::hip::Exl3FastMlp mlp{
+      l.shexp_gate.exl3, l.shexp_up.exl3, l.shexp_down.exl3, gate, up, out,
+      l.shexp_down.rows};
+  if (!gufo::hip::Exl3FastMlpSupported(mlp, ws))
+    return false;
+  for (std::uint32_t first = 0; first < rows;
+       first += gufo::hip::kExl3FastMaxRows) {
+    auto pass = mlp;
+    pass.out += std::size_t{first} * mlp.out_stride;
+    const auto count =
+        std::min<std::uint32_t>(gufo::hip::kExl3FastMaxRows, rows - first);
+    gufo::hip::LaunchExl3FastMlp(pass,
+                                 x + std::size_t{first} * l.shexp_gate.cols,
+                                 l.shexp_gate.cols, count, ws, stream);
+  }
+  return true;
 }
 
 void Exl3RoutedMlp(const DeviceLayer& l, const float* x,
