@@ -132,10 +132,40 @@ __global__ void RoutedGemv(const ex::DeviceLinear* gate,
   const auto* trellis = reinterpret_cast<const std::uint32_t*>(l.trellis);
   const auto* x = reinterpret_cast<const _Float16*>(input) +
                   std::size_t{projection} * assignments * k;
-  for (unsigned kt = 0; kt < k / 16; ++kt) {
+  // Tiles are fetched kAhead at a time so a wave keeps several loads in
+  // flight (one tile per iteration left decode latency-bound, ~150 GB/s);
+  // they are decoded and accumulated in K order exactly as before.
+  constexpr unsigned kAhead = 4;
+  const unsigned k_tiles = k / 16;
+  for (unsigned kt0 = 0; kt0 < k_tiles; kt0 += kAhead) {
+    std::uint32_t raw[kAhead][3];
+#pragma unroll
+    for (unsigned u = 0; u < kAhead; ++u) {
+      const unsigned kt = min(kt0 + u, k_tiles - 1);
+      const auto* tile =
+          trellis + (std::size_t{kt} * (n / 16) + nt) * (8 * Bits);
+      raw[u][0] = tile[lw.o0];
+      raw[u][1] = tile[lw.o1];
+      raw[u][2] = tile[lw.o2];
+    }
+#pragma unroll
+    for (unsigned u = 0; u < kAhead; ++u) {
+    const unsigned kt = kt0 + u;
+    if (kt >= k_tiles)
+      break;
     Half2 w[4];
-    arithmetic::DecodeLaneMul1<Bits>(
-        trellis + (std::size_t{kt} * (n / 16) + nt) * (8 * Bits), lw, w);
+    {
+      std::uint32_t state[8];
+      arithmetic::LaneStates<Bits>(raw[u][0], raw[u][1], raw[u][2], lw.shift,
+                                   state);
+      std::uint32_t p[8];
+#pragma unroll
+      for (int j = 0; j < 8; ++j)
+        p[j] = (state[j] & 0xffffU) * arithmetic::kMul1Multiplier;
+#pragma unroll
+      for (int q = 0; q < 4; ++q)
+        w[q] = arithmetic::DecodePairMul1(p[2 * q], p[2 * q + 1]);
+    }
     for (unsigned r = 0; r < MaxRows; ++r) {
       if (r >= tile_rows.count)
         break;
@@ -153,6 +183,7 @@ __global__ void RoutedGemv(const ex::DeviceLinear* gate,
         b[r] = __builtin_amdgcn_fdot2(w[2], v01, b[r], false);
         b[r] = __builtin_amdgcn_fdot2(w[3], v89, b[r], false);
       }
+    }
     }
   }
   for (unsigned r = 0; r < MaxRows; ++r) {
