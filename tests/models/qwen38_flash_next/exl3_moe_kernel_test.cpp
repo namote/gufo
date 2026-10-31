@@ -1,3 +1,237 @@
+#if defined(GUFO_EXL3_LOADER_TEST_ONLY)
+#include <bit>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "src/models/qwen38_flash_next/exl3_weights.hpp"
+
+namespace q = gufo::models::qwen38_flash_next;
+namespace ex = gufo::quant::exl3;
+namespace {
+void Require(bool value, const char* message) {
+  if (!value)
+    throw std::runtime_error(message);
+}
+template<class F>
+void Reject(F&& f, std::string_view expected) {
+  bool rejected = false;
+  try {
+    f();
+  } catch (const std::exception& error) {
+    rejected = true;
+    Require(
+        std::string_view(error.what()).find(expected) != std::string_view::npos,
+        "fixture failed for an unexpected reason");
+  }
+  Require(rejected, "invalid loader fixture was accepted");
+}
+struct Fixture {
+  std::ostringstream entries;
+  std::vector<std::uint8_t> payload;
+  bool first = true;
+  void Tensor(const std::string& name, const char* dtype,
+              std::vector<std::int64_t> shape, std::size_t bytes,
+              unsigned seed = 0) {
+    if (!first)
+      entries << ',';
+    first = false;
+    entries << '"' << name << "\":{\"dtype\":\"" << dtype << "\",\"shape\":[";
+    for (std::size_t i = 0; i < shape.size(); ++i)
+      entries << (i ? "," : "") << shape[i];
+    entries << "],\"data_offsets\":[" << payload.size() << ','
+            << payload.size() + bytes << "]}";
+    payload.insert(payload.end(), bytes, static_cast<std::uint8_t>(seed));
+  }
+  void Linear(const std::string& name, int bits, bool marker = true,
+              bool bias = false, bool half = false) {
+    const int words = 16 * bits + (half ? 8 : 0);
+    Tensor(name + ".trellis", "I16", {8, 8, words}, 8 * 8 * words * 2);
+    Tensor(name + ".suh", "F16", {128}, 256);
+    Tensor(name + ".svh", "F16", {128}, 256);
+    if (marker)
+      Tensor(name + ".mul1", "I32", {}, 4);
+    if (bias)
+      Tensor(name + ".bias", "F16", {128}, 256);
+  }
+  void Mixer(const q::Config& c, unsigned mask = 7, unsigned seed = 0x31) {
+    const auto width = static_cast<std::int64_t>(c.HcDim());
+    const std::string p = "mtp.hyper_connection_mixer.";
+    if (mask & 1)
+      Tensor(p + "hc_norm.weight", "F16", {width}, width * 2, seed);
+    if (mask & 2)
+      Tensor(p + "input_mix_weight_down.weight", "F16", {c.hc_low_rank, width},
+             c.hc_low_rank * width * 2, seed);
+    if (mask & 4)
+      Tensor(p + "input_mix_weight_up.weight", "F16", {width, c.hc_low_rank},
+             c.hc_low_rank * width * 2, seed);
+  }
+  static void Raw(const std::filesystem::path& path, std::string header,
+                  const std::vector<std::uint8_t>& payload = {}) {
+    while (header.size() % 8)
+      header += ' ';
+    std::ofstream out(path, std::ios::binary);
+    const std::uint64_t length = header.size();
+    out.write(reinterpret_cast<const char*>(&length), 8);
+    out.write(header.data(), header.size());
+    out.write(reinterpret_cast<const char*>(payload.data()), payload.size());
+    Require(bool(out), "cannot write loader fixture");
+  }
+  void Write(const std::filesystem::path& path) const {
+    Raw(path, "{" + entries.str() + "}", payload);
+  }
+};
+struct Directory {
+  std::filesystem::path path =
+      std::filesystem::temp_directory_path() /
+      ("qfn-exl3-rates-" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  Directory() {
+    std::filesystem::create_directories(path);
+    std::ofstream(path / "config.json")
+        << R"({"quantization_config":{"quant_method":"exl3","version":"1.5.0","bits":5.05,"head_bits":6,"out_scales":"always","codebook":"mul1"}})";
+  }
+  ~Directory() { std::filesystem::remove_all(path); }
+  q::Exl3Storage Open(const Fixture& fixture) {
+    fixture.Write(path / "model.safetensors");
+    q::Exl3Storage storage;
+    storage.checkpoint =
+        std::make_shared<ex::Checkpoint>(ex::Checkpoint::Open(path));
+    return storage;
+  }
+};
+void Binding() {
+  Directory directory;
+  Fixture f;
+  for (int bits : {3, 4, 5, 6, 7}) {
+    f.Linear("projection" + std::to_string(bits), bits);
+    for (unsigned expert = 0; expert < 3; ++expert)
+      f.Linear("bank" + std::to_string(bits) + "." + std::to_string(expert),
+               bits);
+  }
+  f.Linear("mixed.0", 4);
+  f.Linear("mixed.1", 6);
+  f.Linear("unsupported2", 2);
+  f.Linear("unsupported8", 8);
+  f.Linear("fractional", 3, true, false, true);
+  f.Linear("codebook", 4, false);
+  f.Linear("biased", 4, true, true);
+  auto storage = directory.Open(f);
+  // A global bits=5.05 setting must not override any actual tensor rate.
+  const auto first = q::BindExl3LinearBank(storage, "projection3", 128, 128);
+  for (int bits : {3, 4, 5, 6, 7}) {
+    const auto single = q::BindExl3LinearBank(
+        storage, "projection" + std::to_string(bits), 128, 128);
+    Require(single.exl3[0].view.rate == ex::BitRate{bits, false},
+            "per-projection tensor rate was not retained");
+    const auto bank = q::BindExl3LinearBank(
+        storage, "bank" + std::to_string(bits) + ".{}", 128, 128, 3);
+    for (const auto& member : bank.exl3)
+      Require(member.view.rate == ex::BitRate{bits, false},
+              "uniform bank rate was not retained");
+  }
+  const auto retained = storage.linears.size();
+  Reject([&] { (void)q::BindExl3LinearBank(storage, "mixed.{}", 128, 128, 2); },
+         "mixed expert rates");
+  Require(
+      storage.linears.size() == retained && first.exl3[0].view.rate.bits == 3,
+      "failed bank binding invalidated retained descriptors");
+  for (const char* name :
+       {"unsupported2", "unsupported8", "fractional", "codebook", "biased"})
+    Reject([&] { (void)q::BindExl3LinearBank(storage, name, 128, 128); },
+           "invalid projection");
+  Reject([&] { (void)q::BindExl3LinearBank(storage, "projection4", 256, 128); },
+         "invalid projection");
+  Reject([&] { (void)q::BindExl3LinearBank(storage, "mixed", 128, 128, 2); },
+         "invalid expert bank");
+  const auto mtp = q::BindExl3LinearBank(storage, "bank6.{}", 128, 128, 3);
+  Require(mtp.exl3[0].view.rate.bits == 6, "MTP bank must retain its own rate");
+}
+void MixerSources() {
+  q::Config c;
+  c.hidden_size = 128;
+  c.hc_count = 4;
+  c.hc_low_rank = 2;
+  Directory directory;
+  Fixture full;
+  full.Mixer(c);
+  const auto patch = directory.path / "patch.safetensors";
+  full.Write(patch);
+  {
+    auto storage = directory.Open(full);
+    const auto main_digest = q::PrepareExl3MtpMixer(storage, c);
+    const auto both_digest = q::PrepareExl3MtpMixer(storage, c, patch);
+    Require(storage.supplementary.empty(),
+            "in-shard mixer was replaced by patch");
+    Require(main_digest != both_digest,
+            "supplied patch omitted from source identity");
+    Fixture changed;
+    changed.Mixer(c, 7, 0x32);
+    changed.Write(directory.path / "changed.safetensors");
+    Reject(
+        [&] {
+          (void)q::PrepareExl3MtpMixer(storage, c,
+                                       directory.path / "changed.safetensors");
+        },
+        "differs from patch");
+    for (const std::string bad : {"[]", "7"}) {
+      Fixture::Raw(directory.path / "bad.safetensors", bad);
+      Reject(
+          [&] {
+            (void)q::PrepareExl3MtpMixer(storage, c,
+                                         directory.path / "bad.safetensors");
+          },
+          "must be an object");
+    }
+    const std::string name = "mtp.hyper_connection_mixer.hc_norm.weight";
+    for (const std::string offset : {"-1", "0.5", "\"bad\""}) {
+      const std::string header =
+          "{\"" + name +
+          "\":{\"dtype\":\"F16\",\"shape\":[512],\"data_offsets\":[" + offset +
+          ",1024]}}";
+      Fixture::Raw(directory.path / "bad.safetensors", header,
+                   std::vector<std::uint8_t>(1024, 0x31));
+      Reject(
+          [&] {
+            (void)q::PrepareExl3MtpMixer(storage, c,
+                                         directory.path / "bad.safetensors");
+          },
+          "invalid MTP mixer patch offset");
+    }
+  }
+  for (unsigned mask : {0U, 1U, 3U}) {
+    Fixture partial;
+    partial.Mixer(c, mask);
+    auto storage = directory.Open(partial);
+    Reject([&] { (void)q::PrepareExl3MtpMixer(storage, c); },
+           "missing/invalid MTP mixer");
+    (void)q::PrepareExl3MtpMixer(storage, c, patch);
+    Require(storage.supplementary.size() == 3 - std::popcount(mask),
+            "patch did not supply exactly missing mixer tensors");
+    for (const auto& [name, tensor] : storage.supplementary)
+      Require(tensor.bytes != 0 && tensor.data[0] == 0x31,
+              "supplementary mixer lost its owned payload");
+  }
+}
+}  // namespace
+int main() {
+  try {
+    Binding();
+    MixerSources();
+    std::cout << "Flash-Next EXL3 rate binding and mixer sources passed\n";
+    return 0;
+  } catch (const std::exception& error) {
+    std::cerr << error.what() << '\n';
+    return 1;
+  }
+}
+#else
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -74,13 +308,15 @@ void Near(std::span<const float> actual, std::span<const float> expected,
 
 struct Bank {
   unsigned k, n, experts;
+  int bits;
+  std::vector<ex::DeviceLinear> descriptors;
   std::vector<std::uint16_t> trellis, suh, svh, inner;
   gpu::DeviceTensor weight;
   Bank(Buffers& buffers, unsigned inputs, unsigned outputs, unsigned count,
-       unsigned seed, bool decode = true)
-      : k(inputs), n(outputs), experts(count) {
+       unsigned seed, bool decode = true, int rate = 5)
+      : k(inputs), n(outputs), experts(count), bits(rate) {
     std::mt19937 rng(seed);
-    const auto words = std::size_t{k / 16} * (n / 16) * 80;
+    const auto words = std::size_t{k / 16} * (n / 16) * 16 * bits;
     trellis.resize(words * experts);
     suh.resize(k * experts);
     svh.resize(n * experts);
@@ -97,23 +333,23 @@ struct Bank {
     auto* dt = buffers.Copy(trellis);
     auto* ds = buffers.Copy(suh);
     auto* dv = buffers.Copy(svh);
-    std::vector<ex::DeviceLinear> descriptors;
     for (unsigned e = 0; e < experts; ++e) {
       descriptors.push_back({dt + e * words,
                              ds + e * k,
                              dv + e * n,
                              k,
                              n,
-                             {5, false},
+                             {bits, false},
                              ex::Codebook::kMul1});
       if (decode)
-        ex::DequantInner(trellis.data() + e * words, k, n, {5, false},
+        ex::DequantInner(trellis.data() + e * words, k, n, {bits, false},
                          ex::Codebook::kMul1,
                          inner.data() + std::size_t{e} * k * n);
     }
     weight.cols = k;
     weight.rows = n;
     weight.experts = experts;
+    weight.exl3 = descriptors.data();
     weight.device_exl3 = buffers.Copy(descriptors);
   }
   std::vector<std::uint16_t> Rotate(unsigned expert, const float* input) const {
@@ -191,12 +427,14 @@ __global__ void UnfusedActivation(const ex::DeviceLinear* gate,
   }
 }
 
-void FusedProducer(unsigned rows, bool shared) {
+void FusedProducer(unsigned rows, bool shared, int bits = 5, int up_bits = 0,
+                   int down_bits = 0) {
   constexpr unsigned k = 256, ff = 640, used = 3, experts = 12;
   const unsigned assignments = rows * used;
   Buffers buffers;
-  Bank gate(buffers, k, ff, experts, 1), up(buffers, k, ff, experts, 2),
-      down(buffers, ff, k, experts, 3);
+  Bank gate(buffers, k, ff, experts, 1, true, bits),
+      up(buffers, k, ff, experts, 2, true, up_bits == 0 ? bits : up_bits),
+      down(buffers, ff, k, experts, 3, true, down_bits == 0 ? bits : down_bits);
   gpu::DeviceLayer layer;
   layer.ffn_gate_exps = gate.weight;
   layer.ffn_up_exps = up.weight;
@@ -300,10 +538,10 @@ void FusedProducer(unsigned rows, bool shared) {
   }
 }
 
-void DownFixtures() {
+void DownFixtures(int bits) {
   constexpr unsigned rows = 8, k = 640, n = 128;
   Buffers buffers;
-  Bank down(buffers, k, n, 1, 5);
+  Bank down(buffers, k, n, 1, 5, true, bits);
   std::vector<std::uint16_t> input(rows * k);
   for (unsigned j = 0; j < k; ++j) {
     input[j] = j & 1 ? 0x8000 : 0;            // signed zero
@@ -406,7 +644,8 @@ void ControlGemm(const ex::DeviceLinear* bank,
                  const std::uint32_t* count, std::uint32_t capacity,
                  std::uint32_t tile_rows, const std::uint16_t* input,
                  float* output, std::uint32_t k, std::uint32_t n,
-                 hipStream_t stream) {
+                 ex::BitRate rate, hipStream_t stream) {
+  Require(!rate.half && rate.bits >= 3 && rate.bits <= 7, "control bank rate");
   Require(tile_rows == 16 || tile_rows == 32 || tile_rows == 64,
           "adapter tile row contract");
   unsigned index = 0;
@@ -425,23 +664,26 @@ void ObservedGemm(const ex::DeviceLinear* bank,
                   const std::uint32_t* count, std::uint32_t capacity,
                   std::uint32_t tile_rows, const std::uint16_t* input,
                   float* output, std::uint32_t k, std::uint32_t n,
-                  hipStream_t stream) {
+                  ex::BitRate rate, hipStream_t stream) {
   ++control_calls;
   candidate_gemm(bank, buckets, count, capacity, tile_rows, input, output, k, n,
-                 stream);
+                 rate, stream);
   if (poison_exponents != nullptr && bank == control_banks[2])
     hipLaunchKernelGGL(PoisonUnsafeDots, dim3(poison_rows), dim3(256), 0,
                        stream, poison_exponents, poison_rows, n, output);
   Check(hipGetLastError());
 }
 
-void PrefillDispatch(gpu::Exl3BucketGemm gemm) {
+void PrefillDispatch(gpu::Exl3BucketGemm gemm, int bits, int up_bits = 0,
+                     int down_bits = 0) {
   candidate_gemm = gemm;
   constexpr unsigned rows = 17, used = 2, experts = 4, k = 128, ff = 640;
   constexpr unsigned assignments = rows * used, tile_rows = 16;
   Buffers buffers;
-  Bank gate(buffers, k, ff, experts, 9), up(buffers, k, ff, experts, 10),
-      down(buffers, ff, k, experts, 11);
+  Bank gate(buffers, k, ff, experts, 9, true, bits),
+      up(buffers, k, ff, experts, 10, true, up_bits == 0 ? bits : up_bits),
+      down(buffers, ff, k, experts, 11, true,
+           down_bits == 0 ? bits : down_bits);
   gpu::DeviceLayer layer;
   layer.ffn_gate_exps = gate.weight;
   layer.ffn_up_exps = up.weight;
@@ -497,12 +739,14 @@ void PrefillDispatch(gpu::Exl3BucketGemm gemm) {
   auto* control_up = buffers.Make<float>(assignments * ff);
   auto* control_down = buffers.Make<float>(assignments * k);
   ControlGemm(gate.weight.device_exl3, s.buckets, s.bucket_count, s.max_buckets,
-              tile_rows, trace.gate_up_input, control_gate, k, ff, nullptr);
+              tile_rows, trace.gate_up_input, control_gate, k, ff,
+              {bits, false}, nullptr);
   ControlGemm(up.weight.device_exl3, s.buckets, s.bucket_count, s.max_buckets,
               tile_rows, trace.gate_up_input + assignments * k, control_up, k,
-              ff, nullptr);
+              ff, up.descriptors[0].rate, nullptr);
   ControlGemm(down.weight.device_exl3, s.buckets, s.bucket_count, s.max_buckets,
-              tile_rows, s.input, control_down, ff, k, nullptr);
+              tile_rows, s.input, control_down, ff, k, down.descriptors[0].rate,
+              nullptr);
   const auto control_gate_inner = Read(control_gate, assignments * ff);
   const auto control_up_inner = Read(control_up, assignments * ff);
   const auto control_down_inner = Read(control_down, assignments * k);
@@ -599,12 +843,12 @@ void PrefillDispatch(gpu::Exl3BucketGemm gemm) {
   Check(hipStreamDestroy(stream));
 }
 
-void PrefillUnsafeRows(gpu::Exl3BucketGemm gemm) {
+void PrefillUnsafeRows(gpu::Exl3BucketGemm gemm, int bits) {
   candidate_gemm = gemm;
   // More rows than the worker grid, and more N tiles than eight waves.
   constexpr unsigned rows = 513, k = 128, n = 640, experts = 2, tile_rows = 32;
   Buffers buffers;
-  Bank down(buffers, k, n, experts, 17);
+  Bank down(buffers, k, n, experts, 17, true, bits);
   control_banks[0] = control_banks[1] = nullptr;
   control_weights[0] = control_weights[1] = nullptr;
   control_banks[2] = down.weight.device_exl3;
@@ -920,7 +1164,7 @@ ExpertRun RunExperts(const gpu::DeviceLayer& layer,
   return result;
 }
 
-void ExpertInvariance(bool prefill, gpu::Exl3BucketGemm gemm) {
+void ExpertInvariance(bool prefill, gpu::Exl3BucketGemm gemm, int bits) {
   if (prefill) {
     candidate_gemm = gemm;
     gemm = ObservedGemm;
@@ -928,8 +1172,9 @@ void ExpertInvariance(bool prefill, gpu::Exl3BucketGemm gemm) {
   constexpr unsigned k = 128, ff = 640, used = 3, experts = 12;
   const unsigned rows = prefill ? 65 : 17;
   Buffers buffers;
-  Bank gate(buffers, k, ff, experts, 21), up(buffers, k, ff, experts, 22),
-      down(buffers, ff, k, experts, 23);
+  Bank gate(buffers, k, ff, experts, 21, true, bits),
+      up(buffers, k, ff, experts, 22, true, bits),
+      down(buffers, ff, k, experts, 23, true, bits);
   gpu::DeviceLayer layer;
   layer.ffn_gate_exps = gate.weight;
   layer.ffn_up_exps = up.weight;
@@ -1000,13 +1245,45 @@ void ExpertInvariance(bool prefill, gpu::Exl3BucketGemm gemm) {
   }
 }
 
-void Buckets(unsigned rows, bool shared, unsigned tile_rows) {
+void SelectedHeadRate(int bits) {
+  constexpr unsigned k = 128, n = 640, prefix = 128;
+  Buffers buffers;
+  Bank bank(buffers, k, n, 1, 31, true, bits);
+  std::vector<float> input(k);
+  for (unsigned i = 0; i < k; ++i)
+    input[i] = (int(i % 73) - 36) * 0.00003125F;
+  const std::vector<std::int32_t> ids{0, 127, 128, 257, 639, -1};
+  gpu::Exl3Scratch scratch;
+  scratch.projection.fast_input = buffers.Make<std::uint16_t>(k);
+  scratch.head_segments = buffers.Make<std::uint32_t>(ids.size() + 1);
+  scratch.head_values = buffers.Make<float>((prefix / 128 + ids.size()) * 128);
+  auto* y = buffers.Make<float>(prefix + ids.size());
+  gpu::Exl3DraftHead(bank.weight, buffers.Copy(input), y, prefix,
+                     buffers.Copy(ids), ids.size(), scratch, nullptr);
+  const auto actual = Read(y, prefix + ids.size());
+  const auto rotated = bank.Rotate(0, input.data());
+  const auto expected = bank.Restore(0, bank.Dot(0, rotated.data()));
+  Near(std::span(actual).first(prefix), std::span(expected).first(prefix),
+       "selected-head prefix FP64");
+  std::vector<float> extras, reference;
+  for (unsigned i = 0; i < ids.size(); ++i) {
+    if (ids[i] < 0) {
+      Require(actual[prefix + i] == -INFINITY, "invalid selected-head ID");
+    } else {
+      extras.push_back(actual[prefix + i]);
+      reference.push_back(expected[ids[i]]);
+    }
+  }
+  Near(extras, reference, "selected-head extras FP64");
+}
+
+void Buckets(unsigned rows, bool shared, unsigned tile_rows, int bits) {
   constexpr unsigned used = 3, experts = 12, width = 640;
   const unsigned assignments = rows * used;
   const unsigned capacity =
       std::min(assignments, experts + assignments / tile_rows);
   Buffers buffers;
-  Bank bank(buffers, width, 128, experts, 6, false);
+  Bank bank(buffers, width, 128, experts, 6, false, bits);
   std::vector<std::int32_t> ids(assignments);
   for (unsigned i = 0; i < assignments; ++i)
     ids[i] = shared ? i % used : (i * 5 + 3) % experts;
@@ -1097,29 +1374,42 @@ void Buckets(unsigned rows, bool shared, unsigned tile_rows) {
 
 // Both adapters must pass the independent FP64 stage/output bars, poisoned
 // fallback fixtures and exact partition/reordering contract.
-void QualifyFlashNextExl3PrefillAdapter(gpu::Exl3BucketGemm gemm) {
+void QualifyFlashNextExl3PrefillAdapter(gpu::Exl3BucketGemm gemm, int bits) {
   Require(gemm != nullptr,
           "prefill adapter qualification needs the actual callback");
-  PrefillDispatch(gemm);
-  PrefillUnsafeRows(gemm);
-  ExpertInvariance(true, gemm);
+  PrefillDispatch(gemm, bits);
+  PrefillUnsafeRows(gemm, bits);
+  ExpertInvariance(true, gemm, bits);
 }
 
 int main() {
   try {
-    DownFixtures();
-    std::cout << "CASE FMA control adapter qualification\n";
-    QualifyFlashNextExl3PrefillAdapter(ControlGemm);
-    std::cout << "CASE production X3 adapter qualification\n";
-    QualifyFlashNextExl3PrefillAdapter(gpu::Exl3PrefillBucketInner);
-    ExpertInvariance(false, nullptr);
-    for (unsigned rows : {1U, 2U, 3U, 4U, 7U, 8U, 9U})
-      for (bool shared : {false, true})
-        FusedProducer(rows, shared);
-    for (unsigned tile_rows : {16U, 32U, 64U})
-      for (unsigned rows : {1U, 3U, 17U, 33U, 65U})
+    for (int bits : {3, 4, 5, 6, 7}) {
+      std::cout << "CASE expert K=" << bits << '\n';
+      bool rejected = false;
+      try {
+        gpu::Exl3PrefillBucketInner(nullptr, nullptr, nullptr, 1, 16, nullptr,
+                                    nullptr, 128, 128, {bits, false}, nullptr);
+      } catch (const std::invalid_argument&) {
+        rejected = true;
+      }
+      Require(rejected, "bucket adapter must reject null pointers for every K");
+      DownFixtures(bits);
+      SelectedHeadRate(bits);
+      QualifyFlashNextExl3PrefillAdapter(ControlGemm, bits);
+      QualifyFlashNextExl3PrefillAdapter(gpu::Exl3PrefillBucketInner, bits);
+      ExpertInvariance(false, nullptr, bits);
+      for (unsigned rows : {1U, 2U, 3U, 4U, 7U, 8U, 9U})
         for (bool shared : {false, true})
-          Buckets(rows, shared, tile_rows);
+          FusedProducer(rows, shared, bits);
+      for (unsigned tile_rows : {16U, 32U, 64U})
+        for (unsigned rows : {1U, 3U, 17U, 33U, 65U})
+          for (bool shared : {false, true})
+            Buckets(rows, shared, tile_rows, bits);
+    }
+    FusedProducer(3, true, 4, 3, 7);  // Different rates in distinct banks.
+    PrefillDispatch(ControlGemm, 4, 3, 7);
+    PrefillDispatch(gpu::Exl3PrefillBucketInner, 4, 3, 7);
     // No zero-dimensional GPU launches, and no scratch accesses, for no work.
     gpu::Exl3RoutedDown({}, nullptr, nullptr, 0, 0, {}, nullptr);
     gpu::Exl3PrefillDown({}, 0, 0, {}, nullptr, nullptr);
@@ -1136,3 +1426,5 @@ int main() {
     return 1;
   }
 }
+
+#endif  // GUFO_EXL3_LOADER_TEST_ONLY
