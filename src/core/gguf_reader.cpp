@@ -65,6 +65,7 @@ GgufReader::GgufReader(GgufReader&& other) noexcept
       mapping_(std::move(other.mapping_)),
       version_(other.version_),
       alignment_(other.alignment_),
+      data_offset_(other.data_offset_),
       metadata_(std::move(other.metadata_)),
       tensors_(std::move(other.tensors_)),
       tensor_index_(std::move(other.tensor_index_)),
@@ -86,6 +87,7 @@ GgufReader& GgufReader::operator=(GgufReader&& other) noexcept {
     mapping_ = std::move(other.mapping_);
     version_ = other.version_;
     alignment_ = other.alignment_;
+    data_offset_ = other.data_offset_;
     metadata_ = std::move(other.metadata_);
     tensors_ = std::move(other.tensors_);
     tensor_index_ = std::move(other.tensor_index_);
@@ -148,9 +150,9 @@ std::unique_ptr<GgufReader> GgufReader::OpenSingleFile(
       *error_msg = "Insufficient memory for GGUF descriptors";
     return nullptr;
   }
-  reader->mapped_regions_.push_back({reader->data_, reader->size_,
-                                     reader->mapping_.PlatformHandle(),
-                                     reader->source_path_});
+  reader->mapped_regions_.push_back(
+      {reader->data_, reader->size_, reader->mapping_.PlatformHandle(),
+       reader->source_path_, reader->data_offset_});
   return reader;
 }
 
@@ -254,9 +256,9 @@ std::unique_ptr<GgufReader> GgufReader::OpenSplitFileSet(
   combined->mapped_regions_.reserve(split_count);
 
   for (const auto& shard : shards) {
-    combined->mapped_regions_.push_back({shard->data_, shard->size_,
-                                         shard->mapping_.PlatformHandle(),
-                                         shard->source_path_});
+    combined->mapped_regions_.push_back(
+        {shard->data_, shard->size_, shard->mapping_.PlatformHandle(),
+         shard->source_path_, shard->data_offset_});
     for (const auto& tensor : shard->tensors_) {
       if (combined->tensor_index_.contains(tensor.name)) {
         if (error_msg != nullptr) {
@@ -308,8 +310,11 @@ std::unique_ptr<GgufReader> GgufReader::OpenMemory(const void* data,
       *error_msg = "Insufficient memory for GGUF descriptors";
     return nullptr;
   }
-  reader->mapped_regions_.push_back(
-      {reader->data_, reader->size_, platform::kInvalidFile, {}});
+  reader->mapped_regions_.push_back({reader->data_,
+                                     reader->size_,
+                                     platform::kInvalidFile,
+                                     {},
+                                     reader->data_offset_});
   return reader;
 }
 
@@ -710,6 +715,7 @@ bool GgufReader::ParseHeaders(std::string* error_msg) {
   if (offset > size_ || padding > size_ - offset)
     return false;
   const std::size_t data_base = offset + padding;
+  data_offset_ = data_base;
   for (auto& tensor : tensors_) {
     if (tensor.offset % alignment_ != 0 || tensor.offset > size_ - data_base ||
         tensor.size_bytes > size_ - data_base - tensor.offset) {

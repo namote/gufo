@@ -153,28 +153,6 @@ std::string HeadersDigest(const ex::Checkpoint& checkpoint) {
   return hash.FinishHex();
 }
 
-std::string GgufHeadersDigest(const core::GgufReader& reader) {
-  crypto::Sha256Hasher hash;
-  for (const auto& region : reader.GetMappedRegions()) {
-    const auto* base = static_cast<const std::uint8_t*>(region.data);
-    std::size_t header = region.size;
-    for (const auto& tensor : reader.GetTensors()) {
-      const auto address = reinterpret_cast<std::uintptr_t>(tensor.data);
-      const auto start = reinterpret_cast<std::uintptr_t>(base);
-      if (address >= start && address < start + region.size)
-        header = std::min(header, static_cast<std::size_t>(address - start));
-    }
-    if (header == region.size)
-      Fail("retained GGUF shard has no tensors");
-    const auto label = region.source_path.filename().string() + '\0' +
-                       std::to_string(region.size) + '\0';
-    hash.Update(
-        {reinterpret_cast<const std::uint8_t*>(label.data()), label.size()});
-    hash.Update({base, header});
-  }
-  return hash.FinishHex();
-}
-
 struct Binder {
   Exl3Storage& storage;
   const Config& c;
@@ -424,6 +402,19 @@ std::shared_ptr<Exl3Storage> Open(const std::filesystem::path& path,
 
 }  // namespace
 
+std::string Exl3PleHeadersDigest(const core::GgufReader& reader) {
+  crypto::Sha256Hasher hash;
+  for (const auto& region : reader.GetMappedRegions()) {
+    const auto* base = static_cast<const std::uint8_t*>(region.data);
+    const auto label = region.source_path.filename().string() + '\0' +
+                       std::to_string(region.size) + '\0';
+    hash.Update(
+        {reinterpret_cast<const std::uint8_t*>(label.data()), label.size()});
+    hash.Update({base, region.data_offset});
+  }
+  return hash.FinishHex();
+}
+
 std::uint32_t Exl3VHeadDestination(std::uint32_t index, std::uint32_t dim,
                                    const Config& c) {
   const auto head = index / dim;
@@ -457,7 +448,7 @@ std::optional<ModelWeights> LoadExl3Model(const std::filesystem::path& path,
       if (!storage.ple_reader)
         return std::nullopt;
       CheckDigest(sidecar, "gufo.exl3.ple_headers_sha256",
-                  GgufHeadersDigest(*storage.ple_reader));
+                  Exl3PleHeadersDigest(*storage.ple_reader));
       auto source = ModelWeights::Bind(*storage.ple_reader, error);
       if (!source)
         return std::nullopt;
