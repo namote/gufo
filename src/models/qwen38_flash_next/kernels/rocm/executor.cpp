@@ -153,19 +153,46 @@ std::uint32_t IndexerCapacity(const Config& c, std::uint32_t batch,
 /// block's, as KV block planes (kernels.hpp kKvPooledRatio). The blocks cover
 /// `max_context` tokens and max_context / ratio + 1 pooled rows, the pooled
 /// capacity the snapshot and continuation guards address.
-enum SessionKvPlane : std::size_t { kKeyPlane, kValuePlane, kPooledPlane };
-hip::KvBlockGeometry SessionKvGeometry(const Config& c, bool mtp,
-                                       std::uint32_t max_context) {
-  const std::uint32_t layers =
-      c.num_layers / c.full_attention_interval + (mtp ? 1 : 0);
+/// With KVarN the trunk layers' K/V are one record plane of k4v4 token-major
+/// groups (two a block) and only the draft block keeps FP16 K/V planes.
+struct SessionKvLayout {
+  hip::KvBlockGeometry geometry;
+  std::size_t keys{0}, values{0}, pooled{0}, records{0};
+  bool fp16_trunk{true};
+};
+SessionKvLayout SessionKvPlanes(const Config& c, bool mtp, bool kvarn,
+                                std::uint32_t max_context) {
+  const std::uint32_t attention = c.num_layers / c.full_attention_interval;
   const std::size_t kv_row = std::size_t{c.AttentionKvDim()} * sizeof(__half);
-  return hip::KvBlockGeometry(
-      {{layers, kv_row, hip::kKvBlockTokens},
-       {layers, kv_row, hip::kKvBlockTokens},
-       {layers, std::size_t{c.indexer_head_dim} * sizeof(__half),
-        hip::kKvBlockTokens / kKvPooledRatio}},
-      hip::KvBlockGeometry::BlocksFor(std::size_t{max_context} +
-                                      kKvPooledRatio));
+  SessionKvLayout out;
+  out.fp16_trunk = !kvarn;
+  std::vector<hip::KvBlockPlane> planes;
+  const auto add = [&](hip::KvBlockPlane plane) {
+    planes.push_back(plane);
+    return planes.size() - 1;
+  };
+  if (kvarn)
+    out.records = add(hip::KvarnRecordPlane(attention, c.num_kv_heads, 4,
+                                            hip::KvarnValueOrder::kTokenMajor));
+  const std::uint32_t fp16_layers = (kvarn ? 0 : attention) + (mtp ? 1 : 0);
+  if (fp16_layers != 0) {
+    out.keys = add({fp16_layers, kv_row, hip::kKvBlockTokens});
+    out.values = add({fp16_layers, kv_row, hip::kKvBlockTokens});
+  }
+  out.pooled = add({attention + (mtp ? 1 : 0),
+                    std::size_t{c.indexer_head_dim} * sizeof(__half),
+                    hip::kKvBlockTokens / kKvPooledRatio});
+  out.geometry = hip::KvBlockGeometry(
+      std::move(planes), hip::KvBlockGeometry::BlocksFor(
+                             std::size_t{max_context} + kKvPooledRatio));
+  return out;
+}
+
+/// Halves of one KVarN session's FP16 sink and tail rows: K and V of every
+/// attention layer.
+std::size_t KvarnFp16Elements(const Config& c) {
+  return std::size_t{2} * (c.num_layers / c.full_attention_interval) *
+         hip::kKvarnFp16Tokens * c.AttentionKvDim();
 }
 
 void PopulateSnapshotPrefix(std::uint8_t* data, std::uint64_t bytes,
@@ -766,6 +793,10 @@ PrefillCheckpoint::~PrefillCheckpoint() {
 std::unique_ptr<PrefillCheckpoint> Executor::MakePrefillCheckpoint(
     Session& source, std::span<const std::int32_t> tokens, std::uint32_t prefix,
     std::string* error_msg) const {
+  if (source.kvarn_) {
+    AssignError(error_msg, "KVarN sessions take no in-pass checkpoints");
+    return nullptr;
+  }
   if (source.owner_ != this || prefix == 0 || prefix > tokens.size() ||
       tokens.size() - prefix > kVecBatch ||
       !source.VisionLayout().images.empty()) {
@@ -889,6 +920,8 @@ void Session::Reset(bool reuse_mtp) {
   snapshot_lineage_.reset();
   position_ = 0;
   spec_tokens_ = 0;
+  kvarn_tail_ = {};
+  kvarn_pass_ = {};
   ngram_.Reset();
   mtp_.position = 0;
   mtp_.residual_valid = false;
@@ -1150,6 +1183,18 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     if (ngram)
       ngram->ReserveGather(T * c.ple_heads);
   }
+  if (options.kvarn) {
+    if (c.head_dim != hip::kKvarnHeadDim) {
+      AssignError(error_msg, "KVarN needs 256-wide attention heads");
+      return nullptr;
+    }
+    const std::size_t staging =
+        hip::KvarnStagingRows(T) * std::size_t{c.AttentionKvDim()};
+    e->kvarn_staging_k_ = Alloc<__half>(a, staging, error_msg);
+    e->kvarn_staging_v_ = Alloc<__half>(a, staging, error_msg);
+    if (e->kvarn_staging_k_ == nullptr || e->kvarn_staging_v_ == nullptr)
+      return nullptr;
+  }
   s.router = f32(T * (c.num_experts + 1));
   s.ids = Alloc<std::int32_t>(a, slots, error_msg);
   s.expert_counts = Alloc<std::uint32_t>(a, c.num_experts, error_msg);
@@ -1305,7 +1350,9 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   // layer's rows stay contiguous in position order, which snapshots,
   // checkpoints and the continuation adapter read as plain regions, while
   // the kernels already address rows through the table.
-  const auto kv = SessionKvGeometry(c, s->mtp_enabled_, max_context);
+  const auto layout =
+      SessionKvPlanes(c, s->mtp_enabled_, options_.kvarn, max_context);
+  const auto& kv = layout.geometry;
   auto* kv_rows =
       Alloc<std::byte>(a, kv.bytes(), error_msg, &s->allocated_bytes_);
   auto* kv_table =
@@ -1322,9 +1369,24 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
                "KV block table", error_msg))
       return nullptr;
   }
-  const auto plane_layer = [&](SessionKvPlane plane, std::uint32_t slot) {
+  const auto plane_layer = [&](std::size_t plane, std::uint32_t slot) {
     return kv_rows + kv.plane_offset(plane) + slot * kv.layer_pitch(plane);
   };
+  s->kv_table_ = kv_table;
+  const std::uint32_t attention_layers =
+      c.num_layers / c.full_attention_interval;
+  const std::size_t fp16_layer =
+      std::size_t{hip::kKvarnFp16Tokens} * c.AttentionKvDim();
+  if (options_.kvarn) {
+    s->kvarn_ = true;
+    s->kvarn_fp16_ =
+        Alloc<__half>(a, KvarnFp16Elements(c), error_msg, &s->allocated_bytes_);
+    if (s->kvarn_fp16_ == nullptr)
+      return nullptr;
+    s->kvarn_records_ =
+        reinterpret_cast<std::uint8_t*>(plane_layer(layout.records, 0));
+    s->kvarn_records_pitch_ = kv.layer_pitch(layout.records);
+  }
   std::uint32_t kv_slot = 0;
   const std::size_t conv_elems =
       static_cast<std::size_t>(c.ssm_conv_kernel - 1) * c.SsmConvChannels();
@@ -1338,10 +1400,20 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
       l.state = Alloc<float>(a, state_elems, error_msg, &s->allocated_bytes_);
     } else {
       auto& at = s->attention_[il];
-      at.k_cache = reinterpret_cast<__half*>(plane_layer(kKeyPlane, kv_slot));
-      at.v_cache = reinterpret_cast<__half*>(plane_layer(kValuePlane, kv_slot));
+      if (layout.fp16_trunk) {
+        at.k_cache =
+            reinterpret_cast<__half*>(plane_layer(layout.keys, kv_slot));
+        at.v_cache =
+            reinterpret_cast<__half*>(plane_layer(layout.values, kv_slot));
+      } else {
+        at.kvarn_k = s->kvarn_fp16_ + kv_slot * fp16_layer;
+        at.kvarn_v = s->kvarn_fp16_ + (attention_layers + kv_slot) * fp16_layer;
+        at.kvarn_records =
+            s->kvarn_records_ + std::size_t{kv_slot} * s->kvarn_records_pitch_;
+        at.kvarn_pass = &s->kvarn_pass_;
+      }
       at.block_k =
-          reinterpret_cast<__half*>(plane_layer(kPooledPlane, kv_slot));
+          reinterpret_cast<__half*>(plane_layer(layout.pooled, kv_slot));
       at.kv_blocks = kv_table;
       ++kv_slot;
       at.index_k = Alloc<float>(
@@ -1359,12 +1431,15 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
     s->mtp_.target_hidden = Alloc<float>(
         a, static_cast<std::size_t>(options_.max_speculative) * c.HcDim(),
         error_msg, &s->allocated_bytes_);
+    // The draft block's FP16 K/V follow the trunk's FP16 layers, or are the
+    // only FP16 layer of a KVarN session.
+    const std::uint32_t draft_slot = layout.fp16_trunk ? kv_slot : 0;
     s->mtp_.k_cache =
-        reinterpret_cast<__half*>(plane_layer(kKeyPlane, kv_slot));
+        reinterpret_cast<__half*>(plane_layer(layout.keys, draft_slot));
     s->mtp_.v_cache =
-        reinterpret_cast<__half*>(plane_layer(kValuePlane, kv_slot));
+        reinterpret_cast<__half*>(plane_layer(layout.values, draft_slot));
     s->mtp_.block_k =
-        reinterpret_cast<__half*>(plane_layer(kPooledPlane, kv_slot));
+        reinterpret_cast<__half*>(plane_layer(layout.pooled, kv_slot));
     s->mtp_.kv_blocks = kv_table;
     s->mtp_.index_k =
         Alloc<float>(a, std::size_t{s->index_capacity_} * c.indexer_head_dim,
@@ -1465,6 +1540,68 @@ bool Executor::DraftLogits(const Session& session, const float* x,
   return true;
 }
 
+void Executor::FlushKvarnGroups(const Session& session, std::uint32_t first,
+                                std::uint32_t groups) const {
+  const Config& c = config();
+  const std::uint32_t attention = c.num_layers / c.full_attention_interval;
+  const std::size_t layer =
+      std::size_t{hip::kKvarnFp16Tokens} * c.AttentionKvDim();
+  KvarnQuantizeGroups(
+      session.kvarn_fp16_, session.kvarn_fp16_ + std::size_t{attention} * layer,
+      layer, session.kvarn_records_, session.kvarn_records_pitch_,
+      session.kv_table_, c.num_kv_heads, attention, first, groups, stream_);
+}
+
+bool Executor::PlanKvarn(Session& session, std::uint32_t start, std::uint32_t n,
+                         std::string* error_msg) const {
+  KvarnPass pass{.start = start, .rows = n};
+  if (n <= hip::kKvarnMaxPassRows) {
+    const auto plan = hip::PlanKvarnPass(session.kvarn_tail_, start, n);
+    if (!plan.error.empty()) {
+      AssignError(error_msg, std::string(plan.error));
+      return false;
+    }
+    FlushKvarnGroups(session, plan.first_group, plan.groups);
+    pass.flushed_end = plan.flushed_end;
+  } else {
+    const auto plan = hip::PlanKvarnPrefill(session.kvarn_tail_, start, n);
+    if (!plan.error.empty()) {
+      AssignError(error_msg, std::string(plan.error));
+      return false;
+    }
+    FlushKvarnGroups(session, plan.first_group, plan.groups);
+    pass.prefill = true;
+    // A chunk inside the sink stages from position 0 and stores its sink
+    // rows afterwards; otherwise the ring rows of its first group lead.
+    pass.staging_first = start < hip::kKvarnSinkTokens ? 0 : plan.target;
+    pass.quant_end = plan.target;
+    pass.flushed_end = plan.flushed_end;
+    if (start + n - pass.staging_first >
+        hip::KvarnStagingRows(options_.max_batch)) {
+      AssignError(error_msg, "KVarN prompt chunk exceeds its staging rows");
+      return false;
+    }
+  }
+  session.kvarn_pass_ = pass;
+  return true;
+}
+
+bool Executor::FinishKvarn(Session& session, std::string* error_msg) const {
+  const auto& pass = session.kvarn_pass_;
+  const std::uint32_t end = pass.start + pass.rows;
+  session.kvarn_tail_.flushed_end = pass.flushed_end;
+  session.kvarn_tail_.written_end =
+      std::max(session.kvarn_tail_.written_end, end);
+  // A pass ending exactly at a group end quantizes that group now, so the
+  // records of every committed state reach its group floor (snapshots).
+  if (!pass.prefill && end % hip::kKvarnGroupTokens == 0 &&
+      end > hip::kKvarnSinkTokens && pass.flushed_end < end) {
+    FlushKvarnGroups(session, (end >> hip::kKvarnGroupShift) - 1, 1);
+    session.kvarn_tail_.flushed_end = end;
+  }
+  return Check(hipGetLastError(), "KVarN flush", error_msg);
+}
+
 bool Executor::EnsureRollback(Session& session, std::uint32_t depth,
                               std::string* error_msg) const {
   if (depth <= session.rollback_depth_)
@@ -1525,11 +1662,12 @@ std::size_t Executor::SessionBytes(
       c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
   // K/V/pooled rows and the block table (CreateSession); the raw indexer
   // rings stay per layer.
-  const auto kv_geometry = SessionKvGeometry(
-      c, mode == core::SessionMode::kSpeculative, max_context);
+  const auto kv_layout = SessionKvPlanes(
+      c, mode == core::SessionMode::kSpeculative, options_.kvarn, max_context);
   const std::size_t kv_blocks =
-      kv_geometry.bytes() +
-      std::size_t{kv_geometry.blocks()} * sizeof(std::uint32_t);
+      kv_layout.geometry.bytes() +
+      std::size_t{kv_layout.geometry.blocks()} * sizeof(std::uint32_t) +
+      (options_.kvarn ? KvarnFp16Elements(c) * sizeof(__half) : 0);
   const std::size_t index =
       std::size_t{IndexerCapacity(c, options_.max_batch, max_context)} *
       c.indexer_head_dim * sizeof(float);
@@ -2529,6 +2667,39 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   const std::uint32_t index_capacity =
       IndexerCapacity(c, options_.max_batch, max_context);
   bool prepared = false;
+  // KVarN layers write FP16 rows and rotate them into the KVarN frame: a
+  // pass into the sink and tail ring, a prompt chunk into the staging rows,
+  // whose row 0 holds staging_first (plan/exl3/F1-KVARN-DESIGN.md 3).
+  const KvarnPass* kvarn = s.kvarn_pass;
+  __half* write_k = s.k_cache;
+  __half* write_v = s.v_cache;
+  const std::uint32_t* write_rows = s.kv_blocks;
+  const std::size_t kvarn_row_bytes = std::size_t{kv_row} * sizeof(__half);
+  if (kvarn != nullptr && kvarn->prefill) {
+    // The rows before the chunk that it reads in FP16: the sink rows of a
+    // chunk starting inside the sink, or the ring rows of its first group.
+    const std::uint32_t lead = start_pos - kvarn->staging_first;
+    const std::size_t from =
+        kvarn->staging_first == 0 ? 0 : hip::KvarnFp16Row(kvarn->staging_first);
+    if (lead != 0 &&
+        (!Check(hipMemcpyAsync(kvarn_staging_k_, s.kvarn_k + from * kv_row,
+                               lead * kvarn_row_bytes, hipMemcpyDeviceToDevice,
+                               stream_),
+                "KVarN staging lead", error_msg) ||
+         !Check(hipMemcpyAsync(kvarn_staging_v_, s.kvarn_v + from * kv_row,
+                               lead * kvarn_row_bytes, hipMemcpyDeviceToDevice,
+                               stream_),
+                "KVarN staging lead", error_msg)))
+      return false;
+    // Writers address rows by absolute position.
+    write_k = kvarn_staging_k_ - std::size_t{kvarn->staging_first} * kv_row;
+    write_v = kvarn_staging_v_ - std::size_t{kvarn->staging_first} * kv_row;
+    write_rows = nullptr;
+  } else if (kvarn != nullptr) {
+    write_k = s.kvarn_k;
+    write_v = s.kvarn_v;
+    write_rows = KvarnFp16Rows();
+  }
   if (!l.attn_qkv.empty()) {
     const bool fused_projection =
         !projections_ready && WidePrefill(n_tokens) &&
@@ -2540,9 +2711,9 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       PrepareHalfInput(x, n_tokens, l.attn_qkv.cols);
       prepared = AttentionF16Gemm(
           l.attn_qkv.data, static_cast<const __half*>(s_.x_half),
-          l.attn_q_norm.f32(), l.attn_k_norm.f32(), s_.q, s_.attn_gate,
-          s.k_cache, s.v_cache, n_tokens, pos, c.rope_theta, c.rms_eps, stream_,
-          s.rope, yarn_, s.kv_blocks);
+          l.attn_q_norm.f32(), l.attn_k_norm.f32(), s_.q, s_.attn_gate, write_k,
+          write_v, n_tokens, pos, c.rope_theta, c.rms_eps, stream_, s.rope,
+          yarn_, write_rows);
       if (!prepared) {
         AssignError(error_msg, "fused attention projection failed");
         return false;
@@ -2554,9 +2725,9 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       }
       prepared = PrepareAttention(
           s_.qg, l.attn_qkv.rows, l.attn_q_norm.f32(), l.attn_k_norm.f32(),
-          s_.q, s_.attn_gate, s.k_cache, s.v_cache, n_tokens, c.num_heads,
+          s_.q, s_.attn_gate, write_k, write_v, n_tokens, c.num_heads,
           c.num_kv_heads, c.head_dim, c.rotary_dim, pos, c.rope_theta,
-          c.rms_eps, stream_, s.rope, prefill_phase, yarn_, s.kv_blocks);
+          c.rms_eps, stream_, s.rope, prefill_phase, yarn_, write_rows);
       if (!prepared) {
         UnpackQGate(s_.qg, l.attn_qkv.rows, s_.q, s_.attn_gate, s_.k, s_.v,
                     n_tokens, c.num_heads, c.head_dim, kv_row, stream_);
@@ -2583,8 +2754,26 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
          c.rope_theta, stream_, s.rope, yarn_);
     Rope(s_.k, n_tokens, c.num_kv_heads, c.head_dim, c.rotary_dim, pos,
          c.rope_theta, stream_, s.rope, yarn_);
-    StoreKv(s_.k, s.k_cache, n_tokens, kv_row, pos, stream_, s.kv_blocks);
-    StoreKv(s_.v, s.v_cache, n_tokens, kv_row, pos, stream_, s.kv_blocks);
+    StoreKv(s_.k, write_k, n_tokens, kv_row, pos, stream_, write_rows);
+    StoreKv(s_.v, write_v, n_tokens, kv_row, pos, stream_, write_rows);
+  }
+  if (kvarn != nullptr) {
+    if (checkpoint_tokens != 0) {
+      AssignError(error_msg, "KVarN sessions take no in-pass checkpoints");
+      return false;
+    }
+    if (kvarn->prefill) {
+      RotateKvRows(kvarn_staging_k_, kvarn_staging_v_, n_tokens, c.num_kv_heads,
+                   pos, stream_, kvarn->staging_first);
+    } else {
+      RotateKvRows(s.kvarn_k, s.kvarn_v, n_tokens, c.num_kv_heads, pos,
+                   stream_);
+      // A group ending inside the pass is quantized before the rows after
+      // it read it (hip::PlanKvarnPass boundary).
+      KvarnQuantizePassBoundary(s.kvarn_k, s.kvarn_v, s.kvarn_records,
+                                s.kv_blocks, c.num_kv_heads, pos, n_tokens,
+                                stream_);
+    }
   }
 
   // Raw keys survive only until pooling. The ring holds the initial
@@ -2656,6 +2845,10 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
              "partial attention output initialization", error_msg)) {
     return false;
   }
+  if (kvarn != nullptr) {
+    return KvarnAttention(l, s, n_tokens, pos, start_pos, mask, last_only,
+                          project_output, out, error_msg);
+  }
   // Queries before the token budget always take the dense tiles, also in a
   // batch that crosses it, so each position's key sweep (and its rounding)
   // does not depend on where the prefill chunks fall. The sparse part goes
@@ -2712,6 +2905,128 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   const std::uint32_t q_dim = c.AttentionQDim();
   const std::size_t ctx_count = static_cast<std::size_t>(n_tokens) * q_dim;
   // A decode batch's output projection reads the gate's Q8_1 rows.
+  if (project_output && split && l.attn_out.type == GgmlType::kQ8_0 &&
+      l.attn_out.cols == q_dim && UnpaddedQ8(q_dim) &&
+      SigmoidMulQ8_1(s_.ctx, s_.attn_gate, ctx_count, s_.ctx_q8_1, stream_)) {
+    return Dense(l.attn_out, Q8Input{s_.ctx, s_.ctx_q8_1, n_tokens, q_dim}, out,
+                 error_msg);
+  }
+  SigmoidMul(s_.ctx, s_.attn_gate, ctx_count, stream_);
+  return !project_output || Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
+}
+
+bool Executor::KvarnAttention(const DeviceLayer& l,
+                              const Session::AttentionState& s,
+                              std::uint32_t n_tokens, const std::uint32_t* pos,
+                              std::uint32_t start_pos,
+                              const std::uint32_t* mask, bool last_only,
+                              bool project_output, float* out,
+                              std::string* error_msg) const {
+  const Config& c = config();
+  const KvarnPass& pass = *s.kvarn_pass;
+  const std::uint32_t kv_row = c.AttentionKvDim();
+  const std::size_t row_bytes = std::size_t{kv_row} * sizeof(__half);
+  const KvarnReadView view{
+      .k_fp16 = s.kvarn_k,
+      .v_fp16 = s.kvarn_v,
+      .k_staging = pass.prefill ? kvarn_staging_k_ : nullptr,
+      .v_staging = pass.prefill ? kvarn_staging_v_ : nullptr,
+      .staging_first = pass.staging_first,
+      .records = s.kvarn_records,
+      .blocks = s.kv_blocks,
+      .quant_end = pass.prefill ? pass.quant_end : 0,
+      .kv_heads = c.num_kv_heads};
+  // Scores and context in the rotated frame: H q . H k = q . k, and the
+  // context rotates back before the output gate.
+  RotateHeadRows(s_.q, n_tokens * c.num_heads, stream_);
+  bool attended = false;
+  if (pass.prefill && MatrixRows(n_tokens)) {
+    // The FP16 path's split: queries before the token budget take the dense
+    // tiles. A prompt chunk reads one fixed record range, so the fused
+    // kernel's shared key tiles hold for every query.
+    const std::uint32_t dense_rows =
+        mask != nullptr && start_pos < c.indexer_top_k
+            ? std::min(n_tokens, c.indexer_top_k - start_pos)
+            : 0;
+    const auto at = [&](std::uint32_t row) {
+      return std::size_t{row} * c.AttentionQDim();
+    };
+    attended =
+        (dense_rows == n_tokens ||
+         WmmaCausalAttention(
+             s_.q + at(dense_rows), nullptr, nullptr, nullptr,
+             mask ? mask + std::size_t{dense_rows} * mask_words_ : nullptr,
+             mask_words_, s_.ctx + at(dense_rows), n_tokens - dense_rows,
+             start_pos + dense_rows, c.num_heads, c.num_kv_heads, c.head_dim,
+             c.compress_ratio, stream_, last_only, s.kv_blocks, &view)) &&
+        (dense_rows == 0 || (last_only && dense_rows != n_tokens) ||
+         WmmaCausalAttention(
+             s_.q, nullptr, nullptr, nullptr, nullptr, mask_words_, s_.ctx,
+             dense_rows, start_pos, c.num_heads, c.num_kv_heads, c.head_dim,
+             c.compress_ratio, stream_, last_only, s.kv_blocks, &view));
+  }
+  // Passes read records by each query's own position (KvarnReadGroups), so
+  // their rows run one per query as decode steps do.
+  const bool split = !MatrixRows(n_tokens);
+  if (!attended) {
+    rocm::Attention(
+        s_.q, nullptr, nullptr, mask, mask_words_, s_.ctx,
+        split ? s_.attn_partials : nullptr, kAttnSplits, n_tokens, pos,
+        c.num_heads, c.num_kv_heads, c.head_dim, c.compress_ratio, stream_,
+        split ? s_.attn_lists : nullptr, split ? s_.attn_counts : nullptr,
+        c.compress_ratio > 0 ? c.indexer_top_k / c.compress_ratio : 0,
+        s.kv_blocks, &view);
+  }
+  RotateHeadRows(s_.ctx, n_tokens * c.num_heads, stream_);
+  if (pass.prefill) {
+    // Quantize the groups the chunk completed from staging, then keep its
+    // sink rows and its recent rows.
+    const std::uint32_t end = start_pos + n_tokens;
+    const std::uint32_t first =
+        pass.staging_first == 0 ? 1
+                                : pass.staging_first >> hip::kKvarnGroupShift;
+    const std::uint32_t complete = end >> hip::kKvarnGroupShift;
+    if (complete > first)
+      KvarnQuantizeGroups(kvarn_staging_k_, kvarn_staging_v_, 0,
+                          s.kvarn_records, 0, s.kv_blocks, c.num_kv_heads, 1,
+                          first, complete - first, stream_, pass.staging_first);
+    const auto copy = [&](std::size_t to, std::uint32_t from_position,
+                          std::uint32_t rows) {
+      const std::size_t from = from_position - pass.staging_first;
+      return rows == 0 ||
+             (Check(hipMemcpyAsync(s.kvarn_k + to * kv_row,
+                                   kvarn_staging_k_ + from * kv_row,
+                                   rows * row_bytes, hipMemcpyDeviceToDevice,
+                                   stream_),
+                    "KVarN chunk rows", error_msg) &&
+              Check(hipMemcpyAsync(s.kvarn_v + to * kv_row,
+                                   kvarn_staging_v_ + from * kv_row,
+                                   rows * row_bytes, hipMemcpyDeviceToDevice,
+                                   stream_),
+                    "KVarN chunk rows", error_msg));
+    };
+    if (pass.staging_first == 0 &&
+        !copy(0, 0, std::min(end, hip::kKvarnSinkTokens)))
+      return false;
+    // The ring keeps every row a later pass may rewind into
+    // (hip::PlanKvarnPass): the groups starting within one ring of the end.
+    // Pieces split at group starts, where the ring may wrap.
+    constexpr std::uint32_t kGroup = hip::kKvarnGroupTokens;
+    const std::uint32_t reach =
+        end > hip::kKvarnTailRingTokens
+            ? (end - hip::kKvarnTailRingTokens + kGroup - 1) / kGroup * kGroup
+            : 0;
+    for (std::uint32_t p =
+             std::max({hip::kKvarnSinkTokens, pass.staging_first, reach});
+         p < end;) {
+      const std::uint32_t piece = std::min(end, (p / kGroup + 1) * kGroup);
+      if (!copy(hip::KvarnFp16Row(p), p, piece - p))
+        return false;
+      p = piece;
+    }
+  }
+  const std::uint32_t q_dim = c.AttentionQDim();
+  const std::size_t ctx_count = static_cast<std::size_t>(n_tokens) * q_dim;
   if (project_output && split && l.attn_out.type == GgmlType::kQ8_0 &&
       l.attn_out.cols == q_dim && UnpaddedQ8(q_dim) &&
       SigmoidMulQ8_1(s_.ctx, s_.attn_gate, ctx_count, s_.ctx_q8_1, stream_)) {
@@ -3140,6 +3455,12 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   const std::uint32_t start_pos = session.position_;
   if (!session.CheckCancellation(error_msg))
     return false;
+  if (session.kvarn_ && checkpoint) {
+    AssignError(error_msg, "KVarN sessions take no in-pass checkpoints");
+    return false;
+  }
+  if (session.kvarn_ && !PlanKvarn(session, start_pos, n, error_msg))
+    return false;
   if (session.mtp_enabled_ && prefill_phase &&
       session.mtp_.position != start_pos) {
     AssignError(error_msg,
@@ -3253,6 +3574,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   if (sparse) {
     session.blocks_ = complete;
   }
+  if (session.kvarn_ && !FinishKvarn(session, error_msg))
+    return false;
   if (session.mtp_enabled_ && prefill_phase && n > 1) {
     // Every successor except the last one is already known. Consume it while
     // the trunk residual is still in shared scratch. MtpBody reads that
@@ -3518,6 +3841,10 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
   return true;
 }
 
+/// KVarN sessions' payloads (records, FP16 sink and tail rows in place of
+/// the FP16 K/V of the trunk layers). FP16 payloads keep kSnapshotMagic.
+constexpr std::array<char, 8> kSnapshotKvarnMagic{'Q', 'F', 'N', 'S',
+                                                  'N', 'A', 'P', 'K'};
 constexpr std::array<char, 8> kSnapshotMagic{'Q', 'F', 'N', 'S',
                                              'N', 'A', 'P', '6'};
 
@@ -3560,7 +3887,7 @@ namespace {
 SnapshotHeader MakeSnapshotHeader(const Config& c, bool has_mtp,
                                   const Session& session) {
   SnapshotHeader h{};
-  h.magic = kSnapshotMagic;
+  h.magic = session.kvarn() ? kSnapshotKvarnMagic : kSnapshotMagic;
   h.num_layers = c.num_layers;
   h.full_attention_interval = c.full_attention_interval;
   h.conv_elems = (c.ssm_conv_kernel - 1) * c.SsmConvChannels();
@@ -3654,10 +3981,41 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
   for (std::uint32_t il = 0; il < h.num_layers; ++il) {
     if (((il + 1) % h.full_attention_interval) == 0) {
       const auto* at = attention(il);
-      if (!region(at != nullptr ? at->k_cache : nullptr, kv_bytes, "K cache",
-                  std::uint64_t{h.kv_row} * sizeof(__half)) ||
-          !region(at != nullptr ? at->v_cache : nullptr, kv_bytes, "V cache",
-                  std::uint64_t{h.kv_row} * sizeof(__half))) {
+      if (h.magic == kSnapshotKvarnMagic) {
+        // The sink, the records of every group before the position's group
+        // floor (FinishKvarn keeps them quantized) and the FP16 tail rows
+        // after it, all copied when captured: a rewind can requantize a
+        // group and the ring is rewritten. Records lie in group order in
+        // the session's private span (identity block table).
+        const std::uint32_t base = std::max(
+            hip::kKvarnSinkTokens,
+            h.position >> hip::kKvarnGroupShift << hip::kKvarnGroupShift);
+        const std::uint64_t row = std::uint64_t{h.kv_row} * sizeof(__half);
+        const std::uint64_t sink =
+            std::min(h.position, hip::kKvarnSinkTokens) * row;
+        const std::uint64_t record =
+            std::uint64_t{h.kv_row / hip::kKvarnHeadDim} *
+            hip::KvarnRecord(4, hip::KvarnValueOrder::kTokenMajor).bytes;
+        const std::uint64_t records =
+            std::uint64_t{(base >> hip::kKvarnGroupShift) - 1} * record;
+        const std::uint64_t tail =
+            h.position > base ? std::uint64_t{h.position - base} * row : 0;
+        const std::size_t tail_row = hip::KvarnFp16Row(base) * h.kv_row;
+        if (!region(at != nullptr ? at->kvarn_k : nullptr, sink,
+                    "KVarN K sink") ||
+            !region(at != nullptr ? at->kvarn_v : nullptr, sink,
+                    "KVarN V sink") ||
+            !region(at != nullptr ? at->kvarn_records + record : nullptr,
+                    records, "KVarN records") ||
+            !region(at != nullptr ? at->kvarn_k + tail_row : nullptr, tail,
+                    "KVarN K tail") ||
+            !region(at != nullptr ? at->kvarn_v + tail_row : nullptr, tail,
+                    "KVarN V tail"))
+          return 0;
+      } else if (!region(at != nullptr ? at->k_cache : nullptr, kv_bytes,
+                         "K cache", std::uint64_t{h.kv_row} * sizeof(__half)) ||
+                 !region(at != nullptr ? at->v_cache : nullptr, kv_bytes,
+                         "V cache", std::uint64_t{h.kv_row} * sizeof(__half))) {
         return 0;
       }
       // Serialize only unpooled rows, in chronological order. The physical
@@ -4199,6 +4557,22 @@ bool Executor::RestoreSnapshot(Session& session,
   session.RestoreVisionLayout(layout, stream_);
   session.position_ = h.position;
   session.blocks_ = h.blocks;
+  if (session.kvarn_) {
+    // The payload's records end at the group floor and its ring rows start
+    // there, so a rewind before it must be refused: written_end is raised
+    // past the ring's reach of the group before (hip::PlanKvarnPass).
+    const std::uint32_t base =
+        std::max(hip::kKvarnSinkTokens,
+                 h.position >> hip::kKvarnGroupShift << hip::kKvarnGroupShift);
+    session.kvarn_tail_ = {
+        .flushed_end = base,
+        .written_end =
+            base == hip::kKvarnSinkTokens
+                ? h.position
+                : std::max(h.position, base + hip::kKvarnTailRingTokens -
+                                           hip::kKvarnGroupTokens + 1)};
+    session.kvarn_pass_ = {};
+  }
   session.mtp_.position = h.mtp_position;
   session.mtp_.blocks = h.mtp_blocks;
   session.mtp_.residual_valid = h.mtp_residual_valid != 0;

@@ -38,9 +38,49 @@ inline const std::uint32_t* KvarnFp16Rows() noexcept {
 /// in a KVarN FP16 sink/tail ring (hip::KvarnFp16Row, rows of kv_heads x 256
 /// halves) in place by the normalized 256-point Hadamard, as the KVarN
 /// store writes them (src/core/hip/detail/kvarn_device.hpp Fwht256).
+/// With `staging_first` other than kKvarnRingRows the rows are a contiguous
+/// staging buffer whose row 0 holds that position.
+inline constexpr std::uint32_t kKvarnRingRows = ~0U;
 void RotateKvRows(__half* k_rows, __half* v_rows, std::uint32_t n_tokens,
                   std::uint32_t kv_heads, const std::uint32_t* start_pos,
-                  hipStream_t stream);
+                  hipStream_t stream,
+                  std::uint32_t staging_first = kKvarnRingRows);
+
+/// Rotates `rows` FP32 rows of 256 in place by the normalized Hadamard: the
+/// queries into, and the attention context out of, the KVarN frame.
+void RotateHeadRows(float* x, std::uint32_t rows, hipStream_t stream);
+
+/// One layer's KVarN K/V as the attention kernels read it
+/// (plan/exl3/F1-KVARN-DESIGN.md 4). Position j of a query at position p is
+///   * a staging row when `k_staging` is set and j >= staging_first (the rows
+///     a prompt chunk writes, and the ring rows before it);
+///   * a sink row for j < 128;
+///   * a k4v4 token-major record row for j < quant_end, or with quant_end
+///     zero for j < 128 * (1 + hip::KvarnReadGroups(p)) (decode and passes);
+///   * otherwise a tail ring row (hip::KvarnFp16Row).
+/// Rows are in the rotated frame: rotate queries in and the context out.
+struct KvarnReadView {
+  const __half* k_fp16{nullptr};  ///< [kKvarnFp16Tokens][kv_heads * 256]
+  const __half* v_fp16{nullptr};
+  const __half* k_staging{nullptr};
+  const __half* v_staging{nullptr};
+  std::uint32_t staging_first{0};
+  const std::uint8_t* records{nullptr};  ///< this layer's record plane
+  const std::uint32_t* blocks{nullptr};  ///< block table; null: plane row g
+  std::uint32_t quant_end{0};
+  std::uint32_t kv_heads{0};
+};
+
+/// The in-pass group flush of one layer: when the pass of `n_tokens` rows at
+/// *start_pos ends a group (hip::PlanKvarnPass boundary), quantizes it from
+/// the ring into its record; otherwise does nothing. Reads the position on
+/// the device, so a captured decode graph replays it at any position.
+void KvarnQuantizePassBoundary(const __half* k_fp16, const __half* v_fp16,
+                               std::uint8_t* records,
+                               const std::uint32_t* kv_blocks,
+                               std::uint32_t kv_heads,
+                               const std::uint32_t* start_pos,
+                               std::uint32_t n_tokens, hipStream_t stream);
 
 /// Quantizes groups [first_group, first_group + groups) of `layers` layers
 /// from the rotated FP16 tail ring (`fp16_layer_elements` halves per layer
@@ -53,7 +93,8 @@ void KvarnQuantizeGroups(const __half* k_rows, const __half* v_rows,
                          std::size_t records_layer_pitch,
                          const std::uint32_t* kv_blocks, std::uint32_t kv_heads,
                          std::uint32_t layers, std::uint32_t first_group,
-                         std::uint32_t groups, hipStream_t stream);
+                         std::uint32_t groups, hipStream_t stream,
+                         std::uint32_t staging_first = kKvarnRingRows);
 
 /// Stable per-prefix rollback addresses. Growing the depth does not move
 /// existing buffers or invalidate graphs captured for a smaller batch.
@@ -537,7 +578,8 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
                hipStream_t stream, std::uint32_t* lists = nullptr,
                std::uint32_t* counts = nullptr, std::uint32_t list_capacity = 0,
-               const std::uint32_t* kv_blocks = nullptr);
+               const std::uint32_t* kv_blocks = nullptr,
+               const KvarnReadView* kvarn = nullptr);
 
 /// Maximum visible sparse context for this WMMA geometry, or zero when the
 /// geometry is unsupported. Checkpoint planning uses the same dispatch limit.
@@ -561,7 +603,8 @@ bool WmmaCausalAttention(const float* q, const float* gate,
                          std::uint32_t kv_heads, std::uint32_t d,
                          std::uint32_t ratio, hipStream_t stream,
                          bool last_only = false,
-                         const std::uint32_t* kv_blocks = nullptr);
+                         const std::uint32_t* kv_blocks = nullptr,
+                         const KvarnReadView* kvarn = nullptr);
 
 /// counts[e] = number of (token, slot) pairs routed to expert e.
 void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,

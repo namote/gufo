@@ -2543,7 +2543,9 @@ public:
     // supply file fingerprints when disk caching is disabled. Its model
     // lifetime is an exact process-local identity; durable caches still
     // require the validated full artifact fingerprints below.
-    if (!artifact_fingerprint.empty()) {
+    // KVarN K/V have no continuation components yet: such a server keeps no
+    // prefix cache, snapshots or persistence (plan/exl3/F1-RESULTS.md).
+    if (!artifact_fingerprint.empty() && !model_->Kvarn()) {
       persistence_ = TextRunnerPersistenceDescriptor{
           .compatibility_identity = QwenFlashNextCompatibilityIdentity(
               artifact_fingerprint, use_mtp_ ? mtp_fingerprint : std::string{},
@@ -2569,7 +2571,9 @@ public:
     }
   }
 
-  [[nodiscard]] bool UsesComponentCache() const override { return true; }
+  [[nodiscard]] bool UsesComponentCache() const override {
+    return !model_->Kvarn();
+  }
   [[nodiscard]] std::unique_ptr<ComponentCacheResources>
   CreateComponentCacheResources(cache::ResourceLedger& ledger,
                                 std::size_t ram) const override {
@@ -2597,21 +2601,22 @@ public:
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
     return {
         .model_id = model_->ModelName(),
-        .state_abi = std::string(kQwenFlashNextStateAbi),
+        .state_abi = std::string(kQwenFlashNextStateAbi) +
+                     (model_->Kvarn() ? "+kvarn-k4v4" : ""),
         .max_context = max_context_,
         .capabilities =
             TextRunnerCapabilities{
                 .incremental_prefill = true,
-                .snapshot = true,
-                .fork = true,
+                .snapshot = !model_->Kvarn(),
+                .fork = !model_->Kvarn(),
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
                 .multi_token_decode = use_mtp_,
                 .batched_multi_token_decode = use_mtp_,
                 .batched_multi_token_decode_max_width = use_mtp_ ? 8u : 0u,
-                .prefix_reuse = true,
-                .in_pass_checkpoint = true,
-                .partial_prefill_retention = true,
+                .prefix_reuse = !model_->Kvarn(),
+                .in_pass_checkpoint = !model_->Kvarn(),
+                .partial_prefill_retention = !model_->Kvarn(),
             },
         .persistence = persistence_,
     };
@@ -3327,6 +3332,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .decode_concurrency = static_cast<std::uint32_t>(
                 std::clamp<std::size_t>(session_count, 1, 8)),
             .rope_scaling = rope_scaling,
+            .kvarn = resolved_kv_cache_type == cli::KvCacheType::kKvarnK4V4,
         },
         &load_error);
     if (model == nullptr) {
