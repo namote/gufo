@@ -1211,23 +1211,15 @@ void LaunchExl3PrefillGemmGrouped(const Exl3GemmProblem* problems,
   HIP_CHECK(hipGetLastError());
 }
 
-void LaunchExl3PrefillBucketInner(const quant::exl3::DeviceLinear* device_bank,
-                                  const Exl3PrefillBucket* device_buckets,
-                                  const std::uint32_t* device_bucket_count,
-                                  std::uint32_t max_buckets,
-                                  std::uint32_t tile_rows,
-                                  const std::uint16_t* input, float* inner,
-                                  std::uint32_t k, std::uint32_t n,
-                                  hipStream_t stream) {
-  if (!Exl3GemmShapeSupported(k, n, quant::exl3::BitRate{5, false},
-                              quant::exl3::Codebook::kMul1) ||
-      tile_rows == 0 || tile_rows > 64 || max_buckets > 65535 ||
-      device_bank == nullptr || device_buckets == nullptr ||
-      device_bucket_count == nullptr || input == nullptr || inner == nullptr) {
-    throw std::invalid_argument("EXL3 bucket GEMM: unsupported call");
-  }
-  if (max_buckets == 0)
-    return;
+namespace {
+
+template<int Bits>
+void LaunchBucketTiles(const quant::exl3::DeviceLinear* device_bank,
+                       const Exl3PrefillBucket* device_buckets,
+                       const std::uint32_t* device_bucket_count,
+                       std::uint32_t max_buckets, std::uint32_t tile_rows,
+                       const std::uint16_t* input, float* inner,
+                       std::uint32_t k, std::uint32_t n, hipStream_t stream) {
   using gufo::core::GgmlType;
   // 128 weight rows per block; the token tile is the smallest of 16/32/64
   // covering tile_rows. Every tile accumulates each output over k in the
@@ -1241,11 +1233,11 @@ void LaunchExl3PrefillBucketInner(const quant::exl3::DeviceLinear* device_bank,
   constexpr auto kStore = HalfEpilogue::kStore;
   if (tile_rows <= 16)
     args(HalfPrefillGemmKernel<128, 16, 8, 1, GgmlType::kQ8_0, kStore, false,
-                               GgmlType::kQ8_0, 5, 2>,
+                               GgmlType::kQ8_0, Bits, 2>,
          256);
   else if (tile_rows <= 32)
     args(HalfPrefillGemmKernel<128, 32, 4, 2, GgmlType::kQ8_0, kStore, false,
-                               GgmlType::kQ8_0, 5, 2>,
+                               GgmlType::kQ8_0, Bits, 2>,
          256);
   else
     // Four waves (2 x 2), each decoding eight tiles per stage: 15-17 % less
@@ -1253,8 +1245,57 @@ void LaunchExl3PrefillBucketInner(const quant::exl3::DeviceLinear* device_bank,
     // expert shapes (188 vs 218 VGPRs; tools/bench/exl3_x3_tiles_bench.hip),
     // bit-identical (the same K order per output).
     args(HalfPrefillGemmKernel<128, 64, 2, 2, GgmlType::kQ8_0, kStore, false,
-                               GgmlType::kQ8_0, 5, 2>,
+                               GgmlType::kQ8_0, Bits, 2>,
          128);
+}
+
+}  // namespace
+
+void LaunchExl3PrefillBucketInner(const quant::exl3::DeviceLinear* device_bank,
+                                  const Exl3PrefillBucket* device_buckets,
+                                  const std::uint32_t* device_bucket_count,
+                                  std::uint32_t max_buckets,
+                                  std::uint32_t tile_rows,
+                                  const std::uint16_t* input, float* inner,
+                                  std::uint32_t k, std::uint32_t n,
+                                  quant::exl3::BitRate rate,
+                                  hipStream_t stream) {
+  if (!Exl3GemmShapeSupported(k, n, rate, quant::exl3::Codebook::kMul1) ||
+      tile_rows == 0 || tile_rows > 64 || max_buckets > 65535 ||
+      device_bank == nullptr || device_buckets == nullptr ||
+      device_bucket_count == nullptr || input == nullptr || inner == nullptr) {
+    throw std::invalid_argument("EXL3 bucket GEMM: unsupported call");
+  }
+  if (max_buckets == 0)
+    return;
+  const auto launch = [&]<int Bits>() {
+    LaunchBucketTiles<Bits>(device_bank, device_buckets, device_bucket_count,
+                            max_buckets, tile_rows, input, inner, k, n,
+                            stream);
+  };
+  switch (rate.bits) {
+    case 1:
+      launch.template operator()<1>();
+      break;
+    case 2:
+      launch.template operator()<2>();
+      break;
+    case 3:
+      launch.template operator()<3>();
+      break;
+    case 4:
+      launch.template operator()<4>();
+      break;
+    case 5:
+      launch.template operator()<5>();
+      break;
+    case 6:
+      launch.template operator()<6>();
+      break;
+    default:
+      launch.template operator()<7>();
+      break;
+  }
   HIP_CHECK(hipGetLastError());
 }
 

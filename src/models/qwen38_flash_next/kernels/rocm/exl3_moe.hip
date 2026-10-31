@@ -488,57 +488,6 @@ __global__ void BucketDownFallback(const ex::DeviceLinear* bank,
   }
 }
 
-template<int Bits>
-__global__ void BucketInnerGemv(const ex::DeviceLinear* bank,
-                                const Exl3ExpertBucket* buckets,
-                                const unsigned* bucket_count,
-                                const std::uint16_t* input, float* output,
-                                unsigned k, unsigned n) {
-  if (blockIdx.y >= *bucket_count)
-    return;
-  const auto bucket = buckets[blockIdx.y];
-  const unsigned first_row = blockIdx.z * 8;
-  if (first_row >= bucket.count)
-    return;
-  const auto& l = bank[bucket.expert];
-  const unsigned rows = min(8U, bucket.count - first_row);
-  const unsigned lane = threadIdx.x, r0 = (lane % 4) * 2, nt = blockIdx.x;
-  const bool valid = l.rate.bits == Bits && !l.rate.half &&
-                     l.codebook == ex::Codebook::kMul1 && l.k == k && l.n == n;
-  float a[8]{}, b[8]{};
-  if (valid) {
-    const auto lw = arithmetic::MakeLaneWindow<Bits>(lane);
-    const auto* trellis = reinterpret_cast<const std::uint32_t*>(l.trellis);
-    const auto* x = reinterpret_cast<const _Float16*>(input);
-    for (unsigned kt = 0; kt < k / 16; ++kt) {
-      Half2 w[4];
-      arithmetic::DecodeLaneMul1<Bits>(
-          trellis + (std::size_t{kt} * (n / 16) + nt) * (8 * Bits), lw, w);
-      for (unsigned r = 0; r < rows; ++r) {
-        const auto* row =
-            x + std::size_t{bucket.first + first_row + r} * k + kt * 16 + r0;
-        const Half2 v01{row[0], row[1]}, v89{row[8], row[9]};
-        a[r] = __builtin_amdgcn_fdot2(w[0], v01, a[r], false);
-        a[r] = __builtin_amdgcn_fdot2(w[1], v89, a[r], false);
-        b[r] = __builtin_amdgcn_fdot2(w[2], v01, b[r], false);
-        b[r] = __builtin_amdgcn_fdot2(w[3], v89, b[r], false);
-      }
-    }
-  }
-  for (unsigned r = 0; r < rows; ++r) {
-    a[r] += __shfl_xor(a[r], 1, 32);
-    b[r] += __shfl_xor(b[r], 1, 32);
-    a[r] += __shfl_xor(a[r], 2, 32);
-    b[r] += __shfl_xor(b[r], 2, 32);
-    if (lane % 4 == 0) {
-      auto* y =
-          output + std::size_t{bucket.first + first_row + r} * n + nt * 16;
-      y[lane / 4] = valid ? a[r] : __builtin_nanf("");
-      y[lane / 4 + 8] = valid ? b[r] : __builtin_nanf("");
-    }
-  }
-}
-
 __global__ void RestoreDownBuckets(const ex::DeviceLinear* bank,
                                    const unsigned* offsets, unsigned experts,
                                    const std::int32_t* exponents, float* output,
@@ -927,17 +876,11 @@ void Exl3PrefillBucketInner(const ex::DeviceLinear* bank,
       input == nullptr || inner == nullptr ||
       (tile_rows != 16 && tile_rows != 32 && tile_rows != 64))
     throw std::invalid_argument("invalid Flash-Next bucket shape");
+  // The shared X3 bucket WMMA takes every integer rate (K3..K7 here).
   WithRate(rate, [&]<int Bits>() {
-    if constexpr (Bits == 5) {
-      gufo::hip::LaunchExl3PrefillBucketInner(bank, buckets, bucket_count,
-                                              max_buckets, tile_rows, input,
-                                              inner, k, n, stream);
-    } else if (max_buckets != 0) {
-      hipLaunchKernelGGL((BucketInnerGemv<Bits>),
-                         dim3(n / 16, max_buckets, (tile_rows + 7) / 8),
-                         dim3(32), 0, stream, bank, buckets, bucket_count,
-                         input, inner, k, n);
-    }
+    gufo::hip::LaunchExl3PrefillBucketInner(bank, buckets, bucket_count,
+                                            max_buckets, tile_rows, input,
+                                            inner, k, n, rate, stream);
   });
   Check();
 }

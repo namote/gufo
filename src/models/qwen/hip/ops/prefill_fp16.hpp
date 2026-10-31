@@ -52,9 +52,10 @@ void LaunchExl3PrefillGemmGrouped(const Exl3GemmProblem* problems,
 // [rows][n], both packed; rows past count are neither read nor written. The
 // count is read on the device (graph-replay safe). Each value depends only
 // on its own input row and expert, never on the partition into buckets,
-// tile_rows or its position in a tile. Bank entries must be mul1 K5 with
-// this k and n (checked on the device: a mismatching bucket writes NaN);
-// k and n multiples of 128, tile_rows 1..64 (16/32/64 are the tuned tiles).
+// tile_rows or its position in a tile. Bank entries must be mul1 at `rate`
+// (integer K1..K7) with this k and n (checked on the device: a mismatching
+// bucket writes NaN); k and n multiples of 128, tile_rows 1..64 (16/32/64
+// are the tuned tiles).
 void LaunchExl3PrefillBucketInner(const quant::exl3::DeviceLinear* device_bank,
                                   const Exl3PrefillBucket* device_buckets,
                                   const std::uint32_t* device_bucket_count,
@@ -62,6 +63,7 @@ void LaunchExl3PrefillBucketInner(const quant::exl3::DeviceLinear* device_bank,
                                   std::uint32_t tile_rows,
                                   const std::uint16_t* input, float* inner,
                                   std::uint32_t k, std::uint32_t n,
+                                  quant::exl3::BitRate rate,
                                   hipStream_t stream);
 // Optional residual and sum_out preserve the FP32 residual link; sum_out may
 // alias input. The normalization reduction matches LaunchBatchedRMSNorm.
