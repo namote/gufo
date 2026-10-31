@@ -65,6 +65,15 @@ if (ENGINE_ENABLE_HIP)
   add_qwen27b_test(qwen27b_exl3_kernel_test exl3_kernel_test.hip
     "hip;gpu;exl3;kernels;correctness")
   target_link_libraries(qwen27b_exl3_kernel_test PRIVATE hip::host)
+  add_qwen27b_test(qwen27b_plain_prefill_stable_test
+    plain_prefill_stable_test.hip "hip;gpu;kernels;correctness")
+  # The verbatim SmallGemmStable reference keeps Flash-Next's kernel flags.
+  target_sources(qwen27b_plain_prefill_stable_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/small_gemm_stable_reference.hip)
+  set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/small_gemm_stable_reference.hip PROPERTIES
+    COMPILE_OPTIONS "-O3;-ffast-math;-fno-finite-math-only;-Wno-switch")
+  target_link_libraries(qwen27b_plain_prefill_stable_test PRIVATE hip::host)
   # The CLI tests drive the gufo binary, which Windows does not build yet.
   if (TARGET gufo)
     add_test(NAME qwen27b.cli-options COMMAND ${Python3_EXECUTABLE}

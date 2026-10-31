@@ -40,6 +40,7 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_gemm.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_quant_gemm.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_fp16.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/plain_prefill_stable.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_quant_wave64.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/small_batch_wave64.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/small_batch_quant16_wave64.hip
