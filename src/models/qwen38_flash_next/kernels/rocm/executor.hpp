@@ -543,6 +543,8 @@ public:
     /// actual grouped rotation/GEMM calls. Plain rows retain FP32 arithmetic.
     std::uint64_t prefill_dense_rows{0}, prefill_dense_rotation_groups{0},
         prefill_dense_gemm_groups{0}, prefill_plain_rows{0};
+    /// Plain prefill rows using LDS weight reuse instead of SmallGemmStable.
+    std::uint64_t prefill_plain_tiled_rows{0};
     /// Exclusive call wall times. draft_ms/catch_up_ms include inline heads;
     /// head_ms covers standalone MtpHeads. Diagnostic count downloads and
     /// synchronization are included; use an uninstrumented run for speed.

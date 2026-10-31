@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "src/models/qwen/hip/ops/plain_prefill_stable.hpp"
 #include "src/models/qwen/vision/device_input.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
@@ -1082,6 +1083,18 @@ void CheckHcDownSilu() {
                "HC reference download");
       if (std::memcmp(scalar.data(), expected.data(), count * sizeof(float)))
         throw std::runtime_error("HC stable baseline changes with width");
+      // Prefill uses the row-tiled stable GEMM followed by the existing
+      // separate SiLU. Check the current fused decode epilogue's exact
+      // store boundary below against this same scalar baseline.
+      gufo::hip::LaunchPlainPrefillStable(gufo::core::GgmlType::kF16, dw, dx,
+                                          reference, rows, m, k, nullptr);
+      q::SiluScale(reference, 0.25F, count, nullptr);
+      CheckHip(hipMemcpy(expected.data(), reference, count * sizeof(float),
+                         hipMemcpyDeviceToHost),
+               "HC tiled prefill download");
+      if (std::memcmp(scalar.data(), expected.data(), count * sizeof(float)))
+        throw std::runtime_error(
+            "HC tiled prefill/SiLU differs from stable bits");
       hipStream_t stream = nullptr;
       hipGraph_t graph = nullptr;
       hipGraphExec_t replay = nullptr;

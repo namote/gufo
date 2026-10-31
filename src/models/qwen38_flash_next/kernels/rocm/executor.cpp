@@ -23,6 +23,7 @@
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/core/platform/pages.hpp"
 #include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
+#include "src/models/qwen/hip/ops/plain_prefill_stable.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
@@ -2208,6 +2209,19 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
   // precision and reduction must not change with phase or cohort width.
   if (w.exl3 != nullptr || model_->output().exl3 != nullptr) {
     try {
+      // Both kernels keep FP32 inputs, exact weight widening, the same four
+      // FMAs per lane per 128-element step, and the xor 16..1 reduction.
+      // Use LDS reuse beyond the small GEMM's eight-row register tile;
+      // crossing this threshold must preserve every output bit.
+      if (prefill_phase && w.exl3 == nullptr && n_tokens > 8 &&
+          (w.type == GgmlType::kF16 || w.type == GgmlType::kBF16 ||
+           w.type == GgmlType::kF32)) {
+        gufo::hip::LaunchPlainPrefillStable(w.type, w.data, x, out, n_tokens,
+                                            w.rows, w.cols, stream_);
+        if (diagnostics_active_)
+          cycle_diagnostics_.prefill_plain_tiled_rows += n_tokens;
+        return true;
+      }
       const auto piece = std::max<std::uint32_t>(1, options_.max_batch);
       for (std::uint32_t first = 0; first < n_tokens; first += piece) {
         const auto count = std::min(piece, n_tokens - first);

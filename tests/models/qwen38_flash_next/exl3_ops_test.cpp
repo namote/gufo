@@ -18,6 +18,7 @@
 
 #include "src/core/hip/detail/exl3_gemv.hpp"
 #include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
+#include "src/models/qwen/hip/ops/plain_prefill_stable.hpp"
 #include "src/models/qwen38_flash_next/exl3_weights.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hpp"
@@ -1282,6 +1283,13 @@ void PlainOperandPrecision() {
                             std::min(chunk, rows - first), {}, nullptr, false);
       SameBits(expected, gpu::ExecutorTestAccess::Read<float>(y, rows * n),
                "plain projection vs exact FP64 cancellation result");
+      Check(hipMemset(y, 0xFF, rows * n * sizeof(float)));
+      for (unsigned first = 0; first < rows; first += chunk)
+        gufo::hip::LaunchPlainPrefillStable(
+            type, plain.data, x + first * k, y + first * n,
+            std::min(chunk, rows - first), n, k, nullptr);
+      SameBits(expected, gpu::ExecutorTestAccess::Read<float>(y, rows * n),
+               "tiled plain prefill retains FP32 cancellation result");
     }
     auto rounded = input;
     for (auto& v : rounded)
@@ -1292,6 +1300,92 @@ void PlainOperandPrecision() {
     Require(std::ranges::all_of(narrowed, [](float v) { return v == 0; }),
             "witness must expose FP16 input's loss of the nonzero dot product");
   }
+}
+
+void PlainPrefillStable() {
+  BeginCase("tiled plain prefill vs current SmallGemmStable bytes and FP64");
+  using gufo::core::GgmlType;
+  using Access = gpu::ExecutorTestAccess;
+  constexpr unsigned rows = 65, n = 33;
+  std::mt19937 rng(0xF3316U);
+  std::uniform_real_distribution<float> random(-0.125F, 0.125F);
+  // k=512 selects the reference's vector-load specialization for <=8 rows;
+  // ragged k exercises the masked-step break and partial four-element step.
+  for (unsigned k : {1U, 127U, 128U, 129U, 132U, 512U})
+    for (auto type : {GgmlType::kF16, GgmlType::kBF16, GgmlType::kF32}) {
+      Buffers buffers;
+      std::vector<float> input(rows * k), weights(n * k);
+      for (auto& v : input)
+        v = random(rng);
+      for (auto& v : weights)
+        v = random(rng);
+      const void* w = nullptr;
+      gpu::WeightType wt = gpu::WeightType::kF32;
+      if (type == GgmlType::kF32) {
+        w = buffers.Copy(weights);
+      } else {
+        wt = type == GgmlType::kF16 ? gpu::WeightType::kF16
+                                    : gpu::WeightType::kBF16;
+        std::vector<std::uint16_t> bits(weights.size());
+        for (std::size_t i = 0; i < bits.size(); ++i) {
+          bits[i] = type == GgmlType::kF16
+                        ? ex::HalfFromDouble(weights[i])
+                        : std::bit_cast<std::uint32_t>(weights[i]) >> 16;
+          weights[i] = type == GgmlType::kF16
+                           ? float(ex::HalfToDouble(bits[i]))
+                           : std::bit_cast<float>(std::uint32_t{bits[i]} << 16);
+        }
+        w = buffers.Copy(bits);
+      }
+      auto* x = buffers.Copy(input);
+      auto* baseline = buffers.Make<float>(rows * n);
+      auto* y = buffers.Make<float>(rows * n + 8);
+      for (unsigned r = 0; r < rows; ++r)
+        gpu::SmallGemmStable(w, wt, x + r * k, baseline + r * n, 1, n, k,
+                             nullptr);
+      const auto scalar = Access::Read<float>(baseline, rows * n);
+      std::vector<float> oracle(rows * n);
+      for (unsigned r = 0; r < rows; ++r)
+        for (unsigned j = 0; j < n; ++j) {
+          double dot = 0;
+          for (unsigned i = 0; i < k; ++i)
+            dot += double(weights[j * k + i]) * input[r * k + i];
+          oracle[r * n + j] = float(dot);
+        }
+      Near(scalar, oracle, 1e-5, "plain stable vs independent FP64");
+      for (unsigned chunk : {1U, 8U, 9U, 15U, 16U, 17U, 32U, 33U, 64U, 65U}) {
+        Check(hipMemset(y, 0xA5, (rows * n + 8) * sizeof(float)));
+        for (unsigned first = 0; first < rows; first += chunk) {
+          const auto count = std::min(chunk, rows - first);
+          gpu::SmallGemmStable(w, wt, x + first * k, baseline + first * n,
+                               count, n, k, nullptr);
+          gufo::hip::LaunchPlainPrefillStable(
+              type, w, x + first * k, y + first * n, count, n, k, nullptr);
+        }
+        SameBits(scalar, Access::Read<float>(baseline, rows * n),
+                 "current stable scalar vs grouped/tail bytes");
+        SameBits(scalar, Access::Read<float>(y, rows * n),
+                 "tiled plain scalar/batch/chunk bytes");
+        const auto guard = Access::Read<std::uint32_t>(y + rows * n, 8);
+        Require(
+            std::ranges::all_of(guard, [](auto v) { return v == 0xA5A5A5A5U; }),
+            "tiled plain ragged output overwrote guard");
+      }
+    }
+  // Padding an entirely invalid step with FMAs can turn an underflowed -0
+  // partial into +0. Compare the live reference, including its signed bytes.
+  Buffers buffers;
+  constexpr unsigned k = 132;
+  auto* w = buffers.Copy(std::vector<float>(n * k, -0x1p-100F));
+  auto* x = buffers.Copy(std::vector<float>(rows * k, 0x1p-100F));
+  auto* baseline = buffers.Make<float>(rows * n);
+  auto* y = buffers.Make<float>(rows * n);
+  gpu::SmallGemmStable(w, gpu::WeightType::kF32, x, baseline, rows, n, k,
+                       nullptr);
+  gufo::hip::LaunchPlainPrefillStable(GgmlType::kF32, w, x, y, rows, n, k,
+                                      nullptr);
+  SameBits(Access::Read<float>(baseline, rows * n),
+           Access::Read<float>(y, rows * n), "underflowed signed-zero chains");
 }
 
 void PrefillScratchEstimate() {
@@ -1413,6 +1507,11 @@ void ExecutorPrefillExperts() {
                 d.prefill_plain_rows != 0,
             "real prefill must group Q/K/V and gate/up, dispatch dense X3, and "
             "retain FP32 plain operands");
+    Require(d.prefill_plain_tiled_rows <= d.prefill_plain_rows &&
+                (chunk <= 8 || d.prefill_plain_tiled_rows != 0) &&
+                (chunk != rows ||
+                 d.prefill_plain_tiled_rows == d.prefill_plain_rows),
+            "wide EXL3 prefill must dispatch tiled stable plain operands");
     Require(std::ranges::all_of(
                 logits, [](float value) { return std::isfinite(value); }),
             "prefill logits are not finite");
@@ -1446,7 +1545,8 @@ void ExecutorPrefillExperts() {
   Require(exec.EndMtpCycleDiagnostics(0, 0, &d, &error), error);
   Require(d.scaled_down_rows == assignments && d.prefill_expert_rows == 0,
           "decode did not dispatch scaled routed down across 64+1 rows");
-  Require(d.prefill_dense_rows == 0 && d.prefill_plain_rows == 0,
+  Require(d.prefill_dense_rows == 0 && d.prefill_plain_rows == 0 &&
+              d.prefill_plain_tiled_rows == 0,
           "decode incorrectly entered prefill dense dispatch");
   const auto exponents = Access::Read<std::int32_t>(routed.down_exponents,
                                                     64 * c.num_experts_used);
@@ -1564,6 +1664,10 @@ void ExecutorGdnPrefill() {
     Require(d.prefill_expert_rows == rows * c.num_layers &&
                 d.prefill_plain_rows != 0 && d.scaled_down_rows == 0,
             "GDN fixture must retain the prefill phase through both layers");
+    Require((chunk <= 8 || d.prefill_plain_tiled_rows != 0) &&
+                (chunk != rows ||
+                 d.prefill_plain_tiled_rows == d.prefill_plain_rows),
+            "wide GDN prefill omitted tiled stable plain projections");
     auto state = Access::GdnState(*session, c);
     result.conv = std::move(state.first);
     result.recurrent = std::move(state.second);
@@ -1655,6 +1759,11 @@ int main(int argc, char** argv) {
     }
     if (argc == 2 && std::string(argv[1]) == "--dense-prefill-only") {
       DensePrefillProjection();
+      PlainOperandPrecision();
+      return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--plain-prefill-only") {
+      PlainPrefillStable();
       PlainOperandPrecision();
       return 0;
     }
