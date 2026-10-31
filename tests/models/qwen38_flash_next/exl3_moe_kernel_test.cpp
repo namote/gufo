@@ -493,6 +493,19 @@ void PrefillDispatch(gpu::Exl3BucketGemm gemm) {
   const auto scaled = Read(s.input, assignments * ff);
   const auto exponents = Read(s.down_exponents, assignments);
   const auto actual = Read(y, assignments * k);
+  auto* control_gate = buffers.Make<float>(assignments * ff);
+  auto* control_up = buffers.Make<float>(assignments * ff);
+  auto* control_down = buffers.Make<float>(assignments * k);
+  ControlGemm(gate.weight.device_exl3, s.buckets, s.bucket_count, s.max_buckets,
+              tile_rows, trace.gate_up_input, control_gate, k, ff, nullptr);
+  ControlGemm(up.weight.device_exl3, s.buckets, s.bucket_count, s.max_buckets,
+              tile_rows, trace.gate_up_input + assignments * k, control_up, k,
+              ff, nullptr);
+  ControlGemm(down.weight.device_exl3, s.buckets, s.bucket_count, s.max_buckets,
+              tile_rows, s.input, control_down, ff, k, nullptr);
+  const auto control_gate_inner = Read(control_gate, assignments * ff);
+  const auto control_up_inner = Read(control_up, assignments * ff);
+  const auto control_down_inner = Read(control_down, assignments * k);
   for (unsigned packed = 0; packed < assignments; ++packed) {
     const unsigned slot = map[packed], expert = ids[slot];
     const float* x = input.data() + (slot / used) * k;
@@ -507,6 +520,12 @@ void PrefillDispatch(gpu::Exl3BucketGemm gemm) {
          "bucket gate FP64 inner stage");
     Near(std::span(up_inner).subspan(packed * ff, ff), ud,
          "bucket up FP64 inner stage");
+    Near(std::span(gate_inner).subspan(packed * ff, ff),
+         std::span(control_gate_inner).subspan(packed * ff, ff),
+         "bucket gate vs FMA control on frozen input");
+    Near(std::span(up_inner).subspan(packed * ff, ff),
+         std::span(control_up_inner).subspan(packed * ff, ff),
+         "bucket up vs FMA control on frozen input");
     auto expected_activation = gate.Restore(expert, gd);
     const auto restored_up = up.Restore(expert, ud);
     for (unsigned j = 0; j < ff; ++j) {
@@ -537,12 +556,32 @@ void PrefillDispatch(gpu::Exl3BucketGemm gemm) {
       expected[j] = restored[j] * ex::HalfToDouble(down.svh[expert * k + j]);
     Near(std::span(actual).subspan(slot * k, k), expected,
          "bucket prefill frozen-input FP64 output");
+    std::vector<float> unscaled_control(k);
+    for (unsigned j = 0; j < k; ++j) {
+      const float raw = control_down_inner[packed * k + j];
+      unscaled_control[j] =
+          exponents[packed] > 0 ? std::ldexp(raw, -exponents[packed]) : raw;
+    }
+    Near(std::span(actual).subspan(slot * k, k),
+         down.Restore(expert, unscaled_control),
+         "bucket down vs widened FMA control on frozen input");
+  }
+  if (gemm == gpu::Exl3PrefillBucketInner) {
+    gpu::Exl3PrefillExperts(layer, dx, di, y, rows, used, tile_rows, s,
+                            nullptr);
+    const auto production = Read(y, assignments * k);
+    Require(std::memcmp(actual.data(), production.data(),
+                        actual.size() * sizeof(float)) == 0,
+            "default production adapter differs from explicit X3");
   }
   hipStream_t stream;
   Check(hipStreamCreate(&stream));
   Check(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal));
-  gpu::Exl3PrefillExperts(layer, dx, di, y, rows, used, tile_rows, s,
-                          ObservedGemm, stream);
+  if (gemm == gpu::Exl3PrefillBucketInner)
+    gpu::Exl3PrefillExperts(layer, dx, di, y, rows, used, tile_rows, s, stream);
+  else
+    gpu::Exl3PrefillExperts(layer, dx, di, y, rows, used, tile_rows, s,
+                            ObservedGemm, stream, nullptr);
   hipGraph_t graph;
   Check(hipStreamEndCapture(stream, &graph));
   hipGraphExec_t executable;
@@ -1056,8 +1095,8 @@ void Buckets(unsigned rows, bool shared, unsigned tile_rows) {
 }
 }  // namespace
 
-// Invoke this same entry point with W3's real callback when it is available;
-// the FMA control adapter below qualifies only the expert-owned stages.
+// Both adapters must pass the independent FP64 stage/output bars, poisoned
+// fallback fixtures and exact partition/reordering contract.
 void QualifyFlashNextExl3PrefillAdapter(gpu::Exl3BucketGemm gemm) {
   Require(gemm != nullptr,
           "prefill adapter qualification needs the actual callback");
@@ -1069,7 +1108,10 @@ void QualifyFlashNextExl3PrefillAdapter(gpu::Exl3BucketGemm gemm) {
 int main() {
   try {
     DownFixtures();
+    std::cout << "CASE FMA control adapter qualification\n";
     QualifyFlashNextExl3PrefillAdapter(ControlGemm);
+    std::cout << "CASE production X3 adapter qualification\n";
+    QualifyFlashNextExl3PrefillAdapter(gpu::Exl3PrefillBucketInner);
     ExpertInvariance(false, nullptr);
     for (unsigned rows : {1U, 2U, 3U, 4U, 7U, 8U, 9U})
       for (bool shared : {false, true})
@@ -1083,6 +1125,8 @@ int main() {
     gpu::Exl3PrefillDown({}, 0, 0, {}, nullptr, nullptr);
     gpu::Exl3RoutedMlp({}, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 10,
                        {}, nullptr);
+    gpu::Exl3PrefillExperts({}, nullptr, nullptr, nullptr, 0, 10, 16, {},
+                            nullptr);
     gpu::Exl3PrefillExperts({}, nullptr, nullptr, nullptr, 0, 10, 16, {},
                             nullptr, nullptr);
     std::cout << "Flash-Next EXL3 expert kernel contracts passed\n";

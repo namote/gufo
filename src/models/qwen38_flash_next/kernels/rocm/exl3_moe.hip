@@ -3,6 +3,7 @@
 
 #include "src/core/hip/detail/exl3_gemv.hpp"
 #include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
+#include "src/models/qwen/hip/ops/prefill_fp16.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
@@ -824,6 +825,28 @@ void PrefillSnapshot(void* destination, const void* source, std::size_t bytes,
     throw std::runtime_error("EXL3 prefill trace copy failed");
 }
 }  // namespace
+
+void Exl3PrefillBucketInner(const ex::DeviceLinear* bank,
+                            const Exl3ExpertBucket* buckets,
+                            const std::uint32_t* bucket_count,
+                            std::uint32_t max_buckets, std::uint32_t tile_rows,
+                            const std::uint16_t* input, float* inner,
+                            std::uint32_t k, std::uint32_t n,
+                            hipStream_t stream) {
+  gufo::hip::LaunchExl3PrefillBucketInner(bank, buckets, bucket_count,
+                                          max_buckets, tile_rows, input, inner,
+                                          k, n, stream);
+  Check();
+}
+
+void Exl3PrefillExperts(const DeviceLayer& layer, const float* x,
+                        const std::int32_t* ids, float* out, std::uint32_t rows,
+                        std::uint32_t used, std::uint32_t tile_rows,
+                        const Exl3PrefillScratch& scratch, hipStream_t stream,
+                        const Exl3PrefillTrace* trace) {
+  Exl3PrefillExperts(layer, x, ids, out, rows, used, tile_rows, scratch,
+                     Exl3PrefillBucketInner, stream, trace);
+}
 
 void Exl3PrefillDown(const DeviceTensor& down, std::uint32_t assignments,
                      std::uint32_t tile_rows, const Exl3PrefillScratch& scratch,

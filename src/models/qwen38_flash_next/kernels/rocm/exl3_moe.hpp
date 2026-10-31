@@ -4,6 +4,7 @@
 #include <hip/hip_runtime.h>
 
 #include "src/core/quant/exl3/reference.hpp"
+#include "src/models/qwen/hip/ops/exl3_prefill_bucket.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
@@ -79,10 +80,7 @@ void Exl3RoutedDown(const DeviceTensor& down, std::uint16_t* input, float* out,
 /// One compact tile of an expert bucket, with contiguous packed input rows.
 /// slots map the bucket rows back to [token * used + expert_slot]. A final
 /// partial tile has count < tile_rows; inactive descriptors have count == 0.
-struct Exl3ExpertBucket {
-  std::uint32_t expert, count, first;
-};
-static_assert(sizeof(Exl3ExpertBucket) == 3 * sizeof(std::uint32_t));
+using Exl3ExpertBucket = gufo::hip::Exl3PrefillBucket;
 
 /// Valid IDs in [0, experts) are required.
 /// Device-only bucket construction; capacities: offsets[experts + 1],
@@ -109,7 +107,7 @@ void Exl3ScatterExpertBuckets(const float* packed, const std::int32_t* slots,
                               float* out, std::uint32_t assignments,
                               std::uint32_t width, hipStream_t stream);
 
-/// Adapter supplied by the shared X3 owner. One call launches all device
+/// Raw-inner adapter signature for qualification. One call launches all device
 /// buckets, bounded by max_buckets, with no host count/descriptor reads.
 /// Input/output are packed [assignments][k/n]. Output MUST be the raw
 /// FP32 inner dot, without H/svh. This model owns restoration, down-row
@@ -120,6 +118,15 @@ using Exl3BucketGemm = void (*)(
     const std::uint32_t* bucket_count, std::uint32_t max_buckets,
     std::uint32_t tile_rows, const std::uint16_t* input, float* output,
     std::uint32_t k, std::uint32_t n, hipStream_t stream);
+
+/// Production adapter: shared X3 WMMA, with no function-pointer casts.
+void Exl3PrefillBucketInner(const quant::exl3::DeviceLinear* bank,
+                            const Exl3ExpertBucket* buckets,
+                            const std::uint32_t* bucket_count,
+                            std::uint32_t max_buckets, std::uint32_t tile_rows,
+                            const std::uint16_t* input, float* inner,
+                            std::uint32_t k, std::uint32_t n,
+                            hipStream_t stream);
 
 struct Exl3PrefillScratch {
   std::uint32_t* offsets{nullptr};        ///< [experts + 1]
@@ -153,16 +160,21 @@ void Exl3PrefillDown(const DeviceTensor& down, std::uint32_t assignments,
                      Exl3BucketGemm gemm, hipStream_t stream,
                      const Exl3PrefillTrace* trace = nullptr);
 
-/// Complete bucketed prefill dispatch, ready for the shared X3 adapter.
+/// Complete bucketed prefill dispatch using the shared X3 production adapter.
 /// Valid, distinct expert IDs per token are required. The caller retains
 /// scratch until all launches finish and performs the ordered MoE sum.
 /// Input/output and all scratch slabs must be disjoint.
 void Exl3PrefillExperts(const DeviceLayer& layer, const float* x,
                         const std::int32_t* ids, float* out, std::uint32_t rows,
                         std::uint32_t used, std::uint32_t tile_rows,
-                        const Exl3PrefillScratch& scratch, Exl3BucketGemm gemm,
-                        hipStream_t stream,
+                        const Exl3PrefillScratch& scratch, hipStream_t stream,
                         const Exl3PrefillTrace* trace = nullptr);
+/// Qualification overload: substitute an independent inner-product control.
+void Exl3PrefillExperts(const DeviceLayer& layer, const float* x,
+                        const std::int32_t* ids, float* out, std::uint32_t rows,
+                        std::uint32_t used, std::uint32_t tile_rows,
+                        const Exl3PrefillScratch& scratch, Exl3BucketGemm gemm,
+                        hipStream_t stream, const Exl3PrefillTrace* trace);
 
 /// Prefix plus unique complete 128-column segments for the dynamic IDs.
 /// Original trellis N stride is retained, and only final logits are gathered.
