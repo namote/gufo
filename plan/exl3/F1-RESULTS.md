@@ -308,6 +308,52 @@ cold는 새 프로세스의 첫 요청(빈 행 캐시), warm은 같은 요청의
 - **창 계획:** `PLAN-F1-K1T.json`(sha `0e214322…`), LOCKS `3771bbec…`. 감독 "start"를 기다린다. 이전 결과는 `f1-k1/f1-k1-unit.attempt-2-diagnosis/`에 있다.
 - **P1 inconclusive 재측정 계획:** `PLAN-F1-REP-{BASE,CAND}.json`. `repetition_sequence`만 대상으로 ABBA × 2, 반복 5, 팔마다 20표본이다. 감독 "start"를 기다린다.
 
+### K1T option-A 창 (2026-10-31 09:55, `f1333e24` 테스트, 이미지 id `3eba25ca`) [확인]
+
+- **결과:** FAILED(`flash-next-kvarn-ops`만), health_PASS, 재시도 없음. 나머지 4개는 다시 통과했다(27B KVarN op 비트 동일 포함). 위치 `f1-k1/f1-k1-unit/`.
+- **실패:** 27B식 Gaussian 데이터에서 32 tile 중 21개만 비트 동일했다(11개 불일치).
+- **원인 [확인]:** 진단 때와 같은 float ulp 동률이다. imbalance가 5–8단계에서 2.00000048로 같고, GPU 열 scale은 5/6/7단계와 같으며 참조는 8단계를 고른다. 11개 중 10개는 코드 차이가 0이다. **k4v4 token-major V는 Gaussian 데이터에서도 동률이 난다.** 그래서 "27B식 데이터는 동률이 없다"는 option-A 가정은 k4v4 token-major V에서 틀렸다. 27B k4v2 테스트는 그대로 비트 동일이다.
+- **결정(감독 2026-10-31, option A의 범위 안):** 테스트만 고친다. 27B와 커널은 그대로다. Gaussian 데이터에도 같은 tie/boundary 허용(코드 3개 이하, FP16 1 ulp)을 적용하고, 허용한 tile마다 종류와 코드 차이를 출력한다. **실제 정확성은 최종 통합 품질 관문(real‖fake KL)에서 판정한다.**
+- **테스트 수정(`fa5ba8af`에 포함):** Gaussian도 허용 검사로 바꿨다. `Near`의 ulp 검사가 부호가 다른 첫 값에서 나머지를 보지 않고 끝내던 문제를 고쳤다(더 엄격해졌다).
+
+## K2/K3: Flash-Next KVarN k4v4 실행기 연결 (2026-10-31, `fa5ba8af`, 브랜치 `ai-tools/f1-paged-kv`)
+
+- **커밋:** `fa5ba8af` feat(qwen38_flash_next): store trunk attention K/V as KVarN k4v4 records.
+- **읽기 경로(kernels):** `KvarnReadView`(staging → sink → 레코드 → ring), per-token `Attention`과 WMMA `WmmaCausalAttention`의 KVarN 변형(템플릿 인자, FP16 경로는 그대로 인스턴스화된다), `RotateHeadRows`(q를 회전 좌표로 넣고 ctx를 되돌린다), 장치 조건부 in-pass 경계 flush `KvarnQuantizePassBoundary`(graph replay에서도 위치로 판정), staging 행을 읽는 `RotateKvRows`/`KvarnQuantizeGroups`.
+- **실행기:**
+  - `SessionKvPlanes`: KVarN이면 trunk 12층은 레코드 plane 하나(블록당 두 그룹), FP16 K/V plane은 MTP 층 하나만 둔다. pooled indexer plane은 그대로다. 세션마다 FP16 sink+ring(384행 × 12층 × K/V)을 따로 할당한다. `SessionBytes`도 같은 식이다.
+  - 실행기마다 staging K/V(`KvarnStagingRows(max_batch)` 행)를 둔다.
+  - `PlanKvarn`(본문 전): pass(≤128행)는 `PlanKvarnPass`, 그보다 긴 prompt chunk는 `PlanKvarnPrefill`로 계획하고, 필요한 그룹을 ring에서 먼저 양자화한다. `FinishKvarn`(성공 뒤): tail을 갱신하고, pass가 그룹 끝에서 끝나면 그 그룹을 바로 양자화한다.
+  - `Attention`: writer 포인터만 바꾼다(pass는 sink/ring 태그 행, chunk는 staging). 그다음 `KvarnAttention`이 attention, chunk 뒤처리(완성 그룹을 staging에서 양자화, sink 행과 rewind 가능한 마지막 행을 ring에 복사), 출력 gate와 projection을 맡는다. pass는 질의마다 `KvarnReadGroups`로 읽으므로 per-token kernel을 쓴다. chunk는 고정 `quant_end`로 WMMA를 쓴다.
+  - `ForwardBatch`: 세션마다 같은 plan/finish를 부른다.
+  - 스냅샷: magic `QFNSNAPK`. sink, 그룹 바닥 전까지의 레코드, 바닥 뒤 ring 행을 private 영역으로 복사한다. 복원 뒤 바닥보다 앞으로의 rewind는 거절한다(그 그룹 FP16 행이 payload에 없다).
+  - in-pass checkpoint와 continuation adapter는 KVarN을 거절한다.
+- **서버/CLI:** `--kv-cache-type kvarn-k4v4`(기존 canonical 옵션, alias 없음)를 Flash-Next에 허용한다. k4v2는 이름을 대며 거절한다. 기본값은 fp16 그대로다. KVarN 서버는 state ABI `qwen38-flash-next-rocm-session-v1+kvarn-k4v4`를 쓰고, component cache, prefix reuse, snapshot/fork, in-pass checkpoint, persistence를 끈다. 레코드 형식의 디스크 캐시 identity는 component가 생길 때 정한다(지금은 디스크 캐시 없음).
+- **K0 `--real`:** `qwen38_flash_next_kvarn_k0 --dump-reference FILE`(FP16 실행)과 `--real FILE`(KVarN 실행)의 두 프로세스로, 기준 FP16 logits에 대해 teacher-forced KL, top-1, 자유 생성 일치를 잰다.
+- **빌드 [확인]:** 포맷 PASS. nix 테스트 빌드 `/nix/store/v72kjw6jn11l323jm2rzj5wy4a0smgms-gufo-f1-k2-tests-0-unstable-dirty`(gufo, CLI 테스트, op 테스트, K0, session/snapshot/adapter 테스트, 모두 컴파일). 이미지 `ai-tools/gufo-eval:f1-k2-tests-rocm101` id `62616023`, 라벨 `fa5ba8af…`.
+
+### K2T 창 (2026-10-31 10:07, `PLAN-F1-K2T.json` `f1-k2-unit`, 한 번) [확인]
+
+- **결과:** COMPLETE, 3개 모두 PASS, health_PASS. 위치 `f1-k2/f1-k2-unit/`.
+  - `kv_cache_type_test` PASS.
+  - Flash-Next `kvarn_ops` PASS:
+    - writer, 회전 비트 동일.
+    - 레코드: Gaussian exact 21 / tie 9 / boundary 2, uniform 23 / 0 / 9, stretched 21 / 8 / 3. 불일치 0, mirror 0. 코드가 다른 tile은 최대 2개 차이다.
+    - `RotateHeadRows` 오차 0.
+    - **읽기 경로:** chunk 2개(sink에서 시작, ring 행 staging), pass 9종(in-pass 경계, rewind 뒤 재양자화, 그룹 끝 flush)의 14회 실행이 모두 연속 FP16 참조와 **비트 단위로 같다**(max abs 0).
+  - Flash-Next `attention_ops` PASS(49 s, FP16 kernel이 템플릿 분리 뒤에도 그대로임을 확인).
+
+### Codex F2(fn-exl3)와 충돌 지점
+
+- `Executor::Attention`의 fused `AttentionF16Gemm` / `Dense(attn_qkv)` + `PrepareAttention` 호출(F2-DESIGN.md:240-266의 projection 호출 지점). F1은 이 호출들에서 K/V writer 인자(`write_k`, `write_v`, `write_rows`)만 바꿨다. F2가 이 호출을 EXL3 projection으로 바꾸면 merge 때 writer 인자 세 개를 새 호출에 옮겨야 한다.
+- `executor.cpp`의 `CreateSession`/`SessionBytes`(KV plane 배치)와 `executor.hpp`의 `AttentionState`는 F2가 건드리지 않는다고 본다 [짐작].
+
+### 남은 일
+
+- 모델 단계 검사는 최종 통합 창에서 한다: K0 `--real`(real‖fake KL, 27B와 같은 기준), session/snapshot 테스트, KVarN 서버 correctness와 ABBA.
+- [짐작] pass 모드(MTP 검증 폭, 짧은 prompt)는 WMMA 대신 per-token kernel을 쓴다. prefill 단계의 ≤128행 pass가 느려질 수 있다. 최종 창에서 잰다.
+- P2 공유 pool은 하지 않았다(W9 engine.* 관문).
+
 ## ABBA 계획 초안 (P1 정확성 통과 뒤)
 
 - **계획:** `PLAN-F1-ABBA-BASE.json`(이미지 `f1-base-rocm101`, d2b751a9)와 `PLAN-F1-ABBA-CAND.json`(`f1-cand-rocm101`, 766a593e)이다.
