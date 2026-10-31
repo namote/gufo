@@ -119,8 +119,6 @@ bool PlanExl3Prefill(const Config& c, std::uint32_t rows,
       !add(1, sizeof(std::uint32_t)) ||
       !add(assignments * std::max(c.hidden_size, c.expert_ff),
            sizeof(std::uint16_t)) ||
-      !add(assignments * c.expert_ff, sizeof(float)) ||
-      !add(assignments * c.expert_ff, sizeof(float)) ||
       !add(assignments * c.hidden_size, sizeof(float)) ||
       !add(assignments, sizeof(std::int32_t))) {
     AssignError(error, "EXL3 prefill scratch byte size overflows size_t");
@@ -1154,10 +1152,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     pp.bucket_count = Alloc<std::uint32_t>(a, 1, error_msg);
     pp.input = Alloc<std::uint16_t>(a, A * std::max(c.hidden_size, c.expert_ff),
                                     error_msg);
-    pp.gate = f32(A * c.expert_ff);
-    pp.up = f32(A * c.expert_ff);
-    // Each slab, including packed out, has its own allocation. s.down_e
-    // remains in the separate stage arena and receives the scattered rows.
+    // Gate/up borrow the current stage view at dispatch. Packed out must
+    // remain separate from stage down_e, which receives the scattered rows.
     pp.out = f32(A * c.hidden_size);
     pp.down_exponents = Alloc<std::int32_t>(a, A, error_msg);
     e->exl3_prefill_scratch_bytes_ = layout.bytes;
@@ -3521,6 +3517,15 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
   return true;
 }
 
+Exl3PrefillScratch Executor::Exl3PrefillView() const {
+  auto view = exl3_prefill_;
+  // Attention intermediates are dead. Resolve these pointers after any
+  // RowScratch narrowing, rather than retaining the arena's base addresses.
+  view.gate = s_.gate_e;
+  view.up = s_.up_e;
+  return view;
+}
+
 bool Executor::Exl3Experts(const DeviceLayer& l, const float* x, float* out,
                            std::uint32_t rows, std::string* error) const {
   const auto& c = config();
@@ -3547,8 +3552,9 @@ bool Executor::Exl3Experts(const DeviceLayer& l, const float* x, float* out,
       // Selecting decode GEMV by token/bucket width changes the reduction
       // tree when a Sync/checkpoint boundary moves. X3 is a phase contract,
       // not a minimum-row heuristic; its 64-row tile never changes here.
+      const auto scratch = Exl3PrefillView();
       Exl3PrefillExperts(l, x, s_.ids, s_.down_e, rows, c.num_experts_used,
-                         kExl3PrefillTileRows, exl3_prefill_, stream_);
+                         kExl3PrefillTileRows, scratch, stream_);
       if (diagnostics_active_) {
         cycle_diagnostics_.prefill_expert_rows += rows;
         cycle_diagnostics_.expert_tile_reads_complete = false;

@@ -55,8 +55,21 @@ struct ExecutorTestAccess {
     Hip(hipMemcpy(session.mtp_.target_hidden, hidden.data(),
                   hidden.size_bytes(), hipMemcpyHostToDevice));
   }
-  static const Exl3PrefillScratch& PrefillScratch(const Executor& exec) {
-    return exec.exl3_prefill_;
+  static Exl3PrefillScratch PrefillScratch(const Executor& exec) {
+    return exec.Exl3PrefillView();
+  }
+  static bool PrefillBorrowsStage(const Executor& exec, unsigned offset) {
+    const auto base = exec.s_;
+    exec.UseScratch(exec.RowScratch(base, offset));
+    const auto view = exec.Exl3PrefillView();
+    exec.UseScratch(base);
+    const auto elements = std::size_t{offset} * exec.config().num_experts_used *
+                          exec.config().expert_ff;
+    return exec.exl3_prefill_.gate == nullptr &&
+           exec.exl3_prefill_.up == nullptr &&
+           view.gate == base.gate_e + elements &&
+           view.up == base.up_e + elements &&
+           view.out == exec.exl3_prefill_.out;
   }
   static const Exl3Scratch& RoutedScratch(const Executor& exec) {
     return exec.exl3_;
@@ -1091,10 +1104,10 @@ void PrefillScratchEstimate() {
       gpu::Executor::EstimateExl3PrefillScratchBytes(c, 4096, &error);
   const auto through =
       gpu::Executor::EstimateExl3PrefillScratchBytes(c, 4224, &error);
-  Require(chunk == 839204360, "4096-row disjoint scratch byte count");
-  Require(through == 865429240, "4224-row tail-capacity scratch byte count");
-  std::cout << "MEMORY EXL3 prefill P4096=" << chunk << " bytes (800.328 MiB)"
-            << " P4224=" << through << " bytes (825.338 MiB)\n";
+  Require(chunk == 629489160, "4096-row additional scratch byte count");
+  Require(through == 649160440, "4224-row tail-capacity scratch byte count");
+  std::cout << "MEMORY EXL3 prefill P4096=" << chunk << " bytes (600.328 MiB)"
+            << " P4224=" << through << " bytes (619.088 MiB)\n";
   Require(gpu::Executor::EstimateExl3PrefillScratchBytes(c, 0, &error) == 0 &&
               !error.empty(),
           "zero-row scratch must be rejected");
@@ -1125,7 +1138,11 @@ void ExecutorPrefillExperts() {
   Require(exec.exl3_prefill_scratch_bytes() ==
               gpu::Executor::EstimateExl3PrefillScratchBytes(c, rows),
           "allocated prefill bytes differ from host estimate");
-  // Check all persistent slabs, including the caller's assignment output.
+  Require(Access::PrefillBorrowsStage(exec, 0) &&
+              Access::PrefillBorrowsStage(exec, 1) &&
+              Access::PrefillBorrowsStage(exec, rows - 1),
+          "prefill gate/up must borrow the current RowScratch stage view");
+  // Check all live slabs, including borrowed gate/up and assignment output.
   // An alias can appear to work for a single expert, then fail under scatter.
   const std::vector<std::pair<const void*, std::size_t>> slabs{
       {pp.offsets, (c.num_experts + 1) * sizeof(std::uint32_t)},

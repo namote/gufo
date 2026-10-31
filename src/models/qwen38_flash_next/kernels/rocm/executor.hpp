@@ -511,8 +511,8 @@ public:
   [[nodiscard]] std::uint32_t PrefillChunkRows(
       std::uint32_t requested, std::uint32_t until_checkpoint) const noexcept;
   /// Host-only estimate of the disjoint persistent bucket slabs. Zero means
-  /// invalid geometry (error_msg explains); excludes existing s_.down_e and
-  /// the decode path's 64 * used exponents. Uses the production 64-row tile.
+  /// invalid geometry (error_msg explains); excludes existing stage gate/up,
+  /// s_.down_e and the decode path's 64 * used exponents. Uses a 64-row tile.
   [[nodiscard]] static std::size_t EstimateExl3PrefillScratchBytes(
       const Config& config, std::uint32_t rows,
       std::string* error_msg = nullptr);
@@ -850,6 +850,7 @@ private:
   Exl3Scratch exl3_{};
   Exl3PrefillScratch exl3_prefill_{};
   std::size_t exl3_prefill_scratch_bytes_{0};
+  [[nodiscard]] Exl3PrefillScratch Exl3PrefillView() const;
   bool Exl3Group(std::initializer_list<const DeviceTensor*> weights,
                  std::initializer_list<float*> outputs, const float* x,
                  std::uint32_t rows, std::string* error) const;
