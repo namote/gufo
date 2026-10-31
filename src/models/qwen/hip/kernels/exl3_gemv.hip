@@ -532,7 +532,7 @@ template<unsigned M>
 void LaunchPass(std::span<const Exl3FastTarget> targets, const float* x,
                 std::size_t x_stride, unsigned rows, std::size_t first_row,
                 const Exl3FastWorkspace& ws, hipStream_t stream,
-                bool input_rotated) {
+                bool input_rotated, std::size_t shape_basis_n) {
   const auto& first = *targets[0].linear;
   auto* slab = reinterpret_cast<_Float16*>(ws.input);
   RotateArgs rotate{};
@@ -564,6 +564,12 @@ void LaunchPass(std::span<const Exl3FastTarget> targets, const float* x,
         Exl3RotateInputKernel<M>,
         dim3((segments + kRotateWaves - 1) / kRotateWaves, M, gemv.slots),
         dim3(kRotateWaves * 32), 0, stream, x, x_stride, rows, first.k, rotate);
+  }
+  if (shape_basis_n != 0) {
+    // The launch geometry of the group whose outputs total shape_basis_n:
+    // a subset launch then splits K into the same waves and reduces each
+    // output exactly as that group's launch does.
+    blocks_two_tiles = static_cast<unsigned>(shape_basis_n / 32);
   }
   LaunchGemvBits<M>(first.rate.bits, gemv,
                     PickShape(first.k / 16, blocks_two_tiles), stream);
@@ -691,13 +697,16 @@ void LaunchExl3FastProjections(std::span<const Exl3FastTarget> targets,
                                const float* x, std::size_t x_stride,
                                std::size_t rows,
                                const Exl3FastWorkspace& workspace,
-                               hipStream_t stream, bool input_rotated) {
+                               hipStream_t stream, bool input_rotated,
+                               std::size_t shape_basis_n) {
   if (!Exl3FastGroupSupported(targets, workspace) || rows == 0 ||
-      rows > kExl3FastMaxRows || (input_rotated && rows != 1)) {
+      rows > kExl3FastMaxRows || (input_rotated && rows != 1) ||
+      shape_basis_n % 32 != 0) {
     throw std::invalid_argument("EXL3 fast projection: unsupported call");
   }
   if (input_rotated) {
-    LaunchPass<1>(targets, x, x_stride, 1, 0, workspace, stream, true);
+    LaunchPass<1>(targets, x, x_stride, 1, 0, workspace, stream, true,
+                  shape_basis_n);
     return;
   }
   for (std::size_t first = 0; first < rows; first += exl3::kMaxRows) {
@@ -706,16 +715,16 @@ void LaunchExl3FastProjections(std::span<const Exl3FastTarget> targets,
     const float* xp = x + first * x_stride;
     if (pass == 1) {
       LaunchPass<1>(targets, xp, x_stride, pass, first, workspace, stream,
-                    false);
+                    false, shape_basis_n);
     } else if (pass == 2) {
       LaunchPass<2>(targets, xp, x_stride, pass, first, workspace, stream,
-                    false);
+                    false, shape_basis_n);
     } else if (pass <= 4) {
       LaunchPass<4>(targets, xp, x_stride, pass, first, workspace, stream,
-                    false);
+                    false, shape_basis_n);
     } else {
       LaunchPass<8>(targets, xp, x_stride, pass, first, workspace, stream,
-                    false);
+                    false, shape_basis_n);
     }
   }
 }

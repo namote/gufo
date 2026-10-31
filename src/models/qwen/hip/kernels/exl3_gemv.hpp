@@ -92,11 +92,18 @@ void LaunchExl3RotateRows(const float* x, std::size_t x_stride,
 /// group must pass Exl3FastGroupSupported; 1 <= rows <= kExl3FastMaxRows.
 /// With input_rotated (rows == 1 only) the slabs already hold the rotated
 /// row (LaunchExl3FastRmsNorm) and x is not read.
+///
+/// shape_basis_n (a multiple of 32; 0 = these targets) is the total output
+/// width of the group whose launch geometry (waves splitting K, tiles per
+/// wave) to use. The geometry decides each output's reduction order, so a
+/// subset of a group (e.g. k and v without q) launched with the full group's
+/// total n gives every target the bits of the full-group launch.
 void LaunchExl3FastProjections(std::span<const Exl3FastTarget> targets,
                                const float* x, std::size_t x_stride,
                                std::size_t rows,
                                const Exl3FastWorkspace& workspace,
-                               hipStream_t stream, bool input_rotated = false);
+                               hipStream_t stream, bool input_rotated = false,
+                               std::size_t shape_basis_n = 0);
 
 /// A SwiGLU MLP: out = down(silu(x gate) * (x up)). gate_y and up_y are
 /// [8][gate.n] FP32 scratch rows (the pre-activation sums).
