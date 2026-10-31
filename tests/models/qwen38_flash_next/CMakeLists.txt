@@ -37,6 +37,10 @@ target_link_libraries(qwen38_flash_next_reference_probe PRIVATE
 set_source_files_properties(reference_probe.cpp PROPERTIES COMPILE_OPTIONS "-O2")
 
 if (ENGINE_ENABLE_HIP)
+  add_executable(qwen38_flash_next_rq_logits EXCLUDE_FROM_ALL fn_rq_logits.cpp)
+  target_link_libraries(qwen38_flash_next_rq_logits PRIVATE
+    gufo_qwen38_flash_next hip::host)
+
   add_qwen38_flash_next_test(exl3_ops gufo_qwen38_flash_next_reference "hip;gpu;gfx1151;exl3")
   set_source_files_properties(exl3_ops_test.cpp PROPERTIES LANGUAGE HIP)
   foreach(name IN ITEMS mtp_ops blaslt_ops hc_mix_ops gdn_ops

@@ -4771,6 +4771,32 @@ bool Executor::RestoreSnapshot(Session& session,
   return true;
 }
 
+bool Executor::ReplayOutputHead(std::uint32_t batch_rows,
+                                std::span<float> logits,
+                                std::string* error_msg) const {
+  const auto& c = config();
+  const auto rows = logits.size() / c.vocab_size;
+  if (batch_rows == 0 || batch_rows > options_.max_batch || rows == 0 ||
+      rows > batch_rows || rows > options_.max_logit_rows ||
+      logits.size() % c.vocab_size != 0) {
+    AssignError(error_msg, "invalid output head replay rows");
+    return false;
+  }
+  DropReadyQ8();
+  q8t_src_ = nullptr;
+  half_src_ = nullptr;
+  PrefillPhase head_phase(false);
+  return HcMix(model_->hc_head(), s_.res + (batch_rows - rows) * c.HcDim(),
+               false, s_.mixed, nullptr, static_cast<std::uint32_t>(rows),
+               error_msg) &&
+         Dense(model_->output(), s_.mixed, s_.logits,
+               static_cast<std::uint32_t>(rows), error_msg) &&
+         Check(hipMemcpyAsync(logits.data(), s_.logits, logits.size_bytes(),
+                              hipMemcpyDeviceToHost, stream_),
+               "output head replay download", error_msg) &&
+         Check(hipStreamSynchronize(stream_), "output head replay", error_msg);
+}
+
 bool Executor::ReadVerificationRows(std::uint32_t row, std::span<float> logits,
                                     std::string* error_msg) const {
   const auto vocab = config().vocab_size;

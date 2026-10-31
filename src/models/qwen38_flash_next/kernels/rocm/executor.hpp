@@ -346,6 +346,14 @@ public:
                              PrefillCheckpoint* checkpoint = nullptr,
                              std::span<const std::int32_t> next = {}) const;
 
+  /// Quality-probe replay of the last Forward's output head, with the same
+  /// batch width and requested tail. Call immediately after an AR Forward,
+  /// before any other executor operation reuses scratch. Does not advance
+  /// session state. `logits` must have n_logits * vocab elements.
+  [[nodiscard]] bool ReplayOutputHead(std::uint32_t batch_rows,
+                                      std::span<float> logits,
+                                      std::string* error_msg) const;
+
   struct BatchItem {
     Session* session;
     std::span<const std::int32_t> tokens;
