@@ -7,7 +7,11 @@ Checks (all must pass; headers only, no tensor data is read):
   config      config.json quantization_config equals the values recorded in plan/exl3/F2-PLAN.md section 2.
   storage     every tensor listed in quantization_config.json tensor_storage exists in the safetensors
               files (shards plus ngram_embedding.safetensors) with the recorded shape, dtype and byte size,
-              and every stored tensor is listed (MTP, vision and the patch file are reported, not required).
+              and every stored tensor is listed, except the parameters of non-leaf modules that upstream
+              does not list (quant_config.py lists leaf modules only: GDN A_log, dt_bias, conv1d and the
+              PLE conv1d) and the MTP, vision and patch-file tensors, which are checked by `side` instead.
+  side        trellis K (= last dim / 16): MTP experts and indexer 5 (1,537 tensors), MTP attention and
+              shared expert 7 (-hq, 7), MTP fc_embedding/fc_hidden 6 (2); vision 6 (164).
   bits        EXL3 bits per category match F2-PLAN.md: experts 5, GDN/attention/shared expert 7,
               indexer 5, lm_head 6; router, in_proj_a/b, hyper-connections, PLE projections not EXL3;
               73,728 expert tensors; n-gram trellis int16 [320001536, 61].
@@ -79,10 +83,19 @@ def main() -> int:
             elif (h["shape"], h["dtype"], h["bytes"]) != (t["shape"], DTYPE.get(t["dtype"], t["dtype"]), t["n_bytes"]):
                 bad.append({"tensor": name, "header": [h["shape"], h["dtype"], h["bytes"]], "listed": [t["shape"], t["dtype"], t["n_bytes"]]})
     unlisted = sorted(k for k in hdr if k not in listed)
-    unlisted_main = [k for k in unlisted if not (k.startswith("mtp.") or k.startswith("model.visual.") or hdr[k]["file"].startswith("mtp_"))]
+    side = [k for k in unlisted if k.startswith("mtp.") or k.startswith("model.visual.") or hdr[k]["file"].startswith("mtp_")]
+    nonleaf = re.compile(r"\.(linear_attn\.(A_log|dt_bias|conv1d\.weight)|ple\.conv1d\.weight)$")
+    unlisted_nonleaf = [k for k in unlisted if k not in side and nonleaf.search(k)]
+    unlisted_main = [k for k in unlisted if k not in side and k not in unlisted_nonleaf]
     rep["checks"]["storage"] = {"PASS": not (bad or missing or unlisted_main), "listed": len(listed), "header_tensors": len(hdr),
                                 "mismatch": bad[:20], "missing": missing[:20], "unlisted_main": unlisted_main[:20],
-                                "unlisted_mtp_vision_patch": len(unlisted) - len(unlisted_main)}
+                                "unlisted_nonleaf": len(unlisted_nonleaf), "unlisted_mtp_vision_patch": len(side)}
+    ks = collections.defaultdict(collections.Counter)
+    for k in side:
+        if k.endswith(".trellis"):
+            ks["mtp" if k.startswith("mtp.") else "vision"][hdr[k]["shape"][-1] // 16] += 1
+    rep["checks"]["side"] = {"PASS": dict(ks["mtp"]) == {5: 1537, 7: 7, 6: 2} and dict(ks["vision"]) == {6: 164},
+                             "trellis_K": {g: {str(k): n for k, n in c.items()} for g, c in ks.items()}}
 
     cats = collections.defaultdict(collections.Counter)
     wrong = []
@@ -111,7 +124,7 @@ def main() -> int:
     a.out.parent.mkdir(parents=True, exist_ok=True)
     a.out.write_text(json.dumps(rep, indent=1) + "\n")
     print(json.dumps({"PASS": rep["PASS"], **{k: {kk: vv for kk, vv in v.items() if kk in ("PASS", "differs", "listed", "header_tensors",
-          "mismatch", "missing", "unlisted_main", "unlisted_mtp_vision_patch", "expert_tensors", "categories", "wrong", "entries", "bad")}
+          "mismatch", "missing", "unlisted_main", "unlisted_nonleaf", "unlisted_mtp_vision_patch", "trellis_K", "expert_tensors", "categories", "wrong", "entries", "bad")}
           for k, v in rep["checks"].items()}}, indent=1))
     return 0 if rep["PASS"] else 1
 
