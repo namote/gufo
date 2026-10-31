@@ -302,49 +302,112 @@ __global__ void RestoreActivateRotate(const ex::DeviceLinear* gate,
   }
 }
 
-// One thread per expert counts without atomics. The prefix pass has no
-// allocation or host synchronization and zeroes inactive descriptors, which
-// lets a bounded WMMA launch consume it safely during graph replay.
-__global__ void CountBuckets(const std::int32_t* ids, unsigned assignments,
-                             unsigned experts, unsigned* offsets) {
-  const unsigned expert = blockIdx.x * blockDim.x + threadIdx.x;
-  if (expert >= experts)
-    return;
+// Bucket construction, all on the device and atomic-free, so it is
+// deterministic and graph-replay safe. One 256-thread block per expert scans
+// the IDs (L2-resident) to count, then again to emit its slots in assignment
+// order; one block turns the counts into offsets and descriptors and zeroes
+// the inactive tail. (A thread per expert over all IDs, the former shape,
+// left the GPU nearly idle: 0.55 + 0.87 ms per layer at pp2048.)
+__global__ __launch_bounds__(256) void CountBuckets(const std::int32_t* ids,
+                                                    unsigned assignments,
+                                                    unsigned* offsets) {
+  const unsigned expert = blockIdx.x;
   unsigned count = 0;
-  for (unsigned slot = 0; slot < assignments; ++slot)
+  for (unsigned slot = threadIdx.x; slot < assignments; slot += 256)
     count += ids[slot] == static_cast<int>(expert);
-  offsets[expert + 1] = count;
+  for (unsigned offset = 16; offset != 0; offset >>= 1)
+    count += __shfl_xor(count, offset, 32);
+  __shared__ unsigned partial[8];
+  if (threadIdx.x % 32 == 0)
+    partial[threadIdx.x / 32] = count;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    unsigned total = 0;
+    for (unsigned w = 0; w < 8; ++w)
+      total += partial[w];
+    offsets[expert + 1] = total;
+  }
 }
 
-__global__ void DescribeBuckets(unsigned* offsets, unsigned experts,
-                                unsigned tile_rows, Exl3ExpertBucket* buckets,
-                                unsigned* bucket_count, unsigned capacity) {
-  if (threadIdx.x != 0)
-    return;
-  unsigned first = 0, count = 0;
-  offsets[0] = 0;
-  for (unsigned expert = 0; expert < experts; ++expert) {
-    const unsigned rows = offsets[expert + 1];
-    offsets[expert + 1] = first + rows;
-    for (unsigned row = 0; row < rows; row += tile_rows)
-      buckets[count++] = {expert, min(tile_rows, rows - row), first + row};
-    first += rows;
+__global__ __launch_bounds__(1024) void DescribeBuckets(
+    unsigned* offsets, unsigned experts, unsigned tile_rows,
+    Exl3ExpertBucket* buckets, unsigned* bucket_count, unsigned capacity) {
+  // Exclusive scans of rows and buckets per expert, 1024 experts at a time.
+  __shared__ unsigned rows_scan[1024], tiles_scan[1024];
+  __shared__ unsigned carry_rows, carry_tiles;
+  const unsigned tid = threadIdx.x;
+  if (tid == 0) {
+    carry_rows = 0;
+    carry_tiles = 0;
   }
-  *bucket_count = count;
-  for (unsigned i = count; i < capacity; ++i)
+  __syncthreads();
+  for (unsigned base = 0; base < experts; base += 1024) {
+    const unsigned expert = base + tid;
+    const unsigned rows = expert < experts ? offsets[expert + 1] : 0;
+    const unsigned tiles = (rows + tile_rows - 1) / tile_rows;
+    rows_scan[tid] = rows;
+    tiles_scan[tid] = tiles;
+    __syncthreads();
+    // Hillis-Steele inclusive scan (exact integer sums).
+    for (unsigned step = 1; step < 1024; step <<= 1) {
+      const unsigned r = tid >= step ? rows_scan[tid - step] : 0;
+      const unsigned t = tid >= step ? tiles_scan[tid - step] : 0;
+      __syncthreads();
+      rows_scan[tid] += r;
+      tiles_scan[tid] += t;
+      __syncthreads();
+    }
+    const unsigned first = carry_rows + rows_scan[tid] - rows;
+    unsigned bucket = carry_tiles + tiles_scan[tid] - tiles;
+    if (expert < experts) {
+      offsets[expert + 1] = first + rows;
+      for (unsigned row = 0; row < rows; row += tile_rows)
+        buckets[bucket++] = {expert, min(tile_rows, rows - row), first + row};
+    }
+    __syncthreads();
+    if (tid == 1023) {
+      carry_rows += rows_scan[1023];
+      carry_tiles += tiles_scan[1023];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    offsets[0] = 0;
+    *bucket_count = carry_tiles;
+  }
+  for (unsigned i = carry_tiles + tid; i < capacity; i += 1024)
     buckets[i] = {};
 }
 
-__global__ void FillBucketSlots(const std::int32_t* ids, unsigned assignments,
-                                unsigned experts, const unsigned* offsets,
-                                std::int32_t* slots) {
-  const unsigned expert = blockIdx.x * blockDim.x + threadIdx.x;
-  if (expert >= experts)
-    return;
+__global__ __launch_bounds__(256) void FillBucketSlots(const std::int32_t* ids,
+                                                       unsigned assignments,
+                                                       const unsigned* offsets,
+                                                       std::int32_t* slots) {
+  // Stable compaction of this expert's slots, 256 IDs per step: a wave
+  // ballot ranks the lanes, the eight wave totals rank the waves.
+  const unsigned expert = blockIdx.x, tid = threadIdx.x;
+  const unsigned lane = tid % 32, wave = tid / 32;
+  __shared__ unsigned wave_counts[8];
   unsigned next = offsets[expert];
-  for (unsigned slot = 0; slot < assignments; ++slot)
-    if (ids[slot] == static_cast<int>(expert))
-      slots[next++] = slot;
+  for (unsigned base = 0; base < assignments; base += 256) {
+    const unsigned slot = base + tid;
+    const bool hit =
+        slot < assignments && ids[slot] == static_cast<int>(expert);
+    const auto mask = static_cast<unsigned>(__ballot(hit));
+    const unsigned before = __popc(mask & ((1U << lane) - 1U));
+    if (lane == 0)
+      wave_counts[wave] = __popc(mask);
+    __syncthreads();
+    unsigned wave_base = 0, total = 0;
+    for (unsigned w = 0; w < 8; ++w) {
+      wave_base += w < wave ? wave_counts[w] : 0;
+      total += wave_counts[w];
+    }
+    if (hit)
+      slots[next + wave_base + before] = static_cast<std::int32_t>(slot);
+    next += total;
+    __syncthreads();
+  }
 }
 
 __device__ __forceinline__ unsigned BucketExpert(const unsigned* offsets,
@@ -388,6 +451,47 @@ __global__ void RotateBuckets(const ex::DeviceLinear* bank, const float* input,
     reinterpret_cast<_Float16*>(
         output)[std::size_t{packed} * width + first + j] =
         static_cast<_Float16>(scaled);
+  }
+}
+
+// Gate and up rotations of the same gathered rows in one pass: each input
+// element is read once and rotated with both banks' suh, the arithmetic of
+// two RotateBuckets launches.
+__global__ void RotateGateUpBuckets(const ex::DeviceLinear* gate,
+                                    const ex::DeviceLinear* up,
+                                    const float* input, std::uint16_t* gate_out,
+                                    std::uint16_t* up_out,
+                                    const unsigned* offsets,
+                                    const std::int32_t* slots, unsigned experts,
+                                    unsigned width, unsigned used) {
+  const unsigned packed = blockIdx.y;
+  if (packed >= offsets[experts])
+    return;
+  const unsigned lo = BucketExpert(offsets, experts, packed);
+  const unsigned row = slots[packed] / used;
+  const unsigned lane = threadIdx.x, first = blockIdx.x * 128 + lane * 4;
+  const auto* gs = reinterpret_cast<const _Float16*>(gate[lo].suh);
+  const auto* us = reinterpret_cast<const _Float16*>(up[lo].suh);
+  float g[4], u[4];
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j) {
+    const float x = input[std::size_t{row} * width + first + j];
+    g[j] = x * static_cast<float>(gs[first + j]);
+    asm volatile("" : "+v"(g[j]));
+    u[j] = x * static_cast<float>(us[first + j]);
+    asm volatile("" : "+v"(u[j]));
+  }
+  arithmetic::Butterfly128(g, lane);
+  arithmetic::Butterfly128(u, lane);
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j) {
+    float a = g[j] * arithmetic::kHadamardScale;
+    asm volatile("" : "+v"(a));
+    float b = u[j] * arithmetic::kHadamardScale;
+    asm volatile("" : "+v"(b));
+    const auto at = std::size_t{packed} * width + first + j;
+    reinterpret_cast<_Float16*>(gate_out)[at] = static_cast<_Float16>(a);
+    reinterpret_cast<_Float16*>(up_out)[at] = static_cast<_Float16>(b);
   }
 }
 
@@ -488,10 +592,13 @@ __global__ void BucketDownFallback(const ex::DeviceLinear* bank,
   }
 }
 
+// destination == nullptr restores in place (packed order); otherwise the
+// restored row goes to destination row slots[row] (the bucket scatter fused).
 __global__ void RestoreDownBuckets(const ex::DeviceLinear* bank,
                                    const unsigned* offsets, unsigned experts,
                                    const std::int32_t* exponents, float* output,
-                                   unsigned width) {
+                                   unsigned width, float* destination,
+                                   const std::int32_t* slots) {
   const unsigned row = blockIdx.y, lane = threadIdx.x;
   if (row >= offsets[experts])
     return;
@@ -510,10 +617,15 @@ __global__ void RestoreDownBuckets(const ex::DeviceLinear* bank,
     asm volatile("" : "+v"(v[j]));
   }
   arithmetic::Butterfly128(v, lane);
+  float* target =
+      destination == nullptr
+          ? output + offset
+          : destination +
+                std::size_t{static_cast<unsigned>(slots[row])} * width + first;
 #pragma unroll
   for (unsigned j = 0; j < 4; ++j)
-    output[offset + j] = (v[j] * arithmetic::kHadamardScale) *
-                         static_cast<float>(svh[first + j]);
+    target[j] = (v[j] * arithmetic::kHadamardScale) *
+                static_cast<float>(svh[first + j]);
 }
 
 __global__ void HeadInput(ex::DeviceLinear l, const float* x,
@@ -821,12 +933,12 @@ void Exl3BuildExpertBuckets(const std::int32_t* ids, std::uint32_t assignments,
       assignments, std::uint64_t{experts} + assignments / tile_rows);
   if (max_buckets < bound)
     throw std::invalid_argument("EXL3 bucket descriptor capacity too small");
-  hipLaunchKernelGGL(CountBuckets, dim3((experts + 63) / 64), dim3(64), 0,
-                     stream, ids, assignments, experts, offsets);
-  hipLaunchKernelGGL(DescribeBuckets, dim3(1), dim3(1), 0, stream, offsets,
+  hipLaunchKernelGGL(CountBuckets, dim3(experts), dim3(256), 0, stream, ids,
+                     assignments, offsets);
+  hipLaunchKernelGGL(DescribeBuckets, dim3(1), dim3(1024), 0, stream, offsets,
                      experts, tile_rows, buckets, bucket_count, max_buckets);
-  hipLaunchKernelGGL(FillBucketSlots, dim3((experts + 63) / 64), dim3(64), 0,
-                     stream, ids, assignments, experts, offsets, slots);
+  hipLaunchKernelGGL(FillBucketSlots, dim3(experts), dim3(256), 0, stream, ids,
+                     assignments, offsets, slots);
   Check();
 }
 
@@ -897,13 +1009,14 @@ void Exl3PrefillExperts(const DeviceLayer& layer, const float* x,
 void Exl3PrefillDown(const DeviceTensor& down, std::uint32_t assignments,
                      std::uint32_t tile_rows, const Exl3PrefillScratch& scratch,
                      Exl3BucketGemm gemm, hipStream_t stream,
-                     const Exl3PrefillTrace* trace) {
+                     const Exl3PrefillTrace* trace, float* scatter_out) {
   if (assignments == 0)
     return;
   if (assignments > scratch.max_assignments || gemm == nullptr ||
       scratch.input == nullptr || scratch.out == nullptr ||
       scratch.down_exponents == nullptr || scratch.offsets == nullptr ||
       scratch.buckets == nullptr || scratch.bucket_count == nullptr ||
+      (scatter_out != nullptr && scratch.slots == nullptr) ||
       (tile_rows != 16 && tile_rows != 32 && tile_rows != 64))
     throw std::invalid_argument(
         "EXL3 prefill down needs bucket scratch and adapter");
@@ -930,7 +1043,7 @@ void Exl3PrefillDown(const DeviceTensor& down, std::uint32_t assignments,
   hipLaunchKernelGGL(RestoreDownBuckets, dim3(down.rows / 128, assignments),
                      dim3(32), 0, stream, down.device_exl3, scratch.offsets,
                      down.experts, scratch.down_exponents, scratch.out,
-                     down.rows);
+                     down.rows, scatter_out, scratch.slots);
   Check();
 }
 
@@ -961,9 +1074,16 @@ void Exl3PrefillExperts(const DeviceLayer& layer, const float* x,
          scratch.max_buckets, tile_rows, scratch.input, target, bank.cols,
          bank.rows, BankRate(bank), stream);
   };
-  Exl3RotateExpertBuckets(g.device_exl3, x, scratch.input, scratch.offsets,
-                          scratch.slots, g.experts, assignments, g.cols, used,
-                          false, stream);
+  // One gathered read of x feeds both rotations. The up rows go to
+  // scratch.out, free until the down projection writes it (it holds
+  // assignments x hidden floats, twice the FP16 slab).
+  if (g.cols != u.cols || u.cols > d.rows * 2)
+    throw std::invalid_argument("EXL3 prefill gate/up widths differ");
+  auto* up_input = reinterpret_cast<std::uint16_t*>(scratch.out);
+  hipLaunchKernelGGL(RotateGateUpBuckets, dim3(g.cols / 128, assignments),
+                     dim3(32), 0, stream, g.device_exl3, u.device_exl3, x,
+                     scratch.input, up_input, scratch.offsets, scratch.slots,
+                     g.experts, g.cols, used);
   if (trace != nullptr)
     PrefillSnapshot(trace->gate_up_input, scratch.input,
                     std::size_t{assignments} * g.cols * sizeof(std::uint16_t),
@@ -972,14 +1092,13 @@ void Exl3PrefillExperts(const DeviceLayer& layer, const float* x,
   if (trace != nullptr)
     PrefillSnapshot(trace->gate_inner, scratch.gate,
                     std::size_t{assignments} * g.rows * sizeof(float), stream);
-  Exl3RotateExpertBuckets(u.device_exl3, x, scratch.input, scratch.offsets,
-                          scratch.slots, u.experts, assignments, u.cols, used,
-                          false, stream);
   if (trace != nullptr && trace->gate_up_input != nullptr)
-    PrefillSnapshot(trace->gate_up_input + assignments * g.cols, scratch.input,
+    PrefillSnapshot(trace->gate_up_input + assignments * g.cols, up_input,
                     std::size_t{assignments} * u.cols * sizeof(std::uint16_t),
                     stream);
-  projection(u, scratch.up);
+  gemm(u.device_exl3, scratch.buckets, scratch.bucket_count,
+       scratch.max_buckets, tile_rows, up_input, scratch.up, u.cols, u.rows,
+       BankRate(u), stream);
   if (trace != nullptr)
     PrefillSnapshot(trace->up_inner, scratch.up,
                     std::size_t{assignments} * u.rows * sizeof(float), stream);
@@ -990,9 +1109,9 @@ void Exl3PrefillExperts(const DeviceLayer& layer, const float* x,
   if (trace != nullptr)
     PrefillSnapshot(trace->activation, scratch.gate,
                     std::size_t{assignments} * g.rows * sizeof(float), stream);
-  Exl3PrefillDown(d, assignments, tile_rows, scratch, gemm, stream, trace);
-  Exl3ScatterExpertBuckets(scratch.out, scratch.slots, out, assignments, d.rows,
-                           stream);
+  // The restore writes each row to its slot: no separate scatter pass.
+  Exl3PrefillDown(d, assignments, tile_rows, scratch, gemm, stream, trace,
+                  out);
   Check();
 }
 

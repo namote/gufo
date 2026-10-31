@@ -89,6 +89,10 @@ int main(int argc, char** argv) {
     run("128x64 bk2 4x2", [&] { Plain<128, 64, 2, 4, 2>(w, xh, y, rows, n, k); });
     run("128x128 bk4 2x4", [&] { Plain<128, 128, 4, 2, 4>(w, xh, y, rows, n, k); });
     run("64x64 bk4 2x4", [&] { Plain<64, 64, 4, 2, 4>(w, xh, y, rows, n, k); });
+    if (n == 320) {
+      run("320x64 bk2 2x4", [&] { Plain<320, 64, 2, 2, 4>(w, xh, y, rows, n, k); });
+      run("320x128 bk2 2x4", [&] { Plain<320, 128, 2, 2, 4>(w, xh, y, rows, n, k); });
+    }
     for (void* p : {static_cast<void*>(w), static_cast<void*>(x),
                     static_cast<void*>(y), static_cast<void*>(y0)})
       Check(hipFree(p));

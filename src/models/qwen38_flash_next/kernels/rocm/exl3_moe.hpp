@@ -157,11 +157,14 @@ struct Exl3PrefillTrace {
 
 /// Consume scratch.input as already-rounded, packed FP16 down rows. This is
 /// also the down stage of Exl3PrefillExperts, including scaling, widened
-/// fallback and restoration. scratch.out receives packed restored output.
+/// fallback and restoration. scratch.out receives the packed raw dots; the
+/// restored rows go back to scratch.out (packed) or, with scatter_out, to
+/// scatter_out row scratch.slots[row] (Exl3ScatterExpertBuckets fused).
 void Exl3PrefillDown(const DeviceTensor& down, std::uint32_t assignments,
                      std::uint32_t tile_rows, const Exl3PrefillScratch& scratch,
                      Exl3BucketGemm gemm, hipStream_t stream,
-                     const Exl3PrefillTrace* trace = nullptr);
+                     const Exl3PrefillTrace* trace = nullptr,
+                     float* scatter_out = nullptr);
 
 /// Complete bucketed prefill dispatch using the shared X3 production adapter.
 /// Valid, distinct expert IDs per token are required. The caller retains

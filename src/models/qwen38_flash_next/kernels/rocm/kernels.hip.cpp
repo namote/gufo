@@ -3777,6 +3777,55 @@ __global__ void MoeEpilogueKernel(const float* expert_out, const float* weights,
                        shared_out[idx];
 }
 
+/// MoeEpilogueKernel's k <= 16 arithmetic, element for element (the same
+/// Materialize-bounded chain and final expression), for four adjacent
+/// elements per thread with 16-byte loads and stores (dim % 4 == 0, aligned).
+__global__ void MoeEpilogueExact4Kernel(const float* expert_out,
+                                        const float* weights,
+                                        const float* shared_out,
+                                        const float* gate,
+                                        std::uint32_t gate_stride, float* out,
+                                        std::uint32_t k, std::uint32_t dim) {
+  const std::uint32_t t = blockIdx.x;
+  const std::uint32_t i = (blockIdx.y * blockDim.x + threadIdx.x) * 4;
+  if (i >= dim) {
+    return;
+  }
+  constexpr std::uint32_t kMaxSlots = 16;
+  const float* rows = expert_out + static_cast<std::size_t>(t) * k * dim + i;
+  float w[kMaxSlots];
+  float4 v[kMaxSlots];
+#pragma unroll
+  for (std::uint32_t s = 0; s < kMaxSlots; ++s) {
+    w[s] = s < k ? weights[t * k + s] : 0.0f;
+    v[s] = s < k ? *reinterpret_cast<const float4*>(
+                       rows + static_cast<std::size_t>(s) * dim)
+                 : float4{0.0f, 0.0f, 0.0f, 0.0f};
+  }
+  const std::size_t idx = static_cast<std::size_t>(t) * dim + i;
+  const float4 sh4 = *reinterpret_cast<const float4*>(shared_out + idx);
+  const float g = gate[static_cast<std::size_t>(t) * gate_stride];
+  float result[4];
+#pragma unroll
+  for (int e = 0; e < 4; ++e) {
+    const float sh = e == 0 ? sh4.x : e == 1 ? sh4.y : e == 2 ? sh4.z : sh4.w;
+    float acc = Materialize(0.0f);
+#pragma unroll
+    for (std::uint32_t s = 0; s < kMaxSlots; ++s) {
+      if (s < k) {
+        const float vs = e == 0   ? v[s].x
+                         : e == 1 ? v[s].y
+                         : e == 2 ? v[s].z
+                                  : v[s].w;
+        acc = Materialize(acc + w[s] * vs);
+      }
+    }
+    result[e] = acc + SigmoidF(g) * sh;
+  }
+  *reinterpret_cast<float4*>(out + idx) =
+      float4{result[0], result[1], result[2], result[3]};
+}
+
 /// Four adjacent output lanes per thread: the same reduction over the top-k
 /// slots with a quarter of the waves, so the per-wave issue overhead no
 /// longer hides the streaming reads.
@@ -8321,6 +8370,18 @@ void MoeEpilogue(const float* expert_out, const float* weights,
                  const float* shared, const float* gate,
                  std::uint32_t gate_stride, float* out, std::uint32_t n_tokens,
                  std::uint32_t k, std::uint32_t dim, hipStream_t stream) {
+  // Same values: the vector kernel repeats the scalar arithmetic per element.
+  const bool aligned = (reinterpret_cast<std::uintptr_t>(expert_out) |
+                        reinterpret_cast<std::uintptr_t>(shared) |
+                        reinterpret_cast<std::uintptr_t>(out)) %
+                           16 ==
+                       0;
+  if (k <= 16 && dim % 4 == 0 && aligned) {
+    hipLaunchKernelGGL(MoeEpilogueExact4Kernel, dim3(n_tokens, Blocks(dim / 4)),
+                       dim3(kThreads), 0, stream, expert_out, weights, shared,
+                       gate, gate_stride, out, k, dim);
+    return;
+  }
   hipLaunchKernelGGL(MoeEpilogueKernel, dim3(n_tokens, Blocks(dim)),
                      dim3(kThreads), 0, stream, expert_out, weights, shared,
                      gate, gate_stride, out, k, dim);
