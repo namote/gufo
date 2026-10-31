@@ -59,6 +59,9 @@ struct ModelOptions {
   /// artifact's own setting, which is always off: no GGUF metadata key sets
   /// it today.
   std::optional<RopeScaling> rope_scaling{};
+  /// Trunk attention K/V as KVarN k4v4 records (`--kv-cache-type
+  /// kvarn-k4v4`, plan/exl3/F1-KVARN-DESIGN.md); the MTP layer stays FP16.
+  bool kvarn = false;
 };
 
 class Session;
@@ -92,6 +95,8 @@ public:
     return options_.max_context;
   }
   [[nodiscard]] bool HasMtp() const noexcept;
+  /// Whether sessions keep trunk K/V as KVarN k4v4 (ModelOptions::kvarn).
+  [[nodiscard]] bool Kvarn() const noexcept { return options_.kvarn; }
   [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {
     return options_.decode_concurrency;
   }

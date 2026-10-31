@@ -231,6 +231,8 @@ struct Binder {
 }  // namespace
 
 std::size_t TensorRef::RowBytes() const noexcept {
+  if (!exl3.empty())
+    return 0;
   const Format f = FormatOf(type);
   if (f.block == 0 || cols % f.block != 0) {
     return 0;

@@ -75,7 +75,7 @@ struct LaneWindow {
 
 template<int K>
 __device__ __forceinline__ LaneWindow MakeLaneWindow(unsigned lane) {
-  static_assert(K >= 1 && K <= 6, "one 64-bit window holds K <= 6 only");
+  static_assert(K >= 1 && K <= 7, "supported integer rates are K1 through K7");
   constexpr int kTileBits = 256 * K;
   constexpr unsigned kWords = 8 * K;
   const int start =
@@ -142,6 +142,32 @@ __device__ __forceinline__ void DecodeLaneMul1(
   for (int q = 0; q < 4; ++q) {
     w[q] = DecodePairMul1(p[2 * q], p[2 * q + 1]);
   }
+}
+
+// K7 needs 65 bits for eight consecutive states. Extract each cyclic
+// 16-bit window separately; the K1-K6 decoder above remains unchanged.
+template<>
+__device__ __forceinline__ void DecodeLaneMul1<7>(
+    const std::uint32_t* __restrict__ tile, const LaneWindow&, Half2 (&w)[4]) {
+  constexpr unsigned K = 7;
+  const unsigned lane = threadIdx.x % 32;
+  std::uint32_t p[8];
+#pragma unroll
+  for (unsigned j = 0; j < 8; ++j) {
+    constexpr unsigned bits = 256 * K;
+    const unsigned start = ((8 * lane + j + 1) * K + bits - 16) % bits;
+    const unsigned index = start / 32;
+    const unsigned shift = start % 32;
+    const std::uint32_t a = tile[index];
+    const std::uint32_t b = tile[(index + 1) % (8 * K)];
+    const std::uint32_t state =
+        shift <= 16 ? (a >> (16 - shift)) & 0xffffU
+                    : ((a << (shift - 16)) | (b >> (48 - shift))) & 0xffffU;
+    p[j] = state * kMul1Multiplier;
+  }
+#pragma unroll
+  for (unsigned q = 0; q < 4; ++q)
+    w[q] = DecodePairMul1(p[2 * q], p[2 * q + 1]);
 }
 
 /// In-place unnormalized 128-point Walsh-Hadamard butterflies of one segment

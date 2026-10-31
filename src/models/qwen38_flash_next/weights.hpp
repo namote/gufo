@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -13,6 +14,9 @@
 #include "src/models/qwen38_flash_next/config.hpp"
 
 namespace gufo::models::qwen38_flash_next {
+
+struct Exl3Storage;
+struct Exl3HostLinear;
 
 /// Optional host destinations for independent predictor qualification.
 /// Every populated span contains the final complete row of its stage.
@@ -35,9 +39,10 @@ struct MtpTrace {
   }
 };
 
-/// Non-owning view of one GGUF tensor. `rows` x `cols` follows the GGUF
-/// convention: cols (ne[0]) is the contiguous reduction dimension, rows
-/// (ne[1]) the output dimension, and `experts` (ne[2]) stacks whole matrices.
+/// Non-owning view of a GGUF tensor or an EXL3 descriptor bank. `rows` x `cols`
+/// follows the GGUF convention: cols (ne[0]) is the contiguous reduction
+/// dimension, rows (ne[1]) the output dimension, and `experts` (ne[2]) stacks
+/// whole matrices.
 struct TensorRef {
   const void* data{nullptr};
   core::GgmlType type{core::GgmlType::kF32};
@@ -47,6 +52,11 @@ struct TensorRef {
   std::uint64_t file_offset{0};  ///< Byte offset inside the owning shard.
   std::uint32_t shard{0};        ///< Mapped region index in the reader.
   std::string_view name;
+
+  std::span<const Exl3HostLinear> exl3;
+  std::uint32_t output_begin{0};  ///< View after the full output Hadamard.
+  bool safetensors{false};
+  bool memory_owned{false};
 
   [[nodiscard]] bool empty() const noexcept { return data == nullptr; }
   [[nodiscard]] std::uint64_t ElementCount() const noexcept {
@@ -59,6 +69,8 @@ struct TensorRef {
   }
   /// Base address of one stacked expert matrix.
   [[nodiscard]] const std::uint8_t* Expert(std::uint64_t e) const noexcept {
+    if (!exl3.empty())
+      return nullptr;
     return static_cast<const std::uint8_t*>(data) + RowBytes() * rows * e;
   }
 };
@@ -121,11 +133,13 @@ struct LayerWeights {
   // Speculative `nextn` block only.
   TensorRef nextn_enorm;  ///< [hidden]
   TensorRef nextn_hnorm;  ///< [hc_dim], one RMS denominator across all streams
+  TensorRef nextn_fc_embedding, nextn_fc_hidden;
   TensorRef nextn_eh_proj;  ///< GGUF rows: [fc_embedding | fc_hidden]
   HcMixer nextn_head;       ///< Output mixer of the draft block.
 };
 
 struct ModelWeights {
+  std::shared_ptr<Exl3Storage> exl3_storage;
   Config config;
   TensorRef token_embd;  ///< [hidden -> vocab]
   TensorRef output;      ///< [hidden -> vocab]
@@ -143,6 +157,7 @@ struct ModelWeights {
 /// its own hyper-connection mixers and experts; token embedding and LM head
 /// are borrowed from the trunk.
 struct MtpWeights {
+  std::shared_ptr<Exl3Storage> exl3_storage;
   Config config;
   LayerWeights block;
 

@@ -37,6 +37,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
+#include "src/models/qwen38_flash_next/exl3_weights.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
@@ -308,7 +309,9 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "open failed: %s\n", error.c_str());
     return 1;
   }
-  auto weights = q::ModelWeights::Bind(*reader, &error);
+  const bool exl3 = reader->FindMetadata(q::kExl3Checkpoint) != nullptr;
+  auto weights = exl3 ? q::LoadExl3Model(model_path, *reader, &error)
+                      : q::ModelWeights::Bind(*reader, &error);
   if (!weights) {
     std::fprintf(stderr, "bind failed: %s\n", error.c_str());
     return 1;
@@ -340,8 +343,10 @@ int main(int argc, char** argv) {
   if (c.ple_layer >= 0) {
     const auto& t = weights->ple_table;
     ngram = q::NgramTable::Open(
-        reader->GetMappedRegions()[t.shard].file_descriptor, t.file_offset,
-        t.rows, c.ple_head_dim, t.type, &error);
+        (exl3 ? weights->exl3_storage->ple_reader.get() : reader.get())
+            ->GetMappedRegions()[t.shard]
+            .file_descriptor,
+        t.file_offset, t.rows, c.ple_head_dim, t.type, &error);
     if (!ngram) {
       std::fprintf(stderr, "n-gram table failed: %s\n", error.c_str());
       return 1;
@@ -353,7 +358,9 @@ int main(int argc, char** argv) {
   if (!mtp_path.empty()) {
     mtp_reader = gufo::core::GgufReader::OpenFile(mtp_path, &error);
     if (mtp_reader)
-      mtp_weights = q::MtpWeights::Bind(*mtp_reader, c, &error);
+      mtp_weights =
+          exl3 ? q::LoadExl3Mtp(mtp_path, *mtp_reader, *weights, &error)
+               : q::MtpWeights::Bind(*mtp_reader, c, &error);
     if (!mtp_weights) {
       std::fprintf(stderr, "MTP bind failed: %s\n", error.c_str());
       return 1;

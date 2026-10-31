@@ -1,6 +1,7 @@
 # Qwen3.8-Flash-Next (qwen4exp) model package. The scalar oracle is built
 # only by explicit validation targets, not by production or routine checks.
 add_library(gufo_qwen38_flash_next STATIC
+  exl3_weights.cpp
   config.cpp
   continuation_layout.cpp
   ngram.cpp
@@ -51,6 +52,7 @@ if (ENGINE_ENABLE_HIP)
 
   set(QFN_HIP_SOURCES
     continuation_adapter.cpp
+    ${QFN_ROCM_DIR}/exl3_moe.hip
     ${QFN_ROCM_DIR}/kernels.hip.cpp
     ${QFN_ROCM_DIR}/w8a8_wave64.hip
     ${QFN_ROCM_DIR}/blaslt.cpp

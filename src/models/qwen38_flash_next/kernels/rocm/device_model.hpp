@@ -3,23 +3,29 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <span>
 #include <string>
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/core/quant/exl3/device.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 
-/// One weight resident in device memory, still in its GGUF encoding.
+/// One resident GGUF weight or compressed EXL3 descriptor bank.
 struct DeviceTensor {
   void* data{nullptr};
   core::GgmlType type{core::GgmlType::kF32};
   std::uint32_t cols{0};
   std::uint32_t rows{0};
   std::uint32_t experts{1};
+
+  const quant::exl3::DeviceLinear* exl3{nullptr};  ///< Stable host descriptors.
+  const quant::exl3::DeviceLinear* device_exl3{nullptr};
+  std::uint32_t output_begin{0};
 
   [[nodiscard]] bool empty() const noexcept { return data == nullptr; }
   [[nodiscard]] const float* f32() const noexcept {
@@ -126,6 +132,7 @@ private:
   DeviceLayer mtp_;
   bool has_mtp_{false};
   std::vector<void*> allocations_;
+  std::deque<std::vector<quant::exl3::DeviceLinear>> exl3_linears_;
   std::size_t bytes_{0};
   std::size_t max_half_cols_{1};
   std::size_t max_q8_cols_{32};

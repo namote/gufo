@@ -213,6 +213,11 @@ ContinuationAdapter::ContinuationAdapter(std::shared_ptr<Model> model,
               mode == core::SessionMode::kSpeculative, context,
               model_ ? model_->executor_->max_speculative() : 0),
       identity_(std::move(identity)) {
+  // The component inventory describes FP16 K/V rows; KVarN records, sink
+  // and tail rows have no components yet.
+  if (model_ && model_->executor_->kvarn())
+    throw std::invalid_argument(
+        "the Flash-Next continuation adapter does not support KVarN K/V");
   if ((mode != core::SessionMode::kAutoregressive &&
        mode != core::SessionMode::kSpeculative) ||
       identity_.empty() || context > model_->MaxContext() ||

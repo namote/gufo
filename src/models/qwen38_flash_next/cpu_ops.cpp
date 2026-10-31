@@ -1,10 +1,12 @@
 #include "src/models/qwen38_flash_next/cpu_ops.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <vector>
 
 #include "src/core/quant/ggml_dequant.hpp"
+#include "src/models/qwen38_flash_next/exl3_weights.hpp"
 
 namespace gufo::models::qwen38_flash_next::cpu {
 namespace {
@@ -39,6 +41,16 @@ void DequantizeQ5_1(const std::uint8_t* src, float* dst, std::size_t k) {
 
 void DequantizeRow(const TensorRef& t, std::uint64_t e, std::uint64_t row,
                    float* out) {
+  if (!t.exl3.empty()) {
+    std::vector<float> x(t.cols), y(t.exl3[e].view.n);
+    for (std::size_t i = 0; i < t.cols; ++i) {
+      x[i] = 1;
+      Exl3MatVec(t.exl3[e], x, y);
+      out[i] = y[t.output_begin + row];
+      x[i] = 0;
+    }
+    return;
+  }
   const std::uint8_t* src = t.Expert(e) + row * t.RowBytes();
   const std::size_t k = t.cols;
   switch (t.type) {
@@ -86,6 +98,11 @@ void DequantizeRow(const TensorRef& t, std::uint64_t e, std::uint64_t row,
 
 float DotRow(const TensorRef& t, std::uint64_t e, std::uint64_t row,
              std::span<const float> x) {
+  if (!t.exl3.empty()) {
+    std::vector<float> y(t.exl3[e].view.n);
+    Exl3MatVec(t.exl3[e], x, y);
+    return y[t.output_begin + row];
+  }
   std::vector<float> w(t.cols);
   DequantizeRow(t, e, row, w.data());
   double acc = 0.0;
@@ -97,6 +114,12 @@ float DotRow(const TensorRef& t, std::uint64_t e, std::uint64_t row,
 
 void MatVec(const TensorRef& t, std::uint64_t e, std::span<const float> x,
             std::span<float> y) {
+  if (!t.exl3.empty()) {
+    std::vector<float> complete(t.exl3[e].view.n);
+    Exl3MatVec(t.exl3[e], x, complete);
+    std::copy_n(complete.begin() + t.output_begin, t.rows, y.begin());
+    return;
+  }
   const auto rows = static_cast<std::int64_t>(t.rows);
 #pragma omp parallel
   {

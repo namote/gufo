@@ -12,6 +12,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
+#include "src/models/qwen38_flash_next/exl3_weights.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
@@ -93,7 +94,9 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (!m->reader_) {
     return nullptr;
   }
-  auto weights = ModelWeights::Bind(*m->reader_, error_msg);
+  const bool exl3 = m->reader_->FindMetadata(kExl3Checkpoint) != nullptr;
+  auto weights = exl3 ? LoadExl3Model(model_path, *m->reader_, error_msg)
+                      : ModelWeights::Bind(*m->reader_, error_msg);
   if (!weights) {
     return nullptr;
   }
@@ -127,8 +130,10 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (c.ple_layer >= 0) {
     const auto& t = m->weights_->ple_table;
     m->ngram_ = NgramTable::Open(
-        m->reader_->GetMappedRegions()[t.shard].file_descriptor, t.file_offset,
-        t.rows, c.ple_head_dim, t.type, error_msg);
+        (exl3 ? m->weights_->exl3_storage->ple_reader.get() : m->reader_.get())
+            ->GetMappedRegions()[t.shard]
+            .file_descriptor,
+        t.file_offset, t.rows, c.ple_head_dim, t.type, error_msg);
     if (!m->ngram_) {
       return nullptr;
     }
@@ -139,7 +144,15 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     if (!m->mtp_reader_) {
       return nullptr;
     }
-    auto mtp = MtpWeights::Bind(*m->mtp_reader_, c, error_msg);
+    const bool mtp_exl3 =
+        m->mtp_reader_->FindMetadata(kExl3Checkpoint) != nullptr;
+    if (mtp_exl3 != exl3) {
+      AssignError(error_msg, "trunk and MTP weight formats must match");
+      return nullptr;
+    }
+    auto mtp = mtp_exl3 ? LoadExl3Mtp(options.mtp_model_path, *m->mtp_reader_,
+                                      *m->weights_, error_msg)
+                        : MtpWeights::Bind(*m->mtp_reader_, c, error_msg);
     if (!mtp) {
       return nullptr;
     }
@@ -176,6 +189,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
           : 1;
   exec.max_speculative = exec.max_logit_rows;
   exec.max_context = options.max_context;
+  exec.kvarn = options.kvarn;
   m->executor_ =
       rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);
   if (!m->executor_) {

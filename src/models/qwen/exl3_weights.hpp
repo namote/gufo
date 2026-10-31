@@ -73,8 +73,9 @@ struct RawKv {
 /// GGUF key naming the EXL3 checkpoint directory of a sidecar (relative to
 /// the sidecar's directory).
 inline constexpr std::string_view kCheckpointKey = "gufo.exl3.checkpoint";
-/// Optional sidecar key: "bf16" keeps the token embedding in BF16 (the
-/// X2a embedding comparison); otherwise it is quantized to Q8_0.
+/// Optional sidecar key: "q8_0" quantizes the token embedding to Q8_0;
+/// otherwise ("bf16" or absent) it stays BF16, the default since the X2a
+/// quality window (plan/exl3/XA-RESULTS.md: Q8_0 cost 0.04 %p top-1 at 5.00).
 inline constexpr std::string_view kEmbeddingKey = "gufo.exl3.embedding";
 
 /// The projection host copy of one EXL3 linear in GGUF orientation: the

@@ -125,16 +125,22 @@ void TestRefusals() {
              "the refusal names the model and its KV storage");
     }
   }
-  for (const auto type : {KvCacheType::kKvarnK4V2, KvCacheType::kKvarnK4V4}) {
+  {
+    // Flash-Next stores KVarN k4v4 only (plan/exl3/F1-KVARN-DESIGN.md).
     bool accepted = true;
     std::string error;
-    (void)Resolve("qwen4exp", type, &accepted, &error);
-    Expect(!accepted &&
-               error == "--kv-cache-type " +
-                            std::string(gufo::cli::KvCacheTypeName(type)) +
-                            " is not supported by Qwen3.8-Flash-Next; its KV "
-                            "cache is FP16, so it accepts only fp16",
-           "Flash-Next refuses KVarN by name");
+    (void)Resolve("qwen4exp", KvCacheType::kKvarnK4V2, &accepted, &error);
+    Expect(!accepted && error ==
+                            "--kv-cache-type kvarn-k4v2 is not supported by "
+                            "Qwen3.8-Flash-Next; its KV cache is FP16, so it "
+                            "accepts fp16 and kvarn-k4v4",
+           "Flash-Next refuses kvarn-k4v2 by name");
+    accepted = false;
+    error.clear();
+    Expect(Resolve("qwen4exp", KvCacheType::kKvarnK4V4, &accepted, &error) ==
+                   KvCacheType::kKvarnK4V4 &&
+               accepted,
+           "Flash-Next accepts kvarn-k4v4");
   }
   for (const auto type : {KvCacheType::kKvarnK4V2, KvCacheType::kKvarnK4V4}) {
     bool accepted = false;
