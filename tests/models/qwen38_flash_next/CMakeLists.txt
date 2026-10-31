@@ -18,6 +18,7 @@ function(add_qwen38_flash_next_test name library labels)
 endfunction()
 
 add_qwen38_flash_next_test(exl3_reference gufo_qwen38_flash_next_reference "cpu;exl3")
+add_qwen38_flash_next_test(exl3_ple_digest gufo_qwen38_flash_next "cpu;exl3")
 
 add_qwen38_flash_next_test(config gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(continuation_layout gufo_qwen38_flash_next "cpu")
