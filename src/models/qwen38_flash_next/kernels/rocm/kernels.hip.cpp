@@ -1343,6 +1343,20 @@ __global__ void SigmoidMulQ8Kernel(float* x, const float* g, std::size_t count,
   QuantizeQ8_1Lane(v, x_q8, i);
 }
 
+/// NarrowKernel<__half>, four elements per thread with 16-byte loads (the
+/// same conversion per element).
+__global__ void NarrowHalf4Kernel(const float4* x, ushort4* out,
+                                  std::size_t count4) {
+  const std::size_t i =
+      blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i < count4) {
+    const float4 v = x[i];
+    out[i] = make_ushort4(
+        __half_as_ushort(__half(v.x)), __half_as_ushort(__half(v.y)),
+        __half_as_ushort(__half(v.z)), __half_as_ushort(__half(v.w)));
+  }
+}
+
 template<typename T>
 __global__ void NarrowKernel(const float* x, T* out, std::size_t count) {
   const std::size_t i =
@@ -6423,6 +6437,14 @@ void NarrowActivations(const float* x, void* out, bool bf16, std::size_t count,
     hipLaunchKernelGGL(NarrowKernel<hip_bfloat16>, dim3(Blocks(count)),
                        dim3(kThreads), 0, stream, x,
                        static_cast<hip_bfloat16*>(out), count);
+  } else if (count % 4 == 0 && (reinterpret_cast<std::uintptr_t>(x) |
+                                reinterpret_cast<std::uintptr_t>(out)) %
+                                       16 ==
+                                   0) {
+    hipLaunchKernelGGL(NarrowHalf4Kernel, dim3(Blocks(count / 4)),
+                       dim3(kThreads), 0, stream,
+                       reinterpret_cast<const float4*>(x),
+                       static_cast<ushort4*>(out), count / 4);
   } else {
     hipLaunchKernelGGL(NarrowKernel<__half>, dim3(Blocks(count)),
                        dim3(kThreads), 0, stream, x, static_cast<__half*>(out),
