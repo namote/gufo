@@ -365,6 +365,73 @@ cold는 새 프로세스의 첫 요청(빈 행 캐시), warm은 같은 요청의
 - [짐작] pass 모드(MTP 검증 폭, 짧은 prompt)는 WMMA 대신 per-token kernel을 쓴다. prefill 단계의 ≤128행 pass가 느려질 수 있다. 최종 창에서 잰다.
 - P2 공유 pool은 하지 않았다(W9 engine.* 관문).
 
+## FINAL-FN 품질 창 (2026-10-31, `PLAN-FINAL-FN.json`, ai-tools/integ `c97d555d`) [확인]
+
+- **이미지:** X-A의 `final-c97d555d-tests-rocm101`(a42ab0c0), 그리고 F1 추가본 `final-c97d555d-fn-tests-rocm101`(95e7bf4a). 추가본은 테스트 이미지에 `build/fn-final-tests.nix` closure를 더한 것이고, 최종 테스트 derivation이 빼는(EXCLUDE_FROM_ALL) session/snapshot/adapter 테스트, kvarn_k0, gpu_probe, reference_probe가 들어 있다.
+- **source mount:** `gufo/build/fn-final-src`. c97d555d의 detached worktree이고 `.gufo-revision`이 들어 있다. 결과는 `ai.tools/tmp/test-results/gufo-upstream-port-20261023/final-fn/`에 있다.
+- **아래 UD-Q4 결과는 모두 `c97d555d`에서 나왔다.** EXL3 부분은 BLOCKED-loader다. `exl3_weights.cpp:168`이 텐서가 없는 UD shard 1을 거절한다. 고친 것은 efc396ba → integ b6e3ff82이고, 새 이미지에서 다시 돌린다. FAIL로 세지 않는다.
+
+| 창 | 결과 |
+|---|---|
+| q1 op 단위 16개 | PASS. kvarn_ops 읽기 경로 14회 비트 동일, exl3_ops 계약 통과 |
+| q2 GGUF 경로(FP16 KV) | PASS: session, snapshot, continuation adapter, MTP audit, F32 fixture dump. 첫 시도는 plan의 mount 오류였다(mmproj가 모델 옆에 없었다) |
+| q4 K0 real(UD-Q4) | 아래 참조 |
+| q5 KVarN 서버 suite(UD-Q4) | **expected-fail**(아래). 통과로 세지 않는다 |
+| q6a UD-Q4 대 BF16 prefill | 32,760행: KL_256 0.0392(token CI [0.0378, 0.0407]), top-1 0.909, flip 2,994 |
+| q7 MTP 수락(UD-Q4) | K/A/D greedy trace 완료 |
+| q3, q4b, q5b, q5c, q6/q7 EXL3 절반 | BLOCKED-loader |
+
+### KVarN K0 기준 바로잡기 (감독 수락 2026-10-31)
+
+- **처음 기준(fake-after):** FP16으로 prefill한 뒤 양자화한다. 이 기준으로 보면 needle의 max KL이 10× 막대를 넘었다.
+- **원인 [확인]:** 운영 prefill은 4096 토큰 chunk(`kPrefillChunkTokens`)마다 chunk 시작보다 앞 그룹을 레코드로 읽는다. 그래서 K/V 자체가 FP16 prefill과 달라진다. fake-after는 이것을 재현하지 않는다.
+- **진단:** `kvarn_k0 --prefill-chunk 4096 --quantize-decode`(fake-chunked: chunk마다, decode 중 그룹마다 양자화)로 다시 쟀다.
+
+| needle-32k (42 step) | fake-after | fake-chunked | real |
+|---|---:|---:|---:|
+| step 0 KL | 0 | 0.0478 | 0.0279 |
+| median | 4.1e-6 | 5.4e-6 | 2.7e-6 |
+| max | 1.7e-4 | 0.0478 | 0.0279 |
+
+| needle-200k (42 step) | fake-after | fake-chunked | real |
+|---|---:|---:|---:|
+| step 0 KL | 0 | 8.6e-3 | 6.2e-3 |
+| step 9 KL | 2.8e-5 | 0.0702 | 0.1476 |
+| median | 3.8e-5 | 1.2e-4 | 9.6e-5 |
+| max | 1.8e-3 | 0.0702 | 0.1476 |
+
+- **세 경우 모두 같다:** top-1 일치는 모든 step에서 1.0이다(step 0과 9 포함). needle 답은 FP16, fake-chunked, real 모두 `A=418-27-9063, B=775-04-2318, C=296-61-5547`이다. real은 FP16과 토큰 단위로 같다.
+- **결정:** 막대는 그대로 두고 기준만 바꾼다. 앞으로 KVarN 기준은 운영 chunk와 맞춘 fake-chunked다. real 대 FP16의 median/p99/max가 그 기준의 10× 이하, top-1 차이 1/100 이하, needle 답 정확. 이 기준으로 needle 둘 다 통과한다.
+- **k0-32k, k0-256k:** real의 max(8.0e-4, 6.1e-3)는 fake-after의 max(1.7e-3, 9.6e-3)보다도 작다.
+- **관찰(실패는 아님):** real이 fake-chunked의 10×를 넘는 단일 step이 두 개 있다. needle-32k step 5(3.3e-3 대 9.1e-5)와 needle-200k step 23(2.9e-3 대 1.1e-4)이다. 절대값은 작고, 분포 막대는 통과한다.
+
+### KVarN 서버 suite: expected-fail (cdbe0563, prefix cache 없음)
+
+- KVarN 서버는 prefix cache, snapshot, persistence를 끈다. suite마다 첫 cache 재사용 assertion에서 멈춘다. 그래서 그 뒤의 검사는 돌지 않았다. 실패한 assertion은 다음과 같다.
+  - long-context: `cache_growth.py:44` `check_unchanged_retry`의 `prefilled <= mutable_suffix_tokens`(재시도가 12,425 토큰을 다시 prefill했다)
+  - state-edges: `openai_sdk.py:2002` `cached_tokens > 0`
+  - batch: `openai_sdk.py:689` `replay cached_tokens > 0`
+  - tools: `openai_sdk.py:1524` `check_strict_tools`의 `cached_tokens > 0`
+  - structured: `openai_sdk.py:1288` `schema_cache_2_alpha cached_tokens > 0`
+  - sampling-defaults: `openai_sdk.py:410` `cached cached_tokens > 0`
+- **이것과 별개로 답은 맞다:** long-context는 `{"keyword": "LANTERN"}`, state-edges는 맞는 tool call이었다. MTP draft도 실제로 돌았다(11개 중 10개, 39개 중 30개 수락).
+- prefix cache 추가는 이후 F3 항목이다.
+- functional runner는 이미지 안의 사본이다(64849ca6ec7b의 `tests/functional`).
+
+### q2 F32 fixture: 기존 바닥, 회귀 아님
+
+- **기준이 계산하는 것:** `qwen38_flash_next_reference_probe`(revision 8b52b42c)는 같은 UD-Q4_K_XL shard를 쓴다. 그 shard의 sha256은 storage 사본과 4/4 같다. 양자화 가중치를 F32로 풀어 CPU F32로 계산한다. fixture는 prefill pass마다 마지막 256행의 top-256 logit과 전체 vocabulary logsumexp를 담는다. KL은 top-256과 나머지 묶음으로 구한 하한이다.
+- GPU 엔진은 FP16/BF16 활성값, W8A8 MMQ 활성 양자화, FP16 KV, QSA를 쓴다. 그래서 이 값은 엔진 산술 차이를 포함한 바닥이다. 같은 가중치의 1e-4 수준 floor와는 다른 양이다.
+- **값:** c97d555d는 전체 KL 0.0341(median 6.6e-4), top-1 0.951, NLL 1.2049(ref 1.1079)다. tools는 KL 0.0997, p99 2.02, max 3.53이다. EXPERIMENTS.md:139-145에 기록된 main 값(0.0341, tools 0.0997, p99 2.02)과 같다.
+- **pre-merge 22425173 대조:** 이미지 `fn-base-probe-rocm101`(fn-base-rocm101 + 같은 revision의 gpu_probe, `PLAN-FINAL-FN-BASE.json` `fn-q2-base-f32`)로 dump를 다시 떴다. dump 4개가 c97d555d와 **바이트 단위로 같다**(sha256 28a454a1/c108c0a7/5206cbbc/1aecc119). 따라서 GGUF 경로는 바뀌지 않았고, 이 KL은 기존 바닥이다.
+
+### BF16 기준 (q6)
+
+- `PLAN-FINAL-FN-BF16.json`, 이미지 7c2c5a728270(transformers 5.19.0)이다. prefill만 했다(decode는 CPU로 며칠 걸린다는 추정; 27B에서는 prefill과 decode가 같은 경향이었다).
+- 32,760행, 2.84 h, peak RSS 8.2 GB, `bf16-prefill.bin` sha256 de728d88….
+- 도구 수정은 브랜치 `ai-tools/fn-quality-bf16fix`에 있다(ec2d4dc1 DiskEmbedding.weight, 55500d5a logits_io prefix, 52cb1318 창 단위 저장·재개). port-u4f 병합은 감독이 한다. 앞으로 BF16 실행은 window.py 밖에서 한다(GPU 장치 없음, nice 10).
+- 수집기는 `qwen38_flash_next_rq_logits` sha256 21f7dc49…다(fn-quality 48451349, 64849ca6ec7b /opt/rocm 7.2.4 gpu-test 빌드, `storage/tools/fn-quality-48451349`).
+
 ## ABBA 계획 초안 (P1 정확성 통과 뒤)
 
 - **계획:** `PLAN-F1-ABBA-BASE.json`(이미지 `f1-base-rocm101`, d2b751a9)와 `PLAN-F1-ABBA-CAND.json`(`f1-cand-rocm101`, 766a593e)이다.

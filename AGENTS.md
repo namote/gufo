@@ -22,6 +22,19 @@ Stage only task-owned paths before Nix builds; flakes include tracked files.
 Measure performance with `result/bin/gufo` or `build/release/gufo`. Preserve
 compiler/dependency versions when comparing results.
 
+## Iteration workflow
+
+- Per work item: implement, have a second reviewer (another agent or
+  Codex thread) review the code, fix, and re-review. Keep each loop near
+  10–20 minutes.
+- Do not run per-item model, session, integration or timing windows. While
+  iterating, run only the build and the CPU/unit tests that catch compile and
+  unit errors.
+- After all items are done, run one combined pass: integration/correctness and
+  performance together. Diagnose and fix its failures, then rerun only the
+  affected checks.
+- No change may wait hours on its own verification cycle.
+
 ## Focused tests
 
 Formatting and Python repository checks may run on the editing host; they do

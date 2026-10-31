@@ -117,3 +117,87 @@ File ownership is exclusive; primitive APIs are agreed first, and the integratio
 4. Qualify fixed-history full-vocabulary KL/ΔNLL/top-1/tails, real MTP proposals and every rejection prefix; seeded sampling, EOS, images, cancellation, continuation, snapshots, `long-context` and `cache`. Keep the upstream MTP normalization mismatch visible (`plan/exl3/F2-DESIGN.md:159`).
 5. Retain standard speed and numerical-quality tests. Compare affected requests/phases at **5% and 10 ms**, retaining inconclusive results. Include C1 and affected C2/C4/C6/C8, plus an actual `pi_agent.py` workflow.
 6. Publish only when all requested speed cells pass and quality passes. Successful kernels become defaults; remove rejected routes and experimental switches.
+
+## F3-API (W3, 2026-10-31)
+
+Model-independent shared EXL3 primitives for the Flash-Next expert and integration workers. Headers:
+
+- `src/core/hip/detail/exl3_gemv.hpp`: device decode
+- `src/models/qwen/hip/kernels/exl3_gemv.hpp`: decode/verify GEMV and rotation
+- `src/models/qwen/hip/ops/prefill_fp16.hpp`: WMMA GEMM
+
+All take `quant::exl3::DeviceLinear` or raw device pointers in checkpoint layout (trellis `[k/16][n/16][16K]`, FP16 `suh[k]` and `svh[n]`). The codebook must be mul1.
+
+### Device decode (`exl3_gemv.hpp`, namespace `gufo::hip::exl3`)
+
+- `MakeLaneWindow<K>(lane)`: K1–K7.
+- `LaneStates<K>(d0, d1, d2, shift, state[8])`: the lane's eight 16-bit states from its three dwords. K7 takes the 65-bit window plus bit 64, so it no longer needs a separate per-state extraction.
+- `HashMul1Packed(src)`: full-rate hash.
+- `DecodePairMul1(p0, p1)` and `DecodeLaneMul1<K>(tile, lw, w[4])`: bit-exact with the CPU `DequantTile` (the kernel test checks K1–K7).
+- `Butterfly128`.
+- Lane layout: lane L holds positions 8L..8L+7, at rows r0, r0+1, r0+8, r0+9 (r0 = 2(L%4)) of columns L/4 and L/4+8.
+
+### Decode and verify (GEMV, rows 1–64 in 8-row passes)
+
+- `Exl3FastWorkspace`, `Exl3FastTarget`, `Exl3FastSupported` (mul1, K1–7, k and n multiples of 128).
+- `LaunchExl3FastProjection(s)`: up to 3 matrices with the same k and rate, one launch.
+- `LaunchExl3FastMlp`: gate/up, then SwiGLU, then the down input in the epilogue.
+- `LaunchExl3FastRmsNorm`: 5120-wide only; Flash-Next's 2560/10240 do not apply.
+- Per-row results do not depend on the batch.
+- Arithmetic: FP16 rotated input; `v_dot2acc_f32_f16` with FP32 accumulation; `svh` and FP32 butterflies at the output.
+- Subnormal FP16 inputs lose accuracy (X3-RESULTS "dot2 명령 형태와 서브노멀").
+
+### Rotation
+
+- `LaunchExl3RotateRows(x, x_stride, rows, k, suh, out)`: FP32 → FP16 `H(suh ⊙ x)`, row-major `[rows][k]`.
+- `LaunchExl3RotateRowsGrouped(problems, count, max_rows, k)` with `Exl3RotateProblem {x, x_stride, row_index (gather, nullable), suh, out, rows}`. One launch for all experts' rows.
+
+### WMMA GEMM (prefill and expert buckets, `ops/prefill_fp16.hpp`, namespace `gufo::hip`)
+
+- `Exl3GemmShapeSupported(k, n, rate, codebook)`: mul1, integer K1–7, n and k positive multiples of 128.
+- `LaunchExl3PrefillGemm(linear, x_fp16_rotated, y, rows, residual)`.
+- `LaunchExl3PrefillGemmGrouped(problems, count, max_rows, k, n, rate, residual)` with `Exl3GemmProblem {trellis, svh, x, y, rows}` (a device array; `rows = 0` skips). All problems share k, n and rate.
+- Tile, chosen by rows (`max_rows` for grouped):
+  - ≤ 64 rows: 128 channels × 64 tokens (the weights are read once)
+  - otherwise: 256 × 256, or 128 × 256 when n % 256 ≠ 0 (640-wide experts)
+- Output: `y[r][n]` FP32 = `svh ⊙ H(xW')`, residual: `+= `. `y` is dense `[rows][n]`; scatter/combine belongs to the caller.
+- Error bound: relative L2 ≤ (k / 16) × 2⁻²³ against FP64 fed the same FP16 rows (WMMA accumulation, X3-RESULTS).
+- Not covered: the grouped gate/up SwiGLU fusion (the expert worker's producer chain), and a per-row power-of-two scale.
+
+### Guarantee
+
+- The GGUF `HalfPrefillGemmKernel` instances are unchanged in resources and instruction text (ISA comparison).
+- The 27B GEMV/prefill kernels changed only in instruction scheduling of the integer decode (same ops), so the results are the same. The 27B kernel test values and fingerprints are reconfirmed in the next unit window.
+
+### F3-API status (W3, 2026-10-31 17:50)
+
+- **#1:** done. The GPU unit window f3u1 (45462f43) passed every production check:
+  - K7 2560→512 and 6144→2560 GEMV
+  - K7 prefill at 300 and 33 rows
+  - K5 640-wide (128×256 tile)
+  - 640→2560
+  - grouped 7/33/300
+  - 27B fingerprints identical to rq2h
+- **The new lane-decode test failed** because of a compiler miscompile, which is a warning for workers. hipcc 7.2 (gfx1151, true16) compiles `__builtin_bit_cast(std::uint16_t, half2.y)` to a `global_store_b16` of the low half. Verified in the ISA. Split the pair as a dword (`bit_cast<uint32_t>(pair) >> 16`) instead. The fixed test stores correctly (`global_store_d16_hi_b16`); it will be confirmed in the combined pass.
+- **#2 code:** the shared K7 lane window takes the K7 GEMV kernel (M8 W4 TN2) from 1379 to 1015 instructions, the same as K6 (1010). Neither has spills. VGPRs: 84 for K7 vs 81 for K6.
+- **Remaining #2 work goes to the combined pass:**
+  - FN-shape timing with `tools/bench/exl3_k7_bench.hip`: GEMV vs WMMA at R=1..8, and the 2×4 / 2×8 / 2×16 / 4×4 shape sweep with checks against production output.
+  - Tuning `PickShape` from those results. With few blocks (o, shared down: 80 blocks), wider waves are the candidate.
+
+### F3-API: expert bucket raw inner GEMM (W3, 2026-10-31)
+
+- **Header** `src/models/qwen/hip/ops/exl3_prefill_bucket.hpp`, HIP-free: `gufo::hip::Exl3PrefillBucket {expert, count, first}` (12 B). The expert worker aliases its `Exl3ExpertBucket` to this type with `using Exl3ExpertBucket = gufo::hip::Exl3PrefillBucket;` so the `Exl3BucketGemm` function pointer matches without a cast.
+- **Entry point** `LaunchExl3PrefillBucketInner(bank, buckets, bucket_count, max_buckets, tile_rows, input, inner, k, n, stream)` in `ops/prefill_fp16.hpp`:
+  - Bank: mul1 K5; k and n multiples of 128.
+  - Input: FP16 rotated, packed `[rows][k]`. Output: raw FP32 inner products, packed `[rows][n]`, with no H, svh or suh.
+  - Masking: descriptors at or past the device count (`*bucket_count`, read on the device) are ignored; rows past `count` are neither read nor written; nothing is padded.
+  - Bank-entry check on the device: an entry with the wrong rate, k, n or codebook writes NaN to that bucket's rows.
+- **Tiles:** 128 channels × 16, 32 or 64 tokens, the smallest that holds `tile_rows`. The grid is `(1, n/128, max_buckets)`. No spills. VGPRs are 129, 170 and 218, for occupancy of 10, 8 and 6.
+- **Arithmetic:** every tile accumulates each element over k in the same WMMA order, so values do not depend on the bucket partition or the position in a tile. The test checks this bit for bit.
+- **Test:** `qwen27b_exl3_kernel_test` `TestBuckets`, for 2560→640 and 640→2560. Experts have 1, 37, 0 and 70 rows, with partitions of 16, 32, 64 and 7 rows. Checks:
+  - bit identity across partitions
+  - FP64 at the (k/16)·2⁻²³ bar
+  - rows outside every bucket stay untouched
+  - descriptors past the count are ignored
+  - K6 entry poisoning
+- **Status:** built; the GPU run waits for the combined pass.

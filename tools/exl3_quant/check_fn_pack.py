@@ -16,6 +16,11 @@ Checks (all must pass; headers only, no tensor data is read):
               indexer 5, lm_head 6; router, in_proj_a/b, hyper-connections, PLE projections not EXL3;
               73,728 expert tensors; n-gram trellis int16 [320001536, 61].
   index       model.safetensors.index.json maps every shard tensor to the file that holds it.
+
+--survey (for packs without recorded expectations, e.g. other bitrates or other quantizers): config, bits
+and side only report what the pack holds (bits per category, MTP/vision K, n-gram trellis shape) and do
+not fail; storage and index stay strict. --extra FILE adds the headers of a safetensors file kept outside
+the pack (e.g. an n-gram table shared with another pack) to the storage check.
 Standard library only.
 """
 from __future__ import annotations
@@ -47,9 +52,9 @@ BITS = [  # (pattern on the module key, expected bits or None = not EXL3)
 ]
 
 
-def headers(directory: Path) -> dict:
+def headers(directory: Path, extra: list[Path] = ()) -> dict:
     out = {}
-    for f in sorted(directory.glob("*.safetensors")):
+    for f in sorted(directory.glob("*.safetensors")) + list(extra):
         with f.open("rb") as fh:
             n = struct.unpack("<Q", fh.read(8))[0]
             h = json.loads(fh.read(n))
@@ -63,14 +68,16 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("pack", type=Path)
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--survey", action="store_true")
+    ap.add_argument("--extra", type=Path, action="append", default=[])
     a = ap.parse_args()
     rep: dict = {"pack": str(a.pack), "checks": {}}
 
     qc = json.loads((a.pack / "config.json").read_text()).get("quantization_config", {})
-    rep["checks"]["config"] = {"PASS": qc == EXPECT_QC, "quantization_config": qc,
+    rep["checks"]["config"] = {"PASS": a.survey or qc == EXPECT_QC, "quantization_config": qc,
                                "differs": {k: qc.get(k) for k in set(EXPECT_QC) | set(qc) if qc.get(k) != EXPECT_QC.get(k)}}
 
-    hdr = headers(a.pack)
+    hdr = headers(a.pack, a.extra)
     q = json.loads((a.pack / "quantization_config.json").read_text())
     storage = q["tensor_storage"]
     listed, bad, missing = set(), [], []
@@ -94,7 +101,7 @@ def main() -> int:
     for k in side:
         if k.endswith(".trellis"):
             ks["mtp" if k.startswith("mtp.") else "vision"][hdr[k]["shape"][-1] // 16] += 1
-    rep["checks"]["side"] = {"PASS": dict(ks["mtp"]) == {5: 1537, 7: 7, 6: 2} and dict(ks["vision"]) == {6: 164},
+    rep["checks"]["side"] = {"PASS": a.survey or (dict(ks["mtp"]) == {5: 1537, 7: 7, 6: 2} and dict(ks["vision"]) == {6: 164}),
                              "trellis_K": {g: {str(k): n for k, n in c.items()} for g, c in ks.items()}}
 
     cats = collections.defaultdict(collections.Counter)
@@ -112,7 +119,15 @@ def main() -> int:
                 break
     ng = {k: v for k, v in hdr.items() if k.endswith("ngram_embedding.trellis")}
     ng_ok = len(ng) == 1 and next(iter(ng.values()))["shape"] == [320001536, 61] and next(iter(ng.values()))["dtype"] == "I16"
-    rep["checks"]["bits"] = {"PASS": not wrong and experts == 73728 and ng_ok, "expert_tensors": experts,
+    if a.survey:
+        cats = collections.defaultdict(collections.Counter)
+        for mod, v in storage.items():
+            bits = v.get("bits_per_weight") if v.get("quant_format") == "exl3" else None
+            for pat, _ in BITS:
+                if re.search(pat, mod):
+                    cats[pat][bits] += 1
+                    break
+    rep["checks"]["bits"] = {"PASS": a.survey or (not wrong and experts == 73728 and ng_ok), "expert_tensors": experts,
                              "categories": {p: {str(k): n for k, n in c.items()} for p, c in cats.items()},
                              "wrong": wrong[:20], "ngram_trellis": ng}
 

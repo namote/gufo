@@ -12,6 +12,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -911,6 +912,338 @@ void TestDispatch(std::mt19937& rng) {
     Check(hipFree(p));
 }
 
+// Every K's lane decode (DecodeLaneMul1, the GEMV producer; K7 through the
+// shared 65-bit lane window) against the CPU dequant, FP16 bits.
+template<int K>
+__global__ void DecodeTilesKernel(const std::uint16_t* trellis, unsigned,
+                                  unsigned n, std::uint16_t* out) {
+  const unsigned lane = threadIdx.x;
+  const unsigned tile = blockIdx.x, n_tiles = n / 16;
+  const unsigned kt = tile / n_tiles, nt = tile % n_tiles;
+  const auto lw = gufo::hip::exl3::MakeLaneWindow<K>(lane);
+  gufo::hip::exl3::Half2 w[4];
+  gufo::hip::exl3::DecodeLaneMul1<K>(
+      reinterpret_cast<const std::uint32_t*>(trellis) +
+          std::size_t(tile) * 8 * K,
+      lw, w);
+  const unsigned r0 = (lane % 4) * 2, c0 = lane / 4;
+  for (int q = 0; q < 4; ++q) {
+    const unsigned col = nt * 16 + c0 + 8 * (q / 2);
+    const unsigned row = kt * 16 + r0 + 8 * (q % 2);
+    // Split the pair as a dword: hipcc 7.2 stores the low half for both
+    // elements of __builtin_bit_cast(std::uint16_t, w[q].y) (true16).
+    const auto pair = __builtin_bit_cast(std::uint32_t, w[q]);
+    out[std::size_t(row) * n + col] = static_cast<std::uint16_t>(pair);
+    out[std::size_t(row + 1) * n + col] =
+        static_cast<std::uint16_t>(pair >> 16);
+  }
+}
+
+template<int K>
+std::size_t DecodeTilesDiff(std::mt19937& rng) {
+  constexpr unsigned k = 256, n = 512;
+  const BitRate rate{K, false};
+  std::vector<std::uint16_t> trellis((k / 16) * (n / 16) * rate.TileWords());
+  for (auto& w : trellis)
+    w = static_cast<std::uint16_t>(rng());
+  std::vector<std::uint16_t> want(k * n);
+  DequantInner(trellis.data(), k, n, rate, Codebook::kMul1, want.data());
+  auto* d_t = Upload(trellis);
+  std::uint16_t* d_out = nullptr;
+  Check(hipMalloc(&d_out, k * n * 2));
+  hipLaunchKernelGGL(DecodeTilesKernel<K>, dim3((k / 16) * (n / 16)), dim3(32),
+                     0, 0, d_t, k, n, d_out);
+  Check(hipGetLastError());
+  Check(hipDeviceSynchronize());
+  const auto got = Download(d_out, k * n);
+  std::size_t diff = 0;
+  for (std::size_t i = 0; i < got.size(); ++i)
+    diff += got[i] != want[i];
+  Check(hipFree(d_t));
+  Check(hipFree(d_out));
+  return diff;
+}
+
+void TestDecodeTiles(std::mt19937& rng) {
+  const std::size_t diffs[] = {DecodeTilesDiff<1>(rng), DecodeTilesDiff<2>(rng),
+                               DecodeTilesDiff<3>(rng), DecodeTilesDiff<4>(rng),
+                               DecodeTilesDiff<5>(rng), DecodeTilesDiff<6>(rng),
+                               DecodeTilesDiff<7>(rng)};
+  for (int b = 0; b < 7; ++b)
+    Expect(diffs[b] == 0, "lane decode K" + std::to_string(b + 1) + ": " +
+                              std::to_string(diffs[b]) + " FP16 values differ");
+  std::cout << "lane decode K1..K7 vs CPU: ";
+  for (int b = 0; b < 7; ++b)
+    std::cout << diffs[b] << (b < 6 ? "/" : " values differ\n");
+}
+
+// Grouped rotation (gathered rows) and grouped GEMM over expert-like buckets
+// with ragged rows: every problem against its FP64 reference at the WMMA
+// bound, finite, and rotated rows against the FP32 contract. With residual
+// the outputs start from a known prior; the zero-row problem's output must
+// stay untouched (sentinel). max_rows picks the tile (<= 64: narrow).
+void TestGrouped(std::mt19937& rng, const std::size_t (&rows)[4],
+                 std::size_t max_rows, bool residual) {
+  constexpr std::size_t k = 2560, n = 640, source_rows = 400;
+  const BitRate rate{5, false};
+  constexpr std::size_t count = 4;
+  constexpr std::uint32_t kSentinel = 0x7fc0beefU;
+  std::normal_distribution<float> normal;
+  std::vector<float> x(source_rows * k);
+  for (auto& v : x)
+    v = normal(rng);
+  auto* d_x = Upload(x);
+  std::vector<void*> owned;
+  std::vector<gufo::hip::Exl3RotateProblem> rot(count);
+  std::vector<gufo::hip::Exl3GemmProblem> gemm(count);
+  struct Host {
+    std::vector<std::uint16_t> trellis, suh, svh, inner;
+    std::vector<std::uint32_t> index;
+    std::vector<float> prior;
+  };
+  std::vector<Host> host(count);
+  for (std::size_t p = 0; p < count; ++p) {
+    Host& h = host[p];
+    h.trellis.resize((k / 16) * (n / 16) * rate.TileWords());
+    for (auto& w : h.trellis)
+      w = static_cast<std::uint16_t>(rng());
+    h.suh = RandomScales(rng, k, 0x3800);
+    h.svh = RandomScales(rng, n, 0x2000);
+    h.inner.resize(k * n);
+    DequantInner(h.trellis.data(), k, n, rate, Codebook::kMul1, h.inner.data());
+    for (std::size_t r = 0; r < rows[p]; ++r)
+      h.index.push_back(static_cast<std::uint32_t>(rng() % source_rows));
+    if (h.index.empty())
+      h.index.push_back(0);
+    auto* d_t = Upload(h.trellis);
+    auto* d_suh = Upload(h.suh);
+    auto* d_svh = Upload(h.svh);
+    auto* d_index = Upload(h.index);
+    std::uint16_t* d_slab = nullptr;
+    float* d_y = nullptr;
+    Check(hipMalloc(&d_slab, std::max<std::size_t>(rows[p], 1) * k * 2));
+    Check(hipMalloc(&d_y, std::max<std::size_t>(rows[p], 1) * n * 4));
+    {
+      // Prior: a sentinel for the zero-row problem, values for residual.
+      std::vector<float> prior(std::max<std::size_t>(rows[p], 1) * n);
+      for (std::size_t i = 0; i < prior.size(); ++i)
+        prior[i] = rows[p] == 0 ? std::bit_cast<float>(kSentinel)
+                                : (static_cast<float>(i % 7) - 3.0F) * 0x1p-8F;
+      h.prior = prior;
+      Check(hipMemcpy(d_y, prior.data(), prior.size() * 4,
+                      hipMemcpyHostToDevice));
+    }
+    owned.insert(owned.end(), {d_t, d_suh, d_svh, d_index, d_slab, d_y});
+    rot[p] = {
+        d_x, k, d_index, d_suh, d_slab, static_cast<std::uint32_t>(rows[p]), 0};
+    gemm[p] = {d_t, d_svh, d_slab, d_y, static_cast<std::uint32_t>(rows[p]), 0};
+  }
+  auto* d_rot = Upload(rot);
+  auto* d_gemm = Upload(gemm);
+  gufo::hip::LaunchExl3RotateRowsGrouped(d_rot, count, max_rows, k, nullptr);
+  gufo::hip::LaunchExl3PrefillGemmGrouped(d_gemm, count, max_rows, k, n, rate,
+                                          residual, nullptr);
+  Check(hipDeviceSynchronize());
+  const double bar = static_cast<double>(k) / 16.0 * std::ldexp(1.0, -23);
+  for (std::size_t p = 0; p < count; ++p) {
+    const Host& h = host[p];
+    if (rows[p] == 0) {
+      const auto y = Download(gemm[p].y, n);
+      bool untouched = true;
+      for (float v : y)
+        untouched = untouched && std::bit_cast<std::uint32_t>(v) == kSentinel;
+      Expect(untouched, "grouped zero-row problem: output written");
+      continue;
+    }
+    const auto slab =
+        Download(static_cast<const std::uint16_t*>(rot[p].out), rows[p] * k);
+    const auto y = Download(gemm[p].y, rows[p] * n);
+    std::size_t rot_diff = 0;
+    double num = 0.0, den = 0.0;
+    bool finite = true;
+    for (std::size_t r = 0; r < rows[p]; ++r) {
+      const auto rr = KernelRotatedInput(&x[h.index[r] * k], h.suh.data(), k);
+      for (std::size_t i = 0; i < k; ++i)
+        rot_diff += slab[r * k + i] != HalfFromDouble(rr[i]);
+      const auto want = ProjectRotated(rr, h.inner, h.svh, k, n);
+      for (std::size_t j = 0; j < n; ++j) {
+        finite = finite && std::isfinite(y[r * n + j]);
+        // Residual: compare the added part (the prior is exact in FP32
+        // only up to the final rounding, which the bar covers).
+        const double got =
+            static_cast<double>(y[r * n + j]) -
+            (residual ? static_cast<double>(h.prior[r * n + j]) : 0.0);
+        num += (got - want[j]) * (got - want[j]);
+        den += want[j] * want[j];
+      }
+    }
+    const double rel = std::sqrt(num / den);
+    const std::string name =
+        std::string("grouped ") + (max_rows <= 64 ? "narrow" : "wide") +
+        (residual ? " residual" : "") + " problem " + std::to_string(p) +
+        " rows=" + std::to_string(rows[p]);
+    Expect(rot_diff == 0, name + ": gathered rotation differs");
+    Expect(finite, name + ": non-finite output");
+    Expect(rel < bar, name + " relative L2 " + std::to_string(rel));
+    std::cout << name << ": relative L2 " << rel << " (bar " << bar
+              << "), rotation diffs " << rot_diff << "\n";
+  }
+  for (void* p : owned)
+    Check(hipFree(p));
+  for (void* p : {static_cast<void*>(d_x), static_cast<void*>(d_rot),
+                  static_cast<void*>(d_gemm)})
+    Check(hipFree(p));
+}
+
+// Bucketed raw inner products (Flash-Next routed prefill): an expert bank
+// with ragged per-expert rows split into 16/32/64-row tiles. Every
+// partition gives bit-identical values; each against the FP64 inner product
+// at the WMMA bound; rows outside every bucket and descriptors past the
+// device count stay untouched; a bank entry of the wrong rate writes NaN.
+void TestBuckets(std::size_t k, std::size_t n, std::mt19937& rng) {
+  constexpr std::size_t kExperts = 4;
+  const BitRate rate{5, false};
+  const std::size_t expert_rows[kExperts] = {1, 37, 0, 70};
+  std::size_t total = 1;  // row 0 belongs to no bucket (sentinel)
+  for (std::size_t e : expert_rows)
+    total += e;
+  std::vector<std::vector<std::uint16_t>> inner(kExperts);
+  std::vector<DeviceLinear> bank(kExperts + 1);
+  std::vector<void*> owned;
+  for (std::size_t e = 0; e <= kExperts; ++e) {
+    // Entry kExperts: K6, a contract violation.
+    const BitRate r = e < kExperts ? rate : BitRate{6, false};
+    std::vector<std::uint16_t> trellis((k / 16) * (n / 16) * r.TileWords());
+    for (auto& w : trellis)
+      w = static_cast<std::uint16_t>(rng());
+    if (e < kExperts) {
+      inner[e].resize(k * n);
+      DequantInner(trellis.data(), k, n, rate, Codebook::kMul1,
+                   inner[e].data());
+    }
+    auto* d_t = Upload(trellis);
+    owned.push_back(d_t);
+    bank[e].trellis = d_t;
+    bank[e].k = static_cast<std::uint32_t>(k);
+    bank[e].n = static_cast<std::uint32_t>(n);
+    bank[e].rate = r;
+    bank[e].codebook = Codebook::kMul1;
+  }
+  std::normal_distribution<double> normal;
+  std::vector<std::uint16_t> input(total * k);
+  for (auto& v : input)
+    v = HalfFromDouble(normal(rng));
+  auto* d_bank = Upload(bank);
+  auto* d_input = Upload(input);
+  constexpr std::uint32_t kSentinel = 0x7fc0beefU;
+  const std::vector<float> sentinel(total * n, std::bit_cast<float>(kSentinel));
+  float* d_inner = nullptr;
+  Check(hipMalloc(&d_inner, total * n * 4));
+  const double bar = static_cast<double>(k) / 16.0 * std::ldexp(1.0, -23);
+  std::vector<float> first_result;
+  for (std::uint32_t tile_rows : {16U, 32U, 64U, 7U}) {
+    std::vector<gufo::hip::Exl3PrefillBucket> buckets;
+    std::uint32_t row = 1;
+    for (std::uint32_t e = 0; e < kExperts; ++e) {
+      for (std::uint32_t r = 0; r < expert_rows[e]; r += tile_rows)
+        buckets.push_back(
+            {e, std::min<std::uint32_t>(tile_rows, expert_rows[e] - r),
+             row + r});
+      row += static_cast<std::uint32_t>(expert_rows[e]);
+    }
+    const auto active = static_cast<std::uint32_t>(buckets.size());
+    // Past the device count: would overwrite row 0 if read.
+    buckets.push_back({0, 1, 0});
+    buckets.push_back({1, 1, 0});
+    auto* d_buckets = Upload(buckets);
+    auto* d_count = Upload(std::vector<std::uint32_t>{active});
+    Check(hipMemcpy(d_inner, sentinel.data(), sentinel.size() * 4,
+                    hipMemcpyHostToDevice));
+    gufo::hip::LaunchExl3PrefillBucketInner(
+        d_bank, d_buckets, d_count, static_cast<std::uint32_t>(buckets.size()),
+        tile_rows, d_input, d_inner, static_cast<std::uint32_t>(k),
+        static_cast<std::uint32_t>(n), nullptr);
+    Check(hipDeviceSynchronize());
+    const auto got = Download(d_inner, total * n);
+    const std::string name = "bucket k=" + std::to_string(k) +
+                             " n=" + std::to_string(n) +
+                             " tile_rows=" + std::to_string(tile_rows);
+    bool untouched = true;
+    for (std::size_t j = 0; j < n; ++j)
+      untouched =
+          untouched && std::bit_cast<std::uint32_t>(got[j]) == kSentinel;
+    Expect(untouched, name + ": row outside every bucket written");
+    double num = 0.0, den = 0.0;
+    bool finite = true;
+    row = 1;
+    for (std::size_t e = 0; e < kExperts; ++e) {
+      for (std::size_t r = 0; r < expert_rows[e]; ++r, ++row) {
+        std::vector<double> want(n, 0.0);
+        for (std::size_t i = 0; i < k; ++i) {
+          const double xi = HalfToDouble(input[row * k + i]);
+          for (std::size_t j = 0; j < n; ++j)
+            want[j] += xi * HalfToDouble(inner[e][i * n + j]);
+        }
+        for (std::size_t j = 0; j < n; ++j) {
+          const double g = got[row * n + j];
+          finite = finite && std::isfinite(g);
+          num += (g - want[j]) * (g - want[j]);
+          den += want[j] * want[j];
+        }
+      }
+    }
+    const double rel = std::sqrt(num / den);
+    Expect(finite, name + ": non-finite output");
+    Expect(rel < bar, name + " relative L2 " + std::to_string(rel));
+    std::size_t partition_diffs = 0;
+    if (first_result.empty())
+      first_result = got;
+    else
+      for (std::size_t i = 0; i < got.size(); ++i)
+        partition_diffs += std::bit_cast<std::uint32_t>(got[i]) !=
+                           std::bit_cast<std::uint32_t>(first_result[i]);
+    Expect(partition_diffs == 0,
+           name + ": " + std::to_string(partition_diffs) +
+               " values differ from the 16-row partition");
+    std::cout << name << ": relative L2 " << rel << " (bar " << bar
+              << "), bits differing from 16-row partition " << partition_diffs
+              << "\n";
+    Check(hipFree(d_buckets));
+    Check(hipFree(d_count));
+  }
+  {
+    // A K6 bank entry under the K5 entry point poisons its rows only.
+    std::vector<gufo::hip::Exl3PrefillBucket> buckets{
+        {static_cast<std::uint32_t>(kExperts), 3, 1}};
+    auto* d_buckets = Upload(buckets);
+    auto* d_count = Upload(std::vector<std::uint32_t>{1});
+    Check(hipMemcpy(d_inner, sentinel.data(), sentinel.size() * 4,
+                    hipMemcpyHostToDevice));
+    gufo::hip::LaunchExl3PrefillBucketInner(
+        d_bank, d_buckets, d_count, 1, 16, d_input, d_inner,
+        static_cast<std::uint32_t>(k), static_cast<std::uint32_t>(n), nullptr);
+    Check(hipDeviceSynchronize());
+    const auto got = Download(d_inner, total * n);
+    bool poisoned = true, rest = true;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+      const bool in = i >= n && i < 4 * n;
+      if (in)
+        poisoned = poisoned && std::isnan(got[i]) &&
+                   std::bit_cast<std::uint32_t>(got[i]) != kSentinel;
+      else
+        rest = rest && std::bit_cast<std::uint32_t>(got[i]) == kSentinel;
+    }
+    Expect(poisoned && rest, "bucket rate mismatch: rows not poisoned alone");
+    Check(hipFree(d_buckets));
+    Check(hipFree(d_count));
+  }
+  for (void* p : owned)
+    Check(hipFree(p));
+  Check(hipFree(d_bank));
+  Check(hipFree(d_input));
+  Check(hipFree(d_inner));
+}
+
 }  // namespace
 
 int main() {
@@ -918,9 +1251,18 @@ int main() {
   std::cout << std::unitbuf;
   std::mt19937 rng(20261030);
   // Narrow and wide outputs cover the 16-, 8- and 4-wave launch shapes.
-  const Problem problems[] = {{1024, 2048, 5}, {6144, 1024, 5}, {512, 16384, 6},
-                              {2048, 1024, 4}, {384, 256, 3},   {256, 512, 2},
-                              {256, 384, 1}};
+  const Problem problems[] = {{1024, 2048, 5},
+                              {6144, 1024, 5},
+                              {512, 16384, 6},
+                              {2048, 1024, 4},
+                              {384, 256, 3},
+                              {256, 512, 2},
+                              {256, 384, 1},
+                              // Flash-Next: K7 trunk, K5 experts (640 wide).
+                              {2560, 512, 7},
+                              {2560, 640, 5},
+                              {640, 2560, 5},
+                              {6144, 2560, 7}};
   for (const Problem& p : problems)
     TestProblem(p, rng);
   // q + k + v (four tiles per wave) and gate + up shapes at small k.
@@ -938,6 +1280,17 @@ int main() {
   TestPrefill(512, 256, 4, 65, rng);
   TestPrefill(17408, 256, 5, 33, rng);
   TestPrefill(5120, 256, 6, 520, rng);
+  // Flash-Next shapes: K7 trunk (prefill and narrow), 640-wide experts
+  // (the 128 x 256 tile), 640 -> 2560 down.
+  TestPrefill(2560, 512, 7, 300, rng);
+  TestPrefill(2560, 512, 7, 33, rng);
+  TestPrefill(2560, 640, 5, 300, rng);
+  TestPrefill(640, 2560, 5, 65, rng);
+  TestDecodeTiles(rng);
+  TestGrouped(rng, {0, 7, 33, 300}, 300, false);
+  TestGrouped(rng, {5, 0, 64, 1}, 64, true);
+  TestBuckets(2560, 640, rng);
+  TestBuckets(640, 2560, rng);
   TestDispatch(rng);
   if (failures != 0) {
     std::cerr << failures << " failure(s)\n";
