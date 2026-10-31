@@ -65,9 +65,11 @@ using Half4 = _Float16 __attribute__((ext_vector_type(4)));
 
 inline constexpr std::uint32_t kMul1Multiplier = 0x83DCD12DU;
 
-/// Lane-constant placement of the lane's 64-bit state window in a tile of
-/// 8 * K dwords: the three source dwords and 32 minus the bit offset of the
-/// first state (that offset is never 0 for K = 1..6).
+/// Lane-constant placement of the lane's state window in a tile of 8 * K
+/// dwords: the three source dwords and 32 minus the bit offset of the first
+/// state (that offset is never 0 for K = 1..7). The lane's eight states span
+/// 7K + 16 bits from that offset, at most 65 bits (K7): always inside the
+/// three dwords.
 struct LaneWindow {
   unsigned o0, o1, o2;
   unsigned shift;
@@ -118,6 +120,31 @@ __device__ __forceinline__ Half2 DecodePairMul1(std::uint32_t p0,
   return __builtin_elementwise_fma(u, inv, bias);
 }
 
+/// The lane's eight 16-bit states (in the low halves; the upper halves are
+/// arbitrary) from its three dwords: state j is bits [off + Kj, off + Kj +
+/// 16) of d0:d1:d2, most significant bit first. For K <= 6 every state lies in
+/// the 64-bit window cut out by two v_alignbit_b32; K7's last state also needs
+/// bit 64, the bit of d2 at the window offset.
+template<int K>
+__device__ __forceinline__ void LaneStates(std::uint32_t d0, std::uint32_t d1,
+                                           std::uint32_t d2, unsigned shift,
+                                           std::uint32_t (&state)[8]) {
+  static_assert(K >= 1 && K <= 7);
+  const std::uint32_t hi = __builtin_amdgcn_alignbit(d0, d1, shift);
+  const std::uint32_t lo = __builtin_amdgcn_alignbit(d1, d2, shift);
+  const std::uint64_t window = (static_cast<std::uint64_t>(hi) << 32) | lo;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    if (48 - K * j >= 0) {
+      state[j] = static_cast<std::uint32_t>(window >> (48 - K * j));
+    } else {
+      // K7, j = 7: bits 49 .. 63 of the window, then bit 64 (d2's bit at
+      // the offset, shift = 32 - offset >= 1).
+      state[j] = (lo << 1) | ((d2 >> (shift - 1)) & 1U);
+    }
+  }
+}
+
 /// The lane's eight decoded weights as four pairs: w[0] rows (r0, r0+1) and
 /// w[1] rows (r0+8, r0+9) of column L / 4; w[2], w[3] the same rows of
 /// column L / 4 + 8.
@@ -125,49 +152,17 @@ template<int K>
 __device__ __forceinline__ void DecodeLaneMul1(
     const std::uint32_t* __restrict__ tile, const LaneWindow& lw,
     Half2 (&w)[4]) {
-  const std::uint32_t d0 = tile[lw.o0];
-  const std::uint32_t d1 = tile[lw.o1];
-  const std::uint32_t d2 = tile[lw.o2];
-  const std::uint32_t hi = __builtin_amdgcn_alignbit(d0, d1, lw.shift);
-  const std::uint32_t lo = __builtin_amdgcn_alignbit(d1, d2, lw.shift);
-  const std::uint64_t window = (static_cast<std::uint64_t>(hi) << 32) | lo;
+  std::uint32_t state[8];
+  LaneStates<K>(tile[lw.o0], tile[lw.o1], tile[lw.o2], lw.shift, state);
   std::uint32_t p[8];
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
-    const std::uint32_t state =
-        static_cast<std::uint32_t>(window >> (48 - K * j)) & 0xffffU;
-    p[j] = state * kMul1Multiplier;
+    p[j] = (state[j] & 0xffffU) * kMul1Multiplier;
   }
 #pragma unroll
   for (int q = 0; q < 4; ++q) {
     w[q] = DecodePairMul1(p[2 * q], p[2 * q + 1]);
   }
-}
-
-// K7 needs 65 bits for eight consecutive states. Extract each cyclic
-// 16-bit window separately; the K1-K6 decoder above remains unchanged.
-template<>
-__device__ __forceinline__ void DecodeLaneMul1<7>(
-    const std::uint32_t* __restrict__ tile, const LaneWindow&, Half2 (&w)[4]) {
-  constexpr unsigned K = 7;
-  const unsigned lane = threadIdx.x % 32;
-  std::uint32_t p[8];
-#pragma unroll
-  for (unsigned j = 0; j < 8; ++j) {
-    constexpr unsigned bits = 256 * K;
-    const unsigned start = ((8 * lane + j + 1) * K + bits - 16) % bits;
-    const unsigned index = start / 32;
-    const unsigned shift = start % 32;
-    const std::uint32_t a = tile[index];
-    const std::uint32_t b = tile[(index + 1) % (8 * K)];
-    const std::uint32_t state =
-        shift <= 16 ? (a >> (16 - shift)) & 0xffffU
-                    : ((a << (shift - 16)) | (b >> (48 - shift))) & 0xffffU;
-    p[j] = state * kMul1Multiplier;
-  }
-#pragma unroll
-  for (unsigned q = 0; q < 4; ++q)
-    w[q] = DecodePairMul1(p[2 * q], p[2 * q + 1]);
 }
 
 /// In-place unnormalized 128-point Walsh-Hadamard butterflies of one segment

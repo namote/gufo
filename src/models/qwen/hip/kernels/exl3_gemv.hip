@@ -116,6 +116,41 @@ __global__ __launch_bounds__(256) void Exl3RotateRowsKernel(
   }
 }
 
+// Grouped prefill rotation: problem blockIdx.y rotates its rows (gathered
+// through row_index when set) with its suh into its FP16 slab, row-major;
+// the arithmetic of Exl3RotateRowsKernel.
+__global__ __launch_bounds__(256) void Exl3RotateRowsGroupedKernel(
+    const Exl3RotateProblem* __restrict__ problems, unsigned k) {
+  const Exl3RotateProblem problem = problems[blockIdx.y];
+  const unsigned lane = threadIdx.x % 32;
+  const unsigned segments = k / exl3::kSegment;
+  const std::size_t item = std::size_t(blockIdx.x) * 8 + threadIdx.x / 32;
+  if (item >= std::size_t(problem.rows) * segments) {
+    return;
+  }
+  const std::size_t row = item / segments;
+  const std::size_t source =
+      problem.row_index != nullptr ? problem.row_index[row] : row;
+  const unsigned first =
+      static_cast<unsigned>(item % segments) * exl3::kSegment + lane * 4;
+  const auto* suh = reinterpret_cast<const _Float16*>(problem.suh);
+  auto* out = reinterpret_cast<_Float16*>(problem.out);
+  float v[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    v[j] = problem.x[source * problem.x_stride + first + j] *
+           static_cast<float>(suh[first + j]);
+    asm volatile("" : "+v"(v[j]));
+  }
+  exl3::Butterfly128(v, lane);
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    v[j] *= kHadamardScale;
+    asm volatile("" : "+v"(v[j]));
+    out[row * k + first + j] = static_cast<_Float16>(v[j]);
+  }
+}
+
 // RMSNorm of one 5120-wide row, the arithmetic of norm.hip RMSNormKernel
 // <5120> (cached row, FMA sum, the same tree), stored as FP32 and, for every
 // consumer, rotated with its suh into its FP16 slab (M = 1 lane-major), with
@@ -596,6 +631,23 @@ void LaunchMlpPass(const Exl3FastMlp& mlp, const float* x, std::size_t x_stride,
 }
 
 }  // namespace
+
+void LaunchExl3RotateRowsGrouped(const Exl3RotateProblem* problems,
+                                 std::size_t count, std::size_t max_rows,
+                                 std::size_t k, hipStream_t stream) {
+  if (count == 0 || count > 65535 || k == 0 || k % exl3::kSegment != 0) {
+    throw std::invalid_argument("EXL3 grouped rotation: unsupported call");
+  }
+  if (max_rows == 0) {
+    return;
+  }
+  const std::size_t items = max_rows * (k / exl3::kSegment);
+  hipLaunchKernelGGL(Exl3RotateRowsGroupedKernel,
+                     dim3(static_cast<unsigned>((items + 7) / 8),
+                          static_cast<unsigned>(count)),
+                     dim3(256), 0, stream, problems, static_cast<unsigned>(k));
+  HIP_CHECK(hipGetLastError());
+}
 
 void LaunchExl3RotateRows(const float* x, std::size_t x_stride,
                           std::size_t rows, std::size_t k,

@@ -353,3 +353,13 @@ struct DeviceLinear {                 // one EXL3 projection y = x W, W [k][n]
   - c02 팩에 `gufo-bf16emb.gguf`(sha256 `cb044d6c…`, 4.00/5.00과 같은 파일)를 기본으로 두었다.
   - `PLAN-FINAL-27B`의 타이밍 창(XB6)은 EXL3 4.00과 c02를 모두 이 sidecar로 불러온다(4곳).
   - 로더의 키 없는 기본값(Q8_0)은 바꾸지 않았다. 바꾸려면 코드 변경과 이미지 재빌드가 필요하다.
+
+### 최종 이미지 재빌드 b6e3ff82 (2026-10-31, gufo-06 요청)
+
+- **소스:** integ `b6e3ff82` = c97d555d + 3712dbe7(BF16 임베딩 기본값) + efc396ba(FN tensorless shard digest, `gguf_reader`에 `data_offset` 기록).
+  - 같은 방법으로 빌드했다(`build/final-b6e3ff82/`). 테스트 실행 파일은 207개다.
+- **이미지:**
+  - release `ai-tools/gufo-eval:final-b6e3ff82-rocm101` id `08fcc2b23cea`
+  - tests `final-b6e3ff82-tests-rocm101` id `4db07a5bff24`
+  - 둘 다 라벨 `b6e3ff827801febf5fd5ca83c3ba5042f9a02452`이다. c97d555d 이미지는 남겼다.
+- **sanity 창**(`PLAN-FINAL-B6E3-SANITY.json`, `final-b6e3-sanity/`): final-units 32/32 PASS. UD fingerprints는 rq2h와 byte-equal이고, BF16 prefill 창 0은 rq0-a01과 4095/4095 같다. 둘 다 COMPLETE, health_PASS다.

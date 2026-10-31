@@ -333,6 +333,7 @@ gpu::Exl3Scratch Scratch(Buffers& buffers, unsigned rows, unsigned k,
   s.slice = buffers.Make<float>(s.slice_elements);
   s.tiles = buffers.Make<gpu::Exl3RouteTile>(rows * used);
   s.tile_count = buffers.Make<std::uint32_t>(1);
+  s.down_exponents = buffers.Make<std::int32_t>(rows * used);
   s.routed_input =
       buffers.Make<std::uint16_t>(std::size_t{2} * rows * used * k);
   s.head_segments = buffers.Make<std::uint32_t>(33);
@@ -634,7 +635,7 @@ void Routed(bool shared, unsigned rows, unsigned k = 128, unsigned ff = 128,
       std::cout << "CONTROL " << current_case << " : down slot=" << slot
                 << " expert=" << expert << " subnormal_inputs=" << subnormals
                 << " packed_inner_L2=" << RelativeL2(packed_inner, raw)
-                << " FP32_inner_L2=" << RelativeL2(actual_inner, raw)
+                << " scaled_inner_L2=" << RelativeL2(actual_inner, raw)
                 << " restored_L2="
                 << RelativeL2(
                        std::span(actual).subspan(std::size_t{slot} * k, k),
@@ -659,7 +660,7 @@ void Routed(bool shared, unsigned rows, unsigned k = 128, unsigned ff = 128,
             << " down_FP16_changes=" << ideal_down_changes
             << " packed_down_inner_L2="
             << RelativeL2(down_packed_inner, expected_down)
-            << " FP32_down_inner_L2=" << RelativeL2(down_inner, expected_down)
+            << " scaled_down_inner_L2=" << RelativeL2(down_inner, expected_down)
             << '\n';
   Require(producer_mismatches == 0,
           "gate/up FP32 rotation + FP16 RNE mismatches=" +
@@ -671,7 +672,7 @@ void Routed(bool shared, unsigned rows, unsigned k = 128, unsigned ff = 128,
   Require(down_mismatches == 0, "down FP32 rotation + FP16 RNE mismatches=" +
                                     std::to_string(down_mismatches));
   Near(down_inner, expected_down, 1e-5,
-       "down inner FP32 vs FP64 matched input");
+       "down inner scaled vs FP64 matched input");
   Near(actual, restored_down, 1e-5,
        "down restoration vs FP64 with frozen GPU inner output");
   Near(actual, matched, 1e-5, "down output vs FP64 with frozen GPU FP16 input");

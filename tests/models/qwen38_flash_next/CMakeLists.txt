@@ -44,6 +44,11 @@ if (ENGINE_ENABLE_HIP)
 
   add_qwen38_flash_next_test(exl3_ops gufo_qwen38_flash_next_reference "hip;gpu;gfx1151;exl3")
   set_source_files_properties(exl3_ops_test.cpp PROPERTIES LANGUAGE HIP)
+  add_qwen38_flash_next_test(exl3_moe_kernel gufo_qwen38_flash_next "hip;gpu;gfx1151;exl3")
+  set_source_files_properties(exl3_moe_kernel_test.cpp PROPERTIES LANGUAGE HIP)
+  # Match production device arithmetic while keeping CPU oracles strict.
+  set_source_files_properties(exl3_moe_kernel_test.cpp PROPERTIES
+    COMPILE_OPTIONS "-O3;-Xarch_device;-ffast-math;-fno-finite-math-only")
   add_test(NAME qwen38_flash_next.exl3_shared_invariance
     COMMAND qwen38_flash_next_exl3_ops_test --shared-invariance-only)
   set_tests_properties(qwen38_flash_next.exl3_shared_invariance PROPERTIES

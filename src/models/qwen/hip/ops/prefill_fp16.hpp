@@ -1,9 +1,11 @@
 #ifndef GUFO_MODELS_QWEN_HIP_OPS_PREFILL_FP16_HPP_
 #define GUFO_MODELS_QWEN_HIP_OPS_PREFILL_FP16_HPP_
 #include <cstddef>
+#include <cstdint>
 
 #include "src/core/gguf_reader.hpp"
 #include "src/core/quant/exl3/device.hpp"
+#include "src/models/qwen/hip/ops/exl3_prefill_bucket.hpp"
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 namespace gufo::hip {
@@ -11,16 +13,56 @@ namespace gufo::hip {
 // scratch allocations after their BF16 contents are no longer live.
 void LaunchFloatToFp16(const float* input, void* output, std::size_t elements,
                        hipStream_t stream);
-// EXL3 prefill projection (plan/exl3/X3-DESIGN.md): the FP16 GEMM frame with
-// the trellis decode producer. x is the FP16 rotated input [batch][k]
-// (H(suh * x) per 128 elements, row-major); y [batch][n] FP32 receives
-// svh * H(x W') (residual: added to y). Supported: mul1, integer K 1..6,
-// n and k positive, n % 256 == 0, k % 128 == 0.
+// EXL3 trellis-decode WMMA GEMM (plan/exl3/X3-DESIGN.md; model-independent
+// API: plan/exl3/F3-PLAN.md "F3-API"). x is the FP16 rotated input [rows][k]
+// (H(suh * x) per 128 elements, row-major, LaunchExl3RotateRows); y [rows][n]
+// FP32 receives svh * H(x W') (residual: added to y). The FP16 WMMA
+// accumulation bound is (k / 16) * 2^-23 relative L2 (X3-RESULTS.md).
+// Supported: mul1, integer K 1..7, n and k positive multiples of 128.
+[[nodiscard]] bool Exl3GemmShapeSupported(
+    std::uint32_t k, std::uint32_t n, quant::exl3::BitRate rate,
+    quant::exl3::Codebook codebook) noexcept;
 [[nodiscard]] bool Exl3PrefillSupported(
     const quant::exl3::DeviceLinear& linear) noexcept;
 void LaunchExl3PrefillGemm(const quant::exl3::DeviceLinear& linear,
                            const void* x, float* y, std::size_t batch,
                            bool residual, hipStream_t stream);
+// One problem of a grouped launch (an expert bucket). Device memory.
+struct Exl3GemmProblem {
+  const std::uint16_t* trellis;  // [k/16][n/16][16K]
+  const std::uint16_t* svh;      // FP16 [n]
+  const void* x;                 // FP16 rotated rows [rows][k]
+  float* y;                      // [rows][n] FP32
+  std::uint32_t rows;            // 0 skips the problem
+  std::uint32_t reserved;
+};
+// Every problem of `problems` (device array, count <= 65535) with the same k,
+// n and rate, in one launch; blocks past a problem's rows exit. max_rows
+// bounds every problem's rows and picks the tile (<= 64: narrow).
+void LaunchExl3PrefillGemmGrouped(const Exl3GemmProblem* problems,
+                                  std::size_t count, std::size_t max_rows,
+                                  std::uint32_t k, std::uint32_t n,
+                                  quant::exl3::BitRate rate, bool residual,
+                                  hipStream_t stream);
+// Raw inner products of expert buckets (Flash-Next routed prefill): for
+// every active descriptor b < min(*device_bucket_count, max_buckets) and
+// row r < count, inner[(first + r) * n + j] = sum_i input[(first + r) * k +
+// i] * W'[i][j] in FP32 for the bank's expert (its trellis only; no output
+// Hadamard, svh or suh). input is the FP16 rotated slab [rows][k], inner
+// [rows][n], both packed; rows past count are neither read nor written. The
+// count is read on the device (graph-replay safe). Each value depends only
+// on its own input row and expert, never on the partition into buckets,
+// tile_rows or its position in a tile. Bank entries must be mul1 K5 with
+// this k and n (checked on the device: a mismatching bucket writes NaN);
+// k and n multiples of 128, tile_rows 1..64 (16/32/64 are the tuned tiles).
+void LaunchExl3PrefillBucketInner(const quant::exl3::DeviceLinear* device_bank,
+                                  const Exl3PrefillBucket* device_buckets,
+                                  const std::uint32_t* device_bucket_count,
+                                  std::uint32_t max_buckets,
+                                  std::uint32_t tile_rows,
+                                  const std::uint16_t* input, float* inner,
+                                  std::uint32_t k, std::uint32_t n,
+                                  hipStream_t stream);
 // Optional residual and sum_out preserve the FP32 residual link; sum_out may
 // alias input. The normalization reduction matches LaunchBatchedRMSNorm.
 // The FP16 output must be disjoint from the FP32 inputs and weights.
