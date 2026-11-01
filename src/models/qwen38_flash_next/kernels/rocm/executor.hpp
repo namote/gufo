@@ -994,6 +994,21 @@ private:
     std::uint32_t rows{0};
   };
   mutable DeferredNorm xn_deferred_{};
+  /// The norm (residual, gamma, rows) whose tiled Q8 rows an EXL3 prefill
+  /// combine left in s_.xn_q8t for the next mixer's W8A8 down projection.
+  mutable DeferredNorm xn_q8t_norm_{};
+  /// Every trunk mixer has a Q8_0 down copy (DeviceMixer::down_q8): EXL3
+  /// prefill combines then emit tiled Q8 norms instead of F16.
+  bool hc_down_q8_{false};
+  /// Set before an EXL3 prefill MoE whose output only the next combine
+  /// reads: the MoE then leaves its expert sum to that combine
+  /// (exl3_moe_pending_), which forms it per token in LDS.
+  mutable bool exl3_moe_defer_{false};
+  struct PendingExl3Moe {
+    const DeviceLayer* layer{nullptr};
+    std::uint32_t rows{0};
+  };
+  mutable PendingExl3Moe exl3_moe_pending_{};
   /// Partial sums per inject logit the last HcMix left in s_.inject.
   mutable std::uint32_t inject_parts_{1};
   /// Inject weights whose partials the last combine already wrote to
