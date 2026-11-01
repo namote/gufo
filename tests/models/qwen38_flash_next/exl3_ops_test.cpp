@@ -1691,10 +1691,13 @@ void PrefillScratchEstimate() {
       gpu::Executor::EstimateExl3PrefillScratchBytes(c, 4096, &error);
   const auto through =
       gpu::Executor::EstimateExl3PrefillScratchBytes(c, 4224, &error);
-  Require(chunk == 629489160, "4096-row additional scratch byte count");
-  Require(through == 649160440, "4224-row tail-capacity scratch byte count");
-  std::cout << "MEMORY EXL3 prefill P4096=" << chunk << " bytes (600.328 MiB)"
-            << " P4224=" << through << " bytes (619.088 MiB)\n";
+  // The inverse slot map adds 4 bytes per assignment (fused combine).
+  Require(chunk == 629489160 + 4096 * 10 * 4,
+          "4096-row additional scratch byte count");
+  Require(through == 649160440 + 4224 * 10 * 4,
+          "4224-row tail-capacity scratch byte count");
+  std::cout << "MEMORY EXL3 prefill P4096=" << chunk << " bytes (600.48 MiB)"
+            << " P4224=" << through << " bytes (619.25 MiB)\n";
   Require(gpu::Executor::EstimateExl3PrefillScratchBytes(c, 0, &error) == 0 &&
               !error.empty(),
           "zero-row scratch must be rejected");

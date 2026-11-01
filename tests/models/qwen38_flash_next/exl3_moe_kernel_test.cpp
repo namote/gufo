@@ -246,6 +246,7 @@ int main() {
 
 #include "src/core/hip/detail/exl3_gemv.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
 namespace gpu = gufo::models::qwen38_flash_next::rocm;
 namespace ex = gufo::quant::exl3;
@@ -817,6 +818,33 @@ void PrefillDispatch(gpu::Exl3BucketGemm gemm, int bits, int up_bits = 0,
     Require(std::memcmp(actual.data(), production.data(),
                         actual.size() * sizeof(float)) == 0,
             "default production adapter differs from explicit X3");
+    // Raw dots + fused combine == restored rows + MoeEpilogue, bit for bit.
+    std::vector<float> weights(assignments), shared(rows * k),
+        gate_logits(rows * 3);
+    for (unsigned i = 0; i < assignments; ++i)
+      weights[i] = 0.05F + 0.01F * float(i % 13);
+    for (unsigned i = 0; i < shared.size(); ++i)
+      shared[i] = (int(i % 31) - 15) * 0.0125F;
+    for (unsigned i = 0; i < gate_logits.size(); ++i)
+      gate_logits[i] = (int(i % 7) - 3) * 0.5F;
+    auto* dw = buffers.Copy(weights);
+    auto* dsh = buffers.Copy(shared);
+    auto* dg = buffers.Copy(gate_logits);
+    auto* combined = buffers.Make<float>(rows * k);
+    auto* reference = buffers.Make<float>(rows * k);
+    gpu::MoeEpilogue(y, dw, dsh, dg + 1, 3, reference, rows, used, k, nullptr);
+    auto raw_scratch = s;
+    raw_scratch.inverse = buffers.Make<std::int32_t>(assignments);
+    gpu::Exl3PrefillExpertsRaw(layer, dx, di, rows, used, tile_rows,
+                               raw_scratch, nullptr);
+    gpu::Exl3PrefillCombine(layer, raw_scratch, rows, used, dw, dsh, dg + 1, 3,
+                            combined, nullptr);
+    Check(hipDeviceSynchronize());
+    const auto want = Read(reference, rows * k);
+    const auto got = Read(combined, rows * k);
+    Require(
+        std::memcmp(want.data(), got.data(), want.size() * sizeof(float)) == 0,
+        "fused prefill combine differs from restore + MoeEpilogue");
   }
   hipStream_t stream;
   Check(hipStreamCreate(&stream));

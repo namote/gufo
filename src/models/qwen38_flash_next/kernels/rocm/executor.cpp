@@ -120,6 +120,7 @@ bool PlanExl3Prefill(const Config& c, std::uint32_t rows,
       !add(assignments * std::max(c.hidden_size, c.expert_ff),
            sizeof(std::uint16_t)) ||
       !add(assignments * c.hidden_size, sizeof(float)) ||
+      !add(assignments, sizeof(std::int32_t)) ||
       !add(assignments, sizeof(std::int32_t))) {
     AssignError(error, "EXL3 prefill scratch byte size overflows size_t");
     return false;
@@ -1159,6 +1160,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     // remain separate from stage down_e, which receives the scattered rows.
     pp.out = f32(A * c.hidden_size);
     pp.down_exponents = Alloc<std::int32_t>(a, A, error_msg);
+    pp.inverse = Alloc<std::int32_t>(a, A, error_msg);
     e->exl3_prefill_scratch_bytes_ = layout.bytes;
   }
   s.tokens = Alloc<std::int32_t>(a, T, error_msg);
@@ -3744,8 +3746,9 @@ bool Executor::Exl3Experts(const DeviceLayer& l, const float* x, float* out,
       // tree when a Sync/checkpoint boundary moves. X3 is a phase contract,
       // not a minimum-row heuristic; its 64-row tile never changes here.
       const auto scratch = Exl3PrefillView();
-      Exl3PrefillExperts(l, x, s_.ids, s_.down_e, rows, c.num_experts_used,
-                         kExl3PrefillTileRows, scratch, stream_);
+      // Raw down dots stay packed; the combine below restores and sums them.
+      Exl3PrefillExpertsRaw(l, x, s_.ids, rows, c.num_experts_used,
+                            kExl3PrefillTileRows, scratch, stream_);
       if (diagnostics_active_) {
         cycle_diagnostics_.prefill_expert_rows += rows;
         cycle_diagnostics_.expert_tile_reads_complete = false;
@@ -3756,6 +3759,12 @@ bool Executor::Exl3Experts(const DeviceLayer& l, const float* x, float* out,
     }
     if (!JoinSide(error))
       return false;
+    if (prefill_phase) {
+      Exl3PrefillCombine(l, Exl3PrefillView(), rows, c.num_experts_used,
+                         s_.weights, s_.shexp_out, s_.router + c.num_experts,
+                         c.num_experts + 1, out, stream_);
+      return true;
+    }
     MoeEpilogue(s_.down_e, s_.weights, s_.shexp_out, s_.router + c.num_experts,
                 c.num_experts + 1, out, rows, c.num_experts_used, c.hidden_size,
                 stream_);

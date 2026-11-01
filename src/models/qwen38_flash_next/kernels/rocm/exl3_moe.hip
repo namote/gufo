@@ -413,7 +413,8 @@ __global__ __launch_bounds__(1024) void DescribeBuckets(
 __global__ __launch_bounds__(256) void FillBucketSlots(const std::int32_t* ids,
                                                        unsigned assignments,
                                                        const unsigned* offsets,
-                                                       std::int32_t* slots) {
+                                                       std::int32_t* slots,
+                                                       std::int32_t* inverse) {
   // Stable compaction of this expert's slots, 256 IDs per step: a wave
   // ballot ranks the lanes, the eight wave totals rank the waves.
   const unsigned expert = blockIdx.x, tid = threadIdx.x;
@@ -434,8 +435,12 @@ __global__ __launch_bounds__(256) void FillBucketSlots(const std::int32_t* ids,
       wave_base += w < wave ? wave_counts[w] : 0;
       total += wave_counts[w];
     }
-    if (hit)
-      slots[next + wave_base + before] = static_cast<std::int32_t>(slot);
+    if (hit) {
+      const unsigned packed = next + wave_base + before;
+      slots[packed] = static_cast<std::int32_t>(slot);
+      if (inverse != nullptr)
+        inverse[slot] = static_cast<std::int32_t>(packed);
+    }
     next += total;
     __syncthreads();
   }
@@ -529,7 +534,8 @@ __global__ void RotateGateUpBuckets(const ex::DeviceLinear* gate,
 __global__ void RestoreActivateRotateBuckets(
     const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
     const ex::DeviceLinear* down, const unsigned* offsets, unsigned experts,
-    float* gate_y, const float* up_y, std::uint16_t* output, unsigned width) {
+    float* gate_y, const float* up_y, std::uint16_t* output, unsigned width,
+    bool keep_activation) {
   const unsigned row = blockIdx.y, lane = threadIdx.x;
   if (row >= offsets[experts])
     return;
@@ -558,7 +564,9 @@ __global__ void RestoreActivateRotateBuckets(
                         static_cast<float>(us[first + j]);
     float activation = (value / (1.0F + expf(-value))) * other;
     asm volatile("" : "+v"(activation));
-    gate_y[offset + j] = activation;
+    // Only the qualification trace reads the FP32 activation back.
+    if (keep_activation)
+      gate_y[offset + j] = activation;
     gv[j] = activation * static_cast<float>(ds[first + j]);
     asm volatile("" : "+v"(gv[j]));
   }
@@ -957,7 +965,8 @@ void Exl3BuildExpertBuckets(const std::int32_t* ids, std::uint32_t assignments,
                             std::uint32_t* offsets, std::int32_t* slots,
                             Exl3ExpertBucket* buckets,
                             std::uint32_t* bucket_count,
-                            std::uint32_t max_buckets, hipStream_t stream) {
+                            std::uint32_t max_buckets, hipStream_t stream,
+                            std::int32_t* inverse) {
   if (experts == 0 || (tile_rows != 16 && tile_rows != 32 && tile_rows != 64))
     throw std::invalid_argument("EXL3 buckets need experts and 16/32/64 rows");
   const auto bound = std::min<std::uint64_t>(
@@ -969,7 +978,7 @@ void Exl3BuildExpertBuckets(const std::int32_t* ids, std::uint32_t assignments,
   hipLaunchKernelGGL(DescribeBuckets, dim3(1), dim3(1024), 0, stream, offsets,
                      experts, tile_rows, buckets, bucket_count, max_buckets);
   hipLaunchKernelGGL(FillBucketSlots, dim3(experts), dim3(256), 0, stream, ids,
-                     assignments, offsets, slots);
+                     assignments, offsets, slots, inverse);
   Check();
 }
 
@@ -1040,7 +1049,8 @@ void Exl3PrefillExperts(const DeviceLayer& layer, const float* x,
 void Exl3PrefillDown(const DeviceTensor& down, std::uint32_t assignments,
                      std::uint32_t tile_rows, const Exl3PrefillScratch& scratch,
                      Exl3BucketGemm gemm, hipStream_t stream,
-                     const Exl3PrefillTrace* trace, float* scatter_out) {
+                     const Exl3PrefillTrace* trace, float* scatter_out,
+                     bool raw_only) {
   if (assignments == 0)
     return;
   if (assignments > scratch.max_assignments || gemm == nullptr ||
@@ -1071,6 +1081,10 @@ void Exl3PrefillDown(const DeviceTensor& down, std::uint32_t assignments,
                        scratch.down_exponents, scratch.input, scratch.out,
                        down.cols, down.rows, assignments, counts);
   });
+  if (raw_only) {
+    Check();
+    return;
+  }
   hipLaunchKernelGGL(RestoreDownBuckets, dim3(down.rows / 128, assignments),
                      dim3(32), 0, stream, down.device_exl3, scratch.offsets,
                      down.experts, scratch.down_exponents, scratch.out,
@@ -1078,11 +1092,42 @@ void Exl3PrefillDown(const DeviceTensor& down, std::uint32_t assignments,
   Check();
 }
 
+namespace {
+void PrefillExperts(const DeviceLayer& layer, const float* x,
+                    const std::int32_t* ids, float* out, std::uint32_t rows,
+                    std::uint32_t used, std::uint32_t tile_rows,
+                    const Exl3PrefillScratch& scratch, Exl3BucketGemm gemm,
+                    hipStream_t stream, const Exl3PrefillTrace* trace,
+                    bool raw_only);
+}  // namespace
+
 void Exl3PrefillExperts(const DeviceLayer& layer, const float* x,
                         const std::int32_t* ids, float* out, std::uint32_t rows,
                         std::uint32_t used, std::uint32_t tile_rows,
                         const Exl3PrefillScratch& scratch, Exl3BucketGemm gemm,
                         hipStream_t stream, const Exl3PrefillTrace* trace) {
+  PrefillExperts(layer, x, ids, out, rows, used, tile_rows, scratch, gemm,
+                 stream, trace, false);
+}
+
+void Exl3PrefillExpertsRaw(const DeviceLayer& layer, const float* x,
+                           const std::int32_t* ids, std::uint32_t rows,
+                           std::uint32_t used, std::uint32_t tile_rows,
+                           const Exl3PrefillScratch& scratch,
+                           hipStream_t stream) {
+  if (scratch.inverse == nullptr)
+    throw std::invalid_argument("EXL3 raw prefill needs the inverse slot map");
+  PrefillExperts(layer, x, ids, nullptr, rows, used, tile_rows, scratch,
+                 Exl3PrefillBucketInner, stream, nullptr, true);
+}
+
+namespace {
+void PrefillExperts(const DeviceLayer& layer, const float* x,
+                    const std::int32_t* ids, float* out, std::uint32_t rows,
+                    std::uint32_t used, std::uint32_t tile_rows,
+                    const Exl3PrefillScratch& scratch, Exl3BucketGemm gemm,
+                    hipStream_t stream, const Exl3PrefillTrace* trace,
+                    bool raw_only) {
   const std::uint64_t assignments = std::uint64_t{rows} * used;
   if (assignments == 0)
     return;
@@ -1099,7 +1144,8 @@ void Exl3PrefillExperts(const DeviceLayer& layer, const float* x,
   const auto& d = layer.ffn_down_exps;
   Exl3BuildExpertBuckets(ids, assignments, g.experts, tile_rows,
                          scratch.offsets, scratch.slots, scratch.buckets,
-                         scratch.bucket_count, scratch.max_buckets, stream);
+                         scratch.bucket_count, scratch.max_buckets, stream,
+                         scratch.inverse);
   const auto projection = [&](const DeviceTensor& bank, float* target) {
     gemm(bank.device_exl3, scratch.buckets, scratch.bucket_count,
          scratch.max_buckets, tile_rows, scratch.input, target, bank.cols,
@@ -1136,13 +1182,99 @@ void Exl3PrefillExperts(const DeviceLayer& layer, const float* x,
   hipLaunchKernelGGL(
       RestoreActivateRotateBuckets, dim3(d.cols / 128, assignments), dim3(32),
       0, stream, g.device_exl3, u.device_exl3, d.device_exl3, scratch.offsets,
-      d.experts, scratch.gate, scratch.up, scratch.input, d.cols);
+      d.experts, scratch.gate, scratch.up, scratch.input, d.cols,
+      trace != nullptr && trace->activation != nullptr);
   if (trace != nullptr)
     PrefillSnapshot(trace->activation, scratch.gate,
                     std::size_t{assignments} * g.rows * sizeof(float), stream);
-  // The restore writes each row to its slot: no separate scatter pass.
+  // The restore writes each row to its slot: no separate scatter pass. Raw:
+  // scratch.out keeps the packed raw dots for Exl3PrefillCombine.
   Exl3PrefillDown(d, assignments, tile_rows, scratch, gemm, stream, trace,
-                  out);
+                  raw_only ? nullptr : out, raw_only);
+  Check();
+}
+}  // namespace
+
+namespace {
+// RestoreDownBuckets' arithmetic for each of a token's slots, then
+// MoeEpilogueKernel's weighted sum (same expressions, values pinned between
+// them), straight from the packed raw rows: neither the restored rows nor
+// their slot-ordered copy reach memory. One wave per 128-wide segment.
+__global__ __launch_bounds__(256) void PrefillCombineKernel(
+    const ex::DeviceLinear* bank, const unsigned* offsets, unsigned experts,
+    const std::int32_t* inverse, const std::int32_t* exponents,
+    const float* raw, const float* weights, const float* shared,
+    const float* gate, unsigned gate_stride, float* out, unsigned k,
+    unsigned width) {
+  const unsigned t = blockIdx.y, lane = threadIdx.x % 32;
+  const unsigned segment = blockIdx.x * 8 + threadIdx.x / 32;
+  if (segment * 128 >= width)
+    return;
+  const unsigned first = segment * 128 + lane * 4;
+  constexpr unsigned kMaxSlots = 16;
+  float acc[4];
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j) {
+    acc[j] = 0.0F;
+    asm volatile("" : "+v"(acc[j]));
+  }
+  for (unsigned slot = 0; slot < kMaxSlots; ++slot) {
+    if (slot >= k)
+      break;
+    const unsigned assignment = t * k + slot;
+    const unsigned packed = static_cast<unsigned>(inverse[assignment]);
+    const unsigned lo = BucketExpert(offsets, experts, packed);
+    const auto* svh = reinterpret_cast<const _Float16*>(bank[lo].svh);
+    const int exponent = exponents[packed];
+    const float scale =
+        exponent > 0 ? __builtin_bit_cast(float, unsigned(127 - exponent) << 23)
+                     : 1.0F;
+    const auto offset = std::size_t{packed} * width + first;
+    float v[4];
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) {
+      v[j] = raw[offset + j] * scale;
+      asm volatile("" : "+v"(v[j]));
+    }
+    arithmetic::Butterfly128(v, lane);
+    const float w = weights[assignment];
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) {
+      float restored = (v[j] * arithmetic::kHadamardScale) *
+                       static_cast<float>(svh[first + j]);
+      asm volatile("" : "+v"(restored));
+      float a = acc[j] + w * restored;
+      asm volatile("" : "+v"(a));
+      acc[j] = a;
+    }
+  }
+  const float g = gate[std::size_t{t} * gate_stride];
+  const float sig = 1.0f / (1.0f + __expf(-g));
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j) {
+    const std::size_t idx = std::size_t{t} * width + first + j;
+    out[idx] = acc[j] + sig * shared[idx];
+  }
+}
+}  // namespace
+
+void Exl3PrefillCombine(const DeviceLayer& layer,
+                        const Exl3PrefillScratch& scratch, std::uint32_t rows,
+                        std::uint32_t used, const float* weights,
+                        const float* shared, const float* gate,
+                        std::uint32_t gate_stride, float* out,
+                        hipStream_t stream) {
+  const auto& d = layer.ffn_down_exps;
+  if (rows == 0)
+    return;
+  if (used == 0 || used > 16 || d.rows % 128 != 0 ||
+      scratch.inverse == nullptr || scratch.out == nullptr)
+    throw std::invalid_argument("EXL3 prefill combine: unsupported call");
+  hipLaunchKernelGGL(PrefillCombineKernel, dim3((d.rows / 128 + 7) / 8, rows),
+                     dim3(256), 0, stream, d.device_exl3, scratch.offsets,
+                     d.experts, scratch.inverse, scratch.down_exponents,
+                     scratch.out, weights, shared, gate, gate_stride, out,
+                     used, d.rows);
   Check();
 }
 
