@@ -5,6 +5,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <hipcub/block/block_radix_sort.hpp>
 #include <stdexcept>
 #include <type_traits>
@@ -6518,26 +6519,28 @@ bool HcCombine(float* res, const float* block_out, const float* inject,
                std::uint32_t n_tokens, std::uint32_t hidden,
                std::uint32_t streams, float eps, hipStream_t stream,
                bool decode, bool any_width, __half* xn_half, float* xn_scale,
-               const Exl3PrefillMoeRows* moe) {
+               const Exl3PrefillMoeRows* moe, void* xn_q8t) {
   // One block per token wants a batch: a decode step keeps the
   // one-block-per-stream kernel's parallelism.
   if (!decode && (n_tokens >= 16 || any_width) && streams == 4 &&
       hidden % 128 == 0 && hidden <= 2560) {
     xn_half = gamma != nullptr ? xn_half : nullptr;
-    xn_scale = xn_half != nullptr ? xn_scale : nullptr;
+    xn_q8t = gamma != nullptr ? xn_q8t : nullptr;
+    const bool side = xn_half != nullptr || xn_q8t != nullptr;
+    xn_scale = side ? xn_scale : nullptr;
     if (moe != nullptr) {
       hipLaunchKernelGGL((HcCombineVec4Kernel<float, false, false, true>),
                          dim3(n_tokens), dim3(kThreads), 0, stream, res,
-                         block_out, inject, inject_parts, gamma, xn, nullptr,
+                         block_out, inject, inject_parts, gamma, xn, xn_q8t,
                          hidden, eps, nullptr, nullptr, nullptr, xn_half,
                          xn_scale, *moe);
     } else {
       hipLaunchKernelGGL(HcCombineVec4Kernel<float>, dim3(n_tokens),
                          dim3(kThreads), 0, stream, res, block_out, inject,
-                         inject_parts, gamma, xn, nullptr, hidden, eps, nullptr,
+                         inject_parts, gamma, xn, xn_q8t, hidden, eps, nullptr,
                          nullptr, nullptr, xn_half, xn_scale);
     }
-    return xn_half != nullptr;
+    return side;
   }
   if (moe != nullptr)
     throw std::invalid_argument(
@@ -6866,6 +6869,38 @@ bool HcDownF16Gemm(const void* w, const void* x_tiled, __half* out,
   }
   LaunchW8A8Tail<true>(w, x_tiled, out, tiled, n_tokens, 320, 10240, stream);
   return true;
+}
+
+__global__ void QuantizeHalfQ8_0Kernel(const __half* x, std::uint8_t* out,
+                                       std::size_t blocks) {
+  const std::size_t b =
+      blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (b >= blocks)
+    return;
+  float v[32];
+  float amax = 0.0F;
+#pragma unroll
+  for (int j = 0; j < 32; ++j) {
+    v[j] = __half2float(x[(b * 32) + j]);
+    amax = fmaxf(amax, fabsf(v[j]));
+  }
+  const float d = amax / 127.0F;
+  const float id = d != 0.0F ? 1.0F / d : 0.0F;
+  std::uint8_t* block = out + (b * 34);
+  const __half dh = __float2half_rn(d);
+  std::memcpy(block, &dh, 2);
+#pragma unroll
+  for (int j = 0; j < 32; ++j)
+    block[2 + j] =
+        static_cast<std::uint8_t>(static_cast<std::int8_t>(roundf(v[j] * id)));
+}
+
+void QuantizeHalfQ8_0(const void* half, void* q8, std::size_t count,
+                      hipStream_t stream) {
+  const std::size_t blocks = count / 32;
+  hipLaunchKernelGGL(
+      QuantizeHalfQ8_0Kernel, dim3(Blocks(blocks)), dim3(kThreads), 0, stream,
+      static_cast<const __half*>(half), static_cast<std::uint8_t*>(q8), blocks);
 }
 
 bool W8A8Gemm(const void* w, const void* x_tiled, float* out, std::size_t batch,

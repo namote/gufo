@@ -206,7 +206,7 @@ bool HcCombine(float* res, const float* block_out, const float* inject,
                std::uint32_t streams, float eps, hipStream_t stream,
                bool decode = false, bool any_width = false,
                __half* xn_half = nullptr, float* xn_scale = nullptr,
-               const Exl3PrefillMoeRows* moe = nullptr);
+               const Exl3PrefillMoeRows* moe = nullptr, void* xn_q8t = nullptr);
 /// The F32 norm HcCombine left out (four streams): res * scale * gamma in
 /// the combine's own expression.
 void HcNormFromRes(const float* res, const float* gamma, const float* xn_scale,
@@ -312,6 +312,10 @@ void NarrowActivations(const float* x, void* out, bool bf16, std::size_t count,
 std::size_t Q8TiledBytes(std::size_t batch, std::size_t k);
 void QuantizeQ8Tiled(const float* x, void* out, std::size_t batch,
                      std::size_t k, hipStream_t stream);
+/// F16 values (count % 32 == 0) to ggml Q8_0 blocks: d = amax / 127 as
+/// F16, codes round(x / d).
+void QuantizeHalfQ8_0(const void* half, void* q8, std::size_t count,
+                      hipStream_t stream);
 bool W8A8Gemm(const void* w, const void* x_tiled, float* out, std::size_t batch,
               std::size_t m, std::size_t k, hipStream_t stream);
 /// Native wave64 launch, selected by W8A8Gemm for wide output projections.

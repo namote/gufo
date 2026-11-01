@@ -1175,6 +1175,12 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                  std::size_t{c.expert_ff}, std::size_t{c.shared_expert_ff}})
           : model.max_half_cols();
   s.x_half = Alloc<std::uint16_t>(a, T * e->half_input_cols_, error_msg);
+  if (model.output().exl3 != nullptr) {
+    e->hc_down_q8_ = !model.layers().empty();
+    for (const auto& layer : model.layers())
+      e->hc_down_q8_ = e->hc_down_q8_ && !layer.hc_attn.down_q8.empty() &&
+                       !layer.hc_ffn.down_q8.empty();
+  }
   for (void*& slot : s.x_q8) {
     slot = Alloc<std::uint8_t>(
         a,
@@ -2544,6 +2550,7 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
   const Config& c = config();
   inject_fused_ = nullptr;
   xn_deferred_ = {};  // s_.xn is rewritten (or left stale) below
+  xn_q8t_norm_ = {};
   // An EXL3 prefill MoE output left to this combine: the four-lane kernel
   // below forms it; any other route gets it in s_.block_out first.
   Exl3PrefillMoeRows exl3_moe{};
@@ -2659,15 +2666,26 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
   // residual and these scales.
   float* const xn_scale =
       half_norm && MatrixRows(n_tokens) ? s_.xn_scale : nullptr;
-  if (HcCombine(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn,
-                n_tokens, c.hidden_size, c.hc_count, c.rms_eps, stream_,
-                exl3 && !prefill_phase, exl3 && prefill_phase,
-                half_norm ? static_cast<__half*>(s_.x_half) : nullptr, xn_scale,
-                exl3_moe_fused ? &exl3_moe : nullptr)) {
-    half_src_ = s_.xn;
-    half_rows_ = n_tokens;
-    half_cols_ = c.HcDim();
-    half_bf16_ = false;
+  // With Q8_0 mixer down weights the down projection is W8A8 and reads the
+  // norm as tiled Q8 rows at every prefill width; no F16 copy is needed.
+  const bool q8_norm = half_norm && hc_down_q8_;
+  if (HcCombine(
+          res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn, n_tokens,
+          c.hidden_size, c.hc_count, c.rms_eps, stream_, exl3 && !prefill_phase,
+          exl3 && prefill_phase,
+          half_norm && !q8_norm ? static_cast<__half*>(s_.x_half) : nullptr,
+          xn_scale, exl3_moe_fused ? &exl3_moe : nullptr,
+          q8_norm ? s_.xn_q8t : nullptr)) {
+    if (q8_norm) {
+      xn_q8t_norm_ = {res, gamma, n_tokens};
+      if (half_src_ == s_.xn)
+        half_src_ = nullptr;
+    } else {
+      half_src_ = s_.xn;
+      half_rows_ = n_tokens;
+      half_cols_ = c.HcDim();
+      half_bf16_ = false;
+    }
     if (xn_scale != nullptr)
       xn_deferred_ = {res, gamma, n_tokens};
   } else if (half_src_ == s_.xn) {
@@ -2687,16 +2705,23 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   // A deferred norm feeds only the vectorized epilogue below (and the F16
   // down projection through the half cache); any other reader gets the F32
   // rows the combine left out, in its own expression.
+  // The combine's tiled Q8 norm of this mixer's input, for its W8A8 down.
+  const bool q8_down = normed && prefill_phase && !m.down_q8.empty() &&
+                       xn_q8t_norm_.res == res &&
+                       xn_q8t_norm_.gamma == m.norm.f32() &&
+                       xn_q8t_norm_.rows == n_tokens;
+  xn_q8t_norm_ = {};
   bool norm_from_res = false;
   if (normed && xn_deferred_.res != nullptr) {
     const DeferredNorm d = xn_deferred_;
     const bool other_inject = inject != nullptr && !m.inject.empty() &&
                               m.inject.type != GgmlType::kF32;
+    const bool half_down =
+        half_src_ == s_.xn && half_rows_ == n_tokens && half_cols_ == c.HcDim();
     norm_from_res = res == d.res && m.norm.f32() == d.gamma &&
                     n_tokens == d.rows && MatrixRows(n_tokens) &&
                     c.hc_count == 4 && c.hidden_size % 4 == 0 &&
-                    !other_inject && half_src_ == s_.xn &&
-                    half_rows_ == n_tokens && half_cols_ == c.HcDim();
+                    !other_inject && (half_down || q8_down);
     if (!norm_from_res)
       HcNormFromRes(d.res, d.gamma, s_.xn_scale, s_.xn, d.rows, c.hidden_size,
                     stream_);
@@ -2719,10 +2744,10 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       m.up.type == GgmlType::kQ8_0 && m.up.rows == c.HcDim() &&
       m.up.cols == c.hc_low_rank;
   const bool fused_down =
-      model_->output().exl3 != nullptr && !xn_half_ && !MatrixRows(n_tokens) &&
-      m.down.type == GgmlType::kF16 && m.up.type == GgmlType::kF16 &&
-      m.down.rows == 320 && m.down.cols == 10240 && c.hc_count == 4 &&
-      c.hc_low_rank == 320;
+      !q8_down && model_->output().exl3 != nullptr && !xn_half_ &&
+      !MatrixRows(n_tokens) && m.down.type == GgmlType::kF16 &&
+      m.up.type == GgmlType::kF16 && m.down.rows == 320 &&
+      m.down.cols == 10240 && c.hc_count == 4 && c.hc_low_rank == 320;
   if (fused_projection) {
     // The up projection writes x_half; keep its input in the gate buffer.
     if (!HcDownF16Gemm(m.down.data, s_.xn_q8t,
@@ -2732,9 +2757,10 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       return false;
     }
   } else {
-    if (xn_half_) {
-      if (!W8A8Gemm(m.down.data, s_.xn_q8t, s_.lo, n_tokens, m.down.rows,
-                    m.down.cols, stream_)) {
+    if (xn_half_ || q8_down) {
+      const DeviceTensor& down = q8_down ? m.down_q8 : m.down;
+      if (!W8A8Gemm(down.data, s_.xn_q8t, s_.lo, n_tokens, down.rows, down.cols,
+                    stream_)) {
         AssignError(error_msg, "W8A8 mixer down projection failed");
         return false;
       }
@@ -4061,7 +4087,8 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
             half_bf16_, xn_half_, inject_parts_, inject_fused_, q8_slot_,
             xn_q8_ready_, mixed_q8_ready_, xn_deferred_.res, xn_deferred_.gamma,
             xn_deferred_.rows, exl3_moe_defer_, exl3_moe_pending_.layer,
-            exl3_moe_pending_.rows);
+            exl3_moe_pending_.rows, xn_q8t_norm_.res, xn_q8t_norm_.gamma,
+            xn_q8t_norm_.rows);
         const auto before = std::apply(
             [](const auto&... fields) { return std::make_tuple(fields...); },
             dispatch);
