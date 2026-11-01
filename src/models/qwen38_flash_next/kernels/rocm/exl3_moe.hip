@@ -585,6 +585,81 @@ __global__ __launch_bounds__(256) void RotateGateUpTokens(
   }
 }
 
+// RestoreActivateRotateBuckets<_Float16> and ScaleDownRows in one pass: one
+// block per packed row (a wave per 128-wide segment) forms the FP16 down
+// input in registers, reduces its magnitude range over the row exactly as
+// ScaleDownRows does on the stored halves, and stores the scaled halves once.
+__global__ __launch_bounds__(1024) void RestoreActivateScaleBuckets(
+    const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
+    const ex::DeviceLinear* down, const unsigned* offsets, unsigned experts,
+    const _Float16* gate_y, const _Float16* up_y, std::uint16_t* output,
+    std::int32_t* exponents, unsigned width) {
+  const unsigned row = blockIdx.x, lane = threadIdx.x % 32;
+  const unsigned wave = threadIdx.x / 32, waves = blockDim.x / 32;
+  if (row >= offsets[experts])
+    return;
+  const unsigned lo = BucketExpert(offsets, experts, row);
+  const unsigned first = wave * 128 + lane * 4;
+  const auto* gs = reinterpret_cast<const _Float16*>(gate[lo].svh);
+  const auto* us = reinterpret_cast<const _Float16*>(up[lo].svh);
+  const auto* ds = reinterpret_cast<const _Float16*>(down[lo].suh);
+  const auto offset = std::size_t{row} * width + first;
+  float gv[4], uv[4];
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j) {
+    gv[j] = static_cast<float>(gate_y[offset + j]);
+    uv[j] = static_cast<float>(up_y[offset + j]);
+  }
+  arithmetic::Butterfly128(gv, lane);
+  arithmetic::Butterfly128(uv, lane);
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j) {
+    const float value = (gv[j] * arithmetic::kHadamardScale) *
+                        static_cast<float>(gs[first + j]);
+    const float other = (uv[j] * arithmetic::kHadamardScale) *
+                        static_cast<float>(us[first + j]);
+    float activation = (value / (1.0F + expf(-value))) * other;
+    asm volatile("" : "+v"(activation));
+    gv[j] = activation * static_cast<float>(ds[first + j]);
+    asm volatile("" : "+v"(gv[j]));
+  }
+  arithmetic::Butterfly128(gv, lane);
+  std::uint16_t bits[4];
+  unsigned minimum = 0x7fffU, maximum = 0;
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j) {
+    float scaled = gv[j] * arithmetic::kHadamardScale;
+    asm volatile("" : "+v"(scaled));
+    bits[j] = __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(scaled));
+    const unsigned value = bits[j] & 0x7fffU;
+    if (value != 0)
+      minimum = min(minimum, value);
+    maximum = max(maximum, value);
+  }
+  for (unsigned o = 16; o != 0; o >>= 1) {
+    minimum = min(minimum, __shfl_xor(minimum, o, 32));
+    maximum = max(maximum, __shfl_xor(maximum, o, 32));
+  }
+  __shared__ unsigned minima[32], maxima[32];
+  if (lane == 0) {
+    minima[wave] = minimum;
+    maxima[wave] = maximum;
+  }
+  __syncthreads();
+  minimum = 0x7fffU;
+  maximum = 0;
+  for (unsigned i = 0; i < waves; ++i) {
+    minimum = min(minimum, minima[i]);
+    maximum = max(maximum, maxima[i]);
+  }
+  const int exponent = DownExponent(minimum, maximum);
+  if (threadIdx.x == 0)
+    exponents[row] = exponent;
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j)
+    output[offset + j] = exponent > 0 ? ScaleHalf(bits[j], exponent) : bits[j];
+}
+
 // InT: float (Exl3PrefillExperts) or _Float16 (the FP16 raw path); the
 // activation itself is kept only in the float form.
 template<typename InT>
@@ -1126,8 +1201,9 @@ void Exl3PrefillDown(const DeviceTensor& down, std::uint32_t assignments,
     PrefillSnapshot(
         trace->down_input, scratch.input,
         std::size_t{assignments} * down.cols * sizeof(std::uint16_t), stream);
-  hipLaunchKernelGGL(ScaleDownRows, dim3(assignments), dim3(256), 0, stream,
-                     scratch.input, scratch.down_exponents, down.cols);
+  if (!raw_only)
+    hipLaunchKernelGGL(ScaleDownRows, dim3(assignments), dim3(256), 0, stream,
+                       scratch.input, scratch.down_exponents, down.cols);
   if (raw_only)
     // FP16 raw dots, unscaled by the row's exponent first (q6-gated).
     gufo::hip::LaunchExl3PrefillBucketInnerHalf(
@@ -1279,14 +1355,18 @@ void PrefillExperts(const DeviceLayer& layer, const float* x,
   if (trace != nullptr)
     PrefillSnapshot(trace->up_inner, scratch.up,
                     std::size_t{assignments} * u.rows * sizeof(float), stream);
-  if (raw_only)
-    hipLaunchKernelGGL(
-        RestoreActivateRotateBuckets<_Float16>, dim3(d.cols / 128, assignments),
-        dim3(32), 0, stream, g.device_exl3, u.device_exl3, d.device_exl3,
-        scratch.offsets, d.experts, reinterpret_cast<_Float16*>(scratch.gate),
-        reinterpret_cast<const _Float16*>(scratch.up), scratch.input, d.cols,
-        false);
-  else
+  if (raw_only) {
+    if (d.cols % 128 != 0 || d.cols > 4096)
+      throw std::invalid_argument("EXL3 prefill down width unsupported");
+    // Activation, down-input rotation and the down rows' power-of-two
+    // scaling in one pass (Exl3PrefillDown skips ScaleDownRows for it).
+    hipLaunchKernelGGL(RestoreActivateScaleBuckets, dim3(assignments),
+                       dim3(32 * (d.cols / 128)), 0, stream, g.device_exl3,
+                       u.device_exl3, d.device_exl3, scratch.offsets, d.experts,
+                       reinterpret_cast<const _Float16*>(scratch.gate),
+                       reinterpret_cast<const _Float16*>(scratch.up),
+                       scratch.input, scratch.down_exponents, d.cols);
+  } else
     hipLaunchKernelGGL(
         RestoreActivateRotateBuckets<float>, dim3(d.cols / 128, assignments),
         dim3(32), 0, stream, g.device_exl3, u.device_exl3, d.device_exl3,
