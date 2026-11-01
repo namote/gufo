@@ -1,0 +1,51 @@
+{
+  "code_commit": "b13b712aec7023e7c2abfefecbf6112a4bd9faa6",
+  "compiled_source_base": "0b5d58a3431c43bb15ba8a777f3ebeaae4408936",
+  "compiled_patch_sha256": "67a50024ddc3b6b00ad99809753899f68934065f6d982864059a55f66b47664e",
+  "as_built_revision": "0b5d58a3-prefill3-67a50024",
+  "image": "ai-tools/gufo-eval:f3-prefill3-67a50024-rocm101",
+  "image_id": "sha256:31fd777e84c185efbe8c55926cf46a48085d4d2a6bb3493bbf0cb3451f693bb3",
+  "worktrees_at_code_integration": {
+    "gufo-f3-integ": {
+      "branch": "ai-tools/f3-integ",
+      "commit": "b13b712aec7023e7c2abfefecbf6112a4bd9faa6",
+      "source_patch_sha256": "67a50024ddc3b6b00ad99809753899f68934065f6d982864059a55f66b47664e",
+      "compiled_input_listing_sha256": "013381b499839d59ad65ec3e8d55c1f448eada19a73b04f0952363556403d9f8",
+      "status": ""
+    },
+    "gufo": {
+      "branch": "ai-tools/port-u4f",
+      "commit": "b13b712aec7023e7c2abfefecbf6112a4bd9faa6",
+      "source_patch_sha256": "67a50024ddc3b6b00ad99809753899f68934065f6d982864059a55f66b47664e",
+      "compiled_input_listing_sha256": "013381b499839d59ad65ec3e8d55c1f448eada19a73b04f0952363556403d9f8",
+      "status": "?? .dockerignore"
+    },
+    "gufo-integ": {
+      "branch": "ai-tools/integ",
+      "commit": "b13b712aec7023e7c2abfefecbf6112a4bd9faa6",
+      "source_patch_sha256": "67a50024ddc3b6b00ad99809753899f68934065f6d982864059a55f66b47664e",
+      "compiled_input_listing_sha256": "013381b499839d59ad65ec3e8d55c1f448eada19a73b04f0952363556403d9f8",
+      "status": ""
+    }
+  },
+  "compiled_scope": [
+    "src",
+    "tests",
+    "tools",
+    "nix",
+    "flake.nix",
+    "flake.lock",
+    "CMakeLists.txt",
+    "CMakePresets.json",
+    "cmake",
+    "assets"
+  ],
+  "main_preexisting_untracked_preserved": {
+    "sha256": "49c26750db91feb1bb16a5792dafcb03edcb71aeb86926ddda42fb4821cb0f5d",
+    "bytes": 16
+  },
+  "root_free_bytes": 163372421120,
+  "baseline_or_model_tests_repeated_for_integration": false,
+  "remote_push": false,
+  "note": "A following documentation-only commit adds this proof. All listed compiled inputs remain identical; image labels retain as-built source snapshot."
+}

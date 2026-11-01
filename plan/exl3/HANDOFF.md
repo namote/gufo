@@ -19,6 +19,14 @@ Integration commits are source-identity attestations, not newly built image
 revisions. The source patch and installed hashes are in
 [F3-PREFILL-GRID-QUALIFICATION.json](F3-PREFILL-GRID-QUALIFICATION.json).
 
+Qualified code commit: `b13b712a`. It was fast-forwarded locally into
+`ai-tools/port-u4f` (the main gufo folder) and `ai-tools/integ`.
+[Integration proof](F3-INTEGRATION-BATCH3.json) confirms identical compiled
+inputs and the tested source patch across all three worktrees. The main
+folder's pre-existing untracked `.dockerignore` was preserved. This final
+documentation-only integration record needs no rebuild or repeated model test.
+No remote push was performed.
+
 Keep `build/f3-nix-incremental/{release,units,batch2,batch3,before-batch2}` and
 all frozen controls/receipts/images. New operator artifacts are in
 `build/f3-prefill-{store,epilogue,wave64,predecode,grid,grid-rest,cold}` and
