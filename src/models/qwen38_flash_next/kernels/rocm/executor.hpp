@@ -1009,6 +1009,11 @@ private:
     std::uint32_t rows{0};
   };
   mutable PendingExl3Moe exl3_moe_pending_{};
+  /// Set by Attention for KvarnAttention: the queries are already in the
+  /// KVarN frame (AttentionQueryRows), and the output gate is read from the
+  /// packed s_.qg rows (attn_gate_stride_) instead of s_.attn_gate.
+  mutable bool attn_q_rotated_{false};
+  mutable std::uint32_t attn_gate_stride_{0};
   /// Partial sums per inject logit the last HcMix left in s_.inject.
   mutable std::uint32_t inject_parts_{1};
   /// Inject weights whose partials the last combine already wrote to

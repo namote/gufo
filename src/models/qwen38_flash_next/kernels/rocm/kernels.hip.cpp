@@ -8474,6 +8474,139 @@ void RotateKvRows(__half* k_rows, __half* v_rows, std::uint32_t n_tokens,
                      staging_first);
 }
 
+/// AttentionQueryRows: one (token, head) row of 256 per block.
+template<bool kYarn, bool kRotate>
+__launch_bounds__(256) __global__ void AttentionQueryRowsKernel(
+    const float* __restrict__ qg, std::uint32_t qg_stride,
+    const float* __restrict__ gamma, float* __restrict__ q,
+    float* __restrict__ gate, std::uint32_t heads, std::uint32_t rotary_dim,
+    const std::uint32_t* start_pos, float theta, float eps,
+    const qwen::vision::DeviceRope* rope, [[maybe_unused]] YarnRope yarn) {
+  constexpr std::uint32_t d = hip::kKvarnHeadDim;
+  __shared__ float shared[32];
+  __shared__ float s_row[d];
+  const std::uint32_t t = blockIdx.x / heads;
+  const std::uint32_t h = blockIdx.x % heads;
+  const std::uint32_t i = threadIdx.x;
+  const float* src =
+      qg + (static_cast<std::size_t>(t) * qg_stride) + (h * 2 * d);
+  const std::size_t row = (static_cast<std::size_t>(t) * heads) + h;
+  if (gate != nullptr)
+    gate[(row * d) + i] = src[d + i];
+  // RmsNormKernel (one element per thread).
+  const float x = src[i];
+  // The square stays its own rounding: fast-math would otherwise fold the
+  // first lane exchange into an FMA with the partner's square.
+  const float ss = BlockSum(Materialize(x * x), shared);
+  const float scale = rsqrtf(ss / static_cast<float>(d) + eps);
+  // RmsNormKernel's (x * scale) * gamma.
+  s_row[i] = Materialize(Materialize(x * scale) * gamma[i]);
+  __syncthreads();
+  // RopeKernel's pair (i, i + half).
+  const std::uint32_t half = rotary_dim / 2;
+  if (i < half) {
+    float freq = powf(
+        theta, -2.0f * static_cast<float>(i) / static_cast<float>(rotary_dim));
+    if constexpr (kYarn)
+      freq = YarnFrequency(freq, i, yarn);
+    float s = 0.0f;
+    float c = 0.0f;
+    sincosf(qwen::vision::RopePosition(rope, *start_pos + t, i) * freq, &s, &c);
+    if constexpr (kYarn)
+      YarnScale(s, c, yarn);
+    const float a = s_row[i];
+    const float b = s_row[i + half];
+    // RopeKernel's compiled form in both variants: fma(a, c, -(b s)) and
+    // fma(a, s, b c).
+    s_row[i] = __fmaf_rn(a, c, -__fmul_rn(b, s));
+    s_row[i + half] = __fmaf_rn(a, s, __fmul_rn(b, c));
+  }
+  __syncthreads();
+  float* dst = q + (row * d);
+  if constexpr (kRotate) {
+    // RotateHeadRowsKernel: one wave, eight consecutive values per lane.
+    if (i >= 32)
+      return;
+    float y[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k)
+      y[k] = s_row[(8 * i) + k];
+    hip::kvarn_detail::Fwht256(y, i);
+    reinterpret_cast<float4*>(dst + (8 * i))[0] = make_float4(
+        y[0] * 0.0625F, y[1] * 0.0625F, y[2] * 0.0625F, y[3] * 0.0625F);
+    reinterpret_cast<float4*>(dst + (8 * i))[1] = make_float4(
+        y[4] * 0.0625F, y[5] * 0.0625F, y[6] * 0.0625F, y[7] * 0.0625F);
+  } else {
+    dst[i] = s_row[i];
+  }
+}
+
+bool AttentionQueryRows(const float* qg, std::uint32_t qg_stride,
+                        const float* gamma, float* q, float* gate,
+                        std::uint32_t n_tokens, std::uint32_t heads,
+                        std::uint32_t d, std::uint32_t rotary_dim,
+                        const std::uint32_t* start_pos, float theta, float eps,
+                        bool rotate, hipStream_t stream,
+                        const qwen::vision::DeviceRope* rope,
+                        const YarnRope& yarn) {
+  if (d != hip::kKvarnHeadDim || rotary_dim > d || rotary_dim % 2 != 0 ||
+      gamma == nullptr || n_tokens == 0)
+    return false;
+  const auto launch = [&](auto kernel) {
+    hipLaunchKernelGGL(kernel, dim3(n_tokens * heads), dim3(256), 0, stream, qg,
+                       qg_stride, gamma, q, gate, heads, rotary_dim, start_pos,
+                       theta, eps, rope, yarn);
+  };
+  if (yarn.enabled != 0)
+    rotate ? launch(AttentionQueryRowsKernel<true, true>)
+           : launch(AttentionQueryRowsKernel<true, false>);
+  else
+    rotate ? launch(AttentionQueryRowsKernel<false, true>)
+           : launch(AttentionQueryRowsKernel<false, false>);
+  return true;
+}
+
+/// GateRotatedContext: one wave per context row of 256.
+__launch_bounds__(256) __global__
+    void GateRotatedContextKernel(float* __restrict__ ctx,
+                                  const float* __restrict__ qg,
+                                  std::uint32_t qg_stride, std::uint32_t heads,
+                                  std::uint32_t rows) {
+  constexpr std::uint32_t d = hip::kKvarnHeadDim;
+  const std::uint32_t row = blockIdx.x * 8 + threadIdx.x / 32;
+  const std::uint32_t lane = threadIdx.x % 32;
+  if (row >= rows)
+    return;
+  float* p = ctx + std::size_t{row} * d + 8 * lane;
+  const float* g = qg + (static_cast<std::size_t>(row / heads) * qg_stride) +
+                   ((row % heads) * 2 * d) + d + 8 * lane;
+  float y[8];
+  const float4 lo = reinterpret_cast<const float4*>(p)[0];
+  const float4 hi = reinterpret_cast<const float4*>(p)[1];
+  y[0] = lo.x, y[1] = lo.y, y[2] = lo.z, y[3] = lo.w;
+  y[4] = hi.x, y[5] = hi.y, y[6] = hi.z, y[7] = hi.w;
+  hip::kvarn_detail::Fwht256(y, lane);
+  float out[8];
+#pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    // RotateHeadRowsKernel's stored value, then SigmoidMulKernel's product.
+    const float rotated = Materialize(y[k] * 0.0625F);
+    out[k] = rotated * Materialize(SigmoidF(g[k]));
+  }
+  reinterpret_cast<float4*>(p)[0] = make_float4(out[0], out[1], out[2], out[3]);
+  reinterpret_cast<float4*>(p)[1] = make_float4(out[4], out[5], out[6], out[7]);
+}
+
+void GateRotatedContext(float* ctx, const float* qg, std::uint32_t qg_stride,
+                        std::uint32_t n_tokens, std::uint32_t heads,
+                        hipStream_t stream) {
+  const std::uint32_t rows = n_tokens * heads;
+  if (rows == 0)
+    return;
+  hipLaunchKernelGGL(GateRotatedContextKernel, dim3((rows + 7) / 8), dim3(256),
+                     0, stream, ctx, qg, qg_stride, heads, rows);
+}
+
 void RotateHeadRows(float* x, std::uint32_t rows, hipStream_t stream) {
   if (rows == 0)
     return;
