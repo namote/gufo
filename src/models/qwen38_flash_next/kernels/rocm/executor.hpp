@@ -5,6 +5,7 @@
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -160,6 +161,7 @@ public:
 
 private:
   friend class Executor;
+  friend struct ExecutorTestAccess;
   friend struct PrefillCheckpoint;
   friend class gufo::models::qwen38_flash_next::ContinuationAdapter;
   Session() = default;
@@ -291,6 +293,10 @@ public:
     /// Trunk attention K/V as KVarN k4v4 records with token-major values
     /// (plan/exl3/F1-KVARN-DESIGN.md); the MTP layer stays FP16.
     bool kvarn{false};
+    /// Diagnostic chunk-policy hook for EXL3. Zero preserves the caller's
+    /// existing policy; a nonzero limit is bounded by max_batch. The caller
+    /// still supplies checkpoint/cancellation boundaries to PrefillChunkRows.
+    std::uint32_t exl3_prefill_chunk_rows{0};
   };
 
   ~Executor();
@@ -502,8 +508,77 @@ public:
   /// Whether trunk K/V are KVarN k4v4 (Options::kvarn).
   [[nodiscard]] bool kvarn() const noexcept { return options_.kvarn; }
 
+  [[nodiscard]] std::uint32_t PrefillChunkRows(
+      std::uint32_t requested, std::uint32_t until_checkpoint) const noexcept;
+  /// Host-only estimate of the disjoint persistent bucket slabs. Zero means
+  /// invalid geometry (error_msg explains); excludes existing stage gate/up,
+  /// s_.down_e and the decode path's 64 * used exponents. Uses a 64-row tile.
+  [[nodiscard]] static std::size_t EstimateExl3PrefillScratchBytes(
+      const Config& config, std::uint32_t rows,
+      std::string* error_msg = nullptr);
+  [[nodiscard]] std::size_t exl3_prefill_scratch_bytes() const noexcept {
+    return exl3_prefill_scratch_bytes_;
+  }
+
+  /// Opt-in operator/profiling diagnostics, following MtpTrace's eager path.
+  /// No production caller enables this implicitly. Counts cover the whole
+  /// executor/cohort; the engine supplies actual committed/proposed tokens
+  /// after acceptance, stops and cancellation, including copied proposals.
+  struct MtpCycleDiagnostics {
+    std::uint64_t committed_tokens{0}, drafts{0}, verify_rows{0};
+    /// One routed MLP tile (all three projections), summed over layers.
+    std::uint64_t expert_tile_reads{0};
+    /// False if a reference/bucket-prefill route ran without eight-row tiles.
+    bool expert_tile_reads_complete{true};
+    /// 128-column draft-head segments actually projected, including prefix.
+    std::uint64_t head_segments{0}, catch_up_rows{0};
+    /// Rows that entered the cache-only branch, rather than a full body.
+    std::uint64_t cache_only_rows{0};
+    /// Routed prefill rows and actual 64-row expert buckets, across layers.
+    std::uint64_t prefill_expert_rows{0}, prefill_expert_buckets{0};
+    /// Decode/verify assignments sent through the allocated scaled-down path
+    /// (which can still select widened fallback for an unsafe row).
+    std::uint64_t scaled_down_rows{0};
+    /// Dense compressed prefill input rows (summed over projections), and
+    /// actual grouped rotation/GEMM calls. Plain prefill rows counted
+    /// separately.
+    std::uint64_t prefill_dense_rows{0}, prefill_dense_rotation_groups{0},
+        prefill_dense_gemm_groups{0}, prefill_plain_rows{0};
+    /// Plain prefill rows using FP16 WMMA, including singleton/tail chunks.
+    std::uint64_t prefill_plain_half_rows{0};
+    /// Exclusive call wall times. draft_ms/catch_up_ms include inline heads;
+    /// head_ms covers standalone MtpHeads. Diagnostic count downloads and
+    /// synchronization are included; use an uninstrumented run for speed.
+    double target_ms{0}, draft_ms{0}, head_ms{0}, catch_up_ms{0}, wall_ms{0};
+  };
+  [[nodiscard]] bool BeginMtpCycleDiagnostics(std::string* error_msg) const;
+  [[nodiscard]] bool EndMtpCycleDiagnostics(std::uint64_t committed_tokens,
+                                            std::uint64_t drafts,
+                                            MtpCycleDiagnostics* output,
+                                            std::string* error_msg) const;
+
 private:
   Executor() = default;
+  friend struct ExecutorTestAccess;
+
+  enum class DiagnosticStage { kTarget, kDraft, kHead, kCatchUp };
+  struct DiagnosticPhase {
+    const Executor& executor;
+    DiagnosticStage stage;
+    std::chrono::steady_clock::time_point started{};
+    DiagnosticPhase* parent{nullptr};
+    double children_ms{0};
+    bool active{false};
+    DiagnosticPhase(const Executor& e, DiagnosticStage s);
+    ~DiagnosticPhase();
+  };
+  mutable bool diagnostics_active_{false};
+  mutable std::uint32_t diagnostic_depth_{0};
+  mutable DiagnosticPhase* diagnostic_phase_{nullptr};
+  mutable std::chrono::steady_clock::time_point diagnostic_started_{};
+  mutable MtpCycleDiagnostics cycle_diagnostics_{};
+  bool DiagnosticCount(const std::uint32_t* device, std::uint64_t* total,
+                       std::string* error_msg) const;
 
   /// Visits every device region of a snapshot in payload order with
   /// (device pointer or null when sizing, payload offset, bytes, name).
@@ -532,6 +607,13 @@ private:
              std::string* error_msg) const;
   bool Dense(const DeviceTensor& w, const float* x, float* out,
              std::uint32_t n_tokens, std::string* error_msg) const;
+  /// Cache-only MTP uses the packed GGUF slice or the separate EXL3 K/V
+  /// group. Separate outputs retain the full attention path's arithmetic.
+  bool MtpKvProjection(const DeviceLayer& layer, const float* x,
+                       std::uint32_t rows, std::string* error_msg) const;
+  bool StoreMtpKv(const DeviceLayer& layer, const Session& session,
+                  std::uint32_t rows, const YarnRope& yarn,
+                  std::string* error_msg) const;
   /// out = (up . x) * silu(gate . x); s_.shexp_gate is scratch.
   /// With `down` (the projection that consumes the result), a wide batch
   /// leaves only that projection's staged input form (F16 rows in
@@ -704,6 +786,8 @@ private:
     float* inject;
     float* block_out;
     float* hc_defer_w;  ///< [t][4] stream weights of a deferred combine
+    /// [t][4] stream norm scales of a combine that left s_.xn unwritten.
+    float* xn_scale{nullptr};
     // linear attention
     float* qkv;
     float* z;
@@ -772,10 +856,22 @@ private:
     float* mtp_scores;
   };
   mutable Scratch s_{};
+  std::size_t half_input_cols_{0};
   Exl3Scratch exl3_{};
+  gufo::hip::Exl3RotateProblem* exl3_dense_rotations_{nullptr};
+  gufo::hip::Exl3GemmProblem* exl3_dense_gemms_{nullptr};
+  bool Exl3DensePrefill(std::initializer_list<const DeviceTensor*> weights,
+                        std::initializer_list<float*> outputs, const float* x,
+                        std::uint32_t rows, std::string* error) const;
+  Exl3PrefillScratch exl3_prefill_{};
+  std::size_t exl3_prefill_scratch_bytes_{0};
+  [[nodiscard]] Exl3PrefillScratch Exl3PrefillView() const;
   bool Exl3Group(std::initializer_list<const DeviceTensor*> weights,
                  std::initializer_list<float*> outputs, const float* x,
-                 std::uint32_t rows, std::string* error) const;
+                 std::uint32_t rows, std::string* error,
+                 std::size_t shape_basis_n = 0) const;
+  bool PlainDensePrefill(const DeviceTensor& weight, const float* x, float* out,
+                         std::uint32_t rows, std::string* error) const;
   bool Exl3Experts(const DeviceLayer& layer, const float* x, float* out,
                    std::uint32_t rows, std::string* error) const;
   [[nodiscard]] Scratch RowScratch(const Scratch& base,
@@ -889,6 +985,35 @@ private:
   mutable bool half_bf16_{false};
   /// Set by a combine that wrote s_.xn_half / s_.xn_q8t instead of s_.xn.
   mutable bool xn_half_{false};
+  /// An EXL3 prefill combine that wrote the F16 norm and s_.xn_scale but no
+  /// F32 s_.xn: its residual, gamma and rows, for the next mixer to
+  /// recompute the norm from (or materialize it into s_.xn).
+  struct DeferredNorm {
+    const float* res{nullptr};
+    const float* gamma{nullptr};
+    std::uint32_t rows{0};
+  };
+  mutable DeferredNorm xn_deferred_{};
+  /// The norm (residual, gamma, rows) whose tiled Q8 rows an EXL3 prefill
+  /// combine left in s_.xn_q8t for the next mixer's W8A8 down projection.
+  mutable DeferredNorm xn_q8t_norm_{};
+  /// Every trunk mixer has a Q8_0 down copy (DeviceMixer::down_q8): EXL3
+  /// prefill combines then emit tiled Q8 norms instead of F16.
+  bool hc_down_q8_{false};
+  /// Set before an EXL3 prefill MoE whose output only the next combine
+  /// reads: the MoE then leaves its expert sum to that combine
+  /// (exl3_moe_pending_), which forms it per token in LDS.
+  mutable bool exl3_moe_defer_{false};
+  struct PendingExl3Moe {
+    const DeviceLayer* layer{nullptr};
+    std::uint32_t rows{0};
+  };
+  mutable PendingExl3Moe exl3_moe_pending_{};
+  /// Set by Attention for KvarnAttention: the queries are already in the
+  /// KVarN frame (AttentionQueryRows), and the output gate is read from the
+  /// packed s_.qg rows (attn_gate_stride_) instead of s_.attn_gate.
+  mutable bool attn_q_rotated_{false};
+  mutable std::uint32_t attn_gate_stride_{0};
   /// Partial sums per inject logit the last HcMix left in s_.inject.
   mutable std::uint32_t inject_parts_{1};
   /// Inject weights whose partials the last combine already wrote to

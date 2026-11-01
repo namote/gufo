@@ -1029,14 +1029,32 @@ void CheckDraftVocabLifecycle(const std::shared_ptr<qfn::Model>& model) {
     Require(session != nullptr, error);
     return session;
   };
-  // Every rare token appears in the first copy of the pattern; the copies
-  // after it run well past the window without a miss.
+  // Continue an assistant's requested repetition. Raw repeated text can be
+  // interpreted as a user turn and answered with an English explanation.
+  // Every rare token appears in the first copy; the complete copies after
+  // it run well past the window without a miss.
   const auto repeated = [&](const std::string& text) {
+    namespace qt = gufo::tokenization;
     const auto pattern = model->Tokenize(text);
-    Require(RareTokens(pattern) * 3 >= pattern.size(),
+    Require(!pattern.empty() && RareTokens(pattern) * 3 >= pattern.size(),
             "lifecycle pattern is not mostly rare tokens");
-    return RepeatTokens(pattern,
-                        pattern.size() * 2 + qfn::kMtpDraftVocabWindow + 64);
+    const std::array messages{qt::ChatMessage{
+        qt::ChatRole::kUser,
+        "Repeat the following text exactly 100 times. Output only the "
+        "repetitions, with no explanation or numbering:\n" +
+            text}};
+    const auto encoded = qt::QwenChatTemplate::RenderAndTokenize(
+        model->tokenizer(), messages, {.enable_thinking = false}, &error);
+    Require(encoded.has_value(), error);
+    std::vector<std::int32_t> prompt(encoded->begin(), encoded->end());
+    const auto copies =
+        2 +
+        (qfn::kMtpDraftVocabWindow + 64 + pattern.size() - 1) / pattern.size();
+    const auto continuation = RepeatTokens(pattern, copies * pattern.size());
+    prompt.insert(prompt.end(), continuation.begin(), continuation.end());
+    Require(prompt.size() + 64 < 2048,
+            "lifecycle fixture is not a short prompt");
+    return prompt;
   };
   const auto thai = repeated(
       "แมวสีส้มนอน"
@@ -1098,6 +1116,35 @@ void CheckDraftVocabLifecycle(const std::shared_ptr<qfn::Model>& model) {
   Require(tabled.drafting > 0, "no tabled cycle drafted through the MTP head");
   Require(tabled.small_head == tabled.drafting,
           "tabled text did not return to the small head");
+  if (RareTokens(thai_out) * 3 < thai_out.size()) {
+    // Keep the coverage requirement below strict, but distinguish a fixture
+    // continuation assumption from speculative decoding changing the target.
+    auto ar = model->CreateSession(gufo::core::SessionMode::kAutoregressive,
+                                   6145, &error);
+    Require(ar && ar->Sync(thai, &error), error);
+    sampling::SamplerState ar_greedy({}, history(thai));
+    std::vector<std::int32_t> reference;
+    while (reference.size() < thai_out.size()) {
+      qfn::Session::DecodeResult step;
+      Require(ar->DecodeStep(1, ar_greedy, &step, &error, false), error);
+      Require(step.tokens.size() == 1, "empty Thai AR diagnostic step");
+      reference.push_back(step.tokens.front());
+    }
+    std::cout << "draft table Thai coverage: prompt_tokens=" << thai.size()
+              << " generated=" << thai_out.size()
+              << " rare=" << RareTokens(thai_out)
+              << " AR_tokens_exact=" << (reference == thai_out)
+              << "\nMTP text: " << model->Decode(thai_out)
+              << "\nAR text: " << model->Decode(reference) << "\nMTP IDs:";
+    for (const auto token : thai_out)
+      std::cout << ' ' << token;
+    std::cout << "\nAR IDs:";
+    for (const auto token : reference)
+      std::cout << ' ' << token;
+    std::cout << '\n' << std::flush;
+    Require(reference == thai_out,
+            "Thai continuation differs between AR and speculative decoding");
+  }
   Require(RareTokens(thai_out) * 3 >= thai_out.size(),
           "the repeated Thai continuation has too few rare tokens");
   // Wrong table IDs would reject every drafted rare token. Accepted copies
@@ -1906,6 +1953,8 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
 }
 
 int main(int argc, char** argv) {
+  const bool draft_vocab_only =
+      argc == 6 && std::string_view(argv[5]) == "--draft-vocab-only";
   const bool lookup_only =
       argc == 6 && std::string_view(argv[5]) == "--lookup-only";
   const bool execution_only =
@@ -1921,13 +1970,15 @@ int main(int argc, char** argv) {
       argc == 6 && std::string_view(argv[5]) == "--cache-only";
   const bool eos_only = argc == 6 && std::string_view(argv[5]) == "--eos-only";
   if ((argc != 5 && !batch_only && !prefill_only && !sampling_only &&
-       !cache_only && !eos_only && !execution_only && !lookup_only) ||
+       !cache_only && !eos_only && !execution_only && !lookup_only &&
+       !draft_vocab_only) ||
       std::string_view(argv[1]) != "--model" ||
       std::string_view(argv[3]) != "--mtp-model") {
-    std::cerr << "Usage: session_test --model FIRST.gguf --mtp-model MTP.gguf "
-                 "[--batch-only | --prefill-only | --sampling-only | "
-                 "--cache-only | --eos-only | --lookup-only | "
-                 "--execution-only TOKENS]\n";
+    std::cerr
+        << "Usage: session_test --model FIRST.gguf --mtp-model MTP.gguf "
+           "[--batch-only | --prefill-only | --sampling-only | "
+           "--cache-only | --eos-only | --lookup-only | --draft-vocab-only | "
+           "--execution-only TOKENS]\n";
     return 77;
   }
   if (execution_only) {
@@ -1947,9 +1998,22 @@ int main(int argc, char** argv) {
         {.max_context = execution_only ? execution_tokens + 16 : 6145,
          .mtp_model_path = argv[4],
          .max_draft_tokens = 7,
-         .decode_concurrency = 8},
+         .decode_concurrency = draft_vocab_only ? 1U : 8U},
         &error);
     Require(model != nullptr, error);
+    if (draft_vocab_only) {
+      CheckDraftVocabLifecycle(model);
+      model.reset();
+      model = qfn::Model::Load(argv[2],
+                               {.max_context = 6145,
+                                .mtp_model_path = argv[4],
+                                .max_draft_tokens = 7,
+                                .decode_concurrency = 2},
+                               &error);
+      Require(model != nullptr, error);
+      CheckSampledDraftHead(model);
+      return 0;
+    }
     if (lookup_only) {
       CheckLookupBatch(model);
       return 0;

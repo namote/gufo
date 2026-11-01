@@ -3,6 +3,7 @@
 
 #include <deque>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <span>
 #include <string>
@@ -33,7 +34,25 @@ struct Exl3Storage {
   std::deque<std::vector<Exl3HostLinear>> linears;
   std::deque<std::vector<std::uint8_t>> converted;
   std::deque<std::string> names;
+  /// Only missing in-shard MTP mixer tensors; bytes live in converted.
+  std::map<std::string, quant::exl3::Tensor, std::less<>> supplementary;
 };
+
+/// Bind actual per-tensor integer K3..K7 rates. Every expert in this bank
+/// must agree; different banks/projections may use different rates.
+[[nodiscard]] TensorRef BindExl3LinearBank(Exl3Storage& storage,
+                                           const std::string& module,
+                                           std::uint32_t k, std::uint32_t n,
+                                           std::uint32_t experts = 1);
+/// Prefer in-shard MTP mixer operands. A patch supplies missing tensors;
+/// overlapping operands must have identical dtype, shape and payload bytes.
+/// Returns the header identity of the checkpoint and any supplied patch.
+[[nodiscard]] std::string PrepareExl3MtpMixer(
+    Exl3Storage& storage, const Config& config,
+    const std::filesystem::path& patch = {});
+
+/// Identity of retained GGUF shard filenames, sizes and aligned headers.
+[[nodiscard]] std::string Exl3PleHeadersDigest(const core::GgufReader& reader);
 
 /// Header/metadata validation only; projection payloads remain demand mapped.
 [[nodiscard]] std::optional<ModelWeights> LoadExl3Model(
@@ -48,8 +67,10 @@ struct Exl3Storage {
                                                  std::uint32_t head_dim,
                                                  const Config& config);
 /// Independently usable CPU projection, with lossless block permutations.
+/// decode_storage includes the decode path's FP32 input rotation and FP16
+/// storage boundary; the default retains the mathematical FP64 formula.
 void Exl3MatVec(const Exl3HostLinear& linear, std::span<const float> x,
-                std::span<float> y);
+                std::span<float> y, bool decode_storage = false);
 
 }  // namespace gufo::models::qwen38_flash_next
 #endif

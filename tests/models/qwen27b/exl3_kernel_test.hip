@@ -1100,9 +1100,9 @@ void TestGrouped(std::mt19937& rng, const std::size_t (&rows)[4],
 // partition gives bit-identical values; each against the FP64 inner product
 // at the WMMA bound; rows outside every bucket and descriptors past the
 // device count stay untouched; a bank entry of the wrong rate writes NaN.
-void TestBuckets(std::size_t k, std::size_t n, std::mt19937& rng) {
+void TestBuckets(std::size_t k, std::size_t n, int bits, std::mt19937& rng) {
   constexpr std::size_t kExperts = 4;
-  const BitRate rate{5, false};
+  const BitRate rate{bits, false};
   const std::size_t expert_rows[kExperts] = {1, 37, 0, 70};
   std::size_t total = 1;  // row 0 belongs to no bucket (sentinel)
   for (std::size_t e : expert_rows)
@@ -1111,8 +1111,8 @@ void TestBuckets(std::size_t k, std::size_t n, std::mt19937& rng) {
   std::vector<DeviceLinear> bank(kExperts + 1);
   std::vector<void*> owned;
   for (std::size_t e = 0; e <= kExperts; ++e) {
-    // Entry kExperts: K6, a contract violation.
-    const BitRate r = e < kExperts ? rate : BitRate{6, false};
+    // Entry kExperts: another rate, a contract violation.
+    const BitRate r = e < kExperts ? rate : BitRate{bits == 6 ? 5 : 6, false};
     std::vector<std::uint16_t> trellis((k / 16) * (n / 16) * r.TileWords());
     for (auto& w : trellis)
       w = static_cast<std::uint16_t>(rng());
@@ -1141,14 +1141,18 @@ void TestBuckets(std::size_t k, std::size_t n, std::mt19937& rng) {
   Check(hipMalloc(&d_inner, total * n * 4));
   const double bar = static_cast<double>(k) / 16.0 * std::ldexp(1.0, -23);
   std::vector<float> first_result;
-  for (std::uint32_t tile_rows : {16U, 32U, 64U, 7U}) {
+  // 128: 64-row tiles plus the hot-expert class (the 70-row expert in one
+  // 128-token bucket).
+  for (std::uint32_t partition : {16U, 32U, 64U, 7U, 128U}) {
+    const std::uint32_t tile_rows = std::min(partition, 64U);
     std::vector<gufo::hip::Exl3PrefillBucket> buckets;
     std::uint32_t row = 1;
     for (std::uint32_t e = 0; e < kExperts; ++e) {
-      for (std::uint32_t r = 0; r < expert_rows[e]; r += tile_rows)
+      const std::uint32_t size =
+          partition == 128 && expert_rows[e] <= 64 ? 64 : partition;
+      for (std::uint32_t r = 0; r < expert_rows[e]; r += size)
         buckets.push_back(
-            {e, std::min<std::uint32_t>(tile_rows, expert_rows[e] - r),
-             row + r});
+            {e, std::min<std::uint32_t>(size, expert_rows[e] - r), row + r});
       row += static_cast<std::uint32_t>(expert_rows[e]);
     }
     const auto active = static_cast<std::uint32_t>(buckets.size());
@@ -1162,12 +1166,12 @@ void TestBuckets(std::size_t k, std::size_t n, std::mt19937& rng) {
     gufo::hip::LaunchExl3PrefillBucketInner(
         d_bank, d_buckets, d_count, static_cast<std::uint32_t>(buckets.size()),
         tile_rows, d_input, d_inner, static_cast<std::uint32_t>(k),
-        static_cast<std::uint32_t>(n), nullptr);
+        static_cast<std::uint32_t>(n), rate, nullptr);
     Check(hipDeviceSynchronize());
     const auto got = Download(d_inner, total * n);
-    const std::string name = "bucket k=" + std::to_string(k) +
-                             " n=" + std::to_string(n) +
-                             " tile_rows=" + std::to_string(tile_rows);
+    const std::string name =
+        "bucket K" + std::to_string(bits) + " k=" + std::to_string(k) +
+        " n=" + std::to_string(n) + " partition=" + std::to_string(partition);
     bool untouched = true;
     for (std::size_t j = 0; j < n; ++j)
       untouched =
@@ -1221,7 +1225,8 @@ void TestBuckets(std::size_t k, std::size_t n, std::mt19937& rng) {
                     hipMemcpyHostToDevice));
     gufo::hip::LaunchExl3PrefillBucketInner(
         d_bank, d_buckets, d_count, 1, 16, d_input, d_inner,
-        static_cast<std::uint32_t>(k), static_cast<std::uint32_t>(n), nullptr);
+        static_cast<std::uint32_t>(k), static_cast<std::uint32_t>(n), rate,
+        nullptr);
     Check(hipDeviceSynchronize());
     const auto got = Download(d_inner, total * n);
     bool poisoned = true, rest = true;
@@ -1377,8 +1382,11 @@ int main() {
   TestDecodeTiles(rng);
   TestGrouped(rng, {0, 7, 33, 300}, 300, false);
   TestGrouped(rng, {5, 0, 64, 1}, 64, true);
-  TestBuckets(2560, 640, rng);
-  TestBuckets(640, 2560, rng);
+  TestBuckets(2560, 640, 5, rng);
+  TestBuckets(640, 2560, 5, rng);
+  // Mixed-rate packs (4.05 / Kyojin): K4 and K7 expert banks.
+  TestBuckets(2560, 640, 4, rng);
+  TestBuckets(640, 2560, 7, rng);
   // Flash-Next attention q (production geometry 4 x 4 for q + k + v) and a
   // smaller q (2 x 4); k + v alone would take 2 x 16.
   TestShapeBasis(12288, rng);

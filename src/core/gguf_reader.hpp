@@ -150,6 +150,8 @@ struct GgufMappedRegion {
   /// instead of resolving `source_path` again.
   platform::PlatformFile file_descriptor{platform::kInvalidFile};
   std::filesystem::path source_path{};
+  /// Aligned start of the GGUF data section, even when no tensors exist.
+  std::size_t data_offset{0};
 };
 
 /// Zero-copy, lightweight GGUF binary reader and tensor indexer.
@@ -247,6 +249,7 @@ private:
 
   std::uint32_t version_{0};
   std::uint64_t alignment_{32};
+  std::size_t data_offset_{0};
   std::unordered_map<std::string_view, GgufMetadataValue> metadata_;
   std::vector<GgufTensorInfo> tensors_;
   std::unordered_map<std::string_view, std::size_t> tensor_index_;

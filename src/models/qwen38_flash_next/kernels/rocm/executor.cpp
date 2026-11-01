@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
@@ -81,6 +82,53 @@ WeightType SmallType(GgmlType type) {
 // The tier's tiled kernels compute whole column tiles; below this width the
 // matrix-vector kernels read each weight once per row and win outright.
 constexpr std::uint32_t kVecBatch = 8;
+constexpr std::uint32_t kExl3PrefillTileRows = 64;
+
+struct Exl3PrefillLayout {
+  std::uint32_t assignments{0}, buckets{0};
+  std::size_t bytes{0};
+};
+
+bool PlanExl3Prefill(const Config& c, std::uint32_t rows,
+                     Exl3PrefillLayout* layout, std::string* error) {
+  if (rows == 0 || c.num_experts_used == 0 ||
+      c.num_experts_used > c.num_experts || c.hidden_size == 0 ||
+      c.expert_ff == 0) {
+    AssignError(error, "invalid EXL3 prefill scratch geometry");
+    return false;
+  }
+  const std::uint64_t assignments = std::uint64_t{rows} * c.num_experts_used;
+  const auto buckets =
+      std::min(assignments, std::uint64_t{c.num_experts} +
+                                assignments / kExl3PrefillTileRows);
+  if (assignments > std::numeric_limits<std::uint32_t>::max() ||
+      buckets > 65535) {
+    AssignError(error, "EXL3 prefill scratch exceeds device descriptor limits");
+    return false;
+  }
+  std::size_t bytes = 0;
+  const auto add = [&](std::uint64_t count, std::size_t element) {
+    if (count > (std::numeric_limits<std::size_t>::max() - bytes) / element)
+      return false;
+    bytes += static_cast<std::size_t>(count) * element;
+    return true;
+  };
+  if (!add(std::uint64_t{c.num_experts} + 1, sizeof(std::uint32_t)) ||
+      !add(assignments, sizeof(std::int32_t)) ||
+      !add(buckets, sizeof(Exl3ExpertBucket)) ||
+      !add(1, sizeof(std::uint32_t)) ||
+      !add(assignments * std::max(c.hidden_size, c.expert_ff),
+           sizeof(std::uint16_t)) ||
+      !add(assignments * c.hidden_size, sizeof(float)) ||
+      !add(assignments, sizeof(std::int32_t)) ||
+      !add(assignments, sizeof(std::int32_t))) {
+    AssignError(error, "EXL3 prefill scratch byte size overflows size_t");
+    return false;
+  }
+  *layout = {static_cast<std::uint32_t>(assignments),
+             static_cast<std::uint32_t>(buckets), bytes};
+  return true;
+}
 // Keep prompt arithmetic independent of chunk width. A scoped, per-thread
 // policy also lets the output head retain its existing logits-row arithmetic.
 thread_local bool prefill_phase = false;
@@ -1079,21 +1127,60 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     ex.slice_elements = std::max(T, std::size_t{64}) * (c.indexer_heads + 1) *
                         c.indexer_head_dim;
     ex.slice = f32(ex.slice_elements);
-    ex.gather = f32(T * c.hidden_size);
-    ex.gate = f32(T * c.expert_ff);
-    ex.up = f32(T * c.expert_ff);
-    ex.out = f32(T * c.hidden_size);
     const auto assignments = std::size_t{64} * c.num_experts_used;
-    ex.routed_input =
-        Alloc<std::uint16_t>(a, 2 * assignments * c.hidden_size, error_msg);
+    ex.routed_input = Alloc<std::uint16_t>(
+        a,
+        assignments *
+            std::max(std::size_t{2} * c.hidden_size, std::size_t{c.expert_ff}),
+        error_msg);
     ex.tiles = Alloc<Exl3RouteTile>(a, assignments, error_msg);
     ex.tile_count = Alloc<std::uint32_t>(a, 1, error_msg);
+    ex.down_exponents = Alloc<std::int32_t>(a, assignments, error_msg);
+    e->exl3_dense_rotations_ =
+        Alloc<gufo::hip::Exl3RotateProblem>(a, 3, error_msg);
+    e->exl3_dense_gemms_ = Alloc<gufo::hip::Exl3GemmProblem>(a, 3, error_msg);
     ex.head_segments =
         Alloc<std::uint32_t>(a, kMtpDraftExtraRows + 1, error_msg);
     ex.head_values = f32(c.vocab_size + std::size_t{kMtpDraftExtraRows} * 128);
+    Exl3PrefillLayout layout;
+    if (!PlanExl3Prefill(c, e->options_.max_batch, &layout, error_msg))
+      return nullptr;
+    auto& pp = e->exl3_prefill_;
+    pp.max_assignments = layout.assignments;
+    pp.max_buckets = layout.buckets;
+    const std::size_t A = layout.assignments;
+    pp.offsets =
+        Alloc<std::uint32_t>(a, std::size_t{c.num_experts} + 1, error_msg);
+    pp.slots = Alloc<std::int32_t>(a, A, error_msg);
+    pp.buckets = Alloc<Exl3ExpertBucket>(a, layout.buckets, error_msg);
+    pp.bucket_count = Alloc<std::uint32_t>(a, 1, error_msg);
+    pp.input = Alloc<std::uint16_t>(a, A * std::max(c.hidden_size, c.expert_ff),
+                                    error_msg);
+    // Gate/up borrow the current stage view at dispatch. Packed out must
+    // remain separate from stage down_e, which receives the scattered rows.
+    pp.out = f32(A * c.hidden_size);
+    pp.down_exponents = Alloc<std::int32_t>(a, A, error_msg);
+    pp.inverse = Alloc<std::int32_t>(a, A, error_msg);
+    e->exl3_prefill_scratch_bytes_ = layout.bytes;
   }
   s.tokens = Alloc<std::int32_t>(a, T, error_msg);
-  s.x_half = Alloc<std::uint16_t>(a, T * model.max_half_cols(), error_msg);
+  // F32 plain weights do not contribute to max_half_cols during upload.
+  // EXL3 prefill nevertheless narrows their inputs, including F32 HC/PLE.
+  e->half_input_cols_ =
+      model.output().exl3 != nullptr
+          ? std::max(
+                {model.max_half_cols(), hc_dim, hidden,
+                 std::size_t{c.PleEmbeddingDim()}, std::size_t{c.SsmValueDim()},
+                 std::size_t{c.AttentionQDim()}, std::size_t{c.hc_low_rank},
+                 std::size_t{c.expert_ff}, std::size_t{c.shared_expert_ff}})
+          : model.max_half_cols();
+  s.x_half = Alloc<std::uint16_t>(a, T * e->half_input_cols_, error_msg);
+  if (model.output().exl3 != nullptr) {
+    e->hc_down_q8_ = !model.layers().empty();
+    for (const auto& layer : model.layers())
+      e->hc_down_q8_ = e->hc_down_q8_ && !layer.hc_attn.down_q8.empty() &&
+                       !layer.hc_ffn.down_q8.empty();
+  }
   for (void*& slot : s.x_q8) {
     slot = Alloc<std::uint8_t>(
         a,
@@ -1122,6 +1209,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   s.inject = f32(T * c.hc_count * HcInjectParts(hidden));
   s.block_out = f32(T * hidden);
   s.hc_defer_w = f32(T * c.hc_count);
+  s.xn_scale = f32(T * c.hc_count);
   e->mask_words_ = c.SparseMaskWords(e->context_capacity_);
   const std::size_t linear_projection = std::max<std::size_t>(
       c.SsmConvChannels() + c.SsmValueDim(), c.ple_layer >= 0 ? hc_dim : 0);
@@ -1574,6 +1662,12 @@ bool Executor::DraftLogits(const Session& session, const float* x,
   if (model_->output().exl3 != nullptr) {
     Exl3DraftHead(model_->output(), x, logits, prefix.rows,
                   session.mtp_.draft_ids, kMtpDraftExtraRows, exl3_, stream_);
+    if (diagnostics_active_) {
+      cycle_diagnostics_.head_segments += (prefix.rows + 127) / 128;
+      if (!DiagnosticCount(exl3_.head_segments,
+                           &cycle_diagnostics_.head_segments, error_msg))
+        return false;
+    }
     return true;
   }
   if (!Dense(prefix, x, logits, 1, error_msg) ||
@@ -1843,6 +1937,14 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
                           const float* x, float* out, std::uint32_t n_tokens,
                           const DeviceTensor* down,
                           std::string* error_msg) const {
+  if (prefill_phase && gate.exl3 != nullptr && up.exl3 != nullptr &&
+      gate.cols == up.cols) {
+    if (!Exl3DensePrefill({&gate, &up}, {out, s_.shexp_gate}, x, n_tokens,
+                          error_msg))
+      return false;
+    Swiglu(out, s_.shexp_gate, std::size_t{n_tokens} * gate.rows, stream_);
+    return true;
+  }
   // Decode and verification use the same fused projections and activation.
   // A different SwiGLU rounding can change later activation quantization.
   if (!MatrixRows(n_tokens) && up.type == GgmlType::kQ8_0 &&
@@ -1914,9 +2016,134 @@ bool Executor::DenseF16Route(const DeviceTensor& w,
          w.cols <= model_->max_half_cols();
 }
 
+bool Executor::Exl3DensePrefill(
+    std::initializer_list<const DeviceTensor*> weights,
+    std::initializer_list<float*> outputs, const float* x, std::uint32_t rows,
+    std::string* error) const {
+  try {
+    if (weights.size() == 0 || weights.size() != outputs.size() ||
+        weights.size() > 3)
+      throw std::invalid_argument(
+          "EXL3 dense prefill requires 1..3 matching outputs");
+    struct Target {
+      const DeviceTensor* weight;
+      float* output;
+    };
+    std::array<Target, 3> targets{};
+    const auto output_count = weights.size();
+    const auto k = (*weights.begin())->cols;
+    auto output = outputs.begin();
+    bool sliced = false;
+    for (std::size_t i = 0; const auto* w : weights) {
+      if (w->exl3 == nullptr || w->experts != 1 || w->cols != k ||
+          w->exl3->k != k || !gufo::hip::Exl3PrefillSupported(*w->exl3) ||
+          std::uint64_t{w->output_begin} + w->rows > w->exl3->n)
+        throw std::invalid_argument(
+            "unsupported EXL3 dense prefill projection");
+      sliced |= w->output_begin != 0 || w->rows != w->exl3->n;
+      targets[i++] = {w, *output++};
+    }
+    if (sliced)
+      for (const auto* w : weights)
+        if (w->exl3 != targets[0].weight->exl3)
+          throw std::invalid_argument(
+              "EXL3 dense slices require a shared projection");
+    // Slices of one descriptor share its full rotation and GEMM. Keep the
+    // singleton chunk geometry and copy every view before reusing scratch.
+    const auto count = sliced ? std::size_t{1} : output_count;
+    if (rows == 0)
+      return true;
+    // q/k/v have different N; K/V and gate/up can share a GEMM launch.
+    // All three still rotate together, each with its own checkpoint suh.
+    std::sort(targets.begin(), targets.begin() + count, [](auto a, auto b) {
+      return std::pair{a.weight->exl3->n, a.weight->exl3->rate.bits} <
+             std::pair{b.weight->exl3->n, b.weight->exl3->rate.bits};
+    });
+    // Routed prefill and dense projections never overlap. Reuse the larger
+    // of their existing FP16 slabs; even tiny configured batches retain the
+    // decode slab (24 * widest K). No second chunk-sized activation allocation.
+    auto* rotated = exl3_prefill_.input;
+    std::size_t capacity = std::size_t{exl3_prefill_.max_assignments} *
+                           std::max(config().hidden_size, config().expert_ff);
+    if (exl3_.projection.fast_input_elements > capacity) {
+      rotated = exl3_.projection.fast_input;
+      capacity = exl3_.projection.fast_input_elements;
+    }
+    const auto piece = static_cast<std::uint32_t>(
+        std::min<std::size_t>(options_.max_batch, capacity / (count * k)));
+    if (rotated == nullptr || piece == 0 || exl3_dense_rotations_ == nullptr ||
+        exl3_dense_gemms_ == nullptr)
+      throw std::runtime_error("EXL3 dense prefill exceeds rotation scratch");
+    for (std::uint32_t first = 0; first < rows; first += piece) {
+      const auto n = std::min(piece, rows - first);
+      std::array<Exl3DensePrefillProblem, 3> problems{};
+      for (std::size_t i = 0; i < count; ++i) {
+        const auto& t = targets[i];
+        const auto& l = *t.weight->exl3;
+        if (sliced && exl3_.slice_elements < std::size_t{n} * l.n)
+          throw std::runtime_error("EXL3 dense prefill slice exceeds scratch");
+        problems[i] = {l.trellis,
+                       l.suh,
+                       l.svh,
+                       x + std::size_t{first} * k,
+                       k,
+                       rotated + i * std::size_t{n} * k,
+                       sliced ? exl3_.slice
+                              : t.output + std::size_t{first} * t.weight->rows,
+                       n};
+      }
+      PrepareExl3DensePrefill(std::span(problems.data(), count),
+                              exl3_dense_rotations_, exl3_dense_gemms_,
+                              stream_);
+      gufo::hip::LaunchExl3RotateRowsGrouped(exl3_dense_rotations_, count, n, k,
+                                             stream_);
+      for (std::size_t begin = 0; begin < count;) {
+        const auto& l = *targets[begin].weight->exl3;
+        auto end = begin + 1;
+        while (end < count && targets[end].weight->exl3->n == l.n &&
+               targets[end].weight->exl3->rate == l.rate)
+          ++end;
+        // Always X3, including a singleton/tail; a GEMV row threshold would
+        // change the reduction tree when a prompt/checkpoint chunk moves.
+        gufo::hip::LaunchExl3PrefillGemmGrouped(exl3_dense_gemms_ + begin,
+                                                end - begin, n, k, l.n, l.rate,
+                                                false, stream_);
+        if (diagnostics_active_)
+          ++cycle_diagnostics_.prefill_dense_gemm_groups;
+        begin = end;
+      }
+      if (sliced) {
+        for (std::size_t i = 0; i < output_count; ++i) {
+          const auto& t = targets[i];
+          if (!Check(hipMemcpy2DAsync(
+                         t.output + std::size_t{first} * t.weight->rows,
+                         t.weight->rows * sizeof(float),
+                         exl3_.slice + t.weight->output_begin,
+                         t.weight->exl3->n * sizeof(float),
+                         t.weight->rows * sizeof(float), n,
+                         hipMemcpyDeviceToDevice, stream_),
+                     "EXL3 dense prefill slice", error))
+            return false;
+        }
+      }
+      if (diagnostics_active_) {
+        cycle_diagnostics_.prefill_dense_rows += std::uint64_t{n} * count;
+        ++cycle_diagnostics_.prefill_dense_rotation_groups;
+      }
+    }
+    return true;
+  } catch (const std::exception& e) {
+    AssignError(error, e.what());
+    return false;
+  }
+}
+
 bool Executor::Exl3Group(std::initializer_list<const DeviceTensor*> weights,
                          std::initializer_list<float*> outputs, const float* x,
-                         std::uint32_t rows, std::string* error) const {
+                         std::uint32_t rows, std::string* error,
+                         std::size_t shape_basis_n) const {
+  if (prefill_phase)
+    return Exl3DensePrefill(weights, outputs, x, rows, error);
   try {
     if (weights.size() != outputs.size() || weights.size() > 3)
       throw std::logic_error("invalid EXL3 projection group");
@@ -1936,10 +2163,19 @@ bool Executor::Exl3Group(std::initializer_list<const DeviceTensor*> weights,
         p.fast_down_input, p.fast_down_input_elements};
     const std::span<const gufo::hip::Exl3FastTarget> group(targets.data(),
                                                            count);
-    if (!prefill_phase && rows <= 64 &&
-        gufo::hip::Exl3FastGroupSupported(group, ws)) {
-      gufo::hip::LaunchExl3FastProjections(group, x, (*weights.begin())->cols,
-                                           rows, ws, stream_);
+    if (!prefill_phase && gufo::hip::Exl3FastGroupSupported(group, ws)) {
+      for (std::uint32_t first = 0; first < rows;
+           first += gufo::hip::kExl3FastMaxRows) {
+        auto pass = targets;
+        for (std::size_t i = 0; i < count; ++i)
+          pass[i].y += std::size_t{first} * pass[i].y_stride;
+        const auto n =
+            std::min<std::uint32_t>(gufo::hip::kExl3FastMaxRows, rows - first);
+        gufo::hip::LaunchExl3FastProjections(
+            std::span(pass.data(), count),
+            x + std::size_t{first} * (*weights.begin())->cols,
+            (*weights.begin())->cols, n, ws, stream_, false, shape_basis_n);
+      }
       return true;
     }
     output = outputs.begin();
@@ -1953,10 +2189,90 @@ bool Executor::Exl3Group(std::initializer_list<const DeviceTensor*> weights,
   }
 }
 
+bool Executor::MtpKvProjection(const DeviceLayer& l, const float* x,
+                               std::uint32_t rows,
+                               std::string* error_msg) const {
+  if (l.attn_qkv.empty() && model_->output().exl3 != nullptr) {
+    // Omit Q while retaining the full group's W/TN launch geometry and
+    // therefore exactly the K/V reduction used by full MTP execution.
+    const auto basis =
+        std::size_t{l.attn_q.rows} + l.attn_k.rows + l.attn_v.rows;
+    return Exl3Group({&l.attn_k, &l.attn_v}, {s_.k, s_.v}, x, rows, error_msg,
+                     basis);
+  }
+  if (l.attn_qkv.empty())
+    return Exl3Group({&l.attn_k, &l.attn_v}, {s_.k, s_.v}, x, rows, error_msg);
+  auto kv = l.attn_qkv;
+  const TensorRef layout{.type = kv.type, .cols = kv.cols};
+  kv.data = static_cast<std::uint8_t*>(kv.data) +
+            std::size_t{2} * config().AttentionQDim() * layout.RowBytes();
+  kv.rows = 2 * config().AttentionKvDim();
+  return DenseBatch(kv, x, s_.qg, rows, error_msg);
+}
+
+bool Executor::StoreMtpKv(const DeviceLayer& l, const Session& session,
+                          std::uint32_t rows, const YarnRope& yarn,
+                          std::string* error_msg) const {
+  const auto& c = config();
+  if (l.attn_qkv.empty()) {
+    PrepareAttentionKv(
+        s_.k, s_.v, l.attn_k_norm.f32(), session.mtp_.k_cache,
+        session.mtp_.v_cache, rows, c.num_kv_heads, c.head_dim, c.rotary_dim,
+        &session.control_->mtp_position, c.rope_theta, c.rms_eps, stream_,
+        session.vision_input_.rope(), yarn, session.mtp_.kv_blocks);
+    return true;
+  }
+  if (PrepareAttention(
+          s_.qg, 2 * c.AttentionKvDim(), nullptr, l.attn_k_norm.f32(), nullptr,
+          nullptr, session.mtp_.k_cache, session.mtp_.v_cache, rows, 0,
+          c.num_kv_heads, c.head_dim, c.rotary_dim,
+          &session.control_->mtp_position, c.rope_theta, c.rms_eps, stream_,
+          session.vision_input_.rope(), false, yarn, session.mtp_.kv_blocks))
+    return true;
+  AssignError(error_msg, "MTP cache projection failed");
+  return false;
+}
+
+bool Executor::PlainDensePrefill(const DeviceTensor& w, const float* x,
+                                 float* out, std::uint32_t rows,
+                                 std::string* error) const {
+  if ((w.type != GgmlType::kF16 && w.type != GgmlType::kBF16 &&
+       w.type != GgmlType::kF32) ||
+      w.cols > half_input_cols_ || w.cols % 32 != 0) {
+    AssignError(error, "unsupported plain half prefill geometry/type");
+    return false;
+  }
+  const auto piece = std::max<std::uint32_t>(1, options_.max_batch);
+  for (std::uint32_t first = 0; first < rows; first += piece) {
+    const auto count = std::min(piece, rows - first);
+    PrepareHalfInput(x + std::size_t{first} * w.cols, count, w.cols);
+    if (!PlainPrefillGemm(w.data, SmallType(w.type),
+                          static_cast<const __half*>(s_.x_half),
+                          out + std::size_t{first} * w.rows, count, w.rows,
+                          w.cols, stream_)) {
+      AssignError(error, "plain half prefill GEMM failed");
+      return false;
+    }
+  }
+  if (diagnostics_active_)
+    cycle_diagnostics_.prefill_plain_half_rows += rows;
+  return true;
+}
+
 bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
                      std::uint32_t n_tokens, std::string* error_msg) const {
-  if (w.exl3 != nullptr) {
+  if (prefill_phase && w.exl3 != nullptr)
+    return Exl3DensePrefill({&w}, {out}, x, n_tokens, error_msg);
+  if (diagnostics_active_ && prefill_phase && model_->output().exl3 != nullptr)
+    cycle_diagnostics_.prefill_plain_rows += n_tokens;
+  // Prefill plain operands use the accepted FP16 activation boundary
+  // at every width. Decode/verify retain the established FP32-input path.
+  if (w.exl3 != nullptr || model_->output().exl3 != nullptr) {
     try {
+      if (prefill_phase && w.exl3 == nullptr &&
+          (w.type == GgmlType::kF16 || w.type == GgmlType::kBF16 ||
+           w.type == GgmlType::kF32))
+        return PlainDensePrefill(w, x, out, n_tokens, error_msg);
       const auto piece = std::max<std::uint32_t>(1, options_.max_batch);
       for (std::uint32_t first = 0; first < n_tokens; first += piece) {
         const auto count = std::min(piece, n_tokens - first);
@@ -2240,6 +2556,40 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
                        const float* inject_w) const {
   const Config& c = config();
   inject_fused_ = nullptr;
+  xn_deferred_ = {};  // s_.xn is rewritten (or left stale) below
+  xn_q8t_norm_ = {};
+  // An EXL3 prefill MoE output left to this combine: the four-lane kernel
+  // below forms it; any other route gets it in s_.block_out first.
+  Exl3PrefillMoeRows exl3_moe{};
+  bool exl3_moe_fused = false;
+  if (exl3_moe_pending_.layer != nullptr) {
+    const PendingExl3Moe pending = exl3_moe_pending_;
+    exl3_moe_pending_ = {};
+    const auto& d = pending.layer->ffn_down_exps;
+    const auto scratch = Exl3PrefillView();
+    exl3_moe_fused = prefill_phase && pending.rows == n_tokens &&
+                     c.hc_count == 4 && c.hidden_size % 128 == 0 &&
+                     c.hidden_size <= 2560 && d.rows == c.hidden_size &&
+                     !moe_pending_ && !res_deferred_ &&
+                     !(wide_mixer_ && MatrixRows(n_tokens) && gamma != nullptr);
+    if (exl3_moe_fused) {
+      exl3_moe = {d.device_exl3,
+                  s_.ids,
+                  scratch.inverse,
+                  scratch.out,
+                  s_.weights,
+                  s_.shexp_out,
+                  s_.router + c.num_experts,
+                  c.num_experts + 1,
+                  c.num_experts_used,
+                  d.rows};
+    } else {
+      Exl3PrefillCombine(*pending.layer, scratch, s_.ids, pending.rows,
+                         c.num_experts_used, s_.weights, s_.shexp_out,
+                         s_.router + c.num_experts, c.num_experts + 1,
+                         s_.block_out, stream_);
+    }
+  }
   // Wide batches hand the next mixer an F16 norm for its epilogue and the
   // same norm quantized into the tiled Q8 layout for its W8A8 down
   // projection: half the bytes for the combine and the epilogue, and no
@@ -2299,15 +2649,54 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
   }
   // A decode batch's next mixer quantizes xn for its down projection: the
   // combine writes those rows as well.
-  if (!MatrixRows(n_tokens) && UnpaddedQ8(c.HcDim()) &&
+  // (Not for EXL3 prefill: every prefill chunk, tails included, must take
+  // the same combine below.)
+  if (!(prefill_phase && model_->output().exl3 != nullptr) &&
+      !MatrixRows(n_tokens) && UnpaddedQ8(c.HcDim()) &&
       HcCombineQ8_1(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn,
                     s_.xn_q8_1, n_tokens, c.hidden_size, c.hc_count, c.rms_eps,
                     stream_)) {
     xn_q8_ready_ = {s_.xn, s_.xn_q8_1, n_tokens, c.HcDim()};
     return;
   }
-  HcCombine(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn, n_tokens,
-            c.hidden_size, c.hc_count, c.rms_eps, stream_);
+  // EXL3: prefill takes the four-lane combine at every chunk width (28 %
+  // less time at 2,048 tokens); decode/verify keep the per-stream kernel.
+  const bool exl3 = model_->output().exl3 != nullptr;
+  // The next mixer's plain down projection reads this norm as F16: the
+  // combine stores that copy too instead of a separate narrowing pass
+  // rereading the F32 row.
+  const bool half_norm = exl3 && prefill_phase &&
+                         n_tokens <= options_.max_batch &&
+                         c.HcDim() <= half_input_cols_;
+  // Its F32 copy is then left out as well: the mixer recomputes it from the
+  // residual and these scales.
+  float* const xn_scale =
+      half_norm && MatrixRows(n_tokens) ? s_.xn_scale : nullptr;
+  // With Q8_0 mixer down weights the down projection is W8A8 and reads the
+  // norm as tiled Q8 rows at every prefill width; no F16 copy is needed.
+  const bool q8_norm = half_norm && hc_down_q8_;
+  if (HcCombine(
+          res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn, n_tokens,
+          c.hidden_size, c.hc_count, c.rms_eps, stream_, exl3 && !prefill_phase,
+          exl3 && prefill_phase,
+          half_norm && !q8_norm ? static_cast<__half*>(s_.x_half) : nullptr,
+          xn_scale, exl3_moe_fused ? &exl3_moe : nullptr,
+          q8_norm ? s_.xn_q8t : nullptr)) {
+    if (q8_norm) {
+      xn_q8t_norm_ = {res, gamma, n_tokens};
+      if (half_src_ == s_.xn)
+        half_src_ = nullptr;
+    } else {
+      half_src_ = s_.xn;
+      half_rows_ = n_tokens;
+      half_cols_ = c.HcDim();
+      half_bf16_ = false;
+    }
+    if (xn_scale != nullptr)
+      xn_deferred_ = {res, gamma, n_tokens};
+  } else if (half_src_ == s_.xn) {
+    half_src_ = nullptr;  // the F32 norm was rewritten without its copy
+  }
 }
 
 bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
@@ -2319,9 +2708,37 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   // Without `normed` this mixer's grouped norm of res is computed here (F32);
   // otherwise the previous combine produced it, as F16 plus tiled Q8 on the
   // wide route or as F32 in s_.xn (with its Q8_1 rows on a decode batch).
+  // A deferred norm feeds only the vectorized epilogue below (and the F16
+  // down projection through the half cache); any other reader gets the F32
+  // rows the combine left out, in its own expression.
+  // The combine's tiled Q8 norm of this mixer's input, for its W8A8 down.
+  const bool q8_down = normed && prefill_phase && !m.down_q8.empty() &&
+                       xn_q8t_norm_.res == res &&
+                       xn_q8t_norm_.gamma == m.norm.f32() &&
+                       xn_q8t_norm_.rows == n_tokens;
+  xn_q8t_norm_ = {};
+  bool norm_from_res = false;
+  if (normed && xn_deferred_.res != nullptr) {
+    const DeferredNorm d = xn_deferred_;
+    const bool other_inject = inject != nullptr && !m.inject.empty() &&
+                              m.inject.type != GgmlType::kF32;
+    const bool half_down =
+        half_src_ == s_.xn && half_rows_ == n_tokens && half_cols_ == c.HcDim();
+    norm_from_res = res == d.res && m.norm.f32() == d.gamma &&
+                    n_tokens == d.rows && MatrixRows(n_tokens) &&
+                    c.hc_count == 4 && c.hidden_size % 4 == 0 &&
+                    !other_inject && (half_down || q8_down);
+    if (!norm_from_res)
+      HcNormFromRes(d.res, d.gamma, s_.xn_scale, s_.xn, d.rows, c.hidden_size,
+                    stream_);
+  }
+  const DeferredNorm deferred_norm = xn_deferred_;
+  xn_deferred_ = {};
   if (!normed) {
     xn_half_ = false;
     xn_q8_ready_ = {};
+    if (half_src_ == s_.xn)
+      half_src_ = nullptr;
     RmsNormRows(res, m.norm.f32(), s_.xn, n_tokens, c.HcDim(), c.hc_count,
                 c.rms_eps, stream_);
   }
@@ -2332,6 +2749,11 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       c.hidden_size == 2560 && c.hc_low_rank == 320 &&
       m.up.type == GgmlType::kQ8_0 && m.up.rows == c.HcDim() &&
       m.up.cols == c.hc_low_rank;
+  const bool fused_down =
+      !q8_down && model_->output().exl3 != nullptr && !xn_half_ &&
+      !MatrixRows(n_tokens) && m.down.type == GgmlType::kF16 &&
+      m.up.type == GgmlType::kF16 && m.down.rows == 320 &&
+      m.down.cols == 10240 && c.hc_count == 4 && c.hc_low_rank == 320;
   if (fused_projection) {
     // The up projection writes x_half; keep its input in the gate buffer.
     if (!HcDownF16Gemm(m.down.data, s_.xn_q8t,
@@ -2341,12 +2763,15 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       return false;
     }
   } else {
-    if (xn_half_) {
-      if (!W8A8Gemm(m.down.data, s_.xn_q8t, s_.lo, n_tokens, m.down.rows,
-                    m.down.cols, stream_)) {
+    if (xn_half_ || q8_down) {
+      const DeviceTensor& down = q8_down ? m.down_q8 : m.down;
+      if (!W8A8Gemm(down.data, s_.xn_q8t, s_.lo, n_tokens, down.rows, down.cols,
+                    stream_)) {
         AssignError(error_msg, "W8A8 mixer down projection failed");
         return false;
       }
+    } else if (fused_down) {
+      HcDownSiluF16(m.down.data, s_.xn, s_.lo, n_tokens, stream_);
     } else if (!Dense(m.down, s_.xn, s_.lo, n_tokens, error_msg)) {
       return false;
     }
@@ -2362,8 +2787,9 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
         return false;
       }
     } else {
-      SiluScale(s_.lo, scale,
-                static_cast<std::size_t>(n_tokens) * c.hc_low_rank, stream_);
+      if (!fused_down)
+        SiluScale(s_.lo, scale,
+                  static_cast<std::size_t>(n_tokens) * c.hc_low_rank, stream_);
       if (!Dense(m.up, s_.lo, s_.hc_gate, n_tokens, error_msg)) {
         return false;
       }
@@ -2419,6 +2845,11 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
         q8t_cols_ = c.hidden_size;
       }
     }
+  } else if (vectorized && norm_from_res) {
+    HcMixEpilogueVec4FromRes(deferred_norm.res, deferred_norm.gamma,
+                             s_.xn_scale, s_.hc_gate,
+                             fused_inject ? m.inject.f32() : nullptr, mixed,
+                             inject, n_tokens, c.hidden_size, stream_);
   } else if (vectorized) {
     HcMixEpilogueVec4(xn, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr,
                       mixed, inject, n_tokens, c.hidden_size, c.hc_count,
@@ -2442,6 +2873,8 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
     // on the wide route the combine only produced F16, so norm again.
     if (xn_half_) {
       xn_q8_ready_ = {};
+      if (half_src_ == s_.xn)
+        half_src_ = nullptr;
       RmsNormRows(res, m.norm.f32(), s_.xn, n_tokens, c.HcDim(), c.hc_count,
                   c.rms_eps, stream_);
     }
@@ -2726,7 +3159,8 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                      c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim,
                      c.ssm_conv_kernel, MatrixRows(n_tokens) && !speculative,
                      convolved, c.rms_eps, stream_, out_half, checkpoint,
-                     half_stride, out_q8_1 ? s_.gdn_q8_1 : nullptr, z_ready)) {
+                     half_stride, out_q8_1 ? s_.gdn_q8_1 : nullptr, z_ready,
+                     model_->output().exl3 != nullptr)) {
     AssignError(error_msg, "DeltaNet launch failed");
     return false;
   }
@@ -2768,11 +3202,27 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                          std::string* error_msg, bool last_only,
                          bool projections_ready, bool project_output,
                          std::uint32_t checkpoint_tokens) const {
+  // Set below for this call's KvarnAttention only.
+  attn_q_rotated_ = false;
+  attn_gate_stride_ = 0;
   const Config& c = config();
+  // The generic fallback consumes every query's selector mask. Only prune
+  // masks when WMMA can honor the same last-query restriction; otherwise
+  // uninitialized masks can produce NaNs and invalid downstream routing IDs.
+  const auto wmma_limit = WmmaCausalAttentionContextLimit(
+      c.num_heads, c.num_kv_heads, c.head_dim, c.compress_ratio);
+  const auto live_context = std::uint64_t{start_pos} + n_tokens;
+  last_only = last_only && MatrixRows(n_tokens) && wmma_limit != 0 &&
+              (s.kvarn_pass == nullptr || s.kvarn_pass->prefill) &&
+              (!sparse || (live_context <= wmma_limit &&
+                           live_context <= std::uint64_t{mask_words_} *
+                                               c.compress_ratio * 32));
+
   const std::uint32_t kv_row = c.AttentionKvDim();
   const std::uint32_t index_capacity =
       IndexerCapacity(c, options_.max_batch, max_context);
   bool prepared = false;
+  bool query_rows = false;
   // KVarN layers write FP16 rows and rotate them into the KVarN frame: a
   // pass into the sink and tail ring, a prompt chunk into the staging rows,
   // whose row 0 holds staging_first (plan/exl3/F1-KVARN-DESIGN.md 3).
@@ -2852,16 +3302,33 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                 !Dense(l.attn_v, xq, s_.v, error_msg))) {
       return false;
     }
-    UnpackQGate(s_.qg, 2 * c.AttentionQDim(), s_.q, s_.attn_gate, nullptr,
-                nullptr, n_tokens, c.num_heads, c.head_dim, 0, stream_);
+    // EXL3 prefill: the query rows are unpacked, normalized, rotated by
+    // RoPE and (KVarN) into the KVarN frame in one pass; a KVarN layer's
+    // output gate then reads the packed rows directly.
+    const bool kvarn_rows = kvarn != nullptr;
+    query_rows = prefill_phase && model_->output().exl3 != nullptr &&
+                 AttentionQueryRows(
+                     s_.qg, 2 * c.AttentionQDim(), l.attn_q_norm.f32(), s_.q,
+                     kvarn_rows ? nullptr : s_.attn_gate, n_tokens, c.num_heads,
+                     c.head_dim, c.rotary_dim, pos, c.rope_theta, c.rms_eps,
+                     kvarn_rows, stream_, s.rope, yarn_);
+    if (query_rows) {
+      attn_q_rotated_ = kvarn_rows;
+      attn_gate_stride_ = kvarn_rows ? 2 * c.AttentionQDim() : 0;
+    } else {
+      UnpackQGate(s_.qg, 2 * c.AttentionQDim(), s_.q, s_.attn_gate, nullptr,
+                  nullptr, n_tokens, c.num_heads, c.head_dim, 0, stream_);
+    }
   }
   if (!prepared) {
-    RmsNormRows(s_.q, l.attn_q_norm.f32(), s_.q, n_tokens * c.num_heads,
-                c.head_dim, 1, c.rms_eps, stream_);
+    if (!query_rows)
+      RmsNormRows(s_.q, l.attn_q_norm.f32(), s_.q, n_tokens * c.num_heads,
+                  c.head_dim, 1, c.rms_eps, stream_);
     RmsNormRows(s_.k, l.attn_k_norm.f32(), s_.k, n_tokens * c.num_kv_heads,
                 c.head_dim, 1, c.rms_eps, stream_);
-    Rope(s_.q, n_tokens, c.num_heads, c.head_dim, c.rotary_dim, pos,
-         c.rope_theta, stream_, s.rope, yarn_);
+    if (!query_rows)
+      Rope(s_.q, n_tokens, c.num_heads, c.head_dim, c.rotary_dim, pos,
+           c.rope_theta, stream_, s.rope, yarn_);
     Rope(s_.k, n_tokens, c.num_kv_heads, c.head_dim, c.rotary_dim, pos,
          c.rope_theta, stream_, s.rope, yarn_);
     StoreKv(s_.k, write_k, n_tokens, kv_row, pos, stream_, write_rows);
@@ -2888,8 +3355,16 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
 
   // Raw keys survive only until pooling. The ring holds the initial
   // pre-budget backlog and a batch, independently for trunk and predictor.
+  const bool shared_indexer = prefill_phase && sparse && s.index_k != nullptr &&
+                              l.indexer_q.exl3 != nullptr &&
+                              l.indexer_q.exl3 == l.indexer_k.exl3;
+  if (shared_indexer &&
+      !Exl3DensePrefill({&l.indexer_q, &l.indexer_k}, {s_.iq, s_.ik}, x,
+                        n_tokens, error_msg))
+    return false;
   if (s.index_k != nullptr) {
-    if (!(projections_ready
+    if (!shared_indexer &&
+        !(projections_ready
               ? DenseBatch(l.indexer_k, x, s_.ik, n_tokens, error_msg)
               : Dense(l.indexer_k, x, s_.ik, n_tokens, error_msg))) {
       return false;
@@ -2899,7 +3374,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   }
   const std::uint32_t* mask = nullptr;
   if (sparse) {
-    if (!Dense(l.indexer_q, x, s_.iq, n_tokens, error_msg)) {
+    if (!shared_indexer && !Dense(l.indexer_q, x, s_.iq, n_tokens, error_msg)) {
       return false;
     }
     RmsNormRows(s_.iq, l.indexer_q_norm.f32(), s_.iq,
@@ -3011,7 +3486,8 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                   c.compress_ratio, stream_, split ? s_.attn_lists : nullptr,
                   split ? s_.attn_counts : nullptr,
                   c.compress_ratio > 0 ? c.indexer_top_k / c.compress_ratio : 0,
-                  s.kv_blocks);
+                  s.kv_blocks, nullptr,
+                  model_->output().exl3 != nullptr ? c.indexer_top_k : 0);
   const std::uint32_t q_dim = c.AttentionQDim();
   const std::size_t ctx_count = static_cast<std::size_t>(n_tokens) * q_dim;
   // A decode batch's output projection reads the gate's Q8_1 rows.
@@ -3048,7 +3524,12 @@ bool Executor::KvarnAttention(const DeviceLayer& l,
       .kv_heads = c.num_kv_heads};
   // Scores and context in the rotated frame: H q . H k = q . k, and the
   // context rotates back before the output gate.
-  RotateHeadRows(s_.q, n_tokens * c.num_heads, stream_);
+  const bool q_rotated = attn_q_rotated_;
+  const std::uint32_t gate_stride = attn_gate_stride_;
+  attn_q_rotated_ = false;
+  attn_gate_stride_ = 0;
+  if (!q_rotated)
+    RotateHeadRows(s_.q, n_tokens * c.num_heads, stream_);
   bool attended = false;
   if (pass.prefill && MatrixRows(n_tokens)) {
     // The FP16 path's split: queries before the token budget take the dense
@@ -3085,9 +3566,11 @@ bool Executor::KvarnAttention(const DeviceLayer& l,
         c.num_heads, c.num_kv_heads, c.head_dim, c.compress_ratio, stream_,
         split ? s_.attn_lists : nullptr, split ? s_.attn_counts : nullptr,
         c.compress_ratio > 0 ? c.indexer_top_k / c.compress_ratio : 0,
-        s.kv_blocks, &view);
+        s.kv_blocks, &view,
+        model_->output().exl3 != nullptr ? c.indexer_top_k : 0);
   }
-  RotateHeadRows(s_.ctx, n_tokens * c.num_heads, stream_);
+  if (gate_stride == 0)
+    RotateHeadRows(s_.ctx, n_tokens * c.num_heads, stream_);
   if (pass.prefill) {
     // Quantize the groups the chunk completed from staging, then keep its
     // sink rows and its recent rows.
@@ -3137,6 +3620,12 @@ bool Executor::KvarnAttention(const DeviceLayer& l,
   }
   const std::uint32_t q_dim = c.AttentionQDim();
   const std::size_t ctx_count = static_cast<std::size_t>(n_tokens) * q_dim;
+  if (gate_stride != 0) {
+    GateRotatedContext(s_.ctx, s_.qg, gate_stride, n_tokens, c.num_heads,
+                       stream_);
+    return !project_output ||
+           Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
+  }
   if (project_output && split && l.attn_out.type == GgmlType::kQ8_0 &&
       l.attn_out.cols == q_dim && UnpaddedQ8(q_dim) &&
       SigmoidMulQ8_1(s_.ctx, s_.attn_gate, ctx_count, s_.ctx_q8_1, stream_)) {
@@ -3196,21 +3685,10 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   }
   const auto shared_expert = [&] {
     shexp_half_ready_ = false;
-    if (l.shexp_gate.exl3 != nullptr && !prefill_phase && n_tokens <= 64) {
-      const auto& p = exl3_.projection;
-      const gufo::hip::Exl3FastWorkspace ws{
-          p.fast_input,      p.fast_input_elements,
-          p.fast_counters,   p.fast_counter_count,
-          p.fast_down_input, p.fast_down_input_elements};
-      const gufo::hip::Exl3FastMlp mlp{
-          l.shexp_gate.exl3, l.shexp_up.exl3, l.shexp_down.exl3, s_.shexp_gate,
-          s_.shexp_up,       s_.shexp_out,    c.hidden_size};
-      if (gufo::hip::Exl3FastMlpSupported(mlp, ws)) {
-        gufo::hip::LaunchExl3FastMlp(mlp, x, c.hidden_size, n_tokens, ws,
-                                     stream_);
-        return true;
-      }
-    }
+    if (l.shexp_gate.exl3 != nullptr && !prefill_phase &&
+        Exl3SharedMlp(l, x, s_.shexp_gate, s_.shexp_up, s_.shexp_out, n_tokens,
+                      exl3_, stream_))
+      return true;
     if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
                     &l.shexp_down, error_msg)) {
       return false;
@@ -3401,47 +3879,66 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
   return true;
 }
 
+Exl3PrefillScratch Executor::Exl3PrefillView() const {
+  auto view = exl3_prefill_;
+  // Attention intermediates are dead. Resolve these pointers after any
+  // RowScratch narrowing, rather than retaining the arena's base addresses.
+  view.gate = s_.gate_e;
+  view.up = s_.up_e;
+  return view;
+}
+
 bool Executor::Exl3Experts(const DeviceLayer& l, const float* x, float* out,
                            std::uint32_t rows, std::string* error) const {
   const auto& c = config();
   try {
-    if (!prefill_phase && rows <= 64) {
-      Exl3RoutedMlp(l, x, s_.ids, s_.gate_e, s_.up_e, s_.down_e, rows,
-                    c.num_experts_used, exl3_, stream_);
-    } else {
-      ExpertCounts(s_.ids, s_.expert_counts, rows, c.num_experts,
-                   c.num_experts_used, stream_);
-      RoutedCompact(s_.ids, s_.expert_counts, s_.routed_bounds,
-                    s_.routed_cursors, s_.rows_token, s_.rows_slot, rows,
-                    c.num_experts_used, c.num_experts, stream_);
-      if (!Check(hipMemcpyAsync(counts_host_, s_.expert_counts,
-                                c.num_experts * sizeof(std::uint32_t),
-                                hipMemcpyDeviceToHost, stream_),
-                 "EXL3 expert counts", error) ||
-          !Check(hipStreamSynchronize(stream_), "EXL3 expert buckets", error))
-        return false;
-      std::size_t base = 0;
-      for (std::uint32_t expert = 0; expert < c.num_experts; ++expert) {
-        const auto count = counts_host_[expert];
-        if (count == 0)
-          continue;
-        Exl3Gather(x, s_.rows_token + base, exl3_.gather, count, c.hidden_size,
-                   stream_);
-        const auto projection = [&](const DeviceTensor& bank,
-                                    const float* input, float* output) {
-          auto weight = bank;
-          weight.exl3 += expert;
-          weight.experts = 1;
-          Exl3Projection(weight, input, output, count, exl3_, stream_, false);
-        };
-        projection(l.ffn_gate_exps, exl3_.gather, exl3_.gate);
-        projection(l.ffn_up_exps, exl3_.gather, exl3_.up);
-        Swiglu(exl3_.gate, exl3_.up, std::size_t{count} * c.expert_ff, stream_);
-        projection(l.ffn_down_exps, exl3_.gate, exl3_.out);
-        Exl3Scatter(exl3_.out, s_.rows_slot + base, s_.down_e, count,
-                    c.hidden_size, stream_);
-        base += (count + 15) / 16 * 16;
+    if (!prefill_phase) {
+      for (std::uint32_t first = 0; first < rows; first += 64) {
+        const auto count = std::min(64U, rows - first);
+        const auto assignment = std::size_t{first} * c.num_experts_used;
+        Exl3RoutedMlp(l, x + std::size_t{first} * c.hidden_size,
+                      s_.ids + assignment, s_.gate_e, s_.up_e,
+                      s_.down_e + assignment * c.hidden_size, count,
+                      c.num_experts_used, exl3_, stream_);
+        if (diagnostics_active_) {
+          if (exl3_.down_exponents != nullptr)
+            cycle_diagnostics_.scaled_down_rows +=
+                std::uint64_t{count} * c.num_experts_used;
+          if (!DiagnosticCount(exl3_.tile_count,
+                               &cycle_diagnostics_.expert_tile_reads, error))
+            return false;
+        }
       }
+    } else {
+      // Keep this route for EVERY kPrefill row, including singleton tails.
+      // Selecting decode GEMV by token/bucket width changes the reduction
+      // tree when a Sync/checkpoint boundary moves. X3 is a phase contract,
+      // not a minimum-row heuristic; its 64-row tile never changes here.
+      const auto scratch = Exl3PrefillView();
+      // Raw down dots stay packed; the combine below restores and sums them.
+      Exl3PrefillExpertsRaw(l, x, s_.ids, rows, c.num_experts_used,
+                            kExl3PrefillTileRows, scratch, stream_);
+      if (diagnostics_active_) {
+        cycle_diagnostics_.prefill_expert_rows += rows;
+        cycle_diagnostics_.expert_tile_reads_complete = false;
+        if (!DiagnosticCount(exl3_prefill_.bucket_count,
+                             &cycle_diagnostics_.prefill_expert_buckets, error))
+          return false;
+      }
+    }
+    if (!JoinSide(error))
+      return false;
+    if (prefill_phase) {
+      const bool defer = exl3_moe_defer_ && out == s_.block_out;
+      exl3_moe_defer_ = false;
+      if (defer) {
+        exl3_moe_pending_ = {&l, rows};
+        return true;
+      }
+      Exl3PrefillCombine(l, Exl3PrefillView(), s_.ids, rows, c.num_experts_used,
+                         s_.weights, s_.shexp_out, s_.router + c.num_experts,
+                         c.num_experts + 1, out, stream_);
+      return true;
     }
     MoeEpilogue(s_.down_e, s_.weights, s_.shexp_out, s_.router + c.num_experts,
                 c.num_experts + 1, out, rows, c.num_experts_used, c.hidden_size,
@@ -3470,12 +3967,120 @@ bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
          Check(hipStreamSynchronize(stream_), "trunk hidden", error_msg);
 }
 
+std::size_t Executor::EstimateExl3PrefillScratchBytes(const Config& config,
+                                                      std::uint32_t rows,
+                                                      std::string* error_msg) {
+  Exl3PrefillLayout layout;
+  return PlanExl3Prefill(config, rows, &layout, error_msg) ? layout.bytes : 0;
+}
+
+std::uint32_t Executor::PrefillChunkRows(
+    std::uint32_t requested, std::uint32_t until_checkpoint) const noexcept {
+  auto limit = options_.max_batch;
+  if (model_->output().exl3 != nullptr && options_.exl3_prefill_chunk_rows != 0)
+    limit = std::min(limit, options_.exl3_prefill_chunk_rows);
+  return std::min({requested, until_checkpoint, limit});
+}
+
+bool Executor::BeginMtpCycleDiagnostics(std::string* error_msg) const {
+  if (diagnostics_active_ || model_->output().exl3 == nullptr) {
+    AssignError(error_msg, "MTP cycle diagnostics require idle EXL3 executor");
+    return false;
+  }
+  if (!Check(hipStreamSynchronize(stream_), "diagnostic cycle start",
+             error_msg))
+    return false;
+  cycle_diagnostics_ = {};
+  diagnostic_depth_ = 0;
+  diagnostic_phase_ = nullptr;
+  diagnostic_started_ = std::chrono::steady_clock::now();
+  diagnostics_active_ = true;
+  return true;
+}
+
+bool Executor::EndMtpCycleDiagnostics(std::uint64_t committed_tokens,
+                                      std::uint64_t drafts,
+                                      MtpCycleDiagnostics* output,
+                                      std::string* error_msg) const {
+  if (!diagnostics_active_ || diagnostic_depth_ != 0 || output == nullptr) {
+    AssignError(error_msg, "invalid MTP diagnostic cycle end");
+    return false;
+  }
+  // Always release the diagnostic scope, including a failed GPU cycle.
+  diagnostics_active_ = false;
+  if (!Check(hipStreamSynchronize(stream_), "diagnostic cycle end", error_msg))
+    return false;
+  cycle_diagnostics_.committed_tokens = committed_tokens;
+  cycle_diagnostics_.drafts = drafts;
+  cycle_diagnostics_.wall_ms =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - diagnostic_started_)
+          .count();
+  *output = cycle_diagnostics_;
+  return true;
+}
+
+Executor::DiagnosticPhase::DiagnosticPhase(const Executor& e, DiagnosticStage s)
+    : executor(e), stage(s), active(e.diagnostics_active_) {
+  if (active) {
+    ++executor.diagnostic_depth_;
+    parent = executor.diagnostic_phase_;
+    executor.diagnostic_phase_ = this;
+    started = std::chrono::steady_clock::now();
+  }
+}
+
+Executor::DiagnosticPhase::~DiagnosticPhase() {
+  if (!active)
+    return;
+  --executor.diagnostic_depth_;
+  executor.diagnostic_phase_ = parent;
+  const auto elapsed = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - started)
+                           .count();
+  if (parent != nullptr)
+    parent->children_ms += elapsed;
+  const auto ms = elapsed - children_ms;
+  auto& d = executor.cycle_diagnostics_;
+  switch (stage) {
+    case DiagnosticStage::kTarget:
+      d.target_ms += ms;
+      break;
+    case DiagnosticStage::kDraft:
+      d.draft_ms += ms;
+      break;
+    case DiagnosticStage::kHead:
+      d.head_ms += ms;
+      break;
+    case DiagnosticStage::kCatchUp:
+      d.catch_up_ms += ms;
+      break;
+  }
+}
+
+bool Executor::DiagnosticCount(const std::uint32_t* device,
+                               std::uint64_t* total,
+                               std::string* error_msg) const {
+  std::uint32_t count = 0;
+  if (!Check(hipMemcpyAsync(&count, device, sizeof(count),
+                            hipMemcpyDeviceToHost, stream_),
+             "diagnostic count", error_msg) ||
+      !Check(hipStreamSynchronize(stream_), "diagnostic count ready",
+             error_msg))
+    return false;
+  *total += count;
+  return true;
+}
+
 bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
                        bool candidates, const Session* draft,
                        std::string* error_msg) const {
   const std::uint32_t prefix = model_->draft_output().rows;
   const std::uint32_t rows =
       draft != nullptr ? prefix + kMtpDraftExtraRows : model_->output().rows;
+  if (diagnostics_active_ && draft == nullptr &&
+      model_->output().exl3 != nullptr)
+    cycle_diagnostics_.head_segments += (rows + 127) / 128;
   if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg) ||
       !(draft != nullptr
             ? DraftLogits(*draft, s_.mixed, s_.logits, error_msg)
@@ -3518,6 +4123,9 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
 bool Executor::Run(Session& session, std::uint64_t key, bool graph,
                    const std::function<bool()>& body, std::string* error_msg,
                    bool synchronize) const {
+  // Host counters must observe each executed operation. Captured/replayed
+  // bodies would either duplicate or omit them, as with MtpTrace copies.
+  graph = graph && !diagnostics_active_;
   // A batch shape runs eagerly once before it is captured: the first pass
   // grows the GEMM tier's arena, which capture forbids.
   if (graph && session.warmed_.contains(key)) {
@@ -3536,7 +4144,10 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
             moe_pending_, defer_residual_, res_deferred_, shexp_half_ready_,
             q8t_src_, q8t_rows_, q8t_cols_, half_src_, half_rows_, half_cols_,
             half_bf16_, xn_half_, inject_parts_, inject_fused_, q8_slot_,
-            xn_q8_ready_, mixed_q8_ready_);
+            xn_q8_ready_, mixed_q8_ready_, xn_deferred_.res, xn_deferred_.gamma,
+            xn_deferred_.rows, exl3_moe_defer_, exl3_moe_pending_.layer,
+            exl3_moe_pending_.rows, xn_q8t_norm_.res, xn_q8t_norm_.gamma,
+            xn_q8t_norm_.rows);
         const auto before = std::apply(
             [](const auto&... fields) { return std::make_tuple(fields...); },
             dispatch);
@@ -3591,6 +4202,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
                        std::uint32_t n_logits, float* logits, ForwardMode mode,
                        std::string* error_msg, PrefillCheckpoint* checkpoint,
                        std::span<const std::int32_t> next) const {
+  DiagnosticPhase diagnostic(*this, DiagnosticStage::kTarget);
   // Only this call's PLE layer may start the prefetch of `next`.
   struct NextHint {
     std::span<const std::int32_t>& hint;
@@ -3708,7 +4320,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   // Decode-sized batches replay as graphs; a pooling backlog (the first
   // batch past the budget) needs the wider eager grid.
   const std::uint32_t graph_pool_grid = n / std::max(c.compress_ratio, 1u) + 1;
-  const bool graph = !prefill_phase && n <= kVecBatch &&
+  const bool graph = !diagnostics_active_ && !prefill_phase && n <= kVecBatch &&
                      pool_grid <= graph_pool_grid &&
                      session.position_ >= session.VisionLayout().PrefixLength();
   const std::uint64_t key = static_cast<std::uint64_t>(n) |
@@ -3750,6 +4362,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   }
 
   session.position_ += n;
+  if (diagnostics_active_ && speculative)
+    cycle_diagnostics_.verify_rows += n;
   if (sparse) {
     session.blocks_ = complete;
   }
@@ -3863,8 +4477,14 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                           l.shexp_up.type == GgmlType::kQ8_0;
       Combine(s_.res, l.hc_ffn.norm.f32(), rows, InjectWeights(l.hc_ffn));
       if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, rows, error_msg,
-                 false, no_f32) ||
-          !Moe(l, s_.mixed, s_.block_out, rows, error_msg))
+                 false, no_f32))
+        return false;
+      // Only the combine below reads this MoE output: EXL3 prefill folds the
+      // expert sum into it.
+      exl3_moe_defer_ = prefill_phase;
+      const bool moe_ok = Moe(l, s_.mixed, s_.block_out, rows, error_msg);
+      exl3_moe_defer_ = false;
+      if (!moe_ok)
         return false;
       Combine(s_.res, next_norm, rows, next_inject);
       return true;
@@ -4951,6 +5571,8 @@ bool Executor::MtpForward(Session& session,
                           std::int32_t hidden_row, MtpOutput output,
                           std::string* error_msg,
                           const float* hidden_source) const {
+  DiagnosticPhase diagnostic(*this, hidden_row >= 0 ? DiagnosticStage::kCatchUp
+                                                    : DiagnosticStage::kDraft);
   DropReadyQ8();
   const auto n = static_cast<std::uint32_t>(tokens.size());
   if (session.owner_ != this ||
@@ -5010,8 +5632,9 @@ bool Executor::MtpForward(Session& session,
   const auto complete = (pos + n) / c.compress_ratio;
   const auto pool = sparse ? complete - session.mtp_.blocks : 0;
   const auto graph_pool = n / c.compress_ratio + 1;
-  const bool graph = output.trace == nullptr && hidden_source == nullptr &&
-                     n <= kVecBatch && pool <= graph_pool &&
+  const bool graph = !diagnostics_active_ && output.trace == nullptr &&
+                     hidden_source == nullptr && n <= kVecBatch &&
+                     pool <= graph_pool &&
                      pos + 1 >= session.VisionLayout().PrefixLength();
   // Captured graphs bake in the head; key on the one this draft reads.
   const bool subset = UseDraftSubset(session, output.draft_subset) &&
@@ -5040,6 +5663,8 @@ bool Executor::MtpForward(Session& session,
     *output.candidates = *mtp_candidates_host_;
   }
   session.mtp_.position = pos + n;
+  if (diagnostics_active_ && hidden_row >= 0)
+    cycle_diagnostics_.catch_up_rows += n;
   session.mtp_.residual_valid = !output.kv_only;
   if (sparse)
     session.mtp_.blocks = complete;
@@ -5132,27 +5757,20 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
       control_host_->hidden_row >= 0 && n > 2 && n <= kVecBatch
           ? n - 2
           : (last_only && n >= 224 ? (n - 96) / 128 * 128 : 0U);
-  const bool cache_only = kv_only && !l.attn_qkv.empty();
+  const bool cache_only =
+      kv_only && (!l.attn_qkv.empty() ||
+                  (l.attn_k.exl3 != nullptr && l.attn_v.exl3 != nullptr));
   if (!HcMixBatch(l.hc_attn, s_.mtp_res, false, s_.mixed,
                   cache_only ? nullptr : s_.inject, n, error_msg)) {
     return false;
   }
   if (cache_only) {
+    if (diagnostics_active_)
+      cycle_diagnostics_.cache_only_rows += n;
     // Known trunk rows replace the predictor residual on the next forward.
-    // Only K/V and pooled indexer keys survive this catch-up. Slice the
-    // packed Q/gate/K/V weight without copying or changing its arithmetic.
-    auto kv = l.attn_qkv;
-    const TensorRef layout{.type = kv.type, .cols = kv.cols};
-    kv.data = static_cast<std::uint8_t*>(kv.data) +
-              std::size_t{2} * c.AttentionQDim() * layout.RowBytes();
-    kv.rows = 2 * c.AttentionKvDim();
-    if (!DenseBatch(kv, s_.mixed, s_.qg, n, error_msg) ||
-        !PrepareAttention(
-            s_.qg, kv.rows, nullptr, l.attn_k_norm.f32(), nullptr, nullptr,
-            attn.k_cache, attn.v_cache, n, 0, c.num_kv_heads, c.head_dim,
-            c.rotary_dim, &session.control_->mtp_position, c.rope_theta,
-            c.rms_eps, stream_, attn.rope, false, yarn_, attn.kv_blocks)) {
-      AssignError(error_msg, "MTP cache projection failed");
+    // Only K/V and pooled indexer keys survive this catch-up.
+    if (!MtpKvProjection(l, s_.mixed, n, error_msg) ||
+        !StoreMtpKv(l, session, n, yarn_, error_msg)) {
       return false;
     }
     const auto capacity =

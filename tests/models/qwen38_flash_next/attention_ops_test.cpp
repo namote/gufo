@@ -119,8 +119,22 @@ void CheckPreparation(std::uint32_t n, std::uint32_t start,
   HipBuffer<float> v(static_cast<std::size_t>(n) * kKvWidth);
   HipBuffer<__half> k_ref(cache_rows * kKvWidth), v_ref(cache_rows * kKvWidth);
   HipBuffer<__half> k_out(cache_rows * kKvWidth), v_out(cache_rows * kKvWidth);
+  HipBuffer<__half> k_only(cache_rows * kKvWidth),
+      v_only(cache_rows * kKvWidth);
+  HipBuffer<float> separate_k(std::size_t{n} * kKvWidth),
+      separate_v(std::size_t{n} * kKvWidth);
   HipBuffer<std::uint32_t> pos(1);
-  Upload(&packed, MakeValues(static_cast<std::size_t>(n) * stride, 17, 4.0F));
+  const auto projection = MakeValues(std::size_t{n} * stride, 17, 4.0F);
+  Upload(&packed, projection);
+  std::vector<float> raw_k(std::size_t{n} * kKvWidth), raw_v(raw_k.size());
+  for (std::uint32_t row = 0; row < n; ++row) {
+    std::copy_n(projection.data() + std::size_t{row} * stride + 2 * kQWidth,
+                kKvWidth, raw_k.data() + std::size_t{row} * kKvWidth);
+    std::copy_n(
+        projection.data() + std::size_t{row} * stride + 2 * kQWidth + kKvWidth,
+        kKvWidth, raw_v.data() + std::size_t{row} * kKvWidth);
+  }
+  Upload(&separate_v, raw_v);
   auto qg = MakeValues(kDim, 37, 0.5F);
   auto kg = MakeValues(kDim, 91, 0.5F);
   for (auto& x : qg)
@@ -172,6 +186,7 @@ void CheckPreparation(std::uint32_t n, std::uint32_t start,
   for (std::uint32_t replay = 0; replay < 2; ++replay) {
     const std::vector<std::uint32_t> position{start + replay};
     Upload(&pos, position);
+    Upload(&separate_k, raw_k);  // preparation normalizes K in place
     q::UnpackQGate(packed.get(), stride, q_ref.get(), gate_ref.get(), k.get(),
                    v.get(), n, kHeads, kDim, kKvWidth, nullptr);
     q::RmsNormRows(q_ref.get(), q_gamma.get(), q_ref.get(), n * kHeads, kDim, 1,
@@ -193,6 +208,10 @@ void CheckPreparation(std::uint32_t n, std::uint32_t start,
           packed.get(), stride, q_gamma.get(), k_gamma.get(), q_out.get(),
           gate_out.get(), k_out.get(), v_out.get(), n, kHeads, kKvHeads, kDim,
           rotary, pos.get(), 1e7F, 1e-6F, capture.stream, nullptr, false, yarn);
+      q::PrepareAttentionKv(separate_k.get(), separate_v.get(), k_gamma.get(),
+                            k_only.get(), v_only.get(), n, kKvHeads, kDim,
+                            rotary, pos.get(), 1e7F, 1e-6F, capture.stream,
+                            nullptr, yarn);
       CheckHip(hipStreamEndCapture(capture.stream, &capture.graph),
                "preparation capture end");
       if (!supported)
@@ -213,6 +232,10 @@ void CheckPreparation(std::uint32_t n, std::uint32_t start,
          "key cache", replay);
     same(v_ref.get() + first * kKvWidth, v_out.get() + first * kKvWidth, window,
          "value cache", replay);
+    same(k_ref.get(), k_only.get(), cache_rows * kKvWidth,
+         "separate catch-up key cache and guards", replay);
+    same(v_ref.get(), v_only.get(), cache_rows * kKvWidth,
+         "separate catch-up value cache and guards", replay);
   }
   if (n >= 32) {
     // Each small prefill piece must match the full preparation, including
@@ -1063,13 +1086,15 @@ void CheckPagedRows(std::uint32_t n_tokens, std::uint32_t start_pos,
     const auto gamma = MakeValues(2 * kDim, seed ^ 7U, 1.0F);
     HipBuffer<float> d_packed(packed.size()), d_gamma(gamma.size()),
         d_src(std::size_t{n_tokens} * kKvWidth), qa(q_count), ga(q_count),
-        qb(q_count), gb(q_count);
+        qb(q_count), gb(q_count), separated_k(std::size_t{n_tokens} * kKvWidth),
+        separated_v(std::size_t{n_tokens} * kKvWidth);
     Upload(&d_packed, packed);
     Upload(&d_gamma, gamma);
     Upload(&d_src,
            MakeValues(std::size_t{n_tokens} * kKvWidth, seed ^ 5U, 1.0F));
     HipBuffer<__half> ck(kv_count), cv(kv_count), pk(paged_count),
         pv(paged_count), cs(kv_count), ps(paged_count);
+    HipBuffer<__half> kv_only_k(paged_count), kv_only_v(paged_count);
     for (const bool prefill : {false, true}) {
       if (!q::PrepareAttention(d_packed.get(), stride, d_gamma.get(),
                                d_gamma.get() + kDim, qa.get(), ga.get(),
@@ -1086,12 +1111,25 @@ void CheckPagedRows(std::uint32_t n_tokens, std::uint32_t start_pos,
                  nullptr);
       q::StoreKv(d_src.get(), ps.get(), n_tokens, kKvWidth, d_pos.get(),
                  nullptr, table);
-      CheckHip(hipDeviceSynchronize(), "paged writers");
+      CheckHip(hipDeviceSynchronize(), "paged prepared queries");
       RequireSame(Download(&qa, q_count).data(), Download(&qb, q_count).data(),
                   q_count * sizeof(float), "prepared queries");
-      for (auto [c, p, what] : {std::tuple{&ck, &pk, "prepared keys"},
-                                std::tuple{&cv, &pv, "prepared values"},
-                                std::tuple{&cs, &ps, "stored rows"}}) {
+      q::UnpackQGate(d_packed.get(), stride, qa.get(), ga.get(),
+                     separated_k.get(), separated_v.get(), n_tokens, kHeads,
+                     kDim, kKvWidth, nullptr);
+      // Only query/gate scratch was reused above; the cache-only writer
+      // receives independent K/V allocations and a permuted page table.
+      q::PrepareAttentionKv(
+          separated_k.get(), separated_v.get(), d_gamma.get() + kDim,
+          kv_only_k.get(), kv_only_v.get(), n_tokens, kKvHeads, kDim, 64,
+          d_pos.get(), 1e7F, 1e-6F, nullptr, nullptr, {}, table);
+      CheckHip(hipDeviceSynchronize(), "paged writers");
+      for (auto [c, p, what] :
+           {std::tuple{&ck, &pk, "prepared keys"},
+            std::tuple{&cv, &pv, "prepared values"},
+            std::tuple{&ck, &kv_only_k, "cache-only keys"},
+            std::tuple{&cv, &kv_only_v, "cache-only values"},
+            std::tuple{&cs, &ps, "stored rows"}}) {
         const auto contiguous = DownloadAs(c, kv_count);
         const auto gathered =
             layout.Gather(DownloadAs(p, paged_count), n_kv, kKvWidth, false);
@@ -1160,8 +1198,17 @@ void CheckPagedRows(std::uint32_t n_tokens, std::uint32_t start_pos,
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::string(argv[1]) == "--mtp-kv") {
+      for (const auto rows : {1U, 2U, 3U, 7U, 8U, 9U, 32U, 33U}) {
+        CheckPreparation(rows, 63, 64);
+        CheckPreparation(rows, 4093, 64, Yarn(1.5625F));
+      }
+      CheckPagedRows(3, 63, 0xF3B10C03U);
+      CheckPagedRows(9, 4093, 0xF3B10C09U);
+      return 0;
+    }
     for (const auto& [n, start, seed] : {std::tuple{1U, 5000U, 0xB10C0001U},
                                          std::tuple{8U, 9000U, 0xB10C0002U},
                                          std::tuple{64U, 4093U, 0xB10C0003U},

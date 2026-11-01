@@ -38,6 +38,9 @@ struct DeviceMixer {
   DeviceTensor down;
   DeviceTensor up;
   DeviceTensor inject;
+  /// An F16 `down` quantized to Q8_0 at load (ggml's Q8_0 rounding) for the
+  /// EXL3 prefill W8A8 down projection; empty otherwise.
+  DeviceTensor down_q8;
 };
 
 struct DeviceLayer {
@@ -120,6 +123,7 @@ public:
 
 private:
   DeviceModel() = default;
+  friend struct ExecutorTestAccess;
 
   Config config_;
   DeviceTensor token_embd_;

@@ -1,5 +1,24 @@
 # Qwen3.8 Flash-Next benchmarks
 
+## EXL3 5.05 prefill batch, November 1, 2026
+
+Nix ROCm10.1, GCC16.2/Clang24, gfx1151; KVarN k4v4, speculative off,
+temperature0, seed 314159. One candidate r2 window, saved pre-batch baseline reused.
+
+| Prefill | Saved pre-batch (tok/s) | Candidate (tok/s) | Change |
+|---|---:|---:|---:|
+| pp512 | 1039.61 ± 0.73 | 1061.85 ± 0.37 | +2.14% |
+| pp2048 | 1372.10 ± 0.11 | 1400.15 ± 0.83 | +2.04% |
+| pp8192 | 1411.52 ± 1.17 | 1442.28 ± 1.13 | +2.18% |
+| pp2048 @ d32768 | 1257.46 ± 0.39 | 1280.80 ± 3.23 | +1.86% |
+
+`fn-prefill-batch-nix101` is healthy and complete. Contexts, prefill warmups and
+case order match saved `fn-final-t1-x-ar-nix101`; generation cases were omitted.
+These are observed batch-level gains; individual changes were not timed separately.
+[Build and exactness evidence](../../../plan/exl3/F3-RESUME-RESULTS.md#qualified-prefill-batch-2026-11-01).
+
+## Earlier GGUF benchmark suite
+
 AMD Strix Halo `gfx1151`, 128 GB unified memory. Unsloth `UD-Q4_K_XL` target
 with shared-Q8_0 MTP; adaptive drafting. HTTP, greedy, thinking off.
 Gufo `fec4759d` (October 18, 2026); llama.cpp `b11069` AR and `6fcaa16f` MTP

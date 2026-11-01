@@ -21,7 +21,8 @@ namespace gufo::models::qwen38_flash_next {
 class ReferenceModel {
 public:
   /// Float32 formulas versus an independent emulation of decode storage:
-  /// Q8 activation blocks, F16 KV/pooled keys and F16 uploaded router weights.
+  /// Q8 activation blocks, F16 KV/pooled keys and uploaded router weights,
+  /// and EXL3's FP32 rotation followed by F16 activation storage.
   enum class Storage { kFloat32, kDecode };
   ReferenceModel(const ModelWeights& weights, NgramTable* ngram,
                  std::uint32_t max_context,
@@ -38,7 +39,7 @@ public:
   /// predictor residual; otherwise use the supplied pre-head trunk stream.
   /// The shifted token always uses the text embedding table, including
   /// image-pad IDs. Visual information is carried by hidden and mRoPE.
-  /// `stage_inputs` optionally supplies observed fusion/attention outputs as
+  /// `stage_inputs` optionally supplies observed fusion/attention/FFN inputs as
   /// inputs to the following stages, isolating arithmetic from accumulated
   /// quantization drift. Attention caches remain independently computed.
   [[nodiscard]] bool MtpStep(const MtpWeights& mtp, std::int32_t token,

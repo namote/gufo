@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <stdexcept>
@@ -134,9 +135,13 @@ void CheckMetadata(const std::filesystem::path& directory,
   }
 }
 
-std::string HeadersDigest(const ex::Checkpoint& checkpoint) {
+std::string HeadersDigest(
+    const ex::Checkpoint& checkpoint,
+    const core::GgufMappedRegion* supplementary = nullptr) {
   crypto::Sha256Hasher hash;
   auto regions = checkpoint.GetMappedRegions();
+  if (supplementary != nullptr)
+    regions.push_back(*supplementary);
   std::sort(regions.begin(), regions.end(), [](const auto& a, const auto& b) {
     return a.source_path.filename() < b.source_path.filename();
   });
@@ -149,28 +154,6 @@ std::string HeadersDigest(const ex::Checkpoint& checkpoint) {
     std::memcpy(&count, region.data, 8);
     hash.Update({static_cast<const std::uint8_t*>(region.data),
                  static_cast<std::size_t>(8 + count)});
-  }
-  return hash.FinishHex();
-}
-
-std::string GgufHeadersDigest(const core::GgufReader& reader) {
-  crypto::Sha256Hasher hash;
-  for (const auto& region : reader.GetMappedRegions()) {
-    const auto* base = static_cast<const std::uint8_t*>(region.data);
-    std::size_t header = region.size;
-    for (const auto& tensor : reader.GetTensors()) {
-      const auto address = reinterpret_cast<std::uintptr_t>(tensor.data);
-      const auto start = reinterpret_cast<std::uintptr_t>(base);
-      if (address >= start && address < start + region.size)
-        header = std::min(header, static_cast<std::size_t>(address - start));
-    }
-    if (header == region.size)
-      Fail("retained GGUF shard has no tensors");
-    const auto label = region.source_path.filename().string() + '\0' +
-                       std::to_string(region.size) + '\0';
-    hash.Update(
-        {reinterpret_cast<const std::uint8_t*>(label.data()), label.size()});
-    hash.Update({base, header});
   }
   return hash.FinishHex();
 }
@@ -189,6 +172,9 @@ struct Binder {
                   bool plus_one = false, bool neg_exp = false,
                   bool v_order = false, bool qkv_order = false) {
     const auto* t = storage.checkpoint->Find(name);
+    const bool owned = t == nullptr && storage.supplementary.contains(name);
+    if (owned)
+      t = &storage.supplementary.at(name);
     if (t == nullptr || t->Elements() != std::int64_t{cols} * rows ||
         t->shape.empty() ||
         (rows > 1 &&
@@ -206,7 +192,8 @@ struct Binder {
     ref.shard = t->shard;
     ref.file_offset = t->file_offset;
     ref.name = Name(name);
-    ref.safetensors = true;
+    ref.safetensors = !owned;
+    ref.memory_owned = owned;
     if (!f32 && !v_order && !qkv_order)
       return ref;
     storage.converted.emplace_back(std::size_t{cols} * rows * 4);
@@ -244,31 +231,10 @@ struct Binder {
   }
 
   TensorRef Linear(const std::string& module, std::uint32_t k, std::uint32_t n,
-                   int bits, std::uint32_t experts = 1, bool input_v = false,
+                   std::uint32_t experts = 1, bool input_v = false,
                    bool output_v = false, bool qkv_v = false) {
-    storage.linears.emplace_back();
-    auto& bank = storage.linears.back();
-    bank.reserve(experts);
-    for (std::uint32_t e = 0; e < experts; ++e) {
-      std::string name = module;
-      if (experts > 1)
-        name.replace(name.find("{}"), 2, std::to_string(e));
-      const auto lin = storage.checkpoint->GetLinear(name);
-      if (lin.in_features != k || lin.out_features != n ||
-          lin.rate != ex::BitRate{bits, false} ||
-          lin.codebook != ex::Codebook::kMul1 || lin.bias != nullptr)
-        Fail("invalid projection geometry/rate/codebook " + name);
-      const auto* trellis = storage.checkpoint->Find(name + ".trellis");
-      const auto* suh = storage.checkpoint->Find(name + ".suh");
-      const auto* svh = storage.checkpoint->Find(name + ".svh");
-      Exl3HostLinear host;
-      host.view = {lin.trellis, lin.suh, lin.svh, k, n, lin.rate, lin.codebook};
-      host.shard = trellis->shard;
-      if (suh->shard != trellis->shard || svh->shard != trellis->shard)
-        Fail("projection quartet spans shards: " + name);
-      host.trellis_offset = trellis->file_offset;
-      host.suh_offset = suh->file_offset;
-      host.svh_offset = svh->file_offset;
+    auto ref = BindExl3LinearBank(storage, module, k, n, experts);
+    for (auto& host : storage.linears.back()) {
       const auto blocks = [&](std::uint32_t width, bool v, bool qkv) {
         std::vector<std::uint32_t> permutation;
         if (!v && !qkv)
@@ -286,15 +252,7 @@ struct Binder {
       };
       host.input_blocks = blocks(k, input_v, false);
       host.output_blocks = blocks(n, output_v, qkv_v);
-      bank.push_back(std::move(host));
     }
-    TensorRef ref;
-    ref.data = bank[0].view.trellis;
-    ref.cols = k;
-    ref.rows = n;
-    ref.experts = experts;
-    ref.name = Name(module);
-    ref.exl3 = bank;
     return ref;
   }
 
@@ -322,11 +280,11 @@ struct Binder {
     if (l.linear) {
       const auto a = p + "linear_attn.";
       l.ssm_qkv = Linear(a + "in_proj_qkv", c.hidden_size, c.SsmConvChannels(),
-                         7, 1, false, false, true);
-      l.ssm_gate = Linear(a + "in_proj_z", c.hidden_size, c.SsmValueDim(), 7, 1,
+                         1, false, false, true);
+      l.ssm_gate = Linear(a + "in_proj_z", c.hidden_size, c.SsmValueDim(), 1,
                           false, true);
       l.ssm_out =
-          Linear(a + "out_proj", c.SsmValueDim(), c.hidden_size, 7, 1, true);
+          Linear(a + "out_proj", c.SsmValueDim(), c.hidden_size, 1, true);
       l.ssm_conv1d =
           Plain(a + "conv1d.weight", c.ssm_conv_kernel, c.SsmConvChannels(),
                 true, false, false, false, true);
@@ -342,14 +300,14 @@ struct Binder {
       l.ssm_norm = Plain(a + "norm.weight", c.ssm_head_dim, 1, true);
     } else {
       const auto a = p + "self_attn.";
-      l.attn_q = Linear(a + "q_proj", c.hidden_size, 2 * c.AttentionQDim(), 7);
-      l.attn_k = Linear(a + "k_proj", c.hidden_size, c.AttentionKvDim(), 7);
-      l.attn_v = Linear(a + "v_proj", c.hidden_size, c.AttentionKvDim(), 7);
-      l.attn_out = Linear(a + "o_proj", c.AttentionQDim(), c.hidden_size, 7);
+      l.attn_q = Linear(a + "q_proj", c.hidden_size, 2 * c.AttentionQDim());
+      l.attn_k = Linear(a + "k_proj", c.hidden_size, c.AttentionKvDim());
+      l.attn_v = Linear(a + "v_proj", c.hidden_size, c.AttentionKvDim());
+      l.attn_out = Linear(a + "o_proj", c.AttentionQDim(), c.hidden_size);
       l.attn_q_norm = Plain(a + "q_norm.weight", c.head_dim, 1, true, true);
       l.attn_k_norm = Plain(a + "k_norm.weight", c.head_dim, 1, true, true);
       l.indexer_q = Linear(a + "indexer.index_qk_proj", c.hidden_size,
-                           (c.indexer_heads + 1) * c.indexer_head_dim, 5);
+                           (c.indexer_heads + 1) * c.indexer_head_dim);
       l.indexer_k = l.indexer_q;
       l.indexer_q.rows = c.indexer_heads * c.indexer_head_dim;
       l.indexer_k.rows = c.indexer_head_dim;
@@ -375,26 +333,25 @@ struct Binder {
     l.shexp_gate_inp =
         Plain(p + "mlp.shared_expert_gate.weight", c.hidden_size);
     l.ffn_gate_exps = Linear(p + "mlp.experts.{}.gate_proj", c.hidden_size,
-                             c.expert_ff, 5, c.num_experts);
+                             c.expert_ff, c.num_experts);
     l.ffn_up_exps = Linear(p + "mlp.experts.{}.up_proj", c.hidden_size,
-                           c.expert_ff, 5, c.num_experts);
+                           c.expert_ff, c.num_experts);
     l.ffn_down_exps = Linear(p + "mlp.experts.{}.down_proj", c.expert_ff,
-                             c.hidden_size, 5, c.num_experts);
+                             c.hidden_size, c.num_experts);
     l.shexp_gate = Linear(p + "mlp.shared_expert.gate_proj", c.hidden_size,
-                          c.shared_expert_ff, 7);
+                          c.shared_expert_ff);
     l.shexp_up = Linear(p + "mlp.shared_expert.up_proj", c.hidden_size,
-                        c.shared_expert_ff, 7);
+                        c.shared_expert_ff);
     l.shexp_down = Linear(p + "mlp.shared_expert.down_proj", c.shared_expert_ff,
-                          c.hidden_size, 7);
+                          c.hidden_size);
     if (mtp) {
       l.nextn_enorm = Plain("mtp.pre_fc_norm_embedding.weight", c.hidden_size,
                             1, true, true);
       l.nextn_hnorm =
           Plain("mtp.pre_fc_norm_hidden.weight", c.HcDim(), 1, true, true);
       l.nextn_fc_embedding =
-          Linear("mtp.fc_embedding", c.hidden_size, c.hidden_size, 6);
-      l.nextn_fc_hidden =
-          Linear("mtp.fc_hidden", c.hidden_size, c.hidden_size, 6);
+          Linear("mtp.fc_embedding", c.hidden_size, c.hidden_size);
+      l.nextn_fc_hidden = Linear("mtp.fc_hidden", c.hidden_size, c.hidden_size);
       l.nextn_head = Mixer("mtp.hyper_connection_mixer.", false);
     }
     return l;
@@ -411,18 +368,176 @@ std::shared_ptr<Exl3Storage> Open(const std::filesystem::path& path,
   const auto directory = Reference(path, sidecar, kExl3Checkpoint);
   CheckMetadata(directory, sidecar, c);
   auto storage = std::make_shared<Exl3Storage>();
-  std::vector<std::filesystem::path> supplementary;
-  if (mtp)
-    supplementary.push_back(Reference(path, sidecar, kExl3MtpMixer));
-  storage->checkpoint = std::make_shared<ex::Checkpoint>(
-      ex::Checkpoint::Open(directory, supplementary));
+  storage->checkpoint =
+      std::make_shared<ex::Checkpoint>(ex::Checkpoint::Open(directory));
+  std::filesystem::path patch;
+  if (mtp && sidecar.GetMetadataString(kExl3MtpMixer))
+    patch = Reference(path, sidecar, kExl3MtpMixer);
+  const auto digest = mtp ? PrepareExl3MtpMixer(*storage, c, patch)
+                          : HeadersDigest(*storage->checkpoint);
   CheckDigest(sidecar,
               mtp ? "gufo.exl3.mtp_headers_sha256" : "gufo.exl3.headers_sha256",
-              HeadersDigest(*storage->checkpoint));
+              digest);
   return storage;
 }
 
 }  // namespace
+
+TensorRef BindExl3LinearBank(Exl3Storage& storage, const std::string& module,
+                             std::uint32_t k, std::uint32_t n,
+                             std::uint32_t experts) {
+  if (experts == 0 || (experts > 1 && module.find("{}") == std::string::npos))
+    Fail("invalid expert bank " + module);
+  // Commit storage only after the entire bank has validated.
+  std::vector<Exl3HostLinear> bank;
+  bank.reserve(experts);
+  for (std::uint32_t e = 0; e < experts; ++e) {
+    auto name = module;
+    if (name.find("{}") != std::string::npos)
+      name.replace(name.find("{}"), 2, std::to_string(e));
+    const auto lin = storage.checkpoint->GetLinear(name);
+    if (lin.in_features != k || lin.out_features != n || lin.rate.half ||
+        lin.rate.bits < 3 || lin.rate.bits > 7 ||
+        lin.codebook != ex::Codebook::kMul1 || lin.bias != nullptr)
+      Fail("invalid projection geometry/rate/codebook " + name);
+    if (!bank.empty() && lin.rate != bank.front().view.rate)
+      Fail("mixed expert rates in bank " + module + " at " + name);
+    const auto* trellis = storage.checkpoint->Find(name + ".trellis");
+    const auto* suh = storage.checkpoint->Find(name + ".suh");
+    const auto* svh = storage.checkpoint->Find(name + ".svh");
+    if (suh->shard != trellis->shard || svh->shard != trellis->shard)
+      Fail("projection quartet spans shards: " + name);
+    Exl3HostLinear host;
+    host.view = {lin.trellis, lin.suh, lin.svh, k, n, lin.rate, lin.codebook};
+    host.shard = trellis->shard;
+    host.trellis_offset = trellis->file_offset;
+    host.suh_offset = suh->file_offset;
+    host.svh_offset = svh->file_offset;
+    bank.push_back(std::move(host));
+  }
+  storage.linears.push_back(std::move(bank));
+  storage.names.push_back(module);
+  TensorRef ref;
+  ref.data = storage.linears.back().front().view.trellis;
+  ref.cols = k;
+  ref.rows = n;
+  ref.experts = experts;
+  ref.name = storage.names.back();
+  ref.exl3 = storage.linears.back();
+  return ref;
+}
+
+std::string PrepareExl3MtpMixer(Exl3Storage& storage, const Config& c,
+                                const std::filesystem::path& patch) {
+  const std::string prefix = "mtp.hyper_connection_mixer.";
+  const auto width = static_cast<std::int64_t>(c.HcDim());
+  const std::map<std::string, std::vector<std::int64_t>> shapes{
+      {prefix + "hc_norm.weight", {width}},
+      {prefix + "input_mix_weight_down.weight", {c.hc_low_rank, width}},
+      {prefix + "input_mix_weight_up.weight", {width, c.hc_low_rank}}};
+  std::vector<std::uint8_t> header;
+  std::uint64_t file_size = 0;
+  if (!patch.empty()) {
+    std::ifstream in(patch, std::ios::binary | std::ios::ate);
+    if (!in || in.tellg() < 8)
+      Fail("cannot read MTP mixer patch " + patch.string());
+    file_size = static_cast<std::uint64_t>(in.tellg());
+    in.seekg(0);
+    std::uint64_t length = 0;
+    in.read(reinterpret_cast<char*>(&length), 8);
+    if (length == 0 || length > (64U << 20) || length > file_size - 8)
+      Fail("invalid MTP mixer patch header");
+    header.resize(8 + length);
+    std::memcpy(header.data(), &length, 8);
+    in.read(reinterpret_cast<char*>(header.data() + 8), length);
+    const auto entries = json::parse(std::string_view(
+        reinterpret_cast<const char*>(header.data() + 8), length));
+    if (!entries.is_object())
+      Fail("MTP mixer patch header must be an object");
+    for (const auto& [name, entry] : entries.members()) {
+      if (name == "__metadata__")
+        continue;
+      const auto expected = shapes.find(name);
+      if (expected == shapes.end())
+        Fail("unexpected tensor in MTP mixer patch " + name);
+      ex::Tensor tensor;
+      tensor.dtype_name = entry.member_str("dtype");
+      const unsigned element = tensor.dtype_name == "F32" ? 4 : 2;
+      tensor.dtype = tensor.dtype_name == "F16"    ? ex::DType::kF16
+                     : tensor.dtype_name == "BF16" ? ex::DType::kBF16
+                     : tensor.dtype_name == "F32"  ? ex::DType::kF32
+                                                   : ex::DType::kOther;
+      const auto* dims = entry.find("shape");
+      const auto* offsets = entry.find("data_offsets");
+      if (tensor.dtype == ex::DType::kOther || dims == nullptr ||
+          !dims->is_array() || dims->size() != expected->second.size() ||
+          offsets == nullptr || !offsets->is_array() || offsets->size() != 2)
+        Fail("invalid MTP mixer patch tensor " + name);
+      std::uint64_t elements = 1;
+      for (std::size_t i = 0; i < dims->size(); ++i) {
+        if (dims->items()[i].as_double() != expected->second[i])
+          Fail("MTP mixer patch geometry mismatch " + name);
+        tensor.shape.push_back(expected->second[i]);
+        elements *= expected->second[i];
+      }
+      const auto offset = [&](const json::Value& value) {
+        const auto position =
+            value.as_size(std::numeric_limits<std::size_t>::max());
+        if (position == std::numeric_limits<std::size_t>::max())
+          Fail("invalid MTP mixer patch offset " + name);
+        return position;
+      };
+      const auto begin = offset(offsets->items()[0]);
+      const auto end = offset(offsets->items()[1]);
+      if (begin > end || end > file_size - 8 - length ||
+          end - begin != elements * element)
+        Fail("MTP mixer patch payload mismatch " + name);
+      tensor.bytes = end - begin;
+      std::vector<std::uint8_t> bytes(tensor.bytes);
+      in.seekg(8 + length + begin);
+      in.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
+      if (!in)
+        Fail("truncated MTP mixer patch tensor " + name);
+      if (const auto* existing = storage.checkpoint->Find(name)) {
+        if (existing->dtype != tensor.dtype ||
+            existing->shape != tensor.shape ||
+            existing->bytes != tensor.bytes ||
+            std::memcmp(existing->data, bytes.data(), tensor.bytes) != 0)
+          Fail("in-shard MTP mixer differs from patch " + name);
+      } else {
+        storage.converted.push_back(std::move(bytes));
+        tensor.data = storage.converted.back().data();
+        storage.supplementary.insert_or_assign(name, std::move(tensor));
+      }
+    }
+  }
+  for (const auto& [name, shape] : shapes) {
+    const auto* tensor = storage.checkpoint->Find(name);
+    if (tensor == nullptr && storage.supplementary.contains(name))
+      tensor = &storage.supplementary.at(name);
+    if (tensor == nullptr || tensor->shape != shape ||
+        (tensor->dtype != ex::DType::kF16 &&
+         tensor->dtype != ex::DType::kBF16 && tensor->dtype != ex::DType::kF32))
+      Fail("missing/invalid MTP mixer operand " + name);
+  }
+  if (patch.empty())
+    return HeadersDigest(*storage.checkpoint);
+  const core::GgufMappedRegion region{header.data(), file_size, {}, patch};
+  return HeadersDigest(*storage.checkpoint, &region);
+}
+
+std::string Exl3PleHeadersDigest(const core::GgufReader& reader) {
+  crypto::Sha256Hasher hash;
+  for (const auto& region : reader.GetMappedRegions()) {
+    const auto* base = static_cast<const std::uint8_t*>(region.data);
+    const auto label = region.source_path.filename().string() + '\0' +
+                       std::to_string(region.size) + '\0';
+    hash.Update(
+        {reinterpret_cast<const std::uint8_t*>(label.data()), label.size()});
+    hash.Update({base, region.data_offset});
+  }
+  return hash.FinishHex();
+}
 
 std::uint32_t Exl3VHeadDestination(std::uint32_t index, std::uint32_t dim,
                                    const Config& c) {
@@ -448,8 +563,7 @@ std::optional<ModelWeights> LoadExl3Model(const std::filesystem::path& path,
                            w.config.hidden_size, w.config.vocab_size);
     if (w.token_embd.type != core::GgmlType::kBF16)
       Fail("embedding must remain BF16");
-    w.output =
-        b.Linear("lm_head", w.config.hidden_size, w.config.vocab_size, 6);
+    w.output = b.Linear("lm_head", w.config.hidden_size, w.config.vocab_size);
     w.hc_head = b.Mixer("model.language_model.hyper_connection_mixer.", false);
     if (w.config.ple_layer >= 0) {
       storage.ple_reader = core::GgufReader::OpenFile(
@@ -457,7 +571,7 @@ std::optional<ModelWeights> LoadExl3Model(const std::filesystem::path& path,
       if (!storage.ple_reader)
         return std::nullopt;
       CheckDigest(sidecar, "gufo.exl3.ple_headers_sha256",
-                  GgufHeadersDigest(*storage.ple_reader));
+                  Exl3PleHeadersDigest(*storage.ple_reader));
       auto source = ModelWeights::Bind(*storage.ple_reader, error);
       if (!source)
         return std::nullopt;
@@ -524,7 +638,7 @@ std::optional<MtpWeights> LoadExl3Mtp(const std::filesystem::path& path,
 }
 
 void Exl3MatVec(const Exl3HostLinear& host, std::span<const float> x,
-                std::span<float> y) {
+                std::span<float> y, bool decode_storage) {
   const auto& l = host.view;
   if (x.size() != l.k || y.size() != l.n)
     Fail("CPU projection shape mismatch");
@@ -532,10 +646,35 @@ void Exl3MatVec(const Exl3HostLinear& host, std::span<const float> x,
     return blocks.empty() ? i : blocks[i / 128] * 128 + i % 128;
   };
   std::vector<double> rotated(l.k), inner_y(l.n);
-  for (std::size_t i = 0; i < l.k; ++i)
-    rotated[i] =
-        x[destination(i, host.input_blocks)] * ex::HalfToDouble(l.suh[i]);
-  ex::HadamardBlocks(rotated);
+  if (decode_storage) {
+    for (std::size_t base = 0; base < l.k; base += 128) {
+      float segment[128];
+      for (std::size_t i = 0; i < 128; ++i) {
+        // The input producer rounds each product and butterfly to FP32
+        // before storing its normalized Hadamard result as FP16.
+        volatile float product =
+            x[destination(base + i, host.input_blocks)] *
+            static_cast<float>(ex::HalfToDouble(l.suh[base + i]));
+        segment[i] = product;
+      }
+      for (unsigned length = 1; length < 128; length *= 2)
+        for (unsigned first = 0; first < 128; first += 2 * length)
+          for (unsigned i = first; i < first + length; ++i) {
+            const float a = segment[i], b = segment[i + length];
+            segment[i] = a + b;
+            segment[i + length] = a - b;
+          }
+      for (unsigned i = 0; i < 128; ++i) {
+        volatile float scaled = segment[i] * 0.0883883461356163F;
+        rotated[base + i] = ex::HalfToDouble(ex::HalfFromDouble(scaled));
+      }
+    }
+  } else {
+    for (std::size_t i = 0; i < l.k; ++i)
+      rotated[i] =
+          x[destination(i, host.input_blocks)] * ex::HalfToDouble(l.suh[i]);
+    ex::HadamardBlocks(rotated);
+  }
   std::vector<std::uint16_t> tile(l.k * 128);
   for (std::size_t n0 = 0; n0 < l.n; n0 += 128) {
     ex::DequantInnerColumns(l.trellis, l.k, l.n, l.rate, l.codebook, n0, 128,

@@ -515,6 +515,74 @@ int main() {
                       kRows * sizeof(__half)) != 0)
         throw std::runtime_error("HC prefill depends on chunk width");
     }
+    // EXL3 prefill: the combine writes the F16 norm and its stream scales
+    // instead of the F32 norm, and the mixer recomputes that norm from the
+    // residual. Everything must match the F32 route byte for byte.
+    {
+      const auto bytes_equal = [](const void* x, const void* y, std::size_t n) {
+        return std::memcmp(x, y, n) == 0;
+      };
+      Upload(&d_inject_vec, inject_vec);
+      HipBuffer<float> d_res_a(kRows);
+      HipBuffer<float> d_res_b(kRows);
+      HipBuffer<float> d_xn_a(kRows);
+      HipBuffer<float> d_xn_b(kRows);
+      HipBuffer<__half> d_half_a(kRows);
+      HipBuffer<__half> d_half_b(kRows);
+      HipBuffer<float> d_scale(static_cast<std::size_t>(kTokens) * kStreams);
+      HipBuffer<float> d_mixed_a(kMixed);
+      HipBuffer<float> d_mixed_b(kMixed);
+      HipBuffer<float> d_inj_a(vec_inject);
+      HipBuffer<float> d_inj_b(vec_inject);
+      Upload(&d_res_a, res);
+      Upload(&d_res_b, res);
+      q::HcCombine(d_res_a.get(), d_block_out.get(), d_inject_vec.get(),
+                   vec_parts, d_gamma.get(), d_xn_a.get(), kTokens, kHidden,
+                   kStreams, kEps, nullptr, false, true);
+      q::NarrowActivations(d_xn_a.get(), d_half_a.get(), false, kRows, nullptr);
+      if (!q::HcCombine(d_res_b.get(), d_block_out.get(), d_inject_vec.get(),
+                        vec_parts, d_gamma.get(), d_xn_b.get(), kTokens,
+                        kHidden, kStreams, kEps, nullptr, false, true,
+                        d_half_b.get(), d_scale.get()))
+        throw std::runtime_error("HC combine did not write the F16 norm");
+      q::HcMixEpilogueVec4(d_xn_a.get(), d_gate.get(), d_weight.get(),
+                           d_mixed_a.get(), d_inj_a.get(), kTokens, kHidden,
+                           kStreams, nullptr);
+      q::HcMixEpilogueVec4FromRes(d_res_b.get(), d_gamma.get(), d_scale.get(),
+                                  d_gate.get(), d_weight.get(), d_mixed_b.get(),
+                                  d_inj_b.get(), kTokens, kHidden, nullptr);
+      q::HcNormFromRes(d_res_b.get(), d_gamma.get(), d_scale.get(),
+                       d_xn_b.get(), kTokens, kHidden, nullptr);
+      CheckHip(hipDeviceSynchronize(), "HC deferred norm");
+      const auto res_a = Download(&d_res_a, kRows);
+      const auto res_b = Download(&d_res_b, kRows);
+      const auto xn_a = Download(&d_xn_a, kRows);
+      const auto xn_b = Download(&d_xn_b, kRows);
+      const auto mixed_a = Download(&d_mixed_a, kMixed);
+      const auto mixed_b = Download(&d_mixed_b, kMixed);
+      const auto inj_a = Download(&d_inj_a, vec_inject);
+      const auto inj_b = Download(&d_inj_b, vec_inject);
+      std::vector<__half> half_a(kRows);
+      std::vector<__half> half_b(kRows);
+      CheckHip(hipMemcpy(half_a.data(), d_half_a.get(), kRows * sizeof(__half),
+                         hipMemcpyDeviceToHost),
+               "F32-route half norm");
+      CheckHip(hipMemcpy(half_b.data(), d_half_b.get(), kRows * sizeof(__half),
+                         hipMemcpyDeviceToHost),
+               "deferred half norm");
+      const bool res_ok = bytes_equal(res_a.data(), res_b.data(), kRows * 4);
+      const bool half_ok =
+          bytes_equal(half_a.data(), half_b.data(), kRows * sizeof(__half));
+      const bool xn_ok = bytes_equal(xn_a.data(), xn_b.data(), kRows * 4);
+      const bool mix_ok =
+          bytes_equal(mixed_a.data(), mixed_b.data(), kMixed * 4) &&
+          bytes_equal(inj_a.data(), inj_b.data(), vec_inject * 4);
+      std::cout << "HC deferred norm: residual " << res_ok << ", F16 norm "
+                << half_ok << ", recomputed F32 norm " << xn_ok
+                << ", mix epilogue " << mix_ok << '\n';
+      if (!res_ok || !half_ok || !xn_ok || !mix_ok)
+        throw std::runtime_error("HC deferred norm changed the F32 route");
+    }
     std::cout << "HC mixed outputs and short prefill chunks passed\n";
     return 0;
   } catch (const std::exception& error) {
