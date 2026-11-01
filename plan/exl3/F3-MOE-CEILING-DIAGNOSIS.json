@@ -1,0 +1,51 @@
+{
+  "scope": "Offline diagnosis from preserved profile, code and synthetic operator routing. No new GPU work, build, baseline or quality qualification.",
+  "current_profile": "F3-CURRENT-PREFILL-PROFILE.json",
+  "qualified_pp2048_tps": 1429.13,
+  "gate_up": {
+    "useful_flops": 6316621824000,
+    "measured_ms": 303.137204,
+    "useful_TFLOPS": 20.83750110725439,
+    "cold_ms": 133.698852,
+    "hot_ms": 169.438352,
+    "row_scope": "47 layers at2048 rows plus final FFN128 rows; executor.cpp final FFN pruning, trace final shared matrix rows_arg128",
+    "previous_21_253_correction": "Earlier21.253 assumed48 full2048-row FFNs, overcounting1920 final-layer rows."
+  },
+  "ceiling": {
+    "historical_register_FP16_TFLOPS": 55.34,
+    "toolchain": "ROCm 7.2.4; not recalibrated on Nix10.1",
+    "source": "../rotated-quant/R0B-RESULTS.md",
+    "ideal_gate_up_ms_ignoring_all_overheads": 114.14206404047705,
+    "warning": "Arithmetic reference, not achievable kernel target or measured hardware utilization."
+  },
+  "synthetic_routing": {
+    "path": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-stage-screen-nix101/receipt/run/stage-controls/routed-routing.routing",
+    "sha256": "bd65483e8f25510918c50a4bfaff9ed375bb933ae636df30c14413755842e0b5",
+    "source_generator": "build/f3-prefill-cold/screen.hip:CutBuckets; synthetic skew modeled on historical routing, not captured current model routes",
+    "experts": 512,
+    "useful_rows": 20480,
+    "live_buckets": 400,
+    "class_counts": [
+      127,
+      56,
+      62,
+      155
+    ],
+    "executed_WMMA_rows": 23648,
+    "B_staged_row_slots": 35520,
+    "WMMA_padding_percent": 15.468750000000009,
+    "B_staging_overhead_percent": 73.4375,
+    "warning": "Logical row work, not measured physical memory traffic or latency. Do not multiply current model throughput by this synthetic padding factor.",
+    "wholly_dead_B_staging_slots": 11872,
+    "dead_B_slots_percent_of_staged": 33.42342342342342
+  },
+  "latency_budgets": {
+    "qualified_ms": 1433.0396814845394,
+    "target_2000_ms": 1024,
+    "required_saving_ms": 409.0396814845394,
+    "gate_up_20percent_time_reduction_ms": 60.6274408,
+    "routed_all_20percent_time_reduction_ms": 92.688929,
+    "routed_plus_dense_20percent_time_reduction_ms": 151.83004300000002,
+    "warning": "Fixed-other-cost arithmetic, not predicted net savings; concurrency and contention may change."
+  }
+}

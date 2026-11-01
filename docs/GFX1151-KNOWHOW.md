@@ -129,8 +129,8 @@ span rather than adding isolated kernel times (S:5,8; EFN:52–71,107–108).
 Source audit clarification (no new measurement): that generic probe and the
 existing Q8-weight production overlaps do not cover current EXL3 branch pairs.
 [EXL3 stream candidate audit](../plan/exl3/F3-STREAM-OVERLAP.md) records their
-joins, workspace aliases and priority; GDN Z and shared/routed overlap remain
-open, not measured failures.
+joins, workspace aliases and priority. Shared/routed overlap is now qualified;
+GDN Z had weak/negative evidence. See the final stream qualification below.
 
 LDS-fed WMMA calibration:
 
@@ -1125,3 +1125,20 @@ Profiled1426.48tok/s is advisory (context4096 versus earlier benchmark8193);
 qualified clean1429.13 remains current. Existing `tools/prof/prof.py` exactly
 cross-checks interval totals; its generic stage map is not used for EXL3
 attribution. [Raw receipt, shapes, coverage and limitations](../plan/exl3/F3-CURRENT-PREFILL-PROFILE.json).
+
+### Routed MoE ceiling diagnosis (2026-11-02, offline only)
+
+Current gate/up is303.137ms for6.31662e12 useful FLOPs (20.838TFLOPS):47 full
+2048-row FFNs plus the final128-row FFN. The earlier21.253 estimate incorrectly
+counted48 full layers. The
+55.34TFLOPS register-fed reference used ROCm7.2.4; their ratio is not hardware
+utilization. Saved synthetic routing has20,480 useful rows,23,648 WMMA rows and
+35,520 B staging slots; current kernels skip dead16-row WMMA subtiles but still
+prepare full64/128-row inputs. This is logical work, not measured DRAM traffic
+or the current model's routing distribution. Decode/issue competition and LDS
+reuse have historical support, but current causal percentages remain unknown.
+No GPU measurement, production change or quality qualification was added.
+[Calculations/provenance](../plan/exl3/F3-MOE-CEILING-DIAGNOSIS.json) and
+[ordered plan](../plan/exl3/F3-SEARCH-STATUS.md#ordered-improvement-plan) preserve
+existing rejected experiments and prioritize dead-subtile preparation before
+conditional trellis-address work, with one final combined qualification.
