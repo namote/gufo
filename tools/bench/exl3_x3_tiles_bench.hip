@@ -201,6 +201,19 @@ int main(int argc, char** argv) {
     auto* y0 = Alloc<float>(std::size_t(assignments) * n);
     hipLaunchKernelGGL(FillHalf, dim3(1024), dim3(256), 0, 0, x,
                        std::size_t(assignments) * k, 6U, false);
+    if (argc > 3 && std::strcmp(argv[3], "pmc") == 0) {
+      // Counter collection: the production tile, one dispatch per shape.
+      Buckets<128, 64, 2, 2>(d_bank, d_b, d_count, max_buckets, k, n, x, y);
+      Check(hipDeviceSynchronize());
+      std::printf("pmc routed %u->%u %s\n", k, n, skew ? "skew" : "unif");
+      for (void* p :
+           {static_cast<void*>(t), static_cast<void*>(d_bank),
+            static_cast<void*>(d_b), static_cast<void*>(d_count),
+            static_cast<void*>(x), static_cast<void*>(y),
+            static_cast<void*>(y0)})
+        Check(hipFree(p));
+      continue;
+    }
     Buckets<128, 64, 4, 2>(d_bank, d_b, d_count, max_buckets, k, n, x, y0);
     Check(hipDeviceSynchronize());
     std::vector<float> ref(std::size_t(assignments) * n), got(ref.size());
