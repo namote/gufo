@@ -1083,3 +1083,45 @@ Gate/up intermediate values were not separately compared. Five linked objects
 match old controls; the kernels TU differs. No fresh independent oracle,
 full-model qualification, baseline run or profile. Prototype/source/objects
 remain in `build/f3-grouped-moe`; [all results and provenance](../plan/exl3/F3-GROUPED-MOE-SCREEN.json).
+
+
+### Current shared5 prefill profile (2026-11-02, user requested)
+
+Native Nix roctracer10.1 timestamps now cover the exact qualified shared5 ELF
+(SHA b6b28244…) under patched ROCr88j/CLRal4. A bounded collector activates at
+first embedding: startup-inclusive collection twice hit its2Mrecord cap;
+those failed receipts remain. The successful32.81s process includes29.31s
+loading, one2048 warmup and one2048 measured forward, d0/k4v4/AR/context4096.
+Exactly4798 GPU launches match4798 HIP API correlations,2399 per forward,
+with no invalid timestamps or graphs. No prior baseline was rerun.
+
+Measured GPU span1434.413ms, kernel union1429.764ms (**99.676% busy**), gap
+4.648ms. Kernel+copy union1430.050ms;94 barrier-wait intervals are excluded.
+The main stream holds1428.485ms and the shared side stream342.044ms, with
+340.764ms temporal overlap and1.280ms side-only activity. Summed kernel time
+1770.529ms is not latency. Temporal overlap does not quantify net savings.
+Kernel-active coverage is not SM/ALU utilization; the1386.046ms host stream
+synchronize call waits on the GPU and is not additive CPU overhead.
+
+| Main-stream work | ms | % of measured GPU span |
+|---|---:|---:|
+| Routed MoE matrices | 463.445 | 32.31 |
+| HC-family mixing/projections, including fused routed combine | 326.251 | 22.74 |
+| Dense EXL3 matrices | 295.706 | 20.62 |
+| MoE routing/rotation/activation | 104.580 | 7.29 |
+| GDN recurrence/epilogue | 100.231 | 6.99 |
+| Attention/KV preparation | 57.339 | 4.00 |
+
+Routed gate/up account for303.137ms; down160.307ms. Largest main dense shapes:
+K2560→N10240 (GDN QKV)100.094ms, K6144→N256086.207ms, K2560→N6144 (Z)62.545ms,
+K2560→N12288 (attention Q)40.461ms. HC-family mix/combine costs229.990ms, including86.710ms in the fused
+routed-output restore/combine specialization; it is not pure HC math.
+Main-stream MoE+dense matrices total52.92% of span. Prioritize their kernel
+work and HC passes; pure host/launch idle is a small opportunity at this shape.
+
+No hardware counters were collected: timing alone does not distinguish ALU,
+LDS, dequantization and DRAM stalls. Reuse the actual release no-spill audit.
+Profiled1426.48tok/s is advisory (context4096 versus earlier benchmark8193);
+qualified clean1429.13 remains current. Existing `tools/prof/prof.py` exactly
+cross-checks interval totals; its generic stage map is not used for EXL3
+attribution. [Raw receipt, shapes, coverage and limitations](../plan/exl3/F3-CURRENT-PREFILL-PROFILE.json).

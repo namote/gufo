@@ -7,8 +7,12 @@ or 29% lower latency. No claim of hardware impossibility is made.
 The current continuation has screened the concrete matrix mechanisms supported
 by the existing profiles and retained the qualified changes. The remaining
 ideas below are research leads, not known improvements waiting to be enabled.
-Do not repeat the rejected experiments unchanged or collect another full-model
-profile merely to rediscover the same bottlenecks.
+Do not repeat rejected experiments unchanged. A user-requested profile of the
+current shared5 binary now replaces the older profile as the current bottleneck
+map: main-stream MoE matrices32.31%, HC-family mixing/projections (including fused MoE combine)22.74%, dense EXL3
+matrices20.62%, with99.676% kernel busy. The shared side stream is already
+mostly overlapped. Reuse [this profile](F3-CURRENT-PREFILL-PROFILE.json); no
+extra baseline or deep-context profile was collected.
 
 ## Retained and qualified
 

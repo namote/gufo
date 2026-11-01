@@ -16,6 +16,9 @@ temperature0, seed314159, r2; saved baseline reused.
 [Qualification and exact scope](../../../plan/exl3/F3-STREAM-QUALIFICATION.json).
 The later routed grouped-gate/up screen was not promoted and did not run a
 model benchmark; these remain current. Goal2000 tok/s is unmet.
+A subsequent user-requested current-binary profile measured1426.48tok/s under
+tracing at context4096, versus8193 here. This is advisory and does not replace
+the clean table. [Bottleneck profile](../../../plan/exl3/F3-CURRENT-PREFILL-PROFILE.json).
 
 ## EXL3 5.05 dense traversal follow-up, November 1, 2026
 

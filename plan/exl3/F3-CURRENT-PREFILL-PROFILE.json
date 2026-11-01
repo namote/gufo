@@ -1,0 +1,760 @@
+{
+  "status": "CURRENT_SHARED5_PREFILL_PROFILE_COMPLETE",
+  "context_capacity": 4096,
+  "prompt_tokens": 2048,
+  "depth": 0,
+  "repetitions": 1,
+  "warmup_forwards": 1,
+  "model_changed": false,
+  "baseline_runs": 0,
+  "scope": "Measured second2048 forward only, first EmbedKernel through final kernel; loading/pre-embedding setup excluded. Exact shared5 ELF, pinned Nix ROCr/CLR10.1. Native roctracer activity timestamps. Not a new clean benchmark.",
+  "coverage": {
+    "raw_records": 12122,
+    "gpu_dispatches_all": 4798,
+    "launch_api_correlations": 4798,
+    "warmup_dispatches": 2399,
+    "measured_dispatches": 2399,
+    "missing_launch_correlations": 0,
+    "invalid_dispatch_timestamps": 0,
+    "graph_launches": 0,
+    "embed_grid": [
+      "2048,1,1",
+      "2048,1,1"
+    ],
+    "selected_hip_api_operations": 11
+  },
+  "timeline": {
+    "kernel_span_ms": 1434.412578,
+    "kernel_duration_sum_ms": 1770.528563,
+    "kernel_union_ms": 1429.76425,
+    "kernel_plus_copy_union_ms": 1430.050382,
+    "kernel_idle_ms": 4.648327999999992,
+    "kernel_plus_copy_idle_ms": 4.36219600000004,
+    "barrier_intervals_excluded": 94,
+    "gpu_kernel_busy_percent": 99.6759420496381,
+    "main_kernel_ms": 1428.484694,
+    "side_kernel_ms": 342.043869,
+    "overlapping_kernel_ms": 340.7643129999999,
+    "side_only_ms": 1.2795559999999568,
+    "main_dispatches": 2070,
+    "side_dispatches": 329,
+    "main_stream": 109791294989760,
+    "side_streams": [
+      109791285941200
+    ]
+  },
+  "stage_activity": [
+    {
+      "name": "routed MoE matrix",
+      "calls": 288,
+      "ms": 463.4446449999999,
+      "percent_of_gpu_span": 32.30901988088952
+    },
+    {
+      "name": "shared MLP side stream",
+      "calls": 329,
+      "ms": 342.0438690000001,
+      "percent_of_gpu_span": 23.845570949810796
+    },
+    {
+      "name": "dense EXL3 matrix",
+      "calls": 158,
+      "ms": 295.7055700000003,
+      "percent_of_gpu_span": 20.615098789241117
+    },
+    {
+      "name": "HC mixing/combine",
+      "calls": 193,
+      "ms": 229.98962499999996,
+      "percent_of_gpu_span": 16.033715022261887
+    },
+    {
+      "name": "MoE rotation/routing/activation",
+      "calls": 336,
+      "ms": 104.58000599999997,
+      "percent_of_gpu_span": 7.290789805107243
+    },
+    {
+      "name": "GDN recurrence/epilogue",
+      "calls": 108,
+      "ms": 100.23063000000002,
+      "percent_of_gpu_span": 6.987573278237108
+    },
+    {
+      "name": "attention/KV preparation",
+      "calls": 96,
+      "ms": 57.338902000000004,
+      "percent_of_gpu_span": 3.997378639829524
+    },
+    {
+      "name": "HC FP16 projections",
+      "calls": 98,
+      "ms": 56.57251299999999,
+      "percent_of_gpu_span": 3.9439498696308832
+    },
+    {
+      "name": "dense rotation/conversion/norm",
+      "calls": 422,
+      "ms": 48.37920499999996,
+      "percent_of_gpu_span": 3.372753818671546
+    },
+    {
+      "name": "HC W8A8 projections",
+      "calls": 94,
+      "ms": 39.688966999999984,
+      "percent_of_gpu_span": 2.7669143180087192
+    },
+    {
+      "name": "router/other small projections",
+      "calls": 87,
+      "ms": 20.83570999999999,
+      "percent_of_gpu_span": 1.4525604640926393
+    },
+    {
+      "name": "other support/head/PLE",
+      "calls": 189,
+      "ms": 8.300247000000008,
+      "percent_of_gpu_span": 0.5786512979113049
+    },
+    {
+      "name": "PLE FP16 projection",
+      "calls": 1,
+      "ms": 3.418674,
+      "percent_of_gpu_span": 0.2383326842244129
+    }
+  ],
+  "matrix_shapes": [
+    {
+      "name": "side | K640 -> N2560 | rows_arg=2048 | HalfPrefillGemmKernel<256, 256, 8, 4, (gufo::core::GgmlType)8, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)8, 7, 1, 4>",
+      "calls": 47,
+      "ms": 214.670934,
+      "percent_of_gpu_span": 14.965773257462331
+    },
+    {
+      "name": "main | K2560 -> N640 | rows_arg=0 | HalfPrefillGemmKernel<128, 128, 8, 1, (gufo::core::GgmlType)8, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)8, 5, 3, 4>",
+      "calls": 96,
+      "ms": 169.438352,
+      "percent_of_gpu_span": 11.812386101371736
+    },
+    {
+      "name": "main | K2560 -> N640 | rows_arg=0 | HalfPrefillGemmKernel<128, 64, 8, 1, (gufo::core::GgmlType)8, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)8, 5, 3, 4>",
+      "calls": 96,
+      "ms": 133.698852,
+      "percent_of_gpu_span": 9.320808674615511
+    },
+    {
+      "name": "main | K2560 -> N10240 | rows_arg=2048 | HalfPrefillGemmKernel<256, 256, 8, 4, (gufo::core::GgmlType)8, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)8, 7, 1, 4>",
+      "calls": 36,
+      "ms": 100.09384700000001,
+      "percent_of_gpu_span": 6.978037458341362
+    },
+    {
+      "name": "main | K640 -> N2560 | rows_arg=0 | HalfPrefillGemmKernel<128, 128, 8, 1, (gufo::core::GgmlType)8, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)8, 5, 3, 4>",
+      "calls": 48,
+      "ms": 94.93409600000001,
+      "percent_of_gpu_span": 6.618325679517293
+    },
+    {
+      "name": "main | K6144 -> N2560 | rows_arg=2048 | HalfPrefillGemmKernel<256, 256, 8, 4, (gufo::core::GgmlType)8, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)8, 7, 1, 4>",
+      "calls": 48,
+      "ms": 86.20693599999998,
+      "percent_of_gpu_span": 6.0099121635002835
+    },
+    {
+      "name": "side | K2560 -> N640 | rows_arg=2048 | HalfPrefillGemmKernel<128, 256, 4, 8, (gufo::core::GgmlType)8, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)8, 7, 1, 4>",
+      "calls": 47,
+      "ms": 78.313407,
+      "percent_of_gpu_span": 5.459615190295689
+    },
+    {
+      "name": "main | K640 -> N2560 | rows_arg=0 | HalfPrefillGemmKernel<128, 64, 8, 1, (gufo::core::GgmlType)8, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)8, 5, 3, 4>",
+      "calls": 48,
+      "ms": 65.37334500000001,
+      "percent_of_gpu_span": 4.55749942538499
+    },
+    {
+      "name": "main | K2560 -> N6144 | rows_arg=2048 | HalfPrefillGemmKernel<256, 256, 8, 4, (gufo::core::GgmlType)8, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)8, 7, 1, 4>",
+      "calls": 36,
+      "ms": 62.54518399999999,
+      "percent_of_gpu_span": 4.360334324954588
+    },
+    {
+      "name": "main | K320 -> N10240 | rows_arg=2048 | HalfPrefillGemmKernel<128, 64, 4, 2, (gufo::core::GgmlType)1, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)1, 0, 0, 4>",
+      "calls": 95,
+      "ms": 53.79096399999998,
+      "percent_of_gpu_span": 3.7500343224123616
+    },
+    {
+      "name": "main | K2560 -> N12288 | rows_arg=2048 | HalfPrefillGemmKernel<256, 256, 8, 4, (gufo::core::GgmlType)8, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)8, 7, 1, 4>",
+      "calls": 12,
+      "ms": 40.460749,
+      "percent_of_gpu_span": 2.8207190609283685
+    },
+    {
+      "name": "main | K2560 -> N512 | rows_arg=2048 | HalfPrefillGemmKernel<256, 256, 8, 4, (gufo::core::GgmlType)8, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)8, 7, 1, 4>",
+      "calls": 12,
+      "ms": 4.909948000000001,
+      "percent_of_gpu_span": 0.34229677537030084
+    },
+    {
+      "name": "main | K2560 -> N10240 | rows_arg=2048 | HalfPrefillGemmKernel<128, 64, 4, 2, (gufo::core::GgmlType)1, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)1, 0, 0, 4>",
+      "calls": 1,
+      "ms": 3.418674,
+      "percent_of_gpu_span": 0.2383326842244129
+    },
+    {
+      "name": "main | K10240 -> N320 | rows_arg=2048 | HalfPrefillGemmKernel<128, 64, 4, 2, (gufo::core::GgmlType)1, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)1, 0, 0, 4>",
+      "calls": 2,
+      "ms": 2.723957,
+      "percent_of_gpu_span": 0.1899005238644805
+    },
+    {
+      "name": "main | K2560 -> N128 | rows_arg=2048 | HalfPrefillGemmKernel<128, 256, 4, 8, (gufo::core::GgmlType)8, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)8, 5, 4, 4>",
+      "calls": 12,
+      "ms": 1.339455,
+      "percent_of_gpu_span": 0.09338003727404572
+    },
+    {
+      "name": "main | K2560 -> N640 | rows_arg=128 | HalfPrefillGemmKernel<128, 256, 4, 8, (gufo::core::GgmlType)8, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)8, 7, 1, 4>",
+      "calls": 1,
+      "ms": 0.098352,
+      "percent_of_gpu_span": 0.006856604683230825
+    },
+    {
+      "name": "main | K320 -> N10240 | rows_arg=128 | HalfPrefillGemmKernel<128, 64, 4, 2, (gufo::core::GgmlType)1, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)1, 0, 0, 4>",
+      "calls": 1,
+      "ms": 0.057592,
+      "percent_of_gpu_span": 0.00401502335404089
+    },
+    {
+      "name": "main | K640 -> N2560 | rows_arg=128 | HalfPrefillGemmKernel<256, 256, 8, 4, (gufo::core::GgmlType)8, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)8, 7, 1, 4>",
+      "calls": 1,
+      "ms": 0.051099,
+      "percent_of_gpu_span": 0.003562364188917479
+    }
+  ],
+  "kernels": [
+    {
+      "name": "void gufo::hip::(anonymous namespace)::HalfPrefillGemmKernel<256, 256, 8, 4, (gufo::core::GgmlType)8, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)8, 7, 1, 4>(void const*, short const*, float*, int, int, int, float const*, void const*, int const*)",
+      "calls": 145,
+      "ms": 294.26776300000034,
+      "percent_of_gpu_span": 20.514862147283846
+    },
+    {
+      "name": "void gufo::hip::(anonymous namespace)::HalfPrefillGemmKernel<128, 128, 8, 1, (gufo::core::GgmlType)8, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)8, 5, 3, 4>(void const*, short const*, float*, int, int, int, float const*, void const*, int const*)",
+      "calls": 144,
+      "ms": 264.3724480000001,
+      "percent_of_gpu_span": 18.430711780889034
+    },
+    {
+      "name": "void gufo::hip::(anonymous namespace)::HalfPrefillGemmKernel<128, 64, 8, 1, (gufo::core::GgmlType)8, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)8, 5, 3, 4>(void const*, short const*, float*, int, int, int, float const*, void const*, int const*)",
+      "calls": 144,
+      "ms": 199.07219699999996,
+      "percent_of_gpu_span": 13.878308100000497
+    },
+    {
+      "name": "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::HcMixEpilogueVec4Kernel<float, true>(float const*, float const*, float const*, float*, float*, unsigned int, float const*, float const*)",
+      "calls": 94,
+      "ms": 93.02897400000002,
+      "percent_of_gpu_span": 6.485510196076935
+    },
+    {
+      "name": "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::HcCombineVec4Kernel<float, false, false, true>(float*, float const*, float const*, unsigned int, float const*, float*, void*, unsigned int, float, float*, float const*, float*, __half*, float*, gufo::models::qwen38_flash_next::rocm::Exl3PrefillMoeRows)",
+      "calls": 48,
+      "ms": 86.710233,
+      "percent_of_gpu_span": 6.044999488285302
+    },
+    {
+      "name": "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::GdnRowSplitKernel<true>(float const*, float const*, float const*, float*, float*, unsigned int, unsigned int, unsigned int, gufo::models::qwen38_flash_next::rocm::GdnCheckpoint, float const*, unsigned int, float const*, float const*, float)",
+      "calls": 36,
+      "ms": 75.582997,
+      "percent_of_gpu_span": 5.2692647958640535
+    },
+    {
+      "name": "void gufo::hip::(anonymous namespace)::HalfPrefillGemmKernel<128, 64, 4, 2, (gufo::core::GgmlType)1, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)1, 0, 0, 4>(void const*, short const*, float*, int, int, int, float const*, void const*, int const*)",
+      "calls": 99,
+      "ms": 59.99118699999998,
+      "percent_of_gpu_span": 4.182282553855296
+    },
+    {
+      "name": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::RotateGateUpTokens(gufo::quant::exl3::DeviceLinear const*, gufo::quant::exl3::DeviceLinear const*, float const*, unsigned short*, unsigned short*, int const*, int const*, unsigned int, unsigned int)",
+      "calls": 48,
+      "ms": 57.895906999999994,
+      "percent_of_gpu_span": 4.036210215105908
+    },
+    {
+      "name": "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::HcCombineVec4Kernel<float, false, false, false>(float*, float const*, float const*, unsigned int, float const*, float*, void*, unsigned int, float, float*, float const*, float*, __half*, float*, gufo::models::qwen38_flash_next::rocm::Exl3PrefillMoeRows)",
+      "calls": 48,
+      "ms": 48.09040099999999,
+      "percent_of_gpu_span": 3.352619862484223
+    },
+    {
+      "name": "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::W8A8BlockedWmmaGEMMKernel<64, 128, 4, 2, 4, false, false>(void const*, void const*, std::conditional<false, __half, float>::type*, unsigned long, unsigned long, unsigned long)",
+      "calls": 94,
+      "ms": 39.688966999999984,
+      "percent_of_gpu_span": 2.7669143180087192
+    },
+    {
+      "name": "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::WmmaCausalAttentionKernel<16u, 16u, false, true>(float const*, float const*, __half const*, __half const*, unsigned int const*, unsigned int, float*, unsigned int, unsigned int, unsigned int, unsigned int const*, gufo::models::qwen38_flash_next::rocm::KvarnReadView)",
+      "calls": 12,
+      "ms": 30.787983999999998,
+      "percent_of_gpu_span": 2.1463827403777826
+    },
+    {
+      "name": "gufo::hip::(anonymous namespace)::Exl3RotateRowsGroupedKernel(gufo::hip::Exl3RotateProblem const*, unsigned int)",
+      "calls": 110,
+      "ms": 28.372790999999996,
+      "percent_of_gpu_span": 1.9780076830865603
+    },
+    {
+      "name": "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::GdnEpilogueKernel<false>(float const*, float const*, unsigned int, float const*, float*, void*, __half*, unsigned int, unsigned int, float, gufo::models::qwen38_flash_next::rocm::GdnBatchItem const*, unsigned int, void*, unsigned int)",
+      "calls": 36,
+      "ms": 24.456820999999998,
+      "percent_of_gpu_span": 1.7050060334872497
+    },
+    {
+      "name": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::RestoreActivateScaleBuckets(gufo::quant::exl3::DeviceLinear const*, gufo::quant::exl3::DeviceLinear const*, gufo::quant::exl3::DeviceLinear const*, unsigned int const*, unsigned int, _Float16 const*, _Float16 const*, unsigned short*, int*, unsigned int)",
+      "calls": 48,
+      "ms": 22.127316000000008,
+      "percent_of_gpu_span": 1.5426047107626528
+    },
+    {
+      "name": "void gufo::models::qwen38_flash_next::rocm::DenseF16GEMMKernel<128, 128, 2, 2, 4, 1, false, false, false, true, false, false, false, (gufo::models::qwen38_flash_next::rocm::WeightType)1, true>(void const*, __half const*, float*, unsigned long, unsigned long, unsigned long, __half const*, __half*, void*, float const*, float*, gufo::models::qwen38_flash_next::rocm::AttentionProjectionOutput, unsigned int, unsigned long, unsigned int)",
+      "calls": 85,
+      "ms": 20.752065999999992,
+      "percent_of_gpu_span": 1.4467292268821692
+    },
+    {
+      "name": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::NarrowHalf4Kernel(HIP_vector_type<float, 4u> const*, HIP_vector_type<unsigned short, 4u>*, unsigned long)",
+      "calls": 183,
+      "ms": 15.126563999999998,
+      "percent_of_gpu_span": 1.0545476407555594
+    },
+    {
+      "name": "gufo::models::qwen38_flash_next::rocm::GateRotatedContextKernel(float*, float const*, unsigned int, unsigned int, unsigned int)",
+      "calls": 12,
+      "ms": 10.899357,
+      "percent_of_gpu_span": 0.7598481195136313
+    },
+    {
+      "name": "void gufo::models::qwen38_flash_next::rocm::AttentionQueryRowsKernel<false, true>(float const*, unsigned int, float const*, float*, float*, unsigned int, unsigned int, unsigned int const*, float, float, gufo::models::qwen::vision::DeviceRope const*, gufo::models::qwen38_flash_next::YarnRope)",
+      "calls": 12,
+      "ms": 10.359786999999999,
+      "percent_of_gpu_span": 0.7222320243764622
+    },
+    {
+      "name": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::FillBucketSlots(int const*, unsigned int, unsigned int const*, int*, int*)",
+      "calls": 48,
+      "ms": 10.211531999999998,
+      "percent_of_gpu_span": 0.7118964345835511
+    },
+    {
+      "name": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::CountBuckets(int const*, unsigned int, unsigned int*)",
+      "calls": 48,
+      "ms": 7.302659000000001,
+      "percent_of_gpu_span": 0.5091045011737203
+    },
+    {
+      "name": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::KvarnQuantizeGroupsKernel(__half const*, __half const*, unsigned long, unsigned char*, unsigned long, unsigned int const*, unsigned int, unsigned int, unsigned int)",
+      "calls": 12,
+      "ms": 4.318714,
+      "percent_of_gpu_span": 0.30107892709791895
+    },
+    {
+      "name": "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::RmsNormCachedKernel<10u>(float const*, float const*, float*, unsigned int, unsigned int, float)",
+      "calls": 6,
+      "ms": 4.046019,
+      "percent_of_gpu_span": 0.2820680090271768
+    },
+    {
+      "name": "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::RouterTopKKernel<512u>(float const*, unsigned int, int*, float*, unsigned int, unsigned int)",
+      "calls": 48,
+      "ms": 3.800741,
+      "percent_of_gpu_span": 0.2649684657185152
+    },
+    {
+      "name": "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::BucketDownFallback<5, _Float16>(gufo::quant::exl3::DeviceLinear const*, unsigned int const*, unsigned int, int const*, unsigned short const*, _Float16*, unsigned int, unsigned int, unsigned int, unsigned int*)",
+      "calls": 48,
+      "ms": 2.7238030000000006,
+      "percent_of_gpu_span": 0.18988978776230453
+    },
+    {
+      "name": "void gufo::hip::(anonymous namespace)::Exl3GemvKernel<6, 1u, 4u, 2u, 0>(gufo::hip::(anonymous namespace)::GemvArgs)",
+      "calls": 1,
+      "ms": 2.201658,
+      "percent_of_gpu_span": 0.15348847561485898
+    },
+    {
+      "name": "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::HcMixEpilogueVec4Kernel<float, false>(float const*, float const*, float const*, float*, float*, unsigned int, float const*, float const*)",
+      "calls": 2,
+      "ms": 2.1577330000000003,
+      "percent_of_gpu_span": 0.15042624647146677
+    },
+    {
+      "name": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::PleGateKernel(float const*, float const*, float const*, float*, unsigned int, unsigned int)",
+      "calls": 1,
+      "ms": 1.845002,
+      "percent_of_gpu_span": 0.1286242206947519
+    },
+    {
+      "name": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::PleInjectKernel(float*, float const*, float const*, unsigned long)",
+      "calls": 1,
+      "ms": 1.578762,
+      "percent_of_gpu_span": 0.11006331262106377
+    },
+    {
+      "name": "void gufo::hip::(anonymous namespace)::HalfPrefillGemmKernel<128, 256, 4, 8, (gufo::core::GgmlType)8, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)8, 5, 4, 4>(void const*, short const*, float*, int, int, int, float const*, void const*, int const*)",
+      "calls": 12,
+      "ms": 1.339455,
+      "percent_of_gpu_span": 0.09338003727404572
+    },
+    {
+      "name": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::PleConvKernel(float const*, float const*, float const*, float*, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int)",
+      "calls": 1,
+      "ms": 1.206355,
+      "percent_of_gpu_span": 0.08410097753618556
+    },
+    {
+      "name": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::SiluScaleKernel(float*, float, unsigned long)",
+      "calls": 97,
+      "ms": 0.785411,
+      "percent_of_gpu_span": 0.054754887962227564
+    },
+    {
+      "name": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::StoreKvKernel(float const*, __half*, unsigned int, unsigned int const*, unsigned int const*)",
+      "calls": 24,
+      "ms": 0.676361,
+      "percent_of_gpu_span": 0.047152472752508175
+    },
+    {
+      "name": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::RmsNormKernel(float const*, float const*, float*, unsigned int, unsigned int, float)",
+      "calls": 12,
+      "ms": 0.595963,
+      "percent_of_gpu_span": 0.04154753026712514
+    },
+    {
+      "name": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::DescribeBuckets(unsigned int*, unsigned int, unsigned int, gufo::hip::Exl3PrefillBucket*, unsigned int*, unsigned int)",
+      "calls": 48,
+      "ms": 0.518048,
+      "percent_of_gpu_span": 0.0361156900005934
+    },
+    {
+      "name": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::EmbedKernel(void const*, gufo::models::qwen38_flash_next::rocm::WeightType, int const*, float*, unsigned int, unsigned int)",
+      "calls": 1,
+      "ms": 0.42491,
+      "percent_of_gpu_span": 0.02962257906246553
+    },
+    {
+      "name": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::PrepareExl3DensePrefillKernel(gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::Exl3DensePrefillArguments, gufo::hip::Exl3RotateProblem*, gufo::hip::Exl3GemmProblem*)",
+      "calls": 110,
+      "ms": 0.2350219999999999,
+      "percent_of_gpu_span": 0.016384546789717284
+    },
+    {
+      "name": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::GdnPrepAbKernel(float const*, float const*, float const*, float*, unsigned long, unsigned int)",
+      "calls": 36,
+      "ms": 0.190812,
+      "percent_of_gpu_span": 0.01330244888580446
+    },
+    {
+      "name": "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::RopeKernel<false>(float*, unsigned int, unsigned int, unsigned int, unsigned int const*, float, gufo::models::qwen::vision::DeviceRope const*, gufo::models::qwen38_flash_next::YarnRope)",
+      "calls": 12,
+      "ms": 0.15381899999999998,
+      "percent_of_gpu_span": 0.010723483770232248
+    },
+    {
+      "name": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::RotateKvRowsKernel(__half*, __half*, unsigned int, unsigned int const*, unsigned int)",
+      "calls": 12,
+      "ms": 0.14288,
+      "percent_of_gpu_span": 0.00996087194098768
+    },
+    {
+      "name": "void gufo::hip::(anonymous namespace)::HalfPrefillGemmKernel<128, 256, 4, 8, (gufo::core::GgmlType)8, (gufo::hip::(anonymous namespace)::HalfEpilogue)0, false, (gufo::core::GgmlType)8, 7, 1, 4>(void const*, short const*, float*, int, int, int, float const*, void const*, int const*)",
+      "calls": 1,
+      "ms": 0.098352,
+      "percent_of_gpu_span": 0.006856604683230825
+    },
+    {
+      "name": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::StoreRowsKernel(float const*, float*, unsigned int, unsigned int const*, unsigned int)",
+      "calls": 12,
+      "ms": 0.09222,
+      "percent_of_gpu_span": 0.006429112614766823
+    },
+    {
+      "name": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::HistoryShiftKernel(float const*, unsigned int, float const*, float*, unsigned int, unsigned int, unsigned int)",
+      "calls": 37,
+      "ms": 0.09050200000000003,
+      "percent_of_gpu_span": 0.006309342332049742
+    },
+    {
+      "name": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::CopyKernel(float const*, float*, unsigned long)",
+      "calls": 37,
+      "ms": 0.07302199999999999,
+      "percent_of_gpu_span": 0.005090725020120397
+    },
+    {
+      "name": "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::SmallGemmKernel<(gufo::models::qwen38_flash_next::rocm::WeightType)1, 1u, false, true, true, false>(void const*, float const*, float*, unsigned int, unsigned int)",
+      "calls": 1,
+      "ms": 0.049577,
+      "percent_of_gpu_span": 0.003456258036242624
+    },
+    {
+      "name": "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::SmallGemmKernel<(gufo::models::qwen38_flash_next::rocm::WeightType)1, 1u, false, false, true, false>(void const*, float const*, float*, unsigned int, unsigned int)",
+      "calls": 1,
+      "ms": 0.034067,
+      "percent_of_gpu_span": 0.0023749791742275145
+    },
+    {
+      "name": "void gufo::hip::(anonymous namespace)::Exl3RotateInputKernel<1u>(float const*, unsigned long, unsigned int, unsigned int, gufo::hip::(anonymous namespace)::RotateArgs)",
+      "calls": 1,
+      "ms": 0.002846,
+      "percent_of_gpu_span": 0.0001984087454090911
+    },
+    {
+      "name": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::SwigluKernel(float*, float const*, unsigned long)",
+      "calls": 1,
+      "ms": 0.002405,
+      "percent_of_gpu_span": 0.00016766445281407732
+    },
+    {
+      "name": "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::HcMixEpilogueKernel<4u>(float const*, float const*, float const*, float*, float*, unsigned int, unsigned int, void*)",
+      "calls": 1,
+      "ms": 0.002284,
+      "percent_of_gpu_span": 0.00015922894396147718
+    }
+  ],
+  "selected_api": [
+    {
+      "name": "hipStreamSynchronize",
+      "calls": 1,
+      "ms": 1386.046155,
+      "percent_of_gpu_span": 96.62813727780907
+    },
+    {
+      "name": "hipMemcpyAsync",
+      "calls": 73,
+      "ms": 35.014403,
+      "percent_of_gpu_span": 2.4410273262397455
+    },
+    {
+      "name": "hipLaunchKernel",
+      "calls": 2397,
+      "ms": 8.373712000000003,
+      "percent_of_gpu_span": 0.5837729066539183
+    },
+    {
+      "name": "hipStreamWaitEvent",
+      "calls": 94,
+      "ms": 0.342835,
+      "percent_of_gpu_span": 0.023900724607282414
+    },
+    {
+      "name": "hipEventRecord",
+      "calls": 94,
+      "ms": 0.218873,
+      "percent_of_gpu_span": 0.015258720075166547
+    }
+  ],
+  "largest_kernel_gaps": [
+    {
+      "ms": 0.175062,
+      "before": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::StoreRowsKernel(float const*, float*, unsigned int, unsigned int const*, unsigned int)",
+      "after": "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::WmmaCausalAttentionKernel<16u, 16u, false, true>(float const*, float const*, __half const*, __half const*, unsigned int const*, unsigned int, float*, unsigned int, unsigned int, unsigned int, unsigned int const*, gufo::models::qwen38_flash_next::rocm::KvarnReadView)"
+    },
+    {
+      "ms": 0.024287,
+      "before": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::KvarnQuantizeGroupsKernel(__half const*, __half const*, unsigned long, unsigned char*, unsigned long, unsigned int const*, unsigned int, unsigned int, unsigned int)",
+      "after": "gufo::models::qwen38_flash_next::rocm::GateRotatedContextKernel(float*, float const*, unsigned int, unsigned int, unsigned int)"
+    },
+    {
+      "ms": 0.023967,
+      "before": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::KvarnQuantizeGroupsKernel(__half const*, __half const*, unsigned long, unsigned char*, unsigned long, unsigned int const*, unsigned int, unsigned int, unsigned int)",
+      "after": "gufo::models::qwen38_flash_next::rocm::GateRotatedContextKernel(float*, float const*, unsigned int, unsigned int, unsigned int)"
+    },
+    {
+      "ms": 0.023966,
+      "before": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::KvarnQuantizeGroupsKernel(__half const*, __half const*, unsigned long, unsigned char*, unsigned long, unsigned int const*, unsigned int, unsigned int, unsigned int)",
+      "after": "gufo::models::qwen38_flash_next::rocm::GateRotatedContextKernel(float*, float const*, unsigned int, unsigned int, unsigned int)"
+    },
+    {
+      "ms": 0.023846,
+      "before": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::KvarnQuantizeGroupsKernel(__half const*, __half const*, unsigned long, unsigned char*, unsigned long, unsigned int const*, unsigned int, unsigned int, unsigned int)",
+      "after": "gufo::models::qwen38_flash_next::rocm::GateRotatedContextKernel(float*, float const*, unsigned int, unsigned int, unsigned int)"
+    },
+    {
+      "ms": 0.023767,
+      "before": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::KvarnQuantizeGroupsKernel(__half const*, __half const*, unsigned long, unsigned char*, unsigned long, unsigned int const*, unsigned int, unsigned int, unsigned int)",
+      "after": "gufo::models::qwen38_flash_next::rocm::GateRotatedContextKernel(float*, float const*, unsigned int, unsigned int, unsigned int)"
+    },
+    {
+      "ms": 0.023766,
+      "before": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::KvarnQuantizeGroupsKernel(__half const*, __half const*, unsigned long, unsigned char*, unsigned long, unsigned int const*, unsigned int, unsigned int, unsigned int)",
+      "after": "gufo::models::qwen38_flash_next::rocm::GateRotatedContextKernel(float*, float const*, unsigned int, unsigned int, unsigned int)"
+    },
+    {
+      "ms": 0.023647,
+      "before": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::KvarnQuantizeGroupsKernel(__half const*, __half const*, unsigned long, unsigned char*, unsigned long, unsigned int const*, unsigned int, unsigned int, unsigned int)",
+      "after": "gufo::models::qwen38_flash_next::rocm::GateRotatedContextKernel(float*, float const*, unsigned int, unsigned int, unsigned int)"
+    },
+    {
+      "ms": 0.023646,
+      "before": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::KvarnQuantizeGroupsKernel(__half const*, __half const*, unsigned long, unsigned char*, unsigned long, unsigned int const*, unsigned int, unsigned int, unsigned int)",
+      "after": "gufo::models::qwen38_flash_next::rocm::GateRotatedContextKernel(float*, float const*, unsigned int, unsigned int, unsigned int)"
+    },
+    {
+      "ms": 0.023486,
+      "before": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::KvarnQuantizeGroupsKernel(__half const*, __half const*, unsigned long, unsigned char*, unsigned long, unsigned int const*, unsigned int, unsigned int, unsigned int)",
+      "after": "gufo::models::qwen38_flash_next::rocm::GateRotatedContextKernel(float*, float const*, unsigned int, unsigned int, unsigned int)"
+    },
+    {
+      "ms": 0.023446,
+      "before": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::KvarnQuantizeGroupsKernel(__half const*, __half const*, unsigned long, unsigned char*, unsigned long, unsigned int const*, unsigned int, unsigned int, unsigned int)",
+      "after": "gufo::models::qwen38_flash_next::rocm::GateRotatedContextKernel(float*, float const*, unsigned int, unsigned int, unsigned int)"
+    },
+    {
+      "ms": 0.023205,
+      "before": "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::KvarnQuantizeGroupsKernel(__half const*, __half const*, unsigned long, unsigned char*, unsigned long, unsigned int const*, unsigned int, unsigned int, unsigned int)",
+      "after": "gufo::models::qwen38_flash_next::rocm::GateRotatedContextKernel(float*, float const*, unsigned int, unsigned int, unsigned int)"
+    }
+  ],
+  "limits": [
+    "Kernel times measure durations under overlap; main-stream attribution is not proof of each kernel's standalone causal speedup. Side overlap is not net savings.",
+    "HIP barrier wait intervals are excluded from busy calculations; kernel-plus-copy union is separate from the kernel union.",
+    "No hardware counter collection: compute/LDS/dequantization/DRAM bottleneck split not newly measured. Existing release ISA no-spill audit is reused.",
+    "Context4096 differs from8193 in earlier multishape benchmark; profiled1426.48tok/s is advisory, clean1429.13 remains qualified.",
+    "Only11 HIP API types recorded; this is not all CPU/HIP overhead. Two startup collection failures preserved separately.",
+    "Collector first-embedding activation scoped to this single-host-thread benchmark; not a general concurrency-safe tracing tool.",
+    "HC-family total326.251105ms includes86.710233ms in HcCombineVec4<...,true>, which also restores and combines routed MoE outputs. This is a fused category, not pure HC mathematics.",
+    "99.676percent is temporal kernel-active coverage, not SM/ALU utilization.",
+    "Stage percentages include separately labeled overlapping side work and therefore do not sum to100percent; headline rows contain main-stream work only.",
+    "hipStreamSynchronize1386.046ms is host waiting overlapping GPU execution, not additive CPU overhead."
+  ],
+  "raw_sha256": "fe9740cb044333763026c9db83c16c47b337852015312d53e7257f9709755dff",
+  "date": "2026-11-02",
+  "user_requested": true,
+  "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-shared5-profile-embedding-nix101",
+  "health_PASS": true,
+  "image": "sha256:2184da9ff7ff9dee6757b630fb4efb521f1bda10cfddc9e9562a5b75142f0d32",
+  "binary_sha256": "b6b282448c1a8af0e6efa3f37e97b9eec4a71a5bc50266fff71435b98d8d7937",
+  "collector_manifest": {
+    "binary_sha256": "b6b282448c1a8af0e6efa3f37e97b9eec4a71a5bc50266fff71435b98d8d7937",
+    "image": "sha256:2184da9ff7ff9dee6757b630fb4efb521f1bda10cfddc9e9562a5b75142f0d32",
+    "files": {
+      "trace.cpp": "828f0ce9e427f17b27de4734b9e30e4082bc8c1fc28abfb8e9df97079be56e60",
+      "trace.so": "124bbe39796c2552b76013ebe9720f414e967f8e1326ef1032245f2cf5361c68",
+      "build.sh": "04f23f1bb57e41604a18e4f4084053c48a0e511186928672955029e20ab47acb",
+      "canary": "94505731fb37784ef8be58f4183d1a208b7216413039d6d57370628b9ba6bebd",
+      "run_profile.py": "53359bff47be703baa43729fbff8657d9833f6180a21d5f1f2a39211dc0f3a99"
+    },
+    "collector": "Nix roctracer10.1 HIP_OPS+11 selected HIP_API native timestamps, starts at first embedding; no per-kernel events/synchronizations",
+    "compiler": "HIP version: 7.16.0-0000000\nnixpkgs-AMD clang version 24.0.0 (https://github.com/ROCm/llvm-project/tree/therock-10.1 therock-10.1)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /nix/store/92bpbb2rmrkszhw83x63x7qzj9jsz324-rocm-toolchain/bin\nConfiguration file: /nix/store/92bpbb2rmrkszhw83x63x7qzj9jsz324-rocm-toolchain/bin/x86_64-unknown-linux-gnu.cfg\n",
+    "profiles": [
+      {
+        "name": "canary",
+        "argv": [
+          "/src/build/f3-shared5-profile/canary"
+        ],
+        "returncode": 0,
+        "seconds": 0.28833385091274977,
+        "runtime_paths": [
+          "/nix/store/88jjsz00km321bcl9851aiwwdig79b4l-rocm-runtime-10.1/lib/libhsa-runtime64.so.1.21.0",
+          "/nix/store/al4qwi7jfyrdkyb25xsri8b00b1agj1r-clr-10.1/lib/libamdhip64.so.7.16.0-0000000",
+          "/src/build/f3-shared5-profile/runtime/2bg8lrhqn629ik74bmfb66w6lfv1xhw8-roctracer-10.1/lib/libroctracer64.so.4.1.0"
+        ]
+      },
+      {
+        "name": "pp2048",
+        "argv": [
+          "/opt/gufo-prefill/bin/.gufo-wrapped",
+          "bench",
+          "-m",
+          "/models/fnx-meta/gufo.gguf",
+          "--speculative",
+          "off",
+          "-p",
+          "2048",
+          "-d",
+          "0",
+          "-r",
+          "1",
+          "--temperature",
+          "0",
+          "--seed",
+          "314159",
+          "--kv-cache-type",
+          "kvarn-k4v4"
+        ],
+        "returncode": 0,
+        "seconds": 32.811430390924215,
+        "runtime_paths": [
+          "/nix/store/88jjsz00km321bcl9851aiwwdig79b4l-rocm-runtime-10.1/lib/libhsa-runtime64.so.1.21.0",
+          "/nix/store/al4qwi7jfyrdkyb25xsri8b00b1agj1r-clr-10.1/lib/libamdhip64.so.7.16.0-0000000",
+          "/src/build/f3-shared5-profile/runtime/2bg8lrhqn629ik74bmfb66w6lfv1xhw8-roctracer-10.1/lib/libroctracer64.so.4.1.0"
+        ]
+      }
+    ]
+  },
+  "qualified_unprofiled_pp2048_tok_s": 1429.13,
+  "profiled_pp2048_tok_s_advisory": 1426.48,
+  "first_collector_failures": [
+    {
+      "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-shared5-profile-nix101",
+      "reason": "Startup-inclusive collection reached unchanged2Mrecord cap; no usable profile, healthPASS. Precise overflow phase not captured."
+    },
+    {
+      "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-shared5-profile-filtered-nix101",
+      "reason": "Startup-inclusive collection reached unchanged2Mrecord cap; no usable profile, healthPASS. Precise overflow phase not captured."
+    }
+  ],
+  "headline_main_stream_groups": [
+    {
+      "name": "routed MoE matrix",
+      "ms": 463.4446449999999,
+      "percent_of_gpu_span": 32.30901988088952
+    },
+    {
+      "name": "HC-family projections/mixing + fused routed output combine",
+      "ms": 326.25110499999994,
+      "percent_of_gpu_span": 22.744579209901488
+    },
+    {
+      "name": "dense EXL3 matrix",
+      "ms": 295.7055700000003,
+      "percent_of_gpu_span": 20.615098789241117
+    },
+    {
+      "name": "MoE routing/rotation/activation",
+      "ms": 104.58000599999997,
+      "percent_of_gpu_span": 7.290789805107243
+    },
+    {
+      "name": "GDN recurrence/epilogue",
+      "ms": 100.23063000000002,
+      "percent_of_gpu_span": 6.987573278237108
+    },
+    {
+      "name": "attention/KV preparation",
+      "ms": 57.338902000000004,
+      "percent_of_gpu_span": 3.997378639829524
+    }
+  ],
+  "conclusions": [
+    "Current pp2048 is GPU-kernel dominated:99.676percent kernel busy; only4.648ms gap across1434.413ms span. Pure host/launch-gap removal is a small opportunity for this workload.",
+    "Main-stream routed gate/up303.137ms and down160.307ms dominate individual matrix categories. Dense EXL3 main295.706ms; combined with routed matrices52.924percent of span.",
+    "HC-family mix/combine229.990ms plus projections96.261ms totals326.251ms(22.745percent); this includes86.710ms fused routed-MoE restore/combine, so it is not pure HC math.",
+    "Shared side stream342.044ms temporally overlaps main by340.764ms, leaving1.280ms side-only activity. This does NOT mean342ms net performance savings; contention is not measured separately.",
+    "Prioritize work inside main-stream MoE/dense kernels and HC memory/compute passes over further launch grouping. Existing exact source resource audit has no EXL3 matrix private/spills; no new spill-driven split is established."
+  ],
+  "evidence_sha256": {
+    "WINDOW.json": "e5c1bed99fbf96968f73abb04a1bf4a5d210f60b07da72de5b75dad4f4337cda",
+    "receipt/run/pp2048.tsv": "fe9740cb044333763026c9db83c16c47b337852015312d53e7257f9709755dff",
+    "receipt/run/MANIFEST.json": "db14078e4d8623c79d05c60b533d1dd8ae39a59ad3c516eb799a838bdc702e3a",
+    "receipt/run/pp2048.log": "e1a8312966e43c4c6c8a0f2f02dc3eef04d8525833c66c8ad66b1925fe7f12e9",
+    "receipt/run/PROFILE-ANALYSIS.json": "01633a07a11eef6ec1a8adc86d1929ba558c336f6f3c5b429f7a79ab66db9558",
+    "receipt/run/prof-front-end.json": "467cce735a9820c1bc85c2f7e8296f077e32137fc8c19011a3904971dcb39e93",
+    "receipt/run/analyze.py": "24f7847b7517cecc2eedb3b0c8497f9d056e4230845dbb109d1e39247d4163ff",
+    "receipt/run/trace.cpp": "828f0ce9e427f17b27de4734b9e30e4082bc8c1fc28abfb8e9df97079be56e60"
+  },
+  "prof_front_end_check": "tools/prof/prof.py show on measured-native-activity.db exactly matches2399dispatches,1770.528563ms duration sum,1429.764250ms busy union and1434.412578ms span. Its generic stage map is not used for EXL3 attribution.",
+  "review": "indexer_review independently recomputed raw correlation Counters, embedding boundaries, interval union/overlap, and raw SHA; all exact. HC-family attribution corrected to include fused routed-MoE output restore/combine."
+}

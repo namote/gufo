@@ -1,5 +1,14 @@
 # EXL3 / Flash-Next F3 handoff (2026-11-02; qualified shared-MoE/KVarN batch)
 
+Current-version profiling is complete at the user's request. Exact shared5,
+Nix10.1, pp2048/d0/k4v4/context4096: measured GPU span1434.413ms, kernel busy
+99.676%. Main-stream MoE matrices32.31%, HC-family mixing/projections (including fused MoE combine)22.74%, dense
+EXL3 matrices20.62%; routed gate/up alone303.137ms. Shared-side342.044ms is
+mostly overlapped (340.764ms), not additive latency or net savings. Further
+launch grouping is a lower priority than work inside those kernels/passes.
+[Current profile, raw evidence and limits](F3-CURRENT-PREFILL-PROFILE.json).
+No engine change, baseline run or new throughput qualification.
+
 Latest follow-up: routed K5 gate/up single-launch grouping was screened and
 not promoted. It is exact on saved512/2048 shared/combined/raw-down outputs,
 but with shared overlap takes8.65352/14.89320ms versus saved8.55525/14.76090ms.

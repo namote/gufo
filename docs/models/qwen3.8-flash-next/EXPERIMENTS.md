@@ -479,3 +479,16 @@ passed, but shared-side512/2048 spans were8.65352/14.89320ms versus saved
 unchanged105/149VGPR. Not promoted: no useful speed signal or simplification.
 Prototype preserved; no old baseline, profile or full-model run repeated.
 [All measurements](../../../plan/exl3/F3-GROUPED-MOE-SCREEN.json).
+
+
+## Current shared5 bottleneck profile, November 2, 2026
+
+User-requested native Nix10.1 trace of the qualified ELF: one2048-row warmup
+and one measured forward, context4096/d0/k4v4/AR. Measured2399 kernels span
+1434.413ms and occupy99.676% of that span. Main-stream MoE matrices463.445ms
+(32.31%), HC-family mixing/projections (including fused MoE combine)326.251ms (22.74%) and dense EXL3 matrices
+295.706ms (20.62%) dominate. Gate/up alone303.137ms. Shared-side342.044ms
+has340.764ms temporal overlap; this is not net speedup. No new counter/stall
+or quality claim; qualified clean1429.13 remains current. Two failed startup
+collections and the successful trace are preserved. [Provenance, shape totals,
+coverage and limits](../../../plan/exl3/F3-CURRENT-PREFILL-PROFILE.json).

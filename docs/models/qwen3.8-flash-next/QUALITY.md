@@ -15,6 +15,10 @@ combined and raw-down outputs plus guards at512/2048 synthetic rows. Gate/up
 intermediates have guards only. No new independent oracle or full-model,
 state/capture or other-rate claim. It was not promoted; existing production
 qualification remains unchanged. [Screen provenance and limits](../../../plan/exl3/F3-GROUPED-MOE-SCREEN.json).
+The later current-binary profile changes no model code or arithmetic. It
+validates native timestamp/correlation coverage, not numerical model quality;
+the qualified evidence above remains the quality basis.
+[Profile scope](../../../plan/exl3/F3-CURRENT-PREFILL-PROFILE.json).
 
 ## Narrow dense/output-slice batch qualification, November 1, 2026
 
