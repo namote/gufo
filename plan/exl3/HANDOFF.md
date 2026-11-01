@@ -6,6 +6,12 @@ boundaries](F3-SEARCH-STATUS.md) before starting more experiments. Current
 profile-backed matrix candidates have been screened; rejected mechanisms and
 baselines should not be rerun unchanged.
 
+Next open direction: [EXL3 stream overlap](F3-STREAM-OVERLAP.md). Source review
+prioritizes GDN Z alongside recurrence, then shared MLP alongside routed MoE.
+These are unimplemented/unmeasured EXL3 schedules, not closed by the earlier
+matrix screen or generic two-stream probe. Preserve scratch lifetimes; simply
+turning on the existing Q8 overlap dispatch is unsafe for EXL3.
+
 Retained production changes: small-row K5 narrow tile, aligned singleton parent
 output slices, and token-first traversal for singleton K7 6144→2560/R2048.
 [Final qualification](F3-PREFILL-GRID.md) records all performance and correctness

@@ -126,6 +126,11 @@ There is no demonstrated free same-SIMD compute engine for a scalar decode
 producer beside a WMMA consumer. The cross-stream result is narrower: overlap
 can depend on compiler, resources and neighboring work, so measure complete
 span rather than adding isolated kernel times (S:5,8; EFN:52–71,107–108).
+Source audit clarification (no new measurement): that generic probe and the
+existing Q8-weight production overlaps do not cover current EXL3 branch pairs.
+[EXL3 stream candidate audit](../plan/exl3/F3-STREAM-OVERLAP.md) records their
+joins, workspace aliases and priority; GDN Z and shared/routed overlap remain
+open, not measured failures.
 
 LDS-fed WMMA calibration:
 

@@ -50,6 +50,13 @@ Neither can become a win by adding the omitted device partition-builder cost.
 
 ## Open research boundaries
 
+- **EXL3 stream schedules remain untested.** The matrix screen and older generic
+  two-stream probe do not cover GDN Z beside recurrence, shared versus routed
+  MoE, Q versus grouped K/V, or routed gate versus up. The
+  [dependency and buffer audit](F3-STREAM-OVERLAP.md) puts GDN Z first, then
+  shared/routed overlap, with explicit fork/join and scratch-lifetime rules.
+  No fresh profiling or performance claim accompanies this source audit.
+
 - Stream-K remains unimplemented. It changes reduction structure and needs a
   fresh numerical/quality argument; existing full-grid/persistent results do
   not establish a useful scheduling tail to recover. It is not a validated
