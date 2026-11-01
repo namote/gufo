@@ -1304,13 +1304,14 @@ void LaunchBucketTiles(const quant::exl3::DeviceLinear* device_bank,
                                GgmlType::kQ8_0, Bits, Mode>,
          256);
   else
-    // Four waves (2 x 2), each decoding eight tiles per stage: 15-17 % less
-    // time than eight waves at Flash-Next's 2560 -> 640 and 640 -> 2560
-    // expert shapes (188 vs 218 VGPRs; tools/bench/exl3_x3_tiles_bench.hip),
+    // Eight waves (8 x 1), each one 16-row strip over the 64 tokens and four
+    // decoded tiles per stage: 7-12 % less time than 2 x 2 at Flash-Next's
+    // 2560 -> 640 and 640 -> 2560 expert shapes, uniform and skewed routing
+    // (97-106 VGPRs, no scratch; tools/bench/exl3_x3_tiles_bench.hip),
     // bit-identical (the same K order per output).
-    args(HalfPrefillGemmKernel<128, 64, 2, 2, GgmlType::kQ8_0, kStore, false,
+    args(HalfPrefillGemmKernel<128, 64, 8, 1, GgmlType::kQ8_0, kStore, false,
                                GgmlType::kQ8_0, Bits, Mode>,
-         128);
+         256);
 }
 
 }  // namespace
