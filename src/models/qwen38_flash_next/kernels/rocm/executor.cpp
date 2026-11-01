@@ -3196,11 +3196,15 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                          std::string* error_msg, bool last_only,
                          bool projections_ready, bool project_output,
                          std::uint32_t checkpoint_tokens) const {
+  // Set below for this call's KvarnAttention only.
+  attn_q_rotated_ = false;
+  attn_gate_stride_ = 0;
   const Config& c = config();
   const std::uint32_t kv_row = c.AttentionKvDim();
   const std::uint32_t index_capacity =
       IndexerCapacity(c, options_.max_batch, max_context);
   bool prepared = false;
+  bool query_rows = false;
   // KVarN layers write FP16 rows and rotate them into the KVarN frame: a
   // pass into the sink and tail ring, a prompt chunk into the staging rows,
   // whose row 0 holds staging_first (plan/exl3/F1-KVARN-DESIGN.md 3).
@@ -3280,16 +3284,33 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                 !Dense(l.attn_v, xq, s_.v, error_msg))) {
       return false;
     }
-    UnpackQGate(s_.qg, 2 * c.AttentionQDim(), s_.q, s_.attn_gate, nullptr,
-                nullptr, n_tokens, c.num_heads, c.head_dim, 0, stream_);
+    // EXL3 prefill: the query rows are unpacked, normalized, rotated by
+    // RoPE and (KVarN) into the KVarN frame in one pass; a KVarN layer's
+    // output gate then reads the packed rows directly.
+    const bool kvarn_rows = kvarn != nullptr;
+    query_rows = prefill_phase && model_->output().exl3 != nullptr &&
+                 AttentionQueryRows(
+                     s_.qg, 2 * c.AttentionQDim(), l.attn_q_norm.f32(), s_.q,
+                     kvarn_rows ? nullptr : s_.attn_gate, n_tokens, c.num_heads,
+                     c.head_dim, c.rotary_dim, pos, c.rope_theta, c.rms_eps,
+                     kvarn_rows, stream_, s.rope, yarn_);
+    if (query_rows) {
+      attn_q_rotated_ = kvarn_rows;
+      attn_gate_stride_ = kvarn_rows ? 2 * c.AttentionQDim() : 0;
+    } else {
+      UnpackQGate(s_.qg, 2 * c.AttentionQDim(), s_.q, s_.attn_gate, nullptr,
+                  nullptr, n_tokens, c.num_heads, c.head_dim, 0, stream_);
+    }
   }
   if (!prepared) {
-    RmsNormRows(s_.q, l.attn_q_norm.f32(), s_.q, n_tokens * c.num_heads,
-                c.head_dim, 1, c.rms_eps, stream_);
+    if (!query_rows)
+      RmsNormRows(s_.q, l.attn_q_norm.f32(), s_.q, n_tokens * c.num_heads,
+                  c.head_dim, 1, c.rms_eps, stream_);
     RmsNormRows(s_.k, l.attn_k_norm.f32(), s_.k, n_tokens * c.num_kv_heads,
                 c.head_dim, 1, c.rms_eps, stream_);
-    Rope(s_.q, n_tokens, c.num_heads, c.head_dim, c.rotary_dim, pos,
-         c.rope_theta, stream_, s.rope, yarn_);
+    if (!query_rows)
+      Rope(s_.q, n_tokens, c.num_heads, c.head_dim, c.rotary_dim, pos,
+           c.rope_theta, stream_, s.rope, yarn_);
     Rope(s_.k, n_tokens, c.num_kv_heads, c.head_dim, c.rotary_dim, pos,
          c.rope_theta, stream_, s.rope, yarn_);
     StoreKv(s_.k, write_k, n_tokens, kv_row, pos, stream_, write_rows);
@@ -3477,7 +3498,12 @@ bool Executor::KvarnAttention(const DeviceLayer& l,
       .kv_heads = c.num_kv_heads};
   // Scores and context in the rotated frame: H q . H k = q . k, and the
   // context rotates back before the output gate.
-  RotateHeadRows(s_.q, n_tokens * c.num_heads, stream_);
+  const bool q_rotated = attn_q_rotated_;
+  const std::uint32_t gate_stride = attn_gate_stride_;
+  attn_q_rotated_ = false;
+  attn_gate_stride_ = 0;
+  if (!q_rotated)
+    RotateHeadRows(s_.q, n_tokens * c.num_heads, stream_);
   bool attended = false;
   if (pass.prefill && MatrixRows(n_tokens)) {
     // The FP16 path's split: queries before the token budget take the dense
@@ -3517,7 +3543,8 @@ bool Executor::KvarnAttention(const DeviceLayer& l,
         s.kv_blocks, &view,
         model_->output().exl3 != nullptr ? c.indexer_top_k : 0);
   }
-  RotateHeadRows(s_.ctx, n_tokens * c.num_heads, stream_);
+  if (gate_stride == 0)
+    RotateHeadRows(s_.ctx, n_tokens * c.num_heads, stream_);
   if (pass.prefill) {
     // Quantize the groups the chunk completed from staging, then keep its
     // sink rows and its recent rows.
@@ -3567,6 +3594,12 @@ bool Executor::KvarnAttention(const DeviceLayer& l,
   }
   const std::uint32_t q_dim = c.AttentionQDim();
   const std::size_t ctx_count = static_cast<std::size_t>(n_tokens) * q_dim;
+  if (gate_stride != 0) {
+    GateRotatedContext(s_.ctx, s_.qg, gate_stride, n_tokens, c.num_heads,
+                       stream_);
+    return !project_output ||
+           Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
+  }
   if (project_output && split && l.attn_out.type == GgmlType::kQ8_0 &&
       l.attn_out.cols == q_dim && UnpaddedQ8(q_dim) &&
       SigmoidMulQ8_1(s_.ctx, s_.attn_gate, ctx_count, s_.ctx_q8_1, stream_)) {

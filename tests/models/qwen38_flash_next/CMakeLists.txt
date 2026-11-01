@@ -65,7 +65,7 @@ if (ENGINE_ENABLE_HIP)
   add_qwen38_flash_next_test(exl3_invariance gufo_qwen38_flash_next "hip;gpu;gfx1151;exl3")
   set_source_files_properties(exl3_invariance_test.cpp PROPERTIES LANGUAGE HIP)
   foreach(name IN ITEMS mtp_ops blaslt_ops hc_mix_ops gdn_ops
-      attention_ops moe_epilogue_ops moe_ids_ops projection_ops routed_wmma_ops
+      attention_ops attention_rows moe_epilogue_ops moe_ids_ops projection_ops routed_wmma_ops
       select_ops snapshot_copy verification_sampling kvarn_ops)
     add_qwen38_flash_next_test(${name} gufo_qwen38_flash_next "hip;gpu;gfx1151")
   endforeach()
@@ -141,6 +141,11 @@ if (ENGINE_ENABLE_HIP)
   add_executable(qwen38_flash_next_decode_attn_bench EXCLUDE_FROM_ALL
     decode_attn_bench.cpp)
   target_link_libraries(qwen38_flash_next_decode_attn_bench PRIVATE
+    gufo_qwen38_flash_next hip::host)
+
+  add_executable(qwen38_flash_next_overlap_bench EXCLUDE_FROM_ALL
+    overlap_bench.cpp)
+  target_link_libraries(qwen38_flash_next_overlap_bench PRIVATE
     gufo_qwen38_flash_next hip::host)
 
   add_executable(qwen38_flash_next_f16_gemm_bench EXCLUDE_FROM_ALL

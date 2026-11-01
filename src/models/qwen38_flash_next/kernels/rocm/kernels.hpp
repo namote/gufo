@@ -73,6 +73,25 @@ void RotateKvRows(__half* k_rows, __half* v_rows, std::uint32_t n_tokens,
 /// queries into, and the attention context out of, the KVarN frame.
 void RotateHeadRows(float* x, std::uint32_t rows, hipStream_t stream);
 
+/// UnpackQGate's query half, RmsNormRows (gamma), Rope and, with `rotate`,
+/// RotateHeadRows of every (token, head) row of 256 in one pass, each in
+/// the separate kernel's arithmetic: q[t][h] from the packed [q | gate] head
+/// pairs of qg. Non-null `gate` also receives the gate half. Returns false
+/// (launching nothing) unless d == 256 and rotary_dim <= 256.
+bool AttentionQueryRows(const float* qg, std::uint32_t qg_stride,
+                        const float* gamma, float* q, float* gate,
+                        std::uint32_t n_tokens, std::uint32_t heads,
+                        std::uint32_t d, std::uint32_t rotary_dim,
+                        const std::uint32_t* start_pos, float theta, float eps,
+                        bool rotate, hipStream_t stream,
+                        const qwen::vision::DeviceRope* rope,
+                        const YarnRope& yarn);
+/// RotateHeadRows of the context rows, then SigmoidMul by the gate half of
+/// the packed qg rows (UnpackQGate's layout), in one pass.
+void GateRotatedContext(float* ctx, const float* qg, std::uint32_t qg_stride,
+                        std::uint32_t n_tokens, std::uint32_t heads,
+                        hipStream_t stream);
+
 /// One layer's KVarN K/V as the attention kernels read it
 /// (plan/exl3/F1-KVARN-DESIGN.md 4). Position j of a query at position p is
 ///   * a staging row when `k_staging` is set and j >= staging_first (the rows
