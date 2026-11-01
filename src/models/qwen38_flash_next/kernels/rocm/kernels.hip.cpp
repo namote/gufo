@@ -405,6 +405,18 @@ __global__ void HcMixEpilogueKernel(const float* xn, const float* gate,
   }
 }
 
+/// One stream's normalized float4, as HcCombineVec4Kernel stores it and
+/// its consumers recompute it: v * (scale * gamma) per element, the order
+/// fast-math gave the combine's original v * scale * gamma.
+__device__ __forceinline__ float4 HcNorm4(float4 v, float sc, float4 gm) {
+  // The result is pinned too: a consumer's own products must not fold
+  // into this one.
+  return float4{Materialize(v.x * Materialize(sc * gm.x)),
+                Materialize(v.y * Materialize(sc * gm.y)),
+                Materialize(v.z * Materialize(sc * gm.z)),
+                Materialize(v.w * Materialize(sc * gm.w))};
+}
+
 /// Four adjacent hidden lanes per thread. This keeps the stream arithmetic in
 /// registers while cutting the number of blocks and inject partials by almost
 /// four for the model's 2,560-wide, four-stream rows.
@@ -419,10 +431,14 @@ __device__ __forceinline__ float4 Load4(const __half* p) {
   return float4{lo.x, lo.y, hi.x, hi.y};
 }
 
-template<typename XnT>
+/// kFromRes: xn is the residual row and the norm is recomputed from it,
+/// gamma and the combine's per-stream scales (HcNorm4).
+template<typename XnT, bool kFromRes = false>
 __global__ void HcMixEpilogueVec4Kernel(const XnT* xn, const float* gate,
                                         const float* inject_w, float* mixed,
-                                        float* inject, std::uint32_t hidden) {
+                                        float* inject, std::uint32_t hidden,
+                                        const float* gamma = nullptr,
+                                        const float* xn_scale = nullptr) {
   constexpr std::uint32_t kStreams = 4;
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t i = (blockIdx.y * blockDim.x + threadIdx.x) * 4;
@@ -430,10 +446,30 @@ __global__ void HcMixEpilogueVec4Kernel(const XnT* xn, const float* gate,
   const XnT* x = xn + static_cast<std::size_t>(t) * hc_dim;
   float4 v[kStreams];
   float4 acc{0.0F, 0.0F, 0.0F, 0.0F};
+  if constexpr (kFromRes) {
+    // Every load is issued before the first pinned product, which would
+    // otherwise wait on each stream's row in turn.
+    float4 gm[kStreams];
+    float sc[kStreams];
+#pragma unroll
+    for (std::uint32_t s = 0; s < kStreams; ++s) {
+      const std::size_t idx = static_cast<std::size_t>(s) * hidden + i;
+      v[s] = i < hidden ? Load4(x + idx) : float4{0.0F, 0.0F, 0.0F, 0.0F};
+      gm[s] = i < hidden ? *reinterpret_cast<const float4*>(gamma + idx)
+                         : float4{0.0F, 0.0F, 0.0F, 0.0F};
+      sc[s] = xn_scale[(static_cast<std::size_t>(t) * kStreams) + s];
+    }
+#pragma unroll
+    for (std::uint32_t s = 0; s < kStreams; ++s) {
+      if (i < hidden)
+        v[s] = HcNorm4(v[s], sc[s], gm[s]);
+    }
+  }
 #pragma unroll
   for (std::uint32_t s = 0; s < kStreams; ++s) {
     const std::size_t idx = static_cast<std::size_t>(s) * hidden + i;
-    v[s] = i < hidden ? Load4(x + idx) : float4{0.0F, 0.0F, 0.0F, 0.0F};
+    if constexpr (!kFromRes)
+      v[s] = i < hidden ? Load4(x + idx) : float4{0.0F, 0.0F, 0.0F, 0.0F};
     if (i < hidden) {
       const float4 g = *reinterpret_cast<const float4*>(
           gate + static_cast<std::size_t>(t) * hc_dim + idx);
@@ -855,7 +891,8 @@ __global__ void HcCombineVec4Kernel(
     float* res, const float* block_out, const float* inject,
     std::uint32_t inject_parts, const float* gamma, XnT* xn, void* xn_q8,
     std::uint32_t hidden, float eps, float* defer_w,
-    const float* inject_w = nullptr, float* inject_out = nullptr) {
+    const float* inject_w = nullptr, float* inject_out = nullptr,
+    __half* xn_half = nullptr, float* xn_scale = nullptr) {
   constexpr std::uint32_t kStreams = 4;
   constexpr std::uint32_t kMaxChunks = 10;  // 4 x 2560 / 4 / kThreads
   __shared__ float shared[kStreams][kThreads / 32];
@@ -932,6 +969,13 @@ __global__ void HcCombineVec4Kernel(
     }
     scale[k] = rsqrtf(total / static_cast<float>(hidden) + eps);
   }
+  if (xn_scale != nullptr) {
+#pragma unroll
+    for (std::uint32_t k = 0; k < kStreams; ++k) {
+      if (threadIdx.x == k)
+        xn_scale[(static_cast<std::size_t>(t) * kStreams) + k] = scale[k];
+    }
+  }
   const std::size_t num_blocks = hc_dim / 32;
 #pragma unroll
   for (std::uint32_t c = 0; c < kMaxChunks; ++c) {
@@ -943,11 +987,30 @@ __global__ void HcCombineVec4Kernel(
       const std::uint32_t s = e / hidden;
       const float sc = scale[s];
       const float4 gm = *reinterpret_cast<const float4*>(gamma + e);
-      n = float4{v[c].x * sc * gm.x, v[c].y * sc * gm.y, v[c].z * sc * gm.z,
-                 v[c].w * sc * gm.w};
+      // The F32 route's consumers may recompute this norm (HcNorm4); the F16
+      // route keeps its original expression.
+      if constexpr (std::is_same_v<XnT, float>) {
+        n = HcNorm4(v[c], sc, gm);
+      } else {
+        n = float4{v[c].x * sc * gm.x, v[c].y * sc * gm.y, v[c].z * sc * gm.z,
+                   v[c].w * sc * gm.w};
+      }
       XnT* out = xn + (static_cast<std::size_t>(t) * hc_dim) + e;
       if constexpr (std::is_same_v<XnT, float>) {
-        *reinterpret_cast<float4*>(out) = n;
+        if (xn_scale == nullptr)
+          *reinterpret_cast<float4*>(out) = n;
+        // The F16 copy a projection would otherwise narrow from `out`
+        // (NarrowHalf4Kernel's conversion).
+        // Streaming stores: the projection that reads these rows next
+        // otherwise finds them dirty in the caches.
+        if (xn_half != nullptr) {
+          __half* h = xn_half + (static_cast<std::size_t>(t) * hc_dim) + e;
+          using Half4Bits = std::uint16_t __attribute__((ext_vector_type(4)));
+          const Half4Bits bits{
+              __half_as_ushort(__half(n.x)), __half_as_ushort(__half(n.y)),
+              __half_as_ushort(__half(n.z)), __half_as_ushort(__half(n.w))};
+          __builtin_nontemporal_store(bits, reinterpret_cast<Half4Bits*>(h));
+        }
       } else {
         const __half2 lo = __floats2half2_rn(n.x, n.y);
         const __half2 hi = __floats2half2_rn(n.z, n.w);
@@ -6371,6 +6434,40 @@ void HcMixEpilogueVec4(const float* xn, const float* gate,
                      0, stream, xn, gate, inject_w, mixed, inject, hidden);
 }
 
+void HcMixEpilogueVec4FromRes(const float* res, const float* gamma,
+                              const float* xn_scale, const float* gate,
+                              const float* inject_w, float* mixed,
+                              float* inject, std::uint32_t n_tokens,
+                              std::uint32_t hidden, hipStream_t stream) {
+  hipLaunchKernelGGL((HcMixEpilogueVec4Kernel<float, true>),
+                     dim3(n_tokens, HcInjectPartsVec4(hidden)), dim3(kThreads),
+                     0, stream, res, gate, inject_w, mixed, inject, hidden,
+                     gamma, xn_scale);
+}
+
+__global__ void HcNormFromResKernel(const float* res, const float* gamma,
+                                    const float* xn_scale, float* xn,
+                                    std::uint32_t hidden) {
+  constexpr std::uint32_t kStreams = 4;
+  const std::uint32_t t = blockIdx.x;
+  const std::size_t hc_dim = static_cast<std::size_t>(kStreams) * hidden;
+  const std::size_t row = static_cast<std::size_t>(t) * hc_dim;
+  for (std::uint32_t e = threadIdx.x * 4; e < hc_dim; e += kThreads * 4) {
+    const std::uint32_t s = e / hidden;
+    *reinterpret_cast<float4*>(xn + row + e) =
+        HcNorm4(*reinterpret_cast<const float4*>(res + row + e),
+                xn_scale[(static_cast<std::size_t>(t) * kStreams) + s],
+                *reinterpret_cast<const float4*>(gamma + e));
+  }
+}
+
+void HcNormFromRes(const float* res, const float* gamma, const float* xn_scale,
+                   float* xn, std::uint32_t n_tokens, std::uint32_t hidden,
+                   hipStream_t stream) {
+  hipLaunchKernelGGL(HcNormFromResKernel, dim3(n_tokens), dim3(kThreads), 0,
+                     stream, res, gamma, xn_scale, xn, hidden);
+}
+
 void HcMixEpilogueVec4F16(const __half* xn, const float* gate,
                           const float* inject_w, float* mixed,
                           __half* mixed_half, void* mixed_q8, float* inject,
@@ -6395,24 +6492,28 @@ void HcMixEpilogueVec4F16(const __half* xn, const float* gate,
   }
 }
 
-void HcCombine(float* res, const float* block_out, const float* inject,
+bool HcCombine(float* res, const float* block_out, const float* inject,
                std::uint32_t inject_parts, const float* gamma, float* xn,
                std::uint32_t n_tokens, std::uint32_t hidden,
                std::uint32_t streams, float eps, hipStream_t stream,
-               bool decode, bool any_width) {
+               bool decode, bool any_width, __half* xn_half, float* xn_scale) {
   // One block per token wants a batch: a decode step keeps the
   // one-block-per-stream kernel's parallelism.
   if (!decode && (n_tokens >= 16 || any_width) && streams == 4 &&
       hidden % 128 == 0 && hidden <= 2560) {
+    xn_half = gamma != nullptr ? xn_half : nullptr;
+    xn_scale = xn_half != nullptr ? xn_scale : nullptr;
     hipLaunchKernelGGL(HcCombineVec4Kernel<float>, dim3(n_tokens),
                        dim3(kThreads), 0, stream, res, block_out, inject,
-                       inject_parts, gamma, xn, nullptr, hidden, eps, nullptr);
-    return;
+                       inject_parts, gamma, xn, nullptr, hidden, eps, nullptr,
+                       nullptr, nullptr, xn_half, xn_scale);
+    return xn_half != nullptr;
   }
   hipLaunchKernelGGL(HcCombineKernel<float>, dim3(n_tokens, streams),
                      dim3(kThreads), 0, stream, res, block_out, inject,
                      inject_parts, gamma, xn, nullptr, hidden, streams, eps,
                      nullptr);
+  return false;
 }
 
 bool HcCombineQ8_1(float* res, const float* block_out, const float* inject,
@@ -6504,7 +6605,8 @@ bool HcCombineF16(float* res, const float* block_out, const float* inject,
                                             : HcCombineVec4Kernel<__half>;
     hipLaunchKernelGGL(combine, dim3(n_tokens), dim3(kThreads), 0, stream, res,
                        block_out, inject, inject_parts, gamma, xn, xn_q8,
-                       hidden, eps, defer_w, nullptr, nullptr);
+                       hidden, eps, defer_w, nullptr, nullptr, nullptr,
+                       nullptr);
     return defer_w != nullptr;
   }
   hipLaunchKernelGGL(HcCombineKernel<__half>, dim3(n_tokens, streams),

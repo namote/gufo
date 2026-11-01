@@ -1203,6 +1203,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   s.inject = f32(T * c.hc_count * HcInjectParts(hidden));
   s.block_out = f32(T * hidden);
   s.hc_defer_w = f32(T * c.hc_count);
+  s.xn_scale = f32(T * c.hc_count);
   e->mask_words_ = c.SparseMaskWords(e->context_capacity_);
   const std::size_t linear_projection = std::max<std::size_t>(
       c.SsmConvChannels() + c.SsmValueDim(), c.ple_layer >= 0 ? hc_dim : 0);
@@ -2542,6 +2543,7 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
                        const float* inject_w) const {
   const Config& c = config();
   inject_fused_ = nullptr;
+  xn_deferred_ = {};  // s_.xn is rewritten (or left stale) below
   // Wide batches hand the next mixer an F16 norm for its epilogue and the
   // same norm quantized into the tiled Q8 layout for its W8A8 down
   // projection: half the bytes for the combine and the epilogue, and no
@@ -2614,9 +2616,30 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
   // EXL3: prefill takes the four-lane combine at every chunk width (28 %
   // less time at 2,048 tokens); decode/verify keep the per-stream kernel.
   const bool exl3 = model_->output().exl3 != nullptr;
-  HcCombine(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn, n_tokens,
-            c.hidden_size, c.hc_count, c.rms_eps, stream_,
-            exl3 && !prefill_phase, exl3 && prefill_phase);
+  // The next mixer's plain down projection reads this norm as F16: the
+  // combine stores that copy too instead of a separate narrowing pass
+  // rereading the F32 row.
+  const bool half_norm = exl3 && prefill_phase &&
+                         n_tokens <= options_.max_batch &&
+                         c.HcDim() <= half_input_cols_;
+  // Its F32 copy is then left out as well: the mixer recomputes it from the
+  // residual and these scales.
+  float* const xn_scale =
+      half_norm && MatrixRows(n_tokens) ? s_.xn_scale : nullptr;
+  if (HcCombine(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn,
+                n_tokens, c.hidden_size, c.hc_count, c.rms_eps, stream_,
+                exl3 && !prefill_phase, exl3 && prefill_phase,
+                half_norm ? static_cast<__half*>(s_.x_half) : nullptr,
+                xn_scale)) {
+    half_src_ = s_.xn;
+    half_rows_ = n_tokens;
+    half_cols_ = c.HcDim();
+    half_bf16_ = false;
+    if (xn_scale != nullptr)
+      xn_deferred_ = {res, gamma, n_tokens};
+  } else if (half_src_ == s_.xn) {
+    half_src_ = nullptr;  // the F32 norm was rewritten without its copy
+  }
 }
 
 bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
@@ -2628,9 +2651,30 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   // Without `normed` this mixer's grouped norm of res is computed here (F32);
   // otherwise the previous combine produced it, as F16 plus tiled Q8 on the
   // wide route or as F32 in s_.xn (with its Q8_1 rows on a decode batch).
+  // A deferred norm feeds only the vectorized epilogue below (and the F16
+  // down projection through the half cache); any other reader gets the F32
+  // rows the combine left out, in its own expression.
+  bool norm_from_res = false;
+  if (normed && xn_deferred_.res != nullptr) {
+    const DeferredNorm d = xn_deferred_;
+    const bool other_inject = inject != nullptr && !m.inject.empty() &&
+                              m.inject.type != GgmlType::kF32;
+    norm_from_res = res == d.res && m.norm.f32() == d.gamma &&
+                    n_tokens == d.rows && MatrixRows(n_tokens) &&
+                    c.hc_count == 4 && c.hidden_size % 4 == 0 &&
+                    !other_inject && half_src_ == s_.xn &&
+                    half_rows_ == n_tokens && half_cols_ == c.HcDim();
+    if (!norm_from_res)
+      HcNormFromRes(d.res, d.gamma, s_.xn_scale, s_.xn, d.rows, c.hidden_size,
+                    stream_);
+  }
+  const DeferredNorm deferred_norm = xn_deferred_;
+  xn_deferred_ = {};
   if (!normed) {
     xn_half_ = false;
     xn_q8_ready_ = {};
+    if (half_src_ == s_.xn)
+      half_src_ = nullptr;
     RmsNormRows(res, m.norm.f32(), s_.xn, n_tokens, c.HcDim(), c.hc_count,
                 c.rms_eps, stream_);
   }
@@ -2736,6 +2780,11 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
         q8t_cols_ = c.hidden_size;
       }
     }
+  } else if (vectorized && norm_from_res) {
+    HcMixEpilogueVec4FromRes(deferred_norm.res, deferred_norm.gamma,
+                             s_.xn_scale, s_.hc_gate,
+                             fused_inject ? m.inject.f32() : nullptr, mixed,
+                             inject, n_tokens, c.hidden_size, stream_);
   } else if (vectorized) {
     HcMixEpilogueVec4(xn, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr,
                       mixed, inject, n_tokens, c.hidden_size, c.hc_count,
@@ -2759,6 +2808,8 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
     // on the wide route the combine only produced F16, so norm again.
     if (xn_half_) {
       xn_q8_ready_ = {};
+      if (half_src_ == s_.xn)
+        half_src_ = nullptr;
       RmsNormRows(res, m.norm.f32(), s_.xn, n_tokens, c.HcDim(), c.hc_count,
                   c.rms_eps, stream_);
     }
