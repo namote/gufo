@@ -462,3 +462,20 @@ The complete seven-shape K7 grid sweep found one clear local gain: singleton
 from1405.25 to1416.51 tok/s (+.80%). Cached internal FP16 weights remained
 slower on large shapes after traversal tuning and were not promoted. No full
 model quality or old baseline repeats. [Results](../../../plan/exl3/F3-PREFILL-GRID.md).
+
+
+## EXL3 overlap and grouped gate/up, November 2, 2026
+
+Shared MLP overlap before router/top-k and KVarN register selection were
+retained together at1429.13±1.13pp2048 tok/s (+.89%). Q overlap was neutral
+alone and regressed in combination, so Q source was restored. GDN Z,
+smaller-LDS and routed gate/up stream screens were not promoted.
+[Full decisions](../../../plan/exl3/F3-STREAM-QUALIFICATION.json).
+
+A subsequent K5 paired-grid prototype halves gate/up matrix launches from
+four to two while preserving separate inputs/K16/FP16. Saved-output exactness
+passed, but shared-side512/2048 spans were8.65352/14.89320ms versus saved
+8.55525/14.76090ms (+1.15/+.90%, historical/advisory). Zero private/spills and
+unchanged105/149VGPR. Not promoted: no useful speed signal or simplification.
+Prototype preserved; no old baseline, profile or full-model run repeated.
+[All measurements](../../../plan/exl3/F3-GROUPED-MOE-SCREEN.json).

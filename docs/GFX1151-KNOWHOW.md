@@ -631,8 +631,9 @@ searches and unqualified work. They are not policies or thresholds for a new mod
   no WMMA 3.04, skeleton 1.06 ms; estimated floor near 2.05 is not achieved
   throughput (S:29).
 - **MoE dead ends:** two-stage register prefetch was neutral; paired gate/up
-  was shelved at estimated 10–20 ms/pass because independent expert suh loses
-  operand sharing. Producer-fused rotation was analytically rejected at a
+  was initially shelved at estimated 10–20 ms/pass because independent expert
+  suh loses operand sharing. A later K5 single-launch grouping screen, preserving
+  separate inputs, also found no useful gain (see November 2 entry below). Producer-fused rotation was analytically rejected at a
   modeled 38% gate/up increase; it was not a measured candidate (S:30,35–36).
   Rejected parameterizations included output width 320, hot 256-token class,
   forced 128-row buckets, 16-B trellis-through-LDS and two-deep fragment
@@ -1059,3 +1060,26 @@ Baseline inference/profile runs:0. Target2000 remains unmet.
 
 [All bounded numeric records](../plan/exl3/F3-STREAM-SCREENS.json),
 [whole-model qualification and scope bridge](../plan/exl3/F3-STREAM-QUALIFICATION.json).
+
+
+### Routed K5 gate/up grouped launch screen (2026-11-02)
+
+A new paired grid selects bank/input/output per block, retaining independent
+rotations, K16 accumulation and FP16 rounding. Cold64 and hot128 launches each
+cover both banks: four matrix launches become two. Compiler resources remain
+105/149VGPR, 24/32KiB LDS, zero private bytes and both spill counters zero;
+no device workspace is added.
+
+The healthy 4.92-second synthetic shared-MLP + routed-MoE + combine screen
+reused the saved512/2048-row controls and all payloads. Serial-shared grouped
+latency was8.71150/15.08650ms versus8.61897/15.07550ms (+1.07/+.07%). With
+the retained shared side stream it was8.65352/14.89320ms versus saved shared-
+side8.55525/14.76090ms (+1.15/+.90%). Small historical differences are advisory,
+not a proven regression; there is no useful speed signal. Unlike a neutral
+simplification, this introduces paired dispatch/grid cases. Not promoted.
+
+Shared, combined and raw-down outputs are exact and finite; output guards pass.
+Gate/up intermediate values were not separately compared. Five linked objects
+match old controls; the kernels TU differs. No fresh independent oracle,
+full-model qualification, baseline run or profile. Prototype/source/objects
+remain in `build/f3-grouped-moe`; [all results and provenance](../plan/exl3/F3-GROUPED-MOE-SCREEN.json).

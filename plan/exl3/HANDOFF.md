@@ -1,5 +1,13 @@
 # EXL3 / Flash-Next F3 handoff (2026-11-02; qualified shared-MoE/KVarN batch)
 
+Latest follow-up: routed K5 gate/up single-launch grouping was screened and
+not promoted. It is exact on saved512/2048 shared/combined/raw-down outputs,
+but with shared overlap takes8.65352/14.89320ms versus saved8.55525/14.76090ms.
+These small historical differences are advisory; no useful gain and no code
+simplification. Four launches become two with unchanged105/149VGPR and no
+private/spills. Prototype is preserved; no baseline/profile/full-model rerun.
+[Screen and limits](F3-GROUPED-MOE-SCREEN.json). Qualified code/image below stay unchanged.
+
 Latest qualified pp2048 is **1429.13±1.13 tok/s**, +.89% versus saved1416.51
 and+2.07% versus the earlier1400.15. Other final cases: pp5121068.58±3.09,
 pp81921460.97±.73, d32Kpp20481301.99±1.41 (+.52/.93/.85%). **Target2000 is

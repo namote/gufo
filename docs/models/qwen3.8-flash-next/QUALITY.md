@@ -1,5 +1,21 @@
 # Qwen3.8 Flash-Next quality
 
+## Shared-MoE/KVarN and grouped follow-up, November 2, 2026
+
+The final shared5 image passed1025-row full-FFN residual/logit/convolution/
+recurrent-state equality, covering two512-row chunks, four shared forks and
+one tail. Flash-Next/Qwen KVarN CPU-oracle tests passed. The32760-record,
+64-head-replay FP16-KV collector is supporting evidence reused from the
+combined image, whose retained MoE source is equal and Q path is restored;
+it is not a fresh collector on shared5. Prior hc7 NLL drift+.006600 remains.
+[Qualification](../../../plan/exl3/F3-STREAM-QUALIFICATION.json).
+
+The subsequent grouped gate/up prototype passed saved finite/exact shared,
+combined and raw-down outputs plus guards at512/2048 synthetic rows. Gate/up
+intermediates have guards only. No new independent oracle or full-model,
+state/capture or other-rate claim. It was not promoted; existing production
+qualification remains unchanged. [Screen provenance and limits](../../../plan/exl3/F3-GROUPED-MOE-SCREEN.json).
+
 ## Narrow dense/output-slice batch qualification, November 1, 2026
 
 The batch2 installed binaries passed boundary64/65/2048/2049 and slice/guard

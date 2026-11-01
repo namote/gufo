@@ -1,8 +1,25 @@
 # Qwen3.8 Flash-Next benchmarks
 
+## EXL3 shared-MoE/KVarN qualified batch, November 2, 2026
+
+Current qualified image is `ai-tools/gufo-eval:f3-shared5-703d3e77-rocm101`
+(`2184da9f…`), code `da1fd6a8`. Nix ROCm10.1, k4v4, speculative off,
+temperature0, seed314159, r2; saved baseline reused.
+
+| Case | Prior qualified tok/s | Current tok/s | Change |
+|---|---:|---:|---:|
+| pp512 | 1063.05 ±.22 | 1068.58 ±3.09 | +.52% |
+| pp2048 | 1416.51 ±.82 | 1429.13 ±1.13 | +.89% |
+| pp8192 | 1447.47 ±1.36 | 1460.97 ±.73 | +.93% |
+| pp2048 at d32768 | 1291.03 ±1.09 | 1301.99 ±1.41 | +.85% |
+
+[Qualification and exact scope](../../../plan/exl3/F3-STREAM-QUALIFICATION.json).
+The later routed grouped-gate/up screen was not promoted and did not run a
+model benchmark; these remain current. Goal2000 tok/s is unmet.
+
 ## EXL3 5.05 dense traversal follow-up, November 1, 2026
 
-Current qualified image: `ai-tools/gufo-eval:f3-prefill3-67a50024-rocm101`
+Earlier qualified image: `ai-tools/gufo-eval:f3-prefill3-67a50024-rocm101`
 (`31fd777e…`). Nix ROCm10.1, KVarN k4v4, speculative off, temperature0,
 seed314159, r2. Stored baselines reused; no new baseline inference.
 

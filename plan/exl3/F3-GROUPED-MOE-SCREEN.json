@@ -1,0 +1,151 @@
+{
+  "date": "2026-11-02",
+  "status": "SCREENED_NOT_PROMOTED",
+  "production_changed": false,
+  "source_commit": "be639166",
+  "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-grouped-moe-nix101",
+  "health_PASS": true,
+  "baseline_inference_runs": 0,
+  "baseline_operator_runs": 0,
+  "full_model_runs": 0,
+  "profile_runs": 0,
+  "mechanism": "Interleave gate/up in grid.z: bucket=z/2, bank=z%2; distinct rotated inputs; unchanged K16 WMMA/FP16 rounding; K5 N640 K2560. Cold64/hot128 kernels each launch once (4 to2 launches total).",
+  "resources": {
+    "cold64": {
+      "vgpr": 105,
+      "sgpr": 29,
+      "lds_bytes": 24576,
+      "private_bytes": 0,
+      "sgpr_spills": 0,
+      "vgpr_spills": 0
+    },
+    "hot128": {
+      "vgpr": 149,
+      "sgpr": 32,
+      "lds_bytes": 32768,
+      "private_bytes": 0,
+      "sgpr_spills": 0,
+      "vgpr_spills": 0
+    },
+    "extra_device_workspace_bytes": 0
+  },
+  "records": [
+    {
+      "case": "moe",
+      "rows": 512,
+      "variant": "serial",
+      "ms": 8.61897,
+      "cached": true
+    },
+    {
+      "case": "moe",
+      "rows": 512,
+      "variant": "grouped-gate-up",
+      "ms": 8.7115,
+      "change_percent": 1.0735,
+      "exact": true,
+      "guards": true
+    },
+    {
+      "case": "moe",
+      "rows": 512,
+      "variant": "grouped-gate-up+shared-side",
+      "ms": 8.65352,
+      "change_percent": 0.400803,
+      "exact": true,
+      "guards": true,
+      "saved_shared_side_ms": 8.55525,
+      "change_vs_saved_shared_side_percent": 1.1486514128751457
+    },
+    {
+      "case": "moe",
+      "rows": 2048,
+      "variant": "serial",
+      "ms": 15.0755,
+      "cached": true
+    },
+    {
+      "case": "moe",
+      "rows": 2048,
+      "variant": "grouped-gate-up",
+      "ms": 15.0865,
+      "change_percent": 0.0732117,
+      "exact": true,
+      "guards": true
+    },
+    {
+      "case": "moe",
+      "rows": 2048,
+      "variant": "grouped-gate-up+shared-side",
+      "ms": 14.8932,
+      "change_percent": -1.2089,
+      "exact": true,
+      "guards": true,
+      "saved_shared_side_ms": 14.7609,
+      "change_vs_saved_shared_side_percent": 0.8962868117797784
+    }
+  ],
+  "screen_wall_seconds": 4.918189114890993,
+  "decision": "No useful latency signal; no production promotion. Similar speed alone can justify a simpler implementation, but this prototype adds paired dispatch/grid cases and does not simplify existing paths. Preserve prototype. No full model validation warranted.",
+  "limits": [
+    "Historical timing, one arm per variant; small differences are advisory, not a proven regression.",
+    "Exact finite shared/combined/raw-down payloads and guards pass for512/2048; gate/up intermediates have guards only. No independent new oracle, graph/state/rate-wide or full-model qualification.",
+    "Shared-side percentage must compare saved shared-side, not serial; both comparisons recorded.",
+    "Five of six linked production objects equal old control. kernels.hip.cpp.o differs; do not claim all linked bytes match.",
+    "RESULT.json inherited stale source_revision0b5d58a3 from runtime tooling. WINDOW actual image and MANIFEST prototype/object SHA plus runtime mappings are authoritative for this screen."
+  ],
+  "manifest": {
+    "files": {
+      "build/f3-grouped-moe/screen.hip": "f22f732bf14d9ce0a0e5df47baba30b1a4cb4300822299ca0a39532ac4131d21",
+      "build/f3-grouped-moe/matrix.hip": "d63dc29c6423183a6c46111aebfc593d06581d4c51144b1b8472a3298fa60d64",
+      "build/f3-grouped-moe/kernel.hip": "2bcbe3d233691a22ba0ad9cf15d5c6d15ecaa60b3ba56874079b3f89caeb5ad5",
+      "build/f3-grouped-moe/build.sh": "b5e54600aee3e01519eb4996a65162b95c32ea5d766445aefe66898911ea07a2",
+      "build/f3-grouped-moe/run_screen.py": "7b692a0e46fbeeded163013704fece73d05df71e243647f5453e1ac677d2cd16",
+      "build/f3-grouped-moe/objects/screen": "1dc4b414040de3ec7929e74b5e7d326340fe5d3eaad6b619ac093b8027c19175",
+      "build/f3-grouped-moe/objects/matrix.o": "685fd76f5745d71875499025a2ae8f618a60e47a848a2afe4adf5a4fca89b1b5",
+      "build/f3-grouped-moe/objects/screen.o": "3a68c37043ab4976806de6442f923520162b8715607a47fdbf25ebf907b920e5",
+      "build/f3-grouped-moe/objects/build.ninja": "1ee915f1617c7af47d3ac87580d19c3a4af52092871e8ee48a001ac45dfb4f7a",
+      "build/f3-grouped-moe/compiler.txt": "33e4b542e9888fe837c8b5d93824d07a830b2a30c0dad1a987477684d1066682",
+      "tests/models/qwen38_flash_next/gdn_prefill_bench.cpp": "949c4ab504cda39d49cc3810ba59a52cc9a725460991a376f669c5d03ee1918b",
+      "build/f3-nix-incremental/release/CMakeFiles/gufo_core.dir/src/models/qwen/hip/kernels/prefill_fp16.hip.o": "5bf869c114fa69b8481c491fe42d3e356209226672bf2c9f4f2445e7baf1eac0",
+      "build/f3-nix-incremental/release/CMakeFiles/gufo_core.dir/src/models/qwen/hip/kernels/exl3_gemv.hip.o": "a157ca0b9ff9dbcad34003345885a8d7d8f0fd29a9b7bfa97d4b1af06288e664",
+      "build/f3-nix-incremental/release/src/models/qwen38_flash_next/CMakeFiles/gufo_qwen38_flash_next.dir/kernels/rocm/kernels.hip.cpp.o": "dfcf85734e0adf39edd5a9ce0d8d91d760ccebce833cbe980ffe95f09a6ad83e",
+      "build/f3-nix-incremental/release/src/models/qwen38_flash_next/CMakeFiles/gufo_qwen38_flash_next.dir/kernels/rocm/w8a8_wave64.hip.o": "3d525e288d1c79d15c82367f4882b588d40e1ec23ff310efe8a09752ca97f997",
+      "build/f3-nix-incremental/release/src/models/qwen38_flash_next/CMakeFiles/gufo_qwen38_flash_next.dir/kernels/rocm/exl3_moe.hip.o": "6620efa368df90ac3f8565acb02cec0044667dd4bddbbc60bd72110b30028394",
+      "build/f3-nix-incremental/release/CMakeFiles/gufo_core.dir/src/core/quant/exl3/reference.hip.o": "f23755cd846d99f6458056b0c5573122185e7817432efad883f6a37526e7dd8a"
+    },
+    "compiler": "HIP version: 7.16.0-0000000\nnixpkgs-AMD clang version 24.0.0 (https://github.com/ROCm/llvm-project/tree/therock-10.1 therock-10.1)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /nix/store/92bpbb2rmrkszhw83x63x7qzj9jsz324-rocm-toolchain/bin\nConfiguration file: /nix/store/92bpbb2rmrkszhw83x63x7qzj9jsz324-rocm-toolchain/bin/x86_64-unknown-linux-gnu.cfg\n",
+    "runtime_image": "sha256:2184da9ff7ff9dee6757b630fb4efb521f1bda10cfddc9e9562a5b75142f0d32",
+    "source_code_commit": "be639166",
+    "controls": "/workspace/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-stream-moe-nix101/receipt/run/moe-controls",
+    "control_manifest_sha256": "97972d6bfbc3da414e3b532adeac84d0133f5caef84a519dbd7a6b3288cbbd21",
+    "control_payload_manifest_sha256": "c3a7074d0c7230b7fb67a39eb293499af3c1526f5b148292f22922ae573e321e",
+    "scope": "synthetic shared MLP + raw routed MoE + combine; saved serial baseline; new grouped gate/up with separate inputs; serial-shared and shared-side variants; no model/profile",
+    "matrix_flags": "O2 fno-fast-math gfx1151",
+    "moe_flags": "O3 ffast-math fno-finite-math-only gfx1151",
+    "rows": [
+      512,
+      2048
+    ],
+    "reps": 10,
+    "warmups": 2,
+    "old_object_equality": {
+      "build/f3-nix-incremental/release/CMakeFiles/gufo_core.dir/src/models/qwen/hip/kernels/prefill_fp16.hip.o": true,
+      "build/f3-nix-incremental/release/CMakeFiles/gufo_core.dir/src/models/qwen/hip/kernels/exl3_gemv.hip.o": true,
+      "build/f3-nix-incremental/release/src/models/qwen38_flash_next/CMakeFiles/gufo_qwen38_flash_next.dir/kernels/rocm/kernels.hip.cpp.o": false,
+      "build/f3-nix-incremental/release/src/models/qwen38_flash_next/CMakeFiles/gufo_qwen38_flash_next.dir/kernels/rocm/w8a8_wave64.hip.o": true,
+      "build/f3-nix-incremental/release/src/models/qwen38_flash_next/CMakeFiles/gufo_qwen38_flash_next.dir/kernels/rocm/exl3_moe.hip.o": true,
+      "build/f3-nix-incremental/release/CMakeFiles/gufo_core.dir/src/core/quant/exl3/reference.hip.o": true
+    },
+    "no_new_baseline_execution": true
+  },
+  "evidence_sha256": {
+    "WINDOW.json": "fadb350a2574df0396eebefa718658d575bcffc0dc1b3a36eada840d3c489d03",
+    "receipt/run/RESULT.json": "7ff49de381de77d6c63f997b52f605ea0e808855ca74c09b3ef5ea0ead8171fc",
+    "receipt/run/MANIFEST.json": "af16b61fc8cbdc6803efe6a6a717f08ebd1d1d8eda4fd7eed6454d4304820d4d",
+    "receipt/run/provenance.json": "e095895fd05b99d2d2b5c23c8e9f2a7e11099ebbc501bd4c493c8e0c63656155",
+    "receipt/run/grouped-moe-screen.log": "90c9be2a441de029b0adc493c2705166ac9aa118537e6b561d2d9e68a7910672"
+  },
+  "prototype": "build/f3-grouped-moe (ignored, preserved; build logs include initial ADL compile failure and corrected successful build)",
+  "review": "indexer_review: mechanism/file review, two ADL calls fixed; final bounded-screen approval; scope and historical comparison limitations incorporated"
+}

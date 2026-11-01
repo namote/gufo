@@ -8,10 +8,11 @@ All raw bounded records are in [the screen ledger](F3-STREAM-SCREENS.json), and
 whole-model selection/validation scopes in [qualification](F3-STREAM-QUALIFICATION.json).
 
 
-Status: source/dependency review only, against code `b13b712a` (documentation
-head `ab7ce1cb`). These EXL3 schedules are **not implemented or measured**.
-The qualified image and saved performance/accuracy receipts are unchanged.
-Matrix-kernel screening did not close this separate scheduling direction.
+The queue below preserves the original source/dependency review against
+`b13b712a` (documentation head `ab7ce1cb`); it is historical, not a current
+unmeasured-work list. Final decisions above and later sections supersede it.
+The separate routed single-launch grouping screen is now closed without
+promotion: [results and limits](F3-GROUPED-MOE-SCREEN.json).
 
 ## Existing evidence and its limits
 
@@ -28,8 +29,9 @@ Matrix-kernel screening did not close this separate scheduling direction.
   FP16 X3 or W8A8 HC-down beside HC combine/mix. Its measured 12–20% overlap
   does not accept or reject the EXL3 pairs below. Same-SIMD WMMA/VALU contention
   likewise does not prove that different kernels cannot benefit from streams.
-- The shelved paired gate/up launch is a different proposal from two-stream
-  gate/up execution. Neither is a measured success for this EXL3 workload.
+- Paired gate/up launch grouping is distinct from two-stream gate/up execution.
+  Both have now been screened without a useful incremental gain for this EXL3
+  workload; preserve their receipts rather than repeating either unchanged.
 
 ## Candidate queue
 
