@@ -1,19 +1,35 @@
-# EXL3 / Flash-Next F3 handoff (2026-11-01; prefill batch qualified)
+# EXL3 / Flash-Next F3 handoff (2026-11-01; qualified batch integrated locally)
 
-Latest prefill batch QUALIFIED: `fn-prefill-batch-nix101` COMPLETE/health_PASS.
-Retain direct routing-ID combine, attention mask-pruning eligibility fix, and
-grouped dense X3 scheduling.32,760 collected records/64 head checks are identical
-to saved Nix q6. Prefill gains versus saved pre-batch Nix T1: pp512+2.14%,
-pp2048+2.04%, pp8192+2.18%, d32K pp2048+1.86% (one candidate r2 window).
-No baseline inference, TG/MTP rerun, commit, merge or push. Prior work is preserved.
-Performance-neutral simplifications/correctness can be retained per the user;
-no speedup alone is not grounds for rejection. Wider/persistent matrix prototypes
-add complexity and were not promoted; their artifacts remain available.
-Candidate: `ai-tools/gufo-eval:f3-prefill-batch-f712b2d0-rocm101` (image93197735...).
-Preserve f3-integ `build/f3-nix-incremental/{release,units}` and
-`build/f3-prefill-matrix/objects`. Evidence and build identities are in
-`~/projects/gufo-f3-integ/plan/exl3/F3-RESUME-RESULTS.md`, final section.
-Broader performance goals and formal integration remain outstanding.
+Latest status: the qualified F3 batch is committed and locally integrated.
+Code checkpoint: `2c159a12` on `ai-tools/f3-integ`.
+Port integration merge: `9fcaffea`;
+integ merge: `ffc0738a`. See
+[F3-INTEGRATION.json](F3-INTEGRATION.json) for the compiled-input identity proof.
+All tracked production/test/toolchain inputs match the qualified checkpoint;
+only documentation/guidance differ. No new build, GPU window or baseline
+inference was needed for integration. No remote push was performed.
+
+Retained: direct routing-ID combine, attention mask-pruning eligibility, and
+grouped dense X3 scheduling. `fn-prefill-batch-nix101` is COMPLETE/health_PASS:
+32,760 collected records and 64 head checks match saved Nix q6 exactly.
+Prefill versus saved pre-batch Nix T1: pp512 +2.14%, pp2048 +2.04%, pp8192
++2.18%, d32K pp2048 +1.86% (one candidate r2 window). These are batch-level
+observations, with prior hc7-relative quality drift still recorded.
+
+The tested image remains `ai-tools/gufo-eval:f3-prefill-batch-f712b2d0-rocm101`
+(image `93197735...`, as-built source patch `f712b2d0...`). Integration commits
+attest source identity; they are not newly built image revisions. Preserve
+`~/projects/gufo-f3-integ/build/f3-nix-incremental/{release,units}`, the operator
+objects and all baseline/candidate artifacts for incremental work.
+
+Performance-neutral simplifications/correctness remain eligible for retention.
+Wider and persistent matrix prototypes added complexity without a qualified
+benefit; their source/binaries are preserved. Previously completed TG/MTP work
+is kept. Further prefill work remains the priority; the >=2,000 tok/s goal is
+not met. TG/MTP expansion, deferred serving/27B qualification and deployment
+are separate remaining work, not implied complete by this integration.
+gufo-00 has ended; this chat coordinates machine use. Long validations stay
+batched, and stored matching baselines are reused.
 
 ## Historical resume record (superseded by the latest status above)
 

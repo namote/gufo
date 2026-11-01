@@ -443,3 +443,23 @@ Docker packaging-cache IDs were reclaimed for the 150 GiB window floor; see
 `PACKAGING-CACHE-CLEANUP.json`. No Nix objects, source, images or baseline receipts
 were deleted. The persistent80/160 prototype passed exact outputs/health but was
 not promoted; it and wider tiles are retained in `archive-persistent`/`archive-wide`.
+
+## Local integration follow-up, 2026-11-01
+
+Validated code and its evidence were committed as `2c159a12`; pending know-how
+and instruction-pointer work received independent review as well. F3 was merged
+into port-u4f (`9fcaffea`) and then into integ (`ffc0738a`), preserving the
+port branch's documentation-only history. The old no-commit/no-merge statements
+above describe the qualification snapshot, before this follow-up.
+
+`F3-INTEGRATION.json` records exact tracked-blob identity across production
+sources, tests, tools, CMake, Nix pins and runtime assets. The source/test diff
+from base `966f84b8` still has the tested patch SHA `f712b2d0...`. The pre-commit
+CI formatting check passed all 758 C++ files. No model tests, baseline inference,
+builds or image creation were repeated solely for these merge labels.
+The tested image `93197735...` and persistent Nix intermediates are unchanged;
+main's pre-existing `.dockerignore` was preserved by content hash. No push.
+
+Further prefill work starts from this integrated code and saved candidate
+measurements. The >=2,000 tok/s goal remains unmet; completed TG/MTP work stays
+in place and further TG/MTP tuning remains deferred under the user's priority.

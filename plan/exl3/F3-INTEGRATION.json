@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "date": "2026-11-01",
+  "status": "local source integration verified",
+  "source_checkpoint": "2c159a123dda7e58cfaf1f60946af78d8a4d9cbb",
+  "merge_commits": {
+    "ai-tools/port-u4f": "9fcaffea1ab2b89f6014177b3e8fffc6a67ee1f1",
+    "ai-tools/integ": "ffc0738ac1e72b50bc0ecf9245a662d7546b9bd7"
+  },
+  "compiled_inputs_manifest_sha256": "a7c93443ce81d89f75b147ae93fe32b71280e5fea28e00189b87779883bde16e",
+  "manifest_scope": "All tracked blobs except docs/, plan/, .agents/ and AGENTS.md; includes src, tests, tools, CMake, Nix pins and package/runtime assets.",
+  "tested_image": "sha256:931977351cdc6b604873272394d404497215523f68a1c5dea7dfbc01bc3605d5",
+  "tested_revision": "966f84b8-prefill-batch-f712b2d0",
+  "tested_patch_sha256": "f712b2d037d148c07f3e9466a2edd02ddf1ce0ab802afdda32324477eba182bd",
+  "qualification_receipt": "fn-prefill-batch-nix101",
+  "qualification_health_PASS": true,
+  "baseline_inference_runs": 0,
+  "new_builds": 0,
+  "new_gpu_windows": 0,
+  "validation_reused_reason": "Merged compiled inputs are byte-identical to the qualified checkpoint. Only documentation/guidance differ. These commits attest source identity; they do not claim a newly built image.",
+  "format_check": "758 C++ files passed pinned clang-format CI check before commit",
+  "independent_review": "Code, evidence, integration plan, guide pointers and ledger fixes approved by indexer_review",
+  "unrelated_main_dockerignore_sha256": "49c26750db91feb1bb16a5792dafcb03edcb71aeb86926ddda42fb4821cb0f5d",
+  "push_performed": false
+}
