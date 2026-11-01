@@ -1,5 +1,10 @@
 # Qwen3.8 Flash-Next benchmarks
 
+The subsequent [matrix follow-up screen](../../../plan/exl3/F3-NEXT-MATRIX-SCREEN.md)
+made no production change. The qualified numbers below remain current; its
+local narrow-tile signal is not an end-to-end speedup. Stored model baselines
+were reused, without another inference pass.
+
 ## EXL3 5.05 prefill batch, November 1, 2026
 
 Nix ROCm10.1, GCC16.2/Clang24, gfx1151; KVarN k4v4, speculative off,

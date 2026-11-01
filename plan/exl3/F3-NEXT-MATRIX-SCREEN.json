@@ -1,0 +1,317 @@
+{
+  "stage": {
+    "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-stage-screen-nix101",
+    "health_PASS": true,
+    "seconds": 2.7661280250176787,
+    "measurements": [
+      {
+        "case": "dense-k6144-n2560-g1",
+        "variant": "control",
+        "ms": 1.897835,
+        "cached": false
+      },
+      {
+        "case": "dense-k6144-n2560-g1",
+        "variant": "256x128-8x2-k32",
+        "ms": 2.329934,
+        "change_percent": 22.768,
+        "exact": true
+      },
+      {
+        "case": "dense-k6144-n2560-g1",
+        "variant": "128x256-4x4-k32",
+        "ms": 3.014226,
+        "change_percent": 58.824,
+        "exact": true
+      },
+      {
+        "case": "dense-k6144-n2560-g1",
+        "variant": "128x128-4x2-k32",
+        "ms": 2.309306,
+        "change_percent": 21.681,
+        "exact": true
+      },
+      {
+        "case": "dense-k2560-n6144-g1",
+        "variant": "control",
+        "ms": 1.837185,
+        "cached": false
+      },
+      {
+        "case": "dense-k2560-n6144-g1",
+        "variant": "256x128-8x2-k32",
+        "ms": 2.315318,
+        "change_percent": 26.025,
+        "exact": true
+      },
+      {
+        "case": "dense-k2560-n6144-g1",
+        "variant": "128x256-4x4-k32",
+        "ms": 2.436246,
+        "change_percent": 32.608,
+        "exact": true
+      },
+      {
+        "case": "dense-k2560-n6144-g1",
+        "variant": "128x128-4x2-k32",
+        "ms": 2.220525,
+        "change_percent": 20.866,
+        "exact": true
+      },
+      {
+        "case": "dense-k2560-n640-g2",
+        "variant": "control",
+        "ms": 0.443321,
+        "cached": false
+      },
+      {
+        "case": "dense-k2560-n640-g2",
+        "variant": "256x128-8x2-k32",
+        "ms": 0.64164,
+        "change_percent": 44.735,
+        "exact": true
+      },
+      {
+        "case": "dense-k2560-n640-g2",
+        "variant": "128x256-4x4-k32",
+        "ms": 0.484193,
+        "change_percent": 9.219,
+        "exact": true
+      },
+      {
+        "case": "dense-k2560-n640-g2",
+        "variant": "128x128-4x2-k32",
+        "ms": 0.453673,
+        "change_percent": 2.335,
+        "exact": true
+      },
+      {
+        "case": "dense-k2560-n640-g2",
+        "variant": "masked256x256-8x4-k64",
+        "ms": 0.527145,
+        "change_percent": 18.908,
+        "exact": true
+      },
+      {
+        "case": "dense-k2560-n640-g1",
+        "variant": "control",
+        "ms": 0.255579,
+        "cached": false
+      },
+      {
+        "case": "dense-k2560-n640-g1",
+        "variant": "256x128-8x2-k32",
+        "ms": 0.38154,
+        "change_percent": 49.285,
+        "exact": true
+      },
+      {
+        "case": "dense-k2560-n640-g1",
+        "variant": "128x256-4x4-k32",
+        "ms": 0.230169,
+        "change_percent": -9.942,
+        "exact": true
+      },
+      {
+        "case": "dense-k2560-n640-g1",
+        "variant": "128x128-4x2-k32",
+        "ms": 0.213457,
+        "change_percent": -16.481,
+        "exact": true
+      },
+      {
+        "case": "dense-k2560-n640-g1",
+        "variant": "masked256x256-8x4-k64",
+        "ms": 0.322153,
+        "change_percent": 26.048,
+        "exact": true
+      },
+      {
+        "case": "routed-k2560-n640",
+        "variant": "control",
+        "ms": 3.10629,
+        "cached": false
+      },
+      {
+        "case": "routed-k2560-n640",
+        "variant": "128-k32",
+        "ms": 3.171793,
+        "change_percent": 2.109,
+        "exact": true
+      },
+      {
+        "case": "routed-k2560-n640",
+        "variant": "64-k32",
+        "ms": 3.792725,
+        "change_percent": 22.098,
+        "exact": true
+      },
+      {
+        "case": "routed-k640-n2560",
+        "variant": "control",
+        "ms": 3.232299,
+        "cached": false
+      },
+      {
+        "case": "routed-k640-n2560",
+        "variant": "128-k32",
+        "ms": 3.168744,
+        "change_percent": -1.966,
+        "exact": true
+      },
+      {
+        "case": "routed-k640-n2560",
+        "variant": "64-k32",
+        "ms": 3.597648,
+        "change_percent": 11.303,
+        "exact": true
+      }
+    ],
+    "provenance": {
+      "manifest_sha256": "864c12cc22f56ff37d1907d940d0dffaf6e58d3d2e1050f2c9727e2c0cf8aad7",
+      "wrapper_sha256": "8cf87dc3372c78b713b41004a8336dc31e0961e674ab01afe3119e1d600cd313",
+      "controls_cached": false,
+      "full_model_run": false,
+      "returncode": 0,
+      "runtime_paths": [
+        "/nix/store/88jjsz00km321bcl9851aiwwdig79b4l-rocm-runtime-10.1/lib/libhsa-runtime64.so.1.21.0",
+        "/nix/store/al4qwi7jfyrdkyb25xsri8b00b1agj1r-clr-10.1/lib/libamdhip64.so.7.16.0-0000000"
+      ]
+    }
+  },
+  "partition": {
+    "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-partition-screen-nix101",
+    "health_PASS": true,
+    "seconds": 2.0653017109725624,
+    "measurements": [
+      {
+        "case": "routed-k2560-n640",
+        "variant": "control",
+        "ms": 3.10629,
+        "cached": true
+      },
+      {
+        "case": "routed-k2560-n640",
+        "variant": "current-capacity1172",
+        "ms": 2.979682,
+        "change_percent": -4.076,
+        "exact": true
+      },
+      {
+        "case": "routed-k2560-n640",
+        "variant": "tight-total668",
+        "ms": 3.015123,
+        "change_percent": -2.935,
+        "exact": true
+      },
+      {
+        "case": "routed-k2560-n640",
+        "variant": "partition-cold512-hot315",
+        "ms": 3.010771,
+        "change_percent": -3.075,
+        "exact": true
+      },
+      {
+        "case": "routed-k640-n2560",
+        "variant": "control",
+        "ms": 3.232299,
+        "cached": true
+      },
+      {
+        "case": "routed-k640-n2560",
+        "variant": "current-capacity1172",
+        "ms": 3.198049,
+        "change_percent": -1.06,
+        "exact": true
+      },
+      {
+        "case": "routed-k640-n2560",
+        "variant": "tight-total668",
+        "ms": 3.156427,
+        "change_percent": -2.347,
+        "exact": true
+      },
+      {
+        "case": "routed-k640-n2560",
+        "variant": "partition-cold512-hot315",
+        "ms": 3.125126,
+        "change_percent": -3.316,
+        "exact": true
+      }
+    ],
+    "provenance": {
+      "manifest_sha256": "864c12cc22f56ff37d1907d940d0dffaf6e58d3d2e1050f2c9727e2c0cf8aad7",
+      "binary_sha256": "630f1294802a7bb16c7e1fed7b4785b2d93cfca7bfdf3f094cdd3c5c1b4d3719",
+      "wrapper_sha256": "f8e2e828c2c6ad1a0e7c07fb6317eb092965ee5cef8111a770297d9d5a71b3de",
+      "source_sha256": "fadf2b9c296edd543d63fabc5254a9739b3b3958cc7752279414cd18c2ea80f6",
+      "controls_cached": true,
+      "full_model_run": false,
+      "returncode": 0,
+      "runtime_paths": [
+        "/nix/store/88jjsz00km321bcl9851aiwwdig79b4l-rocm-runtime-10.1/lib/libhsa-runtime64.so.1.21.0",
+        "/nix/store/al4qwi7jfyrdkyb25xsri8b00b1agj1r-clr-10.1/lib/libamdhip64.so.7.16.0-0000000"
+      ]
+    },
+    "current_capacity_comparison": {
+      "tight-total668": {
+        "gate_change_percent": 1.1894222269356325,
+        "down_change_percent": -1.3014809966951812,
+        "two_gate_plus_down_change_percent": 0.31952255511462635,
+        "scope": "synthetic operator sum; excludes descriptor generation and model traffic"
+      },
+      "partition-cold512-hot315": {
+        "gate_change_percent": 1.0433663726531872,
+        "down_change_percent": -2.280233980154789,
+        "two_gate_plus_down_change_percent": -0.11733663208156608,
+        "scope": "synthetic operator sum; excludes descriptor generation and model traffic"
+      }
+    }
+  },
+  "source_revision": "9dc1d15cd6664878386f450a9cdc5a3781bce094",
+  "production_change": false,
+  "full_model_run": false,
+  "decision": "Preserve narrow K5 single-group candidate; no production promotion. Other tested variants slower or lack aggregate benefit.",
+  "quality_scope": "finite/nonzero and exact output bytes for all matrix cases; output guards checked only in unequal65/129-row grouped tail test, not generic Comparison::Run",
+  "model_metadata": {
+    "path": "/home/m2on/projects/ai.tools/storage/models/llm/flash-next-exl3-5.05-h6-ng6/quantization_config.json",
+    "sha256": "04b309b7bc26bce905a93d419bfffc1bbd7267fcc41f16332ce922d215818f61",
+    "selected": {
+      "model.language_model.layers.3.self_attn.indexer.index_qk_proj": {
+        "bits": 5,
+        "trellis_shapes": [
+          [
+            160,
+            40,
+            80
+          ]
+        ]
+      },
+      "model.language_model.layers.0.mlp.shared_expert.gate_proj": {
+        "bits": 7,
+        "trellis_shapes": [
+          [
+            160,
+            40,
+            112
+          ]
+        ]
+      },
+      "model.language_model.layers.0.mlp.shared_expert.up_proj": {
+        "bits": 7,
+        "trellis_shapes": [
+          [
+            160,
+            40,
+            112
+          ]
+        ]
+      }
+    }
+  },
+  "review": {
+    "reviewer": "/root/indexer_review",
+    "kernel_findings": "StageK2 preserves ascendingK16 and Stage16 epilogue ownership; maskedN640 padding cannot mix into valid128-channel Hadamard segments. Descriptor initializer fixed before compilation; unequal65/129-row grouped case added and passed.",
+    "partition_findings": "1172slot production capacity and tight668/cold512/hot315 bounds verified; generic bound requires min(A,E) for A<E.",
+    "measurement_limitations": "Generic timed guard initializer/check absent; exact/finite checks still passed. Separate tailcase guards passed. Partition builder cost excluded; correct reference is1172slot measurement, not printed832slot ratios."
+  }
+}

@@ -1,5 +1,14 @@
 # Qwen3.8 Flash-Next quality
 
+## Matrix follow-up operator checks, November 1, 2026
+
+Two short healthy Nix 10.1 windows passed finite/nonzero and exact-output
+comparisons for K5 stage/geometry and descriptor-partition prototypes.
+Allocation guards were checked only by the unequal65/129-row grouped dense
+tail case. These checks do not establish full-model or other-rate quality.
+Production is unchanged, so the existing qualified collection is reused.
+[Evidence and limitations](../../../plan/exl3/F3-NEXT-MATRIX-SCREEN.md).
+
 ## EXL3 prefill batch, November 1, 2026
 
 The direct expert-ID combine, attention pruning eligibility fix and grouped

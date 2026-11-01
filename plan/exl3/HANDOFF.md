@@ -1,6 +1,16 @@
-# EXL3 / Flash-Next F3 handoff (2026-11-01; qualified batch integrated locally)
+# EXL3 / Flash-Next F3 handoff (2026-11-01; matrix follow-up screened)
 
-Latest status: the qualified F3 batch is committed and locally integrated.
+Latest work: [matrix follow-up screen](F3-NEXT-MATRIX-SCREEN.md) completed two
+short healthy operator windows. K32/workgroup and masked-wide variants were
+mostly slower; tighter MoE launch bounds/descriptor partition had no aggregate
+benefit. One narrow K5 indexer candidate is preserved for a later larger batch.
+No production code or image changed, no full-model baseline was rerun, and the
+qualified pp2048 result remains 1400.15 tok/s. All new artifacts stay under
+f3-integ `build/f3-prefill-stage` and `build/f3-prefill-partition`. Do not retry
+the rejected mechanisms unchanged. Production incremental objects and TG/MTP
+work remain intact. This follow-up does not meet the >=2000 tok/s goal.
+
+Qualified production status: the F3 batch is committed and locally integrated.
 Code checkpoint: `2c159a12` on `ai-tools/f3-integ`.
 Port integration merge: `9fcaffea`;
 integ merge: `ffc0738a`. See

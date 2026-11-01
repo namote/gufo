@@ -1,5 +1,14 @@
 # Qwen3.8 Flash-Next experiments
 
+## Matrix follow-up screening, November 1, 2026
+
+K32 staging with smaller workgroups and masked dense N640 tiles were mostly
+slower; a single-group K5 narrow tile improved16.48% locally and is preserved
+for a later batch. Tight MoE launch bounds and cold/hot descriptor partition
+changed the matched 2×gate+down operator estimate by +0.32% and −0.12%.
+Neither justifies production complexity. No production change or full-model
+rerun. [Tables, scope, and retained artifacts](../../../plan/exl3/F3-NEXT-MATRIX-SCREEN.md).
+
 ## Nix ROCm 10.1 EXL3 prefill batch, November 1, 2026
 
 | Change | Result |

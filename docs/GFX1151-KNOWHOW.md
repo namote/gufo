@@ -430,12 +430,12 @@ changed path and an explicit reason. Model-only searches are preserved in Other.
 
 ## Open leads — shared mechanisms
 
-These remain unmeasured opportunities, not promised speedups. Check later
+These remain open opportunities, not promised end-to-end speedups. Check later
 commits before acting; model-specific reachability and pending work are in Other.
 
 | Lead | Bounded next action | Evidence |
 |---|---|---|
-| Shared kWideHalf narrow-output path | Existing 128×256 tile measured 20–29 versus 31–36 TFLOPS for wide; try a masked wide tile preserving row/K order. Profile real call counts first. | S:26; `F3src/models/qwen/hip/kernels/prefill_fp16.hip:1161–1201` |
+| Deferred K5 indexer narrow tile | The 128×128 4×2 K32 single-group candidate reduced synthetic time 16.48%; qualify actual weights and model impact only with a later larger batch. The tested masked-wide K5 variant was slower. | `plan/exl3/F3-NEXT-MATRIX-SCREEN.md` |
 | Stream-K bucket scheduling | Persistent 80/160-block scheduling has now been screened without a qualified benefit. Stream-K remains untried and would need its own reduction-order/quality proof; inspect skewed layer tail span first. | S:29–31; final Nix prefill section below |
 | Reuse low-bit decode across small batches | Existing upstream mmvq repeats decoding per activation row; shared-row decoding is a new path requiring independent quality and real verification timing. | R0b:200,208 |
 | Prepare actual first-use functions/graph keys | Profile one affected first use; broad warmup already exists and some stalls remain inconclusive. | W9:563–592; EFN:229,243 |
@@ -857,3 +857,32 @@ Performance-neutral simplification or correctness can still justify retention.
 Final image `f3-prefill-batch-f712b2d0-rocm101`, code patchf712b2d0, preserves all
 previously completed work; no new TG/MTP qualification or baseline inference.
 See f3-integ F3-RESUME-RESULTS.md final section and BATCH-QUALIFICATION.json.
+
+### Flash-Next matrix follow-up screen (2026-11-01)
+
+No production change; the qualified pp2048 baseline remains 1400.15 tok/s.
+Two healthy, short Nix 10.1 operator windows reused saved outputs and avoided
+full-model inference. [Detailed tables and identities](../plan/exl3/F3-NEXT-MATRIX-SCREEN.md).
+
+- K32 staging paired with fewer waves was mostly slower: wide dense +21–59%,
+  routed BM64 +11–22%; routed BM128 gave gate +2.11% / down −1.97%.
+  Masked dense 256×256 at N640 lost 19–26%; the tested K5 variant is rejected.
+- Single-group K5 K2560/N640 with 128×128 4×2 K32 improved 0.255579→0.213457 ms
+  (−16.48%), but two groups lost 2.34%. Preserve as a deferred candidate.
+  Pack metadata identifies the indexer parent as K5 and shared gate/up as K7.
+  Indexer key prefill computes the complete parent even before sparse attention,
+  so pp2048 d0 can reach this candidate; its model impact remains unmeasured.
+  Do not generalize the K5 signal to shared experts.
+- Production's 4224-row scratch launches 1172 bucket slots per class, versus
+  the old operator's 832. A first 1172-slot measurement gave gate/down
+  2.979682/3.198049 ms. Tightening to668 changed the 2×gate+down estimate +0.32%;
+  cold512/hot315 descriptor partition changed it −0.12%, excluding builder
+  cost. No meaningful aggregate benefit; neither route is promoted.
+- All screened matrix outputs matched exact finite bytes. Only the separate
+  unequal65/129-row dense tail check exercised allocation guards; generic
+  timed cases did not. These K5 checks do not qualify full-model quality.
+
+Receipts: `fn-prefill-stage-screen-nix101` and
+`fn-prefill-partition-screen-nix101`, both COMPLETE/health_PASS. Source,
+objects, resources, and controls stay in f3-integ `build/f3-prefill-stage` and
+`build/f3-prefill-partition`; production incremental trees remain intact.
