@@ -110,6 +110,20 @@ struct ExecutorTestAccess {
                                              unsigned rows) {
     return Read<float>(exec.s_.res, std::size_t{rows} * exec.config().HcDim());
   }
+  static bool PrefillWithoutSharedWorkspace(
+      Executor& exec, Session& session, std::span<const std::int32_t> tokens,
+      std::string* error) {
+    // Exercise the production serial fallback with identical rows/kernels,
+    // without adding a runtime optimization switch.
+    struct Restore {
+      Executor& exec;
+      Executor::Exl3DenseWorkspace workspace;
+      ~Restore() { exec.exl3_shared_workspace_ = workspace; }
+    } restore{exec, exec.exl3_shared_workspace_};
+    exec.exl3_shared_workspace_ = {};
+    return exec.Forward(session, tokens, tokens.size(), nullptr,
+                        Executor::ForwardMode::kPrefill, error);
+  }
   static bool PrefillLinearOnly(Executor& exec, Session& session,
                                 std::span<const std::int32_t> tokens,
                                 std::string* error) {
@@ -928,7 +942,8 @@ struct MtpExecutorFixture {
   explicit MtpExecutorFixture(unsigned max_batch = 16, unsigned expert_ff = 128,
                               int shared_bits = 6, bool linear_prefix = false,
                               unsigned half_weight_cols = 0,
-                              unsigned max_context = 128) {
+                              unsigned max_context = 128,
+                              unsigned max_logit_rows = 8) {
     config.num_layers = linear_prefix ? 2 : 1;
     config.num_layers_all = config.num_layers + 1;
     config.hidden_size = 128;
@@ -1015,7 +1030,7 @@ struct MtpExecutorFixture {
     std::string error;
     exec = gpu::Executor::Create(*model, nullptr,
                                  {.max_batch = max_batch,
-                                  .max_logit_rows = 8,
+                                  .max_logit_rows = max_logit_rows,
                                   .max_speculative = 8,
                                   .max_context = max_context},
                                  &error);
@@ -2154,6 +2169,77 @@ bool ExecutorGdnPrefillCase(bool linear_only) {
   return equal;
 }
 
+void ExecutorSharedOverlap() {
+  BeginCase("EXL3 shared overlap: two 512-row chunks, serial tail and state");
+  constexpr unsigned rows = 1025;
+  MtpExecutorFixture f(512, 640, 7, true, 0, 2048, 512);
+  auto& exec = *f.exec;
+  const auto& c = f.config;
+  using Access = gpu::ExecutorTestAccess;
+  std::vector<std::int32_t> tokens(rows);
+  for (unsigned r = 0; r < rows; ++r)
+    tokens[r] = 1 + (r * 17) % (c.vocab_size - 1);
+  struct Result {
+    std::vector<float> hidden, logits, conv, recurrent;
+  };
+  std::string error;
+  const auto run = [&](bool overlap) {
+    auto session = exec.CreateSession(gufo::core::SessionMode::kAutoregressive,
+                                      2048, &error);
+    Require(session != nullptr, error);
+    Result result{std::vector<float>(std::size_t{rows} * c.HcDim()),
+                  std::vector<float>(c.vocab_size),
+                  {},
+                  {}};
+    Require(exec.BeginMtpCycleDiagnostics(&error), error);
+    for (unsigned first : {0U, 512U, 1024U}) {
+      const auto count = std::min(512U, rows - first);
+      const auto part = std::span(tokens).subspan(first, count);
+      Require(overlap
+                  ? exec.Forward(*session, part, count, nullptr,
+                                 gpu::Executor::ForwardMode::kPrefill, &error)
+                  : Access::PrefillWithoutSharedWorkspace(exec, *session, part,
+                                                          &error),
+              error);
+      const auto hidden = Access::PrefillResiduals(exec, count);
+      std::copy(hidden.begin(), hidden.end(),
+                result.hidden.begin() + std::size_t{first} * c.HcDim());
+      Require(exec.ReplayOutputHead(count, result.logits, &error), error);
+    }
+    gpu::Executor::MtpCycleDiagnostics d;
+    Require(exec.EndMtpCycleDiagnostics(0, 0, &d, &error), error);
+    // Request all head rows to retain both full FFNs. Two chunks exercise
+    // shared -> attention -> shared ordering and repeated event generations.
+    Require(
+        c.num_layers == 2 && d.prefill_shared_overlaps == (overlap ? 4U : 0U),
+        "shared overlap eligibility was not exercised at 512 rows");
+    auto state = Access::GdnState(*session, c);
+    result.conv = std::move(state.first);
+    result.recurrent = std::move(state.second);
+    for (const auto* values :
+         {&result.hidden, &result.logits, &result.conv, &result.recurrent})
+      Require(std::ranges::all_of(*values,
+                                  [](float v) { return std::isfinite(v); }),
+              "nonfinite overlap result");
+    return result;
+  };
+  const auto serial = run(false);
+  const auto concurrent = run(true);
+  bool equal = CompareBits(serial.hidden, concurrent.hidden,
+                           "shared overlap every residual", c.HcDim());
+  equal = CompareBits(serial.logits, concurrent.logits,
+                      "shared overlap tail logits", c.vocab_size) &&
+          equal;
+  equal =
+      CompareBits(serial.conv, concurrent.conv,
+                  "shared overlap convolution history", c.SsmConvChannels()) &&
+      equal;
+  equal = CompareBits(serial.recurrent, concurrent.recurrent,
+                      "shared overlap recurrent state", c.ssm_head_dim) &&
+          equal;
+  Require(equal, "shared overlap changed executor results");
+}
+
 void ExecutorGdnPrefill() {
   bool equal = ExecutorGdnPrefillCase(true);
   equal = ExecutorGdnPrefillCase(false) && equal;
@@ -2228,6 +2314,11 @@ void MtpKvGroup() {
 int main(int argc, char** argv) {
   std::cout << std::unitbuf;
   try {
+    if (argc == 2 && std::string(argv[1]) == "--prefill-overlap-only") {
+      ExecutorSharedOverlap();
+      ExecutorGdnPrefill();
+      return 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--gdn-prefill-only") {
       ExecutorGdnPrefill();
       return 0;

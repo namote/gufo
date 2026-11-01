@@ -451,12 +451,17 @@ __device__ __forceinline__ void KvarnQuantizeTile(
   // lane i of a wave updates its token i, wave j (< 8) channel 8l + j. The
   // values are those every lane computed before, bit for bit; the double
   // log and exp were most of the quantizer's time.
+  // Keep the unrolled register selections: Clang24 otherwise reconstructs
+  // an indexed array load, creating an 80-byte private frame for these stds.
+  // The barriers preserve values and emit no instructions.
   const auto update_tokens = [&](const float (&stds)[8]) {
     float s = stds[0];
 #pragma unroll
-    for (unsigned i = 1; i < 8; ++i)
+    for (unsigned i = 1; i < 8; ++i) {
       if ((lane & 7) == i)
         s = stds[i];
+      asm volatile("" : "+v"(s));
+    }
     own_token_scale = update(own_token_log, s);
 #pragma unroll
     for (unsigned i = 0; i < 8; ++i)
@@ -467,9 +472,11 @@ __device__ __forceinline__ void KvarnQuantizeTile(
     if (wave < 8) {
       float s = stds[0];
 #pragma unroll
-      for (unsigned j = 1; j < 8; ++j)
+      for (unsigned j = 1; j < 8; ++j) {
         if (wave == j)
           s = stds[j];
+        asm volatile("" : "+v"(s));
+      }
       own_channel_scale = update(own_channel_log, s);
       shared_scale[8 * lane + wave] = own_channel_scale;
     }

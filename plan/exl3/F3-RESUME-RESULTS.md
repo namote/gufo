@@ -484,3 +484,22 @@ exact/guard checks passed; batch512 collector reused because the new predicate
 requires2048. All seven actual K7 shapes were screened; only6144→2560 singleton
 uses the new traversal. The cached-FP16 branch is rejected. Image31fd777e…,
 source patch67a50024…, persistent Nix intermediates retained. Goal2000 unmet.
+
+
+## Shared-MoE and KVarN closure, 2026-11-02
+
+The two-phase stream/resource goal qualifies shared EXL3 MLP beside router and
+routed MoE, plus exact register-held KVarN statistics. Final pp2048 is1429.13±1.13,
++.89% from saved1416.51; pp512/8192/d32K improve.52/.93/.85%. All final-image
+bounded state and KVarN CPU-oracle checks pass. The combined-image fullcollector
+32760/64 exact result is supporting evidence with a source/scope bridge; the
+cleaned image did not rerun it. Target2000 remains unmet; TG/MTP preserved.
+
+Initial Q/shared combination was exact but regressed1.27–1.66%. Isolation picked
+shared-only; dedicated Q events did not fix the interaction. Baseline Q/KV
+launching is restored. All bounded measurements, private/spill distinctions,
+failed candidates and final artifacts/scopes are recorded in
+[F3-STREAM-QUALIFICATION.json](F3-STREAM-QUALIFICATION.json),
+[F3-STREAM-SCREENS.json](F3-STREAM-SCREENS.json) and
+[F3-RELEASE-RESOURCE-AUDIT.json](F3-RELEASE-RESOURCE-AUDIT.json).
+No saved baseline inference or full profile was repeated. Reuse Nix intermediates.

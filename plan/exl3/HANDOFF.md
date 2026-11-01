@@ -1,21 +1,50 @@
-# EXL3 / Flash-Next F3 handoff (2026-11-01; qualified narrow/slice/grid batch)
+# EXL3 / Flash-Next F3 handoff (2026-11-02; qualified shared-MoE/KVarN batch)
 
-Latest qualified pp2048 is **1416.51 ±0.82 tok/s**, +1.17% versus saved1400.15.
-The2000 tok/s target is not reached. Read [search status and open research
-boundaries](F3-SEARCH-STATUS.md) before starting more experiments. Current
-profile-backed matrix candidates have been screened; rejected mechanisms and
-baselines should not be rerun unchanged.
+Latest qualified pp2048 is **1429.13±1.13 tok/s**, +.89% versus saved1416.51
+and+2.07% versus the earlier1400.15. Other final cases: pp5121068.58±3.09,
+pp81921460.97±.73, d32Kpp20481301.99±1.41 (+.52/.93/.85%). **Target2000 is
+not reached.** The requested stream-then-kernel investigation is complete for
+this concrete batch; no claim of exhausting every future algorithm is made.
 
-Next open direction: [EXL3 stream overlap](F3-STREAM-OVERLAP.md). Source review
-prioritizes GDN Z alongside recurrence, then shared MLP alongside routed MoE.
-These are unimplemented/unmeasured EXL3 schedules, not closed by the earlier
-matrix screen or generic two-stream probe. Preserve scratch lifetimes; simply
-turning on the existing Q8 overlap dispatch is unsafe for EXL3.
+Retained: shared EXL3 MLP starts before router/top-k on the side stream with
+its own rotated operands/descriptors (41.25MiB at4224×2560), and KVarN standard-
+deviation selection stays in registers, removing80B private arrays. All79
+EXL3 matrix variants had no private/spill issue; do not repeat a spill-driven
+matrix split without new evidence. Completed TG/MTP code remains unchanged.
 
-Also keep [register pressure / kernel fission](F3-SEARCH-STATUS.md#register-pressure-and-kernel-fission)
-in the candidate queue. Saved stage-screen matrix kernels have zero private
-frame/spills; audit uncovered hot kernels before assuming spills are the cause.
-Resource reduction may still help stream co-residency. No new GPU run occurred.
+Q/KV overlap is not retained. Its whole-model-only result was neutral, and
+combining it with shared overlap regressed1.27–1.66%. Dedicated Q events did
+not recover baseline. Q group/attention source is restored to the qualified
+baseline. GDN Z, gate/up, heterogeneous grouping and smaller-LDS screens have
+explicit dispositions; remaining alpha/beta, PLE and broader pipeline ideas
+are unmeasured research leads. See [stream decisions](F3-STREAM-OVERLAP.md),
+[all screen records](F3-STREAM-SCREENS.json), and
+[actual resource audit](F3-RELEASE-RESOURCE-AUDIT.json).
+
+Image: `ai-tools/gufo-eval:f3-shared5-703d3e77-rocm101`, ID`2184da9f…`.
+As-built source: `534c0f00-shared5-703d3e77`; source patchSHA703d3e77….
+Final receipt: `ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-shared5-nix101`.
+[Qualification](F3-STREAM-QUALIFICATION.json) contains installed binary hashes,
+actual patched ROCr/CLR10.1 mappings and all performance/accuracy scopes.
+
+Final-image1025-row full-FFN test matches serial residuals, logits, convolution
+history and recurrent state, including four shared forks and a1-row tail.
+Flash-Next and Qwen KVarN CPU-oracle tests pass. The32760-record/64head-replay
+FP16-KV fullcollector is **supporting evidence reused from the combined image**,
+with retained MoE source equality and restored baseline Q code; no fresh
+fullcollector on the cleaned final image is claimed. KVarN correctness is
+separate operator/state evidence; performance usesk4v4. Prior hc7 NLL drift
++.006600 remains. No baseline model or full profile was repeated.
+
+Current source/integration attestation is recorded in
+[F3-INTEGRATION-BATCH5.json](F3-INTEGRATION-BATCH5.json). It does not relabel the
+already tested image. Nix10.1 incremental objects, frozen candidate binaries,
+source patches, controls and rejected images are preserved. Unused Docker
+build cache and redundant batch2/3 packaging staging copies were reclaimed;
+those baseline images remain. Root free-space floor stays150GiB. The main
+folder's pre-existing untracked `.dockerignore` must remain untouched.
+
+## Previous qualified matrix batch
 
 Retained production changes: small-row K5 narrow tile, aligned singleton parent
 output slices, and token-first traversal for singleton K7 6144→2560/R2048.

@@ -1,0 +1,503 @@
+{
+  "scope": "All bounded scheduling and quantizer screen numeric records; controls saved once, no model baseline/profile rerun. Final whole-model decisions override local wins.",
+  "screens": [
+    {
+      "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-stream-gdn-nix101",
+      "health_PASS": true,
+      "records": [
+        {
+          "case": "gdn",
+          "rows": 65,
+          "variant": "serial",
+          "ms": 0.812238,
+          "cached": false
+        },
+        {
+          "case": "gdn",
+          "rows": 65,
+          "variant": "z-after-qkv",
+          "ms": 0.798619,
+          "change_percent": -1.67669,
+          "exact_output_state_history": true,
+          "guards": true
+        },
+        {
+          "case": "gdn",
+          "rows": 65,
+          "variant": "z-with-qkv",
+          "ms": 0.793112,
+          "change_percent": -2.35465,
+          "exact_output_state_history": true,
+          "guards": true
+        },
+        {
+          "case": "gdn",
+          "rows": 65,
+          "variant": "qkv-first-serial",
+          "ms": 0.808166,
+          "change_percent": -0.501317,
+          "exact_output_state_history": true,
+          "guards": true
+        },
+        {
+          "case": "gdn",
+          "rows": 512,
+          "variant": "serial",
+          "ms": 2.05581,
+          "cached": false
+        },
+        {
+          "case": "gdn",
+          "rows": 512,
+          "variant": "z-after-qkv",
+          "ms": 2.04718,
+          "change_percent": -0.419396,
+          "exact_output_state_history": true,
+          "guards": true
+        },
+        {
+          "case": "gdn",
+          "rows": 512,
+          "variant": "z-with-qkv",
+          "ms": 2.0894,
+          "change_percent": 1.63422,
+          "exact_output_state_history": true,
+          "guards": true
+        },
+        {
+          "case": "gdn",
+          "rows": 512,
+          "variant": "qkv-first-serial",
+          "ms": 2.05592,
+          "change_percent": 0.00560284,
+          "exact_output_state_history": true,
+          "guards": true
+        },
+        {
+          "case": "gdn",
+          "rows": 2048,
+          "variant": "serial",
+          "ms": 7.8903,
+          "cached": false
+        },
+        {
+          "case": "gdn",
+          "rows": 2048,
+          "variant": "z-after-qkv",
+          "ms": 7.84739,
+          "change_percent": -0.543839,
+          "exact_output_state_history": true,
+          "guards": true
+        },
+        {
+          "case": "gdn",
+          "rows": 2048,
+          "variant": "z-with-qkv",
+          "ms": 7.93047,
+          "change_percent": 0.509071,
+          "exact_output_state_history": true,
+          "guards": true
+        },
+        {
+          "case": "gdn",
+          "rows": 2048,
+          "variant": "qkv-first-serial",
+          "ms": 7.90913,
+          "change_percent": 0.238705,
+          "exact_output_state_history": true,
+          "guards": true
+        }
+      ],
+      "provenance_sha256": "2243bd6693ff51925e0123ba469bb5a275caedf071d23e35f28815c31f877e9e"
+    },
+    {
+      "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-stream-resource-nix101",
+      "health_PASS": true,
+      "records": [
+        {
+          "case": "gdn",
+          "rows": 512,
+          "variant": "serial",
+          "ms": 2.05581,
+          "cached": true
+        },
+        {
+          "case": "gdn",
+          "rows": 512,
+          "variant": "z-256x128-k32",
+          "ms": 2.11567,
+          "change_percent": 2.91202,
+          "exact_output_state_history": true,
+          "guards": true
+        },
+        {
+          "case": "gdn",
+          "rows": 512,
+          "variant": "z-128x256-k32",
+          "ms": 2.06053,
+          "change_percent": 0.229561,
+          "exact_output_state_history": true,
+          "guards": true
+        },
+        {
+          "case": "gdn",
+          "rows": 512,
+          "variant": "z-128x128-k32",
+          "ms": 2.16346,
+          "change_percent": 5.23651,
+          "exact_output_state_history": true,
+          "guards": true
+        },
+        {
+          "case": "gdn",
+          "rows": 512,
+          "variant": "grouped-heterogeneous",
+          "ms": 2.1059,
+          "change_percent": 2.43664,
+          "exact_output_state_history": true,
+          "guards": true
+        },
+        {
+          "case": "gdn",
+          "rows": 2048,
+          "variant": "serial",
+          "ms": 7.8903,
+          "cached": true
+        },
+        {
+          "case": "gdn",
+          "rows": 2048,
+          "variant": "z-256x128-k32",
+          "ms": 8.29745,
+          "change_percent": 5.1602,
+          "exact_output_state_history": true,
+          "guards": true
+        },
+        {
+          "case": "gdn",
+          "rows": 2048,
+          "variant": "z-128x256-k32",
+          "ms": 8.10486,
+          "change_percent": 2.71925,
+          "exact_output_state_history": true,
+          "guards": true
+        },
+        {
+          "case": "gdn",
+          "rows": 2048,
+          "variant": "z-128x128-k32",
+          "ms": 8.23299,
+          "change_percent": 4.34318,
+          "exact_output_state_history": true,
+          "guards": true
+        },
+        {
+          "case": "gdn",
+          "rows": 2048,
+          "variant": "grouped-heterogeneous",
+          "ms": 8.03178,
+          "change_percent": 1.79305,
+          "exact_output_state_history": true,
+          "guards": true
+        },
+        {
+          "case": "qkv",
+          "rows": 65,
+          "variant": "serial",
+          "ms": 0.685226,
+          "cached": false
+        },
+        {
+          "case": "qkv",
+          "rows": 65,
+          "variant": "kv-side",
+          "ms": 0.51715,
+          "change_percent": -24.5286,
+          "exact": true,
+          "guards": true
+        },
+        {
+          "case": "qkv",
+          "rows": 65,
+          "variant": "q-side",
+          "ms": 0.514156,
+          "change_percent": -24.9655,
+          "exact": true,
+          "guards": true
+        },
+        {
+          "case": "qkv",
+          "rows": 65,
+          "variant": "grouped-heterogeneous",
+          "ms": 0.520717,
+          "change_percent": -24.008,
+          "exact": true,
+          "guards": true
+        },
+        {
+          "case": "qkv",
+          "rows": 512,
+          "variant": "serial",
+          "ms": 1.17504,
+          "cached": false
+        },
+        {
+          "case": "qkv",
+          "rows": 512,
+          "variant": "kv-side",
+          "ms": 1.19248,
+          "change_percent": 1.48438,
+          "exact": true,
+          "guards": true
+        },
+        {
+          "case": "qkv",
+          "rows": 512,
+          "variant": "q-side",
+          "ms": 1.16679,
+          "change_percent": -0.70194,
+          "exact": true,
+          "guards": true
+        },
+        {
+          "case": "qkv",
+          "rows": 512,
+          "variant": "grouped-heterogeneous",
+          "ms": 1.19523,
+          "change_percent": 1.71834,
+          "exact": true,
+          "guards": true
+        },
+        {
+          "case": "qkv",
+          "rows": 2048,
+          "variant": "serial",
+          "ms": 4.40757,
+          "cached": false
+        },
+        {
+          "case": "qkv",
+          "rows": 2048,
+          "variant": "kv-side",
+          "ms": 4.27553,
+          "change_percent": -2.99571,
+          "exact": true,
+          "guards": true
+        },
+        {
+          "case": "qkv",
+          "rows": 2048,
+          "variant": "q-side",
+          "ms": 4.28673,
+          "change_percent": -2.74146,
+          "exact": true,
+          "guards": true
+        },
+        {
+          "case": "qkv",
+          "rows": 2048,
+          "variant": "grouped-heterogeneous",
+          "ms": 4.29973,
+          "change_percent": -2.44666,
+          "exact": true,
+          "guards": true
+        }
+      ],
+      "provenance_sha256": "80cd465f9affa685ae001d3261350b28f8509d9b5f9a232ef51d19e9e474b844"
+    },
+    {
+      "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-stream-moe-nix101",
+      "health_PASS": true,
+      "records": [
+        {
+          "case": "moe",
+          "rows": 512,
+          "variant": "serial",
+          "ms": 8.61897,
+          "cached": false
+        },
+        {
+          "case": "moe",
+          "rows": 512,
+          "variant": "shared-side",
+          "ms": 8.55525,
+          "change_percent": -0.739296,
+          "exact": true,
+          "guards": true
+        },
+        {
+          "case": "moe",
+          "rows": 512,
+          "variant": "gate-up-streams",
+          "ms": 8.6097,
+          "change_percent": -0.107597,
+          "exact": true,
+          "guards": true
+        },
+        {
+          "case": "moe",
+          "rows": 2048,
+          "variant": "serial",
+          "ms": 15.0755,
+          "cached": false
+        },
+        {
+          "case": "moe",
+          "rows": 2048,
+          "variant": "shared-side",
+          "ms": 14.7609,
+          "change_percent": -2.08658,
+          "exact": true,
+          "guards": true
+        },
+        {
+          "case": "moe",
+          "rows": 2048,
+          "variant": "gate-up-streams",
+          "ms": 14.9834,
+          "change_percent": -0.61087,
+          "exact": true,
+          "guards": true
+        }
+      ],
+      "provenance_sha256": "23cbea2634af9a0dd0bf2ab6af34ff413bb3c98004c4fb28969be4608ce652d3"
+    },
+    {
+      "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-stream-branches-nix101",
+      "health_PASS": true,
+      "records": [
+        {
+          "case": "qkv",
+          "rows": 65,
+          "variant": "serial",
+          "ms": 0.692416,
+          "cached": false
+        },
+        {
+          "case": "qkv",
+          "rows": 65,
+          "variant": "kv-projection-side",
+          "ms": 0.538684,
+          "change_percent": -22.2023,
+          "exact": true,
+          "guards": true
+        },
+        {
+          "case": "qkv",
+          "rows": 65,
+          "variant": "kv-branch-side",
+          "ms": 0.521907,
+          "change_percent": -24.6252,
+          "exact": true,
+          "guards": true
+        },
+        {
+          "case": "qkv",
+          "rows": 65,
+          "variant": "q-branch-side",
+          "ms": 0.528247,
+          "change_percent": -23.7095,
+          "exact": true,
+          "guards": true
+        },
+        {
+          "case": "qkv",
+          "rows": 512,
+          "variant": "serial",
+          "ms": 1.30607,
+          "cached": false
+        },
+        {
+          "case": "qkv",
+          "rows": 512,
+          "variant": "kv-projection-side",
+          "ms": 1.32108,
+          "change_percent": 1.1495,
+          "exact": true,
+          "guards": true
+        },
+        {
+          "case": "qkv",
+          "rows": 512,
+          "variant": "kv-branch-side",
+          "ms": 1.30999,
+          "change_percent": 0.300443,
+          "exact": true,
+          "guards": true
+        },
+        {
+          "case": "qkv",
+          "rows": 512,
+          "variant": "q-branch-side",
+          "ms": 1.30251,
+          "change_percent": -0.272518,
+          "exact": true,
+          "guards": true
+        },
+        {
+          "case": "qkv",
+          "rows": 2048,
+          "variant": "serial",
+          "ms": 5.18853,
+          "cached": false
+        },
+        {
+          "case": "qkv",
+          "rows": 2048,
+          "variant": "kv-projection-side",
+          "ms": 5.07193,
+          "change_percent": -2.24735,
+          "exact": true,
+          "guards": true
+        },
+        {
+          "case": "qkv",
+          "rows": 2048,
+          "variant": "kv-branch-side",
+          "ms": 5.06726,
+          "change_percent": -2.33731,
+          "exact": true,
+          "guards": true
+        },
+        {
+          "case": "qkv",
+          "rows": 2048,
+          "variant": "q-branch-side",
+          "ms": 5.06312,
+          "change_percent": -2.41719,
+          "exact": true,
+          "guards": true
+        }
+      ],
+      "provenance_sha256": "33111b8aa542ce2d8abfcc3e5801efd565102d88c428244d270b0fd0fb345607"
+    },
+    {
+      "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-kvarn-registers-nix101",
+      "health_PASS": true,
+      "records": [
+        {
+          "groups": 1,
+          "baseline_ms": 0.116067,
+          "candidate_ms": 0.10436,
+          "change_percent": -10.0864,
+          "records_prefix_guards_exact": true
+        },
+        {
+          "groups": 4,
+          "baseline_ms": 0.116459,
+          "candidate_ms": 0.112471,
+          "change_percent": -3.42421,
+          "records_prefix_guards_exact": true
+        },
+        {
+          "groups": 16,
+          "baseline_ms": 0.380499,
+          "candidate_ms": 0.32808,
+          "change_percent": -13.7762,
+          "records_prefix_guards_exact": true
+        }
+      ],
+      "provenance_sha256": "b1c35060c70e4c260fd3840f28261c0e933c9ef16975a2c87bd6a71e2a22c0ba"
+    }
+  ]
+}

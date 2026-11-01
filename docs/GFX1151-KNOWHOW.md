@@ -976,3 +976,86 @@ Existing padding-skip already avoids unused WMMAs; four classes reduce staged
 B rows22.21%, but only5.72% beyond split32. The older split32 health-failed
 window remains advisory; this new healthy compact test closes the distinct
 partition/LDS-pressure idea. [Search status and limits](../plan/exl3/F3-SEARCH-STATUS.md).
+
+### Flash-Next stream scheduling screens (2026-11-01, initial operator evidence)
+
+Healthy pinned Nix10.1 screens reused controls and exact production matrix
+objects. At2048 rows, Q-side Q/KV projections improved4.40757→4.28673ms(2.74%);
+shared MLP beside raw routed MoE+combine improved15.0755→14.7609ms(2.09%).
+These are candidates, not model throughput claims. Shared/routed excludes
+router/top-k; production integration starts shared before those operations.
+At512 rows these gains were only.70/.74%. Grouped heterogeneous Q/KV was
+slightly slower than streams, so no extra GEMM batching mode is promoted.
+
+GDN late Z only gained.54%(7.89030→7.84739ms); simultaneous Z lost.51%.
+The GDN screen freezes alpha/beta and excludes their projection. Smaller-LDS
+Z tiles lost2.72–5.16%, grouped GDN lost1.79%; fewer resources did not produce
+a better complete span. Routed gate/up overlap gained only.61%; sharing the
+single side stream with simultaneous shared/routed work would be unsafe.
+
+Expanding Q/KV overlap through norm/RoPE/cache preparation gained2.34–2.42%
+against5.18853ms, versus2.25% for the projection-only fork in that same scope.
+The extra refactor is not justified by that small difference. Attention and
+KVarN quantization were excluded. The65-row projection/branch gains24–25% are
+not extrapolated to large-model prefill. All candidate outputs/guards were
+exact, including GDN recurrent/history state and immutable KV prefix. Details,
+512-row results and provenance: [stream ledger](../plan/exl3/F3-STREAM-OVERLAP.md).
+
+### Actual release resources and KVarN register selection (2026-11-01)
+
+Static extraction of the qualified115MB release ELF covers3383 kernels. All79
+EXL3 prefill matrix specializations have zero private bytes and zero SGPR/VGPR
+spill counts; max219VGPR, routed128×64/128×128 use105/149 and dense K7 256²188.
+Relevant plain F16, HC and GDN kernels also have no private/spills. This does
+not describe the whole binary: SelectScore retains18SGPR spills/private0,
+unrelated Q4_K has16Bprivate/3VGPR spills, and packed fused F16 attention has
+544Bprivate but is outside the current EXL3 separate-QKV dispatch. No new
+spill-driven fission of those hot matrix kernels is justified by this audit.
+
+KVarN group/boundary quantizers have80Bprivate despite zero spill counters.
+ISA shows34static scratch accesses: the compiler reconstructs indexed reads
+of two eight-element standard-deviation arrays. Unconditional empty `+v`
+barriers after the unrolled selections keep them in registers without changing
+arithmetic. The copied matching-flags prototype has0private,166VGPR vs162,
+unchanged36096B LDS and no spills. Actual-release-control screen:1/4/16groups
+.116067/.116459/.380499→.104360/.112471/.328080ms (−10.09/−3.42/−13.78%).
+All quantized record bytes, prefix and guards match; health_PASS. New matched
+controls are saved once. Production qualification and selection follow below.
+
+The saved hc7 profile puts this quantizer at10.13ms/24calls versus987+726ms
+for its two largest matrix entries; it is a bounded cleanup, not a claim of
+large whole-model speedup. No new profile was collected.
+[Actual release audit and screen provenance](../plan/exl3/F3-RELEASE-RESOURCE-AUDIT.json).
+
+### Whole-model stream selection and final closure (2026-11-02)
+
+Do not promote the initial Q/shared combination: it was exact but measured
+pp5121047.19, pp20481393.02, pp81921423.83, d32K1274.65tok/s, losing
+1.49/1.66/1.63/1.27% to saved controls. Same-allocation pp2048 isolation gave
+quantizer-only1417.09±1.37, Q-only1417.67±.20, shared-only1425.06±.51.
+Separate Q event handles still gave1399.91±.26. The interaction's cause is
+unproved; independent local wins did not compose. The first isolation attempt
+failed to mount model metadata and ran no inference; it is not a timing sample.
+
+Retain shared/routed overlap plus register selection, restore baseline Q/KV
+launching, and remove the extra Q scheduling/events/counter. Final actual image
+`f3-shared5-703d3e77-rocm101` qualified COMPLETE/health_PASS:
+
+| Case | Saved baseline | Final tok/s | Change |
+|---|---:|---:|---:|
+| pp512 |1063.05±.22|1068.58±3.09|+.52%|
+| pp2048 |1416.51±.82|1429.13±1.13|+.89%|
+| pp8192 |1447.47±1.36|1460.97±.73|+.93%|
+| pp2048,d32K |1291.03±1.09|1301.99±1.41|+.85%|
+
+Final-image1025-row test covers two full512-row chunks, four shared forks, a
+serial tail, all residuals/logits and GDN state against the serial fallback.
+Both KVarN format CPU-oracle code/scale tests pass; allfour final quantizers
+have0private/spills. Supporting32760-record/64replay FP16-KV collector evidence
+is reused from the combined image: retained MoE source matches and Q code is
+restored baseline. No fresh fullcollector on the cleaned image is claimed.
+KVarN performance usesk4v4; its correctness is separate operator evidence.
+Baseline inference/profile runs:0. Target2000 remains unmet.
+
+[All bounded numeric records](../plan/exl3/F3-STREAM-SCREENS.json),
+[whole-model qualification and scope bridge](../plan/exl3/F3-STREAM-QUALIFICATION.json).

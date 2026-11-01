@@ -1,7 +1,7 @@
 # F3 prefill search status, 2026-11-01
 
-The qualified result is **1416.51 ±0.82 tok/s at pp2048**. The target of
-2000 tok/s is **not reached**: it would still require about 41% more throughput,
+The qualified result is **1429.13 ±1.13 tok/s at pp2048**. The target of
+2000 tok/s is **not reached**: it would still require about 40% more throughput,
 or 29% lower latency. No claim of hardware impossibility is made.
 
 The current continuation has screened the concrete matrix mechanisms supported
@@ -16,9 +16,13 @@ profile merely to rediscover the same bottlenecks.
 2. Aligned singleton parent-output slicing with the original trellis K-stride.
 3. K7 singleton 6144→2560/R2048 token-first tile traversal.
 
-Starting saved batch 1400.15→final 1416.51 tok/s is +1.17%. Other qualified
-prefill cases are pp512 1063.05, pp8192 1447.47 and d32K pp2048 1291.03 tok/s.
-All existing TG/MTP work remains. [Qualification and accuracy scopes](F3-PREFILL-GRID.md).
+4. Early shared EXL3 MLP beside router/routed MoE, with dedicated operands.
+5. KVarN register selection removes80B private arrays without changing arithmetic.
+
+Starting saved batch1400.15→final1429.13 is+2.07%; the stream/private-memory
+batch alone improves1416.51→1429.13(+.89%). Other final cases: pp5121068.58,
+pp81921460.97 and d32Kpp20481301.99. TG/MTP work remains.
+[Final selection and exactness scopes](F3-STREAM-QUALIFICATION.json).
 
 ## Evidence against the tested alternatives
 
@@ -50,21 +54,21 @@ Neither can become a win by adding the omitted device partition-builder cost.
 
 ## Open research boundaries
 
-- **EXL3 stream schedules remain untested.** The matrix screen and older generic
-  two-stream probe do not cover GDN Z beside recurrence, shared versus routed
-  MoE, Q versus grouped K/V, or routed gate versus up. The
-  [dependency and buffer audit](F3-STREAM-OVERLAP.md) puts GDN Z first, then
-  shared/routed overlap, with explicit fork/join and scratch-lifetime rules.
-  No fresh profiling or performance claim accompanies this source audit.
-
+- **EXL3 stream schedules have whole-model qualification.**
+  Shared/routed MoE is retained. Q/KV alone is neutral and its combination
+  with shared overlap regressed; dedicated events did not fix it. GDN Z alone,
+  smaller-LDS Z, heterogeneous grouping and routed gate/up have weak or negative
+  evidence. See the [stream ledger](F3-STREAM-OVERLAP.md). GDN alpha/beta and
+  broader dependency schedules remain separate research leads.
 - Stream-K remains unimplemented. It changes reduction structure and needs a
   fresh numerical/quality argument; existing full-grid/persistent results do
   not establish a useful scheduling tail to recover. It is not a validated
   route to the remaining 29% latency reduction.
-- Paired gate/up launches remain shelved with an unmeasured estimate of
-  10–20 ms per pass. Independent expert input rotations limit operand reuse.
+- Single-launch grouped routed gate/up remains shelved with an unmeasured
+  10–20ms-per-pass estimate; this differs from the measured two-stream screen.
+  Independent expert input rotations limit operand reuse.
   HC combine/mix gather latency also remains incompletely explained. Neither
-  has a demonstrated fix approaching the additional 422 ms per pass required;
+  has a demonstrated fix approaching the additional 409 ms per pass required;
   they are not represented as measured failures or as solved problems.
 - A new matrix algorithm or instruction schedule could still improve things.
   Existing measurements show WMMA/VALU competition and LDS/core limits; neither
@@ -78,6 +82,12 @@ Neither can become a win by adding the omitted device partition-builder cost.
   version, future compiler or different hardware.
 
 ## Register pressure and kernel fission
+
+The actual preserved release has now been audited: all79 EXL3 matrix variants
+have zero private bytes and both spill counters zero. KVarN's80B addressable
+arrays were removed and qualified; selector18SGPR spills/private0 and unrelated
+fused attention/Q4_K exceptions remain explicitly scoped. See the
+[actual release audit](F3-RELEASE-RESOURCE-AUDIT.json). Do not repeat it unchanged.
 
 This is an explicit candidate direction, not a diagnosis that the current
 prefill bottleneck is spilling. The saved Nix ROCm 10.1 stage-screen assembly

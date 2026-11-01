@@ -1036,6 +1036,8 @@ int main(int argc, char** argv) {
     TestWrite();
     for (const int bits : {2, 4}) {
       TestFlush(bits);
+      if (argc > 1 && std::string_view(argv[1]) == "quantize")
+        continue;
       struct Case {
         unsigned groups, tail, rows, splits;
         bool device_position;

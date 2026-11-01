@@ -544,6 +544,8 @@ public:
     /// separately.
     std::uint64_t prefill_dense_rows{0}, prefill_dense_rotation_groups{0},
         prefill_dense_gemm_groups{0}, prefill_plain_rows{0};
+    /// Prefill forks actually queued for the shared MLP.
+    std::uint64_t prefill_shared_overlaps{0};
     /// Plain prefill rows using FP16 WMMA, including singleton/tail chunks.
     std::uint64_t prefill_plain_half_rows{0};
     /// Exclusive call wall times. draft_ms/catch_up_ms include inline heads;
@@ -860,9 +862,18 @@ private:
   Exl3Scratch exl3_{};
   gufo::hip::Exl3RotateProblem* exl3_dense_rotations_{nullptr};
   gufo::hip::Exl3GemmProblem* exl3_dense_gemms_{nullptr};
+  struct Exl3DenseWorkspace {
+    std::uint16_t* input{nullptr};
+    std::size_t elements{0};
+    gufo::hip::Exl3RotateProblem* rotations{nullptr};
+    gufo::hip::Exl3GemmProblem* gemms{nullptr};
+  };
+  Exl3DenseWorkspace exl3_shared_workspace_{};
   bool Exl3DensePrefill(std::initializer_list<const DeviceTensor*> weights,
                         std::initializer_list<float*> outputs, const float* x,
-                        std::uint32_t rows, std::string* error) const;
+                        std::uint32_t rows, std::string* error,
+                        const Exl3DenseWorkspace* workspace = nullptr,
+                        hipStream_t launch_stream = nullptr) const;
   Exl3PrefillScratch exl3_prefill_{};
   std::size_t exl3_prefill_scratch_bytes_{0};
   [[nodiscard]] Exl3PrefillScratch Exl3PrefillView() const;

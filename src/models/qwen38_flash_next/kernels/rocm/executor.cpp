@@ -1139,6 +1139,17 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     e->exl3_dense_rotations_ =
         Alloc<gufo::hip::Exl3RotateProblem>(a, 3, error_msg);
     e->exl3_dense_gemms_ = Alloc<gufo::hip::Exl3GemmProblem>(a, 3, error_msg);
+    if (e->options_.max_batch >= 512) {
+      // Shared EXL3 projections may run beside routed prefill. Their rotated
+      // operands and descriptors must not borrow either routed or x_half space.
+      auto& shared = e->exl3_shared_workspace_;
+      shared.elements = std::size_t{e->options_.max_batch} *
+                        std::max(std::size_t{2} * c.hidden_size,
+                                 std::size_t{c.shared_expert_ff});
+      shared.input = Alloc<std::uint16_t>(a, shared.elements, error_msg);
+      shared.rotations = Alloc<gufo::hip::Exl3RotateProblem>(a, 3, error_msg);
+      shared.gemms = Alloc<gufo::hip::Exl3GemmProblem>(a, 3, error_msg);
+    }
     ex.head_segments =
         Alloc<std::uint32_t>(a, kMtpDraftExtraRows + 1, error_msg);
     ex.head_values = f32(c.vocab_size + std::size_t{kMtpDraftExtraRows} * 128);
@@ -2019,7 +2030,11 @@ bool Executor::DenseF16Route(const DeviceTensor& w,
 bool Executor::Exl3DensePrefill(
     std::initializer_list<const DeviceTensor*> weights,
     std::initializer_list<float*> outputs, const float* x, std::uint32_t rows,
-    std::string* error) const {
+    std::string* error, const Exl3DenseWorkspace* workspace,
+    hipStream_t launch_stream) const {
+  const auto execution = launch_stream != nullptr ? launch_stream : stream_;
+  auto* rotations = exl3_dense_rotations_;
+  auto* gemms = exl3_dense_gemms_;
   try {
     if (weights.size() == 0 || weights.size() != outputs.size() ||
         weights.size() > 3)
@@ -2065,9 +2080,9 @@ bool Executor::Exl3DensePrefill(
       return std::pair{a.weight->exl3->n, a.weight->exl3->rate.bits} <
              std::pair{b.weight->exl3->n, b.weight->exl3->rate.bits};
     });
-    // Routed prefill and dense projections never overlap. Reuse the larger
-    // of their existing FP16 slabs; even tiny configured batches retain the
-    // decode slab (24 * widest K). No second chunk-sized activation allocation.
+    // Main-stream dense work reuses the larger routed/decode FP16 slab.
+    // Concurrent shared experts supply their own operands and descriptors.
+    // Tiny batches still retain the decode slab (24 * widest K).
     auto* rotated = exl3_prefill_.input;
     std::size_t capacity = std::size_t{exl3_prefill_.max_assignments} *
                            std::max(config().hidden_size, config().expert_ff);
@@ -2075,10 +2090,16 @@ bool Executor::Exl3DensePrefill(
       rotated = exl3_.projection.fast_input;
       capacity = exl3_.projection.fast_input_elements;
     }
+    if (workspace != nullptr) {
+      rotated = workspace->input;
+      capacity = workspace->elements;
+      rotations = workspace->rotations;
+      gemms = workspace->gemms;
+    }
     const auto piece = static_cast<std::uint32_t>(
         std::min<std::size_t>(options_.max_batch, capacity / (count * k)));
-    if (rotated == nullptr || piece == 0 || exl3_dense_rotations_ == nullptr ||
-        exl3_dense_gemms_ == nullptr)
+    if (rotated == nullptr || piece == 0 || rotations == nullptr ||
+        gemms == nullptr)
       throw std::runtime_error("EXL3 dense prefill exceeds rotation scratch");
     for (std::uint32_t first = 0; first < rows; first += piece) {
       const auto n = std::min(piece, rows - first);
@@ -2102,11 +2123,9 @@ bool Executor::Exl3DensePrefill(
                        n,
                        direct_slice ? l.n : 0};
       }
-      PrepareExl3DensePrefill(std::span(problems.data(), count),
-                              exl3_dense_rotations_, exl3_dense_gemms_,
-                              stream_);
-      gufo::hip::LaunchExl3RotateRowsGrouped(exl3_dense_rotations_, count, n, k,
-                                             stream_);
+      PrepareExl3DensePrefill(std::span(problems.data(), count), rotations,
+                              gemms, execution);
+      gufo::hip::LaunchExl3RotateRowsGrouped(rotations, count, n, k, execution);
       for (std::size_t begin = 0; begin < count;) {
         const auto& l = *targets[begin].weight->exl3;
         auto end = begin + 1;
@@ -2116,9 +2135,9 @@ bool Executor::Exl3DensePrefill(
         // Always X3, including a singleton/tail; a GEMV row threshold would
         // change the reduction tree when a prompt/checkpoint chunk moves.
         gufo::hip::LaunchExl3PrefillGemmGrouped(
-            exl3_dense_gemms_ + begin, end - begin, n, k,
+            gemms + begin, end - begin, n, k,
             direct_slice ? targets[begin].weight->rows : l.n, l.rate, false,
-            stream_, direct_slice);
+            execution, direct_slice);
         if (diagnostics_active_)
           ++cycle_diagnostics_.prefill_dense_gemm_groups;
         begin = end;
@@ -2132,7 +2151,7 @@ bool Executor::Exl3DensePrefill(
                          exl3_.slice + t.weight->output_begin,
                          t.weight->exl3->n * sizeof(float),
                          t.weight->rows * sizeof(float), n,
-                         hipMemcpyDeviceToDevice, stream_),
+                         hipMemcpyDeviceToDevice, execution),
                      "EXL3 dense prefill slice", error))
             return false;
         }
@@ -3652,6 +3671,52 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
                    bool last_only) const {
   const Config& c = config();
   const std::uint32_t used = c.num_experts_used;
+  // This guard must precede the early shared fork: router failures must
+  // still order all side writes before a subsequent pass reuses scratch.
+  struct JoinGuard {
+    const Executor* executor;
+    ~JoinGuard() { (void)executor->JoinSide(nullptr); }
+  } join_guard{this};
+  const auto full_exl3 = [](const DeviceTensor& w) {
+    return w.exl3 != nullptr && w.experts == 1 && w.output_begin == 0 &&
+           w.rows == w.exl3->n && w.cols == w.exl3->k;
+  };
+  const bool exl3_overlap = prefill_phase && !last_only && n_tokens >= 512 &&
+                            exl3_shared_workspace_.input != nullptr &&
+                            n_tokens <= options_.max_batch &&
+                            full_exl3(l.shexp_gate) && full_exl3(l.shexp_up) &&
+                            full_exl3(l.shexp_down);
+  if (exl3_overlap) {
+    if (!Check(hipEventRecord(side_start_, stream_), "shared EXL3 fork",
+               error_msg) ||
+        !Check(hipStreamWaitEvent(side_stream_, side_start_, 0),
+               "shared EXL3 wait", error_msg))
+      return false;
+    shexp_half_ready_ = false;
+    const auto shared = [&] {
+      if (!Exl3DensePrefill({&l.shexp_gate, &l.shexp_up},
+                            {s_.shexp_up, s_.shexp_gate}, x, n_tokens,
+                            error_msg, &exl3_shared_workspace_, side_stream_))
+        return false;
+      Swiglu(s_.shexp_up, s_.shexp_gate,
+             std::size_t{n_tokens} * l.shexp_gate.rows, side_stream_);
+      return Exl3DensePrefill({&l.shexp_down}, {s_.shexp_out}, s_.shexp_up,
+                              n_tokens, error_msg, &exl3_shared_workspace_,
+                              side_stream_);
+    };
+    const bool shared_ok = shared();
+    // Even a partial enqueue must be joined on every exit.
+    if (!Check(hipEventRecord(side_done_, side_stream_), "shared EXL3 join",
+               error_msg)) {
+      (void)hipStreamSynchronize(side_stream_);
+      return false;
+    }
+    side_pending_ = true;
+    if (!shared_ok)
+      return false;
+    if (diagnostics_active_)
+      ++cycle_diagnostics_.prefill_shared_overlaps;
+  }
   // Router logits and the shared-expert gate come out of one GEMM.
   if (!Dense(l.router, x, s_.router, n_tokens, error_msg)) {
     return false;
@@ -3677,11 +3742,10 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   // which leave compute idle while they stream expert weights. The shared
   // expert writes its own scratch and may quantize x into s_.x_q8t, so no
   // main-stream work may use s_.x_q8t before JoinSide.
-  // Only the Q8_0 shared expert overlaps: its kernels take stream_, while
-  // the BF16, F16 and F32 routes go through BLAS handles bound to the main
-  // stream.
-  const bool overlap = ExpertMatrixRows(n_tokens) && !last_only &&
-                       l.shexp_gate.type == GgmlType::kQ8_0 &&
+  // The legacy path below overlaps Q8_0; EXL3 uses the explicit-stream
+  // workspace above. Other routes retain their original stream ownership.
+  const bool overlap = !exl3_overlap && ExpertMatrixRows(n_tokens) &&
+                       !last_only && l.shexp_gate.type == GgmlType::kQ8_0 &&
                        l.shexp_up.type == GgmlType::kQ8_0 &&
                        l.shexp_down.type == GgmlType::kQ8_0;
   const hipStream_t main = stream_;
@@ -3716,7 +3780,7 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
     }
     return Dense(l.shexp_down, s_.shexp_up, s_.shexp_out, n_tokens, error_msg);
   };
-  const bool shared_ok = shared_expert();
+  const bool shared_ok = exl3_overlap || shared_expert();
   stream_ = main;
   if (overlap) {
     if (!Check(hipEventRecord(side_done_, side_stream_), "side stream join",
@@ -3727,12 +3791,6 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
     }
     side_pending_ = true;
   }
-  // Every exit, including errors, orders the main stream after the shared
-  // expert: its side-stream writes must not race the next pass.
-  struct JoinGuard {
-    const Executor* executor;
-    ~JoinGuard() { (void)executor->JoinSide(nullptr); }
-  } join_guard{this};
   if (!shared_ok) {
     return false;
   }
@@ -3762,9 +3820,11 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
 bool Executor::JoinSide(std::string* error_msg) const {
   if (!side_pending_)
     return true;
+  const auto status = hipStreamWaitEvent(stream_, side_done_, 0);
+  if (status != hipSuccess)
+    (void)hipStreamSynchronize(side_stream_);
   side_pending_ = false;
-  return Check(hipStreamWaitEvent(stream_, side_done_, 0),
-               "side stream join wait", error_msg);
+  return Check(status, "side stream join wait", error_msg);
 }
 
 bool Executor::WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const {

@@ -83,6 +83,8 @@ if (ENGINE_ENABLE_HIP)
     COMMAND qwen38_flash_next_exl3_ops_test --plain-prefill-only)
   add_test(NAME qwen38_flash_next.exl3_gdn_prefill
     COMMAND qwen38_flash_next_exl3_ops_test --gdn-prefill-only)
+  add_test(NAME qwen38_flash_next.exl3_prefill_overlap
+    COMMAND qwen38_flash_next_exl3_ops_test --prefill-overlap-only)
   add_test(NAME qwen38_flash_next.exl3_prefill_scratch
     COMMAND qwen38_flash_next_exl3_ops_test --prefill-scratch-only)
   set_tests_properties(qwen38_flash_next.exl3_prefill_scratch PROPERTIES
@@ -95,6 +97,7 @@ if (ENGINE_ENABLE_HIP)
     qwen38_flash_next.exl3_dense_prefill
     qwen38_flash_next.exl3_plain_prefill
     qwen38_flash_next.exl3_gdn_prefill
+    qwen38_flash_next.exl3_prefill_overlap
     PROPERTIES LABELS "qwen38_flash_next;hip;gpu;gfx1151;exl3")
   # The rope phase and RMS checks compare against the scalar CPU oracle.
   target_link_libraries(qwen38_flash_next_attention_ops_test PRIVATE

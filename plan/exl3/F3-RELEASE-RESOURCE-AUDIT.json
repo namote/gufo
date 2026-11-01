@@ -1,0 +1,327 @@
+{
+  "scope": "preserved qualified release binary; static code-object metadata, no GPU run",
+  "baseline_binary_sha256": "2e15b736d3fd401b5ffed14b628dee6115d9a47724c8f12a274f1c9e9cb066e5",
+  "all_kernel_count": 3453,
+  "inventory": "build/f3-release-resources/INVENTORY.json",
+  "isa": "build/f3-release-resources/flash-next-disasm.txt",
+  "selected_kernels": [
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_125KvarnQuantizeGroupsKernelEPK6__halfS6_mPhmPKjjjj",
+      "private_segment_fixed_size": 80,
+      "vgpr_count": 162,
+      "sgpr_count": 75,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 36096
+    },
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_127KvarnQuantizeBoundaryKernelEPK6__halfS6_PhPKjjS9_j",
+      "private_segment_fixed_size": 80,
+      "vgpr_count": 162,
+      "sgpr_count": 72,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 36096
+    },
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_117SelectScoreKernelEPKfPK6__halfPfjPKjjjjjSB_",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 163,
+      "sgpr_count": 106,
+      "sgpr_spill_count": 18,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 0
+    },
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_119HcMixEpilogueKernelILj4EEEvPKfS6_S6_PfS7_jjPv",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 31,
+      "sgpr_count": 30,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 256
+    },
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_119HcMixEpilogueKernelILj0EEEvPKfS6_S6_PfS7_jjPv",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 89,
+      "sgpr_count": 60,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 256
+    },
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_123HcMixEpilogueVec4KernelIfLb0EEEvPKT_PKfS9_PfSA_jS9_S9_",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 38,
+      "sgpr_count": 26,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 128
+    },
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_123HcMixEpilogueVec4KernelIfLb1EEEvPKT_PKfS9_PfSA_jS9_S9_",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 38,
+      "sgpr_count": 34,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 128
+    },
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_122HcMixEpilogueF16KernelILb1EEEvPK6__halfPKfS9_PfPS5_PvSA_j",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 100,
+      "sgpr_count": 28,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 128
+    },
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_123HcMixEpilogueVec4KernelI6__halfLb0EEEvPKT_PKfSA_PfSB_jSA_SA_",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 38,
+      "sgpr_count": 26,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 128
+    },
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_119HcCombineVec4KernelIfLb0ELb0ELb1EEEvPfPKfS7_jS7_PT_PvjfS5_S7_S5_P6__halfS5_NS2_18Exl3PrefillMoeRowsE",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 96,
+      "sgpr_count": 54,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 10368
+    },
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_119HcCombineVec4KernelIfLb0ELb0ELb0EEEvPfPKfS7_jS7_PT_PvjfS5_S7_S5_P6__halfS5_NS2_18Exl3PrefillMoeRowsE",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 96,
+      "sgpr_count": 38,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 128
+    },
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_115HcCombineKernelIfEEvPfPKfS7_jS7_PT_PvjjfSA_",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 46,
+      "sgpr_count": 70,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 128
+    },
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_121HcCombineMoeF16KernelILb1ELb1ELb0EEEvPfPK6__halfPKfSA_SA_jjSA_jSA_PS6_PvjfSA_SA_SA_S5_",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 93,
+      "sgpr_count": 42,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 128
+    },
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_121HcCombineMoeF16KernelILb0ELb1ELb0EEEvPfPK6__halfPKfSA_SA_jjSA_jSA_PS6_PvjfSA_SA_SA_S5_",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 28,
+      "sgpr_count": 30,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 0
+    },
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_121HcCombineMoeF16KernelILb1ELb0ELb0EEEvPfPK6__halfPKfSA_SA_jjSA_jSA_PS6_PvjfSA_SA_SA_S5_",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 93,
+      "sgpr_count": 34,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 128
+    },
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_121HcCombineMoeF16KernelILb0ELb0ELb0EEEvPfPK6__halfPKfSA_SA_jjSA_jSA_PS6_PvjfSA_SA_SA_S5_",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 24,
+      "sgpr_count": 26,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 0
+    },
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_121HcCombineMoeF16KernelILb1ELb1ELb1EEEvPfPK6__halfPKfSA_SA_jjSA_jSA_PS6_PvjfSA_SA_SA_S5_",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 99,
+      "sgpr_count": 46,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 128
+    },
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_119HcCombineVec4KernelI6__halfLb1ELb1ELb0EEEvPfPKfS8_jS8_PT_PvjfS6_S8_S6_PS5_S6_NS2_18Exl3PrefillMoeRowsE",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 92,
+      "sgpr_count": 44,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 20608
+    },
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_119HcCombineVec4KernelI6__halfLb1ELb0ELb0EEEvPfPKfS8_jS8_PT_PvjfS6_S8_S6_PS5_S6_NS2_18Exl3PrefillMoeRowsE",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 92,
+      "sgpr_count": 32,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 128
+    },
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_119HcCombineVec4KernelI6__halfLb0ELb0ELb0EEEvPfPKfS8_jS8_PT_PvjfS6_S8_S6_PS5_S6_NS2_18Exl3PrefillMoeRowsE",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 92,
+      "sgpr_count": 32,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 128
+    },
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_115HcCombineKernelI6__halfEEvPfPKfS8_jS8_PT_PvjjfSB_",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 46,
+      "sgpr_count": 70,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 128
+    },
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_122HcMixEpilogueF16KernelILb0EEEvPK6__halfPKfS9_PfPS5_PvSA_j",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 84,
+      "sgpr_count": 20,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 128
+    },
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_117GdnRowSplitKernelILb1EEEvPKfS6_S6_PfS7_jjjNS2_13GdnCheckpointES6_jS6_S6_f",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 233,
+      "sgpr_count": 38,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 10400
+    },
+    {
+      "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_117GdnRowSplitKernelILb0EEEvPKfS6_S6_PfS7_jjjNS2_13GdnCheckpointES6_jS6_S6_f",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 205,
+      "sgpr_count": 34,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 10400
+    }
+  ],
+  "independent_review": {
+    "EXL3_HalfPrefill_specializations": 79,
+    "max_VGPR": 219,
+    "private_and_SGPR_VGPR_spills": 0,
+    "routed_128x64_VGPR": 105,
+    "routed_128x128_VGPR": 149,
+    "dense_K7_256x256_VGPR": 188
+  },
+  "exceptions": [
+    "Selector has18 SGPR spills but private0; retained earlier reduction from304.",
+    "Two fused F16 attention GEMMs have544B private but are outside current separate EXL3 Q/KV path.",
+    "One unrelated Q4_K HalfPrefill variant has16B private/3 VGPR spills.",
+    "KVarN group/boundary quantizers have80B private from dynamically indexed std arrays, not compiler-reported spills."
+  ],
+  "quantizer_candidate": {
+    "change": "Unconditional register barrier after each selected standard deviation; arithmetic unchanged",
+    "prototype_private_bytes": 0,
+    "prototype_VGPR": 166,
+    "prototype_SGPR_spills": 0,
+    "prototype_VGPR_spills": 0,
+    "LDS_bytes": 36096,
+    "baseline_VGPR": 162,
+    "screen_receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-kvarn-registers-nix101",
+    "health_PASS": true,
+    "records_prefix_guards_exact": true,
+    "groups1": {
+      "baseline_ms": 0.116067,
+      "candidate_ms": 0.10436,
+      "change_percent": -10.0864
+    },
+    "groups4": {
+      "baseline_ms": 0.116459,
+      "candidate_ms": 0.112471,
+      "change_percent": -3.42421
+    },
+    "groups16": {
+      "baseline_ms": 0.380499,
+      "candidate_ms": 0.32808,
+      "change_percent": -13.7762
+    },
+    "production_build_and_full_qualification": "Qualified final shared5 release; final actualbinary unit/performance window COMPLETE/health_PASS. Fullcollector supporting evidence reused with explicit source/scope bridge.",
+    "production_resources": {
+      "_ZN4gufo3hip12_GLOBAL__N_119KvarnQuantizeKernelILi2EEEvPK6__halfS5_PhmPKjjmj": {
+        "arch": "gfx1151",
+        "scratch": 0,
+        "vgpr": 182,
+        "vgpr_spill": 0,
+        "sgpr_spill": 0
+      },
+      "_ZN4gufo3hip12_GLOBAL__N_119KvarnQuantizeKernelILi4EEEvPK6__halfS5_PhmPKjjmj": {
+        "arch": "gfx1151",
+        "scratch": 0,
+        "vgpr": 176,
+        "vgpr_spill": 0,
+        "sgpr_spill": 0
+      },
+      "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_125KvarnQuantizeGroupsKernelEPK6__halfS6_mPhmPKjjjj": {
+        "arch": "gfx1151",
+        "scratch": 0,
+        "vgpr": 166,
+        "vgpr_spill": 0,
+        "sgpr_spill": 0
+      },
+      "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_127KvarnQuantizeBoundaryKernelEPK6__halfS6_PhPKjjS9_j": {
+        "arch": "gfx1151",
+        "scratch": 0,
+        "vgpr": 166,
+        "vgpr_spill": 0,
+        "sgpr_spill": 0
+      }
+    },
+    "final_production_resources": {
+      "_ZN4gufo3hip12_GLOBAL__N_119KvarnQuantizeKernelILi2EEEvPK6__halfS5_PhmPKjjmj": {
+        "arch": "gfx1151",
+        "scratch": 0,
+        "vgpr": 182,
+        "vgpr_spill": 0,
+        "sgpr_spill": 0
+      },
+      "_ZN4gufo3hip12_GLOBAL__N_119KvarnQuantizeKernelILi4EEEvPK6__halfS5_PhmPKjjmj": {
+        "arch": "gfx1151",
+        "scratch": 0,
+        "vgpr": 176,
+        "vgpr_spill": 0,
+        "sgpr_spill": 0
+      },
+      "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_125KvarnQuantizeGroupsKernelEPK6__halfS6_mPhmPKjjjj": {
+        "arch": "gfx1151",
+        "scratch": 0,
+        "vgpr": 166,
+        "vgpr_spill": 0,
+        "sgpr_spill": 0
+      },
+      "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_127KvarnQuantizeBoundaryKernelEPK6__halfS6_PhPKjjS9_j": {
+        "arch": "gfx1151",
+        "scratch": 0,
+        "vgpr": 166,
+        "vgpr_spill": 0,
+        "sgpr_spill": 0
+      }
+    }
+  }
+}

@@ -1,0 +1,272 @@
+{
+  "status": "QUALIFIED_SHARED_PREFILL_AND_KVARN",
+  "baseline_inference_runs": 0,
+  "full_profile_runs": 0,
+  "combined": {
+    "image": {
+      "image": "ai-tools/gufo-eval:f3-stream4-46824364-rocm101",
+      "id": "sha256:e334e0a0aa639a3f61c589e0f13b541874a4b9f187408fc3cb4dd97e350617aa",
+      "labels": {
+        "ai.tools.patch-sha256": "4682436482f0565d816596b9225e8434141590d8d8cbdb5cdd6cf6251d813ef8",
+        "ai.tools.production-build": "persistent-release-cmake-in-pinned-nix-derivation-env",
+        "ai.tools.source-base": "966f84b8",
+        "ai.tools.test-source-sha256": "4682436482f0565d816596b9225e8434141590d8d8cbdb5cdd6cf6251d813ef8",
+        "ai.tools.test-variant": "prefill-stream-kvarn-batch4",
+        "ai.tools.toolchain": "nix-rocm-10.1",
+        "org.opencontainers.image.ref.name": "gufo-nix-rocm-10.1-prefill-stream-kvarn-batch4",
+        "org.opencontainers.image.revision": "534c0f00-stream4-46824364",
+        "org.opencontainers.image.source": "https://github.com/franzmoca/gufo",
+        "org.opencontainers.image.version": "534c0f00-stream4-46824364"
+      }
+    },
+    "source": {
+      "base": "534c0f0092ef744c5bf01d4365b479920deee41e",
+      "patch_sha256": "4682436482f0565d816596b9225e8434141590d8d8cbdb5cdd6cf6251d813ef8",
+      "revision": "534c0f00-stream4-46824364"
+    },
+    "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-stream4-nix101",
+    "health_PASS": true,
+    "decision": "Do not promote: exact correctness but1.27\u20131.66percent prefill throughput regression across measured contexts. Preserve artifact; isolate forks before selecting final subset.",
+    "collector": {
+      "PASS": true,
+      "candidate_sha256": "789c46a2a6939dc980e23b2cbf78bac71ccbcd9b1472899be846a1d56584f2a0",
+      "saved_baseline_sha256": "789c46a2a6939dc980e23b2cbf78bac71ccbcd9b1472899be846a1d56584f2a0",
+      "bytes": 101424960,
+      "baseline": "fn-final-q6-nix101/receipt/run/exl3-5.05-prefill.bin",
+      "records": 32760,
+      "head_replay_checks": 64,
+      "metadata_bin_sha256": "789c46a2a6939dc980e23b2cbf78bac71ccbcd9b1472899be846a1d56584f2a0",
+      "verifier_sha256": "de8d4dee263023b54fb82be8db97c954bce6d7f71dbbc561676dce39c7d8b02f",
+      "baseline_inference_runs": 0,
+      "meaning": "Exact binary record match; existing q6 drift remains unchanged."
+    },
+    "collector_scope": "FP16 KV full-model collector; KVarN correctness separately covered by strict operator/code/scale/prefix/state tests, not a KVarN full-model collector.",
+    "units": [
+      {
+        "name": "executor-overlap",
+        "PASS": true,
+        "returncode": 0,
+        "runtime_paths": [
+          "/nix/store/88jjsz00km321bcl9851aiwwdig79b4l-rocm-runtime-10.1/lib/libhsa-runtime64.so.1.21.0",
+          "/nix/store/al4qwi7jfyrdkyb25xsri8b00b1agj1r-clr-10.1/lib/libamdhip64.so.7.16.0-0000000"
+        ]
+      },
+      {
+        "name": "flash-kvarn",
+        "PASS": true,
+        "returncode": 0,
+        "runtime_paths": [
+          "/nix/store/88jjsz00km321bcl9851aiwwdig79b4l-rocm-runtime-10.1/lib/libhsa-runtime64.so.1.21.0",
+          "/nix/store/al4qwi7jfyrdkyb25xsri8b00b1agj1r-clr-10.1/lib/libamdhip64.so.7.16.0-0000000"
+        ]
+      },
+      {
+        "name": "qwen-kvarn-quantize",
+        "PASS": true,
+        "returncode": 0,
+        "runtime_paths": [
+          "/nix/store/88jjsz00km321bcl9851aiwwdig79b4l-rocm-runtime-10.1/lib/libhsa-runtime64.so.1.21.0",
+          "/nix/store/al4qwi7jfyrdkyb25xsri8b00b1agj1r-clr-10.1/lib/libamdhip64.so.7.16.0-0000000"
+        ]
+      }
+    ],
+    "performance": {
+      "pp512": {
+        "candidate_tps": 1047.19,
+        "stddev": 1.43,
+        "saved_baseline_tps": 1063.05,
+        "baseline_stddev": 0.22,
+        "change_percent": -1.4919335873194939
+      },
+      "pp2048": {
+        "candidate_tps": 1393.02,
+        "stddev": 0.31,
+        "saved_baseline_tps": 1416.51,
+        "baseline_stddev": 0.82,
+        "change_percent": -1.6583010356439387
+      },
+      "pp8192": {
+        "candidate_tps": 1423.83,
+        "stddev": 1.31,
+        "saved_baseline_tps": 1447.47,
+        "baseline_stddev": 1.36,
+        "change_percent": -1.6331944703517287
+      },
+      "pp2048 @ d32768": {
+        "candidate_tps": 1274.65,
+        "stddev": 0.41,
+        "saved_baseline_tps": 1291.03,
+        "baseline_stddev": 1.09,
+        "change_percent": -1.2687544053972322
+      }
+    }
+  },
+  "diagnostics": {
+    "status": "COMPLETE",
+    "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-stream-isolate-r1-nix101",
+    "scope": "Q-only,shared-only and quantizer-only releases with identical allocations, onepp2048r2 perarm; not final qualification.",
+    "health_PASS": true,
+    "quant_only": {
+      "tps": 1417.09,
+      "stddev": 1.37
+    },
+    "q_only": {
+      "tps": 1417.67,
+      "stddev": 0.2
+    },
+    "shared_only": {
+      "tps": 1425.06,
+      "stddev": 0.51
+    },
+    "setup_failure": "First isolation window lacked metadata mount and ran no model inference; preserved separately as fn-prefill-stream-isolate-nix101.",
+    "selection": "Retain shared MoE plus quantizer; Q-only is locally faster but neutral in whole-model screen. Both forks interact negatively; cause unproved."
+  },
+  "separate_events_screen": {
+    "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-stream-events-nix101",
+    "health_PASS": true,
+    "pp2048_tps": 1399.91,
+    "stddev": 0.26,
+    "state_check": "1025 rows, two512-row full-FFN chunks then1-row tail; all outputs/logits/GDN state exact, four shared forks.",
+    "decision": "Rejected: dedicated event handles do not recover baseline throughput. No claim that event reuse caused the regression."
+  },
+  "final": {
+    "source": {
+      "base": "534c0f0092ef744c5bf01d4365b479920deee41e",
+      "patch_sha256": "703d3e77e2cb3a82bccd9a4e51254fcb0fb6cc9ecf3afc113e5757479e121f60",
+      "revision": "534c0f00-shared5-703d3e77"
+    },
+    "image": {
+      "image": "ai-tools/gufo-eval:f3-shared5-703d3e77-rocm101",
+      "id": "sha256:2184da9ff7ff9dee6757b630fb4efb521f1bda10cfddc9e9562a5b75142f0d32",
+      "labels": {
+        "ai.tools.patch-sha256": "703d3e77e2cb3a82bccd9a4e51254fcb0fb6cc9ecf3afc113e5757479e121f60",
+        "ai.tools.production-build": "persistent-release-cmake-in-pinned-nix-derivation-env",
+        "ai.tools.source-base": "966f84b8",
+        "ai.tools.test-source-sha256": "703d3e77e2cb3a82bccd9a4e51254fcb0fb6cc9ecf3afc113e5757479e121f60",
+        "ai.tools.test-variant": "prefill-shared-kvarn-batch5",
+        "ai.tools.toolchain": "nix-rocm-10.1",
+        "org.opencontainers.image.ref.name": "gufo-nix-rocm-10.1-prefill-shared-kvarn-batch5",
+        "org.opencontainers.image.revision": "534c0f00-shared5-703d3e77",
+        "org.opencontainers.image.source": "https://github.com/franzmoca/gufo",
+        "org.opencontainers.image.version": "534c0f00-shared5-703d3e77"
+      }
+    },
+    "artifacts": {
+      "base": "534c0f0092ef744c5bf01d4365b479920deee41e",
+      "patch_sha256": "703d3e77e2cb3a82bccd9a4e51254fcb0fb6cc9ecf3afc113e5757479e121f60",
+      "revision": "534c0f00-shared5-703d3e77",
+      "files": {
+        "build/f3-nix-incremental/release/gufo": {
+          "bytes": 114993944,
+          "sha256": "8790ad8a101ba4db18f9e44928854ff7cbe3ea9d231876d5c69e7485443851e7"
+        },
+        "build/f3-nix-incremental/batch5/stage/opt/gufo-prefill/tests/qwen38_flash_next_exl3_ops_test": {
+          "bytes": 26072336,
+          "sha256": "bdba551b7ce7ff02e1fc594b1908a71fcdeca96e2752aebd4e2216270f1db6f8"
+        },
+        "build/f3-nix-incremental/batch5/stage/opt/gufo-prefill/tests/qwen38_flash_next_kvarn_ops_test": {
+          "bytes": 5665720,
+          "sha256": "257ffa54aefd84a095c184ce170b4324c6b2309cb0a7b3824d9012cf80b89830"
+        },
+        "build/f3-nix-incremental/batch5/stage/opt/gufo-prefill/tests/qwen_attention_kvarn_ops_test": {
+          "bytes": 2292856,
+          "sha256": "3f07a89d13f8de6ef17d12d3815c08ec5c69733719af1119fe088172efa4e3ed"
+        },
+        "build/f3-nix-incremental/batch5/stage/opt/gufo-prefill/tests/qwen38_flash_next_rq_logits": {
+          "bytes": 27027968,
+          "sha256": "630dfcb09033f8f32017c724eb590ad992b26adfb63fd5c0fb2bd977f091d713"
+        },
+        "build/f3-nix-incremental/batch5/stage/opt/gufo-prefill/bin/.gufo-wrapped": {
+          "bytes": 114993944,
+          "sha256": "b6b282448c1a8af0e6efa3f37e97b9eec4a71a5bc50266fff71435b98d8d7937"
+        },
+        "build/f3-nix-incremental/batch5/stage/opt/gufo-prefill/bin/gufo": {
+          "bytes": 250,
+          "sha256": "8f86d5b61217a6f4b60ffc9dfb4351550fced1d8ee8d3fab7c7ab43612bf42e9"
+        }
+      }
+    },
+    "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-shared5-nix101",
+    "health_PASS": true,
+    "performance": {
+      "pp512": {
+        "tps": 1068.58,
+        "stddev": 3.09,
+        "saved_baseline_tps": 1063.05,
+        "baseline_stddev": 0.22,
+        "change_percent": 0.5202013075584322,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-shared5-nix101/receipt/run/prefill-d0.log"
+      },
+      "pp2048": {
+        "tps": 1429.13,
+        "stddev": 1.13,
+        "saved_baseline_tps": 1416.51,
+        "baseline_stddev": 0.82,
+        "change_percent": 0.8909220549096153,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-shared5-nix101/receipt/run/prefill-d0.log"
+      },
+      "pp8192": {
+        "tps": 1460.97,
+        "stddev": 0.73,
+        "saved_baseline_tps": 1447.47,
+        "baseline_stddev": 1.36,
+        "change_percent": 0.9326618168252088,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-shared5-nix101/receipt/run/prefill-d0.log"
+      },
+      "pp2048 @ d32768": {
+        "tps": 1301.99,
+        "stddev": 1.41,
+        "saved_baseline_tps": 1291.03,
+        "baseline_stddev": 1.09,
+        "change_percent": 0.8489345716211183,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-shared5-nix101/receipt/run/prefill-d32k.log"
+      }
+    },
+    "units": [
+      {
+        "name": "executor-overlap",
+        "PASS": true,
+        "returncode": 0,
+        "runtime_paths": [
+          "/nix/store/88jjsz00km321bcl9851aiwwdig79b4l-rocm-runtime-10.1/lib/libhsa-runtime64.so.1.21.0",
+          "/nix/store/al4qwi7jfyrdkyb25xsri8b00b1agj1r-clr-10.1/lib/libamdhip64.so.7.16.0-0000000"
+        ]
+      },
+      {
+        "name": "flash-kvarn",
+        "PASS": true,
+        "returncode": 0,
+        "runtime_paths": [
+          "/nix/store/88jjsz00km321bcl9851aiwwdig79b4l-rocm-runtime-10.1/lib/libhsa-runtime64.so.1.21.0",
+          "/nix/store/al4qwi7jfyrdkyb25xsri8b00b1agj1r-clr-10.1/lib/libamdhip64.so.7.16.0-0000000"
+        ]
+      },
+      {
+        "name": "qwen-kvarn-quantize",
+        "PASS": true,
+        "returncode": 0,
+        "runtime_paths": [
+          "/nix/store/88jjsz00km321bcl9851aiwwdig79b4l-rocm-runtime-10.1/lib/libhsa-runtime64.so.1.21.0",
+          "/nix/store/al4qwi7jfyrdkyb25xsri8b00b1agj1r-clr-10.1/lib/libamdhip64.so.7.16.0-0000000"
+        ]
+      }
+    ],
+    "quality_bridge": {
+      "Q_group_and_attention_source_restored_baseline": true,
+      "retained_Moe_source_matches_combined_collector_image": true,
+      "combined_source_snapshot_sha256": "c6600bf2ae87dd925d99fbdedeebf435a510c0a95326be4c85bd5bc41e3ffe5d",
+      "scope": "Supporting collector evidence from combined image, not a fresh fullcollector on final image. Fresh finalbinary1025-row state and both KVarN format CPU-oracle checks cover retained changes; actual final performance measured separately."
+    },
+    "fresh_full_collector": false,
+    "retained": [
+      "Early shared EXL3 MLP on side stream with dedicated operands/descriptors; router/routed work remains main.",
+      "Register-resident KVarN standard-deviation selection; unchanged arithmetic, private80\u21920."
+    ],
+    "rejected": [
+      "Combined Q/shared forks: complete prefill regression despite local wins.",
+      "Dedicated dense event pair does not recover baseline.",
+      "Q-only fork whole-model result is neutral, so leave baseline Q/KV grouping."
+    ],
+    "target_2000_reached": false
+  }
+}
