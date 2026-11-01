@@ -77,6 +77,55 @@ Neither can become a win by adding the omitted device partition-builder cost.
   user memory constraint. Likewise, no claim covers every possible library
   version, future compiler or different hardware.
 
+## Register pressure and kernel fission
+
+This is an explicit candidate direction, not a diagnosis that the current
+prefill bottleneck is spilling. The saved Nix ROCm 10.1 stage-screen assembly
+contains 13 matrix specializations with 89–214 VGPRs and **zero private frame,
+SGPR spills and VGPR spills**; see [extracted metadata](F3-REGISTER-AUDIT.json).
+This is a static inspection of preserved operator artifacts, not a new build,
+profile or performance run, and not proof the final image is globally spill-free.
+
+Private frame bytes, register counts and spill counts are distinct fields in
+[LLVM's metadata](https://llvm.org/docs/AMDGPUUsage.html#code-object-v3-metadata).
+Private memory can also hold addressable local arrays; zero private bytes does
+not exclude scalar-register spilling into vector registers. Use ISA and hot-loop
+location as well as metadata, rather than treating any one count as traffic.
+
+Already retained: GDN named q/k vectors replaced a 112-byte private array;
+bounded selector-head loads reduced SGPR spills from 304 to 18 with private
+scratch still zero on Clang 24; bounded sparse-QK scheduling reduced VGPRs
+227→221 without spills. Conversely, cached-FP16 smaller consumer tiles spilled
+and lost performance, and most tested K32/smaller-wave matrix tiles also lost.
+These existing results must not be repeated unchanged.
+
+Candidate order:
+
+1. Inspect preserved release objects for hot prefill kernels not covered by the
+   saved resource inventory. If hot-loop spill/private traffic exists, shorten
+   value lifetimes, bound unrolling/prefetch and scalarize addressable arrays
+   before splitting launches. Do not force a lower VGPR limit blindly.
+2. Where accumulator/temporary pressure is the cause, partition independent
+   output channels or token rows, or process smaller groups sequentially inside
+   the kernel. Preserve each dot product's K order and complete output rotation,
+   normalization and recurrence dependencies. Smaller tiles with fewer waves
+   can increase per-thread pressure; verify generated resources for the exact
+   shape and compiler. Merely dividing the launch grid while keeping the same
+   kernel does not reduce its per-thread register requirements.
+3. Consider splitting fused stages only when the removed live ranges/spill work
+   can repay extra launches, synchronization and intermediate global reads/writes.
+   Count any partial-output/rotation pass in the complete operator span.
+4. Evaluate resource fit together with [stream candidates](F3-STREAM-OVERLAP.md):
+   a spill-free kernel may still occupy enough LDS/registers to prevent useful
+   co-residency. A new paired workload is a distinct reason to revisit a layout,
+   not permission to repeat the old standalone sweep.
+
+Split-K/Stream-K changes the reduction organization and belongs to the separate
+numerical-quality scope above. Splitting recurrent time into the previously
+rejected approximate scan is not an exact spill fix. Screen genuine new changes
+with small operator/state checks; retain controls and batch final prefill
+qualification. No speedup is claimed by this audit.
+
 ## Reuse and preservation
 
 No new full-model profile or old baseline inference ran. The batch2 collector

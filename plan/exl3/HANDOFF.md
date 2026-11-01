@@ -12,6 +12,11 @@ These are unimplemented/unmeasured EXL3 schedules, not closed by the earlier
 matrix screen or generic two-stream probe. Preserve scratch lifetimes; simply
 turning on the existing Q8 overlap dispatch is unsafe for EXL3.
 
+Also keep [register pressure / kernel fission](F3-SEARCH-STATUS.md#register-pressure-and-kernel-fission)
+in the candidate queue. Saved stage-screen matrix kernels have zero private
+frame/spills; audit uncovered hot kernels before assuming spills are the cause.
+Resource reduction may still help stream co-residency. No new GPU run occurred.
+
 Retained production changes: small-row K5 narrow tile, aligned singleton parent
 output slices, and token-first traversal for singleton K7 6144→2560/R2048.
 [Final qualification](F3-PREFILL-GRID.md) records all performance and correctness

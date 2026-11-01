@@ -1,0 +1,151 @@
+{
+  "scope": "Static metadata inspection of preserved stage-screen operator assembly; not a new compile/run and not an audit of every kernel in the final qualified image.",
+  "source": "/home/m2on/projects/gufo-f3-integ/build/f3-prefill-stage/objects/screen.hip-hip-amdgcn-amd-amdhsa.hipfb.amdgcn.gfx1151.img.lto.s",
+  "compiler_ident": "nixpkgs-AMD clang version 24.0.0 (https://github.com/ROCm/llvm-project/tree/therock-10.1 therock-10.1)",
+  "kernel_count": 13,
+  "kernels": [
+    {
+      "name": "_ZN4gufo3hip12_GLOBAL__N_121HalfPrefillGemmKernelILi256ELi256ELi8ELi4ELNS_4core8GgmlTypeE8ELNS1_12HalfEpilogueE0ELb0ELS4_8ELi5ELi1ELi4ELb0EEEvPKvPKsPfiiiPKfS7_PKi",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 187,
+      "sgpr_count": 21,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 65536,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 1024
+    },
+    {
+      "name": "_ZN4gufo3hip12_GLOBAL__N_121HalfPrefillGemmKernelILi128ELi256ELi4ELi8ELNS_4core8GgmlTypeE8ELNS1_12HalfEpilogueE0ELb0ELS4_8ELi5ELi1ELi4ELb0EEEvPKvPKsPfiiiPKfS7_PKi",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 169,
+      "sgpr_count": 20,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 49152,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 1024
+    },
+    {
+      "name": "_ZN4gufo3hip12_GLOBAL__N_121HalfPrefillGemmKernelILi256ELi128ELi8ELi2ELNS_4core8GgmlTypeE8ELNS1_12HalfEpilogueE0ELb0ELS4_8ELi5ELi1ELi2ELb1EEEvPKvPKsPfiiiPKfS7_PKi",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 214,
+      "sgpr_count": 22,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 24576,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 512
+    },
+    {
+      "name": "_ZN4gufo3hip12_GLOBAL__N_121HalfPrefillGemmKernelILi256ELi128ELi8ELi2ELNS_4core8GgmlTypeE8ELNS1_12HalfEpilogueE0ELb0ELS4_8ELi5ELi1ELi2ELb0EEEvPKvPKsPfiiiPKfS7_PKi",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 189,
+      "sgpr_count": 22,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 24576,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 512
+    },
+    {
+      "name": "_ZN4gufo3hip12_GLOBAL__N_121HalfPrefillGemmKernelILi128ELi256ELi4ELi4ELNS_4core8GgmlTypeE8ELNS1_12HalfEpilogueE0ELb0ELS4_8ELi5ELi1ELi2ELb0EEEvPKvPKsPfiiiPKfS7_PKi",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 195,
+      "sgpr_count": 21,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 24576,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 512
+    },
+    {
+      "name": "_ZN4gufo3hip12_GLOBAL__N_121HalfPrefillGemmKernelILi128ELi128ELi4ELi2ELNS_4core8GgmlTypeE8ELNS1_12HalfEpilogueE0ELb0ELS4_8ELi5ELi1ELi2ELb0EEEvPKvPKsPfiiiPKfS7_PKi",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 188,
+      "sgpr_count": 23,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 16384,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 256
+    },
+    {
+      "name": "_ZN4gufo3hip12_GLOBAL__N_121HalfPrefillGemmKernelILi256ELi256ELi8ELi4ELNS_4core8GgmlTypeE8ELNS1_12HalfEpilogueE0ELb0ELS4_8ELi5ELi1ELi4ELb1EEEvPKvPKsPfiiiPKfS7_PKi",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 147,
+      "sgpr_count": 21,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 65536,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 1024
+    },
+    {
+      "name": "_ZN4gufo3hip12_GLOBAL__N_121HalfPrefillGemmKernelILi128ELi64ELi8ELi1ELNS_4core8GgmlTypeE8ELNS1_12HalfEpilogueE0ELb0ELS4_8ELi5ELi3ELi4ELb0EEEvPKvPKsPfiiiPKfS7_PKi",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 105,
+      "sgpr_count": 28,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 24576,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 256
+    },
+    {
+      "name": "_ZN4gufo3hip12_GLOBAL__N_121HalfPrefillGemmKernelILi128ELi128ELi8ELi1ELNS_4core8GgmlTypeE8ELNS1_12HalfEpilogueE0ELb0ELS4_8ELi5ELi3ELi4ELb0EEEvPKvPKsPfiiiPKfS7_PKi",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 149,
+      "sgpr_count": 30,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 32768,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 256
+    },
+    {
+      "name": "_ZN4gufo3hip12_GLOBAL__N_121HalfPrefillGemmKernelILi128ELi64ELi8ELi1ELNS_4core8GgmlTypeE8ELNS1_12HalfEpilogueE0ELb0ELS4_8ELi5ELi3ELi2ELb0EEEvPKvPKsPfiiiPKfS7_PKi",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 90,
+      "sgpr_count": 28,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 12288,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 256
+    },
+    {
+      "name": "_ZN4gufo3hip12_GLOBAL__N_121HalfPrefillGemmKernelILi128ELi128ELi8ELi1ELNS_4core8GgmlTypeE8ELNS1_12HalfEpilogueE0ELb0ELS4_8ELi5ELi3ELi2ELb0EEEvPKvPKsPfiiiPKfS7_PKi",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 122,
+      "sgpr_count": 32,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 16384,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 256
+    },
+    {
+      "name": "_ZN4gufo3hip12_GLOBAL__N_121HalfPrefillGemmKernelILi64ELi64ELi4ELi1ELNS_4core8GgmlTypeE8ELNS1_12HalfEpilogueE0ELb0ELS4_8ELi5ELi3ELi2ELb0EEEvPKvPKsPfiiiPKfS7_PKi",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 90,
+      "sgpr_count": 28,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 8192,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 128
+    },
+    {
+      "name": "_ZN4gufo3hip12_GLOBAL__N_121HalfPrefillGemmKernelILi64ELi128ELi4ELi2ELNS_4core8GgmlTypeE8ELNS1_12HalfEpilogueE0ELb0ELS4_8ELi5ELi3ELi2ELb0EEEvPKvPKsPfiiiPKfS7_PKi",
+      "private_segment_fixed_size": 0,
+      "vgpr_count": 89,
+      "sgpr_count": 28,
+      "sgpr_spill_count": 0,
+      "vgpr_spill_count": 0,
+      "group_segment_fixed_size": 12288,
+      "wavefront_size": 32,
+      "max_flat_workgroup_size": 256
+    }
+  ]
+}

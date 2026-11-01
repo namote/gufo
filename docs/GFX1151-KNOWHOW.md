@@ -926,6 +926,17 @@ Units/collector passed before a wrapper0644 packaging fault; mode0755 repair
 changed no ELF bytes, and only the unexecuted benchmarks resumed. Both windows
 passed health fences; the first remains a recorded failure, not relabeled.
 
+### EXL3 register-pressure evidence scope (2026-11-01)
+
+Static inspection, no new build/GPU measurement: 13 matrix specializations in
+preserved Nix ROCm 10.1 stage-screen assembly have 89–214 VGPRs, zero private
+frame, and zero SGPR/VGPR spill counts. This does not cover every kernel in the
+final qualified image. [Metadata and provenance](../plan/exl3/F3-REGISTER-AUDIT.json).
+[Candidate scope](../plan/exl3/F3-SEARCH-STATUS.md#register-pressure-and-kernel-fission)
+separates actual spill removal, array scalarization, independent output tiling,
+stage fission, and resource fit for streams. Existing smaller-tile regressions
+remain evidence; high register use alone is not a demonstrated spill bottleneck.
+
 ### Flash-Next dense traversal sweep (2026-11-01)
 
 All seven actual trunk K7 shape/group combinations were screened with exact
