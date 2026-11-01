@@ -533,6 +533,58 @@ __global__ void RotateGateUpBuckets(const ex::DeviceLinear* gate,
   }
 }
 
+// RotateGateUpBuckets per token: each 128-wide segment of a token's row is
+// read once and rotated for each of its `used` assignments (with that
+// expert's suh) into the assignment's packed row, found through the inverse
+// slot map. The same arithmetic per element; 1/used of the gathered reads.
+__global__ __launch_bounds__(256) void RotateGateUpTokens(
+    const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
+    const float* __restrict__ input, std::uint16_t* __restrict__ gate_out,
+    std::uint16_t* __restrict__ up_out, const std::int32_t* __restrict__ ids,
+    const std::int32_t* __restrict__ inverse, unsigned width, unsigned used) {
+  const unsigned row = blockIdx.y, lane = threadIdx.x % 32;
+  const unsigned segment = blockIdx.x * 8 + threadIdx.x / 32;
+  if (segment * 128 >= width)
+    return;
+  const unsigned first = segment * 128 + lane * 4;
+  float x[4];
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j)
+    x[j] = input[std::size_t{row} * width + first + j];
+  // Lane s holds assignment s's packed row and suh pointers (used <= 32).
+  const unsigned mine = row * used + min(lane, used - 1);
+  const int my_packed = inverse[mine];
+  const auto my_expert = static_cast<unsigned>(ids[mine]);
+  const auto my_gs = reinterpret_cast<std::uintptr_t>(gate[my_expert].suh);
+  const auto my_us = reinterpret_cast<std::uintptr_t>(up[my_expert].suh);
+#pragma unroll 2
+  for (unsigned s = 0; s < used; ++s) {
+    const auto packed = static_cast<unsigned>(__shfl(my_packed, s, 32));
+    const auto* gs = reinterpret_cast<const _Float16*>(__shfl(my_gs, s, 32));
+    const auto* us = reinterpret_cast<const _Float16*>(__shfl(my_us, s, 32));
+    float g[4], u[4];
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) {
+      g[j] = x[j] * static_cast<float>(gs[first + j]);
+      asm volatile("" : "+v"(g[j]));
+      u[j] = x[j] * static_cast<float>(us[first + j]);
+      asm volatile("" : "+v"(u[j]));
+    }
+    arithmetic::Butterfly128(g, lane);
+    arithmetic::Butterfly128(u, lane);
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) {
+      float a = g[j] * arithmetic::kHadamardScale;
+      asm volatile("" : "+v"(a));
+      float b = u[j] * arithmetic::kHadamardScale;
+      asm volatile("" : "+v"(b));
+      const auto at = std::size_t{packed} * width + first + j;
+      reinterpret_cast<_Float16*>(gate_out)[at] = static_cast<_Float16>(a);
+      reinterpret_cast<_Float16*>(up_out)[at] = static_cast<_Float16>(b);
+    }
+  }
+}
+
 // InT: float (Exl3PrefillExperts) or _Float16 (the FP16 raw path); the
 // activation itself is kept only in the float form.
 template<typename InT>
@@ -1182,10 +1234,18 @@ void PrefillExperts(const DeviceLayer& layer, const float* x,
   if (g.cols != u.cols || u.cols > d.rows * 2)
     throw std::invalid_argument("EXL3 prefill gate/up widths differ");
   auto* up_input = reinterpret_cast<std::uint16_t*>(scratch.out);
-  hipLaunchKernelGGL(RotateGateUpBuckets, dim3(g.cols / 128, assignments),
-                     dim3(32), 0, stream, g.device_exl3, u.device_exl3, x,
-                     scratch.input, up_input, scratch.offsets, scratch.slots,
-                     g.experts, g.cols, used);
+  if (raw_only && used > 32)
+    throw std::invalid_argument("EXL3 raw prefill takes at most 32 experts");
+  if (raw_only)
+    hipLaunchKernelGGL(
+        RotateGateUpTokens, dim3((g.cols / 128 + 7) / 8, assignments / used),
+        dim3(256), 0, stream, g.device_exl3, u.device_exl3, x, scratch.input,
+        up_input, ids, scratch.inverse, g.cols, used);
+  else
+    hipLaunchKernelGGL(RotateGateUpBuckets, dim3(g.cols / 128, assignments),
+                       dim3(32), 0, stream, g.device_exl3, u.device_exl3, x,
+                       scratch.input, up_input, scratch.offsets, scratch.slots,
+                       g.experts, g.cols, used);
   if (trace != nullptr)
     PrefillSnapshot(trace->gate_up_input, scratch.input,
                     std::size_t{assignments} * g.cols * sizeof(std::uint16_t),
