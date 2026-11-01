@@ -151,40 +151,41 @@ __global__ void RoutedGemv(const ex::DeviceLinear* gate,
     }
 #pragma unroll
     for (unsigned u = 0; u < kAhead; ++u) {
-    const unsigned kt = kt0 + u;
-    if (kt >= k_tiles)
-      break;
-    Half2 w[4];
-    {
-      std::uint32_t state[8];
-      arithmetic::LaneStates<Bits>(raw[u][0], raw[u][1], raw[u][2], lw.shift,
-                                   state);
-      std::uint32_t p[8];
-#pragma unroll
-      for (int j = 0; j < 8; ++j)
-        p[j] = (state[j] & 0xffffU) * arithmetic::kMul1Multiplier;
-#pragma unroll
-      for (int q = 0; q < 4; ++q)
-        w[q] = arithmetic::DecodePairMul1(p[2 * q], p[2 * q + 1]);
-    }
-    for (unsigned r = 0; r < MaxRows; ++r) {
-      if (r >= tile_rows.count)
+      const unsigned kt = kt0 + u;
+      if (kt >= k_tiles)
         break;
-      const auto* row = x + std::size_t{tile_rows.slots[r]} * k + kt * 16 + r0;
-      const Half2 v01{row[0], row[1]};
-      const Half2 v89{row[8], row[9]};
-      if (FullPrecision || (Scaled && exponents[tile_rows.slots[r]] < 0)) {
-        a[r] = DotPairF32(w[0], v01, a[r]);
-        a[r] = DotPairF32(w[1], v89, a[r]);
-        b[r] = DotPairF32(w[2], v01, b[r]);
-        b[r] = DotPairF32(w[3], v89, b[r]);
-      } else {
-        a[r] = __builtin_amdgcn_fdot2(w[0], v01, a[r], false);
-        a[r] = __builtin_amdgcn_fdot2(w[1], v89, a[r], false);
-        b[r] = __builtin_amdgcn_fdot2(w[2], v01, b[r], false);
-        b[r] = __builtin_amdgcn_fdot2(w[3], v89, b[r], false);
+      Half2 w[4];
+      {
+        std::uint32_t state[8];
+        arithmetic::LaneStates<Bits>(raw[u][0], raw[u][1], raw[u][2], lw.shift,
+                                     state);
+        std::uint32_t p[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+          p[j] = (state[j] & 0xffffU) * arithmetic::kMul1Multiplier;
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+          w[q] = arithmetic::DecodePairMul1(p[2 * q], p[2 * q + 1]);
       }
-    }
+      for (unsigned r = 0; r < MaxRows; ++r) {
+        if (r >= tile_rows.count)
+          break;
+        const auto* row =
+            x + std::size_t{tile_rows.slots[r]} * k + kt * 16 + r0;
+        const Half2 v01{row[0], row[1]};
+        const Half2 v89{row[8], row[9]};
+        if (FullPrecision || (Scaled && exponents[tile_rows.slots[r]] < 0)) {
+          a[r] = DotPairF32(w[0], v01, a[r]);
+          a[r] = DotPairF32(w[1], v89, a[r]);
+          b[r] = DotPairF32(w[2], v01, b[r]);
+          b[r] = DotPairF32(w[3], v89, b[r]);
+        } else {
+          a[r] = __builtin_amdgcn_fdot2(w[0], v01, a[r], false);
+          a[r] = __builtin_amdgcn_fdot2(w[1], v89, a[r], false);
+          b[r] = __builtin_amdgcn_fdot2(w[2], v01, b[r], false);
+          b[r] = __builtin_amdgcn_fdot2(w[3], v89, b[r], false);
+        }
+      }
     }
   }
   for (unsigned r = 0; r < MaxRows; ++r) {
@@ -630,8 +631,10 @@ __global__ void BucketDownFallback(const ex::DeviceLinear* bank,
       a += __shfl_xor(a, 2, 32);
       b += __shfl_xor(b, 2, 32);
       if (lane % 4 == 0) {
-        output[std::size_t{row} * n + nt * 16 + lane / 4] = static_cast<OutT>(a);
-        output[std::size_t{row} * n + nt * 16 + lane / 4 + 8] = static_cast<OutT>(b);
+        output[std::size_t{row} * n + nt * 16 + lane / 4] =
+            static_cast<OutT>(a);
+        output[std::size_t{row} * n + nt * 16 + lane / 4 + 8] =
+            static_cast<OutT>(b);
       }
     }
   }
@@ -1097,12 +1100,11 @@ void Exl3PrefillDown(const DeviceTensor& down, std::uint32_t assignments,
                          reinterpret_cast<_Float16*>(scratch.out), down.cols,
                          down.rows, assignments, counts);
     else
-      hipLaunchKernelGGL((BucketDownFallback<Bits>),
-                         dim3(std::min(assignments, 256U)), dim3(256), 0,
-                         stream, down.device_exl3, scratch.offsets,
-                         down.experts, scratch.down_exponents, scratch.input,
-                         scratch.out, down.cols, down.rows, assignments,
-                         counts);
+      hipLaunchKernelGGL(
+          (BucketDownFallback<Bits>), dim3(std::min(assignments, 256U)),
+          dim3(256), 0, stream, down.device_exl3, scratch.offsets, down.experts,
+          scratch.down_exponents, scratch.input, scratch.out, down.cols,
+          down.rows, assignments, counts);
   });
   if (raw_only) {
     Check();
@@ -1248,9 +1250,9 @@ namespace {
 // their slot-ordered copy reach memory. One wave per 128-wide segment.
 __global__ __launch_bounds__(256) void PrefillCombineKernel(
     const ex::DeviceLinear* bank, const unsigned* offsets, unsigned experts,
-    const std::int32_t* inverse, const _Float16* raw, const float* weights, const float* shared,
-    const float* gate, unsigned gate_stride, float* out, unsigned k,
-    unsigned width) {
+    const std::int32_t* inverse, const _Float16* raw, const float* weights,
+    const float* shared, const float* gate, unsigned gate_stride, float* out,
+    unsigned k, unsigned width) {
   const unsigned t = blockIdx.y, lane = threadIdx.x % 32;
   const unsigned segment = blockIdx.x * 8 + threadIdx.x / 32;
   if (segment * 128 >= width)
