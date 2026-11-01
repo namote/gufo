@@ -34,16 +34,20 @@ struct Exl3GemmProblem {
   const void* x;                 // FP16 rotated rows [rows][k]
   float* y;                      // [rows][n] FP32
   std::uint32_t rows;            // 0 skips the problem
-  std::uint32_t reserved;
+  // Parent output width for an aligned slice; zero means n.
+  std::uint32_t trellis_rows;
 };
 // Every problem of `problems` (device array, count <= 65535) with the same k,
 // n and rate, in one launch; blocks past a problem's rows exit. max_rows
-// bounds every problem's rows and picks the tile (<= 64: narrow).
+// bounds every problem's rows and picks the tile (<= 64: narrow). When
+// strided_trellis is true, trellis_rows supplies the parent K-step stride;
+// trellis/svh already point at a 128-channel-aligned output slice of width n.
 void LaunchExl3PrefillGemmGrouped(const Exl3GemmProblem* problems,
                                   std::size_t count, std::size_t max_rows,
                                   std::uint32_t k, std::uint32_t n,
                                   quant::exl3::BitRate rate, bool residual,
-                                  hipStream_t stream);
+                                  hipStream_t stream,
+                                  bool strided_trellis = false);
 // Raw inner products of expert buckets (Flash-Next routed prefill): for
 // every active descriptor b < min(*device_bucket_count, max_buckets) and
 // row r < count, inner[(first + r) * n + j] = sum_i input[(first + r) * k +

@@ -1215,6 +1215,49 @@ void MtpExecutorCatchUp(bool batched) {
   Require(equal, "all MTP states and continuation logits match bitwise");
 }
 
+void NarrowIndexerPrefill() {
+  BeginCase("singleton K5 indexer X3 stage and row boundaries");
+  constexpr unsigned rows = 2049, k = 2560, n = 640;
+  Buffers buffers;
+  Bank bank(buffers, k, n, 5, 1, 23);
+  const auto input = Input(rows * k);
+  std::vector<std::uint16_t> half(input.size());
+  std::transform(input.begin(), input.end(), half.begin(),
+                 [](float x) { return ex::HalfFromDouble(x); });
+  auto* x = buffers.Copy(half);
+  const auto& weight = bank.descriptors[0];
+  using Access = gpu::ExecutorTestAccess;
+  auto* reference = buffers.Make<float>(rows * n);
+  std::vector<gufo::hip::Exl3GemmProblem> chunks;
+  for (unsigned first = 0; first < rows; first += 64)
+    chunks.push_back({weight.trellis, weight.svh, x + first * k,
+                      reference + first * n, std::min(64U, rows - first), 0});
+  auto* descriptors = buffers.Copy(chunks);
+  for (unsigned i = 0; i < chunks.size(); ++i)
+    gufo::hip::LaunchExl3PrefillGemmGrouped(descriptors + i, 1, chunks[i].rows,
+                                            k, n, weight.rate, false, nullptr);
+  const auto expected = Access::Read<float>(reference, rows * n);
+  Require(
+      std::ranges::all_of(expected, [](float v) { return std::isfinite(v); }) &&
+          std::ranges::any_of(expected, [](float v) { return v != 0; }),
+      "indexer control must be finite and nonzero");
+  for (unsigned count : {64U, 65U, 2048U, 2049U}) {
+    auto* output = buffers.Make<float>(count * n + 8);
+    Check(hipMemset(output, 0xFF, count * n * sizeof(float)));
+    Check(hipMemset(output + count * n, 0x7F, 8 * sizeof(float)));
+    const std::vector<gufo::hip::Exl3GemmProblem> problem{
+        {weight.trellis, weight.svh, x, output, count, 0}};
+    gufo::hip::LaunchExl3PrefillGemmGrouped(buffers.Copy(problem), 1, count, k,
+                                            n, weight.rate, false, nullptr);
+    const auto actual = Access::Read<float>(output, count * n);
+    Require(std::memcmp(expected.data(), actual.data(),
+                        actual.size() * sizeof(float)) == 0,
+            "singleton indexer differs across stage/row dispatch boundary");
+    for (auto word : Access::Read<std::uint32_t>(output + count * n, 8))
+      Require(word == 0x7F7F7F7FU, "singleton indexer overwrote its guard");
+  }
+}
+
 void DensePrefillProjection() {
   BeginCase("executor grouped K7 dense X3, slices and chunk bits");
   constexpr unsigned rows = 65, k = 256;
@@ -1323,6 +1366,32 @@ void DensePrefillProjection() {
     Require(Access::Read<std::uint32_t>(sliced + rows * slice.rows, 1)[0] ==
                 0x7F7F7F7FU,
             "dense X3 slice overwrote its guard");
+  }
+  // A prefix uses the wider tile; an unaligned suffix must retain the full
+  // parent's 128-channel rotations before extraction.
+  for (auto [begin, width] : {std::pair{0U, 512U}, std::pair{513U, 127U}}) {
+    auto view = key.weight;
+    view.output_begin = begin;
+    view.rows = width;
+    auto* dst = f.buffers.Make<float>(rows * width + 8);
+    for (unsigned chunk : {64U, 65U}) {
+      Check(hipMemset(dst, 0xFF, rows * width * sizeof(float)));
+      Check(hipMemset(dst + rows * width, 0x7F, 8 * sizeof(float)));
+      for (unsigned first = 0; first < rows; first += chunk)
+        Require(Access::DensePrefill(exec, {&view}, {dst + first * width},
+                                     x + first * k,
+                                     std::min(chunk, rows - first), &error),
+                error);
+      Check(hipStreamSynchronize(exec.stream()));
+      const auto actual = Access::Read<float>(dst, rows * width);
+      for (unsigned row = 0; row < rows; ++row)
+        Require(std::memcmp(actual.data() + row * width,
+                            bulk[1].data() + row * key.n + begin,
+                            width * sizeof(float)) == 0,
+                "aligned prefix or unaligned slice differs from parent");
+      for (auto word : Access::Read<std::uint32_t>(dst + rows * width, 8))
+        Require(word == 0x7F7F7F7FU, "output slice overwrote its guard");
+    }
   }
   auto query = key.weight;
   query.rows = 512;
@@ -2164,6 +2233,7 @@ int main(int argc, char** argv) {
       return 0;
     }
     if (argc == 2 && std::string(argv[1]) == "--dense-prefill-only") {
+      NarrowIndexerPrefill();
       DensePrefillProjection();
       PlainOperandPrecision();
       return 0;

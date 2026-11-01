@@ -35,7 +35,7 @@ __global__ void PrepareExl3DensePrefillKernel(
     return;
   const auto p = args.problems[i];
   rotations[i] = {p.x, p.x_stride, nullptr, p.suh, p.rotated, p.rows, 0};
-  gemms[i] = {p.trellis, p.svh, p.rotated, p.y, p.rows, 0};
+  gemms[i] = {p.trellis, p.svh, p.rotated, p.y, p.rows, p.trellis_rows};
 }
 
 /// Row of token position `pos` in one layer of a K/V plane: through the

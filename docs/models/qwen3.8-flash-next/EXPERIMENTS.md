@@ -1,5 +1,15 @@
 # Qwen3.8 Flash-Next experiments
 
+## Narrow dense and output-slice batch, November 1, 2026
+
+K5 singleton N640/K2560 uses a smaller K32 tile through2048 rows; aligned
+singleton indexer slices compute only their requested channels. Units and
+32760-record quality payload passed exactly. Model pp2048 is1405.25 tok/s
+(+.36% versus the stored prior batch). Routed vector stores, wave64 and dense
+full-LDS epilogues were exact but offered no useful aggregate gain. Cache-fed
+current X3 also lost on the two large K7 shapes; no model cache was added.
+[Measurements, image identity and packaging-only recovery](../../../plan/exl3/F3-PREFILL-BATCH2.md).
+
 ## Matrix follow-up screening, November 1, 2026
 
 K32 staging with smaller workgroups and masked dense N640 tiles were mostly
@@ -444,3 +454,11 @@ not unprofiled throughput measurements.
 Next: improve prefill at depth and target/draft batch projection reuse while
 preserving [quality](QUALITY.md). The 1750 tok/s PP and flat d0–d128K
 objectives remain unmet; see [current benchmarks](BENCHMARKS.md).
+
+## Dense traversal follow-up, November 1, 2026
+
+The complete seven-shape K7 grid sweep found one clear local gain: singleton
+6144→2560/R2048 group1 −15.05%. Its bounded production dispatch raised pp2048
+from1405.25 to1416.51 tok/s (+.80%). Cached internal FP16 weights remained
+slower on large shapes after traversal tuning and were not promoted. No full
+model quality or old baseline repeats. [Results](../../../plan/exl3/F3-PREFILL-GRID.md).

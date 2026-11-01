@@ -1,5 +1,15 @@
 # Qwen3.8 Flash-Next quality
 
+## Narrow dense/output-slice batch qualification, November 1, 2026
+
+The batch2 installed binaries passed boundary64/65/2048/2049 and slice/guard
+checks. Its32760-record collector with64 head replays has the same saved q6
+payload SHA789c46a2…; prior hc7-relative NLL drift+.006600 remains unchanged.
+Runtime maps confirm patched Nix ROCr10.1/CLR10.1. A wrapper execute-permission
+packaging error stopped benchmarks after quality passed; only the unexecuted
+benchmarks resumed after mode repair, with identical ELF bytes. No completed
+quality or baseline inference repeated. [Exact receipts and artifact identities](../../../plan/exl3/F3-PREFILL-BATCH2-QUALIFICATION.json).
+
 ## Matrix follow-up operator checks, November 1, 2026
 
 Two short healthy Nix 10.1 windows passed finite/nonzero and exact-output
@@ -1138,3 +1148,12 @@ Loading measures cold target/sidecar files to HTTP readiness, verified with
 runtime libraries may remain warm. Memory uses C1/AR/capacity 133121 and peak
 global HIP allocation, including idle memory. See the
 [benchmark workflow](../../../.agents/skills/benchmark-model/SKILL.md).
+
+## Dense traversal follow-up, November 1, 2026
+
+The actual final release object passed exact finite/nonzero output and guard
+checks at2048 rows for K7 6144→2560,2560→6144,640→2560. The only changed
+production branch is the first shape, singleton2048. The previously successful
+batch512 collector cannot execute it and is reused; it was not repeated or
+misrepresented as a fresh batch3 collector. All seven K7 shape/group screens
+also passed exact outputs. [Evidence](../../../plan/exl3/F3-PREFILL-GRID.md).

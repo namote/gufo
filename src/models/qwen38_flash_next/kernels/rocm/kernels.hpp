@@ -34,6 +34,7 @@ struct Exl3DensePrefillProblem {
   std::uint16_t* rotated;
   float* y;
   std::uint32_t rows;
+  std::uint32_t trellis_rows{0};
 };
 void PrepareExl3DensePrefill(std::span<const Exl3DensePrefillProblem> problems,
                              gufo::hip::Exl3RotateProblem* rotations,

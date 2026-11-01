@@ -886,3 +886,77 @@ Receipts: `fn-prefill-stage-screen-nix101` and
 `fn-prefill-partition-screen-nix101`, both COMPLETE/health_PASS. Source,
 objects, resources, and controls stay in f3-integ `build/f3-prefill-stage` and
 `build/f3-prefill-partition`; production incremental trees remain intact.
+
+### Flash-Next narrow dense and output-slice batch (2026-11-01)
+
+- K5 singleton N640/K2560 StageK2/128²/4×2 is exact and faster at R512
+  (−29.22%) andR2048 (−15.31%); R4096 regressed1.78%, so dispatch stops
+  at2048. Grouped/residual/other-bit paths remain unchanged.
+- Singleton output slices aligned to128 channels can preserve the parent
+  trellis K-stride while computing only the slice. Keep original input
+  rotation, offset trellis by begin×bits uint16 elements, and offset svh by
+  begin. Paired q/k outputs still need one complete parent calculation.
+- Routed WMMA operand transpose plus vector stores: gate+2.18%, down+.01%;
+  null-exponent scaling removal did not improve the aggregate. Wave64 with
+  corrected32-lane decoder subgroups: gate+1.08%, down−.21%; wider hot groups
+  lost8.92%/9.45%. No routed variant promoted. Use saved1172-slot controls,
+  not the older832-slot timings printed alongside cached-output identities.
+- Dense K7 epilogue Stage64 reusing full64KiB LDS was+.08%/+3.03% on the
+  large shapes; XOR output swizzle/combinations were worse. Exactness and
+  output guards passed, but these variants remain prototypes.
+- Cached raw FP16 W′ feeding the *current* X3 producer/consumer (distinct
+  from the old UnquantizedF16Gemm reconstruction test) passed exact outputs
+  and guards but large shapes lost57.30%/7.31%, excluding initialization.
+  Smaller tile consumers spilled and lost37.97–190.10%. K640/N2560 improved
+  3.06% locally; reconstruction adds.010621ms. Expanding all300 trunk K7
+  parents costs5.42GiB and2.286× weight bytes; no model cache is implemented.
+- Qualified model batch: pp5121062.82±.08, pp20481405.25±.83,
+  pp81921446.11±1.33, d32K pp20481282.89±2.18 tok/s, respectively
+  +.09/+.36/+.27/+.16% versus saved prior batch. The32760-record payload
+  and64 head checks remain exact; hc7 NLL drift+.006600 is not removed.
+
+All detailed operator values, exactness limits, source/runtime fingerprints,
+and receipts: [batch2](../plan/exl3/F3-PREFILL-BATCH2.md) and its linked JSON.
+Units/collector passed before a wrapper0644 packaging fault; mode0755 repair
+changed no ELF bytes, and only the unexecuted benchmarks resumed. Both windows
+passed health fences; the first remains a recorded failure, not relabeled.
+
+### Flash-Next dense traversal sweep (2026-11-01)
+
+All seven actual trunk K7 shape/group combinations were screened with exact
+outputs and guards. Singleton K6144/N2560/R2048 packed traversal group1 changed
+1.930083→1.639585 ms (−15.05%); a narrowly guarded production dispatch is
+qualified below. Other best packed alternatives: K2560/N6144 +2.37%,
+K640/N2560 +1.49%, K2560/N10240 +4.23%, K2560/N12288 −.48%, grouped N512 +.57%,
+grouped N640 −1.74%. These do not warrant extra branches. Controls for the four
+newly needed shape/group combinations were saved once; prior controls reused.
+
+Cache-fed current X3 with tuned traversal still lost17.82%/2.70% on the large
+shapes; small K640/N2560 gained at most4.55% before initialization. No persistent
+model cache is added. Partial-group mapping was independently checked; the
+actual release object also passed untimed saved-output checks. Reuse batch512
+collector evidence separately from new2048 operator evidence. See
+[detailed traversal results](../plan/exl3/F3-PREFILL-GRID.md) and its linked JSON.
+
+The dense traversal batch subsequently qualified: pp5121063.05±.22,
+pp20481416.51±.82, pp81921447.47±1.36, d32K pp20481291.03±1.09 tok/s.
+That is +.11/+1.17/+.36/+.80% versus the saved starting batch; pp2048 gains
++.80% over batch2 alone. Actual release-object exact/guard checks passed;
+batch512 collector evidence was reused under its explicit unchanged scope.
+The >=2000 tok/s target remains unmet. [Qualification](../plan/exl3/F3-PREFILL-GRID-QUALIFICATION.json).
+
+### Flash-Next compact cold-class closure (2026-11-01)
+
+Healthy cached-control screen: raw128×16/32/64/128 8×1 kernels with disjoint
+bucket classes, unchanged K16 order and packed-row offsets. Compact32/64/128
+measured gate3.027125/down3.184357 ms; compact16/32/64/128 measured
+3.115747/3.220175. Against saved1172-slot2.979682/3.198049 controls, the weighted
+2×gate+down estimate loses.89%/3.21%. All launches and realistic512-per-cold,
+315-hot bounds are included; device partition builder cost is excluded. Exact
+finite bytes and guards passed. No promotion or another model rerun.
+
+Live classes:127/56/62/155 buckets, carrying4.63/6.50/14.08/74.79% of assignments.
+Existing padding-skip already avoids unused WMMAs; four classes reduce staged
+B rows22.21%, but only5.72% beyond split32. The older split32 health-failed
+window remains advisory; this new healthy compact test closes the distinct
+partition/LDS-pressure idea. [Search status and limits](../plan/exl3/F3-SEARCH-STATUS.md).

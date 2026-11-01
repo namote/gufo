@@ -1,4 +1,35 @@
-# EXL3 / Flash-Next F3 handoff (2026-11-01; matrix follow-up screened)
+# EXL3 / Flash-Next F3 handoff (2026-11-01; qualified narrow/slice/grid batch)
+
+Latest qualified pp2048 is **1416.51 ±0.82 tok/s**, +1.17% versus saved1400.15.
+The2000 tok/s target is not reached. Read [search status and open research
+boundaries](F3-SEARCH-STATUS.md) before starting more experiments. Current
+profile-backed matrix candidates have been screened; rejected mechanisms and
+baselines should not be rerun unchanged.
+
+Retained production changes: small-row K5 narrow tile, aligned singleton parent
+output slices, and token-first traversal for singleton K7 6144→2560/R2048.
+[Final qualification](F3-PREFILL-GRID.md) records all performance and correctness
+scopes. Batch512 collector32760 records/64 replays stayed exact; the final2048
+path separately passed saved-output/guard checks through the actual release
+object. Prior hc7 NLL drift+.006600 remains. All completed TG/MTP code is kept.
+
+Image: `ai-tools/gufo-eval:f3-prefill3-67a50024-rocm101`, ID `31fd777e…`.
+As-built source: `0b5d58a3-prefill3-67a50024`; patch SHA67a50024….
+Integration commits are source-identity attestations, not newly built image
+revisions. The source patch and installed hashes are in
+[F3-PREFILL-GRID-QUALIFICATION.json](F3-PREFILL-GRID-QUALIFICATION.json).
+
+Keep `build/f3-nix-incremental/{release,units,batch2,batch3,before-batch2}` and
+all frozen controls/receipts/images. New operator artifacts are in
+`build/f3-prefill-{store,epilogue,wave64,predecode,grid,grid-rest,cold}` and
+`build/f3-prod-gridcheck`. The old stage/partition controls remain dependencies.
+Only unused unshared Docker packaging cache was deleted; Nix objects were not.
+No new full-model profiling or baseline inference ran. gufo-00 has ended;
+this chat coordinates machine use. Long verification remains batched.
+
+## Earlier qualified state (superseded)
+
+### Matrix follow-up screen
 
 Latest work: [matrix follow-up screen](F3-NEXT-MATRIX-SCREEN.md) completed two
 short healthy operator windows. K32/workgroup and masked-wide variants were

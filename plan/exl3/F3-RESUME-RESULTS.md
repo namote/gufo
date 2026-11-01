@@ -463,3 +463,24 @@ main's pre-existing `.dockerignore` was preserved by content hash. No push.
 Further prefill work starts from this integrated code and saved candidate
 measurements. The >=2,000 tok/s goal remains unmet; completed TG/MTP work stays
 in place and further TG/MTP tuning remains deferred under the user's priority.
+
+## Qualified narrow dense/output-slice batch, 2026-11-01
+
+[Batch2](F3-PREFILL-BATCH2.md) retains the small-row K5 narrow tile and avoids
+unused aligned singleton parent outputs. All boundaries/slices/guards passed;
+32760 records and64 replay checks exactly match saved q6. pp20481405.25±.83
+is+.36% versus saved1400.15±.83; other prefill cases are+.09–.27%. The2000
+objective is unmet. Nix incremental build reused old objects and preserved
+changed predecessors; no baseline inference or new model profiling occurred.
+Routed vector stores/wave64, full-LDS dense epilogues and cached internal FP16
+weights had no useful large-shape benefit; artifacts and measurements remain.
+See batch2 for the wrapper-permission-only recovery and exact installed hashes.
+
+## Qualified dense traversal follow-up, 2026-11-01
+
+[Final grid batch](F3-PREFILL-GRID.md): pp20481416.51±.82 tok/s, +.80% over
+batch2 and+1.17% over the saved starting batch. Actual production-object
+exact/guard checks passed; batch512 collector reused because the new predicate
+requires2048. All seven actual K7 shapes were screened; only6144→2560 singleton
+uses the new traversal. The cached-FP16 branch is rejected. Image31fd777e…,
+source patch67a50024…, persistent Nix intermediates retained. Goal2000 unmet.

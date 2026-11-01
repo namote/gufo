@@ -2048,8 +2048,14 @@ bool Executor::Exl3DensePrefill(
         if (w->exl3 != targets[0].weight->exl3)
           throw std::invalid_argument(
               "EXL3 dense slices require a shared projection");
-    // Slices of one descriptor share its full rotation and GEMM. Keep the
-    // singleton chunk geometry and copy every view before reusing scratch.
+    // Output rotation is independent in each 128-channel Hadamard block.
+    // An aligned singleton can project only its requested blocks, retaining
+    // the parent's input rotation and packed trellis K-step stride.
+    const bool direct_slice = sliced && output_count == 1 &&
+                              targets[0].weight->output_begin % 128 == 0 &&
+                              targets[0].weight->rows % 128 == 0;
+    // Multiple views still share one full parent projection and are copied
+    // before scratch is reused; an unaligned view also needs the full blocks.
     const auto count = sliced ? std::size_t{1} : output_count;
     if (rows == 0)
       return true;
@@ -2080,17 +2086,21 @@ bool Executor::Exl3DensePrefill(
       for (std::size_t i = 0; i < count; ++i) {
         const auto& t = targets[i];
         const auto& l = *t.weight->exl3;
-        if (sliced && exl3_.slice_elements < std::size_t{n} * l.n)
+        if (sliced && !direct_slice &&
+            exl3_.slice_elements < std::size_t{n} * l.n)
           throw std::runtime_error("EXL3 dense prefill slice exceeds scratch");
-        problems[i] = {l.trellis,
+        const auto begin = direct_slice ? t.weight->output_begin : 0;
+        problems[i] = {l.trellis + std::size_t{begin} * l.rate.bits,
                        l.suh,
-                       l.svh,
+                       l.svh + begin,
                        x + std::size_t{first} * k,
                        k,
                        rotated + i * std::size_t{n} * k,
-                       sliced ? exl3_.slice
-                              : t.output + std::size_t{first} * t.weight->rows,
-                       n};
+                       sliced && !direct_slice
+                           ? exl3_.slice
+                           : t.output + std::size_t{first} * t.weight->rows,
+                       n,
+                       direct_slice ? l.n : 0};
       }
       PrepareExl3DensePrefill(std::span(problems.data(), count),
                               exl3_dense_rotations_, exl3_dense_gemms_,
@@ -2105,14 +2115,15 @@ bool Executor::Exl3DensePrefill(
           ++end;
         // Always X3, including a singleton/tail; a GEMV row threshold would
         // change the reduction tree when a prompt/checkpoint chunk moves.
-        gufo::hip::LaunchExl3PrefillGemmGrouped(exl3_dense_gemms_ + begin,
-                                                end - begin, n, k, l.n, l.rate,
-                                                false, stream_);
+        gufo::hip::LaunchExl3PrefillGemmGrouped(
+            exl3_dense_gemms_ + begin, end - begin, n, k,
+            direct_slice ? targets[begin].weight->rows : l.n, l.rate, false,
+            stream_, direct_slice);
         if (diagnostics_active_)
           ++cycle_diagnostics_.prefill_dense_gemm_groups;
         begin = end;
       }
-      if (sliced) {
+      if (sliced && !direct_slice) {
         for (std::size_t i = 0; i < output_count; ++i) {
           const auto& t = targets[i];
           if (!Check(hipMemcpy2DAsync(

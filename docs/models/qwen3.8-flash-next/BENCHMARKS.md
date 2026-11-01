@@ -1,9 +1,41 @@
 # Qwen3.8 Flash-Next benchmarks
 
-The subsequent [matrix follow-up screen](../../../plan/exl3/F3-NEXT-MATRIX-SCREEN.md)
-made no production change. The qualified numbers below remain current; its
-local narrow-tile signal is not an end-to-end speedup. Stored model baselines
-were reused, without another inference pass.
+## EXL3 5.05 dense traversal follow-up, November 1, 2026
+
+Current qualified image: `ai-tools/gufo-eval:f3-prefill3-67a50024-rocm101`
+(`31fd777e…`). Nix ROCm10.1, KVarN k4v4, speculative off, temperature0,
+seed314159, r2. Stored baselines reused; no new baseline inference.
+
+| Case | Starting batch tok/s | Current tok/s | Change |
+|---|---:|---:|---:|
+| pp512 | 1061.85 ±.37 | 1063.05 ±.22 | +.11% |
+| pp2048 | 1400.15 ±.83 | 1416.51 ±.82 | +1.17% |
+| pp8192 | 1442.28 ±1.13 | 1447.47 ±1.36 | +.36% |
+| pp2048 at d32768 | 1280.80 ±3.23 | 1291.03 ±1.09 | +.80% |
+
+Only singleton K7 6144→2560 at2048 rows changes grid traversal. The actual
+release object passed saved exact-output/guard comparisons. Batch512 model
+collector evidence is reused because it cannot enter the new2048 predicate.
+[Full scopes and qualification](../../../plan/exl3/F3-PREFILL-GRID.md).
+The2000 tok/s goal remains unmet; earlier batches below are historical.
+
+## EXL3 5.05 narrow dense/output-slice batch, November 1, 2026
+
+Prior batch2 qualified prefill: Nix ROCm10.1, KVarN k4v4, speculative off,
+temperature0, seed314159, r2. One candidate benchmark pass; prior saved
+baseline reused. Accuracy payload remained exact. Goal2000 tok/s is unmet.
+
+| Case | Prior batch tok/s | Current tok/s | Change |
+|---|---:|---:|---:|
+| pp512 | 1061.85 ±.37 | 1062.82 ±.08 | +.09% |
+| pp2048 | 1400.15 ±.83 | 1405.25 ±.83 | +.36% |
+| pp8192 | 1442.28 ±1.13 | 1446.11 ±1.33 | +.27% |
+| pp2048 at d32768 | 1280.80 ±3.23 | 1282.89 ±2.18 | +.16% |
+
+Image `ai-tools/gufo-eval:f3-prefill2-f497677d-rocm101-r1` (`d256d2ab…`).
+[Qualification and scope](../../../plan/exl3/F3-PREFILL-BATCH2.md).
+The earlier matrix screens below are historical; their narrow candidate is
+now qualified in this batch. Completed TG/MTP work is retained.
 
 ## EXL3 5.05 prefill batch, November 1, 2026
 

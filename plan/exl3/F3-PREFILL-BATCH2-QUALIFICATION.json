@@ -1,0 +1,143 @@
+{
+  "status": "QUALIFIED_PREFILL_BATCH2",
+  "image": "ai-tools/gufo-eval:f3-prefill2-f497677d-rocm101-r1",
+  "image_id": "sha256:d256d2ab05575cf66f9dc771d188cfdb7020e313c6bd53f1ca0259d752e0e356",
+  "source": {
+    "base_revision": "0b5d58a3431c43bb15ba8a777f3ebeaae4408936",
+    "revision": "0b5d58a3-prefill2-f497677d",
+    "patch_sha256": "f497677d913202d10f765773fb6d8339108243e907c699c07736593955b492d3",
+    "production_changes": [
+      "K5 singleton640-wide narrow tile",
+      "aligned singleton parent output slices"
+    ],
+    "format": "pinned clang-format21.1.8 PASS"
+  },
+  "artifacts": {
+    "revision": "0b5d58a3-prefill2-f497677d",
+    "files": {
+      "build/f3-nix-incremental/release/gufo": {
+        "bytes": 115000336,
+        "sha256": "487fc232b161aaab927e58aca6aacf7c5487fb2786bf00bcb9dd6a8c1cede252"
+      },
+      "build/f3-nix-incremental/batch2/stage/opt/gufo-prefill/bin/.gufo-wrapped": {
+        "bytes": 115000336,
+        "sha256": "a25da47618d3315be124004f8360f408ce0cb928d49f377f6e7b451fce30bb3c"
+      },
+      "build/f3-nix-incremental/batch2/stage/opt/gufo-prefill/tests/qwen38_flash_next_exl3_ops_test": {
+        "bytes": 26057256,
+        "sha256": "9c7aa5359d725d2049c5973191ebf86f387721d04b37a1d1ca5b7a6ac151314f"
+      },
+      "build/f3-nix-incremental/batch2/stage/opt/gufo-prefill/tests/qwen38_flash_next_rq_logits": {
+        "bytes": 27024880,
+        "sha256": "a588a28a5de6bea68ee29bfc621228245779a49aa0d299cd99271d321b560827"
+      }
+    },
+    "source_patch_sha256": "f497677d913202d10f765773fb6d8339108243e907c699c07736593955b492d3"
+  },
+  "quality_receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch2-nix101",
+  "performance_receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch2-bench-nix101",
+  "baseline_inference_runs": 0,
+  "candidate_collector_runs": 1,
+  "candidate_bench_runs_per_case": 2,
+  "comparison": {
+    "pp512": {
+      "baseline": {
+        "tps": 1061.85,
+        "stddev": 0.37,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch-nix101/receipt/run/prefill-d0.log"
+      },
+      "candidate": {
+        "tps": 1062.82,
+        "stddev": 0.08,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch2-bench-nix101/receipt/run/prefill-d0.log"
+      },
+      "change_percent": 0.09135000235438451
+    },
+    "pp2048": {
+      "baseline": {
+        "tps": 1400.15,
+        "stddev": 0.83,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch-nix101/receipt/run/prefill-d0.log"
+      },
+      "candidate": {
+        "tps": 1405.25,
+        "stddev": 0.83,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch2-bench-nix101/receipt/run/prefill-d0.log"
+      },
+      "change_percent": 0.36424668785486336
+    },
+    "pp8192": {
+      "baseline": {
+        "tps": 1442.28,
+        "stddev": 1.13,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch-nix101/receipt/run/prefill-d0.log"
+      },
+      "candidate": {
+        "tps": 1446.11,
+        "stddev": 1.33,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch2-bench-nix101/receipt/run/prefill-d0.log"
+      },
+      "change_percent": 0.26555176526055213
+    },
+    "pp2048 @ d32768": {
+      "baseline": {
+        "tps": 1280.8,
+        "stddev": 3.23,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch-nix101/receipt/run/prefill-d32k.log"
+      },
+      "candidate": {
+        "tps": 1282.89,
+        "stddev": 2.18,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch2-bench-nix101/receipt/run/prefill-d32k.log"
+      },
+      "change_percent": 0.16317926296065544
+    }
+  },
+  "collector": {
+    "PASS": true,
+    "candidate_sha256": "789c46a2a6939dc980e23b2cbf78bac71ccbcd9b1472899be846a1d56584f2a0",
+    "saved_baseline_sha256": "789c46a2a6939dc980e23b2cbf78bac71ccbcd9b1472899be846a1d56584f2a0",
+    "bytes": 101424960,
+    "baseline": "fn-final-q6-nix101/receipt/run/exl3-5.05-prefill.bin",
+    "records": 32760,
+    "head_replay_checks": 64,
+    "metadata_bin_sha256": "789c46a2a6939dc980e23b2cbf78bac71ccbcd9b1472899be846a1d56584f2a0",
+    "verifier_sha256": "de8d4dee263023b54fb82be8db97c954bce6d7f71dbbc561676dce39c7d8b02f",
+    "baseline_inference_runs": 0,
+    "meaning": "Exact binary record match; existing q6 drift remains unchanged."
+  },
+  "runtime": {
+    "PASS": true,
+    "unit_returncode": 0,
+    "installed_sha256": {
+      "/opt/gufo-prefill/bin/.gufo-wrapped": "a25da47618d3315be124004f8360f408ce0cb928d49f377f6e7b451fce30bb3c",
+      "/opt/gufo-prefill/tests/qwen38_flash_next_exl3_ops_test": "9c7aa5359d725d2049c5973191ebf86f387721d04b37a1d1ca5b7a6ac151314f",
+      "/opt/gufo-prefill/tests/qwen38_flash_next_rq_logits": "a588a28a5de6bea68ee29bfc621228245779a49aa0d299cd99271d321b560827"
+    },
+    "rocm10_1_loaded": true,
+    "baseline_inference_runs": 0
+  },
+  "packaging_fix": {
+    "initial_receipt": "fn-prefill-batch2-nix101",
+    "initial_image": "sha256:f1b4b791e67a845bdef4bccf81639465dec971ab4ffae527e2bee88a863b804b",
+    "failure": "Wrapper copied with0644 mode; bench could not exec. No bench inference occurred.",
+    "fix": "Set wrapper0755; all ELF bytes unchanged. Update ignored host source-revision marker for future receipts.",
+    "reuse": [
+      "units PASS",
+      "32760 records +64 head checks exact"
+    ],
+    "rerun": [
+      "only unexecuted d0/d32k bench"
+    ]
+  },
+  "quality_window": {
+    "status": "FAILED_no_fallback",
+    "health_PASS": true,
+    "result_status": "FAILED"
+  },
+  "performance_window": {
+    "status": "COMPLETE",
+    "health_PASS": true,
+    "result_status": "COMPLETE"
+  }
+}

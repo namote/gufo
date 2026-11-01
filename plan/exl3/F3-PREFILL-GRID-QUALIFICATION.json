@@ -1,0 +1,138 @@
+{
+  "status": "QUALIFIED_PREFILL_GRID_BATCH3",
+  "source": {
+    "base_revision": "0b5d58a3431c43bb15ba8a777f3ebeaae4408936",
+    "revision": "0b5d58a3-prefill3-67a50024",
+    "patch_sha256": "67a50024ddc3b6b00ad99809753899f68934065f6d982864059a55f66b47664e",
+    "previous_qualified_patch": "f497677d913202d10f765773fb6d8339108243e907c699c07736593955b492d3",
+    "change_since_previous": "Only grid traversal for singleton K7 K6144 N2560 rows2048 256x256 store; K16 arithmetic unchanged."
+  },
+  "artifacts": {
+    "revision": "0b5d58a3-prefill3-67a50024",
+    "source_patch_sha256": "67a50024ddc3b6b00ad99809753899f68934065f6d982864059a55f66b47664e",
+    "files": {
+      "build/f3-nix-incremental/release/gufo": {
+        "bytes": 115000328,
+        "sha256": "2e15b736d3fd401b5ffed14b628dee6115d9a47724c8f12a274f1c9e9cb066e5"
+      },
+      "build/f3-nix-incremental/release/CMakeFiles/gufo_core.dir/src/models/qwen/hip/kernels/prefill_fp16.hip.o": {
+        "bytes": 2410384,
+        "sha256": "5bf869c114fa69b8481c491fe42d3e356209226672bf2c9f4f2445e7baf1eac0"
+      },
+      "build/f3-nix-incremental/batch3/stage/opt/gufo-prefill/bin/.gufo-wrapped": {
+        "bytes": 115000328,
+        "sha256": "5ee0158fab885d0e64fd23b13982e205b1f0e5dd713c3f993f32a3feae629ef5"
+      },
+      "build/f3-nix-incremental/batch3/stage/opt/gufo-prefill/tests/qwen38_flash_next_exl3_ops_test": {
+        "bytes": 26053192,
+        "sha256": "ba07e0185b27914e2921cc9ab442b25770beeeac96489f335e72688f7943aa76"
+      },
+      "build/f3-nix-incremental/batch3/stage/opt/gufo-prefill/tests/qwen38_flash_next_rq_logits": {
+        "bytes": 27020648,
+        "sha256": "05454c687469de5abcad2622b0b1b986dfa115a69d48b5f70d5d383690291d1a"
+      }
+    }
+  },
+  "image": "ai-tools/gufo-eval:f3-prefill3-67a50024-rocm101",
+  "image_id": "sha256:31fd777e84c185efbe8c55926cf46a48085d4d2a6bb3493bbf0cb3451f693bb3",
+  "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch3-nix101",
+  "health_PASS": true,
+  "baseline_inference_runs": 0,
+  "reused_quality_receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch2-nix101",
+  "quality_scope": "Batch512 collector reused: new2048grid predicate unreachable. Actual finalrelease object separately checked at2048 against exact saved controls. No claim of a fresh fullcollector on batch3 image.",
+  "production_object_check": {
+    "production_object_sha256": "5bf869c114fa69b8481c491fe42d3e356209226672bf2c9f4f2445e7baf1eac0",
+    "runtime_image": "sha256:31fd777e84c185efbe8c55926cf46a48085d4d2a6bb3493bbf0cb3451f693bb3",
+    "reference_runtime_image": "sha256:931977351cdc6b604873272394d404497215523f68a1c5dea7dfbc01bc3605d5",
+    "manifest_sha256": "6a40732473d0ff3bcb79c51a35487af8a20ddc2f3846c96273d3382bfec59c35",
+    "binary_sha256": "65214d0b1804b1e567ea976272ca15b47888b9ec2954745d4c9913f0a96769a7",
+    "wrapper_sha256": "39e019f79019bfe98f5936e0c951534cf0213ce9fdc16f455bbb1c815cdc22b5",
+    "source_sha256": "9378b84d9931b56a17366d79b0d20989ecf1d6766011f7c735fab4a39fca78c7",
+    "controls_cached": true,
+    "full_model_run": false,
+    "installed_elf_sha256": "5ee0158fab885d0e64fd23b13982e205b1f0e5dd713c3f993f32a3feae629ef5",
+    "returncode": 0,
+    "runtime_paths": [
+      "/nix/store/88jjsz00km321bcl9851aiwwdig79b4l-rocm-runtime-10.1/lib/libhsa-runtime64.so.1.21.0",
+      "/nix/store/al4qwi7jfyrdkyb25xsri8b00b1agj1r-clr-10.1/lib/libamdhip64.so.7.16.0-0000000"
+    ]
+  },
+  "comparison": {
+    "pp512": {
+      "candidate": {
+        "tps": 1063.05,
+        "stddev": 0.22,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch3-nix101/receipt/run/prefill-d0.log"
+      },
+      "previous_batch": {
+        "tps": 1062.82,
+        "stddev": 0.08,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch2-bench-nix101/receipt/run/prefill-d0.log"
+      },
+      "starting_batch": {
+        "tps": 1061.85,
+        "stddev": 0.37,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch-nix101/receipt/run/prefill-d0.log"
+      },
+      "change_vs_previous_percent": 0.02164054120170622,
+      "change_vs_starting_percent": 0.11301031219099755
+    },
+    "pp2048": {
+      "candidate": {
+        "tps": 1416.51,
+        "stddev": 0.82,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch3-nix101/receipt/run/prefill-d0.log"
+      },
+      "previous_batch": {
+        "tps": 1405.25,
+        "stddev": 0.83,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch2-bench-nix101/receipt/run/prefill-d0.log"
+      },
+      "starting_batch": {
+        "tps": 1400.15,
+        "stddev": 0.83,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch-nix101/receipt/run/prefill-d0.log"
+      },
+      "change_vs_previous_percent": 0.8012809108699503,
+      "change_vs_starting_percent": 1.1684462379030647
+    },
+    "pp8192": {
+      "candidate": {
+        "tps": 1447.47,
+        "stddev": 1.36,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch3-nix101/receipt/run/prefill-d0.log"
+      },
+      "previous_batch": {
+        "tps": 1446.11,
+        "stddev": 1.33,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch2-bench-nix101/receipt/run/prefill-d0.log"
+      },
+      "starting_batch": {
+        "tps": 1442.28,
+        "stddev": 1.13,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch-nix101/receipt/run/prefill-d0.log"
+      },
+      "change_vs_previous_percent": 0.0940454045681216,
+      "change_vs_starting_percent": 0.3598469090606571
+    },
+    "pp2048 @ d32768": {
+      "candidate": {
+        "tps": 1291.03,
+        "stddev": 1.09,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch3-nix101/receipt/run/prefill-d32k.log"
+      },
+      "previous_batch": {
+        "tps": 1282.89,
+        "stddev": 2.18,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch2-bench-nix101/receipt/run/prefill-d32k.log"
+      },
+      "starting_batch": {
+        "tps": 1280.8,
+        "stddev": 3.23,
+        "file": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch-nix101/receipt/run/prefill-d32k.log"
+      },
+      "change_vs_previous_percent": 0.6345049068898989,
+      "change_vs_starting_percent": 0.7987195502810795
+    }
+  }
+}

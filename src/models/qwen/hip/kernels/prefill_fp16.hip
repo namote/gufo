@@ -232,7 +232,7 @@ enum class HalfEpilogue { kStore, kSwiGLU, kGateUp, kResidual };
 template<int BM, int BN, int WM, int WN, gufo::core::GgmlType Type,
          HalfEpilogue Epilogue, bool Complete = false,
          gufo::core::GgmlType UpType = Type, int TrellisBits = 0,
-         int Batching = 0>
+         int Batching = 0, int StageK = 4>
 
 __launch_bounds__(WM * WN * 32) __global__ void HalfPrefillGemmKernel(
     const void* __restrict__ w, const short* __restrict__ x,
@@ -246,7 +246,8 @@ __launch_bounds__(WM * WN * 32) __global__ void HalfPrefillGemmKernel(
   constexpr bool Mixed = Paired && Type != UpType;
   constexpr bool UpRaw = UpType == gufo::core::GgmlType::kQ4_K ||
                          UpType == gufo::core::GgmlType::kQ5_K;
-  constexpr int BK = 4, WaveSize = 32;
+  static_assert(StageK == 2 || StageK == 4);
+  constexpr int BK = StageK, WaveSize = 32;
   // A 256-weight Q5 block spans four K64 iterations. Keep its header in
   // registers for the Q5 and Q4/Q5 kernels that benefit from this reuse.
   constexpr bool CacheQ5Header = BM == 256 && BN == 256 &&
@@ -298,6 +299,13 @@ __launch_bounds__(WM * WN * 32) __global__ void HalfPrefillGemmKernel(
     // Wider row groups improve input reuse for these large projections.
     // Long Q5 reductions and mixed gate/up decoders retain smaller groups.
     unsigned group_shift = 3;
+    // This long-K EXL3 projection benefits from reusing each weight tile
+    // across token blocks before advancing to the next output-channel tile.
+    if constexpr (BM == 256 && BN == 256 && TrellisBits == 7 &&
+                  Batching == 1 && Epilogue == HalfEpilogue::kStore) {
+      if (k == 6144 && m == 2560 && batch == 2048 && gridDim.z == 1)
+        group_shift = 0;
+    }
     if constexpr (BM == 256 && BN == 256 && !Mixed) {
       if constexpr (Type == gufo::core::GgmlType::kIQ4_XS)
         group_shift = 5;
@@ -317,14 +325,18 @@ __launch_bounds__(WM * WN * 32) __global__ void HalfPrefillGemmKernel(
   // trellis, svh read through gate, FP16 rows and output); 2 = one
   // Exl3PrefillBucket per blockIdx.z of the bank in w, active while z <
   // *gate (the device count), raw inner products. Blocks past the rows exit.
+  // 4 = grouped descriptors with a parent trellis stride for output slices.
   static_assert(Batching == 0 || TrellisBits > 0, "batching is EXL3 only");
-  if constexpr (Batching == 1) {
+  int trellis_rows = m;
+  if constexpr (Batching == 1 || Batching == 4) {
     const auto& problem = static_cast<const Exl3GemmProblem*>(up)[blockIdx.z];
     w = problem.trellis;
     x = static_cast<const short*>(problem.x);
     y = problem.y;
     gate = reinterpret_cast<const float*>(problem.svh);
     batch = static_cast<int>(problem.rows);
+    if constexpr (Batching == 4)
+      trellis_rows = problem.trellis_rows == 0 ? m : problem.trellis_rows;
     if (t_block >= batch)
       return;
   } else if constexpr (Batching == 2 || Batching == 3) {
@@ -479,7 +491,7 @@ __launch_bounds__(WM * WN * 32) __global__ void HalfPrefillGemmKernel(
       for (int i = 0; i < TPW; ++i) {
         const int t = wave * TPW + i, ks = t / RS, rt = t % RS;
         const std::uint32_t* tile =
-            base + (static_cast<std::size_t>(ks0 + ks) * (m / 16) +
+            base + (static_cast<std::size_t>(ks0 + ks) * (trellis_rows / 16) +
                     (r_block / 16) + rt) *
                        (8 * kTrellisK);
         traw[i] = {tile[lw.o0], tile[lw.o1], tile[lw.o2]};
@@ -685,7 +697,8 @@ __launch_bounds__(WM * WN * 32) __global__ void HalfPrefillGemmKernel(
       // decoders retain the compiler's default instruction schedule.
       __builtin_amdgcn_iglp_opt(0);
     }
-    if constexpr (Trellis && Batching <= 1 && BM == 256 && BN == 256) {
+    if constexpr (Trellis && (Batching <= 1 || Batching == 4) && BM == 256 &&
+                  BN == 256) {
       // Dense X3, including grouped projections: interleave LDS reads and
       // WMMA without changing the per-output K16 accumulation order.
       __builtin_amdgcn_iglp_opt(0);
@@ -1196,6 +1209,20 @@ void LaunchExl3Tile(Exl3Tile tile, const void* w, const void* x, float* y,
            256, 256, 1024);
       break;
     case Exl3Tile::kWideHalf:
+      if constexpr (Bits == 5 && Grouped == 1 &&
+                    Epilogue == HalfEpilogue::kStore) {
+        // A single Flash-Next indexer parent underfills the 32-wave tile.
+        // K32 staging and eight waves retain the ascending K16 chain and
+        // complete 128-channel output rotations. Keep larger/grouped work
+        // on its existing tile; the two-group screen did not improve.
+        if (count == 1 && k == 2560 && n == 640 && rows <= 2048) {
+          args(HalfPrefillGemmKernel<128, 128, 4, 2, GgmlType::kQ8_0,
+                                     Epilogue, false, GgmlType::kQ8_0, Bits,
+                                     Grouped, 2>,
+               128, 128, 256);
+          break;
+        }
+      }
       args(HalfPrefillGemmKernel<128, 256, 4, 8, GgmlType::kQ8_0, Epilogue,
                                  false, GgmlType::kQ8_0, Bits, Grouped>,
            256, 128, 1024);
@@ -1259,16 +1286,21 @@ void LaunchExl3PrefillGemmGrouped(const Exl3GemmProblem* problems,
                                   std::size_t count, std::size_t max_rows,
                                   std::uint32_t k, std::uint32_t n,
                                   quant::exl3::BitRate rate, bool residual,
-                                  hipStream_t stream) {
+                                  hipStream_t stream, bool strided_trellis) {
   if (!Exl3GemmShapeSupported(k, n, rate, quant::exl3::Codebook::kMul1) ||
       count == 0 || count > 65535) {
     throw std::invalid_argument("EXL3 grouped GEMM: unsupported problem set");
   }
   if (max_rows == 0)
     return;
-  LaunchExl3Bits<1>(rate.bits, residual, PickExl3Tile(max_rows, n), nullptr,
-                    nullptr, nullptr, max_rows, n, k, nullptr, problems,
-                    static_cast<unsigned>(count), stream);
+  if (strided_trellis)
+    LaunchExl3Bits<4>(rate.bits, residual, PickExl3Tile(max_rows, n), nullptr,
+                      nullptr, nullptr, max_rows, n, k, nullptr, problems,
+                      static_cast<unsigned>(count), stream);
+  else
+    LaunchExl3Bits<1>(rate.bits, residual, PickExl3Tile(max_rows, n), nullptr,
+                      nullptr, nullptr, max_rows, n, k, nullptr, problems,
+                      static_cast<unsigned>(count), stream);
   HIP_CHECK(hipGetLastError());
 }
 
