@@ -2,12 +2,13 @@
 // raw rows) + MoeEpilogue against the fused PrefillCombineKernel on FP16 raw
 // rows (the q6-gated raw path), at 2048 tokens x 10 experts x 2560: time and
 // relative L2.
-#include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hip"
-
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
+
+#include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hip"
 
 namespace fnr = gufo::models::qwen38_flash_next::rocm;
 namespace ex = gufo::quant::exl3;
@@ -73,8 +74,8 @@ int main() {
     l.svh = d_svh;
     l.n = width;
   }
-  std::vector<float> raw(std::size_t(A) * width), w(A), sh(std::size_t(rows) * width),
-      gate(rows * 3);
+  std::vector<float> raw(std::size_t(A) * width), w(A),
+      sh(std::size_t(rows) * width), gate(rows * 3);
   for (std::size_t i = 0; i < raw.size(); ++i)
     raw[i] = float(int(i * 2654435761U % 2001) - 1000) / 37.0F;
   for (unsigned i = 0; i < A; ++i)
@@ -109,14 +110,16 @@ int main() {
     hipLaunchKernelGGL(fnr::RestoreDownBuckets, dim3(width / 128, A), dim3(32),
                        0, nullptr, d_bank, d_off, experts, d_exp, d_work, width,
                        d_scatter, d_slots);
-    fnr::MoeEpilogue(d_scatter, d_w, d_sh, d_g + 1, 3, d_ref, rows, used,
-                     width, nullptr);
+    fnr::MoeEpilogue(d_scatter, d_w, d_sh, d_g + 1, 3, d_ref, rows, used, width,
+                     nullptr);
   };
   const auto new_path = [&] {
-    hipLaunchKernelGGL(fnr::PrefillCombineKernel, dim3((width / 128 + 7) / 8, rows),
-                       dim3(256), 0, nullptr, d_bank, d_off, experts, d_inv,
-                       reinterpret_cast<const _Float16*>(d_raw16), d_w, d_sh,
-                       d_g + 1, 3u, d_new, used, width);
+    const fnr::Exl3PrefillMoeRows moe{d_bank,  d_off, experts, d_inv,
+                                      d_raw16, d_w,   d_sh,    d_g + 1,
+                                      3u,      used,  width};
+    hipLaunchKernelGGL(fnr::PrefillCombineKernel,
+                       dim3((width / 128 + 7) / 8, rows), dim3(256), 0, nullptr,
+                       moe, d_new);
   };
   old_path();
   new_path();
@@ -124,6 +127,13 @@ int main() {
   std::vector<float> a(sh.size()), b(sh.size());
   Ck(hipMemcpy(a.data(), d_ref, a.size() * 4, hipMemcpyDeviceToHost));
   Ck(hipMemcpy(b.data(), d_new, b.size() * 4, hipMemcpyDeviceToHost));
+  if (const char* dump = std::getenv("FN_COMBINE_DUMP")) {
+    // Fused-combine output bytes, to compare builds bit for bit.
+    if (FILE* f = std::fopen(dump, "wb")) {
+      std::fwrite(b.data(), 4, b.size(), f);
+      std::fclose(f);
+    }
+  }
   double num = 0, den = 0;
   for (std::size_t i = 0; i < a.size(); ++i) {
     num += (double(a[i]) - b[i]) * (double(a[i]) - b[i]);
@@ -136,8 +146,9 @@ int main() {
       },
       10);
   const float t_old = TimeIt(old_path, 10) - copy, t_new = TimeIt(new_path, 10);
-  std::printf("MoE tail %u tokens: FP32 restore+scatter+epilogue %.3f ms | "
-              "FP16 fused combine %.3f ms, rel L2 %.2e\n",
-              rows, t_old, t_new, std::sqrt(num / den));
+  std::printf(
+      "MoE tail %u tokens: FP32 restore+scatter+epilogue %.3f ms | "
+      "FP16 fused combine %.3f ms, rel L2 %.2e\n",
+      rows, t_old, t_new, std::sqrt(num / den));
   return 0;
 }

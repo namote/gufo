@@ -1385,59 +1385,22 @@ void PrefillExperts(const DeviceLayer& layer, const float* x,
 
 namespace {
 // RestoreDownBuckets' arithmetic for each of a token's slots, then
-// MoeEpilogueKernel's weighted sum (same expressions, values pinned between
-// them), straight from the packed raw rows: neither the restored rows nor
-// their slot-ordered copy reach memory. One wave per 128-wide segment.
+// MoeEpilogueKernel's weighted sum, straight from the packed raw rows
+// (Exl3PrefillMoeSegment, shared with the fused HC combine): neither the
+// restored rows nor their slot-ordered copy reach memory. One wave per
+// 128-wide segment; the fallback when the HC combine does not fuse it.
 __global__ __launch_bounds__(256) void PrefillCombineKernel(
-    const ex::DeviceLinear* bank, const unsigned* offsets, unsigned experts,
-    const std::int32_t* inverse, const _Float16* raw, const float* weights,
-    const float* shared, const float* gate, unsigned gate_stride, float* out,
-    unsigned k, unsigned width) {
+    Exl3PrefillMoeRows rows, float* out) {
   const unsigned t = blockIdx.y, lane = threadIdx.x % 32;
   const unsigned segment = blockIdx.x * 8 + threadIdx.x / 32;
-  if (segment * 128 >= width)
+  if (segment * 128 >= rows.width)
     return;
-  const unsigned first = segment * 128 + lane * 4;
-  constexpr unsigned kMaxSlots = 16;
-  float acc[4];
+  float o[4];
+  Exl3PrefillMoeSegment(rows, t, segment, lane, o);
+  const auto first = std::size_t{t} * rows.width + segment * 128 + lane * 4;
 #pragma unroll
-  for (unsigned j = 0; j < 4; ++j) {
-    acc[j] = 0.0F;
-    asm volatile("" : "+v"(acc[j]));
-  }
-  for (unsigned slot = 0; slot < kMaxSlots; ++slot) {
-    if (slot >= k)
-      break;
-    const unsigned assignment = t * k + slot;
-    const unsigned packed = static_cast<unsigned>(inverse[assignment]);
-    const unsigned lo = BucketExpert(offsets, experts, packed);
-    const auto* svh = reinterpret_cast<const _Float16*>(bank[lo].svh);
-    const auto offset = std::size_t{packed} * width + first;
-    float v[4];
-#pragma unroll
-    for (unsigned j = 0; j < 4; ++j) {
-      v[j] = static_cast<float>(raw[offset + j]);
-      asm volatile("" : "+v"(v[j]));
-    }
-    arithmetic::Butterfly128(v, lane);
-    const float w = weights[assignment];
-#pragma unroll
-    for (unsigned j = 0; j < 4; ++j) {
-      float restored = (v[j] * arithmetic::kHadamardScale) *
-                       static_cast<float>(svh[first + j]);
-      asm volatile("" : "+v"(restored));
-      float a = acc[j] + w * restored;
-      asm volatile("" : "+v"(a));
-      acc[j] = a;
-    }
-  }
-  const float g = gate[std::size_t{t} * gate_stride];
-  const float sig = 1.0f / (1.0f + __expf(-g));
-#pragma unroll
-  for (unsigned j = 0; j < 4; ++j) {
-    const std::size_t idx = std::size_t{t} * width + first + j;
-    out[idx] = acc[j] + sig * shared[idx];
-  }
+  for (unsigned j = 0; j < 4; ++j)
+    out[first + j] = o[j];
 }
 }  // namespace
 
@@ -1453,11 +1416,12 @@ void Exl3PrefillCombine(const DeviceLayer& layer,
   if (used == 0 || used > 16 || d.rows % 128 != 0 ||
       scratch.inverse == nullptr || scratch.out == nullptr)
     throw std::invalid_argument("EXL3 prefill combine: unsupported call");
+  const Exl3PrefillMoeRows moe{
+      d.device_exl3, scratch.offsets, d.experts, scratch.inverse, scratch.out,
+      weights,       shared,          gate,      gate_stride,     used,
+      d.rows};
   hipLaunchKernelGGL(PrefillCombineKernel, dim3((d.rows / 128 + 7) / 8, rows),
-                     dim3(256), 0, stream, d.device_exl3, scratch.offsets,
-                     d.experts, scratch.inverse,
-                     reinterpret_cast<const _Float16*>(scratch.out), weights,
-                     shared, gate, gate_stride, out, used, d.rows);
+                     dim3(256), 0, stream, moe, out);
   Check();
 }
 
