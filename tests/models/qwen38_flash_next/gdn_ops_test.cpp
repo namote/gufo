@@ -9,6 +9,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -653,6 +654,130 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
 
 }  // namespace
 
+/// EXL3's stable-conv row-split route convolves inside the recurrence. A
+/// call with conv rollback rows takes the separate convolution, scale and
+/// recurrence kernels instead: both must agree bit for bit, and the fused
+/// route must not depend on how the tokens are chunked.
+int RunStableCase(std::uint32_t kTokens) {
+  const std::size_t kQkvCount = static_cast<std::size_t>(kTokens) * kChannels;
+  const std::size_t kStateCount =
+      static_cast<std::size_t>(kVHeads) * kDim * kDim;
+  const std::size_t kConvState =
+      static_cast<std::size_t>(kKernel - 1) * kChannels;
+  const std::size_t kScratch =
+      static_cast<std::size_t>(kTokens + kKernel) * kChannels;
+  const std::size_t kQn =
+      static_cast<std::size_t>(kTokens) * kKHeads * kDim * 3;
+  const std::size_t kRaw = static_cast<std::size_t>(kTokens) * kVHeads * kDim;
+  const std::size_t kOut = static_cast<std::size_t>(kTokens) * kZ;
+  HipBuffer<float> d_qkv(kQkvCount);
+  HipBuffer<float> d_z(kOut);
+  HipBuffer<float> d_alpha_beta(static_cast<std::size_t>(kTokens) * 2 *
+                                kVHeads);
+  HipBuffer<float> d_conv_w(static_cast<std::size_t>(kChannels) * kKernel);
+  HipBuffer<float> d_a(kVHeads);
+  HipBuffer<float> d_dt(kVHeads);
+  HipBuffer<float> d_norm_w(kDim);
+  HipBuffer<float> d_scratch(kScratch);
+  HipBuffer<float> d_qn(kQn);
+  HipBuffer<float> d_kn(kQn);
+  HipBuffer<float> d_raw(kRaw);
+  HipBuffer<float> d_conv_state(kConvState);
+  HipBuffer<float> d_state(kStateCount);
+  HipBuffer<float> d_out(kOut);
+  Upload(&d_qkv, MakeValues(kQkvCount, 0x5151ABCDU, 1.0F));
+  Upload(&d_z, MakeValues(kOut, 0x7E57F00DU, 2.0F));
+  Upload(&d_alpha_beta,
+         MakeValues(static_cast<std::size_t>(kTokens) * 2 * kVHeads,
+                    0xA1B2C3D4U, 2.0F));
+  Upload(&d_conv_w, MakeValues(static_cast<std::size_t>(kChannels) * kKernel,
+                               0x0DDBA11U, 0.5F));
+  Upload(&d_a, MakeValues(kVHeads, 0xC0FFEE22U, 1.0F, -1.5F));
+  Upload(&d_dt, MakeValues(kVHeads, 0xFEEDBEEFU, 1.0F));
+  Upload(&d_norm_w, MakeValues(kDim, 0x600DD00DU, 0.5F, 1.0F));
+  const auto conv_state = MakeValues(kConvState, 0x2468BDF1U, 1.0F);
+  const auto state = MakeValues(kStateCount, 0x13572468U, 0.1F);
+
+  struct Result {
+    std::vector<float> out, state, conv;
+  };
+  // Tokens [first, first + count) of the batch, continuing the state.
+  const auto call = [&](std::uint32_t first, std::uint32_t count,
+                        q::RollbackRows conv_rows) {
+    q::GatedDeltaNet(
+        d_qkv.get() + static_cast<std::size_t>(first) * kChannels, kChannels,
+        d_z.get() + static_cast<std::size_t>(first) * kZ, kZ,
+        d_alpha_beta.get() + static_cast<std::size_t>(first) * 2 * kVHeads,
+        d_conv_w.get(), d_a.get(), d_dt.get(), d_norm_w.get(),
+        d_conv_state.get(), d_scratch.get(), d_qn.get(), d_kn.get(),
+        d_raw.get(), d_state.get(),
+        d_out.get() + static_cast<std::size_t>(first) * kZ, nullptr, {},
+        conv_rows, count, kKHeads, kVHeads, kDim, kKernel, true, false, kEps,
+        nullptr, nullptr, {}, 0, nullptr, nullptr, true);
+  };
+  const auto run = [&](const std::vector<std::uint32_t>& chunks,
+                       q::RollbackRows conv_rows) {
+    Upload(&d_conv_state, conv_state);
+    Upload(&d_state, state);
+    std::uint32_t first = 0;
+    for (const auto count : chunks) {
+      call(first, count, conv_rows);
+      first += count;
+    }
+    CheckHip(hipDeviceSynchronize(), "stable GDN synchronization");
+    return Result{Download(&d_out, kOut), Download(&d_state, kStateCount),
+                  Download(&d_conv_state, kConvState)};
+  };
+  const auto bytes_equal = [](const std::vector<float>& x,
+                              const std::vector<float>& y) {
+    return x.size() == y.size() &&
+           std::memcmp(x.data(), y.data(), x.size() * sizeof(float)) == 0;
+  };
+  const auto same = [&](const Result& x, const Result& y) {
+    return bytes_equal(x.out, y.out) && bytes_equal(x.state, y.state) &&
+           bytes_equal(x.conv, y.conv);
+  };
+  const Result fused = run({kTokens}, {});
+  if (kTokens <= 8) {
+    std::vector<std::unique_ptr<HipBuffer<float>>> rows;
+    q::RollbackRows conv_rows;
+    for (auto& row : conv_rows.rows) {
+      rows.push_back(std::make_unique<HipBuffer<float>>(kConvState));
+      row = rows.back()->get();
+    }
+    if (!same(fused, run({kTokens}, conv_rows)))
+      throw std::runtime_error(
+          "fused stable GDN differs from the separate convolution");
+  }
+  if (kTokens > 1) {
+    const std::uint32_t head = kTokens / 3 + 1;
+    if (!same(fused, run({head, kTokens - head}, {})) ||
+        !same(fused, run({1, kTokens - 1}, {})))
+      throw std::runtime_error("fused stable GDN depends on chunking");
+    // A checkpoint captures the state and history a prefix call leaves.
+    const std::uint32_t prefix = kTokens / 2;
+    HipBuffer<float> cp_state(kStateCount);
+    HipBuffer<float> cp_history(kConvState);
+    Upload(&d_conv_state, conv_state);
+    Upload(&d_state, state);
+    q::GatedDeltaNet(
+        d_qkv.get(), kChannels, d_z.get(), kZ, d_alpha_beta.get(),
+        d_conv_w.get(), d_a.get(), d_dt.get(), d_norm_w.get(),
+        d_conv_state.get(), d_scratch.get(), d_qn.get(), d_kn.get(),
+        d_raw.get(), d_state.get(), d_out.get(), nullptr, {}, {}, kTokens,
+        kKHeads, kVHeads, kDim, kKernel, true, false, kEps, nullptr, nullptr,
+        {cp_state.get(), cp_history.get(), prefix}, 0, nullptr, nullptr, true);
+    CheckHip(hipDeviceSynchronize(), "stable GDN checkpoint");
+    const auto captured_state = Download(&cp_state, kStateCount);
+    const auto captured_history = Download(&cp_history, kConvState);
+    const Result head_only = run({prefix}, {});
+    if (!bytes_equal(captured_state, head_only.state) ||
+        !bytes_equal(captured_history, head_only.conv))
+      throw std::runtime_error("fused stable GDN checkpoint differs");
+  }
+  return 0;
+}
+
 int main() {
   try {
     // Short batches cover every rollback prefix and the no-snapshot case.
@@ -665,6 +790,11 @@ int main() {
     }
     if (RunCase(1, true) != 0 || RunCase(8, true) != 0)
       return 1;
+    for (std::uint32_t n : {1u, 2u, 3u, 5u, 8u, 37u, 99u}) {
+      std::cout << "stable n=" << n << '\n';
+      if (RunStableCase(n) != 0)
+        return 1;
+    }
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

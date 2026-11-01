@@ -786,6 +786,8 @@ private:
     float* inject;
     float* block_out;
     float* hc_defer_w;  ///< [t][4] stream weights of a deferred combine
+    /// [t][4] stream norm scales of a combine that left s_.xn unwritten.
+    float* xn_scale{nullptr};
     // linear attention
     float* qkv;
     float* z;
@@ -983,6 +985,15 @@ private:
   mutable bool half_bf16_{false};
   /// Set by a combine that wrote s_.xn_half / s_.xn_q8t instead of s_.xn.
   mutable bool xn_half_{false};
+  /// An EXL3 prefill combine that wrote the F16 norm and s_.xn_scale but no
+  /// F32 s_.xn: its residual, gamma and rows, for the next mixer to
+  /// recompute the norm from (or materialize it into s_.xn).
+  struct DeferredNorm {
+    const float* res{nullptr};
+    const float* gamma{nullptr};
+    std::uint32_t rows{0};
+  };
+  mutable DeferredNorm xn_deferred_{};
   /// Partial sums per inject logit the last HcMix left in s_.inject.
   mutable std::uint32_t inject_parts_{1};
   /// Inject weights whose partials the last combine already wrote to

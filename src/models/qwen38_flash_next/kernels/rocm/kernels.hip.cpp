@@ -405,6 +405,18 @@ __global__ void HcMixEpilogueKernel(const float* xn, const float* gate,
   }
 }
 
+/// One stream's normalized float4, as HcCombineVec4Kernel stores it and
+/// its consumers recompute it: v * (scale * gamma) per element, the order
+/// fast-math gave the combine's original v * scale * gamma.
+__device__ __forceinline__ float4 HcNorm4(float4 v, float sc, float4 gm) {
+  // The result is pinned too: a consumer's own products must not fold
+  // into this one.
+  return float4{Materialize(v.x * Materialize(sc * gm.x)),
+                Materialize(v.y * Materialize(sc * gm.y)),
+                Materialize(v.z * Materialize(sc * gm.z)),
+                Materialize(v.w * Materialize(sc * gm.w))};
+}
+
 /// Four adjacent hidden lanes per thread. This keeps the stream arithmetic in
 /// registers while cutting the number of blocks and inject partials by almost
 /// four for the model's 2,560-wide, four-stream rows.
@@ -419,10 +431,14 @@ __device__ __forceinline__ float4 Load4(const __half* p) {
   return float4{lo.x, lo.y, hi.x, hi.y};
 }
 
-template<typename XnT>
+/// kFromRes: xn is the residual row and the norm is recomputed from it,
+/// gamma and the combine's per-stream scales (HcNorm4).
+template<typename XnT, bool kFromRes = false>
 __global__ void HcMixEpilogueVec4Kernel(const XnT* xn, const float* gate,
                                         const float* inject_w, float* mixed,
-                                        float* inject, std::uint32_t hidden) {
+                                        float* inject, std::uint32_t hidden,
+                                        const float* gamma = nullptr,
+                                        const float* xn_scale = nullptr) {
   constexpr std::uint32_t kStreams = 4;
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t i = (blockIdx.y * blockDim.x + threadIdx.x) * 4;
@@ -430,10 +446,30 @@ __global__ void HcMixEpilogueVec4Kernel(const XnT* xn, const float* gate,
   const XnT* x = xn + static_cast<std::size_t>(t) * hc_dim;
   float4 v[kStreams];
   float4 acc{0.0F, 0.0F, 0.0F, 0.0F};
+  if constexpr (kFromRes) {
+    // Every load is issued before the first pinned product, which would
+    // otherwise wait on each stream's row in turn.
+    float4 gm[kStreams];
+    float sc[kStreams];
+#pragma unroll
+    for (std::uint32_t s = 0; s < kStreams; ++s) {
+      const std::size_t idx = static_cast<std::size_t>(s) * hidden + i;
+      v[s] = i < hidden ? Load4(x + idx) : float4{0.0F, 0.0F, 0.0F, 0.0F};
+      gm[s] = i < hidden ? *reinterpret_cast<const float4*>(gamma + idx)
+                         : float4{0.0F, 0.0F, 0.0F, 0.0F};
+      sc[s] = xn_scale[(static_cast<std::size_t>(t) * kStreams) + s];
+    }
+#pragma unroll
+    for (std::uint32_t s = 0; s < kStreams; ++s) {
+      if (i < hidden)
+        v[s] = HcNorm4(v[s], sc[s], gm[s]);
+    }
+  }
 #pragma unroll
   for (std::uint32_t s = 0; s < kStreams; ++s) {
     const std::size_t idx = static_cast<std::size_t>(s) * hidden + i;
-    v[s] = i < hidden ? Load4(x + idx) : float4{0.0F, 0.0F, 0.0F, 0.0F};
+    if constexpr (!kFromRes)
+      v[s] = i < hidden ? Load4(x + idx) : float4{0.0F, 0.0F, 0.0F, 0.0F};
     if (i < hidden) {
       const float4 g = *reinterpret_cast<const float4*>(
           gate + static_cast<std::size_t>(t) * hc_dim + idx);
@@ -855,7 +891,8 @@ __global__ void HcCombineVec4Kernel(
     float* res, const float* block_out, const float* inject,
     std::uint32_t inject_parts, const float* gamma, XnT* xn, void* xn_q8,
     std::uint32_t hidden, float eps, float* defer_w,
-    const float* inject_w = nullptr, float* inject_out = nullptr) {
+    const float* inject_w = nullptr, float* inject_out = nullptr,
+    __half* xn_half = nullptr, float* xn_scale = nullptr) {
   constexpr std::uint32_t kStreams = 4;
   constexpr std::uint32_t kMaxChunks = 10;  // 4 x 2560 / 4 / kThreads
   __shared__ float shared[kStreams][kThreads / 32];
@@ -932,6 +969,13 @@ __global__ void HcCombineVec4Kernel(
     }
     scale[k] = rsqrtf(total / static_cast<float>(hidden) + eps);
   }
+  if (xn_scale != nullptr) {
+#pragma unroll
+    for (std::uint32_t k = 0; k < kStreams; ++k) {
+      if (threadIdx.x == k)
+        xn_scale[(static_cast<std::size_t>(t) * kStreams) + k] = scale[k];
+    }
+  }
   const std::size_t num_blocks = hc_dim / 32;
 #pragma unroll
   for (std::uint32_t c = 0; c < kMaxChunks; ++c) {
@@ -943,11 +987,30 @@ __global__ void HcCombineVec4Kernel(
       const std::uint32_t s = e / hidden;
       const float sc = scale[s];
       const float4 gm = *reinterpret_cast<const float4*>(gamma + e);
-      n = float4{v[c].x * sc * gm.x, v[c].y * sc * gm.y, v[c].z * sc * gm.z,
-                 v[c].w * sc * gm.w};
+      // The F32 route's consumers may recompute this norm (HcNorm4); the F16
+      // route keeps its original expression.
+      if constexpr (std::is_same_v<XnT, float>) {
+        n = HcNorm4(v[c], sc, gm);
+      } else {
+        n = float4{v[c].x * sc * gm.x, v[c].y * sc * gm.y, v[c].z * sc * gm.z,
+                   v[c].w * sc * gm.w};
+      }
       XnT* out = xn + (static_cast<std::size_t>(t) * hc_dim) + e;
       if constexpr (std::is_same_v<XnT, float>) {
-        *reinterpret_cast<float4*>(out) = n;
+        if (xn_scale == nullptr)
+          *reinterpret_cast<float4*>(out) = n;
+        // The F16 copy a projection would otherwise narrow from `out`
+        // (NarrowHalf4Kernel's conversion).
+        // Streaming stores: the projection that reads these rows next
+        // otherwise finds them dirty in the caches.
+        if (xn_half != nullptr) {
+          __half* h = xn_half + (static_cast<std::size_t>(t) * hc_dim) + e;
+          using Half4Bits = std::uint16_t __attribute__((ext_vector_type(4)));
+          const Half4Bits bits{
+              __half_as_ushort(__half(n.x)), __half_as_ushort(__half(n.y)),
+              __half_as_ushort(__half(n.z)), __half_as_ushort(__half(n.w))};
+          __builtin_nontemporal_store(bits, reinterpret_cast<Half4Bits*>(h));
+        }
       } else {
         const __half2 lo = __floats2half2_rn(n.x, n.y);
         const __half2 hi = __floats2half2_rn(n.z, n.w);
@@ -1709,12 +1772,34 @@ constexpr int kGdnWindowsAhead = 3;
 constexpr int kGdnRows = 2;   // state rows per lane
 constexpr int kGdnWaves = 4;  // waves per block
 constexpr int kGdnRowSplitRowsPerBlock = 8 * kGdnRows * kGdnWaves;
+constexpr int kGdnConvHistory = 3;  // four-tap convolution
 
+/// SsmConv4Kernel<..., stable=true>'s arithmetic for one channel and token:
+/// w0..w2 are tokens t-3..t-1 and v is token t.
+__device__ __forceinline__ float GdnStableConv4(float4 taps, float w0, float w1,
+                                                float w2, float v) {
+  float acc = Materialize(Materialize(taps.x) * Materialize(w0));
+  acc = Materialize(__builtin_fmaf(Materialize(taps.y), Materialize(w1), acc));
+  acc = Materialize(__builtin_fmaf(Materialize(taps.z), Materialize(w2), acc));
+  acc = Materialize(__builtin_fmaf(Materialize(taps.w), Materialize(v), acc));
+  return SiluF(acc);
+}
+
+/// kConv: the block convolves its own q, k and v channels from the raw
+/// projection (EXL3's stable four-tap convolution, history from conv_state)
+/// and computes GdnPrepKqKernel's scales per token from the staged q and k,
+/// so neither the convolved rows nor the scales round-trip through memory.
+/// Every value keeps the separate kernels' arithmetic; conv_state is read
+/// only (the caller shifts history after this kernel).
+template<bool kConv>
 __launch_bounds__(kGdnWaves * 32) __global__
     void GdnRowSplitKernel(const float* conv_out, const float* scales,
                            const float* ab, float* state, float* raw,
                            std::uint32_t n_tokens, std::uint32_t k_heads,
-                           std::uint32_t v_heads, GdnCheckpoint checkpoint) {
+                           std::uint32_t v_heads, GdnCheckpoint checkpoint,
+                           const float* qkv, std::uint32_t qkv_stride,
+                           const float* conv_w, const float* conv_state,
+                           float eps) {
   constexpr int kRows = kGdnRows;
   constexpr int kWaves = kGdnWaves;
   constexpr int d = kGdnDim;
@@ -1732,6 +1817,10 @@ __launch_bounds__(kGdnWaves * 32) __global__
   static_assert(kQkChunks % kThreadsPerBlock == 0);
   static_assert(kVChunks % kThreadsPerBlock == 0);
   static_assert(kW * 5 <= kThreadsPerBlock, "scales and decays per window");
+  // kConv: two q|k channels per thread, and one v channel for each thread
+  // below kRowsPerBlock.
+  static_assert(!kConv || 2 * d == 2 * kThreadsPerBlock);
+  static_assert(!kConv || kRowsPerBlock <= kThreadsPerBlock);
   const int h = blockIdx.y;
   const int tid = threadIdx.x;
   const int lane = tid & 31;
@@ -1767,6 +1856,35 @@ __launch_bounds__(kGdnWaves * 32) __global__
 
   // Window loads: chunk c of the q/k plane is (q or k, token, float4 index),
   // laid out so a token's 128 floats are 32 consecutive chunks.
+  // kConv sources: channels cq_ch and cq_ch + 1 of the key head's q (or k)
+  // row, stored into half cq_half of LDS float4 cq_slot; v channel cv_ch.
+  const int cq_which = tid >> 6;
+  const int cq_vec = (tid >> 1) & 31;
+  const int cq_half = tid & 1;
+  const int cq_ch =
+      ((cq_which == 0 ? kh : k_heads + kh) * d) + (cq_vec * 4) + (cq_half * 2);
+  const int cq_slot = ((cq_vec % kVec) * kLanesPerRow) + (cq_vec / kVec);
+  const bool has_v = tid < kRowsPerBlock;
+  const int cv_ch = (2 * k_heads * d) + (h * d) + (blockIdx.x * kRowsPerBlock) +
+                    (has_v ? tid : 0);
+  float4 tap_q0{};
+  float4 tap_q1{};
+  float4 tap_v{};
+  // hist_*[i] holds raw token t0 - 3 + i of the next window to convolve.
+  float2 hist_q[kGdnConvHistory]{};
+  float hist_v[kGdnConvHistory]{};
+  if constexpr (kConv) {
+    const auto* taps = reinterpret_cast<const float4*>(conv_w);
+    tap_q0 = taps[cq_ch];
+    tap_q1 = taps[cq_ch + 1];
+    tap_v = taps[cv_ch];
+#pragma unroll
+    for (int i = 0; i < kGdnConvHistory; ++i) {
+      hist_q[i] = *reinterpret_cast<const float2*>(
+          conv_state + (static_cast<std::size_t>(i) * channels) + cq_ch);
+      hist_v[i] = conv_state[(static_cast<std::size_t>(i) * channels) + cv_ch];
+    }
+  }
   const float* qk_src[kQkPerThread];
   int qk_tok[kQkPerThread];
   int qk_which[kQkPerThread];
@@ -1794,8 +1912,11 @@ __launch_bounds__(kGdnWaves * 32) __global__
     v_src[j] = conv_out + 2 * k_heads * d + h * d + blockIdx.x * kRowsPerBlock +
                v_row[j];
   }
-  const int m_tok = tid / 5;
-  const int m_idx = tid % 5;
+  // kConv loads only the decay and beta (s_misc[..][3..4]); it computes the
+  // scales per token from LDS.
+  constexpr int kMiscLoads = kConv ? 2 : 5;
+  const int m_tok = tid / kMiscLoads;
+  const int m_idx = (tid % kMiscLoads) + (kConv ? 3 : 0);
   const float* m_src =
       m_idx < 3 ? scales + kh * 3 + m_idx : ab + h * 2 + (m_idx - 3);
   const std::size_t m_stride = m_idx < 3 ? k_heads * 3 : v_heads * 2;
@@ -1805,43 +1926,96 @@ __launch_bounds__(kGdnWaves * 32) __global__
   // Two named q/k vectors: an array of them stayed in private memory
   // (112 B of scratch, reloaded every window).
   static_assert(kQkPerThread == 2, "named q/k window vectors");
-  struct Window {
+  struct PlainWindow {
     float4 qk0;
     float4 qk1;
     float v[kVPerThread];
     float m;
   };
+  // kConv: the raw projection values of the window's tokens.
+  struct ConvWindow {
+    float2 q[kW];
+    float v[kW];
+    float m;
+  };
+  using Window = std::conditional_t<kConv, ConvWindow, PlainWindow>;
   Window r0;
   Window r1;
   Window r2;
   const auto load_window = [&](int w, Window& r) {
     const int last = static_cast<int>(n_tokens) - 1;
-    const auto qk_row = [&](int j) {
-      const int t_qk = min((w * kW) + qk_tok[j], last);
-      return *reinterpret_cast<const float4*>(
-          qk_src[j] + static_cast<std::size_t>(t_qk) * channels);
-    };
-    r.qk0 = qk_row(0);
-    r.qk1 = qk_row(1);
+    if constexpr (kConv) {
 #pragma unroll
-    for (int j = 0; j < kVPerThread; ++j) {
-      const int t_v = min((w * kW) + v_tok[j], last);
-      r.v[j] = v_src[j][static_cast<std::size_t>(t_v) * channels];
-    }
-    if (tid < 5 * kW) {
-      const int t_m = min((w * kW) + m_tok, last);
-      r.m = m_src[static_cast<std::size_t>(t_m) * m_stride];
+      for (int tl = 0; tl < kW; ++tl) {
+        const auto t =
+            static_cast<std::size_t>(min((w * kW) + tl, last)) * qkv_stride;
+        r.q[tl] = *reinterpret_cast<const float2*>(qkv + t + cq_ch);
+        if (has_v)
+          r.v[tl] = qkv[t + cv_ch];
+      }
+      if (tid < kMiscLoads * kW) {
+        const int t_m = min((w * kW) + m_tok, last);
+        r.m = m_src[static_cast<std::size_t>(t_m) * m_stride];
+      }
+      return;
+    } else {
+      const auto qk_row = [&](int j) {
+        const int t_qk = min((w * kW) + qk_tok[j], last);
+        return *reinterpret_cast<const float4*>(
+            qk_src[j] + static_cast<std::size_t>(t_qk) * channels);
+      };
+      r.qk0 = qk_row(0);
+      r.qk1 = qk_row(1);
+#pragma unroll
+      for (int j = 0; j < kVPerThread; ++j) {
+        const int t_v = min((w * kW) + v_tok[j], last);
+        r.v[j] = v_src[j][static_cast<std::size_t>(t_v) * channels];
+      }
+      if (tid < 5 * kW) {
+        const int t_m = min((w * kW) + m_tok, last);
+        r.m = m_src[static_cast<std::size_t>(t_m) * m_stride];
+      }
     }
   };
+  // Windows commit in token order, so the history registers always hold
+  // the three raw tokens before the window being convolved.
   const auto commit_window = [&](const Window& r, int lds) {
-    s_qk[lds][qk_which[0]][qk_tok[0]][qk_slot[0]] = r.qk0;
-    s_qk[lds][qk_which[1]][qk_tok[1]][qk_slot[1]] = r.qk1;
+    if constexpr (kConv) {
 #pragma unroll
-    for (int j = 0; j < kVPerThread; ++j) {
-      s_v[lds][v_tok[j]][v_row[j]] = r.v[j];
-    }
-    if (tid < 5 * kW) {
-      s_misc[lds][m_tok][m_idx] = r.m;
+      for (int tl = 0; tl < kW; ++tl) {
+        const float2 x = r.q[tl];
+        float2 y;
+        y.x =
+            GdnStableConv4(tap_q0, hist_q[0].x, hist_q[1].x, hist_q[2].x, x.x);
+        y.y =
+            GdnStableConv4(tap_q1, hist_q[0].y, hist_q[1].y, hist_q[2].y, x.y);
+        reinterpret_cast<float2*>(&s_qk[lds][cq_which][tl][cq_slot])[cq_half] =
+            y;
+        hist_q[0] = hist_q[1];
+        hist_q[1] = hist_q[2];
+        hist_q[2] = x;
+        if (has_v) {
+          s_v[lds][tl][tid] =
+              GdnStableConv4(tap_v, hist_v[0], hist_v[1], hist_v[2], r.v[tl]);
+          hist_v[0] = hist_v[1];
+          hist_v[1] = hist_v[2];
+          hist_v[2] = r.v[tl];
+        }
+      }
+      if (tid < kMiscLoads * kW) {
+        s_misc[lds][m_tok][m_idx] = r.m;
+      }
+      return;
+    } else {
+      s_qk[lds][qk_which[0]][qk_tok[0]][qk_slot[0]] = r.qk0;
+      s_qk[lds][qk_which[1]][qk_tok[1]][qk_slot[1]] = r.qk1;
+#pragma unroll
+      for (int j = 0; j < kVPerThread; ++j) {
+        s_v[lds][v_tok[j]][v_row[j]] = r.v[j];
+      }
+      if (tid < 5 * kW) {
+        s_misc[lds][m_tok][m_idx] = r.m;
+      }
     }
   };
 
@@ -1902,9 +2076,36 @@ __launch_bounds__(kGdnWaves * 32) __global__
           p[rr] = __builtin_fmaf(s[rr][i].w, qv.w, p[rr]);
         }
       }
-      const float inv_k = s_misc[lds][tl][0];
-      const float q_scale = s_misc[lds][tl][1];
-      const float kq = s_misc[lds][tl][2];
+      float inv_k;
+      float q_scale;
+      float kq;
+      if constexpr (kConv) {
+        // GdnPrepKqKernel for this token: lane L takes the head's float4 L.
+        const int slot = ((lane % kVec) * kLanesPerRow) + (lane / kVec);
+        const float4 q = q4[slot];
+        const float4 k = k4[slot];
+        float qs = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+        float ks = k.x * k.x + k.y * k.y + k.z * k.z + k.w * k.w;
+        float dot = k.x * q.x + k.y * q.y + k.z * q.z + k.w * q.w;
+#pragma unroll
+        for (unsigned offset = 16; offset > 0; offset >>= 1) {
+          qs += XorLane(qs, offset);
+          ks += XorLane(ks, offset);
+          dot += XorLane(dot, offset);
+        }
+        // Lane 0's sums, as GdnPrepKqKernel stores them.
+        const auto first = [](float x) {
+          return __builtin_bit_cast(float, __builtin_amdgcn_readfirstlane(
+                                               __builtin_bit_cast(int, x)));
+        };
+        inv_k = rsqrtf(first(ks) + eps);
+        q_scale = rsqrtf(first(qs) + eps) * rsqrtf(static_cast<float>(d));
+        kq = first(dot);
+      } else {
+        inv_k = s_misc[lds][tl][0];
+        q_scale = s_misc[lds][tl][1];
+        kq = s_misc[lds][tl][2];
+      }
       const float beta = s_misc[lds][tl][4];
 #pragma unroll
       for (int rr = 0; rr < kRows; ++rr) {
@@ -6233,6 +6434,40 @@ void HcMixEpilogueVec4(const float* xn, const float* gate,
                      0, stream, xn, gate, inject_w, mixed, inject, hidden);
 }
 
+void HcMixEpilogueVec4FromRes(const float* res, const float* gamma,
+                              const float* xn_scale, const float* gate,
+                              const float* inject_w, float* mixed,
+                              float* inject, std::uint32_t n_tokens,
+                              std::uint32_t hidden, hipStream_t stream) {
+  hipLaunchKernelGGL((HcMixEpilogueVec4Kernel<float, true>),
+                     dim3(n_tokens, HcInjectPartsVec4(hidden)), dim3(kThreads),
+                     0, stream, res, gate, inject_w, mixed, inject, hidden,
+                     gamma, xn_scale);
+}
+
+__global__ void HcNormFromResKernel(const float* res, const float* gamma,
+                                    const float* xn_scale, float* xn,
+                                    std::uint32_t hidden) {
+  constexpr std::uint32_t kStreams = 4;
+  const std::uint32_t t = blockIdx.x;
+  const std::size_t hc_dim = static_cast<std::size_t>(kStreams) * hidden;
+  const std::size_t row = static_cast<std::size_t>(t) * hc_dim;
+  for (std::uint32_t e = threadIdx.x * 4; e < hc_dim; e += kThreads * 4) {
+    const std::uint32_t s = e / hidden;
+    *reinterpret_cast<float4*>(xn + row + e) =
+        HcNorm4(*reinterpret_cast<const float4*>(res + row + e),
+                xn_scale[(static_cast<std::size_t>(t) * kStreams) + s],
+                *reinterpret_cast<const float4*>(gamma + e));
+  }
+}
+
+void HcNormFromRes(const float* res, const float* gamma, const float* xn_scale,
+                   float* xn, std::uint32_t n_tokens, std::uint32_t hidden,
+                   hipStream_t stream) {
+  hipLaunchKernelGGL(HcNormFromResKernel, dim3(n_tokens), dim3(kThreads), 0,
+                     stream, res, gamma, xn_scale, xn, hidden);
+}
+
 void HcMixEpilogueVec4F16(const __half* xn, const float* gate,
                           const float* inject_w, float* mixed,
                           __half* mixed_half, void* mixed_q8, float* inject,
@@ -6257,24 +6492,28 @@ void HcMixEpilogueVec4F16(const __half* xn, const float* gate,
   }
 }
 
-void HcCombine(float* res, const float* block_out, const float* inject,
+bool HcCombine(float* res, const float* block_out, const float* inject,
                std::uint32_t inject_parts, const float* gamma, float* xn,
                std::uint32_t n_tokens, std::uint32_t hidden,
                std::uint32_t streams, float eps, hipStream_t stream,
-               bool decode, bool any_width) {
+               bool decode, bool any_width, __half* xn_half, float* xn_scale) {
   // One block per token wants a batch: a decode step keeps the
   // one-block-per-stream kernel's parallelism.
   if (!decode && (n_tokens >= 16 || any_width) && streams == 4 &&
       hidden % 128 == 0 && hidden <= 2560) {
+    xn_half = gamma != nullptr ? xn_half : nullptr;
+    xn_scale = xn_half != nullptr ? xn_scale : nullptr;
     hipLaunchKernelGGL(HcCombineVec4Kernel<float>, dim3(n_tokens),
                        dim3(kThreads), 0, stream, res, block_out, inject,
-                       inject_parts, gamma, xn, nullptr, hidden, eps, nullptr);
-    return;
+                       inject_parts, gamma, xn, nullptr, hidden, eps, nullptr,
+                       nullptr, nullptr, xn_half, xn_scale);
+    return xn_half != nullptr;
   }
   hipLaunchKernelGGL(HcCombineKernel<float>, dim3(n_tokens, streams),
                      dim3(kThreads), 0, stream, res, block_out, inject,
                      inject_parts, gamma, xn, nullptr, hidden, streams, eps,
                      nullptr);
+  return false;
 }
 
 bool HcCombineQ8_1(float* res, const float* block_out, const float* inject,
@@ -6366,7 +6605,8 @@ bool HcCombineF16(float* res, const float* block_out, const float* inject,
                                             : HcCombineVec4Kernel<__half>;
     hipLaunchKernelGGL(combine, dim3(n_tokens), dim3(kThreads), 0, stream, res,
                        block_out, inject, inject_parts, gamma, xn, xn_q8,
-                       hidden, eps, defer_w, nullptr, nullptr);
+                       hidden, eps, defer_w, nullptr, nullptr, nullptr,
+                       nullptr);
     return defer_w != nullptr;
   }
   hipLaunchKernelGGL(HcCombineKernel<__half>, dim3(n_tokens, streams),
@@ -7918,7 +8158,14 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
   if (checkpoint.history != nullptr)
     HistoryPrefix(qkv, qkv_stride, conv_state, checkpoint.history,
                   checkpoint.tokens, channels, kernel - 1, stream);
-  if (!convolved) {
+  // EXL3 prefill: the recurrence convolves its channels itself. It reads
+  // q|k channel pairs as float2, so token rows must be 8-byte aligned.
+  const bool fused_conv =
+      row_split && d == kGdnDim && state_snapshots.rows[0] == nullptr &&
+      stable_conv && !convolved && kernel == kSsmConvTaps &&
+      conv_snapshots.rows[0] == nullptr && qkv_stride % 2 == 0 &&
+      reinterpret_cast<std::uintptr_t>(qkv) % alignof(float2) == 0;
+  if (!convolved && !fused_conv) {
     if (stable_conv && kernel == kSsmConvTaps) {
       // One specialization at every EXL3 width; history updates below use
       // the same stream-ordered shift, including singleton calls.
@@ -7946,7 +8193,30 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                          conv_scratch, n_tokens, channels, kernel);
     }
   }
-  if (!saved_history) {
+  // The rolling state is the last kernel-1 projections: [history ; qkv].
+  const auto shift_history = [&] {
+    const std::uint32_t hist = kernel - 1;
+    const std::size_t hist_count = static_cast<std::size_t>(hist) * channels;
+    hipLaunchKernelGGL(HistoryShiftKernel, dim3(Blocks(hist_count)),
+                       dim3(kThreads), 0, stream, qkv, qkv_stride, conv_state,
+                       conv_scratch + count, n_tokens, channels, hist);
+    hipLaunchKernelGGL(CopyKernel, dim3(Blocks(hist_count)), dim3(kThreads), 0,
+                       stream, conv_scratch + count, conv_state, hist_count);
+  };
+  const unsigned waves = kThreads / 32;
+  if (fused_conv) {
+    hipLaunchKernelGGL(
+        GdnPrepAbKernel,
+        dim3(Blocks(static_cast<std::size_t>(n_tokens) * v_heads)),
+        dim3(kThreads), 0, stream, alpha_beta, a, dt, kn,
+        static_cast<std::size_t>(n_tokens) * v_heads, v_heads);
+    hipLaunchKernelGGL(GdnRowSplitKernel<true>,
+                       dim3(kGdnDim / kGdnRowSplitRowsPerBlock, v_heads),
+                       dim3(kGdnWaves * 32), 0, stream, conv_scratch, qn, kn,
+                       state, raw, n_tokens, k_heads, v_heads, checkpoint, qkv,
+                       qkv_stride, conv_w, conv_state, eps);
+    shift_history();
+  } else if (!saved_history) {
     if (conv_snapshots.rows[0] != nullptr && n_tokens > 1) {
       const std::size_t saved =
           static_cast<std::size_t>(n_tokens - 1) * channels;
@@ -7955,17 +8225,11 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                          stream, qkv, qkv_stride, conv_state, conv_snapshots,
                          n_tokens - 1, channels, kernel - 1);
     }
-    // The rolling state is the last kernel-1 projections: [history ; qkv].
-    const std::uint32_t hist = kernel - 1;
-    const std::size_t hist_count = static_cast<std::size_t>(hist) * channels;
-    hipLaunchKernelGGL(HistoryShiftKernel, dim3(Blocks(hist_count)),
-                       dim3(kThreads), 0, stream, qkv, qkv_stride, conv_state,
-                       conv_scratch + count, n_tokens, channels, hist);
-    hipLaunchKernelGGL(CopyKernel, dim3(Blocks(hist_count)), dim3(kThreads), 0,
-                       stream, conv_scratch + count, conv_state, hist_count);
+    shift_history();
   }
-  const unsigned waves = kThreads / 32;
-  if (row_split && d == kGdnDim && state_snapshots.rows[0] == nullptr) {
+  if (fused_conv) {
+    // Recurrence launched above.
+  } else if (row_split && d == kGdnDim && state_snapshots.rows[0] == nullptr) {
     hipLaunchKernelGGL(GdnPrepKqKernel, dim3(k_heads, n_tokens), dim3(32), 0,
                        stream, conv_scratch, qn, n_tokens, k_heads, channels,
                        eps);
@@ -7974,10 +8238,11 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
         dim3(Blocks(static_cast<std::size_t>(n_tokens) * v_heads)),
         dim3(kThreads), 0, stream, alpha_beta, a, dt, kn,
         static_cast<std::size_t>(n_tokens) * v_heads, v_heads);
-    hipLaunchKernelGGL(GdnRowSplitKernel,
+    hipLaunchKernelGGL(GdnRowSplitKernel<false>,
                        dim3(kGdnDim / kGdnRowSplitRowsPerBlock, v_heads),
                        dim3(kGdnWaves * 32), 0, stream, conv_scratch, qn, kn,
-                       state, raw, n_tokens, k_heads, v_heads, checkpoint);
+                       state, raw, n_tokens, k_heads, v_heads, checkpoint,
+                       nullptr, 0U, nullptr, nullptr, eps);
   } else {
     hipLaunchKernelGGL(GdnPrepKernel<false>,
                        dim3((n_tokens * k_heads + waves - 1) / waves),

@@ -193,11 +193,29 @@ void HcMixEpilogueVec4F16(const __half* xn, const float* gate,
 /// updated residual into `xn`.
 /// `inject` is [t][s][inject_parts] partial sums (1 part for a plain GEMM).
 /// Concatenated decode requests retain scalar reduction with `decode=true`.
-void HcCombine(float* res, const float* block_out, const float* inject,
+/// xn_half, if given, also receives the norm rounded to F16 (the separate
+/// narrowing pass's conversion) where the four-lane kernel runs with a
+/// gamma; returns whether it was written. With xn_scale as well, the F32
+/// norm is not stored: xn_scale receives each row's four stream scales,
+/// from which HcNormFromRes / HcMixEpilogueVec4FromRes recompute it.
+bool HcCombine(float* res, const float* block_out, const float* inject,
                std::uint32_t inject_parts, const float* gamma, float* xn,
                std::uint32_t n_tokens, std::uint32_t hidden,
                std::uint32_t streams, float eps, hipStream_t stream,
-               bool decode = false, bool any_width = false);
+               bool decode = false, bool any_width = false,
+               __half* xn_half = nullptr, float* xn_scale = nullptr);
+/// The F32 norm HcCombine left out (four streams): res * scale * gamma in
+/// the combine's own expression.
+void HcNormFromRes(const float* res, const float* gamma, const float* xn_scale,
+                   float* xn, std::uint32_t n_tokens, std::uint32_t hidden,
+                   hipStream_t stream);
+/// HcMixEpilogueVec4 reading that norm from res, xn_scale and gamma instead
+/// of an F32 xn (four streams, hidden % 4 == 0).
+void HcMixEpilogueVec4FromRes(const float* res, const float* gamma,
+                              const float* xn_scale, const float* gate,
+                              const float* inject_w, float* mixed,
+                              float* inject, std::uint32_t n_tokens,
+                              std::uint32_t hidden, hipStream_t stream);
 // any_width: the four-lane kernel at every token count (no 16-row
 // threshold), so a route fixed by phase never depends on the chunk width.
 /// The one-block-per-stream HcCombine that also writes xn's Q8_1 rows (as

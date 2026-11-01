@@ -121,6 +121,7 @@ void Executor::UseScratch(const Scratch& scratch) const {
   q8t_src_ = nullptr;
   half_src_ = nullptr;
   xn_half_ = false;
+  xn_deferred_ = {};
   moe_pending_ = false;
 }
 
