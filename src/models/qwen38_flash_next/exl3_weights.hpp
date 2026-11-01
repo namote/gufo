@@ -67,8 +67,10 @@ struct Exl3Storage {
                                                  std::uint32_t head_dim,
                                                  const Config& config);
 /// Independently usable CPU projection, with lossless block permutations.
+/// decode_storage includes the decode path's FP32 input rotation and FP16
+/// storage boundary; the default retains the mathematical FP64 formula.
 void Exl3MatVec(const Exl3HostLinear& linear, std::span<const float> x,
-                std::span<float> y);
+                std::span<float> y, bool decode_storage = false);
 
 }  // namespace gufo::models::qwen38_flash_next
 #endif

@@ -927,12 +927,13 @@ struct MtpExecutorFixture {
   }
   explicit MtpExecutorFixture(unsigned max_batch = 16, unsigned expert_ff = 128,
                               int shared_bits = 6, bool linear_prefix = false,
-                              unsigned half_weight_cols = 0) {
+                              unsigned half_weight_cols = 0,
+                              unsigned max_context = 128) {
     config.num_layers = linear_prefix ? 2 : 1;
     config.num_layers_all = config.num_layers + 1;
     config.hidden_size = 128;
     config.vocab_size = 256;
-    config.context_length = 64;
+    config.context_length = max_context / 2;
     config.hc_count = 4;
     config.hc_low_rank = 32;
     config.full_attention_interval = linear_prefix ? 2 : 1;
@@ -941,7 +942,8 @@ struct MtpExecutorFixture {
     config.head_dim = 256;
     config.rotary_dim = 64;
     config.rope_theta = 10000;
-    config.rope_scaling = {.factor = 2.0F, .original_context = 64};
+    config.rope_scaling = {.factor = 2.0F,
+                           .original_context = config.context_length};
     config.indexer_heads = 4;
     config.indexer_head_dim = 128;
     config.indexer_top_k = 8;
@@ -1015,7 +1017,7 @@ struct MtpExecutorFixture {
                                  {.max_batch = max_batch,
                                   .max_logit_rows = 8,
                                   .max_speculative = 8,
-                                  .max_context = 128},
+                                  .max_context = max_context},
                                  &error);
     Require(exec != nullptr, error);
     Require(q::MakeYarnRope(config.rope_scaling, config.rotary_dim,
@@ -1322,6 +1324,47 @@ void DensePrefillProjection() {
                 0x7F7F7F7FU,
             "dense X3 slice overwrote its guard");
   }
+  auto query = key.weight;
+  query.rows = 512;
+  auto* queries = f.buffers.Make<float>(rows * query.rows + 8);
+  for (unsigned chunk : {1U, 9U, 33U, 64U, 65U}) {
+    Check(hipMemset(queries, 0xFF, rows * query.rows * sizeof(float)));
+    Check(hipMemset(queries + rows * query.rows, 0x7F, 8 * sizeof(float)));
+    Check(hipMemset(sliced, 0xFF, rows * slice.rows * sizeof(float)));
+    Check(hipMemset(sliced + rows * slice.rows, 0x7F, 8 * sizeof(float)));
+    Require(exec.BeginMtpCycleDiagnostics(&error), error);
+    for (unsigned first = 0; first < rows; first += chunk)
+      Require(Access::DensePrefill(
+                  exec, {&query, &slice},
+                  {queries + first * query.rows, sliced + first * slice.rows},
+                  x + first * k, std::min(chunk, rows - first), &error),
+              error);
+    gpu::Executor::MtpCycleDiagnostics d;
+    Require(exec.EndMtpCycleDiagnostics(0, 0, &d, &error), error);
+    const auto groups = (rows + chunk - 1) / chunk;
+    Require(d.prefill_dense_rows == rows &&
+                d.prefill_dense_rotation_groups == groups &&
+                d.prefill_dense_gemm_groups == groups,
+            "shared indexer slices repeated their parent projection");
+    Check(hipStreamSynchronize(exec.stream()));
+    for (const auto& [view, dst] :
+         {std::pair{&query, queries}, std::pair{&slice, sliced}}) {
+      const auto actual = Access::Read<float>(dst, rows * view->rows);
+      for (unsigned row = 0; row < rows; ++row)
+        Require(std::memcmp(actual.data() + row * view->rows,
+                            bulk[1].data() + row * key.n + view->output_begin,
+                            view->rows * sizeof(float)) == 0,
+                "shared indexer slice differs from full parent bytes");
+      Require(Access::Read<std::uint32_t>(dst + rows * view->rows, 1)[0] ==
+                  0x7F7F7F7FU,
+              "shared indexer slice overwrote its guard");
+    }
+  }
+  auto other_slice = slice;
+  other_slice.exl3 = value.weight.exl3;
+  Require(!Access::DensePrefill(exec, {&query, &other_slice}, {queries, sliced},
+                                x, rows, &error),
+          "slices of different parents must not share a projection");
 }
 
 void PlainOperandPrecision() {
@@ -1906,6 +1949,40 @@ void ExecutorPrefillExperts() {
   }
 }
 
+void ExecutorPrefillFinalTail() {
+  BeginCase("EXL3 final-layer prefill tail routing IDs");
+  constexpr unsigned rows = 225;
+  MtpExecutorFixture f(rows, 640, 7, false, 0, 256);
+  auto& exec = *f.exec;
+  std::vector<std::int32_t> tokens(rows);
+  for (unsigned r = 0; r < rows; ++r)
+    tokens[r] = 1 + (r * 17) % (f.config.vocab_size - 1);
+  std::string error;
+  const auto prefill = [&](unsigned chunk) {
+    auto session = exec.CreateSession(gufo::core::SessionMode::kAutoregressive,
+                                      256, &error);
+    Require(session != nullptr, error);
+    std::vector<float> logits(f.config.vocab_size);
+    Require(exec.BeginMtpCycleDiagnostics(&error), error);
+    for (unsigned first = 0; first < rows; first += chunk) {
+      const auto count = std::min(chunk, rows - first);
+      Require(exec.Forward(*session, std::span(tokens).subspan(first, count), 1,
+                           logits.data(), gpu::Executor::ForwardMode::kPrefill,
+                           &error),
+              error);
+    }
+    gpu::Executor::MtpCycleDiagnostics d;
+    Require(exec.EndMtpCycleDiagnostics(0, 0, &d, &error), error);
+    Require(d.prefill_expert_rows == (chunk == rows ? 97U : rows),
+            "prefill tail fixture did not exercise the FFN skip");
+    return logits;
+  };
+  // The 225-row call skips 128 final-layer FFN rows and shifts RowScratch
+  // to its 97-row tail. The 64-row chunks compute all FFN rows, with a fresh
+  // router/inverse map per chunk. Their final logits must still be exact.
+  SameBits(prefill(rows), prefill(64), "final-layer prefill RowScratch tail");
+}
+
 bool ExecutorGdnPrefillCase(bool linear_only) {
   BeginCase(linear_only
                 ? "isolated GDN output and state before attention"
@@ -2103,6 +2180,7 @@ int main(int argc, char** argv) {
     }
     if (argc == 2 && std::string(argv[1]) == "--prefill-experts-only") {
       ExecutorPrefillExperts();
+      ExecutorPrefillFinalTail();
       return 0;
     }
     if (argc == 2 && std::string(argv[1]) == "--mtp-kv-executor") {

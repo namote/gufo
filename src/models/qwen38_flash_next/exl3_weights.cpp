@@ -638,7 +638,7 @@ std::optional<MtpWeights> LoadExl3Mtp(const std::filesystem::path& path,
 }
 
 void Exl3MatVec(const Exl3HostLinear& host, std::span<const float> x,
-                std::span<float> y) {
+                std::span<float> y, bool decode_storage) {
   const auto& l = host.view;
   if (x.size() != l.k || y.size() != l.n)
     Fail("CPU projection shape mismatch");
@@ -646,10 +646,35 @@ void Exl3MatVec(const Exl3HostLinear& host, std::span<const float> x,
     return blocks.empty() ? i : blocks[i / 128] * 128 + i % 128;
   };
   std::vector<double> rotated(l.k), inner_y(l.n);
-  for (std::size_t i = 0; i < l.k; ++i)
-    rotated[i] =
-        x[destination(i, host.input_blocks)] * ex::HalfToDouble(l.suh[i]);
-  ex::HadamardBlocks(rotated);
+  if (decode_storage) {
+    for (std::size_t base = 0; base < l.k; base += 128) {
+      float segment[128];
+      for (std::size_t i = 0; i < 128; ++i) {
+        // The input producer rounds each product and butterfly to FP32
+        // before storing its normalized Hadamard result as FP16.
+        volatile float product =
+            x[destination(base + i, host.input_blocks)] *
+            static_cast<float>(ex::HalfToDouble(l.suh[base + i]));
+        segment[i] = product;
+      }
+      for (unsigned length = 1; length < 128; length *= 2)
+        for (unsigned first = 0; first < 128; first += 2 * length)
+          for (unsigned i = first; i < first + length; ++i) {
+            const float a = segment[i], b = segment[i + length];
+            segment[i] = a + b;
+            segment[i + length] = a - b;
+          }
+      for (unsigned i = 0; i < 128; ++i) {
+        volatile float scaled = segment[i] * 0.0883883461356163F;
+        rotated[base + i] = ex::HalfToDouble(ex::HalfFromDouble(scaled));
+      }
+    }
+  } else {
+    for (std::size_t i = 0; i < l.k; ++i)
+      rotated[i] =
+          x[destination(i, host.input_blocks)] * ex::HalfToDouble(l.suh[i]);
+    ex::HadamardBlocks(rotated);
+  }
   std::vector<std::uint16_t> tile(l.k * 128);
   for (std::size_t n0 = 0; n0 < l.n; n0 += 128) {
     ex::DequantInnerColumns(l.trellis, l.k, l.n, l.rate, l.codebook, n0, 128,

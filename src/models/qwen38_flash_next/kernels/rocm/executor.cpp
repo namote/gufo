@@ -2030,7 +2030,7 @@ bool Executor::Exl3DensePrefill(
       float* output;
     };
     std::array<Target, 3> targets{};
-    const auto count = weights.size();
+    const auto output_count = weights.size();
     const auto k = (*weights.begin())->cols;
     auto output = outputs.begin();
     bool sliced = false;
@@ -2043,9 +2043,14 @@ bool Executor::Exl3DensePrefill(
       sliced |= w->output_begin != 0 || w->rows != w->exl3->n;
       targets[i++] = {w, *output++};
     }
-    if (sliced && count != 1)
-      throw std::invalid_argument(
-          "EXL3 dense slices require an individual projection");
+    if (sliced)
+      for (const auto* w : weights)
+        if (w->exl3 != targets[0].weight->exl3)
+          throw std::invalid_argument(
+              "EXL3 dense slices require a shared projection");
+    // Slices of one descriptor share its full rotation and GEMM. Keep the
+    // singleton chunk geometry and copy every view before reusing scratch.
+    const auto count = sliced ? std::size_t{1} : output_count;
     if (rows == 0)
       return true;
     // q/k/v have different N; K/V and gate/up can share a GEMM launch.
@@ -2108,16 +2113,18 @@ bool Executor::Exl3DensePrefill(
         begin = end;
       }
       if (sliced) {
-        const auto& t = targets[0];
-        if (!Check(
-                hipMemcpy2DAsync(t.output + std::size_t{first} * t.weight->rows,
-                                 t.weight->rows * sizeof(float),
-                                 exl3_.slice + t.weight->output_begin,
-                                 t.weight->exl3->n * sizeof(float),
-                                 t.weight->rows * sizeof(float), n,
-                                 hipMemcpyDeviceToDevice, stream_),
-                "EXL3 dense prefill slice", error))
-          return false;
+        for (std::size_t i = 0; i < output_count; ++i) {
+          const auto& t = targets[i];
+          if (!Check(hipMemcpy2DAsync(
+                         t.output + std::size_t{first} * t.weight->rows,
+                         t.weight->rows * sizeof(float),
+                         exl3_.slice + t.weight->output_begin,
+                         t.weight->exl3->n * sizeof(float),
+                         t.weight->rows * sizeof(float), n,
+                         hipMemcpyDeviceToDevice, stream_),
+                     "EXL3 dense prefill slice", error))
+            return false;
+        }
       }
       if (diagnostics_active_) {
         cycle_diagnostics_.prefill_dense_rows += std::uint64_t{n} * count;
@@ -2567,8 +2574,7 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
                      !(wide_mixer_ && MatrixRows(n_tokens) && gamma != nullptr);
     if (exl3_moe_fused) {
       exl3_moe = {d.device_exl3,
-                  scratch.offsets,
-                  d.experts,
+                  s_.ids,
                   scratch.inverse,
                   scratch.out,
                   s_.weights,
@@ -2578,7 +2584,7 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
                   c.num_experts_used,
                   d.rows};
     } else {
-      Exl3PrefillCombine(*pending.layer, scratch, pending.rows,
+      Exl3PrefillCombine(*pending.layer, scratch, s_.ids, pending.rows,
                          c.num_experts_used, s_.weights, s_.shexp_out,
                          s_.router + c.num_experts, c.num_experts + 1,
                          s_.block_out, stream_);
@@ -3200,6 +3206,18 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   attn_q_rotated_ = false;
   attn_gate_stride_ = 0;
   const Config& c = config();
+  // The generic fallback consumes every query's selector mask. Only prune
+  // masks when WMMA can honor the same last-query restriction; otherwise
+  // uninitialized masks can produce NaNs and invalid downstream routing IDs.
+  const auto wmma_limit = WmmaCausalAttentionContextLimit(
+      c.num_heads, c.num_kv_heads, c.head_dim, c.compress_ratio);
+  const auto live_context = std::uint64_t{start_pos} + n_tokens;
+  last_only = last_only && MatrixRows(n_tokens) && wmma_limit != 0 &&
+              (s.kvarn_pass == nullptr || s.kvarn_pass->prefill) &&
+              (!sparse || (live_context <= wmma_limit &&
+                           live_context <= std::uint64_t{mask_words_} *
+                                               c.compress_ratio * 32));
+
   const std::uint32_t kv_row = c.AttentionKvDim();
   const std::uint32_t index_capacity =
       IndexerCapacity(c, options_.max_batch, max_context);
@@ -3337,8 +3355,16 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
 
   // Raw keys survive only until pooling. The ring holds the initial
   // pre-budget backlog and a batch, independently for trunk and predictor.
+  const bool shared_indexer = prefill_phase && sparse && s.index_k != nullptr &&
+                              l.indexer_q.exl3 != nullptr &&
+                              l.indexer_q.exl3 == l.indexer_k.exl3;
+  if (shared_indexer &&
+      !Exl3DensePrefill({&l.indexer_q, &l.indexer_k}, {s_.iq, s_.ik}, x,
+                        n_tokens, error_msg))
+    return false;
   if (s.index_k != nullptr) {
-    if (!(projections_ready
+    if (!shared_indexer &&
+        !(projections_ready
               ? DenseBatch(l.indexer_k, x, s_.ik, n_tokens, error_msg)
               : Dense(l.indexer_k, x, s_.ik, n_tokens, error_msg))) {
       return false;
@@ -3348,7 +3374,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   }
   const std::uint32_t* mask = nullptr;
   if (sparse) {
-    if (!Dense(l.indexer_q, x, s_.iq, n_tokens, error_msg)) {
+    if (!shared_indexer && !Dense(l.indexer_q, x, s_.iq, n_tokens, error_msg)) {
       return false;
     }
     RmsNormRows(s_.iq, l.indexer_q_norm.f32(), s_.iq,
@@ -3909,7 +3935,7 @@ bool Executor::Exl3Experts(const DeviceLayer& l, const float* x, float* out,
         exl3_moe_pending_ = {&l, rows};
         return true;
       }
-      Exl3PrefillCombine(l, Exl3PrefillView(), rows, c.num_experts_used,
+      Exl3PrefillCombine(l, Exl3PrefillView(), s_.ids, rows, c.num_experts_used,
                          s_.weights, s_.shexp_out, s_.router + c.num_experts,
                          c.num_experts + 1, out, stream_);
       return true;

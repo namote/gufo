@@ -20,7 +20,8 @@ void Require(bool condition, const char* message) {
     throw std::runtime_error(message);
 }
 
-void Projection(int bits, unsigned k, unsigned n, bool permute) {
+void Projection(int bits, unsigned k, unsigned n, bool permute,
+                bool decode_storage = false) {
   std::mt19937 rng(20261031 + bits + k);
   std::vector<std::uint16_t> trellis(std::size_t{k / 16} * (n / 16) * 16 *
                                      bits);
@@ -30,6 +31,9 @@ void Projection(int bits, unsigned k, unsigned n, bool permute) {
   for (auto& value : suh)
     value = ex::HalfFromDouble((rng() & 1 ? -1 : 1) *
                                (0.01 + (rng() % 100) * 0.0001));
+  if (decode_storage)
+    for (auto& value : suh)
+      value = ex::HalfFromDouble((rng() & 1 ? -1 : 1) / 32.0);
   for (auto& value : svh)
     value = ex::HalfFromDouble((rng() & 1 ? -1 : 1) *
                                (0.1 + (rng() % 100) * 0.001));
@@ -48,8 +52,9 @@ void Projection(int bits, unsigned k, unsigned n, bool permute) {
                    inner.data());
   std::vector<float> x(k), actual(n);
   for (auto& value : x)
-    value = (static_cast<int>(rng() % 1000) - 500) * 0.00001F;
-  q::Exl3MatVec(h, x, actual);
+    value = decode_storage ? (static_cast<int>(rng() % 17) - 8) / 1024.0F
+                           : (static_cast<int>(rng() % 1000) - 500) * 0.00001F;
+  q::Exl3MatVec(h, x, actual, decode_storage);
   // Independent dense Sylvester multiplication, with no Hadamard helper or
   // source permutation recipe in the expected path.
   std::vector<double> rotated(k), sums(n);
@@ -61,7 +66,13 @@ void Projection(int bits, unsigned k, unsigned n, bool permute) {
       sum += x[source] * ex::HalfToDouble(suh[j]) *
              (std::popcount((i % 128) & (j % 128)) % 2 ? -1 : 1);
     }
-    rotated[i] = sum * scale;
+    // Dyadic products/sums are exact in FP32 for the storage fixture. Dense
+    // Sylvester multiplication therefore independently specifies its input
+    // rotation without mirroring the implementation's butterfly loops.
+    rotated[i] = decode_storage
+                     ? ex::HalfToDouble(ex::HalfFromDouble(
+                           static_cast<float>(sum) * 0.0883883461356163F))
+                     : sum * scale;
   }
   for (unsigned j = 0; j < n; ++j)
     for (unsigned i = 0; i < k; ++i)
@@ -76,6 +87,12 @@ void Projection(int bits, unsigned k, unsigned n, bool permute) {
     Require(std::abs(actual[dest] - expected) <=
                 1e-10F + std::abs(expected) * 1e-6F,
             "CPU projection differs from independent Sylvester formula");
+  }
+  if (decode_storage) {
+    std::vector<float> ideal(n);
+    q::Exl3MatVec(h, x, ideal);
+    Require(ideal != actual, "decode fixture did not exercise FP16 storage");
+    return;
   }
   q::TensorRef view;
   view.data = trellis.data();
@@ -185,6 +202,8 @@ int main() {
     for (int bits : {5, 6, 7}) {
       Projection(bits, 256, 640, false);
       Projection(bits, 640, 256, true);
+      Projection(bits, 256, 640, false, true);
+      Projection(bits, 640, 256, true, true);
     }
     Projection(7, 6144, 128, true);
     Projection(7, 10240, 128, true);

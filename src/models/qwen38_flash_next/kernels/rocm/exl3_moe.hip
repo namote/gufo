@@ -1422,7 +1422,8 @@ __global__ __launch_bounds__(256) void PrefillCombineKernel(
 }  // namespace
 
 void Exl3PrefillCombine(const DeviceLayer& layer,
-                        const Exl3PrefillScratch& scratch, std::uint32_t rows,
+                        const Exl3PrefillScratch& scratch,
+                        const std::int32_t* ids, std::uint32_t rows,
                         std::uint32_t used, const float* weights,
                         const float* shared, const float* gate,
                         std::uint32_t gate_stride, float* out,
@@ -1430,13 +1431,12 @@ void Exl3PrefillCombine(const DeviceLayer& layer,
   const auto& d = layer.ffn_down_exps;
   if (rows == 0)
     return;
-  if (used == 0 || used > 16 || d.rows % 128 != 0 ||
+  if (ids == nullptr || used == 0 || used > 16 || d.rows % 128 != 0 ||
       scratch.inverse == nullptr || scratch.out == nullptr)
     throw std::invalid_argument("EXL3 prefill combine: unsupported call");
   const Exl3PrefillMoeRows moe{
-      d.device_exl3, scratch.offsets, d.experts, scratch.inverse, scratch.out,
-      weights,       shared,          gate,      gate_stride,     used,
-      d.rows};
+      d.device_exl3, ids,  scratch.inverse, scratch.out, weights,
+      shared,        gate, gate_stride,     used,        d.rows};
   hipLaunchKernelGGL(PrefillCombineKernel, dim3((d.rows / 128 + 7) / 8, rows),
                      dim3(256), 0, stream, moe, out);
   Check();

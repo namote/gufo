@@ -192,8 +192,11 @@ void Exl3PrefillExpertsRaw(const DeviceLayer& layer, const float* x,
                            std::uint32_t used, std::uint32_t tile_rows,
                            const Exl3PrefillScratch& scratch,
                            hipStream_t stream);
+/// Retain the original IDs passed to Exl3PrefillExpertsRaw until combine
+/// completes; inverse rows and weights use that same token/slot order.
 void Exl3PrefillCombine(const DeviceLayer& layer,
-                        const Exl3PrefillScratch& scratch, std::uint32_t rows,
+                        const Exl3PrefillScratch& scratch,
+                        const std::int32_t* ids, std::uint32_t rows,
                         std::uint32_t used, const float* weights,
                         const float* shared, const float* gate,
                         std::uint32_t gate_stride, float* out,

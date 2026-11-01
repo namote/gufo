@@ -6,6 +6,7 @@
 #include <numeric>
 
 #include "src/models/qwen38_flash_next/cpu_ops.hpp"
+#include "src/models/qwen38_flash_next/exl3_weights.hpp"
 
 namespace gufo::models::qwen38_flash_next {
 
@@ -50,7 +51,10 @@ void ReferenceModel::MatVec(const TensorRef& weight, std::uint64_t expert,
                             std::span<const float> x, std::span<float> out,
                             bool narrow_weights) {
   if (!weight.exl3.empty()) {
-    cpu::MatVec(weight, expert, x, out);
+    std::vector<float> complete(weight.exl3[expert].view.n);
+    Exl3MatVec(weight.exl3[expert], x, complete, storage_ == Storage::kDecode);
+    std::copy_n(complete.begin() + weight.output_begin, weight.rows,
+                out.begin());
     return;
   }
 
@@ -638,7 +642,9 @@ bool ReferenceModel::MtpStep(const MtpWeights& mtp, std::int32_t token,
       (trace && !trace->Valid(H, D)) ||
       (stage_inputs && (stage_inputs->fused.size() != D ||
                         stage_inputs->attention.size() != D ||
-                        stage_inputs->hidden.size() != D)) ||
+                        stage_inputs->hidden.size() != D ||
+                        (!stage_inputs->ffn_input.empty() &&
+                         stage_inputs->ffn_input.size() != H))) ||
       (!logits.empty() && logits.size() != c_.vocab_size)) {
     if (error_msg)
       *error_msg = "invalid reference MTP input";
@@ -666,10 +672,9 @@ bool ReferenceModel::MtpStep(const MtpWeights& mtp, std::int32_t token,
   std::vector<float> res(D), row(2 * H);
   if (!l.nextn_fc_embedding.empty()) {
     std::vector<float> ep(H), hp(H);
-    cpu::MatVec(l.nextn_fc_embedding, 0, embedding, ep);
+    MatVec(l.nextn_fc_embedding, 0, embedding, ep);
     for (std::uint32_t stream = 0; stream < c_.hc_count; ++stream) {
-      cpu::MatVec(l.nextn_fc_hidden, 0, std::span(norm).subspan(stream * H, H),
-                  hp);
+      MatVec(l.nextn_fc_hidden, 0, std::span(norm).subspan(stream * H, H), hp);
       for (std::uint32_t r = 0; r < H; ++r)
         res[stream * H + r] = ep[r] + hp[r];
     }
@@ -702,6 +707,11 @@ bool ReferenceModel::MtpStep(const MtpWeights& mtp, std::int32_t token,
   HcMix(l.hc_ffn, res, mixed, inject);
   if (trace)
     copy(mixed, trace->ffn_input);
+  // Validate the mixer separately before freezing its output: an otherwise
+  // negligible reduction difference can change an EXL3 FP16 input bin.
+  if (stage_inputs && !stage_inputs->ffn_input.empty())
+    mixed.assign(stage_inputs->ffn_input.begin(),
+                 stage_inputs->ffn_input.end());
   Moe(l, mixed, block);
   if (trace)
     copy(block, trace->ffn_output);

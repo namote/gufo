@@ -16,6 +16,7 @@
 
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/cpu_ops.hpp"
+#include "src/models/qwen38_flash_next/exl3_weights.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
@@ -58,8 +59,8 @@ struct Trace {
         ffn_output(c.hidden_size),
         spans{norm, fused, attention, hidden, head, ffn_input, ffn_output} {}
 };
-void Compare(std::span<const float> actual, std::span<const float> expected,
-             const char* stage, double limit) {
+double ReportError(std::span<const float> actual,
+                   std::span<const float> expected, const char* stage) {
   Require(actual.size() == expected.size(), "oracle shape mismatch");
   double error = 0, norm = 0, maximum = 0;
   for (std::size_t i = 0; i < actual.size(); ++i) {
@@ -73,6 +74,11 @@ void Compare(std::span<const float> actual, std::span<const float> expected,
   const auto relative = std::sqrt(error / std::max(norm, 1e-30));
   std::printf("  %s relative_rms=%.7f max_abs=%.7f\n", stage, relative,
               maximum);
+  return relative;
+}
+void Compare(std::span<const float> actual, std::span<const float> expected,
+             const char* stage, double limit) {
+  const auto relative = ReportError(actual, expected, stage);
   Require(relative <= limit,
           std::string(stage) + " exceeds scalar oracle tolerance");
 }
@@ -85,12 +91,40 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
   const auto& c = exec.config();
   const auto stream = exec.stream();
   std::string error;
-  // Verify the upload split byte for byte against the ORIGINAL GGUF rows.
+  // Verify original checkpoint bytes: combined GGUF halves or separate
+  // EXL3 projections.
   const auto& combined = mtp.block.nextn_eh_proj;
   const auto half_row = combined.RowBytes() / 2;
   for (unsigned part = 0; part < 2; ++part) {
     const auto& tensor =
         part ? device.mtp().nextn_fc_hidden : device.mtp().nextn_fc_embedding;
+    const auto& separate =
+        part ? mtp.block.nextn_fc_hidden : mtp.block.nextn_fc_embedding;
+    if (!separate.exl3.empty()) {
+      Require(separate.exl3.size() == 1 && tensor.exl3 != nullptr,
+              "EXL3 MTP projection descriptor missing");
+      const auto& host = separate.exl3.front();
+      const auto& source = host.view;
+      const auto& uploaded = *tensor.exl3;
+      Require(host.input_blocks.empty() && host.output_blocks.empty() &&
+                  source.k == uploaded.k && source.n == uploaded.n &&
+                  source.rate == uploaded.rate &&
+                  source.codebook == uploaded.codebook,
+              "EXL3 MTP projection geometry changed on upload");
+      const auto exact_bytes = [&](const void* gpu, const void* cpu,
+                                   std::size_t size) {
+        std::vector<std::uint8_t> bytes(size);
+        Hip(hipMemcpy(bytes.data(), gpu, size, hipMemcpyDeviceToHost));
+        Require(std::memcmp(bytes.data(), cpu, size) == 0,
+                "EXL3 MTP projection changed checkpoint bytes");
+      };
+      exact_bytes(uploaded.trellis, source.trellis, source.TrellisBytes());
+      exact_bytes(uploaded.suh, source.suh, source.k * 2);
+      exact_bytes(uploaded.svh, source.svh, source.n * 2);
+      continue;
+    }
+    Require(combined.rows != 0 && half_row != 0,
+            "missing combined GGUF MTP projection");
     std::vector<std::uint8_t> bytes(half_row * combined.rows);
     Hip(hipMemcpy(bytes.data(), tensor.data, bytes.size(),
                   hipMemcpyDeviceToHost));
@@ -107,6 +141,22 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
   auto* logits = arena.Make<float>(c.vocab_size);
   auto* quantized =
       arena.Make<std::uint8_t>(qfn_mmq_q8_1_bytes(1, c.hidden_size));
+  q::rocm::Exl3Scratch head_scratch;
+  if (device.output().exl3 != nullptr) {
+    const auto& head = *device.output().exl3;
+    auto& p = head_scratch.projection;
+    p.rotated_elements = head.k;
+    p.rotated = arena.Make<float>(p.rotated_elements);
+    p.weight_elements = std::size_t{128} * head.k;
+    p.weight = arena.Make<float>(p.weight_elements);
+    p.fast_input_elements = std::size_t{24} * head.k;
+    p.fast_input = arena.Make<std::uint16_t>(p.fast_input_elements);
+    p.fast_counter_count = head.n / 128;
+    p.fast_counters = arena.Make<std::uint32_t>(p.fast_counter_count);
+    Hip(hipMemset(p.fast_counters, 0, p.fast_counter_count * 4));
+    head_scratch.slice_elements = head.n;
+    head_scratch.slice = arena.Make<float>(head.n);
+  }
   std::vector<float> all_logits(c.vocab_size), initial(c.HcDim());
   // Direct adversarial norm check: unequal HC magnitudes distinguish a
   // single 10240-wide denominator from four independent denominators.
@@ -200,20 +250,29 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
       Compare(gpu.norm, cpu.norm, "full-hidden-norm", 2e-6);
       Compare(gpu.fused, cpu.fused, "split-fusion", 0.002);
       Compare(gpu.attention, cpu.attention, "attention-state", 0.002);
+      Compare(gpu.ffn_input, cpu.ffn_input, "ffn-input", 2e-6);
+      ReportError(gpu.ffn_output, cpu.ffn_output, "ffn-output");
       Compare(gpu.hidden, cpu.hidden, "recursive-carry", 0.00005);
       Compare(gpu.head, cpu.head, "head-mixer", 0.00005);
-      // Full Q8 vocabulary baseline uses the exact production dot arithmetic;
+      // Full vocabulary baseline uses the format's production dot arithmetic;
       // independent host sorting checks candidate selection and vocabulary
       // tail.
       Hip(hipMemcpyAsync(head_input, gpu.head.data(),
                          gpu.head.size() * sizeof(float), hipMemcpyHostToDevice,
                          stream));
-      Require(qfn_mmq_quantize_q8_1(head_input, quantized, 1, c.hidden_size,
-                                    stream) == 0 &&
-                  qfn_mmq_q8_0_dense_vec_preq(device.output().data, nullptr,
-                                              quantized, logits, c.vocab_size,
-                                              1, c.hidden_size, stream) == 0,
-              "full Q8 oracle projection failed");
+      if (device.output().exl3 != nullptr) {
+        q::rocm::Exl3Projection(device.output(), head_input, logits, 1,
+                                head_scratch, stream);
+      } else {
+        Require(device.output().type == gufo::core::GgmlType::kQ8_0,
+                "full vocabulary oracle requires Q8_0 or EXL3 weights");
+        Require(qfn_mmq_quantize_q8_1(head_input, quantized, 1, c.hidden_size,
+                                      stream) == 0 &&
+                    qfn_mmq_q8_0_dense_vec_preq(device.output().data, nullptr,
+                                                quantized, logits, c.vocab_size,
+                                                1, c.hidden_size, stream) == 0,
+                "full Q8 oracle projection failed");
+      }
       Hip(hipMemcpyAsync(all_logits.data(), logits,
                          all_logits.size() * sizeof(float),
                          hipMemcpyDeviceToHost, stream));
@@ -229,7 +288,7 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
       for (std::size_t i = 0; i < candidates.size; ++i)
         Require(candidates.ids[i] == ids[i] &&
                     candidates.logits[i] == all_logits[ids[i]],
-                "MTP candidates differ from full Q8 head");
+                "MTP candidates differ from full vocabulary head");
       next[sequence] = candidates.ids[0];
     }
   }
@@ -452,7 +511,8 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
   }
   std::puts(
       "MTP oracle PASS: full-width norm, byte-exact split, attention, "
-      "recursive carry, full-Q8 head, image IDs and independent batches");
+      "recursive carry, full-vocabulary head, image IDs and independent "
+      "batches");
 }
 
 // Model-level cost calibration. Restore identical real states for every

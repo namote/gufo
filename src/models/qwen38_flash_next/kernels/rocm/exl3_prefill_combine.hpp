@@ -12,12 +12,11 @@
 namespace gufo::models::qwen38_flash_next::rocm {
 
 /// What the EXL3 prefill MoE combine reads: the packed FP16 raw down dots
-/// (Exl3PrefillExpertsRaw), their bucket bank and inverse slot map, the
+/// (Exl3PrefillExpertsRaw), their expert bank and inverse slot map, the
 /// routing weights and the gated shared expert.
 struct Exl3PrefillMoeRows {
   const quant::exl3::DeviceLinear* bank{nullptr};
-  const unsigned* offsets{nullptr};
-  unsigned experts{0};
+  const std::int32_t* ids{nullptr};  ///< Original [token][slot] routing IDs.
   const std::int32_t* inverse{nullptr};
   const void* raw{nullptr};  ///< _Float16 [packed][width]
   const float* weights{nullptr};
@@ -29,22 +28,6 @@ struct Exl3PrefillMoeRows {
 };
 
 #if defined(__HIPCC__)
-namespace detail {
-__device__ __forceinline__ unsigned PrefillBucketExpert(const unsigned* offsets,
-                                                        unsigned experts,
-                                                        unsigned row) {
-  unsigned lo = 0, hi = experts;
-  while (lo + 1 < hi) {
-    const unsigned mid = (lo + hi) / 2;
-    if (offsets[mid] <= row)
-      lo = mid;
-    else
-      hi = mid;
-  }
-  return lo;
-}
-}  // namespace detail
-
 /// One wave: token t's MoE output for the 128 columns from segment * 128,
 /// four per lane. Each slot's raw row is restored (inverse Hadamard and
 /// sign/scale vector) and weighted in slot order, then the gated shared
@@ -67,9 +50,10 @@ __device__ __forceinline__ void Exl3PrefillMoeSegment(
       break;
     const unsigned assignment = t * m.used + slot;
     const unsigned packed = static_cast<unsigned>(m.inverse[assignment]);
-    const unsigned lo =
-        detail::PrefillBucketExpert(m.offsets, m.experts, packed);
-    const auto* svh = reinterpret_cast<const _Float16*>(m.bank[lo].svh);
+    // Routing IDs and inverse rows share the original token/slot order.
+    // Reuse the ID instead of searching bucket offsets for every segment.
+    const auto expert = static_cast<unsigned>(m.ids[assignment]);
+    const auto* svh = reinterpret_cast<const _Float16*>(m.bank[expert].svh);
     const auto offset = std::size_t{packed} * m.width + first;
     float v[4];
 #pragma unroll

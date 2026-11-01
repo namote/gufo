@@ -235,6 +235,7 @@ int main() {
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -837,8 +838,8 @@ void PrefillDispatch(gpu::Exl3BucketGemm gemm, int bits, int up_bits = 0,
     raw_scratch.inverse = buffers.Make<std::int32_t>(assignments);
     gpu::Exl3PrefillExpertsRaw(layer, dx, di, rows, used, tile_rows,
                                raw_scratch, nullptr);
-    gpu::Exl3PrefillCombine(layer, raw_scratch, rows, used, dw, dsh, dg + 1, 3,
-                            combined, nullptr);
+    gpu::Exl3PrefillCombine(layer, raw_scratch, di, rows, used, dw, dsh, dg + 1,
+                            3, combined, nullptr);
     Check(hipDeviceSynchronize());
     const auto want = Read(reference, rows * k);
     const auto got = Read(combined, rows * k);
@@ -858,8 +859,8 @@ void PrefillDispatch(gpu::Exl3BucketGemm gemm, int bits, int up_bits = 0,
               << "\n";
     gpu::Exl3PrefillExpertsRaw(layer, dx, di, rows, used, tile_rows,
                                raw_scratch, nullptr);
-    gpu::Exl3PrefillCombine(layer, raw_scratch, rows, used, dw, dsh, dg + 1, 3,
-                            combined, nullptr);
+    gpu::Exl3PrefillCombine(layer, raw_scratch, di, rows, used, dw, dsh, dg + 1,
+                            3, combined, nullptr);
     Check(hipDeviceSynchronize());
     const auto again = Read(combined, rows * k);
     Require(
@@ -889,6 +890,88 @@ void PrefillDispatch(gpu::Exl3BucketGemm gemm, int bits, int up_bits = 0,
   Check(hipGraphExecDestroy(executable));
   Check(hipGraphDestroy(graph));
   Check(hipStreamDestroy(stream));
+}
+
+// Independent dense Sylvester oracle on frozen FP16 raw dots. Dyadic
+// weights/scales make the products exact, so this checks bits without relying
+// on a second GPU route or on FP32-vs-FP16 projection tolerances.
+void PrefillCombineFrozenRows() {
+  constexpr unsigned rows = 5, used = 3, experts = 6, width = 256;
+  constexpr unsigned assignments = rows * used;
+  Buffers buffers;
+  std::vector<std::int32_t> ids(assignments), inverse(assignments);
+  constexpr std::int32_t selected[] = {5, 0, 3};
+  for (unsigned a = 0; a < assignments; ++a)
+    ids[a] = selected[(a + a / used) % used];
+  unsigned packed = 0;
+  for (unsigned e = 0; e < experts; ++e)
+    for (unsigned a = 0; a < assignments; ++a)
+      if (ids[a] == static_cast<std::int32_t>(e))
+        inverse[a] = packed++;
+  std::vector<std::uint16_t> raw(assignments * width);
+  const auto dot = [](unsigned a, unsigned j) {
+    return int((a * 13 + j * 7) % 17) - 8;
+  };
+  for (unsigned a = 0; a < assignments; ++a)
+    for (unsigned j = 0; j < width; ++j)
+      raw[inverse[a] * width + j] = ex::HalfFromDouble(dot(a, j) / 64.0);
+  const auto scale = [](unsigned e, unsigned j) {
+    return std::ldexp(((e + j) % 3) == 0 ? -1.0F : 1.0F,
+                      int((e + j / 128) % 3) - 1);
+  };
+  std::vector<ex::DeviceLinear> bank(experts);
+  for (unsigned e = 0; e < experts; ++e) {
+    std::vector<std::uint16_t> svh(width);
+    for (unsigned j = 0; j < width; ++j)
+      svh[j] = ex::HalfFromDouble(scale(e, j));
+    bank[e].svh = buffers.Copy(svh);
+  }
+  std::vector<float> weights(assignments), shared(rows * width), gates(rows);
+  for (unsigned a = 0; a < assignments; ++a)
+    weights[a] = std::ldexp(1.0F, -int(1 + a % 4));
+  for (unsigned i = 0; i < shared.size(); ++i)
+    shared[i] = (int(i % 11) - 5) / 32.0F;
+  std::vector<float> expected(rows * width);
+  for (unsigned t = 0; t < rows; ++t)
+    for (unsigned j = 0; j < width; ++j) {
+      volatile float acc = 0.0F;
+      for (unsigned slot = 0; slot < used; ++slot) {
+        const unsigned a = t * used + slot;
+        int sum = 0;
+        for (unsigned col = 0; col < 128; ++col) {
+          const int sign = (std::popcount((j % 128) & col) % 2) ? -1 : 1;
+          sum += sign * dot(a, (j / 128) * 128 + col);
+        }
+        const float restored =
+            ((sum / 64.0F) * ar::kHadamardScale) * scale(ids[a], j);
+        acc = acc + weights[a] * restored;
+      }
+      expected[t * width + j] = acc + 0.5F * shared[t * width + j];
+    }
+  gpu::DeviceLayer layer;
+  layer.ffn_down_exps.device_exl3 = buffers.Copy(bank);
+  layer.ffn_down_exps.rows = width;
+  layer.ffn_down_exps.experts = experts;
+  gpu::Exl3PrefillScratch scratch;
+  scratch.inverse = buffers.Copy(inverse);
+  scratch.out = reinterpret_cast<float*>(buffers.Copy(raw));
+  auto* di = buffers.Copy(ids);
+  auto* dw = buffers.Copy(weights);
+  auto* ds = buffers.Copy(shared);
+  auto* dg = buffers.Copy(gates);
+  auto* output = buffers.Make<float>(rows * width);
+  for (unsigned first : {0U, rows - 1}) {
+    auto tail = scratch;
+    tail.inverse += first * used;
+    gpu::Exl3PrefillCombine(layer, tail, di + first * used, rows - first, used,
+                            dw + first * used, ds + first * width, dg + first,
+                            1, output, nullptr);
+    Check(hipDeviceSynchronize());
+    const auto actual = Read(output, (rows - first) * width);
+    Require(std::memcmp(actual.data(), expected.data() + first * width,
+                        actual.size() * sizeof(float)) == 0,
+            "frozen raw combine differs from dense Sylvester oracle");
+  }
 }
 
 void PrefillUnsafeRows(gpu::Exl3BucketGemm gemm, int bits) {
@@ -1462,6 +1545,7 @@ int main() {
           for (bool shared : {false, true})
             Buckets(rows, shared, tile_rows, bits);
     }
+    PrefillCombineFrozenRows();
     FusedProducer(3, true, 4, 3, 7);  // Different rates in distinct banks.
     PrefillDispatch(ControlGemm, 4, 3, 7);
     PrefillDispatch(gpu::Exl3PrefillBucketInner, 4, 3, 7);
