@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 #include "src/core/hip/detail/exl3_gemv.hpp"
@@ -77,11 +78,19 @@ struct ExecutorTestAccess {
     return exec.exl3_;
   }
   static float* RoutedOutput(const Executor& exec) { return exec.s_.down_e; }
+  static void HalfWeightCols(DeviceModel& model, unsigned cols) {
+    model.max_half_cols_ = cols;
+  }
   static bool DensePrefill(const Executor& exec,
                            std::initializer_list<const DeviceTensor*> weights,
                            std::initializer_list<float*> outputs,
                            const float* x, unsigned rows, std::string* error) {
     return exec.Exl3DensePrefill(weights, outputs, x, rows, error);
+  }
+  static bool PlainPrefill(const Executor& exec, const DeviceTensor& weight,
+                           const float* x, float* out, unsigned rows,
+                           std::string* error) {
+    return exec.PlainDensePrefill(weight, x, out, rows, error);
   }
   struct State {
     std::vector<std::uint16_t> k, v, pooled;
@@ -100,6 +109,22 @@ struct ExecutorTestAccess {
   static std::vector<float> PrefillResiduals(const Executor& exec,
                                              unsigned rows) {
     return Read<float>(exec.s_.res, std::size_t{rows} * exec.config().HcDim());
+  }
+  static bool PrefillLinearOnly(Executor& exec, Session& session,
+                                std::span<const std::int32_t> tokens,
+                                std::string* error) {
+    // CreateSession saw the valid two-layer geometry and allocated its KV
+    // plane. Stop this test's public prefill after layer0 to observe GDN
+    // before attention; all production dispatch/phase handling stays active.
+    auto& model = const_cast<DeviceModel&>(*exec.model_);
+    struct Restore {
+      std::uint32_t& layers;
+      std::uint32_t value;
+      ~Restore() { layers = value; }
+    } restore{model.config_.num_layers, model.config_.num_layers};
+    model.config_.num_layers = 1;
+    return exec.Forward(session, tokens, 0, nullptr,
+                        Executor::ForwardMode::kPrefill, error);
   }
   static auto GdnState(const Session& session, const Config& c) {
     const auto& state = session.linear_[0];
@@ -901,12 +926,14 @@ struct MtpExecutorFixture {
                    : gpu::DeviceTensor{}};
   }
   explicit MtpExecutorFixture(unsigned max_batch = 16, unsigned expert_ff = 128,
-                              int shared_bits = 6, bool linear_prefix = false) {
+                              int shared_bits = 6, bool linear_prefix = false,
+                              unsigned half_weight_cols = 0,
+                              unsigned max_context = 128) {
     config.num_layers = linear_prefix ? 2 : 1;
     config.num_layers_all = config.num_layers + 1;
     config.hidden_size = 128;
     config.vocab_size = 256;
-    config.context_length = 64;
+    config.context_length = max_context / 2;
     config.hc_count = 4;
     config.hc_low_rank = 32;
     config.full_attention_interval = linear_prefix ? 2 : 1;
@@ -915,7 +942,8 @@ struct MtpExecutorFixture {
     config.head_dim = 256;
     config.rotary_dim = 64;
     config.rope_theta = 10000;
-    config.rope_scaling = {.factor = 2.0F, .original_context = 64};
+    config.rope_scaling = {.factor = 2.0F,
+                           .original_context = config.context_length};
     config.indexer_heads = 4;
     config.indexer_head_dim = 128;
     config.indexer_top_k = 8;
@@ -982,12 +1010,14 @@ struct MtpExecutorFixture {
     model = gpu::ExecutorTestAccess::Model(config, l, embedding, output,
                                            Mixer(false),
                                            linear_prefix ? &linear : nullptr);
+    if (half_weight_cols != 0)
+      gpu::ExecutorTestAccess::HalfWeightCols(*model, half_weight_cols);
     std::string error;
     exec = gpu::Executor::Create(*model, nullptr,
                                  {.max_batch = max_batch,
                                   .max_logit_rows = 8,
                                   .max_speculative = 8,
-                                  .max_context = 128},
+                                  .max_context = max_context},
                                  &error);
     Require(exec != nullptr, error);
     Require(q::MakeYarnRope(config.rope_scaling, config.rotary_dim,
@@ -998,12 +1028,50 @@ struct MtpExecutorFixture {
 };
 
 template<class T>
+bool CompareBits(const std::vector<T>& a, const std::vector<T>& b,
+                 const std::string& name, std::size_t columns = 0) {
+  if (a.size() != b.size()) {
+    std::cerr << "FAIL " << name << " sizes=" << a.size() << '/' << b.size()
+              << '\n';
+    return false;
+  }
+  using Bits = std::conditional_t<sizeof(T) == 4, std::uint32_t, std::uint16_t>;
+  static_assert(sizeof(T) == sizeof(Bits));
+  constexpr std::uint64_t sign = std::uint64_t{1} << (sizeof(T) * 8 - 1);
+  const auto ordered = [&](Bits v) {
+    return (v & sign) ? ((2 * sign - 1) ^ v) : (std::uint64_t{v} | sign);
+  };
+  const auto value = [](T v) {
+    if constexpr (std::is_same_v<T, float>)
+      return double(v);
+    else if constexpr (sizeof(T) == 2)
+      return ex::HalfToDouble(std::bit_cast<std::uint16_t>(v));
+    else
+      return double(v);
+  };
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    const auto av = std::bit_cast<Bits>(a[i]), bv = std::bit_cast<Bits>(b[i]);
+    if (av == bv)
+      continue;
+    const auto ao = ordered(av), bo = ordered(bv);
+    std::cerr << "FAIL " << name << " first index=" << i;
+    if (columns != 0)
+      std::cerr << " row=" << i / columns << " col=" << i % columns;
+    std::cerr << " expected=" << std::setprecision(10) << value(a[i])
+              << " actual=" << value(b[i]) << " bits=0x" << std::hex << av
+              << "/0x" << bv << std::dec
+              << " ulps=" << (ao > bo ? ao - bo : bo - ao) << '\n';
+    return false;
+  }
+  std::cout << "PASS " << name << " matches bitwise\n";
+  return true;
+}
+
+template<class T>
 void SameBits(const std::vector<T>& a, const std::vector<T>& b,
-              const std::string& name) {
-  Require(a.size() == b.size() &&
-              (a.empty() ||
-               std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0),
-          name + " differs bitwise");
+              const std::string& name, std::size_t columns = 0) {
+  if (!CompareBits(a, b, name, columns))
+    throw std::runtime_error(current_case + " : " + name + " differs bitwise");
 }
 
 void MtpExecutorCatchUp(bool batched) {
@@ -1022,13 +1090,23 @@ void MtpExecutorCatchUp(bool batched) {
   const auto state_equal = [&](unsigned i, const std::string& stage) {
     const auto a = Access::ReadState(*reference[i], f.config);
     const auto b = Access::ReadState(*cached[i], f.config);
-    Require(a.position == b.position && a.blocks == b.blocks,
-            stage + " position/block shadows differ");
-    SameBits(a.k, b.k, stage + " K cache");
-    SameBits(a.v, b.v, stage + " V cache");
-    SameBits(a.raw, b.raw,
-             stage + " raw indexer ring including untouched rows");
-    SameBits(a.pooled, b.pooled, stage + " pooled indexer keys");
+    bool equal = a.position == b.position && a.blocks == b.blocks;
+    std::cout << (equal ? "PASS " : "FAIL ") << stage
+              << " position/block shadows\n";
+    equal =
+        CompareBits(a.k, b.k, stage + " K cache", f.config.AttentionKvDim()) &&
+        equal;
+    equal =
+        CompareBits(a.v, b.v, stage + " V cache", f.config.AttentionKvDim()) &&
+        equal;
+    equal = CompareBits(a.raw, b.raw,
+                        stage + " raw indexer ring including untouched rows",
+                        f.config.indexer_head_dim) &&
+            equal;
+    equal = CompareBits(a.pooled, b.pooled, stage + " pooled indexer keys",
+                        f.config.indexer_head_dim) &&
+            equal;
+    return equal;
   };
   std::vector<gpu::Executor::MtpBatchItem> items;
   unsigned expected_rows = 0;
@@ -1068,8 +1146,10 @@ void MtpExecutorCatchUp(bool batched) {
           "EXL3 cache-only dispatch did not execute every requested row");
   Require(diagnostic.expert_tile_reads == 0,
           "cache-only catch-up unexpectedly executed experts");
+  bool equal = true;
   for (unsigned i = 0; i < sessions; ++i) {
-    state_equal(i, "ragged catch-up session=" + std::to_string(i));
+    equal =
+        state_equal(i, "ragged catch-up session=" + std::to_string(i)) && equal;
     Require(!Access::ReadState(*cached[i], f.config).residual_valid,
             "cache-only catch-up exposed a carried residual");
   }
@@ -1092,7 +1172,8 @@ void MtpExecutorCatchUp(bool batched) {
     Require(exec.MtpForward(*reference[0], more, 2, {}, &error), error);
     Require(exec.MtpForward(*cached[0], more, 2, {.kv_only = true}, &error),
             error);
-    state_equal(0, "graph catch-up pass=" + std::to_string(pass));
+    equal =
+        state_equal(0, "graph catch-up pass=" + std::to_string(pass)) && equal;
     if (pass == 1) {
       captured_graphs = Access::Graphs(*cached[0]);
       Require(captured_graphs != 0, "cache-only graph was not captured");
@@ -1113,20 +1194,25 @@ void MtpExecutorCatchUp(bool batched) {
                 "sparse selector must replace poison with exactly the nonempty "
                 "causal budget");
     }
-    state_equal(i, "known-hidden continuation");
+    equal = state_equal(i, "known-hidden continuation") && equal;
     const auto a = Access::FullLogits(exec, *reference[i]);
     const auto b = Access::FullLogits(exec, *cached[i]);
     Require(std::ranges::all_of(a, [](float v) { return std::isfinite(v); }),
             "continuation logits are nonfinite");
-    SameBits(a, b, "subsequent full-vocabulary logits");
+    equal = CompareBits(a, b, "subsequent full-vocabulary logits",
+                        f.config.vocab_size) &&
+            equal;
     for (auto* session : {reference[i].get(), cached[i].get()})
       Require(exec.MtpForward(*session, std::span(&next, 1), -1, {}, &error),
               error);
-    state_equal(i, "recursive continuation");
-    SameBits(Access::FullLogits(exec, *reference[i]),
-             Access::FullLogits(exec, *cached[i]),
-             "recursive full-vocabulary logits");
+    equal = state_equal(i, "recursive continuation") && equal;
+    equal =
+        CompareBits(Access::FullLogits(exec, *reference[i]),
+                    Access::FullLogits(exec, *cached[i]),
+                    "recursive full-vocabulary logits", f.config.vocab_size) &&
+        equal;
   }
+  Require(equal, "all MTP states and continuation logits match bitwise");
 }
 
 void DensePrefillProjection() {
@@ -1238,12 +1324,55 @@ void DensePrefillProjection() {
                 0x7F7F7F7FU,
             "dense X3 slice overwrote its guard");
   }
+  auto query = key.weight;
+  query.rows = 512;
+  auto* queries = f.buffers.Make<float>(rows * query.rows + 8);
+  for (unsigned chunk : {1U, 9U, 33U, 64U, 65U}) {
+    Check(hipMemset(queries, 0xFF, rows * query.rows * sizeof(float)));
+    Check(hipMemset(queries + rows * query.rows, 0x7F, 8 * sizeof(float)));
+    Check(hipMemset(sliced, 0xFF, rows * slice.rows * sizeof(float)));
+    Check(hipMemset(sliced + rows * slice.rows, 0x7F, 8 * sizeof(float)));
+    Require(exec.BeginMtpCycleDiagnostics(&error), error);
+    for (unsigned first = 0; first < rows; first += chunk)
+      Require(Access::DensePrefill(
+                  exec, {&query, &slice},
+                  {queries + first * query.rows, sliced + first * slice.rows},
+                  x + first * k, std::min(chunk, rows - first), &error),
+              error);
+    gpu::Executor::MtpCycleDiagnostics d;
+    Require(exec.EndMtpCycleDiagnostics(0, 0, &d, &error), error);
+    const auto groups = (rows + chunk - 1) / chunk;
+    Require(d.prefill_dense_rows == rows &&
+                d.prefill_dense_rotation_groups == groups &&
+                d.prefill_dense_gemm_groups == groups,
+            "shared indexer slices repeated their parent projection");
+    Check(hipStreamSynchronize(exec.stream()));
+    for (const auto& [view, dst] :
+         {std::pair{&query, queries}, std::pair{&slice, sliced}}) {
+      const auto actual = Access::Read<float>(dst, rows * view->rows);
+      for (unsigned row = 0; row < rows; ++row)
+        Require(std::memcmp(actual.data() + row * view->rows,
+                            bulk[1].data() + row * key.n + view->output_begin,
+                            view->rows * sizeof(float)) == 0,
+                "shared indexer slice differs from full parent bytes");
+      Require(Access::Read<std::uint32_t>(dst + rows * view->rows, 1)[0] ==
+                  0x7F7F7F7FU,
+              "shared indexer slice overwrote its guard");
+    }
+  }
+  auto other_slice = slice;
+  other_slice.exl3 = value.weight.exl3;
+  Require(!Access::DensePrefill(exec, {&query, &other_slice}, {queries, sliced},
+                                x, rows, &error),
+          "slices of different parents must not share a projection");
 }
 
 void PlainOperandPrecision() {
-  BeginCase(
-      "plain operands retain FP32 inputs: half-WMMA cancellation witness");
+  BeginCase("plain prefill rounds to FP16; decode retains FP32 cancellation");
   constexpr unsigned rows = 65, k = 128, n = 128;
+  MtpExecutorFixture fixture(rows, 128, 6, false, k);
+  auto& exec = *fixture.exec;
+  std::string error;
   Buffers buffers;
   std::vector<float> input(rows * k), expected(rows * n);
   for (unsigned row = 0; row < rows; ++row) {
@@ -1276,6 +1405,7 @@ void PlainOperandPrecision() {
                             std::bit_cast<std::uint32_t>(weights[j]) >> 16);
       plain.data = buffers.Copy(bits);
     }
+    std::vector<float> cancel_bits;
     for (unsigned chunk : {1U, 8U, 9U, 32U, 33U, 64U, 65U}) {
       Check(hipMemset(y, 0xFF, rows * n * sizeof(float)));
       for (unsigned first = 0; first < rows; first += chunk)
@@ -1283,13 +1413,31 @@ void PlainOperandPrecision() {
                             std::min(chunk, rows - first), {}, nullptr, false);
       SameBits(expected, gpu::ExecutorTestAccess::Read<float>(y, rows * n),
                "plain projection vs exact FP64 cancellation result");
-      Check(hipMemset(y, 0xFF, rows * n * sizeof(float)));
+      // Approved prefill contract returns to the pre-66b2d89c FP16 input
+      // boundary. These two inputs become identical halves, so their exact
+      // dot product is zero; decode above must retain the nonzero FP32 dot.
+      // gfx1151 WMMA (f32_16x16x16_f16) does not cancel exactly: 1*1 +
+      // (-1)*1 returns -2^-24 (probe: a=(1,-1), b=(1,1) -> -0x1p-24; scaled
+      // operands give the same -2^-24 relative residue). Bound the residue
+      // by 2^-23 of the absolute product sum (2 here) and keep it chunk
+      // invariant; the nonzero FP32 dot (2^-17..7*2^-17) stays excluded.
+      Check(hipMemsetAsync(y, 0xFF, rows * n * sizeof(float), exec.stream()));
       for (unsigned first = 0; first < rows; first += chunk)
-        gufo::hip::LaunchPlainPrefillStable(
-            type, plain.data, x + first * k, y + first * n,
-            std::min(chunk, rows - first), n, k, nullptr);
-      SameBits(expected, gpu::ExecutorTestAccess::Read<float>(y, rows * n),
-               "tiled plain prefill retains FP32 cancellation result");
+        Require(gpu::ExecutorTestAccess::PlainPrefill(
+                    exec, plain, x + first * k, y + first * n,
+                    std::min(chunk, rows - first), &error),
+                error);
+      Check(hipStreamSynchronize(exec.stream()));
+      const auto cancelled = gpu::ExecutorTestAccess::Read<float>(y, rows * n);
+      Require(std::ranges::all_of(
+                  cancelled,
+                  [](float v) { return std::fabs(v) <= std::ldexp(2.0, -23); }),
+              "prefill vs FP16 cancellation oracle within the WMMA residue");
+      if (chunk == 1)
+        cancel_bits = cancelled;
+      else
+        SameBits(cancel_bits, cancelled,
+                 "prefill FP16 cancellation chunk=" + std::to_string(chunk));
     }
     auto rounded = input;
     for (auto& v : rounded)
@@ -1300,6 +1448,110 @@ void PlainOperandPrecision() {
     Require(std::ranges::all_of(narrowed, [](float v) { return v == 0; }),
             "witness must expose FP16 input's loss of the nonzero dot product");
   }
+  // F32 weights are omitted from the uploader's half-weight width bound.
+  // A valid wide F32 HC input still needs narrowing scratch from the model
+  // geometry, rather than rejecting it against that narrower metadata.
+  const unsigned wide_k = fixture.config.HcDim();
+  gpu::DeviceTensor wide;
+  wide.type = gufo::core::GgmlType::kF32;
+  wide.rows = n;
+  wide.cols = wide_k;
+  wide.data = buffers.Copy(std::vector<float>(n * wide_k, 0.25F));
+  auto* wide_x = buffers.Copy(std::vector<float>(rows * wide_k, 0.25F));
+  Require(wide_k > fixture.model->max_half_cols(), "F32 HC capacity witness");
+  Require(gpu::ExecutorTestAccess::PlainPrefill(exec, wide, wide_x, y, rows,
+                                                &error),
+          error);
+  Check(hipStreamSynchronize(exec.stream()));
+  SameBits(std::vector<float>(rows * n, wide_k * 0.0625F),
+           gpu::ExecutorTestAccess::Read<float>(y, rows * n),
+           "wide F32 HC prefill scratch and exact FP16 oracle", n);
+}
+
+void PlainPrefillHalf() {
+  BeginCase("plain FP16 WMMA fixed reduction: chunk bytes and rounded FP64");
+  using gufo::core::GgmlType;
+  using Access = gpu::ExecutorTestAccess;
+  constexpr unsigned rows = 129;
+  std::mt19937 rng(0xF316A11U);
+  std::uniform_real_distribution<float> random(-0.125F, 0.125F);
+  for (const auto [k, n] : {std::pair{128U, 33U}, std::pair{320U, 128U},
+                            std::pair{10240U, 320U}, std::pair{320U, 10240U}})
+    for (auto type : {GgmlType::kF16, GgmlType::kBF16, GgmlType::kF32}) {
+      if (type != GgmlType::kF16 && (k == 10240 || n == 10240))
+        continue;
+      BeginCase("plain FP16 WMMA k=" + std::to_string(k) +
+                " n=" + std::to_string(n) +
+                " type=" + std::to_string(static_cast<unsigned>(type)));
+      Buffers buffers;
+      std::vector<float> input(rows * k), weights(n * k);
+      for (auto& v : input)
+        v = random(rng);
+      for (auto& v : weights)
+        v = random(rng);
+      const void* w = nullptr;
+      const auto wt = type == GgmlType::kF16    ? gpu::WeightType::kF16
+                      : type == GgmlType::kBF16 ? gpu::WeightType::kBF16
+                                                : gpu::WeightType::kF32;
+      if (type == GgmlType::kF32) {
+        w = buffers.Copy(weights);
+      } else {
+        std::vector<std::uint16_t> bits(weights.size());
+        for (std::size_t i = 0; i < bits.size(); ++i) {
+          bits[i] = type == GgmlType::kF16
+                        ? ex::HalfFromDouble(weights[i])
+                        : std::bit_cast<std::uint32_t>(weights[i]) >> 16;
+          weights[i] = type == GgmlType::kF16
+                           ? float(ex::HalfToDouble(bits[i]))
+                           : std::bit_cast<float>(std::uint32_t{bits[i]} << 16);
+        }
+        w = buffers.Copy(bits);
+      }
+      // WMMA consumes these rounded operands. The F64 oracle includes both
+      // FP16 boundaries; its 1e-5 bar measures accumulation, not input loss.
+      for (auto& v : weights)
+        v = float(ex::HalfToDouble(ex::HalfFromDouble(v)));
+      auto rounded = input;
+      for (auto& v : rounded)
+        v = float(ex::HalfToDouble(ex::HalfFromDouble(v)));
+      auto* x = buffers.Copy(input);
+      auto* half = buffers.Make<std::uint16_t>(input.size());
+      gpu::NarrowActivations(x, half, false, input.size(), nullptr);
+      auto* y = buffers.Make<float>(rows * n + 8);
+      const auto project = [&](unsigned chunk) {
+        Check(hipMemset(y, 0xA5, (rows * n + 8) * sizeof(float)));
+        for (unsigned first = 0; first < rows; first += chunk)
+          Require(
+              gpu::PlainPrefillGemm(
+                  w, wt, reinterpret_cast<const __half*>(half + first * k),
+                  y + first * n, std::min(chunk, rows - first), n, k, nullptr),
+              "plain FP16 WMMA shape supported");
+        const auto guard = Access::Read<std::uint32_t>(y + rows * n, 8);
+        Require(
+            std::ranges::all_of(guard, [](auto v) { return v == 0xA5A5A5A5U; }),
+            "plain FP16 WMMA preserves ragged output guard");
+        return Access::Read<float>(y, rows * n);
+      };
+      const auto bulk = project(rows);
+      for (unsigned chunk : {1U, 8U, 9U, 32U, 33U, 64U, 65U, 128U})
+        SameBits(bulk, project(chunk),
+                 "plain FP16 WMMA chunk=" + std::to_string(chunk), n);
+      for (unsigned r : {0U, rows - 1}) {
+        std::vector<float> oracle(n);
+        for (unsigned j = 0; j < n; ++j) {
+          double dot = 0;
+          for (unsigned i = 0; i < k; ++i)
+            dot += double(weights[j * k + i]) * rounded[r * k + i];
+          oracle[j] = float(dot);
+        }
+        // WMMA accumulation error grows with k (plan/exl3/X3-RESULTS.md:
+        // ~3.1e-9 k relative L2; the non-cancelling residue above), so the
+        // bar is the X3 contract's (k/16) 2^-23, at least 1e-5.
+        Near(std::span(bulk).subspan(r * n, n), oracle,
+             std::max(1e-5, double(k) / 16.0 * std::ldexp(1.0, -23)),
+             "plain WMMA vs FP64 of rounded FP16 operands");
+      }
+    }
 }
 
 void PlainPrefillStable() {
@@ -1482,10 +1734,13 @@ void PrefillScratchEstimate() {
       gpu::Executor::EstimateExl3PrefillScratchBytes(c, 4096, &error);
   const auto through =
       gpu::Executor::EstimateExl3PrefillScratchBytes(c, 4224, &error);
-  Require(chunk == 629489160, "4096-row additional scratch byte count");
-  Require(through == 649160440, "4224-row tail-capacity scratch byte count");
-  std::cout << "MEMORY EXL3 prefill P4096=" << chunk << " bytes (600.328 MiB)"
-            << " P4224=" << through << " bytes (619.088 MiB)\n";
+  // The inverse slot map adds 4 bytes per assignment (fused combine).
+  Require(chunk == 629489160 + 4096 * 10 * 4,
+          "4096-row additional scratch byte count");
+  Require(through == 649160440 + 4224 * 10 * 4,
+          "4224-row tail-capacity scratch byte count");
+  std::cout << "MEMORY EXL3 prefill P4096=" << chunk << " bytes (600.48 MiB)"
+            << " P4224=" << through << " bytes (619.25 MiB)\n";
   Require(gpu::Executor::EstimateExl3PrefillScratchBytes(c, 0, &error) == 0 &&
               !error.empty(),
           "zero-row scratch must be rejected");
@@ -1588,25 +1843,30 @@ void ExecutorPrefillExperts() {
                 d.prefill_dense_gemm_groups == gemms &&
                 d.prefill_plain_rows != 0,
             "real prefill must group Q/K/V and gate/up, dispatch dense X3, and "
-            "retain FP32 plain operands");
-    Require(d.prefill_plain_tiled_rows <= d.prefill_plain_rows &&
-                (chunk <= 8 || d.prefill_plain_tiled_rows != 0) &&
-                (chunk != rows ||
-                 d.prefill_plain_tiled_rows == d.prefill_plain_rows),
-            "wide EXL3 prefill must dispatch tiled stable plain operands");
+            "dispatch plain operands through FP16 WMMA");
+    Require(d.prefill_plain_half_rows == d.prefill_plain_rows &&
+                d.prefill_plain_half_rows != 0,
+            "every EXL3 plain prefill row must dispatch FP16 WMMA");
     Require(std::ranges::all_of(
                 logits, [](float value) { return std::isfinite(value); }),
             "prefill logits are not finite");
     return std::pair{logits, hidden};
   };
   const auto bulk = prefill(rows);
+  bool equal = true;
   for (unsigned chunk : {1U, 3U, 8U, 9U, 32U, 33U, 64U}) {
     const auto split = prefill(chunk);
-    SameBits(bulk.first, split.first,
-             "executor prefill chunks=" + std::to_string(chunk));
-    SameBits(bulk.second, split.second,
-             "every prefill residual row chunks=" + std::to_string(chunk));
+    equal = CompareBits(bulk.first, split.first,
+                        "executor prefill chunks=" + std::to_string(chunk),
+                        c.vocab_size) &&
+            equal;
+    equal = CompareBits(
+                bulk.second, split.second,
+                "every prefill residual row chunks=" + std::to_string(chunk),
+                c.HcDim()) &&
+            equal;
   }
+  Require(equal, "all prefill residuals and logits match bitwise");
 
   // Exercise the allocated scaled-down path through a real decode forward,
   // including the executor's 64+1 partition and expert_ff > 2 * hidden.
@@ -1628,7 +1888,7 @@ void ExecutorPrefillExperts() {
   Require(d.scaled_down_rows == assignments && d.prefill_expert_rows == 0,
           "decode did not dispatch scaled routed down across 64+1 rows");
   Require(d.prefill_dense_rows == 0 && d.prefill_plain_rows == 0 &&
-              d.prefill_plain_tiled_rows == 0,
+              d.prefill_plain_half_rows == 0,
           "decode incorrectly entered prefill dense dispatch");
   const auto exponents = Access::Read<std::int32_t>(routed.down_exponents,
                                                     64 * c.num_experts_used);
@@ -1680,16 +1940,53 @@ void ExecutorPrefillExperts() {
     if (shared)
       Require(
           Access::Read<std::uint32_t>(pp.bucket_count, 1)[0] ==
-              2 * c.num_experts_used,
-          "shared history must create 64+1 buckets for each selected expert");
+              c.num_experts_used,
+          "shared history must create one 65-row hot-expert bucket for each "
+          "selected expert");
     for (unsigned chunk : {1U, 3U, 8U, 9U, 32U, 33U, 64U})
       SameBits(reference, project(chunk),
                "X3 expert operator chunks=" + std::to_string(chunk));
   }
 }
 
-void ExecutorGdnPrefill() {
-  BeginCase("executor linear GDN dense X3 wiring and 1/64/65 chunk bits");
+void ExecutorPrefillFinalTail() {
+  BeginCase("EXL3 final-layer prefill tail routing IDs");
+  constexpr unsigned rows = 225;
+  MtpExecutorFixture f(rows, 640, 7, false, 0, 256);
+  auto& exec = *f.exec;
+  std::vector<std::int32_t> tokens(rows);
+  for (unsigned r = 0; r < rows; ++r)
+    tokens[r] = 1 + (r * 17) % (f.config.vocab_size - 1);
+  std::string error;
+  const auto prefill = [&](unsigned chunk) {
+    auto session = exec.CreateSession(gufo::core::SessionMode::kAutoregressive,
+                                      256, &error);
+    Require(session != nullptr, error);
+    std::vector<float> logits(f.config.vocab_size);
+    Require(exec.BeginMtpCycleDiagnostics(&error), error);
+    for (unsigned first = 0; first < rows; first += chunk) {
+      const auto count = std::min(chunk, rows - first);
+      Require(exec.Forward(*session, std::span(tokens).subspan(first, count), 1,
+                           logits.data(), gpu::Executor::ForwardMode::kPrefill,
+                           &error),
+              error);
+    }
+    gpu::Executor::MtpCycleDiagnostics d;
+    Require(exec.EndMtpCycleDiagnostics(0, 0, &d, &error), error);
+    Require(d.prefill_expert_rows == (chunk == rows ? 97U : rows),
+            "prefill tail fixture did not exercise the FFN skip");
+    return logits;
+  };
+  // The 225-row call skips 128 final-layer FFN rows and shifts RowScratch
+  // to its 97-row tail. The 64-row chunks compute all FFN rows, with a fresh
+  // router/inverse map per chunk. Their final logits must still be exact.
+  SameBits(prefill(rows), prefill(64), "final-layer prefill RowScratch tail");
+}
+
+bool ExecutorGdnPrefillCase(bool linear_only) {
+  BeginCase(linear_only
+                ? "isolated GDN output and state before attention"
+                : "executor linear GDN dense X3 wiring and 1/64/65 chunk bits");
   constexpr unsigned rows = 65;
   // A genuine linear layer followed by attention keeps the resident model
   // geometry valid and observes the GDN output through its downstream consumer.
@@ -1698,8 +1995,8 @@ void ExecutorGdnPrefill() {
   const auto& c = f.config;
   using Access = gpu::ExecutorTestAccess;
   Require(c.IsLinearLayer(0) && f.model->layers()[0].linear &&
-              !f.model->layers()[1].linear,
-          "GDN fixture must execute a linear layer before attention");
+              (linear_only || !f.model->layers()[1].linear),
+          "GDN fixture must execute its real linear layer");
   std::vector<std::int32_t> tokens(rows);
   for (unsigned r = 0; r < rows; ++r)
     tokens[r] = 1 + (r * 17) % (c.vocab_size - 1);
@@ -1723,13 +2020,17 @@ void ExecutorGdnPrefill() {
       // GDN: QKV/Z grouped rotation (two unequal-N GEMMs), output,
       // shared gate/up and shared down = 6 projection rows, 4 rotations,
       // 5 GEMMs. Add the existing attention layer's exact totals.
-      dense_rows += (std::uint64_t{14} + sparse) * count;
-      rotations += 9 + sparse;
-      gemms += 11 + sparse;
-      Require(
-          exec.Forward(*session, std::span(tokens).subspan(first, count), 0,
-                       nullptr, gpu::Executor::ForwardMode::kPrefill, &error),
-          error);
+      dense_rows += (linear_only ? 6 : std::uint64_t{14} + sparse) * count;
+      rotations += linear_only ? 4 : 9 + sparse;
+      gemms += linear_only ? 5 : 11 + sparse;
+      Require(linear_only
+                  ? Access::PrefillLinearOnly(
+                        exec, *session, std::span(tokens).subspan(first, count),
+                        &error)
+                  : exec.Forward(
+                        *session, std::span(tokens).subspan(first, count), 0,
+                        nullptr, gpu::Executor::ForwardMode::kPrefill, &error),
+              error);
       // Disable final-query pruning (n_logits=0); all65 rows fit below the
       // final FFN skip. Preserve every row before scratch is reused.
       const auto hidden = Access::PrefillResiduals(exec, count);
@@ -1743,13 +2044,12 @@ void ExecutorGdnPrefill() {
                 d.prefill_dense_rotation_groups == rotations &&
                 d.prefill_dense_gemm_groups == gemms,
             "GDN QKV/Z grouping or output X3 dispatch was reverted");
-    Require(d.prefill_expert_rows == rows * c.num_layers &&
+    Require(d.prefill_expert_rows == rows * (linear_only ? 1 : c.num_layers) &&
                 d.prefill_plain_rows != 0 && d.scaled_down_rows == 0,
             "GDN fixture must retain the prefill phase through both layers");
-    Require((chunk <= 8 || d.prefill_plain_tiled_rows != 0) &&
-                (chunk != rows ||
-                 d.prefill_plain_tiled_rows == d.prefill_plain_rows),
-            "wide GDN prefill omitted tiled stable plain projections");
+    Require(d.prefill_plain_half_rows == d.prefill_plain_rows &&
+                d.prefill_plain_half_rows != 0,
+            "GDN plain prefill rows must all dispatch FP16 WMMA");
     auto state = Access::GdnState(*session, c);
     result.conv = std::move(state.first);
     result.recurrent = std::move(state.second);
@@ -1764,13 +2064,32 @@ void ExecutorGdnPrefill() {
     return result;
   };
   const auto bulk = run(rows);
+  bool equal = true;
   for (unsigned chunk : {1U, 64U, 65U}) {
     const auto split = run(chunk);
-    SameBits(bulk.hidden, split.hidden, "GDN every residual row");
-    SameBits(bulk.logits, split.logits, "GDN downstream full logits");
-    SameBits(bulk.conv, split.conv, "GDN convolution history");
-    SameBits(bulk.recurrent, split.recurrent, "GDN recurrent state");
+    const auto suffix = " chunks=" + std::to_string(chunk);
+    equal = CompareBits(bulk.hidden, split.hidden,
+                        "GDN every residual row" + suffix, c.HcDim()) &&
+            equal;
+    equal = CompareBits(bulk.logits, split.logits,
+                        "GDN downstream full logits" + suffix, c.vocab_size) &&
+            equal;
+    equal =
+        CompareBits(bulk.conv, split.conv, "GDN convolution history" + suffix,
+                    c.SsmConvChannels()) &&
+        equal;
+    equal = CompareBits(bulk.recurrent, split.recurrent,
+                        "GDN recurrent state" + suffix, c.ssm_head_dim) &&
+            equal;
   }
+  return equal;
+}
+
+void ExecutorGdnPrefill() {
+  bool equal = ExecutorGdnPrefillCase(true);
+  equal = ExecutorGdnPrefillCase(false) && equal;
+  Require(equal,
+          "all isolated/downstream GDN outputs and states match bitwise");
 }
 
 void MtpKvGroup() {
@@ -1785,6 +2104,7 @@ void MtpKvGroup() {
   const fast::Exl3FastWorkspace ws{
       p.fast_input,         p.fast_input_elements, p.fast_counters,
       p.fast_counter_count, p.fast_down_input,     p.fast_down_input_elements};
+  bool equal = true;
   for (const unsigned rows : {1U, 2U, 3U, 7U, 8U, 9U, 32U, 33U, 64U}) {
     BeginCase("MTP K7 QKV vs KV group rows=" + std::to_string(rows));
     const auto input = Input(rows * k);
@@ -1807,7 +2127,8 @@ void MtpKvGroup() {
     Check(hipMemset(k_only, 0x7F, (rows * kv_width + 8) * sizeof(float)));
     Check(hipMemset(v_only, 0x7F, (rows * kv_width + 8) * sizeof(float)));
     fast::LaunchExl3FastProjections(full, x, k, rows, ws, nullptr);
-    fast::LaunchExl3FastProjections(kv, x, k, rows, ws, nullptr);
+    fast::LaunchExl3FastProjections(kv, x, k, rows, ws, nullptr, false,
+                                    std::size_t{q_width} + 2 * kv_width);
     for (const auto& [bank, a, b] : {std::tuple{&key, k_full, k_only},
                                      std::tuple{&value, v_full, v_only}}) {
       std::vector<float> expected(rows * kv_width), actual(expected.size());
@@ -1815,9 +2136,11 @@ void MtpKvGroup() {
                       hipMemcpyDeviceToHost));
       Check(hipMemcpy(actual.data(), b, actual.size() * sizeof(float),
                       hipMemcpyDeviceToHost));
-      Require(std::memcmp(expected.data(), actual.data(),
-                          actual.size() * sizeof(float)) == 0,
-              "removing Q preserves every K/V projection bit");
+      equal = CompareBits(expected, actual,
+                          std::string(bank == &key ? "K" : "V") +
+                              " removing Q, rows=" + std::to_string(rows),
+                          kv_width) &&
+              equal;
       for (const unsigned row : {0U, rows - 1})
         Near(std::span(actual).subspan(row * kv_width, kv_width),
              bank->Reference(0, input.data() + row * k, true), 1e-5,
@@ -1828,6 +2151,7 @@ void MtpKvGroup() {
       Require(guard == 0x7F7F7F7FU, "K/V group preserves output guard");
     }
   }
+  Require(equal, "all K/V group projections preserve full-QKV bits");
 }
 
 }  // namespace
@@ -1845,6 +2169,7 @@ int main(int argc, char** argv) {
       return 0;
     }
     if (argc == 2 && std::string(argv[1]) == "--plain-prefill-only") {
+      PlainPrefillHalf();
       PlainPrefillStable();
       PlainOperandPrecision();
       return 0;
@@ -1855,6 +2180,7 @@ int main(int argc, char** argv) {
     }
     if (argc == 2 && std::string(argv[1]) == "--prefill-experts-only") {
       ExecutorPrefillExperts();
+      ExecutorPrefillFinalTail();
       return 0;
     }
     if (argc == 2 && std::string(argv[1]) == "--mtp-kv-executor") {

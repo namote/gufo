@@ -34,6 +34,9 @@ compiler/dependency versions when comparing results.
   performance together. Diagnose and fix its failures, then rerun only the
   affected checks.
 - No change may wait hours on its own verification cycle.
+- On gfx1151, read and keep [docs/GFX1151-KNOWHOW.md](docs/GFX1151-KNOWHOW.md)
+  current: record every measured result, kept or rejected, there in the same
+  commit, and do not re-measure what it already records.
 
 ## Focused tests
 

@@ -540,11 +540,12 @@ public:
     /// (which can still select widened fallback for an unsafe row).
     std::uint64_t scaled_down_rows{0};
     /// Dense compressed prefill input rows (summed over projections), and
-    /// actual grouped rotation/GEMM calls. Plain rows retain FP32 arithmetic.
+    /// actual grouped rotation/GEMM calls. Plain prefill rows counted
+    /// separately.
     std::uint64_t prefill_dense_rows{0}, prefill_dense_rotation_groups{0},
         prefill_dense_gemm_groups{0}, prefill_plain_rows{0};
-    /// Plain prefill rows using LDS weight reuse instead of SmallGemmStable.
-    std::uint64_t prefill_plain_tiled_rows{0};
+    /// Plain prefill rows using FP16 WMMA, including singleton/tail chunks.
+    std::uint64_t prefill_plain_half_rows{0};
     /// Exclusive call wall times. draft_ms/catch_up_ms include inline heads;
     /// head_ms covers standalone MtpHeads. Diagnostic count downloads and
     /// synchronization are included; use an uninstrumented run for speed.
@@ -785,6 +786,8 @@ private:
     float* inject;
     float* block_out;
     float* hc_defer_w;  ///< [t][4] stream weights of a deferred combine
+    /// [t][4] stream norm scales of a combine that left s_.xn unwritten.
+    float* xn_scale{nullptr};
     // linear attention
     float* qkv;
     float* z;
@@ -853,6 +856,7 @@ private:
     float* mtp_scores;
   };
   mutable Scratch s_{};
+  std::size_t half_input_cols_{0};
   Exl3Scratch exl3_{};
   gufo::hip::Exl3RotateProblem* exl3_dense_rotations_{nullptr};
   gufo::hip::Exl3GemmProblem* exl3_dense_gemms_{nullptr};
@@ -864,7 +868,10 @@ private:
   [[nodiscard]] Exl3PrefillScratch Exl3PrefillView() const;
   bool Exl3Group(std::initializer_list<const DeviceTensor*> weights,
                  std::initializer_list<float*> outputs, const float* x,
-                 std::uint32_t rows, std::string* error) const;
+                 std::uint32_t rows, std::string* error,
+                 std::size_t shape_basis_n = 0) const;
+  bool PlainDensePrefill(const DeviceTensor& weight, const float* x, float* out,
+                         std::uint32_t rows, std::string* error) const;
   bool Exl3Experts(const DeviceLayer& layer, const float* x, float* out,
                    std::uint32_t rows, std::string* error) const;
   [[nodiscard]] Scratch RowScratch(const Scratch& base,
@@ -978,6 +985,35 @@ private:
   mutable bool half_bf16_{false};
   /// Set by a combine that wrote s_.xn_half / s_.xn_q8t instead of s_.xn.
   mutable bool xn_half_{false};
+  /// An EXL3 prefill combine that wrote the F16 norm and s_.xn_scale but no
+  /// F32 s_.xn: its residual, gamma and rows, for the next mixer to
+  /// recompute the norm from (or materialize it into s_.xn).
+  struct DeferredNorm {
+    const float* res{nullptr};
+    const float* gamma{nullptr};
+    std::uint32_t rows{0};
+  };
+  mutable DeferredNorm xn_deferred_{};
+  /// The norm (residual, gamma, rows) whose tiled Q8 rows an EXL3 prefill
+  /// combine left in s_.xn_q8t for the next mixer's W8A8 down projection.
+  mutable DeferredNorm xn_q8t_norm_{};
+  /// Every trunk mixer has a Q8_0 down copy (DeviceMixer::down_q8): EXL3
+  /// prefill combines then emit tiled Q8 norms instead of F16.
+  bool hc_down_q8_{false};
+  /// Set before an EXL3 prefill MoE whose output only the next combine
+  /// reads: the MoE then leaves its expert sum to that combine
+  /// (exl3_moe_pending_), which forms it per token in LDS.
+  mutable bool exl3_moe_defer_{false};
+  struct PendingExl3Moe {
+    const DeviceLayer* layer{nullptr};
+    std::uint32_t rows{0};
+  };
+  mutable PendingExl3Moe exl3_moe_pending_{};
+  /// Set by Attention for KvarnAttention: the queries are already in the
+  /// KVarN frame (AttentionQueryRows), and the output gate is read from the
+  /// packed s_.qg rows (attn_gate_stride_) instead of s_.attn_gate.
+  mutable bool attn_q_rotated_{false};
+  mutable std::uint32_t attn_gate_stride_{0};
   /// Partial sums per inject logit the last HcMix left in s_.inject.
   mutable std::uint32_t inject_parts_{1};
   /// Inject weights whose partials the last combine already wrote to

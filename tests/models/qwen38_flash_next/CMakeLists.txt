@@ -20,6 +20,15 @@ endfunction()
 add_qwen38_flash_next_test(exl3_reference gufo_qwen38_flash_next_reference "cpu;exl3")
 add_qwen38_flash_next_test(exl3_ple_digest gufo_qwen38_flash_next "cpu;exl3")
 
+# Compile the dedicated fixture source without GPU code for loader checks.
+add_executable(qwen38_flash_next_exl3_loader_test exl3_moe_kernel_test.cpp)
+target_compile_definitions(qwen38_flash_next_exl3_loader_test PRIVATE
+  GUFO_EXL3_LOADER_TEST_ONLY=1)
+target_link_libraries(qwen38_flash_next_exl3_loader_test PRIVATE gufo_qwen38_flash_next)
+add_test(NAME qwen38_flash_next.exl3_loader COMMAND qwen38_flash_next_exl3_loader_test)
+set_tests_properties(qwen38_flash_next.exl3_loader PROPERTIES LABELS "cpu;qwen38_flash_next;exl3")
+add_dependencies(qwen38_flash_next_tests qwen38_flash_next_exl3_loader_test)
+
 add_qwen38_flash_next_test(config gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(continuation_layout gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(ngram gufo_qwen38_flash_next "cpu")
@@ -56,7 +65,7 @@ if (ENGINE_ENABLE_HIP)
   add_qwen38_flash_next_test(exl3_invariance gufo_qwen38_flash_next "hip;gpu;gfx1151;exl3")
   set_source_files_properties(exl3_invariance_test.cpp PROPERTIES LANGUAGE HIP)
   foreach(name IN ITEMS mtp_ops blaslt_ops hc_mix_ops gdn_ops
-      attention_ops moe_epilogue_ops moe_ids_ops projection_ops routed_wmma_ops
+      attention_ops attention_rows moe_epilogue_ops moe_ids_ops projection_ops routed_wmma_ops
       select_ops snapshot_copy verification_sampling kvarn_ops)
     add_qwen38_flash_next_test(${name} gufo_qwen38_flash_next "hip;gpu;gfx1151")
   endforeach()
@@ -132,6 +141,21 @@ if (ENGINE_ENABLE_HIP)
   add_executable(qwen38_flash_next_decode_attn_bench EXCLUDE_FROM_ALL
     decode_attn_bench.cpp)
   target_link_libraries(qwen38_flash_next_decode_attn_bench PRIVATE
+    gufo_qwen38_flash_next hip::host)
+
+  add_executable(qwen38_flash_next_overlap_bench EXCLUDE_FROM_ALL
+    overlap_bench.cpp)
+  target_link_libraries(qwen38_flash_next_overlap_bench PRIVATE
+    gufo_qwen38_flash_next hip::host)
+
+  add_executable(qwen38_flash_next_f16_gemm_bench EXCLUDE_FROM_ALL
+    f16_gemm_bench.cpp)
+  target_link_libraries(qwen38_flash_next_f16_gemm_bench PRIVATE
+    gufo_qwen38_flash_next hip::host roc::hipblaslt)
+
+  add_executable(qwen38_flash_next_gdn_prefill_bench EXCLUDE_FROM_ALL
+    gdn_prefill_bench.cpp)
+  target_link_libraries(qwen38_flash_next_gdn_prefill_bench PRIVATE
     gufo_qwen38_flash_next hip::host)
 
   add_executable(qwen38_flash_next_routed_gemm_bench EXCLUDE_FROM_ALL

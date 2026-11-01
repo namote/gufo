@@ -57,6 +57,9 @@ struct Uploader {
   bool ok{true};
   std::uint32_t shard_base{0};
   std::uint64_t requested{0};
+  /// F16 mixer down weights to quantize into their Q8_0 copies once the
+  /// upload has drained (count = elements).
+  std::vector<Conversion> q8_conversions;
 
   [[nodiscard]] bool Measuring() const noexcept { return weights == nullptr; }
 
@@ -357,7 +360,34 @@ struct Uploader {
   }
 
   DeviceMixer Mixer(const HcMixer& m) {
-    return {Copy(m.norm), Copy(m.down), Copy(m.up), Copy(m.inject)};
+    DeviceMixer d{Copy(m.norm), Copy(m.down), Copy(m.up), Copy(m.inject), {}};
+    // The EXL3 prefill down projection runs W8A8 on a Q8_0 copy, as the
+    // GGUF route's Q8_0 mixer weights do; decode keeps the F16 rows.
+    if (!ok || m.down.empty() || !m.down.exl3.empty() ||
+        m.down.type != core::GgmlType::kF16 || m.down.cols % 32 != 0)
+      return d;
+    const std::size_t count =
+        static_cast<std::size_t>(m.down.cols) * m.down.rows;
+    const std::size_t size = count / 32 * 34;
+    void* q8 = nullptr;
+    if (Allocate(&q8, size + kTailMargin) != hipSuccess) {
+      Fail("device allocation failed for the Q8_0 copy of " +
+           std::string(m.down.name));
+      return d;
+    }
+    if (Measuring())
+      return d;
+    allocations.push_back(q8);
+    bytes += size + kTailMargin;
+    (void)hipMemsetAsync(static_cast<std::uint8_t*>(q8) + size, 0, kTailMargin,
+                         nullptr);
+    q8_conversions.push_back({d.down.data, q8, count});
+    d.down_q8.data = q8;
+    d.down_q8.type = core::GgmlType::kQ8_0;
+    d.down_q8.cols = d.down.cols;
+    d.down_q8.rows = d.down.rows;
+    max_q8_cols = std::max<std::size_t>(max_q8_cols, d.down_q8.cols);
+    return d;
   }
 
   DeviceLayer Layer(const LayerWeights& l) {
@@ -582,6 +612,8 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     NarrowActivations(static_cast<const float*>(c.source), c.destination, false,
                       c.count, nullptr);
   }
+  for (const auto& c : up.q8_conversions)
+    QuantizeHalfQ8_0(c.source, c.destination, c.count, nullptr);
   const auto status = hipDeviceSynchronize();
   if (status != hipSuccess) {
     if (error_msg != nullptr) {

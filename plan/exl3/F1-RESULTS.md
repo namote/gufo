@@ -381,6 +381,60 @@ cold는 새 프로세스의 첫 요청(빈 행 캐시), warm은 같은 요청의
 | q7 MTP 수락(UD-Q4) | K/A/D greedy trace 완료 |
 | q3, q4b, q5b, q5c, q6/q7 EXL3 절반 | BLOCKED-loader |
 
+### b6e3ff82에서 다시 돌린 EXL3 부분 (2026-10-31, loader 수정 efc396ba) [확인]
+
+- **이미지:** `final-b6e3ff82-tests-rocm101`(4db07a5b), `final-b6e3ff82-fn-tests-rocm101`(ca11e0e4), q6용 `final-b6e3ff82-fn-q-rocm101`(2ed9523d). q6 수집기는 0dc0a457에서 운영 toolchain으로 다시 빌드했다(0dc0a457 = b6e3ff82 + fn-quality-bf16fix, sha256 b569ac49…). 48451349의 수집기는 loader 수정 전 코드라 sidecar를 거절했다.
+
+| 창 | 결과 |
+|---|---|
+| q3 EXL3 session | **FAIL-pending-fix(Codex fn-exl3-impl 담당).** `--batch-only`: C6 row 0 cycle 0에서 batched MTP frontier가 다르다(C2/C4는 정확). `--prefill-only`: chunk 분할이 logit을 바꾼다(length 136, boundary 94). MTP audit은 scalar oracle 허용치를 넘는다(recursive-carry rms 2.1e-4, split-fusion 2.2e-4, attention-state 4.2e-4; GGUF는 1e-7 수준). sampling과 execution-32k는 PASS. engine floor는 889 토큰 prompt를 써서 끝날 수 없었다(plan 오류, 중단). 다음 통합 패스에서 짧은 prompt로 다시 돈다 |
+| q4b EXL3+KVarN K0 32K | PASS. real median 1.09e-6, p99 1.9e-4, max 9.9e-4. chunk 맞춘 fake는 1.02e-6, 2.7e-4, 9.3e-4. top-1 1.0, 자유 생성 동일 |
+| q5c EXL3 FP16 KV long-context + cache | COMPLETE(통과) |
+| q5b EXL3+KVarN suite | q5와 같은 expected-fail. 6개 suite가 같은 cache 재사용 assertion에서 멈췄다 |
+| q6 BF16 대비 prefill(32,760행) | 아래 |
+| q7b EXL3 MTP trace | COMPLETE |
+
+**q6: EXL3 5.05와 UD-Q4_K_XL을 BF16과 비교(FP16 KV, MTP 없음, a01 prefill, 3중 CI)**
+
+| | KL_256 | ΔNLL | top-1 | flip(KL>1) | KL median |
+|---|---:|---:|---:|---:|---:|
+| UD-Q4_K_XL | 0.0391 [0.0377, 0.0405] | +0.0061 | 0.9098 | 2,955 (56) | 0.0135 |
+| EXL3 5.05 | 0.0269 [0.0259, 0.0279] | −0.0064 | 0.9209 | 2,591 (26) | 0.0092 |
+| EXL3 − UD | −0.0122 (window CI [−0.0146, −0.0102]) | −0.0125 (window CI [−0.039, +0.005]) | +0.0111 (window CI [+0.0085, +0.0137]) | | |
+
+- 범주별 KL(UD → EXL3): chat 0.0374 → 0.0265, code 0.0290 → 0.0198, en_prose 0.0388 → 0.0269, ko_prose 0.0513 → 0.0342. 모든 범주에서 EXL3가 낫다. top-1도 모든 범주에서 높다.
+- top-256 질량 평균은 0.970이다(p5 0.852). KL_256은 full KL의 하한이다.
+- decode는 하지 않았다(CPU BF16 decode는 며칠이 걸린다). 27B에서는 prefill과 decode가 같은 경향이었다.
+- 4.05와 Kyojin 3.05는 XQ 확인 뒤 통합 패스에서 한다.
+
+**q7: MTP greedy chain 수락 길이(depth 7, 위치마다 앞에서부터 맞은 draft 수, 정책 없음)**
+
+| 범주 | UD | EXL3 |
+|---|---:|---:|
+| chat / prose / code (suite K) | 1.97 / 1.41 / 4.58 | 2.04 / 1.45 / 4.54 |
+| multi / copy | 1.99 / 5.43 | 2.11 / 5.44 |
+| 8K / 32K (suite D) | 2.35 / 2.07 | 2.28 / 2.19 |
+
+- A suite도 비슷하다(예: creative 1.37 → 1.20, d4_instruction 2.74 → 3.25). 수락은 양자화에 따라 크게 달라지지 않는다.
+
+### q6b: 4.05와 "Kyojin ~4.0 bpw" 대 BF16 (2026-11-01, `PLAN-FINAL-FN2-Q6B.json` `fn2-q6b-ef76`) [확인]
+
+- **수집기:** `qwen38_flash_next_rq_logits` sha256 8631d444…. 브랜치는 `ai-tools/fn-quality-ef76`(ddfd1b56 = f3-integ ef76672e + fn-quality-bf16fix)이고, docker 64849ca6ec7b(/opt/rocm 7.2.4) RelWithDebInfo로 빌드해 `storage/tools/fn-quality-ef76-ddfd1b56`에 두었다. 셋 다 같은 binary로 수집했다. 5.05는 b6e3ff82 이후 prefill 경로가 바뀌어 다시 쟀다.
+- UD-Q4_K_XL은 q6a의 실행을 그대로 쓴다(c97d555d, nix 수집기). 모두 FP16 KV, MTP 없음, a01 prefill 32,760행이다. CI는 window CI다.
+
+| | KL_256 | ΔNLL | top-1 | flip(KL>1) | KL median |
+|---|---:|---:|---:|---:|---:|
+| UD-Q4_K_XL | 0.0392 [0.0321, 0.0466] | +0.0067 | 0.9086 | 2,994 (59) | 0.0134 |
+| EXL3 5.05 (ef76672e) | 0.0269 [0.0217, 0.0322] | −0.0041 | 0.9191 | 2,649 (28) | 0.0093 |
+| turboderp 4.05 | 0.0424 [0.0344, 0.0514] | −0.0284 | 0.9056 | 3,094 (79) | 0.0145 |
+| Kyojin ~4.0 bpw | 0.0598 [0.0497, 0.0700] | +0.0277 | 0.8730 | 4,162 (96) | 0.0252 |
+
+- **UD 대비 짝 비교(window CI):**
+  - 5.05: KL −0.0124 [−0.0146, −0.0102], top-1 +0.0105 [+0.0067, +0.0157]. 더 낫다.
+  - 4.05: KL +0.0031 [−0.0010, +0.0085], top-1 −0.0031 [−0.0067, +0.0013]. 비슷하다(구간이 0을 포함). ΔNLL은 −0.035 [−0.085, −0.003]이라 NLL은 더 낮다.
+  - Kyojin: KL +0.0206 [+0.0170, +0.0243], top-1 −0.0357 [−0.0461, −0.0252]. 모든 범주에서 나쁘다(ko_prose KL 0.0784).
+- 5.05의 ef76672e 값은 b6e3ff82 값(0.0269, top-1 0.9209)과 같은 수준이다. prefill 속도를 올린 경로가 품질을 바꾸지 않았다.
+
 ### KVarN K0 기준 바로잡기 (감독 수락 2026-10-31)
 
 - **처음 기준(fake-after):** FP16으로 prefill한 뒤 양자화한다. 이 기준으로 보면 needle의 max KL이 10× 막대를 넘었다.
@@ -431,6 +485,36 @@ cold는 새 프로세스의 첫 요청(빈 행 캐시), warm은 같은 요청의
 - 32,760행, 2.84 h, peak RSS 8.2 GB, `bf16-prefill.bin` sha256 de728d88….
 - 도구 수정은 브랜치 `ai-tools/fn-quality-bf16fix`에 있다(ec2d4dc1 DiskEmbedding.weight, 55500d5a logits_io prefix, 52cb1318 창 단위 저장·재개). port-u4f 병합은 감독이 한다. 앞으로 BF16 실행은 window.py 밖에서 한다(GPU 장치 없음, nice 10).
 - 수집기는 `qwen38_flash_next_rq_logits` sha256 21f7dc49…다(fn-quality 48451349, 64849ca6ec7b /opt/rocm 7.2.4 gpu-test 빌드, `storage/tools/fn-quality-48451349`).
+
+## HC int8 실험 (2026-11-01, 사용자 승인, 브랜치 `ai-tools/fn-hc-int8`) — 결과: **채택하지 않음** [확인]
+
+- **목표:** EXL3 decode에서 HC mixer F16 가중치(down 320×10240, up 10240×320, 토큰당 96개, 1.26 GB)를 group-int8 사본으로 읽는다. 기대치는 tg +7 % 정도였다.
+- **구현:** 71fa4a63, 182cf295. base는 f3-integ c8625608이다.
+  - 형식은 Kyojin EXL3_GR_GS와 같다. down은 128, up은 64 입력마다 FP32 scale 하나(absmax/127)를 두고, 코드는 nearbyint로 ±127에 clamp한다(plain rounding).
+  - load 때 host에서 양자화한다(`hc_int8.hpp`). HIP TU의 -ffast-math에서는 `__fdiv_rn`과 `#pragma float_control`로도 scale이 1 ulp 낮게 나왔기 때문이다(측정).
+  - kernel은 `SmallGemmStable`을 따라 썼고, 가중치는 half(code·scale)로 읽는다. 단위 테스트 44개를 통과했다: F16 kernel(dequant 가중치)과 폭 1–9, 16, 17에서 비트 동일하고, 모든 행이 폭 1과 같다.
+  - trunk 48층의 attn/ffn mixer만 바꾼다. head와 MTP mixer는 F16 그대로다(prompt head, head replay, prompt chunk의 MTP catch-up). snapshot payload version은 18에서 19로 올렸다. 장치 메모리는 +659 MB다.
+  - Codex 리뷰 3회의 지적(measure 계산, leak, prompt 경로, snapshot version, non-finite)을 모두 반영했다.
+- **품질 관문**(teacher-forced decode, a01 2048–2559, 4,096행, BF16 prefill 기준, docker RelWithDebInfo):
+
+| | KL_256 | ΔNLL | top-1 |
+|---|---:|---:|---:|
+| UD-Q4_K_XL | 0.0420 | −0.0040 | 0.9004 |
+| EXL3 5.05 F16 HC | 0.0234 | −0.0161 | 0.9167 |
+| EXL3 5.05 int8 HC | 0.0254 | −0.0130 | 0.9167 |
+
+  - int8 − F16HC: KL +0.0019 [+0.0003, +0.0034](막대 ≤ +0.002, **FAIL**). top-1 0.0000 [−0.0093, +0.0071](막대 ≥ −0.005, **FAIL**). ΔNLL +0.0031 [−0.0018, +0.0077].
+  - int8 − UD: KL −0.0167 [−0.0201, −0.0143](**PASS**).
+  - suite K MTP greedy: 평균 수락 길이는 거의 같다. 17개 중 6개 완성이 F16과 같다.
+- **속도**(probe-hc-int8-docker, EXL3 5.05 + KVarN, A B A, tg128 t/s):
+
+| | F16 HC | int8 HC | F16 HC (재측정) | 이득 |
+|---|---:|---:|---:|---:|
+| d0 | 24.60 | 25.56 | 24.79 | +3.5 % |
+| d32K | 24.11 | 24.69 | 24.11 | +2.4 % |
+
+  - int8 HC load는 33.6 s다(F16 30.0 s, host 양자화 +3.6 s).
+- **결정(사용자 규칙):** d0와 d32K 모두 tg128 +10 % 이상이어야 기본값으로 둔다. 실제 이득은 +3.5 %와 +2.4 %라 **버린다.** g32 변형은 같은 바이트 규모라 10 %에 이를 수 없어 재지 않았다. 브랜치는 기록으로 남기고 병합하지 않는다.
 
 ## ABBA 계획 초안 (P1 정확성 통과 뒤)
 

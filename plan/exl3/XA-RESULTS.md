@@ -363,3 +363,25 @@ struct DeviceLinear {                 // one EXL3 projection y = x W, W [k][n]
   - tests `final-b6e3ff82-tests-rocm101` id `4db07a5bff24`
   - 둘 다 라벨 `b6e3ff827801febf5fd5ca83c3ba5042f9a02452`이다. c97d555d 이미지는 남겼다.
 - **sanity 창**(`PLAN-FINAL-B6E3-SANITY.json`, `final-b6e3-sanity/`): final-units 32/32 PASS. UD fingerprints는 rq2h와 byte-equal이고, BF16 prefill 창 0은 rq0-a01과 4095/4095 같다. 둘 다 COMPLETE, health_PASS다.
+
+### 최종 이미지 68d4e3c8과 통합 시험 (2026-10-31, gufo-06 요청)
+
+- **이미지:** 라벨은 모두 `68d4e3c8643a39323d06ee73674c6b0d956c6997`이다.
+  - release `final-68d4e3c8-rocm101` id `50ccc384a513`
+  - tests `final-68d4e3c8-tests-rocm101` id `f25dd87105b6`
+  - 테스트 derivation은 `/nix/store/1qrjnri6…`(`build/final-68d4e3c8/`)이고, 요청한 ctest 바이너리가 모두 있다.
+- **창**(`PLAN-FINAL-68D4.json`, `final-68d4-a01/`, 한 번씩 돌렸다):
+  - final-units 32/32 PASS.
+  - final-identity 3/3 PASS: UD fingerprints가 rq2h와 byte-equal, BF16 prefill이 4095/4095 동일.
+  - final-gpu-units 13/18 PASS. 27B `exl3_kernel_test`(TestBuckets 포함), `exl3_reference_test`, `plain_prefill_stable_test`는 모두 통과했다.
+- **실패 5개.** 모두 FN의 bitwise 동일성 검사다. 로그는 `final-gpu-units/receipt/run/<이름>.log`에 있다. 고치지 않았다.
+
+| ctest | 실패한 검사 |
+|---|---|
+| fn.exl3_prefill_executor | X3 prefill F=640: chunks=1의 prefill 잔차 행이 bitwise로 다르다 |
+| fn.exl3_gdn_prefill | GDN dense X3 1/64/65 chunk: 잔차 행이 bitwise로 다르다 |
+| fn.mtp_kv_group | MTP K7 QKV vs KV group rows=1: Q를 빼면 K/V projection 비트가 바뀐다 |
+| fn.mtp_kv_executor | EXL3 scalar cache-only YaRN: ragged catch-up session 0의 K cache가 bitwise로 다르다 |
+| fn.hc_down_f16 | HC fusion이 stable scalar와 31비트 다르다 |
+
+- 추정(확인 안 함): 이 바이너리는 운영 nix 툴체인(ROCm 10.1 / HIP Clang 24, release 플래그)으로 빌드됐다. integ docker gpu-test 빌드(ROCm 7.2.4 이미지, RelWithDebInfo)와 컴파일러·플래그가 다르다.

@@ -1100,9 +1100,9 @@ void TestGrouped(std::mt19937& rng, const std::size_t (&rows)[4],
 // partition gives bit-identical values; each against the FP64 inner product
 // at the WMMA bound; rows outside every bucket and descriptors past the
 // device count stay untouched; a bank entry of the wrong rate writes NaN.
-void TestBuckets(std::size_t k, std::size_t n, std::mt19937& rng) {
+void TestBuckets(std::size_t k, std::size_t n, int bits, std::mt19937& rng) {
   constexpr std::size_t kExperts = 4;
-  const BitRate rate{5, false};
+  const BitRate rate{bits, false};
   const std::size_t expert_rows[kExperts] = {1, 37, 0, 70};
   std::size_t total = 1;  // row 0 belongs to no bucket (sentinel)
   for (std::size_t e : expert_rows)
@@ -1111,8 +1111,8 @@ void TestBuckets(std::size_t k, std::size_t n, std::mt19937& rng) {
   std::vector<DeviceLinear> bank(kExperts + 1);
   std::vector<void*> owned;
   for (std::size_t e = 0; e <= kExperts; ++e) {
-    // Entry kExperts: K6, a contract violation.
-    const BitRate r = e < kExperts ? rate : BitRate{6, false};
+    // Entry kExperts: another rate, a contract violation.
+    const BitRate r = e < kExperts ? rate : BitRate{bits == 6 ? 5 : 6, false};
     std::vector<std::uint16_t> trellis((k / 16) * (n / 16) * r.TileWords());
     for (auto& w : trellis)
       w = static_cast<std::uint16_t>(rng());
@@ -1141,14 +1141,18 @@ void TestBuckets(std::size_t k, std::size_t n, std::mt19937& rng) {
   Check(hipMalloc(&d_inner, total * n * 4));
   const double bar = static_cast<double>(k) / 16.0 * std::ldexp(1.0, -23);
   std::vector<float> first_result;
-  for (std::uint32_t tile_rows : {16U, 32U, 64U, 7U}) {
+  // 128: 64-row tiles plus the hot-expert class (the 70-row expert in one
+  // 128-token bucket).
+  for (std::uint32_t partition : {16U, 32U, 64U, 7U, 128U}) {
+    const std::uint32_t tile_rows = std::min(partition, 64U);
     std::vector<gufo::hip::Exl3PrefillBucket> buckets;
     std::uint32_t row = 1;
     for (std::uint32_t e = 0; e < kExperts; ++e) {
-      for (std::uint32_t r = 0; r < expert_rows[e]; r += tile_rows)
+      const std::uint32_t size =
+          partition == 128 && expert_rows[e] <= 64 ? 64 : partition;
+      for (std::uint32_t r = 0; r < expert_rows[e]; r += size)
         buckets.push_back(
-            {e, std::min<std::uint32_t>(tile_rows, expert_rows[e] - r),
-             row + r});
+            {e, std::min<std::uint32_t>(size, expert_rows[e] - r), row + r});
       row += static_cast<std::uint32_t>(expert_rows[e]);
     }
     const auto active = static_cast<std::uint32_t>(buckets.size());
@@ -1162,12 +1166,12 @@ void TestBuckets(std::size_t k, std::size_t n, std::mt19937& rng) {
     gufo::hip::LaunchExl3PrefillBucketInner(
         d_bank, d_buckets, d_count, static_cast<std::uint32_t>(buckets.size()),
         tile_rows, d_input, d_inner, static_cast<std::uint32_t>(k),
-        static_cast<std::uint32_t>(n), nullptr);
+        static_cast<std::uint32_t>(n), rate, nullptr);
     Check(hipDeviceSynchronize());
     const auto got = Download(d_inner, total * n);
-    const std::string name = "bucket k=" + std::to_string(k) +
-                             " n=" + std::to_string(n) +
-                             " tile_rows=" + std::to_string(tile_rows);
+    const std::string name =
+        "bucket K" + std::to_string(bits) + " k=" + std::to_string(k) +
+        " n=" + std::to_string(n) + " partition=" + std::to_string(partition);
     bool untouched = true;
     for (std::size_t j = 0; j < n; ++j)
       untouched =
@@ -1221,7 +1225,8 @@ void TestBuckets(std::size_t k, std::size_t n, std::mt19937& rng) {
                     hipMemcpyHostToDevice));
     gufo::hip::LaunchExl3PrefillBucketInner(
         d_bank, d_buckets, d_count, 1, 16, d_input, d_inner,
-        static_cast<std::uint32_t>(k), static_cast<std::uint32_t>(n), nullptr);
+        static_cast<std::uint32_t>(k), static_cast<std::uint32_t>(n), rate,
+        nullptr);
     Check(hipDeviceSynchronize());
     const auto got = Download(d_inner, total * n);
     bool poisoned = true, rest = true;
@@ -1242,6 +1247,94 @@ void TestBuckets(std::size_t k, std::size_t n, std::mt19937& rng) {
   Check(hipFree(d_bank));
   Check(hipFree(d_input));
   Check(hipFree(d_inner));
+}
+
+// A subset of a grouped launch (Flash-Next MTP cache-only catch-up: k and v
+// without q) with shape_basis_n = the full group's output width reproduces
+// the full launch bit for bit; without it the geometry, and so the
+// reduction, may change (reported, not required).
+void TestShapeBasis(std::size_t q_n, std::mt19937& rng) {
+  constexpr std::size_t k = 2560, kv_n = 512;
+  const BitRate rate{7, false};
+  const std::size_t ns[3] = {q_n, kv_n, kv_n};
+  std::normal_distribution<float> normal;
+  std::vector<void*> owned;
+  DeviceLinear lin[3];
+  float* full_y[3];
+  float* sub_y[3];
+  for (int s = 0; s < 3; ++s) {
+    std::vector<std::uint16_t> trellis((k / 16) * (ns[s] / 16) *
+                                       rate.TileWords());
+    for (auto& w : trellis)
+      w = static_cast<std::uint16_t>(rng());
+    auto* d_t = Upload(trellis);
+    auto* d_suh = Upload(RandomScales(rng, k, 0x3800));
+    auto* d_svh = Upload(RandomScales(rng, ns[s], 0x2000));
+    // Up to 9 rows (two passes); the workspace slabs stay 8 rows.
+    Check(hipMalloc(&full_y[s], 9 * ns[s] * 4));
+    Check(hipMalloc(&sub_y[s], 9 * ns[s] * 4));
+    owned.insert(owned.end(), {d_t, d_suh, d_svh, full_y[s], sub_y[s]});
+    lin[s] = DeviceLinear{d_t,
+                          d_suh,
+                          d_svh,
+                          static_cast<std::uint32_t>(k),
+                          static_cast<std::uint32_t>(ns[s]),
+                          rate,
+                          Codebook::kMul1};
+  }
+  std::vector<float> x(9 * k);
+  for (auto& v : x)
+    v = normal(rng);
+  auto* d_x = Upload(x);
+  gufo::hip::Exl3FastWorkspace ws;
+  ws.input_elements = 3 * 8 * k;
+  Check(hipMalloc(&ws.input, ws.input_elements * sizeof(std::uint16_t)));
+  ws.counter_count = (q_n + 2 * kv_n) / 128;
+  Check(hipMalloc(&ws.counters, ws.counter_count * sizeof(std::uint32_t)));
+  Check(hipMemset(ws.counters, 0, ws.counter_count * sizeof(std::uint32_t)));
+  const std::size_t basis = q_n + 2 * kv_n;
+  for (std::size_t rows : {1, 3, 8, 9}) {
+    const gufo::hip::Exl3FastTarget full[3] = {{&lin[0], full_y[0], q_n},
+                                               {&lin[1], full_y[1], kv_n},
+                                               {&lin[2], full_y[2], kv_n}};
+    const gufo::hip::Exl3FastTarget sub[2] = {{&lin[1], sub_y[1], kv_n},
+                                              {&lin[2], sub_y[2], kv_n}};
+    gufo::hip::LaunchExl3FastProjections(full, d_x, k, rows, ws, nullptr);
+    gufo::hip::LaunchExl3FastProjections(sub, d_x, k, rows, ws, nullptr, false,
+                                         basis);
+    Check(hipDeviceSynchronize());
+    std::size_t diffs = 0;
+    for (int s = 1; s < 3; ++s) {
+      const auto a = Download(full_y[s], rows * kv_n);
+      const auto b = Download(sub_y[s], rows * kv_n);
+      for (std::size_t i = 0; i < a.size(); ++i)
+        diffs += std::bit_cast<std::uint32_t>(a[i]) !=
+                 std::bit_cast<std::uint32_t>(b[i]);
+    }
+    // Control: the subset with its own geometry.
+    gufo::hip::LaunchExl3FastProjections(sub, d_x, k, rows, ws, nullptr);
+    Check(hipDeviceSynchronize());
+    std::size_t own = 0;
+    for (int s = 1; s < 3; ++s) {
+      const auto a = Download(full_y[s], rows * kv_n);
+      const auto b = Download(sub_y[s], rows * kv_n);
+      for (std::size_t i = 0; i < a.size(); ++i)
+        own += std::bit_cast<std::uint32_t>(a[i]) !=
+               std::bit_cast<std::uint32_t>(b[i]);
+    }
+    const std::string name = "shape basis q=" + std::to_string(q_n) +
+                             " k/v=" + std::to_string(kv_n) +
+                             " rows=" + std::to_string(rows);
+    Expect(diffs == 0, name + ": " + std::to_string(diffs) +
+                           " k/v outputs differ from the full group");
+    std::cout << name << ": k/v bits differing from the full group " << diffs
+              << " (own geometry: " << own << ")\n";
+  }
+  for (void* p : owned)
+    Check(hipFree(p));
+  Check(hipFree(d_x));
+  Check(hipFree(ws.input));
+  Check(hipFree(ws.counters));
 }
 
 }  // namespace
@@ -1289,8 +1382,15 @@ int main() {
   TestDecodeTiles(rng);
   TestGrouped(rng, {0, 7, 33, 300}, 300, false);
   TestGrouped(rng, {5, 0, 64, 1}, 64, true);
-  TestBuckets(2560, 640, rng);
-  TestBuckets(640, 2560, rng);
+  TestBuckets(2560, 640, 5, rng);
+  TestBuckets(640, 2560, 5, rng);
+  // Mixed-rate packs (4.05 / Kyojin): K4 and K7 expert banks.
+  TestBuckets(2560, 640, 4, rng);
+  TestBuckets(640, 2560, 7, rng);
+  // Flash-Next attention q (production geometry 4 x 4 for q + k + v) and a
+  // smaller q (2 x 4); k + v alone would take 2 x 16.
+  TestShapeBasis(12288, rng);
+  TestShapeBasis(4096, rng);
   TestDispatch(rng);
   if (failures != 0) {
     std::cerr << failures << " failure(s)\n";

@@ -87,12 +87,15 @@ using Exl3ExpertBucket = gufo::hip::Exl3PrefillBucket;
 /// slots[assignments], buckets[max_buckets], bucket_count[1]. max_buckets
 /// must be >= min(assignments, experts + assignments / tile_rows). Slots
 /// remain in assignment order within each expert. No host count download.
+/// With tile_rows 64, an expert with more than 64 rows gets an even split
+/// into buckets of at most 128 rows (the X3 128-token tile).
 void Exl3BuildExpertBuckets(const std::int32_t* ids, std::uint32_t assignments,
                             std::uint32_t experts, std::uint32_t tile_rows,
                             std::uint32_t* offsets, std::int32_t* slots,
                             Exl3ExpertBucket* buckets,
                             std::uint32_t* bucket_count,
-                            std::uint32_t max_buckets, hipStream_t stream);
+                            std::uint32_t max_buckets, hipStream_t stream,
+                            std::int32_t* inverse = nullptr);
 /// Gather + FP32 rotation + FP16 RNE for bucketed gate/up or down. For
 /// gate/up, input_row = slot / used; for down it is slot. Offsets and slots
 /// are produced by Exl3BuildExpertBuckets. Packed output is [assignments][k].
@@ -113,20 +116,23 @@ void Exl3ScatterExpertBuckets(const float* packed, const std::int32_t* slots,
 /// FP32 inner dot, without H/svh. This model owns restoration, down-row
 /// unscaling and widened fallback. Reads/stores must mask ragged row and
 /// output tails (notably n=640); no slab padding is required.
-using Exl3BucketGemm = void (*)(
-    const quant::exl3::DeviceLinear* bank, const Exl3ExpertBucket* buckets,
-    const std::uint32_t* bucket_count, std::uint32_t max_buckets,
-    std::uint32_t tile_rows, const std::uint16_t* input, float* output,
-    std::uint32_t k, std::uint32_t n, hipStream_t stream);
+using Exl3BucketGemm = void (*)(const quant::exl3::DeviceLinear* bank,
+                                const Exl3ExpertBucket* buckets,
+                                const std::uint32_t* bucket_count,
+                                std::uint32_t max_buckets,
+                                std::uint32_t tile_rows,
+                                const std::uint16_t* input, float* output,
+                                std::uint32_t k, std::uint32_t n,
+                                quant::exl3::BitRate rate, hipStream_t stream);
 
-/// Production adapter: shared X3 WMMA, with no function-pointer casts.
+/// Production adapter: the shared X3 bucket WMMA at the bank's rate (K3..K7).
 void Exl3PrefillBucketInner(const quant::exl3::DeviceLinear* bank,
                             const Exl3ExpertBucket* buckets,
                             const std::uint32_t* bucket_count,
                             std::uint32_t max_buckets, std::uint32_t tile_rows,
                             const std::uint16_t* input, float* inner,
                             std::uint32_t k, std::uint32_t n,
-                            hipStream_t stream);
+                            quant::exl3::BitRate rate, hipStream_t stream);
 
 struct Exl3PrefillScratch {
   std::uint32_t* offsets{nullptr};        ///< [experts + 1]
@@ -138,6 +144,9 @@ struct Exl3PrefillScratch {
   float* up{nullptr};                     ///< [max_assignments][expert_ff]
   float* out{nullptr};                    ///< [max_assignments][hidden]
   std::int32_t* down_exponents{nullptr};  ///< [max_assignments]
+  /// Packed position of each assignment (slots inverted), for the fused
+  /// combine; optional elsewhere.
+  std::int32_t* inverse{nullptr};  ///< [max_assignments]
   std::uint32_t max_assignments{0}, max_buckets{0};
 };
 
@@ -154,11 +163,14 @@ struct Exl3PrefillTrace {
 
 /// Consume scratch.input as already-rounded, packed FP16 down rows. This is
 /// also the down stage of Exl3PrefillExperts, including scaling, widened
-/// fallback and restoration. scratch.out receives packed restored output.
+/// fallback and restoration. scratch.out receives the packed raw dots; the
+/// restored rows go back to scratch.out (packed) or, with scatter_out, to
+/// scatter_out row scratch.slots[row] (Exl3ScatterExpertBuckets fused).
 void Exl3PrefillDown(const DeviceTensor& down, std::uint32_t assignments,
                      std::uint32_t tile_rows, const Exl3PrefillScratch& scratch,
                      Exl3BucketGemm gemm, hipStream_t stream,
-                     const Exl3PrefillTrace* trace = nullptr);
+                     const Exl3PrefillTrace* trace = nullptr,
+                     float* scatter_out = nullptr, bool raw_only = false);
 
 /// Complete bucketed prefill dispatch using the shared X3 production adapter.
 /// Valid, distinct expert IDs per token are required. The caller retains
@@ -169,6 +181,26 @@ void Exl3PrefillExperts(const DeviceLayer& layer, const float* x,
                         std::uint32_t used, std::uint32_t tile_rows,
                         const Exl3PrefillScratch& scratch, hipStream_t stream,
                         const Exl3PrefillTrace* trace = nullptr);
+/// Exl3PrefillExperts up to the down projection's raw dots (scratch.out,
+/// packed, with scratch.down_exponents and scratch.inverse); then
+/// Exl3PrefillCombine restores them and forms the MoE output out[t] =
+/// sum_s weights[t*used+s] * restored(t, s) + sigmoid(gate[t*stride]) *
+/// shared[t]: the values of Exl3PrefillExperts + MoeEpilogue, bit for bit,
+/// without the restored rows' round trip through memory.
+void Exl3PrefillExpertsRaw(const DeviceLayer& layer, const float* x,
+                           const std::int32_t* ids, std::uint32_t rows,
+                           std::uint32_t used, std::uint32_t tile_rows,
+                           const Exl3PrefillScratch& scratch,
+                           hipStream_t stream);
+/// Retain the original IDs passed to Exl3PrefillExpertsRaw until combine
+/// completes; inverse rows and weights use that same token/slot order.
+void Exl3PrefillCombine(const DeviceLayer& layer,
+                        const Exl3PrefillScratch& scratch,
+                        const std::int32_t* ids, std::uint32_t rows,
+                        std::uint32_t used, const float* weights,
+                        const float* shared, const float* gate,
+                        std::uint32_t gate_stride, float* out,
+                        hipStream_t stream);
 /// Qualification overload: substitute an independent inner-product control.
 void Exl3PrefillExperts(const DeviceLayer& layer, const float* x,
                         const std::int32_t* ids, float* out, std::uint32_t rows,

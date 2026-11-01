@@ -18,6 +18,8 @@
 /// tier. Activations are row-major float32 [tokens][dim] unless noted; every
 /// launch is asynchronous on `stream`. Weights referenced here are device
 /// pointers in their GGUF encoding.
+#include "src/models/qwen38_flash_next/kernels/rocm/exl3_prefill_combine.hpp"
+
 namespace gufo::models::qwen38_flash_next::rocm {
 
 /// Host launch values, copied into kernel arguments before returning. The
@@ -70,6 +72,25 @@ void RotateKvRows(__half* k_rows, __half* v_rows, std::uint32_t n_tokens,
 /// Rotates `rows` FP32 rows of 256 in place by the normalized Hadamard: the
 /// queries into, and the attention context out of, the KVarN frame.
 void RotateHeadRows(float* x, std::uint32_t rows, hipStream_t stream);
+
+/// UnpackQGate's query half, RmsNormRows (gamma), Rope and, with `rotate`,
+/// RotateHeadRows of every (token, head) row of 256 in one pass, each in
+/// the separate kernel's arithmetic: q[t][h] from the packed [q | gate] head
+/// pairs of qg. Non-null `gate` also receives the gate half. Returns false
+/// (launching nothing) unless d == 256 and rotary_dim <= 256.
+bool AttentionQueryRows(const float* qg, std::uint32_t qg_stride,
+                        const float* gamma, float* q, float* gate,
+                        std::uint32_t n_tokens, std::uint32_t heads,
+                        std::uint32_t d, std::uint32_t rotary_dim,
+                        const std::uint32_t* start_pos, float theta, float eps,
+                        bool rotate, hipStream_t stream,
+                        const qwen::vision::DeviceRope* rope,
+                        const YarnRope& yarn);
+/// RotateHeadRows of the context rows, then SigmoidMul by the gate half of
+/// the packed qg rows (UnpackQGate's layout), in one pass.
+void GateRotatedContext(float* ctx, const float* qg, std::uint32_t qg_stride,
+                        std::uint32_t n_tokens, std::uint32_t heads,
+                        hipStream_t stream);
 
 /// One layer's KVarN K/V as the attention kernels read it
 /// (plan/exl3/F1-KVARN-DESIGN.md 4). Position j of a query at position p is
@@ -193,11 +214,32 @@ void HcMixEpilogueVec4F16(const __half* xn, const float* gate,
 /// updated residual into `xn`.
 /// `inject` is [t][s][inject_parts] partial sums (1 part for a plain GEMM).
 /// Concatenated decode requests retain scalar reduction with `decode=true`.
-void HcCombine(float* res, const float* block_out, const float* inject,
+/// xn_half, if given, also receives the norm rounded to F16 (the separate
+/// narrowing pass's conversion) where the four-lane kernel runs with a
+/// gamma; returns whether it was written. With xn_scale as well, the F32
+/// norm is not stored: xn_scale receives each row's four stream scales,
+/// from which HcNormFromRes / HcMixEpilogueVec4FromRes recompute it.
+bool HcCombine(float* res, const float* block_out, const float* inject,
                std::uint32_t inject_parts, const float* gamma, float* xn,
                std::uint32_t n_tokens, std::uint32_t hidden,
                std::uint32_t streams, float eps, hipStream_t stream,
-               bool decode = false);
+               bool decode = false, bool any_width = false,
+               __half* xn_half = nullptr, float* xn_scale = nullptr,
+               const Exl3PrefillMoeRows* moe = nullptr, void* xn_q8t = nullptr);
+/// The F32 norm HcCombine left out (four streams): res * scale * gamma in
+/// the combine's own expression.
+void HcNormFromRes(const float* res, const float* gamma, const float* xn_scale,
+                   float* xn, std::uint32_t n_tokens, std::uint32_t hidden,
+                   hipStream_t stream);
+/// HcMixEpilogueVec4 reading that norm from res, xn_scale and gamma instead
+/// of an F32 xn (four streams, hidden % 4 == 0).
+void HcMixEpilogueVec4FromRes(const float* res, const float* gamma,
+                              const float* xn_scale, const float* gate,
+                              const float* inject_w, float* mixed,
+                              float* inject, std::uint32_t n_tokens,
+                              std::uint32_t hidden, hipStream_t stream);
+// any_width: the four-lane kernel at every token count (no 16-row
+// threshold), so a route fixed by phase never depends on the chunk width.
 /// The one-block-per-stream HcCombine that also writes xn's Q8_1 rows (as
 /// qfn_mmq_quantize_q8_1 would) to `xn_q8` for a small-batch mixer down
 /// projection. False, with nothing launched, without `gamma` or unless
@@ -289,6 +331,10 @@ void NarrowActivations(const float* x, void* out, bool bf16, std::size_t count,
 std::size_t Q8TiledBytes(std::size_t batch, std::size_t k);
 void QuantizeQ8Tiled(const float* x, void* out, std::size_t batch,
                      std::size_t k, hipStream_t stream);
+/// F16 values (count % 32 == 0) to ggml Q8_0 blocks: d = amax / 127 as
+/// F16, codes round(x / d).
+void QuantizeHalfQ8_0(const void* half, void* q8, std::size_t count,
+                      hipStream_t stream);
 bool W8A8Gemm(const void* w, const void* x_tiled, float* out, std::size_t batch,
               std::size_t m, std::size_t k, hipStream_t stream);
 /// Native wave64 launch, selected by W8A8Gemm for wide output projections.
@@ -326,11 +372,18 @@ bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
                   void* mixed_q8, float* inject, std::uint32_t n_tokens,
                   std::uint32_t hidden, std::uint32_t rank, hipStream_t stream);
 
-/// F16 activation rows [batch][k], Q8_0 weights dequantized to F16 in LDS,
-/// F32 accumulation. out is [batch][m]. Unsupported shapes launch nothing.
+/// F16 activation rows [batch][k] and F16 weights [m][k], F32 accumulation.
+/// out is [batch][m]. Unsupported shapes launch nothing.
 bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
                         std::size_t batch, std::size_t m, std::size_t k,
                         hipStream_t stream);
+/// EXL3 plain prefill: fixed tile and two K16 chains for every row count.
+/// FP16 activation rows; F16/BF16/F32 weights rounded to FP16 in LDS. FP32
+/// output. K is a multiple of 32. Other model dispatch remains unchanged.
+bool PlainPrefillGemm(const void* w, WeightType type, const __half* x,
+                      float* out, std::size_t batch, std::size_t m,
+                      std::size_t k, hipStream_t stream);
+/// Q8_0 weights dequantized to F16 in LDS and F16 activation rows.
 /// input_stride is in half elements; zero means k. Padded rows are supported
 /// by the wide SSM output projection (batch >= 1024, m=2560, k=6144).
 bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
@@ -487,7 +540,7 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    bool convolved, float eps, hipStream_t stream,
                    __half* out_half = nullptr, GdnCheckpoint checkpoint = {},
                    std::uint32_t out_half_stride = 0, void* out_q8_1 = nullptr,
-                   hipEvent_t z_ready = nullptr);
+                   hipEvent_t z_ready = nullptr, bool stable_conv = false);
 
 /// Private rows for one request in a decode batch. Scratch regions and all
 /// recurrent/history/rollback buffers must be disjoint between requests.
@@ -515,7 +568,8 @@ bool GatedDeltaNetBatch(const GdnBatchItem* items, std::uint32_t count,
                         std::uint32_t qkv_stride, std::uint32_t z_stride,
                         const float* conv_w, const float* a, const float* dt,
                         const float* norm_w, std::uint32_t k_heads,
-                        std::uint32_t v_heads, float eps, hipStream_t stream);
+                        std::uint32_t v_heads, float eps, hipStream_t stream,
+                        bool stable_conv = false);
 
 /// Splits the interleaved [q|gate] projection (rows `qg_stride` apart) into
 /// q [t][heads][d] and gate [t][heads*d]. With non-null `k`, the row
@@ -615,6 +669,8 @@ void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
 /// mask at ratio 4, each row's selected blocks are first compacted once into
 /// `lists`; `list_capacity` is the selection budget (blocks per row). The
 /// output is bitwise identical to the mask walk. Null lists use the mask walk.
+/// Nonzero dense_prefix forces queries at earlier absolute positions through
+/// the dense sweep even if this chunk also contains sparse queries (EXL3).
 void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                const std::uint32_t* mask, std::uint32_t mask_words, float* out,
                float* partials, std::uint32_t splits, std::uint32_t n_tokens,
@@ -623,7 +679,8 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                hipStream_t stream, std::uint32_t* lists = nullptr,
                std::uint32_t* counts = nullptr, std::uint32_t list_capacity = 0,
                const std::uint32_t* kv_blocks = nullptr,
-               const KvarnReadView* kvarn = nullptr);
+               const KvarnReadView* kvarn = nullptr,
+               std::uint32_t dense_prefix = 0);
 
 /// Maximum visible sparse context for this WMMA geometry, or zero when the
 /// geometry is unsupported. Checkpoint planning uses the same dispatch limit.

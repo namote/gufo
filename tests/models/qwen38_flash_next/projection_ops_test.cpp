@@ -1028,6 +1028,24 @@ void CheckMtpOutputHead(float input_scale) {
 
 void CheckHcDownSilu() {
   constexpr unsigned m = 320, k = 10240, total_rows = 65;
+  const auto same = [](const float* expected, const float* actual,
+                       std::size_t count, const std::string& label) {
+    const auto ordered = [](std::uint32_t bits) {
+      return bits & 0x80000000U ? ~bits : bits | 0x80000000U;
+    };
+    for (std::size_t i = 0; i < count; ++i) {
+      const auto a = std::bit_cast<std::uint32_t>(expected[i]);
+      const auto b = std::bit_cast<std::uint32_t>(actual[i]);
+      if (a == b)
+        continue;
+      const auto ao = ordered(a), bo = ordered(b);
+      std::cerr << label << " first row=" << i / m << " col=" << i % m
+                << " expected=" << expected[i] << " actual=" << actual[i]
+                << " bits=0x" << std::hex << a << "/0x" << b << std::dec
+                << " ulps=" << (ao > bo ? ao - bo : bo - ao) << '\n';
+      throw std::runtime_error(label + " differs bitwise");
+    }
+  };
   std::uint32_t seed = 0xF316320U;
   std::vector<__half> weights(std::size_t{m} * k);
   for (auto& value : weights)
@@ -1081,8 +1099,8 @@ void CheckHcDownSilu() {
       CheckHip(hipMemcpy(expected.data(), reference, count * sizeof(float),
                          hipMemcpyDeviceToHost),
                "HC reference download");
-      if (std::memcmp(scalar.data(), expected.data(), count * sizeof(float)))
-        throw std::runtime_error("HC stable baseline changes with width");
+      same(scalar.data(), expected.data(), count,
+           "HC stable baseline width=" + std::to_string(rows));
       // Prefill uses the row-tiled stable GEMM followed by the existing
       // separate SiLU. Check the current fused decode epilogue's exact
       // store boundary below against this same scalar baseline.
@@ -1092,9 +1110,8 @@ void CheckHcDownSilu() {
       CheckHip(hipMemcpy(expected.data(), reference, count * sizeof(float),
                          hipMemcpyDeviceToHost),
                "HC tiled prefill download");
-      if (std::memcmp(scalar.data(), expected.data(), count * sizeof(float)))
-        throw std::runtime_error(
-            "HC tiled prefill/SiLU differs from stable bits");
+      same(scalar.data(), expected.data(), count,
+           "HC tiled prefill/SiLU width=" + std::to_string(rows));
       hipStream_t stream = nullptr;
       hipGraph_t graph = nullptr;
       hipGraphExec_t replay = nullptr;
@@ -1107,17 +1124,18 @@ void CheckHcDownSilu() {
       CheckHip(hipGraphInstantiate(&replay, graph, nullptr, nullptr, 0),
                "HC instantiate");
       for (unsigned pass = 0; pass < 2; ++pass) {
-        CheckHip(hipMemset(fused, 0xA5, (count + 8) * sizeof(float)),
-                 "HC guard");
+        // The graph uses a nonblocking stream, so a default-stream memset
+        // can race its GEMM and overwrite totals before the separate SiLU.
+        CheckHip(
+            hipMemsetAsync(fused, 0xA5, (count + 8) * sizeof(float), stream),
+            "HC guard");
         CheckHip(hipGraphLaunch(replay, stream), "HC replay");
         CheckHip(hipStreamSynchronize(stream), "HC ready");
         CheckHip(hipMemcpy(actual.data(), fused, actual.size() * sizeof(float),
                            hipMemcpyDeviceToHost),
                  "HC fused download");
-        if (std::memcmp(scalar.data(), actual.data(), count * sizeof(float)))
-          throw std::runtime_error(
-              "HC fusion differs from stable scalar bits: " +
-              std::to_string(rows));
+        same(scalar.data(), actual.data(), count,
+             "HC entry point width=" + std::to_string(rows));
         for (std::size_t i = count; i < actual.size(); ++i)
           if (std::bit_cast<std::uint32_t>(actual[i]) != 0xA5A5A5A5U)
             throw std::runtime_error("HC F16 fusion overwrote guard");
@@ -1138,10 +1156,8 @@ void CheckHcDownSilu() {
       CheckHip(hipMemcpy(actual.data(), all_y, actual.size() * sizeof(float),
                          hipMemcpyDeviceToHost),
                "HC chunk download");
-      if (std::memcmp(scalar.data(), actual.data(),
-                      scalar.size() * sizeof(float)))
-        throw std::runtime_error("HC fusion changes across chunk boundary " +
-                                 std::to_string(chunk));
+      same(scalar.data(), actual.data(), scalar.size(),
+           "HC entry point chunk=" + std::to_string(chunk));
     }
     // Retain the independent numerical oracle, including unsaturated inputs.
     for (unsigned token = 0; token < total_rows; ++token)

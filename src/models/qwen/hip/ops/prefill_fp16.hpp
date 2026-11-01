@@ -52,9 +52,11 @@ void LaunchExl3PrefillGemmGrouped(const Exl3GemmProblem* problems,
 // [rows][n], both packed; rows past count are neither read nor written. The
 // count is read on the device (graph-replay safe). Each value depends only
 // on its own input row and expert, never on the partition into buckets,
-// tile_rows or its position in a tile. Bank entries must be mul1 K5 with
-// this k and n (checked on the device: a mismatching bucket writes NaN);
-// k and n multiples of 128, tile_rows 1..64 (16/32/64 are the tuned tiles).
+// tile_rows or its position in a tile. Bank entries must be mul1 at `rate`
+// (integer K1..K7) with this k and n (checked on the device: a mismatching
+// bucket writes NaN); k and n multiples of 128, tile_rows 1..64 (16/32/64
+// are the tuned tiles). Every count <= tile_rows, except that with
+// tile_rows > 32 a bucket may also hold 65..128 rows (a hot expert's).
 void LaunchExl3PrefillBucketInner(const quant::exl3::DeviceLinear* device_bank,
                                   const Exl3PrefillBucket* device_buckets,
                                   const std::uint32_t* device_bucket_count,
@@ -62,7 +64,24 @@ void LaunchExl3PrefillBucketInner(const quant::exl3::DeviceLinear* device_bank,
                                   std::uint32_t tile_rows,
                                   const std::uint16_t* input, float* inner,
                                   std::uint32_t k, std::uint32_t n,
+                                  quant::exl3::BitRate rate,
                                   hipStream_t stream);
+// y[r][j] = sum_i w[j][i] * x[r][i] for unquantized FP16 weights w
+// [m][k] and FP16 rows x [rows][k]; FP32 accumulation in one WMMA chain per
+// output in K order (independent of rows or tiling). k % 16 == 0.
+void LaunchPlainF16PrefillGemm(const void* w, const void* x, float* y,
+                               std::size_t rows, std::uint32_t m,
+                               std::uint32_t k, hipStream_t stream);
+// LaunchExl3PrefillBucketInner with FP16 outputs: each value (divided first
+// by 2^row_exponents[row] when that entry is positive; row_exponents is
+// indexed by the packed input row and may be null) rounded once to FP16.
+void LaunchExl3PrefillBucketInnerHalf(
+    const quant::exl3::DeviceLinear* device_bank,
+    const Exl3PrefillBucket* device_buckets,
+    const std::uint32_t* device_bucket_count, std::uint32_t max_buckets,
+    std::uint32_t tile_rows, const std::uint16_t* input, std::uint16_t* inner,
+    std::uint32_t k, std::uint32_t n, quant::exl3::BitRate rate,
+    const std::int32_t* row_exponents, hipStream_t stream);
 // Optional residual and sum_out preserve the FP32 residual link; sum_out may
 // alias input. The normalization reduction matches LaunchBatchedRMSNorm.
 // The FP16 output must be disjoint from the FP32 inputs and weights.

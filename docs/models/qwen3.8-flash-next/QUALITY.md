@@ -1,5 +1,17 @@
 # Qwen3.8 Flash-Next quality
 
+## EXL3 prefill batch, November 1, 2026
+
+The direct expert-ID combine, attention pruning eligibility fix and grouped
+X3 scheduling retain byte-identical32,760 collected records against the saved
+pre-batch Nix baseline, with64 head replay checks. The independent frozen-row MoE
+oracle,225-row/97-expert-row tail regression, and K7 dense/cancellation checks
+pass. Tolerances were not relaxed. The final combined window has health_PASS.
+The earlier hc7-relative NLL drift (+0.006600, about0.66% perplexity) remains;
+matching records establish no added drift in this collection, not universal parity.
+Previously completed TG/MTP evidence is retained; this batch does not requalify it.
+[Receipt and build identities](../../../plan/exl3/F3-RESUME-RESULTS.md#qualified-prefill-batch-2026-11-01).
+
 ## Sampled draft-head costs, October 23, 2026
 
 Based on main `41d93463`, including the expanded greedy-head eligibility.

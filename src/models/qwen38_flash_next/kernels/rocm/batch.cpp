@@ -121,6 +121,10 @@ void Executor::UseScratch(const Scratch& scratch) const {
   q8t_src_ = nullptr;
   half_src_ = nullptr;
   xn_half_ = false;
+  xn_deferred_ = {};
+  xn_q8t_norm_ = {};
+  exl3_moe_defer_ = false;
+  exl3_moe_pending_ = {};
   moe_pending_ = false;
 }
 
@@ -1107,7 +1111,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
                 l.ssm_in.empty() ? c.SsmValueDim() : l.ssm_in.rows,
                 l.ssm_conv1d.f32(), l.ssm_a.f32(), l.ssm_dt.f32(),
                 l.ssm_norm.f32(), c.ssm_num_k_heads, c.ssm_num_v_heads,
-                c.rms_eps, stream_))
+                c.rms_eps, stream_, model_->output().exl3 != nullptr))
           return Fail(error, "batched GatedDeltaNet launch failed");
       }
       UseScratch(base);

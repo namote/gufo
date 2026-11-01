@@ -1,5 +1,21 @@
 # Qwen3.8 Flash-Next experiments
 
+## Nix ROCm 10.1 EXL3 prefill batch, November 1, 2026
+
+| Change | Result |
+|---|---|
+| Original routing IDs for combine | Retained: removes expert recovery binary search; frozen independent row oracle and final collector exact. |
+| Attention pruning eligibility | Retained correctness fix: generic fallback needs every selector mask; gate pruning on WMMA geometry/live extent and KVarN prefill support.225-row fixture proves 97 expert rows and exact chunk logits. |
+| Grouped dense 256x256 iglp0 | Retained with the batch; K7 and 64/65-row checks pass. Changes scheduling while preserving each K16 chain. |
+| Routed iglp/split32, BM256 tiles, persistent80/160 scheduling | Not promoted: exact operator outputs, additional complexity and no qualified benefit. Original operator control window failed health, so timing ratios remain advisory. Sources/binaries preserved outside production. |
+
+Combined prefill gains observed 1.86–2.18% in one healthy r2 candidate window
+against saved pre-batch Nix T1, with32,760 exact records/64 head checks. No baseline
+inference or full-model sweep per small change. Performance-neutral simplicity or
+correctness improvements remain eligible for retention. Preserve persistent
+Nix release/unit trees for subsequent incremental builds.
+[Detailed receipts](../../../plan/exl3/F3-RESUME-RESULTS.md#qualified-prefill-batch-2026-11-01).
+
 ## Chunked DeltaNet removed (October 27, 2026)
 
 The release-tier functional `tool-reasoning` suite failed in both MTP and AR

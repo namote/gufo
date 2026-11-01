@@ -7,6 +7,13 @@ metadata:
 
 # Optimize gfx1151 kernels
 
+Before any gfx1151 kernel experiment, read docs/GFX1151-KNOWHOW.md and do not
+re-measure what it already records unless the code path changed. Keep it
+current: in the same commit as any measured result, kept or rejected, add or
+update its entry there with a citation. Put model-agnostic lessons in the main
+sections and model-only results under "Other (model-specific)". Replace stale
+entries instead of appending duplicates.
+
 Read the affected model's `docs/models/<model>/{BENCHMARKS,QUALITY,EXPERIMENTS}.md`
 and its launch code. Establish the timed scope and arithmetic contract before
 changing dispatch. Follow the user's machine, time, and Git instructions.

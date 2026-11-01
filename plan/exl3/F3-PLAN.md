@@ -225,3 +225,22 @@ All take `quant::exl3::DeviceLinear` or raw device pointers in checkpoint layout
   - The FP32 VALU ceiling is about 7–15 T FMA/s. With LDS reuse the kernel is compute-bound, about 1–2 ms.
   - SmallGemmStable re-reads the weight row for every 8-token group (about 1.7 GB of weights) and the input slab for every 4-row block (about 6.7 GB). That is cache-bound, about 8–15 ms.
   - Estimated speedup: about 5–10×. The combined pass measures it.
+
+## Status at hold (2026-11-01 14:30)
+
+Code lives on `ai-tools/f3-integ` (HEAD `966f84b8`, not merged into port-u4f yet). All prefill changes are chunk-invariant; bit changes passed the q6 gate (5.05 vs BF16 KL 0.0264, top-1 92.1 %).
+
+| Probe (docker 7.2.4 RelWithDebInfo, 5.05 + KVarN) | pp2048 | pp8192 | tg128 |
+|---|---:|---:|---:|
+| 68d4e3c8 (start) | 454 | 466 | 24.7 |
+| hc7/att2 (now) | ≈1,255–1,260 | ≈1,290–1,324 | ≈24.7 |
+| UD-Q4_K_XL, same docker binary | 1,567 | — | — |
+| UD-Q4_K_XL, nix | 1,762 | 1,796 | 29.2 |
+
+Not yet measured end to end: W3's 8x1 tile, hot-expert buckets and att2 together on `966f84b8`.
+
+Remaining pp2048 gap vs UD (kernel ms/pass, hc7 trace): HC combine/mix +119, MoE glue +71, routed GEMM +69, attention non-GEMM +32 (att2 ≈ −22), HC GEMMs +24; EXL3 wins on dense (−135) and GDN (−66).
+
+Measured dead ends (numbers in the agent reports and benches): HC int8 decode (+3.5 % tg, below the +10 % bar), split-K/320/LDS double buffer/fragment ping-pong/stagger/global-space trellis loads, producer–consumer decode (WMMA and VALU do not overlap on a SIMD), two-stream micro-batch overlap (12–20 %), hipBLASLt (not faster, not shift-invariant), mix fused into HC up (+28 ms).
+
+Next on resume: one T1 probe on `966f84b8`; then the HC combine/mix gather latency, the remaining MoE glue, the kWideHalf (n % 256 ≠ 0) dense tile at 20–29 TFLOP/s; then the nix final images and the combined final pass (q3, q6, FN timing, 27B timing).
