@@ -18,6 +18,8 @@
 /// tier. Activations are row-major float32 [tokens][dim] unless noted; every
 /// launch is asynchronous on `stream`. Weights referenced here are device
 /// pointers in their GGUF encoding.
+#include "src/models/qwen38_flash_next/kernels/rocm/exl3_prefill_combine.hpp"
+
 namespace gufo::models::qwen38_flash_next::rocm {
 
 /// Host launch values, copied into kernel arguments before returning. The
@@ -203,7 +205,8 @@ bool HcCombine(float* res, const float* block_out, const float* inject,
                std::uint32_t n_tokens, std::uint32_t hidden,
                std::uint32_t streams, float eps, hipStream_t stream,
                bool decode = false, bool any_width = false,
-               __half* xn_half = nullptr, float* xn_scale = nullptr);
+               __half* xn_half = nullptr, float* xn_scale = nullptr,
+               const Exl3PrefillMoeRows* moe = nullptr);
 /// The F32 norm HcCombine left out (four streams): res * scale * gamma in
 /// the combine's own expression.
 void HcNormFromRes(const float* res, const float* gamma, const float* xn_scale,

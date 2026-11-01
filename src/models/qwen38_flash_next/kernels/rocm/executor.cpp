@@ -2544,6 +2544,39 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
   const Config& c = config();
   inject_fused_ = nullptr;
   xn_deferred_ = {};  // s_.xn is rewritten (or left stale) below
+  // An EXL3 prefill MoE output left to this combine: the four-lane kernel
+  // below forms it; any other route gets it in s_.block_out first.
+  Exl3PrefillMoeRows exl3_moe{};
+  bool exl3_moe_fused = false;
+  if (exl3_moe_pending_.layer != nullptr) {
+    const PendingExl3Moe pending = exl3_moe_pending_;
+    exl3_moe_pending_ = {};
+    const auto& d = pending.layer->ffn_down_exps;
+    const auto scratch = Exl3PrefillView();
+    exl3_moe_fused = prefill_phase && pending.rows == n_tokens &&
+                     c.hc_count == 4 && c.hidden_size % 128 == 0 &&
+                     c.hidden_size <= 2560 && d.rows == c.hidden_size &&
+                     !moe_pending_ && !res_deferred_ &&
+                     !(wide_mixer_ && MatrixRows(n_tokens) && gamma != nullptr);
+    if (exl3_moe_fused) {
+      exl3_moe = {d.device_exl3,
+                  scratch.offsets,
+                  d.experts,
+                  scratch.inverse,
+                  scratch.out,
+                  s_.weights,
+                  s_.shexp_out,
+                  s_.router + c.num_experts,
+                  c.num_experts + 1,
+                  c.num_experts_used,
+                  d.rows};
+    } else {
+      Exl3PrefillCombine(*pending.layer, scratch, pending.rows,
+                         c.num_experts_used, s_.weights, s_.shexp_out,
+                         s_.router + c.num_experts, c.num_experts + 1,
+                         s_.block_out, stream_);
+    }
+  }
   // Wide batches hand the next mixer an F16 norm for its epilogue and the
   // same norm quantized into the tiled Q8 layout for its W8A8 down
   // projection: half the bytes for the combine and the epilogue, and no
@@ -2629,8 +2662,8 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
   if (HcCombine(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn,
                 n_tokens, c.hidden_size, c.hc_count, c.rms_eps, stream_,
                 exl3 && !prefill_phase, exl3 && prefill_phase,
-                half_norm ? static_cast<__half*>(s_.x_half) : nullptr,
-                xn_scale)) {
+                half_norm ? static_cast<__half*>(s_.x_half) : nullptr, xn_scale,
+                exl3_moe_fused ? &exl3_moe : nullptr)) {
     half_src_ = s_.xn;
     half_rows_ = n_tokens;
     half_cols_ = c.HcDim();
@@ -3811,6 +3844,12 @@ bool Executor::Exl3Experts(const DeviceLayer& l, const float* x, float* out,
     if (!JoinSide(error))
       return false;
     if (prefill_phase) {
+      const bool defer = exl3_moe_defer_ && out == s_.block_out;
+      exl3_moe_defer_ = false;
+      if (defer) {
+        exl3_moe_pending_ = {&l, rows};
+        return true;
+      }
       Exl3PrefillCombine(l, Exl3PrefillView(), rows, c.num_experts_used,
                          s_.weights, s_.shexp_out, s_.router + c.num_experts,
                          c.num_experts + 1, out, stream_);
@@ -4020,7 +4059,9 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
             moe_pending_, defer_residual_, res_deferred_, shexp_half_ready_,
             q8t_src_, q8t_rows_, q8t_cols_, half_src_, half_rows_, half_cols_,
             half_bf16_, xn_half_, inject_parts_, inject_fused_, q8_slot_,
-            xn_q8_ready_, mixed_q8_ready_);
+            xn_q8_ready_, mixed_q8_ready_, xn_deferred_.res, xn_deferred_.gamma,
+            xn_deferred_.rows, exl3_moe_defer_, exl3_moe_pending_.layer,
+            exl3_moe_pending_.rows);
         const auto before = std::apply(
             [](const auto&... fields) { return std::make_tuple(fields...); },
             dispatch);
@@ -4350,8 +4391,14 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                           l.shexp_up.type == GgmlType::kQ8_0;
       Combine(s_.res, l.hc_ffn.norm.f32(), rows, InjectWeights(l.hc_ffn));
       if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, rows, error_msg,
-                 false, no_f32) ||
-          !Moe(l, s_.mixed, s_.block_out, rows, error_msg))
+                 false, no_f32))
+        return false;
+      // Only the combine below reads this MoE output: EXL3 prefill folds the
+      // expert sum into it.
+      exl3_moe_defer_ = prefill_phase;
+      const bool moe_ok = Moe(l, s_.mixed, s_.block_out, rows, error_msg);
+      exl3_moe_defer_ = false;
+      if (!moe_ok)
         return false;
       Combine(s_.res, next_norm, rows, next_inject);
       return true;

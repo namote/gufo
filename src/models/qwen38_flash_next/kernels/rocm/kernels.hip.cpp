@@ -12,6 +12,7 @@
 #include "src/core/hip/detail/kvarn_device.hpp"
 #include "src/core/hip/kv_block_table.hpp"
 #include "src/core/hip/kvarn_layout.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/exl3_prefill_combine.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 
 // HIP kernels follow the layouts and operator formulas in reference.cpp.
@@ -886,16 +887,23 @@ __device__ __forceinline__ void HcInjectPart(
 /// between the two passes, reduces the four stream norms in one block
 /// reduction, and quantizes each 32-wide block over its eight lanes with a
 /// four-code store. Rows of four streams up to 2,560 wide.
-template<typename XnT, bool kDefer = false, bool kInject = false>
+/// kMoe: the block output is the EXL3 prefill MoE output, formed per token
+/// in LDS from the raw expert rows (Exl3PrefillMoeSegment) instead of read
+/// from block_out.
+template<typename XnT, bool kDefer = false, bool kInject = false,
+         bool kMoe = false>
 __global__ void HcCombineVec4Kernel(
     float* res, const float* block_out, const float* inject,
     std::uint32_t inject_parts, const float* gamma, XnT* xn, void* xn_q8,
     std::uint32_t hidden, float eps, float* defer_w,
     const float* inject_w = nullptr, float* inject_out = nullptr,
-    __half* xn_half = nullptr, float* xn_scale = nullptr) {
+    __half* xn_half = nullptr, float* xn_scale = nullptr,
+    Exl3PrefillMoeRows moe = {}) {
   constexpr std::uint32_t kStreams = 4;
   constexpr std::uint32_t kMaxChunks = 10;  // 4 x 2560 / 4 / kThreads
+  constexpr std::uint32_t kMaxHidden = kMaxChunks * kThreads;  // 2560
   __shared__ float shared[kStreams][kThreads / 32];
+  __shared__ float s_moe[kMoe ? kMaxHidden : 1];
   // The F16 norm row, regathered for the next mixer's inject partials.
   __shared__ __half2 s_xn[kInject ? kMaxChunks * kThreads * 2 : 1];
   const std::uint32_t t = blockIdx.x;
@@ -921,6 +929,19 @@ __global__ void HcCombineVec4Kernel(
   }
   float* dst = res + static_cast<std::size_t>(t) * hc_dim;
   const float* src = block_out + static_cast<std::size_t>(t) * hidden;
+  if constexpr (kMoe) {
+    const std::uint32_t lane = threadIdx.x & 31u;
+    for (std::uint32_t segment = threadIdx.x >> 5u; segment * 128 < hidden;
+         segment += kThreads / 32) {
+      float o[4];
+      Exl3PrefillMoeSegment(moe, t, segment, lane, o);
+#pragma unroll
+      for (std::uint32_t j = 0; j < 4; ++j)
+        s_moe[(segment * 128) + (lane * 4) + j] = o[j];
+    }
+    __syncthreads();
+    src = s_moe;
+  }
   const std::uint32_t chunks = static_cast<std::uint32_t>(hc_dim / 4);
   float4 v[kMaxChunks];
   float ss[kStreams] = {0.0F, 0.0F, 0.0F, 0.0F};
@@ -6496,19 +6517,31 @@ bool HcCombine(float* res, const float* block_out, const float* inject,
                std::uint32_t inject_parts, const float* gamma, float* xn,
                std::uint32_t n_tokens, std::uint32_t hidden,
                std::uint32_t streams, float eps, hipStream_t stream,
-               bool decode, bool any_width, __half* xn_half, float* xn_scale) {
+               bool decode, bool any_width, __half* xn_half, float* xn_scale,
+               const Exl3PrefillMoeRows* moe) {
   // One block per token wants a batch: a decode step keeps the
   // one-block-per-stream kernel's parallelism.
   if (!decode && (n_tokens >= 16 || any_width) && streams == 4 &&
       hidden % 128 == 0 && hidden <= 2560) {
     xn_half = gamma != nullptr ? xn_half : nullptr;
     xn_scale = xn_half != nullptr ? xn_scale : nullptr;
-    hipLaunchKernelGGL(HcCombineVec4Kernel<float>, dim3(n_tokens),
-                       dim3(kThreads), 0, stream, res, block_out, inject,
-                       inject_parts, gamma, xn, nullptr, hidden, eps, nullptr,
-                       nullptr, nullptr, xn_half, xn_scale);
+    if (moe != nullptr) {
+      hipLaunchKernelGGL((HcCombineVec4Kernel<float, false, false, true>),
+                         dim3(n_tokens), dim3(kThreads), 0, stream, res,
+                         block_out, inject, inject_parts, gamma, xn, nullptr,
+                         hidden, eps, nullptr, nullptr, nullptr, xn_half,
+                         xn_scale, *moe);
+    } else {
+      hipLaunchKernelGGL(HcCombineVec4Kernel<float>, dim3(n_tokens),
+                         dim3(kThreads), 0, stream, res, block_out, inject,
+                         inject_parts, gamma, xn, nullptr, hidden, eps, nullptr,
+                         nullptr, nullptr, xn_half, xn_scale);
+    }
     return xn_half != nullptr;
   }
+  if (moe != nullptr)
+    throw std::invalid_argument(
+        "HC combine: the fused MoE output needs the four-lane prefill kernel");
   hipLaunchKernelGGL(HcCombineKernel<float>, dim3(n_tokens, streams),
                      dim3(kThreads), 0, stream, res, block_out, inject,
                      inject_parts, gamma, xn, nullptr, hidden, streams, eps,
@@ -6605,8 +6638,8 @@ bool HcCombineF16(float* res, const float* block_out, const float* inject,
                                             : HcCombineVec4Kernel<__half>;
     hipLaunchKernelGGL(combine, dim3(n_tokens), dim3(kThreads), 0, stream, res,
                        block_out, inject, inject_parts, gamma, xn, xn_q8,
-                       hidden, eps, defer_w, nullptr, nullptr, nullptr,
-                       nullptr);
+                       hidden, eps, defer_w, nullptr, nullptr, nullptr, nullptr,
+                       Exl3PrefillMoeRows{});
     return defer_w != nullptr;
   }
   hipLaunchKernelGGL(HcCombineKernel<__half>, dim3(n_tokens, streams),
