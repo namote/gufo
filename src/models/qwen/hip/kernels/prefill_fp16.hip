@@ -58,8 +58,8 @@ struct RawIqWeights {
 };
 
 template<gufo::core::GgmlType Type>
-__device__ __forceinline__ RawIqWeights LoadIqRaw(
-    const void* row, unsigned sub, const uint2* header = nullptr) {
+__device__ __forceinline__ RawIqWeights
+LoadIqRaw(const void* row, unsigned sub, const uint2* header = nullptr) {
   static_assert(Type == gufo::core::GgmlType::kIQ4_XS ||
                 Type == gufo::core::GgmlType::kIQ4_NL);
   RawIqWeights weights;
@@ -72,9 +72,8 @@ __device__ __forceinline__ RawIqWeights LoadIqRaw(
         header ? header->y >> (8 * (sb / 2)) : block.scales_l[sb / 2];
     const unsigned high = header ? header->x >> 16 : block.scales_h;
     const __half d = header ? __ushort_as_half(header->x & 65535) : block.d;
-    const int code = static_cast<int>(
-                         ((low >> (4 * (sb & 1))) & 15) |
-                         (((high >> (2 * sb)) & 3) << 4)) -
+    const int code = static_cast<int>(((low >> (4 * (sb & 1))) & 15) |
+                                      (((high >> (2 * sb)) & 3) << 4)) -
                      32;
     weights.scale = __half2float(d) * static_cast<float>(code);
   } else {
@@ -88,7 +87,8 @@ __device__ __forceinline__ RawIqWeights LoadIqRaw(
 // All 16 IQ4 codebook entries are integers represented exactly in FP16.
 // Look up their half bits directly, avoiding signed-byte extraction and
 // conversion for each weight. Scaling still uses the original FP32 product.
-__device__ __forceinline__ HalfWeights DecodeIqRaw(const RawIqWeights& weights) {
+__device__ __forceinline__ HalfWeights
+DecodeIqRaw(const RawIqWeights& weights) {
   union {
     v16bf f;
     uint4 u[2];
@@ -100,24 +100,20 @@ __device__ __forceinline__ HalfWeights DecodeIqRaw(const RawIqWeights& weights) 
     const unsigned select = ((n & 0x08080808U) >> 3) * 255;
     // Low and high bytes of FP16 {-127, -104, -83, -65, -49, -35,
     // -22, -10, 1, 13, 25, 38, 53, 69, 89, 113}, four entries per word.
-    const unsigned lo0 =
-        __builtin_amdgcn_perm(0x00806020U, 0x103080f0U, index);
-    const unsigned lo1 =
-        __builtin_amdgcn_perm(0x109050a0U, 0xc0408000U, index);
-    const unsigned hi0 =
-        __builtin_amdgcn_perm(0xc9cdd0d2U, 0xd4d5d6d7U, index);
-    const unsigned hi1 =
-        __builtin_amdgcn_perm(0x57555452U, 0x504e4a3cU, index);
+    const unsigned lo0 = __builtin_amdgcn_perm(0x00806020U, 0x103080f0U, index);
+    const unsigned lo1 = __builtin_amdgcn_perm(0x109050a0U, 0xc0408000U, index);
+    const unsigned hi0 = __builtin_amdgcn_perm(0xc9cdd0d2U, 0xd4d5d6d7U, index);
+    const unsigned hi1 = __builtin_amdgcn_perm(0x57555452U, 0x504e4a3cU, index);
     const unsigned lo = (lo0 & ~select) | (lo1 & select);
     const unsigned hi = (hi0 & ~select) | (hi1 & select);
     const unsigned c0 = __builtin_amdgcn_perm(hi, lo, 0x05010400U);
     const unsigned c1 = __builtin_amdgcn_perm(hi, lo, 0x07030602U);
-    result.f[4 * i] = static_cast<_Float16>(__fmul_rn(
-        weights.scale, __half2float(__ushort_as_half(c0 & 65535))));
+    result.f[4 * i] = static_cast<_Float16>(
+        __fmul_rn(weights.scale, __half2float(__ushort_as_half(c0 & 65535))));
     result.f[4 * i + 1] = static_cast<_Float16>(
         __fmul_rn(weights.scale, __half2float(__ushort_as_half(c0 >> 16))));
-    result.f[4 * i + 2] = static_cast<_Float16>(__fmul_rn(
-        weights.scale, __half2float(__ushort_as_half(c1 & 65535))));
+    result.f[4 * i + 2] = static_cast<_Float16>(
+        __fmul_rn(weights.scale, __half2float(__ushort_as_half(c1 & 65535))));
     result.f[4 * i + 3] = static_cast<_Float16>(
         __fmul_rn(weights.scale, __half2float(__ushort_as_half(c1 >> 16))));
   }
@@ -145,9 +141,8 @@ struct RawWeights {
   int signed_scale;
 };
 template<gufo::core::GgmlType Type>
-__device__ __forceinline__ RawWeights<Type> LoadRaw(const void* row,
-                                                    unsigned sub,
-                                                    const uint4* header = nullptr) {
+__device__ __forceinline__ RawWeights<Type> LoadRaw(
+    const void* row, unsigned sub, const uint4* header = nullptr) {
   using namespace gufo::hip;
   using gufo::core::GgmlType;
   RawWeights<Type> r{};
@@ -239,14 +234,11 @@ template<int BM, int BN, int WM, int WN, gufo::core::GgmlType Type,
          gufo::core::GgmlType UpType = Type, int TrellisBits = 0,
          int Batching = 0>
 
-__launch_bounds__(WM * WN * 32) __global__
-    void HalfPrefillGemmKernel(const void* __restrict__ w,
-                               const short* __restrict__ x,
-                               float* __restrict__ y, int batch, int m, int k,
-                               const float* __restrict__ gate,
-                               const void* __restrict__ up = nullptr,
-                               const std::int32_t* __restrict__ row_exponents =
-                                   nullptr) {
+__launch_bounds__(WM * WN * 32) __global__ void HalfPrefillGemmKernel(
+    const void* __restrict__ w, const short* __restrict__ x,
+    float* __restrict__ y, int batch, int m, int k,
+    const float* __restrict__ gate, const void* __restrict__ up = nullptr,
+    const std::int32_t* __restrict__ row_exponents = nullptr) {
   // EXL3 instances read svh (FP16) through `gate`, unused by their kStore and
   // kResidual epilogues, so the GGUF instances keep their signature.
   constexpr bool Trellis = TrellisBits > 0;
@@ -257,11 +249,10 @@ __launch_bounds__(WM * WN * 32) __global__
   constexpr int BK = 4, WaveSize = 32;
   // A 256-weight Q5 block spans four K64 iterations. Keep its header in
   // registers for the Q5 and Q4/Q5 kernels that benefit from this reuse.
-  constexpr bool CacheQ5Header =
-      BM == 256 && BN == 256 &&
-      (Type == gufo::core::GgmlType::kQ5_K ||
-       (Type == gufo::core::GgmlType::kQ4_K &&
-        UpType == gufo::core::GgmlType::kQ5_K));
+  constexpr bool CacheQ5Header = BM == 256 && BN == 256 &&
+                                 (Type == gufo::core::GgmlType::kQ5_K ||
+                                  (Type == gufo::core::GgmlType::kQ4_K &&
+                                   UpType == gufo::core::GgmlType::kQ5_K));
   // These IQ4_XS projections benefit from keeping packed weights until
   // LDS commit and reusing the block header. Q3/IQ4_NL mixed pairs retain
   // immediate decoding.
@@ -274,12 +265,13 @@ __launch_bounds__(WM * WN * 32) __global__
         UpType == gufo::core::GgmlType::kIQ4_XS));
   // The mixed Q6 gate is qualified with the fetch-stage decoder; deferring
   // its decode changes dot-product rounding in this kernel specialization.
-  constexpr int DecodeStage = (Type == gufo::core::GgmlType::kQ4_K ||
-                               Type == gufo::core::GgmlType::kQ5_K ||
-                               (Type == gufo::core::GgmlType::kQ6_K && !Mixed) ||
-                               Type == gufo::core::GgmlType::kQ8_0)
-                                  ? 2
-                                  : 0;
+  constexpr int DecodeStage =
+      (Type == gufo::core::GgmlType::kQ4_K ||
+       Type == gufo::core::GgmlType::kQ5_K ||
+       (Type == gufo::core::GgmlType::kQ6_K && !Mixed) ||
+       Type == gufo::core::GgmlType::kQ8_0)
+          ? 2
+          : 0;
   constexpr int kThreads = WM * WN * WaveSize;
   constexpr int RS = BM / 16;
   constexpr int TS = BN / 16;
@@ -327,8 +319,7 @@ __launch_bounds__(WM * WN * 32) __global__
   // *gate (the device count), raw inner products. Blocks past the rows exit.
   static_assert(Batching == 0 || TrellisBits > 0, "batching is EXL3 only");
   if constexpr (Batching == 1) {
-    const auto& problem =
-        static_cast<const Exl3GemmProblem*>(up)[blockIdx.z];
+    const auto& problem = static_cast<const Exl3GemmProblem*>(up)[blockIdx.z];
     w = problem.trellis;
     x = static_cast<const short*>(problem.x);
     y = problem.y;
@@ -344,7 +335,10 @@ __launch_bounds__(WM * WN * 32) __global__
     const Exl3PrefillBucket bucket =
         static_cast<const Exl3PrefillBucket*>(up)[blockIdx.z];
     batch = static_cast<int>(bucket.count);
-    if (t_block >= batch)
+    // Bucket classes (Exl3BuildExpertBuckets): a hot expert's rows come in
+    // buckets of BN/2 < count <= BN for a token tile wider than 64; the
+    // 64-token tile takes the rest. Each bucket has exactly one taker.
+    if (t_block >= batch || batch > BN || (BN > 64 && batch <= BN / 2))
       return;
     const auto& linear =
         static_cast<const quant::exl3::DeviceLinear*>(w)[bucket.expert];
@@ -365,8 +359,9 @@ __launch_bounds__(WM * WN * 32) __global__
         const int token = t_block + i / BM, row = r_block + i % BM;
         if (token < batch) {
           if constexpr (Batching == 3)
-            reinterpret_cast<__half*>(y)[static_cast<std::size_t>(token) * m +
-                                         row] = __float2half(__builtin_nanf(""));
+            reinterpret_cast<__half*>(
+                y)[static_cast<std::size_t>(token) * m + row] =
+                __float2half(__builtin_nanf(""));
           else
             y[static_cast<std::size_t>(token) * m + row] = __builtin_nanf("");
         }
@@ -389,16 +384,17 @@ __launch_bounds__(WM * WN * 32) __global__
   const std::size_t up_row_bytes = gufo::hip::QuantRowBytes(UpType, k);
   if constexpr (!Trellis) {
 #pragma unroll
-  for (int p = 0; p < PFA; ++p) {
-    const int physical_row = ((p * kThreads) + tid) / BK;
-    const int r =
-        r_block +
-        (Paired ? (physical_row / 32) * 16 + physical_row % 16 : physical_row);
-    const void* source = Paired && physical_row % 32 >= 16 ? up : w;
-    w_row[p] = static_cast<const std::uint8_t*>(source) +
-               (static_cast<std::size_t>((Complete || r < m) ? r : (m - 1)) *
-                (Mixed && physical_row % 32 >= 16 ? up_row_bytes : row_bytes));
-  }
+    for (int p = 0; p < PFA; ++p) {
+      const int physical_row = ((p * kThreads) + tid) / BK;
+      const int r =
+          r_block + (Paired ? (physical_row / 32) * 16 + physical_row % 16
+                            : physical_row);
+      const void* source = Paired && physical_row % 32 >= 16 ? up : w;
+      w_row[p] =
+          static_cast<const std::uint8_t*>(source) +
+          (static_cast<std::size_t>((Complete || r < m) ? r : (m - 1)) *
+           (Mixed && physical_row % 32 >= 16 ? up_row_bytes : row_bytes));
+    }
   }
   // Trellis producer: lane L decodes positions 8L .. 8L + 7 of a tile
   // (src/core/hip/detail/exl3_gemv.hpp), TPW tiles per wave and stage.
@@ -435,16 +431,14 @@ __launch_bounds__(WM * WN * 32) __global__
     if ((kk & 12) == 0)
       __builtin_memcpy(
           &iq_headers[p],
-          reinterpret_cast<const IQ4XSBlock*>(w_row[p]) + unsigned(kk) / 16,
-          8);
-    raw_iq[p] = LoadIqRaw<gufo::core::GgmlType::kIQ4_XS>(
-        w_row[p], unsigned(kk), &iq_headers[p]);
+          reinterpret_cast<const IQ4XSBlock*>(w_row[p]) + unsigned(kk) / 16, 8);
+    raw_iq[p] = LoadIqRaw<gufo::core::GgmlType::kIQ4_XS>(w_row[p], unsigned(kk),
+                                                         &iq_headers[p]);
   };
   const auto fetch_up = [&](int p, int kk) {
     if constexpr (Mixed) {
       if constexpr (UpRaw) {
-        if constexpr (CacheQ5Header &&
-                      UpType == gufo::core::GgmlType::kQ5_K) {
+        if constexpr (CacheQ5Header && UpType == gufo::core::GgmlType::kQ5_K) {
           if ((kk & 12) == 0)
             __builtin_memcpy(
                 &headers[p],
@@ -465,7 +459,10 @@ __launch_bounds__(WM * WN * 32) __global__
       } else {
         gufo::hip::QuantSub16 q;
         gufo::hip::DecodeQuantSub16<true>(UpType, w_row[p], kk, q);
-        union { v16bf f; uint4 u[2]; } packed;
+        union {
+          v16bf f;
+          uint4 u[2];
+        } packed;
 #pragma unroll
         for (int j = 0; j < 16; ++j)
           packed.f[j] = static_cast<_Float16>(__fsub_rn(
@@ -489,62 +486,61 @@ __launch_bounds__(WM * WN * 32) __global__
       }
     } else {
 #pragma unroll
-    for (int p = 0; p < PFA; ++p) {
-      const int idx = p * kThreads + tid, kk = ks0 + idx % BK;
-      if (idx < BM * BK && (Complete || kk < ksteps)) {
-        if (Mixed && (idx / BK) % 32 >= 16)
-          fetch_up(p, kk);
-        else if constexpr (CacheQ5Header &&
-                           Type == gufo::core::GgmlType::kQ5_K) {
-          if ((ks0 & 15) == 0)
-            __builtin_memcpy(
-                &headers[p],
-                reinterpret_cast<const Q5KBlock*>(w_row[p]) + unsigned(kk) / 16,
-                16);
-          raw[p] = LoadRaw<Type>(w_row[p], kk, &headers[p]);
-        } else if constexpr (DecodeStage == 2)
-          raw[p] = LoadRaw<Type>(w_row[p], kk);
-        else if constexpr (CacheIqHeader &&
-                           Type == gufo::core::GgmlType::kIQ4_XS) {
-          fetch_iq(p, kk);
-        } else if constexpr (Type == gufo::core::GgmlType::kIQ4_XS ||
-                           Type == gufo::core::GgmlType::kIQ4_NL) {
-          const auto packed = LoadIqHalf<Type>(w_row[p], unsigned(kk));
-          ra[p][0] = packed.low;
-          ra[p][1] = packed.high;
-        } else if constexpr (Type == gufo::core::GgmlType::kF16) {
-          const auto* src =
-              reinterpret_cast<const uint4*>(w_row[p] + std::size_t(kk) * 32);
-          ra[p][0] = src[0];
-          ra[p][1] = src[1];
-        }
-        else {
-          gufo::hip::QuantSub16 q;
-          gufo::hip::DecodeQuantSub16<true>(Type, w_row[p], kk, q);
-          union {
-            v16bf f;
-            uint4 u[2];
-          } packed;
+      for (int p = 0; p < PFA; ++p) {
+        const int idx = p * kThreads + tid, kk = ks0 + idx % BK;
+        if (idx < BM * BK && (Complete || kk < ksteps)) {
+          if (Mixed && (idx / BK) % 32 >= 16)
+            fetch_up(p, kk);
+          else if constexpr (CacheQ5Header &&
+                             Type == gufo::core::GgmlType::kQ5_K) {
+            if ((ks0 & 15) == 0)
+              __builtin_memcpy(&headers[p],
+                               reinterpret_cast<const Q5KBlock*>(w_row[p]) +
+                                   unsigned(kk) / 16,
+                               16);
+            raw[p] = LoadRaw<Type>(w_row[p], kk, &headers[p]);
+          } else if constexpr (DecodeStage == 2)
+            raw[p] = LoadRaw<Type>(w_row[p], kk);
+          else if constexpr (CacheIqHeader &&
+                             Type == gufo::core::GgmlType::kIQ4_XS) {
+            fetch_iq(p, kk);
+          } else if constexpr (Type == gufo::core::GgmlType::kIQ4_XS ||
+                               Type == gufo::core::GgmlType::kIQ4_NL) {
+            const auto packed = LoadIqHalf<Type>(w_row[p], unsigned(kk));
+            ra[p][0] = packed.low;
+            ra[p][1] = packed.high;
+          } else if constexpr (Type == gufo::core::GgmlType::kF16) {
+            const auto* src =
+                reinterpret_cast<const uint4*>(w_row[p] + std::size_t(kk) * 32);
+            ra[p][0] = src[0];
+            ra[p][1] = src[1];
+          } else {
+            gufo::hip::QuantSub16 q;
+            gufo::hip::DecodeQuantSub16<true>(Type, w_row[p], kk, q);
+            union {
+              v16bf f;
+              uint4 u[2];
+            } packed;
 #pragma unroll
-          for (int j = 0; j < 16; ++j)
-            packed.f[j] = static_cast<_Float16>(__fsub_rn(
-                __fmul_rn(q.scale, static_cast<float>(q.q[j])), q.offset));
-          ra[p][0] = packed.u[0];
-          ra[p][1] = packed.u[1];
+            for (int j = 0; j < 16; ++j)
+              packed.f[j] = static_cast<_Float16>(__fsub_rn(
+                  __fmul_rn(q.scale, static_cast<float>(q.q[j])), q.offset));
+            ra[p][0] = packed.u[0];
+            ra[p][1] = packed.u[1];
+          }
+        } else {
+          if constexpr (CacheIqHeader)
+            raw_iq[p] = {};
+          ra[p][0] = make_uint4(0, 0, 0, 0);
+          ra[p][1] = make_uint4(0, 0, 0, 0);
+          if (Mixed && (idx / BK) % 32 >= 16)
+            fetch_up(p, kk);
+          else if constexpr (DecodeStage == 2)
+            raw[p] = {};
+          if constexpr (Mixed && UpRaw)
+            raw_up[p] = {};
         }
-      } else {
-        if constexpr (CacheIqHeader)
-          raw_iq[p] = {};
-        ra[p][0] = make_uint4(0, 0, 0, 0);
-        ra[p][1] = make_uint4(0, 0, 0, 0);
-        if (Mixed && (idx / BK) % 32 >= 16)
-          fetch_up(p, kk);
-        else if constexpr (DecodeStage == 2)
-          raw[p] = {};
-        if constexpr (Mixed && UpRaw)
-          raw_up[p] = {};
       }
-    }
     }
 #pragma unroll
     for (int p = 0; p < PFB; ++p) {
@@ -563,7 +559,10 @@ __launch_bounds__(WM * WN * 32) __global__
     if constexpr (Mixed) {
       if constexpr (UpRaw) {
         gufo::hip::QuantSub16 q = DecodeRaw<UpType>(raw_up[p]);
-        union { v16bf f; uint4 u[2]; } packed;
+        union {
+          v16bf f;
+          uint4 u[2];
+        } packed;
 #pragma unroll
         for (int j = 0; j < 16; ++j)
           packed.f[j] = static_cast<_Float16>(__fsub_rn(
@@ -607,32 +606,32 @@ __launch_bounds__(WM * WN * 32) __global__
       }
     } else {
 #pragma unroll
-    for (int p = 0; p < PFA; ++p) {
-      const int idx = p * kThreads + tid, row = idx / BK, ks = idx % BK;
-      if (idx < BM * BK) {
-        const int placed = (row ^ (ks & 3));
-        short* dst = &s_a[ks][placed / 16][placed % 16][0];
-        if (Mixed && row % 32 >= 16) {
-          commit_up(p, dst, row);
-        } else if constexpr (DecodeStage != 0) {
-          gufo::hip::QuantSub16 q = DecodeRaw<Type>(raw[p]);
-          union {
-            v16bf f;
-            uint4 u[2];
-          } packed;
+      for (int p = 0; p < PFA; ++p) {
+        const int idx = p * kThreads + tid, row = idx / BK, ks = idx % BK;
+        if (idx < BM * BK) {
+          const int placed = (row ^ (ks & 3));
+          short* dst = &s_a[ks][placed / 16][placed % 16][0];
+          if (Mixed && row % 32 >= 16) {
+            commit_up(p, dst, row);
+          } else if constexpr (DecodeStage != 0) {
+            gufo::hip::QuantSub16 q = DecodeRaw<Type>(raw[p]);
+            union {
+              v16bf f;
+              uint4 u[2];
+            } packed;
 #pragma unroll
-          for (int j = 0; j < 16; ++j)
-            packed.f[j] = static_cast<_Float16>(__fsub_rn(
-                __fmul_rn(q.scale, static_cast<float>(q.q[j])), q.offset));
-          StoreSwizzled(dst, packed.u[0], packed.u[1], row);
-        } else if constexpr (CacheIqHeader &&
-                             Type == gufo::core::GgmlType::kIQ4_XS) {
-          const auto packed = DecodeIqRaw(raw_iq[p]);
-          StoreSwizzled(dst, packed.low, packed.high, row);
-        } else
-          StoreSwizzled(dst, ra[p][0], ra[p][1], row);
+            for (int j = 0; j < 16; ++j)
+              packed.f[j] = static_cast<_Float16>(__fsub_rn(
+                  __fmul_rn(q.scale, static_cast<float>(q.q[j])), q.offset));
+            StoreSwizzled(dst, packed.u[0], packed.u[1], row);
+          } else if constexpr (CacheIqHeader &&
+                               Type == gufo::core::GgmlType::kIQ4_XS) {
+            const auto packed = DecodeIqRaw(raw_iq[p]);
+            StoreSwizzled(dst, packed.low, packed.high, row);
+          } else
+            StoreSwizzled(dst, ra[p][0], ra[p][1], row);
+        }
       }
-    }
     }
 #pragma unroll
     for (int p = 0; p < PFB; ++p) {
@@ -729,8 +728,8 @@ __launch_bounds__(WM * WN * 32) __global__
 #pragma unroll
         for (int i = 0; i < WRS; ++i) {
           const int row = r_block + (wr * WRS + i) * 16 + sl;
-          reinterpret_cast<__half*>(y)[static_cast<std::size_t>(token) * m +
-                                       row] =
+          reinterpret_cast<__half*>(
+              y)[static_cast<std::size_t>(token) * m + row] =
               __float2half_rn(acc[i][j][l] * scale);
         }
       }
@@ -794,9 +793,10 @@ __launch_bounds__(WM * WN * 32) __global__
           float* dst = y + static_cast<std::size_t>(token) * m + row;
 #pragma unroll
           for (int j = 0; j < 4; ++j) {
-            const float value = (v[j] * exl3::kHadamardScale) *
-                                static_cast<float>(
-                                    reinterpret_cast<const _Float16*>(gate)[row + j]);
+            const float value =
+                (v[j] * exl3::kHadamardScale) *
+                static_cast<float>(
+                    reinterpret_cast<const _Float16*>(gate)[row + j]);
             if constexpr (Epilogue == HalfEpilogue::kResidual)
               dst[j] = __fadd_rn(dst[j], value);
             else
@@ -922,8 +922,8 @@ __global__ void HalfNorm(const float* x, const float* residual,
   }
 }
 __global__ void HalfNorm5120(const float* __restrict__ x,
-                              const float* __restrict__ weight,
-                              __half* __restrict__ out, float eps) {
+                             const float* __restrict__ weight,
+                             __half* __restrict__ out, float eps) {
   constexpr unsigned Dim = 5120, Elements = Dim / 256;
   const unsigned row = blockIdx.x, tid = threadIdx.x;
   const std::size_t base = std::size_t(row) * Dim;
@@ -1000,8 +1000,9 @@ __global__ void HalfNormRotated(const float* __restrict__ x,
 // rounded to FP16. Lane l owns elements 4l..4l+3 of its segment.
 __launch_bounds__(256) __global__
     void SwiGLURotateFp16(const float* __restrict__ gate,
-                          const float* __restrict__ up, __half* __restrict__ out,
-                          std::size_t segments, std::size_t row_segments,
+                          const float* __restrict__ up,
+                          __half* __restrict__ out, std::size_t segments,
+                          std::size_t row_segments,
                           const std::uint32_t* __restrict__ signs) {
   const std::size_t segment = std::size_t(blockIdx.x) * 8 + threadIdx.x / 32;
   if (segment >= segments) {
@@ -1036,8 +1037,8 @@ void LaunchBatchedRMSNormFp16(const float* x, const float* residual,
                               std::size_t batch, std::size_t dim, float eps,
                               hipStream_t stream) {
   if (dim == 5120 && residual == nullptr && sum_out == nullptr) {
-    HalfNorm5120<<<batch, 256, 0, stream>>>(
-        x, weight, static_cast<__half*>(out), eps);
+    HalfNorm5120<<<batch, 256, 0, stream>>>(x, weight,
+                                            static_cast<__half*>(out), eps);
     return;
   }
   HalfNorm<<<batch, 256, 0, stream>>>(x, residual, weight, sum_out,
@@ -1178,11 +1179,10 @@ void LaunchExl3Tile(Exl3Tile tile, const void* w, const void* x, float* y,
                         unsigned threads) {
     kernel<<<dim3(static_cast<unsigned>((rows + tokens - 1) / tokens),
                   n / channels, count),
-             threads, 0, stream>>>(w, static_cast<const short*>(x), y,
-                                   static_cast<int>(rows), static_cast<int>(n),
-                                   static_cast<int>(k),
-                                   static_cast<const float*>(svh), problems,
-                                   nullptr);
+             threads, 0, stream>>>(
+        w, static_cast<const short*>(x), y, static_cast<int>(rows),
+        static_cast<int>(n), static_cast<int>(k),
+        static_cast<const float*>(svh), problems, nullptr);
   };
   switch (tile) {
     case Exl3Tile::kNarrow:
@@ -1249,10 +1249,9 @@ void LaunchExl3PrefillGemm(const quant::exl3::DeviceLinear& linear,
   if (!Exl3PrefillSupported(linear) || batch == 0) {
     throw std::invalid_argument("EXL3 prefill GEMM: unsupported projection");
   }
-  LaunchExl3Bits<0>(linear.rate.bits, residual,
-                        PickExl3Tile(batch, linear.n), linear.trellis, x, y,
-                        batch, linear.n, linear.k, linear.svh, nullptr, 1,
-                        stream);
+  LaunchExl3Bits<0>(linear.rate.bits, residual, PickExl3Tile(batch, linear.n),
+                    linear.trellis, x, y, batch, linear.n, linear.k, linear.svh,
+                    nullptr, 1, stream);
   HIP_CHECK(hipGetLastError());
 }
 
@@ -1268,8 +1267,8 @@ void LaunchExl3PrefillGemmGrouped(const Exl3GemmProblem* problems,
   if (max_rows == 0)
     return;
   LaunchExl3Bits<1>(rate.bits, residual, PickExl3Tile(max_rows, n), nullptr,
-                       nullptr, nullptr, max_rows, n, k, nullptr, problems,
-                       static_cast<unsigned>(count), stream);
+                    nullptr, nullptr, max_rows, n, k, nullptr, problems,
+                    static_cast<unsigned>(count), stream);
   HIP_CHECK(hipGetLastError());
 }
 
@@ -1285,8 +1284,9 @@ void LaunchBucketTiles(const quant::exl3::DeviceLinear* device_bank,
                        const std::int32_t* row_exponents = nullptr) {
   using gufo::core::GgmlType;
   // 128 weight rows per block; the token tile is the smallest of 16/32/64
-  // covering tile_rows. Every tile accumulates each output over k in the
-  // same order, so values do not depend on the tile chosen.
+  // covering tile_rows (64 also takes 65-128-row buckets on a 128 tile). Every
+  // tile accumulates each output over k in the same order, so values do not
+  // depend on the tile chosen.
   const auto args = [&](auto kernel, unsigned threads) {
     kernel<<<dim3(1, n / 128, max_buckets), threads, 0, stream>>>(
         device_bank, reinterpret_cast<const short*>(input), inner, 0,
@@ -1303,7 +1303,7 @@ void LaunchBucketTiles(const quant::exl3::DeviceLinear* device_bank,
     args(HalfPrefillGemmKernel<128, 32, 4, 2, GgmlType::kQ8_0, kStore, false,
                                GgmlType::kQ8_0, Bits, Mode>,
          256);
-  else
+  else {
     // Eight waves (8 x 1), each one 16-row strip over the 64 tokens and four
     // decoded tiles per stage: 7-12 % less time than 2 x 2 at Flash-Next's
     // 2560 -> 640 and 640 -> 2560 expert shapes, uniform and skewed routing
@@ -1312,6 +1312,12 @@ void LaunchBucketTiles(const quant::exl3::DeviceLinear* device_bank,
     args(HalfPrefillGemmKernel<128, 64, 8, 1, GgmlType::kQ8_0, kStore, false,
                                GgmlType::kQ8_0, Bits, Mode>,
          256);
+    // Hot experts' 65-128-row buckets: one weight decode per 128 tokens
+    // (150 VGPRs, no scratch); each kernel takes only its own bucket class.
+    args(HalfPrefillGemmKernel<128, 128, 8, 1, GgmlType::kQ8_0, kStore, false,
+                               GgmlType::kQ8_0, Bits, Mode>,
+         256);
+  }
 }
 
 }  // namespace
@@ -1333,9 +1339,9 @@ void LaunchExl3PrefillBucketInnerHalf(
     return;
   auto* out = reinterpret_cast<float*>(inner);
   const auto launch = [&]<int Bits>() {
-    LaunchBucketTiles<Bits, 3>(device_bank, device_buckets,
-                               device_bucket_count, max_buckets, tile_rows,
-                               input, out, k, n, stream, row_exponents);
+    LaunchBucketTiles<Bits, 3>(device_bank, device_buckets, device_bucket_count,
+                               max_buckets, tile_rows, input, out, k, n, stream,
+                               row_exponents);
   };
   switch (rate.bits) {
     case 1:
@@ -1382,8 +1388,7 @@ void LaunchExl3PrefillBucketInner(const quant::exl3::DeviceLinear* device_bank,
     return;
   const auto launch = [&]<int Bits>() {
     LaunchBucketTiles<Bits>(device_bank, device_buckets, device_bucket_count,
-                            max_buckets, tile_rows, input, inner, k, n,
-                            stream);
+                            max_buckets, tile_rows, input, inner, k, n, stream);
   };
   switch (rate.bits) {
     case 1:
@@ -1426,10 +1431,9 @@ void LaunchPlainF16PrefillGemm(const void* w, const void* x, float* y,
   // output is one WMMA chain in K order, whatever the tile or row count.
   using gufo::core::GgmlType;
   HalfPrefillGemmKernel<128, 64, 4, 2, GgmlType::kF16, HalfEpilogue::kStore>
-      <<<dim3(static_cast<unsigned>((rows + 63) / 64), (m + 127) / 128), 256,
-          0, stream>>>(w, static_cast<const short*>(x), y,
-                       static_cast<int>(rows), static_cast<int>(m),
-                       static_cast<int>(k), nullptr);
+      <<<dim3(static_cast<unsigned>((rows + 63) / 64), (m + 127) / 128), 256, 0,
+         stream>>>(w, static_cast<const short*>(x), y, static_cast<int>(rows),
+                   static_cast<int>(m), static_cast<int>(k), nullptr);
   HIP_CHECK(hipGetLastError());
 }
 
@@ -1460,58 +1464,49 @@ bool TryLaunchBatchedDualQuantGEMMSwiGLUFp16(
     gufo::core::GgmlType gate_type, gufo::core::GgmlType up_type,
     const void* gate_weights, const void* up_weights, const void* x, void* y,
     std::size_t batch, std::size_t m, std::size_t k, hipStream_t stream) {
-  const auto launch = [&]<gufo::core::GgmlType Type,
-                          gufo::core::GgmlType UpType = Type>() {
-    const auto tile = [&]<bool Full>() {
-      HalfPrefillGemmKernel<256, 256, 8, 4, Type, HalfEpilogue::kGateUp, Full,
-                            UpType>
-          <<<dim3((batch + 255) / 256, (m + 127) / 128), 1024, 0, stream>>>(
-              gate_weights, static_cast<const short*>(x),
-              static_cast<float*>(y), batch, m, k, nullptr, up_weights);
-    };
-    if constexpr ((Type == gufo::core::GgmlType::kQ4_K ||
-                   Type == gufo::core::GgmlType::kQ5_K) &&
-                  (UpType == gufo::core::GgmlType::kQ4_K ||
-                   UpType == gufo::core::GgmlType::kQ5_K)) {
-      if (m % 128 == 0 && batch % 256 == 0) {
-        tile.template operator()<true>();
-        return;
-      }
-    }
-    tile.template operator()<false>();
-  };
+  const auto launch =
+      [&]<gufo::core::GgmlType Type, gufo::core::GgmlType UpType = Type>() {
+        const auto tile = [&]<bool Full>() {
+          HalfPrefillGemmKernel<256, 256, 8, 4, Type, HalfEpilogue::kGateUp,
+                                Full, UpType>
+              <<<dim3((batch + 255) / 256, (m + 127) / 128), 1024, 0, stream>>>(
+                  gate_weights, static_cast<const short*>(x),
+                  static_cast<float*>(y), batch, m, k, nullptr, up_weights);
+        };
+        if constexpr ((Type == gufo::core::GgmlType::kQ4_K ||
+                       Type == gufo::core::GgmlType::kQ5_K) &&
+                      (UpType == gufo::core::GgmlType::kQ4_K ||
+                       UpType == gufo::core::GgmlType::kQ5_K)) {
+          if (m % 128 == 0 && batch % 256 == 0) {
+            tile.template operator()<true>();
+            return;
+          }
+        }
+        tile.template operator()<false>();
+      };
   using gufo::core::GgmlType;
   // Mixed pairs keep independent row strides and decoders. Qualify each
   // pairing: a shared input alone does not guarantee a faster kernel.
   if (gate_type != up_type) {
     if (gate_type == GgmlType::kQ4_K && up_type == GgmlType::kQ5_K) {
       launch.template operator()<GgmlType::kQ4_K, GgmlType::kQ5_K>();
-    } else if (gate_type == GgmlType::kIQ4_XS &&
-               up_type == GgmlType::kQ5_K) {
+    } else if (gate_type == GgmlType::kIQ4_XS && up_type == GgmlType::kQ5_K) {
       launch.template operator()<GgmlType::kIQ4_XS, GgmlType::kQ5_K>();
-    } else if (gate_type == GgmlType::kQ4_K &&
-               up_type == GgmlType::kIQ4_XS) {
+    } else if (gate_type == GgmlType::kQ4_K && up_type == GgmlType::kIQ4_XS) {
       launch.template operator()<GgmlType::kQ4_K, GgmlType::kIQ4_XS>();
-    } else if (gate_type == GgmlType::kIQ4_XS &&
-               up_type == GgmlType::kQ4_K) {
+    } else if (gate_type == GgmlType::kIQ4_XS && up_type == GgmlType::kQ4_K) {
       launch.template operator()<GgmlType::kIQ4_XS, GgmlType::kQ4_K>();
-    } else if (gate_type == GgmlType::kQ6_K &&
-               up_type == GgmlType::kQ5_K) {
+    } else if (gate_type == GgmlType::kQ6_K && up_type == GgmlType::kQ5_K) {
       launch.template operator()<GgmlType::kQ6_K, GgmlType::kQ5_K>();
-    } else if (gate_type == GgmlType::kIQ4_XS &&
-               up_type == GgmlType::kQ3_K) {
+    } else if (gate_type == GgmlType::kIQ4_XS && up_type == GgmlType::kQ3_K) {
       launch.template operator()<GgmlType::kIQ4_XS, GgmlType::kQ3_K>();
-    } else if (gate_type == GgmlType::kQ3_K &&
-               up_type == GgmlType::kIQ4_XS) {
+    } else if (gate_type == GgmlType::kQ3_K && up_type == GgmlType::kIQ4_XS) {
       launch.template operator()<GgmlType::kQ3_K, GgmlType::kIQ4_XS>();
-    } else if (gate_type == GgmlType::kIQ4_NL &&
-               up_type == GgmlType::kIQ4_XS) {
+    } else if (gate_type == GgmlType::kIQ4_NL && up_type == GgmlType::kIQ4_XS) {
       launch.template operator()<GgmlType::kIQ4_NL, GgmlType::kIQ4_XS>();
-    } else if (gate_type == GgmlType::kIQ4_NL &&
-               up_type == GgmlType::kQ5_K) {
+    } else if (gate_type == GgmlType::kIQ4_NL && up_type == GgmlType::kQ5_K) {
       launch.template operator()<GgmlType::kIQ4_NL, GgmlType::kQ5_K>();
-    } else if (gate_type == GgmlType::kQ5_K &&
-               up_type == GgmlType::kIQ4_NL) {
+    } else if (gate_type == GgmlType::kQ5_K && up_type == GgmlType::kIQ4_NL) {
       launch.template operator()<GgmlType::kQ5_K, GgmlType::kIQ4_NL>();
     } else {
       return false;

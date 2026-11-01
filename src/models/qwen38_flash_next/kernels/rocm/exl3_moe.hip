@@ -362,6 +362,15 @@ __global__ __launch_bounds__(256) void CountBuckets(const std::int32_t* ids,
   }
 }
 
+// A hot expert's rows (more than 64, with 64-row tiles) are split evenly
+// into buckets of at most 128 rows for the 128-token X3 tile: fewer
+// re-decodes of its weights. The bucket a row lands in never changes its
+// value (every tile keeps each output's K order).
+__device__ __forceinline__ unsigned BucketRows(unsigned rows,
+                                               unsigned tile_rows) {
+  return tile_rows == 64 && rows > 64 ? 128 : tile_rows;
+}
+
 __global__ __launch_bounds__(1024) void DescribeBuckets(
     unsigned* offsets, unsigned experts, unsigned tile_rows,
     Exl3ExpertBucket* buckets, unsigned* bucket_count, unsigned capacity) {
@@ -377,7 +386,8 @@ __global__ __launch_bounds__(1024) void DescribeBuckets(
   for (unsigned base = 0; base < experts; base += 1024) {
     const unsigned expert = base + tid;
     const unsigned rows = expert < experts ? offsets[expert + 1] : 0;
-    const unsigned tiles = (rows + tile_rows - 1) / tile_rows;
+    const unsigned size = BucketRows(rows, tile_rows);
+    const unsigned tiles = (rows + size - 1) / size;
     rows_scan[tid] = rows;
     tiles_scan[tid] = tiles;
     __syncthreads();
@@ -394,8 +404,15 @@ __global__ __launch_bounds__(1024) void DescribeBuckets(
     unsigned bucket = carry_tiles + tiles_scan[tid] - tiles;
     if (expert < experts) {
       offsets[expert + 1] = first + rows;
-      for (unsigned row = 0; row < rows; row += tile_rows)
-        buckets[bucket++] = {expert, min(tile_rows, rows - row), first + row};
+      if (size == tile_rows)
+        for (unsigned row = 0; row < rows; row += tile_rows)
+          buckets[bucket++] = {expert, min(tile_rows, rows - row), first + row};
+      else
+        for (unsigned t = 0, row = 0; t < tiles; ++t) {
+          const unsigned count = (rows - row) / (tiles - t);
+          buckets[bucket++] = {expert, count, first + row};
+          row += count;
+        }
     }
     __syncthreads();
     if (tid == 1023) {

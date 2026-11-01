@@ -1367,12 +1367,19 @@ void Buckets(unsigned rows, bool shared, unsigned tile_rows, int bits) {
         ++cursor;
       }
     Require(cursor == bounds[e + 1], "bucket expert count");
-    for (unsigned row = bounds[e]; row < bounds[e + 1]; row += tile_rows) {
-      Require(
-          next < active && buckets[next].expert == e &&
-              buckets[next].first == row &&
-              buckets[next].count == std::min(tile_rows, bounds[e + 1] - row),
-          "bucket ragged tile");
+    // With 64-row tiles, a hot expert (more than 64 rows) is split evenly
+    // into buckets of at most 128 rows.
+    const unsigned rows = bounds[e + 1] - bounds[e];
+    const bool hot = tile_rows == 64 && rows > 64;
+    const unsigned tiles =
+        hot ? (rows + 127) / 128 : (rows + tile_rows - 1) / tile_rows;
+    for (unsigned t = 0, row = bounds[e]; t < tiles; ++t) {
+      const unsigned want = hot ? (bounds[e + 1] - row) / (tiles - t)
+                                : std::min(tile_rows, bounds[e + 1] - row);
+      Require(next < active && buckets[next].expert == e &&
+                  buckets[next].first == row && buckets[next].count == want,
+              "bucket ragged tile");
+      row += want;
       ++next;
     }
   }

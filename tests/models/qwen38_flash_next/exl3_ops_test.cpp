@@ -1897,8 +1897,9 @@ void ExecutorPrefillExperts() {
     if (shared)
       Require(
           Access::Read<std::uint32_t>(pp.bucket_count, 1)[0] ==
-              2 * c.num_experts_used,
-          "shared history must create 64+1 buckets for each selected expert");
+              c.num_experts_used,
+          "shared history must create one 65-row hot-expert bucket for each "
+          "selected expert");
     for (unsigned chunk : {1U, 3U, 8U, 9U, 32U, 33U, 64U})
       SameBits(reference, project(chunk),
                "X3 expert operator chunks=" + std::to_string(chunk));

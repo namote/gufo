@@ -87,6 +87,8 @@ using Exl3ExpertBucket = gufo::hip::Exl3PrefillBucket;
 /// slots[assignments], buckets[max_buckets], bucket_count[1]. max_buckets
 /// must be >= min(assignments, experts + assignments / tile_rows). Slots
 /// remain in assignment order within each expert. No host count download.
+/// With tile_rows 64, an expert with more than 64 rows gets an even split
+/// into buckets of at most 128 rows (the X3 128-token tile).
 void Exl3BuildExpertBuckets(const std::int32_t* ids, std::uint32_t assignments,
                             std::uint32_t experts, std::uint32_t tile_rows,
                             std::uint32_t* offsets, std::int32_t* slots,

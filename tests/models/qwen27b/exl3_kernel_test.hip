@@ -1141,14 +1141,18 @@ void TestBuckets(std::size_t k, std::size_t n, int bits, std::mt19937& rng) {
   Check(hipMalloc(&d_inner, total * n * 4));
   const double bar = static_cast<double>(k) / 16.0 * std::ldexp(1.0, -23);
   std::vector<float> first_result;
-  for (std::uint32_t tile_rows : {16U, 32U, 64U, 7U}) {
+  // 128: 64-row tiles plus the hot-expert class (the 70-row expert in one
+  // 128-token bucket).
+  for (std::uint32_t partition : {16U, 32U, 64U, 7U, 128U}) {
+    const std::uint32_t tile_rows = std::min(partition, 64U);
     std::vector<gufo::hip::Exl3PrefillBucket> buckets;
     std::uint32_t row = 1;
     for (std::uint32_t e = 0; e < kExperts; ++e) {
-      for (std::uint32_t r = 0; r < expert_rows[e]; r += tile_rows)
+      const std::uint32_t size =
+          partition == 128 && expert_rows[e] <= 64 ? 64 : partition;
+      for (std::uint32_t r = 0; r < expert_rows[e]; r += size)
         buckets.push_back(
-            {e, std::min<std::uint32_t>(tile_rows, expert_rows[e] - r),
-             row + r});
+            {e, std::min<std::uint32_t>(size, expert_rows[e] - r), row + r});
       row += static_cast<std::uint32_t>(expert_rows[e]);
     }
     const auto active = static_cast<std::uint32_t>(buckets.size());
@@ -1165,10 +1169,9 @@ void TestBuckets(std::size_t k, std::size_t n, int bits, std::mt19937& rng) {
         static_cast<std::uint32_t>(n), rate, nullptr);
     Check(hipDeviceSynchronize());
     const auto got = Download(d_inner, total * n);
-    const std::string name = "bucket K" + std::to_string(bits) +
-                             " k=" + std::to_string(k) +
-                             " n=" + std::to_string(n) +
-                             " tile_rows=" + std::to_string(tile_rows);
+    const std::string name =
+        "bucket K" + std::to_string(bits) + " k=" + std::to_string(k) +
+        " n=" + std::to_string(n) + " partition=" + std::to_string(partition);
     bool untouched = true;
     for (std::size_t j = 0; j < n; ++j)
       untouched =

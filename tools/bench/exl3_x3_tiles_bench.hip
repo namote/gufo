@@ -4,13 +4,15 @@
 // each output's K order, so values are identical; the bench checks that.
 //   hipcc -O3 -std=c++20 --offload-arch=gfx1151 -DENGINE_ENABLE_HIP=1 -I. \
 //     tools/bench/exl3_x3_tiles_bench.hip -o exl3_x3_tiles_bench
-#include "src/models/qwen/hip/kernels/prefill_fp16.hip"
-
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <tuple>
 #include <vector>
+
+#include "src/models/qwen/hip/kernels/prefill_fp16.hip"
 
 namespace {
 
@@ -123,9 +125,166 @@ void PlainF16(const std::uint16_t* w, const std::uint16_t* x, float* y,
 
 }  // namespace
 
+// Per-expert token counts shaped like Flash-Next's measured pp2048 routing
+// (fn-hc9 expert-counts.log, mid layers: max ~700-1,500, p95 ~150-180, ~80
+// experts over 64 tokens holding ~70 %, ~120 experts idle): `zero` idle
+// experts, the rest lognormal(3, sigma), scaled to `total`.
+std::vector<unsigned> RoutingCounts(unsigned experts, unsigned total,
+                                    unsigned zero, double sigma,
+                                    unsigned seed) {
+  std::vector<double> w(experts, 0.0);
+  std::uint32_t lcg = seed;
+  const auto uniform = [&] {
+    lcg = lcg * 1664525U + 1013904223U;
+    return (double(lcg >> 8) + 0.5) / double(1U << 24);
+  };
+  for (unsigned e = zero; e < experts; ++e) {
+    const double z = std::sqrt(-2.0 * std::log(uniform())) *
+                     std::cos(6.283185307179586 * uniform());
+    w[e] = std::exp(3.0 + sigma * z);
+  }
+  double sum = 0;
+  for (double v : w)
+    sum += v;
+  std::vector<unsigned> c(experts);
+  unsigned got = 0;
+  for (unsigned e = 0; e < experts; ++e)
+    got += c[e] = unsigned(w[e] * total / sum);
+  for (unsigned e = zero; got < total; e = e + 1 < experts ? e + 1 : zero)
+    ++c[e], ++got;
+  return c;
+}
+
+// Buckets as Exl3BuildExpertBuckets cuts them: 64 rows, or (classes) a hot
+// expert's rows split evenly into <= 128- or <= 256-row buckets.
+std::vector<Exl3PrefillBucket> CutBuckets(const std::vector<unsigned>& per,
+                                          unsigned largest) {
+  std::vector<Exl3PrefillBucket> b;
+  unsigned first = 0;
+  for (unsigned e = 0; e < per.size(); ++e) {
+    const unsigned n = per[e];
+    const unsigned tile = n <= 64 || largest == 64     ? 64
+                          : n <= 256 || largest == 128 ? 128
+                                                       : 256;
+    const unsigned parts = (n + tile - 1) / tile;
+    for (unsigned p = 0, at = 0; p < parts; ++p) {
+      const unsigned rows =
+          tile == 64 ? std::min(64U, n - at) : (n - at) / (parts - p);
+      b.push_back({e, rows, first + at});
+      at += rows;
+    }
+    first += n;
+  }
+  return b;
+}
+
 int main(int argc, char** argv) {
   const unsigned rows = argc > 1 ? unsigned(std::atoi(argv[1])) : 2048;
   const int reps = argc > 2 ? std::atoi(argv[2]) : 10;
+  if (argc > 3 && std::strcmp(argv[3], "hist") == 0) {
+    constexpr unsigned kExperts = 512;
+    const unsigned assignments = rows * 10;
+    for (auto [zero, sigma] : {std::pair{120U, 1.4}, std::pair{180U, 1.6}}) {
+      const auto per =
+          RoutingCounts(kExperts, assignments, zero, sigma, 12345U);
+      std::vector<unsigned> sorted = per;
+      std::sort(sorted.begin(), sorted.end());
+      unsigned hot = 0, hot_rows = 0;
+      for (unsigned v : per)
+        if (v > 64)
+          ++hot, hot_rows += v;
+      std::printf(
+          "hist zero=%u sigma=%.1f: max %u p95 %u p50 %u, %u experts "
+          ">64 hold %.0f %%\n",
+          zero, sigma, sorted.back(), sorted[kExperts * 95 / 100],
+          sorted[kExperts / 2], hot, 100.0 * hot_rows / assignments);
+      for (auto [k, n] : {std::pair{2560U, 640U}, std::pair{640U, 2560U}}) {
+        const std::size_t words = std::size_t(k) * n * 5 / 32;
+        auto* t = Alloc<std::uint32_t>(words * kExperts);
+        hipLaunchKernelGGL(Fill, dim3(4096), dim3(256), 0, 0, t,
+                           words * kExperts, 5U);
+        std::vector<DeviceLinear> bank(kExperts);
+        for (unsigned e = 0; e < kExperts; ++e) {
+          bank[e].trellis =
+              reinterpret_cast<const std::uint16_t*>(t + words * e);
+          bank[e].k = k;
+          bank[e].n = n;
+          bank[e].rate = BitRate{5, false};
+          bank[e].codebook = Codebook::kMul1;
+        }
+        auto* d_bank = Alloc<DeviceLinear>(kExperts);
+        Check(hipMemcpy(d_bank, bank.data(), kExperts * sizeof(DeviceLinear),
+                        hipMemcpyHostToDevice));
+        auto* x = Alloc<std::uint16_t>(std::size_t(assignments) * k);
+        auto* y = Alloc<float>(std::size_t(assignments) * n);
+        hipLaunchKernelGGL(FillHalf, dim3(1024), dim3(256), 0, 0, x,
+                           std::size_t(assignments) * k, 6U, false);
+        const unsigned max_buckets = kExperts + assignments / 64;
+        auto* d_b = Alloc<Exl3PrefillBucket>(max_buckets);
+        auto* d_count = Alloc<std::uint32_t>(1);
+        std::vector<float> ref(std::size_t(assignments) * n), got(ref.size());
+        const auto upload = [&](unsigned largest) {
+          auto b = CutBuckets(per, largest);
+          const unsigned count = unsigned(b.size());
+          b.resize(max_buckets, Exl3PrefillBucket{0, 0, 0});
+          Check(hipMemcpy(d_b, b.data(),
+                          max_buckets * sizeof(Exl3PrefillBucket),
+                          hipMemcpyHostToDevice));
+          Check(hipMemcpy(d_count, &count, 4, hipMemcpyHostToDevice));
+          return count;
+        };
+        const auto run = [&](const char* tile, unsigned largest, bool first,
+                             auto launch) {
+          const unsigned count = upload(largest);
+          Check(hipMemset(y, 0, ref.size() * 4));
+          launch();
+          Check(hipDeviceSynchronize());
+          Check(
+              hipMemcpy(got.data(), y, got.size() * 4, hipMemcpyDeviceToHost));
+          if (first)
+            ref = got;
+          const bool same =
+              std::memcmp(got.data(), ref.data(), got.size() * 4) == 0;
+          const float ms = TimeIt(launch, reps);
+          std::printf("  hist %4u->%-4u %-26s %3u buckets %.3f ms %s\n", k, n,
+                      tile, count, ms, same ? "bit-identical" : "DIFFERS");
+        };
+        const auto small = [&] {
+          Buckets<128, 64, 8, 1>(d_bank, d_b, d_count, max_buckets, k, n, x, y);
+        };
+        run("64: 128x64 8x1", 64, true, small);
+        run("128: +128x128 8x1", 128, false, [&] {
+          small();
+          Buckets<128, 128, 8, 1>(d_bank, d_b, d_count, max_buckets, k, n, x,
+                                  y);
+        });
+        run("128: +128x128 4x2", 128, false, [&] {
+          small();
+          Buckets<128, 128, 4, 2>(d_bank, d_b, d_count, max_buckets, k, n, x,
+                                  y);
+        });
+        run("256: +128x128 8x1 +256 8x1", 256, false, [&] {
+          small();
+          Buckets<128, 128, 8, 1>(d_bank, d_b, d_count, max_buckets, k, n, x,
+                                  y);
+          Buckets<128, 256, 8, 1>(d_bank, d_b, d_count, max_buckets, k, n, x,
+                                  y);
+        });
+        run("256: +128x128 8x1 +256 4x2", 256, false, [&] {
+          small();
+          Buckets<128, 128, 8, 1>(d_bank, d_b, d_count, max_buckets, k, n, x,
+                                  y);
+          Buckets<128, 256, 4, 2>(d_bank, d_b, d_count, max_buckets, k, n, x,
+                                  y);
+        });
+        for (void* p : {static_cast<void*>(t), static_cast<void*>(d_bank),
+                        static_cast<void*>(d_b), static_cast<void*>(d_count),
+                        static_cast<void*>(x), static_cast<void*>(y)})
+          Check(hipFree(p));
+      }
+    }
+    return 0;
+  }
   if (argc > 3 && std::strcmp(argv[3], "plain") == 0) {
     for (auto [k, m] : {std::pair{10240U, 320U}, std::pair{320U, 10240U},
                         std::pair{2560U, 544U}}) {
@@ -156,10 +315,14 @@ int main(int argc, char** argv) {
                     tile, ms, flop / ms / 1e9,
                     same ? "bit-identical" : "DIFFERS");
       };
-      run("256x256 8x4", [&] { PlainF16<256, 256, 8, 4>(w, x, y, rows, m, k); });
-      run("128x256 4x8", [&] { PlainF16<128, 256, 4, 8>(w, x, y, rows, m, k); });
-      run("256x128 8x2", [&] { PlainF16<256, 128, 8, 2>(w, x, y, rows, m, k); });
-      run("128x128 4x2", [&] { PlainF16<128, 128, 4, 2>(w, x, y, rows, m, k); });
+      run("256x256 8x4",
+          [&] { PlainF16<256, 256, 8, 4>(w, x, y, rows, m, k); });
+      run("128x256 4x8",
+          [&] { PlainF16<128, 256, 4, 8>(w, x, y, rows, m, k); });
+      run("256x128 8x2",
+          [&] { PlainF16<256, 128, 8, 2>(w, x, y, rows, m, k); });
+      run("128x128 4x2",
+          [&] { PlainF16<128, 128, 4, 2>(w, x, y, rows, m, k); });
       run("64x256 2x8", [&] { PlainF16<64, 256, 2, 8>(w, x, y, rows, m, k); });
       run("64x128 2x4", [&] { PlainF16<64, 128, 2, 4>(w, x, y, rows, m, k); });
       run("128x64 4x2", [&] { PlainF16<128, 64, 4, 2>(w, x, y, rows, m, k); });
@@ -182,8 +345,8 @@ int main(int argc, char** argv) {
           float total = 0;
           for (int i = 0; i < reps; ++i) {
             if (read_flush)
-              hipLaunchKernelGGL(ReadFlush, dim3(2048), dim3(256), 0, 0,
-                                 flush, kFlush, y + i % 7);
+              hipLaunchKernelGGL(ReadFlush, dim3(2048), dim3(256), 0, 0, flush,
+                                 kFlush, y + i % 7);
             else
               Check(hipMemsetAsync(flush, i, kFlush * 4));
             Check(hipEventRecord(a));
@@ -197,13 +360,17 @@ int main(int argc, char** argv) {
           std::printf("  plain %5u->%-5u %-12s cold(%s) %.3f ms\n", k, m, tile,
                       read_flush ? "read" : "write", total / reps);
         };
-        cold("128x64 4x2", [&] { PlainF16<128, 64, 4, 2>(w, x, y, rows, m, k); });
-        cold("128x32 4x2", [&] { PlainF16<128, 32, 4, 2>(w, x, y, rows, m, k); });
+        cold("128x64 4x2",
+             [&] { PlainF16<128, 64, 4, 2>(w, x, y, rows, m, k); });
+        cold("128x32 4x2",
+             [&] { PlainF16<128, 32, 4, 2>(w, x, y, rows, m, k); });
         cold("64x64 4x2", [&] { PlainF16<64, 64, 4, 2>(w, x, y, rows, m, k); });
         cold("64x32 2x2", [&] { PlainF16<64, 32, 2, 2>(w, x, y, rows, m, k); });
-        cold("256x128 8x2", [&] { PlainF16<256, 128, 8, 2>(w, x, y, rows, m, k); });
+        cold("256x128 8x2",
+             [&] { PlainF16<256, 128, 8, 2>(w, x, y, rows, m, k); });
         read_flush = true;
-        cold("128x64 4x2", [&] { PlainF16<128, 64, 4, 2>(w, x, y, rows, m, k); });
+        cold("128x64 4x2",
+             [&] { PlainF16<128, 64, 4, 2>(w, x, y, rows, m, k); });
 
         Check(hipFree(flush));
       }
@@ -216,7 +383,8 @@ int main(int argc, char** argv) {
   struct S {
     const char* name;
     unsigned k, n;
-  } shapes[] = {{"gdn qkv", 2560, 10240}, {"gdn out", 6144, 2560},
+  } shapes[] = {{"gdn qkv", 2560, 10240},
+                {"gdn out", 6144, 2560},
                 {"attn q", 2560, 12288}};
   for (const S& s : shapes) {
     if (argc > 3)
@@ -250,7 +418,8 @@ int main(int argc, char** argv) {
       launch();
       Check(hipDeviceSynchronize());
       Check(hipMemcpy(got.data(), y, got.size() * 4, hipMemcpyDeviceToHost));
-      const bool same = std::memcmp(got.data(), ref.data(), got.size() * 4) == 0;
+      const bool same =
+          std::memcmp(got.data(), ref.data(), got.size() * 4) == 0;
       const float ms = TimeIt(launch, reps);
       std::printf("  %-8s %-14s %.3f ms %.2f TFLOPS %s\n", s.name, tile, ms,
                   flop / ms / 1e9, same ? "bit-identical" : "DIFFERS");
@@ -261,9 +430,9 @@ int main(int argc, char** argv) {
     run("128x128 4x2", [&] { Dense<128, 128, 4, 2, 7>(l, x, y, rows); });
     run("128x128 4x4", [&] { Dense<128, 128, 4, 4, 7>(l, x, y, rows); });
     run("256x256 4x8", [&] { Dense<256, 256, 4, 8, 7>(l, x, y, rows); });
-    for (void* p : {static_cast<void*>(t), static_cast<void*>(svh),
-                    static_cast<void*>(x), static_cast<void*>(y),
-                    static_cast<void*>(y0)})
+    for (void* p :
+         {static_cast<void*>(t), static_cast<void*>(svh), static_cast<void*>(x),
+          static_cast<void*>(y), static_cast<void*>(y0)})
       Check(hipFree(p));
   }
   // Routed buckets: 512 K5 experts, rows * 10 uniform assignments, 64-row
@@ -308,7 +477,8 @@ int main(int argc, char** argv) {
     auto* d_count = Alloc<std::uint32_t>(1);
     Check(hipMemcpy(d_bank, bank.data(), kExperts * sizeof(DeviceLinear),
                     hipMemcpyHostToDevice));
-    Check(hipMemcpy(d_b, buckets.data(), max_buckets * sizeof(Exl3PrefillBucket),
+    Check(hipMemcpy(d_b, buckets.data(),
+                    max_buckets * sizeof(Exl3PrefillBucket),
                     hipMemcpyHostToDevice));
     Check(hipMemcpy(d_count, &count, 4, hipMemcpyHostToDevice));
     auto* x = Alloc<std::uint16_t>(std::size_t(assignments) * k);
@@ -318,14 +488,13 @@ int main(int argc, char** argv) {
                        std::size_t(assignments) * k, 6U, false);
     if (argc > 3 && std::strcmp(argv[3], "pmc") == 0) {
       // Counter collection: the production tile, one dispatch per shape.
-      Buckets<128, 64, 2, 2>(d_bank, d_b, d_count, max_buckets, k, n, x, y);
+      Buckets<128, 64, 8, 1>(d_bank, d_b, d_count, max_buckets, k, n, x, y);
       Check(hipDeviceSynchronize());
       std::printf("pmc routed %u->%u %s\n", k, n, skew ? "skew" : "unif");
-      for (void* p :
-           {static_cast<void*>(t), static_cast<void*>(d_bank),
-            static_cast<void*>(d_b), static_cast<void*>(d_count),
-            static_cast<void*>(x), static_cast<void*>(y),
-            static_cast<void*>(y0)})
+      for (void* p : {static_cast<void*>(t), static_cast<void*>(d_bank),
+                      static_cast<void*>(d_b), static_cast<void*>(d_count),
+                      static_cast<void*>(x), static_cast<void*>(y),
+                      static_cast<void*>(y0)})
         Check(hipFree(p));
       continue;
     }
@@ -339,10 +508,11 @@ int main(int argc, char** argv) {
       launch();
       Check(hipDeviceSynchronize());
       Check(hipMemcpy(got.data(), y, got.size() * 4, hipMemcpyDeviceToHost));
-      const bool same = std::memcmp(got.data(), ref.data(), got.size() * 4) == 0;
+      const bool same =
+          std::memcmp(got.data(), ref.data(), got.size() * 4) == 0;
       const float ms = TimeIt(launch, reps);
-      std::printf("  routed %4u->%-4u %s %-12s %.3f ms %6.1f GB/s %s\n", k,
-                  n, skew ? "skew" : "unif", tile, ms, unique / ms / 1e6,
+      std::printf("  routed %4u->%-4u %s %-12s %.3f ms %6.1f GB/s %s\n", k, n,
+                  skew ? "skew" : "unif", tile, ms, unique / ms / 1e6,
                   same ? "bit-identical" : "DIFFERS");
     };
     run("128x64 4x2", [&] {
@@ -356,6 +526,9 @@ int main(int argc, char** argv) {
     });
     run("128x64 8x1", [&] {
       Buckets<128, 64, 8, 1>(d_bank, d_b, d_count, max_buckets, k, n, x, y);
+    });
+    run("128x64 4x1", [&] {
+      Buckets<128, 64, 4, 1>(d_bank, d_b, d_count, max_buckets, k, n, x, y);
     });
     run("128x64 2x2", [&] {
       Buckets<128, 64, 2, 2>(d_bank, d_b, d_count, max_buckets, k, n, x, y);
