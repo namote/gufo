@@ -1,4 +1,72 @@
-# EXL3 / Flash-Next F3 handoff (2026-11-01, held)
+# EXL3 / Flash-Next F3 handoff (2026-11-01; prefill batch qualified)
+
+Latest prefill batch QUALIFIED: `fn-prefill-batch-nix101` COMPLETE/health_PASS.
+Retain direct routing-ID combine, attention mask-pruning eligibility fix, and
+grouped dense X3 scheduling.32,760 collected records/64 head checks are identical
+to saved Nix q6. Prefill gains versus saved pre-batch Nix T1: pp512+2.14%,
+pp2048+2.04%, pp8192+2.18%, d32K pp2048+1.86% (one candidate r2 window).
+No baseline inference, TG/MTP rerun, commit, merge or push. Prior work is preserved.
+Performance-neutral simplifications/correctness can be retained per the user;
+no speedup alone is not grounds for rejection. Wider/persistent matrix prototypes
+add complexity and were not promoted; their artifacts remain available.
+Candidate: `ai-tools/gufo-eval:f3-prefill-batch-f712b2d0-rocm101` (image93197735...).
+Preserve f3-integ `build/f3-nix-incremental/{release,units}` and
+`build/f3-prefill-matrix/objects`. Evidence and build identities are in
+`~/projects/gufo-f3-integ/plan/exl3/F3-RESUME-RESULTS.md`, final section.
+Broader performance goals and formal integration remain outstanding.
+
+## Historical resume record (superseded by the latest status above)
+
+Resume update (2026-11-01): T1 probe completed; shared indexer Q/K projection
+reuse is implemented and independently reviewed in the uncommitted f3-integ
+worktree. FP16-KV/KVarN collector bytes match hc7; focused Nix ROCm 10.1 unit
+passes. Candidate images are `ai-tools/gufo-eval:f3-indexer-b03a1f1e-rocm101`
+and `-tests-rocm101`. Full evidence and runtime caveats are in
+`~/projects/gufo-f3-integ/plan/exl3/F3-RESUME-RESULTS.md`.
+The user requires Nix ROCm 10.1, one combined final model/timing pass, and
+reuse of stored matching baselines. No merge or final model qualification yet.
+The first q3 batch item's Thai rare-vocabulary fixture failure is resolved:
+raw repetition produced identical AR/MTP English reasoning, so the fixture
+now explicitly continues a non-thinking assistant's requested repetitions.
+All original coverage/exactness gates remain strict. Focused lifecycle and
+sampled-head checks PASS on EXL3 and GGUF (`fn-draft-fixture-nix101`, health_PASS).
+The q3 resume scope is now complete: reuse the original passed batch prefix
+plus the repaired fixture tail; sampling, prefill and execution32k passed in
+`fn-final-q3-remaining-nix101`. The EXL3 MTP oracle needed storage-boundary
+and full-head repairs; independently reviewed, original tolerances unchanged.
+Its final matched-input audit passed in `fn-final-q3-mtpinput-nix101`
+(maximum carry relative RMS 4.71e-5, limit 5e-5). That window also completed
+the three-token CPU/GPU floor diagnostic (604.27 s, top-1 3/3, finite KL up
+to 0.00175); this is not a full-quality gate. health_PASS, actual loaded
+libraries all Nix ROCm 10.1. Do not repeat this expensive CPU probe routinely.
+Final test overlay: `ai-tools/gufo-eval:f3-indexer-mtpinput-rocm101`.
+Evidence index: `fn-final-q3-mtpinput-nix101/q3-summary.json`; details and
+hashes are in the F3 resume results. q6, Nix FN/27B timing, performance goals
+and formal integration remain. Next q6 must use the Nix collector and reuse
+saved BF16/UD results with their recorded provenance (the saved UD quality
+metadata says 7.2.4 despite an old plan note calling it Nix; do not conflate
+that with the separate Nix timing baselines).
+q6 resume update: `fn-final-q6-nix101` completed32760 rows/64 head checks,
+health_PASS, one candidate collection with stored BF16/UD/hc7 data reused.
+KL2560.026481 and top1 92.0543% remain better than historical UD; versus hc7,
+NLL increases0.006600 (window95%CI [0.001729,0.013902]), about0.66% perplexity.
+This warning remains recorded; q6 is measured with documented drift.
+The user directs prioritizing performance over eliminating small quality
+changes. No precision patch was applied. Stop further quantizer diagnosis
+and proceed to current-candidate Nix timing; see Q6-SUMMARY.json and the F3
+resume results for tails, provenance and the isolated compiler diagnostic.
+Latest user direction: **prefill is the highest priority**. Defer TG/MTP
+optimization and T4. Completed pure-Nix T1 AR prefill baselines are pp512
+1039.61, pp2048 1372.10, pp8192 1411.52 tok/s; d32K pp2048 1257.46.
+Reuse `fn-final-t1-x-ar-nix101`; do not repeat it. T2 is also saved.
+T3 worktree wrapper completed K17, then D was intentionally stopped;
+`fn-final-t3-worktree-nix101/USER-PRIORITY-STOP.json`, health_PASS. Do not
+interpret that cancellation as a failing candidate. Historical UD timing
+images also inherited /opt/rocm/lib, so they are not proven matched controls.
+An unqualified prefill candidate now replaces repeated MoE bucket searches
+with retained original routing IDs; focused exactness tests and one combined
+candidate validation/prefill timing pass are next. See F3 resume results.
+The original hold-point inventory below remains historical context.
 
 This lists what has **not** been done, what is **still unexplained**, and the
 order to resume. Read [docs/GFX1151-KNOWHOW.md](../../docs/GFX1151-KNOWHOW.md)
@@ -106,8 +174,8 @@ pp2048. That is an estimate and has not been measured.
 
 ## Rules that still apply
 
-- GPU windows one at a time under `ABBA-OWNER.lock`. Tell gufo-00 before builds,
-  hashing or large writes. No builds during timing windows.
+- GPU windows one at a time under `ABBA-OWNER.lock`. gufo-00 has ended; this chat coordinates builds,
+  hashing and large writes. No builds during timing windows.
 - Root free space must be ≥150 GiB.
 - Commit your own files only, as one-line Conventional Commits, and do not push.
 - Bit changes need the q6 gate; chunk invariance is mandatory. The collector
