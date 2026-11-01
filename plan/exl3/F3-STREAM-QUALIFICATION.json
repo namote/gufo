@@ -267,6 +267,8 @@
       "Dedicated dense event pair does not recover baseline.",
       "Q-only fork whole-model result is neutral, so leave baseline Q/KV grouping."
     ],
-    "target_2000_reached": false
+    "target_2000_reached": false,
+    "qualified_code_commit_attestation": "da1fd6a86f1e256cebdfedf8600fa7071bf74007",
+    "integration_record": "F3-INTEGRATION-BATCH5.json"
   }
 }

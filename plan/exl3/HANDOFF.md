@@ -36,6 +36,7 @@ fullcollector on the cleaned final image is claimed. KVarN correctness is
 separate operator/state evidence; performance usesk4v4. Prior hc7 NLL drift
 +.006600 remains. No baseline model or full profile was repeated.
 
+Qualified code commit: `da1fd6a8` (source identity, not a rebuilt image).
 Current source/integration attestation is recorded in
 [F3-INTEGRATION-BATCH5.json](F3-INTEGRATION-BATCH5.json). It does not relabel the
 already tested image. Nix10.1 incremental objects, frozen candidate binaries,

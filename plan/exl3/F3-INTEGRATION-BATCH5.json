@@ -1,0 +1,58 @@
+{
+  "status": "VERIFIED_LOCAL_FAST_FORWARD_SOURCE_IDENTITY",
+  "timestamp_utc": "2026-11-01T15:55:03.871524+00:00",
+  "qualified_code_commit": "da1fd6a86f1e256cebdfedf8600fa7071bf74007",
+  "as_built_source": {
+    "base": "534c0f0092ef744c5bf01d4365b479920deee41e",
+    "patch_sha256": "703d3e77e2cb3a82bccd9a4e51254fcb0fb6cc9ecf3afc113e5757479e121f60",
+    "revision": "534c0f00-shared5-703d3e77"
+  },
+  "image": {
+    "image": "ai-tools/gufo-eval:f3-shared5-703d3e77-rocm101",
+    "id": "sha256:2184da9ff7ff9dee6757b630fb4efb521f1bda10cfddc9e9562a5b75142f0d32",
+    "labels": {
+      "ai.tools.patch-sha256": "703d3e77e2cb3a82bccd9a4e51254fcb0fb6cc9ecf3afc113e5757479e121f60",
+      "ai.tools.production-build": "persistent-release-cmake-in-pinned-nix-derivation-env",
+      "ai.tools.source-base": "966f84b8",
+      "ai.tools.test-source-sha256": "703d3e77e2cb3a82bccd9a4e51254fcb0fb6cc9ecf3afc113e5757479e121f60",
+      "ai.tools.test-variant": "prefill-shared-kvarn-batch5",
+      "ai.tools.toolchain": "nix-rocm-10.1",
+      "org.opencontainers.image.ref.name": "gufo-nix-rocm-10.1-prefill-shared-kvarn-batch5",
+      "org.opencontainers.image.revision": "534c0f00-shared5-703d3e77",
+      "org.opencontainers.image.source": "https://github.com/franzmoca/gufo",
+      "org.opencontainers.image.version": "534c0f00-shared5-703d3e77"
+    }
+  },
+  "qualification": "F3-STREAM-QUALIFICATION.json",
+  "repositories": [
+    {
+      "path": "/home/m2on/projects/gufo-f3-integ",
+      "branch": "ai-tools/f3-integ",
+      "head_after_source_merge": "da1fd6a86f1e256cebdfedf8600fa7071bf74007",
+      "compiled_source_patch_sha256": "703d3e77e2cb3a82bccd9a4e51254fcb0fb6cc9ecf3afc113e5757479e121f60",
+      "status_after_source_merge": ""
+    },
+    {
+      "path": "/home/m2on/projects/gufo",
+      "branch": "ai-tools/port-u4f",
+      "head_after_source_merge": "da1fd6a86f1e256cebdfedf8600fa7071bf74007",
+      "compiled_source_patch_sha256": "703d3e77e2cb3a82bccd9a4e51254fcb0fb6cc9ecf3afc113e5757479e121f60",
+      "status_after_source_merge": "?? .dockerignore\n"
+    },
+    {
+      "path": "/home/m2on/projects/gufo-integ",
+      "branch": "ai-tools/integ",
+      "head_after_source_merge": "da1fd6a86f1e256cebdfedf8600fa7071bf74007",
+      "compiled_source_patch_sha256": "703d3e77e2cb3a82bccd9a4e51254fcb0fb6cc9ecf3afc113e5757479e121f60",
+      "status_after_source_merge": ""
+    }
+  ],
+  "preexisting_untracked_preserved": {
+    "path": "/home/m2on/projects/gufo/.dockerignore",
+    "bytes": 16,
+    "sha256": "49c26750db91feb1bb16a5792dafcb03edcb71aeb86926ddda42fb4821cb0f5d",
+    "after_sha256": "49c26750db91feb1bb16a5792dafcb03edcb71aeb86926ddda42fb4821cb0f5d"
+  },
+  "free_disk_GiB": 150.22634887695312,
+  "note": "This source-identity attestation is a subsequent documentation-only commit, not a rebuilt image revision. No push, baseline inference, extra model qualification or profile was performed for integration. Nix10.1 incremental objects, frozen controls and candidate binaries are retained."
+}
