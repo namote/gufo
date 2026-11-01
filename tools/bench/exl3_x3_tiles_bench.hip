@@ -430,6 +430,11 @@ int main(int argc, char** argv) {
     run("128x128 4x2", [&] { Dense<128, 128, 4, 2, 7>(l, x, y, rows); });
     run("128x128 4x4", [&] { Dense<128, 128, 4, 4, 7>(l, x, y, rows); });
     run("256x256 4x8", [&] { Dense<256, 256, 4, 8, 7>(l, x, y, rows); });
+    // 0.5 fragment reads per WMMA (4 x 4 subtiles per wave; 242 VGPRs, no
+    // scratch) vs 0.75 for the production 8x4 (142 VGPRs): within +-2 % at
+    // M = 2048 and 4096 (2026-11-01), so LDS fragment reads do not bound
+    // the dense X3 tile.
+    run("256x256 4x4", [&] { Dense<256, 256, 4, 4, 7>(l, x, y, rows); });
     for (void* p :
          {static_cast<void*>(t), static_cast<void*>(svh), static_cast<void*>(x),
           static_cast<void*>(y), static_cast<void*>(y0)})
