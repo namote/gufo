@@ -1142,3 +1142,24 @@ No GPU measurement, production change or quality qualification was added.
 [ordered plan](../plan/exl3/F3-SEARCH-STATUS.md#ordered-improvement-plan) preserve
 existing rejected experiments and prioritize dead-subtile preparation before
 conditional trellis-address work, with one final combined qualification.
+
+### Routed input staging follow-up (2026-11-02)
+
+Implemented two exact-work candidates: skip B global/LDS preparation for
+wholly dead16-row subtiles, and remove the K-tail test guaranteed false by
+validated EXL3 k%128 with StageK2/4. Live padded tiles, A work, barriers and
+per-output K16 order stay unchanged. Nix10.1 raw K2560/N640:2.979682→2.940020ms
+(dead B) or2.948984ms (combined); K640/N2560:3.198049→3.158803/3.164221ms.
+Saved1172-slot controls are reused; old832 control labels in logs are not the
+comparison denominator. The extra K simplification has no established gain.
+Cold/hot VGPR105/149→104/149→103/148; LDS24/32KiB unchanged, no private/spills.
+
+Complete shared-side512/2048 operator spans8.59501/14.6878ms versus saved
+8.55525/14.7609ms (+.46/−.50%). Synthetic output/guards and144 separate
+boundary/exponent refactor comparisons pass. Small historical differences
+remain advisory; no new model, baseline timing or profile. Preserve the narrow
+K5 raw-half candidate for a later combined qualification; do not repeatedly
+measure it or claim the original33.4% logical staging reduction as time saved.
+Trellis ISA already uses shared bases/immediate offsets/pointer induction;
+there is no concrete additional address-hoist candidate.
+[All outcomes, artifacts and limits](../plan/exl3/F3-MOE-STAGING-SCREENS.json).

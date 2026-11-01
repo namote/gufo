@@ -1,5 +1,15 @@
 # EXL3 / Flash-Next F3 handoff (2026-11-02; qualified shared-MoE/KVarN batch)
 
+Latest kernel follow-up: dead16-row B staging plus the redundant K-tail
+check were implemented and screened, with144 boundary/exponent checks exact.
+Raw gate/down improve about1%; current shared-side2048 span14.7609→14.6878ms,
+5128.55525→8.59501ms. Small mixed historical differences remain advisory.
+The [narrow K5 Mode3 patch](F3-MOE-STAGING-CANDIDATE.patch) is preserved for a
+later combined batch, not applied to production or qualified by a new model
+run. [Receipts/resources/source closure](F3-MOE-STAGING-SCREENS.json).
+Reuse all controls and intermediate builds. Next larger lead: HC combine/mix
+traffic from the saved profile; do not rerun a full profile or this screen.
+
 Current-version profiling is complete at the user's request. Exact shared5,
 Nix10.1, pp2048/d0/k4v4/context4096: measured GPU span1434.413ms, kernel busy
 99.676%. Main-stream MoE matrices32.31%, HC-family mixing/projections (including fused MoE combine)22.74%, dense

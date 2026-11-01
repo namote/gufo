@@ -1,5 +1,14 @@
 # Qwen3.8 Flash-Next benchmarks
 
+## Pending input-staging candidate, November 2, 2026
+
+Qualified pp2048 remains1429.13±1.13tok/s. The pending staging candidate was
+measured only in synthetic operators: complete shared-side512/2048 spans
+8.59501/14.6878ms versus saved8.55525/14.7609ms (+.46/−.50%). These small
+historical comparisons establish no new full-model speed. No model or saved
+baseline timing was rerun; full prefill qualification stays batched.
+[Results and exact scope](../../../plan/exl3/F3-MOE-STAGING-SCREENS.json).
+
 ## EXL3 shared-MoE/KVarN qualified batch, November 2, 2026
 
 Current qualified image is `ai-tools/gufo-eval:f3-shared5-703d3e77-rocm101`

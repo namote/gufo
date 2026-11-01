@@ -1,5 +1,16 @@
 # Qwen3.8 Flash-Next quality
 
+## Pending input-staging candidate, November 2, 2026
+
+The pending K5 Mode3 staging candidate passed saved finite/exact raw outputs
+and guards, plus synthetic512/2048 shared/raw-down/combined outputs. Another
+144 untimed original-versus-candidate checks cover all16-row boundaries,
+exact-size inputs, K128/2560/640 and null or nonzero row exponents. These are
+refactor comparisons, not an independent teacher or full-model quality gate.
+Gate/up intermediate payloads in the complete operator have guards only.
+Production and its existing qualification remain unchanged.
+[Results and exact scope](../../../plan/exl3/F3-MOE-STAGING-SCREENS.json).
+
 ## Shared-MoE/KVarN and grouped follow-up, November 2, 2026
 
 The final shared5 image passed1025-row full-FFN residual/logit/convolution/

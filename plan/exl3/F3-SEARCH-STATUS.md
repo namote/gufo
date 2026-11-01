@@ -14,6 +14,21 @@ matrices20.62%, with99.676% kernel-active time (not ALU utilization). The shared
 mostly overlapped. Reuse [this profile](F3-CURRENT-PREFILL-PROFILE.json); no
 extra baseline or deep-context profile was collected.
 
+## Latest bounded kernel batch
+
+Dead B-subtile preparation and the invariant K-tail check have now been
+implemented and screened on pinned Nix10.1. Raw gate/down times improve about
+1% against saved controls; the complete shared-side operator is−0.50% at2048
+but+0.46% at512 (historical/advisory, not a qualified speedup). All saved-output
+checks and144 boundary/exponent refactor checks pass. Preserve the
+[K5 Mode3 candidate patch](F3-MOE-STAGING-CANDIDATE.patch) for the next combined
+batch; production code and the qualified image are unchanged. Do not rerun
+these small screens or start a long model validation for this alone.
+[Measurements, resources and reproducibility](F3-MOE-STAGING-SCREENS.json).
+Trellis address bases/offsets are already hoisted by the compiler. The next
+larger investigation is HC-family combine/mix data movement using the saved
+profile/dirty-cache evidence; no repeat profile is required to start it.
+
 ## Retained and qualified
 
 1. K5 singleton N640/K2560 narrow tile through 2048 rows.
@@ -122,6 +137,9 @@ No new GPU run or kernel change was made for this diagnosis.
   Side-stream temporal overlap of340.76ms is not net saved time.
 
 ### Ordered improvement plan
+
+Steps1–4 below produced the bounded candidate batch above. Step5 remains
+deferred until there is a combined batch worth full-model qualification.
 
 1. **Complete the work accounting offline first.** Reuse the saved release ISA,
    operator outputs/routing, current timeline and existing ablations. Report

@@ -1,5 +1,14 @@
 # Qwen3.8 Flash-Next experiments
 
+## Pending input-staging candidate, November 2, 2026
+
+Dead B-subtile preparation and a validated full-K-stage simplification were
+screened with cached Nix10.1 controls. Raw gate/down are about1% faster, but
+complete shared-side512/2048 changes are+.46/−.50% (historical/advisory).
+Keep the implemented narrow K5 Mode3 candidate for a later combined batch;
+no production promotion, baseline timing repeat or full-model qualification.
+[Results and exact scope](../../../plan/exl3/F3-MOE-STAGING-SCREENS.json).
+
 ## Narrow dense and output-slice batch, November 1, 2026
 
 K5 singleton N640/K2560 uses a smaller K32 tile through2048 rows; aligned

@@ -1,0 +1,32 @@
+--- a/src/models/qwen/hip/kernels/prefill_fp16.hip
++++ b/src/models/qwen/hip/kernels/prefill_fp16.hip
+@@ -557,7 +558,16 @@
+ #pragma unroll
+     for (int p = 0; p < PFB; ++p) {
+       const int idx = p * kThreads + tid, kk = ks0 + idx % BK;
+-      if (idx < BN * BK && (Complete || kk < ksteps)) {
++      if constexpr (Batching == 3 && TrellisBits == 5) {
++        // Keep the complete final live WMMA subtile, including its padding.
++        if (t_block + ((idx / BK) / 16) * 16 >= batch)
++          continue;
++      }
++      // Supported EXL3 K is a multiple of 128: stages dividing eight K16
++      // steps have no K tail. This does not make token rows complete.
++      if (idx < BN * BK &&
++          (Complete || (Batching == 3 && TrellisBits == 5 && 8 % BK == 0) ||
++           kk < ksteps)) {
+         const short* src = x_row[p] + static_cast<std::size_t>(kk) * 16;
+         rb[p][0] = *reinterpret_cast<const uint4*>(src);
+         rb[p][1] = *reinterpret_cast<const uint4*>(src + 8);
+@@ -648,6 +658,11 @@
+ #pragma unroll
+     for (int p = 0; p < PFB; ++p) {
+       const int idx = p * kThreads + tid, row = idx / BK, ks = idx % BK;
++      if constexpr (Batching == 3 && TrellisBits == 5) {
++        // XOR(ks & 3) never crosses a 16-row subtile boundary.
++        if (t_block + (row / 16) * 16 >= batch)
++          continue;
++      }
+       if (idx < BN * BK) {
+         const int placed = (row ^ (ks & 3));
+         short* dst = &s_b[ks][placed / 16][placed % 16][0];
