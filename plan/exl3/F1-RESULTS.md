@@ -486,6 +486,36 @@ cold는 새 프로세스의 첫 요청(빈 행 캐시), warm은 같은 요청의
 - 도구 수정은 브랜치 `ai-tools/fn-quality-bf16fix`에 있다(ec2d4dc1 DiskEmbedding.weight, 55500d5a logits_io prefix, 52cb1318 창 단위 저장·재개). port-u4f 병합은 감독이 한다. 앞으로 BF16 실행은 window.py 밖에서 한다(GPU 장치 없음, nice 10).
 - 수집기는 `qwen38_flash_next_rq_logits` sha256 21f7dc49…다(fn-quality 48451349, 64849ca6ec7b /opt/rocm 7.2.4 gpu-test 빌드, `storage/tools/fn-quality-48451349`).
 
+## HC int8 실험 (2026-11-01, 사용자 승인, 브랜치 `ai-tools/fn-hc-int8`) — 결과: **채택하지 않음** [확인]
+
+- **목표:** EXL3 decode에서 HC mixer F16 가중치(down 320×10240, up 10240×320, 토큰당 96개, 1.26 GB)를 group-int8 사본으로 읽는다. 기대치는 tg +7 % 정도였다.
+- **구현:** 71fa4a63, 182cf295. base는 f3-integ c8625608이다.
+  - 형식은 Kyojin EXL3_GR_GS와 같다. down은 128, up은 64 입력마다 FP32 scale 하나(absmax/127)를 두고, 코드는 nearbyint로 ±127에 clamp한다(plain rounding).
+  - load 때 host에서 양자화한다(`hc_int8.hpp`). HIP TU의 -ffast-math에서는 `__fdiv_rn`과 `#pragma float_control`로도 scale이 1 ulp 낮게 나왔기 때문이다(측정).
+  - kernel은 `SmallGemmStable`을 따라 썼고, 가중치는 half(code·scale)로 읽는다. 단위 테스트 44개를 통과했다: F16 kernel(dequant 가중치)과 폭 1–9, 16, 17에서 비트 동일하고, 모든 행이 폭 1과 같다.
+  - trunk 48층의 attn/ffn mixer만 바꾼다. head와 MTP mixer는 F16 그대로다(prompt head, head replay, prompt chunk의 MTP catch-up). snapshot payload version은 18에서 19로 올렸다. 장치 메모리는 +659 MB다.
+  - Codex 리뷰 3회의 지적(measure 계산, leak, prompt 경로, snapshot version, non-finite)을 모두 반영했다.
+- **품질 관문**(teacher-forced decode, a01 2048–2559, 4,096행, BF16 prefill 기준, docker RelWithDebInfo):
+
+| | KL_256 | ΔNLL | top-1 |
+|---|---:|---:|---:|
+| UD-Q4_K_XL | 0.0420 | −0.0040 | 0.9004 |
+| EXL3 5.05 F16 HC | 0.0234 | −0.0161 | 0.9167 |
+| EXL3 5.05 int8 HC | 0.0254 | −0.0130 | 0.9167 |
+
+  - int8 − F16HC: KL +0.0019 [+0.0003, +0.0034](막대 ≤ +0.002, **FAIL**). top-1 0.0000 [−0.0093, +0.0071](막대 ≥ −0.005, **FAIL**). ΔNLL +0.0031 [−0.0018, +0.0077].
+  - int8 − UD: KL −0.0167 [−0.0201, −0.0143](**PASS**).
+  - suite K MTP greedy: 평균 수락 길이는 거의 같다. 17개 중 6개 완성이 F16과 같다.
+- **속도**(probe-hc-int8-docker, EXL3 5.05 + KVarN, A B A, tg128 t/s):
+
+| | F16 HC | int8 HC | F16 HC (재측정) | 이득 |
+|---|---:|---:|---:|---:|
+| d0 | 24.60 | 25.56 | 24.79 | +3.5 % |
+| d32K | 24.11 | 24.69 | 24.11 | +2.4 % |
+
+  - int8 HC load는 33.6 s다(F16 30.0 s, host 양자화 +3.6 s).
+- **결정(사용자 규칙):** d0와 d32K 모두 tg128 +10 % 이상이어야 기본값으로 둔다. 실제 이득은 +3.5 %와 +2.4 %라 **버린다.** g32 변형은 같은 바이트 규모라 10 %에 이를 수 없어 재지 않았다. 브랜치는 기록으로 남기고 병합하지 않는다.
+
 ## ABBA 계획 초안 (P1 정확성 통과 뒤)
 
 - **계획:** `PLAN-F1-ABBA-BASE.json`(이미지 `f1-base-rocm101`, d2b751a9)와 `PLAN-F1-ABBA-CAND.json`(`f1-cand-rocm101`, 766a593e)이다.
