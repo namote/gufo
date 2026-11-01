@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <stdexcept>
+#include <type_traits>
 
 #include "src/core/hip/detail/exl3_gemv.hpp"
 #include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
@@ -531,10 +532,13 @@ __global__ void RotateGateUpBuckets(const ex::DeviceLinear* gate,
   }
 }
 
+// InT: float (Exl3PrefillExperts) or _Float16 (the FP16 raw path); the
+// activation itself is kept only in the float form.
+template<typename InT>
 __global__ void RestoreActivateRotateBuckets(
     const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
     const ex::DeviceLinear* down, const unsigned* offsets, unsigned experts,
-    float* gate_y, const float* up_y, std::uint16_t* output, unsigned width,
+    InT* gate_y, const InT* up_y, std::uint16_t* output, unsigned width,
     bool keep_activation) {
   const unsigned row = blockIdx.y, lane = threadIdx.x;
   if (row >= offsets[experts])
@@ -551,8 +555,8 @@ __global__ void RestoreActivateRotateBuckets(
   float gv[4], uv[4];
 #pragma unroll
   for (unsigned j = 0; j < 4; ++j) {
-    gv[j] = gate_y[offset + j];
-    uv[j] = up_y[offset + j];
+    gv[j] = static_cast<float>(gate_y[offset + j]);
+    uv[j] = static_cast<float>(up_y[offset + j]);
   }
   arithmetic::Butterfly128(gv, lane);
   arithmetic::Butterfly128(uv, lane);
@@ -565,8 +569,10 @@ __global__ void RestoreActivateRotateBuckets(
     float activation = (value / (1.0F + expf(-value))) * other;
     asm volatile("" : "+v"(activation));
     // Only the qualification trace reads the FP32 activation back.
-    if (keep_activation)
-      gate_y[offset + j] = activation;
+    if constexpr (std::is_same_v<InT, float>) {
+      if (keep_activation)
+        gate_y[offset + j] = activation;
+    }
     gv[j] = activation * static_cast<float>(ds[first + j]);
     asm volatile("" : "+v"(gv[j]));
   }
@@ -585,11 +591,11 @@ __global__ void RestoreActivateRotateBuckets(
 // A bounded block grid checks each row before assigning its output tiles to
 // the block's eight waves. The all-safe case launches <= 256 blocks, rather
 // than one block for every (assignment, output tile) pair.
-template<int Bits>
+template<int Bits, typename OutT = float>
 __global__ void BucketDownFallback(const ex::DeviceLinear* bank,
                                    const unsigned* offsets, unsigned experts,
                                    const std::int32_t* exponents,
-                                   const std::uint16_t* input, float* output,
+                                   const std::uint16_t* input, OutT* output,
                                    unsigned k, unsigned n, unsigned assignments,
                                    unsigned* counts) {
   if (counts != nullptr && threadIdx.x == 0)
@@ -624,8 +630,8 @@ __global__ void BucketDownFallback(const ex::DeviceLinear* bank,
       a += __shfl_xor(a, 2, 32);
       b += __shfl_xor(b, 2, 32);
       if (lane % 4 == 0) {
-        output[std::size_t{row} * n + nt * 16 + lane / 4] = a;
-        output[std::size_t{row} * n + nt * 16 + lane / 4 + 8] = b;
+        output[std::size_t{row} * n + nt * 16 + lane / 4] = static_cast<OutT>(a);
+        output[std::size_t{row} * n + nt * 16 + lane / 4 + 8] = static_cast<OutT>(b);
       }
     }
   }
@@ -1067,19 +1073,36 @@ void Exl3PrefillDown(const DeviceTensor& down, std::uint32_t assignments,
         std::size_t{assignments} * down.cols * sizeof(std::uint16_t), stream);
   hipLaunchKernelGGL(ScaleDownRows, dim3(assignments), dim3(256), 0, stream,
                      scratch.input, scratch.down_exponents, down.cols);
-  gemm(down.device_exl3, scratch.buckets, scratch.bucket_count,
-       scratch.max_buckets, tile_rows, scratch.input, scratch.out, down.cols,
-       down.rows, BankRate(down), stream);
+  if (raw_only)
+    // FP16 raw dots, unscaled by the row's exponent first (q6-gated).
+    gufo::hip::LaunchExl3PrefillBucketInnerHalf(
+        down.device_exl3, scratch.buckets, scratch.bucket_count,
+        scratch.max_buckets, tile_rows, scratch.input,
+        reinterpret_cast<std::uint16_t*>(scratch.out), down.cols, down.rows,
+        BankRate(down), scratch.down_exponents, stream);
+  else
+    gemm(down.device_exl3, scratch.buckets, scratch.bucket_count,
+         scratch.max_buckets, tile_rows, scratch.input, scratch.out, down.cols,
+         down.rows, BankRate(down), stream);
   auto* counts = trace == nullptr ? nullptr : trace->fallback_counts;
   if (counts != nullptr &&
       hipMemsetAsync(counts, 0, 2 * sizeof(unsigned), stream) != hipSuccess)
     throw std::runtime_error("EXL3 fallback trace reset failed");
   WithRate(BankRate(down), [&]<int Bits>() {
-    hipLaunchKernelGGL((BucketDownFallback<Bits>),
-                       dim3(std::min(assignments, 256U)), dim3(256), 0, stream,
-                       down.device_exl3, scratch.offsets, down.experts,
-                       scratch.down_exponents, scratch.input, scratch.out,
-                       down.cols, down.rows, assignments, counts);
+    if (raw_only)
+      hipLaunchKernelGGL((BucketDownFallback<Bits, _Float16>),
+                         dim3(std::min(assignments, 256U)), dim3(256), 0,
+                         stream, down.device_exl3, scratch.offsets,
+                         down.experts, scratch.down_exponents, scratch.input,
+                         reinterpret_cast<_Float16*>(scratch.out), down.cols,
+                         down.rows, assignments, counts);
+    else
+      hipLaunchKernelGGL((BucketDownFallback<Bits>),
+                         dim3(std::min(assignments, 256U)), dim3(256), 0,
+                         stream, down.device_exl3, scratch.offsets,
+                         down.experts, scratch.down_exponents, scratch.input,
+                         scratch.out, down.cols, down.rows, assignments,
+                         counts);
   });
   if (raw_only) {
     Check();
@@ -1165,7 +1188,19 @@ void PrefillExperts(const DeviceLayer& layer, const float* x,
     PrefillSnapshot(trace->gate_up_input, scratch.input,
                     std::size_t{assignments} * g.cols * sizeof(std::uint16_t),
                     stream);
-  projection(g, scratch.gate);
+  // Raw path: the gate/up dots in FP16 (half the bytes; q6-gated).
+  const auto half_projection = [&](const DeviceTensor& bank,
+                                   const std::uint16_t* input, float* target) {
+    gufo::hip::LaunchExl3PrefillBucketInnerHalf(
+        bank.device_exl3, scratch.buckets, scratch.bucket_count,
+        scratch.max_buckets, tile_rows, input,
+        reinterpret_cast<std::uint16_t*>(target), bank.cols, bank.rows,
+        BankRate(bank), nullptr, stream);
+  };
+  if (raw_only)
+    half_projection(g, scratch.input, scratch.gate);
+  else
+    projection(g, scratch.gate);
   if (trace != nullptr)
     PrefillSnapshot(trace->gate_inner, scratch.gate,
                     std::size_t{assignments} * g.rows * sizeof(float), stream);
@@ -1173,17 +1208,28 @@ void PrefillExperts(const DeviceLayer& layer, const float* x,
     PrefillSnapshot(trace->gate_up_input + assignments * g.cols, up_input,
                     std::size_t{assignments} * u.cols * sizeof(std::uint16_t),
                     stream);
-  gemm(u.device_exl3, scratch.buckets, scratch.bucket_count,
-       scratch.max_buckets, tile_rows, up_input, scratch.up, u.cols, u.rows,
-       BankRate(u), stream);
+  if (raw_only)
+    half_projection(u, up_input, scratch.up);
+  else
+    gemm(u.device_exl3, scratch.buckets, scratch.bucket_count,
+         scratch.max_buckets, tile_rows, up_input, scratch.up, u.cols, u.rows,
+         BankRate(u), stream);
   if (trace != nullptr)
     PrefillSnapshot(trace->up_inner, scratch.up,
                     std::size_t{assignments} * u.rows * sizeof(float), stream);
-  hipLaunchKernelGGL(
-      RestoreActivateRotateBuckets, dim3(d.cols / 128, assignments), dim3(32),
-      0, stream, g.device_exl3, u.device_exl3, d.device_exl3, scratch.offsets,
-      d.experts, scratch.gate, scratch.up, scratch.input, d.cols,
-      trace != nullptr && trace->activation != nullptr);
+  if (raw_only)
+    hipLaunchKernelGGL(
+        RestoreActivateRotateBuckets<_Float16>, dim3(d.cols / 128, assignments),
+        dim3(32), 0, stream, g.device_exl3, u.device_exl3, d.device_exl3,
+        scratch.offsets, d.experts, reinterpret_cast<_Float16*>(scratch.gate),
+        reinterpret_cast<const _Float16*>(scratch.up), scratch.input, d.cols,
+        false);
+  else
+    hipLaunchKernelGGL(
+        RestoreActivateRotateBuckets<float>, dim3(d.cols / 128, assignments),
+        dim3(32), 0, stream, g.device_exl3, u.device_exl3, d.device_exl3,
+        scratch.offsets, d.experts, scratch.gate, scratch.up, scratch.input,
+        d.cols, trace != nullptr && trace->activation != nullptr);
   if (trace != nullptr)
     PrefillSnapshot(trace->activation, scratch.gate,
                     std::size_t{assignments} * g.rows * sizeof(float), stream);
@@ -1202,8 +1248,7 @@ namespace {
 // their slot-ordered copy reach memory. One wave per 128-wide segment.
 __global__ __launch_bounds__(256) void PrefillCombineKernel(
     const ex::DeviceLinear* bank, const unsigned* offsets, unsigned experts,
-    const std::int32_t* inverse, const std::int32_t* exponents,
-    const float* raw, const float* weights, const float* shared,
+    const std::int32_t* inverse, const _Float16* raw, const float* weights, const float* shared,
     const float* gate, unsigned gate_stride, float* out, unsigned k,
     unsigned width) {
   const unsigned t = blockIdx.y, lane = threadIdx.x % 32;
@@ -1225,15 +1270,11 @@ __global__ __launch_bounds__(256) void PrefillCombineKernel(
     const unsigned packed = static_cast<unsigned>(inverse[assignment]);
     const unsigned lo = BucketExpert(offsets, experts, packed);
     const auto* svh = reinterpret_cast<const _Float16*>(bank[lo].svh);
-    const int exponent = exponents[packed];
-    const float scale =
-        exponent > 0 ? __builtin_bit_cast(float, unsigned(127 - exponent) << 23)
-                     : 1.0F;
     const auto offset = std::size_t{packed} * width + first;
     float v[4];
 #pragma unroll
     for (unsigned j = 0; j < 4; ++j) {
-      v[j] = raw[offset + j] * scale;
+      v[j] = static_cast<float>(raw[offset + j]);
       asm volatile("" : "+v"(v[j]));
     }
     arithmetic::Butterfly128(v, lane);
@@ -1272,9 +1313,9 @@ void Exl3PrefillCombine(const DeviceLayer& layer,
     throw std::invalid_argument("EXL3 prefill combine: unsupported call");
   hipLaunchKernelGGL(PrefillCombineKernel, dim3((d.rows / 128 + 7) / 8, rows),
                      dim3(256), 0, stream, d.device_exl3, scratch.offsets,
-                     d.experts, scratch.inverse, scratch.down_exponents,
-                     scratch.out, weights, shared, gate, gate_stride, out,
-                     used, d.rows);
+                     d.experts, scratch.inverse,
+                     reinterpret_cast<const _Float16*>(scratch.out), weights,
+                     shared, gate, gate_stride, out, used, d.rows);
   Check();
 }
 

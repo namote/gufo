@@ -244,7 +244,9 @@ __launch_bounds__(WM * WN * 32) __global__
                                const short* __restrict__ x,
                                float* __restrict__ y, int batch, int m, int k,
                                const float* __restrict__ gate,
-                               const void* __restrict__ up = nullptr) {
+                               const void* __restrict__ up = nullptr,
+                               const std::int32_t* __restrict__ row_exponents =
+                                   nullptr) {
   // EXL3 instances read svh (FP16) through `gate`, unused by their kStore and
   // kResidual epilogues, so the GGUF instances keep their signature.
   constexpr bool Trellis = TrellisBits > 0;
@@ -334,7 +336,9 @@ __launch_bounds__(WM * WN * 32) __global__
     batch = static_cast<int>(problem.rows);
     if (t_block >= batch)
       return;
-  } else if constexpr (Batching == 2) {
+  } else if constexpr (Batching == 2 || Batching == 3) {
+    // Batching 3: the same buckets with FP16 output rows (y holds halves),
+    // each row first divided by 2^row_exponents[row] when that is positive.
     if (blockIdx.z >= *reinterpret_cast<const std::uint32_t*>(gate))
       return;
     const Exl3PrefillBucket bucket =
@@ -345,16 +349,27 @@ __launch_bounds__(WM * WN * 32) __global__
     const auto& linear =
         static_cast<const quant::exl3::DeviceLinear*>(w)[bucket.expert];
     x += static_cast<std::size_t>(bucket.first) * k;
-    y += static_cast<std::size_t>(bucket.first) * m;
+    if constexpr (Batching == 3) {
+      y = reinterpret_cast<float*>(reinterpret_cast<__half*>(y) +
+                                   static_cast<std::size_t>(bucket.first) * m);
+      if (row_exponents != nullptr)
+        row_exponents += bucket.first;
+    } else {
+      y += static_cast<std::size_t>(bucket.first) * m;
+    }
     if (linear.codebook != quant::exl3::Codebook::kMul1 || linear.rate.half ||
         linear.rate.bits != TrellisBits || linear.k != unsigned(k) ||
         linear.n != unsigned(m)) {
       // Contract violation: poison this bucket's block of outputs.
       for (int i = tid; i < BM * BN; i += kThreads) {
         const int token = t_block + i / BM, row = r_block + i % BM;
-        if (token < batch)
-          y[static_cast<std::size_t>(token) * m + row] =
-              __builtin_nanf("");
+        if (token < batch) {
+          if constexpr (Batching == 3)
+            reinterpret_cast<__half*>(y)[static_cast<std::size_t>(token) * m +
+                                         row] = __float2half(__builtin_nanf(""));
+          else
+            y[static_cast<std::size_t>(token) * m + row] = __builtin_nanf("");
+        }
       }
       return;
     }
@@ -647,7 +662,7 @@ __launch_bounds__(WM * WN * 32) __global__
         // Expert buckets: 16-token subtiles wholly past the bucket's rows
         // hold only padding; skip their WMMAs (wave-uniform; no live
         // output's reduction changes).
-        if constexpr (Batching == 2) {
+        if constexpr (Batching == 2 || Batching == 3) {
           if (t_block + (wt * WTS + j) * 16 >= batch)
             continue;
         }
@@ -695,7 +710,33 @@ __launch_bounds__(WM * WN * 32) __global__
       y[index] = value;
   };
   const int hi = lane / 16;
-  if constexpr (Batching == 2) {
+  if constexpr (Batching == 3) {
+    // FP16 raw inner products: unscaled by the row's power of two (exact),
+    // then rounded once.
+#pragma unroll
+    for (int j = 0; j < WTS; ++j) {
+#pragma unroll
+      for (int l = 0; l < 8; ++l) {
+        const int token = t_block + (wt * WTS + j) * 16 + 2 * l + hi;
+        if (token >= batch)
+          continue;
+        float scale = 1.0F;
+        if (row_exponents != nullptr) {
+          const int e = row_exponents[token];
+          if (e > 0)
+            scale = __builtin_bit_cast(float, unsigned(127 - e) << 23);
+        }
+#pragma unroll
+        for (int i = 0; i < WRS; ++i) {
+          const int row = r_block + (wr * WRS + i) * 16 + sl;
+          reinterpret_cast<__half*>(y)[static_cast<std::size_t>(token) * m +
+                                       row] =
+              __float2half_rn(acc[i][j][l] * scale);
+        }
+      }
+    }
+    return;
+  } else if constexpr (Batching == 2) {
     // Raw inner products, [token][row] (no H, no svh): acc[i][j][l] is
     // weight row (wr * WRS + i) * 16 + sl, token (wt * WTS + j) * 16 + 2l +
     // hi of the block.
@@ -1140,7 +1181,8 @@ void LaunchExl3Tile(Exl3Tile tile, const void* w, const void* x, float* y,
              threads, 0, stream>>>(w, static_cast<const short*>(x), y,
                                    static_cast<int>(rows), static_cast<int>(n),
                                    static_cast<int>(k),
-                                   static_cast<const float*>(svh), problems);
+                                   static_cast<const float*>(svh), problems,
+                                   nullptr);
   };
   switch (tile) {
     case Exl3Tile::kNarrow:
@@ -1233,13 +1275,14 @@ void LaunchExl3PrefillGemmGrouped(const Exl3GemmProblem* problems,
 
 namespace {
 
-template<int Bits>
+template<int Bits, int Mode = 2>
 void LaunchBucketTiles(const quant::exl3::DeviceLinear* device_bank,
                        const Exl3PrefillBucket* device_buckets,
                        const std::uint32_t* device_bucket_count,
                        std::uint32_t max_buckets, std::uint32_t tile_rows,
                        const std::uint16_t* input, float* inner,
-                       std::uint32_t k, std::uint32_t n, hipStream_t stream) {
+                       std::uint32_t k, std::uint32_t n, hipStream_t stream,
+                       const std::int32_t* row_exponents = nullptr) {
   using gufo::core::GgmlType;
   // 128 weight rows per block; the token tile is the smallest of 16/32/64
   // covering tile_rows. Every tile accumulates each output over k in the
@@ -1248,16 +1291,17 @@ void LaunchBucketTiles(const quant::exl3::DeviceLinear* device_bank,
     kernel<<<dim3(1, n / 128, max_buckets), threads, 0, stream>>>(
         device_bank, reinterpret_cast<const short*>(input), inner, 0,
         static_cast<int>(n), static_cast<int>(k),
-        reinterpret_cast<const float*>(device_bucket_count), device_buckets);
+        reinterpret_cast<const float*>(device_bucket_count), device_buckets,
+        row_exponents);
   };
   constexpr auto kStore = HalfEpilogue::kStore;
   if (tile_rows <= 16)
     args(HalfPrefillGemmKernel<128, 16, 8, 1, GgmlType::kQ8_0, kStore, false,
-                               GgmlType::kQ8_0, Bits, 2>,
+                               GgmlType::kQ8_0, Bits, Mode>,
          256);
   else if (tile_rows <= 32)
     args(HalfPrefillGemmKernel<128, 32, 4, 2, GgmlType::kQ8_0, kStore, false,
-                               GgmlType::kQ8_0, Bits, 2>,
+                               GgmlType::kQ8_0, Bits, Mode>,
          256);
   else
     // Four waves (2 x 2), each decoding eight tiles per stage: 15-17 % less
@@ -1265,11 +1309,58 @@ void LaunchBucketTiles(const quant::exl3::DeviceLinear* device_bank,
     // expert shapes (188 vs 218 VGPRs; tools/bench/exl3_x3_tiles_bench.hip),
     // bit-identical (the same K order per output).
     args(HalfPrefillGemmKernel<128, 64, 2, 2, GgmlType::kQ8_0, kStore, false,
-                               GgmlType::kQ8_0, Bits, 2>,
+                               GgmlType::kQ8_0, Bits, Mode>,
          128);
 }
 
 }  // namespace
+
+void LaunchExl3PrefillBucketInnerHalf(
+    const quant::exl3::DeviceLinear* device_bank,
+    const Exl3PrefillBucket* device_buckets,
+    const std::uint32_t* device_bucket_count, std::uint32_t max_buckets,
+    std::uint32_t tile_rows, const std::uint16_t* input, std::uint16_t* inner,
+    std::uint32_t k, std::uint32_t n, quant::exl3::BitRate rate,
+    const std::int32_t* row_exponents, hipStream_t stream) {
+  if (!Exl3GemmShapeSupported(k, n, rate, quant::exl3::Codebook::kMul1) ||
+      tile_rows == 0 || tile_rows > 64 || max_buckets > 65535 ||
+      device_bank == nullptr || device_buckets == nullptr ||
+      device_bucket_count == nullptr || input == nullptr || inner == nullptr) {
+    throw std::invalid_argument("EXL3 FP16 bucket GEMM: unsupported call");
+  }
+  if (max_buckets == 0)
+    return;
+  auto* out = reinterpret_cast<float*>(inner);
+  const auto launch = [&]<int Bits>() {
+    LaunchBucketTiles<Bits, 3>(device_bank, device_buckets,
+                               device_bucket_count, max_buckets, tile_rows,
+                               input, out, k, n, stream, row_exponents);
+  };
+  switch (rate.bits) {
+    case 1:
+      launch.template operator()<1>();
+      break;
+    case 2:
+      launch.template operator()<2>();
+      break;
+    case 3:
+      launch.template operator()<3>();
+      break;
+    case 4:
+      launch.template operator()<4>();
+      break;
+    case 5:
+      launch.template operator()<5>();
+      break;
+    case 6:
+      launch.template operator()<6>();
+      break;
+    default:
+      launch.template operator()<7>();
+      break;
+  }
+  HIP_CHECK(hipGetLastError());
+}
 
 void LaunchExl3PrefillBucketInner(const quant::exl3::DeviceLinear* device_bank,
                                   const Exl3PrefillBucket* device_buckets,

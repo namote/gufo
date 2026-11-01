@@ -842,9 +842,29 @@ void PrefillDispatch(gpu::Exl3BucketGemm gemm, int bits, int up_bits = 0,
     Check(hipDeviceSynchronize());
     const auto want = Read(reference, rows * k);
     const auto got = Read(combined, rows * k);
+    // The raw path keeps its gate/up and down dots in FP16 (q6-gated):
+    // within FP16 rounding of the FP32 path, finite, and deterministic.
+    double num = 0.0, den = 0.0;
+    bool finite = true;
+    for (std::size_t i = 0; i < want.size(); ++i) {
+      finite = finite && std::isfinite(got[i]);
+      num += (double(got[i]) - want[i]) * (double(got[i]) - want[i]);
+      den += double(want[i]) * want[i];
+    }
+    Require(finite, "fused FP16 prefill combine must be finite");
+    Require(std::sqrt(num / den) < 2e-3,
+            "fused FP16 prefill combine vs FP32 restore + MoeEpilogue");
+    std::cout << "fused FP16 prefill combine rel L2 " << std::sqrt(num / den)
+              << "\n";
+    gpu::Exl3PrefillExpertsRaw(layer, dx, di, rows, used, tile_rows,
+                               raw_scratch, nullptr);
+    gpu::Exl3PrefillCombine(layer, raw_scratch, rows, used, dw, dsh, dg + 1, 3,
+                            combined, nullptr);
+    Check(hipDeviceSynchronize());
+    const auto again = Read(combined, rows * k);
     Require(
-        std::memcmp(want.data(), got.data(), want.size() * sizeof(float)) == 0,
-        "fused prefill combine differs from restore + MoeEpilogue");
+        std::memcmp(again.data(), got.data(), got.size() * sizeof(float)) == 0,
+        "fused FP16 prefill combine must be deterministic");
   }
   hipStream_t stream;
   Check(hipStreamCreate(&stream));

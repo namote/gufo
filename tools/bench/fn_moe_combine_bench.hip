@@ -1,8 +1,10 @@
-// Flash-Next EXL3 prefill MoE tail (W3): RestoreDownBuckets (scatter) +
-// MoeEpilogue against the fused PrefillCombineKernel, at 2048 tokens x 10
-// experts x 2560: bitwise equality and time.
+// Flash-Next EXL3 prefill MoE tail (W3): RestoreDownBuckets (scatter, FP32
+// raw rows) + MoeEpilogue against the fused PrefillCombineKernel on FP16 raw
+// rows (the q6-gated raw path), at 2048 tokens x 10 experts x 2560: time and
+// relative L2.
 #include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hip"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -87,6 +89,13 @@ int main() {
   auto* d_inv = Up(inverse);
   auto* d_exp = Up(exps);
   auto* d_raw = Up(raw);
+  std::vector<std::uint16_t> raw16(raw.size());
+  for (std::size_t i = 0; i < raw.size(); ++i) {
+    const int e = exps[i / width];
+    const float unscaled = e > 0 ? std::ldexp(raw[i], -e) : raw[i];
+    raw16[i] = __half_as_ushort(__float2half(unscaled));
+  }
+  auto* d_raw16 = Up(raw16);
   auto* d_work = Up(raw);
   auto* d_w = Up(w);
   auto* d_sh = Up(sh);
@@ -106,7 +115,8 @@ int main() {
   const auto new_path = [&] {
     hipLaunchKernelGGL(fnr::PrefillCombineKernel, dim3((width / 128 + 7) / 8, rows),
                        dim3(256), 0, nullptr, d_bank, d_off, experts, d_inv,
-                       d_exp, d_raw, d_w, d_sh, d_g + 1, 3u, d_new, used, width);
+                       reinterpret_cast<const _Float16*>(d_raw16), d_w, d_sh,
+                       d_g + 1, 3u, d_new, used, width);
   };
   old_path();
   new_path();
@@ -114,7 +124,11 @@ int main() {
   std::vector<float> a(sh.size()), b(sh.size());
   Ck(hipMemcpy(a.data(), d_ref, a.size() * 4, hipMemcpyDeviceToHost));
   Ck(hipMemcpy(b.data(), d_new, b.size() * 4, hipMemcpyDeviceToHost));
-  const bool same = std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
+  double num = 0, den = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    num += (double(a[i]) - b[i]) * (double(a[i]) - b[i]);
+    den += double(a[i]) * a[i];
+  }
   const float copy = TimeIt(
       [&] {
         Ck(hipMemcpyAsync(d_work, d_raw, raw.size() * 4,
@@ -122,8 +136,8 @@ int main() {
       },
       10);
   const float t_old = TimeIt(old_path, 10) - copy, t_new = TimeIt(new_path, 10);
-  std::printf("MoE tail %u tokens: restore+scatter+epilogue %.3f ms | fused "
-              "combine %.3f ms %s\n",
-              rows, t_old, t_new, same ? "bit-identical" : "DIFFERS");
+  std::printf("MoE tail %u tokens: FP32 restore+scatter+epilogue %.3f ms | "
+              "FP16 fused combine %.3f ms, rel L2 %.2e\n",
+              rows, t_old, t_new, std::sqrt(num / den));
   return 0;
 }
