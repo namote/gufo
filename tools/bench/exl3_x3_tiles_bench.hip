@@ -93,6 +93,25 @@ void Buckets(const DeviceLinear* bank, const Exl3PrefillBucket* b,
           reinterpret_cast<const float*>(count), b);
 }
 
+__global__ void FillFloatB(float* p, std::size_t n, unsigned seed) {
+  for (std::size_t i = blockIdx.x * std::size_t(blockDim.x) + threadIdx.x;
+       i < n; i += std::size_t(gridDim.x) * blockDim.x)
+    p[i] = float(int((i + seed) * 2654435761U % 2001) - 1000) / 1000.0F;
+}
+__global__ void NarrowB(const float* x, std::uint16_t* y, std::size_t n) {
+  for (std::size_t i = blockIdx.x * std::size_t(blockDim.x) + threadIdx.x;
+       i < n; i += std::size_t(gridDim.x) * blockDim.x)
+    y[i] = __half_as_ushort(__half(x[i]));
+}
+__global__ void ReadFlush(const float* p, std::size_t n, float* sink) {
+  float acc = 0;
+  for (std::size_t i = blockIdx.x * std::size_t(blockDim.x) + threadIdx.x;
+       i < n; i += std::size_t(gridDim.x) * blockDim.x)
+    acc += p[i];
+  if (acc == 12345.0F)
+    *sink = acc;
+}
+
 template<int BM, int BN, int WM, int WN>
 void PlainF16(const std::uint16_t* w, const std::uint16_t* x, float* y,
               unsigned rows, unsigned m, unsigned k) {
@@ -144,6 +163,50 @@ int main(int argc, char** argv) {
       run("64x256 2x8", [&] { PlainF16<64, 256, 2, 8>(w, x, y, rows, m, k); });
       run("64x128 2x4", [&] { PlainF16<64, 128, 2, 4>(w, x, y, rows, m, k); });
       run("128x64 4x2", [&] { PlainF16<128, 64, 4, 2>(w, x, y, rows, m, k); });
+      run("64x64 2x2", [&] { PlainF16<64, 64, 2, 2>(w, x, y, rows, m, k); });
+      run("64x64 4x1", [&] { PlainF16<64, 64, 4, 1>(w, x, y, rows, m, k); });
+      run("128x32 4x2", [&] { PlainF16<128, 32, 4, 2>(w, x, y, rows, m, k); });
+      run("64x32 2x2", [&] { PlainF16<64, 32, 2, 2>(w, x, y, rows, m, k); });
+      run("64x64 4x2", [&] { PlainF16<64, 64, 4, 2>(w, x, y, rows, m, k); });
+      // In-situ-like: a 256 MB streaming pass between calls flushes L2 and
+      // the MALL, as the surrounding kernels of a layer do.
+      {
+        float* flush = nullptr;
+        constexpr std::size_t kFlush = 64ull << 20;  // floats = 256 MB
+        Check(hipMalloc(&flush, kFlush * 4));
+        hipEvent_t a, b;
+        Check(hipEventCreate(&a));
+        Check(hipEventCreate(&b));
+        bool read_flush = false;
+        const auto cold = [&](const char* tile, auto launch) {
+          float total = 0;
+          for (int i = 0; i < reps; ++i) {
+            if (read_flush)
+              hipLaunchKernelGGL(ReadFlush, dim3(2048), dim3(256), 0, 0,
+                                 flush, kFlush, y + i % 7);
+            else
+              Check(hipMemsetAsync(flush, i, kFlush * 4));
+            Check(hipEventRecord(a));
+            launch();
+            Check(hipEventRecord(b));
+            Check(hipEventSynchronize(b));
+            float ms = 0;
+            Check(hipEventElapsedTime(&ms, a, b));
+            total += ms;
+          }
+          std::printf("  plain %5u->%-5u %-12s cold(%s) %.3f ms\n", k, m, tile,
+                      read_flush ? "read" : "write", total / reps);
+        };
+        cold("128x64 4x2", [&] { PlainF16<128, 64, 4, 2>(w, x, y, rows, m, k); });
+        cold("128x32 4x2", [&] { PlainF16<128, 32, 4, 2>(w, x, y, rows, m, k); });
+        cold("64x64 4x2", [&] { PlainF16<64, 64, 4, 2>(w, x, y, rows, m, k); });
+        cold("64x32 2x2", [&] { PlainF16<64, 32, 2, 2>(w, x, y, rows, m, k); });
+        cold("256x128 8x2", [&] { PlainF16<256, 128, 8, 2>(w, x, y, rows, m, k); });
+        read_flush = true;
+        cold("128x64 4x2", [&] { PlainF16<128, 64, 4, 2>(w, x, y, rows, m, k); });
+
+        Check(hipFree(flush));
+      }
       for (void* p : {static_cast<void*>(w), static_cast<void*>(x),
                       static_cast<void*>(y), static_cast<void*>(y0)})
         Check(hipFree(p));
