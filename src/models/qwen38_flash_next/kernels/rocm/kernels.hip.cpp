@@ -7564,6 +7564,15 @@ bool PlainPrefillGemm(const void* w, WeightType type, const __half* x,
                       std::size_t k, hipStream_t stream) {
   if (m == 0 || batch == 0 || k == 0 || k % 32 != 0)
     return false;
+  // The HC projections (F16, very wide or very long) take the X3 core's
+  // FP16 tile: 0.59 / 0.76 ms vs 1.09 / 0.88 ms at 2,048 tokens. Chosen by
+  // shape alone, so every chunk of a projection uses the same kernel.
+  if (type == WeightType::kF16 && (m >= 4096 || k >= 8192)) {
+    gufo::hip::LaunchPlainF16PrefillGemm(w, x, out, batch,
+                                         static_cast<std::uint32_t>(m),
+                                         static_cast<std::uint32_t>(k), stream);
+    return true;
+  }
   // Fixed at every M, including singleton/tail chunks: each output keeps
   // one K16 chain for each half of a K32 block, then adds the two totals.
   // Row/token tile coordinates only select operands, never rotate K.

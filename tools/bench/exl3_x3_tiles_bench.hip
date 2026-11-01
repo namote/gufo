@@ -93,11 +93,63 @@ void Buckets(const DeviceLinear* bank, const Exl3PrefillBucket* b,
           reinterpret_cast<const float*>(count), b);
 }
 
+template<int BM, int BN, int WM, int WN>
+void PlainF16(const std::uint16_t* w, const std::uint16_t* x, float* y,
+              unsigned rows, unsigned m, unsigned k) {
+  HalfPrefillGemmKernel<BM, BN, WM, WN, GgmlType::kF16, HalfEpilogue::kStore>
+      <<<dim3((rows + BN - 1) / BN, (m + BM - 1) / BM), WM * WN * 32>>>(
+          w, reinterpret_cast<const short*>(x), y, int(rows), int(m), int(k),
+          nullptr);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   const unsigned rows = argc > 1 ? unsigned(std::atoi(argv[1])) : 2048;
   const int reps = argc > 2 ? std::atoi(argv[2]) : 10;
+  if (argc > 3 && std::strcmp(argv[3], "plain") == 0) {
+    for (auto [k, m] : {std::pair{10240U, 320U}, std::pair{320U, 10240U},
+                        std::pair{2560U, 544U}}) {
+      std::uint16_t *w, *x;
+      float *y, *y0;
+      Check(hipMalloc(&w, std::size_t(m) * k * 2));
+      Check(hipMalloc(&x, std::size_t(rows) * k * 2));
+      Check(hipMalloc(&y, std::size_t(rows) * m * 4));
+      Check(hipMalloc(&y0, std::size_t(rows) * m * 4));
+      hipLaunchKernelGGL(FillHalf, dim3(1024), dim3(256), 0, 0, w,
+                         std::size_t(m) * k, 1U, false);
+      hipLaunchKernelGGL(FillHalf, dim3(1024), dim3(256), 0, 0, x,
+                         std::size_t(rows) * k, 2U, false);
+      PlainF16<256, 256, 8, 4>(w, x, y0, rows, m, k);
+      Check(hipDeviceSynchronize());
+      std::vector<float> ref(std::size_t(rows) * m), got(ref.size());
+      Check(hipMemcpy(ref.data(), y0, ref.size() * 4, hipMemcpyDeviceToHost));
+      const double flop = 2.0 * rows * k * m;
+      const auto run = [&](const char* tile, auto launch) {
+        Check(hipMemset(y, 0, ref.size() * 4));
+        launch();
+        Check(hipDeviceSynchronize());
+        Check(hipMemcpy(got.data(), y, got.size() * 4, hipMemcpyDeviceToHost));
+        const bool same =
+            std::memcmp(got.data(), ref.data(), got.size() * 4) == 0;
+        const float ms = TimeIt(launch, reps);
+        std::printf("  plain %5u->%-5u %-12s %.3f ms %.2f TFLOPS %s\n", k, m,
+                    tile, ms, flop / ms / 1e9,
+                    same ? "bit-identical" : "DIFFERS");
+      };
+      run("256x256 8x4", [&] { PlainF16<256, 256, 8, 4>(w, x, y, rows, m, k); });
+      run("128x256 4x8", [&] { PlainF16<128, 256, 4, 8>(w, x, y, rows, m, k); });
+      run("256x128 8x2", [&] { PlainF16<256, 128, 8, 2>(w, x, y, rows, m, k); });
+      run("128x128 4x2", [&] { PlainF16<128, 128, 4, 2>(w, x, y, rows, m, k); });
+      run("64x256 2x8", [&] { PlainF16<64, 256, 2, 8>(w, x, y, rows, m, k); });
+      run("64x128 2x4", [&] { PlainF16<64, 128, 2, 4>(w, x, y, rows, m, k); });
+      run("128x64 4x2", [&] { PlainF16<128, 64, 4, 2>(w, x, y, rows, m, k); });
+      for (void* p : {static_cast<void*>(w), static_cast<void*>(x),
+                      static_cast<void*>(y), static_cast<void*>(y0)})
+        Check(hipFree(p));
+    }
+    return 0;
+  }
   struct S {
     const char* name;
     unsigned k, n;

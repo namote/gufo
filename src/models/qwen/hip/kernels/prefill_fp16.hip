@@ -367,7 +367,10 @@ __launch_bounds__(WM * WN * 32) __global__
   // Hoisted 64-bit row bases, clamped so an out-of-range row reads row m-1 and
   // is masked out at the store instead of branching in the K loop.
   const std::uint8_t* w_row[PFA];
-  const std::size_t row_bytes = gufo::hip::QuantRowBytes(Type, k);
+  // kF16: unquantized FP16 rows (EXL3 plain operands), staged as they are.
+  const std::size_t row_bytes = Type == gufo::core::GgmlType::kF16
+                                    ? static_cast<std::size_t>(k) * 2
+                                    : gufo::hip::QuantRowBytes(Type, k);
   const std::size_t up_row_bytes = gufo::hip::QuantRowBytes(UpType, k);
   if constexpr (!Trellis) {
 #pragma unroll
@@ -494,6 +497,11 @@ __launch_bounds__(WM * WN * 32) __global__
           const auto packed = LoadIqHalf<Type>(w_row[p], unsigned(kk));
           ra[p][0] = packed.low;
           ra[p][1] = packed.high;
+        } else if constexpr (Type == gufo::core::GgmlType::kF16) {
+          const auto* src =
+              reinterpret_cast<const uint4*>(w_row[p] + std::size_t(kk) * 32);
+          ra[p][0] = src[0];
+          ra[p][1] = src[1];
         }
         else {
           gufo::hip::QuantSub16 q;
@@ -1303,6 +1311,28 @@ void LaunchExl3PrefillBucketInner(const quant::exl3::DeviceLinear* device_bank,
       launch.template operator()<7>();
       break;
   }
+  HIP_CHECK(hipGetLastError());
+}
+
+void LaunchPlainF16PrefillGemm(const void* w, const void* x, float* y,
+                               std::size_t rows, std::uint32_t m,
+                               std::uint32_t k, hipStream_t stream) {
+  if (w == nullptr || x == nullptr || y == nullptr || m == 0 || k == 0 ||
+      k % 16 != 0) {
+    throw std::invalid_argument("plain F16 prefill GEMM: unsupported call");
+  }
+  if (rows == 0)
+    return;
+  // 128 weight rows x 64 tokens, eight waves: the fastest tile for the
+  // Flash-Next HC projections (10240 -> 320: 0.76 ms, 320 -> 10240:
+  // 0.59 ms at 2,048 tokens; tools/bench/exl3_x3_tiles_bench.hip). Every
+  // output is one WMMA chain in K order, whatever the tile or row count.
+  using gufo::core::GgmlType;
+  HalfPrefillGemmKernel<128, 64, 4, 2, GgmlType::kF16, HalfEpilogue::kStore>
+      <<<dim3(static_cast<unsigned>((rows + 63) / 64), (m + 127) / 128), 256,
+          0, stream>>>(w, static_cast<const short*>(x), y,
+                       static_cast<int>(rows), static_cast<int>(m),
+                       static_cast<int>(k), nullptr);
   HIP_CHECK(hipGetLastError());
 }
 

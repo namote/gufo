@@ -65,6 +65,12 @@ void LaunchExl3PrefillBucketInner(const quant::exl3::DeviceLinear* device_bank,
                                   std::uint32_t k, std::uint32_t n,
                                   quant::exl3::BitRate rate,
                                   hipStream_t stream);
+// y[r][j] = sum_i w[j][i] * x[r][i] for unquantized FP16 weights w
+// [m][k] and FP16 rows x [rows][k]; FP32 accumulation in one WMMA chain per
+// output in K order (independent of rows or tiling). k % 16 == 0.
+void LaunchPlainF16PrefillGemm(const void* w, const void* x, float* y,
+                               std::size_t rows, std::uint32_t m,
+                               std::uint32_t k, hipStream_t stream);
 // Optional residual and sum_out preserve the FP32 residual link; sum_out may
 // alias input. The normalization reduction matches LaunchBatchedRMSNorm.
 // The FP16 output must be disjoint from the FP32 inputs and weights.
