@@ -671,6 +671,11 @@ __launch_bounds__(WM * WN * 32) __global__
       // decoders retain the compiler's default instruction schedule.
       __builtin_amdgcn_iglp_opt(0);
     }
+    if constexpr (Trellis && Batching == 0 && BM == 256 && BN == 256) {
+      // Dense X3: interleaved LDS reads and WMMA, 8 % faster at 6144 ->
+      // 2560 and neutral elsewhere (exl3_x3_tiles_bench); schedule only.
+      __builtin_amdgcn_iglp_opt(0);
+    }
     __syncthreads();
   }
 
