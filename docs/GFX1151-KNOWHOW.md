@@ -1319,3 +1319,33 @@ are retained in the comparison report. Existing numerical qualification and
 its NLL caveat remain unchanged. No Kyojin quality parity is claimed.
 
 [Comparison](../plan/exl3/F3-TGMTP-KYOJIN-COMPARISON.json).
+
+
+## Native EXL3 PLE transition, November 2, 2026
+
+EXL3 n-gram rings are distinct from EXL3 matrix tiles: cyclic symbols, mul1
+FP16 codebook, row scale and per-head bias, then a final FP16 embedding store.
+There is no matrix Hadamard transform. A sliding16-bit state avoids repeatedly
+reconstructing all preceding symbols. Keep compressed rows in the existing
+bounded asynchronous cache; support single and split tensor ranges independently
+of head boundaries. Current native5.05 K6 and Kyojin K4 boundary rows agree with
+an independent bit-at-a-time oracle (51200elements); preserve both tests.
+
+One native5.05 combined window:32760 quality records/64head replays plus
+sampling/EOS, C2/4/6/8 AR/MTP/lookup,32K and cache/policy serialization pass.
+Native PLE changes weights: old output hashes are not the quality oracle.
+Saved-reference paired NLL improves by.007451, window95%CI[−.017370,−.001770];
+KL256+.rest.026481→.025464; top-1−.0794pp unresolved. PP2048/8192 rates are
+1423.76/1461.67tok/s (saved1435.59/1466.18); AR25.20/24.43 (saved25.24/24.51).
+Short MTP40.09 vs46.70 reflects changed generated text, cycles40→54 and
+accepted88/113→74/114. This is a material end-to-end loss, not established
+loader/kernel slowdown. Same-output32K MTP78.53 vs79.31 keeps17cycles and
+111accepted,101from lookup. Never generalize that repetitive rate to prose.
+All ROCr/CLR paths match pinned Nix10.1; no GGUF mappings and healthPASS.
+
+Native directory metadata can use an owned typed adapter without writing a
+GGUF sidecar. Validate NFC/pretokenizer/added-token contracts, distinguish PLE
+EOS from generation EOS, match native MTP to trunk shards, and bind persistent
+identity to full payloads plus all metadata and source stamps. Preserve the
+existing Nix volume/objects; only the completed export's new unused BuildKit
+records were cleaned after packaging. [Evidence](../plan/exl3/F3-NATIVE-PACK.json).

@@ -15,6 +15,7 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
+#include "src/models/qwen38_flash_next/exl3_ngram.hpp"
 
 namespace gufo::models::qwen38_flash_next {
 
@@ -88,6 +89,10 @@ public:
       std::uint64_t rows, std::uint32_t row_dim, core::GgmlType type,
       std::string* error_msg = nullptr);
 
+  [[nodiscard]] static std::unique_ptr<NgramTable> OpenExl3(
+      const std::filesystem::path& path, const Config& config,
+      std::string* error_msg = nullptr);
+
   /// Gathers `rows.size()` rows into `out` (rows.size() * row_dim floats).
   /// Duplicate ids are read once. Returns false on any failed read.
   [[nodiscard]] bool Read(std::span<const std::uint32_t> rows,
@@ -124,7 +129,7 @@ private:
   // Reuse deduplication storage across gathers. Entries index the first
   // occurrence in the current input, so no row-cache state is retained here.
   std::vector<std::size_t> first_rows_;
-  void DecodeRow(const std::uint8_t* src, float* dst) const;
+  void DecodeRow(const std::uint8_t* src, float* dst, std::uint32_t row) const;
   bool ReadCached(std::uint32_t row, float* dst);
   bool ReadOne(std::uint32_t row, float* dst, std::vector<std::uint8_t>& buf,
                NgramCounters* owner);
@@ -145,6 +150,11 @@ private:
   std::uint64_t rows_{0};
   std::uint32_t row_dim_{0};
   std::size_t row_bytes_{0};
+  unsigned ring_bits_{0};
+  std::vector<Exl3Ngram::Segment> segments_;
+  std::vector<std::uint64_t> head_offsets_;
+  std::vector<float> head_bias_;
+  std::array<float, 65536> codebook_{};
   core::GgmlType type_{core::GgmlType::kIQ4_NL};
 
   // A small resident pool keeps decode-time reads from paying thread

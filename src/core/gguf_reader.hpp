@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -168,6 +169,11 @@ public:
   [[nodiscard]] static std::unique_ptr<GgufReader> OpenFile(
       const std::filesystem::path& path, std::string* error_msg = nullptr);
 
+  /// Own typed metadata supplied by a native model adapter. No GGUF bytes,
+  /// file, tensors or mapped regions are created. All string views are copied.
+  [[nodiscard]] static std::unique_ptr<GgufReader> FromMetadata(
+      std::vector<std::pair<std::string, GgufMetadataValue>> entries);
+
   /// Parses a GGUF file from an existing in-memory buffer without file mapping.
   [[nodiscard]] static std::unique_ptr<GgufReader> OpenMemory(
       const void* data, std::size_t size, std::string* error_msg = nullptr);
@@ -255,6 +261,7 @@ private:
   std::unordered_map<std::string_view, std::size_t> tensor_index_;
   std::vector<GgufMappedRegion> mapped_regions_;
   std::vector<std::unique_ptr<GgufReader>> shards_;
+  std::deque<std::string> owned_metadata_;
 };
 
 }  // namespace gufo::core

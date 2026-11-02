@@ -95,6 +95,7 @@ public:
     return options_.max_context;
   }
   [[nodiscard]] bool HasMtp() const noexcept;
+  [[nodiscard]] bool IsNativeExl3() const noexcept;
   /// Whether sessions keep trunk K/V as KVarN k4v4 (ModelOptions::kvarn).
   [[nodiscard]] bool Kvarn() const noexcept { return options_.kvarn; }
   [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {

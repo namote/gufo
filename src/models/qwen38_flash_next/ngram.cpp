@@ -10,6 +10,7 @@
 
 #include "src/core/platform/fs.hpp"
 #include "src/core/platform/mapped_file.hpp"
+#include "src/core/quant/exl3/format.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
 
 namespace gufo::models::qwen38_flash_next {
@@ -117,8 +118,67 @@ std::unique_ptr<NgramTable> NgramTable::Open(
   return t;
 }
 
-void NgramTable::DecodeRow(const std::uint8_t* src, float* dst) const {
-  if (type_ == core::GgmlType::kIQ4_NL) {
+std::unique_ptr<NgramTable> NgramTable::OpenExl3(
+    const std::filesystem::path& path, const Config& config,
+    std::string* error_msg) {
+  try {
+    auto native = Exl3Ngram::Open(path);
+    native.Validate(config);
+    // Open owns the file descriptor before the temporary mapping is released.
+    auto table = Open(native.file.PlatformHandle(), 0, config.ple_rows,
+                      native.dim, core::GgmlType::kBF16, error_msg);
+    if (!table)
+      return nullptr;
+    table->ring_bits_ = native.bits;
+    table->row_bytes_ = 2 * (1 + native.dim * native.bits / 16);
+    table->cache_count_ = std::bit_floor(kCacheBytes / table->row_bytes_);
+    table->cache_entries_ = std::make_unique<CacheEntry[]>(table->cache_count_);
+    table->cache_rows_.resize(table->cache_count_ * table->row_bytes_);
+    table->segments_ = std::move(native.segments);
+    table->head_offsets_ = std::move(native.offsets);
+    table->head_bias_ = std::move(native.bias);
+    for (unsigned i = 0; i < table->codebook_.size(); ++i)
+      table->codebook_[i] = quant::exl3::HalfToDouble(
+          quant::exl3::DecodeState(i, quant::exl3::Codebook::kMul1));
+    return table;
+  } catch (const std::exception& e) {
+    if (error_msg)
+      *error_msg = e.what();
+    return nullptr;
+  }
+}
+
+void NgramTable::DecodeRow(const std::uint8_t* src, float* dst,
+                           std::uint32_t row) const {
+  if (ring_bits_) {
+    std::uint16_t scale_bits;
+    std::memcpy(&scale_bits, src, 2);
+    const float scale = quant::exl3::HalfToDouble(scale_bits);
+    const auto head =
+        std::upper_bound(head_offsets_.begin(), head_offsets_.end(), row) -
+        head_offsets_.begin() - 1;
+    const unsigned words = row_dim_ * ring_bits_ / 16;
+    const auto word = [&](unsigned i) {
+      std::uint16_t value;
+      std::memcpy(&value, src + 2 + 2 * (i % words), 2);
+      return static_cast<std::uint32_t>(value);
+    };
+    const auto symbol = [&](unsigned i) {
+      const unsigned bit = i * ring_bits_;
+      const unsigned window = word(bit / 16) | (word(bit / 16 + 1) << 16);
+      return (window >> (bit % 16)) & ((1U << ring_bits_) - 1);
+    };
+    unsigned state = 0;
+    for (unsigned j = 1; j * ring_bits_ < 16; ++j)
+      state |= symbol(row_dim_ - j) << ((j - 1) * ring_bits_);
+    for (unsigned i = 0; i < row_dim_; ++i) {
+      state = ((state << ring_bits_) | symbol(i)) & 65535;
+      const float product = codebook_[state] * scale;
+      // Upstream fetch_rows/fused embedding stores FP16 before projections.
+      const float value = product + head_bias_[head * row_dim_ + i];
+      dst[i] = quant::exl3::HalfToDouble(quant::exl3::HalfFromDouble(value));
+    }
+  } else if (type_ == core::GgmlType::kIQ4_NL) {
     gufo::quant::DequantizeIQ4_NL(src, dst, row_dim_);
   } else {
     for (std::uint32_t i = 0; i < row_dim_; ++i) {
@@ -141,7 +201,7 @@ bool NgramTable::ReadCached(std::uint32_t row, float* dst) {
   }
   const bool hit = entry.valid && entry.row == row;
   if (hit) {
-    DecodeRow(cache_rows_.data() + slot * row_bytes_, dst);
+    DecodeRow(cache_rows_.data() + slot * row_bytes_, dst, row);
   }
   entry.busy.clear(std::memory_order_release);
   return hit;
@@ -157,7 +217,14 @@ bool NgramTable::ReadOne(std::uint32_t row, float* dst,
       owner->cache_hits_.fetch_add(1, std::memory_order_relaxed);
     return true;
   }
-  const std::uint64_t offset = base_offset_ + row * row_bytes_;
+  std::uint64_t offset = base_offset_ + row * row_bytes_;
+  if (ring_bits_) {
+    const auto it = std::upper_bound(
+        segments_.begin(), segments_.end(), row,
+        [](std::uint32_t r, const auto& segment) { return r < segment.first; });
+    const auto& segment = *std::prev(it);
+    offset = segment.offset + (row - segment.first) * row_bytes_;
+  }
   const std::uint64_t begin = direct_ ? offset & ~(kPage - 1) : offset;
   const std::uint64_t end =
       direct_ ? (offset + row_bytes_ + kPage - 1) & ~(kPage - 1)
@@ -204,7 +271,7 @@ bool NgramTable::ReadOne(std::uint32_t row, float* dst,
     entry->valid = true;
     entry->busy.clear(std::memory_order_release);
   }
-  DecodeRow(base + (offset - begin), dst);
+  DecodeRow(base + (offset - begin), dst, row);
   return true;
 }
 

@@ -220,6 +220,42 @@ std::string RegionDigest(const GgufMappedRegion& region) {
 
 }  // namespace
 
+std::string FileSetIdentityHex(const std::filesystem::path& directory,
+                               const std::vector<std::string>& names) {
+  std::vector<platform::ReadOnlyMappedFile> files;
+  std::vector<std::string> stamps;
+  crypto::Sha256Hasher hash;
+  HashString(hash, kNativeIdentityScheme);
+  std::string previous;
+  for (const auto& name : names) {
+    if (name.empty() || name <= previous ||
+        std::filesystem::path(name).is_absolute() ||
+        name.find("..") != std::string::npos ||
+        name.find('/') != std::string::npos)
+      throw std::runtime_error("invalid native artifact file list");
+    previous = name;
+    std::string error;
+    files.push_back(
+        platform::ReadOnlyMappedFile::Open(directory / name, &error));
+    const auto& file = files.back();
+    if (!file.valid())
+      throw std::runtime_error(error);
+    GgufMappedRegion region{file.data(), file.size(), file.PlatformHandle(),
+                            directory / name, 0};
+    stamps.push_back(FileStamp(region.file_descriptor, region.size));
+    HashString(hash, ":" + std::to_string(name.size()) + ":" + name + ":" +
+                         std::to_string(region.size) + ":");
+    HashString(hash, RegionDigest(region));
+  }
+  if (files.empty())
+    throw std::runtime_error("empty native artifact");
+  for (std::size_t i = 0; i < files.size(); ++i)
+    if (stamps[i] != FileStamp(files[i].PlatformHandle(), files[i].size()))
+      throw std::runtime_error(
+          "native artifact changed during identity lookup");
+  return hash.FinishHex();
+}
+
 std::string GgufIdentityHex(const GgufReader& reader) {
   std::vector<std::string> stamps;
   for (const auto& region : reader.GetMappedRegions())

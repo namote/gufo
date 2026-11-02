@@ -1,5 +1,21 @@
 # Qwen3.8 Flash-Next quality
 
+## Native EXL3 n-gram, November 2, 2026
+
+Native directory loading removes GGUF metadata/PLE dependencies for text/MTP.
+The selected5.05 pack now uses its own K6 ring table, with upstream FP16 output
+rounding; Kyojin K4 sharding is CPU-covered. Existing GPU optimizations remain.
+One combined window passes quality/sampling/batch/32K/cache/PP/TG and health;
+no GGUF mappings or baseline rerun. PP2048/8192=1423.76/1461.67tok/s;
+AR d0/d32K=25.20/24.43; MTP=40.09/78.53. PP/AR/d32K MTP are within1% of saved
+rates, but d0 MTP falls14.15% with changed output and acceptance88/113→74/114.
+This material workload-specific loss is retained; do not describe universal
+performance parity. Native full-vocabulary NLL improves2.175202→2.167751,
+paired window95%CI forΔNLL[−.017370,−.001770]. Top-1 change−.0794pp is unresolved.
+
+[Complete scope, caveats and evidence](../../../plan/exl3/F3-NATIVE-PACK.md).
+
+
 ## K/D serving follow-up, November 2, 2026
 
 All25requests completed with valid terminal usage/finish status, prompt caching

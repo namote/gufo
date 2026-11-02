@@ -1,13 +1,38 @@
 # Qwen3.8 Flash-Next
 
 Hybrid recurrent/QSA mixture-of-experts text/image model on gfx1151.
-Supported target: `unsloth/Qwen3.8-Flash-Next-GGUF`, **UD-Q4_K_XL** (four shards).
-Optional shared-Q8 MTP predictor; optional BF16 vision projector.
+Text/MTP accepts native Flash-Next EXL3 directories, including the pack's own
+n-gram embedding. The existing `unsloth/Qwen3.8-Flash-Next-GGUF` **UD-Q4_K_XL**
+loader and optional BF16 vision projector remain available.
 Original unquantized-model and GGUF-conversion parity remain unqualified.
 
 [Benchmarks](BENCHMARKS.md) · [Quality](QUALITY.md) · [Experiments](EXPERIMENTS.md) · [ROCm 10.1 status](ROCM.md)
 
-## Load and run
+## Native EXL3 text/MTP
+
+Pass the pack directory directly to `--model` and, when enabled, `--mtp-model`:
+
+```sh
+MODEL=/path/to/flash-next-exl3-pack
+./result/bin/gufo chat --model "$MODEL"
+./result/bin/gufo serve llm --model "$MODEL" --speculative mtp \
+  --mtp-model "$MODEL" --sessions 2 --context 32768
+```
+
+The directory supplies `config.json`, `tokenizer.json`, `tokenizer_config.json`,
+`chat_template.jinja`, `model.safetensors.index.json`, its indexed shards, and
+`ngram_embedding.safetensors`. No GGUF metadata sidecar or GGUF PLE table is
+needed. Native mul1 n-gram rings support K1–K8 and single or split tensors;
+compressed rows remain on disk behind the bounded cache. Keep the n-gram file
+on fast local storage. Missing or incompatible files fail explicitly.
+
+MTP uses the same pack. If its index omits the MTP hyper-connection mixer,
+include the matching `mtp_hyper_connection_mixer_patch.safetensors` in that
+directory. A different pack cannot silently supply MTP. The native text path
+does not automatically load an EXL3 vision encoder; explicit vision projector
+support is separate. See [native qualification](../../../plan/exl3/F3-NATIVE-PACK.md).
+
+## GGUF load and run
 
 ```sh
 nix develop -c hf download unsloth/Qwen3.8-Flash-Next-GGUF \

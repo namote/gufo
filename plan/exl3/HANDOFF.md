@@ -1,4 +1,28 @@
-# EXL3 / Flash-Next F3 handoff (2026-11-02; qualified TG/MTP)
+# EXL3 / Flash-Next F3 handoff (2026-11-02; native EXL3 qualified)
+
+## Current native EXL3 selection, November 2, 2026
+
+**Use the pack directory directly; no GGUF metadata/PLE dependency.**
+Image `ai-tools/gufo-eval:f3-native-b4ebe27c-rocm101`,
+wrapper `/opt/gufo-native/bin/gufo`, ELF SHA
+`b4ebe27cb5cbd3173143ddf129b9188db6f13178682921fb3c8dccbaadbc9455`.
+`--model /models/fnx/ --speculative mtp --mtp-model /models/fnx/`.
+The 5.05 pack uses its internal-NVMe native K6 n-gram file; Kyojin's sharded K4
+reader is CPU-qualified, with the pack still in its existing external location.
+
+One combined window: quality, sampling/EOS, C2/4/6/8,32K,cache/policy replay,
+PP/TG and hardware health all passed. No GGUF mappings, no old baseline rerun.
+PP2048/8192=1423.76/1461.67tok/s; AR d0/d32K=25.20/24.43;
+MTP=40.09/78.53. Short MTP is14.15% below the saved rate: new n-gram weights
+change output, acceptance77.88%→64.91% and cycles40→54. Preserve this caveat;
+there is no claim of universal speed parity. PP/AR/same-output d32K MTP stay
+within1%. Saved-corpus NLL improves by.007451 with negative paired windowCI.
+
+[Native implementation, exact scope and results](F3-NATIVE-PACK.md) ·
+[Machine-readable receipt](F3-NATIVE-PACK.json). Previous selected images and
+all baseline/model artifacts remain available. Keep native input for the next
+MTP investigation; do not silently mix in old IQ4_NL PLE.
+
 
 ## Kyojin target comparison, November 2, 2026
 

@@ -28,6 +28,7 @@
 #include "src/models/qwen38_flash_next/exl3_weights.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
+#include "src/models/qwen38_flash_next/native_metadata.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 
 namespace json = gufo::json;
@@ -343,7 +344,7 @@ int main(int argc, char** argv) {
 
     const auto load_start = Clock::now();
     std::string error;
-    auto reader = gufo::core::GgufReader::OpenFile(model_path, &error);
+    auto reader = q::OpenArtifactMetadata(model_path, &error);
     Require(bool(reader), error);
     const bool exl3 = reader->FindMetadata(q::kExl3Checkpoint) != nullptr;
     auto weights = exl3 ? q::LoadExl3Model(model_path, *reader, &error)
@@ -354,11 +355,16 @@ int main(int argc, char** argv) {
     std::unique_ptr<q::NgramTable> ngram;
     if (c.ple_layer >= 0) {
       const auto& t = weights->ple_table;
-      ngram = q::NgramTable::Open(
-          (exl3 ? weights->exl3_storage->ple_reader.get() : reader.get())
-              ->GetMappedRegions()[t.shard]
-              .file_descriptor,
-          t.file_offset, t.rows, c.ple_head_dim, t.type, &error);
+      if (reader->GetMetadataBool("gufo.exl3.native").value_or(false)) {
+        ngram = q::NgramTable::OpenExl3(
+            std::filesystem::path(model_path) / "ngram_embedding.safetensors",
+            c, &error);
+      } else
+        ngram = q::NgramTable::Open(
+            (exl3 ? weights->exl3_storage->ple_reader.get() : reader.get())
+                ->GetMappedRegions()[t.shard]
+                .file_descriptor,
+            t.file_offset, t.rows, c.ple_head_dim, t.type, &error);
       Require(bool(ngram), error);
     }
     auto device = q::rocm::DeviceModel::Upload(*weights, *reader, nullptr,
@@ -375,6 +381,7 @@ int main(int argc, char** argv) {
     auto session = executor->CreateSession(
         gufo::core::SessionMode::kAutoregressive, context, &error);
     Require(bool(session), error);
+    q::ValidateNativeSources(*reader);
     const double load_ms = Ms(load_start);
     std::filesystem::remove(out_prefix + ".json");
     Writer writer(out_prefix + ".bin", top_k);

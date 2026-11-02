@@ -17,6 +17,7 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
+#include "src/models/qwen38_flash_next/native_metadata.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
 
@@ -71,6 +72,11 @@ std::uint64_t SessionSnapshotHostBytes(std::uint32_t token_count,
 
 Model::~Model() = default;
 
+bool Model::IsNativeExl3() const noexcept {
+  return reader_ &&
+         reader_->GetMetadataBool("gufo.exl3.native").value_or(false);
+}
+
 std::shared_ptr<Model> Model::Load(const std::string& model_path,
                                    const ModelOptions& options,
                                    std::string* error_msg) {
@@ -90,7 +96,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     return nullptr;
   }
   m->options_ = options;
-  m->reader_ = core::GgufReader::OpenFile(model_path, error_msg);
+  m->reader_ = OpenArtifactMetadata(model_path, error_msg);
   if (!m->reader_) {
     return nullptr;
   }
@@ -129,18 +135,23 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   }
   if (c.ple_layer >= 0) {
     const auto& t = m->weights_->ple_table;
-    m->ngram_ = NgramTable::Open(
-        (exl3 ? m->weights_->exl3_storage->ple_reader.get() : m->reader_.get())
-            ->GetMappedRegions()[t.shard]
-            .file_descriptor,
-        t.file_offset, t.rows, c.ple_head_dim, t.type, error_msg);
+    if (m->reader_->GetMetadataBool("gufo.exl3.native").value_or(false)) {
+      m->ngram_ = NgramTable::OpenExl3(
+          std::filesystem::path(model_path) / "ngram_embedding.safetensors", c,
+          error_msg);
+    } else
+      m->ngram_ = NgramTable::Open(
+          (exl3 ? m->weights_->exl3_storage->ple_reader.get()
+                : m->reader_.get())
+              ->GetMappedRegions()[t.shard]
+              .file_descriptor,
+          t.file_offset, t.rows, c.ple_head_dim, t.type, error_msg);
     if (!m->ngram_) {
       return nullptr;
     }
   }
   if (!options.mtp_model_path.empty()) {
-    m->mtp_reader_ =
-        core::GgufReader::OpenFile(options.mtp_model_path, error_msg);
+    m->mtp_reader_ = OpenArtifactMetadata(options.mtp_model_path, error_msg);
     if (!m->mtp_reader_) {
       return nullptr;
     }
@@ -193,6 +204,14 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   m->executor_ =
       rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);
   if (!m->executor_) {
+    return nullptr;
+  }
+  try {
+    ValidateNativeSources(*m->reader_);
+    if (m->mtp_reader_)
+      ValidateNativeSources(*m->mtp_reader_);
+  } catch (const std::exception& e) {
+    AssignError(error_msg, e.what());
     return nullptr;
   }
   return m;

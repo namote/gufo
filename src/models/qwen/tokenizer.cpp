@@ -369,6 +369,21 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
     }
   }
 
+  if (reader.GetMetadataBool("gufo.exl3.native").value_or(false)) {
+    const auto* entry = reader.FindMetadata("tokenizer.ggml.token_type");
+    const auto* types =
+        entry ? std::get_if<std::vector<std::uint64_t>>(&entry->value)
+              : nullptr;
+    if (!types || types->size() != tokens.size()) {
+      if (error_msg)
+        *error_msg = "native tokenizer type count mismatch";
+      return nullptr;
+    }
+    for (std::size_t i = 0; i < tokens.size(); ++i)
+      if ((*types)[i] == 3 || (*types)[i] == 4)
+        special_tokens[tokens[i]] = static_cast<TokenId>(i);
+  }
+
   auto tokenizer =
       CreateFromVocabulary(tokens, merges, special_tokens, error_msg);
   if (tokenizer == nullptr) {

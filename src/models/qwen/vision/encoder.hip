@@ -562,8 +562,9 @@ std::shared_ptr<Encoder> Encoder::Open(const std::filesystem::path& target,
                                        std::uint32_t width) {
   if (!sidecar.empty())
     return std::make_shared<Encoder>(sidecar, width);
-  auto directory = target.parent_path();
-  for (unsigned level = 0; level < 2; ++level) {
+  const bool native = std::filesystem::is_directory(target);
+  auto directory = native ? target : target.parent_path();
+  for (unsigned level = 0; level < (native ? 1U : 2U); ++level) {
     const auto path = directory / "mmproj-BF16.gguf";
     if (std::filesystem::is_regular_file(path))
       return std::make_shared<Encoder>(path, width);

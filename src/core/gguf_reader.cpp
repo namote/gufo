@@ -70,7 +70,8 @@ GgufReader::GgufReader(GgufReader&& other) noexcept
       tensors_(std::move(other.tensors_)),
       tensor_index_(std::move(other.tensor_index_)),
       mapped_regions_(std::move(other.mapped_regions_)),
-      shards_(std::move(other.shards_)) {
+      shards_(std::move(other.shards_)),
+      owned_metadata_(std::move(other.owned_metadata_)) {
   other.data_ = nullptr;
   other.size_ = 0;
 }
@@ -88,6 +89,7 @@ GgufReader& GgufReader::operator=(GgufReader&& other) noexcept {
     version_ = other.version_;
     alignment_ = other.alignment_;
     data_offset_ = other.data_offset_;
+    owned_metadata_ = std::move(other.owned_metadata_);
     metadata_ = std::move(other.metadata_);
     tensors_ = std::move(other.tensors_);
     tensor_index_ = std::move(other.tensor_index_);
@@ -98,6 +100,25 @@ GgufReader& GgufReader::operator=(GgufReader&& other) noexcept {
     other.size_ = 0;
   }
   return *this;
+}
+
+std::unique_ptr<GgufReader> GgufReader::FromMetadata(
+    std::vector<std::pair<std::string, GgufMetadataValue>> entries) {
+  auto out = std::unique_ptr<GgufReader>(new GgufReader());
+  const auto own = [&](std::string_view text) -> std::string_view {
+    out->owned_metadata_.emplace_back(text);
+    return out->owned_metadata_.back();
+  };
+  for (auto& [name, entry] : entries) {
+    if (auto* text = std::get_if<std::string_view>(&entry.value))
+      *text = own(*text);
+    if (auto* texts = std::get_if<std::vector<std::string_view>>(&entry.value))
+      for (auto& text : *texts)
+        text = own(text);
+    if (!out->metadata_.emplace(own(name), std::move(entry)).second)
+      throw std::invalid_argument("duplicate native metadata key");
+  }
+  return out;
 }
 
 std::unique_ptr<GgufReader> GgufReader::OpenFile(
@@ -827,6 +848,8 @@ bool GgufReader::HasTensor(std::string_view name) const noexcept {
 }
 
 std::string GgufReader::GetQuantizationLabel() const {
+  if (GetMetadataBool("gufo.exl3.native").value_or(false))
+    return "EXL3";
   // `general.file_type` is deliberately not consulted. The Unsloth UD-*_K_XL
   // artifacts this repo targets carry a stale one -- UD-Q8_K_XL records ftype
   // 15 (Q4_K_M), which is what llama-bench prints for it -- so the recorded

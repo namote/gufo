@@ -365,19 +365,31 @@ std::shared_ptr<Exl3Storage> Open(const std::filesystem::path& path,
     Fail("EXL3 metadata sidecar must be tensorless");
   c.vocab_size = static_cast<std::uint32_t>(
       sidecar.GetMetadataStringArray("tokenizer.ggml.tokens").size());
-  const auto directory = Reference(path, sidecar, kExl3Checkpoint);
-  CheckMetadata(directory, sidecar, c);
+  const bool native =
+      sidecar.GetMetadataBool("gufo.exl3.native").value_or(false);
+  const auto directory =
+      native ? path : Reference(path, sidecar, kExl3Checkpoint);
+  if (!native)
+    CheckMetadata(directory, sidecar, c);
   auto storage = std::make_shared<Exl3Storage>();
   storage->checkpoint =
       std::make_shared<ex::Checkpoint>(ex::Checkpoint::Open(directory));
   std::filesystem::path patch;
   if (mtp && sidecar.GetMetadataString(kExl3MtpMixer))
     patch = Reference(path, sidecar, kExl3MtpMixer);
+  if (native && mtp) {
+    const auto candidate =
+        directory / "mtp_hyper_connection_mixer_patch.safetensors";
+    if (std::filesystem::is_regular_file(candidate))
+      patch = candidate;
+  }
   const auto digest = mtp ? PrepareExl3MtpMixer(*storage, c, patch)
                           : HeadersDigest(*storage->checkpoint);
-  CheckDigest(sidecar,
-              mtp ? "gufo.exl3.mtp_headers_sha256" : "gufo.exl3.headers_sha256",
-              digest);
+  if (!native)
+    CheckDigest(
+        sidecar,
+        mtp ? "gufo.exl3.mtp_headers_sha256" : "gufo.exl3.headers_sha256",
+        digest);
   return storage;
 }
 
@@ -565,7 +577,8 @@ std::optional<ModelWeights> LoadExl3Model(const std::filesystem::path& path,
       Fail("embedding must remain BF16");
     w.output = b.Linear("lm_head", w.config.hidden_size, w.config.vocab_size);
     w.hc_head = b.Mixer("model.language_model.hyper_connection_mixer.", false);
-    if (w.config.ple_layer >= 0) {
+    if (w.config.ple_layer >= 0 &&
+        !sidecar.GetMetadataBool("gufo.exl3.native").value_or(false)) {
       storage.ple_reader = core::GgufReader::OpenFile(
           Reference(path, sidecar, kExl3PleSource), error);
       if (!storage.ple_reader)
@@ -625,8 +638,19 @@ std::optional<MtpWeights> LoadExl3Mtp(const std::filesystem::path& path,
       Fail("MTP EXL3 metadata does not match trunk");
     w.config = *config;
     w.exl3_storage = Open(path, sidecar, w.config, true);
-    CheckDigest(sidecar, "gufo.exl3.headers_sha256",
-                HeadersDigest(*trunk.exl3_storage->checkpoint));
+    if (sidecar.GetMetadataBool("gufo.exl3.native").value_or(false)) {
+      const auto source = trunk.exl3_storage->checkpoint->GetMappedRegions();
+      const auto draft = w.exl3_storage->checkpoint->GetMappedRegions();
+      if (source.size() != draft.size())
+        Fail("native MTP must use the trunk pack");
+      for (std::size_t i = 0; i < source.size(); ++i)
+        if (!std::filesystem::equivalent(source[i].source_path,
+                                         draft[i].source_path))
+          Fail("native MTP must use the trunk pack");
+    } else {
+      CheckDigest(sidecar, "gufo.exl3.headers_sha256",
+                  HeadersDigest(*trunk.exl3_storage->checkpoint));
+    }
     Binder b{*w.exl3_storage, w.config};
     w.block = b.Layer(0, true);
     return w;

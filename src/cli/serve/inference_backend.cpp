@@ -33,6 +33,7 @@
 #include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/vision/image_cache.hpp"
+#include "src/models/qwen38_flash_next/native_metadata.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include "src/core/hip/committed_backing.hpp"
@@ -292,7 +293,8 @@ std::vector<std::uint8_t> DeepSeekCompatibilityIdentity(
 std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
     std::string_view artifact_fingerprint, std::string_view mtp_fingerprint,
     bool has_mtp, std::uint32_t max_context, std::uint32_t max_draft_tokens,
-    std::uint32_t decode_concurrency, std::string_view position_policy) {
+    std::uint32_t decode_concurrency, std::string_view position_policy,
+    bool native) {
   if (!IsSha256Hex(artifact_fingerprint)) {
     throw std::invalid_argument(
         "Qwen3.8-Flash-Next disk cache requires an artifact fingerprint");
@@ -302,11 +304,12 @@ std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
         "Qwen3.8-Flash-Next MTP disk cache requires a draft artifact "
         "fingerprint");
   }
+  const auto scheme =
+      native ? core::kNativeIdentityScheme : core::kGgufIdentityScheme;
   std::ostringstream identity;
   identity << "schema=gufo-text-continuation-v2\n"
            << "model_kind=qwen38-flash-next\n"
-           << "artifact_id=" << core::kGgufIdentityScheme << ':'
-           << artifact_fingerprint << '\n'
+           << "artifact_id=" << scheme << ':' << artifact_fingerprint << '\n'
            << "tokenizer=embedded-in-artifact\n"
            << "chat_template=qwen38-reasoning-compiled-v3\n"
            << "chat_template_reference_sha256="
@@ -320,8 +323,7 @@ std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
            << "adapters=none\n";
   if (has_mtp) {
     identity << "draft_backend=qfn-mtp-v1\n"
-             << "draft_artifact_id=" << core::kGgufIdentityScheme << ':'
-             << mtp_fingerprint << '\n'
+             << "draft_artifact_id=" << scheme << ':' << mtp_fingerprint << '\n'
              << "draft_max_tokens=" << max_draft_tokens << '\n'
              << "draft_cost_concurrency=" << decode_concurrency << '\n';
   }
@@ -2413,7 +2415,10 @@ bool FingerprintArtifact(std::string_view label, const core::GgufReader& reader,
   Logger::Info("loader", "event=load_phase phase=artifact_identity model=" +
                              std::string(label));
   try {
-    *fingerprint = core::GgufIdentityHex(reader);
+    *fingerprint =
+        reader.GetMetadataBool("gufo.exl3.native").value_or(false)
+            ? models::qwen38_flash_next::NativeArtifactIdentity(reader)
+            : core::GgufIdentityHex(reader);
   } catch (const std::exception& exception) {
     SetError(error, std::string("Failed to fingerprint ") + std::string(label) +
                         " GGUF: " + exception.what());
@@ -2424,9 +2429,11 @@ bool FingerprintArtifact(std::string_view label, const core::GgufReader& reader,
                                 .count();
   std::ostringstream message;
   message << "Fingerprinted " << label << " artifact ("
-          << core::kGgufIdentityScheme << ", " << reader.GetTensorCount()
-          << " tensors) in " << std::fixed << std::setprecision(0) << elapsed_ms
-          << " ms";
+          << (reader.GetMetadataBool("gufo.exl3.native").value_or(false)
+                  ? core::kNativeIdentityScheme
+                  : core::kGgufIdentityScheme)
+          << ", " << reader.GetTensorCount() << " tensors) in " << std::fixed
+          << std::setprecision(0) << elapsed_ms << " ms";
   Logger::Info("engine", message.str());
   return true;
 }
@@ -2435,10 +2442,11 @@ bool FingerprintArtifactFile(std::string_view label,
                              const std::filesystem::path& path,
                              std::string* fingerprint, std::string* error) {
   std::string open_error;
-  const auto reader = core::GgufReader::OpenFile(path, &open_error);
+  const auto reader =
+      models::qwen38_flash_next::OpenArtifactMetadata(path, &open_error);
   if (reader == nullptr) {
     SetError(error, std::string("Failed to open ") + std::string(label) +
-                        " GGUF for fingerprinting: " + open_error);
+                        " model for fingerprinting: " + open_error);
     return false;
   }
   return FingerprintArtifact(label, *reader, fingerprint, error);
@@ -2563,7 +2571,8 @@ public:
               use_mtp_, max_context_, max_draft_tokens_,
               model_->DecodeConcurrency(),
               models::qwen38_flash_next::RopePositionPolicy(
-                  model_->config().rope_scaling)),
+                  model_->config().rope_scaling),
+              model_->IsNativeExl3()),
           .payload_version =
               models::qwen38_flash_next::Session::kSnapshotPayloadVersion,
       };
@@ -3207,9 +3216,10 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
-  auto reader_owner = core::GgufReader::OpenFile(model_path, &load_error);
+  auto reader_owner =
+      models::qwen38_flash_next::OpenArtifactMetadata(model_path, &load_error);
   if (reader_owner == nullptr) {
-    SetError(error, "Failed to open GGUF: " + load_error);
+    SetError(error, "Failed to open model: " + load_error);
     return false;
   }
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
