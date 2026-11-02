@@ -1,5 +1,16 @@
 # Qwen3.8 Flash-Next experiments
 
+## Kyojin comparison follow-up, November 2, 2026
+
+No kernel changes. One qualified-image K17/D8 serving window passed all25
+requests and health checks. Chat/prose/code client medians41.67/34.65/57.25tok/s
+remain below public52.8/47.5/73.2 targets. Preserve the improvements and receipts;
+do not rerun controls. Cross-machine/pack/prompt differences and actual D depths
+are explicit in [comparison](../../../plan/exl3/F3-TGMTP-KYOJIN-COMPARISON.json).
+Next bottleneck attribution, if pursued, needs an ordinary prose prompt on the
+optimized ELF; the saved native profile predates the routed LDS fix.
+
+
 ## TG/MTP routed and HC optimization, November 2, 2026
 
 | Change | Evidence | Decision |

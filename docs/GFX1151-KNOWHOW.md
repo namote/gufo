@@ -1271,3 +1271,51 @@ identical; only FlashNext general kernels and routed-MoE TUs changed.
 [Qualification](../plan/exl3/F3-TGMTP-QUALIFICATION.json),
 [screens](../plan/exl3/F3-TGMTP-SCREENS.json),
 [flow inventory](../plan/exl3/F3-TGMTP-FLOW.json).
+
+## Kyojin target comparison, November 2, 2026
+
+The qualified TG/MTP image completed the frozen K17/D8 serving suites in one
+window (40.1s ready,95.6s K,175.9s D);25 measured requests and GPU health pass.
+No rebuild, baseline rerun or new numerical qualification. All17 historical K
+completion hashes agree; that is output continuity, not an independent oracle.
+
+C1, context49152, EXL3 5.05, pinned Nix ROCm10.1, KVarN k4v4, MTP+lookup,
+thinking off, temperature0, up to256tokens, prompt cache off. Client rate uses
+(completion_tokens−1)/(first-to-last useful SSE event span), matching pinned
+Kyojin bench.py; server decode rate is retained separately. Medians below are
+across distinct prompts, one pass each, not repeated-run confidence estimates.
+
+| Category | Prompts | Gufo client tok/s | Gufo server tok/s | Published Kyojin target | Client gap |
+|---|---:|---:|---:|---:|---:|
+| Chat | 3 | 41.67 | 41.83 | 52.8 | −21.08% |
+| Prose | 3 | 34.65 | 34.79 | 47.5 | −27.05% |
+| Code | 3 | 57.25 | 57.48 | 73.2 | −21.79% |
+| Multilingual | 4 | 38.94 | 39.09 | — | — |
+| Copy/edit | 4 | 64.63 | 65.00 | — | — |
+
+All three published category targets remain unmet. This is a cross-machine,
+cross-pack reference: Kyojin was not run locally. Frozen source2132bd2 has
+three card prompts/category, while today's public description says four.
+The saved published table is not a matched performance control.
+
+D labels are approximate: d8k actually contains7274–7509tokens; d32k contains
+27158–39256tokens. Client mixed-task medians are40.55 and35.61tok/s, respectively.
+Story subgroups are35.06/31.91; documentation subgroups47.56/43.26 (two each).
+Published Kyojin8K/32K essay rates52.2/51.1 are different workloads and exact
+depths. Do not call this a matched depth comparison. Server prefill medians
+1293.51/1280.75 also belong to these documentation inputs and the serving path;
+they do not replace the frozen fixed-pattern prefill benchmark.
+
+This confirms that79.31tok/s on the earlier repetitive lookup fixture is not
+a general-generation rate. Preserve current kernel improvements. Any next
+optimization should first attribute the remaining cost on a real prose prompt
+using this optimized ELF: dense/HC, draft+verify cost per committed token, and
+PLE/host waits. The prior native profile predates verifier LDS removal and
+cannot establish the new bottleneck; no new profile was run in this comparison.
+
+Receipt `fn-tgmtp-kd-nix101`; per-request client/server rates, output hashes,
+acceptance/lookup counts, runtime maps, frozen inputs and published-page SHA
+are retained in the comparison report. Existing numerical qualification and
+its NLL caveat remain unchanged. No Kyojin quality parity is claimed.
+
+[Comparison](../plan/exl3/F3-TGMTP-KYOJIN-COMPARISON.json).

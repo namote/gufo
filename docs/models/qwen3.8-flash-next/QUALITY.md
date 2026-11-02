@@ -1,5 +1,16 @@
 # Qwen3.8 Flash-Next quality
 
+## K/D serving follow-up, November 2, 2026
+
+All25requests completed with valid terminal usage/finish status, prompt caching
+off, and passing GPU health. All17historical K completion SHA256 values agree;
+there is no historical complete D control. This serving run is not a quality
+oracle or a Kyojin quality comparison. Reuse the existing TG/MTP numerical
+qualification below; its prefill NLL caveat is unchanged. Raw responses and
+client/server timings are preserved in the
+[comparison](../../../plan/exl3/F3-TGMTP-KYOJIN-COMPARISON.json).
+
+
 ## TG/MTP routed and HC optimization, November 2, 2026
 
 One combined final window passed numerical boundaries, the existing25AR/MTP
