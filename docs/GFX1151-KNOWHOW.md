@@ -1424,3 +1424,27 @@ routes. Do not start with2.77% drafthead approximation or previouslyfailed HC
 int8. C1greedy uses confidence afterinitialcycle; oldcostcurves alone do not
 establish a retuning opportunity. Batch small screens and final qualification.
 [All evidence and limitations](../plan/exl3/F3-KYOJIN-SAME-PACK.md).
+
+## Exact live-row routed verification, November 2, 2026
+
+Repeated ragged-row checks inside every K step were a material K5 R3/R4 cost.
+Selecting an exact live-row body once per tile retained dot/reduction/scaling
+order and improved cold gate/up21.38/32.03%, scaled down9.60/13.90%.
+Keep negative-exponent FP32 down and generic other rates/widths/full-precision.
+The retained path uses gate VGPR40/46, down54/58, zero private/LDS. Occupancy
+alone is not decisive: flat→global reduced gate VGPR38/40 to32/34 but R3/R4
+changed only+0.32/+0.33%; aligned-K additionally changed−0.44/−0.35%.
+Those casts/assumes were excluded. Prior prefill global-address-space neutrality
+was reused as context, not confused with this decode-path evaluation.
+Dense K7 TN2 already issues six raw loads before dot; no redundant experiment.
+
+Three small screens pass112 cases each, reusing one saved cold control series;
+64experts/62.5MiB avoids MALL-only timings. Final independent operators include
+K3..K7, partial/poison rows, zero/overcapacity/count guards and distinct z2 banks.
+One combined native5.05 window passes32760 identical collector rows, sampling,
+batches,32K/cache, and identical AR/MTP output hashes/work counts. MTP d0
+40.09→40.85tok/s (+1.90%); d32K78.53→79.48 is lookup-heavy and overlaps saved
+baseline spread. PP1426.88/1460.75 and AR25.20/24.49 are effectively unchanged.
+Do not equate component gains with whole-model gains. All baseline/prototype
+objects remain; no baseline/model remeasurement or extra pipeline profile.
+[Complete evidence and all measured shapes](../plan/exl3/F3-TGMTP-ROWS.md).

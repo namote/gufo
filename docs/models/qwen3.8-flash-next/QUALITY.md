@@ -1,5 +1,18 @@
 # Qwen3.8 Flash-Next quality
 
+## Exact live-row verification, November 2, 2026
+
+Retained scheduling-only K5 R3/R4 specialization passes one combined window:
+32760-position collector byte-identical to the saved native5.05 baseline,
+64head replays, independent routed operators across K3..K7, exact partial-row
+checks, count0/overcapacity/count guards, and distinct z2 gate/up banks.
+Sampling, mixed batches,32K state and cache continuation pass. Every repeated
+AR/MTP output hash and draft/acceptance/lookup count matches saved evidence.
+Negative-exponent FP32 down handling and all numerical tolerances are unchanged.
+Loaded CLR/ROCr are pinned Nix10.1; healthPASS. No new teacher/model precision
+claim: native-pack quality evidence transfers through identical collector bytes.
+[Full results and rejected candidates](../../../plan/exl3/F3-TGMTP-ROWS.md).
+
 ## Same-pack local Kyojin follow-up, November 2, 2026
 
 Same-pack Gufo MTP42.55/46.94/62.66tok/s versus saved Kyojin42.52/49.44/63.22

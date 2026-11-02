@@ -1,5 +1,22 @@
 # Qwen3.8 Flash-Next benchmarks
 
+## Exact live-row verification, November 2, 2026
+
+Native5.05/K6 n-gram, Nix ROCm10.1, kvarn-k4v4, two repeats per configured
+benchmark, one final candidate window against the saved native baseline:
+
+| Scope | Baseline tok/s | Candidate tok/s | Change |
+| --- | ---: | ---: | ---: |
+| PP2048 / PP8192 | 1423.76 / 1461.67 | 1426.88 / 1460.75 | +0.22% / -0.06% |
+| AR128 d0 / d32K | 25.20 / 24.43 | 25.20 / 24.49 | 0.00% / +0.25% |
+| MTP128 d0 / d32K | 40.09 / 78.53 | 40.85 / 79.48 | +1.90% / +1.21% |
+
+Outputs and cycle/draft/acceptance counts are unchanged. PP/AR are effectively
+neutral; d32K is lookup-heavy and its gain overlaps baseline spread.
+The21–32% routed component gain is not a whole-model claim. No new Kyojin run.
+Image `ai-tools/gufo-eval:f3-rows-91fce75a-rocm101`.
+[Full results and rejected candidates](../../../plan/exl3/F3-TGMTP-ROWS.md).
+
 ## Same-pack local Kyojin follow-up, November 2, 2026
 
 Same-pack Gufo MTP42.55/46.94/62.66tok/s versus saved Kyojin42.52/49.44/63.22

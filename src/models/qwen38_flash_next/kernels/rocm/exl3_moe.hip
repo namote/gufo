@@ -112,8 +112,8 @@ __device__ __forceinline__ float DotPairF32(Half2 w, Half2 x, float acc) {
 // One wave owns one output tile and up to eight actual rows of one expert.
 // No floating-point atomics or masked reads from absent assignment rows.
 template<int Bits, bool FullPrecision, unsigned MaxRows = 8,
-         bool Scaled = false>
-__global__ void RoutedGemv(const ex::DeviceLinear* gate,
+         bool Scaled = false, bool ExactRows = false>
+__device__ __forceinline__ void RoutedGemvBody(const ex::DeviceLinear* gate,
                            const ex::DeviceLinear* up,
                            const Exl3RouteTile* tiles, const unsigned* count,
                            const std::uint16_t* input, float* gate_y,
@@ -172,7 +172,7 @@ __global__ void RoutedGemv(const ex::DeviceLinear* gate,
       // per one-wave block on the pinned compiler, starving verification.
 #pragma unroll
       for (unsigned r = 0; r < MaxRows; ++r) {
-        if (r >= tile_rows.count)
+        if (!ExactRows && r >= tile_rows.count)
           continue;
         const auto* row =
             x + std::size_t{tile_rows.slots[r]} * k + kt * 16 + r0;
@@ -194,7 +194,7 @@ __global__ void RoutedGemv(const ex::DeviceLinear* gate,
   }
 #pragma unroll
   for (unsigned r = 0; r < MaxRows; ++r) {
-    if (r >= tile_rows.count)
+    if (!ExactRows && r >= tile_rows.count)
       continue;
     a[r] += __shfl_xor(a[r], 1, 32);
     b[r] += __shfl_xor(b[r], 1, 32);
@@ -213,6 +213,47 @@ __global__ void RoutedGemv(const ex::DeviceLinear* gate,
       y[lane / 4 + 8] = b[r] * scale;
     }
   }
+}
+
+// Select the live-row loop once per expert tile. Rechecking each absent
+// row in every K step is costly for ragged K5 verification. Keep generic
+// dispatch for other shapes and the unscaled full-precision down path.
+template<int Bits, bool FullPrecision, unsigned MaxRows = 8,
+         bool Scaled = false>
+__global__ void RoutedGemv(const ex::DeviceLinear* gate,
+                           const ex::DeviceLinear* up,
+                           const Exl3RouteTile* tiles, const unsigned* count,
+                           const std::uint16_t* input, float* gate_y,
+                           float* up_y, unsigned k, unsigned n,
+                           unsigned assignments,
+                           const std::int32_t* exponents) {
+  if (blockIdx.y >= *count)
+    return;
+  if constexpr (Bits == 5 && !FullPrecision &&
+                (MaxRows == 3 || MaxRows == 4)) {
+    switch (tiles[blockIdx.y].count) {
+      case 1:
+        RoutedGemvBody<Bits, FullPrecision, 1, Scaled, true>(gate, up, tiles,
+            count, input, gate_y, up_y, k, n, assignments, exponents);
+        return;
+      case 2:
+        RoutedGemvBody<Bits, FullPrecision, 2, Scaled, true>(gate, up, tiles,
+            count, input, gate_y, up_y, k, n, assignments, exponents);
+        return;
+      case 3:
+        RoutedGemvBody<Bits, FullPrecision, 3, Scaled, true>(gate, up, tiles,
+            count, input, gate_y, up_y, k, n, assignments, exponents);
+        return;
+      case 4:
+        if constexpr (MaxRows == 4) {
+          RoutedGemvBody<Bits, FullPrecision, 4, Scaled, true>(gate, up, tiles,
+              count, input, gate_y, up_y, k, n, assignments, exponents);
+          return;
+        }
+    }
+  }
+  RoutedGemvBody<Bits, FullPrecision, MaxRows, Scaled>(gate, up, tiles, count,
+      input, gate_y, up_y, k, n, assignments, exponents);
 }
 
 __global__ void RestoreDownAssignments(const ex::DeviceLinear* down,

@@ -1,6 +1,24 @@
 # EXL3 / Flash-Next F3 handoff (2026-11-02; native EXL3 qualified)
 
-## Latest: same-pack TG/MTP attribution
+## Latest: exact live-row verification retained
+
+K5 R3/R4 gate/up and scaled down choose the actual row loop once per tile.
+Native5.05 MTP d0=40.85tok/s versus saved40.09 (+1.90%); d32K=79.48 versus78.53
+(lookup-heavy, within saved spread). PP2048/8192=1426.88/1460.75, AR=25.20/24.49;
+prefill and AR preserved. Quality collector bytes, generated output hashes and
+all cycle/draft/acceptance counts unchanged. Operators, sampling, C2/4/6/8,
+32K state, cache and health pass in one combined final window.
+
+Local image `ai-tools/gufo-eval:f3-rows-91fce75a-rocm101`; qualified ELF91fce75a.
+Preserve `build/f3-tgmtp3/` and all prior Nix intermediates. Baselineb4ebe27c and
+saved screens remain; no baseline rerun. Cold component gains21–32% gate/up,
+10–14% down are not full-model gains. No Kyojin parity claim.
+Dense TN2 load grouping already exists; global-address-space/aligned-K probes
+were neutral. Do not repeat them. Saved b4ebe27c profile is pre-change evidence,
+still useful for unchanged dense K7; it is not a post-change latency profile.
+[Mechanism, final results and reusable evidence](F3-TGMTP-ROWS.md).
+
+## Previous: same-pack TG/MTP attribution
 
 Corrected neutral-greedy comparison using the same internal Kyojin pack:
 Gufo AR30.49/30.51/30.23, MTP42.55/46.94/62.66tok/s (prose/chat/code).

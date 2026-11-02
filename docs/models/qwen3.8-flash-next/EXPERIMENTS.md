@@ -1,5 +1,16 @@
 # Qwen3.8 Flash-Next experiments
 
+## Exact live-row verification, November 2, 2026
+
+Retained K5 R3/R4 gate/up and scaled-down specialization: select each tile's
+actual row loop once, preserving dot/reduction/scaling order and generic
+routes elsewhere. Cold component gains are21.38/32.03% gate/up and9.60/13.90%
+down; final native MTP d0 is40.09→40.85tok/s (+1.90%). Prefill/AR are unchanged
+within noise. Full quality/session/32K/cache and frozen outputs pass; one final
+combined window, saved baseline reused. Global-address-space and aligned-tail
+candidates were neutral and excluded; dense TN2 load grouping already exists.
+[Full results and rejected candidates](../../../plan/exl3/F3-TGMTP-ROWS.md).
+
 ## Same-pack local Kyojin follow-up, November 2, 2026
 
 Same-pack Gufo MTP42.55/46.94/62.66tok/s versus saved Kyojin42.52/49.44/63.22
