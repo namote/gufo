@@ -1,6 +1,25 @@
 # EXL3 / Flash-Next F3 handoff (2026-11-02; native EXL3 qualified)
 
-## Latest: local Kyojin measured; equality failed
+## Latest: same-pack TG/MTP attribution
+
+Corrected neutral-greedy comparison using the same internal Kyojin pack:
+Gufo AR30.49/30.51/30.23, MTP42.55/46.94/62.66tok/s (prose/chat/code).
+Saved Kyojin MTP42.52/49.44/63.22; no rerun. Gufo paired text matches3/3;
+Kyojin's earlier AR/MTP token/text gate failed3/3. Same files still differ in
+HC effective quantization, draft head, KV codec and runtime, and cross-engine
+outputs differ. These are single-pass observations, not statistical/pure-engine
+parity. Native5.05 selection remains unchanged; no new kernel speedup claimed.
+
+Current native5.05 real-prose64 profile afterwarm16: AR dense35.44%,experts20.39%;
+MTP experts27.43%,dense22.21%,draftsubsethead2.77% of decode span.
+Prior pre-LDSfix profile is historical. Reuse this new trace; next distinct
+operator candidates target denseK7 and routedK5R3/4, with small checks batched.
+Possible graph first-use/capture is not separated from expected eager work;
+do not call all gaps CPU waste. No full quality/PP sweep or rebuild repeated. Both completed windows
+healthPASS; first invalid penalty-default comparison was stopped and preserved.
+[Results, exact limits and next batch](F3-KYOJIN-SAME-PACK.md).
+
+## Local Kyojin measured; equality failed
 
 Kyojin and native K4 n-gram now reside on internal NVMe at
 `ai.tools/storage/models/llm/flash-next-exl3-kyojin/` (88.82 GiB).

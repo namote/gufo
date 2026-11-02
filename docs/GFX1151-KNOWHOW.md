@@ -1393,3 +1393,34 @@ including24.4GiB ngram; external originals/manifests remain. Streamed source
 hashes and destination sizes/fsync checked, no redundant full reread. Existing
 Gufo artifacts preserved. Infra432pass; no Gufo inference change.
 [Receipt and limitations](../plan/exl3/F3-KYOJIN-LOCAL.md).
+
+## Same-pack TG/MTP attribution, November 2, 2026
+
+Same internal Kyojin≈4bpw/K4 PLE, C1/context16384/neutral greedy256tokens:
+Gufo nativeb4ebe27c AR30.49/30.51/30.23, MTP42.55/46.94/62.66tok/s for
+prose/chat/code. Saved Kyojin MTP42.52/49.44/63.22 reused. Gufo text equality
+passes3/3; no rawoutput-ID claim. Effective HC/int8sidecar, drafthead, KVcodec
+and runtime still differ; cross-engine text differs. Single-pass MTP gaps
++0.08/−5.06/−0.89% do not establish statistical/pure-engine/quality parity.
+No inference change or model switch. First partial run inheritedpresence1.5,
+was stopped and preserved; corrected Gufo explicitlyneutral, Kyojin not rerun.
+Greedy temperature0 does not disable Gufo penalties: inspect effective defaults.
+
+Current native5.05 prose64 afterwarm16 (postverifierLDSfix): ARdense35.44%,
+routed20.39%,otherstable small14.82%,HCup7.20%; MTP routed27.43%,dense22.21%,
+otherstable9.88%,HCup5.12%,draftsubsethead2.77% of decodekernelspan.
+AR/MTP spans2579.785/2064.302ms, kernelactive90.13/78.24%; bothtextmatch and
+healthPASS. MTP28cycles/63drafts/35accepted.19,141directlaunches/4mallocs observed;
+possiblefirst-use/capture is not separated from expected eager work, and
+nonkernelspan is not proven removable CPU overhead.
+Range selection by Embed sequence excludeswarm/prefill: AR18,7; MTP18,17,1,7,6,
+then1-row decodeanchor. No unverifiedPython/roctracer clock join; serverdecode
+agrees within1ms. Replaynames retained, missinggridnotinvented. Tracer reused
+unchanged and preserved under ai.tools test/.../native_decode_trace.
+
+Prioritize distinct denseK7 load/reuse and routedK5R3/4 gate/up candidates;
+reuse rejected tile/prefetch ledger, preserve arithmetic and qualify realragged
+routes. Do not start with2.77% drafthead approximation or previouslyfailed HC
+int8. C1greedy uses confidence afterinitialcycle; oldcostcurves alone do not
+establish a retuning opportunity. Batch small screens and final qualification.
+[All evidence and limitations](../plan/exl3/F3-KYOJIN-SAME-PACK.md).

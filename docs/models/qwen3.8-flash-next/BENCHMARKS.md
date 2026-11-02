@@ -1,5 +1,18 @@
 # Qwen3.8 Flash-Next benchmarks
 
+## Same-pack local Kyojin follow-up, November 2, 2026
+
+Same-pack Gufo MTP42.55/46.94/62.66tok/s versus saved Kyojin42.52/49.44/63.22
+(prose/chat/code,256tokens,neutral greedy,C1/context16384). Gufo text equality
+passes3/3; no rawtoken or cross-engine quality parity claim. HC effective
+quantization/head/KV/runtime differ; all cross-engine texts differ. No new
+kernel change or default model switch. Current native5.05 profile attributes
+ARdense35.44% and MTPexperts27.43%/dense22.21%; retain as diagnostic evidence,
+not unprofiled speed. Both completed windows healthPASS; prior invalid default
+penalty attempt is preserved. Existing numerical qualification is not repeated.
+[Exact scope, receipts and next batch](../../../plan/exl3/F3-KYOJIN-SAME-PACK.md).
+
+
 ## Native EXL3 n-gram, November 2, 2026
 
 Native directory loading removes GGUF metadata/PLE dependencies for text/MTP.
@@ -38,7 +51,7 @@ across distinct prompts, one pass each, not repeated-run confidence estimates.
 | Copy/edit | 4 | 64.63 | 65.00 | — | — |
 
 All three published category targets remain unmet. This is a cross-machine,
-cross-pack reference: Kyojin was not run locally. Frozen source2132bd2 has
+cross-pack reference: Kyojin had not been run locally at that stage. Frozen source2132bd2 has
 three card prompts/category, while today's public description says four.
 The saved published table is not a matched performance control.
 

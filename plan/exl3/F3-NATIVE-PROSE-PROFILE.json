@@ -1,0 +1,383 @@
+{
+  "schema": 1,
+  "scope": "Native5.05 b4ebe27c C1 real prose64 afterwarm16, capacity16384, neutral greedy sampling. Diagnostic only; no unprofiled baseline repeated.",
+  "receipt": "tmp/test-results/gufo-upstream-port-20261023/fn-native-prose-profile-nix101/receipt/run",
+  "modes": {
+    "off": {
+      "source_sha256": "7618793ae0d66f52d887433c08a2ccf91e83dae53b96d0467501763fc6d71017",
+      "warm_and_prefill_excluded_gpu_kernels": 37024,
+      "measured_prefill_embed_rows": [
+        18,
+        7
+      ],
+      "decode_first_kernel": 37024,
+      "kernel_dispatches": 115603,
+      "kernel_span_ms": 2579.785057,
+      "kernel_union_ms": 2325.269626,
+      "kernel_active_percent": 90.1342388851584,
+      "families": {
+        "Dense EXL3": {
+          "calls": 12915,
+          "ms": 914.3833430000094,
+          "percent_of_span": 35.44416774253799
+        },
+        "Routed experts": {
+          "calls": 6048,
+          "ms": 526.1093230000002,
+          "percent_of_span": 20.39353323535435
+        },
+        "Other stable small projections (includes HC-down)": {
+          "calls": 11529,
+          "ms": 382.3623009999997,
+          "percent_of_span": 14.821479020606628
+        },
+        "HC-up K320": {
+          "calls": 6111,
+          "ms": 185.75657299999983,
+          "percent_of_span": 7.200467050383409
+        },
+        "Other support": {
+          "calls": 63754,
+          "ms": 163.68001799999783,
+          "percent_of_span": 6.344715330289543
+        },
+        "HC mixing": {
+          "calls": 12159,
+          "ms": 67.9358980000003,
+          "percent_of_span": 2.633393732383352
+        },
+        "GDN recurrence": {
+          "calls": 2268,
+          "ms": 53.20223900000007,
+          "percent_of_span": 2.0622740974346248
+        },
+        "Attention": {
+          "calls": 756,
+          "ms": 31.360678999999983,
+          "percent_of_span": 1.2156314695639383
+        },
+        "Embedding": {
+          "calls": 63,
+          "ms": 0.4792520000000001,
+          "percent_of_span": 0.018577206604852434
+        }
+      },
+      "top_kernels": {
+        "void gufo::hip::(anonymous namespace)::Exl3GemvKernel<7, 1u, 4u, 2u, 0>(gufo::hip::(anonymous namespace)::GemvArgs)": {
+          "calls": 5292,
+          "ms": 411.41243499999985
+        },
+        "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::SmallGemmKernel<(gufo::models::qwen38_flash_next::rocm::WeightType)1, 1u, false, true, true, false, false>(void const*, float const*, float*, unsigned int, unsigned int)": {
+          "calls": 11529,
+          "ms": 382.3623009999997
+        },
+        "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::RoutedGemv<5, false, 1u, false>(gufo::quant::exl3::DeviceLinear const*, gufo::quant::exl3::DeviceLinear const*, gufo::models::qwen38_flash_next::rocm::Exl3RouteTile const*, unsigned int const*, unsigned short const*, float*, float*, unsigned int, unsigned int, unsigned int, int const*)": {
+          "calls": 3024,
+          "ms": 339.0270000000001
+        },
+        "void gufo::hip::(anonymous namespace)::Exl3GemvKernel<7, 1u, 8u, 2u, 0>(gufo::hip::(anonymous namespace)::GemvArgs)": {
+          "calls": 3024,
+          "ms": 202.5311239999997
+        },
+        "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::RoutedGemv<5, false, 1u, true>(gufo::quant::exl3::DeviceLinear const*, gufo::quant::exl3::DeviceLinear const*, gufo::models::qwen38_flash_next::rocm::Exl3RouteTile const*, unsigned int const*, unsigned short const*, float*, float*, unsigned int, unsigned int, unsigned int, int const*)": {
+          "calls": 3024,
+          "ms": 187.08232300000032
+        },
+        "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::SmallGemmKernel<(gufo::models::qwen38_flash_next::rocm::WeightType)1, 1u, false, false, true, false, true>(void const*, float const*, float*, unsigned int, unsigned int)": {
+          "calls": 6111,
+          "ms": 185.75657299999983
+        },
+        "void gufo::hip::(anonymous namespace)::Exl3GemvKernel<6, 1u, 4u, 2u, 0>(gufo::hip::(anonymous namespace)::GemvArgs)": {
+          "calls": 63,
+          "ms": 135.497147
+        },
+        "void gufo::hip::(anonymous namespace)::Exl3GemvKernel<7, 1u, 4u, 4u, 0>(gufo::hip::(anonymous namespace)::GemvArgs)": {
+          "calls": 756,
+          "ms": 104.55811199999985
+        },
+        "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::GdnKernel<false>(float const*, float const*, float const*, float const*, float const*, float const*, float*, float*, gufo::models::qwen38_flash_next::rocm::RollbackRows, unsigned int, unsigned int, unsigned int, gufo::models::qwen38_flash_next::rocm::GdnBatchItem const*, unsigned int, gufo::models::qwen38_flash_next::rocm::GdnCheckpoint)": {
+          "calls": 2268,
+          "ms": 53.20223900000007
+        },
+        "void gufo::hip::(anonymous namespace)::Exl3GemvKernel<7, 1u, 16u, 2u, 1>(gufo::hip::(anonymous namespace)::GemvArgs)": {
+          "calls": 3024,
+          "ms": 53.17613499999998
+        },
+        "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::HcCombineKernel<float>(float*, float const*, float const*, unsigned int, float const*, float*, void*, unsigned int, unsigned int, float, void*)": {
+          "calls": 6048,
+          "ms": 47.0483760000001
+        },
+        "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::AttentionKernel<2u, true>(float const*, __half const*, __half const*, unsigned int const*, unsigned int, float*, float*, unsigned int const*, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int const*, unsigned int const*, unsigned int, unsigned int const*, gufo::models::qwen38_flash_next::rocm::KvarnReadView, unsigned int)": {
+          "calls": 756,
+          "ms": 31.360678999999983
+        },
+        "void gufo::hip::(anonymous namespace)::Exl3RotateInputKernel<1u>(float const*, unsigned long, unsigned int, unsigned int, gufo::hip::(anonymous namespace)::RotateArgs)": {
+          "calls": 9891,
+          "ms": 23.63340700000025
+        },
+        "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::HcMixEpilogueKernel<4u>(float const*, float const*, float const*, float*, float*, unsigned int, unsigned int, void*)": {
+          "calls": 6111,
+          "ms": 20.887521999999915
+        },
+        "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::RouterTopKKernel<512u>(float const*, unsigned int, int*, float*, unsigned int, unsigned int)": {
+          "calls": 3024,
+          "ms": 14.835290000000027
+        },
+        "gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::RestoreActivateRotate(gufo::quant::exl3::DeviceLinear const*, gufo::quant::exl3::DeviceLinear const*, gufo::quant::exl3::DeviceLinear const*, int const*, float*, float const*, unsigned short*, unsigned int)": {
+          "calls": 3024,
+          "ms": 13.089476999999961
+        }
+      },
+      "selected_api_counts": {
+        "hipStreamSynchronize": 62,
+        "hipGraphLaunch": 124
+      },
+      "usage": {
+        "prompt_tokens": 25,
+        "completion_tokens": 64,
+        "total_tokens": 89,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "cached_tokens": 0,
+        "prompt_tokens_per_second": 112.83233070524268,
+        "completion_tokens_per_second": 24.80563976994893,
+        "draft_tokens": 0,
+        "draft_tokens_accepted": 0,
+        "gufo": {
+          "cache_hit": false,
+          "cache_miss_reason": "disabled",
+          "cache_common_prefix_tokens": 0,
+          "cache_checkpoint_tokens": 0,
+          "cache_restore_bytes": 0,
+          "cache_snapshot_bytes": 0,
+          "cache_disk_queued_bytes": 0,
+          "cache_shared_bytes": 0,
+          "cache_restore_ms": 0,
+          "cache_snapshot_ms": 0,
+          "cache_disk_enqueue_ms": 0,
+          "cache_disk_hit": false,
+          "cache_shared_prefix_snapshots": 0,
+          "cache_shared_prefix_bytes": 0,
+          "cache_shared_prefix_ms": 0,
+          "draft_rounds": 0,
+          "prefill_tokens": 25,
+          "prefill_chunks": 2,
+          "active_decode_prefill_chunks": 0,
+          "max_prefill_chunk_tokens": 18,
+          "queue_depth_at_submit": 1,
+          "client_queue_depth_at_submit": 1,
+          "resident_requests_at_admission": 1,
+          "requested_logical_concurrency": 1,
+          "physical_execution_width": 1,
+          "queue_ms": 0.128942,
+          "shared_prefix_wait_ms": 0,
+          "prefill_ms": 221.5677,
+          "decode_ms": 2580.05843,
+          "ttft_ms": 221.750317,
+          "mean_inter_token_ms": 40.954106952380954,
+          "max_inter_token_ms": 42.53105,
+          "execution_plan": "serial-c1"
+        }
+      }
+    },
+    "mtp": {
+      "source_sha256": "775e9e7d26859587c8885a87798465e0109486d8bb877abd274fd55dbc5eaaf3",
+      "warm_and_prefill_excluded_gpu_kernels": 24031,
+      "measured_prefill_embed_rows": [
+        18,
+        17,
+        1,
+        7,
+        6
+      ],
+      "decode_first_kernel": 24031,
+      "kernel_dispatches": 59826,
+      "kernel_span_ms": 2064.30185,
+      "kernel_union_ms": 1615.210402,
+      "kernel_active_percent": 78.24487499248232,
+      "families": {
+        "Routed experts": {
+          "calls": 2920,
+          "ms": 566.3305679999994,
+          "percent_of_span": 27.43448435121053
+        },
+        "Dense EXL3": {
+          "calls": 6438,
+          "ms": 458.3786229999989,
+          "percent_of_span": 22.205019241735357
+        },
+        "Other stable small projections (includes HC-down)": {
+          "calls": 5580,
+          "ms": 204.01211599999962,
+          "percent_of_span": 9.882862624959603
+        },
+        "Other support": {
+          "calls": 34306,
+          "ms": 136.23826599999848,
+          "percent_of_span": 6.599726004217769
+        },
+        "HC-up K320": {
+          "calls": 3018,
+          "ms": 105.61661700000002,
+          "percent_of_span": 5.11633591763724
+        },
+        "Draft subset head": {
+          "calls": 68,
+          "ms": 57.26736499999999,
+          "percent_of_span": 2.774175927808232
+        },
+        "HC mixing": {
+          "calls": 5938,
+          "ms": 36.31692799999995,
+          "percent_of_span": 1.759283798539441
+        },
+        "GDN recurrence": {
+          "calls": 1044,
+          "ms": 33.238455000000044,
+          "percent_of_span": 1.610154784291844
+        },
+        "Attention": {
+          "calls": 416,
+          "ms": 17.147009,
+          "percent_of_span": 0.830644462194325
+        },
+        "Embedding": {
+          "calls": 98,
+          "ms": 0.6644550000000001,
+          "percent_of_span": 0.03218787988781777
+        }
+      },
+      "top_kernels": {
+        "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::RoutedGemv<5, false, 4u, false>(gufo::quant::exl3::DeviceLinear const*, gufo::quant::exl3::DeviceLinear const*, gufo::models::qwen38_flash_next::rocm::Exl3RouteTile const*, unsigned int const*, unsigned short const*, float*, float*, unsigned int, unsigned int, unsigned int, int const*)": {
+          "calls": 528,
+          "ms": 164.54578399999994
+        },
+        "void gufo::hip::(anonymous namespace)::Exl3GemvKernel<7, 4u, 4u, 2u, 0>(gufo::hip::(anonymous namespace)::GemvArgs)": {
+          "calls": 1764,
+          "ms": 142.1134959999998
+        },
+        "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::RoutedGemv<5, false, 3u, false>(gufo::quant::exl3::DeviceLinear const*, gufo::quant::exl3::DeviceLinear const*, gufo::models::qwen38_flash_next::rocm::Exl3RouteTile const*, unsigned int const*, unsigned short const*, float*, float*, unsigned int, unsigned int, unsigned int, int const*)": {
+          "calls": 480,
+          "ms": 125.29225999999997
+        },
+        "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::RoutedGemv<5, false, 4u, true>(gufo::quant::exl3::DeviceLinear const*, gufo::quant::exl3::DeviceLinear const*, gufo::models::qwen38_flash_next::rocm::Exl3RouteTile const*, unsigned int const*, unsigned short const*, float*, float*, unsigned int, unsigned int, unsigned int, int const*)": {
+          "calls": 528,
+          "ms": 80.01967499999988
+        },
+        "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::SmallGemmKernel<(gufo::models::qwen38_flash_next::rocm::WeightType)1, 4u, false, true, true, false, false>(void const*, float const*, float*, unsigned int, unsigned int)": {
+          "calls": 2016,
+          "ms": 79.14204900000006
+        },
+        "void gufo::hip::(anonymous namespace)::Exl3GemvKernel<7, 4u, 8u, 2u, 0>(gufo::hip::(anonymous namespace)::GemvArgs)": {
+          "calls": 1008,
+          "ms": 68.89963699999993
+        },
+        "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::SmallGemmKernel<(gufo::models::qwen38_flash_next::rocm::WeightType)1, 3u, false, true, true, false, false>(void const*, float const*, float*, unsigned int, unsigned int)": {
+          "calls": 1838,
+          "ms": 63.27662200000001
+        },
+        "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::RoutedGemv<5, false, 2u, false>(gufo::quant::exl3::DeviceLinear const*, gufo::quant::exl3::DeviceLinear const*, gufo::models::qwen38_flash_next::rocm::Exl3RouteTile const*, unsigned int const*, unsigned short const*, float*, float*, unsigned int, unsigned int, unsigned int, int const*)": {
+          "calls": 306,
+          "ms": 62.202731000000014
+        },
+        "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::RoutedGemv<5, false, 3u, true>(gufo::quant::exl3::DeviceLinear const*, gufo::quant::exl3::DeviceLinear const*, gufo::models::qwen38_flash_next::rocm::Exl3RouteTile const*, unsigned int const*, unsigned short const*, float*, float*, unsigned int, unsigned int, unsigned int, int const*)": {
+          "calls": 480,
+          "ms": 59.82884800000004
+        },
+        "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::HeadGemv<6>(gufo::quant::exl3::DeviceLinear, unsigned short const*, float*, unsigned int, unsigned int const*)": {
+          "calls": 68,
+          "ms": 57.26736499999999
+        },
+        "void gufo::hip::(anonymous namespace)::Exl3GemvKernel<6, 4u, 4u, 2u, 0>(gufo::hip::(anonymous namespace)::GemvArgs)": {
+          "calls": 92,
+          "ms": 48.003166
+        },
+        "void gufo::hip::(anonymous namespace)::Exl3GemvKernel<7, 2u, 4u, 2u, 0>(gufo::hip::(anonymous namespace)::GemvArgs)": {
+          "calls": 522,
+          "ms": 40.32656899999997
+        },
+        "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::SmallGemmKernel<(gufo::models::qwen38_flash_next::rocm::WeightType)1, 4u, false, false, true, false, true>(void const*, float const*, float*, unsigned int, unsigned int)": {
+          "calls": 1070,
+          "ms": 38.89705600000004
+        },
+        "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::SmallGemmKernel<(gufo::models::qwen38_flash_next::rocm::WeightType)1, 2u, false, true, true, false, false>(void const*, float const*, float*, unsigned int, unsigned int)": {
+          "calls": 1140,
+          "ms": 38.51260900000001
+        },
+        "void gufo::hip::(anonymous namespace)::Exl3GemvKernel<7, 4u, 4u, 4u, 0>(gufo::hip::(anonymous namespace)::GemvArgs)": {
+          "calls": 263,
+          "ms": 37.363998999999986
+        },
+        "void gufo::models::qwen38_flash_next::rocm::(anonymous namespace)::SmallGemmKernel<(gufo::models::qwen38_flash_next::rocm::WeightType)1, 3u, false, false, true, false, true>(void const*, float const*, float*, unsigned int, unsigned int)": {
+          "calls": 978,
+          "ms": 34.20212499999999
+        }
+      },
+      "selected_api_counts": {
+        "hipGraphLaunch": 116,
+        "hipStreamSynchronize": 152,
+        "hipMalloc": 4,
+        "hipMemcpyAsync": 848,
+        "hipLaunchKernel": 19141
+      },
+      "usage": {
+        "prompt_tokens": 25,
+        "completion_tokens": 64,
+        "total_tokens": 89,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "cached_tokens": 0,
+        "prompt_tokens_per_second": 110.9496320579571,
+        "completion_tokens_per_second": 30.99489766014369,
+        "draft_tokens": 63,
+        "draft_tokens_accepted": 35,
+        "gufo": {
+          "cache_hit": false,
+          "cache_miss_reason": "disabled",
+          "cache_common_prefix_tokens": 0,
+          "cache_checkpoint_tokens": 0,
+          "cache_restore_bytes": 0,
+          "cache_snapshot_bytes": 0,
+          "cache_disk_queued_bytes": 0,
+          "cache_shared_bytes": 0,
+          "cache_restore_ms": 0,
+          "cache_snapshot_ms": 0,
+          "cache_disk_enqueue_ms": 0,
+          "cache_disk_hit": false,
+          "cache_shared_prefix_snapshots": 0,
+          "cache_shared_prefix_bytes": 0,
+          "cache_shared_prefix_ms": 0,
+          "draft_rounds": 28,
+          "prefill_tokens": 25,
+          "prefill_chunks": 2,
+          "active_decode_prefill_chunks": 0,
+          "max_prefill_chunk_tokens": 18,
+          "queue_depth_at_submit": 1,
+          "client_queue_depth_at_submit": 1,
+          "resident_requests_at_admission": 1,
+          "requested_logical_concurrency": 1,
+          "physical_execution_width": 1,
+          "queue_ms": 0.155764,
+          "shared_prefix_wait_ms": 0,
+          "prefill_ms": 225.327471,
+          "decode_ms": 2064.8559870000004,
+          "ttft_ms": 225.540507,
+          "mean_inter_token_ms": 32.77525973015872,
+          "max_inter_token_ms": 161.618893,
+          "execution_plan": "serial-c1"
+        }
+      }
+    }
+  },
+  "text_equal": true,
+  "limits": [
+    "Python monotonic_ns not used to select GPU ranges; no unverified cross-clock join.",
+    "HTTP prefill split25=18+7 is visible in each mode. MTP each prefill proactively caches n-1 draft rows; anchor catch-up between chunks remains prefill.",
+    "Graph replay dispatch names preserved; absent replay launch grid/stream is not invented.",
+    "Kernel active percentage is time occupancy, not ALU utilization; selected11HIPAPI calls are not complete host attribution.",
+    "Warm16 does not guarantee every later MTP width or routing state is warmed; capture/allocation overhead can remain.",
+    "One short prose fixture; no full quality or long-context/sampled/concurrent generalization."
+  ]
+}
