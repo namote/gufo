@@ -1349,3 +1349,20 @@ EOS from generation EOS, match native MTP to trunk shards, and bind persistent
 identity to full payloads plus all metadata and source stamps. Preserve the
 existing Nix volume/objects; only the completed export's new unused BuildKit
 records were cleaned after packaging. [Evidence](../plan/exl3/F3-NATIVE-PACK.json).
+
+## Native PLE host attribution, November 2, 2026
+
+Prior GPU profiles began at EmbedKernel and omitted pre-embedding host work.
+Ordinary embeddings run on GPU; native PLE reads/dequantizes on CPU, even on
+compressed-cache hits, into coherent mapped memory consumed by the GPU.
+A separate host-only diagnostic retains production graphs/kernels. Nonoverlap
+PleFetch+WaitPle+PrefetchPle was6.54/1420.88ms forPP2048 and25.48/5558.23ms
+forPP8192 (both0.46%); AR12888.31/5073.33ms (1.74%), MTP12853.73/3182.50ms
+(1.69%). Prefix/warmup excluded as appropriate; nested read scopes not summed.
+AR/MTP outputs match saved native64c0a14b, MTP54cycles/114drafts/74accepted.
+Health/runtime/no-GGUF checks pass. No production change or baseline rerun.
+These are instrumented host durations, partly overlapped with GPU work; logging
+can hide waits. No uninstrumented-stall bound, worker/SSD bandwidth interference,
+GPU mapped-quantizer attribution or cold/prose generalization is established.
+Observed host cost is small here; profile those unresolved costs before a large
+loader rewrite. [Evidence and scope](../plan/exl3/F3-PLE-HOST-PROFILE.md).

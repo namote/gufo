@@ -1,0 +1,245 @@
+{
+  "scope": "Instrumented host wall time only; GPU overlap and logging prevent claiming an uninstrumented exposed-stall bound.",
+  "cases": {
+    "pp": {
+      "scope_counts": {
+        "StartRead": 6,
+        "WaitRead": 7,
+        "PleFetch": 6,
+        "WaitPle": 6,
+        "PrefetchPle": 2,
+        "Forward": 6
+      },
+      "rates": [
+        [
+          "pp2048",
+          "1441.35"
+        ],
+        [
+          "pp8192",
+          "1473.84"
+        ]
+      ],
+      "output_sha256": [],
+      "phases": {
+        "pp2048_first_untimed": {
+          "forwards": 1,
+          "token_rows": 2048,
+          "forward_ms": 1464.942739,
+          "scope_ms": {
+            "StartRead": 0.416623,
+            "WaitRead": 2.493889,
+            "PleFetch": 1.367781,
+            "WaitPle": 2.521994,
+            "PrefetchPle": 0
+          },
+          "nonoverlapping_ple_host_ms": 3.8897749999999998,
+          "ple_host_percent_of_forward": 0.26552403015118803
+        },
+        "pp2048_measured": {
+          "forwards": 1,
+          "token_rows": 2048,
+          "forward_ms": 1420.877186,
+          "scope_ms": {
+            "StartRead": 3.050546,
+            "WaitRead": 3.395419,
+            "PleFetch": 3.141885,
+            "WaitPle": 3.399698,
+            "PrefetchPle": 0
+          },
+          "nonoverlapping_ple_host_ms": 6.541582999999999,
+          "ple_host_percent_of_forward": 0.46039045910896903
+        },
+        "pp8192_untimed": {
+          "forwards": 2,
+          "token_rows": 8192,
+          "forward_ms": 5550.950148,
+          "scope_ms": {
+            "StartRead": 5.795285,
+            "WaitRead": 14.705760999999999,
+            "PleFetch": 3.198725,
+            "WaitPle": 18.399203,
+            "PrefetchPle": 16.038624
+          },
+          "nonoverlapping_ple_host_ms": 37.636552,
+          "ple_host_percent_of_forward": 0.6780199965146579
+        },
+        "pp8192_measured": {
+          "forwards": 2,
+          "token_rows": 8192,
+          "forward_ms": 5558.23441,
+          "scope_ms": {
+            "StartRead": 6.47925,
+            "WaitRead": 14.796489,
+            "PleFetch": 3.410067,
+            "WaitPle": 18.67436,
+            "PrefetchPle": 3.39079
+          },
+          "nonoverlapping_ple_host_ms": 25.475217,
+          "ple_host_percent_of_forward": 0.45833290071693833
+        }
+      }
+    },
+    "tg-off": {
+      "scope_counts": {
+        "StartRead": 129,
+        "WaitRead": 130,
+        "PleFetch": 129,
+        "WaitPle": 129,
+        "PrefetchPle": 0,
+        "Forward": 129
+      },
+      "rates": [
+        [
+          "tg128",
+          "25.23"
+        ]
+      ],
+      "output_sha256": [
+        "64c0a14b57711d22c337c8a496f6fd1c7805d751c51b722909cdcae195ec5748"
+      ],
+      "prefix": {
+        "forwards": 1,
+        "token_rows": 16,
+        "forward_ms": 169.123335,
+        "scope_ms": {
+          "StartRead": 0.192536,
+          "WaitRead": 0.000491,
+          "PleFetch": 0.221613,
+          "WaitPle": 0.461401,
+          "PrefetchPle": 0
+        },
+        "nonoverlapping_ple_host_ms": 0.683014,
+        "ple_host_percent_of_forward": 0.40385556493431257
+      },
+      "decode": {
+        "forwards": 128,
+        "token_rows": 128,
+        "forward_ms": 5067.395594,
+        "scope_ms": {
+          "StartRead": 4.33218,
+          "WaitRead": 83.649399,
+          "PleFetch": 4.455142,
+          "WaitPle": 83.853886,
+          "PrefetchPle": 0
+        },
+        "nonoverlapping_ple_host_ms": 88.309028,
+        "ple_host_percent_of_forward": 1.742690626020227,
+        "bench_ms_from_rounded_rate": 5073.3254062623855,
+        "ple_host_percent_of_bench": 1.74065373159375
+      },
+      "statistics": [
+        "Qwen3.8-Flash-Next tg depth=0 cycles=0 drafted=0 accepted=0 lookup_proposed=0 lookup_accepted=0 output_sha256=64c0a14b57711d22c337c8a496f6fd1c7805d751c51b722909cdcae195ec5748"
+      ],
+      "counts": {
+        "cycles": 0,
+        "drafted": 0,
+        "accepted": 0,
+        "lookup_proposed": 0,
+        "lookup_accepted": 0
+      }
+    },
+    "tg-mtp": {
+      "scope_counts": {
+        "StartRead": 55,
+        "WaitRead": 56,
+        "PleFetch": 55,
+        "WaitPle": 55,
+        "PrefetchPle": 0,
+        "Forward": 55
+      },
+      "rates": [
+        [
+          "tg128",
+          "40.22"
+        ]
+      ],
+      "output_sha256": [
+        "64c0a14b57711d22c337c8a496f6fd1c7805d751c51b722909cdcae195ec5748"
+      ],
+      "prefix": {
+        "forwards": 1,
+        "token_rows": 16,
+        "forward_ms": 173.502705,
+        "scope_ms": {
+          "StartRead": 0.192385,
+          "WaitRead": 0.000722,
+          "PleFetch": 0.223396,
+          "WaitPle": 0.016191,
+          "PrefetchPle": 0
+        },
+        "nonoverlapping_ple_host_ms": 0.23958700000000002,
+        "ple_host_percent_of_forward": 0.13808833700892448
+      },
+      "decode": {
+        "forwards": 54,
+        "token_rows": 168,
+        "forward_ms": 2866.457958,
+        "scope_ms": {
+          "StartRead": 5.255974,
+          "WaitRead": 48.222243,
+          "PleFetch": 5.399126,
+          "WaitPle": 48.328441,
+          "PrefetchPle": 0
+        },
+        "nonoverlapping_ple_host_ms": 53.727567,
+        "ple_host_percent_of_forward": 1.8743539164791057,
+        "bench_ms_from_rounded_rate": 3182.496270512183,
+        "ple_host_percent_of_bench": 1.688220894328125
+      },
+      "statistics": [
+        "Qwen3.8-Flash-Next tg depth=0 cycles=54 drafted=114 accepted=74 lookup_proposed=0 lookup_accepted=0 output_sha256=64c0a14b57711d22c337c8a496f6fd1c7805d751c51b722909cdcae195ec5748"
+      ],
+      "counts": {
+        "cycles": 54,
+        "drafted": 114,
+        "accepted": 74,
+        "lookup_proposed": 0,
+        "lookup_accepted": 0
+      }
+    }
+  },
+  "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-ple-profile-nix101",
+  "revision": "1c16241f",
+  "production_unchanged": true,
+  "baseline_repeated": false,
+  "full_quality_repeated": false,
+  "health_PASS": true,
+  "inputs": {
+    "profile.hpp": "76d9b34a2045cb136db7beee9e1b9ade1797c922730dbd6b1f62f0f4807ede46",
+    "ngram.cpp": "a66ffc6d54c0d0c9cc6b8cfe692c2242b55c90dcc1124a377d8f4026c59db24a",
+    "executor.cpp": "ec7a59da3ecaf73fab7d81ef0f9e98bb82effce2e137ed9a36d49b24e16ffeda",
+    "COMPILE.json": "430b2d20657b599d59674c7760fedcc030d567acf59a4b775744f7e82691e768",
+    "LINK.json": "67db2128aae701538371cde972e2a086259906dc0dfe2096fa5da73513a06275",
+    "build.py": "00993a204ecd4545c7604fb983a3a501826d2553a190f68555dca26aed0a7993",
+    "gufo": "80f861d0d6aba794663a88c1e3d122f14c11aa4122456d04828cb8ddd62b4114"
+  },
+  "receipt_sha256": {
+    "FENCE-0001.json": "89f02745bcf53876ea3dceba63de35908321033e248ee1a80c0bade8e9d29cc6",
+    "FENCE-0001.txt": "14bb716cbd64e80c6c883afa50e5bb79cae0d9d9c747d48a9541e56143f18bfd",
+    "FENCE-0002.json": "21f6f9120ba9707c4b8f6c51736c391ab87b059d735078b126ae83020542e028",
+    "FENCE-0002.txt": "8a49190249d1958a0c657905016b436a8b4c8480c4548177bef7274c24eefc26",
+    "KERNEL-BASELINE.txt": "c27a2612e2b18156568d880a510869fbcc74d3a227b1157c92e9fc922dce882b",
+    "KERNEL-DELTA-0001.txt": "9a7224c4b185987c89450badd4c03dcda576e415f3f21b9ec7ab144cab7c745c",
+    "WINDOW.json": "40639703ee9ab0120ee30ddff23e70b7fbc1996c421bb744de655b12663c72f0",
+    "receipt/run/ANALYSIS.json": "c09328c4fd7512dd8675578e510b72b510afb3c182adbc6e3f2a4fc14285cc73",
+    "receipt/run/MANIFEST.json": "8f0d4e741155f9207ee942848a6555d8c2f3e51878cb0ed6c4acb576ee3eed58",
+    "receipt/run/RESULT.json": "492ff9ac4d0762dbd76773ec747a5483f56c4284c83bc9c8904826bbf4db04d1",
+    "receipt/run/ple-profile.log": "881008236d0c31f8cb73b2a871700cd093b143068dc5f9c9c2ecaa5d09660852",
+    "receipt/run/pp-maps.txt": "341e983834f4938286aa738cb82703ac07c3fc6977f2fcf60f0eb57774639e23",
+    "receipt/run/pp.log": "7a5df28a928ecc7b28a8365b66ca3984d3567830cdb7a5b76726100414e73d20",
+    "receipt/run/tg-mtp-maps.txt": "a8bcb0afa899402b8d9d0fa71e741c341dda9cfa04bbacb9b7edb78d414af5ca",
+    "receipt/run/tg-mtp.log": "46f7b4ed028662a43810a7f8a9ac03cdd77681d3ac842976d1d6d31c7ca623f6",
+    "receipt/run/tg-off-maps.txt": "3325673cc9a81bbddfec58911aab999f3d3a75b19ec3d5ed3f94036724ad956f",
+    "receipt/run/tg-off.log": "104ad83e560475f37f06e65703c886a4fdbc039283be1764319a6c84edf36904"
+  },
+  "limits": [
+    "No GPU activity trace: host waits can overlap queued GPU prefix.",
+    "stderr logging permits background progress; no strict uninstrumented-stall bound.",
+    "Does not isolate CPU dequant from SSD service, worker scheduling or duplicate row copies.",
+    "Does not measure worker/GPU shared-bandwidth interference or mapped PLE quantizer cost.",
+    "PP fixed-pattern benchmark and shallow TG output only; no cold-cache flush or long-context prose claim.",
+    "Diagnostic rates do not replace clean saved performance qualification."
+  ],
+  "identity_note": "Generic harness RESULT.json has inherited source/binary labels, not mounted diagnostic identity. Authoritative identity is inputs (also INPUTS.json and receipt MANIFEST.json). Production remains b4ebe27c; instrumented ELF 80f861d0d6aba794663a88c1e3d122f14c11aa4122456d04828cb8ddd62b4114."
+}

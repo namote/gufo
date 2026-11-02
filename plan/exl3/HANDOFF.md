@@ -1,5 +1,16 @@
 # EXL3 / Flash-Next F3 handoff (2026-11-02; native EXL3 qualified)
 
+## Latest: CPU PLE diagnostic
+
+Native production selection below is unchanged. A bounded host-timing run finds
+PLE host work0.46% of PP2048/8192 and1.74%/1.69% of AR/MTP128 on the current
+fixture. Outputs and MTP counts match the saved native run; healthPASS.
+The old first-Embed GPU trace omitted CPU setup. This diagnostic addresses host
+waits only, not worker/shared-bandwidth or GPU mapped-memory costs; cold/prose
+behavior remains unresolved. No baseline/full quality rerun.
+[Evidence and exact limitations](F3-PLE-HOST-PROFILE.md).
+
+
 ## Current native EXL3 selection, November 2, 2026
 
 **Use the pack directory directly; no GGUF metadata/PLE dependency.**
