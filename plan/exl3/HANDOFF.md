@@ -1,84 +1,60 @@
-# EXL3 / Flash-Next F3 handoff (2026-11-02; qualified shared-MoE/KVarN batch)
+# EXL3 / Flash-Next F3 handoff (2026-11-02; qualified HC/MoE batch6)
 
-Latest source candidate: HC MoE combine operand-load grouping, exact after
-pinning the original two-product restore order. Synthetic fused operator
-−8.87% plain/−8.93% after write pressure; actual production two-TU replay and
-independent irregular-scale oracle pass. Extra DPP transport is not selected.
-[Frozen screens/failed prototype/actual-object proof](F3-HC-LOAD-SCREENS.json).
-Source is selected; qualified image and1429.13tok/s remain unchanged pending
-one combined model qualification with other pending work. Do not repeat these
-screens or the HCmix gate-load hoist (already present in ISA).
+## HC/MoE combined qualification, November 2, 2026
 
-Latest kernel follow-up: dead16-row B staging plus the redundant K-tail
-check were implemented and screened, with144 boundary/exponent checks exact.
-Raw gate/down improve about1%; current shared-side2048 span14.7609→14.6878ms,
-5128.55525→8.59501ms. Small mixed historical differences remain advisory.
-The [narrow K5 Mode3 patch](F3-MOE-STAGING-CANDIDATE.patch) is preserved for a
-later combined batch, not applied to production or qualified by a new model
-run. [Receipts/resources/source closure](F3-MOE-STAGING-SCREENS.json).
-Reuse all controls and intermediate builds. HC follow-up is recorded above; do not rerun a full profile or this screen.
+HC operand-load grouping and K5 Mode3 dead-subtile/K-tail staging are now
+qualified together on pinned Nix ROCm10.1. Dense K7 K-tail removal is not
+selected. Current image: `ai-tools/gufo-eval:f3-prefill6-f15434b2-rocm101`,
+as-built `1dbee4d6-prefill6-f15434b2`.
 
-Current-version profiling is complete at the user's request. Exact shared5,
-Nix10.1, pp2048/d0/k4v4/context4096: measured GPU span1434.413ms, kernel busy
-99.676%. Main-stream MoE matrices32.31%, HC-family mixing/projections (including fused MoE combine)22.74%, dense
-EXL3 matrices20.62%; routed gate/up alone303.137ms. Shared-side342.044ms is
-mostly overlapped (340.764ms), not additive latency or net savings. Further
-launch grouping is a lower priority than work inside those kernels/passes.
-[Current profile, raw evidence and limits](F3-CURRENT-PREFILL-PROFILE.json).
-No engine change, baseline run or new throughput qualification.
+| Case | Saved shared5 tok/s | Qualified tok/s | Change |
+|---|---:|---:|---:|
+| pp512 | 1068.58 ±3.09 | 1078.15 ±.40 | +.90% |
+| pp2048 | 1429.13 ±1.13 | 1435.59 ±.07 | +.45% |
+| pp8192 | 1460.97 ±.73 | 1466.18 ±1.12 | +.36% |
+| pp2048 at d32768 | 1301.99 ±1.41 | 1311.98 ±1.03 | +.77% |
 
-Latest follow-up: routed K5 gate/up single-launch grouping was screened and
-not promoted. It is exact on saved512/2048 shared/combined/raw-down outputs,
-but with shared overlap takes8.65352/14.89320ms versus saved8.55525/14.76090ms.
-These small historical differences are advisory; no useful gain and no code
-simplification. Four launches become two with unchanged105/149VGPR and no
-private/spills. Prototype is preserved; no baseline/profile/full-model rerun.
-[Screen and limits](F3-GROUPED-MOE-SCREEN.json). Qualified code/image below stay unchanged.
+One fresh32760-record/64-head-replay FP16-KV collector is byte-exact to the
+saved Nix baseline; affected full-FFN1025/shared-state and expert/final-tail
+checks pass. Performance uses k4v4/temp0/seed314159/r2. The initial pp2048
+1342.22±103.86 was inconclusive. A shortened-list replay inadvertently changed
+context8193→4096 and is diagnostic only; the final d0 replay restored the
+original512,2048,8192 list and8193 capacity. All attempts are retained; no
+baseline, correctness or d32K rerun. Target2000 is still unmet.
+[Qualification, runtime/code identities and all attempts](F3-PREFILL-BATCH6-QUALIFICATION.json).
 
-Latest qualified pp2048 is **1429.13±1.13 tok/s**, +.89% versus saved1416.51
-and+2.07% versus the earlier1400.15. Other final cases: pp5121068.58±3.09,
-pp81921460.97±.73, d32Kpp20481301.99±1.41 (+.52/.93/.85%). **Target2000 is
-not reached.** The requested stream-then-kernel investigation is complete for
-this concrete batch; no claim of exhausting every future algorithm is made.
+Retained this batch: HC grouped raw/SVH/shared reads preserve the original
+restore rounding; K5 Mode3 skips wholly dead16-row B preparation and the
+invariant K-tail check. Both are defaults, with no switches/workspace.
+[HC screens](F3-HC-LOAD-SCREENS.json), [MoE screens](F3-MOE-STAGING-SCREENS.json).
+The saved [MoE patch](F3-MOE-STAGING-CANDIDATE.patch) is now applied; do not
+apply it twice. Completed TG/MTP code is retained; this batch does not requalify those modes.
 
-Retained: shared EXL3 MLP starts before router/top-k on the side stream with
-its own rotated operands/descriptors (41.25MiB at4224×2560), and KVarN standard-
-deviation selection stays in registers, removing80B private arrays. All79
-EXL3 matrix variants had no private/spill issue; do not repeat a spill-driven
-matrix split without new evidence. Completed TG/MTP code remains unchanged.
+Dense K7 K-tail screening is exact but not selected: QKV+5.98% and mixed
+smaller results against historical controls. Other inspected address/LDS
+scheduling already exists. [ISA and all results](F3-DENSE-KTAIL-SCREEN.json).
+No repeat tile/cache/buffering/gate-load sweep is justified without a new
+mechanism. A larger algorithm/schedule remains research, not a ready win.
 
-Q/KV overlap is not retained. Its whole-model-only result was neutral, and
-combining it with shared overlap regressed1.27–1.66%. Dedicated Q events did
-not recover baseline. Q group/attention source is restored to the qualified
-baseline. GDN Z, gate/up, heterogeneous grouping and smaller-LDS screens have
-explicit dispositions; remaining alpha/beta, PLE and broader pipeline ideas
-are unmeasured research leads. See [stream decisions](F3-STREAM-OVERLAP.md),
-[all screen records](F3-STREAM-SCREENS.json), and
-[actual resource audit](F3-RELEASE-RESOURCE-AUDIT.json).
+The saved pre-batch6 shared5 profile remains the bottleneck map: MoE32.31%,
+HC-family22.74% including routed combine, dense20.62%,99.676% kernel-active
+(not ALU utilization). [Raw profile](F3-CURRENT-PREFILL-PROFILE.json). It is
+not a new profile of batch6. No current-batch full profile was repeated.
+Earlier shared-MoE overlap/KVarN register selection stays retained; Q/KV overlap
+and the previous rejected schedules remain rejected. [Stream qualification](F3-STREAM-QUALIFICATION.json).
 
-Image: `ai-tools/gufo-eval:f3-shared5-703d3e77-rocm101`, ID`2184da9f…`.
-As-built source: `534c0f00-shared5-703d3e77`; source patchSHA703d3e77….
-Final receipt: `ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-shared5-nix101`.
-[Qualification](F3-STREAM-QUALIFICATION.json) contains installed binary hashes,
-actual patched ROCr/CLR10.1 mappings and all performance/accuracy scopes.
+The batch6 build keeps all original Nix CMake objects/archives and links three
+production replacements.74 GPU codeobjects are identical to shared5; exactly
+three changed, with unchanged kernel-name sets/multiplicities. K5 cold/hot
+103/148VGPR and HC96VGPR have no private/spills. Preserve intermediates,
+baselines and rejected prototypes. Root free-space floor150GiB; unused Python
+package and Docker packaging caches were reclaimed. The main folder's existing
+untracked `.dockerignore` must remain untouched. No push was performed.
 
-Final-image1025-row full-FFN test matches serial residuals, logits, convolution
-history and recurrent state, including four shared forks and a1-row tail.
-Flash-Next and Qwen KVarN CPU-oracle tests pass. The32760-record/64head-replay
-FP16-KV fullcollector is **supporting evidence reused from the combined image**,
-with retained MoE source equality and restored baseline Q code; no fresh
-fullcollector on the cleaned final image is claimed. KVarN correctness is
-separate operator/state evidence; performance usesk4v4. Prior hc7 NLL drift
-+.006600 remains. No baseline model or full profile was repeated.
-
-Qualified code commit: `da1fd6a8` (source identity, not a rebuilt image).
-Current source/integration attestation is recorded in
-[F3-INTEGRATION-BATCH5.json](F3-INTEGRATION-BATCH5.json). It does not relabel the
-already tested image. Nix10.1 incremental objects, frozen candidate binaries,
-source patches, controls and rejected images are preserved. Unused Docker
-build cache and redundant batch2/3 packaging staging copies were reclaimed;
-those baseline images remain. Root free-space floor stays150GiB. The main
-folder's pre-existing untracked `.dockerignore` must remain untouched.
+Current continuation: the concrete bounded batch is fully qualified. Reuse its
+results; do not start another long test for each small idea. Future work needs
+a distinct mechanism with small operator evidence first. Target2000 remains
+unmet; no claim of exhausting all possible algorithms is made.
 
 ## Previous qualified matrix batch
 
@@ -302,7 +278,7 @@ pp2048. That is an estimate and has not been measured.
 - Code cleanups flagged: stale dispatch comments, the ISA help path, bench vs
   production no-SLP flags, and profiler classification of EXL3 kernels.
 
-## Resume order
+## Historical resume order (superseded by current continuation above)
 
 1. T1 probe on `966f84b8` (EXL3 only, docker binary; label it as a probe).
 2. Fix the double indexer projection; gate it with the collector byte check.

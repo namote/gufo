@@ -1,42 +1,47 @@
 # F3 prefill search status, 2026-11-02
 
-The qualified result is **1429.13 ±1.13 tok/s at pp2048**. The target of
-2000 tok/s is **not reached**: it would still require about 40% more throughput,
-or 29% lower latency. No claim of hardware impossibility is made.
+The qualified result is **1435.59 ±.07 tok/s at pp2048**. The target of
+2000 tok/s is **not reached**: it would still require about 39% more throughput,
+or 28.2% lower latency. No claim of hardware impossibility is made.
 
 The current continuation has screened the concrete matrix mechanisms supported
 by the existing profiles and retained the qualified changes. The remaining
 ideas below are research leads, not known improvements waiting to be enabled.
 Do not repeat rejected experiments unchanged. A user-requested profile of the
-current shared5 binary now replaces the older profile as the current bottleneck
+pre-batch6 shared5 binary now replaces the older profile as the current bottleneck
 map: main-stream MoE matrices32.31%, HC-family mixing/projections (including fused MoE combine)22.74%, dense EXL3
 matrices20.62%, with99.676% kernel-active time (not ALU utilization). The shared side stream is already
 mostly overlapped. Reuse [this profile](F3-CURRENT-PREFILL-PROFILE.json); no
 extra baseline or deep-context profile was collected.
 
-## Latest bounded kernel batch
+## HC/MoE combined qualification, November 2, 2026
 
-HC MoE combine load grouping is now selected in source, pending combined
-model qualification. The fixed candidate saves8.87/8.93% in plain/write-pressure
-synthetic operator conditions, with unchanged96VGPR/no spills. Actual production
-fused saved-hash replay and independent irregular-scale oracle pass. Extra DPP
-is not selected because timings are effectively equal. HcMix gate loads are
-already hoisted, so that proposed lead is closed without another GPU sweep.
-[All outcomes and preserved evidence](F3-HC-LOAD-SCREENS.json). The qualified
-image/rates are unchanged; the MoE staging patch below remains preserved.
+HC operand-load grouping and K5 Mode3 dead-subtile/K-tail staging are now
+qualified together on pinned Nix ROCm10.1. Dense K7 K-tail removal is not
+selected. Current image: `ai-tools/gufo-eval:f3-prefill6-f15434b2-rocm101`,
+as-built `1dbee4d6-prefill6-f15434b2`.
 
-Dead B-subtile preparation and the invariant K-tail check have now been
-implemented and screened on pinned Nix10.1. Raw gate/down times improve about
-1% against saved controls; the complete shared-side operator is−0.50% at2048
-but+0.46% at512 (historical/advisory, not a qualified speedup). All saved-output
-checks and144 boundary/exponent refactor checks pass. Preserve the
-[K5 Mode3 candidate patch](F3-MOE-STAGING-CANDIDATE.patch) for the next combined
-batch; that patch is not applied and the qualified image is unchanged. Do not rerun
-these small screens or start a long model validation for this alone.
-[Measurements, resources and reproducibility](F3-MOE-STAGING-SCREENS.json).
-Trellis address bases/offsets are already hoisted by the compiler. The HC load follow-up above uses the saved profile/dirty-cache evidence.
-Remaining HC projection/dense leads require a concrete mechanism before another
-screen; preserve existing negative results. No repeat profile is needed.
+| Case | Saved shared5 tok/s | Qualified tok/s | Change |
+|---|---:|---:|---:|
+| pp512 | 1068.58 ±3.09 | 1078.15 ±.40 | +.90% |
+| pp2048 | 1429.13 ±1.13 | 1435.59 ±.07 | +.45% |
+| pp8192 | 1460.97 ±.73 | 1466.18 ±1.12 | +.36% |
+| pp2048 at d32768 | 1301.99 ±1.41 | 1311.98 ±1.03 | +.77% |
+
+One fresh32760-record/64-head-replay FP16-KV collector is byte-exact to the
+saved Nix baseline; affected full-FFN1025/shared-state and expert/final-tail
+checks pass. Performance uses k4v4/temp0/seed314159/r2. The initial pp2048
+1342.22±103.86 was inconclusive. A shortened-list replay inadvertently changed
+context8193→4096 and is diagnostic only; the final d0 replay restored the
+original512,2048,8192 list and8193 capacity. All attempts are retained; no
+baseline, correctness or d32K rerun. Target2000 is still unmet.
+[Qualification, runtime/code identities and all attempts](F3-PREFILL-BATCH6-QUALIFICATION.json).
+
+Dense K7 K-tail removal is the last screened candidate and is not selected;
+its largest QKV shape is+5.98% against the saved control. All six outputs pass.
+[Audit/measurements](F3-DENSE-KTAIL-SCREEN.json). HC DPP and gate-load hoisting
+are closed leads (neutral/already present). MoE staging and HC load grouping
+are now applied and qualified; no pending full-model pass remains for them.
 
 ## Retained and qualified
 
@@ -46,8 +51,10 @@ screen; preserve existing negative results. No repeat profile is needed.
 
 4. Early shared EXL3 MLP beside router/routed MoE, with dedicated operands.
 5. KVarN register selection removes80B private arrays without changing arithmetic.
+6. HC operand loads grouped with original restore rounding.
+7. K5 Mode3 dead B staging and invariant K-tail removal.
 
-Starting saved batch1400.15→final1429.13 is+2.07%; the stream/private-memory
+Prior to batch6, saved batch1400.15→1429.13 was+2.07%; the stream/private-memory
 batch alone improves1416.51→1429.13(+.89%). Other final cases: pp5121068.58,
 pp81921460.97 and d32Kpp20481301.99. TG/MTP work remains.
 [Final selection and exactness scopes](F3-STREAM-QUALIFICATION.json).
@@ -91,7 +98,7 @@ Neither can become a win by adding the omitted device partition-builder cost.
 - Stream-K remains unimplemented. It changes reduction structure and needs a
   fresh numerical/quality argument; existing full-grid/persistent results do
   not establish a useful scheduling tail to recover. It is not a validated
-  route to the remaining 29% latency reduction.
+  route to the remaining 28.2% latency reduction.
 - Single-launch grouped routed gate/up was screened on Nix10.1. Launches
   fell from four to two, but the shared-side operator span rose 0.90% at2048
   and1.15% at512; exact output checks passed. No promotion; retain prototypes.
@@ -147,8 +154,8 @@ No new GPU run or kernel change was made for this diagnosis.
 
 ### Ordered improvement plan
 
-Steps1–4 below produced the bounded candidate batch above. Step5 remains
-deferred until there is a combined batch worth full-model qualification.
+Steps1–5 below are complete for the current bounded batch. The combined
+qualification above includes its surviving HC and K5 staging candidates.
 
 1. **Complete the work accounting offline first.** Reuse the saved release ISA,
    operator outputs/routing, current timeline and existing ablations. Report

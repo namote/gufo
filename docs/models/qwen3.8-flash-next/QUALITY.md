@@ -1,15 +1,27 @@
 # Qwen3.8 Flash-Next quality
 
-## Pending input-staging candidate, November 2, 2026
+## HC/MoE combined qualification, November 2, 2026
 
-The pending K5 Mode3 staging candidate passed saved finite/exact raw outputs
-and guards, plus synthetic512/2048 shared/raw-down/combined outputs. Another
-144 untimed original-versus-candidate checks cover all16-row boundaries,
-exact-size inputs, K128/2560/640 and null or nonzero row exponents. These are
-refactor comparisons, not an independent teacher or full-model quality gate.
-Gate/up intermediate payloads in the complete operator have guards only.
-Production and its existing qualification remain unchanged.
-[Results and exact scope](../../../plan/exl3/F3-MOE-STAGING-SCREENS.json).
+HC operand-load grouping and K5 Mode3 dead-subtile/K-tail staging are now
+qualified together on pinned Nix ROCm10.1. Dense K7 K-tail removal is not
+selected. Current image: `ai-tools/gufo-eval:f3-prefill6-f15434b2-rocm101`,
+as-built `1dbee4d6-prefill6-f15434b2`.
+
+| Case | Saved shared5 tok/s | Qualified tok/s | Change |
+|---|---:|---:|---:|
+| pp512 | 1068.58 ±3.09 | 1078.15 ±.40 | +.90% |
+| pp2048 | 1429.13 ±1.13 | 1435.59 ±.07 | +.45% |
+| pp8192 | 1460.97 ±.73 | 1466.18 ±1.12 | +.36% |
+| pp2048 at d32768 | 1301.99 ±1.41 | 1311.98 ±1.03 | +.77% |
+
+One fresh32760-record/64-head-replay FP16-KV collector is byte-exact to the
+saved Nix baseline; affected full-FFN1025/shared-state and expert/final-tail
+checks pass. Performance uses k4v4/temp0/seed314159/r2. The initial pp2048
+1342.22±103.86 was inconclusive. A shortened-list replay inadvertently changed
+context8193→4096 and is diagnostic only; the final d0 replay restored the
+original512,2048,8192 list and8193 capacity. All attempts are retained; no
+baseline, correctness or d32K rerun. Target2000 is still unmet.
+[Qualification, runtime/code identities and all attempts](../../../plan/exl3/F3-PREFILL-BATCH6-QUALIFICATION.json).
 
 ## Shared-MoE/KVarN and grouped follow-up, November 2, 2026
 
@@ -1198,5 +1210,5 @@ with power-of-two and non-power-of-two FP16 scales; checked-in regression now
 preserves the two restore products explicitly. Earlier unpinned reassociation
 failed exactness and was fixed before timing. Prototype standalone24-case
 parity additionally covers widths128/2560, used1/10/16, stride0/3 and tail1.
-This is operator evidence only; full model/chunk qualification waits for the
-combined batch. [Exact scope and receipts](../../../plan/exl3/F3-HC-LOAD-SCREENS.json).
+This was operator evidence; subsequent full model/chunk qualification is
+recorded at the top of this document. [Exact scope and receipts](../../../plan/exl3/F3-HC-LOAD-SCREENS.json).

@@ -290,5 +290,10 @@
       }
     }
   },
-  "experiment_plan_commit": "ai.tools:8b1b8faa"
+  "experiment_plan_commit": "ai.tools:8b1b8faa",
+  "subsequent_qualification": {
+    "report": "F3-PREFILL-BATCH6-QUALIFICATION.json",
+    "status": "SELECTED_AND_QUALIFIED",
+    "note": "Originalscreen fields describe that earliercheckpoint; candidate nowapplied andqualifiedtogether. Retainalloriginalevidence."
+  }
 }

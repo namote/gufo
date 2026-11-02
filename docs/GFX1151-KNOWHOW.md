@@ -1183,3 +1183,44 @@ No baseline replay, model run or profile for the production check. These are
 operator timings, not a whole-prefill speedup; qualified1429.13tok/s remains.
 HcMix gate loads are already grouped in ISA; do not repeat that lead.
 [Failures, all candidates, hashes and receipts](../plan/exl3/F3-HC-LOAD-SCREENS.json).
+
+### Dense X3 K-tail audit (2026-11-02)
+
+Audited the actual qualified shared5 K7 grouped256² ISA, reusing the saved
+profile. Trellis pointer induction/immediate offsets and grouped LDS reads
+with descending WMMA waits are already present;188VGPR,64KiBLDS,zero spills.
+One distinct removal remained: the B K-tail branch despite validated k%128.
+A narrow K7/Batching==1 grouped-descriptor mode/256²/kStore prototype removes it, retaining all row bounds
+and per-output K16 order. All six saved-output/finite/guard checks pass.
+
+Saved-control timings: out1.639585→1.637545ms, Z1.819499→1.799713,
+sharedDown.215308→.212555, QKV2.854322→3.025093, Q3.709895→3.723071,
+group2KV.352216→.364407. Candidate187VGPR/no spills. Not selected: mixed
+historical evidence with the largest QKV worse, no aggregate win justifying
+another specialization. These are advisory operator timings, not a confirmed
+model regression. No baseline/profile/model rerun for this screen. Preserve
+prototype and failed pre-GPU manifest check; move to combined HC/MoE batch.
+[All numbers, ISA sites and receipts](../plan/exl3/F3-DENSE-KTAIL-SCREEN.json).
+
+### HC/MoE combined qualification, November 2, 2026
+
+HC operand-load grouping and K5 Mode3 dead-subtile/K-tail staging are now
+qualified together on pinned Nix ROCm10.1. Dense K7 K-tail removal is not
+selected. Current image: `ai-tools/gufo-eval:f3-prefill6-f15434b2-rocm101`,
+as-built `1dbee4d6-prefill6-f15434b2`.
+
+| Case | Saved shared5 tok/s | Qualified tok/s | Change |
+|---|---:|---:|---:|
+| pp512 | 1068.58 ±3.09 | 1078.15 ±.40 | +.90% |
+| pp2048 | 1429.13 ±1.13 | 1435.59 ±.07 | +.45% |
+| pp8192 | 1460.97 ±.73 | 1466.18 ±1.12 | +.36% |
+| pp2048 at d32768 | 1301.99 ±1.41 | 1311.98 ±1.03 | +.77% |
+
+One fresh32760-record/64-head-replay FP16-KV collector is byte-exact to the
+saved Nix baseline; affected full-FFN1025/shared-state and expert/final-tail
+checks pass. Performance uses k4v4/temp0/seed314159/r2. The initial pp2048
+1342.22±103.86 was inconclusive. A shortened-list replay inadvertently changed
+context8193→4096 and is diagnostic only; the final d0 replay restored the
+original512,2048,8192 list and8193 capacity. All attempts are retained; no
+baseline, correctness or d32K rerun. Target2000 is still unmet.
+[Qualification, runtime/code identities and all attempts](../plan/exl3/F3-PREFILL-BATCH6-QUALIFICATION.json).

@@ -1,21 +1,35 @@
 # Qwen3.8 Flash-Next benchmarks
 
-## Pending input-staging candidate, November 2, 2026
+## HC/MoE combined qualification, November 2, 2026
 
-Qualified pp2048 remains1429.13±1.13tok/s. The pending staging candidate was
-measured only in synthetic operators: complete shared-side512/2048 spans
-8.59501/14.6878ms versus saved8.55525/14.7609ms (+.46/−.50%). These small
-historical comparisons establish no new full-model speed. No model or saved
-baseline timing was rerun; full prefill qualification stays batched.
-[Results and exact scope](../../../plan/exl3/F3-MOE-STAGING-SCREENS.json).
+HC operand-load grouping and K5 Mode3 dead-subtile/K-tail staging are now
+qualified together on pinned Nix ROCm10.1. Dense K7 K-tail removal is not
+selected. Current image: `ai-tools/gufo-eval:f3-prefill6-f15434b2-rocm101`,
+as-built `1dbee4d6-prefill6-f15434b2`.
+
+| Case | Saved shared5 tok/s | Qualified tok/s | Change |
+|---|---:|---:|---:|
+| pp512 | 1068.58 ±3.09 | 1078.15 ±.40 | +.90% |
+| pp2048 | 1429.13 ±1.13 | 1435.59 ±.07 | +.45% |
+| pp8192 | 1460.97 ±.73 | 1466.18 ±1.12 | +.36% |
+| pp2048 at d32768 | 1301.99 ±1.41 | 1311.98 ±1.03 | +.77% |
+
+One fresh32760-record/64-head-replay FP16-KV collector is byte-exact to the
+saved Nix baseline; affected full-FFN1025/shared-state and expert/final-tail
+checks pass. Performance uses k4v4/temp0/seed314159/r2. The initial pp2048
+1342.22±103.86 was inconclusive. A shortened-list replay inadvertently changed
+context8193→4096 and is diagnostic only; the final d0 replay restored the
+original512,2048,8192 list and8193 capacity. All attempts are retained; no
+baseline, correctness or d32K rerun. Target2000 is still unmet.
+[Qualification, runtime/code identities and all attempts](../../../plan/exl3/F3-PREFILL-BATCH6-QUALIFICATION.json).
 
 ## EXL3 shared-MoE/KVarN qualified batch, November 2, 2026
 
-Current qualified image is `ai-tools/gufo-eval:f3-shared5-703d3e77-rocm101`
+Previous qualified image was `ai-tools/gufo-eval:f3-shared5-703d3e77-rocm101`
 (`2184da9f…`), code `da1fd6a8`. Nix ROCm10.1, k4v4, speculative off,
 temperature0, seed314159, r2; saved baseline reused.
 
-| Case | Prior qualified tok/s | Current tok/s | Change |
+| Case | Prior qualified tok/s | Shared5 tok/s | Change |
 |---|---:|---:|---:|
 | pp512 | 1063.05 ±.22 | 1068.58 ±3.09 | +.52% |
 | pp2048 | 1416.51 ±.82 | 1429.13 ±1.13 | +.89% |
@@ -24,7 +38,7 @@ temperature0, seed314159, r2; saved baseline reused.
 
 [Qualification and exact scope](../../../plan/exl3/F3-STREAM-QUALIFICATION.json).
 The later routed grouped-gate/up screen was not promoted and did not run a
-model benchmark; these remain current. Goal2000 tok/s is unmet.
+model benchmark; this is the prior batch. Goal2000 tok/s is unmet.
 A subsequent user-requested current-binary profile measured1426.48tok/s under
 tracing at context4096, versus8193 here. This is advisory and does not replace
 the clean table. [Bottleneck profile](../../../plan/exl3/F3-CURRENT-PREFILL-PROFILE.json).
@@ -192,9 +206,9 @@ C1, context capacity 133121, AR. Peak memory reported by HIP.
 
 ![Memory occupation](artifacts/charts/memory.svg)
 
-## Pending HC combine candidate, November 2, 2026
+## HC combine operator screen (subsequently qualified above), November 2, 2026
 
-Qualified pp2048 remains1429.13±1.13tok/s. The source-selected HC operand-load
+At the operator-screen checkpoint, qualified pp2048 was1429.13±1.13tok/s. The source-selected HC operand-load
 change reduces one synthetic2048-row fused combine screen by8.87% (plain)
 and8.93% (after256MiB write pressure); these are not model measurements.
 No model baseline or full profile was repeated. Preserve saved controls and

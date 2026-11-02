@@ -1,0 +1,280 @@
+{
+  "status": "COMBINED_HC_MOE_PREFILL_QUALIFIED",
+  "target_tps": 2000,
+  "target_reached": false,
+  "production_changes": [
+    "HC raw/SVH/shared operand-load grouping with original restore rounding pins (1dbee4d6).",
+    "K5 Mode3 only: skip wholly dead16-row B preparation and remove invariant K-tail check. Exact preserved candidate applied."
+  ],
+  "not_selected": "DenseK7 B K-tail candidate, extraHC DPP transport; prototypes retained.",
+  "image": {
+    "tag": "ai-tools/gufo-eval:f3-prefill6-f15434b2-rocm101",
+    "id": "sha256:117be60cb7b7bc3a5d5ee36cb709a1fcced8160bb75a2dff20b5cf7a0a9860f8",
+    "source": {
+      "base": "1dbee4d6",
+      "patch_sha256": "f15434b2cfd905556a5683cb469cd61b0b3df378ad325b6e09194daee86cfa09",
+      "revision": "1dbee4d6-prefill6-f15434b2",
+      "included": "HC load grouping at source base plus K5Mode3 dead B and K-tail patch; denseK7 rejected",
+      "build_method": "Pinned original CMake compile/link commands, production replacement objects before original archives. Original Nix trees preserved."
+    }
+  },
+  "artifacts": {
+    "files": {
+      "build/f3-nix-incremental/batch6/stage/opt/gufo-prefill/tests/qwen38_flash_next_exl3_ops_test": {
+        "bytes": 26086496,
+        "sha256": "b0a470221b398739e12547182424679c154a0f2c5f6c516795567f9d148a8735"
+      },
+      "build/f3-nix-incremental/batch6/stage/opt/gufo-prefill/tests/qwen38_flash_next_rq_logits": {
+        "bytes": 27034840,
+        "sha256": "2f1b8b2c1d7cd92783653f5111fd14ab4bbcea05420a0fbdb1104c8cc1d23630"
+      },
+      "build/f3-nix-incremental/batch6/stage/opt/gufo-prefill/bin/.gufo-wrapped": {
+        "bytes": 115008048,
+        "sha256": "b691cfe2717729562e940d3d0955792840f644fb0dcc7a48428cfbb6d01b929a"
+      }
+    },
+    "source_base": "1dbee4d6",
+    "source_patch_sha256": "f15434b2cfd905556a5683cb469cd61b0b3df378ad325b6e09194daee86cfa09",
+    "compile_link_commands_sha256": "84e3f9078d3da027fce58f05719ea10f3c6a7b9fdf25cd7cf9e30c5460e1a5c9",
+    "link_inputs_sha256": "2a4de272652c0f03c07a1f0121853382d170e2dad106e856681302f65eb788f4"
+  },
+  "correctness": {
+    "fresh_full_collector": {
+      "PASS": true,
+      "candidate_sha256": "789c46a2a6939dc980e23b2cbf78bac71ccbcd9b1472899be846a1d56584f2a0",
+      "saved_baseline_sha256": "789c46a2a6939dc980e23b2cbf78bac71ccbcd9b1472899be846a1d56584f2a0",
+      "bytes": 101424960,
+      "baseline": "fn-final-q6-nix101/receipt/run/exl3-5.05-prefill.bin",
+      "records": 32760,
+      "head_replay_checks": 64,
+      "metadata_bin_sha256": "789c46a2a6939dc980e23b2cbf78bac71ccbcd9b1472899be846a1d56584f2a0",
+      "verifier_sha256": "de8d4dee263023b54fb82be8db97c954bce6d7f71dbbc561676dce39c7d8b02f",
+      "baseline_inference_runs": 0,
+      "meaning": "Exact binary record match; existing q6 drift remains unchanged."
+    },
+    "collector_scope": "FP16-KV prefill,batch512,prefix2048,8windows of4095scoredrecords;32760exactrecordbytes and64headreplays vs storedNixbaseline. Not a new BF16-equivalence claim; previoushc7NLL drift+.006600 retained.",
+    "affected_units": [
+      {
+        "name": "full-ffn-overlap-tail",
+        "PASS": true,
+        "returncode": 0,
+        "runtime_paths": [
+          "/nix/store/88jjsz00km321bcl9851aiwwdig79b4l-rocm-runtime-10.1/lib/libhsa-runtime64.so.1.21.0",
+          "/nix/store/al4qwi7jfyrdkyb25xsri8b00b1agj1r-clr-10.1/lib/libamdhip64.so.7.16.0-0000000"
+        ]
+      },
+      {
+        "name": "prefill-experts-tail",
+        "PASS": true,
+        "returncode": 0,
+        "runtime_paths": [
+          "/nix/store/88jjsz00km321bcl9851aiwwdig79b4l-rocm-runtime-10.1/lib/libhsa-runtime64.so.1.21.0",
+          "/nix/store/al4qwi7jfyrdkyb25xsri8b00b1agj1r-clr-10.1/lib/libamdhip64.so.7.16.0-0000000"
+        ]
+      }
+    ],
+    "independent_oracle_reused": "fn-hc-prodcheck-nix101 independentSylvester4 irregularscales/full5/tail1, actualsameHCobjects. exl3_ops does not execute this separate exl3_moe_kernel fixture.",
+    "prior_boundary_evidence": "F3-MOE-STAGING-SCREENS.json144checks preserved; newfinal actualkernel covered by fullFFN1025/shared-state and expert/finaltailunits plusfullcollector.",
+    "runtime": "Actual patched Nix ROCr88jjsz00...10.1 andCLRal4qwi7...10.1 paths recorded in final unit/collector maps."
+  },
+  "performance": {
+    "pp512": {
+      "saved_baseline_tps": 1068.58,
+      "candidate_tps": 1078.15,
+      "candidate_sample_stddev": 0.4,
+      "change_percent": 0.8955810514889029,
+      "context_capacity": 8193,
+      "source": "fn-prefill-batch6-timing-r3-nix101"
+    },
+    "pp2048": {
+      "saved_baseline_tps": 1429.13,
+      "candidate_tps": 1435.59,
+      "candidate_sample_stddev": 0.07,
+      "change_percent": 0.4520232589057649,
+      "context_capacity": 8193,
+      "source": "fn-prefill-batch6-timing-r3-nix101"
+    },
+    "pp8192": {
+      "saved_baseline_tps": 1460.97,
+      "candidate_tps": 1466.18,
+      "candidate_sample_stddev": 1.12,
+      "change_percent": 0.35661238766024894,
+      "context_capacity": 8193,
+      "source": "fn-prefill-batch6-timing-r3-nix101"
+    },
+    "d32768pp2048": {
+      "saved_baseline_tps": 1301.99,
+      "candidate_tps": 1311.98,
+      "candidate_sample_stddev": 1.03,
+      "change_percent": 0.7672869991320885,
+      "context_capacity": 34817,
+      "source": "fn-prefill-batch6-nix101"
+    }
+  },
+  "performance_settings": "SameEXL3pack/meta/PLEsource,NixROCm10.1,kvarn-k4v4,speculativeoff,temp0,seed314159,r2. d0 original512,2048,8192 list allocates8193; d32768pp2048 allocates34817. Savedshared5baseline reused, no baselineexecution.",
+  "all_attempts": [
+    {
+      "receipt": "fn-prefill-batch6-nix101",
+      "scope": "One full combinedaccuracy/performance pass",
+      "d0_tps": [
+        [
+          1076.24,
+          0.35
+        ],
+        [
+          1342.22,
+          103.86
+        ],
+        [
+          1465.1,
+          0.9
+        ]
+      ],
+      "d32_tps": [
+        1311.98,
+        1.03
+      ],
+      "disposition": "Accuracy andd32K retained. pp2048inconclusive from highvariance; alloriginaltimingspreserved."
+    },
+    {
+      "receipt": "fn-prefill-batch6-timing-r2-nix101",
+      "scope": "Shortened512,2048 prefix replay",
+      "d0_tps": [
+        [
+          1075.84,
+          1.13
+        ],
+        [
+          1431.41,
+          0.52
+        ]
+      ],
+      "context_capacity": 4096,
+      "disposition": "Diagnostic only: omitted8192inadvertently changedautomaticcapacity8193->4096. Not used forstrictbaselinecomparison."
+    },
+    {
+      "receipt": "fn-prefill-batch6-timing-r3-nix101",
+      "scope": "Originald0list restored, samecapacity/history; noaccuracy/d32K repetition",
+      "d0_tps": [
+        [
+          1078.15,
+          0.4
+        ],
+        [
+          1435.59,
+          0.07
+        ],
+        [
+          1466.18,
+          1.12
+        ]
+      ],
+      "context_capacity": 8193,
+      "disposition": "Retained matched d0 result. ExistingCLI lacks contextoverride; preservingcapacity requiresoriginalpromptlist."
+    }
+  ],
+  "limits": [
+    "Small saved-baseline gains, not8.9%whole-prefill; noisolated attribution betweenHC andMoE.",
+    "Initial highvariance source not identified; noGPUerror orfencepending was observed. Do not average it withdifferentcontextdiagnostic orhideit.",
+    "Goal2000unmet; no claimallfuturealgorithms exhausted. NoTG/MTPexpansion orprofile rerun."
+  ],
+  "build_bridge": {
+    "method": "OneaffectedprefillTUcompiled fromoriginalCMake productionargv,2previouslycheckedHCobjects reused. Production3objects explicitly precede originalnon-wholearchives in3savedlinkcommands. Originalobjects/archives neveroverwritten.",
+    "unit_define": "Units addGUFO_CACHE_TESTING only; absent fromthese kernel/include trees. Productionobjects deliberatelyusedinunit/collectorbinary.",
+    "code_object_comparison": {
+      "unchanged": 74,
+      "changed": 3,
+      "identical_names_and_multiplicity": true,
+      "path": "/home/m2on/projects/gufo-f3-integ/build/f3-nix-incremental/batch6/CODE-OBJECT-BRIDGE.json",
+      "sha256": "49b6acf891310b1a2530f185c8ae53fdb7dc69315f0bf1ad2c34abc069e3858c"
+    },
+    "resources": "K5Mode3 cold/hot103/148VGPR,24/32KiBLDS;fusedHC96VGPR;allzeroprivate/spills.",
+    "format": "Pinnedclang-format21.1.8 CIcheckPASS758files."
+  },
+  "baseline_executions": 0,
+  "profile_executions": 0,
+  "cleanup": "uvunused/cache downloads323.8+348.9MiB; newlyunusedDockerpackagingcache859.4MBlogical. RetainedNixstore,CMakeobjects,baselines,images,prototypes. Finaldiskfloor>=150GiB.",
+  "receipts": {
+    "fn-prefill-batch6-nix101": {
+      "path": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch6-nix101",
+      "status": "COMPLETE",
+      "health_PASS": true,
+      "tests": [
+        {
+          "name": "combined-prefill-contracts",
+          "PASS": true,
+          "seconds": 0.9647946779150516
+        },
+        {
+          "name": "exl3-5.05-prefill",
+          "PASS": true,
+          "seconds": 150.7722216420807
+        },
+        {
+          "name": "collector-exact",
+          "PASS": true,
+          "seconds": 0.11375512997619808
+        },
+        {
+          "name": "prefill-d0",
+          "PASS": true,
+          "seconds": 53.35892099607736
+        },
+        {
+          "name": "prefill-d32k",
+          "PASS": true,
+          "seconds": 105.40317094000056
+        }
+      ],
+      "window_sha256": "88c8f7304a838acdc1f3b2667fb5d8a23134f8eebe81b8e7903354097d2c2669",
+      "result_sha256": "47fe71a6c64ad661adae392b2cf413a2a367655db0feeaa8e86d5aaff83141f2"
+    },
+    "fn-prefill-batch6-timing-r2-nix101": {
+      "path": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch6-timing-r2-nix101",
+      "status": "COMPLETE",
+      "health_PASS": true,
+      "tests": [
+        {
+          "name": "prefill-d0-prefix-replay",
+          "PASS": true,
+          "seconds": 36.738947367994115
+        }
+      ],
+      "window_sha256": "6cc86b0c3ebbb09ea52a3b719dcd3c4ec9a59ca328aa6d8cdf05bb34d4ce9966",
+      "result_sha256": "49e6a518d1d4ceb9ff7710e44153fff4e9c83b5c5b673d5619b7a20f0bf8aec1"
+    },
+    "fn-prefill-batch6-timing-r3-nix101": {
+      "path": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-batch6-timing-r3-nix101",
+      "status": "COMPLETE",
+      "health_PASS": true,
+      "tests": [
+        {
+          "name": "prefill-d0",
+          "PASS": true,
+          "seconds": 53.208246695110574
+        }
+      ],
+      "window_sha256": "b32f05a0e5ad2081767b498d4d323078d28dfd7def9177ed69608424c5ed689a",
+      "result_sha256": "63dd8fad5cb87cabcaa7b8503d7cee93fd83a1241ad44939d51ed090c1c4a22b"
+    }
+  },
+  "files": {
+    "build/f3-nix-incremental/batch6/SOURCE.patch": "f15434b2cfd905556a5683cb469cd61b0b3df378ad325b6e09194daee86cfa09",
+    "build/f3-nix-incremental/batch6/SOURCE.json": "82c720d75bb7036f1f0d0c7084cb1835360ee3431c6628b2efc4b667a3e0cc47",
+    "build/f3-nix-incremental/batch6/ARTIFACTS.json": "afb3e621a81800113b3bd47ccf09d43a02145a66c59bd8304d25b6dbca7b2304",
+    "build/f3-nix-incremental/batch6/COMPILE-LINK-COMMANDS.json": "84e3f9078d3da027fce58f05719ea10f3c6a7b9fdf25cd7cf9e30c5460e1a5c9",
+    "build/f3-nix-incremental/batch6/LINK-INPUTS.json": "2a4de272652c0f03c07a1f0121853382d170e2dad106e856681302f65eb788f4",
+    "build/f3-nix-incremental/batch6/build.py": "d5708a2fc00deb5d691eb07ef0965d7e69a92c31d62a23972a5927c5e29beb4a",
+    "build/f3-nix-incremental/batch6/build.log": "338b6cf611d0fdfa16a363a3c0e26d0765427aa44d6d3e7c540deb57a89b4ea2",
+    "build/f3-nix-incremental/batch6/build-r2.log": "37ecd6eb0d18d9d4c290a99de7ca765a1d47802c53711d768837e42f3d7da986",
+    "build/f3-nix-incremental/batch6/run_units.py": "12bcf3da9e8b1e3873c368c39d3b6bc8fb32d1cb44e5c67f84cb63ebf3ff9a35",
+    "build/f3-nix-incremental/batch6/run_collect.py": "dfbd7d4e09927d4dc754b4bbe9cd0c896672d7cff0bba23ce2a72a8455572e42",
+    "build/f3-nix-incremental/batch6/format.log": "840dd97e5ae77d83edd39cd8a3f3c32a77c0585df68d93b6d64382e1ea90fec3",
+    "build/f3-nix-incremental/batch6/cache-prune.log": "63f2535e5ec92538fb3d5c3e49b8b62753adb7223caeba954cd12f3fc68d572c",
+    "build/f3-nix-incremental/batch6/IMAGE.json": "09f596287246e3865185e8762dfe13ecee707b2e84b87fa42dcb2ad151b005c4",
+    "build/f3-nix-incremental/batch6/Dockerfile": "11587a8ec152f9f3c204dc5b80ad8e3338f3ce77a71beb9e4f84940da0b1dcd6"
+  },
+  "review": "Independent second reviewer approved code, buildbridge, dense-screen nonselection, finalhashes/deltas/accuracy andcontext-attempt distinctions. Re-reviewed corrected28.2%latency gap, TG/MTPcode-only retention andhistoricaltablelabels; no remainingissues.",
+  "receipt_metadata_caveat": "Genericunitrunner inheritedsource_revision/binary_SHA do notidentify these binaries; installedARTIFACTS hashes, imageId, compiledinputs andruntime maps are authoritative.",
+  "plan_commit": "ai.tools1aa30a9c"
+}

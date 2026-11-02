@@ -129,5 +129,10 @@
   "next": "Retain source candidate pending combined prefill qualification with preserved MoE staging patch. Use saved profile for remaining HC/dense leads; no repeat gate-hoist, DPP or baseline screens.",
   "receipt_metadata_caveat": "Generic unit RESULT source_revision/binary_SHA are inherited runner metadata, not these operator binaries. Use per-run MANIFEST/ORACLE-MANIFEST hashes, compiler and runtime maps for actual identities.",
   "review": "Second reviewer approved code and re-reviewed final evidence: bounds/rounding, regression sensitivity,49 artifact/receipt hashes, timing percentages, and scope distinctions. No remaining fixes.",
-  "format_check": "Pinned clang-format21.1.8; tools/ci/check-format.py PASS758 C++ files. build/f3-hc-production/format-final.log"
+  "format_check": "Pinned clang-format21.1.8; tools/ci/check-format.py PASS758 C++ files. build/f3-hc-production/format-final.log",
+  "subsequent_qualification": {
+    "report": "F3-PREFILL-BATCH6-QUALIFICATION.json",
+    "status": "SELECTED_AND_QUALIFIED",
+    "note": "Originalscreen fields describe that earliercheckpoint; candidate nowapplied andqualifiedtogether. Retainalloriginalevidence."
+  }
 }

@@ -1,0 +1,135 @@
+{
+  "status": "DENSE_K7_KTAIL_SCREENED_NOT_SELECTED",
+  "production_dense_changed": false,
+  "new_baseline_executions": 0,
+  "new_profile_executions": 0,
+  "source_base": "1dbee4d6",
+  "audit": {
+    "source_elf": "/home/m2on/projects/gufo-f3-integ/build/f3-nix-incremental/batch5/stage/opt/gufo-prefill/bin/.gufo-wrapped",
+    "source_sha256": "b6b282448c1a8af0e6efa3f37e97b9eec4a71a5bc50266fff71435b98d8d7937",
+    "code_object_sha256": "5b5c23c5fca89ca326f3d1bd79d9e3ef958df68e8651621029cb61252c5b5393",
+    "shape_scope": "K7 grouped256x256 kStore: shared core ofQKV,out,Z,Q,KV,sharedDown; primary current-profile shape totals100.094/86.207/62.545ms.",
+    "resources": "Production188VGPR,64KiBLDS,zero private/spills. Candidate187VGPR,64KiBLDS,zero private/spills.",
+    "already_present": [
+      "Trellis base-pointer induction at0x1ADFB0..1ADFE0, immediate224-byte paired loads at0x1AE5E4..1AE614.",
+      "Twelve LDS b128 reads at0x1ADFFC..1AE054 before first WMMA, descending waits at0x1AE05C onward.",
+      "iglp0 includes grouped dense; prior deeper stage/prefetch/buffering/fragment/tile/cache experiments preserved and not repeated."
+    ],
+    "distinct_candidate": "Redundant B K-tail predicate at0x1AE634/648/64C before paired vector loads0x1AE654/65C. Exl3GemmShapeSupported requiresk%128, StageK4 divides8K16steps. Remove only forK7,group1,256\u00b2,kStore; preserve token/idx bounds and K16 order.",
+    "limits": "Static ISA is not a stall counter or hardware utilization measurement. No new dense redesign or universal ceiling claim."
+  },
+  "decision": "Do not select: exact six shapes but mixed historical timings, largest QKV+5.983% and group2KV+3.461%; out-.124%, Z-1.087%,sharedDown-1.279%,Q+.355%. No demonstrated aggregate gain for additional narrow dispatch condition. Preserve prototype; no repeated sweep. Proceed to combined HC+K5staging model qualification.",
+  "control_note": "Printed6144\u21922560 control1.930083ms is legacy group8; actual candidate change_percent uses saved qualified group1 time1.639585ms from original grid-screen.log. No baseline rerun.",
+  "timing_scope": "2048rows,2warmups10HIPevents, frozen inputs and saved outputbytes. First3 match prior reconstruction allocation/traffic. Remaining3 reuse original grouped shape controls. Historical comparisons advisory, not proven same-day regressions.",
+  "measurements": [
+    {
+      "case": "k7-dense-k6144-n2560",
+      "variant": "control",
+      "ms": 1.930083,
+      "cached": true
+    },
+    {
+      "case": "k7-dense-k6144-n2560",
+      "variant": "dense-k-tail-removed",
+      "ms": 1.637545,
+      "change_percent": -0.124,
+      "exact": true
+    },
+    {
+      "case": "k7-dense-k2560-n6144",
+      "variant": "control",
+      "ms": 1.819499,
+      "cached": true
+    },
+    {
+      "case": "k7-dense-k2560-n6144",
+      "variant": "dense-k-tail-removed",
+      "ms": 1.799713,
+      "change_percent": -1.087,
+      "exact": true
+    },
+    {
+      "case": "k7-dense-k640-n2560",
+      "variant": "control",
+      "ms": 0.215308,
+      "cached": true
+    },
+    {
+      "case": "k7-dense-k640-n2560",
+      "variant": "dense-k-tail-removed",
+      "ms": 0.212555,
+      "change_percent": -1.279,
+      "exact": true
+    },
+    {
+      "case": "k7-dense-k2560-n10240-g1",
+      "variant": "control",
+      "ms": 2.854322,
+      "cached": true
+    },
+    {
+      "case": "k7-dense-k2560-n10240-g1",
+      "variant": "dense-k-tail-removed",
+      "ms": 3.025093,
+      "change_percent": 5.983,
+      "exact": true
+    },
+    {
+      "case": "k7-dense-k2560-n12288-g1",
+      "variant": "control",
+      "ms": 3.709895,
+      "cached": true
+    },
+    {
+      "case": "k7-dense-k2560-n12288-g1",
+      "variant": "dense-k-tail-removed",
+      "ms": 3.723071,
+      "change_percent": 0.355,
+      "exact": true
+    },
+    {
+      "case": "k7-dense-k2560-n512-g2",
+      "variant": "control",
+      "ms": 0.352216,
+      "cached": true
+    },
+    {
+      "case": "k7-dense-k2560-n512-g2",
+      "variant": "dense-k-tail-removed",
+      "ms": 0.364407,
+      "change_percent": 3.461,
+      "exact": true
+    }
+  ],
+  "correctness": "All six candidateoutputs exact, finite/nonzero, poisoned output and1024-byte tail guards. No independent numerical claim added; refactor equality only.",
+  "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-dense-ktail-r2-nix101",
+  "status_from_window": "COMPLETE",
+  "health_PASS": true,
+  "failed_attempts": [
+    "Initial CLI plan revision mismatched existing image label; rejected before container.",
+    "fn-dense-ktail-nix101 healthPASS but wrapper failed before GPU launch: truncated RESULT tail lacks1.639585. Corrected to existing rawgrid-screen.log.",
+    "Dense code extraction first expected1 specialization, found2(store/residual); corrected inventory; noGPU involved."
+  ],
+  "artifacts": {
+    "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-dense-ktail-r2-nix101/WINDOW.json": "e8d60409b54f17935836d41070e9502036687dda80556f701ccb6f97bcc97b5d",
+    "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-dense-ktail-r2-nix101/receipt/run/MANIFEST.json": "edda76aab34be5ada87c742c39e1e46f453fe1a66f90401221f8bfb714eac141",
+    "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-dense-ktail-r2-nix101/receipt/run/provenance.json": "bf571fa79b4e019ff49ecfe281595389b1fe4c161bc127b3464b1e13fe9861bf",
+    "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-dense-ktail-r2-nix101/receipt/run/dense-ktail.log": "4999d8420b5186c25e3504f89f27761639e2618238cfb2e710a8932cfdee8abc",
+    "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-dense-ktail-nix101/WINDOW.json": "1a898567ba2a719fda0b5cd04f4cf666a522ab5a7f7ce7725428a59c0753c6e0",
+    "build/f3-dense-final-audit/extract.py": "4873cf46a2f88ad9116596bda636dbcdbc5e9cdb1fa6c87fd36c8c3c5864fcfa",
+    "build/f3-dense-final-audit/INVENTORY.json": "b7b62c1e5dae0c1830f061ae376e770bc19849e079f8dd985bd7379092e9e25f",
+    "build/f3-dense-final-audit/dense.hsaco": "5b5c23c5fca89ca326f3d1bd79d9e3ef958df68e8651621029cb61252c5b5393",
+    "build/f3-dense-final-audit/disasm.txt": "0ab7c9cda028c55bfae2a033a9fa3fafd70665eca09bf2f599da3edddd040486",
+    "build/f3-dense-ktail/kernel.hip": "eab471bdd53a471e77614b59e5eb6d0856e7494a9e73a72105e1db95aa90195e",
+    "build/f3-dense-ktail/screen.hip": "e7dd0c491e710a6a66e7daccc572bf91b481e60406e9ef6015a6473eec884818",
+    "build/f3-dense-ktail/rest.hip": "3f8b50c6d5dee3e9423f63e12c76d1e83f3bf085d2351f60a6258647de6220ca",
+    "build/f3-dense-ktail/build.sh": "1281efc6ae254b0f4faba37249218ea7612fb359f4acc7779279b2bea6b2bf59",
+    "build/f3-dense-ktail/run_screen.py": "25c49bb76ae1c0e138953dc40f917f012e574b00f61d5d27c04a2d2abfdb06f3",
+    "build/f3-dense-ktail/run_screen-v1.py": "d0ee34fe12de8c1a65eb2709c31d7828364ceb5d33396b151a4cc630cf6edcf7",
+    "build/f3-dense-ktail/compiler.txt": "33e4b542e9888fe837c8b5d93824d07a830b2a30c0dad1a987477684d1066682",
+    "build/f3-dense-ktail/build.log": "5202ae1c88cdecc2914542162ad457a84eb36835b65a13051f88404375aa6987",
+    "build/f3-dense-ktail/objects/screen": "92aa2a2ccd85379b78e41c5f0b3e601dd65f9f3ddfc35d4710fa596fad1fca3a",
+    "build/f3-dense-ktail/objects/rest": "ddc521841195feb4c704fb6ab576fa9cfb5f3770d4e95f60dd64b6cb96dad1de"
+  },
+  "review": "Secondreviewconfirmednumericdenominators andreceipt hashes; fixedBatching==1 terminology toavoidconfusionwithdescriptorcount."
+}
