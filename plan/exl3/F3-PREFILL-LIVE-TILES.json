@@ -1,0 +1,113 @@
+{
+  "source_revision": "1465c403",
+  "date": "2026-11-02",
+  "decision": "reject-all-at-compiler-screen",
+  "gpu_run": false,
+  "timings": null,
+  "correctness": "not GPU tested; prototypes not adopted",
+  "selected_image": "ai-tools/gufo-eval:f3-rows-91fce75a-rocm101",
+  "selected_elf_sha256": "91fce75a239ab0aa80fe532b52422fa5850cfe568e3d5df9de461bb3d8b7e5f1",
+  "compiler_flags": "Production prefill TU: Nix ROCm10.1 clang24, O2, gfx1151, no fast-math",
+  "baseline_object": "build/f3-nix-incremental/batch6/objects/prefill_fp16.hip.o",
+  "resources": [
+    {
+      "variant": "baseline",
+      "kernels": [
+        {
+          "bn": 64,
+          "name": "_ZN4gufo3hip12_GLOBAL__N_121HalfPrefillGemmKernelILi128ELi64ELi8ELi1ELNS_4core8GgmlTypeE8ELNS1_12HalfEpilogueE0ELb0ELS4_8ELi5ELi3ELi4EEEvPKvPKsPfiiiPKfS7_PKi",
+          "vgpr_count": 103,
+          "sgpr_count": 27,
+          "group_segment_fixed_size": 24576,
+          "private_segment_fixed_size": 0,
+          "vgpr_spill_count": 0
+        },
+        {
+          "bn": 128,
+          "name": "_ZN4gufo3hip12_GLOBAL__N_121HalfPrefillGemmKernelILi128ELi128ELi8ELi1ELNS_4core8GgmlTypeE8ELNS1_12HalfEpilogueE0ELb0ELS4_8ELi5ELi3ELi4EEEvPKvPKsPfiiiPKfS7_PKi",
+          "vgpr_count": 148,
+          "sgpr_count": 34,
+          "group_segment_fixed_size": 32768,
+          "private_segment_fixed_size": 0,
+          "vgpr_spill_count": 0
+        }
+      ]
+    },
+    {
+      "variant": "four-way-loop",
+      "kernels": [
+        {
+          "bn": 64,
+          "name": "_ZN4gufo3hip12_GLOBAL__N_121HalfPrefillGemmKernelILi128ELi64ELi8ELi1ELNS_4core8GgmlTypeE8ELNS1_12HalfEpilogueE0ELb0ELS4_8ELi5ELi3ELi4EEEvPKvPKsPfiiiPKfS7_PKi",
+          "vgpr_count": 231,
+          "sgpr_count": 38,
+          "group_segment_fixed_size": 24576,
+          "private_segment_fixed_size": 0,
+          "vgpr_spill_count": 0
+        },
+        {
+          "bn": 128,
+          "name": "_ZN4gufo3hip12_GLOBAL__N_121HalfPrefillGemmKernelILi128ELi128ELi8ELi1ELNS_4core8GgmlTypeE8ELNS1_12HalfEpilogueE0ELb0ELS4_8ELi5ELi3ELi4EEEvPKvPKsPfiiiPKfS7_PKi",
+          "vgpr_count": 256,
+          "sgpr_count": 32,
+          "group_segment_fixed_size": 32768,
+          "private_segment_fixed_size": 244,
+          "vgpr_spill_count": 108
+        }
+      ]
+    },
+    {
+      "variant": "four-way-body",
+      "kernels": [
+        {
+          "bn": 64,
+          "name": "_ZN4gufo3hip12_GLOBAL__N_121HalfPrefillGemmKernelILi128ELi64ELi8ELi1ELNS_4core8GgmlTypeE8ELNS1_12HalfEpilogueE0ELb0ELS4_8ELi5ELi3ELi4EEEvPKvPKsPfiiiPKfS7_PKi",
+          "vgpr_count": 239,
+          "sgpr_count": 39,
+          "group_segment_fixed_size": 24576,
+          "private_segment_fixed_size": 0,
+          "vgpr_spill_count": 0
+        },
+        {
+          "bn": 128,
+          "name": "_ZN4gufo3hip12_GLOBAL__N_121HalfPrefillGemmKernelILi128ELi128ELi8ELi1ELNS_4core8GgmlTypeE8ELNS1_12HalfEpilogueE0ELb0ELS4_8ELi5ELi3ELi4EEEvPKvPKsPfiiiPKfS7_PKi",
+          "vgpr_count": 256,
+          "sgpr_count": 39,
+          "group_segment_fixed_size": 32768,
+          "private_segment_fixed_size": 136,
+          "vgpr_spill_count": 68
+        }
+      ]
+    },
+    {
+      "variant": "two-way-full-subtile",
+      "kernels": [
+        {
+          "bn": 64,
+          "name": "_ZN4gufo3hip12_GLOBAL__N_121HalfPrefillGemmKernelILi128ELi64ELi8ELi1ELNS_4core8GgmlTypeE8ELNS1_12HalfEpilogueE0ELb0ELS4_8ELi5ELi3ELi4EEEvPKvPKsPfiiiPKfS7_PKi",
+          "vgpr_count": 191,
+          "sgpr_count": 37,
+          "group_segment_fixed_size": 24576,
+          "private_segment_fixed_size": 0,
+          "vgpr_spill_count": 0
+        },
+        {
+          "bn": 128,
+          "name": "_ZN4gufo3hip12_GLOBAL__N_121HalfPrefillGemmKernelILi128ELi128ELi8ELi1ELNS_4core8GgmlTypeE8ELNS1_12HalfEpilogueE0ELb0ELS4_8ELi5ELi3ELi4EEEvPKvPKsPfiiiPKfS7_PKi",
+          "vgpr_count": 256,
+          "sgpr_count": 38,
+          "group_segment_fixed_size": 32768,
+          "private_segment_fixed_size": 148,
+          "vgpr_spill_count": 71
+        }
+      ]
+    }
+  ],
+  "limits": [
+    "Compiler resource regression, not measured latency regression.",
+    "Source scopes do not prove register allocator root cause.",
+    "No baseline inference, pipeline profile or full model test repeated."
+  ],
+  "artifacts": "/home/m2on/projects/ai.tools/test/experiments/gufo_upstream_port_20261023/prefill_live_tiles_artifacts",
+  "intermediates": "/home/m2on/projects/gufo-f3-integ/build/f3-prefill-live-tiles"
+}

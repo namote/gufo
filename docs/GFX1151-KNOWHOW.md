@@ -1448,3 +1448,18 @@ baseline spread. PP1426.88/1460.75 and AR25.20/24.49 are effectively unchanged.
 Do not equate component gains with whole-model gains. All baseline/prototype
 objects remain; no baseline/model remeasurement or extra pipeline profile.
 [Complete evidence and all measured shapes](../plan/exl3/F3-TGMTP-ROWS.md).
+
+## Prefill live-subtile compiler screen, November 2, 2026
+
+Do not directly clone the successful routed GEMV live-row loops into X3
+prefill. Existing dead-B/WMMA skipping already removes inactive subtiles;
+selecting exact live-subtile loops once adds substantial register pressure.
+Production BN64/128 uses103/148VGPR, zero private/spills. Four-way loop clones
+use231/256VGPR and BN128 private244B/spill108; full-body scopes still use
+239/256 and private136B/spill68. A final two-way full-subtile/generic refinement
+uses191/256 and private148B/spill71. LDS remains24/32KiB throughout.
+All three compile with production Nix10.1/O2 and are rejected before GPU
+execution. Compiler evidence does not establish actual latency regression or
+the precise allocator cause. No new correctness/speed claim; existing
+prefill/TG/MTP implementation and saved baselines remain selected.
+[Scope, patches and resources](../plan/exl3/F3-PREFILL-LIVE-TILES.md).

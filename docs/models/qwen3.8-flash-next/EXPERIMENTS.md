@@ -1,5 +1,15 @@
 # Qwen3.8 Flash-Next experiments
 
+## Prefill live-subtile selection, November 2, 2026
+
+Rejected at compiler screen: porting the TG/MTP live-row selection idea to
+prefill X3 with four-way loop, four-way body and two-way full-subtile/generic
+clones. Baseline BN64/128 VGPR103/148 rises to231/256,239/256,191/256;
+BN128 private/spills becomes244B/108,136B/68,148B/71. LDS unchanged24/32KiB.
+No GPU or full-model test was warranted; no measured latency regression or
+new quality claim. Production source/image and current qualified speeds stay
+unchanged. [All evidence](../../../plan/exl3/F3-PREFILL-LIVE-TILES.md).
+
 ## Exact live-row verification, November 2, 2026
 
 Retained K5 R3/R4 gate/up and scaled-down specialization: select each tile's

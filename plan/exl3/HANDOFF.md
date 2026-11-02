@@ -1,6 +1,16 @@
 # EXL3 / Flash-Next F3 handoff (2026-11-02; native EXL3 qualified)
 
-## Latest: exact live-row verification retained
+## Latest: prefill live-subtile port rejected at compiler screen
+
+Three bounded X3 prototypes (four-way K loop, four-way full body, two-way
+full-subtile/generic) all increase VGPR substantially and introduce BN128
+private spills. No GPU/model/baseline rerun. Keep the qualified image and
+all existing prefill/TG/MTP improvements below. Preserve incremental objects
+in build/f3-prefill-live-tiles and ai.tools prefill_live_tiles_artifacts.
+Do not repeat these clones without a distinct code-generation mechanism.
+[Resources, limits and reproduction](F3-PREFILL-LIVE-TILES.md).
+
+## Current selection: exact live-row verification retained
 
 K5 R3/R4 gate/up and scaled down choose the actual row loop once per tile.
 Native5.05 MTP d0=40.85tok/s versus saved40.09 (+1.90%); d32K=79.48 versus78.53
