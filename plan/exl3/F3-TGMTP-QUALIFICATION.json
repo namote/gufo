@@ -384,5 +384,25 @@
     "wrapper_smoke_PASS": true
   },
   "format": "PASS: Checked758C++files, pinnedclang-format21.1.8",
-  "review": "indexer_review: bothcodepatches, strengthenedguards, K320boundaryfixture andfinalreporting approved; no openblockers."
+  "review": "indexer_review: bothcodepatches, strengthenedguards, K320boundaryfixture andfinalreporting approved; no openblockers.",
+  "integration": {
+    "implementation_commit": "3bdabdad550a95e3e0073f7486e972f4b492e079",
+    "harness_commit": "a594c870",
+    "verified_source_patch_sha256": "9fc9a496ea9635b034619820f911d29c60a5660b4261d0dd87a496822b71b47d",
+    "integrated_code_heads_before_doc_receipt": {
+      "/home/m2on/projects/gufo-f3-integ": "3bdabdad550a95e3e0073f7486e972f4b492e079",
+      "/home/m2on/projects/gufo": "3bdabdad550a95e3e0073f7486e972f4b492e079",
+      "/home/m2on/projects/gufo-integ": "3bdabdad550a95e3e0073f7486e972f4b492e079"
+    },
+    "main_preexisting_untracked": [
+      ".dockerignore"
+    ],
+    "remote_push": false,
+    "cleanup": {
+      "browser_cache_receipt": "build/f3-tgmtp-profile/CACHE-CLEANUP.json",
+      "unused_packaging_cache_receipt": "build/f3-tgmtp2/packaging-cache-cleanup.log",
+      "root_free_bytes_after_cleanup": 161865117696,
+      "preserved": "Nix trees, artifacts, controls, rejected prototypes and all images"
+    }
+  }
 }

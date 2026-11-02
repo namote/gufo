@@ -45,8 +45,11 @@ has moved priority toTG/MTP. Do not restart prefill experiments automatically.
 Future TG/MTP work must begin from these saved results, use small checks,
 preserve current controls and batch long verification. Any new grouped>8 HC
 or cost-model calibration remains a distinct future scope, not a measured win.
-Root disk floor150GiB; only disposable inactive browser caches were cleared
-this round, with cleanup receipt retained. Main worktree `.dockerignore` is
+Implementation `3bdabdad` is fast-forwarded locally into all three worktrees;
+harness plans are saved at ai.tools `a594c870`. The committed code/test patch
+exactly matches the qualified image patch hash.
+Root disk floor150GiB; disposable inactive browser caches and unused image
+packaging cache were cleared, with both cleanup receipts retained. Main worktree `.dockerignore` is
 pre-existing and untouched. No remote push or deployment.
 
 
