@@ -1188,3 +1188,15 @@ production branch is the first shape, singleton2048. The previously successful
 batch512 collector cannot execute it and is reused; it was not repeated or
 misrepresented as a fresh batch3 collector. All seven K7 shape/group screens
 also passed exact outputs. [Evidence](../../../plan/exl3/F3-PREFILL-GRID.md).
+
+## HC load grouping candidate, November 2, 2026
+
+Actual production objects pass three saved fused six-payload comparisons
+(residual, normalized FP16, scales, Q8, subsequent mix/inject), finite outputs
+and tail guards. Four independent Sylvester oracle cases cover full5/tail1
+with power-of-two and non-power-of-two FP16 scales; checked-in regression now
+preserves the two restore products explicitly. Earlier unpinned reassociation
+failed exactness and was fixed before timing. Prototype standalone24-case
+parity additionally covers widths128/2560, used1/10/16, stride0/3 and tail1.
+This is operator evidence only; full model/chunk qualification waits for the
+combined batch. [Exact scope and receipts](../../../plan/exl3/F3-HC-LOAD-SCREENS.json).

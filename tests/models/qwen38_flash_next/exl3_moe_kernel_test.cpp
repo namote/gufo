@@ -892,10 +892,10 @@ void PrefillDispatch(gpu::Exl3BucketGemm gemm, int bits, int up_bits = 0,
   Check(hipStreamDestroy(stream));
 }
 
-// Independent dense Sylvester oracle on frozen FP16 raw dots. Dyadic
-// weights/scales make the products exact, so this checks bits without relying
-// on a second GPU route or on FP32-vs-FP16 projection tolerances.
-void PrefillCombineFrozenRows() {
+// Independent dense Sylvester oracle on frozen FP16 raw dots. Integer sums
+// and power-of-two weights isolate the restore products; irregular scales
+// also exercise their FP32 rounding order without a second GPU reference.
+void PrefillCombineFrozenRows(bool irregular_scales = false) {
   constexpr unsigned rows = 5, used = 3, experts = 6, width = 256;
   constexpr unsigned assignments = rows * used;
   Buffers buffers;
@@ -915,8 +915,10 @@ void PrefillCombineFrozenRows() {
   for (unsigned a = 0; a < assignments; ++a)
     for (unsigned j = 0; j < width; ++j)
       raw[inverse[a] * width + j] = ex::HalfFromDouble(dot(a, j) / 64.0);
-  const auto scale = [](unsigned e, unsigned j) {
-    return std::ldexp(((e + j) % 3) == 0 ? -1.0F : 1.0F,
+  const auto scale = [irregular_scales](unsigned e, unsigned j) {
+    const float mantissa =
+        irregular_scales ? 1.0F + float((e * 13 + j) % 7) / 32.0F : 1.0F;
+    return std::ldexp(((e + j) % 3) == 0 ? -mantissa : mantissa,
                       int((e + j / 128) % 3) - 1);
   };
   std::vector<ex::DeviceLinear> bank(experts);
@@ -942,8 +944,10 @@ void PrefillCombineFrozenRows() {
           const int sign = (std::popcount((j % 128) & col) % 2) ? -1 : 1;
           sum += sign * dot(a, (j / 128) * 128 + col);
         }
-        const float restored =
-            ((sum / 64.0F) * ar::kHadamardScale) * scale(ids[a], j);
+        // Preserve the two FP32 products independently of compiler
+        // reassociation; non-power-of-two scales exercise this boundary.
+        volatile float scaled = (sum / 64.0F) * ar::kHadamardScale;
+        const float restored = scaled * scale(ids[a], j);
         acc = acc + weights[a] * restored;
       }
       expected[t * width + j] = acc + 0.5F * shared[t * width + j];
@@ -1546,6 +1550,7 @@ int main() {
             Buckets(rows, shared, tile_rows, bits);
     }
     PrefillCombineFrozenRows();
+    PrefillCombineFrozenRows(true);
     FusedProducer(3, true, 4, 3, 7);  // Different rates in distinct banks.
     PrefillDispatch(ControlGemm, 4, 3, 7);
     PrefillDispatch(gpu::Exl3PrefillBucketInner, 4, 3, 7);

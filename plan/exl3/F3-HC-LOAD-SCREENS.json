@@ -1,0 +1,133 @@
+{
+  "status": "SOURCE_SELECTED_OPERATOR_CHECKED_PENDING_COMBINED_MODEL_QUALIFICATION",
+  "production_source_changed": true,
+  "qualified_image_changed": false,
+  "qualified_pp2048_unchanged": 1429.13,
+  "full_model_executions": 0,
+  "profile_executions": 0,
+  "decision": "Select grouped raw/SVH/shared loads with explicit original restore rounding boundary. Do not select the extra DPP transport: effectively equal timing with more code. Preserve both prototypes and saved controls; combine full qualification with other pending prefill work.",
+  "toolchain": "Pinned Nix ROCm10.1 gfx1151; actual patched ROCr/CLR paths in each manifest/provenance",
+  "source_base": "b2060f7c",
+  "mechanism": {
+    "helper": "Exl3PrefillMoeSegment",
+    "load_groups": "Four adjacent FP16 raw values, four FP16 SVH values, four shared FP32 values before arithmetic pins. Existing 128-point butterfly and slot accumulation order unchanged.",
+    "rounding_fix": "First version failed exactness before timing: hoisting allowed v*(HadamardScale*svh). Explicit pinned scaled=v*HadamardScale preserves original compiled (v*HadamardScale)*svh. No tolerance or golden changed.",
+    "resources": "Prototype baseline and both fixed candidates96VGPR, zero private/spills. No new workspace. Actual production compiled separately, no original objects overwritten.",
+    "already_optimized": "Existing HcMix gate float4 loads already all issue before first wait. Do not repeat that load-hoist experiment."
+  },
+  "screen": {
+    "rows": 2048,
+    "hidden": 2560,
+    "used_experts": 10,
+    "expert_bank": 17,
+    "plain_ms": {
+      "baseline": 2.02531,
+      "grouped_loads": 1.84565,
+      "grouped_loads_dpp": 1.84522
+    },
+    "after_256MiB_write_ms": {
+      "baseline": 2.09518,
+      "grouped_loads": 1.90804,
+      "grouped_loads_dpp": 1.91
+    },
+    "grouped_loads_change_percent": {
+      "plain": -8.87074077548623,
+      "after_write": -8.931929476226387
+    },
+    "contract": "HcCombine only, two warmups plus10 event samples/condition. Repeated residual updates identical between arms. Write flush outside event. Synthetic cache pressure, not a real full producer/consumer pipeline.",
+    "baseline_policy": "This new operator condition measured once per plain/write condition, saved to controls. Original19x1 control reused after failed first candidate. Actual production replay uses saved hashes, no baseline execution. No old model/profile rerun.",
+    "limits": "Operator advisory only; not8.9% whole-prefill improvement. No counters or causal stall percentages."
+  },
+  "correctness": {
+    "fused_prototype": "Three cases19x1,19x16,2048x10 for each of two candidates. Exact SHA256 of residual, normalizedFP16, scales, Q8, following HcMix output and inject; finite and guards.",
+    "standalone_prototype": "Independent integer Sylvester oracle2 plus24 exact production comparisons: widths128/2560,used1/10/16,full19/tail1,gate_stride0/3. Non-power-of-two SVH scales. Output poison, finite, guards.",
+    "actual_production": "Both production TUs rebuilt with original compile commands; same fused three saved six-payload hashes pass. Independent Sylvester oracle4 with power-of-two and irregular exactly-half-representable scales, full5/tail1; strict host arithmetic, fast-math device. Output poison, finite, guards. No timing.",
+    "regression": "Checked-in frozen oracle adds irregular scales and explicit two FP32 restore products. The failed reassociation changes279/1280 expected values in reviewer analysis.",
+    "scope_limits": "No model accuracy, chunk invariance or model performance requalification in this bounded iteration."
+  },
+  "receipts": {
+    "fn-hc-loads-nix101": {
+      "path": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-hc-loads-nix101",
+      "status": "FAILED_no_fallback",
+      "health_PASS": true,
+      "files": {
+        "receipt/run/MANIFEST.json": "662c4d720a8f10065d056bd3a8d5530f2a9d8812b7f94cd00ff3c5eb19d3e4fe",
+        "receipt/run/RESULT.json": "23467ba8d8dba08fb4bb75f21a060022d295b6c8ef04fef095dd2d43ea058fb9",
+        "receipt/run/provenance.json": "e3b44ff445c4a3d0f8d828e8b347f212221b0d22fde2aa7b2840f365b8184580",
+        "WINDOW.json": "b8457f0daa2bd0e4b8205bdb94a67e712956452d45bf214135efd034771ff258"
+      }
+    },
+    "fn-hc-loads-r2-nix101": {
+      "path": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-hc-loads-r2-nix101",
+      "status": "COMPLETE",
+      "health_PASS": true,
+      "files": {
+        "receipt/run/MANIFEST.json": "92079a074fdb2a0efa371ea6275c2c86e98418fe097c63db7c9c165ced095498",
+        "receipt/run/RESULT.json": "bacc4846f4c320e5d53e5ccaefddede633588d31d72e365f1a4d29de282a510a",
+        "receipt/run/provenance.json": "e9b33a565cf6d3ea31a604f1c1b74f0520f64c4b8c9bb13a3e7696f30efe6248",
+        "WINDOW.json": "49fb992f835cc905f83b3e44283c1ae046f0763b6dba3c322ef002c11a69f98d"
+      }
+    },
+    "fn-hc-oracle-nix101": {
+      "path": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-hc-oracle-nix101",
+      "status": "COMPLETE",
+      "health_PASS": true,
+      "files": {
+        "receipt/run/ORACLE-MANIFEST.json": "cd17d10b318d867080862b2f977c829c581b08d4f6b268166d0867e127f386ec",
+        "receipt/run/RESULT.json": "61dafcabde78dd2c0457ae1a3b82281afc54f8be34d1180199e64e2beb9d044e",
+        "receipt/run/oracle-provenance.json": "d5e22cf4bacf8fb40c943e4212adadd56d8e7049627b1722460b49ee6ed2d548",
+        "WINDOW.json": "6d5ee6d8d1c909d3afb7f8cb8ad81d2d4e80d2c3422120875f8f58774f0aa022"
+      }
+    },
+    "fn-hc-prodcheck-nix101": {
+      "path": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-hc-prodcheck-nix101",
+      "status": "COMPLETE",
+      "health_PASS": true,
+      "files": {
+        "receipt/run/MANIFEST.json": "9111236403fbf239c6ad6adfd07561988291fe6fce5568af0fa0d02adce6125e",
+        "receipt/run/RESULT.json": "88e6b52cfe7d315469b3932f4c13307fac04ad5017d9e382501f4299a3fb98eb",
+        "receipt/run/provenance.json": "7da249aac1a81e74a56eb0310d5b502f5ae33a9b0a6d7b157014089ceabff44f",
+        "WINDOW.json": "3b246caba0e9361643e9ff0ee1b37994530a5d47b46191ac459f125c6c199012"
+      }
+    }
+  },
+  "artifacts": {
+    "build/f3-hc-loads/INCLUDE-CLOSURE.json": "748cbdcadd67bfdf023885a15354fdb0a53f6cb8b9fb388c496f9470ba25e2a4",
+    "build/f3-hc-loads/build-r2.log": "bc52ff4ef81c6fea13907b8589316cfa0424884c7557bea441ab925f91adb7a5",
+    "build/f3-hc-loads/build-r3.log": "bc52ff4ef81c6fea13907b8589316cfa0424884c7557bea441ab925f91adb7a5",
+    "build/f3-hc-loads/build.log": "66807c8e902e86db1d745367eddd712ca2d1e0d68429bc76b77651a52a83f1fd",
+    "build/f3-hc-loads/build.sh": "8b390be90500b91190b0b1336343bc576c50f303f98718135f0cb35b6c610ad6",
+    "build/f3-hc-loads/candidate.hpp": "850fc9c556e95e7d34c33c01d57fb44d79a8eb5fceab9ea0f397c259224e754e",
+    "build/f3-hc-loads/compiler.txt": "33e4b542e9888fe837c8b5d93824d07a830b2a30c0dad1a987477684d1066682",
+    "build/f3-hc-loads/kernel.hip": "44ea368f9be2a415eb9b8f3e10f698170e8bd0a4acd40a2af336973cdb777e4a",
+    "build/f3-hc-loads/run_screen.py": "8424625b5198f9d68759a329d42820536f0c6c0afbbd4ae67dc766ddd1b1a887",
+    "build/f3-hc-loads/screen.hip": "839a86974fa18e423c2eb9a25eeee2c4a73ac343af0e92603b23ff76bda41954",
+    "build/f3-hc-loads/v1/INCLUDE-CLOSURE.json": "f19cf2a1d6378b18701056adc0f78d8925a5f9c3ba87cd2088c726c735d3ae2b",
+    "build/f3-hc-loads/v1/candidate.hpp": "9da18d745b17463c94061eaeb2a7bc2faedbb15208c44909852f97b34e74e0d5",
+    "build/f3-hc-loads/v1/kernel.hip": "44ea368f9be2a415eb9b8f3e10f698170e8bd0a4acd40a2af336973cdb777e4a",
+    "build/f3-hc-loads/v1/run_screen.py": "564c1a83ac7c13e6d20faeb5eceeab3f8dfcbf6ebd2e85762ee93df577cb7393",
+    "build/f3-hc-loads/v1/screen.hip": "839a86974fa18e423c2eb9a25eeee2c4a73ac343af0e92603b23ff76bda41954",
+    "build/f3-hc-oracle/build-r2.log": "7282da677ec57130f22e5cf3fb9e81367183078f1a73849784b7d60061bcb23a",
+    "build/f3-hc-oracle/build.log": "7282da677ec57130f22e5cf3fb9e81367183078f1a73849784b7d60061bcb23a",
+    "build/f3-hc-oracle/build.sh": "722c4a90980548c01183841f9d024cd917767db426462052e797476dd3b16cb1",
+    "build/f3-hc-oracle/compiler.txt": "33e4b542e9888fe837c8b5d93824d07a830b2a30c0dad1a987477684d1066682",
+    "build/f3-hc-oracle/run_screen.py": "41bd8587f98f1ba122382eda33f9d1d4ddf49a30786d90ecdc12b5ed13636da2",
+    "build/f3-hc-oracle/screen.hip": "1eac0d854e25a71772da258ef66709ae30e5a14979a46c875dfff2d97a730f89",
+    "build/f3-hc-production/COMPILE-COMMANDS.json": "547cac6b044970743e67ef632ef8da2634a7648702344d534b39ae85dbc103e3",
+    "build/f3-hc-production/build-r2.log": "d80b77ecd5b3289b63674df3639e0b2f9098cfb60b1c9ba343da33431898c446",
+    "build/f3-hc-production/build.log": "dde793358ba481ba460819e778396ca6791e8065187a03e43487460ca4c8128f",
+    "build/f3-hc-production/build_objects.py": "d21ac70713cb670b1e743188b4fcf1ddd03b5a806374c6848a43812f952af6a5",
+    "build/f3-hc-prodcheck/build.log": "09cb8e3bab67fc29a4d3b5b84ab10433af8b4546ac073d1c31f9e2847e99772f",
+    "build/f3-hc-prodcheck/build.sh": "8bd406d203e914eef10d119f737bfdca0b9d3664c502410cd403bdb042bc41c6",
+    "build/f3-hc-prodcheck/compiler.txt": "33e4b542e9888fe837c8b5d93824d07a830b2a30c0dad1a987477684d1066682",
+    "build/f3-hc-prodcheck/oracle.hip": "2d29dd67bf4e8e77e8e5d7190ea788ae128818aca77bdf6846a106ae8e8d4745",
+    "build/f3-hc-prodcheck/run_screen.py": "444b686f6be531f253cd0de13c49a7980bb45a941a9b5c9d425e164b16856136",
+    "build/f3-hc-prodcheck/screen.hip": "0a16876727fa4a93f74bca3ccca0c590505891bf426aaa9b1239a4d13d5948cd",
+    "src/models/qwen38_flash_next/kernels/rocm/exl3_prefill_combine.hpp": "cef938abd560337fe3275c11674f1e9a495b5624bb07fb012f9feaab9e28d789",
+    "tests/models/qwen38_flash_next/exl3_moe_kernel_test.cpp": "82326bab29ea9d6e20ed6422ab6ef879ef22bcb4ab1de087a0861cf2f9abff9b"
+  },
+  "next": "Retain source candidate pending combined prefill qualification with preserved MoE staging patch. Use saved profile for remaining HC/dense leads; no repeat gate-hoist, DPP or baseline screens.",
+  "receipt_metadata_caveat": "Generic unit RESULT source_revision/binary_SHA are inherited runner metadata, not these operator binaries. Use per-run MANIFEST/ORACLE-MANIFEST hashes, compiler and runtime maps for actual identities.",
+  "review": "Second reviewer approved code and re-reviewed final evidence: bounds/rounding, regression sensitivity,49 artifact/receipt hashes, timing percentages, and scope distinctions. No remaining fixes.",
+  "format_check": "Pinned clang-format21.1.8; tools/ci/check-format.py PASS758 C++ files. build/f3-hc-production/format-final.log"
+}

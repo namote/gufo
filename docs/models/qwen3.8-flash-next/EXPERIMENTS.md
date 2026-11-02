@@ -501,3 +501,23 @@ has340.764ms temporal overlap; this is not net speedup. No new counter/stall
 or quality claim; qualified clean1429.13 remains current. Two failed startup
 collections and the successful trace are preserved. [Provenance, shape totals,
 coverage and limits](../../../plan/exl3/F3-CURRENT-PREFILL-PROFILE.json).
+
+## HC MoE-combine operand loads, November 2, 2026
+
+Selected in source, pending combined model qualification: group four adjacent
+raw FP16, SVH FP16 and shared FP32 loads before arithmetic pins. The original
+compiled restore order needs an explicit intermediate pin; the first unpinned
+prototype failed exactness before timing and is preserved. Fixed Nix10.1
+synthetic HC combine2048/hidden2560/used10:2.02531→1.84565ms (−8.87%);
+after256MiB write flush2.09518→1.90804ms (−8.93%). Extra DPP transport
+1.84522/1.91000ms adds no useful gain and is not selected. Prototype96VGPR,
+zero private/spills throughout; no additional workspace.
+
+Both actual production TUs compile and match all six saved fused-output
+hashes on19×1,19×16,2048×10 cases, including following norm/mix outputs.
+Independent Sylvester oracle4 passes with irregular scales/full5/tail1;
+prototype standalone parity24 also passes. Guards/finite/poison included.
+No baseline replay, model run or profile for the production check. These are
+operator timings, not a whole-prefill speedup; qualified1429.13tok/s remains.
+HcMix gate loads are already grouped in ISA; do not repeat that lead.
+[Failures, all candidates, hashes and receipts](../../../plan/exl3/F3-HC-LOAD-SCREENS.json).

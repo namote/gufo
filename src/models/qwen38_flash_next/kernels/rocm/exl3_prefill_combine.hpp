@@ -55,19 +55,28 @@ __device__ __forceinline__ void Exl3PrefillMoeSegment(
     const auto expert = static_cast<unsigned>(m.ids[assignment]);
     const auto* svh = reinterpret_cast<const _Float16*>(m.bank[expert].svh);
     const auto offset = std::size_t{packed} * m.width + first;
+    // Read adjacent operands together before the arithmetic pins, which
+    // otherwise serialize four independent loads and their waits.
+    _Float16 raw[4], signs[4];
+    __builtin_memcpy(raw, static_cast<const _Float16*>(m.raw) + offset,
+                     sizeof(raw));
+    __builtin_memcpy(signs, svh + first, sizeof(signs));
     float v[4];
 #pragma unroll
-    for (unsigned j = 0; j < 4; ++j) {
-      v[j] =
-          static_cast<float>(static_cast<const _Float16*>(m.raw)[offset + j]);
+    for (unsigned j = 0; j < 4; ++j)
+      v[j] = static_cast<float>(raw[j]);
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j)
       asm volatile("" : "+v"(v[j]));
-    }
     arithmetic::Butterfly128(v, lane);
     const float w = m.weights[assignment];
 #pragma unroll
     for (unsigned j = 0; j < 4; ++j) {
-      float restored = (v[j] * arithmetic::kHadamardScale) *
-                       static_cast<float>(svh[first + j]);
+      // Keep the original compiled rounding boundary. Hoisting svh can
+      // otherwise reassociate this as v * (kHadamardScale * svh).
+      float scaled = v[j] * arithmetic::kHadamardScale;
+      asm volatile("" : "+v"(scaled));
+      float restored = scaled * static_cast<float>(signs[j]);
       asm volatile("" : "+v"(restored));
       float a = acc[j] + w * restored;
       asm volatile("" : "+v"(a));
@@ -76,10 +85,12 @@ __device__ __forceinline__ void Exl3PrefillMoeSegment(
   }
   const float g = m.gate[std::size_t{t} * m.gate_stride];
   const float sig = 1.0f / (1.0f + __expf(-g));
+  float shared[4];
+  __builtin_memcpy(shared, m.shared + std::size_t{t} * m.width + first,
+                   sizeof(shared));
 #pragma unroll
   for (unsigned j = 0; j < 4; ++j) {
-    const std::size_t idx = std::size_t{t} * m.width + first + j;
-    float o = acc[j] + sig * m.shared[idx];
+    float o = acc[j] + sig * shared[j];
     // Stored by PrefillCombineKernel: no later product may fold into it.
     asm volatile("" : "+v"(o));
     out[j] = o;

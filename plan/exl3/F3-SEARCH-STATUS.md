@@ -16,18 +16,27 @@ extra baseline or deep-context profile was collected.
 
 ## Latest bounded kernel batch
 
+HC MoE combine load grouping is now selected in source, pending combined
+model qualification. The fixed candidate saves8.87/8.93% in plain/write-pressure
+synthetic operator conditions, with unchanged96VGPR/no spills. Actual production
+fused saved-hash replay and independent irregular-scale oracle pass. Extra DPP
+is not selected because timings are effectively equal. HcMix gate loads are
+already hoisted, so that proposed lead is closed without another GPU sweep.
+[All outcomes and preserved evidence](F3-HC-LOAD-SCREENS.json). The qualified
+image/rates are unchanged; the MoE staging patch below remains preserved.
+
 Dead B-subtile preparation and the invariant K-tail check have now been
 implemented and screened on pinned Nix10.1. Raw gate/down times improve about
 1% against saved controls; the complete shared-side operator is−0.50% at2048
 but+0.46% at512 (historical/advisory, not a qualified speedup). All saved-output
 checks and144 boundary/exponent refactor checks pass. Preserve the
 [K5 Mode3 candidate patch](F3-MOE-STAGING-CANDIDATE.patch) for the next combined
-batch; production code and the qualified image are unchanged. Do not rerun
+batch; that patch is not applied and the qualified image is unchanged. Do not rerun
 these small screens or start a long model validation for this alone.
 [Measurements, resources and reproducibility](F3-MOE-STAGING-SCREENS.json).
-Trellis address bases/offsets are already hoisted by the compiler. The next
-larger investigation is HC-family combine/mix data movement using the saved
-profile/dirty-cache evidence; no repeat profile is required to start it.
+Trellis address bases/offsets are already hoisted by the compiler. The HC load follow-up above uses the saved profile/dirty-cache evidence.
+Remaining HC projection/dense leads require a concrete mechanism before another
+screen; preserve existing negative results. No repeat profile is needed.
 
 ## Retained and qualified
 

@@ -1,5 +1,14 @@
 # EXL3 / Flash-Next F3 handoff (2026-11-02; qualified shared-MoE/KVarN batch)
 
+Latest source candidate: HC MoE combine operand-load grouping, exact after
+pinning the original two-product restore order. Synthetic fused operator
+−8.87% plain/−8.93% after write pressure; actual production two-TU replay and
+independent irregular-scale oracle pass. Extra DPP transport is not selected.
+[Frozen screens/failed prototype/actual-object proof](F3-HC-LOAD-SCREENS.json).
+Source is selected; qualified image and1429.13tok/s remain unchanged pending
+one combined model qualification with other pending work. Do not repeat these
+screens or the HCmix gate-load hoist (already present in ISA).
+
 Latest kernel follow-up: dead16-row B staging plus the redundant K-tail
 check were implemented and screened, with144 boundary/exponent checks exact.
 Raw gate/down improve about1%; current shared-side2048 span14.7609→14.6878ms,
@@ -7,8 +16,7 @@ Raw gate/down improve about1%; current shared-side2048 span14.7609→14.6878ms,
 The [narrow K5 Mode3 patch](F3-MOE-STAGING-CANDIDATE.patch) is preserved for a
 later combined batch, not applied to production or qualified by a new model
 run. [Receipts/resources/source closure](F3-MOE-STAGING-SCREENS.json).
-Reuse all controls and intermediate builds. Next larger lead: HC combine/mix
-traffic from the saved profile; do not rerun a full profile or this screen.
+Reuse all controls and intermediate builds. HC follow-up is recorded above; do not rerun a full profile or this screen.
 
 Current-version profiling is complete at the user's request. Exact shared5,
 Nix10.1, pp2048/d0/k4v4/context4096: measured GPU span1434.413ms, kernel busy

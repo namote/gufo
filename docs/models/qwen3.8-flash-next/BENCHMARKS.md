@@ -191,3 +191,12 @@ C1, context capacity 133121, AR. Peak memory reported by HIP.
 <!-- /bench -->
 
 ![Memory occupation](artifacts/charts/memory.svg)
+
+## Pending HC combine candidate, November 2, 2026
+
+Qualified pp2048 remains1429.13±1.13tok/s. The source-selected HC operand-load
+change reduces one synthetic2048-row fused combine screen by8.87% (plain)
+and8.93% (after256MiB write pressure); these are not model measurements.
+No model baseline or full profile was repeated. Preserve saved controls and
+Nix production objects for the next combined qualification.
+[Scope, both variants and receipts](../../../plan/exl3/F3-HC-LOAD-SCREENS.json).
