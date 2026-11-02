@@ -1,6 +1,19 @@
 # EXL3 / Flash-Next F3 handoff (2026-11-02; native EXL3 qualified)
 
-## Current selection: Flash-Next shared K4V4 KV and Pi
+## Local Pi configuration update: C4 / 512K
+
+User selected C4 with524288 tokens per session. Same shared-KV image below,
+static YaRN factor2 enabled,4098 blocks/9920176128B pool (two full contexts),
+RAM continuation retention2GiB and disk50GiB. Pi client context also524288.
+Ready36.14s; short C4 first/repeat eight requests and Pi1.4.0 three tasks/nine
+tools pass. Host16GiB floor remains enforced. Initial Pi harness run used a
+relative config path and sent no request; corrected absolute-path run passes.
+No full512K quality/occupancy/latency test, and earlier native256K numerical
+and speed qualification does not establish YaRN equivalence. Receipts/config:
+ai.tools test/experiments/gufo_upstream_port_20261023/c4_512k_artifacts.
+`/home/m2on/projects/pitest/README.txt` describes current execution.
+
+## Qualified implementation: Flash-Next shared K4V4 KV and Pi (256K evidence)
 
 Implemented shared two-context pool (2050 blocks,4.62GiB), C4 with262144
 tokens per session,4GiB RAM continuation cache and50GiB disk quota. Current
