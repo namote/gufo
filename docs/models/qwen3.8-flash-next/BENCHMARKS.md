@@ -1,5 +1,15 @@
 # Qwen3.8 Flash-Next benchmarks
 
+## Shared KV and durable continuation, November 2, 2026
+
+Shared KV implementation preserves native5.05/K6 standard model rates against
+saved baseline (no rerun): PP2048/8192 1426.88/1460.75 →1425.09/1462.00;
+AR128 d0/d32K25.20/24.49 →25.20/24.47; MTP40.85/79.48 →40.92/79.27tok/s.
+All hashes exact, maximum change0.264%; d32K MTP is lookup-heavy.
+C4 shared serving passes and actual disk restore uses12352 cached+7 prefill
+in0.486s with identical output. No full two-times-256K timing claim.
+[Evidence and limitations](../../../plan/exl3/F3-SHARED-KV.md).
+
 ## Exact live-row verification, November 2, 2026
 
 Native5.05/K6 n-gram, Nix ROCm10.1, kvarn-k4v4, two repeats per configured

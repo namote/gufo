@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "src/core/hip/host_allocations.hpp"
+#include "src/core/hip/kv_block_pool.hpp"
 #include "src/core/hip/kvarn_layout.hpp"
 #include "src/core/session_mode.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
@@ -134,6 +135,13 @@ public:
   /// Drops every token; the next Forward starts at position 0. Cache slot
   /// reassignment may retain bounded MTP scratch and its recorded graphs.
   void Reset(bool reuse_mtp = false);
+  // Stable device table; only newly mapped entries are uploaded before writes.
+  void EnsureKvRows(std::uint32_t rows);
+  void TrimKvRows(std::uint32_t rows);
+  std::uint32_t ReserveKvRows(std::uint32_t rows, std::uint32_t margin);
+  std::uint32_t ReleaseKvReservation() noexcept;
+  [[nodiscard]] std::size_t MappedKvBlocks() const { return kv_blocks_.size(); }
+
   void SetCancellationCheck(std::function<bool()> check);
   [[nodiscard]] bool CheckCancellation(std::string* error) const;
   [[nodiscard]] bool Cancelled() const noexcept { return cancelled_; }
@@ -236,7 +244,13 @@ private:
   __half* kvarn_fp16_{nullptr};
   std::uint8_t* kvarn_records_{nullptr};  ///< record plane, attention layer 0
   std::size_t kvarn_records_pitch_{0};    ///< bytes per layer of that plane
-  const std::uint32_t* kv_table_{nullptr};
+  std::uint32_t* kv_table_{nullptr};
+  std::shared_ptr<hip::KvBlockPool> kv_pool_;
+  hip::KvBlockReservation kv_reservation_;
+  hip::HostAllocations kv_table_host_owner_;
+  std::uint32_t* kv_table_host_{nullptr};
+  std::vector<std::uint32_t> kv_blocks_;
+
   RollbackRows ple_snapshots_;  ///< [max_spec-1][PleConvHistory()][hc_dim]
   NgramHistory ngram_;
   std::vector<NgramHistory> ngram_snapshots_;
@@ -310,7 +324,10 @@ public:
 
   [[nodiscard]] std::unique_ptr<Session> CreateSession(
       core::SessionMode mode, std::uint32_t max_context,
-      std::string* error_msg = nullptr) const;
+      std::string* error_msg = nullptr,
+      std::shared_ptr<hip::KvBlockPool> pool = {}) const;
+  [[nodiscard]] hip::KvBlockGeometry KvGeometry(core::SessionMode mode,
+                                                std::uint32_t context) const;
   /// KVarN sessions: plans a forward over rows [start, start + n) and
   /// quantizes the groups it needs before running (KvarnPass), then records
   /// the tail after it, quantizing a group that ends exactly at the new

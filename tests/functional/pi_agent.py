@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Real Pi agent regression for #368; executes generated code in disposable fixtures.
 
-Requires Pi 0.87.0 and Node, and an already-running local Gufo server. Keeps Pi
+Defaults to Pi 0.87.0; another installed version must be selected explicitly.
+Node is required for the JavaScript tasks. Needs a running local Gufo server. Keeps Pi
 sessions, exact HTTP bodies/SSE, task files and individual request/task timings.
 """
 
@@ -17,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -393,6 +395,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--pi", type=Path, required=True)
+    parser.add_argument("--pi-version", default="0.87.0",
+                        help="Exact expected installed Pi version; retained in the receipt")
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--server-log", type=Path, required=True, help="Gufo informational log for request timing correlation")
@@ -411,10 +415,13 @@ def main():
     assert not args.output.exists(), "Use a fresh output directory; preserve previous evidence"
     args.output.mkdir(parents=True)
     version = subprocess.check_output([str(args.pi), "--version"], text=True).strip()
-    assert version == "0.87.0", f"Expected reporter's Pi 0.87.0, got {version}"
+    assert version == args.pi_version, f"Expected Pi {args.pi_version}, got {version}"
+    node = shutil.which("node")
+    selected = args.case or list(PROMPTS)
+    assert node or not {"creation", "bugfix"}.intersection(selected), "JavaScript tasks require Node"
     metadata = {
         "pi_version": version,
-        "node_version": subprocess.check_output(["node", "--version"], text=True).strip(),
+        "node_version": subprocess.check_output([node, "--version"], text=True).strip() if node else None,
         "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "options": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
     }

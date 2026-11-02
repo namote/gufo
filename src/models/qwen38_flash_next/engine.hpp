@@ -12,6 +12,7 @@
 #include <string_view>
 #include <vector>
 
+#include "src/core/hip/kv_block_layout.hpp"
 #include "src/core/sampling.hpp"
 #include "src/core/session_mode.hpp"
 #include "src/core/speculative/prompt_lookup.hpp"
@@ -23,6 +24,10 @@
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
+
+namespace gufo::hip {
+class KvBlockPool;
+}
 
 namespace gufo::core {
 class GgufReader;
@@ -81,7 +86,10 @@ public:
 
   [[nodiscard]] std::unique_ptr<Session> CreateSession(
       core::SessionMode mode, std::uint32_t max_context,
-      std::string* error_msg = nullptr);
+      std::string* error_msg = nullptr,
+      std::shared_ptr<hip::KvBlockPool> pool = {});
+  [[nodiscard]] hip::KvBlockGeometry KvGeometry(core::SessionMode mode,
+                                                std::uint32_t context) const;
 
   [[nodiscard]] std::vector<std::int32_t> Tokenize(std::string_view text) const;
   [[nodiscard]] std::string Decode(std::span<const std::int32_t> tokens) const;

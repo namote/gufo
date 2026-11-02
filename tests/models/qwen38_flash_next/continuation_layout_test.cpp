@@ -103,6 +103,38 @@ void Check(bool mtp) {
   Require(layout.PrivateBytes() - no_ple_layout.PrivateBytes() == 368640,
           "PLE history inventory is incorrect");
 }
+void CheckKvarn(bool mtp) {
+  const auto c = ProductionGeometry();
+  const qfn::ContinuationLayout plain(c, mtp, 262144, 8);
+  const qfn::ContinuationLayout layout(c, mtp, 262144, 8, true);
+  Require(layout.Components().size() == plain.Components().size() + 12,
+          "KVarN must replace two KV rows with records and two private rings");
+  Require(
+      layout.PrivateBytes() == plain.PrivateBytes() + 12 * 2 * 384 * 512 * 2,
+      "KVarN sink/tail reserve differs from independent geometry");
+  for (const auto target : {0U, 127U, 128U, 129U, 255U, 256U, 257U, 2047U,
+                            2048U, 2049U, 262143U, 262144U}) {
+    const auto draft = mtp && target ? target - 1 : 0;
+    const auto groups = target / 128 > 1 ? target / 128 - 1 : 0;
+    const auto positions =
+        layout.Positions(target, draft, target / 4, draft / 4);
+    const auto expected =
+        std::size_t{target} * 4 + std::size_t{groups} * 12 * 2 * 35072 +
+        std::size_t{target / 4} * 12 * 256 +
+        (mtp ? std::size_t{draft} * 2048 + std::size_t{draft / 4} * 256 : 0);
+    Require(layout.RowBytes(target, draft, target / 4, draft / 4) == expected,
+            "KVarN record frontier includes sink or incomplete group");
+    for (const auto& component : layout.Components()) {
+      const auto& d = component.descriptor;
+      if (component.part == qfn::ContinuationPart::kKvarnRecords) {
+        Require(d.row_bytes == 70144 && d.rows_per_chunk == 2,
+                "KVarN token-major record schema changed");
+        Require(positions[d.id.value - 1].valid_rows == groups,
+                "KVarN component position is not a completed group count");
+      }
+    }
+  }
+}
 void CheckExtendedContext(bool mtp) {
   const auto native = ProductionGeometry();
   Reject([&] {
@@ -190,6 +222,7 @@ int main() {
     Check(false);
     Check(true);
     for (const auto mtp : {false, true}) {
+      CheckKvarn(mtp);
       CheckExtendedContext(mtp);
       CheckBacking(mtp, 32768, 2, 8ULL << 30, 32, 2 * 32768);
       CheckBacking(mtp, 32768, 2, 2ULL << 30, 8, 2 * 4096);

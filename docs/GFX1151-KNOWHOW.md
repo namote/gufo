@@ -1463,3 +1463,27 @@ execution. Compiler evidence does not establish actual latency regression or
 the precise allocator cause. No new correctness/speed claim; existing
 prefill/TG/MTP implementation and saved baselines remain selected.
 [Scope, patches and resources](../plan/exl3/F3-PREFILL-LIVE-TILES.md).
+
+## Flash-Next shared K4V4 pool, November 2, 2026
+
+Retained: existing KvBlockPool shared across sessions, with exclusive blocks,
+stable tables, KVarN group-offset-aware transfers and canonical sink/tail state.
+Include the pooled-index guard in mapped/admission counts: two256K contexts
+need2050 blocks (4.62GiB). Host-backed checkpoints retain no GPU blocks; short
+restore must return excess mappings. Coalesce only physically and logically
+adjacent copies to preserve private-session transfer cost. Unsupported shared
+or KVarN in-pass checkpoints must return zero bytes/reject throughout the stack.
+
+Shared GPU fixtures92.04s and final103.511s pass, including fragmented mappings
+and saturated final-token admission. Numerical32760 rows/101424960 bytes exact
+against saved baseline. Remaining sampling/batches/32K/cache pass; initial
+aggregate mixed EOS assertion lacked clause diagnostics, focused diagnostic
+and serving sampling pass unchanged (not a proven noise diagnosis). An initial
+Python module-path failure resumed only unstarted checks; both failures retained.
+PP2048/8192 1426.88/1460.75→1425.09/1462.00, AR25.20/24.49→25.20/24.47,
+MTP40.85/79.48→40.92/79.27tok/s; hashes exact, maximum difference0.264%.
+No baseline rerun;32K MTP is lookup-heavy. No full two-times-256K inference.
+Actual C4 HTTP,12K long context, process-restart disk restore12352+7 tokens
+(0.486s, same output), Pi1.4.0 three tasks/nine tools pass. Cold/warm identity
+startup85.34/35.15s. Current image4757e04f, Nix10.1 incremental objects retained.
+[All results and provenance](../plan/exl3/F3-SHARED-KV.md).

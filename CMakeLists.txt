@@ -774,6 +774,11 @@ if (BUILD_TESTING)
   add_test(NAME component_text_cache_test COMMAND component_text_cache_test)
   set_tests_properties(component_text_cache_test PROPERTIES LABELS "cpu;server;cache;state;lifecycle")
 
+  add_executable(row_block_admission_test tests/cli/row_block_admission_test.cpp)
+  target_include_directories(row_block_admission_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME row_block_admission_test COMMAND row_block_admission_test)
+  set_tests_properties(row_block_admission_test PROPERTIES LABELS "cpu;cli;cache")
+
   add_executable(text_model_runner_test
     tests/cli/text_model_runner_test.cpp
     src/cli/serve/continuation_cache.cpp

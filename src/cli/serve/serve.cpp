@@ -718,7 +718,8 @@ void PrintServeHelp(std::string_view program_name,
         "Scheduling", &max_buffered_output_bytes_total);
     parser.AddOption(
         "", "--kv-pool-bytes", "N",
-        "Paged attention KV (Qwen 27B): bytes of the device pool every "
+        "Paged attention KV (Qwen 27B / Flash-Next): bytes of the device pool "
+        "every "
         "session shares, taking 256-token blocks as it writes; admission "
         "waits while the pool is short (default: 0 = every session at the "
         "full context). Must hold one full-context session; other models "
@@ -1362,7 +1363,8 @@ int RunServe(std::span<const char* const> args) {
         "Scheduling", &max_buffered_output_bytes_total);
     llm_parser.AddOption(
         "", "--kv-pool-bytes", "N",
-        "Paged attention KV (Qwen 27B): bytes of the device pool every "
+        "Paged attention KV (Qwen 27B / Flash-Next): bytes of the device pool "
+        "every "
         "session shares, taking 256-token blocks as it writes; admission "
         "waits while the pool is short (default: 0 = every session at the "
         "full context). Must hold one full-context session; other models "

@@ -217,14 +217,15 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   return m;
 }
 
-std::unique_ptr<Session> Model::CreateSession(core::SessionMode mode,
-                                              std::uint32_t max_context,
-                                              std::string* error_msg) {
+std::unique_ptr<Session> Model::CreateSession(
+    core::SessionMode mode, std::uint32_t max_context, std::string* error_msg,
+    std::shared_ptr<hip::KvBlockPool> pool) {
   if (max_context == 0 || max_context > options_.max_context) {
     AssignError(error_msg, "session context is outside the model limits");
     return nullptr;
   }
-  auto native = executor_->CreateSession(mode, max_context, error_msg);
+  auto native =
+      executor_->CreateSession(mode, max_context, error_msg, std::move(pool));
   if (!native) {
     return nullptr;
   }
@@ -298,6 +299,11 @@ std::string Model::ModelName() const {
 
 const Config& Model::config() const noexcept {
   return weights_->config;
+}
+
+hip::KvBlockGeometry Model::KvGeometry(core::SessionMode mode,
+                                       std::uint32_t context) const {
+  return executor_->KvGeometry(mode, context);
 }
 
 std::size_t Model::ResidentBytes() const noexcept {
@@ -447,8 +453,11 @@ std::uint64_t Session::SnapshotBytes() const {
 std::uint64_t Session::PrefillCheckpointBytes(std::uint32_t position) const {
   if (!session_->VisionLayout().images.empty())
     return 0;
-  return SessionSnapshotHostBytes(position, model_->VocabSize(), 0) +
-         model_->executor_->PrefillCheckpointBytes(*session_, position);
+  const auto payload =
+      model_->executor_->PrefillCheckpointBytes(*session_, position);
+  return payload ? SessionSnapshotHostBytes(position, model_->VocabSize(), 0) +
+                       payload
+                 : 0;
 }
 
 std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(

@@ -1948,9 +1948,7 @@ std::size_t TextRunnerPool::AdmissionRowBlocks(std::size_t rows) const {
   // which no admitted request does: a continued frontier ends in a block no
   // checkpoint retains (they retain complete blocks behind their boundary),
   // and a restore copies the rows of the block it splits.
-  return std::min((rows + pool.block_rows - 1) / pool.block_rows +
-                      TextModelRunner::kRowBlockMargin,
-                  (context + pool.block_rows - 1) / pool.block_rows);
+  return pool.AdmissionBlocks(rows, context, TextModelRunner::kRowBlockMargin);
 }
 
 bool TextRunnerPool::AdmissionReady(std::span<const TextRunnerToken> prompt,
@@ -1972,8 +1970,10 @@ bool TextRunnerPool::AdmissionReady(std::span<const TextRunnerToken> prompt,
   const auto continued = impl_->component_cache->ContinuedTokens(
       prompt, context, reuse_prompt, cache_prefix_tokens);
   const auto held = continued.live
-                        ? (continued.tokens + block_rows - 1) / block_rows
-                        : continued.tokens / block_rows;
+                        ? runner.RowBlocks().MappedBlocks(continued.tokens)
+                    : runner.RowBlocks().checkpoint_blocks_retained
+                        ? continued.tokens / block_rows
+                        : 0;
   need -= std::min(need, held);
   if (runner.RowBlocks().free_blocks >= need)
     return true;

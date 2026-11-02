@@ -15,9 +15,14 @@ namespace gufo::models::qwen38_flash_next {
 class ContinuationAdapter final : public cache::Adapter {
 public:
   ContinuationAdapter(std::shared_ptr<Model>, core::SessionMode,
-                      std::uint32_t context, cache::Identity);
+                      std::uint32_t context, cache::Identity,
+                      std::shared_ptr<hip::KvBlockPool> pool = {});
   ~ContinuationAdapter() override;
   [[nodiscard]] Session& GetSession(cache::Slot&);
+  std::uint32_t ReserveKvRows(cache::Slot&, std::uint32_t rows,
+                              std::uint32_t margin);
+  std::uint32_t ReleaseKvReservation(cache::Slot&) noexcept;
+  [[nodiscard]] std::size_t MappedKvBlocks(const cache::Slot&) const;
   // Capture synchronously while the coherent boundary is exposed; settle
   // all transfers before the callback returns and the shared arena is reused.
   void PrefillThrough(cache::Slot&, std::span<const std::int32_t>,
@@ -84,7 +89,10 @@ private:
   [[nodiscard]] cache::Completion Transfer(
       State&, bool load, cache::Stream&,
       const std::function<void(gufo::hip::TransferStream&)>&);
+  [[nodiscard]] Region RowRegion(State&, const ContinuationComponent&,
+                                 cache::Rows first, cache::Rows end) const;
   std::shared_ptr<Model> model_;
+  std::shared_ptr<hip::KvBlockPool> kv_pool_;
   core::SessionMode mode_;
   std::uint32_t context_;
   ContinuationLayout layout_;

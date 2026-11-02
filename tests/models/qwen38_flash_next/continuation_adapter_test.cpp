@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "src/cache/slot.hpp"
+#include "src/core/hip/kv_block_pool.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "tests/models/qwen38_flash_next/mtp_replay.hpp"
 
@@ -863,6 +864,108 @@ void CheckImages(const std::shared_ptr<qfn::Model>& model, bool mtp) {
   }
   std::cout << (mtp ? "MTP" : "AR") << ",image_restore,PASS\n";
 }
+void CheckSharedKvarn(const std::shared_ptr<qfn::Model>& model, bool mtp,
+                      std::span<const std::int32_t> prompt) {
+  const auto mode = mtp ? gufo::core::SessionMode::kSpeculative
+                        : gufo::core::SessionMode::kAutoregressive;
+  constexpr std::uint32_t context = 4096;
+  const auto geometry = model->KvGeometry(mode, context);
+  auto pool = std::make_shared<gufo::hip::KvBlockPool>(
+      std::vector<gufo::hip::KvBlockPlane>(geometry.planes().begin(),
+                                           geometry.planes().end()),
+      geometry.blocks() * 2);
+  qfn::ContinuationAdapter adapter(model, mode, context,
+                                   {'s', 'h', 'a', 'r', 'e'}, pool);
+  gufo::hip::TransferPool streams(2);
+  std::array<Guard, 4> guards;
+  std::array<std::unique_ptr<cache::Slot>, 4> slots;
+  for (std::size_t i = 0; i < slots.size(); ++i)
+    slots[i] = adapter.CreateSlot(guards[i]);
+  Require(pool->free_blocks() == pool->blocks(),
+          "empty slots preallocated whole contexts");
+  adapter.ReserveKvRows(*slots[0], context, 2);
+  adapter.ReserveKvRows(*slots[1], context, 2);
+  Reject([&] { adapter.ReserveKvRows(*slots[2], 1, 2); });
+  Require(pool->free_blocks() == 0, "failed reservation leaked capacity");
+  adapter.ReleaseKvReservation(*slots[0]);
+  adapter.ReleaseKvReservation(*slots[1]);
+  Require(pool->free_blocks() == pool->blocks(),
+          "reservations were not released");
+  std::string error;
+  auto oracle = model->CreateSession(mode, context, &error);
+  Require(bool(oracle), error);
+  auto& a = adapter.GetSession(*slots[0]);
+  auto& b = adapter.GetSession(*slots[1]);
+  for (const auto boundary :
+       {127U, 128U, 129U, 255U, 256U, 257U, 2047U, 2048U, 2049U}) {
+    for (auto& slot : slots)
+      Require(adapter.Invalidate(*slot), "shared slot reset failed");
+    oracle->Reset();
+    // Interleave another slot between the first and later logical blocks.
+    Require(a.Sync(prompt.first(17), &error), error);
+    Require(adapter.GetSession(*slots[2]).Sync(prompt.first(17), &error),
+            error);
+    Require(adapter.GetSession(*slots[3]).Sync(prompt.first(17), &error),
+            error);
+    Require(oracle->Sync(prompt.first(17), &error), error);
+    Require(a.Sync(prompt.first(boundary), &error) &&
+                oracle->Sync(prompt.first(boundary), &error),
+            error);
+    SameLogits(a, *oracle);
+    const auto saved = Capture(adapter, *slots[0], streams);
+    Require(!a.SaveSnapshot(&error),
+            "legacy snapshot accepted shared device rows");
+    Load(adapter, *slots[1], saved, streams);
+    Require(adapter.Validate(*slots[1], saved.positions),
+            "shared restore rejected");
+    Require(Capture(adapter, *slots[1], streams).bytes == saved.bytes,
+            "fragmented restore changed component bytes");
+    SameLogits(a, b);
+    const auto expected = Decode(*oracle, 12, boundary == 2049);
+    Require(Decode(a, 12, boundary == 2049) == expected &&
+                Decode(b, 12, boundary == 2049) == expected,
+            "shared mapping or restored KVarN boundary changed decoding");
+    SameLogits(a, b);
+    // Restoring an earlier frontier must return now-unused physical blocks.
+    const auto short_saved = [&] {
+      auto& short_session = adapter.GetSession(*slots[3]);
+      (void)short_session;
+      return Capture(adapter, *slots[3], streams);
+    }();
+    const auto before = pool->free_blocks();
+    const auto mapped = adapter.MappedKvBlocks(*slots[1]);
+    Load(adapter, *slots[1], short_saved, streams);
+    Require(adapter.Validate(*slots[1], short_saved.positions),
+            "short restore rejected");
+    Require(adapter.MappedKvBlocks(*slots[1]) == 1 &&
+                pool->free_blocks() == before + mapped - 1,
+            "short restore retained unreachable blocks");
+    std::cout << (mtp ? "MTP" : "AR") << ",shared_kvarn," << boundary << ",PASS"
+              << std::endl;
+  }
+  for (auto& slot : slots)
+    Require(adapter.Invalidate(*slot), "saturated fixture reset failed");
+  Require(a.Sync(prompt.first(context - 1), &error), error);
+  Require(b.Sync(prompt.first(context - 1), &error), error);
+  Require(pool->free_blocks() == 0,
+          "two full contexts did not saturate the pool");
+  Require(adapter.ReserveKvRows(*slots[0], context, 2) == 0 &&
+              adapter.ReserveKvRows(*slots[1], context, 2) == 0,
+          "live continuation reserved its already-mapped guard twice");
+  Require(a.Evaluate(prompt[context - 1], &error) &&
+              b.Evaluate(prompt[context - 1], &error),
+          error);
+  SameLogits(a, b);
+  Require(pool->free_blocks() == 0, "saturated continuation changed capacity");
+  Require(adapter.Invalidate(*slots[0]), "full source reset failed");
+  a.SetCancellationCheck([] { return true; });
+  Require(!a.Evaluate(prompt[0], &error), "cancelled shared session executed");
+  a.SetCancellationCheck({});
+  for (auto& slot : slots)
+    Require(adapter.Invalidate(*slot), "shared cancellation/reset failed");
+  Require(pool->free_blocks() == pool->blocks(), "shared reset leaked blocks");
+}
+
 void CheckLearnedDraftPolicy(const std::shared_ptr<qfn::Model>& model) {
   namespace qt = gufo::tokenization;
   gufo::hip::TransferPool streams(2);
@@ -903,6 +1006,8 @@ void CheckLearnedDraftPolicy(const std::shared_ptr<qfn::Model>& model) {
 }
 }  // namespace
 int main(int argc, char** argv) {
+  const bool shared_kvarn_only =
+      argc == 6 && std::string_view(argv[5]) == "--shared-kvarn-only";
   const bool guard_only =
       argc == 6 && std::string_view(argv[5]) == "--guard-only";
   const bool image_only =
@@ -914,19 +1019,22 @@ int main(int argc, char** argv) {
   const bool reuse_only =
       argc == 6 && std::string_view(argv[5]) == "--reuse-only";
   if ((argc != 5 && !guard_only && !image_only && !in_pass_only &&
-       !policy_only && !reuse_only) ||
+       !policy_only && !reuse_only && !shared_kvarn_only) ||
       std::string_view(argv[1]) != "--model" ||
       std::string_view(argv[3]) != "--mtp-model") {
     std::cerr << "Usage: continuation_adapter_test --model FIRST.gguf "
                  "--mtp-model MTP.gguf "
                  "[--guard-only|--image-only|--in-pass-only|--policy-only|"
-                 "--reuse-only]\n";
+                 "--reuse-only|--shared-kvarn-only]\n";
     return 77;
   }
   try {
     std::string error;
-    auto model = qfn::Model::Load(
-        argv[2], {.max_context = 16384, .mtp_model_path = argv[4]}, &error);
+    auto model = qfn::Model::Load(argv[2],
+                                  {.max_context = 16384,
+                                   .mtp_model_path = argv[4],
+                                   .kvarn = shared_kvarn_only},
+                                  &error);
     Require(bool(model), error);
     if (policy_only) {
       CheckLearnedDraftPolicy(model);
@@ -944,6 +1052,11 @@ int main(int argc, char** argv) {
     std::vector<std::int32_t> prompt(10000);
     for (std::size_t i = 0; i < prompt.size(); ++i)
       prompt[i] = pattern[i % pattern.size()];
+    if (shared_kvarn_only) {
+      CheckSharedKvarn(model, false, prompt);
+      CheckSharedKvarn(model, true, prompt);
+      return 0;
+    }
     // The repeated prefix can accept every draft. End the
     // sampled boundary with real code generation to exercise rejection and
     // residual replay as well as the long recurrent/KV state.

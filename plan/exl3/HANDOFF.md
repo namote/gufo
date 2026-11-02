@@ -1,5 +1,18 @@
 # EXL3 / Flash-Next F3 handoff (2026-11-02; native EXL3 qualified)
 
+## Current selection: Flash-Next shared K4V4 KV and Pi
+
+Implemented shared two-context pool (2050 blocks,4.62GiB), C4 with262144
+tokens per session,4GiB RAM continuation cache and50GiB disk quota. Current
+image `ai-tools/gufo-eval:f3-shared-kv-4757e04f-rocm101`; Pi1.4.0 workspace
+`/home/m2on/projects/pitest`, binds0.0.0.0:18740. Shared fixtures, numerical
+bytes,32K state, C4 HTTP, actual restart/disk restore and3 Pi tasks pass.
+PP/AR/MTP differ by at most0.264% from saved baseline; no baseline rerun.
+Full two-times-256K inference remains untested. Disk cache stores continuations,
+not active-page swap. The supervisor expires each window after one hour;
+`./server status` / `./server start` / `./pi`. Preserve all incremental objects.
+[Implementation, limits, failed attempts and complete results](F3-SHARED-KV.md).
+
 ## Latest: prefill live-subtile port rejected at compiler screen
 
 Three bounded X3 prototypes (four-way K loop, four-way full body, two-way
@@ -10,7 +23,7 @@ in build/f3-prefill-live-tiles and ai.tools prefill_live_tiles_artifacts.
 Do not repeat these clones without a distinct code-generation mechanism.
 [Resources, limits and reproduction](F3-PREFILL-LIVE-TILES.md).
 
-## Current selection: exact live-row verification retained
+## Retained kernels: exact live-row verification
 
 K5 R3/R4 gate/up and scaled down choose the actual row loop once per tile.
 Native5.05 MTP d0=40.85tok/s versus saved40.09 (+1.90%); d32K=79.48 versus78.53

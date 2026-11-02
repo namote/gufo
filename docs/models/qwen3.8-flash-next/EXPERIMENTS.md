@@ -1,5 +1,18 @@
 # Qwen3.8 Flash-Next experiments
 
+## Shared KV and durable continuation, November 2, 2026
+
+Selected: shared KvBlockPool for exclusive mapped per-session blocks, stable
+device tables and reservation admission; KVarN component snapshots and durable
+cache. Two256K contexts use2050 blocks/4962508800B including index guard;
+C4 shares this capacity. Coalesce adjacent transfers, return excess blocks on
+short restore, and keep host-only checkpoints out of GPU ownership accounting.
+Unsupported typed shared snapshots and KVarN/shared in-pass checkpoints reject
+explicitly. No arithmetic/precision change. Reused Nix10.1 objects and baseline;
+combined checks plus focused failure/fix checks pass, performance within0.3%.
+Pi workspace uses50GiB disk retention, not active KV swapping.
+[Evidence and limitations](../../../plan/exl3/F3-SHARED-KV.md).
+
 ## Prefill live-subtile selection, November 2, 2026
 
 Rejected at compiler screen: porting the TG/MTP live-row selection idea to

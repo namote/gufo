@@ -1,6 +1,7 @@
 #ifndef GUFO_SERVER_TEXT_MODEL_RUNNER_HPP_
 #define GUFO_SERVER_TEXT_MODEL_RUNNER_HPP_
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -434,6 +435,23 @@ public:
     /// Neither held by a state nor reserved for an admitted request.
     std::size_t free_blocks{0};
     std::size_t block_rows{0};
+    // Extra rows mapped after each positive frontier (e.g. pooled-key guard).
+    std::size_t row_guard_rows{0};
+    // Qwen checkpoints retain device blocks; host-only snapshots do not.
+    bool checkpoint_blocks_retained{true};
+    [[nodiscard]] std::size_t MappedBlocks(std::size_t rows) const {
+      return rows && block_rows
+                 ? (rows + row_guard_rows + block_rows - 1) / block_rows
+                 : 0;
+    }
+    [[nodiscard]] std::size_t AdmissionBlocks(std::size_t rows,
+                                              std::size_t context,
+                                              std::size_t margin) const {
+      return block_rows
+                 ? std::min((rows + block_rows - 1) / block_rows + margin,
+                            MappedBlocks(context))
+                 : 0;
+    }
   };
   [[nodiscard]] virtual RowBlockPool RowBlocks() const { return {}; }
   /// Holds back the blocks `state` needs to write rows [0, rows) beyond those

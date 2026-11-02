@@ -4,6 +4,8 @@
 #include <map>
 #include <stdexcept>
 
+#include "src/core/hip/kvarn_layout.hpp"
+
 namespace gufo::models::qwen38_flash_next {
 namespace {
 bool IsDraft(ContinuationPart part) {
@@ -21,7 +23,7 @@ bool IsPool(ContinuationPart part) {
 
 ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
                                        std::uint32_t context,
-                                       std::uint32_t kept_rows)
+                                       std::uint32_t kept_rows, bool kvarn)
     : context_(context), ratio_(c.compress_ratio), mtp_(mtp) {
   if (!context || context > c.MaxContextLength() || !ratio_ ||
       !c.full_attention_interval || !c.num_layers || !c.AttentionKvDim() ||
@@ -33,15 +35,18 @@ ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
   const auto add = [&](ContinuationPart part, std::size_t row,
                        std::size_t state, std::uint32_t layer = 0) {
     const auto id = static_cast<std::uint32_t>(components_.size() + 1);
-    components_.push_back({{{id},
-                            1,
-                            row ? cache::ComponentKind::kAppendRows
-                                : cache::ComponentKind::kPrivateState,
-                            row,
-                            row ? cache::Rows{256} : 0,
-                            state},
-                           part,
-                           layer});
+    components_.push_back(
+        {{{id},
+          1,
+          row ? cache::ComponentKind::kAppendRows
+              : cache::ComponentKind::kPrivateState,
+          row,
+          row ? (part == ContinuationPart::kKvarnRecords ? cache::Rows{2}
+                                                         : cache::Rows{256})
+              : 0,
+          state},
+         part,
+         layer});
   };
   add(ContinuationPart::kTokens, sizeof(std::int32_t), 0);
   add(ContinuationPart::kLogits, 0, std::size_t{c.vocab_size} * sizeof(float));
@@ -57,10 +62,22 @@ ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
               sizeof(float),
           layer);
     } else {
-      add(ContinuationPart::kKey, std::size_t{c.AttentionKvDim()} * 2, 0,
-          layer);
-      add(ContinuationPart::kValue, std::size_t{c.AttentionKvDim()} * 2, 0,
-          layer);
+      if (kvarn) {
+        add(ContinuationPart::kKvarnRecords,
+            hip::KvarnRecordPlane(1, c.num_kv_heads, 4,
+                                  hip::KvarnValueOrder::kTokenMajor)
+                .row_bytes,
+            0, layer);
+        const auto tail =
+            std::size_t{hip::kKvarnFp16Tokens} * c.AttentionKvDim() * 2;
+        add(ContinuationPart::kKvarnKeyTail, 0, tail, layer);
+        add(ContinuationPart::kKvarnValueTail, 0, tail, layer);
+      } else {
+        add(ContinuationPart::kKey, std::size_t{c.AttentionKvDim()} * 2, 0,
+            layer);
+        add(ContinuationPart::kValue, std::size_t{c.AttentionKvDim()} * 2, 0,
+            layer);
+      }
       add(ContinuationPart::kPooledKeys, std::size_t{c.indexer_head_dim} * 2, 0,
           layer);
       add(ContinuationPart::kRawKeys, 0,
@@ -105,6 +122,8 @@ std::vector<cache::ComponentPosition> ContinuationLayout::Positions(
         {component.descriptor.id,
          component.descriptor.kind == cache::ComponentKind::kPrivateState
              ? target
+         : component.part == ContinuationPart::kKvarnRecords
+             ? hip::KvarnReadGroups(target)
          : IsPool(component.part) ? (draft_part ? draft_blocks : blocks)
                                   : (draft_part ? draft : target)});
   }

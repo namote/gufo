@@ -1798,6 +1798,18 @@ void CheckServingEos(const std::shared_ptr<qfn::Model>& model) {
   }
   const auto stopped = pending[0].get();
   const auto continuing = pending[1].get();
+  std::cout << "mixed_eos stopped_tokens=" << stopped.tokens.size()
+            << " reference_equal=" << (stopped.tokens == references[0].tokens)
+            << " continuing_tokens=" << continuing.tokens.size()
+            << " continuing_tail_all_eos="
+            << std::all_of(
+                   continuing.tokens.begin() +
+                       std::min<std::size_t>(1, continuing.tokens.size()),
+                   continuing.tokens.end(),
+                   [&](auto token) { return model->IsStopToken(token); })
+            << " widths=" << stopped.physical_execution_width << ','
+            << continuing.physical_execution_width << std::endl;
+
   Require(
       stopped.tokens == references[0].tokens && continuing.tokens.size() == 8 &&
           std::all_of(continuing.tokens.begin() + 1, continuing.tokens.end(),
@@ -1968,17 +1980,19 @@ int main(int argc, char** argv) {
       argc == 6 && std::string_view(argv[5]) == "--sampling-only";
   const bool cache_only =
       argc == 6 && std::string_view(argv[5]) == "--cache-only";
+  const bool serving_sampling_only =
+      argc == 6 && std::string_view(argv[5]) == "--serving-sampling-only";
   const bool eos_only = argc == 6 && std::string_view(argv[5]) == "--eos-only";
   if ((argc != 5 && !batch_only && !prefill_only && !sampling_only &&
-       !cache_only && !eos_only && !execution_only && !lookup_only &&
-       !draft_vocab_only) ||
+       !cache_only && !eos_only && !serving_sampling_only && !execution_only &&
+       !lookup_only && !draft_vocab_only) ||
       std::string_view(argv[1]) != "--model" ||
       std::string_view(argv[3]) != "--mtp-model") {
-    std::cerr
-        << "Usage: session_test --model FIRST.gguf --mtp-model MTP.gguf "
-           "[--batch-only | --prefill-only | --sampling-only | "
-           "--cache-only | --eos-only | --lookup-only | --draft-vocab-only | "
-           "--execution-only TOKENS]\n";
+    std::cerr << "Usage: session_test --model FIRST.gguf --mtp-model MTP.gguf "
+                 "[--batch-only | --prefill-only | --sampling-only | "
+                 "--cache-only | --eos-only | --serving-sampling-only | "
+                 "--lookup-only | --draft-vocab-only | "
+                 "--execution-only TOKENS]\n";
     return 77;
   }
   if (execution_only) {
@@ -2020,6 +2034,10 @@ int main(int argc, char** argv) {
     }
     if (execution_only) {
       CheckExecutionModes(model, execution_tokens);
+      return 0;
+    }
+    if (serving_sampling_only) {
+      CheckServingSampling(model);
       return 0;
     }
     if (eos_only) {

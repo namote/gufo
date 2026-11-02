@@ -2553,18 +2553,38 @@ public:
                           std::uint32_t max_context, bool use_mtp,
                           std::uint32_t max_draft_tokens,
                           std::string artifact_fingerprint = {},
-                          std::string mtp_fingerprint = {})
+                          std::string mtp_fingerprint = {},
+                          std::size_t kv_pool_bytes = 0)
       : model_(std::move(model)),
         max_context_(max_context),
         use_mtp_(use_mtp),
         max_draft_tokens_(max_draft_tokens) {
+    if (kv_pool_bytes) {
+      const auto geometry =
+          model_->KvGeometry(use_mtp_ ? core::SessionMode::kSpeculative
+                                      : core::SessionMode::kAutoregressive,
+                             max_context_);
+      const auto blocks = kv_pool_bytes / geometry.bytes_per_block();
+      if (blocks < geometry.blocks() ||
+          blocks > std::numeric_limits<std::uint32_t>::max())
+        throw std::invalid_argument(
+            "Flash-Next KV pool must hold at least one full context");
+      kv_pool_ = std::make_shared<hip::KvBlockPool>(
+          std::vector<hip::KvBlockPlane>(geometry.planes().begin(),
+                                         geometry.planes().end()),
+          static_cast<std::uint32_t>(blocks));
+      Logger::Info(
+          "cache",
+          "event=kv_pool_created model=flash-next blocks=" +
+              std::to_string(blocks) +
+              " block_bytes=" + std::to_string(geometry.bytes_per_block()) +
+              " bytes=" + std::to_string(kv_pool_->geometry().bytes()));
+    }
     // The typed in-process API owns an immutable loaded model but need not
     // supply file fingerprints when disk caching is disabled. Its model
     // lifetime is an exact process-local identity; durable caches still
     // require the validated full artifact fingerprints below.
-    // KVarN K/V have no continuation components yet: such a server keeps no
-    // prefix cache, snapshots or persistence (plan/exl3/F1-RESULTS.md).
-    if (!artifact_fingerprint.empty() && !model_->Kvarn()) {
+    if (!artifact_fingerprint.empty()) {
       persistence_ = TextRunnerPersistenceDescriptor{
           .compatibility_identity = QwenFlashNextCompatibilityIdentity(
               artifact_fingerprint, use_mtp_ ? mtp_fingerprint : std::string{},
@@ -2591,9 +2611,7 @@ public:
     }
   }
 
-  [[nodiscard]] bool UsesComponentCache() const override {
-    return !model_->Kvarn();
-  }
+  [[nodiscard]] bool UsesComponentCache() const override { return true; }
   [[nodiscard]] std::unique_ptr<ComponentCacheResources>
   CreateComponentCacheResources(cache::ResourceLedger& ledger,
                                 std::size_t ram) const override {
@@ -2603,7 +2621,7 @@ public:
             model_,
             use_mtp_ ? core::SessionMode::kSpeculative
                      : core::SessionMode::kAutoregressive,
-            max_context_, component_identity_),
+            max_context_, component_identity_, kv_pool_),
         ledger);
   }
   [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
@@ -2624,22 +2642,44 @@ public:
         .state_abi = std::string(kQwenFlashNextStateAbi) +
                      (model_->Kvarn() ? "+kvarn-k4v4" : ""),
         .max_context = max_context_,
+        .kv_cache_type = model_->Kvarn() ? "kvarn-k4v4" : "fp16",
+        .kv_layout_version = 3,
         .capabilities =
             TextRunnerCapabilities{
                 .incremental_prefill = true,
-                .snapshot = !model_->Kvarn(),
-                .fork = !model_->Kvarn(),
+                .snapshot = true,
+                .fork = true,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
                 .multi_token_decode = use_mtp_,
                 .batched_multi_token_decode = use_mtp_,
                 .batched_multi_token_decode_max_width = use_mtp_ ? 8u : 0u,
-                .prefix_reuse = !model_->Kvarn(),
-                .in_pass_checkpoint = !model_->Kvarn(),
-                .partial_prefill_retention = !model_->Kvarn(),
+                .prefix_reuse = true,
+                .in_pass_checkpoint = !model_->Kvarn() && !kv_pool_,
+                .partial_prefill_retention = true,
             },
         .persistence = persistence_,
     };
+  }
+
+  [[nodiscard]] RowBlockPool RowBlocks() const override {
+    if (!kv_pool_)
+      return {};
+    return {.total_blocks = kv_pool_->blocks(),
+            .free_blocks = kv_pool_->free_blocks(),
+            .block_rows = hip::kKvBlockTokens,
+            .row_guard_rows = model_->config().compress_ratio,
+            .checkpoint_blocks_retained = false};
+  }
+  void ReserveRowBlocks(TextRunnerState& state,
+                        std::size_t rows) const override {
+    auto& flash = RequireQwenFlashNextState(state);
+    flash.adapter().ReserveKvRows(
+        flash.slot(), static_cast<std::uint32_t>(rows), kRowBlockMargin);
+  }
+  void ReleaseRowBlocks(TextRunnerState& state) const noexcept override {
+    auto& flash = RequireQwenFlashNextState(state);
+    flash.adapter().ReleaseKvReservation(flash.slot());
   }
 
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
@@ -2655,10 +2695,18 @@ public:
     return {
         .resident_weights_bytes = model_->ResidentBytes(),
         .state_capacity_bytes = capacity,
-        .per_request_state_bytes = model_->SessionBytes(
-            use_mtp_ ? gufo::core::SessionMode::kSpeculative
-                     : gufo::core::SessionMode::kAutoregressive,
-            max_context_),
+        .per_request_state_bytes =
+            model_->SessionBytes(use_mtp_
+                                     ? gufo::core::SessionMode::kSpeculative
+                                     : gufo::core::SessionMode::kAutoregressive,
+                                 max_context_) -
+            (kv_pool_ ? model_
+                            ->KvGeometry(
+                                use_mtp_ ? core::SessionMode::kSpeculative
+                                         : core::SessionMode::kAutoregressive,
+                                max_context_)
+                            .bytes()
+                      : 0),
         // Runtime scratch is shared and already allocated at model load;
         // reserve its remaining lazy buffers once from aggregate capacity.
         .temporary_scratch_bytes = 0,
@@ -2751,19 +2799,8 @@ public:
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
-    if (UsesComponentCache())
-      throw std::logic_error(
-          "Flash-Next execution slots are owned by the component cache");
-    // KVarN sessions: the plain session pool owns each slot's session.
-    std::string error;
-    auto session =
-        model_->CreateSession(use_mtp_ ? core::SessionMode::kSpeculative
-                                       : core::SessionMode::kAutoregressive,
-                              max_context_, &error);
-    if (!session)
-      throw std::runtime_error("Flash-Next session allocation failed: " +
-                               error);
-    return std::make_unique<QwenFlashNextTextRunnerState>(std::move(session));
+    throw std::logic_error(
+        "Flash-Next execution slots are owned by the component cache");
   }
 
   void PreparePrefixReuse(
@@ -3080,6 +3117,7 @@ public:
 private:
   mutable models::qwen::vision::ImageCache image_cache_;
   std::shared_ptr<QwenFlashNextModel> model_;
+  std::shared_ptr<hip::KvBlockPool> kv_pool_;
   std::uint32_t max_context_;
   bool use_mtp_;
   std::uint32_t max_draft_tokens_;
@@ -3714,12 +3752,6 @@ bool InferenceBackend::load(
     TextSpeculativeConfig speculative_config,
     TextDiskCacheConfig disk_cache_config,
     TextRunnerRamCacheOptions ram_cache_config) {
-  if (ram_cache_config.kv_pool_bytes != 0) {
-    SetError(error,
-             "--kv-pool-bytes needs a runner with paged KV rows; "
-             "this model keeps each session's context");
-    return false;
-  }
   if (model == nullptr) {
     SetError(error, "Qwen3.8-Flash-Next model must not be null");
     return false;
@@ -3773,7 +3805,8 @@ bool InferenceBackend::load(
         speculative_config.backend == TextSpeculativeBackend::kMtp,
         speculative_config.max_draft_tokens,
         disk_cache_config.model_artifact_fingerprint,
-        disk_cache_config.draft_model_artifact_fingerprint);
+        disk_cache_config.draft_model_artifact_fingerprint,
+        ram_cache_config.kv_pool_bytes);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;

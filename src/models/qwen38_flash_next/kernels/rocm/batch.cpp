@@ -238,9 +238,12 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
   }
   for (const auto& item : items) {
     auto& session = *item.session;
-    if (!session.Cancelled() && session.continuation_hooks_) {
+    if (!session.Cancelled()) {
       const auto end = session.mtp_.position +
                        static_cast<std::uint32_t>(item.tokens.size());
+      session.EnsureKvRows(end);
+      if (!session.continuation_hooks_)
+        continue;
       session.continuation_hooks_->BeforeWrite(
           true, session.mtp_.position, end, session.mtp_.blocks,
           end > c.indexer_top_k ? end / c.compress_ratio : session.mtp_.blocks);
@@ -882,9 +885,12 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     return true;
   for (const auto& item : items) {
     auto& session = *item.session;
-    if (!session.Cancelled() && session.continuation_hooks_) {
+    if (!session.Cancelled()) {
       const auto end =
           session.position_ + static_cast<std::uint32_t>(item.tokens.size());
+      session.EnsureKvRows(end);
+      if (!session.continuation_hooks_)
+        continue;
       session.continuation_hooks_->BeforeWrite(
           false, session.position_, end, session.blocks_,
           end > c.indexer_top_k ? end / c.compress_ratio : session.blocks_);

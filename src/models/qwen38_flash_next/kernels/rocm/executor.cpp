@@ -750,6 +750,11 @@ void Session::PreserveSnapshots(std::uint32_t position,
 }
 
 Session::~Session() {
+  if (kv_pool_) {
+    (void)hipStreamSynchronize(owner_->stream());
+    kv_pool_->Release(kv_blocks_);
+    kv_reservation_.Reset();
+  }
   try {
     PreserveSnapshots(0, 0);
   } catch (...) {
@@ -842,8 +847,9 @@ PrefillCheckpoint::~PrefillCheckpoint() {
 std::unique_ptr<PrefillCheckpoint> Executor::MakePrefillCheckpoint(
     Session& source, std::span<const std::int32_t> tokens, std::uint32_t prefix,
     std::string* error_msg) const {
-  if (source.kvarn_) {
-    AssignError(error_msg, "KVarN sessions take no in-pass checkpoints");
+  if (source.kvarn_ || source.kv_pool_) {
+    AssignError(error_msg,
+                "KVarN or shared KV sessions take no in-pass checkpoints");
     return nullptr;
   }
   if (source.owner_ != this || prefix == 0 || prefix > tokens.size() ||
@@ -957,7 +963,78 @@ void Session::TrimRollback(std::uint32_t depth) noexcept {
   ngram_snapshots_.resize(depth);
 }
 
+void Session::EnsureKvRows(std::uint32_t rows) {
+  if (!kv_pool_)
+    return;
+  if (rows > max_context_)
+    throw std::length_error("Flash-Next KV rows exceed context");
+  const auto need =
+      rows ? hip::KvBlockGeometry::BlocksFor(std::size_t{rows} + kKvPooledRatio)
+           : 0;
+  if (need <= kv_blocks_.size())
+    return;
+  auto fresh = kv_pool_->Allocate(need - kv_blocks_.size(), &kv_reservation_);
+  if (fresh.size() != need - kv_blocks_.size())
+    throw std::length_error("Flash-Next shared KV pool exhausted");
+  const auto first = kv_blocks_.size();
+  kv_blocks_.insert(kv_blocks_.end(), fresh.begin(), fresh.end());
+  std::copy(fresh.begin(), fresh.end(), kv_table_host_ + first);
+  const auto result = hipMemcpyAsync(kv_table_ + first, kv_table_host_ + first,
+                                     fresh.size() * sizeof(std::uint32_t),
+                                     hipMemcpyHostToDevice, owner_->stream());
+  if (result != hipSuccess)
+    throw std::runtime_error(hipGetErrorString(result));
+}
+
+void Session::TrimKvRows(std::uint32_t rows) {
+  if (!kv_pool_)
+    return;
+  const auto keep =
+      rows ? hip::KvBlockGeometry::BlocksFor(std::size_t{rows} + kKvPooledRatio)
+           : 0;
+  if (keep >= kv_blocks_.size())
+    return;
+  const auto result = hipStreamSynchronize(owner_->stream());
+  if (result != hipSuccess)
+    throw std::runtime_error(hipGetErrorString(result));
+  kv_pool_->Release(std::span(kv_blocks_).subspan(keep));
+  kv_blocks_.resize(keep);
+}
+
+std::uint32_t Session::ReserveKvRows(std::uint32_t rows, std::uint32_t margin) {
+  if (!kv_pool_)
+    return 0;
+  if (rows > max_context_)
+    throw std::length_error("Flash-Next KV reservation exceeds context");
+  const auto target = std::min(hip::KvBlockGeometry::BlocksFor(rows) + margin,
+                               hip::KvBlockGeometry::BlocksFor(
+                                   std::size_t{max_context_} + kKvPooledRatio));
+  const auto need = target > kv_blocks_.size() ? target - kv_blocks_.size() : 0;
+  kv_reservation_.Reset();
+  if (need) {
+    kv_reservation_ = kv_pool_->TryReserve(need);
+    if (!kv_reservation_)
+      throw std::length_error(
+          "Flash-Next shared KV pool reservation exhausted");
+  }
+  return need;
+}
+std::uint32_t Session::ReleaseKvReservation() noexcept {
+  const auto unused = kv_reservation_.blocks();
+  kv_reservation_.Reset();
+  return unused;
+}
+
 void Session::Reset(bool reuse_mtp) {
+  if (kv_pool_) {
+    const auto result = hipStreamSynchronize(owner_->stream());
+    if (result != hipSuccess)
+      throw std::runtime_error(hipGetErrorString(result));
+    kv_pool_->Release(kv_blocks_);
+    kv_blocks_.clear();
+    kv_reservation_.Reset();
+  }
+
   // Reset leaves append-only rows intact. Preserve them at the first write
   // that would overwrite them, allowing cancellation to resume by rewind.
   // Scratch is overwritten by the next verification. Retaining its stable
@@ -1455,9 +1532,16 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   return e;
 }
 
-std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
-                                                 std::uint32_t max_context,
-                                                 std::string* error_msg) const {
+hip::KvBlockGeometry Executor::KvGeometry(core::SessionMode mode,
+                                          std::uint32_t context) const {
+  return SessionKvPlanes(config(), mode == core::SessionMode::kSpeculative,
+                         options_.kvarn, context)
+      .geometry;
+}
+
+std::unique_ptr<Session> Executor::CreateSession(
+    core::SessionMode mode, std::uint32_t max_context, std::string* error_msg,
+    std::shared_ptr<hip::KvBlockPool> pool) const {
   std::unique_ptr<Session> s(new Session());
   s->owner_ = this;
   s->mtp_enabled_ = mode == core::SessionMode::kSpeculative;
@@ -1482,22 +1566,33 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
     AssignError(error_msg, "pooled indexer keys need a ratio of 4");
     return nullptr;
   }
-  // One private span of KV blocks behind an identity block table: every
-  // layer's rows stay contiguous in position order, which snapshots,
-  // checkpoints and the continuation adapter read as plain regions, while
-  // the kernels already address rows through the table.
   const auto layout =
       SessionKvPlanes(c, s->mtp_enabled_, options_.kvarn, max_context);
-  const auto& kv = layout.geometry;
-  auto* kv_rows =
-      Alloc<std::byte>(a, kv.bytes(), error_msg, &s->allocated_bytes_);
-  auto* kv_table =
-      Alloc<std::uint32_t>(a, kv.blocks(), error_msg, &s->allocated_bytes_);
+  const auto& logical = layout.geometry;
+  if (pool &&
+      !std::ranges::equal(pool->geometry().planes(), logical.planes())) {
+    AssignError(error_msg, "Flash-Next KV pool has incompatible planes");
+    return nullptr;
+  }
+  s->kv_pool_ = std::move(pool);
+  const auto& kv = s->kv_pool_ ? s->kv_pool_->geometry() : logical;
+  auto* kv_rows = s->kv_pool_ ? static_cast<std::byte*>(s->kv_pool_->data())
+                              : Alloc<std::byte>(a, kv.bytes(), error_msg,
+                                                 &s->allocated_bytes_);
+  auto* kv_table = Alloc<std::uint32_t>(a, logical.blocks(), error_msg,
+                                        &s->allocated_bytes_);
   if (kv_rows == nullptr || kv_table == nullptr)
     return nullptr;
-  {
-    std::vector<std::uint32_t> identity(kv.blocks());
-    for (std::uint32_t b = 0; b < kv.blocks(); ++b)
+  if (s->kv_pool_) {
+    s->kv_blocks_.reserve(logical.blocks());
+    if (!Check(
+            s->kv_table_host_owner_.Allocate(
+                &s->kv_table_host_, logical.blocks() * sizeof(std::uint32_t)),
+            "KV host block table", error_msg))
+      return nullptr;
+  } else {
+    std::vector<std::uint32_t> identity(logical.blocks());
+    for (std::uint32_t b = 0; b < logical.blocks(); ++b)
       identity[b] = b;
     if (!Check(hipMemcpy(kv_table, identity.data(),
                          identity.size() * sizeof(std::uint32_t),
@@ -4317,12 +4412,11 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   const std::uint32_t start_pos = session.position_;
   if (!session.CheckCancellation(error_msg))
     return false;
-  if (session.kvarn_ && checkpoint) {
-    AssignError(error_msg, "KVarN sessions take no in-pass checkpoints");
+  if ((session.kvarn_ || session.kv_pool_) && checkpoint) {
+    AssignError(error_msg,
+                "KVarN or shared KV sessions take no in-pass checkpoints");
     return false;
   }
-  if (session.kvarn_ && !PlanKvarn(session, start_pos, n, error_msg))
-    return false;
   if (session.mtp_enabled_ && prefill_phase &&
       session.mtp_.position != start_pos) {
     AssignError(error_msg,
@@ -4342,6 +4436,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
         (void)hipStreamSynchronize(stream);
     }
   } pinned_inputs{stream_};
+  session.EnsureKvRows(start_pos + n);
   // Start the disk rows before protecting checkpoint rows, which can commit
   // device pages: layer 0 alone cannot hide the whole read.
   if (session.continuation_hooks_) {
@@ -4351,6 +4446,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
         false, session.position_, end, session.blocks_,
         end > c.indexer_top_k ? end / c.compress_ratio : session.blocks_);
   }
+  if (session.kvarn_ && !PlanKvarn(session, start_pos, n, error_msg))
+    return false;
   const auto ngram = session.ngram_;
   if (c.ple_layer >= 0) {
     if (ngram_ == nullptr) {
@@ -4973,6 +5070,10 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
                             std::string* error_msg,
                             std::shared_ptr<SnapshotState>* deferred,
                             std::shared_ptr<void> storage) const {
+  if (session.kv_pool_) {
+    AssignError(error_msg, "shared KV sessions use component snapshots");
+    return false;
+  }
   if (session.owner_ != this) {
     AssignError(error_msg, "session belongs to another executor");
     return false;
@@ -5121,6 +5222,8 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
 
 std::uint64_t Executor::PrefillCheckpointBytes(const Session& session,
                                                std::uint32_t position) const {
+  if (session.kvarn_ || session.kv_pool_)
+    return 0;
   const auto& c = config();
   auto h = MakeSnapshotHeader(c, session.mtp_enabled_, session);
   h.position = position;
@@ -5145,6 +5248,10 @@ bool Executor::RestoreSnapshot(Session& session,
                                SnapshotInfo* info, std::string* error_msg,
                                std::uint32_t next_drafts,
                                const SnapshotState* deferred) const {
+  if (session.kv_pool_) {
+    AssignError(error_msg, "shared KV sessions use component snapshots");
+    return false;
+  }
   if (session.owner_ != this) {
     AssignError(error_msg, "session belongs to another executor");
     return false;
@@ -5684,6 +5791,7 @@ bool Executor::MtpForward(Session& session,
     AssignError(error_msg, "MTP context is full");
     return false;
   }
+  session.EnsureKvRows(pos + n);
   if (session.continuation_hooks_)
     session.continuation_hooks_->BeforeWrite(
         true, pos, pos + n, session.mtp_.blocks,

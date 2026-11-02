@@ -127,8 +127,14 @@ public:
       if (component.descriptor.kind != cache::ComponentKind::kAppendRows ||
           Draft(component.part) != draft)
         continue;
-      const auto a = Pool(component.part) ? first_block : first;
-      const auto b = Pool(component.part) ? end_block : end;
+      const bool records = component.part == ContinuationPart::kKvarnRecords;
+      const auto a = records                ? hip::KvarnReadGroups(first)
+                     : Pool(component.part) ? first_block
+                                            : first;
+      const auto b =
+          records ? hip::KvarnReadGroups(end + hip::kKvarnGroupTokens - 1)
+          : Pool(component.part) ? end_block
+                                 : end;
       if (a < b)
         guard.BeforeOverwrite(component.descriptor.id, a, b);
     }
@@ -155,7 +161,9 @@ public:
       if (component.descriptor.kind == cache::ComponentKind::kAppendRows)
         guard.BeforeRelease(
             component.descriptor.id, 0,
-            Pool(component.part)
+            component.part == ContinuationPart::kKvarnRecords
+                ? hip::KvarnReadGroups(adapter.context_)
+            : Pool(component.part)
                 ? adapter.context_ / adapter.model_->config().compress_ratio + 1
                 : adapter.context_);
   }
@@ -165,7 +173,9 @@ public:
       if (component.descriptor.kind == cache::ComponentKind::kAppendRows)
         guard.BeforeOverwrite(
             component.descriptor.id, 0,
-            Pool(component.part)
+            component.part == ContinuationPart::kKvarnRecords
+                ? hip::KvarnReadGroups(adapter.context_)
+            : Pool(component.part)
                 ? adapter.context_ / adapter.model_->config().compress_ratio + 1
                 : adapter.context_);
   }
@@ -205,19 +215,17 @@ struct ContinuationAdapter::Region {
 ContinuationAdapter::ContinuationAdapter(std::shared_ptr<Model> model,
                                          core::SessionMode mode,
                                          std::uint32_t context,
-                                         cache::Identity identity)
+                                         cache::Identity identity,
+                                         std::shared_ptr<hip::KvBlockPool> pool)
     : model_(std::move(model)),
+      kv_pool_(std::move(pool)),
       mode_(mode),
       context_(context),
       layout_(model_ ? model_->config() : Config{},
               mode == core::SessionMode::kSpeculative, context,
-              model_ ? model_->executor_->max_speculative() : 0),
+              model_ ? model_->executor_->max_speculative() : 0,
+              model_ && model_->Kvarn()),
       identity_(std::move(identity)) {
-  // The component inventory describes FP16 K/V rows; KVarN records, sink
-  // and tail rows have no components yet.
-  if (model_ && model_->executor_->kvarn())
-    throw std::invalid_argument(
-        "the Flash-Next continuation adapter does not support KVarN K/V");
   if ((mode != core::SessionMode::kAutoregressive &&
        mode != core::SessionMode::kSpeculative) ||
       identity_.empty() || context > model_->MaxContext() ||
@@ -227,7 +235,11 @@ ContinuationAdapter::ContinuationAdapter(std::shared_ptr<Model> model,
     for (unsigned i = 0; i < 4; ++i)
       identity_.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
   };
-  put(2);  // Private components attest the target checkpoint boundary.
+  put(3);  // KVarN token-major records, canonical sink/tail and paged copies.
+  put(model_->Kvarn());
+  put(model_->Kvarn() ? 4 : 16);
+  put(model_->Kvarn() ? hip::kKvarnGroupTokens : 0);
+  put(static_cast<std::uint32_t>(hip::KvarnValueOrder::kTokenMajor));
   put(Session::kSnapshotPayloadVersion);
   put(context);
   put(mode == core::SessionMode::kSpeculative);
@@ -252,6 +264,18 @@ Session& ContinuationAdapter::GetSession(cache::Slot& slot) {
   auto& state = As(slot);
   state.BeforeExecution();
   return *state.session;
+}
+std::uint32_t ContinuationAdapter::ReserveKvRows(cache::Slot& slot,
+                                                 std::uint32_t rows,
+                                                 std::uint32_t margin) {
+  return As(slot).session->session_->ReserveKvRows(rows, margin);
+}
+std::uint32_t ContinuationAdapter::ReleaseKvReservation(
+    cache::Slot& slot) noexcept {
+  return As(slot).session->session_->ReleaseKvReservation();
+}
+std::size_t ContinuationAdapter::MappedKvBlocks(const cache::Slot& slot) const {
+  return As(slot).session->session_->MappedKvBlocks();
 }
 void ContinuationAdapter::PrefillThrough(cache::Slot& slot,
                                          std::span<const std::int32_t> prompt,
@@ -302,7 +326,7 @@ cache::Identity ContinuationAdapter::CompatibilityIdentity() const {
 std::unique_ptr<cache::Slot> ContinuationAdapter::CreateSlot(
     cache::MutationGuard& guard) {
   std::string error;
-  auto session = model_->CreateSession(mode_, context_, &error);
+  auto session = model_->CreateSession(mode_, context_, &error, kv_pool_);
   if (!session)
     throw std::runtime_error(error);
   return std::make_unique<State>(*this, guard, std::move(session));
@@ -366,6 +390,8 @@ void* ContinuationAdapter::RowData(
   switch (component.part) {
     case ContinuationPart::kTokens:
       return state.session->tokens_.data();
+    case ContinuationPart::kKvarnRecords:
+      return native.attention_[component.layer].kvarn_records;
     case ContinuationPart::kKey:
       return native.attention_[component.layer].k_cache;
     case ContinuationPart::kValue:
@@ -381,6 +407,50 @@ void* ContinuationAdapter::RowData(
     default:
       throw std::invalid_argument("component has no append rows");
   }
+}
+
+ContinuationAdapter::Region ContinuationAdapter::RowRegion(
+    State& state, const ContinuationComponent& component, Rows first,
+    Rows end) const {
+  Region result;
+  if (first == end)
+    return result;
+  auto& native = state.CaptureState();
+  auto* base = static_cast<std::byte*>(RowData(state, component));
+  const auto width = component.descriptor.row_bytes;
+  if (component.part == ContinuationPart::kTokens) {
+    result.pieces.push_back(
+        {base + first * width, 0, (end - first) * width, true});
+    return result;
+  }
+  const bool records = component.part == ContinuationPart::kKvarnRecords;
+  const Rows block_rows =
+      records ? hip::kKvarnGroupsPerBlock
+      : Pool(component.part)
+          ? hip::kKvBlockTokens / model_->config().compress_ratio
+          : hip::kKvBlockTokens;
+  const Rows offset = records ? 1 : 0;  // Group zero is the private FP16 sink.
+  for (Rows row = first; row < end;) {
+    const Rows logical = row + offset;
+    const Rows count = std::min(end - row, block_rows - logical % block_rows);
+    const Rows block = logical / block_rows;
+    const Rows physical = native.kv_pool_ ? native.kv_blocks_.at(block) : block;
+    auto* pointer =
+        base + (physical * block_rows + logical % block_rows) * width;
+    const auto payload_offset = (row - first) * width;
+    if (!result.pieces.empty() && !result.pieces.back().host &&
+        static_cast<std::byte*>(result.pieces.back().pointer) +
+                result.pieces.back().bytes ==
+            pointer &&
+        result.pieces.back().offset + result.pieces.back().bytes ==
+            payload_offset) {
+      result.pieces.back().bytes += count * width;
+    } else {
+      result.pieces.push_back({pointer, payload_offset, count * width, false});
+    }
+    row += count;
+  }
+  return result;
 }
 
 void ContinuationAdapter::BeginRestore(
@@ -420,6 +490,8 @@ void ContinuationAdapter::BeginRestore(
   state.session->logits_.reserve(model_->VocabSize());
   std::vector<Coverage> coverage(descriptors_.size());
   state.GuardAll();
+  Check(hipStreamSynchronize(model_->executor_->stream()));
+  state.session->session_->EnsureKvRows(target);
   Check(hipStreamSynchronize(model_->executor_->stream()));
   state.session->session_->PreserveSnapshots(0, 0);
   state.expected = std::move(ordered);
@@ -503,6 +575,28 @@ ContinuationAdapter::Region ContinuationAdapter::PrivateRegion(
                                                  : session.KeptHiddenRows()} *
                         model_->config().HcDim() * sizeof(float));
       break;
+    case ContinuationPart::kKvarnKeyTail:
+    case ContinuationPart::kKvarnValueTail: {
+      const auto target =
+          loading ? state.expected.front().valid_rows : native.position_;
+      const auto width = std::size_t{model_->config().AttentionKvDim()} * 2;
+      auto& attention = native.attention_[component.layer];
+      auto* base = reinterpret_cast<std::byte*>(
+          component.part == ContinuationPart::kKvarnKeyTail
+              ? attention.kvarn_k
+              : attention.kvarn_v);
+      const auto sink = std::min<Rows>(target, hip::kKvarnSinkTokens);
+      add(base, sink * width);
+      const auto tail = std::max<Rows>(
+          hip::kKvarnSinkTokens,
+          target / hip::kKvarnGroupTokens * hip::kKvarnGroupTokens);
+      if (target > tail) {
+        const auto physical = hip::KvarnFp16Row(tail);
+        add(base + physical * width, (target - tail) * width, false,
+            physical * width);
+      }
+      break;
+    }
     case ContinuationPart::kRawKeys:
     case ContinuationPart::kDraftRawKeys: {
       const auto positions = loading ? state.expected : Positions(state);
@@ -690,26 +784,30 @@ cache::Completion ContinuationAdapter::CopyRowsOut(const cache::Slot& slot,
     throw std::logic_error("cannot read an invalid Flash-Next slot");
   const auto& native = state.CaptureState();
   const auto rows =
-      component.part == ContinuationPart::kTokens ? native.position_
+      component.part == ContinuationPart::kKvarnRecords
+          ? hip::KvarnReadGroups(native.position_)
+      : component.part == ContinuationPart::kTokens ? native.position_
       : Pool(component.part)
           ? (Draft(component.part) ? native.mtp_.blocks : native.blocks_)
           : (Draft(component.part) ? native.mtp_.position : native.position_);
   const auto row = component.descriptor.row_bytes;
   if (!row || first > end || end > rows || bytes.size() != (end - first) * row)
     throw std::invalid_argument("invalid Flash-Next row capture");
-  auto* source =
-      bytes.empty()
-          ? nullptr
-          : static_cast<std::byte*>(RowData(state, component)) + first * row;
+  const auto region = RowRegion(state, component, first, end);
   return Transfer(
       state, false, stream, [&](gufo::hip::TransferStream& transfer) {
-        if (component.part == ContinuationPart::kTokens && !bytes.empty())
-          std::memcpy(bytes.data(), source, bytes.size());
-        else if (!bytes.empty())
-          Check(hip::CopySnapshotToHost(bytes.data(), source, bytes.size(),
-                                        transfer.Native()));
+        for (const auto& piece : region.pieces) {
+          if (piece.host)
+            std::memcpy(bytes.data() + piece.offset, piece.pointer,
+                        piece.bytes);
+          else
+            Check(hip::CopySnapshotToHost(bytes.data() + piece.offset,
+                                          piece.pointer, piece.bytes,
+                                          transfer.Native()));
+        }
       });
 }
+
 std::span<const std::byte> ContinuationAdapter::BorrowRowsView(
     const cache::Slot& slot, cache::ComponentId id, Rows first,
     Rows end) const {
@@ -717,7 +815,8 @@ std::span<const std::byte> ContinuationAdapter::BorrowRowsView(
   const auto& component = Component(id);
   // The host token vector can move when execution appends. Device append
   // allocations stay fixed for the session and are guarded before mutation.
-  if (component.part == ContinuationPart::kTokens)
+  if (component.part == ContinuationPart::kTokens || kv_pool_ ||
+      component.part == ContinuationPart::kKvarnRecords)
     return {};
   if (!state.IsValid() ||
       component.descriptor.kind != cache::ComponentKind::kAppendRows)
@@ -745,21 +844,22 @@ cache::Completion ContinuationAdapter::CopyRowsIn(
     if (!row || first > end || end > state.expected[id.value - 1].valid_rows ||
         bytes.size() != (end - first) * row)
       throw std::invalid_argument("invalid Flash-Next row restore");
-    auto* destination =
-        bytes.empty()
-            ? nullptr
-            : static_cast<std::byte*>(RowData(state, component)) + first * row;
+    const auto region = RowRegion(state, component, first, end);
     {
       const std::lock_guard lock(state.jobs_mutex);
       state.coverage[id.value - 1].emplace_back(first * row, end * row);
     }
     return Transfer(
         state, true, stream, [&](gufo::hip::TransferStream& transfer) {
-          if (component.part == ContinuationPart::kTokens && !bytes.empty())
-            std::memcpy(destination, bytes.data(), bytes.size());
-          else if (!bytes.empty())
-            Check(hip::CopySnapshotToDevice(destination, bytes.data(),
-                                            bytes.size(), transfer.Native()));
+          for (const auto& piece : region.pieces) {
+            if (piece.host)
+              std::memcpy(piece.pointer, bytes.data() + piece.offset,
+                          piece.bytes);
+            else
+              Check(hip::CopySnapshotToDevice(piece.pointer,
+                                              bytes.data() + piece.offset,
+                                              piece.bytes, transfer.Native()));
+          }
         });
   } catch (...) {
     state.failed = true;
@@ -822,8 +922,20 @@ bool ContinuationAdapter::Validate(
       session.image_prompt_.reset();
     }
     Check(hipStreamSynchronize(model_->executor_->stream()));
+    native.TrimKvRows(metadata.target);
   } catch (...) {
     return refuse();
+  }
+  if (native.kvarn_) {
+    const auto base = std::max(
+        hip::kKvarnSinkTokens,
+        metadata.target / hip::kKvarnGroupTokens * hip::kKvarnGroupTokens);
+    native.kvarn_tail_ = {
+        base, base == hip::kKvarnSinkTokens
+                  ? metadata.target
+                  : std::max(metadata.target, base + hip::kKvarnTailRingTokens -
+                                                  hip::kKvarnGroupTokens + 1)};
+    native.kvarn_pass_ = {};
   }
   native.position_ = metadata.target;
   native.blocks_ = metadata.blocks;

@@ -1,5 +1,18 @@
 # Qwen3.8 Flash-Next quality
 
+## Shared KV and durable continuation, November 2, 2026
+
+32760-position collector/101424960 bytes match saved baseline exactly.
+Shared AR/MTP, fragmented mappings, group/block boundaries, saturation at final
+context token, cancellation, short restore and complete release pass. CPU guard
+admission and disk quota pass. Serving sampling, mixed batches,32K state and
+MTP cache/policy replay pass; HTTP C4,12K long context, actual restart/disk
+restore and real Pi1.4.0 (3 tasks,9 tools) pass. Initial aggregate mixed EOS
+assertion failed without clause diagnostics; focused diagnostic and serving
+sampling pass unchanged. Original failure retained, not proven noise.
+Full two-times-256K inference is untested.
+[Evidence and limitations](../../../plan/exl3/F3-SHARED-KV.md).
+
 ## Exact live-row verification, November 2, 2026
 
 Retained scheduling-only K5 R3/R4 specialization passes one combined window:
