@@ -1294,7 +1294,8 @@ across distinct prompts, one pass each, not repeated-run confidence estimates.
 | Copy/edit | 4 | 64.63 | 65.00 | — | — |
 
 All three published category targets remain unmet. This is a cross-machine,
-cross-pack reference: Kyojin was not run locally. Frozen source2132bd2 has
+cross-pack reference: Kyojin had not been run locally at that stage
+(the later local run is recorded below). Frozen source2132bd2 has
 three card prompts/category, while today's public description says four.
 The saved published table is not a matched performance control.
 
@@ -1366,3 +1367,29 @@ can hide waits. No uninstrumented-stall bound, worker/SSD bandwidth interference
 GPU mapped-quantizer attribution or cold/prose generalization is established.
 Observed host cost is small here; profile those unresolved costs before a large
 loader rewrite. [Evidence and scope](../plan/exl3/F3-PLE-HOST-PROFILE.md).
+
+## Local Kyojin, November 2, 2026
+
+Frozen source2132bd2 built once (458.03s CPU-only), then preserved with its
+source-pinned ROCm10.1.0a20260822 wheel SDK/clang23. This is not the Gufo
+Nix10.1 release/clang24 runtime; Torch reports HIP7.16.26332. Internal NVMe
+Kyojin≈4bpw/K4 PLE, context16384, quant K4V4, HC sidecar and draft2s active.
+One resident server, twelve requests, no saved Gufo baseline rerun.
+Real-text PP2048/8192=1550.88/1386.46tok/s after one warm pass each; distinct
+from Gufo fixed-pattern PP. Client AR prose/chat/code=31.30/31.33/31.28;
+MTP=42.52/49.44/63.22tok/s, 256 output tokens per case. Startup172.05s excluded.
+
+All requests completed and healthPASS, but paired greedy AR/MTP exact token
+and text equality failed3/3, first differing zero-based token57/76/149.
+Independent raw-request review confirms speculative is the only request
+parameter difference; actual accepted/rejected drafts138/105,160/61,194/36.
+Cause and general quality impact are not isolated; no repeat/determinism claim.
+Retain as measured evidence, not an accepted production replacement. Historical
+Gufo K-suite rates differ in pack/PLE/KV/runtime/capacity; do not call the raw
+12–20% difference pure engine gain or current native parity.
+
+User-authorized five-payload internal GGUF removal funded88.82GiB local copy,
+including24.4GiB ngram; external originals/manifests remain. Streamed source
+hashes and destination sizes/fsync checked, no redundant full reread. Existing
+Gufo artifacts preserved. Infra432pass; no Gufo inference change.
+[Receipt and limitations](../plan/exl3/F3-KYOJIN-LOCAL.md).

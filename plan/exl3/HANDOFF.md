@@ -1,6 +1,22 @@
 # EXL3 / Flash-Next F3 handoff (2026-11-02; native EXL3 qualified)
 
-## Latest: CPU PLE diagnostic
+## Latest: local Kyojin measured; equality failed
+
+Kyojin and native K4 n-gram now reside on internal NVMe at
+`ai.tools/storage/models/llm/flash-next-exl3-kyojin/` (88.82 GiB).
+Five unused internal Flash-Next GGUF payloads were removed with user approval;
+external originals and provenance remain. About 166 GiB free. Reusable Kyojin
+source/extension/SDK/JIT are retained; do not rebuild or recopy without cause.
+
+All 12 requests completed; GPU health PASS. PP2048/8192=1550.88/1386.46tok/s
+(real text, not the Gufo fixed-pattern fixture). AR prose/chat/code≈31.3tok/s;
+MTP=42.52/49.44/63.22tok/s. **AR/MTP token and text equality failed 3/3**;
+no production acceptance or matched engine/quality parity is established.
+Gufo native selection below remains unchanged. The frozen Kyojin source uses
+its pinned ROCm10.1 nightly wheels, distinct from the Gufo Nix10.1 release.
+[Exact scope, provenance and results](F3-KYOJIN-LOCAL.md).
+
+## CPU PLE diagnostic
 
 Native production selection below is unchanged. A bounded host-timing run finds
 PLE host work0.46% of PP2048/8192 and1.74%/1.69% of AR/MTP128 on the current
@@ -19,7 +35,7 @@ wrapper `/opt/gufo-native/bin/gufo`, ELF SHA
 `b4ebe27cb5cbd3173143ddf129b9188db6f13178682921fb3c8dccbaadbc9455`.
 `--model /models/fnx/ --speculative mtp --mtp-model /models/fnx/`.
 The 5.05 pack uses its internal-NVMe native K6 n-gram file; Kyojin's sharded K4
-reader is CPU-qualified, with the pack still in its existing external location.
+reader is CPU-qualified; the pack is now on internal NVMe (local Kyojin results above).
 
 One combined window: quality, sampling/EOS, C2/4/6/8,32K,cache/policy replay,
 PP/TG and hardware health all passed. No GGUF mappings, no old baseline rerun.
@@ -57,7 +73,9 @@ across distinct prompts, one pass each, not repeated-run confidence estimates.
 | Copy/edit | 4 | 64.63 | 65.00 | — | — |
 
 All three published category targets remain unmet. This is a cross-machine,
-cross-pack reference: Kyojin was not run locally. Frozen source2132bd2 has
+cross-pack reference: Kyojin had not been run locally at that stage.
+See the later local run above; it does not turn this published table into a
+control. Frozen source2132bd2 has
 three card prompts/category, while today's public description says four.
 The saved published table is not a matched performance control.
 
@@ -336,8 +354,8 @@ living document: update it with every new result. History is in
 | Last final images | `ai-tools/gufo-eval:final-68d4e3c8-rocm101` and `-tests-rocm101`. They predate all F3 speed work. |
 | Plans and LOCKS | `~/projects/ai.tools/test/experiments/gufo_upstream_port_20261023/` (PLAN-FINAL-FN2*.json, PLAN-FN-*.json, PLAN-FINAL-27B.json) |
 | Receipts | `~/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/` (final-fn2/, fn-713c, fn-434f, fn-hc2…hc9, fn-att1/2, gdn/) |
-| UD-Q4 timing baselines | Measured once on 68d4e3c8 with nix: T1 probe AR, T2-q MTP, T3-q card. Reuse them while the GGUF path stays byte-identical. |
-| Packs | 5.05: internal `ai.tools/storage/models/llm/flash-next-exl3-5.05-h6-ng6/`. 4.05 and Kyojin (≈4.0 bpw): T5 EVO USB, about 270 s load each. |
+| UD-Q4 timing baselines | Measured once on 68d4e3c8 with nix: T1 probe AR, T2-q MTP, T3-q card. Retain as historical evidence; internal GGUF payloads now removed, external originals preserved. |
+| Packs | 5.05: internal `ai.tools/storage/models/llm/flash-next-exl3-5.05-h6-ng6/`. 4.05: T5 EVO USB. Kyojin (≈4.0 bpw): internal `ai.tools/storage/models/llm/flash-next-exl3-kyojin/`; earlier USB load observations are historical. |
 | Dropped branch, kept as record | `ai-tools/fn-hc-int8` (HC int8 decode: +3.5 % tg, failed the gate) |
 
 ## Current numbers (docker 7.2.4 RelWithDebInfo probes, 5.05 + KVarN)
