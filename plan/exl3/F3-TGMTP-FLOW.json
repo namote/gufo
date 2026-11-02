@@ -1,0 +1,50 @@
+{
+  "date": "2026-11-02",
+  "prefill_frozen_at": "0ff1cb20",
+  "objective": "Optimize autoregressive TG and MTP across drafting, batched verification, recurrence/rollback, sampling and graph/PLE orchestration; preserve established quality and prefill paths.",
+  "profile": "F3-TGMTP-PROFILE.json",
+  "screens": "F3-TGMTP-SCREENS.json",
+  "flow": [
+    {
+      "stage": "Dense EXL3 and target vocabulary projection",
+      "observed": "AR464.92ms/1325.71ms diagnostic decode span,35.07%; shared row decoding/groupedQKV already implemented.",
+      "decision": "Retain existing lanes/tiles and independent grouping. Prior wider/buffering/row-tile negative results remain applicable; no precision reduction or speculative new schedule."
+    },
+    {
+      "stage": "HC plain projections",
+      "observed": "All SmallGemm302.94ms/1325.71ms ARspan; exact K320up subset108.59ms across3104calls.",
+      "decision": "Candidate alignedK320 stableF16 valid-four-wide loads, preserving scalar accumulation; operatorqualified rows1..8. Broader wholeK vector loads already exist."
+    },
+    {
+      "stage": "Routed expert gate/up/down",
+      "observed": "AR267.17ms; MTP1469.80ms/1977.02ms diagnostic span74.34%. Multitoken kernel LDS40960B versus scalar0.",
+      "decision": "Candidate compile-time row slots eliminate promoted LDS for allK3..7, widths1/2/3/4/8. Keep original quantization, ordered dot products, scaling and output restore."
+    },
+    {
+      "stage": "Draft catch-up, recursive body and vocabulary head",
+      "observed": "MTP28drafts,22accepted,10cycles for32committed; subsetHeadGemv23.50ms,1.19%span. Cache-only prefill, laggedcatchup and short-tailcompaction already retained.",
+      "decision": "Reuse same optimized commonHC/MoE kernels; retain subsethead and batching. No evidence that draft precision or head replacement is needed before fixing verifier."
+    },
+    {
+      "stage": "GDN recurrence and rollback",
+      "observed": "GdnKernel12.43ms in MTPspan; allother support48.75ms includes rollback/support. No separate rollback cost fabricated.",
+      "decision": "Preserve compact exact rollback replay and session-isolated states; exercise existing batch/rejection/snapshot tests."
+    },
+    {
+      "stage": "Sampler, acceptance and prompt lookup",
+      "observed": "Policies and RNG topology unchanged. Confidence-basedgreedy and privatepromptlookup already present; oldcosttables citeQ4/Q8.",
+      "decision": "Do not retune costs from pre-fix timings: removing pathological verifierLDS changes the costs. Validate25samplingstrategies,budgets,C2 andbatchhistories instead."
+    },
+    {
+      "stage": "Host, graphs, PLE and I/O",
+      "observed": "Current native trace confirms graph launches/replay; ARkernelbusy90.15%,MTP93.79% withininitialdecode kernelspan. These are not ALUutilization and omit selected hostAPI types.",
+      "decision": "Retain existing PLE prefetch/graph split and capture semantics. No broad graph/cache rewrite for a smaller unisolated cost in this batch."
+    }
+  ],
+  "qualification": "F3-TGMTP-QUALIFICATION.json",
+  "boundaries": [
+    "Frozen prefillspeed and quality evidence remain in F3-PREFILL-BATCH6-QUALIFICATION.json; no repeatedprefillbaseline orfullcollector.",
+    "Only kernel loading/indexing changed; no newknobs,precisionpolicy,costtable,sampler orcacheformat changes.",
+    "FutureC8throughput/deepercostcalibration must reuse this receipt and justify new scope; completednumericchecks should not be rerun for each small candidate."
+  ]
+}

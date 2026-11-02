@@ -1,0 +1,388 @@
+{
+  "date": "2026-11-02",
+  "status": "COMBINED_QUALIFICATION_PASS",
+  "source_base": "0ff1cb20",
+  "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-tgmtp2-qualification-nix101",
+  "health_PASS": true,
+  "actual_binaries": {
+    "/opt/gufo-prefill/bin/.gufo-wrapped": "b691cfe2717729562e940d3d0955792840f644fb0dcc7a48428cfbb6d01b929a",
+    "/src/build/f3-tgmtp2/gufo": "f4dca2bca9efe4da63e8e1309f9b15dd31792c5460d5e27cff35ae19740578d5",
+    "/src/build/f3-tgmtp2/session_test": "a1727e61d47df17261805247b6633819f38a8548d70e9f6076652f4f5fc665af",
+    "/src/build/f3-tgmtp2/exl3_ops": "1c96b315ec8db4090a671931c781bad85c690a0db3a3e8a37b8c82efa6c58b8c"
+  },
+  "scope": "TG128 only, C1,depth0/32768,context32897,temp0,seed314159,KVarN4v4,r2. One fresh matched frozen-batch6 control per mode, saved for reuse. Historical T1/T2 remains historical (different source/context34817, no per-output hashes).",
+  "performance": [
+    {
+      "mode": "off",
+      "depth": 0,
+      "baseline": {
+        "tps": 24.95,
+        "sample_stddev": 0.06
+      },
+      "candidate": {
+        "tps": 25.24,
+        "sample_stddev": 0.04
+      },
+      "throughput_change_percent": 1.1623246492985961,
+      "token_and_draft_stats_exact": true,
+      "repetitions": [
+        {
+          "cycles": 0,
+          "drafted": 0,
+          "accepted": 0,
+          "lookup_proposed": 0,
+          "lookup_accepted": 0,
+          "output_sha256": "b2c54baf65a6a87a43b57e842708d2cae2ce87aef69d9ff6a6ba4a7b170a266d"
+        },
+        {
+          "cycles": 0,
+          "drafted": 0,
+          "accepted": 0,
+          "lookup_proposed": 0,
+          "lookup_accepted": 0,
+          "output_sha256": "b2c54baf65a6a87a43b57e842708d2cae2ce87aef69d9ff6a6ba4a7b170a266d"
+        }
+      ]
+    },
+    {
+      "mode": "off",
+      "depth": 32768,
+      "baseline": {
+        "tps": 24.3,
+        "sample_stddev": 0.02
+      },
+      "candidate": {
+        "tps": 24.51,
+        "sample_stddev": 0.03
+      },
+      "throughput_change_percent": 0.8641975308641969,
+      "token_and_draft_stats_exact": true,
+      "repetitions": [
+        {
+          "cycles": 0,
+          "drafted": 0,
+          "accepted": 0,
+          "lookup_proposed": 0,
+          "lookup_accepted": 0,
+          "output_sha256": "d856f78e53b98c09031ee55f8a76ba0b49acde5e1186a8330e007361cfd73b57"
+        },
+        {
+          "cycles": 0,
+          "drafted": 0,
+          "accepted": 0,
+          "lookup_proposed": 0,
+          "lookup_accepted": 0,
+          "output_sha256": "d856f78e53b98c09031ee55f8a76ba0b49acde5e1186a8330e007361cfd73b57"
+        }
+      ]
+    },
+    {
+      "mode": "mtp",
+      "depth": 0,
+      "baseline": {
+        "tps": 17.05,
+        "sample_stddev": 0.58
+      },
+      "candidate": {
+        "tps": 46.7,
+        "sample_stddev": 3.9
+      },
+      "throughput_change_percent": 173.900293255132,
+      "token_and_draft_stats_exact": true,
+      "repetitions": [
+        {
+          "cycles": 40,
+          "drafted": 113,
+          "accepted": 88,
+          "lookup_proposed": 0,
+          "lookup_accepted": 0,
+          "output_sha256": "b2c54baf65a6a87a43b57e842708d2cae2ce87aef69d9ff6a6ba4a7b170a266d"
+        },
+        {
+          "cycles": 40,
+          "drafted": 113,
+          "accepted": 88,
+          "lookup_proposed": 0,
+          "lookup_accepted": 0,
+          "output_sha256": "b2c54baf65a6a87a43b57e842708d2cae2ce87aef69d9ff6a6ba4a7b170a266d"
+        }
+      ]
+    },
+    {
+      "mode": "mtp",
+      "depth": 32768,
+      "baseline": {
+        "tps": 22.23,
+        "sample_stddev": 0.01
+      },
+      "candidate": {
+        "tps": 79.31,
+        "sample_stddev": 0.94
+      },
+      "throughput_change_percent": 256.77013045434103,
+      "token_and_draft_stats_exact": true,
+      "repetitions": [
+        {
+          "cycles": 17,
+          "drafted": 111,
+          "accepted": 111,
+          "lookup_proposed": 101,
+          "lookup_accepted": 101,
+          "output_sha256": "d856f78e53b98c09031ee55f8a76ba0b49acde5e1186a8330e007361cfd73b57"
+        },
+        {
+          "cycles": 17,
+          "drafted": 111,
+          "accepted": 111,
+          "lookup_proposed": 101,
+          "lookup_accepted": 101,
+          "output_sha256": "d856f78e53b98c09031ee55f8a76ba0b49acde5e1186a8330e007361cfd73b57"
+        }
+      ]
+    }
+  ],
+  "correctness": [
+    {
+      "name": "numeric-boundaries",
+      "argv": [
+        "/src/build/f3-tgmtp2/exl3_ops",
+        "--plain-prefill-only"
+      ],
+      "returncode": 0,
+      "seconds": 0.8082901150919497,
+      "runtime_paths": [
+        "/nix/store/88jjsz00km321bcl9851aiwwdig79b4l-rocm-runtime-10.1/lib/libhsa-runtime64.so.1.21.0",
+        "/nix/store/al4qwi7jfyrdkyb25xsri8b00b1agj1r-clr-10.1/lib/libamdhip64.so.7.16.0-0000000"
+      ],
+      "PASS": true
+    },
+    {
+      "name": "sampling",
+      "argv": [
+        "/src/build/f3-tgmtp2/session_test",
+        "--model",
+        "/models/fnx-meta/gufo.gguf",
+        "--mtp-model",
+        "/models/fnx-meta/gufo.gguf",
+        "--sampling-only"
+      ],
+      "returncode": 0,
+      "seconds": 109.7825770729687,
+      "runtime_paths": [
+        "/nix/store/88jjsz00km321bcl9851aiwwdig79b4l-rocm-runtime-10.1/lib/libhsa-runtime64.so.1.21.0",
+        "/nix/store/al4qwi7jfyrdkyb25xsri8b00b1agj1r-clr-10.1/lib/libamdhip64.so.7.16.0-0000000"
+      ],
+      "PASS": true
+    },
+    {
+      "name": "batch",
+      "argv": [
+        "/src/build/f3-tgmtp2/session_test",
+        "--model",
+        "/models/fnx-meta/gufo.gguf",
+        "--mtp-model",
+        "/models/fnx-meta/gufo.gguf",
+        "--batch-only"
+      ],
+      "returncode": 0,
+      "seconds": 178.6578727120068,
+      "runtime_paths": [
+        "/nix/store/88jjsz00km321bcl9851aiwwdig79b4l-rocm-runtime-10.1/lib/libhsa-runtime64.so.1.21.0",
+        "/nix/store/al4qwi7jfyrdkyb25xsri8b00b1agj1r-clr-10.1/lib/libamdhip64.so.7.16.0-0000000"
+      ],
+      "PASS": true
+    },
+    {
+      "name": "deep-state",
+      "argv": [
+        "/src/build/f3-tgmtp2/session_test",
+        "--model",
+        "/models/fnx-meta/gufo.gguf",
+        "--mtp-model",
+        "/models/fnx-meta/gufo.gguf",
+        "--execution-only",
+        "32768"
+      ],
+      "returncode": 0,
+      "seconds": 82.4702706169337,
+      "runtime_paths": [
+        "/nix/store/88jjsz00km321bcl9851aiwwdig79b4l-rocm-runtime-10.1/lib/libhsa-runtime64.so.1.21.0",
+        "/nix/store/al4qwi7jfyrdkyb25xsri8b00b1agj1r-clr-10.1/lib/libamdhip64.so.7.16.0-0000000"
+      ],
+      "PASS": true
+    }
+  ],
+  "component_evidence": "F3-TGMTP-SCREENS.json",
+  "profile_evidence": "F3-TGMTP-PROFILE.json",
+  "flow_review": "F3-TGMTP-FLOW.json",
+  "limits": [
+    "Fresh baseline is frozen currentbatch6 onepasspermode, not a repeat of historical T1/T2 whose revision/capacity differ. All new controlvalues/hashes retained.",
+    "Model benchmark C1,greedy TG128 with fixedpattern histories at d0/32768/context32897/KVarN4v4/r2; C2/4/6/8 correctness is covered but no new concurrent-serving throughput claim.",
+    "No new prefill performance/corpus collection; frozen batch6 evidence retained. No new BF16parity claim; prior hc7 NLL drift remains.",
+    "Kernel-only loading/indexing changes: costs/draftpolicy/sampling/precision/cacheformats unchanged.",
+    "ShallowMTP46.70\u00b13.90tok/s is mean/sampleSD of2repetitions (CV8.35%). Clear large improvement, but no precise steady-state claim and no established cause for variance. Approximate two-point endpoints are observations, not confidence intervals or universal bounds.",
+    "DeepMTP79.31tok/s is complete MTP+promptlookup on fixedrepetitive history:111accepted includes101lookupaccepted and10neuralaccepted,17cycles. It is not pure neuralMTP throughput or a general claim that deepercontext speeds decoding."
+  ],
+  "retained": [
+    "RoutedGemv staticrowindices remove40960B LDS allocation at widths2..8",
+    "StableF16 aligned HC-up K320 vectorloads at widths1..8 preserve FMA boundaries"
+  ],
+  "code_object_bridge": {
+    "unchanged_code_objects": 75,
+    "baseline_objects": 77,
+    "candidate_objects": 77,
+    "changed": {
+      "baseline": [
+        {
+          "sha256": "5418671f6277f4db3a79f93dcf212e8f1b0af33f6bb0b38e2127bec9aea6791f",
+          "kernel_count": 260,
+          "routed_kernels": 0,
+          "small_projection_kernels": 102,
+          "nonzero_private": [
+            {
+              ".group_segment_fixed_size": 24576,
+              ".kernarg_segment_align": 8,
+              ".kernarg_segment_size": 472,
+              ".language": "OpenCL C",
+              ".language_version": [
+                2,
+                0
+              ],
+              ".max_flat_workgroup_size": 256,
+              ".name": "_ZN4gufo6models17qwen38_flash_next4rocm18DenseF16GEMMKernelILi256ELi128ELi1ELi8ELi1ELi4ELb0ELb0ELb1ELb0ELb0ELb0ELb1ELNS2_10WeightTypeE1ELb0EEEvPKvPK6__halfPfmmmS9_PS7_PvPKfSA_NS2_25AttentionProjectionOutputEjmj",
+              ".private_segment_fixed_size": 544,
+              ".sgpr_count": 48,
+              ".sgpr_spill_count": 0,
+              ".symbol": "_ZN4gufo6models17qwen38_flash_next4rocm18DenseF16GEMMKernelILi256ELi128ELi1ELi8ELi1ELi4ELb0ELb0ELb1ELb0ELb0ELb0ELb1ELNS2_10WeightTypeE1ELb0EEEvPKvPK6__halfPfmmmS9_PS7_PvPKfSA_NS2_25AttentionProjectionOutputEjmj.kd",
+              ".uniform_work_group_size": 1,
+              ".uses_dynamic_stack": false,
+              ".vgpr_count": 207,
+              ".vgpr_spill_count": 0,
+              ".wavefront_size": 32,
+              ".workgroup_processor_mode": 1
+            },
+            {
+              ".group_segment_fixed_size": 24576,
+              ".kernarg_segment_align": 8,
+              ".kernarg_segment_size": 472,
+              ".language": "OpenCL C",
+              ".language_version": [
+                2,
+                0
+              ],
+              ".max_flat_workgroup_size": 256,
+              ".name": "_ZN4gufo6models17qwen38_flash_next4rocm18DenseF16GEMMKernelILi256ELi128ELi1ELi8ELi1ELi4ELb0ELb0ELb1ELb0ELb0ELb0ELb0ELNS2_10WeightTypeE1ELb0EEEvPKvPK6__halfPfmmmS9_PS7_PvPKfSA_NS2_25AttentionProjectionOutputEjmj",
+              ".private_segment_fixed_size": 544,
+              ".sgpr_count": 44,
+              ".sgpr_spill_count": 0,
+              ".symbol": "_ZN4gufo6models17qwen38_flash_next4rocm18DenseF16GEMMKernelILi256ELi128ELi1ELi8ELi1ELi4ELb0ELb0ELb1ELb0ELb0ELb0ELb0ELNS2_10WeightTypeE1ELb0EEEvPKvPK6__halfPfmmmS9_PS7_PvPKfSA_NS2_25AttentionProjectionOutputEjmj.kd",
+              ".uniform_work_group_size": 1,
+              ".uses_dynamic_stack": false,
+              ".vgpr_count": 207,
+              ".vgpr_spill_count": 0,
+              ".wavefront_size": 32,
+              ".workgroup_processor_mode": 1
+            }
+          ]
+        },
+        {
+          "sha256": "29ee621b8440b72230a430cb8ba93e300d16e67d1d86767b9225f5994771a27f",
+          "kernel_count": 112,
+          "routed_kernels": 75,
+          "small_projection_kernels": 0,
+          "nonzero_private": []
+        }
+      ],
+      "candidate": [
+        {
+          "sha256": "3b8084c9bf64a1793ad8f30d11193bd1b9ad78ef96b5c49c38401edc5347c427",
+          "kernel_count": 268,
+          "routed_kernels": 0,
+          "small_projection_kernels": 110,
+          "nonzero_private": [
+            {
+              ".group_segment_fixed_size": 24576,
+              ".kernarg_segment_align": 8,
+              ".kernarg_segment_size": 472,
+              ".language": "OpenCL C",
+              ".language_version": [
+                2,
+                0
+              ],
+              ".max_flat_workgroup_size": 256,
+              ".name": "_ZN4gufo6models17qwen38_flash_next4rocm18DenseF16GEMMKernelILi256ELi128ELi1ELi8ELi1ELi4ELb0ELb0ELb1ELb0ELb0ELb0ELb1ELNS2_10WeightTypeE1ELb0EEEvPKvPK6__halfPfmmmS9_PS7_PvPKfSA_NS2_25AttentionProjectionOutputEjmj",
+              ".private_segment_fixed_size": 544,
+              ".sgpr_count": 48,
+              ".sgpr_spill_count": 0,
+              ".symbol": "_ZN4gufo6models17qwen38_flash_next4rocm18DenseF16GEMMKernelILi256ELi128ELi1ELi8ELi1ELi4ELb0ELb0ELb1ELb0ELb0ELb0ELb1ELNS2_10WeightTypeE1ELb0EEEvPKvPK6__halfPfmmmS9_PS7_PvPKfSA_NS2_25AttentionProjectionOutputEjmj.kd",
+              ".uniform_work_group_size": 1,
+              ".uses_dynamic_stack": false,
+              ".vgpr_count": 207,
+              ".vgpr_spill_count": 0,
+              ".wavefront_size": 32,
+              ".workgroup_processor_mode": 1
+            },
+            {
+              ".group_segment_fixed_size": 24576,
+              ".kernarg_segment_align": 8,
+              ".kernarg_segment_size": 472,
+              ".language": "OpenCL C",
+              ".language_version": [
+                2,
+                0
+              ],
+              ".max_flat_workgroup_size": 256,
+              ".name": "_ZN4gufo6models17qwen38_flash_next4rocm18DenseF16GEMMKernelILi256ELi128ELi1ELi8ELi1ELi4ELb0ELb0ELb1ELb0ELb0ELb0ELb0ELNS2_10WeightTypeE1ELb0EEEvPKvPK6__halfPfmmmS9_PS7_PvPKfSA_NS2_25AttentionProjectionOutputEjmj",
+              ".private_segment_fixed_size": 544,
+              ".sgpr_count": 44,
+              ".sgpr_spill_count": 0,
+              ".symbol": "_ZN4gufo6models17qwen38_flash_next4rocm18DenseF16GEMMKernelILi256ELi128ELi1ELi8ELi1ELi4ELb0ELb0ELb1ELb0ELb0ELb0ELb0ELNS2_10WeightTypeE1ELb0EEEvPKvPK6__halfPfmmmS9_PS7_PvPKfSA_NS2_25AttentionProjectionOutputEjmj.kd",
+              ".uniform_work_group_size": 1,
+              ".uses_dynamic_stack": false,
+              ".vgpr_count": 207,
+              ".vgpr_spill_count": 0,
+              ".wavefront_size": 32,
+              ".workgroup_processor_mode": 1
+            }
+          ]
+        },
+        {
+          "sha256": "712e5584887f3d8ad4f07bd008a5bbd07c98a882265b2bc30d48bb316e1ea6be",
+          "kernel_count": 112,
+          "routed_kernels": 75,
+          "small_projection_kernels": 0,
+          "nonzero_private": []
+        }
+      ]
+    },
+    "meaning": "Only FlashNext exl3_moe and kernels HIP codeobjects differ; original prefillspecialization object andallother75objects preserved."
+  },
+  "artifacts": {
+    "build/f3-tgmtp2/gufo": "f4dca2bca9efe4da63e8e1309f9b15dd31792c5460d5e27cff35ae19740578d5",
+    "build/f3-tgmtp2/hc_screen": "6c88c7000efca7a91204ee0f63fd2ccb58bfcbb8853e5963c75e688c27908a1b",
+    "build/f3-tgmtp2/session_test": "a1727e61d47df17261805247b6633819f38a8548d70e9f6076652f4f5fc665af",
+    "build/f3-tgmtp2/exl3_ops": "1c96b315ec8db4090a671931c781bad85c690a0db3a3e8a37b8c82efa6c58b8c",
+    "build/f3-tgmtp2/hc_screen.cpp": "bdf556911571bbc6eda069299adc99bd49b234754d6923a96fa580b97e476d0a",
+    "build/f3-tgmtp2/FINAL-SOURCE.patch": "9fc9a496ea9635b034619820f911d29c60a5660b4261d0dd87a496822b71b47d",
+    "build/f3-tgmtp2/run_final.py": "673d23560e6a4f666445f616c48e944f8acd95be1987d6c43711a3b8ac9afd94",
+    "build/f3-tgmtp1/screen": "ca09c4d785320185e99dc7bc6c3bbb08801f2f24d27d175da2b21d36da99549c",
+    "build/f3-tgmtp1/screen.hip": "2837fc814571d8df85cd05197034473bca30515c47e55016a0551d12cac11df6"
+  },
+  "image": {
+    "image_tag": "ai-tools/gufo-eval:f3-tgmtp-9fc9a496-rocm101",
+    "revision": "0ff1cb20-tgmtp-9fc9a496",
+    "source_patch_sha256": "9fc9a496ea9635b034619820f911d29c60a5660b4261d0dd87a496822b71b47d",
+    "qualified_elf_sha256": "f4dca2bca9efe4da63e8e1309f9b15dd31792c5460d5e27cff35ae19740578d5",
+    "entrypoint": "/opt/gufo-tgmtp/bin/gufo",
+    "status": "PACKAGED_AND_IDENTICAL_TO_QUALIFIED_ELF",
+    "image_id": "sha256:4864462158dc5947475d1e09421e1582c2facb5afbd47ee5d0d356a60bb30aa3",
+    "installed_elf": {
+      "path": "/opt/gufo-tgmtp/bin/.gufo-wrapped",
+      "sha256": "f4dca2bca9efe4da63e8e1309f9b15dd31792c5460d5e27cff35ae19740578d5",
+      "bytes": 115297688
+    },
+    "wrapper_smoke_PASS": true
+  },
+  "format": "PASS: Checked758C++files, pinnedclang-format21.1.8",
+  "review": "indexer_review: bothcodepatches, strengthenedguards, K320boundaryfixture andfinalreporting approved; no openblockers."
+}

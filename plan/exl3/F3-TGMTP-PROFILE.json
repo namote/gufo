@@ -1,0 +1,117 @@
+{
+  "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-tgmtp-profile-nix101/receipt/run",
+  "scope": "Frozen batch6 diagnostic C1 TG32 at d0/context4096, temp0/seed314159/k4v4; native roctracer10.1, initial16-token prefill excluded. Not an unprofiled speed baseline.",
+  "baseline_inference_repeated": false,
+  "modes": {
+    "off": {
+      "raw_sha256": "db628d6d55209c12fe75ed535a83e7d135f24a2883ed30889d8a0b64db73eeb0",
+      "start_kernel_index": 2399,
+      "kernel_dispatches": 58621,
+      "kernel_span_ms": 1325.706149,
+      "kernel_union_ms": 1195.094949,
+      "kernel_active_percent": 90.14780160003617,
+      "kernel_plus_copy_union_ms": 1195.303073,
+      "families": {
+        "Exl3GemvKernel": {
+          "calls": 6560,
+          "ms": 464.9210660000004
+        },
+        "SmallGemmKernel": {
+          "calls": 8960,
+          "ms": 302.9370820000013
+        },
+        "RoutedGemv": {
+          "calls": 3072,
+          "ms": 267.1654500000006
+        },
+        "other": {
+          "calls": 35421,
+          "ms": 94.25513199999936
+        },
+        "GdnKernel": {
+          "calls": 1152,
+          "ms": 27.145486999999928
+        },
+        "HcCombine": {
+          "calls": 3072,
+          "ms": 23.71469499999993
+        },
+        "AttentionKernel": {
+          "calls": 384,
+          "ms": 14.956036999999991
+        }
+      },
+      "selected_api_counts": {
+        "hipLaunchKernel": 5314,
+        "hipMemcpyAsync": 5,
+        "hipStreamSynchronize": 32,
+        "hipGraphLaunch": 61
+      },
+      "output_sha256": "e54088323746fecb1e9cb2bda682f815f51cd2509dfd004f395247f925578d10"
+    },
+    "mtp": {
+      "raw_sha256": "da90d38df5daa763283257fe157e71914abddff191bd4f91f986817003a89ea8",
+      "start_kernel_index": 2444,
+      "kernel_dispatches": 20529,
+      "kernel_span_ms": 1977.018144,
+      "kernel_union_ms": 1854.317511,
+      "kernel_active_percent": 93.7936516479436,
+      "kernel_plus_copy_union_ms": 1855.721093,
+      "families": {
+        "RoutedGemv": {
+          "calls": 1016,
+          "ms": 1469.8000919999988
+        },
+        "Exl3GemvKernel": {
+          "calls": 2254,
+          "ms": 159.91265299999966
+        },
+        "SmallGemmKernel": {
+          "calls": 2996,
+          "ms": 125.79231400000015
+        },
+        "other": {
+          "calls": 12711,
+          "ms": 48.75320399999981
+        },
+        "HeadGemv": {
+          "calls": 28,
+          "ms": 23.501246000000002
+        },
+        "GdnKernel": {
+          "calls": 360,
+          "ms": 12.426205999999992
+        },
+        "HcCombine": {
+          "calls": 1016,
+          "ms": 8.340758999999998
+        },
+        "AttentionKernel": {
+          "calls": 148,
+          "ms": 5.791037000000001
+        }
+      },
+      "selected_api_counts": {
+        "hipLaunchKernel": 17338,
+        "hipMemcpyAsync": 218,
+        "hipStreamSynchronize": 56,
+        "hipGraphLaunch": 27,
+        "hipMalloc": 6
+      },
+      "output_sha256": "e54088323746fecb1e9cb2bda682f815f51cd2509dfd004f395247f925578d10",
+      "acceptance": {
+        "cycles": 10,
+        "drafted": 28,
+        "accepted": 22,
+        "lookup_proposed": 0,
+        "committed_tokens": 32
+      }
+    }
+  },
+  "limits": [
+    "Native dispatch timestamps include graph replay; replay grid/stream correlation is unavailable in this tracer, so no replay-shape attribution is fabricated.",
+    "Selected11HIPAPI operations do not cover all host overhead.",
+    "Cold graph capture and allocation are included in this short first request, as in bench; no claim of steady-state saturation.",
+    "MTP prefix catch-up15rows excluded; decode starts next anchor catch-up. Kernel-active percent is not ALU utilization."
+  ]
+}

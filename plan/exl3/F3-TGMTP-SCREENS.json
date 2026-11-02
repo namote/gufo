@@ -1,0 +1,428 @@
+{
+  "date": "2026-11-02",
+  "status": "OPERATOR_SCREENS_PASS_MODEL_QUALIFICATION_SEPARATE",
+  "source_base": "0ff1cb20",
+  "compiler_runtime": "Pinned Nix ROCm10.1, gfx1151; same production compile commands, frozen batch6 controls preserved",
+  "routed": {
+    "mechanism": "Unroll row loops and mask each compile-time row index; keep descriptors/accumulators out of promoted LDS. No launch bound/tile/precision/policy change.",
+    "resource_entries": 75,
+    "candidate_all_LDS_bytes": [
+      0
+    ],
+    "candidate_all_private_bytes": [
+      0
+    ],
+    "candidate_all_vgpr_spills": [
+      0
+    ],
+    "attribution": "40-byte Exl3RouteTile copied local descriptor times compiler maximum1024threads equals40960B; descriptor/slot alloca promotion is an inference, not measured register spilling.",
+    "exact_frozen_checks": 75,
+    "shapes": [
+      "K2560 N640 unscaled",
+      "K640 N2560 scaled with exponents-1/0/1",
+      "K640 N2560 widened"
+    ],
+    "rates": [
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "max_rows": [
+      1,
+      2,
+      3,
+      4,
+      8
+    ],
+    "coverage": "Each partial count1..R, reversed slots, poison inactive slots, exact-size input, independent output sentinel checks in second screen. Reused DownFixtures/ExpertInvariance/FusedProducer all rates with independent FP64, signedzero/subnormal/unsafe exponent, partitions/reordering/shared-disjoint routes and graph replay.",
+    "timings": [
+      {
+        "k": 2560.0,
+        "n": 640.0,
+        "rows": 1.0,
+        "scaled": 0.0,
+        "old_ms": 0.0464764,
+        "new_ms": 0.0464049,
+        "exact": 1.0,
+        "latency_change_percent": -0.15384151956692182
+      },
+      {
+        "k": 640.0,
+        "n": 2560.0,
+        "rows": 1.0,
+        "scaled": 1.0,
+        "old_ms": 0.043691,
+        "new_ms": 0.044152,
+        "exact": 1.0,
+        "latency_change_percent": 1.0551372136137882
+      },
+      {
+        "k": 2560.0,
+        "n": 640.0,
+        "rows": 2.0,
+        "scaled": 0.0,
+        "old_ms": 0.447477,
+        "new_ms": 0.0626336,
+        "exact": 1.0,
+        "latency_change_percent": -86.00294540278048
+      },
+      {
+        "k": 640.0,
+        "n": 2560.0,
+        "rows": 2.0,
+        "scaled": 1.0,
+        "old_ms": 0.519967,
+        "new_ms": 0.0580419,
+        "exact": 1.0,
+        "latency_change_percent": -88.83738775729998
+      },
+      {
+        "k": 2560.0,
+        "n": 640.0,
+        "rows": 3.0,
+        "scaled": 0.0,
+        "old_ms": 0.557108,
+        "new_ms": 0.0772222,
+        "exact": 1.0,
+        "latency_change_percent": -86.13873791078211
+      },
+      {
+        "k": 640.0,
+        "n": 2560.0,
+        "rows": 3.0,
+        "scaled": 1.0,
+        "old_ms": 0.609931,
+        "new_ms": 0.0736266,
+        "exact": 1.0,
+        "latency_change_percent": -87.92870013165424
+      },
+      {
+        "k": 2560.0,
+        "n": 640.0,
+        "rows": 4.0,
+        "scaled": 0.0,
+        "old_ms": 0.640133,
+        "new_ms": 0.091991,
+        "exact": 1.0,
+        "latency_change_percent": -85.62939264184162
+      },
+      {
+        "k": 640.0,
+        "n": 2560.0,
+        "rows": 4.0,
+        "scaled": 1.0,
+        "old_ms": 0.757914,
+        "new_ms": 0.0832367,
+        "exact": 1.0,
+        "latency_change_percent": -89.01765899561164
+      },
+      {
+        "k": 2560.0,
+        "n": 640.0,
+        "rows": 8.0,
+        "scaled": 0.0,
+        "old_ms": 0.953568,
+        "new_ms": 0.145664,
+        "exact": 1.0,
+        "latency_change_percent": -84.72431960804055
+      },
+      {
+        "k": 640.0,
+        "n": 2560.0,
+        "rows": 8.0,
+        "scaled": 1.0,
+        "old_ms": 1.03906,
+        "new_ms": 0.134878,
+        "exact": 1.0,
+        "latency_change_percent": -87.0192289184455
+      }
+    ],
+    "frozen_binary_sha256": "b691cfe2717729562e940d3d0955792840f644fb0dcc7a48428cfbb6d01b929a",
+    "candidate_binary_sha256": "fe315eaa071e1a046d62cf466f426d79d215056b3814d398148f46f69c654539",
+    "baseline_multirow_LDS_bytes": 40960
+  },
+  "hc320": {
+    "mechanism": "StableF16 aligned K320 non-HcDown projection only: four-wide weight/input loads for valid steps; original4step accumulation and FMA materialization unchanged.",
+    "cold_weight_bytes": 52428800,
+    "coverage": "Rows1..8 N7/10240; original module vs actual SmallGemmStable dispatch bit-exact for all8rotating matrices; independent ordered FP32 FMA+descendingXOR oracle N7, exact-size input, tail8word sentinel and live-output checks. Existing numerical fixture extended toK320 for signedzero/subnormal +8/9rows, run in finalbatch.",
+    "timings": [
+      {
+        "rows": 1.0,
+        "K": 320.0,
+        "N": 10240.0,
+        "old_ms": 0.0363671,
+        "new_ms": 0.0322329,
+        "exact": 1.0,
+        "latency_change_percent": -11.367967201124085
+      },
+      {
+        "rows": 2.0,
+        "K": 320.0,
+        "N": 10240.0,
+        "old_ms": 0.0401018,
+        "new_ms": 0.0326727,
+        "exact": 1.0,
+        "latency_change_percent": -18.525602342039516
+      },
+      {
+        "rows": 3.0,
+        "K": 320.0,
+        "N": 10240.0,
+        "old_ms": 0.0446046,
+        "new_ms": 0.0339907,
+        "exact": 1.0,
+        "latency_change_percent": -23.79552781551679
+      },
+      {
+        "rows": 4.0,
+        "K": 320.0,
+        "N": 10240.0,
+        "old_ms": 0.0491545,
+        "new_ms": 0.035178,
+        "exact": 1.0,
+        "latency_change_percent": -28.433815825611074
+      },
+      {
+        "rows": 5.0,
+        "K": 320.0,
+        "N": 10240.0,
+        "old_ms": 0.0573913,
+        "new_ms": 0.0388276,
+        "exact": 1.0,
+        "latency_change_percent": -32.34584335953359
+      },
+      {
+        "rows": 6.0,
+        "K": 320.0,
+        "N": 10240.0,
+        "old_ms": 0.065052,
+        "new_ms": 0.0425982,
+        "exact": 1.0,
+        "latency_change_percent": -34.51669433683821
+      },
+      {
+        "rows": 7.0,
+        "K": 320.0,
+        "N": 10240.0,
+        "old_ms": 0.072956,
+        "new_ms": 0.0460603,
+        "exact": 1.0,
+        "latency_change_percent": -36.865645046329284
+      },
+      {
+        "rows": 8.0,
+        "K": 320.0,
+        "N": 10240.0,
+        "old_ms": 0.0821404,
+        "new_ms": 0.046299,
+        "exact": 1.0,
+        "latency_change_percent": -43.63431393078193
+      }
+    ],
+    "resources": [
+      {
+        "group_segment_fixed_size": 0,
+        "kernarg_segment_align": 8,
+        "kernarg_segment_size": 288,
+        "language": "OpenCL C",
+        "language_version": [
+          2,
+          0
+        ],
+        "max_flat_workgroup_size": 1024,
+        "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_115SmallGemmKernelILNS2_10WeightTypeE1ELj1ELb0ELb0ELb1ELb0ELb1EEEvPKvPKfPfjj",
+        "private_segment_fixed_size": 0,
+        "sgpr_count": 14,
+        "sgpr_spill_count": 0,
+        "symbol": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_115SmallGemmKernelILNS2_10WeightTypeE1ELj1ELb0ELb0ELb1ELb0ELb1EEEvPKvPKfPfjj.kd",
+        "uniform_work_group_size": 1,
+        "uses_dynamic_stack": false,
+        "vgpr_count": 40,
+        "vgpr_spill_count": 0,
+        "wavefront_size": 32,
+        "workgroup_processor_mode": 1
+      },
+      {
+        "group_segment_fixed_size": 0,
+        "kernarg_segment_align": 8,
+        "kernarg_segment_size": 288,
+        "language": "OpenCL C",
+        "language_version": [
+          2,
+          0
+        ],
+        "max_flat_workgroup_size": 1024,
+        "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_115SmallGemmKernelILNS2_10WeightTypeE1ELj2ELb0ELb0ELb1ELb0ELb1EEEvPKvPKfPfjj",
+        "private_segment_fixed_size": 0,
+        "sgpr_count": 17,
+        "sgpr_spill_count": 0,
+        "symbol": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_115SmallGemmKernelILNS2_10WeightTypeE1ELj2ELb0ELb0ELb1ELb0ELb1EEEvPKvPKfPfjj.kd",
+        "uniform_work_group_size": 1,
+        "uses_dynamic_stack": false,
+        "vgpr_count": 58,
+        "vgpr_spill_count": 0,
+        "wavefront_size": 32,
+        "workgroup_processor_mode": 1
+      },
+      {
+        "group_segment_fixed_size": 0,
+        "kernarg_segment_align": 8,
+        "kernarg_segment_size": 288,
+        "language": "OpenCL C",
+        "language_version": [
+          2,
+          0
+        ],
+        "max_flat_workgroup_size": 1024,
+        "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_115SmallGemmKernelILNS2_10WeightTypeE1ELj3ELb0ELb0ELb1ELb0ELb1EEEvPKvPKfPfjj",
+        "private_segment_fixed_size": 0,
+        "sgpr_count": 19,
+        "sgpr_spill_count": 0,
+        "symbol": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_115SmallGemmKernelILNS2_10WeightTypeE1ELj3ELb0ELb0ELb1ELb0ELb1EEEvPKvPKfPfjj.kd",
+        "uniform_work_group_size": 1,
+        "uses_dynamic_stack": false,
+        "vgpr_count": 74,
+        "vgpr_spill_count": 0,
+        "wavefront_size": 32,
+        "workgroup_processor_mode": 1
+      },
+      {
+        "group_segment_fixed_size": 0,
+        "kernarg_segment_align": 8,
+        "kernarg_segment_size": 288,
+        "language": "OpenCL C",
+        "language_version": [
+          2,
+          0
+        ],
+        "max_flat_workgroup_size": 1024,
+        "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_115SmallGemmKernelILNS2_10WeightTypeE1ELj4ELb0ELb0ELb1ELb0ELb1EEEvPKvPKfPfjj",
+        "private_segment_fixed_size": 0,
+        "sgpr_count": 21,
+        "sgpr_spill_count": 0,
+        "symbol": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_115SmallGemmKernelILNS2_10WeightTypeE1ELj4ELb0ELb0ELb1ELb0ELb1EEEvPKvPKfPfjj.kd",
+        "uniform_work_group_size": 1,
+        "uses_dynamic_stack": false,
+        "vgpr_count": 91,
+        "vgpr_spill_count": 0,
+        "wavefront_size": 32,
+        "workgroup_processor_mode": 1
+      },
+      {
+        "group_segment_fixed_size": 0,
+        "kernarg_segment_align": 8,
+        "kernarg_segment_size": 288,
+        "language": "OpenCL C",
+        "language_version": [
+          2,
+          0
+        ],
+        "max_flat_workgroup_size": 1024,
+        "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_115SmallGemmKernelILNS2_10WeightTypeE1ELj5ELb0ELb0ELb1ELb0ELb1EEEvPKvPKfPfjj",
+        "private_segment_fixed_size": 0,
+        "sgpr_count": 21,
+        "sgpr_spill_count": 0,
+        "symbol": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_115SmallGemmKernelILNS2_10WeightTypeE1ELj5ELb0ELb0ELb1ELb0ELb1EEEvPKvPKfPfjj.kd",
+        "uniform_work_group_size": 1,
+        "uses_dynamic_stack": false,
+        "vgpr_count": 108,
+        "vgpr_spill_count": 0,
+        "wavefront_size": 32,
+        "workgroup_processor_mode": 1
+      },
+      {
+        "group_segment_fixed_size": 0,
+        "kernarg_segment_align": 8,
+        "kernarg_segment_size": 288,
+        "language": "OpenCL C",
+        "language_version": [
+          2,
+          0
+        ],
+        "max_flat_workgroup_size": 1024,
+        "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_115SmallGemmKernelILNS2_10WeightTypeE1ELj6ELb0ELb0ELb1ELb0ELb1EEEvPKvPKfPfjj",
+        "private_segment_fixed_size": 0,
+        "sgpr_count": 21,
+        "sgpr_spill_count": 0,
+        "symbol": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_115SmallGemmKernelILNS2_10WeightTypeE1ELj6ELb0ELb0ELb1ELb0ELb1EEEvPKvPKfPfjj.kd",
+        "uniform_work_group_size": 1,
+        "uses_dynamic_stack": false,
+        "vgpr_count": 127,
+        "vgpr_spill_count": 0,
+        "wavefront_size": 32,
+        "workgroup_processor_mode": 1
+      },
+      {
+        "group_segment_fixed_size": 0,
+        "kernarg_segment_align": 8,
+        "kernarg_segment_size": 288,
+        "language": "OpenCL C",
+        "language_version": [
+          2,
+          0
+        ],
+        "max_flat_workgroup_size": 1024,
+        "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_115SmallGemmKernelILNS2_10WeightTypeE1ELj7ELb0ELb0ELb1ELb0ELb1EEEvPKvPKfPfjj",
+        "private_segment_fixed_size": 0,
+        "sgpr_count": 21,
+        "sgpr_spill_count": 0,
+        "symbol": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_115SmallGemmKernelILNS2_10WeightTypeE1ELj7ELb0ELb0ELb1ELb0ELb1EEEvPKvPKfPfjj.kd",
+        "uniform_work_group_size": 1,
+        "uses_dynamic_stack": false,
+        "vgpr_count": 143,
+        "vgpr_spill_count": 0,
+        "wavefront_size": 32,
+        "workgroup_processor_mode": 1
+      },
+      {
+        "group_segment_fixed_size": 0,
+        "kernarg_segment_align": 8,
+        "kernarg_segment_size": 288,
+        "language": "OpenCL C",
+        "language_version": [
+          2,
+          0
+        ],
+        "max_flat_workgroup_size": 1024,
+        "name": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_115SmallGemmKernelILNS2_10WeightTypeE1ELj8ELb0ELb0ELb1ELb0ELb1EEEvPKvPKfPfjj",
+        "private_segment_fixed_size": 0,
+        "sgpr_count": 21,
+        "sgpr_spill_count": 0,
+        "symbol": "_ZN4gufo6models17qwen38_flash_next4rocm12_GLOBAL__N_115SmallGemmKernelILNS2_10WeightTypeE1ELj8ELb0ELb0ELb1ELb0ELb1EEEvPKvPKfPfjj.kd",
+        "uniform_work_group_size": 1,
+        "uses_dynamic_stack": false,
+        "vgpr_count": 161,
+        "vgpr_spill_count": 0,
+        "wavefront_size": 32,
+        "workgroup_processor_mode": 1
+      }
+    ]
+  },
+  "receipts": [
+    {
+      "path": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-tgmtp1-screen-nix101",
+      "window": "COMPLETE",
+      "health_PASS": true
+    },
+    {
+      "path": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-tgmtp2-screen-nix101",
+      "window": "COMPLETE",
+      "health_PASS": true
+    }
+  ],
+  "limits": [
+    "Component timing uses synthetic device-allocated weights, not whole-model mapped production traffic; actual model timing is separate.",
+    "First routed screen compared guard bytes to frozen controls; independent unchanged-sentinel checks were added and all75 rerun once without repeating component timings/oracles.",
+    "Old and new final controls are not profiled; profiled TG32 numbers remain diagnostic only."
+  ],
+  "artifacts": [
+    "build/f3-tgmtp1",
+    "build/f3-tgmtp2"
+  ],
+  "reviews": [
+    "indexer_review approved production scalarization, requested independent sentinel assertions; fixed and re-reviewed.",
+    "indexer_review approved HC320 vector loads, requested existing signedzero/subnormal fixture includeK320; added and re-reviewed."
+  ]
+}

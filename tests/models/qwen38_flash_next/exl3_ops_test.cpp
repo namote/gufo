@@ -1728,7 +1728,7 @@ void PlainPrefillStable() {
   // uses vector loads at aligned k; width9 uses the grouped masked path.
   constexpr unsigned special_rows = 9, special_n = 8;
   constexpr std::array<float, 4> zero_operands{0.0F, -0.0F, 1.0F, -1.0F};
-  for (unsigned special_k : {133U, 512U})
+  for (unsigned special_k : {133U, 320U, 512U})
     for (auto type : {GgmlType::kF16, GgmlType::kBF16, GgmlType::kF32})
       for (unsigned mode = 0; mode < 3; ++mode) {
         Buffers special;

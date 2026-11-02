@@ -167,9 +167,13 @@ __global__ void RoutedGemv(const ex::DeviceLinear* gate,
         for (int q = 0; q < 4; ++q)
           w[q] = arithmetic::DecodePairMul1(p[2 * q], p[2 * q + 1]);
       }
+      // Fixed row indices keep the accumulators and route slots in VGPRs.
+      // A dynamically indexed local array otherwise promotes to 40 KiB LDS
+      // per one-wave block on the pinned compiler, starving verification.
+#pragma unroll
       for (unsigned r = 0; r < MaxRows; ++r) {
         if (r >= tile_rows.count)
-          break;
+          continue;
         const auto* row =
             x + std::size_t{tile_rows.slots[r]} * k + kt * 16 + r0;
         const Half2 v01{row[0], row[1]};
@@ -188,9 +192,10 @@ __global__ void RoutedGemv(const ex::DeviceLinear* gate,
       }
     }
   }
+#pragma unroll
   for (unsigned r = 0; r < MaxRows; ++r) {
     if (r >= tile_rows.count)
-      break;
+      continue;
     a[r] += __shfl_xor(a[r], 1, 32);
     b[r] += __shfl_xor(b[r], 1, 32);
     a[r] += __shfl_xor(a[r], 2, 32);

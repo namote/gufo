@@ -1456,7 +1456,8 @@ __global__ void NarrowKernel(const float* x, T* out, std::size_t count) {
 /// tokens accumulate in registers, then a wave reduction per token.
 constexpr unsigned kSmallGemmRows = 4;
 template<WeightType type, unsigned tokens, bool grouped = false,
-         bool kWhole = false, bool stable = false, bool kHcDown = false>
+         bool kWhole = false, bool stable = false, bool kHcDown = false,
+         bool kTailVector = false>
 __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
                                 std::uint32_t m, std::uint32_t k) {
   static_assert(!kHcDown || (stable && type == WeightType::kF16));
@@ -1484,7 +1485,21 @@ __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
 #pragma unroll
     for (unsigned st = 0; st < kSteps; ++st) {
       const std::uint32_t i0 = i_base + st * stride;
-      if constexpr (kWhole) {
+      if constexpr (kWhole || kTailVector) {
+        if constexpr (kTailVector) {
+          // HC-up has K=320: a lane's four values are wholly valid or
+          // absent. Do not read the missing steps of the four-step pass.
+          if (i0 >= k) {
+#pragma unroll
+            for (unsigned r = 0; r < 4; ++r) {
+              wv[st][r] = 0.0F;
+#pragma unroll
+              for (unsigned j = 0; j < tokens; ++j)
+                xv[st][j][r] = 0.0F;
+            }
+            continue;
+          }
+        }
         // Rows of whole passes (k a multiple of stride * kSteps): every step
         // is in range, so the four elements arrive as one load: 16 bytes for
         // F32, 8 bytes for F16/BF16 (widened exactly, as RowElement does).
@@ -8039,6 +8054,15 @@ void LaunchSmallGemm(const void* w, const float* x, float* out, std::uint32_t m,
                           reinterpret_cast<std::uintptr_t>(x)) %
                              16 ==
                          0;
+    if constexpr (stable && type == WeightType::kF16 && !kHcDown) {
+      if (aligned && k == 320) {
+        hipLaunchKernelGGL(
+            (SmallGemmKernel<type, tokens, false, false, stable, false, true>),
+            dim3((m + kSmallGemmRows - 1) / kSmallGemmRows),
+            dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m, k);
+        return;
+      }
+    }
     if (aligned && k % (32 * 4 * 4) == 0) {
       hipLaunchKernelGGL(
           (SmallGemmKernel<type, tokens, false, true, stable, kHcDown>),

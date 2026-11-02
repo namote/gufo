@@ -1,5 +1,11 @@
 # F3 prefill search status, 2026-11-02
 
+User priority moved to TG/MTP after freezing this prefill phase on November2.
+The qualified follow-up removes routed verifier LDS and vectorizes exact HC320
+loads. See [TG/MTP qualification](F3-TGMTP-QUALIFICATION.json) and
+[full execution-flow review](F3-TGMTP-FLOW.json). The prefill figures and rejected
+research below remain preserved history; do not repeat them as a new TG task.
+
 The qualified result is **1435.59 ±.07 tok/s at pp2048**. The target of
 2000 tok/s is **not reached**: it would still require about 39% more throughput,
 or 28.2% lower latency. No claim of hardware impossibility is made.

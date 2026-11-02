@@ -1,5 +1,41 @@
 # Qwen3.8 Flash-Next benchmarks
 
+## TG/MTP routed and HC optimization, November 2, 2026
+
+Pinned Nix ROCm10.1, EXL3 5.05, C1 TG128, KVarN k4v4, temperature0,
+seed314159, r2, depth0/32768 and common context capacity32897. Frozen
+batch6 was measured once per mode and saved as the current control; historical
+T1/T2 had different source/capacity34817 and are not reused as matched controls.
+Both repetitions retain identical output hashes and draft/acceptance/lookup
+counts before and after; candidate AR and MTP outputs also agree.
+
+| Mode | Depth | Frozen batch6 tok/s | Candidate tok/s | Change |
+|---|---:|---:|---:|---:|
+| AR | 0 | 24.95 ±0.06 | 25.24 ±0.04 | +1.16% |
+| AR | 32768 | 24.30 ±0.02 | 24.51 ±0.03 | +0.86% |
+| MTP + lookup | 0 | 17.05 ±0.58 | 46.70 ±3.90 | +173.90% |
+| MTP + lookup | 32768 | 22.23 ±0.01 | 79.31 ±0.94 | +256.77% |
+
+Shallow MTP has material spread (46.70±3.90, only2repetitions): the large
+improvement is clear, but neither precise steady-state speed nor the variance
+cause is established. Deep MTP is the complete flow on the fixed repetitive
+history:111accepted includes101lookup tokens and10neural drafts,17cycles.
+It is not pure neural-MTP throughput or evidence that depth itself speeds decoding.
+C2/4/6/8 correctness passed; their serving throughput was not measured here.
+
+Prefill remains frozen at the batch6 evidence below; no new prefill speed or
+full-corpus collector claim is made for this TG/MTP batch.
+
+Image `ai-tools/gufo-eval:f3-tgmtp-9fc9a496-rocm101`; as-built `0ff1cb20-tgmtp-9fc9a496`.
+Use `/opt/gufo-tgmtp/bin/gufo` (the image entrypoint); the inherited legacy
+`/opt/gufo/src/build/release/gufo` is an older binary. Installed ELF SHA256
+`f4dca2bca9efe4da63e8e1309f9b15dd31792c5460d5e27cff35ae19740578d5` matches the qualified mounted candidate.
+
+
+[Qualification and identities](../../../plan/exl3/F3-TGMTP-QUALIFICATION.json),
+[operator screens](../../../plan/exl3/F3-TGMTP-SCREENS.json),
+[flow review](../../../plan/exl3/F3-TGMTP-FLOW.json).
+
 ## HC/MoE combined qualification, November 2, 2026
 
 HC operand-load grouping and K5 Mode3 dead-subtile/K-tail staging are now

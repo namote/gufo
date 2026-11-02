@@ -1224,3 +1224,50 @@ context8193→4096 and is diagnostic only; the final d0 replay restored the
 original512,2048,8192 list and8193 capacity. All attempts are retained; no
 baseline, correctness or d32K rerun. Target2000 is still unmet.
 [Qualification, runtime/code identities and all attempts](../plan/exl3/F3-PREFILL-BATCH6-QUALIFICATION.json).
+
+## TG/MTP routed and HC optimization, November 2, 2026
+
+Flash-Next EXL3 decode/verify exposed an LDS problem that a private-spill-only
+audit missed: routed widths2/3/4/8 reserved40960B per one-wave block while
+width1 reserved0. Native batch6TG32 profile attributed74.34% of MTPspan to
+RoutedGemv (28drafts/22accepted). Static row indices removed LDS for all75
+K3–K7/dot-mode variants with no new private/spills.40-byte route descriptor ×
+compiler-max1024threads is the inferred promotion source; do not call it a
+measured register spill. Keep valid-row guards, per-row K order and exact
+scaled-down fallback. The actualshape frozen-module, independent oracle,
+partial-row poison and sentinel checks pass.
+
+HC-up K320 did not reach the existing K%512 vector-load path. Its retained
+stableF16 path loads four valid weights/activations at a time, skips whole absent
+steps and keeps the original4step FMA chain. Cold52MiB component time dropped
+11.37% atR1 and43.63% atR8; row1–8 frozen bytes/orderedFMA oracle and signedzero/
+subnormal8/9boundaries pass. This is distinct from the rejected prefill HC
+prefetch/tiling mechanisms. The grouped>8 path is unchanged.
+
+Pinned Nix ROCm10.1, EXL3 5.05, C1 TG128, KVarN k4v4, temperature0,
+seed314159, r2, depth0/32768 and common context capacity32897. Frozen
+batch6 was measured once per mode and saved as the current control; historical
+T1/T2 had different source/capacity34817 and are not reused as matched controls.
+Both repetitions retain identical output hashes and draft/acceptance/lookup
+counts before and after; candidate AR and MTP outputs also agree.
+
+| Mode | Depth | Frozen batch6 tok/s | Candidate tok/s | Change |
+|---|---:|---:|---:|---:|
+| AR | 0 | 24.95 ±0.06 | 25.24 ±0.04 | +1.16% |
+| AR | 32768 | 24.30 ±0.02 | 24.51 ±0.03 | +0.86% |
+| MTP + lookup | 0 | 17.05 ±0.58 | 46.70 ±3.90 | +173.90% |
+| MTP + lookup | 32768 | 22.23 ±0.01 | 79.31 ±0.94 | +256.77% |
+
+Shallow MTP has material spread (46.70±3.90, only2repetitions): the large
+improvement is clear, but neither precise steady-state speed nor the variance
+cause is established. Deep MTP is the complete flow on the fixed repetitive
+history:111accepted includes101lookup tokens and10neural drafts,17cycles.
+It is not pure neural-MTP throughput or evidence that depth itself speeds decoding.
+C2/4/6/8 correctness passed; their serving throughput was not measured here.
+
+Complete sampling/batch/rejection/lookup/snapshot/deep-state checks pass.
+Draft policy/costtables and precision are unchanged.75of77codeobjects remain
+identical; only FlashNext general kernels and routed-MoE TUs changed.
+[Qualification](../plan/exl3/F3-TGMTP-QUALIFICATION.json),
+[screens](../plan/exl3/F3-TGMTP-SCREENS.json),
+[flow inventory](../plan/exl3/F3-TGMTP-FLOW.json).

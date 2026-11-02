@@ -1,5 +1,26 @@
 # Qwen3.8 Flash-Next experiments
 
+## TG/MTP routed and HC optimization, November 2, 2026
+
+| Change | Evidence | Decision |
+|---|---|---|
+| Routed MoE static row indexes | All75 K3–K7/width1,2,3,4,8/three dot-mode kernels have0LDS/private/spills; multitoken LDS was40960B. Real-shape frozen raw outputs, independent oracles and guards pass. Synthetic multitoken component latency falls6.5–9×. | Retain default; same K/dot/reduction/scaling order, no tile/precision/policy change. |
+| HC K320 valid-chunk vector loads | Aligned stableF16 HC-up widths1–8 retain exact original bytes and independent ordered-FMA outputs.52MiB rotating synthetic weights: R1−11.37%, R8−43.63% latency. Signed-zero/subnormal and8/9row boundaries pass. | Retain default; missing steps are never read; otherK/grouped>8 paths unchanged. |
+
+The original local route descriptor is40B;40×compiler-max1024threads equals
+40960B. Descriptor/slot promotion to LDS is a supported inference, not a
+register/private-spill finding. Constant indices remove the measured reservation;
+no launch-bound modification was needed. Whole-flow timings in BENCHMARKS
+qualify the combined changes. Draft confidence/cost tables, precision, prompt
+lookup, RNG and rollback formats remain unchanged. The flow review includes
+existing QKV grouping, PLE/graphs, heads, catch-up, recurrence and sampling;
+these were retained instead of retuned from the pathological verifier costs.
+
+
+[Qualification and identities](../../../plan/exl3/F3-TGMTP-QUALIFICATION.json),
+[operator screens](../../../plan/exl3/F3-TGMTP-SCREENS.json),
+[flow review](../../../plan/exl3/F3-TGMTP-FLOW.json).
+
 ## HC/MoE combined qualification, November 2, 2026
 
 HC operand-load grouping and K5 Mode3 dead-subtile/K-tail staging are now

@@ -1,4 +1,54 @@
-# EXL3 / Flash-Next F3 handoff (2026-11-02; qualified HC/MoE batch6)
+# EXL3 / Flash-Next F3 handoff (2026-11-02; qualified TG/MTP)
+
+## TG/MTP routed and HC optimization, November 2, 2026
+
+Pinned Nix ROCm10.1, EXL3 5.05, C1 TG128, KVarN k4v4, temperature0,
+seed314159, r2, depth0/32768 and common context capacity32897. Frozen
+batch6 was measured once per mode and saved as the current control; historical
+T1/T2 had different source/capacity34817 and are not reused as matched controls.
+Both repetitions retain identical output hashes and draft/acceptance/lookup
+counts before and after; candidate AR and MTP outputs also agree.
+
+| Mode | Depth | Frozen batch6 tok/s | Candidate tok/s | Change |
+|---|---:|---:|---:|---:|
+| AR | 0 | 24.95 ±0.06 | 25.24 ±0.04 | +1.16% |
+| AR | 32768 | 24.30 ±0.02 | 24.51 ±0.03 | +0.86% |
+| MTP + lookup | 0 | 17.05 ±0.58 | 46.70 ±3.90 | +173.90% |
+| MTP + lookup | 32768 | 22.23 ±0.01 | 79.31 ±0.94 | +256.77% |
+
+Shallow MTP has material spread (46.70±3.90, only2repetitions): the large
+improvement is clear, but neither precise steady-state speed nor the variance
+cause is established. Deep MTP is the complete flow on the fixed repetitive
+history:111accepted includes101lookup tokens and10neural drafts,17cycles.
+It is not pure neural-MTP throughput or evidence that depth itself speeds decoding.
+C2/4/6/8 correctness passed; their serving throughput was not measured here.
+
+Image `ai-tools/gufo-eval:f3-tgmtp-9fc9a496-rocm101`; as-built `0ff1cb20-tgmtp-9fc9a496`.
+Use `/opt/gufo-tgmtp/bin/gufo` (the image entrypoint); the inherited legacy
+`/opt/gufo/src/build/release/gufo` is an older binary. Installed ELF SHA256
+`f4dca2bca9efe4da63e8e1309f9b15dd31792c5460d5e27cff35ae19740578d5` matches the qualified mounted candidate.
+
+Retain routed static row indexes and aligned HC320 vector loads. Both preserve
+existing arithmetic; no policy/precision/cacheformat changes. All model/unit
+checks above and final GPU health pass. Formatting758files and second review
+pass. Exact raw results, runtime maps, build/link commands, frozen binaries,
+operator modules and Nix intermediates are preserved under
+`build/f3-tgmtp{1,2}` and `build/f3-tgmtp-profile`; do not rerun their controls.
+The qualification receipt is `fn-tgmtp2-qualification-nix101` under ai.tools
+`tmp/test-results/gufo-upstream-port-20261023/`.
+
+[Qualification](F3-TGMTP-QUALIFICATION.json), [screens](F3-TGMTP-SCREENS.json),
+[current TG/MTP profile](F3-TGMTP-PROFILE.json), [full flow review](F3-TGMTP-FLOW.json).
+The initial profile belongs to frozenbatch6, not the optimized candidate.
+Prefill is frozen at1435.59tok/s/pp2048; its2000target remains unmet. The user
+has moved priority toTG/MTP. Do not restart prefill experiments automatically.
+Future TG/MTP work must begin from these saved results, use small checks,
+preserve current controls and batch long verification. Any new grouped>8 HC
+or cost-model calibration remains a distinct future scope, not a measured win.
+Root disk floor150GiB; only disposable inactive browser caches were cleared
+this round, with cleanup receipt retained. Main worktree `.dockerignore` is
+pre-existing and untouched. No remote push or deployment.
+
 
 ## HC/MoE combined qualification, November 2, 2026
 

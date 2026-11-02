@@ -1,5 +1,34 @@
 # Qwen3.8 Flash-Next quality
 
+## TG/MTP routed and HC optimization, November 2, 2026
+
+One combined final window passed numerical boundaries, the existing25AR/MTP
+sampling strategies (including C2 and short budgets), C2/4/6/8 mixed execution,
+actual rejection/residual replay, independent session state, prompt lookup,
+used-session restores, cancellation/recovery, graph/snapshot overlap, small/full
+draft-vocabulary transitions and32K mixed execution with RAM/serialized sampled
+replay. The new K320 entry in PlainPrefillStable covers signedzero/subnormal and
+8/9row path boundaries. Final health checks pass; actual patched Nix ROCr/CLR
+library maps are retained for every case and benchmark.
+
+Before that, allK3–K7 routed independent DownFixtures/ExpertInvariance/FusedProducer
+checks passed.75 frozen-module comparisons cover actual2560→640/640→2560,
+widths1/2/3/4/8, every partial count, poison inactive slots, unsafe scaled fallback,
+exact-size inputs, independent unwritten-row/end sentinels and byte-exact outputs.
+HC320 checks cover rows1–8, N7/10240, an independent ordered FP32 FMA/XOR oracle,
+frozen-module equality and independent guards. No tolerance/golden was relaxed.
+
+Both repetitions of each final TG128 case preserve complete output SHA256 and
+all draft/acceptance/lookup counts, and candidate AR equals MTP output at both
+depths. Tests link the actual two production replacement objects;75 of77GPU
+codeobjects are byte-identical to frozenbatch6. No new full prefill collector or
+BF16 parity claim is made; prior hc7-relative NLL drift remains recorded below.
+
+
+[Qualification and identities](../../../plan/exl3/F3-TGMTP-QUALIFICATION.json),
+[operator screens](../../../plan/exl3/F3-TGMTP-SCREENS.json),
+[flow review](../../../plan/exl3/F3-TGMTP-FLOW.json).
+
 ## HC/MoE combined qualification, November 2, 2026
 
 HC operand-load grouping and K5 Mode3 dead-subtile/K-tail staging are now
