@@ -210,7 +210,7 @@ struct SessionKvLayout {
   bool fp16_trunk{true};
 };
 SessionKvLayout SessionKvPlanes(const Config& c, bool mtp, bool kvarn,
-                                std::uint32_t max_context) {
+                                std::uint32_t max_context, int bits) {
   const std::uint32_t attention = c.num_layers / c.full_attention_interval;
   const std::size_t kv_row = std::size_t{c.AttentionKvDim()} * sizeof(__half);
   SessionKvLayout out;
@@ -221,8 +221,9 @@ SessionKvLayout SessionKvPlanes(const Config& c, bool mtp, bool kvarn,
     return planes.size() - 1;
   };
   if (kvarn)
-    out.records = add(hip::KvarnRecordPlane(attention, c.num_kv_heads, 4,
-                                            hip::KvarnValueOrder::kTokenMajor));
+    out.records =
+        add(hip::KvarnRecordPlane(attention, c.num_kv_heads, bits,
+                                  hip::KvarnValueOrder::kTokenMajor, bits));
   const std::uint32_t fp16_layers = (kvarn ? 0 : attention) + (mtp ? 1 : 0);
   if (fp16_layers != 0) {
     out.keys = add({fp16_layers, kv_row, hip::kKvBlockTokens});
@@ -1108,6 +1109,12 @@ Executor::~Executor() {
 std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                                            NgramTable* ngram, Options options,
                                            std::string* error_msg) {
+  if (options.kvarn_bits != 4 && options.kvarn_bits != 6) {
+    if (error_msg)
+      *error_msg = "KVarN bits must be 4 or 6";
+    return nullptr;
+  }
+
   std::unique_ptr<Executor> e(new Executor());
   e->model_ = &model;
   e->ngram_ = ngram;
@@ -1535,7 +1542,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
 hip::KvBlockGeometry Executor::KvGeometry(core::SessionMode mode,
                                           std::uint32_t context) const {
   return SessionKvPlanes(config(), mode == core::SessionMode::kSpeculative,
-                         options_.kvarn, context)
+                         options_.kvarn, context, options_.kvarn_bits)
       .geometry;
 }
 
@@ -1566,8 +1573,8 @@ std::unique_ptr<Session> Executor::CreateSession(
     AssignError(error_msg, "pooled indexer keys need a ratio of 4");
     return nullptr;
   }
-  const auto layout =
-      SessionKvPlanes(c, s->mtp_enabled_, options_.kvarn, max_context);
+  const auto layout = SessionKvPlanes(c, s->mtp_enabled_, options_.kvarn,
+                                      max_context, options_.kvarn_bits);
   const auto& logical = layout.geometry;
   if (pool &&
       !std::ranges::equal(pool->geometry().planes(), logical.planes())) {
@@ -1610,6 +1617,7 @@ std::unique_ptr<Session> Executor::CreateSession(
       std::size_t{hip::kKvarnFp16Tokens} * c.AttentionKvDim();
   if (options_.kvarn) {
     s->kvarn_ = true;
+    s->kvarn_bits_ = options_.kvarn_bits;
     s->kvarn_fp16_ =
         Alloc<__half>(a, KvarnFp16Elements(c), error_msg, &s->allocated_bytes_);
     if (s->kvarn_fp16_ == nullptr)
@@ -1793,7 +1801,8 @@ void Executor::FlushKvarnGroups(const Session& session, std::uint32_t first,
   KvarnQuantizeGroups(
       session.kvarn_fp16_, session.kvarn_fp16_ + std::size_t{attention} * layer,
       layer, session.kvarn_records_, session.kvarn_records_pitch_,
-      session.kv_table_, c.num_kv_heads, attention, first, groups, stream_);
+      session.kv_table_, c.num_kv_heads, attention, first, groups, stream_,
+      kKvarnRingRows, options_.kvarn_bits);
 }
 
 bool Executor::PlanKvarn(Session& session, std::uint32_t start, std::uint32_t n,
@@ -1909,8 +1918,9 @@ std::size_t Executor::SessionBytes(
       c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
   // K/V/pooled rows and the block table (CreateSession); the raw indexer
   // rings stay per layer.
-  const auto kv_layout = SessionKvPlanes(
-      c, mode == core::SessionMode::kSpeculative, options_.kvarn, max_context);
+  const auto kv_layout =
+      SessionKvPlanes(c, mode == core::SessionMode::kSpeculative,
+                      options_.kvarn, max_context, options_.kvarn_bits);
   const std::size_t kv_blocks =
       kv_layout.geometry.bytes() +
       std::size_t{kv_layout.geometry.blocks()} * sizeof(std::uint32_t) +
@@ -3474,7 +3484,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       // it read it (hip::PlanKvarnPass boundary).
       KvarnQuantizePassBoundary(s.kvarn_k, s.kvarn_v, s.kvarn_records,
                                 s.kv_blocks, c.num_kv_heads, pos, n_tokens,
-                                stream_);
+                                stream_, options_.kvarn_bits);
     }
   }
 
@@ -3646,7 +3656,8 @@ bool Executor::KvarnAttention(const DeviceLayer& l,
       .records = s.kvarn_records,
       .blocks = s.kv_blocks,
       .quant_end = pass.prefill ? pass.quant_end : 0,
-      .kv_heads = c.num_kv_heads};
+      .kv_heads = c.num_kv_heads,
+      .bits = options_.kvarn_bits};
   // Scores and context in the rotated frame: H q . H k = q . k, and the
   // context rotates back before the output gate.
   const bool q_rotated = attn_q_rotated_;
@@ -3707,7 +3718,8 @@ bool Executor::KvarnAttention(const DeviceLayer& l,
     if (complete > first)
       KvarnQuantizeGroups(kvarn_staging_k_, kvarn_staging_v_, 0,
                           s.kvarn_records, 0, s.kv_blocks, c.num_kv_heads, 1,
-                          first, complete - first, stream_, pass.staging_first);
+                          first, complete - first, stream_, pass.staging_first,
+                          options_.kvarn_bits);
     const auto copy = [&](std::size_t to, std::uint32_t from_position,
                           std::uint32_t rows) {
       const std::size_t from = from_position - pass.staging_first;
@@ -4812,6 +4824,8 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
 /// the FP16 K/V of the trunk layers). FP16 payloads keep kSnapshotMagic.
 constexpr std::array<char, 8> kSnapshotKvarnMagic{'Q', 'F', 'N', 'S',
                                                   'N', 'A', 'P', 'K'};
+constexpr std::array<char, 8> kSnapshotKvarn6Magic{'Q', 'F', 'N', 'S',
+                                                   'N', 'A', 'K', '6'};
 constexpr std::array<char, 8> kSnapshotMagic{'Q', 'F', 'N', 'S',
                                              'N', 'A', 'P', '6'};
 
@@ -4854,7 +4868,9 @@ namespace {
 SnapshotHeader MakeSnapshotHeader(const Config& c, bool has_mtp,
                                   const Session& session) {
   SnapshotHeader h{};
-  h.magic = session.kvarn() ? kSnapshotKvarnMagic : kSnapshotMagic;
+  h.magic = session.kvarn() ? (session.kvarn_bits() == 6 ? kSnapshotKvarn6Magic
+                                                         : kSnapshotKvarnMagic)
+                            : kSnapshotMagic;
   h.num_layers = c.num_layers;
   h.full_attention_interval = c.full_attention_interval;
   h.conv_elems = (c.ssm_conv_kernel - 1) * c.SsmConvChannels();
@@ -4948,7 +4964,8 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
   for (std::uint32_t il = 0; il < h.num_layers; ++il) {
     if (((il + 1) % h.full_attention_interval) == 0) {
       const auto* at = attention(il);
-      if (h.magic == kSnapshotKvarnMagic) {
+      if (h.magic == kSnapshotKvarnMagic || h.magic == kSnapshotKvarn6Magic) {
+        const int bits = h.magic == kSnapshotKvarn6Magic ? 6 : 4;
         // The sink, the records of every group before the position's group
         // floor (FinishKvarn keeps them quantized) and the FP16 tail rows
         // after it, all copied when captured: a rewind can requantize a
@@ -4962,7 +4979,8 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
             std::min(h.position, hip::kKvarnSinkTokens) * row;
         const std::uint64_t record =
             std::uint64_t{h.kv_row / hip::kKvarnHeadDim} *
-            hip::KvarnRecord(4, hip::KvarnValueOrder::kTokenMajor).bytes;
+            hip::KvarnRecord(bits, hip::KvarnValueOrder::kTokenMajor, bits)
+                .bytes;
         const std::uint64_t records =
             std::uint64_t{(base >> hip::kKvarnGroupShift) - 1} * record;
         const std::uint64_t tail =

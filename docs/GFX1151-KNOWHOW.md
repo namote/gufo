@@ -1,5 +1,31 @@
 # gfx1151 optimization know-how
 
+## Flash-Next K6V6 KV, November 3, 2026
+
+Implemented explicit K6V6 token-major KVarN with existing low-nibble words
+plus a high-two-bit plane per row. Keep K4 specializations, FP16 sink/tail,
+and FP16 MTP KV. Propagate precision through pool geometry, component-cache
+identity and native snapshot magic; changing only CLI/quantizer corrupts restores.
+C2 native262144, YaRN off, two-context pool:2050*3207168=6574694400B (6.123GiB).
+
+Independent K4/K6 operator checks pass; K6 read path14 launches maxabs0.000151
+within existing tolerance, not bit-exact. Shared AR/MTP fragmented mappings,
+boundary rewinds, saturation, native materialized replay and wrong-codec
+snapshot rejection pass. CPU parser/layout and764-file formatting pass;
+independent code review approved. Saved BF16 reference reused:32760 scored
+positions, NLL2.170561, KL2560.024987, top1agreement0.920910. This is not a
+matched K4-to-K6 quality gain or a full256K quality test.
+
+Single candidate timings under desktop graphics (prebusy11%, no foreign KFD):
+PP2048/8192=1374.42/1403.11, AR128 d0/d32K=24.33/23.58,
+MTP128=35.66/76.06tok/s. Saved quiet K4 rates1425.09/1462.00,25.20/24.47,
+40.92/79.27 are historical; current repeats1 vs saved2 and desktop activity
+prevent causal attribution. Short-context MTP observation is12.9% lower;
+do not claim performance neutrality. No baseline rerun or discarded failure.
+Nix ROCm10.1 compiler/flags and previous objects retained in build/k6v6.
+Evidence: `/home/m2on/.local/state/gufo/k6v6-256k-20261103/qualification/RESULT.json`, `quality-score.json`;
+source diff/build/review logs in `build/k6v6/`.
+
 ## How to use
 
 **Read before experimenting. Measured means do not repeat unchanged work.**

@@ -1,5 +1,23 @@
 # Qwen3.8 Flash-Next benchmarks
 
+## K6V6 candidate observations, November 3, 2026
+
+One repetition, native5.05/NG6, Nix10.1, K6V6, YaRN off; desktop graphics
+active (11% at admission), no competing KFD compute process. These are advisory,
+not matched performance qualification. Existing baselines were reused, not rerun.
+
+| Scope | K6V6 tok/s | Saved quiet K4V4 tok/s |
+| --- | ---: | ---: |
+| PP2048 | 1374.42 | 1425.09 |
+| PP8192 | 1403.11 | 1462.00 |
+| AR128 d0 / d32768 | 24.33 / 23.58 | 25.20 / 24.47 |
+| MTP128 d0 / d32768 | 35.66 / 76.06 | 40.92 / 79.27 |
+
+MTP d0 observation is12.9% lower; precision, compiler specialization, desktop
+activity and repeat count are not separated. AR and MTP output hashes agree
+at both depths. The d32K fixture is lookup-heavy. All checks and GPU health pass.
+Evidence: `/home/m2on/.local/state/gufo/k6v6-256k-20261103/qualification/`.
+
 ## Shared KV and durable continuation, November 2, 2026
 
 Shared KV implementation preserves native5.05/K6 standard model rates against

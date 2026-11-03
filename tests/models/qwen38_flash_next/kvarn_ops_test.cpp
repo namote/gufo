@@ -55,7 +55,8 @@ constexpr std::uint32_t kLayers = 2;
 constexpr std::size_t kFp16Rows = hip::kKvarnFp16Tokens;
 constexpr std::size_t kLayerElements = kFp16Rows * kRow;
 constexpr auto kOrder = hip::KvarnValueOrder::kTokenMajor;
-constexpr auto kRecord = hip::KvarnRecord(4, kOrder);
+int bits = 4;
+auto kRecord = hip::KvarnRecord(4, kOrder);
 
 void CheckHip(hipError_t error, const char* what) {
   if (error != hipSuccess)
@@ -178,8 +179,16 @@ kvarn::QuantizedTile Unpack(const std::uint8_t* record, bool key) {
     for (std::uint32_t c = 0; c < kDim; ++c) {
       const std::uint32_t j = c % 8;
       const std::uint32_t nibble = (j % 2 == 0) ? j / 2 : 4 + j / 2;
-      const auto code = static_cast<std::uint8_t>(
-          (words[t * 32 + c / 8] >> (4 * nibble)) & 15);
+      auto code = static_cast<std::uint8_t>(
+          (words[t * (kDim * bits / 32) + c / 8] >> (4 * nibble)) & 15);
+      if (bits == 6) {
+        std::uint16_t high;
+        std::memcpy(&high,
+                    record + (key ? kRecord.k_codes : kRecord.v_codes) +
+                        t * (kDim * bits / 8) + kDim / 2 + (c / 8) * 2,
+                    2);
+        code |= ((high >> (2 * j)) & 3) << 4;
+      }
       // The reference tile: K rows are channels, V rows are tokens.
       out.codes[key ? std::size_t{c} * kGroup + t : std::size_t{t} * kDim + c] =
           code;
@@ -276,7 +285,7 @@ kvarn::QuantizedTile QuantizeAtStep(const std::vector<float>& source,
     for (std::size_t c = 0; c < cols; ++c)
       tile[r * cols + c] =
           source[r * cols + c] / step.column_scale[c] / step.row_scale[r];
-  constexpr float kMax = 15.0F;
+  const float kMax = static_cast<float>((1 << bits) - 1);
   kvarn::QuantizedTile out;
   out.codes.resize(rows * cols);
   for (std::size_t r = 0; r < rows; ++r) {
@@ -427,7 +436,8 @@ void CheckRotateAndQuantize(Data data) {
     const std::uint32_t first = std::max(1U, begin / kGroup);
     q::KvarnQuantizeGroups(k_rows.get(), v_rows.get(), kLayerElements,
                            records.get(), layer_pitch, d_table.get(), kKvHeads,
-                           kLayers, first, end / kGroup - first, nullptr);
+                           kLayers, first, end / kGroup - first, nullptr,
+                           q::kKvarnRingRows, bits);
     CheckHip(hipDeviceSynchronize(), "rotate and quantize");
     // The rotated rows of this phase against the reference rotation.
     const auto got_k = k_rows.Download(), got_v = v_rows.Download();
@@ -474,7 +484,7 @@ void CheckRotateAndQuantize(Data data) {
           }
           const std::vector<float> source_tile = tile;
           const auto ref = kvarn::QuantizeTileCodes(
-              tile, key ? kDim : kGroup, key ? kGroup : kDim, 4, true, 8);
+              tile, key ? kDim : kGroup, key ? kGroup : kDim, bits, true, 8);
           const std::size_t plane_row =
               std::size_t{table[g / hip::kKvarnGroupsPerBlock]} *
                   hip::kKvarnGroupsPerBlock +
@@ -539,7 +549,7 @@ void CheckRotateAndQuantize(Data data) {
         }
   const std::string counts =
       std::string(Name(data)) +
-      " k4v4 token-major records tiles=" + std::to_string(tiles) +
+      " token-major records tiles=" + std::to_string(tiles) +
       " exact=" + std::to_string(exact) + " tied_step=" + std::to_string(tied) +
       " boundary=" + std::to_string(boundary) +
       " mismatched=" + std::to_string(mismatched) +
@@ -628,8 +638,8 @@ public:
     Write(start, n, k_.get(), v_.get(), q::KvarnFp16Rows());
     q::RotateKvRows(k_.get(), v_.get(), n, kKvHeads, pos_.get(), nullptr);
     q::KvarnQuantizePassBoundary(k_.get(), v_.get(), records_.get(),
-                                 table_.get(), kKvHeads, pos_.get(), n,
-                                 nullptr);
+                                 table_.get(), kKvHeads, pos_.get(), n, nullptr,
+                                 bits);
     Attend(start, n, false, 0, 0);
     const std::uint32_t end = start + n;
     tail_.flushed_end = plan.flushed_end;
@@ -670,7 +680,7 @@ public:
       q::KvarnQuantizeGroups(staging_k_.get(), staging_v_.get(), 0,
                              records_.get(), 0, table_.get(), kKvHeads, 1,
                              first_group, complete - first_group, nullptr,
-                             first);
+                             first, bits);
     const auto copy = [&](std::size_t to, std::uint32_t position,
                           std::uint32_t rows) {
       const std::size_t at = std::size_t{position - first} * kRow;
@@ -710,7 +720,7 @@ private:
     if (groups != 0)
       q::KvarnQuantizeGroups(k_.get(), v_.get(), kLayerElements, records_.get(),
                              0, table_.get(), kKvHeads, 1, first, groups,
-                             nullptr);
+                             nullptr, q::kKvarnRingRows, bits);
   }
 
   void Write(std::uint32_t start, std::uint32_t n, __half* k, __half* v,
@@ -776,7 +786,8 @@ private:
         .records = records_.get(),
         .blocks = table_.get(),
         .quant_end = prefill ? quant_end : 0,
-        .kv_heads = kKvHeads};
+        .kv_heads = kKvHeads,
+        .bits = bits};
     const bool split = n == 1;
     const auto attend = [&](float* o, const __half* k, const __half* v,
                             std::uint32_t first, std::uint32_t rows,
@@ -872,8 +883,15 @@ void CheckReadPath() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::string_view(argv[1]) == "--k6v6")
+      bits = 6;
+    else if (argc != 1)
+      throw std::invalid_argument("usage: kvarn_ops_test [--k6v6]");
+    kRecord = hip::KvarnRecord(bits, kOrder, bits);
+    std::cout << "KV bits=" << bits << ", record bytes=" << kRecord.bytes
+              << "\n";
     CheckWriterRows();
     CheckRotateAndQuantize(Data::kGaussian);
     CheckRotateAndQuantize(Data::kUniform);

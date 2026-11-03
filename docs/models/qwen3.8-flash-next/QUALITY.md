@@ -1,5 +1,17 @@
 # Qwen3.8 Flash-Next quality
 
+## K6V6 native context, November 3, 2026
+
+Independent six-bit quantizer/read operators, shared AR/MTP fragmented restore,
+group boundaries, native snapshot roundtrip and wrong-codec rejection pass.
+K4 remains supported. Saved HF BF16 reference,8 windows/32760 positions:
+NLL2.170561 (reference2.172846), KL2560.024987, top1agreement92.0910%.
+DeltaNLL window95%CI[-0.013815,+0.007388] includes zero. This does not establish
+K6 superiority over K4; no matched K4 numerical rerun. Numerical corpus uses
+4096-token windows; no full256K quality claim. Default local serving changes
+to C2/262144, YaRN off, K6V6 and vision; model/ngram weights are unchanged.
+Evidence: `/home/m2on/.local/state/gufo/k6v6-256k-20261103/quality-score.json` and `qualification/RESULT.json`.
+
 ## Shared KV and durable continuation, November 2, 2026
 
 32760-position collector/101424960 bytes match saved baseline exactly.

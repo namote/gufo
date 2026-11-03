@@ -73,7 +73,7 @@ struct Config {
                   &group) != 3)
     return std::nullopt;
   const auto bits_ok = [](int bits) {
-    return bits == 2 || bits == 4 || bits == 8;
+    return bits == 2 || bits == 4 || bits == 6 || bits == 8;
   };
   if (!bits_ok(config.key_bits) || !bits_ok(config.value_bits) ||
       (group != 64 && group != 128))

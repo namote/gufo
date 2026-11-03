@@ -262,6 +262,7 @@ int main(int argc, char** argv) {
     std::size_t top_k = 256, prefix = 2048, batch = 512, window_limit = 8,
                 position_limit = std::numeric_limits<std::size_t>::max();
     bool kvarn = false;
+    int kvarn_bits = 4;
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
       const auto value = [&]() -> std::string {
@@ -293,7 +294,10 @@ int main(int argc, char** argv) {
         window_limit = number();
       else if (arg == "--positions-limit")
         position_limit = number();
-      else if (arg == "--kvarn")
+      else if (arg == "--kvarn-k6v6") {
+        kvarn = true;
+        kvarn_bits = 6;
+      } else if (arg == "--kvarn")
         kvarn = true;
       else if (arg == "--label")
         label = value();
@@ -311,7 +315,7 @@ int main(int argc, char** argv) {
             "--windows windows.json --path prefill|decode --out PREFIX "
             "[--reference PREFIX] [--top-k 256] [--prefix 2048] "
             "[--positions-limit 512] [--windows-limit 8] [--batch 512] "
-            "[--kvarn] [--label TEXT] [--toolchain TEXT]");
+            "[--kvarn|--kvarn-k6v6] [--label TEXT] [--toolchain TEXT]");
     Require(top_k >= 1 && top_k <= 1024, "--top-k must be 1..1024");
     Require(batch >= 1 && batch <= 4096, "--batch must be 1..4096");
     Require(window_limit > 0 && position_limit > 0, "empty collection");
@@ -375,6 +379,7 @@ int main(int argc, char** argv) {
     options.max_logit_rows = static_cast<std::uint32_t>(batch);
     options.max_context = context;
     options.kvarn = kvarn;
+    options.kvarn_bits = kvarn_bits;
     auto executor =
         q::rocm::Executor::Create(*device, ngram.get(), options, &error);
     Require(bool(executor), error);
@@ -457,7 +462,8 @@ int main(int argc, char** argv) {
                           std::to_string(HIP_VERSION_MINOR) + "." +
                           std::to_string(HIP_VERSION_PATCH);
     meta["path"] = path_name;
-    meta["kv_cache"] = kvarn ? "kvarn-k4v4" : "fp16";
+    meta["kv_cache"] =
+        kvarn ? (kvarn_bits == 6 ? "kvarn-k6v6" : "kvarn-k4v4") : "fp16";
     meta["vocab_size"] = std::size_t{c.vocab_size};
     meta["top_k"] = top_k;
     meta["prefix"] = path_name == "prefill" ? 0 : prefix;

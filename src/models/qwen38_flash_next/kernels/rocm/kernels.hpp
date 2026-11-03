@@ -112,6 +112,7 @@ struct KvarnReadView {
   const std::uint32_t* blocks{nullptr};  ///< block table; null: plane row g
   std::uint32_t quant_end{0};
   std::uint32_t kv_heads{0};
+  int bits{4};
 };
 
 /// The in-pass group flush of one layer: when the pass of `n_tokens` rows at
@@ -123,7 +124,8 @@ void KvarnQuantizePassBoundary(const __half* k_fp16, const __half* v_fp16,
                                const std::uint32_t* kv_blocks,
                                std::uint32_t kv_heads,
                                const std::uint32_t* start_pos,
-                               std::uint32_t n_tokens, hipStream_t stream);
+                               std::uint32_t n_tokens, hipStream_t stream,
+                               int bits = 4);
 
 /// Quantizes groups [first_group, first_group + groups) of `layers` layers
 /// from the rotated FP16 tail ring (`fp16_layer_elements` halves per layer
@@ -137,7 +139,8 @@ void KvarnQuantizeGroups(const __half* k_rows, const __half* v_rows,
                          const std::uint32_t* kv_blocks, std::uint32_t kv_heads,
                          std::uint32_t layers, std::uint32_t first_group,
                          std::uint32_t groups, hipStream_t stream,
-                         std::uint32_t staging_first = kKvarnRingRows);
+                         std::uint32_t staging_first = kKvarnRingRows,
+                         int bits = 4);
 
 /// Stable per-prefix rollback addresses. Growing the depth does not move
 /// existing buffers or invalidate graphs captured for a smaller batch.

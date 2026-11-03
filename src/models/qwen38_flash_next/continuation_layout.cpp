@@ -23,13 +23,14 @@ bool IsPool(ContinuationPart part) {
 
 ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
                                        std::uint32_t context,
-                                       std::uint32_t kept_rows, bool kvarn)
+                                       std::uint32_t kept_rows, bool kvarn,
+                                       int kvarn_bits)
     : context_(context), ratio_(c.compress_ratio), mtp_(mtp) {
-  if (!context || context > c.MaxContextLength() || !ratio_ ||
-      !c.full_attention_interval || !c.num_layers || !c.AttentionKvDim() ||
-      !c.indexer_head_dim || !c.indexer_top_k || !c.ssm_conv_kernel ||
-      !c.ssm_head_dim || !c.ssm_num_v_heads || !c.HcDim() || !c.vocab_size ||
-      (mtp && !kept_rows))
+  if ((kvarn_bits != 4 && kvarn_bits != 6) || !context ||
+      context > c.MaxContextLength() || !ratio_ || !c.full_attention_interval ||
+      !c.num_layers || !c.AttentionKvDim() || !c.indexer_head_dim ||
+      !c.indexer_top_k || !c.ssm_conv_kernel || !c.ssm_head_dim ||
+      !c.ssm_num_v_heads || !c.HcDim() || !c.vocab_size || (mtp && !kept_rows))
     throw std::invalid_argument("invalid Flash-Next continuation geometry");
   raw_capacity_ = std::min(context, std::max(c.indexer_top_k, ratio_ - 1));
   const auto add = [&](ContinuationPart part, std::size_t row,
@@ -64,8 +65,8 @@ ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
     } else {
       if (kvarn) {
         add(ContinuationPart::kKvarnRecords,
-            hip::KvarnRecordPlane(1, c.num_kv_heads, 4,
-                                  hip::KvarnValueOrder::kTokenMajor)
+            hip::KvarnRecordPlane(1, c.num_kv_heads, kvarn_bits,
+                                  hip::KvarnValueOrder::kTokenMajor, kvarn_bits)
                 .row_bytes,
             0, layer);
         const auto tail =

@@ -2639,10 +2639,16 @@ public:
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
     return {
         .model_id = model_->ModelName(),
-        .state_abi = std::string(kQwenFlashNextStateAbi) +
-                     (model_->Kvarn() ? "+kvarn-k4v4" : ""),
+        .state_abi =
+            std::string(kQwenFlashNextStateAbi) +
+            (model_->Kvarn()
+                 ? (model_->KvarnBits() == 6 ? "+kvarn-k6v6" : "+kvarn-k4v4")
+                 : ""),
         .max_context = max_context_,
-        .kv_cache_type = model_->Kvarn() ? "kvarn-k4v4" : "fp16",
+        .kv_cache_type =
+            model_->Kvarn()
+                ? (model_->KvarnBits() == 6 ? "kvarn-k6v6" : "kvarn-k4v4")
+                : "fp16",
         .kv_layout_version = 3,
         .capabilities =
             TextRunnerCapabilities{
@@ -3402,7 +3408,10 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .decode_concurrency = static_cast<std::uint32_t>(
                 std::clamp<std::size_t>(session_count, 1, 8)),
             .rope_scaling = rope_scaling,
-            .kvarn = resolved_kv_cache_type == cli::KvCacheType::kKvarnK4V4,
+            .kvarn = resolved_kv_cache_type == cli::KvCacheType::kKvarnK4V4 ||
+                     resolved_kv_cache_type == cli::KvCacheType::kKvarnK6V6,
+            .kvarn_bits =
+                resolved_kv_cache_type == cli::KvCacheType::kKvarnK6V6 ? 6 : 4,
         },
         &load_error);
     if (model == nullptr) {

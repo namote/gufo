@@ -81,6 +81,11 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
                                    const ModelOptions& options,
                                    std::string* error_msg) {
   std::shared_ptr<Model> m(new Model());
+  if (options.kvarn_bits != 4 && options.kvarn_bits != 6) {
+    if (error_msg)
+      *error_msg = "KVarN bits must be 4 or 6";
+    return nullptr;
+  }
   if (options.decode_concurrency == 0 || options.decode_concurrency > 8) {
     AssignError(error_msg, "decode concurrency must be between one and eight");
     return nullptr;
@@ -201,6 +206,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   exec.max_speculative = exec.max_logit_rows;
   exec.max_context = options.max_context;
   exec.kvarn = options.kvarn;
+  exec.kvarn_bits = options.kvarn_bits;
   m->executor_ =
       rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);
   if (!m->executor_) {

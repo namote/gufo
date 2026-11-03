@@ -1,5 +1,32 @@
 # EXL3 / Flash-Next F3 handoff (2026-11-02; native EXL3 qualified)
 
+## Current local profile: K6V6 / native256K (2026-11-03)
+
+User requested K6V6 and disabled extended context/YaRN. Global `gufo-start.sh`
+uses permanent `/home/m2on/.local/share/gufo/gufo-server.py`: C2/262144,
+K6V6 two-context pool6574694400B, vision BF16 sidecar, medium/MTP, no serving
+expiry/request/stall timeout,64MiB HTTP bodies,4GiB host reserve. Bind remains
+0.0.0.0:18740. Pi/DSH context settings now262144; DSH web restarted.
+Image `ai-tools/gufo-eval:k6v6-256k-rocm101`, ID
+`sha256:b9338d46667d8c54f58e2876053a4b853f520c226d3db2224f5658aa5b012610`.
+
+K4/K6 operators, K6 shared/native restoration, numerical32760-position collection
+and candidate PP/AR/MTP pass. Desktop activity makes timing advisory; short
+MTP observation35.66 vs saved40.92 is not performance-neutral. No full256K or
+matched K4/K6 task-quality claim. Independent review approved. Preserve prior
+images/baselines and `build/k6v6/` incremental objects. HTTP/client verification
+receipts and complete current status are in `/home/m2on/.local/state/gufo/k6v6-256k-20261103/`.
+
+Final HTTP:C2,9637-token repeat fully cached, image colors and medium arithmetic pass.
+DSH/Pi both replyOK. Actual restart restores9630tokens from K6 disk cache and
+prefills7, same answer. Port preflight now tolerates TIME_WAIT while rejecting
+active listeners. Final selected server is ready; see RESULT.json.
+
+Old K4/YaRN continuation disk cache was cleared while stopped to fund the build;
+conversation histories and weights remain. New cache grows within50GiB quota.
+The older pitest/worktree launch instructions below are historical, superseded
+by permanent global launchers and retained-worktrees build storage.
+
 ## Local Pi configuration update: C4 / 512K
 
 User selected C4 with524288 tokens per session. Same shared-KV image below,

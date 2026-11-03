@@ -16,6 +16,7 @@ enum class KvCacheType : std::uint8_t {
   kFp16,
   kKvarnK4V2,
   kKvarnK4V4,
+  kKvarnK6V6,
 };
 
 /// Parses the one canonical spelling of each type.
@@ -46,13 +47,12 @@ void RegisterKvCacheTypeOption(ArgParser& parser,
                                       std::string* error);
 
 /// Qwen3.8-27B executor storage for a resolved type.
-[[nodiscard]] hip::QwenKvCacheStorage QwenKvCacheStorageFor(
-    KvCacheType type) noexcept;
+[[nodiscard]] hip::QwenKvCacheStorage QwenKvCacheStorageFor(KvCacheType type);
 
 /// Production Qwen3.8-27B policy with the resolved KV storage; fp16 and an
 /// empty type are exactly QwenExecutionPolicy::Production().
 [[nodiscard]] hip::QwenExecutionPolicy QwenExecutionPolicyFor(
-    std::optional<KvCacheType> type) noexcept;
+    std::optional<KvCacheType> type);
 
 }  // namespace gufo::cli
 

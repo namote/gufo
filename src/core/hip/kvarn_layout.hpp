@@ -72,10 +72,11 @@ struct KvarnRecordLayout {
 };
 
 [[nodiscard]] constexpr KvarnRecordLayout KvarnRecord(
-    int value_bits, KvarnValueOrder order = KvarnValueOrder::kChannelMajor) {
+    int value_bits, KvarnValueOrder order = KvarnValueOrder::kChannelMajor,
+    int key_bits = 4) {
   KvarnRecordLayout r;
   r.k_codes = 0;
-  r.v_codes = r.k_codes + kKvarnGroupTokens * kKvarnHeadDim / 2;
+  r.v_codes = r.k_codes + kKvarnGroupTokens * kKvarnHeadDim * key_bits / 8;
   r.v_row_bytes =
       static_cast<std::size_t>(order == KvarnValueOrder::kChannelMajor
                                    ? kKvarnGroupTokens
@@ -100,10 +101,10 @@ static_assert(KvarnRecord(4, KvarnValueOrder::kTokenMajor).bytes == 35072 &&
 /// [group in block 2][KV head][record], one plane row per group.
 [[nodiscard]] constexpr KvBlockPlane KvarnRecordPlane(
     std::uint32_t layers, std::uint32_t kv_heads, int value_bits,
-    KvarnValueOrder order = KvarnValueOrder::kChannelMajor) {
+    KvarnValueOrder order = KvarnValueOrder::kChannelMajor, int key_bits = 4) {
   return {.layers = layers,
           .row_bytes = static_cast<std::size_t>(kv_heads) *
-                       KvarnRecord(value_bits, order).bytes,
+                       KvarnRecord(value_bits, order, key_bits).bytes,
           .rows_per_block = kKvarnGroupsPerBlock};
 }
 

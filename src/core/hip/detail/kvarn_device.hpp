@@ -270,15 +270,18 @@ __device__ __forceinline__ float RoundedExp(float x) {
 // round to the same float; log and exp round once, correctly, as the K0
 // reference (tests/models/qwen27b/kvarn_fake_quant.hpp) does through double.
 // ---------------------------------------------------------------------------
-template<int VBits, KvarnValueOrder Order>
+template<int VBits, KvarnValueOrder Order, int KBits = 4>
 __device__ __forceinline__ void KvarnQuantizeTile(
     const __half* __restrict__ src, std::size_t row_stride,
     std::uint8_t* __restrict__ record, bool key) {
 #pragma clang fp contract(off)
-  static_assert(VBits == 2 || VBits == 4);
-  static_assert(Order == KvarnValueOrder::kChannelMajor || VBits == 4,
-                "token-major values are 4-bit");
-  constexpr KvarnRecordLayout R = KvarnRecord(VBits, Order);
+  static_assert(VBits == 2 || VBits == 4 || VBits == 6);
+  static_assert(KBits == 4 || KBits == 6);
+  static_assert(
+      (Order == KvarnValueOrder::kChannelMajor && KBits == 4 && VBits != 6) ||
+          (Order == KvarnValueOrder::kTokenMajor && VBits == KBits),
+      "6-bit records require token-major K6V6");
+  constexpr KvarnRecordLayout R = KvarnRecord(VBits, Order, KBits);
   constexpr unsigned kWaves = 16;
   __shared__ float2 channel_part[kWaves][kDim];
   __shared__ float2 channel_result[kDim];
@@ -529,7 +532,7 @@ __device__ __forceinline__ void KvarnQuantizeTile(
   apply(best_token, best_channel);
 
   // Per-row asymmetric RTN; K rows are channels, V rows are tokens.
-  constexpr float kKeyMax = 15.0F;
+  constexpr float kKeyMax = static_cast<float>((1 << KBits) - 1);
   constexpr float kValueMax = static_cast<float>((1 << VBits) - 1);
   const auto halves = [&](std::size_t offset) {
     return reinterpret_cast<__half*>(record + offset);
@@ -575,15 +578,21 @@ __device__ __forceinline__ void KvarnQuantizeTile(
     auto* codes = reinterpret_cast<unsigned*>(record + R.k_codes);
 #pragma unroll
     for (unsigned i = 0; i < 8; ++i) {
-      unsigned word = 0;
+      unsigned word = 0, high = 0;
 #pragma unroll
       for (unsigned j = 0; j < 8; ++j) {
         const float q =
             fminf(fmaxf(rintf((cur[i][j] - low[j]) / step[j]), 0.0F), kKeyMax);
         const unsigned nibble = (j % 2 == 0) ? j / 2 : 4 + j / 2;
-        word |= static_cast<unsigned>(q) << (4 * nibble);
+        word |= (static_cast<unsigned>(q) & 15U) << (4 * nibble);
+        if constexpr (KBits == 6)
+          high |= (static_cast<unsigned>(q) >> 4) << (2 * j);
       }
-      codes[(8 * wave + i) * 32 + lane] = word;
+      codes[(8 * wave + i) * (kDim * KBits / 32) + lane] = word;
+      if constexpr (KBits == 6)
+        reinterpret_cast<std::uint16_t*>(record + R.k_codes +
+                                         (8 * wave + i) * (kDim * KBits / 8) +
+                                         kDim / 2)[lane] = high;
     }
     if (wave == 0)
 #pragma unroll
@@ -612,7 +621,7 @@ __device__ __forceinline__ void KvarnQuantizeTile(
       }
       const float step = fmaxf((hi - lo) / kValueMax, 1e-10F);
       const unsigned token = 8 * wave + i;
-      [[maybe_unused]] unsigned token_word = 0;
+      [[maybe_unused]] unsigned token_word = 0, token_high = 0;
 #pragma unroll
       for (unsigned j = 0; j < 8; ++j) {
         const unsigned q = static_cast<unsigned>(
@@ -621,7 +630,9 @@ __device__ __forceinline__ void KvarnQuantizeTile(
         if constexpr (Order == KvarnValueOrder::kTokenMajor) {
           // The K packing: channels 8l..8l+7 of this token in one word.
           const unsigned nibble = (j % 2 == 0) ? j / 2 : 4 + j / 2;
-          token_word |= q << (4 * nibble);
+          token_word |= (q & 15U) << (4 * nibble);
+          if constexpr (VBits == 6)
+            token_high |= (q >> 4) << (2 * j);
           (void)channel;
         } else if constexpr (VBits == 2) {
           const unsigned u = token % 16;
@@ -633,9 +644,15 @@ __device__ __forceinline__ void KvarnQuantizeTile(
           atomicOr(&value_codes[channel * 16 + token / 8], q << (4 * nibble));
         }
       }
-      if constexpr (Order == KvarnValueOrder::kTokenMajor)
-        reinterpret_cast<unsigned*>(record + R.v_codes)[token * 32 + lane] =
+      if constexpr (Order == KvarnValueOrder::kTokenMajor) {
+        reinterpret_cast<unsigned*>(
+            record + R.v_codes)[token * (kDim * VBits / 32) + lane] =
             token_word;
+        if constexpr (VBits == 6)
+          reinterpret_cast<std::uint16_t*>(record + R.v_codes +
+                                           token * (kDim * VBits / 8) +
+                                           kDim / 2)[lane] = token_high;
+      }
       if (lane == 0) {
         halves(R.v_scale)[token] = product_half(best_token[i], step);
         halves(R.v_zero)[token] = product_half(best_token[i], lo);

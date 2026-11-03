@@ -94,6 +94,10 @@ void TestSharedPlanners() {
 }  // namespace
 
 int main() {
+  static_assert(
+      gufo::hip::KvarnRecord(6, gufo::hip::KvarnValueOrder::kTokenMajor, 6)
+          .bytes == 51456);
+
   TestRecordOrders();
   TestPlanes();
   TestSharedPlanners();

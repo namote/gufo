@@ -103,10 +103,10 @@ void Check(bool mtp) {
   Require(layout.PrivateBytes() - no_ple_layout.PrivateBytes() == 368640,
           "PLE history inventory is incorrect");
 }
-void CheckKvarn(bool mtp) {
+void CheckKvarn(bool mtp, int bits = 4) {
   const auto c = ProductionGeometry();
   const qfn::ContinuationLayout plain(c, mtp, 262144, 8);
-  const qfn::ContinuationLayout layout(c, mtp, 262144, 8, true);
+  const qfn::ContinuationLayout layout(c, mtp, 262144, 8, true, bits);
   Require(layout.Components().size() == plain.Components().size() + 12,
           "KVarN must replace two KV rows with records and two private rings");
   Require(
@@ -119,7 +119,8 @@ void CheckKvarn(bool mtp) {
     const auto positions =
         layout.Positions(target, draft, target / 4, draft / 4);
     const auto expected =
-        std::size_t{target} * 4 + std::size_t{groups} * 12 * 2 * 35072 +
+        std::size_t{target} * 4 +
+        std::size_t{groups} * 12 * 2 * (bits == 6 ? 51456 : 35072) +
         std::size_t{target / 4} * 12 * 256 +
         (mtp ? std::size_t{draft} * 2048 + std::size_t{draft / 4} * 256 : 0);
     Require(layout.RowBytes(target, draft, target / 4, draft / 4) == expected,
@@ -127,7 +128,8 @@ void CheckKvarn(bool mtp) {
     for (const auto& component : layout.Components()) {
       const auto& d = component.descriptor;
       if (component.part == qfn::ContinuationPart::kKvarnRecords) {
-        Require(d.row_bytes == 70144 && d.rows_per_chunk == 2,
+        Require(d.row_bytes == (bits == 6 ? 102912U : 70144U) &&
+                    d.rows_per_chunk == 2,
                 "KVarN token-major record schema changed");
         Require(positions[d.id.value - 1].valid_rows == groups,
                 "KVarN component position is not a completed group count");
@@ -223,6 +225,7 @@ int main() {
     Check(true);
     for (const auto mtp : {false, true}) {
       CheckKvarn(mtp);
+      CheckKvarn(mtp, 6);
       CheckExtendedContext(mtp);
       CheckBacking(mtp, 32768, 2, 8ULL << 30, 32, 2 * 32768);
       CheckBacking(mtp, 32768, 2, 2ULL << 30, 8, 2 * 4096);

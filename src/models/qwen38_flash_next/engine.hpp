@@ -67,6 +67,7 @@ struct ModelOptions {
   /// Trunk attention K/V as KVarN k4v4 records (`--kv-cache-type
   /// kvarn-k4v4`, plan/exl3/F1-KVARN-DESIGN.md); the MTP layer stays FP16.
   bool kvarn = false;
+  int kvarn_bits = 4;
 };
 
 class Session;
@@ -106,6 +107,7 @@ public:
   [[nodiscard]] bool IsNativeExl3() const noexcept;
   /// Whether sessions keep trunk K/V as KVarN k4v4 (ModelOptions::kvarn).
   [[nodiscard]] bool Kvarn() const noexcept { return options_.kvarn; }
+  [[nodiscard]] int KvarnBits() const noexcept { return options_.kvarn_bits; }
   [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {
     return options_.decode_concurrency;
   }

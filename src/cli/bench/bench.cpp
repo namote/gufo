@@ -944,7 +944,10 @@ int RunQwen38FlashNextBenchmark(
           .max_draft_tokens = std::max<std::uint32_t>(1, options.draft_tokens),
           .rope_scaling = rope_scaling,
           // ResolveKvCacheType accepted the request before the load.
-          .kvarn = options.kv_cache_type == KvCacheType::kKvarnK4V4,
+          .kvarn = options.kv_cache_type == KvCacheType::kKvarnK4V4 ||
+                   options.kv_cache_type == KvCacheType::kKvarnK6V6,
+          .kvarn_bits =
+              options.kv_cache_type == KvCacheType::kKvarnK6V6 ? 6 : 4,
       },
       &error);
   if (model == nullptr) {
@@ -953,7 +956,11 @@ int RunQwen38FlashNextBenchmark(
     return 1;
   }
   PrintModelLoadTime(model_load_start);
-  std::cout << "KV cache: " << (model->Kvarn() ? "kvarn-k4v4" : "fp16") << '\n';
+  std::cout << "KV cache: "
+            << (model->Kvarn()
+                    ? (model->KvarnBits() == 6 ? "kvarn-k6v6" : "kvarn-k4v4")
+                    : "fp16")
+            << '\n';
   if (rope_scaling) {
     std::cout << "[YaRN]: factor=" << rope_scaling->factor
               << " original_context=" << qwen4exp_native_context

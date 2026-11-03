@@ -1,5 +1,15 @@
 # Qwen3.8 Flash-Next experiments
 
+## K6V6 native256K selection, November 3, 2026
+
+User-selected precision change: add `kvarn-k6v6` for Flash-Next; retain K4V4
+and FP16. Six-bit records use51456B per group/head (K4:35072B), separate codec
+identities, identical balancing rules and native FP16 sink/tail/MTP states.
+Permanent local profile:C2/262144/YaRN off/vision/medium/MTP, shared pool
+6574694400B. Quality/operator/state checks pass; performance observations and
+limitations are in BENCHMARKS.md. No general quality improvement is claimed.
+Incremental build/review: `build/k6v6/`; results: `/home/m2on/.local/state/gufo/k6v6-256k-20261103/`.
+
 ## Shared KV and durable continuation, November 2, 2026
 
 Selected: shared KvBlockPool for exclusive mapped per-session blocks, stable

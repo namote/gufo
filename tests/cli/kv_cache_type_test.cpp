@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -21,8 +22,8 @@ void Expect(bool condition, const char* message) {
 }
 
 void TestParse() {
-  for (const auto type :
-       {KvCacheType::kFp16, KvCacheType::kKvarnK4V2, KvCacheType::kKvarnK4V4}) {
+  for (const auto type : {KvCacheType::kFp16, KvCacheType::kKvarnK4V2,
+                          KvCacheType::kKvarnK4V4, KvCacheType::kKvarnK6V6}) {
     Expect(
         gufo::cli::ParseKvCacheType(gufo::cli::KvCacheTypeName(type)) == type,
         "canonical names round-trip");
@@ -62,7 +63,8 @@ void TestOption() {
   const std::array<const char*, 2> bad_args = {"--kv-cache-type", "q4"};
   error.clear();
   Expect(!invalid.Parse(bad_args, &error) && !bad &&
-             error.find("fp16, kvarn-k4v2 or kvarn-k4v4") != std::string::npos,
+             error.find("fp16, kvarn-k4v2, kvarn-k4v4 or kvarn-k6v6") !=
+                 std::string::npos,
          "invalid values name the accepted set");
 }
 
@@ -133,7 +135,7 @@ void TestRefusals() {
     Expect(!accepted && error ==
                             "--kv-cache-type kvarn-k4v2 is not supported by "
                             "Qwen3.8-Flash-Next; its KV cache is FP16, so it "
-                            "accepts fp16 and kvarn-k4v4",
+                            "accepts fp16 and kvarn-k4v4 and kvarn-k6v6",
            "Flash-Next refuses kvarn-k4v2 by name");
     accepted = false;
     error.clear();
@@ -156,6 +158,21 @@ void TestRefusals() {
 }
 
 void TestPolicy() {
+  bool accepted = false;
+  std::string error;
+  Expect(Resolve("qwen4exp", KvCacheType::kKvarnK6V6, &accepted, &error) ==
+                 KvCacheType::kKvarnK6V6 &&
+             accepted,
+         "Flash-Next K6V6 accepted");
+  (void)Resolve("qwen35", KvCacheType::kKvarnK6V6, &accepted, &error);
+  Expect(!accepted, "Other Qwen backend rejects K6V6");
+  bool threw = false;
+  try {
+    (void)gufo::cli::QwenExecutionPolicyFor(KvCacheType::kKvarnK6V6);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  Expect(threw, "K6V6 cannot silently become FP16 in another backend");
   const auto production = gufo::hip::QwenExecutionPolicy::Production();
   const auto fp16 = gufo::cli::QwenExecutionPolicyFor(KvCacheType::kFp16);
   Expect(

@@ -128,6 +128,7 @@ public:
   [[nodiscard]] bool mtp_enabled() const noexcept { return mtp_enabled_; }
   /// Trunk attention K/V are KVarN k4v4 records (Executor::Options::kvarn).
   [[nodiscard]] bool kvarn() const noexcept { return kvarn_; }
+  [[nodiscard]] int kvarn_bits() const noexcept { return kvarn_bits_; }
   [[nodiscard]] std::uint32_t position() const noexcept { return position_; }
   [[nodiscard]] std::uint32_t max_context() const noexcept {
     return max_context_;
@@ -239,6 +240,7 @@ private:
   /// quantized, the current forward's plan and the FP16 sink/tail rows
   /// ([K|V][attention layer][kKvarnFp16Tokens][kv row]).
   bool kvarn_{false};
+  int kvarn_bits_{4};
   hip::KvarnTail kvarn_tail_{};
   KvarnPass kvarn_pass_{};
   __half* kvarn_fp16_{nullptr};
@@ -307,6 +309,7 @@ public:
     /// Trunk attention K/V as KVarN k4v4 records with token-major values
     /// (plan/exl3/F1-KVARN-DESIGN.md); the MTP layer stays FP16.
     bool kvarn{false};
+    int kvarn_bits{4};
     /// Diagnostic chunk-policy hook for EXL3. Zero preserves the caller's
     /// existing policy; a nonzero limit is bounded by max_batch. The caller
     /// still supplies checkpoint/cancellation boundaries to PrefillChunkRows.

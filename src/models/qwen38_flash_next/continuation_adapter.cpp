@@ -224,7 +224,7 @@ ContinuationAdapter::ContinuationAdapter(std::shared_ptr<Model> model,
       layout_(model_ ? model_->config() : Config{},
               mode == core::SessionMode::kSpeculative, context,
               model_ ? model_->executor_->max_speculative() : 0,
-              model_ && model_->Kvarn()),
+              model_ && model_->Kvarn(), model_ ? model_->KvarnBits() : 4),
       identity_(std::move(identity)) {
   if ((mode != core::SessionMode::kAutoregressive &&
        mode != core::SessionMode::kSpeculative) ||
@@ -237,7 +237,7 @@ ContinuationAdapter::ContinuationAdapter(std::shared_ptr<Model> model,
   };
   put(3);  // KVarN token-major records, canonical sink/tail and paged copies.
   put(model_->Kvarn());
-  put(model_->Kvarn() ? 4 : 16);
+  put(model_->Kvarn() ? model_->KvarnBits() : 16);
   put(model_->Kvarn() ? hip::kKvarnGroupTokens : 0);
   put(static_cast<std::uint32_t>(hip::KvarnValueOrder::kTokenMajor));
   put(Session::kSnapshotPayloadVersion);

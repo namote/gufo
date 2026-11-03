@@ -2855,9 +2855,11 @@ __launch_bounds__(256) __global__
 }
 
 constexpr auto kKvarnOrder = hip::KvarnValueOrder::kTokenMajor;
-constexpr auto kKvarnRecord = hip::KvarnRecord(4, kKvarnOrder);
+template<int Bits>
+constexpr auto kKvarnRecord = hip::KvarnRecord(Bits, kKvarnOrder, Bits);
 
 /// Record of global group `group` and KV head `kv` in one layer's plane.
+template<int Bits>
 __device__ __forceinline__ std::size_t KvarnRecordOffset(
     const std::uint32_t* kv_blocks, std::uint32_t kv_heads, std::uint32_t group,
     std::uint32_t kv) {
@@ -2867,12 +2869,13 @@ __device__ __forceinline__ std::size_t KvarnRecordOffset(
           : std::size_t{kv_blocks[group / hip::kKvarnGroupsPerBlock]} *
                     hip::kKvarnGroupsPerBlock +
                 group % hip::kKvarnGroupsPerBlock;
-  return (plane_row * kv_heads + kv) * kKvarnRecord.bytes;
+  return (plane_row * kv_heads + kv) * kKvarnRecord<Bits>.bytes;
 }
 
 /// One k4v4 token-major record tile per block: (KV head, group, layer, K or
 /// V), from the rotated FP16 tail ring or a staging buffer
 /// (hip::kvarn_detail::KvarnQuantizeTile).
+template<int Bits>
 __launch_bounds__(512) __global__ void KvarnQuantizeGroupsKernel(
     const __half* __restrict__ k_rows, const __half* __restrict__ v_rows,
     std::size_t fp16_layer_elements, std::uint8_t* __restrict__ records,
@@ -2889,13 +2892,15 @@ __launch_bounds__(512) __global__ void KvarnQuantizeGroupsKernel(
       KvarnFp16RowOf(group * hip::kKvarnGroupTokens, staging_first) *
           row_width +
       kv * hip::kKvarnHeadDim;
-  std::uint8_t* record = records + layer * records_layer_pitch +
-                         KvarnRecordOffset(kv_blocks, kv_heads, group, kv);
-  hip::kvarn_detail::KvarnQuantizeTile<4, kKvarnOrder>(src, row_width, record,
-                                                       key);
+  std::uint8_t* record =
+      records + layer * records_layer_pitch +
+      KvarnRecordOffset<Bits>(kv_blocks, kv_heads, group, kv);
+  hip::kvarn_detail::KvarnQuantizeTile<Bits, kKvarnOrder, Bits>(src, row_width,
+                                                                record, key);
 }
 
 /// KvarnQuantizePassBoundary: the group ending inside the pass, if any.
+template<int Bits>
 __launch_bounds__(512) __global__ void KvarnQuantizeBoundaryKernel(
     const __half* __restrict__ k_rows, const __half* __restrict__ v_rows,
     std::uint8_t* __restrict__ records, const std::uint32_t* kv_blocks,
@@ -2915,15 +2920,16 @@ __launch_bounds__(512) __global__ void KvarnQuantizeBoundaryKernel(
       (key ? k_rows : v_rows) +
       hip::KvarnFp16Row(group * hip::kKvarnGroupTokens) * row_width +
       kv * hip::kKvarnHeadDim;
-  hip::kvarn_detail::KvarnQuantizeTile<4, kKvarnOrder>(
+  hip::kvarn_detail::KvarnQuantizeTile<Bits, kKvarnOrder, Bits>(
       src, row_width,
-      records + KvarnRecordOffset(kv_blocks, kv_heads, group, kv), key);
+      records + KvarnRecordOffset<Bits>(kv_blocks, kv_heads, group, kv), key);
 }
 
 /// Eight FP16 values, dims d0..d0+7 of KV head `kv`, of position j's K or V
 /// row as a query at position `query` reads it (KvarnReadView). Records
 /// dequantize as (code * scale + zero) * column in FP32, rounded once to
 /// FP16 as the fake-quantized cache stores them.
+template<int Bits>
 __device__ __forceinline__ uint4 KvarnLoad8(const KvarnReadView& v, bool key,
                                             std::uint32_t query,
                                             std::uint32_t j, std::uint32_t kv,
@@ -2946,22 +2952,32 @@ __device__ __forceinline__ uint4 KvarnLoad8(const KvarnReadView& v, bool key,
   const std::uint32_t group = j >> hip::kKvarnGroupShift;
   const std::uint32_t t = j & (hip::kKvarnGroupTokens - 1);
   const std::uint8_t* record =
-      v.records + KvarnRecordOffset(v.blocks, v.kv_heads, group, kv);
+      v.records + KvarnRecordOffset<Bits>(v.blocks, v.kv_heads, group, kv);
   const std::uint32_t word = reinterpret_cast<const std::uint32_t*>(
       record +
-      (key ? kKvarnRecord.k_codes : kKvarnRecord.v_codes))[t * 32 + d0 / 8];
+      (key ? kKvarnRecord<Bits>.k_codes
+           : kKvarnRecord<Bits>.v_codes))[t * (hip::kKvarnHeadDim * Bits / 32) +
+                                          d0 / 8];
+  unsigned high = 0;
+  if constexpr (Bits == 6)
+    high = reinterpret_cast<const std::uint16_t*>(
+        record +
+        (key ? kKvarnRecord<Bits>.k_codes : kKvarnRecord<Bits>.v_codes) +
+        t * (hip::kKvarnHeadDim * Bits / 8) + hip::kKvarnHeadDim / 2)[d0 / 8];
   const auto* scale = reinterpret_cast<const __half*>(
-      record + (key ? kKvarnRecord.k_scale : kKvarnRecord.v_scale));
+      record + (key ? kKvarnRecord<Bits>.k_scale : kKvarnRecord<Bits>.v_scale));
   const auto* zero = reinterpret_cast<const __half*>(
-      record + (key ? kKvarnRecord.k_zero : kKvarnRecord.v_zero));
+      record + (key ? kKvarnRecord<Bits>.k_zero : kKvarnRecord<Bits>.v_zero));
   const auto* column = reinterpret_cast<const __half*>(
-      record + (key ? kKvarnRecord.k_column : kKvarnRecord.v_column));
+      record +
+      (key ? kKvarnRecord<Bits>.k_column : kKvarnRecord<Bits>.v_column));
   _Float16 h[8];
 #pragma unroll
   for (std::uint32_t i = 0; i < 8; ++i) {
     // Channels c..c+7 of a word: c + 2i in nibble i, c + 2i + 1 in i + 4.
     const std::uint32_t nibble = (i % 2 == 0) ? i / 2 : 4 + i / 2;
-    const auto code = static_cast<float>((word >> (4 * nibble)) & 15U);
+    const auto code = static_cast<float>(((word >> (4 * nibble)) & 15U) |
+                                         (((high >> (2 * i)) & 3U) << 4));
     // K: scale and zero per channel, column per token; V the other way.
     const float s = __half2float(key ? scale[d0 + i] : scale[t]);
     const float z = __half2float(key ? zero[d0 + i] : zero[t]);
@@ -3470,7 +3486,7 @@ __global__ void CompactSelectionKernel(
 /// selected blocks are read from the ready-made list instead of being
 /// compacted from the mask. The tiles are the same 64-block tiles dealt to the
 /// splits in the same order, so the output is bitwise identical.
-template<std::uint32_t kGroup, bool kKvarn>
+template<std::uint32_t kGroup, int kKvarn>
 __global__ void AttentionKernel(
     const float* q, const __half* k_cache, const __half* v_cache,
     const std::uint32_t* mask, std::uint32_t mask_words, float* out,
@@ -3554,7 +3570,7 @@ __global__ void AttentionKernel(
     for (std::uint32_t b = 0; b < kBatch; ++b) {
       const std::uint32_t j = min(keys[base + b], n_kv - 1);
       if constexpr (kKvarn)
-        rows[b] = KvarnLoad8(kvarn, key, pos, j, kvh, lane * 8);
+        rows[b] = KvarnLoad8<kKvarn>(kvarn, key, pos, j, kvh, lane * 8);
       else
         rows[b] = *reinterpret_cast<const uint4*>(
             head + (KvRow(kv_blocks, j) * kv_stride) + (lane * 8));
@@ -4522,7 +4538,7 @@ constexpr std::uint32_t kWmmaMaxMaskWords = 2048;
 /// four selections overlap far less than 32 (measured at 16k depth: 846
 /// versus 2,478 selected blocks against 512 per query).
 template<std::uint32_t kQueryRows, std::uint32_t kKeys, bool kPackHeads,
-         bool kKvarn = false>
+         int kKvarn = 0>
 __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
     const __half* __restrict__ k_cache, const __half* __restrict__ v_cache,
@@ -4839,8 +4855,8 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
       // query of the tile reads the same rows.
 #pragma unroll
       for (std::uint32_t j = 0; j < kVRegs; ++j)
-        dst[j] = live ? KvarnLoad8(kvarn, false, 0, key_position, kv_head,
-                                   v_slice + (j * 8))
+        dst[j] = live ? KvarnLoad8<kKvarn>(kvarn, false, 0, key_position,
+                                           kv_head, v_slice + (j * 8))
                       : make_uint4(0u, 0u, 0u, 0u);
       return;
     }
@@ -4861,8 +4877,9 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
       const std::uint32_t d8 = (idx % (kHeadDim / 8)) * 8;
       const bool live = key_position < context_end;
       if constexpr (kKvarn) {
-        dst[n] = live ? KvarnLoad8(kvarn, true, 0, key_position, kv_head, d8)
-                      : make_uint4(0u, 0u, 0u, 0u);
+        dst[n] =
+            live ? KvarnLoad8<kKvarn>(kvarn, true, 0, key_position, kv_head, d8)
+                 : make_uint4(0u, 0u, 0u, 0u);
         continue;
       }
       dst[n] = live ? *reinterpret_cast<const uint4*>(
@@ -8643,12 +8660,21 @@ void KvarnQuantizePassBoundary(const __half* k_fp16, const __half* v_fp16,
                                const std::uint32_t* kv_blocks,
                                std::uint32_t kv_heads,
                                const std::uint32_t* start_pos,
-                               std::uint32_t n_tokens, hipStream_t stream) {
+                               std::uint32_t n_tokens, hipStream_t stream,
+                               int bits) {
   if (n_tokens == 0)
     return;
-  hipLaunchKernelGGL(KvarnQuantizeBoundaryKernel, dim3(kv_heads, 1, 2),
-                     dim3(512), 0, stream, k_fp16, v_fp16, records, kv_blocks,
-                     kv_heads, start_pos, n_tokens);
+  if (bits == 6) {
+    hipLaunchKernelGGL(KvarnQuantizeBoundaryKernel<6>, dim3(kv_heads, 1, 2),
+                       dim3(512), 0, stream, k_fp16, v_fp16, records, kv_blocks,
+                       kv_heads, start_pos, n_tokens);
+  } else if (bits == 4) {
+    hipLaunchKernelGGL(KvarnQuantizeBoundaryKernel<4>, dim3(kv_heads, 1, 2),
+                       dim3(512), 0, stream, k_fp16, v_fp16, records, kv_blocks,
+                       kv_heads, start_pos, n_tokens);
+  } else {
+    throw std::invalid_argument("KVarN bits must be 4 or 6");
+  }
 }
 
 void KvarnQuantizeGroups(const __half* k_rows, const __half* v_rows,
@@ -8657,15 +8683,24 @@ void KvarnQuantizeGroups(const __half* k_rows, const __half* v_rows,
                          const std::uint32_t* kv_blocks, std::uint32_t kv_heads,
                          std::uint32_t layers, std::uint32_t first_group,
                          std::uint32_t groups, hipStream_t stream,
-                         std::uint32_t staging_first) {
+                         std::uint32_t staging_first, int bits) {
   if (groups == 0 || layers == 0)
     return;
   if (first_group == 0)
     throw std::invalid_argument("KVarN group 0 is the FP16 sink");
-  hipLaunchKernelGGL(
-      KvarnQuantizeGroupsKernel, dim3(kv_heads, groups, 2 * layers), dim3(512),
-      0, stream, k_rows, v_rows, fp16_layer_elements, records,
-      records_layer_pitch, kv_blocks, kv_heads, first_group, staging_first);
+  if (bits == 6) {
+    hipLaunchKernelGGL(
+        KvarnQuantizeGroupsKernel<6>, dim3(kv_heads, groups, 2 * layers),
+        dim3(512), 0, stream, k_rows, v_rows, fp16_layer_elements, records,
+        records_layer_pitch, kv_blocks, kv_heads, first_group, staging_first);
+  } else if (bits == 4) {
+    hipLaunchKernelGGL(
+        KvarnQuantizeGroupsKernel<4>, dim3(kv_heads, groups, 2 * layers),
+        dim3(512), 0, stream, k_rows, v_rows, fp16_layer_elements, records,
+        records_layer_pitch, kv_blocks, kv_heads, first_group, staging_first);
+  } else {
+    throw std::invalid_argument("KVarN bits must be 4 or 6");
+  }
 }
 
 void StoreRows(const float* src, float* dst, std::uint32_t n_tokens,
@@ -8734,6 +8769,9 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                hipStream_t stream, std::uint32_t* lists, std::uint32_t* counts,
                std::uint32_t list_capacity, const std::uint32_t* kv_blocks,
                const KvarnReadView* kvarn, std::uint32_t dense_prefix) {
+  if (kvarn != nullptr && kvarn->bits != 4 && kvarn->bits != 6)
+    throw std::invalid_argument("KVarN bits must be 4 or 6");
+
   if (d != 256) {
     return;  // the kernel is written for the model's 256-wide heads
   }
@@ -8770,15 +8808,20 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                        partials, start_pos, heads, kv_heads, d, ratio, lists,
                        counts, list_capacity, kv_blocks, view, dense_prefix);
   };
-  if (kvarn != nullptr) {
+  if (kvarn != nullptr && kvarn->bits == 6) {
     if (n_tokens <= 2)
-      launch(AttentionKernel<2, true>, 2);
+      launch(AttentionKernel<2, 6>, 2);
     else
-      launch(AttentionKernel<4, true>, 4);
+      launch(AttentionKernel<4, 6>, 4);
+  } else if (kvarn != nullptr) {
+    if (n_tokens <= 2)
+      launch(AttentionKernel<2, 4>, 2);
+    else
+      launch(AttentionKernel<4, 4>, 4);
   } else if (n_tokens <= 2) {
-    launch(AttentionKernel<2, false>, 2);
+    launch(AttentionKernel<2, 0>, 2);
   } else {
-    launch(AttentionKernel<4, false>, 4);
+    launch(AttentionKernel<4, 0>, 4);
   }
   if (z > 1) {
     hipLaunchKernelGGL(AttentionMergeKernel, dim3(heads, n_tokens),
@@ -8805,6 +8848,9 @@ bool WmmaCausalAttention(const float* q, const float* gate,
                          std::uint32_t ratio, hipStream_t stream,
                          bool last_only, const std::uint32_t* kv_blocks,
                          const KvarnReadView* kvarn) {
+  if (kvarn != nullptr && kvarn->bits != 4 && kvarn->bits != 6)
+    throw std::invalid_argument("KVarN bits must be 4 or 6");
+
   if (WmmaCausalAttentionContextLimit(heads, kv_heads, d, ratio) == 0 ||
       n_tokens == 0) {
     return false;
@@ -8826,10 +8872,15 @@ bool WmmaCausalAttention(const float* q, const float* gate,
     const dim3 grid(
         (n_tokens + kPackedQueries - 1) / kPackedQueries - first_group,
         kWmmaKvHeads);
-    if (kvarn != nullptr)
+    if (kvarn != nullptr && kvarn->bits == 6)
       hipLaunchKernelGGL(
-          (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true, true>),
-          grid, dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask,
+          (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true, 6>), grid,
+          dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask,
+          mask_words, out, start_pos, n_tokens, first_group, kv_blocks, *kvarn);
+    else if (kvarn != nullptr)
+      hipLaunchKernelGGL(
+          (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true, 4>), grid,
+          dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask,
           mask_words, out, start_pos, n_tokens, first_group, kv_blocks, *kvarn);
     else
       hipLaunchKernelGGL(
@@ -8844,11 +8895,16 @@ bool WmmaCausalAttention(const float* q, const float* gate,
   const dim3 grid(
       (n_tokens + kWmmaQueryRows - 1) / kWmmaQueryRows - first_group,
       kWmmaKvHeads * (kWmmaGqa / kWmmaHeads));
-  if (kvarn != nullptr)
+  if (kvarn != nullptr && kvarn->bits == 6)
     hipLaunchKernelGGL(
-        (WmmaCausalAttentionKernel<kWmmaQueryRows, kWmmaKeys, false, true>),
-        grid, dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask,
-        mask_words, out, start_pos, n_tokens, first_group, kv_blocks, *kvarn);
+        (WmmaCausalAttentionKernel<kWmmaQueryRows, kWmmaKeys, false, 6>), grid,
+        dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask, mask_words,
+        out, start_pos, n_tokens, first_group, kv_blocks, *kvarn);
+  else if (kvarn != nullptr)
+    hipLaunchKernelGGL(
+        (WmmaCausalAttentionKernel<kWmmaQueryRows, kWmmaKeys, false, 4>), grid,
+        dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask, mask_words,
+        out, start_pos, n_tokens, first_group, kv_blocks, *kvarn);
   else
     hipLaunchKernelGGL(
         (WmmaCausalAttentionKernel<kWmmaQueryRows, kWmmaKeys, false>), grid,

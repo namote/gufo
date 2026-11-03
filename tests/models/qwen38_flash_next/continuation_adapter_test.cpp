@@ -876,6 +876,11 @@ void CheckSharedKvarn(const std::shared_ptr<qfn::Model>& model, bool mtp,
       geometry.blocks() * 2);
   qfn::ContinuationAdapter adapter(model, mode, context,
                                    {'s', 'h', 'a', 'r', 'e'}, pool);
+  const auto identity = adapter.CompatibilityIdentity();
+  // Five caller bytes, schema, enabled, then little-endian codec bits.
+  Require(identity.size() >= 17 && identity[13] == model->KvarnBits() &&
+              identity[14] == 0 && identity[15] == 0 && identity[16] == 0,
+          "component compatibility identity lost KV precision");
   gufo::hip::TransferPool streams(2);
   std::array<Guard, 4> guards;
   std::array<std::unique_ptr<cache::Slot>, 4> slots;
@@ -921,7 +926,36 @@ void CheckSharedKvarn(const std::shared_ptr<qfn::Model>& model, bool mtp,
     Require(Capture(adapter, *slots[1], streams).bytes == saved.bytes,
             "fragmented restore changed component bytes");
     SameLogits(a, b);
+    std::unique_ptr<qfn::SessionSnapshot> legacy;
+    if (boundary == 257) {
+      legacy = oracle->SaveSnapshot(&error,
+                                    qfn::Session::SnapshotMode::kMaterialized);
+      Require(bool(legacy), error);
+      auto bytes = legacy->bytes();
+      std::vector<std::uint8_t> wrong(bytes.begin(), bytes.end());
+      // The other codec's native header must reject before copying payload.
+      std::uint64_t executor_bytes = 0;
+      Require(wrong.size() >= 32, "native snapshot outer header truncated");
+      std::memcpy(&executor_bytes, wrong.data() + 24, sizeof(executor_bytes));
+      Require(executor_bytes >= 8 && executor_bytes <= wrong.size(),
+              "native snapshot executor length invalid");
+      const auto base = wrong.size() - executor_bytes;
+      const std::string_view expected_magic =
+          model->KvarnBits() == 6 ? "QFNSNAK6" : "QFNSNAPK";
+      Require(std::memcmp(wrong.data() + base, expected_magic.data(), 8) == 0,
+              "native snapshot did not record selected KV codec");
+      wrong[base + 6] = model->KvarnBits() == 6 ? 'P' : 'K';
+      wrong[base + 7] = model->KvarnBits() == 6 ? 'K' : '6';
+      Require(!oracle->RestoreSnapshot(wrong, &error),
+              "native snapshot accepted the other KV codec");
+      Require(oracle->RestoreSnapshot(bytes, &error), error);
+    }
     const auto expected = Decode(*oracle, 12, boundary == 2049);
+    if (legacy) {
+      Require(oracle->RestoreSnapshot(legacy->bytes(), &error), error);
+      Require(Decode(*oracle, 12, false) == expected,
+              "native KV snapshot changed replay");
+    }
     Require(Decode(a, 12, boundary == 2049) == expected &&
                 Decode(b, 12, boundary == 2049) == expected,
             "shared mapping or restored KVarN boundary changed decoding");
@@ -1007,7 +1041,10 @@ void CheckLearnedDraftPolicy(const std::shared_ptr<qfn::Model>& model) {
 }  // namespace
 int main(int argc, char** argv) {
   const bool shared_kvarn_only =
-      argc == 6 && std::string_view(argv[5]) == "--shared-kvarn-only";
+      argc == 6 && (std::string_view(argv[5]) == "--shared-kvarn-only" ||
+                    std::string_view(argv[5]) == "--shared-k6v6-only");
+  const int kvarn_bits =
+      argc == 6 && std::string_view(argv[5]) == "--shared-k6v6-only" ? 6 : 4;
   const bool guard_only =
       argc == 6 && std::string_view(argv[5]) == "--guard-only";
   const bool image_only =
@@ -1033,7 +1070,8 @@ int main(int argc, char** argv) {
     auto model = qfn::Model::Load(argv[2],
                                   {.max_context = 16384,
                                    .mtp_model_path = argv[4],
-                                   .kvarn = shared_kvarn_only},
+                                   .kvarn = shared_kvarn_only,
+                                   .kvarn_bits = kvarn_bits},
                                   &error);
     Require(bool(model), error);
     if (policy_only) {
