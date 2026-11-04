@@ -323,11 +323,17 @@ std::size_t Model::SessionBytes(core::SessionMode mode,
                                         3 * sizeof(std::int32_t)) +
                     64
               : 0;
+  return BaseSessionBytes(mode, context) + vision;
+}
+
+std::size_t Model::BaseSessionBytes(core::SessionMode mode,
+                                    std::uint32_t context) const noexcept {
+  // Request-specific images are budgeted from their prepared dimensions by
+  // the serving runner, not as max_context image tokens for every slot.
   return executor_->SessionBytes(mode, context,
                                  mode == core::SessionMode::kSpeculative
                                      ? executor_->max_speculative() - 1
-                                     : 0) +
-         vision;
+                                     : 0);
 }
 
 std::size_t Model::DeferredScratchBytes() const {
@@ -336,6 +342,14 @@ std::size_t Model::DeferredScratchBytes() const {
 
 std::size_t Session::AllocatedBytes() const noexcept {
   return session_->AllocatedBytes();
+}
+
+Session::MemoryUsage Session::Memory() const noexcept {
+  return {
+      session_->AllocatedBytes(), session_->RollbackBytes(),
+      session_->VisionBytes(), session_->GraphCount(),
+      (tokens_.capacity() + draft_added_.capacity()) * sizeof(std::int32_t) +
+          (logits_.capacity() + verify_logits_.capacity()) * sizeof(float)};
 }
 
 NgramTotals Session::NgramRowTotals() const noexcept {

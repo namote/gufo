@@ -1,5 +1,37 @@
 # Qwen3.8 Flash-Next benchmarks
 
+## Native EXL3 vision (2026-11-04)
+
+Native K6 vision residency 352601088 B versus historical BF16 903984064 B,
+a 525.84 MiB reduction. Quantization/weights differ; not a matched accuracy or
+latency comparison. K8 generic decoding uses temporary per-image memory.
+[Evidence and limits](../../../plan/exl3/F3-VISION-NATIVE.md).
+
+## Physical KV prefix references, November 4, 2026
+
+Same Nix10.1/native5.05-NG6/K6V6 settings, one repetition; saved K6 results
+reused without another baseline run. Desktop graphics remain active, so these
+are observations rather than matched speedup qualification. The final serving
+admission fixes do not participate in these standalone bench paths.
+
+| Scope | Saved K6 tok/s | Candidate tok/s | Change |
+| --- | ---: | ---: | ---: |
+| PP2048 | 1374.42 | 1372.59 | -0.13% |
+| PP8192 | 1403.11 | 1398.58 | -0.32% |
+| AR128 d0 | 24.33 | 24.30 | -0.12% |
+| AR128 d32768 | 23.58 | 23.59 | +0.04% |
+| MTP128 d0 | 35.66 | 33.90 | -4.94% |
+| MTP128 d32768 | 76.06 | 76.67 | +0.80% |
+
+AR/MTP output hashes remain exact at both depths; d32K MTP is lookup-heavy.
+Sharing changes physical block occupancy and restore work inside the fixed
+pool, not the size of its initial backing allocation. Direct GPU fixtures
+restore shared4K branches with at most two newly allocated blocks, including
+MTP's private frontier/guard. All88 boundary/reference cases pass.
+Evidence: `build/fn-kv-sharing/RESULT.json`, `gpu/` and `gpu-reservation/`;
+[implementation and limits](../../../plan/exl3/F3-KV-REFERENCES.md).
+
+
 ## K6V6 candidate observations, November 3, 2026
 
 One repetition, native5.05/NG6, Nix10.1, K6V6, YaRN off; desktop graphics

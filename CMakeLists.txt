@@ -623,6 +623,11 @@ if (BUILD_TESTING)
   add_test(NAME json_test COMMAND json_test)
   set_tests_properties(json_test PROPERTIES LABELS "cpu;json")
 
+  add_executable(request_memory_budget_test tests/cli/request_memory_budget_test.cpp)
+  target_include_directories(request_memory_budget_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME request_memory_budget_test COMMAND request_memory_budget_test)
+  set_tests_properties(request_memory_budget_test PROPERTIES LABELS "cpu;server;memory")
+
   add_executable(kv_block_layout_test tests/core/kv_block_layout_test.cpp)
   target_include_directories(kv_block_layout_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   add_test(NAME kv_block_layout_test COMMAND kv_block_layout_test)

@@ -23,6 +23,7 @@
 
 #include "src/cli/serve/component_text_cache.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/request_memory_budget.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/gguf_identity.hpp"
@@ -33,6 +34,7 @@
 #include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/vision/image_cache.hpp"
+#include "src/models/qwen/vision/memory.hpp"
 #include "src/models/qwen38_flash_next/native_metadata.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -172,7 +174,8 @@ TextPreparedPrompt PrepareQwenPrompt(
     return {std::move(prompt->tokens), {}, cache_prefix, system_prefix};
   if (!encoder)
     throw std::invalid_argument(
-        "image input requires a matching --mmproj BF16 sidecar");
+        "image input requires embedded EXL3 vision weights or a matching "
+        "--mmproj");
   auto context = std::make_shared<QwenImageContext>();
   context->cache_identity = prompt->cache_identity;
   for (const auto& image : prompt->images) {
@@ -210,7 +213,7 @@ void PrepareVision(
     encoder->Upload();
   } catch (const std::exception& e) {
     throw std::runtime_error(
-        std::string("could not upload the Qwen vision sidecar: ") + e.what());
+        std::string("could not upload the Qwen vision encoder: ") + e.what());
   }
   const auto uploaded = Clock::now();
   std::size_t heap_free = 0, heap_total = 0;
@@ -872,7 +875,9 @@ private:
 
 template<typename AdapterType>
 std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
-    std::unique_ptr<AdapterType> adapter, cache::ResourceLedger& ledger) {
+    std::unique_ptr<AdapterType> adapter, cache::ResourceLedger& ledger,
+    std::function<std::size_t()> pending_memory = {},
+    std::function<std::shared_ptr<void>(std::size_t)> reserve_memory = {}) {
   struct Backing {
     hip::TransferPool streams{64};
     std::unique_ptr<hip::CommittedBackingPool> pool;
@@ -893,8 +898,9 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
   }
   // The remainder belongs to index, histories, disk catalog and queue
   // metadata. The pools charge their own per-block allocator headroom.
-  result->commit_backing = [backing, &ledger, adapter = result->adapter.get()](
-                               std::size_t budget) {
+  result->commit_backing = [backing, &ledger, adapter = result->adapter.get(),
+                            pending_memory,
+                            reserve_memory](std::size_t budget) {
     const auto plan = static_cast<AdapterType*>(adapter)->BackingPlan(budget);
     if (plan.size() != 1)
       throw std::invalid_argument("insufficient component backing budget");
@@ -924,7 +930,8 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
             allocation.blocks * allocation.block_bytes +
                 allocation.metadata_bytes,
             allocation.block_bytes, allocation.metadata_bytes, segment,
-            [limited = std::make_shared<Limited>()](std::size_t bytes) {
+            [limited = std::make_shared<Limited>(),
+             pending_memory](std::size_t bytes) {
               const std::lock_guard lock(limited->mutex);
               const auto now = std::chrono::steady_clock::now();
               // Pressure retries ask once per capture; recheck at most
@@ -932,14 +939,18 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
               if (limited->active &&
                   now - limited->refused < std::chrono::seconds(1))
                 return false;
-              const auto ceiling = HostSnapshotCeilingBytes();
+              const auto pending = pending_memory ? pending_memory() : 0;
+              const auto host_ceiling = HostSnapshotCeilingBytes();
+              const auto ceiling =
+                  host_ceiling > pending ? host_ceiling - pending : 0;
               // Pinned host pages come out of the same device heap that
               // session and scratch allocations draw on; keep its dispatch
               // reserve so they do not fall back to managed memory.
               std::size_t heap_free = 0, heap_total = 0;
               const bool heap_fits =
                   hipMemGetInfo(&heap_free, &heap_total) == hipSuccess &&
-                  hip::HeapFitsAboveReserve(heap_free, bytes);
+                  heap_free >= pending &&
+                  hip::HeapFitsAboveReserve(heap_free - pending, bytes);
               if (ceiling >= bytes && heap_fits) {
                 limited->active = false;
                 return true;
@@ -957,7 +968,8 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
               limited->active = true;
               limited->refused = now;
               return false;
-            }});
+            },
+            reserve_memory});
     // Prepare a bounded reserve before readiness. The first shared-prefix
     // capture needs more than one segment; preparing 2 GiB avoids moving
     // registration onto that request's capture or decode path.
@@ -2622,7 +2634,19 @@ public:
             use_mtp_ ? core::SessionMode::kSpeculative
                      : core::SessionMode::kAutoregressive,
             max_context_, component_identity_, kv_pool_),
-        ledger);
+        ledger,
+        [budget = image_memory_, deferred = model_->DeferredScratchBytes()] {
+          return budget->ReservedBytes() + deferred;
+        },
+        [budget = image_memory_,
+         deferred = model_->DeferredScratchBytes()](std::size_t bytes) {
+          try {
+            return budget->Acquire(
+                {bytes, 0}, [deferred] { return ImageHeadroomFor(deferred); });
+          } catch (const std::length_error&) {
+            return std::shared_ptr<void>{};
+          }
+        });
   }
   [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
       cache::Adapter& adapter, cache::Slot& slot) const override {
@@ -2649,7 +2673,7 @@ public:
             model_->Kvarn()
                 ? (model_->KvarnBits() == 6 ? "kvarn-k6v6" : "kvarn-k4v4")
                 : "fp16",
-        .kv_layout_version = 3,
+        .kv_layout_version = 4,
         .capabilities =
             TextRunnerCapabilities{
                 .incremental_prefill = true,
@@ -2675,7 +2699,8 @@ public:
             .free_blocks = kv_pool_->free_blocks(),
             .block_rows = hip::kKvBlockTokens,
             .row_guard_rows = model_->config().compress_ratio,
-            .checkpoint_blocks_retained = false};
+            .checkpoint_blocks_retained = true,
+            .progressive_row_admission = true};
   }
   void ReserveRowBlocks(TextRunnerState& state,
                         std::size_t rows) const override {
@@ -2686,6 +2711,77 @@ public:
   void ReleaseRowBlocks(TextRunnerState& state) const noexcept override {
     auto& flash = RequireQwenFlashNextState(state);
     flash.adapter().ReleaseKvReservation(flash.slot());
+  }
+
+  std::string MemoryReport(const TextRunnerState& state) const override {
+    const auto& flash =
+        dynamic_cast<const QwenFlashNextTextRunnerState&>(state);
+    const auto memory = flash.session().Memory();
+    std::size_t free = 0, total = 0;
+    const bool heap = hipMemGetInfo(&free, &total) == hipSuccess;
+    std::ostringstream out;
+    out << "session_device_total_bytes=" << memory.device_bytes
+        << " session_rollback_bytes=" << memory.rollback_bytes
+        << " session_vision_bytes=" << memory.vision_bytes
+        << " session_graph_count=" << memory.graph_count
+        << " session_host_vector_bytes=" << memory.host_vector_bytes
+        << " model_resident_bytes=" << model_->ResidentBytes()
+        << " deferred_scratch_budget_bytes=" << model_->DeferredScratchBytes()
+        << " pending_image_and_cache_budget_bytes="
+        << image_memory_->ReservedBytes() << " graph_bytes=unmeasured";
+    if (heap)
+      out << " device_free_bytes=" << free;
+    if (kv_pool_) {
+      const auto reserved = kv_pool_->reserved_blocks();
+      const auto available = kv_pool_->free_blocks();
+      out << " kv_pool_bytes=" << kv_pool_->geometry().bytes()
+          << " kv_total_blocks=" << kv_pool_->blocks()
+          << " kv_free_blocks=" << available
+          << " kv_reserved_blocks=" << reserved
+          << " kv_used_blocks=" << kv_pool_->blocks() - available - reserved;
+    }
+    return out.str();
+  }
+
+  RequestMemoryClaim ImageClaim(const TextPromptContext* context) const {
+    const auto* image = dynamic_cast<const QwenImageContext*>(context);
+    if (!image || !image->prompt || image->prompt->images.empty())
+      return {};
+    RequestMemoryClaim claim;
+    claim.persistent_bytes =
+        std::size_t{image->prompt->rope.PrefixLength()} * 12 + 64;
+    for (const auto& input : image->prompt->images) {
+      const auto memory = models::qwen::vision::EstimateImageMemory(
+          input.pixels->width, input.pixels->height,
+          model_->config().hidden_size,
+          model_->VisionEncoder() && model_->VisionEncoder()->IsExl3());
+      if (memory.embedding_bytes >
+          std::numeric_limits<std::size_t>::max() - claim.persistent_bytes)
+        throw std::length_error("image request memory size overflows");
+      claim.persistent_bytes += memory.embedding_bytes;
+      claim.scratch_bytes = std::max(claim.scratch_bytes, memory.scratch_bytes);
+    }
+    return claim;
+  }
+  static std::size_t ImageHeadroomFor(std::size_t deferred) {
+    std::size_t free = 0, total = 0;
+    if (hipMemGetInfo(&free, &total) != hipSuccess)
+      throw std::runtime_error("cannot query image memory headroom");
+    const auto reserve = kHostSnapshotHeadroomBytes + deferred;
+    const auto host = HostSnapshotCeilingBytes();
+    return std::min(host > deferred ? host - deferred : 0,
+                    free > reserve ? free - reserve : 0);
+  }
+  bool RequestMemoryReady(const TextPromptContext* context) const override {
+    return image_memory_->Ready(ImageClaim(context), [this] {
+      return ImageHeadroomFor(model_->DeferredScratchBytes());
+    });
+  }
+  std::shared_ptr<void> ReserveRequestMemory(
+      const TextPromptContext* context) const override {
+    return image_memory_->Acquire(ImageClaim(context), [this] {
+      return ImageHeadroomFor(model_->DeferredScratchBytes());
+    });
   }
 
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
@@ -2702,10 +2798,10 @@ public:
         .resident_weights_bytes = model_->ResidentBytes(),
         .state_capacity_bytes = capacity,
         .per_request_state_bytes =
-            model_->SessionBytes(use_mtp_
-                                     ? gufo::core::SessionMode::kSpeculative
-                                     : gufo::core::SessionMode::kAutoregressive,
-                                 max_context_) -
+            model_->BaseSessionBytes(
+                use_mtp_ ? gufo::core::SessionMode::kSpeculative
+                         : gufo::core::SessionMode::kAutoregressive,
+                max_context_) -
             (kv_pool_ ? model_
                             ->KvGeometry(
                                 use_mtp_ ? core::SessionMode::kSpeculative
@@ -3121,6 +3217,8 @@ public:
   }
 
 private:
+  std::shared_ptr<RequestMemoryBudget> image_memory_ =
+      std::make_shared<RequestMemoryBudget>();
   mutable models::qwen::vision::ImageCache image_cache_;
   std::shared_ptr<QwenFlashNextModel> model_;
   std::shared_ptr<hip::KvBlockPool> kv_pool_;

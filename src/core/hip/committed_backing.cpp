@@ -59,6 +59,7 @@ struct BackingState {
       std::numeric_limits<std::size_t>::max()};
   cache::ResourceLedger* ledger{};
   std::function<bool(std::size_t)> admit_segment;
+  std::function<std::shared_ptr<void>(std::size_t)> reserve_segment;
   std::mutex growth;
   std::atomic<bool> growing_ahead{};
   std::byte* Address(std::size_t index) const {
@@ -84,6 +85,10 @@ struct BackingState {
       return false;
     const auto count = std::min(segment_blocks, capacity - first);
     if (admit_segment && !admit_segment(count * block_bytes))
+      return false;
+    auto physical_promise =
+        reserve_segment ? reserve_segment(count * block_bytes) : nullptr;
+    if (reserve_segment && !physical_promise)
       return false;
     std::vector<cache::ResourceReservation> reservations;
     try {
@@ -227,6 +232,7 @@ CommittedBackingPool::CommittedBackingPool(cache::ResourceLedger& ledger,
       (count + state->segment_blocks - 1) / state->segment_blocks + 1);
   state->ledger = &ledger;
   state->admit_segment = std::move(config.admit_segment);
+  state->reserve_segment = std::move(config.reserve_segment);
   if (!config.segment_bytes && count) {
     std::vector<cache::ResourceReservation> reservations;
     reservations.reserve(count);

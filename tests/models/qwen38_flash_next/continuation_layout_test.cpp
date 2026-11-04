@@ -78,6 +78,10 @@ void Check(bool mtp) {
       if (component.part == qfn::ContinuationPart::kDraftKey)
         Require(positions[i].valid_rows == draft,
                 "predictor KV lost its independent frontier");
+      if (component.part == qfn::ContinuationPart::kPooledKeys ||
+          component.part == qfn::ContinuationPart::kDraftPooledKeys)
+        Require(component.descriptor.rows_per_chunk == 64,
+                "pooled chunks cross physical 256-token block boundaries");
       if (component.part == qfn::ContinuationPart::kDraftPooledKeys)
         Require(positions[i].valid_rows == draft / 4,
                 "predictor pools are counted in tokens");
@@ -129,7 +133,7 @@ void CheckKvarn(bool mtp, int bits = 4) {
       const auto& d = component.descriptor;
       if (component.part == qfn::ContinuationPart::kKvarnRecords) {
         Require(d.row_bytes == (bits == 6 ? 102912U : 70144U) &&
-                    d.rows_per_chunk == 2,
+                    d.rows_per_chunk == 1,
                 "KVarN token-major record schema changed");
         Require(positions[d.id.value - 1].valid_rows == groups,
                 "KVarN component position is not a completed group count");

@@ -120,6 +120,9 @@ public:
   /// Worst-case private device state, including the configured rollback cap.
   [[nodiscard]] std::size_t SessionBytes(core::SessionMode mode,
                                          std::uint32_t context) const noexcept;
+  /// Text/rollback state only; prepared images receive a request-time claim.
+  [[nodiscard]] std::size_t BaseSessionBytes(
+      core::SessionMode mode, std::uint32_t context) const noexcept;
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
   [[nodiscard]] const std::shared_ptr<qwen::vision::Encoder>& VisionEncoder()
       const noexcept {
@@ -233,6 +236,12 @@ public:
   void SetCancellationCheck(std::function<bool()> check);
   [[nodiscard]] bool IsValid() const noexcept { return valid_; }
   [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
+  struct MemoryUsage {
+    std::size_t device_bytes{}, rollback_bytes{}, vision_bytes{}, graph_count{};
+    /// Selected large host vectors; not all C++/HIP runtime allocations.
+    std::size_t host_vector_bytes{};
+  };
+  [[nodiscard]] MemoryUsage Memory() const noexcept;
   void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt);
   /// A new request reusing cached context starts its own acceptance history.
   void ResetDraftPolicy();

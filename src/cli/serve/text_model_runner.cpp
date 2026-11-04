@@ -1311,11 +1311,14 @@ struct TextRunnerPool::Request::Impl {
   bool stopped{false};
   std::optional<TextDecodeSelection> pending_selection;
   sampling::SamplerState sampler;
+  std::shared_ptr<void> request_memory;
   std::shared_ptr<const TextPromptContext> context;
   bool retain_fallback{false};
   bool overlap_snapshots{false};
   // ReserveRows holds row blocks on this lease's state.
   bool rows_reserved{false};
+  std::size_t reserved_rows{0};
+  mutable std::chrono::steady_clock::time_point memory_logged{};
   std::size_t fallback_position{0};
   /// This turn's stable boundary when the reused frontier sits before it, so
   /// the boundary is checkpointed after the frozen fallback instead of being
@@ -1810,6 +1813,7 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
   impl_->CapturePromptSnapshot();
   auto& state = dynamic_cast<TextRunnerState&>(impl_->lease.state());
   state.SetCancellationCheck({});
+  LogMemory("release", true);
   impl_->ReleaseRows();
   if (!impl_->runner->Descriptor().capabilities.prefix_reuse) {
     impl_->lease.Invalidate();
@@ -1863,6 +1867,7 @@ TextRunnerPool::Request::Cancel() noexcept {
       impl_->FinishSnapshot();
     auto& state = dynamic_cast<TextRunnerState&>(impl_->lease.state());
     state.SetCancellationCheck({});
+    LogMemory("release", true);
     impl_->ReleaseRows();
     const auto capabilities = impl_->runner->Descriptor().capabilities;
     if (!capabilities.prefix_reuse) {
@@ -1919,6 +1924,7 @@ void TextRunnerPool::Request::Invalidate() noexcept {
       impl_->snapshot_future.wait();
     dynamic_cast<TextRunnerState&>(impl_->lease.state())
         .SetCancellationCheck({});
+    LogMemory("release", true);
     impl_->ReleaseRows();
     impl_->lease.Invalidate();
     impl_.reset();
@@ -1943,11 +1949,10 @@ std::size_t TextRunnerPool::AdmissionRowBlocks(std::size_t rows) const {
   if (pool.block_rows == 0)
     return 0;
   const std::size_t context = impl_->validated.descriptor.max_context;
-  // The reservation's rule (QwenGpuArena::ReserveKvRows). Past the context
-  // cap it also charges a copy when writes start inside a shared block,
-  // which no admitted request does: a continued frontier ends in a block no
-  // checkpoint retains (they retain complete blocks behind their boundary),
-  // and a restore copies the rows of the block it splits.
+  // Qwen and Flash-Next retain only complete blocks behind every writable
+  // frontier, and a restore copies the block it splits. Flash-Next includes
+  // the draft and pooled-indexer frontiers in that rule: later captures must
+  // not introduce COW debt after a growing request has reserved its rows.
   return pool.AdmissionBlocks(rows, context, TextModelRunner::kRowBlockMargin);
 }
 
@@ -1957,12 +1962,14 @@ bool TextRunnerPool::AdmissionReady(std::span<const TextRunnerToken> prompt,
                                     bool reuse_prompt,
                                     std::size_t cache_prefix_tokens) {
   const auto& runner = *impl_->validated.runner;
+  if (!runner.RequestMemoryReady(context))
+    return false;
   std::size_t need = AdmissionRowBlocks(std::min<std::size_t>(
       impl_->validated.descriptor.max_context, prompt.size() + max_new_tokens));
   if (need == 0 || runner.RowBlocks().free_blocks >= need)
     return true;
   if (impl_->component_cache == nullptr)
-    return true;
+    return runner.RowBlocks().checkpoint_blocks_retained;
   // A continued session's slot already maps the rows of its frontier, and a
   // restore maps the complete device blocks of its checkpoint;
   // Request::ReserveRows reserves only the blocks past them.
@@ -1978,9 +1985,10 @@ bool TextRunnerPool::AdmissionReady(std::span<const TextRunnerToken> prompt,
   if (runner.RowBlocks().free_blocks >= need)
     return true;
   // kExhausted: nothing more will free; admit, and ReserveRows refuses.
-  return impl_->component_cache->ReclaimRows(prompt, reuse_prompt, [&] {
-    return runner.RowBlocks().free_blocks >= need;
-  }) != ComponentTextCache::RowReclaim::kWaiting;
+  return impl_->component_cache->ReclaimRows(
+             prompt, reuse_prompt,
+             [&] { return runner.RowBlocks().free_blocks >= need; }, context,
+             cache_prefix_tokens) != ComponentTextCache::RowReclaim::kWaiting;
 }
 
 std::size_t TextRunnerPool::WriteBackIdle(
@@ -2000,12 +2008,88 @@ void TextRunnerPool::Request::ReserveRows(std::size_t max_new_tokens) {
   const auto& runner = *impl_->runner;
   if (runner.RowBlocks().block_rows == 0)
     return;
-  const std::size_t rows = std::min<std::size_t>(
-      runner.Descriptor().max_context, impl_->prompt.size() + max_new_tokens);
-  impl_->ReleaseRows();
+  const std::size_t limit = runner.Descriptor().max_context;
+  const std::size_t rows =
+      impl_->prompt.size() +
+      std::min(max_new_tokens, limit - impl_->prompt.size());
   runner.ReserveRowBlocks(dynamic_cast<TextRunnerState&>(impl_->lease.state()),
                           rows);
   impl_->rows_reserved = true;
+  impl_->reserved_rows = rows;
+}
+
+void TextRunnerPool::Request::LogMemory(std::string_view reason,
+                                        bool force) const noexcept {
+  if (!*this || !Logger::Enabled(LogLevel::kInfo))
+    return;
+  try {
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && now - impl_->memory_logged < std::chrono::seconds(10))
+      return;
+    const auto details = impl_->runner->MemoryReport(
+        dynamic_cast<TextRunnerState&>(impl_->lease.state()));
+    if (details.empty())
+      return;
+    impl_->memory_logged = now;
+    std::ostringstream line;
+    line << "event=usage reason=" << reason << " request_state=" << impl_.get()
+         << " prompt_tokens=" << impl_->prompt.size()
+         << " generated_tokens=" << impl_->generated.size()
+         << " kv_reserved_rows=" << impl_->reserved_rows
+         << " request_token_capacity_bytes="
+         << (impl_->prompt.capacity() + impl_->generated.capacity() +
+             impl_->snapshot_tokens.capacity()) *
+                sizeof(TextRunnerToken)
+         << ' ' << details << ' ' << Logger::MemoryStatus();
+    if (const auto metrics = component_cache_metrics()) {
+      line << " cache_ledger_total_bytes=" << metrics->ledger.total_bytes;
+      constexpr const char* names[]{
+          "backing_free",  "backing_assigned", "backing_materialized",
+          "private_state", "private_tail",     "metadata",
+          "staging"};
+      static_assert(std::size(names) == cache::kResourceCategoryCount);
+      for (std::size_t i = 0; i < cache::kResourceCategoryCount; ++i)
+        line << " cache_" << names[i] << "_bytes=" << metrics->ledger.bytes[i]
+             << " cache_" << names[i]
+             << "_reserved_bytes=" << metrics->ledger.reserved_bytes[i];
+    }
+    Logger::Info("memory", line.str());
+  } catch (...) {
+    // Observability cannot fail or change inference.
+  }
+}
+
+std::size_t TextRunnerPool::Request::ReservedDecodeTokens() const noexcept {
+  if (!impl_ || !impl_->rows_reserved)
+    return std::numeric_limits<std::size_t>::max();
+  const auto used = impl_->prompt.size() + impl_->generated.size();
+  return impl_->reserved_rows > used ? impl_->reserved_rows - used : 0;
+}
+
+bool TextRunnerPool::TryGrowRows(Request& request, std::size_t max_new_tokens) {
+  if (!request || request.impl_->runner != impl_->validated.runner)
+    throw std::invalid_argument("row growth needs a live request of this pool");
+  const auto& runner = *impl_->validated.runner;
+  if (runner.RowBlocks().block_rows == 0)
+    return true;
+  const auto context = runner.Descriptor().max_context;
+  const auto rows =
+      request.impl_->prompt.size() +
+      std::min(max_new_tokens, context - request.impl_->prompt.size());
+  if (rows <= request.impl_->reserved_rows)
+    return true;
+  const auto extra = AdmissionRowBlocks(rows) -
+                     AdmissionRowBlocks(request.impl_->reserved_rows);
+  const auto fits = [&] { return runner.RowBlocks().free_blocks >= extra; };
+  if (!fits() && impl_->component_cache)
+    (void)impl_->component_cache->ReclaimRows(request.prompt(), false, fits);
+  if (!fits())
+    return false;
+  // The scheduler is the only reservation writer. Reclaim/capture workers
+  // can return rows but cannot take this unreserved capacity. ReserveRows
+  // therefore cannot lose an old reservation on ordinary pool pressure.
+  request.ReserveRows(max_new_tokens);
+  return true;
 }
 
 std::size_t TextRunnerPool::capacity() const noexcept {
@@ -2205,6 +2289,8 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
       return {};
   }
 
+  auto request_memory =
+      impl_->validated.runner->ReserveRequestMemory(context.get());
   if (impl_->component_cache) {
     auto lease = impl_->component_cache->Acquire(
         prompt, is_cancelled, context, reuse_prompt, cache_prefix_tokens,
@@ -2216,6 +2302,7 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
         std::move(prompt), std::vector<std::size_t>{}, sampling_config,
         std::move(context), cache_prefix_tokens, capacity() > 1,
         impl_->tail_checkpoints));
+    request.impl_->request_memory = std::move(request_memory);
     request.impl_->cancelled = is_cancelled;
     if (reuse_prompt) {
       // The next conversation under the same system prompt restores this
@@ -2359,6 +2446,7 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
       impl_->validated.runner, impl_->disk_store, std::move(lease),
       std::move(prompt), std::move(boundaries), sampling_config,
       std::move(context), cache_prefix_tokens, impl_->cache->capacity() > 1));
+  request.impl_->request_memory = std::move(request_memory);
   request.impl_->cancelled = is_cancelled;
   // The next conversation under the same system prompt restores this one's
   // checkpoint where they diverge, from RAM or disk.

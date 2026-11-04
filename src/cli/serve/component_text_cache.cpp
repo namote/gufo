@@ -1335,13 +1335,27 @@ std::size_t ComponentTextCache::WriteBackIdle(
 
 ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
     std::span<const ContinuationToken> prompt, bool reuse,
-    const std::function<bool()>& enough) {
+    const std::function<bool()>& enough, const TextPromptContext* context,
+    std::size_t stable) {
   std::vector<const Impl::Entry*> visited;
+  std::shared_ptr<const cache::Checkpoint> protected_checkpoint;
+  std::optional<cache::BorrowedLocation> protected_live;
+  {
+    const std::lock_guard lock(impl_->mutex);
+    auto found =
+        impl_->index.Lookup({impl_->identity, prompt,
+                             Inputs(prompt.size(), context), stable, reuse});
+    if (found.selected) {
+      protected_checkpoint = std::move(found.selected->checkpoint);
+      protected_live = found.selected->live;
+    }
+    // Destroy the other candidate pins before reclaiming. Token-equal cold
+    // executions can own distinct physical blocks; only the selected source
+    // serves this request, including its image identity and stable boundary.
+  }
   // Device rows only checkpoints hold come back when those are dropped.
   const auto only_retained = [&](const cache::Checkpoint& checkpoint) {
-    const auto tokens = checkpoint.Tokens();
-    if (reuse && tokens.size() <= prompt.size() &&
-        std::ranges::equal(tokens, prompt.first(tokens.size())))
+    if (&checkpoint == protected_checkpoint.get())
       return false;
     for (const auto& c : checkpoint.Components())
       for (const auto& chunk : c.chunks)
@@ -1357,11 +1371,6 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
     std::optional<Impl::Uncovered> uncovered;
     {
       const std::lock_guard lock(impl_->mutex);
-      const auto continues = [&](const Impl::Entry& e) {
-        return e.live_tokens.size() <= prompt.size() &&
-               std::ranges::equal(e.live_tokens,
-                                  prompt.first(e.live_tokens.size()));
-      };
       const auto covered = [&](const Impl::Entry& e) {
         return impl_->index.HasCheckpoint(
             {impl_->identity, e.live_tokens,
@@ -1379,7 +1388,8 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
         }
         if (!candidate->holds_rows ||
             std::ranges::find(visited, candidate.get()) != visited.end() ||
-            (candidate->live && reuse && continues(*candidate)))
+            (candidate->live && protected_live &&
+             protected_live->slot.value == i + 1))
           continue;
         const Rank rank{bool(candidate->live),
                         candidate->live && !covered(*candidate),
@@ -1472,21 +1482,57 @@ ComponentTextCache::HeldRows ComponentTextCache::ContinuedTokens(
   const auto& checkpoint = found.selected->checkpoint;
   if (!checkpoint || impl_->device_components.empty())
     return {};
-  // The rows every device component holds on the device from row 0.
-  std::size_t rows = found.selected->boundary;
+  // Intersect retained token ranges across all physical planes. A host-only
+  // early chunk must not hide later shared blocks; conversely, partial blocks
+  // on opposite sides of a host gap must not count as one reusable block.
+  // Adapters retain only complete immutable blocks; histories inherit whole
+  // checkpoint frontiers and extend monotonically. Thus a surviving device
+  // block carries matching physical ownership across all its plane chunks.
+  using Range = std::pair<cache::Rows, cache::Rows>;
+  std::vector<Range> shared{{0, found.selected->boundary}};
   for (const auto& c : checkpoint->Components()) {
     if (std::ranges::find(impl_->device_components, c.descriptor.id) ==
         impl_->device_components.end())
       continue;
     if (found.selected->UsesDisk(c.descriptor.id))
       return {};
-    cache::Rows end = 0;
+    std::vector<Range> available;
     for (const auto& chunk : c.chunks) {
-      if (chunk.First() != end || !chunk.Storage().OnDevice())
-        break;
-      end = chunk.End();
+      if (!chunk.Storage().OnDevice())
+        continue;
+      const auto first = impl_->resources->adapter->RetainedTokenRows(
+          c.descriptor.id, chunk.First());
+      const auto end = impl_->resources->adapter->RetainedTokenRows(
+          c.descriptor.id, chunk.End());
+      if (!available.empty() && available.back().second == first)
+        available.back().second = end;
+      else
+        available.emplace_back(first, end);
     }
-    rows = std::min<std::size_t>(rows, end);
+    std::vector<Range> intersection;
+    std::size_t i = 0, j = 0;
+    while (i < shared.size() && j < available.size()) {
+      const auto first = std::max(shared[i].first, available[j].first);
+      const auto end = std::min(shared[i].second, available[j].second);
+      if (first < end)
+        intersection.emplace_back(first, end);
+      if (shared[i].second < available[j].second)
+        ++i;
+      else
+        ++j;
+    }
+    shared = std::move(intersection);
+    if (shared.empty())
+      return {};
+  }
+  const auto block =
+      std::max<std::size_t>(1, impl_->runner->RowBlocks().block_rows);
+  std::size_t rows = 0;
+  for (const auto& [first, end] : shared) {
+    const auto begin_block = first / block + (first % block != 0);
+    const auto end_block = end / block;
+    if (begin_block < end_block)
+      rows += (end_block - begin_block) * block;
   }
   return {.tokens = rows};
 }

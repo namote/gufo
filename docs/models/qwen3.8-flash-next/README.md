@@ -8,7 +8,7 @@ Original unquantized-model and GGUF-conversion parity remain unqualified.
 
 [Benchmarks](BENCHMARKS.md) · [Quality](QUALITY.md) · [Experiments](EXPERIMENTS.md) · [ROCm 10.1 status](ROCM.md)
 
-## Native EXL3 text/MTP
+## Native EXL3 text/MTP/vision
 
 Pass the pack directory directly to `--model` and, when enabled, `--mtp-model`:
 
@@ -28,9 +28,12 @@ on fast local storage. Missing or incompatible files fail explicitly.
 
 MTP uses the same pack. If its index omits the MTP hyper-connection mixer,
 include the matching `mtp_hyper_connection_mixer_patch.safetensors` in that
-directory. A different pack cannot silently supply MTP. The native text path
-does not automatically load an EXL3 vision encoder; explicit vision projector
-support is separate. See [native qualification](../../../plan/exl3/F3-NATIVE-PACK.md).
+directory. A different pack cannot silently supply MTP. A native pack with a
+supported `vision_config` automatically supplies its embedded `model.visual.*`
+weights. An explicit `--mmproj` overrides that selection; malformed embedded
+vision fails instead of silently selecting a different encoder.
+See [native text qualification](../../../plan/exl3/F3-NATIVE-PACK.md) and
+[native vision qualification](../../../plan/exl3/F3-VISION-NATIVE.md).
 
 ## GGUF load and run
 
@@ -134,8 +137,15 @@ creating sessions.
 
 ## Images
 
-Use this model's `mmproj-BF16.gguf`, discovered beside the target or selected
-with `--mmproj`. PNG/JPEG CLI and HTTP requests use the
+Native EXL3 packs use their embedded vision encoder without another model file.
+Its projections remain EXL3 on the GPU; native FP16 activations and FP32 residuals
+are separate from the existing BF16 GGUF arithmetic. K1–K7 mul1 projections use
+the shared packed GEMM; other supported EXL3 formats use a bounded per-image
+decoded-inner scratch slab. The pack's selected vision weights and numerical
+contract are included in image-cache identity.
+
+GGUF targets use the matching `mmproj-BF16.gguf`, discovered beside the target
+or selected with `--mmproj`. PNG/JPEG/WebP CLI and HTTP requests use the
 [same image interface](../qwen3.8-27b/README.md#images). Image state participates
 in prefill, decoding, verification, multi-turn reuse and disk cache identity.
 The predictor embeds shifted text IDs; visual information comes from target

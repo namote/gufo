@@ -753,7 +753,7 @@ void Session::PreserveSnapshots(std::uint32_t position,
 Session::~Session() {
   if (kv_pool_) {
     (void)hipStreamSynchronize(owner_->stream());
-    kv_pool_->Release(kv_blocks_);
+    ReleaseMappedKvBlocks();
     kv_reservation_.Reset();
   }
   try {
@@ -967,6 +967,8 @@ void Session::TrimRollback(std::uint32_t depth) noexcept {
 void Session::EnsureKvRows(std::uint32_t rows) {
   if (!kv_pool_)
     return;
+  if (kv_unmapped_blocks_)
+    throw std::logic_error("Flash-Next KV restore has unmapped blocks");
   if (rows > max_context_)
     throw std::length_error("Flash-Next KV rows exceed context");
   const auto need =
@@ -998,8 +1000,116 @@ void Session::TrimKvRows(std::uint32_t rows) {
   const auto result = hipStreamSynchronize(owner_->stream());
   if (result != hipSuccess)
     throw std::runtime_error(hipGetErrorString(result));
-  kv_pool_->Release(std::span(kv_blocks_).subspan(keep));
+  ReleaseMappedKvBlocks(keep);
   kv_blocks_.resize(keep);
+}
+
+void Session::ReleaseMappedKvBlocks(std::size_t first) noexcept {
+  const auto begin = kv_blocks_.begin() + static_cast<std::ptrdiff_t>(first);
+  const auto end = std::remove(begin, kv_blocks_.end(), kUnmappedKvBlock);
+  kv_unmapped_blocks_ -= std::distance(end, kv_blocks_.end());
+  kv_pool_->Release(std::span(begin, end));
+}
+
+void Session::PrepareKvRestoreRows(std::uint32_t rows) {
+  if (!kv_pool_)
+    return;
+  if (rows > max_context_)
+    throw std::length_error("Flash-Next KV restore exceeds context");
+  const auto need =
+      rows ? hip::KvBlockGeometry::BlocksFor(std::size_t{rows} + kKvPooledRatio)
+           : 0;
+  kv_blocks_.reserve(need);
+  TrimKvRows(rows);
+  const auto previous = kv_blocks_.size();
+  kv_blocks_.resize(need, kUnmappedKvBlock);
+  kv_unmapped_blocks_ += need - previous;
+}
+
+void Session::EnsureKvRestoreBlock(std::uint32_t logical) {
+  auto& physical = kv_blocks_.at(logical);
+  if (physical != kUnmappedKvBlock)
+    return;
+  physical = kv_pool_->Allocate(1, &kv_reservation_).front();
+  kv_table_host_[logical] = physical;
+  --kv_unmapped_blocks_;
+}
+
+void Session::MapKvBlock(std::uint32_t logical, std::uint32_t physical) {
+  auto& entry = kv_blocks_.at(logical);
+  if (entry == physical)
+    return;
+  kv_pool_->Retain(std::span(&physical, 1));
+  const auto replaced = std::exchange(entry, physical);
+  kv_table_host_[logical] = physical;
+  if (replaced == kUnmappedKvBlock)
+    --kv_unmapped_blocks_;
+  else
+    kv_pool_->Release(std::span(&replaced, 1), kv_reservation_);
+}
+
+void Session::UploadKvTable() {
+  if (!kv_pool_ || kv_blocks_.empty())
+    return;
+  if (kv_unmapped_blocks_)
+    throw std::logic_error("Flash-Next KV restore has unmapped blocks");
+  const auto result = hipMemcpyAsync(kv_table_, kv_table_host_,
+                                     kv_blocks_.size() * sizeof(std::uint32_t),
+                                     hipMemcpyHostToDevice, owner_->stream());
+  if (result != hipSuccess)
+    throw std::runtime_error(hipGetErrorString(result));
+}
+
+void Session::UnshareKvRows(std::uint32_t first, std::uint32_t end) {
+  if (!kv_pool_ || first >= end)
+    return;
+  const auto check = [](hipError_t result) {
+    if (result != hipSuccess)
+      throw std::runtime_error(hipGetErrorString(result));
+  };
+  const auto& geometry = kv_pool_->geometry();
+  const auto last = std::min<std::size_t>(hip::KvBlockGeometry::BlocksFor(end),
+                                          kv_blocks_.size());
+  for (std::size_t logical = first >> hip::kKvBlockShift; logical < last;
+       ++logical) {
+    const auto shared = kv_blocks_[logical];
+    if (shared == kUnmappedKvBlock)
+      throw std::logic_error("cannot write unmapped Flash-Next KV rows");
+    if (kv_pool_->references(shared) < 2)
+      continue;
+    // Drain graph/table users before changing the pinned table. Copy every
+    // plane: target, predictor and pooled indexer share one physical ID.
+    check(hipStreamSynchronize(owner_->stream()));
+    const auto copy = kv_pool_->Allocate(1, &kv_reservation_).front();
+    try {
+      for (std::size_t plane = 0; plane < geometry.planes().size(); ++plane) {
+        const auto pitch = geometry.layer_pitch(plane);
+        const auto width = geometry.block_bytes(plane);
+        auto* base = kv_pool_->plane_data(plane);
+        check(hipMemcpy2DAsync(base + copy * width, pitch,
+                               base + shared * width, pitch, width,
+                               geometry.planes()[plane].layers,
+                               hipMemcpyDeviceToDevice, owner_->stream()));
+      }
+      check(hipStreamSynchronize(owner_->stream()));
+    } catch (...) {
+      if (hipStreamSynchronize(owner_->stream()) == hipSuccess)
+        kv_pool_->Release(std::span(&copy, 1), kv_reservation_);
+      throw;
+    }
+    kv_blocks_[logical] = copy;
+    kv_table_host_[logical] = copy;
+    try {
+      check(hipMemcpyAsync(kv_table_ + logical, kv_table_host_ + logical,
+                           sizeof(std::uint32_t), hipMemcpyHostToDevice,
+                           owner_->stream()));
+      check(hipStreamSynchronize(owner_->stream()));
+    } catch (...) {
+      kv_pool_->Release(std::span(&shared, 1));
+      throw;
+    }
+    kv_pool_->Release(std::span(&shared, 1));
+  }
 }
 
 std::uint32_t Session::ReserveKvRows(std::uint32_t rows, std::uint32_t margin) {
@@ -1010,7 +1120,22 @@ std::uint32_t Session::ReserveKvRows(std::uint32_t rows, std::uint32_t margin) {
   const auto target = std::min(hip::KvBlockGeometry::BlocksFor(rows) + margin,
                                hip::KvBlockGeometry::BlocksFor(
                                    std::size_t{max_context_} + kKvPooledRatio));
-  const auto need = target > kv_blocks_.size() ? target - kv_blocks_.size() : 0;
+  if (kv_unmapped_blocks_)
+    throw std::logic_error("cannot reserve an incomplete Flash-Next restore");
+  auto first = mtp_enabled_ ? std::min(position_, mtp_.position) : position_;
+  if (kvarn_)
+    first = std::min(first, kvarn_tail_.flushed_end);
+  if (rows > owner_->config().indexer_top_k) {
+    first = std::min(first, blocks_ * kKvPooledRatio);
+    if (mtp_enabled_)
+      first = std::min(first, mtp_.blocks * kKvPooledRatio);
+  }
+  std::uint32_t copies = 0;
+  for (std::size_t i = first >> hip::kKvBlockShift;
+       i < std::min<std::size_t>(target, kv_blocks_.size()); ++i)
+    copies += kv_pool_->references(kv_blocks_[i]) > 1;
+  const auto need =
+      (target > kv_blocks_.size() ? target - kv_blocks_.size() : 0) + copies;
   kv_reservation_.Reset();
   if (need) {
     kv_reservation_ = kv_pool_->TryReserve(need);
@@ -1031,7 +1156,7 @@ void Session::Reset(bool reuse_mtp) {
     const auto result = hipStreamSynchronize(owner_->stream());
     if (result != hipSuccess)
       throw std::runtime_error(hipGetErrorString(result));
-    kv_pool_->Release(kv_blocks_);
+    ReleaseMappedKvBlocks();
     kv_blocks_.clear();
     kv_reservation_.Reset();
   }

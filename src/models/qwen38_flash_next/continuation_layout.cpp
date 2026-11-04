@@ -42,8 +42,9 @@ ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
           row ? cache::ComponentKind::kAppendRows
               : cache::ComponentKind::kPrivateState,
           row,
-          row ? (part == ContinuationPart::kKvarnRecords ? cache::Rows{2}
-                                                         : cache::Rows{256})
+          row ? (part == ContinuationPart::kKvarnRecords ? cache::Rows{1}
+                 : IsPool(part) ? cache::Rows{256} / ratio_
+                                : cache::Rows{256})
               : 0,
           state},
          part,

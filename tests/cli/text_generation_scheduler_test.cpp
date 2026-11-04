@@ -29,6 +29,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
+#include "src/core/hip/kv_block_layout.hpp"
 #include "src/core/json.hpp"
 #include "src/core/platform/env.hpp"
 #include "src/core/platform/os_info.hpp"
@@ -212,6 +213,9 @@ struct FakeControl {
   bool preview_first_token{false};
   std::vector<std::string> output_pieces;
   std::uint32_t max_context{128};
+  std::shared_ptr<gufo::hip::KvBlockAllocator> row_pool;
+  bool retained_progressive_rows{};
+  std::function<void()> cancel_borrower;
   std::optional<std::size_t> stop_after;
   std::optional<std::size_t> eos_after;
   std::function<void()> snapshot_callback;
@@ -222,7 +226,25 @@ public:
   explicit FakeState(std::shared_ptr<FakeControl> control)
       : control_(std::move(control)) {}
 
+  ~FakeState() override { ReleaseRows(); }
+  void ReleaseRows() noexcept {
+    if (control_->row_pool)
+      control_->row_pool->Release(row_blocks);
+    row_blocks.clear();
+    row_reservation.Reset();
+  }
+  void EnsureRows(std::size_t rows) {
+    if (!control_->row_pool)
+      return;
+    const auto need = gufo::hip::KvBlockGeometry::BlocksFor(rows + 4);
+    if (need > row_blocks.size()) {
+      auto fresh = control_->row_pool->Allocate(need - row_blocks.size(),
+                                                &row_reservation);
+      row_blocks.insert(row_blocks.end(), fresh.begin(), fresh.end());
+    }
+  }
   void Invalidate() noexcept override {
+    ReleaseRows();
     control_->RecordInvalidation();
     label = 0;
     position = 0;
@@ -230,6 +252,8 @@ public:
     frontier.reset();
   }
 
+  std::vector<std::uint32_t> row_blocks;
+  gufo::hip::KvBlockReservation row_reservation;
   std::shared_ptr<FakeControl> control_;
   TextRunnerToken label{0};
   std::size_t position{0};
@@ -280,6 +304,37 @@ public:
             },
         .persistence = std::nullopt,
     };
+  }
+
+  RowBlockPool RowBlocks() const override {
+    if (!control_->row_pool)
+      return {};
+    return {.total_blocks = control_->row_pool->blocks(),
+            .free_blocks = control_->row_pool->free_blocks(),
+            .block_rows = 256,
+            .row_guard_rows = 4,
+            .checkpoint_blocks_retained = control_->retained_progressive_rows,
+            .progressive_row_admission = control_->retained_progressive_rows};
+  }
+  void ReserveRowBlocks(TextRunnerState& state,
+                        std::size_t rows) const override {
+    if (!control_->row_pool)
+      return;
+    auto& fake = RequireFakeState(state);
+    const auto target = RowBlocks().AdmissionBlocks(rows, control_->max_context,
+                                                    kRowBlockMargin);
+    fake.row_reservation.Reset();
+    const auto need =
+        target > fake.row_blocks.size() ? target - fake.row_blocks.size() : 0;
+    fake.row_reservation = control_->row_pool->TryReserve(need);
+    if (!fake.row_reservation)
+      throw std::length_error("fake row pool exhausted");
+  }
+  void ReleaseRowBlocks(TextRunnerState& state) const noexcept override {
+    // This fixture has no retained snapshots/live-prefix reuse. A completed
+    // request releases its actual allocator blocks as well as its promise.
+    if (control_->row_pool)
+      RequireFakeState(state).ReleaseRows();
   }
 
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
@@ -391,6 +446,7 @@ public:
       }
     }
 
+    fake.EnsureRows(fake.position + consumed);
     fake.position += consumed;
     const bool ready = fake.position == prompt.size();
     if (ready) {
@@ -499,8 +555,12 @@ public:
       });
     }
 
+    fake.EnsureRows(fake.position + 1);
     ++fake.position;
     ++fake.decode_count;
+    if (fake.label == 1 && fake.decode_count == 12000 &&
+        control_->cancel_borrower)
+      control_->cancel_borrower();
     fake.frontier = token + 1;
     if (fake.label == 1)
       control_->first_request_advance_ns.fetch_add(
@@ -2081,6 +2141,55 @@ void TestDecodeCancellationAndStateReclamation() {
          "decode cancellation invalidates partial model state");
 }
 
+void TestProgressiveRows(bool multi_token, std::uint32_t contexts,
+                         bool cancel_guarantor, bool cancel_borrower = false,
+                         bool retained_progressive = false) {
+  auto control = std::make_shared<FakeControl>();
+  control->retained_progressive_rows = retained_progressive;
+  control->max_context = 32768;
+  control->prefix_reuse = false;
+  control->multi_token_decode = multi_token;
+  control->preview_first_token = multi_token;
+  control->supports_batched_advance = true;
+  control->batched_multi_token_decode = multi_token;
+  control->row_pool =
+      std::make_shared<gufo::hip::KvBlockAllocator>(contexts * 129);
+  control->block_prefill_label = 1;
+  auto scheduler = MakeScheduler(control, 4);
+  auto first = scheduler->Submit({1, 10}, 20000, 0.0F);
+  control->WaitForPrefill(1);
+  auto second = scheduler->Submit({2, 20}, 20000, 0.0F);
+  auto third = scheduler->Submit({3, 30}, 20000, 0.0F);
+  auto fourth = scheduler->Submit({4, 40}, 20000, 0.0F);
+  if (cancel_borrower)
+    control->cancel_borrower = [&] { second.Cancel(); };
+  if (cancel_guarantor)
+    first.Cancel();
+  control->ReleasePrefill();
+  auto a = first.Wait();
+  auto b = second.Wait();
+  auto c = third.Wait();
+  auto d = fourth.Wait();
+  Expect(a.cancelled == cancel_guarantor,
+         "guarantor cancellation is preserved");
+  if (!cancel_guarantor)
+    Expect(a.tokens == ExpectedTokens(1, 20000), "guarantor output exact");
+  Expect(
+      (cancel_borrower ? b.cancelled : b.tokens == ExpectedTokens(2, 20000)) &&
+          c.tokens == ExpectedTokens(3, 20000) &&
+          d.tokens == ExpectedTokens(4, 20000),
+      "bounded borrowers finish without truncation, replay or lost preview");
+  if (contexts == 2 && !cancel_guarantor) {
+    const auto events = control->Events();
+    Expect(EventIndex(events, EventKind::kPrefill, 4) <
+               EventIndex(events, EventKind::kAdvance, 1, 100),
+           "four short prompts enter before the first long output finishes");
+  }
+  Expect(control->row_pool->free_blocks() == contexts * 129 &&
+             control->row_pool->reserved_blocks() == 0,
+         "all physical blocks and reservations return after completion");
+}
+
 void TestFourResidentRequestsMakeProgress() {
   auto control = std::make_shared<FakeControl>();
   auto scheduler = MakeScheduler(control, 4);
@@ -3150,6 +3259,13 @@ int main() {
   TestMetricsDuringCacheAdmission();
   TestSessionStatesFollowAdmittedRequests();
   TestDecodeCancellationAndStateReclamation();
+  for (const bool mtp : {false, true})
+    for (const auto contexts : {1U, 2U})
+      for (const bool cancel : {false, true})
+        TestProgressiveRows(mtp, contexts, cancel);
+  TestProgressiveRows(true, 2, false, true);
+  for (const bool mtp : {false, true})
+    TestProgressiveRows(mtp, 2, false, false, true);
   TestFourResidentRequestsMakeProgress();
   TestRunnerFailureInvalidatesAndDoesNotPoisonReplacement();
   TestDeviceLossIsStickyAndReported();

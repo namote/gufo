@@ -559,16 +559,21 @@ void FakeAdapter::SetRetainRows(bool retain) {
   retain_rows_ = retain;
 }
 bool FakeAdapter::RetainsRows(ComponentId id) const {
-  return retain_rows_ && id == kTarget;
+  return retain_rows_ &&
+         (id == kTarget || (id == kDraft && retained_draft_end_));
 }
 Adapter::RetainedRows FakeAdapter::RetainRows(const Slot& slot, ComponentId id,
                                               Rows first, Rows end) const {
   const auto& state = AsSlot(slot);
   RequireCapture(state);
-  if (!RetainsRows(id) || first >= end || end > state.target.size())
+  const auto& source = id == kDraft ? state.draft : state.target;
+  const auto lower = id == kDraft ? retained_draft_first_ : retained_row_first_;
+  const auto upper = id == kDraft ? retained_draft_end_ : retained_row_limit_;
+  if (!RetainsRows(id) || first >= end || first < lower ||
+      end > source.size() || (upper && end > upper))
     return {};
-  auto rows = std::make_shared<const std::vector<Token>>(
-      state.target.begin() + first, state.target.begin() + end);
+  auto rows = std::make_shared<const std::vector<Token>>(source.begin() + first,
+                                                         source.begin() + end);
   std::shared_ptr<const void> owner(rows, rows->data());
   std::erase_if(retained_, [](const auto& r) { return r.expired(); });
   retained_.push_back(owner);

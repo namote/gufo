@@ -1,6 +1,8 @@
 #ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_CONTINUATION_ADAPTER_HPP_
 #define GUFO_MODELS_QWEN38_FLASH_NEXT_CONTINUATION_ADAPTER_HPP_
 
+#include <mutex>
+
 #include "src/cache/adapter.hpp"
 #include "src/core/hip/transfer_pool.hpp"
 #include "src/models/qwen38_flash_next/continuation_layout.hpp"
@@ -72,12 +74,20 @@ public:
                                              cache::Rows first, cache::Rows end,
                                              std::span<const std::byte>,
                                              cache::Stream&) override;
+  [[nodiscard]] RetainedRows RetainRows(const cache::Slot&, cache::ComponentId,
+                                        cache::Rows,
+                                        cache::Rows) const override;
+  [[nodiscard]] bool RetainsRows(cache::ComponentId) const override;
+  [[nodiscard]] cache::Rows RetainedTokenRows(cache::ComponentId,
+                                              cache::Rows) const override;
+  [[nodiscard]] bool OnlyRetained(const void*) const override;
   [[nodiscard]] bool Validate(
       cache::Slot&, std::span<const cache::ComponentPosition>) override;
   [[nodiscard]] bool Invalidate(cache::Slot&) noexcept override;
 
 private:
   class State;
+  struct RetainedBlock;
   struct Region;
   [[nodiscard]] State& As(cache::Slot&) const;
   [[nodiscard]] const State& As(const cache::Slot&) const;
@@ -91,6 +101,9 @@ private:
       const std::function<void(gufo::hip::TransferStream&)>&);
   [[nodiscard]] Region RowRegion(State&, const ContinuationComponent&,
                                  cache::Rows first, cache::Rows end) const;
+  [[nodiscard]] cache::Rows BlockRows(const ContinuationComponent&) const;
+  mutable std::mutex retained_mutex_;
+  mutable std::vector<std::weak_ptr<RetainedBlock>> retained_;
   std::shared_ptr<Model> model_;
   std::shared_ptr<hip::KvBlockPool> kv_pool_;
   core::SessionMode mode_;

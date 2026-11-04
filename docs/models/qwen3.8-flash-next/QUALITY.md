@@ -1,5 +1,54 @@
 # Qwen3.8 Flash-Next quality
 
+## Native EXL3 vision (2026-11-04)
+
+Native EXL3 vision: K6 Turboderp and K8 Vemloir all 29 stage outputs pass the
+preselected 1% relative RMS gate against independent ExLlamaV3 on 320x224.
+Final 0.6023%/0.6212%; not bit-exact or a broad image-quality benchmark.
+Legacy GGUF 29 stage bytes unchanged. API image+repeat and text smoke pass with
+zero GGUF mappings. [Evidence and limits](../../../plan/exl3/F3-VISION-NATIVE.md).
+
+## Physical GPU KV references, November 4, 2026
+
+K4V4/K6V6/FP16 AR+MTP:88 GPU boundary/reference cases pass. Checks cover
+actual retained pointers, fragmented physical allocation, reverse restore,
+complete component bytes, divergent branches, parent release, nearly-full
+pool restore and allocation-free sharing after row reservation. Shared/private
+frontiers remain independent. Saved K6 numerical32760-position binary matches
+exactly; no weights, arithmetic or quality-gain claim changed.
+
+C4 pressure/cancellation, greedy/seeded MTP,9637-token cache, image and medium
+pass. A branch→image test exposed duplicate-prefix overprotection during KV
+reclaim; a03 selects the actual context-aware cache source and passes the
+13-request affected history. Real disk restart restores4867tokens with no
+prefill. Pi1.5.0 two tasks/seven requests/six successful tools pass, including
+execution of generated Node assertions. CPU scheduler/runner/cache suites and
+geometry/format checks pass; independent review approves. Full256K and matched
+performance qualification remain outside this run. All failures/results and
+limits: [physical-reference report](../../../plan/exl3/F3-KV-REFERENCES.md).
+
+
+## Memory-efficiency candidate, November 3, 2026
+
+CPU budget/concurrency, runner, component cache and scheduler suites pass.
+Coverage includes atomic image/cache claims, claim release, image geometry,
+real host KV allocator exhaustion/promotion with C4, AR and fake3-token MTP,
+preview, cancellation, idle-prefix reclaim and failed reservation growth.
+GPU qualification November4 passes:20 completed HTTP requests plus four
+concurrent unlimited streams and three pressure streams at16K/C4. C1 greedy
+and seeded sampled MTP repeat exactly; C4 is response/progress smoke, not
+cross-batch token equality. Actual draft_limit=7, accepted/rejected drafts,
+9637-token cached replay, cached/cold continuation equality, correct image
+left/right, medium and post-cancel recovery pass. KV waiter25 is promoted and
+resumed after cancelling its guarantor. New categorized memory logs present.
+Evidence: build/memory-efficiency/gpu/http-a03/RESULT.json, pressure.log and
+server logs. Earlier bad HTTP input and stale-scheduler linked image attempts
+are retained separately. Corrected image selected for C2/native256K/K6V6.
+No new GPU errors. Desktop-active timings are observations; no matched
+speedup, new numerical quality gain or full256K inference claim. Existing K6
+numerical evidence below is reused because arithmetic and weights are unchanged.
+
+
 ## K6V6 native context, November 3, 2026
 
 Independent six-bit quantizer/read operators, shared AR/MTP fragmented restore,

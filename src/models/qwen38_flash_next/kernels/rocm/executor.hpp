@@ -139,6 +139,13 @@ public:
   // Stable device table; only newly mapped entries are uploaded before writes.
   void EnsureKvRows(std::uint32_t rows);
   void TrimKvRows(std::uint32_t rows);
+  void PrepareKvRestoreRows(std::uint32_t rows);
+  void EnsureKvRestoreBlock(std::uint32_t logical);
+  void MapKvBlock(std::uint32_t logical, std::uint32_t physical);
+  void UploadKvTable();
+  void UnshareKvRows(std::uint32_t first, std::uint32_t end);
+  void ReleaseMappedKvBlocks(std::size_t first = 0) noexcept;
+  static constexpr std::uint32_t kUnmappedKvBlock = ~std::uint32_t{0};
   std::uint32_t ReserveKvRows(std::uint32_t rows, std::uint32_t margin);
   std::uint32_t ReleaseKvReservation() noexcept;
   [[nodiscard]] std::size_t MappedKvBlocks() const { return kv_blocks_.size(); }
@@ -150,6 +157,15 @@ public:
     return mutation_epoch_;
   }
   [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
+  [[nodiscard]] std::size_t RollbackBytes() const noexcept {
+    return rollback_bytes_;
+  }
+  [[nodiscard]] std::size_t VisionBytes() const noexcept {
+    return vision_input_.Bytes();
+  }
+  [[nodiscard]] std::size_t GraphCount() const noexcept {
+    return graphs_.size();
+  }
   /// PLE rows this session has gathered, including prefetches, since creation.
   [[nodiscard]] NgramTotals NgramRowTotals() const noexcept {
     return ngram_counters_.Load();
@@ -252,6 +268,7 @@ private:
   hip::HostAllocations kv_table_host_owner_;
   std::uint32_t* kv_table_host_{nullptr};
   std::vector<std::uint32_t> kv_blocks_;
+  std::size_t kv_unmapped_blocks_{0};
 
   RollbackRows ple_snapshots_;  ///< [max_spec-1][PleConvHistory()][hc_dim]
   NgramHistory ngram_;

@@ -1,6 +1,50 @@
 # EXL3 / Flash-Next F3 handoff (2026-11-02; native EXL3 qualified)
 
-## Current local profile: K6V6 / native256K (2026-11-03)
+## Native EXL3 vision (2026-11-04)
+
+Gufo direct embedded EXL3 vision is implemented and tested on Turboderp K6
+and Vemloir K8. The permanent Gufo controller selects native-exl3-vision-rocm101
+and no longer mounts/requires the BF16 GGUF projector. Original weights retained.
+Kyojin remains the default; restored run `873264740ec0` is healthy.
+[Results, image identity, numerical limits and artifacts](F3-VISION-NATIVE.md).
+
+## Current default and Flash-Next KV references (2026-11-04)
+
+Latest user switch: Gufo stopped; Kyojin is ready again, run5872fb29bf5c,
+confirmed health source=kyojin. Active/default: native256K,C2,shared512K FP16,
+vision,medium,MTPmix7 at0.0.0.0:18740. Gufo FP16 profile below is preserved
+for its next explicit start; its memory measurements are historical. Stopped
+Gufo continuation cache (~15GiB) was cleared to meet Kyojin disk admission;
+models and user conversation files were retained.
+
+Previous Gufo measurement run used C2, native256K per
+conversation, FP16 shared512K KV, vision, medium/MTP7,0.0.0.0:18740. Kyojin
+is stopped; `llm`/`kyojin` default aliases remain Kyojin. The permanent Gufo
+controller selects `ai-tools/gufo-eval:fn-kv-references-a03-rocm101` and now
+uses FP16 with14,408,908,800B (13.419GiB),2,050 blocks including guards.
+This costs7.296GiB more than the previous K6V6 pool. YaRN remains disabled.
+Run d46df13dd50a passed a bounded memory check: two concurrent2,431/9,011-token
+prompts with96-token output caps, then a224px image with correct red/blue
+answer. Host MemAvailable minimum10.687GiB; after checks10.725GiB. This is
+not a full256K stress/quality/performance comparison. Other scratch/graph/image
+memory can grow; the4GiB host shutdown floor remains. Controller cgroup stats
+omit most UMA GPU allocations and must not substitute for host MemAvailable.
+Receipt: `/home/m2on/.local/share/gufo/fp16-c2-256k-20261104/RESULT.json`.
+Stopped Kyojin's regenerable continuation cache (6.658GiB) was cleared to
+retain existing Gufo disk reserve admission; models and user sessions retained.
+
+Flash-Next now physically shares immutable GPU prefix blocks across branches,
+not only pool capacity. Private recurrent and incomplete frontier state remains
+per conversation. Layout version4 excludes old component disk checkpoints.
+Core88 GPU checks, byte-exact32760 saved-K6 numerics, standard speed observations,
+CPU/review, C4 pressure, branch/image replay, Pi and disk restart all pass.
+A duplicate-prefix reclaim bug found during validation is fixed; failed runs
+are retained. No full256K or matched speedup claim. Keep baseline and candidate
+binaries/Nix10.1 intermediate objects in build/fn-kv-sharing/.
+[Implementation, qualification and limits](F3-KV-REFERENCES.md).
+
+
+## Archived local profile: K6V6 / native256K (2026-11-03)
 
 User requested K6V6 and disabled extended context/YaRN. Global `gufo-start.sh`
 uses permanent `/home/m2on/.local/share/gufo/gufo-server.py`: C2/262144,

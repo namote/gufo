@@ -78,6 +78,9 @@ struct BackingPoolConfig {
   // Asked before each on-demand segment with its bytes; false keeps the pool
   // at its current size, for example to leave host memory to the OS.
   std::function<bool(std::size_t)> admit_segment;
+  // Optional process-wide promise held until physical commit completes, so
+  // request admission cannot spend an in-flight segment's memory. Null denies.
+  std::function<std::shared_ptr<void>(std::size_t)> reserve_segment;
 };
 
 class CommittedBackingPool {

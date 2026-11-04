@@ -73,6 +73,19 @@ public:
   // Target chunks retained as immutable copies outside any ledger, standing
   // in for device storage a backend keeps for checkpoints.
   void SetRetainRows(bool);
+  // Synthetic non-token component units for admission accounting tests.
+  void SetRetainedRowUnits(Rows limit, Rows tokens_per_row, Rows first = 0) {
+    retained_row_first_ = first;
+    retained_row_limit_ = limit;
+    retained_tokens_per_row_ = tokens_per_row;
+  }
+  void SetRetainedDraftRange(Rows first, Rows end) {
+    retained_draft_first_ = first;
+    retained_draft_end_ = end;
+  }
+  [[nodiscard]] Rows RetainedTokenRows(ComponentId, Rows rows) const override {
+    return rows * retained_tokens_per_row_;
+  }
   [[nodiscard]] RetainedRows RetainRows(const Slot&, ComponentId, Rows,
                                         Rows) const override;
   [[nodiscard]] bool RetainsRows(ComponentId) const override;
@@ -127,6 +140,11 @@ private:
   bool fail_allocation_{false};
   bool predict_checkpoints_{true};
   bool retain_rows_{false};
+  Rows retained_row_limit_{};
+  Rows retained_row_first_{};
+  Rows retained_draft_first_{};
+  Rows retained_draft_end_{};
+  Rows retained_tokens_per_row_{1};
   mutable std::vector<std::weak_ptr<const void>> retained_;
   bool fail_transfer_{false};
   std::atomic<std::size_t> invalidations_{};

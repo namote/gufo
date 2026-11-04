@@ -127,8 +127,8 @@ public:
                                                 Rows) const {
     return {};
   }
-  // Pure query: completed chunks of this component can be retained (above),
-  // so a capture needs no RAM for them.
+  // Pure capability query. RetainRows may still refuse incomplete physical
+  // blocks or frontiers whose other planes are not yet immutable.
   [[nodiscard]] virtual bool RetainsRows(ComponentId) const { return false; }
   // Retained rows (by their first byte) whose storage no slot holds: only
   // checkpoints keep it, so dropping them returns it to the backend.
@@ -173,6 +173,11 @@ public:
   // and leave a valid empty slot ready for cold prefill. Destruction instead
   // drains all outstanding slot transfers before the nonthrowing release path.
   [[nodiscard]] virtual bool Invalidate(Slot&) noexcept = 0;
+  // Convert a retained append-row frontier to token rows for pool admission.
+  // Compressed records and pooled indexer rows need model-specific units.
+  [[nodiscard]] virtual Rows RetainedTokenRows(ComponentId, Rows rows) const {
+    return rows;
+  }
 };
 
 }  // namespace gufo::cache

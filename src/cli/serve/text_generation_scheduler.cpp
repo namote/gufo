@@ -32,6 +32,7 @@ namespace gufo::server {
 namespace {
 
 constexpr std::size_t kDecodeProgressInterval = 50;
+constexpr std::size_t kKvDecodeWindow = 4096;
 constexpr std::size_t kNoSession = std::numeric_limits<std::size_t>::max();
 
 struct OutputBudget {
@@ -620,6 +621,7 @@ struct TextGenerationScheduler::Impl {
 
   void LogDecodeProgress(const std::shared_ptr<ScheduledRequest>& request,
                          bool final = false) const noexcept {
+    request->runner_request.LogMemory("decode");
     if (!scheduler_policy.log_progress || !Logger::Enabled(LogLevel::kInfo)) {
       return;
     }
@@ -1169,21 +1171,22 @@ struct TextGenerationScheduler::Impl {
              std::deque<std::shared_ptr<ScheduledRequest>>& decoding,
              std::deque<std::shared_ptr<ScheduledRequest>>& capturing,
              std::deque<std::shared_ptr<ScheduledRequest>>& waiting,
-             const std::stop_token& stop_token) {
+             const std::stop_token& stop_token, std::size_t kv_waiting_count) {
     UpdateWaiting(waiting);
     const std::array<const std::deque<std::shared_ptr<ScheduledRequest>>*, 2>
         residents{&prefilling, &capturing};
     // Captures retain their runner lease until decoding resumes.
-    while (!stop_token.stop_requested() &&
-           prefilling.size() + decoding.size() + capturing.size() <
-               runner_pool->capacity()) {
+    while (!stop_token.stop_requested() && prefilling.size() + decoding.size() +
+                                                   capturing.size() +
+                                                   kv_waiting_count <
+                                               runner_pool->capacity()) {
       auto request = PopReleased(waiting);
       if (request == nullptr) {
         // Parked followers already reserve a visible admission session. They
         // may resume in place, but new arrivals must respect those
         // reservations.
         if (prefilling.size() + decoding.size() + capturing.size() +
-                waiting.size() >=
+                kv_waiting_count + waiting.size() >=
             runner_pool->capacity())
           return;
         request = PopQueued();
@@ -1215,10 +1218,18 @@ struct TextGenerationScheduler::Impl {
           }
         }
 
-        if (!runner_pool->AdmissionReady(request->prompt, request->token_limit,
-                                         request->prompt_context.get(),
-                                         request->cache_prompt,
-                                         request->cache_prefix_tokens)) {
+        const auto guarantor = kv_guarantor.lock();
+        const bool full_rows =
+            !ProgressiveRows() || !guarantor || IsTerminal(guarantor);
+        const auto row_limit =
+            full_rows && ProgressiveRows()
+                ? runner_pool->runner().Descriptor().max_context
+            : ProgressiveRows()
+                ? std::min(request->token_limit, kKvDecodeWindow)
+                : request->token_limit;
+        if (!runner_pool->AdmissionReady(
+                request->prompt, row_limit, request->prompt_context.get(),
+                request->cache_prompt, request->cache_prefix_tokens)) {
           // The row pool cannot hold this request until residents finish.
           // Retry on a later pass so they keep decoding meanwhile.
           waiting.push_front(std::move(request));
@@ -1243,7 +1254,9 @@ struct TextGenerationScheduler::Impl {
           CompleteCancelled(request);
           continue;
         }
-        request->runner_request.ReserveRows(request->token_limit);
+        request->runner_request.ReserveRows(row_limit);
+        if (ProgressiveRows() && full_rows)
+          kv_guarantor = request;
 
         request->result.component_cache =
             request->runner_request.component_cache_metrics();
@@ -1269,7 +1282,9 @@ struct TextGenerationScheduler::Impl {
                                        Clock::now() - request->request_start)
                                        .count();
         request->result.resident_requests_at_admission =
-            prefilling.size() + decoding.size() + capturing.size() + 1;
+            prefilling.size() + decoding.size() + capturing.size() +
+            kv_waiting_count + 1;
+        request->runner_request.LogMemory("admission", true);
         PublishAdmission(request);
         PublishPromptProgress(request);
         request->phase.store(TextRequestPhase::kAdmitted,
@@ -1342,6 +1357,7 @@ struct TextGenerationScheduler::Impl {
       ++request->result.prefill_chunks;
       request->result.max_prefill_chunk_tokens = std::max(
           request->result.max_prefill_chunk_tokens, step.consumed_tokens);
+      request->runner_request.LogMemory("prefill");
       LogPrefillProgress(request, step.consumed_tokens, step_ms);
       PublishPromptProgress(request);
 
@@ -1517,7 +1533,8 @@ struct TextGenerationScheduler::Impl {
       const std::size_t remaining =
           request->token_limit - request->result.tokens.size() +
           (request->preview_token.has_value() ? 1 : 0);
-      const auto step = request->runner_request.DecodeStep(remaining);
+      const auto step = request->runner_request.DecodeStep(
+          std::min(remaining, request->runner_request.ReservedDecodeTokens()));
       request->result.draft_rounds += step.draft_rounds;
       request->result.draft_tokens += step.draft_tokens;
       request->result.draft_accepted_tokens += step.draft_accepted_tokens;
@@ -1779,7 +1796,8 @@ struct TextGenerationScheduler::Impl {
     max_tokens.reserve(prepared.size());
     for (const auto& item : prepared) {
       runner_requests.push_back(&item.request->runner_request);
-      max_tokens.push_back(item.remaining);
+      max_tokens.push_back(std::min(
+          item.remaining, item.request->runner_request.ReservedDecodeTokens()));
     }
 
     std::vector<TextDecodeStep> steps;
@@ -1934,10 +1952,113 @@ struct TextGenerationScheduler::Impl {
     waiting.clear();
   }
 
+  bool ProgressiveRows() const {
+    const auto rows = runner_pool->runner().RowBlocks();
+    return rows.block_rows != 0 &&
+           (!rows.checkpoint_blocks_retained || rows.progressive_row_admission);
+  }
+
+  void RenewRows(std::deque<std::shared_ptr<ScheduledRequest>>& prefilling,
+                 std::deque<std::shared_ptr<ScheduledRequest>>& decoding,
+                 std::deque<std::shared_ptr<ScheduledRequest>>& capturing,
+                 std::deque<std::shared_ptr<ScheduledRequest>>& blocked) {
+    if (!ProgressiveRows())
+      return;
+    for (auto it = blocked.begin(); it != blocked.end();) {
+      if (CompleteIfStopped(*it))
+        it = blocked.erase(it);
+      else
+        ++it;
+    }
+    auto guarantor = kv_guarantor.lock();
+    if (!guarantor || IsTerminal(guarantor)) {
+      kv_guarantor.reset();
+      guarantor.reset();
+      // Completed requests may still own an idle cached frontier. Growth
+      // reclaims those rows before promoting the oldest eligible resident.
+      std::vector<std::shared_ptr<ScheduledRequest>> residents;
+      for (const auto* queue : {&prefilling, &decoding, &capturing, &blocked})
+        residents.insert(residents.end(), queue->begin(), queue->end());
+      std::ranges::sort(residents, {}, &ScheduledRequest::id);
+      for (const auto& request : residents) {
+        if (IsTerminal(request) || request->runner_request.SnapshotPending())
+          continue;
+        try {
+          if (!runner_pool->TryGrowRows(
+                  request->runner_request,
+                  runner_pool->runner().Descriptor().max_context))
+            continue;
+          kv_guarantor = guarantor = request;
+          Logger::Info("memory", "event=kv_guarantor request=" +
+                                     std::to_string(request->id));
+          break;
+        } catch (...) {
+          CompleteFailure(request, std::current_exception());
+        }
+      }
+    }
+    // Park only decoders; every prefill was admitted with its entire prompt.
+    // Never release/reacquire their lease: RNG, preview and MTP state survive.
+    for (std::size_t n = decoding.size(); n; --n) {
+      auto request = std::move(decoding.front());
+      decoding.pop_front();
+      if (CompleteIfStopped(request))
+        continue;
+      const auto generated = request->result.tokens.size();
+      bool ready = true;
+      try {
+        if (request != guarantor && generated < request->token_limit &&
+            request->runner_request.ReservedDecodeTokens() < 256) {
+          ready = guarantor &&
+                  runner_pool->TryGrowRows(
+                      request->runner_request,
+                      generated + std::min(kKvDecodeWindow,
+                                           request->token_limit - generated));
+        }
+      } catch (...) {
+        CompleteFailure(request, std::current_exception());
+        continue;
+      }
+      if (ready)
+        decoding.push_back(std::move(request));
+      else {
+        Logger::Info("memory",
+                     "event=kv_wait request=" + std::to_string(request->id));
+        blocked.push_back(std::move(request));
+      }
+    }
+    for (auto it = blocked.begin(); it != blocked.end();) {
+      const auto& request = *it;
+      bool ready = request == guarantor;
+      try {
+        const auto generated = request->result.tokens.size();
+        ready = ready ||
+                (guarantor &&
+                 runner_pool->TryGrowRows(
+                     request->runner_request,
+                     generated + std::min(kKvDecodeWindow,
+                                          request->token_limit - generated)));
+      } catch (...) {
+        CompleteFailure(request, std::current_exception());
+        it = blocked.erase(it);
+        continue;
+      }
+      if (ready) {
+        request->decode_due = true;
+        Logger::Info("memory",
+                     "event=kv_resume request=" + std::to_string(request->id));
+        decoding.push_back(request);
+        it = blocked.erase(it);
+      } else
+        ++it;
+    }
+  }
+
   void Run(const std::stop_token& stop_token) noexcept {
     std::deque<std::shared_ptr<ScheduledRequest>> prefilling;
     std::deque<std::shared_ptr<ScheduledRequest>> decoding;
     std::deque<std::shared_ptr<ScheduledRequest>> capturing;
+    std::deque<std::shared_ptr<ScheduledRequest>> kv_waiting;
     // Cold requests waiting for a resident prefill of their shared prefix.
     std::deque<std::shared_ptr<ScheduledRequest>> waiting;
     // Sessions idle for the write-back delay are written to disk while others
@@ -1974,7 +2095,16 @@ struct TextGenerationScheduler::Impl {
           }
         }
       }
-      Admit(prefilling, decoding, capturing, waiting, stop_token);
+      RenewRows(prefilling, decoding, capturing, kv_waiting);
+      // A retiring guarantor's asynchronous cache write must finish before
+      // more borrowers are admitted. Its existing peers retain their leases.
+      const auto guarantor = kv_guarantor.lock();
+      if (!ProgressiveRows() ||
+          (prefilling.empty() && decoding.empty() && capturing.empty() &&
+           kv_waiting.empty()) ||
+          (guarantor && !IsTerminal(guarantor)))
+        Admit(prefilling, decoding, capturing, waiting, stop_token,
+              kv_waiting.size());
       if (device_lost.load(std::memory_order_acquire))
         break;
       if (prefilling.empty() && decoding.empty()) {
@@ -1982,9 +2112,10 @@ struct TextGenerationScheduler::Impl {
         const auto wake = [&] {
           return stop_token.stop_requested() || stopping ||
                  (queued_count != 0 &&
-                  capturing.size() + waiting.size() < runner_pool->capacity());
+                  capturing.size() + waiting.size() + kv_waiting.size() <
+                      runner_pool->capacity());
         };
-        if (capturing.empty() && waiting.empty()) {
+        if (capturing.empty() && waiting.empty() && kv_waiting.empty()) {
           // Only the idle wait has a timer. Arrival interrupts it immediately;
           // active work units add one clock read per loop (idle write-back)
           // and no device polling.
@@ -2135,11 +2266,14 @@ struct TextGenerationScheduler::Impl {
         }
       }
     }
+    for (auto& request : kv_waiting)
+      decoding.push_back(std::move(request));
     for (auto& request : capturing)
       decoding.push_back(std::move(request));
     CancelRemaining(prefilling, decoding, waiting);
   }
 
+  std::weak_ptr<ScheduledRequest> kv_guarantor;
   std::shared_ptr<TextRunnerPool> runner_pool;
   TextPrefillPolicy prefill_policy;
   TextSchedulerPolicy scheduler_policy;

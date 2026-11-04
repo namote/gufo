@@ -1,5 +1,71 @@
 # gfx1151 optimization know-how
 
+## Native EXL3 vision, November 4, 2026
+
+Embedded vision now loads directly from native packs. Strict geometry and
+selected-tensor identity, split QKV precedence, FP16 operands/FP32 residuals
+and padded FFN channels preserve the pack's numerical contract. K6 uses the
+shared packed GEMM; K8 uses one temporary decoded-inner slab, never a permanent
+dense encoder copy. Image admission includes the additional scratch.
+
+K6/K8 independent same-pack vision comparison: all 29 stages pass 1% relative RMS
+on 320x224; final 0.6023%/0.6212%. Existing GGUF all 29 stages byte-exact against
+retained baseline. Full Gufo C2/native 256K image+repeat succeeds without any
+GGUF mappings,91/91 cached tokens and 0 prefill on repeat. K6 vision residence
+352601088B vs historical BF16 903984064 B saves 525.84 MiB; no matched speed claim.
+[Scope, provenance, failures and limits](../plan/exl3/F3-VISION-NATIVE.md).
+
+## Request memory budgeting and KV admission candidate, November 3, 2026
+
+Fixed physical KV capacity is independent of concurrency. For Flash-Next's
+host-only checkpoints, keep one active request entitled to a full context;
+peers reserve their prompt plus4096 output tokens and pause before growing
+past their window. Promote a resident after the guarantor finishes. Reclaim
+idle rows with reuse=false when growing an already acquired lease: protecting
+a duplicate idle prefix here can deadlock promotion. Do not apply this policy
+to device-reference checkpoints without qualifying their shared-row accounting.
+
+Image admission uses actual prepared dimensions, summed persistent embeddings
+and the maximum serialized encoder scratch. Keep request promises through
+completion and cache-segment promises through physical commit. Both consult
+current free memory with4GiB headroom. A background callback must not read
+mutable executor scratch pointers; capture a conservative bound instead.
+Already materialized images are conservatively double-counted until request
+completion. BLAS workspace and other lazy allocations are not fully measured.
+Memory logs separate budgets, device totals/subsets, graph counts, host vector
+capacity, cache ledger categories, RSS and host/device free; graph bytes remain
+unmeasured. They run at admission/release and at most once per10seconds.
+
+Candidate CPU checks: request_memory_budget_test, text_model_runner_test,
+component_text_cache_test and text_generation_scheduler_test pass (50.23s).
+Actual host block allocator exercises C4 on one/two-context pools,20K outputs,
+AR/fake3-token-MTP, preview, promotion and cancellation; matching idle-prefix
+reclaim and failed growth reservation preservation pass. This is not actual
+7-draft GPU/RNG, multimodal or performance qualification. Existing baselines
+and Nix10.1 intermediates retained. Candidate evidence: build/memory-efficiency/.
+GPU qualification on November4 passed at16K/C4/two-context pool: four
+unlimited-output streams admitted together and cancelled;20 completed requests
+cover C1 greedy/seeded MTP exact replay, C4 response smoke,9637-token cache and
+continuation, vision left/right and medium. Three live streams reached real
+reservation pressure: request25 waited, then was promoted/resumed after the
+guarantor was cancelled. MTP draft_limit=7 and accepted/rejected drafts observed.
+No new GPU errors; compute owners released. Exit quiet flag is false because
+desktop GPU busy=11%, so timings remain advisory, not matched qualification.
+Long cold prefill8082ms; exact cached replay0ms prefill/140ms total;
+continuation cached285ms vs cold8302ms, same output. These are different cache
+histories, not candidate-vs-baseline speedups. Full256K inference not repeated.
+Evidence: build/memory-efficiency/gpu/http-a03/ and its retained server logs.
+
+Incremental link maps must normalize compile output paths: the first candidate
+compiled the new scheduler but linked a retained old relative-path object.
+That attempt is INVALID_ARTIFACT (not engine failure); LINK-a01.json and the
+old image are retained. Corrected LINK.json asserts all five changed objects
+occur exactly once. The earlier HTTP max_tokens=-1 attempt was invalid input;
+omit the HTTP field to inherit the server's unlimited default. Both failed
+attempts remain recorded. Default launch image is the corrected candidate;
+C2/native256K/K6V6/vision/medium/MTP and the fixed6.123GiB pool are retained.
+
+
 ## Flash-Next K6V6 KV, November 3, 2026
 
 Implemented explicit K6V6 token-major KVarN with existing low-nibble words
@@ -1490,6 +1556,34 @@ the precise allocator cause. No new correctness/speed claim; existing
 prefill/TG/MTP implementation and saved baselines remain selected.
 [Scope, patches and resources](../plan/exl3/F3-PREFILL-LIVE-TILES.md).
 
+## Flash-Next physical prefix references, November 4, 2026
+
+The pool below originally shared capacity, with exclusive per-session blocks.
+It now shares physical immutable prefix blocks as Gufo27B does. Retain only
+blocks complete in target, draft and pooled-indexer planes: the sparse
+transition writes an old pooled backlog, and capturing a writable frontier
+after admission otherwise creates unreserved COW debt. KVarN append group0
+maps to physical group1, so use one-group chunks; pooled keys use64-row chunks
+for256-token blocks. COW copies every plane/layer and keeps the device table
+pointer stable. Recurrent/raw/sink/tail state stays private.
+
+For admission, intersect retained token ranges across planes and align to
+whole blocks; do not lose later GPU capacity behind early RAM chunks. Reclaim
+only preserves the actually selected context-aware checkpoint/live frontier.
+Protecting every token-prefix match retained duplicate cold histories and
+rejected a valid image branch with a misleading context-length400. a03 fixes
+this; failures and the targeted replay remain preserved.
+
+88 GPU cases (K4/K6/FP16 AR+MTP) and exact32760 saved-K6 numerical records pass;
+new reservations followed by capture incur zero COW debt. CPU tests include
+mixed row units, disjoint spans, cross-plane intersection and image-aware
+reclaim. C4 pressure/resume,13 branch/image requests, disk4867+0 prefill and
+Pi2tasks/6tools pass. PP2048/8192=1372.59/1398.58, AR d0/d32K=24.30/23.59,
+MTP=33.90/76.67tok/s vs saved K6=1374.42/1403.11,24.33/23.58,35.66/76.06.
+Desktop-active timing is advisory; no baseline rerun or full256K replay.
+Pool backing size is unchanged; sharing reduces duplicate block occupancy.
+[Full evidence and limits](../plan/exl3/F3-KV-REFERENCES.md).
+
 ## Flash-Next shared K4V4 pool, November 2, 2026
 
 Retained: existing KvBlockPool shared across sessions, with exclusive blocks,
@@ -1513,3 +1607,18 @@ Actual C4 HTTP,12K long context, process-restart disk restore12352+7 tokens
 (0.486s, same output), Pi1.4.0 three tasks/nine tools pass. Cold/warm identity
 startup85.34/35.15s. Current image4757e04f, Nix10.1 incremental objects retained.
 [All results and provenance](../plan/exl3/F3-SHARED-KV.md).
+
+
+### 2026-11-04: Gufo FP16/native256K/C2 serving memory
+
+User-requested precision switch on the already qualified Flash-Next KV-sharing
+image `fn-kv-references-a03-rocm101`; no kernel/build/baseline rerun. The shared
+FP16 pool is14,408,908,800B=13.419GiB (2,050×7,028,736B),+7.296GiB over K6V6.
+Vision, medium and MTP7 remain enabled. Two concurrent2,431/9,011-token prompts
+with96-token output caps and one224px image (90tokens, correct red/blue answer)
+completed; host MemAvailable minimum10.687GiB over70 half-second samples and
+after checks10.725GiB. Not a full256K worst-case test or speed/quality comparison.
+KV backing is allocated, but scratch/graphs/images can grow. Keep the4GiB host
+shutdown floor visible; cgroup memory excludes most UMA GPU allocations.
+Gufo remains ready, run d46df13dd50a; Kyojin stopped,default alias unchanged.
+Evidence: `/home/m2on/.local/share/gufo/fp16-c2-256k-20261104/RESULT.json`.

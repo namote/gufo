@@ -1000,6 +1000,139 @@ void CheckSharedKvarn(const std::shared_ptr<qfn::Model>& model, bool mtp,
   Require(pool->free_blocks() == pool->blocks(), "shared reset leaked blocks");
 }
 
+void CheckSharedReferences(const std::shared_ptr<qfn::Model>& model, bool mtp,
+                           std::span<const std::int32_t> prompt,
+                           bool reservation_only = false) {
+  const auto mode = mtp ? gufo::core::SessionMode::kSpeculative
+                        : gufo::core::SessionMode::kAutoregressive;
+  constexpr std::uint32_t context = 8192;
+  const auto geometry = model->KvGeometry(mode, context);
+  auto pool = std::make_shared<gufo::hip::KvBlockPool>(
+      std::vector<gufo::hip::KvBlockPlane>(geometry.planes().begin(),
+                                           geometry.planes().end()),
+      geometry.blocks() * 2);
+  qfn::ContinuationAdapter adapter(model, mode, context, {'r', 'e', 'f'}, pool);
+  gufo::hip::TransferPool streams(2);
+  std::array<Guard, 4> guards;
+  std::array<std::unique_ptr<cache::Slot>, 4> slots;
+  for (std::size_t i = 0; i < slots.size(); ++i)
+    slots[i] = adapter.CreateSlot(guards[i]);
+  struct Piece {
+    cache::Rows first, end;
+    cache::Adapter::RetainedRows rows;
+  };
+  std::string error;
+  for (const auto boundary :
+       {251U, 255U, 256U, 383U, 384U, 2048U, 2049U, 2304U, 4096U}) {
+    if (reservation_only && boundary != 251 && boundary != 4096)
+      continue;
+    for (auto& slot : slots)
+      Require(adapter.Invalidate(*slot), "reference fixture reset failed");
+    auto& parent = adapter.GetSession(*slots[0]);
+    Require(parent.Sync(prompt.first(17), &error), error);
+    Require(adapter.GetSession(*slots[3]).Sync(prompt.first(17), &error),
+            error);
+    Require(parent.Sync(prompt.first(boundary), &error), error);
+    // Production reserves before checkpoint capture. Retaining this prefix
+    // must not add an unreserved copy-on-write obligation.
+    adapter.ReserveKvRows(*slots[0], boundary + 32, 2);
+    const auto saved = Capture(adapter, *slots[0], streams);
+    std::vector<std::vector<Piece>> pieces(adapter.Components().size());
+    std::size_t retained = 0;
+    for (const auto& d : adapter.Components()) {
+      if (!d.row_bytes)
+        continue;
+      const auto end = saved.positions[d.id.value - 1].valid_rows;
+      for (cache::Rows first = 0; first < end; first += d.rows_per_chunk) {
+        const auto last = std::min(end, first + d.rows_per_chunk);
+        auto rows = last - first == d.rows_per_chunk
+                        ? adapter.RetainRows(*slots[0], d.id, first, last)
+                        : cache::Adapter::RetainedRows{};
+        retained += bool(rows.owner);
+        pieces[d.id.value - 1].push_back({first, last, std::move(rows)});
+      }
+    }
+    if (boundary <= 2048)
+      Require(retained == 0,
+              "dense indexer backlog was retained before completion");
+    if (boundary >= 2304)
+      Require(retained > 0, "completed shared prefix has no retained GPU rows");
+    const auto restore = [&](cache::Slot& slot) {
+      adapter.BeginRestore(slot, saved.positions);
+      for (std::size_t i = adapter.Components().size(); i-- > 0;) {
+        const auto& d = adapter.Components()[i];
+        if (!d.row_bytes) {
+          auto stream = streams.TryAcquire();
+          Wait(adapter.LoadPrivate(slot, d.id, saved.bytes[i], *stream));
+          continue;
+        }
+        for (const auto& piece : pieces[i]) {
+          auto stream = streams.TryAcquire();
+          const auto bytes =
+              piece.rows.owner
+                  ? std::span(
+                        static_cast<const std::byte*>(piece.rows.owner.get()),
+                        piece.rows.bytes)
+                  : std::span<const std::byte>(saved.bytes[i])
+                        .subspan(piece.first * d.row_bytes,
+                                 (piece.end - piece.first) * d.row_bytes);
+          Wait(adapter.CopyRowsIn(slot, d.id, piece.first, piece.end, bytes,
+                                  *stream));
+        }
+      }
+      Require(adapter.Validate(slot, saved.positions),
+              "retained restore rejected");
+      Require(Capture(adapter, slot, streams).bytes == saved.bytes,
+              "retained restore changed component bytes");
+    };
+    // Only two free blocks: eager allocation of a duplicate prefix cannot fit.
+    const auto before = pool->free_blocks();
+    auto filler =
+        retained ? pool->Allocate(before - 2) : std::vector<std::uint32_t>{};
+    restore(*slots[1]);
+    pool->Release(filler);
+    if (retained)
+      Require(before - pool->free_blocks() <= 2,
+              "restored branch allocated duplicate shared prefix blocks");
+    restore(*slots[2]);
+    auto& child = adapter.GetSession(*slots[1]);
+    auto& sibling = adapter.GetSession(*slots[2]);
+    adapter.ReserveKvRows(*slots[1], boundary + 32, 2);
+    auto growth_filler = pool->Allocate(pool->free_blocks());
+    const auto decode_reserved = [&](std::size_t index, qfn::Session& session) {
+      const auto reserved = pool->reserved_blocks();
+      const auto mapped = adapter.MappedKvBlocks(*slots[index]);
+      auto result = Decode(session, 12, boundary == 2049);
+      Require(reserved - pool->reserved_blocks() ==
+                  adapter.MappedKvBlocks(*slots[index]) - mapped,
+              "checkpoint capture introduced reserved COW debt");
+      return result;
+    };
+    const auto expected = decode_reserved(0, parent);
+    Require(decode_reserved(1, child) == expected,
+            "shared-reference AR/MTP replay changed output");
+    pool->Release(growth_filler);
+    adapter.ReleaseKvReservation(*slots[0]);
+    adapter.ReleaseKvReservation(*slots[1]);
+    SameLogits(parent, child);
+    Require(Capture(adapter, *slots[2], streams).bytes == saved.bytes,
+            "parent or child append mutated the untouched sibling");
+    Require(sibling.Evaluate(prompt[boundary + 1], &error), error);
+    (void)Decode(sibling, 3, false);
+    restore(*slots[2]);
+    // Retained checkpoint bytes survive divergent writes and source release.
+    Require(adapter.Invalidate(*slots[0]), "source release failed");
+    restore(*slots[1]);
+    pieces.clear();
+    for (auto& slot : slots)
+      Require(adapter.Invalidate(*slot), "reference final reset failed");
+    Require(pool->free_blocks() == pool->blocks(),
+            "retained GPU references leaked blocks");
+    std::cout << (mtp ? "MTP" : "AR") << ",shared_references," << boundary
+              << ",retained=" << retained << ",PASS" << std::endl;
+  }
+}
+
 void CheckLearnedDraftPolicy(const std::shared_ptr<qfn::Model>& model) {
   namespace qt = gufo::tokenization;
   gufo::hip::TransferPool streams(2);
@@ -1040,9 +1173,13 @@ void CheckLearnedDraftPolicy(const std::shared_ptr<qfn::Model>& model) {
 }
 }  // namespace
 int main(int argc, char** argv) {
+  const bool reservation_only =
+      argc == 6 && std::string_view(argv[5]) == "--shared-reservation-only";
   const bool shared_kvarn_only =
-      argc == 6 && (std::string_view(argv[5]) == "--shared-kvarn-only" ||
-                    std::string_view(argv[5]) == "--shared-k6v6-only");
+      argc == 6 &&
+      (std::string_view(argv[5]) == "--shared-kvarn-only" ||
+       std::string_view(argv[5]) == "--shared-k6v6-only" ||
+       std::string_view(argv[5]) == "--shared-fp16-only" || reservation_only);
   const int kvarn_bits =
       argc == 6 && std::string_view(argv[5]) == "--shared-k6v6-only" ? 6 : 4;
   const bool guard_only =
@@ -1067,12 +1204,14 @@ int main(int argc, char** argv) {
   }
   try {
     std::string error;
-    auto model = qfn::Model::Load(argv[2],
-                                  {.max_context = 16384,
-                                   .mtp_model_path = argv[4],
-                                   .kvarn = shared_kvarn_only,
-                                   .kvarn_bits = kvarn_bits},
-                                  &error);
+    auto model = qfn::Model::Load(
+        argv[2],
+        {.max_context = 16384,
+         .mtp_model_path = argv[4],
+         .kvarn = shared_kvarn_only &&
+                  std::string_view(argv[5]) != "--shared-fp16-only",
+         .kvarn_bits = kvarn_bits},
+        &error);
     Require(bool(model), error);
     if (policy_only) {
       CheckLearnedDraftPolicy(model);
@@ -1091,8 +1230,12 @@ int main(int argc, char** argv) {
     for (std::size_t i = 0; i < prompt.size(); ++i)
       prompt[i] = pattern[i % pattern.size()];
     if (shared_kvarn_only) {
-      CheckSharedKvarn(model, false, prompt);
-      CheckSharedKvarn(model, true, prompt);
+      if (model->Kvarn() && !reservation_only) {
+        CheckSharedKvarn(model, false, prompt);
+        CheckSharedKvarn(model, true, prompt);
+      }
+      CheckSharedReferences(model, false, prompt, reservation_only);
+      CheckSharedReferences(model, true, prompt, reservation_only);
       return 0;
     }
     // The repeated prefix can accept every draft. End the

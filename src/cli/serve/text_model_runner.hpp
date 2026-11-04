@@ -439,6 +439,9 @@ public:
     std::size_t row_guard_rows{0};
     // Qwen checkpoints retain device blocks; host-only snapshots do not.
     bool checkpoint_blocks_retained{true};
+    // Complete shared prefixes stay immutable across later captures; growth
+    // needs only new blocks, with no deferred frontier COW reservation debt.
+    bool progressive_row_admission{false};
     [[nodiscard]] std::size_t MappedBlocks(std::size_t rows) const {
       return rows && block_rows
                  ? (rows + row_guard_rows + block_rows - 1) / block_rows
@@ -583,6 +586,22 @@ public:
   virtual void RestorePersistentSnapshot(
       TextRunnerState& state, std::span<const std::uint8_t> payload) const;
 
+  /// Named physical counters/budgets for diagnostics, never a fabricated total.
+  [[nodiscard]] virtual std::string MemoryReport(const TextRunnerState&) const {
+    return {};
+  }
+  /// Request-specific lazy storage, reserved before any cache restore/input
+  /// allocation. Null means no additional storage. Current physical free
+  /// memory must include retained idle slots, independently of this token.
+  [[nodiscard]] virtual bool RequestMemoryReady(
+      const TextPromptContext*) const {
+    return true;
+  }
+  [[nodiscard]] virtual std::shared_ptr<void> ReserveRequestMemory(
+      const TextPromptContext*) const {
+    return {};
+  }
+
 private:
   mutable std::mutex constraint_mutex_;
   mutable std::shared_ptr<const sampling::ConstraintVocabulary>
@@ -660,7 +679,10 @@ public:
     /// `max_new_tokens` more, capped at the context. Throws
     /// std::length_error when the row pool lacks them.
     void ReserveRows(std::size_t max_new_tokens);
+    /// Remaining output covered by the current row reservation.
+    [[nodiscard]] std::size_t ReservedDecodeTokens() const noexcept;
 
+    void LogMemory(std::string_view reason, bool force = false) const noexcept;
     void PrepareBatchExecution();
     [[nodiscard]] TextPrefillStep Prefill(std::size_t max_input_tokens);
     [[nodiscard]] TextDecodeSelection SelectNext();
@@ -716,6 +738,9 @@ public:
                                     const TextPromptContext* context = nullptr,
                                     bool reuse_prompt = true,
                                     std::size_t cache_prefix_tokens = 0);
+  /// Grow a live reservation, reclaiming idle rows when necessary. A false
+  /// result keeps the existing reservation and execution state unchanged.
+  [[nodiscard]] bool TryGrowRows(Request& request, std::size_t max_new_tokens);
   /// Blocks an admission of `rows` holds; zero without paged rows.
   [[nodiscard]] std::size_t AdmissionRowBlocks(std::size_t rows) const;
   /// Writes idle sessions' live frontiers to the disk cache (component cache

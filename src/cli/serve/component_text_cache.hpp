@@ -146,20 +146,23 @@ public:
   // only they use are dropped, lowest retention priority first. Then live
   // frontiers, a frontier some checkpoint covers before the only copy of its
   // work, oldest first; without device row retention an uncovered one is
-  // captured first. With `reuse` the request may restore its prefix
-  // checkpoints and continue a live frontier, so those are kept: their rows
-  // serve it. A slot is reset at most once per call, and not again until it
-  // is leased; its borrowed checkpoint rows are preserved as on any cold
-  // reassignment. `enough` runs without the cache lock.
-  [[nodiscard]] RowReclaim ReclaimRows(std::span<const ContinuationToken>,
-                                       bool reuse,
-                                       const std::function<bool()>& enough);
+  // captured first. With `reuse`, only the actually selected checkpoint or
+  // live frontier is kept, using the same input identity/stable boundary as
+  // Acquire. Other token-equal histories may own duplicate physical blocks. A
+  // slot is reset at most once per call, and not again until it is leased; its
+  // borrowed checkpoint rows are preserved as on any cold reassignment.
+  // `enough` runs without the cache lock.
+  [[nodiscard]] RowReclaim ReclaimRows(
+      std::span<const ContinuationToken>, bool reuse,
+      const std::function<bool()>& enough,
+      const TextPromptContext* context = nullptr, std::size_t stable = 0);
   // Rows Acquire with the same arguments would not need new paged blocks
   // for. `live`: the idle live frontier it would continue, whose slot already
   // maps them (a partly written last block included). Otherwise the device
   // rows of the resident checkpoint it would restore, which the restore maps
   // instead of copying (complete blocks only). Zero for a cold slot or a disk
-  // restore.
+  // restore. Checkpoint rows may be disjoint; tokens is their total complete
+  // block capacity, not the end of a contiguous retained prefix.
   struct HeldRows {
     std::size_t tokens{};
     bool live{};

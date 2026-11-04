@@ -44,6 +44,15 @@ public:
   std::size_t private_blocks{128};
   cache::Rows rows_per_chunk{4};
   bool retain_rows{};
+  cache::Rows retained_row_limit{};
+  cache::Rows retained_row_first{};
+  cache::Rows retained_draft_first{};
+  cache::Rows retained_draft_end{};
+  std::size_t row_block_rows{};
+  RowBlockPool RowBlocks() const override {
+    return {.block_rows = row_block_rows};
+  }
+  cache::Rows retained_tokens_per_row{1};
   mutable std::size_t through_calls{};
   bool UsesComponentCache() const override { return true; }
   TextRunnerDescriptor Descriptor() const override {
@@ -109,6 +118,9 @@ public:
     resources->adapter = std::make_unique<FakeAdapter>(rows_per_chunk);
     adapter = dynamic_cast<FakeAdapter*>(resources->adapter.get());
     adapter->SetRetainRows(retain_rows);
+    adapter->SetRetainedRowUnits(retained_row_limit, retained_tokens_per_row,
+                                 retained_row_first);
+    adapter->SetRetainedDraftRange(retained_draft_first, retained_draft_end);
     resources->owner = blocks;
     resources->stream = [this, foreground = std::this_thread::get_id()]()
         -> std::unique_ptr<cache::Stream> {
@@ -1978,7 +1990,9 @@ void PagedRowsAdmitWaitAndReclaim() {
       const auto target =
           (rows + kPagedTokens - 1) / kPagedTokens + kRowBlockMargin;
       const auto mapped = Mapped(slot);
-      if (target > mapped && target - mapped > RowBlocks().free_blocks)
+      const auto old = reserved.contains(slot) ? reserved.at(slot) : 0;
+      const auto credit = old > mapped ? old - mapped : 0;
+      if (target > mapped && target - mapped > RowBlocks().free_blocks + credit)
         throw std::length_error("row pool cannot hold this request");
       reserved[slot] = target;
     }
@@ -2059,6 +2073,28 @@ void PagedRowsAdmitWaitAndReclaim() {
   assert(continued.cached_prompt_tokens() == talk.size());
   continued.ReserveRows(1);
   continued.Invalidate();
+
+  // A live borrower's growth may reclaim another idle copy of its prefix.
+  // Protecting that copy with reuse=true would prevent guarantor promotion.
+  auto growing = std::make_shared<PagedRunner>();
+  TextRunnerPool growth(growing, 2);
+  const std::vector<TextRunnerToken> prefix{20, 21, 22, 23};
+  auto leader = growth.Acquire(prefix);
+  leader.ReserveRows(0);
+  Prefill(leader);
+  auto extended = prefix;
+  extended.push_back(24);
+  auto borrower = growth.Acquire(extended);
+  borrower.ReserveRows(0);
+  Prefill(borrower);
+  leader.Commit();
+  const auto invalidated = growing->adapter->Invalidations();
+  assert(growth.TryGrowRows(borrower, 12));
+  assert(growing->adapter->Invalidations() > invalidated);
+  const auto held_before = growing->reserved;
+  assert(!growth.TryGrowRows(borrower, 16));
+  assert(growing->reserved == held_before);
+  borrower.Invalidate();
 }
 // A cold assignment that replaces a live frontier no checkpoint covers first
 // captures it, so that conversation's next turn restores its whole frontier
@@ -2574,6 +2610,67 @@ void RowReclaimKeepsTheCheckpointABranchRestores() {
     return runner->adapter->Invalidations() > before;
   }) == ComponentTextCache::RowReclaim::kReady);
 }
+void RowReclaimProtectsOnlySelectedInput() {
+  auto runner = std::make_shared<Runner>();
+  runner->retain_rows = true;
+  ComponentTextCache cache(runner, 2, 1 << 22, std::nullopt);
+  std::vector<TextRunnerToken> prompt(40);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  auto image = std::make_shared<TextPromptContext>();
+  image->cache_identity = {99};
+  for (const auto& context : {std::shared_ptr<TextPromptContext>{}, image}) {
+    auto lease = cache.Acquire(prompt, {}, context, false, 0, true);
+    auto& state = dynamic_cast<State&>(lease->state());
+    runner->adapter->Append(state.slot, prompt, prompt);
+    assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
+                                     false, SnapshotPurpose::kContinuation,
+                                     {}));
+    (void)lease->Commit(prompt, lease->Capture(), prompt);
+  }
+  assert(runner->adapter->RetainedChunks() == 20);
+  auto branch = prompt;
+  branch.push_back(50);
+  // The image request continues its live slot. The token-equal text-only
+  // checkpoint is neither its source nor necessary to preserve that slot.
+  assert(cache.ReclaimRows(
+             branch, true,
+             [&] { return runner->adapter->RetainedChunks() <= 10; },
+             image.get()) == ComponentTextCache::RowReclaim::kReady);
+  auto lease = cache.Acquire(branch, {}, image, true, 0, true);
+  assert(lease->cached_tokens() == prompt.size());
+  lease->Invalidate();
+}
+void RetainedRowsUseComponentTokenUnits(cache::Rows first, cache::Rows end,
+                                        cache::Rows scale, std::size_t block,
+                                        std::size_t expected,
+                                        cache::Rows draft_first = 0,
+                                        cache::Rows draft_end = 0) {
+  auto runner = std::make_shared<Runner>();
+  runner->retain_rows = true;
+  runner->retained_row_first = first;
+  runner->retained_row_limit = end;
+  runner->retained_tokens_per_row = scale;
+  runner->row_block_rows = block;
+  runner->retained_draft_first = draft_first;
+  runner->retained_draft_end = draft_end;
+  ComponentTextCache cache(runner, 1, 1 << 22, std::nullopt);
+  std::vector<TextRunnerToken> prompt(40);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  (void)CapturePrompt(cache, *runner, prompt);
+  auto reply = prompt;
+  reply.insert(reply.end(), {7, 8, 9, 10});
+  {
+    auto lease = cache.Acquire(reply, {}, {}, true, 0, true);
+    auto& state = dynamic_cast<State&>(lease->state());
+    const auto tail = std::span(reply).subspan(prompt.size());
+    runner->adapter->Append(state.slot, tail, tail);
+    (void)lease->Commit({}, {}, reply);
+  }
+  auto branch = prompt;
+  branch.push_back(50);
+  const auto held = cache.ContinuedTokens(branch, nullptr, true, 0);
+  assert(!held.live && held.tokens == expected);
+}
 void NearbyStableBoundaryDoesNotSplitAContinuation() {
   // A stable boundary within 64 tokens of the reused frontier is not worth a
   // second pass; one further away still stops prefill for its checkpoint.
@@ -2895,6 +2992,14 @@ int main() {
   RetainedChunksReachDisk();
   RowReclaimDropsRetainedCheckpoints();
   RowReclaimKeepsTheCheckpointABranchRestores();
+  RowReclaimProtectsOnlySelectedInput();
+  // Compressed units; host prefix followed by shared blocks; two partial
+  // blocks cannot be combined into a complete reusable physical block.
+  RetainedRowsUseComponentTokenUnits(0, 8, 4, 8, 32);
+  RetainedRowsUseComponentTokenUnits(4, 32, 1, 8, 24);
+  RetainedRowsUseComponentTokenUnits(4, 12, 1, 8, 0);
+  // Target [4,32), draft [20,40): only physical [24,32) is shared.
+  RetainedRowsUseComponentTokenUnits(4, 32, 1, 8, 8, 20, 40);
   SharedLineageCoversOnlyItsOwnFrontier();
   ReassignmentWritesUncoveredFrontier();
   ColdAssignmentCapturesUncoveredFrontier();

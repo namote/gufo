@@ -1,5 +1,58 @@
 # Qwen3.8 Flash-Next experiments
 
+## Native EXL3 vision (2026-11-04)
+
+Retained embedded EXL3 vision loading and native precision graph, with packed
+residency, split QKV precedence, padded FFN preservation and cache identity.
+CPU/review/K6+K8 numerics/GGUF exact/API checks pass; no broad sweep.
+[Evidence and limits](../../../plan/exl3/F3-VISION-NATIVE.md).
+
+## Physical GPU KV prefix sharing, November 4, 2026
+
+Kept shared immutable GPU block references for Flash-Next checkpoints and
+branches, with full-plane COW for overwritten/mixed blocks. KVarN chunk1 and
+pooled chunk64 align with256-token physical blocks; layout identity is4.
+Only frontiers complete across target/draft/pooled planes can be retained,
+so captures cannot introduce COW debt after progressive admission. Recurrence,
+raw indexer, FP16 sink/tail and predictor private state remain copied.
+
+Admission intersects retained token ranges across planes and credits complete
+blocks even after host-only early history. Validation found that reclaiming
+must protect only the actually selected checkpoint/live slot, using image
+identity and stable boundary; protecting every matching token prefix left
+redundant cold copies and produced a false context-exhaustion400. a03 fixes
+this and passes the affected branch/image replay.88 GPU reference cases,
+exact saved K6 numerics32760 positions, C4 pressure, Pi and disk restart pass.
+Standard PP/AR observations are within0.33% of saved K6; shallow/deep MTP
+-4.94%/+0.80%, desktop-active and advisory. No baseline rerun. Default service
+remains Kyojin; the permanent Gufo launcher selects the new image for next use.
+[Implementation, artifacts and failed attempts](../../../plan/exl3/F3-KV-REFERENCES.md).
+
+
+## Memory-efficiency implementation, November4,2026
+
+Kept request-sized vision/scratch admission with atomic image/cache growth
+claims, progressive shared-KV entitlements and categorized memory telemetry.
+CPU four suites pass; Nix10.1 incremental compile/link and two reviews pass.
+Corrected link explicitly includes all five changed objects. The first
+candidate accidentally retained the old scheduler; preserve this as invalid
+artifact evidence, not a performance or correctness result.
+
+Combined GPU HTTP qualification at16K/C4/two-context KV passes:20 completed
+requests plus four unlimited streams/cancellation and three pressure streams.
+Real kv_wait → guarantor cancellation → promotion/kv_resume observed;
+7-draft MTP greedy/seeded C1 repeats, C4 response smoke,9637-token cache,
+continuation, image and medium pass. Desktop activity prevents matched timing
+qualification; new GPU errors0 and compute owners released. Cold long prefill
+8082ms, cached repeat140ms total, cached/cold continuation285/8302ms. These
+cache-history differences are not candidate-vs-baseline improvements.
+
+Corrected image ai-tools/gufo-eval:memory-efficiency-rocm101 selected with
+C2/native256K/K6V6/vision/medium/MTP, fixed6.123GiB pool and existing no-timeout
+launch profile. Full256K generation and broad numerical sweep not repeated.
+Evidence: build/memory-efficiency/RESULT.json and gpu/http-a03/.
+
+
 ## K6V6 native256K selection, November 3, 2026
 
 User-selected precision change: add `kvarn-k6v6` for Flash-Next; retain K4V4
