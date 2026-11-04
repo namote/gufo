@@ -170,7 +170,7 @@ void ReleaseWeightRegions(std::vector<QwenGpuWeightRegion>& regions) noexcept {
     hipError_t map_error;
     try {
       if (source.file_descriptor == platform::kInvalidFile) {
-        // A memory image (the EXL3 sidecar's GGUF image) lives on the heap:
+        // A memory image (a native EXL3 pack's GGUF image) lives on the heap:
         // it is neither page aligned nor a mapping that may be dropped, so
         // it is copied to device memory instead of cloned and registered.
         map_error = AllocateDeviceRegion(source, destination);
@@ -456,26 +456,20 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
   }
 
   std::optional<models::QwenModelWeights> weights_opt;
-  if (reader->GetMetadataString(quant::exl3::kCheckpointKey)) {
-    // An EXL3 checkpoint through its GGUF sidecar (plan/exl3/XA-RESULTS.md):
-    // the projections stay EXL3, the rest becomes an in-memory GGUF image.
-    const auto regions = reader->GetMappedRegions();
-    if (regions.empty() || regions.front().source_path.empty()) {
-      if (error_msg != nullptr)
-        *error_msg = "EXL3 sidecar has no file path";
-      return nullptr;
-    }
-    const auto embedding =
-        reader->GetMetadataString(models::qwen_exl3::kEmbeddingKey) ==
-                std::optional<std::string_view>("q8_0")
-            ? models::qwen_exl3::EmbeddingFormat::kQ8_0
-            : models::qwen_exl3::EmbeddingFormat::kBf16;
-    auto loaded = models::qwen_exl3::LoadFromSidecar(
-        regions.front().source_path, *reader, embedding, error_msg);
+  if (reader->GetMetadataBool(quant::exl3::kNativeKey).value_or(false)) {
+    // A native EXL3 pack directory: the projections stay EXL3, the rest
+    // becomes an in-memory GGUF image carrying the native metadata.
+    auto loaded = models::qwen_exl3::LoadFromDirectory(*reader, error_msg);
     if (!loaded)
       return nullptr;
     reader = std::move(loaded->reader);
     weights_opt = std::move(loaded->weights);
+  } else if (reader->FindMetadata(quant::exl3::kCheckpointKey)) {
+    if (error_msg != nullptr)
+      *error_msg =
+          "EXL3 metadata sidecar files are not supported; pass the EXL3 pack "
+          "directory";
+    return nullptr;
   } else {
     weights_opt = models::QwenModelWeights::LoadFromGguf(*reader, error_msg);
   }

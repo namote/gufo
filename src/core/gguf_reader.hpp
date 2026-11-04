@@ -211,6 +211,8 @@ public:
       std::string_view key) const noexcept;
   [[nodiscard]] std::vector<std::string_view> GetMetadataStringArray(
       std::string_view key) const;
+  /// Every metadata key, sorted.
+  [[nodiscard]] std::vector<std::string_view> GetMetadataKeys() const;
   /// Tensor lookup helpers
   [[nodiscard]] const GgufTensorInfo* FindTensor(
       std::string_view name) const noexcept;

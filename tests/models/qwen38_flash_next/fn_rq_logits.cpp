@@ -26,6 +26,7 @@
 #include "src/core/json.hpp"
 #include "src/core/quant/exl3/layout.hpp"
 #include "src/core/session_mode.hpp"
+#include "src/models/qwen/native_pack.hpp"
 #include "src/models/qwen38_flash_next/exl3_weights.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
@@ -378,7 +379,7 @@ int main(int argc, char** argv) {
     auto session = executor->CreateSession(
         gufo::core::SessionMode::kAutoregressive, context, &error);
     Require(bool(session), error);
-    q::ValidateNativeSources(*reader);
+    gufo::models::qwen::ValidateNativeSources(*reader);
     const double load_ms = Ms(load_start);
     std::filesystem::remove(out_prefix + ".json");
     Writer writer(out_prefix + ".bin", top_k);

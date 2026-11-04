@@ -105,7 +105,7 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/cli/serve/text_model_runner.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/text_generation_scheduler.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp)
-  target_link_libraries(qwen38_flash_next_session_test PRIVATE gufo_logging
+  target_link_libraries(qwen38_flash_next_session_test PRIVATE gufo_logging gufo_model_artifact
     gufo_kv_cache_type gufo_qwen38_flash_next gufo_deepseek_v4_flash gufo_cache_hip hip::host)
   add_executable(qwen38_flash_next_snapshot_test EXCLUDE_FROM_ALL snapshot_test.cpp
     device_headroom_fault.cpp)

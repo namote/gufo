@@ -21,6 +21,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "src/cli/model_artifact.hpp"
 #include "src/cli/serve/component_text_cache.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/request_memory_budget.hpp"
@@ -35,7 +36,6 @@
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/vision/image_cache.hpp"
 #include "src/models/qwen/vision/memory.hpp"
-#include "src/models/qwen38_flash_next/native_metadata.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include "src/core/hip/committed_backing.hpp"
@@ -50,6 +50,7 @@
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/native_pack.hpp"
 #include "src/models/qwen38_flash_next/continuation_adapter.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #endif
@@ -2430,7 +2431,7 @@ bool FingerprintArtifact(std::string_view label, const core::GgufReader& reader,
   try {
     *fingerprint =
         reader.GetMetadataBool(quant::exl3::kNativeKey).value_or(false)
-            ? models::qwen38_flash_next::NativeArtifactIdentity(reader)
+            ? models::qwen::NativeArtifactIdentity(reader)
             : core::GgufIdentityHex(reader);
   } catch (const std::exception& exception) {
     SetError(error, std::string("Failed to fingerprint ") + std::string(label) +
@@ -2455,8 +2456,7 @@ bool FingerprintArtifactFile(std::string_view label,
                              const std::filesystem::path& path,
                              std::string* fingerprint, std::string* error) {
   std::string open_error;
-  const auto reader =
-      models::qwen38_flash_next::OpenArtifactMetadata(path, &open_error);
+  const auto reader = cli::OpenModelArtifact(path, &open_error);
   if (reader == nullptr) {
     SetError(error, std::string("Failed to open ") + std::string(label) +
                         " model for fingerprinting: " + open_error);
@@ -3359,8 +3359,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
-  auto reader_owner =
-      models::qwen38_flash_next::OpenArtifactMetadata(model_path, &load_error);
+  auto reader_owner = cli::OpenModelArtifact(model_path, &load_error);
   if (reader_owner == nullptr) {
     SetError(error, "Failed to open model: " + load_error);
     return false;

@@ -7,13 +7,14 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
-#include <sstream>
+#include <limits>
 #include <stdexcept>
 #include <thread>
+#include <variant>
 
-#include "src/core/json.hpp"
 #include "src/core/quant/exl3/format.hpp"
 #include "src/core/quant/exl3/layout.hpp"
+#include "src/models/qwen/native_pack.hpp"
 
 namespace gufo::models::qwen_exl3 {
 namespace {
@@ -479,22 +480,116 @@ std::vector<RawKv> ReadRawMetadata(const std::filesystem::path& path) {
   return out;
 }
 
-RawKv StringKv(std::string_view key, std::string_view value) {
-  RawKv kv;
-  kv.key = std::string(key);
-  auto put = [&](const void* p, std::size_t n) {
-    const auto* b = static_cast<const std::uint8_t*>(p);
-    kv.bytes.insert(kv.bytes.end(), b, b + n);
-  };
-  const std::uint64_t key_length = key.size();
-  const std::uint32_t type = 8;
-  const std::uint64_t value_length = value.size();
-  put(&key_length, 8);
-  put(key.data(), key.size());
-  put(&type, 4);
-  put(&value_length, 8);
-  put(value.data(), value.size());
-  return kv;
+std::vector<RawKv> SerializeMetadata(const core::GgufReader& reader) {
+  using T = core::GgufValueType;
+  std::vector<RawKv> out;
+  for (const auto key : reader.GetMetadataKeys()) {
+    const auto& entry = *reader.FindMetadata(key);
+    RawKv kv;
+    kv.key = std::string(key);
+    auto& bytes = kv.bytes;
+    const auto put = [&](const void* p, std::size_t n) {
+      const auto* b = static_cast<const std::uint8_t*>(p);
+      bytes.insert(bytes.end(), b, b + n);
+    };
+    const auto u32 = [&](std::uint32_t v) { put(&v, 4); };
+    const auto u64 = [&](std::uint64_t v) { put(&v, 8); };
+    const auto str = [&](std::string_view v) {
+      u64(v.size());
+      put(v.data(), v.size());
+    };
+    str(key);
+    if (entry.type == T::kArray) {
+      u32(static_cast<std::uint32_t>(T::kArray));
+      if (const auto* v =
+              std::get_if<std::vector<std::string_view>>(&entry.value)) {
+        u32(static_cast<std::uint32_t>(T::kString));
+        u64(v->size());
+        for (const auto s : *v)
+          str(s);
+      } else if (const auto* v =
+                     std::get_if<std::vector<std::uint64_t>>(&entry.value)) {
+        u32(static_cast<std::uint32_t>(T::kUint32));
+        u64(v->size());
+        for (const auto x : *v) {
+          if (x > std::numeric_limits<std::uint32_t>::max())
+            throw std::runtime_error("metadata integer out of 32-bit range");
+          u32(static_cast<std::uint32_t>(x));
+        }
+      } else if (const auto* v =
+                     std::get_if<std::vector<std::int64_t>>(&entry.value)) {
+        u32(static_cast<std::uint32_t>(T::kInt32));
+        u64(v->size());
+        for (const auto x : *v) {
+          if (x < std::numeric_limits<std::int32_t>::min() ||
+              x > std::numeric_limits<std::int32_t>::max())
+            throw std::runtime_error("metadata integer out of 32-bit range");
+          const auto y = static_cast<std::int32_t>(x);
+          put(&y, 4);
+        }
+      } else if (const auto* v =
+                     std::get_if<std::vector<double>>(&entry.value)) {
+        u32(static_cast<std::uint32_t>(T::kFloat32));
+        u64(v->size());
+        for (const auto x : *v) {
+          const auto y = static_cast<float>(x);
+          put(&y, 4);
+        }
+      } else {
+        throw std::runtime_error("unsupported metadata array " + kv.key);
+      }
+    } else {
+      u32(static_cast<std::uint32_t>(entry.type));
+      switch (entry.type) {
+        case T::kString:
+          str(std::get<std::string_view>(entry.value));
+          break;
+        case T::kBool: {
+          const std::uint8_t b = std::get<bool>(entry.value) ? 1 : 0;
+          put(&b, 1);
+          break;
+        }
+        case T::kFloat32: {
+          const auto f = static_cast<float>(std::get<double>(entry.value));
+          put(&f, 4);
+          break;
+        }
+        case T::kFloat64: {
+          const auto d = std::get<double>(entry.value);
+          put(&d, 8);
+          break;
+        }
+        case T::kUint8:
+        case T::kUint16:
+        case T::kUint32:
+        case T::kUint64: {
+          const auto v = std::get<std::uint64_t>(entry.value);
+          const unsigned width = entry.type == T::kUint8    ? 1
+                                 : entry.type == T::kUint16 ? 2
+                                 : entry.type == T::kUint32 ? 4
+                                                            : 8;
+          put(&v, width);  // little endian
+          break;
+        }
+        case T::kInt8:
+        case T::kInt16:
+        case T::kInt32:
+        case T::kInt64: {
+          const auto v = std::get<std::int64_t>(entry.value);
+          const unsigned width = entry.type == T::kInt8    ? 1
+                                 : entry.type == T::kInt16 ? 2
+                                 : entry.type == T::kInt32 ? 4
+                                                           : 8;
+          put(&v, width);
+          break;
+        }
+        case T::kArray:
+          break;
+      }
+    }
+    out.push_back(std::move(kv));
+  }
+  return out;
 }
 
 std::vector<std::string> TargetTensorNames(const core::ModelConfig& config) {
@@ -521,28 +616,6 @@ std::vector<std::string> TargetTensorNames(const core::ModelConfig& config) {
     }
   }
   return names;
-}
-
-void QuantizeQ8_0(std::span<const float> values, std::uint8_t* out) {
-  constexpr std::size_t kBlock = 32;
-  if (values.size() % kBlock != 0) {
-    throw std::invalid_argument("Q8_0: length is not a multiple of 32");
-  }
-  for (std::size_t b = 0; b < values.size() / kBlock; ++b) {
-    const float* x = values.data() + b * kBlock;
-    float amax = 0.0f;
-    for (std::size_t j = 0; j < kBlock; ++j)
-      amax = std::max(amax, std::fabs(x[j]));
-    const float d = amax / 127.0f;
-    const float id = d != 0.0f ? 1.0f / d : 0.0f;
-    const std::uint16_t d16 = exl3::HalfFromDouble(static_cast<double>(d));
-    std::uint8_t* block = out + b * 34;
-    std::memcpy(block, &d16, 2);
-    for (std::size_t j = 0; j < kBlock; ++j) {
-      const auto q = static_cast<std::int8_t>(std::roundf(x[j] * id));
-      std::memcpy(block + 2 + j, &q, 1);
-    }
-  }
 }
 
 bool Source::IsProjection(std::string_view gguf_name) const {
@@ -593,13 +666,8 @@ QwenExl3HostLinear Source::PrepareLinear(std::string_view gguf_name) const {
 
 std::vector<std::uint8_t> Source::BuildImage(
     const std::vector<RawKv>& metadata, const std::vector<std::string>& names,
-    EmbeddingFormat embedding, int threads) const {
-  struct Entry {
-    TensorPlan plan;      // as produced
-    core::GgmlType type;  // as stored
-    std::size_t bytes;    // as stored
-  };
-  std::vector<Entry> entries;
+    int threads) const {
+  std::vector<TensorPlan> entries;
   for (const auto& name : names) {
     if (IsProjection(name))
       continue;
@@ -607,12 +675,7 @@ std::vector<std::uint8_t> Source::BuildImage(
     auto plan = Plan(name, &error);
     if (!plan)
       throw std::runtime_error(error);
-    Entry e{*plan, plan->type, plan->bytes};
-    if (name == "token_embd.weight" && embedding == EmbeddingFormat::kQ8_0) {
-      e.type = core::GgmlType::kQ8_0;
-      e.bytes = plan->bytes / 2 / 32 * 34;
-    }
-    entries.push_back(std::move(e));
+    entries.push_back(std::move(*plan));
   }
   constexpr std::size_t kAlign = 32;
   auto align = [](std::size_t x) { return (x + kAlign - 1) / kAlign * kAlign; };
@@ -631,10 +694,10 @@ std::vector<std::uint8_t> Source::BuildImage(
     put(kv.bytes.data(), kv.bytes.size());
   std::size_t offset = 0;
   for (const auto& e : entries) {
-    u64(e.plan.gguf_name.size());
-    put(e.plan.gguf_name.data(), e.plan.gguf_name.size());
-    u32(static_cast<std::uint32_t>(e.plan.ne.size()));
-    for (const auto d : e.plan.ne)
+    u64(e.gguf_name.size());
+    put(e.gguf_name.data(), e.gguf_name.size());
+    u32(static_cast<std::uint32_t>(e.ne.size()));
+    for (const auto d : e.ne)
       u64(d);
     u32(static_cast<std::uint32_t>(e.type));
     u64(offset);
@@ -644,151 +707,42 @@ std::vector<std::uint8_t> Source::BuildImage(
   const std::size_t data_start = image.size();
   image.resize(data_start + offset, 0);
   std::size_t position = data_start;
-  std::vector<std::uint8_t> scratch;
   for (const auto& e : entries) {
-    std::span<std::uint8_t> out(image.data() + position, e.bytes);
-    if (e.type == e.plan.type) {
-      Produce(e.plan, out, threads);
-    } else {
-      scratch.resize(e.plan.bytes);
-      Produce(e.plan, scratch, threads);
-      const std::size_t count = e.plan.bytes / 2;
-      std::vector<float> row(static_cast<std::size_t>(e.plan.ne[0]));
-      const auto* bf16 = reinterpret_cast<const std::uint16_t*>(scratch.data());
-      const std::size_t rows = count / row.size();
-      const std::size_t row_bytes = row.size() / 32 * 34;
-      for (std::size_t r = 0; r < rows; ++r) {
-        for (std::size_t j = 0; j < row.size(); ++j)
-          row[j] = Bf16ToFloat(bf16[r * row.size() + j]);
-        QuantizeQ8_0(row, out.data() + r * row_bytes);
-      }
-    }
+    Produce(e, std::span<std::uint8_t>(image.data() + position, e.bytes),
+            threads);
     position += align(e.bytes);
   }
   return image;
 }
 
-std::string CheckSidecar(const std::filesystem::path& checkpoint,
-                         const core::GgufReader& sidecar) {
-  auto read_json = [](const std::filesystem::path& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in)
-      throw std::runtime_error("cannot read " + path.string());
-    std::ostringstream text;
-    text << in.rdbuf();
-    return json::parse(text.str());
-  };
-  try {
-    const auto config = read_json(checkpoint / "config.json");
-    const json::Value* text = config.find("text_config");
-    const json::Value& c = text != nullptr ? *text : config;
-    const auto u32 = [&](const char* key) {
-      return sidecar.GetMetadataUint32(std::string("qwen35.") + key);
-    };
-    const auto nextn = u32("nextn_predict_layers").value_or(0);
-    const struct {
-      const char* hf;
-      std::optional<std::uint32_t> gguf;
-      const char* gguf_name;
-    } checks[] = {
-        {"hidden_size", u32("embedding_length"), "embedding_length"},
-        {"intermediate_size", u32("feed_forward_length"),
-         "feed_forward_length"},
-        {"num_attention_heads", u32("attention.head_count"),
-         "attention.head_count"},
-        {"num_key_value_heads", u32("attention.head_count_kv"),
-         "attention.head_count_kv"},
-        {"head_dim", u32("attention.key_length"), "attention.key_length"},
-        {"linear_num_key_heads", u32("ssm.group_count"), "ssm.group_count"},
-        {"linear_num_value_heads", u32("ssm.time_step_rank"),
-         "ssm.time_step_rank"},
-        {"linear_key_head_dim", u32("ssm.state_size"), "ssm.state_size"},
-        {"linear_conv_kernel_dim", u32("ssm.conv_kernel"), "ssm.conv_kernel"},
-    };
-    for (const auto& check : checks) {
-      const auto hf = static_cast<std::uint64_t>(c.member_double(check.hf, -1));
-      if (!check.gguf || hf != *check.gguf) {
-        return std::string("config.json ") + check.hf +
-               " differs from GGUF qwen35." + check.gguf_name;
-      }
-    }
-    const auto layers =
-        static_cast<std::uint64_t>(c.member_double("num_hidden_layers", -1));
-    const auto blocks = u32("block_count");
-    if (!blocks || layers + nextn != *blocks) {
-      return "config.json num_hidden_layers differs from GGUF "
-             "qwen35.block_count";
-    }
-    const auto inner = u32("ssm.inner_size");
-    if (!inner || static_cast<std::uint64_t>(
-                      c.member_double("linear_value_head_dim", -1)) *
-                          static_cast<std::uint64_t>(
-                              c.member_double("linear_num_value_heads", -1)) !=
-                      *inner) {
-      return "config.json linear value size differs from GGUF "
-             "qwen35.ssm.inner_size";
-    }
-    const auto tokens = sidecar.GetMetadataStringArray("tokenizer.ggml.tokens");
-    if (static_cast<double>(tokens.size()) !=
-        c.member_double("vocab_size", -1)) {
-      return "config.json vocab_size differs from tokenizer.ggml.tokens";
-    }
-    const auto tokenizer = read_json(checkpoint / "tokenizer.json");
-    std::size_t checked = 0;
-    auto check_token = [&](std::size_t id, const std::string& token) {
-      if (id >= tokens.size() || tokens[id] != token) {
-        throw std::runtime_error("tokenizer.json token " + std::to_string(id) +
-                                 " differs from tokenizer.ggml.tokens");
-      }
-      ++checked;
-    };
-    if (const auto* model = tokenizer.find("model")) {
-      if (const auto* vocab = model->find("vocab")) {
-        for (const auto& [token, id] : vocab->members())
-          check_token(id.as_size(), token);
-      }
-    }
-    if (const auto* added = tokenizer.find("added_tokens")) {
-      for (const auto& t : added->items())
-        check_token(t.member_size("id"), t.member_str("content"));
-    }
-    if (checked == 0)
-      return "tokenizer.json has no vocabulary";
-  } catch (const std::exception& e) {
-    return e.what();
-  }
-  return {};
-}
-
-std::optional<LoadedExl3> LoadFromSidecar(
-    const std::filesystem::path& sidecar_path, const core::GgufReader& sidecar,
-    EmbeddingFormat embedding, std::string* error, int threads) {
+std::optional<LoadedExl3> LoadFromDirectory(const core::GgufReader& metadata,
+                                            std::string* error, int threads) {
+  const auto directory = metadata.GetMetadataString(exl3::kCheckpointKey);
   auto fail = [&](const std::string& why) -> std::optional<LoadedExl3> {
     if (error != nullptr)
-      *error = "EXL3 sidecar " + sidecar_path.string() + ": " + why;
+      *error = "EXL3 pack " + std::string(directory.value_or("")) + ": " + why;
     return std::nullopt;
   };
   try {
-    const auto relative = sidecar.GetMetadataString(exl3::kCheckpointKey);
-    if (!relative)
-      return fail(std::string("no ") + std::string(exl3::kCheckpointKey) +
-                  " key");
-    const auto directory = sidecar_path.parent_path() / std::string(*relative);
-    if (auto mismatch = CheckSidecar(directory, sidecar); !mismatch.empty())
-      return fail(mismatch);
+    if (!directory ||
+        !metadata.GetMetadataBool(exl3::kNativeKey).value_or(false))
+      return fail("metadata is not from a native EXL3 pack directory");
+    // The checkpoint must be the one the metadata was built from.
+    qwen::ValidateNativeSources(metadata);
     std::string why;
-    const auto geometry = GeometryFromGguf(sidecar, &why);
+    const auto geometry = GeometryFromGguf(metadata, &why);
     if (!geometry)
       return fail(why);
-    const auto config = sidecar.ExtractModelConfig(&why);
+    const auto config = metadata.ExtractModelConfig(&why);
     if (!config)
       return fail(why);
-    const auto checkpoint = quant::exl3::Checkpoint::Open(directory);
+    const auto checkpoint =
+        quant::exl3::Checkpoint::Open(std::filesystem::path(*directory));
     const Source source(checkpoint, *geometry);
     const auto names = TargetTensorNames(*config);
 
-    auto image = std::make_shared<std::vector<std::uint8_t>>(source.BuildImage(
-        ReadRawMetadata(sidecar_path), names, embedding, threads));
+    auto image = std::make_shared<std::vector<std::uint8_t>>(
+        source.BuildImage(SerializeMetadata(metadata), names, threads));
     auto* raw = core::GgufReader::OpenMemory(image->data(), image->size(), &why)
                     .release();
     if (raw == nullptr)
@@ -823,6 +777,7 @@ std::optional<LoadedExl3> LoadFromSidecar(
     if (!weights)
       return fail(why);
     weights->exl3_storage = storage;
+    qwen::ValidateNativeSources(metadata);
     loaded.image_bytes = image->size();
     loaded.reader = std::move(reader);
     loaded.weights = std::move(*weights);

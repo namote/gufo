@@ -385,11 +385,16 @@ endif()
 add_library(gufo_kv_cache_type STATIC src/cli/kv_cache_type.cpp)
 target_include_directories(gufo_kv_cache_type PUBLIC ${CMAKE_SOURCE_DIR})
 
+# Text model artifacts (GGUF files and native EXL3 pack directories).
+add_library(gufo_model_artifact STATIC src/cli/model_artifact.cpp)
+target_link_libraries(gufo_model_artifact PUBLIC gufo_core
+  gufo_qwen38_flash_next)
+
 add_library(gufo_llm_cli STATIC
   src/cli/bench/bench.cpp
   src/cli/prompt/prompt.cpp)
 target_link_libraries(gufo_llm_cli PUBLIC gufo_core gufo_kv_cache_type
-  gufo_qwen38_flash_next)
+  gufo_model_artifact gufo_qwen38_flash_next)
 if(ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_llm_cli PUBLIC gufo_deepseek_v4_flash)
 endif()

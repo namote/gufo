@@ -36,6 +36,24 @@ but AR and speculation need not share the same-seed sequence. See the
 [quality contract](QUALITY.md). Thinking/template controls and HTTP
 sampling defaults are described in [the server guide](../../SERVER.md#reasoning-controls).
 
+## Native EXL3 text
+
+Pass an EXL3 pack directory (for example `turboderp/Qwen3.8-27B-exl3`,
+branch `5.00bpw`) directly to `--model`:
+
+```sh
+nix develop -c hf download turboderp/Qwen3.8-27B-exl3 --revision 5.00bpw \
+  --local-dir models/qwen3.8-27b-exl3
+./result/bin/gufo chat --model models/qwen3.8-27b-exl3
+```
+
+The directory supplies `config.json`, `tokenizer.json`, `tokenizer_config.json`,
+`chat_template.jinja`, `model.safetensors.index.json` and its shards; Gufo
+builds the same metadata llama.cpp writes for this model
+(`qwen27b_exl3_to_gguf metadata` compares them). Projections stay EXL3 on the
+GPU; the other tensors are converted at load. The former GGUF metadata
+sidecars are rejected. The pack's MTP block is not loaded.
+
 ## KV cache type
 
 `--kv-cache-type` selects attention KV storage in `serve llm`, `prompt`,

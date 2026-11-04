@@ -11,6 +11,7 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/core/quant/exl3/layout.hpp"
+#include "src/models/qwen/native_pack.hpp"
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/exl3_weights.hpp"
@@ -205,9 +206,9 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     return nullptr;
   }
   try {
-    ValidateNativeSources(*m->reader_);
+    qwen::ValidateNativeSources(*m->reader_);
     if (m->mtp_reader_)
-      ValidateNativeSources(*m->mtp_reader_);
+      qwen::ValidateNativeSources(*m->mtp_reader_);
   } catch (const std::exception& e) {
     AssignError(error_msg, e.what());
     return nullptr;

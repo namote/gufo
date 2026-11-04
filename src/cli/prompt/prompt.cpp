@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
+#include "src/cli/model_artifact.hpp"
 #include "src/cli/sampling_options.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/gguf_reader.hpp"
@@ -23,7 +24,6 @@
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/tokenizer.hpp"
-#include "src/models/qwen38_flash_next/native_metadata.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
@@ -1024,8 +1024,7 @@ int RunPrompt(std::span<const char* const> args) {
 
   const auto model_load_start = std::chrono::steady_clock::now();
   std::string err;
-  auto reader_owner = gufo::models::qwen38_flash_next::OpenArtifactMetadata(
-      opt.model_path, &err);
+  auto reader_owner = gufo::cli::OpenModelArtifact(opt.model_path, &err);
   if (!reader_owner) {
     std::cerr << "Error loading GGUF model '" << opt.model_path << "': " << err
               << "\n";
@@ -1256,8 +1255,7 @@ int RunChat(std::span<const char* const> args) {
 
   const auto model_load_start = std::chrono::steady_clock::now();
   std::string err;
-  auto reader_owner = gufo::models::qwen38_flash_next::OpenArtifactMetadata(
-      opt.model_path, &err);
+  auto reader_owner = gufo::cli::OpenModelArtifact(opt.model_path, &err);
   if (!reader_owner) {
     std::cerr << "Error loading GGUF model '" << opt.model_path << "': " << err
               << "\n";

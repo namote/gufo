@@ -844,6 +844,15 @@ const GgufTensorInfo* GgufReader::FindTensor(
   return nullptr;
 }
 
+std::vector<std::string_view> GgufReader::GetMetadataKeys() const {
+  std::vector<std::string_view> keys;
+  keys.reserve(metadata_.size());
+  for (const auto& [key, value] : metadata_)
+    keys.push_back(key);
+  std::sort(keys.begin(), keys.end());
+  return keys;
+}
+
 bool GgufReader::HasTensor(std::string_view name) const noexcept {
   return tensor_index_.contains(name);
 }
