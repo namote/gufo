@@ -2,6 +2,7 @@
 
 #include <stdexcept>
 #include <string_view>
+#include <vector>
 
 #include "src/core/quant/exl3/layout.hpp"
 #include "src/models/qwen/native_pack.hpp"
@@ -23,12 +24,17 @@ std::unique_ptr<core::GgufReader> OpenArtifactMetadata(
     return reader;
   }
   try {
-    constexpr std::string_view kRequired[] = {"ngram_embedding.safetensors"};
+    const auto ngram_files = Exl3Ngram::PackFiles(path);
+    std::vector<std::string> ngram_names;
+    for (const auto& file : ngram_files)
+      ngram_names.push_back(file.filename().string());
+    const std::vector<std::string_view> required(ngram_names.begin(),
+                                                 ngram_names.end());
     constexpr std::string_view kOptional[] = {
         "mtp_hyper_connection_mixer_patch.safetensors"};
-    qwen::NativePackMetadata pack(path, "qwen4_exp_text", kRequired, kOptional);
+    qwen::NativePackMetadata pack(path, "qwen4_exp_text", required, kOptional);
     const auto& c = pack.text_config();
-    auto ngram = Exl3Ngram::Open(path / "ngram_embedding.safetensors");
+    auto ngram = Exl3Ngram::Open(ngram_files);
     pack.Text("general.architecture", "qwen4exp");
     pack.Text("general.name", "Qwen3.8 Flash Next");
     const auto number = [&](const char* key) { return pack.Number(key); };

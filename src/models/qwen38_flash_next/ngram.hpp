@@ -90,12 +90,13 @@ public:
       std::uint64_t rows, std::uint32_t row_dim, core::GgmlType type,
       std::string* error_msg = nullptr);
 
+  /// A native EXL3 table from its part files (Exl3Ngram::PackFiles).
   [[nodiscard]] static std::unique_ptr<NgramTable> OpenExl3(
-      const std::filesystem::path& path, const Config& config,
+      std::span<const std::filesystem::path> files, const Config& config,
       std::string* error_msg = nullptr);
 
-  /// The PLE table of a bound model: a native EXL3 pack's
-  /// ngram_embedding.safetensors, otherwise the GGUF ple_table of `reader`.
+  /// The PLE table of a bound model: a native EXL3 pack's n-gram table
+  /// files, otherwise the GGUF ple_table of `reader`.
   [[nodiscard]] static std::unique_ptr<NgramTable> ForModel(
       const std::filesystem::path& model_path, const core::GgufReader& reader,
       const ModelWeights& weights, std::string* error_msg = nullptr);
@@ -159,6 +160,8 @@ private:
   std::size_t row_bytes_{0};
   unsigned ring_bits_{0};
   std::vector<Exl3Ngram::Segment> segments_;
+  /// One handle per native table part (segments_[i].file indexes it).
+  std::vector<platform::PlatformFile> segment_files_;
   std::vector<std::uint64_t> head_offsets_;
   std::vector<float> head_bias_;
   std::array<float, 65536> codebook_{};

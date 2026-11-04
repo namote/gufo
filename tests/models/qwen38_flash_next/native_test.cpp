@@ -57,16 +57,25 @@ q::Config Geometry() {
   c.ple_multipliers = {11, 13, 17};
   return c;
 }
-void Fixture(const std::filesystem::path& path, unsigned bits, bool shards) {
+// A native table with 7 rows. With `second`, shard_1 is written to that
+// separate part file (a split table); otherwise everything goes to `path`.
+void Fixture(const std::filesystem::path& path, unsigned bits, bool shards,
+             const std::filesystem::path& second = {},
+             bool duplicate_shard = false) {
   const std::string prefix =
       "model.language_model.layers.1.ple.ple_embedding.ngram_embedding";
-  std::string header =
+  const std::string meta =
       "{\"__metadata__\":{\"format\":\"exl3_ngram_trellis\",\"version\":\"1\","
       "\"codebook\":\"mul1\",\"row_dim\":\"160\",\"rows\":\"7\",\"K\":\"" +
       std::to_string(bits) + "\"}";
-  std::vector<char> payload;
-  const auto add = [&](const std::string& name, const char* type,
+  struct Part {
+    std::string header;
+    std::vector<char> payload;
+  };
+  Part parts[2] = {{meta, {}}, {meta, {}}};
+  const auto add = [&](int part, const std::string& name, const char* type,
                        std::string shape, const auto& data) {
+    auto& [header, payload] = parts[part];
     const auto begin = payload.size();
     const auto* bytes = reinterpret_cast<const char*>(data.data());
     payload.insert(payload.end(), bytes, bytes + data.size() * sizeof(data[0]));
@@ -77,10 +86,10 @@ void Fixture(const std::filesystem::path& path, unsigned bits, bool shards) {
   };
   std::vector<std::uint16_t> bias(320, 0x3400);
   std::fill(bias.begin() + 160, bias.end(), 0xb800);
-  add(".head_bias", "F16", "[2,160]", bias);
-  add(".head_offsets", "I64", "[2]", std::vector<std::int64_t>{0, 3});
-  add(".head_vocab_sizes", "I64", "[2]", std::vector<std::int64_t>{3, 3});
-  add(".layer_multipliers", "I64", "[3]",
+  add(0, ".head_bias", "F16", "[2,160]", bias);
+  add(0, ".head_offsets", "I64", "[2]", std::vector<std::int64_t>{0, 3});
+  add(0, ".head_vocab_sizes", "I64", "[2]", std::vector<std::int64_t>{3, 3});
+  add(0, ".layer_multipliers", "I64", "[3]",
       std::vector<std::int64_t>{11, 13, 17});
   const unsigned width = 1 + 10 * bits;
   const auto rows = [&](unsigned begin, unsigned end) {
@@ -97,21 +106,75 @@ void Fixture(const std::filesystem::path& path, unsigned bits, bool shards) {
     }
     return data;
   };
-  if (shards) {
+  if (shards || !second.empty()) {
     // Shard and hash-head boundaries deliberately differ.
-    add(".shard_0.trellis", "I16", "[2," + std::to_string(width) + "]",
+    add(0, ".shard_0.trellis", "I16", "[2," + std::to_string(width) + "]",
         rows(0, 2));
-    add(".shard_1.trellis", "I16", "[5," + std::to_string(width) + "]",
-        rows(2, 7));
+    add(second.empty() ? 0 : 1, ".shard_1.trellis", "I16",
+        "[5," + std::to_string(width) + "]", rows(2, 7));
+    if (duplicate_shard)
+      add(1, ".shard_0.trellis", "I16", "[2," + std::to_string(width) + "]",
+          rows(0, 2));
   } else
-    add(".trellis", "I16", "[7," + std::to_string(width) + "]", rows(0, 7));
-  header += "}";
-  std::ofstream out(path, std::ios::binary);
-  const std::uint64_t size = header.size();
-  out.write(reinterpret_cast<const char*>(&size), 8);
-  out << header;
-  out.write(payload.data(), payload.size());
-  Check(out.good(), "write native fixture");
+    add(0, ".trellis", "I16", "[7," + std::to_string(width) + "]", rows(0, 7));
+  const auto write = [](const std::filesystem::path& file, Part& part) {
+    part.header += "}";
+    std::ofstream out(file, std::ios::binary);
+    const std::uint64_t size = part.header.size();
+    out.write(reinterpret_cast<const char*>(&size), 8);
+    out << part.header;
+    out.write(part.payload.data(), part.payload.size());
+    Check(out.good(), "write native fixture");
+  };
+  write(path, parts[0]);
+  if (!second.empty())
+    write(second, parts[1]);
+}
+// Split tables: part discovery and a gather across both parts.
+void SplitRows() {
+  TemporaryDirectory temp("native-ngram-split");
+  const auto dir = temp.path();
+  const auto first = dir / "ngram_embedding-00001-of-00002.safetensors";
+  const auto second = dir / "ngram_embedding-00002-of-00002.safetensors";
+  for (unsigned bits : {3U, 8U}) {
+    Fixture(first, bits, true, second);
+    const auto files = q::Exl3Ngram::PackFiles(dir);
+    Check(files.size() == 2 && files[0] == first && files[1] == second,
+          "split table parts discovered in order");
+    const auto layout = q::Exl3Ngram::Open(files);
+    Check(layout.segments.size() == 2 && layout.segments[0].file == 0 &&
+              layout.segments[1].file == 1,
+          "split shards keep their part");
+    std::string error;
+    auto table = q::NgramTable::OpenExl3(files, Geometry(), &error);
+    Check(table != nullptr, error);
+    const std::vector<std::uint32_t> ids{0, 1, 2, 3, 5, 1, 4};
+    std::vector<float> out(ids.size() * 160);
+    Check(table->Read(ids, out), "split gather");
+    for (std::size_t i = 0; i < ids.size(); ++i)
+      for (unsigned col = 0; col < 160; ++col)
+        Check(out[i * 160 + col] == Reference(ids[i], col, bits),
+              "split row exact oracle");
+  }
+  const auto rejects = [&](const char* why, const char* reason) {
+    std::string message;
+    try {
+      (void)q::Exl3Ngram::Open(q::Exl3Ngram::PackFiles(dir));
+    } catch (const std::exception& e) {
+      message = e.what();
+    }
+    Check(message.find(reason) != std::string::npos,
+          std::string(why) + ": " + message);
+  };
+  std::filesystem::remove(second);
+  rejects("missing table part rejected", "missing table parts");
+  Fixture(first, 3, true, second);
+  Fixture(dir / "ngram_embedding.safetensors", 3, false);
+  rejects("single table beside parts rejected", "both");
+  std::filesystem::remove(dir / "ngram_embedding.safetensors");
+  // The same row shard in both parts.
+  Fixture(first, 3, true, second, true);
+  rejects("duplicated shards rejected", "several table parts");
 }
 void Rows() {
   TemporaryDirectory temp("native-ngram");
@@ -121,7 +184,8 @@ void Rows() {
       Fixture(path, bits, shards);
       std::string error;
       auto c = Geometry();
-      auto table = q::NgramTable::OpenExl3(path, c, &error);
+      auto table = q::NgramTable::OpenExl3(
+          std::span<const std::filesystem::path>(&path, 1), c, &error);
       Check(table != nullptr, error);
       std::vector<std::uint32_t> ids{0, 2, 3, 5, 1, 5, 3};
       for (unsigned pass = 0; pass < 3; ++pass) {
@@ -142,11 +206,14 @@ void Rows() {
       std::array<float, 160> output{};
       Check(!table->Read(padded, output), "padded rows are inaccessible");
       c.ple_multipliers[0]++;
-      Check(!q::NgramTable::OpenExl3(path, c, &error),
+      Check(!q::NgramTable::OpenExl3(
+                std::span<const std::filesystem::path>(&path, 1), c, &error),
             "hash mismatch rejected");
       table.reset();
       std::filesystem::resize_file(path, std::filesystem::file_size(path) - 1);
-      Check(!q::NgramTable::OpenExl3(path, Geometry(), &error),
+      Check(!q::NgramTable::OpenExl3(
+                std::span<const std::filesystem::path>(&path, 1), Geometry(),
+                &error),
             "truncated native tensor rejected");
     }
   }
@@ -317,9 +384,9 @@ void Pack(const std::filesystem::path& path) {
                 std::vector<gufo::tokenization::TokenId>{
                     static_cast<std::uint32_t>(i)},
             "native added token is atomic");
-  auto layout = q::Exl3Ngram::Open(path / "ngram_embedding.safetensors");
-  auto table = q::NgramTable::OpenExl3(path / "ngram_embedding.safetensors",
-                                       *config, &error);
+  const auto files = q::Exl3Ngram::PackFiles(path);
+  auto layout = q::Exl3Ngram::Open(files);
+  auto table = q::NgramTable::OpenExl3(files, *config, &error);
   Check(table != nullptr, error);
   std::vector<std::uint32_t> ids{
       0, 1, static_cast<std::uint32_t>(config->ple_rows - 1)};
@@ -335,13 +402,12 @@ void Pack(const std::filesystem::path& path) {
     }
   std::vector<float> values(ids.size() * 160);
   Check(table->Read(ids, values), "real native boundary rows");
-  std::ifstream raw_file(path / "ngram_embedding.safetensors",
-                         std::ios::binary);
   for (std::size_t r = 0; r < ids.size(); ++r) {
     const auto row = ids[r];
     const auto segment = std::prev(std::upper_bound(
         layout.segments.begin(), layout.segments.end(), row,
         [](auto id, const auto& part) { return id < part.first; }));
+    std::ifstream raw_file(files[segment->file], std::ios::binary);
     std::vector<std::uint16_t> packed(1 + 10 * layout.bits);
     raw_file.seekg(segment->offset +
                    (row - segment->first) * packed.size() * 2);
@@ -384,6 +450,8 @@ int main(int argc, char** argv) {
     Identity();
     std::cerr << "identity PASS\n";
     Rows();
+    SplitRows();
+    std::cerr << "split PASS\n";
     std::cerr << "rows PASS\n";
     for (int i = 1; i < argc; ++i)
       Pack(argv[i]);

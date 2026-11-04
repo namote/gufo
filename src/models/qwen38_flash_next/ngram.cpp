@@ -76,6 +76,8 @@ NgramTable::~NgramTable() {
   if (file_ != platform::kInvalidFile) {
     platform::CloseFile(file_);
   }
+  for (const auto file : segment_files_)
+    platform::CloseFile(file);
 }
 
 std::unique_ptr<NgramTable> NgramTable::Open(
@@ -123,24 +125,50 @@ std::unique_ptr<NgramTable> NgramTable::ForModel(
     const std::filesystem::path& model_path, const core::GgufReader& reader,
     const ModelWeights& weights, std::string* error_msg) {
   if (reader.GetMetadataBool(quant::exl3::kNativeKey).value_or(false))
-    return OpenExl3(model_path / "ngram_embedding.safetensors", weights.config,
-                    error_msg);
+    try {
+      return OpenExl3(Exl3Ngram::PackFiles(model_path), weights.config,
+                      error_msg);
+    } catch (const std::exception& e) {
+      if (error_msg)
+        *error_msg = e.what();
+      return nullptr;
+    }
   const auto& t = weights.ple_table;
   return Open(reader.GetMappedRegions()[t.shard].file_descriptor, t.file_offset,
               t.rows, weights.config.ple_head_dim, t.type, error_msg);
 }
 
 std::unique_ptr<NgramTable> NgramTable::OpenExl3(
-    const std::filesystem::path& path, const Config& config,
+    std::span<const std::filesystem::path> files, const Config& config,
     std::string* error_msg) {
   try {
-    auto native = Exl3Ngram::Open(path);
+    auto native = Exl3Ngram::Open(files);
     native.Validate(config);
     // Open owns the file descriptor before the temporary mapping is released.
-    auto table = Open(native.file.PlatformHandle(), 0, config.ple_rows,
+    auto table = Open(native.files.front().PlatformHandle(), 0, config.ple_rows,
                       native.dim, core::GgmlType::kBF16, error_msg);
     if (!table)
       return nullptr;
+    // Every part gets its own handle with the first part's I/O mode, since
+    // reads are aligned for direct I/O exactly when the table uses it.
+    table->segment_files_.reserve(native.files.size());
+    for (const auto& part : native.files) {
+      bool direct = false;
+      auto handle =
+          platform::ReopenRandomReadFile(part.PlatformHandle(), direct);
+      if (platform::FileValid(handle) && direct != table->direct_) {
+        platform::CloseFile(handle);
+        handle = platform::kInvalidFile;
+      }
+      if (!platform::FileValid(handle) && !table->direct_)
+        handle = platform::DuplicateFile(part.PlatformHandle());
+      if (!platform::FileValid(handle)) {
+        if (error_msg)
+          *error_msg = "cannot open n-gram table part";
+        return nullptr;
+      }
+      table->segment_files_.push_back(handle);
+    }
     table->ring_bits_ = native.bits;
     table->row_bytes_ = 2 * (1 + native.dim * native.bits / 16);
     table->cache_count_ = std::bit_floor(kCacheBytes / table->row_bytes_);
@@ -230,12 +258,14 @@ bool NgramTable::ReadOne(std::uint32_t row, float* dst,
     return true;
   }
   std::uint64_t offset = base_offset_ + row * row_bytes_;
+  platform::PlatformFile file = file_;
   if (ring_bits_) {
     const auto it = std::upper_bound(
         segments_.begin(), segments_.end(), row,
         [](std::uint32_t r, const auto& segment) { return r < segment.first; });
     const auto& segment = *std::prev(it);
     offset = segment.offset + (row - segment.first) * row_bytes_;
+    file = segment_files_[segment.file];
   }
   const std::uint64_t begin = direct_ ? offset & ~(kPage - 1) : offset;
   const std::uint64_t end =
@@ -263,7 +293,7 @@ bool NgramTable::ReadOne(std::uint32_t row, float* dst,
   std::error_code ec;
   while (got < needed) {
     const std::size_t n =
-        platform::ReadAt(file_, begin + got, base + got, length - got, ec);
+        platform::ReadAt(file, begin + got, base + got, length - got, ec);
     if (n == 0 && ec == std::errc::interrupted) {
       continue;
     }
