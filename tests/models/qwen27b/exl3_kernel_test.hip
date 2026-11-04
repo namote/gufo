@@ -773,8 +773,9 @@ void TestPrefill(std::size_t k, std::size_t n, int bits, std::size_t rows,
 // Dispatch level (src/models/qwen/hip/exl3_dispatch.hpp) at 16 and 17 rows:
 // decode/verify groups, MLPs and single projections stay on the GEMV at any
 // row count (bit-identical to the direct GEMV launches); a prefill projection
-// switches to the WMMA GEMM at kExl3WmmaMinRows (bit-identical to the direct
-// rotation + WMMA launches).
+// switches to the WMMA GEMM at Exl3WmmaMinRows: 17 rows for this small q, 9
+// rows for a large (FFN-sized) matrix (bit-identical to the direct rotation +
+// WMMA launches).
 void TestDispatch(std::mt19937& rng) {
   constexpr std::size_t kHidden = 1024, kInter = 2048, kRows = 17;
   const BitRate rate{5, false};
@@ -877,10 +878,10 @@ void TestDispatch(std::mt19937& rng) {
     Check(hipDeviceSynchronize());
     Expect(Download(a[0], rows * 1024) == Download(b[0], rows * 1024),
            tag + ": decode/verify projection left the GEMV");
-    // Prefill projection: GEMV below kExl3WmmaMinRows, WMMA from it.
+    // Prefill projection: GEMV below Exl3WmmaMinRows, WMMA from it.
     gufo::hip::LaunchExl3Projection(rq, d_x, rows, a[0], &scratch, nullptr, 0,
                                     0, gufo::hip::Exl3Pass::kPrefill);
-    if (rows >= gufo::hip::kExl3WmmaMinRows) {
+    if (rows >= gufo::hip::Exl3WmmaMinRows(q)) {
       std::uint16_t* rot = nullptr;
       Check(hipMalloc(&rot, rows * kHidden * 2));
       gufo::hip::LaunchExl3RotateRows(d_x, kHidden, rows, kHidden, q.suh, rot,
@@ -896,8 +897,70 @@ void TestDispatch(std::mt19937& rng) {
     Expect(Download(a[0], rows * 1024) == Download(b[0], rows * 1024),
            tag + ": prefill projection took the wrong path");
     std::cout << tag << ": decode/verify on the GEMV, prefill on the "
-              << (rows >= gufo::hip::kExl3WmmaMinRows ? "WMMA" : "GEMV")
+              << (rows >= gufo::hip::Exl3WmmaMinRows(q) ? "WMMA" : "GEMV")
               << " path\n";
+  }
+  // A large (FFN-sized) projection switches to the WMMA at 9 rows.
+  {
+    constexpr std::size_t kBigK = 5120, kBigN = 17408;
+    const DeviceLinear big = make(kBigK, kBigN);
+    Expect(gufo::hip::Exl3WmmaMinRows(big) == 9 &&
+               gufo::hip::Exl3WmmaMinRows(q) == 17,
+           "WMMA threshold by projection size");
+    const auto rbig = ref(big);
+    std::vector<float> xb(9 * kBigK);
+    for (auto& e : xb)
+      e = normal(rng);
+    auto* d_xb = Upload(xb);
+    float* ya = alloc(9 * kBigN);
+    float* yb = alloc(9 * kBigN);
+    gufo::quant::exl3::ReferenceScratch big_scratch = scratch;
+    big_scratch.fast_prefill_input_elements = 9 * kBigK;
+    Check(hipMalloc(&big_scratch.fast_prefill_input,
+                    big_scratch.fast_prefill_input_elements * 2));
+    for (std::size_t rows : {8, 9}) {
+      if (rows >= 9) {
+        gufo::hip::LaunchExl3Projection(rbig, d_xb, rows, ya, &big_scratch,
+                                        nullptr, 0, 0,
+                                        gufo::hip::Exl3Pass::kPrefill);
+        gufo::hip::LaunchExl3RotateRows(d_xb, kBigK, rows, kBigK, big.suh,
+                                        big_scratch.fast_prefill_input,
+                                        nullptr);
+        gufo::hip::LaunchExl3PrefillGemm(big, big_scratch.fast_prefill_input,
+                                         yb, rows, false, nullptr);
+      } else {
+        // The GEMV slab and counters above are sized for this test's small
+        // matrices; size the large one's GEMV workspace separately.
+        std::uint16_t* slab = nullptr;
+        std::uint32_t* counters = nullptr;
+        Check(hipMalloc(&slab, 8 * kBigK * 2));
+        Check(hipMalloc(&counters, kBigN / 128 * 4));
+        Check(hipMemset(counters, 0, kBigN / 128 * 4));
+        const gufo::hip::Exl3FastWorkspace big_ws{
+            slab, 8 * kBigK, counters, kBigN / 128, nullptr, 0};
+        gufo::quant::exl3::ReferenceScratch gemv_scratch = big_scratch;
+        gemv_scratch.fast_input = slab;
+        gemv_scratch.fast_input_elements = 8 * kBigK;
+        gemv_scratch.fast_counters = counters;
+        gemv_scratch.fast_counter_count = kBigN / 128;
+        gufo::hip::LaunchExl3Projection(rbig, d_xb, rows, ya, &gemv_scratch,
+                                        nullptr, 0, 0,
+                                        gufo::hip::Exl3Pass::kPrefill);
+        gufo::hip::LaunchExl3FastProjection(big, d_xb, kBigK, rows, yb, kBigN,
+                                            big_ws, nullptr);
+        Check(hipDeviceSynchronize());
+        Check(hipFree(slab));
+        Check(hipFree(counters));
+      }
+      Check(hipDeviceSynchronize());
+      Expect(Download(ya, rows * kBigN) == Download(yb, rows * kBigN),
+             "dispatch large rows=" + std::to_string(rows) +
+                 ": prefill projection took the wrong path");
+      std::cout << "dispatch large rows=" << rows << ": prefill on the "
+                << (rows >= 9 ? "WMMA" : "GEMV") << " path\n";
+    }
+    Check(hipFree(big_scratch.fast_prefill_input));
+    Check(hipFree(d_xb));
   }
   for (void* p : owned)
     Check(hipFree(p));

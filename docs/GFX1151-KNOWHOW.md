@@ -1,5 +1,25 @@
 # gfx1151 optimization know-how
 
+## Qwen3.8 27B EXL3 prefill WMMA threshold, November 4, 2026
+
+Per-projection prefill time, X2b GEMV (8-row passes) versus X3/X3b trellis
+WMMA (rotation + GEMM), actual `turboderp/Qwen3.8-27B-exl3` 5.00bpw weights,
+1-64 rows, two runs (50 and 100 reps; `tools/bench/exl3_wmma_threshold_bench.hip`,
+RelWithDebInfo; each matrix timed repeatedly, so small ones may stay warm in
+the MALL). One WMMA launch costs about 1.7-1.9x a GEMV pass for the
+5120x17408 FFN matrices (9-16 rows: gate/up WMMA 449-469 vs 2-pass GEMV
+522-542 us, down 490-507 vs 528-538 us), but 2.1-4.2x for q (5120x12288),
+qkv, z, ssm_out, o and k/v. Retained:
+projections of at least 2^26 elements switch at 9 rows, the others keep 17.
+Model projection time at 9-16 rows falls about 8%; the per-projection optimum
+adds only 0.1-0.7% at 17-32 rows (k/v prefer the GEMV through 32). Matched
+`gufo bench` (alternating base/candidate, 5 reps each, same build flags):
+pp9 57.6/57.9 to 63.7/64.0 tok/s (+10%), pp12 76.1/76.2 to 82.4/83.3 (+9%),
+pp16 98.4/98.6 to 107.0/108.1 (+9%); pp8, pp17 and pp32 unchanged within 1%.
+The large WMMA path is the kernel already qualified for 17+ rows; a raw
+15-token greedy prompt gives identical output. Only 5.00bpw was measured;
+other bit rates may move the crossover.
+
 ## Native EXL3 vision, November 4, 2026
 
 Embedded vision now loads directly from native packs. Strict geometry and

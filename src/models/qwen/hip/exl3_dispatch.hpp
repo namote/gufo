@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <initializer_list>
 #include <span>
 #include <stdexcept>
@@ -28,11 +29,26 @@
 namespace gufo::hip {
 
 /// From this many rows a prefill chunk uses the trellis WMMA GEMM (X3b narrow
-/// tile up to 64 rows, X3 prefill tile above) instead of 8-row GEMV passes;
-/// provisional until the final window compares the two at 9-64 rows. Decode
-/// and verify (batched sessions included) always stay on the GEMV, whose
-/// per-row results do not depend on the batch.
+/// tile up to 64 rows, X3 prefill tile above) instead of 8-row GEMV passes.
+/// Measured per projection on the Qwen3.8 27B 5.00bpw pack at 1-64 rows
+/// (tools/bench/exl3_wmma_threshold_bench.hip, docs/GFX1151-KNOWHOW.md): one
+/// WMMA launch costs about 1.7x a GEMV pass for the 5120 x 17408 FFN
+/// matrices, so they switch at the second pass (9 rows); the smaller
+/// projections (up to 5120 x 12288) cost 2.1-4.2x and switch at the third
+/// (17 rows). Decode and verify (batched sessions included) always stay on the
+/// GEMV, whose per-row results do not depend on the batch.
 inline constexpr std::size_t kExl3WmmaMinRows = 17;
+inline constexpr std::size_t kExl3WmmaMinRowsLarge = 9;
+/// Weight elements (k x n) from which a projection counts as large.
+inline constexpr std::uint64_t kExl3WmmaLargeElements = std::uint64_t{1} << 26;
+
+/// The prefill row count from which `linear` takes the WMMA GEMM.
+[[nodiscard]] inline std::size_t Exl3WmmaMinRows(
+    const quant::exl3::DeviceLinear& linear) noexcept {
+  return std::uint64_t{linear.k} * linear.n >= kExl3WmmaLargeElements
+             ? kExl3WmmaMinRowsLarge
+             : kExl3WmmaMinRows;
+}
 
 /// Which forward pass calls a projection.
 enum class Exl3Pass { kDecodeVerify, kPrefill };
@@ -56,15 +72,15 @@ inline void LaunchExl3Projection(const models::QwenTensorRef& weight,
         "EXL3 projection without a descriptor or session workspace");
   }
   const auto& linear = *weight.exl3;
-  // Prefill chunks from kExl3WmmaMinRows rows take the X3 trellis WMMA GEMM
+  // Prefill chunks from Exl3WmmaMinRows rows take the X3 trellis WMMA GEMM
   // (the X3b narrow tile up to 64 rows): rotate the rows into the FP16 slab,
   // then GEMM with the svh epilogue. Decode and verify rows (up to 64) take
   // the X2b trellis GEMV. Anything else stays on the reference path.
-  const bool wmma = pass == Exl3Pass::kPrefill &&
-                    scratch->fast_prefill_input != nullptr &&
-                    rows >= kExl3WmmaMinRows && Exl3PrefillSupported(linear) &&
-                    scratch->fast_prefill_input_elements >= rows * linear.k &&
-                    (y_stride == 0 || y_stride == linear.n);
+  const bool wmma =
+      pass == Exl3Pass::kPrefill && scratch->fast_prefill_input != nullptr &&
+      rows >= Exl3WmmaMinRows(linear) && Exl3PrefillSupported(linear) &&
+      scratch->fast_prefill_input_elements >= rows * linear.k &&
+      (y_stride == 0 || y_stride == linear.n);
   if (wmma) {
     LaunchExl3RotateRows(x, x_stride != 0 ? x_stride : linear.k, rows, linear.k,
                          linear.suh, scratch->fast_prefill_input, stream);
