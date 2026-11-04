@@ -38,7 +38,8 @@ public:
       std::function<void(std::string_view, std::span<const float>)>;
   using CancellationCheck = std::function<bool()>;
   Encoder(const std::filesystem::path& path, std::uint32_t output_width);
-  /// An explicit sidecar is required to exist. Otherwise discover the canonical
+  /// An explicit sidecar is required to exist. Otherwise native EXL3 packs
+  /// use their embedded vision weights; GGUF targets discover the canonical
   /// sidecar beside the target or its quantization subdirectory.
   [[nodiscard]] static std::shared_ptr<Encoder> Open(
       const std::filesystem::path& target, const std::filesystem::path& sidecar,
@@ -48,6 +49,7 @@ public:
   Encoder& operator=(const Encoder&) = delete;
   [[nodiscard]] const std::string& identity() const;
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
+  [[nodiscard]] bool IsExl3() const noexcept;
   /// Upload the weights now instead of in the first Encode. Repeated calls
   /// keep the existing upload.
   void Upload();

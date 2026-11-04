@@ -141,3 +141,7 @@ if (ENGINE_ENABLE_HIP)
     tests/models/qwen/hip/integration_test.cpp
     "hip;gpu;kernels;qwen;module;l2")
 endif()
+
+add_qwen_cpu_test(qwen_vision_exl3_test
+  tests/models/qwen/vision_exl3_test.cpp
+  "cpu;vision;exl3;correctness")
