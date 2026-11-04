@@ -2,8 +2,11 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <initializer_list>
 #include <iostream>
 #include <stdexcept>
+#include <string_view>
+#include <utility>
 
 #include "src/core/gguf_identity.hpp"
 #include "src/core/json.hpp"
@@ -207,6 +210,45 @@ void Identity() {
     Check(rejected, "invalid native file list rejected");
   }
 }
+// A tensorless GGUF holding only string keys (an old metadata sidecar).
+void WriteStringGguf(
+    const std::filesystem::path& path,
+    std::initializer_list<std::pair<std::string_view, std::string_view>> kvs) {
+  std::ofstream out(path, std::ios::binary);
+  const auto u32 = [&](std::uint32_t v) {
+    out.write(reinterpret_cast<const char*>(&v), 4);
+  };
+  const auto u64 = [&](std::uint64_t v) {
+    out.write(reinterpret_cast<const char*>(&v), 8);
+  };
+  const auto str = [&](std::string_view v) {
+    u64(v.size());
+    out.write(v.data(), static_cast<std::streamsize>(v.size()));
+  };
+  out.write("GGUF", 4);
+  u32(3);
+  u64(0);
+  u64(kvs.size());
+  for (const auto& [key, value] : kvs) {
+    str(key);
+    u32(8);  // string
+    str(value);
+  }
+  // The (empty) data section starts at the next 32-byte boundary.
+  const auto size = static_cast<std::size_t>(out.tellp());
+  out.write(std::string((32 - size % 32) % 32, '\0').data(),
+            static_cast<std::streamsize>((32 - size % 32) % 32));
+}
+void SidecarRejected() {
+  TemporaryDirectory temp("native-sidecar");
+  const auto file = temp.path() / "gufo.gguf";
+  WriteStringGguf(file, {{"general.architecture", "qwen4exp"},
+                         {"gufo.exl3.checkpoint", "pack"}});
+  std::string error;
+  const bool opened = q::OpenArtifactMetadata(file, &error) != nullptr;
+  Check(!opened && error.find("sidecar") != std::string::npos,
+        "EXL3 metadata sidecar rejected: " + error);
+}
 void MetadataRejections() {
   TemporaryDirectory temp("native-metadata-contract");
   const auto dir = temp.path();
@@ -336,6 +378,7 @@ void Pack(const std::filesystem::path& path) {
 int main(int argc, char** argv) {
   try {
     MetadataRejections();
+    SidecarRejected();
     Ownership();
     std::cerr << "ownership PASS\n";
     Identity();

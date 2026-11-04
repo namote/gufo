@@ -16,6 +16,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
 #include "src/models/qwen38_flash_next/exl3_ngram.hpp"
+#include "src/models/qwen38_flash_next/weights.hpp"
 
 namespace gufo::models::qwen38_flash_next {
 
@@ -92,6 +93,12 @@ public:
   [[nodiscard]] static std::unique_ptr<NgramTable> OpenExl3(
       const std::filesystem::path& path, const Config& config,
       std::string* error_msg = nullptr);
+
+  /// The PLE table of a bound model: a native EXL3 pack's
+  /// ngram_embedding.safetensors, otherwise the GGUF ple_table of `reader`.
+  [[nodiscard]] static std::unique_ptr<NgramTable> ForModel(
+      const std::filesystem::path& model_path, const core::GgufReader& reader,
+      const ModelWeights& weights, std::string* error_msg = nullptr);
 
   /// Gathers `rows.size()` rows into `out` (rows.size() * row_dim floats).
   /// Duplicate ids are read once. Returns false on any failed read.

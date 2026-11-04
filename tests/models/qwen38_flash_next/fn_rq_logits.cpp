@@ -360,18 +360,7 @@ int main(int argc, char** argv) {
     Require(c.vocab_size == 248320, "unexpected Flash-Next vocabulary");
     std::unique_ptr<q::NgramTable> ngram;
     if (c.ple_layer >= 0) {
-      const auto& t = weights->ple_table;
-      if (reader->GetMetadataBool(gufo::quant::exl3::kNativeKey)
-              .value_or(false)) {
-        ngram = q::NgramTable::OpenExl3(
-            std::filesystem::path(model_path) / "ngram_embedding.safetensors",
-            c, &error);
-      } else
-        ngram = q::NgramTable::Open(
-            (exl3 ? weights->exl3_storage->ple_reader.get() : reader.get())
-                ->GetMappedRegions()[t.shard]
-                .file_descriptor,
-            t.file_offset, t.rows, c.ple_head_dim, t.type, &error);
+      ngram = q::NgramTable::ForModel(model_path, *reader, *weights, &error);
       Require(bool(ngram), error);
     }
     auto device = q::rocm::DeviceModel::Upload(*weights, *reader, nullptr,

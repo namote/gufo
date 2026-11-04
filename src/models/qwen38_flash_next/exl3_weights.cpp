@@ -6,10 +6,8 @@
 #include <fstream>
 #include <limits>
 #include <map>
-#include <sstream>
 #include <stdexcept>
 
-#include "src/core/crypto/sha256.hpp"
 #include "src/core/json.hpp"
 #include "src/core/quant/exl3/layout.hpp"
 
@@ -19,143 +17,6 @@ namespace ex = quant::exl3;
 
 [[noreturn]] void Fail(const std::string& message) {
   throw std::runtime_error("Flash-Next EXL3: " + message);
-}
-
-std::string Read(const std::filesystem::path& path) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in)
-    Fail("cannot read " + path.string());
-  std::ostringstream out;
-  out << in.rdbuf();
-  return out.str();
-}
-
-std::string Digest(std::string_view text) {
-  return crypto::Sha256Hex(
-      {reinterpret_cast<const std::uint8_t*>(text.data()), text.size()});
-}
-
-std::filesystem::path Reference(const std::filesystem::path& path,
-                                const core::GgufReader& reader,
-                                std::string_view key) {
-  const auto value = reader.GetMetadataString(key);
-  if (!value || value->empty() || std::filesystem::path(*value).is_absolute())
-    Fail("missing relative reference " + std::string(key));
-  return (path.parent_path() / *value).lexically_normal();
-}
-
-void CheckDigest(const core::GgufReader& sidecar, std::string_view key,
-                 std::string_view digest) {
-  if (sidecar.GetMetadataString(key) != digest)
-    Fail("source identity mismatch: " + std::string(key));
-}
-
-void CheckMetadata(const std::filesystem::path& directory,
-                   const core::GgufReader& sidecar, const Config& c) {
-  const auto config_bytes = Read(directory / "config.json");
-  CheckDigest(sidecar, "gufo.exl3.config_sha256", Digest(config_bytes));
-  const auto config = json::parse(config_bytes);
-  const auto* text = config.find("text_config");
-  if (text == nullptr)
-    Fail("missing text_config");
-  const std::pair<const char*, std::uint32_t> geometry[] = {
-      {"hidden_size", c.hidden_size},
-      {"num_hidden_layers", c.num_layers},
-      {"num_attention_heads", c.num_heads},
-      {"num_key_value_heads", c.num_kv_heads},
-      {"head_dim", c.head_dim},
-      {"hc_count", c.hc_count},
-      {"hc_lowrank", c.hc_low_rank},
-      {"full_attention_interval", c.full_attention_interval},
-      {"linear_num_key_heads", c.ssm_num_k_heads},
-      {"linear_num_value_heads", c.ssm_num_v_heads},
-      {"linear_key_head_dim", c.ssm_head_dim},
-      {"linear_value_head_dim", c.ssm_head_dim},
-      {"linear_conv_kernel_dim", c.ssm_conv_kernel},
-      {"num_experts", c.num_experts},
-      {"num_experts_per_tok", c.num_experts_used},
-      {"moe_intermediate_size", c.expert_ff},
-      {"shared_expert_intermediate_size", c.shared_expert_ff},
-      {"indexer_n_heads", c.indexer_heads},
-      {"indexer_head_dim", c.indexer_head_dim},
-      {"indexer_budget", c.indexer_top_k},
-      {"indexer_compress_ratio", c.compress_ratio},
-      {"max_position_embeddings", c.context_length},
-      {"vocab_size", c.vocab_size}};
-  for (const auto& [key, expected] : geometry)
-    if (text->member_double(key, -1) != expected)
-      Fail("config.json geometry mismatch: " + std::string(key));
-  if (static_cast<float>(text->member_double("rms_norm_eps", -1)) != c.rms_eps)
-    Fail("config.json rms_norm_eps mismatch");
-  const auto* rope = text->find("rope_parameters");
-  if (rope == nullptr ||
-      rope->member_double("rope_theta", -1) != c.rope_theta ||
-      rope->member_double("partial_rotary_factor", -1) * c.head_dim !=
-          c.rotary_dim)
-    Fail("config.json rotary geometry mismatch");
-  const auto* sections = rope->find("mrope_section");
-  if (sections == nullptr || sections->size() != 3)
-    Fail("config.json mrope_section missing");
-  for (std::size_t i = 0; i < 3; ++i)
-    if (sections->items()[i].as_double() != c.rope_sections[i])
-      Fail("config.json mrope_section mismatch");
-  const auto tokenizer_bytes = Read(directory / "tokenizer.json");
-  CheckDigest(sidecar, "gufo.exl3.tokenizer_sha256", Digest(tokenizer_bytes));
-  const auto tokenizer = json::parse(tokenizer_bytes);
-  const auto tokens = sidecar.GetMetadataStringArray("tokenizer.ggml.tokens");
-  std::vector<bool> seen(tokens.size());
-  const auto token = [&](std::size_t id, std::string_view value) {
-    if (id >= tokens.size() || tokens[id] != value)
-      Fail("tokenizer vocabulary mismatch at " + std::to_string(id));
-    seen[id] = true;
-  };
-  const auto* model = tokenizer.find("model");
-  if (model == nullptr || model->find("vocab") == nullptr)
-    Fail("tokenizer vocabulary missing");
-  for (const auto& [value, id] : model->find("vocab")->members())
-    token(id.as_size(), value);
-  if (const auto* added = tokenizer.find("added_tokens"))
-    for (const auto& entry : added->items())
-      token(entry.member_size("id"), entry.member_str("content"));
-  const auto padding = std::find(seen.begin(), seen.end(), false);
-  if (padding == seen.begin() ||
-      std::find(padding, seen.end(), true) != seen.end())
-    Fail("tokenizer vocabulary has holes before its padded tail");
-  const auto merges = sidecar.GetMetadataStringArray("tokenizer.ggml.merges");
-  const auto* hf_merges = model->find("merges");
-  if (hf_merges == nullptr || hf_merges->size() != merges.size())
-    Fail("tokenizer merges count mismatch");
-  for (std::size_t i = 0; i < merges.size(); ++i) {
-    const auto& value = hf_merges->items()[i];
-    const auto merge = value.is_string() ? value.str()
-                                         : value.items()[0].str() + " " +
-                                               value.items()[1].str();
-    if (merges[i] != merge)
-      Fail("tokenizer merge mismatch at " + std::to_string(i));
-  }
-}
-
-std::string HeadersDigest(
-    const ex::Checkpoint& checkpoint,
-    const core::GgufMappedRegion* supplementary = nullptr) {
-  crypto::Sha256Hasher hash;
-  auto regions = checkpoint.GetMappedRegions();
-  if (supplementary != nullptr)
-    regions.push_back(*supplementary);
-  std::sort(regions.begin(), regions.end(), [](const auto& a, const auto& b) {
-    return a.source_path.filename() < b.source_path.filename();
-  });
-  for (const auto& region : regions) {
-    const auto label = region.source_path.filename().string() + '\0' +
-                       std::to_string(region.size) + '\0';
-    hash.Update(
-        {reinterpret_cast<const std::uint8_t*>(label.data()), label.size()});
-    std::uint64_t count;
-    std::memcpy(&count, region.data, 8);
-    hash.Update({static_cast<const std::uint8_t*>(region.data),
-                 static_cast<std::size_t>(8 + count)});
-  }
-  return hash.FinishHex();
 }
 
 struct Binder {
@@ -350,37 +211,22 @@ struct Binder {
 };
 
 std::shared_ptr<Exl3Storage> Open(const std::filesystem::path& path,
-                                  const core::GgufReader& sidecar, Config& c,
+                                  const core::GgufReader& metadata, Config& c,
                                   bool mtp) {
-  if (sidecar.GetTensorCount() != 0)
-    Fail("EXL3 metadata sidecar must be tensorless");
+  if (!metadata.GetMetadataBool(quant::exl3::kNativeKey).value_or(false))
+    Fail("EXL3 metadata sidecars are not supported; pass the pack directory");
   c.vocab_size = static_cast<std::uint32_t>(
-      sidecar.GetMetadataStringArray("tokenizer.ggml.tokens").size());
-  const bool native =
-      sidecar.GetMetadataBool(quant::exl3::kNativeKey).value_or(false);
-  const auto directory =
-      native ? path : Reference(path, sidecar, quant::exl3::kCheckpointKey);
-  if (!native)
-    CheckMetadata(directory, sidecar, c);
+      metadata.GetMetadataStringArray("tokenizer.ggml.tokens").size());
   auto storage = std::make_shared<Exl3Storage>();
   storage->checkpoint =
-      std::make_shared<ex::Checkpoint>(ex::Checkpoint::Open(directory));
-  std::filesystem::path patch;
-  if (mtp && sidecar.GetMetadataString(kExl3MtpMixer))
-    patch = Reference(path, sidecar, kExl3MtpMixer);
-  if (native && mtp) {
-    const auto candidate =
-        directory / "mtp_hyper_connection_mixer_patch.safetensors";
-    if (std::filesystem::is_regular_file(candidate))
-      patch = candidate;
+      std::make_shared<ex::Checkpoint>(ex::Checkpoint::Open(path));
+  if (mtp) {
+    std::filesystem::path patch =
+        path / "mtp_hyper_connection_mixer_patch.safetensors";
+    if (!std::filesystem::is_regular_file(patch))
+      patch.clear();
+    PrepareExl3MtpMixer(*storage, c, patch);
   }
-  const auto digest = mtp ? PrepareExl3MtpMixer(*storage, c, patch)
-                          : HeadersDigest(*storage->checkpoint);
-  if (!native)
-    CheckDigest(
-        sidecar,
-        mtp ? "gufo.exl3.mtp_headers_sha256" : "gufo.exl3.headers_sha256",
-        digest);
   return storage;
 }
 
@@ -430,8 +276,8 @@ TensorRef BindExl3LinearBank(Exl3Storage& storage, const std::string& module,
   return ref;
 }
 
-std::string PrepareExl3MtpMixer(Exl3Storage& storage, const Config& c,
-                                const std::filesystem::path& patch) {
+void PrepareExl3MtpMixer(Exl3Storage& storage, const Config& c,
+                         const std::filesystem::path& patch) {
   const std::string prefix = "mtp.hyper_connection_mixer.";
   const auto width = static_cast<std::int64_t>(c.HcDim());
   const std::map<std::string, std::vector<std::int64_t>> shapes{
@@ -523,23 +369,6 @@ std::string PrepareExl3MtpMixer(Exl3Storage& storage, const Config& c,
          tensor->dtype != ex::DType::kBF16 && tensor->dtype != ex::DType::kF32))
       Fail("missing/invalid MTP mixer operand " + name);
   }
-  if (patch.empty())
-    return HeadersDigest(*storage.checkpoint);
-  const core::GgufMappedRegion region{header.data(), file_size, {}, patch};
-  return HeadersDigest(*storage.checkpoint, &region);
-}
-
-std::string Exl3PleHeadersDigest(const core::GgufReader& reader) {
-  crypto::Sha256Hasher hash;
-  for (const auto& region : reader.GetMappedRegions()) {
-    const auto* base = static_cast<const std::uint8_t*>(region.data);
-    const auto label = region.source_path.filename().string() + '\0' +
-                       std::to_string(region.size) + '\0';
-    hash.Update(
-        {reinterpret_cast<const std::uint8_t*>(label.data()), label.size()});
-    hash.Update({base, region.data_offset});
-  }
-  return hash.FinishHex();
 }
 
 std::uint32_t Exl3VHeadDestination(std::uint32_t index, std::uint32_t dim,
@@ -549,15 +378,15 @@ std::uint32_t Exl3VHeadDestination(std::uint32_t index, std::uint32_t dim,
 }
 
 std::optional<ModelWeights> LoadExl3Model(const std::filesystem::path& path,
-                                          const core::GgufReader& sidecar,
+                                          const core::GgufReader& metadata,
                                           std::string* error) {
   try {
     ModelWeights w;
-    auto config = Config::FromGguf(sidecar, true, error);
+    auto config = Config::FromGguf(metadata, true, error);
     if (!config)
       return std::nullopt;
     w.config = *config;
-    w.exl3_storage = Open(path, sidecar, w.config, false);
+    w.exl3_storage = Open(path, metadata, w.config, false);
     auto& storage = *w.exl3_storage;
     Binder b{storage, w.config};
     w.token_embd = b.Plain("model.language_model.embed_tokens.weight",
@@ -566,44 +395,6 @@ std::optional<ModelWeights> LoadExl3Model(const std::filesystem::path& path,
       Fail("embedding must remain BF16");
     w.output = b.Linear("lm_head", w.config.hidden_size, w.config.vocab_size);
     w.hc_head = b.Mixer("model.language_model.hyper_connection_mixer.", false);
-    if (w.config.ple_layer >= 0 &&
-        !sidecar.GetMetadataBool(quant::exl3::kNativeKey).value_or(false)) {
-      storage.ple_reader = core::GgufReader::OpenFile(
-          Reference(path, sidecar, kExl3PleSource), error);
-      if (!storage.ple_reader)
-        return std::nullopt;
-      CheckDigest(sidecar, "gufo.exl3.ple_headers_sha256",
-                  Exl3PleHeadersDigest(*storage.ple_reader));
-      auto source = ModelWeights::Bind(*storage.ple_reader, error);
-      if (!source)
-        return std::nullopt;
-      const auto& a = source->config;
-      const auto& c = w.config;
-      auto compatible = a;
-      compatible.nextn_layers = 1;
-      if (!compatible.MtpMatches(c) || a.ple_layer != c.ple_layer ||
-          a.ple_rows != c.ple_rows || a.ple_multipliers != c.ple_multipliers ||
-          a.ple_head_offsets != c.ple_head_offsets ||
-          a.ple_head_vocab != c.ple_head_vocab ||
-          a.ple_eos_token != c.ple_eos_token ||
-          a.ple_head_dim != c.ple_head_dim ||
-          source->ple_table.type != core::GgmlType::kIQ4_NL)
-        Fail("retained IQ4_NL PLE source metadata mismatch");
-      for (const auto key :
-           {"tokenizer.ggml.tokens", "tokenizer.ggml.merges",
-            "tokenizer.chat_template", "tokenizer.ggml.bos_token_id",
-            "tokenizer.ggml.eos_token_id", "tokenizer.ggml.pre",
-            "tokenizer.ggml.token_type"}) {
-        const auto* expected = sidecar.FindMetadata(key);
-        const auto* actual = storage.ple_reader->FindMetadata(key);
-        if ((expected == nullptr) != (actual == nullptr) ||
-            (expected && (expected->type != actual->type ||
-                          expected->value != actual->value)))
-          Fail("retained source tokenizer/template mismatch: " +
-               std::string(key));
-      }
-      w.ple_table = source->ple_table;
-    }
     for (std::uint32_t i = 0; i < w.config.num_layers; ++i)
       w.layers.push_back(b.Layer(i, false));
     return w;
@@ -615,31 +406,26 @@ std::optional<ModelWeights> LoadExl3Model(const std::filesystem::path& path,
 }
 
 std::optional<MtpWeights> LoadExl3Mtp(const std::filesystem::path& path,
-                                      const core::GgufReader& sidecar,
+                                      const core::GgufReader& metadata,
                                       const ModelWeights& trunk,
                                       std::string* error) {
   try {
     MtpWeights w;
-    auto config = Config::FromGguf(sidecar, false, error);
+    auto config = Config::FromGguf(metadata, false, error);
     if (!config)
       return std::nullopt;
     if (!config->MtpMatches(trunk.config) || !trunk.exl3_storage)
       Fail("MTP EXL3 metadata does not match trunk");
     w.config = *config;
-    w.exl3_storage = Open(path, sidecar, w.config, true);
-    if (sidecar.GetMetadataBool(quant::exl3::kNativeKey).value_or(false)) {
-      const auto source = trunk.exl3_storage->checkpoint->GetMappedRegions();
-      const auto draft = w.exl3_storage->checkpoint->GetMappedRegions();
-      if (source.size() != draft.size())
+    w.exl3_storage = Open(path, metadata, w.config, true);
+    const auto source = trunk.exl3_storage->checkpoint->GetMappedRegions();
+    const auto draft = w.exl3_storage->checkpoint->GetMappedRegions();
+    if (source.size() != draft.size())
+      Fail("native MTP must use the trunk pack");
+    for (std::size_t i = 0; i < source.size(); ++i)
+      if (!std::filesystem::equivalent(source[i].source_path,
+                                       draft[i].source_path))
         Fail("native MTP must use the trunk pack");
-      for (std::size_t i = 0; i < source.size(); ++i)
-        if (!std::filesystem::equivalent(source[i].source_path,
-                                         draft[i].source_path))
-          Fail("native MTP must use the trunk pack");
-    } else {
-      CheckDigest(sidecar, "gufo.exl3.headers_sha256",
-                  HeadersDigest(*trunk.exl3_storage->checkpoint));
-    }
     Binder b{*w.exl3_storage, w.config};
     w.block = b.Layer(0, true);
     return w;

@@ -165,27 +165,25 @@ void MixerSources() {
   full.Write(patch);
   {
     auto storage = directory.Open(full);
-    const auto main_digest = q::PrepareExl3MtpMixer(storage, c);
-    const auto both_digest = q::PrepareExl3MtpMixer(storage, c, patch);
+    q::PrepareExl3MtpMixer(storage, c);
+    q::PrepareExl3MtpMixer(storage, c, patch);
     Require(storage.supplementary.empty(),
             "in-shard mixer was replaced by patch");
-    Require(main_digest != both_digest,
-            "supplied patch omitted from source identity");
     Fixture changed;
     changed.Mixer(c, 7, 0x32);
     changed.Write(directory.path / "changed.safetensors");
     Reject(
         [&] {
-          (void)q::PrepareExl3MtpMixer(storage, c,
-                                       directory.path / "changed.safetensors");
+          q::PrepareExl3MtpMixer(storage, c,
+                                 directory.path / "changed.safetensors");
         },
         "differs from patch");
     for (const std::string bad : {"[]", "7"}) {
       Fixture::Raw(directory.path / "bad.safetensors", bad);
       Reject(
           [&] {
-            (void)q::PrepareExl3MtpMixer(storage, c,
-                                         directory.path / "bad.safetensors");
+            q::PrepareExl3MtpMixer(storage, c,
+                                   directory.path / "bad.safetensors");
           },
           "must be an object");
     }
@@ -199,8 +197,8 @@ void MixerSources() {
                    std::vector<std::uint8_t>(1024, 0x31));
       Reject(
           [&] {
-            (void)q::PrepareExl3MtpMixer(storage, c,
-                                         directory.path / "bad.safetensors");
+            q::PrepareExl3MtpMixer(storage, c,
+                                   directory.path / "bad.safetensors");
           },
           "invalid MTP mixer patch offset");
     }
@@ -209,9 +207,9 @@ void MixerSources() {
     Fixture partial;
     partial.Mixer(c, mask);
     auto storage = directory.Open(partial);
-    Reject([&] { (void)q::PrepareExl3MtpMixer(storage, c); },
+    Reject([&] { q::PrepareExl3MtpMixer(storage, c); },
            "missing/invalid MTP mixer");
-    (void)q::PrepareExl3MtpMixer(storage, c, patch);
+    q::PrepareExl3MtpMixer(storage, c, patch);
     Require(storage.supplementary.size() == 3 - std::popcount(mask),
             "patch did not supply exactly missing mixer tensors");
     for (const auto& [name, tensor] : storage.supplementary)

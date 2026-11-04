@@ -1,8 +1,3 @@
-add_test(NAME qwen38_flash_next.exl3_metadata
-  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/exl3_metadata_test.py)
-set_tests_properties(qwen38_flash_next.exl3_metadata PROPERTIES
-  LABELS "cpu;qwen38_flash_next;exl3")
-
 # Small operator checks are the default. Full-model qualification and
 # diagnostic probes are built explicitly so routine iterations stay focused.
 add_custom_target(qwen38_flash_next_tests)
@@ -18,7 +13,6 @@ function(add_qwen38_flash_next_test name library labels)
 endfunction()
 
 add_qwen38_flash_next_test(exl3_reference gufo_qwen38_flash_next_reference "cpu;exl3")
-add_qwen38_flash_next_test(exl3_ple_digest gufo_qwen38_flash_next "cpu;exl3")
 
 # Compile the dedicated fixture source without GPU code for loader checks.
 add_executable(qwen38_flash_next_exl3_loader_test exl3_moe_kernel_test.cpp)

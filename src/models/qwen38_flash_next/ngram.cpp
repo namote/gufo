@@ -11,6 +11,7 @@
 #include "src/core/platform/fs.hpp"
 #include "src/core/platform/mapped_file.hpp"
 #include "src/core/quant/exl3/format.hpp"
+#include "src/core/quant/exl3/layout.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
 
 namespace gufo::models::qwen38_flash_next {
@@ -116,6 +117,17 @@ std::unique_ptr<NgramTable> NgramTable::Open(
     t->workers_.emplace_back([raw = t.get()] { raw->Worker(); });
   }
   return t;
+}
+
+std::unique_ptr<NgramTable> NgramTable::ForModel(
+    const std::filesystem::path& model_path, const core::GgufReader& reader,
+    const ModelWeights& weights, std::string* error_msg) {
+  if (reader.GetMetadataBool(quant::exl3::kNativeKey).value_or(false))
+    return OpenExl3(model_path / "ngram_embedding.safetensors", weights.config,
+                    error_msg);
+  const auto& t = weights.ple_table;
+  return Open(reader.GetMappedRegions()[t.shard].file_descriptor, t.file_offset,
+              t.rows, weights.config.ple_head_dim, t.type, error_msg);
 }
 
 std::unique_ptr<NgramTable> NgramTable::OpenExl3(

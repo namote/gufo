@@ -141,18 +141,8 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     return nullptr;
   }
   if (c.ple_layer >= 0) {
-    const auto& t = m->weights_->ple_table;
-    if (m->reader_->GetMetadataBool(quant::exl3::kNativeKey).value_or(false)) {
-      m->ngram_ = NgramTable::OpenExl3(
-          std::filesystem::path(model_path) / "ngram_embedding.safetensors", c,
-          error_msg);
-    } else
-      m->ngram_ = NgramTable::Open(
-          (exl3 ? m->weights_->exl3_storage->ple_reader.get()
-                : m->reader_.get())
-              ->GetMappedRegions()[t.shard]
-              .file_descriptor,
-          t.file_offset, t.rows, c.ple_head_dim, t.type, error_msg);
+    m->ngram_ =
+        NgramTable::ForModel(model_path, *m->reader_, *m->weights_, error_msg);
     if (!m->ngram_) {
       return nullptr;
     }

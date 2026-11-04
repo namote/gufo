@@ -15,9 +15,6 @@
 
 namespace gufo::models::qwen38_flash_next {
 
-inline constexpr std::string_view kExl3PleSource = "gufo.exl3.ple_source";
-inline constexpr std::string_view kExl3MtpMixer = "gufo.exl3.mtp_mixer";
-
 /// Source descriptors borrow the checkpoint. Permutations move whole 128-wide
 /// Hadamard blocks; no compressed payload is duplicated on the host.
 struct Exl3HostLinear {
@@ -29,7 +26,6 @@ struct Exl3HostLinear {
 
 struct Exl3Storage {
   std::shared_ptr<quant::exl3::Checkpoint> checkpoint;
-  std::shared_ptr<core::GgufReader> ple_reader;
   std::deque<std::vector<Exl3HostLinear>> linears;
   std::deque<std::vector<std::uint8_t>> converted;
   std::deque<std::string> names;
@@ -45,20 +41,18 @@ struct Exl3Storage {
                                            std::uint32_t experts = 1);
 /// Prefer in-shard MTP mixer operands. A patch supplies missing tensors;
 /// overlapping operands must have identical dtype, shape and payload bytes.
-/// Returns the header identity of the checkpoint and any supplied patch.
-[[nodiscard]] std::string PrepareExl3MtpMixer(
-    Exl3Storage& storage, const Config& config,
-    const std::filesystem::path& patch = {});
+void PrepareExl3MtpMixer(Exl3Storage& storage, const Config& config,
+                         const std::filesystem::path& patch = {});
 
-/// Identity of retained GGUF shard filenames, sizes and aligned headers.
-[[nodiscard]] std::string Exl3PleHeadersDigest(const core::GgufReader& reader);
-
-/// Header/metadata validation only; projection payloads remain demand mapped.
+/// Binds the native EXL3 pack directory `path` whose metadata
+/// OpenArtifactMetadata built. Header/metadata validation only; projection
+/// payloads remain demand mapped.
 [[nodiscard]] std::optional<ModelWeights> LoadExl3Model(
-    const std::filesystem::path& path, const core::GgufReader& sidecar,
+    const std::filesystem::path& path, const core::GgufReader& metadata,
     std::string* error);
+/// The MTP block of the same native pack as `trunk`.
 [[nodiscard]] std::optional<MtpWeights> LoadExl3Mtp(
-    const std::filesystem::path& path, const core::GgufReader& sidecar,
+    const std::filesystem::path& path, const core::GgufReader& metadata,
     const ModelWeights& trunk, std::string* error);
 
 /// Grouped Hugging Face V head -> tiled runtime head.

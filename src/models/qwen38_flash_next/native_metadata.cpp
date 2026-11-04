@@ -102,8 +102,19 @@ std::uint64_t UInt(const json::Value& v) {
 std::unique_ptr<core::GgufReader> OpenArtifactMetadata(
     const std::filesystem::path& path, std::string* error) {
   std::error_code ec;
-  if (!std::filesystem::is_directory(path, ec))
-    return core::GgufReader::OpenFile(path, error);
+  if (!std::filesystem::is_directory(path, ec)) {
+    auto reader = core::GgufReader::OpenFile(path, error);
+    if (reader && reader->FindMetadata(quant::exl3::kCheckpointKey) &&
+        reader->GetMetadataString("general.architecture") ==
+            std::optional<std::string_view>("qwen4exp")) {
+      if (error)
+        *error =
+            "EXL3 metadata sidecar files are not supported; pass the EXL3 "
+            "pack directory";
+      return nullptr;
+    }
+    return reader;
+  }
   try {
     if (!quant::exl3::Checkpoint::IsExl3(path))
       throw std::runtime_error("directory is not an EXL3 pack");

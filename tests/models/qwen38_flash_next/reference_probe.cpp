@@ -23,6 +23,7 @@
 #include "src/core/quant/exl3/layout.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/exl3_weights.hpp"
+#include "src/models/qwen38_flash_next/native_metadata.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 #include "src/models/qwen38_flash_next/reference.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
@@ -112,7 +113,7 @@ int main(int argc, char** argv) {
   }
 
   std::string error;
-  auto reader = gufo::core::GgufReader::OpenFile(model_path, &error);
+  auto reader = q::OpenArtifactMetadata(model_path, &error);
   if (!reader) {
     std::fprintf(stderr, "open failed: %s\n", error.c_str());
     return 1;
@@ -134,12 +135,7 @@ int main(int argc, char** argv) {
   const auto& c = weights->config;
   std::unique_ptr<q::NgramTable> ngram;
   if (c.ple_layer >= 0) {
-    const auto& t = weights->ple_table;
-    ngram = q::NgramTable::Open(
-        (exl3 ? weights->exl3_storage->ple_reader.get() : reader.get())
-            ->GetMappedRegions()[t.shard]
-            .file_descriptor,
-        t.file_offset, t.rows, c.ple_head_dim, t.type, &error);
+    ngram = q::NgramTable::ForModel(model_path, *reader, *weights, &error);
     if (!ngram) {
       std::fprintf(stderr, "n-gram table failed: %s\n", error.c_str());
       return 1;
