@@ -119,6 +119,7 @@ void Binding() {
   f.Linear("mixed.1", 6);
   f.Linear("unsupported2", 2);
   f.Linear("fractional", 3, true, false, true);
+  f.Linear("fractional2", 2, true, false, true);
   f.Linear("codebook", 4, false);
   f.Linear("biased", 4, true, true);
   auto storage = directory.Open(f);
@@ -135,13 +136,18 @@ void Binding() {
       Require(member.view.rate == ex::BitRate{bits, false},
               "uniform bank rate was not retained");
   }
+  // K3.5 (Vemloir gate/up experts) is the one supported half-integer rate.
+  Require(q::BindExl3LinearBank(storage, "fractional", 128, 128)
+                  .exl3[0]
+                  .view.rate == ex::BitRate{3, true},
+          "K3.5 projection rate was not retained");
   const auto retained = storage.linears.size();
   Reject([&] { (void)q::BindExl3LinearBank(storage, "mixed.{}", 128, 128, 2); },
          "mixed expert rates");
   Require(
       storage.linears.size() == retained && first.exl3[0].view.rate.bits == 3,
       "failed bank binding invalidated retained descriptors");
-  for (const char* name : {"unsupported2", "fractional", "codebook", "biased"})
+  for (const char* name : {"unsupported2", "fractional2", "codebook", "biased"})
     Reject([&] { (void)q::BindExl3LinearBank(storage, name, 128, 128); },
            "invalid projection");
   Reject([&] { (void)q::BindExl3LinearBank(storage, "projection4", 256, 128); },

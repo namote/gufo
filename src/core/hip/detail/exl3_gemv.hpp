@@ -45,6 +45,33 @@ inline constexpr unsigned kSegment = 128;
 /// float(1 / sqrt(128)), correctly rounded.
 inline constexpr float kHadamardScale = 0.0883883461356163F;
 
+/// Compile-time rate codes of the templated trellis kernels: K for an integer
+/// rate K (1..8), kHalfRate + K for the half-integer rate K + 0.5 (mul1,
+/// K = 1..3; the format's mask 0xAAAA: even positions take K bits, odd
+/// positions K + 1, docs/EXL3-FORMAT.md "Positions").
+inline constexpr int kHalfRate = 16;
+constexpr int RateCode(int bits, bool half) noexcept {
+  return half ? kHalfRate + bits : bits;
+}
+constexpr int RateBits(int code) noexcept {
+  return code % kHalfRate;
+}
+constexpr bool RateHalf(int code) noexcept {
+  return code > kHalfRate;
+}
+/// Dwords of one 256-weight tile (8 K, or 8 K + 4 for K + 0.5).
+constexpr unsigned TileDwords(int code) noexcept {
+  return 8U * static_cast<unsigned>(RateBits(code)) +
+         (RateHalf(code) ? 4U : 0U);
+}
+/// Exclusive end bit of tile position `p` (src/core/quant/exl3 StateEndBit).
+constexpr int StateEnd(int code, int p) noexcept {
+  const int k = RateBits(code);
+  if (!RateHalf(code))
+    return (p + 1) * k;
+  return (p / 2) * (2 * k + 1) + (p % 2 == 0 ? k : 2 * k + 1);
+}
+
 /// Offset of element `i` of row `r` in an M-row lane-major input.
 constexpr std::size_t LaneMajorOffset(std::size_t i, unsigned r, unsigned m) {
   const std::size_t kt = i / 16;
@@ -66,24 +93,29 @@ using Half4 = _Float16 __attribute__((ext_vector_type(4)));
 
 inline constexpr std::uint32_t kMul1Multiplier = 0x83DCD12DU;
 
-/// Lane-constant placement of the lane's state window in a tile of 8 * K
-/// dwords: the three source dwords and 32 minus the bit offset of the first
-/// state (that offset is never 0 for K = 1..8; for K8 it is always 24). The
-/// lane's eight states span 7K + 16 bits from that offset, at most 72 bits
-/// (K8, ending exactly at the third dword's end): always inside the three
-/// dwords.
+/// Lane-constant placement of the lane's state window in a tile of
+/// TileDwords(Code) dwords: the three source dwords and 32 minus the bit
+/// offset of the first state's window. That offset is never 0: for an integer
+/// K it is (8L + 1) K - 16 (always 24 for K8); for K + 0.5 it is
+/// 4L (2K + 1) + K - 16, odd for K1, K3 and 2 mod 4 for K2. The lane's eight
+/// states span 7K + 16 bits (integer, at most 72 for K8, ending exactly at the
+/// third dword's end) or 7K + 20 bits (K + 0.5, at most 41): always inside
+/// the three dwords.
 struct LaneWindow {
   unsigned o0, o1, o2;
   unsigned shift;
 };
 
-template<int K>
+template<int Code>
 __device__ __forceinline__ LaneWindow MakeLaneWindow(unsigned lane) {
-  static_assert(K >= 1 && K <= 8, "supported integer rates are K1 through K8");
-  constexpr int kTileBits = 256 * K;
-  constexpr unsigned kWords = 8 * K;
+  static_assert(
+      (!RateHalf(Code) && Code >= 1 && Code <= 8) ||
+          (RateHalf(Code) && RateBits(Code) >= 1 && RateBits(Code) <= 3),
+      "supported rates are K1 through K8 and K1.5 through K3.5");
+  constexpr int kTileBits = 32 * static_cast<int>(TileDwords(Code));
+  constexpr unsigned kWords = TileDwords(Code);
   const int start =
-      ((8 * static_cast<int>(lane) + 1) * K - 16 + kTileBits) % kTileBits;
+      (StateEnd(Code, 8 * static_cast<int>(lane)) - 16 + kTileBits) % kTileBits;
   const unsigned i0 = static_cast<unsigned>(start) / 32;
   LaneWindow w;
   w.o0 = i0;
@@ -123,28 +155,29 @@ __device__ __forceinline__ Half2 DecodePairMul1(std::uint32_t p0,
 }
 
 /// The lane's eight 16-bit states (in the low halves; the upper halves are
-/// arbitrary) from its three dwords: state j is bits [off + Kj, off + Kj +
-/// 16) of d0:d1:d2, most significant bit first. For K <= 6 every state lies in
-/// the 64-bit window cut out by two v_alignbit_b32; the last state of K7 (K8)
-/// also needs window bit 64 (bits 64 .. 71): the d2 bits just below the
-/// window offset.
-template<int K>
+/// arbitrary) from its three dwords: state j is the 16 bits ending at
+/// StateEnd(Code, 8L + j) - StateEnd(Code, 8L) + 16 bits past the window
+/// offset in d0:d1:d2, most significant bit first (bits [off + Kj, off + Kj +
+/// 16) for an integer K). Every state lies in the 64-bit window cut out by two
+/// v_alignbit_b32, except the last state of K7 (K8), which also needs window
+/// bit 64 (bits 64 .. 71): the d2 bits just below the window offset.
+template<int Code>
 __device__ __forceinline__ void LaneStates(std::uint32_t d0, std::uint32_t d1,
                                            std::uint32_t d2, unsigned shift,
                                            std::uint32_t (&state)[8]) {
-  static_assert(K >= 1 && K <= 8);
   const std::uint32_t hi = __builtin_amdgcn_alignbit(d0, d1, shift);
   const std::uint32_t lo = __builtin_amdgcn_alignbit(d1, d2, shift);
   const std::uint64_t window = (static_cast<std::uint64_t>(hi) << 32) | lo;
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
-    if (48 - K * j >= 0) {
-      state[j] = static_cast<std::uint32_t>(window >> (48 - K * j));
+    const int end = StateEnd(Code, j) - StateEnd(Code, 0) + 16;
+    if (64 - end >= 0) {
+      state[j] = static_cast<std::uint32_t>(window >> (64 - end));
     } else {
       // K7 (K8), j = 7: window bits 49 (56) .. 63, then `extra` bits from
       // 64: d2's bits just below the offset (shift = 32 - offset >= extra;
       // K8 has offset 24, shift 8).
-      const int extra = K * j - 48;
+      const int extra = end - 64;
       state[j] =
           (lo << extra) | ((d2 >> (shift - extra)) & ((1U << extra) - 1U));
     }
@@ -154,12 +187,12 @@ __device__ __forceinline__ void LaneStates(std::uint32_t d0, std::uint32_t d1,
 /// The lane's eight decoded weights as four pairs: w[0] rows (r0, r0+1) and
 /// w[1] rows (r0+8, r0+9) of column L / 4; w[2], w[3] the same rows of
 /// column L / 4 + 8.
-template<int K>
+template<int Code>
 __device__ __forceinline__ void DecodeLaneMul1(
     const std::uint32_t* __restrict__ tile, const LaneWindow& lw,
     Half2 (&w)[4]) {
   std::uint32_t state[8];
-  LaneStates<K>(tile[lw.o0], tile[lw.o1], tile[lw.o2], lw.shift, state);
+  LaneStates<Code>(tile[lw.o0], tile[lw.o1], tile[lw.o2], lw.shift, state);
   std::uint32_t p[8];
 #pragma unroll
   for (int j = 0; j < 8; ++j) {

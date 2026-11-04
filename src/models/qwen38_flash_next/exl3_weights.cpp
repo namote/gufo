@@ -245,9 +245,10 @@ TensorRef BindExl3LinearBank(Exl3Storage& storage, const std::string& module,
     if (name.find("{}") != std::string::npos)
       name.replace(name.find("{}"), 2, std::to_string(e));
     const auto lin = storage.checkpoint->GetLinear(name);
-    if (lin.in_features != k || lin.out_features != n || lin.rate.half ||
-        lin.rate.bits < 3 || lin.rate.bits > 8 ||
-        lin.codebook != ex::Codebook::kMul1 || lin.bias != nullptr)
+    if (lin.in_features != k || lin.out_features != n ||
+        (lin.rate.half && lin.rate.bits != 3) || lin.rate.bits < 3 ||
+        lin.rate.bits > 8 || lin.codebook != ex::Codebook::kMul1 ||
+        lin.bias != nullptr)
       Fail("invalid projection geometry/rate/codebook " + name);
     if (!bank.empty() && lin.rate != bank.front().view.rate)
       Fail("mixed expert rates in bank " + module + " at " + name);

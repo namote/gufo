@@ -33,7 +33,7 @@ struct Exl3Storage {
   std::map<std::string, quant::exl3::Tensor, std::less<>> supplementary;
 };
 
-/// Bind actual per-tensor integer K3..K8 rates. Every expert in this bank
+/// Bind actual per-tensor K3..K8 or K3.5 rates. Every expert in this bank
 /// must agree; different banks/projections may use different rates.
 [[nodiscard]] TensorRef BindExl3LinearBank(Exl3Storage& storage,
                                            const std::string& module,

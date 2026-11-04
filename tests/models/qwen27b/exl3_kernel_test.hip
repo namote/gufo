@@ -975,8 +975,9 @@ void TestDispatch(std::mt19937& rng) {
     Check(hipFree(p));
 }
 
-// Every K's lane decode (DecodeLaneMul1, the GEMV producer; K7 through the
-// shared 65-bit lane window) against the CPU dequant, FP16 bits.
+// Every rate's lane decode (DecodeLaneMul1, the GEMV producer; K7 and K8
+// through the third dword, K + 0.5 through the 0xAAAA position widths)
+// against the CPU dequant, FP16 bits. K is a rate code (exl3::RateCode).
 template<int K>
 __global__ void DecodeTilesKernel(const std::uint16_t* trellis, unsigned,
                                   unsigned n, std::uint16_t* out) {
@@ -987,7 +988,7 @@ __global__ void DecodeTilesKernel(const std::uint16_t* trellis, unsigned,
   gufo::hip::exl3::Half2 w[4];
   gufo::hip::exl3::DecodeLaneMul1<K>(
       reinterpret_cast<const std::uint32_t*>(trellis) +
-          std::size_t(tile) * 8 * K,
+          std::size_t(tile) * gufo::hip::exl3::TileDwords(K),
       lw, w);
   const unsigned r0 = (lane % 4) * 2, c0 = lane / 4;
   for (int q = 0; q < 4; ++q) {
@@ -1005,7 +1006,8 @@ __global__ void DecodeTilesKernel(const std::uint16_t* trellis, unsigned,
 template<int K>
 std::size_t DecodeTilesDiff(std::mt19937& rng) {
   constexpr unsigned k = 256, n = 512;
-  const BitRate rate{K, false};
+  const BitRate rate{gufo::hip::exl3::RateBits(K),
+                     gufo::hip::exl3::RateHalf(K)};
   std::vector<std::uint16_t> trellis((k / 16) * (n / 16) * rate.TileWords());
   for (auto& w : trellis)
     w = static_cast<std::uint16_t>(rng());
@@ -1038,6 +1040,15 @@ void TestDecodeTiles(std::mt19937& rng) {
   std::cout << "lane decode K1..K8 vs CPU: ";
   for (int b = 0; b < 8; ++b)
     std::cout << diffs[b] << (b < 7 ? "/" : " values differ\n");
+  using gufo::hip::exl3::RateCode;
+  const std::size_t half[] = {DecodeTilesDiff<RateCode(1, true)>(rng),
+                              DecodeTilesDiff<RateCode(2, true)>(rng),
+                              DecodeTilesDiff<RateCode(3, true)>(rng)};
+  for (int b = 0; b < 3; ++b)
+    Expect(half[b] == 0, "lane decode K" + std::to_string(b + 1) + ".5: " +
+                             std::to_string(half[b]) + " FP16 values differ");
+  std::cout << "lane decode K1.5/K2.5/K3.5 vs CPU: " << half[0] << "/"
+            << half[1] << "/" << half[2] << " values differ\n";
 }
 
 // Grouped rotation (gathered rows) and grouped GEMM over expert-like buckets
@@ -1163,9 +1174,10 @@ void TestGrouped(std::mt19937& rng, const std::size_t (&rows)[4],
 // partition gives bit-identical values; each against the FP64 inner product
 // at the WMMA bound; rows outside every bucket and descriptors past the
 // device count stay untouched; a bank entry of the wrong rate writes NaN.
-void TestBuckets(std::size_t k, std::size_t n, int bits, std::mt19937& rng) {
+void TestBuckets(std::size_t k, std::size_t n, BitRate rate,
+                 std::mt19937& rng) {
   constexpr std::size_t kExperts = 4;
-  const BitRate rate{bits, false};
+  const int bits = rate.bits;
   const std::size_t expert_rows[kExperts] = {1, 37, 0, 70};
   std::size_t total = 1;  // row 0 belongs to no bucket (sentinel)
   for (std::size_t e : expert_rows)
@@ -1233,8 +1245,9 @@ void TestBuckets(std::size_t k, std::size_t n, int bits, std::mt19937& rng) {
     Check(hipDeviceSynchronize());
     const auto got = Download(d_inner, total * n);
     const std::string name =
-        "bucket K" + std::to_string(bits) + " k=" + std::to_string(k) +
-        " n=" + std::to_string(n) + " partition=" + std::to_string(partition);
+        "bucket K" + std::to_string(bits) + (rate.half ? ".5" : "") +
+        " k=" + std::to_string(k) + " n=" + std::to_string(n) +
+        " partition=" + std::to_string(partition);
     bool untouched = true;
     for (std::size_t j = 0; j < n; ++j)
       untouched =
@@ -1455,12 +1468,14 @@ int main() {
   TestDecodeTiles(rng);
   TestGrouped(rng, {0, 7, 33, 300}, 300, false);
   TestGrouped(rng, {5, 0, 64, 1}, 64, true);
-  TestBuckets(2560, 640, 5, rng);
-  TestBuckets(640, 2560, 5, rng);
+  TestBuckets(2560, 640, {5, false}, rng);
+  TestBuckets(640, 2560, {5, false}, rng);
   // Mixed-rate packs (4.05 / Kyojin): K4 and K7 expert banks.
-  TestBuckets(2560, 640, 4, rng);
-  TestBuckets(640, 2560, 7, rng);
-  TestBuckets(2560, 640, 8, rng);
+  TestBuckets(2560, 640, {4, false}, rng);
+  TestBuckets(640, 2560, {7, false}, rng);
+  TestBuckets(2560, 640, {8, false}, rng);
+  // Vemloir Flash-Next K3.5 gate/up experts.
+  TestBuckets(2560, 640, {3, true}, rng);
   // Flash-Next attention q (production geometry 4 x 4 for q + k + v) and a
   // smaller q (2 x 4); k + v alone would take 2 x 16.
   TestShapeBasis(12288, rng);

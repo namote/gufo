@@ -223,8 +223,9 @@ enum class HalfEpilogue { kStore, kSwiGLU, kGateUp, kResidual };
 
 // Fully scaled FP16 weights and activations; FP32 accumulation in K16 order.
 // TrellisBits > 0 (EXL3, plan/exl3/X3-DESIGN.md) replaces the GGUF weight
-// producer by the trellis decode (mul1 codebook, K = TrellisBits): w is the
-// trellis [k/16][m/16][16K], each 16 x 16 tile one weight sub-tile of s_a,
+// producer by the trellis decode (mul1 codebook, TrellisBits the rate code
+// exl3::RateCode: K, or kHalfRate + K for K + 0.5): w is the trellis
+// [k/16][m/16][TileDwords], each 16 x 16 tile one weight sub-tile of s_a,
 // decoded bit for bit as src/core/quant/exl3 DequantTile. The activations,
 // the WMMA loop and the K16 order are unchanged; the epilogue then rotates
 // every 128-channel segment, y = svh * H(acc) (kStore or kResidual), staged
@@ -363,9 +364,9 @@ __launch_bounds__(WM * WN * 32) __global__ void HalfPrefillGemmKernel(
     } else {
       y += static_cast<std::size_t>(bucket.first) * m;
     }
-    if (linear.codebook != quant::exl3::Codebook::kMul1 || linear.rate.half ||
-        linear.rate.bits != TrellisBits || linear.k != unsigned(k) ||
-        linear.n != unsigned(m)) {
+    if (linear.codebook != quant::exl3::Codebook::kMul1 ||
+        exl3::RateCode(linear.rate.bits, linear.rate.half) != TrellisBits ||
+        linear.k != unsigned(k) || linear.n != unsigned(m)) {
       // Contract violation: poison this bucket's block of outputs.
       for (int i = tid; i < BM * BN; i += kThreads) {
         const int token = t_block + i / BM, row = r_block + i % BM;
@@ -493,7 +494,7 @@ __launch_bounds__(WM * WN * 32) __global__ void HalfPrefillGemmKernel(
         const std::uint32_t* tile =
             base + (static_cast<std::size_t>(ks0 + ks) * (trellis_rows / 16) +
                     (r_block / 16) + rt) *
-                       (8 * kTrellisK);
+                       exl3::TileDwords(kTrellisK);
         traw[i] = {tile[lw.o0], tile[lw.o1], tile[lw.o2]};
       }
     } else {
@@ -1322,6 +1323,16 @@ void LaunchExl3PrefillGemmGrouped(const Exl3GemmProblem* problems,
 
 namespace {
 
+// Expert buckets also take K3.5 (Vemloir Flash-Next gate/up experts).
+bool Exl3BucketShapeSupported(std::uint32_t k, std::uint32_t n,
+                              quant::exl3::BitRate rate) noexcept {
+  return rate.half
+             ? rate.bits == 3 &&
+                   Exl3GemmShapeSupported(k, n, {3, false},
+                                          quant::exl3::Codebook::kMul1)
+             : Exl3GemmShapeSupported(k, n, rate, quant::exl3::Codebook::kMul1);
+}
+
 template<int Bits, int Mode = 2>
 void LaunchBucketTiles(const quant::exl3::DeviceLinear* device_bank,
                        const Exl3PrefillBucket* device_buckets,
@@ -1377,10 +1388,10 @@ void LaunchExl3PrefillBucketInnerHalf(
     std::uint32_t tile_rows, const std::uint16_t* input, std::uint16_t* inner,
     std::uint32_t k, std::uint32_t n, quant::exl3::BitRate rate,
     const std::int32_t* row_exponents, hipStream_t stream) {
-  if (!Exl3GemmShapeSupported(k, n, rate, quant::exl3::Codebook::kMul1) ||
-      tile_rows == 0 || tile_rows > 64 || max_buckets > 65535 ||
-      device_bank == nullptr || device_buckets == nullptr ||
-      device_bucket_count == nullptr || input == nullptr || inner == nullptr) {
+  if (!Exl3BucketShapeSupported(k, n, rate) || tile_rows == 0 ||
+      tile_rows > 64 || max_buckets > 65535 || device_bank == nullptr ||
+      device_buckets == nullptr || device_bucket_count == nullptr ||
+      input == nullptr || inner == nullptr) {
     throw std::invalid_argument("EXL3 FP16 bucket GEMM: unsupported call");
   }
   if (max_buckets == 0)
@@ -1391,6 +1402,11 @@ void LaunchExl3PrefillBucketInnerHalf(
                                max_buckets, tile_rows, input, out, k, n, stream,
                                row_exponents);
   };
+  if (rate.half) {
+    launch.template operator()<exl3::RateCode(3, true)>();
+    HIP_CHECK(hipGetLastError());
+    return;
+  }
   switch (rate.bits) {
     case 1:
       launch.template operator()<1>();
@@ -1429,10 +1445,10 @@ void LaunchExl3PrefillBucketInner(const quant::exl3::DeviceLinear* device_bank,
                                   std::uint32_t k, std::uint32_t n,
                                   quant::exl3::BitRate rate,
                                   hipStream_t stream) {
-  if (!Exl3GemmShapeSupported(k, n, rate, quant::exl3::Codebook::kMul1) ||
-      tile_rows == 0 || tile_rows > 64 || max_buckets > 65535 ||
-      device_bank == nullptr || device_buckets == nullptr ||
-      device_bucket_count == nullptr || input == nullptr || inner == nullptr) {
+  if (!Exl3BucketShapeSupported(k, n, rate) || tile_rows == 0 ||
+      tile_rows > 64 || max_buckets > 65535 || device_bank == nullptr ||
+      device_buckets == nullptr || device_bucket_count == nullptr ||
+      input == nullptr || inner == nullptr) {
     throw std::invalid_argument("EXL3 bucket GEMM: unsupported call");
   }
   if (max_buckets == 0)
@@ -1441,6 +1457,11 @@ void LaunchExl3PrefillBucketInner(const quant::exl3::DeviceLinear* device_bank,
     LaunchBucketTiles<Bits>(device_bank, device_buckets, device_bucket_count,
                             max_buckets, tile_rows, input, inner, k, n, stream);
   };
+  if (rate.half) {
+    launch.template operator()<exl3::RateCode(3, true)>();
+    HIP_CHECK(hipGetLastError());
+    return;
+  }
   switch (rate.bits) {
     case 1:
       launch.template operator()<1>();

@@ -281,14 +281,16 @@ struct Buffers {
 struct Bank {
   unsigned k, n, experts;
   int bits;
+  bool half;
   std::vector<std::uint16_t> trellis, suh, svh;
   std::vector<ex::DeviceLinear> descriptors;
   gpu::DeviceTensor weight;
 
   Bank(Buffers& buffers, unsigned inputs, unsigned outputs, int rate,
-       unsigned count = 1, unsigned seed = 12345)
-      : k(inputs), n(outputs), experts(count), bits(rate) {
-    const auto words = std::size_t{k / 16} * (n / 16) * 16 * bits;
+       unsigned count = 1, unsigned seed = 12345, bool half_rate = false)
+      : k(inputs), n(outputs), experts(count), bits(rate), half(half_rate) {
+    const auto words =
+        std::size_t{k / 16} * (n / 16) * ex::BitRate{bits, half}.TileWords();
     trellis.resize(words * experts);
     suh.resize(std::size_t{k} * experts);
     svh.resize(std::size_t{n} * experts);
@@ -310,7 +312,7 @@ struct Bank {
                              dv + e * n,
                              k,
                              n,
-                             {bits, false},
+                             {bits, half},
                              ex::Codebook::kMul1});
     weight.data = dt;
     weight.cols = k;
@@ -370,9 +372,10 @@ struct Bank {
   std::vector<float> ProjectRotated(unsigned expert,
                                     std::span<const float> rotated,
                                     std::vector<float>* raw = nullptr) const {
-    const auto words = std::size_t{k / 16} * (n / 16) * 16 * bits;
+    const auto words =
+        std::size_t{k / 16} * (n / 16) * ex::BitRate{bits, half}.TileWords();
     std::vector<std::uint16_t> inner(std::size_t{k} * n);
-    ex::DequantInner(trellis.data() + expert * words, k, n, {bits, false},
+    ex::DequantInner(trellis.data() + expert * words, k, n, {bits, half},
                      ex::Codebook::kMul1, inner.data());
     std::vector<double> y(n);
     for (unsigned j = 0; j < n; ++j)
@@ -570,15 +573,19 @@ void Projection(unsigned k, unsigned n, int bits,
   }
 }
 
+// gate_up_half: K3.5 gate/up banks (Vemloir Flash-Next), K5 down.
 void Routed(bool shared, unsigned rows, unsigned k = 128, unsigned ff = 128,
-            unsigned experts = 512) {
-  BeginCase(
-      Shape(shared ? "routed shared" : "routed disjoint", k, ff, 5, rows) +
-      " down_n=" + std::to_string(k) + " experts=" + std::to_string(experts) +
-      " topk=10");
+            unsigned experts = 512, bool gate_up_half = false) {
+  const int gate_up_bits = gate_up_half ? 3 : 5;
+  BeginCase(Shape(std::string(shared ? "routed shared" : "routed disjoint") +
+                      (gate_up_half ? " gate_up=K3.5" : ""),
+                  k, ff, 5, rows) +
+            " down_n=" + std::to_string(k) +
+            " experts=" + std::to_string(experts) + " topk=10");
   Buffers buffers;
   constexpr unsigned used = 10;
-  Bank gate(buffers, k, ff, 5, experts, 1), up(buffers, k, ff, 5, experts, 2),
+  Bank gate(buffers, k, ff, gate_up_bits, experts, 1, gate_up_half),
+      up(buffers, k, ff, gate_up_bits, experts, 2, gate_up_half),
       down(buffers, ff, k, 5, experts, 3);
   gpu::DeviceLayer layer;
   layer.ffn_gate_exps = gate.weight;
@@ -2377,6 +2384,8 @@ int main(int argc, char** argv) {
       Routed(true, rows);
       Routed(false, rows);
     }
+    for (unsigned rows : {1U, 3U, 8U, 9U})
+      Routed(false, rows, 256, 256, 64, true);
     std::cout << "Flash-Next EXL3 GPU contracts passed\n";
     return 0;
   } catch (const std::exception& error) {

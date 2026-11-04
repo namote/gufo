@@ -141,8 +141,8 @@ __device__ __forceinline__ void RoutedGemvBody(
 #pragma unroll
     for (unsigned u = 0; u < kAhead; ++u) {
       const unsigned kt = min(kt0 + u, k_tiles - 1);
-      const auto* tile =
-          trellis + (std::size_t{kt} * (n / 16) + nt) * (8 * Bits);
+      const auto* tile = trellis + (std::size_t{kt} * (n / 16) + nt) *
+                                       arithmetic::TileDwords(Bits);
       raw[u][0] = tile[lw.o0];
       raw[u][1] = tile[lw.o1];
       raw[u][2] = tile[lw.o2];
@@ -810,7 +810,9 @@ __global__ void BucketDownFallback(const ex::DeviceLinear* bank,
       for (unsigned kt = 0; kt < k / 16; ++kt) {
         Half2 w[4];
         arithmetic::DecodeLaneMul1<Bits>(
-            trellis + (std::size_t{kt} * (n / 16) + nt) * (8 * Bits), lw, w);
+            trellis + (std::size_t{kt} * (n / 16) + nt) *
+                          arithmetic::TileDwords(Bits),
+            lw, w);
         const auto* group = x + kt * 16 + r0;
         const Half2 v01{group[0], group[1]}, v89{group[8], group[9]};
         a = DotPairF32(w[0], v01, a);
@@ -930,7 +932,9 @@ __global__ void HeadGemv(ex::DeviceLinear l, const std::uint16_t* input,
   for (unsigned kt = 0; kt < l.k / 16; ++kt) {
     Half2 w[4];
     arithmetic::DecodeLaneMul1<Bits>(
-        trellis + (std::size_t{kt} * (l.n / 16) + nt) * (8 * Bits), lw, w);
+        trellis +
+            (std::size_t{kt} * (l.n / 16) + nt) * arithmetic::TileDwords(Bits),
+        lw, w);
     const auto offset = arithmetic::LaneMajorOffset(kt * 16 + r0, 0, 1);
     const auto* group = x + offset;
     const Half2 v01{group[0], group[1]}, v89{group[2], group[3]};
@@ -1068,8 +1072,12 @@ void Exl3Scatter(const float* x, const std::int32_t* slots, float* out,
 namespace {
 template<class F>
 void WithRate(ex::BitRate rate, F&& f) {
-  if (rate.half)
-    throw std::invalid_argument("Flash-Next experts need integer K3..K8");
+  if (rate.half) {
+    if (rate.bits != 3)
+      throw std::invalid_argument("Flash-Next experts need K3..K8 or K3.5");
+    f.template operator()<arithmetic::RateCode(3, true)>();
+    return;
+  }
   switch (rate.bits) {
     case 3:
       f.template operator()<3>();
@@ -1090,7 +1098,7 @@ void WithRate(ex::BitRate rate, F&& f) {
       f.template operator()<8>();
       break;
     default:
-      throw std::invalid_argument("Flash-Next experts need K3..K8");
+      throw std::invalid_argument("Flash-Next experts need K3..K8 or K3.5");
   }
 }
 ex::BitRate BankRate(const DeviceTensor& bank) {
