@@ -106,21 +106,12 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
     const auto& rotation = layer.rotation;
     // EXL3 layers norm and rotate the row for their input group in one
     // launch (false: the usual norm below).
-    const bool attn_rotated =
-        layer.is_full_attention
-            ? IsExl3(layer.attn_q) &&
-                  LaunchExl3NormForConsumers(
-                      decode_scratch.hidden.data(),
-                      static_cast<const float*>(layer.attn_norm.data),
-                      decode_scratch.normed.data(), hidden_size, 1e-6F,
-                      {&layer.attn_q, &layer.attn_k, &layer.attn_v}, exl3,
-                      arena.stream)
-            : IsExl3(layer.attn_qkv) &&
-                  LaunchExl3NormForConsumers(
-                      decode_scratch.hidden.data(),
-                      static_cast<const float*>(layer.attn_norm.data),
-                      decode_scratch.normed.data(), hidden_size, 1e-6F,
-                      {&layer.attn_qkv, &layer.attn_gate}, exl3, arena.stream);
+    const bool attn_rotated = LaunchExl3LayerNorm(
+        layer, Exl3LayerInput::kAttention, decode_scratch.hidden.data(),
+        decode_scratch.normed.data(), hidden_size, 1e-6F, exl3, arena.stream);
+    const Exl3AttentionInputs exl3_inputs{
+        ssm_scratch.qkv.data(), attention_scratch.k.data(),
+        attention_scratch.v.data(), ssm_scratch.gate.data()};
     if (attn_rotated) {
       // Normed and rotated above.
     } else if (rotation.attn_in != nullptr) {
@@ -143,13 +134,10 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
       const std::size_t total_k = arena.GetAttentionKvPlaneElements();
       const std::uint32_t attn_layer_idx = l / config.full_attention_interval;
 
-      if (IsExl3(layer.attn_q)) {
-        const Exl3GroupOutput qkv[] = {
-            {&layer.attn_q, ssm_scratch.qkv.data()},
-            {&layer.attn_k, attention_scratch.k.data()},
-            {&layer.attn_v, attention_scratch.v.data()}};
-        LaunchExl3Projections(qkv, decode_scratch.normed.data(), 1, exl3,
-                              arena.stream, 0, attn_rotated);
+      if (IsExl3AttentionInput(layer)) {
+        LaunchExl3AttentionInputs(layer, decode_scratch.normed.data(), 1,
+                                  exl3_inputs, exl3, arena.stream,
+                                  attn_rotated);
       } else {
         LaunchFusedQKVProjections(
             layer.attn_q.data, layer.attn_q.type, layer.attn_k.data,
@@ -266,13 +254,11 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
     } else {
       // SSM path
 
-      if (IsExl3(layer.attn_qkv)) {
+      if (IsExl3AttentionInput(layer)) {
         // EXL3 qkv and z; alpha and beta stay unquantized GGUF tensors.
-        const Exl3GroupOutput qkvz[] = {
-            {&layer.attn_qkv, ssm_scratch.qkv.data()},
-            {&layer.attn_gate, ssm_scratch.gate.data()}};
-        LaunchExl3Projections(qkvz, decode_scratch.normed.data(), 1, exl3,
-                              arena.stream, 0, attn_rotated);
+        LaunchExl3AttentionInputs(layer, decode_scratch.normed.data(), 1,
+                                  exl3_inputs, exl3, arena.stream,
+                                  attn_rotated);
         LaunchGEMV(layer.ssm_alpha.data, layer.ssm_alpha.type,
                    decode_scratch.normed.data(), ssm_scratch.alpha.data(),
                    time_step_rank, hidden_size, arena.stream);
@@ -324,12 +310,10 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
 
       {
         // FFN Pre-RMSNorm (EXL3: fused with the gate/up input rotation).
-        ffn_rotated = IsExl3(layer.ffn_gate) &&
-                      LaunchExl3NormForConsumers(
-                          decode_scratch.hidden.data(),
-                          static_cast<const float*>(layer.ffn_norm.data),
-                          decode_scratch.normed.data(), hidden_size, 1e-6F,
-                          {&layer.ffn_gate, &layer.ffn_up}, exl3, arena.stream);
+        ffn_rotated = LaunchExl3LayerNorm(
+            layer, Exl3LayerInput::kFfn, decode_scratch.hidden.data(),
+            decode_scratch.normed.data(), hidden_size, 1e-6F, exl3,
+            arena.stream);
         if (ffn_rotated) {
           // Normed and rotated above.
         } else if (rotation.ffn_in != nullptr) {

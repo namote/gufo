@@ -207,6 +207,70 @@ inline bool LaunchExl3NormForConsumers(
                                stream);
 }
 
+/// Which shared input of a layer a group of projections reads.
+enum class Exl3LayerInput { kAttention, kFfn };
+
+/// LaunchExl3NormForConsumers for the projections of `layer` that read
+/// `input`, in the order of LaunchExl3AttentionInputs (q, k, v or qkv, z) and
+/// LaunchExl3SwiGLUMlp (gate, up). False, launching nothing, for non-EXL3
+/// layers or when the fast path does not apply.
+inline bool LaunchExl3LayerNorm(const models::QwenLayerWeights& layer,
+                                Exl3LayerInput input, const float* x,
+                                float* normed, std::size_t dim, float eps,
+                                const quant::exl3::ReferenceScratch* scratch,
+                                hipStream_t stream) {
+  if (input == Exl3LayerInput::kFfn) {
+    return LaunchExl3NormForConsumers(
+        x, static_cast<const float*>(layer.ffn_norm.data), normed, dim, eps,
+        {&layer.ffn_gate, &layer.ffn_up}, scratch, stream);
+  }
+  const auto* weight = static_cast<const float*>(layer.attn_norm.data);
+  return layer.is_full_attention
+             ? LaunchExl3NormForConsumers(
+                   x, weight, normed, dim, eps,
+                   {&layer.attn_q, &layer.attn_k, &layer.attn_v}, scratch,
+                   stream)
+             : LaunchExl3NormForConsumers(x, weight, normed, dim, eps,
+                                          {&layer.attn_qkv, &layer.attn_gate},
+                                          scratch, stream);
+}
+
+/// Destinations of a layer's attention input projections (dense rows).
+/// Full attention writes q (gate interleaved) to `qkv`, k and v; linear
+/// attention writes qkv and z (`gate`). Unused pointers may be null.
+struct Exl3AttentionInputs {
+  float* qkv;
+  float* k;
+  float* v;
+  float* gate;
+};
+
+/// The EXL3 attention input projections of `layer` as one group: q, k, v for
+/// full attention, qkv and z for linear attention (whose alpha and beta stay
+/// unquantized). `input_rotated` as in LaunchExl3Projections.
+inline void LaunchExl3AttentionInputs(
+    const models::QwenLayerWeights& layer, const float* x, std::size_t rows,
+    const Exl3AttentionInputs& out,
+    const quant::exl3::ReferenceScratch* scratch, hipStream_t stream,
+    bool input_rotated = false) {
+  if (layer.is_full_attention) {
+    const Exl3GroupOutput qkv[] = {{&layer.attn_q, out.qkv},
+                                   {&layer.attn_k, out.k},
+                                   {&layer.attn_v, out.v}};
+    LaunchExl3Projections(qkv, x, rows, scratch, stream, 0, input_rotated);
+    return;
+  }
+  const Exl3GroupOutput qkvz[] = {{&layer.attn_qkv, out.qkv},
+                                  {&layer.attn_gate, out.gate}};
+  LaunchExl3Projections(qkvz, x, rows, scratch, stream, 0, input_rotated);
+}
+
+/// Whether the attention input projections of `layer` are EXL3.
+[[nodiscard]] inline bool IsExl3AttentionInput(
+    const models::QwenLayerWeights& layer) noexcept {
+  return IsExl3(layer.is_full_attention ? layer.attn_q : layer.attn_qkv);
+}
+
 /// The largest input width of the model's projections (workspace sizing).
 [[nodiscard]] inline std::size_t MaxExl3InputWidth(
     const core::ModelConfig& config) noexcept {
