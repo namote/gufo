@@ -1,5 +1,24 @@
 # gfx1151 optimization know-how
 
+## EXL3 refactor and native 27B combined pass, November 4, 2026
+
+Base `e5002432` versus `76e46955`, identical RelWithDebInfo docker builds,
+`tests/functional/run.py` with recorded baselines. All suites pass functionally
+with no quality/coverage change: 27B EXL3 5.00bpw (base through a GGUF
+sidecar, candidate from the pack directory, same `--model` string and BF16
+`--mmproj` on both) `conversation`/`batch`/`long-context`; 27B UD-Q4_K_M and
+Flash-Next Kyojin native `conversation`/`batch`. Summed per run, decode and
+server time stay within 1% (27B EXL3 prefill -4% from the WMMA threshold).
+`gufo bench` 27B EXL3 pp512/pp2048/tg128 is unchanged within 1% across two
+alternations. Every retained per-request flag is inconclusive and moves both
+ways: `batch_c2_greedy_short_*` cache snapshots take a whole number of
+~80 ms steps (175/257, 489/570/813 ms), so the step a request pays shifts
+between runs; `short_pairs` TTFT/inter-token flags follow which of the two
+concurrent requests is admitted first. A bisect over every intermediate commit
+shows the same pattern, not a code regression. Starting a native-pack 27B
+server without `--mmproj` loads its embedded EXL3 vision (927,587,264 B), so
+compare text timing only with matching vision residency.
+
 ## Qwen3.8 27B EXL3 prefill WMMA threshold, November 4, 2026
 
 Per-projection prefill time, X2b GEMV (8-row passes) versus X3/X3b trellis
