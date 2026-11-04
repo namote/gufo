@@ -1028,16 +1028,16 @@ std::size_t DecodeTilesDiff(std::mt19937& rng) {
 }
 
 void TestDecodeTiles(std::mt19937& rng) {
-  const std::size_t diffs[] = {DecodeTilesDiff<1>(rng), DecodeTilesDiff<2>(rng),
-                               DecodeTilesDiff<3>(rng), DecodeTilesDiff<4>(rng),
-                               DecodeTilesDiff<5>(rng), DecodeTilesDiff<6>(rng),
-                               DecodeTilesDiff<7>(rng)};
-  for (int b = 0; b < 7; ++b)
+  const std::size_t diffs[] = {
+      DecodeTilesDiff<1>(rng), DecodeTilesDiff<2>(rng), DecodeTilesDiff<3>(rng),
+      DecodeTilesDiff<4>(rng), DecodeTilesDiff<5>(rng), DecodeTilesDiff<6>(rng),
+      DecodeTilesDiff<7>(rng), DecodeTilesDiff<8>(rng)};
+  for (int b = 0; b < 8; ++b)
     Expect(diffs[b] == 0, "lane decode K" + std::to_string(b + 1) + ": " +
                               std::to_string(diffs[b]) + " FP16 values differ");
-  std::cout << "lane decode K1..K7 vs CPU: ";
-  for (int b = 0; b < 7; ++b)
-    std::cout << diffs[b] << (b < 6 ? "/" : " values differ\n");
+  std::cout << "lane decode K1..K8 vs CPU: ";
+  for (int b = 0; b < 8; ++b)
+    std::cout << diffs[b] << (b < 7 ? "/" : " values differ\n");
 }
 
 // Grouped rotation (gathered rows) and grouped GEMM over expert-like buckets
@@ -1418,7 +1418,12 @@ int main() {
                               {2560, 512, 7},
                               {2560, 640, 5},
                               {640, 2560, 5},
-                              {6144, 2560, 7}};
+                              {6144, 2560, 7},
+                              // Vemloir Flash-Next: K8 head, shared expert,
+                              // attention k/v and indexer.
+                              {2560, 512, 8},
+                              {512, 2560, 8},
+                              {1024, 384, 8}};
   for (const Problem& p : problems)
     TestProblem(p, rng);
   // q + k + v (four tiles per wave) and gate + up shapes at small k.
@@ -1427,6 +1432,8 @@ int main() {
   TestGroup(1024, {2048, 1024}, 6, rng);
   TestMlp(512, 1024, 5, rng);
   TestMlp(1024, 2048, 4, rng);
+  TestMlp(512, 1024, 8, rng);
+  TestGroup(512, {1024, 1024}, 8, rng);
   TestNormFusion(rng);
   TestPackedHash();
   // X3b narrow tile (17..64 rows) and the X3 prefill tile, k up to 17408.
@@ -1442,6 +1449,9 @@ int main() {
   TestPrefill(2560, 512, 7, 33, rng);
   TestPrefill(2560, 640, 5, 300, rng);
   TestPrefill(640, 2560, 5, 65, rng);
+  // K8 (Vemloir Flash-Next dense projections): narrow and prefill tiles.
+  TestPrefill(2560, 512, 8, 33, rng);
+  TestPrefill(2560, 512, 8, 300, rng);
   TestDecodeTiles(rng);
   TestGrouped(rng, {0, 7, 33, 300}, 300, false);
   TestGrouped(rng, {5, 0, 64, 1}, 64, true);
@@ -1450,6 +1460,7 @@ int main() {
   // Mixed-rate packs (4.05 / Kyojin): K4 and K7 expert banks.
   TestBuckets(2560, 640, 4, rng);
   TestBuckets(640, 2560, 7, rng);
+  TestBuckets(2560, 640, 8, rng);
   // Flash-Next attention q (production geometry 4 x 4 for q + k + v) and a
   // smaller q (2 x 4); k + v alone would take 2 x 16.
   TestShapeBasis(12288, rng);

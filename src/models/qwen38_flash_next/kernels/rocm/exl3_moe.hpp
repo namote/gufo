@@ -125,7 +125,7 @@ using Exl3BucketGemm = void (*)(const quant::exl3::DeviceLinear* bank,
                                 std::uint32_t k, std::uint32_t n,
                                 quant::exl3::BitRate rate, hipStream_t stream);
 
-/// Production adapter: the shared X3 bucket WMMA at the bank's rate (K3..K7).
+/// Production adapter: the shared X3 bucket WMMA at the bank's rate (K3..K8).
 void Exl3PrefillBucketInner(const quant::exl3::DeviceLinear* bank,
                             const Exl3ExpertBucket* buckets,
                             const std::uint32_t* bucket_count,

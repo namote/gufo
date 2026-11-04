@@ -2365,7 +2365,7 @@ int main(int argc, char** argv) {
     CompressedPrefillChunks();
     InputRoundingControl();
     DecodeK7();
-    for (int bits : {5, 6, 7})
+    for (int bits : {5, 6, 7, 8})
       Projection(256, 640, bits);
     Projection(640, 2560, 7);
     Projection(2560, 6144, 7, {1U, 3U});

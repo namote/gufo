@@ -109,7 +109,7 @@ struct Directory {
 void Binding() {
   Directory directory;
   Fixture f;
-  for (int bits : {3, 4, 5, 6, 7}) {
+  for (int bits : {3, 4, 5, 6, 7, 8}) {
     f.Linear("projection" + std::to_string(bits), bits);
     for (unsigned expert = 0; expert < 3; ++expert)
       f.Linear("bank" + std::to_string(bits) + "." + std::to_string(expert),
@@ -118,14 +118,13 @@ void Binding() {
   f.Linear("mixed.0", 4);
   f.Linear("mixed.1", 6);
   f.Linear("unsupported2", 2);
-  f.Linear("unsupported8", 8);
   f.Linear("fractional", 3, true, false, true);
   f.Linear("codebook", 4, false);
   f.Linear("biased", 4, true, true);
   auto storage = directory.Open(f);
   // A global bits=5.05 setting must not override any actual tensor rate.
   const auto first = q::BindExl3LinearBank(storage, "projection3", 128, 128);
-  for (int bits : {3, 4, 5, 6, 7}) {
+  for (int bits : {3, 4, 5, 6, 7, 8}) {
     const auto single = q::BindExl3LinearBank(
         storage, "projection" + std::to_string(bits), 128, 128);
     Require(single.exl3[0].view.rate == ex::BitRate{bits, false},
@@ -142,8 +141,7 @@ void Binding() {
   Require(
       storage.linears.size() == retained && first.exl3[0].view.rate.bits == 3,
       "failed bank binding invalidated retained descriptors");
-  for (const char* name :
-       {"unsupported2", "unsupported8", "fractional", "codebook", "biased"})
+  for (const char* name : {"unsupported2", "fractional", "codebook", "biased"})
     Reject([&] { (void)q::BindExl3LinearBank(storage, name, 128, 128); },
            "invalid projection");
   Reject([&] { (void)q::BindExl3LinearBank(storage, "projection4", 256, 128); },
@@ -645,7 +643,7 @@ void ControlGemm(const ex::DeviceLinear* bank,
                  std::uint32_t tile_rows, const std::uint16_t* input,
                  float* output, std::uint32_t k, std::uint32_t n,
                  ex::BitRate rate, hipStream_t stream) {
-  Require(!rate.half && rate.bits >= 3 && rate.bits <= 7, "control bank rate");
+  Require(!rate.half && rate.bits >= 3 && rate.bits <= 8, "control bank rate");
   Require(tile_rows == 16 || tile_rows == 32 || tile_rows == 64,
           "adapter tile row contract");
   unsigned index = 0;
@@ -1524,7 +1522,7 @@ void QualifyFlashNextExl3PrefillAdapter(gpu::Exl3BucketGemm gemm, int bits) {
 
 int main() {
   try {
-    for (int bits : {3, 4, 5, 6, 7}) {
+    for (int bits : {3, 4, 5, 6, 7, 8}) {
       std::cout << "CASE expert K=" << bits << '\n';
       bool rejected = false;
       try {

@@ -301,8 +301,8 @@ __launch_bounds__(WM * WN * 32) __global__ void HalfPrefillGemmKernel(
     unsigned group_shift = 3;
     // This long-K EXL3 projection benefits from reusing each weight tile
     // across token blocks before advancing to the next output-channel tile.
-    if constexpr (BM == 256 && BN == 256 && TrellisBits == 7 &&
-                  Batching == 1 && Epilogue == HalfEpilogue::kStore) {
+    if constexpr (BM == 256 && BN == 256 && TrellisBits == 7 && Batching == 1 &&
+                  Epilogue == HalfEpilogue::kStore) {
       if (k == 6144 && m == 2560 && batch == 2048 && gridDim.z == 1)
         group_shift = 0;
     }
@@ -1179,7 +1179,7 @@ bool Exl3GemmShapeSupported(std::uint32_t k, std::uint32_t n,
                             quant::exl3::BitRate rate,
                             quant::exl3::Codebook codebook) noexcept {
   return codebook == quant::exl3::Codebook::kMul1 && !rate.half &&
-         rate.bits >= 1 && rate.bits <= 7 && n > 0 && k > 0 && n % 128 == 0 &&
+         rate.bits >= 1 && rate.bits <= 8 && n > 0 && k > 0 && n % 128 == 0 &&
          k % 128 == 0;
 }
 
@@ -1230,9 +1230,8 @@ void LaunchExl3Tile(Exl3Tile tile, const void* w, const void* x, float* y,
         // complete 128-channel output rotations. Keep larger/grouped work
         // on its existing tile; the two-group screen did not improve.
         if (count == 1 && k == 2560 && n == 640 && rows <= 2048) {
-          args(HalfPrefillGemmKernel<128, 128, 4, 2, GgmlType::kQ8_0,
-                                     Epilogue, false, GgmlType::kQ8_0, Bits,
-                                     Grouped, 2>,
+          args(HalfPrefillGemmKernel<128, 128, 4, 2, GgmlType::kQ8_0, Epilogue,
+                                     false, GgmlType::kQ8_0, Bits, Grouped, 2>,
                128, 128, 256);
           break;
         }
@@ -1276,8 +1275,11 @@ void LaunchExl3Bits(int bits, bool residual, Exl3Tile tile, const void* w,
     case 6:
       epilogue.template operator()<6>();
       break;
-    default:
+    case 7:
       epilogue.template operator()<7>();
+      break;
+    default:
+      epilogue.template operator()<8>();
       break;
   }
 }
@@ -1408,8 +1410,11 @@ void LaunchExl3PrefillBucketInnerHalf(
     case 6:
       launch.template operator()<6>();
       break;
-    default:
+    case 7:
       launch.template operator()<7>();
+      break;
+    default:
+      launch.template operator()<8>();
       break;
   }
   HIP_CHECK(hipGetLastError());
@@ -1455,8 +1460,11 @@ void LaunchExl3PrefillBucketInner(const quant::exl3::DeviceLinear* device_bank,
     case 6:
       launch.template operator()<6>();
       break;
-    default:
+    case 7:
       launch.template operator()<7>();
+      break;
+    default:
+      launch.template operator()<8>();
       break;
   }
   HIP_CHECK(hipGetLastError());

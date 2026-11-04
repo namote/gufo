@@ -1069,7 +1069,7 @@ namespace {
 template<class F>
 void WithRate(ex::BitRate rate, F&& f) {
   if (rate.half)
-    throw std::invalid_argument("Flash-Next experts need integer K3..K7");
+    throw std::invalid_argument("Flash-Next experts need integer K3..K8");
   switch (rate.bits) {
     case 3:
       f.template operator()<3>();
@@ -1086,8 +1086,11 @@ void WithRate(ex::BitRate rate, F&& f) {
     case 7:
       f.template operator()<7>();
       break;
+    case 8:
+      f.template operator()<8>();
+      break;
     default:
-      throw std::invalid_argument("Flash-Next experts need K3..K7");
+      throw std::invalid_argument("Flash-Next experts need K3..K8");
   }
 }
 ex::BitRate BankRate(const DeviceTensor& bank) {
@@ -1229,7 +1232,7 @@ void Exl3PrefillBucketInner(const ex::DeviceLinear* bank,
       input == nullptr || inner == nullptr ||
       (tile_rows != 16 && tile_rows != 32 && tile_rows != 64))
     throw std::invalid_argument("invalid Flash-Next bucket shape");
-  // The shared X3 bucket WMMA takes every integer rate (K3..K7 here).
+  // The shared X3 bucket WMMA takes every integer rate (K3..K8 here).
   WithRate(rate, [&]<int Bits>() {
     gufo::hip::LaunchExl3PrefillBucketInner(bank, buckets, bucket_count,
                                             max_buckets, tile_rows, input,
@@ -1600,8 +1603,8 @@ void Exl3DraftHead(const DeviceTensor& head, const float* x, float* logits,
                    hipStream_t stream) {
   const auto& l = *head.exl3;
   if (prefix % 128 != 0 || prefix > l.n || l.rate.half || l.rate.bits < 3 ||
-      l.rate.bits > 7 || l.codebook != ex::Codebook::kMul1)
-    throw std::runtime_error("EXL3 draft head needs a complete K3..K7 prefix");
+      l.rate.bits > 8 || l.codebook != ex::Codebook::kMul1)
+    throw std::runtime_error("EXL3 draft head needs a complete K3..K8 prefix");
   hipLaunchKernelGGL(SelectSegments, dim3(1), dim3(1), 0, stream, ids, extras,
                      prefix, l.n, s.head_segments);
   hipLaunchKernelGGL(HeadInput, dim3(l.k / 128), dim3(32), 0, stream, l, x,

@@ -18,7 +18,7 @@ void LaunchFloatToFp16(const float* input, void* output, std::size_t elements,
 // (H(suh * x) per 128 elements, row-major, LaunchExl3RotateRows); y [rows][n]
 // FP32 receives svh * H(x W') (residual: added to y). The FP16 WMMA
 // accumulation bound is (k / 16) * 2^-23 relative L2 (X3-RESULTS.md).
-// Supported: mul1, integer K 1..7, n and k positive multiples of 128.
+// Supported: mul1, integer K 1..8, n and k positive multiples of 128.
 [[nodiscard]] bool Exl3GemmShapeSupported(
     std::uint32_t k, std::uint32_t n, quant::exl3::BitRate rate,
     quant::exl3::Codebook codebook) noexcept;
@@ -57,7 +57,7 @@ void LaunchExl3PrefillGemmGrouped(const Exl3GemmProblem* problems,
 // count is read on the device (graph-replay safe). Each value depends only
 // on its own input row and expert, never on the partition into buckets,
 // tile_rows or its position in a tile. Bank entries must be mul1 at `rate`
-// (integer K1..K7) with this k and n (checked on the device: a mismatching
+// (integer K1..K8) with this k and n (checked on the device: a mismatching
 // bucket writes NaN); k and n multiples of 128, tile_rows 1..64 (16/32/64
 // are the tuned tiles). Every count <= tile_rows, except that with
 // tile_rows > 32 a bucket may also hold 65..128 rows (a hot expert's).

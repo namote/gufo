@@ -11,7 +11,8 @@
 // of columns L / 4 (positions 0-3) and L / 4 + 8 (positions 4-7). For
 // K <= 6 the lane's eight 16-bit states lie in one 64-bit window of the tile
 // bit string, cut out of three dwords with two v_alignbit_b32; each state is
-// then a constant shift of the window. The decode is exact integer arithmetic
+// then a constant shift of the window (the last state of K7 and K8 also
+// takes low bits from the third dword). The decode is exact integer arithmetic
 // plus one fused FP16 FMA, bit for bit the CPU reference
 // (src/core/quant/exl3/format.hpp DequantTile).
 //
@@ -67,9 +68,10 @@ inline constexpr std::uint32_t kMul1Multiplier = 0x83DCD12DU;
 
 /// Lane-constant placement of the lane's state window in a tile of 8 * K
 /// dwords: the three source dwords and 32 minus the bit offset of the first
-/// state (that offset is never 0 for K = 1..7). The lane's eight states span
-/// 7K + 16 bits from that offset, at most 65 bits (K7): always inside the
-/// three dwords.
+/// state (that offset is never 0 for K = 1..8; for K8 it is always 24). The
+/// lane's eight states span 7K + 16 bits from that offset, at most 72 bits
+/// (K8, ending exactly at the third dword's end): always inside the three
+/// dwords.
 struct LaneWindow {
   unsigned o0, o1, o2;
   unsigned shift;
@@ -77,7 +79,7 @@ struct LaneWindow {
 
 template<int K>
 __device__ __forceinline__ LaneWindow MakeLaneWindow(unsigned lane) {
-  static_assert(K >= 1 && K <= 7, "supported integer rates are K1 through K7");
+  static_assert(K >= 1 && K <= 8, "supported integer rates are K1 through K8");
   constexpr int kTileBits = 256 * K;
   constexpr unsigned kWords = 8 * K;
   const int start =
@@ -123,13 +125,14 @@ __device__ __forceinline__ Half2 DecodePairMul1(std::uint32_t p0,
 /// The lane's eight 16-bit states (in the low halves; the upper halves are
 /// arbitrary) from its three dwords: state j is bits [off + Kj, off + Kj +
 /// 16) of d0:d1:d2, most significant bit first. For K <= 6 every state lies in
-/// the 64-bit window cut out by two v_alignbit_b32; K7's last state also needs
-/// bit 64, the bit of d2 at the window offset.
+/// the 64-bit window cut out by two v_alignbit_b32; the last state of K7 (K8)
+/// also needs window bit 64 (bits 64 .. 71): the d2 bits just below the
+/// window offset.
 template<int K>
 __device__ __forceinline__ void LaneStates(std::uint32_t d0, std::uint32_t d1,
                                            std::uint32_t d2, unsigned shift,
                                            std::uint32_t (&state)[8]) {
-  static_assert(K >= 1 && K <= 7);
+  static_assert(K >= 1 && K <= 8);
   const std::uint32_t hi = __builtin_amdgcn_alignbit(d0, d1, shift);
   const std::uint32_t lo = __builtin_amdgcn_alignbit(d1, d2, shift);
   const std::uint64_t window = (static_cast<std::uint64_t>(hi) << 32) | lo;
@@ -138,9 +141,12 @@ __device__ __forceinline__ void LaneStates(std::uint32_t d0, std::uint32_t d1,
     if (48 - K * j >= 0) {
       state[j] = static_cast<std::uint32_t>(window >> (48 - K * j));
     } else {
-      // K7, j = 7: bits 49 .. 63 of the window, then bit 64 (d2's bit at
-      // the offset, shift = 32 - offset >= 1).
-      state[j] = (lo << 1) | ((d2 >> (shift - 1)) & 1U);
+      // K7 (K8), j = 7: window bits 49 (56) .. 63, then `extra` bits from
+      // 64: d2's bits just below the offset (shift = 32 - offset >= extra;
+      // K8 has offset 24, shift 8).
+      const int extra = K * j - 48;
+      state[j] =
+          (lo << extra) | ((d2 >> (shift - extra)) & ((1U << extra) - 1U));
     }
   }
 }
