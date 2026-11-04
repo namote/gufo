@@ -550,7 +550,7 @@ bool Source::IsProjection(std::string_view gguf_name) const {
   return recipe && recipe->kind == Kind::kLinear;
 }
 
-HostLinear Source::PrepareLinear(std::string_view gguf_name) const {
+QwenExl3HostLinear Source::PrepareLinear(std::string_view gguf_name) const {
   const auto recipe = RecipeFor(gguf_name, geometry_, checkpoint_);
   if (!recipe || recipe->kind != Kind::kLinear) {
     throw std::runtime_error(std::string(gguf_name) +
@@ -560,7 +560,7 @@ HostLinear Source::PrepareLinear(std::string_view gguf_name) const {
   const std::size_t k = lin.in_features, n = lin.out_features;
   const std::size_t words = static_cast<std::size_t>(lin.rate.TileWords());
   const std::size_t tiles_k = k / 16, tiles_n = n / 16;
-  HostLinear h;
+  QwenExl3HostLinear h;
   h.gguf_name = std::string(gguf_name);
   h.trellis.resize(tiles_k * tiles_n * words);
   h.suh.resize(k);
@@ -760,14 +760,6 @@ std::string CheckSidecar(const std::filesystem::path& checkpoint,
   return {};
 }
 
-namespace {
-
-struct Exl3Storage {
-  std::vector<HostLinear> linears;
-};
-
-}  // namespace
-
 std::optional<LoadedExl3> LoadFromSidecar(
     const std::filesystem::path& sidecar_path, const core::GgufReader& sidecar,
     EmbeddingFormat embedding, std::string* error, int threads) {
@@ -804,18 +796,18 @@ std::optional<LoadedExl3> LoadFromSidecar(
     std::shared_ptr<const core::GgufReader> reader(
         raw, [image](const core::GgufReader* r) { delete r; });
 
-    auto storage = std::make_shared<Exl3Storage>();
+    auto storage = std::make_shared<QwenExl3Storage>();
     std::size_t projections = 0;
     for (const auto& name : names)
       projections += source.IsProjection(name) ? 1 : 0;
-    storage->linears.reserve(projections);  // views must not move
+    storage->host.reserve(projections);  // views must not move
     std::vector<std::pair<std::string, QwenTensorRef>> refs;
     LoadedExl3 loaded;
     for (const auto& name : names) {
       if (!source.IsProjection(name))
         continue;
-      storage->linears.push_back(source.PrepareLinear(name));
-      auto& h = storage->linears.back();
+      storage->host.push_back(source.PrepareLinear(name));
+      auto& h = storage->host.back();
       h.view.trellis = h.trellis.data();
       h.view.suh = h.suh.data();
       h.view.svh = h.svh.data();

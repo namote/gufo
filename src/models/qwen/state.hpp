@@ -20,6 +20,27 @@
 
 namespace gufo::models {
 
+/// Host copy of an EXL3 projection in the GGUF layout (block-permuted).
+struct QwenExl3HostLinear {
+  std::string gguf_name;
+  std::vector<std::uint16_t> trellis;
+  std::vector<std::uint16_t> suh;
+  std::vector<std::uint16_t> svh;
+  quant::exl3::DeviceLinear view;  // pointers into the vectors above
+};
+
+/// Owner of the EXL3 projections the layer refs' `exl3` descriptors point
+/// into: the host copies after loading, then one device allocation after
+/// upload (which replaces the host storage). Neither vector is resized after
+/// the refs are bound.
+struct QwenExl3Storage {
+  std::vector<QwenExl3HostLinear> host;
+  std::vector<quant::exl3::DeviceLinear> device;
+  /// The device allocation `device` points into; its deleter frees it.
+  std::shared_ptr<void> device_buffer;
+  std::size_t device_bytes = 0;
+};
+
 /// Non-owning reference to a mapped tensor. Consumers validate the exact
 /// formats supported for each tensor role.
 struct QwenTensorRef {
@@ -196,9 +217,9 @@ struct QwenModelWeights {
   /// at load (the file keeps them unrotated); the layer refs point into it.
   std::shared_ptr<const std::vector<std::uint8_t>> folded_weights;
   std::size_t folded_bytes = 0;
-  /// Owns the EXL3 projection descriptors and host copies the layer refs'
-  /// `exl3` pointers use (null for GGUF checkpoints).
-  std::shared_ptr<const void> exl3_storage;
+  /// Owns the EXL3 projections the layer refs' `exl3` pointers use (null for
+  /// GGUF checkpoints).
+  std::shared_ptr<const QwenExl3Storage> exl3_storage;
   double fold_seconds = 0.0;
 
   [[nodiscard]] bool IsRotated() const noexcept {

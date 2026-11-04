@@ -335,18 +335,6 @@ bool UploadRotationSigns(models::QwenModelWeights& weights, void** device,
   return true;
 }
 
-// Device copies of the EXL3 projections (X2a): one allocation, every trellis
-// and scale vector 256-byte aligned, and the descriptors the kernels read.
-struct Exl3DeviceStorage {
-  void* buffer{nullptr};
-  std::size_t bytes{0};
-  std::vector<quant::exl3::DeviceLinear> linears;
-  ~Exl3DeviceStorage() {
-    if (buffer != nullptr)
-      (void)hipFree(buffer);
-  }
-};
-
 std::vector<models::QwenTensorRef*> Exl3Refs(models::QwenModelWeights& w) {
   std::vector<models::QwenTensorRef*> refs;
   const auto add = [&](models::QwenTensorRef& t) {
@@ -362,7 +350,8 @@ std::vector<models::QwenTensorRef*> Exl3Refs(models::QwenModelWeights& w) {
   return refs;
 }
 
-// Uploads every EXL3 projection, rebinds the references to the device views
+// Uploads every EXL3 projection into one allocation (every trellis and scale
+// vector 256-byte aligned), rebinds the references to the device descriptors
 // and drops the host copies. Returns the device bytes, or 0 on failure.
 std::size_t UploadExl3(models::QwenModelWeights& weights,
                        std::string* error_msg) {
@@ -371,21 +360,23 @@ std::size_t UploadExl3(models::QwenModelWeights& weights,
     return (v + kAlign - 1) / kAlign * kAlign;
   };
   const auto refs = Exl3Refs(weights);
-  auto storage = std::make_shared<Exl3DeviceStorage>();
+  auto storage = std::make_shared<models::QwenExl3Storage>();
   for (const auto* ref : refs) {
     const auto& h = *ref->exl3;
-    storage->bytes +=
+    storage->device_bytes +=
         align(h.TrellisBytes()) + align(h.k * 2U) + align(h.n * 2U);
   }
-  if (const auto status = hipMalloc(&storage->buffer, storage->bytes);
+  void* buffer = nullptr;
+  if (const auto status = hipMalloc(&buffer, storage->device_bytes);
       status != hipSuccess) {
     if (error_msg != nullptr)
       *error_msg =
           std::string("EXL3 projection upload: ") + hipGetErrorString(status);
     return 0;
   }
-  storage->linears.reserve(refs.size());  // views must not move
-  auto* base = static_cast<std::uint8_t*>(storage->buffer);
+  storage->device_buffer.reset(buffer, [](void* p) { (void)hipFree(p); });
+  storage->device.reserve(refs.size());  // views must not move
+  auto* base = static_cast<std::uint8_t*>(buffer);
   std::size_t offset = 0;
   const auto copy = [&](const void* src, std::size_t bytes) {
     auto* dst = base + offset;
@@ -400,8 +391,8 @@ std::size_t UploadExl3(models::QwenModelWeights& weights,
       view.trellis = copy(view.trellis, view.TrellisBytes());
       view.suh = copy(view.suh, view.k * 2U);
       view.svh = copy(view.svh, view.n * 2U);
-      storage->linears.push_back(view);
-      ref->exl3 = &storage->linears.back();
+      storage->device.push_back(view);
+      ref->exl3 = &storage->device.back();
       ref->data = view.trellis;
       ref->available_bytes = view.TrellisBytes();
     }
@@ -411,7 +402,7 @@ std::size_t UploadExl3(models::QwenModelWeights& weights,
     return 0;
   }
   weights.exl3_storage = storage;  // releases the host copies
-  return storage->bytes;
+  return storage->device_bytes;
 }
 
 }  // namespace

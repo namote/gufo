@@ -78,14 +78,6 @@ inline constexpr std::string_view kEmbeddingKey = "gufo.exl3.embedding";
 /// The projection host copy of one EXL3 linear in GGUF orientation: the
 /// linear-attention V-head reorders become permutations of whole 128-wide
 /// tile blocks (exact: H acts within those blocks).
-struct HostLinear {
-  std::string gguf_name;
-  std::vector<std::uint16_t> trellis;
-  std::vector<std::uint16_t> suh;
-  std::vector<std::uint16_t> svh;
-  quant::exl3::DeviceLinear view;  // pointers into the vectors above
-};
-
 /// Embedding storage of a directly loaded checkpoint.
 enum class EmbeddingFormat : std::uint8_t { kBf16, kQ8_0 };
 
@@ -117,7 +109,8 @@ public:
   [[nodiscard]] bool IsProjection(std::string_view gguf_name) const;
 
   /// Host copy of the EXL3 projection `gguf_name` (block-permuted).
-  [[nodiscard]] HostLinear PrepareLinear(std::string_view gguf_name) const;
+  [[nodiscard]] QwenExl3HostLinear PrepareLinear(
+      std::string_view gguf_name) const;
 
   /// A GGUF image holding `metadata` and every tensor of `names` that is not
   /// an EXL3 projection, with the embedding stored as `embedding`.
