@@ -1,5 +1,5 @@
 // X2b EXL3 decode/verify projection
-// (src/models/qwen/hip/kernels/exl3_gemv.hpp). Device helpers and the
+// (src/core/quant/exl3/gemv.hpp). Device helpers and the
 // arithmetic contract: src/core/hip/detail/exl3_gemv.hpp.
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -10,7 +10,7 @@
 
 #include "src/core/hip/detail/exl3_gemv.hpp"
 #include "src/core/hip/hip_utils.hpp"
-#include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
+#include "src/core/quant/exl3/gemv.hpp"
 
 namespace gufo::hip {
 namespace {

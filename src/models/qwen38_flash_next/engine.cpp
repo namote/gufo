@@ -10,6 +10,7 @@
 #include <type_traits>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/core/quant/exl3/layout.hpp"
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/exl3_weights.hpp"
@@ -74,7 +75,7 @@ Model::~Model() = default;
 
 bool Model::IsNativeExl3() const noexcept {
   return reader_ &&
-         reader_->GetMetadataBool("gufo.exl3.native").value_or(false);
+         reader_->GetMetadataBool(quant::exl3::kNativeKey).value_or(false);
 }
 
 std::shared_ptr<Model> Model::Load(const std::string& model_path,
@@ -105,7 +106,8 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (!m->reader_) {
     return nullptr;
   }
-  const bool exl3 = m->reader_->FindMetadata(kExl3Checkpoint) != nullptr;
+  const bool exl3 =
+      m->reader_->FindMetadata(quant::exl3::kCheckpointKey) != nullptr;
   auto weights = exl3 ? LoadExl3Model(model_path, *m->reader_, error_msg)
                       : ModelWeights::Bind(*m->reader_, error_msg);
   if (!weights) {
@@ -140,7 +142,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   }
   if (c.ple_layer >= 0) {
     const auto& t = m->weights_->ple_table;
-    if (m->reader_->GetMetadataBool("gufo.exl3.native").value_or(false)) {
+    if (m->reader_->GetMetadataBool(quant::exl3::kNativeKey).value_or(false)) {
       m->ngram_ = NgramTable::OpenExl3(
           std::filesystem::path(model_path) / "ngram_embedding.safetensors", c,
           error_msg);
@@ -161,7 +163,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
       return nullptr;
     }
     const bool mtp_exl3 =
-        m->mtp_reader_->FindMetadata(kExl3Checkpoint) != nullptr;
+        m->mtp_reader_->FindMetadata(quant::exl3::kCheckpointKey) != nullptr;
     if (mtp_exl3 != exl3) {
       AssignError(error_msg, "trunk and MTP weight formats must match");
       return nullptr;

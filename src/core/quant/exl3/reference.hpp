@@ -29,7 +29,7 @@ struct ReferenceScratch {
   std::size_t rotated_elements = 0;
   float* weight = nullptr;  ///< >= 128 * k floats; larger chunks run faster
   std::size_t weight_elements = 0;
-  /// X2b fast decode/verify path (src/models/qwen/hip/kernels/exl3_gemv.hpp):
+  /// X2b fast decode/verify path (src/core/quant/exl3/gemv.hpp):
   /// FP16 rotated-input slab and segment counters. Null keeps every call on
   /// the reference path.
   std::uint16_t* fast_input = nullptr;

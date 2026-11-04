@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/core/quant/exl3/layout.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/exl3_weights.hpp"
@@ -309,7 +310,8 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "open failed: %s\n", error.c_str());
     return 1;
   }
-  const bool exl3 = reader->FindMetadata(q::kExl3Checkpoint) != nullptr;
+  const bool exl3 =
+      reader->FindMetadata(gufo::quant::exl3::kCheckpointKey) != nullptr;
   auto weights = exl3 ? q::LoadExl3Model(model_path, *reader, &error)
                       : q::ModelWeights::Bind(*reader, &error);
   if (!weights) {

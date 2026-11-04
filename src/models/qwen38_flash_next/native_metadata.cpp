@@ -12,6 +12,7 @@
 #include "src/core/json.hpp"
 #include "src/core/platform/fs.hpp"
 #include "src/core/quant/exl3/checkpoint.hpp"
+#include "src/core/quant/exl3/layout.hpp"
 #include "src/models/qwen38_flash_next/exl3_ngram.hpp"
 
 namespace gufo::models::qwen38_flash_next {
@@ -168,8 +169,10 @@ std::unique_ptr<core::GgufReader> OpenArtifactMetadata(
     };
     text("general.architecture", "qwen4exp");
     text("general.name", "Qwen3.8 Flash Next");
-    text("gufo.exl3.checkpoint", std::filesystem::absolute(path).string());
-    metadata.emplace_back("gufo.exl3.native", V{T::kBool, true});
+    text(std::string(quant::exl3::kCheckpointKey),
+         std::filesystem::absolute(path).string());
+    metadata.emplace_back(std::string(quant::exl3::kNativeKey),
+                          V{T::kBool, true});
     const auto number = [&](const char* key) { return UInt(Member(c, key)); };
     if (c.member_str("hidden_act") != "silu" ||
         c.member_str("output_gate_type") != "sigmoid" ||
@@ -362,9 +365,10 @@ std::unique_ptr<core::GgufReader> OpenArtifactMetadata(
 
 namespace gufo::models::qwen38_flash_next {
 void ValidateNativeSources(const core::GgufReader& metadata) {
-  if (!metadata.GetMetadataBool("gufo.exl3.native").value_or(false))
+  if (!metadata.GetMetadataBool(quant::exl3::kNativeKey).value_or(false))
     return;
-  const auto directory = metadata.GetMetadataString("gufo.exl3.checkpoint");
+  const auto directory =
+      metadata.GetMetadataString(quant::exl3::kCheckpointKey);
   const auto files = metadata.GetMetadataStringArray("gufo.exl3.source_files");
   const auto stamps =
       metadata.GetMetadataStringArray("gufo.exl3.source_stamps");
@@ -376,7 +380,8 @@ void ValidateNativeSources(const core::GgufReader& metadata) {
 }
 std::string NativeArtifactIdentity(const core::GgufReader& metadata) {
   ValidateNativeSources(metadata);
-  const auto directory = metadata.GetMetadataString("gufo.exl3.checkpoint");
+  const auto directory =
+      metadata.GetMetadataString(quant::exl3::kCheckpointKey);
   const auto files = metadata.GetMetadataStringArray("gufo.exl3.source_files");
   std::vector<std::string> names;
   for (const auto file : files)

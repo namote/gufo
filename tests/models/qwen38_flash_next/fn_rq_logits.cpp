@@ -24,6 +24,7 @@
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/json.hpp"
+#include "src/core/quant/exl3/layout.hpp"
 #include "src/core/session_mode.hpp"
 #include "src/models/qwen38_flash_next/exl3_weights.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
@@ -350,7 +351,8 @@ int main(int argc, char** argv) {
     std::string error;
     auto reader = q::OpenArtifactMetadata(model_path, &error);
     Require(bool(reader), error);
-    const bool exl3 = reader->FindMetadata(q::kExl3Checkpoint) != nullptr;
+    const bool exl3 =
+        reader->FindMetadata(gufo::quant::exl3::kCheckpointKey) != nullptr;
     auto weights = exl3 ? q::LoadExl3Model(model_path, *reader, &error)
                         : q::ModelWeights::Bind(*reader, &error);
     Require(bool(weights), error);
@@ -359,7 +361,8 @@ int main(int argc, char** argv) {
     std::unique_ptr<q::NgramTable> ngram;
     if (c.ple_layer >= 0) {
       const auto& t = weights->ple_table;
-      if (reader->GetMetadataBool("gufo.exl3.native").value_or(false)) {
+      if (reader->GetMetadataBool(gufo::quant::exl3::kNativeKey)
+              .value_or(false)) {
         ngram = q::NgramTable::OpenExl3(
             std::filesystem::path(model_path) / "ngram_embedding.safetensors",
             c, &error);

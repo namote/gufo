@@ -19,7 +19,7 @@
 #ifndef ENGINE_ENABLE_HIP
 #define ENGINE_ENABLE_HIP 1
 #endif
-#include "src/models/qwen/hip/kernels/exl3_gemv.hip"
+#include "src/core/quant/exl3/gemv.hip"
 #include "src/models/qwen/hip/kernels/prefill_fp16.hip"
 
 namespace {
@@ -88,8 +88,9 @@ float TimeIt(const auto& fn, int reps) {
   return ms * 1000.0F / static_cast<float>(reps);
 }
 
-// The production pass (exl3_gemv.hip LaunchPass) without the rotation and
-// with a forced launch shape: GEMV-only timing of the shape choices.
+// The production pass (src/core/quant/exl3/gemv.hip LaunchPass) without the
+// rotation and with a forced launch shape: GEMV-only timing of the shape
+// choices.
 template<unsigned M>
 void LaunchGemvShape(const std::vector<DeviceLinear>& g, float* const (&y)[3],
                      unsigned rows, const gufo::hip::Exl3FastWorkspace& ws,

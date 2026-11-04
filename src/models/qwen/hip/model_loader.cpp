@@ -15,6 +15,7 @@
 #include "src/core/platform/mapped_file.hpp"
 #include "src/core/platform/pages.hpp"
 #include "src/core/platform/prefault.hpp"
+#include "src/core/quant/exl3/layout.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/exl3_weights.hpp"
 #include "src/models/qwen/hip/executor.hpp"
@@ -464,7 +465,7 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
   }
 
   std::optional<models::QwenModelWeights> weights_opt;
-  if (reader->GetMetadataString(models::qwen_exl3::kCheckpointKey)) {
+  if (reader->GetMetadataString(quant::exl3::kCheckpointKey)) {
     // An EXL3 checkpoint through its GGUF sidecar (plan/exl3/XA-RESULTS.md):
     // the projections stay EXL3, the rest becomes an in-memory GGUF image.
     const auto regions = reader->GetMappedRegions();

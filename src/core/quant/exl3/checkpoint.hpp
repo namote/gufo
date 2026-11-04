@@ -35,6 +35,9 @@ struct Tensor {
   std::uint64_t file_offset = 0;
 
   [[nodiscard]] std::int64_t Elements() const noexcept;
+  /// Element `i` of an F16, BF16 or F32 tensor, widened exactly to float.
+  /// Throws std::logic_error for other dtypes.
+  [[nodiscard]] float Value(std::size_t i) const;
 };
 
 /// The checkpoint-level quantization_config of config.json.

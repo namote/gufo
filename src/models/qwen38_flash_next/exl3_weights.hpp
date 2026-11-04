@@ -15,7 +15,6 @@
 
 namespace gufo::models::qwen38_flash_next {
 
-inline constexpr std::string_view kExl3Checkpoint = "gufo.exl3.checkpoint";
 inline constexpr std::string_view kExl3PleSource = "gufo.exl3.ple_source";
 inline constexpr std::string_view kExl3MtpMixer = "gufo.exl3.mtp_mixer";
 

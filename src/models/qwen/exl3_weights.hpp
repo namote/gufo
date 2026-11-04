@@ -70,9 +70,6 @@ struct RawKv {
 /// A GGUF string key/value entry.
 [[nodiscard]] RawKv StringKv(std::string_view key, std::string_view value);
 
-/// GGUF key naming the EXL3 checkpoint directory of a sidecar (relative to
-/// the sidecar's directory).
-inline constexpr std::string_view kCheckpointKey = "gufo.exl3.checkpoint";
 /// Optional sidecar key: "q8_0" quantizes the token embedding to Q8_0;
 /// otherwise ("bf16" or absent) it stays BF16, the default since the X2a
 /// quality window (plan/exl3/XA-RESULTS.md: Q8_0 cost 0.04 %p top-1 at 5.00).

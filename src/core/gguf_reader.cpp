@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "src/core/platform/mapped_file.hpp"
+#include "src/core/quant/exl3/layout.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
 
 namespace gufo::core {
@@ -848,7 +849,7 @@ bool GgufReader::HasTensor(std::string_view name) const noexcept {
 }
 
 std::string GgufReader::GetQuantizationLabel() const {
-  if (GetMetadataBool("gufo.exl3.native").value_or(false))
+  if (GetMetadataBool(quant::exl3::kNativeKey).value_or(false))
     return "EXL3";
   // `general.file_type` is deliberately not consulted. The Unsloth UD-*_K_XL
   // artifacts this repo targets carry a stale one -- UD-Q8_K_XL records ftype

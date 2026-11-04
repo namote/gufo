@@ -3,7 +3,7 @@
 #include <type_traits>
 
 #include "src/core/hip/detail/exl3_gemv.hpp"
-#include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
+#include "src/core/quant/exl3/gemv.hpp"
 #include "src/models/qwen/hip/ops/prefill_fp16.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
@@ -113,13 +113,11 @@ __device__ __forceinline__ float DotPairF32(Half2 w, Half2 x, float acc) {
 // No floating-point atomics or masked reads from absent assignment rows.
 template<int Bits, bool FullPrecision, unsigned MaxRows = 8,
          bool Scaled = false, bool ExactRows = false>
-__device__ __forceinline__ void RoutedGemvBody(const ex::DeviceLinear* gate,
-                           const ex::DeviceLinear* up,
-                           const Exl3RouteTile* tiles, const unsigned* count,
-                           const std::uint16_t* input, float* gate_y,
-                           float* up_y, unsigned k, unsigned n,
-                           unsigned assignments,
-                           const std::int32_t* exponents) {
+__device__ __forceinline__ void RoutedGemvBody(
+    const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
+    const Exl3RouteTile* tiles, const unsigned* count,
+    const std::uint16_t* input, float* gate_y, float* up_y, unsigned k,
+    unsigned n, unsigned assignments, const std::int32_t* exponents) {
   if (blockIdx.y >= *count)
     return;
   const auto tile_rows = tiles[blockIdx.y];
@@ -229,31 +227,35 @@ __global__ void RoutedGemv(const ex::DeviceLinear* gate,
                            const std::int32_t* exponents) {
   if (blockIdx.y >= *count)
     return;
-  if constexpr (Bits == 5 && !FullPrecision &&
-                (MaxRows == 3 || MaxRows == 4)) {
+  if constexpr (Bits == 5 && !FullPrecision && (MaxRows == 3 || MaxRows == 4)) {
     switch (tiles[blockIdx.y].count) {
       case 1:
-        RoutedGemvBody<Bits, FullPrecision, 1, Scaled, true>(gate, up, tiles,
-            count, input, gate_y, up_y, k, n, assignments, exponents);
+        RoutedGemvBody<Bits, FullPrecision, 1, Scaled, true>(
+            gate, up, tiles, count, input, gate_y, up_y, k, n, assignments,
+            exponents);
         return;
       case 2:
-        RoutedGemvBody<Bits, FullPrecision, 2, Scaled, true>(gate, up, tiles,
-            count, input, gate_y, up_y, k, n, assignments, exponents);
+        RoutedGemvBody<Bits, FullPrecision, 2, Scaled, true>(
+            gate, up, tiles, count, input, gate_y, up_y, k, n, assignments,
+            exponents);
         return;
       case 3:
-        RoutedGemvBody<Bits, FullPrecision, 3, Scaled, true>(gate, up, tiles,
-            count, input, gate_y, up_y, k, n, assignments, exponents);
+        RoutedGemvBody<Bits, FullPrecision, 3, Scaled, true>(
+            gate, up, tiles, count, input, gate_y, up_y, k, n, assignments,
+            exponents);
         return;
       case 4:
         if constexpr (MaxRows == 4) {
-          RoutedGemvBody<Bits, FullPrecision, 4, Scaled, true>(gate, up, tiles,
-              count, input, gate_y, up_y, k, n, assignments, exponents);
+          RoutedGemvBody<Bits, FullPrecision, 4, Scaled, true>(
+              gate, up, tiles, count, input, gate_y, up_y, k, n, assignments,
+              exponents);
           return;
         }
     }
   }
-  RoutedGemvBody<Bits, FullPrecision, MaxRows, Scaled>(gate, up, tiles, count,
-      input, gate_y, up_y, k, n, assignments, exponents);
+  RoutedGemvBody<Bits, FullPrecision, MaxRows, Scaled>(
+      gate, up, tiles, count, input, gate_y, up_y, k, n, assignments,
+      exponents);
 }
 
 __global__ void RestoreDownAssignments(const ex::DeviceLinear* down,

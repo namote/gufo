@@ -10,10 +10,13 @@
 #include <iostream>
 #include <random>
 #include <set>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
+#include "src/core/quant/exl3/checkpoint.hpp"
 #include "src/core/quant/exl3/format.hpp"
+#include "src/core/quant/exl3/layout.hpp"
 
 namespace {
 
@@ -238,6 +241,48 @@ void TestGemv() {
   Expect(same, "column slice dequant");
 }
 
+// Tensor::Value widens F16, BF16 and F32 exactly and rejects other dtypes.
+void TestTensorValue() {
+  const std::uint16_t f16[] = {0x3c00, 0xc000};   // 1, -2
+  const std::uint16_t bf16[] = {0x3f80, 0x4040};  // 1, 3
+  const float f32[] = {0.5F, -7.25F};
+  Tensor t;
+  t.dtype = DType::kF16;
+  t.data = reinterpret_cast<const std::uint8_t*>(f16);
+  Expect(t.Value(0) == 1.0F && t.Value(1) == -2.0F, "F16 tensor value");
+  t.dtype = DType::kBF16;
+  t.data = reinterpret_cast<const std::uint8_t*>(bf16);
+  Expect(t.Value(0) == 1.0F && t.Value(1) == 3.0F, "BF16 tensor value");
+  t.dtype = DType::kF32;
+  t.data = reinterpret_cast<const std::uint8_t*>(f32);
+  Expect(t.Value(0) == 0.5F && t.Value(1) == -7.25F, "F32 tensor value");
+  t.dtype = DType::kU8;
+  bool threw = false;
+  try {
+    (void)t.Value(0);
+  } catch (const std::logic_error&) {
+    threw = true;
+  }
+  Expect(threw, "non-float tensor value must throw");
+}
+
+// TiledVHeadIndex: grouped (k head a, v head b, h) -> tiled (b, a, h), a
+// bijection, for head vectors and per-head scalars.
+void TestTiledVHeadIndex() {
+  constexpr std::size_t kK = 16, kV = 48;
+  for (const std::size_t dim : {std::size_t{1}, std::size_t{128}}) {
+    std::vector<bool> seen(kV * dim);
+    for (std::size_t head = 0; head < kV; ++head) {
+      for (std::size_t h = 0; h < dim; ++h) {
+        const auto actual = TiledVHeadIndex(head * dim + h, dim, kK, kV);
+        const auto expected = ((head % 3) * kK + head / 3) * dim + h;
+        Expect(actual == expected && !seen[actual], "tiled V head index");
+        seen[actual] = true;
+      }
+    }
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -247,6 +292,8 @@ int main() {
   TestCodebooks();
   TestHadamard();
   TestGemv();
+  TestTensorValue();
+  TestTiledVHeadIndex();
   if (failures != 0) {
     std::cerr << failures << " failure(s)\n";
     return 1;

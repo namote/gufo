@@ -1,5 +1,5 @@
-#ifndef GUFO_MODELS_QWEN_HIP_KERNELS_EXL3_GEMV_HPP_
-#define GUFO_MODELS_QWEN_HIP_KERNELS_EXL3_GEMV_HPP_
+#ifndef GUFO_CORE_QUANT_EXL3_GEMV_HPP_
+#define GUFO_CORE_QUANT_EXL3_GEMV_HPP_
 
 // X2b fast path of an EXL3 projection for decode and verify rows
 // (plan/exl3/XB-DESIGN.md): the input rows are scaled by suh, rotated per 128
@@ -18,7 +18,8 @@
 
 namespace gufo::hip {
 
-/// Session workspace of the fast path (QwenGpuArena::AllocateExl3).
+/// Session workspace of the fast path, owned by the model arena (Qwen:
+/// QwenGpuArena::AllocateExl3).
 struct Exl3FastWorkspace {
   /// FP16 lane-major rotated input: 8 rows of the input per matrix of a
   /// group, >= 3 * 8 * hidden and >= 8 * widest input halves.
@@ -152,4 +153,4 @@ void LaunchExl3FastProjection(const quant::exl3::DeviceLinear& linear,
 }  // namespace gufo::hip
 
 #endif  // defined(ENGINE_ENABLE_HIP)
-#endif  // GUFO_MODELS_QWEN_HIP_KERNELS_EXL3_GEMV_HPP_
+#endif  // GUFO_CORE_QUANT_EXL3_GEMV_HPP_

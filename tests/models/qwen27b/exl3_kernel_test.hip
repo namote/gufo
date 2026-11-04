@@ -1,5 +1,5 @@
 // X2b EXL3 fast decode/verify projection
-// (src/models/qwen/hip/kernels/exl3_gemv.hpp) against FP64 references:
+// (src/core/quant/exl3/gemv.hpp) against FP64 references:
 //   - the exact projection (src/core/quant/exl3/format.hpp GemvReference):
 //     relative L2 below 1e-3, the FP16 rounding of the rotated input;
 //   - the same projection fed the kernel's FP16 rotated input (FP32 rotation
@@ -25,8 +25,8 @@
 
 #include "src/core/hip/detail/exl3_gemv.hpp"
 #include "src/core/quant/exl3/format.hpp"
+#include "src/core/quant/exl3/gemv.hpp"
 #include "src/models/qwen/hip/exl3_dispatch.hpp"
-#include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
 #include "src/models/qwen/hip/ops/norm_residual.hpp"
 #include "src/models/qwen/hip/ops/prefill_fp16.hpp"
 #include "src/models/qwen/hip/ops/swiglu.hpp"

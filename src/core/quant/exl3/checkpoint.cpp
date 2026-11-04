@@ -1,5 +1,6 @@
 #include "src/core/quant/exl3/checkpoint.hpp"
 
+#include <bit>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -123,6 +124,21 @@ std::int64_t Tensor::Elements() const noexcept {
     count *= dim;
   }
   return count;
+}
+
+float Tensor::Value(std::size_t i) const {
+  if (dtype == DType::kF32) {
+    float value;
+    std::memcpy(&value, data + i * 4, 4);
+    return value;
+  }
+  if (dtype != DType::kBF16 && dtype != DType::kF16)
+    throw std::logic_error("EXL3 tensor element of a non-float dtype");
+  std::uint16_t bits;
+  std::memcpy(&bits, data + i * 2, 2);
+  if (dtype == DType::kBF16)
+    return std::bit_cast<float>(static_cast<std::uint32_t>(bits) << 16);
+  return static_cast<float>(HalfToDouble(bits));
 }
 
 Checkpoint::Checkpoint() = default;

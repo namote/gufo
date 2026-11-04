@@ -42,6 +42,7 @@
 #include "src/core/hip/heap_placement.hpp"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/host_allocations.hpp"
+#include "src/core/quant/exl3/layout.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
@@ -2428,7 +2429,7 @@ bool FingerprintArtifact(std::string_view label, const core::GgufReader& reader,
                              std::string(label));
   try {
     *fingerprint =
-        reader.GetMetadataBool("gufo.exl3.native").value_or(false)
+        reader.GetMetadataBool(quant::exl3::kNativeKey).value_or(false)
             ? models::qwen38_flash_next::NativeArtifactIdentity(reader)
             : core::GgufIdentityHex(reader);
   } catch (const std::exception& exception) {
@@ -2441,7 +2442,7 @@ bool FingerprintArtifact(std::string_view label, const core::GgufReader& reader,
                                 .count();
   std::ostringstream message;
   message << "Fingerprinted " << label << " artifact ("
-          << (reader.GetMetadataBool("gufo.exl3.native").value_or(false)
+          << (reader.GetMetadataBool(quant::exl3::kNativeKey).value_or(false)
                   ? core::kNativeIdentityScheme
                   : core::kGgufIdentityScheme)
           << ", " << reader.GetTensorCount() << " tensors) in " << std::fixed

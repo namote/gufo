@@ -39,6 +39,7 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/core/quant/exl3/checkpoint.hpp"
+#include "src/core/quant/exl3/layout.hpp"
 #include "src/models/qwen/exl3_weights.hpp"
 
 namespace {
@@ -264,7 +265,8 @@ int Metadata(const std::string& exl3_dir, const std::string& out_path,
              const std::string& template_path, bool q8_embedding) {
   std::vector<RawKv> kvs;
   for (auto& kv : ReadRawMetadata(template_path)) {
-    if (!kv.key.starts_with("split.") && kv.key != qe::kCheckpointKey &&
+    if (!kv.key.starts_with("split.") &&
+        kv.key != gufo::quant::exl3::kCheckpointKey &&
         kv.key != qe::kEmbeddingKey)
       kvs.push_back(std::move(kv));
   }
@@ -273,7 +275,8 @@ int Metadata(const std::string& exl3_dir, const std::string& out_path,
   const auto out_dir = std::filesystem::absolute(out_path).parent_path();
   const auto relative =
       std::filesystem::relative(std::filesystem::absolute(exl3_dir), out_dir);
-  kvs.push_back(qe::StringKv(qe::kCheckpointKey, relative.generic_string()));
+  kvs.push_back(qe::StringKv(gufo::quant::exl3::kCheckpointKey,
+                             relative.generic_string()));
   std::vector<std::uint8_t> image;
   auto put = [&](const void* p, std::size_t n) {
     const auto* b = static_cast<const std::uint8_t*>(p);
@@ -346,7 +349,8 @@ int Load(const std::string& sidecar_path, bool q8_embedding, int threads) {
   {
     const auto checkpoint_dir =
         std::filesystem::path(sidecar_path).parent_path() /
-        std::string(*sidecar->GetMetadataString(qe::kCheckpointKey));
+        std::string(
+            *sidecar->GetMetadataString(gufo::quant::exl3::kCheckpointKey));
     const auto checkpoint = gufo::quant::exl3::Checkpoint::Open(checkpoint_dir);
     const auto geometry = qe::GeometryFromGguf(*sidecar, &error);
     const qe::Source source(checkpoint, *geometry);

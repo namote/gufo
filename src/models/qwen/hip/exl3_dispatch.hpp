@@ -20,8 +20,8 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 
+#include "src/core/quant/exl3/gemv.hpp"
 #include "src/core/quant/exl3/reference.hpp"
-#include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
 #include "src/models/qwen/hip/ops/prefill_fp16.hpp"
 #include "src/models/qwen/hip/ops/swiglu.hpp"
 

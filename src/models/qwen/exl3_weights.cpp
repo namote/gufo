@@ -13,6 +13,7 @@
 
 #include "src/core/json.hpp"
 #include "src/core/quant/exl3/format.hpp"
+#include "src/core/quant/exl3/layout.hpp"
 
 namespace gufo::models::qwen_exl3 {
 namespace {
@@ -57,14 +58,9 @@ std::size_t Destination(Reorder order, std::size_t index, std::size_t size,
     return index;
   }
   const auto nk = static_cast<std::size_t>(g.num_k_heads);
-  const auto per_k = static_cast<std::size_t>(g.num_v_heads / g.num_k_heads);
   auto tiled = [&](std::size_t i, std::size_t head_dim) {
-    // grouped (a = k head, b = v within group, h) -> tiled (b, a, h)
-    const std::size_t h = i % head_dim;
-    const std::size_t head = i / head_dim;
-    const std::size_t a = head / per_k;
-    const std::size_t b = head % per_k;
-    return (b * nk + a) * head_dim + h;
+    return exl3::TiledVHeadIndex(i, head_dim, nk,
+                                 static_cast<std::size_t>(g.num_v_heads));
   };
   const auto qk = 2 * nk * static_cast<std::size_t>(g.head_k_dim);
   switch (order) {
@@ -167,15 +163,6 @@ std::optional<Recipe> RecipeFor(std::string_view name, const Geometry& g,
     return Recipe{Kind::kToF32, la + "norm.weight"};
   (void)checkpoint;
   return std::nullopt;
-}
-
-float SourceValue(const exl3::Tensor& t, std::size_t i) {
-  std::uint16_t bits;
-  std::memcpy(&bits, t.data + 2 * i, 2);
-  if (t.dtype == exl3::DType::kBF16) {
-    return Bf16ToFloat(bits);
-  }
-  return static_cast<float>(exl3::HalfToDouble(bits));
 }
 
 // Effective BF16 weight of an EXL3 linear, written [out][in] with reorders.
@@ -386,28 +373,27 @@ void Source::Produce(const TensorPlan& plan, std::span<std::uint8_t> out,
       for (std::size_t r = 0; r < rows; ++r) {
         const auto d = Destination(recipe->out_order, r, rows, g);
         for (std::size_t c = 0; c < cols; ++c) {
-          u16[d * cols + c] = FloatToBf16(SourceValue(t, r * cols + c));
+          u16[d * cols + c] = FloatToBf16(t.Value(r * cols + c));
         }
       }
       break;
     }
     case Kind::kNormPlusOne:
       for (std::size_t i = 0; i < plan.ne[0]; ++i) {
-        f32[i] = SourceValue(t, i) + 1.0f;
+        f32[i] = t.Value(i) + 1.0f;
       }
       break;
     case Kind::kToF32: {
       const auto size = static_cast<std::size_t>(plan.ne[0]);
       for (std::size_t i = 0; i < size; ++i) {
-        f32[Destination(recipe->out_order, i, size, g)] = SourceValue(t, i);
+        f32[Destination(recipe->out_order, i, size, g)] = t.Value(i);
       }
       break;
     }
     case Kind::kNegExp: {
       const auto size = static_cast<std::size_t>(plan.ne[0]);
       for (std::size_t i = 0; i < size; ++i) {
-        f32[Destination(recipe->out_order, i, size, g)] =
-            -std::exp(SourceValue(t, i));
+        f32[Destination(recipe->out_order, i, size, g)] = -std::exp(t.Value(i));
       }
       break;
     }
@@ -417,7 +403,7 @@ void Source::Produce(const TensorPlan& plan, std::span<std::uint8_t> out,
       for (std::size_t c = 0; c < channels; ++c) {
         const auto d = Destination(recipe->out_order, c, channels, g);
         for (std::size_t j = 0; j < kernel; ++j) {
-          f32[d * kernel + j] = SourceValue(t, c * kernel + j);
+          f32[d * kernel + j] = t.Value(c * kernel + j);
         }
       }
       break;
@@ -791,9 +777,10 @@ std::optional<LoadedExl3> LoadFromSidecar(
     return std::nullopt;
   };
   try {
-    const auto relative = sidecar.GetMetadataString(kCheckpointKey);
+    const auto relative = sidecar.GetMetadataString(exl3::kCheckpointKey);
     if (!relative)
-      return fail(std::string("no ") + std::string(kCheckpointKey) + " key");
+      return fail(std::string("no ") + std::string(exl3::kCheckpointKey) +
+                  " key");
     const auto directory = sidecar_path.parent_path() / std::string(*relative);
     if (auto mismatch = CheckSidecar(directory, sidecar); !mismatch.empty())
       return fail(mismatch);

@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/core/quant/exl3/layout.hpp"
 #include "src/models/qwen/control_tokens.hpp"
 
 namespace gufo::tokenization {
@@ -369,7 +370,7 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
     }
   }
 
-  if (reader.GetMetadataBool("gufo.exl3.native").value_or(false)) {
+  if (reader.GetMetadataBool(quant::exl3::kNativeKey).value_or(false)) {
     const auto* entry = reader.FindMetadata("tokenizer.ggml.token_type");
     const auto* types =
         entry ? std::get_if<std::vector<std::uint64_t>>(&entry->value)

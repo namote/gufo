@@ -1,7 +1,6 @@
 #include "src/models/qwen38_flash_next/exl3_weights.hpp"
 
 #include <algorithm>
-#include <bit>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -12,6 +11,7 @@
 
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/json.hpp"
+#include "src/core/quant/exl3/layout.hpp"
 
 namespace gufo::models::qwen38_flash_next {
 namespace {
@@ -207,16 +207,7 @@ struct Binder {
                     : r;
       for (std::uint32_t col = 0; col < cols; ++col) {
         const auto i = std::size_t{r} * cols + col;
-        float value;
-        if (t->dtype == ex::DType::kF32) {
-          std::memcpy(&value, t->data + i * 4, 4);
-        } else {
-          std::uint16_t bits;
-          std::memcpy(&bits, t->data + i * 2, 2);
-          value = t->dtype == ex::DType::kBF16
-                      ? std::bit_cast<float>(std::uint32_t{bits} << 16)
-                      : static_cast<float>(ex::HalfToDouble(bits));
-        }
+        float value = t->Value(i);
         if (plus_one)
           value += 1.0F;
         if (neg_exp)
@@ -366,9 +357,9 @@ std::shared_ptr<Exl3Storage> Open(const std::filesystem::path& path,
   c.vocab_size = static_cast<std::uint32_t>(
       sidecar.GetMetadataStringArray("tokenizer.ggml.tokens").size());
   const bool native =
-      sidecar.GetMetadataBool("gufo.exl3.native").value_or(false);
+      sidecar.GetMetadataBool(quant::exl3::kNativeKey).value_or(false);
   const auto directory =
-      native ? path : Reference(path, sidecar, kExl3Checkpoint);
+      native ? path : Reference(path, sidecar, quant::exl3::kCheckpointKey);
   if (!native)
     CheckMetadata(directory, sidecar, c);
   auto storage = std::make_shared<Exl3Storage>();
@@ -553,10 +544,8 @@ std::string Exl3PleHeadersDigest(const core::GgufReader& reader) {
 
 std::uint32_t Exl3VHeadDestination(std::uint32_t index, std::uint32_t dim,
                                    const Config& c) {
-  const auto head = index / dim;
-  const auto group = c.ssm_num_v_heads / c.ssm_num_k_heads;
-  return ((head % group) * c.ssm_num_k_heads + head / group) * dim +
-         index % dim;
+  return static_cast<std::uint32_t>(
+      ex::TiledVHeadIndex(index, dim, c.ssm_num_k_heads, c.ssm_num_v_heads));
 }
 
 std::optional<ModelWeights> LoadExl3Model(const std::filesystem::path& path,
@@ -578,7 +567,7 @@ std::optional<ModelWeights> LoadExl3Model(const std::filesystem::path& path,
     w.output = b.Linear("lm_head", w.config.hidden_size, w.config.vocab_size);
     w.hc_head = b.Mixer("model.language_model.hyper_connection_mixer.", false);
     if (w.config.ple_layer >= 0 &&
-        !sidecar.GetMetadataBool("gufo.exl3.native").value_or(false)) {
+        !sidecar.GetMetadataBool(quant::exl3::kNativeKey).value_or(false)) {
       storage.ple_reader = core::GgufReader::OpenFile(
           Reference(path, sidecar, kExl3PleSource), error);
       if (!storage.ple_reader)
@@ -638,7 +627,7 @@ std::optional<MtpWeights> LoadExl3Mtp(const std::filesystem::path& path,
       Fail("MTP EXL3 metadata does not match trunk");
     w.config = *config;
     w.exl3_storage = Open(path, sidecar, w.config, true);
-    if (sidecar.GetMetadataBool("gufo.exl3.native").value_or(false)) {
+    if (sidecar.GetMetadataBool(quant::exl3::kNativeKey).value_or(false)) {
       const auto source = trunk.exl3_storage->checkpoint->GetMappedRegions();
       const auto draft = w.exl3_storage->checkpoint->GetMappedRegions();
       if (source.size() != draft.size())

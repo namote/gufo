@@ -18,7 +18,7 @@
 #include <vector>
 
 #include "src/core/hip/detail/exl3_gemv.hpp"
-#include "src/models/qwen/hip/kernels/exl3_gemv.hpp"
+#include "src/core/quant/exl3/gemv.hpp"
 #include "src/models/qwen/hip/ops/plain_prefill_stable.hpp"
 #include "src/models/qwen38_flash_next/exl3_weights.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
