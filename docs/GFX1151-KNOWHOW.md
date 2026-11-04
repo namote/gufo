@@ -1,5 +1,27 @@
 # gfx1151 optimization know-how
 
+## Vemloir Flash-Next EXL3 pack, November 4, 2026
+
+`Vemloir/Qwen3.8-Flash-Next-sc-exl3` 4.05bpw_sc_h8_ng8 (`fe8ad64b`) needed
+three loader/kernel additions: n-gram tables split over
+`ngram_embedding-NNNNN-of-MMMMM.safetensors`, integer K8 (head, shared
+experts, attention k/v, indexer) in the shared decode GEMV, X3 WMMA and
+buckets, and K3.5 routed gate/up experts (decode `RoutedGemv` and bucket
+WMMA; rate code 16 + K). K8 lane decode takes state 7's low byte from the
+third dword (offset always 24); K + 0.5 lane windows span 7K + 20 bits. Lane
+decode K1-K8 and K1.5-K3.5 matches the CPU dequant bit for bit; K8/K3.5
+projections, MLPs, buckets and routed experts pass their FP64 bars. Real pack:
+the n-gram row oracle passes over both parts; greedy text, image (embedded K8
+vision) and MTP prompts are correct; `conversation`/`batch`/`long-context`/
+`state-edges` pass in MTP mode (1,417 of 1,702 drafts accepted).
+RelWithDebInfo `gufo bench`: pp512 1081.9, pp2048 1395.4, tg128 26.21 tok/s
+(AR); MTP tg128 38.55. Kyojin on the same build: 1093.8/1393.2/30.50. The
+lower Vemloir TG follows its bit allocation (dense GDN/attention K6-K7 and K8
+shared experts versus Kyojin's K4 dense): its K6-K8 GEMVs take ~918 ms versus
+~578 ms of K4 GEMVs per 64-token profile at similar bandwidth, not a slower
+kernel. Kyojin and 27B EXL3 pp/tg stay within 1% of `c74430b1` (one
+cold-cache Kyojin pp512 outlier did not reproduce over six reps).
+
 ## EXL3 refactor and native 27B combined pass, November 4, 2026
 
 Base `e5002432` versus `76e46955`, identical RelWithDebInfo docker builds,

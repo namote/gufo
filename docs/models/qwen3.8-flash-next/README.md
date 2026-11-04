@@ -21,8 +21,10 @@ MODEL=/path/to/flash-next-exl3-pack
 
 The directory supplies `config.json`, `tokenizer.json`, `tokenizer_config.json`,
 `chat_template.jinja`, `model.safetensors.index.json`, its indexed shards, and
-`ngram_embedding.safetensors`. No GGUF PLE table is needed, and the former
-GGUF metadata sidecars (`gufo.exl3.checkpoint` files) are rejected. Native mul1 n-gram rings support K1–K8 and single or split tensors;
+`ngram_embedding.safetensors` (or its `ngram_embedding-NNNNN-of-MMMMM`
+parts). Projections may use K3-K8, and routed experts also K3.5 (for example
+`Vemloir/Qwen3.8-Flash-Next-sc-exl3`). No GGUF PLE table is needed, and the
+former GGUF metadata sidecars (`gufo.exl3.checkpoint` files) are rejected. Native mul1 n-gram rings support K1–K8 and single or split tensors;
 compressed rows remain on disk behind the bounded cache. Keep the n-gram file
 on fast local storage. Missing or incompatible files fail explicitly.
 
