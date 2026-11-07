@@ -133,7 +133,9 @@ ChainResult MeasureChain(const Shape& shape, bool forked) {
   };
   const auto timed = [&](auto&& body) {
     std::vector<double> samples;
-    HIP_OK(hipMemset(counter, 0, sizeof(std::uint32_t)));
+    // On `main` itself: the null stream does not order a non-blocking one.
+    HIP_OK(hipMemsetAsync(counter, 0, sizeof(std::uint32_t), main));
+    HIP_OK(hipMemsetAsync(side_counter, 0, sizeof(std::uint32_t), main));
     body();  // warm-up
     HIP_OK(hipStreamSynchronize(main));
     for (int rep = 0; rep < kReps; ++rep) {
@@ -146,6 +148,18 @@ ChainResult MeasureChain(const Shape& shape, bool forked) {
       samples.push_back(1000.0 * ms / kChain);
     }
     check(kReps + 1);
+    if (forked) {
+      std::uint32_t side_value = 0;
+      HIP_OK(hipMemcpy(&side_value, side_counter, sizeof(side_value),
+                       hipMemcpyDeviceToHost));
+      const std::uint32_t forks = (kChain + kPerLayer - 1) / kPerLayer;
+      if (side_value != (kReps + 1) * forks * kSideKernels) {
+        std::fprintf(stderr, "chain %s: side counter %u, expected %u\n",
+                     shape.name, side_value,
+                     (kReps + 1) * forks * kSideKernels);
+        std::exit(1);
+      }
+    }
     return Median(samples);
   };
   ChainResult result{};
@@ -180,7 +194,6 @@ __global__ void PersistentBarriers(std::uint32_t* count,
                                    std::uint32_t* generation,
                                    std::uint32_t* slots, int barriers,
                                    std::uint32_t* errors) {
-  __shared__ std::uint32_t seen;
   for (int b = 0; b < barriers; ++b) {
     if (threadIdx.x == 0)
       __hip_atomic_store(slots + blockIdx.x, static_cast<std::uint32_t>(b + 1),
@@ -197,12 +210,19 @@ __global__ void PersistentBarriers(std::uint32_t* count,
         __hip_atomic_fetch_add(generation, 1U, __ATOMIC_RELEASE,
                                __HIP_MEMORY_SCOPE_AGENT);
       } else {
-        while (__hip_atomic_load(generation, __ATOMIC_ACQUIRE,
-                                 __HIP_MEMORY_SCOPE_AGENT) == gen)
+        // Bounded: a grid that is not co-resident reports instead of hanging.
+        for (std::uint32_t spins = 0;
+             __hip_atomic_load(generation, __ATOMIC_ACQUIRE,
+                               __HIP_MEMORY_SCOPE_AGENT) == gen;
+             ++spins) {
+          if (spins == (1U << 26)) {
+            atomicAdd(errors, 1U << 16);
+            break;
+          }
           __builtin_amdgcn_s_sleep(1);
+        }
       }
       __threadfence();
-      seen = 0;
     }
     __syncthreads();
     // A neighbour's slot must already hold this phase.
@@ -215,7 +235,6 @@ __global__ void PersistentBarriers(std::uint32_t* count,
     }
     __syncthreads();
   }
-  (void)seen;
 }
 
 double MeasureBarrier(int blocks, int threads, int barriers) {
@@ -242,8 +261,11 @@ double MeasureBarrier(int blocks, int threads, int barriers) {
     HIP_OK(hipMemset(generation, 0, 4));
     HIP_OK(hipMemset(slots, 0, 4 * blocks));
     HIP_OK(hipEventRecord(t0, nullptr));
-    hipLaunchKernelGGL(PersistentBarriers, dim3(blocks), dim3(threads), 0,
-                       nullptr, count, generation, slots, n, errors);
+    // A cooperative launch refuses a grid that cannot be co-resident.
+    void* args[] = {&count, &generation, &slots, &n, &errors};
+    HIP_OK(hipLaunchCooperativeKernel(
+        reinterpret_cast<const void*>(PersistentBarriers), dim3(blocks),
+        dim3(threads), args, 0, nullptr));
     HIP_OK(hipEventRecord(t1, nullptr));
     HIP_OK(hipEventSynchronize(t1));
     float ms = 0.0F;
