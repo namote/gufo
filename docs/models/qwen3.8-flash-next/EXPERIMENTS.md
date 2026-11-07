@@ -711,3 +711,222 @@ another specialization. These are advisory operator timings, not a confirmed
 model regression. No baseline/profile/model rerun for this screen. Preserve
 prototype and failed pre-GPU manifest check; move to combined HC/MoE batch.
 [All numbers, ISA sites and receipts](../../../plan/exl3/F3-DENSE-KTAIL-SCREEN.json).
+
+
+## EXL3 c03 conversion capture, November 5, 2026
+
+| Candidate | Decision | Evidence |
+| --- | --- | --- |
+| Skip terminal routed expert down GEMMs only when the capture output is discarded | Deployed provisionally; suspected conversion regression under investigation | GDN/attention516 Hessians and counters/output bytes match at33/512/8192; initial timing gains are unqualified because inference_mode, warmup and input residency differ from production |
+| Foreach H/count additions, same bmm/chunk64/order | Not deployed; experiment retained | Exact, but8K neutral and attention512 slightly slower than down-only |
+| Direct FP32 capture stack, retaining original BMM/masking/accumulation | Not deployed; 0.485% is below the 5% timing criterion | Real64-row ABBA55.2241/55.2856s control vs55.0169/54.9570s pack; all516H/counters/references/inputs/RNG exact against saved control. `capture-pack/{SUMMARY,STATE,REVIEW}.json` |
+
+Single-baseline timing includes possible shape/library/allocator warmup; overall
+conversion improvement remains pending. No calibration rows, bits, precision or
+worker/grouping changes. Existing checkpoint idx7 and completed ngram reused.
+Module009 capture projects about63min versus old complete GDN blocks58.6–59.9min.
+Matched inference-mode comparison completed in136.11s: resident capture means
+512 rows0.55880→0.42625s,8192 rows15.00277→13.16548s,3217 rows4.94569→4.15319s.
+All H/counters/normal outputs are exact; cleanup errors0/KFD0. These12–24% gains
+exclude I/O and do not resolve whole-block regression: module009 took4424.52s,
+including3732.49s capture. Independent review retained the candidate and resumed
+idx8 unchanged. Evidence: `capture-regression/{SUMMARY,STATE,REVIEW}.json`.
+The subsequent real cm.main64-row ABBA preserves actual DiskRows reads, automatic
+capture scope, first five normal references and original asynchronous H flush.
+Original66.7137/67.1036s versus skip54.9655/54.8417s:17.9% reduction, all516H,
+counters/references/inputs/RNG exact. Independent review retained skip-down and
+resumed idx9 unchanged. It uses private byte-identical rows on the same SSD and
+warmed caches; complete-model conversion gain and the historical slowdown remain
+unresolved. Evidence: `capture-pipeline/{SUMMARY,STATE,REVIEW}.json`.
+[Receipts and rollout](../../../plan/exl3/F3-CONVERSION-WATCH.md).
+
+## Static optimization-gate audit, November 7, 2026
+
+Read-only review of shared EXL3/GGUF projection kernels and Flash-Next
+dispatch, HC, MoE, GDN, attention, MTP, graph and stream policies. Other
+model backends were checked for analogous backend/precision policies; their
+individual vendor kernel specializations were not exhaustively qualified.
+The audit itself made no additional kernel edits or GPU measurements. The
+first three candidates below were subsequently implemented as one batch.
+Independent review covered the shared-kernel findings and grouped small GEMM.
+
+### Candidates, in implementation order
+
+| Scope | Current restriction | Decision and required bounds |
+| --- | --- | --- |
+| EXL3 routed GEMV | K5-only R3/R4 live rows | Already removed in source; preserve prior candidate objects and batch its pending GPU checks with the next changes. |
+| EXL3 bucket Mode3 | `Batching == 3 && TrellisBits == 5` at `prefill_fp16.hip:561,570,661` | Highest-priority new candidate. Remove only the bit gate: skip loads/stores for fully dead 16-row B subtiles and redundant K-tail checks. Keep partial live padding, barriers and all arithmetic. Supported bucket K is a multiple of128 and BK is currently4 (the template supports2/4). Mode2 expansion is separate. |
+| Flash-Next stable small GEMM | `tokens > 8` goes directly to grouped scalar loads at `kernels.hip.cpp:8101` | Reuse aligned K320 tail-vector and K%512 whole-pass loads in grouped stable F16/F32/BF16 variants as applicable. Preserve group offsets and existing type/shape checks. Stable uses four steps and the same explicit FMA/Materialize chain; unstable changes both step grouping and arithmetic branches, so it is a separate candidate. |
+| Draft subset head | Previously rejected K3.5 | Extended and operator-qualified below; current K8 head unchanged. |
+| Dense packed traversal | Previously K7 plus exact K6144/N2560/R2048/group1 | Extended to integer K1..8 at the same geometry; original shape restriction retained. |
+| Shared-expert overlap | EXL3 prefill at least512 rows at `executor.cpp:3916` | Threshold retuning candidate only. Private workspace, full tensor views, phase and stream joins remain ownership/arithmetic requirements. Prior scheduling screens do not establish a universal lower threshold. |
+| GGUF mixed gate/up and header reuse | Original14 pairs retained | The tested49-pair extension was reverted at the user’s request; header conditions and tail handling are restored with it. |
+
+Mode3 directly reaches current Flash-Next prefill through
+`Executor::Exl3Experts` / `Exl3PrefillExpertsRaw`, including singleton tails;
+it is not limited to an unused test adapter. The historical `q6-gated`
+comments describe prior qualification, not a current `rate == 6` dispatch.
+Reuse [saved staging evidence](../../../plan/exl3/F3-MOE-STAGING-SCREENS.json)
+and the existing arithmetic/guard criteria, adding each newly enabled rate
+including K3.5. Historical K5 timings do not establish gains for K4 or K8.
+
+### Restrictions to retain
+
+- **Measured geometry:** K5 singleton indexer128-square/StageK2 and its2048-row
+  ceiling, K7 traversal geometry, GGUF wave64/grouped row policies and
+  compiler-specific launch geometry. Saved sweeps include larger-shape and
+  wider-policy regressions; these are not blanket compatibility locks.
+- **Stored format and memory:** Mul1/codebook, supported half rates, identical
+  rates within one templated group, packed strides, Hadamard128 boundaries,
+  vector alignment, scratch capacity, and hardware instruction requirements.
+  Dense EXL3 half-rate support also needs new dispatch/offset handling; simply
+  deleting its rejection would use the wrong layout.
+- **Numerical contracts:** phase-stable X3 prefill, FP32 unsafe-down fallback,
+  explicit HC rounding boundaries and mixed-Q6 decode staging. Switching
+  F16 HC to Q8 is a new quantization choice, not unlocking the same operation.
+- **State and stream correctness:** GDN snapshot/speculation exclusions,
+  graph pool/backlog/vision/trace guards, private side-stream buffers and
+  MTP catch-up's retained final tile. Earlier outputs can be skipped only
+  after proving which KV, recurrent state and residual values are needed.
+- **Other engines:** ASR's measured Lt rank6/zero-workspace policy protects
+  its token/numerical contract; TTS disables atomic split-K for reproducible
+  sampling; H3's integrated gfx1151 gate covers mapping and pinned kernels.
+  EmbeddingGemma's zero-workspace Lt search can be expanded with a bounded
+  workspace implementation, but that is separate from Flash-Next serving.
+
+The first three candidates are implemented with original arithmetic and fallback
+contracts retained. Pinned Nix10.1 build and CPU checks pass. Compiler resources
+versus the qualified binary: 0 worse, 5 better, 3509 unchanged, 4 unmatched;
+no increased scratch. This is compiler evidence, not measured speed.
+Focused GPU rate/ragged/guard, stable grouped, HC-down and plain-projection
+checks pass. Mode3 tests include representative 16-row boundaries through128,
+K256 and K2560/N128; grouped checks include misaligned input but do not claim
+misaligned-weight coverage. Saved 32,760-position c03 prefill bytes match.
+AR/MTP output hashes and draft counts match the saved baseline. HTTP
+greedy/sampled512 C1/C2 off/MTP also pass, with no individual phase timing
+flag at both5% and10ms. Small stored-baseline deltas (MTP d0+3.10%, other CLI
+cases-0.39%..+1.03%) do not establish universal gains. Keep the three default
+source paths; original service deployment remains unchanged. Timings and
+review evidence are retained in `build/f3-general-opts/`.
+The next batch below tested three format candidates. Dense and MTP head are
+retained; the user subsequently requested reverting the GGUF candidate.
+Measured geometry, arithmetic and state restrictions remain in place.
+
+
+### Format generalization qualification, November 7, 2026
+
+**Current decision:** the user subsequently requested reverting only the GGUF
+gate/up generalization. Original14-pair dispatch, Q5/IQ4_XS header conditions,
+and the associated K-tail handling/tests are restored. Dense K1..8 traversal,
+K3.5 draft head and the previous general-optimization batch remain unchanged.
+The results below describe the preserved, now-reverted GGUF experiment, not
+current49-pair support. Rollback receipts: `build/f3-general-formats/rollback/`.
+
+
+The initial decision retained these as generality improvements; small neutral costs were acceptable,
+while substantial regressions are not. Dense traversal now covers integer
+K1..8 at the existing exact geometry. Draft subset head accepts K3.5 through
+the existing decoder and handles empty/prefix-only requests without zero-grid
+launches. GGUF paired prefill expands14→49 combinations of Q3_K/Q4_K/Q5_K/
+Q6_K/Q8_0/IQ4_NL/IQ4_XS. Q5 and IQ4_XS header lifetime no longer depends on the
+partner type. Mixed-Q6 decode stage, independent strides and arithmetic stay
+unchanged. K32-mod64 tails zero staging without reading the absent up operand.
+IQ3_S uses different accumulator/output coordinates; F16 needs a different
+up loader. Neither is admitted by deleting a guard.
+
+Pinned Nix10.1 incremental build and CPU checks pass. GGUF complete/ragged/
+large49-pair checks and 32-weight tails preserve424,157,714 output bytes against
+the preserved pre-change binary. Dense eight-rate checks preserve167,772,160
+bytes and match unchanged direct K16 reduction, including guards/repeat.
+Head checks cover K3.5 K128/K256, every supported integer rate, prefix0/128/256/
+640, duplicated and invalid IDs, guards/repeat, extras0 and invalid half rates.
+
+The first GGUF screen timed a four-launch independent correctness oracle as
+fallback. Its new-pair timing deltas are invalid for production comparisons;
+retain that evidence but supersede those deltas. The corrected177-case screen
+uses actual two-launch gate GEMM + up/SwiGLU fallback and alternating batches.
+All output comparisons are exact. New35 pairs reduce warm-cache operation
+latency16.35–32.63% at256×768/R256,39.46–58.25% at1024×K/R512
+(K256/768/2048), and12.73–21.88% at4096×2048/R1024. No generic shape cutoff
+is needed on this evidence. These are operator observations, not model gains.
+Dense latency changes range-10.36%..+0.32%. An affected-only old/new A/B/B/A
+check of existing Q5_K/IQ4_NL measures+3.96% (+2.11us): retain this small cost
+for generality, per the user's criterion. No large measured regression was found; the later user decision nevertheless
+reverts the entire GGUF candidate, including its small existing-pair cost.
+
+Independent review and receipts: `build/f3-general-formats/QUALIFICATION.json`
+and `INDEPENDENT-FINAL-REVIEW.json`. First numeric evidence is preserved in
+`validation-001`; corrected admission in002; only the flagged existing pair
+was rechecked in003. Completed dense/head and full model baselines were not
+rerun. Current c03 K7 dense/K8 head EXL3 serving does not activate these new
+format branches. Original server/runtime/settings restored; candidate not
+automatically deployed. No full-model or universal-shape speed claim.
+
+
+### Wider EXL3 MoE token tiles, November 7, 2026
+
+After the user-requested GGUF gate/up-only rollback, screened larger routed
+EXL3 K4 Mode3 token tiles in an isolated source snapshot. Production remains
+cold64/hot128. The new128×256 tiles use8×2/K32,8×2/K64 or8×4/K64 waves/staging;
+unlike the earlier8-wave hot256 failures, they use114/137/90VGPR versus140
+for current hot128, with zero scratch/spills. Resource reduction alone did
+not improve speed.
+
+All six configurations preserve stored output bytes, finite values, prefix/
+suffix guards and repeat results across13 synthetic cases: awkward expert
+counts through513 and512-expert pp512/2048/4096 histograms with two skews.
+Capacity is1172 slots; gate/up uses null row exponents, down uses exponents.
+CPU descriptor coverage is checked; actual device builder/rotations/activation/
+combine are excluded. Expert counts129..256 retain128-sized splitting; only
+counts>256 use balanced <=256-row buckets.
+
+Three-class cold64/hot128/hot256 paths are slower2.67–9.87% across all36
+non-tail candidate comparisons in the alternating window. A second screen
+merges hot128/hot256 launches, retaining cold64+wide65..256 only: stored-control
+comparison is14.81–38.36% slower atpp2048/4096; pp512 spans−1.08..+10.65%.
+The second timing comparison is cross-window/advisory, and all output buffers
+are shifted2bytes for guards; neither screen qualifies production-alignment
+or whole-model throughput. There is no useful signal to promote.
+
+No production MoE changes, model-baseline rerun or long model validation.
+First13 controls were saved once and reused read-only. Original serving ELF
+and settings restored after each owned GPU window. Preserved sources, binaries,
+controls and results: `build/f3-moe-wide/QUALIFICATION.json`. GGUF rollback
+passed CPU build and restored the previously measured kernel bytes exactly:
+`build/f3-general-formats/rollback/VERIFICATION.json`. Dense/head generalizations
+and the preceding common optimizations remain.
+
+### Fused EXL3 gate/up intermediates, November 7, 2026
+
+Screened five isolated K4 configurations in two bounded windows. Original
+64/128 bucket GEMMs write half gate/up dots before restoring rotations,
+activation and down-input scaling. Candidates instead transpose rounded dots
+in dead operand LDS, keep gate values in registers, complete up/activation/
+down rotation within the block and then scale each whole row. Inputs and
+output are disjoint; production integration would need dead gate scratch, not
+overwrite the still-read rotated input. Down GEMM/fallback is unchanged and
+outside this timed scope.
+
+The first two configurations keep restored gate FP32 values; the next three
+keep original FP16 bits packed in uint32 pairs and postpone gate Hadamard.
+This preserves precision while reducing registers. All tested outputs,
+exponents, guards and repeats agree with the stored original stage. Seven
+shapes cover signed scales, zero/tiny inputs, expert-count tails to513 and
+512-expert pp512/2048/4096 skews. Negative exponents were not reached; this
+is not full-model, down-fallback or all-rate qualification.
+
+No useful speed improvement: first full-stage candidates lose0.5–17.2% on
+non-tail shapes. The packed split64/8-wave candidate loses12.0–17.2% atpp2K/4K
+versus saved timings; sixteen-wave variants lose18.5–36.7%. Those later
+comparisons are cross-window advisory. Register reductions and absence of
+spills did not suffice to make this fusion worthwhile. No candidate is promoted
+and no whole-model baseline or quality test is repeated.
+
+Preserve a harness failure from the first window: its manifest used the previous
+ELF while the last CPU link was finishing, so the runtime identity assertion
+failed despite the completed bench log. The second window requires completed
+build/hash/manifest ordering and verifies the actual ELF and Nix10.1 mappings.
+It reuses the saved first control bytes and does not recompute baseline.
+Original serving runtime/settings restored. Evidence and independent reviews:
+`build/f3-moe-fused/{QUALIFICATION,SCREEN-FIRST,SCREEN-PACKED,
+INDEPENDENT-REVIEW,INDEPENDENT-REVIEW-PACKED}.json`.

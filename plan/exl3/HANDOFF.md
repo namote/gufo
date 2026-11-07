@@ -1,5 +1,23 @@
 # EXL3 / Flash-Next F3 handoff (2026-11-02; native EXL3 qualified)
 
+## Active default: c03 Gufo, 2026-11-07
+
+User authorized temperature0.9 and starting our model. `llm` now delegates to
+`/usr/local/bin/gufo`; persistent controller uses the qualified current Nix10.1
+ELF6edf0d44 mounted from the frozen test runtime (not the older image ELF).
+Model: `ai.tools/storage/models/llm/flash-next-exl3-gufo-c03`, immutable payload
+hardlinks with copied metadata; original final assembly and evidence preserved.
+C2/native262144 per conversation, FP16 shared512K pool14,408,908,800bytes,
+MTP max7/medium, embedded BF16 vision, top_k20/top_p0.95/min_p0, temperature0.9.
+RAMcache2GiB/disk50GiB,0.0.0.0:18740, no serving/request/stall expiration;
+4GiB host floor and desktop diagnostics log-only remain.
+Run cae6f0a41f5e ready; default-parameter arithmetic and image smoke passed,
+actual FP16 and drafts confirmed. Available RAM after checks about27GiB.
+Not a full256K stress test. Kyojin stays stopped. `llm start/stop/status` control
+this service; old conversion/hourly monitors remain disabled.
+Evidence/rollback: `/home/m2on/.local/share/gufo/c03-deployment-20261107/`.
+
+
 ## Native EXL3 vision (2026-11-04)
 
 Gufo direct embedded EXL3 vision is implemented and tested on Turboderp K6
@@ -599,3 +617,29 @@ pp2048. That is an estimate and has not been measured.
   only results inside 5 %·10 ms.
 - Iterate as implement → second-reviewer review → fix. No per-item model
   windows; one combined pass at the end.
+
+## Local repository cleanup, 2026-11-07
+
+- Current development branch remains `ai-tools/port-u4f`; `main` is the only
+  other local branch. Eleven inactive worktrees and22 historical local branch
+  names were removed after verifying their tips (including detached HEADs)
+  in a complete Git bundle. This does not mean all experimental branches were
+  merged. No remote branch or tag was changed.
+- Recovery bundle and before/after receipts:
+  `/home/m2on/projects/ai.tools/tmp/gufo-cleanup-20261107/`.
+  `BEFORE.json` maps old names to commits; `branches-before.bundle` retains
+  their history. Recover an old branch with
+  `git fetch <bundle-path> refs/heads/<old-name>:refs/heads/<restored-name>`.
+  `CLEANUP.json` maps relocated build directories and `ASSET-MOVES.json`
+  locates the unrelated cyclist HTML/images/browser inspection artifacts.
+- Only retired compilation objects were deleted (6564 files,11.67GiB logical).
+  Current release/CPU/GPU and f3 incremental builds, saved controls, runtimes,
+  model files and measurement receipts remain. Source snapshots and final
+  binaries are retained; historical build directories may need recompilation.
+- Validated source/test changes are committed as `f24b10ea`; rejected wide
+  MoE and fused gate/up experiments remain isolated and are not deployed.
+  The live service still uses its qualified original `6edf0d44` ELF.
+- The old root `issue.md` is preserved as
+  [the November4 compatibility investigation](archive/VEMLOIR-COMPATIBILITY-20261104.md).
+  Conversion-plan headings now distinguish completed c03 service from the
+  historical conversion instructions. Cleanup did not restart the server.

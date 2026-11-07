@@ -1,5 +1,46 @@
 # Exact live-row loops for EXL3 verification
 
+## Generalization to supported rates, November 7, 2026
+
+The current source removes only the `Bits == 5` restriction: K3, K3.5,
+K4, K5, K6, K7 and K8 now select exact live-row bodies for R3/R4 gate/up
+and scaled down. The format-specific unpack, accumulation/reduction order,
+negative-exponent FP32 fallback, generic R1/R2/R8 and unscaled full-precision
+path remain unchanged. This is a source change, not a deployed speed claim.
+
+The existing operator fixture now represents fractional rates with `BitRate`
+and adds K3.5 shared/disjoint routing and exact partition/reordering checks.
+Every supported rate also compares R3/R4 live counts against unchanged R8
+down output, including negative exponents, poisoned unused slots and guards.
+Independent review found no blocking code issues. The combined November 7
+candidate also generalizes Mode3 dead-B staging/K-tail elision to its supported
+rates and stable grouped SmallGemm vector loads. Pinned Nix10.1 incremental
+build, CPU format/loader checks and all four focused GPU suites pass.
+The 32,760-position prefill payload is byte-identical to the saved c03 result;
+AR/MTP benchmark output hashes and draft work also match. HTTP greedy/sampled C1/C2 off/MTP checks pass, with no per-request
+prefill/decode timing flag at both5% and10ms. Receipts for the last two cases
+are in `build/f3-general-opts/validation-003/`.
+The existing qualified service runtime is restored after the validation window;
+source qualification does not automatically replace that runtime.
+
+Baseline build/runtime are preserved. Earlier candidate objects remain in
+`build/f3-live-rows-all-rates/`; the combined source snapshot, binaries, hashes,
+compiler resources and results are in `build/f3-general-opts/`. The first
+attempt lacked the render-device group and did no GPU computation; the second
+completed TG-MTP but hit a mixed-stdout/stderr parser assertion. Original logs
+remain unchanged. One interrupted hash was reconstructed on CPU, independently
+reviewed, and all four hashes/counters match; no completed GPU case was rerun.
+
+The adjacent-gate audit retains bank format/codebook/rate consistency,
+Hadamard alignment, dense integer-only dispatch and numerical fallbacks:
+removing those checks alone would violate their implementation contracts.
+Draft-head K3.5 support was subsequently implemented and operator-qualified
+in the separate general-formats work (including empty/prefix-only guards);
+it does not improve the current K8 head. See `build/f3-general-formats/QUALIFICATION.json`. The historical measurements
+below qualify K5 only; they must not be extrapolated to the new rates.
+
+## Previously qualified K5 implementation
+
 2026-11-02. Base `add504fe`; native 5.05/K6 n-gram, Nix ROCm10.1 unchanged.
 Retained after one combined qualification. Component gains are not full-model gains.
 

@@ -380,3 +380,17 @@ in `cache-concurrency`. Optimization is tracked in
 binaries and every observation. The earlier cold-prefill versus
 decoded-history vision difference remains unqualified; the wide prefill route
 restored by `dabc85cf` is retained.
+
+
+## Paired-format operator extension, November 7, 2026
+
+**Reverted at user request:** original14-pair behavior and tests are restored.
+The following records the historical49-pair experiment, not current support.
+
+Shared FP16 prefill qualifies49 pairs from Q3/4/5/6_K, Q8_0, IQ4_NL/XS with
+independent operand strides, complete/ragged rows and tokens, two input scales,
+output guards/repeat, and K32/96/160 tails for32-weight formats. Candidate and
+preserved original/fallback output streams match byte-for-byte; the additional
+177-case production-fallback admission comparison is also exact. IQ3_S/F16
+are excluded. No full27B quality or serving rerun is claimed for this extension.
+[Evidence and corrected timing scope](../qwen3.8-flash-next/EXPERIMENTS.md#format-generalization-qualification-november-7-2026).

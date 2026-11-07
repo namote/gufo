@@ -1,5 +1,21 @@
 # Qwen3.8 Flash-Next quality
 
+## Generalized kernel paths, November 7, 2026
+
+The combined candidate's c03 prefill output at 32,760 sampled positions is
+byte-identical to the stored qualified c03 payload (SHA256
+`d11b38d0dabb532a9bbc0956f9fa2097e60b1a08f65c6504dbf02bde433ac74d`).
+The saved BF16 reference and quality scores are reused; no teacher collection,
+quantization or corpus-wide quality improvement is claimed.
+All-rate routed checks, independent Mode3 FP64/FP16-RNE checks, grouped stable
+projection checks, HC-down and plain projection regressions pass. Grouped
+input misalignment is covered; misaligned weights and exhaustive shapes are
+not claimed. AR/MTP greedy benchmark hashes and draft work match stored
+controls at d0/d32768. HTTP greedy/sampled512 C1/C2 off/MTP pass; greedy
+signatures match the stored controls, without asserting sampled equality.
+Evidence: `build/f3-general-opts/validation-002/` and `validation-003/`.
+
+
 ## Native EXL3 vision (2026-11-04)
 
 Native EXL3 vision: K6 Turboderp and K8 Vemloir all 29 stage outputs pass the
@@ -1368,3 +1384,43 @@ failed exactness and was fixed before timing. Prototype standalone24-case
 parity additionally covers widths128/2560, used1/10/16, stride0/3 and tail1.
 This was operator evidence; subsequent full model/chunk qualification is
 recorded at the top of this document. [Exact scope and receipts](../../../plan/exl3/F3-HC-LOAD-SCREENS.json).
+
+
+## EXL3 conversion capture exactness, November 5, 2026
+
+A206.45s affected-block screen compares the pinned converter against discarded
+routed-down elision on actual c03 inputs: first GDN and full-attention blocks,
+33/512/8192 tokens,516 Hessian entries per block. Every H tensor/key/count,
+inf/nan/total counter, preserved input, quant_preserve and normal routed output
+matches byte-for-byte. Unscoped all-expert output stays unchanged; invalid
+export/slice/pending contexts are rejected. FP32 output shortcut remains off.
+
+The initial decorated-function source guard failed before baseline computation;
+source/body identity now uses inspect.unwrap and a decorator-inclusive pin.
+Real-runtime CPU scope15 checks include decorated direct/foreign callers. An
+exact foreach candidate was measured but is not deployed. This establishes the
+capture transformation, not final packed-model KLD or inference qualification;
+the final combined quality/performance run remains pending after conversion.
+[Evidence](../../../plan/exl3/F3-CONVERSION-WATCH.md).
+
+
+## Calibrated c03 EXL3 final pack, November 7, 2026
+
+The completed mixed-bit c03 pack plus calibrated mixed MTP and original BF16
+vision passed loading, text/arithmetic/image-history/RAM-prefix smoke and
+MTP-off/on emitted-token equality at32 tokens and TG128 atdepth0/32768.
+Four greedy HTTP prompts match the C1-off reference across C1/C2 and both modes.
+
+Against the saved HF CPU BF16 reference on32760 positions, NLL is2.162650
+(reference2.172846), KL256+rest0.041522 and top1 agreement90.8394%. The eight
+project-document/code/synthetic-chat windows are not a proven independent
+calibration holdout. KL uses a coarse tail bin and is not full-vocabulary KL;
+reference top256 probability mass averages97.03%. The c03 deltaNLL window95%
+interval includes zero. These metrics do not establish higher task accuracy.
+
+Candidate KV is FP16; reference native HF cache dtype was not recorded.
+Historical UD-Q4 has KL0.039227 and top1 agreement90.8608%, but its different
+ROCm7.2.4/GCC13 runtime prevents attributing the difference solely to quantization.
+Current Gufo6edf0d44/collectorbc989832 share sourcea81c0f93 and NixROCm10.1.
+The older image-contained Gufo lacks K8; its failed load is retained separately.
+[Final evidence and limits](../../../plan/exl3/F3-MTP-CALIBRATION.md).

@@ -1,5 +1,55 @@
 # gfx1151 optimization know-how
 
+## c03 final-pack runtime compatibility, November 7, 2026
+
+Final assembly passed payload checks, but nativevision image e7a761a40187 /
+ELF62f0c59a… is older than K8 support. Actual smoke002 failed before inference
+on the valid K8 head. Disassembly of the actual ELF (not current source) shows
+BindExl3LinearBank K3..7, Exl3FastSupported/GEMV K1..7 and zero K8 GEMV symbols.
+The final pack has42 K8 projections, so changing only a head loader bound is
+unsafe. Source commit2095529d adds coherent K8 loader/decode/GEMV/prefill/MoE
+support. The newer refactor-gpu binary was built with ROCm7.2.4, so it is not
+a Nix10.1 replacement. Prepare a coherent current-source Nix10.1 build and
+matched quality collector, preserving all completed packs and references.
+This is runtime incompatibility, not a measured quantization quality failure.
+Evidence: flash-next-quant-20261104/mtp-final-validation-preparation/
+loader-diagnosis/DIAGNOSIS.json; final-validation/smoke-002/.
+
+## c03 terminal head recovery, November 7, 2026
+
+The completed K8 head failed only when row1's 7793×248320 FP16 logits
+exceeded the 2GiB asynchronous write budget. Reused the existing packed head;
+recomputed only five lost raw references and packed forwards, with original
+CPU error reduction/dtype/scales. No H collection or quantization repeated.
+Five finite full-row comparisons took 554.55s; mean RFN 0.00386195,
+range 0.00273402–0.00499969, mean SQNR 48.5118dB. This is a local head
+comparison on calibration inputs, not whole-model quality or throughput.
+Private synchronous writes retained 9.18GiB logits. Independent review,
+cleanup zero and unchanged protected metadata passed; CPU commit hashed all
+five saved outputs then atomically promoted idx53, preserving idx52/idx51 and
+failed module062 evidence. Final assembly and bundled inference validation
+are separate stages. Evidence: `flash-next-quant-20261104/head-recovery/`
+`RESULT-REVIEW.json`, `COMMIT-JOURNAL.json`, and recovery001 result `SUMMARY.json`.
+
+## Offline EXL3 K8 ngram conversion, November 4, 2026
+
+Kyojin v1.8.6 (`fbde8a36`) with the retained ROCm 10.1 Torch/native extension
+defaults K8/L160/mul1 trellis conversion to its base kernel on gfx1151. Its
+already-compiled optimized kernel cut the same 131,072 mixed-hash-head rows
+from 17.837 s (base, 8192-row chunks) to 2.975 s (opt, 32768-row chunks),
+with all packed bytes equal. Increasing base chunks to 131,072 only gave
+17.690 s; extra memory alone did not fix the kernel bottleneck. Two workers,
+each with a private stream and TLS scratch, took 2.520 s; four took 2.560 s.
+Zero, constant, tiny, ramp and alternating test rows also matched base exactly.
+These are conversion measurements, not inference speed or final model quality.
+The 1.71-hour full-table extrapolation excludes I/O and production checks.
+Adopt opt/32768/two streams only for this qualified K8/L160 conversion;
+do not globally force the kernel family for other bitrates or tile lengths.
+Evidence: `ai.tools/tmp/test-results/flash-next-quant-20261104/`
+`ngram-speed/RESULTS.json`, `ngram-streams/RESULTS.json`, and retained
+`ngram-streams/opt-reference.safetensors`; execution plan
+[`F3-QUANT-BIT-ALLOCATION.md`](../plan/exl3/F3-QUANT-BIT-ALLOCATION.md).
+
 ## Vemloir Flash-Next EXL3 pack, November 4, 2026
 
 `Vemloir/Qwen3.8-Flash-Next-sc-exl3` 4.05bpw_sc_h8_ng8 (`fe8ad64b`) needed
@@ -1602,6 +1652,39 @@ Do not equate component gains with whole-model gains. All baseline/prototype
 objects remain; no baseline/model remeasurement or extra pipeline profile.
 [Complete evidence and all measured shapes](../plan/exl3/F3-TGMTP-ROWS.md).
 
+November 7 generalization removes the K5-only R3/R4 gate, including K3.5/K8,
+and qualifies it together with all-rate Mode3 dead-B staging/K-tail elimination
+and stable grouped SmallGemm vector loads. Format-specific unpack, FMA/rounding,
+alignment, negative-exponent FP32 fallback and unstable grouped path remain
+unchanged. Nix10.1 incremental build, CPU format/loader and four focused GPU
+suites pass; representative boundaries include K2560/N128 Mode3 and grouped
+input misalignment, not exhaustive shapes or misaligned weights. Compiler
+resource comparison: 0 worse, 5 better, 3509 unchanged, 4 unmatched; scratch
+increase0. This resource result alone is not a speed measurement.
+
+Saved c03 32,760-position prefill payload is byte-identical; repeated AR/MTP
+emitted hashes and draft work match stored controls. CLI two-repeat observations:
+PP-off2048/8192 1460.97/1501.37→1457.86/1495.46tok/s; AR d0/d32K
+27.33/26.72→27.32/26.76; PP-MTP1370.97/1403.43→1385.03/1416.51;
+MTP d0/d32K50.70/87.30→52.27/87.69. These are small stored-baseline deltas,
+not isolated per-change or confirmed universal gains; d32K is lookup-heavy.
+HTTP greedy/sampled512 C1/C2, off/MTP pass; greedy outputs match, with no
+individual prefill/decode slowdown crossing both5% and10ms. Sampled-output
+identity is not asserted. C2 MTP draft/accept counts differ from the
+stored baseline despite identical greedy output; its timing difference cannot
+be attributed solely to kernel work. Group-wall aggregate MTP C1 greedy/sample
+41.70/41.97→43.29/43.80 and C2 45.55/50.08→45.90/52.48tok/s.
+
+Keep these default source paths, preserving original server deployment after
+the approved test window. All baseline/model data and incremental build
+artifacts remain. Attempt001 lacked render-device permission before computation;
+attempt002's completed TG-MTP hash was interrupted by stdout headers, repaired
+only for CPU parsing and independently checked against all four baseline
+hashes/counters. Raw evidence stays intact; attempt003 ran only the two unrun
+HTTP cases. Evidence: `build/f3-general-opts/{runtime,validation-002,validation-003}`,
+`QUALIFICATION.json`, `INDEPENDENT-FINAL-REVIEW.json` and
+`validation-002/tg-mtp/PARSE-REPAIR.json`.
+
 ## Prefill live-subtile compiler screen, November 2, 2026
 
 Do not directly clone the successful routed GEMV live-row loops into X3
@@ -1683,3 +1766,825 @@ KV backing is allocated, but scratch/graphs/images can grow. Keep the4GiB host
 shutdown floor visible; cgroup memory excludes most UMA GPU allocations.
 Gufo remains ready, run d46df13dd50a; Kyojin stopped,default alias unchanged.
 Evidence: `/home/m2on/.local/share/gufo/fp16-c2-256k-20261104/RESULT.json`.
+
+### 2026-11-05: EXL3 c03 long calibration preflight
+
+Pinned Kyojin converter/ROCm10.1 image79e3e0b7, c03 SHA36c8eddb,
+BF16 source de4b8e4d, completed K8 ngram reused. Independent8192/512-token
+rows pass embedding/HC/GDN/PLE/first full-attention. All-expert capture output
+is discarded; normal routing advances state. Five B1 packed operators pass
+the existing5% relative activation-error limit: GDNqkvK5 0.5451%,
+first expert-downK4 4.3159%, attentionqK6 0.2406%, kK8 0.1947%,
+full-attention-block expert-downK4 4.8279%. FP32 output shortcut disabled;
+finite H/output/scales, nonnegative proxy, no uncalibrated fallback.
+Pilot169.1s, peak GPU allocated15.829GiB, host available minimum89.87GiB,
+returnedKFD0. This is a two-row operator/long-shape screen, not full-model
+quality or peak-memory qualification. Existing512 baseline not repeated.
+Main retains8GiB host reserve/100GiB container and module checkpoints.
+Evidence: `ai.tools/tmp/test-results/flash-next-quant-20261104/long-row-pilot/`;
+[conversion/watch](../plan/exl3/F3-CONVERSION-WATCH.md).
+
+### 2026-11-05: c03 calibration state residency repair
+
+Full calibration checkpoint is81,899,571,619B (~76.28GiB). The converter's
+eager CPU reader retained all rows as anonymous RAM; attempt003 stopped at
+first block loading when MemAvailable fell below8GiB. No computation failure
+was recorded; c03 idx2 checkpoint and K8 ngram retained, KFD returned0.
+Use a one-row disk-backed cache and stream unchanged tensor values into the
+same checkpoint format. CPU seven contracts pass including official reader,
+BF16 byte-view flattening, rotation/resume and unchanged source. Metadata-only
+open of the real76GiB checkpoint adds2MiB RSS. GPU staging on actual3217/8192
+rows preserves exact values, including GPU-only head eviction;3.13s,
+peak320MiB, host available minimum108.34GiB, KFD0. Independent review passed.
+This fixes storage residency; full conversion peak/time/quality remain to be
+measured. Existing long-row/512 baseline reused, runtime/kernels unchanged.
+Evidence: `ai.tools/tmp/test-results/flash-next-quant-20261104/model-job-c03/repair-001-eager-state/`.
+
+### 2026-11-05: completed row checkpoint recovery without recomputation
+
+Attempt004 completed layer0 quantization and all2309 forward rows in3576.52s;
+RFN0.017948/cos0.000078/SQNR40.802051, minimum host available73.95GiB.
+The3600s module guard interrupted redundant76GiB aggregate checkpoint writing.
+Final per-row outputs survived. Verified exact original calibration token IDs,
+frozen input/recipe hashes, every row's extent/shape/dtype/attempt provenance,
+and all1542 packed targets (6184 total saved tensor entries), then recovered
+idx3 using immutable hardlinks in1.229s. No GPU work repeated. CPU7contracts,
+actual recovered row0/364/2308 exact reads, infra432/18.38s and independent
+review pass. Reader accepts old aggregate and new row manifests; private input
+links survive old checkpoint deletion, output replace preserves snapshots.
+Fixed stop/kill auto-remove race so cleanup errors no longer hide initial cause.
+Failed scratch is retained until recovery; successful scratch links are retired.
+Full model quality/performance still pending; time/memory/disk guards unchanged.
+Evidence: `ai.tools/tmp/test-results/flash-next-quant-20261104/model-job-c03/repair-002-checkpoint/`.
+
+### 2026-11-05: Docker missing-object diagnostic case
+
+Attempt005 completed PLE in345.05s and committed idx4; supervisor stopped only
+because the installed Docker CLI emits lowercase `error: no such object` after
+`--rm`. Normalize diagnostic case while retaining ownership/reap/KFD checks and
+rejecting unrelated daemon/permission/socket errors. CPU11 regression cases,
+including the real installed CLI, pass; infra432/18.60s and independent review
+pass. Confirmed all2309 checkpoint row headers/shapes/dtypes and unchanged input
+IDs; KFD0. Resume idx4 without repeating model/GPU tests or completed work.
+Evidence: `ai.tools/tmp/test-results/flash-next-quant-20261104/model-job-c03/repair-003-cleanup-case/`.
+
+### 2026-11-05: CPU checkpoint commit after bounded GPU window
+
+Attempt006 completed layer1 and2309 forward rows in3592.60s, RFN0.008642,
+cos0.000148/SQNR52.849043, minimum host available74.108GiB. GPU3600s guard
+expired just before checkpoint commit. Reaped owned container/KFD0, then
+validated completed TransformerBlock outputs and committed unchanged rows in
+2.337s on CPU, without repeating compute. Use a separate120s CPU window with
+8GiB RAM/100GiB disk floors, only for explicit GPU window timeout and complete
+new rows/IDs/recipe/packed tensors/feedback. Other failures and head are rejected.
+Durable commit journal and incomplete-stage admission guard protect interrupted
+rename. CPU10 checks and infra432/18.82s pass; independent review pass.
+Retire redundant links only after commit; actual disk free292.34GiB. Full model
+quality/performance still pending. A converter commit during stop grace can
+still require manual audit; it is never silently treated as success.
+Evidence: `ai.tools/tmp/test-results/flash-next-quant-20261104/model-job-c03/module-006/CPU-COMMIT.json`;
+`repair-004-cpu-commit/`. GPU window and numerical settings unchanged.
+
+
+### 2026-11-05: Elide discarded expert-down outputs during EXL3 calibration
+
+The pinned converter computes all512 experts while collecting Hessians, then
+throws away that forward output and separately computes normal routed reference
+rows/state. Keep Linear.forward padding/capture_H intact and skip only routed
+down LinearFP16.inner GEMMs inside this explicitly discarded terminal-MoE scope.
+Shared experts, normal routing, FP32 arithmetic, calibration, recipe and N2
+quantization remain unchanged. Require the audited terminal structure and pinned
+unwrapped cm.main caller/source; the torch.inference_mode decorator must be
+included in the source identity. An initial guard mismatch stopped before any
+baseline computation; the CPU fixture now tests the real decorator too.
+
+One retained baseline per GDN/full-attention block at33/512/8192 rows: all516 H
+keys/tensors/counters, preserved inputs and normal outputs match byte-for-byte.
+At512 rows, capture1.37779/1.21895s becomes0.52963/0.53058s; at8192,
+33.58238/35.01159s becomes24.19120/23.78136s. The206.45s combined GPU screen
+returns KFD0. First-shape/library/allocator warmup can favor later candidates;
+these are provisional capture timings, not full-conversion or inference gains.
+Save baseline H and outputs; do not repeat them for unchanged comparisons.
+
+Foreach H/count additions also match exactly but add no material8K gain
+(24.15114/23.78973s), with attention512 at0.54635s. Preserve experiment evidence;
+do not deploy this extra machinery. Keep the original flush. Use host-only60s
+progress instead of EXL3_QUANT_PROFILE=1, which synchronizes quant-worker stages.
+
+CPU scope15/foreach18/progress9/guardian8 checks pass. The existing first
+attention block finished in4886.74s, RFN0.008242, and committed idx7: a bounded
+supervisor-only handoff preserved its GPU calculation past the old1h guard.
+The new module limit is2h with unchanged RAM8GiB/disk100GiB running floors.
+Full model accuracy/performance remain the final combined qualification.
+Evidence: `ai.tools/tmp/test-results/flash-next-quant-20261104/capture-speed/`,
+`capture-optimization-cpu-active-runtime/`, and `model-job-c03/repair-005-capture-speed/`.
+[Conversion watch and rollout](../plan/exl3/F3-CONVERSION-WATCH.md).
+
+Production activation is confirmed on resumed module009: the first host progress
+record reports4 capture scopes and2048 skipped down calls (9,900,032 expert rows).
+`capture-speed/ACTIVATION.json` distinguishes this from the explicit probe scope.
+Post-integration infra432 checks pass in19.17s; full conversion remains running.
+
+09:20 qualification correction: module009 capture projects about63min, whereas
+old complete GDN blocks took58.6–59.9min. This is a suspected real regression,
+not an established ETA-only effect. Earlier probe omitted production inference_mode,
+used resident inputs and original-first timing without balanced warmup. These
+are confirmed measurement limitations, not yet a causal diagnosis. A bounded
+matched diagnostic is reserved at the next natural checkpoint boundary, with
+saved initial H, real512/8192/3217 rows and separate read/H2D/forward/flush timing.
+See `capture-regression/` and the conversion watch; no full baseline repeat.
+
+09:45 matched diagnostic completed in136.11s with exact H/counters/normal outputs
+and clean GPU return. Resident capture means512:0.55880→0.42625s,
+8192:15.00277→13.16548s,3217:4.94569→4.15319s. Original-first warmup inflated
+earlier gains; new measurements still favor skip-down, but do not explain the
+4424.52s complete module009 (capture3732.49s). I/O is excluded from these gains;
+512 pipeline also contains a read-time outlier. Overall regression remains
+unresolved. Independent review retained code unchanged and resumed idx8;
+`capture-regression/REVIEW.json` records the decision.
+
+Actual-loop follow-up: pinned cm.main64-row ABBA with automatic scope, DiskRows,
+first five normal references and no per-stage synchronization gives original
+66.7137/67.1036s versus skip54.9655/54.8417s (17.9% less time). All516H/counters,
+references/inputs/RNG are exact. Private byte-identical copies preserve protected
+checkpoint mounts; page caches are warm. Cleanup errors0/KFD0, independent review
+keeps skip-down and resumes idx9. This qualifies the sampled capture loop, not
+complete conversion or the cause of earlier whole-block slowdown. Evidence:
+`capture-pipeline/{SUMMARY,STATE,REVIEW}.json`.
+
+Direct FP32 pack follow-up: keep the original flush. Actual64-row capture ABBA
+with deployed skip-down gives55.2241/55.2856s original versus55.0169/54.9570s
+pack (0.485% mean reduction, below5% criterion). All516H/counters/references/
+inputs/RNG match the saved original control; no whole baseline rerun. Separate
+3217/7793/512-row flush event intervals sum to729.09ms preprocessing,
+6091.85ms BMM and50.97ms H/count accumulation. These three samples are not a
+whole-capture cost fraction and may include host submission gaps. No claim
+about the historical whole-block slowdown follows. Cleanup errors0/KFD0;
+independent review resumed idx10 unchanged. `capture-pack/{SUMMARY,STATE,REVIEW}.json`.
+
+November5 follow-up profiling did not qualify numerically: the64-row loop with
+all-row events and a row4 torch.profiler trace took75.917s, then failed saved-control
+byte equality at `capture_H.block.attn.input.H`. This is the first comparison
+failure, not proof of a unique bad tensor or first causal layer. No magnitude was
+retained by that initial harness; raw numeric preservation was corrected before
+retry. Do not interpret the profiled wall time as a regression or deploy a changed
+arithmetic contract. Original checkpoint idx10 is untouched; cleanup errors0/KFD0.
+Evidence: `capture-profile-quarter-attempt-001/`. Retry isolates events-only first,
+then trace only if exact, with provisional profile/difference/numeric persistence.
+Quarter calibration is an independent two-projection screen using retained full2M
+packed weights; its first attempt had not started when this profile failed.
+
+Quarter c03 operator screen (577rows/503322tokens) completed: prefix capture401.48s,
+full diagnostic488.97s, K6 GDNout/K4expert0 down retained the full2M rotation signs.
+Same-c03 mean document error increases1.181%/0.556% (biased toward full calibration).
+Fresh fixed8-input screen reusing both packs took37.31s: mean document error ratios
+1.007627/0.994610, maxima1.013991/1.001267; neither flags the predeclared advisory
+1.02mean/1.05max. Includes synthetic Korean4K/local C++8K and samples max256positions;
+some sampled p99 errors rise. This supports a subset-mapping check, not all-layer
+quality equivalence or inference speed. Prefix401s is65H/64experts, not full512expert
+conversion timing. Both cleanups have0errors/0KFD. Evidence: `capture-profile-quarter/`
+and `capture-quarter-holdout/`, each REVIEW.json. Full2309-row state remains intact.
+
+Same-shape Hessian chunk128 rejected for deployment: six real64-row historical
+GDN capture cases match all516 saved H/counts/references/IDs/RNG exactly. Warmed
+ABBA chunk64 54.912/55.085s vs chunk128 55.474/55.069s; mean +0.495% time is
+inconclusive, not a confirmed regression or improvement. Peak allocated GPU
+memory rises15.23→19.10GiB (+3.87GiB). First candidate warmup77.44s is excluded;
+its initialization cause was not identified. Keep chunk64, full2M calibration,
+FP32 and idx10 stopped. Cleanup0/KFD0; production frozen and protected inputs
+unchanged. Independent review: `capture-chunk/{SUMMARY,STATE,REVIEW}.json` under
+`ai.tools/tmp/test-results/flash-next-quant-20261104/`. Do not repeat this unchanged
+comparison or extrapolate its capture-only timing to full conversion.
+
+Gram operator follow-up (`capture-gram/`,97.35s,cleanup0/KFD0): direct hipBLASLt
+FP32 heuristics2/3 improve resident64×512×640 Gram ~2.1–2.2x,1×512×6144
+~3.2–3.5x,64×8192×640 ~2.4–3.7x. Relative differences vs Torch FP32 BMM are
+4.05e-7/4.07e-7/8.25e-7; FP64 samples(first2batches,8columns) improve on expert
+shapes and change dense4.84e-7→4.91e-7. Heuristic1 is byteexact and ~7% faster
+on8K only. Original-FP16-input Lt reaches7.2/9.9/17.5x, but8K sample error grows
+9.61e-7→~1.71e-5. Custom WMMA achieves3.2/6.0/6.1x, slower than fastest half Lt;
+its dyadic analytic mismatch is preserved, not accepted by relaxing exact checks.
+No FP32 input was cast down. All outputs FP32; accumulation order changes matter.
+Operator-only timing excludes packing/masking/H addition. Torch preference is Lt,
+but profiler exported no GPU kernel events; actual kernel attribution remains
+unproven. Prefer matched flush/quantization quality checks before any deployment;
+production unchanged,full2M maintained,idx10 stopped. Preserve real-inputs.pt and
+per-case control.pt; no recapture or whole baseline rerun. REVIEW.json records
+independent assessment; first analytic attempt retained separately.
+
+Complete-flush and matched-quantization follow-up (`capture-lt/`,37.37s): reuse
+saved64-expert512/8192 and dense512 inputs; keep stack/cast/finite mask/H-add/count
+ordering. Original flush0.73544s,FP32Lt3 0.36042s(~2.04x),original-halfLt1
+0.12585s(~5.84x). Original agrees byte-exact with saved Gram controls; candidate
+repeats/counts are exact. Same small H samples, weights, RNG and worker stream
+for two projections: mean document error increase dense+0.0435%/+0.1032%,
+expert+0.0154%/+0.0140%(FP32/half); worst sampled p99 rises~1.92%. Rotations
+match/no fallback. Dense512 is rank-deficient before damping, so not full-model
+quality qualification. Cleanup0/KFD0 and production unchanged. Next real-loop
+qualification must bound Lt plan/workspace caching: current per-shape32MiB plans
+cannot accumulate without a limit across all ragged calibration lengths.
+Independent assessment in REVIEW.json; retain H/packed/evaluation inputs.
+
+Bounded Lt actual-loop follow-up failed before matched timing: first FP32Lt
+warmup72.64s completed64 rows but normal refs differed from saved control.
+CPU retained-output audit: all5 finite, relativeL2 7.85e-7..8.42e-6;516H counters/
+metadata, input hashes, IDs, preserves and RNG match. No causal claim: H is not
+read by the normal reference forward. No valid A/B/C comparison/cache-peak result
+was recorded; do not use warmup as a speed result. Cleanup0/KFD0, mainidx10 stopped,
+25% deferred, candidate uninstalled. Retain failed-numeric.pt and REVIEW.json in
+capture-lt-pipeline/. Focused row0 same-process normal repeats before/after original
+flush, Lt flush and plan close will separate reproducibility from intervention;
+no full64 baseline replay or completed-checkpoint change.
+
+Focused Lt failure isolation retained original baseline: warmed row0 (32.00s),
+cold Lt-first row0 with original host wrapper/entry sync (21.05s), and first5-row
+prefix (60.70s) all match saved normal references byte-exact. These elapsed spans
+include CPU copies/hash/validation and are not performance timings. Prefix
+references remain unchanged after subsequent rows;516H counters each19848,
+inputs/preserves/IDs/RNG exact. Native LRU exercised12evictions, peak8plans,
+explicit workspace cap256MiB; Torch peak15.20GiB excludes native workspace and
+library reservations. All diagnostics cleanup0/KFD0. Evidence capture-lt-ref/,
+capture-lt-cold/,capture-lt-prefix/ under the same retained November4 results.
+This does not reproduce or explain the first64-row failure. No arithmetic guard
+was relaxed, no production code installed, no full baseline repeated. Keep
+FP32Lt3 as the next qualification candidate; FP16Lt1 remains separately unqualified
+for the complete loop. Any next candidate-only64-row diagnostic should preserve
+normal refs both immediately and at loop end to distinguish later mutation from
+cross-process reproducibility; it has not started. Mainidx10/25% hold remain.
+
+User-authorized numerical-quality evaluation separates arithmetic differences
+from data integrity (`capture-lt-evaluate/`). Original saved baseline was reused;
+observer+half warmup excluded, candidate-only B/C/C/B capture means FP32Lt3
+53.516s, original-halfLt1 44.853s (16.19% less wall time between candidates).
+All6 cases preserve saved normal references exactly, candidate repeats H/refs
+byte-exact, observer refs unchanged at loop end. H differences vs saved original
+max relativeL2 FP32 5.39e-8 / half 2.03e-5.12evictions,peak8plans,explicit256MiB
+workspace; Torch peak15.23GiB excludes native reservations. Cleanup0/KFD0;
+381.90s diagnostic. Historical original~55s is not a concurrent matched control.
+The first separate64-row mismatch remains unexplained and its failure receipt
+is retained. Next quality comparison uses saved64-row H (50056tokens) to quantize
+two layer6 projections identically, fixed8 documents and actualBF16 source weight
+projection teacher with sampledCPUFP64. No calibration reduction/main resume.
+
+Layer6 paired quality follow-up (`capture-lt-quality/`,177.35s,cleanup0/KFD0):
+reuse original/new64-row H (50056tokens), quantize GDNoutK6 and expert0downK4
+with identical RNG/worker arithmetic. Fixed8 reused docs traverse original loader
+weights plus fixedK8 ngram; the projection teacher uses actual sourceBF16 weights
+in FP32 and sampledCPUFP64 cross-check. BF16→loadedFP16 max2.98e-8 recorded.
+Mean document error ratios vs original-H pack: dense FP32 .99744961 (-.2550%),
+original-half 1.00001649 (+.00165%); expert both1.0 with ALL packed bytes identical.
+Half dense worst document+0.615%, worst sampled-p99+1.882%; not all metrics improve.
+All6quantizations CPUFP32 Cholesky first attempt,rotation signs same,no fallback.
+Prefer original-half Lt for next integration qualification given16.19% less
+capture wall time than FP32Lt, while retaining FP32 inputs as FP32. No production
+installation/main resume: full-attention/unseen shape/heuristic support and
+explicit unsupported handling remain before integration. Two projections/fixed8
+docs are not whole-model quality equivalence. Original initial64 mismatch remains
+unexplained; later6candidate captures are repeatable/exact in normal references.
+Preserve H/prefix states/evaluation activations/BF16 teachers/packs for reuse.
+
+
+Lt integration qualification (`capture-lt-support/`,50.09s,cleanup0/KFD0):
+152 calibrated/diagnostic lengths ×5 batch/dimension pairs ×2 input precisions
+support the selected algorithms (1520 creations). Actual attention33/512/8192
+keeps saved normal refs exact, H/ref repeats byte-exact,516 counters8737;
+max H relativeL2 vs original2.45e-5.8plan/256MiB explicit bound,16evictions.
+This is selected heuristic support, not numerical execution of all1520 shapes.
+
+User-requested Lt64 versus128 actual64-row ABBA (`capture-lt-chunk/`):
+64first65.7576s,12844.7009/44.6832s,64last44.6663s. All four cases match
+saved qualified Lt64 H/refs/counts/IDs/RNG byte-exact; B128304 new support
+combinations pass; cleanup0/KFD0. First-A discrepancy is cold/order-associated,
+not evidence of128 gain. Warm128 shows no gain and peakTorch19.096GiB vs
+64last15.231GiB (+3.865GiB), so retain64. Original baseline/quality not rerun.
+Original-half Lt1/F32Lt3 is now integrated at idx10 with full1,999,496tokens,
+chunk64, bounded8plans, explicit unsupported errors. Prior393-file freeze and
+2caller sources/checkpoint metadata preserved; new405-file freeze. Final whole
+model correctness/performance still required after conversion. Evidence:
+`capture-lt-chunk/REVIEW.json`, `model-job-c03/repair-006-capture-lt/`.
+
+
+Capture-owner correctness regression discovered by full-token guard (module013,
+layer7): capture completes1969.08s, then indexer count audit fails before quant.
+Shared block.attn.input chooses first_key once. A long first row3217 executes
+conditional QSA indexer before QKV (threshold2051); following512 rows skip that
+owner. Predicted full-c03 input-H coverage898184/1999496tokens. Existing layer3
+uses the same owner history; prior completion did not establish full coverage.
+Lt arithmetic is independent of this preexisting ordering defect.
+`capture-owner/`: real layer7 long3217→short512 produces count3217→3217;
+canonical always-run q_proj owner produces3217→3729, matching valid short-first
+for ALL516 H bytes and normal refs. CPU7/infra432, cleanup0/KFD0, independent review.
+GPU run retained failed additional assumption (other515 H equal broken control):
+mlp.input differs8.34e-8 relative; valid short-first comparison is exact. Saved
+CPU audit avoids GPU repeat. FP64 actual-input16×16 Gram relative7.83e-6.
+Production remains pausedidx10; restore layer3 input via retainedidx2+existing
+0/PLE/1/2 packed forward, then repair3 onward. Do not re-quantize healthy0..2 or
+silently retain invalid full-calibration claims. Evidence capture-owner/REVIEW.json.
+
+
+Owner-bug recovery authorization: user discarded unusable idx10 and old layer3~6
+packs; exact deletion manifest retained under repair-007-capture-owner (81.29GiB).
+Preserve idx2 and healthy layer0/PLE/layer1/layer2 packs. Prefix replay clones the
+pinned converter, replacing only capture/quant/save-pack section with existing
+packed load; original state advance/preserves/finite/checkpoint code retained.
+Pilot first3 actual rows passes in45.74s,idx6,source/IDs intact,cleanup0/KFD0;
+CPU AST6/owner integration7/infra432. First pilot failed before forward on a
+premature display-only weights_numel lookup; preserved attempt-001, no math change.
+Full2309-row replay completed in1813.25s,idx6,1999496tokens; first3 final rows
+match pilot byte-for-byte, all rows finite, original protection and cleanup pass.
+Independent review qualified promotion; rename preserves all2309 row inodes and
+header/extents. Owner integration changes only the two production callers in the
+old405-file freeze, adding14 dependencies (419 total); CPU admission passes.
+Full calibration and Lt64 remain unchanged. No async state I/O change is included.
+This qualifies state recovery, not complete layer0..2 model quality.
+Evidence prefix-recovery/{SUMMARY,REVIEW,PROMOTION}.json and
+model-job-c03/repair-007-capture-owner/{MIGRATION,ADMISSION}.json;
+full model quality/performance remains final.
+
+
+Conversion state I/O overlap (user requested stop/restart at layer3): CPU reader1
+and writer1, each queue bounded2GiB, prefetch8rows. Writer owns cloned CPU
+snapshot; stale reads invalidate/join, read-after-write waits, checkpoint drains
+both workers before fsync/link. Current row/GPU/clone temporaries are additional.
+CPU9 includes speculative-read failure blocking checkpoint. Real idx6 first16rows
+GPU transfer+elementwise+I/O ABBA .83949/.74239/.72310/.72396s, all output hashes
+exact, original metadata/stats preserved, cleanup0/KFD0. Warm timing is equal/noisy;
+no end-to-end model speed gain established. User-requested overlap structure
+adopted; arithmetic/full calibration/Lt64 unchanged, idx6 preserved.
+Independent review + infra432/18.95s +428-file admission. Evidence capture-io/
+{RESULTS,REVIEW,CPU}.json and repair-008-state-io/. One-off completed probe runner
+lacks SIGTERM handler; recorded limitation, do not reuse. Production supervisor
+retains existing signal cleanup. Main layer3 restarted for actual timing.
+
+
+User-requested larger read queue integrated at healthy layer3→layer4 boundary:
+reuse async I/O mechanics, cap800rows/10GiB (whichever first), writer2GiB unchanged.
+CPU9 contracts plus3 policy checks pass: actual first window319rows/
+10,602,127,360bytes; pure512-token rows fit512 at10GiB. Original428-file freeze
+preserved in repair-009-large-prefetch; two callers changed, new433-file freeze.
+No GPU rebenchmark or measured whole-conversion speed gain. Queue cap excludes
+current tensors. Evidence capture-io-large/ and repair-009-large-prefetch/.
+
+Remaining capture forward operator screen completed, not deployed. Actual
+LinearFP16.forward controls retain expert FP16 and dense FP32 output. Shared-input
+expert gate/up B2 Lt0:512 rows .118–.130→.096–.097ms;8192 rows1.654–1.662→
+1.273–1.327ms. Sampled FP64 relative error is about2.25e-4/2.11e-4 for both paths;
+outputs differ by relL2 about4e-5. Dense512 Lt4:2.55→.557–.565ms, but sampled
+FP64 relL2 rises1.03e-6→1.90e-5. All candidates finite and repeat-byte-exact.
+Output-buffer reuse and hot small weights confound pure-GEMM/end-to-end claims;
+no actual capture/H/normal-reference/quantized quality qualification yet.
+WMMA excluded pending its small analytic rounding discrepancy (max1.91e-6),
+not proof of worse model quality. Original small-M hgemm also has a separate
+M9..32/CPL2→CPL1 stale-grid defect: N64 second32 columns unwritten; this c03
+uses minimum512 rows, so unaffected. Preserve attempt-003 and CPU audit; runtime
+was not changed. Evidence capture-forward/{SUMMARY,STATE,LT-ANALYTIC,
+WMMA-REVIEW,SMALL-M-CPU-AUDIT}.json and saved inputs/control/candidate tensors.
+Next qualification: actual capture H/counters/normal references for promising
+expert batching; independent error evaluation for dense; remove redundant FP32
+preparation in original-half Gram and discarded-routing traffic. No25% subset.
+
+
+Expert paired capture candidate prepared separately while main conversion runs:
+only discarded up/gate LinearFP16 inners use shared-input B2 Lt0; original outer
+H capture and normal references remain intact. Fresh output per expert is
+mandatory because down H retains activated up storage until flush. That view
+also retains the consumed gate half: up to5GiB extra at8192 rows, plus3.125GiB
+packed weights, bounded8plans/256MiB workspace and other allocations.
+No output-scratch reuse; inference tensors use pinned adjacent-call/source and
+identity/stream guards rather than unavailable _version counters. CPU19 checks
+include retained H storage, scalar/signed-zero byte checks and failure cleanup;
+infra432/19.41s, independent review qualified_for_capture_screen. No new GPU
+results yet, production433-file freeze unchanged. Natural-boundary runner waits
+for main completion, then candidate-only64-row capture twice against saved
+capture-lt-evaluate/1-original_f16/numeric.pt; no baseline recomputation.
+Input reader differs from historical timing, so no speedup inference from this
+qualification. Evidence capture-forward-pair/{CPU,INPUT,READINESS-REVIEW,
+RESERVATION}.json. H/normal references and quantized quality remain unqualified.
+
+
+Layer4 module016 disk-reserve incident: capture/quant/forward completed2528.59s,
+then100GiB free-space guard stopped checkpoint publication. This was not a numeric
+or pair-kernel failure; paired probe never reached GPU admission. New state output
+is76.275GiB, so150GiB admission minus100GiB runtime reserve leaves too little
+space; budget at least185GiB before next module including new packed tensors.
+Independent complete2309row/1542packed/IDs/extents/mtime audit passed. Isolated
+recover_disk_checkpoint reuses frozen validation/commit with exact disk-stop+
+complete-forward eligibility; CPU9/independent review, idx8 committed1.68s with
+no GPU recomputation. Old input/partial/scratch links rotated only after new inode
+checks. Unused Docker buildcache older24h reclaimed28.85GB; free200.92GiB after
+rotation. Production433 freeze unchanged. Evidence module016/DISK-RECOVERY.json,
+CPU-COMMIT.json and repair-010-disk-checkpoint/. Pair first pre-admission failure
+preserved in capture-forward-pair/attempt-001-boundary-disk; narrow reviewed CPU
+recovery gate permits its first actual GPU screen from this healthy boundary.
+
+
+Paired expert Lt actual capture completed (candidate-only64rows/50056tokens,
+retained layer6 control reused):516 H counters/5normal refs/IDs/RNG exact,
+512expert-down H changed (maxrelL2 1.260194e-5), other4H byte-exact; second
+candidate full numeric repeat byte-exact. Pack3.125GiB/0.162s, GPU peak23.08→
+23.24GiB across cases (old halfLt control peak15.23GiB). Capture64.0717 then
+43.0643s; first-use/cache effects and changed read-only row loader prevent matched
+speedup/regression claims against old44.78s. Finite/integrity passed, not quantized
+quality qualification. Keep as uninstalled candidate pending convincing pipeline
+gain and downstream quality; no full baseline rerun or new quant sweep yet.
+GPU window133.30s, cleanup0/KFD0. Evidence capture-forward-pair/{SUMMARY,
+DIFFERENCES-0,DIFFERENCES-1,STATE}.json, retained case numeric and originalcontrol.
+
+
+Per-module disk preflight prepared at user request (not yet integrated): validate
+fixed calibration row/token shape and current checkpoint, retire only completed
+attempt transient directories with durable deletion records and current-link
+protection. Failed unresolved and baseline/model data remain protected. Required
+free bytes=100GiB+actual state bytes+16GiB (currently192.275GiB). Final main module
+also budgets current qtensors plus20GiB for new head/side qtensors and compiled
+copies/auxiliary slack; existing ngram is not recopied. Low space permits only
+unused Docker buildcache older24h pruning, then alerts before GPU work if still
+insufficient. CPU20 filesystem/negative cases, infra432/19.58s and independent
+review pass; natural-boundary integration reserved, production433 unchanged.
+Evidence disk-boundary/{CPU,REVIEW,INTEGRATION-CPU,BOUNDARY}.json.
+
+
+Capture traffic removal qualified and integrated (2026-11-05): original-half
+Gram uses its private stack for masking, eliminating unused F32 cast/mask and
+second half buffer. Pinned standard all-expert discarded pass reuses one owning
+gather, retains per-expert activated up for H, and removes empty routed-down
+zero/multiply/scatter consumers. Normal forward and Lt1/3, chunk64, H addition
+order/calibration/shape guards stay unchanged. Saved64-row/50056-token control
+reused: all516H,5normalrefs,counters,IDs,preserve,RNG byte-exact in two runs; repeat
+byte-exact. CPU exhausts65536 half patterns, mixed bad rows/float types, flush
+tail/alias cases and runtime guards (7+5 groups), infra432/18.80s; independent
+review passed. GPU128.23s window, cleanup0/KFD0. Capture59.13/37.48s and peak
+13.41/13.57GiB are diagnostic cold/warm observations; historical control reader
+differs, so no matched/full-conversion speed claim. Retained as exact traffic
+reduction. No new full baseline or quantization quality rerun.
+Disk preflight integrated alongside this change: past successful transient state
+cleanup and dynamic space budget before every module. Previous433 freeze/callers
+and idx9 retained; new450 freeze. Evidence capture-lean/{STATE,SUMMARY,REVIEW,
+CPU,RUNTIME-CPU}.json and model-job-c03/repair-012-lean-disk/.
+
+Disk preflight activation caught retired module011 idx10 log after approved
+rollback to idx6/currentidx9; no GPU work started. Ignore past entries only when
+all three cleanup trees are absent, while unresolved journals remain unconditional
+blocks and newer attempts with actual targets remain blocked. Dangling cleanup
+symlinks rejected. CPU23 + independent re-review + infra432 pass; four affected
+freeze hashes updated with old450 freeze preserved. Real preflight ready276.88GiB
+vs required192.275GiB, cleanup0; module018 Layer6 resumed. Evidence
+model-job-c03/repair-013-disk-empty-history/.
+
+First production layer with capture traffic removal completed: Layer6
+2207.66s total (capture1565.66s, quant432.72s, forward206.60s),2309rows,
+idx10,bad_rows[],cleanup0/KFD0. Actual gather2309/reuses1179899 and dead
+down/scatter removals1182208 each. State IO read wait81.72s. Next Layer7
+capture completed1598.89s and quantization began. These differ in layer/IO
+from Layer5, so total differences are observations, not matched speedup proof.
+Evidence model-job-c03/module-018/{STATE.json,run.log}, module-019/run.log.
+
+Static all-expert capture candidate prepared separately during module020: skip
+router/softmax/T×E assignment sort/count readback under pinned all-expert guards.
+Aggregate repeated immutable-gather gate/up Inf/NaN counts once and multiply the
+integer diagnostic by1024, preserving H queue/num_total and every expert GEMM.
+Native counter uses uint64 atomic counts; final bounded int64 totals remain exact.
+CPU9 groups include real capture_H mocked counter comparison with Inf/NaN and
+nonzero initial counters; runtime5 groups pass. Not yet GPU qualified or deployed.
+Next boundary combines saved64-row control exact/repeat checks and small count
+ABBA; no whole baseline recapture. Evidence capture-static/{CPU,RUNTIME-CPU}.json.
+
+Static all-expert candidate qualified/integrated at idx12 after Layer8:
+saved64rows/50056tokens, all516H and metadata (Inf/NaN,num_total,count),5normal
+refs,preserve,IDs,RNG byte-exact in two runs, repeat exact.64routes/64count
+kernels/65472count reuses/64commits, bounded8plans. Capture42.43/20.75s vs
+historical lean59.13/37.48s is encouraging, not matched whole-conversion timing.
+Synthetic1024 repeated counts ABBA:512rows old168/115ms,new7.42/.700ms;
+8192rows old4.289/4.280s,new4.263/4.205ms, all invalid-value integer counts exact.
+These times cover count diagnostics only. Small retained benchmark input adds
+approx40MiB to candidate peak. GPU window106.84s,cleanup0/KFD0; CPU9+runtime5
+and infra432/19.67s, independent review pass. Original450 freeze/callers and
+checkpoint retained; two callers changed, new464 freeze. Evidence capture-static/
+{STATE,SUMMARY,COUNT-ABBA,REVIEW}.json and repair-014-static-capture/.
+
+Production static capture: Layer10 completed1475.16s total, capture855.81s,
+quant427.24s, forward170.72s; count kernels2309/reuses2362107. Full2309rows,
+idx14,bad_rows[],cleanup0/KFD0. Following attention Layer11 capture893.20s
+completed, so guarded static routing also executed in its real capture path.
+No extra benchmark: observed different-layer timings, not matched speedup.
+Evidence model-job-c03/module-022 and module-023/{STATE.json,run.log}.
+
+
+## 2026-11-06 — Flash-Next MTP calibration preparation (CPU only)
+
+- User selected full c03 MTP calibration and K4/K6/K8 role-based allocation,
+  plus original BF16 vision. No running converter source was changed.
+- Pinned MTP input FCs originally share `block.mtp.fc` although their inputs
+  differ. A calibrated adapter must split their H maps: hidden FC sees four
+  HC streams per token (7,997,984 samples), embedding FC sees 1,999,496.
+- Runtime prompt alignment is zero first hidden + previous token's pre-mixer
+  FP16 HC stack, with unchanged full IDs. idx51 is the last preserved input
+  before the final mixer collapses that stack. Reuse it; do not replay main.
+- CPU contract checks cover lengths1/2/33/512/8192, FP16 overflow/nonfinite,
+  source immutability, actual1546-target recipe coverage, distinct H owners,
+  count mismatch and uncalibrated fallback rejection. GPU qualification pending.
+- Read-only idx51 boundary reservation:7CPU tests + independent review pass;
+  tolerate checkpoint rename gaps, retain the lease on notification failures.
+- Original vision payload from source safetensors headers:333 tensors,
+  448,931,056 parameters,897,862,112 bytes(0.8362GiB). Existing vision_bits16
+  compiler path copies raw extras with BF16 enabled; final payload audit pending.
+- Evidence: flash-next-quant-20261104/mtp-calibration-candidate/ and
+  mtp-calibration-boundary/. This records preparation, not measured GPU speed,
+  MTP acceptance improvement, or full-model quality parity.
+
+### Correction: target Gufo MTP semantics differ from pinned Kyojin
+
+Subsequent source review found Gufo executor/reference use full HC*H FP32 RMSNorm
+and pairs ids[:,1:] with pre-mixer hidden[:,:-1]. The initial per-stream/FP16/
+zero-prefix CPU checks above validate the Kyojin adapter only. They do not qualify
+Gufo calibration. Correct counts are1,997,187 valid pairs across all2309 rows,
+7,988,748 hidden-FC samples. FP32 input must reach input Hadamard before rounding
+rotated operands toFP16; output staysFP32. New T-1 decoder Gram shapes require
+new bounded qualification, not an unreviewed allowlist extension. The candidate
+was explicitly gated against GPU use while this adapter is corrected; live main
+and idx51 reservation are unchanged. See MTP-GUFO-INPUT-MISMATCH.json and current
+F3-MTP-CALIBRATION.md. No GPU/acceptance/throughput result is claimed.
+
+### 2026-11-06 EXL3 Layer44 scale-search completion stall
+
+Module056 stopped progressing at1142/1542 for>53min; two py-spy snapshots
+showed worker K4 [2560,640] g_scale_search_batch mse2.tolist waiting for ROCr
+completion. This does not identify the preceding failing kernel. Only the owned
+container was stopped; cleanup KFD0, checkpoint47/2309rows and464 frozen hashes
+verified; completed layers0–43 preserved. Fresh-context add and synthetic same
+K4/mul1 g-scale workers1→2→2 passed finite/exact repeat (0.443/0.205/0.199s,
+diagnostic only, no performance conclusion). Driver busy remained100 despite
+KFD0 and no increasing available DRM engine counters over8.11s. No reset or
+production quiet-gate waiver; root cause unresolved. Evidence: ai.tools
+`tmp/test-results/flash-next-quant-20261104/model-job-c03/repair-015-quant-stall/`
+STACK-1/STACK-LOCALS,PROBE-WINDOW,PROBE,CHECKPOINT-AUDIT,GPU-OWNER-DELTA,OWNER-REVIEW.
+
+Layer44 stall follow-up: explicit user-approved MODE2 reset at2026-11-06 18:15KST
+reported device-wedged recovery. Same bounded K4 probe passes again and exactly
+matches pre-reset scale/MSE; recovery of device does not identify original kernel
+cause. Post-reset10–11% is actual Chrome/KWin graphics (306ms/41ms over3.12s),
+not the previous zero-counter/busy100 state. Production still stopped atidx47
+because existing <=4 quiet admission is unmet; no app killed or gate changed.
+Receipts same repair directory: GPU-RESET,RESET-KERNEL,POST-RESET-OWNER-DELTA,RECOVERY-STATUS.
+
+
+### 2026-11-06: 변환 시작 시 화면렌더링과 GPU wedge 구분
+
+KFD0/작은 연산 성공만으로 GPU 건강을 단정하지 않는다. 이번 busy100+DRM engine
+카운터 정지 상태는 승인 MODE2 reset 후 해소됐고 커널도 wedged recovery를 보고했다.
+reset 후 busy10~11%는 실제 Chrome/KWin gfx 증분으로 귀속됐다. 최초 원인은 미확정.
+변환에만 고정 boot/pdev/전체 DRM client·proc 신원, 두 coherent 짧은 표본의
+단조 카운터·non-gfx 증분0·낮은 busy와 gfx 귀속 조건을 추가했다. malformed counter,
+새 client, reset counter, 설명되지 않는 activity는 차단한다. CPU7/독립리뷰 통과.
+GPU/JOB락·KFD/NPU·RAM/디스크 guard 및 성능측정 quiet는 유지한다.
+증거: flash-next-quant-20261104/model-job-c03/repair-016-desktop-admission.
+
+
+### 2026-11-06: MTP 입력 보정과 shifted Lt 소형 검사
+
+Gufo MTP는 F32 HC 전체10240차원 RMSNorm 및 hidden[:-1]/token[1:] 정렬이다.
+일반 변환기의 per-stream/zero-first 경로를 그대로 쓰지 않는다. 실제idx51 네위치에서
+Gufo source native와비교: rawFC 상대L2 최대9.01e-7, K8 packed 최대1.087e-6;
+실제codec FP16 내측가중치와입력회전은byte-exact. BF16→FP16 로드의아주작은값은
+최대2.98e-8 차이라원본가중치전체byte-exact라고하지않는다. 전체품질/속도증명은아니다.
+
+T-1 Lt1510shape 지원,20edge 수치검사/반복성확인. 긴FP16 5shape는원래1e-5
+screen실패(최대2.2100e-5), 기존8192 FP16Lt 약1.9902e-5와같은규모다.
+저장8191input CPU FP64합산에서 대각후보편향 약-1.63e-5; FP32 control이더가깝다.
+실패를지우지않고별도3e-5 후속screen으로실제MTP검사까지허용했다. 속도·수락률·
+최종모델품질은미검증. calibration Gram속도와실제draft+verify token/s는구분한다.
+
+호출부를cm.main밖으로옮기면capture_fast의caller-code guard로자동scope가비활성이다.
+별도run_module에서는검토된index1 discarded capture에만명시scope를연결하고
+normal reference를밖에둔다. 실제2행에서staticroutes2/emptydown1024/H516카운터정상.
+exec생성flush는inspect.getsource가실패하므로실제marshal코드/Python버전/고정leafSHA로
+신원을기록한다. 기존입력pack/H/derived는명시input-preserving migration으로재사용했다.
+읽기전용source와RW별도bind간hardlink는같은host디스크라도EXDEV다. 원본예약을유지한
+borrowed read-only행+private output overlay로대체하고완전advance전checkpoint를금지한다.
+근거: flash-next-quant-20261104/mtp-calibration-runs/, mtp-borrowed-source/,
+mtp-calibration-work/main/{gram,gram-followup,native-raw-002,native-packed,probe}/.
+
+
+### 2026-11-06: MTP 전체 입력 보정 완료·결과 재사용
+
+전체2309행/1997187 shifted쌍에서 입력FC 두개 K8 보정1441.10초 완료.
+저장로그 구간: 통계1221.96초/양자화12.31초/전체derived전진204.60초.
+hidden H7988748·embedding H1997187, H/refs/packed finite·hash검사통과.
+첫5보정참조RFN0.01080~0.01382, SQNR37.80~40.10dB는 입력결합블록 지표다.
+전체품질·초안수락률·추론성능으로 일반화하지 않는다. 원본idx51보존/cleanup0/KFD0.
+2309개F32 T-1 derived행의header/inode신원과실제FCpack을연결확인한뒤 재사용하면,
+디코더에새76.19GiB할당을중복예산잡을필요없다. 현재검토예산122.05GiB에
+runtime100GiB floor·H/refs·packed상한·margin을포함한다. 행payload전체재해시없음.
+근거 flash-next-quant-20261104/mtp-full-input-review/{REVIEW,CPU-AUDIT}.json 및
+mtp-calibration-runner/contracts/full-decoder-001-admission.json.
+
+
+### 2026-11-06: MTP 전체 디코더 보정 완료
+
+2309행/1997187쌍 통계907.01초,1544투영양자화424.12초,5정상참조5.58초,
+모듈1364.01초. 516H/카운터/finite/inf_nan0·실제혼합1546=K4 1536/K6 5/K8 5
+저장팩/refs/Hpayload/입력FC→derived→H→packed 연결독립감사통과.
+첫5보정참조RFN3.711~5.571%/SQNR27.05~30.85dB는블록출력오차이며
+초안수락률·전체품질저하율·추론속도아님. 2행pilot와H표본이달라동등비교금지.
+원본idx51/저장H/packed/refs보존, baseline/입력보정재수집없음.
+근거 flash-next-quant-20261104/mtp-full-decoder-review/.
+
+
+### 2026-11-06: 보정된 side model을 위한 마지막 본체 단계 분리
+
+완료MTP재사용시본체converter와supervisor를함께main-only로바꿔야한다.
+converter는EXL3_SKIP_SIDE_MODELS=1/vision16 및MAIN-CONVERSION·compileargs를
+기록하고supervisor는idx53+그marker만완료로본다. marker없는idx53은head재실행금지.
+이모드에서head시점옛packed+20GiB compile예산은실제로실행되지않는다.
+검토된정확한caller/source/c03와idx51/52에만예산분리;100GiB실행여유+
+실제state+16GiBmargin 및원래cleanup유지, 최종assembler는자체완성팩예산을요구.
+CPU예산4+완료4/독립리뷰/통합CPUadmission/infra432(18.91초)통과,470동결로재개.
+근거 flash-next-quant-20261104/model-job-c03/repair-018-final-mtp-vision/ 및
+mtp-final-compile-candidate/main-only-disk/. GPU산술변경없음.
+
+
+### 2026-11-07: terminal head 로그잇과 비동기쓰기큐 크기
+
+module062 head H수집2309행2405.63초·K8양자화637.64초는완료됐지만,
+첫5참조출력전진중7793×248320 FP16로그잇3.60GiB가2GiBasyncwrite budget을넘었다.
+이는캡처/양자화/메모리부족실패가아니며완료qtensors/lm_head.safetensors는보존됐다.
+첫5head상태는일반hidden보다크다(총9.18GiB);쓰지않는2304행은원래prehead입력유지.
+복구는저장pack+원본idx52로잃어버린5RAM참조만재비교하고직접파일쓰기,
+완료H/양자화전체반복없음. 후보CPU5·감독CPU7·독립리뷰/infra43218.73초통과,
+현재GPU실결과대기. 새완료marker는복구결과검토후에만생성한다.
+근거 flash-next-quant-20261104/head-recovery/.
+
+
+### 2026-11-07: c03 조립팩의 K8 런타임 및 최종 품질 검증
+
+최종17shard 조립159.31초, MTP1546투영(K4 1536/K6 5/K8 5)과비전333개
+BF16 payload exact. 과거native-vision 이미지의실제ELF는K8 GPU커널이없어
+정상lm_head K8팩을거부했다. 로더상한만완화하지않고현재HEAD a81c0f93…의
+Gufo/rq_logits를같은NixROCm10.1로빌드했다.319작업완료,각K8심볼64개,
+실제빌드의존성과실행동적라이브러리Nix경로확인. Nix호스트없는환경에서는
+보존gufo-nix volume을RO로붙이고실행ELF와baseimage신원을구분한다.
+
+새ELF6edf0d44…로HTTP10요청은MTPoff/on 모두본문·종료·토큰수동일,
+산술42/17·BF16비전/이미지이력·prefix반복1821/branch1811캐시통과.
+RAMprefix재사용검사이지물리GPU블록zero-copy증명은아니다.
+bench stdout/stderr합친로그는output_sha256=와실제SHA사이에표를끼울수있다.
+smoke003실패영수증보존,저장off실제SHA복구후누락MTP만별도확인한다.
+성능수집기는stdout/stderr분리하여같은파싱실패를방지한다.
+
+저장HF BF16원본32760위치(8×4095)와새팩FP16KV/MTPoff출력을비교:
+candidate수집155.37초,CPUscore5.14초,64head replay exact/finite/cleanup통과.
+평균ΔNLL -0.010195878, KL256 0.041522177, top1일치0.908394383,
+기준top256평균확률질량0.970305786. 전체어휘KL·독립holdout·decode정답률이아니다.
+참조는HF CPU BF16, KV실제dtype은기록부족으로단정하지않는다.
+기존UD자료와같은위치CPUpaired비교:ΔNLL차이 -0.016849077,
+KL차이+0.002295360, top1차이-7/32760. KL/top1 block/window CI는0포함,
+기존UD실행환경ROCm7.2.4/GCC13이달라양자화만의인과효과로해석하지않는다.
+원본/기존baseline재수집없음. 전체속도·MTP성능검증은별도진행한다.
+근거 flash-next-quant-20261104/final-current-nix101/ 및
+final-validation/{smoke-003,quality-current-001}/.
+
+
+### 2026-11-07: c03 혼합 MTP 최종 생성 속도
+
+현재동일Nix10.1/FP16KV팩에서off→MTP최대7:TG128 depth0
+27.33±0.03→50.70±0.35tok/s,depth32768 26.72±0.01→87.30±0.05.
+각2반복최종tokenSHA동일. 32K샘플111/111초안수락이라일반긴문맥속도아님.
+HTTPgreedy4요청전체wall C1 26.13→41.70,C2합산36.56→45.55tok/s,
+C1off기준C2off/C1on/C2on본문/종료/토큰수모두동일.
+PP2048 1460.97→1370.97,PP8192 1501.37→1403.43으로약6–7%비용도존재.
+동일자료의순차off/on관측이며희소온도표본/적은반복한계유지.
+8case cleanup0/returnedKFD0/팩불변,최소가용39.65GiB(32K설정).
+근거 final-validation/throughput-001/RESULT-REVIEW.json,FINAL-QUALIFICATION.json.
+기존baseline전체반복없이완료,시간별감시종료. 서비스자동배포없음.
+
+
+## 2026-11-07 c03 KVarN K4V4 versus retained FP16
+
+Same assembled c03 pack and frozen a81c0f93 Nix ROCm10.1 runtime; no re-quantization,
+rebuild, or FP16/BF16 baseline rerun. Evidence root:
+`/home/m2on/projects/ai.tools/tmp/test-results/flash-next-quant-20261104/final-validation/`.
+Quality: `quality-kv4-001/{RESULT-REVIEW.json,quality/compare-fp16.json}`.
+Performance/correctness: `kv4/throughput-001/{STATE,RESULTS,RESULT-REVIEW}.json`.
+
+| Metric | Saved FP16 | K4V4 |
+|---|---:|---:|
+| Prefill 2048, MTP off (tok/s) | 1460.97 | 1456.81 |
+| Prefill 8192, MTP off (tok/s) | 1501.37 | 1487.07 |
+| TG128 depth0, MTP off (tok/s) | 27.33 | 27.10 |
+| TG128 depth32768, MTP off (tok/s) | 26.72 | 26.33 |
+| TG128 depth0, adaptive mixed MTP max7 (tok/s) | 50.70 | 39.30 |
+| TG128 depth32768, adaptive mixed MTP max7 (tok/s) | 87.30 | 86.26 |
+| HTTP C1 greedy, MTP on group-wall tok/s | 41.7024 | 42.6084 |
+| HTTP C1 sampled, MTP on group-wall tok/s | 41.9665 | 44.4836 |
+| HTTP C2 greedy, MTP on aggregate group-wall tok/s | 45.5548 | 47.0233 |
+| HTTP C2 sampled, MTP on aggregate group-wall tok/s | 50.0779 | 48.6803 |
+
+All eight cases passed; K4 internal off/on native emitted SHA and C1/C2 HTTP greedy
+signatures match. Actual KVarN K4V4 metadata and repeat/branch cache reuse verified.
+Cross-KV texts differ: these historical timing ratios are not isolated kernel gains.
+Depth32768 is a repetitive lookup-heavy case, not general neural-MTP throughput.
+Two native repeats and one HTTP group per mode do not resolve small timing changes.
+
+Same configured pool 1932735283 bytes: off 297→1028 blocks (76032→263168 tokens);
+MTP on 274→798 blocks (70144→204288 tokens). Pool bytes were held fixed, so this
+measures capacity gain, not whole-process RAM reduction. FP16 sink/tail, MTP draft KV,
+GDN states and other allocations remain. Minimum host availability across cases 39.47GiB.
+
+On the same 32760 teacher-forced prefill positions (8×4K windows), BF16-reference
+compressed top256+rest KL 0.04152218→0.04497509; top1 agreement 90.8394→90.3327%.
+Both paired differences exclude zero in block/window 95% bootstrap intervals.
+NLL 2.1626503→2.1645008, paired +0.0018505 has intervals crossing zero.
+This is a small measured fidelity loss, not quality equivalence, and not independent
+holdout/general task/long-context/vision quality proof. K4 favors KV capacity; it is
+not a uniform speed win. Persistent service/default deployment was not performed.
+
+
+## Format-general paired prefill and EXL3 dispatch, November 7, 2026
+
+**Final scope after user-requested rollback:** retain Dense K1..8 and K3.5
+head, but revert the GGUF49-pair dispatch, expanded header caching, associated
+K-tail change and candidate-only GGUF tests. Original14-pair behavior returns.
+The measurements below are preserved historical evidence for the rejected
+GGUF candidate. `build/f3-general-formats/rollback/` records the selective
+rollback; no GPU/model baseline or service restart is needed for it.
+
+Retained for generality: dense traversal's K7 gate becomes integer K1..8 at
+unchanged6144→2560/R2048/singleton geometry; draft subset head adds K3.5 via
+the existing half-rate decoder, plus zero-work/prefix-only launch guards.
+GGUF paired prefill expands14→49 combinations among Q3/4/5/6_K, Q8_0 and
+IQ4_NL/XS. Header reuse follows each operand's format, not its partner.
+Mixed-Q6 decode placement and accumulator ordering remain intact. IQ3_S/F16
+remain unsupported by this paired route because their coordinate/loader
+contracts differ. New32-weight combinations required eliminating invalid
+up fetches in the final partial K64 stage; covered K32/96/160.
+
+All focused outputs match independent/direct and preserved controls: GGUF
+424,157,714B and dense167,772,160B byte-exact, head K3.5 K128/K256 and integer
+K3..8 with IDs/guards/repeat/empty-prefix tests pass. Nix10.1 incremental
+build/CPU checks and independent review pass. Dense eight-rate warm latency
+changes-10.36%..+0.32%. Actual two-launch production fallback versus new fused
+GGUF35 pairs gives16.35–32.63% lower latency on small shapes,39.46–58.25%
+on tested admission boundaries and12.73–21.88% on the larger shape. These
+are warm component measurements; no model-level or universal gain claim.
+An old/new A/B/B/A check retains existing Q5/IQ4_NL's small+3.96%/+2.11us cost
+under the user's explicit generality-first criterion.
+
+Measurement correction: the initial four-launch independent oracle is valid
+for correctness but is not production fallback timing. Its apparent new-pair
+small-shape slowdown must not drive dispatch policy. Preserve the initial
+screen, then reuse its numeric outputs and only fix affected timing controls.
+Original model/reference and successful dense/head checks are not repeated.
+Evidence: `build/f3-general-formats/{QUALIFICATION.json,SCREEN.json,ADMISSION.json,
+validation-001,validation-002,validation-003,INDEPENDENT-FINAL-REVIEW.json}`.
+The original serving runtime is restored after the approved windows.
+
+
+### EXL3 hot256 with more waves, November 7, 2026
+
+K4 Mode3 screen with128×256/8×2/K32,8×2/K64,8×4/K64 avoids the old
+hot256 register pressure:114/137/90VGPR, zero scratch/spills (currenthot128140).
+All six three-/two-class candidates preserve output bytes/finite/guards/repeat,
+but the three-class complete matrix launches lose2.67–9.87% across synthetic
+pp512/2048/4096. Removing the hot128 launch also fails to give a useful signal
+(pp2048/4096 +14.81–38.36% versus stored control, cross-window advisory).
+Keep cold64/hot128; fewer registers and fewer weight decodes do not by
+themselves offset altered workgroup shape, padding and scheduling. Their
+individual causal contributions were not profiled or established.
+
+Fixed1172-slot capacity, null gate/up exponents, scaled down, deterministic
+512-expert histograms;13 controls stored once and reused. Output guard
+shift2bytes and excluded descriptor-building/glue costs limit timing scope.
+No production MoE edit or model-baseline repeat. Detailed scope and source/ELF
+evidence: `build/f3-moe-wide/QUALIFICATION.json`; model experiment entry
+“Wider EXL3 MoE token tiles”.
+
+### Fused EXL3 gate/up and down-input preparation, November 7, 2026
+
+Rejected an isolated K4 prototype that kept gate intermediates inside the
+workgroup, preserving Mode3 FP16 rounding, Hadamard/scale/SwiGLU arithmetic,
+and separate whole-row down exponents. Use a disjoint dead output slab:
+writing into gate input while other output-channel blocks still read it is
+unsafe. LDS transpose can reuse dead operand storage after block barriers.
+Keeping rounded gate half bits in two uint32 registers instead of four restored
+FP32 values reduces register use without adding quantization.
+
+These savings did not produce a useful speed signal. Restored-FP32 hot128
+initially spilled (256VGPR/32B scratch); moving to16 waves removed spills
+(159VGPR). Packed-half candidates use111VGPR for64 rows/16 waves,143 for128
+rows/16 waves,147 for split64/8 waves, all scratch/spill-free. Across synthetic
+pp2048/4096, the fastest packed candidate is still12.0–17.2% slower than stored
+complete-stage controls; other packed variants lose18.5–36.7%. Cross-window
+numbers are advisory, not an isolated causal or model-performance result.
+Removing stores alone does not establish a gain; the cost of longer fused
+kernels and changed workgroup layouts must also be measured.
+
+Seven shapes include awkward counts through513, signed scales, zeros/tiny
+inputs and512-expert histograms. All42 packed candidate/repeat comparisons
+match saved half outputs and row exponents exactly; guards/finite pass.
+Positive exponents are covered, negative-exponent fallback is not. The first
+window completed numeric/timing work but its runtime observer rejected a stale
+expected ELF prepared before the signed-fixture build completed. Keep that
+failure: it does not qualify deployment. The second window waits for completed
+build/hash, verifies actual Nix10.1 ELF, and reuses controls without recomputing
+them. No production changes, full-model rerun or deployment. Evidence:
+`build/f3-moe-fused/{SCREEN-FIRST,SCREEN-PACKED,QUALIFICATION}.json`.

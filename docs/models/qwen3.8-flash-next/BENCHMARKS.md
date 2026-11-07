@@ -1,5 +1,35 @@
 # Qwen3.8 Flash-Next benchmarks
 
+## Generalized kernel paths, November 7, 2026
+
+Combined all-rate R3/R4 live rows, Mode3 staging and stable grouped vector
+loads; c03 pack, pinned Nix10.1, FP16 KV, two CLI repetitions. Existing matched
+runtime/model/settings baseline is reused; these small changes are observations
+against stored results, not a fresh alternating speedup experiment.
+
+| Scope | Saved baseline tok/s | Candidate tok/s | Change |
+| --- | ---: | ---: | ---: |
+| PP2048, MTP off | 1460.97 | 1457.86 | -0.21% |
+| PP8192, MTP off | 1501.37 | 1495.46 | -0.39% |
+| AR128 d0 | 27.33 | 27.32 | -0.04% |
+| AR128 d32768 | 26.72 | 26.76 | +0.15% |
+| PP2048, MTP7 | 1370.97 | 1385.03 | +1.03% |
+| PP8192, MTP7 | 1403.43 | 1416.51 | +0.93% |
+| MTP128 d0 | 50.70 | 52.27 | +3.10% |
+| MTP128 d32768 | 87.30 | 87.69 | +0.45% |
+
+All AR/MTP token hashes and draft work match saved controls. The d32768 MTP
+fixture is lookup-heavy. No individual mechanism's contribution is isolated.
+Receipts: `build/f3-general-opts/validation-002/` and its preserved TG-MTP
+`PARSE-REPAIR.json`/`REVIEWED-RESULT.json`; no successful measurement rerun.
+HTTP group-wall aggregate MTP C1 greedy/sampled41.70/41.97→43.29/43.80tok/s;
+C2 45.55/50.08→45.90/52.48. No individual prefill/decode slowdown crossed
+both5% and10ms across off/MTP C1/C2. Sampled outputs are not an equality
+oracle; these aggregate rates are not sums of individual decode rates. C2 MTP draft/accept counts differ from the
+stored baseline despite identical greedy output; its timing difference cannot
+be attributed solely to kernel work.
+
+
 ## Native EXL3 vision (2026-11-04)
 
 Native K6 vision residency 352601088 B versus historical BF16 903984064 B,
@@ -404,3 +434,21 @@ and8.93% (after256MiB write pressure); these are not model measurements.
 No model baseline or full profile was repeated. Preserve saved controls and
 Nix production objects for the next combined qualification.
 [Scope, both variants and receipts](../../../plan/exl3/F3-HC-LOAD-SCREENS.json).
+
+
+## EXL3 conversion capture screen, November 5, 2026
+
+These are conversion-only wall times, not serving prefill/decode benchmarks.
+One saved baseline; possible first-use library/allocator warmup means the
+percentage is provisional until complete conversion timings are available.
+
+| Block | Tokens | Original capture (s) | Dead-down elision (s) | Reduction |
+| --- | ---: | ---: | ---: | ---: |
+| GDN | 512 | 1.37779 | 0.52963 | 61.56% |
+| Full attention | 512 | 1.21895 | 0.53058 | 56.47% |
+| GDN | 8192 | 33.58238 | 24.19120 | 27.96% |
+| Full attention | 8192 | 35.01159 | 23.78136 | 32.08% |
+
+All captured statistics and normal outputs are byte-exact. The unchanged first
+attention conversion completed in4886.74s before adoption; later block timings
+will be logged without quant-worker synchronization. [Scope and receipts](../../../plan/exl3/F3-CONVERSION-WATCH.md).
