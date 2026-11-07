@@ -2946,11 +2946,13 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
         !MatrixRows(n_tokens) && UnpaddedQ8(c.HcDim()) && !moe_pending_ &&
         !res_deferred_ && d.rows == c.hidden_size && c.hidden_size % 128 == 0 &&
         c.hidden_size <= 2560 && c.num_experts_used <= 16;
-    if (!decode_moe_fused)
+    if (!decode_moe_fused) {
+      ApplyPendingResidual();  // the combine below rewrites block_out
       Exl3RoutedCombine(*pending.layer, s_.ids, pending.rows,
                         c.num_experts_used, s_.down_e, s_.weights, s_.shexp_out,
                         s_.router + c.num_experts, c.num_experts + 1,
                         s_.block_out, stream_);
+    }
   }
   if (exl3_moe_pending_.layer != nullptr) {
     const PendingExl3Moe pending = exl3_moe_pending_;

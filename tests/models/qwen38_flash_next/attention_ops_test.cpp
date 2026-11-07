@@ -1128,8 +1128,17 @@ void CheckPagedRows(std::uint32_t n_tokens, std::uint32_t start_pos,
         CheckHip(
             hipMemcpy(sv.get(), pv.get(), sv.bytes(), hipMemcpyDeviceToDevice),
             "copy paged V");
+        // [q|gate]-only rows at their own stride: K/V can only come from
+        // the split sources.
+        constexpr std::uint32_t qg_stride = 2 * kQWidth;
+        HipBuffer<float> qg_only(std::size_t{n_tokens} * qg_stride);
+        CheckHip(hipMemcpy2D(qg_only.get(), qg_stride * sizeof(float),
+                             d_packed.get(), stride * sizeof(float),
+                             qg_stride * sizeof(float), n_tokens,
+                             hipMemcpyDeviceToDevice),
+                 "copy query rows");
         if (!q::PrepareAttention(
-                d_packed.get(), stride, d_gamma.get(), d_gamma.get() + kDim,
+                qg_only.get(), qg_stride, d_gamma.get(), d_gamma.get() + kDim,
                 qs.get(), gs.get(), sk.get(), sv.get(), n_tokens, kHeads,
                 kKvHeads, kDim, 64, d_pos.get(), 1e7F, 1e-6F, nullptr, nullptr,
                 false, {}, table, separated_k.get(), separated_v.get()))
