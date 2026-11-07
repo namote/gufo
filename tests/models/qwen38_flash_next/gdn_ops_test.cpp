@@ -843,7 +843,10 @@ int RunStableDecodeCase(std::uint32_t kTokens) {
   struct Result {
     std::vector<float> out, state, conv;
   };
-  const auto run = [&](const std::vector<std::uint32_t>& chunks, bool batch) {
+  HipBuffer<std::uint32_t> d_arrivals(1);
+  CheckHip(hipMemset(d_arrivals.get(), 0, sizeof(std::uint32_t)), "memset");
+  const auto run = [&](const std::vector<std::uint32_t>& chunks, bool batch,
+                       bool fused_prep = false) {
     Upload(&d_conv_state, conv_state);
     Upload(&d_state, state);
     std::uint32_t first = 0;
@@ -883,7 +886,8 @@ int RunStableDecodeCase(std::uint32_t kTokens) {
             d_dt.get(), d_norm_w.get(), d_conv_state.get(), d_scratch.get(),
             d_qn.get(), d_kn.get(), d_raw.get(), d_state.get(), out_at, nullptr,
             {}, {}, count, kKHeads, kVHeads, kDim, kKernel, false, false, kEps,
-            nullptr, nullptr, {}, 0, nullptr, nullptr, true);
+            nullptr, nullptr, {}, 0, nullptr, nullptr, true, nullptr,
+            fused_prep ? d_arrivals.get() : nullptr);
       }
       first += count;
     }
@@ -901,6 +905,23 @@ int RunStableDecodeCase(std::uint32_t kTokens) {
            bytes_equal(x.conv, y.conv);
   };
   const Result whole = run({kTokens}, false);
+  // The convolution's last block normalizing q/k (one- and two-token
+  // calls): the separate GdnPrepKernel's bytes, counter back at zero.
+  {
+    std::vector<std::uint32_t> ones(kTokens, 1U), twos;
+    for (std::uint32_t left = kTokens; left != 0; left -= std::min(left, 2U))
+      twos.push_back(std::min(left, 2U));
+    for (const auto& chunks : {ones, twos}) {
+      if (!same(run(chunks, false), run(chunks, false, true)))
+        throw std::runtime_error("fused conv/prep GDN differs from GdnPrep");
+      std::uint32_t arrivals = 1;
+      CheckHip(hipMemcpy(&arrivals, d_arrivals.get(), sizeof(arrivals),
+                         hipMemcpyDeviceToHost),
+               "download arrivals");
+      if (arrivals != 0)
+        throw std::runtime_error("fused conv/prep arrivals not reset");
+    }
+  }
   if (kTokens <= 8) {
     // Verify: rollback rows and a checkpoint, written by the fused stages,
     // must leave the forward unchanged and match fresh prefix forwards.
@@ -982,7 +1003,7 @@ int main() {
       if (RunStableCase(n) != 0)
         return 1;
     }
-    for (std::uint32_t n : {1u, 3u, 8u, 9u, 12u, 16u}) {
+    for (std::uint32_t n : {1u, 2u, 3u, 8u, 9u, 12u, 16u}) {
       std::cout << "stable decode n=" << n << '\n';
       if (RunStableDecodeCase(n) != 0)
         return 1;

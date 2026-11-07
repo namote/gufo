@@ -1425,6 +1425,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   s.xn_q8_1 = q8_1(hc_dim);
   s.lo_q8_1 = q8_1(c.hc_low_rank);
   s.hc_arrivals = Alloc<std::uint32_t>(a, kHcArrivals, error_msg);
+  s.gdn_arrivals = Alloc<std::uint32_t>(a, 1, error_msg);
   s.mixed_q8_1 = q8_1(hidden);
   s.gdn_q8_1 = q8_1(c.SsmValueDim());
   s.ctx_q8_1 = q8_1(c.AttentionQDim());
@@ -3650,19 +3651,19 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   const DeviceTensor* const out_consumer[] = {&l.ssm_out};
   auto out_slabs = project_output && !tiled ? Exl3Slabs(out_consumer, n_tokens)
                                             : Exl3InputSlabs{};
-  if (!GatedDeltaNet(qkv, qkv_stride, z, z_stride, s_.alpha_beta,
-                     l.ssm_conv1d.f32(), l.ssm_a.f32(), l.ssm_dt.f32(),
-                     l.ssm_norm.f32(), s.conv_state, s_.conv_scratch, s_.qn,
-                     s_.kn, s_.gdn_raw, s.state, s_.gdn_out,
-                     tiled && !half_output ? s_.x_q8t : nullptr,
-                     speculative ? s.state_snapshots : RollbackRows{},
-                     speculative ? s.conv_snapshots : RollbackRows{}, n_tokens,
-                     c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim,
-                     c.ssm_conv_kernel, MatrixRows(n_tokens) && !speculative,
-                     convolved, c.rms_eps, stream_, out_half, checkpoint,
-                     half_stride, out_q8_1 ? s_.gdn_q8_1 : nullptr, z_ready,
-                     model_->output().exl3 != nullptr,
-                     out_slabs.count != 0 ? &out_slabs : nullptr)) {
+  if (!GatedDeltaNet(
+          qkv, qkv_stride, z, z_stride, s_.alpha_beta, l.ssm_conv1d.f32(),
+          l.ssm_a.f32(), l.ssm_dt.f32(), l.ssm_norm.f32(), s.conv_state,
+          s_.conv_scratch, s_.qn, s_.kn, s_.gdn_raw, s.state, s_.gdn_out,
+          tiled && !half_output ? s_.x_q8t : nullptr,
+          speculative ? s.state_snapshots : RollbackRows{},
+          speculative ? s.conv_snapshots : RollbackRows{}, n_tokens,
+          c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim,
+          c.ssm_conv_kernel, MatrixRows(n_tokens) && !speculative, convolved,
+          c.rms_eps, stream_, out_half, checkpoint, half_stride,
+          out_q8_1 ? s_.gdn_q8_1 : nullptr, z_ready,
+          model_->output().exl3 != nullptr,
+          out_slabs.count != 0 ? &out_slabs : nullptr, s_.gdn_arrivals)) {
     AssignError(error_msg, "DeltaNet launch failed");
     return false;
   }

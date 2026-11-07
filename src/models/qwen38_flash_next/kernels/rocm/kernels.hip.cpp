@@ -1904,6 +1904,45 @@ __device__ __forceinline__ void GdnPrepRow(float (&qv)[kGdnDim / 32],
   }
 }
 
+/// GdnPrepKernel's (token, key head) row `row` by the calling wave; kCoherent
+/// reads the convolution with agent-scope loads (SsmConv4PrepKernel's tail).
+template<bool kCoherent>
+__device__ __forceinline__ void GdnPrepRowOf(const float* conv_out, float* qn,
+                                             float* kn, std::uint32_t row,
+                                             std::uint32_t k_heads,
+                                             std::uint32_t channels,
+                                             float eps) {
+  constexpr std::uint32_t d = kGdnDim;
+  const std::uint32_t lane = threadIdx.x % warpSize;
+  const std::uint32_t t = row / k_heads;
+  const std::uint32_t kh = row % k_heads;
+  const float* conv = conv_out + static_cast<std::size_t>(t) * channels;
+  const auto load = [&](std::size_t i) {
+    if constexpr (kCoherent)
+      return __hip_atomic_load(conv + i, __ATOMIC_RELAXED,
+                               __HIP_MEMORY_SCOPE_AGENT);
+    else
+      return conv[i];
+  };
+  float qv[d / 32];
+  float kv[d / 32];
+#pragma unroll
+  for (std::uint32_t r = 0; r < d / 32; ++r) {
+    const std::uint32_t i = r * warpSize + lane;
+    qv[r] = load(kh * d + i);
+    kv[r] = load(k_heads * d + kh * d + i);
+  }
+  GdnPrepRow(qv, kv, eps);
+  float* q_out = qn + static_cast<std::size_t>(row) * d;
+  float* k_out = kn + static_cast<std::size_t>(row) * d;
+#pragma unroll
+  for (std::uint32_t r = 0; r < d / 32; ++r) {
+    const std::uint32_t i = r * warpSize + lane;
+    q_out[i] = qv[r];
+    k_out[i] = kv[r];
+  }
+}
+
 template<bool kBatch>
 __global__ void GdnPrepKernel(const float* conv_out, float* qn, float* kn,
                               std::uint32_t n_rows, std::uint32_t k_heads,
@@ -1925,27 +1964,7 @@ __global__ void GdnPrepKernel(const float* conv_out, float* qn, float* kn,
   if (row >= n_rows) {
     return;
   }
-  const std::uint32_t t = row / k_heads;
-  const std::uint32_t kh = row % k_heads;
-  const float* conv = conv_out + static_cast<std::size_t>(t) * channels;
-  const std::uint32_t per_lane = d / warpSize;
-  float qv[d / 32];
-  float kv[d / 32];
-#pragma unroll
-  for (std::uint32_t r = 0; r < per_lane; ++r) {
-    const std::uint32_t i = r * warpSize + lane;
-    qv[r] = conv[kh * d + i];
-    kv[r] = conv[k_heads * d + kh * d + i];
-  }
-  GdnPrepRow(qv, kv, eps);
-  float* q_out = qn + static_cast<std::size_t>(row) * d;
-  float* k_out = kn + static_cast<std::size_t>(row) * d;
-#pragma unroll
-  for (std::uint32_t r = 0; r < per_lane; ++r) {
-    const std::uint32_t i = r * warpSize + lane;
-    q_out[i] = qv[r];
-    k_out[i] = kv[r];
-  }
+  GdnPrepRowOf<false>(conv_out, qn, kn, row, k_heads, channels, eps);
 }
 
 __global__ void GdnPrepKqKernel(const float* conv_out, float* scales,
@@ -2767,12 +2786,11 @@ __global__ void SsmConvKernel(const float* qkv, std::uint32_t qkv_stride,
 constexpr std::uint32_t kSsmConvTaps = 4;
 constexpr std::uint32_t kSsmConvTokensPerThread = 8;
 template<bool kSaveHistory, bool kBatch, bool stable = false>
-__global__ void SsmConv4Kernel(const float* qkv, std::uint32_t qkv_stride,
-                               const float* w, float* conv_state, float* out,
-                               std::uint32_t n_tokens, std::uint32_t channels,
-                               RollbackRows snapshots,
-                               const GdnBatchItem* batch,
-                               std::uint32_t active) {
+__device__ __forceinline__ void SsmConv4Body(
+    const float* qkv, std::uint32_t qkv_stride, const float* w,
+    float* conv_state, float* out, std::uint32_t n_tokens,
+    std::uint32_t channels, const RollbackRows& snapshots,
+    const GdnBatchItem* batch, std::uint32_t active) {
   if constexpr (kBatch) {
     if ((active & (1U << blockIdx.z)) == 0)
       return;
@@ -2846,6 +2864,47 @@ __global__ void SsmConv4Kernel(const float* qkv, std::uint32_t qkv_stride,
     for (std::uint32_t j = 0; j < kSsmConvTaps - 1; ++j)
       conv_state[std::size_t{j} * channels + c] = window[j];
   }
+}
+
+template<bool kSaveHistory, bool kBatch, bool stable = false>
+__global__ void SsmConv4Kernel(const float* qkv, std::uint32_t qkv_stride,
+                               const float* w, float* conv_state, float* out,
+                               std::uint32_t n_tokens, std::uint32_t channels,
+                               RollbackRows snapshots,
+                               const GdnBatchItem* batch,
+                               std::uint32_t active) {
+  SsmConv4Body<kSaveHistory, kBatch, stable>(qkv, qkv_stride, w, conv_state,
+                                             out, n_tokens, channels, snapshots,
+                                             batch, active);
+}
+
+/// SsmConv4Kernel<true, false, true> (one token tile), then the last block
+/// to finish runs GdnPrepKernel's rows over the convolution it wrote, one
+/// wave per (token, key head) row, read back with agent-scope loads: the
+/// same pinned normalization, one launch instead of two. The arrival
+/// counter wraps to zero on the last arrival.
+__global__ void SsmConv4PrepKernel(const float* qkv, std::uint32_t qkv_stride,
+                                   const float* w, float* conv_state,
+                                   float* out, std::uint32_t n_tokens,
+                                   std::uint32_t channels,
+                                   RollbackRows snapshots, float* qn, float* kn,
+                                   std::uint32_t k_heads, float eps,
+                                   std::uint32_t* arrivals) {
+  SsmConv4Body<true, false, true>(qkv, qkv_stride, w, conv_state, out, n_tokens,
+                                  channels, snapshots, nullptr, 0);
+  __shared__ unsigned last;
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0)
+    last = atomicInc(arrivals, gridDim.x - 1) == gridDim.x - 1;
+  __syncthreads();
+  if (last == 0)
+    return;
+  __threadfence();
+  const std::uint32_t waves = blockDim.x / warpSize;
+  for (std::uint32_t row = threadIdx.x / warpSize; row < n_tokens * k_heads;
+       row += waves)
+    GdnPrepRowOf<true>(out, qn, kn, row, k_heads, channels, eps);
 }
 
 __global__ void UnpackQGateKernel(const float* qg, std::uint32_t qg_stride,
@@ -9101,7 +9160,7 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    __half* out_half, GdnCheckpoint checkpoint,
                    std::uint32_t out_half_stride, void* out_q8_1,
                    hipEvent_t z_ready, bool stable_conv,
-                   Exl3InputSlabs* out_slabs) {
+                   Exl3InputSlabs* out_slabs, std::uint32_t* arrivals) {
   const std::uint32_t channels = 2 * k_heads * d + v_heads * d;
   const std::size_t count = static_cast<std::size_t>(n_tokens) * channels;
   if (checkpoint.history != nullptr)
@@ -9121,7 +9180,18 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
   const bool saved_history = !convolved && !fused_conv &&
                              kernel == kSsmConvTaps &&
                              n_tokens <= kSsmConvTokensPerThread;
-  if (!convolved && !fused_conv) {
+  // One or two decode tokens (16 or 32 prep rows): the convolution's last
+  // block also normalizes q/k (SsmConv4PrepKernel), as the separate
+  // GdnPrepKernel below would; wider calls keep the parallel prep.
+  const bool fused_prep = arrivals != nullptr && saved_history && stable_conv &&
+                          !row_split && d == kGdnDim &&
+                          n_tokens * k_heads <= 32;
+  if (fused_prep) {
+    hipLaunchKernelGGL(SsmConv4PrepKernel, dim3(Blocks(channels)),
+                       dim3(kThreads), 0, stream, qkv, qkv_stride, conv_w,
+                       conv_state, conv_scratch, n_tokens, channels,
+                       conv_snapshots, qn, kn, k_heads, eps, arrivals);
+  } else if (!convolved && !fused_conv) {
     if (saved_history && stable_conv) {
       hipLaunchKernelGGL((SsmConv4Kernel<true, false, true>),
                          dim3(Blocks(channels)), dim3(kThreads), 0, stream, qkv,
@@ -9205,10 +9275,11 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                        state, raw, n_tokens, k_heads, v_heads, checkpoint,
                        nullptr, 0U, nullptr, nullptr, eps);
   } else {
-    hipLaunchKernelGGL(GdnPrepKernel<false>,
-                       dim3((n_tokens * k_heads + waves - 1) / waves),
-                       dim3(kThreads), 0, stream, conv_scratch, qn, kn,
-                       n_tokens * k_heads, k_heads, channels, eps, nullptr, 0);
+    if (!fused_prep)
+      hipLaunchKernelGGL(
+          GdnPrepKernel<false>, dim3((n_tokens * k_heads + waves - 1) / waves),
+          dim3(kThreads), 0, stream, conv_scratch, qn, kn, n_tokens * k_heads,
+          k_heads, channels, eps, nullptr, 0);
     hipLaunchKernelGGL(
         GdnKernel<false>, dim3(v_heads, kGdnDim / kGdnRowsPerBlock),
         dim3(kGdnRowsPerBlock * kGdnLanes), 0, stream, conv_scratch, qn, kn,
