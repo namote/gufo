@@ -760,6 +760,13 @@ private:
   [[nodiscard]] bool SideCapturing() const;
   /// Orders the main stream after the work queued on side_stream_.
   bool JoinSide(std::string* error_msg) const;
+  /// Decode/verify: queues `enqueue`'s launches on side_stream_ after the
+  /// work queued so far, with Dense's EXL3 projections on exl3_side_; the
+  /// main stream joins them at JoinSide. False when the side branch is
+  /// unavailable (nothing queued) or a launch failed.
+  bool ForkSide(const std::function<bool()>& enqueue,
+                std::string* error_msg) const;
+  [[nodiscard]] bool SideBranchAvailable() const noexcept;
   bool Moe(const DeviceLayer& l, const float* x, float* out,
            std::uint32_t n_tokens, std::string* error_msg,
            bool last_only = false) const;
@@ -920,6 +927,13 @@ private:
   mutable Scratch s_{};
   std::size_t half_input_cols_{0};
   Exl3Scratch exl3_{};
+  /// A decode side branch's EXL3 projection scratch (ForkSide): its own
+  /// rotated-input slab, segment counters and slice rows, so it may run
+  /// beside a main-stream EXL3 GEMV.
+  Exl3Scratch exl3_side_{};
+  /// The scratch Dense's EXL3 projections use (exl3_ unless ForkSide).
+  mutable const Exl3Scratch* dense_exl3_{nullptr};
+  mutable std::uint64_t side_branches_{0};  ///< ForkSide calls (tests)
   gufo::hip::Exl3RotateProblem* exl3_dense_rotations_{nullptr};
   gufo::hip::Exl3GemmProblem* exl3_dense_gemms_{nullptr};
   struct Exl3DenseWorkspace {

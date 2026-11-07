@@ -1343,6 +1343,22 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     ex.slice_elements = std::max(T, std::size_t{64}) * (c.indexer_heads + 1) *
                         c.indexer_head_dim;
     ex.slice = f32(ex.slice_elements);
+    // The decode side branch's projections (ForkSide): kVecBatch rows of
+    // one hidden-width consumer.
+    auto& side = e->exl3_side_;
+    auto& side_projection = side.projection;
+    side_projection.fast_input_elements = std::size_t{8} * c.hidden_size;
+    side_projection.fast_input =
+        Alloc<std::uint16_t>(a, side_projection.fast_input_elements, error_msg);
+    side_projection.fast_counter_count =
+        std::max(3 * c.AttentionQDim(),
+                 (c.indexer_heads + 1) * c.indexer_head_dim) /
+        128;
+    side_projection.fast_counters =
+        Alloc<std::uint32_t>(a, side_projection.fast_counter_count, error_msg);
+    side.slice_elements =
+        std::size_t{kVecBatch} * (c.indexer_heads + 1) * c.indexer_head_dim;
+    side.slice = f32(side.slice_elements);
     const auto assignments = std::size_t{64} * c.num_experts_used;
     ex.routed_input = Alloc<std::uint16_t>(
         a,
@@ -2619,14 +2635,16 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
         return PlainDensePrefill(w, x, out, n_tokens, error_msg);
       const auto piece = std::max<std::uint32_t>(1, options_.max_batch);
       const DeviceTensor* const consumer[] = {&w};
-      const auto* rotated =
-          w.exl3 != nullptr && !prefill_phase && n_tokens <= piece
-              ? TakeExl3Rotated(x, n_tokens, consumer)
-              : nullptr;
+      // A side branch (ForkSide) never takes the main stream's hand-off.
+      const auto* rotated = w.exl3 != nullptr && !prefill_phase &&
+                                    n_tokens <= piece && dense_exl3_ == nullptr
+                                ? TakeExl3Rotated(x, n_tokens, consumer)
+                                : nullptr;
       for (std::uint32_t first = 0; first < n_tokens; first += piece) {
         const auto count = std::min(piece, n_tokens - first);
         Exl3Projection(w, x + std::size_t{first} * w.cols,
-                       out + std::size_t{first} * w.rows, count, exl3_, stream_,
+                       out + std::size_t{first} * w.rows, count,
+                       dense_exl3_ != nullptr ? *dense_exl3_ : exl3_, stream_,
                        !prefill_phase, rotated);
       }
       return true;
@@ -3535,6 +3553,23 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
         (void)hipStreamWaitEvent(stream, event, 0);
     }
   } z_join{stream_};
+  // EXL3 decode/verify: the alpha/beta projection reads only x, so a side
+  // branch runs it beside the qkv+z GEMV; GatedDeltaNet joins it first.
+  struct JoinGuard {
+    const Executor* executor;
+    ~JoinGuard() { (void)executor->JoinSide(nullptr); }
+  } join_guard{this};
+  const bool side_alpha_beta = !projections_ready && l.ssm_in.empty() &&
+                               l.ssm_qkv.exl3 != nullptr &&
+                               l.ssm_alpha_beta.exl3 == nullptr &&
+                               n_tokens <= kVecBatch && SideBranchAvailable();
+  if (side_alpha_beta && !ForkSide(
+                             [&] {
+                               return Dense(l.ssm_alpha_beta, x, s_.alpha_beta,
+                                            n_tokens, error_msg);
+                             },
+                             error_msg))
+    return false;
   if (!l.ssm_in.empty()) {
     // Wide prefill convolves QKV in the projection's LDS tile. The raw
     // boundary rows remain available for the rolling history update.
@@ -3580,10 +3615,12 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
       return false;
     }
   }
-  if (!projections_ready &&
+  if (!projections_ready && !side_alpha_beta &&
       !Dense(l.ssm_alpha_beta, x, s_.alpha_beta, n_tokens, error_msg)) {
     return false;
   }
+  if (side_alpha_beta && !JoinSide(error_msg))
+    return false;
   // Keep the same activation precision across prefill chunk boundaries.
   // The F16 epilogue reuses the F32 output allocation. Switching this
   // projection to Q8 for a short tail changes every subsequent layer.
@@ -3717,6 +3754,95 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     write_v = s.kvarn_v;
     write_rows = KvarnFp16Rows();
   }
+  const bool shared_indexer = prefill_phase && sparse && s.index_k != nullptr &&
+                              l.indexer_q.exl3 != nullptr &&
+                              l.indexer_q.exl3 == l.indexer_k.exl3;
+  // The indexer keys and block selection read only x, the indexer caches and
+  // their own scratch (s_.ik, s_.iq, s_.scores, s_.mask).
+  const std::uint32_t* mask = nullptr;
+  const auto indexer = [&]() -> bool {
+    if (s.index_k != nullptr) {
+      if (!shared_indexer &&
+          !(projections_ready
+                ? DenseBatch(l.indexer_k, x, s_.ik, n_tokens, error_msg)
+                : Dense(l.indexer_k, x, s_.ik, n_tokens, error_msg))) {
+        return false;
+      }
+      StoreRows(s_.ik, s.index_k, n_tokens, c.indexer_head_dim, pos,
+                index_capacity, stream_);
+    }
+    if (sparse) {
+      if (!shared_indexer &&
+          !Dense(l.indexer_q, x, s_.iq, n_tokens, error_msg)) {
+        return false;
+      }
+      RmsNormRows(s_.iq, l.indexer_q_norm.f32(), s_.iq,
+                  n_tokens * c.indexer_heads, c.indexer_head_dim, 1, c.rms_eps,
+                  stream_);
+      Rope(s_.iq, n_tokens, c.indexer_heads, c.indexer_head_dim, c.rotary_dim,
+           pos, c.rope_theta, stream_, s.rope, yarn_);
+      PoolIndexerBlocks(s.index_k, l.indexer_k_norm.f32(), s.block_k,
+                        first_block, pos, n_tokens, pool_grid, c.compress_ratio,
+                        c.indexer_head_dim, c.rotary_dim, c.rope_theta,
+                        c.rms_eps, index_capacity, stream_, s.rope, yarn_,
+                        s.kv_blocks);
+      // Align score rows to full cache lines. The selector still considers
+      // only complete causal blocks, so padding cannot change the ranking.
+      // Wide prefill is never captured: compact score rows to the populated
+      // context. Graphs retain the maximum stride for replay at later
+      // positions.
+      const auto score_context =
+          n_tokens > kVecBatch ? start_pos + n_tokens : max_context;
+      const std::uint32_t blocks =
+          (score_context + c.compress_ratio - 1) / c.compress_ratio;
+      const std::uint32_t max_blocks = (blocks + 31) / 32 * 32;
+      // Query rows are independent; rounding down to a power of two wasted
+      // up to half the bounded scratch and doubled launches above 160K.
+      const auto select_chunk = static_cast<std::uint32_t>(
+          std::min(std::size_t{512}, select_score_floats_ / max_blocks));
+      // Catch-up consumes only the final attention tile. Cover its masks even
+      // when the dense/sparse boundary shifts the four-query sparse groups.
+      const auto first_query = last_only && n_tokens > 16 ? n_tokens - 16 : 0U;
+      for (std::uint32_t t0 = first_query; t0 < n_tokens; t0 += select_chunk) {
+        const std::uint32_t n = std::min(select_chunk, n_tokens - t0);
+        // Batches wider than kVecBatch are never captured, so the host
+        // position bounds the scored range (a replayed graph must cover
+        // max_blocks).
+        const std::uint32_t live =
+            n_tokens > kVecBatch ? (start_pos + t0 + n) / c.compress_ratio : 0;
+        SelectBlocks(s_.iq + static_cast<std::size_t>(t0) * c.indexer_heads *
+                                 c.indexer_head_dim,
+                     s.block_k,
+                     s_.mask + static_cast<std::size_t>(t0) * mask_words_,
+                     s_.scores, n, pos, t0, c.indexer_heads, c.indexer_head_dim,
+                     c.compress_ratio, c.indexer_top_k / c.compress_ratio,
+                     mask_words_, max_blocks, stream_, live, s.kv_blocks);
+      }
+      mask = s_.mask;
+    }
+    return true;
+  };
+  // EXL3 decode/verify: a side branch runs them beside the q/k/v GEMV and
+  // the query/cache preparation (exl3_side_ scratch for its projections);
+  // attention joins it.
+  struct JoinGuard {
+    const Executor* executor;
+    ~JoinGuard() { (void)executor->JoinSide(nullptr); }
+  } join_guard{this};
+  // Only fast-path projections: the side scratch has no reference-path
+  // buffers.
+  const auto exl3_view = [&](const DeviceTensor& w) {
+    return w.exl3 != nullptr && w.cols == c.hidden_size &&
+           gufo::hip::Exl3FastSupported(*w.exl3) &&
+           w.exl3->n / 128 <= exl3_side_.projection.fast_counter_count;
+  };
+  const bool side_indexer =
+      !projections_ready && l.attn_qkv.empty() && l.attn_q.exl3 != nullptr &&
+      (s.index_k != nullptr || sparse) && n_tokens <= kVecBatch &&
+      (s.index_k == nullptr || exl3_view(l.indexer_k)) &&
+      (!sparse || exl3_view(l.indexer_q)) && SideBranchAvailable();
+  if (side_indexer && !ForkSide(indexer, error_msg))
+    return false;
   if (!l.attn_qkv.empty()) {
     const bool fused_projection =
         !projections_ready && WidePrefill(n_tokens) &&
@@ -3827,70 +3953,12 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
 
   // Raw keys survive only until pooling. The ring holds the initial
   // pre-budget backlog and a batch, independently for trunk and predictor.
-  const bool shared_indexer = prefill_phase && sparse && s.index_k != nullptr &&
-                              l.indexer_q.exl3 != nullptr &&
-                              l.indexer_q.exl3 == l.indexer_k.exl3;
   if (shared_indexer &&
       !Exl3DensePrefill({&l.indexer_q, &l.indexer_k}, {s_.iq, s_.ik}, x,
                         n_tokens, error_msg))
     return false;
-  if (s.index_k != nullptr) {
-    if (!shared_indexer &&
-        !(projections_ready
-              ? DenseBatch(l.indexer_k, x, s_.ik, n_tokens, error_msg)
-              : Dense(l.indexer_k, x, s_.ik, n_tokens, error_msg))) {
-      return false;
-    }
-    StoreRows(s_.ik, s.index_k, n_tokens, c.indexer_head_dim, pos,
-              index_capacity, stream_);
-  }
-  const std::uint32_t* mask = nullptr;
-  if (sparse) {
-    if (!shared_indexer && !Dense(l.indexer_q, x, s_.iq, n_tokens, error_msg)) {
-      return false;
-    }
-    RmsNormRows(s_.iq, l.indexer_q_norm.f32(), s_.iq,
-                n_tokens * c.indexer_heads, c.indexer_head_dim, 1, c.rms_eps,
-                stream_);
-    Rope(s_.iq, n_tokens, c.indexer_heads, c.indexer_head_dim, c.rotary_dim,
-         pos, c.rope_theta, stream_, s.rope, yarn_);
-    PoolIndexerBlocks(s.index_k, l.indexer_k_norm.f32(), s.block_k, first_block,
-                      pos, n_tokens, pool_grid, c.compress_ratio,
-                      c.indexer_head_dim, c.rotary_dim, c.rope_theta, c.rms_eps,
-                      index_capacity, stream_, s.rope, yarn_, s.kv_blocks);
-    // Align score rows to full cache lines. The selector still considers
-    // only complete causal blocks, so padding cannot change the ranking.
-    // Wide prefill is never captured: compact score rows to the populated
-    // context. Graphs retain the maximum stride for replay at later positions.
-    const auto score_context =
-        n_tokens > kVecBatch ? start_pos + n_tokens : max_context;
-    const std::uint32_t blocks =
-        (score_context + c.compress_ratio - 1) / c.compress_ratio;
-    const std::uint32_t max_blocks = (blocks + 31) / 32 * 32;
-    // Query rows are independent; rounding down to a power of two wasted
-    // up to half the bounded scratch and doubled launches above 160K.
-    const auto select_chunk = static_cast<std::uint32_t>(
-        std::min(std::size_t{512}, select_score_floats_ / max_blocks));
-    // Catch-up consumes only the final attention tile. Cover its masks even
-    // when the dense/sparse boundary shifts the four-query sparse groups.
-    const auto first_query = last_only && n_tokens > 16 ? n_tokens - 16 : 0U;
-    for (std::uint32_t t0 = first_query; t0 < n_tokens; t0 += select_chunk) {
-      const std::uint32_t n = std::min(select_chunk, n_tokens - t0);
-      // Batches wider than kVecBatch are never captured, so the host
-      // position bounds the scored range (a replayed graph must cover
-      // max_blocks).
-      const std::uint32_t live =
-          n_tokens > kVecBatch ? (start_pos + t0 + n) / c.compress_ratio : 0;
-      SelectBlocks(s_.iq + static_cast<std::size_t>(t0) * c.indexer_heads *
-                               c.indexer_head_dim,
-                   s.block_k,
-                   s_.mask + static_cast<std::size_t>(t0) * mask_words_,
-                   s_.scores, n, pos, t0, c.indexer_heads, c.indexer_head_dim,
-                   c.compress_ratio, c.indexer_top_k / c.compress_ratio,
-                   mask_words_, max_blocks, stream_, live, s.kv_blocks);
-    }
-    mask = s_.mask;
-  }
+  if (side_indexer ? !JoinSide(error_msg) : !indexer())
+    return false;
   // Wide batches run the fused WMMA kernel (never inside a graph: the kv
   // extent is a host value), output gate included, skipping the key tiles
   // no query of a block selected; the per-token kernel covers the rest.
@@ -4313,6 +4381,57 @@ bool Executor::SideCapturing() const {
   hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
   return hipStreamIsCapturing(side_stream_, &status) == hipSuccess &&
          status != hipStreamCaptureStatusNone;
+}
+
+bool Executor::SideBranchAvailable() const noexcept {
+  return !prefill_phase && side_stream_ != nullptr &&
+         exl3_side_.projection.fast_counters != nullptr &&
+         exl3_side_.slice != nullptr;
+}
+
+bool Executor::ForkSide(const std::function<bool()>& enqueue,
+                        std::string* error_msg) const {
+  if (!SideBranchAvailable() ||
+      !Check(hipEventRecord(side_start_, stream_), "side branch fork",
+             error_msg) ||
+      !Check(hipStreamWaitEvent(side_stream_, side_start_, 0),
+             "side branch wait", error_msg))
+    return false;
+  const hipStream_t main = stream_;
+  // However the branch exits, later work returns to the main stream and
+  // the side launches queued so far are joined (JoinSide).
+  struct Restore {
+    const Executor* executor;
+    hipStream_t main;
+    bool joined = false;
+    bool Join() {
+      executor->stream_ = main;
+      executor->dense_exl3_ = nullptr;
+      if (joined)
+        return true;
+      joined = true;
+      if (hipEventRecord(executor->side_done_, executor->side_stream_) ==
+          hipSuccess) {
+        executor->side_pending_ = true;
+        return true;
+      }
+      // Nothing to join: wait for the whole side stream instead (not while
+      // a graph captures it).
+      if (!executor->SideCapturing())
+        (void)hipStreamSynchronize(executor->side_stream_);
+      return false;
+    }
+    ~Restore() { (void)Join(); }
+  } restore{this, main};
+  stream_ = side_stream_;
+  dense_exl3_ = &exl3_side_;
+  ++side_branches_;
+  const bool ok = enqueue();
+  if (!restore.Join()) {
+    AssignError(error_msg, "side branch join record failed");
+    return false;
+  }
+  return ok;
 }
 
 bool Executor::JoinSide(std::string* error_msg) const {

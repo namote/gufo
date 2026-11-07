@@ -126,6 +126,27 @@ struct ExecutorTestAccess {
     return exec.Forward(session, tokens, tokens.size(), nullptr,
                         Executor::ForwardMode::kPrefill, error);
   }
+  // The production serial order of a decode/verify forward: without the
+  // side branch's scratch (no runtime switch), ForkSide is never taken.
+  static bool ForwardWithoutSideBranch(Executor& exec, Session& session,
+                                       std::span<const std::int32_t> tokens,
+                                       std::uint32_t n_logits, float* logits,
+                                       Executor::ForwardMode mode,
+                                       std::string* error) {
+    struct Restore {
+      Executor& exec;
+      Exl3Scratch side;
+      ~Restore() { exec.exl3_side_ = side; }
+    } restore{exec, exec.exl3_side_};
+    exec.exl3_side_ = {};
+    return exec.Forward(session, tokens, n_logits, logits, mode, error);
+  }
+  static bool SideBranchAvailable(const Executor& exec) {
+    return exec.SideBranchAvailable();
+  }
+  static std::uint64_t SideBranches(const Executor& exec) {
+    return exec.side_branches_;
+  }
   static bool PrefillLinearOnly(Executor& exec, Session& session,
                                 std::span<const std::int32_t> tokens,
                                 std::string* error) {
@@ -2249,6 +2270,80 @@ void ExecutorSharedOverlap() {
   Require(equal, "shared overlap changed executor results");
 }
 
+// B5 J3: decode/verify with the GDN alpha/beta projection and the attention
+// indexer on side branches must keep every logit and state byte of the
+// serial order (a GDN layer then a sparse attention layer, past the
+// indexer's top-k so selection runs, AR decode steps and verify passes).
+void DecodeSideBranches() {
+  BeginCase("EXL3 decode side branches: alpha/beta and indexer");
+  MtpExecutorFixture f(16, 128, 6, true);
+  auto& exec = *f.exec;
+  const auto& c = f.config;
+  using Access = gpu::ExecutorTestAccess;
+  Require(Access::SideBranchAvailable(exec), "decode side branch allocated");
+  std::vector<std::int32_t> prompt(20);
+  for (unsigned i = 0; i < prompt.size(); ++i)
+    prompt[i] = 1 + (i * 29) % (c.vocab_size - 1);
+  std::string error;
+  struct Result {
+    std::vector<float> logits, conv, recurrent;
+  };
+  const auto run = [&](bool side, gufo::core::SessionMode session_mode) {
+    auto session = exec.CreateSession(session_mode, 128, &error);
+    Require(session != nullptr, error);
+    Require(exec.Forward(*session, prompt, 1, nullptr,
+                         gpu::Executor::ForwardMode::kPrefill, &error),
+            error);
+    const bool verify = session_mode == gufo::core::SessionMode::kSpeculative;
+    const unsigned width = verify ? 4 : 1;
+    const auto mode = verify ? gpu::Executor::ForwardMode::kVerify
+                             : gpu::Executor::ForwardMode::kDecode;
+    Result result;
+    const auto forks = Access::SideBranches(exec);
+    for (unsigned step = 0; step < 6; ++step) {
+      std::vector<std::int32_t> tokens(width);
+      for (unsigned i = 0; i < width; ++i)
+        tokens[i] = 1 + (step * 37 + i * 11) % (c.vocab_size - 1);
+      std::vector<float> logits(std::size_t{width} * c.vocab_size);
+      Require(
+          side ? exec.Forward(*session, tokens, width, logits.data(), mode,
+                              &error)
+               : Access::ForwardWithoutSideBranch(exec, *session, tokens, width,
+                                                  logits.data(), mode, &error),
+          error);
+      result.logits.insert(result.logits.end(), logits.begin(), logits.end());
+    }
+    // Steps fork the GDN and attention branches (graph replays do not
+    // count), or never.
+    const auto taken = Access::SideBranches(exec) - forks;
+    Require(side ? taken >= 2 : taken == 0,
+            "decode side branches were not taken as expected");
+    auto state = Access::GdnState(*session, c);
+    result.conv = std::move(state.first);
+    result.recurrent = std::move(state.second);
+    Require(std::ranges::all_of(result.logits,
+                                [](float v) { return std::isfinite(v); }),
+            "nonfinite side-branch logits");
+    return result;
+  };
+  bool equal = true;
+  for (const auto mode : {gufo::core::SessionMode::kAutoregressive,
+                          gufo::core::SessionMode::kSpeculative}) {
+    const auto serial = run(false, mode);
+    const auto branched = run(true, mode);
+    equal = CompareBits(serial.logits, branched.logits, "side branch logits",
+                        c.vocab_size) &&
+            equal;
+    equal = CompareBits(serial.conv, branched.conv, "side branch conv state",
+                        c.SsmConvChannels()) &&
+            equal;
+    equal = CompareBits(serial.recurrent, branched.recurrent,
+                        "side branch recurrent state", c.ssm_head_dim) &&
+            equal;
+  }
+  Require(equal, "decode side branches changed executor results");
+}
+
 void ExecutorGdnPrefill() {
   bool equal = ExecutorGdnPrefillCase(true);
   equal = ExecutorGdnPrefillCase(false) && equal;
@@ -2777,6 +2872,10 @@ int main(int argc, char** argv) {
       DenseGemvPipeline();
       return 0;
     }
+    if (argc == 2 && std::string(argv[1]) == "--decode-side-branches") {
+      DecodeSideBranches();
+      return 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--producer-rotation") {
       ProducerRotation();
       return 0;
@@ -2802,6 +2901,7 @@ int main(int argc, char** argv) {
     Routed(true, 3, 2560, 640, 16);
     ProducerRotation();
     DenseGemvPipeline();
+    DecodeSideBranches();
     SelectedHead();
     for (unsigned rows : {1U, 2U, 3U, 7U, 8U, 9U, 32U, 33U, 64U}) {
       Routed(true, rows);

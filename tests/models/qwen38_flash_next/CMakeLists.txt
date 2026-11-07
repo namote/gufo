@@ -92,6 +92,8 @@ if (ENGINE_ENABLE_HIP)
     COMMAND qwen38_flash_next_exl3_ops_test --producer-rotation)
   add_test(NAME qwen38_flash_next.exl3_dense_gemv_pipeline
     COMMAND qwen38_flash_next_exl3_ops_test --dense-gemv-pipeline)
+  add_test(NAME qwen38_flash_next.exl3_decode_side_branches
+    COMMAND qwen38_flash_next_exl3_ops_test --decode-side-branches)
   add_test(NAME qwen38_flash_next.exl3_prefill_executor
     COMMAND qwen38_flash_next_exl3_ops_test --prefill-experts-only)
   add_test(NAME qwen38_flash_next.exl3_dense_prefill
@@ -112,6 +114,7 @@ if (ENGINE_ENABLE_HIP)
     qwen38_flash_next.mtp_kv_executor qwen38_flash_next.hc_down_f16
     qwen38_flash_next.exl3_producer_rotation
     qwen38_flash_next.exl3_dense_gemv_pipeline
+    qwen38_flash_next.exl3_decode_side_branches
     qwen38_flash_next.exl3_prefill_executor
     qwen38_flash_next.exl3_dense_prefill
     qwen38_flash_next.exl3_plain_prefill
