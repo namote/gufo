@@ -39,7 +39,8 @@ struct DeviceMixer {
   DeviceTensor up;
   DeviceTensor inject;
   /// An F16 `down` quantized to Q8_0 at load (ggml's Q8_0 rounding) for the
-  /// EXL3 prefill W8A8 down projection; empty otherwise.
+  /// EXL3 W8A8 / Q8_0 GEMV down projections; empty otherwise. Such a
+  /// mixer's F16 `up` is replaced by its Q8_0 quantization the same way.
   DeviceTensor down_q8;
 };
 

@@ -28,6 +28,9 @@ struct Conversion {
   void* source;
   void* destination;
   std::size_t count;
+  /// Q8_0 conversions only: the F16 source has no other reader and is
+  /// released once converted.
+  bool release_source{false};
 };
 
 /// The trunk and the optional MTP block as one traversal's output.
@@ -54,6 +57,8 @@ struct Uploader {
   std::deque<std::vector<quant::exl3::DeviceLinear>>& descriptors;
   std::map<const Exl3HostLinear*, DeviceTensor> linear_cache;
   std::uint32_t checkpoint_base{0}, mtp_checkpoint_base{0};
+  /// EXL3 pack: its F16 HC up weights are replaced by Q8_0 copies.
+  bool exl3_model{false};
   bool ok{true};
   std::uint32_t shard_base{0};
   std::uint64_t requested{0};
@@ -359,6 +364,35 @@ struct Uploader {
     return d;
   }
 
+  /// A Q8_0 copy of the uploaded F16 matrix `half`, quantized once the
+  /// upload has drained; empty on failure or while measuring.
+  DeviceTensor Q8Copy(const DeviceTensor& half, const TensorRef& source,
+                      bool release_source) {
+    const std::size_t count =
+        static_cast<std::size_t>(source.cols) * source.rows;
+    const std::size_t size = count / 32 * 34;
+    void* q8 = nullptr;
+    if (Allocate(&q8, size + kTailMargin) != hipSuccess) {
+      Fail("device allocation failed for the Q8_0 copy of " +
+           std::string(source.name));
+      return {};
+    }
+    if (Measuring())
+      return {};
+    allocations.push_back(q8);
+    bytes += size + kTailMargin;
+    (void)hipMemsetAsync(static_cast<std::uint8_t*>(q8) + size, 0, kTailMargin,
+                         nullptr);
+    q8_conversions.push_back({half.data, q8, count, release_source});
+    DeviceTensor d;
+    d.data = q8;
+    d.type = core::GgmlType::kQ8_0;
+    d.cols = half.cols;
+    d.rows = half.rows;
+    max_q8_cols = std::max<std::size_t>(max_q8_cols, d.cols);
+    return d;
+  }
+
   DeviceMixer Mixer(const HcMixer& m) {
     DeviceMixer d{Copy(m.norm), Copy(m.down), Copy(m.up), Copy(m.inject), {}};
     // The EXL3 down projection runs W8A8 (prefill) or the Q8_0 GEMV
@@ -367,27 +401,15 @@ struct Uploader {
     if (!ok || m.down.empty() || !m.down.exl3.empty() ||
         m.down.type != core::GgmlType::kF16 || m.down.cols % 32 != 0)
       return d;
-    const std::size_t count =
-        static_cast<std::size_t>(m.down.cols) * m.down.rows;
-    const std::size_t size = count / 32 * 34;
-    void* q8 = nullptr;
-    if (Allocate(&q8, size + kTailMargin) != hipSuccess) {
-      Fail("device allocation failed for the Q8_0 copy of " +
-           std::string(m.down.name));
-      return d;
+    d.down_q8 = Q8Copy(d.down, m.down, false);
+    // Every up reader (the Q8_0 GEMV of decode, the Q8_0 x F16 GEMM of
+    // prefill) takes Q8_0 weights, so the F16 rows are replaced.
+    if (ok && exl3_model && !m.up.empty() && m.up.exl3.empty() &&
+        m.up.type == core::GgmlType::kF16 && m.up.cols % 32 == 0) {
+      const DeviceTensor up = Q8Copy(d.up, m.up, true);
+      if (up.data != nullptr)
+        d.up = up;
     }
-    if (Measuring())
-      return d;
-    allocations.push_back(q8);
-    bytes += size + kTailMargin;
-    (void)hipMemsetAsync(static_cast<std::uint8_t*>(q8) + size, 0, kTailMargin,
-                         nullptr);
-    q8_conversions.push_back({d.down.data, q8, count});
-    d.down_q8.data = q8;
-    d.down_q8.type = core::GgmlType::kQ8_0;
-    d.down_q8.cols = d.down.cols;
-    d.down_q8.rows = d.down.rows;
-    max_q8_cols = std::max<std::size_t>(max_q8_cols, d.down_q8.cols);
     return d;
   }
 
@@ -584,6 +606,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
                      max_q8_cols, error_msg, descriptors};
     measure.checkpoint_base = checkpoint_base;
     measure.mtp_checkpoint_base = mtp_checkpoint_base;
+    measure.exl3_model = w.exl3_storage != nullptr;
     (void)measure.Model(w, mtp, shard_count);
     if (!measure.ok) {
       return nullptr;
@@ -597,6 +620,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
               m->max_q8_cols_, error_msg, m->exl3_linears_};
   up.checkpoint_base = checkpoint_base;
   up.mtp_checkpoint_base = mtp_checkpoint_base;
+  up.exl3_model = w.exl3_storage != nullptr;
   Uploaded uploaded = up.Model(w, mtp, shard_count);
   if (!up.ok || !stager->Finish(error_msg)) {
     return nullptr;
@@ -627,6 +651,13 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     std::erase(m->allocations_, c.source);
     (void)hipFree(c.source);
     m->bytes_ -= c.count * sizeof(float) + kTailMargin;
+  }
+  for (const auto& c : up.q8_conversions) {
+    if (!c.release_source)
+      continue;
+    std::erase(m->allocations_, c.source);
+    (void)hipFree(c.source);
+    m->bytes_ -= c.count * sizeof(std::uint16_t) + kTailMargin;
   }
   return m;
 }
