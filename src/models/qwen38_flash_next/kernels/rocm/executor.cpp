@@ -3120,15 +3120,29 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
         q8t_cols_ = c.hidden_size;
       }
     }
-  } else if (vectorized && norm_from_res) {
-    HcMixEpilogueVec4FromRes(deferred_norm.res, deferred_norm.gamma,
-                             s_.xn_scale, s_.hc_gate,
-                             fused_inject ? m.inject.f32() : nullptr, mixed,
-                             inject, n_tokens, c.hidden_size, stream_);
   } else if (vectorized) {
-    HcMixEpilogueVec4(xn, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr,
-                      mixed, inject, n_tokens, c.hidden_size, c.hc_count,
-                      stream_);
+    // EXL3 prefill: the plain F16 projections of `mixed` (router, alpha/beta)
+    // read these F16 rows instead of a separate narrowing pass.
+    auto* mixed_half = model_->output().exl3 != nullptr && prefill_phase &&
+                               extras && c.hidden_size <= half_input_cols_
+                           ? static_cast<__half*>(s_.x_half)
+                           : nullptr;
+    bool half_written = mixed_half != nullptr;
+    if (norm_from_res)
+      HcMixEpilogueVec4FromRes(
+          deferred_norm.res, deferred_norm.gamma, s_.xn_scale, s_.hc_gate,
+          fused_inject ? m.inject.f32() : nullptr, mixed, inject, n_tokens,
+          c.hidden_size, stream_, mixed_half);
+    else
+      half_written = HcMixEpilogueVec4(
+          xn, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr, mixed,
+          inject, n_tokens, c.hidden_size, c.hc_count, stream_, mixed_half);
+    if (half_written) {
+      half_src_ = mixed;
+      half_rows_ = n_tokens;
+      half_cols_ = c.hidden_size;
+      half_bf16_ = false;
+    }
   } else {
     // A decode batch's projections of `mixed` share its Q8_1 rows, which
     // the epilogue writes as it stores them.

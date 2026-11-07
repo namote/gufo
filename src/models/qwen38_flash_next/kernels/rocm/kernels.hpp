@@ -201,10 +201,13 @@ void HcMixEpilogue(const float* xn, const float* gate, const float* inject_w,
                    hipStream_t stream, void* mixed_q8 = nullptr);
 /// Four adjacent hidden lanes per thread. The model's four-stream geometry
 /// emits HcInjectPartsVec4(hidden) partial sums per inject logit.
-void HcMixEpilogueVec4(const float* xn, const float* gate,
+/// A non-null `mixed_half` also receives NarrowActivations' F16 rows of
+/// `mixed` (vectorized route only; returns whether they were written).
+bool HcMixEpilogueVec4(const float* xn, const float* gate,
                        const float* inject_w, float* mixed, float* inject,
                        std::uint32_t n_tokens, std::uint32_t hidden,
-                       std::uint32_t streams, hipStream_t stream);
+                       std::uint32_t streams, hipStream_t stream,
+                       __half* mixed_half = nullptr);
 /// The vec4 epilogue over an F16 `xn` (the F16 mixer input route); the
 /// four-stream geometry is the caller's contract. Non-null `mixed_half` /
 /// `mixed_q8` also receive the mixed rows as F16 and in the W8A8 tiled Q8
@@ -243,7 +246,8 @@ void HcMixEpilogueVec4FromRes(const float* res, const float* gamma,
                               const float* xn_scale, const float* gate,
                               const float* inject_w, float* mixed,
                               float* inject, std::uint32_t n_tokens,
-                              std::uint32_t hidden, hipStream_t stream);
+                              std::uint32_t hidden, hipStream_t stream,
+                              __half* mixed_half = nullptr);
 // any_width: the four-lane kernel at every token count (no 16-row
 // threshold), so a route fixed by phase never depends on the chunk width.
 /// The one-block-per-stream HcCombine that also writes xn's Q8_1 rows (as

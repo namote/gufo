@@ -441,7 +441,8 @@ __global__ void HcMixEpilogueVec4Kernel(const XnT* xn, const float* gate,
                                         const float* inject_w, float* mixed,
                                         float* inject, std::uint32_t hidden,
                                         const float* gamma = nullptr,
-                                        const float* xn_scale = nullptr) {
+                                        const float* xn_scale = nullptr,
+                                        __half* mixed_half = nullptr) {
   constexpr std::uint32_t kStreams = 4;
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t i = (blockIdx.y * blockDim.x + threadIdx.x) * 4;
@@ -490,6 +491,14 @@ __global__ void HcMixEpilogueVec4Kernel(const XnT* xn, const float* gate,
     acc.w *= kInvStreams;
     *reinterpret_cast<float4*>(mixed + static_cast<std::size_t>(t) * hidden +
                                i) = acc;
+    // NarrowHalf4Kernel's conversion of the stored row, for an F16 consumer.
+    if (mixed_half != nullptr)
+      *reinterpret_cast<ushort4*>(mixed_half +
+                                  static_cast<std::size_t>(t) * hidden + i) =
+          make_ushort4(__half_as_ushort(__half(Materialize(acc.x))),
+                       __half_as_ushort(__half(Materialize(acc.y))),
+                       __half_as_ushort(__half(Materialize(acc.z))),
+                       __half_as_ushort(__half(Materialize(acc.w))));
   }
   if (inject_w == nullptr) {
     return;
@@ -6649,29 +6658,33 @@ void HcMixEpilogue(const float* xn, const float* gate, const float* inject_w,
                      inject, hidden, streams, mixed_q8);
 }
 
-void HcMixEpilogueVec4(const float* xn, const float* gate,
+bool HcMixEpilogueVec4(const float* xn, const float* gate,
                        const float* inject_w, float* mixed, float* inject,
                        std::uint32_t n_tokens, std::uint32_t hidden,
-                       std::uint32_t streams, hipStream_t stream) {
+                       std::uint32_t streams, hipStream_t stream,
+                       __half* mixed_half) {
   if (streams != 4 || hidden % 4 != 0) {
     HcMixEpilogue(xn, gate, inject_w, mixed, inject, n_tokens, hidden, streams,
                   stream);
-    return;
+    return false;
   }
   hipLaunchKernelGGL(HcMixEpilogueVec4Kernel<float>,
                      dim3(n_tokens, HcInjectPartsVec4(hidden)), dim3(kThreads),
-                     0, stream, xn, gate, inject_w, mixed, inject, hidden);
+                     0, stream, xn, gate, inject_w, mixed, inject, hidden,
+                     nullptr, nullptr, mixed_half);
+  return mixed_half != nullptr;
 }
 
 void HcMixEpilogueVec4FromRes(const float* res, const float* gamma,
                               const float* xn_scale, const float* gate,
                               const float* inject_w, float* mixed,
                               float* inject, std::uint32_t n_tokens,
-                              std::uint32_t hidden, hipStream_t stream) {
+                              std::uint32_t hidden, hipStream_t stream,
+                              __half* mixed_half) {
   hipLaunchKernelGGL((HcMixEpilogueVec4Kernel<float, true>),
                      dim3(n_tokens, HcInjectPartsVec4(hidden)), dim3(kThreads),
                      0, stream, res, gate, inject_w, mixed, inject, hidden,
-                     gamma, xn_scale);
+                     gamma, xn_scale, mixed_half);
 }
 
 __global__ void HcNormFromResKernel(const float* res, const float* gamma,

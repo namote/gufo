@@ -582,6 +582,41 @@ int main() {
                 << ", mix epilogue " << mix_ok << '\n';
       if (!res_ok || !half_ok || !xn_ok || !mix_ok)
         throw std::runtime_error("HC deferred norm changed the F32 route");
+      // Both epilogues' F16 copy of `mixed` equals narrowing the stored
+      // FP32 rows, and writing it changes neither FP32 output.
+      HipBuffer<__half> d_mixed_half(kMixed), d_narrowed(kMixed);
+      HipBuffer<float> d_mixed_c(kMixed), d_inj_c(vec_inject);
+      q::NarrowActivations(d_mixed_a.get(), d_narrowed.get(), false, kMixed,
+                           nullptr);
+      std::vector<__half> narrowed(kMixed), mixed_half(kMixed);
+      CheckHip(hipDeviceSynchronize(), "narrowed mix");
+      CheckHip(hipMemcpy(narrowed.data(), d_narrowed.get(),
+                         kMixed * sizeof(__half), hipMemcpyDeviceToHost),
+               "narrowed mix download");
+      for (int route = 0; route < 2; ++route) {
+        if (route == 0) {
+          if (!q::HcMixEpilogueVec4(d_xn_a.get(), d_gate.get(), d_weight.get(),
+                                    d_mixed_c.get(), d_inj_c.get(), kTokens,
+                                    kHidden, kStreams, nullptr,
+                                    d_mixed_half.get()))
+            throw std::runtime_error("vec4 epilogue skipped its F16 mix");
+        } else {
+          q::HcMixEpilogueVec4FromRes(
+              d_res_b.get(), d_gamma.get(), d_scale.get(), d_gate.get(),
+              d_weight.get(), d_mixed_c.get(), d_inj_c.get(), kTokens, kHidden,
+              nullptr, d_mixed_half.get());
+        }
+        CheckHip(hipMemcpy(mixed_half.data(), d_mixed_half.get(),
+                           kMixed * sizeof(__half), hipMemcpyDeviceToHost),
+                 "F16 mix download");
+        if (!bytes_equal(mixed_half.data(), narrowed.data(),
+                         kMixed * sizeof(__half)) ||
+            !bytes_equal(Download(&d_mixed_c, kMixed).data(), mixed_a.data(),
+                         kMixed * 4) ||
+            !bytes_equal(Download(&d_inj_c, vec_inject).data(), inj_a.data(),
+                         vec_inject * 4))
+          throw std::runtime_error("HC epilogue F16 mix differs");
+      }
     }
     std::cout << "HC mixed outputs and short prefill chunks passed\n";
     return 0;
