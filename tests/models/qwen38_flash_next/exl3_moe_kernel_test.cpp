@@ -617,13 +617,18 @@ void FusedProducer(unsigned rows, bool shared, int bits = 5, int up_bits = 0,
     fused.routed_down_input = buffers.Make<std::uint16_t>(assignments * ff);
     fused.routed_arrivals = buffers.Make<std::uint32_t>(assignments);
     fused.routed_assignments = assignments;
+    // Gate and up banks of different rates keep the separate restore, which
+    // writes the down input in place over the gate/up input slab.
+    const bool restore_fused = up_bits == 0 || up_bits == bits;
+    std::uint16_t* down_input =
+        restore_fused ? fused.routed_down_input : fused.routed_input;
     const auto check = [&](const float* folded, const char* what) {
       const auto folded_rows = Read(folded, assignments * k);
       Require(
           std::memcmp(separate_rows.data(), folded_rows.data(),
                       folded_rows.size() * sizeof(float)) == 0 &&
               separate_exponents == Read(fused.down_exponents, assignments) &&
-              separate_input == Read(fused.routed_down_input, assignments * ff),
+              separate_input == Read(down_input, assignments * ff),
           what);
       for (auto v : Read(fused.routed_arrivals, assignments))
         Require(v == 0, "restore-fused arrivals not reset");
@@ -632,7 +637,7 @@ void FusedProducer(unsigned rows, bool shared, int bits = 5, int up_bits = 0,
       // Poisoned exponents and down input: the tail must write them all.
       Check(hipMemset(fused.down_exponents, 0xff,
                       assignments * sizeof(std::int32_t)));
-      Check(hipMemset(fused.routed_down_input, 0xff,
+      Check(hipMemset(down_input, 0xff,
                       assignments * ff * sizeof(std::uint16_t)));
       auto* folded = buffers.Make<float>(assignments * k);
       gpu::Exl3RoutedMlp(layer, dx, di, g, u, folded, rows, used, fused,
