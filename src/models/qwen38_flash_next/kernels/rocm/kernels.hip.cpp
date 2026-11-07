@@ -5783,15 +5783,11 @@ __global__ __launch_bounds__(32) void HcDownSiluQ8Kernel(
       for (unsigned t = 0; t < kTokens; ++t) {
         int dot = Dp4a(v[j][0], u[j][t][0], 0);
         dot = Dp4a(v[j][1], u[j][t][1], dot);
-        if constexpr (kTokens == 1) {
-          const float d =
-              __fmul_rn(__half2float(dw[j]), __half2float(dx[j][t]));
-          sum[t] = __fadd_rn(sum[t], __fmul_rn(d, static_cast<float>(dot)));
-        } else {
-          const float product =
-              __fmul_rn(__half2float(dw[j]), static_cast<float>(dot));
-          sum[t] = __fmaf_rn(__half2float(dx[j][t]), product, sum[t]);
-        }
+        // One rounding sequence for every width keeps a row's result
+        // independent of how many rows share the launch.
+        const float product =
+            __fmul_rn(__half2float(dw[j]), static_cast<float>(dot));
+        sum[t] = __fmaf_rn(__half2float(dx[j][t]), product, sum[t]);
       }
     }
   }

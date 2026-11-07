@@ -636,18 +636,12 @@ __launch_bounds__(32) __global__ static void qfn_q8_hc_down_kernel(
             for (int t = 0; t < tokens; ++t) {
                 int dot = ggml_hip_dp4a(v[j][0], u[j][t][0], 0);
                 dot = ggml_hip_dp4a(v[j][1], u[j][t][1], dot);
-                if constexpr (tokens == 1) {
-                    const float scale =
-                        __fmul_rn(__half2float(dw[j]), __half2float(dx[j][t]));
-                    const float product = __fmul_rn(scale, static_cast<float>(dot));
-                    sum[t] = __fadd_rn(sum[t], product);
-                } else {
-                    // Preserve the batched MMVQ weight-dot rounding and
-                    // input-scale FMA; reassociating the scales changes logits.
-                    const float product =
-                        __fmul_rn(__half2float(dw[j]), static_cast<float>(dot));
-                    sum[t] = __fmaf_rn(__half2float(dx[j][t]), product, sum[t]);
-                }
+                // One rounding sequence for every width (the batched MMVQ
+                // weight-dot rounding and input-scale FMA) keeps a row's result
+                // independent of how many rows share the launch.
+                const float product =
+                    __fmul_rn(__half2float(dw[j]), static_cast<float>(dot));
+                sum[t] = __fmaf_rn(__half2float(dx[j][t]), product, sum[t]);
             }
         }
     }

@@ -284,6 +284,7 @@ void CheckFusedDecodeHc(bool with_inject, std::uint32_t slab_count) {
   const float scale = 1.0F / kStreams;
   const float* inject_w_ptr = with_inject ? d_inject_w.get() : nullptr;
   bool ok = true;
+  std::vector<float> row0_lo, row0_gate;
   for (int pass = 0; pass < 2; ++pass) {
     for (std::uint32_t rows = 1; rows <= kRows; ++rows) {
       if (qfn_mmq_quantize_q8_1(d_xn.get(), d_xq, static_cast<int>(rows),
@@ -348,11 +349,28 @@ void CheckFusedDecodeHc(bool with_inject, std::uint32_t slab_count) {
       const bool counters_ok =
           std::all_of(counters.begin(), counters.end(),
                       [](std::uint32_t v) { return v == 0; });
-      if (!lo_ok || !gate_ok || !mix_ok || !counters_ok) {
+      // Split invariance: row 0 must not depend on the launch width.
+      const auto lo_all = DownloadRaw(fused.lo.get(), rows * kRank);
+      const auto gate_all = DownloadRaw(fused.gate.get(), rows * kHcDim);
+      if (rows == 1) {
+        row0_lo.assign(lo_all.begin(), lo_all.begin() + kRank);
+        row0_gate.assign(gate_all.begin(), gate_all.begin() + kHcDim);
+      }
+      const bool split_ok =
+          std::equal(row0_lo.begin(), row0_lo.end(), lo_all.begin(),
+                     [](float a, float b) {
+                       return std::memcmp(&a, &b, sizeof a) == 0;
+                     }) &&
+          std::equal(row0_gate.begin(), row0_gate.end(), gate_all.begin(),
+                     [](const auto& a, const auto& b) {
+                       return std::memcmp(&a, &b, sizeof a) == 0;
+                     });
+      if (!lo_ok || !gate_ok || !mix_ok || !counters_ok || !split_ok) {
         std::cerr << "fused decode HC inject " << with_inject << " slabs "
                   << slab_count << " rows " << rows << " pass " << pass
                   << ": lo " << lo_ok << " gate " << gate_ok << " mix "
-                  << mix_ok << " counters " << counters_ok << '\n';
+                  << mix_ok << " counters " << counters_ok << " split "
+                  << split_ok << '\n';
         ok = false;
       }
     }
