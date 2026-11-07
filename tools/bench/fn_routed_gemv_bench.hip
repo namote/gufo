@@ -183,7 +183,7 @@ void Run(unsigned k, unsigned n, unsigned tokens) {
     hipLaunchKernelGGL((fnr::RoutedGemv<5, false, R, false>), packed,
                        dim3(32 * fnr::kRoutedWaves), 0, nullptr, d_bank, d_bank,
                        d_tiles + (i % kSets) * assignments, d_count, x, g1, u1,
-                       k, n, assignments, nullptr, nullptr);
+                       k, n, assignments, nullptr);
   };
   old(0);
   cur(0);

@@ -1354,9 +1354,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     ex.route_arrivals = Alloc<std::uint32_t>(a, 1, error_msg);
     ex.routed_down_input = Alloc<std::uint16_t>(
         a, assignments * std::size_t{c.expert_ff}, error_msg);
-    ex.routed_ranges = Alloc<std::uint32_t>(
-        a, assignments * ((std::size_t{c.expert_ff} + 127) / 128) * 2,
-        error_msg);
+    ex.routed_arrivals = Alloc<std::uint32_t>(a, assignments, error_msg);
     ex.routed_assignments = static_cast<std::uint32_t>(assignments);
     ex.down_exponents = Alloc<std::int32_t>(a, assignments, error_msg);
     e->exl3_dense_rotations_ =
@@ -2924,39 +2922,6 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
   // below forms it; any other route gets it in s_.block_out first.
   Exl3PrefillMoeRows exl3_moe{};
   bool exl3_moe_fused = false;
-  // An EXL3 decode MoE output left to this combine: the decode combine
-  // below forms it from the raw FP32 rows; any other route gets it in
-  // s_.block_out first.
-  Exl3PrefillMoeRows decode_moe{};
-  bool decode_moe_fused = false;
-  const DeviceLayer* decode_moe_layer = nullptr;
-  if (exl3_moe_pending_.layer != nullptr && exl3_moe_pending_.decode) {
-    const PendingExl3Moe pending = std::exchange(exl3_moe_pending_, {});
-    decode_moe_layer = pending.layer;
-    const auto& d = pending.layer->ffn_down_exps;
-    decode_moe = {d.device_exl3,
-                  s_.ids,
-                  nullptr,
-                  s_.down_e,
-                  s_.weights,
-                  s_.shexp_out,
-                  s_.router + c.num_experts,
-                  c.num_experts + 1,
-                  c.num_experts_used,
-                  d.rows};
-    decode_moe_fused =
-        !prefill_phase && pending.rows == n_tokens && gamma != nullptr &&
-        !MatrixRows(n_tokens) && UnpaddedQ8(c.HcDim()) && !moe_pending_ &&
-        !res_deferred_ && d.rows == c.hidden_size && c.hidden_size % 128 == 0 &&
-        c.hidden_size <= 2560 && c.num_experts_used <= 16;
-    if (!decode_moe_fused) {
-      ApplyPendingResidual();  // the combine below rewrites block_out
-      Exl3RoutedCombine(*pending.layer, s_.ids, pending.rows,
-                        c.num_experts_used, s_.down_e, s_.weights, s_.shexp_out,
-                        s_.router + c.num_experts, c.num_experts + 1,
-                        s_.block_out, stream_);
-    }
-  }
   if (exl3_moe_pending_.layer != nullptr) {
     const PendingExl3Moe pending = exl3_moe_pending_;
     exl3_moe_pending_ = {};
@@ -3059,15 +3024,10 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
       !MatrixRows(n_tokens) && UnpaddedQ8(c.HcDim()) &&
       HcCombineQ8_1(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn,
                     s_.xn_q8_1, n_tokens, c.hidden_size, c.hc_count, c.rms_eps,
-                    stream_, decode_moe_fused ? &decode_moe : nullptr)) {
+                    stream_)) {
     xn_q8_ready_ = {s_.xn, s_.xn_q8_1, n_tokens, c.HcDim()};
     return;
   }
-  if (decode_moe_fused)  // HcCombineQ8_1 refused it: write it out first
-    Exl3RoutedCombine(*decode_moe_layer, s_.ids, n_tokens, c.num_experts_used,
-                      s_.down_e, s_.weights, s_.shexp_out,
-                      s_.router + c.num_experts, c.num_experts + 1,
-                      s_.block_out, stream_);
   // EXL3: prefill takes the four-lane combine at every chunk width (28 %
   // less time at 2,048 tokens); decode/verify keep the per-stream kernel.
   const bool exl3 = model_->output().exl3 != nullptr;
@@ -4277,8 +4237,7 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   // their original stream ownership.
   // EXL3 decode/verify: the fused shared MLP (its own fast-path slabs,
   // counters and shexp rows) runs beside the routed GEMVs (routed_input,
-  // routed_down_input and its segment ranges, tiles, gate_e/up_e/down_e);
-  // Exl3Experts joins before the combine reads
+  // tiles, gate_e/up_e/down_e); Exl3Experts joins before the combine reads
   // shexp_out.
   const bool exl3_decode_overlap =
       !exl3_overlap && !prefill_phase && !last_only &&
@@ -4573,13 +4532,6 @@ bool Executor::Exl3Experts(const DeviceLayer& l, const float* x, float* out,
                          c.num_experts + 1, out, stream_);
       return true;
     }
-    // Decode: the next combine forms this MoE output from the raw rows
-    // (HcCombineQ8_1) or writes it first.
-    if (exl3_moe_defer_ && out == s_.block_out) {
-      exl3_moe_defer_ = false;
-      exl3_moe_pending_ = {&l, rows, true};
-      return true;
-    }
     Exl3RoutedCombine(l, s_.ids, rows, c.num_experts_used, s_.down_e,
                       s_.weights, s_.shexp_out, s_.router + c.num_experts,
                       c.num_experts + 1, out, stream_);
@@ -4786,9 +4738,8 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
             half_bf16_, xn_half_, inject_parts_, inject_fused_, q8_slot_,
             xn_q8_ready_, mixed_q8_ready_, xn_deferred_.res, xn_deferred_.gamma,
             xn_deferred_.rows, exl3_moe_defer_, exl3_moe_pending_.layer,
-            exl3_moe_pending_.rows, exl3_moe_pending_.decode, xn_q8t_norm_.res,
-            xn_q8t_norm_.gamma, xn_q8t_norm_.rows, exl3_rotated_,
-            exl3_res_pending_);
+            exl3_moe_pending_.rows, xn_q8t_norm_.res, xn_q8t_norm_.gamma,
+            xn_q8t_norm_.rows, exl3_rotated_, exl3_res_pending_);
         const auto before = std::apply(
             [](const auto&... fields) { return std::make_tuple(fields...); },
             dispatch);
@@ -5137,9 +5088,9 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, rows, error_msg,
                  false, no_f32, shared_rotate))
         return false;
-      // Only the combine below reads this MoE output: EXL3 folds the expert
-      // sum into it (prefill and decode).
-      exl3_moe_defer_ = l.ffn_gate_exps.exl3 != nullptr;
+      // Only the combine below reads this MoE output: EXL3 prefill folds the
+      // expert sum into it.
+      exl3_moe_defer_ = prefill_phase;
       const bool moe_ok = Moe(l, s_.mixed, s_.block_out, rows, error_msg);
       exl3_moe_defer_ = false;
       if (!moe_ok)

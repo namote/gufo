@@ -301,15 +301,11 @@ void HcMixEpilogueVec4FromRes(const float* res, const float* gamma,
 /// The one-block-per-stream HcCombine that also writes xn's Q8_1 rows (as
 /// qfn_mmq_quantize_q8_1 would) to `xn_q8` for a small-batch mixer down
 /// projection. False, with nothing launched, without `gamma` or unless
-/// hidden % 32 == 0. A non-null `moe` (the routed decode's FP32 raw rows,
-/// no inverse; hidden % 128 == 0 up to 2,560) replaces block_out with the
-/// MoE output Exl3RoutedCombine would write, formed in the combine (and
-/// also stored to block_out); false without a launch otherwise.
+/// hidden % 32 == 0.
 bool HcCombineQ8_1(float* res, const float* block_out, const float* inject,
                    std::uint32_t inject_parts, const float* gamma, float* xn,
                    void* xn_q8, std::uint32_t n_tokens, std::uint32_t hidden,
-                   std::uint32_t streams, float eps, hipStream_t stream,
-                   const Exl3PrefillMoeRows* moe = nullptr);
+                   std::uint32_t streams, float eps, hipStream_t stream);
 /// HcCombine writing the normalized output as F16, the width the next
 /// mixer's projection and epilogue consume on the F16 mixer input route.
 /// A non-null `xn_q8` also receives the norm quantized into the tiled Q8
