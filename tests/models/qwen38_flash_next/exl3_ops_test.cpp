@@ -2276,7 +2276,7 @@ void ExecutorSharedOverlap() {
 // indexer's top-k so selection runs, AR decode steps and verify passes).
 void DecodeSideBranches() {
   BeginCase("EXL3 decode side branches: alpha/beta and indexer");
-  MtpExecutorFixture f(16, 128, 6, true);
+  MtpExecutorFixture f(32, 128, 6, true);
   auto& exec = *f.exec;
   const auto& c = f.config;
   using Access = gpu::ExecutorTestAccess;
