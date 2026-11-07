@@ -25,6 +25,7 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "tests/models/qwen38_flash_next/exl3_gemv_reference.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 
@@ -2541,6 +2542,195 @@ void ProducerRotation() {
 }
 }  // namespace
 
+// B5 J1: the pipelined decode GEMV (next K-tile group in flight) must keep
+// every output byte of the pre-B5 kernel (exl3_gemv_reference.hpp) on the
+// real decode shapes: GDN qkv+z K5, ssm_out/attention out K6 (8 waves),
+// q+k+v K6 (four tiles per wave), the K6 shared MLP (gate/up SwiGLU 16
+// waves, down), a K8 head-shaped launch, narrow K8 projections, the MTP K/V
+// subset geometry, and short K3/K7 splits whose waves end partway through a
+// group pair (or own no K tile). Rows 1..8 cover every pass width; the input
+// slab has signed zeros, subnormals and NaN padded rows.
+void DenseGemvPipeline() {
+  namespace fast = gufo::hip;
+  namespace ref = gufo::tests::exl3_gemv_reference;
+  constexpr unsigned kMaxK = 6144;
+  Buffers buffers;
+  const std::size_t slab_elements = std::size_t{3} * 8 * kMaxK;
+  auto* slab = buffers.Make<std::uint16_t>(slab_elements);
+  auto* counters = buffers.Make<std::uint32_t>(512);
+  auto* ref_counters = buffers.Make<std::uint32_t>(512);
+  auto* down_slab = buffers.Make<std::uint16_t>(8 * kMaxK);
+  auto* ref_down_slab = buffers.Make<std::uint16_t>(8 * kMaxK);
+  const fast::Exl3FastWorkspace pre{slab, slab_elements, counters,
+                                    512,  down_slab,     8 * kMaxK};
+  const auto download = [](const auto* d, std::size_t count) {
+    std::vector<std::remove_cv_t<std::remove_pointer_t<decltype(d)>>> h(count);
+    Check(hipMemcpy(h.data(), d, count * sizeof(h[0]), hipMemcpyDeviceToHost));
+    return h;
+  };
+  const auto fill_slab = [&](unsigned k, unsigned rows, unsigned seed) {
+    const unsigned m = fast::Exl3FastPassRows(rows);
+    std::vector<std::uint16_t> h(slab_elements, 0x7E00);  // NaN padding
+    std::mt19937 rng(seed);
+    for (unsigned s = 0; s < 3; ++s)
+      for (unsigned i = 0; i < k; ++i)
+        for (unsigned r = 0; r < rows; ++r) {
+          std::uint16_t v = ex::HalfFromDouble(
+              (static_cast<int>(rng() % 4001) - 2000) * 0.0005);
+          switch (rng() % 64) {
+            case 0:
+              v = 0x8000;  // -0
+              break;
+            case 1:
+              v = 0x0000;
+              break;
+            case 2:
+              v = 0x0001;  // smallest subnormal
+              break;
+            case 3:
+              v = 0x83FF;  // largest negative subnormal
+              break;
+            default:
+              break;
+          }
+          h[std::size_t{s} * 8 * k +
+            gufo::hip::exl3::LaneMajorOffset(i, r, m)] = v;
+        }
+    Check(hipMemcpy(slab, h.data(), h.size() * 2, hipMemcpyHostToDevice));
+  };
+  const auto projections = [&](const std::string& name,
+                               std::initializer_list<const Bank*> banks,
+                               std::size_t shape_basis_n = 0) {
+    const unsigned k = banks.begin()[0]->k;
+    for (unsigned rows = 1; rows <= 8; ++rows) {
+      BeginCase("pipelined GEMV " + name + " rows=" + std::to_string(rows));
+      fill_slab(k, rows, 1000 + rows);
+      std::vector<fast::Exl3FastTarget> fresh, old;
+      for (const Bank* b : banks) {
+        // Guard columns past each output are never written.
+        const std::size_t count = std::size_t{rows} * b->n + 16;
+        auto* y = buffers.Make<float>(count);
+        auto* y_ref = buffers.Make<float>(count);
+        Check(hipMemset(y, 0x7F, count * sizeof(float)));
+        Check(hipMemset(y_ref, 0x7F, count * sizeof(float)));
+        fresh.push_back({b->weight.exl3, y, b->n});
+        old.push_back({b->weight.exl3, y_ref, b->n});
+      }
+      Require(fast::Exl3FastGroupSupported(fresh, pre),
+              "group supported by the fast GEMV");
+      fast::LaunchExl3FastProjections(fresh, nullptr, k, rows, pre, nullptr,
+                                      true, shape_basis_n);
+      ref::Projections(old, slab, rows, ref_counters, nullptr, shape_basis_n);
+      Check(hipDeviceSynchronize());
+      for (std::size_t i = 0; i < fresh.size(); ++i) {
+        const std::size_t count = std::size_t{rows} * fresh[i].y_stride + 16;
+        const auto a = download(fresh[i].y, count);
+        SameBits(download(old[i].y, count), a,
+                 "slot " + std::to_string(i) + " output", fresh[i].y_stride);
+        Require(std::all_of(a.begin(), a.begin() + count - 16,
+                            [](float v) { return std::isfinite(v); }),
+                "finite outputs");
+      }
+    }
+  };
+  const auto mlp = [&](const std::string& name, const Bank& gate,
+                       const Bank& up, const Bank& down) {
+    for (unsigned rows = 1; rows <= 8; ++rows) {
+      BeginCase("pipelined GEMV " + name + " rows=" + std::to_string(rows));
+      fill_slab(gate.k, rows, 2000 + rows);
+      const std::size_t out_count = std::size_t{rows} * down.n;
+      const auto make = [&](std::size_t count) {
+        auto* p = buffers.Make<float>(count);
+        Check(hipMemset(p, 0x7F, count * sizeof(float)));
+        return p;
+      };
+      const fast::Exl3FastMlp fresh{gate.weight.exl3,
+                                    up.weight.exl3,
+                                    down.weight.exl3,
+                                    make(8 * gate.n),
+                                    make(8 * gate.n),
+                                    make(out_count),
+                                    down.n};
+      const fast::Exl3FastMlp old{gate.weight.exl3,
+                                  up.weight.exl3,
+                                  down.weight.exl3,
+                                  make(8 * gate.n),
+                                  make(8 * gate.n),
+                                  make(out_count),
+                                  down.n};
+      Check(hipMemset(down_slab, 0xFF, 8 * kMaxK * 2));
+      Check(hipMemset(ref_down_slab, 0xFF, 8 * kMaxK * 2));
+      Require(fast::Exl3FastMlpSupported(fresh, pre), "MLP supported");
+      fast::LaunchExl3FastMlp(fresh, nullptr, gate.k, rows, pre, nullptr, true);
+      ref::Mlp(old, slab, rows, ref_down_slab, ref_counters, nullptr);
+      Check(hipDeviceSynchronize());
+      SameBits(download(old.gate_y, std::size_t{rows} * gate.n),
+               download(fresh.gate_y, std::size_t{rows} * gate.n), "gate sums",
+               gate.n);
+      SameBits(download(old.up_y, std::size_t{rows} * gate.n),
+               download(fresh.up_y, std::size_t{rows} * gate.n), "up sums",
+               gate.n);
+      Require(download(ref_down_slab, 8 * down.k) ==
+                  download(down_slab, 8 * down.k),
+              "down input slab bytes equal");
+      const auto out = download(fresh.out, out_count);
+      SameBits(download(old.out, out_count), out, "MLP output", down.n);
+      Require(std::all_of(out.begin(), out.end(),
+                          [](float v) { return std::isfinite(v); }),
+              "finite MLP outputs");
+    }
+  };
+  {
+    Bank qkv(buffers, 2560, 10240, 5, 1, 401),
+        z(buffers, 2560, 6144, 5, 1, 402);
+    projections("GDN qkv+z K5", {&qkv, &z});
+  }
+  {
+    Bank out(buffers, 6144, 2560, 6, 1, 403);
+    projections("ssm_out/attention out K6", {&out});
+  }
+  {
+    Bank q(buffers, 2560, 12288, 6, 1, 404), key(buffers, 2560, 512, 6, 1, 405),
+        value(buffers, 2560, 512, 6, 1, 406);
+    projections("attention q+k+v K6", {&q, &key, &value});
+    projections("MTP K/V subset K6", {&key, &value},
+                std::size_t{12288} + 512 + 512);
+  }
+  {
+    Bank gate(buffers, 2560, 640, 6, 1, 407), up(buffers, 2560, 640, 6, 1, 408),
+        down(buffers, 640, 2560, 6, 1, 409);
+    mlp("shared MLP K6", gate, up, down);
+  }
+  {
+    Bank head(buffers, 2560, 16384, 8, 1, 410);
+    projections("head-shaped K8", {&head});
+    Bank narrow(buffers, 2560, 512, 8, 1, 411),
+        wide(buffers, 2560, 640, 8, 1, 412);
+    projections("narrow K8", {&narrow});
+    projections("indexer-width K8", {&wide});
+  }
+  {
+    // Over 16 waves: 8 K tiles (half the waves own none), 16, 24 (one or
+    // two tiles) and 48 (three: a checked tail after a pair); 24 tiles over
+    // 4 waves (six: an unchecked group pair, then a checked group), and
+    // four tiles per wave (one-tile groups).
+    Bank e(buffers, 128, 512, 5, 1, 420), f(buffers, 768, 512, 5, 1, 421);
+    Bank a(buffers, 256, 512, 3, 1, 413), b(buffers, 384, 512, 7, 1, 414),
+        c(buffers, 384, 4096, 7, 1, 415), d(buffers, 384, 12288, 3, 1, 416);
+    Bank k4(buffers, 2560, 4096, 4, 1, 422);
+    projections("K4 2560->4096", {&k4});
+    projections("short K5 k=128", {&e});
+    projections("short K5 k=768", {&f});
+    projections("short K3 k=256", {&a});
+    projections("short K7 k=384", {&b});
+    projections("short K7 k=384 wide", {&c});
+    projections("short K3 k=384 four tiles", {&d});
+    Bank g(buffers, 384, 640, 7, 1, 417), u(buffers, 384, 640, 7, 1, 418),
+        dn(buffers, 640, 384, 7, 1, 419);
+    mlp("short MLP K7", g, u, dn);
+  }
+}
+
 int main(int argc, char** argv) {
   std::cout << std::unitbuf;
   try {
@@ -2583,6 +2773,10 @@ int main(int argc, char** argv) {
       MtpKvGroup();
       return 0;
     }
+    if (argc == 2 && std::string(argv[1]) == "--dense-gemv-pipeline") {
+      DenseGemvPipeline();
+      return 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--producer-rotation") {
       ProducerRotation();
       return 0;
@@ -2607,6 +2801,7 @@ int main(int argc, char** argv) {
     Projection(6144, 2560, 7, {1U});
     Routed(true, 3, 2560, 640, 16);
     ProducerRotation();
+    DenseGemvPipeline();
     SelectedHead();
     for (unsigned rows : {1U, 2U, 3U, 7U, 8U, 9U, 32U, 33U, 64U}) {
       Routed(true, rows);

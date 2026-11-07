@@ -55,6 +55,15 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen38_flash_next_hc_decode_bench PRIVATE
     gufo_qwen38_flash_next)
 
+  # Dense EXL3 decode GEMV, pre-B5 kernel vs production (tools/bench).
+  add_executable(qwen38_flash_next_dense_gemv_bench EXCLUDE_FROM_ALL
+    ${PROJECT_SOURCE_DIR}/tools/bench/flash_next_dense_gemv.hip)
+  set_source_files_properties(
+    ${PROJECT_SOURCE_DIR}/tools/bench/flash_next_dense_gemv.hip
+    PROPERTIES LANGUAGE HIP)
+  target_link_libraries(qwen38_flash_next_dense_gemv_bench PRIVATE
+    gufo_qwen38_flash_next)
+
   add_qwen38_flash_next_test(exl3_ops gufo_qwen38_flash_next_reference "hip;gpu;gfx1151;exl3")
   set_source_files_properties(exl3_ops_test.cpp PROPERTIES LANGUAGE HIP)
   add_qwen38_flash_next_test(exl3_moe_kernel gufo_qwen38_flash_next "hip;gpu;gfx1151;exl3")
@@ -81,6 +90,8 @@ if (ENGINE_ENABLE_HIP)
     COMMAND qwen38_flash_next_exl3_ops_test --mtp-kv-executor)
   add_test(NAME qwen38_flash_next.exl3_producer_rotation
     COMMAND qwen38_flash_next_exl3_ops_test --producer-rotation)
+  add_test(NAME qwen38_flash_next.exl3_dense_gemv_pipeline
+    COMMAND qwen38_flash_next_exl3_ops_test --dense-gemv-pipeline)
   add_test(NAME qwen38_flash_next.exl3_prefill_executor
     COMMAND qwen38_flash_next_exl3_ops_test --prefill-experts-only)
   add_test(NAME qwen38_flash_next.exl3_dense_prefill
@@ -100,6 +111,7 @@ if (ENGINE_ENABLE_HIP)
   set_tests_properties(qwen38_flash_next.mtp_kv qwen38_flash_next.mtp_kv_group
     qwen38_flash_next.mtp_kv_executor qwen38_flash_next.hc_down_f16
     qwen38_flash_next.exl3_producer_rotation
+    qwen38_flash_next.exl3_dense_gemv_pipeline
     qwen38_flash_next.exl3_prefill_executor
     qwen38_flash_next.exl3_dense_prefill
     qwen38_flash_next.exl3_plain_prefill
