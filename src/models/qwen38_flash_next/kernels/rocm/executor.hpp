@@ -634,8 +634,11 @@ private:
     std::uint32_t n;
     std::uint32_t k;
   };
+  /// `q8_weight`: the consumer is a plain Q8_0 GEMV (an EXL3 model's mixer
+  /// copies), which needs the Q8_1 rows even where EXL3 reads FP32.
   bool Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
-                Q8Input* q, std::string* error_msg) const;
+                Q8Input* q, std::string* error_msg,
+                bool q8_weight = false) const;
   /// Q8_1 rows of a small-batch input that its producer kernel already
   /// wrote (byte-identical to Quantize's), or null.
   const void* ReadyQ8(const float* x, std::uint32_t n_tokens,

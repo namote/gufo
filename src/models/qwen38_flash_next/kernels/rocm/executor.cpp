@@ -2130,12 +2130,14 @@ void Executor::DropReadyQ8() const {
 }
 
 bool Executor::Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
-                        Q8Input* q, std::string* error_msg) const {
+                        Q8Input* q, std::string* error_msg,
+                        bool q8_weight) const {
   q->x = x;
   q->data = nullptr;
   q->n = n_tokens;
   q->k = k;
-  if (model_->output().exl3 != nullptr || MatrixRows(n_tokens)) {
+  if ((model_->output().exl3 != nullptr && !q8_weight) ||
+      MatrixRows(n_tokens)) {
     return true;  // EXL3 consumes the original FP32 rows; wide Q8 stages per
                   // call
   }
@@ -2527,7 +2529,10 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
     cycle_diagnostics_.prefill_plain_rows += n_tokens;
   // Prefill plain operands use the accepted FP16 activation boundary
   // at every width. Decode/verify retain the established FP32-input path.
-  if (w.exl3 != nullptr || model_->output().exl3 != nullptr) {
+  // An EXL3 model's plain Q8_0 weights (its mixer copies) take the Q8_0
+  // routes below.
+  if (w.exl3 != nullptr ||
+      (model_->output().exl3 != nullptr && w.type != GgmlType::kQ8_0)) {
     try {
       if (prefill_phase && w.exl3 == nullptr &&
           (w.type == GgmlType::kF16 || w.type == GgmlType::kBF16 ||
@@ -2549,7 +2554,7 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
   if (w.type == GgmlType::kQ8_0) {
     if (!MatrixRows(n_tokens)) {
       Q8Input q;
-      return Quantize(x, n_tokens, w.cols, &q, error_msg) &&
+      return Quantize(x, n_tokens, w.cols, &q, error_msg, true) &&
              Dense(w, q, out, error_msg);
     }
     // Wide batches: the F16 route for the shapes it wins (F16 rows in
@@ -3009,9 +3014,14 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       c.hidden_size == 2560 && c.hc_low_rank == 320 &&
       m.up.type == GgmlType::kQ8_0 && m.up.rows == c.HcDim() &&
       m.up.cols == c.hc_low_rank;
+  // EXL3 decode/verify reads the Q8_0 copy the prefill W8A8 route uses:
+  // 3.4 instead of 6.6 MB per mixer and token step.
+  const bool q8_decode_down = !q8_down && model_->output().exl3 != nullptr &&
+                              !xn_half_ && !MatrixRows(n_tokens) &&
+                              !m.down_q8.empty();
   const bool fused_down =
-      !q8_down && model_->output().exl3 != nullptr && !xn_half_ &&
-      !MatrixRows(n_tokens) && m.down.type == GgmlType::kF16 &&
+      !q8_down && !q8_decode_down && model_->output().exl3 != nullptr &&
+      !xn_half_ && !MatrixRows(n_tokens) && m.down.type == GgmlType::kF16 &&
       m.up.type == GgmlType::kF16 && m.down.rows == 320 &&
       m.down.cols == 10240 && c.hc_count == 4 && c.hc_low_rank == 320;
   if (fused_projection) {
@@ -3030,6 +3040,9 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
         AssignError(error_msg, "W8A8 mixer down projection failed");
         return false;
       }
+    } else if (q8_decode_down) {
+      if (!Dense(m.down_q8, s_.xn, s_.lo, n_tokens, error_msg))
+        return false;
     } else if (fused_down) {
       HcDownSiluF16(m.down.data, s_.xn, s_.lo, n_tokens, stream_);
     } else if (!Dense(m.down, s_.xn, s_.lo, n_tokens, error_msg)) {

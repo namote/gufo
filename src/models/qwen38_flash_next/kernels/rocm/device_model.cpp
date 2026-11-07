@@ -361,8 +361,9 @@ struct Uploader {
 
   DeviceMixer Mixer(const HcMixer& m) {
     DeviceMixer d{Copy(m.norm), Copy(m.down), Copy(m.up), Copy(m.inject), {}};
-    // The EXL3 prefill down projection runs W8A8 on a Q8_0 copy, as the
-    // GGUF route's Q8_0 mixer weights do; decode keeps the F16 rows.
+    // The EXL3 down projection runs W8A8 (prefill) or the Q8_0 GEMV
+    // (decode/verify) on a Q8_0 copy, as the GGUF route's Q8_0 mixer
+    // weights do; an unnormed prefill input still reads the F16 rows.
     if (!ok || m.down.empty() || !m.down.exl3.empty() ||
         m.down.type != core::GgmlType::kF16 || m.down.cols % 32 != 0)
       return d;

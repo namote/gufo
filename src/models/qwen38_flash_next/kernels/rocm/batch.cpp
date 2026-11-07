@@ -151,10 +151,12 @@ bool Executor::HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
                           m.down.type == core::GgmlType::kF16 &&
                           m.down.rows == 320 && m.down.cols == 10240 &&
                           c.hc_count == 4 && c.hc_low_rank == 320;
-  if (fused_down) {
+  // An EXL3 model's down reads the Q8_0 copy the single-request route uses.
+  const bool q8_down = model_->output().exl3 != nullptr && !m.down_q8.empty();
+  if (fused_down && !q8_down) {
     HcDownSiluF16(m.down.data, s_.xn, s_.lo, rows, stream_);
   } else {
-    if (!DenseBatch(m.down, s_.xn, s_.lo, rows, error))
+    if (!DenseBatch(q8_down ? m.down_q8 : m.down, s_.xn, s_.lo, rows, error))
       return false;
     SiluScale(s_.lo, 1.0F / static_cast<float>(c.hc_count),
               std::size_t{rows} * c.hc_low_rank, stream_);
@@ -717,7 +719,8 @@ bool Executor::QuantizeBatch(const float* x, std::uint32_t rows,
 
 bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
                           std::uint32_t rows, std::string* error) const {
-  if (w.exl3 != nullptr || model_->output().exl3 != nullptr ||
+  if (w.exl3 != nullptr ||
+      (model_->output().exl3 != nullptr && w.type != core::GgmlType::kQ8_0) ||
       rows <= kDecodeRows)
     return Dense(w, x, out, rows, error);
   if (w.type != core::GgmlType::kQ8_0) {
