@@ -24,6 +24,13 @@ namespace gufo::models::qwen38_flash_next::rocm {
 
 struct Exl3RouteTile;  // exl3_moe.hpp
 
+/// A four-lane combine's residual update left out of res (HcCombine
+/// defer_w): res[t][s][i] + block_out[t][i] * w[t * 4 + s].
+struct DeferredResidual {
+  const float* block_out{nullptr};
+  const float* w{nullptr};
+};
+
 /// FP16 lane-major input slabs of the EXL3 decode projections that follow a
 /// producer epilogue (gufo::hip::LaunchExl3FastProjections / LaunchExl3FastMlp
 /// with input_rotated): consumer c's slab starts at out + c * 8 * k and holds
@@ -261,18 +268,24 @@ void HcMixEpilogueVec4F16(const __half* xn, const float* gate,
 /// gamma; returns whether it was written. With xn_scale as well, the F32
 /// norm is not stored: xn_scale receives each row's four stream scales,
 /// from which HcNormFromRes / HcMixEpilogueVec4FromRes recompute it.
+/// Four-lane route only: a non-null `defer_w` (with xn_scale, no `moe`)
+/// leaves res unchanged and stores each row's four stream weights there
+/// instead; the readers (HcMixEpilogueVec4FromRes, HcNormFromRes, the next
+/// HcCombine, HcApplyDeferred) reapply it given `prior`, in the combine's
+/// own FMA. `prior` adds such a deferred update first.
 bool HcCombine(float* res, const float* block_out, const float* inject,
                std::uint32_t inject_parts, const float* gamma, float* xn,
                std::uint32_t n_tokens, std::uint32_t hidden,
                std::uint32_t streams, float eps, hipStream_t stream,
                bool decode = false, bool any_width = false,
                __half* xn_half = nullptr, float* xn_scale = nullptr,
-               const Exl3PrefillMoeRows* moe = nullptr, void* xn_q8t = nullptr);
+               const Exl3PrefillMoeRows* moe = nullptr, void* xn_q8t = nullptr,
+               float* defer_w = nullptr, DeferredResidual prior = {});
 /// The F32 norm HcCombine left out (four streams): res * scale * gamma in
 /// the combine's own expression.
 void HcNormFromRes(const float* res, const float* gamma, const float* xn_scale,
                    float* xn, std::uint32_t n_tokens, std::uint32_t hidden,
-                   hipStream_t stream);
+                   hipStream_t stream, DeferredResidual prior = {});
 /// HcMixEpilogueVec4 reading that norm from res, xn_scale and gamma instead
 /// of an F32 xn (four streams, hidden % 4 == 0).
 void HcMixEpilogueVec4FromRes(const float* res, const float* gamma,
@@ -281,7 +294,8 @@ void HcMixEpilogueVec4FromRes(const float* res, const float* gamma,
                               float* inject, std::uint32_t n_tokens,
                               std::uint32_t hidden, hipStream_t stream,
                               __half* mixed_half = nullptr,
-                              const __half* gate_half = nullptr);
+                              const __half* gate_half = nullptr,
+                              DeferredResidual prior = {});
 // any_width: the four-lane kernel at every token count (no 16-row
 // threshold), so a route fixed by phase never depends on the chunk width.
 /// The one-block-per-stream HcCombine that also writes xn's Q8_1 rows (as

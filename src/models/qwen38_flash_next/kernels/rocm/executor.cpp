@@ -2898,8 +2898,15 @@ const float* InjectWeights(const DeviceMixer& m) {
 
 }  // namespace
 
+void Executor::ApplyPendingResidual() const {
+  const PendingResidual p = std::exchange(exl3_res_pending_, {});
+  if (p.res != nullptr)
+    HcApplyDeferred(p.res, p.update.block_out, p.update.w, p.rows,
+                    config().hidden_size, stream_);
+}
+
 void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
-                       const float* inject_w) const {
+                       const float* inject_w, bool defer_res) const {
   const Config& c = config();
   inject_fused_ = nullptr;
   xn_deferred_ = {};  // s_.xn is rewritten (or left stale) below
@@ -2918,6 +2925,9 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
                      c.hidden_size <= 2560 && d.rows == c.hidden_size &&
                      !moe_pending_ && !res_deferred_ &&
                      !(wide_mixer_ && MatrixRows(n_tokens) && gamma != nullptr);
+    if (!exl3_moe_fused || exl3_res_pending_.res != res ||
+        exl3_res_pending_.rows != n_tokens)
+      ApplyPendingResidual();  // the combine below rewrites block_out
     if (exl3_moe_fused) {
       exl3_moe = {d.device_exl3,
                   s_.ids,
@@ -2936,6 +2946,12 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
                          s_.block_out, stream_);
     }
   }
+  // The fused EXL3 MoE combine adds a deferred attention update itself;
+  // any other route gets it in res first.
+  const DeferredResidual prior =
+      exl3_moe_fused ? std::exchange(exl3_res_pending_, {}).update
+                     : DeferredResidual{};
+  ApplyPendingResidual();
   // Wide batches hand the next mixer an F16 norm for its epilogue and the
   // same norm quantized into the tiled Q8 layout for its W8A8 down
   // projection: half the bytes for the combine and the epilogue, and no
@@ -3021,13 +3037,23 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
   // With Q8_0 mixer down weights the down projection is W8A8 and reads the
   // norm as tiled Q8 rows at every prefill width; no F16 copy is needed.
   const bool q8_norm = half_norm && hc_down_q8_;
+  // The FFN mixer then recomputes the norm from res (HcMixEpilogueVec4FromRes
+  // / HcNormFromRes) and the next combine rereads res: both add this
+  // combine's update themselves, so res is not written here (one FP32
+  // residual write and reread fewer per layer).
+  const bool defer_now = defer_res && exl3 && prefill_phase &&
+                         xn_scale != nullptr && !exl3_moe_fused &&
+                         c.hc_count == 4;
   if (HcCombine(
           res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn, n_tokens,
           c.hidden_size, c.hc_count, c.rms_eps, stream_, exl3 && !prefill_phase,
           exl3 && prefill_phase,
           half_norm && !q8_norm ? static_cast<__half*>(s_.x_half) : nullptr,
           xn_scale, exl3_moe_fused ? &exl3_moe : nullptr,
-          q8_norm ? s_.xn_q8t : nullptr)) {
+          q8_norm ? s_.xn_q8t : nullptr, defer_now ? s_.hc_defer_w : nullptr,
+          prior)) {
+    if (defer_now)
+      exl3_res_pending_ = {res, {s_.block_out, s_.hc_defer_w}, n_tokens};
     if (q8_norm) {
       xn_q8t_norm_ = {res, gamma, n_tokens};
       if (half_src_ == s_.xn)
@@ -3064,6 +3090,13 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
                        xn_q8t_norm_.gamma == m.norm.f32() &&
                        xn_q8t_norm_.rows == n_tokens;
   xn_q8t_norm_ = {};
+  // A deferred update of exactly this residual is added by the norm readers
+  // below; any other pending one is written out first.
+  if (exl3_res_pending_.res != nullptr &&
+      (!normed || exl3_res_pending_.res != res ||
+       exl3_res_pending_.rows != n_tokens))
+    ApplyPendingResidual();
+  const DeferredResidual prior = exl3_res_pending_.update;
   bool norm_from_res = false;
   if (normed && xn_deferred_.res != nullptr) {
     const DeferredNorm d = xn_deferred_;
@@ -3077,7 +3110,7 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
                     !other_inject && (half_down || q8_down);
     if (!norm_from_res)
       HcNormFromRes(d.res, d.gamma, s_.xn_scale, s_.xn, d.rows, c.hidden_size,
-                    stream_);
+                    stream_, d.res == res ? prior : DeferredResidual{});
   }
   const DeferredNorm deferred_norm = xn_deferred_;
   xn_deferred_ = {};
@@ -3231,7 +3264,7 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       HcMixEpilogueVec4FromRes(
           deferred_norm.res, deferred_norm.gamma, s_.xn_scale, s_.hc_gate,
           fused_inject ? m.inject.f32() : nullptr, mixed, inject, n_tokens,
-          c.hidden_size, stream_, mixed_half, gate_half);
+          c.hidden_size, stream_, mixed_half, gate_half, prior);
     else
       half_written = HcMixEpilogueVec4(
           xn, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr, mixed,
@@ -3269,6 +3302,7 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       xn_q8_ready_ = {};
       if (half_src_ == s_.xn)
         half_src_ = nullptr;
+      ApplyPendingResidual();
       RmsNormRows(res, m.norm.f32(), s_.xn, n_tokens, c.HcDim(), c.hc_count,
                   c.rms_eps, stream_);
     }
@@ -4435,6 +4469,8 @@ bool Executor::Exl3Experts(const DeviceLayer& l, const float* x, float* out,
         exl3_moe_pending_ = {&l, rows};
         return true;
       }
+      if (out == s_.block_out)
+        ApplyPendingResidual();  // its update reads the attention output
       Exl3PrefillCombine(l, Exl3PrefillView(), s_.ids, rows, c.num_experts_used,
                          s_.weights, s_.shexp_out, s_.router + c.num_experts,
                          c.num_experts + 1, out, stream_);
@@ -4647,7 +4683,7 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
             xn_q8_ready_, mixed_q8_ready_, xn_deferred_.res, xn_deferred_.gamma,
             xn_deferred_.rows, exl3_moe_defer_, exl3_moe_pending_.layer,
             exl3_moe_pending_.rows, xn_q8t_norm_.res, xn_q8t_norm_.gamma,
-            xn_q8t_norm_.rows, exl3_rotated_);
+            xn_q8t_norm_.rows, exl3_rotated_, exl3_res_pending_);
         const auto before = std::apply(
             [](const auto&... fields) { return std::make_tuple(fields...); },
             dispatch);
@@ -4897,6 +4933,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                            PrefillCheckpoint* checkpoint,
                            bool embeddings_ready) const {
   const Config& c = config();
+  exl3_res_pending_ = {};  // only a failed earlier pass can leave one
   if (first_layer == 0) {
     if (!Check(hipMemcpyAsync(session.control_, control_host_,
                               sizeof(Session::Control), hipMemcpyHostToDevice,
@@ -4987,7 +5024,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                           l.router.type == GgmlType::kF16 &&
                           l.shexp_gate.type == GgmlType::kQ8_0 &&
                           l.shexp_up.type == GgmlType::kQ8_0;
-      Combine(s_.res, l.hc_ffn.norm.f32(), rows, InjectWeights(l.hc_ffn));
+      Combine(s_.res, l.hc_ffn.norm.f32(), rows, InjectWeights(l.hc_ffn), true);
       const DeviceTensor* const shared_rotate[] = {&l.shexp_gate, &l.shexp_up};
       if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, rows, error_msg,
                  false, no_f32, shared_rotate))
@@ -5019,6 +5056,9 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     }
     normed = next_norm != nullptr;
   }
+  // Every layer's FFN combine consumes its deferred update; never leave one
+  // across a split forward or to the head.
+  ApplyPendingResidual();
   if (end_layer < c.num_layers) {
     return true;
   }

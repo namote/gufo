@@ -617,6 +617,89 @@ int main() {
                          vec_inject * 4))
           throw std::runtime_error("HC epilogue F16 mix differs");
       }
+      // E2: the attention combine leaves its update out of res; the FFN
+      // mixer's recomputed norm, HcNormFromRes and the next combine add it
+      // in the combine's FMA. Every output and the final residual keep the
+      // writing route's bits.
+      HipBuffer<float> d_res_c(kRows), d_res_d(kRows),
+          d_defer_w(static_cast<std::size_t>(kTokens) * kStreams);
+      HipBuffer<float> d_xn_c(kRows), d_xn_d(kRows), d_next_out(kMixed);
+      HipBuffer<__half> d_half_c(kRows), d_half_d(kRows);
+      HipBuffer<float> d_scale_c(static_cast<std::size_t>(kTokens) * kStreams);
+      HipBuffer<float> d_mixed_d(kMixed), d_inj_d(vec_inject);
+      Upload(&d_res_c, res);
+      Upload(&d_res_d, res);
+      Upload(&d_next_out, MakeValues(kMixed, 0x5EED1234U, 2.0F));
+      q::HcCombine(d_res_c.get(), d_block_out.get(), d_inject_vec.get(),
+                   vec_parts, d_gamma.get(), d_xn_c.get(), kTokens, kHidden,
+                   kStreams, kEps, nullptr, false, true, d_half_c.get(),
+                   d_scale_c.get());
+      if (!q::HcCombine(d_res_d.get(), d_block_out.get(), d_inject_vec.get(),
+                        vec_parts, d_gamma.get(), d_xn_d.get(), kTokens,
+                        kHidden, kStreams, kEps, nullptr, false, true,
+                        d_half_d.get(), d_scale.get(), nullptr, nullptr,
+                        d_defer_w.get()))
+        throw std::runtime_error("deferring HC combine skipped its norm");
+      const q::DeferredResidual prior{d_block_out.get(), d_defer_w.get()};
+      if (!bytes_equal(Download(&d_res_d, kRows).data(), res.data(), kRows * 4))
+        throw std::runtime_error("deferring HC combine wrote the residual");
+      q::HcMixEpilogueVec4FromRes(d_res_c.get(), d_gamma.get(), d_scale_c.get(),
+                                  d_gate.get(), d_weight.get(), d_mixed_c.get(),
+                                  d_inj_c.get(), kTokens, kHidden, nullptr);
+      q::HcMixEpilogueVec4FromRes(d_res_d.get(), d_gamma.get(), d_scale.get(),
+                                  d_gate.get(), d_weight.get(), d_mixed_d.get(),
+                                  d_inj_d.get(), kTokens, kHidden, nullptr,
+                                  nullptr, nullptr, prior);
+      q::HcNormFromRes(d_res_c.get(), d_gamma.get(), d_scale_c.get(),
+                       d_xn_c.get(), kTokens, kHidden, nullptr);
+      q::HcNormFromRes(d_res_d.get(), d_gamma.get(), d_scale.get(),
+                       d_xn_d.get(), kTokens, kHidden, nullptr, prior);
+      CheckHip(hipDeviceSynchronize(), "HC deferred residual readers");
+      std::vector<__half> half_c(kRows), half_d(kRows);
+      CheckHip(hipMemcpy(half_c.data(), d_half_c.get(), kRows * sizeof(__half),
+                         hipMemcpyDeviceToHost),
+               "half norm c");
+      CheckHip(hipMemcpy(half_d.data(), d_half_d.get(), kRows * sizeof(__half),
+                         hipMemcpyDeviceToHost),
+               "half norm d");
+      const bool readers_ok =
+          bytes_equal(half_c.data(), half_d.data(), kRows * sizeof(__half)) &&
+          bytes_equal(Download(&d_scale_c, kTokens * kStreams).data(),
+                      Download(&d_scale, kTokens * kStreams).data(),
+                      kTokens * kStreams * 4) &&
+          bytes_equal(Download(&d_mixed_c, kMixed).data(),
+                      Download(&d_mixed_d, kMixed).data(), kMixed * 4) &&
+          bytes_equal(Download(&d_inj_c, vec_inject).data(),
+                      Download(&d_inj_d, vec_inject).data(), vec_inject * 4) &&
+          bytes_equal(Download(&d_xn_c, kRows).data(),
+                      Download(&d_xn_d, kRows).data(), kRows * 4);
+      // The next combine (no norm), then the applied update alone.
+      HipBuffer<float> d_res_e(kRows);
+      Upload(&d_res_e, res);
+      q::HcCombine(d_res_c.get(), d_next_out.get(), d_inject_vec.get(),
+                   vec_parts, nullptr, d_xn_c.get(), kTokens, kHidden, kStreams,
+                   kEps, nullptr, false, true);
+      q::HcCombine(d_res_d.get(), d_next_out.get(), d_inject_vec.get(),
+                   vec_parts, nullptr, d_xn_d.get(), kTokens, kHidden, kStreams,
+                   kEps, nullptr, false, true, nullptr, nullptr, nullptr,
+                   nullptr, nullptr, prior);
+      q::HcApplyDeferred(d_res_e.get(), d_block_out.get(), d_defer_w.get(),
+                         kTokens, kHidden, nullptr);
+      HipBuffer<float> d_res_f(kRows);
+      Upload(&d_res_f, res);
+      q::HcCombine(d_res_f.get(), d_block_out.get(), d_inject_vec.get(),
+                   vec_parts, nullptr, d_xn_c.get(), kTokens, kHidden, kStreams,
+                   kEps, nullptr, false, true);
+      CheckHip(hipDeviceSynchronize(), "HC deferred residual combine");
+      const bool chain_ok =
+          bytes_equal(Download(&d_res_c, kRows).data(),
+                      Download(&d_res_d, kRows).data(), kRows * 4) &&
+          bytes_equal(Download(&d_res_e, kRows).data(),
+                      Download(&d_res_f, kRows).data(), kRows * 4);
+      std::cout << "HC deferred residual: readers " << readers_ok
+                << ", next combine and applied update " << chain_ok << '\n';
+      if (!readers_ok || !chain_ok)
+        throw std::runtime_error("HC deferred residual changed the F32 route");
     }
     std::cout << "HC mixed outputs and short prefill chunks passed\n";
     return 0;

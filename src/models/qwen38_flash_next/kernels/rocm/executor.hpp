@@ -702,8 +702,22 @@ private:
   /// mixer (`gamma`); wide batches write it as F16 and tiled Q8. With that
   /// mixer's F32 `inject_w`, the fused MoE combine also leaves its inject
   /// partials in s_.inject (inject_fused_).
+  /// defer_res: the caller's next mixer and combine read res (EXL3
+  /// prefill attention combine); a four-lane combine with a deferred norm
+  /// may then leave its update to them (exl3_res_pending_).
   void Combine(float* res, const float* gamma, std::uint32_t n_tokens,
-               const float* inject_w = nullptr) const;
+               const float* inject_w = nullptr, bool defer_res = false) const;
+  /// An EXL3 prefill combine's residual update left out of `res` for the
+  /// FFN mixer's recomputed norm and the next combine.
+  struct PendingResidual {
+    float* res{nullptr};
+    DeferredResidual update;
+    std::uint32_t rows{0};
+  };
+  mutable PendingResidual exl3_res_pending_;
+  /// Writes a pending deferred update into its residual (HcApplyDeferred,
+  /// the same FMA), for a reader that cannot add it itself.
+  void ApplyPendingResidual() const;
   /// Hashes the batch's n-gram rows and starts reading them from disk, so
   /// the read overlaps the layers before the PLE one.
   bool PleFetch(Session& s, std::span<const std::int32_t> tokens,

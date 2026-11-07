@@ -462,6 +462,14 @@ __global__ void HcMixEpilogueKernel(const float* xn, const float* gate,
   }
 }
 
+/// r + b * w as the four-lane combine forms the updated residual, one FMA
+/// per element: also the expression every reader of a deferred update
+/// (DeferredResidual) reapplies, so both give the same bits.
+__device__ __forceinline__ float4 CombineAdd(float4 r, float4 b, float w) {
+  return float4{__fmaf_rn(b.x, w, r.x), __fmaf_rn(b.y, w, r.y),
+                __fmaf_rn(b.z, w, r.z), __fmaf_rn(b.w, w, r.w)};
+}
+
 /// One stream's normalized float4, as HcCombineVec4Kernel stores it and
 /// its consumers recompute it: v * (scale * gamma) per element, the order
 /// fast-math gave the combine's original v * scale * gamma.
@@ -498,7 +506,8 @@ __global__ void HcMixEpilogueVec4Kernel(const XnT* xn, const GateT* gate,
                                         float* inject, std::uint32_t hidden,
                                         const float* gamma = nullptr,
                                         const float* xn_scale = nullptr,
-                                        __half* mixed_half = nullptr) {
+                                        __half* mixed_half = nullptr,
+                                        DeferredResidual prior = {}) {
   constexpr std::uint32_t kStreams = 4;
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t i = (blockIdx.y * blockDim.x + threadIdx.x) * 4;
@@ -518,6 +527,15 @@ __global__ void HcMixEpilogueVec4Kernel(const XnT* xn, const GateT* gate,
       gm[s] = i < hidden ? *reinterpret_cast<const float4*>(gamma + idx)
                          : float4{0.0F, 0.0F, 0.0F, 0.0F};
       sc[s] = xn_scale[(static_cast<std::size_t>(t) * kStreams) + s];
+    }
+    // A deferred combine left its update out of res: the combine's sum.
+    if (prior.block_out != nullptr && i < hidden) {
+      const float4 b =
+          Load4(prior.block_out + (static_cast<std::size_t>(t) * hidden) + i);
+#pragma unroll
+      for (std::uint32_t s = 0; s < kStreams; ++s)
+        v[s] = CombineAdd(
+            v[s], b, prior.w[(static_cast<std::size_t>(t) * kStreams) + s]);
     }
 #pragma unroll
     for (std::uint32_t s = 0; s < kStreams; ++s) {
@@ -974,7 +992,7 @@ __global__ void HcCombineVec4Kernel(
     std::uint32_t hidden, float eps, float* defer_w,
     const float* inject_w = nullptr, float* inject_out = nullptr,
     __half* xn_half = nullptr, float* xn_scale = nullptr,
-    Exl3PrefillMoeRows moe = {}) {
+    Exl3PrefillMoeRows moe = {}, DeferredResidual prior = {}) {
   constexpr std::uint32_t kStreams = 4;
   constexpr std::uint32_t kMaxChunks = 10;  // 4 x 2560 / 4 / kThreads
   constexpr std::uint32_t kMaxHidden = kMaxChunks * kThreads;  // 2560
@@ -1029,10 +1047,22 @@ __global__ void HcCombineVec4Kernel(
       const std::uint32_t s = e / hidden;
       const std::uint32_t i = e - (s * hidden);
       const float ws = w[s];
-      const float4 r = *reinterpret_cast<const float4*>(dst + e);
+      float4 r = *reinterpret_cast<const float4*>(dst + e);
       const float4 b = *reinterpret_cast<const float4*>(src + i);
-      v[c] = float4{r.x + b.x * ws, r.y + b.y * ws, r.z + b.z * ws,
-                    r.w + b.w * ws};
+      if constexpr (std::is_same_v<XnT, float>) {
+        // The previous combine's deferred update first, then this one, each
+        // as that combine would have stored it.
+        if (prior.block_out != nullptr)
+          r = CombineAdd(
+              r,
+              *reinterpret_cast<const float4*>(
+                  prior.block_out + (static_cast<std::size_t>(t) * hidden) + i),
+              prior.w[(static_cast<std::size_t>(t) * kStreams) + s]);
+        v[c] = CombineAdd(r, b, ws);
+      } else {
+        v[c] = float4{r.x + b.x * ws, r.y + b.y * ws, r.z + b.z * ws,
+                      r.w + b.w * ws};
+      }
       if constexpr (!kDefer) {
         *reinterpret_cast<float4*>(dst + e) = v[c];
       }
@@ -6780,39 +6810,49 @@ void HcMixEpilogueVec4FromRes(const float* res, const float* gamma,
                               const float* inject_w, float* mixed,
                               float* inject, std::uint32_t n_tokens,
                               std::uint32_t hidden, hipStream_t stream,
-                              __half* mixed_half, const __half* gate_half) {
+                              __half* mixed_half, const __half* gate_half,
+                              DeferredResidual prior) {
   const dim3 grid(n_tokens, HcInjectPartsVec4(hidden));
   if (gate_half != nullptr)
     hipLaunchKernelGGL((HcMixEpilogueVec4Kernel<float, true, __half>), grid,
                        dim3(kThreads), 0, stream, res, gate_half, inject_w,
-                       mixed, inject, hidden, gamma, xn_scale, mixed_half);
+                       mixed, inject, hidden, gamma, xn_scale, mixed_half,
+                       prior);
   else
     hipLaunchKernelGGL((HcMixEpilogueVec4Kernel<float, true>), grid,
                        dim3(kThreads), 0, stream, res, gate, inject_w, mixed,
-                       inject, hidden, gamma, xn_scale, mixed_half);
+                       inject, hidden, gamma, xn_scale, mixed_half, prior);
 }
 
 __global__ void HcNormFromResKernel(const float* res, const float* gamma,
                                     const float* xn_scale, float* xn,
-                                    std::uint32_t hidden) {
+                                    std::uint32_t hidden,
+                                    DeferredResidual prior) {
   constexpr std::uint32_t kStreams = 4;
   const std::uint32_t t = blockIdx.x;
   const std::size_t hc_dim = static_cast<std::size_t>(kStreams) * hidden;
   const std::size_t row = static_cast<std::size_t>(t) * hc_dim;
   for (std::uint32_t e = threadIdx.x * 4; e < hc_dim; e += kThreads * 4) {
     const std::uint32_t s = e / hidden;
+    float4 r = *reinterpret_cast<const float4*>(res + row + e);
+    if (prior.block_out != nullptr)
+      r = CombineAdd(
+          r,
+          *reinterpret_cast<const float4*>(
+              prior.block_out + (static_cast<std::size_t>(t) * hidden) +
+              (e - s * hidden)),
+          prior.w[(static_cast<std::size_t>(t) * kStreams) + s]);
     *reinterpret_cast<float4*>(xn + row + e) =
-        HcNorm4(*reinterpret_cast<const float4*>(res + row + e),
-                xn_scale[(static_cast<std::size_t>(t) * kStreams) + s],
+        HcNorm4(r, xn_scale[(static_cast<std::size_t>(t) * kStreams) + s],
                 *reinterpret_cast<const float4*>(gamma + e));
   }
 }
 
 void HcNormFromRes(const float* res, const float* gamma, const float* xn_scale,
                    float* xn, std::uint32_t n_tokens, std::uint32_t hidden,
-                   hipStream_t stream) {
+                   hipStream_t stream, DeferredResidual prior) {
   hipLaunchKernelGGL(HcNormFromResKernel, dim3(n_tokens), dim3(kThreads), 0,
-                     stream, res, gamma, xn_scale, xn, hidden);
+                     stream, res, gamma, xn_scale, xn, hidden, prior);
 }
 
 void HcMixEpilogueVec4F16(const __half* xn, const float* gate,
@@ -6844,7 +6884,8 @@ bool HcCombine(float* res, const float* block_out, const float* inject,
                std::uint32_t n_tokens, std::uint32_t hidden,
                std::uint32_t streams, float eps, hipStream_t stream,
                bool decode, bool any_width, __half* xn_half, float* xn_scale,
-               const Exl3PrefillMoeRows* moe, void* xn_q8t) {
+               const Exl3PrefillMoeRows* moe, void* xn_q8t, float* defer_w,
+               DeferredResidual prior) {
   // One block per token wants a batch: a decode step keeps the
   // one-block-per-stream kernel's parallelism.
   if (!decode && (n_tokens >= 16 || any_width) && streams == 4 &&
@@ -6853,23 +6894,35 @@ bool HcCombine(float* res, const float* block_out, const float* inject,
     xn_q8t = gamma != nullptr ? xn_q8t : nullptr;
     const bool side = xn_half != nullptr || xn_q8t != nullptr;
     xn_scale = side ? xn_scale : nullptr;
+    // Deferral needs the recomputing consumers: a deferred norm (xn_scale).
+    if (defer_w != nullptr && (xn_scale == nullptr || moe != nullptr))
+      throw std::invalid_argument(
+          "HC combine: a deferred update needs a deferred norm and no MoE");
     if (moe != nullptr) {
       hipLaunchKernelGGL((HcCombineVec4Kernel<float, false, false, true>),
                          dim3(n_tokens), dim3(kThreads), 0, stream, res,
                          block_out, inject, inject_parts, gamma, xn, xn_q8t,
                          hidden, eps, nullptr, nullptr, nullptr, xn_half,
-                         xn_scale, *moe);
+                         xn_scale, *moe, prior);
+    } else if (defer_w != nullptr) {
+      hipLaunchKernelGGL((HcCombineVec4Kernel<float, true>), dim3(n_tokens),
+                         dim3(kThreads), 0, stream, res, block_out, inject,
+                         inject_parts, gamma, xn, xn_q8t, hidden, eps, defer_w,
+                         nullptr, nullptr, xn_half, xn_scale,
+                         Exl3PrefillMoeRows{}, prior);
     } else {
       hipLaunchKernelGGL(HcCombineVec4Kernel<float>, dim3(n_tokens),
                          dim3(kThreads), 0, stream, res, block_out, inject,
                          inject_parts, gamma, xn, xn_q8t, hidden, eps, nullptr,
-                         nullptr, nullptr, xn_half, xn_scale);
+                         nullptr, nullptr, xn_half, xn_scale,
+                         Exl3PrefillMoeRows{}, prior);
     }
     return side;
   }
-  if (moe != nullptr)
+  if (moe != nullptr || defer_w != nullptr || prior.block_out != nullptr)
     throw std::invalid_argument(
-        "HC combine: the fused MoE output needs the four-lane prefill kernel");
+        "HC combine: fused MoE and deferred updates need the four-lane "
+        "prefill kernel");
   hipLaunchKernelGGL(HcCombineKernel<float>, dim3(n_tokens, streams),
                      dim3(kThreads), 0, stream, res, block_out, inject,
                      inject_parts, gamma, xn, nullptr, hidden, streams, eps,
@@ -6967,7 +7020,7 @@ bool HcCombineF16(float* res, const float* block_out, const float* inject,
     hipLaunchKernelGGL(combine, dim3(n_tokens), dim3(kThreads), 0, stream, res,
                        block_out, inject, inject_parts, gamma, xn, xn_q8,
                        hidden, eps, defer_w, nullptr, nullptr, nullptr, nullptr,
-                       Exl3PrefillMoeRows{});
+                       Exl3PrefillMoeRows{}, DeferredResidual{});
     return defer_w != nullptr;
   }
   hipLaunchKernelGGL(HcCombineKernel<__half>, dim3(n_tokens, streams),
