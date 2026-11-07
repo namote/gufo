@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
 namespace q = gufo::models::qwen38_flash_next::rocm;
 namespace {
@@ -188,8 +189,182 @@ void CheckFusedProjection(std::uint32_t tokens) {
 
 }  // namespace
 
+/// Random Q8_0 blocks (F16 scale, 32 codes) for `blocks` blocks; every
+/// 17th block has a zero scale.
+std::vector<std::uint8_t> MakeQ8_0(std::size_t blocks, std::uint32_t seed) {
+  std::vector<std::uint8_t> bytes(blocks * 34);
+  for (std::size_t b = 0; b < blocks; ++b) {
+    const float d =
+        b % 17 == 3 ? 0.0F
+                    : 1.0e-3F * static_cast<float>(1 + NextRandom(&seed) % 64);
+    const __half h = __float2half(d);
+    std::memcpy(bytes.data() + b * 34, &h, 2);
+    for (int i = 0; i < 32; ++i)
+      bytes[b * 34 + 2 + i] = static_cast<std::uint8_t>(NextRandom(&seed));
+  }
+  return bytes;
+}
+
+template<typename T>
+std::vector<T> DownloadRaw(const T* source, std::size_t count) {
+  std::vector<T> values(count);
+  CheckHip(hipMemcpy(values.data(), source, count * sizeof(T),
+                     hipMemcpyDeviceToHost),
+           "download");
+  return values;
+}
+
+// The fused decode HC projections (down + SiLU/Q8_1, up + mix epilogue)
+// against qfn_mmq's GEMVs, SiluScaleQ8_1 and HcMixEpilogue, byte for byte,
+// for every decode width, twice (arrival counters wrap back to zero).
+void CheckFusedDecodeHc() {
+  constexpr std::uint32_t kRank = 320;
+  constexpr std::uint32_t kHcDim = kHidden * kStreams;
+  constexpr std::uint32_t kRows = q::kHcDecodeMaxRows;
+  const std::uint32_t parts = q::HcInjectParts(kHidden);
+  const auto down = MakeQ8_0(std::size_t{kRank} * kHcDim / 32, 0x51EDU);
+  const auto up = MakeQ8_0(std::size_t{kHcDim} * kRank / 32, 0x7A11U);
+  auto xn = MakeValues(std::size_t{kRows} * kHcDim, 0xC0DEU, 0.5F);
+  // A zero block, a signed zero and subnormals in the norm rows.
+  for (std::uint32_t i = 0; i < 32; ++i)
+    xn[64 + i] = 0.0F;
+  xn[200] = -0.0F;
+  xn[201] = 1.0e-40F;
+  xn[202] = -2.0e-39F;
+  const auto inject_w =
+      MakeValues(std::size_t{kStreams} * kHcDim, 0xFEEDU, 0.1F);
+  std::vector<std::uint16_t> suh(kHidden);
+  std::uint32_t seed = 0x5EEDU;
+  for (auto& h : suh) {
+    const __half v = __float2half(NextRandom(&seed) & 1U ? 1.0F : -1.0F);
+    std::memcpy(&h, &v, 2);
+  }
+  const std::size_t xq_bytes = qfn_mmq_q8_1_bytes(kRows, kHcDim);
+  const std::size_t lo_bytes = qfn_mmq_q8_1_bytes(kRows, kRank);
+  const std::size_t mixed_bytes = qfn_mmq_q8_1_bytes(kRows, kHidden);
+  const std::uint32_t lo_cols =
+      static_cast<std::uint32_t>(qfn_mmq_q8_1_bytes(1, kRank) / 36 * 32);
+  const std::size_t slab = std::size_t{2} * 8 * kHidden;  // two consumers
+  void *d_down, *d_up, *d_xq, *d_suh;
+  CheckHip(hipMalloc(&d_down, down.size()), "hipMalloc");
+  CheckHip(hipMalloc(&d_up, up.size()), "hipMalloc");
+  CheckHip(hipMalloc(&d_xq, xq_bytes), "hipMalloc");
+  CheckHip(hipMalloc(&d_suh, suh.size() * 2), "hipMalloc");
+  CheckHip(hipMemcpy(d_down, down.data(), down.size(), hipMemcpyHostToDevice),
+           "upload");
+  CheckHip(hipMemcpy(d_up, up.data(), up.size(), hipMemcpyHostToDevice),
+           "upload");
+  CheckHip(hipMemcpy(d_suh, suh.data(), suh.size() * 2, hipMemcpyHostToDevice),
+           "upload");
+  HipBuffer<float> d_xn(std::size_t{kRows} * kHcDim);
+  HipBuffer<float> d_inject_w(std::size_t{kStreams} * kHcDim);
+  Upload(&d_xn, xn);
+  Upload(&d_inject_w, inject_w);
+  struct Outputs {
+    HipBuffer<float> lo{std::size_t{kRows} * kRank};
+    HipBuffer<float> gate{std::size_t{kRows} * kHcDim};
+    HipBuffer<float> mixed{std::size_t{kRows} * kHidden};
+    HipBuffer<float> inject{std::size_t{kRows} * kStreams * 16};
+    HipBuffer<std::uint8_t> lo_q8;
+    HipBuffer<std::uint8_t> mixed_q8;
+    HipBuffer<std::uint16_t> slabs;
+    Outputs(std::size_t lo_b, std::size_t mixed_b, std::size_t slab_n)
+        : lo_q8(lo_b), mixed_q8(mixed_b), slabs(slab_n) {}
+  };
+  Outputs ref(lo_bytes, mixed_bytes, slab), fused(lo_bytes, mixed_bytes, slab);
+  for (Outputs* o : {&ref, &fused}) {
+    CheckHip(hipMemset(o->lo_q8.get(), 0, lo_bytes), "memset");
+    CheckHip(hipMemset(o->mixed_q8.get(), 0, mixed_bytes), "memset");
+    CheckHip(hipMemset(o->slabs.get(), 0, slab * 2), "memset");
+  }
+  std::uint32_t* d_arrivals;
+  CheckHip(hipMalloc(&d_arrivals, q::kHcArrivals * 4), "hipMalloc");
+  CheckHip(hipMemset(d_arrivals, 0, q::kHcArrivals * 4), "memset");
+  const float scale = 1.0F / kStreams;
+  bool ok = true;
+  for (int pass = 0; pass < 2; ++pass) {
+    for (std::uint32_t rows = 1; rows <= kRows; ++rows) {
+      if (qfn_mmq_quantize_q8_1(d_xn.get(), d_xq, static_cast<int>(rows),
+                                static_cast<int>(kHcDim), nullptr) != 0)
+        throw std::runtime_error("quantize_q8_1 failed");
+      const auto slabs_of = [&](Outputs& o) {
+        q::Exl3InputSlabs s{};
+        s.suh[0] = static_cast<const std::uint16_t*>(d_suh);
+        s.suh[1] = static_cast<const std::uint16_t*>(d_suh);
+        s.out = o.slabs.get();
+        s.count = 2;
+        s.pass_rows = rows;
+        s.k = kHidden;
+        return s;
+      };
+      // Reference: the four separate launches.
+      if (qfn_mmq_q8_0_dense_vec_preq(
+              d_down, nullptr, d_xq, ref.lo.get(), static_cast<int>(kRank),
+              static_cast<int>(rows), static_cast<int>(kHcDim), nullptr) != 0 ||
+          !q::SiluScaleQ8_1(ref.lo.get(), scale, rows, kRank, lo_cols,
+                            ref.lo_q8.get(), nullptr) ||
+          qfn_mmq_q8_0_dense_vec_preq(d_up, nullptr, ref.lo_q8.get(),
+                                      ref.gate.get(), static_cast<int>(kHcDim),
+                                      static_cast<int>(rows),
+                                      static_cast<int>(kRank), nullptr) != 0)
+        throw std::runtime_error("reference HC projections failed");
+      const bool ref_rot = q::HcMixEpilogue(
+          d_xn.get(), ref.gate.get(), d_inject_w.get(), ref.mixed.get(),
+          ref.inject.get(), rows, kHidden, kStreams, nullptr,
+          ref.mixed_q8.get(), slabs_of(ref));
+      q::HcDownSiluQ8_1(d_down, d_xq, fused.lo.get(), scale, rows, lo_cols,
+                        fused.lo_q8.get(), d_arrivals, nullptr);
+      const bool fused_rot = q::HcUpMix(
+          d_up, fused.lo_q8.get(), lo_cols / 32, kRank, fused.gate.get(),
+          d_xn.get(), d_inject_w.get(), fused.mixed.get(), fused.inject.get(),
+          rows, kHidden, nullptr, fused.mixed_q8.get(), slabs_of(fused),
+          d_arrivals + 1);
+      CheckHip(hipDeviceSynchronize(), "fused decode HC");
+      const auto same = [](const auto& a, const auto& b) {
+        return a.size() == b.size() &&
+               std::memcmp(a.data(), b.data(), a.size() * sizeof(a[0])) == 0;
+      };
+      const bool lo_ok = same(DownloadRaw(ref.lo.get(), rows * kRank),
+                              DownloadRaw(fused.lo.get(), rows * kRank)) &&
+                         same(DownloadRaw(ref.lo_q8.get(), lo_bytes),
+                              DownloadRaw(fused.lo_q8.get(), lo_bytes));
+      const bool gate_ok = same(DownloadRaw(ref.gate.get(), rows * kHcDim),
+                                DownloadRaw(fused.gate.get(), rows * kHcDim));
+      const bool mix_ok =
+          ref_rot && fused_rot &&
+          same(DownloadRaw(ref.mixed.get(), rows * kHidden),
+               DownloadRaw(fused.mixed.get(), rows * kHidden)) &&
+          same(DownloadRaw(ref.mixed_q8.get(), mixed_bytes),
+               DownloadRaw(fused.mixed_q8.get(), mixed_bytes)) &&
+          same(DownloadRaw(ref.inject.get(), rows * kStreams * parts),
+               DownloadRaw(fused.inject.get(), rows * kStreams * parts)) &&
+          same(DownloadRaw(ref.slabs.get(), slab),
+               DownloadRaw(fused.slabs.get(), slab));
+      const auto counters = DownloadRaw(d_arrivals, q::kHcArrivals);
+      const bool counters_ok =
+          std::all_of(counters.begin(), counters.end(),
+                      [](std::uint32_t v) { return v == 0; });
+      if (!lo_ok || !gate_ok || !mix_ok || !counters_ok) {
+        std::cerr << "fused decode HC rows " << rows << " pass " << pass
+                  << ": lo " << lo_ok << " gate " << gate_ok << " mix "
+                  << mix_ok << " counters " << counters_ok << '\n';
+        ok = false;
+      }
+    }
+  }
+  (void)hipFree(d_arrivals);
+  (void)hipFree(d_down);
+  (void)hipFree(d_up);
+  (void)hipFree(d_xq);
+  (void)hipFree(d_suh);
+  if (!ok)
+    throw std::runtime_error("fused decode HC projections differ");
+  std::cout << "fused decode HC projections: rows 1-8 byte-identical\n";
+}
+
 int main() {
   try {
+    CheckFusedDecodeHc();
     CheckFusedProjection(96);
     CheckFusedProjection(2049);
     constexpr std::size_t kHcDim = static_cast<std::size_t>(kHidden) * kStreams;

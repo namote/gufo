@@ -1420,6 +1420,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   };
   s.xn_q8_1 = q8_1(hc_dim);
   s.lo_q8_1 = q8_1(c.hc_low_rank);
+  s.hc_arrivals = Alloc<std::uint32_t>(a, kHcArrivals, error_msg);
   s.mixed_q8_1 = q8_1(hidden);
   s.gdn_q8_1 = q8_1(c.SsmValueDim());
   s.ctx_q8_1 = q8_1(c.AttentionQDim());
@@ -3135,6 +3136,16 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   const bool q8_decode_down = !q8_down && model_->output().exl3 != nullptr &&
                               !xn_half_ && !MatrixRows(n_tokens) &&
                               !m.down_q8.empty();
+  // EXL3 decode/verify: the down projection's last block applies SiLU and
+  // quantizes lo for the up projection, whose last block per chunk runs the
+  // mix epilogue (two launches instead of four, the same arithmetic).
+  const bool fused_decode =
+      q8_decode_down && n_tokens <= kHcDecodeMaxRows && c.hc_count == 4 &&
+      c.hc_low_rank == 320 && m.down_q8.rows == 320 &&
+      m.down_q8.cols == 10240 && m.up.type == GgmlType::kQ8_0 &&
+      m.up.rows == c.HcDim() && m.up.cols == c.hc_low_rank &&
+      c.hidden_size % 256 == 0 && c.hidden_size / 256 <= kHcUpMaxChunks &&
+      UnpaddedQ8(c.HcDim()) && s_.hc_arrivals != nullptr;
   const bool fused_down =
       !q8_down && !q8_decode_down && model_->output().exl3 != nullptr &&
       !xn_half_ && !MatrixRows(n_tokens) && m.down.type == GgmlType::kF16 &&
@@ -3147,6 +3158,9 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       !xn_half_ && extras && c.hc_count == 4 && c.hidden_size % 4 == 0 &&
       m.up.type == GgmlType::kQ8_0 && m.up.rows % 8 == 0 &&
       DenseF16Route(m.up, n_tokens) && m.up.cols <= half_input_cols_;
+  const float scale = 1.0F / static_cast<float>(c.hc_count);
+  const std::uint32_t lo_q8_cols = static_cast<std::uint32_t>(
+      qfn_mmq_q8_1_bytes(1, static_cast<int>(c.hc_low_rank)) / 36 * 32);
   if (fused_projection) {
     // The up projection writes x_half; keep its input in the gate buffer.
     if (!HcDownF16Gemm(m.down.data, s_.xn_q8t,
@@ -3163,6 +3177,12 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
         AssignError(error_msg, "W8A8 mixer down projection failed");
         return false;
       }
+    } else if (fused_decode) {
+      Q8Input q;
+      if (!Quantize(s_.xn, n_tokens, m.down_q8.cols, &q, error_msg, true))
+        return false;
+      HcDownSiluQ8_1(m.down_q8.data, q.data, s_.lo, scale, n_tokens, lo_q8_cols,
+                     s_.lo_q8_1, s_.hc_arrivals, stream_);
     } else if (q8_decode_down) {
       if (!Dense(m.down_q8, s_.xn, s_.lo, n_tokens, error_msg))
         return false;
@@ -3171,13 +3191,12 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
     } else if (!Dense(m.down, s_.xn, s_.lo, n_tokens, error_msg)) {
       return false;
     }
-    const float scale = 1.0F / static_cast<float>(c.hc_count);
-    const std::uint32_t lo_q8_cols = static_cast<std::uint32_t>(
-        qfn_mmq_q8_1_bytes(1, static_cast<int>(c.hc_low_rank)) / 36 * 32);
-    if (!MatrixRows(n_tokens) && m.up.type == GgmlType::kQ8_0 &&
-        m.up.cols == c.hc_low_rank &&
-        SiluScaleQ8_1(s_.lo, scale, n_tokens, c.hc_low_rank, lo_q8_cols,
-                      s_.lo_q8_1, stream_)) {
+    if (fused_decode) {
+      // The up projection runs with the epilogue below.
+    } else if (!MatrixRows(n_tokens) && m.up.type == GgmlType::kQ8_0 &&
+               m.up.cols == c.hc_low_rank &&
+               SiluScaleQ8_1(s_.lo, scale, n_tokens, c.hc_low_rank, lo_q8_cols,
+                             s_.lo_q8_1, stream_)) {
       const Q8Input lo{s_.lo, s_.lo_q8_1, n_tokens, c.hc_low_rank};
       if (!Dense(m.up, lo, s_.hc_gate, error_msg)) {
         return false;
@@ -3285,9 +3304,17 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
     // read it next (GDN qkv/z, attention q/k/v or the shared MLP), removing
     // their separate rotation launch; the same rounded FP16 values.
     const auto slabs = Exl3Slabs(rotate_for, n_tokens);
-    if (HcMixEpilogue(xn, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr,
-                      mixed, inject, n_tokens, c.hidden_size, c.hc_count,
-                      stream_, q8 ? s_.mixed_q8_1 : nullptr, slabs))
+    const bool rotated =
+        fused_decode
+            ? HcUpMix(m.up.data, s_.lo_q8_1, lo_q8_cols / 32, m.up.cols,
+                      s_.hc_gate, xn, fused_inject ? m.inject.f32() : nullptr,
+                      mixed, inject, n_tokens, c.hidden_size, stream_,
+                      q8 ? s_.mixed_q8_1 : nullptr, slabs, s_.hc_arrivals + 1)
+            : HcMixEpilogue(xn, s_.hc_gate,
+                            fused_inject ? m.inject.f32() : nullptr, mixed,
+                            inject, n_tokens, c.hidden_size, c.hc_count,
+                            stream_, q8 ? s_.mixed_q8_1 : nullptr, slabs);
+    if (rotated)
       NoteExl3Rotated(slabs, mixed, n_tokens, rotate_for);
     if (q8) {
       mixed_q8_ready_ = {mixed, s_.mixed_q8_1, n_tokens, c.hidden_size};

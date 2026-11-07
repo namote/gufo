@@ -848,6 +848,8 @@ private:
     float* inject;
     float* block_out;
     float* hc_defer_w;  ///< [t][4] stream weights of a deferred combine
+    /// Arrival counters of the fused decode HC projections (kHcArrivals).
+    std::uint32_t* hc_arrivals{nullptr};
     /// [t][4] stream norm scales of a combine that left s_.xn unwritten.
     float* xn_scale{nullptr};
     // linear attention

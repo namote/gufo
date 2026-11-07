@@ -355,6 +355,34 @@ void SiluScale(float* x, float scale, std::size_t count, hipStream_t stream);
 /// k_padded >= k are multiples of 32.
 bool SiluScaleQ8_1(float* x, float scale, std::uint32_t rows, std::uint32_t k,
                    std::uint32_t k_padded, void* x_q8, hipStream_t stream);
+/// Rows (decode/verify tokens) the fused HC decode projections take, and
+/// hidden chunks of 256 columns HcUpMix counts arrivals for.
+constexpr std::uint32_t kHcDecodeMaxRows = 8;
+constexpr std::uint32_t kHcUpMaxChunks = 16;
+/// Arrival counters HcDownSiluQ8_1 (one) and HcUpMix (one per chunk) need,
+/// zero-initialized; each launch leaves them at zero again.
+constexpr std::uint32_t kHcArrivals = 1 + kHcUpMaxChunks;
+/// The decode HC down projection (Q8_0 weights, 320 x 10240) of `rows`
+/// Q8_1 input rows into lo, then SiluScaleQ8_1(lo, scale, rows, 320,
+/// k_padded, lo_q8) in the same launch: the last block to finish runs it.
+/// Same arithmetic as qfn_mmq_q8_0_dense_vec_preq plus SiluScaleQ8_1.
+/// `arrivals` is one counter (kHcArrivals' first). Throws on an unsupported
+/// call.
+void HcDownSiluQ8_1(const void* weights, const void* input, float* lo,
+                    float scale, std::uint32_t rows, std::uint32_t k_padded,
+                    void* lo_q8, std::uint32_t* arrivals, hipStream_t stream);
+/// The decode HC up projection (Q8_0 weights, 4 * hidden x k) of the Q8_1
+/// rows lo_q8 (`lo_stride` blocks apart) into gate, then HcMixEpilogue
+/// (four streams) in the same launch: the last block of each 256-column
+/// chunk runs that chunk's epilogue. Same arithmetic as the Q8_0 GEMV plus
+/// HcMixEpilogue; returns whether `slabs` were written. `arrivals` holds
+/// hidden / 256 counters. Throws on an unsupported call.
+bool HcUpMix(const void* weights, const void* lo_q8, std::uint32_t lo_stride,
+             std::uint32_t k, float* gate, const float* xn,
+             const float* inject_w, float* mixed, float* inject,
+             std::uint32_t rows, std::uint32_t hidden, hipStream_t stream,
+             void* mixed_q8, const Exl3InputSlabs& slabs,
+             std::uint32_t* arrivals);
 /// gate[i] = silu(gate[i]) * up[i], in place in `gate`.
 void Swiglu(float* gate, const float* up, std::size_t count,
             hipStream_t stream);
