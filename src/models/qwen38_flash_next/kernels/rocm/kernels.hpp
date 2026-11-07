@@ -166,18 +166,28 @@ struct RollbackRows {
   float* rows[7]{};
 };
 
-// Recurrent rollback keeps the state after the first token, then exact
-// FP32 keys/decays/betas/errors for later tokens. No inverse or quantization.
+// Recurrent rollback of an n-token speculative batch (n > 1): the batch
+// leaves the live state at its value before the batch and records each
+// token's exact FP32 keys/decays/betas/errors (record t in row t, the last
+// token's record after row 0's); RestoreGdnState then replays the kept
+// prefix in place. No inverse, quantization or full-state snapshot.
+constexpr std::size_t GdnRollbackRecordFloats(std::uint32_t k_heads,
+                                              std::uint32_t v_heads,
+                                              std::uint32_t dim) {
+  return std::size_t{k_heads} * dim + v_heads * (dim + 2);
+}
 constexpr std::size_t GdnRollbackRowFloats(std::uint32_t row,
                                            std::uint32_t k_heads,
                                            std::uint32_t v_heads,
                                            std::uint32_t dim) {
-  return row == 0 ? std::size_t{v_heads} * dim * dim
-                  : std::size_t{k_heads} * dim + v_heads * (dim + 2);
+  return (row == 0 ? 2 : 1) * GdnRollbackRecordFloats(k_heads, v_heads, dim);
 }
+/// Commits `keep` (1..n) tokens of a deferred n-token speculative batch to
+/// `state`, the arithmetic of the recurrence (bit for bit its final state
+/// for keep == n).
 void RestoreGdnState(float* state, RollbackRows snapshots, std::uint32_t keep,
-                     std::uint32_t k_heads, std::uint32_t v_heads,
-                     hipStream_t stream);
+                     std::uint32_t n, std::uint32_t k_heads,
+                     std::uint32_t v_heads, hipStream_t stream);
 
 /// GGUF type ids the runtime accepts for the small-matrix and lookup paths.
 enum class WeightType : std::uint32_t {
@@ -557,9 +567,12 @@ struct GdnCheckpoint {
 /// [t][alpha(v_heads) | beta(v_heads)]. Outputs the normalized,
 /// sigmoid-gated attention rows [tokens][v_heads*d] ready for the output
 /// projection.
-/// `state_snapshots` ([n_tokens-1][v_heads*d*d]) and `conv_snapshots`
-/// ([n_tokens-1][(kernel-1)*channels]), when populated, receive the state after
-/// each proper prefix. The live state already holds the full batch.
+/// `conv_snapshots` ([n_tokens-1][(kernel-1)*channels]), when populated,
+/// receive the convolution history after each proper prefix; the live
+/// history holds the full batch. Populated `state_snapshots` (rows of
+/// GdnRollbackRowFloats, n_tokens > 1) receive every token's update record
+/// instead, and the live recurrent state keeps its value before the batch
+/// until RestoreGdnState commits the kept prefix.
 /// Scratch: `conv_scratch` ((n_tokens + kernel) * channels), `qn`/`kn`
 /// (n_tokens * k_heads * d), `raw` (n_tokens * v_heads * d).
 /// `qkv` rows are `qkv_stride` floats apart and `z` rows `z_stride`, so a

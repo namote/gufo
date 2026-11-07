@@ -352,8 +352,9 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
       }
     }
     if (kTokens <= 8) {
-      // Every rollback prefix must match a fresh forward of that prefix.
-      // The final state stays live; no snapshot may be written for it.
+      // Every committed prefix must match a fresh forward of that prefix.
+      // The batch leaves the state it started from and writes compact
+      // per-token records only.
       constexpr std::size_t kGuard = 32;
       constexpr float kSentinel = 12345.0F;
       const std::size_t saved = kTokens - 1;
@@ -424,7 +425,9 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
           Download(&conv_snaps, saved * kConvState + kGuard);
       const auto final_state = Download(&current_state, kStateCount);
       const auto final_out = Download(&current_out, kOut);
-      if (std::memcmp(final_state.data(), states[0].data(),
+      // Deferred (n > 1): the state the batch started from.
+      const auto& live_state = kTokens > 1 ? state : states[0];
+      if (std::memcmp(final_state.data(), live_state.data(),
                       kStateCount * sizeof(float)) ||
           std::memcmp(final_out.data(), outs[0].data(), kOut * sizeof(float))) {
         throw std::runtime_error("GDN snapshots changed the full forward");
@@ -453,7 +456,8 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
           if (saved_states[end + i] != kSentinel)
             throw std::runtime_error("GDN overwrote a compact rollback row");
       }
-      for (std::uint32_t keep = 1; keep < kTokens; ++keep) {
+      // A one-token batch updates in place and records nothing.
+      for (std::uint32_t keep = 1; kTokens > 1 && keep <= kTokens; ++keep) {
         forward(keep, nullptr, nullptr, true);
         const auto expected_state = Download(&current_state, kStateCount);
         const auto expected_conv = Download(&current_conv, kConvState);
@@ -467,9 +471,14 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
           const auto h = index / (kDim * kDim);
           const auto j = (index / kDim) % kDim;
           const auto k = index % kDim;
-          float value = saved_states[state_offsets[0] + index];
-          for (std::uint32_t t = 1; t < keep; ++t) {
-            const auto* update = saved_states.data() + state_offsets[t];
+          float value = state[index];
+          for (std::uint32_t t = 0; t < keep; ++t) {
+            const auto* update =
+                saved_states.data() +
+                (t + 1 == kTokens && t != 0
+                     ? state_offsets[0] +
+                           q::GdnRollbackRecordFloats(kKHeads, kVHeads, kDim)
+                     : state_offsets[t]);
             const float key = update[(h % kKHeads) * kDim + k];
             const float decay = update[kKHeads * kDim + h];
             const float beta = update[kKHeads * kDim + kVHeads + h];
@@ -487,14 +496,16 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
         q::RollbackRows replay;
         for (std::size_t i = 0; i < saved; ++i)
           replay.rows[i] = state_snaps.get() + state_offsets[i];
-        q::RestoreGdnState(current_state.get(), replay, keep, kKHeads, kVHeads,
-                           nullptr);
+        Upload(&current_state, state);
+        q::RestoreGdnState(current_state.get(), replay, keep, kTokens, kKHeads,
+                           kVHeads, nullptr);
         const auto restored_state = Download(&current_state, kStateCount);
         if (std::memcmp(expected_state.data(), restored_state.data(),
                         kStateCount * sizeof(float)) ||
-            std::memcmp(expected_conv.data(),
-                        saved_convs.data() + (saved - keep) * kConvState,
-                        kConvState * sizeof(float))) {
+            (keep < kTokens &&
+             std::memcmp(expected_conv.data(),
+                         saved_convs.data() + (saved - keep) * kConvState,
+                         kConvState * sizeof(float)))) {
           throw std::runtime_error("GDN rollback prefix changed state");
         }
       }
@@ -917,6 +928,13 @@ int RunStableDecodeCase(std::uint32_t kTokens) {
                      {cp_state.get(), cp_history.get(), prefix}, 0, nullptr,
                      nullptr, true);
     CheckHip(hipDeviceSynchronize(), "stable decode GDN verify");
+    // The verify batch left the state it started from; committing every
+    // token must give the full forward's state bit for bit.
+    if (!bytes_equal(Download(&d_state, kStateCount), state))
+      throw std::runtime_error("stable decode verify wrote its state early");
+    q::RestoreGdnState(d_state.get(), states, kTokens, kTokens, kKHeads,
+                       kVHeads, nullptr);
+    CheckHip(hipDeviceSynchronize(), "stable decode GDN commit");
     const Result verified{Download(&d_out, kOut),
                           Download(&d_state, kStateCount),
                           Download(&d_conv_state, kConvState)};

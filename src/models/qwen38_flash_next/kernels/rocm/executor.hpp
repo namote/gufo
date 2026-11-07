@@ -195,7 +195,7 @@ private:
     float* conv_state{nullptr};    ///< [kernel-1][channels]
     float* state{nullptr};         ///< [v_heads][d][d]
     RollbackRows conv_snapshots;   ///< [max_spec-1][kernel-1][channels]
-    RollbackRows state_snapshots;  ///< [max_spec-1][v_heads][d][d]
+    RollbackRows state_snapshots;  ///< GdnRollbackRowFloats records
   };
   struct AttentionState {
     const qwen::vision::DeviceRope* rope{nullptr};
@@ -1087,6 +1087,13 @@ private:
   };
   mutable ReadyRows xn_q8_ready_;
   mutable ReadyRows mixed_q8_ready_;
+  /// Replays `keep` of the deferred n-token speculative batch into every
+  /// recurrent state (nothing for n <= 1).
+  bool CommitGdnStates(Session& session, std::uint32_t keep, std::uint32_t n,
+                       std::string* error_msg) const;
+  /// Keeps all of a speculative batch that was never rolled back (before a
+  /// new forward overwrites its records).
+  bool CommitPendingSpeculation(Session& session, std::string* error_msg) const;
   /// Rows of `x` a producer epilogue rotated into exl3_.rotated_input for the
   /// decode projections `consumers` (slab c for consumer c); consumed by the
   /// first matching TakeExl3Rotated, cleared whenever HcMix rewrites mixed.

@@ -2061,9 +2061,11 @@ std::size_t Executor::SessionBytes(
   const auto rollback_state =
       rollback_depth == 0
           ? 0
-          : state + (rollback_depth - 1) *
-                        GdnRollbackRowFloats(1, c.ssm_num_k_heads,
-                                             c.ssm_num_v_heads, c.ssm_head_dim);
+          : GdnRollbackRowFloats(0, c.ssm_num_k_heads, c.ssm_num_v_heads,
+                                 c.ssm_head_dim) +
+                (rollback_depth - 1) *
+                    GdnRollbackRowFloats(1, c.ssm_num_k_heads,
+                                         c.ssm_num_v_heads, c.ssm_head_dim);
   return ((linear * conv + ple) * (rollback_depth + 1) +
           linear * (state + rollback_state)) *
              sizeof(float) +
@@ -4774,6 +4776,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     session.ngram_ = ngram;
     throw;
   }
+  if (!CommitPendingSpeculation(session, error_msg))
+    return false;
   ++session.mutation_epoch_;
   session.spec_base_ = start_pos;
   session.spec_tokens_ = speculative ? n : 0;
@@ -5050,6 +5054,30 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
   return true;
 }
 
+bool Executor::CommitGdnStates(Session& session, std::uint32_t keep,
+                               std::uint32_t n, std::string* error_msg) const {
+  if (n <= 1)
+    return true;  // a one-token batch updates its state in place
+  const Config& c = config();
+  for (auto& l : session.linear_) {
+    if (l.state == nullptr)
+      continue;
+    RestoreGdnState(l.state, l.state_snapshots, keep, n, c.ssm_num_k_heads,
+                    c.ssm_num_v_heads, stream_);
+    if (!Check(hipGetLastError(), "state commit", error_msg))
+      return false;
+  }
+  return true;
+}
+
+bool Executor::CommitPendingSpeculation(Session& session,
+                                        std::string* error_msg) const {
+  // A pending batch nobody rolled back keeps every token, as the in-place
+  // recurrence did before deferral.
+  const auto n = std::exchange(session.spec_tokens_, 0U);
+  return CommitGdnStates(session, n, n, error_msg);
+}
+
 bool Executor::Rollback(Session& session, std::uint32_t keep,
                         std::string* error_msg, float* logits) const {
   const Config& c = config();
@@ -5074,6 +5102,10 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
              "frontier download", error_msg)) {
     return false;
   }
+  // The batch left each recurrent state at its value before the batch:
+  // commit the kept prefix, accepted in full or not.
+  if (!CommitGdnStates(session, keep, n, error_msg))
+    return false;
   if (keep == n && logits == nullptr) {
     return true;
   }
@@ -5085,10 +5117,7 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
       if (l.state == nullptr) {
         continue;
       }
-      RestoreGdnState(l.state, l.state_snapshots, keep, c.ssm_num_k_heads,
-                      c.ssm_num_v_heads, stream_);
-      if (!Check(hipGetLastError(), "state rollback", error_msg) ||
-          !Check(hipMemcpyAsync(l.conv_state, l.conv_snapshots.rows[slot],
+      if (!Check(hipMemcpyAsync(l.conv_state, l.conv_snapshots.rows[slot],
                                 conv_elems * sizeof(float),
                                 hipMemcpyDeviceToDevice, stream_),
                  "conv rollback", error_msg)) {

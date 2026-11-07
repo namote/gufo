@@ -944,6 +944,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
   for (std::size_t i = 0; i < items.size(); ++i) {
     const auto& item = items[i];
     auto& session = *item.session;
+    if (!CommitPendingSpeculation(session, error))
+      return false;
     ++session.mutation_epoch_;
     session.spec_base_ = session.position_;
     session.spec_tokens_ = item.speculative ? item.tokens.size() : 0;

@@ -2345,6 +2345,16 @@ constexpr unsigned kGdnRowsPerBlock = 32;
 // the last element of each lane, fusing the state decay into that result.
 // HIP's FP intrinsics alone still permit reassociation of this three-product
 // expression under fast-math. Keep its actual instruction sequence explicit.
+/// Record t of an n-token deferred speculative batch (GdnRollbackRowFloats).
+__device__ __forceinline__ float* GdnRecord(const RollbackRows& rows,
+                                            std::uint32_t t, std::uint32_t n,
+                                            std::uint32_t k_heads,
+                                            std::uint32_t v_heads) {
+  return t + 1 == n && t != 0
+             ? rows.rows[0] + GdnRollbackRecordFloats(k_heads, v_heads, kGdnDim)
+             : rows.rows[t];
+}
+
 __device__ __forceinline__ float GdnLastUpdate(float state, float decay,
                                                float error, float key,
                                                float beta) {
@@ -2396,6 +2406,9 @@ __global__ void GdnKernel(const float* conv_out, const float* qn,
     row[i] = S[i];
   }
   const float q_scale = rsqrtf(static_cast<float>(d));
+  const bool deferred = (kBatch ? batch[blockIdx.z].state_snapshots.rows[0]
+                                : snapshots.rows[0]) != nullptr &&
+                        n_tokens > 1;
   for (std::uint32_t t = 0; t < n_tokens; ++t) {
     const float* q = qn + (static_cast<std::size_t>(t) * k_heads + kh) * d + i0;
     const float* k = kn + (static_cast<std::size_t>(t) * k_heads + kh) * d + i0;
@@ -2447,32 +2460,28 @@ __global__ void GdnKernel(const float* conv_out, const float* qn,
           target[i] = row[i];
       }
     }
-    if ((kBatch ? batch[blockIdx.z].state_snapshots.rows[0]
-                : snapshots.rows[0]) != nullptr &&
-        t + 1 < n_tokens) {
-      float* snap = kBatch ? batch[blockIdx.z].state_snapshots.rows[t]
-                           : snapshots.rows[t];
-      if (t == 0) {
-        snap += static_cast<std::size_t>(h) * d * d + j * d + i0;
+    if (deferred) {
+      float* snap =
+          GdnRecord(kBatch ? batch[blockIdx.z].state_snapshots : snapshots, t,
+                    n_tokens, k_heads, v_heads);
+      if (j == 0 && h < k_heads) {
 #pragma unroll
         for (std::uint32_t i = 0; i < slice; ++i)
-          snap[i] = row[i];
-      } else {
-        if (j == 0 && h < k_heads) {
-#pragma unroll
-          for (std::uint32_t i = 0; i < slice; ++i)
-            snap[h * d + i0 + i] = kr[i];
+          snap[h * d + i0 + i] = kr[i];
+      }
+      if (lane == 0) {
+        if (j == 0) {
+          snap[k_heads * d + h] = decay;
+          snap[k_heads * d + v_heads + h] = b;
         }
-        if (lane == 0) {
-          if (j == 0) {
-            snap[k_heads * d + h] = decay;
-            snap[k_heads * d + v_heads + h] = b;
-          }
-          snap[k_heads * d + 2 * v_heads + h * d + j] = error;
-        }
+        snap[k_heads * d + 2 * v_heads + h * d + j] = error;
       }
     }
   }
+  // A speculative batch keeps the state it started from; RestoreGdnState
+  // commits the accepted prefix from the records (no 3 MB/layer snapshot).
+  if (deferred)
+    return;
 #pragma unroll
   for (std::uint32_t i = 0; i < slice; ++i) {
     S[i] = row[i];
@@ -2480,7 +2489,8 @@ __global__ void GdnKernel(const float* conv_out, const float* qn,
 }
 
 __global__ void RestoreGdnStateKernel(float* state, RollbackRows snapshots,
-                                      std::uint32_t keep, std::uint32_t k_heads,
+                                      std::uint32_t keep, std::uint32_t n,
+                                      std::uint32_t k_heads,
                                       std::uint32_t v_heads) {
   constexpr std::uint32_t d = kGdnDim;
   const std::size_t i = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
@@ -2489,9 +2499,9 @@ __global__ void RestoreGdnStateKernel(float* state, RollbackRows snapshots,
   const auto h = i / (d * d);
   const auto j = (i / d) % d;
   const auto k = i % d;
-  float value = snapshots.rows[0][i];
-  for (std::uint32_t t = 1; t < keep; ++t) {
-    const auto* update = snapshots.rows[t];
+  float value = state[i];
+  for (std::uint32_t t = 0; t < keep; ++t) {
+    const auto* update = GdnRecord(snapshots, t, n, k_heads, v_heads);
     const float key = update[(h % k_heads) * d + k];
     const float decay = update[k_heads * d + h];
     const float beta = update[k_heads * d + v_heads + h];
@@ -8655,11 +8665,11 @@ void PleInject(float* res, const float* gated, const float* conv,
 }
 
 void RestoreGdnState(float* state, RollbackRows snapshots, std::uint32_t keep,
-                     std::uint32_t k_heads, std::uint32_t v_heads,
-                     hipStream_t stream) {
+                     std::uint32_t n, std::uint32_t k_heads,
+                     std::uint32_t v_heads, hipStream_t stream) {
   const auto count = std::size_t{v_heads} * kGdnDim * kGdnDim;
   RestoreGdnStateKernel<<<(count + 255) / 256, 256, 0, stream>>>(
-      state, snapshots, keep, k_heads, v_heads);
+      state, snapshots, keep, n, k_heads, v_heads);
 }
 
 void HistoryPrefix(const float* in, std::uint32_t stride, const float* history,
