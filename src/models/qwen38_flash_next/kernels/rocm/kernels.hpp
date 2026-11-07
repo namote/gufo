@@ -831,6 +831,17 @@ void RouterTopKTiles(const float* logits, std::uint32_t stride,
                      Exl3RouteTile* tiles, std::uint32_t* tile_count,
                      std::uint32_t* arrivals, std::uint32_t tile_rows,
                      hipStream_t stream);
+/// One token's Dense(router) (SmallGemm's rows, m logits of k_in) and
+/// RouterTopKTiles in one launch: the last block to finish selects the
+/// token's experts and builds the tiles. Same arithmetic as the two calls.
+/// False, with nothing launched, for an unsupported weight type or shape.
+bool RouterGemvTopKTiles(const void* w, WeightType type, const float* x,
+                         float* logits, std::uint32_t m, std::uint32_t k_in,
+                         std::int32_t* ids, float* weights,
+                         std::uint32_t n_experts, std::uint32_t k,
+                         Exl3RouteTile* tiles, std::uint32_t* tile_count,
+                         std::uint32_t* arrivals, std::uint32_t tile_rows,
+                         hipStream_t stream);
 
 /// out[t][i] = sum_s weights[t][s] * expert_out[t*k + s][i]
 ///           + sigmoid(gate[t * gate_stride]) * shared[t][i].

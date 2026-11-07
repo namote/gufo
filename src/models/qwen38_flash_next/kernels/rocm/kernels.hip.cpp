@@ -1602,11 +1602,14 @@ __global__ void NarrowKernel(const float* x, T* out, std::size_t count) {
 /// once (four consecutive elements per lane per step) while up to eight
 /// tokens accumulate in registers, then a wave reduction per token.
 constexpr unsigned kSmallGemmRows = 4;
+/// The body runs any whole number of waves per block (RouterGemvTopKTiles
+/// uses eight); each wave's row arithmetic is the same.
 template<WeightType type, unsigned tokens, bool grouped = false,
          bool kWhole = false, bool stable = false, bool kHcDown = false,
          bool kTailVector = false, unsigned kDeepSteps = 0>
-__global__ void SmallGemmKernel(const void* w, const float* x, float* out,
-                                std::uint32_t m, std::uint32_t k) {
+__device__ __forceinline__ void SmallGemmRows(const void* w, const float* x,
+                                              float* out, std::uint32_t m,
+                                              std::uint32_t k) {
   static_assert(!kHcDown || (stable && type == WeightType::kF16));
   if constexpr (grouped) {
     x += std::size_t{blockIdx.y} * tokens * k;
@@ -1752,6 +1755,15 @@ __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
           kHcDown ? SiluF(Materialize(total) * 0.25F) : total;
     }
   }
+}
+
+template<WeightType type, unsigned tokens, bool grouped = false,
+         bool kWhole = false, bool stable = false, bool kHcDown = false,
+         bool kTailVector = false, unsigned kDeepSteps = 0>
+__global__ void SmallGemmKernel(const void* w, const float* x, float* out,
+                                std::uint32_t m, std::uint32_t k) {
+  SmallGemmRows<type, tokens, grouped, kWhole, stable, kHcDown, kTailVector,
+                kDeepSteps>(w, x, out, m, k);
 }
 
 __global__ void PleGateKernel(const float* key_n, const float* query_n,
@@ -4139,24 +4151,32 @@ __global__ void AttentionMergeKernel(const float* partials, float* out,
 // Keep the original block-wide softmax reduction. Selection then stays in
 // one wave's registers, retaining probability ordering and lowest-index ties.
 // Threads past the first wave return early.
-template<unsigned MaxExperts>
+/// kCoherent reads the logits with agent-scope loads, for a caller whose
+/// own grid wrote them (RouterGemvTopKTilesKernel's last block).
+template<unsigned MaxExperts, bool kCoherent = false>
 __device__ __forceinline__ void RouterTopKBody(
     const float* logits, std::uint32_t stride, std::int32_t* ids,
-    float* weights, std::uint32_t n_experts, std::uint32_t k) {
+    float* weights, std::uint32_t n_experts, std::uint32_t k, std::uint32_t t) {
   __shared__ float probs[1024];
   __shared__ float shared[32];
   __shared__ std::uint32_t chosen[32];
   __shared__ float chosen_p[32];
-  const std::uint32_t t = blockIdx.x;
   const float* src = logits + static_cast<std::size_t>(t) * stride;
+  const auto logit = [&](std::uint32_t e) {
+    if constexpr (kCoherent)
+      return __hip_atomic_load(src + e, __ATOMIC_RELAXED,
+                               __HIP_MEMORY_SCOPE_AGENT);
+    else
+      return src[e];
+  };
   float local_max = -INFINITY;
   for (std::uint32_t e = threadIdx.x; e < n_experts; e += blockDim.x) {
-    local_max = fmaxf(local_max, src[e]);
+    local_max = fmaxf(local_max, logit(e));
   }
   const float max_logit = BlockMax(local_max, shared);
   float local_sum = 0.0f;
   for (std::uint32_t e = threadIdx.x; e < n_experts; e += blockDim.x) {
-    probs[e] = __expf(src[e] - max_logit);
+    probs[e] = __expf(logit(e) - max_logit);
     local_sum += probs[e];
   }
   const float denom = BlockSum(local_sum, shared);
@@ -4221,38 +4241,20 @@ template<unsigned MaxExperts>
 __global__ void RouterTopKKernel(const float* logits, std::uint32_t stride,
                                  std::int32_t* ids, float* weights,
                                  std::uint32_t n_experts, std::uint32_t k) {
-  RouterTopKBody<MaxExperts>(logits, stride, ids, weights, n_experts, k);
+  RouterTopKBody<MaxExperts>(logits, stride, ids, weights, n_experts, k,
+                             blockIdx.x);
 }
 
-/// RouterTopKKernel, then the last block to finish groups all of the grid's
-/// IDs into BuildTiles' tiles with its first wave: per expert in assignment
-/// order, a new tile every tile_rows assignments. Tile positions follow the
-/// leading assignment's order instead of BuildTiles' atomic order; every
-/// tile still covers the same rows and writes disjoint outputs.
-template<unsigned MaxExperts>
-__global__ void RouterTopKTilesKernel(const float* logits, std::uint32_t stride,
-                                      std::int32_t* ids, float* weights,
-                                      std::uint32_t n_experts, std::uint32_t k,
-                                      Exl3RouteTile* tiles,
-                                      std::uint32_t* tile_count,
-                                      std::uint32_t* arrivals,
-                                      std::uint32_t tile_rows) {
-  RouterTopKBody<MaxExperts>(logits, stride, ids, weights, n_experts, k);
-  if (threadIdx.x >= 32)
-    return;
-  // Thread 0 wrote this block's IDs; publish them before arriving. The
-  // counter wraps to zero on the last arrival, ready for the next launch.
-  unsigned last = 0;
-  if (threadIdx.x == 0) {
-    __threadfence();
-    last = atomicInc(arrivals, gridDim.x - 1) == gridDim.x - 1;
-  }
-  if (__shfl(last, 0, 32) == 0)
-    return;
-  __threadfence();
+/// The first wave groups the n IDs (assignment order, written before the
+/// call by this or other blocks: read with agent-scope loads) into
+/// BuildTiles' tiles.
+__device__ __forceinline__ void RouterBuildTiles(const std::int32_t* ids,
+                                                 unsigned n,
+                                                 Exl3RouteTile* tiles,
+                                                 std::uint32_t* tile_count,
+                                                 std::uint32_t tile_rows) {
   constexpr unsigned kChunks = kExl3FusedTileAssignments / 32;
   const unsigned lane = threadIdx.x;
-  const unsigned n = gridDim.x * k;
   // Lane l holds assignments l + 32 c in registers; each pass broadcasts
   // every ID in assignment order (fixed chunk indices, no local array).
   int mine[kChunks];
@@ -4320,6 +4322,66 @@ __global__ void RouterTopKTilesKernel(const float* logits, std::uint32_t stride,
   }
   if (lane == 0)
     *tile_count = base;
+}
+
+/// RouterTopKKernel, then the last block to finish groups all of the grid's
+/// IDs into BuildTiles' tiles with its first wave: per expert in assignment
+/// order, a new tile every tile_rows assignments. Tile positions follow the
+/// leading assignment's order instead of BuildTiles' atomic order; every
+/// tile still covers the same rows and writes disjoint outputs.
+template<unsigned MaxExperts>
+__global__ void RouterTopKTilesKernel(const float* logits, std::uint32_t stride,
+                                      std::int32_t* ids, float* weights,
+                                      std::uint32_t n_experts, std::uint32_t k,
+                                      Exl3RouteTile* tiles,
+                                      std::uint32_t* tile_count,
+                                      std::uint32_t* arrivals,
+                                      std::uint32_t tile_rows) {
+  RouterTopKBody<MaxExperts>(logits, stride, ids, weights, n_experts, k,
+                             blockIdx.x);
+  if (threadIdx.x >= 32)
+    return;
+  // Thread 0 wrote this block's IDs; publish them before arriving. The
+  // counter wraps to zero on the last arrival, ready for the next launch.
+  unsigned last = 0;
+  if (threadIdx.x == 0) {
+    __threadfence();
+    last = atomicInc(arrivals, gridDim.x - 1) == gridDim.x - 1;
+  }
+  if (__shfl(last, 0, 32) == 0)
+    return;
+  __threadfence();
+  RouterBuildTiles(ids, gridDim.x * k, tiles, tile_count, tile_rows);
+}
+
+/// SmallGemmStable's single-token rows (one wave per logit row, eight rows
+/// per block; the EXL3 plain-operand route of Dense) of the router and
+/// shared-expert gate, then the last block to
+/// store its rows runs RouterTopKTilesKernel's token over the logits the
+/// grid wrote (read back with agent-scope loads) and builds the tiles with
+/// its first wave. The arrival counter wraps to zero on the last arrival.
+template<WeightType type, bool kWhole, unsigned MaxExperts>
+__global__ __launch_bounds__(kThreads) void RouterGemvTopKTilesKernel(
+    const void* w, const float* x, float* logits, std::uint32_t m,
+    std::uint32_t k_in, std::int32_t* ids, float* weights,
+    std::uint32_t n_experts, std::uint32_t k, Exl3RouteTile* tiles,
+    std::uint32_t* tile_count, std::uint32_t* arrivals,
+    std::uint32_t tile_rows) {
+  SmallGemmRows<type, 1, false, kWhole, true>(w, x, logits, m, k_in);
+  __shared__ unsigned last;
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0)
+    last = atomicInc(arrivals, gridDim.x - 1) == gridDim.x - 1;
+  __syncthreads();
+  if (last == 0)
+    return;
+  __threadfence();
+  RouterTopKBody<MaxExperts, true>(logits, m, ids, weights, n_experts, k, 0);
+  if (threadIdx.x >= 32)
+    return;
+  __threadfence();  // thread 0's IDs, read back below
+  RouterBuildTiles(ids, k, tiles, tile_count, tile_rows);
 }
 
 /// grid (tokens, dim chunks of kThreads). Up to kMaxSlots slots, every read
@@ -9728,6 +9790,69 @@ void RouterTopKTiles(const float* logits, std::uint32_t stride,
   hipLaunchKernelGGL(kernel, dim3(n_tokens), dim3(kThreads), 0, stream, logits,
                      stride, ids, weights, n_experts, k, tiles, tile_count,
                      arrivals, tile_rows);
+}
+
+namespace {
+
+template<WeightType type>
+void LaunchRouterGemvTopKTiles(const void* w, const float* x, float* logits,
+                               std::uint32_t m, std::uint32_t k_in,
+                               std::int32_t* ids, float* weights,
+                               std::uint32_t n_experts, std::uint32_t k,
+                               Exl3RouteTile* tiles, std::uint32_t* tile_count,
+                               std::uint32_t* arrivals, std::uint32_t tile_rows,
+                               hipStream_t stream) {
+  // LaunchSmallGemm's whole-pass selection for one stable token (its
+  // K = 320 tail-vector rows are not a router shape).
+  const bool whole = (reinterpret_cast<std::uintptr_t>(w) |
+                      reinterpret_cast<std::uintptr_t>(x)) %
+                             16 ==
+                         0 &&
+                     k_in % (32 * 4 * 4) == 0;
+
+  const auto kernel =
+      whole ? (n_experts <= 512 ? RouterGemvTopKTilesKernel<type, true, 512>
+                                : RouterGemvTopKTilesKernel<type, true, 1024>)
+            : (n_experts <= 512 ? RouterGemvTopKTilesKernel<type, false, 512>
+                                : RouterGemvTopKTilesKernel<type, false, 1024>);
+  hipLaunchKernelGGL(kernel, dim3((m + kThreads / 32 - 1) / (kThreads / 32)),
+                     dim3(kThreads), 0, stream, w, x, logits, m, k_in, ids,
+                     weights, n_experts, k, tiles, tile_count, arrivals,
+                     tile_rows);
+}
+
+}  // namespace
+
+bool RouterGemvTopKTiles(const void* w, WeightType type, const float* x,
+                         float* logits, std::uint32_t m, std::uint32_t k_in,
+                         std::int32_t* ids, float* weights,
+                         std::uint32_t n_experts, std::uint32_t k,
+                         Exl3RouteTile* tiles, std::uint32_t* tile_count,
+                         std::uint32_t* arrivals, std::uint32_t tile_rows,
+                         hipStream_t stream) {
+  if (k == 0 || k > kExl3FusedTileAssignments || k > 32 || n_experts > 1024 ||
+      k_in == 0 || k_in == 320 || m < n_experts || tile_rows == 0 ||
+      tile_rows > 8 || arrivals == nullptr)
+    return false;
+  switch (type) {
+    case WeightType::kF32:
+      LaunchRouterGemvTopKTiles<WeightType::kF32>(
+          w, x, logits, m, k_in, ids, weights, n_experts, k, tiles, tile_count,
+          arrivals, tile_rows, stream);
+      return true;
+    case WeightType::kF16:
+      LaunchRouterGemvTopKTiles<WeightType::kF16>(
+          w, x, logits, m, k_in, ids, weights, n_experts, k, tiles, tile_count,
+          arrivals, tile_rows, stream);
+      return true;
+    case WeightType::kBF16:
+      LaunchRouterGemvTopKTiles<WeightType::kBF16>(
+          w, x, logits, m, k_in, ids, weights, n_experts, k, tiles, tile_count,
+          arrivals, tile_rows, stream);
+      return true;
+    default:
+      return false;
+  }
 }
 
 void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,

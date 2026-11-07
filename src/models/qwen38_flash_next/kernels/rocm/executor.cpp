@@ -4168,17 +4168,31 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
     if (diagnostics_active_)
       ++cycle_diagnostics_.prefill_shared_overlaps;
   }
-  // Router logits and the shared-expert gate come out of one GEMM.
-  if (!Dense(l.router, x, s_.router, n_tokens, error_msg)) {
-    return false;
-  }
   // An EXL3 decode call of one routed chunk also builds its expert tiles in
   // the router launch (Exl3RoutedMlp skips its counter reset and BuildTiles).
   exl3_tiles_ready_ = l.ffn_gate_exps.exl3 != nullptr && !prefill_phase &&
                       n_tokens <= 64 &&
                       n_tokens * used <= kExl3FusedTileAssignments &&
                       exl3_.route_arrivals != nullptr;
-  if (exl3_tiles_ready_)
+  // One AR token: the router GEMV (Dense's SmallGemmStable rows) selects
+  // the experts and builds the tiles in its last block, one launch instead
+  // of two with the same arithmetic.
+  const bool plain_router =
+      l.router.exl3 == nullptr && model_->output().exl3 != nullptr &&
+      (l.router.type == GgmlType::kF16 || l.router.type == GgmlType::kBF16 ||
+       l.router.type == GgmlType::kF32);
+  if (exl3_tiles_ready_ && n_tokens == 1 && plain_router &&
+      l.router.rows == c.num_experts + 1 &&
+      RouterGemvTopKTiles(l.router.data, SmallType(l.router.type), x, s_.router,
+                          l.router.rows, l.router.cols, s_.ids, s_.weights,
+                          c.num_experts, used, exl3_.tiles, exl3_.tile_count,
+                          exl3_.route_arrivals, Exl3RouteTileRows(n_tokens),
+                          stream_)) {
+    // Routed below.
+  } else if (!Dense(l.router, x, s_.router, n_tokens, error_msg)) {
+    // Router logits and the shared-expert gate come out of one GEMM.
+    return false;
+  } else if (exl3_tiles_ready_)
     RouterTopKTiles(s_.router, c.num_experts + 1, s_.ids, s_.weights, n_tokens,
                     c.num_experts, used, exl3_.tiles, exl3_.tile_count,
                     exl3_.route_arrivals, Exl3RouteTileRows(n_tokens), stream_);
