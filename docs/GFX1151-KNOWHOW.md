@@ -1,5 +1,35 @@
 # gfx1151 optimization know-how
 
+## Flash-Next B2 producer rotation, verify state and side stream, November 7, 2026
+
+Commits `c49ea976..9599b4c6` (brief `plan/exl3/B2-BRIEF.md`): producer epilogues
+write the rotated X2b input for R≤8 (E1, −144 rotate launches/token); exact
+R5–R8 routed live-row bodies (E4, MaxRows-8 VGPR 39–69→66–84, no scratch/LDS);
+GDN verify keeps state and replays the kept prefix from per-token records
+instead of a 3.1 MB/layer snapshot (E6, −≈113 MB/session); EXL3 decode shared
+MLP on a captured side-stream branch beside the routed chain (E7); EXL3 prefill
+attention-combine residual write deferred to its readers (E2).
+
+Same window, c03, Nix10.1, FP16 KV, B C B C r2, baseline B1 `cc86343e`:
+PP2048/8192 off 1507.96/1534.37→1516.66/1547.74 (+0.6/+0.9%); MTP-PP
+1440.77/1460.82→1450.14/1476.09; AR128 d0/d32K 31.04/30.38→31.80/31.10
+(+2.5/+2.4%); MTP128 d0/d32K 61.28/94.61→63.89/99.19 (+4.3/+4.9%). Repeatable
+but each below the 5% gate. E7 alone (interleaved no-E7 variant): TG +1.1–1.5%;
+side-stream overlap does pay on decode here. AR/MTP hashes, MTP work counts and
+the 32,760-position prefill logits are byte-identical to B1 (E2's explicit FMA
+changed no bits). Rejected: E3 HC-up+mix fusion (≈13.4 GFLOP/call makes it a
+WMMA epilogue fusion, the rejected S:34 design); E5 device-chained drafts (host
+decides confidence stop/lookup/EOS each step; chaining wastes draft work).
+
+Decode profile (rocprofv3 7.2.4 over the Nix runtime, AR d0, 31.46 tok/s under
+the tracer): 31.78 ms and 1442 dispatches/token, kernel-active 67.0% (tracer
+may inflate gaps). ms/token: EXL3 dense+shared GEMV 10.48 (≈200 GB/s),
+routed 7.27 (≈165 GB/s), HC Q8 3.42 (≈190 GB/s), lm head 2.74 (≈230 GB/s),
+HC combine/mix 1.22, GDN 1.16, small GEMM 1.14, routed glue 1.12, attention
+0.74, router top-k 0.58. Next levers: inter-kernel idle (launch count/
+persistent decode) and routed GEMV bandwidth.
+Evidence: `build/b1/gpu-b2/RESULT.json`, `perf.json`, `prof/decode-summary.json`.
+
 ## Flash-Next B1 decode glue and HC Q8, November 7, 2026
 
 User rule change: output bits may change; slight error is acceptable for speed.

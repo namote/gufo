@@ -1,5 +1,13 @@
 # Qwen3.8 Flash-Next benchmarks
 
+## B2 producer rotation, verify state and side stream, November 7, 2026
+
+Same-window B C B C vs B1 `cc86343e` (candidate `9599b4c6`), c03, Nix10.1, FP16
+KV, r2: PP2048/8192 off 1507.96/1534.37→1516.66/1547.74 tok/s; AR128 d0/d32K
+31.04/30.38→31.80/31.10; MTP128 d0/d32K 61.28/94.61→63.89/99.19. Outputs and
+prefill logits byte-identical to B1. Versus the pre-B1 baseline: AR +16.4%,
+MTP d0 +24.4%, PP2048 +3.1%. Details: [know-how](../../GFX1151-KNOWHOW.md).
+
 ## B1 decode glue and HC Q8, November 7, 2026
 
 Same-window B C B C control (baseline `f24b10ea`, candidate `cc86343e`), c03,
