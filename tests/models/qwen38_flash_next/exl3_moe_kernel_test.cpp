@@ -246,6 +246,7 @@ int main() {
 #include <random>
 #include <span>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include "src/core/hip/detail/exl3_gemv.hpp"
@@ -1808,6 +1809,77 @@ void QualifyFlashNextExl3PrefillAdapter(gpu::Exl3BucketGemm gemm, int bits) {
   ExpertInvariance(true, gemm, bits);
 }
 
+/// RouterTopKTiles at the production expert count with skewed routing: its
+/// IDs equal RouterTopK's and its tiles equal BuildTiles' grouping (per
+/// expert, consecutive runs of tile_rows assignments in assignment order)
+/// as a set, including experts split over several tiles and every register
+/// chunk of the 256-assignment bound.
+void RouterTilesSet(unsigned rows, unsigned used) {
+  constexpr unsigned experts = 512;
+  const unsigned assignments = rows * used;
+  const unsigned tile_rows = gpu::Exl3RouteTileRows(rows);
+  Buffers buffers;
+  std::vector<float> logits(rows * (experts + 1));
+  std::mt19937 rng(rows * 131 + used);
+  for (unsigned t = 0; t < rows; ++t)
+    for (unsigned e = 0; e <= experts; ++e) {
+      float v = (int(rng() % 4000) - 2000) * 0.001F;
+      // A few hot experts take most tokens; the rest stay random.
+      if (e < used + 2 && rng() % 4 != 0)
+        v += 8.0F;
+      logits[t * (experts + 1) + e] = v;
+    }
+  auto* dl = buffers.Copy(logits);
+  auto* ref_ids = buffers.Make<std::int32_t>(assignments);
+  auto* ref_w = buffers.Make<float>(assignments);
+  gpu::RouterTopK(dl, experts + 1, ref_ids, ref_w, rows, experts, used,
+                  nullptr);
+  auto* ids = buffers.Make<std::int32_t>(assignments);
+  auto* weights = buffers.Make<float>(assignments);
+  auto* tiles = buffers.Make<gpu::Exl3RouteTile>(assignments);
+  auto* count = buffers.Make<std::uint32_t>(1);
+  auto* arrivals = buffers.Make<std::uint32_t>(1);
+  gpu::RouterTopKTiles(dl, experts + 1, ids, weights, rows, experts, used,
+                       tiles, count, arrivals, tile_rows, nullptr);
+  const auto host_ids = Read(ref_ids, assignments);
+  Require(host_ids == Read(ids, assignments), "router tiles changed IDs");
+  const auto w0 = Read(ref_w, assignments), w1 = Read(weights, assignments);
+  Require(std::memcmp(w0.data(), w1.data(), w0.size() * sizeof(float)) == 0,
+          "router tiles changed weights");
+  Require(Read(arrivals, 1)[0] == 0, "router tile arrivals not reset");
+  using Key = std::vector<std::uint32_t>;
+  std::vector<Key> expected;
+  bool split = false;
+  for (unsigned e = 0; e < experts; ++e) {
+    Key tile{e, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    for (unsigned i = 0; i < assignments; ++i) {
+      if (host_ids[i] != static_cast<int>(e))
+        continue;
+      tile[2 + tile[1]++] = i;
+      if (tile[1] == tile_rows) {
+        expected.push_back(tile);
+        tile = Key{e, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        split = true;
+      }
+    }
+    if (tile[1] != 0)
+      expected.push_back(tile);
+  }
+  const auto n = Read(count, 1)[0];
+  Require(n == expected.size(), "router tile count differs from BuildTiles");
+  std::vector<Key> actual;
+  for (const auto& t : Read(tiles, n)) {
+    Key k{t.expert, t.count};
+    k.insert(k.end(), std::begin(t.slots), std::end(t.slots));
+    actual.push_back(k);
+  }
+  std::sort(expected.begin(), expected.end());
+  std::sort(actual.begin(), actual.end());
+  Require(actual == expected, "router tiles differ from BuildTiles grouping");
+  Require(split || assignments < tile_rows * 2,
+          "router tile fixture never split an expert");
+}
+
 int main(int argc, char** argv) {
   try {
     if (argc == 2 && std::string(argv[1]) == "--head-generalization") {
@@ -1864,6 +1936,10 @@ int main(int argc, char** argv) {
       std::cout << "EXL3 rate generalization contracts passed\n";
       return 0;
     }
+    for (const auto [rows, used] :
+         {std::pair{1U, 10U}, std::pair{3U, 10U}, std::pair{8U, 10U},
+          std::pair{25U, 10U}, std::pair{64U, 4U}})
+      RouterTilesSet(rows, used);
     PrefillCombineFrozenRows();
     PrefillCombineFrozenRows(true);
     FusedProducer(3, true, 4, 3, 7);  // Different rates in distinct banks.
