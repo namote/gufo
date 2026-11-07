@@ -109,21 +109,51 @@ __device__ __forceinline__ float DotPairF32(Half2 w, Half2 x, float acc) {
   return __builtin_fmaf(w1, x1, acc);
 }
 
+// Scale only the already-rounded FP16 values. min/max are absolute FP16
+// bit patterns, so this classification is independent of half-denormal mode.
+__device__ int DownExponent(unsigned minimum, unsigned maximum) {
+  if (maximum >= 0x7c00U)
+    return -1;
+  if (minimum >= 0x400U)  // Includes the all-zero row (minimum == 0x7fff).
+    return 0;
+  const int shift = __clz(minimum) - 21;  // 1..10, to make minimum normal.
+  return (maximum >> 10) + shift <= 30 ? shift : -1;
+}
+
+__device__ std::uint16_t ScaleHalf(std::uint16_t bits, int exponent) {
+  const unsigned value = bits & 0x7fffU;
+  if (value == 0 || exponent <= 0)
+    return bits;
+  if (value >= 0x400U)
+    return bits + (exponent << 10);
+  const int normalize = __clz(value) - 21;
+  const unsigned significand = value << normalize;
+  return (bits & 0x8000U) | ((1 + exponent - normalize) << 10) |
+         (significand & 0x3ffU);
+}
+
 // Waves per routed GEMV block: adjacent output tiles of the same expert
 // tile. Each wave's arithmetic is the former one-wave block's; packing only
 // cuts the block count (40 x 10 x 2 gate/up and 160 x 10 down blocks at
 // R=1 became a quarter as many).
 constexpr unsigned kRoutedWaves = 4;
 
-// FP16 activation halves a routed GEMV block stages in LDS per K chunk:
-// a whole 2560-wide row per tile row, capped so a four-wave block keeps 16
-// blocks (64 waves) resident per WGP.
+// Waves per restore-fused gate/up block (RoutedGateUpRestore): eight gate
+// and eight up output tiles, one 128-wide segment of both projections.
+constexpr unsigned kRestoreWaves = 16;
+
+// FP16 activation halves a routed GEMV block stages in LDS per K chunk and
+// projection: a whole 2560-wide row per tile row, capped so a four-wave
+// block keeps 16 blocks (64 waves) resident per WGP and a restore-fused
+// block (both projections) four blocks with its segment outputs.
 constexpr unsigned kRoutedStageRowHalves = 2560;
-constexpr unsigned kRoutedStageHalves = 4096;
-constexpr unsigned RoutedStageHalves(unsigned rows) {
-  return rows * kRoutedStageRowHalves < kRoutedStageHalves
-             ? rows * kRoutedStageRowHalves
-             : kRoutedStageHalves;
+constexpr unsigned RoutedStageCap(unsigned staged) {
+  return staged == 1 ? 4096 : 5120;
+}
+constexpr unsigned RoutedStageHalves(unsigned rows, unsigned staged = 1) {
+  return staged * (rows * kRoutedStageRowHalves < RoutedStageCap(staged)
+                       ? rows * kRoutedStageRowHalves
+                       : RoutedStageCap(staged));
 }
 
 // One wave owns one output tile and up to eight actual rows of one expert.
@@ -134,23 +164,37 @@ constexpr unsigned RoutedStageHalves(unsigned rows) {
 // wave wait for the next tile group's loads too (vmcnt counts in order).
 // Every wave of the block reaches the staging barriers; a wave past the
 // last output tile computes a duplicate of it and stores nothing.
+// Staged 1: a four-wave block of one projection (blockIdx.z), waves on
+// adjacent output tiles. Staged 2: a kRestoreWaves block of 128-wide
+// segment blockIdx.x, waves 0-7 gate and 8-15 up, staging both inputs and
+// also storing its outputs to `segment_y` ([2][8][128] FP32).
+// Ranged (scaled down rows): each row's exponent is DownExponent over the
+// FP16 magnitude ranges RoutedGateUpRestore stored per segment
+// (`ranges`, [slot][k / 128][min, max]); the staged halves are scaled by
+// it (ScaleHalf) and block 0 stores it to `exponents`.
 template<int Bits, bool FullPrecision, unsigned MaxRows = 8,
-         bool Scaled = false, bool ExactRows = false>
+         bool Scaled = false, bool ExactRows = false, unsigned Staged = 1,
+         bool Ranged = false>
 __device__ __forceinline__ void RoutedGemvBody(
     const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
     const Exl3RouteTile* tiles, const unsigned* count,
     const std::uint16_t* input, float* gate_y, float* up_y, unsigned k,
-    unsigned n, unsigned assignments, const std::int32_t* exponents,
-    _Float16* stage) {
+    unsigned n, unsigned assignments, std::int32_t* exponents,
+    const std::uint32_t* ranges, _Float16* stage, float* segment_y) {
+  static_assert(Staged == 1 || (Staged == 2 && !Scaled && !FullPrecision));
+  static_assert(!Ranged || (Scaled && Staged == 1));
   if (blockIdx.y >= *count)
     return;
   const auto tile_rows = tiles[blockIdx.y];
-  const unsigned projection = blockIdx.z;
+  const unsigned wave = threadIdx.x / 32;
+  const unsigned projection = Staged == 1 ? blockIdx.z : wave / 8;
+  const unsigned first_projection = Staged == 1 ? blockIdx.z : 0;
   const auto& l = (projection == 0 ? gate : up)[tile_rows.expert];
   const unsigned lane = threadIdx.x % 32;
   const unsigned r0 = (lane % 4) * 2;
   const unsigned n_tiles = n / 16;
-  const unsigned wave_tile = blockIdx.x * kRoutedWaves + threadIdx.x / 32;
+  const unsigned wave_tile = Staged == 1 ? blockIdx.x * kRoutedWaves + wave
+                                         : blockIdx.x * 8 + wave % 8;
   const bool live = wave_tile < n_tiles;
   const unsigned nt = live ? wave_tile : n_tiles - 1;
   if (n_tiles == 0)
@@ -159,7 +203,7 @@ __device__ __forceinline__ void RoutedGemvBody(
   const auto lw = arithmetic::MakeLaneWindow<Bits>(lane);
   const auto* trellis = reinterpret_cast<const std::uint32_t*>(l.trellis);
   const auto* x = reinterpret_cast<const _Float16*>(input) +
-                  std::size_t{projection} * assignments * k;
+                  std::size_t{first_projection} * assignments * k;
   // Tiles are fetched kAhead at a time so a wave keeps several loads in
   // flight (one tile per iteration left decode latency-bound, ~150 GB/s);
   // they are decoded and accumulated in K order exactly as before. The
@@ -192,37 +236,83 @@ __device__ __forceinline__ void RoutedGemvBody(
   // the block's threads (at most four per thread). The compiler sinks each
   // load into its guarded store, a round trip per vector; issuing them all
   // first kept 30-50 more VGPRs live through the K loop at R3-R8.
-  constexpr unsigned kChunk =
-      RoutedStageHalves(MaxRows) / (MaxRows * 16) / kAhead * kAhead;
+  constexpr unsigned kChunk = RoutedStageHalves(MaxRows, Staged) /
+                              (Staged * MaxRows * 16) / kAhead * kAhead;
   constexpr unsigned kRowHalves = kChunk * 16;
-  constexpr unsigned kThreads = 32 * kRoutedWaves;
+  constexpr unsigned kThreads =
+      32 * (Staged == 1 ? kRoutedWaves : kRestoreWaves);
   constexpr unsigned kPerThread =
-      (MaxRows * kChunk * 2 + kThreads - 1) / kThreads;
-  static_assert(kChunk >= kAhead && MaxRows * kRowHalves <= kRoutedStageHalves);
+      (Staged * MaxRows * kChunk * 2 + kThreads - 1) / kThreads;
+  static_assert(kChunk >= kAhead && Staged * MaxRows * kRowHalves <=
+                                        RoutedStageHalves(MaxRows, Staged));
   const unsigned rows = ExactRows ? MaxRows : tile_rows.count;
+  // Each row's down exponent, fixed for the whole K loop.
+  int exponent[MaxRows]{};
+  if constexpr (Scaled) {
+#pragma unroll
+    for (unsigned r = 0; r < MaxRows; ++r) {
+      if (!ExactRows && r >= tile_rows.count)
+        continue;
+      const unsigned slot = tile_rows.slots[r];
+      if constexpr (Ranged) {
+        const unsigned segments = k / 128;
+        unsigned minimum = 0x7fffU, maximum = 0;
+        for (unsigned g = 0; g < segments; ++g) {
+          minimum = min(minimum, ranges[(slot * segments + g) * 2]);
+          maximum = max(maximum, ranges[(slot * segments + g) * 2 + 1]);
+        }
+        exponent[r] = DownExponent(minimum, maximum);
+        if (blockIdx.x == 0 && threadIdx.x == 0)
+          exponents[slot] = exponent[r];
+      } else {
+        exponent[r] = exponents[slot];
+      }
+    }
+  }
   const auto stage_chunk = [&](unsigned base) {
     const unsigned vectors = min(kChunk, k_tiles - base) * 2;
-    const unsigned total = rows * vectors;
+    const unsigned total = Staged * rows * vectors;
     uint4 data[kPerThread];
     __syncthreads();  // every wave is done with the previous chunk
 #pragma unroll
     for (unsigned j = 0; j < kPerThread; ++j) {
       const unsigned i = min(threadIdx.x + j * kThreads, total - 1);
-      const unsigned r = i / vectors;
+      const unsigned r = Staged == 1 ? i / vectors : i / vectors % rows;
+      const unsigned p = Staged == 1 ? 0 : i / vectors / rows;
       unsigned slot = tile_rows.slots[0];
       // Fixed indices: a dynamically indexed slot array promotes to LDS.
 #pragma unroll
       for (unsigned q = 1; q < MaxRows; ++q)
         slot = r == q ? tile_rows.slots[q] : slot;
-      data[j] = reinterpret_cast<const uint4*>(x + std::size_t{slot} * k +
-                                               base * 16)[i % vectors];
+      data[j] = reinterpret_cast<const uint4*>(
+          x + (std::size_t{p} * assignments + slot) * k +
+          base * 16)[i % vectors];
     }
 #pragma unroll
     for (unsigned j = 0; j < kPerThread; ++j) {
       const unsigned i = threadIdx.x + j * kThreads;
-      if (i < total)
-        reinterpret_cast<uint4*>(stage + (i / vectors) *
+      if (i < total) {
+        const unsigned r = Staged == 1 ? i / vectors : i / vectors % rows;
+        const unsigned p = Staged == 1 ? 0 : i / vectors / rows;
+        if constexpr (Ranged) {
+          // A sum, not a select chain: the chain folds back into a
+          // dynamically indexed private array (scratch on this compiler).
+          int e = 0;
+#pragma unroll
+          for (unsigned q = 0; q < MaxRows; ++q)
+            e += int(r == q) * exponent[q];
+          if (e > 0) {
+            const auto scale = [e](unsigned pair) {
+              return ScaleHalf(pair & 0xffffU, e) |
+                     unsigned(ScaleHalf(pair >> 16, e)) << 16;
+            };
+            data[j] = uint4{scale(data[j].x), scale(data[j].y),
+                            scale(data[j].z), scale(data[j].w)};
+          }
+        }
+        reinterpret_cast<uint4*>(stage + (p * MaxRows + r) *
                                              kRowHalves)[i % vectors] = data[j];
+      }
     }
     __syncthreads();
   };
@@ -231,8 +321,8 @@ __device__ __forceinline__ void RoutedGemvBody(
 #pragma unroll
   for (unsigned r = 0; r < MaxRows; ++r)
     widened[r] =
-        FullPrecision || (Scaled && (ExactRows || r < tile_rows.count) &&
-                          exponents[tile_rows.slots[r]] < 0);
+        FullPrecision ||
+        (Scaled && (ExactRows || r < tile_rows.count) && exponent[r] < 0);
   // Two register sets alternate, so the group in flight is never copied
   // (a copy at the loop edge waited for it before the next group began).
   std::uint32_t even[kAhead][3], odd[kAhead][3];
@@ -240,55 +330,58 @@ __device__ __forceinline__ void RoutedGemvBody(
   // decode a whole group at once (30-40 more VGPRs at R3/R4). The loop edge
   // then makes each pair's first group wait for its own loads before it
   // issues the next group's; no tile waits for loads issued after it.
-  const auto group = [&](unsigned kt0, const std::uint32_t (&raw)[kAhead][3],
-                         std::uint32_t (
-                             &next)[kAhead][3]) __attribute__((always_inline)) {
-    if (kt0 % kChunk == 0)
-      stage_chunk(kt0);
-    const unsigned chunk_base = kt0 - kt0 % kChunk;
-    fetch(kt0 + kAhead, next);
+  const auto group =
+      [&](unsigned kt0, const std::uint32_t (&raw)[kAhead][3],
+          std::uint32_t (&next)[kAhead][3]) __attribute__((always_inline)) {
+        if (kt0 % kChunk == 0)
+          stage_chunk(kt0);
+        const unsigned chunk_base = kt0 - kt0 % kChunk;
+        fetch(kt0 + kAhead, next);
 #pragma unroll
-    for (unsigned u = 0; u < kAhead; ++u) {
-      const unsigned kt = kt0 + u;
-      if (kt >= k_tiles)
-        break;
-      Half2 w[4];
-      {
-        std::uint32_t state[8];
-        arithmetic::LaneStates<Bits>(raw[u][0], raw[u][1], raw[u][2], lw.shift,
-                                     state);
-        std::uint32_t p[8];
+        for (unsigned u = 0; u < kAhead; ++u) {
+          const unsigned kt = kt0 + u;
+          if (kt >= k_tiles)
+            break;
+          Half2 w[4];
+          {
+            std::uint32_t state[8];
+            arithmetic::LaneStates<Bits>(raw[u][0], raw[u][1], raw[u][2],
+                                         lw.shift, state);
+            std::uint32_t p[8];
 #pragma unroll
-        for (int j = 0; j < 8; ++j)
-          p[j] = (state[j] & 0xffffU) * arithmetic::kMul1Multiplier;
+            for (int j = 0; j < 8; ++j)
+              p[j] = (state[j] & 0xffffU) * arithmetic::kMul1Multiplier;
 #pragma unroll
-        for (int q = 0; q < 4; ++q)
-          w[q] = arithmetic::DecodePairMul1(p[2 * q], p[2 * q + 1]);
-      }
+            for (int q = 0; q < 4; ++q)
+              w[q] = arithmetic::DecodePairMul1(p[2 * q], p[2 * q + 1]);
+          }
       // Fixed row indices keep the accumulators and route slots in VGPRs.
       // A dynamically indexed local array otherwise promotes to 40 KiB LDS
       // per one-wave block on the pinned compiler, starving verification.
 #pragma unroll
-      for (unsigned r = 0; r < MaxRows; ++r) {
-        if (!ExactRows && r >= tile_rows.count)
-          continue;
-        const auto* row = stage + r * kRowHalves + (kt - chunk_base) * 16 + r0;
-        const Half2 v01 = *reinterpret_cast<const Half2*>(row);
-        const Half2 v89 = *reinterpret_cast<const Half2*>(row + 8);
-        if (widened[r]) {
-          a[r] = DotPairF32(w[0], v01, a[r]);
-          a[r] = DotPairF32(w[1], v89, a[r]);
-          b[r] = DotPairF32(w[2], v01, b[r]);
-          b[r] = DotPairF32(w[3], v89, b[r]);
-        } else {
-          a[r] = __builtin_amdgcn_fdot2(w[0], v01, a[r], false);
-          a[r] = __builtin_amdgcn_fdot2(w[1], v89, a[r], false);
-          b[r] = __builtin_amdgcn_fdot2(w[2], v01, b[r], false);
-          b[r] = __builtin_amdgcn_fdot2(w[3], v89, b[r], false);
+          for (unsigned r = 0; r < MaxRows; ++r) {
+            if (!ExactRows && r >= tile_rows.count)
+              continue;
+            const auto* row =
+                stage +
+                ((projection - first_projection) * MaxRows + r) * kRowHalves +
+                (kt - chunk_base) * 16 + r0;
+            const Half2 v01 = *reinterpret_cast<const Half2*>(row);
+            const Half2 v89 = *reinterpret_cast<const Half2*>(row + 8);
+            if (widened[r]) {
+              a[r] = DotPairF32(w[0], v01, a[r]);
+              a[r] = DotPairF32(w[1], v89, a[r]);
+              b[r] = DotPairF32(w[2], v01, b[r]);
+              b[r] = DotPairF32(w[3], v89, b[r]);
+            } else {
+              a[r] = __builtin_amdgcn_fdot2(w[0], v01, a[r], false);
+              a[r] = __builtin_amdgcn_fdot2(w[1], v89, a[r], false);
+              b[r] = __builtin_amdgcn_fdot2(w[2], v01, b[r], false);
+              b[r] = __builtin_amdgcn_fdot2(w[3], v89, b[r], false);
+            }
+          }
         }
-      }
-    }
-  };
+      };
   fetch(0, even);
   for (unsigned kt0 = 0; kt0 < k_tiles; kt0 += 2 * kAhead) {
     group(kt0, even, odd);
@@ -309,12 +402,16 @@ __device__ __forceinline__ void RoutedGemvBody(
                 std::size_t{tile_rows.slots[r]} * n + nt * 16;
       float scale = 1.0F;
       if constexpr (Scaled) {
-        const int exponent = exponents[tile_rows.slots[r]];
-        if (exponent > 0)
-          scale = __builtin_bit_cast(float, unsigned(127 - exponent) << 23);
+        if (exponent[r] > 0)
+          scale = __builtin_bit_cast(float, unsigned(127 - exponent[r]) << 23);
       }
       y[lane / 4] = a[r] * scale;
       y[lane / 4 + 8] = b[r] * scale;
+      if constexpr (Staged == 2) {
+        float* segment = segment_y + (projection * 8 + r) * 128 + nt % 8 * 16;
+        segment[lane / 4] = a[r];
+        segment[lane / 4 + 8] = b[r];
+      }
     }
   }
 }
@@ -324,25 +421,26 @@ __device__ __forceinline__ void RoutedGemvBody(
 // loop is specialized, independently of the bit rate.
 // The generic body remains for MaxRows 1/2 and unscaled full-precision down.
 template<int Bits, bool FullPrecision, unsigned MaxRows = 8,
-         bool Scaled = false>
+         bool Scaled = false, unsigned Staged = 1, bool Ranged = false>
 __device__ __forceinline__ void RoutedGemvTile(
     const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
     const Exl3RouteTile* tiles, const unsigned* count,
     const std::uint16_t* input, float* gate_y, float* up_y, unsigned k,
-    unsigned n, unsigned assignments, const std::int32_t* exponents) {
+    unsigned n, unsigned assignments, std::int32_t* exponents,
+    const std::uint32_t* ranges = nullptr, float* segment_y = nullptr) {
   if (blockIdx.y >= *count)
     return;
   // One staging buffer for whichever row body the tile selects.
-  __shared__
-      __attribute__((aligned(16))) _Float16 stage[RoutedStageHalves(MaxRows)];
+  __shared__ __attribute__((
+      aligned(16))) _Float16 stage[RoutedStageHalves(MaxRows, Staged)];
   if constexpr (!FullPrecision &&
                 (MaxRows == 3 || MaxRows == 4 || MaxRows == 8)) {
     // Each live-row body runs exactly the generic body's arithmetic for the
     // tile's rows; R5-R8 verify tiles (MaxRows 8) mostly hold 1-2 rows.
     const auto exact = [&]<unsigned Rows>() __attribute__((always_inline)) {
-      RoutedGemvBody<Bits, FullPrecision, Rows, Scaled, true>(
+      RoutedGemvBody<Bits, FullPrecision, Rows, Scaled, true, Staged, Ranged>(
           gate, up, tiles, count, input, gate_y, up_y, k, n, assignments,
-          exponents, stage);
+          exponents, ranges, stage, segment_y);
     };
     switch (tiles[blockIdx.y].count) {
       case 1:
@@ -388,23 +486,23 @@ __device__ __forceinline__ void RoutedGemvTile(
         break;
     }
   }
-  RoutedGemvBody<Bits, FullPrecision, MaxRows, Scaled>(
+  RoutedGemvBody<Bits, FullPrecision, MaxRows, Scaled, false, Staged, Ranged>(
       gate, up, tiles, count, input, gate_y, up_y, k, n, assignments, exponents,
-      stage);
+      ranges, stage, segment_y);
 }
 
 template<int Bits, bool FullPrecision, unsigned MaxRows = 8,
-         bool Scaled = false>
+         bool Scaled = false, bool Ranged = false>
 __global__ void RoutedGemv(const ex::DeviceLinear* gate,
                            const ex::DeviceLinear* up,
                            const Exl3RouteTile* tiles, const unsigned* count,
                            const std::uint16_t* input, float* gate_y,
                            float* up_y, unsigned k, unsigned n,
-                           unsigned assignments,
-                           const std::int32_t* exponents) {
-  RoutedGemvTile<Bits, FullPrecision, MaxRows, Scaled>(
-      gate, up, tiles, count, input, gate_y, up_y, k, n, assignments,
-      exponents);
+                           unsigned assignments, std::int32_t* exponents,
+                           const std::uint32_t* ranges) {
+  RoutedGemvTile<Bits, FullPrecision, MaxRows, Scaled, 1, Ranged>(
+      gate, up, tiles, count, input, gate_y, up_y, k, n, assignments, exponents,
+      ranges);
 }
 
 __global__ void RestoreDownAssignments(const ex::DeviceLinear* down,
@@ -424,29 +522,6 @@ __global__ void RestoreDownAssignments(const ex::DeviceLinear* down,
   for (unsigned j = 0; j < 4; ++j)
     output[offset + j] = (v[j] * arithmetic::kHadamardScale) *
                          static_cast<float>(svh[first + j]);
-}
-
-// Scale only the already-rounded FP16 values. min/max are absolute FP16
-// bit patterns, so this classification is independent of half-denormal mode.
-__device__ int DownExponent(unsigned minimum, unsigned maximum) {
-  if (maximum >= 0x7c00U)
-    return -1;
-  if (minimum >= 0x400U)  // Includes the all-zero row (minimum == 0x7fff).
-    return 0;
-  const int shift = __clz(minimum) - 21;  // 1..10, to make minimum normal.
-  return (maximum >> 10) + shift <= 30 ? shift : -1;
-}
-
-__device__ std::uint16_t ScaleHalf(std::uint16_t bits, int exponent) {
-  const unsigned value = bits & 0x7fffU;
-  if (value == 0 || exponent <= 0)
-    return bits;
-  if (value >= 0x400U)
-    return bits + (exponent << 10);
-  const int normalize = __clz(value) - 21;
-  const unsigned significand = value << normalize;
-  return (bits & 0x8000U) | ((1 + exponent - normalize) << 10) |
-         (significand & 0x3ffU);
 }
 
 __global__ void ScaleDownRows(std::uint16_t* input, std::int32_t* exponents,
@@ -532,32 +607,18 @@ __global__ void RestoreActivateRotate(const ex::DeviceLinear* gate,
   }
 }
 
-// RestoreActivateRotate and ScaleDownRows in one pass: one block per
-// assignment (a wave per 128-wide segment) forms the FP16 down input in
-// registers with RestoreActivateRotate's expressions, reduces its magnitude
-// range over the row exactly as ScaleDownRows does on the stored halves, and
-// stores the scaled halves once. The FP32 activation has no reader here.
-__global__ __launch_bounds__(1024) void RestoreActivateScale(
-    const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
-    const ex::DeviceLinear* down, const std::int32_t* ids, const float* gate_y,
-    const float* up_y, std::uint16_t* output, std::int32_t* exponents,
-    unsigned width) {
-  const unsigned row = blockIdx.x, lane = threadIdx.x % 32;
-  const unsigned wave = threadIdx.x / 32, waves = blockDim.x / 32;
-  const unsigned first = wave * 128 + lane * 4;
-  const auto& g = gate[ids[row]];
-  const auto& u = up[ids[row]];
-  const auto& d = down[ids[row]];
+// RestoreActivateRotate's expressions for one 128-wide segment starting at
+// `first - lane * 4` of an expert's gate/up GEMV outputs (four per lane, in
+// gv/uv, consumed): the FP16 down-input halves before power-of-two scaling.
+__device__ __forceinline__ void RestoreSegment(const ex::DeviceLinear& g,
+                                               const ex::DeviceLinear& u,
+                                               const ex::DeviceLinear& d,
+                                               unsigned first, unsigned lane,
+                                               float (&gv)[4], float (&uv)[4],
+                                               std::uint16_t (&bits)[4]) {
   const auto* gs = reinterpret_cast<const _Float16*>(g.svh);
   const auto* us = reinterpret_cast<const _Float16*>(u.svh);
   const auto* ds = reinterpret_cast<const _Float16*>(d.suh);
-  const auto offset = std::size_t{row} * width + first;
-  float gv[4], uv[4];
-#pragma unroll
-  for (unsigned j = 0; j < 4; ++j) {
-    gv[j] = gate_y[offset + j];
-    uv[j] = up_y[offset + j];
-  }
   arithmetic::Butterfly128(gv, lane);
   arithmetic::Butterfly128(uv, lane);
 #pragma unroll
@@ -572,13 +633,21 @@ __global__ __launch_bounds__(1024) void RestoreActivateScale(
     asm volatile("" : "+v"(gv[j]));
   }
   arithmetic::Butterfly128(gv, lane);
-  std::uint16_t bits[4];
-  unsigned minimum = 0x7fffU, maximum = 0;
 #pragma unroll
   for (unsigned j = 0; j < 4; ++j) {
     float scaled = gv[j] * arithmetic::kHadamardScale;
     asm volatile("" : "+v"(scaled));
     bits[j] = __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(scaled));
+  }
+}
+
+// The FP16 magnitude range ScaleDownRows classifies, over one wave's halves
+// (zeros excluded from the minimum), reduced across the wave.
+__device__ __forceinline__ void WaveHalfRange(const std::uint16_t (&bits)[4],
+                                              unsigned& minimum,
+                                              unsigned& maximum) {
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j) {
     const unsigned value = bits[j] & 0x7fffU;
     if (value != 0)
       minimum = min(minimum, value);
@@ -588,6 +657,33 @@ __global__ __launch_bounds__(1024) void RestoreActivateScale(
     minimum = min(minimum, __shfl_xor(minimum, o, 32));
     maximum = max(maximum, __shfl_xor(maximum, o, 32));
   }
+}
+
+// RestoreActivateRotate and ScaleDownRows in one pass: one block per
+// assignment (a wave per 128-wide segment) forms the FP16 down input in
+// registers with RestoreActivateRotate's expressions, reduces its magnitude
+// range over the row exactly as ScaleDownRows does on the stored halves, and
+// stores the scaled halves once. The FP32 activation has no reader here.
+__global__ __launch_bounds__(1024) void RestoreActivateScale(
+    const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
+    const ex::DeviceLinear* down, const std::int32_t* ids, const float* gate_y,
+    const float* up_y, std::uint16_t* output, std::int32_t* exponents,
+    unsigned width) {
+  const unsigned row = blockIdx.x, lane = threadIdx.x % 32;
+  const unsigned wave = threadIdx.x / 32, waves = blockDim.x / 32;
+  const unsigned first = wave * 128 + lane * 4;
+  const auto offset = std::size_t{row} * width + first;
+  float gv[4], uv[4];
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j) {
+    gv[j] = gate_y[offset + j];
+    uv[j] = up_y[offset + j];
+  }
+  std::uint16_t bits[4];
+  RestoreSegment(gate[ids[row]], up[ids[row]], down[ids[row]], first, lane, gv,
+                 uv, bits);
+  unsigned minimum = 0x7fffU, maximum = 0;
+  WaveHalfRange(bits, minimum, maximum);
   __shared__ unsigned minima[32], maxima[32];
   if (lane == 0) {
     minima[wave] = minimum;
@@ -608,127 +704,58 @@ __global__ __launch_bounds__(1024) void RestoreActivateScale(
     output[offset + j] = exponent > 0 ? ScaleHalf(bits[j], exponent) : bits[j];
 }
 
-// RestoreActivateScale for assignment `row` by any whole number of waves
-// (each takes segments wave, wave + waves, ...), reading gate_y/up_y with
-// agent-scope loads (the caller's own grid wrote them). Every segment's
-// expressions are the kernel's; the halves are stored unscaled, the row's
-// magnitude range (order-free min/max) gives the exponent, and each thread
-// then rescales the halves it stored itself.
-__device__ __forceinline__ void RestoreActivateScaleRow(
-    const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
-    const ex::DeviceLinear* down, unsigned expert, unsigned row,
-    const float* gate_y, const float* up_y, std::uint16_t* output,
-    std::int32_t* exponents, unsigned width) {
-  const unsigned lane = threadIdx.x % 32;
-  const unsigned wave = threadIdx.x / 32, waves = blockDim.x / 32;
-  const auto& g = gate[expert];
-  const auto& u = up[expert];
-  const auto& d = down[expert];
-  const auto* gs = reinterpret_cast<const _Float16*>(g.svh);
-  const auto* us = reinterpret_cast<const _Float16*>(u.svh);
-  const auto* ds = reinterpret_cast<const _Float16*>(d.suh);
-  unsigned minimum = 0x7fffU, maximum = 0;
-  for (unsigned segment = wave; segment < width / 128; segment += waves) {
-    const unsigned first = segment * 128 + lane * 4;
-    const auto offset = std::size_t{row} * width + first;
-    float gv[4], uv[4];
-#pragma unroll
-    for (unsigned j = 0; j < 4; ++j) {
-      gv[j] = __hip_atomic_load(gate_y + offset + j, __ATOMIC_RELAXED,
-                                __HIP_MEMORY_SCOPE_AGENT);
-      uv[j] = __hip_atomic_load(up_y + offset + j, __ATOMIC_RELAXED,
-                                __HIP_MEMORY_SCOPE_AGENT);
-    }
-    arithmetic::Butterfly128(gv, lane);
-    arithmetic::Butterfly128(uv, lane);
-#pragma unroll
-    for (unsigned j = 0; j < 4; ++j) {
-      const float value = (gv[j] * arithmetic::kHadamardScale) *
-                          static_cast<float>(gs[first + j]);
-      const float other = (uv[j] * arithmetic::kHadamardScale) *
-                          static_cast<float>(us[first + j]);
-      float activation = (value / (1.0F + expf(-value))) * other;
-      asm volatile("" : "+v"(activation));
-      gv[j] = activation * static_cast<float>(ds[first + j]);
-      asm volatile("" : "+v"(gv[j]));
-    }
-    arithmetic::Butterfly128(gv, lane);
-#pragma unroll
-    for (unsigned j = 0; j < 4; ++j) {
-      float scaled = gv[j] * arithmetic::kHadamardScale;
-      asm volatile("" : "+v"(scaled));
-      const auto bits =
-          __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(scaled));
-      const unsigned value = bits & 0x7fffU;
-      if (value != 0)
-        minimum = min(minimum, value);
-      maximum = max(maximum, value);
-      output[offset + j] = bits;
-    }
-  }
-  for (unsigned o = 16; o != 0; o >>= 1) {
-    minimum = min(minimum, __shfl_xor(minimum, o, 32));
-    maximum = max(maximum, __shfl_xor(maximum, o, 32));
-  }
-  __shared__ unsigned minima[32], maxima[32];
-  if (lane == 0) {
-    minima[wave] = minimum;
-    maxima[wave] = maximum;
-  }
-  __syncthreads();
-  minimum = 0x7fffU;
-  maximum = 0;
-  for (unsigned i = 0; i < waves; ++i) {
-    minimum = min(minimum, minima[i]);
-    maximum = max(maximum, maxima[i]);
-  }
-  const int exponent = DownExponent(minimum, maximum);
-  if (threadIdx.x == 0)
-    exponents[row] = exponent;
-  if (exponent > 0)
-    for (unsigned segment = wave; segment < width / 128; segment += waves) {
-      const auto offset = std::size_t{row} * width + segment * 128 + lane * 4;
-#pragma unroll
-      for (unsigned j = 0; j < 4; ++j)
-        output[offset + j] = ScaleHalf(output[offset + j], exponent);
-    }
-  __syncthreads();  // minima/maxima are reused by the tile's next row
-}
-
-// The routed gate/up GEMV (RoutedGemv's tile bodies, both projections in
-// one grid), then the last of an expert tile's blocks to store its rows
-// runs RestoreActivateScale for each of the tile's assignments into
-// `down_input` (not the gate/up input slab, which other tiles may still be
-// reading). One arrival counter per tile, wrapping to zero.
+// The routed gate/up GEMV with each block owning one 128-wide segment
+// (blockIdx.x) of both projections for an expert tile: eight gate and eight
+// up output tiles, one per wave, from both inputs staged once. The block
+// then restores its segment for every tile row in-block, a wave per row
+// (RestoreSegment over the outputs it kept in LDS), storing the unscaled
+// FP16 halves to `down_input` (not the gate/up input slab, which other
+// tiles may still be reading) and the segment's FP16 magnitude range to
+// `ranges` ([slot][n / 128][min, max]). The down GEMV forms each row's
+// exponent from its segments' ranges (order-free min/max) and scales while
+// staging (RoutedGemv Ranged), so no block waits for another.
 template<int Bits, unsigned MaxRows>
-__global__ void RoutedGateUpRestore(
+__global__ __launch_bounds__(32 * kRestoreWaves) void RoutedGateUpRestore(
     const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
     const ex::DeviceLinear* down, const Exl3RouteTile* tiles,
     const unsigned* count, const std::uint16_t* input, float* gate_y,
     float* up_y, unsigned k, unsigned n, unsigned assignments,
-    std::uint16_t* down_input, std::int32_t* exponents, unsigned width,
-    std::uint32_t* arrivals) {
+    std::uint16_t* down_input, std::uint32_t* ranges) {
   if (blockIdx.y >= *count)
     return;
-  RoutedGemvTile<Bits, false, MaxRows>(gate, up, tiles, count, input, gate_y,
-                                       up_y, k, n, assignments, nullptr);
-  __shared__ unsigned last;
-  __threadfence();
+  __shared__ float segment_y[2 * 8 * 128];
+  RoutedGemvTile<Bits, false, MaxRows, false, 2>(
+      gate, up, tiles, count, input, gate_y, up_y, k, n, assignments, nullptr,
+      nullptr, segment_y);
   __syncthreads();
-  const unsigned blocks = gridDim.x * gridDim.z;
-  if (threadIdx.x == 0)
-    last = atomicInc(arrivals + blockIdx.y, blocks - 1) == blocks - 1;
-  __syncthreads();
-  if (last == 0)
-    return;
-  __threadfence();
   // Slots are read through the pointer: a dynamically indexed local copy
   // of the tile promotes to 40 KiB of LDS on the pinned compiler.
   const Exl3RouteTile* tile = tiles + blockIdx.y;
-  const unsigned rows = tile->count, expert = tile->expert;
-  for (unsigned r = 0; r < rows; ++r)
-    RestoreActivateScaleRow(gate, up, down, expert, tile->slots[r], gate_y,
-                            up_y, down_input, exponents, width);
+  const unsigned wave = threadIdx.x / 32, lane = threadIdx.x % 32;
+  if (wave >= tile->count)
+    return;
+  const unsigned slot = tile->slots[wave], expert = tile->expert;
+  const unsigned first = blockIdx.x * 128 + lane * 4;
+  float gv[4], uv[4];
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j) {
+    gv[j] = segment_y[wave * 128 + lane * 4 + j];
+    uv[j] = segment_y[(8 + wave) * 128 + lane * 4 + j];
+  }
+  std::uint16_t bits[4];
+  RestoreSegment(gate[expert], up[expert], down[expert], first, lane, gv, uv,
+                 bits);
+  unsigned minimum = 0x7fffU, maximum = 0;
+  WaveHalfRange(bits, minimum, maximum);
+  const auto offset = std::size_t{slot} * n + first;
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j)
+    down_input[offset + j] = bits[j];
+  if (lane == 0) {
+    auto* range = ranges + (std::size_t{slot} * gridDim.x + blockIdx.x) * 2;
+    range[0] = minimum;
+    range[1] = maximum;
+  }
 }
 
 // Bucket construction, all on the device and atomic-free, so it is
@@ -1472,7 +1499,8 @@ unsigned TileRows(unsigned rows) {
   return Exl3RouteTileRows(rows);
 }
 
-template<bool FullPrecision, bool Scaled = false>
+// Ranged: the down rows' exponents come from scratch.routed_ranges.
+template<bool FullPrecision, bool Scaled = false, bool Ranged = false>
 void LaunchRouted(const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
                   const std::uint16_t* input, float* gate_y, float* up_y,
                   unsigned k, unsigned n, unsigned assignments,
@@ -1481,12 +1509,13 @@ void LaunchRouted(const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
                   ex::BitRate rate) {
   WithRate(rate, [&]<int Bits>() {
     const auto launch = [&]<unsigned R>() {
-      hipLaunchKernelGGL((RoutedGemv<Bits, FullPrecision, R, Scaled>),
+      hipLaunchKernelGGL((RoutedGemv<Bits, FullPrecision, R, Scaled, Ranged>),
                          dim3((n / 16 + kRoutedWaves - 1) / kRoutedWaves,
                               assignments, projections),
                          dim3(32 * kRoutedWaves), 0, stream, gate, up,
                          scratch.tiles, scratch.tile_count, input, gate_y, up_y,
-                         k, n, assignments, scratch.down_exponents);
+                         k, n, assignments, scratch.down_exponents,
+                         scratch.routed_ranges);
     };
     switch (tile_rows) {
       case 1:
@@ -1508,7 +1537,7 @@ void LaunchRouted(const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
   });
 }
 // The gate/up launch of LaunchRouted (one bank rate for both) with the
-// RestoreActivateScale tail (RoutedGateUpRestore).
+// in-block segment restore (RoutedGateUpRestore); g.rows % 128 == 0.
 void LaunchGateUpRestore(const DeviceLayer& l, const std::uint16_t* input,
                          float* gate_y, float* up_y, unsigned assignments,
                          unsigned tile_rows, const Exl3Scratch& scratch,
@@ -1518,13 +1547,11 @@ void LaunchGateUpRestore(const DeviceLayer& l, const std::uint16_t* input,
   WithRate(BankRate(g), [&]<int Bits>() {
     const auto launch = [&]<unsigned R>() {
       hipLaunchKernelGGL(
-          (RoutedGateUpRestore<Bits, R>),
-          dim3((g.rows / 16 + kRoutedWaves - 1) / kRoutedWaves, assignments, 2),
-          dim3(32 * kRoutedWaves), 0, stream, g.device_exl3,
+          (RoutedGateUpRestore<Bits, R>), dim3(g.rows / 128, assignments),
+          dim3(32 * kRestoreWaves), 0, stream, g.device_exl3,
           l.ffn_up_exps.device_exl3, d.device_exl3, scratch.tiles,
           scratch.tile_count, input, gate_y, up_y, g.cols, g.rows, assignments,
-          scratch.routed_down_input, scratch.down_exponents, d.cols,
-          scratch.routed_arrivals);
+          scratch.routed_down_input, scratch.routed_ranges);
     };
     switch (tile_rows) {
       case 1:
@@ -1549,16 +1576,23 @@ void LaunchGateUpRestore(const DeviceLayer& l, const std::uint16_t* input,
 
 namespace {
 // prescaled: RestoreActivateScale already scaled the input and wrote the
-// exponents (the ScaleDownRows pass is folded into it).
+// exponents (the ScaleDownRows pass is folded into it). ranged: the input
+// is unscaled and scratch.routed_ranges holds its segments' magnitude
+// ranges (RoutedGateUpRestore); the GEMV scales while staging.
 void RoutedDown(const DeviceTensor& down, std::uint16_t* input, float* out,
                 std::uint32_t assignments, std::uint32_t max_tile_rows,
-                const Exl3Scratch& scratch, hipStream_t stream,
-                bool prescaled) {
+                const Exl3Scratch& scratch, hipStream_t stream, bool prescaled,
+                bool ranged = false) {
   if (assignments == 0)
     return;
   if (max_tile_rows == 0 || max_tile_rows > 8)
     throw std::invalid_argument("EXL3 down tile rows must be 1..8");
-  if (scratch.down_exponents != nullptr) {
+  if (ranged) {
+    LaunchRouted<false, true, true>(down.device_exl3, down.device_exl3, input,
+                                    out, out, down.cols, down.rows, assignments,
+                                    1, TileRows(max_tile_rows), scratch, stream,
+                                    BankRate(down));
+  } else if (scratch.down_exponents != nullptr) {
     if (!prescaled)
       hipLaunchKernelGGL(ScaleDownRows, dim3(assignments), dim3(256), 0, stream,
                          input, scratch.down_exponents, down.cols);
@@ -1983,19 +2017,19 @@ void Exl3RoutedMlp(const DeviceLayer& l, const float* x,
   if (trace != nullptr)
     snapshot(trace->gate_up_input, s.routed_input,
              std::size_t{2} * assignments * g.cols * sizeof(std::uint16_t));
-  // Without a trace the restore runs in the gate/up launch's last block
-  // per tile, writing the down input to its own slab.
+  // Without a trace each gate/up block restores its own segment, writing
+  // the unscaled down input to its own slab and the segment ranges the
+  // down GEMV scales by.
   const bool restore_fused =
       trace == nullptr && s.down_exponents != nullptr &&
-      s.routed_down_input != nullptr && s.routed_arrivals != nullptr &&
+      s.routed_down_input != nullptr && s.routed_ranges != nullptr &&
       assignments <= s.routed_assignments && BankRate(g) == BankRate(u) &&
-      g.rows == d.cols && d.cols % 128 == 0 && d.cols <= 4096 &&
-      g.rows % 16 == 0;
+      g.rows == d.cols && d.cols % 128 == 0 && d.cols <= 4096;
   if (restore_fused) {
     LaunchGateUpRestore(l, s.routed_input, gate, up, assignments, tile_rows, s,
                         stream);
     RoutedDown(d, s.routed_down_input, out, assignments, tile_rows, s, stream,
-               true);
+               true, true);
     if (!raw_down)
       hipLaunchKernelGGL(RestoreDownAssignments,
                          dim3(d.rows / 128, assignments), dim3(32), 0, stream,

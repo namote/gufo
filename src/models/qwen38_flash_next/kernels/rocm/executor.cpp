@@ -1351,7 +1351,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     ex.route_arrivals = Alloc<std::uint32_t>(a, 1, error_msg);
     ex.routed_down_input = Alloc<std::uint16_t>(
         a, assignments * std::size_t{c.expert_ff}, error_msg);
-    ex.routed_arrivals = Alloc<std::uint32_t>(a, assignments, error_msg);
+    ex.routed_ranges = Alloc<std::uint32_t>(
+        a, assignments * ((std::size_t{c.expert_ff} + 127) / 128) * 2,
+        error_msg);
     ex.routed_assignments = static_cast<std::uint32_t>(assignments);
     ex.down_exponents = Alloc<std::int32_t>(a, assignments, error_msg);
     e->exl3_dense_rotations_ =
@@ -4250,7 +4252,7 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   // their original stream ownership.
   // EXL3 decode/verify: the fused shared MLP (its own fast-path slabs,
   // counters and shexp rows) runs beside the routed GEMVs (routed_input,
-  // routed_down_input, tiles and their arrival counters, gate_e/up_e/down_e);
+  // routed_down_input and its segment ranges, tiles, gate_e/up_e/down_e);
   // Exl3Experts joins before the combine reads
   // shexp_out.
   const bool exl3_decode_overlap =

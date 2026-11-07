@@ -40,13 +40,14 @@ struct Exl3Scratch {
   /// so other fast launches between producer and consumer cannot clobber it.
   std::uint16_t* rotated_input{nullptr};
   std::size_t rotated_input_elements{0};
-  /// [routed_assignments][expert_ff] FP16 down input written by the routed
-  /// gate/up launch's restore tail (routed_input still holds other tiles'
-  /// gate/up input then), and its zero-initialized per-tile arrival
-  /// counters, which return to zero. Optional: null keeps the separate
-  /// restore launch.
+  /// [routed_assignments][expert_ff] unscaled FP16 down input written by
+  /// the routed gate/up launch's in-block segment restore (routed_input
+  /// still holds other tiles' gate/up input then), and the FP16 magnitude
+  /// range of each 128-wide segment, [routed_assignments][expert_ff / 128]
+  /// [min, max], from which the down GEMV forms each row's exponent.
+  /// Optional: null keeps the separate restore launch.
   std::uint16_t* routed_down_input{nullptr};
-  std::uint32_t* routed_arrivals{nullptr};
+  std::uint32_t* routed_ranges{nullptr};
   std::uint32_t routed_assignments{0};
 };
 
