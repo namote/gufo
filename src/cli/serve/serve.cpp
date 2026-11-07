@@ -939,6 +939,7 @@ int RunServe(std::span<const char* const> args) {
         diagnostics::PlanQueues(profile, diagnostics::QueryQueueCensus(),
                                 std::getenv("GPU_MAX_HW_QUEUES"));
     diagnostics::ApplyQueuePlan(plan);
+    diagnostics::ApplyLaunchDefaults();
     server::Logger::Info("gpu",
                          diagnostics::DescribeQueuePlan(subcommand, plan));
     if (plan.may_exceed_budget) {

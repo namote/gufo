@@ -87,6 +87,14 @@ struct QueuePlan {
 /// a hardware queue back.
 void ApplyQueuePlan(const QueuePlan& plan);
 
+/// Exports HIP_FORCE_DEV_KERNARG=1 unless the operator set it: kernel
+/// arguments are then staged in device memory, which the command processor
+/// reads at each dispatch instead of fetching them from host memory (the
+/// default on this APU). Decode issues over a thousand small dispatches per
+/// token, so per-dispatch latency matters. Must run before the first HIP
+/// call; the runtime reads it once at initialization.
+void ApplyLaunchDefaults();
+
 /// Renders the plan as a log line for the queue-budget event.
 [[nodiscard]] std::string DescribeQueuePlan(std::string_view kind,
                                             const QueuePlan& plan);

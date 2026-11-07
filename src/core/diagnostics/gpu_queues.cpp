@@ -137,6 +137,13 @@ QueuePlan PlanQueues(QueueProfile profile, const QueueCensus& census,
   return plan;
 }
 
+void ApplyLaunchDefaults() {
+  constexpr const char* kDeviceKernargEnvironment = "HIP_FORCE_DEV_KERNARG";
+  if (std::getenv(kDeviceKernargEnvironment) == nullptr) {
+    (void)platform::SetEnv(kDeviceKernargEnvironment, "1");
+  }
+}
+
 void ApplyQueuePlan(const QueuePlan& plan) {
   if (plan.cap == 0) {
     return;
