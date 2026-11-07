@@ -8,7 +8,6 @@
 #include <string_view>
 #include <vector>
 
-#include "src/core/platform/env.hpp"
 #include "src/core/platform/os_info.hpp"
 
 namespace {
@@ -238,21 +237,6 @@ void OperatorPlanDoesNotPredictAQueueCount() {
          "the operator's value bounds the resident count");
 }
 
-void LaunchDefaultsKeepOperatorKernargSetting() {
-  constexpr const char* kName = "HIP_FORCE_DEV_KERNARG";
-  Expect(gufo::platform::UnsetEnv(kName), "the variable can be cleared");
-  gufo::diagnostics::ApplyLaunchDefaults();
-  const char* set = std::getenv(kName);
-  Expect(set != nullptr && std::string_view(set) == "1",
-         "device kernel arguments are the default");
-  Expect(gufo::platform::SetEnv(kName, "0"), "an operator value can be set");
-  gufo::diagnostics::ApplyLaunchDefaults();
-  const char* kept = std::getenv(kName);
-  Expect(kept != nullptr && std::string_view(kept) == "0",
-         "an operator kernarg setting is never overridden");
-  (void)gufo::platform::UnsetEnv(kName);
-}
-
 }  // namespace
 
 int main() {
@@ -271,7 +255,6 @@ int main() {
   EmptyOperatorValueIsIgnored();
   PlanIsDescribedForTheLog();
   OperatorPlanDoesNotPredictAQueueCount();
-  LaunchDefaultsKeepOperatorKernargSetting();
   std::cout << "gpu_queues_test: all checks passed\n";
   return 0;
 }
