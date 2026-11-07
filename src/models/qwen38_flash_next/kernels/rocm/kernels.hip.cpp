@@ -1457,7 +1457,7 @@ __global__ void NarrowKernel(const float* x, T* out, std::size_t count) {
 constexpr unsigned kSmallGemmRows = 4;
 template<WeightType type, unsigned tokens, bool grouped = false,
          bool kWhole = false, bool stable = false, bool kHcDown = false,
-         bool kTailVector = false>
+         bool kTailVector = false, unsigned kDeepSteps = 0>
 __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
                                 std::uint32_t m, std::uint32_t k) {
   static_assert(!kHcDown || (stable && type == WeightType::kF16));
@@ -1475,8 +1475,12 @@ __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
       static_cast<const std::uint8_t*>(w) + RowBytes(type, k) * row;
   // A lane's steps are loaded kSteps at a time so their reads overlap (one
   // step at a time leaves a decode-sized projection latency-bound); the
-  // steps still accumulate one after another, in order.
-  constexpr unsigned kSteps = stable || kWhole || tokens <= 2 ? 4 : 2;
+  // steps still accumulate one after another, in order. kDeepSteps (whole
+  // passes only) keeps more of a long row's steps in flight.
+  static_assert(kDeepSteps == 0 || kWhole);
+  constexpr unsigned kSteps = kDeepSteps != 0                   ? kDeepSteps
+                              : stable || kWhole || tokens <= 2 ? 4
+                                                                : 2;
   const std::uint32_t stride = warpSize * 4;
   float acc[tokens] = {};
   for (std::uint32_t i_base = lane * 4; i_base < k; i_base += stride * kSteps) {
@@ -8153,11 +8157,57 @@ void PrepareExl3DensePrefill(std::span<const Exl3DensePrefillProblem> problems,
                      stream, args, rotations, gemms);
 }
 
+/// HC down's stable whole-pass kernel with `steps` four-element steps of a
+/// lane in flight per pass instead of four: 80 blocks stream 10240-wide rows
+/// and were latency-bound. Every lane still visits its steps in increasing
+/// order with the same pinned FMA chain, so each output keeps its bits.
+template<unsigned tokens, unsigned steps>
+void LaunchHcDownDeep(const void* w, const float* x, float* out,
+                      hipStream_t stream) {
+  constexpr std::uint32_t m = 320;
+  constexpr std::uint32_t k = 10240;
+  static_assert(k % (32 * 4 * steps) == 0);
+  hipLaunchKernelGGL((SmallGemmKernel<WeightType::kF16, tokens, false, true,
+                                      true, false, false, steps>),
+                     dim3((m + kSmallGemmRows - 1) / kSmallGemmRows),
+                     dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m, k);
+}
+
 void HcDownSiluF16(const void* w, const float* x, float* out,
                    std::uint32_t n_tokens, hipStream_t stream) {
   // The fused SiLU compiled differently for some rows despite nominally
   // identical source expressions. Keep the established F32 store boundary.
-  SmallGemmStable(w, WeightType::kF16, x, out, n_tokens, 320, 10240, stream);
+  // Steps in flight are bounded by the live x registers (4 * tokens each);
+  // seven or eight rows already fill the registers at four steps (five
+  // spilled), so they keep the generic launch.
+  const bool aligned = (reinterpret_cast<std::uintptr_t>(w) |
+                        reinterpret_cast<std::uintptr_t>(x)) %
+                           16 ==
+                       0;
+  if (!aligned || n_tokens == 0 || n_tokens > 6) {
+    SmallGemmStable(w, WeightType::kF16, x, out, n_tokens, 320, 10240, stream);
+  } else {
+    switch (n_tokens) {
+      case 1:
+        LaunchHcDownDeep<1, 10>(w, x, out, stream);
+        break;
+      case 2:
+        LaunchHcDownDeep<2, 10>(w, x, out, stream);
+        break;
+      case 3:
+        LaunchHcDownDeep<3, 8>(w, x, out, stream);
+        break;
+      case 4:
+        LaunchHcDownDeep<4, 8>(w, x, out, stream);
+        break;
+      case 5:
+        LaunchHcDownDeep<5, 5>(w, x, out, stream);
+        break;
+      default:
+        LaunchHcDownDeep<6, 5>(w, x, out, stream);
+        break;
+    }
+  }
   SiluScale(out, 0.25F, std::size_t{n_tokens} * 320, stream);
 }
 

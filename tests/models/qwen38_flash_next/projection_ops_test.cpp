@@ -1073,6 +1073,12 @@ void CheckHcDownSilu() {
   std::vector<float> history(std::size_t{total_rows} * k);
   for (auto& value : history)
     value = Uniform(&seed, 1.0F);
+  // Signed zeros and subnormals on both operands, spread over every step of
+  // a lane's pass (the deep decode launch keeps more steps in flight).
+  for (std::size_t i = 0; i < history.size(); i += 997)
+    history[i] = i % 3 == 0 ? -0.0F : (i % 3 == 1 ? 1.0e-39F : -2.5e-41F);
+  for (std::size_t i = 0; i < weights.size(); i += 1009)
+    weights[i] = __float2half(i % 2 == 0 ? -0.0F : 3.0e-6F);
   void* dw = nullptr;
   CheckHip(hipMalloc(&dw, weights.size() * sizeof(__half)), "HC F16 weights");
   CheckHip(hipMemcpy(dw, weights.data(), weights.size() * sizeof(__half),
