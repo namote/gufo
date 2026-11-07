@@ -11,6 +11,7 @@
 #include "src/cli/serve/serve.hpp"
 #include "src/cli/transcribe/transcribe.hpp"
 #include "src/cli/video/video.hpp"
+#include "src/core/diagnostics/gpu_queues.h"
 
 #ifndef GUFO_RELEASE_VERSION
 #define GUFO_RELEASE_VERSION "development"
@@ -122,6 +123,12 @@ int run(std::span<const char* const> args) {
   }
 
   gufo::cli::PrintStartupBanner(kGufoReleaseVersion, options);
+
+  // Before any HIP call: every model-running command dispatches with the
+  // same runtime defaults. `probe` and `diagnose` report the environment
+  // as the operator left it.
+  if (first_arg != "probe" && first_arg != "diagnose")
+    gufo::diagnostics::ApplyLaunchDefaults();
 
   if (first_arg == "probe") {
     return gufo::cli::RunProbe(options.subspan(1));
