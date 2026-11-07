@@ -775,7 +775,8 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
 
 // Unquantized router, alpha/beta and indexer projections must keep the same
 // result when a token moves between decode and any verification batch width.
-void CheckSmallProjection(q::WeightType type, unsigned rows, unsigned cols) {
+void CheckSmallProjection(q::WeightType type, unsigned rows, unsigned cols,
+                          bool stable = false, bool unaligned = false) {
   constexpr unsigned tokens = 64;
   const unsigned element_bytes = type == q::WeightType::kF32 ? 4 : 2;
   std::vector<std::uint8_t> weights(std::size_t(rows) * cols * element_bytes);
@@ -802,11 +803,14 @@ void CheckSmallProjection(q::WeightType type, unsigned rows, unsigned cols) {
     value = Uniform(&seed, 1.7F);
   void* dw = nullptr;
   float* dx = nullptr;
+  float* input_allocation = nullptr;
   float* dy = nullptr;
   const std::size_t count = std::size_t(tokens) * rows;
   CheckHip(hipMalloc(&dw, weights.size()), "small weights allocation");
-  CheckHip(hipMalloc(&dx, input.size() * sizeof(float)),
+  CheckHip(hipMalloc(&input_allocation,
+                     (input.size() + unsigned(unaligned)) * sizeof(float)),
            "small input allocation");
+  dx = input_allocation + unsigned(unaligned);
   CheckHip(hipMalloc(&dy, (count + 8) * sizeof(float)),
            "small output allocation");
   CheckHip(hipMemcpy(dw, weights.data(), weights.size(), hipMemcpyHostToDevice),
@@ -814,9 +818,14 @@ void CheckSmallProjection(q::WeightType type, unsigned rows, unsigned cols) {
   CheckHip(hipMemcpy(dx, input.data(), input.size() * sizeof(float),
                      hipMemcpyHostToDevice),
            "small input upload");
+  const auto project = [&](const float* x, float* y, unsigned count) {
+    if (stable)
+      q::SmallGemmStable(dw, type, x, y, count, rows, cols, nullptr);
+    else
+      q::SmallGemm(dw, type, x, y, count, rows, cols, nullptr);
+  };
   for (unsigned token = 0; token < tokens; ++token)
-    q::SmallGemm(dw, type, dx + token * cols, dy + token * rows, 1, rows, cols,
-                 nullptr);
+    project(dx + token * cols, dy + token * rows, 1);
   std::vector<float> scalar(count), batch(count + 8), replay(count);
   CheckHip(hipMemcpy(scalar.data(), dy, count * sizeof(float),
                      hipMemcpyDeviceToHost),
@@ -834,11 +843,11 @@ void CheckSmallProjection(q::WeightType type, unsigned rows, unsigned cols) {
             "small projection differs from FP64 reference");
     }
   }
-  for (const unsigned n :
-       {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U, 16U, 31U, 32U, 33U, tokens}) {
+  for (const unsigned n : {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U, 15U, 16U, 17U,
+                           31U, 32U, 33U, tokens}) {
     CheckHip(hipMemset(dy, 0xA5, batch.size() * sizeof(float)),
              "small output poison");
-    q::SmallGemm(dw, type, dx, dy, n, rows, cols, nullptr);
+    project(dx, dy, n);
     CheckHip(hipMemcpy(batch.data(), dy, batch.size() * sizeof(float),
                        hipMemcpyDeviceToHost),
              "small batch output");
@@ -849,15 +858,25 @@ void CheckSmallProjection(q::WeightType type, unsigned rows, unsigned cols) {
       if (std::bit_cast<std::uint32_t>(batch[i]) != 0xA5A5A5A5U)
         throw std::runtime_error("small projection overwrote its output guard");
   }
-  q::SmallGemm(dw, type, dx, dy, tokens, rows, cols, nullptr);
+  project(dx, dy, tokens);
   CheckHip(hipMemcpy(replay.data(), dy, count * sizeof(float),
                      hipMemcpyDeviceToHost),
            "small replay output");
   if (std::memcmp(scalar.data(), replay.data(), count * sizeof(float)))
     throw std::runtime_error("small projection replay differs");
   CheckHip(hipFree(dy), "small output free");
-  CheckHip(hipFree(dx), "small input free");
+  CheckHip(hipFree(input_allocation), "small input free");
   CheckHip(hipFree(dw), "small weights free");
+}
+
+void CheckStableGroupedProjections() {
+  for (auto type :
+       {q::WeightType::kF16, q::WeightType::kBF16, q::WeightType::kF32})
+    for (unsigned k : {131U, 320U, 512U, 2560U})
+      for (bool unaligned : {false, true})
+        CheckSmallProjection(type, 7, k, true, unaligned);
+  std::cout << "Stable grouped projections: FP64, partition bytes and guards "
+               "passed\n";
 }
 
 void CheckDecodeGrouping(int rows, int cols, int grouped_tokens = 0) {
@@ -1185,6 +1204,10 @@ void CheckHcDownSilu() {
 
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::string(argv[1]) == "--stable-grouped") {
+      CheckStableGroupedProjections();
+      return 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--hc-down-f16") {
       CheckHcDownSilu();
       return 0;
@@ -1193,6 +1216,7 @@ int main(int argc, char** argv) {
     if (qfn_mmq_init(0) != 0)
       throw std::runtime_error("prepare quantized decode projections");
     CheckRoutedQ8Placement();
+    CheckStableGroupedProjections();
     CheckDenseAcrossStreams();
     CheckSmallProjection(q::WeightType::kF32, 513, 2560);
     CheckSmallProjection(q::WeightType::kF32, 96, 2560);

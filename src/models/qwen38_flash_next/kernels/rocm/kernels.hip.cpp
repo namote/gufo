@@ -8060,9 +8060,10 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
 }
 
 template<WeightType type, unsigned tokens, bool stable = false,
-         bool kHcDown = false>
+         bool kHcDown = false, bool grouped = false>
 void LaunchSmallGemm(const void* w, const float* x, float* out, std::uint32_t m,
-                     std::uint32_t k, hipStream_t stream) {
+                     std::uint32_t k, hipStream_t stream, unsigned groups = 1) {
+  const dim3 grid((m + kSmallGemmRows - 1) / kSmallGemmRows, groups);
   if constexpr (type != WeightType::kQ8_0) {
     // Rows of whole four-step passes (K 2560: router and GDN alpha/beta in
     // F16, indexer in BF16) take the unchecked vector loads, four steps at a
@@ -8073,24 +8074,22 @@ void LaunchSmallGemm(const void* w, const float* x, float* out, std::uint32_t m,
                          0;
     if constexpr (stable && type == WeightType::kF16 && !kHcDown) {
       if (aligned && k == 320) {
-        hipLaunchKernelGGL(
-            (SmallGemmKernel<type, tokens, false, false, stable, false, true>),
-            dim3((m + kSmallGemmRows - 1) / kSmallGemmRows),
-            dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m, k);
+        hipLaunchKernelGGL((SmallGemmKernel<type, tokens, grouped, false,
+                                            stable, false, true>),
+                           grid, dim3(kSmallGemmRows * 32), 0, stream, w, x,
+                           out, m, k);
         return;
       }
     }
     if (aligned && k % (32 * 4 * 4) == 0) {
       hipLaunchKernelGGL(
-          (SmallGemmKernel<type, tokens, false, true, stable, kHcDown>),
-          dim3((m + kSmallGemmRows - 1) / kSmallGemmRows),
+          (SmallGemmKernel<type, tokens, grouped, true, stable, kHcDown>), grid,
           dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m, k);
       return;
     }
   }
   hipLaunchKernelGGL(
-      (SmallGemmKernel<type, tokens, false, false, stable, kHcDown>),
-      dim3((m + kSmallGemmRows - 1) / kSmallGemmRows),
+      (SmallGemmKernel<type, tokens, grouped, false, stable, kHcDown>), grid,
       dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m, k);
 }
 
@@ -8100,9 +8099,17 @@ void SmallGemmForType(const void* w, const float* x, float* out,
                       hipStream_t stream) {
   if (tokens > 8) {
     const auto groups = tokens / 8;
-    hipLaunchKernelGGL((SmallGemmKernel<type, 8, true, false, stable, kHcDown>),
-                       dim3((m + kSmallGemmRows - 1) / kSmallGemmRows, groups),
-                       dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m, k);
+    if constexpr (stable) {
+      // Each group owns eight complete rows, preserving vector alignment.
+      // Stable scalar/vector loads share the same four-step FMA chain.
+      LaunchSmallGemm<type, 8, stable, kHcDown, true>(w, x, out, m, k, stream,
+                                                      groups);
+    } else {
+      hipLaunchKernelGGL(
+          (SmallGemmKernel<type, 8, true, false, stable, kHcDown>),
+          dim3((m + kSmallGemmRows - 1) / kSmallGemmRows, groups),
+          dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m, k);
+    }
     const auto consumed = groups * 8;
     x += std::size_t{consumed} * k;
     out += std::size_t{consumed} * m;

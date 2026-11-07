@@ -213,9 +213,10 @@ __device__ __forceinline__ void RoutedGemvBody(
   }
 }
 
-// Select the live-row loop once per expert tile. Rechecking each absent
-// row in every K step is costly for ragged K5 verification. Keep generic
-// dispatch for other shapes and the unscaled full-precision down path.
+// Select the live-row loop once per expert tile, avoiding absent-row checks
+// in every K step. Rate-specific decoding stays in the body; only the row
+// loop is specialized, independently of the bit rate.
+// Keep generic dispatch for other shapes and unscaled full-precision down.
 template<int Bits, bool FullPrecision, unsigned MaxRows = 8,
          bool Scaled = false>
 __global__ void RoutedGemv(const ex::DeviceLinear* gate,
@@ -227,7 +228,7 @@ __global__ void RoutedGemv(const ex::DeviceLinear* gate,
                            const std::int32_t* exponents) {
   if (blockIdx.y >= *count)
     return;
-  if constexpr (Bits == 5 && !FullPrecision && (MaxRows == 3 || MaxRows == 4)) {
+  if constexpr (!FullPrecision && (MaxRows == 3 || MaxRows == 4)) {
     switch (tiles[blockIdx.y].count) {
       case 1:
         RoutedGemvBody<Bits, FullPrecision, 1, Scaled, true>(
@@ -1610,9 +1611,12 @@ void Exl3DraftHead(const DeviceTensor& head, const float* x, float* logits,
                    std::uint32_t extras, const Exl3Scratch& s,
                    hipStream_t stream) {
   const auto& l = *head.exl3;
-  if (prefix % 128 != 0 || prefix > l.n || l.rate.half || l.rate.bits < 3 ||
+  if (prefix % 128 != 0 || prefix > l.n || (l.rate.half && l.rate.bits != 3) ||
+      l.rate.bits < 3 ||
       l.rate.bits > 8 || l.codebook != ex::Codebook::kMul1)
-    throw std::runtime_error("EXL3 draft head needs a complete K3..K8 prefix");
+    throw std::runtime_error("EXL3 draft head needs a complete K3..K8 or K3.5 prefix");
+  if (prefix == 0 && extras == 0)
+    return;
   hipLaunchKernelGGL(SelectSegments, dim3(1), dim3(1), 0, stream, ids, extras,
                      prefix, l.n, s.head_segments);
   hipLaunchKernelGGL(HeadInput, dim3(l.k / 128), dim3(32), 0, stream, l, x,
@@ -1624,9 +1628,10 @@ void Exl3DraftHead(const DeviceTensor& head, const float* x, float* logits,
   });
   hipLaunchKernelGGL(RestoreHead, dim3(prefix / 128 + extras), dim3(32), 0,
                      stream, l, s.head_values, logits, prefix, s.head_segments);
-  hipLaunchKernelGGL(GatherHead, dim3((extras + 255) / 256), dim3(256), 0,
-                     stream, s.head_values, logits, prefix, ids, extras, l.n,
-                     s.head_segments);
+  if (extras != 0)
+    hipLaunchKernelGGL(GatherHead, dim3((extras + 255) / 256), dim3(256), 0,
+                       stream, s.head_values, logits, prefix, ids, extras, l.n,
+                       s.head_segments);
   Check();
 }
 

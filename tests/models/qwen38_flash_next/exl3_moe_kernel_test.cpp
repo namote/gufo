@@ -241,6 +241,7 @@ int main() {
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <random>
 #include <span>
@@ -312,15 +313,15 @@ void Near(std::span<const float> actual, std::span<const float> expected,
 
 struct Bank {
   unsigned k, n, experts;
-  int bits;
+  ex::BitRate rate;
   std::vector<ex::DeviceLinear> descriptors;
   std::vector<std::uint16_t> trellis, suh, svh, inner;
   gpu::DeviceTensor weight;
   Bank(Buffers& buffers, unsigned inputs, unsigned outputs, unsigned count,
-       unsigned seed, bool decode = true, int rate = 5)
-      : k(inputs), n(outputs), experts(count), bits(rate) {
+       unsigned seed, bool decode = true, int bits = 5, bool half = false)
+      : k(inputs), n(outputs), experts(count), rate{bits, half} {
     std::mt19937 rng(seed);
-    const auto words = std::size_t{k / 16} * (n / 16) * 16 * bits;
+    const auto words = std::size_t{k / 16} * (n / 16) * rate.TileWords();
     trellis.resize(words * experts);
     suh.resize(k * experts);
     svh.resize(n * experts);
@@ -338,15 +339,10 @@ struct Bank {
     auto* ds = buffers.Copy(suh);
     auto* dv = buffers.Copy(svh);
     for (unsigned e = 0; e < experts; ++e) {
-      descriptors.push_back({dt + e * words,
-                             ds + e * k,
-                             dv + e * n,
-                             k,
-                             n,
-                             {bits, false},
+      descriptors.push_back({dt + e * words, ds + e * k, dv + e * n, k, n, rate,
                              ex::Codebook::kMul1});
       if (decode)
-        ex::DequantInner(trellis.data() + e * words, k, n, {bits, false},
+        ex::DequantInner(trellis.data() + e * words, k, n, rate,
                          ex::Codebook::kMul1,
                          inner.data() + std::size_t{e} * k * n);
     }
@@ -402,6 +398,66 @@ struct Bank {
   }
 };
 
+// Mode2 is unchanged by the Mode3 staging optimization. Check its raw FP32
+// dots against FP64, then require one FP16 rounding of those same dots in
+// Mode3. Exact-size input and inactive descriptors exercise the skipped tiles.
+void HalfBucketStaging(int bits, bool half = false, unsigned k = 256) {
+  constexpr unsigned n = 128;
+  Buffers weights;
+  Bank bank(weights, k, n, 1, 73, true, bits, half);
+  for (unsigned rows :
+       {1U, 15U, 16U, 17U, 31U, 32U, 33U, 63U, 64U, 65U, 127U, 128U}) {
+    Buffers buffers;
+    // Row zero is outside the active bucket; no allocation padding follows
+    // its final input row. The extra descriptor is outside the device count.
+    std::vector<std::uint16_t> input((rows + 1) * k);
+    for (std::size_t i = 0; i < input.size(); ++i)
+      input[i] = ex::HalfFromDouble((int(i % 61) - 30) / 4096.0);
+    auto* x = buffers.Copy(input);
+    auto* buckets = buffers.Copy(
+        std::vector<gpu::Exl3ExpertBucket>{{0, rows, 1}, {0xffffffffU, 1, 0}});
+    auto* count = buffers.Copy(std::vector<std::uint32_t>{1});
+    auto* control = buffers.Make<float>((rows + 1) * n);
+    const unsigned tile_rows = rows <= 16 ? 16 : rows <= 32 ? 32 : 64;
+    gufo::hip::LaunchExl3PrefillBucketInner(bank.weight.device_exl3, buckets,
+                                            count, 2, tile_rows, x, control, k,
+                                            n, bank.rate, nullptr);
+    const auto dots = Read(control, (rows + 1) * n);
+    for (unsigned r = 1; r <= rows; ++r)
+      Near(std::span(dots).subspan(r * n, n), bank.Dot(0, input.data() + r * k),
+           "bucket FP32 vs independent FP64");
+    std::vector<std::int32_t> exponents(rows + 1);
+    for (unsigned r = 0; r <= rows; ++r)
+      exponents[r] = std::array{-1, 0, 1, 5}[r % 4];
+    auto* e = buffers.Copy(exponents);
+    constexpr std::uint16_t sentinel = 0x7e55;
+    std::vector<std::uint16_t> poison((rows + 1) * n + 2, sentinel);
+    auto* output = buffers.Copy(poison);
+    for (bool scaled : {false, true}) {
+      for (unsigned repeat = 0; repeat < 2; ++repeat) {
+        Check(hipMemcpy(output, poison.data(), poison.size() * sizeof(sentinel),
+                        hipMemcpyHostToDevice));
+        gufo::hip::LaunchExl3PrefillBucketInnerHalf(
+            bank.weight.device_exl3, buckets, count, 2, tile_rows, x,
+            output + 1, k, n, bank.rate, scaled ? e : nullptr, nullptr);
+        const auto actual = Read(output, poison.size());
+        for (unsigned i = 0; i <= n; ++i)
+          Require(actual[i] == sentinel, "half bucket prefix guard");
+        Require(actual.back() == sentinel, "half bucket suffix guard");
+        for (unsigned r = 1; r <= rows; ++r)
+          for (unsigned j = 0; j < n; ++j) {
+            const auto idx = std::size_t{r} * n + j;
+            const auto expected = ex::HalfFromDouble(std::ldexp(
+                double(dots[idx]), scaled ? -std::max(exponents[r], 0) : 0));
+            Require((actual[idx + 1] & 0x7c00) != 0x7c00 &&
+                        actual[idx + 1] == expected,
+                    "half bucket differs from rounded FP32 control");
+          }
+      }
+    }
+  }
+}
+
 // Frozen pre-change producer: restore/SwiGLU writes FP32, and only a
 // subsequent launch rotates it. Compare exact bytes, not an ideal FP64
 // activation that can cross a different FP16 down-input bin.
@@ -432,13 +488,14 @@ __global__ void UnfusedActivation(const ex::DeviceLinear* gate,
 }
 
 void FusedProducer(unsigned rows, bool shared, int bits = 5, int up_bits = 0,
-                   int down_bits = 0) {
+                   int down_bits = 0, bool half = false) {
   constexpr unsigned k = 256, ff = 640, used = 3, experts = 12;
   const unsigned assignments = rows * used;
   Buffers buffers;
-  Bank gate(buffers, k, ff, experts, 1, true, bits),
-      up(buffers, k, ff, experts, 2, true, up_bits == 0 ? bits : up_bits),
-      down(buffers, ff, k, experts, 3, true, down_bits == 0 ? bits : down_bits);
+  Bank gate(buffers, k, ff, experts, 1, true, bits, half),
+      up(buffers, k, ff, experts, 2, true, up_bits == 0 ? bits : up_bits, half),
+      down(buffers, ff, k, experts, 3, true, down_bits == 0 ? bits : down_bits,
+           half);
   gpu::DeviceLayer layer;
   layer.ffn_gate_exps = gate.weight;
   layer.ffn_up_exps = up.weight;
@@ -542,10 +599,10 @@ void FusedProducer(unsigned rows, bool shared, int bits = 5, int up_bits = 0,
   }
 }
 
-void DownFixtures(int bits) {
+void DownFixtures(int bits, bool half = false) {
   constexpr unsigned rows = 8, k = 640, n = 128;
   Buffers buffers;
-  Bank down(buffers, k, n, 1, 5, true, bits);
+  Bank down(buffers, k, n, 1, 5, true, bits, half);
   std::vector<std::uint16_t> input(rows * k);
   for (unsigned j = 0; j < k; ++j) {
     input[j] = j & 1 ? 0x8000 : 0;            // signed zero
@@ -603,6 +660,36 @@ void DownFixtures(int bits) {
       Require(std::equal(actual.begin() + r * n, actual.begin() + (r + 1) * n,
                          widened.begin() + r * n),
               "widened fallback changed bits");
+  }
+  // Exercise every live count in the specialized R3/R4 bodies, including
+  // negative-exponent FP32 fallback rows. R8 above remains an unchanged
+  // arithmetic control; unused slots are poisoned and output has guards.
+  for (unsigned cap : {3U, 4U}) {
+    for (unsigned live = 1; live <= cap; ++live) {
+      std::vector<gpu::Exl3RouteTile> tiles;
+      for (unsigned first = 0; first < rows; first += live) {
+        gpu::Exl3RouteTile part{};
+        std::fill(std::begin(part.slots), std::end(part.slots), -1);
+        part.count = std::min(live, rows - first);
+        for (unsigned r = 0; r < part.count; ++r)
+          part.slots[r] = first + r;
+        tiles.push_back(part);
+      }
+      s.tiles = buffers.Copy(tiles);
+      s.tile_count = buffers.Copy(
+          std::vector<std::uint32_t>{static_cast<std::uint32_t>(tiles.size())});
+      Check(hipMemcpy(scaled, input.data(), input.size() * sizeof(input[0]),
+                      hipMemcpyHostToDevice));
+      auto* guarded = buffers.Copy(std::vector<float>(rows * n + 2, 12345.0F));
+      gpu::Exl3RoutedDown(down.weight, scaled, guarded + 1, rows, cap, s,
+                          nullptr);
+      const auto result = Read(guarded, rows * n + 2);
+      Require(result.front() == 12345.0F && result.back() == 12345.0F,
+              "live-row down output guard");
+      Require(std::memcmp(result.data() + 1, actual.data(),
+                          actual.size() * sizeof(float)) == 0,
+              "live-row down differs from generic R8");
+    }
   }
 }
 
@@ -1301,7 +1388,8 @@ ExpertRun RunExperts(const gpu::DeviceLayer& layer,
   return result;
 }
 
-void ExpertInvariance(bool prefill, gpu::Exl3BucketGemm gemm, int bits) {
+void ExpertInvariance(bool prefill, gpu::Exl3BucketGemm gemm, int bits,
+                      bool half = false) {
   if (prefill) {
     candidate_gemm = gemm;
     gemm = ObservedGemm;
@@ -1309,9 +1397,9 @@ void ExpertInvariance(bool prefill, gpu::Exl3BucketGemm gemm, int bits) {
   constexpr unsigned k = 128, ff = 640, used = 3, experts = 12;
   const unsigned rows = prefill ? 65 : 17;
   Buffers buffers;
-  Bank gate(buffers, k, ff, experts, 21, true, bits),
-      up(buffers, k, ff, experts, 22, true, bits),
-      down(buffers, ff, k, experts, 23, true, bits);
+  Bank gate(buffers, k, ff, experts, 21, true, bits, half),
+      up(buffers, k, ff, experts, 22, true, bits, half),
+      down(buffers, ff, k, experts, 23, true, bits, half);
   gpu::DeviceLayer layer;
   layer.ffn_gate_exps = gate.weight;
   layer.ffn_up_exps = up.weight;
@@ -1382,36 +1470,164 @@ void ExpertInvariance(bool prefill, gpu::Exl3BucketGemm gemm, int bits) {
   }
 }
 
-void SelectedHeadRate(int bits) {
-  constexpr unsigned k = 128, n = 640, prefix = 128;
+void SelectedHeadRate(int bits, bool half = false, unsigned k = 128) {
+  constexpr unsigned n = 640;
   Buffers buffers;
-  Bank bank(buffers, k, n, 1, 31, true, bits);
+  Bank bank(buffers, k, n, 1, 31, true, bits, half);
   std::vector<float> input(k);
   for (unsigned i = 0; i < k; ++i)
     input[i] = (int(i % 73) - 36) * 0.00003125F;
-  const std::vector<std::int32_t> ids{0, 127, 128, 257, 639, -1};
-  gpu::Exl3Scratch scratch;
-  scratch.projection.fast_input = buffers.Make<std::uint16_t>(k);
-  scratch.head_segments = buffers.Make<std::uint32_t>(ids.size() + 1);
-  scratch.head_values = buffers.Make<float>((prefix / 128 + ids.size()) * 128);
-  auto* y = buffers.Make<float>(prefix + ids.size());
-  gpu::Exl3DraftHead(bank.weight, buffers.Copy(input), y, prefix,
-                     buffers.Copy(ids), ids.size(), scratch, nullptr);
-  const auto actual = Read(y, prefix + ids.size());
+  // Duplicated IDs/segments, both prefix boundaries, and invalid upper IDs.
+  const std::vector<std::int32_t> ids{0,  127, 128,   129, 257, 639,
+                                      -1, 640, 99999, 257, 128};
   const auto rotated = bank.Rotate(0, input.data());
   const auto expected = bank.Restore(0, bank.Dot(0, rotated.data()));
-  Near(std::span(actual).first(prefix), std::span(expected).first(prefix),
-       "selected-head prefix FP64");
-  std::vector<float> extras, reference;
-  for (unsigned i = 0; i < ids.size(); ++i) {
-    if (ids[i] < 0) {
-      Require(actual[prefix + i] == -INFINITY, "invalid selected-head ID");
-    } else {
-      extras.push_back(actual[prefix + i]);
-      reference.push_back(expected[ids[i]]);
+  for (unsigned prefix : {0U, 128U, 256U, n}) {
+    gpu::Exl3Scratch scratch;
+    scratch.projection.fast_input = buffers.Make<std::uint16_t>(k);
+    scratch.head_segments = buffers.Make<std::uint32_t>(ids.size() + 1);
+    const unsigned values = (prefix / 128 + ids.size()) * 128;
+    scratch.head_values = buffers.Make<float>(values + 16);
+    constexpr float sentinel = 12345.0F;
+    std::vector<float> initial(values + 16, sentinel);
+    Check(hipMemcpy(scratch.head_values, initial.data(),
+                    initial.size() * sizeof(float), hipMemcpyHostToDevice));
+    auto* storage =
+        buffers.Copy(std::vector<float>(prefix + ids.size() + 32, sentinel));
+    auto* y = storage + 16;
+    auto* dx = buffers.Copy(input);
+    auto* di = buffers.Copy(ids);
+    std::vector<float> first;
+    for (int repeat = 0; repeat < 2; ++repeat) {
+      gpu::Exl3DraftHead(bank.weight, dx, y, prefix, di, ids.size(), scratch,
+                         nullptr);
+      const auto actual = Read(y, prefix + ids.size());
+      Near(std::span(actual).first(prefix), std::span(expected).first(prefix),
+           "selected-head prefix FP64");
+      std::vector<float> extras, reference;
+      for (unsigned i = 0; i < ids.size(); ++i) {
+        if (ids[i] < 0 || ids[i] >= int(n)) {
+          Require(actual[prefix + i] == -INFINITY, "invalid selected-head ID");
+        } else {
+          extras.push_back(actual[prefix + i]);
+          reference.push_back(expected[ids[i]]);
+        }
+      }
+      Near(extras, reference, "selected-head extras FP64");
+      if (repeat == 0)
+        first = actual;
+      else
+        Require(std::memcmp(first.data(), actual.data(),
+                            first.size() * sizeof(float)) == 0,
+                "selected-head repeat");
+      for (float value : Read(storage, 16))
+        Require(value == sentinel, "head prefix guard");
+      for (float value : Read(y + prefix + ids.size(), 16))
+        Require(value == sentinel, "head suffix guard");
+      for (float value : Read(scratch.head_values + values, 16))
+        Require(value == sentinel, "head scratch guard");
     }
   }
-  Near(extras, reference, "selected-head extras FP64");
+  // Prefix-only requests and completely empty requests must not launch a
+  // zero-sized gather grid or touch absent ID/output storage.
+  for (unsigned prefix : {0U, 128U, n}) {
+    gpu::Exl3Scratch scratch;
+    scratch.projection.fast_input = buffers.Make<std::uint16_t>(k);
+    scratch.head_segments = buffers.Make<std::uint32_t>(1);
+    scratch.head_values = buffers.Make<float>(n);
+    auto* y = buffers.Make<float>(n);
+    gpu::Exl3DraftHead(bank.weight, buffers.Copy(input), y, prefix, nullptr, 0,
+                       scratch, nullptr);
+    if (prefix != 0)
+      Near(Read(y, prefix), std::span(expected).first(prefix),
+           "prefix-only head FP64");
+    else
+      Require(Read(y, n) == std::vector<float>(n), "empty head wrote output");
+  }
+  for (ex::BitRate invalid : {ex::BitRate{2, true}, ex::BitRate{4, true}}) {
+    auto descriptor = bank.descriptors[0];
+    descriptor.rate = invalid;
+    auto weight = bank.weight;
+    weight.exl3 = &descriptor;
+    bool rejected = false;
+    try {
+      gpu::Exl3DraftHead(weight, nullptr, nullptr, 128, nullptr, 0, {},
+                         nullptr);
+    } catch (const std::runtime_error&) {
+      rejected = true;
+    }
+    Require(rejected, "unsupported fractional head accepted");
+  }
+  std::cout << "selected head K=" << bits << (half ? ".5" : "") << " passed\n";
+}
+
+template<class F>
+float DenseTime(F&& launch) {
+  hipEvent_t start, end;
+  Check(hipEventCreate(&start));
+  Check(hipEventCreate(&end));
+  for (int i = 0; i < 2; ++i)
+    launch();
+  std::vector<float> samples;
+  for (int r = 0; r < 7; ++r) {
+    Check(hipEventRecord(start));
+    for (int i = 0; i < 5; ++i)
+      launch();
+    Check(hipEventRecord(end));
+    Check(hipEventSynchronize(end));
+    float ms = 0;
+    Check(hipEventElapsedTime(&ms, start, end));
+    samples.push_back(ms / 5);
+  }
+  Check(hipEventDestroy(start));
+  Check(hipEventDestroy(end));
+  std::sort(samples.begin(), samples.end());
+  return samples[samples.size() / 2];
+}
+
+void DenseTraversalRates(const char* evidence) {
+  constexpr unsigned k = 6144, n = 2560, rows = 2048;
+  std::ofstream file(evidence, std::ios::binary);
+  Require(bool(file), "open dense evidence");
+  for (int bits = 1; bits <= 8; ++bits) {
+    Buffers buffers;
+    Bank bank(buffers, k, n, 1, 941, false, bits);
+    std::vector<std::uint16_t> input(std::size_t(rows) * k);
+    for (std::size_t i = 0; i < input.size(); ++i)
+      input[i] = ex::HalfFromDouble((int(i % 119) - 59) * 0.00003125);
+    auto* dx = buffers.Copy(input);
+    constexpr float sentinel = 23456.0F;
+    auto* storage =
+        buffers.Copy(std::vector<float>(std::size_t(rows) * n + 32, sentinel));
+    auto* y = storage + 16;
+    auto* direct = buffers.Make<float>(std::size_t(rows) * n);
+    gufo::hip::LaunchExl3PrefillGemm(bank.descriptors[0], dx, direct, rows,
+                                     false, nullptr);
+    const auto reference = Read(direct, std::size_t(rows) * n);
+    const auto& l = bank.descriptors[0];
+    gufo::hip::Exl3GemmProblem problem{l.trellis, l.svh, dx, y, rows, 0};
+    auto* dp = buffers.Copy(std::vector{problem});
+    const auto launch = [&] {
+      gufo::hip::LaunchExl3PrefillGemmGrouped(dp, 1, rows, k, n, bank.rate,
+                                              false, nullptr);
+    };
+    for (int repeat = 0; repeat < 2; ++repeat) {
+      launch();
+      const auto actual = Read(y, std::size_t(rows) * n);
+      Require(std::memcmp(actual.data(), reference.data(),
+                          actual.size() * sizeof(float)) == 0,
+              "dense traversal differs from direct K16 control");
+      for (float v : Read(storage, 16))
+        Require(v == sentinel, "dense prefix guard");
+      for (float v : Read(y + std::size_t(rows) * n, 16))
+        Require(v == sentinel, "dense suffix guard");
+      if (repeat == 0)
+        file.write(reinterpret_cast<const char*>(actual.data()),
+                   actual.size() * sizeof(float));
+    }
+    std::cout << "DENSE K=" << bits
+              << " exact=1 median_ms=" << DenseTime(launch) << '\n';
+  }
 }
 
 void Buckets(unsigned rows, bool shared, unsigned tile_rows, int bits) {
@@ -1526,8 +1742,26 @@ void QualifyFlashNextExl3PrefillAdapter(gpu::Exl3BucketGemm gemm, int bits) {
   ExpertInvariance(true, gemm, bits);
 }
 
-int main() {
+int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::string(argv[1]) == "--head-generalization") {
+      for (int bits = 3; bits <= 8; ++bits)
+        SelectedHeadRate(bits);
+      SelectedHeadRate(3, true);
+      SelectedHeadRate(3, true, 256);
+      return 0;
+    }
+    if (argc == 3 && std::string(argv[1]) == "--dense-generalization") {
+      DenseTraversalRates(argv[2]);
+      return 0;
+    }
+    const bool rates_only =
+        argc == 2 && std::string(argv[1]) == "--rate-generalization";
+    Require(argc == 1 || rates_only, "unknown EXL3 kernel test option");
+    for (int bits : {1, 2, 3, 4, 5, 6, 7, 8})
+      HalfBucketStaging(bits);
+    HalfBucketStaging(3, true);
+    HalfBucketStaging(4, false, 2560);
     for (int bits : {3, 4, 5, 6, 7, 8}) {
       std::cout << "CASE expert K=" << bits << '\n';
       bool rejected = false;
@@ -1539,17 +1773,30 @@ int main() {
       }
       Require(rejected, "bucket adapter must reject null pointers for every K");
       DownFixtures(bits);
-      SelectedHeadRate(bits);
-      QualifyFlashNextExl3PrefillAdapter(ControlGemm, bits);
-      QualifyFlashNextExl3PrefillAdapter(gpu::Exl3PrefillBucketInner, bits);
+      if (!rates_only) {
+        SelectedHeadRate(bits);
+        QualifyFlashNextExl3PrefillAdapter(ControlGemm, bits);
+        QualifyFlashNextExl3PrefillAdapter(gpu::Exl3PrefillBucketInner, bits);
+      }
       ExpertInvariance(false, nullptr, bits);
       for (unsigned rows : {1U, 2U, 3U, 4U, 7U, 8U, 9U})
         for (bool shared : {false, true})
           FusedProducer(rows, shared, bits);
-      for (unsigned tile_rows : {16U, 32U, 64U})
-        for (unsigned rows : {1U, 3U, 17U, 33U, 65U})
-          for (bool shared : {false, true})
-            Buckets(rows, shared, tile_rows, bits);
+      if (!rates_only)
+        for (unsigned tile_rows : {16U, 32U, 64U})
+          for (unsigned rows : {1U, 3U, 17U, 33U, 65U})
+            for (bool shared : {false, true})
+              Buckets(rows, shared, tile_rows, bits);
+    }
+    // Fractional-rate decoding also uses the live-row routed path.
+    DownFixtures(3, true);
+    ExpertInvariance(false, nullptr, 3, true);
+    for (unsigned rows : {3U, 4U})
+      for (bool shared : {false, true})
+        FusedProducer(rows, shared, 3, 0, 0, true);
+    if (rates_only) {
+      std::cout << "EXL3 rate generalization contracts passed\n";
+      return 0;
     }
     PrefillCombineFrozenRows();
     PrefillCombineFrozenRows(true);

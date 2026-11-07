@@ -302,7 +302,7 @@ __launch_bounds__(WM * WN * 32) __global__ void HalfPrefillGemmKernel(
     unsigned group_shift = 3;
     // This long-K EXL3 projection benefits from reusing each weight tile
     // across token blocks before advancing to the next output-channel tile.
-    if constexpr (BM == 256 && BN == 256 && TrellisBits == 7 && Batching == 1 &&
+    if constexpr (BM == 256 && BN == 256 && Trellis && Batching == 1 &&
                   Epilogue == HalfEpilogue::kStore) {
       if (k == 6144 && m == 2560 && batch == 2048 && gridDim.z == 1)
         group_shift = 0;
@@ -558,7 +558,7 @@ __launch_bounds__(WM * WN * 32) __global__ void HalfPrefillGemmKernel(
 #pragma unroll
     for (int p = 0; p < PFB; ++p) {
       const int idx = p * kThreads + tid, kk = ks0 + idx % BK;
-      if constexpr (Batching == 3 && TrellisBits == 5) {
+      if constexpr (Batching == 3) {
         // Keep the complete final live WMMA subtile, including its padding.
         if (t_block + ((idx / BK) / 16) * 16 >= batch)
           continue;
@@ -566,7 +566,7 @@ __launch_bounds__(WM * WN * 32) __global__ void HalfPrefillGemmKernel(
       // Supported EXL3 K is a multiple of 128: stages dividing eight K16
       // steps have no K tail. This does not make token rows complete.
       if (idx < BN * BK &&
-          (Complete || (Batching == 3 && TrellisBits == 5 && 8 % BK == 0) ||
+          (Complete || (Batching == 3 && 8 % BK == 0) ||
            kk < ksteps)) {
         const short* src = x_row[p] + static_cast<std::size_t>(kk) * 16;
         rb[p][0] = *reinterpret_cast<const uint4*>(src);
@@ -658,7 +658,7 @@ __launch_bounds__(WM * WN * 32) __global__ void HalfPrefillGemmKernel(
 #pragma unroll
     for (int p = 0; p < PFB; ++p) {
       const int idx = p * kThreads + tid, row = idx / BK, ks = idx % BK;
-      if constexpr (Batching == 3 && TrellisBits == 5) {
+      if constexpr (Batching == 3) {
         // XOR(ks & 3) never crosses a 16-row subtile boundary.
         if (t_block + (row / 16) * 16 >= batch)
           continue;
