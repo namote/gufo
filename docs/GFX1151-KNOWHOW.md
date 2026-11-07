@@ -1,5 +1,43 @@
 # gfx1151 optimization know-how
 
+## Flash-Next B1 decode glue and HC Q8, November 7, 2026
+
+User rule change: output bits may change; slight error is acceptable for speed.
+Commits `5c328695..cc86343e` (brief `plan/exl3/B1-BRIEF.md`): HC-down decode
+deep steps (A3); GDN decode history/rollback writes folded into SsmConv4 (A1);
+routed decode memset/BuildTiles/ScaleDown/RestoreDown folded into router,
+restore and combine (B1); four routed GEMV waves per block (B2); prefill mix
+epilogue emits F16 mixed (B4); IEEE-rounded Q8_0 copy scales (C1); EXL3 decode
+HC-down reads the resident Q8_0 copy (C2); EXL3 HC-up stored Q8_0, F16 freed
+(C3); prefill HC gate stored F16 (C4).
+
+Same window, c03 pack, pinned Nix10.1, FP16 KV, B C B C, r2, baseline
+`f24b10ea` build vs candidate `cc86343e`:
+
+| Row | Baseline tok/s | Candidate tok/s | Change |
+|---|---:|---:|---:|
+| PP2048 / 8192 off | 1471.5 / 1499.7 | 1508.7 / 1535.0 | +2.5% / +2.4% |
+| PP2048 / 8192 MTP | 1395.9 / 1419.8 | 1440.5 / 1461.7 | +3.2% / +3.0% |
+| AR128 d0 / d32768 | 27.31 / 26.75 | 31.02 / 30.37 | +13.6% / +13.5% |
+| MTP128 d0 / d32768 | 51.36 / 87.62 | 60.72 / 94.51 | +18.2% / +7.9% |
+
+PP gains are consistent but below the 5% gate. Candidate AR/MTP greedy hashes
+agree at both depths; d0 differs from baseline (allowed), d32768 is identical
+and lookup-heavy. Quality on the 32,760 BF16-teacher positions vs saved c03 FP16
+reference: KL256 0.041522→0.041742, top-1 90.8394→90.8303%, NLL
+2.1626503→2.162053; every paired token/block/window interval spans zero, so no
+C2/C3/C4 isolation was needed. Contributions of individual items are not
+isolated.
+
+Rejected: fusing q/k normalization into GdnKernel (`kPrep`) broke chunk and
+checkpoint invariance (state ≤1.5e-8, output ≤6e-7 across {3}→{1,2}); reverted
+in `cc86343e`, history fusion kept. A4 GPU greedy argmax saves only ≈50 µs/token
+because the host still syncs for the token. C5 full HC-up+mix fusion and A2
+producer-side rotation, B3 EXL3 deferred residual remain open. Pre-existing:
+gdn_ops "fused stable GDN differs from the separate convolution" (n=1, few-ulp
+outputs, identical state) also fails at `f24b10ea`.
+Evidence: `build/b1/gpu/RESULT.json`, `perf.json`, `quality/`, `units2/`.
+
 ## c03 final-pack runtime compatibility, November 7, 2026
 
 Final assembly passed payload checks, but nativevision image e7a761a40187 /

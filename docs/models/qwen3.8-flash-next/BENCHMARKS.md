@@ -1,5 +1,16 @@
 # Qwen3.8 Flash-Next benchmarks
 
+## B1 decode glue and HC Q8, November 7, 2026
+
+Same-window B C B C control (baseline `f24b10ea`, candidate `cc86343e`), c03,
+Nix10.1, FP16 KV, r2: PP2048/8192 off 1471.5/1499.7→1508.7/1535.0 tok/s
+(+2.5/+2.4%), MTP 1395.9/1419.8→1440.5/1461.7; AR128 d0/d32K
+27.31/26.75→31.02/30.37 (+13.6/+13.5%); MTP128 d0/d32K 51.36/87.62→60.72/94.51
+(+18.2/+7.9%, d32K lookup-heavy). Outputs may differ from baseline (Q8_0 HC,
+F16 prefill HC gate); BF16-teacher KL256 0.041522→0.041742, top-1
+90.8394→90.8303%, NLL 2.16265→2.16205, all paired intervals span zero.
+Details: [know-how](../../GFX1151-KNOWHOW.md).
+
 ## Generalized kernel paths, November 7, 2026
 
 Combined all-rate R3/R4 live rows, Mode3 staging and stable grouped vector
