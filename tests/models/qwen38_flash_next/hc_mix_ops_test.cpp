@@ -216,8 +216,9 @@ std::vector<T> DownloadRaw(const T* source, std::size_t count) {
 
 // The fused decode HC projections (down + SiLU/Q8_1, up + mix epilogue)
 // against qfn_mmq's GEMVs, SiluScaleQ8_1 and HcMixEpilogue, byte for byte,
-// for every decode width, twice (arrival counters wrap back to zero).
-void CheckFusedDecodeHc() {
+// for every decode width, twice (arrival counters wrap back to zero), with
+// and without inject partials and for zero, two and three rotation slabs.
+void CheckFusedDecodeHc(bool with_inject, std::uint32_t slab_count) {
   constexpr std::uint32_t kRank = 320;
   constexpr std::uint32_t kHcDim = kHidden * kStreams;
   constexpr std::uint32_t kRows = q::kHcDecodeMaxRows;
@@ -244,7 +245,7 @@ void CheckFusedDecodeHc() {
   const std::size_t mixed_bytes = qfn_mmq_q8_1_bytes(kRows, kHidden);
   const std::uint32_t lo_cols =
       static_cast<std::uint32_t>(qfn_mmq_q8_1_bytes(1, kRank) / 36 * 32);
-  const std::size_t slab = std::size_t{2} * 8 * kHidden;  // two consumers
+  const std::size_t slab = std::size_t{3} * 8 * kHidden;  // three consumers
   void *d_down, *d_up, *d_xq, *d_suh;
   CheckHip(hipMalloc(&d_down, down.size()), "hipMalloc");
   CheckHip(hipMalloc(&d_up, up.size()), "hipMalloc");
@@ -281,6 +282,7 @@ void CheckFusedDecodeHc() {
   CheckHip(hipMalloc(&d_arrivals, q::kHcArrivals * 4), "hipMalloc");
   CheckHip(hipMemset(d_arrivals, 0, q::kHcArrivals * 4), "memset");
   const float scale = 1.0F / kStreams;
+  const float* inject_w_ptr = with_inject ? d_inject_w.get() : nullptr;
   bool ok = true;
   for (int pass = 0; pass < 2; ++pass) {
     for (std::uint32_t rows = 1; rows <= kRows; ++rows) {
@@ -291,8 +293,9 @@ void CheckFusedDecodeHc() {
         q::Exl3InputSlabs s{};
         s.suh[0] = static_cast<const std::uint16_t*>(d_suh);
         s.suh[1] = static_cast<const std::uint16_t*>(d_suh);
+        s.suh[2] = static_cast<const std::uint16_t*>(d_suh);
         s.out = o.slabs.get();
-        s.count = 2;
+        s.count = slab_count;
         s.pass_rows = rows;
         s.k = kHidden;
         return s;
@@ -309,15 +312,15 @@ void CheckFusedDecodeHc() {
                                       static_cast<int>(kRank), nullptr) != 0)
         throw std::runtime_error("reference HC projections failed");
       const bool ref_rot = q::HcMixEpilogue(
-          d_xn.get(), ref.gate.get(), d_inject_w.get(), ref.mixed.get(),
+          d_xn.get(), ref.gate.get(), inject_w_ptr, ref.mixed.get(),
           ref.inject.get(), rows, kHidden, kStreams, nullptr,
           ref.mixed_q8.get(), slabs_of(ref));
       q::HcDownSiluQ8_1(d_down, d_xq, fused.lo.get(), scale, rows, lo_cols,
                         fused.lo_q8.get(), d_arrivals, nullptr);
       const bool fused_rot = q::HcUpMix(
           d_up, fused.lo_q8.get(), lo_cols / 32, kRank, fused.gate.get(),
-          d_xn.get(), d_inject_w.get(), fused.mixed.get(), fused.inject.get(),
-          rows, kHidden, nullptr, fused.mixed_q8.get(), slabs_of(fused),
+          d_xn.get(), inject_w_ptr, fused.mixed.get(), fused.inject.get(), rows,
+          kHidden, nullptr, fused.mixed_q8.get(), slabs_of(fused),
           d_arrivals + 1);
       CheckHip(hipDeviceSynchronize(), "fused decode HC");
       const auto same = [](const auto& a, const auto& b) {
@@ -331,13 +334,14 @@ void CheckFusedDecodeHc() {
       const bool gate_ok = same(DownloadRaw(ref.gate.get(), rows * kHcDim),
                                 DownloadRaw(fused.gate.get(), rows * kHcDim));
       const bool mix_ok =
-          ref_rot && fused_rot &&
+          ref_rot == (slab_count != 0) && fused_rot == ref_rot &&
           same(DownloadRaw(ref.mixed.get(), rows * kHidden),
                DownloadRaw(fused.mixed.get(), rows * kHidden)) &&
           same(DownloadRaw(ref.mixed_q8.get(), mixed_bytes),
                DownloadRaw(fused.mixed_q8.get(), mixed_bytes)) &&
-          same(DownloadRaw(ref.inject.get(), rows * kStreams * parts),
-               DownloadRaw(fused.inject.get(), rows * kStreams * parts)) &&
+          (!with_inject ||
+           same(DownloadRaw(ref.inject.get(), rows * kStreams * parts),
+                DownloadRaw(fused.inject.get(), rows * kStreams * parts))) &&
           same(DownloadRaw(ref.slabs.get(), slab),
                DownloadRaw(fused.slabs.get(), slab));
       const auto counters = DownloadRaw(d_arrivals, q::kHcArrivals);
@@ -345,7 +349,8 @@ void CheckFusedDecodeHc() {
           std::all_of(counters.begin(), counters.end(),
                       [](std::uint32_t v) { return v == 0; });
       if (!lo_ok || !gate_ok || !mix_ok || !counters_ok) {
-        std::cerr << "fused decode HC rows " << rows << " pass " << pass
+        std::cerr << "fused decode HC inject " << with_inject << " slabs "
+                  << slab_count << " rows " << rows << " pass " << pass
                   << ": lo " << lo_ok << " gate " << gate_ok << " mix "
                   << mix_ok << " counters " << counters_ok << '\n';
         ok = false;
@@ -359,12 +364,15 @@ void CheckFusedDecodeHc() {
   (void)hipFree(d_suh);
   if (!ok)
     throw std::runtime_error("fused decode HC projections differ");
-  std::cout << "fused decode HC projections: rows 1-8 byte-identical\n";
+  std::cout << "fused decode HC projections (inject " << with_inject
+            << ", slabs " << slab_count << "): rows 1-8 byte-identical\n";
 }
 
 int main() {
   try {
-    CheckFusedDecodeHc();
+    CheckFusedDecodeHc(true, 2);
+    CheckFusedDecodeHc(false, 0);
+    CheckFusedDecodeHc(true, 3);
     CheckFusedProjection(96);
     CheckFusedProjection(2049);
     constexpr std::size_t kHcDim = static_cast<std::size_t>(kHidden) * kStreams;

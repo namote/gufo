@@ -3141,11 +3141,12 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   // mix epilogue (two launches instead of four, the same arithmetic).
   const bool fused_decode =
       q8_decode_down && n_tokens <= kHcDecodeMaxRows && c.hc_count == 4 &&
-      c.hc_low_rank == 320 && m.down_q8.rows == 320 &&
-      m.down_q8.cols == 10240 && m.up.type == GgmlType::kQ8_0 &&
-      m.up.rows == c.HcDim() && m.up.cols == c.hc_low_rank &&
-      c.hidden_size % 256 == 0 && c.hidden_size / 256 <= kHcUpMaxChunks &&
-      UnpaddedQ8(c.HcDim()) && s_.hc_arrivals != nullptr;
+      c.hc_low_rank == 320 && m.down_q8.type == GgmlType::kQ8_0 &&
+      m.down_q8.rows == 320 && m.down_q8.cols == 10240 &&
+      m.up.type == GgmlType::kQ8_0 && m.up.rows == c.HcDim() &&
+      m.up.cols == c.hc_low_rank && c.hidden_size % 256 == 0 &&
+      c.hidden_size / 256 <= kHcUpMaxChunks && UnpaddedQ8(c.HcDim()) &&
+      s_.hc_arrivals != nullptr;
   const bool fused_down =
       !q8_down && !q8_decode_down && model_->output().exl3 != nullptr &&
       !xn_half_ && !MatrixRows(n_tokens) && m.down.type == GgmlType::kF16 &&
