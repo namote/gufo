@@ -2,23 +2,23 @@
 // ahead (exl3_moe.hip) against the former one-tile-per-iteration kernel
 // (copied from git HEAD as RoutedGemvOld): bitwise equality and time, cold
 // expert banks (512 experts), 10 routed experts, 1..8 tokens.
-#include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hip"
-
 #include <cstdio>
 #include <cstring>
 #include <vector>
+
+#include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hip"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
 template<int Bits, bool FullPrecision, unsigned MaxRows = 8,
          bool Scaled = false>
 __global__ void RoutedGemvOld(const ex::DeviceLinear* gate,
-                           const ex::DeviceLinear* up,
-                           const Exl3RouteTile* tiles, const unsigned* count,
-                           const std::uint16_t* input, float* gate_y,
-                           float* up_y, unsigned k, unsigned n,
-                           unsigned assignments,
-                           const std::int32_t* exponents) {
+                              const ex::DeviceLinear* up,
+                              const Exl3RouteTile* tiles, const unsigned* count,
+                              const std::uint16_t* input, float* gate_y,
+                              float* up_y, unsigned k, unsigned n,
+                              unsigned assignments,
+                              const std::int32_t* exponents) {
   if (blockIdx.y >= *count)
     return;
   const auto tile_rows = tiles[blockIdx.y];
@@ -102,7 +102,8 @@ __global__ void FillU32(std::uint32_t* p, std::size_t n, std::uint32_t seed) {
 __global__ void FillH(std::uint16_t* p, std::size_t n) {
   for (std::size_t i = blockIdx.x * std::size_t(blockDim.x) + threadIdx.x;
        i < n; i += std::size_t(gridDim.x) * blockDim.x)
-    p[i] = __half_as_ushort(__float2half(float(i * 37 % 1000) / 1000.0F - 0.5F));
+    p[i] =
+        __half_as_ushort(__float2half(float(i * 37 % 1000) / 1000.0F - 0.5F));
 }
 float TimeIt(const auto& fn, int reps) {
   hipEvent_t a, b;
@@ -176,8 +177,11 @@ void Run(unsigned k, unsigned n, unsigned tokens) {
                        k, n, assignments, nullptr);
   };
   const auto cur = [&](int i) {
-    hipLaunchKernelGGL((fnr::RoutedGemv<5, false, R, false>), grid, dim3(32), 0,
-                       nullptr, d_bank, d_bank,
+    // The production kernel packs kRoutedWaves output tiles per block.
+    const dim3 packed((n / 16 + fnr::kRoutedWaves - 1) / fnr::kRoutedWaves,
+                      assignments, 2);
+    hipLaunchKernelGGL((fnr::RoutedGemv<5, false, R, false>), packed,
+                       dim3(32 * fnr::kRoutedWaves), 0, nullptr, d_bank, d_bank,
                        d_tiles + (i % kSets) * assignments, d_count, x, g1, u1,
                        k, n, assignments, nullptr);
   };
@@ -193,15 +197,16 @@ void Run(unsigned k, unsigned n, unsigned tokens) {
   same = same && std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
   const float t_old = TimeIt(old, 300), t_new = TimeIt(cur, 300);
   const double bytes = 2.0 * assignments * words * 4;
-  std::printf("routed %4u->%-4u tokens %u: old %6.1f us %5.1f GB/s | ahead4 "
-              "%6.1f us %5.1f GB/s %s\n",
-              k, n, tokens, t_old, bytes / t_old / 1e3, t_new,
-              bytes / t_new / 1e3, same ? "bit-identical" : "DIFFERS");
-  for (void* p : {static_cast<void*>(t), static_cast<void*>(d_bank),
-                  static_cast<void*>(x), static_cast<void*>(g0),
-                  static_cast<void*>(u0), static_cast<void*>(g1),
-                  static_cast<void*>(u1), static_cast<void*>(d_tiles),
-                  static_cast<void*>(d_count)})
+  std::printf(
+      "routed %4u->%-4u tokens %u: old %6.1f us %5.1f GB/s | ahead4 "
+      "%6.1f us %5.1f GB/s %s\n",
+      k, n, tokens, t_old, bytes / t_old / 1e3, t_new, bytes / t_new / 1e3,
+      same ? "bit-identical" : "DIFFERS");
+  for (void* p :
+       {static_cast<void*>(t), static_cast<void*>(d_bank),
+        static_cast<void*>(x), static_cast<void*>(g0), static_cast<void*>(u0),
+        static_cast<void*>(g1), static_cast<void*>(u1),
+        static_cast<void*>(d_tiles), static_cast<void*>(d_count)})
     Ck(hipFree(p));
 }
 }  // namespace
