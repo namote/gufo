@@ -778,6 +778,174 @@ int RunStableCase(std::uint32_t kTokens) {
   return 0;
 }
 
+/// EXL3 decode/verify (stable conv, no row split): a call of at most eight
+/// tokens shifts history inside the convolution and normalizes q/k inside
+/// the recurrence. Splitting a longer call, which takes the separate
+/// shift, normalization and recurrence launches, into such calls must keep
+/// every output, state and history byte; so must the batched launcher.
+int RunStableDecodeCase(std::uint32_t kTokens) {
+  const std::size_t kQkvCount = static_cast<std::size_t>(kTokens) * kChannels;
+  const std::size_t kStateCount =
+      static_cast<std::size_t>(kVHeads) * kDim * kDim;
+  const std::size_t kConvState =
+      static_cast<std::size_t>(kKernel - 1) * kChannels;
+  const std::size_t kScratch =
+      static_cast<std::size_t>(kTokens + kKernel) * kChannels;
+  const std::size_t kQn = static_cast<std::size_t>(kTokens) * kKHeads * kDim;
+  const std::size_t kRaw = static_cast<std::size_t>(kTokens) * kVHeads * kDim;
+  const std::size_t kOut = static_cast<std::size_t>(kTokens) * kZ;
+  HipBuffer<float> d_qkv(kQkvCount);
+  HipBuffer<float> d_z(kOut);
+  HipBuffer<float> d_alpha_beta(static_cast<std::size_t>(kTokens) * 2 *
+                                kVHeads);
+  HipBuffer<float> d_conv_w(static_cast<std::size_t>(kChannels) * kKernel);
+  HipBuffer<float> d_a(kVHeads);
+  HipBuffer<float> d_dt(kVHeads);
+  HipBuffer<float> d_norm_w(kDim);
+  HipBuffer<float> d_scratch(kScratch);
+  HipBuffer<float> d_qn(kQn);
+  HipBuffer<float> d_kn(kQn);
+  HipBuffer<float> d_raw(kRaw);
+  HipBuffer<float> d_conv_state(kConvState);
+  HipBuffer<float> d_state(kStateCount);
+  HipBuffer<float> d_out(kOut);
+  auto qkv = MakeValues(kQkvCount, 0x0DEC0DE5U, 1.0F);
+  // Signed zeros, subnormals and an all-zero key head exercise the norm.
+  for (std::uint32_t t = 0; t < kTokens; ++t) {
+    float* row = qkv.data() + static_cast<std::size_t>(t) * kChannels;
+    row[t] = -0.0F;
+    row[kKHeads * kDim + t] = 1e-40F;
+    if (t % 3 == 1)
+      std::fill(row + 2 * kDim, row + 3 * kDim, 0.0F);
+  }
+  Upload(&d_qkv, qkv);
+  Upload(&d_z, MakeValues(kOut, 0x5EED5EEDU, 2.0F));
+  Upload(&d_alpha_beta,
+         MakeValues(static_cast<std::size_t>(kTokens) * 2 * kVHeads,
+                    0xB0B0CAFEU, 2.0F));
+  Upload(&d_conv_w, MakeValues(static_cast<std::size_t>(kChannels) * kKernel,
+                               0x00C0FFEEU, 0.5F));
+  Upload(&d_a, MakeValues(kVHeads, 0xA5A5A5A5U, 1.0F, -1.5F));
+  Upload(&d_dt, MakeValues(kVHeads, 0x5A5A5A5AU, 1.0F));
+  Upload(&d_norm_w, MakeValues(kDim, 0x12121212U, 0.5F, 1.0F));
+  const auto conv_state = MakeValues(kConvState, 0x34343434U, 1.0F);
+  const auto state = MakeValues(kStateCount, 0x56565656U, 0.1F);
+  struct Result {
+    std::vector<float> out, state, conv;
+  };
+  const auto run = [&](const std::vector<std::uint32_t>& chunks, bool batch) {
+    Upload(&d_conv_state, conv_state);
+    Upload(&d_state, state);
+    std::uint32_t first = 0;
+    for (const auto count : chunks) {
+      const auto t = static_cast<std::size_t>(first);
+      float* qkv_at = d_qkv.get() + t * kChannels;
+      float* z_at = d_z.get() + t * kZ;
+      float* ab_at = d_alpha_beta.get() + t * 2 * kVHeads;
+      float* out_at = d_out.get() + t * kZ;
+      if (batch) {
+        HipBuffer<q::GdnBatchItem> items(1);
+        const q::GdnBatchItem item{qkv_at,
+                                   z_at,
+                                   ab_at,
+                                   d_conv_state.get(),
+                                   d_scratch.get(),
+                                   d_qn.get(),
+                                   d_kn.get(),
+                                   d_raw.get(),
+                                   d_state.get(),
+                                   out_at,
+                                   {},
+                                   {},
+                                   count};
+        CheckHip(
+            hipMemcpy(items.get(), &item, sizeof(item), hipMemcpyHostToDevice),
+            "stable batch descriptor");
+        if (!q::GatedDeltaNetBatch(items.get(), 1, count, 1U, kChannels, kZ,
+                                   d_conv_w.get(), d_a.get(), d_dt.get(),
+                                   d_norm_w.get(), kKHeads, kVHeads, kEps,
+                                   nullptr, true))
+          throw std::runtime_error("stable GDN batch launch failed");
+        CheckHip(hipDeviceSynchronize(), "stable GDN batch");
+      } else {
+        q::GatedDeltaNet(
+            qkv_at, kChannels, z_at, kZ, ab_at, d_conv_w.get(), d_a.get(),
+            d_dt.get(), d_norm_w.get(), d_conv_state.get(), d_scratch.get(),
+            d_qn.get(), d_kn.get(), d_raw.get(), d_state.get(), out_at, nullptr,
+            {}, {}, count, kKHeads, kVHeads, kDim, kKernel, false, false, kEps,
+            nullptr, nullptr, {}, 0, nullptr, nullptr, true);
+      }
+      first += count;
+    }
+    CheckHip(hipDeviceSynchronize(), "stable decode GDN synchronization");
+    return Result{Download(&d_out, kOut), Download(&d_state, kStateCount),
+                  Download(&d_conv_state, kConvState)};
+  };
+  const auto bytes_equal = [](const std::vector<float>& x,
+                              const std::vector<float>& y) {
+    return x.size() == y.size() &&
+           std::memcmp(x.data(), y.data(), x.size() * sizeof(float)) == 0;
+  };
+  const auto same = [&](const Result& x, const Result& y) {
+    return bytes_equal(x.out, y.out) && bytes_equal(x.state, y.state) &&
+           bytes_equal(x.conv, y.conv);
+  };
+  const Result whole = run({kTokens}, false);
+  if (kTokens <= 8) {
+    // Verify: rollback rows and a checkpoint, written by the fused stages,
+    // must leave the forward unchanged and match fresh prefix forwards.
+    const std::size_t saved = kTokens - 1;
+    std::vector<std::unique_ptr<HipBuffer<float>>> rows;
+    q::RollbackRows states, convs;
+    for (std::size_t i = 0; i < saved; ++i) {
+      rows.push_back(std::make_unique<HipBuffer<float>>(kConvState));
+      convs.rows[i] = rows.back()->get();
+      rows.push_back(std::make_unique<HipBuffer<float>>(
+          q::GdnRollbackRowFloats(i, kKHeads, kVHeads, kDim)));
+      states.rows[i] = rows.back()->get();
+    }
+    HipBuffer<float> cp_state(kStateCount);
+    HipBuffer<float> cp_history(kConvState);
+    const std::uint32_t prefix = (kTokens + 1) / 2;
+    Upload(&d_conv_state, conv_state);
+    Upload(&d_state, state);
+    q::GatedDeltaNet(d_qkv.get(), kChannels, d_z.get(), kZ, d_alpha_beta.get(),
+                     d_conv_w.get(), d_a.get(), d_dt.get(), d_norm_w.get(),
+                     d_conv_state.get(), d_scratch.get(), d_qn.get(),
+                     d_kn.get(), d_raw.get(), d_state.get(), d_out.get(),
+                     nullptr, states, convs, kTokens, kKHeads, kVHeads, kDim,
+                     kKernel, false, false, kEps, nullptr, nullptr,
+                     {cp_state.get(), cp_history.get(), prefix}, 0, nullptr,
+                     nullptr, true);
+    CheckHip(hipDeviceSynchronize(), "stable decode GDN verify");
+    const Result verified{Download(&d_out, kOut),
+                          Download(&d_state, kStateCount),
+                          Download(&d_conv_state, kConvState)};
+    if (!same(whole, verified))
+      throw std::runtime_error("stable decode rollback rows changed output");
+    std::vector<std::vector<float>> history(saved);
+    for (std::size_t i = 0; i < saved; ++i)
+      history[i] = Download(rows[2 * i].get(), kConvState);
+    const auto captured_state = Download(&cp_state, kStateCount);
+    const auto captured_history = Download(&cp_history, kConvState);
+    for (std::uint32_t keep = 1; keep < kTokens; ++keep)
+      if (!bytes_equal(history[keep - 1], run({keep}, false).conv))
+        throw std::runtime_error("stable decode conv rollback row differs");
+    const Result head_only = run({prefix}, false);
+    if (!bytes_equal(captured_state, head_only.state) ||
+        !bytes_equal(captured_history, head_only.conv))
+      throw std::runtime_error("stable decode checkpoint differs");
+  }
+  for (std::uint32_t head = 1; head < kTokens; ++head) {
+    if (head > 8 || kTokens - head > 8)
+      continue;
+    if (!same(whole, run({head, kTokens - head}, false)) ||
+        !same(whole, run({head, kTokens - head}, true)))
+      throw std::runtime_error("fused decode GDN differs from separate stages");
+  }
+  return 0;
+}
+
 int main() {
   try {
     // Short batches cover every rollback prefix and the no-snapshot case.
@@ -793,6 +961,11 @@ int main() {
     for (std::uint32_t n : {1u, 2u, 3u, 5u, 8u, 37u, 99u}) {
       std::cout << "stable n=" << n << '\n';
       if (RunStableCase(n) != 0)
+        return 1;
+    }
+    for (std::uint32_t n : {1u, 3u, 8u, 9u, 12u, 16u}) {
+      std::cout << "stable decode n=" << n << '\n';
+      if (RunStableDecodeCase(n) != 0)
         return 1;
     }
     return 0;

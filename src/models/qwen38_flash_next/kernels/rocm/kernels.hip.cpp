@@ -1686,6 +1686,39 @@ __global__ void PleInjectKernel(float* res, const float* gated,
 /// packed [t][kh][d] buffers the recurrence streams from, so the serial loop
 /// carries no block-wide reductions. One wave per (token, head) row.
 constexpr unsigned kGdnDim = 128;
+
+/// GdnPrepKernel's normalization of one (token, key head) row for one lane
+/// of a wave32: qv/kv hold elements r * 32 + lane on entry and the scaled
+/// values on return. Every step is pinned to the sequence the original
+/// kernel compiled to under fast-math (product, then FMA chain, butterfly
+/// sum whose last step adds eps to the partner first, rsqrt, product), so
+/// the recurrence can normalize its own rows with the same bits.
+__device__ __forceinline__ void GdnPrepRow(float (&qv)[kGdnDim / 32],
+                                           float (&kv)[kGdnDim / 32],
+                                           float eps) {
+  float qs = Materialize(qv[0] * qv[0]);
+  float ks = Materialize(kv[0] * kv[0]);
+#pragma unroll
+  for (std::uint32_t r = 1; r < kGdnDim / 32; ++r) {
+    qs = Materialize(__builtin_fmaf(qv[r], qv[r], qs));
+    ks = Materialize(__builtin_fmaf(kv[r], kv[r], ks));
+  }
+#pragma unroll
+  for (int offset = 16; offset > 1; offset >>= 1) {
+    qs = Materialize(qs + XorLane(qs, offset));
+    ks = Materialize(ks + XorLane(ks, offset));
+  }
+  qs = Materialize(Materialize(eps + XorLane(qs, 1)) + qs);
+  ks = Materialize(Materialize(eps + XorLane(ks, 1)) + ks);
+  qs = Materialize(rsqrtf(qs));
+  ks = Materialize(rsqrtf(ks));
+#pragma unroll
+  for (std::uint32_t r = 0; r < kGdnDim / 32; ++r) {
+    qv[r] = Materialize(qv[r] * qs);
+    kv[r] = Materialize(kv[r] * ks);
+  }
+}
+
 template<bool kBatch>
 __global__ void GdnPrepKernel(const float* conv_out, float* qn, float* kn,
                               std::uint32_t n_rows, std::uint32_t k_heads,
@@ -1713,25 +1746,20 @@ __global__ void GdnPrepKernel(const float* conv_out, float* qn, float* kn,
   const std::uint32_t per_lane = d / warpSize;
   float qv[d / 32];
   float kv[d / 32];
-  float qs = 0.0f;
-  float ks = 0.0f;
 #pragma unroll
   for (std::uint32_t r = 0; r < per_lane; ++r) {
     const std::uint32_t i = r * warpSize + lane;
     qv[r] = conv[kh * d + i];
     kv[r] = conv[k_heads * d + kh * d + i];
-    qs += qv[r] * qv[r];
-    ks += kv[r] * kv[r];
   }
-  qs = rsqrtf(WaveSum(qs) + eps);
-  ks = rsqrtf(WaveSum(ks) + eps);
+  GdnPrepRow(qv, kv, eps);
   float* q_out = qn + static_cast<std::size_t>(row) * d;
   float* k_out = kn + static_cast<std::size_t>(row) * d;
 #pragma unroll
   for (std::uint32_t r = 0; r < per_lane; ++r) {
     const std::uint32_t i = r * warpSize + lane;
-    q_out[i] = qv[r] * qs;
-    k_out[i] = kv[r] * ks;
+    q_out[i] = qv[r];
+    k_out[i] = kv[r];
   }
 }
 
@@ -2231,14 +2259,19 @@ __device__ __forceinline__ float GdnLastUpdate(float state, float decay,
   return value;
 }
 
-template<bool kBatch>
+/// kPrep: a call of at most kGdnPrepTokens tokens normalizes its own q/k
+/// rows into LDS with GdnPrepRow (each wave one token), replacing the
+/// GdnPrepKernel launch and its qn/kn round trip with the same values.
+constexpr std::uint32_t kGdnPrepTokens = 8;
+template<bool kBatch, bool kPrep = false>
 __global__ void GdnKernel(const float* conv_out, const float* qn,
                           const float* kn, const float* alpha_beta,
                           const float* a, const float* dt, float* state,
                           float* raw, RollbackRows snapshots,
                           std::uint32_t n_tokens, std::uint32_t k_heads,
                           std::uint32_t v_heads, const GdnBatchItem* batch,
-                          std::uint32_t active, GdnCheckpoint checkpoint) {
+                          std::uint32_t active, GdnCheckpoint checkpoint,
+                          float eps = 0.0f) {
   if constexpr (kBatch) {
     if ((active & (1U << blockIdx.z)) == 0)
       return;
@@ -2260,6 +2293,33 @@ __global__ void GdnKernel(const float* conv_out, const float* qn,
   const std::uint32_t lane = threadIdx.x % kGdnLanes;
   const std::uint32_t i0 = lane * slice;
   const std::uint32_t channels = 2 * k_heads * d + v_heads * d;
+  // Four pad floats after each lane slice keep the slices of one row group
+  // in distinct banks.
+  constexpr std::uint32_t pitch = d + d / slice * 4;
+  [[maybe_unused]] __shared__ float prepped[kPrep ? kGdnPrepTokens : 1][2]
+                                           [pitch];
+  if constexpr (kPrep) {
+    constexpr std::uint32_t waves = kGdnRowsPerBlock * kGdnLanes / 32;
+    const std::uint32_t wlane = threadIdx.x % 32;
+    for (std::uint32_t t = threadIdx.x / 32; t < n_tokens; t += waves) {
+      const float* conv = conv_out + static_cast<std::size_t>(t) * channels;
+      float qv[d / 32];
+      float kv[d / 32];
+#pragma unroll
+      for (std::uint32_t r = 0; r < d / 32; ++r) {
+        qv[r] = conv[kh * d + r * 32 + wlane];
+        kv[r] = conv[k_heads * d + kh * d + r * 32 + wlane];
+      }
+      GdnPrepRow(qv, kv, eps);
+#pragma unroll
+      for (std::uint32_t r = 0; r < d / 32; ++r) {
+        const std::uint32_t i = r * 32 + wlane;
+        prepped[t][0][i + i / slice * 4] = qv[r];
+        prepped[t][1][i + i / slice * 4] = kv[r];
+      }
+    }
+    __syncthreads();
+  }
   const float a_h = a[h];
   const float dt_h = dt[h];
   float* S = state + static_cast<std::size_t>(h) * d * d + j * d + i0;
@@ -2270,8 +2330,12 @@ __global__ void GdnKernel(const float* conv_out, const float* qn,
   }
   const float q_scale = rsqrtf(static_cast<float>(d));
   for (std::uint32_t t = 0; t < n_tokens; ++t) {
-    const float* q = qn + (static_cast<std::size_t>(t) * k_heads + kh) * d + i0;
-    const float* k = kn + (static_cast<std::size_t>(t) * k_heads + kh) * d + i0;
+    const float* q =
+        kPrep ? &prepped[t][0][i0 + lane * 4]
+              : qn + (static_cast<std::size_t>(t) * k_heads + kh) * d + i0;
+    const float* k =
+        kPrep ? &prepped[t][1][i0 + lane * 4]
+              : kn + (static_cast<std::size_t>(t) * k_heads + kh) * d + i0;
     const float vv = conv_out[static_cast<std::size_t>(t) * channels +
                               2 * k_heads * d + h * d + j];
     const float alpha = alpha_beta[t * 2 * v_heads + h];
@@ -8318,9 +8382,6 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    hipEvent_t z_ready, bool stable_conv) {
   const std::uint32_t channels = 2 * k_heads * d + v_heads * d;
   const std::size_t count = static_cast<std::size_t>(n_tokens) * channels;
-  const bool saved_history = !stable_conv && !convolved &&
-                             kernel == kSsmConvTaps &&
-                             n_tokens <= kSsmConvTokensPerThread;
   if (checkpoint.history != nullptr)
     HistoryPrefix(qkv, qkv_stride, conv_state, checkpoint.history,
                   checkpoint.tokens, channels, kernel - 1, stream);
@@ -8331,10 +8392,22 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
       stable_conv && !convolved && kernel == kSsmConvTaps &&
       conv_snapshots.rows[0] == nullptr && qkv_stride % 2 == 0 &&
       reinterpret_cast<std::uintptr_t>(qkv) % alignof(float2) == 0;
+  // One token tile: each channel's single owner shifts its history (and
+  // writes the rollback rows) in place, replacing the HistoryShift, Copy and
+  // RollingSnapshot launches with the same copied values. EXL3's stable
+  // instantiation keeps its pinned arithmetic.
+  const bool saved_history = !convolved && !fused_conv &&
+                             kernel == kSsmConvTaps &&
+                             n_tokens <= kSsmConvTokensPerThread;
   if (!convolved && !fused_conv) {
-    if (stable_conv && kernel == kSsmConvTaps) {
-      // One specialization at every EXL3 width; history updates below use
-      // the same stream-ordered shift, including singleton calls.
+    if (saved_history && stable_conv) {
+      hipLaunchKernelGGL((SsmConv4Kernel<true, false, true>),
+                         dim3(Blocks(channels)), dim3(kThreads), 0, stream, qkv,
+                         qkv_stride, conv_w, conv_state, conv_scratch, n_tokens,
+                         channels, conv_snapshots, nullptr, 0);
+    } else if (stable_conv && kernel == kSsmConvTaps) {
+      // Wider EXL3 chunks: the same arithmetic over several token tiles;
+      // history updates below use the stream-ordered shift.
       hipLaunchKernelGGL(
           (SsmConv4Kernel<false, false, true>),
           dim3(Blocks(channels), (n_tokens + kSsmConvTokensPerThread - 1) /
@@ -8409,6 +8482,12 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                        dim3(kGdnWaves * 32), 0, stream, conv_scratch, qn, kn,
                        state, raw, n_tokens, k_heads, v_heads, checkpoint,
                        nullptr, 0U, nullptr, nullptr, eps);
+  } else if (n_tokens <= kGdnPrepTokens) {
+    hipLaunchKernelGGL(
+        (GdnKernel<false, true>), dim3(v_heads, kGdnDim / kGdnRowsPerBlock),
+        dim3(kGdnRowsPerBlock * kGdnLanes), 0, stream, conv_scratch, nullptr,
+        nullptr, alpha_beta, a, dt, state, raw, state_snapshots, n_tokens,
+        k_heads, v_heads, nullptr, 0, checkpoint, eps);
   } else {
     hipLaunchKernelGGL(GdnPrepKernel<false>,
                        dim3((n_tokens * k_heads + waves - 1) / waves),
@@ -8450,16 +8529,12 @@ bool GatedDeltaNetBatch(const GdnBatchItem* items, std::uint32_t count,
   hipLaunchKernelGGL(conv, dim3(Blocks(channels), 1, count), dim3(kThreads), 0,
                      stream, nullptr, qkv_stride, conv_w, nullptr, nullptr,
                      max_tokens, channels, RollbackRows{}, items, active);
-  hipLaunchKernelGGL(GdnPrepKernel<true>,
-                     dim3((max_tokens * k_heads + waves - 1) / waves, 1, count),
-                     dim3(kThreads), 0, stream, nullptr, nullptr, nullptr,
-                     max_tokens * k_heads, k_heads, channels, eps, items,
-                     active);
+  static_assert(kSsmConvTokensPerThread <= kGdnPrepTokens);
   hipLaunchKernelGGL(
-      GdnKernel<true>, dim3(v_heads, kGdnDim / kGdnRowsPerBlock, count),
+      (GdnKernel<true, true>), dim3(v_heads, kGdnDim / kGdnRowsPerBlock, count),
       dim3(kGdnRowsPerBlock * kGdnLanes), 0, stream, nullptr, nullptr, nullptr,
       nullptr, a, dt, nullptr, nullptr, RollbackRows{}, max_tokens, k_heads,
-      v_heads, items, active, GdnCheckpoint{});
+      v_heads, items, active, GdnCheckpoint{}, eps);
   hipLaunchKernelGGL(GdnEpilogueKernel<true>,
                      dim3((max_tokens * v_heads + waves - 1) / waves, 1, count),
                      dim3(kThreads), 0, stream, nullptr, nullptr, z_stride,
