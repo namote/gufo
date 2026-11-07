@@ -840,13 +840,21 @@ struct InjectParts {
 /// `XnT` is float for the reference route and __half for the F16 mixer
 /// input route; a non-null `xn_q8` also receives the norm quantized into
 /// the tiled Q8 layout (hidden % 32 == 0) for the W8A8 down projection.
-template<typename XnT>
+/// kMoe (hidden % 128 == 0, up to kHcMoeMaxHidden): the block output is
+/// the routed decode MoE output, formed per token in LDS from the raw FP32
+/// expert rows with RoutedCombineKernel's segment arithmetic
+/// (Exl3MoeSegment) instead of read from block_out; the stream-0 block
+/// also stores it to block_out.
+constexpr std::uint32_t kHcMoeMaxHidden = 2560;
+template<typename XnT, bool kMoe = false>
 __global__ void HcCombineKernel(float* res, const float* block_out,
                                 const float* inject, std::uint32_t inject_parts,
                                 const float* gamma, XnT* xn, void* xn_q8,
                                 std::uint32_t hidden, std::uint32_t streams,
-                                float eps, void* xn_q8_1) {
+                                float eps, void* xn_q8_1,
+                                Exl3PrefillMoeRows moe = {}) {
   __shared__ float shared[32];
+  __shared__ float s_moe[kMoe ? kHcMoeMaxHidden : 1];
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t s = blockIdx.y;
   const float* parts =
@@ -854,6 +862,23 @@ __global__ void HcCombineKernel(float* res, const float* block_out,
   const std::size_t base = (static_cast<std::size_t>(t) * streams + s) * hidden;
   float* dst = res + base;
   const float* src = block_out + static_cast<std::size_t>(t) * hidden;
+  if constexpr (kMoe) {
+    const std::uint32_t lane = threadIdx.x % 32;
+    for (std::uint32_t segment = threadIdx.x / 32; segment < hidden / 128;
+         segment += blockDim.x / 32) {
+      float o[4];
+      Exl3MoeSegment<float, false>(moe, t, segment, lane, o);
+      const std::uint32_t first = segment * 128 + lane * 4;
+#pragma unroll
+      for (std::uint32_t j = 0; j < 4; ++j) {
+        s_moe[first + j] = o[j];
+        if (s == 0)
+          const_cast<float*>(src)[first + j] = o[j];
+      }
+    }
+    __syncthreads();
+    src = s_moe;
+  }
   const float* g = gamma + static_cast<std::size_t>(s) * hidden;
   // A row of up to kHeld elements per thread stays in registers between the
   // two passes, every read issued up front (a strided loop of loads behind
@@ -7168,21 +7193,32 @@ bool HcCombine(float* res, const float* block_out, const float* inject,
   hipLaunchKernelGGL(HcCombineKernel<float>, dim3(n_tokens, streams),
                      dim3(kThreads), 0, stream, res, block_out, inject,
                      inject_parts, gamma, xn, nullptr, hidden, streams, eps,
-                     nullptr);
+                     nullptr, Exl3PrefillMoeRows{});
   return false;
 }
 
 bool HcCombineQ8_1(float* res, const float* block_out, const float* inject,
                    std::uint32_t inject_parts, const float* gamma, float* xn,
                    void* xn_q8, std::uint32_t n_tokens, std::uint32_t hidden,
-                   std::uint32_t streams, float eps, hipStream_t stream) {
-  if (gamma == nullptr || hidden % 32 != 0) {
+                   std::uint32_t streams, float eps, hipStream_t stream,
+                   const Exl3PrefillMoeRows* moe) {
+  if (gamma == nullptr || hidden % 32 != 0 ||
+      (moe != nullptr &&
+       (hidden % 128 != 0 || hidden > kHcMoeMaxHidden || moe->width != hidden ||
+        moe->used == 0 || moe->used > 16 || moe->inverse != nullptr))) {
     return false;
+  }
+  if (moe != nullptr) {
+    hipLaunchKernelGGL((HcCombineKernel<float, true>), dim3(n_tokens, streams),
+                       dim3(kThreads), 0, stream, res, block_out, inject,
+                       inject_parts, gamma, xn, nullptr, hidden, streams, eps,
+                       xn_q8, *moe);
+    return true;
   }
   hipLaunchKernelGGL(HcCombineKernel<float>, dim3(n_tokens, streams),
                      dim3(kThreads), 0, stream, res, block_out, inject,
                      inject_parts, gamma, xn, nullptr, hidden, streams, eps,
-                     xn_q8);
+                     xn_q8, Exl3PrefillMoeRows{});
   return true;
 }
 
@@ -7268,7 +7304,7 @@ bool HcCombineF16(float* res, const float* block_out, const float* inject,
   hipLaunchKernelGGL(HcCombineKernel<__half>, dim3(n_tokens, streams),
                      dim3(kThreads), 0, stream, res, block_out, inject,
                      inject_parts, gamma, xn, xn_q8, hidden, streams, eps,
-                     nullptr);
+                     nullptr, Exl3PrefillMoeRows{});
   return false;
 }
 

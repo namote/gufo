@@ -488,6 +488,74 @@ __global__ void UnfusedActivation(const ex::DeviceLinear* gate,
   }
 }
 
+/// The decode HC combine forming the MoE output from the raw routed rows
+/// (HcCombineQ8_1 with Exl3PrefillMoeRows) against Exl3RoutedCombine and
+/// the plain HcCombineQ8_1: residual, norm, Q8_1 rows and block output
+/// byte for byte.
+void DecodeMoeCombine(const gpu::DeviceLayer& layer, const std::int32_t* ids,
+                      const float* raw, unsigned rows, unsigned used,
+                      unsigned hidden) {
+  constexpr unsigned streams = 4;
+  constexpr float eps = 1.0e-6F;
+  Buffers buffers;
+  std::mt19937 rng(rows * 17 + used);
+  const auto values = [&](std::size_t n, float scale) {
+    std::vector<float> v(n);
+    for (auto& x : v)
+      x = (int(rng() % 2000) - 1000) * scale;
+    return v;
+  };
+  auto* weights = buffers.Copy(values(rows * used, 1.0e-3F));
+  auto* shared = buffers.Copy(values(std::size_t{rows} * hidden, 1.0e-3F));
+  auto* gate = buffers.Copy(values(rows * 3, 1.0e-2F));
+  auto* inject = buffers.Copy(values(rows * streams, 1.0e-2F));
+  auto* gamma = buffers.Copy(values(streams * hidden, 1.0e-3F));
+  const auto res0 = values(std::size_t{rows} * streams * hidden, 1.0e-3F);
+  const std::size_t hc = std::size_t{rows} * streams * hidden;
+  const std::size_t q8 = std::size_t{rows} * streams * hidden / 32 * 36;
+  struct Out {
+    float* res;
+    float* block;
+    float* xn;
+    std::uint8_t* q8;
+  };
+  const auto make = [&] {
+    return Out{buffers.Copy(res0),
+               buffers.Make<float>(std::size_t{rows} * hidden),
+               buffers.Make<float>(hc), buffers.Make<std::uint8_t>(q8)};
+  };
+  const Out ref = make(), fused = make();
+  gpu::Exl3RoutedCombine(layer, ids, rows, used, raw, weights, shared, gate + 2,
+                         3, ref.block, nullptr);
+  Require(gpu::HcCombineQ8_1(ref.res, ref.block, inject, 1, gamma, ref.xn,
+                             ref.q8, rows, hidden, streams, eps, nullptr),
+          "plain decode HC combine rejected");
+  const gpu::Exl3PrefillMoeRows moe{layer.ffn_down_exps.device_exl3,
+                                    ids,
+                                    nullptr,
+                                    raw,
+                                    weights,
+                                    shared,
+                                    gate + 2,
+                                    3,
+                                    used,
+                                    hidden};
+  Check(hipMemset(fused.block, 0xff, std::size_t{rows} * hidden * 4));
+  Require(
+      gpu::HcCombineQ8_1(fused.res, fused.block, inject, 1, gamma, fused.xn,
+                         fused.q8, rows, hidden, streams, eps, nullptr, &moe),
+      "MoE-forming decode HC combine rejected");
+  const auto same = [](const auto& a, const auto& b) {
+    return std::memcmp(a.data(), b.data(), a.size() * sizeof(a[0])) == 0;
+  };
+  Require(same(Read(ref.res, hc), Read(fused.res, hc)) &&
+              same(Read(ref.xn, hc), Read(fused.xn, hc)) &&
+              same(Read(ref.q8, q8), Read(fused.q8, q8)) &&
+              same(Read(ref.block, std::size_t{rows} * hidden),
+                   Read(fused.block, std::size_t{rows} * hidden)),
+          "MoE-forming decode HC combine changed the combine");
+}
+
 void FusedProducer(unsigned rows, bool shared, int bits = 5, int up_bits = 0,
                    int down_bits = 0, bool half = false) {
   constexpr unsigned k = 256, ff = 640, used = 3, experts = 12;
@@ -541,21 +609,58 @@ void FusedProducer(unsigned rows, bool shared, int bits = 5, int up_bits = 0,
                        nullptr, false, raw);
     const auto separate_rows = Read(separate, assignments * k);
     const auto separate_exponents = Read(s.down_exponents, assignments);
+    const auto separate_input = Read(s.routed_input, assignments * ff);
+    if (raw)
+      DecodeMoeCombine(layer, di, separate, rows, used, k);
     gpu::Exl3Scratch fused = s;
+    fused.down_exponents = buffers.Make<std::int32_t>(assignments);
     fused.routed_down_input = buffers.Make<std::uint16_t>(assignments * ff);
     fused.routed_arrivals = buffers.Make<std::uint32_t>(assignments);
     fused.routed_assignments = assignments;
+    const auto check = [&](const float* folded, const char* what) {
+      const auto folded_rows = Read(folded, assignments * k);
+      Require(
+          std::memcmp(separate_rows.data(), folded_rows.data(),
+                      folded_rows.size() * sizeof(float)) == 0 &&
+              separate_exponents == Read(fused.down_exponents, assignments) &&
+              separate_input == Read(fused.routed_down_input, assignments * ff),
+          what);
+      for (auto v : Read(fused.routed_arrivals, assignments))
+        Require(v == 0, "restore-fused arrivals not reset");
+    };
     for (unsigned launch = 0; launch < 2; ++launch) {
+      // Poisoned exponents and down input: the tail must write them all.
+      Check(hipMemset(fused.down_exponents, 0xff,
+                      assignments * sizeof(std::int32_t)));
+      Check(hipMemset(fused.routed_down_input, 0xff,
+                      assignments * ff * sizeof(std::uint16_t)));
       auto* folded = buffers.Make<float>(assignments * k);
       gpu::Exl3RoutedMlp(layer, dx, di, g, u, folded, rows, used, fused,
                          nullptr, nullptr, false, raw);
-      const auto folded_rows = Read(folded, assignments * k);
-      Require(std::memcmp(separate_rows.data(), folded_rows.data(),
-                          folded_rows.size() * sizeof(float)) == 0 &&
-                  separate_exponents == Read(fused.down_exponents, assignments),
-              "restore-fused gate/up changed routed rows");
-      for (auto v : Read(fused.routed_arrivals, assignments))
-        Require(v == 0, "restore-fused arrivals not reset");
+      check(folded, "restore-fused gate/up changed routed rows");
+    }
+    // Graph replay of the fused route: the counters wrap across replays.
+    if (rows == 3 && !raw) {
+      hipStream_t stream;
+      Check(hipStreamCreate(&stream));
+      auto* folded = buffers.Make<float>(assignments * k);
+      Check(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal));
+      gpu::Exl3RoutedMlp(layer, dx, di, g, u, folded, rows, used, fused, stream,
+                         nullptr, false, raw);
+      hipGraph_t graph;
+      Check(hipStreamEndCapture(stream, &graph));
+      hipGraphExec_t executable;
+      Check(hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+      for (unsigned replay = 0; replay < 3; ++replay) {
+        Check(hipMemset(fused.down_exponents, 0xff,
+                        assignments * sizeof(std::int32_t)));
+        Check(hipGraphLaunch(executable, stream));
+        Check(hipStreamSynchronize(stream));
+        check(folded, "restore-fused graph replay changed routed rows");
+      }
+      Check(hipGraphExecDestroy(executable));
+      Check(hipGraphDestroy(graph));
+      Check(hipStreamDestroy(stream));
     }
   }
   const auto frozen = Read(trace.down_input, assignments * ff);
