@@ -1957,8 +1957,6 @@ __global__ void GdnPrepKernel(const float* conv_out, float* qn, float* kn,
     kn = item.kn;
     n_rows = item.n_tokens * k_heads;
   }
-  constexpr std::uint32_t d = kGdnDim;
-  const std::uint32_t lane = threadIdx.x % warpSize;
   const std::uint32_t row =
       blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
   if (row >= n_rows) {

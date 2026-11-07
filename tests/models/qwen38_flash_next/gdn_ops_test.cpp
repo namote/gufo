@@ -963,6 +963,33 @@ int RunStableDecodeCase(std::uint32_t kTokens) {
                           Download(&d_conv_state, kConvState)};
     if (!same(whole, verified))
       throw std::runtime_error("stable decode rollback rows changed output");
+    // The fused conv/prep with rollback rows (two-token verify).
+    if (kTokens <= 2) {
+      const auto rows_before = kTokens > 1 ? Download(rows[0].get(), kConvState)
+                                           : std::vector<float>{};
+      Upload(&d_conv_state, conv_state);
+      Upload(&d_state, state);
+      q::GatedDeltaNet(
+          d_qkv.get(), kChannels, d_z.get(), kZ, d_alpha_beta.get(),
+          d_conv_w.get(), d_a.get(), d_dt.get(), d_norm_w.get(),
+          d_conv_state.get(), d_scratch.get(), d_qn.get(), d_kn.get(),
+          d_raw.get(), d_state.get(), d_out.get(), nullptr, states, convs,
+          kTokens, kKHeads, kVHeads, kDim, kKernel, false, false, kEps, nullptr,
+          nullptr, {cp_state.get(), cp_history.get(), prefix}, 0, nullptr,
+          nullptr, true, nullptr, d_arrivals.get());
+      CheckHip(hipDeviceSynchronize(), "fused stable decode GDN verify");
+      if (kTokens > 1)
+        q::RestoreGdnState(d_state.get(), states, kTokens, kTokens, kKHeads,
+                           kVHeads, nullptr);
+      CheckHip(hipDeviceSynchronize(), "fused stable decode GDN commit");
+      const Result fused_verified{Download(&d_out, kOut),
+                                  Download(&d_state, kStateCount),
+                                  Download(&d_conv_state, kConvState)};
+      if (!same(whole, fused_verified) ||
+          (kTokens > 1 &&
+           !bytes_equal(rows_before, Download(rows[0].get(), kConvState))))
+        throw std::runtime_error("fused conv/prep verify changed output");
+    }
     std::vector<std::vector<float>> history(saved);
     for (std::size_t i = 0; i < saved; ++i)
       history[i] = Download(rows[2 * i].get(), kConvState);
