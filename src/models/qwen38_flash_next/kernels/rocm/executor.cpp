@@ -1334,6 +1334,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
         std::size_t{8} * std::max(c.expert_ff, c.shared_expert_ff);
     projection.fast_down_input =
         Alloc<std::uint16_t>(a, projection.fast_down_input_elements, error_msg);
+    ex.rotated_input_elements = std::size_t{3 * 8} * width;
+    ex.rotated_input =
+        Alloc<std::uint16_t>(a, ex.rotated_input_elements, error_msg);
     ex.slice_elements = std::max(T, std::size_t{64}) * (c.indexer_heads + 1) *
                         c.indexer_head_dim;
     ex.slice = f32(ex.slice_elements);
@@ -2129,6 +2132,7 @@ const void* Executor::ReadyQ8(const float* x, std::uint32_t n_tokens,
 void Executor::DropReadyQ8() const {
   xn_q8_ready_ = {};
   mixed_q8_ready_ = {};
+  exl3_rotated_ = {};  // also producer-rotated rows
 }
 
 bool Executor::Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
@@ -2402,6 +2406,59 @@ bool Executor::Exl3DensePrefill(
   }
 }
 
+Exl3InputSlabs Executor::Exl3Slabs(
+    std::span<const DeviceTensor* const> consumers, std::uint32_t rows) const {
+  if (prefill_phase || exl3_.rotated_input == nullptr || rows == 0 ||
+      rows > gufo::hip::kExl3FastRotatedRows || consumers.empty() ||
+      consumers.size() > gufo::hip::kExl3FastMaxGroup)
+    return {};
+  const auto* first = consumers.front()->exl3;
+  Exl3InputSlabs slabs{};
+  for (const auto* w : consumers) {
+    const auto* l = w->exl3;
+    if (l == nullptr || first == nullptr || w->experts != 1 ||
+        w->output_begin != 0 || w->rows != l->n || w->cols != l->k ||
+        !gufo::hip::Exl3FastSupported(*l) || l->k != first->k ||
+        !(l->rate == first->rate))
+      return {};
+    slabs.suh[slabs.count++] = l->suh;
+  }
+  if (std::size_t{slabs.count} * gufo::hip::kExl3FastRotatedRows * first->k >
+      exl3_.rotated_input_elements)
+    return {};
+  slabs.out = exl3_.rotated_input;
+  slabs.pass_rows = gufo::hip::Exl3FastPassRows(rows);
+  slabs.k = first->k;
+  return slabs;
+}
+
+void Executor::NoteExl3Rotated(
+    const Exl3InputSlabs& slabs, const float* x, std::uint32_t rows,
+    std::span<const DeviceTensor* const> consumers) const {
+  exl3_rotated_ = {};
+  if (slabs.count == 0 || slabs.count != consumers.size())
+    return;
+  exl3_rotated_.x = x;
+  exl3_rotated_.rows = rows;
+  exl3_rotated_.count = slabs.count;
+  for (std::size_t c = 0; c < consumers.size(); ++c)
+    exl3_rotated_.consumers[c] = consumers[c]->exl3;
+}
+
+const std::uint16_t* Executor::TakeExl3Rotated(
+    const float* x, std::uint32_t rows,
+    std::span<const DeviceTensor* const> consumers) const {
+  const auto& r = exl3_rotated_;
+  if (r.x == nullptr || r.x != x || r.rows != rows ||
+      r.count != consumers.size())
+    return nullptr;
+  for (std::size_t c = 0; c < consumers.size(); ++c)
+    if (r.consumers[c] != consumers[c]->exl3)
+      return nullptr;
+  exl3_rotated_ = {};
+  return exl3_.rotated_input;
+}
+
 bool Executor::Exl3Group(std::initializer_list<const DeviceTensor*> weights,
                          std::initializer_list<float*> outputs, const float* x,
                          std::uint32_t rows, std::string* error,
@@ -2428,6 +2485,21 @@ bool Executor::Exl3Group(std::initializer_list<const DeviceTensor*> weights,
     const std::span<const gufo::hip::Exl3FastTarget> group(targets.data(),
                                                            count);
     if (!prefill_phase && gufo::hip::Exl3FastGroupSupported(group, ws)) {
+      // A producer epilogue may already have rotated x for this group.
+      if (const auto* rotated = TakeExl3Rotated(
+              x, rows, std::span(weights.begin(), weights.size()))) {
+        const gufo::hip::Exl3FastWorkspace pre{
+            const_cast<std::uint16_t*>(rotated),
+            exl3_.rotated_input_elements,
+            p.fast_counters,
+            p.fast_counter_count,
+            p.fast_down_input,
+            p.fast_down_input_elements};
+        gufo::hip::LaunchExl3FastProjections(group, x, (*weights.begin())->cols,
+                                             rows, pre, stream_, true,
+                                             shape_basis_n);
+        return true;
+      }
       for (std::uint32_t first = 0; first < rows;
            first += gufo::hip::kExl3FastMaxRows) {
         auto pass = targets;
@@ -2541,11 +2613,16 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
            w.type == GgmlType::kF32))
         return PlainDensePrefill(w, x, out, n_tokens, error_msg);
       const auto piece = std::max<std::uint32_t>(1, options_.max_batch);
+      const DeviceTensor* const consumer[] = {&w};
+      const auto* rotated =
+          w.exl3 != nullptr && !prefill_phase && n_tokens <= piece
+              ? TakeExl3Rotated(x, n_tokens, consumer)
+              : nullptr;
       for (std::uint32_t first = 0; first < n_tokens; first += piece) {
         const auto count = std::min(piece, n_tokens - first);
         Exl3Projection(w, x + std::size_t{first} * w.cols,
                        out + std::size_t{first} * w.rows, count, exl3_, stream_,
-                       !prefill_phase);
+                       !prefill_phase, rotated);
       }
       return true;
     } catch (const std::exception& error) {
@@ -2968,10 +3045,11 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
 
 bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
                      float* mixed, float* inject, std::uint32_t n_tokens,
-                     std::string* error_msg, bool half_only,
-                     bool no_f32) const {
+                     std::string* error_msg, bool half_only, bool no_f32,
+                     std::span<const DeviceTensor* const> rotate_for) const {
   const Config& c = config();
   mixed_q8_ready_ = {};  // `mixed` is rewritten below
+  exl3_rotated_ = {};
   // Without `normed` this mixer's grouped norm of res is computed here (F32);
   // otherwise the previous combine produced it, as F16 plus tiled Q8 on the
   // wide route or as F32 in s_.xn (with its Q8_1 rows on a decode batch).
@@ -3167,9 +3245,14 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
     // A decode batch's projections of `mixed` share its Q8_1 rows, which
     // the epilogue writes as it stores them.
     const bool q8 = !MatrixRows(n_tokens) && UnpaddedQ8(c.hidden_size);
-    HcMixEpilogue(xn, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr,
-                  mixed, inject, n_tokens, c.hidden_size, c.hc_count, stream_,
-                  q8 ? s_.mixed_q8_1 : nullptr);
+    // EXL3 decode: the epilogue also rotates mixed for the projections that
+    // read it next (GDN qkv/z, attention q/k/v or the shared MLP), removing
+    // their separate rotation launch; the same rounded FP16 values.
+    const auto slabs = Exl3Slabs(rotate_for, n_tokens);
+    if (HcMixEpilogue(xn, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr,
+                      mixed, inject, n_tokens, c.hidden_size, c.hc_count,
+                      stream_, q8 ? s_.mixed_q8_1 : nullptr, slabs))
+      NoteExl3Rotated(slabs, mixed, n_tokens, rotate_for);
     if (q8) {
       mixed_q8_ready_ = {mixed, s_.mixed_q8_1, n_tokens, c.hidden_size};
     }
@@ -3458,6 +3541,10 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                         c.ssm_head_dim == 128 &&
                         l.ssm_out.type == GgmlType::kQ8_0 &&
                         l.ssm_out.cols == value_dim && UnpaddedQ8(value_dim);
+  // EXL3 decode: the epilogue also rotates its rows for ssm_out.
+  const DeviceTensor* const out_consumer[] = {&l.ssm_out};
+  auto out_slabs = project_output && !tiled ? Exl3Slabs(out_consumer, n_tokens)
+                                            : Exl3InputSlabs{};
   if (!GatedDeltaNet(qkv, qkv_stride, z, z_stride, s_.alpha_beta,
                      l.ssm_conv1d.f32(), l.ssm_a.f32(), l.ssm_dt.f32(),
                      l.ssm_norm.f32(), s.conv_state, s_.conv_scratch, s_.qn,
@@ -3469,10 +3556,12 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                      c.ssm_conv_kernel, MatrixRows(n_tokens) && !speculative,
                      convolved, c.rms_eps, stream_, out_half, checkpoint,
                      half_stride, out_q8_1 ? s_.gdn_q8_1 : nullptr, z_ready,
-                     model_->output().exl3 != nullptr)) {
+                     model_->output().exl3 != nullptr,
+                     out_slabs.count != 0 ? &out_slabs : nullptr)) {
     AssignError(error_msg, "DeltaNet launch failed");
     return false;
   }
+  NoteExl3Rotated(out_slabs, s_.gdn_out, n_tokens, out_consumer);
   z_join.event = nullptr;  // GatedDeltaNet waited for the Z rows
   if (!project_output) {
     return true;
@@ -3799,6 +3888,10 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                   model_->output().exl3 != nullptr ? c.indexer_top_k : 0);
   const std::uint32_t q_dim = c.AttentionQDim();
   const std::size_t ctx_count = static_cast<std::size_t>(n_tokens) * q_dim;
+  // EXL3 decode: the gate also rotates the context for attn_out.
+  const DeviceTensor* const out_consumer[] = {&l.attn_out};
+  const auto out_slabs =
+      project_output ? Exl3Slabs(out_consumer, n_tokens) : Exl3InputSlabs{};
   // A decode batch's output projection reads the gate's Q8_1 rows.
   if (project_output && split && l.attn_out.type == GgmlType::kQ8_0 &&
       l.attn_out.cols == q_dim && UnpaddedQ8(q_dim) &&
@@ -3806,7 +3899,11 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     return Dense(l.attn_out, Q8Input{s_.ctx, s_.ctx_q8_1, n_tokens, q_dim}, out,
                  error_msg);
   }
-  SigmoidMul(s_.ctx, s_.attn_gate, ctx_count, stream_);
+  if (out_slabs.count != 0 && SigmoidMulRotate(s_.ctx, s_.attn_gate, n_tokens,
+                                               q_dim, out_slabs, stream_))
+    NoteExl3Rotated(out_slabs, s_.ctx, n_tokens, out_consumer);
+  else
+    SigmoidMul(s_.ctx, s_.attn_gate, ctx_count, stream_);
   return !project_output || Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
 }
 
@@ -3931,9 +4028,14 @@ bool Executor::KvarnAttention(const DeviceLayer& l,
   }
   const std::uint32_t q_dim = c.AttentionQDim();
   const std::size_t ctx_count = static_cast<std::size_t>(n_tokens) * q_dim;
+  // EXL3 decode: the gating kernel also rotates the context for attn_out.
+  const DeviceTensor* const out_consumer[] = {&l.attn_out};
+  const auto out_slabs =
+      project_output ? Exl3Slabs(out_consumer, n_tokens) : Exl3InputSlabs{};
   if (gate_stride != 0) {
-    GateRotatedContext(s_.ctx, s_.qg, gate_stride, n_tokens, c.num_heads,
-                       stream_);
+    if (GateRotatedContext(s_.ctx, s_.qg, gate_stride, n_tokens, c.num_heads,
+                           stream_, out_slabs))
+      NoteExl3Rotated(out_slabs, s_.ctx, n_tokens, out_consumer);
     return !project_output ||
            Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
   }
@@ -3943,7 +4045,11 @@ bool Executor::KvarnAttention(const DeviceLayer& l,
     return Dense(l.attn_out, Q8Input{s_.ctx, s_.ctx_q8_1, n_tokens, q_dim}, out,
                  error_msg);
   }
-  SigmoidMul(s_.ctx, s_.attn_gate, ctx_count, stream_);
+  if (out_slabs.count != 0 && SigmoidMulRotate(s_.ctx, s_.attn_gate, n_tokens,
+                                               q_dim, out_slabs, stream_))
+    NoteExl3Rotated(out_slabs, s_.ctx, n_tokens, out_consumer);
+  else
+    SigmoidMul(s_.ctx, s_.attn_gate, ctx_count, stream_);
   return !project_output || Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
 }
 
@@ -4050,11 +4156,13 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
     }
     stream_ = side_stream_;
   }
+  const DeviceTensor* const shared_inputs[] = {&l.shexp_gate, &l.shexp_up};
   const auto shared_expert = [&] {
     shexp_half_ready_ = false;
     if (l.shexp_gate.exl3 != nullptr && !prefill_phase &&
         Exl3SharedMlp(l, x, s_.shexp_gate, s_.shexp_up, s_.shexp_out, n_tokens,
-                      exl3_, stream_))
+                      exl3_, stream_,
+                      TakeExl3Rotated(x, n_tokens, shared_inputs)))
       return true;
     if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
                     &l.shexp_down, error_msg)) {
@@ -4513,7 +4621,7 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
             xn_q8_ready_, mixed_q8_ready_, xn_deferred_.res, xn_deferred_.gamma,
             xn_deferred_.rows, exl3_moe_defer_, exl3_moe_pending_.layer,
             exl3_moe_pending_.rows, xn_q8t_norm_.res, xn_q8t_norm_.gamma,
-            xn_q8t_norm_.rows);
+            xn_q8t_norm_.rows, exl3_rotated_);
         const auto before = std::apply(
             [](const auto&... fields) { return std::make_tuple(fields...); },
             dispatch);
@@ -4790,8 +4898,14 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                            l.linear && DenseF16Route(l.ssm_in, n) &&
                            l.ssm_alpha_beta.type == GgmlType::kF16 &&
                            l.ssm_alpha_beta.cols == l.ssm_in.cols;
+    // The mixer's EXL3 decode projections of `mixed`.
+    const std::array<const DeviceTensor*, 3> mixer_rotate =
+        l.linear ? std::array<const DeviceTensor*, 3>{&l.ssm_qkv, &l.ssm_gate}
+                 : std::array<const DeviceTensor*, 3>{&l.attn_q, &l.attn_k,
+                                                      &l.attn_v};
+    const std::size_t mixer_count = l.linear ? (l.ssm_in.empty() ? 2 : 0) : 3;
     if (!HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, n, error_msg,
-               half_only)) {
+               half_only, false, std::span(mixer_rotate.data(), mixer_count))) {
       return false;
     }
     // The last target layer's query outputs have no later cache consumer.
@@ -4844,8 +4958,9 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                           l.shexp_gate.type == GgmlType::kQ8_0 &&
                           l.shexp_up.type == GgmlType::kQ8_0;
       Combine(s_.res, l.hc_ffn.norm.f32(), rows, InjectWeights(l.hc_ffn));
+      const DeviceTensor* const shared_rotate[] = {&l.shexp_gate, &l.shexp_up};
       if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, rows, error_msg,
-                 false, no_f32))
+                 false, no_f32, shared_rotate))
         return false;
       // Only the combine below reads this MoE output: EXL3 prefill folds the
       // expert sum into it.
@@ -6219,13 +6334,16 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     return false;
   if (!session.CheckCancellation(error_msg))
     return false;
+  const DeviceTensor* const shared_rotate[] = {&l.shexp_gate, &l.shexp_up};
   if (!HcMix(l.hc_ffn, s_.mtp_res, true, s_.mixed, s_.inject, tail_rows,
-             error_msg) ||
+             error_msg, false, false, shared_rotate) ||
       (trace && !copy_trace(s_.mixed + static_cast<std::size_t>(tail_rows - 1) *
                                            c.hidden_size,
                             trace->ffn_input))) {
     return false;
   }
+  if (skipped != 0 && tail_rows == 2)
+    exl3_rotated_ = {};  // row 0 is rewritten below; its slab row is stale
   if (skipped != 0 && tail_rows == 2 &&
       !Check(hipMemcpyAsync(s_.mixed, s_.mixed + c.hidden_size,
                             c.hidden_size * sizeof(float),

@@ -8,6 +8,7 @@
 #include <initializer_list>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -2316,6 +2317,214 @@ void MtpKvGroup() {
   Require(equal, "all K/V group projections preserve full-QKV bits");
 }
 
+// E1: producer epilogues that also write the rotated FP16 input of the next
+// EXL3 decode projections. The rotation runs the standalone kernels'
+// arithmetic on the same stored FP32 values, so producer outputs and every
+// projection must keep their bits (rows 1..8, every pass width, signed zero
+// and subnormal inputs, a slab prefilled with NaN so padded rows are unused).
+void ProducerRotation() {
+  namespace fast = gufo::hip;
+  constexpr unsigned hidden = 2560, streams = 4, width = 6144;
+  constexpr unsigned k_heads = 16, v_heads = 48, head = 128, taps = 4;
+  constexpr unsigned channels = (2 * k_heads + v_heads) * head;
+  constexpr unsigned heads = 24, head_dim = 256;
+  Buffers buffers;
+  Bank q(buffers, hidden, 512, 6, 1, 31), key(buffers, hidden, 256, 6, 1, 32),
+      value(buffers, hidden, 256, 6, 1, 33);
+  Bank gate(buffers, hidden, 640, 4, 1, 34), up(buffers, hidden, 640, 4, 1, 35),
+      down(buffers, 640, hidden, 5, 1, 36);
+  Bank out(buffers, width, hidden, 3, 1, 37);
+  auto scratch = Scratch(buffers, 8, width, width);
+  scratch.rotated_input_elements = std::size_t{24} * width;
+  scratch.rotated_input =
+      buffers.Make<std::uint16_t>(scratch.rotated_input_elements);
+  const auto& p = scratch.projection;
+  const fast::Exl3FastWorkspace ws{
+      p.fast_input,         p.fast_input_elements, p.fast_counters,
+      p.fast_counter_count, p.fast_down_input,     p.fast_down_input_elements};
+  const fast::Exl3FastWorkspace pre{
+      scratch.rotated_input, scratch.rotated_input_elements,
+      p.fast_counters,       p.fast_counter_count,
+      p.fast_down_input,     p.fast_down_input_elements};
+  const auto special = [](std::vector<float> x) {
+    for (std::size_t i = 0; i + 64 < x.size(); i += 997) {
+      x[i] = -0.0F;
+      x[i + 1] = 0.0F;
+      x[i + 2] = 1e-40F;
+      x[i + 3] = -3e-39F;
+      x[i + 4] = std::numeric_limits<float>::denorm_min();
+    }
+    return x;
+  };
+  const auto download = [](const auto* d, std::size_t count) {
+    std::vector<std::remove_cv_t<std::remove_pointer_t<decltype(d)>>> h(count);
+    Check(hipMemcpy(h.data(), d, count * sizeof(h[0]), hipMemcpyDeviceToHost));
+    return h;
+  };
+  const auto slabs = [&](std::initializer_list<const Bank*> banks,
+                         unsigned rows) {
+    gpu::Exl3InputSlabs s{};
+    for (const Bank* b : banks)
+      s.suh[s.count++] = b->weight.exl3->suh;
+    s.out = scratch.rotated_input;
+    s.pass_rows = fast::Exl3FastPassRows(rows);
+    s.k = banks.begin()[0]->k;
+    // Padded rows and stale slabs must never be read.
+    Check(hipMemset(scratch.rotated_input, 0xFF,
+                    scratch.rotated_input_elements * 2));
+    return s;
+  };
+  const auto project = [&](const float* x, unsigned rows, bool rotated) {
+    auto* y = buffers.Make<float>(std::size_t{rows} * hidden);
+    gpu::Exl3Projection(out.weight, x, y, rows, scratch, nullptr, true,
+                        rotated ? scratch.rotated_input : nullptr);
+    return download(y, std::size_t{rows} * hidden);
+  };
+  for (unsigned rows = 1; rows <= 8; ++rows) {
+    const std::string tag = " rows=" + std::to_string(rows);
+    BeginCase("producer rotation HC mix" + tag);
+    {
+      const auto* xn = buffers.Copy(special(Input(rows * streams * hidden)));
+      auto g = Input(rows * streams * hidden);
+      std::reverse(g.begin(), g.end());
+      const auto* dg = buffers.Copy(g);
+      const std::size_t q8_bytes = std::size_t{rows} * hidden / 32 * 36;
+      float* mixed[3];
+      std::uint8_t* q8[3];
+      for (int i = 0; i < 3; ++i) {
+        mixed[i] = buffers.Make<float>(rows * hidden);
+        q8[i] = buffers.Make<std::uint8_t>(q8_bytes);
+      }
+      const auto group = [&](const float* x, bool rotated) {
+        std::array<float*, 3> y{buffers.Make<float>(rows * 512),
+                                buffers.Make<float>(rows * 256),
+                                buffers.Make<float>(rows * 256)};
+        const std::array<fast::Exl3FastTarget, 3> targets{
+            {{q.weight.exl3, y[0], 512},
+             {key.weight.exl3, y[1], 256},
+             {value.weight.exl3, y[2], 256}}};
+        fast::LaunchExl3FastProjections(targets, x, hidden, rows,
+                                        rotated ? pre : ws, nullptr, rotated);
+        std::vector<float> all = download(y[0], rows * 512);
+        for (int i = 1; i < 3; ++i) {
+          const auto part = download(y[i], rows * 256);
+          all.insert(all.end(), part.begin(), part.end());
+        }
+        return all;
+      };
+      const auto mlp = [&](const float* x, bool rotated) {
+        auto* y = buffers.Make<float>(rows * hidden);
+        const fast::Exl3FastMlp m{gate.weight.exl3,
+                                  up.weight.exl3,
+                                  down.weight.exl3,
+                                  buffers.Make<float>(8 * 640),
+                                  buffers.Make<float>(8 * 640),
+                                  y,
+                                  hidden};
+        fast::LaunchExl3FastMlp(m, x, hidden, rows, rotated ? pre : ws, nullptr,
+                                rotated);
+        return download(y, rows * hidden);
+      };
+      gpu::HcMixEpilogue(xn, dg, nullptr, mixed[0], nullptr, rows, hidden,
+                         streams, nullptr, q8[0]);
+      const auto group_ref = group(mixed[0], false);
+      const auto mlp_ref = mlp(mixed[0], false);
+      Require(gpu::HcMixEpilogue(xn, dg, nullptr, mixed[1], nullptr, rows,
+                                 hidden, streams, nullptr, q8[1],
+                                 slabs({&q, &key, &value}, rows)),
+              "HC mix epilogue rotates for q/k/v");
+      SameBits(group_ref, group(mixed[1], true), "q/k/v from HC mix slabs");
+      Require(gpu::HcMixEpilogue(xn, dg, nullptr, mixed[2], nullptr, rows,
+                                 hidden, streams, nullptr, q8[2],
+                                 slabs({&gate, &up}, rows)),
+              "HC mix epilogue rotates for the shared MLP");
+      SameBits(mlp_ref, mlp(mixed[2], true), "shared MLP from HC mix slabs");
+      for (int i = 1; i < 3; ++i) {
+        SameBits(download(mixed[0], rows * hidden),
+                 download(mixed[i], rows * hidden), "HC mixed rows");
+        Require(download(q8[0], q8_bytes) == download(q8[i], q8_bytes),
+                "HC mixed Q8_1 rows differ");
+      }
+    }
+    BeginCase("producer rotation GDN epilogue" + tag);
+    {
+      auto qkv = Input(rows * channels);
+      for (auto& v : qkv)
+        v *= 16.0F;
+      const auto* dqkv = buffers.Copy(special(qkv));
+      const auto* dz = buffers.Copy(special(Input(rows * width)));
+      const auto* dab = buffers.Copy(Input(rows * 2 * v_heads));
+      const auto* conv_w = buffers.Copy(Input(channels * taps));
+      const auto* a = buffers.Copy(Input(v_heads));
+      const auto* dt = buffers.Copy(Input(v_heads));
+      auto norm = Input(head);
+      for (auto& v : norm)
+        v += 1.0F;
+      const auto* norm_w = buffers.Copy(norm);
+      auto* conv_state = buffers.Make<float>((taps - 1) * channels);
+      auto* conv_scratch = buffers.Make<float>((rows + taps) * channels);
+      auto* qn = buffers.Make<float>(rows * k_heads * head);
+      auto* kn = buffers.Make<float>(rows * k_heads * head);
+      auto* raw = buffers.Make<float>(rows * width);
+      auto* state = buffers.Make<float>(std::size_t{v_heads} * head * head);
+      float* gdn[2] = {buffers.Make<float>(rows * width),
+                       buffers.Make<float>(rows * width)};
+      std::vector<float> states[2];
+      for (int run = 0; run < 2; ++run) {
+        Check(hipMemset(conv_state, 0, (taps - 1) * channels * 4));
+        Check(hipMemset(state, 0, std::size_t{v_heads} * head * head * 4));
+        auto s = run == 1 ? slabs({&out}, rows) : gpu::Exl3InputSlabs{};
+        Require(gpu::GatedDeltaNet(dqkv, channels, dz, width, dab, conv_w, a,
+                                   dt, norm_w, conv_state, conv_scratch, qn, kn,
+                                   raw, state, gdn[run], nullptr, {}, {}, rows,
+                                   k_heads, v_heads, head, taps, false, false,
+                                   1e-6F, nullptr, nullptr, {}, 0, nullptr,
+                                   nullptr, true, run == 1 ? &s : nullptr),
+                "GDN launch");
+        Require(run == 0 || s.count == 1, "GDN epilogue rotates for ssm_out");
+        states[run] = download(state, std::size_t{v_heads} * head * head);
+      }
+      SameBits(states[0], states[1], "GDN state");
+      SameBits(download(gdn[0], rows * width), download(gdn[1], rows * width),
+               "GDN output rows");
+      // The reference projection rotates through the fast workspace and
+      // leaves run 1's slab in place.
+      const auto ref = project(gdn[0], rows, false);
+      SameBits(ref, project(gdn[1], rows, true), "ssm_out from GDN slabs");
+    }
+    BeginCase("producer rotation attention gate" + tag);
+    {
+      const auto ctx = special(Input(rows * width));
+      const auto* g = buffers.Copy(Input(rows * width));
+      float* x[2] = {buffers.Copy(ctx), buffers.Copy(ctx)};
+      gpu::SigmoidMul(x[0], g, std::size_t{rows} * width, nullptr);
+      const auto ref = project(x[0], rows, false);
+      Require(gpu::SigmoidMulRotate(x[1], g, rows, width, slabs({&out}, rows),
+                                    nullptr),
+              "gate rotates for attn_out");
+      SameBits(ref, project(x[1], rows, true), "attn_out from gate slabs");
+      SameBits(download(x[0], rows * width), download(x[1], rows * width),
+               "gated context rows");
+    }
+    BeginCase("producer rotation KVarN context gate" + tag);
+    {
+      const auto ctx = special(Input(rows * width));
+      const auto* qg = buffers.Copy(Input(rows * 2 * width));
+      float* x[2] = {buffers.Copy(ctx), buffers.Copy(ctx)};
+      Require(
+          !gpu::GateRotatedContext(x[0], qg, 2 * width, rows, heads, nullptr),
+          "plain KVarN gate writes no slab");
+      const auto ref = project(x[0], rows, false);
+      Require(gpu::GateRotatedContext(x[1], qg, 2 * width, rows, heads, nullptr,
+                                      slabs({&out}, rows)),
+              "KVarN gate rotates for attn_out");
+      SameBits(ref, project(x[1], rows, true), "attn_out from KVarN slabs");
+      SameBits(download(x[0], rows * width), download(x[1], rows * width),
+               "KVarN gated context rows");
+      static_assert(heads * head_dim == width);
+    }
+  }
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2360,6 +2569,10 @@ int main(int argc, char** argv) {
       MtpKvGroup();
       return 0;
     }
+    if (argc == 2 && std::string(argv[1]) == "--producer-rotation") {
+      ProducerRotation();
+      return 0;
+    }
     if (argc == 2) {
       Require(std::string_view(argv[1]) == "--shared-invariance-only",
               "unknown operator test argument");
@@ -2379,6 +2592,7 @@ int main(int argc, char** argv) {
     Projection(2560, 10240, 7, {1U});
     Projection(6144, 2560, 7, {1U});
     Routed(true, 3, 2560, 640, 16);
+    ProducerRotation();
     SelectedHead();
     for (unsigned rows : {1U, 2U, 3U, 7U, 8U, 9U, 32U, 33U, 64U}) {
       Routed(true, rows);

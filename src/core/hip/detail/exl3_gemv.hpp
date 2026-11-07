@@ -231,6 +231,31 @@ __device__ __forceinline__ void Butterfly128(float (&v)[4], unsigned lane) {
   }
 }
 
+/// The input rotation of one segment held four consecutive elements per lane
+/// (v[j] is element first + j, first = segment * 128 + 4 * lane): stores
+/// FP16(H(suh * v)) at row `row` of an M-row lane-major slab with the
+/// producer arithmetic above, bit for bit the standalone rotation kernels'.
+/// Producers that already hold the FP32 row call this instead of a separate
+/// rotation launch rereading it.
+__device__ __forceinline__ void RotateInputSegment(float (&v)[4], unsigned lane,
+                                                   unsigned first,
+                                                   const _Float16* suh,
+                                                   _Float16* slab, unsigned row,
+                                                   unsigned m) {
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    v[j] = v[j] * static_cast<float>(suh[first + j]);
+    asm volatile("" : "+v"(v[j]));
+  }
+  Butterfly128(v, lane);
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    v[j] *= kHadamardScale;
+    asm volatile("" : "+v"(v[j]));
+    slab[LaneMajorOffset(first + j, row, m)] = static_cast<_Float16>(v[j]);
+  }
+}
+
 }  // namespace gufo::hip::exl3
 #endif  // defined(__HIPCC__)
 

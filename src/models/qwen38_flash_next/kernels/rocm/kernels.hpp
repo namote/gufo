@@ -24,6 +24,19 @@ namespace gufo::models::qwen38_flash_next::rocm {
 
 struct Exl3RouteTile;  // exl3_moe.hpp
 
+/// FP16 lane-major input slabs of the EXL3 decode projections that follow a
+/// producer epilogue (gufo::hip::LaunchExl3FastProjections / LaunchExl3FastMlp
+/// with input_rotated): consumer c's slab starts at out + c * 8 * k and holds
+/// the producer's rows rotated with suh[c], M = pass_rows
+/// (Exl3FastPassRows of the row count). count == 0: no slabs.
+struct Exl3InputSlabs {
+  const std::uint16_t* suh[gufo::hip::kExl3FastMaxGroup]{};
+  std::uint16_t* out{nullptr};
+  std::uint32_t count{0};
+  std::uint32_t pass_rows{0};
+  std::uint32_t k{0};
+};
+
 /// Host launch values, copied into kernel arguments before returning. The
 /// device descriptor tables may be reused on the same stream after GEMM;
 /// no mapped host descriptor is overwritten while the GPU still reads it.
@@ -91,9 +104,12 @@ bool AttentionQueryRows(const float* qg, std::uint32_t qg_stride,
                         const YarnRope& yarn);
 /// RotateHeadRows of the context rows, then SigmoidMul by the gate half of
 /// the packed qg rows (UnpackQGate's layout), in one pass.
-void GateRotatedContext(float* ctx, const float* qg, std::uint32_t qg_stride,
+/// Non-empty `slabs` (one consumer, k == heads * 256) also receive the
+/// gated context rotated for the EXL3 output projection; returns whether
+/// they were written.
+bool GateRotatedContext(float* ctx, const float* qg, std::uint32_t qg_stride,
                         std::uint32_t n_tokens, std::uint32_t heads,
-                        hipStream_t stream);
+                        hipStream_t stream, const Exl3InputSlabs& slabs = {});
 
 /// One layer's KVarN K/V as the attention kernels read it
 /// (plan/exl3/F1-KVARN-DESIGN.md 4). Position j of a query at position p is
@@ -195,10 +211,14 @@ std::uint32_t HcInjectPartsVec4(std::uint32_t hidden);
 /// A non-null `mixed_q8` (hidden % 32 == 0) also receives mixed as the
 /// small-batch projections' Q8_1 rows, byte-identical to
 /// qfn_mmq_quantize_q8_1.
-void HcMixEpilogue(const float* xn, const float* gate, const float* inject_w,
+/// Non-empty `slabs` (four streams, hidden % 256 == 0, k == hidden) also
+/// receive mixed rotated for the next EXL3 decode projections; returns
+/// whether they were written (false launches the plain epilogue).
+bool HcMixEpilogue(const float* xn, const float* gate, const float* inject_w,
                    float* mixed, float* inject, std::uint32_t n_tokens,
                    std::uint32_t hidden, std::uint32_t streams,
-                   hipStream_t stream, void* mixed_q8 = nullptr);
+                   hipStream_t stream, void* mixed_q8 = nullptr,
+                   const Exl3InputSlabs& slabs = {});
 /// Four adjacent hidden lanes per thread. The model's four-stream geometry
 /// emits HcInjectPartsVec4(hidden) partial sums per inject logit.
 /// A non-null `mixed_half` also receives NarrowActivations' F16 rows of
@@ -324,6 +344,12 @@ bool SwigluQ8Tiled(const float* gate, const float* up, void* out_q8,
 /// x[i] *= sigmoid(g[i]).
 void SigmoidMul(float* x, const float* g, std::size_t count,
                 hipStream_t stream);
+/// SigmoidMul over rows of `width` (count = rows * width) that also writes
+/// x rotated into `slabs` (one consumer, k == width, width % 128 == 0). False,
+/// with nothing launched, otherwise.
+bool SigmoidMulRotate(float* x, const float* g, std::uint32_t rows,
+                      std::uint32_t width, const Exl3InputSlabs& slabs,
+                      hipStream_t stream);
 /// SigmoidMul that also writes x's Q8_1 rows to `x_q8` as
 /// qfn_mmq_quantize_q8_1 would for unpadded rows. False, with nothing
 /// launched, unless count is a multiple of 32.
@@ -546,7 +572,9 @@ struct GdnCheckpoint {
 /// of `z`, waits for `z_ready` when it is set. Returns false when that wait
 /// cannot be queued. `convolved`
 /// consumes convolution rows already in conv_scratch; it requires null
-/// speculative snapshots.
+/// speculative snapshots. A non-null `out_slabs` with one consumer (F32
+/// `out` rows, d == 128, k == v_heads * d) also receives the rows rotated
+/// for the EXL3 output projection; its count is zeroed when it does not.
 bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    std::uint32_t z_stride, const float* alpha_beta,
                    const float* conv_w, const float* a, const float* dt,
@@ -559,7 +587,8 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    bool convolved, float eps, hipStream_t stream,
                    __half* out_half = nullptr, GdnCheckpoint checkpoint = {},
                    std::uint32_t out_half_stride = 0, void* out_q8_1 = nullptr,
-                   hipEvent_t z_ready = nullptr, bool stable_conv = false);
+                   hipEvent_t z_ready = nullptr, bool stable_conv = false,
+                   Exl3InputSlabs* out_slabs = nullptr);
 
 /// Private rows for one request in a decode batch. Scratch regions and all
 /// recurrent/history/rollback buffers must be disjoint between requests.

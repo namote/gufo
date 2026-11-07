@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <type_traits>
 
+#include "src/core/hip/detail/exl3_gemv.hpp"
 #include "src/core/hip/detail/kvarn_device.hpp"
 #include "src/core/hip/kv_block_table.hpp"
 #include "src/core/hip/kvarn_layout.hpp"
@@ -23,6 +24,38 @@ namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
 
 constexpr unsigned kThreads = 256;
+
+/// Consumer c's FP16 slab and suh of `slabs` (c < slabs.count; wave-uniform
+/// selection, no dynamic indexing of the argument block).
+struct SlabTarget {
+  const _Float16* suh;
+  _Float16* out;
+};
+__device__ __forceinline__ SlabTarget SlabOf(const Exl3InputSlabs& slabs,
+                                             unsigned c) {
+  const std::uint16_t* suh = slabs.suh[0];
+  if (c == 1)
+    suh = slabs.suh[1];
+  else if (c == 2)
+    suh = slabs.suh[2];
+  return {reinterpret_cast<const _Float16*>(suh),
+          reinterpret_cast<_Float16*>(slabs.out) +
+              std::size_t{c} * hip::exl3::kMaxRows * slabs.k};
+}
+
+/// Rotates one 128-element segment (v[j] = element first + j, first =
+/// segment * 128 + 4 * lane) of slab row `row` into every consumer's slab.
+__device__ __forceinline__ void RotateIntoSlabs(const float (&v)[4],
+                                                unsigned lane, unsigned first,
+                                                unsigned row,
+                                                const Exl3InputSlabs& slabs) {
+  for (unsigned c = 0; c < slabs.count; ++c) {
+    const SlabTarget target = SlabOf(slabs, c);
+    float w[4] = {v[0], v[1], v[2], v[3]};
+    hip::exl3::RotateInputSegment(w, lane, first, target.suh, target.out, row,
+                                  slabs.pass_rows);
+  }
+}
 
 struct Exl3DensePrefillArguments {
   Exl3DensePrefillProblem problems[3];
@@ -320,11 +353,16 @@ __global__ void RmsNormCachedKernel(const float* x, const float* gamma,
 /// the stream loops unroll: every read is issued up front, the inject
 /// weights before the `mixed` store, and the sums still run stream by
 /// stream in order.
+/// Non-empty `slabs` (hidden % 256 == 0: every block holds two whole
+/// segments of its row) also receive the row rotated for the EXL3 decode
+/// projections that read `mixed` next: wave w rotates segment w % 2 for
+/// consumer w / 2 from the block's stored values.
 template<std::uint32_t kStreams>
 __global__ void HcMixEpilogueKernel(const float* xn, const float* gate,
                                     const float* inject_w, float* mixed,
                                     float* inject, std::uint32_t hidden,
-                                    std::uint32_t streams, void* mixed_q8) {
+                                    std::uint32_t streams, void* mixed_q8,
+                                    Exl3InputSlabs slabs) {
   constexpr std::uint32_t kMaxStreams = 8;
   constexpr std::uint32_t kSlots = kStreams != 0 ? kStreams : kMaxStreams;
   if constexpr (kStreams != 0) {
@@ -362,12 +400,27 @@ __global__ void HcMixEpilogueKernel(const float* xn, const float* gate,
       acc = Materialize(acc + v[s] * SigmoidF(gv[s]));
     }
   }
+  float out = 0.0f;
   if (live) {
-    const float out = acc / static_cast<float>(streams);
+    out = acc / static_cast<float>(streams);
     mixed[static_cast<std::size_t>(t) * hidden + i] = out;
     // hidden % 32 == 0, so whole 32-lane groups take this branch together.
     if (mixed_q8 != nullptr) {
       QuantizeQ8_1Lane(out, mixed_q8, static_cast<std::size_t>(t) * hidden + i);
+    }
+  }
+  if (slabs.count != 0) {
+    __shared__ float row[kThreads];
+    row[threadIdx.x] = out;
+    __syncthreads();
+    const std::uint32_t w = threadIdx.x / warpSize;
+    if (w < 2 * slabs.count) {
+      const std::uint32_t l = threadIdx.x % warpSize;
+      const std::uint32_t local = (w % 2) * hip::exl3::kSegment + 4 * l;
+      float v[4] = {row[local], row[local + 1], row[local + 2], row[local + 3]};
+      const SlabTarget target = SlabOf(slabs, w / 2);
+      hip::exl3::RotateInputSegment(v, l, blockIdx.y * kThreads + local,
+                                    target.suh, target.out, t, slabs.pass_rows);
     }
   }
   if (inject_w == nullptr) {
@@ -1436,6 +1489,30 @@ __global__ void SigmoidMulKernel(float* x, const float* g, std::size_t count) {
   }
 }
 
+/// SigmoidMulKernel over rows of `width` (width % 128 == 0), one wave per
+/// (row, segment), that also rotates the stored values into `slabs`.
+__launch_bounds__(256) __global__
+    void SigmoidMulRotateKernel(float* __restrict__ x,
+                                const float* __restrict__ g, std::uint32_t rows,
+                                std::uint32_t width, Exl3InputSlabs slabs) {
+  const std::uint32_t segments = width / hip::exl3::kSegment;
+  const std::uint32_t item = blockIdx.x * 8 + threadIdx.x / 32;
+  const std::uint32_t lane = threadIdx.x % 32;
+  if (item >= rows * segments)
+    return;
+  const std::uint32_t row = item / segments;
+  const std::uint32_t first =
+      (item % segments) * hip::exl3::kSegment + 4 * lane;
+  float v[4];
+#pragma unroll
+  for (std::uint32_t j = 0; j < 4; ++j) {
+    const std::size_t i = std::size_t{row} * width + first + j;
+    v[j] = x[i] * SigmoidF(g[i]);
+    x[i] = v[j];
+  }
+  RotateIntoSlabs(v, lane, first, row, slabs);
+}
+
 /// SigmoidMulKernel that also writes x's unpadded Q8_1 rows (count % 32 == 0).
 __global__ void SigmoidMulQ8Kernel(float* x, const float* g, std::size_t count,
                                    void* x_q8) {
@@ -2432,7 +2509,9 @@ __global__ void RestoreGdnStateKernel(float* state, RollbackRows snapshots,
 /// A non-null `out_q8` receives the row quantized into the tiled Q8 layout
 /// of the ssm_out projection (K = v_heads * d) in place of the F32 row:
 /// each wave-wide slice of 32 lanes is one K block. Otherwise a non-null
-/// `out_q8_1` also receives the F32 rows' unpadded Q8_1 rows.
+/// `out_q8_1` also receives the F32 rows' unpadded Q8_1 rows. Non-empty
+/// `slabs` (F32 rows only; k == v_heads * d) also receive each token's F32
+/// row rotated for the EXL3 output projection.
 template<bool kBatch>
 __global__ void GdnEpilogueKernel(const float* raw, const float* z,
                                   std::uint32_t z_stride, const float* norm_w,
@@ -2440,7 +2519,8 @@ __global__ void GdnEpilogueKernel(const float* raw, const float* z,
                                   std::uint32_t n_rows, std::uint32_t v_heads,
                                   float eps, const GdnBatchItem* batch,
                                   std::uint32_t active, void* out_q8_1,
-                                  std::uint32_t out_half_stride = 0) {
+                                  std::uint32_t out_half_stride = 0,
+                                  Exl3InputSlabs slabs = {}) {
   if constexpr (kBatch) {
     if ((active & (1U << blockIdx.z)) == 0)
       return;
@@ -2470,10 +2550,12 @@ __global__ void GdnEpilogueKernel(const float* raw, const float* z,
   }
   const float scale = rsqrtf(WaveSum(ss) / static_cast<float>(d) + eps);
   if (out_q8 == nullptr) {
+    float values[d / 32];
 #pragma unroll
     for (std::uint32_t r = 0; r < per_lane; ++r) {
       const std::uint32_t i = r * warpSize + lane;
       const float value = v[r] * scale * norm_w[i] * SigmoidF(zrow[i]);
+      values[r] = value;
       if (out_half != nullptr) {
         const auto offset =
             out_half_stride != 0
@@ -2484,6 +2566,27 @@ __global__ void GdnEpilogueKernel(const float* raw, const float* z,
         out[row * d + i] = value;
         if (out_q8_1 != nullptr)
           QuantizeQ8_1Lane(value, out_q8_1, row * d + i);
+      }
+    }
+    if constexpr (!kBatch) {
+      if (slabs.count != 0 && out_half == nullptr) {
+        // The head row is one segment; lane l takes elements 4l .. 4l + 3,
+        // held as values[l / 8] by lanes (4l + j) % 32.
+        static_assert(d == hip::exl3::kSegment && d / 32 == 4);
+        float seg[4];
+#pragma unroll
+        for (std::uint32_t j = 0; j < 4; ++j) {
+          const int source = static_cast<int>((4 * lane + j) % warpSize);
+          float pick = 0.0f;
+#pragma unroll
+          for (std::uint32_t r = 0; r < 4; ++r) {
+            const float moved = __shfl(values[r], source, warpSize);
+            pick = lane / 8 == r ? moved : pick;
+          }
+          seg[j] = pick;
+        }
+        RotateIntoSlabs(seg, lane, (row % v_heads) * d + 4 * lane,
+                        row / v_heads, slabs);
       }
     }
     return;
@@ -6616,22 +6719,27 @@ std::uint32_t HcInjectPartsVec4(std::uint32_t hidden) {
   return Blocks((hidden + 3) / 4);
 }
 
-void HcMixEpilogue(const float* xn, const float* gate, const float* inject_w,
+bool HcMixEpilogue(const float* xn, const float* gate, const float* inject_w,
                    float* mixed, float* inject, std::uint32_t n_tokens,
                    std::uint32_t hidden, std::uint32_t streams,
-                   hipStream_t stream, void* mixed_q8) {
+                   hipStream_t stream, void* mixed_q8,
+                   const Exl3InputSlabs& slabs) {
   if (hidden % 32 != 0) {
     mixed_q8 = nullptr;
   }
+  const bool rotate = slabs.count != 0 && streams == 4 && hidden % 256 == 0 &&
+                      slabs.k == hidden && n_tokens <= slabs.pass_rows;
+  const Exl3InputSlabs launch_slabs = rotate ? slabs : Exl3InputSlabs{};
   if (streams == 4) {
     hipLaunchKernelGGL(HcMixEpilogueKernel<4>, dim3(n_tokens, Blocks(hidden)),
                        dim3(kThreads), 0, stream, xn, gate, inject_w, mixed,
-                       inject, hidden, streams, mixed_q8);
-    return;
+                       inject, hidden, streams, mixed_q8, launch_slabs);
+    return rotate;
   }
   hipLaunchKernelGGL(HcMixEpilogueKernel<0>, dim3(n_tokens, Blocks(hidden)),
                      dim3(kThreads), 0, stream, xn, gate, inject_w, mixed,
-                     inject, hidden, streams, mixed_q8);
+                     inject, hidden, streams, mixed_q8, launch_slabs);
+  return false;
 }
 
 bool HcMixEpilogueVec4(const float* xn, const float* gate,
@@ -6901,6 +7009,18 @@ void SigmoidMul(float* x, const float* g, std::size_t count,
                 hipStream_t stream) {
   hipLaunchKernelGGL(SigmoidMulKernel, dim3(Blocks(count)), dim3(kThreads), 0,
                      stream, x, g, count);
+}
+
+bool SigmoidMulRotate(float* x, const float* g, std::uint32_t rows,
+                      std::uint32_t width, const Exl3InputSlabs& slabs,
+                      hipStream_t stream) {
+  if (rows == 0 || slabs.count != 1 || slabs.k != width ||
+      width % hip::exl3::kSegment != 0 || rows > slabs.pass_rows)
+    return false;
+  const std::uint32_t items = rows * (width / hip::exl3::kSegment);
+  hipLaunchKernelGGL(SigmoidMulRotateKernel, dim3((items + 7) / 8), dim3(256),
+                     0, stream, x, g, rows, width, slabs);
+  return true;
 }
 
 bool SigmoidMulQ8_1(float* x, const float* g, std::size_t count, void* x_q8,
@@ -8564,7 +8684,8 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    bool convolved, float eps, hipStream_t stream,
                    __half* out_half, GdnCheckpoint checkpoint,
                    std::uint32_t out_half_stride, void* out_q8_1,
-                   hipEvent_t z_ready, bool stable_conv) {
+                   hipEvent_t z_ready, bool stable_conv,
+                   Exl3InputSlabs* out_slabs) {
   const std::uint32_t channels = 2 * k_heads * d + v_heads * d;
   const std::size_t count = static_cast<std::size_t>(n_tokens) * channels;
   if (checkpoint.history != nullptr)
@@ -8681,13 +8802,19 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
   if (z_ready != nullptr &&
       hipStreamWaitEvent(stream, z_ready, 0) != hipSuccess)
     return false;
+  const bool rotate = out_slabs != nullptr && out_slabs->count == 1 &&
+                      out_q8 == nullptr && out_half == nullptr &&
+                      d == kGdnDim && out_slabs->k == v_heads * d &&
+                      n_tokens <= out_slabs->pass_rows;
+  if (out_slabs != nullptr && !rotate)
+    out_slabs->count = 0;
   hipLaunchKernelGGL(
       GdnEpilogueKernel<false>, dim3((n_tokens * v_heads + waves - 1) / waves),
       dim3(kThreads), 0, stream, raw, z, z_stride, norm_w, out, out_q8,
       out_half, n_tokens * v_heads, v_heads, eps, nullptr, 0,
       out_q8 == nullptr && out_half == nullptr && d == kGdnDim ? out_q8_1
                                                                : nullptr,
-      out_half_stride);
+      out_half_stride, rotate ? *out_slabs : Exl3InputSlabs{});
   return true;
 }
 
@@ -8923,11 +9050,14 @@ bool AttentionQueryRows(const float* qg, std::uint32_t qg_stride,
 }
 
 /// GateRotatedContext: one wave per context row of 256.
+/// Non-empty `slabs` also receive the stored row rotated for the EXL3 output
+/// projection (lane l of segment s takes elements s * 128 + 4l + j, held by
+/// lane s * 16 + l / 2 at 4 * (l % 2) + j).
 __launch_bounds__(256) __global__
     void GateRotatedContextKernel(float* __restrict__ ctx,
                                   const float* __restrict__ qg,
                                   std::uint32_t qg_stride, std::uint32_t heads,
-                                  std::uint32_t rows) {
+                                  std::uint32_t rows, Exl3InputSlabs slabs) {
   constexpr std::uint32_t d = hip::kKvarnHeadDim;
   const std::uint32_t row = blockIdx.x * 8 + threadIdx.x / 32;
   const std::uint32_t lane = threadIdx.x % 32;
@@ -8951,16 +9081,38 @@ __launch_bounds__(256) __global__
   }
   reinterpret_cast<float4*>(p)[0] = make_float4(out[0], out[1], out[2], out[3]);
   reinterpret_cast<float4*>(p)[1] = make_float4(out[4], out[5], out[6], out[7]);
+  if (slabs.count == 0)
+    return;
+  static_assert(d == 2 * hip::exl3::kSegment);
+#pragma unroll
+  for (std::uint32_t segment = 0; segment < 2; ++segment) {
+    const int source = static_cast<int>(segment * 16 + lane / 2);
+    float v[4];
+#pragma unroll
+    for (std::uint32_t j = 0; j < 4; ++j) {
+      const float low = __shfl(out[j], source, 32);
+      const float high = __shfl(out[4 + j], source, 32);
+      v[j] = lane % 2 != 0 ? high : low;
+    }
+    RotateIntoSlabs(
+        v, lane, (row % heads) * d + segment * hip::exl3::kSegment + 4 * lane,
+        row / heads, slabs);
+  }
 }
 
-void GateRotatedContext(float* ctx, const float* qg, std::uint32_t qg_stride,
+bool GateRotatedContext(float* ctx, const float* qg, std::uint32_t qg_stride,
                         std::uint32_t n_tokens, std::uint32_t heads,
-                        hipStream_t stream) {
+                        hipStream_t stream, const Exl3InputSlabs& slabs) {
   const std::uint32_t rows = n_tokens * heads;
   if (rows == 0)
-    return;
+    return false;
+  const bool rotate = slabs.count == 1 &&
+                      slabs.k == heads * hip::kKvarnHeadDim &&
+                      n_tokens <= slabs.pass_rows;
   hipLaunchKernelGGL(GateRotatedContextKernel, dim3((rows + 7) / 8), dim3(256),
-                     0, stream, ctx, qg, qg_stride, heads, rows);
+                     0, stream, ctx, qg, qg_stride, heads, rows,
+                     rotate ? slabs : Exl3InputSlabs{});
+  return rotate;
 }
 
 void RotateHeadRows(float* x, std::uint32_t rows, hipStream_t stream) {

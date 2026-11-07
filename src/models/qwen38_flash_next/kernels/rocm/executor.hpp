@@ -685,9 +685,13 @@ private:
   /// of res (F32 in s_.xn, or F16 plus tiled Q8 on the wide route).
   /// `half_only` leaves only the F16 copy of `mixed`; `no_f32` keeps its
   /// F16 and tiled Q8 copies but skips the F32 rows nothing reads.
+  /// `rotate_for`: the EXL3 decode projections (one group, or gate/up of
+  /// the shared MLP) that read `mixed` next; the epilogue also writes their
+  /// rotated input where Exl3Slabs applies.
   bool HcMix(const DeviceMixer& m, const float* res, bool normed, float* mixed,
              float* inject, std::uint32_t n_tokens, std::string* error_msg,
-             bool half_only = false, bool no_f32 = false) const;
+             bool half_only = false, bool no_f32 = false,
+             std::span<const DeviceTensor* const> rotate_for = {}) const;
   /// Share mixer projections across decode requests without selecting the
   /// prefill arithmetic. Injection rows are compact across the whole batch.
   bool HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
@@ -1083,6 +1087,29 @@ private:
   };
   mutable ReadyRows xn_q8_ready_;
   mutable ReadyRows mixed_q8_ready_;
+  /// Rows of `x` a producer epilogue rotated into exl3_.rotated_input for the
+  /// decode projections `consumers` (slab c for consumer c); consumed by the
+  /// first matching TakeExl3Rotated, cleared whenever HcMix rewrites mixed.
+  struct Exl3RotatedRows {
+    const float* x{nullptr};
+    std::uint32_t rows{0};
+    std::uint32_t count{0};
+    const quant::exl3::DeviceLinear* consumers[gufo::hip::kExl3FastMaxGroup]{};
+  };
+  mutable Exl3RotatedRows exl3_rotated_;
+  /// Slabs for `rows` (1..8) decode rows of the given complete EXL3 fast-path
+  /// projections (equal k and rate), or count 0 when they do not apply.
+  [[nodiscard]] Exl3InputSlabs Exl3Slabs(
+      std::span<const DeviceTensor* const> consumers, std::uint32_t rows) const;
+  /// Records that a producer wrote `slabs` from rows of `x`.
+  void NoteExl3Rotated(const Exl3InputSlabs& slabs, const float* x,
+                       std::uint32_t rows,
+                       std::span<const DeviceTensor* const> consumers) const;
+  /// The slabs NoteExl3Rotated recorded for exactly these consumers, rows
+  /// and x (then forgotten), or null.
+  [[nodiscard]] const std::uint16_t* TakeExl3Rotated(
+      const float* x, std::uint32_t rows,
+      std::span<const DeviceTensor* const> consumers) const;
 };
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

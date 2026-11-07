@@ -1088,7 +1088,8 @@ __global__ void GatherHead(const float* values, float* logits, unsigned prefix,
 
 void Exl3Projection(const DeviceTensor& w, const float* x, float* out,
                     std::uint32_t rows, const Exl3Scratch& scratch,
-                    hipStream_t stream, bool fast) {
+                    hipStream_t stream, bool fast,
+                    const std::uint16_t* rotated) {
   if (w.exl3 == nullptr) {
     WeightType type;
     switch (w.type) {
@@ -1119,7 +1120,18 @@ void Exl3Projection(const DeviceTensor& w, const float* x, float* out,
       s.fast_input,         s.fast_input_elements, s.fast_counters,
       s.fast_counter_count, s.fast_down_input,     s.fast_down_input_elements};
   const gufo::hip::Exl3FastTarget t{&l, target, l.n};
-  if (fast && gufo::hip::Exl3FastGroupSupported({&t, 1}, ws)) {
+  const gufo::hip::Exl3FastWorkspace pre{const_cast<std::uint16_t*>(rotated),
+                                         scratch.rotated_input_elements,
+                                         ws.counters,
+                                         ws.counter_count,
+                                         ws.down_input,
+                                         ws.down_input_elements};
+  if (fast && rotated != nullptr && !slice &&
+      rows <= gufo::hip::kExl3FastRotatedRows &&
+      gufo::hip::Exl3FastGroupSupported({&t, 1}, pre)) {
+    gufo::hip::LaunchExl3FastProjections({&t, 1}, x, l.k, rows, pre, stream,
+                                         true);
+  } else if (fast && gufo::hip::Exl3FastGroupSupported({&t, 1}, ws)) {
     for (std::uint32_t first = 0; first < rows;
          first += gufo::hip::kExl3FastMaxRows) {
       const auto count =
@@ -1601,7 +1613,7 @@ void Exl3PrefillCombine(const DeviceLayer& layer,
 
 bool Exl3SharedMlp(const DeviceLayer& l, const float* x, float* gate, float* up,
                    float* out, std::uint32_t rows, const Exl3Scratch& scratch,
-                   hipStream_t stream) {
+                   hipStream_t stream, const std::uint16_t* rotated) {
   if (rows == 0)
     return false;
   const auto& p = scratch.projection;
@@ -1613,6 +1625,18 @@ bool Exl3SharedMlp(const DeviceLayer& l, const float* x, float* gate, float* up,
       l.shexp_down.rows};
   if (!gufo::hip::Exl3FastMlpSupported(mlp, ws))
     return false;
+  const gufo::hip::Exl3FastWorkspace pre{const_cast<std::uint16_t*>(rotated),
+                                         scratch.rotated_input_elements,
+                                         ws.counters,
+                                         ws.counter_count,
+                                         ws.down_input,
+                                         ws.down_input_elements};
+  if (rotated != nullptr && rows <= gufo::hip::kExl3FastRotatedRows &&
+      gufo::hip::Exl3FastMlpSupported(mlp, pre)) {
+    gufo::hip::LaunchExl3FastMlp(mlp, x, l.shexp_gate.cols, rows, pre, stream,
+                                 true);
+    return true;
+  }
   for (std::uint32_t first = 0; first < rows;
        first += gufo::hip::kExl3FastMaxRows) {
     auto pass = mlp;

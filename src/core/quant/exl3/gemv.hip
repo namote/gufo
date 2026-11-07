@@ -703,31 +703,33 @@ void LaunchExl3FastProjections(std::span<const Exl3FastTarget> targets,
                                hipStream_t stream, bool input_rotated,
                                std::size_t shape_basis_n) {
   if (!Exl3FastGroupSupported(targets, workspace) || rows == 0 ||
-      rows > kExl3FastMaxRows || (input_rotated && rows != 1) ||
+      rows > kExl3FastMaxRows ||
+      (input_rotated && rows > kExl3FastRotatedRows) ||
       shape_basis_n % 32 != 0) {
     throw std::invalid_argument("EXL3 fast projection: unsupported call");
   }
-  if (input_rotated) {
-    LaunchPass<1>(targets, x, x_stride, 1, 0, workspace, stream, true,
-                  shape_basis_n);
-    return;
-  }
+  // One pass when pre-rotated (rows <= 8): its slab holds every row.
   for (std::size_t first = 0; first < rows; first += exl3::kMaxRows) {
     const auto pass = static_cast<unsigned>(
         std::min<std::size_t>(exl3::kMaxRows, rows - first));
-    const float* xp = x + first * x_stride;
-    if (pass == 1) {
-      LaunchPass<1>(targets, xp, x_stride, pass, first, workspace, stream,
-                    false, shape_basis_n);
-    } else if (pass == 2) {
-      LaunchPass<2>(targets, xp, x_stride, pass, first, workspace, stream,
-                    false, shape_basis_n);
-    } else if (pass <= 4) {
-      LaunchPass<4>(targets, xp, x_stride, pass, first, workspace, stream,
-                    false, shape_basis_n);
-    } else {
-      LaunchPass<8>(targets, xp, x_stride, pass, first, workspace, stream,
-                    false, shape_basis_n);
+    const float* xp = input_rotated ? x : x + first * x_stride;
+    switch (Exl3FastPassRows(pass)) {
+      case 1:
+        LaunchPass<1>(targets, xp, x_stride, pass, first, workspace, stream,
+                      input_rotated, shape_basis_n);
+        break;
+      case 2:
+        LaunchPass<2>(targets, xp, x_stride, pass, first, workspace, stream,
+                      input_rotated, shape_basis_n);
+        break;
+      case 4:
+        LaunchPass<4>(targets, xp, x_stride, pass, first, workspace, stream,
+                      input_rotated, shape_basis_n);
+        break;
+      default:
+        LaunchPass<8>(targets, xp, x_stride, pass, first, workspace, stream,
+                      input_rotated, shape_basis_n);
+        break;
     }
   }
 }
@@ -754,29 +756,32 @@ void LaunchExl3FastMlp(const Exl3FastMlp& mlp, const float* x,
                        const Exl3FastWorkspace& workspace, hipStream_t stream,
                        bool input_rotated) {
   if (!Exl3FastMlpSupported(mlp, workspace) || rows == 0 ||
-      rows > kExl3FastMaxRows || (input_rotated && rows != 1)) {
+      rows > kExl3FastMaxRows ||
+      (input_rotated && rows > kExl3FastRotatedRows)) {
     throw std::invalid_argument("EXL3 fast MLP: unsupported call");
   }
-  if (input_rotated) {
-    LaunchMlpPass<1>(mlp, x, x_stride, 1, 0, workspace, stream, true);
-    return;
-  }
+  // One pass when pre-rotated (rows <= 8): its slab holds every row.
   for (std::size_t first = 0; first < rows; first += exl3::kMaxRows) {
     const auto pass = static_cast<unsigned>(
         std::min<std::size_t>(exl3::kMaxRows, rows - first));
-    const float* xp = x + first * x_stride;
-    if (pass == 1) {
-      LaunchMlpPass<1>(mlp, xp, x_stride, pass, first, workspace, stream,
-                       false);
-    } else if (pass == 2) {
-      LaunchMlpPass<2>(mlp, xp, x_stride, pass, first, workspace, stream,
-                       false);
-    } else if (pass <= 4) {
-      LaunchMlpPass<4>(mlp, xp, x_stride, pass, first, workspace, stream,
-                       false);
-    } else {
-      LaunchMlpPass<8>(mlp, xp, x_stride, pass, first, workspace, stream,
-                       false);
+    const float* xp = input_rotated ? x : x + first * x_stride;
+    switch (Exl3FastPassRows(pass)) {
+      case 1:
+        LaunchMlpPass<1>(mlp, xp, x_stride, pass, first, workspace, stream,
+                         input_rotated);
+        break;
+      case 2:
+        LaunchMlpPass<2>(mlp, xp, x_stride, pass, first, workspace, stream,
+                         input_rotated);
+        break;
+      case 4:
+        LaunchMlpPass<4>(mlp, xp, x_stride, pass, first, workspace, stream,
+                         input_rotated);
+        break;
+      default:
+        LaunchMlpPass<8>(mlp, xp, x_stride, pass, first, workspace, stream,
+                         input_rotated);
+        break;
     }
   }
 }

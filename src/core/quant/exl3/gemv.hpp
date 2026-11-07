@@ -42,6 +42,15 @@ inline constexpr std::size_t kExl3FastMaxRows = 64;
 /// Matrices one launch can carry (q + k + v).
 inline constexpr std::size_t kExl3FastMaxGroup = 3;
 
+/// Rows a pre-rotated input may carry (one GEMV pass).
+inline constexpr std::size_t kExl3FastRotatedRows = 8;
+
+/// Padded rows M of the GEMV pass that takes `rows` (1 <= rows <= 8): the
+/// row count of the lane-major slab a producer writes for input_rotated.
+constexpr unsigned Exl3FastPassRows(std::size_t rows) noexcept {
+  return rows <= 1 ? 1U : rows <= 2 ? 2U : rows <= 4 ? 4U : 8U;
+}
+
 /// One projection of a group: y[r][0..n) = x[r] W (y stride in floats).
 struct Exl3FastTarget {
   const quant::exl3::DeviceLinear* linear;
@@ -91,8 +100,12 @@ void LaunchExl3RotateRows(const float* x, std::size_t x_stride,
 /// Every target's projection of the shared input x (rows of x_stride floats),
 /// one rotation launch and one GEMV launch per pass of up to 8 rows. The
 /// group must pass Exl3FastGroupSupported; 1 <= rows <= kExl3FastMaxRows.
-/// With input_rotated (rows == 1 only) the slabs already hold the rotated
-/// row (LaunchExl3FastRmsNorm) and x is not read.
+/// With input_rotated (rows <= kExl3FastRotatedRows) the slabs already hold
+/// the rotated rows and x is not read: target s reads the slab at
+/// workspace.input + s * 8 * k, lane-major with M = Exl3FastPassRows(rows)
+/// (LaunchExl3FastRmsNorm, or a producer epilogue using
+/// exl3::RotateInputSegment). Slab rows rows .. M - 1 are never stored and
+/// may hold anything.
 ///
 /// shape_basis_n (a multiple of 32; 0 = these targets) is the total output
 /// width of the group whose launch geometry (waves splitting K, tiles per
@@ -126,6 +139,7 @@ struct Exl3FastMlp {
 /// rows: gate and up together, whose epilogue applies SwiGLU and writes the
 /// down projection's rotated input, then down. The activation never reaches
 /// memory in FP32; the values are those of the unfused launches.
+/// input_rotated: as in LaunchExl3FastProjections (slab 0 gate, 1 up).
 void LaunchExl3FastMlp(const Exl3FastMlp& mlp, const float* x,
                        std::size_t x_stride, std::size_t rows,
                        const Exl3FastWorkspace& workspace, hipStream_t stream,

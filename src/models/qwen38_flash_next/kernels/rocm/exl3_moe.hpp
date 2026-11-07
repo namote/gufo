@@ -35,6 +35,11 @@ struct Exl3Scratch {
   /// Zero-initialized arrival counter of RouterTopKTiles; it returns to zero
   /// at the end of every launch.
   std::uint32_t* route_arrivals{nullptr};
+  /// FP16 lane-major input slabs written by decode producer epilogues
+  /// (Exl3InputSlabs, 3 * 8 * widest input halves); only producers write it,
+  /// so other fast launches between producer and consumer cannot clobber it.
+  std::uint16_t* rotated_input{nullptr};
+  std::size_t rotated_input_elements{0};
 };
 
 /// Rows per routed decode tile for a call of `rows` tokens. R=3 does not
@@ -46,9 +51,12 @@ constexpr std::uint32_t Exl3RouteTileRows(std::uint32_t rows) {
 constexpr std::uint32_t kExl3FusedTileAssignments = 256;
 
 /// Compressed projections, or the pack's plain operands with fixed FP32 math.
+/// A non-null `rotated` (scratch.rotated_input) holds the rows already
+/// rotated (slab 0, rows <= 8) for the fast path, which then does not read x.
 void Exl3Projection(const DeviceTensor& weight, const float* x, float* out,
                     std::uint32_t rows, const Exl3Scratch& scratch,
-                    hipStream_t stream, bool fast = true);
+                    hipStream_t stream, bool fast = true,
+                    const std::uint16_t* rotated = nullptr);
 void Exl3Gather(const float* x, const std::int32_t* rows, float* out,
                 std::uint32_t count, std::uint32_t width, hipStream_t stream);
 void Exl3Scatter(const float* x, const std::int32_t* slots, float* out,
@@ -68,9 +76,12 @@ struct Exl3RoutedTrace {
 
 /// Shared expert's decode/verify contract, common to serial and cohort calls.
 /// Returns false without launches when the fused fast MLP cannot apply.
+/// A non-null `rotated` (scratch.rotated_input) holds the gate and up slabs
+/// of the rows (rows <= 8), so x is not read.
 bool Exl3SharedMlp(const DeviceLayer& layer, const float* x, float* gate,
                    float* up, float* out, std::uint32_t rows,
-                   const Exl3Scratch& scratch, hipStream_t stream);
+                   const Exl3Scratch& scratch, hipStream_t stream,
+                   const std::uint16_t* rotated = nullptr);
 
 /// Groups actual assignments by expert into 1..8-row tiles on device. Every
 /// slot keeps its own rotation and output; the caller performs ordered MoE sum.

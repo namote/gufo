@@ -70,6 +70,8 @@ if (ENGINE_ENABLE_HIP)
     COMMAND qwen38_flash_next_exl3_ops_test --mtp-kv-group)
   add_test(NAME qwen38_flash_next.mtp_kv_executor
     COMMAND qwen38_flash_next_exl3_ops_test --mtp-kv-executor)
+  add_test(NAME qwen38_flash_next.exl3_producer_rotation
+    COMMAND qwen38_flash_next_exl3_ops_test --producer-rotation)
   add_test(NAME qwen38_flash_next.exl3_prefill_executor
     COMMAND qwen38_flash_next_exl3_ops_test --prefill-experts-only)
   add_test(NAME qwen38_flash_next.exl3_dense_prefill
@@ -88,6 +90,7 @@ if (ENGINE_ENABLE_HIP)
     COMMAND qwen38_flash_next_projection_ops_test --hc-down-f16)
   set_tests_properties(qwen38_flash_next.mtp_kv qwen38_flash_next.mtp_kv_group
     qwen38_flash_next.mtp_kv_executor qwen38_flash_next.hc_down_f16
+    qwen38_flash_next.exl3_producer_rotation
     qwen38_flash_next.exl3_prefill_executor
     qwen38_flash_next.exl3_dense_prefill
     qwen38_flash_next.exl3_plain_prefill
