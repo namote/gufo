@@ -5025,7 +5025,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                           l.router.type == GgmlType::kF16 &&
                           l.shexp_gate.type == GgmlType::kQ8_0 &&
                           l.shexp_up.type == GgmlType::kQ8_0;
-      // EXL3 experts never write block_out before the FFN combine.
+      // EXL3 experts settle or consume the deferred update before writing
+      // block_out.
       Combine(s_.res, l.hc_ffn.norm.f32(), rows, InjectWeights(l.hc_ffn),
               l.ffn_gate_exps.exl3 != nullptr);
       const DeviceTensor* const shared_rotate[] = {&l.shexp_gate, &l.shexp_up};
