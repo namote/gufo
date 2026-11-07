@@ -148,19 +148,31 @@ __device__ __forceinline__ void RoutedGemvBody(
   // past the end clamp to the last tile, already cached by this group.
   constexpr unsigned kAhead = 4;
   const unsigned k_tiles = k / 16;
-  const auto fetch = [&](unsigned kt0, std::uint32_t (&raw)[kAhead][3])
-                         __attribute__((always_inline)) {
+  // Global, not flat, loads: a flat load also counts against lgkmcnt, so a
+  // scalar wait in the loop would drain the group still in flight.
+  using GlobalDword = const __attribute__((address_space(1))) std::uint32_t;
+  const auto fetch = [&](unsigned kt0, std::uint32_t (&raw)[kAhead][3]) {
 #pragma unroll
-                           for (unsigned u = 0; u < kAhead; ++u) {
-                             const unsigned kt = min(kt0 + u, k_tiles - 1);
-                             const auto* tile =
-                                 trellis + (std::size_t{kt} * (n / 16) + nt) *
-                                               arithmetic::TileDwords(Bits);
-                             raw[u][0] = tile[lw.o0];
-                             raw[u][1] = tile[lw.o1];
-                             raw[u][2] = tile[lw.o2];
-                           }
-                         };
+    for (unsigned u = 0; u < kAhead; ++u) {
+      const unsigned kt = min(kt0 + u, k_tiles - 1);
+      // An address-space conversion is spelled as a C cast.
+      const auto* tile =
+          (GlobalDword*)(trellis + (std::size_t{kt} * (n / 16) + nt) *
+                                       arithmetic::TileDwords(Bits));
+      raw[u][0] = tile[lw.o0];
+      raw[u][1] = tile[lw.o1];
+      raw[u][2] = tile[lw.o2];
+    }
+  };
+  if (k_tiles == 0)
+    return;
+  // A row's widened-FMA choice is fixed for the whole K loop.
+  bool widened[MaxRows];
+#pragma unroll
+  for (unsigned r = 0; r < MaxRows; ++r)
+    widened[r] =
+        FullPrecision || (Scaled && (ExactRows || r < tile_rows.count) &&
+                          exponents[tile_rows.slots[r]] < 0);
   std::uint32_t next[kAhead][3];
   fetch(0, next);
   for (unsigned kt0 = 0; kt0 < k_tiles; kt0 += kAhead) {
@@ -201,7 +213,7 @@ __device__ __forceinline__ void RoutedGemvBody(
             x + std::size_t{tile_rows.slots[r]} * k + kt * 16 + r0;
         const Half2 v01{row[0], row[1]};
         const Half2 v89{row[8], row[9]};
-        if (FullPrecision || (Scaled && exponents[tile_rows.slots[r]] < 0)) {
+        if (widened[r]) {
           a[r] = DotPairF32(w[0], v01, a[r]);
           a[r] = DotPairF32(w[1], v89, a[r]);
           b[r] = DotPairF32(w[2], v01, b[r]);
