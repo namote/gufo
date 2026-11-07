@@ -115,15 +115,33 @@ __device__ __forceinline__ float DotPairF32(Half2 w, Half2 x, float acc) {
 // R=1 became a quarter as many).
 constexpr unsigned kRoutedWaves = 4;
 
+// FP16 activation halves a routed GEMV block stages in LDS per K chunk:
+// a whole 2560-wide row per tile row, capped so a four-wave block keeps 16
+// blocks (64 waves) resident per WGP.
+constexpr unsigned kRoutedStageRowHalves = 2560;
+constexpr unsigned kRoutedStageHalves = 4096;
+constexpr unsigned RoutedStageHalves(unsigned rows) {
+  return rows * kRoutedStageRowHalves < kRoutedStageHalves
+             ? rows * kRoutedStageRowHalves
+             : kRoutedStageHalves;
+}
+
 // One wave owns one output tile and up to eight actual rows of one expert.
 // No floating-point atomics or masked reads from absent assignment rows.
+// The block stages its rows' activations in LDS (`stage`,
+// RoutedStageHalves(MaxRows) halves) once per K chunk, so the K loop issues
+// only trellis global loads: an activation global load at its use made the
+// wave wait for the next tile group's loads too (vmcnt counts in order).
+// Every wave of the block reaches the staging barriers; a wave past the
+// last output tile computes a duplicate of it and stores nothing.
 template<int Bits, bool FullPrecision, unsigned MaxRows = 8,
          bool Scaled = false, bool ExactRows = false>
 __device__ __forceinline__ void RoutedGemvBody(
     const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
     const Exl3RouteTile* tiles, const unsigned* count,
     const std::uint16_t* input, float* gate_y, float* up_y, unsigned k,
-    unsigned n, unsigned assignments, const std::int32_t* exponents) {
+    unsigned n, unsigned assignments, const std::int32_t* exponents,
+    _Float16* stage) {
   if (blockIdx.y >= *count)
     return;
   const auto tile_rows = tiles[blockIdx.y];
@@ -131,8 +149,11 @@ __device__ __forceinline__ void RoutedGemvBody(
   const auto& l = (projection == 0 ? gate : up)[tile_rows.expert];
   const unsigned lane = threadIdx.x % 32;
   const unsigned r0 = (lane % 4) * 2;
-  const unsigned nt = blockIdx.x * kRoutedWaves + threadIdx.x / 32;
-  if (nt >= n / 16)
+  const unsigned n_tiles = n / 16;
+  const unsigned wave_tile = blockIdx.x * kRoutedWaves + threadIdx.x / 32;
+  const bool live = wave_tile < n_tiles;
+  const unsigned nt = live ? wave_tile : n_tiles - 1;
+  if (n_tiles == 0)
     return;
   float a[MaxRows]{}, b[MaxRows]{};
   const auto lw = arithmetic::MakeLaneWindow<Bits>(lane);
@@ -166,6 +187,45 @@ __device__ __forceinline__ void RoutedGemvBody(
   };
   if (k_tiles == 0)
     return;
+  // K tiles per staged chunk (a whole number of fetch groups) and the
+  // block's staging work: 16-byte vectors, two per tile row, spread over
+  // the block's threads (at most four per thread). The compiler sinks each
+  // load into its guarded store, a round trip per vector; issuing them all
+  // first kept 30-50 more VGPRs live through the K loop at R3-R8.
+  constexpr unsigned kChunk =
+      RoutedStageHalves(MaxRows) / (MaxRows * 16) / kAhead * kAhead;
+  constexpr unsigned kRowHalves = kChunk * 16;
+  constexpr unsigned kThreads = 32 * kRoutedWaves;
+  constexpr unsigned kPerThread =
+      (MaxRows * kChunk * 2 + kThreads - 1) / kThreads;
+  static_assert(kChunk >= kAhead && MaxRows * kRowHalves <= kRoutedStageHalves);
+  const unsigned rows = ExactRows ? MaxRows : tile_rows.count;
+  const auto stage_chunk = [&](unsigned base) {
+    const unsigned vectors = min(kChunk, k_tiles - base) * 2;
+    const unsigned total = rows * vectors;
+    uint4 data[kPerThread];
+    __syncthreads();  // every wave is done with the previous chunk
+#pragma unroll
+    for (unsigned j = 0; j < kPerThread; ++j) {
+      const unsigned i = min(threadIdx.x + j * kThreads, total - 1);
+      const unsigned r = i / vectors;
+      unsigned slot = tile_rows.slots[0];
+      // Fixed indices: a dynamically indexed slot array promotes to LDS.
+#pragma unroll
+      for (unsigned q = 1; q < MaxRows; ++q)
+        slot = r == q ? tile_rows.slots[q] : slot;
+      data[j] = reinterpret_cast<const uint4*>(x + std::size_t{slot} * k +
+                                               base * 16)[i % vectors];
+    }
+#pragma unroll
+    for (unsigned j = 0; j < kPerThread; ++j) {
+      const unsigned i = threadIdx.x + j * kThreads;
+      if (i < total)
+        reinterpret_cast<uint4*>(stage + (i / vectors) *
+                                             kRowHalves)[i % vectors] = data[j];
+    }
+    __syncthreads();
+  };
   // A row's widened-FMA choice is fixed for the whole K loop.
   bool widened[MaxRows];
 #pragma unroll
@@ -173,16 +233,19 @@ __device__ __forceinline__ void RoutedGemvBody(
     widened[r] =
         FullPrecision || (Scaled && (ExactRows || r < tile_rows.count) &&
                           exponents[tile_rows.slots[r]] < 0);
-  std::uint32_t next[kAhead][3];
-  fetch(0, next);
-  for (unsigned kt0 = 0; kt0 < k_tiles; kt0 += kAhead) {
-    std::uint32_t raw[kAhead][3];
-#pragma unroll
-    for (unsigned u = 0; u < kAhead; ++u) {
-      raw[u][0] = next[u][0];
-      raw[u][1] = next[u][1];
-      raw[u][2] = next[u][2];
-    }
+  // Two register sets alternate, so the group in flight is never copied
+  // (a copy at the loop edge waited for it before the next group began).
+  std::uint32_t even[kAhead][3], odd[kAhead][3];
+  // The K-end test stays in every group: unguarded groups let the compiler
+  // decode a whole group at once (30-40 more VGPRs at R3/R4). The loop edge
+  // then makes each pair's first group wait for its own loads before it
+  // issues the next group's; no tile waits for loads issued after it.
+  const auto group = [&](unsigned kt0, const std::uint32_t (&raw)[kAhead][3],
+                         std::uint32_t (
+                             &next)[kAhead][3]) __attribute__((always_inline)) {
+    if (kt0 % kChunk == 0)
+      stage_chunk(kt0);
+    const unsigned chunk_base = kt0 - kt0 % kChunk;
     fetch(kt0 + kAhead, next);
 #pragma unroll
     for (unsigned u = 0; u < kAhead; ++u) {
@@ -209,10 +272,9 @@ __device__ __forceinline__ void RoutedGemvBody(
       for (unsigned r = 0; r < MaxRows; ++r) {
         if (!ExactRows && r >= tile_rows.count)
           continue;
-        const auto* row =
-            x + std::size_t{tile_rows.slots[r]} * k + kt * 16 + r0;
-        const Half2 v01{row[0], row[1]};
-        const Half2 v89{row[8], row[9]};
+        const auto* row = stage + r * kRowHalves + (kt - chunk_base) * 16 + r0;
+        const Half2 v01 = *reinterpret_cast<const Half2*>(row);
+        const Half2 v89 = *reinterpret_cast<const Half2*>(row + 8);
         if (widened[r]) {
           a[r] = DotPairF32(w[0], v01, a[r]);
           a[r] = DotPairF32(w[1], v89, a[r]);
@@ -226,6 +288,13 @@ __device__ __forceinline__ void RoutedGemvBody(
         }
       }
     }
+  };
+  fetch(0, even);
+  for (unsigned kt0 = 0; kt0 < k_tiles; kt0 += 2 * kAhead) {
+    group(kt0, even, odd);
+    if (kt0 + kAhead >= k_tiles)
+      break;
+    group(kt0 + kAhead, odd, even);
   }
 #pragma unroll
   for (unsigned r = 0; r < MaxRows; ++r) {
@@ -235,7 +304,7 @@ __device__ __forceinline__ void RoutedGemvBody(
     b[r] += __shfl_xor(b[r], 1, 32);
     a[r] += __shfl_xor(a[r], 2, 32);
     b[r] += __shfl_xor(b[r], 2, 32);
-    if (lane % 4 == 0) {
+    if (live && lane % 4 == 0) {
       auto* y = (projection == 0 ? gate_y : up_y) +
                 std::size_t{tile_rows.slots[r]} * n + nt * 16;
       float scale = 1.0F;
@@ -263,6 +332,9 @@ __device__ __forceinline__ void RoutedGemvTile(
     unsigned n, unsigned assignments, const std::int32_t* exponents) {
   if (blockIdx.y >= *count)
     return;
+  // One staging buffer for whichever row body the tile selects.
+  __shared__
+      __attribute__((aligned(16))) _Float16 stage[RoutedStageHalves(MaxRows)];
   if constexpr (!FullPrecision &&
                 (MaxRows == 3 || MaxRows == 4 || MaxRows == 8)) {
     // Each live-row body runs exactly the generic body's arithmetic for the
@@ -270,7 +342,7 @@ __device__ __forceinline__ void RoutedGemvTile(
     const auto exact = [&]<unsigned Rows>() __attribute__((always_inline)) {
       RoutedGemvBody<Bits, FullPrecision, Rows, Scaled, true>(
           gate, up, tiles, count, input, gate_y, up_y, k, n, assignments,
-          exponents);
+          exponents, stage);
     };
     switch (tiles[blockIdx.y].count) {
       case 1:
@@ -317,8 +389,8 @@ __device__ __forceinline__ void RoutedGemvTile(
     }
   }
   RoutedGemvBody<Bits, FullPrecision, MaxRows, Scaled>(
-      gate, up, tiles, count, input, gate_y, up_y, k, n, assignments,
-      exponents);
+      gate, up, tiles, count, input, gate_y, up_y, k, n, assignments, exponents,
+      stage);
 }
 
 template<int Bits, bool FullPrecision, unsigned MaxRows = 8,

@@ -556,9 +556,11 @@ void DecodeMoeCombine(const gpu::DeviceLayer& layer, const std::int32_t* ids,
           "MoE-forming decode HC combine changed the combine");
 }
 
+// `k` 2560 (the model's hidden width) stages the gate/up rows in several
+// LDS chunks for R >= 2; 384 is three whole tile-group pairs.
 void FusedProducer(unsigned rows, bool shared, int bits = 5, int up_bits = 0,
-                   int down_bits = 0, bool half = false) {
-  constexpr unsigned k = 256, ff = 640, used = 3, experts = 12;
+                   int down_bits = 0, bool half = false, unsigned k = 256) {
+  constexpr unsigned ff = 640, used = 3, experts = 12;
   const unsigned assignments = rows * used;
   Buffers buffers;
   Bank gate(buffers, k, ff, experts, 1, true, bits, half),
@@ -802,8 +804,11 @@ void FusedProducer(unsigned rows, bool shared, int bits = 5, int up_bits = 0,
   }
 }
 
-void DownFixtures(int bits, bool half = false) {
-  constexpr unsigned rows = 8, k = 640, n = 128;
+// k = 272 and 352 end the routed GEMV K loop partway through a pair's first
+// or second group; n = 80 leaves waves past the last output tile.
+void DownFixtures(int bits, bool half = false, unsigned k = 640,
+                  unsigned n = 128) {
+  constexpr unsigned rows = 8;
   Buffers buffers;
   Bank down(buffers, k, n, 1, 5, true, bits, half);
   std::vector<std::uint16_t> input(rows * k);
@@ -2161,10 +2166,20 @@ int main(int argc, char** argv) {
     }
     // Fractional-rate decoding also uses the live-row routed path.
     DownFixtures(3, true);
+    DownFixtures(4, false, 272, 80);
+    DownFixtures(3, true, 352, 80);
     ExpertInvariance(false, nullptr, 3, true);
     for (unsigned rows : {3U, 4U})
       for (bool shared : {false, true})
         FusedProducer(rows, shared, 3, 0, 0, true);
+    // Multi-chunk and partial-group activation staging, an integer rate and
+    // K3.5, every tile row width.
+    for (unsigned rows : {1U, 2U, 3U, 4U, 8U}) {
+      for (bool shared : {false, true})
+        FusedProducer(rows, shared, 4, 0, 0, false, 2560);
+      FusedProducer(rows, true, 3, 0, 0, true, 2560);
+      FusedProducer(rows, false, 5, 0, 0, false, 384);
+    }
     if (rates_only) {
       std::cout << "EXL3 rate generalization contracts passed\n";
       return 0;
