@@ -194,11 +194,19 @@ __global__ void PersistentBarriers(std::uint32_t* count,
                                    std::uint32_t* generation,
                                    std::uint32_t* slots, int barriers,
                                    std::uint32_t* errors) {
+  __shared__ bool aborted;
   for (int b = 0; b < barriers; ++b) {
-    if (threadIdx.x == 0)
+    // A timed-out barrier leaves the arrival count unbalanced: every block
+    // then leaves at its next barrier instead of timing out again.
+    if (threadIdx.x == 0) {
+      aborted = __hip_atomic_load(errors, __ATOMIC_RELAXED,
+                                  __HIP_MEMORY_SCOPE_AGENT) >= (1U << 16);
       __hip_atomic_store(slots + blockIdx.x, static_cast<std::uint32_t>(b + 1),
                          __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
     __syncthreads();
+    if (aborted)
+      return;
     if (threadIdx.x == 0) {
       const std::uint32_t gen = __hip_atomic_load(generation, __ATOMIC_RELAXED,
                                                   __HIP_MEMORY_SCOPE_AGENT);
