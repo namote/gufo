@@ -779,9 +779,8 @@ int RunStableCase(std::uint32_t kTokens) {
 }
 
 /// EXL3 decode/verify (stable conv, no row split): a call of at most eight
-/// tokens shifts history inside the convolution and normalizes q/k inside
-/// the recurrence. Splitting a longer call, which takes the separate
-/// shift, normalization and recurrence launches, into such calls must keep
+/// tokens shifts history inside the convolution. Splitting a longer call,
+/// which takes the separate shift launches, into such calls must keep
 /// every output, state and history byte; so must the batched launcher.
 int RunStableDecodeCase(std::uint32_t kTokens) {
   const std::size_t kQkvCount = static_cast<std::size_t>(kTokens) * kChannels;
