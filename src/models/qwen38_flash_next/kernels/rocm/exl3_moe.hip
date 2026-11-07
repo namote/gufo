@@ -236,30 +236,57 @@ __global__ void RoutedGemv(const ex::DeviceLinear* gate,
                            const std::int32_t* exponents) {
   if (blockIdx.y >= *count)
     return;
-  if constexpr (!FullPrecision && (MaxRows == 3 || MaxRows == 4)) {
+  if constexpr (!FullPrecision &&
+                (MaxRows == 3 || MaxRows == 4 || MaxRows == 8)) {
+    // Each live-row body runs exactly the generic body's arithmetic for the
+    // tile's rows; R5-R8 verify tiles (MaxRows 8) mostly hold 1-2 rows.
+    const auto exact = [&]<unsigned Rows>() {
+      RoutedGemvBody<Bits, FullPrecision, Rows, Scaled, true>(
+          gate, up, tiles, count, input, gate_y, up_y, k, n, assignments,
+          exponents);
+    };
     switch (tiles[blockIdx.y].count) {
       case 1:
-        RoutedGemvBody<Bits, FullPrecision, 1, Scaled, true>(
-            gate, up, tiles, count, input, gate_y, up_y, k, n, assignments,
-            exponents);
+        exact.template operator()<1>();
         return;
       case 2:
-        RoutedGemvBody<Bits, FullPrecision, 2, Scaled, true>(
-            gate, up, tiles, count, input, gate_y, up_y, k, n, assignments,
-            exponents);
+        exact.template operator()<2>();
         return;
       case 3:
-        RoutedGemvBody<Bits, FullPrecision, 3, Scaled, true>(
-            gate, up, tiles, count, input, gate_y, up_y, k, n, assignments,
-            exponents);
+        exact.template operator()<3>();
         return;
       case 4:
-        if constexpr (MaxRows == 4) {
-          RoutedGemvBody<Bits, FullPrecision, 4, Scaled, true>(
-              gate, up, tiles, count, input, gate_y, up_y, k, n, assignments,
-              exponents);
+        if constexpr (MaxRows >= 4) {
+          exact.template operator()<4>();
           return;
         }
+        break;
+      case 5:
+        if constexpr (MaxRows == 8) {
+          exact.template operator()<5>();
+          return;
+        }
+        break;
+      case 6:
+        if constexpr (MaxRows == 8) {
+          exact.template operator()<6>();
+          return;
+        }
+        break;
+      case 7:
+        if constexpr (MaxRows == 8) {
+          exact.template operator()<7>();
+          return;
+        }
+        break;
+      case 8:
+        if constexpr (MaxRows == 8) {
+          exact.template operator()<8>();
+          return;
+        }
+        break;
+      default:
+        break;
     }
   }
   RoutedGemvBody<Bits, FullPrecision, MaxRows, Scaled>(

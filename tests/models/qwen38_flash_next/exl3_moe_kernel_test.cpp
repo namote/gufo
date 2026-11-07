@@ -1497,7 +1497,7 @@ void ExpertInvariance(bool prefill, gpu::Exl3BucketGemm gemm, int bits,
                                    16, gemm, false);
     const std::vector<unsigned> widths =
         prefill ? std::vector<unsigned>{1, 3, 17, 32, 33, 64, 65}
-                : std::vector<unsigned>{1, 2, 3, 4, 7, 8, 9, 17};
+                : std::vector<unsigned>{1, 2, 3, 4, 5, 6, 7, 8, 9, 17};
     const std::vector<unsigned> tiles =
         prefill ? std::vector<unsigned>{16, 32, 64} : std::vector<unsigned>{16};
     for (unsigned tile : tiles)
