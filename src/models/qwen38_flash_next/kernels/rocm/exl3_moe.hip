@@ -227,13 +227,11 @@ __device__ __forceinline__ void RoutedGemvBody(
 // The generic body remains for MaxRows 1/2 and unscaled full-precision down.
 template<int Bits, bool FullPrecision, unsigned MaxRows = 8,
          bool Scaled = false>
-__global__ void RoutedGemv(const ex::DeviceLinear* gate,
-                           const ex::DeviceLinear* up,
-                           const Exl3RouteTile* tiles, const unsigned* count,
-                           const std::uint16_t* input, float* gate_y,
-                           float* up_y, unsigned k, unsigned n,
-                           unsigned assignments,
-                           const std::int32_t* exponents) {
+__device__ __forceinline__ void RoutedGemvTile(
+    const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
+    const Exl3RouteTile* tiles, const unsigned* count,
+    const std::uint16_t* input, float* gate_y, float* up_y, unsigned k,
+    unsigned n, unsigned assignments, const std::int32_t* exponents) {
   if (blockIdx.y >= *count)
     return;
   if constexpr (!FullPrecision &&
@@ -290,6 +288,20 @@ __global__ void RoutedGemv(const ex::DeviceLinear* gate,
     }
   }
   RoutedGemvBody<Bits, FullPrecision, MaxRows, Scaled>(
+      gate, up, tiles, count, input, gate_y, up_y, k, n, assignments,
+      exponents);
+}
+
+template<int Bits, bool FullPrecision, unsigned MaxRows = 8,
+         bool Scaled = false>
+__global__ void RoutedGemv(const ex::DeviceLinear* gate,
+                           const ex::DeviceLinear* up,
+                           const Exl3RouteTile* tiles, const unsigned* count,
+                           const std::uint16_t* input, float* gate_y,
+                           float* up_y, unsigned k, unsigned n,
+                           unsigned assignments,
+                           const std::int32_t* exponents) {
+  RoutedGemvTile<Bits, FullPrecision, MaxRows, Scaled>(
       gate, up, tiles, count, input, gate_y, up_y, k, n, assignments,
       exponents);
 }
@@ -493,6 +505,129 @@ __global__ __launch_bounds__(1024) void RestoreActivateScale(
 #pragma unroll
   for (unsigned j = 0; j < 4; ++j)
     output[offset + j] = exponent > 0 ? ScaleHalf(bits[j], exponent) : bits[j];
+}
+
+// RestoreActivateScale for assignment `row` by any whole number of waves
+// (each takes segments wave, wave + waves, ...), reading gate_y/up_y with
+// agent-scope loads (the caller's own grid wrote them). Every segment's
+// expressions are the kernel's; the halves are stored unscaled, the row's
+// magnitude range (order-free min/max) gives the exponent, and each thread
+// then rescales the halves it stored itself.
+__device__ __forceinline__ void RestoreActivateScaleRow(
+    const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
+    const ex::DeviceLinear* down, unsigned expert, unsigned row,
+    const float* gate_y, const float* up_y, std::uint16_t* output,
+    std::int32_t* exponents, unsigned width) {
+  const unsigned lane = threadIdx.x % 32;
+  const unsigned wave = threadIdx.x / 32, waves = blockDim.x / 32;
+  const auto& g = gate[expert];
+  const auto& u = up[expert];
+  const auto& d = down[expert];
+  const auto* gs = reinterpret_cast<const _Float16*>(g.svh);
+  const auto* us = reinterpret_cast<const _Float16*>(u.svh);
+  const auto* ds = reinterpret_cast<const _Float16*>(d.suh);
+  unsigned minimum = 0x7fffU, maximum = 0;
+  for (unsigned segment = wave; segment < width / 128; segment += waves) {
+    const unsigned first = segment * 128 + lane * 4;
+    const auto offset = std::size_t{row} * width + first;
+    float gv[4], uv[4];
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) {
+      gv[j] = __hip_atomic_load(gate_y + offset + j, __ATOMIC_RELAXED,
+                                __HIP_MEMORY_SCOPE_AGENT);
+      uv[j] = __hip_atomic_load(up_y + offset + j, __ATOMIC_RELAXED,
+                                __HIP_MEMORY_SCOPE_AGENT);
+    }
+    arithmetic::Butterfly128(gv, lane);
+    arithmetic::Butterfly128(uv, lane);
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) {
+      const float value = (gv[j] * arithmetic::kHadamardScale) *
+                          static_cast<float>(gs[first + j]);
+      const float other = (uv[j] * arithmetic::kHadamardScale) *
+                          static_cast<float>(us[first + j]);
+      float activation = (value / (1.0F + expf(-value))) * other;
+      asm volatile("" : "+v"(activation));
+      gv[j] = activation * static_cast<float>(ds[first + j]);
+      asm volatile("" : "+v"(gv[j]));
+    }
+    arithmetic::Butterfly128(gv, lane);
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) {
+      float scaled = gv[j] * arithmetic::kHadamardScale;
+      asm volatile("" : "+v"(scaled));
+      const auto bits =
+          __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(scaled));
+      const unsigned value = bits & 0x7fffU;
+      if (value != 0)
+        minimum = min(minimum, value);
+      maximum = max(maximum, value);
+      output[offset + j] = bits;
+    }
+  }
+  for (unsigned o = 16; o != 0; o >>= 1) {
+    minimum = min(minimum, __shfl_xor(minimum, o, 32));
+    maximum = max(maximum, __shfl_xor(maximum, o, 32));
+  }
+  __shared__ unsigned minima[32], maxima[32];
+  if (lane == 0) {
+    minima[wave] = minimum;
+    maxima[wave] = maximum;
+  }
+  __syncthreads();
+  minimum = 0x7fffU;
+  maximum = 0;
+  for (unsigned i = 0; i < waves; ++i) {
+    minimum = min(minimum, minima[i]);
+    maximum = max(maximum, maxima[i]);
+  }
+  const int exponent = DownExponent(minimum, maximum);
+  if (threadIdx.x == 0)
+    exponents[row] = exponent;
+  if (exponent > 0)
+    for (unsigned segment = wave; segment < width / 128; segment += waves) {
+      const auto offset = std::size_t{row} * width + segment * 128 + lane * 4;
+#pragma unroll
+      for (unsigned j = 0; j < 4; ++j)
+        output[offset + j] = ScaleHalf(output[offset + j], exponent);
+    }
+  __syncthreads();  // minima/maxima are reused by the tile's next row
+}
+
+// The routed gate/up GEMV (RoutedGemv's tile bodies, both projections in
+// one grid), then the last of an expert tile's blocks to store its rows
+// runs RestoreActivateScale for each of the tile's assignments into
+// `down_input` (not the gate/up input slab, which other tiles may still be
+// reading). One arrival counter per tile, wrapping to zero.
+template<int Bits, unsigned MaxRows>
+__global__ void RoutedGateUpRestore(
+    const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
+    const ex::DeviceLinear* down, const Exl3RouteTile* tiles,
+    const unsigned* count, const std::uint16_t* input, float* gate_y,
+    float* up_y, unsigned k, unsigned n, unsigned assignments,
+    std::uint16_t* down_input, std::int32_t* exponents, unsigned width,
+    std::uint32_t* arrivals) {
+  if (blockIdx.y >= *count)
+    return;
+  RoutedGemvTile<Bits, false, MaxRows>(gate, up, tiles, count, input, gate_y,
+                                       up_y, k, n, assignments, nullptr);
+  __shared__ unsigned last;
+  __threadfence();
+  __syncthreads();
+  const unsigned blocks = gridDim.x * gridDim.z;
+  if (threadIdx.x == 0)
+    last = atomicInc(arrivals + blockIdx.y, blocks - 1) == blocks - 1;
+  __syncthreads();
+  if (last == 0)
+    return;
+  __threadfence();
+  // Slots are read through the pointer: a dynamically indexed local copy
+  // of the tile promotes to 40 KiB of LDS on the pinned compiler.
+  const Exl3RouteTile* tile = tiles + blockIdx.y;
+  const unsigned rows = tile->count, expert = tile->expert;
+  for (unsigned r = 0; r < rows; ++r)
+    RestoreActivateScaleRow(gate, up, down, expert, tile->slots[r], gate_y,
+                            up_y, down_input, exponents, width);
 }
 
 // Bucket construction, all on the device and atomic-free, so it is
@@ -1271,6 +1406,44 @@ void LaunchRouted(const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
     }
   });
 }
+// The gate/up launch of LaunchRouted (one bank rate for both) with the
+// RestoreActivateScale tail (RoutedGateUpRestore).
+void LaunchGateUpRestore(const DeviceLayer& l, const std::uint16_t* input,
+                         float* gate_y, float* up_y, unsigned assignments,
+                         unsigned tile_rows, const Exl3Scratch& scratch,
+                         hipStream_t stream) {
+  const auto& g = l.ffn_gate_exps;
+  const auto& d = l.ffn_down_exps;
+  WithRate(BankRate(g), [&]<int Bits>() {
+    const auto launch = [&]<unsigned R>() {
+      hipLaunchKernelGGL(
+          (RoutedGateUpRestore<Bits, R>),
+          dim3((g.rows / 16 + kRoutedWaves - 1) / kRoutedWaves, assignments, 2),
+          dim3(32 * kRoutedWaves), 0, stream, g.device_exl3,
+          l.ffn_up_exps.device_exl3, d.device_exl3, scratch.tiles,
+          scratch.tile_count, input, gate_y, up_y, g.cols, g.rows, assignments,
+          scratch.routed_down_input, scratch.down_exponents, d.cols,
+          scratch.routed_arrivals);
+    };
+    switch (tile_rows) {
+      case 1:
+        launch.template operator()<1>();
+        break;
+      case 2:
+        launch.template operator()<2>();
+        break;
+      case 3:
+        launch.template operator()<3>();
+        break;
+      case 4:
+        launch.template operator()<4>();
+        break;
+      default:
+        launch.template operator()<8>();
+        break;
+    }
+  });
+}
 }  // namespace
 
 namespace {
@@ -1709,6 +1882,26 @@ void Exl3RoutedMlp(const DeviceLayer& l, const float* x,
   if (trace != nullptr)
     snapshot(trace->gate_up_input, s.routed_input,
              std::size_t{2} * assignments * g.cols * sizeof(std::uint16_t));
+  // Without a trace the restore runs in the gate/up launch's last block
+  // per tile, writing the down input to its own slab.
+  const bool restore_fused =
+      trace == nullptr && s.down_exponents != nullptr &&
+      s.routed_down_input != nullptr && s.routed_arrivals != nullptr &&
+      assignments <= s.routed_assignments && BankRate(g) == BankRate(u) &&
+      g.rows == d.cols && d.cols % 128 == 0 && d.cols <= 4096 &&
+      g.rows % 16 == 0;
+  if (restore_fused) {
+    LaunchGateUpRestore(l, s.routed_input, gate, up, assignments, tile_rows, s,
+                        stream);
+    RoutedDown(d, s.routed_down_input, out, assignments, tile_rows, s, stream,
+               true);
+    if (!raw_down)
+      hipLaunchKernelGGL(RestoreDownAssignments,
+                         dim3(d.rows / 128, assignments), dim3(32), 0, stream,
+                         d.device_exl3, ids, out, d.rows);
+    Check();
+    return;
+  }
   if (BankRate(g) == BankRate(u)) {
     LaunchRouted<false>(g.device_exl3, u.device_exl3, s.routed_input, gate, up,
                         g.cols, g.rows, assignments, 2, tile_rows, s, stream,

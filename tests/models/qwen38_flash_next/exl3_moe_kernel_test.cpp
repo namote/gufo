@@ -532,6 +532,32 @@ void FusedProducer(unsigned rows, bool shared, int bits = 5, int up_bits = 0,
   trace.down_widened_inner = buffers.Make<float>(assignments * k);
   gpu::Exl3RoutedMlp(layer, dx, di, g, u, y, rows, used, s, nullptr, &trace);
   const auto actual = Read(y, assignments * k);
+  // The restore folded into the gate/up launch (RoutedGateUpRestore):
+  // byte-equal down rows and exponents to the separate restore launch, raw
+  // and restored, twice (the per-tile arrival counters return to zero).
+  for (bool raw : {false, true}) {
+    auto* separate = buffers.Make<float>(assignments * k);
+    gpu::Exl3RoutedMlp(layer, dx, di, g, u, separate, rows, used, s, nullptr,
+                       nullptr, false, raw);
+    const auto separate_rows = Read(separate, assignments * k);
+    const auto separate_exponents = Read(s.down_exponents, assignments);
+    gpu::Exl3Scratch fused = s;
+    fused.routed_down_input = buffers.Make<std::uint16_t>(assignments * ff);
+    fused.routed_arrivals = buffers.Make<std::uint32_t>(assignments);
+    fused.routed_assignments = assignments;
+    for (unsigned launch = 0; launch < 2; ++launch) {
+      auto* folded = buffers.Make<float>(assignments * k);
+      gpu::Exl3RoutedMlp(layer, dx, di, g, u, folded, rows, used, fused,
+                         nullptr, nullptr, false, raw);
+      const auto folded_rows = Read(folded, assignments * k);
+      Require(std::memcmp(separate_rows.data(), folded_rows.data(),
+                          folded_rows.size() * sizeof(float)) == 0 &&
+                  separate_exponents == Read(fused.down_exponents, assignments),
+              "restore-fused gate/up changed routed rows");
+      for (auto v : Read(fused.routed_arrivals, assignments))
+        Require(v == 0, "restore-fused arrivals not reset");
+    }
+  }
   const auto frozen = Read(trace.down_input, assignments * ff);
   const auto down_inner = Read(trace.down_inner, assignments * k);
   Near(down_inner, Read(trace.down_widened_inner, assignments * k),
@@ -1908,26 +1934,37 @@ void RouterGemvTiles(gpu::WeightType type, unsigned offset) {
   constexpr unsigned experts = 512, used = 10, k = 2560, m = experts + 1;
   Buffers buffers;
   std::mt19937 rng(static_cast<unsigned>(type) * 7 + offset);
-  const bool bf16 = type == gpu::WeightType::kBF16;
-  std::vector<std::uint16_t> w(std::size_t{m} * k + 8);
-  for (std::size_t i = 0; i < w.size(); ++i) {
-    const float v = (int(rng() % 2000) - 1000) * 1.0e-4F;
-    std::uint32_t bits;
-    std::memcpy(&bits, &v, 4);
-    const __half h = __float2half(v);
-    std::uint16_t hb;
-    std::memcpy(&hb, &h, 2);
-    w[i] = bf16 ? static_cast<std::uint16_t>(bits >> 16) : hb;
-  }
-  // Expert rows 7 and 300 equal row 3: three tied logits.
-  for (unsigned e : {7U, 300U})
-    std::copy_n(w.begin() + 3 * k, k, w.begin() + std::size_t{e} * k);
+  std::vector<float> wf(std::size_t{m} * k + 8);
+  for (auto& v : wf)
+    v = (int(rng() % 2000) - 1000) * 1.0e-4F;
   std::vector<float> x(k + 8);
   for (auto& v : x)
     v = (int(rng() % 2000) - 1000) * 1.0e-3F;
   x[5] = -0.0F;
   x[6] = 1.0e-40F;
-  auto* dw = buffers.Copy(w);
+  // Row 3 follows the sign of x, so it is the largest logit; rows 7 and 300
+  // equal it: the three tied winners take the lowest-index order.
+  for (unsigned i = 0; i < k; ++i)
+    wf[3 * k + i] = x[offset + i] < 0.0F ? -0.01F : 0.01F;
+  for (unsigned e : {7U, 300U})
+    std::copy_n(wf.begin() + 3 * k, k, wf.begin() + std::size_t{e} * k);
+  void* dw = nullptr;
+  if (type == gpu::WeightType::kF32) {
+    dw = buffers.Copy(wf);
+  } else {
+    std::vector<std::uint16_t> w(wf.size());
+    for (std::size_t i = 0; i < w.size(); ++i) {
+      std::uint32_t bits;
+      std::memcpy(&bits, &wf[i], 4);
+      const __half h = __float2half(wf[i]);
+      std::uint16_t hb;
+      std::memcpy(&hb, &h, 2);
+      w[i] = type == gpu::WeightType::kBF16
+                 ? static_cast<std::uint16_t>(bits >> 16)
+                 : hb;
+    }
+    dw = buffers.Copy(w);
+  }
   auto* dx = buffers.Copy(x) + offset;
   auto* ref_logits = buffers.Make<float>(m);
   auto* ref_ids = buffers.Make<std::int32_t>(used);
@@ -2025,6 +2062,7 @@ int main(int argc, char** argv) {
     RouterGemvTiles(gpu::WeightType::kF16, 0);
     RouterGemvTiles(gpu::WeightType::kBF16, 0);
     RouterGemvTiles(gpu::WeightType::kF16, 1);
+    RouterGemvTiles(gpu::WeightType::kF32, 0);
     for (const auto [rows, used] :
          {std::pair{1U, 10U}, std::pair{3U, 10U}, std::pair{8U, 10U},
           std::pair{25U, 10U}, std::pair{64U, 4U}})

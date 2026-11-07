@@ -1349,6 +1349,10 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     ex.tiles = Alloc<Exl3RouteTile>(a, assignments, error_msg);
     ex.tile_count = Alloc<std::uint32_t>(a, 1, error_msg);
     ex.route_arrivals = Alloc<std::uint32_t>(a, 1, error_msg);
+    ex.routed_down_input = Alloc<std::uint16_t>(
+        a, assignments * std::size_t{c.expert_ff}, error_msg);
+    ex.routed_arrivals = Alloc<std::uint32_t>(a, assignments, error_msg);
+    ex.routed_assignments = static_cast<std::uint32_t>(assignments);
     ex.down_exponents = Alloc<std::int32_t>(a, assignments, error_msg);
     e->exl3_dense_rotations_ =
         Alloc<gufo::hip::Exl3RotateProblem>(a, 3, error_msg);
