@@ -1,5 +1,37 @@
 # gfx1151 optimization know-how
 
+## Flash-Next B4 serial tails undone, routed LDS staging, November 8, 2026
+
+Commits `517445a3..dc24fd89` (brief `plan/exl3/B4-BRIEF.md`). Kept: G1 HC
+tails reverted (H1); device-kernarg default reverted (H2, no effect in B3);
+routed GEMV activations staged in LDS per K chunk so the K loop keeps the next
+trellis group in flight (H4a); HC down finishes each Q8_1 group in its own
+block, no counter, SiLU launch removed (H3). Reverted after measurement
+(structure vs speed): G3/H5 conv q/k norm, G4a router+top-k, G4b/H4b routed
+restore in the gate/up GEMV, G4d MoE output in the next HC combine — together
+−178 dispatches/token and −1.8 ms idle, but +1.9 ms busy (G4d alone +0.51 ms,
+a redundant per-stream combine), AR within ±0.4%, and H4b changed decode bits
+(d0 hash `75a056e35e70`, not caught by `exl3_moe_kernel`), which made MTP d0
+7% slower through a different text path. HC up+mix fusion skipped by design
+screen (one block owning a 256-column chunk needs 1024 gate rows on 10 WGPs).
+
+Same window, c03, Nix10.1, FP16 KV, B C S rotation r2, baseline B2
+`9599b4c6`, adopted tree S: AR128 d0/d32K 31.77/31.09→32.49/31.75
+(+2.3/+2.2%); MTP128 d0/d32K 63.95/99.01→67.39/102.75 (+5.4/+3.8%); PP
+2048/8192 unchanged (1508/1541). Outputs, hashes (`6d067a1254ff`,
+`d856f78e53b9`) and MTP work counts equal B2; prefill logits equal B3 (quality
+unchanged, KL256 0.041742).
+
+HC decode bench (`tests/.../qwen38_flash_next_hc_decode_bench`, µs/call, R=1/4/8):
+B2 down+SiLU 20.78/21.37/21.83 vs fused down 20.08/20.09/22.35; up 18.4–22.5;
+mix 2.8–3.0; chain 41.8→40.0 at R=1. Decode profile AR d0 (S): 30.93 ms,
+1273 dispatches/token, kernel-active 66.8%, busy 20.65, idle 10.28 ms/token;
+routed gate/up 4.54 ms ≈174 GB/s + restore 0.22, down 2.55 ≈155 GB/s (B3 5.08
+≈155 / 2.66 ≈148); HC chain 3.87, combine 0.68. Lesson confirmed: on this GPU a
+removed dispatch is worth ≈3 µs idle; a fusion only pays if busy time does not
+grow, and redundant or serial tail work quickly exceeds that. Evidence:
+`build/b1/gpu-b4/RESULT.json`.
+
 ## Flash-Next B3 decode dispatch fusion and launch gaps, November 8, 2026
 
 Commits `addf9dd3..5bda5f57` (brief `plan/exl3/B3-BRIEF.md`): HC-down tail

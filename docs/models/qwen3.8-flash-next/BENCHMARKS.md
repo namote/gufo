@@ -1,5 +1,14 @@
 # Qwen3.8 Flash-Next benchmarks
 
+## B4 routed LDS staging and simplified decode, November 8, 2026
+
+Same-window rotation vs B2 `9599b4c6` (adopted tree `dc24fd89`), c03, Nix10.1,
+FP16 KV, r2: AR128 d0/d32K 31.77/31.09→32.49/31.75 tok/s (+2.3/+2.2%);
+MTP128 d0/d32K 63.95/99.01→67.39/102.75 (+5.4/+3.8%); PP2048/8192 unchanged.
+Outputs and quality equal B2. B3's coupled fusions were reverted (no wall-clock
+gain). Versus the pre-B1 baseline: AR +19.0%, MTP d0 +31.2%.
+Details: [know-how](../../GFX1151-KNOWHOW.md).
+
 ## B3 decode dispatch fusion, November 8, 2026
 
 Same-window B C B C vs B2 `9599b4c6` (candidate `5bda5f57`), c03, Nix10.1,
