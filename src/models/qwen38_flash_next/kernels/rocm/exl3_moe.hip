@@ -1415,8 +1415,13 @@ void LaunchRouted(const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
 }  // namespace
 
 namespace {
-// Output tiles per down-projection wave.
-constexpr unsigned kDownTiles = 1;
+// Output tiles per down-projection wave. Its K (the expert width, 640) is
+// a quarter of gate/up's: with one tile a wave issued only 40 trellis
+// loads after a serial route/descriptor/staging preamble, and the
+// 160-tile x 10-expert R=1 grid (1600 waves) overran one resident round.
+// Two tiles halve the waves (one round), double the loads in flight per
+// group and share each staged activation read.
+constexpr unsigned kDownTiles = 2;
 
 // prescaled: RestoreActivateScale already scaled the input and wrote the
 // exponents (the ScaleDownRows pass is folded into it).
