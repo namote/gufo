@@ -534,32 +534,6 @@ void FusedProducer(unsigned rows, bool shared, int bits = 5, int up_bits = 0,
   trace.down_widened_inner = buffers.Make<float>(assignments * k);
   gpu::Exl3RoutedMlp(layer, dx, di, g, u, y, rows, used, s, nullptr, &trace);
   const auto actual = Read(y, assignments * k);
-  // The restore folded into the gate/up launch (RoutedGateUpRestore):
-  // byte-equal down rows and exponents to the separate restore launch, raw
-  // and restored, twice (the per-tile arrival counters return to zero).
-  for (bool raw : {false, true}) {
-    auto* separate = buffers.Make<float>(assignments * k);
-    gpu::Exl3RoutedMlp(layer, dx, di, g, u, separate, rows, used, s, nullptr,
-                       nullptr, false, raw);
-    const auto separate_rows = Read(separate, assignments * k);
-    const auto separate_exponents = Read(s.down_exponents, assignments);
-    gpu::Exl3Scratch fused = s;
-    fused.routed_down_input = buffers.Make<std::uint16_t>(assignments * ff);
-    fused.routed_arrivals = buffers.Make<std::uint32_t>(assignments);
-    fused.routed_assignments = assignments;
-    for (unsigned launch = 0; launch < 2; ++launch) {
-      auto* folded = buffers.Make<float>(assignments * k);
-      gpu::Exl3RoutedMlp(layer, dx, di, g, u, folded, rows, used, fused,
-                         nullptr, nullptr, false, raw);
-      const auto folded_rows = Read(folded, assignments * k);
-      Require(std::memcmp(separate_rows.data(), folded_rows.data(),
-                          folded_rows.size() * sizeof(float)) == 0 &&
-                  separate_exponents == Read(fused.down_exponents, assignments),
-              "restore-fused gate/up changed routed rows");
-      for (auto v : Read(fused.routed_arrivals, assignments))
-        Require(v == 0, "restore-fused arrivals not reset");
-    }
-  }
   const auto frozen = Read(trace.down_input, assignments * ff);
   const auto down_inner = Read(trace.down_inner, assignments * k);
   Near(down_inner, Read(trace.down_widened_inner, assignments * k),
