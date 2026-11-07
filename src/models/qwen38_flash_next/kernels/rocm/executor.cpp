@@ -3073,6 +3073,8 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
         SiluScale(s_.lo, scale,
                   static_cast<std::size_t>(n_tokens) * c.hc_low_rank, stream_);
       if (half_gate) {
+        if (diagnostics_active_)
+          cycle_diagnostics_.prefill_plain_rows += n_tokens;
         PrepareHalfInput(s_.lo, n_tokens, m.up.cols);
         if (!HcUpF16Gemm(m.up.data, static_cast<const __half*>(s_.x_half),
                          reinterpret_cast<__half*>(s_.hc_gate), n_tokens,

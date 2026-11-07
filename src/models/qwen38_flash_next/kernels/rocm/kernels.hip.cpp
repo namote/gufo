@@ -8029,7 +8029,7 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
           auto* yh = reinterpret_cast<__half*>(y);
           if (tok < batch && r0 + 32 <= m && m % 8 == 0) {
             const float* v = tile_scratch + (tok_l * kOutputStride) + row_l;
-            __half h[16];
+            __align__(16) __half h[16];
 #pragma unroll
             for (int q = 0; q < 16; ++q)
               h[q] = __float2half_rn(v[q]);

@@ -397,14 +397,14 @@ bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
 bool PlainPrefillGemm(const void* w, WeightType type, const __half* x,
                       float* out, std::size_t batch, std::size_t m,
                       std::size_t k, hipStream_t stream);
-/// Q8_0 weights dequantized to F16 in LDS and F16 activation rows.
-/// input_stride is in half elements; zero means k. Padded rows are supported
-/// by the wide SSM output projection (batch >= 1024, m=2560, k=6144).
-/// DenseF16Gemm (Q8_0 or F16 weights) storing each FP32 sum as F16 (RNE):
-/// the EXL3 prefill HC up projection's gate rows. Requires m % 8 == 0.
+/// DenseF16Gemm over Q8_0 weights storing each FP32 sum as F16 (RNE): the
+/// EXL3 prefill HC up projection's gate rows. Requires m % 8 == 0.
 bool HcUpF16Gemm(const void* w, const __half* x, __half* gate,
                  std::size_t batch, std::size_t m, std::size_t k,
                  hipStream_t stream);
+/// Q8_0 weights dequantized to F16 in LDS and F16 activation rows.
+/// input_stride is in half elements; zero means k. Padded rows are supported
+/// by the wide SSM output projection (batch >= 1024, m=2560, k=6144).
 bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
                   std::size_t m, std::size_t k, hipStream_t stream,
                   std::size_t input_stride = 0);
