@@ -141,20 +141,37 @@ __device__ __forceinline__ void RoutedGemvBody(
                   std::size_t{projection} * assignments * k;
   // Tiles are fetched kAhead at a time so a wave keeps several loads in
   // flight (one tile per iteration left decode latency-bound, ~150 GB/s);
-  // they are decoded and accumulated in K order exactly as before.
+  // they are decoded and accumulated in K order exactly as before. The
+  // next group's loads are issued before this group is decoded, so the
+  // wave never drains to zero loads in flight at a group boundary (the
+  // short K = 640 down projection has ten such boundaries per row). Indices
+  // past the end clamp to the last tile, already cached by this group.
   constexpr unsigned kAhead = 4;
   const unsigned k_tiles = k / 16;
+  const auto fetch = [&](unsigned kt0, std::uint32_t (&raw)[kAhead][3])
+                         __attribute__((always_inline)) {
+#pragma unroll
+                           for (unsigned u = 0; u < kAhead; ++u) {
+                             const unsigned kt = min(kt0 + u, k_tiles - 1);
+                             const auto* tile =
+                                 trellis + (std::size_t{kt} * (n / 16) + nt) *
+                                               arithmetic::TileDwords(Bits);
+                             raw[u][0] = tile[lw.o0];
+                             raw[u][1] = tile[lw.o1];
+                             raw[u][2] = tile[lw.o2];
+                           }
+                         };
+  std::uint32_t next[kAhead][3];
+  fetch(0, next);
   for (unsigned kt0 = 0; kt0 < k_tiles; kt0 += kAhead) {
     std::uint32_t raw[kAhead][3];
 #pragma unroll
     for (unsigned u = 0; u < kAhead; ++u) {
-      const unsigned kt = min(kt0 + u, k_tiles - 1);
-      const auto* tile = trellis + (std::size_t{kt} * (n / 16) + nt) *
-                                       arithmetic::TileDwords(Bits);
-      raw[u][0] = tile[lw.o0];
-      raw[u][1] = tile[lw.o1];
-      raw[u][2] = tile[lw.o2];
+      raw[u][0] = next[u][0];
+      raw[u][1] = next[u][1];
+      raw[u][2] = next[u][2];
     }
+    fetch(kt0 + kAhead, next);
 #pragma unroll
     for (unsigned u = 0; u < kAhead; ++u) {
       const unsigned kt = kt0 + u;
