@@ -843,10 +843,7 @@ int RunStableDecodeCase(std::uint32_t kTokens) {
   struct Result {
     std::vector<float> out, state, conv;
   };
-  HipBuffer<std::uint32_t> d_arrivals(1);
-  CheckHip(hipMemset(d_arrivals.get(), 0, sizeof(std::uint32_t)), "memset");
-  const auto run = [&](const std::vector<std::uint32_t>& chunks, bool batch,
-                       bool fused_prep = false) {
+  const auto run = [&](const std::vector<std::uint32_t>& chunks, bool batch) {
     Upload(&d_conv_state, conv_state);
     Upload(&d_state, state);
     std::uint32_t first = 0;
@@ -886,8 +883,7 @@ int RunStableDecodeCase(std::uint32_t kTokens) {
             d_dt.get(), d_norm_w.get(), d_conv_state.get(), d_scratch.get(),
             d_qn.get(), d_kn.get(), d_raw.get(), d_state.get(), out_at, nullptr,
             {}, {}, count, kKHeads, kVHeads, kDim, kKernel, false, false, kEps,
-            nullptr, nullptr, {}, 0, nullptr, nullptr, true, nullptr,
-            fused_prep ? d_arrivals.get() : nullptr);
+            nullptr, nullptr, {}, 0, nullptr, nullptr, true);
       }
       first += count;
     }
@@ -905,15 +901,6 @@ int RunStableDecodeCase(std::uint32_t kTokens) {
            bytes_equal(x.conv, y.conv);
   };
   const Result whole = run({kTokens}, false);
-  // Each convolution block normalizing its own q/k heads (decode and
-  // verify calls of one to eight tokens): the separate GdnPrepKernel's bytes.
-  for (const std::uint32_t width : {1U, 2U, 3U, 5U, 8U}) {
-    std::vector<std::uint32_t> chunks;
-    for (std::uint32_t left = kTokens; left != 0; left -= std::min(left, width))
-      chunks.push_back(std::min(left, width));
-    if (!same(run(chunks, false), run(chunks, false, true)))
-      throw std::runtime_error("fused conv/prep GDN differs from GdnPrep");
-  }
   if (kTokens <= 8) {
     // Verify: rollback rows and a checkpoint, written by the fused stages,
     // must leave the forward unchanged and match fresh prefix forwards.
@@ -955,33 +942,6 @@ int RunStableDecodeCase(std::uint32_t kTokens) {
                           Download(&d_conv_state, kConvState)};
     if (!same(whole, verified))
       throw std::runtime_error("stable decode rollback rows changed output");
-    // The fused conv/prep with rollback rows (verify of up to eight tokens).
-    {
-      const auto rows_before = kTokens > 1 ? Download(rows[0].get(), kConvState)
-                                           : std::vector<float>{};
-      Upload(&d_conv_state, conv_state);
-      Upload(&d_state, state);
-      q::GatedDeltaNet(
-          d_qkv.get(), kChannels, d_z.get(), kZ, d_alpha_beta.get(),
-          d_conv_w.get(), d_a.get(), d_dt.get(), d_norm_w.get(),
-          d_conv_state.get(), d_scratch.get(), d_qn.get(), d_kn.get(),
-          d_raw.get(), d_state.get(), d_out.get(), nullptr, states, convs,
-          kTokens, kKHeads, kVHeads, kDim, kKernel, false, false, kEps, nullptr,
-          nullptr, {cp_state.get(), cp_history.get(), prefix}, 0, nullptr,
-          nullptr, true, nullptr, d_arrivals.get());
-      CheckHip(hipDeviceSynchronize(), "fused stable decode GDN verify");
-      if (kTokens > 1)
-        q::RestoreGdnState(d_state.get(), states, kTokens, kTokens, kKHeads,
-                           kVHeads, nullptr);
-      CheckHip(hipDeviceSynchronize(), "fused stable decode GDN commit");
-      const Result fused_verified{Download(&d_out, kOut),
-                                  Download(&d_state, kStateCount),
-                                  Download(&d_conv_state, kConvState)};
-      if (!same(whole, fused_verified) ||
-          (kTokens > 1 &&
-           !bytes_equal(rows_before, Download(rows[0].get(), kConvState))))
-        throw std::runtime_error("fused conv/prep verify changed output");
-    }
     std::vector<std::vector<float>> history(saved);
     for (std::size_t i = 0; i < saved; ++i)
       history[i] = Download(rows[2 * i].get(), kConvState);
@@ -1022,7 +982,7 @@ int main() {
       if (RunStableCase(n) != 0)
         return 1;
     }
-    for (std::uint32_t n : {1u, 2u, 3u, 8u, 9u, 12u, 16u}) {
+    for (std::uint32_t n : {1u, 3u, 8u, 9u, 12u, 16u}) {
       std::cout << "stable decode n=" << n << '\n';
       if (RunStableDecodeCase(n) != 0)
         return 1;

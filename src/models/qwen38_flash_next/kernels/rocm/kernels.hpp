@@ -619,9 +619,6 @@ struct GdnCheckpoint {
 /// speculative snapshots. A non-null `out_slabs` with one consumer (F32
 /// `out` rows, d == 128, k == v_heads * d) also receives the rows rotated
 /// for the EXL3 output projection; its count is zeroed when it does not.
-/// A non-null `arrivals` lets a one-token-tile (decode or verify) stable
-/// convolution normalize q/k in each of its blocks; the counter it points
-/// to is no longer read or written.
 bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    std::uint32_t z_stride, const float* alpha_beta,
                    const float* conv_w, const float* a, const float* dt,
@@ -635,8 +632,7 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    __half* out_half = nullptr, GdnCheckpoint checkpoint = {},
                    std::uint32_t out_half_stride = 0, void* out_q8_1 = nullptr,
                    hipEvent_t z_ready = nullptr, bool stable_conv = false,
-                   Exl3InputSlabs* out_slabs = nullptr,
-                   std::uint32_t* arrivals = nullptr);
+                   Exl3InputSlabs* out_slabs = nullptr);
 
 /// Private rows for one request in a decode batch. Scratch regions and all
 /// recurrent/history/rollback buffers must be disjoint between requests.
