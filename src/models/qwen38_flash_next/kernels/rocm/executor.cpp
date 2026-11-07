@@ -3043,7 +3043,8 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
   // residual write and reread fewer per layer).
   const bool defer_now = defer_res && exl3 && prefill_phase &&
                          xn_scale != nullptr && !exl3_moe_fused &&
-                         c.hc_count == 4;
+                         c.hc_count == 4 && c.hidden_size % 128 == 0 &&
+                         c.hidden_size <= 2560;
   if (HcCombine(
           res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn, n_tokens,
           c.hidden_size, c.hc_count, c.rms_eps, stream_, exl3 && !prefill_phase,
@@ -5024,7 +5025,9 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                           l.router.type == GgmlType::kF16 &&
                           l.shexp_gate.type == GgmlType::kQ8_0 &&
                           l.shexp_up.type == GgmlType::kQ8_0;
-      Combine(s_.res, l.hc_ffn.norm.f32(), rows, InjectWeights(l.hc_ffn), true);
+      // EXL3 experts never write block_out before the FFN combine.
+      Combine(s_.res, l.hc_ffn.norm.f32(), rows, InjectWeights(l.hc_ffn),
+              l.ffn_gate_exps.exl3 != nullptr);
       const DeviceTensor* const shared_rotate[] = {&l.shexp_gate, &l.shexp_up};
       if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, rows, error_msg,
                  false, no_f32, shared_rotate))
