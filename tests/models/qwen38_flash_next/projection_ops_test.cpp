@@ -1268,6 +1268,87 @@ void CheckQuantizeHalfQ8_0() {
   std::cout << "Q8_0 quantizer: IEEE host codes for " << blocks << " blocks\n";
 }
 
+/// HcUpF16Gemm stores exactly the F16 rounding of DenseF16Gemm's FP32
+/// output (same tiles and K order) at every token tier of the HC up shape,
+/// and the vec4 mix epilogue over those F16 gates equals the FP32-gate
+/// epilogue fed the same widened values.
+void CheckHcUpHalfGate() {
+  constexpr std::size_t m = 10240, k = 320, hidden = 2560;
+  const auto weights = MakeWeights(m, k, 0x4C0FFEEU, false);
+  void* d_w = nullptr;
+  CheckHip(hipMalloc(&d_w, weights.blocks.size() + 4096), "up weights");
+  CheckHip(hipMemcpy(d_w, weights.blocks.data(), weights.blocks.size(),
+                     hipMemcpyHostToDevice),
+           "up weight upload");
+  for (const std::size_t batch : {7U, 95U, 96U, 333U, 1025U}) {
+    std::uint32_t seed = 0x600DU + static_cast<std::uint32_t>(batch);
+    std::vector<__half> x(batch * k);
+    for (auto& v : x)
+      v = __float2half(Uniform(&seed, 0.5F));
+    std::vector<float> xn(batch * m);
+    for (auto& v : xn)
+      v = Uniform(&seed, 2.0F);
+    __half *d_x = nullptr, *d_gate_h = nullptr;
+    float *d_gate = nullptr, *d_xn = nullptr, *d_widened = nullptr,
+          *d_mixed_a = nullptr, *d_mixed_b = nullptr;
+    CheckHip(hipMalloc(&d_x, x.size() * sizeof(__half)), "up input");
+    CheckHip(hipMalloc(&d_gate_h, batch * m * sizeof(__half)), "F16 gate");
+    CheckHip(hipMalloc(&d_gate, batch * m * sizeof(float)), "F32 gate");
+    CheckHip(hipMalloc(&d_widened, batch * m * sizeof(float)), "widened");
+    CheckHip(hipMalloc(&d_xn, batch * m * sizeof(float)), "norm rows");
+    CheckHip(hipMalloc(&d_mixed_a, batch * hidden * sizeof(float)), "mix a");
+    CheckHip(hipMalloc(&d_mixed_b, batch * hidden * sizeof(float)), "mix b");
+    CheckHip(hipMemcpy(d_x, x.data(), x.size() * sizeof(__half),
+                       hipMemcpyHostToDevice),
+             "up input upload");
+    CheckHip(hipMemcpy(d_xn, xn.data(), xn.size() * sizeof(float),
+                       hipMemcpyHostToDevice),
+             "norm upload");
+    if (!q::DenseF16Gemm(d_w, d_x, d_gate, batch, m, k, nullptr) ||
+        !q::HcUpF16Gemm(d_w, d_x, d_gate_h, batch, m, k, nullptr))
+      throw std::runtime_error("HC up GEMM rejected the shape");
+    std::vector<float> gate(batch * m);
+    std::vector<__half> gate_h(batch * m);
+    CheckHip(hipMemcpy(gate.data(), d_gate, gate.size() * sizeof(float),
+                       hipMemcpyDeviceToHost),
+             "F32 gate download");
+    CheckHip(hipMemcpy(gate_h.data(), d_gate_h, gate_h.size() * sizeof(__half),
+                       hipMemcpyDeviceToHost),
+             "F16 gate download");
+    std::vector<float> widened(batch * m);
+    for (std::size_t i = 0; i < gate.size(); ++i) {
+      const __half expected = __float2half_rn(gate[i]);
+      if (std::memcmp(&expected, &gate_h[i], sizeof(__half)) != 0)
+        throw std::runtime_error("F16 HC gate differs from rounded FP32");
+      widened[i] = __half2float(gate_h[i]);
+    }
+    CheckHip(hipMemcpy(d_widened, widened.data(), widened.size() * 4,
+                       hipMemcpyHostToDevice),
+             "widened upload");
+    q::HcMixEpilogueVec4(d_xn, d_widened, nullptr, d_mixed_a, nullptr,
+                         static_cast<std::uint32_t>(batch), hidden, 4, nullptr);
+    q::HcMixEpilogueVec4(d_xn, nullptr, nullptr, d_mixed_b, nullptr,
+                         static_cast<std::uint32_t>(batch), hidden, 4, nullptr,
+                         nullptr, d_gate_h);
+    std::vector<float> a(batch * hidden), b(batch * hidden);
+    CheckHip(
+        hipMemcpy(a.data(), d_mixed_a, a.size() * 4, hipMemcpyDeviceToHost),
+        "mix a download");
+    CheckHip(
+        hipMemcpy(b.data(), d_mixed_b, b.size() * 4, hipMemcpyDeviceToHost),
+        "mix b download");
+    if (std::memcmp(a.data(), b.data(), a.size() * 4) != 0)
+      throw std::runtime_error("F16-gate mix epilogue differs");
+    for (void* p : {static_cast<void*>(d_x), static_cast<void*>(d_gate_h),
+                    static_cast<void*>(d_gate), static_cast<void*>(d_widened),
+                    static_cast<void*>(d_xn), static_cast<void*>(d_mixed_a),
+                    static_cast<void*>(d_mixed_b)})
+      (void)hipFree(p);
+  }
+  (void)hipFree(d_w);
+  std::cout << "HC up F16 gate: rounded FP32 rows and epilogue bits\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1285,6 +1366,7 @@ int main(int argc, char** argv) {
       throw std::runtime_error("prepare quantized decode projections");
     CheckRoutedQ8Placement();
     CheckQuantizeHalfQ8_0();
+    CheckHcUpHalfGate();
     CheckStableGroupedProjections();
     CheckDenseAcrossStreams();
     CheckSmallProjection(q::WeightType::kF32, 513, 2560);

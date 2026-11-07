@@ -3026,6 +3026,13 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       !xn_half_ && !MatrixRows(n_tokens) && m.down.type == GgmlType::kF16 &&
       m.up.type == GgmlType::kF16 && m.down.rows == 320 &&
       m.down.cols == 10240 && c.hc_count == 4 && c.hc_low_rank == 320;
+  // EXL3 prefill stores the HC gate as F16 (the Q8_0 up GEMM's F16-store
+  // variant), halving its write and the vectorized epilogue's read.
+  const bool half_gate =
+      !fused_projection && model_->output().exl3 != nullptr && prefill_phase &&
+      !xn_half_ && extras && c.hc_count == 4 && c.hidden_size % 4 == 0 &&
+      m.up.type == GgmlType::kQ8_0 && m.up.rows % 8 == 0 &&
+      DenseF16Route(m.up, n_tokens) && m.up.cols <= half_input_cols_;
   if (fused_projection) {
     // The up projection writes x_half; keep its input in the gate buffer.
     if (!HcDownF16Gemm(m.down.data, s_.xn_q8t,
@@ -3065,7 +3072,15 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       if (!fused_down)
         SiluScale(s_.lo, scale,
                   static_cast<std::size_t>(n_tokens) * c.hc_low_rank, stream_);
-      if (!Dense(m.up, s_.lo, s_.hc_gate, n_tokens, error_msg)) {
+      if (half_gate) {
+        PrepareHalfInput(s_.lo, n_tokens, m.up.cols);
+        if (!HcUpF16Gemm(m.up.data, static_cast<const __half*>(s_.x_half),
+                         reinterpret_cast<__half*>(s_.hc_gate), n_tokens,
+                         m.up.rows, m.up.cols, stream_)) {
+          AssignError(error_msg, "HC up F16 GEMM failed");
+          return false;
+        }
+      } else if (!Dense(m.up, s_.lo, s_.hc_gate, n_tokens, error_msg)) {
         return false;
       }
     }
@@ -3128,15 +3143,18 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
                            ? static_cast<__half*>(s_.x_half)
                            : nullptr;
     bool half_written = mixed_half != nullptr;
+    const auto* gate_half =
+        half_gate ? reinterpret_cast<const __half*>(s_.hc_gate) : nullptr;
     if (norm_from_res)
       HcMixEpilogueVec4FromRes(
           deferred_norm.res, deferred_norm.gamma, s_.xn_scale, s_.hc_gate,
           fused_inject ? m.inject.f32() : nullptr, mixed, inject, n_tokens,
-          c.hidden_size, stream_, mixed_half);
+          c.hidden_size, stream_, mixed_half, gate_half);
     else
       half_written = HcMixEpilogueVec4(
           xn, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr, mixed,
-          inject, n_tokens, c.hidden_size, c.hc_count, stream_, mixed_half);
+          inject, n_tokens, c.hidden_size, c.hc_count, stream_, mixed_half,
+          gate_half);
     if (half_written) {
       half_src_ = mixed;
       half_rows_ = n_tokens;

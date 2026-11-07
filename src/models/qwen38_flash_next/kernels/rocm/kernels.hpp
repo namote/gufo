@@ -202,12 +202,15 @@ void HcMixEpilogue(const float* xn, const float* gate, const float* inject_w,
 /// Four adjacent hidden lanes per thread. The model's four-stream geometry
 /// emits HcInjectPartsVec4(hidden) partial sums per inject logit.
 /// A non-null `mixed_half` also receives NarrowActivations' F16 rows of
-/// `mixed` (vectorized route only; returns whether they were written).
+/// `mixed` (vectorized route only; returns whether they were written). A
+/// non-null `gate_half` (HcUpF16Gemm's F16 gate; four streams, hidden % 4
+/// == 0 required) replaces `gate`.
 bool HcMixEpilogueVec4(const float* xn, const float* gate,
                        const float* inject_w, float* mixed, float* inject,
                        std::uint32_t n_tokens, std::uint32_t hidden,
                        std::uint32_t streams, hipStream_t stream,
-                       __half* mixed_half = nullptr);
+                       __half* mixed_half = nullptr,
+                       const __half* gate_half = nullptr);
 /// The vec4 epilogue over an F16 `xn` (the F16 mixer input route); the
 /// four-stream geometry is the caller's contract. Non-null `mixed_half` /
 /// `mixed_q8` also receive the mixed rows as F16 and in the W8A8 tiled Q8
@@ -247,7 +250,8 @@ void HcMixEpilogueVec4FromRes(const float* res, const float* gamma,
                               const float* inject_w, float* mixed,
                               float* inject, std::uint32_t n_tokens,
                               std::uint32_t hidden, hipStream_t stream,
-                              __half* mixed_half = nullptr);
+                              __half* mixed_half = nullptr,
+                              const __half* gate_half = nullptr);
 // any_width: the four-lane kernel at every token count (no 16-row
 // threshold), so a route fixed by phase never depends on the chunk width.
 /// The one-block-per-stream HcCombine that also writes xn's Q8_1 rows (as
@@ -396,6 +400,11 @@ bool PlainPrefillGemm(const void* w, WeightType type, const __half* x,
 /// Q8_0 weights dequantized to F16 in LDS and F16 activation rows.
 /// input_stride is in half elements; zero means k. Padded rows are supported
 /// by the wide SSM output projection (batch >= 1024, m=2560, k=6144).
+/// DenseF16Gemm (Q8_0 or F16 weights) storing each FP32 sum as F16 (RNE):
+/// the EXL3 prefill HC up projection's gate rows. Requires m % 8 == 0.
+bool HcUpF16Gemm(const void* w, const __half* x, __half* gate,
+                 std::size_t batch, std::size_t m, std::size_t k,
+                 hipStream_t stream);
 bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
                   std::size_t m, std::size_t k, hipStream_t stream,
                   std::size_t input_stride = 0);

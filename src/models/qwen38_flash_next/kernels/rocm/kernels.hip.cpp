@@ -436,8 +436,10 @@ __device__ __forceinline__ float4 Load4(const __half* p) {
 
 /// kFromRes: xn is the residual row and the norm is recomputed from it,
 /// gamma and the combine's per-stream scales (HcNorm4).
-template<typename XnT, bool kFromRes = false>
-__global__ void HcMixEpilogueVec4Kernel(const XnT* xn, const float* gate,
+/// GateT: the HC gate rows as stored by the up projection (FP32, or F16
+/// from HcUpF16Gemm).
+template<typename XnT, bool kFromRes = false, typename GateT = float>
+__global__ void HcMixEpilogueVec4Kernel(const XnT* xn, const GateT* gate,
                                         const float* inject_w, float* mixed,
                                         float* inject, std::uint32_t hidden,
                                         const float* gamma = nullptr,
@@ -475,8 +477,17 @@ __global__ void HcMixEpilogueVec4Kernel(const XnT* xn, const float* gate,
     if constexpr (!kFromRes)
       v[s] = i < hidden ? Load4(x + idx) : float4{0.0F, 0.0F, 0.0F, 0.0F};
     if (i < hidden) {
-      const float4 g = *reinterpret_cast<const float4*>(
-          gate + static_cast<std::size_t>(t) * hc_dim + idx);
+      float4 g;
+      if constexpr (std::is_same_v<GateT, __half>) {
+        __half h[4];
+        *reinterpret_cast<uint2*>(h) = *reinterpret_cast<const uint2*>(
+            gate + static_cast<std::size_t>(t) * hc_dim + idx);
+        g = float4{__half2float(h[0]), __half2float(h[1]), __half2float(h[2]),
+                   __half2float(h[3])};
+      } else {
+        g = *reinterpret_cast<const float4*>(
+            gate + static_cast<std::size_t>(t) * hc_dim + idx);
+      }
       acc.x += v[s].x * SigmoidF(g.x);
       acc.y += v[s].y * SigmoidF(g.y);
       acc.z += v[s].z * SigmoidF(g.z);
@@ -6662,16 +6673,21 @@ bool HcMixEpilogueVec4(const float* xn, const float* gate,
                        const float* inject_w, float* mixed, float* inject,
                        std::uint32_t n_tokens, std::uint32_t hidden,
                        std::uint32_t streams, hipStream_t stream,
-                       __half* mixed_half) {
-  if (streams != 4 || hidden % 4 != 0) {
+                       __half* mixed_half, const __half* gate_half) {
+  if (gate_half == nullptr && (streams != 4 || hidden % 4 != 0)) {
     HcMixEpilogue(xn, gate, inject_w, mixed, inject, n_tokens, hidden, streams,
                   stream);
     return false;
   }
-  hipLaunchKernelGGL(HcMixEpilogueVec4Kernel<float>,
-                     dim3(n_tokens, HcInjectPartsVec4(hidden)), dim3(kThreads),
-                     0, stream, xn, gate, inject_w, mixed, inject, hidden,
-                     nullptr, nullptr, mixed_half);
+  const dim3 grid(n_tokens, HcInjectPartsVec4(hidden));
+  if (gate_half != nullptr)
+    hipLaunchKernelGGL((HcMixEpilogueVec4Kernel<float, false, __half>), grid,
+                       dim3(kThreads), 0, stream, xn, gate_half, inject_w,
+                       mixed, inject, hidden, nullptr, nullptr, mixed_half);
+  else
+    hipLaunchKernelGGL(HcMixEpilogueVec4Kernel<float>, grid, dim3(kThreads), 0,
+                       stream, xn, gate, inject_w, mixed, inject, hidden,
+                       nullptr, nullptr, mixed_half);
   return mixed_half != nullptr;
 }
 
@@ -6680,11 +6696,16 @@ void HcMixEpilogueVec4FromRes(const float* res, const float* gamma,
                               const float* inject_w, float* mixed,
                               float* inject, std::uint32_t n_tokens,
                               std::uint32_t hidden, hipStream_t stream,
-                              __half* mixed_half) {
-  hipLaunchKernelGGL((HcMixEpilogueVec4Kernel<float, true>),
-                     dim3(n_tokens, HcInjectPartsVec4(hidden)), dim3(kThreads),
-                     0, stream, res, gate, inject_w, mixed, inject, hidden,
-                     gamma, xn_scale, mixed_half);
+                              __half* mixed_half, const __half* gate_half) {
+  const dim3 grid(n_tokens, HcInjectPartsVec4(hidden));
+  if (gate_half != nullptr)
+    hipLaunchKernelGGL((HcMixEpilogueVec4Kernel<float, true, __half>), grid,
+                       dim3(kThreads), 0, stream, res, gate_half, inject_w,
+                       mixed, inject, hidden, gamma, xn_scale, mixed_half);
+  else
+    hipLaunchKernelGGL((HcMixEpilogueVec4Kernel<float, true>), grid,
+                       dim3(kThreads), 0, stream, res, gate, inject_w, mixed,
+                       inject, hidden, gamma, xn_scale, mixed_half);
 }
 
 __global__ void HcNormFromResKernel(const float* res, const float* gamma,
@@ -7405,7 +7426,7 @@ template<int BM, int BN, int BK, int WM, int WN, int kRowGroup = 1,
          bool kHcMix = false, bool kSsmConv = false, bool kAttention = false,
          bool kHalfWeights = false, bool kBf16 = false, bool kStrided = false,
          bool kYarn = false, WeightType kPlainType = WeightType::kF16,
-         bool kPlainPrefill = false>
+         bool kPlainPrefill = false, bool kHalfOut = false>
 __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
     const void* __restrict__ w, const __half* __restrict__ x,
     float* __restrict__ y, std::size_t batch, std::size_t m, std::size_t k,
@@ -8003,6 +8024,28 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
               }
             }
           }
+        } else if constexpr (kHalfOut) {
+          // y holds F16 rows: each FP32 sum rounded once (RNE).
+          auto* yh = reinterpret_cast<__half*>(y);
+          if (tok < batch && r0 + 32 <= m && m % 8 == 0) {
+            const float* v = tile_scratch + (tok_l * kOutputStride) + row_l;
+            __half h[16];
+#pragma unroll
+            for (int q = 0; q < 16; ++q)
+              h[q] = __float2half_rn(v[q]);
+            auto* dst = reinterpret_cast<uint4*>(
+                yh + (tok * m) + r0 + static_cast<std::size_t>(row_l));
+            dst[0] = *reinterpret_cast<const uint4*>(h);
+            dst[1] = *reinterpret_cast<const uint4*>(h + 8);
+          } else if (tok < batch) {
+#pragma unroll
+            for (int q = 0; q < 16; ++q) {
+              const std::size_t r = r0 + static_cast<std::size_t>(row_l + q);
+              if (r < m)
+                yh[(tok * m) + r] = __float2half_rn(
+                    tile_scratch[(tok_l * kOutputStride) + row_l + q]);
+            }
+          }
         } else {
           if (tok < batch && r0 + 32 <= m && ((tok * m) % 4 == 0) &&
               (!kPlainPrefill ||
@@ -8229,6 +8272,38 @@ bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
                     static_cast<unsigned int>((m + kBM - 1) / kBM));
     hipLaunchKernelGGL((DenseF16GEMMKernel<kBM, kBN, 4, 4, 2>), grid,
                        dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+  }
+  return true;
+}
+
+bool HcUpF16Gemm(const void* w, const __half* x, __half* gate,
+                 std::size_t batch, std::size_t m, std::size_t k,
+                 hipStream_t stream) {
+  if (m == 0 || k == 0 || batch == 0 || k % 32 != 0 || m % 8 != 0)
+    return false;
+  // DenseF16Gemm's tiles for this shape, with F16 stores.
+  auto* out = reinterpret_cast<float*>(gate);
+  constexpr auto kF16 = WeightType::kF16;
+  if (batch >= 96) {
+    const dim3 grid(static_cast<unsigned int>((batch + 127) / 128),
+                    static_cast<unsigned int>((m + 255) / 256));
+    if (m == 10240 && k == 320 && batch >= 1024)
+      hipLaunchKernelGGL(
+          (DenseF16GEMMKernel<256, 128, 1, 4, 2, 8, false, false, false, false,
+                              false, false, false, kF16, false, true>),
+          grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+    else
+      hipLaunchKernelGGL(
+          (DenseF16GEMMKernel<256, 128, 1, 4, 2, 1, false, false, false, false,
+                              false, false, false, kF16, false, true>),
+          grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+  } else {
+    const dim3 grid(static_cast<unsigned int>((batch + 63) / 64),
+                    static_cast<unsigned int>((m + 127) / 128));
+    hipLaunchKernelGGL(
+        (DenseF16GEMMKernel<128, 64, 4, 4, 2, 1, false, false, false, false,
+                            false, false, false, kF16, false, true>),
+        grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k);
   }
   return true;
 }
