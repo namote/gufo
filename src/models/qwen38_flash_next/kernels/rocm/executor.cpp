@@ -4142,16 +4142,17 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   // which leave compute idle while they stream expert weights. The shared
   // expert writes its own scratch and may quantize x into s_.x_q8t, so no
   // main-stream work may use s_.x_q8t before JoinSide.
-  // The legacy path below overlaps Q8_0; EXL3 uses the explicit-stream
-  // workspace above. Other routes retain their original stream ownership.
+  // The fork below overlaps wide Q8_0 batches and EXL3 decode/verify; EXL3
+  // prefill uses the explicit-stream workspace above. Other routes retain
+  // their original stream ownership.
   // EXL3 decode/verify: the fused shared MLP (its own fast-path slabs,
   // counters and shexp rows) runs beside the routed GEMVs (routed_input,
   // tiles, gate_e/up_e/down_e); Exl3Experts joins before the combine reads
   // shexp_out.
   const bool exl3_decode_overlap =
       !exl3_overlap && !prefill_phase && !last_only &&
-      l.shexp_gate.exl3 != nullptr && l.shexp_up.exl3 != nullptr &&
-      l.shexp_down.exl3 != nullptr && l.ffn_gate_exps.exl3 != nullptr;
+      full_exl3(l.shexp_gate) && full_exl3(l.shexp_up) &&
+      full_exl3(l.shexp_down) && l.ffn_gate_exps.exl3 != nullptr;
   const bool overlap = exl3_decode_overlap ||
                        (!exl3_overlap && ExpertMatrixRows(n_tokens) &&
                         !last_only && l.shexp_gate.type == GgmlType::kQ8_0 &&
@@ -4167,6 +4168,12 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
     }
     stream_ = side_stream_;
   }
+  // However the shared expert exits, later work returns to the main stream.
+  struct MainStream {
+    const Executor* executor;
+    hipStream_t main;
+    ~MainStream() { executor->stream_ = main; }
+  } main_stream{this, main};
   const DeviceTensor* const shared_inputs[] = {&l.shexp_gate, &l.shexp_up};
   const auto shared_expert = [&] {
     shexp_half_ready_ = false;
@@ -4196,8 +4203,10 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   if (overlap) {
     if (!Check(hipEventRecord(side_done_, side_stream_), "side stream join",
                error_msg)) {
-      // Nothing to join: wait for the whole side stream instead.
-      (void)hipStreamSynchronize(side_stream_);
+      // Nothing to join: wait for the whole side stream instead (not while
+      // a graph captures it).
+      if (!SideCapturing())
+        (void)hipStreamSynchronize(side_stream_);
       return false;
     }
     side_pending_ = true;
@@ -4228,11 +4237,17 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   return MoeExperts(l, x, out, n_tokens, error_msg) && JoinSide(error_msg);
 }
 
+bool Executor::SideCapturing() const {
+  hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+  return hipStreamIsCapturing(side_stream_, &status) == hipSuccess &&
+         status != hipStreamCaptureStatusNone;
+}
+
 bool Executor::JoinSide(std::string* error_msg) const {
   if (!side_pending_)
     return true;
   const auto status = hipStreamWaitEvent(stream_, side_done_, 0);
-  if (status != hipSuccess)
+  if (status != hipSuccess && !SideCapturing())
     (void)hipStreamSynchronize(side_stream_);
   side_pending_ = false;
   return Check(status, "side stream join wait", error_msg);
