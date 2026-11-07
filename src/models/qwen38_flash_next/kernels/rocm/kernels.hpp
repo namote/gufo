@@ -619,8 +619,9 @@ struct GdnCheckpoint {
 /// speculative snapshots. A non-null `out_slabs` with one consumer (F32
 /// `out` rows, d == 128, k == v_heads * d) also receives the rows rotated
 /// for the EXL3 output projection; its count is zeroed when it does not.
-/// A non-null `arrivals` (one zero-initialized counter, left at zero) lets
-/// a one- or two-token stable convolution normalize q/k in its last block.
+/// A non-null `arrivals` lets a one-token-tile (decode or verify) stable
+/// convolution normalize q/k in each of its blocks; the counter it points
+/// to is no longer read or written.
 bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    std::uint32_t z_stride, const float* alpha_beta,
                    const float* conv_w, const float* a, const float* dt,

@@ -905,22 +905,14 @@ int RunStableDecodeCase(std::uint32_t kTokens) {
            bytes_equal(x.conv, y.conv);
   };
   const Result whole = run({kTokens}, false);
-  // The convolution's last block normalizing q/k (one- and two-token
-  // calls): the separate GdnPrepKernel's bytes, counter back at zero.
-  {
-    std::vector<std::uint32_t> ones(kTokens, 1U), twos;
-    for (std::uint32_t left = kTokens; left != 0; left -= std::min(left, 2U))
-      twos.push_back(std::min(left, 2U));
-    for (const auto& chunks : {ones, twos}) {
-      if (!same(run(chunks, false), run(chunks, false, true)))
-        throw std::runtime_error("fused conv/prep GDN differs from GdnPrep");
-      std::uint32_t arrivals = 1;
-      CheckHip(hipMemcpy(&arrivals, d_arrivals.get(), sizeof(arrivals),
-                         hipMemcpyDeviceToHost),
-               "download arrivals");
-      if (arrivals != 0)
-        throw std::runtime_error("fused conv/prep arrivals not reset");
-    }
+  // Each convolution block normalizing its own q/k heads (decode and
+  // verify calls of one to eight tokens): the separate GdnPrepKernel's bytes.
+  for (const std::uint32_t width : {1U, 2U, 3U, 5U, 8U}) {
+    std::vector<std::uint32_t> chunks;
+    for (std::uint32_t left = kTokens; left != 0; left -= std::min(left, width))
+      chunks.push_back(std::min(left, width));
+    if (!same(run(chunks, false), run(chunks, false, true)))
+      throw std::runtime_error("fused conv/prep GDN differs from GdnPrep");
   }
   if (kTokens <= 8) {
     // Verify: rollback rows and a checkpoint, written by the fused stages,
@@ -963,8 +955,8 @@ int RunStableDecodeCase(std::uint32_t kTokens) {
                           Download(&d_conv_state, kConvState)};
     if (!same(whole, verified))
       throw std::runtime_error("stable decode rollback rows changed output");
-    // The fused conv/prep with rollback rows (two-token verify).
-    if (kTokens <= 2) {
+    // The fused conv/prep with rollback rows (verify of up to eight tokens).
+    {
       const auto rows_before = kTokens > 1 ? Download(rows[0].get(), kConvState)
                                            : std::vector<float>{};
       Upload(&d_conv_state, conv_state);
