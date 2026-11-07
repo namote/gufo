@@ -728,10 +728,11 @@ void DownFixtures(int bits, bool half = false) {
                          widened.begin() + r * n),
               "widened fallback changed bits");
   }
-  // Exercise every live count in the specialized R3/R4 bodies, including
-  // negative-exponent FP32 fallback rows. R8 above remains an unchanged
-  // arithmetic control; unused slots are poisoned and output has guards.
-  for (unsigned cap : {3U, 4U}) {
+  // Exercise every live count in the specialized R3/R4/R8 bodies, including
+  // negative-exponent FP32 fallback rows, against the eight-row tiles above
+  // (themselves a live-row body since R5-R8 tiles specialize too); unused
+  // slots are poisoned and output has guards.
+  for (unsigned cap : {3U, 4U, 8U}) {
     for (unsigned live = 1; live <= cap; ++live) {
       std::vector<gpu::Exl3RouteTile> tiles;
       for (unsigned first = 0; first < rows; first += live) {
@@ -755,7 +756,7 @@ void DownFixtures(int bits, bool half = false) {
               "live-row down output guard");
       Require(std::memcmp(result.data() + 1, actual.data(),
                           actual.size() * sizeof(float)) == 0,
-              "live-row down differs from generic R8");
+              "live-row down differs from eight-row tiles");
     }
   }
 }
@@ -1516,6 +1517,24 @@ void ExpertInvariance(bool prefill, gpu::Exl3BucketGemm gemm, int bits,
                 k, ff, used);
         std::reverse(order.begin(), order.end());
       }
+    // Every row on the same experts: tile counts equal the width, so each
+    // live-row body (1..8) is compared on all tokens.
+    if (!prefill) {
+      std::vector<std::int32_t> same(ids.size());
+      for (unsigned r = 0; r < rows; ++r)
+        for (unsigned j = 0; j < used; ++j)
+          same[r * used + j] = static_cast<std::int32_t>(j);
+      const auto alone = RunExperts(layer, input, same, order, 1, scale,
+                                    prefill, 16, gemm, false);
+      for (unsigned width = 2; width <= 9; ++width) {
+        std::cout << "CASE routed shared-expert invariance scale=" << scale
+                  << " width=" << width << '\n';
+        SameRun(alone,
+                RunExperts(layer, input, same, order, width, scale, prefill, 16,
+                           gemm, false),
+                k, ff, used);
+      }
+    }
     // Keep token zero's input and IDs fixed while changing its position and
     // the other tokens' route overlap, including single-expert row tiles.
     for (bool shared : {false, true}) {

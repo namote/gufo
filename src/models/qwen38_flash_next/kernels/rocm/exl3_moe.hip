@@ -224,7 +224,7 @@ __device__ __forceinline__ void RoutedGemvBody(
 // Select the live-row loop once per expert tile, avoiding absent-row checks
 // in every K step. Rate-specific decoding stays in the body; only the row
 // loop is specialized, independently of the bit rate.
-// Keep generic dispatch for other shapes and unscaled full-precision down.
+// The generic body remains for MaxRows 1/2 and unscaled full-precision down.
 template<int Bits, bool FullPrecision, unsigned MaxRows = 8,
          bool Scaled = false>
 __global__ void RoutedGemv(const ex::DeviceLinear* gate,
@@ -240,7 +240,7 @@ __global__ void RoutedGemv(const ex::DeviceLinear* gate,
                 (MaxRows == 3 || MaxRows == 4 || MaxRows == 8)) {
     // Each live-row body runs exactly the generic body's arithmetic for the
     // tile's rows; R5-R8 verify tiles (MaxRows 8) mostly hold 1-2 rows.
-    const auto exact = [&]<unsigned Rows>() {
+    const auto exact = [&]<unsigned Rows>() __attribute__((always_inline)) {
       RoutedGemvBody<Bits, FullPrecision, Rows, Scaled, true>(
           gate, up, tiles, count, input, gate_y, up_y, k, n, assignments,
           exponents);
