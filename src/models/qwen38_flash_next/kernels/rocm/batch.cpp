@@ -903,8 +903,9 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     if (!item.session->Cancelled())
       item.session->PreserveSnapshots(item.session->position_,
                                       item.session->mtp_.position);
-    if (item.speculative &&
-        !EnsureRollback(*item.session, item.tokens.size() - 1, error))
+    if (!CommitPendingSpeculation(*item.session, error) ||
+        (item.speculative &&
+         !EnsureRollback(*item.session, item.tokens.size() - 1, error)))
       return false;
     if (item.session->kvarn_ && !item.session->Cancelled() &&
         !PlanKvarn(*item.session, item.session->position_,
@@ -944,8 +945,6 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
   for (std::size_t i = 0; i < items.size(); ++i) {
     const auto& item = items[i];
     auto& session = *item.session;
-    if (!CommitPendingSpeculation(session, error))
-      return false;
     ++session.mutation_epoch_;
     session.spec_base_ = session.position_;
     session.spec_tokens_ = item.speculative ? item.tokens.size() : 0;

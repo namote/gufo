@@ -2342,10 +2342,6 @@ __launch_bounds__(kGdnWaves * 32) __global__
 constexpr unsigned kGdnLanes = 4;
 constexpr unsigned kGdnRowsPerBlock = 32;
 
-// The original vector kernel rounds error*key and then beta*correction for
-// the last element of each lane, fusing the state decay into that result.
-// HIP's FP intrinsics alone still permit reassociation of this three-product
-// expression under fast-math. Keep its actual instruction sequence explicit.
 /// Record t of an n-token deferred speculative batch (GdnRollbackRowFloats).
 __device__ __forceinline__ float* GdnRecord(const RollbackRows& rows,
                                             std::uint32_t t, std::uint32_t n,
@@ -2356,6 +2352,10 @@ __device__ __forceinline__ float* GdnRecord(const RollbackRows& rows,
              : rows.rows[t];
 }
 
+// The original vector kernel rounds error*key and then beta*correction for
+// the last element of each lane, fusing the state decay into that result.
+// HIP's FP intrinsics alone still permit reassociation of this three-product
+// expression under fast-math. Keep its actual instruction sequence explicit.
 __device__ __forceinline__ float GdnLastUpdate(float state, float decay,
                                                float error, float key,
                                                float beta) {

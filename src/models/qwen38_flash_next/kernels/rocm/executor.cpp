@@ -4742,6 +4742,10 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
                 "MTP must consume the preceding frontier before prefill");
     return false;
   }
+  // A pending batch nobody rolled back is kept whole before anything
+  // reuses its records or rollback rows.
+  if (!CommitPendingSpeculation(session, error_msg))
+    return false;
   if (speculative && !EnsureRollback(session, n - 1, error_msg))
     return false;
   // Failed eager/captured work can still be reading pinned inputs. Drain it
@@ -4785,8 +4789,6 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     session.ngram_ = ngram;
     throw;
   }
-  if (!CommitPendingSpeculation(session, error_msg))
-    return false;
   ++session.mutation_epoch_;
   session.spec_base_ = start_pos;
   session.spec_tokens_ = speculative ? n : 0;
@@ -5102,6 +5104,10 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
         std::min(session.blocks_, end / c.compress_ratio), session.blocks_);
   }
   session.spec_tokens_ = 0;
+  // The batch left each recurrent state at its value before the batch:
+  // commit the kept prefix, accepted in full or not.
+  if (!CommitGdnStates(session, keep, n, error_msg))
+    return false;
   if (logits != nullptr &&
       !Check(hipMemcpyAsync(
                  logits_host_,
@@ -5111,12 +5117,11 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
              "frontier download", error_msg)) {
     return false;
   }
-  // The batch left each recurrent state at its value before the batch:
-  // commit the kept prefix, accepted in full or not.
-  if (!CommitGdnStates(session, keep, n, error_msg))
-    return false;
+  // Snapshot and continuation captures copy the states on other streams:
+  // settle the commit first.
   if (keep == n && logits == nullptr) {
-    return true;
+    return n <= 1 ||
+           Check(hipStreamSynchronize(stream_), "rollback commit", error_msg);
   }
   if (keep < n) {
     const std::size_t conv_elems =

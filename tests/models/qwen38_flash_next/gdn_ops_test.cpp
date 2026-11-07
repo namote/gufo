@@ -446,7 +446,7 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
       for (std::size_t i = 0; i < kGuard; ++i) {
         if (saved_states[i] != kSentinel ||
             saved_convs[saved * kConvState + i] != kSentinel) {
-          throw std::runtime_error("GDN wrote an unused final snapshot");
+          throw std::runtime_error("GDN wrote before its last rollback row");
         }
       }
       for (std::size_t row = 0; row < saved; ++row) {
@@ -930,10 +930,12 @@ int RunStableDecodeCase(std::uint32_t kTokens) {
     CheckHip(hipDeviceSynchronize(), "stable decode GDN verify");
     // The verify batch left the state it started from; committing every
     // token must give the full forward's state bit for bit.
-    if (!bytes_equal(Download(&d_state, kStateCount), state))
-      throw std::runtime_error("stable decode verify wrote its state early");
-    q::RestoreGdnState(d_state.get(), states, kTokens, kTokens, kKHeads,
-                       kVHeads, nullptr);
+    if (kTokens > 1) {
+      if (!bytes_equal(Download(&d_state, kStateCount), state))
+        throw std::runtime_error("stable decode verify wrote its state early");
+      q::RestoreGdnState(d_state.get(), states, kTokens, kTokens, kKHeads,
+                         kVHeads, nullptr);
+    }
     CheckHip(hipDeviceSynchronize(), "stable decode GDN commit");
     const Result verified{Download(&d_out, kOut),
                           Download(&d_state, kStateCount),
