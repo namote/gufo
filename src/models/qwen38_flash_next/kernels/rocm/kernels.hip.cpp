@@ -417,9 +417,10 @@ __global__ void HcMixEpilogueKernel(const float* xn, const float* gate,
     if (w < 2 * slabs.count) {
       const std::uint32_t l = threadIdx.x % warpSize;
       const std::uint32_t local = (w % 2) * hip::exl3::kSegment + 4 * l;
-      float v[4] = {row[local], row[local + 1], row[local + 2], row[local + 3]};
+      float seg[4] = {row[local], row[local + 1], row[local + 2],
+                      row[local + 3]};
       const SlabTarget target = SlabOf(slabs, w / 2);
-      hip::exl3::RotateInputSegment(v, l, blockIdx.y * kThreads + local,
+      hip::exl3::RotateInputSegment(seg, l, blockIdx.y * kThreads + local,
                                     target.suh, target.out, t, slabs.pass_rows);
     }
   }

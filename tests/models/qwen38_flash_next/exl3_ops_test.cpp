@@ -2374,9 +2374,13 @@ void ProducerRotation() {
                     scratch.rotated_input_elements * 2));
     return s;
   };
+  // Pre-rotated launches get NaN rows in place of x: they must not read it.
+  auto* nan_x = buffers.Make<float>(std::size_t{8} * width);
+  Check(hipMemset(nan_x, 0xFF, std::size_t{8} * width * sizeof(float)));
   const auto project = [&](const float* x, unsigned rows, bool rotated) {
     auto* y = buffers.Make<float>(std::size_t{rows} * hidden);
-    gpu::Exl3Projection(out.weight, x, y, rows, scratch, nullptr, true,
+    gpu::Exl3Projection(out.weight, rotated ? nan_x : x, y, rows, scratch,
+                        nullptr, true,
                         rotated ? scratch.rotated_input : nullptr);
     return download(y, std::size_t{rows} * hidden);
   };
@@ -2403,8 +2407,9 @@ void ProducerRotation() {
             {{q.weight.exl3, y[0], 512},
              {key.weight.exl3, y[1], 256},
              {value.weight.exl3, y[2], 256}}};
-        fast::LaunchExl3FastProjections(targets, x, hidden, rows,
-                                        rotated ? pre : ws, nullptr, rotated);
+        fast::LaunchExl3FastProjections(targets, rotated ? nan_x : x, hidden,
+                                        rows, rotated ? pre : ws, nullptr,
+                                        rotated);
         std::vector<float> all = download(y[0], rows * 512);
         for (int i = 1; i < 3; ++i) {
           const auto part = download(y[i], rows * 256);
@@ -2421,20 +2426,26 @@ void ProducerRotation() {
                                   buffers.Make<float>(8 * 640),
                                   y,
                                   hidden};
-        fast::LaunchExl3FastMlp(m, x, hidden, rows, rotated ? pre : ws, nullptr,
-                                rotated);
+        fast::LaunchExl3FastMlp(m, rotated ? nan_x : x, hidden, rows,
+                                rotated ? pre : ws, nullptr, rotated);
         return download(y, rows * hidden);
       };
-      gpu::HcMixEpilogue(xn, dg, nullptr, mixed[0], nullptr, rows, hidden,
+      // The production decode epilogue fuses the inject partials too.
+      const auto* inject_w = buffers.Copy(Input(streams * streams * hidden));
+      const std::size_t parts = gpu::HcInjectParts(hidden);
+      float* inject[3];
+      for (auto& partials : inject)
+        partials = buffers.Make<float>(rows * streams * parts);
+      gpu::HcMixEpilogue(xn, dg, inject_w, mixed[0], inject[0], rows, hidden,
                          streams, nullptr, q8[0]);
       const auto group_ref = group(mixed[0], false);
       const auto mlp_ref = mlp(mixed[0], false);
-      Require(gpu::HcMixEpilogue(xn, dg, nullptr, mixed[1], nullptr, rows,
+      Require(gpu::HcMixEpilogue(xn, dg, inject_w, mixed[1], inject[1], rows,
                                  hidden, streams, nullptr, q8[1],
                                  slabs({&q, &key, &value}, rows)),
               "HC mix epilogue rotates for q/k/v");
       SameBits(group_ref, group(mixed[1], true), "q/k/v from HC mix slabs");
-      Require(gpu::HcMixEpilogue(xn, dg, nullptr, mixed[2], nullptr, rows,
+      Require(gpu::HcMixEpilogue(xn, dg, inject_w, mixed[2], inject[2], rows,
                                  hidden, streams, nullptr, q8[2],
                                  slabs({&gate, &up}, rows)),
               "HC mix epilogue rotates for the shared MLP");
@@ -2442,6 +2453,9 @@ void ProducerRotation() {
       for (int i = 1; i < 3; ++i) {
         SameBits(download(mixed[0], rows * hidden),
                  download(mixed[i], rows * hidden), "HC mixed rows");
+        SameBits(download(inject[0], rows * streams * parts),
+                 download(inject[i], rows * streams * parts),
+                 "HC inject partials");
         Require(download(q8[0], q8_bytes) == download(q8[i], q8_bytes),
                 "HC mixed Q8_1 rows differ");
       }

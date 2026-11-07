@@ -21,6 +21,8 @@ using exl3::kHadamardScale;
 
 constexpr unsigned kRotateWaves = 8;
 constexpr unsigned kMaxSlots = kExl3FastMaxGroup;
+// A pre-rotated input is one pass (LaunchExl3FastProjections).
+static_assert(kExl3FastRotatedRows == exl3::kMaxRows);
 
 // DPP quad_perm move: 0xB1 = [1,0,3,2] (lane ^ 1), 0x4E = [2,3,0,1]
 // (lane ^ 2). Full-rate VALU instead of ds_bpermute, the same additions as a

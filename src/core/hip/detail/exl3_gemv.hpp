@@ -244,6 +244,9 @@ __device__ __forceinline__ void RotateInputSegment(float (&v)[4], unsigned lane,
                                                    unsigned m) {
 #pragma unroll
   for (int j = 0; j < 4; ++j) {
+    // The producer's value as stored: its own products must not fuse with
+    // the suh product (fast-math producer TUs).
+    asm volatile("" : "+v"(v[j]));
     v[j] = v[j] * static_cast<float>(suh[first + j]);
     asm volatile("" : "+v"(v[j]));
   }
