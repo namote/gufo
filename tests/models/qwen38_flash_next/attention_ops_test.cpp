@@ -1117,6 +1117,37 @@ void CheckPagedRows(std::uint32_t n_tokens, std::uint32_t start_pos,
       q::UnpackQGate(d_packed.get(), stride, qa.get(), ga.get(),
                      separated_k.get(), separated_v.get(), n_tokens, kHeads,
                      kDim, kKvWidth, nullptr);
+      // Split K/V sources (the EXL3 decode route): the packed row's
+      // [q|gate] plus separate K/V rows give the packed call's bytes.
+      if (!prefill) {
+        HipBuffer<float> qs(q_count), gs(q_count);
+        HipBuffer<__half> sk(paged_count), sv(paged_count);
+        CheckHip(
+            hipMemcpy(sk.get(), pk.get(), sk.bytes(), hipMemcpyDeviceToDevice),
+            "copy paged K");
+        CheckHip(
+            hipMemcpy(sv.get(), pv.get(), sv.bytes(), hipMemcpyDeviceToDevice),
+            "copy paged V");
+        if (!q::PrepareAttention(
+                d_packed.get(), stride, d_gamma.get(), d_gamma.get() + kDim,
+                qs.get(), gs.get(), sk.get(), sv.get(), n_tokens, kHeads,
+                kKvHeads, kDim, 64, d_pos.get(), 1e7F, 1e-6F, nullptr, nullptr,
+                false, {}, table, separated_k.get(), separated_v.get()))
+          throw std::runtime_error("split preparation rejected its geometry");
+        CheckHip(hipDeviceSynchronize(), "split prepared queries");
+        RequireSame(Download(&qb, q_count).data(),
+                    Download(&qs, q_count).data(), q_count * sizeof(float),
+                    "split prepared queries");
+        RequireSame(Download(&gb, q_count).data(),
+                    Download(&gs, q_count).data(), q_count * sizeof(float),
+                    "split prepared gates");
+        RequireSame(DownloadAs(&pk, paged_count).data(),
+                    DownloadAs(&sk, paged_count).data(),
+                    paged_count * sizeof(__half), "split prepared K cache");
+        RequireSame(DownloadAs(&pv, paged_count).data(),
+                    DownloadAs(&sv, paged_count).data(),
+                    paged_count * sizeof(__half), "split prepared V cache");
+      }
       // Only query/gate scratch was reused above; the cache-only writer
       // receives independent K/V allocations and a permuted page table.
       q::PrepareAttentionKv(

@@ -2908,7 +2908,8 @@ __global__ void PrepareAttentionKernel(
     std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t d,
     std::uint32_t rotary, const std::uint32_t* start_pos, float theta,
     float eps, const qwen::vision::DeviceRope* rope,
-    [[maybe_unused]] YarnRope yarn, const std::uint32_t* kv_blocks) {
+    [[maybe_unused]] YarnRope yarn, const std::uint32_t* kv_blocks,
+    const float* __restrict__ k_src, const float* __restrict__ v_src) {
   __shared__ float partial[kHeadsPerBlock][8];
   __shared__ float norm[kHeadsPerBlock][256];
   const std::uint32_t t = blockIdx.x, first = blockIdx.y * kHeadsPerBlock,
@@ -2925,9 +2926,13 @@ __global__ void PrepareAttentionKernel(
     const std::uint32_t h = first + j;
     const bool query = h < heads;
     const std::uint32_t head = query ? h : h - heads;
-    values[j] = j < live && tid < d
-                    ? row[(query ? head * 2 * d : 2 * width + head * d) + tid]
-                    : 0.0f;
+    // Split projections (k_src/v_src: [t][kv_heads * d] rows) carry k and
+    // v outside the packed [q|gate] row.
+    const float* src = query ? row + head * 2 * d
+                       : k_src != nullptr
+                           ? k_src + std::size_t(t) * kv_width + head * d
+                           : row + 2 * width + head * d;
+    values[j] = j < live && tid < d ? src[tid] : 0.0f;
     float ss = values[j] * values[j];
     // Match the separate RMS kernel's rounded square before its reduction.
     // Otherwise fast-math can contract it with the first shuffle addition.
@@ -2955,8 +2960,9 @@ __global__ void PrepareAttentionKernel(
         gate[std::size_t(t) * width + head * d + tid] =
             row[head * 2 * d + d + tid];
       else
-        v_cache[kv_row * kv_width + head * d + tid] =
-            __float2half(row[2 * width + kv_width + head * d + tid]);
+        v_cache[kv_row * kv_width + head * d + tid] = __float2half(
+            v_src != nullptr ? v_src[std::size_t(t) * kv_width + head * d + tid]
+                             : row[2 * width + kv_width + head * d + tid]);
     }
   }
   __syncthreads();
@@ -9279,43 +9285,47 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
                       std::uint32_t rotary_dim, const std::uint32_t* start_pos,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope, bool prefill,
-                      const YarnRope& yarn, const std::uint32_t* kv_blocks) {
+                      const YarnRope& yarn, const std::uint32_t* kv_blocks,
+                      const float* k_src, const float* v_src) {
+  const bool split = k_src != nullptr || v_src != nullptr;
   if (d == 0 || d > 256 || rotary_dim == 0 || rotary_dim > d ||
       rotary_dim % 2 != 0 || kv_heads == 0 ||
-      stride < static_cast<std::size_t>(2) * (heads + kv_heads) * d) {
+      (split && (k_src == nullptr || v_src == nullptr)) ||
+      stride <
+          static_cast<std::size_t>(2) * (heads + (split ? 0 : kv_heads)) * d) {
     return false;
   }
   if (n_tokens == 0)
     return true;
   if (yarn.enabled != 0) {
     if (!prefill && n_tokens < 32) {
-      hipLaunchKernelGGL((PrepareAttentionKernel<1, true>),
-                         dim3(n_tokens, heads + kv_heads), dim3(kThreads), 0,
-                         stream, packed, stride, q_gamma, k_gamma, q, gate,
-                         k_cache, v_cache, heads, kv_heads, d, rotary_dim,
-                         start_pos, theta, eps, rope, yarn, kv_blocks);
+      hipLaunchKernelGGL(
+          (PrepareAttentionKernel<1, true>), dim3(n_tokens, heads + kv_heads),
+          dim3(kThreads), 0, stream, packed, stride, q_gamma, k_gamma, q, gate,
+          k_cache, v_cache, heads, kv_heads, d, rotary_dim, start_pos, theta,
+          eps, rope, yarn, kv_blocks, k_src, v_src);
     } else {
       hipLaunchKernelGGL((PrepareAttentionKernel<4, true>),
                          dim3(n_tokens, (heads + kv_heads + 3) / 4),
                          dim3(kThreads), 0, stream, packed, stride, q_gamma,
                          k_gamma, q, gate, k_cache, v_cache, heads, kv_heads, d,
                          rotary_dim, start_pos, theta, eps, rope, yarn,
-                         kv_blocks);
+                         kv_blocks, k_src, v_src);
     }
   } else {
     if (!prefill && n_tokens < 32) {
-      hipLaunchKernelGGL((PrepareAttentionKernel<1, false>),
-                         dim3(n_tokens, heads + kv_heads), dim3(kThreads), 0,
-                         stream, packed, stride, q_gamma, k_gamma, q, gate,
-                         k_cache, v_cache, heads, kv_heads, d, rotary_dim,
-                         start_pos, theta, eps, rope, yarn, kv_blocks);
+      hipLaunchKernelGGL(
+          (PrepareAttentionKernel<1, false>), dim3(n_tokens, heads + kv_heads),
+          dim3(kThreads), 0, stream, packed, stride, q_gamma, k_gamma, q, gate,
+          k_cache, v_cache, heads, kv_heads, d, rotary_dim, start_pos, theta,
+          eps, rope, yarn, kv_blocks, k_src, v_src);
     } else {
       hipLaunchKernelGGL((PrepareAttentionKernel<4, false>),
                          dim3(n_tokens, (heads + kv_heads + 3) / 4),
                          dim3(kThreads), 0, stream, packed, stride, q_gamma,
                          k_gamma, q, gate, k_cache, v_cache, heads, kv_heads, d,
                          rotary_dim, start_pos, theta, eps, rope, yarn,
-                         kv_blocks);
+                         kv_blocks, k_src, v_src);
     }
   }
   return true;

@@ -3815,9 +3815,20 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                      kvarn_rows ? nullptr : s_.attn_gate, n_tokens, c.num_heads,
                      c.head_dim, c.rotary_dim, pos, c.rope_theta, c.rms_eps,
                      kvarn_rows, stream_, s.rope, yarn_);
+    // Decode/verify: one launch unpacks the query, normalizes and rotates
+    // q/k and writes both caches from the split K/V rows (the stacked
+    // route's PrepareAttention; RoPE with its explicit FMAs).
     if (query_rows) {
       attn_q_rotated_ = kvarn_rows;
       attn_gate_stride_ = kvarn_rows ? 2 * c.AttentionQDim() : 0;
+    } else if (!prefill_phase && model_->output().exl3 != nullptr &&
+               PrepareAttention(
+                   s_.qg, 2 * c.AttentionQDim(), l.attn_q_norm.f32(),
+                   l.attn_k_norm.f32(), s_.q, s_.attn_gate, write_k, write_v,
+                   n_tokens, c.num_heads, c.num_kv_heads, c.head_dim,
+                   c.rotary_dim, pos, c.rope_theta, c.rms_eps, stream_, s.rope,
+                   false, yarn_, write_rows, s_.k, s_.v)) {
+      prepared = true;
     } else {
       UnpackQGate(s_.qg, 2 * c.AttentionQDim(), s_.q, s_.attn_gate, nullptr,
                   nullptr, n_tokens, c.num_heads, c.head_dim, 0, stream_);

@@ -690,16 +690,17 @@ void UnpackQGate(const float* qg, std::uint32_t qg_stride, float* q,
 /// and writes the F16 caches. Returns false for heads wider than 256.
 /// With zero query heads, packed contains only K/V and q/gate may be null.
 /// With yarn enabled, applies static YaRN (see rope_scaling.hpp).
-bool PrepareAttention(const float* packed, std::uint32_t stride,
-                      const float* q_gamma, const float* k_gamma, float* q,
-                      float* gate, __half* k_cache, __half* v_cache,
-                      std::uint32_t n_tokens, std::uint32_t heads,
-                      std::uint32_t kv_heads, std::uint32_t d,
-                      std::uint32_t rotary_dim, const std::uint32_t* start_pos,
-                      float theta, float eps, hipStream_t stream,
-                      const qwen::vision::DeviceRope* rope = nullptr,
-                      bool prefill = false, const YarnRope& yarn = {},
-                      const std::uint32_t* kv_blocks = nullptr);
+/// Non-null `k_src` and `v_src` ([t][kv_heads * d] rows, both or neither)
+/// supply K/V from split projections; packed then holds only [q|gate].
+bool PrepareAttention(
+    const float* packed, std::uint32_t stride, const float* q_gamma,
+    const float* k_gamma, float* q, float* gate, __half* k_cache,
+    __half* v_cache, std::uint32_t n_tokens, std::uint32_t heads,
+    std::uint32_t kv_heads, std::uint32_t d, std::uint32_t rotary_dim,
+    const std::uint32_t* start_pos, float theta, float eps, hipStream_t stream,
+    const qwen::vision::DeviceRope* rope = nullptr, bool prefill = false,
+    const YarnRope& yarn = {}, const std::uint32_t* kv_blocks = nullptr,
+    const float* k_src = nullptr, const float* v_src = nullptr);
 
 /// Separate K/V catch-up, with exactly the unfused attention path's F32
 /// normalization and RoPE boundaries. K is normalized/rotated in place;
