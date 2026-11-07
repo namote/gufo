@@ -46,6 +46,15 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen38_flash_next_rq_logits PRIVATE
     gufo_qwen38_flash_next hip::host)
 
+  # Decode HC projection timing (tools/bench), on the production kernels.
+  add_executable(qwen38_flash_next_hc_decode_bench EXCLUDE_FROM_ALL
+    ${PROJECT_SOURCE_DIR}/tools/bench/flash_next_hc_decode.hip)
+  set_source_files_properties(
+    ${PROJECT_SOURCE_DIR}/tools/bench/flash_next_hc_decode.hip
+    PROPERTIES LANGUAGE HIP)
+  target_link_libraries(qwen38_flash_next_hc_decode_bench PRIVATE
+    gufo_qwen38_flash_next)
+
   add_qwen38_flash_next_test(exl3_ops gufo_qwen38_flash_next_reference "hip;gpu;gfx1151;exl3")
   set_source_files_properties(exl3_ops_test.cpp PROPERTIES LANGUAGE HIP)
   add_qwen38_flash_next_test(exl3_moe_kernel gufo_qwen38_flash_next "hip;gpu;gfx1151;exl3")

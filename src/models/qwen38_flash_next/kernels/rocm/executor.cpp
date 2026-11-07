@@ -1256,6 +1256,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   }
   if (!Check(PrepareW8A8GemmWave64(), "wide Q8 GEMM preparation", error_msg))
     return nullptr;
+  if (!Check(PrepareHcDecodeKernels(), "HC decode kernel preparation",
+             error_msg))
+    return nullptr;
   // The first greedy verification otherwise resolves the shared argmax
   // module on the decode path. Preparation launches no trial kernels.
   if (e->has_mtp() && !Check(gufo::hip::PrepareBatchedGPUArgmax(),
@@ -3180,6 +3183,14 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   const bool q8_decode_down = !q8_down && model_->output().exl3 != nullptr &&
                               !xn_half_ && !MatrixRows(n_tokens) &&
                               !m.down_q8.empty();
+  // EXL3 decode/verify: each down block finishes its own Q8_1 group of lo
+  // (SiLU, scale, quantize) for the Q8_0 up projection: one launch fewer,
+  // the same arithmetic, no block waiting for another.
+  const bool q8_decode_silu =
+      q8_decode_down && n_tokens <= kHcDecodeMaxRows && c.hc_count == 4 &&
+      c.hc_low_rank == 320 && m.down_q8.type == GgmlType::kQ8_0 &&
+      m.down_q8.rows == 320 && m.down_q8.cols == 10240 &&
+      m.up.type == GgmlType::kQ8_0 && m.up.cols == c.hc_low_rank;
   const bool fused_down =
       !q8_down && !q8_decode_down && model_->output().exl3 != nullptr &&
       !xn_half_ && !MatrixRows(n_tokens) && m.down.type == GgmlType::kF16 &&
@@ -3208,6 +3219,20 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
         AssignError(error_msg, "W8A8 mixer down projection failed");
         return false;
       }
+    } else if (q8_decode_silu) {
+      Q8Input q;
+      if (!Quantize(s_.xn, n_tokens, m.down_q8.cols, &q, error_msg, true))
+        return false;
+      if (!HcDownSiluQ8_1(
+              m.down_q8.data, q.data, s_.lo,
+              1.0F / static_cast<float>(c.hc_count), n_tokens,
+              static_cast<std::uint32_t>(
+                  qfn_mmq_q8_1_bytes(1, static_cast<int>(c.hc_low_rank)) / 36 *
+                  32),
+              s_.lo_q8_1, stream_)) {
+        AssignError(error_msg, "fused HC down projection failed");
+        return false;
+      }
     } else if (q8_decode_down) {
       if (!Dense(m.down_q8, s_.xn, s_.lo, n_tokens, error_msg))
         return false;
@@ -3219,10 +3244,11 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
     const float scale = 1.0F / static_cast<float>(c.hc_count);
     const std::uint32_t lo_q8_cols = static_cast<std::uint32_t>(
         qfn_mmq_q8_1_bytes(1, static_cast<int>(c.hc_low_rank)) / 36 * 32);
-    if (!MatrixRows(n_tokens) && m.up.type == GgmlType::kQ8_0 &&
-        m.up.cols == c.hc_low_rank &&
-        SiluScaleQ8_1(s_.lo, scale, n_tokens, c.hc_low_rank, lo_q8_cols,
-                      s_.lo_q8_1, stream_)) {
+    if (q8_decode_silu ||
+        (!MatrixRows(n_tokens) && m.up.type == GgmlType::kQ8_0 &&
+         m.up.cols == c.hc_low_rank &&
+         SiluScaleQ8_1(s_.lo, scale, n_tokens, c.hc_low_rank, lo_q8_cols,
+                       s_.lo_q8_1, stream_))) {
       const Q8Input lo{s_.lo, s_.lo_q8_1, n_tokens, c.hc_low_rank};
       if (!Dense(m.up, lo, s_.hc_gate, error_msg)) {
         return false;

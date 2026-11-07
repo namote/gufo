@@ -218,6 +218,9 @@ std::vector<T> DownloadRaw(const T* source, std::size_t count) {
 // HcMixEpilogue) is split-invariant: row 0's lo, lo Q8_1, gate, mixed, mixed
 // Q8_1 and inject partials are byte-identical for every decode width 1..8,
 // with and without inject partials and for zero, two and three rotation slabs.
+// The fused decode down projection (HcDownSiluQ8_1, SiLU/Q8_1 in each
+// block) gives the separate down GEMV + SiluScaleQ8_1's lo and lo Q8_1 bytes
+// for every row of every width.
 void CheckDecodeHcSplitInvariance(bool with_inject, std::uint32_t slab_count) {
   constexpr std::uint32_t kRank = 320;
   constexpr std::uint32_t kHcDim = kHidden * kStreams;
@@ -268,6 +271,8 @@ void CheckDecodeHcSplitInvariance(bool with_inject, std::uint32_t slab_count) {
   HipBuffer<float> mixed(std::size_t{kRows} * kHidden);
   HipBuffer<float> inject(std::size_t{kRows} * kStreams * parts);
   HipBuffer<std::uint8_t> lo_q8(lo_bytes);
+  HipBuffer<float> fused_lo(std::size_t{kRows} * kRank);
+  HipBuffer<std::uint8_t> fused_lo_q8(lo_bytes);
   HipBuffer<std::uint8_t> mixed_q8(mixed_bytes);
   HipBuffer<std::uint16_t> slabs(slab);
   CheckHip(hipMemset(lo_q8.get(), 0, lo_bytes), "memset");
@@ -302,6 +307,8 @@ void CheckDecodeHcSplitInvariance(bool with_inject, std::uint32_t slab_count) {
     CheckHip(hipMemset(mixed.get(), 0xFF, mixed.bytes()), "memset");
     CheckHip(hipMemset(inject.get(), 0xFF, inject.bytes()), "memset");
     CheckHip(hipMemset(lo_q8.get(), 0xFF, lo_bytes), "memset");
+    CheckHip(hipMemset(fused_lo.get(), 0xFF, fused_lo.bytes()), "memset");
+    CheckHip(hipMemset(fused_lo_q8.get(), 0xFF, lo_bytes), "memset");
     CheckHip(hipMemset(mixed_q8.get(), 0xFF, mixed_bytes), "memset");
     q::Exl3InputSlabs s{};
     s.suh[0] = static_cast<const std::uint16_t*>(d_suh);
@@ -323,6 +330,9 @@ void CheckDecodeHcSplitInvariance(bool with_inject, std::uint32_t slab_count) {
     const bool rotated = q::HcMixEpilogue(
         d_xn.get(), gate.get(), inject_w_ptr, mixed.get(), inject.get(), rows,
         kHidden, kStreams, nullptr, mixed_q8.get(), s);
+    if (!q::HcDownSiluQ8_1(d_down, d_xq, fused_lo.get(), scale, rows, lo_cols,
+                           fused_lo_q8.get(), nullptr))
+      throw std::runtime_error("fused HC down rejected");
     CheckHip(hipGetLastError(), "decode HC launch");
     CheckHip(hipDeviceSynchronize(), "decode HC");
     Row0 row0{DownloadRaw(lo.get(), kRank),
@@ -334,10 +344,17 @@ void CheckDecodeHcSplitInvariance(bool with_inject, std::uint32_t slab_count) {
               DownloadRaw(mixed_q8.get(), mixed_row_bytes)};
     if (rows == 1)
       first = row0;
-    if (rotated != (slab_count != 0) || !bits(first, row0)) {
+    const auto lo_a = DownloadRaw(lo.get(), rows * kRank);
+    const auto lo_b = DownloadRaw(fused_lo.get(), rows * kRank);
+    const bool fused_ok =
+        std::memcmp(lo_a.data(), lo_b.data(), lo_a.size() * sizeof(float)) ==
+            0 &&
+        DownloadRaw(lo_q8.get(), rows * lo_row_bytes) ==
+            DownloadRaw(fused_lo_q8.get(), rows * lo_row_bytes);
+    if (rotated != (slab_count != 0) || !bits(first, row0) || !fused_ok) {
       std::cerr << "decode HC inject " << with_inject << " slabs " << slab_count
-                << " rows " << rows << ": rotated " << rotated
-                << " row 0 differs from the one-row launch\n";
+                << " rows " << rows << ": rotated " << rotated << " fused down "
+                << fused_ok << " (or row 0 differs from the one-row launch)\n";
       ok = false;
     }
   }
@@ -348,7 +365,7 @@ void CheckDecodeHcSplitInvariance(bool with_inject, std::uint32_t slab_count) {
   if (!ok)
     throw std::runtime_error("decode HC row 0 depends on the launch width");
   std::cout << "decode HC (inject " << with_inject << ", slabs " << slab_count
-            << "): row 0 byte-identical for widths 1-8\n";
+            << "): row 0 byte-identical for widths 1-8, fused down equal\n";
 }
 
 int main() {

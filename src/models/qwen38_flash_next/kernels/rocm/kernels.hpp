@@ -359,6 +359,19 @@ void SiluScale(float* x, float scale, std::size_t count, hipStream_t stream);
 /// k_padded >= k are multiples of 32.
 bool SiluScaleQ8_1(float* x, float scale, std::uint32_t rows, std::uint32_t k,
                    std::uint32_t k_padded, void* x_q8, hipStream_t stream);
+/// Rows (decode/verify tokens) HcDownSiluQ8_1 takes.
+constexpr std::uint32_t kHcDecodeMaxRows = 8;
+/// The decode HC down projection (Q8_0 weights, 320 x 10240) of `rows`
+/// Q8_1 input rows into lo, then SiluScaleQ8_1(lo, scale, rows, 320,
+/// k_padded, lo_q8) in the same launch: each block owns one 32-row Q8_1
+/// group and finishes it in-block. Same arithmetic as
+/// qfn_mmq_q8_0_dense_vec_preq plus SiluScaleQ8_1. False on an unsupported
+/// call or a launch error.
+bool HcDownSiluQ8_1(const void* weights, const void* input, float* lo,
+                    float scale, std::uint32_t rows, std::uint32_t k_padded,
+                    void* lo_q8, hipStream_t stream);
+/// Resolves HcDownSiluQ8_1's kernels before serving, without launching.
+hipError_t PrepareHcDecodeKernels();
 /// gate[i] = silu(gate[i]) * up[i], in place in `gate`.
 void Swiglu(float* gate, const float* up, std::size_t count,
             hipStream_t stream);

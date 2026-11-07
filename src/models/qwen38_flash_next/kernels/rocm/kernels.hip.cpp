@@ -5715,6 +5715,96 @@ struct Q8_0Block {
   std::int8_t qs[32];
 };
 static_assert(sizeof(Q8_0Block) == 34, "block_q8_0 must be 34 bytes");
+
+/// mmq's get_int_b2: four bytes of a 2-byte aligned code array.
+__device__ __forceinline__ int Q8Int2(const std::int8_t* qs, int i32) {
+  const auto* x16 = reinterpret_cast<const std::uint16_t*>(qs);
+  return static_cast<int>(x16[2 * i32]) |
+         (static_cast<int>(x16[2 * i32 + 1]) << 16);
+}
+
+/// mmq's get_int_b4 on a Q8_1 block's 4-byte aligned codes.
+__device__ __forceinline__ int Q8Int4(const std::int8_t* qs, int i32) {
+  return reinterpret_cast<const int*>(qs)[i32];
+}
+
+__device__ __forceinline__ int Dp4a(int a, int b, int c) {
+  return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
+}
+
+/// Output rows of the decode HC down projection one HcDownSiluQ8Kernel
+/// block owns: one Q8_1 group of lo, a wave per row.
+constexpr unsigned kHcDownGroupRows = 32;
+
+/// The decode HC down projection (N = 320, K = 10240) with qfn_mmq's
+/// qfn_q8_hc_down_kernel arithmetic per row (two prefetched K iterations,
+/// the same per-lane order, rounded products and wave butterfly), one wave
+/// per row, and each block owning one 32-row Q8_1 group of lo: its waves
+/// leave their sums in LDS and wave t then applies SiluScaleQ8Kernel to the
+/// group for token t (lo = silu(lo * scale), quantized into Q8_1 rows of
+/// `k_padded`). No block waits for another.
+template<unsigned kTokens>
+__global__ __launch_bounds__(32 * kHcDownGroupRows) void HcDownSiluQ8Kernel(
+    const Q8_0Block* __restrict__ weights, const Q8_1Block* __restrict__ input,
+    float* lo, float scale, std::uint32_t k_padded, void* lo_q8) {
+  constexpr int kRows = 320;
+  constexpr int kBlocks = 10240 / 32;
+  constexpr int kPrefetch = 2;
+  const int lane = static_cast<int>(threadIdx.x % 32);
+  const unsigned wave = threadIdx.x / 32;
+  const unsigned row = blockIdx.x * kHcDownGroupRows + wave;
+  const int part = (lane & 3) * 2;
+  float sum[kTokens] = {};
+  for (int first = lane / 4; first < kBlocks; first += 8 * kPrefetch) {
+    int v[kPrefetch][2], u[kPrefetch][kTokens][2];
+    __half dw[kPrefetch], dx[kPrefetch][kTokens];
+#pragma unroll
+    for (int j = 0; j < kPrefetch; ++j) {
+      const int kb = first + 8 * j;
+      const Q8_0Block& w = weights[row * kBlocks + kb];
+      dw[j] = w.d;
+#pragma unroll
+      for (int i = 0; i < 2; ++i)
+        v[j][i] = Q8Int2(w.qs, part + i);
+#pragma unroll
+      for (unsigned t = 0; t < kTokens; ++t) {
+        const Q8_1Block& x = input[t * kBlocks + kb];
+        dx[j][t] = __low2half(x.ds);
+#pragma unroll
+        for (int i = 0; i < 2; ++i)
+          u[j][t][i] = Q8Int4(x.qs, part + i);
+      }
+    }
+    __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+    for (int j = 0; j < kPrefetch; ++j) {
+#pragma unroll
+      for (unsigned t = 0; t < kTokens; ++t) {
+        int dot = Dp4a(v[j][0], u[j][t][0], 0);
+        dot = Dp4a(v[j][1], u[j][t][1], dot);
+        // One rounding sequence for every width keeps a row's result
+        // independent of how many rows share the launch.
+        const float product =
+            __fmul_rn(__half2float(dw[j]), static_cast<float>(dot));
+        sum[t] = __fmaf_rn(__half2float(dx[j][t]), product, sum[t]);
+      }
+    }
+  }
+  __shared__ float group[kTokens][kHcDownGroupRows];
+#pragma unroll
+  for (unsigned t = 0; t < kTokens; ++t) {
+    const float total = WaveSum(sum[t]);
+    if (lane == 0)
+      group[t][wave] = total;
+  }
+  __syncthreads();
+  if (wave >= kTokens)
+    return;
+  const unsigned column = blockIdx.x * kHcDownGroupRows + lane;
+  const float v = SiluF(group[wave][lane] * scale);
+  lo[wave * kRows + column] = v;
+  QuantizeQ8_1Lane(v, lo_q8, std::size_t{wave} * k_padded + column);
+}
 /// W8A8TailKernel limits: tokens past the last full tile and K width.
 constexpr std::size_t kW8A8TailMaxTokens = 16;
 constexpr std::size_t kW8A8TailMaxK = 10240;
@@ -7216,6 +7306,55 @@ bool SiluScaleQ8_1(float* x, float scale, std::uint32_t rows, std::uint32_t k,
   hipLaunchKernelGGL(SiluScaleQ8Kernel, dim3(Blocks(count)), dim3(kThreads), 0,
                      stream, x, scale, count, k, k_padded, x_q8);
   return true;
+}
+
+namespace {
+
+template<unsigned kTokens = 1>
+void LaunchHcDownSiluQ8(const void* weights, const void* input, float* lo,
+                        float scale, std::uint32_t rows, std::uint32_t k_padded,
+                        void* lo_q8, hipStream_t stream) {
+  if (rows == kTokens) {
+    hipLaunchKernelGGL(
+        (HcDownSiluQ8Kernel<kTokens>), dim3(320 / kHcDownGroupRows),
+        dim3(32 * kHcDownGroupRows), 0, stream,
+        static_cast<const Q8_0Block*>(weights),
+        static_cast<const Q8_1Block*>(input), lo, scale, k_padded, lo_q8);
+  } else if constexpr (kTokens < kHcDecodeMaxRows) {
+    LaunchHcDownSiluQ8<kTokens + 1>(weights, input, lo, scale, rows, k_padded,
+                                    lo_q8, stream);
+  }
+}
+
+// Resolves every width's kernel without launching it (as qfn_mmq's
+// prepare_hc_down does): the first resolution otherwise idles the GPU
+// ~30 ms on the first decode step.
+template<unsigned kTokens = 1>
+hipError_t PrepareHcDownSiluQ8() {
+  hipFuncAttributes attributes{};
+  const hipError_t status = hipFuncGetAttributes(
+      &attributes, reinterpret_cast<const void*>(HcDownSiluQ8Kernel<kTokens>));
+  if constexpr (kTokens < kHcDecodeMaxRows) {
+    if (status == hipSuccess)
+      return PrepareHcDownSiluQ8<kTokens + 1>();
+  }
+  return status;
+}
+
+}  // namespace
+
+bool HcDownSiluQ8_1(const void* weights, const void* input, float* lo,
+                    float scale, std::uint32_t rows, std::uint32_t k_padded,
+                    void* lo_q8, hipStream_t stream) {
+  if (rows == 0 || rows > kHcDecodeMaxRows || k_padded < 320 ||
+      k_padded % 32 != 0)
+    return false;
+  LaunchHcDownSiluQ8(weights, input, lo, scale, rows, k_padded, lo_q8, stream);
+  return hipGetLastError() == hipSuccess;
+}
+
+hipError_t PrepareHcDecodeKernels() {
+  return PrepareHcDownSiluQ8();
 }
 
 void Swiglu(float* gate, const float* up, std::size_t count,
