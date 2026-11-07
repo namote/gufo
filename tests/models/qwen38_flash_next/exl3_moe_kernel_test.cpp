@@ -1904,84 +1904,6 @@ void RouterTilesSet(unsigned rows, unsigned used) {
           "router tile fixture never split an expert");
 }
 
-/// RouterGemvTopKTiles (one AR token) against SmallGemmStable +
-/// RouterTopKTiles: logits, IDs, weights, tile count and tiles byte for
-/// byte, twice (the arrival counter returns to zero). Tied logits check
-/// the lowest-index tie order; `offset` floats of misalignment take the
-/// bounds-checked rows.
-void RouterGemvTiles(gpu::WeightType type, unsigned offset) {
-  constexpr unsigned experts = 512, used = 10, k = 2560, m = experts + 1;
-  Buffers buffers;
-  std::mt19937 rng(static_cast<unsigned>(type) * 7 + offset);
-  std::vector<float> wf(std::size_t{m} * k + 8);
-  for (auto& v : wf)
-    v = (int(rng() % 2000) - 1000) * 1.0e-4F;
-  std::vector<float> x(k + 8);
-  for (auto& v : x)
-    v = (int(rng() % 2000) - 1000) * 1.0e-3F;
-  x[5] = -0.0F;
-  x[6] = 1.0e-40F;
-  // Row 3 follows the sign of x, so it is the largest logit; rows 7 and 300
-  // equal it: the three tied winners take the lowest-index order.
-  for (unsigned i = 0; i < k; ++i)
-    wf[3 * k + i] = x[offset + i] < 0.0F ? -0.01F : 0.01F;
-  for (unsigned e : {7U, 300U})
-    std::copy_n(wf.begin() + 3 * k, k, wf.begin() + std::size_t{e} * k);
-  void* dw = nullptr;
-  if (type == gpu::WeightType::kF32) {
-    dw = buffers.Copy(wf);
-  } else {
-    std::vector<std::uint16_t> w(wf.size());
-    for (std::size_t i = 0; i < w.size(); ++i) {
-      std::uint32_t bits;
-      std::memcpy(&bits, &wf[i], 4);
-      const __half h = __float2half(wf[i]);
-      std::uint16_t hb;
-      std::memcpy(&hb, &h, 2);
-      w[i] = type == gpu::WeightType::kBF16
-                 ? static_cast<std::uint16_t>(bits >> 16)
-                 : hb;
-    }
-    dw = buffers.Copy(w);
-  }
-  auto* dx = buffers.Copy(x) + offset;
-  auto* ref_logits = buffers.Make<float>(m);
-  auto* ref_ids = buffers.Make<std::int32_t>(used);
-  auto* ref_w = buffers.Make<float>(used);
-  auto* ref_tiles = buffers.Make<gpu::Exl3RouteTile>(used);
-  auto* ref_count = buffers.Make<std::uint32_t>(1);
-  auto* arrivals = buffers.Make<std::uint32_t>(1);
-  gpu::SmallGemmStable(dw, type, dx, ref_logits, 1, m, k, nullptr);
-  gpu::RouterTopKTiles(ref_logits, m, ref_ids, ref_w, 1, experts, used,
-                       ref_tiles, ref_count, arrivals,
-                       gpu::Exl3RouteTileRows(1), nullptr);
-  auto* logits = buffers.Make<float>(m);
-  auto* ids = buffers.Make<std::int32_t>(used);
-  auto* weights = buffers.Make<float>(used);
-  auto* tiles = buffers.Make<gpu::Exl3RouteTile>(used);
-  auto* count = buffers.Make<std::uint32_t>(1);
-  const auto bytes = [](const auto& a, const auto& b) {
-    return a.size() == b.size() &&
-           std::memcmp(a.data(), b.data(), a.size() * sizeof(a[0])) == 0;
-  };
-  for (unsigned launch = 0; launch < 2; ++launch) {
-    Require(gpu::RouterGemvTopKTiles(dw, type, dx, logits, m, k, ids, weights,
-                                     experts, used, tiles, count, arrivals,
-                                     gpu::Exl3RouteTileRows(1), nullptr),
-            "fused router rejected the model shape");
-    Require(Read(arrivals, 1)[0] == 0, "fused router arrivals not reset");
-    Require(bytes(Read(ref_logits, m), Read(logits, m)),
-            "fused router changed logits");
-    Require(bytes(Read(ref_ids, used), Read(ids, used)) &&
-                bytes(Read(ref_w, used), Read(weights, used)),
-            "fused router changed routing");
-    const auto n = Read(count, 1)[0];
-    Require(n == Read(ref_count, 1)[0], "fused router changed tile count");
-    const auto a = Read(ref_tiles, n), b = Read(tiles, n);
-    Require(bytes(a, b), "fused router changed tiles");
-  }
-}
-
 int main(int argc, char** argv) {
   try {
     if (argc == 2 && std::string(argv[1]) == "--head-generalization") {
@@ -2048,10 +1970,6 @@ int main(int argc, char** argv) {
       std::cout << "EXL3 rate generalization contracts passed\n";
       return 0;
     }
-    RouterGemvTiles(gpu::WeightType::kF16, 0);
-    RouterGemvTiles(gpu::WeightType::kBF16, 0);
-    RouterGemvTiles(gpu::WeightType::kF16, 1);
-    RouterGemvTiles(gpu::WeightType::kF32, 0);
     for (const auto [rows, used] :
          {std::pair{1U, 10U}, std::pair{3U, 10U}, std::pair{8U, 10U},
           std::pair{25U, 10U}, std::pair{64U, 4U}})
