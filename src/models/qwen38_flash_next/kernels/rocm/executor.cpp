@@ -4144,10 +4144,19 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   // main-stream work may use s_.x_q8t before JoinSide.
   // The legacy path below overlaps Q8_0; EXL3 uses the explicit-stream
   // workspace above. Other routes retain their original stream ownership.
-  const bool overlap = !exl3_overlap && ExpertMatrixRows(n_tokens) &&
-                       !last_only && l.shexp_gate.type == GgmlType::kQ8_0 &&
-                       l.shexp_up.type == GgmlType::kQ8_0 &&
-                       l.shexp_down.type == GgmlType::kQ8_0;
+  // EXL3 decode/verify: the fused shared MLP (its own fast-path slabs,
+  // counters and shexp rows) runs beside the routed GEMVs (routed_input,
+  // tiles, gate_e/up_e/down_e); Exl3Experts joins before the combine reads
+  // shexp_out.
+  const bool exl3_decode_overlap =
+      !exl3_overlap && !prefill_phase && !last_only &&
+      l.shexp_gate.exl3 != nullptr && l.shexp_up.exl3 != nullptr &&
+      l.shexp_down.exl3 != nullptr && l.ffn_gate_exps.exl3 != nullptr;
+  const bool overlap = exl3_decode_overlap ||
+                       (!exl3_overlap && ExpertMatrixRows(n_tokens) &&
+                        !last_only && l.shexp_gate.type == GgmlType::kQ8_0 &&
+                        l.shexp_up.type == GgmlType::kQ8_0 &&
+                        l.shexp_down.type == GgmlType::kQ8_0);
   const hipStream_t main = stream_;
   if (overlap) {
     if (!Check(hipEventRecord(side_start_, main), "side stream fork",
