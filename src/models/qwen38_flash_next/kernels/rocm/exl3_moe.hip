@@ -109,6 +109,12 @@ __device__ __forceinline__ float DotPairF32(Half2 w, Half2 x, float acc) {
   return __builtin_fmaf(w1, x1, acc);
 }
 
+// Waves per routed GEMV block: adjacent output tiles of the same expert
+// tile. Each wave's arithmetic is the former one-wave block's; packing only
+// cuts the block count (40 x 10 x 2 gate/up and 160 x 10 down blocks at
+// R=1 became a quarter as many).
+constexpr unsigned kRoutedWaves = 4;
+
 // One wave owns one output tile and up to eight actual rows of one expert.
 // No floating-point atomics or masked reads from absent assignment rows.
 template<int Bits, bool FullPrecision, unsigned MaxRows = 8,
@@ -123,9 +129,11 @@ __device__ __forceinline__ void RoutedGemvBody(
   const auto tile_rows = tiles[blockIdx.y];
   const unsigned projection = blockIdx.z;
   const auto& l = (projection == 0 ? gate : up)[tile_rows.expert];
-  const unsigned lane = threadIdx.x;
+  const unsigned lane = threadIdx.x % 32;
   const unsigned r0 = (lane % 4) * 2;
-  const unsigned nt = blockIdx.x;
+  const unsigned nt = blockIdx.x * kRoutedWaves + threadIdx.x / 32;
+  if (nt >= n / 16)
+    return;
   float a[MaxRows]{}, b[MaxRows]{};
   const auto lw = arithmetic::MakeLaneWindow<Bits>(lane);
   const auto* trellis = reinterpret_cast<const std::uint32_t*>(l.trellis);
@@ -1199,10 +1207,11 @@ void LaunchRouted(const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
   WithRate(rate, [&]<int Bits>() {
     const auto launch = [&]<unsigned R>() {
       hipLaunchKernelGGL((RoutedGemv<Bits, FullPrecision, R, Scaled>),
-                         dim3(n / 16, assignments, projections), dim3(32), 0,
-                         stream, gate, up, scratch.tiles, scratch.tile_count,
-                         input, gate_y, up_y, k, n, assignments,
-                         scratch.down_exponents);
+                         dim3((n / 16 + kRoutedWaves - 1) / kRoutedWaves,
+                              assignments, projections),
+                         dim3(32 * kRoutedWaves), 0, stream, gate, up,
+                         scratch.tiles, scratch.tile_count, input, gate_y, up_y,
+                         k, n, assignments, scratch.down_exponents);
     };
     switch (tile_rows) {
       case 1:
