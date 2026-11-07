@@ -336,7 +336,7 @@ std::size_t Q8TiledBytes(std::size_t batch, std::size_t k);
 void QuantizeQ8Tiled(const float* x, void* out, std::size_t batch,
                      std::size_t k, hipStream_t stream);
 /// F16 values (count % 32 == 0) to ggml Q8_0 blocks: d = amax / 127 as
-/// F16, codes round(x / d).
+/// F16, codes round(x * (1 / d)), each step IEEE-rounded like the host's.
 void QuantizeHalfQ8_0(const void* half, void* q8, std::size_t count,
                       hipStream_t stream);
 bool W8A8Gemm(const void* w, const void* x_tiled, float* out, std::size_t batch,

@@ -6971,6 +6971,31 @@ bool HcDownF16Gemm(const void* w, const void* x_tiled, __half* out,
   return true;
 }
 
+/// IEEE round-to-nearest a / b for finite a >= 0, b > 0 whose quotient and
+/// reciprocal stay normal. Fast-math lowers `/` to an approximate reciprocal
+/// product, so a refined quotient is corrected to the neighbour with the
+/// smallest exact FMA residual (a quotient is never exactly halfway).
+__device__ __forceinline__ float DivRn(float a, float b) {
+  if (a == 0.0F)
+    return 0.0F;
+  float y = Materialize(1.0F / b);
+  y = Materialize(__builtin_fmaf(__builtin_fmaf(-b, y, 1.0F), y, y));
+  float q = Materialize(a * y);
+  q = Materialize(__builtin_fmaf(__builtin_fmaf(-b, q, a), y, q));
+  const auto bits = __builtin_bit_cast(std::uint32_t, q);
+  const float down = __builtin_bit_cast(float, bits - 1);
+  const float up = __builtin_bit_cast(float, bits + 1);
+  const float r = fabsf(Materialize(__builtin_fmaf(-b, q, a)));
+  const float r_down = fabsf(Materialize(__builtin_fmaf(-b, down, a)));
+  const float r_up = fabsf(Materialize(__builtin_fmaf(-b, up, a)));
+  if (r_down < r && r_down <= r_up)
+    return down;
+  return r_up < r ? up : q;
+}
+
+/// Q8_0 of FP16 rows with the host reference's IEEE arithmetic:
+/// d = RN(amax / 127), id = RN(1 / d), code = roundf(RN(v * id)). The
+/// fast-math quotient had flipped codes at |v| = amax / 2 between builds.
 __global__ void QuantizeHalfQ8_0Kernel(const __half* x, std::uint8_t* out,
                                        std::size_t blocks) {
   const std::size_t b =
@@ -6984,15 +7009,15 @@ __global__ void QuantizeHalfQ8_0Kernel(const __half* x, std::uint8_t* out,
     v[j] = __half2float(x[(b * 32) + j]);
     amax = fmaxf(amax, fabsf(v[j]));
   }
-  const float d = amax / 127.0F;
-  const float id = d != 0.0F ? 1.0F / d : 0.0F;
+  const float d = DivRn(amax, 127.0F);
+  const float id = d != 0.0F ? DivRn(1.0F, d) : 0.0F;
   std::uint8_t* block = out + (b * 34);
   const __half dh = __float2half_rn(d);
   std::memcpy(block, &dh, 2);
 #pragma unroll
   for (int j = 0; j < 32; ++j)
-    block[2 + j] =
-        static_cast<std::uint8_t>(static_cast<std::int8_t>(roundf(v[j] * id)));
+    block[2 + j] = static_cast<std::uint8_t>(
+        static_cast<std::int8_t>(roundf(Materialize(__fmul_rn(v[j], id)))));
 }
 
 void QuantizeHalfQ8_0(const void* half, void* q8, std::size_t count,

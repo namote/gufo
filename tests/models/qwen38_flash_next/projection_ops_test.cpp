@@ -1206,6 +1206,68 @@ void CheckHcDownSilu() {
                "through 65\n";
 }
 
+/// QuantizeHalfQ8_0 (the resident HC Q8_0 weight copies) must produce the
+/// host reference's IEEE codes: d = amax / 127, id = 1 / d, roundf(v * id).
+/// One block per positive finite half amax, with -amax, amax / 2 (the
+/// former build-dependent tie neighbourhood), subnormal and random values.
+void CheckQuantizeHalfQ8_0() {
+  std::vector<__half> x;
+  std::uint32_t state = 0x51A7E0U;
+  for (std::uint16_t bits = 1; bits < 0x7C00; ++bits) {
+    const float amax = __half2float(std::bit_cast<__half>(bits));
+    for (int j = 0; j < 32; ++j) {
+      float v = amax * Uniform(&state, 1.0F);
+      if (j == 0)
+        v = amax;
+      else if (j == 1)
+        v = -amax;
+      else if (j < 6)
+        v = (j % 2 ? -0.5F : 0.5F) * amax;
+      else if (j == 6)
+        v = -0.0F;
+      x.push_back(__float2half_rn(v));
+    }
+  }
+  x.resize(x.size() + 32, __float2half_rn(0.0F));  // all-zero block
+  const std::size_t blocks = x.size() / 32;
+  void* d_x = nullptr;
+  void* d_q = nullptr;
+  CheckHip(hipMalloc(&d_x, x.size() * sizeof(__half)), "Q8_0 input");
+  CheckHip(hipMalloc(&d_q, blocks * 34), "Q8_0 output");
+  CheckHip(hipMemcpy(d_x, x.data(), x.size() * sizeof(__half),
+                     hipMemcpyHostToDevice),
+           "Q8_0 upload");
+  q::QuantizeHalfQ8_0(d_x, d_q, x.size(), nullptr);
+  std::vector<std::uint8_t> got(blocks * 34);
+  CheckHip(hipMemcpy(got.data(), d_q, got.size(), hipMemcpyDeviceToHost),
+           "Q8_0 download");
+  (void)hipFree(d_x);
+  (void)hipFree(d_q);
+  std::size_t mismatches = 0;
+  for (std::size_t b = 0; b < blocks; ++b) {
+    float amax = 0.0F;
+    for (int j = 0; j < 32; ++j)
+      amax = std::max(amax, std::fabs(__half2float(x[b * 32 + j])));
+    volatile float d = amax / 127.0F;
+    volatile float id = d != 0.0F ? 1.0F / d : 0.0F;
+    const __half dh = __float2half_rn(d);
+    std::uint8_t expected[34];
+    std::memcpy(expected, &dh, 2);
+    for (int j = 0; j < 32; ++j) {
+      volatile float product = __half2float(x[b * 32 + j]) * id;
+      expected[2 + j] = static_cast<std::uint8_t>(
+          static_cast<std::int8_t>(std::round(product)));
+    }
+    mismatches += std::memcmp(expected, got.data() + b * 34, 34) != 0;
+  }
+  if (mismatches != 0)
+    throw std::runtime_error(
+        "Q8_0 quantizer differs from the IEEE host "
+        "reference in " +
+        std::to_string(mismatches) + " blocks");
+  std::cout << "Q8_0 quantizer: IEEE host codes for " << blocks << " blocks\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1222,6 +1284,7 @@ int main(int argc, char** argv) {
     if (qfn_mmq_init(0) != 0)
       throw std::runtime_error("prepare quantized decode projections");
     CheckRoutedQ8Placement();
+    CheckQuantizeHalfQ8_0();
     CheckStableGroupedProjections();
     CheckDenseAcrossStreams();
     CheckSmallProjection(q::WeightType::kF32, 513, 2560);
