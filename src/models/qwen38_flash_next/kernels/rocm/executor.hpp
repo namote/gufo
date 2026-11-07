@@ -1083,6 +1083,8 @@ private:
   struct PendingExl3Moe {
     const DeviceLayer* layer{nullptr};
     std::uint32_t rows{0};
+    /// Deferred by a decode pass: raw FP32 routed rows, not prefill scratch.
+    bool decode{false};
   };
   mutable PendingExl3Moe exl3_moe_pending_{};
   /// Set by Attention for KvarnAttention: the queries are already in the

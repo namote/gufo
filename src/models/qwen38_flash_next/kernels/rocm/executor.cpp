@@ -2926,7 +2926,7 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
   Exl3PrefillMoeRows decode_moe{};
   bool decode_moe_fused = false;
   const DeviceLayer* decode_moe_layer = nullptr;
-  if (exl3_moe_pending_.layer != nullptr && !prefill_phase) {
+  if (exl3_moe_pending_.layer != nullptr && exl3_moe_pending_.decode) {
     const PendingExl3Moe pending = std::exchange(exl3_moe_pending_, {});
     decode_moe_layer = pending.layer;
     const auto& d = pending.layer->ffn_down_exps;
@@ -2940,11 +2940,11 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
                   c.num_experts + 1,
                   c.num_experts_used,
                   d.rows};
-    decode_moe_fused = pending.rows == n_tokens && gamma != nullptr &&
-                       !MatrixRows(n_tokens) && UnpaddedQ8(c.HcDim()) &&
-                       !moe_pending_ && !res_deferred_ &&
-                       d.rows == c.hidden_size && c.hidden_size % 128 == 0 &&
-                       c.hidden_size <= 2560 && c.num_experts_used <= 16;
+    decode_moe_fused =
+        !prefill_phase && pending.rows == n_tokens && gamma != nullptr &&
+        !MatrixRows(n_tokens) && UnpaddedQ8(c.HcDim()) && !moe_pending_ &&
+        !res_deferred_ && d.rows == c.hidden_size && c.hidden_size % 128 == 0 &&
+        c.hidden_size <= 2560 && c.num_experts_used <= 16;
     if (!decode_moe_fused)
       Exl3RoutedCombine(*pending.layer, s_.ids, pending.rows,
                         c.num_experts_used, s_.down_e, s_.weights, s_.shexp_out,
@@ -4575,7 +4575,7 @@ bool Executor::Exl3Experts(const DeviceLayer& l, const float* x, float* out,
     // (HcCombineQ8_1) or writes it first.
     if (exl3_moe_defer_ && out == s_.block_out) {
       exl3_moe_defer_ = false;
-      exl3_moe_pending_ = {&l, rows};
+      exl3_moe_pending_ = {&l, rows, true};
       return true;
     }
     Exl3RoutedCombine(l, s_.ids, rows, c.num_experts_used, s_.down_e,
@@ -4784,8 +4784,9 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
             half_bf16_, xn_half_, inject_parts_, inject_fused_, q8_slot_,
             xn_q8_ready_, mixed_q8_ready_, xn_deferred_.res, xn_deferred_.gamma,
             xn_deferred_.rows, exl3_moe_defer_, exl3_moe_pending_.layer,
-            exl3_moe_pending_.rows, xn_q8t_norm_.res, xn_q8t_norm_.gamma,
-            xn_q8t_norm_.rows, exl3_rotated_, exl3_res_pending_);
+            exl3_moe_pending_.rows, exl3_moe_pending_.decode, xn_q8t_norm_.res,
+            xn_q8t_norm_.gamma, xn_q8t_norm_.rows, exl3_rotated_,
+            exl3_res_pending_);
         const auto before = std::apply(
             [](const auto&... fields) { return std::make_tuple(fields...); },
             dispatch);
