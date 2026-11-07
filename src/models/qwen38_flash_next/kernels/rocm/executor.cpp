@@ -6278,6 +6278,9 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
                        std::uint32_t pool_grid, const float* hidden_source,
                        MtpTrace* trace, bool kv_only, bool draft_subset) const {
   const Config& c = config();
+  // s_.mtp_res aliases s_.res: a failed trunk pass must not leave its
+  // deferred attention update for this pass's first combine.
+  exl3_res_pending_ = {};
   const DeviceLayer& l = model_->mtp();
   const std::uint32_t hc_dim = c.HcDim();
   const std::size_t final_row = static_cast<std::size_t>(n - 1) * hc_dim;
