@@ -1,5 +1,49 @@
 # gfx1151 optimization know-how
 
+## Flash-Next B3 decode dispatch fusion and launch gaps, November 8, 2026
+
+Commits `addf9dd3..5bda5f57` (brief `plan/exl3/B3-BRIEF.md`): HC-down tail
+SiLU/Q8_1 and HC-up mix-epilogue tail (G1, −192 dispatches/token); router GEMV
+last block runs top-k + tiles (G4a, −48); restore/scale in the gate/up GEMV
+tail (G4b, −48); decode MoE output formed in the next HC combine (G4d, −47);
+one-launch attention prep (G2, −72); q/k norm in SsmConv4's last block (G3,
+−36); routed GEMV next-group prefetch and global trellis loads (G5);
+`HIP_FORCE_DEV_KERNARG=1` default (G6); persistent-decode design doc (G7);
+single-row Q8_0 GEMV rounding unified with batched rows (`6b09c93c`).
+
+Same window, c03, Nix10.1, FP16 KV, B C B C r2, baseline B2 `9599b4c6`:
+PP2048/8192 off 1519.5/1551.1→1519.1/1549.4; MTP-PP 1451.1/1476.3→
+1450.4/1475.6; AR128 d0/d32K 31.74/30.99→31.36/30.69 (−1.2/−1.0%); MTP128
+d0/d32K 63.92/98.74→62.17/95.69 (−2.8/−3.1%). All below the 5%/10 ms gate but
+consistently slower on decode. AR/MTP hashes, MTP work counts and prefill
+logits equal B2; quality unchanged (KL256 0.041742).
+
+Decode profile (AR d0): 998 dispatches/token (B2 1442), kernel-active
+67.0→71.5%, idle 10.5→9.11 ms/token, but kernel busy 21.3→22.9 ms/token. Removing
+444 dispatches saved only ≈1.4 ms idle (≈3.2 µs each). Busy by group (ms/token,
+B2→B3): HC chain q8+combine/mix 4.64→6.23 incl. 0.45 moved MoE combine
+(HcUpMix 2.60 vs Q8 up GEMV 1.71; HcDownSiluQ8 1.98 vs 1.71) — G1's
+last-block tails serialize and cost more than the gaps they remove; router
+GEMV+top-k 1.24→1.25 (neutral, −48 launches); routed gate/up+restore
+≈5.3→5.08 (≈155 GB/s), down 2.63→2.66 (≈148 GB/s); attention 0.74→0.54.
+Isolation (TG, interleaved): G6 env 0 vs 1 ±0.06% (no effect); G5 reverted is
+slower by 0.2–0.3% AR, 1.5–1.9% MTP (keep G5).
+
+Launch gap microbench `tools/bench/gfx1151_launch_gap.hip` (µs/dispatch,
+1500 dependent tiny kernels): stream 1.95–2.16, captured graph 1.83–1.98;
+1 KiB vs 16 B kernargs and 1×32 vs 40×256 grids make no difference; a forked
+side stream adds ≈0.1. `HIP_FORCE_DEV_KERNARG` changes nothing. Cooperative
+grid barrier: 0.91–0.93 µs at 1 block/CU, 0.94–0.97 at 2, 0.98–1.10 at 4 (tool
+reports 20 compute units — WGP count). So the ≈7 µs/dispatch decode idle is
+mostly ramp/drain and dependency latency, not launch cost; a persistent kernel
+saves launch cost ≈0.9 µs/stage but only wins if its stages avoid the same
+serial tails. Fusion pays only when the fused kernel's busy time does not grow.
+
+Bugs found by the pass: inlining SsmConv4 let fast-math reorder its 4-tap FMA
+chain (projection_ops/gdn_ops bit mismatch); fixed by calling the pinned
+`SsmConv4Value` (`abd66204`). Evidence: `build/b1/gpu-b3/RESULT.json`,
+`prof/decode-summary.json`.
+
 ## Flash-Next B2 producer rotation, verify state and side stream, November 7, 2026
 
 Commits `c49ea976..9599b4c6` (brief `plan/exl3/B2-BRIEF.md`): producer epilogues

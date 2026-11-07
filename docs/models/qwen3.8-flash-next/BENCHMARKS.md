@@ -1,5 +1,14 @@
 # Qwen3.8 Flash-Next benchmarks
 
+## B3 decode dispatch fusion, November 8, 2026
+
+Same-window B C B C vs B2 `9599b4c6` (candidate `5bda5f57`), c03, Nix10.1,
+FP16 KV, r2: PP2048/8192 off 1519.5/1551.1→1519.1/1549.4 tok/s; AR128 d0/d32K
+31.74/30.99→31.36/30.69 (−1.2/−1.0%); MTP128 d0/d32K 63.92/98.74→62.17/95.69
+(−2.8/−3.1%). Dispatches/token 1442→998 but fused HC kernels are slower; within
+the gate, not adopted as a gain. Outputs, prefill logits and quality equal B2.
+Details: [know-how](../../GFX1151-KNOWHOW.md).
+
 ## B2 producer rotation, verify state and side stream, November 7, 2026
 
 Same-window B C B C vs B1 `cc86343e` (candidate `9599b4c6`), c03, Nix10.1, FP16
