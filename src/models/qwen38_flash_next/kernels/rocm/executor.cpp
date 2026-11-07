@@ -15,6 +15,7 @@
 #include <thread>
 #include <tuple>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "qfn_mmq.h"
@@ -1344,6 +1345,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
         error_msg);
     ex.tiles = Alloc<Exl3RouteTile>(a, assignments, error_msg);
     ex.tile_count = Alloc<std::uint32_t>(a, 1, error_msg);
+    ex.route_arrivals = Alloc<std::uint32_t>(a, 1, error_msg);
     ex.down_exponents = Alloc<std::int32_t>(a, assignments, error_msg);
     e->exl3_dense_rotations_ =
         Alloc<gufo::hip::Exl3RotateProblem>(a, 3, error_msg);
@@ -3966,8 +3968,19 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   if (!Dense(l.router, x, s_.router, n_tokens, error_msg)) {
     return false;
   }
-  RouterTopK(s_.router, c.num_experts + 1, s_.ids, s_.weights, n_tokens,
-             c.num_experts, used, stream_);
+  // An EXL3 decode call of one routed chunk also builds its expert tiles in
+  // the router launch (Exl3RoutedMlp skips its counter reset and BuildTiles).
+  exl3_tiles_ready_ = l.ffn_gate_exps.exl3 != nullptr && !prefill_phase &&
+                      n_tokens <= 64 &&
+                      n_tokens * used <= kExl3FusedTileAssignments &&
+                      exl3_.route_arrivals != nullptr;
+  if (exl3_tiles_ready_)
+    RouterTopKTiles(s_.router, c.num_experts + 1, s_.ids, s_.weights, n_tokens,
+                    c.num_experts, used, exl3_.tiles, exl3_.tile_count,
+                    exl3_.route_arrivals, Exl3RouteTileRows(n_tokens), stream_);
+  else
+    RouterTopK(s_.router, c.num_experts + 1, s_.ids, s_.weights, n_tokens,
+               c.num_experts, used, stream_);
   if (l.ffn_gate_exps.exl3 == nullptr && ExpertMatrixRows(n_tokens)) {
     ExpertCounts(s_.ids, s_.expert_counts, n_tokens, c.num_experts, used,
                  stream_);
@@ -4207,15 +4220,18 @@ Exl3PrefillScratch Executor::Exl3PrefillView() const {
 bool Executor::Exl3Experts(const DeviceLayer& l, const float* x, float* out,
                            std::uint32_t rows, std::string* error) const {
   const auto& c = config();
+  const bool tiles_ready = std::exchange(exl3_tiles_ready_, false);
   try {
     if (!prefill_phase) {
       for (std::uint32_t first = 0; first < rows; first += 64) {
         const auto count = std::min(64U, rows - first);
         const auto assignment = std::size_t{first} * c.num_experts_used;
+        // Raw down dots: Exl3RoutedCombine restores them in the epilogue.
         Exl3RoutedMlp(l, x + std::size_t{first} * c.hidden_size,
                       s_.ids + assignment, s_.gate_e, s_.up_e,
                       s_.down_e + assignment * c.hidden_size, count,
-                      c.num_experts_used, exl3_, stream_);
+                      c.num_experts_used, exl3_, stream_, nullptr,
+                      tiles_ready && rows <= 64, true);
         if (diagnostics_active_) {
           if (exl3_.down_exponents != nullptr)
             cycle_diagnostics_.scaled_down_rows +=
@@ -4256,9 +4272,9 @@ bool Executor::Exl3Experts(const DeviceLayer& l, const float* x, float* out,
                          c.num_experts + 1, out, stream_);
       return true;
     }
-    MoeEpilogue(s_.down_e, s_.weights, s_.shexp_out, s_.router + c.num_experts,
-                c.num_experts + 1, out, rows, c.num_experts_used, c.hidden_size,
-                stream_);
+    Exl3RoutedCombine(l, s_.ids, rows, c.num_experts_used, s_.down_e,
+                      s_.weights, s_.shexp_out, s_.router + c.num_experts,
+                      c.num_experts + 1, out, stream_);
     return true;
   } catch (const std::exception& e) {
     AssignError(error, e.what());

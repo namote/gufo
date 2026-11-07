@@ -32,7 +32,18 @@ struct Exl3Scratch {
   std::int32_t* down_exponents{nullptr};
   std::uint32_t* head_segments{nullptr};
   float* head_values{nullptr};
+  /// Zero-initialized arrival counter of RouterTopKTiles; it returns to zero
+  /// at the end of every launch.
+  std::uint32_t* route_arrivals{nullptr};
 };
+
+/// Rows per routed decode tile for a call of `rows` tokens. R=3 does not
+/// carry eight independent accumulator pairs through the complete K loop.
+constexpr std::uint32_t Exl3RouteTileRows(std::uint32_t rows) {
+  return rows <= 3 ? rows : rows <= 4 ? 4 : 8;
+}
+/// Largest assignment count whose tiles RouterTopKTiles builds.
+constexpr std::uint32_t kExl3FusedTileAssignments = 256;
 
 /// Compressed projections, or the pack's plain operands with fixed FP32 math.
 void Exl3Projection(const DeviceTensor& weight, const float* x, float* out,
@@ -63,11 +74,27 @@ bool Exl3SharedMlp(const DeviceLayer& layer, const float* x, float* gate,
 
 /// Groups actual assignments by expert into 1..8-row tiles on device. Every
 /// slot keeps its own rotation and output; the caller performs ordered MoE sum.
+/// tiles_ready: RouterTopKTiles already built scratch.tiles/tile_count for
+/// these IDs with Exl3RouteTileRows(rows). raw_down: out keeps the down
+/// projection's FP32 dots, without H/svh, for Exl3RoutedCombine. A trace
+/// runs the unfused restore/scale launches (the fused ones store the same
+/// bytes) so that it can copy their intermediates.
 void Exl3RoutedMlp(const DeviceLayer& layer, const float* x,
                    const std::int32_t* ids, float* gate, float* up, float* out,
                    std::uint32_t rows, std::uint32_t used,
                    const Exl3Scratch& scratch, hipStream_t stream,
-                   const Exl3RoutedTrace* trace = nullptr);
+                   const Exl3RoutedTrace* trace = nullptr,
+                   bool tiles_ready = false, bool raw_down = false);
+/// MoeEpilogue over Exl3RoutedMlp's raw_down rows: out[t] = sum_s
+/// weights[t*used+s] * restored(t, s) + sigmoid(gate[t*stride]) * shared[t],
+/// restoring each [t*used+s] row as Exl3RoutedMlp does, bit for bit, without
+/// the restored rows' round trip through memory. Requires used <= 16 and a
+/// down width divisible by 128.
+void Exl3RoutedCombine(const DeviceLayer& layer, const std::int32_t* ids,
+                       std::uint32_t rows, std::uint32_t used, const float* raw,
+                       const float* weights, const float* shared,
+                       const float* gate, std::uint32_t gate_stride, float* out,
+                       hipStream_t stream);
 /// Inner routed-down stage for a pre-rounded FP16 slab. Uses the existing
 /// scratch tiles/count (each count <= max_tile_rows, 1..8). With exponents
 /// allocated, scales input in place by an exact power of two where safe,

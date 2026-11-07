@@ -384,6 +384,82 @@ __global__ void RestoreActivateRotate(const ex::DeviceLinear* gate,
   }
 }
 
+// RestoreActivateRotate and ScaleDownRows in one pass: one block per
+// assignment (a wave per 128-wide segment) forms the FP16 down input in
+// registers with RestoreActivateRotate's expressions, reduces its magnitude
+// range over the row exactly as ScaleDownRows does on the stored halves, and
+// stores the scaled halves once. The FP32 activation has no reader here.
+__global__ __launch_bounds__(1024) void RestoreActivateScale(
+    const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
+    const ex::DeviceLinear* down, const std::int32_t* ids, const float* gate_y,
+    const float* up_y, std::uint16_t* output, std::int32_t* exponents,
+    unsigned width) {
+  const unsigned row = blockIdx.x, lane = threadIdx.x % 32;
+  const unsigned wave = threadIdx.x / 32, waves = blockDim.x / 32;
+  const unsigned first = wave * 128 + lane * 4;
+  const auto& g = gate[ids[row]];
+  const auto& u = up[ids[row]];
+  const auto& d = down[ids[row]];
+  const auto* gs = reinterpret_cast<const _Float16*>(g.svh);
+  const auto* us = reinterpret_cast<const _Float16*>(u.svh);
+  const auto* ds = reinterpret_cast<const _Float16*>(d.suh);
+  const auto offset = std::size_t{row} * width + first;
+  float gv[4], uv[4];
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j) {
+    gv[j] = gate_y[offset + j];
+    uv[j] = up_y[offset + j];
+  }
+  arithmetic::Butterfly128(gv, lane);
+  arithmetic::Butterfly128(uv, lane);
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j) {
+    const float value = (gv[j] * arithmetic::kHadamardScale) *
+                        static_cast<float>(gs[first + j]);
+    const float other = (uv[j] * arithmetic::kHadamardScale) *
+                        static_cast<float>(us[first + j]);
+    float activation = (value / (1.0F + expf(-value))) * other;
+    asm volatile("" : "+v"(activation));
+    gv[j] = activation * static_cast<float>(ds[first + j]);
+    asm volatile("" : "+v"(gv[j]));
+  }
+  arithmetic::Butterfly128(gv, lane);
+  std::uint16_t bits[4];
+  unsigned minimum = 0x7fffU, maximum = 0;
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j) {
+    float scaled = gv[j] * arithmetic::kHadamardScale;
+    asm volatile("" : "+v"(scaled));
+    bits[j] = __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(scaled));
+    const unsigned value = bits[j] & 0x7fffU;
+    if (value != 0)
+      minimum = min(minimum, value);
+    maximum = max(maximum, value);
+  }
+  for (unsigned o = 16; o != 0; o >>= 1) {
+    minimum = min(minimum, __shfl_xor(minimum, o, 32));
+    maximum = max(maximum, __shfl_xor(maximum, o, 32));
+  }
+  __shared__ unsigned minima[32], maxima[32];
+  if (lane == 0) {
+    minima[wave] = minimum;
+    maxima[wave] = maximum;
+  }
+  __syncthreads();
+  minimum = 0x7fffU;
+  maximum = 0;
+  for (unsigned i = 0; i < waves; ++i) {
+    minimum = min(minimum, minima[i]);
+    maximum = max(maximum, maxima[i]);
+  }
+  const int exponent = DownExponent(minimum, maximum);
+  if (threadIdx.x == 0)
+    exponents[row] = exponent;
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j)
+    output[offset + j] = exponent > 0 ? ScaleHalf(bits[j], exponent) : bits[j];
+}
+
 // Bucket construction, all on the device and atomic-free, so it is
 // deterministic and graph-replay safe. One 256-thread block per expert scans
 // the IDs (L2-resident) to count, then again to emit its slots in assignment
@@ -1108,10 +1184,9 @@ ex::BitRate BankRate(const DeviceTensor& bank) {
   return bank.exl3[0].rate;
 }
 
-// The tile builder uses the same cap. In particular R=3 does not carry
-// eight independent accumulator pairs through the complete K loop.
+// The tile builders use the same cap (Exl3RouteTileRows).
 unsigned TileRows(unsigned rows) {
-  return rows <= 3 ? rows : rows <= 4 ? 4 : 8;
+  return Exl3RouteTileRows(rows);
 }
 
 template<bool FullPrecision, bool Scaled = false>
@@ -1150,16 +1225,21 @@ void LaunchRouted(const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
 }
 }  // namespace
 
-void Exl3RoutedDown(const DeviceTensor& down, std::uint16_t* input, float* out,
-                    std::uint32_t assignments, std::uint32_t max_tile_rows,
-                    const Exl3Scratch& scratch, hipStream_t stream) {
+namespace {
+// prescaled: RestoreActivateScale already scaled the input and wrote the
+// exponents (the ScaleDownRows pass is folded into it).
+void RoutedDown(const DeviceTensor& down, std::uint16_t* input, float* out,
+                std::uint32_t assignments, std::uint32_t max_tile_rows,
+                const Exl3Scratch& scratch, hipStream_t stream,
+                bool prescaled) {
   if (assignments == 0)
     return;
   if (max_tile_rows == 0 || max_tile_rows > 8)
     throw std::invalid_argument("EXL3 down tile rows must be 1..8");
   if (scratch.down_exponents != nullptr) {
-    hipLaunchKernelGGL(ScaleDownRows, dim3(assignments), dim3(256), 0, stream,
-                       input, scratch.down_exponents, down.cols);
+    if (!prescaled)
+      hipLaunchKernelGGL(ScaleDownRows, dim3(assignments), dim3(256), 0, stream,
+                         input, scratch.down_exponents, down.cols);
     LaunchRouted<false, true>(down.device_exl3, down.device_exl3, input, out,
                               out, down.cols, down.rows, assignments, 1,
                               TileRows(max_tile_rows), scratch, stream,
@@ -1171,6 +1251,14 @@ void Exl3RoutedDown(const DeviceTensor& down, std::uint16_t* input, float* out,
                        BankRate(down));
   }
   Check();
+}
+}  // namespace
+
+void Exl3RoutedDown(const DeviceTensor& down, std::uint16_t* input, float* out,
+                    std::uint32_t assignments, std::uint32_t max_tile_rows,
+                    const Exl3Scratch& scratch, hipStream_t stream) {
+  RoutedDown(down, input, out, assignments, max_tile_rows, scratch, stream,
+             false);
 }
 
 void Exl3BuildExpertBuckets(const std::int32_t* ids, std::uint32_t assignments,
@@ -1532,7 +1620,8 @@ bool Exl3SharedMlp(const DeviceLayer& l, const float* x, float* gate, float* up,
 void Exl3RoutedMlp(const DeviceLayer& l, const float* x,
                    const std::int32_t* ids, float* gate, float* up, float* out,
                    std::uint32_t rows, std::uint32_t used, const Exl3Scratch& s,
-                   hipStream_t stream, const Exl3RoutedTrace* trace) {
+                   hipStream_t stream, const Exl3RoutedTrace* trace,
+                   bool tiles_ready, bool raw_down) {
   const unsigned assignments = rows * used;
   if (assignments == 0)
     return;
@@ -1547,11 +1636,13 @@ void Exl3RoutedMlp(const DeviceLayer& l, const float* x,
                        stream) != hipSuccess)
       throw std::runtime_error("EXL3 routed trace copy failed");
   };
-  if (hipMemsetAsync(s.tile_count, 0, sizeof(unsigned), stream) != hipSuccess)
-    throw std::runtime_error("EXL3 route counter reset failed");
-  hipLaunchKernelGGL(BuildTiles, dim3((g.experts + 63) / 64), dim3(64), 0,
-                     stream, ids, assignments, s.tiles, s.tile_count, g.experts,
-                     tile_rows);
+  if (!tiles_ready) {
+    if (hipMemsetAsync(s.tile_count, 0, sizeof(unsigned), stream) != hipSuccess)
+      throw std::runtime_error("EXL3 route counter reset failed");
+    hipLaunchKernelGGL(BuildTiles, dim3((g.experts + 63) / 64), dim3(64), 0,
+                       stream, ids, assignments, s.tiles, s.tile_count,
+                       g.experts, tile_rows);
+  }
   hipLaunchKernelGGL(RotateAssignments, dim3(g.cols / 128, assignments, 2),
                      dim3(32), 0, stream, g.device_exl3, u.device_exl3, ids, x,
                      s.routed_input, used, g.cols, assignments);
@@ -1577,9 +1668,20 @@ void Exl3RoutedMlp(const DeviceLayer& l, const float* x,
     snapshot(trace->up_inner, up,
              std::size_t{assignments} * g.rows * sizeof(float));
   }
-  hipLaunchKernelGGL(RestoreActivateRotate, dim3(g.rows / 128, assignments),
-                     dim3(32), 0, stream, g.device_exl3, u.device_exl3,
-                     d.device_exl3, ids, gate, up, s.routed_input, g.rows);
+  // Without a trace the down rows' power-of-two scaling joins the restore
+  // (RestoreActivateScale); RoutedDown then skips ScaleDownRows.
+  const bool prescaled = trace == nullptr && s.down_exponents != nullptr &&
+                         g.rows == d.cols && d.cols % 128 == 0 &&
+                         d.cols <= 4096;
+  if (prescaled)
+    hipLaunchKernelGGL(RestoreActivateScale, dim3(assignments),
+                       dim3(32 * (d.cols / 128)), 0, stream, g.device_exl3,
+                       u.device_exl3, d.device_exl3, ids, gate, up,
+                       s.routed_input, s.down_exponents, d.cols);
+  else
+    hipLaunchKernelGGL(RestoreActivateRotate, dim3(g.rows / 128, assignments),
+                       dim3(32), 0, stream, g.device_exl3, u.device_exl3,
+                       d.device_exl3, ids, gate, up, s.routed_input, g.rows);
   if (trace != nullptr)
     snapshot(trace->activation, gate,
              std::size_t{assignments} * g.rows * sizeof(float));
@@ -1597,12 +1699,51 @@ void Exl3RoutedMlp(const DeviceLayer& l, const float* x,
                        trace->down_widened_inner, trace->down_widened_inner,
                        d.cols, d.rows, assignments, 1, tile_rows, s, stream,
                        BankRate(d));
-  Exl3RoutedDown(d, s.routed_input, out, assignments, tile_rows, s, stream);
+  RoutedDown(d, s.routed_input, out, assignments, tile_rows, s, stream,
+             prescaled);
   if (trace != nullptr)
     snapshot(trace->down_inner, out,
              std::size_t{assignments} * d.rows * sizeof(float));
-  hipLaunchKernelGGL(RestoreDownAssignments, dim3(d.rows / 128, assignments),
-                     dim3(32), 0, stream, d.device_exl3, ids, out, d.rows);
+  if (!raw_down)
+    hipLaunchKernelGGL(RestoreDownAssignments, dim3(d.rows / 128, assignments),
+                       dim3(32), 0, stream, d.device_exl3, ids, out, d.rows);
+  Check();
+}
+
+namespace {
+// RestoreDownAssignments for each of a token's slots, then MoeEpilogue's
+// weighted sum (Exl3MoeSegment over FP32 rows in assignment order): the
+// restored rows never reach memory. One wave per 128-wide segment.
+__global__ __launch_bounds__(256) void RoutedCombineKernel(
+    Exl3PrefillMoeRows rows, float* out) {
+  const unsigned t = blockIdx.y, lane = threadIdx.x % 32;
+  const unsigned segment = blockIdx.x * 8 + threadIdx.x / 32;
+  if (segment * 128 >= rows.width)
+    return;
+  float o[4];
+  Exl3MoeSegment<float, false>(rows, t, segment, lane, o);
+  const auto first = std::size_t{t} * rows.width + segment * 128 + lane * 4;
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j)
+    out[first + j] = o[j];
+}
+}  // namespace
+
+void Exl3RoutedCombine(const DeviceLayer& layer, const std::int32_t* ids,
+                       std::uint32_t rows, std::uint32_t used, const float* raw,
+                       const float* weights, const float* shared,
+                       const float* gate, std::uint32_t gate_stride, float* out,
+                       hipStream_t stream) {
+  const auto& d = layer.ffn_down_exps;
+  if (rows == 0)
+    return;
+  if (ids == nullptr || raw == nullptr || used == 0 || used > 16 ||
+      d.rows % 128 != 0)
+    throw std::invalid_argument("EXL3 routed combine: unsupported call");
+  const Exl3PrefillMoeRows moe{d.device_exl3, ids,  nullptr,     raw,  weights,
+                               shared,        gate, gate_stride, used, d.rows};
+  hipLaunchKernelGGL(RoutedCombineKernel, dim3((d.rows / 128 + 7) / 8, rows),
+                     dim3(256), 0, stream, moe, out);
   Check();
 }
 
@@ -1612,9 +1753,9 @@ void Exl3DraftHead(const DeviceTensor& head, const float* x, float* logits,
                    hipStream_t stream) {
   const auto& l = *head.exl3;
   if (prefix % 128 != 0 || prefix > l.n || (l.rate.half && l.rate.bits != 3) ||
-      l.rate.bits < 3 ||
-      l.rate.bits > 8 || l.codebook != ex::Codebook::kMul1)
-    throw std::runtime_error("EXL3 draft head needs a complete K3..K8 or K3.5 prefix");
+      l.rate.bits < 3 || l.rate.bits > 8 || l.codebook != ex::Codebook::kMul1)
+    throw std::runtime_error(
+        "EXL3 draft head needs a complete K3..K8 or K3.5 prefix");
   if (prefix == 0 && extras == 0)
     return;
   hipLaunchKernelGGL(SelectSegments, dim3(1), dim3(1), 0, stream, ids, extras,

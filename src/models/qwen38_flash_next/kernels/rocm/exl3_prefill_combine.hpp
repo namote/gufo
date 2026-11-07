@@ -13,7 +13,8 @@ namespace gufo::models::qwen38_flash_next::rocm {
 
 /// What the EXL3 prefill MoE combine reads: the packed FP16 raw down dots
 /// (Exl3PrefillExpertsRaw), their expert bank and inverse slot map, the
-/// routing weights and the gated shared expert.
+/// routing weights and the gated shared expert. The routed decode combine
+/// reads FP32 raw rows in assignment order instead (no inverse).
 struct Exl3PrefillMoeRows {
   const quant::exl3::DeviceLinear* bank{nullptr};
   const std::int32_t* ids{nullptr};  ///< Original [token][slot] routing IDs.
@@ -33,9 +34,12 @@ struct Exl3PrefillMoeRows {
 /// sign/scale vector) and weighted in slot order, then the gated shared
 /// expert is added: PrefillCombineKernel's expressions with the same
 /// pinned values, so the result equals its output bit for bit.
-__device__ __forceinline__ void Exl3PrefillMoeSegment(
-    const Exl3PrefillMoeRows& m, unsigned t, unsigned segment, unsigned lane,
-    float (&out)[4]) {
+/// RawT/kPacked: _Float16 rows at their inverse (packed) positions, or the
+/// routed decode's FP32 rows in assignment order (inverse unused).
+template<typename RawT, bool kPacked>
+__device__ __forceinline__ void Exl3MoeSegment(const Exl3PrefillMoeRows& m,
+                                               unsigned t, unsigned segment,
+                                               unsigned lane, float (&out)[4]) {
   namespace arithmetic = gufo::hip::exl3;
   const unsigned first = segment * 128 + lane * 4;
   constexpr unsigned kMaxSlots = 16;
@@ -49,7 +53,8 @@ __device__ __forceinline__ void Exl3PrefillMoeSegment(
     if (slot >= m.used)
       break;
     const unsigned assignment = t * m.used + slot;
-    const unsigned packed = static_cast<unsigned>(m.inverse[assignment]);
+    const unsigned packed =
+        kPacked ? static_cast<unsigned>(m.inverse[assignment]) : assignment;
     // Routing IDs and inverse rows share the original token/slot order.
     // Reuse the ID instead of searching bucket offsets for every segment.
     const auto expert = static_cast<unsigned>(m.ids[assignment]);
@@ -57,8 +62,9 @@ __device__ __forceinline__ void Exl3PrefillMoeSegment(
     const auto offset = std::size_t{packed} * m.width + first;
     // Read adjacent operands together before the arithmetic pins, which
     // otherwise serialize four independent loads and their waits.
-    _Float16 raw[4], signs[4];
-    __builtin_memcpy(raw, static_cast<const _Float16*>(m.raw) + offset,
+    RawT raw[4];
+    _Float16 signs[4];
+    __builtin_memcpy(raw, static_cast<const RawT*>(m.raw) + offset,
                      sizeof(raw));
     __builtin_memcpy(signs, svh + first, sizeof(signs));
     float v[4];
@@ -95,6 +101,12 @@ __device__ __forceinline__ void Exl3PrefillMoeSegment(
     asm volatile("" : "+v"(o));
     out[j] = o;
   }
+}
+
+__device__ __forceinline__ void Exl3PrefillMoeSegment(
+    const Exl3PrefillMoeRows& m, unsigned t, unsigned segment, unsigned lane,
+    float (&out)[4]) {
+  Exl3MoeSegment<_Float16, true>(m, t, segment, lane, out);
 }
 #endif
 

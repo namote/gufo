@@ -13,6 +13,7 @@
 #include "src/core/hip/detail/kvarn_device.hpp"
 #include "src/core/hip/kv_block_table.hpp"
 #include "src/core/hip/kvarn_layout.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/exl3_prefill_combine.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 
@@ -3990,10 +3991,11 @@ __global__ void AttentionMergeKernel(const float* partials, float* out,
 
 // Keep the original block-wide softmax reduction. Selection then stays in
 // one wave's registers, retaining probability ordering and lowest-index ties.
+// Threads past the first wave return early.
 template<unsigned MaxExperts>
-__global__ void RouterTopKKernel(const float* logits, std::uint32_t stride,
-                                 std::int32_t* ids, float* weights,
-                                 std::uint32_t n_experts, std::uint32_t k) {
+__device__ __forceinline__ void RouterTopKBody(
+    const float* logits, std::uint32_t stride, std::int32_t* ids,
+    float* weights, std::uint32_t n_experts, std::uint32_t k) {
   __shared__ float probs[1024];
   __shared__ float shared[32];
   __shared__ std::uint32_t chosen[32];
@@ -4066,6 +4068,111 @@ __global__ void RouterTopKKernel(const float* logits, std::uint32_t stride,
       weights[t * k + slot] = chosen_p[slot] / sum;
     }
   }
+}
+
+template<unsigned MaxExperts>
+__global__ void RouterTopKKernel(const float* logits, std::uint32_t stride,
+                                 std::int32_t* ids, float* weights,
+                                 std::uint32_t n_experts, std::uint32_t k) {
+  RouterTopKBody<MaxExperts>(logits, stride, ids, weights, n_experts, k);
+}
+
+/// RouterTopKKernel, then the last block to finish groups all of the grid's
+/// IDs into BuildTiles' tiles with its first wave: per expert in assignment
+/// order, a new tile every tile_rows assignments. Tile positions follow the
+/// leading assignment's order instead of BuildTiles' atomic order; every
+/// tile still covers the same rows and writes disjoint outputs.
+template<unsigned MaxExperts>
+__global__ void RouterTopKTilesKernel(const float* logits, std::uint32_t stride,
+                                      std::int32_t* ids, float* weights,
+                                      std::uint32_t n_experts, std::uint32_t k,
+                                      Exl3RouteTile* tiles,
+                                      std::uint32_t* tile_count,
+                                      std::uint32_t* arrivals,
+                                      std::uint32_t tile_rows) {
+  RouterTopKBody<MaxExperts>(logits, stride, ids, weights, n_experts, k);
+  if (threadIdx.x >= 32)
+    return;
+  // Thread 0 wrote this block's IDs; publish them before arriving. The
+  // counter wraps to zero on the last arrival, ready for the next launch.
+  unsigned last = 0;
+  if (threadIdx.x == 0) {
+    __threadfence();
+    last = atomicInc(arrivals, gridDim.x - 1) == gridDim.x - 1;
+  }
+  if (__shfl(last, 0, 32) == 0)
+    return;
+  __threadfence();
+  constexpr unsigned kChunks = kExl3FusedTileAssignments / 32;
+  const unsigned lane = threadIdx.x;
+  const unsigned n = gridDim.x * k;
+  // Lane l holds assignments l + 32 c in registers; each pass broadcasts
+  // every ID in assignment order (fixed chunk indices, no local array).
+  int mine[kChunks];
+  unsigned rank[kChunks], total[kChunks];
+#pragma unroll
+  for (unsigned c = 0; c < kChunks; ++c) {
+    const unsigned i = lane + c * 32;
+    mine[c] = i < n ? __hip_atomic_load(ids + i, __ATOMIC_RELAXED,
+                                        __HIP_MEMORY_SCOPE_AGENT)
+                    : -1;
+    rank[c] = 0;
+    total[c] = 0;
+  }
+#pragma unroll
+  for (unsigned cj = 0; cj < kChunks; ++cj) {
+    for (unsigned l = 0; l < 32 && cj * 32 + l < n; ++l) {
+      const int e = __shfl(mine[cj], l, 32);
+      const unsigned j = cj * 32 + l;
+#pragma unroll
+      for (unsigned c = 0; c < kChunks; ++c) {
+        if (mine[c] == e) {
+          ++total[c];
+          rank[c] += j < lane + c * 32 ? 1U : 0U;
+        }
+      }
+    }
+  }
+  // A tile starts at every tile_rows-th assignment of its expert; leaders
+  // take consecutive positions in assignment order.
+  unsigned base = 0, position[kChunks], count[kChunks], filled[kChunks];
+#pragma unroll
+  for (unsigned c = 0; c < kChunks; ++c) {
+    const bool leader = mine[c] >= 0 && rank[c] % tile_rows == 0;
+    const auto ballot = static_cast<std::uint32_t>(__ballot(leader));
+    position[c] = leader ? base + __popc(ballot & ((1U << lane) - 1U)) : ~0U;
+    count[c] = leader ? min(tile_rows, total[c] - rank[c]) : 0U;
+    filled[c] = 0;
+    base += __popc(ballot);
+  }
+  // Each leader takes the next `count` assignments of its expert, itself
+  // first, in assignment order.
+#pragma unroll
+  for (unsigned cj = 0; cj < kChunks; ++cj) {
+    for (unsigned l = 0; l < 32 && cj * 32 + l < n; ++l) {
+      const int e = __shfl(mine[cj], l, 32);
+      const unsigned j = cj * 32 + l;
+#pragma unroll
+      for (unsigned c = 0; c < kChunks; ++c) {
+        if (mine[c] == e && j >= lane + c * 32 && filled[c] < count[c]) {
+          tiles[position[c]].slots[filled[c]] = j;
+          ++filled[c];
+        }
+      }
+    }
+  }
+#pragma unroll
+  for (unsigned c = 0; c < kChunks; ++c) {
+    if (count[c] != 0) {
+      Exl3RouteTile& tile = tiles[position[c]];
+      tile.expert = static_cast<std::uint32_t>(mine[c]);
+      tile.count = count[c];
+      for (unsigned r = count[c]; r < 8; ++r)
+        tile.slots[r] = 0;
+    }
+  }
+  if (lane == 0)
+    *tile_count = base;
 }
 
 /// grid (tokens, dim chunks of kThreads). Up to kMaxSlots slots, every read
@@ -9089,6 +9196,23 @@ void RouterTopK(const float* logits, std::uint32_t stride, std::int32_t* ids,
     hipLaunchKernelGGL((RouterTopKKernel<1024>), dim3(n_tokens), dim3(kThreads),
                        0, stream, logits, stride, ids, weights, n_experts, k);
   }
+}
+
+void RouterTopKTiles(const float* logits, std::uint32_t stride,
+                     std::int32_t* ids, float* weights, std::uint32_t n_tokens,
+                     std::uint32_t n_experts, std::uint32_t k,
+                     Exl3RouteTile* tiles, std::uint32_t* tile_count,
+                     std::uint32_t* arrivals, std::uint32_t tile_rows,
+                     hipStream_t stream) {
+  if (n_tokens == 0 ||
+      std::uint64_t{n_tokens} * k > kExl3FusedTileAssignments ||
+      tile_rows == 0 || tile_rows > 8 || arrivals == nullptr)
+    throw std::invalid_argument("fused router tiles: unsupported call");
+  const auto kernel = n_experts <= 512 ? RouterTopKTilesKernel<512>
+                                       : RouterTopKTilesKernel<1024>;
+  hipLaunchKernelGGL(kernel, dim3(n_tokens), dim3(kThreads), 0, stream, logits,
+                     stride, ids, weights, n_experts, k, tiles, tile_count,
+                     arrivals, tile_rows);
 }
 
 void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,

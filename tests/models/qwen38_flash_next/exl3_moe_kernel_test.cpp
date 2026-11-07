@@ -576,6 +576,72 @@ void FusedProducer(unsigned rows, bool shared, int bits = 5, int up_bits = 0,
     Near(std::span(actual).subspan(slot * k, k), expected,
          "routed output FP64 frozen-input contract");
   }
+  // Decode glue: the untraced call (restore folded into the down-input
+  // scaling) stores the traced call's bytes; raw down dots plus the fused
+  // restore/combine equal the restored rows plus MoeEpilogue, byte for byte.
+  {
+    const auto same = [](const auto& a, const auto& b) {
+      return a.size() == b.size() &&
+             std::memcmp(a.data(), b.data(), a.size() * sizeof(a[0])) == 0;
+    };
+    auto* untraced = buffers.Make<float>(assignments * k);
+    gpu::Exl3RoutedMlp(layer, dx, di, g, u, untraced, rows, used, s, nullptr);
+    Require(same(actual, Read(untraced, assignments * k)),
+            "fused restore/scale changed routed rows");
+    std::vector<float> weights(assignments), shared_rows(rows * k),
+        gates(rows * 2);
+    for (auto& v : weights)
+      v = (int(rng() % 1000) + 1) * 0.001F;
+    for (auto& v : shared_rows)
+      v = (int(rng() % 2000) - 1000) * 0.001F;
+    for (auto& v : gates)
+      v = (int(rng() % 2000) - 1000) * 0.004F;
+    auto* dw = buffers.Copy(weights);
+    auto* dsh = buffers.Copy(shared_rows);
+    auto* dg = buffers.Copy(gates);
+    auto* reference = buffers.Make<float>(rows * k);
+    gpu::MoeEpilogue(y, dw, dsh, dg + 1, 2, reference, rows, used, k, nullptr);
+    auto* raw = buffers.Make<float>(assignments * k);
+    gpu::Exl3RoutedMlp(layer, dx, di, g, u, raw, rows, used, s, nullptr,
+                       nullptr, false, true);
+    auto* combined = buffers.Make<float>(rows * k);
+    gpu::Exl3RoutedCombine(layer, di, rows, used, raw, dw, dsh, dg + 1, 2,
+                           combined, nullptr);
+    Require(same(Read(reference, rows * k), Read(combined, rows * k)),
+            "fused routed combine differs from restore + MoeEpilogue");
+    // Router top-k with the routed tiles: the same IDs/weights as RouterTopK
+    // and, through tiles_ready, the same routed rows as BuildTiles' tiles.
+    // Two launches check that the arrival counter returns to zero.
+    std::vector<float> logits(rows * (experts + 1));
+    for (auto& v : logits)
+      v = (int(rng() % 4000) - 2000) * 0.002F;
+    auto* dl = buffers.Copy(logits);
+    auto* ref_ids = buffers.Make<std::int32_t>(assignments);
+    auto* ref_w = buffers.Make<float>(assignments);
+    gpu::RouterTopK(dl, experts + 1, ref_ids, ref_w, rows, experts, used,
+                    nullptr);
+    auto* arrivals = buffers.Make<std::uint32_t>(1);
+    auto* tile_ids = buffers.Make<std::int32_t>(assignments);
+    auto* tile_w = buffers.Make<float>(assignments);
+    auto* built = buffers.Make<float>(assignments * k);
+    auto* fused_rows = buffers.Make<float>(assignments * k);
+    gpu::Exl3RoutedMlp(layer, dx, ref_ids, g, u, built, rows, used, s, nullptr,
+                       nullptr, false, true);
+    for (unsigned launch = 0; launch < 2; ++launch) {
+      gpu::RouterTopKTiles(dl, experts + 1, tile_ids, tile_w, rows, experts,
+                           used, s.tiles, s.tile_count, arrivals,
+                           gpu::Exl3RouteTileRows(rows), nullptr);
+      Require(Read(arrivals, 1)[0] == 0, "router tile arrivals not reset");
+      Require(same(Read(ref_ids, assignments), Read(tile_ids, assignments)) &&
+                  same(Read(ref_w, assignments), Read(tile_w, assignments)),
+              "router tiles changed routing");
+      gpu::Exl3RoutedMlp(layer, dx, tile_ids, g, u, fused_rows, rows, used, s,
+                         nullptr, nullptr, true, true);
+      Require(
+          same(Read(built, assignments * k), Read(fused_rows, assignments * k)),
+          "router-built tiles changed routed rows");
+    }
+  }
   // Capture the complete producer + scale + dot path. Input is regenerated
   // on each replay; the scaled scratch must never be scaled twice.
   if (rows == 3) {

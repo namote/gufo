@@ -22,6 +22,8 @@
 
 namespace gufo::models::qwen38_flash_next::rocm {
 
+struct Exl3RouteTile;  // exl3_moe.hpp
+
 /// Host launch values, copied into kernel arguments before returning. The
 /// device descriptor tables may be reused on the same stream after GEMM;
 /// no mapped host descriptor is overwritten while the GPU still reads it.
@@ -721,6 +723,17 @@ void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,
 void RouterTopK(const float* logits, std::uint32_t stride, std::int32_t* ids,
                 float* weights, std::uint32_t n_tokens, std::uint32_t n_experts,
                 std::uint32_t k, hipStream_t stream);
+/// RouterTopK, then the routed decode's expert tiles for all n_tokens * k
+/// IDs (Exl3RoutedMlp's BuildTiles grouping: assignment order per expert,
+/// tile_rows per tile) by the last block to finish, with the tile count
+/// stored rather than accumulated. `arrivals` is zero-initialized and
+/// returns to zero. Requires n_tokens * k <= kExl3FusedTileAssignments.
+void RouterTopKTiles(const float* logits, std::uint32_t stride,
+                     std::int32_t* ids, float* weights, std::uint32_t n_tokens,
+                     std::uint32_t n_experts, std::uint32_t k,
+                     Exl3RouteTile* tiles, std::uint32_t* tile_count,
+                     std::uint32_t* arrivals, std::uint32_t tile_rows,
+                     hipStream_t stream);
 
 /// out[t][i] = sum_s weights[t][s] * expert_out[t*k + s][i]
 ///           + sigmoid(gate[t * gate_stride]) * shared[t][i].

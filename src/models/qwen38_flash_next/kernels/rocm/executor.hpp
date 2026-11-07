@@ -1016,6 +1016,9 @@ private:
   bool wide_mixer_{false};
   /// Set by Moe when its epilogue is left for the combine that follows.
   mutable bool moe_pending_{false};
+  /// Moe's router also built exl3_'s routed decode tiles for its IDs; the
+  /// following Exl3Experts consumes (and clears) it.
+  mutable bool exl3_tiles_ready_{false};
   /// Set before an attention-side combine whose FFN combine fuses the MoE
   /// epilogue: that combine may then leave its residual update to the next
   /// one (res_deferred_), which reads s_.block_out and s_.hc_defer_w.
