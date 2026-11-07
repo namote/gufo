@@ -2777,6 +2777,18 @@ __global__ void SsmConvKernel(const float* qkv, std::uint32_t qkv_stride,
   out[idx] = SiluF(acc);
 }
 
+/// The 4-tap causal convolution of one channel and token, SiLU applied, in
+/// one explicit rounding sequence: every convolution route (token tiles,
+/// saved history, the fused SSM projection and its boundary rows) shares it,
+/// so the fast-math build cannot reassociate one route differently.
+__device__ __forceinline__ float SsmConv4Value(float4 w, float x0, float x1,
+                                               float x2, float x3) {
+  float acc = __fmaf_rn(w.x, x0, __fmul_rn(w.y, x1));
+  acc = __fmaf_rn(w.z, x2, acc);
+  acc = __fmaf_rn(w.w, x3, acc);
+  return SiluF(acc);
+}
+
 /// SsmConvKernel with one thread per (channel, kTokensPerThread tokens) for
 /// the 4-tap kernel: the taps stay in one float4 and the window slides in
 /// registers, so a token costs one load and one store instead of eight
@@ -2824,22 +2836,21 @@ __device__ __forceinline__ void SsmConv4Body(
       break;
     }
     const float v = qkv[static_cast<std::size_t>(t) * qkv_stride + c];
-    float acc;
     if constexpr (stable) {
       // EXL3 keeps the same multiply then three FMA boundaries for every
       // token tile, independent of history-saving and chunk width.
-      acc = Materialize(Materialize(taps.x) * Materialize(window[0]));
+      float acc = Materialize(Materialize(taps.x) * Materialize(window[0]));
       acc = Materialize(
           __builtin_fmaf(Materialize(taps.y), Materialize(window[1]), acc));
       acc = Materialize(
           __builtin_fmaf(Materialize(taps.z), Materialize(window[2]), acc));
       acc =
           Materialize(__builtin_fmaf(Materialize(taps.w), Materialize(v), acc));
+      out[static_cast<std::size_t>(t) * channels + c] = SiluF(acc);
     } else {
-      acc = taps.x * window[0] + taps.y * window[1] + taps.z * window[2] +
-            taps.w * v;
+      out[static_cast<std::size_t>(t) * channels + c] =
+          SsmConv4Value(taps, window[0], window[1], window[2], v);
     }
-    out[static_cast<std::size_t>(t) * channels + c] = SiluF(acc);
     window[0] = window[1];
     window[1] = window[2];
     window[2] = v;
@@ -7892,16 +7903,6 @@ bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
     default:
       return false;
   }
-}
-
-// Keep the separate four-tap convolution's F32 rounding order when its
-// inputs come from the projection's LDS tile.
-__device__ __forceinline__ float SsmConv4Value(float4 w, float x0, float x1,
-                                               float x2, float x3) {
-  float acc = __fmaf_rn(w.x, x0, __fmul_rn(w.y, x1));
-  acc = __fmaf_rn(w.z, x2, acc);
-  acc = __fmaf_rn(w.w, x3, acc);
-  return SiluF(acc);
 }
 
 constexpr unsigned kSsmProjectionTileTokens = 32;
