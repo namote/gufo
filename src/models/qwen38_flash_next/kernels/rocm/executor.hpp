@@ -742,9 +742,9 @@ private:
                       std::uint32_t start_pos, const std::uint32_t* mask,
                       bool last_only, bool project_output, float* out,
                       std::string* error_msg) const;
-  /// Orders the main stream after the work queued on side_stream_.
   /// Whether side_stream_ is part of a graph capture (no synchronize).
   [[nodiscard]] bool SideCapturing() const;
+  /// Orders the main stream after the work queued on side_stream_.
   bool JoinSide(std::string* error_msg) const;
   bool Moe(const DeviceLayer& l, const float* x, float* out,
            std::uint32_t n_tokens, std::string* error_msg,
