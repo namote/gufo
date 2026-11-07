@@ -357,21 +357,19 @@ __global__ void RmsNormCachedKernel(const float* x, const float* gamma,
 /// segments of its row) also receive the row rotated for the EXL3 decode
 /// projections that read `mixed` next: wave w rotates segment w % 2 for
 /// consumer w / 2 from the block's stored values.
-/// The body runs block (t, part) of that grid (parts = gridDim.y). kCoherent
-/// reads `gate` with agent-scope loads, for a caller whose own grid wrote it
-/// (HcUpMixKernel's last block per chunk).
-template<std::uint32_t kStreams, bool kCoherent = false>
-__device__ __forceinline__ void HcMixEpilogueBody(
-    const float* xn, const float* gate, const float* inject_w, float* mixed,
-    float* inject, std::uint32_t hidden, std::uint32_t streams, void* mixed_q8,
-    const Exl3InputSlabs& slabs, std::uint32_t t, std::uint32_t part,
-    std::uint32_t parts) {
+template<std::uint32_t kStreams>
+__global__ void HcMixEpilogueKernel(const float* xn, const float* gate,
+                                    const float* inject_w, float* mixed,
+                                    float* inject, std::uint32_t hidden,
+                                    std::uint32_t streams, void* mixed_q8,
+                                    Exl3InputSlabs slabs) {
   constexpr std::uint32_t kMaxStreams = 8;
   constexpr std::uint32_t kSlots = kStreams != 0 ? kStreams : kMaxStreams;
   if constexpr (kStreams != 0) {
     streams = kStreams;
   }
-  const std::uint32_t i = part * blockDim.x + threadIdx.x;
+  const std::uint32_t t = blockIdx.x;
+  const std::uint32_t i = blockIdx.y * blockDim.x + threadIdx.x;
   const std::size_t hc_dim = static_cast<std::size_t>(streams) * hidden;
   const float* x = xn + static_cast<std::size_t>(t) * hc_dim;
   const float* g = gate + static_cast<std::size_t>(t) * hc_dim;
@@ -382,12 +380,7 @@ __device__ __forceinline__ void HcMixEpilogueBody(
   for (std::uint32_t s = 0; s < kSlots; ++s) {
     const std::size_t idx = static_cast<std::size_t>(s) * hidden + i;
     v[s] = live && s < streams ? x[idx] : 0.0f;
-    if constexpr (kCoherent)
-      gv[s] = live && s < streams ? __hip_atomic_load(g + idx, __ATOMIC_RELAXED,
-                                                      __HIP_MEMORY_SCOPE_AGENT)
-                                  : 0.0f;
-    else
-      gv[s] = live && s < streams ? g[idx] : 0.0f;
+    gv[s] = live && s < streams ? g[idx] : 0.0f;
   }
   float wv[kSlots][kSlots];
 #pragma unroll
@@ -427,8 +420,8 @@ __device__ __forceinline__ void HcMixEpilogueBody(
       float seg[4] = {row[local], row[local + 1], row[local + 2],
                       row[local + 3]};
       const SlabTarget target = SlabOf(slabs, w / 2);
-      hip::exl3::RotateInputSegment(seg, l, part * kThreads + local, target.suh,
-                                    target.out, t, slabs.pass_rows);
+      hip::exl3::RotateInputSegment(seg, l, blockIdx.y * kThreads + local,
+                                    target.suh, target.out, t, slabs.pass_rows);
     }
   }
   if (inject_w == nullptr) {
@@ -464,20 +457,9 @@ __device__ __forceinline__ void HcMixEpilogueBody(
     for (std::uint32_t w = 0; w < blockDim.x / warpSize; ++w) {
       total += partial[threadIdx.x][w];
     }
-    inject[(static_cast<std::size_t>(t) * streams + threadIdx.x) * parts +
-           part] = total;
+    inject[(static_cast<std::size_t>(t) * streams + threadIdx.x) * gridDim.y +
+           blockIdx.y] = total;
   }
-}
-
-template<std::uint32_t kStreams>
-__global__ void HcMixEpilogueKernel(const float* xn, const float* gate,
-                                    const float* inject_w, float* mixed,
-                                    float* inject, std::uint32_t hidden,
-                                    std::uint32_t streams, void* mixed_q8,
-                                    Exl3InputSlabs slabs) {
-  HcMixEpilogueBody<kStreams>(xn, gate, inject_w, mixed, inject, hidden,
-                              streams, mixed_q8, slabs, blockIdx.x, blockIdx.y,
-                              gridDim.y);
 }
 
 /// r + b * w as the four-lane combine forms the updated residual, one FMA
@@ -5733,164 +5715,6 @@ struct Q8_0Block {
   std::int8_t qs[32];
 };
 static_assert(sizeof(Q8_0Block) == 34, "block_q8_0 must be 34 bytes");
-
-/// mmq's get_int_b2: four bytes of a 2-byte aligned code array.
-__device__ __forceinline__ int Q8Int2(const std::int8_t* qs, int i32) {
-  const auto* x16 = reinterpret_cast<const std::uint16_t*>(qs);
-  return static_cast<int>(x16[2 * i32]) |
-         (static_cast<int>(x16[2 * i32 + 1]) << 16);
-}
-
-/// mmq's get_int_b4 on a Q8_1 block's 4-byte aligned codes.
-__device__ __forceinline__ int Q8Int4(const std::int8_t* qs, int i32) {
-  return reinterpret_cast<const int*>(qs)[i32];
-}
-
-__device__ __forceinline__ int Dp4a(int a, int b, int c) {
-  return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
-}
-
-/// The decode HC down projection (N = 320, K = 10240) with qfn_mmq's
-/// qfn_q8_hc_down_kernel arithmetic (two prefetched K iterations, the same
-/// per-lane order, rounded products and wave butterfly), then the last of
-/// its blocks to finish applies SiluScaleQ8Kernel to every row: lo =
-/// silu(lo * scale), quantized into Q8_1 rows of `k_padded` for the up
-/// projection. The arrival counter wraps to zero on the last arrival.
-template<unsigned kTokens>
-__global__ __launch_bounds__(32) void HcDownSiluQ8Kernel(
-    const Q8_0Block* __restrict__ weights, const Q8_1Block* __restrict__ input,
-    float* lo, float scale, std::uint32_t k_padded, void* lo_q8,
-    std::uint32_t* arrivals) {
-  constexpr int kRows = 320;
-  constexpr int kBlocks = 10240 / 32;
-  constexpr int kPrefetch = 2;
-  const int lane = static_cast<int>(threadIdx.x);
-  const int part = (lane & 3) * 2;
-  float sum[kTokens] = {};
-  for (int first = lane / 4; first < kBlocks; first += 8 * kPrefetch) {
-    int v[kPrefetch][2], u[kPrefetch][kTokens][2];
-    __half dw[kPrefetch], dx[kPrefetch][kTokens];
-#pragma unroll
-    for (int j = 0; j < kPrefetch; ++j) {
-      const int kb = first + 8 * j;
-      const Q8_0Block& w = weights[blockIdx.x * kBlocks + kb];
-      dw[j] = w.d;
-#pragma unroll
-      for (int i = 0; i < 2; ++i)
-        v[j][i] = Q8Int2(w.qs, part + i);
-#pragma unroll
-      for (unsigned t = 0; t < kTokens; ++t) {
-        const Q8_1Block& x = input[t * kBlocks + kb];
-        dx[j][t] = __low2half(x.ds);
-#pragma unroll
-        for (int i = 0; i < 2; ++i)
-          u[j][t][i] = Q8Int4(x.qs, part + i);
-      }
-    }
-    __builtin_amdgcn_sched_barrier(0);
-#pragma unroll
-    for (int j = 0; j < kPrefetch; ++j) {
-#pragma unroll
-      for (unsigned t = 0; t < kTokens; ++t) {
-        int dot = Dp4a(v[j][0], u[j][t][0], 0);
-        dot = Dp4a(v[j][1], u[j][t][1], dot);
-        // One rounding sequence for every width keeps a row's result
-        // independent of how many rows share the launch.
-        const float product =
-            __fmul_rn(__half2float(dw[j]), static_cast<float>(dot));
-        sum[t] = __fmaf_rn(__half2float(dx[j][t]), product, sum[t]);
-      }
-    }
-  }
-  unsigned last = 0;
-#pragma unroll
-  for (unsigned t = 0; t < kTokens; ++t) {
-    const float total = WaveSum(sum[t]);
-    if (lane == 0)
-      lo[t * kRows + blockIdx.x] = total;
-  }
-  if (lane == 0) {
-    __threadfence();
-    last = atomicInc(arrivals, gridDim.x - 1) == gridDim.x - 1;
-  }
-  if (__shfl(last, 0, 32) == 0)
-    return;
-  __threadfence();
-  for (unsigned t = 0; t < kTokens; ++t) {
-    for (int g = 0; g < kRows / 32; ++g) {
-      const unsigned i = t * kRows + g * 32 + lane;
-      const float v = SiluF(__hip_atomic_load(lo + i, __ATOMIC_RELAXED,
-                                              __HIP_MEMORY_SCOPE_AGENT) *
-                            scale);
-      lo[i] = v;
-      QuantizeQ8_1Lane(v, lo_q8, std::size_t{t} * k_padded + g * 32 + lane);
-    }
-  }
-}
-
-/// Blocks of HcUpMixKernel per hidden chunk of kThreads columns: the chunk's
-/// four streams of gate rows, one row per wave.
-constexpr unsigned kHcUpChunkBlocks = 4 * kThreads / (kThreads / 32);
-
-/// The decode HC up projection (Q8_0 weights of `k` columns over the Q8_1
-/// rows of lo, `lo_stride` blocks apart) with mul_mat_vec_q8's per-wave
-/// arithmetic, one gate row per wave, then the mix epilogue: block b serves
-/// hidden chunk c = b / kHcUpChunkBlocks, and the last of a chunk's blocks
-/// to store its gate rows runs HcMixEpilogueKernel's block (t, c) for every
-/// token, reading the gate back with agent-scope loads. Four streams,
-/// hidden % kThreads == 0. Each chunk's arrival counter wraps to zero.
-template<unsigned kTokens>
-__global__ __launch_bounds__(kThreads) void HcUpMixKernel(
-    const Q8_0Block* __restrict__ weights, const Q8_1Block* __restrict__ lo,
-    std::uint32_t lo_stride, std::uint32_t k, float* gate, const float* xn,
-    const float* inject_w, float* mixed, float* inject, std::uint32_t hidden,
-    void* mixed_q8, Exl3InputSlabs slabs, std::uint32_t* arrivals) {
-  constexpr unsigned kWaves = kThreads / 32;
-  const unsigned chunk = blockIdx.x / kHcUpChunkBlocks;
-  const unsigned local =
-      (blockIdx.x % kHcUpChunkBlocks) * kWaves + threadIdx.x / 32;
-  const unsigned rows = 4 * hidden;
-  const unsigned row =
-      (local / kThreads) * hidden + chunk * kThreads + local % kThreads;
-  const int lane = static_cast<int>(threadIdx.x % 32);
-  const int blocks_per_row = static_cast<int>(k / 32);
-  const int kqs = 2 * (lane % 4);
-  const Q8_0Block* w_row = weights + std::size_t{row} * blocks_per_row;
-  float sum[kTokens] = {};
-  for (int kbx = lane / 4; kbx < blocks_per_row; kbx += 8) {
-#pragma unroll
-    for (unsigned t = 0; t < kTokens; ++t) {
-      const Q8_0Block& w = w_row[kbx];
-      const Q8_1Block& x = lo[t * lo_stride + kbx];
-      int sumi = Dp4a(Q8Int2(w.qs, kqs), Q8Int4(x.qs, kqs), 0);
-      sumi = Dp4a(Q8Int2(w.qs, kqs + 1), Q8Int4(x.qs, kqs + 1), sumi);
-      sum[t] +=
-          __half2float(w.d) * __low2float(x.ds) * static_cast<float>(sumi);
-    }
-  }
-#pragma unroll
-  for (unsigned t = 0; t < kTokens; ++t) {
-    const float total = WaveSum(sum[t]);
-    if (lane == 0)
-      gate[std::size_t{t} * rows + row] = total;
-  }
-  __shared__ unsigned last;
-  __threadfence();
-  __syncthreads();
-  if (threadIdx.x == 0)
-    last = atomicInc(arrivals + chunk, kHcUpChunkBlocks - 1) ==
-           kHcUpChunkBlocks - 1;
-  __syncthreads();
-  if (last == 0)
-    return;
-  __threadfence();
-  const unsigned parts = hidden / kThreads;
-  for (unsigned t = 0; t < kTokens; ++t) {
-    HcMixEpilogueBody<4, true>(xn, gate, inject_w, mixed, inject, hidden, 4,
-                               mixed_q8, slabs, t, chunk, parts);
-    __syncthreads();  // the next token reuses the body's shared rows
-  }
-}
 /// W8A8TailKernel limits: tokens past the last full tile and K width.
 constexpr std::size_t kW8A8TailMaxTokens = 16;
 constexpr std::size_t kW8A8TailMaxK = 10240;
@@ -7392,74 +7216,6 @@ bool SiluScaleQ8_1(float* x, float scale, std::uint32_t rows, std::uint32_t k,
   hipLaunchKernelGGL(SiluScaleQ8Kernel, dim3(Blocks(count)), dim3(kThreads), 0,
                      stream, x, scale, count, k, k_padded, x_q8);
   return true;
-}
-
-namespace {
-
-template<unsigned kTokens = 1>
-void LaunchHcDownSiluQ8(const void* weights, const void* input, float* lo,
-                        float scale, std::uint32_t rows, std::uint32_t k_padded,
-                        void* lo_q8, std::uint32_t* arrivals,
-                        hipStream_t stream) {
-  if (rows == kTokens) {
-    hipLaunchKernelGGL((HcDownSiluQ8Kernel<kTokens>), dim3(320), dim3(32), 0,
-                       stream, static_cast<const Q8_0Block*>(weights),
-                       static_cast<const Q8_1Block*>(input), lo, scale,
-                       k_padded, lo_q8, arrivals);
-  } else if constexpr (kTokens < kHcDecodeMaxRows) {
-    LaunchHcDownSiluQ8<kTokens + 1>(weights, input, lo, scale, rows, k_padded,
-                                    lo_q8, arrivals, stream);
-  }
-}
-
-template<unsigned kTokens = 1>
-void LaunchHcUpMix(const void* weights, const void* lo_q8,
-                   std::uint32_t lo_stride, std::uint32_t k, float* gate,
-                   const float* xn, const float* inject_w, float* mixed,
-                   float* inject, std::uint32_t rows, std::uint32_t hidden,
-                   void* mixed_q8, const Exl3InputSlabs& slabs,
-                   std::uint32_t* arrivals, hipStream_t stream) {
-  if (rows == kTokens) {
-    hipLaunchKernelGGL(
-        (HcUpMixKernel<kTokens>), dim3(hidden / kThreads * kHcUpChunkBlocks),
-        dim3(kThreads), 0, stream, static_cast<const Q8_0Block*>(weights),
-        static_cast<const Q8_1Block*>(lo_q8), lo_stride, k, gate, xn, inject_w,
-        mixed, inject, hidden, mixed_q8, slabs, arrivals);
-  } else if constexpr (kTokens < kHcDecodeMaxRows) {
-    LaunchHcUpMix<kTokens + 1>(weights, lo_q8, lo_stride, k, gate, xn, inject_w,
-                               mixed, inject, rows, hidden, mixed_q8, slabs,
-                               arrivals, stream);
-  }
-}
-
-}  // namespace
-
-void HcDownSiluQ8_1(const void* weights, const void* input, float* lo,
-                    float scale, std::uint32_t rows, std::uint32_t k_padded,
-                    void* lo_q8, std::uint32_t* arrivals, hipStream_t stream) {
-  if (rows == 0 || rows > kHcDecodeMaxRows || k_padded < 320 ||
-      k_padded % 32 != 0 || arrivals == nullptr)
-    throw std::invalid_argument("fused HC down: unsupported call");
-  LaunchHcDownSiluQ8(weights, input, lo, scale, rows, k_padded, lo_q8, arrivals,
-                     stream);
-}
-
-bool HcUpMix(const void* weights, const void* lo_q8, std::uint32_t lo_stride,
-             std::uint32_t k, float* gate, const float* xn,
-             const float* inject_w, float* mixed, float* inject,
-             std::uint32_t rows, std::uint32_t hidden, hipStream_t stream,
-             void* mixed_q8, const Exl3InputSlabs& slabs,
-             std::uint32_t* arrivals) {
-  if (rows == 0 || rows > kHcDecodeMaxRows || hidden == 0 ||
-      hidden % kThreads != 0 || hidden / kThreads > kHcUpMaxChunks || k == 0 ||
-      k % 32 != 0 || lo_stride < k / 32 || arrivals == nullptr)
-    throw std::invalid_argument("fused HC up and mix: unsupported call");
-  const bool rotate =
-      slabs.count != 0 && slabs.k == hidden && rows <= slabs.pass_rows;
-  LaunchHcUpMix(weights, lo_q8, lo_stride, k, gate, xn, inject_w, mixed, inject,
-                rows, hidden, mixed_q8, rotate ? slabs : Exl3InputSlabs{},
-                arrivals, stream);
-  return rotate;
 }
 
 void Swiglu(float* gate, const float* up, std::size_t count,
