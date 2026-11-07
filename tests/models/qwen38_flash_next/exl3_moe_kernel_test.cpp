@@ -252,6 +252,7 @@ int main() {
 #include "src/core/hip/detail/exl3_gemv.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "tests/models/qwen38_flash_next/exl3_routed_reference.hpp"
 
 namespace gpu = gufo::models::qwen38_flash_next::rocm;
 namespace ex = gufo::quant::exl3;
@@ -1904,6 +1905,157 @@ void RouterTilesSet(unsigned rows, unsigned used) {
           "router tile fixture never split an expert");
 }
 
+// B5 J2: the routed decode GEMV's output bytes against the pre-B5 kernel
+// (exl3_routed_reference.hpp) on the model's shapes (hidden 2560, expert
+// width 640, ten experts per token): gate/up, the scaled down projection
+// and its widened FP32 control, every tile-row cap R = 1..8, distinct and
+// shared experts (1..8-row tiles), K4 and K3.5.
+void RoutedReference(unsigned rows, bool shared, int bits, bool half) {
+  namespace ref = gufo::tests::exl3_routed_reference;
+  constexpr unsigned k = 2560, ff = 640, used = 10, experts = 24;
+  const unsigned assignments = rows * used;
+  Buffers buffers;
+  Bank gate(buffers, k, ff, experts, 11, false, bits, half),
+      up(buffers, k, ff, experts, 12, false, bits, half),
+      down(buffers, ff, k, experts, 13, false, bits, half);
+  gpu::DeviceLayer layer;
+  layer.ffn_gate_exps = gate.weight;
+  layer.ffn_up_exps = up.weight;
+  layer.ffn_down_exps = down.weight;
+  std::vector<float> input(rows * k);
+  std::mt19937 rng(17 + rows);
+  for (auto& v : input)
+    v = (int(rng() % 2000) - 1000) * 0.0005F;
+  if (rows > 1)
+    std::fill_n(input.end() - k, k, 0.0F);
+  std::vector<std::int32_t> ids(assignments);
+  for (unsigned i = 0; i < assignments; ++i)
+    ids[i] = shared ? i % used : (i * 7 + i / used) % experts;
+  auto* dx = buffers.Copy(input);
+  auto* di = buffers.Copy(ids);
+  auto* g = buffers.Make<float>(assignments * ff);
+  auto* u = buffers.Make<float>(assignments * ff);
+  auto* y = buffers.Make<float>(assignments * k);
+  gpu::Exl3Scratch s;
+  s.tiles = buffers.Make<gpu::Exl3RouteTile>(assignments);
+  s.tile_count = buffers.Make<std::uint32_t>(1);
+  s.down_exponents = buffers.Make<std::int32_t>(assignments);
+  s.routed_input = buffers.Make<std::uint16_t>(assignments * 2 * k);
+  gpu::Exl3RoutedTrace trace;
+  trace.gate_up_input = buffers.Make<std::uint16_t>(2 * assignments * k);
+  trace.gate_inner = buffers.Make<float>(assignments * ff);
+  trace.up_inner = buffers.Make<float>(assignments * ff);
+  trace.down_input = buffers.Make<std::uint16_t>(assignments * ff);
+  trace.down_inner = buffers.Make<float>(assignments * k);
+  trace.down_widened_inner = buffers.Make<float>(assignments * k);
+  gpu::Exl3RoutedMlp(layer, dx, di, g, u, y, rows, used, s, nullptr, &trace);
+  Check(hipDeviceSynchronize());
+  const unsigned tile_rows = gpu::Exl3RouteTileRows(rows);
+  const ex::BitRate rate{bits, half};
+  auto* g_ref = buffers.Make<float>(assignments * ff);
+  auto* u_ref = buffers.Make<float>(assignments * ff);
+  ref::LaunchRate<false, false>(rate, tile_rows, gate.weight.device_exl3,
+                                up.weight.device_exl3, s.tiles, s.tile_count,
+                                trace.gate_up_input, g_ref, u_ref, k, ff,
+                                assignments, 2, nullptr, nullptr);
+  // The routed input now holds the scaled down rows and s.down_exponents
+  // their exponents (the trace path runs ScaleDownRows).
+  auto* d_ref = buffers.Make<float>(assignments * k);
+  ref::LaunchRate<false, true>(rate, tile_rows, down.weight.device_exl3,
+                               down.weight.device_exl3, s.tiles, s.tile_count,
+                               s.routed_input, d_ref, d_ref, ff, k, assignments,
+                               1, s.down_exponents, nullptr);
+  auto* w_ref = buffers.Make<float>(assignments * k);
+  ref::LaunchRate<true, false>(rate, tile_rows, down.weight.device_exl3,
+                               down.weight.device_exl3, s.tiles, s.tile_count,
+                               trace.down_input, w_ref, w_ref, ff, k,
+                               assignments, 1, nullptr, nullptr);
+  Check(hipGetLastError());
+  Check(hipDeviceSynchronize());
+  const auto same = [&](const float* a, const float* b, std::size_t count,
+                        const char* what) {
+    const auto x = Read(a, count), z = Read(b, count);
+    const std::string name =
+        std::string("routed GEMV changed bytes vs pre-B5 kernel: ") + what +
+        " rows=" + std::to_string(rows) + (shared ? " shared" : " distinct") +
+        " K" + std::to_string(bits) + (half ? ".5" : "");
+    Require(std::memcmp(x.data(), z.data(), count * sizeof(float)) == 0,
+            name.c_str());
+  };
+  same(trace.gate_inner, g_ref, assignments * ff, "gate");
+  same(trace.up_inner, u_ref, assignments * ff, "up");
+  same(trace.down_inner, d_ref, assignments * k, "scaled down");
+  same(trace.down_widened_inner, w_ref, assignments * k, "widened down");
+  // The production widened down (no exponents) on the same input.
+  auto* widened_in = buffers.Make<std::uint16_t>(assignments * ff);
+  Check(hipMemcpy(widened_in, trace.down_input,
+                  std::size_t{assignments} * ff * sizeof(std::uint16_t),
+                  hipMemcpyDeviceToDevice));
+  auto* w_out = buffers.Make<float>(assignments * k);
+  gpu::Exl3Scratch plain = s;
+  plain.down_exponents = nullptr;
+  gpu::Exl3RoutedDown(down.weight, widened_in, w_out, assignments, rows, plain,
+                      nullptr);
+  Check(hipDeviceSynchronize());
+  same(w_out, w_ref, assignments * k, "production widened down");
+}
+
+// The scaled down projection on DownFixtures' edge rows (signed zeros,
+// subnormals, overflow headroom: exponents 0, 10 and -1, i.e. packed,
+// scaled and widened-fallback rows) at the model's shape, against the
+// pre-B5 kernel, for every tile-row cap and live count.
+void RoutedDownReference(int bits, bool half) {
+  namespace ref = gufo::tests::exl3_routed_reference;
+  constexpr unsigned rows = 8, k = 640, n = 2560;
+  Buffers buffers;
+  Bank down(buffers, k, n, 1, 5, false, bits, half);
+  std::vector<std::uint16_t> input(rows * k);
+  for (unsigned j = 0; j < k; ++j) {
+    input[j] = j & 1 ? 0x8000 : 0;
+    input[k + j] = (j & 1 ? 0x8000 : 0) | 1;
+    input[2 * k + j] = (j & 1 ? 0x8000 : 0) | (1 + j % 1023);
+    input[3 * k + j] = (j & 1 ? 0x8000 : 0) | 0x0400;
+    input[4 * k + j] = j == 0 ? 1 : 0x7bff;
+    input[5 * k + j] = j == 0 ? 1 : 0x53ff;
+    input[6 * k + j] = j == 0 ? 1 : 0x5400;
+    input[7 * k + j] = j % 3 == 0 ? 0x8000 : 0x3c00;
+  }
+  for (unsigned cap : {1U, 2U, 3U, 4U, 8U}) {
+    for (unsigned live = 1; live <= cap; ++live) {
+      std::vector<gpu::Exl3RouteTile> tiles;
+      for (unsigned first = 0; first < rows; first += live) {
+        gpu::Exl3RouteTile part{};
+        std::fill(std::begin(part.slots), std::end(part.slots), -1);
+        part.count = std::min(live, rows - first);
+        for (unsigned r = 0; r < part.count; ++r)
+          part.slots[r] = first + r;
+        tiles.push_back(part);
+      }
+      gpu::Exl3Scratch s;
+      s.tiles = buffers.Copy(tiles);
+      s.tile_count = buffers.Copy(
+          std::vector<std::uint32_t>{static_cast<std::uint32_t>(tiles.size())});
+      s.down_exponents = buffers.Make<std::int32_t>(rows);
+      auto* scaled = buffers.Copy(input);
+      auto* out = buffers.Make<float>(rows * n);
+      gpu::Exl3RoutedDown(down.weight, scaled, out, rows, cap, s, nullptr);
+      auto* expected = buffers.Make<float>(rows * n);
+      ref::LaunchRate<false, true>(
+          down.rate, gpu::Exl3RouteTileRows(cap), down.weight.device_exl3,
+          down.weight.device_exl3, s.tiles, s.tile_count, scaled, expected,
+          expected, k, n, rows, 1, s.down_exponents, nullptr);
+      Check(hipGetLastError());
+      const auto exponents = Read(s.down_exponents, rows);
+      Require(
+          exponents == std::vector<std::int32_t>({0, 10, 10, 0, -1, 10, -1, 0}),
+          "down reference exponent classification");
+      const auto a = Read(out, rows * n), b = Read(expected, rows * n);
+      Require(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0,
+              "scaled down edge rows changed bytes vs pre-B5 kernel");
+    }
+  }
+}
+
 int main(int argc, char** argv) {
   try {
     if (argc == 2 && std::string(argv[1]) == "--head-generalization") {
@@ -1966,6 +2118,14 @@ int main(int argc, char** argv) {
       FusedProducer(rows, true, 3, 0, 0, true, 2560);
       FusedProducer(rows, false, 5, 0, 0, false, 384);
     }
+    for (unsigned rows = 1; rows <= 8; ++rows)
+      for (bool shared : {false, true}) {
+        RoutedReference(rows, shared, 4, false);
+        RoutedReference(rows, shared, 3, true);
+      }
+    RoutedDownReference(4, false);
+    RoutedDownReference(3, true);
+    RoutedDownReference(5, false);
     if (rates_only) {
       std::cout << "EXL3 rate generalization contracts passed\n";
       return 0;

@@ -126,8 +126,9 @@ constexpr unsigned RoutedStageHalves(unsigned rows) {
              : kRoutedStageHalves;
 }
 
-// One wave owns one output tile and up to eight actual rows of one expert.
-// No floating-point atomics or masked reads from absent assignment rows.
+// One wave owns Tiles adjacent output tiles and up to eight actual rows of
+// one expert; each tile's arithmetic is the one-tile wave's. No
+// floating-point atomics or masked reads from absent assignment rows.
 // The block stages its rows' activations in LDS (`stage`,
 // RoutedStageHalves(MaxRows) halves) once per K chunk, so the K loop issues
 // only trellis global loads: an activation global load at its use made the
@@ -135,7 +136,7 @@ constexpr unsigned RoutedStageHalves(unsigned rows) {
 // Every wave of the block reaches the staging barriers; a wave past the
 // last output tile computes a duplicate of it and stores nothing.
 template<int Bits, bool FullPrecision, unsigned MaxRows = 8,
-         bool Scaled = false, bool ExactRows = false>
+         bool Scaled = false, bool ExactRows = false, unsigned Tiles = 1>
 __device__ __forceinline__ void RoutedGemvBody(
     const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
     const Exl3RouteTile* tiles, const unsigned* count,
@@ -150,12 +151,18 @@ __device__ __forceinline__ void RoutedGemvBody(
   const unsigned lane = threadIdx.x % 32;
   const unsigned r0 = (lane % 4) * 2;
   const unsigned n_tiles = n / 16;
-  const unsigned wave_tile = blockIdx.x * kRoutedWaves + threadIdx.x / 32;
-  const bool live = wave_tile < n_tiles;
-  const unsigned nt = live ? wave_tile : n_tiles - 1;
+  const unsigned wave_tile =
+      (blockIdx.x * kRoutedWaves + threadIdx.x / 32) * Tiles;
+  bool live[Tiles];
+  unsigned nt[Tiles];
+#pragma unroll
+  for (unsigned t = 0; t < Tiles; ++t) {
+    live[t] = wave_tile + t < n_tiles;
+    nt[t] = live[t] ? wave_tile + t : n_tiles - 1;
+  }
   if (n_tiles == 0)
     return;
-  float a[MaxRows]{}, b[MaxRows]{};
+  float a[Tiles][MaxRows]{}, b[Tiles][MaxRows]{};
   const auto lw = arithmetic::MakeLaneWindow<Bits>(lane);
   const auto* trellis = reinterpret_cast<const std::uint32_t*>(l.trellis);
   const auto* x = reinterpret_cast<const _Float16*>(input) +
@@ -172,26 +179,34 @@ __device__ __forceinline__ void RoutedGemvBody(
   // Global, not flat, loads: a flat load also counts against lgkmcnt, so a
   // scalar wait in the loop would drain the group still in flight.
   using GlobalDword = const __attribute__((address_space(1))) std::uint32_t;
-  const auto fetch = [&](unsigned kt0, std::uint32_t (&raw)[kAhead][3]) {
+  const auto fetch =
+      [&](unsigned kt0, std::uint32_t (&raw)[kAhead][Tiles][3])
+          __attribute__((always_inline)) {
 #pragma unroll
-    for (unsigned u = 0; u < kAhead; ++u) {
-      const unsigned kt = min(kt0 + u, k_tiles - 1);
-      // An address-space conversion is spelled as a C cast.
-      const auto* tile =
-          (GlobalDword*)(trellis + (std::size_t{kt} * (n / 16) + nt) *
+            for (unsigned u = 0; u < kAhead; ++u) {
+              const unsigned kt = min(kt0 + u, k_tiles - 1);
+#pragma unroll
+              for (unsigned t = 0; t < Tiles; ++t) {
+                // An address-space conversion is spelled as a C cast.
+                const auto* tile =
+                    (GlobalDword*)(trellis +
+                                   (std::size_t{kt} * (n / 16) + nt[t]) *
                                        arithmetic::TileDwords(Bits));
-      raw[u][0] = tile[lw.o0];
-      raw[u][1] = tile[lw.o1];
-      raw[u][2] = tile[lw.o2];
-    }
-  };
+                raw[u][t][0] = tile[lw.o0];
+                raw[u][t][1] = tile[lw.o1];
+                raw[u][t][2] = tile[lw.o2];
+              }
+            }
+          };
   if (k_tiles == 0)
     return;
   // K tiles per staged chunk (a whole number of fetch groups) and the
   // block's staging work: 16-byte vectors, two per tile row, spread over
-  // the block's threads (at most four per thread). The compiler sinks each
-  // load into its guarded store, a round trip per vector; issuing them all
-  // first kept 30-50 more VGPRs live through the K loop at R3-R8.
+  // the block's threads (at most four per thread), each load followed by
+  // its guarded store (a round trip per vector): issuing them all first
+  // kept 30-50 more VGPRs live through the K loop at R3-R8, and a staged
+  // array of them went to scratch (and 48 KiB of promoted LDS) in the
+  // multi-body R3/R4/R8 kernels.
   constexpr unsigned kChunk =
       RoutedStageHalves(MaxRows) / (MaxRows * 16) / kAhead * kAhead;
   constexpr unsigned kRowHalves = kChunk * 16;
@@ -200,29 +215,41 @@ __device__ __forceinline__ void RoutedGemvBody(
       (MaxRows * kChunk * 2 + kThreads - 1) / kThreads;
   static_assert(kChunk >= kAhead && MaxRows * kRowHalves <= kRoutedStageHalves);
   const unsigned rows = ExactRows ? MaxRows : tile_rows.count;
-  const auto stage_chunk = [&](unsigned base) {
+  // The staging threads pick their row's slot from opaque copies: on the
+  // tile's slots LLVM folds an equality select chain back into a
+  // dynamically indexed load (R3/R4/R8 then promoted the tile to 40 KiB of
+  // LDS, plus scratch).
+  std::int32_t stage_slots[MaxRows];
+#pragma unroll
+  for (unsigned q = 0; q < MaxRows; ++q) {
+    stage_slots[q] = tile_rows.slots[q];
+    asm volatile("" : "+v"(stage_slots[q]));
+  }
+  const auto stage_chunk = [&](unsigned base) __attribute__((always_inline)) {
     const unsigned vectors = min(kChunk, k_tiles - base) * 2;
     const unsigned total = rows * vectors;
-    uint4 data[kPerThread];
     __syncthreads();  // every wave is done with the previous chunk
 #pragma unroll
     for (unsigned j = 0; j < kPerThread; ++j) {
-      const unsigned i = min(threadIdx.x + j * kThreads, total - 1);
-      const unsigned r = i / vectors;
-      unsigned slot = tile_rows.slots[0];
-      // Fixed indices: a dynamically indexed slot array promotes to LDS.
-#pragma unroll
-      for (unsigned q = 1; q < MaxRows; ++q)
-        slot = r == q ? tile_rows.slots[q] : slot;
-      data[j] = reinterpret_cast<const uint4*>(x + std::size_t{slot} * k +
-                                               base * 16)[i % vectors];
-    }
-#pragma unroll
-    for (unsigned j = 0; j < kPerThread; ++j) {
       const unsigned i = threadIdx.x + j * kThreads;
-      if (i < total)
-        reinterpret_cast<uint4*>(stage + (i / vectors) *
-                                             kRowHalves)[i % vectors] = data[j];
+      if (i >= total)
+        break;
+      const unsigned r = i / vectors;
+      // A select tree on r's bits over fixed indices: a dynamically indexed
+      // slot array promotes to LDS.
+      std::int32_t pick[MaxRows];
+#pragma unroll
+      for (unsigned q = 0; q < MaxRows; ++q)
+        pick[q] = stage_slots[q];
+#pragma unroll
+      for (unsigned bit = 1; bit < MaxRows; bit <<= 1)
+#pragma unroll
+        for (unsigned q = 0; q + bit < MaxRows; q += 2 * bit)
+          pick[q] = (r & bit) != 0 ? pick[q + bit] : pick[q];
+      const auto slot = static_cast<unsigned>(pick[0]);
+      reinterpret_cast<uint4*>(stage + r * kRowHalves)[i % vectors] =
+          reinterpret_cast<const uint4*>(x + std::size_t{slot} * k +
+                                         base * 16)[i % vectors];
     }
     __syncthreads();
   };
@@ -235,60 +262,65 @@ __device__ __forceinline__ void RoutedGemvBody(
                           exponents[tile_rows.slots[r]] < 0);
   // Two register sets alternate, so the group in flight is never copied
   // (a copy at the loop edge waited for it before the next group began).
-  std::uint32_t even[kAhead][3], odd[kAhead][3];
+  std::uint32_t even[kAhead][Tiles][3], odd[kAhead][Tiles][3];
   // The K-end test stays in every group: unguarded groups let the compiler
   // decode a whole group at once (30-40 more VGPRs at R3/R4). The loop edge
   // then makes each pair's first group wait for its own loads before it
   // issues the next group's; no tile waits for loads issued after it.
-  const auto group = [&](unsigned kt0, const std::uint32_t (&raw)[kAhead][3],
-                         std::uint32_t (
-                             &next)[kAhead][3]) __attribute__((always_inline)) {
-    if (kt0 % kChunk == 0)
-      stage_chunk(kt0);
-    const unsigned chunk_base = kt0 - kt0 % kChunk;
-    fetch(kt0 + kAhead, next);
+  const auto group =
+      [&](unsigned kt0, const std::uint32_t (&raw)[kAhead][Tiles][3],
+          std::uint32_t (&next)[kAhead][Tiles][3])
+          __attribute__((always_inline)) {
+            if (kt0 % kChunk == 0)
+              stage_chunk(kt0);
+            const unsigned chunk_base = kt0 - kt0 % kChunk;
+            fetch(kt0 + kAhead, next);
 #pragma unroll
-    for (unsigned u = 0; u < kAhead; ++u) {
-      const unsigned kt = kt0 + u;
-      if (kt >= k_tiles)
-        break;
-      Half2 w[4];
-      {
-        std::uint32_t state[8];
-        arithmetic::LaneStates<Bits>(raw[u][0], raw[u][1], raw[u][2], lw.shift,
-                                     state);
-        std::uint32_t p[8];
+            for (unsigned u = 0; u < kAhead; ++u) {
+              const unsigned kt = kt0 + u;
+              if (kt >= k_tiles)
+                break;
 #pragma unroll
-        for (int j = 0; j < 8; ++j)
-          p[j] = (state[j] & 0xffffU) * arithmetic::kMul1Multiplier;
+              for (unsigned t = 0; t < Tiles; ++t) {
+                Half2 w[4];
+                {
+                  std::uint32_t state[8];
+                  arithmetic::LaneStates<Bits>(raw[u][t][0], raw[u][t][1],
+                                               raw[u][t][2], lw.shift, state);
+                  std::uint32_t p[8];
 #pragma unroll
-        for (int q = 0; q < 4; ++q)
-          w[q] = arithmetic::DecodePairMul1(p[2 * q], p[2 * q + 1]);
-      }
-      // Fixed row indices keep the accumulators and route slots in VGPRs.
-      // A dynamically indexed local array otherwise promotes to 40 KiB LDS
-      // per one-wave block on the pinned compiler, starving verification.
+                  for (int j = 0; j < 8; ++j)
+                    p[j] = (state[j] & 0xffffU) * arithmetic::kMul1Multiplier;
 #pragma unroll
-      for (unsigned r = 0; r < MaxRows; ++r) {
-        if (!ExactRows && r >= tile_rows.count)
-          continue;
-        const auto* row = stage + r * kRowHalves + (kt - chunk_base) * 16 + r0;
-        const Half2 v01 = *reinterpret_cast<const Half2*>(row);
-        const Half2 v89 = *reinterpret_cast<const Half2*>(row + 8);
-        if (widened[r]) {
-          a[r] = DotPairF32(w[0], v01, a[r]);
-          a[r] = DotPairF32(w[1], v89, a[r]);
-          b[r] = DotPairF32(w[2], v01, b[r]);
-          b[r] = DotPairF32(w[3], v89, b[r]);
-        } else {
-          a[r] = __builtin_amdgcn_fdot2(w[0], v01, a[r], false);
-          a[r] = __builtin_amdgcn_fdot2(w[1], v89, a[r], false);
-          b[r] = __builtin_amdgcn_fdot2(w[2], v01, b[r], false);
-          b[r] = __builtin_amdgcn_fdot2(w[3], v89, b[r], false);
-        }
-      }
-    }
-  };
+                  for (int q = 0; q < 4; ++q)
+                    w[q] = arithmetic::DecodePairMul1(p[2 * q], p[2 * q + 1]);
+                }
+        // Fixed row indices keep the accumulators and route slots in VGPRs.
+        // A dynamically indexed local array otherwise promotes to 40 KiB LDS
+        // per one-wave block on the pinned compiler, starving verification.
+#pragma unroll
+                for (unsigned r = 0; r < MaxRows; ++r) {
+                  if (!ExactRows && r >= tile_rows.count)
+                    continue;
+                  const auto* row =
+                      stage + r * kRowHalves + (kt - chunk_base) * 16 + r0;
+                  const Half2 v01 = *reinterpret_cast<const Half2*>(row);
+                  const Half2 v89 = *reinterpret_cast<const Half2*>(row + 8);
+                  if (widened[r]) {
+                    a[t][r] = DotPairF32(w[0], v01, a[t][r]);
+                    a[t][r] = DotPairF32(w[1], v89, a[t][r]);
+                    b[t][r] = DotPairF32(w[2], v01, b[t][r]);
+                    b[t][r] = DotPairF32(w[3], v89, b[t][r]);
+                  } else {
+                    a[t][r] = __builtin_amdgcn_fdot2(w[0], v01, a[t][r], false);
+                    a[t][r] = __builtin_amdgcn_fdot2(w[1], v89, a[t][r], false);
+                    b[t][r] = __builtin_amdgcn_fdot2(w[2], v01, b[t][r], false);
+                    b[t][r] = __builtin_amdgcn_fdot2(w[3], v89, b[t][r], false);
+                  }
+                }
+              }
+            }
+          };
   fetch(0, even);
   for (unsigned kt0 = 0; kt0 < k_tiles; kt0 += 2 * kAhead) {
     group(kt0, even, odd);
@@ -297,24 +329,28 @@ __device__ __forceinline__ void RoutedGemvBody(
     group(kt0 + kAhead, odd, even);
   }
 #pragma unroll
-  for (unsigned r = 0; r < MaxRows; ++r) {
-    if (!ExactRows && r >= tile_rows.count)
-      continue;
-    a[r] += __shfl_xor(a[r], 1, 32);
-    b[r] += __shfl_xor(b[r], 1, 32);
-    a[r] += __shfl_xor(a[r], 2, 32);
-    b[r] += __shfl_xor(b[r], 2, 32);
-    if (live && lane % 4 == 0) {
-      auto* y = (projection == 0 ? gate_y : up_y) +
-                std::size_t{tile_rows.slots[r]} * n + nt * 16;
-      float scale = 1.0F;
-      if constexpr (Scaled) {
-        const int exponent = exponents[tile_rows.slots[r]];
-        if (exponent > 0)
-          scale = __builtin_bit_cast(float, unsigned(127 - exponent) << 23);
+  for (unsigned t = 0; t < Tiles; ++t) {
+#pragma unroll
+    for (unsigned r = 0; r < MaxRows; ++r) {
+      if (!ExactRows && r >= tile_rows.count)
+        continue;
+      float va = a[t][r], vb = b[t][r];
+      va += __shfl_xor(va, 1, 32);
+      vb += __shfl_xor(vb, 1, 32);
+      va += __shfl_xor(va, 2, 32);
+      vb += __shfl_xor(vb, 2, 32);
+      if (live[t] && lane % 4 == 0) {
+        auto* y = (projection == 0 ? gate_y : up_y) +
+                  std::size_t{tile_rows.slots[r]} * n + nt[t] * 16;
+        float scale = 1.0F;
+        if constexpr (Scaled) {
+          const int exponent = exponents[tile_rows.slots[r]];
+          if (exponent > 0)
+            scale = __builtin_bit_cast(float, unsigned(127 - exponent) << 23);
+        }
+        y[lane / 4] = va * scale;
+        y[lane / 4 + 8] = vb * scale;
       }
-      y[lane / 4] = a[r] * scale;
-      y[lane / 4 + 8] = b[r] * scale;
     }
   }
 }
@@ -324,7 +360,7 @@ __device__ __forceinline__ void RoutedGemvBody(
 // loop is specialized, independently of the bit rate.
 // The generic body remains for MaxRows 1/2 and unscaled full-precision down.
 template<int Bits, bool FullPrecision, unsigned MaxRows = 8,
-         bool Scaled = false>
+         bool Scaled = false, unsigned Tiles = 1>
 __global__ void RoutedGemv(const ex::DeviceLinear* gate,
                            const ex::DeviceLinear* up,
                            const Exl3RouteTile* tiles, const unsigned* count,
@@ -342,7 +378,7 @@ __global__ void RoutedGemv(const ex::DeviceLinear* gate,
     // Each live-row body runs exactly the generic body's arithmetic for the
     // tile's rows; R5-R8 verify tiles (MaxRows 8) mostly hold 1-2 rows.
     const auto exact = [&]<unsigned Rows>() __attribute__((always_inline)) {
-      RoutedGemvBody<Bits, FullPrecision, Rows, Scaled, true>(
+      RoutedGemvBody<Bits, FullPrecision, Rows, Scaled, true, Tiles>(
           gate, up, tiles, count, input, gate_y, up_y, k, n, assignments,
           exponents, stage);
     };
@@ -390,7 +426,7 @@ __global__ void RoutedGemv(const ex::DeviceLinear* gate,
         break;
     }
   }
-  RoutedGemvBody<Bits, FullPrecision, MaxRows, Scaled>(
+  RoutedGemvBody<Bits, FullPrecision, MaxRows, Scaled, false, Tiles>(
       gate, up, tiles, count, input, gate_y, up_y, k, n, assignments, exponents,
       stage);
 }
@@ -1337,7 +1373,7 @@ unsigned TileRows(unsigned rows) {
   return Exl3RouteTileRows(rows);
 }
 
-template<bool FullPrecision, bool Scaled = false>
+template<bool FullPrecision, bool Scaled = false, unsigned Tiles = 1>
 void LaunchRouted(const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
                   const std::uint16_t* input, float* gate_y, float* up_y,
                   unsigned k, unsigned n, unsigned assignments,
@@ -1346,8 +1382,12 @@ void LaunchRouted(const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
                   ex::BitRate rate) {
   WithRate(rate, [&]<int Bits>() {
     const auto launch = [&]<unsigned R>() {
-      hipLaunchKernelGGL((RoutedGemv<Bits, FullPrecision, R, Scaled>),
-                         dim3((n / 16 + kRoutedWaves - 1) / kRoutedWaves,
+      // The eight-row kernel keeps one tile: its widest row body would
+      // need 125-146 VGPRs with two.
+      constexpr unsigned kTiles = R <= 4 ? Tiles : 1;
+      constexpr unsigned kBlockTiles = kRoutedWaves * kTiles;
+      hipLaunchKernelGGL((RoutedGemv<Bits, FullPrecision, R, Scaled, kTiles>),
+                         dim3((n / 16 + kBlockTiles - 1) / kBlockTiles,
                               assignments, projections),
                          dim3(32 * kRoutedWaves), 0, stream, gate, up,
                          scratch.tiles, scratch.tile_count, input, gate_y, up_y,
@@ -1375,6 +1415,9 @@ void LaunchRouted(const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
 }  // namespace
 
 namespace {
+// Output tiles per down-projection wave.
+constexpr unsigned kDownTiles = 1;
+
 // prescaled: RestoreActivateScale already scaled the input and wrote the
 // exponents (the ScaleDownRows pass is folded into it).
 void RoutedDown(const DeviceTensor& down, std::uint16_t* input, float* out,
@@ -1389,15 +1432,15 @@ void RoutedDown(const DeviceTensor& down, std::uint16_t* input, float* out,
     if (!prescaled)
       hipLaunchKernelGGL(ScaleDownRows, dim3(assignments), dim3(256), 0, stream,
                          input, scratch.down_exponents, down.cols);
-    LaunchRouted<false, true>(down.device_exl3, down.device_exl3, input, out,
-                              out, down.cols, down.rows, assignments, 1,
-                              TileRows(max_tile_rows), scratch, stream,
-                              BankRate(down));
+    LaunchRouted<false, true, kDownTiles>(
+        down.device_exl3, down.device_exl3, input, out, out, down.cols,
+        down.rows, assignments, 1, TileRows(max_tile_rows), scratch, stream,
+        BankRate(down));
   } else {
-    LaunchRouted<true>(down.device_exl3, down.device_exl3, input, out, out,
-                       down.cols, down.rows, assignments, 1,
-                       TileRows(max_tile_rows), scratch, stream,
-                       BankRate(down));
+    LaunchRouted<true, false, kDownTiles>(
+        down.device_exl3, down.device_exl3, input, out, out, down.cols,
+        down.rows, assignments, 1, TileRows(max_tile_rows), scratch, stream,
+        BankRate(down));
   }
   Check();
 }
