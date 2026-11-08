@@ -1,5 +1,12 @@
 # Qwen3.8 Flash-Next benchmarks
 
+## B6 prefill streaming stores and packed attention gate, November 8, 2026
+
+Same-window rotation vs deployed B5 (`31cee0b6`), c03, Nix10.1, FP16 KV, r2 ×2:
+PP2048/8192 1515.4/1546.0→1520.5/1553.0 tok/s (+0.3/+0.5%); PP MTP and TG
+unchanged. Outputs and prefill logits equal B5. CU-masked shared-MLP streams
+lost 6–17%. Details: [know-how](../../GFX1151-KNOWHOW.md).
+
 ## B5 routed down tiles and decode side branches, November 8, 2026
 
 Same-window B C B C vs B4 adopted tree, c03, Nix10.1, FP16 KV, r2; adopted

@@ -1,5 +1,36 @@
 # gfx1151 optimization know-how
 
+## Flash-Next B6 prefill streaming stores and packed attention gate, November 8, 2026
+
+Commits `32b3f95e..fa33c927` (brief `plan/exl3/B6-BRIEF.md`). Kept, all exact
+(prefill logits sha `17dc8f9f…`, decode hashes/MTP counts equal B5): P1
+non-temporal stores for `RotateGateUpTokens`/`RestoreActivateScaleBuckets`
+slabs; P3 WMMA attention reads the output gate from packed `qg` rows (no gate
+copy in `AttentionQueryRows`); P5 non-temporal FP32 residual write-back in
+wide (≥512-token) `HcCombineVec4`. Operator benches (old→new µs): rotation
+2048 rows 1181.6→993.9 (−15.9%), 4096 2358.2→2219.6; restore 516.6→483.1 /
+1009.1→913.8; attention per 4096 chunk 12.43→11.93 ms; HC combine within
+±1.5% except 256-row MoE+prior −11.5%. In the full model the rotation gain
+mostly vanishes (RotateGateUpTokens 228.7→227.7 ms at 8192, side-stream
+competition); AttentionQueryRows 51.4→38.9 ms and norms/copies 41.2→30.4 ms.
+
+Same window, c03, Nix10.1, FP16 KV, r2 two rounds, baseline deployed B5
+(`31cee0b6`): PP2048/8192 1515.4/1546.0→1520.5/1553.0 (+0.3/+0.5%); per item
+(C vs C−item, 2048/8192) P1 +0.41/+0.29%, P3 +0.34/+0.39%, P5 +0.20/+0.09%;
+PP MTP and TG unchanged (AR 32.87→32.88, MTP d0 67.05→66.96). PP8192 profile
+span 5315.8→5276.4 ms; routed gate/up 27.0 TF, down 23.6 TF.
+
+Rejected P7 prefill shared-MLP side-stream policy (reverted): low-priority
+stream −0.2% (shared down 742→646 ms but its rotation 131→210 and SwiGLU
+27→45 ms, +16 ms idle); CU-mask streams (HIP bit = WGP in WGP mode) with 6/4/2
+WGPs lose 5.7/8.6/17.3% at PP8192 — the shared MLP then becomes the critical
+path. Skipped after analysis: GdnRowSplit occupancy (96 blocks over 20 WGPs is
+balanced; VALU/LDS-bound), router 513th-row tile, idle-gap fixes (rocprofv3
+timestamps overlap for 906 of 1951 same-stream pairs; no host syncs in the
+EXL3 prefill path). B6 does not approach the 1800 tok/s PP8192 goal; remaining
+time is WMMA GEMM efficiency (routed 23–27 TF, dense 33–37 TF).
+Evidence: `build/b1/gpu-b6/RESULT.json`.
+
 ## Flash-Next c03 prefill profile before B6, November 8, 2026
 
 Deployed B5 binary (sha `31cee0b6…`), c03, Nix10.1, FP16 KV, d0, speculative
