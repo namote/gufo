@@ -585,16 +585,99 @@ double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
                     kDim * sizeof(float));
     HipBuffer<float> d_packed(packed.size());
     Upload(&d_packed, packed);
-    if (!q::WmmaCausalAttention(d_q.get(), d_packed.get() + kDim, d_k.get(),
-                                d_v.get(), mask_ptr, mask_words, d_wmma.get(),
-                                n_tokens, start_pos, kHeads, kKvHeads, kDim,
-                                kRatio, nullptr, false, nullptr, nullptr,
-                                static_cast<std::uint32_t>(pair_width))) {
-      throw std::runtime_error("packed-gate attention rejected the geometry");
-    }
-    const auto strided = Download(&d_wmma, q_count);
+    // Each packed call writes its own poisoned output, so a missing store
+    // cannot leave the expected bytes behind.
+    constexpr float kPackedPoison = -23456.0F;
+    HipBuffer<float> d_packed_out(q_count);
+    const auto packed_call = [&](std::uint32_t first, std::uint32_t rows,
+                                 bool last, const float* gate_base,
+                                 std::uint32_t stride, float* target) {
+      const std::size_t q_offset = std::size_t{first} * kQWidth;
+      const std::uint32_t* rows_mask =
+          mask_ptr != nullptr ? mask_ptr + std::size_t{first} * mask_words
+                              : nullptr;
+      if (!q::WmmaCausalAttention(
+              d_q.get() + q_offset, gate_base, d_k.get(), d_v.get(), rows_mask,
+              mask_words, target + q_offset, rows, start_pos + first, kHeads,
+              kKvHeads, kDim, kRatio, nullptr, last, nullptr, nullptr, stride))
+        throw std::runtime_error("packed-gate attention rejected the geometry");
+      CheckHip(hipDeviceSynchronize(), "packed-gate attention");
+    };
+    const auto pair = static_cast<std::uint32_t>(pair_width);
+    const auto packed_gate = [&](std::uint32_t first) {
+      return d_packed.get() + std::size_t{first} * pair_width + kDim;
+    };
+    // Whole batch.
+    Upload(&d_packed_out, std::vector<float>(q_count, kPackedPoison));
+    packed_call(0, n_tokens, false, packed_gate(0), pair, d_packed_out.get());
+    const auto strided = Download(&d_packed_out, q_count);
     if (std::memcmp(out.data(), strided.data(), q_count * sizeof(float)) != 0) {
       throw std::runtime_error("packed-gate attention changed the output");
+    }
+    // last_only: only the final query tile is written, as with the unpacked
+    // gate; every earlier row keeps its poison.
+    Upload(&d_packed_out, std::vector<float>(q_count, kPackedPoison));
+    packed_call(0, n_tokens, true, packed_gate(0), pair, d_packed_out.get());
+    {
+      const auto tail = Download(&d_packed_out, q_count);
+      const std::uint32_t tile_rows = mask_ptr ? 4 : 16;
+      const std::size_t begin =
+          static_cast<std::size_t>((n_tokens - 1) / tile_rows * tile_rows) *
+          kQWidth;
+      for (std::size_t i = 0; i < q_count; ++i) {
+        if (i < begin ? tail[i] != kPackedPoison
+                      : std::memcmp(&out[i], &tail[i], sizeof(float)) != 0) {
+          throw std::runtime_error(
+              "packed-gate last-tile attention changed a row or guard");
+        }
+      }
+    }
+    // A later subspan (the checkpoint split's second launch): packed and
+    // unpacked gates at the same offset give the same bytes, and rows
+    // before the span stay untouched.
+    if (n_tokens > 1) {
+      const std::uint32_t first = n_tokens / 3 + 1;
+      const std::uint32_t rows = n_tokens - first;
+      HipBuffer<float> d_span_ref(q_count);
+      Upload(&d_span_ref, std::vector<float>(q_count, kPackedPoison));
+      Upload(&d_packed_out, std::vector<float>(q_count, kPackedPoison));
+      packed_call(first, rows, false,
+                  d_gate.get() + std::size_t{first} * kQWidth, 0,
+                  d_span_ref.get());
+      packed_call(first, rows, false, packed_gate(first), pair,
+                  d_packed_out.get());
+      const auto span_ref = Download(&d_span_ref, q_count);
+      const auto span = Download(&d_packed_out, q_count);
+      if (std::memcmp(span_ref.data(), span.data(), q_count * sizeof(float)) !=
+          0)
+        throw std::runtime_error("packed-gate subspan attention differs");
+      for (std::size_t i = 0; i < q_count; ++i)
+        if ((span[i] == kPackedPoison) != (i < std::size_t{first} * kQWidth))
+          throw std::runtime_error(
+              "packed-gate subspan missed a row or wrote an earlier one");
+      // The same span with last_only (the sparse half of a dense/sparse
+      // split): only its final tile, relative to `first`, is written.
+      Upload(&d_span_ref, std::vector<float>(q_count, kPackedPoison));
+      Upload(&d_packed_out, std::vector<float>(q_count, kPackedPoison));
+      packed_call(first, rows, true,
+                  d_gate.get() + std::size_t{first} * kQWidth, 0,
+                  d_span_ref.get());
+      packed_call(first, rows, true, packed_gate(first), pair,
+                  d_packed_out.get());
+      const auto last_ref = Download(&d_span_ref, q_count);
+      const auto last = Download(&d_packed_out, q_count);
+      const std::uint32_t tile_rows = mask_ptr ? 4 : 16;
+      const std::size_t begin =
+          (first +
+           static_cast<std::size_t>((rows - 1) / tile_rows * tile_rows)) *
+          kQWidth;
+      if (std::memcmp(last_ref.data(), last.data(), q_count * sizeof(float)) !=
+          0)
+        throw std::runtime_error("packed-gate subspan last tile differs");
+      for (std::size_t i = 0; i < q_count; ++i)
+        if ((last[i] == kPackedPoison) != (i < begin))
+          throw std::runtime_error(
+              "packed-gate subspan last tile missed a row or wrote another");
     }
   }
   {
