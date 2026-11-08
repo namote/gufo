@@ -7,7 +7,6 @@
 - [EXL3 / Flash-Next 결정](exl3/PLAN.md): 형식·커널·서비스 결정 기록
 - [EXL3 / Flash-Next 인계](exl3/HANDOFF.md): 현재 배포된 서비스 상태(B5 runtime)
 - [Flash-Next B-series 요약](exl3/B-SERIES-SUMMARY.md): B1–B8 최적화 묶음 색인, 측정은 [GFX1151 know-how](../docs/GFX1151-KNOWHOW.md)
-- [B8 정리 지시](exl3/B8-CLEANUP-BRIEF.md): 마무리 정리(진행 중)
 
 ## Archive
 
