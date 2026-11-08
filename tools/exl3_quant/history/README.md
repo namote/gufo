@@ -1,7 +1,8 @@
 # EXL3 conversion history
 
 These files are kept as evidence only. Nothing on the production c03 path
-imports them, and they are not maintained. The production pipeline is in
+imports or hashes them, and they are not maintained. Probes that the
+production receipts pin stay in `../flash_next/` (see below). The production pipeline is in
 [`../flash_next/`](../flash_next/) and [`../kyojin/`](../kyojin/), and the
 [EXL3 tooling README](../README.md) describes it.
 

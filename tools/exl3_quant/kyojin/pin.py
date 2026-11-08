@@ -154,6 +154,15 @@ def unpack(archive: Path, dest: Path, prefix: str) -> int:
     return count
 
 
+def unpack_clean(archive: Path, dest: Path, prefix: str) -> int:
+    """unpack, removing dest again if the archive is rejected part-way."""
+    try:
+        return unpack(archive, dest, prefix)
+    except BaseException:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+
+
 def check(dest: Path, inputs_json: Path = INPUTS_JSON) -> list[str]:
     """Return the mismatches between dest and the recorded source/ hashes."""
     files = json.loads(inputs_json.read_text())["files"]
@@ -206,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
     elif a.action == "unpack":
         if sha256_file(a.archive) != pinned["sha256"]:
             raise SystemExit(f"{a.archive}: sha256 is not the pinned {pinned['sha256']}")
-        print(f"unpacked {unpack(a.archive, a.dest, pinned['prefix'])} files into {a.dest}")
+        print(f"unpacked {unpack_clean(a.archive, a.dest, pinned['prefix'])} files into {a.dest}")
     elif a.action == "check":
         problems = check(a.dest)
         for line in problems:

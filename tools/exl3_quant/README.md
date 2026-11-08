@@ -35,7 +35,7 @@ every pinned file is present and unchanged, except `native/capture-gram.so`
 and the drivers edited later (`model_job.py`, `mtp_calibration_job.py`,
 `ngram_job.py`, `prefix_replay_job.py`, `run_stage.py` and
 `test_disk_boundary.py`). Six of those pinned probe drivers still import the
-ai.tools `window` module, and they are kept byte-identical.
+ai.tools `window` module, and they are kept byte-identical. They are hashed, not run, and cannot run as they are.
 
 ## Pinned converter
 
