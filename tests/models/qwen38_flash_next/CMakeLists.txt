@@ -86,8 +86,13 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen38_flash_next_exl3_wmma_ceiling_bench PRIVATE
     gufo_qwen38_flash_next)
 
+  # One binary, cases by stage: decode (exl3_ops_test.cpp, main), prefill and
+  # MTP, sharing exl3_ops_fixture.hpp.
   add_qwen38_flash_next_test(exl3_ops gufo_qwen38_flash_next_reference "hip;gpu;gfx1151;exl3")
-  set_source_files_properties(exl3_ops_test.cpp PROPERTIES LANGUAGE HIP)
+  target_sources(qwen38_flash_next_exl3_ops_test PRIVATE
+    exl3_prefill_ops.cpp exl3_mtp_ops.cpp)
+  set_source_files_properties(exl3_ops_test.cpp exl3_prefill_ops.cpp
+    exl3_mtp_ops.cpp PROPERTIES LANGUAGE HIP)
   add_qwen38_flash_next_test(exl3_moe_kernel gufo_qwen38_flash_next "hip;gpu;gfx1151;exl3")
   set_source_files_properties(exl3_moe_kernel_test.cpp PROPERTIES LANGUAGE HIP)
   # Match production device arithmetic while keeping CPU oracles strict.
