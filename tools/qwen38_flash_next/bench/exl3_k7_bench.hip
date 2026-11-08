@@ -7,7 +7,7 @@
 // production kernels are compiled in.
 //
 //   hipcc -O3 -std=c++20 --offload-arch=gfx1151 -DENGINE_ENABLE_HIP=1 -I. \
-//     tools/bench/exl3_k7_bench.hip -o exl3_k7_bench
+//     tools/qwen38_flash_next/bench/exl3_k7_bench.hip -o exl3_k7_bench
 //   exl3_k7_bench [reps] [bits]
 #include <cmath>
 #include <cstdio>

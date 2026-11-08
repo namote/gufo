@@ -2,7 +2,7 @@
 // plan/exl3/archive/F3-PLAN.md): plain HC operand (PlainPrefillGemm FP16 WMMA
 // vs LaunchPlainPrefillStable), X3 trellis WMMA (LaunchExl3PrefillGemm) vs
 // reconstruct-once to FP16 + the Flash-Next FP16 WMMA GEMM. Linked against
-// the build's libraries (tools/bench/exl3_prefill_shapes_bench.sh).
+// the build's libraries (tools/qwen38_flash_next/bench/exl3_prefill_shapes_bench.sh).
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 

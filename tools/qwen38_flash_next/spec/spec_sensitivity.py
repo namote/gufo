@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """W9 M1 sensitivity of the TierRule gain to modeled costs: a computed-then-dropped draft (1-6 ms) and an extra cost per
-draft for producing its probability (0 or 0.3 ms). Usage: python3 -I tools/qwen-flash/spec/spec_sensitivity.py TRACE.jsonl"""
+draft for producing its probability (0 or 0.3 ms). Usage: python3 -I tools/qwen38_flash_next/spec/spec_sensitivity.py TRACE.jsonl"""
 import json, sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import spec_sim as s

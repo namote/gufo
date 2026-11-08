@@ -1294,7 +1294,7 @@ for p in docs:2048 code:512 chat:512 tools:512; do
   "$PROBE" --model "$MODEL" --prompt-file "$F/prompts/${p%%:*}.txt" \
     --batch "${p##*:}" --context 4096 --logit-rows 256 --dump "dumps/${p%%:*}.bin"
 done
-nix develop -c python3 tests/models/qwen38_flash_next/f32_reference.py compare \
+nix develop -c python3 tools/qwen38_flash_next/f32_reference.py compare \
   --manifest "$F/manifest.json" --dumps dumps [--against main-dumps]
 ```
 

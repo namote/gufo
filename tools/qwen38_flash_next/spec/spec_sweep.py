@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """W9 M1 policy sweep over a spec_sim trace: TierRule grid and P2 settings chosen on non-K prompts, reported on the
 held-out K prompts (prefix k_), plus per-category rates. Usage (eval image, repository at /src):
-  python3 -I tools/qwen-flash/spec/spec_sweep.py TRACE.jsonl > sweep.json"""
+  python3 -I tools/qwen38_flash_next/spec/spec_sweep.py TRACE.jsonl > sweep.json"""
 import itertools, json, sys
 sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parent))
 import spec_sim as s

@@ -470,7 +470,7 @@ reuse is implemented and independently reviewed in the uncommitted f3-integ
 worktree. FP16-KV/KVarN collector bytes match hc7; focused Nix ROCm 10.1 unit
 passes. Candidate images are `ai-tools/gufo-eval:f3-indexer-b03a1f1e-rocm101`
 and `-tests-rocm101`. Full evidence and runtime caveats are in
-`~/projects/gufo-f3-integ/plan/exl3/F3-RESUME-RESULTS.md`.
+[archive/F3-RESUME-RESULTS.md](archive/F3-RESUME-RESULTS.md).
 The user requires Nix ROCm 10.1, one combined final model/timing pass, and
 reuse of stored matching baselines. No merge or final model qualification yet.
 The first q3 batch item's Thai rare-vocabulary fixture failure is resolved:

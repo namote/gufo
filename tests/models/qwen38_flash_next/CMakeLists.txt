@@ -2,6 +2,10 @@
 # diagnostic probes are built explicitly so routine iterations stay focused.
 add_custom_target(qwen38_flash_next_tests)
 
+# Model benchmarks live in tools/qwen38_flash_next/bench; their targets are
+# declared here, beside the tests that share their libraries.
+set(QFN_BENCH_DIR ${PROJECT_SOURCE_DIR}/tools/qwen38_flash_next/bench)
+
 function(add_qwen38_flash_next_test name library labels)
   set(target qwen38_flash_next_${name}_test)
   add_executable(${target} ${name}_test.cpp)
@@ -46,45 +50,45 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen38_flash_next_rq_logits PRIVATE
     gufo_qwen38_flash_next hip::host)
 
-  # Decode HC projection timing (tools/bench), on the production kernels.
+  # Decode HC projection timing (tools/qwen38_flash_next/bench), on the production kernels.
   add_executable(qwen38_flash_next_hc_decode_bench EXCLUDE_FROM_ALL
-    ${PROJECT_SOURCE_DIR}/tools/bench/flash_next_hc_decode.hip)
+    ${QFN_BENCH_DIR}/flash_next_hc_decode.hip)
   set_source_files_properties(
-    ${PROJECT_SOURCE_DIR}/tools/bench/flash_next_hc_decode.hip
+    ${QFN_BENCH_DIR}/flash_next_hc_decode.hip
     PROPERTIES LANGUAGE HIP)
   target_link_libraries(qwen38_flash_next_hc_decode_bench PRIVATE
     gufo_qwen38_flash_next)
 
-  # Prefill MoE glue, plain-store kernel copies vs production (tools/bench).
+  # Prefill MoE glue, plain-store kernel copies vs production (tools/qwen38_flash_next/bench).
   # The copies compile with the production library's HIP flags.
   add_executable(qwen38_flash_next_moe_glue_bench EXCLUDE_FROM_ALL
-    ${PROJECT_SOURCE_DIR}/tools/bench/flash_next_moe_glue.hip)
+    ${QFN_BENCH_DIR}/flash_next_moe_glue.hip)
   set_source_files_properties(
-    ${PROJECT_SOURCE_DIR}/tools/bench/flash_next_moe_glue.hip
+    ${QFN_BENCH_DIR}/flash_next_moe_glue.hip
     PROPERTIES LANGUAGE HIP
     COMPILE_OPTIONS "-O3;-ffast-math;-fno-finite-math-only")
   target_link_libraries(qwen38_flash_next_moe_glue_bench PRIVATE
     gufo_qwen38_flash_next)
 
   # Prefill HC combine + W8A8 HC down against the frozen plain-store combine
-  # (tools/bench), compiled with the production library's HIP flags.
+  # (tools/qwen38_flash_next/bench), compiled with the production library's HIP flags.
   add_executable(qwen38_flash_next_hc_prefill_bench EXCLUDE_FROM_ALL
-    ${PROJECT_SOURCE_DIR}/tools/bench/flash_next_hc_prefill.hip)
+    ${QFN_BENCH_DIR}/flash_next_hc_prefill.hip)
   set_source_files_properties(
-    ${PROJECT_SOURCE_DIR}/tools/bench/flash_next_hc_prefill.hip
+    ${QFN_BENCH_DIR}/flash_next_hc_prefill.hip
     PROPERTIES LANGUAGE HIP
     COMPILE_OPTIONS "-O3;-ffast-math;-fno-finite-math-only")
   target_link_libraries(qwen38_flash_next_hc_prefill_bench PRIVATE
     gufo_qwen38_flash_next)
 
-  # EXL3 prefill GEMM ceiling screen (tools/bench, plan/exl3/archive/B7-CEILING-BRIEF.md):
+  # EXL3 prefill GEMM ceiling screen (tools/qwen38_flash_next/bench, plan/exl3/archive/B7-CEILING-BRIEF.md):
   # production launchers against no-decode/WMMA-only/decode-only/warp-
   # specialized variants. No extra options: the kernel copies keep the
   # production prefill_fp16.hip flags, so their outputs compare bit for bit.
   add_executable(qwen38_flash_next_exl3_wmma_ceiling_bench EXCLUDE_FROM_ALL
-    ${PROJECT_SOURCE_DIR}/tools/bench/gfx1151_exl3_wmma_ceiling.hip)
+    ${QFN_BENCH_DIR}/gfx1151_exl3_wmma_ceiling.hip)
   set_source_files_properties(
-    ${PROJECT_SOURCE_DIR}/tools/bench/gfx1151_exl3_wmma_ceiling.hip
+    ${QFN_BENCH_DIR}/gfx1151_exl3_wmma_ceiling.hip
     PROPERTIES LANGUAGE HIP)
   target_link_libraries(qwen38_flash_next_exl3_wmma_ceiling_bench PRIVATE
     gufo_qwen38_flash_next)
@@ -181,36 +185,36 @@ if (ENGINE_ENABLE_HIP)
       qwen38_flash_next_continuation_adapter_test)
 
   add_executable(qwen38_flash_next_dense_gemm_bench EXCLUDE_FROM_ALL
-    dense_gemm_bench.cpp)
+    ${QFN_BENCH_DIR}/dense_gemm_bench.cpp)
   target_link_libraries(qwen38_flash_next_dense_gemm_bench PRIVATE
     gufo_qwen38_flash_next hip::host)
 
-  add_executable(qwen38_flash_next_attn_bench EXCLUDE_FROM_ALL attn_bench.cpp)
+  add_executable(qwen38_flash_next_attn_bench EXCLUDE_FROM_ALL ${QFN_BENCH_DIR}/attn_bench.cpp)
   target_link_libraries(qwen38_flash_next_attn_bench PRIVATE
     gufo_qwen38_flash_next hip::host)
 
   add_executable(qwen38_flash_next_decode_attn_bench EXCLUDE_FROM_ALL
-    decode_attn_bench.cpp)
+    ${QFN_BENCH_DIR}/decode_attn_bench.cpp)
   target_link_libraries(qwen38_flash_next_decode_attn_bench PRIVATE
     gufo_qwen38_flash_next hip::host)
 
   add_executable(qwen38_flash_next_overlap_bench EXCLUDE_FROM_ALL
-    overlap_bench.cpp)
+    ${QFN_BENCH_DIR}/overlap_bench.cpp)
   target_link_libraries(qwen38_flash_next_overlap_bench PRIVATE
     gufo_qwen38_flash_next hip::host)
 
   add_executable(qwen38_flash_next_f16_gemm_bench EXCLUDE_FROM_ALL
-    f16_gemm_bench.cpp)
+    ${QFN_BENCH_DIR}/f16_gemm_bench.cpp)
   target_link_libraries(qwen38_flash_next_f16_gemm_bench PRIVATE
     gufo_qwen38_flash_next hip::host roc::hipblaslt)
 
   add_executable(qwen38_flash_next_gdn_prefill_bench EXCLUDE_FROM_ALL
-    gdn_prefill_bench.cpp)
+    ${QFN_BENCH_DIR}/gdn_prefill_bench.cpp)
   target_link_libraries(qwen38_flash_next_gdn_prefill_bench PRIVATE
     gufo_qwen38_flash_next hip::host)
 
   add_executable(qwen38_flash_next_routed_gemm_bench EXCLUDE_FROM_ALL
-    routed_gemm_bench.cpp)
+    ${QFN_BENCH_DIR}/routed_gemm_bench.cpp)
   target_link_libraries(qwen38_flash_next_routed_gemm_bench PRIVATE
     gufo_qwen38_flash_next hip::host)
 

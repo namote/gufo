@@ -13,7 +13,7 @@ benchmark/tuning executables; Python tools run from this source tree.
 | `serving/` | HTTP serving benchmarks, and the Flash-Next serving supervisor with its installer ([`serving/flash_next/`](serving/flash_next/README.md)) |
 | `ds4/` | DeepSeek-specific validation and experiments |
 | `qwen27b/` | Qwen27B/DFlash2 kernels, reference checks, and vision validation |
-| `qwen-flash/` | Flash-Next projection and MoE microbenchmarks |
+| `qwen38_flash_next/` | Flash-Next benchmarks (`bench/`), speculative-decoding analysis (`spec/`) and reference tools; see [its README](qwen38_flash_next/README.md) |
 | `rotquant/` | Input-side Hadamard rotation converter for GGUF weights: rotated BF16 output with upstream llama.cpp `prism.hadamard.*` metadata, JSON recipes and exact `llama-quantize` rules (model input groups live beside each model, e.g. `qwen27b/rotquant_groups.py`; tests `rotquant_test`, `qwen27b.rotquant-groups`) |
 | `h3/` | MiniMax inventory and quality-artifact commands |
 | `audio/` | Audio reference and quality tools |

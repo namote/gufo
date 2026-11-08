@@ -1,8 +1,9 @@
 // Prototype grouped GEMM for the Qwen3.8-Flash-Next expert projections:
 // int8 WMMA (gfx1151, wave32) over Q4_K weights and Q8 activations, with the
 // per-32 scales applied in a float epilogue per k-step. Standalone benchmark
-// against a CPU reference; see ../README.md for the measurements and the
-// comparison with the vendored MMQ tier this was meant to replace.
+// against a CPU reference. Its measurements and the comparison with the
+// vendored MMQ tier it was meant to replace were never recorded in this
+// repository.
 //
 //   hipcc -O3 --offload-arch=gfx1151 -DBNW=128 moe_gemm_i8_bench.hip
 //   ./a.out E N K rows_per_expert [check]

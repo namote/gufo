@@ -191,7 +191,7 @@ private:
 /// Softmax probability of a drafted `token` over the head's reported top
 /// candidates, or -1 when the token is not among them (the draft is their
 /// argmax, so this is not expected). qwen38_flash_next_gpu_probe --mtp-trace
-/// reports the same value; tools/qwen-flash/spec/spec_sim.py replays it.
+/// reports the same value; tools/qwen38_flash_next/spec/spec_sim.py replays it.
 [[nodiscard]] inline double DraftConfidence(const MtpCandidateLogits& c,
                                             std::int32_t token) noexcept {
   std::size_t self = c.size;

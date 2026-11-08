@@ -1,5 +1,5 @@
 {
-  "description": "F32 CPU reference (qwen38_flash_next_reference_probe) top-K logits for gpu_probe --logit-rows dumps; see tests/models/qwen38_flash_next/f32_reference.py",
+  "description": "F32 CPU reference (qwen38_flash_next_reference_probe) top-K logits for gpu_probe --logit-rows dumps; see tools/qwen38_flash_next/f32_reference.py",
   "model": {
     "repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
     "quantization": "UD-Q4_K_XL",

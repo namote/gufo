@@ -1,7 +1,7 @@
 {
  "schema": "gufo.speculative-corpus.v1",
  "version": "w9-kyojin-1",
- "note": "W9 Kyojin comparison suite, verbatim from Yamz-Labs/kyojin@2132bd248e3bfe07258a408669608f3d2cfdda79 (MIT); built by tools/qwen-flash/spec/build_suites.py.",
+ "note": "W9 Kyojin comparison suite, verbatim from Yamz-Labs/kyojin@2132bd248e3bfe07258a408669608f3d2cfdda79 (MIT); built by tools/qwen38_flash_next/spec/build_suites.py.",
  "prompts": [
   {
    "id": "k_prose_0",

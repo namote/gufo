@@ -1,7 +1,7 @@
 {
  "schema": "gufo.speculative-corpus.v1",
  "version": "w9-context-1",
- "note": "W9 long-context suite: 82 Markdown files under docs/ at c94572b33a9c86f315e7860bf22b121f36b47bbd (1120466 characters, sha256 94bc17c6dad6ebc461ad6300641c06a6b5f6aafe51792e9d3d0877be0a25ff72), sliced at 3.6 characters per target token; instructions from Yamz-Labs/kyojin@2132bd248e3bfe07258a408669608f3d2cfdda79 tools/qwen/serve_bench_ctx.py (STORY) and W9 (ASK). Built by tools/qwen-flash/spec/build_suites.py.",
+ "note": "W9 long-context suite: 82 Markdown files under docs/ at c94572b33a9c86f315e7860bf22b121f36b47bbd (1120466 characters, sha256 94bc17c6dad6ebc461ad6300641c06a6b5f6aafe51792e9d3d0877be0a25ff72), sliced at 3.6 characters per target token; instructions from Yamz-Labs/kyojin@2132bd248e3bfe07258a408669608f3d2cfdda79 tools/qwen/serve_bench_ctx.py (STORY) and W9 (ASK). Built by tools/qwen38_flash_next/spec/build_suites.py.",
  "prompts": [
   {
    "id": "d8k_0",

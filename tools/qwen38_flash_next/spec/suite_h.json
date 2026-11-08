@@ -1,7 +1,7 @@
 {
  "schema": "gufo.speculative-corpus.v1",
  "version": "w9-heldout-1",
- "note": "W9 held-out prompts (supervisor 2026-10-30): 32 prompts written for W9 after the confidence-rule thresholds were chosen, never used for tuning. 8 categories x (2 English + 2 Korean). Overlap with the tuning suites (accept_prompts.json, suite_k.json, suite_d.json) is recorded in manifest.overlap by tools/qwen-flash/spec/check_heldout.py.",
+ "note": "W9 held-out prompts (supervisor 2026-10-30): 32 prompts written for W9 after the confidence-rule thresholds were chosen, never used for tuning. 8 categories x (2 English + 2 Korean). Overlap with the tuning suites (accept_prompts.json, suite_k.json, suite_d.json) is recorded in manifest.overlap by tools/qwen38_flash_next/spec/check_heldout.py.",
  "prompts": [
   {
    "id": "h_explain_en_1",

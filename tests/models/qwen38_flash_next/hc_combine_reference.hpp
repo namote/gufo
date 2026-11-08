@@ -5,7 +5,7 @@
 // kInject specialization (a __half-route option the FP32 route never
 // instantiates). Production now streams the wide prefill residual write-back
 // with non-temporal stores, which must not change a byte; the HC prefill
-// bench (tools/bench/flash_next_hc_prefill.hip) compares the production
+// bench (tools/qwen38_flash_next/bench/flash_next_hc_prefill.hip) compares the production
 // combine's bytes against this copy and times both. Include from a HIP TU
 // compiled with the production library's flags (-O3 -ffast-math
 // -fno-finite-math-only).

@@ -11,7 +11,7 @@ documentation read with `git show <revision>:<path>` so the bytes are pinned; ea
 Two prompts per depth end with Kyojin's context-curve instruction (tools/qwen/serve_bench_ctx.py); two ask about
 the context itself. The token count is approximate (server usage reports the exact prompt_tokens).
 
-Usage: python3 -I tools/qwen-flash/spec/build_suites.py [--revision REV] [--out DIR]
+Usage: python3 -I tools/qwen38_flash_next/spec/build_suites.py [--revision REV] [--out DIR]
 """
 import argparse
 import hashlib
@@ -108,7 +108,7 @@ def kyojin_suite():
                             "source": f"{KYOJIN} {source}[{category!r}][{i}]"})
     return {"schema": "gufo.speculative-corpus.v1", "version": "w9-kyojin-1",
             "note": f"W9 Kyojin comparison suite, verbatim from {KYOJIN} (MIT); built by "
-                    "tools/qwen-flash/spec/build_suites.py.",
+                    "tools/qwen38_flash_next/spec/build_suites.py.",
             "prompts": prompts}
 
 
@@ -140,7 +140,7 @@ def context_suite(revision):
                     f"({len(text)} characters, sha256 {hashlib.sha256(text.encode()).hexdigest()}), sliced at "
                     f"{CHARS_PER_TOKEN} characters per target token; instructions from {KYOJIN} "
                     "tools/qwen/serve_bench_ctx.py (STORY) and W9 (ASK). Built by "
-                    "tools/qwen-flash/spec/build_suites.py.",
+                    "tools/qwen38_flash_next/spec/build_suites.py.",
             "prompts": prompts}
 
 

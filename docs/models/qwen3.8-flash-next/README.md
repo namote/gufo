@@ -158,7 +158,7 @@ hidden states and mRoPE. Image snapshots require matching prompt attachment.
 Model tests are in `tests/models/qwen38_flash_next`, focused microbenchmarks in
 `tools/qwen-flash`. [Quality](QUALITY.md) summarizes qualification and focused checks.
 Build a microbenchmark with
-`nix develop -c tools/bench/build.sh tools/qwen-flash/projection_plans.hip`;
+`nix develop -c tools/bench/build.sh tools/qwen38_flash_next/bench/projection_plans.hip`;
 `dense_blaslt_sweep.hip` times hipBLASLt on the dense prefill shapes.
 No historical logit dump is required. New retained result summaries belong in
 `artifacts/`; generated traces stay in the ignored top-level `artifacts/` tree.
