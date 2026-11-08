@@ -55,8 +55,8 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen38_flash_next_hc_decode_bench PRIVATE
     gufo_qwen38_flash_next)
 
-  # Prefill MoE glue, pre-B6 kernels vs production (tools/bench). The old
-  # copies compile with the production library's HIP flags.
+  # Prefill MoE glue, plain-store kernel copies vs production (tools/bench).
+  # The copies compile with the production library's HIP flags.
   add_executable(qwen38_flash_next_moe_glue_bench EXCLUDE_FROM_ALL
     ${PROJECT_SOURCE_DIR}/tools/bench/flash_next_moe_glue.hip)
   set_source_files_properties(
@@ -66,7 +66,7 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen38_flash_next_moe_glue_bench PRIVATE
     gufo_qwen38_flash_next)
 
-  # Prefill HC combine + W8A8 HC down against the frozen pre-B6 combine
+  # Prefill HC combine + W8A8 HC down against the frozen plain-store combine
   # (tools/bench), compiled with the production library's HIP flags.
   add_executable(qwen38_flash_next_hc_prefill_bench EXCLUDE_FROM_ALL
     ${PROJECT_SOURCE_DIR}/tools/bench/flash_next_hc_prefill.hip)

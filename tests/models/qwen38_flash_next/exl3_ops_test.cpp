@@ -2269,7 +2269,7 @@ void ExecutorSharedOverlap() {
   Require(equal, "shared overlap changed executor results");
 }
 
-// B5 J3: decode/verify with the GDN alpha/beta projection and the attention
+// Decode/verify with the GDN alpha/beta projection and the attention
 // indexer on side branches must keep every logit and state byte of the
 // serial order (a GDN layer then a sparse attention layer, past the
 // indexer's top-k so selection runs, AR decode steps and verify passes).
@@ -2412,7 +2412,7 @@ void MtpKvGroup() {
   Require(equal, "all K/V group projections preserve full-QKV bits");
 }
 
-// E1: producer epilogues that also write the rotated FP16 input of the next
+// Producer epilogues that also write the rotated FP16 input of the next
 // EXL3 decode projections. The rotation runs the standalone kernels'
 // arithmetic on the same stored FP32 values, so producer outputs and every
 // projection must keep their bits (rows 1..8, every pass width, signed zero

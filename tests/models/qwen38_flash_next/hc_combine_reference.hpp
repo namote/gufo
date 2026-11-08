@@ -1,10 +1,14 @@
-// Frozen copy of the pre-B6 (bec85727) four-lane HC combine of
+// Frozen copy of the four-lane HC combine of
 // src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp,
-// HcCombineVec4Kernel, with its device helpers, verbatim apart from the
-// kernel's name and its dropped kInject specialization (a __half-route
-// option the FP32 route never instantiates). Benches and tests compare the
-// production combine's bytes against it. Include from a HIP TU compiled
-// with the production library's flags (-O3 -ffast-math -fno-finite-math-only).
+// HcCombineVec4Kernel, at commit bec85727 (plain residual stores), with its
+// device helpers, verbatim apart from the kernel's name and its dropped
+// kInject specialization (a __half-route option the FP32 route never
+// instantiates). Production now streams the wide prefill residual write-back
+// with non-temporal stores, which must not change a byte; the HC prefill
+// bench (tools/bench/flash_next_hc_prefill.hip) compares the production
+// combine's bytes against this copy and times both. Include from a HIP TU
+// compiled with the production library's flags (-O3 -ffast-math
+// -fno-finite-math-only).
 #ifndef GUFO_TESTS_MODELS_QWEN38_FLASH_NEXT_HC_COMBINE_REFERENCE_HPP_
 #define GUFO_TESTS_MODELS_QWEN38_FLASH_NEXT_HC_COMBINE_REFERENCE_HPP_
 

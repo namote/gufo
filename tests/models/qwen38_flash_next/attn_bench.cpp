@@ -11,8 +11,8 @@
 // an FNV-1a hash of the output after the first call, so kernel rewrites can be
 // checked for identical results.
 //
-// Each run also times the EXL3 prefill query pass plus attention in its pre-B6
-// form (AttentionQueryRows unpacks the gate, the kernel reads that copy)
+// Each run also times the EXL3 prefill query pass plus attention with an
+// unpacked gate copy (AttentionQueryRows unpacks the gate, the kernel reads it)
 // against the current one (no copy; the kernel reads the gate halves of the
 // packed projection rows); both outputs must be byte-equal.
 #include <hip/hip_fp16.h>

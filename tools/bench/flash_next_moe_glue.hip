@@ -1,6 +1,6 @@
-// Flash-Next EXL3 prefill MoE glue (B6 P1): the pre-B6 gate/up rotation
-// (RotateGateUpTokens) and down-input preparation (RestoreActivateScaleBuckets)
-// with plain stores, verbatim below, against the production kernels, which
+// Flash-Next EXL3 prefill MoE glue: the gate/up rotation (RotateGateUpTokens)
+// and down-input preparation (RestoreActivateScaleBuckets) with plain stores,
+// as of commit bec85727, verbatim below, against the production kernels, which
 // store their FP16 slabs with streaming (non-temporal) stores. Each is timed
 // alone and followed by the routed bucket GEMMs that read its output (gate
 // and up, or down), since the store policy mainly moves cost between the
@@ -8,6 +8,7 @@
 // expert FF 640, K4 gate/up/down banks, 2,048 and 4,096 token chunks with a
 // skewed routing. µs/call is the best of kReps averages over kCalls calls.
 // Output bytes (and the down exponents) of old and new must be equal.
+// Results: docs/GFX1151-KNOWHOW.md, "Flash-Next B6".
 //
 // Build (CMake, links the production library):
 //   cmake --build --preset gpu-test --target qwen38_flash_next_moe_glue_bench
@@ -101,7 +102,7 @@ ex::DeviceLinear Linear(unsigned k, unsigned n, std::uint32_t seed) {
           ex::Codebook::kMul1};
 }
 
-// ---- pre-B6 kernels, verbatim apart from the names (plain stores) ----
+// ---- plain-store kernels (bec85727), verbatim apart from the names ----
 
 __device__ __forceinline__ unsigned BucketExpert(const unsigned* offsets,
                                                  unsigned experts,

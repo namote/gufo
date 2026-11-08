@@ -800,10 +800,10 @@ int main() {
                          vec_inject * 4))
           throw std::runtime_error("HC epilogue F16 mix differs");
       }
-      // E2: the attention combine leaves its update out of res; the FFN
-      // mixer's recomputed norm, HcNormFromRes and the next combine add it
-      // in the combine's FMA. Every output and the final residual keep the
-      // writing route's bits.
+      // Deferred residual: the attention combine leaves its update out of
+      // res; the FFN mixer's recomputed norm, HcNormFromRes and the next
+      // combine add it in the combine's FMA. Every output and the final
+      // residual keep the writing route's bits.
       HipBuffer<float> d_res_c(kRows), d_res_d(kRows),
           d_defer_w(static_cast<std::size_t>(kTokens) * kStreams);
       HipBuffer<float> d_xn_c(kRows), d_xn_d(kRows), d_next_out(kMixed);

@@ -1,4 +1,4 @@
-// Flash-Next EXL3 decode HC projections (B4 H3): the B2 sequence (Q8_0 HC
+// Flash-Next EXL3 decode HC projections: the split sequence (Q8_0 HC
 // down GEMV 320 x 10240, SiluScaleQ8_1, Q8_0 HC up GEMV 10240 x 320,
 // HcMixEpilogue) against the fused down projection HcDownSiluQ8_1 (each
 // block owns one 32-row Q8_1 group of lo and finishes it in-block) followed
@@ -6,12 +6,13 @@
 // not copies. Rows R = 1..8 (decode and MTP verify widths), weights rotated
 // over enough copies to miss the GPU caches, each variant captured in one
 // graph of kCalls calls like a decode step. The fused lo and lo Q8_1 bytes
-// must equal the B2 sequence's for every R.
+// must equal the split sequence's for every R. Results:
+// docs/GFX1151-KNOWHOW.md, "Flash-Next B4".
 //
 // The HC up + mix fusion is not a variant: one block would have to own a
 // 256-column chunk (1024 gate rows, 32 per wave on 10 of 20 WGPs) to run
 // the mix epilogue without a cross-block tail, and the design screen did not
-// expect that to match the B2 up GEMV. Its B2 kernels are timed for scale.
+// expect that to match the plain up GEMV, which is timed for scale.
 //
 // Build (CMake, links the production library):
 //   cmake --build --preset gpu-test --target qwen38_flash_next_hc_decode_bench
@@ -145,16 +146,16 @@ int main() {
   Ck(hipMalloc(&mixed_q8, qfn_mmq_q8_1_bytes(kMaxRows, kHidden)), "malloc");
   const float scale = 1.0F / kStreams;
   std::printf(
-      "R  down+silu B2  fused down  (GB/s B2/fused)  up GEMV  mix  "
-      "chain B2  chain fused  [us/call]\n");
+      "R  down+silu split  fused down  (GB/s split/fused)  up GEMV  mix  "
+      "chain split  chain fused  [us/call]\n");
   for (int rows = 1; rows <= kMaxRows; ++rows) {
     Require(qfn_mmq_quantize_q8_1(d_xn, xq, rows, kHcDim, stream) == 0,
             "quantize");
-    const auto down_b2 = [&](int c, hipStream_t s) {
+    const auto down_split = [&](int c, hipStream_t s) {
       Require(qfn_mmq_q8_0_dense_vec_preq(down[c], nullptr, xq, lo, kRank, rows,
                                           kHcDim, s) == 0 &&
                   q::SiluScaleQ8_1(lo, scale, rows, kRank, lo_cols, lo_q8, s),
-              "B2 down");
+              "split down");
     };
     const auto down_fused = [&](int c, hipStream_t s) {
       Require(q::HcDownSiluQ8_1(down[c], xq, lo_f, scale, rows, lo_cols,
@@ -171,7 +172,7 @@ int main() {
                        kStreams, s, mixed_q8, q::Exl3InputSlabs{});
     };
     // Equality first (one call of each, copy 0).
-    down_b2(0, stream);
+    down_split(0, stream);
     down_fused(0, stream);
     Ck(hipStreamSynchronize(stream), "sync");
     std::vector<float> a(std::size_t(rows) * kRank), b(a.size());
@@ -181,13 +182,13 @@ int main() {
     Ck(hipMemcpy(qa.data(), lo_q8, qa.size(), hipMemcpyDeviceToHost), "down");
     Ck(hipMemcpy(qb.data(), lo_q8_f, qb.size(), hipMemcpyDeviceToHost), "down");
     Require(std::memcmp(a.data(), b.data(), a.size() * 4) == 0 && qa == qb,
-            "fused HC down differs from the B2 sequence");
-    const double t_b2 = TimeGraph(stream, down_b2);
+            "fused HC down differs from the split sequence");
+    const double t_split = TimeGraph(stream, down_split);
     const double t_fused = TimeGraph(stream, down_fused);
     const double t_up = TimeGraph(stream, up_gemv);
     const double t_mix = TimeGraph(stream, mix);
-    const double t_chain_b2 = TimeGraph(stream, [&](int c, hipStream_t s) {
-      down_b2(c, s);
+    const double t_chain_split = TimeGraph(stream, [&](int c, hipStream_t s) {
+      down_split(c, s);
       up_gemv(c, s);
       mix(c, s);
     });
@@ -202,8 +203,8 @@ int main() {
     std::printf(
         "%d  %10.2f  %10.2f  (%5.0f/%5.0f)  %7.2f  %5.2f  %8.2f  "
         "%10.2f\n",
-        rows, t_b2, t_fused, w_bytes / t_b2 * 1e-3, w_bytes / t_fused * 1e-3,
-        t_up, t_mix, t_chain_b2, t_chain_fused);
+        rows, t_split, t_fused, w_bytes / t_split * 1e-3,
+        w_bytes / t_fused * 1e-3, t_up, t_mix, t_chain_split, t_chain_fused);
   }
   std::printf("fused HC down: lo and lo Q8_1 byte-identical for R = 1..8\n");
   return 0;

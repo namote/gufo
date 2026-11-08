@@ -1,11 +1,13 @@
 #ifndef GUFO_TESTS_MODELS_QWEN38_FLASH_NEXT_EXL3_ROUTED_REFERENCE_HPP_
 #define GUFO_TESTS_MODELS_QWEN38_FLASH_NEXT_EXL3_ROUTED_REFERENCE_HPP_
 
-// The routed expert decode GEMV (src/models/qwen38_flash_next/kernels/rocm/
-// exl3_moe.hip RoutedGemv) as it was before B5 J2 (commit e8e938ed): one
-// output tile per wave, MaxRows 3/4/8 kernels with the route tile promoted
-// to LDS. Kept verbatim so tests can compare the production kernel's output
-// bytes against it. Compile with exl3_moe.hip's device flags (-O3,
+// Frozen copy of the routed expert decode GEMV (src/models/qwen38_flash_next/
+// kernels/rocm/exl3_moe.hip RoutedGemv) at commit e8e938ed: one output tile
+// per wave, MaxRows 3/4/8 kernels with the route tile promoted to LDS.
+// Production now keeps the route tile in registers and gives each down wave
+// two output tiles, without changing any lane's arithmetic; this copy pins
+// that contract, so tests compare the production kernel's output bytes
+// against it. Kept verbatim; compile with exl3_moe.hip's device flags (-O3,
 // -ffast-math, -fno-finite-math-only), as exl3_moe_kernel_test.cpp is.
 
 #include <hip/hip_runtime.h>

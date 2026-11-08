@@ -1,7 +1,7 @@
-// Flash-Next EXL3 prefill HC combine (B6 P5): the four-lane combine as the
+// Flash-Next EXL3 prefill HC combine: the four-lane combine as the
 // EXL3 prefill route runs it (residual update written back, F32 norm left
 // out, per-stream scales and the tiled Q8 norm for the next mixer), against
-// the frozen pre-B6 kernel (tests/models/qwen38_flash_next/
+// the frozen plain-store kernel (tests/models/qwen38_flash_next/
 // hc_combine_reference.hpp), then the W8A8 HC down projection (10240 -> 320)
 // that reads the Q8 norm. Three specializations: the plain combine, the
 // fused-MoE combine with a deferred prior update (the post-MoE combine of
@@ -10,7 +10,7 @@
 // (streaming residual stores). Every output byte (residual, Q8 norm, scales,
 // deferred weights) must equal the frozen kernel's; the bench exits nonzero
 // otherwise. µs/call is the best of kReps averages over kCalls calls, old
-// and new alternating.
+// and new alternating. Results: docs/GFX1151-KNOWHOW.md, "Flash-Next B6".
 //
 // Build (CMake, links the production library):
 //   cmake --build --preset gpu-test --target qwen38_flash_next_hc_prefill_bench

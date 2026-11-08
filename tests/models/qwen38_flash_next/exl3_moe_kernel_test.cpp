@@ -1905,7 +1905,7 @@ void RouterTilesSet(unsigned rows, unsigned used) {
           "router tile fixture never split an expert");
 }
 
-// B5 J2: the routed decode GEMV's output bytes against the pre-B5 kernel
+// The routed decode GEMV's output bytes against the frozen one-tile kernel
 // (exl3_routed_reference.hpp) on the model's shapes (hidden 2560, expert
 // width 640, ten experts per token): gate/up, the scaled down projection
 // and its widened FP32 control, every tile-row cap R = 1..8, distinct and
@@ -1976,7 +1976,7 @@ void RoutedReference(unsigned rows, bool shared, int bits, bool half) {
                         const char* what) {
     const auto x = Read(a, count), z = Read(b, count);
     const std::string name =
-        std::string("routed GEMV changed bytes vs pre-B5 kernel: ") + what +
+        std::string("routed GEMV changed bytes vs the frozen kernel: ") + what +
         " rows=" + std::to_string(rows) + (shared ? " shared" : " distinct") +
         " K" + std::to_string(bits) + (half ? ".5" : "");
     Require(std::memcmp(x.data(), z.data(), count * sizeof(float)) == 0,
@@ -2003,7 +2003,7 @@ void RoutedReference(unsigned rows, bool shared, int bits, bool half) {
 // The scaled down projection on DownFixtures' edge rows (signed zeros,
 // subnormals, overflow headroom: exponents 0, 10 and -1, i.e. packed,
 // scaled and widened-fallback rows) at the model's shape, against the
-// pre-B5 kernel, for every tile-row cap and live count.
+// frozen kernel, for every tile-row cap and live count.
 void RoutedDownReference(int bits, bool half) {
   namespace ref = gufo::tests::exl3_routed_reference;
   constexpr unsigned rows = 8, k = 640, n = 2560;
@@ -2051,7 +2051,7 @@ void RoutedDownReference(int bits, bool half) {
           "down reference exponent classification");
       const auto a = Read(out, rows * n), b = Read(expected, rows * n);
       Require(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0,
-              "scaled down edge rows changed bytes vs pre-B5 kernel");
+              "scaled down edge rows changed bytes vs the frozen kernel");
     }
   }
 }
