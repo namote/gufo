@@ -12,6 +12,7 @@ build-time dependency, not vendored code (see
 | --- | --- |
 | [`flash_next/`](flash_next/) | The c03 production path: job drivers, container stages, recipe, calibration inputs and builders, head recovery, ngram, MTP calibration, final assembly, and their converter-environment tests |
 | [`kyojin/`](kyojin/) | The Kyojin pin (`pin.py`, `fetch_kyojin.sh`, `build_kyojin.sh`), the recorded runtime metadata (`runtime/`), and one serving-only patch |
+| [`hc/`](hc/README.md) | BF16-source HC Q8_0 calibration and code/scale refinement comparison; optional CPU checks, actual GPU collection and runtime qualification pending |
 | [`history/`](history/README.md) | Probes, diagnostics, abandoned candidates and validation scripts that no production receipt pins, kept as evidence |
 | [`legacy/`](legacy/README.md) | Older gufo wrappers from the XQ/F3 work (`run_convert.py`, `provenance.py`, `check_pack.py`, `check_fn_pack.py`, `compare_qtensors.py`, `verify_hf_download.py`). None of them is on the c03 path |
 | `c02_to_caldata.py` | Builds a calibration tensor from the c02 corpus (the XQ path), tested by `test_c02_to_caldata.py` |

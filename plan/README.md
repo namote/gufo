@@ -11,6 +11,7 @@
 | [exl3/HANDOFF.md](exl3/HANDOFF.md) | **먼저 읽을 문서.** 지금 배포된 Flash-Next 서비스(B10 runtime)와 다음 작업 |
 | [exl3/PLAN.md](exl3/PLAN.md) | EXL3 / Flash-Next 형식·커널·서비스 결정 기록 |
 | [exl3/B-SERIES-SUMMARY.md](exl3/B-SERIES-SUMMARY.md) | Flash-Next B1–B10 최적화·정리·GPU 패스 묶음 색인(브리프와 GPU 패스 링크) |
+| [exl3/HC-Q8-CALIBRATION.md](exl3/HC-Q8-CALIBRATION.md) | BF16 원본 기반 HC Q8 보정 및 코드·스케일 반복 보정 비교. 변환 도구로 이관, GPU 수집·실제 품질 검증 준비 중 |
 
 ## Archive (끝났거나 접은 계획)
 

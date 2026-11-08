@@ -1,0 +1,13 @@
+{
+  "source": "retired HC preparation, 2026-11-07/08",
+  "source_files_sha256": {
+    "quant.py": "3ef793be594c44570c0ea3b170946a56274666105a755996bffd98561d6a7529",
+    "refine.py": "0a3def70455fa4adba7885a631a23fe8e80bf26ffdb7c7781855501be8ac7427",
+    "weights.py": "47dc25722eca8c600ca5adb6d7b59954fdc821807fb30a4fea5c57e273945fe7",
+    "inventory.py": "884fd6dba5cb20bbca273233c0b6c972531d95cf22d5406bf1c165b3ac966267",
+    "test_cpu.py": "99408c4994e4d7c292755894c91239015c73c74d27471937f2d391ef2dab46b4",
+    "test_refine.py": "111466a8fe58e1a9ee309b437f02e7b4a101dafd15c65400888ea6be7bc1c059"
+  },
+  "backup_manifest": "/home/m2on/projects/_backup/gufo-hc-q8-20261108/MANIFEST.json",
+  "holdout": "/home/m2on/projects/models/eval/flash-next/hc-holdout"
+}
