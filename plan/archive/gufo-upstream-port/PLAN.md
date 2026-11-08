@@ -28,7 +28,7 @@ U0 원본 기준값은 [U0 결과](U0-RESULTS.md)에, 기능별 상세 대응은
   - 디스크 prefetch(`WILLNEED` 힌트)
   - 행을 복사 없이 빌려 쓰는 checkpoint
 - **원본에 없는 것:** paged live KV. RFC가 측정으로 필요가 보이면 앞당긴다고 적은 후속 과제다(`RFC.md:97`, `:1246-1249`, `:1546-1549`). 우리 P1·P2 측정(256K×4가 40 GiB, 64K×8이 24 GiB)이 그 근거가 된다.
-- **이전 계획과의 관계:** 우리 [S1 component 이전 계획](/home/m2on/projects/ai.tools/archive/plan/2026-10-23-gufo-s1-component/V11-GUFO-S1-PLAN-20261020.md)(보류)은 원본 #540이 같은 일을 해서 취소·보관한다.
+- **이전 계획과의 관계:** 우리 S1 component 이전 계획(`/home/m2on/projects/_ai.tools/archive/plan/2026-10-23-gufo-s1-component/V11-GUFO-S1-PLAN-20261020.md`)(보류)은 원본 #540이 같은 일을 해서 취소·보관한다.
 
 ## 판정 요약
 

@@ -5,7 +5,7 @@
 - offload는 작은 pinned bounce 버퍼를 거쳐(`hipMemcpy` DMA) disk로 간다.
 - 같은 RAM 안에 중간 전체 사본을 두지 않는다.
 
-[S1 계획](/home/m2on/projects/ai.tools/archive/plan/2026-10-23-gufo-s1-component/V11-GUFO-S1-PLAN-20261020.md)은 보류한다. 코드는 gufo 작업 트리 `~/projects/gufo`(브랜치 `ai-tools/cache-s4`)에서 고치고, 실험은 `test/experiments/gufo_eval_20261020/`에 둔다. 실험 기본값·Compose는 바꾸지 않는다.
+S1 계획(`/home/m2on/projects/_ai.tools/archive/plan/2026-10-23-gufo-s1-component/V11-GUFO-S1-PLAN-20261020.md`)은 보류한다. 코드는 gufo 작업 트리 `~/projects/gufo`(브랜치 `ai-tools/cache-s4`)에서 고치고, 실험은 `test/experiments/gufo_eval_20261020/`에 둔다. 실험 기본값·Compose는 바꾸지 않는다.
 
 ## 측정·확인된 사실
 

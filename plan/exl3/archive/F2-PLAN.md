@@ -188,7 +188,7 @@
   - storage: `quantization_config.json`의 텐서 296,814개가 헤더의 모양, dtype, 바이트와 모두 같다.
     - 목록에 없는 본체 텐서 109개는 leaf가 아닌 모듈의 파라미터다(GDN `A_log`/`dt_bias`/`conv1d`, PLE `conv1d`). upstream `quant_config.py`가 leaf만 적기 때문이다.
     - MTP, 비전, `mtp_hyper_connection_mixer_patch.safetensors` 텐서 7,190개는 side 검사로 본다.
-  - bits: experts 5 × 73,728, GDN/attention/shared expert 7(108 + 48 + 144), indexer 5(12), lm_head 6. router, `in_proj_a/b`, hyper-connection, PLE projection은 EXL3가 아니다. n-gram trellis는 int16 [320001536, 61](K=6)이다.
+  - bits: experts 5 × 73,728, GDN/attention/shared expert 7(108 + 48 + 144), indexer 5(12), lm_head 6. router, `in_proj_a/b`, hyper-connection, PLE projection은 EXL3가 아니다. n-gram trellis는 int16 [320001536, 61] (K=6)이다.
   - side: MTP experts와 indexer 5(1,537), MTP attention과 shared expert 7(7), MTP `fc_embedding`/`fc_hidden` 6(2), 비전 6(164)
   - index: `model.safetensors.index.json` 304,105개가 실제 파일과 맞는다.
 - **외장 디스크:** 받은 뒤 가용 306 GB
