@@ -102,7 +102,9 @@ __global__ void SelectScoreKernel(const float* q, const __half* blocks,
   const auto t0 = blockIdx.x;
   const auto complete = (*start_pos + first_token + t0 + 1) / ratio;
   const auto b = blockIdx.y * blockDim.x + threadIdx.x;
-  if (t0 >= n_tokens || complete <= budget || b >= complete)
+  // The position comes from the device, the row size from the host: a block
+  // past max_blocks has no score slot in this row.
+  if (t0 >= n_tokens || complete <= budget || b >= complete || b >= max_blocks)
     return;
   // Load both stored halves together. Unpacking preserves their exact F32
   // values while avoiding a separate narrow memory load for each component.
@@ -222,7 +224,8 @@ __launch_bounds__(kBlock) __global__
   __shared__ std::uint32_t state[3];  // threshold, remaining, bin count
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t pos = *start_pos + first_token + t;
-  const std::uint32_t complete = (pos + 1) / ratio;
+  // Only max_blocks scores exist per row (see SelectScoreKernel).
+  const std::uint32_t complete = min((pos + 1) / ratio, max_blocks);
   std::uint32_t* words = mask + static_cast<std::size_t>(t) * mask_words;
   for (std::uint32_t w = threadIdx.x; w < mask_words; w += blockDim.x) {
     words[w] = complete <= budget ? 0xFFFFFFFFu : 0u;
