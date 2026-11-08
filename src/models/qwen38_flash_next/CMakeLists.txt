@@ -76,6 +76,15 @@ if (ENGINE_ENABLE_HIP)
     ${QFN_ROCM_DIR}/blaslt.cpp
     ${QFN_ROCM_DIR}/device_model.cpp
     ${QFN_ROCM_DIR}/executor.cpp
+    ${QFN_ROCM_DIR}/executor_snapshot.cpp
+    ${QFN_ROCM_DIR}/executor_dense.cpp
+    ${QFN_ROCM_DIR}/executor_hc.cpp
+    ${QFN_ROCM_DIR}/executor_ple.cpp
+    ${QFN_ROCM_DIR}/executor_gdn.cpp
+    ${QFN_ROCM_DIR}/executor_attention.cpp
+    ${QFN_ROCM_DIR}/executor_moe.cpp
+    ${QFN_ROCM_DIR}/executor_forward.cpp
+    ${QFN_ROCM_DIR}/executor_mtp.cpp
     ${QFN_ROCM_DIR}/batch.cpp
     engine.cpp)
   target_sources(gufo_qwen38_flash_next PRIVATE ${QFN_HIP_SOURCES})
