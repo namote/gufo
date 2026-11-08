@@ -12,15 +12,13 @@ import array
 import sys
 from row_checkpoint import tensor_header,link_rows,open_rows,sync_directory
 
-base=Path('/home/m2on/projects/ai.tools')
-task=base/'test/experiments/flash_next_quant_20261104'
-out=base/'tmp/test-results/flash-next-quant-20261104'
+from paths import OUT as out, TASK as task
 root=out/'model-job-c03';repair=root/'repair-002-checkpoint';work=out/'work'
 guard=(root/'JOB.lock').open('a');fcntl.flock(guard,fcntl.LOCK_EX|fcntl.LOCK_NB)
 assert subprocess.check_output(['systemctl','--user','show','gufo-quant-model-c03.service','-p','MainPID','--value'],text=True).strip()=='0'
 assert subprocess.run(['docker','inspect','gufo-quant-model'],capture_output=True).returncode!=0
 assert shutil.disk_usage(out).free>=150*2**30
-from test.experiments.gufo_upstream_port_20261023.window import host,npu,quiet
+from host_guard import host,npu,quiet
 h=host();assert not h['KFD_contexts'] and quiet(h) and not npu()
 old=json.loads((work/'ckpt/job.json').read_text());new=json.loads((work/'ckpt_new/job.json').read_text())
 assert old['next_module_idx']==2 and new['next_module_idx']==3 and new['bad_rows']==[]

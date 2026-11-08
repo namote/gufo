@@ -37,7 +37,7 @@ def functions():
 
 
 def main():
-    from test.experiments.gufo_upstream_port_20261023.window import host,npu
+    from host_guard import host,npu
     attempt=OUT/'model-job-c03/module-016'
     with LOCK.open('a') as gpu,(OUT/'model-job-c03/JOB.lock').open('a') as job:
         fcntl.flock(gpu,fcntl.LOCK_EX|fcntl.LOCK_NB);fcntl.flock(job,fcntl.LOCK_EX|fcntl.LOCK_NB)

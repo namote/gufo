@@ -3,7 +3,8 @@ import json,struct,tempfile,unittest,os,hashlib
 from pathlib import Path
 import disk_boundary as d
 from row_checkpoint import link_rows
-R=Path('/home/m2on/projects/ai.tools/tmp/test-results/flash-next-quant-20261104/disk-boundary');R.mkdir(exist_ok=True)
+from paths import OUT
+R=OUT/'disk-boundary';R.mkdir(parents=True,exist_ok=True)
 class Tests(unittest.TestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory(dir=R);self.out=Path(self.tmp.name);self.root=self.out/'model-job-c03';self.root.mkdir();self.ckpt=self.out/'work/ckpt';self.ckpt.mkdir(parents=True)

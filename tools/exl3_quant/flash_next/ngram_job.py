@@ -9,16 +9,14 @@ import subprocess
 import sys
 import time
 
-TASK=Path(__file__).parent
-OUT=Path('/home/m2on/projects/ai.tools/tmp/test-results/flash-next-quant-20261104')
-SOURCE=Path('/run/media/m2on/T5 EVO/AI/model/originals-flash-next-hf-20261030/Qwen-Qwen3.8-Flash-Next')
+from paths import OUT, RUNTIME, SOURCE, TASK
 STAGE=OUT/'ngram-full'
 STAGE.mkdir(exist_ok=True)
 job_lock=(STAGE/'JOB.lock').open('a')
 fcntl.flock(job_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
 inventory=json.loads((OUT/'source-inventory.json').read_text())
 files=[TASK/'run_stage.py',TASK/'ngram_full.py',TASK/'ngram_job.py',OUT/'source-inventory.json']
-runtime=Path('/home/m2on/projects/ai.tools/test/experiments/gufo_upstream_port_20261023/kyojin_runtime')
+runtime=RUNTIME
 files+=list((runtime/'source/exllamav3/conversion').glob('*.py'))
 files+=list((runtime/'source/exllamav3/modules/quant/exl3_lib').glob('*.py'))
 files+=[runtime/'source/exllamav3/modules/quant/exl3.py',runtime/'SOURCE.json']

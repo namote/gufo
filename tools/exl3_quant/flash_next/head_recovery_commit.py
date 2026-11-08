@@ -134,7 +134,7 @@ def main():
         for p in (LOCK,OUT/'model-job-c03/JOB.lock'):
             f=locks.enter_context(p.open('a'));fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
         assert json.loads((OUT/'WATCH-CONTROL.json').read_text())['enabled']
-        from test.experiments.gufo_upstream_port_20261023.window import host,npu
+        from host_guard import host,npu
         assert not host()['KFD_contexts'] and not npu();assert available()>=8*2**30
         import shutil
         assert shutil.disk_usage(OUT).free>=100*2**30

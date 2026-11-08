@@ -11,7 +11,8 @@ import sys
 import time
 import uuid
 from run_stage import OUT,TASK,LOCK,IMAGE,available,save
-from test.experiments.gufo_upstream_port_20261023.window import host,npu,quiet
+from paths import RUNTIME
+from host_guard import host,npu,quiet
 from owned_cleanup import cleanup_owned
 from conversion_admission import wait_conversion_admission
 from disk_boundary import DiskSpacePending
@@ -152,7 +153,7 @@ paths += [prefix_root/name for name in ('INPUTS.json','SUMMARY.json','STATE.json
 paths += [TASK/name for name in ('prefix_replay.py','prefix_replay_run.py','prefix_replay_job.py')]
 paths += [OUT/'long-row-pilot/SUMMARY.json']
 paths += [OUT/'long-row-pilot/STATE.json']
-runtime=Path('/home/m2on/projects/ai.tools/test/experiments/gufo_upstream_port_20261023/kyojin_runtime')
+runtime=RUNTIME
 paths+=sorted((runtime/'source/exllamav3').rglob('*.py'))
 paths+=[OUT/'model-inventory.json']
 identity={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}

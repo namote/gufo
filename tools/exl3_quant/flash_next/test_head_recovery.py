@@ -8,7 +8,8 @@ import unittest
 from unittest.mock import patch
 import head_recovery as h
 
-TMP=Path('/home/m2on/projects/ai.tools/tmp/test-results/flash-next-quant-20261104/head-recovery')
+from paths import OUT
+TMP=OUT/'head-recovery';TMP.mkdir(parents=True,exist_ok=True)
 
 class Tests(unittest.TestCase):
     def test_numeric(self):

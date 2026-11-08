@@ -9,14 +9,12 @@ import subprocess
 import time
 import uuid
 
-BASE = Path('/home/m2on/projects/ai.tools')
-TASK = BASE/'test/experiments/flash_next_quant_20261104'
-OUT = BASE/'tmp/test-results/flash-next-quant-20261104'
-RUNTIME = BASE/'test/experiments/gufo_upstream_port_20261023/kyojin_runtime'
+from paths import OUT, RUNTIME, SOURCE, TASK
+from host_guard import LOCK
+
+# Container mount point of RUNTIME, unchanged so env and receipts keep the c03 values.
 CR = '/workspace/test/experiments/gufo_upstream_port_20261023/kyojin_runtime'
-SOURCE = Path('/run/media/m2on/T5 EVO/AI/model/originals-flash-next-hf-20261030/Qwen-Qwen3.8-Flash-Next')
 IMAGE = 'sha256:79e3e0b7bc23ed230dc90a11e342aeae109086d145bb0b302363ac2069b43126'
-LOCK = BASE/'storage/runtime/experiments/vllm-multi-selected-20261016/ABBA-OWNER.lock'
 
 def available():
     for line in Path('/proc/meminfo').read_text().splitlines():
@@ -39,7 +37,7 @@ def main():
     with LOCK.open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         # Runtime imports are allowed only after checking current compute ownership.
-        from test.experiments.gufo_upstream_port_20261023.window import host,npu,quiet
+        from host_guard import host,npu,quiet
         h=host();assert quiet(h), 'Another GPU owner is active';assert not npu()
         assert subprocess.run(['docker','inspect',name],capture_output=True).returncode!=0, 'Stage container already exists'
         command=['docker','run','--rm','--name',name,'--pull','never','--network','none',

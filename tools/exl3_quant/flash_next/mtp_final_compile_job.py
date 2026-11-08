@@ -205,7 +205,7 @@ def main():
                 guard();validate_pins(c)
                 main_work,mtp_work,preserved,ngram,budget=validate_inputs(c)
                 assert available()>=28*GIB and shutil.disk_usage(OUT).free>=budget['required_bytes']
-                from test.experiments.gufo_upstream_port_20261023.window import host,npu,quiet
+                from host_guard import host,npu,quiet
                 from conversion_admission import wait_conversion_admission
                 assert not npu()
                 _,admission=wait_conversion_admission(host,quiet,TASK/'conversion-desktop-contract.json')

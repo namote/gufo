@@ -82,7 +82,8 @@ checks.append('Final-main clone changes only skip_side_models, vision16 and comp
 tree=ast.parse((base/'mtp_final_compile_candidate.py').read_text())
 assert not any(isinstance(n,ast.Call) and isinstance(n.func,ast.Attribute) and n.func.attr in ('main','quantize_linears_parallel','quantize_linears_single') for n in ast.walk(tree))
 checks.append('Final assembly does not invoke quantization or converter main')
-runtime=Path('/home/m2on/projects/ai.tools/test/experiments/gufo_upstream_port_20261023/kyojin_runtime/source/exllamav3/conversion/convert_model.py')
+from paths import RUNTIME
+runtime=RUNTIME/'source/exllamav3/conversion/convert_model.py'
 tree=ast.parse(runtime.read_text());main=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='main')
 skip=next(n for n in main.body if isinstance(n,ast.If) and 'EXL3_SKIP_SIDE_MODELS' in ast.unparse(n.test))
 assert any(isinstance(n,ast.Return) for n in skip.body)

@@ -3,7 +3,7 @@ import fcntl,hashlib,json,os,shutil,signal,subprocess,sys,time,uuid
 from pathlib import Path
 from run_stage import OUT,TASK,LOCK,save,available
 from owned_cleanup import cleanup_owned
-from test.experiments.gufo_upstream_port_20261023.window import host,npu,quiet
+from host_guard import host,npu,quiet
 mode=sys.argv[1];assert mode in ('pilot','full')
 root=OUT/'prefix-recovery';base=root/'pilot' if mode=='pilot' else root
 owner=(base/'OWNER.lock').open('a');fcntl.flock(owner,fcntl.LOCK_EX|fcntl.LOCK_NB)

@@ -10,7 +10,7 @@ import time
 import uuid
 
 from run_stage import OUT, TASK, LOCK, IMAGE, available, save
-from test.experiments.gufo_upstream_port_20261023.window import host, npu, quiet
+from host_guard import host, npu, quiet
 
 def stop_signal(signum, frame):
     raise KeyboardInterrupt(f'signal {signum}')
