@@ -55,15 +55,6 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen38_flash_next_hc_decode_bench PRIVATE
     gufo_qwen38_flash_next)
 
-  # Dense EXL3 decode GEMV, pre-B5 kernel vs production (tools/bench).
-  add_executable(qwen38_flash_next_dense_gemv_bench EXCLUDE_FROM_ALL
-    ${PROJECT_SOURCE_DIR}/tools/bench/flash_next_dense_gemv.hip)
-  set_source_files_properties(
-    ${PROJECT_SOURCE_DIR}/tools/bench/flash_next_dense_gemv.hip
-    PROPERTIES LANGUAGE HIP)
-  target_link_libraries(qwen38_flash_next_dense_gemv_bench PRIVATE
-    gufo_qwen38_flash_next)
-
   # Prefill MoE glue, pre-B6 kernels vs production (tools/bench). The old
   # copies compile with the production library's HIP flags.
   add_executable(qwen38_flash_next_moe_glue_bench EXCLUDE_FROM_ALL
@@ -124,8 +115,6 @@ if (ENGINE_ENABLE_HIP)
     COMMAND qwen38_flash_next_exl3_ops_test --mtp-kv-executor)
   add_test(NAME qwen38_flash_next.exl3_producer_rotation
     COMMAND qwen38_flash_next_exl3_ops_test --producer-rotation)
-  add_test(NAME qwen38_flash_next.exl3_dense_gemv_pipeline
-    COMMAND qwen38_flash_next_exl3_ops_test --dense-gemv-pipeline)
   add_test(NAME qwen38_flash_next.exl3_decode_side_branches
     COMMAND qwen38_flash_next_exl3_ops_test --decode-side-branches)
   add_test(NAME qwen38_flash_next.exl3_prefill_executor
@@ -147,7 +136,6 @@ if (ENGINE_ENABLE_HIP)
   set_tests_properties(qwen38_flash_next.mtp_kv qwen38_flash_next.mtp_kv_group
     qwen38_flash_next.mtp_kv_executor qwen38_flash_next.hc_down_f16
     qwen38_flash_next.exl3_producer_rotation
-    qwen38_flash_next.exl3_dense_gemv_pipeline
     qwen38_flash_next.exl3_decode_side_branches
     qwen38_flash_next.exl3_prefill_executor
     qwen38_flash_next.exl3_dense_prefill

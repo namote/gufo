@@ -94,7 +94,9 @@ Reverted: J1 dense EXL3 GEMV next-K-group prefetch (two register sets, VGPR
 118.8→122.5, attn q+k+v K6 116.6→119.0, head-shaped K8 182.0→193.4; small
 shapes −1 µs) and −0.02..−0.76% on TG; the B4 LDS-staging lesson does not carry
 to the dense kernel, which already runs at 210–230 GB/s. Bench
-`qwen38_flash_next_dense_gemv_bench` and the old-kernel reference test stay.
+`qwen38_flash_next_dense_gemv_bench`, its old-kernel reference copy and the
+`exl3_dense_gemv_pipeline` test were removed in the B8 cleanup (after the
+revert they compared the kernel with itself); recover them from `62e9b525`.
 
 Same window, c03, Nix10.1, FP16 KV, B C B C r2, baseline B4 adopted tree
 (`b4-simple-gufo`), candidate with J1 (C): AR128 d0/d32K 32.50/31.77→
