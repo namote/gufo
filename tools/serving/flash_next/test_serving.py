@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 FIXTURES = HERE / 'fixtures'
@@ -149,7 +150,12 @@ class ServerTest(unittest.TestCase):
 
     def test_command_pins_runtime_and_model(self):
         server = load_server()
-        argv = server.build_command({'run_id': 'preview', 'container': 'gufo-preview'})
+        # build_command adds the owner groups of /dev/kfd and the render nodes;
+        # fake them so the test runs without a GPU.
+        with mock.patch.object(Path, 'stat', return_value=os.stat_result((0,) * 5 + (44,) + (0,) * 4)), \
+                mock.patch.object(Path, 'glob', return_value=[Path('/dev/dri/renderD128')]):
+            argv = server.build_command({'run_id': 'preview', 'container': 'gufo-preview'})
+        self.assertEqual(argv[argv.index('--group-add') + 1], '44')
         self.assertEqual(argv[:3], ['docker', 'run', '--rm'])
         self.assertIn(server.IMAGE_ID, argv)
         self.assertEqual(argv[argv.index('--entrypoint') + 1], '/candidate/gufo')
