@@ -24,6 +24,25 @@ artifacts), install the previous serving revision `d01fd32a008ff81f7d60bbb6ddcd4
 `tools/serving/flash_next/install.py`, then `llm start`. The previous B10 binary
 remains in `~/.local/share/gufo/runtime-b9-20261108/`. Do not edit a live model.
 
+### Remaining HC prefill Q8 experiment (November 8, 2026): rejected
+
+Two candidates were tested without repeating the saved BF16/control forward:
+standalone down Q8×Q8 (A, resolved KL+4.135%) and Q8×FP16 (B, resolved
+NLL+0.0086193nats/token). Neither adopted; all production source/cache-policy
+changes are reverted. Existing all200 calibrated HC and qualified runtime
+remain the default. Evidence: `build/exl3-hc/prefill-q8-{001,002}`; see current
+QUALITY/BENCHMARKS and GFX1151-KNOWHOW entries. A's failed disk-admission
+restore recovered after obsolete test ELF cleanup; its failure record stays.
+
+Verified pack metadata: all200 original HC down/up tensors are **F16**, total
+1.220703GiB; their source was BF16. Calibrated Q8 payload is0.648499GiB.
+Removing the sidecar alone regenerates legacy RTN Q8, not a full16-bit HC run.
+B restored the same original server/settings, with live answer42 verified
+in002/FINAL-SERVICE.json and no new GPU error. The user's follow-up asks about
+full16-bit costs; that comparison is unmeasured
+and has not been started. No full16-bit quality/speed claim.
+
+
 ## Previous default: c03 Gufo B10 runtime, 2026-11-08
 
 The previous service ran `9eb3cbdb` (B9 structure split `b56b9f54` plus the GDN k.q

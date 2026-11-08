@@ -947,3 +947,25 @@ It reuses the saved first control bytes and does not recompute baseline.
 Original serving runtime/settings restored. Evidence and independent reviews:
 `build/f3-moe-fused/{QUALIFICATION,SCREEN-FIRST,SCREEN-PACKED,
 INDEPENDENT-REVIEW,INDEPENDENT-REVIEW-PACKED}.json`.
+
+
+### Standalone HC prefill down Q8 unification, November 8, 2026 — rejected
+
+Two bounded candidates changed only native EXL3 HC down paths lacking a
+combine-provided Q8 activation, including wide output heads outside
+PrefillPhase. A fused grouped RMSNorm+tiled Q8 and used W8A8; B retained F16
+inputs with the existing Q8-weight DenseF16Gemm. Existing scalar/GGUF paths
+were preserved. Reviews corrected A's deferred-norm readiness before any GPU
+run; B reuses a matching half cache and chunks scratch at max_batch.
+
+Independent review and operator checks pass, but fixed-corpus quality does
+not: A has resolved KL +4.135%, B has resolved target-NLL +0.0086193 nats/token.
+Neither warrants default adoption for uniformity. Reverted all task-owned
+production source changes, including candidate cache-compatibility tags;
+keep the existing calibrated sidecar and qualified runtime. No third candidate
+or baseline rerun. Detailed quality/timing limits are in QUALITY/BENCHMARKS.
+Evidence: `build/exl3-hc/prefill-q8-{001,002}`; immutable incremental builds
+`runtime-prefill-{001,002}`. Failed A service restoration hit disk reserve,
+not GPU failure; recovered after removing3.43GiB of obsolete non-Flash-Next
+test executables. Source, models, calibration, Flash-Next baselines and logs
+were protected; see002/DISK-CLEANUP.json and001/RESTORE-RECOVERY.json.

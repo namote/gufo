@@ -1,5 +1,38 @@
 # Qwen3.8 Flash-Next quality
 
+## Remaining HC prefill Q8 routes: rejected, November 8, 2026
+
+Compared two candidates against the installed all200 GPTQ HC path, reusing
+its saved logits and the same BF16 teacher at 32,760 positions / eight windows.
+No model weights were regenerated and no baseline forward was repeated.
+
+| Remaining standalone down route | KL256+rest ↓ | Target NLL ↓ | Top1 agreement ↑ |
+| --- | ---: | ---: | ---: |
+| Installed F16 weights / F16 inputs | 0.039935247 | 2.164491218 | 90.9219% |
+| A: calibrated Q8 weights / Q8 inputs | 0.041586613 | 2.164045780 | 90.9646% |
+| B: calibrated Q8 weights / F16 inputs | 0.040223863 | 2.173110517 | 90.9432% |
+
+These labels describe only the previously remaining F16 paths; the installed
+model already uses calibrated Q8 down on the combine-provided W8A8 and decode
+routes. A also fused standalone RMSNorm with tiled Q8 packing. Its FP32 norm
+and packed activations are byte-exact to separate operators across ragged
+rows, zero/tiny inputs and three group widths, with an independent FP64 check.
+This does not make changing weight/activation precision quality-neutral.
+
+A's paired KL change is +0.001651366 (+4.135%); window95%CI
+[+0.00003108,+0.00403921]. B reduces that KL difference to unresolved +0.72%,
+but target NLL increases +0.008619299 nats/token: window95%CI
+[+0.00031282,+0.01945924], approximately0.87% higher perplexity on this set.
+The small top1 gains of both candidates and A's NLL gain are unresolved.
+Neither is adopted. These are corpus findings, not proof of broad task loss
+or attribution to a particular HC/head. B's existing Q8×F16 operator passes
+its independent numerical checks at the actual320×10240 shape.
+
+Evidence: `build/exl3-hc/prefill-q8-{001,002}/window/{score,compare}/RESULT.json`.
+Both source snapshots, logits, binaries and rejected diffs are retained.
+The installed calibrated sidecar and qualified runtime are unchanged.
+
+
 ## All200 calibrated HC Q8 sidecar, November 8, 2026
 
 Original BF16 HC weights → exact FP32 expansion → FP64 full-H GPTQ → Q8_0.

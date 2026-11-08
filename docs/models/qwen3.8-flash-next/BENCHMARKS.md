@@ -1,5 +1,37 @@
 # Qwen3.8 Flash-Next benchmarks
 
+## Rejected standalone HC prefill Q8 candidates, November 8, 2026
+
+Pinned Nix10.1, same c03 all200 GPTQ sidecar, FP16 KV, r2. Saved installed
+controls from `runtime-qualification-001` reused, never remeasured. A replaces
+remaining HC F16 down with Q8×Q8; B uses Q8 weights × F16 activations there.
+The existing producer-fed W8A8 route is unchanged. Values below are tok/s.
+
+| Case | Saved installed control | A | B |
+| --- | ---: | ---: | ---: |
+| PP2048 | 1522.02 | 1528.63 | 1525.18 |
+| PP8192 | 1554.38 | 1560.33 | 1555.40 |
+| AR128 d0 | 32.78 | 32.06 | 32.18 |
+| AR128 d32768 | 32.44 | 31.51 | 31.46 |
+| MTP128 d0 | 65.69 | 47.88 | 36.05 |
+| MTP128 d32768 | 104.39 | 83.37 | 77.71 |
+
+PP observations are only +0.38..0.43% (A) and +0.07..0.21% (B), not a
+resolved speed gain. Both candidates have large MTP timing flags. Shallow
+greedy outputs and acceptance differ from the saved control, so those rates
+are not an isolated arithmetic comparison. Deep emitted tokens and total
+17cycles/111accepted remain equal, but deep timing still regresses; neither
+text change nor acceptance alone explains all of the observed slowdown.
+No causal attribution or same-window baseline confirmation is claimed.
+Quality independently rejects both candidates (see QUALITY.md), so no extra
+baseline timing or third candidate was run. The qualified runtime is retained.
+
+Candidate AR/MTP emitted-token hashes match at both depths and repeats.
+Pure neural acceptance must exclude lookup proposals; deep total acceptance
+is dominated by101lookup tokens, as in the original benchmark.
+Evidence: `build/exl3-hc/prefill-q8-{001,002}/RESULT.json` and per-case logs.
+
+
 ## All200 GPTQ HC Q8 sidecar, November 8, 2026
 
 Same B10 compute kernels, pinned Nix10.1, c03, FP16 KV, r2; saved Cr1/Cr2

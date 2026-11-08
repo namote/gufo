@@ -3011,3 +3011,50 @@ ELF 166953f07227…. Actual sidecar mapping, live answer 42, readiness and
 unchanged settings are verified with 28.2 GiB available. The deployment
 receipt is `build/exl3-hc/deployment-001`. Improved measured BF16 fidelity
 does not imply uniformly better perplexity or task accuracy.
+
+
+### Remaining standalone HC prefill down, November 8, 2026 — rejected
+
+The installed all200 HC Q8 model already uses calibrated Q8 down when the
+preceding combine supplies tiled Q8 activations. Standalone norms and wide
+output-head calls retain original F16 down. Two independently reviewed
+attempts to unify those remaining weights failed quality qualification:
+A fused RMSNorm+tiled Q8 and selected W8A8; B used existing DenseF16Gemm with
+Q8 weights and original F16 activation precision. B needed no new kernels.
+
+A's fused norm/packing is exact to separate operations, including ragged1/8/
+9/16/17/32/33/129rows, zero/tiny data and96/2560/10240group widths, with FP64
+norm/guard/repeat checks. Nevertheless changing input and weight precision
+increased fixed-corpus KL4.135% (paired windowCI entirely positive). B's KL
+change is unresolved, but target NLL increases0.0086193nats/token (all paired
+CIs positive; about0.87% perplexity). Retaining more input precision did not
+make its complete-model result neutral. No individual HC/head is identified
+as the cause. Scalar paths/GGUF and existing combine-provided W8A8 were left
+alone; wide paths outside PrefillPhase were included intentionally.
+
+PP2048/8192 saved1522.02/1554.38→A1528.63/1560.33 or B1525.18/1555.40: only
+sub-percent observations. MTP also showed large timing regressions, with
+changed shallow output/acceptance and unchanged deep output/counts; no
+isolated cause or resolved speedup is claimed. Both candidates rejected;
+all task-owned runtime/kernel/cache-policy changes reverted. Original model,
+calibrated sidecar, qualified runtime, saved teacher and controls retained.
+No baseline forward/quantization repeated. Each changed candidate alone got
+one combined operator/quality/throughput/API pass; no third candidate.
+
+Evidence: `build/exl3-hc/prefill-q8-{001,002}` (diffs, hashes, reviews and
+restoration), `runtime-prefill-{001,002}` (immutable source/binaries).
+A's first service restore failed disk admission, with no GPU error; obsolete
+non-Flash-Next test ELFs3.43GiB were removed under prior cleanup authorization
+and the original service restored. Failed restore evidence is preserved.
+Actual pack metadata: HC down/up200 original tensors are F16,1.220703GiB;
+calibrated Q8 payload0.648499GiB. Source weights were BF16. Removing the
+sidecar alone invokes legacy RTN Q8 loading; it does not test pure16-bit HC.
+Full16-bit HC quality/throughput remains unmeasured by these experiments.
+
+For memory accounting, the current logical HC tensor payload retains F16
+down0.610352GiB plus Q8 down/up0.648499GiB =1.258850GiB. A pure16-bit
+implementation retaining only original down/up would be1.220703GiB, about
+39.1MiB less at this tensor level. This is not measured process/UMA memory;
+activation/workspace/registration residency must be measured separately.
+More bytes read per HC projection does not imply greater resident HC weight
+memory when duplicate representations are removed.
