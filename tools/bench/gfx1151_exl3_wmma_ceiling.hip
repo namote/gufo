@@ -1,8 +1,9 @@
-// EXL3 prefill GEMM ceiling screen on gfx1151 (plan/exl3/archive/B7-CEILING-BRIEF.md
-// Q1). Real Flash-Next c03 shapes: routed gate/up K2560 -> N640 (two banks)
-// and down K640 -> N2560 at 40..640 rows per expert (10-of-512 routing,
-// balanced and skewed), and dense K2560 -> N10240, K6144 -> N2560,
-// K2560 -> N6144 at 2048/4096/8192 rows. Variants per shape:
+// EXL3 prefill GEMM ceiling screen on gfx1151
+// (plan/exl3/archive/B7-CEILING-BRIEF.md Q1). Real Flash-Next c03 shapes:
+// routed gate/up K2560 -> N640 (two banks) and down K640 -> N2560 at 40..640
+// rows per expert (10-of-512 routing, balanced and skewed), and dense K2560 ->
+// N10240, K6144 -> N2560, K2560 -> N6144 at 2048/4096/8192 rows. Variants per
+// shape:
 //   a   production: the real launchers (LaunchExl3PrefillBucketInnerHalf with
 //       device buckets from Exl3BuildExpertBuckets;
 //       LaunchExl3PrefillGemmGrouped)

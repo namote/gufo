@@ -1191,7 +1191,7 @@ searches and unqualified work. They are not policies or thresholds for a new mod
   Candidate Docker probe: pp2048 1285.56, pp8192 1339.10, tg128 25.04.
   Reuse only activates beyond 2048 tokens, so the pp2048 change is not an
   optimization gain. pp8192 difference is -1.1%; no baseline repeat was run.
-  See `gufo-f3-integ/plan/exl3/archive/F3-RESUME-RESULTS.md` and receipts
+  See `gufo-f3-integ/plan/exl3/F3-RESUME-RESULTS.md` and receipts
   `fn-resume-966f84b8-stamped/`, `fn-indexer/` under the raw-evidence root.
 - **GGUF MoE dead ends:** smaller dense tiles/shared rows-first tiles did not
   improve full span; high-nibble half-subnormal trick was noise to 2% slower;

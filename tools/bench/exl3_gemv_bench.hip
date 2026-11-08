@@ -1,5 +1,5 @@
-// X2b (plan/exl3/archive/XB-DESIGN.md): standalone bandwidth experiment of the EXL3
-// trellis decode GEMV core on gfx1151, before any production wiring.
+// X2b (plan/exl3/archive/XB-DESIGN.md): standalone bandwidth experiment of the
+// EXL3 trellis decode GEMV core on gfx1151, before any production wiring.
 //
 // Kernel: one wave decodes 16 x 16 trellis tiles straight into registers (no
 // LDS staging, no barriers in the K loop) and multiplies them with an FP16

@@ -1,6 +1,6 @@
-// X3 step 1 (plan/exl3/archive/X3-DESIGN.md): standalone prefill GEMM experiment on
-// gfx1151. The trellis-decode weight producer in the frame of the production
-// FP16 prefill GEMM (src/models/qwen/hip/kernels/prefill_fp16.hip,
+// X3 step 1 (plan/exl3/archive/X3-DESIGN.md): standalone prefill GEMM
+// experiment on gfx1151. The trellis-decode weight producer in the frame of the
+// production FP16 prefill GEMM (src/models/qwen/hip/kernels/prefill_fp16.hip,
 // HalfPrefillGemmKernel<256, 256, 8, 4>: BM = 256 weight rows (output
 // channels) x BN = 256 tokens, 32 waves, WMMA f32_16x16x16_f16, FP32
 // accumulation in K16 order, swizzled LDS tiles s_a (weights) and s_b

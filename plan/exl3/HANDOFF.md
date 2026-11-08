@@ -1,9 +1,9 @@
-# EXL3 / Flash-Next F3 handoff (2026-11-02; native EXL3 qualified)
+# EXL3 / Flash-Next handoff (updated 2026-11-08; B5 runtime deployed)
 
 ## Active default: c03 Gufo B5 runtime, 2026-11-08
 
 The service runs the B5 binary (sha256 `31cee0b6…`, 126,048,792 B, source
-`eb789c77`, build `build/b1` RelWithDebInfo gfx1151, pinned Nix ROCm 10.1)
+`5912ed64` (src `eb789c77`), build `build/b1` RelWithDebInfo gfx1151, pinned Nix ROCm 10.1)
 from `~/.local/share/gufo/runtime-b5-20261108/` (`RUNTIME.json`: image,
 Nix volume, `LD_LIBRARY_PATH`, evidence `build/b1/gpu-b5/RESULT.json`).
 Model, C2/native262144 FP16 pool, MTP and sampling settings are unchanged
@@ -470,7 +470,7 @@ reuse is implemented and independently reviewed in the uncommitted f3-integ
 worktree. FP16-KV/KVarN collector bytes match hc7; focused Nix ROCm 10.1 unit
 passes. Candidate images are `ai-tools/gufo-eval:f3-indexer-b03a1f1e-rocm101`
 and `-tests-rocm101`. Full evidence and runtime caveats are in
-`~/projects/gufo-f3-integ/plan/exl3/archive/F3-RESUME-RESULTS.md`.
+`~/projects/gufo-f3-integ/plan/exl3/F3-RESUME-RESULTS.md`.
 The user requires Nix ROCm 10.1, one combined final model/timing pass, and
 reuse of stored matching baselines. No merge or final model qualification yet.
 The first q3 batch item's Thai rare-vocabulary fixture failure is resolved:

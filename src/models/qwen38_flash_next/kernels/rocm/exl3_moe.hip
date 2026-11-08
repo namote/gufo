@@ -113,8 +113,8 @@ __device__ __forceinline__ float DotPairF32(Half2 w, Half2 x, float acc) {
 
 // Waves per routed GEMV block: adjacent output tiles of the same expert
 // tile. Each wave's arithmetic is that of a one-wave block; packing only
-// divides the block count by four (R=1 would otherwise launch 40 x 10 x 2
-// gate/up and 160 x 10 down one-wave blocks).
+// divides the block count by four (R=1 with one tile per wave would
+// otherwise launch 40 x 10 x 2 gate/up and 160 x 10 down one-wave blocks).
 constexpr unsigned kRoutedWaves = 4;
 
 // FP16 activation halves a routed GEMV block stages in LDS per K chunk:

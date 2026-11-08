@@ -222,9 +222,9 @@ __device__ __forceinline__ gufo::hip::QuantSub16 DecodeRaw(
 enum class HalfEpilogue { kStore, kSwiGLU, kGateUp, kResidual };
 
 // Fully scaled FP16 weights and activations; FP32 accumulation in K16 order.
-// TrellisBits > 0 (EXL3, plan/exl3/archive/X3-DESIGN.md) replaces the GGUF weight
-// producer by the trellis decode (mul1 codebook, TrellisBits the rate code
-// exl3::RateCode: K, or kHalfRate + K for K + 0.5): w is the trellis
+// TrellisBits > 0 (EXL3, plan/exl3/archive/X3-DESIGN.md) replaces the GGUF
+// weight producer by the trellis decode (mul1 codebook, TrellisBits the rate
+// code exl3::RateCode: K, or kHalfRate + K for K + 0.5): w is the trellis
 // [k/16][m/16][TileDwords], each 16 x 16 tile one weight sub-tile of s_a,
 // decoded bit for bit as src/core/quant/exl3 DequantTile. The activations,
 // the WMMA loop and the K16 order are unchanged; the epilogue then rotates

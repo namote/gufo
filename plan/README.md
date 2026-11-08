@@ -1,6 +1,7 @@
 # gufo 작업 계획 (ai-tools)
 
 > 위치: 2026-10-25 사용자 지시("ai tools에 계획이나 agent md gufo 에 관련된거 있으면 옮기라고")로 ai.tools `plan/`에서 이 gufo 저장소(`~/projects/gufo/plan/`)로 옮겼다. 본문의 `test/`·`storage/`·`tmp/`·`infra/`·`docs/` 경로는 ai.tools(`~/projects/ai.tools`) 기준이다. gufo 소스는 `~/projects/gufo`(이전 `~/.cache/ai-tools/gufo/s4`)다.
+
 ## 진행 중 (Active)
 
 - [EXL3 / Flash-Next 결정](exl3/PLAN.md): 형식·커널·서비스 결정 기록
