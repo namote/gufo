@@ -25,6 +25,7 @@ set_source_files_properties(cpu_ops.cpp reference.cpp
 
 if (ENGINE_ENABLE_HIP)
   set(QFN_ROCM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/kernels/rocm")
+  set(QFN_RUNTIME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/runtime")
   set(QFN_MMQ_DIR "${QFN_ROCM_DIR}/mmq")
 
   # HIP quantized matrix kernels adapted from llama.cpp, isolated in the
@@ -68,24 +69,28 @@ if (ENGINE_ENABLE_HIP)
     ${QFN_ROCM_DIR}/attention.hip.cpp
     ${QFN_ROCM_DIR}/moe_glue.hip.cpp
     ${QFN_ROCM_DIR}/mtp.hip.cpp)
+  # Host runtime: the device-resident model, the executor by stage and the
+  # batched multi-session decode.
+  set(QFN_RUNTIME_SOURCES
+    ${QFN_RUNTIME_DIR}/blaslt.cpp
+    ${QFN_RUNTIME_DIR}/device_model.cpp
+    ${QFN_RUNTIME_DIR}/executor.cpp
+    ${QFN_RUNTIME_DIR}/executor_snapshot.cpp
+    ${QFN_RUNTIME_DIR}/executor_dense.cpp
+    ${QFN_RUNTIME_DIR}/executor_hc.cpp
+    ${QFN_RUNTIME_DIR}/executor_ple.cpp
+    ${QFN_RUNTIME_DIR}/executor_gdn.cpp
+    ${QFN_RUNTIME_DIR}/executor_attention.cpp
+    ${QFN_RUNTIME_DIR}/executor_moe.cpp
+    ${QFN_RUNTIME_DIR}/executor_forward.cpp
+    ${QFN_RUNTIME_DIR}/executor_mtp.cpp
+    ${QFN_RUNTIME_DIR}/executor_batch.cpp)
   set(QFN_HIP_SOURCES
     continuation_adapter.cpp
     ${QFN_ROCM_DIR}/exl3_moe.hip
     ${QFN_KERNEL_SOURCES}
     ${QFN_ROCM_DIR}/w8a8_wave64.hip
-    ${QFN_ROCM_DIR}/blaslt.cpp
-    ${QFN_ROCM_DIR}/device_model.cpp
-    ${QFN_ROCM_DIR}/executor.cpp
-    ${QFN_ROCM_DIR}/executor_snapshot.cpp
-    ${QFN_ROCM_DIR}/executor_dense.cpp
-    ${QFN_ROCM_DIR}/executor_hc.cpp
-    ${QFN_ROCM_DIR}/executor_ple.cpp
-    ${QFN_ROCM_DIR}/executor_gdn.cpp
-    ${QFN_ROCM_DIR}/executor_attention.cpp
-    ${QFN_ROCM_DIR}/executor_moe.cpp
-    ${QFN_ROCM_DIR}/executor_forward.cpp
-    ${QFN_ROCM_DIR}/executor_mtp.cpp
-    ${QFN_ROCM_DIR}/batch.cpp
+    ${QFN_RUNTIME_SOURCES}
     engine.cpp)
   target_sources(gufo_qwen38_flash_next PRIVATE ${QFN_HIP_SOURCES})
   set_source_files_properties(${QFN_KERNEL_SOURCES} PROPERTIES LANGUAGE HIP)

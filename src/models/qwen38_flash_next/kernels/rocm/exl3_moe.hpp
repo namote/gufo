@@ -5,7 +5,7 @@
 
 #include "src/core/quant/exl3/reference.hpp"
 #include "src/models/qwen/hip/ops/exl3_prefill_bucket.hpp"
-#include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
+#include "src/models/qwen38_flash_next/runtime/device_model.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 

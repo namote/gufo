@@ -17,10 +17,10 @@
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/cpu_ops.hpp"
 #include "src/models/qwen38_flash_next/exl3_weights.hpp"
-#include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 #include "src/models/qwen38_flash_next/reference.hpp"
+#include "src/models/qwen38_flash_next/runtime/executor.hpp"
 
 namespace q = gufo::models::qwen38_flash_next;
 namespace {

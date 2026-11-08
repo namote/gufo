@@ -22,9 +22,9 @@
 #include "src/core/quant/exl3/gemv.hpp"
 #include "src/models/qwen/hip/ops/plain_prefill_stable.hpp"
 #include "src/models/qwen38_flash_next/exl3_weights.hpp"
-#include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/runtime/executor.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 

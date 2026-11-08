@@ -12,7 +12,7 @@
 
 #include "src/core/hip/snapshot_copy.hpp"
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
-#include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
+#include "src/models/qwen38_flash_next/runtime/executor.hpp"
 
 namespace gufo::models::qwen38_flash_next {
 namespace {

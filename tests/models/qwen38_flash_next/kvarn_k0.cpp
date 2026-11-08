@@ -118,7 +118,7 @@ T Field(std::span<const std::uint8_t> bytes, std::size_t offset) {
 /// The full-attention K and V sections of a text snapshot payload. Mirrors
 /// the session framing (engine.cpp SessionSnapshotHeader: executor_bytes at
 /// byte 24, executor payload last) and the executor section order
-/// (kernels/rocm/executor_snapshot.cpp WalkSnapshot, "QFNSNAP6": DeltaNet conv
+/// (runtime/executor_snapshot.cpp WalkSnapshot, "QFNSNAP6": DeltaNet conv
 /// and state per linear layer, PLE history, then per attention layer K, V,
 /// unpooled indexer rows and pooled keys). The walk must end exactly at the
 /// executor payload's recorded size.

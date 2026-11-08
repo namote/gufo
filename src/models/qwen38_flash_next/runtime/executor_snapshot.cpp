@@ -1,7 +1,7 @@
 // Session snapshots: the pinned snapshot allocator and registry,
 // prefill checkpoints, and the saved-session format (save and restore).
 
-#include "src/models/qwen38_flash_next/kernels/rocm/executor_snapshot.hpp"
+#include "src/models/qwen38_flash_next/runtime/executor_snapshot.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 

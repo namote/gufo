@@ -1,5 +1,5 @@
-#ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_EXECUTOR_INTERNAL_HPP_
-#define GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_EXECUTOR_INTERNAL_HPP_
+#ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_RUNTIME_EXECUTOR_INTERNAL_HPP_
+#define GUFO_MODELS_QWEN38_FLASH_NEXT_RUNTIME_EXECUTOR_INTERNAL_HPP_
 
 // Private to the executor*.cpp translation units: the helpers, routing
 // thresholds and layouts more than one of them uses. Functions are inline so a
@@ -30,8 +30,8 @@
 #include "src/core/platform/pages.hpp"
 #include "src/core/quant/exl3/gemv.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
-#include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/runtime/executor.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 
@@ -278,4 +278,4 @@ inline const float* InjectWeights(const DeviceMixer& m) {
 
 }  // namespace gufo::models::qwen38_flash_next::rocm
 
-#endif  // GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_EXECUTOR_INTERNAL_HPP_
+#endif  // GUFO_MODELS_QWEN38_FLASH_NEXT_RUNTIME_EXECUTOR_INTERNAL_HPP_

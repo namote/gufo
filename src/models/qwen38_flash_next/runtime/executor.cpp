@@ -2,7 +2,7 @@
 // sizing, K/V row management, rollback depth, KVarN planning, the side
 // stream and MTP cycle diagnostics, vision input and cancellation.
 
-#include "src/models/qwen38_flash_next/kernels/rocm/executor_snapshot.hpp"
+#include "src/models/qwen38_flash_next/runtime/executor_snapshot.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 

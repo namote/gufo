@@ -1,4 +1,4 @@
-#include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
+#include "src/models/qwen38_flash_next/runtime/device_model.hpp"
 
 #include <hip/hip_runtime.h>
 

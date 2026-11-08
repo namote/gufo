@@ -5,9 +5,9 @@
 #include "qfn_mmq.h"
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
-#include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
+#include "src/models/qwen38_flash_next/runtime/executor.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {

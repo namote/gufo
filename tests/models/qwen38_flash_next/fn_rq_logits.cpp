@@ -28,10 +28,10 @@
 #include "src/core/session_mode.hpp"
 #include "src/models/qwen/native_pack.hpp"
 #include "src/models/qwen38_flash_next/exl3_weights.hpp"
-#include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
-#include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/native_metadata.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
+#include "src/models/qwen38_flash_next/runtime/device_model.hpp"
+#include "src/models/qwen38_flash_next/runtime/executor.hpp"
 
 namespace json = gufo::json;
 namespace q = gufo::models::qwen38_flash_next;

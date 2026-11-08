@@ -1,5 +1,5 @@
-#ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_EXECUTOR_HPP_
-#define GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_EXECUTOR_HPP_
+#ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_RUNTIME_EXECUTOR_HPP_
+#define GUFO_MODELS_QWEN38_FLASH_NEXT_RUNTIME_EXECUTOR_HPP_
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -25,12 +25,12 @@
 #include "src/models/qwen/hip/ops/token.hpp"
 #include "src/models/qwen/vision/device_input.hpp"
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
-#include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
-#include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
+#include "src/models/qwen38_flash_next/runtime/blaslt.hpp"
+#include "src/models/qwen38_flash_next/runtime/device_model.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 
@@ -1151,4 +1151,4 @@ private:
 
 }  // namespace gufo::models::qwen38_flash_next::rocm
 
-#endif  // GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_EXECUTOR_HPP_
+#endif  // GUFO_MODELS_QWEN38_FLASH_NEXT_RUNTIME_EXECUTOR_HPP_

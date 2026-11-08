@@ -22,8 +22,8 @@
 #include <string>
 #include <vector>
 
-#include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/runtime/blaslt.hpp"
 
 namespace {
 

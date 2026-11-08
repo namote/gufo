@@ -1,6 +1,6 @@
 // Full attention layers: FP16 K/V and KVarN.
 
-#include "src/models/qwen38_flash_next/kernels/rocm/executor_internal.hpp"
+#include "src/models/qwen38_flash_next/runtime/executor_internal.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 

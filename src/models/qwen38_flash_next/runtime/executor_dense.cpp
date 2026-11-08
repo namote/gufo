@@ -1,7 +1,7 @@
 // Dense projections: Q8 activation inputs, GGUF/F16/EXL3 dense GEMM
 // routes, EXL3 rotated-input slabs and grouped projections.
 
-#include "src/models/qwen38_flash_next/kernels/rocm/executor_internal.hpp"
+#include "src/models/qwen38_flash_next/runtime/executor_internal.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 

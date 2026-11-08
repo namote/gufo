@@ -1,7 +1,7 @@
 // MTP: draft rows and logits, the MTP K/V projection, the MTP head, and
 // greedy/sampled draft candidates and the MTP forward pass.
 
-#include "src/models/qwen38_flash_next/kernels/rocm/executor_internal.hpp"
+#include "src/models/qwen38_flash_next/runtime/executor_internal.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 

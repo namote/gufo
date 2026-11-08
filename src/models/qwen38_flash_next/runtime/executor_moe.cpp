@@ -1,7 +1,7 @@
 // MoE layers: routing hints, routed expert GEMMs (GGUF, WMMA and EXL3)
 // and the MoE block with its shared expert.
 
-#include "src/models/qwen38_flash_next/kernels/rocm/executor_internal.hpp"
+#include "src/models/qwen38_flash_next/runtime/executor_internal.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 

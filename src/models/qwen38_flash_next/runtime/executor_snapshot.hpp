@@ -1,11 +1,11 @@
-#ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_EXECUTOR_SNAPSHOT_HPP_
-#define GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_EXECUTOR_SNAPSHOT_HPP_
+#ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_RUNTIME_EXECUTOR_SNAPSHOT_HPP_
+#define GUFO_MODELS_QWEN38_FLASH_NEXT_RUNTIME_EXECUTOR_SNAPSHOT_HPP_
 
 // Private snapshot storage of the executor: the pinned allocator, lineage and
 // registry that executor_snapshot.cpp implements and executor.cpp releases
 // and sizes with each session.
 
-#include "src/models/qwen38_flash_next/kernels/rocm/executor_internal.hpp"
+#include "src/models/qwen38_flash_next/runtime/executor_internal.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 
@@ -229,4 +229,4 @@ struct SnapshotRegistry {
 
 }  // namespace gufo::models::qwen38_flash_next::rocm
 
-#endif  // GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_EXECUTOR_SNAPSHOT_HPP_
+#endif  // GUFO_MODELS_QWEN38_FLASH_NEXT_RUNTIME_EXECUTOR_SNAPSHOT_HPP_
