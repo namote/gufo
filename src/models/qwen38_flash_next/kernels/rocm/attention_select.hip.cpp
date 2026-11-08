@@ -1,5 +1,5 @@
-// Sparse-attention indexer: pooled key blocks and per-query block
-// selection.
+// Sparse-attention indexer: its key-row stores, pooled key blocks and
+// per-query block selection.
 // HIP kernels follow the layouts and operator formulas in reference.cpp.
 
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels_internal.hpp"
@@ -16,6 +16,18 @@ __device__ __forceinline__ std::size_t PooledRow(const std::uint32_t* kv_blocks,
   if (kv_blocks == nullptr)
     return b;
   return static_cast<std::size_t>(kv_blocks[b / kRows]) * kRows + b % kRows;
+}
+
+__global__ void StoreRowsKernel(const float* src, float* dst,
+                                std::uint32_t row_dim,
+                                const std::uint32_t* start_pos,
+                                std::uint32_t capacity) {
+  const std::uint32_t t = blockIdx.x;
+  const std::uint32_t row = (*start_pos + t) & (capacity - 1);
+  for (std::uint32_t i = threadIdx.x; i < row_dim; i += blockDim.x) {
+    dst[static_cast<std::size_t>(row) * row_dim + i] =
+        src[static_cast<std::size_t>(t) * row_dim + i];
+  }
 }
 
 /// grid: the most blocks a batch can complete. Block b pools raw keys
@@ -387,6 +399,13 @@ __launch_bounds__(kBlock) __global__
 }
 
 }  // namespace
+
+void StoreRows(const float* src, float* dst, std::uint32_t n_tokens,
+               std::uint32_t row_dim, const std::uint32_t* start_pos,
+               std::uint32_t capacity, hipStream_t stream) {
+  hipLaunchKernelGGL(StoreRowsKernel, dim3(n_tokens), dim3(kThreads), 0, stream,
+                     src, dst, row_dim, start_pos, capacity);
+}
 
 void PoolIndexerBlocks(const float* raw_keys, const float* gamma,
                        __half* blocks, const std::uint32_t* first_block,

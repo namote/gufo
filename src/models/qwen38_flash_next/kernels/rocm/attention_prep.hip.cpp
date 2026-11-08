@@ -300,18 +300,6 @@ __launch_bounds__(512) __global__ void KvarnQuantizeBoundaryKernel(
       records + KvarnRecordOffset<Bits>(kv_blocks, kv_heads, group, kv), key);
 }
 
-__global__ void StoreRowsKernel(const float* src, float* dst,
-                                std::uint32_t row_dim,
-                                const std::uint32_t* start_pos,
-                                std::uint32_t capacity) {
-  const std::uint32_t t = blockIdx.x;
-  const std::uint32_t row = (*start_pos + t) & (capacity - 1);
-  for (std::uint32_t i = threadIdx.x; i < row_dim; i += blockDim.x) {
-    dst[static_cast<std::size_t>(row) * row_dim + i] =
-        src[static_cast<std::size_t>(t) * row_dim + i];
-  }
-}
-
 }  // namespace
 
 void UnpackQGate(const float* qg, std::uint32_t qg_stride, float* q,
@@ -633,13 +621,6 @@ void KvarnQuantizeGroups(const __half* k_rows, const __half* v_rows,
   } else {
     throw std::invalid_argument("KVarN bits must be 4 or 6");
   }
-}
-
-void StoreRows(const float* src, float* dst, std::uint32_t n_tokens,
-               std::uint32_t row_dim, const std::uint32_t* start_pos,
-               std::uint32_t capacity, hipStream_t stream) {
-  hipLaunchKernelGGL(StoreRowsKernel, dim3(n_tokens), dim3(kThreads), 0, stream,
-                     src, dst, row_dim, start_pos, capacity);
 }
 
 }  // namespace gufo::models::qwen38_flash_next::rocm
