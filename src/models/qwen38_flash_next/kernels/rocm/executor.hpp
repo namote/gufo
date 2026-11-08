@@ -825,9 +825,6 @@ private:
   /// for its launches and joins back through side_done_ (JoinSide).
   mutable hipStream_t stream_{nullptr};
   hipStream_t side_stream_{nullptr};
-  /// The EXL3 prefill shared MLP's stream (kPrefillSideStream; null: it
-  /// shares side_stream_). Forks and joins through the same events.
-  hipStream_t prefill_side_stream_{nullptr};
   hipEvent_t side_start_{nullptr};
   hipEvent_t side_done_{nullptr};
   mutable bool side_pending_{false};  ///< side_done_ not yet waited on

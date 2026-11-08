@@ -6,7 +6,6 @@
 #include <bit>
 #include <cmath>
 #include <cstddef>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -27,7 +26,6 @@
 #include "src/core/quant/exl3/gemv.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
-#include "src/models/qwen38_flash_next/kernels/rocm/prefill_side_stream.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
@@ -1228,8 +1226,6 @@ Executor::~Executor() {
   }
   if (side_stream_ != nullptr)
     (void)hipStreamDestroy(side_stream_);
-  if (prefill_side_stream_ != nullptr)
-    (void)hipStreamDestroy(prefill_side_stream_);
   if (stream_ != nullptr) {
     qfn_mmq_release_stream(stream_);
     (void)hipStreamDestroy(stream_);
@@ -1280,55 +1276,6 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
              "side stream join event", error_msg)) {
     return nullptr;
   }
-  // B6 P7: the prefill shared MLP's own stream, when the policy asks for
-  // one. A failed creation keeps it on side_stream_ (the default policy).
-  ResolvePrefillSideStream(kPrefillSideStream, [&](PrefillSideStream policy) {
-    hipStream_t stream = nullptr;
-    hipError_t status = hipErrorNotSupported;
-    if (policy == PrefillSideStream::kLowPriority) {
-      int least = 0;
-      int greatest = 0;
-      status = hipDeviceGetStreamPriorityRange(&least, &greatest);
-      if (status == hipSuccess)
-        status = hipStreamCreateWithPriority(&stream, hipStreamDefault, least);
-    } else if (policy == PrefillSideStream::kCuMask) {
-      int device = 0;
-      int units = 0;
-      status = hipGetDevice(&device);
-      if (status == hipSuccess)
-        status = hipDeviceGetAttribute(
-            &units, hipDeviceAttributeMultiprocessorCount, device);
-      const auto mask = PrefillSideCuMask(kPrefillSideWgps,
-                                          static_cast<std::uint32_t>(units));
-      status = status != hipSuccess ? status
-               : mask.empty()
-                   ? hipErrorInvalidValue
-                   : hipExtStreamCreateWithCUMask(
-                         &stream, static_cast<std::uint32_t>(mask.size()),
-                         mask.data());
-    }
-    if (status != hipSuccess) {
-      (void)hipGetLastError();
-      if (stream != nullptr)
-        (void)hipStreamDestroy(stream);
-      std::fprintf(stderr,
-                   "Flash-Next: prefill side stream policy unavailable (%s); "
-                   "using the shared side stream\n",
-                   hipGetErrorString(status));
-      return false;
-    }
-    e->prefill_side_stream_ = stream;
-    if (policy == PrefillSideStream::kLowPriority)
-      std::fprintf(stderr,
-                   "Flash-Next: prefill shared MLP on a low-priority "
-                   "stream\n");
-    else
-      std::fprintf(stderr,
-                   "Flash-Next: prefill shared MLP on %u of the device's "
-                   "WGPs\n",
-                   kPrefillSideWgps);
-    return true;
-  });
   if (hipblasCreate(&e->blas_) != HIPBLAS_STATUS_SUCCESS ||
       hipblasSetStream(e->blas_, e->stream_) != HIPBLAS_STATUS_SUCCESS) {
     AssignError(error_msg, "hipblasCreate failed");
@@ -4296,30 +4243,28 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
                             full_exl3(l.shexp_gate) && full_exl3(l.shexp_up) &&
                             full_exl3(l.shexp_down);
   if (exl3_overlap) {
-    const hipStream_t side =
-        prefill_side_stream_ != nullptr ? prefill_side_stream_ : side_stream_;
     if (!Check(hipEventRecord(side_start_, stream_), "shared EXL3 fork",
                error_msg) ||
-        !Check(hipStreamWaitEvent(side, side_start_, 0), "shared EXL3 wait",
-               error_msg))
+        !Check(hipStreamWaitEvent(side_stream_, side_start_, 0),
+               "shared EXL3 wait", error_msg))
       return false;
     shexp_half_ready_ = false;
     const auto shared = [&] {
       if (!Exl3DensePrefill({&l.shexp_gate, &l.shexp_up},
                             {s_.shexp_up, s_.shexp_gate}, x, n_tokens,
-                            error_msg, &exl3_shared_workspace_, side))
+                            error_msg, &exl3_shared_workspace_, side_stream_))
         return false;
       Swiglu(s_.shexp_up, s_.shexp_gate,
-             std::size_t{n_tokens} * l.shexp_gate.rows, side);
+             std::size_t{n_tokens} * l.shexp_gate.rows, side_stream_);
       return Exl3DensePrefill({&l.shexp_down}, {s_.shexp_out}, s_.shexp_up,
                               n_tokens, error_msg, &exl3_shared_workspace_,
-                              side);
+                              side_stream_);
     };
     const bool shared_ok = shared();
     // Even a partial enqueue must be joined on every exit.
-    if (!Check(hipEventRecord(side_done_, side), "shared EXL3 join",
+    if (!Check(hipEventRecord(side_done_, side_stream_), "shared EXL3 join",
                error_msg)) {
-      (void)hipStreamSynchronize(side);
+      (void)hipStreamSynchronize(side_stream_);
       return false;
     }
     side_pending_ = true;
@@ -4520,11 +4465,8 @@ bool Executor::JoinSide(std::string* error_msg) const {
   if (!side_pending_)
     return true;
   const auto status = hipStreamWaitEvent(stream_, side_done_, 0);
-  if (status != hipSuccess && !SideCapturing()) {
+  if (status != hipSuccess && !SideCapturing())
     (void)hipStreamSynchronize(side_stream_);
-    if (prefill_side_stream_ != nullptr)  // never captured (prefill only)
-      (void)hipStreamSynchronize(prefill_side_stream_);
-  }
   side_pending_ = false;
   return Check(status, "side stream join wait", error_msg);
 }
