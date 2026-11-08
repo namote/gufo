@@ -725,6 +725,12 @@ if (BUILD_TESTING)
   set_tests_properties(rotquant_calibration_test PROPERTIES
     LABELS "cpu;tools;quantization" TIMEOUT 30)
 
+  # Pinned ROCm 10.1 Docker environment (tools/docker); standard library only.
+  add_test(NAME pinned_rocm101_test
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/pinned_rocm101_test.py)
+  set_tests_properties(pinned_rocm101_test PROPERTIES LABELS "cpu;tools" TIMEOUT 30)
+
   add_test(NAME check_docs_test
     COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/check_docs_test.py)

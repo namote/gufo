@@ -20,6 +20,7 @@ benchmark/tuning executables; Python tools run from this source tree.
 | `ci/` | Repository, dependency, and documentation checks |
 | `llama_parity/` | Regenerates the llama.cpp tool-grammar verdicts `json_constraint_test` replays |
 | `gufo/` | Shared Python helpers and model-specific reference implementations |
+| `docker/` | Pinned ROCm 10.1 container environment for CPU builds and GPU runs (below) |
 
 `gufo/gguf.py` reads metadata and decodes existing GGUF tensors for independent
 Qwen reference tests. `gufo/safetensors.py` validates source snapshots used by
@@ -32,6 +33,39 @@ See [performance commands](../docs/PERFORMANCE.md),
 Functional and regression tests live in [tests/functional/](../tests/functional/README.md),
 including the OpenAI SDK suites and interrupted-chat/disk replay. Use its runner
 for API changes.
+
+## Pinned ROCm 10.1 container
+
+`docker/pinned_rocm101.py` is the one definition of the retained ROCm 10.1
+closure used for the Flash-Next B1–B7 builds and GPU passes: image
+`ai-tools/gufo-eval:native-exl3-vision-rocm101`
+(`sha256:e7a761a40187efb13515a0275362ab09d084a129f4544aa4300ec5cccb8c7468`),
+the `gufo-nix` Docker volume read-only at `/nix`, the exported variables of the
+stored development environment
+`/nix/store/65ksrp4rfgpz1wfyxdqfs3syl2m13p80-gufo-0-unstable-dirty-env`, and
+`LD_LIBRARY_PATH` set to the ROCm 10.1 runtime
+`/nix/store/88jjsz00km321bcl9851aiwwdig79b4l-rocm-runtime-10.1/lib`. Every
+container runs as `1000:1000` with no network. CPU containers have 16 GiB
+and 8 CPUs and no devices. GPU containers add `/dev/kfd`, `/dev/dri`,
+`--ipc host`, the render and kfd groups, and 100 GiB.
+
+```sh
+tools/docker/build.sh [--build-dir DIR] [targets...]   # incremental CPU build of DIR/obj
+tools/docker/build.sh [--build-dir DIR] --run CMD...   # e.g. python3 tools/ci/check-docs.py
+tools/docker/gpu-run.sh [--build-dir DIR] [--mount SRC:DST[:ro]]... OUT env|raw CMD...
+python3 tools/docker/pinned_rocm101.py run --print ...  # show the docker command line
+```
+
+`DIR` (default `build/pinned-rocm101`) is mounted at `/build`, and the
+repository at `/build/source`, read-only for GPU runs. Configure a new `DIR/obj` from
+`pinned_rocm101.py configure-args <revision>`. `gpu-run.sh` writes `argv.txt`,
+`stdout.log`, `stderr.log`, `start`, `end` and `rc` to `OUT`. Pass models and
+references explicitly with `--mount`, for example
+`/home/m2on/projects/models/llm/flash-next-exl3-gufo-c03:/models/fnx:ro`.
+The image and volume exist only on the development host and are not published,
+so this environment cannot be rebuilt elsewhere. The Nix development shell and
+`gpu-test` preset remain the portable route. Its CPU contract test is
+`pinned_rocm101_test`.
 
 ## Qwen27B
 
