@@ -1,5 +1,16 @@
 # EXL3 / Flash-Next handoff (updated 2026-11-08; B5 runtime deployed)
 
+## Open: B9 GPU pass, 2026-11-08
+
+B9 ([brief](archive/B9-STRUCTURE-BRIEF.md)) split the kernels and executor by
+stage, moved the host runtime to `src/models/qwen38_flash_next/runtime/`, the
+model benches and tools to `tools/qwen38_flash_next/`, and the serving
+supervisor into `tools/serving/flash_next/` (installed with `install.py`).
+All 7,059 device symbols are identical to the pre-B9 build; host code changed
+only by relocation. Still to run: the GPU operator tests and one combined
+correctness and timing pass of the B9 binary against B5, then a server restart
+onto the installed supervisor copy.
+
 ## Active default: c03 Gufo B5 runtime, 2026-11-08
 
 The service runs the B5 binary (sha256 `31cee0b6…`, 126,048,792 B, source

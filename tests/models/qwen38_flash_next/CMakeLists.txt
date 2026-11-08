@@ -38,8 +38,8 @@ target_link_libraries(qwen38_flash_next_reference_probe PRIVATE
 set_source_files_properties(reference_probe.cpp PROPERTIES COMPILE_OPTIONS "-O2")
 
 if (ENGINE_ENABLE_HIP)
-  add_executable(qwen38_flash_next_rq_logits EXCLUDE_FROM_ALL rq_logits.cpp)
-  target_link_libraries(qwen38_flash_next_rq_logits PRIVATE
+  add_executable(qwen38_flash_next_rq_logits_probe EXCLUDE_FROM_ALL rq_logits_probe.cpp)
+  target_link_libraries(qwen38_flash_next_rq_logits_probe PRIVATE
     gufo_qwen38_flash_next hip::host)
 
   # Decode HC projection timing (tools/qwen38_flash_next/bench), on the production kernels.
@@ -174,8 +174,8 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen38_flash_next_continuation_probe PRIVATE
     gufo_qwen38_flash_next)
   # KVarN K0 accuracy study (plan/exl3/archive/F1-DESIGN.md 3.2); needs the model.
-  add_executable(qwen38_flash_next_kvarn_k0 EXCLUDE_FROM_ALL kvarn_k0.cpp)
-  target_link_libraries(qwen38_flash_next_kvarn_k0 PRIVATE
+  add_executable(qwen38_flash_next_kvarn_k0_probe EXCLUDE_FROM_ALL kvarn_k0_probe.cpp)
+  target_link_libraries(qwen38_flash_next_kvarn_k0_probe PRIVATE
     gufo_qwen38_flash_next_reference)
   add_custom_target(qwen38_flash_next_model_tests
     DEPENDS qwen38_flash_next_session_test qwen38_flash_next_snapshot_test

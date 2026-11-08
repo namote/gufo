@@ -360,7 +360,7 @@ int main(int argc, char** argv) {
     }
     Require(!model_path.empty() && !user_path.empty() && !out_path.empty() &&
                 steps > 0,
-            "Usage: qwen38_flash_next_kvarn_k0 MODEL.gguf --user FILE "
+            "Usage: qwen38_flash_next_kvarn_k0_probe MODEL.gguf --user FILE "
             "[--system FILE] --out FILE.jsonl "
             "[--configs fp16,kvarn_k4v2_g128,...] [--steps N] [--context N] "
             "[--prefill-chunk N] [--quantize-decode] "

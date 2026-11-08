@@ -6,7 +6,21 @@ n-gram embedding. The existing `unsloth/Qwen3.8-Flash-Next-GGUF` **UD-Q4_K_XL**
 loader and optional BF16 vision projector remain available.
 Original unquantized-model and GGUF-conversion parity remain unqualified.
 
-[Benchmarks](BENCHMARKS.md) · [Quality](QUALITY.md) · [Experiments](EXPERIMENTS.md) · [ROCm 10.1 status](ROCM.md)
+**Start with this page** (running the model), then [Benchmarks](BENCHMARKS.md).
+
+| Document | Contents |
+| --- | --- |
+| [BENCHMARKS.md](BENCHMARKS.md) | Retained speed numbers against the reference implementations |
+| [QUALITY.md](QUALITY.md) | Qualification and focused quality checks |
+| [EXPERIMENTS.md](EXPERIMENTS.md) | Tried, kept and rejected experiments with their evidence |
+| [ROCM.md](ROCM.md) | ROCm 10.1 toolchain status |
+| [CONTINUATION-ADAPTER.md](CONTINUATION-ADAPTER.md) | The continuation adapter that owns the serving Session and attaches it to the component cache |
+| [PROMPT-CHECKPOINTS.md](PROMPT-CHECKPOINTS.md) | Qualification of the prompt-checkpoint path (2026-10-06) |
+| `artifacts/` | Recorded JSON evidence and `charts/` that the documents above cite (history; not edited) |
+
+Code: [src/models/qwen38_flash_next/](../../../src/models/qwen38_flash_next/README.md);
+tests: [tests/models/qwen38_flash_next/](../../../tests/models/qwen38_flash_next/README.md);
+tools: [tools/qwen38_flash_next/](../../../tools/qwen38_flash_next/README.md).
 
 ## Native EXL3 text/MTP/vision
 
@@ -158,7 +172,7 @@ hidden states and mRoPE. Image snapshots require matching prompt attachment.
 Model tests are in `tests/models/qwen38_flash_next`, focused microbenchmarks and
 model tools in [`tools/qwen38_flash_next`](../../../tools/qwen38_flash_next/README.md). [Quality](QUALITY.md) summarizes qualification and focused checks.
 Build a microbenchmark with
-`nix develop -c tools/bench/build.sh tools/qwen38_flash_next/bench/experiments/projection_plans.hip`;
+`nix develop -c tools/bench/build.sh tools/qwen38_flash_next/bench/experiments/projection_plans_bench.hip`;
 `dense_blaslt_sweep.hip` times hipBLASLt on the dense prefill shapes.
 No historical logit dump is required. New retained result summaries belong in
 `artifacts/`; generated traces stay in the ignored top-level `artifacts/` tree.

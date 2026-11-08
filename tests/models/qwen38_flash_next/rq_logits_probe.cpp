@@ -313,7 +313,7 @@ int main(int argc, char** argv) {
     Require(!model_path.empty() && !windows_path.empty() &&
                 !out_prefix.empty() &&
                 (path_name == "prefill" || path_name == "decode"),
-            "Usage: qwen38_flash_next_rq_logits MODEL.gguf "
+            "Usage: qwen38_flash_next_rq_logits_probe MODEL.gguf "
             "--windows windows.json --path prefill|decode --out PREFIX "
             "[--reference PREFIX] [--top-k 256] [--prefix 2048] "
             "[--positions-limit 512] [--windows-limit 8] [--batch 512] "
