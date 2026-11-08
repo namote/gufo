@@ -1,5 +1,13 @@
 # B3 persistent decode design (Flash-Next EXL3, design only)
 
+**Not pursued (2026-11-08).** The launch-gap bench measured ≈2 µs per
+dispatch and ≈0.9 µs per cooperative grid barrier, so the ≈7 µs per-dispatch
+decode idle is ramp/drain and dependency latency, not launch cost (KNOWHOW
+"Flash-Next B3"); B3's fusions grew busy time more than they cut idle, and
+B5's side branches recovered idle more cheaply. B7 showed the remaining
+prefill time is GEMM efficiency. A persistent kernel would save only the
+barrier-vs-launch difference per stage while keeping the same serial tails.
+
 Status: design, no implementation. Inputs: B2 decode profile
 (`build/b1/gpu-b2/prof/decode-summary.json`: 31.78 ms/token, 1442
 dispatches/token, kernel-active 67 %), the B3 dispatch cuts (G1–G4) and the
