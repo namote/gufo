@@ -184,16 +184,15 @@ __device__ __forceinline__ void LaneStates(std::uint32_t d0, std::uint32_t d1,
   }
 }
 
-/// DecodeLaneMul1 from the lane's three already loaded dwords
-/// (tile[lw.o0], tile[lw.o1], tile[lw.o2]).
+/// The lane's eight decoded weights as four pairs: w[0] rows (r0, r0+1) and
+/// w[1] rows (r0+8, r0+9) of column L / 4; w[2], w[3] the same rows of
+/// column L / 4 + 8.
 template<int Code>
-__device__ __forceinline__ void DecodeLaneWordsMul1(std::uint32_t d0,
-                                                    std::uint32_t d1,
-                                                    std::uint32_t d2,
-                                                    unsigned shift,
-                                                    Half2 (&w)[4]) {
+__device__ __forceinline__ void DecodeLaneMul1(
+    const std::uint32_t* __restrict__ tile, const LaneWindow& lw,
+    Half2 (&w)[4]) {
   std::uint32_t state[8];
-  LaneStates<Code>(d0, d1, d2, shift, state);
+  LaneStates<Code>(tile[lw.o0], tile[lw.o1], tile[lw.o2], lw.shift, state);
   std::uint32_t p[8];
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
@@ -203,16 +202,6 @@ __device__ __forceinline__ void DecodeLaneWordsMul1(std::uint32_t d0,
   for (int q = 0; q < 4; ++q) {
     w[q] = DecodePairMul1(p[2 * q], p[2 * q + 1]);
   }
-}
-
-/// The lane's eight decoded weights as four pairs: w[0] rows (r0, r0+1) and
-/// w[1] rows (r0+8, r0+9) of column L / 4; w[2], w[3] the same rows of
-/// column L / 4 + 8.
-template<int Code>
-__device__ __forceinline__ void DecodeLaneMul1(
-    const std::uint32_t* __restrict__ tile, const LaneWindow& lw,
-    Half2 (&w)[4]) {
-  DecodeLaneWordsMul1<Code>(tile[lw.o0], tile[lw.o1], tile[lw.o2], lw.shift, w);
 }
 
 /// In-place unnormalized 128-point Walsh-Hadamard butterflies of one segment

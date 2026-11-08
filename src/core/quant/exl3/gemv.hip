@@ -280,8 +280,7 @@ __global__ __launch_bounds__(W * 32) void Exl3GemvKernel(GemvArgs args) {
   }
 
   const unsigned lane = threadIdx.x % 32;
-  // Wave-uniform, so the K loop bounds and branches stay scalar.
-  const unsigned warp = __builtin_amdgcn_readfirstlane(threadIdx.x / 32);
+  const unsigned warp = threadIdx.x / 32;
   const unsigned n_tiles = sl.n / 16;
   const unsigned k_tiles = args.k / 16;
   const unsigned nt0 = (blockIdx.x - sl.block_begin) * TN;
@@ -301,101 +300,32 @@ __global__ __launch_bounds__(W * 32) void Exl3GemvKernel(GemvArgs args) {
     }
   }
 
-  // The wave fetches kGroup K tiles at a time (its trellis words and input
-  // rows) and issues the next group's loads before it decodes the current
-  // one, so it never drains to zero loads in flight between K tiles (one
-  // tile pair per step, waited at its use, left the loop latency-bound).
-  // Tiles are decoded and accumulated in K order exactly as before. Two
-  // register sets alternate, so the group in flight is never copied (as in
-  // the routed GEMV, exl3_moe.hip). Only the last group pair tests the K end:
-  // a test in every group made the loop header wait for all loads (a skipped
-  // group's registers stay pending on that path). Indices past the wave's
-  // range clamp to its last tile, already cached.
-  constexpr unsigned kGroup = M <= 2 ? 4 / TN : 1;
-  // Global, not flat, loads: a flat load also counts against lgkmcnt, so a
-  // scalar wait in the loop would drain the group still in flight.
-  using GlobalDword = const __attribute__((address_space(1))) std::uint32_t;
-  using GlobalHalf4 = const __attribute__((address_space(1))) Half4;
-  struct Fetched {
-    std::uint32_t w[kGroup][TN][3];
-    Half4 a[kGroup][M];
-  };
   const std::uint32_t* base =
       reinterpret_cast<const std::uint32_t*>(sl.trellis);
-  const auto fetch = [&](unsigned kt0,
-                         Fetched& f) __attribute__((always_inline)) {
+  for (unsigned kt = kb0; kt < kb1; ++kt) {
+    Half2 a01[M];
+    Half2 a89[M];
+    const Half4* group = reinterpret_cast<const Half4*>(
+        sl.a + (static_cast<std::size_t>(kt) * 16 + r0 * 2) * M);
 #pragma unroll
-    for (unsigned u = 0; u < kGroup; ++u) {
-      const unsigned kt = min(kt0 + u, kb1 - 1);
-      // An address-space conversion is spelled as a C cast. 32-bit element
-      // offsets (a matrix is far below 2^32 dwords) keep the address math
-      // off the registers of loads in flight.
-      const auto* group = (GlobalHalf4*)(sl.a + (kt * 16 + r0 * 2) * M);
+    for (unsigned r = 0; r < M; ++r) {
+      const Half4 v = group[r];
+      a01[r] = Half2{v.x, v.y};
+      a89[r] = Half2{v.z, v.w};
+    }
+#pragma unroll
+    for (unsigned t = 0; t < TN; ++t) {
+      const std::uint32_t* tile =
+          base +
+          (static_cast<std::size_t>(kt) * n_tiles + nt0 + t) * kTileDwords;
+      Half2 w[4];
+      exl3::DecodeLaneMul1<K>(tile, lw, w);
 #pragma unroll
       for (unsigned r = 0; r < M; ++r) {
-        f.a[u][r] = group[r];
-      }
-#pragma unroll
-      for (unsigned t = 0; t < TN; ++t) {
-        const auto* tile =
-            (GlobalDword*)(base + (kt * n_tiles + nt0 + t) * kTileDwords);
-        f.w[u][t][0] = tile[lw.o0];
-        f.w[u][t][1] = tile[lw.o1];
-        f.w[u][t][2] = tile[lw.o2];
-      }
-    }
-  };
-  const auto step = [&](unsigned kt0, const Fetched& f, Fetched& next,
-                        bool checked) __attribute__((always_inline)) {
-    fetch(kt0 + kGroup, next);
-    // Issue the next group before the waits for this one: the scheduler
-    // otherwise hoists this group's decode (and its vmcnt waits) above it.
-    __builtin_amdgcn_sched_barrier(0);
-#pragma unroll
-    for (unsigned u = 0; u < kGroup; ++u) {
-      if (checked && kt0 + u >= kb1) {
-        break;
-      }
-      Half2 a01[M];
-      Half2 a89[M];
-#pragma unroll
-      for (unsigned r = 0; r < M; ++r) {
-        const Half4 v = f.a[u][r];
-        a01[r] = Half2{v.x, v.y};
-        a89[r] = Half2{v.z, v.w};
-      }
-#pragma unroll
-      for (unsigned t = 0; t < TN; ++t) {
-        Half2 w[4];
-        exl3::DecodeLaneWordsMul1<K>(f.w[u][t][0], f.w[u][t][1], f.w[u][t][2],
-                                     lw.shift, w);
-#pragma unroll
-        for (unsigned r = 0; r < M; ++r) {
-          acc_a[t][r] =
-              __builtin_amdgcn_fdot2(w[0], a01[r], acc_a[t][r], false);
-          acc_a[t][r] =
-              __builtin_amdgcn_fdot2(w[1], a89[r], acc_a[t][r], false);
-          acc_b[t][r] =
-              __builtin_amdgcn_fdot2(w[2], a01[r], acc_b[t][r], false);
-          acc_b[t][r] =
-              __builtin_amdgcn_fdot2(w[3], a89[r], acc_b[t][r], false);
-        }
-      }
-    }
-  };
-  if (kb0 < kb1) {
-    Fetched even;
-    Fetched odd;
-    fetch(kb0, even);
-    unsigned kt0 = kb0;
-    for (; kt0 + 2 * kGroup <= kb1; kt0 += 2 * kGroup) {
-      step(kt0, even, odd, false);
-      step(kt0 + kGroup, odd, even, false);
-    }
-    if (kt0 < kb1) {
-      step(kt0, even, odd, true);
-      if (kt0 + kGroup < kb1) {
-        step(kt0 + kGroup, odd, even, true);
+        acc_a[t][r] = __builtin_amdgcn_fdot2(w[0], a01[r], acc_a[t][r], false);
+        acc_a[t][r] = __builtin_amdgcn_fdot2(w[1], a89[r], acc_a[t][r], false);
+        acc_b[t][r] = __builtin_amdgcn_fdot2(w[2], a01[r], acc_b[t][r], false);
+        acc_b[t][r] = __builtin_amdgcn_fdot2(w[3], a89[r], acc_b[t][r], false);
       }
     }
   }
