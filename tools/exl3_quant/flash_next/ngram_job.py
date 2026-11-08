@@ -11,7 +11,7 @@ import time
 
 from paths import OUT, RUNTIME, SOURCE, TASK
 STAGE=OUT/'ngram-full'
-STAGE.mkdir(exist_ok=True)
+STAGE.mkdir(parents=True,exist_ok=True)
 job_lock=(STAGE/'JOB.lock').open('a')
 fcntl.flock(job_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
 inventory=json.loads((OUT/'source-inventory.json').read_text())

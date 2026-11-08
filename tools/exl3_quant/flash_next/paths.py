@@ -4,9 +4,9 @@ The drivers ran from the retired ai.tools tree. Their host paths now come from
 the environment, defaulting to this repository and /home/m2on/projects/models:
 
   GUFO_QUANT_OUT       stage receipts and work (/output in the containers);
-                       default <repo>/build/flash-next-quant-c03. The c03 run's
-                       receipts, which model_job.py's gates read, are in
-                       HISTORICAL_OUT.
+                       default <repo>/build/flash-next-quant-c03. model_job.py
+                       asserts gate receipts there; the c03 run's are in
+                       HISTORICAL_OUT, to copy from or to point this at.
   GUFO_KYOJIN_RUNTIME  converter runtime from kyojin/fetch_kyojin.sh and
                        build_kyojin.sh (source/ + site/); default
                        <repo>/build/kyojin-runtime.
@@ -19,7 +19,8 @@ import os
 from pathlib import Path
 
 TASK = Path(__file__).resolve().parent
-REPO = TASK.parents[2]
+# Under /task in a container there is no repository; nothing there needs REPO.
+REPO = TASK.parents[2] if len(TASK.parents) > 2 else TASK
 HISTORICAL_OUT = Path('/home/m2on/projects/_ai.tools/tmp/test-results/flash-next-quant-20261104')
 OUT = Path(os.environ.get('GUFO_QUANT_OUT') or REPO / 'build/flash-next-quant-c03')
 RUNTIME = Path(os.environ.get('GUFO_KYOJIN_RUNTIME') or REPO / 'build/kyojin-runtime')
