@@ -733,6 +733,13 @@ if (BUILD_TESTING)
   set_tests_properties(exl3_quant_tools_test PROPERTIES
     LABELS "cpu;tools;quantization" TIMEOUT 60)
 
+  # Flash-Next serving supervisor (tools/serving/flash_next): fence parsing,
+  # host classification, journal deltas and the installer; standard library only.
+  add_test(NAME flash_next_serving_test
+    COMMAND ${Python3_EXECUTABLE} -B -m unittest discover
+      -s ${CMAKE_CURRENT_SOURCE_DIR}/tools/serving/flash_next -p "test_*.py")
+  set_tests_properties(flash_next_serving_test PROPERTIES LABELS "cpu;tools" TIMEOUT 30)
+
   # Pinned ROCm 10.1 Docker environment (tools/docker); standard library only.
   add_test(NAME pinned_rocm101_test
     COMMAND ${Python3_EXECUTABLE}

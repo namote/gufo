@@ -1,0 +1,51 @@
+{
+ "boot_id": "58a99b2f-419f-4809-9ec1-c19f74fc40db",
+ "verified_desktop_clients": [
+  {
+   "PID": 3428,
+   "comm": "ksmserver",
+   "starttime_ticks": 1496,
+   "PGID": 3428,
+   "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/session.slice/plasma-ksmserver.service",
+   "UIDs": [
+    1000,
+    1000,
+    1000,
+    1000
+   ],
+   "exe": "/usr/bin/ksmserver",
+   "exe_stat": [
+    66306,
+    46400577,
+    200368,
+    1783936481000000000,
+    0,
+    33261
+   ]
+  }
+ ],
+ "verified_display_infrastructure": [
+  {
+   "PID": 1,
+   "comm": "systemd",
+   "starttime_ticks": 21,
+   "PGID": 1,
+   "cgroup": "0::/init.scope",
+   "UIDs": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "exe": "/usr/lib/systemd/systemd",
+   "exe_stat": [
+    66306,
+    46429016,
+    141776,
+    1785185042000000000,
+    0,
+    33261
+   ]
+  }
+ ]
+}

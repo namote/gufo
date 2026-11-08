@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""Install the Flash-Next serving supervisor into ~/.local/share/gufo (standard library only).
+
+The live supervisor must not depend on the working tree while it is edited, so
+this copies one committed revision of the files in FILES out of git (`git show
+REV:path`, default HEAD) instead of linking them. It
+
+  1. backs up the files it will replace to BACKUP_ROOT/gufo-serving-<stamp>-<sha>/
+     and appends a line for that folder to BACKUP_ROOT/README.md,
+  2. writes each file atomically (temporary file in the destination, then rename),
+  3. byte-compiles every installed .py file in memory, and
+  4. records the revision, the time and each file's sha256 in DEST/INSTALLED.json.
+
+Nothing else in DEST is touched: not ops/OWNER.lock (the GPU owner lock a running
+supervisor holds), not ops/DESKTOP-*.json (boot-scoped admission manifests),
+server-state.json, profile.json, logs/ or caches. Python has already loaded a
+running supervisor's code, so an install does not change a live server until
+it is restarted; the root-run readers (ops/root_read.py, ops/fence_read.py, ...)
+are started afresh for each reading and are used from the next reading on.
+
+  install.py [--rev REV] [--dest DIR] [--backup-root DIR] [--dry-run]
+  install.py --check [--dest DIR]      compare DEST with its INSTALLED.json
+  install.py --from-dir DIR ...        install a directory's files (tests only)
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+HERE = Path(__file__).resolve().parent
+REPO_PATH = 'tools/serving/flash_next'
+FILES = ('gufo-server.py', 'ops/__init__.py', 'ops/admission.py', 'ops/desktop.py', 'ops/fence.py',
+         'ops/fence_read.py', 'ops/host_audit.py', 'ops/journal.py', 'ops/legacy_root_read.py',
+         'ops/npu_audit.py', 'ops/root_read.py', 'ops/window.py')
+DEST = Path.home() / '.local/share/gufo'
+BACKUP_ROOT = Path.home() / 'projects/_backup'
+RECORD = 'INSTALLED.json'
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def git(*args: str) -> bytes:
+    return subprocess.run(['git', '-C', str(HERE), *args], check=True, capture_output=True).stdout
+
+
+def read_revision(rev: str) -> tuple[str, dict[str, bytes]]:
+    """(full commit sha, {file: bytes}) of FILES at a committed revision."""
+    commit = git('rev-parse', '--verify', rev + '^{commit}').decode().strip()
+    return commit, {name: git('show', f'{commit}:{REPO_PATH}/{name}') for name in FILES}
+
+
+def read_directory(source: Path) -> tuple[str, dict[str, bytes]]:
+    return 'directory:' + str(source), {name: (source / name).read_bytes() for name in FILES}
+
+
+def compile_check(files: dict[str, bytes]) -> None:
+    for name, data in files.items():
+        compile(data, name, 'exec')  # raises SyntaxError before anything is written
+
+
+def backup(dest: Path, backup_root: Path, revision: str, stamp: str) -> Path | None:
+    present = [name for name in FILES if (dest / name).exists()]
+    if not present:
+        return None
+    tag = 'dir' if revision.startswith('directory:') else revision[:8]
+    folder = backup_root / f'gufo-serving-{stamp}-{tag}'
+    for name in present:
+        target = folder / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((dest / name).read_bytes())
+    previous = dest / RECORD
+    if previous.exists():
+        (folder / RECORD).write_bytes(previous.read_bytes())
+    readme = backup_root / 'README.md'
+    line = (f'\n- `{folder.name}/`: serving supervisor files that '
+            f'`tools/serving/flash_next/install.py` replaced with {revision}. Restore by copying '
+            f'the folder\'s files back into `~/.local/share/gufo/` (then restart the server).\n')
+    with readme.open('a') as out:
+        out.write(line)
+    return folder
+
+
+def write_atomic(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name('.' + path.name + '.install-tmp')
+    tmp.write_bytes(data)
+    os.chmod(tmp, 0o664)
+    os.replace(tmp, path)
+
+
+def install(files: dict[str, bytes], revision: str, dest: Path, backup_root: Path, dry_run: bool) -> dict:
+    compile_check(files)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    changed = [name for name in FILES if not (dest / name).exists() or (dest / name).read_bytes() != files[name]]
+    record = {'revision': revision, 'installed_utc': stamp, 'source': REPO_PATH,
+              'files': {name: sha256(files[name]) for name in FILES}, 'changed': changed}
+    if dry_run:
+        return record
+    record['backup'] = str(backup(dest, backup_root, revision, stamp))
+    for name in FILES:
+        if name in changed:
+            write_atomic(dest / name, files[name])
+    write_atomic(dest / RECORD, (json.dumps(record, indent=2) + '\n').encode())
+    return record
+
+
+def check(dest: Path) -> int:
+    record = json.loads((dest / RECORD).read_text())
+    bad = [name for name, digest in record['files'].items()
+           if not (dest / name).exists() or sha256((dest / name).read_bytes()) != digest]
+    print(json.dumps({'revision': record['revision'], 'installed_utc': record['installed_utc'], 'modified': bad},
+                     indent=2))
+    return 1 if bad else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--rev', default='HEAD', help='committed revision to install (default HEAD)')
+    ap.add_argument('--from-dir', type=Path, help='install FILES from this directory instead of git (tests)')
+    ap.add_argument('--dest', type=Path, default=DEST)
+    ap.add_argument('--backup-root', type=Path, default=BACKUP_ROOT)
+    ap.add_argument('--dry-run', action='store_true', help='print what would change, write nothing')
+    ap.add_argument('--check', action='store_true', help='verify DEST against its INSTALLED.json')
+    a = ap.parse_args(argv)
+    if a.check:
+        return check(a.dest)
+    revision, files = read_directory(a.from_dir) if a.from_dir else read_revision(a.rev)
+    print(json.dumps(install(files, revision, a.dest, a.backup_root, a.dry_run), indent=2))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
