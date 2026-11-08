@@ -525,6 +525,10 @@ older retained port evidence is under
 Keep the named window's `receipt/run`, binary hashes, plan, health result and
 rejected attempts. R0 quality records live under
 `~/projects/ai.tools/storage/evaluations/rq-r0-20261029/` (R0:255; XQ:382–390).
+The evaluation inputs these runs read (BF16 prefill reference, corpus a01,
+c02 calibration source, saved c03 FP16 quality reference) are copied to
+`/home/m2on/projects/models/eval/flash-next/` (see its README); use those, not
+the read-only ai.tools tree.
 
 `F3bench/` below means `/home/m2on/projects/gufo-f3-integ/tools/bench/`;
 `GDNtests/` means

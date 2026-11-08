@@ -22,7 +22,7 @@ Outputs: <out>.safetensors and <out>.json (inputs and their sha256, rule, alloca
 of every row, output sha256). Standard library only.
 
   python3 -I tools/exl3_quant/c02_to_caldata.py \
-      --c02 ~/projects/ai.tools/storage/evaluations/rq-r3-calib-20261029/c02 \
+      --c02 ~/projects/models/eval/flash-next/calib-c02 \
       --out "/run/media/m2on/T5 EVO/AI/model/xq-exl3-20261030/cal/c02-250x2048"
 """
 from __future__ import annotations

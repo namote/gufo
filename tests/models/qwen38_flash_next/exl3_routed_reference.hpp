@@ -7,8 +7,8 @@
 // Production now keeps the route tile in registers and gives each down wave
 // two output tiles at R <= 4, without changing any lane's arithmetic; this
 // copy pins that contract, so tests compare the production kernel's output
-// bytes against it. Kept verbatim; compile with exl3_moe.hip's device flags (-O3,
-// -ffast-math, -fno-finite-math-only), as exl3_moe_kernel_test.cpp is.
+// bytes against it. Kept verbatim; compile with exl3_moe.hip's device flags
+// (-O3, -ffast-math, -fno-finite-math-only), as exl3_moe_kernel_test.cpp is.
 
 #include <hip/hip_runtime.h>
 

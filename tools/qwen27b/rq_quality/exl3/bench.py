@@ -208,7 +208,7 @@ def main(argv=None) -> int:
     ap.add_argument("mode", choices=("pptg", "chat", "kernels"))
     ap.add_argument("model_dir")
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--windows", type=Path, default=Path("/workspace/storage/evaluations/rq-r0-20261029/corpus-a01/windows.json"))
+    ap.add_argument("--windows", type=Path, default=Path("/home/m2on/projects/models/eval/flash-next/corpus-a01/windows.json"))
     ap.add_argument("--pp", type=int, default=2048)
     ap.add_argument("--tg", type=int, default=128)
     ap.add_argument("--depths", default="0,32768")
