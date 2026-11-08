@@ -20,6 +20,7 @@ RT=$(cd "$1" && pwd)
 WH=$(cd "${2:-/home/m2on/projects/_backup/third_party/kyojin-wheels-rocm10.1.0a20260822}" && pwd)
 IMAGE=${KYOJIN_IMAGE:-sha256:79e3e0b7bc23ed230dc90a11e342aeae109086d145bb0b302363ac2069b43126}
 python3 -I "$HERE/pin.py" check --dest "$RT/source"
+NAMES=$(python3 -I -c 'import json,sys; print(" ".join(w["name"] for w in json.load(open(sys.argv[1]))))' "$HERE/runtime/WHEELS.json")
 python3 -I - "$HERE/runtime/WHEELS.json" "$WH" <<'PY'
 import hashlib, json, sys
 from pathlib import Path
@@ -38,10 +39,10 @@ PY
 mkdir -p "$RT/site" "$RT/home"
 docker run --rm --pull never --network none --user 1000:1000 --memory 20g --memory-swap 20g \
   --tmpfs /tmp:rw,size=2g --mount "type=bind,src=$RT,dst=/runtime" --mount "type=bind,src=$WH,dst=/wheels,readonly" \
-  --entrypoint /bin/bash "$IMAGE" -c '
+  -e "WHEELS=$NAMES" --entrypoint /bin/bash "$IMAGE" -c '
 set -euo pipefail
 ROOT=/runtime
-/opt/venv/bin/python -m pip install --no-deps --no-index --no-compile --target "$ROOT/site" /wheels/*.whl /wheels/*.tar.gz
+/opt/venv/bin/python -m pip install --no-deps --no-index --no-compile --target "$ROOT/site" $(for w in $WHEELS; do echo "/wheels/$w"; done)
 export PYTHONPATH="$ROOT/site" PATH="$ROOT/site/bin:/opt/venv/bin:$PATH"
 export EXL3_ROCM_SDK="$ROOT/site/_rocm_sdk_devel" EXL3_VENV=/opt/venv EXL3_ROOT="$ROOT/source"
 export PYTORCH_ROCM_ARCH=gfx1151 MAX_JOBS=4 EXL3_HIP_DEFINES=EXL3_HIP_STG_PAD HOME="$ROOT/home"

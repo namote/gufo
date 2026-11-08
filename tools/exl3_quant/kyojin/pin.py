@@ -61,17 +61,20 @@ def fetch(out: Path, expected: str, url: str, backup: Path | None) -> str:
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_name(out.name + ".part")
     origin = url
-    if backup is not None and backup.is_file() and sha256_file(backup) == expected:
-        shutil.copyfile(backup, tmp)
-        origin = str(backup)
-    else:
-        with urllib.request.urlopen(url, timeout=120) as r, tmp.open("wb") as f:
-            shutil.copyfileobj(r, f, 1 << 20)
-    got = sha256_file(tmp)
-    if got != expected:
-        tmp.unlink()
-        raise ValueError(f"sha256 mismatch for {origin}: {got} != {expected}")
-    tmp.replace(out)
+    try:
+        if backup is not None and backup.is_file() and sha256_file(backup) == expected:
+            shutil.copyfile(backup, tmp)
+            origin = str(backup)
+        else:
+            with urllib.request.urlopen(url, timeout=120) as r, tmp.open("wb") as f:
+                shutil.copyfileobj(r, f, 1 << 20)
+        got = sha256_file(tmp)
+        if got != expected:
+            raise ValueError(f"sha256 mismatch for {origin}: {got} != {expected}")
+        tmp.replace(out)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return origin
 
 
@@ -104,25 +107,50 @@ def _inside(rel: PurePosixPath, target: PurePosixPath) -> bool:
     return True
 
 
+def _resolved_parent(dest: Path, rel: PurePosixPath) -> PurePosixPath:
+    """rel's parent after resolving symlinks already on disk; reject one outside dest or a taken path."""
+    root = os.path.realpath(dest)
+    parent = os.path.realpath(dest / rel.parent)
+    if os.path.commonpath([root, parent]) != root:
+        raise ValueError(f"archive member escapes the tree through a symlink: {rel}")
+    if os.path.lexists(dest / rel) and not (dest / rel).is_dir():
+        raise ValueError(f"duplicate archive member: {rel}")
+    return PurePosixPath(os.path.relpath(parent, root))
+
+
 def unpack(archive: Path, dest: Path, prefix: str) -> int:
+    """Extract directories and files first, then symlinks, each checked against the tree on disk."""
     if dest.exists() and any(dest.iterdir()):
         raise FileExistsError(f"{dest} is not empty")
     dest.mkdir(parents=True, exist_ok=True)
-    count = 0
+    count, links = 0, []
     with tarfile.open(archive) as tar:
         for m, rel in safe_members(tar, prefix):
             path = dest / rel
+            if m.issym():
+                links.append((m.linkname, rel))
+                continue
+            _resolved_parent(dest, rel)
             if m.isdir():
                 path.mkdir(parents=True, exist_ok=True)
-            elif m.issym():
-                path.parent.mkdir(parents=True, exist_ok=True)
-                os.symlink(m.linkname, path)
             else:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                with tar.extractfile(m) as src, path.open("wb") as f:
+                with tar.extractfile(m) as src, path.open("xb") as f:
                     shutil.copyfileobj(src, f)
                 os.chmod(path, 0o755 if m.mode & 0o111 else 0o644)
                 count += 1
+    for target, rel in links:
+        parent = _resolved_parent(dest, rel)
+        if not _inside(PurePosixPath(*parent.parts, rel.name) if parent.parts != (".",) else PurePosixPath(rel.name),
+                       PurePosixPath(target)):
+            raise ValueError(f"symlink escapes the tree: {rel} -> {target}")
+        (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(target, dest / rel)
+    # A chain of individually contained links can still resolve outside; check the final tree.
+    root = os.path.realpath(dest)
+    for _, rel in links:
+        if os.path.commonpath([root, os.path.realpath(dest / rel)]) != root:
+            raise ValueError(f"symlink resolves outside the tree: {rel}")
     return count
 
 

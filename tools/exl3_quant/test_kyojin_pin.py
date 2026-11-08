@@ -95,9 +95,31 @@ class Test(unittest.TestCase):
             with tarfile.open(t / "y.tar.gz") as tar, self.assertRaises(ValueError):
                 list(pin.safe_members(tar, "other-prefix"))
 
-    def test_patch_applies_to_upstream_shape(self):
+    def test_chained_symlinks_cannot_escape(self):
+        cases = {
+            "parent link": ({"d/l/evil": b"x"}, {"d": ".", "d/l": ".."}),
+            "chain": ({"x/f": b"1"}, {"x/b": "..", "a": "x/b/.."}),
+            "later link": ({"x/f": b"1"}, {"x/b": "..", "a": "y/..", "y": "x/b"}),
+        }
+        for name, (files, links) in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as t:
+                t = Path(t)
+                make_archive(t / "a.tar.gz", files, links)
+                with self.assertRaises((ValueError, OSError)):
+                    pin.unpack(t / "a.tar.gz", t / "dest", PREFIX)
+                self.assertEqual(sorted(p.name for p in t.iterdir()), ["a.tar.gz", "dest"])
+
+    def test_failed_download_leaves_no_partial_file(self):
+        with tempfile.TemporaryDirectory() as t:
+            t = Path(t)
+            with self.assertRaises(OSError):
+                pin.fetch(t / "out.tar.gz", "0" * 64, (t / "absent.tar.gz").as_uri(), None)
+            self.assertEqual(list(t.iterdir()), [])
+
+    def test_serve_patch_targets_only_serving_files(self):
         text = (pin.PATCHES / "qwen-serve-max-context.patch").read_text()
-        self.assertIn("+++ b/tools/qwen/serve.py", text)
+        targets = sorted(line[6:] for line in text.splitlines() if line.startswith("+++ b/"))
+        self.assertEqual(targets, ["tools/qwen/serve.py", "tools/qwen/test_serve.py"])
         self.assertIn("--max-context", text)
 
 
