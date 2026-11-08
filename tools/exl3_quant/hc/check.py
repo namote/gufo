@@ -19,7 +19,8 @@ def main(argv=None):
     command = ['PYTHONPATH=/build/source', 'PYTHONDONTWRITEBYTECODE=1',
                'OPENBLAS_NUM_THREADS=1', 'OMP_NUM_THREADS=1', 'TMPDIR=/build/tmp',
                PYTHON, '-m', 'unittest',
-               'tools.exl3_quant.hc.test_cpu', 'tools.exl3_quant.hc.test_refine', '-v']
+               'tools.exl3_quant.hc.test_cpu', 'tools.exl3_quant.hc.test_refine',
+               'tools.exl3_quant.hc.test_stats', 'tools.exl3_quant.hc.test_score', '-v']
     argv = docker_argv(out, repo, command, gpu=False, source_readonly=True,
                        raw_entrypoint='/usr/bin/env')
     name = 'gufo-hc-cpu-' + uuid.uuid4().hex

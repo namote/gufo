@@ -37,6 +37,11 @@ def main():
     Path('/build/BUILD.json').write_text(json.dumps({'status': 'built_pending_gpu_validation',
         'revision': manifest['revision'], 'source_manifest_sha256': sha(Path('/build/SOURCE.json')),
         'binary_sha256': sha(p), 'bytes': p.stat().st_size, 'gpu_used': False}, indent=2) + '\n')
+    if 'object_cache_provenance' in manifest:
+        proof = dict(manifest['object_cache_provenance'],
+                     source_manifest_sha256=sha(Path('/build/SOURCE.json')),
+                     build_receipt_sha256=sha(Path('/build/BUILD.json')), gpu_used=False)
+        Path('/build/CACHE-PROVENANCE.json').write_text(json.dumps(proof, indent=2) + '\n')
 
 
 if __name__ == '__main__':

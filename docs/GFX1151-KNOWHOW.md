@@ -2921,3 +2921,44 @@ failure: it does not qualify deployment. The second window waits for completed
 build/hash, verifies actual Nix10.1 ELF, and reuses controls without recomputing
 them. No production changes, full-model rerun or deployment. Evidence:
 `build/f3-moe-fused/{SCREEN-FIRST,SCREEN-PACKED,QUALIFICATION}.json`.
+
+### HC BF16-source Q8_0 pilot, November 8, 2026
+
+First attention HC only, two of200 matrices. B10 `9eb3cbdb` frozen collector002
+preserves capture-on/off prefill32 and decode8 full-vocabulary logits bytes
+(and top8 records). Saved prefill5926/decode1897 rows passed independent finite,
+coverage and phase checks. Decode H uses1024 training rows, holdout873; the same
+8 holdout documents provide1834 prefill rows. Prefix32 is excluded from decode H.
+This does not replace the full1999496-token calibration or qualify all HC sites.
+
+Original BF16 bits expand directly toFP32; full-H GPTQ-style fixed F16 group32
+scales, 1% mean-diagonal damping, followed by two independent six-sweep FP64
+code-only / code+stored-F16-scale refinements. All reuse the same saved H and
+controls. Ratios below are pooled held-out squared output error / legacy RTN:
+
+| Candidate | Down decode | Up decode | Ideal connected decode | Ideal connected prefill |
+| --- | ---: | ---: | ---: | ---: |
+| GPTQ | 0.528719 | 0.182783 | 0.191044 | 0.198557 |
+| GPTQ + codes | 0.541184 | 0.162236 | 0.171119 | 0.172107 |
+| GPTQ + codes + scales | 0.541117 | 0.121988 | 0.131878 | 0.137968 |
+
+Direct BF16 RTN and target-F16 RTN payloads happen to match exactly here: the
+benefit is statistics-aware rounding, not the source dtype conversion alone.
+Down's raw training loss falls with refinement while held-out error rises2.34%
+versus plain GPTQ. Keep both candidates; do not blindly apply refinement to
+all projections. Down has1024 observations for10240 channels, underdetermined
+before damping. Every recorded regularized refinement objective is monotonic.
+
+Connected screen computes `up(SiLU(down(x)/4))` in ideal FP64 on fixed B10 inputs.
+It excludes activation Q8, native GPU rounding, final HC mixing and model KLD.
+Review corrected the scale location before any real connected scoring; the
+first synthetic score test is superseded by the independent ±1 oracle in
+`score-test-002.log`. No claimed whole-model improvement, runtime parity or
+inference-speed result. Offline up/down generation+refinement took1.58/24.79
+and170.61/158.00s on the bounded CPU reference, not GPU-serving timings.
+
+Evidence: `build/exl3-hc/capture-run-001/`, `pilot-weights-001/{REPORT.md,SCORE.json}`.
+Original/target weights are read-only; all sidecars NOT_RUNTIME_QUALIFIED. Six
+GPU cases cleaned up with no new kernel error and the owned server restored
+ready, same configuration. No new capture, quantization or baseline rerun is
+needed to continue native/connected checks of these saved candidates.

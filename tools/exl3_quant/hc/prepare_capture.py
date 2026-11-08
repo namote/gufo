@@ -63,6 +63,16 @@ def instrument(source):
             executor->Forward(*session, std::span(tokens).subspan(p, n), rows,'''
     s = replace_once(s, anchor, '''        gufo_hc_capture::Context(w, p, decode);
 ''' + anchor)
+    s = replace_once(s, '    std::size_t head_checks = 0;',
+                     '    gufo::crypto::Sha256Hasher hc_full_logits;\n    std::size_t head_checks = 0;')
+    s = replace_once(s, '''        if (scored) {
+          // Same row width/dispatch''', '''        if (scored) {
+          hc_full_logits.Update(std::span(
+              reinterpret_cast<const std::uint8_t*>(logits.data()),
+              n * c.vocab_size * sizeof(float)));
+          // Same row width/dispatch''')
+    s = replace_once(s, '    meta["bin_sha256"] = writer.Finish();',
+                     '    meta["bin_sha256"] = writer.Finish();\n    meta["full_logits_sha256"] = hc_full_logits.FinishHex();')
     patches[p] = s
     # All anchors must validate before writing any changed source.
     for p, s in patches.items():

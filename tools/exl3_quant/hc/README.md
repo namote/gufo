@@ -3,7 +3,9 @@
 Offline conversion tools for Flash-Next HC down/up weights. They supplement
 the EXL3 pack with calibrated **Q8_0**, not another EXL3 tensor format. The
 source is the original BF16 snapshot; the existing F16 pack supplies a separate
-legacy rounding control. No command loads a model on the GPU or changes a pack.
+legacy rounding control. Quantization/refinement are CPU-only and never change
+a model pack. The explicit `capture_window --execute` command temporarily
+stops the owned server, captures inputs on the GPU, and restores its settings.
 
 | File | Role |
 | --- | --- |
@@ -11,14 +13,17 @@ legacy rounding control. No command loads a model on the GPU or changes a pack.
 | `quant.py` | Full-H GPTQ-style sequential error feedback with fixed stored F16 group scales |
 | `refine.py` | Reuses the saved GPTQ/control files and H; compares code-only and code-plus-scale coordinate refinement |
 | `test_cpu.py`, `test_refine.py`, `check.py` | Optional NumPy/safetensors CPU checks, independent brute-force numerical oracles |
-| `prepare_capture.py`, `build_capture.py`, `capture_hook.hpp` | Separate B10-layout frozen collector build; first attention HC only, CPU build qualified, GPU capture pending |
+| `prepare_capture.py`, `build_capture.py`, `capture_hook.hpp` | Separate B10-layout frozen collector build; first attention HC only |
 | `prepare_inputs.py` | Bounded pilot from existing c03 and separate holdout token files; hash-checked, no retokenization |
+| `capture_window.py` | Serialized GPU window, prefill/decode full-logit control, resource bounds and owned-server restoration |
+| `prepare_stats.py`, `test_stats.py` | Validated saved captures to phase-specific H; excludes decode's prefill prefix |
+| `score_saved.py` | Per-document evaluation of saved candidates on decode and prefill; no refitting |
 | `ORIGIN.json` | Original source hashes and the preserved migration evidence |
 
-Status: CPU reference tools. **No real HC calibration run or runtime loader
-qualification yet.** The original B5 capture prototype is historical; current
-B10 input capture has a separately reviewed CPU build, still requiring a
-bounded GPU capture-on/off check. See the active
+Status: offline reference tools and a real first-attention-HC pilot. **No runtime
+loader qualification or full 200-tensor calibration yet.** B10 collector002
+passed bounded prefill/decode capture-on/off full-vocabulary byte-hash controls;
+the original B5 prototype and B10 collector001 are historical. See the active
 [HC plan](../../../plan/exl3/HC-Q8-CALIBRATION.md).
 
 ## Commands
@@ -34,6 +39,9 @@ python3 -m tools.exl3_quant.hc quantize --source-model /path/to/BF16 --target-mo
 python3 -m tools.exl3_quant.hc refine --source-model /path/to/BF16 --target-model /path/to/pack \
   --baseline build/exl3-hc/down-gptq --stats /path/to/stats.npz \
   --output build/exl3-hc/down-refined --sweeps 6
+python3 -m tools.exl3_quant.hc.prepare_stats --capture /path/to/clean-capture \
+  --inputs /path/to/pilot-inputs --source-model /path/to/BF16 --target-model /path/to/pack \
+  --phase decode --projection down --output build/exl3-hc/down-stats
 ```
 
 The target on this host is `~/projects/models/llm/flash-next-exl3-gufo-c03`.

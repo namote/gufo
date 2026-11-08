@@ -19,9 +19,8 @@ def read_header(path):
     return json.loads(raw), 8 + size
 
 
-def load_weight(model, tensor, expected_dtype):
-    import numpy as np
-
+def read_weight_payload(model, tensor, expected_dtype):
+    """Standard-library payload identity, also used before GPU collection."""
     model = Path(model).resolve()
     raw_index = (model / 'model.safetensors.index.json').read_bytes()
     shard = (model / json.loads(raw_index)['weight_map'][tensor]).resolve()
@@ -43,6 +42,15 @@ def load_weight(model, tensor, expected_dtype):
         payload = f.read(offsets[1] - offsets[0])
     if len(payload) != offsets[1] - offsets[0]:
         raise ValueError('truncated tensor payload')
+    return payload, {'dtype': expected_dtype, 'model_index_sha256': hashlib.sha256(raw_index).hexdigest(),
+                     'weight_sha256': hashlib.sha256(payload).hexdigest(), 'shape': shape}
+
+
+def load_weight(model, tensor, expected_dtype):
+    import numpy as np
+
+    payload, identity = read_weight_payload(model, tensor, expected_dtype)
+    shape = identity['shape']
     if expected_dtype == 'BF16':
         bits = np.frombuffer(payload, dtype='<u2').astype('<u4') << 16
         w = bits.view('<f4').reshape(shape).astype(np.float32)
@@ -50,5 +58,4 @@ def load_weight(model, tensor, expected_dtype):
         w = np.frombuffer(payload, dtype='<f2').reshape(shape).astype(np.float16)
     if not np.isfinite(w).all():
         raise ValueError('nonfinite source weights')
-    return w, {'dtype': expected_dtype, 'model_index_sha256': hashlib.sha256(raw_index).hexdigest(),
-               'weight_sha256': hashlib.sha256(payload).hexdigest(), 'shape': shape}
+    return w, identity
