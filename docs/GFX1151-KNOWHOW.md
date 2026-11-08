@@ -1,5 +1,35 @@
 # gfx1151 optimization know-how
 
+## Flash-Next B5 routed down tiles, decode side branches, November 8, 2026
+
+Commits `62e9b525..eb789c77` (brief `plan/exl3/B5-BRIEF.md`). Kept: J2a routed
+GEMV route tiles out of LDS/scratch for R3/R4/R8 (B4 H4a had promoted them to
+57,344 B LDS + 80 B scratch, ≈1 block/WGP at MTP widths); J2b two output tiles
+per routed down wave at R1–R4 (1600→800 waves for 1280 resident slots); J3 GDN
+alpha/beta and the attention indexer chain on captured side-stream branches.
+Reverted: J1 dense EXL3 GEMV next-K-group prefetch (two register sets, VGPR
+36→82) — exact but slower on large shapes (bench R=1 µs old→new: GDN qkv+z K5
+118.8→122.5, attn q+k+v K6 116.6→119.0, head-shaped K8 182.0→193.4; small
+shapes −1 µs) and −0.02..−0.76% on TG; the B4 LDS-staging lesson does not carry
+to the dense kernel, which already runs at 210–230 GB/s. Bench
+`qwen38_flash_next_dense_gemv_bench` and the old-kernel reference test stay.
+
+Same window, c03, Nix10.1, FP16 KV, B C B C r2, baseline B4 adopted tree
+(`b4-simple-gufo`), candidate with J1 (C): AR128 d0/d32K 32.50/31.77→
+32.91/32.56 (+1.3/+2.5%); MTP128 d0/d32K 67.39/103.63→66.46/103.80
+(−1.4/+0.2%); PP unchanged. Isolation (C vs C minus item, TG AR d0/d32K/MTP
+d0/d32K): J1 −0.02/−0.17/−0.76/−0.76%; J2b +0.63/+0.62/−0.96/−0.50%; J3
++0.44/+1.70/+0.39/+0.84%. All rows within the 5%/10 ms gate. Adopted tree =
+measured C−J1 binary (same bytes): ≈AR +1.3/+2.7%, MTP −0.6/+0.9% vs B4.
+Outputs, hashes, MTP work counts and prefill logits equal B4.
+
+Decode profile AR d0 (C): 30.84 ms, 1273 dispatches, busy 23.02, idle 7.82
+ms/token (B4 20.65/10.28; side branches overlap, kernel sum exceeds busy by
+10.8 ms); routed gate/up 4.29 ms ≈184 GB/s, down 2.36 ≈168 GB/s (B4 174/155).
+Lesson: concurrent graph branches cut idle ≈2.5 ms/token where dispatch
+fusion could not; dense GEMVs are near their ceiling at R=1. Evidence:
+`build/b1/gpu-b5/RESULT.json`.
+
 ## Flash-Next B4 serial tails undone, routed LDS staging, November 8, 2026
 
 Commits `517445a3..dc24fd89` (brief `plan/exl3/B4-BRIEF.md`). Kept: G1 HC

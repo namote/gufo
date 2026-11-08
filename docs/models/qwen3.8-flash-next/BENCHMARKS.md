@@ -1,5 +1,12 @@
 # Qwen3.8 Flash-Next benchmarks
 
+## B5 routed down tiles and decode side branches, November 8, 2026
+
+Same-window B C B C vs B4 adopted tree, c03, Nix10.1, FP16 KV, r2; adopted
+tree `eb789c77` is the measured C−J1 binary: AR128 d0/d32K ≈32.9/32.6 tok/s
+(+1.3/+2.7%), MTP128 d0/d32K ≈67.0/104.6 (−0.6/+0.9%), PP unchanged. All within
+the gate. Outputs and quality equal B4. Details: [know-how](../../GFX1151-KNOWHOW.md).
+
 ## B4 routed LDS staging and simplified decode, November 8, 2026
 
 Same-window rotation vs B2 `9599b4c6` (adopted tree `dc24fd89`), c03, Nix10.1,
