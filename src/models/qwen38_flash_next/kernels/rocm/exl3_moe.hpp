@@ -230,6 +230,26 @@ void Exl3PrefillExpertsRaw(const DeviceLayer& layer, const float* x,
                            std::uint32_t used, std::uint32_t tile_rows,
                            const Exl3PrefillScratch& scratch,
                            hipStream_t stream);
+/// The raw path's stages (also its operator bench entry points). Gate/up
+/// input: each of a token's `used` assignments gets x[row] rotated with its
+/// expert's gate and up suh, stored as FP16 at the assignment's packed row
+/// inverse[row * used + s] (1 <= used <= 32, width % 128 == 0).
+void Exl3RotateGateUpTokens(const quant::exl3::DeviceLinear* gate,
+                            const quant::exl3::DeviceLinear* up, const float* x,
+                            std::uint16_t* gate_out, std::uint16_t* up_out,
+                            const std::int32_t* ids,
+                            const std::int32_t* inverse, std::uint32_t rows,
+                            std::uint32_t width, std::uint32_t used,
+                            hipStream_t stream);
+/// Down input: each packed row's FP16 gate/up dots restored, SwiGLU, rotated
+/// with the down suh and power-of-two scaled into FP16 `output`, with the
+/// row's exponent (width = expert FF, a multiple of 128 up to 4,096).
+void Exl3RestoreActivateScale(
+    const quant::exl3::DeviceLinear* gate, const quant::exl3::DeviceLinear* up,
+    const quant::exl3::DeviceLinear* down, const std::uint32_t* offsets,
+    std::uint32_t experts, const std::uint16_t* gate_y,
+    const std::uint16_t* up_y, std::uint16_t* output, std::int32_t* exponents,
+    std::uint32_t assignments, std::uint32_t width, hipStream_t stream);
 /// Retain the original IDs passed to Exl3PrefillExpertsRaw until combine
 /// completes; inverse rows and weights use that same token/slot order.
 void Exl3PrefillCombine(const DeviceLayer& layer,

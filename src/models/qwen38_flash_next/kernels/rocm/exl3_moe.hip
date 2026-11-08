@@ -13,6 +13,8 @@ namespace {
 namespace ex = quant::exl3;
 namespace arithmetic = gufo::hip::exl3;
 using arithmetic::Half2;
+/// Four adjacent FP16 bit patterns, one 8-byte (streaming) store.
+using Half4Bits = std::uint16_t __attribute__((ext_vector_type(4)));
 
 void Check() {
   const auto status = hipGetLastError();
@@ -886,16 +888,25 @@ __global__ __launch_bounds__(256) void RotateGateUpTokens(
     }
     arithmetic::Butterfly128(g, lane);
     arithmetic::Butterfly128(u, lane);
+    Half4Bits gate_bits, up_bits;
 #pragma unroll
     for (unsigned j = 0; j < 4; ++j) {
       float a = g[j] * arithmetic::kHadamardScale;
       asm volatile("" : "+v"(a));
       float b = u[j] * arithmetic::kHadamardScale;
       asm volatile("" : "+v"(b));
-      const auto at = std::size_t{packed} * width + first + j;
-      reinterpret_cast<_Float16*>(gate_out)[at] = static_cast<_Float16>(a);
-      reinterpret_cast<_Float16*>(up_out)[at] = static_cast<_Float16>(b);
+      gate_bits[j] =
+          __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(a));
+      up_bits[j] = __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(b));
     }
+    // Streaming stores: the gate/up GEMMs read these rows next, and the
+    // slabs (2 x 210 MB at 4,096 tokens) are far larger than the caches,
+    // which would otherwise hold them dirty when those reads arrive.
+    const auto at = std::size_t{packed} * width + first;
+    __builtin_nontemporal_store(gate_bits,
+                                reinterpret_cast<Half4Bits*>(gate_out + at));
+    __builtin_nontemporal_store(up_bits,
+                                reinterpret_cast<Half4Bits*>(up_out + at));
   }
 }
 
@@ -969,9 +980,14 @@ __global__ __launch_bounds__(1024) void RestoreActivateScaleBuckets(
   const int exponent = DownExponent(minimum, maximum);
   if (threadIdx.x == 0)
     exponents[row] = exponent;
+  Half4Bits scaled_bits;
 #pragma unroll
   for (unsigned j = 0; j < 4; ++j)
-    output[offset + j] = exponent > 0 ? ScaleHalf(bits[j], exponent) : bits[j];
+    scaled_bits[j] = exponent > 0 ? ScaleHalf(bits[j], exponent) : bits[j];
+  // Streaming store for the down GEMM that reads the rows next (see
+  // RotateGateUpTokens).
+  __builtin_nontemporal_store(scaled_bits,
+                              reinterpret_cast<Half4Bits*>(output + offset));
 }
 
 // InT: float (Exl3PrefillExperts) or _Float16 (the FP16 raw path); the
@@ -1636,6 +1652,41 @@ void Exl3PrefillExpertsRaw(const DeviceLayer& layer, const float* x,
                  Exl3PrefillBucketInner, stream, nullptr, true);
 }
 
+void Exl3RotateGateUpTokens(const ex::DeviceLinear* gate,
+                            const ex::DeviceLinear* up, const float* x,
+                            std::uint16_t* gate_out, std::uint16_t* up_out,
+                            const std::int32_t* ids,
+                            const std::int32_t* inverse, std::uint32_t rows,
+                            std::uint32_t width, std::uint32_t used,
+                            hipStream_t stream) {
+  if (rows == 0)
+    return;
+  if (used == 0 || used > 32 || width == 0 || width % 128 != 0)
+    throw std::invalid_argument("EXL3 gate/up rotation: unsupported shape");
+  hipLaunchKernelGGL(RotateGateUpTokens, dim3((width / 128 + 7) / 8, rows),
+                     dim3(256), 0, stream, gate, up, x, gate_out, up_out, ids,
+                     inverse, width, used);
+  Check();
+}
+
+void Exl3RestoreActivateScale(
+    const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
+    const ex::DeviceLinear* down, const std::uint32_t* offsets,
+    std::uint32_t experts, const std::uint16_t* gate_y,
+    const std::uint16_t* up_y, std::uint16_t* output, std::int32_t* exponents,
+    std::uint32_t assignments, std::uint32_t width, hipStream_t stream) {
+  if (assignments == 0)
+    return;
+  if (width == 0 || width % 128 != 0 || width > 4096)
+    throw std::invalid_argument("EXL3 prefill down width unsupported");
+  hipLaunchKernelGGL(
+      RestoreActivateScaleBuckets, dim3(assignments), dim3(32 * (width / 128)),
+      0, stream, gate, up, down, offsets, experts,
+      reinterpret_cast<const _Float16*>(gate_y),
+      reinterpret_cast<const _Float16*>(up_y), output, exponents, width);
+  Check();
+}
+
 namespace {
 void PrefillExperts(const DeviceLayer& layer, const float* x,
                     const std::int32_t* ids, float* out, std::uint32_t rows,
@@ -1675,10 +1726,9 @@ void PrefillExperts(const DeviceLayer& layer, const float* x,
   if (raw_only && used > 32)
     throw std::invalid_argument("EXL3 raw prefill takes at most 32 experts");
   if (raw_only)
-    hipLaunchKernelGGL(
-        RotateGateUpTokens, dim3((g.cols / 128 + 7) / 8, assignments / used),
-        dim3(256), 0, stream, g.device_exl3, u.device_exl3, x, scratch.input,
-        up_input, ids, scratch.inverse, g.cols, used);
+    Exl3RotateGateUpTokens(g.device_exl3, u.device_exl3, x, scratch.input,
+                           up_input, ids, scratch.inverse, rows, g.cols, used,
+                           stream);
   else
     hipLaunchKernelGGL(RotateGateUpBuckets, dim3(g.cols / 128, assignments),
                        dim3(32), 0, stream, g.device_exl3, u.device_exl3, x,
@@ -1718,16 +1768,14 @@ void PrefillExperts(const DeviceLayer& layer, const float* x,
     PrefillSnapshot(trace->up_inner, scratch.up,
                     std::size_t{assignments} * u.rows * sizeof(float), stream);
   if (raw_only) {
-    if (d.cols % 128 != 0 || d.cols > 4096)
-      throw std::invalid_argument("EXL3 prefill down width unsupported");
     // Activation, down-input rotation and the down rows' power-of-two
     // scaling in one pass (Exl3PrefillDown skips ScaleDownRows for it).
-    hipLaunchKernelGGL(RestoreActivateScaleBuckets, dim3(assignments),
-                       dim3(32 * (d.cols / 128)), 0, stream, g.device_exl3,
-                       u.device_exl3, d.device_exl3, scratch.offsets, d.experts,
-                       reinterpret_cast<const _Float16*>(scratch.gate),
-                       reinterpret_cast<const _Float16*>(scratch.up),
-                       scratch.input, scratch.down_exponents, d.cols);
+    Exl3RestoreActivateScale(
+        g.device_exl3, u.device_exl3, d.device_exl3, scratch.offsets, d.experts,
+        reinterpret_cast<const std::uint16_t*>(scratch.gate),
+        reinterpret_cast<const std::uint16_t*>(scratch.up), scratch.input,
+        scratch.down_exponents, static_cast<std::uint32_t>(assignments), d.cols,
+        stream);
   } else
     hipLaunchKernelGGL(
         RestoreActivateRotateBuckets<float>, dim3(d.cols / 128, assignments),
