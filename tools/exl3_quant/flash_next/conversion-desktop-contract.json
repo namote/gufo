@@ -1,0 +1,1245 @@
+{
+  "purpose": "conversion_desktop_graphics_only",
+  "boot_id": "58a99b2f-419f-4809-9ec1-c19f74fc40db",
+  "pdev": "0000:c6:00.0",
+  "clients": [
+    {
+      "proc": {
+        "PID": 1,
+        "comm": "systemd",
+        "starttime_ticks": 21,
+        "cgroup": "0::/init.scope",
+        "PGID": 1,
+        "UIDs": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "exe": "/usr/lib/systemd/systemd",
+        "exe_stat": [
+          66306,
+          46429016,
+          141776,
+          1785185042000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "20",
+      "device": "/dev/dri/card1",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 1307,
+        "comm": "systemd-logind",
+        "starttime_ticks": 685,
+        "cgroup": "0::/system.slice/systemd-logind.service",
+        "PGID": 1307,
+        "UIDs": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "exe": "/usr/lib/systemd/systemd-logind",
+        "exe_stat": [
+          66306,
+          46429032,
+          338512,
+          1785185042000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "20",
+      "device": "/dev/dri/card1",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 3289,
+        "comm": "kwin_wayland",
+        "starttime_ticks": 1418,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/session.slice/plasma-kwin_wayland.service",
+        "PGID": 3279,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/bin/kwin_wayland",
+        "exe_stat": [
+          66306,
+          46400602,
+          1489832,
+          1783936449000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "20",
+      "device": "/dev/dri/card1",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": true
+    },
+    {
+      "proc": {
+        "PID": 3289,
+        "comm": "kwin_wayland",
+        "starttime_ticks": 1418,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/session.slice/plasma-kwin_wayland.service",
+        "PGID": 3279,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/bin/kwin_wayland",
+        "exe_stat": [
+          66306,
+          46400602,
+          1489832,
+          1783936449000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "21",
+      "device": "/dev/dri/card1",
+      "pdev": "0000:c6:00.0",
+      "engines": {
+        "gfx": 2114563489140,
+        "compute": 244629385
+      },
+      "allow_gfx": true
+    },
+    {
+      "proc": {
+        "PID": 3352,
+        "comm": "Xwayland",
+        "starttime_ticks": 1484,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/session.slice/plasma-kwin_wayland.service",
+        "PGID": 3279,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/bin/Xwayland",
+        "exe_stat": [
+          66306,
+          46399932,
+          2410256,
+          1776176172000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "23",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {
+        "gfx": 109200124,
+        "compute": 1136665
+      },
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 3352,
+        "comm": "Xwayland",
+        "starttime_ticks": 1484,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/session.slice/plasma-kwin_wayland.service",
+        "PGID": 3279,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/bin/Xwayland",
+        "exe_stat": [
+          66306,
+          46399932,
+          2410256,
+          1776176172000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "25",
+      "device": "/dev/dri/card1",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 3428,
+        "comm": "ksmserver",
+        "starttime_ticks": 1496,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/session.slice/plasma-ksmserver.service",
+        "PGID": 3428,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/bin/ksmserver",
+        "exe_stat": [
+          66306,
+          46400577,
+          200368,
+          1783936481000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "27",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {
+        "compute": 43186
+      },
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 3430,
+        "comm": "kded6",
+        "starttime_ticks": 1496,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/session.slice/plasma-kded6.service",
+        "PGID": 3430,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/bin/kded6",
+        "exe_stat": [
+          66306,
+          46400539,
+          105488,
+          1773356561000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "26",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 3479,
+        "comm": "plasmashell",
+        "starttime_ticks": 1508,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/session.slice/plasma-plasmashell.service",
+        "PGID": 3479,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/bin/plasmashell",
+        "exe_stat": [
+          66306,
+          46400873,
+          1121488,
+          1783936481000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "28",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {
+        "gfx": 60064098628,
+        "compute": 224960643
+      },
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 3544,
+        "comm": "kaccess",
+        "starttime_ticks": 1517,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/background.slice/plasma-kaccess.service",
+        "PGID": 3544,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/bin/kaccess",
+        "exe_stat": [
+          66306,
+          46400506,
+          138672,
+          1783936461000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "30",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {
+        "compute": 11968
+      },
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 3545,
+        "comm": "polkit-kde-auth",
+        "starttime_ticks": 1517,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/background.slice/plasma-polkit-agent.service",
+        "PGID": 3545,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/lib/x86_64-linux-gnu/libexec/polkit-kde-authentication-agent-1",
+        "exe_stat": [
+          66306,
+          46539300,
+          110352,
+          1775563948000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "29",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 3675,
+        "comm": "kdeconnectd",
+        "starttime_ticks": 1532,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.kde.kdeconnect.daemon@autostart.service",
+        "PGID": 3675,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/bin/kdeconnectd",
+        "exe_stat": [
+          66306,
+          46400536,
+          64168,
+          1772718529000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "31",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 3693,
+        "comm": "DiscoverNotifie",
+        "starttime_ticks": 1532,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.kde.discover.notifier@autostart.service",
+        "PGID": 3693,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/lib/x86_64-linux-gnu/libexec/DiscoverNotifier",
+        "exe_stat": [
+          66306,
+          46539261,
+          151864,
+          1783936417000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "32",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 3898,
+        "comm": "xdg-desktop-por",
+        "starttime_ticks": 1547,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/session.slice/plasma-xdg-desktop-portal-kde.service",
+        "PGID": 3898,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/lib/x86_64-linux-gnu/libexec/xdg-desktop-portal-kde",
+        "exe_stat": [
+          66306,
+          46539302,
+          1963248,
+          1783936498000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "40",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 4049,
+        "comm": "ksecretd",
+        "starttime_ticks": 1558,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/session.slice/dbus.service",
+        "PGID": 2793,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/bin/ksecretd",
+        "exe_stat": [
+          66306,
+          46400576,
+          604792,
+          1773356743000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "42",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 4170,
+        "comm": "fcitx5-plasma-t",
+        "starttime_ticks": 1583,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/session.slice/dbus.service",
+        "PGID": 2793,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/bin/fcitx5-plasma-theme-generator",
+        "exe_stat": [
+          66306,
+          46402736,
+          80664,
+          1773791125000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "45",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 4677,
+        "comm": "kwalletd6",
+        "starttime_ticks": 1731,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/session.slice/dbus.service",
+        "PGID": 2793,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/bin/kwalletd6",
+        "exe_stat": [
+          66306,
+          46400600,
+          232744,
+          1773356743000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "51",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 5115,
+        "comm": "sunshine",
+        "starttime_ticks": 2060,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-dev.lizardbyte.app.Sunshine.service",
+        "PGID": 5115,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/bin/sunshine",
+        "exe_stat": [
+          66306,
+          46400944,
+          31293272,
+          1789430453000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "94",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {
+        "compute": 15071012532,
+        "enc": 119909648209
+      },
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 385035,
+        "comm": "dolphin",
+        "starttime_ticks": 138278294,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.kde.dolphin@d32d1ba3d2f140c78362e5d31ce43dcd.service",
+        "PGID": 385035,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/bin/dolphin",
+        "exe_stat": [
+          66306,
+          46400131,
+          1477672,
+          1772718239000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "17510",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 415125,
+        "comm": "chrome",
+        "starttime_ticks": 140654746,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-com.google.Chrome-415125.scope",
+        "PGID": 415125,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/opt/google/chrome/chrome",
+        "exe_stat": [
+          66306,
+          50856218,
+          297798984,
+          1791245218000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "17546",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 415125,
+        "comm": "chrome",
+        "starttime_ticks": 140654746,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-com.google.Chrome-415125.scope",
+        "PGID": 415125,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/opt/google/chrome/chrome",
+        "exe_stat": [
+          66306,
+          50856218,
+          297798984,
+          1791245218000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "17548",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 415198,
+        "comm": "chrome",
+        "starttime_ticks": 140654800,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-google\\x2dchrome@9f375699580b41c892986530e5a3b2e8.service",
+        "PGID": 415125,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/opt/google/chrome/chrome",
+        "exe_stat": [
+          66306,
+          50856218,
+          297798984,
+          1791245218000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "17549",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {
+        "gfx": 11215393780203,
+        "compute": 10521610
+      },
+      "allow_gfx": true
+    },
+    {
+      "proc": {
+        "PID": 415198,
+        "comm": "chrome",
+        "starttime_ticks": 140654800,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-google\\x2dchrome@9f375699580b41c892986530e5a3b2e8.service",
+        "PGID": 415125,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/opt/google/chrome/chrome",
+        "exe_stat": [
+          66306,
+          50856218,
+          297798984,
+          1791245218000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "17550",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": true
+    },
+    {
+      "proc": {
+        "PID": 1958325,
+        "comm": "drkonqi-coredum",
+        "starttime_ticks": 24999848,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/drkonqi-coredump-launcher@115-20485-1958286_1985860-0.service",
+        "PGID": 1958325,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/lib/x86_64-linux-gnu/libexec/drkonqi-coredump-launcher",
+        "exe_stat": [
+          66306,
+          46539266,
+          101256,
+          1783936421000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "4756",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 1958379,
+        "comm": "drkonqi-coredum",
+        "starttime_ticks": 24999853,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/drkonqi-coredump-launcher@116-40966-1958315_1883686-0.service",
+        "PGID": 1958379,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/lib/x86_64-linux-gnu/libexec/drkonqi-coredump-launcher",
+        "exe_stat": [
+          66306,
+          46539266,
+          101256,
+          1783936421000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "4758",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 1958438,
+        "comm": "drkonqi-coredum",
+        "starttime_ticks": 24999860,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/drkonqi-coredump-launcher@117-81921-1958249_1883683-0.service",
+        "PGID": 1958438,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/lib/x86_64-linux-gnu/libexec/drkonqi-coredump-launcher",
+        "exe_stat": [
+          66306,
+          46539266,
+          101256,
+          1783936421000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "4757",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 1958443,
+        "comm": "drkonqi-coredum",
+        "starttime_ticks": 24999861,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/drkonqi-coredump-launcher@118-86017-1958421_1642098-0.service",
+        "PGID": 1958443,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/lib/x86_64-linux-gnu/libexec/drkonqi-coredump-launcher",
+        "exe_stat": [
+          66306,
+          46539266,
+          101256,
+          1783936421000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "4759",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 1958491,
+        "comm": "drkonqi-coredum",
+        "starttime_ticks": 24999872,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/drkonqi-coredump-launcher@119-73730-1958458_1891509-0.service",
+        "PGID": 1958491,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/lib/x86_64-linux-gnu/libexec/drkonqi-coredump-launcher",
+        "exe_stat": [
+          66306,
+          46539266,
+          101256,
+          1783936421000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "4761",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 1958521,
+        "comm": "drkonqi-coredum",
+        "starttime_ticks": 24999883,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/drkonqi-coredump-launcher@120-73731-1958501_1995852-0.service",
+        "PGID": 1958521,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/lib/x86_64-linux-gnu/libexec/drkonqi-coredump-launcher",
+        "exe_stat": [
+          66306,
+          46539266,
+          101256,
+          1783936421000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "4760",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 1958681,
+        "comm": "drkonqi-coredum",
+        "starttime_ticks": 24999896,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/drkonqi-coredump-launcher@121-90113-1958536_1975971-0.service",
+        "PGID": 1958681,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/lib/x86_64-linux-gnu/libexec/drkonqi-coredump-launcher",
+        "exe_stat": [
+          66306,
+          46539266,
+          101256,
+          1783936421000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "4762",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 1958772,
+        "comm": "drkonqi-coredum",
+        "starttime_ticks": 24999908,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/drkonqi-coredump-launcher@122-98305-1958747_1886707-0.service",
+        "PGID": 1958772,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/lib/x86_64-linux-gnu/libexec/drkonqi-coredump-launcher",
+        "exe_stat": [
+          66306,
+          46539266,
+          101256,
+          1783936421000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "4763",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 1958853,
+        "comm": "drkonqi-coredum",
+        "starttime_ticks": 24999920,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/drkonqi-coredump-launcher@123-90114-1958790_1523500-0.service",
+        "PGID": 1958853,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/lib/x86_64-linux-gnu/libexec/drkonqi-coredump-launcher",
+        "exe_stat": [
+          66306,
+          46539266,
+          101256,
+          1783936421000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "4764",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 1958977,
+        "comm": "drkonqi-coredum",
+        "starttime_ticks": 24999933,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/drkonqi-coredump-launcher@124-90116-1958891_2003002-0.service",
+        "PGID": 1958977,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/lib/x86_64-linux-gnu/libexec/drkonqi-coredump-launcher",
+        "exe_stat": [
+          66306,
+          46539266,
+          101256,
+          1783936421000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "4765",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 1959024,
+        "comm": "drkonqi-coredum",
+        "starttime_ticks": 24999943,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/drkonqi-coredump-launcher@125-57349-1958987_1858494-0.service",
+        "PGID": 1959024,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/lib/x86_64-linux-gnu/libexec/drkonqi-coredump-launcher",
+        "exe_stat": [
+          66306,
+          46539266,
+          101256,
+          1783936421000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "4766",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 1959142,
+        "comm": "drkonqi-coredum",
+        "starttime_ticks": 24999961,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/drkonqi-coredump-launcher@126-16401-1959075_1967135-0.service",
+        "PGID": 1959142,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/lib/x86_64-linux-gnu/libexec/drkonqi-coredump-launcher",
+        "exe_stat": [
+          66306,
+          46539266,
+          101256,
+          1783936421000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "4767",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 1959206,
+        "comm": "drkonqi-coredum",
+        "starttime_ticks": 24999971,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/drkonqi-coredump-launcher@127-28692-1959165_1866931-0.service",
+        "PGID": 1959206,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/lib/x86_64-linux-gnu/libexec/drkonqi-coredump-launcher",
+        "exe_stat": [
+          66306,
+          46539266,
+          101256,
+          1783936421000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "4768",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 1959257,
+        "comm": "drkonqi-coredum",
+        "starttime_ticks": 24999978,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/drkonqi-coredump-launcher@128-4099-1959233_1971658-0.service",
+        "PGID": 1959257,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/lib/x86_64-linux-gnu/libexec/drkonqi-coredump-launcher",
+        "exe_stat": [
+          66306,
+          46539266,
+          101256,
+          1783936421000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "4769",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 1959422,
+        "comm": "drkonqi-coredum",
+        "starttime_ticks": 24999985,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/drkonqi-coredump-launcher@129-57351-1959408_1961308-0.service",
+        "PGID": 1959422,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/lib/x86_64-linux-gnu/libexec/drkonqi-coredump-launcher",
+        "exe_stat": [
+          66306,
+          46539266,
+          101256,
+          1783936421000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "4770",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    },
+    {
+      "proc": {
+        "PID": 1959863,
+        "comm": "drkonqi-coredum",
+        "starttime_ticks": 24999994,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/drkonqi-coredump-launcher@130-102402-1959518_1686265-0.service",
+        "PGID": 1959863,
+        "UIDs": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "exe": "/usr/lib/x86_64-linux-gnu/libexec/drkonqi-coredump-launcher",
+        "exe_stat": [
+          66306,
+          46539266,
+          101256,
+          1783936421000000000,
+          0,
+          33261
+        ]
+      },
+      "client": "4771",
+      "device": "/dev/dri/renderD128",
+      "pdev": "0000:c6:00.0",
+      "engines": {},
+      "allow_gfx": false
+    }
+  ],
+  "reviewed_active_processes": [
+    {
+      "pid": 3289,
+      "args": [
+        "/usr/bin/kwin_wayland",
+        "--wayland-fd",
+        "7",
+        "--socket",
+        "wayland-0",
+        "--xwayland-fd",
+        "8",
+        "--xwayland-fd",
+        "9",
+        "--xwayland-display",
+        ":0",
+        "--xwayland-xauthority",
+        "/run/user/1000/xauth_ZqURfz",
+        "--xwayland"
+      ]
+    },
+    {
+      "pid": 3289,
+      "args": [
+        "/usr/bin/kwin_wayland",
+        "--wayland-fd",
+        "7",
+        "--socket",
+        "wayland-0",
+        "--xwayland-fd",
+        "8",
+        "--xwayland-fd",
+        "9",
+        "--xwayland-display",
+        ":0",
+        "--xwayland-xauthority",
+        "/run/user/1000/xauth_ZqURfz",
+        "--xwayland"
+      ]
+    },
+    {
+      "pid": 415198,
+      "args": [
+        "/opt/google/chrome/chrome",
+        "--type=gpu-process",
+        "--gpu-recent-crash-count=0",
+        "--ozone-platform=wayland",
+        "--render-node-override=/dev/dri/renderD128",
+        "--use-angle=gl",
+        "--disable_vaapi=0",
+        "--crashpad-handler-pid=415132",
+        "--enable-crash-reporter=,",
+        "--change-stack-guard-on-fork=enable",
+        "--gpu-preferences=YAAAAAAAAAAgAQAEAAAAAAAAAAAAAGAASAAAAAAAAAABAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAAAAMAAAAAAAAAAwAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAMAAAAAQAAAAAAAAAAAAAACAAAAAAAAAAIAAAAAAAAAA==",
+        "--use-gl=angle",
+        "--shared-files",
+        "--metrics-shmem-handle=4,i,14443407697602624243,7400807808678399181,262144",
+        "--field-trial-handle=3,i,11896322522352426676,12588751339745690533,262144",
+        "--enable-features=AcceleratedVideoDecodeLinuxGL,AcceleratedVideoDecoder,VaapiIgnoreDriverChecks",
+        "--variations-seed-version=20261102-010039.819000-production",
+        "--pseudonymization-salt-handle=7,i,7226146364056188397,9337582087439184895,4",
+        "--trace-process-track-uuid=3190708988185955192"
+      ]
+    },
+    {
+      "pid": 415198,
+      "args": [
+        "/opt/google/chrome/chrome",
+        "--type=gpu-process",
+        "--gpu-recent-crash-count=0",
+        "--ozone-platform=wayland",
+        "--render-node-override=/dev/dri/renderD128",
+        "--use-angle=gl",
+        "--disable_vaapi=0",
+        "--crashpad-handler-pid=415132",
+        "--enable-crash-reporter=,",
+        "--change-stack-guard-on-fork=enable",
+        "--gpu-preferences=YAAAAAAAAAAgAQAEAAAAAAAAAAAAAGAASAAAAAAAAAABAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAAAAMAAAAAAAAAAwAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAMAAAAAQAAAAAAAAAAAAAACAAAAAAAAAAIAAAAAAAAAA==",
+        "--use-gl=angle",
+        "--shared-files",
+        "--metrics-shmem-handle=4,i,14443407697602624243,7400807808678399181,262144",
+        "--field-trial-handle=3,i,11896322522352426676,12588751339745690533,262144",
+        "--enable-features=AcceleratedVideoDecodeLinuxGL,AcceleratedVideoDecoder,VaapiIgnoreDriverChecks",
+        "--variations-seed-version=20261102-010039.819000-production",
+        "--pseudonymization-salt-handle=7,i,7226146364056188397,9337582087439184895,4",
+        "--trace-process-track-uuid=3190708988185955192"
+      ]
+    }
+  ]
+}

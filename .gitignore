@@ -84,6 +84,9 @@ test-results/
 /artifacts/
 /models
 *.safetensors
+# The c02/c03 Flash-Next calibration token ids (~8 MB each) are retained so the
+# shipped pack stays reproducible.
+!/tools/exl3_quant/flash_next/c0[23]-input-ids.safetensors
 *.gguf
 *.ckpt
 pytorch_model*.bin

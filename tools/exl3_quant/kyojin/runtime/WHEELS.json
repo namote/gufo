@@ -1,0 +1,104 @@
+[
+  {
+    "name": "networkx-3.6.1-py3-none-any.whl",
+    "sha256": "d47fbf302e7d9cbbb9e2555a0d267983d2aa476bac30e90dfbe5669bd57f3762",
+    "bytes": 2068504,
+    "unpacked_bytes": 7038619
+  },
+  {
+    "name": "rocm_sdk_device_gfx1151-10.1.0a20260822-py3-none-linux_x86_64.whl",
+    "sha256": "36a68809080d3bb0640f57de070a35af7a5f2deaae505e7c1cae75712aa5654e",
+    "bytes": 178489548,
+    "unpacked_bytes": 462804704
+  },
+  {
+    "name": "jinja2-3.1.6-py3-none-any.whl",
+    "sha256": "85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67",
+    "bytes": 134899,
+    "unpacked_bytes": 496892
+  },
+  {
+    "name": "amd_torch_device_gfx1151-2.14.0+rocm10.1.0a20260822-cp312-cp312-linux_x86_64.whl",
+    "sha256": "611e758836bb44b4265ac3ae5432fa1014af52fae37cb2b371c37227662e2a98",
+    "bytes": 50206425,
+    "unpacked_bytes": 50411112
+  },
+  {
+    "name": "rocm_sdk_devel-10.1.0a20260822-py3-none-linux_x86_64.whl",
+    "sha256": "56e218658527558a213514e82f733ad492d03f6cdc5c6f667fc7ba0f8c5ec8af",
+    "bytes": 611337392,
+    "unpacked_bytes": 2957793377
+  },
+  {
+    "name": "rocm-10.1.0a20260822.tar.gz",
+    "sha256": "a716097245003c1de6531e495be9ad1948feacfff9c606c7b80659d6a26569cc",
+    "bytes": 27362,
+    "unpacked_bytes": 0
+  },
+  {
+    "name": "fsspec-2026.4.0-py3-none-any.whl",
+    "sha256": "11ef7bb35dab8a394fde6e608221d5cf3e8499401c249bebaeaad760a1a8dec2",
+    "bytes": 203402,
+    "unpacked_bytes": 740590
+  },
+  {
+    "name": "sympy-1.14.0-py3-none-any.whl",
+    "sha256": "e091cc3e99d2141a0ba2847328f5479b05d94a6635cb96148ccb3f34671bd8f5",
+    "bytes": 6299353,
+    "unpacked_bytes": 26841861
+  },
+  {
+    "name": "filelock-3.29.1-py3-none-any.whl",
+    "sha256": "85199dfd706869641b72b2e8955d5416a4b2b7dc4b0e8e6d97b4cc1299a6983b",
+    "bytes": 40750,
+    "unpacked_bytes": 132897
+  },
+  {
+    "name": "typing_extensions-4.15.0-py3-none-any.whl",
+    "sha256": "f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548",
+    "bytes": 44614,
+    "unpacked_bytes": 178133
+  },
+  {
+    "name": "setuptools-82.0.1-py3-none-any.whl",
+    "sha256": "a59e362652f08dcd477c78bb6e7bd9d80a7995bc73ce773050228a348ce2e5bb",
+    "bytes": 1006223,
+    "unpacked_bytes": 3462889
+  },
+  {
+    "name": "rocm_bootstrap-0.1.0-py3-none-any.whl",
+    "sha256": "33e3d4dad086b1f0e06bc049a618ca874d4fb72f758fff00676e23d2a644b652",
+    "bytes": 27015,
+    "unpacked_bytes": 98050
+  },
+  {
+    "name": "triton-3.8.0+git675c5987.rocm10.1.0a20260822-cp312-cp312-linux_x86_64.whl",
+    "sha256": "421919d0d0fb609b27fc1a3be12e09b49a1d2219a4d36ea51cbce20c20da691b",
+    "bytes": 427919583,
+    "unpacked_bytes": 1429404729
+  },
+  {
+    "name": "torch-2.14.0+rocm10.1.0a20260822-cp312-cp312-linux_x86_64.whl",
+    "sha256": "7e6b84714b541cca6dfb33ed00dec23ff4ea587d9d26c0807a2d55875b13641f",
+    "bytes": 213077792,
+    "unpacked_bytes": 917164339
+  },
+  {
+    "name": "amd_torch_device_gfx115x-2.14.0+rocm10.1.0a20260822-cp312-cp312-linux_x86_64.whl",
+    "sha256": "447c63ec9fe8630bf1205e207e1b48aea235240b3bde3c374b0879b4d7a81e32",
+    "bytes": 187801052,
+    "unpacked_bytes": 187958145
+  },
+  {
+    "name": "rocm_sdk_core-10.1.0a20260822-py3-none-linux_x86_64.whl",
+    "sha256": "cf376d3465cffd0c755a1e1ec08324c519eaf3d79c56778ffede1f6a7a2a5729",
+    "bytes": 416591253,
+    "unpacked_bytes": 1489610093
+  },
+  {
+    "name": "rocm_sdk_libraries-10.1.0a20260822-py3-none-linux_x86_64.whl",
+    "sha256": "61f0b7ac01b1d0557b6caf261d5a2516ac1dce796047f2088ca12ec771d7d8c2",
+    "bytes": 270346334,
+    "unpacked_bytes": 1728711700
+  }
+]

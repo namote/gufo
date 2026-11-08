@@ -1,0 +1,15 @@
+{
+  "status": "reviewed_main_only_skip_compile",
+  "skip_side_models": true,
+  "compile_separately": true,
+  "main_modules": 53,
+  "allowed_indices": [
+    51,
+    52
+  ],
+  "converter_sha256": "a944bd3e8237fe52d15b1683b59f018a5ca01a588cb67bb8cc75420462c1d574",
+  "supervisor_sha256": "cf14fc063c69f78a57d073daa579862a8d21fe94c2000611d9ac24371c833875",
+  "disk_boundary_sha256": "f7f7dfce561033c5c7c06f152ae57b398185cab46917fd70c19e9c86f1dd3231",
+  "calibration_sha256": "36c8eddb18c51c3b9788d73195aa72527d9b9d48f818b79a6f0ab251acfebf3d",
+  "scope": "Final main mixer/head only; postpone packed+20GiB compile allowance to separately admitted assembler.100GiB reserve+dynamicstate+16GiB margin unchanged."
+}

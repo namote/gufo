@@ -1,0 +1,173 @@
+"""At a natural module boundary, compare the actual converter capture loop before selecting rollback or retention.
+
+No running converter/code is modified. Keep the existing checkpoint, take one
+bounded GPU window, then queue review/resumption in the already authorized chat.
+"""
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import time
+import uuid
+from run_stage import OUT, TASK, LOCK, available, save
+from owned_cleanup import cleanup_owned
+from row_checkpoint import open_rows
+from test.experiments.gufo_upstream_port_20261023.window import host, npu, quiet
+
+root = OUT / 'capture-lt-chunk'
+root.mkdir(exist_ok=True)
+owner = (root / 'OWNER.lock').open('a')
+fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+assert not (root / 'STATE.json').exists(), 'Retain and inspect an existing attempt before rerunning'
+state = dict(status='waiting_boundary', started=time.time(), pid=os.getpid())
+save(root / 'STATE.json', state)
+
+
+def stopped(signum, frame):
+    raise KeyboardInterrupt(f'signal {signum}')
+
+
+def digest_file(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        while chunk := stream.read(4*2**20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+signal.signal(signal.SIGTERM, stopped)
+try:
+    with LOCK.open('a') as gpu_lock:
+        fcntl.flock(gpu_lock, fcntl.LOCK_EX)
+        with (OUT / 'model-job-c03/JOB.lock').open('a') as job_lock:
+            until = time.monotonic()+180
+            while True:
+                try:
+                    fcntl.flock(job_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    assert time.monotonic() < until
+                    time.sleep(1)
+            assert json.loads((OUT / 'WATCH-CONTROL.json').read_text())['enabled']
+            cpu=json.loads((root/'CPU.json').read_text())
+            assert cpu['status']=='pass' and cpu['gpu_used'] is False
+            for path,digest in cpu['identity'].items():
+                assert hashlib.sha256(Path(path).read_bytes()).hexdigest()==digest,path
+            evaluated=json.loads((OUT/'capture-lt-evaluate/STATE.json').read_text())
+            assert evaluated['status']=='completed_pending_review' and not evaluated['cleanup_errors'] and not evaluated['returned_KFD_contexts']
+            assert json.loads((OUT/'capture-lt-quality/REVIEW.json').read_text())['status']=='reviewed_prefer_original_f16_lt_for_next_integration_qualification'
+            arithmetic=json.loads((OUT/'capture-lt-pipeline/ARITHMETIC-CPU.json').read_text())
+            assert arithmetic['status']=='pass' and all(x['exact'] for x in arithmetic['checks'])
+            assert arithmetic['candidate_sha256']==hashlib.sha256((TASK/'capture_lt.py').read_bytes()).hexdigest()
+            cache=json.loads((OUT/'capture-lt-pipeline/CACHE-CPU.json').read_text())
+            assert cache['status']=='pass' and cache['helper_sha256']==arithmetic['candidate_sha256']
+            warm=json.loads((OUT/'capture-lt-prefix/STATE.json').read_text())
+            assert warm['status']=='completed_pending_review' and warm['cleanup_errors']==[] and warm['returned_KFD_contexts']==[]
+            failed=json.loads((OUT/'capture-lt-pipeline/STATE.json').read_text())
+            assert failed['status']=='failed' and failed['cleanup_errors']==[] and failed['returned_KFD_contexts']==[]
+            failure=json.loads((OUT/'capture-lt-pipeline/FAILURE.json').read_text())
+            assert failure['error']=="AssertionError('capture.ref_states.0')" and failure['mode']=='f32'
+            previous_lt=json.loads((OUT/'capture-lt/STATE.json').read_text())
+            assert previous_lt['cleanup_errors']==[] and previous_lt['returned_KFD_contexts']==[]
+            assert json.loads((OUT/'capture-lt/REVIEW.json').read_text())['status']=='reviewed_proceed_bounded_cache_then_real_capture_loop'
+            prior=json.loads((OUT/'capture-profile-quarter/STATE.json').read_text())
+            assert prior['status']=='completed_pending_review' and not prior['cleanup_errors'] and not prior['returned_KFD_contexts']
+            assert json.loads((OUT/'capture-profile-quarter/quarter/SUMMARY.json').read_text())['status']=='quarter_projection_screen_complete'
+            prior_subset=json.loads((OUT/'capture-subset/STATE.json').read_text())
+            assert prior_subset['cleanup_errors']==[] and prior_subset['returned_KFD_contexts']==[]
+            previous=OUT/'model-job-c03/module-012'
+            assert previous==max((OUT/'model-job-c03').glob('module-[0-9]*'))
+            receipt=json.loads((previous/'STATE.json').read_text())
+            assert receipt['error']=="KeyboardInterrupt('signal 15')"
+            assert receipt['cleanup_errors']==[] and receipt['returned_KFD_contexts']==[]
+            stop=json.loads((OUT/'capture-quarter/STOP-FOR-DIAGNOSTIC.json').read_text())
+            assert stop['status']=='stopped_verified'
+            assert json.loads((OUT/'work/ckpt/job.json').read_text())==stop['checkpoint']
+            frozen = json.loads((OUT / 'model-job-c03/FROZEN.json').read_text())
+            for path, digest in frozen.items():
+                assert hashlib.sha256(Path(path).read_bytes()).hexdigest() == digest, path
+            ngram_frozen = json.loads((OUT / 'ngram-full/FROZEN.json').read_text())
+            for path, digest in ngram_frozen['code'].items():
+                assert hashlib.sha256(Path(path).read_bytes()).hexdigest() == digest, path
+            stat = Path(ngram_frozen['native']).stat()
+            assert [stat.st_size, stat.st_mtime_ns, stat.st_ino] == ngram_frozen['native_stat']
+            inventory = json.loads((OUT / 'source-inventory.json').read_text())
+            for entry in inventory['files']:
+                stat = (Path(inventory['source']) / entry['name']).stat()
+                assert (stat.st_size, stat.st_mtime_ns) == (entry['bytes'], entry['mtime_ns'])
+            for _ in range(30):
+                h = host()
+                assert h['KFD_contexts'] == [], 'Do not interrupt another GPU owner'
+                if quiet(h):
+                    break
+                time.sleep(2)
+            assert quiet(h) and not npu()
+            assert available() >= 28*2**30 and shutil.disk_usage(OUT).free >= 150*2**30
+            window_started = time.time()
+            # Reuse the retained failed run's private fixture; hashes checked by probe.
+            assert available() >= 28*2**30 and shutil.disk_usage(OUT).free >= 150*2**30
+            h = host()
+            assert quiet(h) and not npu(), 'Fresh GPU admission after fixture preparation'
+            name, label = 'gufo-capture-lt-chunk', uuid.uuid4().hex
+            assert subprocess.run(['docker', 'inspect', name], capture_output=True).returncode != 0
+            command = receipt['command'].copy()
+            command[command.index('--name')+1] = name
+            command[command.index('--label')+1] = 'gufo.quant.run='+label
+            assert command[-1] == '/task/convert_main.py'
+            command[-1] = '/task/capture_lt_chunk_probe.py'
+            # This diagnostic may read production inputs, never write checkpoints/pack.
+            index = command.index('--workdir')
+            command[index:index] = [
+                '--mount', f'type=bind,src={OUT / "capture-profile-quarter"},dst=/output/capture-profile-quarter,readonly',
+                '--mount', f'type=bind,src={OUT / "capture-lt-evaluate"},dst=/output/capture-lt-evaluate,readonly',
+                '--mount', f'type=bind,src={OUT / "capture-gram"},dst=/output/capture-gram,readonly',
+                '--mount', f'type=bind,src={OUT / "work"},dst=/output/work,readonly',
+                '--mount', f'type=bind,src={OUT / "pack"},dst=/output/pack,readonly',
+                '--mount', f'type=bind,src={OUT / "capture-pipeline"},dst=/output/capture-pipeline,readonly',
+                '--mount', f'type=bind,src={OUT / "model-job-c03/repair-002-checkpoint"},dst=/output/model-job-c03/repair-002-checkpoint,readonly',
+                '--mount', f'type=bind,src={OUT / "capture-quarter"},dst=/output/capture-quarter,readonly',
+                '--mount', f'type=bind,src={OUT / "capture-speed"},dst=/output/capture-speed,readonly',
+                '--mount', f'type=bind,src={OUT / "capture-regression"},dst=/output/capture-regression,readonly',
+
+            ]
+            identity=cpu['identity']
+            state.update(status='running', admitted=window_started, command=command, identity=identity,
+                         hook_receipt_sha256=hashlib.sha256((root / 'CPU.json').read_bytes()).hexdigest(),
+                         previous_module=previous.name, frozen=frozen,
+                         checkpoint=json.loads((OUT / 'work/ckpt/job.json').read_text()),
+                         minimum_available_bytes=available())
+            save(root / 'STATE.json', state)
+            with (root / 'run.log').open('x') as log:
+                assert time.time()-window_started < 600, 'Diagnostic admission deadline'
+                child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
+                try:
+                    while child.poll() is None:
+                        mem = available()
+                        state['minimum_available_bytes'] = min(state['minimum_available_bytes'], mem)
+                        assert mem >= 8*2**30 and shutil.disk_usage(OUT).free >= 100*2**30
+                        assert time.time()-state['admitted'] < 600, 'Bounded diagnostic deadline'
+                        state['updated'] = time.time(); save(root / 'STATE.json', state)
+                        time.sleep(2)
+                    assert child.returncode == 0, f'Diagnostic exit {child.returncode}'
+                    assert json.loads((root / 'SUMMARY.json').read_text())['status'] == 'lt_chunk_comparison_complete'
+                    state['status'] = 'completed_pending_review'
+                except BaseException as error:
+                    state.update(status='failed', error=repr(error))
+                    raise
+                finally:
+                    state.update(cleanup_owned(name, label, child, host))
+                    if state['cleanup_errors'] or state['returned_KFD_contexts']:
+                        state['status'] = 'cleanup_failed'
+                    save(root / 'STATE.json', state)
+                    if state['status'] == 'cleanup_failed' and 'error' not in state:
+                        raise RuntimeError('Diagnostic cleanup failed')
+except BaseException as error:
+    state.update(status='failed', error=repr(error))
+    raise
+finally:
+    # The with-statements have released both leases before requesting review.
+    state['finished'] = time.time(); save(root / 'STATE.json', state)

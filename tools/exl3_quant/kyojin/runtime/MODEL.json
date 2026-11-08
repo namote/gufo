@@ -1,0 +1,268 @@
+{
+  "root": "/home/m2on/projects/ai.tools/storage/models/llm/flash-next-exl3-kyojin",
+  "files": [
+    {
+      "path": ".gitattributes",
+      "size": 2241,
+      "mtime_ns": 1793433194920000000,
+      "prior_hf_identity": "58e18c81eb4ff334207052a1e81c80a6652897bd"
+    },
+    {
+      "path": "LICENSE",
+      "size": 3235,
+      "mtime_ns": 1793433196170000000,
+      "prior_hf_identity": "9557a8961782792814714b7488346732c043793d"
+    },
+    {
+      "path": "README.md",
+      "size": 11726,
+      "mtime_ns": 1793433197640000000,
+      "prior_hf_identity": "fb5d4eb85d29d9ff3ac673f18dc9654be351c430"
+    },
+    {
+      "path": "assets/banner.png",
+      "size": 25188,
+      "mtime_ns": 1793433198770000000,
+      "prior_hf_identity": "f0421f0a81d24493ac32742c38de675bc961a206"
+    },
+    {
+      "path": "assets/datasheet-context.png",
+      "size": 95101,
+      "mtime_ns": 1793433199530000000,
+      "prior_hf_identity": "7b8bd307182961961630e1605e9e5e43cad79913"
+    },
+    {
+      "path": "assets/datasheet-fidelity.png",
+      "size": 109119,
+      "mtime_ns": 1793433202570000000,
+      "prior_hf_identity": "4aa107f0538ae603b29f8a3f5ee8c5810b399ca1c270b1307733817ed6aefc9d"
+    },
+    {
+      "path": "assets/datasheet-speed.png",
+      "size": 119286,
+      "mtime_ns": 1793433206590000000,
+      "prior_hf_identity": "b1ac0bf44839a793502675227429f6ce5cb104058995698990d31deaff350a77"
+    },
+    {
+      "path": "assets/datasheet-summary.png",
+      "size": 132704,
+      "mtime_ns": 1793433210470000000,
+      "prior_hf_identity": "4d726b5ff5538ec192caff57aa4ac513ddb4a89c19288d94df15550c45bd31cc"
+    },
+    {
+      "path": "assets/datasheet-uncensor.png",
+      "size": 120886,
+      "mtime_ns": 1793433207930000000,
+      "prior_hf_identity": "cf562b99c3f576edd8721294012e1c1bdf915ada2cc79879f3a800c7ca739805"
+    },
+    {
+      "path": "assets/img-context.png",
+      "size": 104978,
+      "mtime_ns": 1793433201290000000,
+      "prior_hf_identity": "cd15dab328f4080955220ba96b6a429da3162637fd8f72a5714b7e8bef153fdc"
+    },
+    {
+      "path": "assets/img-fidelity.png",
+      "size": 111763,
+      "mtime_ns": 1793433203910000000,
+      "prior_hf_identity": "32f4ec23a5af8a39b37ebeaeef46b1e98a50ad21bcf609d2b6664dc1eac0dbc6"
+    },
+    {
+      "path": "assets/img-speed.png",
+      "size": 99253,
+      "mtime_ns": 1793433199990000000,
+      "prior_hf_identity": "63da78fad0e0f5d3edb5ede8d10f63f2117d334e"
+    },
+    {
+      "path": "assets/img-summary.png",
+      "size": 115981,
+      "mtime_ns": 1793433205220000000,
+      "prior_hf_identity": "af62982b7166ef1cb0d198d4cd0280529a6ec3ff3a6fa1be78ffffac3df7bb2e"
+    },
+    {
+      "path": "assets/img-uncensor.png",
+      "size": 127806,
+      "mtime_ns": 1793433209210000000,
+      "prior_hf_identity": "acc9f98f5e5ab6211ce9cf186a249aacca860e1204c82fe65b723ce1a993d2ef"
+    },
+    {
+      "path": "chat_template.jinja",
+      "size": 8952,
+      "mtime_ns": 1793433196580000000,
+      "prior_hf_identity": "c0c686f9c38d70d179fb7b5f5aa7530bc913dda3"
+    },
+    {
+      "path": "config.json",
+      "size": 76690,
+      "mtime_ns": 1793433199060000000,
+      "prior_hf_identity": "40ecda09674442777ef907bdac8006a885b05733"
+    },
+    {
+      "path": "draft2s.st",
+      "size": 331430480,
+      "mtime_ns": 1793433266690000000,
+      "prior_hf_identity": "8c3871e0983cd71cb0ff7ce2d9abec7333d167e0fb98c9f1db9dd03e381d2d05"
+    },
+    {
+      "path": "generation_config.json",
+      "size": 202,
+      "mtime_ns": 1793433193610000000,
+      "prior_hf_identity": "023756cfadf88e5bf69eefeee3e172f38c448d64"
+    },
+    {
+      "path": "hc_gs_sidecar.safetensors",
+      "size": 633103152,
+      "mtime_ns": 1793433331910000000,
+      "prior_hf_identity": "473e7547adaad190788634556ce6b32614bdb280ccedadbed8789d39b59dcc8f"
+    },
+    {
+      "path": "merges.txt",
+      "size": 3353259,
+      "mtime_ns": 1793433211330000000,
+      "prior_hf_identity": "a494e019ca1502219fd0128658b979e5f05ae8e8"
+    },
+    {
+      "path": "model-00001-of-00009.safetensors",
+      "size": 7982890445,
+      "mtime_ns": 1793439512170000000,
+      "prior_hf_identity": "11eda3fa426080cc904eac3928f651beba51422f344028bc770fecc2b9ad360b"
+    },
+    {
+      "path": "model-00002-of-00009.safetensors",
+      "size": 7975746352,
+      "mtime_ns": 1793436660760000000,
+      "prior_hf_identity": "4bb4e820cd82f93d6dcc70eb8e3676973e1a73578817a4a54ef29d8c6ce2579f"
+    },
+    {
+      "path": "model-00003-of-00009.safetensors",
+      "size": 7971893306,
+      "mtime_ns": 1793434497540000000,
+      "prior_hf_identity": "21aa942bd1a5b6483012b2f406f8f893b5dd8bb4c0c3e1a26efbdaade67e0cc1"
+    },
+    {
+      "path": "model-00004-of-00009.safetensors",
+      "size": 7975777278,
+      "mtime_ns": 1793437367330000000,
+      "prior_hf_identity": "acd8ba699849b37bf9cb33e3c14fb4c6d41c1f3dcff754dab4165e7ad98d4bd3"
+    },
+    {
+      "path": "model-00005-of-00009.safetensors",
+      "size": 7971893306,
+      "mtime_ns": 1793435241710000000,
+      "prior_hf_identity": "f90df1fe9c25aa9f81caaffa59154419156925106dc0ec88dc916633ea4fce21"
+    },
+    {
+      "path": "model-00006-of-00009.safetensors",
+      "size": 7975777278,
+      "mtime_ns": 1793438075640000000,
+      "prior_hf_identity": "9f9be9ef87d99ef09ac3409775a1261b69916366e3eddf449e0b3480973ac96c"
+    },
+    {
+      "path": "model-00007-of-00009.safetensors",
+      "size": 7971893306,
+      "mtime_ns": 1793435954360000000,
+      "prior_hf_identity": "91ef60c71a16eed3bad887d8c8c38f2da676c79fdfc84b5779aabe752da3752a"
+    },
+    {
+      "path": "model-00008-of-00009.safetensors",
+      "size": 7975777278,
+      "mtime_ns": 1793438790440000000,
+      "prior_hf_identity": "55482c780b0c4ae3096ce9148692ae5e83eb9535940d4c27270fdcacbba8a714"
+    },
+    {
+      "path": "model-00009-of-00009.safetensors",
+      "size": 4211318336,
+      "mtime_ns": 1793433747640000000,
+      "prior_hf_identity": "450aa3456ebafadbdfdc1a206dd57f7675f7bdb1da1a110e1dc8b1bf4b8b6333"
+    },
+    {
+      "path": "model.safetensors.index.json",
+      "size": 32763270,
+      "mtime_ns": 1793433220530000000,
+      "prior_hf_identity": "116a5bcef45d12f553fcf5dfed064db85d000625ec91a4521e2380cd444400a7"
+    },
+    {
+      "path": "ngram_embedding.safetensors",
+      "size": 26240152672,
+      "mtime_ns": 1793442033760000000,
+      "prior_hf_identity": "da98840f7482e38c415efedd3959e6d9a277153608735b2849ac6e41fc177ca7"
+    },
+    {
+      "path": "preprocessor_config.json",
+      "size": 390,
+      "mtime_ns": 1793433194480000000,
+      "prior_hf_identity": "2ea84a437d448ff71b08df68fdd949d5cc4ebb64"
+    },
+    {
+      "path": "quantization_config.json",
+      "size": 96710895,
+      "mtime_ns": 1793433231500000000,
+      "prior_hf_identity": "b8399c13b8baca10c63f8e14a2954a78f856016962536dad01b5aca9b03b6c37"
+    },
+    {
+      "path": "tokenizer.json",
+      "size": 12809320,
+      "mtime_ns": 1793433215620000000,
+      "prior_hf_identity": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+    },
+    {
+      "path": "tokenizer_config.json",
+      "size": 17928,
+      "mtime_ns": 1793433198310000000,
+      "prior_hf_identity": "5de744b3fca2129d7186979ae47c06be33903243"
+    },
+    {
+      "path": "uncensor-preset/SHA256SUMS",
+      "size": 173,
+      "mtime_ns": 1793433192730000000,
+      "prior_hf_identity": "01291489ce278a1a0578fbcc617581d56c03f1c4"
+    },
+    {
+      "path": "uncensor-preset/uncensor_direction.st",
+      "size": 10312,
+      "mtime_ns": 1793433197000000000,
+      "prior_hf_identity": "ea941fd1d78cea0c345c07ccd0f0bb53528be9fb"
+    },
+    {
+      "path": "uncensor-preset/uncensor_spec.json",
+      "size": 2699,
+      "mtime_ns": 1793433195350000000,
+      "prior_hf_identity": "7e7fef5a6b699946bc3c925aea5d1ffb7d006621"
+    },
+    {
+      "path": "uncensor-think/SHA256SUMS",
+      "size": 173,
+      "mtime_ns": 1793433193160000000,
+      "prior_hf_identity": "cebcf59a58f7afe879f98433f8229a704ab18724"
+    },
+    {
+      "path": "uncensor-think/uncensor_direction.st",
+      "size": 10312,
+      "mtime_ns": 1793433197430000000,
+      "prior_hf_identity": "bb5cf29bc6b930073b981fa503513f7e8403712b"
+    },
+    {
+      "path": "uncensor-think/uncensor_spec.json",
+      "size": 2866,
+      "mtime_ns": 1793433195770000000,
+      "prior_hf_identity": "d996a93f4283bd29cb5beef21247c68ac2d62347"
+    },
+    {
+      "path": "video_preprocessor_config.json",
+      "size": 385,
+      "mtime_ns": 1793433194050000000,
+      "prior_hf_identity": "3ba673a5ad7d4d13f54155ecd38b2a94a6dac8fe"
+    },
+    {
+      "path": "vocab.json",
+      "size": 6722759,
+      "mtime_ns": 1793433212830000000,
+      "prior_hf_identity": "0aa0ce0658d60ac4a5d609f4eadb0e8e43514176"
+    }
+  ],
+  "verification_sha256": "8b7b14a92c8040baa7c69d1f9a31ff184431da39a7b3982d9b6a86cb2d0c5940",
+  "hf_tree_sha256": "12564fedf72672526e0b91013d45a7ff09f9ac6abfbb39519cc51dd75a9dd60c",
+  "full_payload_rehashed": false,
+  "copy_receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/kyojin-local-prepare/LOCAL-COPY.json",
+  "copy_sha256": "fc93f7de3998bfe1a171042f5dbe542c7414c80cdc1abe0f99e72055176ee231"
+}
