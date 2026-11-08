@@ -73,3 +73,25 @@ change directly. Report per item: expected ms at PP2048/PP8192 with reasoning,
 resources (VGPR/LDS/scratch), exactness or expected error, and the exact GPU
 tests/benches the final pass runs. Skip items whose analysis says they cannot
 pay; say why.
+
+## B6 addendum: P7 side-stream contention control (user chose to add it before the GPU pass)
+
+The prefill shared MLP runs on the side stream for 1970 ms at PP8192
+(1.6–4.7 TF) fully overlapped with the routed MoE GEMMs (23–27 TF); both
+compete for the same WGPs, LDS and VALU. Implement a prefill-only side stream
+policy so the final pass can choose by measurement:
+- **P7a stream priority:** the prefill shared-MLP stream created with a lower
+  priority (`hipStreamCreateWithPriority`) than the main stream.
+- **P7b CU mask:** a prefill-only side stream created with
+  `hipExtStreamCreateWithCUMask`, restricting the shared MLP to a subset of
+  CUs (keep the decode E7/J3 branch stream unchanged). gfx1151 runs WGP mode
+  (20 WGPs = 40 CUs); mask whole WGPs (CU pairs). Check how ROCr maps mask bits
+  to CUs/SEs on this chip (read the ROCr/HIP source in the Nix store) so a mask
+  spreads across shader engines.
+- Make the policy a single compile-time constant (no CLI option, no env var),
+  default = current behaviour, so the final pass builds variants: none, P7a,
+  P7b with 4, 8 and 12 CUs (and P7a+P7b-8 if cheap). Graph capture must still
+  work if prefill uses graphs; check that masked streams are compatible with
+  the existing event fork/join and with `hipStreamWaitEvent`.
+- Own commit(s); exact (scheduling only). Add a CPU-buildable check that the
+  stream is created and falls back cleanly if the call fails.
