@@ -672,15 +672,11 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
 /// route must not depend on how the tokens are chunked.
 ///
 /// `route_equality` runs only the fused-versus-separate comparison (CTest
-/// qwen38_flash_next.gdn_stable_route_equality). It is a known failure
-/// that predates the B-series work (also at f24b10ea): at n = 1 (the first
-/// failure stops the run, so larger n were not reached) a few outputs differ
-/// in the last ulps while the states are identical, which points at the
-/// output-only q scale and kq terms (unconfirmed). Production never pairs
-/// rollback rows with the row-split route; a fix would pin those terms in
-/// one of the two routes, either of which changes production prefill bits,
-/// so it needs a GPU pass. The default run skips this check so that the
-/// chunking, checkpoint and decode sections still run.
+/// qwen38_flash_next.gdn_stable_route_equality). Until B10 the fused route
+/// let fast-math sum its per-token k.q in w, y, z, x order, so a few outputs
+/// differed in the last ulps while states matched; both routes now share
+/// GdnKqLaneSums. The default run skips this check so that the chunking,
+/// checkpoint and decode sections still run.
 int RunStableCase(std::uint32_t kTokens, bool route_equality = false) {
   const std::size_t kQkvCount = static_cast<std::size_t>(kTokens) * kChannels;
   const std::size_t kStateCount =

@@ -166,6 +166,28 @@ __global__ void GdnPrepKernel(const float* conv_out, float* qn, float* kn,
   }
 }
 
+/// One lane's share of GdnPrepKqKernel's sums over a float4 of q and k:
+/// |q|^2, |k|^2 and k.q, each a product and then an FMA chain in x, y, z, w
+/// order (the sequence GdnPrepKqKernel compiled to under fast-math). Written
+/// out because GdnRowSplitKernel<true> recomputes the sums per token: left to
+/// fast-math there, k.q was summed w, y, z, x and the fused route's outputs
+/// differed from the separate route's in the last ulps.
+__device__ __forceinline__ void GdnKqLaneSums(float4 q, float4 k, float& qs,
+                                              float& ks, float& kq) {
+  qs = Materialize(q.x * q.x);
+  ks = Materialize(k.x * k.x);
+  kq = Materialize(k.x * q.x);
+  qs = __builtin_fmaf(q.y, q.y, qs);
+  ks = __builtin_fmaf(k.y, k.y, ks);
+  kq = __builtin_fmaf(k.y, q.y, kq);
+  qs = __builtin_fmaf(q.z, q.z, qs);
+  ks = __builtin_fmaf(k.z, k.z, ks);
+  kq = __builtin_fmaf(k.z, q.z, kq);
+  qs = __builtin_fmaf(q.w, q.w, qs);
+  ks = __builtin_fmaf(k.w, k.w, ks);
+  kq = __builtin_fmaf(k.w, q.w, kq);
+}
+
 __global__ void GdnPrepKqKernel(const float* conv_out, float* scales,
                                 std::uint32_t n_tokens, std::uint32_t k_heads,
                                 std::uint32_t channels, float eps) {
@@ -179,11 +201,10 @@ __global__ void GdnPrepKqKernel(const float* conv_out, float* scales,
   const float* row = conv_out + static_cast<std::size_t>(t) * channels;
   const auto* q = reinterpret_cast<const float4*>(row + kh * d);
   const auto* k = reinterpret_cast<const float4*>(row + (k_heads + kh) * d);
-  const float4 q4 = q[lane];
-  const float4 k4 = k[lane];
-  float qs = q4.x * q4.x + q4.y * q4.y + q4.z * q4.z + q4.w * q4.w;
-  float ks = k4.x * k4.x + k4.y * k4.y + k4.z * k4.z + k4.w * k4.w;
-  float kq = k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;
+  float qs;
+  float ks;
+  float kq;
+  GdnKqLaneSums(q[lane], k[lane], qs, ks, kq);
 #pragma unroll
   for (unsigned offset = 16; offset > 0; offset >>= 1) {
     qs += XorLane(qs, offset);
@@ -554,11 +575,10 @@ __launch_bounds__(kGdnWaves * 32) __global__
       if constexpr (kConv) {
         // GdnPrepKqKernel for this token: lane L takes the head's float4 L.
         const int slot = ((lane % kVec) * kLanesPerRow) + (lane / kVec);
-        const float4 q = q4[slot];
-        const float4 k = k4[slot];
-        float qs = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
-        float ks = k.x * k.x + k.y * k.y + k.z * k.z + k.w * k.w;
-        float dot = k.x * q.x + k.y * q.y + k.z * q.z + k.w * q.w;
+        float qs;
+        float ks;
+        float dot;
+        GdnKqLaneSums(q4[slot], k4[slot], qs, ks, dot);
 #pragma unroll
         for (unsigned offset = 16; offset > 0; offset >>= 1) {
           qs += XorLane(qs, offset);
