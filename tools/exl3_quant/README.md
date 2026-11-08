@@ -32,13 +32,13 @@ Use `git show <first commit>:<path>` for the frozen bytes.
 | Archive | `https://github.com/Yamz-Labs/kyojin/archive/fbde8a3670c80727a202da3bce581da2de7c88da.tar.gz`, sha256 `dae498bd6bb2767dd06e46a94fa1dafa9b33be9362d0c8bbce0ae1c2b99f7194` (the `refs/tags/v1.8.6` archive has a different top directory and sha256) |
 | Offline backup | `/home/m2on/projects/_backup/third_party/kyojin-v1.8.6.tar.gz` (same sha256), tried first by `fetch_kyojin.sh` |
 | Verification | On 2026-11-08 the archive was fetched from GitHub and matched the sha256. Its 1,798 files and 15 symlinks equal every `source/` entry of `runtime/INPUTS.json`, the hashes recorded before the c03 converter build. The local ai.tools tree had only hipify outputs, `build/` and the built `exllamav3_ext*.so` beyond them, and one later edit, `tools/qwen/serve.py` and `test_serve.py` (`--max-context`, serving only). That edit is `patches/qwen-serve-max-context.patch` and is applied only with `--serve-patch` |
-| Python site | ROCm 10.1.0a20260822 nightly wheels (torch 2.14.0+rocm10.1.0a20260822, triton 3.8.0, rocm-sdk 10.1.0a20260822, ...), each named with its sha256 in `runtime/WHEELS.json`. Index: `https://rocm.nightlies.amd.com/v2/gfx1151/`. The recorded site also held marisa_trie 1.3.1, which is not in WHEELS.json |
+| Python site | ROCm 10.1.0a20260822 nightly wheels (torch 2.14.0+rocm10.1.0a20260822, triton 3.8.0, rocm-sdk 10.1.0a20260822, ...), each named with its sha256 in `runtime/WHEELS.json`. Index: `https://rocm.nightlies.amd.com/v2/gfx1151/`. All 17 were verified on 2026-11-08 and copied, 2.3 GB with a `SHA256SUMS`, to `/home/m2on/projects/_backup/third_party/kyojin-wheels-rocm10.1.0a20260822/` (from `_ai.tools/tmp/cache/llm/kyojin-wheels/`). The recorded site also held marisa_trie 1.3.1, which is in neither list |
 | Build | `runtime/build.sh`: `rocm-sdk init`, `tools/strix_halo/env.sh build`, `python setup.py build_ext --inplace` with `PYTORCH_ROCM_ARCH=gfx1151 MAX_JOBS=4 EXL3_HIP_DEFINES=EXL3_HIP_STG_PAD`, CPU only, in image `ai-tools/gufo-eval:f3-native-b4ebe27c-rocm101` (`sha256:79e3e0b7bc23ed230dc90a11e342aeae109086d145bb0b302363ac2069b43126`) |
 | Metadata sha256 | SOURCE.json `2623d114…`, WHEELS.json `a8d8e00c…`, INPUTS.json `142ce969…`, MODEL.json `5a5a8bc5…`, build.sh `85ff5262…` |
 
 ```sh
 tools/exl3_quant/kyojin/fetch_kyojin.sh build/kyojin-runtime          # archive -> source/, verified
-tools/exl3_quant/kyojin/build_kyojin.sh build/kyojin-runtime <wheels> # site/ + exllamav3_ext
+tools/exl3_quant/kyojin/build_kyojin.sh build/kyojin-runtime [wheels] # site/ + exllamav3_ext
 ```
 
 `build_kyojin.sh` reproduces `runtime/build.sh` with the pin. It has not been
