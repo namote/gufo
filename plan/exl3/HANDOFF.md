@@ -47,7 +47,7 @@ Run cae6f0a41f5e ready; default-parameter arithmetic and image smoke passed,
 actual FP16 and drafts confirmed. Available RAM after checks about27GiB.
 Not a full256K stress test. Kyojin stays stopped. `llm start/stop/status` control
 this service; old conversion/hourly monitors remain disabled.
-Evidence/rollback: `/home/m2on/.local/share/gufo/c03-deployment-20261107/`.
+Evidence/rollback: `~/projects/_backup/local-share-gufo-history-20261104-1108/c03-deployment-20261107/` (moved from `~/.local/share/gufo/` on 2026-11-08).
 
 
 ## Native EXL3 vision (2026-11-04)

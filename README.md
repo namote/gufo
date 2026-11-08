@@ -15,6 +15,111 @@ for user-facing changes and release history.
 > [!TIP]
 > Check out **[Gufo RDMA for Dual Strix Halo](https://github.com/neuhaus/gufo)**, a Gufo variant that has not been merged yet!
 
+## This fork: native EXL3 on Strix Halo
+
+[`namote/gufo`](https://github.com/namote/gufo) is an independent fork. It
+adds native [EXL3](https://github.com/turboderp-org/exllamav3) (trellis)
+inference to Gufo, tuned for Qwen3.8 Flash-Next on one `gfx1151`.
+
+**Qwen3.8 Flash-Next, EXL3 c03 pack (4.04 bpw over the main weights), FP16 KV, one user**
+
+| Workload | Start (Nov 7) | Now (B10, Nov 8) | Gain |
+| --- | ---: | ---: | ---: |
+| Prefill 2,048 tokens, MTP off | 1,471.5 tok/s | **1,516.3 tok/s** | +3.0% |
+| Prefill 8,192 tokens, MTP off | 1,499.7 tok/s | **1,549.3 tok/s** | +3.3% |
+| Decode, AR, empty context | 27.31 tok/s | **32.87 tok/s** | +20.4% |
+| Decode, AR, 32K context | 26.75 tok/s | **32.56 tok/s** | +21.7% |
+| Decode, MTP, empty context | 51.36 tok/s | **67.91 tok/s** | +32.2% |
+| Decode, MTP, 32K context¹ | 87.62 tok/s | **104.69 tok/s** | +19.5% |
+
+The numbers come from `gufo bench` on pinned Nix ROCm 10.1: 128 generated
+tokens, temperature 0, two repetitions per cell.
+- **Start** is the baseline of the first batch (`f24b10ea`); **Now** is the
+  B10 candidate, which is the binary the server now runs.
+- Each of the ten batches was timed against the batch before it, in the same
+  window. The Gain column therefore chains those steps; Start and Now were not
+  measured side by side.
+- Quality against the BF16 reference stayed within noise at every step: KL\@256
+  moved from 0.0415 to 0.0419, and top-1 agreement is 90.9%.
+
+¹ The 32K MTP prompt is repetitive, so n-gram lookup drafts carry much of it.
+It is not general long-context throughput.
+
+Runs and rejected attempts are recorded in
+[the benchmarks](docs/models/qwen3.8-flash-next/BENCHMARKS.md),
+[the gfx1151 know-how](docs/GFX1151-KNOWHOW.md) and
+[the B-series summary](plan/exl3/B-SERIES-SUMMARY.md).
+
+**What the fork adds**
+
+- **Native EXL3 packs.** Gufo loads ExLlamaV3 pack directories for two
+  models:
+  - Flash-Next: the trunk, routed and shared experts, the MTP head, the n-gram
+    embeddings and the embedded vision tower.
+  - Qwen3.8 27B: the text projections.
+
+  On the GPU, the trellis lane decoder matches the CPU dequantizer bit for bit
+  at K1–K8 and K1.5–K3.5. Production projections accept integer K1–K8, and
+  routed experts also accept K3.5.
+- **EXL3 kernels for gfx1151.**
+  - Decode and MTP verification use trellis GEMVs that keep the next tile
+    group in flight.
+  - The decode HC down projection runs as W8A8 on resident Q8_0 copies.
+  - Prefill uses WMMA GEMMs over expert buckets, with 128-token buckets for
+    hot experts.
+  - Router, restore and combine glue is fused into the neighbouring kernels,
+    and side branches overlap the shared MLP and the attention indexer.
+- **Quantized KV cache.** `--kv-cache-type` accepts `fp16`, `kvarn-k4v2`,
+  `kvarn-k4v4` and `kvarn-k6v6`, where the model stores them. Flash-Next
+  takes `fp16`, `kvarn-k4v4` and `kvarn-k6v6`; Qwen3.8 27B defaults to
+  `kvarn-k4v2`. KVarN types store rotated quantized records after an FP16 sink
+  group.
+- **Block-paged, shared KV.** Attention KV lives in 256-token blocks in one
+  physical pool.
+  - Sessions map blocks only when they write them, and the number of sessions
+    does not depend on the pool size.
+  - Requests with a common prompt prefix share that prefix's complete
+    physical blocks, copy-on-write.
+  - With K4V4, two 256K contexts fit in a 4.62 GiB pool; FP16 needs 13.4 GiB.
+    Admission is tested at that capacity, but full two-times-256K inference
+    has not been run.
+- **Long context.** Flash-Next has served native 256K contexts per
+  conversation, with K6V6 on the 5.05 pack and FP16 on c03. No full-256K
+  stress test has been run.
+- **Persistent continuations.** Finished conversations are kept in a RAM cache
+  and a disk cache in the session's KV format (FP16, K4V4 or K6V6) and are
+  restored on the next turn. One measured K4V4 disk restore (5.05 pack) served
+  12,352 cached tokens plus 7 prefilled tokens in 0.486 s, with identical
+  output.
+- **MTP that pays off.**
+  - Draft chains stop when draft confidence drops.
+  - KV-only catch-up keeps the draft head in step with the trunk.
+  - Verification computes only the rows that are still live.
+  - GDN verify state is written once, for the kept prefix.
+- **Request memory budgeting.** Before a request starts, admission reserves
+  its future KV blocks and its checkpoint memory, so a request that would not
+  fit is refused up front.
+- **Reproducible tooling in the repo.**
+  - [`tools/exl3_quant`](tools/exl3_quant/README.md): the Flash-Next
+    conversion pipeline and a pinned, hash-verified Kyojin v1.8.6 converter.
+  - [`tools/docker`](tools/docker/README.md): the pinned ROCm 10.1 build and
+    GPU-run container.
+  - [`tools/serving/flash_next`](tools/serving/flash_next/README.md): the
+    serving supervisor, with an installer that records its git revision and
+    file hashes.
+  - [`tools/qwen38_flash_next`](tools/qwen38_flash_next/README.md): the
+    model's benches, probes and specs.
+- **Readable model code.** Flash-Next code is split by stage:
+  - [`kernels/rocm`](src/models/qwen38_flash_next/kernels/rocm/README.md)
+    holds HC, GDN, attention, MoE glue, MTP and the GEMMs.
+  - [`runtime/`](src/models/qwen38_flash_next/runtime/README.md) holds the
+    executor.
+  - After the split, all 7,059 device symbols were identical to the build
+    before it.
+
+This fork's results are not upstream claims. Nothing here is proposed back
+upstream.
+
 ## Models and benchmarks
 
 All model documentation lives under [docs/models](docs/models/README.md):
