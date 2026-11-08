@@ -1,30 +1,36 @@
-# EXL3 / Flash-Next handoff (updated 2026-11-08; B5 runtime deployed)
+# EXL3 / Flash-Next handoff (updated 2026-11-08; B10 runtime deployed)
 
-## Open: B9 GPU pass, 2026-11-08
+## Active default: c03 Gufo B10 runtime, 2026-11-08
 
-B9 ([brief](archive/B9-STRUCTURE-BRIEF.md)) split the kernels and executor by
-stage, moved the host runtime to `src/models/qwen38_flash_next/runtime/`, the
-model benches and tools to `tools/qwen38_flash_next/`, and the serving
-supervisor into `tools/serving/flash_next/` (installed with `install.py`).
-All 7,059 device symbols are identical to the pre-B9 build; host code changed
-only by relocation. Still to run: the GPU operator tests and one combined
-correctness and timing pass of the B9 binary against B5, then a server restart
-onto the installed supervisor copy.
+The service runs `9eb3cbdb` (B9 structure split `b56b9f54` plus the GDN k.q
+order fix; sha256 `1d35af4f…`, 129,058,712 B, build `build/b1`
+RelWithDebInfo gfx1151, pinned Nix ROCm 10.1) from
+`~/.local/share/gufo/runtime-b9-20261108/` (`RUNTIME.json`), driven by the
+supervisor installed from `tools/serving/flash_next/` at `d01fd32a`. Model,
+C2/native262144 FP16 pool, MTP and sampling settings are unchanged from the c03
+section below. The B10 pass ([brief](archive/B10-GPU-PASS-BRIEF.md), evidence
+`build/b1/b10/RESULT.json`) ran all Flash-Next GPU tests (41/41), the model
+snapshot/adapter/session tests, quality and one matched B5-vs-candidate
+timing window (PP +0.2/+0.3%, decode unchanged); results are in
+[docs/GFX1151-KNOWHOW.md](../../docs/GFX1151-KNOWHOW.md), batch index
+[B-SERIES-SUMMARY.md](B-SERIES-SUMMARY.md).
 
-## Active default: c03 Gufo B5 runtime, 2026-11-08
+Rollback: the B5 runtime (`31cee0b6`) is in
+`~/projects/_backup/runtime-b5-20261108/`; the recipe is in
+`~/projects/_backup/README.md` (move it back, restore the B5-pointing
+`gufo-server.py` from `_backup/gufo-serving-20261108T105540Z-d01fd32a/`,
+`llm start`).
 
-The service runs the B5 binary (sha256 `31cee0b6…`, 126,048,792 B, source
-`5912ed64` (src `eb789c77`), build `build/b1` RelWithDebInfo gfx1151, pinned Nix ROCm 10.1)
-from `~/.local/share/gufo/runtime-b5-20261108/` (`RUNTIME.json`: image,
-Nix volume, `LD_LIBRARY_PATH`, evidence `build/b1/gpu-b5/RESULT.json`).
-Model, C2/native262144 FP16 pool, MTP and sampling settings are unchanged
-from the c03 section below. B6 and B7 were measured but not deployed; the
-B8 cleanup changes no production code. Measured results and lessons:
-[docs/GFX1151-KNOWHOW.md](../../docs/GFX1151-KNOWHOW.md); batch index:
-[B-SERIES-SUMMARY.md](B-SERIES-SUMMARY.md). Previous runtime (c03 initial,
-`6edf0d44`) and the pre-B5 server script
-(`~/.local/share/gufo/gufo-server.py.bak-20261108-pre-b5`) are kept for
-rollback.
+## Open
+
+- Session test `CheckBatchedSessions` / `CheckLookupBatch`: serial and
+  batched decode leave different snapshot bytes (7–23,822 bytes, all in the
+  snapshot tail: MTP draft K/V cache, draft residual or kept trunk rows) while
+  tokens, logits, RNG and acceptance are exact. Pre-existing (same with the B9
+  sources); these model tests had not been run in the B1–B9 passes, so the
+  introducing batch is unknown. Next: map the differing offsets to their
+  WalkSnapshot region, then bisect over the B-series commits on the batch-only
+  mode (`qwen38_flash_next_session_test … --batch-only`).
 
 ## Previous default: c03 Gufo, 2026-11-07
 

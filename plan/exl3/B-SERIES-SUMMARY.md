@@ -1,9 +1,9 @@
-# Flash-Next EXL3 B-series summary (B1–B9, 2026-11-07 to 2026-11-08)
+# Flash-Next EXL3 B-series summary (B1–B10, 2026-11-07 to 2026-11-08)
 
 Index of the c03 Flash-Next decode/prefill optimization batches on
 `ai-tools/port-u4f`. Measurements and lessons live in
 [docs/GFX1151-KNOWHOW.md](../../docs/GFX1151-KNOWHOW.md) (entries
-"Flash-Next B1" … "B7"); briefs and GPU-pass notes are linked per batch.
+"Flash-Next B1" … "B10"); briefs and GPU-pass notes are linked per batch.
 All numbers: c03 pack, pinned Nix ROCm 10.1, FP16 KV, matched windows.
 
 | Batch | Goal | Kept | Reverted / rejected | Measured result (vs previous batch) | Docs |
@@ -16,4 +16,5 @@ All numbers: c03 pack, pinned Nix ROCm 10.1, FP16 KV, matched windows.
 | B6 | Prefill | P1 streaming MoE slab stores, P3 packed attention gate, P5 streaming HC residual stores | P7 shared-MLP side-stream policy (CU masks −6..−17%) | PP2048/8192 +0.3/+0.5%; bits equal B5 | [brief](archive/B6-BRIEF.md), [pass](archive/B6-GPU-PASS.md) |
 | B7 | Prefill GEMM ceiling screen | bench `gfx1151_exl3_wmma_ceiling.hip` (now `tools/qwen38_flash_next/bench/exl3_wmma_ceiling_bench.hip`) | warp-specialized rewrite (−12..−47%), 8192 chunk cap (+1.3% for +2.1 GiB) | best case ≈1770 tok/s PP8192 with this GEMM structure | [brief](archive/B7-CEILING-BRIEF.md), [result](archive/B7-CEILING-RESULT.md) |
 | B8 | Wrap-up cleanup | — | dense GEMV reference copy, its test and bench | no production change (stripped code compared) | [brief](archive/B8-CLEANUP-BRIEF.md) |
-| B9 | Structure cleanup | kernels and executor split by stage, host runtime in `runtime/`, benches and tools under `tools/qwen38_flash_next/`, serving supervisor tracked in `tools/serving/flash_next/` | — | no production change: all 7,059 device symbols identical; GPU pass pending | [brief](archive/B9-STRUCTURE-BRIEF.md) |
+| B9 | Structure cleanup | kernels and executor split by stage, host runtime in `runtime/`, benches and tools under `tools/qwen38_flash_next/`, serving supervisor tracked in `tools/serving/flash_next/` | — | no production change: all 7,059 device symbols identical; prefill logits equal B6 | [brief](archive/B9-STRUCTURE-BRIEF.md) |
+| B10 | Combined GPU pass and cutover | GDN fused k.q summed in the separate route's order (route equality fixed), session rollback bound restated; B10 runtime deployed | — | PP +0.2/+0.3%, decode unchanged vs B5; quality within noise (KL256 0.041926); open: batched snapshot tail bytes | [brief](archive/B10-GPU-PASS-BRIEF.md) |

@@ -1,5 +1,14 @@
 # Qwen3.8 Flash-Next benchmarks
 
+## B10 deployed runtime (B9 + GDN k.q order), November 8, 2026
+
+Same-window B C B C vs deployed B5 (`31cee0b6`), c03, Nix10.1, FP16 KV, r2:
+PP2048/8192 1513.5/1545.2→1516.3/1549.3 tok/s (+0.2/+0.3%); AR128 d0/d32K
+32.92/32.62→32.87/32.56; MTP128 d0/d32K 67.02/104.53→67.91/104.69. Output
+hashes equal B5; prefill logits changed (GDN k.q order), quality unchanged
+within noise (KL256 0.041926). Now deployed (`1d35af4f`). Details:
+[know-how](../../GFX1151-KNOWHOW.md).
+
 ## B6 prefill streaming stores and packed attention gate, November 8, 2026
 
 Same-window rotation vs deployed B5 (`31cee0b6`), c03, Nix10.1, FP16 KV, r2 ×2:

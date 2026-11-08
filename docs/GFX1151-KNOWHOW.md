@@ -1,5 +1,42 @@
 # gfx1151 optimization know-how
 
+## Flash-Next B10 combined GPU pass, GDN route fix and B10 cutover, November 8, 2026
+
+Candidate `9eb3cbdb` (B9 `b56b9f54` + GDN fix, sha `1d35af4f…`) vs deployed
+B5 (`31cee0b6`); brief `plan/exl3/archive/B10-GPU-PASS-BRIEF.md`.
+- **GDN stable route equality (failing since before B1) is fixed.**
+  `GdnRowSplitKernel<true>` (EXL3 prefill, convolves in-kernel) recomputes
+  `GdnPrepKqKernel`'s per-token sums; fast-math summed its k.q as w, y, z, x
+  (`build/b1/b10/recurrent.s`) while the separate kernel compiled x, y, z, w.
+  |q|², |k|² and the scales matched, hence identical states and last-ulp
+  outputs. Both now call `GdnKqLaneSums` (product, then an FMA chain in x, y,
+  z, w). Per-function ISA diff: `GdnPrepKqKernel` reschedules only (GGUF bits
+  kept), `GdnRowSplitKernel<false>` byte-identical. Lesson: a kernel that
+  re-derives another kernel's dot products must pin the order explicitly,
+  even when the source expressions are textually identical.
+- Prefill logits: B9 still `17dc8f9f…`; with the fix `d051e822…`. Versus
+  BF16: KL256 0.041926, top-1 90.891%, ΔNLL −0.013338; vs B6, KL +0.000184
+  and top-1 +0.06 pt unresolved, NLL −0.0025 (token CI only): unchanged
+  within noise. AR/MTP output hashes equal B5; MTP d0 work 37/112/90 →
+  36/111/91 (cycles/drafted/accepted).
+- Tests: 41/41 `qwen38_flash_next.*` + `snapshot_copy_test`; model snapshot
+  and continuation adapter pass. Session: the eager-rollback bound required
+  one full GDN state per layer, stale since B2 E6 (`9cc91779`) made rollback
+  rows records; now asserts `rollback_bytes == 0` and a first-row bound
+  (`7ea0291d`). **Open, pre-existing (same with B9 sources):**
+  `CheckBatchedSessions`/`CheckLookupBatch` snapshot bytes differ serial vs
+  batched in 7–23,822 bytes, all in the snapshot tail (MTP draft K/V cache /
+  draft residual / kept trunk rows); tokens, logits, RNG and acceptance exact;
+  every other session section passes. These model tests had not been run in
+  B1–B9 GPU passes.
+- Same window, B C B C r2 (`build/b1/b10/perf.json`): PP2048/8192
+  1513.5/1545.2 → 1516.3/1549.3 (+0.19/+0.26%); AR128 d0/d32K 32.92/32.62 →
+  32.87/32.56 (−0.17/−0.20%); MTP128 d0/d32K 67.02/104.53 → 67.91/104.69
+  (+1.34/+0.16%, d0 from the one-cycle work change). All within 5%/10 ms.
+- Deployed: `~/.local/share/gufo/runtime-b9-20261108/` via supervisor
+  `d01fd32a`; B5 rollback runtime in `~/projects/_backup/runtime-b5-20261108/`.
+  Evidence: `build/b1/b10/RESULT.json`.
+
 ## Flash-Next B9 structure split and device-code identity, November 8, 2026
 
 No GPU run. `kernels.hip.cpp` (9,905 lines) became 13 stage TUs plus the
@@ -289,7 +326,7 @@ in `cc86343e`, history fusion kept. A4 GPU greedy argmax saves only ≈50 µs/to
 because the host still syncs for the token. C5 full HC-up+mix fusion and A2
 producer-side rotation, B3 EXL3 deferred residual remain open. Pre-existing:
 gdn_ops "fused stable GDN differs from the separate convolution" (n=1, few-ulp
-outputs, identical state) also fails at `f24b10ea`.
+outputs, identical state) also fails at `f24b10ea` (fixed in B10: k.q order).
 Evidence: `build/b1/gpu/RESULT.json`, `perf.json`, `quality/`, `units2/`.
 
 ## c03 final-pack runtime compatibility, November 7, 2026
