@@ -1,5 +1,39 @@
 # gfx1151 optimization know-how
 
+## Flash-Next B9 structure split and device-code identity, November 8, 2026
+
+No GPU run. `kernels.hip.cpp` (9,905 lines) became 13 stage TUs plus the
+private `kernels_internal.hpp`; `executor.cpp` became ten host TUs in
+`src/models/qwen38_flash_next/runtime/`. Acceptance was per-kernel identity:
+every gfx1151 code object of the binary, strip-debug, each function symbol's
+`.text` bytes and each `.kd` (entry offset masked), compared by name across
+TU bundling (`build/b1/cmp/kerncmp.py`): 7,059 of 7,059 symbols identical.
+The first naive split changed 8 kernels, for two reasons that apply to any
+future move:
+- **IPSCCP specializes internal helpers per TU.** An anonymous-namespace
+  helper (even `__forceinline__`) whose callers move to different TUs sees a
+  narrower argument range in each TU (here `lane = threadIdx.x % 32` instead
+  of the union with a `% warpSize` caller), which adds `nuw` flags and changes
+  instruction selection (`RotateIntoSlabs`: SigmoidMulRotate and
+  GateRotatedContext). Fix: make such shared helpers `inline` functions of a
+  named namespace (linkonce, opaque to IPSCCP, as with all callers in one TU).
+- **Device-library getters are specialized too.** `__ockl_get_num_groups(dim)`
+  is internal after device-lib linking; a TU that reads only `gridDim.z`
+  folds the dimension and changes the implicit-argument load alignment
+  (AttentionKernel, 6 variants). Keep a `gridDim.z` user in a TU that also
+  reads another dimension (decode attention shares `attention.hip.cpp` with
+  the WMMA prefill attention, which reads `gridDim.x`).
+- First divergence was found with `-mllvm -print-after-all
+  -mllvm -filter-print-funcs=<kernel>` on both TUs (`build/b1/b9/firstdiff.sh`):
+  both appeared right after the first `InlinerPass`.
+
+Serial full compile (host + device) in the pinned closure: kernels 69.5 s as
+one TU → 2.0–9.6 s per stage TU, except `attention.hip.cpp` 36.7 s (sum
+88.6 s); executor 8.7 s → 1.6–4.4 s per TU (sum 23.6 s). `check-kernel-resources`
+reports the same 14 kernels over the ROCm 7.2.3/clang 22 budget on the B1
+baseline (`f24b10ea`), B5 and B9 binaries (clang 24 toolchain; 12 of them are
+outside Flash-Next); the budget was left unchanged.
+
 ## Flash-Next B7 prefill GEMM ceiling screen, November 8, 2026
 
 Bench `qwen38_flash_next_exl3_wmma_ceiling_bench`
