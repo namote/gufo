@@ -12,6 +12,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
@@ -669,7 +670,17 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
 /// call with conv rollback rows takes the separate convolution, scale and
 /// recurrence kernels instead: both must agree bit for bit, and the fused
 /// route must not depend on how the tokens are chunked.
-int RunStableCase(std::uint32_t kTokens) {
+///
+/// `route_equality` runs only the fused-versus-separate comparison (CTest
+/// qwen38_flash_next.gdn_stable_route_equality). It is a known failure
+/// that predates the B-series work (also at f24b10ea): at n <= 8 a few
+/// outputs differ in the last ulps while the states are identical, which
+/// points at the output-only q scale and kq terms (unconfirmed). Production
+/// never pairs rollback rows with the row-split route; a fix would pin those
+/// terms in GdnRowSplitKernel<true>, the production prefill route, so it
+/// changes prefill bits and needs a GPU pass. The default run skips this
+/// check so that the chunking, checkpoint and decode sections still run.
+int RunStableCase(std::uint32_t kTokens, bool route_equality = false) {
   const std::size_t kQkvCount = static_cast<std::size_t>(kTokens) * kChannels;
   const std::size_t kStateCount =
       static_cast<std::size_t>(kVHeads) * kDim * kDim;
@@ -749,7 +760,9 @@ int RunStableCase(std::uint32_t kTokens) {
            bytes_equal(x.conv, y.conv);
   };
   const Result fused = run({kTokens}, {});
-  if (kTokens <= 8) {
+  if (route_equality) {
+    if (kTokens > 8)
+      return 0;
     std::vector<std::unique_ptr<HipBuffer<float>>> rows;
     q::RollbackRows conv_rows;
     for (auto& row : conv_rows.rows) {
@@ -759,6 +772,7 @@ int RunStableCase(std::uint32_t kTokens) {
     if (!same(fused, run({kTokens}, conv_rows)))
       throw std::runtime_error(
           "fused stable GDN differs from the separate convolution");
+    return 0;
   }
   if (kTokens > 1) {
     const std::uint32_t head = kTokens / 3 + 1;
@@ -965,8 +979,20 @@ int RunStableDecodeCase(std::uint32_t kTokens) {
   return 0;
 }
 
-int main() {
+int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::string_view(argv[1]) == "--stable-route-equality") {
+      for (std::uint32_t n : {1u, 2u, 3u, 5u, 8u}) {
+        std::cout << "stable route equality n=" << n << '\n';
+        if (RunStableCase(n, true) != 0)
+          return 1;
+      }
+      return 0;
+    }
+    if (argc != 1) {
+      std::cerr << "unknown GDN test arguments\n";
+      return 1;
+    }
     // Short batches cover every rollback prefix and the no-snapshot case.
     // Longer batches exercise full and ragged recurrence windows.
     for (std::uint32_t n : {1u, 8u, 37u, 99u}) {

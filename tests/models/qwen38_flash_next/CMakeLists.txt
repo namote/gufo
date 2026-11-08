@@ -133,8 +133,12 @@ if (ENGINE_ENABLE_HIP)
     LABELS "qwen38_flash_next;cpu;exl3")
   add_test(NAME qwen38_flash_next.hc_down_f16
     COMMAND qwen38_flash_next_projection_ops_test --hc-down-f16)
+  # Known failure, kept visible: see RunStableCase in gdn_ops_test.cpp.
+  add_test(NAME qwen38_flash_next.gdn_stable_route_equality
+    COMMAND qwen38_flash_next_gdn_ops_test --stable-route-equality)
   set_tests_properties(qwen38_flash_next.mtp_kv qwen38_flash_next.mtp_kv_group
     qwen38_flash_next.mtp_kv_executor qwen38_flash_next.hc_down_f16
+    qwen38_flash_next.gdn_stable_route_equality
     qwen38_flash_next.exl3_producer_rotation
     qwen38_flash_next.exl3_decode_side_branches
     qwen38_flash_next.exl3_prefill_executor
