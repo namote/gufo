@@ -4,7 +4,7 @@
 // Row-tiled FP32 GEMM of unquantized F16/BF16/F32 weights and FP32
 // activations whose every output is byte-equal to Flash-Next's
 // SmallGemmStable (src/models/qwen38_flash_next/kernels/rocm/
-// kernels.hip.cpp, SmallGemmKernel<..., stable = true>) for any row count,
+// small_gemm.hip.cpp, SmallGemmKernel<..., stable = true>) for any row count,
 // tiling or position (plan/exl3/archive/F3-PLAN.md "F3-API").
 
 #include <cstdint>

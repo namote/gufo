@@ -1,6 +1,6 @@
 // Flash-Next HC combine at prefill width (W3): the per-stream
 // HcCombineKernel<float> (the EXL3 route) against HcCombineVec4Kernel<float>.
-#include "src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/hc.hip.cpp"
 
 #include <cstdio>
 

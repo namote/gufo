@@ -52,10 +52,26 @@ if (ENGINE_ENABLE_HIP)
   target_include_directories(gufo_qwen38_flash_next_mmq SYSTEM PUBLIC ${QFN_MMQ_DIR})
   target_link_libraries(gufo_qwen38_flash_next_mmq PUBLIC hip::host roc::hipblas)
 
+  # Model kernels by stage, sharing the private kernels_internal.hpp;
+  # kernels.hpp declares their launchers.
+  set(QFN_KERNEL_SOURCES
+    ${QFN_ROCM_DIR}/embed_norm.hip.cpp
+    ${QFN_ROCM_DIR}/hc.hip.cpp
+    ${QFN_ROCM_DIR}/activation.hip.cpp
+    ${QFN_ROCM_DIR}/small_gemm.hip.cpp
+    ${QFN_ROCM_DIR}/w8a8.hip.cpp
+    ${QFN_ROCM_DIR}/routed_f16.hip.cpp
+    ${QFN_ROCM_DIR}/dense_gemm.hip.cpp
+    ${QFN_ROCM_DIR}/recurrent.hip.cpp
+    ${QFN_ROCM_DIR}/attention_prep.hip.cpp
+    ${QFN_ROCM_DIR}/attention_select.hip.cpp
+    ${QFN_ROCM_DIR}/attention.hip.cpp
+    ${QFN_ROCM_DIR}/moe_glue.hip.cpp
+    ${QFN_ROCM_DIR}/mtp.hip.cpp)
   set(QFN_HIP_SOURCES
     continuation_adapter.cpp
     ${QFN_ROCM_DIR}/exl3_moe.hip
-    ${QFN_ROCM_DIR}/kernels.hip.cpp
+    ${QFN_KERNEL_SOURCES}
     ${QFN_ROCM_DIR}/w8a8_wave64.hip
     ${QFN_ROCM_DIR}/blaslt.cpp
     ${QFN_ROCM_DIR}/device_model.cpp
@@ -63,7 +79,7 @@ if (ENGINE_ENABLE_HIP)
     ${QFN_ROCM_DIR}/batch.cpp
     engine.cpp)
   target_sources(gufo_qwen38_flash_next PRIVATE ${QFN_HIP_SOURCES})
-  set_source_files_properties(${QFN_ROCM_DIR}/kernels.hip.cpp PROPERTIES LANGUAGE HIP)
+  set_source_files_properties(${QFN_KERNEL_SOURCES} PROPERTIES LANGUAGE HIP)
   set_source_files_properties(${QFN_ROCM_DIR}/w8a8_wave64.hip
     PROPERTIES COMPILE_OPTIONS "-mwavefrontsize64")
   target_compile_definitions(gufo_qwen38_flash_next PRIVATE QFN_ROCM_BUILD=1)

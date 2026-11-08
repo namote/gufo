@@ -1,8 +1,8 @@
-// Flash-Next plain prefill FP16 WMMA tile variants (W3): kernels.hip.cpp
+// Flash-Next plain prefill FP16 WMMA tile variants (W3): dense_gemm.hip.cpp
 // compiled in, DenseF16GEMMKernel<..., kPlainPrefill> at the HC shapes with
 // other tiles. Each output keeps its two K16 chains, so the variants must be
 // bit-identical; the bench checks that.
-#include "src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/dense_gemm.hip.cpp"
 
 #include <cstdio>
 #include <cstring>
