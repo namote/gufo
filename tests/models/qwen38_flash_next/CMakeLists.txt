@@ -86,6 +86,18 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen38_flash_next_hc_prefill_bench PRIVATE
     gufo_qwen38_flash_next)
 
+  # EXL3 prefill GEMM ceiling screen (tools/bench, plan/exl3/B7-CEILING-BRIEF.md):
+  # production launchers against no-decode/WMMA-only/decode-only/warp-
+  # specialized variants. No extra options: the kernel copies keep the
+  # production prefill_fp16.hip flags, so their outputs compare bit for bit.
+  add_executable(qwen38_flash_next_exl3_wmma_ceiling_bench EXCLUDE_FROM_ALL
+    ${PROJECT_SOURCE_DIR}/tools/bench/gfx1151_exl3_wmma_ceiling.hip)
+  set_source_files_properties(
+    ${PROJECT_SOURCE_DIR}/tools/bench/gfx1151_exl3_wmma_ceiling.hip
+    PROPERTIES LANGUAGE HIP)
+  target_link_libraries(qwen38_flash_next_exl3_wmma_ceiling_bench PRIVATE
+    gufo_qwen38_flash_next)
+
   add_qwen38_flash_next_test(exl3_ops gufo_qwen38_flash_next_reference "hip;gpu;gfx1151;exl3")
   set_source_files_properties(exl3_ops_test.cpp PROPERTIES LANGUAGE HIP)
   add_qwen38_flash_next_test(exl3_moe_kernel gufo_qwen38_flash_next "hip;gpu;gfx1151;exl3")
