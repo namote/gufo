@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 
+#include "src/core/crypto/sha256.hpp"
+#include "src/core/json.hpp"
 #include "src/models/qwen38_flash_next/exl3_weights.hpp"
 
 namespace q = gufo::models::qwen38_flash_next;
@@ -220,11 +222,100 @@ void MixerSources() {
               "supplementary mixer lost its owned payload");
   }
 }
+void CalibratedHc() {
+  namespace json = gufo::json;
+  namespace crypto = gufo::crypto;
+  Directory directory;
+  q::Config c;
+  c.num_layers = 1;
+  c.hidden_size = 8;
+  c.hc_count = 4;
+  c.hc_low_rank = 32;
+  std::vector<std::string> names{
+      "model.language_model.layers.0.attn_hyper_connection",
+      "model.language_model.layers.0.mlp_hyper_connection",
+      "model.language_model.hyper_connection_mixer",
+      "mtp.layers.0.attn_hyper_connection",
+      "mtp.layers.0.mlp_hyper_connection",
+      "mtp.hyper_connection_mixer"};
+  Fixture original, packed;
+  for (const auto& prefix : names)
+    for (const auto* projection : {"down", "up"}) {
+      const auto name = prefix + ".input_mix_weight_" + projection + ".weight";
+      original.Tensor(name, "F16", {32, 32}, 32 * 32 * 2, 0x31);
+      packed.Tensor(name, "U8", {32, 1, 34}, 32 * 34);
+    }
+  auto storage = directory.Open(original);
+  // The single-shard fixture is already mapped; only this file's identity
+  // participates in the artifact association tested below.
+  std::ofstream(directory.path / "model.safetensors.index.json") << "{}";
+  q::PrepareExl3HcQ8(storage, c, directory.path);
+  Require(!storage.hc_q8, "absent sidecar changed the legacy path");
+  const auto sidecar = directory.path / "hc_q8";
+  std::filesystem::create_directory(sidecar);
+  Reject([&] { q::PrepareExl3HcQ8(storage, c, directory.path); }, "manifest");
+  std::filesystem::copy_file(directory.path / "config.json",
+                             sidecar / "config.json");
+  packed.Write(sidecar / "model.safetensors");
+  auto manifest = json::Value::object();
+  manifest["schema"] = "gufo.flash-next.hc-q8.v1";
+  manifest["model_index_sha256"] =
+      crypto::Sha256FileHex(directory.path / "model.safetensors.index.json");
+  auto entries = json::Value::object();
+  const auto refresh = [&] {
+    auto checkpoint = ex::Checkpoint::Open(sidecar);
+    for (const auto& [name, tensor] : checkpoint.tensors()) {
+      auto entry = json::Value::object();
+      const auto* source = storage.checkpoint->Find(name);
+      entry["target_weight_sha256"] =
+          crypto::Sha256Hex({source->data, source->bytes});
+      entry["packed_weight_sha256"] =
+          crypto::Sha256Hex({tensor.data, tensor.bytes});
+      entries[name] = std::move(entry);
+    }
+    manifest["tensors"] = entries;
+    std::ofstream(directory.path / "hc_q8.json") << manifest.dump();
+  };
+  refresh();
+  q::PrepareExl3HcQ8(storage, c, directory.path);
+  Require(storage.hc_q8 && storage.hc_q8->tensors().size() == 12,
+          "complete sidecar not retained");
+  storage.hc_q8.reset();
+  const auto key = names.front() + ".input_mix_weight_down.weight";
+  entries[key]["target_weight_sha256"] = std::string(64, '0');
+  manifest["tensors"] = entries;
+  std::ofstream(directory.path / "hc_q8.json") << manifest.dump();
+  Reject([&] { q::PrepareExl3HcQ8(storage, c, directory.path); },
+         "identity mismatch");
+  refresh();
+  packed.payload[2] = 128;
+  packed.Write(sidecar / "model.safetensors");
+  Reject([&] { q::PrepareExl3HcQ8(storage, c, directory.path); },
+         "identity mismatch");
+  refresh();
+  Reject([&] { q::PrepareExl3HcQ8(storage, c, directory.path); },
+         "invalid Q8 code");
+  packed.payload[2] = 0;
+  packed.payload[0] = 0;
+  packed.payload[1] = 0x7c;
+  packed.Write(sidecar / "model.safetensors");
+  refresh();
+  Reject([&] { q::PrepareExl3HcQ8(storage, c, directory.path); },
+         "invalid Q8 scale");
+  packed.payload[1] = 0;
+  packed.Write(sidecar / "model.safetensors");
+  refresh();
+  manifest["model_index_sha256"] = std::string(64, '0');
+  std::ofstream(directory.path / "hc_q8.json") << manifest.dump();
+  Reject([&] { q::PrepareExl3HcQ8(storage, c, directory.path); },
+         "model identity");
+}
 }  // namespace
 int main() {
   try {
     Binding();
     MixerSources();
+    CalibratedHc();
     std::cout << "Flash-Next EXL3 rate binding and mixer sources passed\n";
     return 0;
   } catch (const std::exception& error) {

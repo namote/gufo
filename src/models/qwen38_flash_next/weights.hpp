@@ -82,6 +82,8 @@ struct HcMixer {
   TensorRef down;    ///< [hc_dim -> low_rank]
   TensorRef up;      ///< [low_rank -> hc_dim]
   TensorRef inject;  ///< [hc_dim -> hc_count], empty on the head mixer.
+  /// Optional calibrated Q8 copies; original F16 operands stay available.
+  TensorRef down_q8, up_q8;
 };
 
 struct LayerWeights {

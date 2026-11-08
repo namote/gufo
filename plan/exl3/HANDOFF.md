@@ -23,6 +23,11 @@ Rollback: the B5 runtime (`31cee0b6`) is in
 
 ## Open
 
+- HC Q8 calibration: all200 matrices generated from BF16, production sidecar
+  loader and cache identity built; final quality/decode/throughput validation
+  active. See [HC-Q8-CALIBRATION.md](HC-Q8-CALIBRATION.md). Reuse saved captures,
+  H and baselines; do not start another GPU job or assume this is deployed yet.
+
 - Session test `CheckBatchedSessions` / `CheckLookupBatch`: serial and
   batched decode leave different snapshot bytes (7–23,822 bytes, all in the
   snapshot tail: MTP draft K/V cache, draft residual or kept trunk rows) while

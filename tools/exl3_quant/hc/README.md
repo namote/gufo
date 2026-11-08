@@ -3,8 +3,8 @@
 Offline conversion tools for Flash-Next HC down/up weights. They supplement
 the EXL3 pack with calibrated **Q8_0**, not another EXL3 tensor format. The
 source is the original BF16 snapshot; the existing F16 pack supplies a separate
-legacy rounding control. Quantization/refinement are CPU-only and never change
-a model pack. The explicit `capture_window --execute` command temporarily
+legacy rounding control. The CPU quantizer is the reference; an optional validated HIP/FP64 worker
+generates all 200 matrices. Neither generator changes a model pack. The explicit `capture_window --execute` command temporarily
 stops the owned server, captures inputs on the GPU, and restores its settings.
 
 | File | Role |
@@ -20,11 +20,30 @@ stops the owned server, captures inputs on the GPU, and restores its settings.
 | `score_saved.py` | Per-document evaluation of saved candidates on decode and prefill; no refitting |
 | `ORIGIN.json` | Original source hashes and the preserved migration evidence |
 
-Status: offline reference tools and a real first-attention-HC pilot. **No runtime
-loader qualification or full 200-tensor calibration yet.** B10 collector002
-passed bounded prefill/decode capture-on/off full-vocabulary byte-hash controls;
-the original B5 prototype and B10 collector001 are historical. See the active
-[HC plan](../../../plan/exl3/HC-Q8-CALIBRATION.md).
+Status: the first-site pilot has expanded to **100 HC sites / 200 matrices**,
+including all three MTP HC sites. Bounded all-site collection and GPU generation
+are complete; native, production-loader, BF16 quality and throughput qualification
+have passed for plain GPTQ and are recorded separately in `build/exl3-hc/`. Do not treat file generation as
+runtime qualification. See the active [HC plan](../../../plan/exl3/HC-Q8-CALIBRATION.md).
+
+The full path is `prepare_all_capture` → `run_all` / resumable `run_saved` →
+`package` → `qualify_quality` → `qualify_decode` → `qualify_runtime`. Saved successful captures,
+H, packed results and B10/BF16 controls are reused. `gpu_window` serializes only
+the owned service and restores its exact configuration after each bounded batch.
+The all-site input set has 1024 calibration and 873 separate held-out scalar
+rows at every site. MTP collection is teacher-forced; recurrent draft acceptance
+is measured by the final actual MTP benchmark. Prefill and scalar decode are
+scored separately because the down projection can retain F16 in prefill. The
+explicit probe `--prefill-reference` option reuses stored BF16 logits at matching
+corpus positions without relabeling the reference or weakening payload checks.
+
+The production sidecar is a directory `hc_q8/` containing config, safetensors,
+and receipts, plus **`hc_q8.json` at the model root**, copied from the sidecar's
+manifest. All 200 entries must match the target F16 weights and packed payload
+hashes. A missing pair, bad hash or invalid Q8 payload fails rather than silently
+converting F16. When neither sidecar nor root manifest exists, legacy loading
+is unchanged. Root receipt identity invalidates incompatible conversation caches.
+Original F16 down remains available for high-precision prefill routes.
 
 ## Commands
 
@@ -95,8 +114,9 @@ tests: `TMPDIR=/tmp python3 -B -m unittest tools.exl3_quant.hc.test_cpu tools.ex
   Results include hashes, weighted SSE, held-out SSE/p99/max and refinement
   time. Outputs remain `NOT_RUNTIME_QUALIFIED`; there is no automatic selection.
 
-The full-H CPU implementation is a correctness reference, not a demonstrated
-fast full-pack converter. A 10240-column H alone needs 800 MiB in FP64, with
+The full-H CPU implementation is a correctness reference. The optional GPU
+worker preserves its FP64 sequential feedback and passes byte-exact saved CPU
+packing controls; generation speed is separate from inference throughput. A 10240-column H alone needs 800 MiB in FP64, with
 additional factorization/work buffers. Screen a bounded real site first.
 Projection error is not connected-HC/model quality, and this weight correction
 does not remove activation-Q8 error. Final deployment requires native packing,

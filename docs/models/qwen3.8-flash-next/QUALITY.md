@@ -1,5 +1,48 @@
 # Qwen3.8 Flash-Next quality
 
+## All200 calibrated HC Q8 sidecar, November 8, 2026
+
+Original BF16 HC weights → exact FP32 expansion → FP64 full-H GPTQ → Q8_0.
+The100 sites comprise194 main and6 MTP matrices; each uses1024 actual scalar
+calibration rows and873 separate held-out rows. These bounded HC inputs do not
+replace the body model's2M-token calibration. All200 target/raw packed identities
+and native RTN controls match; all-site capture-on/off and actual-loader versus
+saved native-import main/MTP-head/full-vocabulary hashes are exact.
+
+Stored BF16 teacher and stored B10 control reused; no full baseline rerun:
+
+| Prefill32760 positions | KL256+rest ↓ | Target NLL ↓ | Top1 agreement ↑ |
+| --- | ---: | ---: | ---: |
+| B10 legacy RTN | 0.041926397 | 2.159508469 | 90.8913% |
+| All200 GPTQ | 0.039935247 | 2.164491218 | 90.9219% |
+| GPTQ + up code/scale refinement | 0.041448555 | 2.165955227 | 90.7875% |
+
+GPTQ paired KL difference−0.00199115, window95%CI[−0.00406314,−0.00027220].
+Target NLL increases+0.00498275; windowCI[−0.00110581,+0.01265618] crosses0.
+This supports improved BF16 distribution fidelity in this corpus, not improved
+perplexity, all tasks or arbitrary long contexts. Up refinement reduces isolated
+projection error further but loses to plain GPTQ on all three prefill metrics.
+
+A separate scalar128positions×8windows check follows2048 tokens because prefill
+can retain F16 down while scalar decode uses calibrated Q8 down. It reuses the
+BF16-prefill teacher at identical histories through an explicit cross-path probe;
+one previously unavailable legacy scalar control was collected, not a full
+baseline rerun. Legacy/GPTQ/refined KL:0.048803884/0.044060911/0.044277188;
+Top1:88.6719/89.5508/89.6484%. GPTQ target-NLL change vs scalar control+0.00024244.
+Scalar paired KL window95%CI[−0.01098422,+0.00050994] crosses0; its9.7%
+point reduction is not a resolved broad improvement. This bounded main-decode
+check is not a recurrent MTP distribution proof.
+
+Evidence: `build/exl3-hc/all-run-002`, `all-finish-001`, `quality-loader-001`,
+`decode-quality-001`; source/ELF/input identities and independent review retained.
+Final API smoke passes two logical C2 branches (physical width1 serial fallback),
+511-token RAM replay, counting1..40 with accepted drafts, and red/blue image.
+This is not physical batch2 or branch-to-branch shared-prefix coverage. AR/MTP
+greedy128 output SHA matches at d0/d32768; neural MTP proposals/accepts are
+nonzero after subtracting lookup. Cleanup and original-service restoration pass.
+Evidence: `runtime-qualification-001`; throughput tradeoff is in BENCHMARKS.md.
+
+
 ## Generalized kernel paths, November 7, 2026
 
 The combined candidate's c03 prefill output at 32,760 sampled positions is

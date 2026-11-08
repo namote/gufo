@@ -1,5 +1,28 @@
 # Qwen3.8 Flash-Next benchmarks
 
+## All200 GPTQ HC Q8 sidecar, November 8, 2026
+
+Same B10 compute kernels, pinned Nix10.1, c03, FP16 KV, r2; saved Cr1/Cr2
+controls reused. Candidate only; no whole baseline remeasurement.
+
+| Case | Saved B10 mean tok/s | Calibrated HC tok/s | Change |
+| --- | ---: | ---: | ---: |
+| PP2048 | 1516.34 | 1522.02 | +0.37% |
+| PP8192 | 1549.30 | 1554.38 | +0.33% |
+| AR128 d0 | 32.87 | 32.78 | −0.27% |
+| AR128 d32768 | 32.56 | 32.44 | −0.37% |
+| MTP128 d0 | 67.91 | 65.69 | −3.27% |
+| MTP128 d32768 | 104.69 | 104.39 | −0.29% |
+
+Candidate AR/MTP emitted-token hashes match at both depths and both repeats.
+Shallow output differs from old B10 after changing HC weights: MTP cycles36→38,
+accepted91/111→90/114 (81.98→78.95%). This is a prompt-specific output/acceptance
+tradeoff, not an isolated kernel speed comparison. After subtracting lookup, shallow neural MTP is89/113. Deep repetitive lookup case
+retains17 cycles,111/111 total drafts and101 lookup accepts (neural MTP10/10); it is not general
+generation speed. No speedup claim from sub-percent differences.
+Evidence: `build/exl3-hc/runtime-qualification-001`, `build/b1/b10/perf`.
+
+
 ## B10 deployed runtime (B9 + GDN k.q order), November 8, 2026
 
 Same-window B C B C vs deployed B5 (`31cee0b6`), c03, Nix10.1, FP16 KV, r2:

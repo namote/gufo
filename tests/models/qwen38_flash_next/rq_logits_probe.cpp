@@ -263,7 +263,7 @@ int main(int argc, char** argv) {
         path_name, label, toolchain;
     std::size_t top_k = 256, prefix = 2048, batch = 512, window_limit = 8,
                 position_limit = std::numeric_limits<std::size_t>::max();
-    bool kvarn = false;
+    bool kvarn = false, prefill_reference = false;
     int kvarn_bits = 4;
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
@@ -296,6 +296,8 @@ int main(int argc, char** argv) {
         window_limit = number();
       else if (arg == "--positions-limit")
         position_limit = number();
+      else if (arg == "--prefill-reference")
+        prefill_reference = true;
       else if (arg == "--kvarn-k6v6") {
         kvarn = true;
         kvarn_bits = 6;
@@ -317,6 +319,7 @@ int main(int argc, char** argv) {
             "--windows windows.json --path prefill|decode --out PREFIX "
             "[--reference PREFIX] [--top-k 256] [--prefix 2048] "
             "[--positions-limit 512] [--windows-limit 8] [--batch 512] "
+            "[--prefill-reference] "
             "[--kvarn|--kvarn-k6v6] [--label TEXT] [--toolchain TEXT]");
     Require(top_k >= 1 && top_k <= 1024, "--top-k must be 1..1024");
     Require(batch >= 1 && batch <= 4096, "--batch must be 1..4096");
@@ -337,6 +340,10 @@ int main(int argc, char** argv) {
             "context too long");
     const auto context =
         static_cast<std::uint32_t>((longest + 255) / 256 * 256);
+    Require(!prefill_reference ||
+                (path_name == "decode" && !reference_prefix.empty()),
+            "--prefill-reference requires decode and an explicit reference");
+    std::string reference_path;
     std::unique_ptr<Reference> reference;
     if (!reference_prefix.empty()) {
       Require(reference_prefix != out_prefix,
@@ -345,7 +352,9 @@ int main(int argc, char** argv) {
           std::make_unique<Reference>(ReadReference(reference_prefix, corpus));
       Require(reference->top_k == top_k, "reference --top-k differs");
       const auto meta = json::parse(ReadFile(reference->meta_path));
-      Require(meta.member_str("path") == path_name, "reference path differs");
+      reference_path = meta.member_str("path");
+      Require(reference_path == (prefill_reference ? "prefill" : path_name),
+              "reference path differs");
     }
 
     const auto load_start = Clock::now();
@@ -472,6 +481,8 @@ int main(int argc, char** argv) {
     if (reference) {
       auto ref = json::Value::object();
       ref["meta"] = reference->meta_path;
+      ref["path"] = reference_path;
+      ref["cross_path"] = prefill_reference;
       ref["bin_sha256"] = reference->bin_sha256;
       meta["reference"] = std::move(ref);
     }

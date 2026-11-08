@@ -115,6 +115,23 @@ struct Binder {
                    c.hc_low_rank);
     m.up =
         Plain(prefix + "input_mix_weight_up.weight", c.hc_low_rank, c.HcDim());
+    if (storage.hc_q8) {
+      const auto calibrated = [&](const TensorRef& original) {
+        const auto* tensor = storage.hc_q8->Find(original.name);
+        if (!tensor)
+          Fail("missing calibrated HC " + std::string(original.name));
+        auto ref = original;
+        ref.data = tensor->data;
+        ref.type = core::GgmlType::kQ8_0;
+        ref.safetensors = false;
+        // A separate immutable mapping owns this buffer; it is not a shard
+        // offset inside the original model's upload stager.
+        ref.memory_owned = true;
+        return ref;
+      };
+      m.down_q8 = calibrated(m.down);
+      m.up_q8 = calibrated(m.up);
+    }
     if (inject)
       m.inject = Plain(prefix + "block_inject_weight.weight", c.HcDim(),
                        c.hc_count, true);
@@ -389,6 +406,7 @@ std::optional<ModelWeights> LoadExl3Model(const std::filesystem::path& path,
     w.config = *config;
     w.exl3_storage = Open(path, metadata, w.config, false);
     auto& storage = *w.exl3_storage;
+    PrepareExl3HcQ8(storage, w.config, path);
     Binder b{storage, w.config};
     w.token_embd = b.Plain("model.language_model.embed_tokens.weight",
                            w.config.hidden_size, w.config.vocab_size);
@@ -427,6 +445,7 @@ std::optional<MtpWeights> LoadExl3Mtp(const std::filesystem::path& path,
       if (!std::filesystem::equivalent(source[i].source_path,
                                        draft[i].source_path))
         Fail("native MTP must use the trunk pack");
+    w.exl3_storage->hc_q8 = trunk.exl3_storage->hc_q8;
     Binder b{*w.exl3_storage, w.config};
     w.block = b.Layer(0, true);
     return w;

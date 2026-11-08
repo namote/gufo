@@ -31,7 +31,7 @@ std::unique_ptr<core::GgufReader> OpenArtifactMetadata(
     const std::vector<std::string_view> required(ngram_names.begin(),
                                                  ngram_names.end());
     constexpr std::string_view kOptional[] = {
-        "mtp_hyper_connection_mixer_patch.safetensors"};
+        "mtp_hyper_connection_mixer_patch.safetensors", "hc_q8.json"};
     qwen::NativePackMetadata pack(path, "qwen4_exp_text", required, kOptional);
     const auto& c = pack.text_config();
     auto ngram = Exl3Ngram::Open(ngram_files);

@@ -1,14 +1,14 @@
 """Prepare HC Q8_0 sidecars from BF16 weights and recorded input statistics.
 
 Run from the repository root. These are offline tools; no command starts a
-model, captures GPU inputs, modifies a source pack or deploys a runtime loader.
+model, captures GPU inputs, modifies a source pack or starts a runtime deployment.
 """
 import argparse
 import importlib
 import sys
 
 
-COMMANDS = {'inventory': 'inventory', 'quantize': 'quant', 'refine': 'refine'}
+COMMANDS = {'inventory': 'inventory', 'quantize': 'quant', 'refine': 'refine', 'package': 'package'}
 
 
 def main(argv=None):

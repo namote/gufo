@@ -26,12 +26,18 @@ struct Exl3HostLinear {
 
 struct Exl3Storage {
   std::shared_ptr<quant::exl3::Checkpoint> checkpoint;
+  /// Immutable calibrated HC mapping, shared with the draft loader.
+  std::shared_ptr<quant::exl3::Checkpoint> hc_q8;
   std::deque<std::vector<Exl3HostLinear>> linears;
   std::deque<std::vector<std::uint8_t>> converted;
   std::deque<std::string> names;
   /// Only missing in-shard MTP mixer tensors; bytes live in converted.
   std::map<std::string, quant::exl3::Tensor, std::less<>> supplementary;
 };
+
+/// Load optional hc_q8/ only when complete and bound to this pack.
+void PrepareExl3HcQ8(Exl3Storage& storage, const Config& config,
+                     const std::filesystem::path& model);
 
 /// Bind actual per-tensor K3..K8 or K3.5 rates. Every expert in this bank
 /// must agree; different banks/projections may use different rates.

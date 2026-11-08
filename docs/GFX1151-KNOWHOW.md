@@ -2962,3 +2962,39 @@ Original/target weights are read-only; all sidecars NOT_RUNTIME_QUALIFIED. Six
 GPU cases cleaned up with no new kernel error and the owned server restored
 ready, same configuration. No new capture, quantization or baseline rerun is
 needed to continue native/connected checks of these saved candidates.
+
+### All200 HC BF16-source calibration, November 8, 2026
+
+User authorized bounded data for all100 HC sites (main97/MTP3), then qualified
+model installation. `build/exl3-hc/all-run-002` captures each site's own1024
+calibration/873 held-out scalar rows, actual teacher-forced MTP inputs included.
+Capture-on/off main/full-vocab/MTP-head byte hashes exact;106.13s full capture.
+GPU FP64 sequential GPTQ feedback matches saved CPU packed bytes (both real
+projections), as do up code/scale refinement and independent analytic cases.
+Real down11.47s vs CPU170.61s; up0.14s/refinement1.58s excludes statistics and IO.
+`all-finish-001` reused capture and first-site artifacts; all200 generation1735.58s.
+Saved full H is retained. Nix10.1 HIP library with Torch2.9.1/ROCm7.2.4 uses
+explicit pinned glibc loader; initial pre-GPU TLS failure preserved, not a pass.
+
+Mean per-site held-out output-SSE ratios to legacy F16 RTN: downGPTQ0.873418
+(max1.406591,19/100 worse); upGPTQ0.294740 and up+code/scale0.248478 (100/100
+improved for either up variant). These are isolated projections, not model KLD.
+Production sidecar preserves the original F16 down prefill route and Q8 layout;
+strict200-entry payload/target hashes fail closed. Root `hc_q8.json` participates
+in artifact identity to prevent old conversation-cache reuse. Final loader,
+BF16/B10 quality and inference throughput are separate qualification gates.
+
+FinalHC prefill32760: savedB10 KL.041926397→GPTQ.039935247 (−4.75%),
+targetNLL2.159508469→2.164491218 (slightly worse); pairedKL window95%CI
+[−.00406314,−.00027220]. Uprefinement loses toplainGPTQ overall despite better
+isolated-HC SSE. Boundedscalar1024: KL.048803884→.044060911 (−9.72%point
+estimate; pairedwindowCI crosses0), targetNLLdifference+.00024244.
+`quality-loader-001`/`decode-quality-001` reuse storedBF16/B10; the latter adds
+only the previously missing smallscalarcontrol. No repeatedteacher/fullbaseline.
+
+`runtime-qualification-001`: PP2048/8192 1522.02/1554.38, ARd0/d32K32.78/32.44,
+MTP65.69/104.39 tok/s vs savedB10 means1516.34/1549.30,32.87/32.56,67.91/104.69.
+AR/MTP greedycandidate hashesexact. ShallowMTP−3.27% accompanies changedtarget
+output and90/114draftacceptance vs91/111, cycles38vs36; depth32K islookup-heavy.
+This retainsQ8inference kernels, improvesmeasuredBF16fidelity, anddoesnotclaim
+universalquality/perplexity improvement or afasterinference kernel.

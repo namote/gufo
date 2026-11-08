@@ -1,5 +1,22 @@
 # Qwen3.8 Flash-Next experiments
 
+## BF16-source all200 HC Q8 calibration, November 8, 2026
+
+Completed GPU FP64 full-H GPTQ for194 main and6 MTP matrices using bounded
+site-specific inputs; candidate retains Q8_0 kernels and F16 down prefill fallback.
+CPU-reference packed parity, source/target binding and actual-loader main/MTP
+parity pass. Plain GPTQ selected over up code/scale refinement: lower full-model
+KL in both prefill and bounded scalar decode; refinement's better isolated
+projection error did not transfer. NLL is mixed, not uniformly improved.
+
+Final candidate PP/AR/deepMTP is within0.4% of stored B10; shallowMTP−3.27%
+on changed greedy text/acceptance. Do not attribute output-dependent speculative
+throughput to a new kernel. Original BF16/model tensors and completed H/control
+results remain reusable; no baseline recapture or body requantization.
+[Quality](QUALITY.md), [timings](BENCHMARKS.md),
+[full protocol and evidence](../../../plan/exl3/HC-Q8-CALIBRATION.md).
+
+
 ## Native EXL3 vision (2026-11-04)
 
 Retained embedded EXL3 vision loading and native precision graph, with packed

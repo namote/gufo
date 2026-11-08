@@ -266,6 +266,14 @@ void Identity() {
   std::ofstream(dir / "b") << "changed";
   Check(first != core::FileSetIdentityHex(dir, {"a", "b"}),
         "same-size weight change invalidates identity");
+  std::ofstream(dir / "hc_q8.json") << "bound-calibrated-HC-artifact";
+  const auto calibrated =
+      core::FileSetIdentityHex(dir, {"a", "b", "hc_q8.json"});
+  Check(calibrated != core::FileSetIdentityHex(dir, {"a", "b"}),
+        "calibrated HC separates continuation identity");
+  std::ofstream(dir / "hc_q8.json") << "different-calibrated-HC-set";
+  Check(calibrated != core::FileSetIdentityHex(dir, {"a", "b", "hc_q8.json"}),
+        "changed HC manifest invalidates continuation identity");
   for (const auto& names :
        {std::vector<std::string>{}, {"b", "a"}, {"a", "a"}, {"../a"}}) {
     bool rejected = false;

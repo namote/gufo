@@ -394,7 +394,20 @@ struct Uploader {
   }
 
   DeviceMixer Mixer(const HcMixer& m) {
-    DeviceMixer d{Copy(m.norm), Copy(m.down), Copy(m.up), Copy(m.inject), {}};
+    const bool calibrated = !m.down_q8.empty() && !m.up_q8.empty();
+    if (m.down_q8.empty() != m.up_q8.empty()) {
+      Fail("incomplete calibrated HC pair");
+      return {};
+    }
+    DeviceMixer d{Copy(m.norm),
+                  Copy(m.down),
+                  Copy(calibrated ? m.up_q8 : m.up),
+                  Copy(m.inject),
+                  {}};
+    if (calibrated) {
+      d.down_q8 = Copy(m.down_q8);
+      return d;
+    }
     // The EXL3 down projection runs W8A8 (prefill) or the Q8_0 GEMV
     // (decode/verify) on a Q8_0 copy, as the GGUF route's Q8_0 mixer
     // weights do; an unnormed prefill input still reads the F16 rows.

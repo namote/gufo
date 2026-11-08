@@ -9,7 +9,7 @@ and restored with exactly the same command/settings.
 
 - Implementation: [`tools/exl3_quant/hc/`](../../tools/exl3_quant/hc/README.md).
   BF16-source generator, five-way comparison and bounded B10 capture.
-  First-attention HC pilot artifacts now exist; full200-tensor pack remains pending.
+  All200 tensors generated in `build/exl3-hc/all-finish-001`; final loader/quality/performance qualification is in progress.
 - Original BF16 snapshot:
   `/run/media/m2on/T5 EVO/AI/model/originals-flash-next-hf-20261030/Qwen-Qwen3.8-Flash-Next`.
 - Target: `/home/m2on/projects/models/llm/flash-next-exl3-gufo-c03`.
@@ -121,3 +121,72 @@ Down refinement slightly worsens held-out error despite lower training error.
 The full HC pack still requires other-site collection, full calibration,
 native arithmetic checks and loader integration; this is a useful first-site
 screen, not a whole-model quality/latency result.
+
+## Full HC execution, November 8, 2026
+
+The user explicitly approved continuing all200 and finishing with model deployment.
+For HC only, bounded input sampling is authorized; the earlier full-body2M policy
+is unchanged. Every site uses its own actual activations from the same8 calibration
+and8 held-out documents (1024/873 scalar rows), including teacher-forced MTP.
+
+- `all-run-001`: Python failed before GPU execution with GLIBC TLS ABI mismatch;
+  no numerical output. Pinned glibc loader/library ordering fixed the entrypoint.
+- `all-run-002`: CPU/GPU sequential feedback and up refinement packed bytes exact
+  on analytic and saved real inputs. Down GPU11.47s vs CPU170.61s; up0.14s and
+  up code/scale1.58s. These are projection compute timings, not total conversion.
+  Capture-on/off control full-vocabulary/main/MTP hashes exact; all100 sites
+  collected once (106.13s,1897 positions). Existing first-site H/packed reused.
+- `all-finish-001`: all200 generated from saved captures, no baseline repetition.
+  GPU stage1735.58s including H, packing and IO. Retained full H enables further
+  investigation without recalibration. Original BF16/target EXL3 files unchanged.
+- `runtime-loader-002`: strict all200 loader and cache-identity CPU tests pass,
+  pinned Nix10.1 incremental build. `loader-collector-002` combines that loader
+  with all-site MTP observer for exact actual-loader/native-import comparison.
+- Pending: saved BF16/B10 full-model quality comparison, chosen candidate timing,
+  C2/cache/vision/MTP smoke, then qualified deployment. No quality claim from
+  HC projection losses alone.
+
+## Full-model prefill result
+
+`quality-loader-001`: both actual-loader variants match the saved native imports
+exactly (1897 records/full-vocabulary main/MTP-head hashes). Both32760-position
+prefill runs scored against the preserved BF16 teacher and saved B10 candidate.
+
+| Candidate | KL256+rest | Target NLL | Top1 agreement |
+| --- | ---: | ---: | ---: |
+| Saved B10 | 0.041926397 | 2.159508469 | 90.8913% |
+| All200 GPTQ | 0.039935247 | 2.164491218 | 90.9219% |
+| GPTQ + up code/scale refinement | 0.041448555 | 2.165955227 | 90.7875% |
+
+GPTQ's paired KL difference is−0.00199115 (window95%CI
+[−0.00406314,−0.00027220]); NLL change+0.00498275 has windowCI
+[−0.00110581,+0.01265618]. Fidelity to the BF16 distribution improved in this
+sample; target NLL did not improve. Refinement's lower isolated up error did
+not produce a better whole-model result. No blanket benchmark-quality claim.
+
+Scalar decode uses a separate128-position×8-window check following2048 tokens,
+with the same saved BF16 teacher and one new small legacy scalar control (no
+previous scalar control existed for these positions). This separates the changed
+Q8-down route from prefill's preserved F16-down route. No full baseline rerun.
+
+The bounded scalar check completed: legacy/GPTQ/refined KL
+0.048803884/0.044060911/0.044277188; GPTQ top1 improves88.6719→89.5508%,
+NLL difference+0.00024244. Plain GPTQ is selected for final throughput/smoke
+qualification: it has the best KL in both paths; the refinement remains a
+retained comparison artifact. Sidecar installation is still pending that pass.
+
+## Final qualification
+
+`runtime-qualification-001` completed and restored the original service with no
+new GPU errors. PP2048/8192 1522.02/1554.38, ARd0/d32K32.78/32.44,
+MTP65.69/104.39 tok/s. ShallowMTP−3.27% vs stored B10 accompanies changed
+target text and neural89/113 acceptance; deep total111/111 includes lookup101/101.
+Greedyoff/on candidate hashes match in all4 cases. API logicalC2 branches42/36,
+repeat42 with511cachedtokens, count1..40, and Redblue vision pass. C2 uses
+physical width1 serial fallback, not a physical batch2 qualification.
+
+Deployment is prepared at `build/exl3-hc/deployment-001`: immutable GPTQ root
+manifest35e650b07f72…, packd3a3c0c2d987…, runtime166953f07227….
+Keep original model tensors and frozen generation receipts. Installation adds
+only `hc_q8/` plus `hc_q8.json`; qualification receipts are separate so the
+validated root-manifest SHA stays unchanged.
