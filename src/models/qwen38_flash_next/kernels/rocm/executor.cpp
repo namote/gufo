@@ -1,6 +1,6 @@
 // Executor and Session lifetime: model upload, session creation and
 // sizing, K/V row management, rollback depth, KVarN planning, the side
-// stream and MTP cycle diagnostics.
+// stream and MTP cycle diagnostics, vision input and cancellation.
 
 #include "src/models/qwen38_flash_next/kernels/rocm/executor_snapshot.hpp"
 

@@ -2,7 +2,8 @@
 #define GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_EXECUTOR_INTERNAL_HPP_
 
 // Private to the executor*.cpp translation units: the helpers, routing
-// thresholds and layouts more than one of them uses.
+// thresholds and layouts more than one of them uses. Functions are inline so a
+// translation unit that does not use one compiles without a warning.
 
 #include <algorithm>
 #include <array>
@@ -38,13 +39,13 @@ namespace {
 
 using core::GgmlType;
 
-void AssignError(std::string* error_msg, const std::string& message) {
+inline void AssignError(std::string* error_msg, const std::string& message) {
   if (error_msg != nullptr) {
     *error_msg = message;
   }
 }
 
-bool Check(hipError_t err, const char* what, std::string* error_msg) {
+inline bool Check(hipError_t err, const char* what, std::string* error_msg) {
   if (err == hipSuccess) {
     return true;
   }
@@ -71,7 +72,7 @@ T* Alloc(std::vector<void*>& allocations, std::size_t count,
   return static_cast<T*>(p);
 }
 
-WeightType SmallType(GgmlType type) {
+inline WeightType SmallType(GgmlType type) {
   switch (type) {
     case GgmlType::kBF16:
       return WeightType::kBF16;
@@ -96,8 +97,8 @@ struct Exl3PrefillLayout {
   std::size_t bytes{0};
 };
 
-bool PlanExl3Prefill(const Config& c, std::uint32_t rows,
-                     Exl3PrefillLayout* layout, std::string* error) {
+inline bool PlanExl3Prefill(const Config& c, std::uint32_t rows,
+                            Exl3PrefillLayout* layout, std::string* error) {
   if (rows == 0 || c.num_experts_used == 0 ||
       c.num_experts_used > c.num_experts || c.hidden_size == 0 ||
       c.expert_ff == 0) {
@@ -153,22 +154,22 @@ struct PrefillPhase {
   }
   ~PrefillPhase() { prefill_phase = previous; }
 };
-bool MatrixRows(std::uint32_t rows) {
+inline bool MatrixRows(std::uint32_t rows) {
   return prefill_phase || rows > kVecBatch;
 }
-bool ExpertMatrixRows(std::uint32_t rows) {
+inline bool ExpertMatrixRows(std::uint32_t rows) {
   return prefill_phase || rows > 4 * kVecBatch;
 }
 /// Prefill passes wider than a vector batch take the fused projections and
 /// the paired routed expert tiles: they win from 9 rows up to the full chunk.
 /// Decode and verification batches keep their single-token arithmetic.
-bool WidePrefill(std::uint32_t rows) {
+inline bool WidePrefill(std::uint32_t rows) {
   return prefill_phase && rows > kVecBatch;
 }
 
 /// Whether mmq's Q8_1 rows of width k carry no padding, so a producer's
 /// contiguous element order is the layout.
-bool UnpaddedQ8(std::uint32_t k) {
+inline bool UnpaddedQ8(std::uint32_t k) {
   return k % 32 == 0 &&
          qfn_mmq_q8_1_bytes(1, static_cast<int>(k)) == k / 32 * 36;
 }
@@ -192,7 +193,7 @@ constexpr std::uint32_t kDenseF16MaxCols = 2560;
 constexpr std::uint32_t kRoutedTileRowsNarrow = 16;
 constexpr std::uint32_t kRoutedTileRowsWide = 48;
 
-std::uint32_t RoutedTileRows(std::size_t slots, const Config& c) {
+inline std::uint32_t RoutedTileRows(std::size_t slots, const Config& c) {
   return slots >= static_cast<std::size_t>(16) * c.num_experts
              ? kRoutedTileRowsWide
              : kRoutedTileRowsNarrow;
@@ -200,14 +201,14 @@ std::uint32_t RoutedTileRows(std::size_t slots, const Config& c) {
 
 /// Upper bound on launched routed tiles: every 16-padded bucket contributes
 /// at most one partial tile beyond its rows.
-std::size_t RoutedTileCapacity(std::size_t slots, const Config& c) {
+inline std::size_t RoutedTileCapacity(std::size_t slots, const Config& c) {
   return (slots + static_cast<std::size_t>(c.num_experts) * 15) /
              kRoutedTileRowsNarrow +
          c.num_experts + 1;
 }
 
-std::uint32_t IndexerCapacity(const Config& c, std::uint32_t batch,
-                              std::uint32_t context) {
+inline std::uint32_t IndexerCapacity(const Config& c, std::uint32_t batch,
+                                     std::uint32_t context) {
   return static_cast<std::uint32_t>(std::bit_ceil(std::min<std::uint64_t>(
       context, std::uint64_t{c.indexer_top_k} + batch)));
 }
@@ -223,8 +224,8 @@ struct SessionKvLayout {
   std::size_t keys{0}, values{0}, pooled{0}, records{0};
   bool fp16_trunk{true};
 };
-SessionKvLayout SessionKvPlanes(const Config& c, bool mtp, bool kvarn,
-                                std::uint32_t max_context, int bits) {
+inline SessionKvLayout SessionKvPlanes(const Config& c, bool mtp, bool kvarn,
+                                       std::uint32_t max_context, int bits) {
   const std::uint32_t attention = c.num_layers / c.full_attention_interval;
   const std::size_t kv_row = std::size_t{c.AttentionKvDim()} * sizeof(__half);
   SessionKvLayout out;
@@ -254,7 +255,7 @@ SessionKvLayout SessionKvPlanes(const Config& c, bool mtp, bool kvarn,
 
 /// Halves of one KVarN session's FP16 sink and tail rows: K and V of every
 /// attention layer.
-std::size_t KvarnFp16Elements(const Config& c) {
+inline std::size_t KvarnFp16Elements(const Config& c) {
   return std::size_t{2} * (c.num_layers / c.full_attention_interval) *
          hip::kKvarnFp16Tokens * c.AttentionKvDim();
 }
@@ -268,7 +269,7 @@ int RoutedTileCols(std::uint32_t n_tokens, std::uint32_t n_used,
 namespace {
 
 /// A mixer's F32 inject weights, which its combine can apply (see Combine).
-const float* InjectWeights(const DeviceMixer& m) {
+inline const float* InjectWeights(const DeviceMixer& m) {
   return !m.inject.empty() && m.inject.type == GgmlType::kF32 ? m.inject.f32()
                                                               : nullptr;
 }
