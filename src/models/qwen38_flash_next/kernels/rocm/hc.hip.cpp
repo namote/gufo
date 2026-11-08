@@ -364,13 +364,21 @@ __global__ void HcMixEpilogueF16Kernel(const __half* xn, const float* gate,
   }
 #pragma unroll
   for (std::uint32_t o = 0; o < kStreams; ++o) {
-    float dot = 0.0F;
+    // HcInjectPart's order, pinned: one product, then FMAs in stream and
+    // component order. A plain `dot +=` chain is contracted and reassociated
+    // differently per instantiation under fast-math, so a short prefill
+    // pass (this epilogue) and a wide one (the combine's fused partials)
+    // gave the same token different inject logits in the last bit.
+    float dot = __fmul_rn(wq[o][0].x, v[0].x);
+    dot = __fmaf_rn(wq[o][0].y, v[0].y, dot);
+    dot = __fmaf_rn(wq[o][0].z, v[0].z, dot);
+    dot = __fmaf_rn(wq[o][0].w, v[0].w, dot);
 #pragma unroll
-    for (std::uint32_t s = 0; s < kStreams; ++s) {
-      dot += wq[o][s].x * v[s].x;
-      dot += wq[o][s].y * v[s].y;
-      dot += wq[o][s].z * v[s].z;
-      dot += wq[o][s].w * v[s].w;
+    for (std::uint32_t s = 1; s < kStreams; ++s) {
+      dot = __fmaf_rn(wq[o][s].x, v[s].x, dot);
+      dot = __fmaf_rn(wq[o][s].y, v[s].y, dot);
+      dot = __fmaf_rn(wq[o][s].z, v[s].z, dot);
+      dot = __fmaf_rn(wq[o][s].w, v[s].w, dot);
     }
     dot = WaveSum(dot);
     if (lane == 0) {
@@ -382,7 +390,7 @@ __global__ void HcMixEpilogueF16Kernel(const __half* xn, const float* gate,
   if (threadIdx.x < kStreams) {
     float total = 0.0F;
     for (std::uint32_t w = 0; w < kThreads / 32; ++w) {
-      total += partial[threadIdx.x][w];
+      total = __fadd_rn(total, partial[threadIdx.x][w]);
     }
     inject[(static_cast<std::size_t>(t) * kStreams + threadIdx.x) * gridDim.x +
            part] = total;
@@ -603,7 +611,7 @@ __device__ __forceinline__ void HcInjectPart(
   if (threadIdx.x < kStreams) {
     float total = 0.0F;
     for (std::uint32_t q = 0; q < kThreads / 32; ++q) {
-      total += shared[threadIdx.x][q];
+      total = __fadd_rn(total, shared[threadIdx.x][q]);
     }
     inject[(static_cast<std::size_t>(t) * kStreams + threadIdx.x) * parts +
            part] = total;
@@ -640,11 +648,15 @@ __global__ void HcCombineVec4Kernel(
   float w[kStreams];
 #pragma unroll
   for (std::uint32_t s = 0; s < kStreams; ++s) {
+    // The partials in order from zero, pinned like InjectParts::Sum: every
+    // instantiation (deferring, inject-writing, MoE-fused) must give a token
+    // the same stream weights whichever pass route computes it.
     float logit = 0.0f;
     for (std::uint32_t p = 0; p < inject_parts; ++p) {
-      logit +=
+      logit = __fadd_rn(
+          logit,
           inject[(static_cast<std::size_t>(t) * kStreams + s) * inject_parts +
-                 p];
+                 p]);
     }
     w[s] = 2.0f * SigmoidF(logit / static_cast<float>(kStreams));
   }
@@ -874,11 +886,15 @@ __global__ void HcCombineMoeF16Kernel(
   float w[kStreams];
 #pragma unroll
   for (std::uint32_t s = 0; s < kStreams; ++s) {
+    // The partials in order from zero, pinned like InjectParts::Sum: every
+    // instantiation (deferring, inject-writing, MoE-fused) must give a token
+    // the same stream weights whichever pass route computes it.
     float logit = 0.0f;
     for (std::uint32_t p = 0; p < inject_parts; ++p) {
-      logit +=
+      logit = __fadd_rn(
+          logit,
           inject[(static_cast<std::size_t>(t) * kStreams + s) * inject_parts +
-                 p];
+                 p]);
     }
     w[s] = 2.0f * SigmoidF(logit / static_cast<float>(kStreams));
   }
