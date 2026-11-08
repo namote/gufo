@@ -1,5 +1,38 @@
 # gfx1151 optimization know-how
 
+## Flash-Next B7 prefill GEMM ceiling screen, November 8, 2026
+
+Bench `qwen38_flash_next_exl3_wmma_ceiling_bench`
+(`tools/bench/gfx1151_exl3_wmma_ceiling.hip`, commit `acc1898d`; decision
+note `plan/exl3/B7-CEILING-RESULT.md`, `726de4c8`). Variants per c03 shape:
+a production launchers, a* faithful copy (within ±3% of a, EQUAL), b
+pre-decoded FP16 weights from global, c weights decoded once into LDS (no
+decode), c0 everything staged once (barriers+LDS reads+WMMA only), d decode
+only, e warp-specialized producer/consumer (barrier ring and LDS-flag ring).
+All exact variants EQUAL over 58 shapes; e-flag never timed out.
+
+TF at 80 rows/expert or 4096 dense rows (a µs): routed gate/up K4 balanced
+a 29.2 (9195 µs), b 16.0, c 39.6, c0 42.8, d 3579 µs, e 25.7/22.4; skewed a
+27.1; routed down K4 a 27.0, c 34.2, c0 35.4, e 19.0; dense qkv K5 a 36.7, c
+38.9, c0 38.7, e 28.0/31.0; dense out K6 a 35.0, c 37.3, c0 42.7, e 18.4; dense
+z/q K5 a 35.0, c 37.9. Routed a/c 1.27–1.39 and a = 0.82–0.89 of (c+d): decode
+and WMMA add (VALU and WMMA do not overlap on one SIMD), 51–68% of decode cost
+is exposed. Dense a/c 1.06–1.08: decode is not the dense limit; dense tiling
+tops out at c0 37–39 TF. Routed rows/expert 40/80/160/320/640 → 22.2/29.2/
+29.6/31.5/34.2 TF. **Warp specialization loses 12–47%** (S 0.81 routed, 0.72
+dense; ≈6094 ms PP8192) — do not pursue on gfx1151. Ceiling arithmetic: free
+routed decode saves ≤358 ms (PP8192 ≈4918 ms, 1666 tok/s); dense tiling to
+46–49 TF would save ≈290 ms; together ≈1770 tok/s is the best case for the c03
+pack with this GEMM structure.
+
+Prefill chunk cap (`kPrefillChunkTokens`, `engine.cpp:34`), two rotated
+rounds: 4096 (default) PP2048/8192/16384 1519.6/1552.0/1527.7; 8192
+1512.9/1572.2/–; 16384 1508.6/1570.9/1570.0. +1.3% at 8192, +2.8% at 16384,
+−0.4..−0.7% at 2048, peak memory +2.14/+6.38 GiB; TG within 0.3%. Profile at
+cap 8192: routed gate/up 27.0→29.4 TF, down 23.6→26.2 TF (−128 ms) but HC
+projections +65 ms and MoE routing +25 ms (net 5276→5215 ms). Not adopted
+(below the 3% bar for its memory). Evidence: `build/b1/gpu-b7/`.
+
 ## Flash-Next B6 prefill streaming stores and packed attention gate, November 8, 2026
 
 Commits `32b3f95e..fa33c927` (brief `plan/exl3/B6-BRIEF.md`). Kept, all exact
