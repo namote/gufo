@@ -77,6 +77,54 @@ U2-2와 U2-3은 prefill bit가 바뀔 수 있다. 바뀌면 U5에서 품질 검�
 
 U4는 U1~U3과 U5가 끝난 뒤 사용자와 범위를 다시 정한다.
 
+## U1~U3 진행 상황 (2026-11-09, GPU 실행 없음)
+
+모든 항목은 구현 → 빌드(`build/b1`, pinned ROCm 10.1 컨테이너) → 관련 CPU
+테스트 → 별도 리뷰어 검토 → 수정 → 재검토를 거쳤다. 기준 바이너리는 배포 중인
+`runtime-hc-20261108/gufo`(device code는 B10과 같음)다.
+
+| 항목 | upstream | 커밋 | 상태 | 비고 |
+|---|---|---|---|---|
+| U1-1 | #849 | `4f049197` | 완료 | 손 이식(attention_select/attention/mtp.hip.cpp, executor_mtp/batch). device code: AttentionKernel 6, SelectMarkKernel 2, SelectScoreKernel, CompactSelectionKernel, RemapDraftIdsKernel(시그니처)만 바뀜. 경계 안 입력의 출력은 그대로 |
+| U1-2 | #1012, #1052, #1059 | `41623db8`, `0f6f7e63`, `d07fc9a0` | 완료 | #1052: `StringValue` 대신 우리 `Lexeme(JsonSchemaLexeme::String)` 유지, functional suite 목록·impact.json 손 해결 |
+| U1-3 | #1064 | `518445f8` | 완료 | ext change note 제외 |
+| U1-4 | #1043 | `746c40f1` | 완료 | |
+| U1-5 | #964, #881 | `d992830d`, `c039686d` | 완료 | |
+| U1-6 | #858, #1021, #740 | `ea847c1e`, `a33d7ec4`, `64e15f15` | 완료 | #740은 host만 바뀜(kernel 전부 동일). `hip_weight_upload_test`는 GPU 테스트라 빌드만 |
+| U1-7 | #1048 일부 | `9db74cf5` | 완료 | `Run`의 CaptureScope + `Moe`의 SharedScope(예외 시 side stream join). decode shared-expert overlap은 가져오지 않음. host만 |
+| U2-1 | #876 | — | 해당 없음 | 같은 수정이 이미 있다: `cef16057`의 `dense_prefix = indexer_top_k`(`pos < dense_prefix` ⇔ upstream `n_kv <= dense_extent`), EXL3 경로에만 켜짐. 운영은 EXL3라 그대로 둔다. GGUF Flash-Next는 서비스하지 않는다 |
+| U2-2 | #877 정렬 부분 + #1016 | `44efce72` | 완료 | 재현 확인(코드 추적): sparse WMMA prefill이 pass 시작부터 4 query씩 묶으므로 4의 배수가 아닌 곳에서 시작한 pass(캐시 복원·용량 분할)는 cold와 bit가 다르다. 우리 tree엔 정렬이 없었다. 이식: `Session::Feed`, runner `StepTokens`, `prefill_alignment`, ComponentTextCache 복원·publish 필터, snapshot payload v19. 포크 전용: tail checkpoint도 정렬, live frontier 복사본(CaptureBeforeReset·WriteBackIdle)은 `kGenerated`로 표시해 위치와 무관하게 복원(live 재사용과 같은 상태), ShareCheckpoint slack은 정렬 위치만. disk readahead 수정·docs/models 측정·fixture는 제외 |
+| U2-3 | #875 일부 | `1b22e7c5` | 완료 | HC inject partial 순서 고정 + blaslt `OwnF16(type,k)`. device code: `HcMixEpilogueF16Kernel<false/true>`만 바뀜(나머지 `__fadd_rn` 고정은 같은 코드로 컴파일). `OwnF16` 변경은 GGUF dense 경로만(EXL3는 BlasLt를 안 씀). SSM conv·wave64 W8A8·hc_route_ops 등 테스트는 제외 |
+| U2-4 | #903, #1063 | — | 보류 | #903: 우리 backing 승인 코드는 request memory budgeting(`e5002432`, pending/reserve)으로 다시 쓰여 upstream 구조와 맞지 않고, 운영 RAM cache 2 GiB는 시작 때 GrowAhead(2 GiB)로 전부 commit돼 on-demand segment 거부가 생기지 않는다. #1063: 시작 시 RAM 부족이면 거부하는 변경으로, 다르게 쓰인 초기화 코드에 GPU 검증 없이 넣으면 지금 동작하는 설정을 거부할 위험이 있다. 필요해지면 따로 이식 |
+| U3-1 | #814 | `5208c592` | 완료 | session_test main의 `--draft-vocab-only`·`--serving-sampling-only`와 `--logprobs-only` 병합. 리뷰: 모든 Flash-Next decode 경로(단일·batch·MTP greedy/sampled·lookup·terminal)에서 토큰마다 logprob 1개, 요청이 없으면 비용 없음 |
+| U3-2 | #860, #915, #1082 | `2be31111`, `2917bfb8`, `a8d46243` | 완료 | #1082 docs는 `docs/SERVER.md`로 |
+| U3-3 | #811 | `84fd6206` | 완료 | 포크의 `system_prefix_tokens` 인자 뒤에 `persist`. 포크 전용: persist=false 요청의 live frontier는 WriteBackIdle·CaptureBeforeReset이 disk에 쓰지 않음(`Entry::live_persist`), `CaptureRefused`도 반영 |
+
+전체 device code(기준 → `84fd6206`): 위 U1-1의 12개 symbol과 U2-3의
+`HcMixEpilogueF16Kernel` 2개 외에 7,045개 symbol이 그대로다.
+
+반복 중 CPU 테스트: json_constraint, sampling, logprobs, openai_chat,
+http_server, text_model_runner, text_generation_scheduler, component_text_cache,
+cache_adapter(+lifecycle), cache_slot, cache_idle_spill, cache 단위 테스트,
+continuation_disk_store, gguf_reader, speculative_verification, ds4.sampling,
+functional_runner, cache_workloads, test_impact 통과. GPU 테스트 target
+(attention/select/mtp/hc_mix/blaslt/projection ops, session/snapshot test,
+decode_attn_bench, hip_weight_upload)은 빌드만 했다. 이번 작업과 무관한 기존
+실패: `serve_cli_test`(help 문자열 `kvarn-k4v2` 기대 불일치), `cache_disk_faults_test`
+(LD_PRELOAD gate가 컨테이너에서 동작 안 함), `cache_backing*`(GPU 필요).
+
+### U5가 GPU에서 확인할 것
+
+- **bit가 바뀔 수 있는 것**
+  - U2-2: 캐시 복원·용량 분할 뒤 prefill이 정렬 위치에서 시작하므로 restore 결과가 cold와 같아져야 한다(기대: 바뀜 → 일치). cold 한 pass prefill logits sha(B10 `d051e822…`)는 그대로여야 한다. 2 K 넘는 prompt의 여러 pass cold prefill은 pass 경계가 이미 4의 배수(2048)라 그대로여야 한다.
+  - U2-3: `HcMixEpilogueF16Kernel`이 바뀜 → 96행 미만 prefill pass(짧은 꼬리, 복원 뒤 짧은 pass)의 inject partial 마지막 bit. 넓은 pass는 그대로.
+  - U1-1: 경계 안 입력은 그대로(비교로 확인).
+  - snapshot payload v19: 기존 disk continuation cache는 재사용되지 않는다(배포 시 첫 요청은 cold).
+- **테스트**: Flash-Next GPU CTest 전체(특히 `attention_ops`·`select_ops`·`mtp_ops`의 새 경계 검사, `hc_mix_ops`의 `CheckFusedInjectPartials`, `blaslt_ops`의 split 검사, `projection_ops`의 arena 검사), `hip_weight_upload_test`, `qwen38_flash_next_session_test`(새 `CheckUnalignedContinuationPasses`, `--logprobs-only`), `snapshot_test`(새 11행 in-pass tail 검사), functional `cache`·`long-context`·`conversation`·`batch`·`tool-type-unions`·`logprobs`·`responses-logprobs`·`openai-count-tokens`·cache_persist·`cache_alignment_qwen38.py`.
+- **성능**: PP2048/8192, AR·MTP d0/d32K를 `runtime-hc-20261108` 대비 한 창. 특히 U2-2의 정렬로 생기는 추가 분할/캡처(nearby-stable warm turn의 aligned prompt tail snapshot, kv_pool 사용 시 in-pass 불가로 final pass 분할)와 tool-loop 재사용률(`pi_agent.py`)을 본다. U1-7의 SharedScope는 정상 경로 동작이 같아 decode 변화가 없어야 한다.
+- **열린 문제**: `CheckBatchedSessions`/`CheckLookupBatch` snapshot 꼬리 차이는 U2-1과 원인이 같지 않다(U2-1 수정은 이미 있었다). U5에서 bisect한다.
+- **남은 low 항목(리뷰어)**: 복원된 비정렬 complete prompt에서 토큰 없이 commit한 live frontier는 정렬 규칙 밖에서 이어질 수 있다(upstream과 같음, 드묾). logprobs 요청 하나가 batch decode 동료를 늦춘다(동기 row download + CPU log-softmax, opt-in).
+
 ## U5 통합 GPU 패스 (한 번)
 
 1. 서버 정지(사용자 확인 후). HC 보정 세션의 GPU 작업과 겹치지 않게 한다.

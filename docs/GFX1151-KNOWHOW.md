@@ -1,5 +1,18 @@
 # gfx1151 optimization know-how
 
+## Upstream U1-U3 imports, device-code delta, November 9, 2026
+
+No GPU run (measurement deferred to U5, `plan/upstream-sync/PLAN.md`).
+`build/b1/cmp/kerncmp.py` from the deployed `runtime-hc-20261108` binary to
+`84fd6206`: 7,045 of 7,059 gfx1151 symbols identical. Changed: #849 bounds in
+AttentionKernel (6 variants), SelectMarkKernel (2), SelectScoreKernel,
+CompactSelectionKernel and RemapDraftIdsKernel (new signature); #875
+HcMixEpilogueF16Kernel<false/true> (inject dot pinned to HcInjectPart's
+product-then-FMA order). The `__fadd_rn` pins on the HcInjectPart and
+HcCombineVec4/MoeF16 partial sums compiled to the code they already had, as
+upstream reported. All other imports (alignment, logprobs, cache_persist,
+capture exception safety, qfn_mmq arena) are host-only.
+
 ## Flash-Next B10 combined GPU pass, GDN route fix and B10 cutover, November 8, 2026
 
 Candidate `9eb3cbdb` (B9 `b56b9f54` + GDN fix, sha `1d35af4f…`) vs deployed
