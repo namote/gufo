@@ -52,7 +52,7 @@ list(APPEND gufo_pr_tests
   cache_workloads_test cache_disk_faults_test
   cache_boundary_test
   kernel_resources_parser_test check_docs_test check_pr_title_test
-  pinned_rocm101_test)
+  pinned_rocm101_test exl3_quant_tools_test)
 if (WIN32)
   # Linux-only hosted suites: RLIMIT_FSIZE and fork()-based tests, the
   # dup2/mmap/socket fixture tests, the permission-fault disk-store cases,

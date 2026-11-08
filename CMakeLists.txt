@@ -725,6 +725,14 @@ if (BUILD_TESTING)
   set_tests_properties(rotquant_calibration_test PROPERTIES
     LABELS "cpu;tools;quantization" TIMEOUT 30)
 
+  # EXL3 conversion tooling: the Kyojin pin, the retained c03 inputs and
+  # c02_to_caldata; standard library only.
+  add_test(NAME exl3_quant_tools_test
+    COMMAND ${Python3_EXECUTABLE} -m unittest discover
+      -s ${CMAKE_CURRENT_SOURCE_DIR}/tools/exl3_quant -p "test_*.py")
+  set_tests_properties(exl3_quant_tools_test PROPERTIES
+    LABELS "cpu;tools;quantization" TIMEOUT 60)
+
   # Pinned ROCm 10.1 Docker environment (tools/docker); standard library only.
   add_test(NAME pinned_rocm101_test
     COMMAND ${Python3_EXECUTABLE}
