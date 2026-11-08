@@ -22,7 +22,7 @@
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/hip/executor.hpp"
-#include "tests/models/qwen27b/sampling_cases.hpp"
+#include "tests/support/sampling_cases.hpp"
 #include "tests/support/temporary_directory.hpp"
 
 namespace {

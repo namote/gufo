@@ -9,7 +9,7 @@
 //
 // Only the public engine API is used. The state moves through a
 // materialized snapshot payload; its attention K/V sections are rewritten in
-// place with tests/models/qwen27b/kvarn_fake_quant.hpp (heads x head_dim rows
+// place with tests/support/kvarn_fake_quant.hpp (heads x head_dim rows
 // are generic) and restored. Pooled indexer keys, raw indexer rows, DeltaNet
 // state and the PLE history stay FP16/F32: KVarN covers attention K/V only,
 // so block selection sees unchanged indexer keys.
@@ -38,7 +38,7 @@
 #include "src/core/session_mode.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
-#include "tests/models/qwen27b/kvarn_fake_quant.hpp"
+#include "tests/support/kvarn_fake_quant.hpp"
 
 namespace json = gufo::json;
 namespace kvarn = gufo::testing::kvarn;

@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include "tests/models/qwen27b/kvarn_fake_quant.hpp"
+#include "tests/support/kvarn_fake_quant.hpp"
 
 int main(int argc, char** argv) {
   namespace kvarn = gufo::testing::kvarn;

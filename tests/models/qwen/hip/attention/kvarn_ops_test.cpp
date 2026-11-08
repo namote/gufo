@@ -1,7 +1,7 @@
 // KVarN attention KV kernels (src/models/qwen/hip/kernels/attention_kvarn.hip)
 // against host references: the rotating row write bit for bit, the
 // group-flush quantizer bit for bit against the K0 reference rules
-// (tests/models/qwen27b/kvarn_fake_quant.hpp), the fused-dequant decode and
+// (tests/support/kvarn_fake_quant.hpp), the fused-dequant decode and
 // verification attention against double attention over the same stored
 // codes, and the whole write -> flush -> attend path against attention over
 // the K0 fake-quantized rows in the original frame.
@@ -24,7 +24,7 @@
 #include <vector>
 
 #include "src/models/qwen/hip/kvarn_layout.hpp"
-#include "tests/models/qwen27b/kvarn_fake_quant.hpp"
+#include "tests/support/kvarn_fake_quant.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>

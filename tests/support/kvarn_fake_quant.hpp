@@ -12,8 +12,8 @@
 // The rotation is orthogonal and symmetric, so attention over rows written
 // back as dequant(quant(x H)) H equals attention in the rotated frame. The
 // study therefore needs no attention kernel change.
-#ifndef GUFO_TESTS_MODELS_QWEN27B_KVARN_FAKE_QUANT_HPP_
-#define GUFO_TESTS_MODELS_QWEN27B_KVARN_FAKE_QUANT_HPP_
+#ifndef GUFO_TESTS_SUPPORT_KVARN_FAKE_QUANT_HPP_
+#define GUFO_TESTS_SUPPORT_KVARN_FAKE_QUANT_HPP_
 
 #include <algorithm>
 #include <atomic>
@@ -343,4 +343,4 @@ inline Error FakeQuantize(std::span<std::uint16_t> rows, std::size_t heads,
 
 }  // namespace gufo::testing::kvarn
 
-#endif  // GUFO_TESTS_MODELS_QWEN27B_KVARN_FAKE_QUANT_HPP_
+#endif  // GUFO_TESTS_SUPPORT_KVARN_FAKE_QUANT_HPP_

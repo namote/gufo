@@ -63,8 +63,8 @@ readers from disk for each reading, so a live install mixes old and new code.
 The installer therefore refuses while a supervisor runs, unless
 `--allow-running` is given, which is safe only when the readers behave as
 before. It holds `~/.local/share/gufo/gufo-control.lock`, the lock `llm start`
-and `llm stop` take, while it writes. Nothing is backed up or written when no
-file changes.
+and `llm stop` take, while it writes. Nothing is backed up when no file changes; `INSTALLED.json` is still
+rewritten when the revision differs. `--dry-run` writes nothing.
 
 ## Rollback
 

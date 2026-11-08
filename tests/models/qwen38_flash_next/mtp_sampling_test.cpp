@@ -10,7 +10,7 @@
 #include <vector>
 
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
-#include "tests/models/qwen27b/sampling_cases.hpp"
+#include "tests/support/sampling_cases.hpp"
 
 namespace qfn = gufo::models::qwen38_flash_next;
 namespace sampling = gufo::sampling;

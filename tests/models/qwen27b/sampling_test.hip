@@ -17,7 +17,7 @@
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/hip/kernels/dflash_kernels.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
-#include "tests/models/qwen27b/sampling_cases.hpp"
+#include "tests/support/sampling_cases.hpp"
 
 namespace {
 

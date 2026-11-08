@@ -23,8 +23,8 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/core/json.hpp"
 #include "src/models/qwen/chat_template.hpp"
-#include "tests/models/qwen27b/kvarn_fake_quant.hpp"
 #include "tests/models/qwen27b/kvarn_session.hpp"
+#include "tests/support/kvarn_fake_quant.hpp"
 
 namespace json = gufo::json;
 namespace kvarn = gufo::testing::kvarn;

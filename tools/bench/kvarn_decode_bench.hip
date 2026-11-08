@@ -41,7 +41,7 @@
 // output by H again (H^-1 = H). The quantization rules (rotation rounded to
 // FP16, eight log-domain balancing iterations keeping the lowest imbalance,
 // asymmetric per-row RTN, FP16 scales) are those of
-// tests/models/qwen27b/kvarn_fake_quant.hpp; `check` compares codes and
+// tests/support/kvarn_fake_quant.hpp; `check` compares codes and
 // scales with it tile by tile.
 //
 // Proposed storage, per layer and 256-token pool block: two 128-token groups,
@@ -85,7 +85,7 @@
 #include <vector>
 
 #include "src/models/qwen/hip/kernels/attention_decode.hip"
-#include "tests/models/qwen27b/kvarn_fake_quant.hpp"
+#include "tests/support/kvarn_fake_quant.hpp"
 
 #define KV_OK(expr)                                                     \
   do {                                                                  \

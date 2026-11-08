@@ -7,7 +7,7 @@ REV:path`, default HEAD) instead of linking them. It
 
   1. backs up the files it will replace to BACKUP_ROOT/gufo-serving-<stamp>-<sha>/
      and appends a line for that folder to BACKUP_ROOT/README.md (nothing is
-     backed up or written when no file changes),
+     backed up when no file changes),
   2. writes each file atomically (temporary file in the destination, then rename),
   3. byte-compiles every installed .py file in memory, and
   4. records the revision, the time and each file's sha256 in DEST/INSTALLED.json.
@@ -123,7 +123,10 @@ def install(files: dict[str, bytes], revision: str, dest: Path, backup_root: Pat
     changed = [name for name in FILES if not (dest / name).exists() or (dest / name).read_bytes() != files[name]]
     record = {'revision': revision, 'installed_utc': stamp, 'source': REPO_PATH,
               'files': {name: sha256(files[name]) for name in FILES}, 'changed': changed}
-    if dry_run or not changed:
+    if dry_run:
+        return record
+    previous = dest / RECORD
+    if not changed and previous.exists() and json.loads(previous.read_text()).get('revision') == revision:
         return record
     folder = backup(dest, backup_root, revision, stamp, changed)
     record['backup'] = None if folder is None else str(folder)
@@ -149,23 +152,29 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--rev', default='HEAD', help='committed revision to install (default HEAD)')
     ap.add_argument('--from-dir', type=Path, help='install FILES from this directory instead of git (tests)')
-    ap.add_argument('--dest', type=Path, default=DEST)
+    ap.add_argument('--dest', type=Path, help=f'destination (default {DEST})')
     ap.add_argument('--backup-root', type=Path, default=BACKUP_ROOT)
     ap.add_argument('--dry-run', action='store_true', help='print what would change, write nothing')
     ap.add_argument('--check', action='store_true', help='verify DEST against its INSTALLED.json')
     ap.add_argument('--allow-running', action='store_true',
                     help='install while a supervisor runs (only when the root-run readers are unchanged)')
     a = ap.parse_args(argv)
+    if a.from_dir and a.dest is None:
+        ap.error('--from-dir needs an explicit --dest: the live destination takes committed revisions only')
+    a.dest = a.dest or DEST
     if a.check:
         return check(a.dest)
     revision, files = read_directory(a.from_dir) if a.from_dir else read_revision(a.rev)
+    if a.dry_run:
+        print(json.dumps(install(files, revision, a.dest, a.backup_root, True), indent=2))
+        return 0
     a.dest.mkdir(parents=True, exist_ok=True)
     with (a.dest / 'gufo-control.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if not a.dry_run and not a.allow_running and supervisor_running(a.dest):
+        if not a.allow_running and supervisor_running(a.dest):
             print('a gufo supervisor is running; stop it first (llm stop) or pass --allow-running', file=sys.stderr)
             return 3
-        print(json.dumps(install(files, revision, a.dest, a.backup_root, a.dry_run), indent=2))
+        print(json.dumps(install(files, revision, a.dest, a.backup_root, False), indent=2))
     return 0
 
 

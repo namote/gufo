@@ -11,7 +11,7 @@
 #include <vector>
 
 #include "src/core/sampling.hpp"
-#include "tests/models/qwen27b/sampling_cases.hpp"
+#include "tests/support/sampling_cases.hpp"
 
 namespace {
 

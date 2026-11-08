@@ -16,7 +16,7 @@
 
 #include "src/core/hip/transfer_pool.hpp"
 #include "src/models/qwen/continuation_adapter.hpp"
-#include "tests/models/qwen27b/kvarn_fake_quant.hpp"
+#include "tests/support/kvarn_fake_quant.hpp"
 
 namespace gufo::testing::kvarn {
 

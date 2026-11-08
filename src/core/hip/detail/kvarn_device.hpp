@@ -4,7 +4,7 @@
 // KVarN device arithmetic shared by the models that use it
 // (src/core/hip/kvarn_layout.hpp): the in-wave 256-point Walsh-Hadamard
 // transform and the group-flush quantizer tile, bit-identical to the CPU
-// reference tests/models/qwen27b/kvarn_fake_quant.hpp. Include only from HIP
+// reference tests/support/kvarn_fake_quant.hpp. Include only from HIP
 // translation units; each model wraps the tile in its own kernel with its
 // row and record addressing. Moved from
 // src/models/qwen/hip/kernels/attention_kvarn.hip unchanged in arithmetic.
@@ -268,7 +268,7 @@ __device__ __forceinline__ float RoundedExp(float x) {
 // a wave and per-channel ones across the 16 waves through LDS. Standard
 // deviations sum in float-float where the reference sums in double, and
 // round to the same float; log and exp round once, correctly, as the K0
-// reference (tests/models/qwen27b/kvarn_fake_quant.hpp) does through double.
+// reference (tests/support/kvarn_fake_quant.hpp) does through double.
 // ---------------------------------------------------------------------------
 template<int VBits, KvarnValueOrder Order, int KBits = 4>
 __device__ __forceinline__ void KvarnQuantizeTile(

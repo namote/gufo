@@ -1,6 +1,6 @@
 // KVarN store operators of Qwen3.8 Flash-Next
 // (plan/exl3/archive/F1-KVARN-DESIGN.md 3, stage K1b) against the CPU reference
-// tests/models/qwen27b/kvarn_fake_quant.hpp:
+// tests/support/kvarn_fake_quant.hpp:
 //   * K/V writers given kKvarnFp16RowTag store position p at the FP16 sink
 //     and tail ring row hip::KvarnFp16Row(p), the same bytes the contiguous
 //     cache gets at row p;
@@ -42,7 +42,7 @@
 
 #include "src/core/hip/kvarn_layout.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
-#include "tests/models/qwen27b/kvarn_fake_quant.hpp"
+#include "tests/support/kvarn_fake_quant.hpp"
 
 namespace q = gufo::models::qwen38_flash_next::rocm;
 namespace hip = gufo::hip;
