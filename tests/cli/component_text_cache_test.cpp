@@ -41,6 +41,10 @@ public:
   bool defer_idle{};
   bool in_pass{};
   bool partial{};
+  std::size_t alignment{1};
+  /// Every prefill step's end and in-pass checkpoint, in order.
+  mutable std::vector<std::size_t> pass_ends;
+  mutable std::vector<std::size_t> in_pass_points;
   std::size_t private_blocks{128};
   cache::Rows rows_per_chunk{4};
   bool retain_rows{};
@@ -65,7 +69,8 @@ public:
                              .final_token_advance_required = false,
                              .prefix_reuse = true,
                              .in_pass_checkpoint = in_pass,
-                             .partial_prefill_retention = partial}};
+                             .partial_prefill_retention = partial,
+                             .prefill_alignment = alignment}};
   }
   TextRunnerResourceClaim ResourceClaim() const override {
     return {.state_capacity_bytes = 1ULL << 30,
@@ -187,6 +192,7 @@ public:
     const auto count = std::min(budget, prompt.size() - offset);
     s.adapter.Append(s.slot, prompt.subspan(offset, count),
                      prompt.subspan(offset, count));
+    pass_ends.push_back(offset + count);
     return {count, offset + count == prompt.size()};
   }
   std::optional<std::size_t> PrefillCheckpointBytes(
@@ -216,6 +222,8 @@ public:
     }
     const auto tail = prompt.subspan(boundary, offset + count - boundary);
     s.adapter.Append(s.slot, tail, tail);
+    in_pass_points.push_back(boundary);
+    pass_ends.push_back(offset + count);
     return {count, offset + count == prompt.size()};
   }
   TextDecodeSelection SelectNext(TextRunnerState& state,
@@ -320,6 +328,126 @@ void InPassCapturePreservesBoundaryAndLiveTail() {
     assert(Generate(independent) == resumed);
     independent.Invalidate();
   }
+}
+// A runner whose prefill continues a prompt exactly only from multiples of
+// four (Flash-Next's sparse tiles) ends every step but the last there and
+// rounds its stable and intermediate checkpoints down. A restore then starts
+// on that boundary and re-prefills the rest. The complete prompt is kept
+// exact for an unchanged retry, but a longer prompt never continues it.
+void AlignedPrefillKeepsAlignedBoundaries() {
+  std::vector<TextRunnerToken> prompt(41);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  const auto aligned = [](const std::vector<std::size_t>& positions,
+                          std::size_t last) {
+    return std::ranges::all_of(positions, [&](std::size_t position) {
+      return position % 4 == 0 || position == last;
+    });
+  };
+  auto runner = std::make_shared<Runner>();
+  runner->alignment = 4;
+  runner->in_pass = true;
+  TextRunnerPool pool(runner, 2);
+  // The stable boundary 35 starts the final user turn.
+  auto seed =
+      pool.Acquire(prompt, sampling::SamplingConfig{}, {}, {}, true, 35);
+  while (!seed.prefill_complete())
+    (void)seed.Prefill(10);
+  assert((runner->pass_ends == std::vector<std::size_t>{8, 16, 24, 32, 41}));
+  assert(runner->in_pass_points.empty());
+  const auto expected = Generate(seed);
+  (void)seed.Commit();
+  for (const auto [edit, cached] :
+       {std::pair{40U, 32U}, std::pair{36U, 32U}, std::pair{33U, 32U}}) {
+    auto branch = prompt;
+    branch[edit] = 999;
+    runner->pass_ends.clear();
+    runner->in_pass_points.clear();
+    auto restored =
+        pool.Acquire(branch, sampling::SamplingConfig{}, {}, {}, true, 35);
+    assert(restored.cached_prompt_tokens() == cached);
+    while (!restored.prefill_complete())
+      (void)restored.Prefill(3);
+    assert(aligned(runner->pass_ends, branch.size()));
+    assert(aligned(runner->in_pass_points, branch.size()));
+    (void)Generate(restored);
+    restored.Invalidate();
+  }
+  // A longer prompt restores an aligned boundary, not the complete prompt:
+  // here 40, the aligned prompt tail that the branch editing position 40
+  // captured (its stable boundary is nearby, so it targets the prompt end,
+  // rounded down to the alignment), over tokens equal to this prompt's.
+  auto longer = prompt;
+  longer.insert(longer.end(), {7, 8, 9});
+  runner->pass_ends.clear();
+  auto extended =
+      pool.Acquire(longer, sampling::SamplingConfig{}, {}, {}, true, 35);
+  assert(extended.cached_prompt_tokens() == 40);
+  while (!extended.prefill_complete())
+    (void)extended.Prefill(3);
+  assert(aligned(runner->pass_ends, longer.size()));
+  (void)Generate(extended);
+  extended.Invalidate();
+  // An unchanged retry restores the complete prompt without prefill.
+  auto retry =
+      pool.Acquire(prompt, sampling::SamplingConfig{}, {}, {}, true, 35);
+  assert(retry.cached_prompt_tokens() == prompt.size());
+  assert(retry.prefill_complete());
+  assert(Generate(retry) == expected);
+  retry.Invalidate();
+}
+// A request that stops at an unaligned prompt end before advancing a token
+// (one-token completions) drops its live frontier there, but still publishes
+// the complete prompt, which an unchanged retry restores without prefill.
+void UnalignedPromptEndPublishesBeforeDroppingTheFrontier() {
+  std::vector<TextRunnerToken> prompt(41);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  auto runner = std::make_shared<Runner>();
+  runner->alignment = 4;
+  runner->in_pass = true;
+  TextRunnerPool pool(runner, 2);
+  auto seed =
+      pool.Acquire(prompt, sampling::SamplingConfig{}, {}, {}, true, 35);
+  Prefill(seed);
+  (void)seed.Commit();
+  auto retry =
+      pool.Acquire(prompt, sampling::SamplingConfig{}, {}, {}, true, 35);
+  assert(retry.cached_prompt_tokens() == prompt.size());
+  assert(retry.prefill_complete());
+  (void)Generate(retry);
+  retry.Invalidate();
+}
+// Raw completions have no separate stable chat boundary. Keep an aligned
+// near-end fallback as well as the exact prompt retry across slot reuse.
+void UnalignedRawPromptKeepsAnAlignedContinuation() {
+  std::vector<TextRunnerToken> prompt(41);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  auto runner = std::make_shared<Runner>();
+  runner->alignment = 4;
+  runner->in_pass = true;
+  TextRunnerPool pool(runner, 1);
+  auto seed = pool.Acquire(prompt, sampling::SamplingConfig{});
+  (void)seed.Prefill(64);
+  assert((runner->pass_ends == std::vector<std::size_t>{41}));
+  assert((runner->in_pass_points == std::vector<std::size_t>{40}));
+  const auto expected = Generate(seed);
+  (void)seed.Commit();
+  auto unrelated =
+      pool.Acquire({999, 998, 997, 996}, sampling::SamplingConfig{});
+  Prefill(unrelated);
+  (void)Generate(unrelated);
+  (void)unrelated.Commit();
+  auto retry = pool.Acquire(prompt, sampling::SamplingConfig{});
+  assert(retry.cached_prompt_tokens() == prompt.size());
+  assert(retry.prefill_complete());
+  assert(Generate(retry) == expected);
+  retry.Invalidate();
+  auto longer = prompt;
+  longer.insert(longer.end(), {7, 8, 9});
+  auto extended = pool.Acquire(longer, sampling::SamplingConfig{});
+  assert(extended.cached_prompt_tokens() == 40);
+  Prefill(extended);
+  (void)Generate(extended);
+  extended.Invalidate();
 }
 void ColdAcquireResetsOnce() {
   auto runner = std::make_shared<Runner>();
@@ -2129,6 +2257,52 @@ void ColdAssignmentCapturesUncoveredFrontier() {
   (void)run(std::vector<TextRunnerToken>(12, 8));
   assert(runner->captures == before);
 }
+// A copy of a live frontier restores at its own position even off the
+// prefill alignment: it is the state live reuse would have continued. Both
+// the RAM copy of a reassigned slot and the idle disk write-back.
+void UnalignedLiveFrontierCopiesRestore() {
+  std::vector<TextRunnerToken> conversation(101);
+  std::iota(conversation.begin(), conversation.end(), 10);
+  auto next = conversation;
+  next.push_back(7);
+  const auto turn = [](ComponentTextCache& cache, Runner& runner,
+                       const std::vector<TextRunnerToken>& tokens) {
+    auto lease = cache.Acquire(tokens, {}, {}, true, 0, true);
+    const auto cached = lease->cached_tokens();
+    const bool disk_hit = lease->restored_from_disk();
+    auto& state = dynamic_cast<State&>(lease->state());
+    const auto tail = std::span(tokens).subspan(cached);
+    runner.adapter->Append(state.slot, tail, tail);
+    (void)lease->Commit({}, {}, tokens);
+    return std::pair{cached, disk_hit};
+  };
+  {
+    auto runner = std::make_shared<Runner>();
+    runner->alignment = 4;
+    ComponentTextCache cache(runner, 1, 1 << 22, {});
+    (void)turn(cache, *runner, conversation);
+    // The only slot goes to another prompt: the frontier is captured.
+    (void)turn(cache, *runner, std::vector<TextRunnerToken>(12, 5));
+    const auto [cached, disk_hit] = turn(cache, *runner, next);
+    assert(cached == conversation.size() && !disk_hit);
+  }
+  const TemporaryDirectory temp("gufo-component-unaligned-frontier-test");
+  const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
+                                        .capacity_bytes = 1 << 22,
+                                        .staging_capacity_bytes = 7};
+  {
+    auto runner = std::make_shared<Runner>();
+    runner->alignment = 4;
+    ComponentTextCache cache(runner, 2, 1 << 22, disk);
+    (void)turn(cache, *runner, conversation);
+    assert(cache.WriteBackIdle(std::chrono::milliseconds(0)) == 1);
+  }
+  auto runner = std::make_shared<Runner>();
+  runner->alignment = 4;
+  ComponentTextCache cache(runner, 2, 1 << 22, disk);
+  const auto [cached, disk_hit] = turn(cache, *runner, next);
+  assert(cached == conversation.size() && disk_hit);
+}
 void IdleWriteBackResumesFromLastTurn() {
   // A finished turn leaves only a live frontier (no checkpoint at its end).
   // The idle write-back, or else the shutdown pass of the destructor, puts
@@ -3005,6 +3179,7 @@ int main() {
   ColdAssignmentCapturesUncoveredFrontier();
   ShutdownWriteBackSharesQueuedCheckpoint();
   IdleWriteBackResumesFromLastTurn();
+  UnalignedLiveFrontierCopiesRestore();
   RefusedCaptureIsKnownBeforePrefill();
   WriteBackReusesPersistedChunks();
   PagedRowsAdmitWaitAndReclaim();
@@ -3018,6 +3193,9 @@ int main() {
   CompletedCancelledPromptGetsARetrySnapshot();
   BudgetUsesAllocatedSlotsInsteadOfLazyStateClaim();
   InPassCapturePreservesBoundaryAndLiveTail();
+  AlignedPrefillKeepsAlignedBoundaries();
+  UnalignedPromptEndPublishesBeforeDroppingTheFrontier();
+  UnalignedRawPromptKeepsAnAlignedContinuation();
   ColdAcquireResetsOnce();
   ColdAssignmentAvoidsDrainingCancelledSlot();
   ColdAssignmentAvoidsDrainingCancelledSlot(true);

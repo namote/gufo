@@ -147,6 +147,11 @@ struct TextRunnerCapabilities {
   /// Interrupted prefill rolls back to its entry frontier without consuming
   /// input, so cancellation need not wait for the whole pass.
   bool prefill_rollback{false};
+  /// Prefill continues a prompt exactly only from positions divisible by
+  /// this. Intermediate pass ends and published prompt checkpoints are
+  /// rounded down to it, except the complete prompt, which only an
+  /// unchanged retry restores; one keeps every position.
+  std::size_t prefill_alignment{1};
 };
 
 /// Model-owned compatibility identity for restart-safe snapshots.

@@ -2688,6 +2688,10 @@ public:
                 .prefix_reuse = true,
                 .in_pass_checkpoint = !model_->Kvarn() && !kv_pool_,
                 .partial_prefill_retention = true,
+                // Sparse prefill tiles group four queries from each pass
+                // start: one selection block (compress ratio).
+                .prefill_alignment =
+                    std::max<std::size_t>(1, model_->config().compress_ratio),
             },
         .persistence = persistence_,
     };
@@ -2931,10 +2935,10 @@ public:
     }
     const std::size_t remaining = prompt.size() - offset;
     const std::size_t consumed =
-        std::min<std::size_t>({max_input_tokens, remaining,
-                               remaining <= model_->PrefillThroughCapacity()
-                                   ? model_->PrefillThroughCapacity()
-                                   : model_->PrefillCapacity()});
+        StepTokens(offset, max_input_tokens, remaining,
+                   remaining <= model_->PrefillThroughCapacity()
+                       ? model_->PrefillThroughCapacity()
+                       : model_->PrefillCapacity());
     const std::size_t next_position = offset + consumed;
     const auto prefix = QwenFlashNextEngineTokens(prompt.first(next_position));
     // The next step most likely takes the same budget; its n-gram rows are
@@ -2966,10 +2970,10 @@ public:
       std::size_t offset, std::size_t budget,
       std::size_t boundary) const override {
     const auto& qfn = RequireQwenFlashNextState(state);
-    const auto consumed = std::min<std::size_t>(
-        {budget, prompt.size() - offset, model_->PrefillThroughCapacity()});
+    const auto consumed = StepTokens(offset, budget, prompt.size() - offset,
+                                     model_->PrefillThroughCapacity());
     if (boundary <= offset + 1 || boundary >= offset + consumed ||
-        offset + consumed - boundary > 8)
+        offset + consumed - boundary > model_->PrefillCheckpointTail())
       return std::nullopt;
     const auto bytes = qfn.session().PrefillCheckpointBytes(
         static_cast<std::uint32_t>(boundary));
@@ -2985,8 +2989,8 @@ public:
     auto& qfn = RequireQwenFlashNextState(state);
     if (!checkpoint || !capture || offset != qfn.position())
       throw std::logic_error("invalid component in-pass checkpoint request");
-    const auto consumed = std::min<std::size_t>(
-        {budget, prompt.size() - offset, model_->PrefillThroughCapacity()});
+    const auto consumed = StepTokens(offset, budget, prompt.size() - offset,
+                                     model_->PrefillThroughCapacity());
     const auto next_position = offset + consumed;
     const auto prefix = QwenFlashNextEngineTokens(prompt.first(next_position));
     double capture_ms = 0;
@@ -3218,6 +3222,21 @@ public:
   }
 
 private:
+  /// Tokens one prefill step takes from `offset`. A step the pass capacity
+  /// ends before the prompt stops on a selection block (prefill_alignment),
+  /// as the serving runner ends budget-limited ones, so the next step
+  /// continues the prompt exactly from an unaligned reused frontier too.
+  [[nodiscard]] std::size_t StepTokens(std::size_t offset, std::size_t budget,
+                                       std::size_t remaining,
+                                       std::size_t capacity) const noexcept {
+    auto count = std::min({budget, remaining, capacity});
+    const std::size_t ratio =
+        std::max<std::uint32_t>(1, model_->config().compress_ratio);
+    if (const auto over = (offset + count) % ratio;
+        count < remaining && count > over)
+      count -= over;
+    return count;
+  }
   std::shared_ptr<RequestMemoryBudget> image_memory_ =
       std::make_shared<RequestMemoryBudget>();
   mutable models::qwen::vision::ImageCache image_cache_;
@@ -3232,6 +3251,15 @@ private:
 #endif
 
 }  // namespace
+
+#if defined(ENGINE_ENABLE_HIP)
+std::shared_ptr<TextModelRunner> CreateQwenFlashNextTextRunner(
+    std::shared_ptr<models::qwen38_flash_next::Model> model,
+    std::uint32_t max_context) {
+  return std::make_shared<QwenFlashNextTextRunner>(std::move(model),
+                                                   max_context, false, 0);
+}
+#endif
 
 struct InferenceBackend::Impl {
 #if defined(ENGINE_ENABLE_HIP)

@@ -198,6 +198,14 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
+#if defined(ENGINE_ENABLE_HIP)
+/// The serving text runner of a loaded Flash-Next model, autoregressive and
+/// without persistence (model tests drive TextRunnerPool with it).
+[[nodiscard]] std::shared_ptr<TextModelRunner> CreateQwenFlashNextTextRunner(
+    std::shared_ptr<models::qwen38_flash_next::Model> model,
+    std::uint32_t max_context);
+#endif
+
 }  // namespace gufo::server
 
 #endif  // GUFO_SERVER_INFERENCE_BACKEND_HPP_

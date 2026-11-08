@@ -110,6 +110,14 @@ bool Published(const cache::PrefixCandidate& candidate) {
 // A learned (shared) boundary is written whatever its spacing. Like a grid
 // capture, it does not consume the spacing allowance of the conversation's
 // own next checkpoint.
+// A copy of a live frontier (CaptureBeforeReset, WriteBackIdle) restores at
+// any position: its state is the one live reuse would continue. A prompt
+// checkpoint restores exactly only on the prefill alignment.
+bool AnyPosition(const cache::PrefixCandidate& candidate) {
+  return (candidate.checkpoint ? candidate.checkpoint->Purpose()
+                               : candidate.durable->Manifest().purpose) ==
+         cache::CheckpointPurpose::kGenerated;
+}
 bool SpacingAnchor(cache::CheckpointPurpose purpose) {
   return purpose != cache::CheckpointPurpose::kLearned;
 }
@@ -820,6 +828,9 @@ struct ComponentTextCache::Lease::Impl {
   SnapshotPurpose purpose{SnapshotPurpose::kContinuation};
   // CaptureDurable for WriteBackIdle: the disk step does not apply.
   bool write_back{};
+  // A copy of a live frontier (CaptureBeforeReset, WriteBackIdle), published
+  // as CheckpointPurpose::kGenerated.
+  bool live_frontier{};
   std::vector<cache::Token> capture_tokens;
   ContinuationLookup lookup_result;
   ComponentCacheMetrics metrics;
@@ -930,7 +941,8 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
   manifest.tokens = capture_tokens;
   manifest.purpose = purpose == SnapshotPurpose::kBranchPoint
                          ? cache::CheckpointPurpose::kLearned
-                         : cache::CheckpointPurpose::kPrompt;
+                     : live_frontier ? cache::CheckpointPurpose::kGenerated
+                                     : cache::CheckpointPurpose::kPrompt;
   manifest.components.reserve(descriptors.size());
   durable->sources.reserve(pieces);
   std::vector<Copy> copies;
@@ -1172,6 +1184,7 @@ void ComponentTextCache::CaptureBeforeReset(std::size_t index,
         impl_.get(), entry, entry->slot->Acquire(location), tokens,
         cache::InputIdentity(tokens.size(), input), tokens.size()));
     lease.impl_->write_back = write_back;
+    lease.impl_->live_frontier = true;
     try {
       // Retry priority: the copy may only displace other optional copies,
       // and is the first to go when prompt or shared checkpoints need the
@@ -1284,6 +1297,7 @@ std::size_t ComponentTextCache::WriteBackIdle(
           impl_.get(), entry, entry->slot->Acquire(location), tokens,
           cache::InputIdentity(tokens.size(), input), tokens.size()));
       lease.impl_->write_back = true;
+      lease.impl_->live_frontier = true;
       lease.impl_->capture_tokens = tokens;
       try {
         if (auto snapshot = lease.impl_->CaptureDurable()) {
@@ -1718,10 +1732,18 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     bool restored = bool(live);
     if (live)
       request.cached = found.selected->boundary;
+    // Prefill continues a checkpoint exactly only from an aligned position.
+    // The complete prompt stays off the alignment for an unchanged retry,
+    // which continues it without prefill; a longer prompt takes an aligned
+    // boundary instead (TextRunnerCapabilities::prefill_alignment).
+    const std::size_t alignment = std::max<std::size_t>(
+        1, impl_->runner->Descriptor().capabilities.prefill_alignment);
     for (const auto& candidate : found.candidates) {
       if (restored || (cancelled && cancelled()))
         break;
-      if (candidate.live)
+      if (candidate.live ||
+          (candidate.boundary % alignment != 0 &&
+           candidate.boundary < prompt.size() && !AnyPosition(candidate)))
         continue;
       try {
         if (candidate.checkpoint) {
@@ -1971,6 +1993,8 @@ std::optional<TextPendingPublication> ComponentTextCache::PendingPublication(
   if (!impl_->queue)
     return std::nullopt;
   const auto input = Inputs(prompt.size(), context);
+  const std::size_t alignment = std::max<std::size_t>(
+      1, impl_->runner->Descriptor().capabilities.prefill_alignment);
   const std::lock_guard lock(impl_->mutex);
   const auto found =
       impl_->index.Lookup({impl_->identity, prompt, input, 0, true});
@@ -1983,7 +2007,10 @@ std::optional<TextPendingPublication> ComponentTextCache::PendingPublication(
     if (checkpoint_id && id != checkpoint_id)
       continue;
     const auto& tokens = capture->manifest.tokens;
+    // Acquire skips an unaligned prompt checkpoint below the prompt end.
     if (tokens.size() > prompt.size() ||
+        (tokens.size() % alignment != 0 && tokens.size() < prompt.size() &&
+         capture->manifest.purpose != cache::CheckpointPurpose::kGenerated) ||
         capture->manifest.input != At(input, tokens.size()) ||
         !std::equal(tokens.begin(), tokens.end(), prompt.begin()))
       continue;
@@ -2170,7 +2197,8 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
                ? cache::CheckpointPurpose::kGrid
            : request.purpose == SnapshotPurpose::kBranchPoint
                ? cache::CheckpointPurpose::kLearned
-               : cache::CheckpointPurpose::kPrompt,
+           : request.live_frontier ? cache::CheckpointPurpose::kGenerated
+                                   : cache::CheckpointPurpose::kPrompt,
            0},
           [&](const cache::PayloadRequest&) {
             const auto i = next_buffer++;

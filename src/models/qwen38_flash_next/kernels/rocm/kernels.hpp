@@ -792,6 +792,13 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
 /// falls back to Attention. `gate_stride` 0: gate is [token][heads * d];
 /// otherwise gate points at the first gate half of packed [q | gate] head
 /// pairs with that token stride (the projection rows, no unpacked copy).
+/// With a mask, each tile packs four consecutive queries from the first row
+/// and gathers the union of their selections, so a row's rounding depends on
+/// which queries share its tile. A prompt split therefore matches one pass
+/// only when every pass after the first starts on a multiple of four.
+/// Session::Feed keeps its own passes there, and the serving runner rounds
+/// pass ends and checkpoints to TextRunnerCapabilities::prefill_alignment
+/// (asserted in TextRunnerPool::Request::Prefill).
 bool WmmaCausalAttention(
     const float* q, const float* gate, const __half* k_cache,
     const __half* v_cache, const std::uint32_t* mask, std::uint32_t mask_words,
