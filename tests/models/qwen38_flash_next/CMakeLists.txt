@@ -31,7 +31,6 @@ add_qwen38_flash_next_test(rope_scaling gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(rope_scaling_oracle
   gufo_qwen38_flash_next_reference "cpu")
 add_qwen38_flash_next_test(draft_vocab gufo_core "cpu")
-add_qwen38_flash_next_test(prompt_lookup gufo_core "cpu")
 
 add_executable(qwen38_flash_next_reference_probe EXCLUDE_FROM_ALL reference_probe.cpp)
 target_link_libraries(qwen38_flash_next_reference_probe PRIVATE
@@ -106,7 +105,7 @@ if (ENGINE_ENABLE_HIP)
   set_source_files_properties(exl3_invariance_test.cpp PROPERTIES LANGUAGE HIP)
   foreach(name IN ITEMS mtp_ops blaslt_ops hc_mix_ops gdn_ops
       attention_ops attention_rows moe_epilogue_ops moe_ids_ops projection_ops routed_wmma_ops
-      select_ops snapshot_copy verification_sampling kvarn_ops)
+      select_ops verification_sampling kvarn_ops)
     add_qwen38_flash_next_test(${name} gufo_qwen38_flash_next "hip;gpu;gfx1151")
   endforeach()
   add_test(NAME qwen38_flash_next.mtp_kv

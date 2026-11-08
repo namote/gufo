@@ -108,6 +108,8 @@ if (ENGINE_ENABLE_HIP)
     gufo_cache_hip
     gufo_qwen38_flash_next_mmq hip::host roc::hipblas roc::hipblaslt)
 
+  # Tool builds without tests still get the continuation probe, which
+  # tests/models/qwen38_flash_next declares when testing is on.
   if (GUFO_BUILD_TOOLS AND NOT BUILD_TESTING)
     add_executable(qwen38_flash_next_continuation_probe EXCLUDE_FROM_ALL
       ${PROJECT_SOURCE_DIR}/tests/models/qwen38_flash_next/continuation_probe.cpp)

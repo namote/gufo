@@ -650,6 +650,11 @@ if (BUILD_TESTING)
   add_test(NAME heap_placement_test COMMAND heap_placement_test)
   set_tests_properties(heap_placement_test PROPERTIES LABELS "cpu;hip;core")
 
+  add_executable(prompt_lookup_test tests/core/prompt_lookup_test.cpp)
+  target_link_libraries(prompt_lookup_test PRIVATE gufo_core)
+  add_test(NAME prompt_lookup_test COMMAND prompt_lookup_test)
+  set_tests_properties(prompt_lookup_test PROPERTIES LABELS "cpu;core;speculative")
+
   add_executable(sampling_test tests/core/sampling_test.cpp)
   target_link_libraries(sampling_test PRIVATE gufo_core)
   add_test(NAME sampling_test COMMAND sampling_test)
@@ -1383,6 +1388,11 @@ if (BUILD_TESTING)
     set_tests_properties(hip_memory_visibility_driver_test PROPERTIES
       LABELS "gpu;hip;gfx1151"
       ENVIRONMENT "HSA_USERPTR_FOR_PAGED_MEM=0")
+
+    add_executable(snapshot_copy_test tests/core/snapshot_copy_test.cpp)
+    target_link_libraries(snapshot_copy_test PRIVATE gufo_core hip::host)
+    add_test(NAME snapshot_copy_test COMMAND snapshot_copy_test)
+    set_tests_properties(snapshot_copy_test PROPERTIES LABELS "gpu;hip;gfx1151")
 
     add_executable(hip_weight_upload_test tests/core/hip_weight_upload_test.cpp)
     target_link_libraries(hip_weight_upload_test PRIVATE gufo_core)

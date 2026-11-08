@@ -1,5 +1,5 @@
 // Frozen copy of the four-lane HC combine of
-// src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp,
+// src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp (now hc.hip.cpp),
 // HcCombineVec4Kernel, at commit bec85727 (plain residual stores), with its
 // device helpers, verbatim apart from the kernel's name and its dropped
 // kInject specialization (a __half-route option the FP32 route never
