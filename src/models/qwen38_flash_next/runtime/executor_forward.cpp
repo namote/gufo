@@ -68,10 +68,25 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
               "graph capture", error_msg)) {
         return false;
       }
+      // An exception from the body must end the HIP capture too, or later
+      // requests inherit a live capture on this stream.
+      struct CaptureScope {
+        hipStream_t origin;
+        bool active{true};
+        ~CaptureScope() {
+          if (active) {
+            hipGraph_t abandoned = nullptr;
+            (void)hipStreamEndCapture(origin, &abandoned);
+            if (abandoned != nullptr)
+              (void)hipGraphDestroy(abandoned);
+          }
+        }
+      } capture_scope{stream_};
       const bool ok = body();
-      if (!Check(hipStreamEndCapture(stream_, &captured), "graph capture end",
-                 error_msg) ||
-          !ok) {
+      const auto capture_status =
+          hipStreamEndCapture(capture_scope.origin, &captured);
+      capture_scope.active = false;
+      if (!Check(capture_status, "graph capture end", error_msg) || !ok) {
         if (captured != nullptr) {
           (void)hipGraphDestroy(captured);
         }

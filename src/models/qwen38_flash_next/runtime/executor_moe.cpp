@@ -296,12 +296,34 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
     }
     stream_ = side_stream_;
   }
-  // However the shared expert exits, later work returns to the main stream.
-  struct MainStream {
+  // However the shared expert exits, even by an exception, later work
+  // returns to the main stream and queued side work is published for the
+  // join guard (upstream #1048).
+  struct SharedScope {
     const Executor* executor;
     hipStream_t main;
-    ~MainStream() { executor->stream_ = main; }
-  } main_stream{this, main};
+    bool overlap;
+    bool finished{false};
+    hipError_t Finish() noexcept {
+      executor->stream_ = main;
+      if (finished)
+        return hipSuccess;
+      finished = true;
+      if (!overlap)
+        return hipSuccess;
+      const auto status =
+          hipEventRecord(executor->side_done_, executor->side_stream_);
+      if (status == hipSuccess) {
+        executor->side_pending_ = true;
+      } else if (!executor->SideCapturing()) {
+        // Nothing to join: wait for the whole side stream instead (not while
+        // a graph captures it; capture cleanup discards recorded work).
+        (void)hipStreamSynchronize(executor->side_stream_);
+      }
+      return status;
+    }
+    ~SharedScope() { (void)Finish(); }
+  } shared_scope{this, main, overlap};
   const DeviceTensor* const shared_inputs[] = {&l.shexp_gate, &l.shexp_up};
   const auto shared_expert = [&] {
     shexp_half_ready_ = false;
@@ -327,18 +349,8 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
     return Dense(l.shexp_down, s_.shexp_up, s_.shexp_out, n_tokens, error_msg);
   };
   const bool shared_ok = exl3_overlap || shared_expert();
-  stream_ = main;
-  if (overlap) {
-    if (!Check(hipEventRecord(side_done_, side_stream_), "side stream join",
-               error_msg)) {
-      // Nothing to join: wait for the whole side stream instead (not while
-      // a graph captures it).
-      if (!SideCapturing())
-        (void)hipStreamSynchronize(side_stream_);
-      return false;
-    }
-    side_pending_ = true;
-  }
+  if (!Check(shared_scope.Finish(), "side stream join", error_msg))
+    return false;
   if (!shared_ok) {
     return false;
   }
