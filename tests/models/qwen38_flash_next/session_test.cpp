@@ -15,6 +15,7 @@
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "tests/models/qwen38_flash_next/mtp_replay.hpp"
 #include "tests/support/sampling_cases.hpp"
 
@@ -116,11 +117,20 @@ void CheckFailureRecovery(const std::shared_ptr<qfn::Model>& model) {
   Require(session != nullptr, error);
   const auto initial_bytes = session->AllocatedBytes();
   const auto& c = model->config();
-  const auto checkpoint_bytes =
+  // Rollback rows are reserved on the first speculative forward, so a fresh
+  // session holds none and its text-state bound still includes them. With
+  // the deferred GDN verify, the first row per linear layer is its conv
+  // history plus two GDN update records, not a full recurrent state.
+  Require(session->Memory().rollback_bytes == 0,
+          "unused deep rollback state was allocated eagerly");
+  const auto first_rollback_row_bytes =
       std::size_t{c.num_layers - c.num_layers / c.full_attention_interval} *
-      c.ssm_num_v_heads * c.ssm_head_dim * c.ssm_head_dim * sizeof(float);
-  Require(model->SessionBytes(gufo::core::SessionMode::kSpeculative, 4096) >
-              initial_bytes + checkpoint_bytes,
+      (std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels() +
+       qfn::rocm::GdnRollbackRowFloats(0, c.ssm_num_k_heads, c.ssm_num_v_heads,
+                                       c.ssm_head_dim)) *
+      sizeof(float);
+  Require(model->BaseSessionBytes(gufo::core::SessionMode::kSpeculative, 4096) >
+              initial_bytes + first_rollback_row_bytes,
           "unused deep rollback state was allocated eagerly");
   const auto pattern =
       model->Tokenize("Explain virtual memory in a short sentence.");
