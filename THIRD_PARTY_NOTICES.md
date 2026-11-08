@@ -98,6 +98,7 @@ Nathan Wilson's notice is retained in
 | SoX | Development audio utility | `GPL-2.0-or-later` | flake.lock | [SoX](https://sourceforge.net/projects/sox/) |
 | antirez/ds4 | Optional benchmark package; not shipped with Gufo | `MIT` | `0aaea5a238fb41a35106a551e73c8409dfb751ac` | [Nix recipe](.devops/nix/ds4-reference.nix) |
 | llama.cpp reference builds | Optional benchmark packages; not shipped with Gufo | `MIT` | Release `68d9053a`; Flash-Next MTP `6fcaa16f` | [Nix recipes](.devops/nix/llama-cpp-reference.nix) |
+| Kyojin / ExLlamaV3 (Yamz-Labs fork of turboderp-org/exllamav3) | External EXL3 converter, fetched at build time for `tools/exl3_quant/`; never vendored or shipped | `MIT` (Copyright (c) 2025 Turboderp; LICENSE kept in the fetched archive) | v1.8.6 `fbde8a3670c80727a202da3bce581da2de7c88da`; archive SHA-256 `dae498bd6bb2767dd06e46a94fa1dafa9b33be9362d0c8bbce0ae1c2b99f7194` | [Yamz-Labs/kyojin](https://github.com/Yamz-Labs/kyojin), [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3); [pin](tools/exl3_quant/kyojin/pin.py) |
 | Torchvision AlexNet weights | Evaluation data only; not shipped | `NOASSERTION` | SHA-256 `7be5be791159472b1fbf3c69796f7cb30dca7ad8466c2df70058c37116cdee02` | [PyTorch model distribution](https://download.pytorch.org/models/alexnet-owt-7be5be79.pth) |
 
 Python/PyTorch and reference scripts are not installed with Gufo. Their own

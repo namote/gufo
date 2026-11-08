@@ -1,0 +1,122 @@
+diff -ruN a/tools/qwen/serve.py b/tools/qwen/serve.py
+--- a/tools/qwen/serve.py
++++ b/tools/qwen/serve.py
+@@ -764,7 +764,7 @@
+ 
+     def __init__(self, model_path: str, ctx: int, ndt: int = 7, draft_policy: str = "mix",
+                  vision: bool = True, max_chunk_size: int = 2048, cache_bits: int = 0, sessions: int = 1,
+-                 k_bits: int = 0, v_bits: int = 0, dflash_dir: str = "", kv_mode: str = "quant"):
++                 k_bits: int = 0, v_bits: int = 0, dflash_dir: str = "", kv_mode: str = "quant", max_context: int | None = None):
+         # The measured Qwen serving configuration. Read at import time by the engine:
+         # set before importing exllamav3. The caller's environment wins.
+         import torch
+@@ -809,7 +809,11 @@
+         import spec_policy  # tools/qwen/spec_policy.py
+         pl = spec_policy.plain_lookup_from_env(self.row_budget)   # drafter-free lookup (plain rounds): its K needs the same history depth
+         ndt = max(ndt, int(os.environ.get("QWSPEC_MAXD") or 0), int(os.environ.get("QWSPEC_FIXD") or 0), pl[1] if pl else 0)  # buffers fit the deepest draft
+-        self.model_path, self.ctx, self.ndt, self.draft_policy = model_path, ctx, ndt, draft_policy
++        self.model_path, self.pool_ctx, self.ndt, self.draft_policy = model_path, ctx, ndt, draft_policy
++        # Pool capacity belongs to all sessions; ctx is the per-request limit.
++        self.ctx = ctx if max_context is None else max_context
++        if not 0 < self.ctx <= self.pool_ctx:
++            raise ValueError("max_context must be positive and no larger than the KV pool")
+         self.config = Config.from_directory(model_path)
+         self.tokenizer = Tokenizer.from_config(self.config)
+         if os.environ.get("KYO_TOKCACHE", "8") == "0":
+@@ -1336,7 +1340,7 @@
+ 
+         while True:
+             max_new = max(max_tokens - generated + discount, 1)
+-            rq = serve_compat.rq_budget(ctx, self.sessions, int(job_ids.numel()), max_new, int(getattr(self.generator, "num_draft_tokens", 0)), PAGE_TOKENS)
++            rq = serve_compat.rq_budget(self.pool_ctx, self.sessions, int(job_ids.numel()), max_new, int(getattr(self.generator, "num_draft_tokens", 0)), PAGE_TOKENS)
+             job = self.Job(input_ids=job_ids, max_new_tokens=max_new,
+                            sampler=self._sampler(sampling), stop_conditions=([] if ignore_eos else self.eos) + list(stop),
+                            embeddings=embs or None, decode_special_tokens=True, seed=seed,
+@@ -1601,7 +1605,10 @@
+              "max_context": getattr(engine, "ctx", None)}]})
+ 
+     async def health(_: web.Request) -> web.Response:
+-        return web.json_response({"status": "ok", "source": "kyojin", "model": model_id, "vision": bool(engine.supports_vision), **startup_health.compiler_health(),
++        return web.json_response({"status": "ok", "source": "kyojin", "model": model_id, "vision": bool(engine.supports_vision),
++                                  "max_context": getattr(engine, "ctx", None),
++                                  "kv_pool_tokens": getattr(getattr(engine, "cache", None), "max_num_tokens", None),
++                                  **startup_health.compiler_health(),
+                                   **(engine.spec_stats() if hasattr(engine, "spec_stats") else {})})
+ 
+     @contextlib.asynccontextmanager
+@@ -2369,7 +2376,7 @@
+           f"defaults={ {k: v for k, v in defaults.items() if v is not None} }", flush=True)
+     engine = QwenEngine(model_dir, args.ctx, ndt=args.ndt, draft_policy=args.draft_policy, vision=not args.no_vision,
+                         cache_bits=args.cache_bits, sessions=args.sessions,
+-                        k_bits=args.k_bits, v_bits=args.v_bits, dflash_dir=str(Path(args.dflash_dir).expanduser()), kv_mode=args.kv_mode)
++                        k_bits=args.k_bits, v_bits=args.v_bits, dflash_dir=str(Path(args.dflash_dir).expanduser()), kv_mode=args.kv_mode, max_context=args.max_context)
+     env = {k: v for k, v in sorted(os.environ.items()) if k.startswith(("EXL3_", "MPW"))}
+     print(f"qserve: effective env {env}", flush=True)
+     from exllamav3.generator.slot_store import SlotStore
+@@ -2420,6 +2427,8 @@
+     parser.add_argument("--admin-knobs", action="store_true", help="opt in to POST /admin/knobs (loopback clients only): switch the A/B knobs of exllamav3.util.knobs without a reload")
+     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID, help="id shown by /v1/models and expected in requests")
+     parser.add_argument("--ctx", "-c", type=int, default=65536, help="KV cache size in tokens (default 65536)")
++    parser.add_argument("--max-context", type=int, default=None,
++                        help="Per-request token limit, independent of the shared --ctx pool (default: pool size)")
+     parser.add_argument("--cache-bits", type=int, default=0, choices=(0, 8),
+                         help="bits per K/V element of the attention cache pages (0 = fp16, the default; 8 = packed int8, about 40 %% smaller pages, saves 2.6 GiB at 256K, greedy output differs from the 16-bit cache; with EXL3_ROW_INV_GROUPS=1 four parallel sessions matched solo runs, 16 of 16)")
+     parser.add_argument("--k-bits", type=int, default=0, choices=(0, 2, 3, 4, 5, 6, 7, 8), help="K bits of the quantized attention cache (with --v-bits; overrides --cache-bits)")
+@@ -2463,6 +2472,8 @@
+         parser.error("--draft-policy dflash needs --dflash-dir")
+     if args.draft_policy == "dflash":
+         os.environ.setdefault("EXL3_DFLASH_ADAPT", "1" if args.dflash_adapt == "on" else "0")
++    if args.max_context is not None and not 0 < args.max_context <= args.ctx:
++        parser.error("--max-context must be positive and no larger than --ctx")
+     if args.sessions < 1:
+         parser.error("--sessions must be at least 1")
+     # Measured with --ndt 3: greedy output equal to a solo run on two short prompts at 2 sessions with --cache-bits 0; not at
+@@ -2508,7 +2519,7 @@
+         sock = startup_health.finish()                            # the early listener's open socket: no refused connection
+         site = web.SockSite(runner, sock) if sock is not None else web.TCPSite(runner, args.host, args.port)
+         await site.start()
+-        print(f"qserve: READY on http://{args.host}:{args.port}  model={args.model_id} ctx={args.ctx} sessions={args.sessions} "
++        print(f"qserve: READY on http://{args.host}:{args.port}  model={args.model_id} pool_ctx={args.ctx} max_context={engine.ctx} sessions={args.sessions} "
+               f"speculative={engine.spec_on} vision={engine.supports_vision} (start-up {time.time() - t0:.0f} s)",
+               flush=True)
+         await asyncio.Event().wait()
+diff -ruN a/tools/qwen/test_serve.py b/tools/qwen/test_serve.py
+--- a/tools/qwen/test_serve.py
++++ b/tools/qwen/test_serve.py
+@@ -895,6 +895,36 @@
+         self.assertEqual([c[1]["speculative"] for c in eng.calls], [False, True])
+ 
+ 
++class SeparatePoolContextTests(unittest.TestCase):
++    def test_pool_does_not_raise_http_context_limit(self):
++        class E(FakeEngine):
++            ctx, pool_ctx, sessions, ndt, draft_model = 4096, 8192, 2, 7, object()
++            cache = types.SimpleNamespace(max_num_tokens=8192)
++        eng = E("x")
++
++        async def fn(client):
++            models = await (await client.get("/v1/models")).json()
++            health = await (await client.get("/health")).json()
++            valid = await client.post("/v1/completions", json={"model": "m", "prompt": "w " * 100, "max_tokens": 10000})
++            await valid.read()
++            rejected = await client.post("/v1/completions", json={"model": "m", "prompt": "w " * 4096, "max_tokens": 1})
++            return models, health, valid.status, rejected.status
++        models, health, ok, rejected = with_client(eng, fn)
++        self.assertEqual(models["data"][0]["max_context"], 4096)
++        self.assertEqual((health["max_context"], health["kv_pool_tokens"]), (4096, 8192))
++        self.assertEqual((ok, rejected), (200, 400))
++        self.assertEqual(len(eng.calls), 1)
++        self.assertEqual(eng.calls[0][1]["max_tokens"], 4096 - 100 - 1 - 7)
++
++    def test_two_full_requests_fit_pool_without_requeue(self):
++        for prompt in (100, 131072, 250000, 262135):
++            reply = serve.reply_room(262144, prompt, 7)
++            self.assertGreater(reply, 0)
++            self.assertIsNone(serve.serve_compat.rq_budget(524288, 2, prompt, reply, 7))
++            pages = ReplyRoomTests.pages_needed(prompt, reply, 7)
++            self.assertLessEqual(2 * pages, 524288 // 256)
++
++
+ class MiscTests(unittest.TestCase):
+ 
+     def test_unknown_path_and_wrong_method_answer_404_405_in_json(self):
