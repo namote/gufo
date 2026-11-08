@@ -20,6 +20,7 @@ benchmark/tuning executables; Python tools run from this source tree.
 | `ci/` | Repository, dependency, and documentation checks |
 | `llama_parity/` | Regenerates the llama.cpp tool-grammar verdicts `json_constraint_test` replays |
 | `gufo/` | Shared Python helpers and model-specific reference implementations |
+| `exl3_quant/` | EXL3 conversion tooling: the Flash-Next c03 pack pipeline, the pinned Kyojin converter source, and pack checks; see [its README](exl3_quant/README.md) |
 | `docker/` | Pinned ROCm 10.1 container environment for CPU builds and GPU runs (below) |
 
 `gufo/gguf.py` reads metadata and decodes existing GGUF tensors for independent
