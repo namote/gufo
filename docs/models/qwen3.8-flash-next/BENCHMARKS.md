@@ -1,5 +1,55 @@
 # Qwen3.8 Flash-Next benchmarks
 
+## Original BF16 / pure F16 HC comparison, November 9, 2026
+
+Only200 HC down/up matrices differ; c03 body/MTP, FP16 KV, Nix10.1,
+r2, temperature0, top_p1, top_k0, seed314159 and draft7 are fixed.
+Installed calibrated-hybrid results are saved controls, not a new same-window
+control. Each candidate uses a fresh process/cache. Rates are completed tok/s.
+
+| Case | Installed Q8 hybrid (saved) | Original BF16 | Pure F16 |
+| --- | ---: | ---: | ---: |
+| PP2048 | 1522.02 | 1273.07 | 1405.17 |
+| PP8192 | 1554.38 | 1251.23 | 1457.40 |
+| AR128 d0 | 32.78 | 27.88 | 29.04 |
+| AR128 d32768 | 32.44 | 27.92 | 28.80 |
+| MTP128 d0 | 65.69 | 52.50 | 59.51 |
+| MTP128 d32768 | 104.39 | 83.06 | 96.84 |
+
+BF16 loses16.36–19.50% PP,13.93–14.95% AR and20.08–20.43% MTP;
+F16 loses6.24–7.68% PP,11.22–11.41% AR and7.23–9.41% MTP.
+Both pure variants emit the same tokens, and each matches its own AR/MTP
+hashes at both depths/repetitions. Shallow text differs from installed hybrid,
+so hybrid free-generation rates are not identical-work kernel timings.
+Deep output is identical across all:17cycles,111accepts including101lookup
+accepts. This lookup-heavy rate is not general neural-MTP throughput.
+Shallow F16 is39cycles/88of111drafts accepted; BF16 is37/90of111,
+both with1of2lookup accepts. Better BF16 acceptance does not offset its cost.
+
+Saved fixed-token histories provide a separate cost observation (milliseconds):
+
+| Full forward scope | Hybrid | BF16 | F16 |
+| --- | ---: | ---: | ---: |
+| Prefill32760 scored positions | 46887.31 | 56120.02 | 47609.75 |
+| Eight2048-prefix +128scalar sequences | 48051.53 | 57158.07 | 52657.36 |
+
+These timers include forward/logit transfer and prefixes where applicable;
+they exclude separate head-replay checking and CPU scoring. They are not
+pure TG kernels. Historical timing uncertainty remains visible; no baseline
+forward or whole-model timing matrix was repeated.
+
+The current pure16 implementations are not a datatype hardware ceiling.
+F16 uses fused HC-down+SiLU; BF16 uses generic BF16 projection then SiLU.
+BF16 prefill materializes the deferred FP32 norm before BF16 narrowing because
+the existing combine produces F16. Contributions were not individually profiled.
+All200 HC weight allocations total1.258850GiB for installed F16-down+Q8-pair,
+versus1.220703GiB pure16 (39.06MiB less). Conversely pure16 projection
+weight payload is1.882× Q8. Allocation capacity is not traffic; these are
+logical weight bytes, not whole-server RSS or measured DRAM bandwidth.
+
+Evidence: `build/exl3-hc/precision-001/{RESULT,INPUTS,INPUTS-002}.json`,
+`window/f16-*`, `window-002/bf16-*`. Model/default settings are unchanged.
+
 ## Rejected standalone HC prefill Q8 candidates, November 8, 2026
 
 Pinned Nix10.1, same c03 all200 GPTQ sidecar, FP16 KV, r2. Saved installed

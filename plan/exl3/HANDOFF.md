@@ -1,4 +1,4 @@
-# EXL3 / Flash-Next handoff (updated 2026-11-08; all200 HC Q8 deployed)
+# EXL3 / Flash-Next handoff (updated 2026-11-09; all200 HC Q8 retained)
 
 ## Active default: c03 + calibrated HC Q8, 2026-11-08
 
@@ -23,6 +23,22 @@ Rollback: stop `llm`, move both model `hc_q8/` and `hc_q8.json` aside (preserve
 artifacts), install the previous serving revision `d01fd32a008ff81f7d60bbb6ddcd4b841ca1bc8e` with
 `tools/serving/flash_next/install.py`, then `llm start`. The previous B10 binary
 remains in `~/.local/share/gufo/runtime-b9-20261108/`. Do not edit a live model.
+
+### Original BF16 / pure F16 HC comparison (November 9, 2026)
+
+Default unchanged after comparison of all200 HC down/up. Original BF16:
+PP2048/8192 1273.07/1251.23, AR128d0 27.88, MTP128d0 52.50tok/s.
+PureF16:1405.17/1457.40,29.04,59.51. Saved hybrid:1522.02/1554.38,
+32.78,65.69. Prefill quality unresolved; bounded scalar KL improves for
+both, but F16 targetNLL worsens and BF16 NLL is unresolved. BF16's generic
+kernel/norm work is not an optimized datatype ceiling. Retain hybrid.
+CPU source audit:65738/655360000 tiny-value mismatches BF16→packedF16,
+maxabs2.98e−8. Pure16 runtime HC allocation is39.06MiB smaller, while
+projection payload is1.882×Q8. Results/frozen variants/bounded log recovery:
+`build/exl3-hc/precision-001`. Both smoke/greedy checks pass; disk-admission
+restore recovered by removing only build intermediates/verified duplicates.
+Original runtime/config ready, realAPI42; about28.45GiB available. No model,
+sidecar or service-default changes, no baseline forward repeated.
 
 ### Remaining HC prefill Q8 experiment (November 8, 2026): rejected
 

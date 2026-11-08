@@ -3058,3 +3058,30 @@ implementation retaining only original down/up would be1.220703GiB, about
 activation/workspace/registration residency must be measured separately.
 More bytes read per HC projection does not imply greater resident HC weight
 memory when duplicate representations are removed.
+
+
+### Flash-Next HC original BF16 / pure F16, November 9, 2026
+
+Compare-only isolated all200 HC down/up bypasses calibrated sidecar AND RTN
+conversion. BF16 binds a separate owned checkpoint mapping and must not reuse
+a deferred F16 norm buffer as BF16: materialize FP32 then narrow correctly.
+Private variants use fresh RAM-only caches; production model/identity/default
+are unchanged. Original BF16 vs packed F16 differs only at65738/655360000
+very small values, maxabs2.98e−8; runtime precision/dispatch is also different.
+
+Versus saved calibrated hybrid, BF16 PP2048/8192=1273.07/1251.23
+(−16.36/19.50%), AR128d0=27.88(−14.95%), MTP128d0=52.50(−20.08%).
+PureF16 gives1405.17/1457.40PP,29.04AR,59.51MTP. Scalar KL improves but
+quality metrics conflict (F16 scalar targetNLL worsens); no default switch.
+Same-history forward timings also increase. BF16 generic projection+SiLU
+and norm-materialization differ from fusedF16; no isolated-cause claim.
+Pure16 HC allocation is39.06MiB smaller because hybrid retains F16 down,
+yet weight-read payload is1.882×Q8: capacity and traffic are different.
+
+Reuse existing teacher/hybrid outputs. A caught stale incremental BF16 ELF
+required touching only the two source inputs whose content differed from the
+preceding snapshot mounted at the same build path. Check actual ELF mode,
+not merely source-manifest hashes. Preserve the unrelated stdout/stderr
+interleaved-SHA parser failure and strict CPU recovery; no successful GPU
+stage repeated. Evidence:`build/exl3-hc/precision-001`; full scope/numbers in
+Flash-Next QUALITY/BENCHMARKS/EXPERIMENTS.

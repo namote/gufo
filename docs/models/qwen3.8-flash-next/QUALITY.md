@@ -1,5 +1,40 @@
 # Qwen3.8 Flash-Next quality
 
+## Original BF16 / pure F16 HC comparison, November 9, 2026
+
+Fixed c03 body/MTP weights, FP16 KV and Nix10.1; only the200 HC down/up
+matrices change. Saved BF16 teacher and installed calibrated-hybrid logits
+are reused. Pure variants bypass both the calibrated sidecar and automatic
+RTN conversion. Norm/inject operands keep the deployed FP32 runtime path.
+
+| HC policy | Prefill KL256+rest ↓ | Prefill NLL ↓ | Scalar KL256+rest ↓ | Scalar NLL ↓ |
+| --- | ---: | ---: | ---: | ---: |
+| Installed calibrated Q8 hybrid | .039935247 | 2.164491218 | .044060911 | 2.563250216 |
+| Original BF16 down/up | .040148764 | 2.164134540 | .041546402 | 2.574458125 |
+| Pure F16 down/up | .040743399 | 2.159793058 | .038462493 | 2.584039458 |
+
+Prefill32760 positions/eight4096-token windows: neither pure variant resolves
+KL or NLL against hybrid using paired document/window95%CIs. Scalar1024
+positions (8×128 after2048-token prefixes, cross-path saved BF16 prefill
+reference): BF16 KL improves5.71%, paired difference−.00251451,
+windowCI[−.00414161,−.00079180]. Its NLL difference+.01120791 has
+windowCI[−.00711958,+.03139786], unresolved. F16 KL improves12.71%,
+windowCI[−.01136861,−.00133399], but NLL increases+.02078924,
+windowCI[+.00340769,+.03967857] (about2.10% perplexity). Thus fidelity and
+next-token loss disagree; do not claim a uniform quality improvement.
+
+CPU audit of all655360000 values verifies saved source/target hashes and
+finite values. Original BF16 versus packed F16 differs at65738 values
+(.01003%), maximum absolute difference2.9802322387695312e−8. Most original
+values survive F16 exactly; these tiny-value differences do not explain all
+runtime changes. BF16/F16 activation rounding, dispatch and epilogues also
+differ. Neither pure policy is installed by this comparison.
+
+Evidence: `build/exl3-hc/precision-001/original-hc/AUDIT.json`,
+`window/f16-{prefill,decode}-{score,compare}/RESULT.json`,
+`window-002/bf16-{prefill,decode}-{score,compare}/RESULT.json`.
+No baseline forward, calibration or weight quantization was repeated.
+
 ## Remaining HC prefill Q8 routes: rejected, November 8, 2026
 
 Compared two candidates against the installed all200 GPTQ HC path, reusing

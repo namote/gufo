@@ -969,3 +969,38 @@ Evidence: `build/exl3-hc/prefill-q8-{001,002}`; immutable incremental builds
 not GPU failure; recovered after removing3.43GiB of obsolete non-Flash-Next
 test executables. Source, models, calibration, Flash-Next baselines and logs
 were protected; see002/DISK-CLEANUP.json and001/RESTORE-RECOVERY.json.
+
+
+### Original BF16 / pure F16 HC, November 9, 2026 — compare only
+
+All200 audited original BF16 or packed F16 down/up replace the calibrated
+hybrid in private frozen binaries. Both sidecar loading and automatic RTN Q8
+copies are bypassed. BF16 uses a separate immutable mapping with owned
+TensorRefs, not a rewritten shard index. Its deferred norm may not consume
+the F16 half-cache as BF16; force materialization and dtype-correct narrowing.
+Body/MTP weights outside HC, norm/inject and KV policy are unchanged.
+
+Independent review caught stale F16 objects reused by the first BF16 build
+before any GPU execution. Only two changed inputs were invalidated; retained
+ELFs are checked for both their own mode marker and absence of the other.
+A combined GPU window later hit a log-parser assertion: stdout inserted its
+model/table header inside a stderr output SHA. Strict reconstruction from the
+retained raw log proved all four hashes exact; no completed GPU measurement
+was repeated. A second window ran only missing smoke and BF16 checks.
+Both windows enforce fresh RAM-only caches and protect the production model.
+
+Quality tradeoffs are mixed; original BF16 costs16–20% PP and about20% MTP,
+F16 costs6–8% PP and7–9% MTP versus saved hybrid. Both have limited scalar
+BF16-fidelity gains; F16 scalar target NLL worsens significantly. Retain hybrid
+as default. This compares existing runtime paths, not optimized BF16 ceilings
+or broad task quality. Full metrics are in QUALITY.md and BENCHMARKS.md.
+Evidence: `build/exl3-hc/precision-001`, including CPU audit, frozen sources,
+original-HC checkpoint, old/stale build receipts and parser-recovery evidence.
+
+Both pure variants pass owned HTTP branch/cache/count/vision smoke and AR/MTP
+emitted-token equality. Final restoration initially hit disk reserve; preserve
+that failed receipt. Removed only regenerable comparison objects and verified
+SHA-identical duplicate ELFs (all source, result and unique binaries retained),
+then restored original SHA166953…/settings and real API answer42. Qualified
+production incremental objects remain. No new GPU error in either window.
+See `RESTORE-RECOVERY.json`, `FINAL-SERVICE.json` and cleanup receipts.
