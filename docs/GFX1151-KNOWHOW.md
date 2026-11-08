@@ -1,5 +1,23 @@
 # gfx1151 optimization know-how
 
+## Flash-Next c03 prefill profile before B6, November 8, 2026
+
+Deployed B5 binary (sha `31cee0b6…`), c03, Nix10.1, FP16 KV, d0, speculative
+off: PP2048/8192 1511.20/1543.80 tok/s (1355.3/5306.5 ms per forward).
+rocprofv3 one forward each (8192 = 2×4096 chunks): span 1377.6/5315.8 ms,
+kernel-active 96.4/98.3%, idle 49.2/91.4 ms (≈22 ms of the 2048 idle is
+collector cost; recurring ≈0.24 ms gaps before large GEMMs/HC/GDN), side stream
+370/1958 ms (shared MLP, 1.6–4.7 TF while overlapped). Main-stream ms
+2048/8192: routed gate/up 281.9/943.6 (22.4/26.8 TF), down 155.2/536.7
+(20.4/23.5 TF), dense EXL3 323.6/1222.2 (GDN qkv 32.7/37.2 TF, out 36/34 TF),
+HC mix/combine 199.1/756.7 (≈200–216 GB/s), HC projections 79.2/306.2, MoE
+routing/rotation/activation 123.8/491.6 (RotateGateUpTokens 58/229, router
+GEMM 13.7 TF), GDN 107.5/433.0 (GdnRowSplit 77/314, 96 workgroups), attention
++ sparse indexer 55.2/391.4 (WMMA attention 13.7 TF useful at 8192), dense
+input prep 27.2/126.8, PLE 9/36. Versus the Nov 2 shared5 profile (different
+pack/KV/collector): routed and HC faster, dense slower from the c03 K5 GDN
+qkv/z rates. Evidence: `build/b1/prefill-prof-b6/summary.json`.
+
 ## Flash-Next B5 routed down tiles, decode side branches, November 8, 2026
 
 Commits `62e9b525..eb789c77` (brief `plan/exl3/B5-BRIEF.md`). Kept: J2a routed
