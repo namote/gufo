@@ -29,12 +29,21 @@ optimization benchmark handoff; no automatic service changes during migration.
   cache is not a required input and is not migrated into the active tool.
 - Current service is B10 `9eb3cbdb`, installed supervisor `d01fd32a`; refer to
   [HANDOFF](HANDOFF.md) and inspect current status again before a GPU window.
+- B10 collector port is reviewed and CPU-built at `build/exl3-hc/capture-b10-001`.
+  ELF SHA `53572ac57b10bbcd7db49eff5996479aeec77e55fa12a568d9cf9b5db659a6f0`;
+  SOURCE/BUILD/CACHE-PROVENANCE receipts retain exact identities. Three
+  instrumented translation units rebuilt; remaining B10 objects reused.
+  This is **not** a GPU/capture correctness pass.
+- Fixed pilot inputs: `/home/m2on/projects/models/eval/flash-next/hc-pilot-001`,
+  8 calibration + 8 separate holdout windows, 5942 tokens, max513 per document.
+  INPUTS.json retains full original row hashes, selected byte hashes and the
+  sampled64/stride32 lexical-overlap screen. This is not a 25% replacement.
 
 ## Next execution steps
 
-1. Finish migration CPU checks and second-reviewer review. Preserve arithmetic
+1. Migration CPU checks and second-reviewer review completed. Preserve arithmetic
    and reusable evidence; use Gufo's shared pinned environment and host guard.
-2. Port bounded activation export to a separate frozen current-source build.
+2. Bounded activation export port and separate frozen B10 CPU build completed.
    Down: after unfolded HC norm; up: after actual scaled SiLU. Do not mix
    source/ELF identities or assume old B5 statistics describe current execution.
    Initial layer0 pilot is only a screen, not a full calibration substitute.
@@ -66,6 +75,8 @@ held-out loss, connected-HC quality, or MTP speed; never auto-select a winner.
 CPU validation before migration: 13 numerical checks and 432 old infrastructure
 checks passed (receipts in the backup). After migration: 13 numerical checks
 passed in `build/exl3-hc/cpu-migration-002/cpu.log`; the hosted EXL3 suite passed
-20 checks, including namespace CLI help without optional packages and the
+22 checks, including namespace CLI help without optional packages and the
 CPU runner's new-directory/owned-container-timeout cleanup contract. No GPU
-was used. These checks do not establish real HC quality or throughput.
+was used. The shared format check passed 801 C++ files using the retained
+clang-tools21.1.8 (initial attempt lacked clang-format on PATH; both logs retained).
+These checks do not establish real HC quality or throughput.

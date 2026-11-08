@@ -11,11 +11,14 @@ legacy rounding control. No command loads a model on the GPU or changes a pack.
 | `quant.py` | Full-H GPTQ-style sequential error feedback with fixed stored F16 group scales |
 | `refine.py` | Reuses the saved GPTQ/control files and H; compares code-only and code-plus-scale coordinate refinement |
 | `test_cpu.py`, `test_refine.py`, `check.py` | Optional NumPy/safetensors CPU checks, independent brute-force numerical oracles |
+| `prepare_capture.py`, `build_capture.py`, `capture_hook.hpp` | Separate B10-layout frozen collector build; first attention HC only, CPU build qualified, GPU capture pending |
+| `prepare_inputs.py` | Bounded pilot from existing c03 and separate holdout token files; hash-checked, no retokenization |
 | `ORIGIN.json` | Original source hashes and the preserved migration evidence |
 
 Status: CPU reference tools. **No real HC calibration run or runtime loader
 qualification yet.** The original B5 capture prototype is historical; current
-B10 input capture needs a separate port and review. See the active
+B10 input capture has a separately reviewed CPU build, still requiring a
+bounded GPU capture-on/off check. See the active
 [HC plan](../../../plan/exl3/HC-Q8-CALIBRATION.md).
 
 ## Commands
@@ -90,3 +93,34 @@ additional factorization/work buffers. Screen a bounded real site first.
 Projection error is not connected-HC/model quality, and this weight correction
 does not remove activation-Q8 error. Final deployment requires native packing,
 connected HC, decode quality and MTP acceptance/whole-model throughput checks.
+
+## Bounded collector preparation
+
+The collector instruments only a new source snapshot under `build/`; it does
+not patch the running checkout. It records first-attention down inputs after
+F32 norm and up inputs after scaled SiLU on both branches, using the same GPU
+stream and an explicit completion before writing. Graphs are disabled during
+capture so replay cannot skip the host export. Unsupported deferred/F16 norm
+paths fail; this first-site pilot does not cover other sites or MTP.
+
+```sh
+python3 -m tools.exl3_quant.hc.prepare_capture --revision 9eb3cbdb \
+  --output build/exl3-hc/capture-b10-002 --objects build/b1/obj \
+  --cache-reference build/b1/b10/b10-gdnfix-gufo --cache-receipt build/b1/b10/RESULT.json
+python3 tools/docker/pinned_rocm101.py run --build-dir build/exl3-hc/capture-b10-002 \
+  --source build/exl3-hc/capture-b10-002/source --source-readonly \
+  --mount "$PWD/tools/exl3_quant/hc:/hc-tools:ro" --raw /usr/bin/env -- \
+  PYTHONPATH=/build/source PYTHONDONTWRITEBYTECODE=1 /opt/venv/bin/python3 /hc-tools/build_capture.py
+python3 -m tools.exl3_quant.hc.prepare_inputs \
+  --calibration tools/exl3_quant/flash_next/c03-input-ids.safetensors \
+  --holdout /home/m2on/projects/models/eval/flash-next/hc-holdout \
+  --output /home/m2on/projects/models/eval/flash-next/hc-pilot-002
+```
+
+These commands are CPU-only. Existing `capture-b10-001` and `hc-pilot-001`
+already exist and should be reused, not regenerated. A later GPU runner must
+take the shared owner lock, preserve/restore the current owned service, check
+source/ELF/input identities, validate exact coverage and finite exported rows,
+and prove the small capture-on/off control before using the inputs. No full
+baseline rerun. The legacy B10 cache's stale CMake revision is not its source
+proof: its retained `gufo` must match the qualified B10 binary and receipt.
