@@ -5,7 +5,7 @@
 Retained embedded EXL3 vision loading and native precision graph, with packed
 residency, split QKV precedence, padded FFN preservation and cache identity.
 CPU/review/K6+K8 numerics/GGUF exact/API checks pass; no broad sweep.
-[Evidence and limits](../../../plan/exl3/F3-VISION-NATIVE.md).
+[Evidence and limits](../../../plan/exl3/archive/F3-VISION-NATIVE.md).
 
 ## Physical GPU KV prefix sharing, November 4, 2026
 
@@ -26,7 +26,7 @@ exact saved K6 numerics32760 positions, C4 pressure, Pi and disk restart pass.
 Standard PP/AR observations are within0.33% of saved K6; shallow/deep MTP
 -4.94%/+0.80%, desktop-active and advisory. No baseline rerun. Default service
 remains Kyojin; the permanent Gufo launcher selects the new image for next use.
-[Implementation, artifacts and failed attempts](../../../plan/exl3/F3-KV-REFERENCES.md).
+[Implementation, artifacts and failed attempts](../../../plan/exl3/archive/F3-KV-REFERENCES.md).
 
 
 ## Memory-efficiency implementation, November4,2026
@@ -74,7 +74,7 @@ Unsupported typed shared snapshots and KVarN/shared in-pass checkpoints reject
 explicitly. No arithmetic/precision change. Reused Nix10.1 objects and baseline;
 combined checks plus focused failure/fix checks pass, performance within0.3%.
 Pi workspace uses50GiB disk retention, not active KV swapping.
-[Evidence and limitations](../../../plan/exl3/F3-SHARED-KV.md).
+[Evidence and limitations](../../../plan/exl3/archive/F3-SHARED-KV.md).
 
 ## Prefill live-subtile selection, November 2, 2026
 
@@ -84,7 +84,7 @@ clones. Baseline BN64/128 VGPR103/148 rises to231/256,239/256,191/256;
 BN128 private/spills becomes244B/108,136B/68,148B/71. LDS unchanged24/32KiB.
 No GPU or full-model test was warranted; no measured latency regression or
 new quality claim. Production source/image and current qualified speeds stay
-unchanged. [All evidence](../../../plan/exl3/F3-PREFILL-LIVE-TILES.md).
+unchanged. [All evidence](../../../plan/exl3/archive/F3-PREFILL-LIVE-TILES.md).
 
 ## Exact live-row verification, November 2, 2026
 
@@ -95,7 +95,7 @@ down; final native MTP d0 is40.09→40.85tok/s (+1.90%). Prefill/AR are unchange
 within noise. Full quality/session/32K/cache and frozen outputs pass; one final
 combined window, saved baseline reused. Global-address-space and aligned-tail
 candidates were neutral and excluded; dense TN2 load grouping already exists.
-[Full results and rejected candidates](../../../plan/exl3/F3-TGMTP-ROWS.md).
+[Full results and rejected candidates](../../../plan/exl3/archive/F3-TGMTP-ROWS.md).
 
 ## Same-pack local Kyojin follow-up, November 2, 2026
 
@@ -107,7 +107,7 @@ kernel change or default model switch. Current native5.05 profile attributes
 ARdense35.44% and MTPexperts27.43%/dense22.21%; retain as diagnostic evidence,
 not unprofiled speed. Both completed windows healthPASS; prior invalid default
 penalty attempt is preserved. Existing numerical qualification is not repeated.
-[Exact scope, receipts and next batch](../../../plan/exl3/F3-KYOJIN-SAME-PACK.md).
+[Exact scope, receipts and next batch](../../../plan/exl3/archive/F3-KYOJIN-SAME-PACK.md).
 
 
 ## Native EXL3 n-gram, November 2, 2026
@@ -123,7 +123,7 @@ This material workload-specific loss is retained; do not describe universal
 performance parity. Native full-vocabulary NLL improves2.175202→2.167751,
 paired window95%CI forΔNLL[−.017370,−.001770]. Top-1 change−.0794pp is unresolved.
 
-[Complete scope, caveats and evidence](../../../plan/exl3/F3-NATIVE-PACK.md).
+[Complete scope, caveats and evidence](../../../plan/exl3/archive/F3-NATIVE-PACK.md).
 
 
 ## Kyojin comparison follow-up, November 2, 2026
@@ -132,7 +132,7 @@ No kernel changes. One qualified-image K17/D8 serving window passed all25
 requests and health checks. Chat/prose/code client medians41.67/34.65/57.25tok/s
 remain below public52.8/47.5/73.2 targets. Preserve the improvements and receipts;
 do not rerun controls. Cross-machine/pack/prompt differences and actual D depths
-are explicit in [comparison](../../../plan/exl3/F3-TGMTP-KYOJIN-COMPARISON.json).
+are explicit in [comparison](../../../plan/exl3/archive/F3-TGMTP-KYOJIN-COMPARISON.json).
 Next bottleneck attribution, if pursued, needs an ordinary prose prompt on the
 optimized ELF; the saved native profile predates the routed LDS fix.
 
@@ -154,9 +154,9 @@ existing QKV grouping, PLE/graphs, heads, catch-up, recurrence and sampling;
 these were retained instead of retuned from the pathological verifier costs.
 
 
-[Qualification and identities](../../../plan/exl3/F3-TGMTP-QUALIFICATION.json),
-[operator screens](../../../plan/exl3/F3-TGMTP-SCREENS.json),
-[flow review](../../../plan/exl3/F3-TGMTP-FLOW.json).
+[Qualification and identities](../../../plan/exl3/archive/F3-TGMTP-QUALIFICATION.json),
+[operator screens](../../../plan/exl3/archive/F3-TGMTP-SCREENS.json),
+[flow review](../../../plan/exl3/archive/F3-TGMTP-FLOW.json).
 
 ## HC/MoE combined qualification, November 2, 2026
 
@@ -179,7 +179,7 @@ checks pass. Performance uses k4v4/temp0/seed314159/r2. The initial pp2048
 context8193→4096 and is diagnostic only; the final d0 replay restored the
 original512,2048,8192 list and8193 capacity. All attempts are retained; no
 baseline, correctness or d32K rerun. Target2000 is still unmet.
-[Qualification, runtime/code identities and all attempts](../../../plan/exl3/F3-PREFILL-BATCH6-QUALIFICATION.json).
+[Qualification, runtime/code identities and all attempts](../../../plan/exl3/archive/F3-PREFILL-BATCH6-QUALIFICATION.json).
 
 ## Narrow dense and output-slice batch, November 1, 2026
 
@@ -189,7 +189,7 @@ singleton indexer slices compute only their requested channels. Units and
 (+.36% versus the stored prior batch). Routed vector stores, wave64 and dense
 full-LDS epilogues were exact but offered no useful aggregate gain. Cache-fed
 current X3 also lost on the two large K7 shapes; no model cache was added.
-[Measurements, image identity and packaging-only recovery](../../../plan/exl3/F3-PREFILL-BATCH2.md).
+[Measurements, image identity and packaging-only recovery](../../../plan/exl3/archive/F3-PREFILL-BATCH2.md).
 
 ## Matrix follow-up screening, November 1, 2026
 
@@ -198,7 +198,7 @@ slower; a single-group K5 narrow tile improved16.48% locally and is preserved
 for a later batch. Tight MoE launch bounds and cold/hot descriptor partition
 changed the matched 2×gate+down operator estimate by +0.32% and −0.12%.
 Neither justifies production complexity. No production change or full-model
-rerun. [Tables, scope, and retained artifacts](../../../plan/exl3/F3-NEXT-MATRIX-SCREEN.md).
+rerun. [Tables, scope, and retained artifacts](../../../plan/exl3/archive/F3-NEXT-MATRIX-SCREEN.md).
 
 ## Nix ROCm 10.1 EXL3 prefill batch, November 1, 2026
 
@@ -214,7 +214,7 @@ against saved pre-batch Nix T1, with32,760 exact records/64 head checks. No base
 inference or full-model sweep per small change. Performance-neutral simplicity or
 correctness improvements remain eligible for retention. Preserve persistent
 Nix release/unit trees for subsequent incremental builds.
-[Detailed receipts](../../../plan/exl3/F3-RESUME-RESULTS.md#qualified-prefill-batch-2026-11-01).
+[Detailed receipts](../../../plan/exl3/archive/F3-RESUME-RESULTS.md#qualified-prefill-batch-2026-11-01).
 
 ## Chunked DeltaNet removed (October 27, 2026)
 
@@ -642,7 +642,7 @@ The complete seven-shape K7 grid sweep found one clear local gain: singleton
 6144→2560/R2048 group1 −15.05%. Its bounded production dispatch raised pp2048
 from1405.25 to1416.51 tok/s (+.80%). Cached internal FP16 weights remained
 slower on large shapes after traversal tuning and were not promoted. No full
-model quality or old baseline repeats. [Results](../../../plan/exl3/F3-PREFILL-GRID.md).
+model quality or old baseline repeats. [Results](../../../plan/exl3/archive/F3-PREFILL-GRID.md).
 
 
 ## EXL3 overlap and grouped gate/up, November 2, 2026
@@ -651,7 +651,7 @@ Shared MLP overlap before router/top-k and KVarN register selection were
 retained together at1429.13±1.13pp2048 tok/s (+.89%). Q overlap was neutral
 alone and regressed in combination, so Q source was restored. GDN Z,
 smaller-LDS and routed gate/up stream screens were not promoted.
-[Full decisions](../../../plan/exl3/F3-STREAM-QUALIFICATION.json).
+[Full decisions](../../../plan/exl3/archive/F3-STREAM-QUALIFICATION.json).
 
 A subsequent K5 paired-grid prototype halves gate/up matrix launches from
 four to two while preserving separate inputs/K16/FP16. Saved-output exactness
@@ -659,7 +659,7 @@ passed, but shared-side512/2048 spans were8.65352/14.89320ms versus saved
 8.55525/14.76090ms (+1.15/+.90%, historical/advisory). Zero private/spills and
 unchanged105/149VGPR. Not promoted: no useful speed signal or simplification.
 Prototype preserved; no old baseline, profile or full-model run repeated.
-[All measurements](../../../plan/exl3/F3-GROUPED-MOE-SCREEN.json).
+[All measurements](../../../plan/exl3/archive/F3-GROUPED-MOE-SCREEN.json).
 
 
 ## Current shared5 bottleneck profile, November 2, 2026
@@ -672,7 +672,7 @@ and one measured forward, context4096/d0/k4v4/AR. Measured2399 kernels span
 has340.764ms temporal overlap; this is not net speedup. No new counter/stall
 or quality claim; qualified clean1429.13 remains current. Two failed startup
 collections and the successful trace are preserved. [Provenance, shape totals,
-coverage and limits](../../../plan/exl3/F3-CURRENT-PREFILL-PROFILE.json).
+coverage and limits](../../../plan/exl3/archive/F3-CURRENT-PREFILL-PROFILE.json).
 
 ## HC MoE-combine operand loads, November 2, 2026
 
@@ -692,7 +692,7 @@ prototype standalone parity24 also passes. Guards/finite/poison included.
 No baseline replay, model run or profile for the production check. These are
 operator timings, not a whole-prefill speedup; qualified1429.13tok/s remains.
 HcMix gate loads are already grouped in ISA; do not repeat that lead.
-[Failures, all candidates, hashes and receipts](../../../plan/exl3/F3-HC-LOAD-SCREENS.json).
+[Failures, all candidates, hashes and receipts](../../../plan/exl3/archive/F3-HC-LOAD-SCREENS.json).
 
 ## Dense X3 K-tail audit (2026-11-02)
 
@@ -710,7 +710,7 @@ historical evidence with the largest QKV worse, no aggregate win justifying
 another specialization. These are advisory operator timings, not a confirmed
 model regression. No baseline/profile/model rerun for this screen. Preserve
 prototype and failed pre-GPU manifest check; move to combined HC/MoE batch.
-[All numbers, ISA sites and receipts](../../../plan/exl3/F3-DENSE-KTAIL-SCREEN.json).
+[All numbers, ISA sites and receipts](../../../plan/exl3/archive/F3-DENSE-KTAIL-SCREEN.json).
 
 
 ## EXL3 c03 conversion capture, November 5, 2026
@@ -738,7 +738,7 @@ counters/references/inputs/RNG exact. Independent review retained skip-down and
 resumed idx9 unchanged. It uses private byte-identical rows on the same SSD and
 warmed caches; complete-model conversion gain and the historical slowdown remain
 unresolved. Evidence: `capture-pipeline/{SUMMARY,STATE,REVIEW}.json`.
-[Receipts and rollout](../../../plan/exl3/F3-CONVERSION-WATCH.md).
+[Receipts and rollout](../../../plan/exl3/archive/F3-CONVERSION-WATCH.md).
 
 ## Static optimization-gate audit, November 7, 2026
 
@@ -766,7 +766,7 @@ Mode3 directly reaches current Flash-Next prefill through
 `Executor::Exl3Experts` / `Exl3PrefillExpertsRaw`, including singleton tails;
 it is not limited to an unused test adapter. The historical `q6-gated`
 comments describe prior qualification, not a current `rate == 6` dispatch.
-Reuse [saved staging evidence](../../../plan/exl3/F3-MOE-STAGING-SCREENS.json)
+Reuse [saved staging evidence](../../../plan/exl3/archive/F3-MOE-STAGING-SCREENS.json)
 and the existing arithmetic/guard criteria, adding each newly enabled rate
 including K3.5. Historical K5 timings do not establish gains for K4 or K8.
 

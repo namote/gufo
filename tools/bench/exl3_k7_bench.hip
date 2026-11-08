@@ -1,4 +1,4 @@
-// Flash-Next K7 dense decode/verify timing (plan/exl3/F3-PLAN.md item 2):
+// Flash-Next K7 dense decode/verify timing (plan/exl3/archive/F3-PLAN.md item 2):
 // the production X2b GEMV (LaunchExl3FastProjections, including its input
 // rotation) against the X3 narrow WMMA tile (LaunchExl3RotateRows +
 // LaunchExl3PrefillGemm) at the Flash-Next K7 trunk shapes for 1..8 rows,

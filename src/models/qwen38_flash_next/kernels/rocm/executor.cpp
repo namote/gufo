@@ -3726,7 +3726,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   bool packed_gate = false;
   // KVarN layers write FP16 rows and rotate them into the KVarN frame: a
   // pass into the sink and tail ring, a prompt chunk into the staging rows,
-  // whose row 0 holds staging_first (plan/exl3/F1-KVARN-DESIGN.md 3).
+  // whose row 0 holds staging_first (plan/exl3/archive/F1-KVARN-DESIGN.md 3).
   const KvarnPass* kvarn = s.kvarn_pass;
   __half* write_k = s.k_cache;
   __half* write_v = s.v_cache;

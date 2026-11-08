@@ -184,10 +184,10 @@ std::string PresentName(const core::GgufReader& reader,
   return {};
 }
 
-// Qwen 27B input groups (plan/rotated-quant/PLAN.md, "27B 입력 그룹"); the
-// converter's tools/qwen27b/rotquant_groups.py defines the same groups. Only
-// layers of the main stack are listed, so a folded weight of an embedded MTP
-// (nextn) layer is refused and never counts toward "rotated in some layers
+// Qwen 27B input groups (plan/archive/rotated-quant/PLAN.md, "27B 입력 그룹");
+// the converter's tools/qwen27b/rotquant_groups.py defines the same groups.
+// Only layers of the main stack are listed, so a folded weight of an embedded
+// MTP (nextn) layer is refused and never counts toward "rotated in some layers
 // only". ssm_alpha and ssm_beta read the attn_in activation but are not
 // foldable upstream; they stay unrotated in the file and are folded at load
 // (FoldAlphaBeta) so every DeltaNet input projection reads one rotated row.

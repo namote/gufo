@@ -1,5 +1,5 @@
-// KVarN store operators of Qwen3.8 Flash-Next (plan/exl3/F1-KVARN-DESIGN.md
-// 3, stage K1b) against the CPU reference
+// KVarN store operators of Qwen3.8 Flash-Next
+// (plan/exl3/archive/F1-KVARN-DESIGN.md 3, stage K1b) against the CPU reference
 // tests/models/qwen27b/kvarn_fake_quant.hpp:
 //   * K/V writers given kKvarnFp16RowTag store position p at the FP16 sink
 //     and tail ring row hip::KvarnFp16Row(p), the same bytes the contiguous

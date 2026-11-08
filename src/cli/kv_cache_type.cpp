@@ -21,8 +21,9 @@ struct TextModelKv {
 // Qwen3.8-27B: KVarN k4v2 by default (DefaultKvCacheType); fp16 stays the
 // QwenExecutionPolicy::Production() storage that explicit fp16 selects.
 // Flash-Next: __half k_cache/v_cache by default, KVarN k4v4 on request
-// (qwen38_flash_next ModelOptions::kvarn, plan/exl3/F1-KVARN-DESIGN.md).
-// DeepSeek V4 Flash: E4M3 FP8 KV (ds4_rocm_fp8_kv.hip.hpp).
+// (qwen38_flash_next ModelOptions::kvarn,
+// plan/exl3/archive/F1-KVARN-DESIGN.md). DeepSeek V4 Flash: E4M3 FP8 KV
+// (ds4_rocm_fp8_kv.hip.hpp).
 constexpr TextModelKv kTextModels[] = {
     {"qwen35", "Qwen3.8-27B", "FP16", true, true, true, false, true},
     {"qwen4exp", "Qwen3.8-Flash-Next", "FP16", true, false, true, true, false},

@@ -1,10 +1,11 @@
-// KVarN K0 accuracy study for Qwen3.8 Flash-Next (plan/exl3/F1-DESIGN.md
-// 3.2, following plan/gufo-upstream-port/KVARN.md K0): prefills a chat prompt
-// with FP16 KV in an autoregressive session, records the FP16 greedy
-// continuation and its logits, then for each configuration restores the
-// prefilled state with fake-quantized full-attention K/V rows and measures,
-// per decode step, the KL divergence from the FP16 distribution and top-1
-// agreement under teacher forcing, followed by a free greedy run.
+// KVarN K0 accuracy study for Qwen3.8 Flash-Next
+// (plan/exl3/archive/F1-DESIGN.md 3.2, following
+// plan/archive/gufo-upstream-port/KVARN.md K0): prefills a chat prompt with
+// FP16 KV in an autoregressive session, records the FP16 greedy continuation
+// and its logits, then for each configuration restores the prefilled state with
+// fake-quantized full-attention K/V rows and measures, per decode step, the KL
+// divergence from the FP16 distribution and top-1 agreement under teacher
+// forcing, followed by a free greedy run.
 //
 // Only the public engine API is used. The state moves through a
 // materialized snapshot payload; its attention K/V sections are rewritten in

@@ -1,11 +1,11 @@
-// KVarN K0 accuracy study (plan/gufo-upstream-port/KVARN.md): prefills a chat
-// prompt with FP16 KV, records the FP16 greedy continuation and its logits,
-// then for each configuration restores the prefilled state with fake-quantized
-// attention K/V rows and measures, per decode step, the KL divergence from the
-// FP16 distribution and top-1 agreement under teacher forcing, followed by a
-// free greedy run. `--prefill-chunk N` instead prefills N tokens at a time and
-// quantizes each completed group before the next chunk reads it, as a
-// quantized cache would during a long prefill. One JSON line per
+// KVarN K0 accuracy study (plan/archive/gufo-upstream-port/KVARN.md): prefills
+// a chat prompt with FP16 KV, records the FP16 greedy continuation and its
+// logits, then for each configuration restores the prefilled state with
+// fake-quantized attention K/V rows and measures, per decode step, the KL
+// divergence from the FP16 distribution and top-1 agreement under teacher
+// forcing, followed by a free greedy run. `--prefill-chunk N` instead prefills
+// N tokens at a time and quantizes each completed group before the next chunk
+// reads it, as a quantized cache would during a long prefill. One JSON line per
 // configuration goes to --out.
 #include <algorithm>
 #include <chrono>

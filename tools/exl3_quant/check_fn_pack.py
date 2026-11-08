@@ -4,7 +4,7 @@
   python3 -I check_fn_pack.py <pack dir> --out <report.json>
 
 Checks (all must pass; headers only, no tensor data is read):
-  config      config.json quantization_config equals the values recorded in plan/exl3/F2-PLAN.md section 2.
+  config      config.json quantization_config equals the values recorded in plan/exl3/archive/F2-PLAN.md section 2.
   storage     every tensor listed in quantization_config.json tensor_storage exists in the safetensors
               files (shards plus ngram_embedding.safetensors) with the recorded shape, dtype and byte size,
               and every stored tensor is listed, except the parameters of non-leaf modules that upstream

@@ -1,4 +1,4 @@
-// R0b (plan/rotated-quant/PLAN.md): effective weight bandwidth per GGUF
+// R0b (plan/archive/rotated-quant/PLAN.md): effective weight bandwidth per GGUF
 // quantization type on gfx1151, at the Qwen 27B matrix shapes and batches.
 //
 // Production types (Q8_0, Q6_K, Q5_K, Q4_K, IQ4_XS, IQ4_NL, Q3_K, IQ3_S) run
@@ -28,7 +28,7 @@
 //          and last output rows; FWHT against a CPU Hadamard.
 //   time   every type x shape x batch, then the FWHT table and token estimates.
 //   fwht   only the FWHT table.
-// Build: see plan/rotated-quant/R0B-RESULTS.md.
+// Build: see plan/archive/rotated-quant/R0B-RESULTS.md.
 #define ENGINE_ENABLE_HIP 1
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>

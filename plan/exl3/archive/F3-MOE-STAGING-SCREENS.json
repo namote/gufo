@@ -1,0 +1,299 @@
+{
+  "status": "OPERATOR_CHECKED_CANDIDATE_PRESERVED_FOR_COMBINED_QUALIFICATION",
+  "production_changed": false,
+  "baseline_timing_executions": 0,
+  "full_model_executions": 0,
+  "profile_executions": 0,
+  "qualified_pp2048_unchanged": 1429.13,
+  "decision": "Keep both implementations and narrowed K5 Mode3 patch for a later combined prefill batch. Small mixed historical differences do not justify a long standalone full-model qualification or a speedup claim. Not rejected for proven regression; not promoted into qualified image.",
+  "timing_controls": {
+    "raw1172_ms": {
+      "routed-k2560-n640": 2.979682,
+      "routed-k640-n2560": 3.198049
+    },
+    "raw1172_log": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-partition-screen-nix101/receipt/run/partition-screen.log",
+    "raw1172_log_sha256": "b5068f36254f32380d18f13ebeeb784c6c27143fe189341c8befb246855f868f",
+    "note": "Raw harness legacy control rows print old832 timing before override; candidate change_percent uses actual1172 times above. Shared operator printed deltas divide by SERIAL controls; use matched_shared_side_comparison for current schedule."
+  },
+  "scopes": [
+    "Prototype raw kernels used generic predicates, instantiated only K5 Mode3. Preserved production patch narrows all changes to K5 Mode3, leaving dense, Mode2 and other bitrates unchanged.",
+    "144 untimed original-versus-candidate checks cover24 row counts at1/15/16/17/.../127/128,3 K/N shapes128/128,2560/640,640/2560, null and row exponents -1..5, exact input size, finite nonzero bytes and output guards. This is refactor equality, not an independent numerical oracle.",
+    "Shared/routed synthetic512/2048 checks cover shared, raw-down and combined outputs; gate/up intermediate payloads have guards only.",
+    "Current source reference prefix matches production4fd4737f. No extra input workspace; A preparation, all barriers, live padded16-row tiles and K16 arithmetic retained.",
+    "K-tail removal has no separately established speedup. Static resources cold/hot105/149\u2192104/149(deadB)\u2192103/148(combined); private/spills0, LDS24/32KiB unchanged.",
+    "Trellis ISA already has shared bases, immediate offsets and pointer induction; no additional address-hoist candidate justified.",
+    "Two prototype build errors (ADL namespace and distinct enum types) were fixed before GPU runs; original failed build logs preserved."
+  ],
+  "candidate_patch": {
+    "path": "plan/exl3/archive/F3-MOE-STAGING-CANDIDATE.patch",
+    "sha256": "b705df0de42c086d84892a538557d9ccb54d010e76f4e5c966093e9f7b4fa444",
+    "compiled_narrow_candidate": "build/f3-prefill-dead-b-boundary/candidate-kernel.hip",
+    "difference": "Namespace for coexistence and whitespace only in the narrowed kernel body."
+  },
+  "screens": {
+    "dead_b": {
+      "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-dead-b-screen-nix101",
+      "status": "COMPLETE",
+      "health_PASS": true,
+      "seconds": 1.7148062931373715,
+      "rows": [
+        {
+          "candidate_kernel_sha256": "1dbdd159e238caa1819976b19b1fdc12949845a4f063acbfd81e05a3113af8ed",
+          "header_extension_sha256": "6b3de9de1b0d8ea56dbdde08a5f6a5688cd04cb5c43044766875b78437525381",
+          "current_capacity_control": "fn-prefill-partition-screen-nix101 current-capacity1172",
+          "manifest_sha256": "864c12cc22f56ff37d1907d940d0dffaf6e58d3d2e1050f2c9727e2c0cf8aad7",
+          "binary_sha256": "43f9bdd9c7ea9ae97345ebe461cc8421d9567d630903d2c6929c2527d47aa0a8",
+          "wrapper_sha256": "f82e2f4434e3e5e46498fbb5dc6f2076d42a02edf19dfebdc7c73d28019820de",
+          "source_sha256": "5b8902f104a0329219e9d595cf2a08d4bed05cd44952d4904f9a72d22397bf01",
+          "controls_cached": true,
+          "full_model_run": false
+        },
+        {
+          "case": "routed-k2560-n640",
+          "variant": "control",
+          "ms": 3.10629,
+          "cached": true
+        },
+        {
+          "case": "routed-k2560-n640",
+          "variant": "dead-b-subtiles",
+          "ms": 2.94002,
+          "change_percent": -1.331,
+          "exact": true
+        },
+        {
+          "case": "routed-k640-n2560",
+          "variant": "control",
+          "ms": 3.232299,
+          "cached": true
+        },
+        {
+          "case": "routed-k640-n2560",
+          "variant": "dead-b-subtiles",
+          "ms": 3.158803,
+          "change_percent": -1.227,
+          "exact": true
+        }
+      ],
+      "artifact_dir": "/home/m2on/projects/gufo-f3-integ/build/f3-prefill-dead-b",
+      "artifact_hashes": {
+        "run_screen.py": "f82e2f4434e3e5e46498fbb5dc6f2076d42a02edf19dfebdc7c73d28019820de",
+        "build.sh": "aac3969be74d5e3644220099ea1b92cd3706acd8ed049f30536e879df0125175",
+        "INCLUDE-CLOSURE.json": "8972d7198d8ee8dbfd34b96ffa6ef40f2df1c630380873e3603e562affd782ab",
+        "screen.hip": "5b8902f104a0329219e9d595cf2a08d4bed05cd44952d4904f9a72d22397bf01",
+        "control-kernel.hip": "88b213f8f8f17e4620bc024a69cce1f322cc9297780243ac88da3bd9829bf738",
+        "candidate.patch": "c3dad91fe54e4ca9b3dc4f4d5ccfcbcd6af27b4567c96ead9fc0aa45eb0a06e2",
+        "kernel.hip": "1dbdd159e238caa1819976b19b1fdc12949845a4f063acbfd81e05a3113af8ed",
+        "CONTROL-HEADER-EXTENSION.json": "6b3de9de1b0d8ea56dbdde08a5f6a5688cd04cb5c43044766875b78437525381"
+      },
+      "binary_sha256": "43f9bdd9c7ea9ae97345ebe461cc8421d9567d630903d2c6929c2527d47aa0a8",
+      "window_sha256": "eff715560d6b903d751980be7294e4aaa9243a958f91d4fcee981f65a479402e",
+      "result_sha256": "2b67f9cd80f3ba84b1470786e9d1ad43fbe0c0fd14594ba4cdfbc6891f8d9e4d",
+      "window_health": {
+        "health_PASS": true
+      },
+      "weighted_2gate_plus_down_change_percent": -1.2947979958968792
+    },
+    "combined": {
+      "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-dead-b-kfull-nix101",
+      "status": "COMPLETE",
+      "health_PASS": true,
+      "seconds": 1.365073615917936,
+      "rows": [
+        {
+          "actual_timing_controls": {
+            "routed-k2560-n640": 2.979682,
+            "routed-k640-n2560": 3.198049
+          },
+          "timing_source": "/workspace/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-partition-screen-nix101/receipt/run/partition-screen.log",
+          "timing_source_sha256": "b5068f36254f32380d18f13ebeeb784c6c27143fe189341c8befb246855f868f",
+          "note": "Printed legacy control rows identify832slot saved output records; candidate change_percent uses these1172slot times."
+        },
+        {
+          "candidate_kernel_sha256": "aa9cef2e1cb7eee657b6014a0ed3c8460907f51acc33cf540eb9975ee9bfc33f",
+          "header_extension_sha256": "6b3de9de1b0d8ea56dbdde08a5f6a5688cd04cb5c43044766875b78437525381",
+          "current_capacity_control": "fn-prefill-partition-screen-nix101 current-capacity1172",
+          "manifest_sha256": "864c12cc22f56ff37d1907d940d0dffaf6e58d3d2e1050f2c9727e2c0cf8aad7",
+          "binary_sha256": "a0bd28b36956a8e677abdb91a8145ed6f4311c60cfccf170e986646da9c4ed6c",
+          "wrapper_sha256": "34a5b6df018f07e337f758a094f6760011f9edf921c47b7c3a1f79a2c399ed86",
+          "source_sha256": "2192e314018a0cb1ac1cf480bd224a5af9f820e03b5b93fa9b330cdcea35c5a3",
+          "controls_cached": true,
+          "full_model_run": false
+        },
+        {
+          "case": "routed-k2560-n640",
+          "variant": "control",
+          "ms": 3.10629,
+          "cached": true
+        },
+        {
+          "case": "routed-k2560-n640",
+          "variant": "dead-b-full-k",
+          "ms": 2.948984,
+          "change_percent": -1.03,
+          "exact": true
+        },
+        {
+          "case": "routed-k640-n2560",
+          "variant": "control",
+          "ms": 3.232299,
+          "cached": true
+        },
+        {
+          "case": "routed-k640-n2560",
+          "variant": "dead-b-full-k",
+          "ms": 3.164221,
+          "change_percent": -1.058,
+          "exact": true
+        }
+      ],
+      "artifact_dir": "/home/m2on/projects/gufo-f3-integ/build/f3-prefill-dead-b-kfull",
+      "artifact_hashes": {
+        "run_screen.py": "34a5b6df018f07e337f758a094f6760011f9edf921c47b7c3a1f79a2c399ed86",
+        "build.sh": "ea9c8d3b3aceb9721b96839df42d18ee9bb7bb81ce23aad167897f0c487ea4ad",
+        "INCLUDE-CLOSURE.json": "013f7d20a23e516add5437512ba4cab33a88abdd1396b9b1b53bfee46a259a1d",
+        "screen.hip": "2192e314018a0cb1ac1cf480bd224a5af9f820e03b5b93fa9b330cdcea35c5a3",
+        "control-kernel.hip": "88b213f8f8f17e4620bc024a69cce1f322cc9297780243ac88da3bd9829bf738",
+        "candidate.patch": "cc6ac243bcae7ae7f15b88f2c2cc36dd5aa06a3cc5af1a12d42146fac02899f0",
+        "kernel.hip": "aa9cef2e1cb7eee657b6014a0ed3c8460907f51acc33cf540eb9975ee9bfc33f",
+        "CONTROL-HEADER-EXTENSION.json": "6b3de9de1b0d8ea56dbdde08a5f6a5688cd04cb5c43044766875b78437525381"
+      },
+      "binary_sha256": "a0bd28b36956a8e677abdb91a8145ed6f4311c60cfccf170e986646da9c4ed6c",
+      "window_sha256": "e3ff4c0e4bc4c226d507d14dc8dfb9d72cf611c1fa4d2dac1ff62c31bdf4a95e",
+      "result_sha256": "d01ff3308bdfe0822f6c143c02a658513f2c7882b78352fdad4a02bd3391f300",
+      "window_health": {
+        "health_PASS": true
+      },
+      "weighted_2gate_plus_down_change_percent": -1.0398569989144346
+    },
+    "moe": {
+      "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-dead-b-moe-nix101",
+      "status": "COMPLETE",
+      "health_PASS": true,
+      "seconds": 4.916844337014481,
+      "rows": [
+        {
+          "case": "moe",
+          "rows": 512,
+          "variant": "serial",
+          "ms": 8.61897,
+          "cached": true
+        },
+        {
+          "case": "moe",
+          "rows": 512,
+          "variant": "dead-b-full-k",
+          "ms": 8.63315,
+          "change_percent": 0.16452,
+          "exact": true,
+          "guards": true
+        },
+        {
+          "case": "moe",
+          "rows": 512,
+          "variant": "dead-b-full-k+shared-side",
+          "ms": 8.59501,
+          "change_percent": -0.277977,
+          "exact": true,
+          "guards": true
+        },
+        {
+          "case": "moe",
+          "rows": 2048,
+          "variant": "serial",
+          "ms": 15.0755,
+          "cached": true
+        },
+        {
+          "case": "moe",
+          "rows": 2048,
+          "variant": "dead-b-full-k",
+          "ms": 15.0694,
+          "change_percent": -0.0401764,
+          "exact": true,
+          "guards": true
+        },
+        {
+          "case": "moe",
+          "rows": 2048,
+          "variant": "dead-b-full-k+shared-side",
+          "ms": 14.6878,
+          "change_percent": -2.57197,
+          "exact": true,
+          "guards": true
+        }
+      ],
+      "artifact_dir": "/home/m2on/projects/gufo-f3-integ/build/f3-prefill-dead-b-moe",
+      "artifact_hashes": {
+        "run_screen.py": "0935aff7fa540e7bc8021dd570ae34c9f8ac566107b1465288e17ccf9e8b529c",
+        "build.sh": "948332f06d878423c76990a54137a16ed3df08e5eb4a686cf40c099bb1d8e81d",
+        "INCLUDE-CLOSURE.json": "074b77e70800822c490b7c370df57601a1f6ef6c39fe70c3979494ca470d3866",
+        "screen.hip": "4f3d799ea3523e4adebc8a0d7d1238ffb3a284026e1cdacdc7cc40e54a9fe068",
+        "kernel.hip": "07516a6fab64063f42c0e6b12a94fde0bb59ff6060557a1f35cdea2bd7074032",
+        "matrix.hip": "3431d846de613044405cffc7a6380e91816b15477ea53c3f0a45daa2c0650e04"
+      },
+      "binary_sha256": "637498bab4c0fd1277efa6419fa2091041b2e7aa6dadce53d12473e440dacc37",
+      "window_sha256": "90bbb4c617e9162d5f92f39b6c5c8d0457800e22275e5f5ac547abf0385a9ca0",
+      "result_sha256": "55ce2a44218b989055516421f220db5549aea5f7289adc4cf5a6a1a72cd7a3e5",
+      "window_health": {
+        "health_PASS": true
+      },
+      "matched_shared_side_comparison": [
+        {
+          "rows": 512,
+          "saved_ms": 8.55525,
+          "candidate_ms": 8.59501,
+          "change_percent": 0.46474387072266143
+        },
+        {
+          "rows": 2048,
+          "saved_ms": 14.7609,
+          "candidate_ms": 14.6878,
+          "change_percent": -0.4952272557906423
+        }
+      ]
+    },
+    "boundary": {
+      "receipt": "/home/m2on/projects/ai.tools/tmp/test-results/gufo-upstream-port-20261023/fn-prefill-dead-b-boundary-nix101",
+      "status": "COMPLETE",
+      "health_PASS": true,
+      "seconds": 0.3640459729358554,
+      "rows": [
+        {
+          "boundary_checks": 144,
+          "exact": true,
+          "guards": true,
+          "input_allocation": "exact row count, no tail scratch",
+          "rates": [
+            5
+          ],
+          "mode": 3,
+          "exponents": "null or repeating -1..5",
+          "timing": false
+        }
+      ],
+      "artifact_dir": "/home/m2on/projects/gufo-f3-integ/build/f3-prefill-dead-b-boundary",
+      "artifact_hashes": {
+        "run_screen.py": "725681134186c60690bada17f5c5840757afe99b3844be167488849d189fe1b2",
+        "production-candidate.patch": "5f8b40b0afb30795a8a5a7845761fe323808628889e6d60a6c6f8ab8af7dc9d4",
+        "build.sh": "9192dcb213cc613ece614b014843f794659276a541aebba92e13e0e197992a55",
+        "candidate-kernel.hip": "5d099f5b2fea3166b896ca58040d26f14f7aa4d64c35ac11c05a4ddca9aac9af",
+        "INCLUDE-CLOSURE.json": "a3c970ba2988235a198c16f67801bb0a1670cc5f5bd4e252228fcd7b74070901",
+        "screen.hip": "9cebc0593b84b153068395e9e3e732bf5507cf0ab19fc17a15dec7e0508766de",
+        "control-kernel.hip": "88b213f8f8f17e4620bc024a69cce1f322cc9297780243ac88da3bd9829bf738"
+      },
+      "binary_sha256": "c2af559abda2202612dd10fd1626ab0e37e515d5ae26caf23b3af377806e41c6",
+      "window_sha256": "1b69fa8b454c2635ed60720a0a28f3e3c1763e42326f8a02ad2fd4ffd5571c8d",
+      "result_sha256": "9ac7ae485ad28a91105d550d16b128fc8531b9a4f8b892d851242aa2cec5a0f2",
+      "window_health": {
+        "health_PASS": true
+      }
+    }
+  },
+  "experiment_plan_commit": "ai.tools:8b1b8faa",
+  "subsequent_qualification": {
+    "report": "F3-PREFILL-BATCH6-QUALIFICATION.json",
+    "status": "SELECTED_AND_QUALIFIED",
+    "note": "Originalscreen fields describe that earliercheckpoint; candidate nowapplied andqualifiedtogether. Retainalloriginalevidence."
+  }
+}

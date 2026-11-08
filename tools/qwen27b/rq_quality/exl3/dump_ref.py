@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Upstream ExLlamaV3 reference values for gufo's EXL3 CPU reference (X0, plan/exl3/XA-BRIEF.md).
+"""Upstream ExLlamaV3 reference values for gufo's EXL3 CPU reference (X0, plan/exl3/archive/XA-BRIEF.md).
 
 Runs in the W8 runtime image (ai-tools/exl3-eval:1.6.5-rocm100) on the GPU and writes JSON that
 tests/core/quant/exl3_upstream_test.cpp compares against src/core/quant/exl3/.

@@ -1,4 +1,4 @@
-// KVarN K1b prototype for Qwen 27B decode attention (plan/gufo-upstream-port/
+// KVarN K1b prototype for Qwen 27B decode attention (plan/archive/gufo-upstream-port/
 // KVARN.md, K1-BRIEF.md): the group-flush quantizer, a fused-dequant split-K
 // decode attention for one query (AR) and for eight verification queries
 // (DFlash2), and the production FP16 split-K path as the baseline in the same

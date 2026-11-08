@@ -1,6 +1,6 @@
 // KVarN fake quantization of FP16 attention KV rows for the K0 accuracy study
-// (plan/gufo-upstream-port/KVARN.md). The algorithm follows the reference
-// store path of huawei-csl/KVarN (Apache-2.0,
+// (plan/archive/gufo-upstream-port/KVARN.md). The algorithm follows the
+// reference store path of huawei-csl/KVarN (Apache-2.0,
 // vllm/model_executor/layers/quantization/kvarn/sinkhorn.py and
 // vllm/v1/attention/ops/kvarn_store.py): a normalized Sylvester Hadamard
 // rotation along head_dim, log-domain alternating column/row standard

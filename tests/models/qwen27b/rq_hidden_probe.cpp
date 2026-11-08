@@ -1,6 +1,6 @@
 // RQ R2 diagnosis probe: per-layer residual hidden states of a Qwen27B GGUF
 // at the last rows of a corpus prefix, to compare a rotated file with its
-// unrotated source layer by layer (plan/rotated-quant/R2-RESULTS.md).
+// unrotated source layer by layer (plan/archive/rotated-quant/R2-RESULTS.md).
 //
 //   qwen27b_rq_hidden_probe <model.gguf> <windows.bin> <window offset>
 //       <position> <rows> <out prefix>

@@ -1232,7 +1232,7 @@ void QwenGpuArena::AllocateExl3(std::size_t max_input_width) {
                       workspace->scratch.rotated_elements * sizeof(float)));
   HIP_CHECK(hipMalloc(&workspace->scratch.weight,
                       workspace->scratch.weight_elements * sizeof(float)));
-  // X2b fast path (plan/exl3/XB-RESULTS.md "X-A arena"): an 8-row FP16
+  // X2b fast path (plan/exl3/archive/XB-RESULTS.md "X-A arena"): an 8-row FP16
   // rotated-input slab of the widest input and one arrival counter per
   // 128-column segment of the widest output (the head). The counters start
   // at zero and every launch returns them to zero.

@@ -4,7 +4,7 @@
 
 Bench `qwen38_flash_next_exl3_wmma_ceiling_bench`
 (`tools/bench/gfx1151_exl3_wmma_ceiling.hip`, commit `acc1898d`; decision
-note `plan/exl3/B7-CEILING-RESULT.md`, `726de4c8`). Variants per c03 shape:
+note `plan/exl3/archive/B7-CEILING-RESULT.md`, `726de4c8`). Variants per c03 shape:
 a production launchers, a* faithful copy (within ±3% of a, EQUAL), b
 pre-decoded FP16 weights from global, c weights decoded once into LDS (no
 decode), c0 everything staged once (barriers+LDS reads+WMMA only), d decode
@@ -35,7 +35,7 @@ projections +65 ms and MoE routing +25 ms (net 5276→5215 ms). Not adopted
 
 ## Flash-Next B6 prefill streaming stores and packed attention gate, November 8, 2026
 
-Commits `32b3f95e..fa33c927` (brief `plan/exl3/B6-BRIEF.md`). Kept, all exact
+Commits `32b3f95e..fa33c927` (brief `plan/exl3/archive/B6-BRIEF.md`). Kept, all exact
 (prefill logits sha `17dc8f9f…`, decode hashes/MTP counts equal B5): P1
 non-temporal stores for `RotateGateUpTokens`/`RestoreActivateScaleBuckets`
 slabs; P3 WMMA attention reads the output gate from packed `qg` rows (no gate
@@ -84,7 +84,7 @@ qkv/z rates. Evidence: `build/b1/prefill-prof-b6/summary.json`.
 
 ## Flash-Next B5 routed down tiles, decode side branches, November 8, 2026
 
-Commits `62e9b525..eb789c77` (brief `plan/exl3/B5-BRIEF.md`). Kept: J2a routed
+Commits `62e9b525..eb789c77` (brief `plan/exl3/archive/B5-BRIEF.md`). Kept: J2a routed
 GEMV route tiles out of LDS/scratch for R3/R4/R8 (B4 H4a had promoted them to
 57,344 B LDS + 80 B scratch, ≈1 block/WGP at MTP widths); J2b two output tiles
 per routed down wave at R1–R4 (1600→800 waves for 1280 resident slots); J3 GDN
@@ -116,7 +116,7 @@ fusion could not; dense GEMVs are near their ceiling at R=1. Evidence:
 
 ## Flash-Next B4 serial tails undone, routed LDS staging, November 8, 2026
 
-Commits `517445a3..dc24fd89` (brief `plan/exl3/B4-BRIEF.md`). Kept: G1 HC
+Commits `517445a3..dc24fd89` (brief `plan/exl3/archive/B4-BRIEF.md`). Kept: G1 HC
 tails reverted (H1); device-kernarg default reverted (H2, no effect in B3);
 routed GEMV activations staged in LDS per K chunk so the K loop keeps the next
 trellis group in flight (H4a); HC down finishes each Q8_1 group in its own
@@ -148,7 +148,7 @@ grow, and redundant or serial tail work quickly exceeds that. Evidence:
 
 ## Flash-Next B3 decode dispatch fusion and launch gaps, November 8, 2026
 
-Commits `addf9dd3..5bda5f57` (brief `plan/exl3/B3-BRIEF.md`): HC-down tail
+Commits `addf9dd3..5bda5f57` (brief `plan/exl3/archive/B3-BRIEF.md`): HC-down tail
 SiLU/Q8_1 and HC-up mix-epilogue tail (G1, −192 dispatches/token); router GEMV
 last block runs top-k + tiles (G4a, −48); restore/scale in the gate/up GEMV
 tail (G4b, −48); decode MoE output formed in the next HC combine (G4d, −47);
@@ -192,7 +192,7 @@ chain (projection_ops/gdn_ops bit mismatch); fixed by calling the pinned
 
 ## Flash-Next B2 producer rotation, verify state and side stream, November 7, 2026
 
-Commits `c49ea976..9599b4c6` (brief `plan/exl3/B2-BRIEF.md`): producer epilogues
+Commits `c49ea976..9599b4c6` (brief `plan/exl3/archive/B2-BRIEF.md`): producer epilogues
 write the rotated X2b input for R≤8 (E1, −144 rotate launches/token); exact
 R5–R8 routed live-row bodies (E4, MaxRows-8 VGPR 39–69→66–84, no scratch/LDS);
 GDN verify keeps state and replays the kept prefix from per-token records
@@ -223,7 +223,7 @@ Evidence: `build/b1/gpu-b2/RESULT.json`, `perf.json`, `prof/decode-summary.json`
 ## Flash-Next B1 decode glue and HC Q8, November 7, 2026
 
 User rule change: output bits may change; slight error is acceptable for speed.
-Commits `5c328695..cc86343e` (brief `plan/exl3/B1-BRIEF.md`): HC-down decode
+Commits `5c328695..cc86343e` (brief `plan/exl3/archive/B1-BRIEF.md`): HC-down decode
 deep steps (A3); GDN decode history/rollback writes folded into SsmConv4 (A1);
 routed decode memset/BuildTiles/ScaleDown/RestoreDown folded into router,
 restore and combine (B1); four routed GEMV waves per block (B2); prefill mix
@@ -306,7 +306,7 @@ do not globally force the kernel family for other bitrates or tile lengths.
 Evidence: `ai.tools/tmp/test-results/flash-next-quant-20261104/`
 `ngram-speed/RESULTS.json`, `ngram-streams/RESULTS.json`, and retained
 `ngram-streams/opt-reference.safetensors`; execution plan
-[`F3-QUANT-BIT-ALLOCATION.md`](../plan/exl3/F3-QUANT-BIT-ALLOCATION.md).
+[`F3-QUANT-BIT-ALLOCATION.md`](../plan/exl3/archive/F3-QUANT-BIT-ALLOCATION.md).
 
 ## Vemloir Flash-Next EXL3 pack, November 4, 2026
 
@@ -382,7 +382,7 @@ on 320x224; final 0.6023%/0.6212%. Existing GGUF all 29 stages byte-exact agains
 retained baseline. Full Gufo C2/native 256K image+repeat succeeds without any
 GGUF mappings,91/91 cached tokens and 0 prefill on repeat. K6 vision residence
 352601088B vs historical BF16 903984064 B saves 525.84 MiB; no matched speed claim.
-[Scope, provenance, failures and limits](../plan/exl3/F3-VISION-NATIVE.md).
+[Scope, provenance, failures and limits](../plan/exl3/archive/F3-VISION-NATIVE.md).
 
 ## Request memory budgeting and KV admission candidate, November 3, 2026
 
@@ -491,24 +491,24 @@ session, with later receipt-backed annotations); it is weaker provenance than ra
 
 | Key | Source, relative to repository root unless stated otherwise |
 |---|---|
-| S | `plan/exl3/F3-SESSION-FINDINGS.md` |
-| R0 | `plan/rotated-quant/R0-RESULTS.md` |
-| R0b | `plan/rotated-quant/R0B-RESULTS.md` |
-| R1b | `plan/rotated-quant/R1B-RESULTS.md` |
-| R2 | `plan/rotated-quant/R2-RESULTS.md` |
-| W8 | `plan/rotated-quant/EXL3-RESULTS.md` |
-| W9 | `plan/rotated-quant/W9-RESULTS.md` |
-| X3 | `plan/exl3/X3-RESULTS.md` |
-| XB | `plan/exl3/XB-RESULTS.md` |
-| XA | `plan/exl3/XA-RESULTS.md` |
-| XQ | `plan/exl3/XQ-RESULTS.md` |
-| F1 | `plan/exl3/F1-RESULTS.md` |
-| F2I | `plan/exl3/F2-IMPLEMENTATION.md` |
-| F2D | `plan/exl3/F2-DESIGN.md` |
-| F2Q | `plan/exl3/F2-QUALITY.md` |
-| F3 | `plan/exl3/F3-PLAN.md` |
-| K | `plan/gufo-upstream-port/KVARN.md` |
-| Skinny | `plan/gufo-upstream-port/SKINNY.md` |
+| S | `plan/exl3/archive/F3-SESSION-FINDINGS.md` |
+| R0 | `plan/archive/rotated-quant/R0-RESULTS.md` |
+| R0b | `plan/archive/rotated-quant/R0B-RESULTS.md` |
+| R1b | `plan/archive/rotated-quant/R1B-RESULTS.md` |
+| R2 | `plan/archive/rotated-quant/R2-RESULTS.md` |
+| W8 | `plan/archive/rotated-quant/EXL3-RESULTS.md` |
+| W9 | `plan/archive/rotated-quant/W9-RESULTS.md` |
+| X3 | `plan/exl3/archive/X3-RESULTS.md` |
+| XB | `plan/exl3/archive/XB-RESULTS.md` |
+| XA | `plan/exl3/archive/XA-RESULTS.md` |
+| XQ | `plan/exl3/archive/XQ-RESULTS.md` |
+| F1 | `plan/exl3/archive/F1-RESULTS.md` |
+| F2I | `plan/exl3/archive/F2-IMPLEMENTATION.md` |
+| F2D | `plan/exl3/archive/F2-DESIGN.md` |
+| F2Q | `plan/exl3/archive/F2-QUALITY.md` |
+| F3 | `plan/exl3/archive/F3-PLAN.md` |
+| K | `plan/archive/gufo-upstream-port/KVARN.md` |
+| Skinny | `plan/archive/gufo-upstream-port/SKINNY.md` |
 | E27 | `docs/models/qwen3.8-27b/EXPERIMENTS.md` |
 | EFN | `docs/models/qwen3.8-flash-next/EXPERIMENTS.md` |
 | Q27 | `docs/models/qwen3.8-27b/QUALITY.md` |
@@ -589,7 +589,7 @@ can depend on compiler, resources and neighboring work, so measure complete
 span rather than adding isolated kernel times (S:5,8; EFN:52–71,107–108).
 Source audit clarification (no new measurement): that generic probe and the
 existing Q8-weight production overlaps do not cover current EXL3 branch pairs.
-[EXL3 stream candidate audit](../plan/exl3/F3-STREAM-OVERLAP.md) records their
+[EXL3 stream candidate audit](../plan/exl3/archive/F3-STREAM-OVERLAP.md) records their
 joins, workspace aliases and priority. Shared/routed overlap is now qualified;
 GDN Z had weak/negative evidence. See the final stream qualification below.
 
@@ -691,7 +691,7 @@ accuracy (Testing:114–149; W8:128–135; F2Q:10–16,157–163).
 Do not assume runtime determinism from operator determinism: repeated upstream
 collection produced different record hashes despite the same pack, image and
 collector. Keep process/reload controls and paired comparisons
-(XQ:414–418; correction to `plan/rotated-quant/PLAN.md:111`).
+(XQ:414–418; correction to `plan/archive/rotated-quant/PLAN.md:111`).
 
 ## Reusable kernel patterns
 
@@ -830,10 +830,10 @@ that one removed instruction family is the bottleneck.
 - Large write/delete cycles changed SSD latency independently of GPU code.
   TRIM-associated controls restored stable reads; the internal QLC mechanism
   was an inference. Record storage history and device latency
-  (`plan/gufo-upstream-port/DISKREAD-RESULTS.md:9–23,48–55`).
+  (`plan/archive/gufo-upstream-port/DISKREAD-RESULTS.md:9–23,48–55`).
 - Separate anonymous allocations, precommitted backing and reclaimable file cache.
   A supposed budget-independent memory floor partly came from precommitted
-  cache backing (`plan/gufo-upstream-port/ANON-FLOOR-RESULTS.md:27–43`).
+  cache backing (`plan/archive/gufo-upstream-port/ANON-FLOOR-RESULTS.md:27–43`).
 - Run a memory-heavy CPU oracle alone where possible. Co-resident weights
   starved page cache; conversion/build work also invalidated timing windows
   (EFN:129–131; R2:527; K:338).
@@ -901,12 +901,12 @@ commits before acting; model-specific reachability and pending work are in Other
 
 | Lead | Bounded next action | Evidence |
 |---|---|---|
-| Deferred K5 indexer narrow tile | The 128×128 4×2 K32 single-group candidate reduced synthetic time 16.48%; qualify actual weights and model impact only with a later larger batch. The tested masked-wide K5 variant was slower. | `plan/exl3/F3-NEXT-MATRIX-SCREEN.md` |
+| Deferred K5 indexer narrow tile | The 128×128 4×2 K32 single-group candidate reduced synthetic time 16.48%; qualify actual weights and model impact only with a later larger batch. The tested masked-wide K5 variant was slower. | `plan/exl3/archive/F3-NEXT-MATRIX-SCREEN.md` |
 | Stream-K bucket scheduling | Persistent 80/160-block scheduling has now been screened without a qualified benefit. Stream-K remains untried and would need its own reduction-order/quality proof; inspect skewed layer tail span first. | S:29–31; final Nix prefill section below |
 | Reuse low-bit decode across small batches | Existing upstream mmvq repeats decoding per activation row; shared-row decoding is a new path requiring independent quality and real verification timing. | R0b:200,208 |
 | Prepare actual first-use functions/graph keys | Profile one affected first use; broad warmup already exists and some stalls remain inconclusive. | W9:563–592; EFN:229,243 |
 | Chunk reuse versus responsiveness | Use real bucket histograms and state hashes; larger chunks must preserve cancellation/checkpoint cadence and row arithmetic. | F3:91; S:31 |
-| Storage-aware checkpoint selection | Compare shallower RAM plus compute against deeper disk restore under measured device latency, preserving state/lineage correctness. | `plan/gufo-upstream-port/DISKREAD-RESULTS.md:43–55` |
+| Storage-aware checkpoint selection | Compare shallower RAM plus compute against deeper disk restore under measured device latency, preserving state/lineage correctness. | `plan/archive/gufo-upstream-port/DISKREAD-RESULTS.md:43–55` |
 
 ## Build and measurement provenance
 
@@ -923,7 +923,7 @@ commits before acting; model-specific reachability and pending work are in Other
 
 ## Other (model-specific)
 
-Full model-specific results live in `docs/models/<model>/EXPERIMENTS.md`, `plan/exl3/*-RESULTS.md`, `plan/rotated-quant/*-RESULTS.md`.
+Full model-specific results live in `docs/models/<model>/EXPERIMENTS.md`, `plan/exl3/*-RESULTS.md`, `plan/archive/rotated-quant/*-RESULTS.md`.
 
 The bullets below preserve the moved model-specific record, including rejected
 searches and unqualified work. They are not policies or thresholds for a new model.
@@ -943,7 +943,7 @@ searches and unqualified work. They are not policies or thresholds for a new mod
   be relabeled. Alpha/beta are folded at load outside the upstream allow-list;
   binding errors were BF16 1.61e-4 and Q8_0 5.81e-4. Loader checks used
   identical-file/token llama.cpp controls
-  (`plan/rotated-quant/R1C-PRISM-MAPPING.md:20–33`; R2:449–466; R0:113–139).
+  (`plan/archive/rotated-quant/R1C-PRISM-MAPPING.md:20–33`; R2:449–466; R0:113–139).
 - **Alignment correction:** the quantizer copied declared alignment but laid
   bytes at its default alignment. The old preservation claim was retracted;
   converter `fe77eaa4` repacks output (R1b:344–351).
@@ -977,7 +977,7 @@ searches and unqualified work. They are not policies or thresholds for a new mod
   head 5120→248320; MTP FC 10240→5120. All output widths are divisible by
   256; none of these production projections reaches kWideHalf
   (`src/models/qwen/exl3_weights.cpp:96–155`; Format:74–77;
-  `plan/exl3/XB-DESIGN.md:20–28`).
+  `plan/exl3/archive/XB-DESIGN.md:20–28`).
 - **Numerical gates/tests:** X2b matched-input stage bound 1e-5 measured
   1.4e-7–3.4e-7; X3 prefill uses `(k/16) × 2^-23`, not a moving ratio to
   another Gufo GEMM. Verify remains GEMV. Packed-hash exhaustive checks,
@@ -1039,7 +1039,7 @@ searches and unqualified work. They are not policies or thresholds for a new mod
   coding gains (E27:12–20,68–71,87–97,118–124).
 - **Memory:** a small BF16 injection matrix deliberately stays cached
   (`QH/kernels/prefill_gemm.hip:167–178`); shared draft-feature backing removed
-  duplicated slot allocation (`plan/gufo-upstream-port/U4D-RESULTS.md:70`).
+  duplicated slot allocation (`plan/archive/gufo-upstream-port/U4D-RESULTS.md:70`).
   Standalone rotated output producers and disabled SwiGLU fusions remain
   candidates only if their measured share justifies work (R2:625–630).
 
@@ -1191,7 +1191,7 @@ searches and unqualified work. They are not policies or thresholds for a new mod
   Candidate Docker probe: pp2048 1285.56, pp8192 1339.10, tg128 25.04.
   Reuse only activates beyond 2048 tokens, so the pp2048 change is not an
   optimization gain. pp8192 difference is -1.1%; no baseline repeat was run.
-  See `gufo-f3-integ/plan/exl3/F3-RESUME-RESULTS.md` and receipts
+  See `gufo-f3-integ/plan/exl3/archive/F3-RESUME-RESULTS.md` and receipts
   `fn-resume-966f84b8-stamped/`, `fn-indexer/` under the raw-evidence root.
 - **GGUF MoE dead ends:** smaller dense tiles/shared rows-first tiles did not
   improve full span; high-nibble half-subnormal trick was noise to 2% slower;
@@ -1238,7 +1238,7 @@ searches and unqualified work. They are not policies or thresholds for a new mod
   reserve regressed individual phases; do not accept total request gain as
   a phase pass (EFN:213,252). The old anonymous-floor interpretation mixed
   precommitted checkpoint backing and per-slot buffers; preserve actual allocation/cache
-  accounting (`plan/gufo-upstream-port/ANON-FLOOR-RESULTS.md:27–43`).
+  accounting (`plan/archive/gufo-upstream-port/ANON-FLOOR-RESULTS.md:27–43`).
 - **Historical status:** earlier reference-prefill/rate-support limitations
   are superseded by the later implementation/API and hold record
   (F3:76,86,155–203,229–246).
@@ -1329,7 +1329,7 @@ See f3-integ F3-RESUME-RESULTS.md final section and BATCH-QUALIFICATION.json.
 
 No production change; the qualified pp2048 baseline remains 1400.15 tok/s.
 Two healthy, short Nix 10.1 operator windows reused saved outputs and avoided
-full-model inference. [Detailed tables and identities](../plan/exl3/F3-NEXT-MATRIX-SCREEN.md).
+full-model inference. [Detailed tables and identities](../plan/exl3/archive/F3-NEXT-MATRIX-SCREEN.md).
 
 - K32 staging paired with fewer waves was mostly slower: wide dense +21–59%,
   routed BM64 +11–22%; routed BM128 gave gate +2.11% / down −1.97%.
@@ -1383,7 +1383,7 @@ objects, resources, and controls stay in f3-integ `build/f3-prefill-stage` and
   and64 head checks remain exact; hc7 NLL drift+.006600 is not removed.
 
 All detailed operator values, exactness limits, source/runtime fingerprints,
-and receipts: [batch2](../plan/exl3/F3-PREFILL-BATCH2.md) and its linked JSON.
+and receipts: [batch2](../plan/exl3/archive/F3-PREFILL-BATCH2.md) and its linked JSON.
 Units/collector passed before a wrapper0644 packaging fault; mode0755 repair
 changed no ELF bytes, and only the unexecuted benchmarks resumed. Both windows
 passed health fences; the first remains a recorded failure, not relabeled.
@@ -1393,8 +1393,8 @@ passed health fences; the first remains a recorded failure, not relabeled.
 Static inspection, no new build/GPU measurement: 13 matrix specializations in
 preserved Nix ROCm 10.1 stage-screen assembly have 89–214 VGPRs, zero private
 frame, and zero SGPR/VGPR spill counts. This does not cover every kernel in the
-final qualified image. [Metadata and provenance](../plan/exl3/F3-REGISTER-AUDIT.json).
-[Candidate scope](../plan/exl3/F3-SEARCH-STATUS.md#register-pressure-and-kernel-fission)
+final qualified image. [Metadata and provenance](../plan/exl3/archive/F3-REGISTER-AUDIT.json).
+[Candidate scope](../plan/exl3/archive/F3-SEARCH-STATUS.md#register-pressure-and-kernel-fission)
 separates actual spill removal, array scalarization, independent output tiling,
 stage fission, and resource fit for streams. Existing smaller-tile regressions
 remain evidence; high register use alone is not a demonstrated spill bottleneck.
@@ -1414,14 +1414,14 @@ shapes; small K640/N2560 gained at most4.55% before initialization. No persisten
 model cache is added. Partial-group mapping was independently checked; the
 actual release object also passed untimed saved-output checks. Reuse batch512
 collector evidence separately from new2048 operator evidence. See
-[detailed traversal results](../plan/exl3/F3-PREFILL-GRID.md) and its linked JSON.
+[detailed traversal results](../plan/exl3/archive/F3-PREFILL-GRID.md) and its linked JSON.
 
 The dense traversal batch subsequently qualified: pp5121063.05±.22,
 pp20481416.51±.82, pp81921447.47±1.36, d32K pp20481291.03±1.09 tok/s.
 That is +.11/+1.17/+.36/+.80% versus the saved starting batch; pp2048 gains
 +.80% over batch2 alone. Actual release-object exact/guard checks passed;
 batch512 collector evidence was reused under its explicit unchanged scope.
-The >=2000 tok/s target remains unmet. [Qualification](../plan/exl3/F3-PREFILL-GRID-QUALIFICATION.json).
+The >=2000 tok/s target remains unmet. [Qualification](../plan/exl3/archive/F3-PREFILL-GRID-QUALIFICATION.json).
 
 ### Flash-Next compact cold-class closure (2026-11-01)
 
@@ -1437,7 +1437,7 @@ Live classes:127/56/62/155 buckets, carrying4.63/6.50/14.08/74.79% of assignment
 Existing padding-skip already avoids unused WMMAs; four classes reduce staged
 B rows22.21%, but only5.72% beyond split32. The older split32 health-failed
 window remains advisory; this new healthy compact test closes the distinct
-partition/LDS-pressure idea. [Search status and limits](../plan/exl3/F3-SEARCH-STATUS.md).
+partition/LDS-pressure idea. [Search status and limits](../plan/exl3/archive/F3-SEARCH-STATUS.md).
 
 ### Flash-Next stream scheduling screens (2026-11-01, initial operator evidence)
 
@@ -1461,7 +1461,7 @@ The extra refactor is not justified by that small difference. Attention and
 KVarN quantization were excluded. The65-row projection/branch gains24–25% are
 not extrapolated to large-model prefill. All candidate outputs/guards were
 exact, including GDN recurrent/history state and immutable KV prefix. Details,
-512-row results and provenance: [stream ledger](../plan/exl3/F3-STREAM-OVERLAP.md).
+512-row results and provenance: [stream ledger](../plan/exl3/archive/F3-STREAM-OVERLAP.md).
 
 ### Actual release resources and KVarN register selection (2026-11-01)
 
@@ -1487,7 +1487,7 @@ controls are saved once. Production qualification and selection follow below.
 The saved hc7 profile puts this quantizer at10.13ms/24calls versus987+726ms
 for its two largest matrix entries; it is a bounded cleanup, not a claim of
 large whole-model speedup. No new profile was collected.
-[Actual release audit and screen provenance](../plan/exl3/F3-RELEASE-RESOURCE-AUDIT.json).
+[Actual release audit and screen provenance](../plan/exl3/archive/F3-RELEASE-RESOURCE-AUDIT.json).
 
 ### Whole-model stream selection and final closure (2026-11-02)
 
@@ -1519,8 +1519,8 @@ restored baseline. No fresh fullcollector on the cleaned image is claimed.
 KVarN performance usesk4v4; its correctness is separate operator evidence.
 Baseline inference/profile runs:0. Target2000 remains unmet.
 
-[All bounded numeric records](../plan/exl3/F3-STREAM-SCREENS.json),
-[whole-model qualification and scope bridge](../plan/exl3/F3-STREAM-QUALIFICATION.json).
+[All bounded numeric records](../plan/exl3/archive/F3-STREAM-SCREENS.json),
+[whole-model qualification and scope bridge](../plan/exl3/archive/F3-STREAM-QUALIFICATION.json).
 
 
 ### Routed K5 gate/up grouped launch screen (2026-11-02)
@@ -1543,7 +1543,7 @@ Shared, combined and raw-down outputs are exact and finite; output guards pass.
 Gate/up intermediate values were not separately compared. Five linked objects
 match old controls; the kernels TU differs. No fresh independent oracle,
 full-model qualification, baseline run or profile. Prototype/source/objects
-remain in `build/f3-grouped-moe`; [all results and provenance](../plan/exl3/F3-GROUPED-MOE-SCREEN.json).
+remain in `build/f3-grouped-moe`; [all results and provenance](../plan/exl3/archive/F3-GROUPED-MOE-SCREEN.json).
 
 
 ### Current shared5 prefill profile (2026-11-02, user requested)
@@ -1585,7 +1585,7 @@ LDS, dequantization and DRAM stalls. Reuse the actual release no-spill audit.
 Profiled1426.48tok/s is advisory (context4096 versus earlier benchmark8193);
 qualified clean1429.13 remains current. Existing `tools/prof/prof.py` exactly
 cross-checks interval totals; its generic stage map is not used for EXL3
-attribution. [Raw receipt, shapes, coverage and limitations](../plan/exl3/F3-CURRENT-PREFILL-PROFILE.json).
+attribution. [Raw receipt, shapes, coverage and limitations](../plan/exl3/archive/F3-CURRENT-PREFILL-PROFILE.json).
 
 ### Routed MoE ceiling diagnosis (2026-11-02, offline only)
 
@@ -1599,8 +1599,8 @@ prepare full64/128-row inputs. This is logical work, not measured DRAM traffic
 or the current model's routing distribution. Decode/issue competition and LDS
 reuse have historical support, but current causal percentages remain unknown.
 No GPU measurement, production change or quality qualification was added.
-[Calculations/provenance](../plan/exl3/F3-MOE-CEILING-DIAGNOSIS.json) and
-[ordered plan](../plan/exl3/F3-SEARCH-STATUS.md#ordered-improvement-plan) preserve
+[Calculations/provenance](../plan/exl3/archive/F3-MOE-CEILING-DIAGNOSIS.json) and
+[ordered plan](../plan/exl3/archive/F3-SEARCH-STATUS.md#ordered-improvement-plan) preserve
 existing rejected experiments and prioritize dead-subtile preparation before
 conditional trellis-address work, with one final combined qualification.
 
@@ -1623,7 +1623,7 @@ K5 raw-half candidate for a later combined qualification; do not repeatedly
 measure it or claim the original33.4% logical staging reduction as time saved.
 Trellis ISA already uses shared bases/immediate offsets/pointer induction;
 there is no concrete additional address-hoist candidate.
-[All outcomes, artifacts and limits](../plan/exl3/F3-MOE-STAGING-SCREENS.json).
+[All outcomes, artifacts and limits](../plan/exl3/archive/F3-MOE-STAGING-SCREENS.json).
 
 ### HC MoE-combine operand loads, November 2, 2026
 
@@ -1643,7 +1643,7 @@ prototype standalone parity24 also passes. Guards/finite/poison included.
 No baseline replay, model run or profile for the production check. These are
 operator timings, not a whole-prefill speedup; qualified1429.13tok/s remains.
 HcMix gate loads are already grouped in ISA; do not repeat that lead.
-[Failures, all candidates, hashes and receipts](../plan/exl3/F3-HC-LOAD-SCREENS.json).
+[Failures, all candidates, hashes and receipts](../plan/exl3/archive/F3-HC-LOAD-SCREENS.json).
 
 ### Dense X3 K-tail audit (2026-11-02)
 
@@ -1661,7 +1661,7 @@ historical evidence with the largest QKV worse, no aggregate win justifying
 another specialization. These are advisory operator timings, not a confirmed
 model regression. No baseline/profile/model rerun for this screen. Preserve
 prototype and failed pre-GPU manifest check; move to combined HC/MoE batch.
-[All numbers, ISA sites and receipts](../plan/exl3/F3-DENSE-KTAIL-SCREEN.json).
+[All numbers, ISA sites and receipts](../plan/exl3/archive/F3-DENSE-KTAIL-SCREEN.json).
 
 ### HC/MoE combined qualification, November 2, 2026
 
@@ -1684,7 +1684,7 @@ checks pass. Performance uses k4v4/temp0/seed314159/r2. The initial pp2048
 context8193→4096 and is diagnostic only; the final d0 replay restored the
 original512,2048,8192 list and8193 capacity. All attempts are retained; no
 baseline, correctness or d32K rerun. Target2000 is still unmet.
-[Qualification, runtime/code identities and all attempts](../plan/exl3/F3-PREFILL-BATCH6-QUALIFICATION.json).
+[Qualification, runtime/code identities and all attempts](../plan/exl3/archive/F3-PREFILL-BATCH6-QUALIFICATION.json).
 
 ## TG/MTP routed and HC optimization, November 2, 2026
 
@@ -1729,9 +1729,9 @@ C2/4/6/8 correctness passed; their serving throughput was not measured here.
 Complete sampling/batch/rejection/lookup/snapshot/deep-state checks pass.
 Draft policy/costtables and precision are unchanged.75of77codeobjects remain
 identical; only FlashNext general kernels and routed-MoE TUs changed.
-[Qualification](../plan/exl3/F3-TGMTP-QUALIFICATION.json),
-[screens](../plan/exl3/F3-TGMTP-SCREENS.json),
-[flow inventory](../plan/exl3/F3-TGMTP-FLOW.json).
+[Qualification](../plan/exl3/archive/F3-TGMTP-QUALIFICATION.json),
+[screens](../plan/exl3/archive/F3-TGMTP-SCREENS.json),
+[flow inventory](../plan/exl3/archive/F3-TGMTP-FLOW.json).
 
 ## Kyojin target comparison, November 2, 2026
 
@@ -1780,7 +1780,7 @@ acceptance/lookup counts, runtime maps, frozen inputs and published-page SHA
 are retained in the comparison report. Existing numerical qualification and
 its NLL caveat remain unchanged. No Kyojin quality parity is claimed.
 
-[Comparison](../plan/exl3/F3-TGMTP-KYOJIN-COMPARISON.json).
+[Comparison](../plan/exl3/archive/F3-TGMTP-KYOJIN-COMPARISON.json).
 
 
 ## Native EXL3 PLE transition, November 2, 2026
@@ -1810,7 +1810,7 @@ GGUF sidecar. Validate NFC/pretokenizer/added-token contracts, distinguish PLE
 EOS from generation EOS, match native MTP to trunk shards, and bind persistent
 identity to full payloads plus all metadata and source stamps. Preserve the
 existing Nix volume/objects; only the completed export's new unused BuildKit
-records were cleaned after packaging. [Evidence](../plan/exl3/F3-NATIVE-PACK.json).
+records were cleaned after packaging. [Evidence](../plan/exl3/archive/F3-NATIVE-PACK.json).
 
 ## Native PLE host attribution, November 2, 2026
 
@@ -1827,7 +1827,7 @@ These are instrumented host durations, partly overlapped with GPU work; logging
 can hide waits. No uninstrumented-stall bound, worker/SSD bandwidth interference,
 GPU mapped-quantizer attribution or cold/prose generalization is established.
 Observed host cost is small here; profile those unresolved costs before a large
-loader rewrite. [Evidence and scope](../plan/exl3/F3-PLE-HOST-PROFILE.md).
+loader rewrite. [Evidence and scope](../plan/exl3/archive/F3-PLE-HOST-PROFILE.md).
 
 ## Local Kyojin, November 2, 2026
 
@@ -1853,7 +1853,7 @@ User-authorized five-payload internal GGUF removal funded88.82GiB local copy,
 including24.4GiB ngram; external originals/manifests remain. Streamed source
 hashes and destination sizes/fsync checked, no redundant full reread. Existing
 Gufo artifacts preserved. Infra432pass; no Gufo inference change.
-[Receipt and limitations](../plan/exl3/F3-KYOJIN-LOCAL.md).
+[Receipt and limitations](../plan/exl3/archive/F3-KYOJIN-LOCAL.md).
 
 ## Same-pack TG/MTP attribution, November 2, 2026
 
@@ -1884,7 +1884,7 @@ reuse rejected tile/prefetch ledger, preserve arithmetic and qualify realragged
 routes. Do not start with2.77% drafthead approximation or previouslyfailed HC
 int8. C1greedy uses confidence afterinitialcycle; oldcostcurves alone do not
 establish a retuning opportunity. Batch small screens and final qualification.
-[All evidence and limitations](../plan/exl3/F3-KYOJIN-SAME-PACK.md).
+[All evidence and limitations](../plan/exl3/archive/F3-KYOJIN-SAME-PACK.md).
 
 ## Exact live-row routed verification, November 2, 2026
 
@@ -1908,7 +1908,7 @@ batches,32K/cache, and identical AR/MTP output hashes/work counts. MTP d0
 baseline spread. PP1426.88/1460.75 and AR25.20/24.49 are effectively unchanged.
 Do not equate component gains with whole-model gains. All baseline/prototype
 objects remain; no baseline/model remeasurement or extra pipeline profile.
-[Complete evidence and all measured shapes](../plan/exl3/F3-TGMTP-ROWS.md).
+[Complete evidence and all measured shapes](../plan/exl3/archive/F3-TGMTP-ROWS.md).
 
 November 7 generalization removes the K5-only R3/R4 gate, including K3.5/K8,
 and qualifies it together with all-rate Mode3 dead-B staging/K-tail elimination
@@ -1956,7 +1956,7 @@ All three compile with production Nix10.1/O2 and are rejected before GPU
 execution. Compiler evidence does not establish actual latency regression or
 the precise allocator cause. No new correctness/speed claim; existing
 prefill/TG/MTP implementation and saved baselines remain selected.
-[Scope, patches and resources](../plan/exl3/F3-PREFILL-LIVE-TILES.md).
+[Scope, patches and resources](../plan/exl3/archive/F3-PREFILL-LIVE-TILES.md).
 
 ## Flash-Next physical prefix references, November 4, 2026
 
@@ -1984,7 +1984,7 @@ Pi2tasks/6tools pass. PP2048/8192=1372.59/1398.58, AR d0/d32K=24.30/23.59,
 MTP=33.90/76.67tok/s vs saved K6=1374.42/1403.11,24.33/23.58,35.66/76.06.
 Desktop-active timing is advisory; no baseline rerun or full256K replay.
 Pool backing size is unchanged; sharing reduces duplicate block occupancy.
-[Full evidence and limits](../plan/exl3/F3-KV-REFERENCES.md).
+[Full evidence and limits](../plan/exl3/archive/F3-KV-REFERENCES.md).
 
 ## Flash-Next shared K4V4 pool, November 2, 2026
 
@@ -2008,7 +2008,7 @@ No baseline rerun;32K MTP is lookup-heavy. No full two-times-256K inference.
 Actual C4 HTTP,12K long context, process-restart disk restore12352+7 tokens
 (0.486s, same output), Pi1.4.0 three tasks/nine tools pass. Cold/warm identity
 startup85.34/35.15s. Current image4757e04f, Nix10.1 incremental objects retained.
-[All results and provenance](../plan/exl3/F3-SHARED-KV.md).
+[All results and provenance](../plan/exl3/archive/F3-SHARED-KV.md).
 
 
 ### 2026-11-04: Gufo FP16/native256K/C2 serving memory
@@ -2040,7 +2040,7 @@ returnedKFD0. This is a two-row operator/long-shape screen, not full-model
 quality or peak-memory qualification. Existing512 baseline not repeated.
 Main retains8GiB host reserve/100GiB container and module checkpoints.
 Evidence: `ai.tools/tmp/test-results/flash-next-quant-20261104/long-row-pilot/`;
-[conversion/watch](../plan/exl3/F3-CONVERSION-WATCH.md).
+[conversion/watch](../plan/exl3/archive/F3-CONVERSION-WATCH.md).
 
 ### 2026-11-05: c03 calibration state residency repair
 
@@ -2136,7 +2136,7 @@ The new module limit is2h with unchanged RAM8GiB/disk100GiB running floors.
 Full model accuracy/performance remain the final combined qualification.
 Evidence: `ai.tools/tmp/test-results/flash-next-quant-20261104/capture-speed/`,
 `capture-optimization-cpu-active-runtime/`, and `model-job-c03/repair-005-capture-speed/`.
-[Conversion watch and rollout](../plan/exl3/F3-CONVERSION-WATCH.md).
+[Conversion watch and rollout](../plan/exl3/archive/F3-CONVERSION-WATCH.md).
 
 Production activation is confirmed on resumed module009: the first host progress
 record reports4 capture scopes and2048 skipped down calls (9,900,032 expert rows).

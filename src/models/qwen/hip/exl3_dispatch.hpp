@@ -2,9 +2,9 @@
 #define GUFO_MODELS_QWEN_HIP_EXL3_DISPATCH_HPP_
 
 // The single dispatch point of an EXL3 projection (QwenTensorRef::exl3) in
-// the Qwen HIP forward paths (plan/exl3/XA-RESULTS.md "X2a 설계 메모",
-// plan/exl3/XB-DESIGN.md). Every call site that multiplies by a projection
-// branches here when the tensor is EXL3. X2a runs the reference path
+// the Qwen HIP forward paths (plan/exl3/archive/XA-RESULTS.md "X2a 설계 메모",
+// plan/exl3/archive/XB-DESIGN.md). Every call site that multiplies by a
+// projection branches here when the tensor is EXL3. X2a runs the reference path
 // (src/core/quant/exl3/reference.hpp); X2b adds its fast kernels behind the
 // same function.
 

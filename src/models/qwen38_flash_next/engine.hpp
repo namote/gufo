@@ -65,7 +65,8 @@ struct ModelOptions {
   /// it today.
   std::optional<RopeScaling> rope_scaling{};
   /// Trunk attention K/V as KVarN k4v4 records (`--kv-cache-type
-  /// kvarn-k4v4`, plan/exl3/F1-KVARN-DESIGN.md); the MTP layer stays FP16.
+  /// kvarn-k4v4`, plan/exl3/archive/F1-KVARN-DESIGN.md); the MTP layer stays
+  /// FP16.
   bool kvarn = false;
   int kvarn_bits = 4;
 };

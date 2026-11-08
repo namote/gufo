@@ -3,7 +3,7 @@
 
 // Device descriptor of one expert bucket tile for the EXL3 bucketed WMMA
 // GEMM (LaunchExl3PrefillBucketInner, ops/prefill_fp16.hpp). HIP-free so
-// model code can alias it (plan/exl3/F3-PLAN.md "F3-API").
+// model code can alias it (plan/exl3/archive/F3-PLAN.md "F3-API").
 
 #include <cstdint>
 

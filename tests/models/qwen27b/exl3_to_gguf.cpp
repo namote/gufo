@@ -1,5 +1,5 @@
-// X1 correctness path tool (plan/exl3/XA-BRIEF.md): Qwen3.8 27B tensors in
-// the llama.cpp qwen35 layout from an EXL3 checkpoint
+// X1 correctness path tool (plan/exl3/archive/XA-BRIEF.md): Qwen3.8 27B tensors
+// in the llama.cpp qwen35 layout from an EXL3 checkpoint
 // (src/models/qwen/exl3_weights.hpp).
 //
 //   exl3_to_gguf compare EXL3_DIR GGUF_SHARD... [--only SUBSTRING] [--threads

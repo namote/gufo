@@ -252,7 +252,7 @@ private:
   std::vector<LinearState> linear_;
   std::vector<AttentionState> attention_;
   float* ple_history_{nullptr};  ///< [PleConvHistory()][hc_dim]
-  /// KVarN trunk K/V (plan/exl3/F1-KVARN-DESIGN.md): which rows are
+  /// KVarN trunk K/V (plan/exl3/archive/F1-KVARN-DESIGN.md): which rows are
   /// quantized, the current forward's plan and the FP16 sink/tail rows
   /// ([K|V][attention layer][kKvarnFp16Tokens][kv row]).
   bool kvarn_{false};
@@ -324,7 +324,7 @@ public:
     /// above it require YaRN (Config::MaxContextLength()).
     std::uint32_t max_context{0};
     /// Trunk attention K/V as KVarN k4v4 records with token-major values
-    /// (plan/exl3/F1-KVARN-DESIGN.md); the MTP layer stays FP16.
+    /// (plan/exl3/archive/F1-KVARN-DESIGN.md); the MTP layer stays FP16.
     bool kvarn{false};
     int kvarn_bits{4};
     /// Diagnostic chunk-policy hook for EXL3. Zero preserves the caller's

@@ -1,5 +1,5 @@
-// RQ R0 quality harness collector (plan/rotated-quant/W2-BRIEF.md): teacher
-// forces the token windows of an evaluation corpus through one Qwen27B
+// RQ R0 quality harness collector (plan/archive/rotated-quant/W2-BRIEF.md):
+// teacher forces the token windows of an evaluation corpus through one Qwen27B
 // execution path and stores, per scored position, the top-k token ids and
 // logits, the full-vocabulary logsumexp, the logit of the next corpus token
 // and, against a reference run, the logits at the reference's top-k ids.

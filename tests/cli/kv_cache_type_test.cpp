@@ -128,7 +128,7 @@ void TestRefusals() {
     }
   }
   {
-    // Flash-Next stores KVarN k4v4 only (plan/exl3/F1-KVARN-DESIGN.md).
+    // Flash-Next stores KVarN k4v4 only (plan/exl3/archive/F1-KVARN-DESIGN.md).
     bool accepted = true;
     std::string error;
     (void)Resolve("qwen4exp", KvCacheType::kKvarnK4V2, &accepted, &error);

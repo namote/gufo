@@ -1,4 +1,4 @@
-// X2b (plan/exl3/XB-DESIGN.md): standalone bandwidth experiment of the EXL3
+// X2b (plan/exl3/archive/XB-DESIGN.md): standalone bandwidth experiment of the EXL3
 // trellis decode GEMV core on gfx1151, before any production wiring.
 //
 // Kernel: one wave decodes 16 x 16 trellis tiles straight into registers (no
@@ -39,7 +39,7 @@
 //          lane-major input with shuffle quad reduction, 2: lane-major with
 //          DPP quad reduction; 0 = row-major is checked only), then a plain
 //          read of the same buffers as the bandwidth ceiling.
-// Build: plan/exl3/XB-RESULTS.md.
+// Build: plan/exl3/archive/XB-RESULTS.md.
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 

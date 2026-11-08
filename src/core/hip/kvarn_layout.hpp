@@ -2,14 +2,14 @@
 #define GUFO_CORE_HIP_KVARN_LAYOUT_HPP_
 
 // KVarN attention KV storage shared by the models that use it
-// (plan/gufo-upstream-port/KVARN.md, plan/exl3/F1-KVARN-DESIGN.md):
-// Hadamard-rotated keys and values of 256-wide heads, the first 128 tokens of
-// a sequence (the sink) and its unquantized tail in FP16, every other complete
-// 128-token group quantized (4-bit keys, 2- or 4-bit values). Host-only
-// arithmetic independent of the head counts: group geometry, record layout,
-// the FP16 sink and tail rows, which groups a position reads and the tail
-// bookkeeping of passes and prompt chunks. Model headers add their kernels'
-// shapes and tuned launch policies.
+// (plan/archive/gufo-upstream-port/KVARN.md,
+// plan/exl3/archive/F1-KVARN-DESIGN.md): Hadamard-rotated keys and values of
+// 256-wide heads, the first 128 tokens of a sequence (the sink) and its
+// unquantized tail in FP16, every other complete 128-token group quantized
+// (4-bit keys, 2- or 4-bit values). Host-only arithmetic independent of the
+// head counts: group geometry, record layout, the FP16 sink and tail rows,
+// which groups a position reads and the tail bookkeeping of passes and prompt
+// chunks. Model headers add their kernels' shapes and tuned launch policies.
 
 #include <algorithm>
 #include <cstddef>
@@ -45,7 +45,8 @@ inline constexpr std::uint32_t kKvarnHeadDim = 256;
 ///   kTokenMajor:   [token 128][256 x b bit], the K packing. Qwen3.8
 ///   Flash-Next:
 ///                  sparse attention gathers four-token blocks, each a
-///                  contiguous run of rows (plan/exl3/F1-KVARN-DESIGN.md 1).
+///                  contiguous run of rows
+///                  (plan/exl3/archive/F1-KVARN-DESIGN.md 1).
 enum class KvarnValueOrder : std::uint8_t { kChannelMajor, kTokenMajor };
 
 /// One (group, KV head) record: byte offsets of its parts.

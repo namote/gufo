@@ -6,7 +6,7 @@ safetensors file with an `input_ids` tensor (rows, cols) and uses its first `cal
 cropped to `cal_cols`. This tool writes rows of `--cols` tokens (default 2048 = 4 c02 chunks of
 512), `--rows` of them (default 250, the converter's default and the turboderp packs' size).
 
-Rule (plan/exl3/XQ-RESULTS.md section 2, approved by the supervisor 2026-10-30):
+Rule (plan/exl3/archive/XQ-RESULTS.md section 2, approved by the supervisor 2026-10-30):
   1. c02 chunks are put back in stream order: segment = (stream, base c01 or extension), and
      inside a segment by the stream-local index (`<stream>-N`, `<stream>-xN`). Chats that span
      chunks (`documents_span_chunks`) become contiguous again.
@@ -115,7 +115,7 @@ def build(c02: Path, rows: int, cols: int, seed: int) -> tuple[list[list[int]], 
 
     meta = {
         "schema": SCHEMA,
-        "rule": "plan/exl3/XQ-RESULTS.md section 2: stream order, %d chunks per row, proportional "
+        "rule": "plan/exl3/archive/XQ-RESULTS.md section 2: stream order, %d chunks per row, proportional "
                 "largest-remainder allocation, Random(f'{seed}:{stream}:{segment}') per segment, "
                 "Random(f'{seed}:order') final order, int64, no lengths" % per_row,
         "seed": seed,

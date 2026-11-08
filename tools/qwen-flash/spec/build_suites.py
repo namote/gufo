@@ -1,4 +1,4 @@
-"""Builds the W9 speculative-decoding prompt suites (plan/rotated-quant/SPEC-DECODE.md 4.2).
+"""Builds the W9 speculative-decoding prompt suites (plan/archive/rotated-quant/SPEC-DECODE.md 4.2).
 
 suite_k.json: the Kyojin comparison prompts, copied verbatim from Yamz-Labs/kyojin (MIT; LICENSE "Copyright (c) 2025 Turboderp", Kyojin additions
 MIT per doc/credits.md) at 2132bd248e3bfe07258a408669608f3d2cfdda79:

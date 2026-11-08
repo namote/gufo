@@ -454,7 +454,7 @@ struct LaunchShape {
   unsigned waves;
 };
 
-// From the xb2/xb3 sweeps (plan/exl3/XB-RESULTS.md): launches of 352 to 511
+// From the xb2/xb3 sweeps (plan/exl3/archive/XB-RESULTS.md): launches of 352 to 511
 // two-tile blocks (q, q + k + v) run best with four tiles per wave and four
 // waves; otherwise two tiles per wave, with more waves for narrow outputs
 // and long K.

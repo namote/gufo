@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""KVarN K0 study helpers (plan/gufo-upstream-port/KVARN.md).
+"""KVarN K0 study helpers (plan/archive/gufo-upstream-port/KVARN.md).
 
 check BIN       Compares the C++ fake quantization (BIN is the
                 qwen27b_kvarn_fake_quant executable) with this independent

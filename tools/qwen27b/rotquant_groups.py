@@ -5,7 +5,7 @@ rotates a group in every trunk layer or not at all. Signs follow the
 upstream prism.hadamard rule: one sign vector per input width K, shared by
 all groups and layers with that K. A group instance is one group in one layer.
 Groups follow the UD-Q4_K_XL header (hidden 5120); see
-plan/rotated-quant/PLAN.md, "27B 입력 그룹".
+plan/archive/rotated-quant/PLAN.md, "27B 입력 그룹".
 """
 from __future__ import annotations
 

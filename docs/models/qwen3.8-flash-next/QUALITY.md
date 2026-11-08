@@ -22,7 +22,7 @@ Native EXL3 vision: K6 Turboderp and K8 Vemloir all 29 stage outputs pass the
 preselected 1% relative RMS gate against independent ExLlamaV3 on 320x224.
 Final 0.6023%/0.6212%; not bit-exact or a broad image-quality benchmark.
 Legacy GGUF 29 stage bytes unchanged. API image+repeat and text smoke pass with
-zero GGUF mappings. [Evidence and limits](../../../plan/exl3/F3-VISION-NATIVE.md).
+zero GGUF mappings. [Evidence and limits](../../../plan/exl3/archive/F3-VISION-NATIVE.md).
 
 ## Physical GPU KV references, November 4, 2026
 
@@ -41,7 +41,7 @@ prefill. Pi1.5.0 two tasks/seven requests/six successful tools pass, including
 execution of generated Node assertions. CPU scheduler/runner/cache suites and
 geometry/format checks pass; independent review approves. Full256K and matched
 performance qualification remain outside this run. All failures/results and
-limits: [physical-reference report](../../../plan/exl3/F3-KV-REFERENCES.md).
+limits: [physical-reference report](../../../plan/exl3/archive/F3-KV-REFERENCES.md).
 
 
 ## Memory-efficiency candidate, November 3, 2026
@@ -88,7 +88,7 @@ restore and real Pi1.4.0 (3 tasks,9 tools) pass. Initial aggregate mixed EOS
 assertion failed without clause diagnostics; focused diagnostic and serving
 sampling pass unchanged. Original failure retained, not proven noise.
 Full two-times-256K inference is untested.
-[Evidence and limitations](../../../plan/exl3/F3-SHARED-KV.md).
+[Evidence and limitations](../../../plan/exl3/archive/F3-SHARED-KV.md).
 
 ## Exact live-row verification, November 2, 2026
 
@@ -101,7 +101,7 @@ AR/MTP output hash and draft/acceptance/lookup count matches saved evidence.
 Negative-exponent FP32 down handling and all numerical tolerances are unchanged.
 Loaded CLR/ROCr are pinned Nix10.1; healthPASS. No new teacher/model precision
 claim: native-pack quality evidence transfers through identical collector bytes.
-[Full results and rejected candidates](../../../plan/exl3/F3-TGMTP-ROWS.md).
+[Full results and rejected candidates](../../../plan/exl3/archive/F3-TGMTP-ROWS.md).
 
 ## Same-pack local Kyojin follow-up, November 2, 2026
 
@@ -113,7 +113,7 @@ kernel change or default model switch. Current native5.05 profile attributes
 ARdense35.44% and MTPexperts27.43%/dense22.21%; retain as diagnostic evidence,
 not unprofiled speed. Both completed windows healthPASS; prior invalid default
 penalty attempt is preserved. Existing numerical qualification is not repeated.
-[Exact scope, receipts and next batch](../../../plan/exl3/F3-KYOJIN-SAME-PACK.md).
+[Exact scope, receipts and next batch](../../../plan/exl3/archive/F3-KYOJIN-SAME-PACK.md).
 
 
 ## Native EXL3 n-gram, November 2, 2026
@@ -129,7 +129,7 @@ This material workload-specific loss is retained; do not describe universal
 performance parity. Native full-vocabulary NLL improves2.175202→2.167751,
 paired window95%CI forΔNLL[−.017370,−.001770]. Top-1 change−.0794pp is unresolved.
 
-[Complete scope, caveats and evidence](../../../plan/exl3/F3-NATIVE-PACK.md).
+[Complete scope, caveats and evidence](../../../plan/exl3/archive/F3-NATIVE-PACK.md).
 
 
 ## K/D serving follow-up, November 2, 2026
@@ -140,7 +140,7 @@ there is no historical complete D control. This serving run is not a quality
 oracle or a Kyojin quality comparison. Reuse the existing TG/MTP numerical
 qualification below; its prefill NLL caveat is unchanged. Raw responses and
 client/server timings are preserved in the
-[comparison](../../../plan/exl3/F3-TGMTP-KYOJIN-COMPARISON.json).
+[comparison](../../../plan/exl3/archive/F3-TGMTP-KYOJIN-COMPARISON.json).
 
 
 ## TG/MTP routed and HC optimization, November 2, 2026
@@ -168,9 +168,9 @@ codeobjects are byte-identical to frozenbatch6. No new full prefill collector or
 BF16 parity claim is made; prior hc7-relative NLL drift remains recorded below.
 
 
-[Qualification and identities](../../../plan/exl3/F3-TGMTP-QUALIFICATION.json),
-[operator screens](../../../plan/exl3/F3-TGMTP-SCREENS.json),
-[flow review](../../../plan/exl3/F3-TGMTP-FLOW.json).
+[Qualification and identities](../../../plan/exl3/archive/F3-TGMTP-QUALIFICATION.json),
+[operator screens](../../../plan/exl3/archive/F3-TGMTP-SCREENS.json),
+[flow review](../../../plan/exl3/archive/F3-TGMTP-FLOW.json).
 
 ## HC/MoE combined qualification, November 2, 2026
 
@@ -193,7 +193,7 @@ checks pass. Performance uses k4v4/temp0/seed314159/r2. The initial pp2048
 context8193→4096 and is diagnostic only; the final d0 replay restored the
 original512,2048,8192 list and8193 capacity. All attempts are retained; no
 baseline, correctness or d32K rerun. Target2000 is still unmet.
-[Qualification, runtime/code identities and all attempts](../../../plan/exl3/F3-PREFILL-BATCH6-QUALIFICATION.json).
+[Qualification, runtime/code identities and all attempts](../../../plan/exl3/archive/F3-PREFILL-BATCH6-QUALIFICATION.json).
 
 ## Shared-MoE/KVarN and grouped follow-up, November 2, 2026
 
@@ -203,17 +203,17 @@ one tail. Flash-Next/Qwen KVarN CPU-oracle tests passed. The32760-record,
 64-head-replay FP16-KV collector is supporting evidence reused from the
 combined image, whose retained MoE source is equal and Q path is restored;
 it is not a fresh collector on shared5. Prior hc7 NLL drift+.006600 remains.
-[Qualification](../../../plan/exl3/F3-STREAM-QUALIFICATION.json).
+[Qualification](../../../plan/exl3/archive/F3-STREAM-QUALIFICATION.json).
 
 The subsequent grouped gate/up prototype passed saved finite/exact shared,
 combined and raw-down outputs plus guards at512/2048 synthetic rows. Gate/up
 intermediates have guards only. No new independent oracle or full-model,
 state/capture or other-rate claim. It was not promoted; existing production
-qualification remains unchanged. [Screen provenance and limits](../../../plan/exl3/F3-GROUPED-MOE-SCREEN.json).
+qualification remains unchanged. [Screen provenance and limits](../../../plan/exl3/archive/F3-GROUPED-MOE-SCREEN.json).
 The later current-binary profile changes no model code or arithmetic. It
 validates native timestamp/correlation coverage, not numerical model quality;
 the qualified evidence above remains the quality basis.
-[Profile scope](../../../plan/exl3/F3-CURRENT-PREFILL-PROFILE.json).
+[Profile scope](../../../plan/exl3/archive/F3-CURRENT-PREFILL-PROFILE.json).
 
 ## Narrow dense/output-slice batch qualification, November 1, 2026
 
@@ -223,7 +223,7 @@ payload SHA789c46a2…; prior hc7-relative NLL drift+.006600 remains unchanged.
 Runtime maps confirm patched Nix ROCr10.1/CLR10.1. A wrapper execute-permission
 packaging error stopped benchmarks after quality passed; only the unexecuted
 benchmarks resumed after mode repair, with identical ELF bytes. No completed
-quality or baseline inference repeated. [Exact receipts and artifact identities](../../../plan/exl3/F3-PREFILL-BATCH2-QUALIFICATION.json).
+quality or baseline inference repeated. [Exact receipts and artifact identities](../../../plan/exl3/archive/F3-PREFILL-BATCH2-QUALIFICATION.json).
 
 ## Matrix follow-up operator checks, November 1, 2026
 
@@ -232,7 +232,7 @@ comparisons for K5 stage/geometry and descriptor-partition prototypes.
 Allocation guards were checked only by the unequal65/129-row grouped dense
 tail case. These checks do not establish full-model or other-rate quality.
 Production is unchanged, so the existing qualified collection is reused.
-[Evidence and limitations](../../../plan/exl3/F3-NEXT-MATRIX-SCREEN.md).
+[Evidence and limitations](../../../plan/exl3/archive/F3-NEXT-MATRIX-SCREEN.md).
 
 ## EXL3 prefill batch, November 1, 2026
 
@@ -244,7 +244,7 @@ pass. Tolerances were not relaxed. The final combined window has health_PASS.
 The earlier hc7-relative NLL drift (+0.006600, about0.66% perplexity) remains;
 matching records establish no added drift in this collection, not universal parity.
 Previously completed TG/MTP evidence is retained; this batch does not requalify it.
-[Receipt and build identities](../../../plan/exl3/F3-RESUME-RESULTS.md#qualified-prefill-batch-2026-11-01).
+[Receipt and build identities](../../../plan/exl3/archive/F3-RESUME-RESULTS.md#qualified-prefill-batch-2026-11-01).
 
 ## Sampled draft-head costs, October 23, 2026
 
@@ -1371,7 +1371,7 @@ checks at2048 rows for K7 6144→2560,2560→6144,640→2560. The only changed
 production branch is the first shape, singleton2048. The previously successful
 batch512 collector cannot execute it and is reused; it was not repeated or
 misrepresented as a fresh batch3 collector. All seven K7 shape/group screens
-also passed exact outputs. [Evidence](../../../plan/exl3/F3-PREFILL-GRID.md).
+also passed exact outputs. [Evidence](../../../plan/exl3/archive/F3-PREFILL-GRID.md).
 
 ## HC load grouping candidate, November 2, 2026
 
@@ -1383,7 +1383,7 @@ preserves the two restore products explicitly. Earlier unpinned reassociation
 failed exactness and was fixed before timing. Prototype standalone24-case
 parity additionally covers widths128/2560, used1/10/16, stride0/3 and tail1.
 This was operator evidence; subsequent full model/chunk qualification is
-recorded at the top of this document. [Exact scope and receipts](../../../plan/exl3/F3-HC-LOAD-SCREENS.json).
+recorded at the top of this document. [Exact scope and receipts](../../../plan/exl3/archive/F3-HC-LOAD-SCREENS.json).
 
 
 ## EXL3 conversion capture exactness, November 5, 2026
@@ -1401,7 +1401,7 @@ Real-runtime CPU scope15 checks include decorated direct/foreign callers. An
 exact foreach candidate was measured but is not deployed. This establishes the
 capture transformation, not final packed-model KLD or inference qualification;
 the final combined quality/performance run remains pending after conversion.
-[Evidence](../../../plan/exl3/F3-CONVERSION-WATCH.md).
+[Evidence](../../../plan/exl3/archive/F3-CONVERSION-WATCH.md).
 
 
 ## Calibrated c03 EXL3 final pack, November 7, 2026
@@ -1423,4 +1423,4 @@ Historical UD-Q4 has KL0.039227 and top1 agreement90.8608%, but its different
 ROCm7.2.4/GCC13 runtime prevents attributing the difference solely to quantization.
 Current Gufo6edf0d44/collectorbc989832 share sourcea81c0f93 and NixROCm10.1.
 The older image-contained Gufo lacks K8; its failed load is retained separately.
-[Final evidence and limits](../../../plan/exl3/F3-MTP-CALIBRATION.md).
+[Final evidence and limits](../../../plan/exl3/archive/F3-MTP-CALIBRATION.md).

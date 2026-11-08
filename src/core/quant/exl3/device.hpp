@@ -1,8 +1,8 @@
 #ifndef GUFO_CORE_QUANT_EXL3_DEVICE_HPP_
 #define GUFO_CORE_QUANT_EXL3_DEVICE_HPP_
 
-// One EXL3 projection as the GPU kernels see it (plan/exl3/XA-RESULTS.md
-// "X2a 설계 메모" section 2, agreed with X2b):
+// One EXL3 projection as the GPU kernels see it
+// (plan/exl3/archive/XA-RESULTS.md "X2a 설계 메모" section 2, agreed with X2b):
 //
 //   y = svh * H_n((H_k(suh * x)) W')     (docs/EXL3-FORMAT.md "Rotations")
 //
@@ -12,7 +12,7 @@
 // reference path and rounded to FP16 in the X2b kernels (as upstream does);
 // the reference therefore differs from the fast path by FP16 activation
 // rounding (relative ~1e-3), which kernel tests allow for
-// (plan/exl3/XB-DESIGN.md section 8).
+// (plan/exl3/archive/XB-DESIGN.md section 8).
 
 #include <cstdint>
 
@@ -22,7 +22,7 @@ namespace gufo::quant::exl3 {
 
 /// Trellis memory layout. Only the checkpoint layout exists; the value is
 /// reserved so a kernel-friendly re-layout can be added without changing the
-/// interface (plan/exl3/XB-DESIGN.md section 8).
+/// interface (plan/exl3/archive/XB-DESIGN.md section 8).
 enum class TrellisLayout : std::uint8_t {
   kCheckpoint,  ///< [k / 16][n / 16][TileWords] uint16, as stored
 };

@@ -11,7 +11,7 @@ reference llama-quantize on the rotated file and reads the output back
 An already rotated input skips stage 1, so one rotated BF16 file serves
 many recipes. NextN (MTP) blocks are never rotated.
 
-Examples (see plan/rotated-quant/R1A-RESULTS.md):
+Examples (see plan/archive/rotated-quant/R1A-RESULTS.md):
   convert.py --groups qwen27b --input BF16-00001-of-00002.gguf --rotate-groups all \\
       --seed 1 --rotate-only --output rot-bf16.gguf
   convert.py --groups qwen27b --input rot-bf16.gguf --rotate-groups all \\

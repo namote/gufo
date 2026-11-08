@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect RQ quality records from an ExLlamaV3 model (W8, plan/rotated-quant/W8-BRIEF.md).
+"""Collect RQ quality records from an ExLlamaV3 model (W8, plan/archive/rotated-quant/W8-BRIEF.md).
 
 Feeds the corpus a01 token ids (windows.json / windows.bin, no re-tokenization) through ExLlamaV3
 and writes logits_io runs that metrics.py scores against the gufo BF16 reference:

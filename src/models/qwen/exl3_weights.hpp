@@ -15,7 +15,7 @@
 //   -exp(A_log), in FP32 (the BF16 GGUF holds them as F32);
 // - mtp.* becomes block num_hidden_layers (nextn).
 //
-// This is the X1 correctness path (plan/exl3/XA-BRIEF.md): the produced
+// This is the X1 correctness path (plan/exl3/archive/XA-BRIEF.md): the produced
 // tensors feed the existing BF16 GGUF code paths unchanged.
 
 #include <cstddef>

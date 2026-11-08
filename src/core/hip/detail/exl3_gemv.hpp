@@ -1,9 +1,10 @@
 #ifndef GUFO_CORE_HIP_DETAIL_EXL3_GEMV_HPP_
 #define GUFO_CORE_HIP_DETAIL_EXL3_GEMV_HPP_
 
-// Device helpers of the EXL3 trellis decode GEMV (plan/exl3/XB-DESIGN.md
-// section 3.1, measured in plan/exl3/XB-RESULTS.md windows xb1 and xb2).
-// Header-only, model independent.
+// Device helpers of the EXL3 trellis decode GEMV
+// (plan/exl3/archive/XB-DESIGN.md section 3.1, measured in
+// plan/exl3/archive/XB-RESULTS.md windows xb1 and xb2). Header-only, model
+// independent.
 //
 // Tile decode. Lane L of a wave decodes the positions 8L .. 8L + 7 of a 16 x
 // 16 tile. The tensor-core permutation of the format (docs/EXL3-FORMAT.md

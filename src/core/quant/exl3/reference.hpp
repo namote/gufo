@@ -1,9 +1,9 @@
 #ifndef GUFO_CORE_QUANT_EXL3_REFERENCE_HPP_
 #define GUFO_CORE_QUANT_EXL3_REFERENCE_HPP_
 
-// X2a reference GPU path for EXL3 projections (plan/exl3/XA-RESULTS.md "X2a
-// 설계 메모" section 4): simple kernels, correctness only. For a projection
-// y = x W (docs/EXL3-FORMAT.md):
+// X2a reference GPU path for EXL3 projections (plan/exl3/archive/XA-RESULTS.md
+// "X2a 설계 메모" section 4): simple kernels, correctness only. For a
+// projection y = x W (docs/EXL3-FORMAT.md):
 //
 //   x' = H_k(suh * x)              FP32 per row
 //   W' chunk -> FP32 [n_chunk][k]  bit-exact decode of the trellis (X0)

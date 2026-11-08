@@ -2,9 +2,9 @@
 #define GUFO_CORE_QUANT_EXL3_GEMV_HPP_
 
 // X2b fast path of an EXL3 projection for decode and verify rows
-// (plan/exl3/XB-DESIGN.md): the input rows are scaled by suh, rotated per 128
-// elements and rounded to FP16 into a lane-major slab, then a trellis decode
-// GEMV multiplies them (FP32 accumulation) and its epilogue rotates each
+// (plan/exl3/archive/XB-DESIGN.md): the input rows are scaled by suh, rotated
+// per 128 elements and rounded to FP16 into a lane-major slab, then a trellis
+// decode GEMV multiplies them (FP32 accumulation) and its epilogue rotates each
 // completed 128-column segment of y in place and scales it by svh.
 
 #include <cstddef>

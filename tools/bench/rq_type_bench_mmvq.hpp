@@ -13,7 +13,7 @@
 // This header adds the launch wrapper and an independent scalar dequantizer
 // for the correctness check, written from ggml-quants.c dequantize_row_* of
 // the same commit. Compile the implementation as its own unit with the
-// vendored kernels' flags (see plan/rotated-quant/R0B-RESULTS.md):
+// vendored kernels' flags (see plan/archive/rotated-quant/R0B-RESULTS.md):
 //   hipcc -x hip -DRQ_MMVQ_IMPLEMENTATION -std=c++17 -DGGML_USE_HIP ...
 #ifndef GUFO_TOOLS_BENCH_RQ_TYPE_BENCH_MMVQ_HPP_
 #define GUFO_TOOLS_BENCH_RQ_TYPE_BENCH_MMVQ_HPP_

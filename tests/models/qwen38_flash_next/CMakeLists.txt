@@ -77,7 +77,7 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen38_flash_next_hc_prefill_bench PRIVATE
     gufo_qwen38_flash_next)
 
-  # EXL3 prefill GEMM ceiling screen (tools/bench, plan/exl3/B7-CEILING-BRIEF.md):
+  # EXL3 prefill GEMM ceiling screen (tools/bench, plan/exl3/archive/B7-CEILING-BRIEF.md):
   # production launchers against no-decode/WMMA-only/decode-only/warp-
   # specialized variants. No extra options: the kernel copies keep the
   # production prefill_fp16.hip flags, so their outputs compare bit for bit.
@@ -172,7 +172,7 @@ if (ENGINE_ENABLE_HIP)
     continuation_probe.cpp)
   target_link_libraries(qwen38_flash_next_continuation_probe PRIVATE
     gufo_qwen38_flash_next)
-  # KVarN K0 accuracy study (plan/exl3/F1-DESIGN.md 3.2); needs the model.
+  # KVarN K0 accuracy study (plan/exl3/archive/F1-DESIGN.md 3.2); needs the model.
   add_executable(qwen38_flash_next_kvarn_k0 EXCLUDE_FROM_ALL kvarn_k0.cpp)
   target_link_libraries(qwen38_flash_next_kvarn_k0 PRIVATE
     gufo_qwen38_flash_next_reference)

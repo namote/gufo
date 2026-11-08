@@ -1,6 +1,6 @@
 // KVarN decode and verification through the Qwen3.8-27B executor (K1c-1,
-// plan/gufo-upstream-port/K1-BRIEF.md): a prompt fed token by token (the
-// first rows through the captured decode graph, then split-K with group
+// plan/archive/gufo-upstream-port/K1-BRIEF.md): a prompt fed token by token
+// (the first rows through the captured decode graph, then split-K with group
 // flushes) against the FP16 executor under teacher forcing, DFlash2-style
 // verification rows against scalar decoding of the same tokens, in-memory
 // snapshots, prompt prefill, and the compact snapshot refusal that stays

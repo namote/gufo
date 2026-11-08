@@ -1,4 +1,4 @@
-// X3 step 1 (plan/exl3/X3-DESIGN.md): standalone prefill GEMM experiment on
+// X3 step 1 (plan/exl3/archive/X3-DESIGN.md): standalone prefill GEMM experiment on
 // gfx1151. The trellis-decode weight producer in the frame of the production
 // FP16 prefill GEMM (src/models/qwen/hip/kernels/prefill_fp16.hip,
 // HalfPrefillGemmKernel<256, 256, 8, 4>: BM = 256 weight rows (output
@@ -40,7 +40,7 @@
 //          + residual) per method. Producer and GEMM run inside one event pair;
 //          weights are rotated over copies beyond the MALL in whole cycles, and
 //          the bytes traversed are reported.
-// Build: plan/exl3/X3-RESULTS.md.
+// Build: plan/exl3/archive/X3-RESULTS.md.
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 

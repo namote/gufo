@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""W8 ExLlamaV3 speed measurements on gfx1151 (plan/rotated-quant/W8-BRIEF.md "속도 측정").
+"""W8 ExLlamaV3 speed measurements on gfx1151 (plan/archive/rotated-quant/W8-BRIEF.md "속도 측정").
 
 Modes (one model load per call):
 

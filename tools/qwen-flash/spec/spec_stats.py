@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""W9 speculative-decoding statistics (plan/rotated-quant/SPEC-DECODE.md 4.1).
+"""W9 speculative-decoding statistics (plan/archive/rotated-quant/SPEC-DECODE.md 4.1).
 
 Inputs are the artifacts of the ai.tools rq_serving driver: a serving benchmark report (bench-<i>.json,
 tools/gufo/serving_bench.py --suite, C=1) and, when the plan entry sets record_responses, the proxy record

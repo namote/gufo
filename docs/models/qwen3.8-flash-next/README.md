@@ -34,8 +34,8 @@ directory. A different pack cannot silently supply MTP. A native pack with a
 supported `vision_config` automatically supplies its embedded `model.visual.*`
 weights. An explicit `--mmproj` overrides that selection; malformed embedded
 vision fails instead of silently selecting a different encoder.
-See [native text qualification](../../../plan/exl3/F3-NATIVE-PACK.md) and
-[native vision qualification](../../../plan/exl3/F3-VISION-NATIVE.md).
+See [native text qualification](../../../plan/exl3/archive/F3-NATIVE-PACK.md) and
+[native vision qualification](../../../plan/exl3/archive/F3-VISION-NATIVE.md).
 
 ## GGUF load and run
 

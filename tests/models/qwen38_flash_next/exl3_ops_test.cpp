@@ -1657,9 +1657,10 @@ void PlainPrefillHalf() {
             dot += double(weights[j * k + i]) * rounded[r * k + i];
           oracle[j] = float(dot);
         }
-        // WMMA accumulation error grows with k (plan/exl3/X3-RESULTS.md:
-        // ~3.1e-9 k relative L2; the non-cancelling residue above), so the
-        // bar is the X3 contract's (k/16) 2^-23, at least 1e-5.
+        // WMMA accumulation error grows with k
+        // (plan/exl3/archive/X3-RESULTS.md: ~3.1e-9 k relative L2; the
+        // non-cancelling residue above), so the bar is the X3 contract's (k/16)
+        // 2^-23, at least 1e-5.
         Near(std::span(bulk).subspan(r * n, n), oracle,
              std::max(1e-5, double(k) / 16.0 * std::ldexp(1.0, -23)),
              "plain WMMA vs FP64 of rounded FP16 operands");

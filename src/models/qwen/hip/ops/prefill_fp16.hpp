@@ -13,12 +13,13 @@ namespace gufo::hip {
 // scratch allocations after their BF16 contents are no longer live.
 void LaunchFloatToFp16(const float* input, void* output, std::size_t elements,
                        hipStream_t stream);
-// EXL3 trellis-decode WMMA GEMM (plan/exl3/X3-DESIGN.md; model-independent
-// API: plan/exl3/F3-PLAN.md "F3-API"). x is the FP16 rotated input [rows][k]
-// (H(suh * x) per 128 elements, row-major, LaunchExl3RotateRows); y [rows][n]
-// FP32 receives svh * H(x W') (residual: added to y). The FP16 WMMA
-// accumulation bound is (k / 16) * 2^-23 relative L2 (X3-RESULTS.md).
-// Supported: mul1, integer K 1..8, n and k positive multiples of 128.
+// EXL3 trellis-decode WMMA GEMM (plan/exl3/archive/X3-DESIGN.md;
+// model-independent API: plan/exl3/archive/F3-PLAN.md "F3-API"). x is the FP16
+// rotated input [rows][k] (H(suh * x) per 128 elements, row-major,
+// LaunchExl3RotateRows); y [rows][n] FP32 receives svh * H(x W') (residual:
+// added to y). The FP16 WMMA accumulation bound is (k / 16) * 2^-23 relative L2
+// (X3-RESULTS.md). Supported: mul1, integer K 1..8, n and k positive multiples
+// of 128.
 [[nodiscard]] bool Exl3GemmShapeSupported(
     std::uint32_t k, std::uint32_t n, quant::exl3::BitRate rate,
     quant::exl3::Codebook codebook) noexcept;

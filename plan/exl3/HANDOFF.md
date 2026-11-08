@@ -1,6 +1,21 @@
 # EXL3 / Flash-Next F3 handoff (2026-11-02; native EXL3 qualified)
 
-## Active default: c03 Gufo, 2026-11-07
+## Active default: c03 Gufo B5 runtime, 2026-11-08
+
+The service runs the B5 binary (sha256 `31cee0b6…`, 126,048,792 B, source
+`eb789c77`, build `build/b1` RelWithDebInfo gfx1151, pinned Nix ROCm 10.1)
+from `~/.local/share/gufo/runtime-b5-20261108/` (`RUNTIME.json`: image,
+Nix volume, `LD_LIBRARY_PATH`, evidence `build/b1/gpu-b5/RESULT.json`).
+Model, C2/native262144 FP16 pool, MTP and sampling settings are unchanged
+from the c03 section below. B6 and B7 were measured but not deployed; the
+B8 cleanup changes no production code. Measured results and lessons:
+[docs/GFX1151-KNOWHOW.md](../../docs/GFX1151-KNOWHOW.md); batch index:
+[B-SERIES-SUMMARY.md](B-SERIES-SUMMARY.md). Previous runtime (c03 initial,
+`6edf0d44`) and the pre-B5 server script
+(`~/.local/share/gufo/gufo-server.py.bak-20261108-pre-b5`) are kept for
+rollback.
+
+## Previous default: c03 Gufo, 2026-11-07
 
 User authorized temperature0.9 and starting our model. `llm` now delegates to
 `/usr/local/bin/gufo`; persistent controller uses the qualified current Nix10.1
@@ -24,7 +39,7 @@ Gufo direct embedded EXL3 vision is implemented and tested on Turboderp K6
 and Vemloir K8. The permanent Gufo controller selects native-exl3-vision-rocm101
 and no longer mounts/requires the BF16 GGUF projector. Original weights retained.
 Kyojin remains the default; restored run `873264740ec0` is healthy.
-[Results, image identity, numerical limits and artifacts](F3-VISION-NATIVE.md).
+[Results, image identity, numerical limits and artifacts](archive/F3-VISION-NATIVE.md).
 
 ## Current default and Flash-Next KV references (2026-11-04)
 
@@ -59,7 +74,7 @@ CPU/review, C4 pressure, branch/image replay, Pi and disk restart all pass.
 A duplicate-prefix reclaim bug found during validation is fixed; failed runs
 are retained. No full256K or matched speedup claim. Keep baseline and candidate
 binaries/Nix10.1 intermediate objects in build/fn-kv-sharing/.
-[Implementation, qualification and limits](F3-KV-REFERENCES.md).
+[Implementation, qualification and limits](archive/F3-KV-REFERENCES.md).
 
 
 ## Archived local profile: K6V6 / native256K (2026-11-03)
@@ -113,7 +128,7 @@ PP/AR/MTP differ by at most0.264% from saved baseline; no baseline rerun.
 Full two-times-256K inference remains untested. Disk cache stores continuations,
 not active-page swap. The supervisor expires each window after one hour;
 `./server status` / `./server start` / `./pi`. Preserve all incremental objects.
-[Implementation, limits, failed attempts and complete results](F3-SHARED-KV.md).
+[Implementation, limits, failed attempts and complete results](archive/F3-SHARED-KV.md).
 
 ## Latest: prefill live-subtile port rejected at compiler screen
 
@@ -123,7 +138,7 @@ private spills. No GPU/model/baseline rerun. Keep the qualified image and
 all existing prefill/TG/MTP improvements below. Preserve incremental objects
 in build/f3-prefill-live-tiles and ai.tools prefill_live_tiles_artifacts.
 Do not repeat these clones without a distinct code-generation mechanism.
-[Resources, limits and reproduction](F3-PREFILL-LIVE-TILES.md).
+[Resources, limits and reproduction](archive/F3-PREFILL-LIVE-TILES.md).
 
 ## Retained kernels: exact live-row verification
 
@@ -141,7 +156,7 @@ saved screens remain; no baseline rerun. Cold component gains21–32% gate/up,
 Dense TN2 load grouping already exists; global-address-space/aligned-K probes
 were neutral. Do not repeat them. Saved b4ebe27c profile is pre-change evidence,
 still useful for unchanged dense K7; it is not a post-change latency profile.
-[Mechanism, final results and reusable evidence](F3-TGMTP-ROWS.md).
+[Mechanism, final results and reusable evidence](archive/F3-TGMTP-ROWS.md).
 
 ## Previous: same-pack TG/MTP attribution
 
@@ -160,7 +175,7 @@ operator candidates target denseK7 and routedK5R3/4, with small checks batched.
 Possible graph first-use/capture is not separated from expected eager work;
 do not call all gaps CPU waste. No full quality/PP sweep or rebuild repeated. Both completed windows
 healthPASS; first invalid penalty-default comparison was stopped and preserved.
-[Results, exact limits and next batch](F3-KYOJIN-SAME-PACK.md).
+[Results, exact limits and next batch](archive/F3-KYOJIN-SAME-PACK.md).
 
 ## Local Kyojin measured; equality failed
 
@@ -176,7 +191,7 @@ MTP=42.52/49.44/63.22tok/s. **AR/MTP token and text equality failed 3/3**;
 no production acceptance or matched engine/quality parity is established.
 Gufo native selection below remains unchanged. The frozen Kyojin source uses
 its pinned ROCm10.1 nightly wheels, distinct from the Gufo Nix10.1 release.
-[Exact scope, provenance and results](F3-KYOJIN-LOCAL.md).
+[Exact scope, provenance and results](archive/F3-KYOJIN-LOCAL.md).
 
 ## CPU PLE diagnostic
 
@@ -186,7 +201,7 @@ fixture. Outputs and MTP counts match the saved native run; healthPASS.
 The old first-Embed GPU trace omitted CPU setup. This diagnostic addresses host
 waits only, not worker/shared-bandwidth or GPU mapped-memory costs; cold/prose
 behavior remains unresolved. No baseline/full quality rerun.
-[Evidence and exact limitations](F3-PLE-HOST-PROFILE.md).
+[Evidence and exact limitations](archive/F3-PLE-HOST-PROFILE.md).
 
 
 ## Current native EXL3 selection, November 2, 2026
@@ -207,8 +222,8 @@ change output, acceptance77.88%→64.91% and cycles40→54. Preserve this caveat
 there is no claim of universal speed parity. PP/AR/same-output d32K MTP stay
 within1%. Saved-corpus NLL improves by.007451 with negative paired windowCI.
 
-[Native implementation, exact scope and results](F3-NATIVE-PACK.md) ·
-[Machine-readable receipt](F3-NATIVE-PACK.json). Previous selected images and
+[Native implementation, exact scope and results](archive/F3-NATIVE-PACK.md) ·
+[Machine-readable receipt](archive/F3-NATIVE-PACK.json). Previous selected images and
 all baseline/model artifacts remain available. Keep native input for the next
 MTP investigation; do not silently mix in old IQ4_NL PLE.
 
@@ -261,7 +276,7 @@ acceptance/lookup counts, runtime maps, frozen inputs and published-page SHA
 are retained in the comparison report. Existing numerical qualification and
 its NLL caveat remain unchanged. No Kyojin quality parity is claimed.
 
-[Comparison](F3-TGMTP-KYOJIN-COMPARISON.json).
+[Comparison](archive/F3-TGMTP-KYOJIN-COMPARISON.json).
 
 ## TG/MTP routed and HC optimization, November 2, 2026
 
@@ -300,8 +315,8 @@ operator modules and Nix intermediates are preserved under
 The qualification receipt is `fn-tgmtp2-qualification-nix101` under ai.tools
 `tmp/test-results/gufo-upstream-port-20261023/`.
 
-[Qualification](F3-TGMTP-QUALIFICATION.json), [screens](F3-TGMTP-SCREENS.json),
-[current TG/MTP profile](F3-TGMTP-PROFILE.json), [full flow review](F3-TGMTP-FLOW.json).
+[Qualification](archive/F3-TGMTP-QUALIFICATION.json), [screens](archive/F3-TGMTP-SCREENS.json),
+[current TG/MTP profile](archive/F3-TGMTP-PROFILE.json), [full flow review](archive/F3-TGMTP-FLOW.json).
 The initial profile belongs to frozenbatch6, not the optimized candidate.
 Prefill is frozen at1435.59tok/s/pp2048; its2000target remains unmet. The user
 has moved priority toTG/MTP. Do not restart prefill experiments automatically.
@@ -337,27 +352,27 @@ checks pass. Performance uses k4v4/temp0/seed314159/r2. The initial pp2048
 context8193→4096 and is diagnostic only; the final d0 replay restored the
 original512,2048,8192 list and8193 capacity. All attempts are retained; no
 baseline, correctness or d32K rerun. Target2000 is still unmet.
-[Qualification, runtime/code identities and all attempts](F3-PREFILL-BATCH6-QUALIFICATION.json).
+[Qualification, runtime/code identities and all attempts](archive/F3-PREFILL-BATCH6-QUALIFICATION.json).
 
 Retained this batch: HC grouped raw/SVH/shared reads preserve the original
 restore rounding; K5 Mode3 skips wholly dead16-row B preparation and the
 invariant K-tail check. Both are defaults, with no switches/workspace.
-[HC screens](F3-HC-LOAD-SCREENS.json), [MoE screens](F3-MOE-STAGING-SCREENS.json).
-The saved [MoE patch](F3-MOE-STAGING-CANDIDATE.patch) is now applied; do not
+[HC screens](archive/F3-HC-LOAD-SCREENS.json), [MoE screens](archive/F3-MOE-STAGING-SCREENS.json).
+The saved [MoE patch](archive/F3-MOE-STAGING-CANDIDATE.patch) is now applied; do not
 apply it twice. Completed TG/MTP code is retained; this batch does not requalify those modes.
 
 Dense K7 K-tail screening is exact but not selected: QKV+5.98% and mixed
 smaller results against historical controls. Other inspected address/LDS
-scheduling already exists. [ISA and all results](F3-DENSE-KTAIL-SCREEN.json).
+scheduling already exists. [ISA and all results](archive/F3-DENSE-KTAIL-SCREEN.json).
 No repeat tile/cache/buffering/gate-load sweep is justified without a new
 mechanism. A larger algorithm/schedule remains research, not a ready win.
 
 The saved pre-batch6 shared5 profile remains the bottleneck map: MoE32.31%,
 HC-family22.74% including routed combine, dense20.62%,99.676% kernel-active
-(not ALU utilization). [Raw profile](F3-CURRENT-PREFILL-PROFILE.json). It is
+(not ALU utilization). [Raw profile](archive/F3-CURRENT-PREFILL-PROFILE.json). It is
 not a new profile of batch6. No current-batch full profile was repeated.
 Earlier shared-MoE overlap/KVarN register selection stays retained; Q/KV overlap
-and the previous rejected schedules remain rejected. [Stream qualification](F3-STREAM-QUALIFICATION.json).
+and the previous rejected schedules remain rejected. [Stream qualification](archive/F3-STREAM-QUALIFICATION.json).
 
 The batch6 build keeps all original Nix CMake objects/archives and links three
 production replacements.74 GPU codeobjects are identical to shared5; exactly
@@ -376,7 +391,7 @@ unmet; no claim of exhausting all possible algorithms is made.
 
 Retained production changes: small-row K5 narrow tile, aligned singleton parent
 output slices, and token-first traversal for singleton K7 6144→2560/R2048.
-[Final qualification](F3-PREFILL-GRID.md) records all performance and correctness
+[Final qualification](archive/F3-PREFILL-GRID.md) records all performance and correctness
 scopes. Batch512 collector32760 records/64 replays stayed exact; the final2048
 path separately passed saved-output/guard checks through the actual release
 object. Prior hc7 NLL drift+.006600 remains. All completed TG/MTP code is kept.
@@ -385,11 +400,11 @@ Image: `ai-tools/gufo-eval:f3-prefill3-67a50024-rocm101`, ID `31fd777e…`.
 As-built source: `0b5d58a3-prefill3-67a50024`; patch SHA67a50024….
 Integration commits are source-identity attestations, not newly built image
 revisions. The source patch and installed hashes are in
-[F3-PREFILL-GRID-QUALIFICATION.json](F3-PREFILL-GRID-QUALIFICATION.json).
+[F3-PREFILL-GRID-QUALIFICATION.json](archive/F3-PREFILL-GRID-QUALIFICATION.json).
 
 Qualified code commit: `b13b712a`. It was fast-forwarded locally into
 `ai-tools/port-u4f` (the main gufo folder) and `ai-tools/integ`.
-[Integration proof](F3-INTEGRATION-BATCH3.json) confirms identical compiled
+[Integration proof](archive/F3-INTEGRATION-BATCH3.json) confirms identical compiled
 inputs and the tested source patch across all three worktrees. The main
 folder's pre-existing untracked `.dockerignore` was preserved. This final
 documentation-only integration record needs no rebuild or repeated model test.
@@ -407,7 +422,7 @@ this chat coordinates machine use. Long verification remains batched.
 
 ### Matrix follow-up screen
 
-Latest work: [matrix follow-up screen](F3-NEXT-MATRIX-SCREEN.md) completed two
+Latest work: [matrix follow-up screen](archive/F3-NEXT-MATRIX-SCREEN.md) completed two
 short healthy operator windows. K32/workgroup and masked-wide variants were
 mostly slower; tighter MoE launch bounds/descriptor partition had no aggregate
 benefit. One narrow K5 indexer candidate is preserved for a later larger batch.
@@ -421,7 +436,7 @@ Qualified production status: the F3 batch is committed and locally integrated.
 Code checkpoint: `2c159a12` on `ai-tools/f3-integ`.
 Port integration merge: `9fcaffea`;
 integ merge: `ffc0738a`. See
-[F3-INTEGRATION.json](F3-INTEGRATION.json) for the compiled-input identity proof.
+[F3-INTEGRATION.json](archive/F3-INTEGRATION.json) for the compiled-input identity proof.
 All tracked production/test/toolchain inputs match the qualified checkpoint;
 only documentation/guidance differ. No new build, GPU window or baseline
 inference was needed for integration. No remote push was performed.
@@ -455,7 +470,7 @@ reuse is implemented and independently reviewed in the uncommitted f3-integ
 worktree. FP16-KV/KVarN collector bytes match hc7; focused Nix ROCm 10.1 unit
 passes. Candidate images are `ai-tools/gufo-eval:f3-indexer-b03a1f1e-rocm101`
 and `-tests-rocm101`. Full evidence and runtime caveats are in
-`~/projects/gufo-f3-integ/plan/exl3/F3-RESUME-RESULTS.md`.
+`~/projects/gufo-f3-integ/plan/exl3/archive/F3-RESUME-RESULTS.md`.
 The user requires Nix ROCm 10.1, one combined final model/timing pass, and
 reuse of stored matching baselines. No merge or final model qualification yet.
 The first q3 batch item's Thai rare-vocabulary fixture failure is resolved:
@@ -505,8 +520,8 @@ This lists what has **not** been done, what is **still unexplained**, and the
 order to resume. Read [docs/GFX1151-KNOWHOW.md](../../docs/GFX1151-KNOWHOW.md)
 first. It records what was already measured, so do not re-run that. It is a
 living document: update it with every new result. History is in
-[F3-PLAN.md](F3-PLAN.md) under "Status at hold", in
-[F1-RESULTS.md](F1-RESULTS.md) and in [F3-SESSION-FINDINGS.md](F3-SESSION-FINDINGS.md).
+[F3-PLAN.md](archive/F3-PLAN.md) under "Status at hold", in
+[F1-RESULTS.md](archive/F1-RESULTS.md) and in [F3-SESSION-FINDINGS.md](archive/F3-SESSION-FINDINGS.md).
 
 ## Where things are
 

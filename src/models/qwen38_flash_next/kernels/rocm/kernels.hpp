@@ -119,7 +119,8 @@ bool GateRotatedContext(float* ctx, const float* qg, std::uint32_t qg_stride,
                         hipStream_t stream, const Exl3InputSlabs& slabs = {});
 
 /// One layer's KVarN K/V as the attention kernels read it
-/// (plan/exl3/F1-KVARN-DESIGN.md 4). Position j of a query at position p is
+/// (plan/exl3/archive/F1-KVARN-DESIGN.md 4). Position j of a query at position
+/// p is
 ///   * a staging row when `k_staging` is set and j >= staging_first (the rows
 ///     a prompt chunk writes, and the ring rows before it);
 ///   * a sink row for j < 128;

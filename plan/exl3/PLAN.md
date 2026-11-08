@@ -1,6 +1,6 @@
 # EXL3(QTIP) 형식 도입 계획 초안 (2026-10-30, 감독 gufo-06)
 
-상태: **확정 (사용자 결정 2026-10-30)**. 결정 내용은 아래 "결정" 절에 있다. 근거는 [RQ PLAN "방향 전환"](../rotated-quant/PLAN.md), [EXL3-RESULTS.md](../rotated-quant/EXL3-RESULTS.md)(W8), [FLASH-NEXT.md 13절](../rotated-quant/FLASH-NEXT.md)(W7), [W9-RESULTS.md](../rotated-quant/W9-RESULTS.md)다.
+상태: **확정 (사용자 결정 2026-10-30)**. 결정 내용은 아래 "결정" 절에 있다. 근거는 [RQ PLAN "방향 전환"](../archive/rotated-quant/PLAN.md), [EXL3-RESULTS.md](../archive/rotated-quant/EXL3-RESULTS.md)(W8), [FLASH-NEXT.md 13절](../archive/rotated-quant/FLASH-NEXT.md)(W7), [W9-RESULTS.md](../archive/rotated-quant/W9-RESULTS.md)다.
 
 ## 목표
 
@@ -88,14 +88,14 @@
 - **이 점유 결과를 보고 Flash-Next EXL3의 bpw를 정한다**(F2의 선행 조건).
 - 통과 기준: greedy 출력이 바이트 단위로 같다. decode와 prefill이 main 대비 5 %·10 ms 안이다(n-gram 조회가 디스크로 가도 속도를 해치지 않아야 한다). 페이지 캐시 상태(cold/warm)를 기록한다.
 
-**F1 KVarN 결정 (사용자 2026-10-30, K0-FN 결과 뒤):** Flash-Next KV는 **k4v4**. K0-FN에서 모든 설정이 top-1 1.0000, greedy 동일, needle 통과였지만 k4v2는 KL 꼬리가 27B k4v2의 약 10배(32K 최대 1.0e-2, 200K needle 3.2e-2)였고, k4v4는 27B k4v2 수준(1.7e-3 / 1.8e-3)이다. 근거: [F1-RESULTS.md](F1-RESULTS.md)(`97315880`).
+**F1 KVarN 결정 (사용자 2026-10-30, K0-FN 결과 뒤):** Flash-Next KV는 **k4v4**. K0-FN에서 모든 설정이 top-1 1.0000, greedy 동일, needle 통과였지만 k4v2는 KL 꼬리가 27B k4v2의 약 10배(32K 최대 1.0e-2, 200K needle 3.2e-2)였고, k4v4는 27B k4v2 수준(1.7e-3 / 1.8e-3)이다. 근거: [F1-RESULTS.md](archive/F1-RESULTS.md)(`97315880`).
 
 ### F2 Flash-Next EXL3
 
 - **대상:** 전문가(MoE) trellis GEMV와 그룹 GEMM, dense 트렁크, MTP, n-gram 표다.
-- **bpw: 전문가 EXL3 5.0 (사용자 결정 2026-10-30, F0 측정 뒤).** 상주 약 77.9 GiB로 지금(UD-Q4_K_XL 79.3 GiB)과 비슷하다. 품질은 지금보다 높을 것으로 보고(27B 환산), decode 속도는 지금과 비슷하다. KVarN이 있으면 262K MTP 세션 8개가 가능하다. F0 결과: [F1-RESULTS.md](F1-RESULTS.md)(`01cf33e0`), HIP 전체 112 GiB. 직접 양자화하려면 Flash-Next HF safetensors 원본이 필요하다(지금은 BF16 GGUF만 있음). 받을지는 F2 시작 전에 정한다. 전문가 bpw b에 대해 상주 약 14.06·b + 7.6 GiB(F1 계산, F0-M으로 확인).
+- **bpw: 전문가 EXL3 5.0 (사용자 결정 2026-10-30, F0 측정 뒤).** 상주 약 77.9 GiB로 지금(UD-Q4_K_XL 79.3 GiB)과 비슷하다. 품질은 지금보다 높을 것으로 보고(27B 환산), decode 속도는 지금과 비슷하다. KVarN이 있으면 262K MTP 세션 8개가 가능하다. F0 결과: [F1-RESULTS.md](archive/F1-RESULTS.md)(`01cf33e0`), HIP 전체 112 GiB. 직접 양자화하려면 Flash-Next HF safetensors 원본이 필요하다(지금은 BF16 GGUF만 있음). 받을지는 F2 시작 전에 정한다. 전문가 bpw b에 대해 상주 약 14.06·b + 7.6 GiB(F1 계산, F0-M으로 확인).
 - **n-gram 표는 F2 범위에서 뺀다.** 디스크에 있으므로 EXL3로 바꿔도 메모리 이득이 없다.
-- **팩: 직접 양자화하지 않고 turboderp `5.05bpw_h6_ng6` 팩을 받아 쓴다 (사용자 결정 2026-10-31).** 직접 양자화는 GPU 26–33시간이 들고, 창마다 작업 디렉터리를 복사하면 외장 디스크가 모자란다. 이 팩의 비트 배분은 전문가 5, 트렁크·attention·공유 전문가 7, 헤드 6, MTP 5, n-gram K6이다. 조사 근거: [F2-PLAN.md](F2-PLAN.md)(`511d7bbc`). HF safetensors 원본(외장, sha256 확인)은 필요하면 직접 양자화할 때 쓴다.
+- **팩: 직접 양자화하지 않고 turboderp `5.05bpw_h6_ng6` 팩을 받아 쓴다 (사용자 결정 2026-10-31).** 직접 양자화는 GPU 26–33시간이 들고, 창마다 작업 디렉터리를 복사하면 외장 디스크가 모자란다. 이 팩의 비트 배분은 전문가 5, 트렁크·attention·공유 전문가 7, 헤드 6, MTP 5, n-gram K6이다. 조사 근거: [F2-PLAN.md](archive/F2-PLAN.md)(`511d7bbc`). HF safetensors 원본(외장, sha256 확인)은 필요하면 직접 양자화할 때 쓴다.
 - **통과 기준:** 품질은 gufo 지금 UD-Q4_K_XL 수준 이상이고, 속도는 Kyojin 카드(52.8/47.5/73.2, 8K/32K 52.2/51.1) 이상이다.
 
 ### 병행: 투기 디코딩 (W9)
@@ -118,7 +118,7 @@
 | F-A | F1: 페이지 KV + KVarN |
 | W9 | 투기 디코딩(계속) |
 
-GPU 창, 빌드, 디스크 규칙은 [W-COMMON.md](../rotated-quant/W-COMMON.md)를 그대로 따른다.
+GPU 창, 빌드, 디스크 규칙은 [W-COMMON.md](../archive/rotated-quant/W-COMMON.md)를 그대로 따른다.
 
 ## 결정 (사용자 2026-10-30)
 
@@ -126,7 +126,7 @@ GPU 창, 빌드, 디스크 규칙은 [W-COMMON.md](../rotated-quant/W-COMMON.md)
 2. **직접 양자화한다.** upstream `convert.py`를 오프라인으로 쓴다(W8 이미지). 보정 코퍼스는 사용자 지시(2026-10-29)대로 c02를 쓴다. turboderp 5.00 팩은 품질 대조군으로만 쓴다.
 3. **R3 imatrix와 E 실험을 멈춘다.**
 4. **X0·X1(형식과 리더), XQ(양자화), F1(Flash-Next 페이지 KV + KVarN)을 동시에 시작한다.** X2·X3은 X1 뒤에 시작한다. 담당은 X-A = W8(이어서), XQ = 새 에이전트, F1 = 새 에이전트다.
-5. **오래 걸리는 양자화는 하지 않고, 이미 만들어진 공개 팩을 받는다 (사용자 2026-10-31, 27B와 Flash-Next 모두).** 27B c02 5.00 팩은 이미 끝났으므로 목표 팩으로 쓴다(품질 판정: [XQ-RESULTS.md](XQ-RESULTS.md) `eeaad672`). 다른 bpw나 변형이 필요하면 turboderp 등 공개 팩을 먼저 찾아 받는다. 직접 양자화는 공개 팩이 없을 때만 감독이 사용자에게 묻는다.
+5. **오래 걸리는 양자화는 하지 않고, 이미 만들어진 공개 팩을 받는다 (사용자 2026-10-31, 27B와 Flash-Next 모두).** 27B c02 5.00 팩은 이미 끝났으므로 목표 팩으로 쓴다(품질 판정: [XQ-RESULTS.md](archive/XQ-RESULTS.md) `eeaad672`). 다른 bpw나 변형이 필요하면 turboderp 등 공개 팩을 먼저 찾아 받는다. 직접 양자화는 공개 팩이 없을 때만 감독이 사용자에게 묻는다.
 6. **빠르게 구축하고, 구축 중에는 단위 테스트만 돌린다. 다 만든 뒤 통합 테스트를 하고 문제를 고친다 (사용자 2026-10-31).** 단위 테스트(CPU, 짧은 GPU 커널 테스트)는 구축 중에 바로 돌린다. 모델 수준 품질·속도 창은 마지막에 한 번 돌린다. X3(27B prefill)과 F2(Flash-Next EXL3: Codex 작업자 `fn-exl3-impl`, 작업 트리 `../gufo-fn-exl3`, 브랜치 `ai-tools/fn-exl3`), F1 K2를 모두 구현한 뒤 마지막에 묶음 창(정확성·품질 창, 그다음 ABBA timing 창)으로 한 번에 비교한다. Flash-Next 팩은 5.05를 그대로 쓴다. 토큰당 가중치는 6.03 GB로 UD-Q4_K_XL의 6.19 GB와 비슷하므로(Codex 헤더 계산), 속도 이득은 커널과 MTP에서 내야 한다.
 7. **목표는 Kyojin을 따라가는 것이 아니라 압도하는 것이다. 그중 prefill이 가장 중요하다 (사용자 2026-11-01).** Flash-Next EXL3 prefill은 UD-Q4_K_XL(pp8192 약 1800 tok/s)과 Kyojin cold 8K(1621 tok/s)를 모두 크게 넘어야 하고, 하드웨어 한계(roofline)까지 올린다. 수치 목표는 pp2048·pp8192 모두 2,000 tok/s 이상이고, 현실적 상한(약 2,300–2,500 tok/s, WMMA 피크 55.5 TFLOPS의 55–65 % 효율 기준)에 가깝게 간다. Kyojin을 프로파일하거나 통째로 옮기지 않고 gufo 자체 설계로 내되, Kyojin 소스는 필요한 부분만 참고할 수 있다(MIT 고지 유지). 품질은 지금처럼 UD-Q4보다 좋아야 한다(5.05: KL 0.0269 대 0.0392).
 

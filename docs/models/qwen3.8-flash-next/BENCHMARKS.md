@@ -86,7 +86,7 @@ be attributed solely to kernel work.
 Native K6 vision residency 352601088 B versus historical BF16 903984064 B,
 a 525.84 MiB reduction. Quantization/weights differ; not a matched accuracy or
 latency comparison. K8 generic decoding uses temporary per-image memory.
-[Evidence and limits](../../../plan/exl3/F3-VISION-NATIVE.md).
+[Evidence and limits](../../../plan/exl3/archive/F3-VISION-NATIVE.md).
 
 ## Physical KV prefix references, November 4, 2026
 
@@ -110,7 +110,7 @@ pool, not the size of its initial backing allocation. Direct GPU fixtures
 restore shared4K branches with at most two newly allocated blocks, including
 MTP's private frontier/guard. All88 boundary/reference cases pass.
 Evidence: `build/fn-kv-sharing/RESULT.json`, `gpu/` and `gpu-reservation/`;
-[implementation and limits](../../../plan/exl3/F3-KV-REFERENCES.md).
+[implementation and limits](../../../plan/exl3/archive/F3-KV-REFERENCES.md).
 
 
 ## K6V6 candidate observations, November 3, 2026
@@ -139,7 +139,7 @@ AR128 d0/d32K25.20/24.49 →25.20/24.47; MTP40.85/79.48 →40.92/79.27tok/s.
 All hashes exact, maximum change0.264%; d32K MTP is lookup-heavy.
 C4 shared serving passes and actual disk restore uses12352 cached+7 prefill
 in0.486s with identical output. No full two-times-256K timing claim.
-[Evidence and limitations](../../../plan/exl3/F3-SHARED-KV.md).
+[Evidence and limitations](../../../plan/exl3/archive/F3-SHARED-KV.md).
 
 ## Exact live-row verification, November 2, 2026
 
@@ -156,7 +156,7 @@ Outputs and cycle/draft/acceptance counts are unchanged. PP/AR are effectively
 neutral; d32K is lookup-heavy and its gain overlaps baseline spread.
 The21–32% routed component gain is not a whole-model claim. No new Kyojin run.
 Image `ai-tools/gufo-eval:f3-rows-91fce75a-rocm101`.
-[Full results and rejected candidates](../../../plan/exl3/F3-TGMTP-ROWS.md).
+[Full results and rejected candidates](../../../plan/exl3/archive/F3-TGMTP-ROWS.md).
 
 ## Same-pack local Kyojin follow-up, November 2, 2026
 
@@ -168,7 +168,7 @@ kernel change or default model switch. Current native5.05 profile attributes
 ARdense35.44% and MTPexperts27.43%/dense22.21%; retain as diagnostic evidence,
 not unprofiled speed. Both completed windows healthPASS; prior invalid default
 penalty attempt is preserved. Existing numerical qualification is not repeated.
-[Exact scope, receipts and next batch](../../../plan/exl3/F3-KYOJIN-SAME-PACK.md).
+[Exact scope, receipts and next batch](../../../plan/exl3/archive/F3-KYOJIN-SAME-PACK.md).
 
 
 ## Native EXL3 n-gram, November 2, 2026
@@ -184,7 +184,7 @@ This material workload-specific loss is retained; do not describe universal
 performance parity. Native full-vocabulary NLL improves2.175202→2.167751,
 paired window95%CI forΔNLL[−.017370,−.001770]. Top-1 change−.0794pp is unresolved.
 
-[Complete scope, caveats and evidence](../../../plan/exl3/F3-NATIVE-PACK.md).
+[Complete scope, caveats and evidence](../../../plan/exl3/archive/F3-NATIVE-PACK.md).
 
 
 ## Kyojin target comparison, November 2, 2026
@@ -233,7 +233,7 @@ acceptance/lookup counts, runtime maps, frozen inputs and published-page SHA
 are retained in the comparison report. Existing numerical qualification and
 its NLL caveat remain unchanged. No Kyojin quality parity is claimed.
 
-[Comparison](../../../plan/exl3/F3-TGMTP-KYOJIN-COMPARISON.json).
+[Comparison](../../../plan/exl3/archive/F3-TGMTP-KYOJIN-COMPARISON.json).
 
 ## TG/MTP routed and HC optimization, November 2, 2026
 
@@ -267,9 +267,9 @@ Use `/opt/gufo-tgmtp/bin/gufo` (the image entrypoint); the inherited legacy
 `f4dca2bca9efe4da63e8e1309f9b15dd31792c5460d5e27cff35ae19740578d5` matches the qualified mounted candidate.
 
 
-[Qualification and identities](../../../plan/exl3/F3-TGMTP-QUALIFICATION.json),
-[operator screens](../../../plan/exl3/F3-TGMTP-SCREENS.json),
-[flow review](../../../plan/exl3/F3-TGMTP-FLOW.json).
+[Qualification and identities](../../../plan/exl3/archive/F3-TGMTP-QUALIFICATION.json),
+[operator screens](../../../plan/exl3/archive/F3-TGMTP-SCREENS.json),
+[flow review](../../../plan/exl3/archive/F3-TGMTP-FLOW.json).
 
 ## HC/MoE combined qualification, November 2, 2026
 
@@ -292,7 +292,7 @@ checks pass. Performance uses k4v4/temp0/seed314159/r2. The initial pp2048
 context8193→4096 and is diagnostic only; the final d0 replay restored the
 original512,2048,8192 list and8193 capacity. All attempts are retained; no
 baseline, correctness or d32K rerun. Target2000 is still unmet.
-[Qualification, runtime/code identities and all attempts](../../../plan/exl3/F3-PREFILL-BATCH6-QUALIFICATION.json).
+[Qualification, runtime/code identities and all attempts](../../../plan/exl3/archive/F3-PREFILL-BATCH6-QUALIFICATION.json).
 
 ## EXL3 shared-MoE/KVarN qualified batch, November 2, 2026
 
@@ -307,12 +307,12 @@ temperature0, seed314159, r2; saved baseline reused.
 | pp8192 | 1447.47 ±1.36 | 1460.97 ±.73 | +.93% |
 | pp2048 at d32768 | 1291.03 ±1.09 | 1301.99 ±1.41 | +.85% |
 
-[Qualification and exact scope](../../../plan/exl3/F3-STREAM-QUALIFICATION.json).
+[Qualification and exact scope](../../../plan/exl3/archive/F3-STREAM-QUALIFICATION.json).
 The later routed grouped-gate/up screen was not promoted and did not run a
 model benchmark; this is the prior batch. Goal2000 tok/s is unmet.
 A subsequent user-requested current-binary profile measured1426.48tok/s under
 tracing at context4096, versus8193 here. This is advisory and does not replace
-the clean table. [Bottleneck profile](../../../plan/exl3/F3-CURRENT-PREFILL-PROFILE.json).
+the clean table. [Bottleneck profile](../../../plan/exl3/archive/F3-CURRENT-PREFILL-PROFILE.json).
 
 ## EXL3 5.05 dense traversal follow-up, November 1, 2026
 
@@ -330,7 +330,7 @@ seed314159, r2. Stored baselines reused; no new baseline inference.
 Only singleton K7 6144→2560 at2048 rows changes grid traversal. The actual
 release object passed saved exact-output/guard comparisons. Batch512 model
 collector evidence is reused because it cannot enter the new2048 predicate.
-[Full scopes and qualification](../../../plan/exl3/F3-PREFILL-GRID.md).
+[Full scopes and qualification](../../../plan/exl3/archive/F3-PREFILL-GRID.md).
 The2000 tok/s goal remains unmet; earlier batches below are historical.
 
 ## EXL3 5.05 narrow dense/output-slice batch, November 1, 2026
@@ -347,7 +347,7 @@ baseline reused. Accuracy payload remained exact. Goal2000 tok/s is unmet.
 | pp2048 at d32768 | 1280.80 ±3.23 | 1282.89 ±2.18 | +.16% |
 
 Image `ai-tools/gufo-eval:f3-prefill2-f497677d-rocm101-r1` (`d256d2ab…`).
-[Qualification and scope](../../../plan/exl3/F3-PREFILL-BATCH2.md).
+[Qualification and scope](../../../plan/exl3/archive/F3-PREFILL-BATCH2.md).
 The earlier matrix screens below are historical; their narrow candidate is
 now qualified in this batch. Completed TG/MTP work is retained.
 
@@ -366,7 +366,7 @@ temperature0, seed 314159. One candidate r2 window, saved pre-batch baseline reu
 `fn-prefill-batch-nix101` is healthy and complete. Contexts, prefill warmups and
 case order match saved `fn-final-t1-x-ar-nix101`; generation cases were omitted.
 These are observed batch-level gains; individual changes were not timed separately.
-[Build and exactness evidence](../../../plan/exl3/F3-RESUME-RESULTS.md#qualified-prefill-batch-2026-11-01).
+[Build and exactness evidence](../../../plan/exl3/archive/F3-RESUME-RESULTS.md#qualified-prefill-batch-2026-11-01).
 
 ## Earlier GGUF benchmark suite
 
@@ -484,7 +484,7 @@ change reduces one synthetic2048-row fused combine screen by8.87% (plain)
 and8.93% (after256MiB write pressure); these are not model measurements.
 No model baseline or full profile was repeated. Preserve saved controls and
 Nix production objects for the next combined qualification.
-[Scope, both variants and receipts](../../../plan/exl3/F3-HC-LOAD-SCREENS.json).
+[Scope, both variants and receipts](../../../plan/exl3/archive/F3-HC-LOAD-SCREENS.json).
 
 
 ## EXL3 conversion capture screen, November 5, 2026
@@ -502,4 +502,4 @@ percentage is provisional until complete conversion timings are available.
 
 All captured statistics and normal outputs are byte-exact. The unchanged first
 attention conversion completed in4886.74s before adoption; later block timings
-will be logged without quant-worker synchronization. [Scope and receipts](../../../plan/exl3/F3-CONVERSION-WATCH.md).
+will be logged without quant-worker synchronization. [Scope and receipts](../../../plan/exl3/archive/F3-CONVERSION-WATCH.md).

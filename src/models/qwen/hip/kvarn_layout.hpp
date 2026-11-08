@@ -1,7 +1,7 @@
 #ifndef GUFO_MODELS_QWEN_HIP_KVARN_LAYOUT_HPP_
 #define GUFO_MODELS_QWEN_HIP_KVARN_LAYOUT_HPP_
 
-// KVarN attention KV storage for Qwen3.8-27B (plan/gufo-upstream-port/
+// KVarN attention KV storage for Qwen3.8-27B (plan/archive/gufo-upstream-port/
 // KVARN.md) on the shared format of src/core/hip/kvarn_layout.hpp: this
 // model's kernel shape (4 KV heads, 24 query heads, channel-major values),
 // pool planes and tuned split and prefill policies. Host-only arithmetic, so
