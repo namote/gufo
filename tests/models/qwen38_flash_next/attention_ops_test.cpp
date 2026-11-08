@@ -572,6 +572,32 @@ double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
     throw std::runtime_error("WMMA attention replay changed the output");
   }
   {
+    // The EXL3 prefill route reads the gate from the packed [q | gate]
+    // projection rows (gate_stride): the same bytes as the unpacked copy.
+    // Query halves hold poison; the kernel must read only the gate halves.
+    const std::size_t pair_width = 2 * kQWidth;
+    std::vector<float> packed(static_cast<std::size_t>(n_tokens) * pair_width,
+                              -54321.0F);
+    for (std::uint32_t t = 0; t < n_tokens; ++t)
+      for (std::uint32_t h = 0; h < kHeads; ++h)
+        std::memcpy(&packed[t * pair_width + (2 * h + 1) * kDim],
+                    &gate[(static_cast<std::size_t>(t) * kHeads + h) * kDim],
+                    kDim * sizeof(float));
+    HipBuffer<float> d_packed(packed.size());
+    Upload(&d_packed, packed);
+    if (!q::WmmaCausalAttention(d_q.get(), d_packed.get() + kDim, d_k.get(),
+                                d_v.get(), mask_ptr, mask_words, d_wmma.get(),
+                                n_tokens, start_pos, kHeads, kKvHeads, kDim,
+                                kRatio, nullptr, false, nullptr, nullptr,
+                                static_cast<std::uint32_t>(pair_width))) {
+      throw std::runtime_error("packed-gate attention rejected the geometry");
+    }
+    const auto strided = Download(&d_wmma, q_count);
+    if (std::memcmp(out.data(), strided.data(), q_count * sizeof(float)) != 0) {
+      throw std::runtime_error("packed-gate attention changed the output");
+    }
+  }
+  {
     constexpr float poison = -12345.0F;
     Upload(&d_wmma, std::vector<float>(q_count, poison));
     if (!q::WmmaCausalAttention(d_q.get(), d_gate.get(), d_k.get(), d_v.get(),

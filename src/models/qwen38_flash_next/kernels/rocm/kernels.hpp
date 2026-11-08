@@ -784,17 +784,17 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
 /// heads over two KV heads. `last_only` computes only the final dense query
 /// tile, retaining its key sweep and leaving earlier output rows untouched.
 /// Returns false when the visible extent exceeds 262,144 tokens; the caller
-/// falls back to Attention.
-bool WmmaCausalAttention(const float* q, const float* gate,
-                         const __half* k_cache, const __half* v_cache,
-                         const std::uint32_t* mask, std::uint32_t mask_words,
-                         float* out, std::uint32_t n_tokens,
-                         std::uint32_t start_pos, std::uint32_t heads,
-                         std::uint32_t kv_heads, std::uint32_t d,
-                         std::uint32_t ratio, hipStream_t stream,
-                         bool last_only = false,
-                         const std::uint32_t* kv_blocks = nullptr,
-                         const KvarnReadView* kvarn = nullptr);
+/// falls back to Attention. `gate_stride` 0: gate is [token][heads * d];
+/// otherwise gate points at the first gate half of packed [q | gate] head
+/// pairs with that token stride (the projection rows, no unpacked copy).
+bool WmmaCausalAttention(
+    const float* q, const float* gate, const __half* k_cache,
+    const __half* v_cache, const std::uint32_t* mask, std::uint32_t mask_words,
+    float* out, std::uint32_t n_tokens, std::uint32_t start_pos,
+    std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t d,
+    std::uint32_t ratio, hipStream_t stream, bool last_only = false,
+    const std::uint32_t* kv_blocks = nullptr,
+    const KvarnReadView* kvarn = nullptr, std::uint32_t gate_stride = 0);
 
 /// counts[e] = number of (token, slot) pairs routed to expert e.
 void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,

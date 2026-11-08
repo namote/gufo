@@ -3721,6 +3721,9 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       IndexerCapacity(c, options_.max_batch, max_context);
   bool prepared = false;
   bool query_rows = false;
+  // The WMMA prefill kernel reads its output gate from the packed [q | gate]
+  // projection rows: AttentionQueryRows skips the unpacked copy.
+  bool packed_gate = false;
   // KVarN layers write FP16 rows and rotate them into the KVarN frame: a
   // pass into the sink and tail ring, a prompt chunk into the staging rows,
   // whose row 0 holds staging_first (plan/exl3/F1-KVARN-DESIGN.md 3).
@@ -3893,12 +3896,20 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     // RoPE and (KVarN) into the KVarN frame in one pass; a KVarN layer's
     // output gate then reads the packed rows directly.
     const bool kvarn_rows = kvarn != nullptr;
-    query_rows = prefill_phase && model_->output().exl3 != nullptr &&
-                 AttentionQueryRows(
-                     s_.qg, 2 * c.AttentionQDim(), l.attn_q_norm.f32(), s_.q,
-                     kvarn_rows ? nullptr : s_.attn_gate, n_tokens, c.num_heads,
-                     c.head_dim, c.rotary_dim, pos, c.rope_theta, c.rms_eps,
-                     kvarn_rows, stream_, s.rope, yarn_);
+    // Only where the WMMA launch accepts the extent (its fallback reruns the
+    // query pass for the unpacked gate).
+    packed_gate = !kvarn_rows && MatrixRows(n_tokens) && wmma_limit != 0 &&
+                  (!sparse || (live_context <= wmma_limit &&
+                               live_context <= std::uint64_t{mask_words_} *
+                                                   c.compress_ratio * 32));
+    query_rows =
+        prefill_phase && model_->output().exl3 != nullptr &&
+        AttentionQueryRows(
+            s_.qg, 2 * c.AttentionQDim(), l.attn_q_norm.f32(), s_.q,
+            kvarn_rows || packed_gate ? nullptr : s_.attn_gate, n_tokens,
+            c.num_heads, c.head_dim, c.rotary_dim, pos, c.rope_theta, c.rms_eps,
+            kvarn_rows, stream_, s.rope, yarn_);
+    packed_gate = packed_gate && query_rows;
     // Decode/verify: one launch unpacks the query, normalizes and rotates
     // q/k and writes both caches from the split K/V rows (the stacked
     // route's PrepareAttention; RoPE with its explicit FMAs).
@@ -3986,21 +3997,27 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     const auto at = [&](std::uint32_t row) {
       return std::size_t{first + row} * c.AttentionQDim();
     };
+    const std::uint32_t gate_stride = packed_gate ? 2 * c.AttentionQDim() : 0;
+    const auto gate = [&](std::uint32_t row) {
+      return packed_gate
+                 ? s_.qg + std::size_t{first + row} * gate_stride + c.head_dim
+                 : s_.attn_gate + at(row);
+    };
     return (dense_rows == rows ||
             WmmaCausalAttention(
-                s_.q + at(dense_rows), s_.attn_gate + at(dense_rows), s.k_cache,
-                s.v_cache,
+                s_.q + at(dense_rows), gate(dense_rows), s.k_cache, s.v_cache,
                 mask ? mask + std::size_t{first + dense_rows} * mask_words_
                      : nullptr,
                 mask_words_, s_.ctx + at(dense_rows), rows - dense_rows,
                 pos + dense_rows, c.num_heads, c.num_kv_heads, c.head_dim,
-                c.compress_ratio, stream_, last, s.kv_blocks)) &&
+                c.compress_ratio, stream_, last, s.kv_blocks, nullptr,
+                gate_stride)) &&
            (dense_rows == 0 || (last && dense_rows != rows) ||
-            WmmaCausalAttention(s_.q + at(0), s_.attn_gate + at(0), s.k_cache,
-                                s.v_cache, nullptr, mask_words_, s_.ctx + at(0),
+            WmmaCausalAttention(s_.q + at(0), gate(0), s.k_cache, s.v_cache,
+                                nullptr, mask_words_, s_.ctx + at(0),
                                 dense_rows, pos, c.num_heads, c.num_kv_heads,
                                 c.head_dim, c.compress_ratio, stream_, last,
-                                s.kv_blocks));
+                                s.kv_blocks, nullptr, gate_stride));
   };
   if (checkpoint_tokens != 0 && checkpoint_tokens < n_tokens) {
     // Sparse tiles compact the union of their queries' selected keys.
@@ -4016,6 +4033,16 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   if (MatrixRows(n_tokens) && attend(0, n_tokens, last_only)) {
     return !project_output ||
            Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
+  }
+  // A refused WMMA launch: the per-token kernel and SigmoidMul read the
+  // unpacked gate. Rerun the query pass for it (it rewrites q unchanged).
+  if (packed_gate &&
+      !AttentionQueryRows(s_.qg, 2 * c.AttentionQDim(), l.attn_q_norm.f32(),
+                          s_.q, s_.attn_gate, n_tokens, c.num_heads, c.head_dim,
+                          c.rotary_dim, pos, c.rope_theta, c.rms_eps, false,
+                          stream_, s.rope, yarn_)) {
+    AssignError(error_msg, "attention gate unpack failed");
+    return false;
   }
   // Narrow batches split each row's key tiles over kAttnSplits blocks so a
   // decode step at depth fills the device.

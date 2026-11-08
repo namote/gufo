@@ -4855,7 +4855,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     const std::uint32_t* __restrict__ mask, std::uint32_t mask_words,
     float* __restrict__ out, std::uint32_t start_pos, std::uint32_t n_tokens,
     std::uint32_t first_query_group, const std::uint32_t* kv_blocks,
-    KvarnReadView kvarn = {}) {
+    KvarnReadView kvarn = {}, std::uint32_t gate_stride = 0) {
   // The launcher accepts only four-token selection blocks. Keep that
   // geometry constant throughout the key sweep.
   constexpr std::uint32_t ratio = kWmmaRatio;
@@ -5536,7 +5536,17 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
         float value =
             (denominator > 0.0F) ? (o_acc[rb][t][i] / denominator) : 0.0F;
         if (gate != nullptr) {
-          value *= SigmoidF(gate[offset]);
+          // gate_stride != 0: the packed [q | gate] projection rows, the
+          // gate half of each head (gate points at the first one).
+          const std::size_t gate_offset =
+              gate_stride == 0
+                  ? offset
+                  : (static_cast<std::size_t>(row_query(rb, row)) *
+                     gate_stride) +
+                        (static_cast<std::size_t>(row_head(rb, row)) * 2 *
+                         kHeadDim) +
+                        (dim_tile * 16) + sub;
+          value *= SigmoidF(gate[gate_offset]);
         }
         out[offset] = value;
       }
@@ -9527,7 +9537,8 @@ bool WmmaCausalAttention(const float* q, const float* gate,
                          std::uint32_t kv_heads, std::uint32_t d,
                          std::uint32_t ratio, hipStream_t stream,
                          bool last_only, const std::uint32_t* kv_blocks,
-                         const KvarnReadView* kvarn) {
+                         const KvarnReadView* kvarn,
+                         std::uint32_t gate_stride) {
   if (kvarn != nullptr && kvarn->bits != 4 && kvarn->bits != 6)
     throw std::invalid_argument("KVarN bits must be 4 or 6");
 
@@ -9556,18 +9567,20 @@ bool WmmaCausalAttention(const float* q, const float* gate,
       hipLaunchKernelGGL(
           (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true, 6>), grid,
           dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask,
-          mask_words, out, start_pos, n_tokens, first_group, kv_blocks, *kvarn);
+          mask_words, out, start_pos, n_tokens, first_group, kv_blocks, *kvarn,
+          gate_stride);
     else if (kvarn != nullptr)
       hipLaunchKernelGGL(
           (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true, 4>), grid,
           dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask,
-          mask_words, out, start_pos, n_tokens, first_group, kv_blocks, *kvarn);
+          mask_words, out, start_pos, n_tokens, first_group, kv_blocks, *kvarn,
+          gate_stride);
     else
       hipLaunchKernelGGL(
           (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true>), grid,
           dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask,
           mask_words, out, start_pos, n_tokens, first_group, kv_blocks,
-          KvarnReadView{});
+          KvarnReadView{}, gate_stride);
     return true;
   }
   const std::uint32_t first_group =
@@ -9579,17 +9592,18 @@ bool WmmaCausalAttention(const float* q, const float* gate,
     hipLaunchKernelGGL(
         (WmmaCausalAttentionKernel<kWmmaQueryRows, kWmmaKeys, false, 6>), grid,
         dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask, mask_words,
-        out, start_pos, n_tokens, first_group, kv_blocks, *kvarn);
+        out, start_pos, n_tokens, first_group, kv_blocks, *kvarn, gate_stride);
   else if (kvarn != nullptr)
     hipLaunchKernelGGL(
         (WmmaCausalAttentionKernel<kWmmaQueryRows, kWmmaKeys, false, 4>), grid,
         dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask, mask_words,
-        out, start_pos, n_tokens, first_group, kv_blocks, *kvarn);
+        out, start_pos, n_tokens, first_group, kv_blocks, *kvarn, gate_stride);
   else
     hipLaunchKernelGGL(
         (WmmaCausalAttentionKernel<kWmmaQueryRows, kWmmaKeys, false>), grid,
         dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask, mask_words,
-        out, start_pos, n_tokens, first_group, kv_blocks, KvarnReadView{});
+        out, start_pos, n_tokens, first_group, kv_blocks, KvarnReadView{},
+        gate_stride);
   return true;
 }
 

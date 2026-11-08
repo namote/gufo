@@ -10,6 +10,11 @@
 // mask words, then the rows' mask words) at its own geometry. Each line prints
 // an FNV-1a hash of the output after the first call, so kernel rewrites can be
 // checked for identical results.
+//
+// Each run also times the EXL3 prefill query pass plus attention in its pre-B6
+// form (AttentionQueryRows unpacks the gate, the kernel reads that copy)
+// against the current one (no copy; the kernel reads the gate halves of the
+// packed projection rows); both outputs must be byte-equal.
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -185,6 +190,59 @@ int main(int argc, char** argv) try {
     std::printf("start %6u tokens %u %s  %8.3f ms  hash %016llx\n", start_pos,
                 tokens, d_mask ? "sparse" : "dense ", ms[reps / 2],
                 static_cast<unsigned long long>(hash));
+    {
+      // Query pass + attention, old (unpacked gate) vs new (packed gate).
+      const std::uint32_t pair = 2 * kHeads * kDim;
+      float* d_qg =
+          Upload(Values(std::size_t{tokens} * pair, 0x51ED5EEDU, 3.0F));
+      float* d_gamma = Upload(Values(kDim, 0x6A33A000U, 0.5F));
+      std::uint32_t* d_start = nullptr;
+      CheckHip(hipMalloc(&d_start, sizeof(std::uint32_t)), "hipMalloc");
+      CheckHip(hipMemcpy(d_start, &start_pos, sizeof(std::uint32_t),
+                         hipMemcpyHostToDevice),
+               "hipMemcpy");
+      float* d_out_new = Upload(std::vector<float>(q_count));
+      const auto pass = [&](bool packed) {
+        if (!q::AttentionQueryRows(
+                d_qg, pair, d_gamma, d_q, packed ? nullptr : d_gate, tokens,
+                kHeads, kDim, 64, d_start, 1.0e7F, 1.0e-6F, false, nullptr,
+                nullptr, gufo::models::qwen38_flash_next::YarnRope{}) ||
+            !q::WmmaCausalAttention(
+                d_q, packed ? d_qg + kDim : d_gate, d_k, d_v, d_mask,
+                mask_words, packed ? d_out_new : d_out, tokens, start_pos,
+                kHeads, kKvHeads, kDim, kRatio, nullptr, false, nullptr,
+                nullptr, packed ? pair : 0))
+          throw std::runtime_error("query pass/attention rejected");
+      };
+      const auto time = [&](bool packed) {
+        pass(packed);
+        std::vector<float> t(reps);
+        for (int i = 0; i < reps; ++i) {
+          CheckHip(hipEventRecord(start, nullptr), "hipEventRecord");
+          pass(packed);
+          CheckHip(hipEventRecord(stop, nullptr), "hipEventRecord");
+          CheckHip(hipEventSynchronize(stop), "hipEventSynchronize");
+          CheckHip(hipEventElapsedTime(&t[i], start, stop),
+                   "hipEventElapsedTime");
+        }
+        std::sort(t.begin(), t.end());
+        return t[reps / 2];
+      };
+      const float old_ms = time(false);
+      const float new_ms = time(true);
+      const float old_again = std::min(old_ms, time(false));
+      const float new_again = std::min(new_ms, time(true));
+      CheckHip(hipDeviceSynchronize(), "hipDeviceSynchronize");
+      const bool same = Hash(d_out, q_count) == Hash(d_out_new, q_count);
+      std::printf("  query pass + attention: old %8.3f ms  new %8.3f ms  %s\n",
+                  old_again, new_again, same ? "equal" : "DIFFER");
+      if (!same)
+        throw std::runtime_error("packed-gate attention changed the output");
+      for (void* p :
+           {static_cast<void*>(d_qg), static_cast<void*>(d_gamma),
+            static_cast<void*>(d_start), static_cast<void*>(d_out_new)})
+        CheckHip(hipFree(p), "hipFree");
+    }
     for (void* p : {static_cast<void*>(d_q), static_cast<void*>(d_gate),
                     static_cast<void*>(d_k), static_cast<void*>(d_v),
                     static_cast<void*>(d_mask), static_cast<void*>(d_out)})
