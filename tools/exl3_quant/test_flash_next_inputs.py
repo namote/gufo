@@ -75,6 +75,31 @@ class Inputs(unittest.TestCase):
         self.assertEqual(head["input_ids"]["shape"], [3906, 512])
 
 
+# Pinned files that later gufo commits edited (paths and host guard); their
+# receipt bytes are in the first import commit.
+EDITED = {"model_job.py", "mtp_calibration_job.py", "ngram_job.py", "prefix_replay_job.py",
+          "run_stage.py", "test_disk_boundary.py"}
+NOT_TRACKED = {"native/capture-gram.so"}  # built by build_capture_gram.py
+
+
+class Pinned(unittest.TestCase):
+    def test_receipt_pinned_files_are_production(self):
+        files = json.loads((FN / "PINNED-FILES.json").read_text())["files"]
+        self.assertGreaterEqual(len(files), 80)
+        for rel, entry in files.items():
+            if rel in NOT_TRACKED:
+                continue
+            path = FN / rel
+            self.assertTrue(path.is_file(), rel)
+            if rel not in EDITED:
+                self.assertEqual(sha256(path), entry["sha256"], rel)
+
+    def test_edited_set_is_current(self):
+        files = json.loads((FN / "PINNED-FILES.json").read_text())["files"]
+        for rel in EDITED:
+            self.assertNotEqual(sha256(FN / rel), files[rel]["sha256"], rel)
+
+
 class PathConfig(unittest.TestCase):
     def fresh(self, env: dict):
         for name in ("paths", "host_guard"):
@@ -103,11 +128,18 @@ class PathConfig(unittest.TestCase):
         self.assertEqual((paths.OUT, paths.RUNTIME, paths.SOURCE), (Path("/o"), Path("/r"), Path("/s")))
         self.assertEqual(guard.LOCK, Path("/x/ops/OWNER.lock"))
 
-    def test_production_drivers_have_no_ai_tools_imports(self):
-        for path in sorted(FN.glob("*.py")):
-            text = path.read_text()
-            self.assertNotIn("from test.experiments", text, path.name)
-            self.assertNotIn("import test.experiments", text, path.name)
+    def test_ai_tools_imports_only_in_verbatim_probes(self):
+        # Probe drivers that the receipts pin (directly or through a pinned test) stay
+        # byte-identical, so they keep their ai.tools imports; no driver of the
+        # production stages imports ai.tools.
+        verbatim = {"capture_probe_job.py", "capture_lean_job.py", "capture_static_job.py",
+                    "state_io_job.py", "model_job_lean_candidate.py", "model_job_static_candidate.py"}
+        pinned = json.loads((FN / "PINNED-FILES.json").read_text())["files"]
+        found = {p.name for p in FN.glob("*.py")
+                 if "from test.experiments" in p.read_text() or "import test.experiments" in p.read_text()}
+        self.assertEqual(found, verbatim)
+        for name in verbatim & pinned.keys():
+            self.assertEqual(sha256(FN / name), pinned[name]["sha256"], name)
 
     def tearDown(self):
         for name in ("paths", "host_guard"):

@@ -11,7 +11,7 @@ build-time dependency, not vendored code (see
 | --- | --- |
 | [`flash_next/`](flash_next/) | The c03 production path: job drivers, container stages, recipe, calibration inputs and builders, head recovery, ngram, MTP calibration, final assembly, and their converter-environment tests |
 | [`kyojin/`](kyojin/) | The Kyojin pin (`pin.py`, `fetch_kyojin.sh`, `build_kyojin.sh`), the recorded runtime metadata (`runtime/`), and one serving-only patch |
-| [`history/`](history/README.md) | Probes, diagnostics, abandoned candidates and validation scripts, kept as evidence |
+| [`history/`](history/README.md) | Probes, diagnostics, abandoned candidates and validation scripts that no production receipt pins, kept as evidence |
 | `run_convert.py`, `provenance.py`, `check_pack.py`, `check_fn_pack.py`, `c02_to_caldata.py`, `compare_qtensors.py`, `verify_hf_download.py` | Older gufo wrappers from the XQ/F3 work. None of them is on the c03 path |
 | `test_*.py` | Hosted CPU tests (`exl3_quant_tools_test`), standard library only |
 
@@ -23,6 +23,19 @@ into [`flash_next/paths.py`](flash_next/paths.py) and their GPU owner and quiet-
 checks into [`flash_next/host_guard.py`](flash_next/host_guard.py). Apart from the
 recorded calibration builder, the edited drivers no longer match FROZEN.json.
 Use `git show <first commit>:<path>` for the frozen bytes.
+
+[`flash_next/PINNED-FILES.json`](flash_next/PINNED-FILES.json) lists the 82
+task files that the production receipts pin by sha256:
+`model-job-c03/FROZEN.json`, the full MTP input and decoder contracts, the MTP
+CPU evidence, and `ngram-full/FROZEN.json`. The drivers re-hash them before
+running, so all of them stay in `flash_next/`. That includes probes the
+receipts pin, such as the capture-lean and capture-static screens and the MTP
+qualifiers, and the files those probes import. The hosted test checks that
+every pinned file is present and unchanged, except `native/capture-gram.so`
+and the drivers edited later (`model_job.py`, `mtp_calibration_job.py`,
+`ngram_job.py`, `prefix_replay_job.py`, `run_stage.py` and
+`test_disk_boundary.py`). Six of those pinned probe drivers still import the
+ai.tools `window` module, and they are kept byte-identical.
 
 ## Pinned converter
 
@@ -139,3 +152,14 @@ The plans behind these settings are archived:
 - The tool that wrote the source `VERIFY-SHA256.log` is not recorded.
 - How the pack was moved into `models/llm` is not recorded. The shards are
   hard links of the assembly output.
+- `convert_main.py` loads `/task/native/capture-gram.so`, and FROZEN.json pins
+  it, but it is a build product and is not tracked (`*.so` is ignored).
+  `build_capture_gram.py` compiles `capture_gram.hip` in the converter image
+  to `/output/capture-gram/gram.so`. Copy that file to
+  `flash_next/native/capture-gram.so` before a run, because `/task` is mounted
+  read-only.
+- The follow-up messages in `prefix_replay_job.py`, `mtp_calibration_boundary.py`
+  and the capture jobs still name the old ai.tools receipt paths and the
+  pre-archive plan path `plan/exl3/F3-CONVERSION-WATCH.md`. They are message
+  text only; the files they name are now under `_ai.tools/` and
+  `plan/exl3/archive/`.

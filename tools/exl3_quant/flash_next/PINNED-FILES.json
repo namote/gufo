@@ -1,0 +1,546 @@
+{
+ "about": "Task files that the c03 production receipts pin by sha256, relative to flash_next/. The receipts are under /home/m2on/projects/_ai.tools/tmp/test-results/flash-next-quant-20261104/. The hashes are of the first gufo import commit; later gufo edits change some files.",
+ "files": {
+  "b1-recipe.json": {
+   "sha256": "83bf62ada9550d0e50d9a913aecc6e4e2224eb567ecda72e08af301131b369c7",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "bank_pilot.py": {
+   "sha256": "ecad55ea56da2334927234363d2b236cf26b11d7b256c1643f2be1f92eb6b64a",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "c02-input-ids.safetensors": {
+   "sha256": "b1d6e42852f6d821d3fa3df906594e88a69855de9288de83abd9b8c9a86805d5",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "c03-input-ids.json": {
+   "sha256": "d4fc88ae217bc91c540f669999caa85db2e00593a2d3579cb5884ee18aeba1e5",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "c03-input-ids.safetensors": {
+   "sha256": "36c8eddb18c51c3b9788d73195aa72527d9b9d48f818b79a6f0ab251acfebf3d",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "capture-lean-contract.json": {
+   "sha256": "faead40732f48df0105fd3f6d999806b0bc865eed998b62e9de8338579b81ee2",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "capture-lt-contract.json": {
+   "sha256": "581efe93c3645da17c66bf62e6adf04772d2045e841bcc5346fb4a8590c799a0",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json",
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "capture-static-contract.json": {
+   "sha256": "a47f0a04adb74abec322e74798b6f9c11d6270652d79a89872f9ea7a268d44e6",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "capture_fast.py": {
+   "sha256": "fd33ce72eca6783a9bbff994333a2840588ccf3befddad8d10ae3216db56dc93",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json",
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "capture_foreach.py": {
+   "sha256": "6bac6f947ca2ec3bf3a17c5d82317dee5f435f8dc261521cc641ff127b83142a",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "capture_gram.hip": {
+   "sha256": "d0c77fc98de37f1adc8a1fae39a5aa9b52d5629ddbcbbf57f47e91b502774383",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "capture_lean_gram.py": {
+   "sha256": "5ebe757467104673130abe985c38383e678a4416dabaff59b7e17f4c85201284",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json",
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "capture_lean_job.py": {
+   "sha256": "5f99093c5adae4f7706ad9e2ad4c69d475680f64c7107794a133ef71b72caf85",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "capture_lean_moe.py": {
+   "sha256": "201fc50c789543c7bacbbfc2fe1b6473d167db7b5cb7f69de020153afe20d01e",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "capture_lean_probe.py": {
+   "sha256": "2de30de7d59c3729c53f27b851518aae566a3c73ee828017f2355c1a33e4c22b",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "capture_lean_runtime.py": {
+   "sha256": "676e75bbeed56b72bf77806e38520f080f5f7cb5b7395c61decb4998d0ae50d4",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "capture_lt.py": {
+   "sha256": "a24f0dada064f9f5566d787ee69e87093e2a108742966cec43571fd903332138",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json",
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "capture_lt_runtime.py": {
+   "sha256": "44b9b3294e1dc8ac4d4e3e9ee776846a6ef634e70739ffd44b0db4649adbb5da",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "capture_owner.py": {
+   "sha256": "e782cc2dd524e84587e1b4f8c8c48fc67ed4baa2d25249ad7c52112f7aa2f07a",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json",
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "capture_probe_job.py": {
+   "sha256": "552946c3b34392bd8c44ff08792a1ef6ab1849ecfca0e991d40d5f424805f970",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "capture_progress.py": {
+   "sha256": "1b38af668022055a485efb6298f305d3df52a0a9d9607d3d48623d673b9f2b32",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "capture_repeat_counts.py": {
+   "sha256": "3ab33ab6934aac4b91fe58667fa2eca97c6e6dba6e9cc6469a89cfbce41434ef",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json",
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "capture_speed_probe.py": {
+   "sha256": "b3210cf13a8dc96f2fb45ed5a85fd94a2d0332c08c4bd1bc7a3964da59477342",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "capture_static_boundary.py": {
+   "sha256": "0c628ec1db9004587b4167765dc27813cce1cdf1e05040b376d2334cf38b7e06",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "capture_static_job.py": {
+   "sha256": "cb7859d583535ff256556f6dad04f5886e2f345da91b69320a5edab0a94e4473",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "capture_static_moe.py": {
+   "sha256": "e17eaa0f0a9ea4e7cbb6428235b91be8dfcdecb18230c132f3a2fc01c326e969",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json",
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "capture_static_probe.py": {
+   "sha256": "171a69c2f61c1f0a911afa62c5b70594879e29d212ab9db2bafe31b0cbde578e",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "capture_static_runtime.py": {
+   "sha256": "5420555d75dbc88f3df8a7870773bc1dfdf342f1e20d7da4ba34a93c72237416",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json",
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "conversion-desktop-contract.json": {
+   "sha256": "f4a0660d3cf86ab820b866d28319525f799278fb7561849bdbda49de46c5fb3e",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json",
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "conversion_admission.py": {
+   "sha256": "f346eb2ae02c7bd28b44c104e4d8d95b52f80f851c2af2da88241e54e802c19f",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json",
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "convert_main.py": {
+   "sha256": "a944bd3e8237fe52d15b1683b59f018a5ca01a588cb67bb8cc75420462c1d574",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "disk_boundary.py": {
+   "sha256": "f7f7dfce561033c5c7c06f152ae57b398185cab46917fd70c19e9c86f1dd3231",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "disk_state.py": {
+   "sha256": "4d4e06c0c70023f1a03bfeb5c5ba90fcd312f4cfe419ba3856b2773f0812c228",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "disk_state_async.py": {
+   "sha256": "aa96a5a9640d66a62c7ff52b7956d55c4a81659a948a13f33586acf8e48b7db3",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "disk_state_large.py": {
+   "sha256": "a86a36e91e6748905a8f1329fc5de9d082ea6f272c5ff69c1613343cbee60542",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "finish_checkpoint.py": {
+   "sha256": "571d0b890b3bd1cc415b5cb9f192d6ccbed87698eb2ccdcb2ec5b85b8a3c09bb",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "long_row_pilot.py": {
+   "sha256": "cfc4dcf8e122b7db79c6e789e8828e5bd5d3c53be9bbb836a196850a2c0e6762",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "main-only-disk-contract.json": {
+   "sha256": "d137bd03010fb2e82ab9a3ba82873c8c7fc75c50fdd341b5ff6c72f3efdfb872",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "main_only_disk_boundary.py": {
+   "sha256": "8ef4ba2d104dfd1992a44ede8b8867cc57c9c08c28246a9287357d7b53552c35",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "model_job.py": {
+   "sha256": "cf14fc063c69f78a57d073daa579862a8d21fe94c2000611d9ac24371c833875",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "mtp_borrowed_rows.py": {
+   "sha256": "33d1901d9704d47202f714faa53ee83f8e0f111311ad72c3445bb0cf9abf1f6e",
+   "pinned_by": [
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "mtp_calibration_boundary.py": {
+   "sha256": "d401e7311196b1bfe238b57a8ac4fc0aa9978dffc6e541821d1978c834446e78",
+   "pinned_by": [
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "mtp_calibration_cache.py": {
+   "sha256": "b5a3c0a5f6bc85d4d69675c57ed22d49613d7eb08567cbec7e1c04e2aa496099",
+   "pinned_by": [
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "mtp_calibration_callback.py": {
+   "sha256": "e222f675005cafb96a4dc563ef1f5d7d3c53b4b956a83be36c783f357d6a5d8c",
+   "pinned_by": [
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "mtp_calibration_candidate.py": {
+   "sha256": "5b8c4dda0bf7d72d00a335981274d27bf016ef77e8a769953e456855267cb78a",
+   "pinned_by": [
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "mtp_calibration_contract.py": {
+   "sha256": "a56554f19831640ebf3629e71d915d86a2fe34373fe0cda6f87c6b7a97b820e0",
+   "pinned_by": [
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "mtp_calibration_gufo.py": {
+   "sha256": "f2f4b7a592bc3758c5f6187f017a7819b1ebc3a5bd236055d2392645980ec901",
+   "pinned_by": [
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "mtp_calibration_job.py": {
+   "sha256": "78c66d7f39f0a6f71d16b1aa014b186d25870196341b31a45056404311f8360d",
+   "pinned_by": [
+    "mtp-calibration-runner/CPU.json",
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "mtp_calibration_probe.py": {
+   "sha256": "0d13243555258a56820ba60f60deb60273b45bbcd9db13b3cf407fc8560392e1",
+   "pinned_by": [
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "mtp_calibration_staged_probe.py": {
+   "sha256": "0b9f3cda39265759cba4e16629742ad262adacded35ba8b68135bd0caa3da1a5",
+   "pinned_by": [
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "mtp_capture_identity.py": {
+   "sha256": "3bd4df6de08dcf8d6dbe6e19c73ac07d997aff322ae6265ed08a51d1fd0a2260",
+   "pinned_by": [
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "mtp_qualify_gram.py": {
+   "sha256": "7eaa8dd760b579f75418c47b055c8e0681f3eee3c5f55828641fe1357428d840",
+   "pinned_by": [
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "mtp_qualify_native.py": {
+   "sha256": "b58a8f84eac5475ee6e6b3fe95c9de0a185d43b5cad2138b93225895bef4b220",
+   "pinned_by": [
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "mtp_stage_disk_budget.py": {
+   "sha256": "0eff31441423db833e23a31f78c1558d6d39f0fa1a0a50472aed098d05d0f0cd",
+   "pinned_by": [
+    "mtp-calibration-runner/CPU.json",
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "native/capture-gram.so": {
+   "sha256": "cb88208ac228470aaca6c6d8ff65a761280000a48856c361ee723b4e692c1abf",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json",
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "native/mtp_gufo_probe.cpp": {
+   "sha256": "2c994c82f6b1ec606dd9869ac4fd782027cf74016a4d0de38d584168e98f192f",
+   "pinned_by": [
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "ngram_full.py": {
+   "sha256": "4487ca9fc202d3834dfa90afef92fe526adf3b3116c8196c0b4ed92eb4cceb45",
+   "pinned_by": [
+    "ngram-full/FROZEN.json"
+   ]
+  },
+  "ngram_job.py": {
+   "sha256": "3f38cbc7c445418c4c81ccdbe16427470d9c1b72460213a4f07cfb76e876054a",
+   "pinned_by": [
+    "ngram-full/FROZEN.json"
+   ]
+  },
+  "owned_cleanup.py": {
+   "sha256": "cdfabbe82663f55277551fc8a1f01159fd8ca3254e0f9d19e0dc98ee14da6aea",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json",
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "prefix_replay.py": {
+   "sha256": "3e085371a1e157771327922ec70e002480268d8a5e1acfeccbf7c07160ab73fc",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "prefix_replay_job.py": {
+   "sha256": "fa076f1e67c971b505c738bfe2ce49a94d8ea1fc8a2ff5cda3395e461d858de3",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "prefix_replay_run.py": {
+   "sha256": "260b82614a12415dcd970635821cb5f49bdd75b35fdd65478ca054d6dd028fa9",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "ragged_calibration.py": {
+   "sha256": "1fc39b4c87e11f66e76ee9501f2d087c531b877f1de3dc14871dfd1a8988e001",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "row_checkpoint.py": {
+   "sha256": "b9d68938355a961cac38bbf7f39417567c7b166f1092ddaceb17f053abecf824",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "run_stage.py": {
+   "sha256": "12c4bba422a8bc7d213b8e06fa4fbed6963f8738558a866797554d958ec8e41d",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json",
+    "ngram-full/FROZEN.json"
+   ]
+  },
+  "state_io_job.py": {
+   "sha256": "4c78584cd76b9d3978674bcff3c70a8e333ddfd13253297f6a8d7555a1780bf7",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "state_io_probe.py": {
+   "sha256": "d67df1b9b7bb58f7314f277f21acdffe5eb0047dc347e5d6fea935a18e0e743c",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "state_large_boundary.py": {
+   "sha256": "0a7cdfdd5312d299b9e1018cf5571ecdd3d3e40c02c0de38b2cba93ce1ce57f6",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "test_capture_lean.py": {
+   "sha256": "77cac9fd667f3827957df50e22050fb85167031c4d8a0bf254f03e4c33d6ff28",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "test_capture_lean_runtime.py": {
+   "sha256": "73f1ba2a82fcdf54ed35aa383180f85ff41e1cf97698bf26b31e938c0b59f48e",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "test_capture_static.py": {
+   "sha256": "3e7e7a5acff6bab9b78d24bf52bd4c550957c3941c5e3dd613a2eeee857f0d8a",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "test_capture_static_runtime.py": {
+   "sha256": "d76a60f74e3129f942014fdef98e1543b133b0d4c56cc2dbee9f78c8039aa82b",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "test_conversion_admission.py": {
+   "sha256": "09c4470458bec4123ecc0fa1d7f3f489c704d0b6a47ebffc7802989b0e54c580",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "test_disk_boundary.py": {
+   "sha256": "c52aa8b9da89acd92da35e1bdb27fff63d2bc665b8b60050b730e3cf1fbee034",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "test_disk_state_async.py": {
+   "sha256": "077029f580d689f95ac8b6abe5159829ae9de9c5cd96f4269e5ba6685fdf746b",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "test_main_only_disk_boundary.py": {
+   "sha256": "36643d7dbb4f821540174ec8e825845fcba3e47e1b591ac37d2c3f9e710e9188",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  },
+  "test_mtp_borrowed_rows.py": {
+   "sha256": "610a6c8a8770320c9c99c7b74f5334e19ae507246aacbd14aaecfbc63dbc37da",
+   "pinned_by": [
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "test_mtp_calibration_callback.py": {
+   "sha256": "9d31fd132aee0af20187e6f11e9d085686df397b0f1a3c47f6d4bbc88b92f373",
+   "pinned_by": [
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "test_mtp_calibration_job.py": {
+   "sha256": "b74e74449df8d00933e5fdba622ee8ddcd0e77f4c6f164a8d9414228bd254523",
+   "pinned_by": [
+    "mtp-calibration-runner/CPU.json",
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "test_mtp_capture_identity.py": {
+   "sha256": "960d7f13c891252480325f971bd5aed0f90515fbe2f7b5a4c374495d9117cbda",
+   "pinned_by": [
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "test_mtp_stage_disk_budget.py": {
+   "sha256": "aea27476fdce105101701f454fd0933a882d8e0177594d8f32b28d0d75db0a99",
+   "pinned_by": [
+    "mtp-calibration-runner/CPU.json",
+    "mtp-calibration-runner/contracts/full-input-001.json",
+    "mtp-calibration-runner/contracts/full-decoder-001.json"
+   ]
+  },
+  "test_state_large.py": {
+   "sha256": "2f5c35f463fc03e3b4438e01bc07bcbb2a7588920127182e9d7eaf9d2936f72a",
+   "pinned_by": [
+    "model-job-c03/FROZEN.json"
+   ]
+  }
+ }
+}

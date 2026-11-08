@@ -23,14 +23,22 @@ more, so do not expect them to run.
 
 | Files | Purpose |
 | --- | --- |
-| `flash_next/capture_*_probe.py`, `capture_*_job.py`, `capture_{chunk,forward*,foreach,inputs,subset,selected,pack,pipeline,time_guard,boundary,static_boundary,diagnostic*,lean_runtime,lean_moe,lt_runtime,lt_chunk,lt_ref_cpu,owner_audit}.py`, `capture_forward.hip`, `capture-*-contract.json` (forward-pair, lean), `integrate_capture_*.py`, `select_capture_quarter.py`, `prepare_quarter_holdout.py` | Calibration-capture speed and exactness probes that led to the `capture_fast`/`capture_lt`/`capture_static_*` code used in production |
-| `flash_next/convert_main_{io,large,lean,lt,owner,static}_candidate.py`, `model_job_{desktop,disk,io,large,lean,lt,owner,static,final}_candidate.py`, `runner_stagebudget_candidate.py` | Superseded drafts of `convert_main.py` and `model_job.py` (`model_job_final_candidate.py` is the pre-freeze copy of `model_job.py`) |
-| `flash_next/mtp_calibration_{probe,staged_probe,cpu,callback}.py`, `mtp_qualify_{native,gram}.py`, `mtp_gram_{continue,saved_cpu}.py`, `mtp_full_decoder_audit.py`, `native/mtp_gufo_probe.cpp` | MTP-calibration qualification probes |
-| `flash_next/state_io_*.py`, `state_large_boundary.py`, `check_*.py` (except `check_long_calibration.py`), `quant_stall_probe*.py`, `disk_boundary_reserve.py`, `hourly_watch.py`, `audit_long_sources.py` | Checkpoint, disk and stall diagnostics, the conversion watch, and the research audit of long calibration sources |
+| `flash_next/capture_*_probe.py` and `capture_*_job.py` (except the pinned ones listed below), `capture_{chunk,inputs,lt_chunk,lt_ref_cpu,owner_audit,pack,selected,subset,time_guard}.py`, `capture_forward.hip`, `capture-forward-pair-contract.json`, `integrate_capture_*.py`, `select_capture_quarter.py`, `prepare_quarter_holdout.py` | Calibration-capture speed and exactness probes that led to the `capture_fast`, `capture_lt` and `capture_static_*` code used in production |
+| `flash_next/convert_main_{io,large,lt,owner}_candidate.py`, `model_job_{desktop,disk,final,io,large,lt,owner}_candidate.py`, `runner_stagebudget_candidate.py` | Superseded drafts of `convert_main.py` and `model_job.py`. `model_job_final_candidate.py` is the pre-freeze copy of `model_job.py` |
+| `flash_next/mtp_calibration_cpu.py`, `mtp_gram_saved_cpu.py`, `mtp_full_decoder_audit.py` | MTP-calibration CPU checks and audits that no production receipt pins |
+| `flash_next/check_*.py`, `quant_stall_probe*.py`, `hourly_watch.py`, `audit_long_sources.py` | Checkpoint, disk and stall diagnostics, the conversion watch, and the research audit of long calibration sources |
 | `flash_next/final_*.py` | Post-conversion quality, smoke and throughput validation of the pack with a gufo build snapshot (results in `FINAL-QUALIFICATION.json`) |
 | `flash_next/test_*.py` | Tests of the files above |
 | `kyojin/kyojin_prepare.py`, `kyojin_update_build.py` | The earlier and v1.8.6 converter builds; [`../kyojin/build_kyojin.sh`](../kyojin/build_kyojin.sh) replaces them |
-| `kyojin/kyojin_local*.py`, `gufo_kyojin_*.py`, `kyojin_update_{check,http}.py` | Kyojin local-serving comparisons and update checks against the Kyojin pack (plan `F3-KYOJIN-LOCAL`, `F3-KYOJIN-SAME-PACK`) |
+| `kyojin/kyojin_local*.py`, `gufo_kyojin_*.py`, `kyojin_update_{check,http}.py` | Kyojin local-serving comparisons and update checks against the Kyojin pack (plans `F3-KYOJIN-LOCAL` and `F3-KYOJIN-SAME-PACK`) |
+
+Some probes stay in `../flash_next/` because the production receipts hash
+them: `model-job-c03/FROZEN.json`, the full MTP runs' contracts and CPU
+evidence, or a pinned test that reads them. The production drivers re-hash
+these files before every stage. They are listed in
+[`../flash_next/PINNED-FILES.json`](../flash_next/PINNED-FILES.json) and
+include the capture-lean and capture-static screens, `state_io_*`, and the
+MTP qualifiers and probes.
 
 The receipts for all of this are in
 `/home/m2on/projects/_ai.tools/tmp/test-results/flash-next-quant-20261104/`.
