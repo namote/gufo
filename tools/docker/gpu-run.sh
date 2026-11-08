@@ -19,7 +19,7 @@ esac; done
 OUT=$1; MODE=$2; shift 2
 case "$MODE" in env) RAW=() ;; raw) RAW=(--raw "$1"); shift ;; *) echo "mode must be env or raw" >&2; exit 2 ;; esac
 mkdir -p "$OUT"
-printf '%q ' "$@" > "$OUT/argv.txt"; echo >> "$OUT/argv.txt"
+printf '%q ' "$MODE" "${RAW[@]}" -- "$@" > "$OUT/argv.txt"; echo >> "$OUT/argv.txt"
 date +%s.%N > "$OUT/start"
 python3 -I "$ROOT/tools/docker/pinned_rocm101.py" run --gpu --build-dir "$DIR" --source "$ROOT" --source-readonly \
   "${M[@]}" "${RAW[@]}" -- "$@" > "$OUT/stdout.log" 2> "$OUT/stderr.log"

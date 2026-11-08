@@ -155,7 +155,8 @@ def main(argv: list[str] | None = None) -> int:
         for name in ("tmp", "cache"):
             Path("/build", name).mkdir(exist_ok=True)
         return subprocess.run(command, cwd="/build/source", env=env).returncode
-    a.build_dir.mkdir(parents=True, exist_ok=True)
+    if not a.print:
+        a.build_dir.mkdir(parents=True, exist_ok=True)
     full = docker_argv(a.build_dir.resolve(), a.source.resolve(), command, gpu=a.gpu,
                        source_readonly=a.source_readonly, mounts=tuple(parse_mount(m) for m in a.mount),
                        raw_entrypoint=a.raw)

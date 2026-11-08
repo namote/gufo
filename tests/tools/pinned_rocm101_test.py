@@ -67,6 +67,19 @@ class Test(unittest.TestCase):
         self.assertIn("type=bind,src=/m,dst=/models/fnx,readonly", argv)
         self.assertEqual(argv[-3:], ["/build/obj/gufo", p.IMAGE, "--version"])
 
+    def test_main_print_strips_separator_and_creates_nothing(self):
+        import contextlib, io, tempfile
+        with tempfile.TemporaryDirectory() as t:
+            build = Path(t) / "absent"
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = p.main(["run", "--build-dir", str(build), "--source", t, "--print", "--",
+                             "cmake", "--build", "/build/obj"])
+            self.assertEqual(rc, 0)
+            self.assertFalse(build.exists())
+            self.assertTrue(out.getvalue().rstrip().endswith(
+                p.SELF + " exec -- cmake --build /build/obj"), out.getvalue())
+
     def test_parse_mount(self):
         self.assertEqual(p.parse_mount("/a:/b:ro"), ("/a", "/b", True))
         self.assertEqual(p.parse_mount("/a:/b"), ("/a", "/b", False))
