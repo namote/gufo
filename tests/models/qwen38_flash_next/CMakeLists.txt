@@ -75,12 +75,14 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen38_flash_next_moe_glue_bench PRIVATE
     gufo_qwen38_flash_next)
 
-  # Prefill HC combine + W8A8 HC down (tools/bench); old vs new across builds.
+  # Prefill HC combine + W8A8 HC down against the frozen pre-B6 combine
+  # (tools/bench), compiled with the production library's HIP flags.
   add_executable(qwen38_flash_next_hc_prefill_bench EXCLUDE_FROM_ALL
     ${PROJECT_SOURCE_DIR}/tools/bench/flash_next_hc_prefill.hip)
   set_source_files_properties(
     ${PROJECT_SOURCE_DIR}/tools/bench/flash_next_hc_prefill.hip
-    PROPERTIES LANGUAGE HIP)
+    PROPERTIES LANGUAGE HIP
+    COMPILE_OPTIONS "-O3;-ffast-math;-fno-finite-math-only")
   target_link_libraries(qwen38_flash_next_hc_prefill_bench PRIVATE
     gufo_qwen38_flash_next)
 
