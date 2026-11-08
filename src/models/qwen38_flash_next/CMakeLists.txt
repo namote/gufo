@@ -87,14 +87,15 @@ if (ENGINE_ENABLE_HIP)
     ${QFN_RUNTIME_DIR}/executor_batch.cpp)
   set(QFN_HIP_SOURCES
     continuation_adapter.cpp
-    ${QFN_ROCM_DIR}/exl3_moe.hip
+    ${QFN_ROCM_DIR}/exl3_moe.hip.cpp
     ${QFN_KERNEL_SOURCES}
-    ${QFN_ROCM_DIR}/w8a8_wave64.hip
+    ${QFN_ROCM_DIR}/w8a8_wave64.hip.cpp
     ${QFN_RUNTIME_SOURCES}
     engine.cpp)
   target_sources(gufo_qwen38_flash_next PRIVATE ${QFN_HIP_SOURCES})
-  set_source_files_properties(${QFN_KERNEL_SOURCES} PROPERTIES LANGUAGE HIP)
-  set_source_files_properties(${QFN_ROCM_DIR}/w8a8_wave64.hip
+  set_source_files_properties(${QFN_KERNEL_SOURCES} ${QFN_ROCM_DIR}/exl3_moe.hip.cpp
+    ${QFN_ROCM_DIR}/w8a8_wave64.hip.cpp PROPERTIES LANGUAGE HIP)
+  set_source_files_properties(${QFN_ROCM_DIR}/w8a8_wave64.hip.cpp
     PROPERTIES COMPILE_OPTIONS "-mwavefrontsize64")
   target_compile_definitions(gufo_qwen38_flash_next PRIVATE QFN_ROCM_BUILD=1)
   target_compile_options(gufo_qwen38_flash_next PRIVATE

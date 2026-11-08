@@ -3,7 +3,8 @@
 The persistent Qwen3.8 Flash-Next server on the development host runs from
 `~/.local/share/gufo/`. That directory holds runtime state (server-state.json,
 logs/, caches, the boot-scoped admission manifests and the GPU owner lock). The
-code that drives it is tracked here:
+code that drives it is tracked here. **Start with `gufo-server.py`** (the
+`main()` actions at its end), then this README's Install section:
 
 | Path | Role |
 | --- | --- |

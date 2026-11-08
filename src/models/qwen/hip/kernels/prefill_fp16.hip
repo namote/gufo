@@ -1366,7 +1366,7 @@ void LaunchBucketTiles(const quant::exl3::DeviceLinear* device_bank,
     // Eight waves (8 x 1), each one 16-row strip over the 64 tokens and four
     // decoded tiles per stage: 7-12 % less time than 2 x 2 at Flash-Next's
     // 2560 -> 640 and 640 -> 2560 expert shapes, uniform and skewed routing
-    // (97-106 VGPRs, no scratch; tools/qwen38_flash_next/bench/exl3_x3_tiles_bench.hip),
+    // (97-106 VGPRs, no scratch; tools/qwen38_flash_next/bench/experiments/x3_tiles_bench.hip),
     // bit-identical (the same K order per output).
     args(HalfPrefillGemmKernel<128, 64, 8, 1, GgmlType::kQ8_0, kStore, false,
                                GgmlType::kQ8_0, Bits, Mode>,
@@ -1502,7 +1502,7 @@ void LaunchPlainF16PrefillGemm(const void* w, const void* x, float* y,
     return;
   // 128 weight rows x 64 tokens, eight waves: the fastest tile for the
   // Flash-Next HC projections (10240 -> 320: 0.76 ms, 320 -> 10240:
-  // 0.59 ms at 2,048 tokens; tools/qwen38_flash_next/bench/exl3_x3_tiles_bench.hip). Every
+  // 0.59 ms at 2,048 tokens; tools/qwen38_flash_next/bench/experiments/x3_tiles_bench.hip). Every
   // output is one WMMA chain in K order, whatever the tile or row count.
   using gufo::core::GgmlType;
   HalfPrefillGemmKernel<128, 64, 4, 2, GgmlType::kF16, HalfEpilogue::kStore>

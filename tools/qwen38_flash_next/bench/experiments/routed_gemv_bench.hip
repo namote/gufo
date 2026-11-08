@@ -1,12 +1,12 @@
 // Flash-Next routed decode GEMV (W3): RoutedGemv with tiles fetched four
-// ahead (exl3_moe.hip) against the former one-tile-per-iteration kernel
+// ahead (exl3_moe.hip.cpp) against the former one-tile-per-iteration kernel
 // (copied from git HEAD as RoutedGemvOld): bitwise equality and time, cold
 // expert banks (512 experts), 10 routed experts, 1..8 tokens.
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
-#include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hip"
+#include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hip.cpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {

@@ -3,7 +3,7 @@
 // prefill (Batching 0) and expert buckets (Batching 2). Every variant keeps
 // each output's K order, so values are identical; the bench checks that.
 //   hipcc -O3 -std=c++20 --offload-arch=gfx1151 -DENGINE_ENABLE_HIP=1 -I. \
-//     tools/qwen38_flash_next/bench/exl3_x3_tiles_bench.hip -o exl3_x3_tiles_bench
+//     tools/qwen38_flash_next/bench/experiments/x3_tiles_bench.hip -o exl3_x3_tiles_bench
 #include <algorithm>
 #include <cmath>
 #include <cstdio>

@@ -1,3 +1,5 @@
+#include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hpp"
+
 #include <algorithm>
 #include <stdexcept>
 #include <type_traits>
@@ -5,7 +7,6 @@
 #include "src/core/hip/detail/exl3_gemv.hpp"
 #include "src/core/quant/exl3/gemv.hpp"
 #include "src/models/qwen/hip/ops/prefill_fp16.hpp"
-#include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {

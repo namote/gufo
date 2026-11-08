@@ -37,7 +37,7 @@ outside Flash-Next); the budget was left unchanged.
 ## Flash-Next B7 prefill GEMM ceiling screen, November 8, 2026
 
 Bench `qwen38_flash_next_exl3_wmma_ceiling_bench`
-(`tools/qwen38_flash_next/bench/gfx1151_exl3_wmma_ceiling.hip`, commit `acc1898d`; decision
+(`tools/qwen38_flash_next/bench/exl3_wmma_ceiling_bench.hip`, commit `acc1898d`; decision
 note `plan/exl3/archive/B7-CEILING-RESULT.md`, `726de4c8`). Variants per c03 shape:
 a production launchers, a* faithful copy (within ±3% of a, EQUAL), b
 pre-decoded FP16 weights from global, c weights decoded once into LDS (no

@@ -5,7 +5,8 @@ reproducing the shipped Qwen3.8 Flash-Next **c03** pack at
 `/home/m2on/projects/models/llm/flash-next-exl3-gufo-c03`. The
 converter is Kyojin, an MIT-licensed ExLlamaV3 fork. It is a pinned external
 build-time dependency, not vendored code (see
-[THIRD_PARTY_NOTICES.md](../../THIRD_PARTY_NOTICES.md)).
+[THIRD_PARTY_NOTICES.md](../../THIRD_PARTY_NOTICES.md)). **Start with the
+"Production c03 pipeline" table below**; it names the file behind each stage.
 
 | Path | Contents |
 | --- | --- |

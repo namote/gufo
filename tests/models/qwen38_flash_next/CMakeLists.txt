@@ -38,15 +38,15 @@ target_link_libraries(qwen38_flash_next_reference_probe PRIVATE
 set_source_files_properties(reference_probe.cpp PROPERTIES COMPILE_OPTIONS "-O2")
 
 if (ENGINE_ENABLE_HIP)
-  add_executable(qwen38_flash_next_rq_logits EXCLUDE_FROM_ALL fn_rq_logits.cpp)
+  add_executable(qwen38_flash_next_rq_logits EXCLUDE_FROM_ALL rq_logits.cpp)
   target_link_libraries(qwen38_flash_next_rq_logits PRIVATE
     gufo_qwen38_flash_next hip::host)
 
   # Decode HC projection timing (tools/qwen38_flash_next/bench), on the production kernels.
   add_executable(qwen38_flash_next_hc_decode_bench EXCLUDE_FROM_ALL
-    ${QFN_BENCH_DIR}/flash_next_hc_decode.hip)
+    ${QFN_BENCH_DIR}/hc_decode_bench.hip)
   set_source_files_properties(
-    ${QFN_BENCH_DIR}/flash_next_hc_decode.hip
+    ${QFN_BENCH_DIR}/hc_decode_bench.hip
     PROPERTIES LANGUAGE HIP)
   target_link_libraries(qwen38_flash_next_hc_decode_bench PRIVATE
     gufo_qwen38_flash_next)
@@ -54,9 +54,9 @@ if (ENGINE_ENABLE_HIP)
   # Prefill MoE glue, plain-store kernel copies vs production (tools/qwen38_flash_next/bench).
   # The copies compile with the production library's HIP flags.
   add_executable(qwen38_flash_next_moe_glue_bench EXCLUDE_FROM_ALL
-    ${QFN_BENCH_DIR}/flash_next_moe_glue.hip)
+    ${QFN_BENCH_DIR}/moe_glue_bench.hip)
   set_source_files_properties(
-    ${QFN_BENCH_DIR}/flash_next_moe_glue.hip
+    ${QFN_BENCH_DIR}/moe_glue_bench.hip
     PROPERTIES LANGUAGE HIP
     COMPILE_OPTIONS "-O3;-ffast-math;-fno-finite-math-only")
   target_link_libraries(qwen38_flash_next_moe_glue_bench PRIVATE
@@ -65,9 +65,9 @@ if (ENGINE_ENABLE_HIP)
   # Prefill HC combine + W8A8 HC down against the frozen plain-store combine
   # (tools/qwen38_flash_next/bench), compiled with the production library's HIP flags.
   add_executable(qwen38_flash_next_hc_prefill_bench EXCLUDE_FROM_ALL
-    ${QFN_BENCH_DIR}/flash_next_hc_prefill.hip)
+    ${QFN_BENCH_DIR}/hc_prefill_bench.hip)
   set_source_files_properties(
-    ${QFN_BENCH_DIR}/flash_next_hc_prefill.hip
+    ${QFN_BENCH_DIR}/hc_prefill_bench.hip
     PROPERTIES LANGUAGE HIP
     COMPILE_OPTIONS "-O3;-ffast-math;-fno-finite-math-only")
   target_link_libraries(qwen38_flash_next_hc_prefill_bench PRIVATE
@@ -78,9 +78,9 @@ if (ENGINE_ENABLE_HIP)
   # specialized variants. No extra options: the kernel copies keep the
   # production prefill_fp16.hip flags, so their outputs compare bit for bit.
   add_executable(qwen38_flash_next_exl3_wmma_ceiling_bench EXCLUDE_FROM_ALL
-    ${QFN_BENCH_DIR}/gfx1151_exl3_wmma_ceiling.hip)
+    ${QFN_BENCH_DIR}/exl3_wmma_ceiling_bench.hip)
   set_source_files_properties(
-    ${QFN_BENCH_DIR}/gfx1151_exl3_wmma_ceiling.hip
+    ${QFN_BENCH_DIR}/exl3_wmma_ceiling_bench.hip
     PROPERTIES LANGUAGE HIP)
   target_link_libraries(qwen38_flash_next_exl3_wmma_ceiling_bench PRIVATE
     gufo_qwen38_flash_next)

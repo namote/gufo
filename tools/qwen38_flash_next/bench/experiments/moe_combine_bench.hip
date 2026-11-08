@@ -8,7 +8,7 @@
 #include <cstring>
 #include <vector>
 
-#include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hip"
+#include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hip.cpp"
 
 namespace fnr = gufo::models::qwen38_flash_next::rocm;
 namespace ex = gufo::quant::exl3;

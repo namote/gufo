@@ -1,6 +1,7 @@
 # Qwen3.8 Flash-Next tests
 
-Targets are declared in [CMakeLists.txt](CMakeLists.txt). Small operator
+**Start with the table below**, then [CMakeLists.txt](CMakeLists.txt), where every
+target is declared. Small operator
 checks build by default. Full-model tests, probes and benchmarks are
 `EXCLUDE_FROM_ALL` and are built by name. Benchmark sources live in
 [tools/qwen38_flash_next/bench/](../../../tools/qwen38_flash_next/README.md),

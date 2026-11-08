@@ -1,7 +1,8 @@
 # Quantized HIP kernels
 
 Adapted from `ggml-org/llama.cpp` at
-`5c0e9468378eba6bf3cc1989ff5d62fbbe4d9e3a` (MIT; see `LICENSE`).
+`5c0e9468378eba6bf3cc1989ff5d62fbbe4d9e3a` (MIT; see [licenses/llama.cpp.txt](../../../../../../licenses/llama.cpp.txt)
+and [THIRD_PARTY_NOTICES.md](../../../../../../THIRD_PARTY_NOTICES.md)).
 The upstream source directory is `ggml/src/ggml-cuda`; Gufo builds these
 sources with HIP for AMD Strix Halo (`gfx1151`).
 
@@ -13,7 +14,8 @@ pool without the ggml graph runtime. Gufo owns scheduling and HIP graphs.
 The kernels use native HIP runtime, hipBLAS and HIP numeric types. The
 upstream runtime aliases, NVIDIA capability dispatch and PTX branches have
 been removed; retained matrix fragments use AMD WMMA/MFMA. Headers use the
-`.hpp` suffix. Gufo owns scheduling and HIP graphs.
+`.hpp` suffix. `src/models/deepseek_v4_flash/kernels/rocm/mmq/` holds a
+separate copy of the same commit, adapted for that model.
 
 When importing an upstream fix, preserve the Gufo namespace, adapter and
 HIP-only dispatch, update the pin, and run the Flash-Next operator tests
