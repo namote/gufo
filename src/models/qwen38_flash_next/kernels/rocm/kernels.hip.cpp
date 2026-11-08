@@ -1064,7 +1064,19 @@ __global__ void HcCombineVec4Kernel(
                       r.w + b.w * ws};
       }
       if constexpr (!kDefer) {
-        *reinterpret_cast<float4*>(dst + e) = v[c];
+        if (std::is_same_v<XnT, float> && gridDim.x >= 512) {
+          // Wide FP32 prefill: a streaming store (one block per token). The
+          // residual (168 MB at 4,096 tokens) is next read after the mixer's
+          // two projections, long after it would have left the caches, and
+          // dirty lines would otherwise be written back under those
+          // projections' reads. Short chunks keep it cached.
+          using Float4Bits = float __attribute__((ext_vector_type(4)));
+          __builtin_nontemporal_store(
+              Float4Bits{v[c].x, v[c].y, v[c].z, v[c].w},
+              reinterpret_cast<Float4Bits*>(dst + e));
+        } else {
+          *reinterpret_cast<float4*>(dst + e) = v[c];
+        }
       }
       const float sq =
           v[c].x * v[c].x + v[c].y * v[c].y + v[c].z * v[c].z + v[c].w * v[c].w;
