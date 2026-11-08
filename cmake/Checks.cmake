@@ -57,14 +57,16 @@ if (WIN32)
   # Linux-only hosted suites: RLIMIT_FSIZE and fork()-based tests, the
   # dup2/mmap/socket fixture tests, the permission-fault disk-store cases,
   # the cache tests that fork or wrap libc symbols, and the 1,250-chunk
-  # per-file fsync stress in component_text_cache_test.
+  # per-file fsync stress in component_text_cache_test, and the Flash-Next
+  # serving supervisor (fcntl, /sys paths).
   set(gufo_pr_linux_only
     gguf_reader_test gguf_identity_test platform_publish_test
     platform_prefault_test trace_test http_server_signals_test
     http_server_test audio_websocket_test continuation_disk_store_test
     component_text_cache_test eval_http_client_test cache_disk_faults_test
     cache_boundary_test cache_adapter_test cache_slot_test cache_disk_test
-    cache_streaming_test cache_tiered_test cache_disk_publication_test)
+    cache_streaming_test cache_tiered_test cache_disk_publication_test
+    flash_next_serving_test)
   list(REMOVE_ITEM gufo_pr_targets ${gufo_pr_linux_only})
   list(REMOVE_ITEM gufo_pr_tests ${gufo_pr_linux_only})
 endif()

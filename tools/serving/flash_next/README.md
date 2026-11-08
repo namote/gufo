@@ -15,13 +15,14 @@ code that drives it is tracked here:
 | `ops/fence.py`, `ops/fence_read.py` | GFX ring fence readings from DRM debugfs (root-run reader) and their pending-interval lower bound |
 | `ops/journal.py` | Kernel journal delta since the server started; GPU errors are recorded |
 | `install.py` | Installs a committed revision into `~/.local/share/gufo/` |
-| `test_serving.py`, `fixtures/` | Hosted CPU tests (`flash_next_serving_test`) with fence and admission fixtures recorded on 2026-11-08 |
+| `test_serving.py`, `fixtures/` | Hosted CPU tests (`flash_next_serving_test`, Linux only): fence readings and admission identities recorded on 2026-11-08 |
 
 The files were copied from the retired ai.tools tree (2026-11-08) and
 reformatted here. Every file's Python AST equals the copy that was live then,
 so behaviour is unchanged. They use the standard library only, and nothing
-imports or runs ai.tools code. Root-run scripts are executed as
-`sudo -n /usr/bin/python3 -I <path>` from the installed `ops/`.
+imports or runs ai.tools code. Root-run scripts are executed from the
+installed `ops/` as `sudo -n /usr/bin/python3 -I <path>` (the fence reader
+under `sudo -n /usr/bin/timeout … /usr/bin/python3 -I`).
 
 ## The `llm` command
 
@@ -56,10 +57,14 @@ records the commit and the sha256 of each file in
 `~/.local/share/gufo/INSTALLED.json`. It never touches `ops/OWNER.lock`,
 `ops/DESKTOP-*.json`, state, logs or caches.
 
-A running supervisor keeps the code it loaded at start, so restart it
-(`llm stop`, then `llm start`) to use a new install. The root-run readers are
-started afresh for each reading, so the next reading after an install already
-uses the new copy.
+Install with the server stopped (`llm stop`, install, `llm start`). A running
+supervisor keeps the Python code it loaded at start but starts the root-run
+readers from disk for each reading, so a live install mixes old and new code.
+The installer therefore refuses while a supervisor runs, unless
+`--allow-running` is given, which is safe only when the readers behave as
+before. It holds `~/.local/share/gufo/gufo-control.lock`, the lock `llm start`
+and `llm stop` take, while it writes. Nothing is backed up or written when no
+file changes.
 
 ## Rollback
 

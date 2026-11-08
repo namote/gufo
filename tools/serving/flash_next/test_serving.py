@@ -1,12 +1,17 @@
 """CPU tests of the pure parts of the Flash-Next serving supervisor (standard library only).
 
-Fixtures were recorded from the live server on 2026-11-08: two GFX fence
-readings (fixtures/fence-samples.json) and one desktop client and one display
-infrastructure identity from the boot's admission manifest
-(fixtures/admission-manifest.json, fixtures/host-sample.json).
+Fixtures from the live server on 2026-11-08: two recorded GFX fence readings
+(fixtures/fence-samples.json) and the boot's admission manifest reduced to one
+desktop client and one display infrastructure identity
+(fixtures/admission-manifest.json). fixtures/host-sample.json places those
+recorded identities on GPU file descriptors, plus one made-up process, to cover
+each classification. Linux only (fcntl, /sys paths).
 """
+import contextlib
 import copy
 import importlib.util
+import io
+import os
 import json
 from pathlib import Path
 import subprocess
@@ -18,7 +23,9 @@ HERE = Path(__file__).resolve().parent
 FIXTURES = HERE / 'fixtures'
 sys.path.insert(0, str(HERE))
 
-from ops import admission, desktop, fence, fence_read, journal  # noqa: E402
+if os.name == 'posix':
+    from ops import admission, desktop, fence, fence_read, journal  # noqa: E402
+POSIX = unittest.skipUnless(os.name == 'posix', 'the supervisor is Linux only')
 
 
 def load(name):
@@ -32,6 +39,7 @@ def load_server():
     return module
 
 
+@POSIX
 class FenceTest(unittest.TestCase):
     def test_parse_recorded_gfx_ring(self):
         ring = fence.parse(load('fence-samples.json')[0]['raw'])
@@ -83,6 +91,7 @@ class FenceTest(unittest.TestCase):
             fence_read.validate_path(ok, 'c6:00.0')
 
 
+@POSIX
 class HostClassificationTest(unittest.TestCase):
     def test_recorded_identities(self):
         host = desktop.classify(load('host-sample.json'), load('admission-manifest.json'))
@@ -110,6 +119,7 @@ class HostClassificationTest(unittest.TestCase):
             admission.classify(host, load('admission-manifest.json'))
 
 
+@POSIX
 class JournalTest(unittest.TestCase):
     def test_delta_flags_gpu_errors_and_keeps_raw(self):
         rows = [json.dumps({'MESSAGE': 'usb 1-1: new device'}),
@@ -126,6 +136,7 @@ class JournalTest(unittest.TestCase):
             self.assertIn('ring gfx timeout', Path(result['path']).read_text())
 
 
+@POSIX
 class ServerTest(unittest.TestCase):
     def test_disk_admission(self):
         server = load_server()
@@ -147,7 +158,12 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(argv[-1], '--log-progress')
 
 
+@POSIX
 class InstallTest(unittest.TestCase):
+    def run_install(self, install, args):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return install.main(args)
+
     def test_install_backup_and_check(self):
         install = importlib.import_module('install')
         with tempfile.TemporaryDirectory() as d:
@@ -158,9 +174,9 @@ class InstallTest(unittest.TestCase):
             (dest / 'ops' / 'OWNER.lock').write_text('')
             (dest / 'ops' / 'DESKTOP-BASELINE.json').write_text('{"keep": true}\n')
             args = ['--from-dir', str(HERE), '--dest', str(dest), '--backup-root', str(backups)]
-            self.assertEqual(install.main(args + ['--dry-run']), 0)
+            self.assertEqual(self.run_install(install, args + ['--dry-run']), 0)
             self.assertEqual((dest / 'gufo-server.py').read_text(), 'old = 1\n')
-            self.assertEqual(install.main(args), 0)
+            self.assertEqual(self.run_install(install, args), 0)
             for name in install.FILES:
                 self.assertEqual((dest / name).read_bytes(), (HERE / name).read_bytes(), name)
             self.assertEqual((dest / 'ops' / 'DESKTOP-BASELINE.json').read_text(), '{"keep": true}\n')
@@ -168,9 +184,31 @@ class InstallTest(unittest.TestCase):
             record = json.loads((dest / 'INSTALLED.json').read_text())
             self.assertEqual(Path(record['backup'], 'gufo-server.py').read_text(), 'old = 1\n')
             self.assertIn(Path(record['backup']).name, (backups / 'README.md').read_text())
-            self.assertEqual(install.main(['--check', '--dest', str(dest)]), 0)
+            self.assertEqual(self.run_install(install, ['--check', '--dest', str(dest)]), 0)
+            # A second install of the same files changes nothing and backs up nothing.
+            self.assertEqual(self.run_install(install, args), 0)
+            self.assertEqual(len([p for p in backups.iterdir() if p.is_dir()]), 1)
             (dest / 'ops' / 'fence.py').write_text('changed = True\n')
-            self.assertEqual(install.main(['--check', '--dest', str(dest)]), 1)
+            self.assertEqual(self.run_install(install, ['--check', '--dest', str(dest)]), 1)
+            self.assertEqual(self.run_install(install, ['--check', '--dest', d]), 2)  # no record there
+
+    def test_refuses_while_a_supervisor_runs(self):
+        install = importlib.import_module('install')
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d, 'gufo')
+            dest.mkdir()
+            fake = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)',
+                                     str(dest / 'gufo-server.py'), '_supervise'])
+            try:
+                (dest / 'server-state.json').write_text(json.dumps({'pid': fake.pid}))
+                args = ['--from-dir', str(HERE), '--dest', str(dest), '--backup-root', d]
+                self.assertEqual(self.run_install(install, args), 3)
+                self.assertFalse((dest / 'gufo-server.py').exists())
+                self.assertEqual(self.run_install(install, args + ['--allow-running']), 0)
+                self.assertTrue((dest / 'gufo-server.py').exists())
+            finally:
+                fake.kill()
+                fake.wait()
 
 
 if __name__ == '__main__':
