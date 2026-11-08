@@ -24,6 +24,7 @@ set_tests_properties(qwen38_flash_next.exl3_loader PROPERTIES LABELS "cpu;qwen38
 add_dependencies(qwen38_flash_next_tests qwen38_flash_next_exl3_loader_test)
 
 add_qwen38_flash_next_test(config gufo_qwen38_flash_next "cpu")
+add_qwen38_flash_next_test(prefill_side_stream gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(continuation_layout gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(ngram gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(native gufo_qwen38_flash_next "cpu;exl3")
