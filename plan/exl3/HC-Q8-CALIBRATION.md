@@ -9,7 +9,7 @@ and restored with exactly the same command/settings.
 
 - Implementation: [`tools/exl3_quant/hc/`](../../tools/exl3_quant/hc/README.md).
   BF16-source generator, five-way comparison and bounded B10 capture.
-  All200 tensors generated in `build/exl3-hc/all-finish-001`; final loader/quality/performance qualification is in progress.
+  All200 tensors generated, qualified and installed. Evidence: `build/exl3-hc/deployment-001`; server ready with actual sidecar mapping.
 - Original BF16 snapshot:
   `/run/media/m2on/T5 EVO/AI/model/originals-flash-next-hf-20261030/Qwen-Qwen3.8-Flash-Next`.
 - Target: `/home/m2on/projects/models/llm/flash-next-exl3-gufo-c03`.
@@ -29,7 +29,7 @@ and restored with exactly the same command/settings.
   attention HC only, with no GPU validation. Do not use it as the B10 collector.
   Its patch/build recipe and identities are retained in the backup; its object
   cache is not a required input and is not migrated into the active tool.
-- Current service is B10 `9eb3cbdb`, installed supervisor `d01fd32a`; refer to
+- Current service is B10 plus HC loader ELF166953f07227…, supervisor284b2378; refer to
   [HANDOFF](HANDOFF.md) and inspect current status again before a GPU window.
 - Historical B10 collector001 is CPU-built at `build/exl3-hc/capture-b10-001`.
   ELF SHA `53572ac57b10bbcd7db49eff5996479aeec77e55fa12a568d9cf9b5db659a6f0`;
@@ -41,7 +41,7 @@ and restored with exactly the same command/settings.
   INPUTS.json retains full original row hashes, selected byte hashes and the
   sampled64/stride32 lexical-overlap screen. This is not a 25% replacement.
 
-## Next execution steps
+## Completed execution protocol
 
 1. Migration CPU checks and second-reviewer review completed. Preserve arithmetic
    and reusable evidence; use Gufo's shared pinned environment and host guard.
@@ -61,7 +61,8 @@ and restored with exactly the same command/settings.
    connected down→SiLU→up after changing down weights.
 7. Final loader integration is separate. Batch decode KLD, native packing,
    connected HC, prefill and MTP tokens/s/acceptance checks. Reuse only matching
-   saved baselines. No automatic pack overwrite or service deployment.
+   saved baselines. The user subsequently approved all200 model installation;
+   deploy only the qualified sidecar/runtime, preserving original weights.
 
 ## Comparison contract
 
@@ -190,3 +191,14 @@ manifest35e650b07f72…, packd3a3c0c2d987…, runtime166953f07227….
 Keep original model tensors and frozen generation receipts. Installation adds
 only `hc_q8/` plus `hc_q8.json`; qualification receipts are separate so the
 validated root-manifest SHA stays unchanged.
+
+## Installed and ready
+
+Deployment complete: source/controller284b2378, production ELF166953f07227…,
+HC rootmanifest35e650b07f72…/packd3a3c0c2d987…. Installed files match their receipt;
+actual server executable SHA and mapped `hc_q8/model.safetensors` verified.
+Live default HTTP response to17+25 is42. Same C2/262144/FP16KV/MTP7/medium/temp0.9
+configuration;0.0.0.0:18740 ready,28.2GiB available at verification. Original EXL3
+weights and old runtime remain intact; model now includes a664MiB HC sidecar.
+Immutable generation manifest retains its original pending marker; the separate
+`hc_q8/QUALIFICATION.json` and deployment STATE record completed qualification.

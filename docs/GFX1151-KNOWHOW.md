@@ -2963,38 +2963,51 @@ GPU cases cleaned up with no new kernel error and the owned server restored
 ready, same configuration. No new capture, quantization or baseline rerun is
 needed to continue native/connected checks of these saved candidates.
 
-### All200 HC BF16-source calibration, November 8, 2026
+### All 200 HC matrices calibrated from BF16, November 8, 2026
 
-User authorized bounded data for all100 HC sites (main97/MTP3), then qualified
-model installation. `build/exl3-hc/all-run-002` captures each site's own1024
-calibration/873 held-out scalar rows, actual teacher-forced MTP inputs included.
-Capture-on/off main/full-vocab/MTP-head byte hashes exact;106.13s full capture.
-GPU FP64 sequential GPTQ feedback matches saved CPU packed bytes (both real
-projections), as do up code/scale refinement and independent analytic cases.
-Real down11.47s vs CPU170.61s; up0.14s/refinement1.58s excludes statistics and IO.
-`all-finish-001` reused capture and first-site artifacts; all200 generation1735.58s.
-Saved full H is retained. Nix10.1 HIP library with Torch2.9.1/ROCm7.2.4 uses
-explicit pinned glibc loader; initial pre-GPU TLS failure preserved, not a pass.
+The user authorized bounded data for all 100 HC sites (97 main and 3 MTP),
+followed by model installation after qualification. `build/exl3-hc/all-run-002`
+captured each site's own 1,024 calibration and 873 held-out scalar rows,
+including teacher-forced MTP inputs. Capture-on/off main and MTP-head hashes
+match exactly. Full collection took 106.13 seconds.
 
-Mean per-site held-out output-SSE ratios to legacy F16 RTN: downGPTQ0.873418
-(max1.406591,19/100 worse); upGPTQ0.294740 and up+code/scale0.248478 (100/100
-improved for either up variant). These are isolated projections, not model KLD.
-Production sidecar preserves the original F16 down prefill route and Q8 layout;
-strict200-entry payload/target hashes fail closed. Root `hc_q8.json` participates
-in artifact identity to prevent old conversation-cache reuse. Final loader,
-BF16/B10 quality and inference throughput are separate qualification gates.
+GPU FP64 sequential GPTQ feedback and up refinement match saved CPU packed
+bytes on real projections and independent analytic cases. The real down
+projection took 11.47 seconds versus 170.61 on CPU; up took 0.14 seconds and
+its refinement 1.58 seconds. These exclude statistics and IO. `all-finish-001`
+reused collection and first-site artifacts; all 200 generation took 1,735.58
+seconds. Full H is retained. The Nix 10.1 HIP library runs with Torch 2.9.1 /
+ROCm 7.2.4 using the explicit pinned glibc loader. The initial pre-GPU TLS
+failure is retained as failed evidence, not a pass.
 
-FinalHC prefill32760: savedB10 KL.041926397→GPTQ.039935247 (−4.75%),
-targetNLL2.159508469→2.164491218 (slightly worse); pairedKL window95%CI
-[−.00406314,−.00027220]. Uprefinement loses toplainGPTQ overall despite better
-isolated-HC SSE. Boundedscalar1024: KL.048803884→.044060911 (−9.72%point
-estimate; pairedwindowCI crosses0), targetNLLdifference+.00024244.
-`quality-loader-001`/`decode-quality-001` reuse storedBF16/B10; the latter adds
-only the previously missing smallscalarcontrol. No repeatedteacher/fullbaseline.
+Mean per-site held-out SSE ratios to legacy F16 RTN: down GPTQ 0.873418
+(maximum 1.406591, 19/100 worse); up GPTQ 0.294740 and refined up 0.248478
+(all 100 improved). These isolated projections do not establish model quality.
+The strict loader validates all 200 original/packed hashes and Q8 payloads,
+retains F16 down for prefill paths that use it, and includes root `hc_q8.json`
+in artifact identity to prevent incompatible conversation-cache reuse.
 
-`runtime-qualification-001`: PP2048/8192 1522.02/1554.38, ARd0/d32K32.78/32.44,
-MTP65.69/104.39 tok/s vs savedB10 means1516.34/1549.30,32.87/32.56,67.91/104.69.
-AR/MTP greedycandidate hashesexact. ShallowMTP−3.27% accompanies changedtarget
-output and90/114draftacceptance vs91/111, cycles38vs36; depth32K islookup-heavy.
-This retainsQ8inference kernels, improvesmeasuredBF16fidelity, anddoesnotclaim
-universalquality/perplexity improvement or afasterinference kernel.
+Final prefill at 32,760 positions: saved B10 KL 0.041926397 → GPTQ 0.039935247
+(−4.75%), target NLL 2.159508469 → 2.164491218 (slightly worse). Paired KL
+window 95% CI is [−0.00406314, −0.00027220]. Up refinement loses to plain GPTQ
+on overall metrics despite lower isolated projection error. Bounded scalar
+1,024-position KL is 0.048803884 → 0.044060911 (−9.72% point estimate, CI
+crosses zero), with target-NLL difference +0.00024244. `quality-loader-001`
+and `decode-quality-001` reuse the saved BF16 teacher and B10 prefill control;
+only the previously unavailable small scalar control was added.
+
+`runtime-qualification-001`: PP2048/8192 1522.02/1554.38, AR d0/d32K
+32.78/32.44, MTP 65.69/104.39 tok/s. Saved B10 means are 1516.34/1549.30,
+32.87/32.56, 67.91/104.69. Candidate AR/MTP greedy hashes match. Shallow MTP
+is 3.27% slower on changed target text, with 38 versus 36 cycles and neural
+MTP acceptance 89/113 versus 91/111. Deep 111/111 total acceptance includes
+101/101 lookup proposals, leaving neural MTP 10/10. It is lookup-heavy,
+not general generation speed. No inference-kernel speedup is claimed.
+
+Logical C2 (physical width 1), 511-token RAM replay, counting with accepted
+drafts, red/blue vision, cleanup and service restoration pass. All 200 GPTQ
+matrices and the strict loader are installed at controller revision 284b2378,
+ELF 166953f07227…. Actual sidecar mapping, live answer 42, readiness and
+unchanged settings are verified with 28.2 GiB available. The deployment
+receipt is `build/exl3-hc/deployment-001`. Improved measured BF16 fidelity
+does not imply uniformly better perplexity or task accuracy.

@@ -1,8 +1,32 @@
-# EXL3 / Flash-Next handoff (updated 2026-11-08; B10 runtime deployed)
+# EXL3 / Flash-Next handoff (updated 2026-11-08; all200 HC Q8 deployed)
 
-## Active default: c03 Gufo B10 runtime, 2026-11-08
+## Active default: c03 + calibrated HC Q8, 2026-11-08
 
-The service runs `9eb3cbdb` (B9 structure split `b56b9f54` plus the GDN k.q
+All200 HC matrices (main194/MTP6) are loaded from original-BF16-source GPTQ
+sidecar `~/projects/models/llm/flash-next-exl3-gufo-c03/hc_q8/`, bound by immutable
+root `hc_q8.json` SHA35e650b07f72…. Original model weights are unchanged.
+Runtime `~/.local/share/gufo/runtime-hc-20261108/gufo` SHA166953f07227… is the
+qualified B10 compute path plus strict sidecar loading/cache identity. Supervisor
+installed from284b2378. Ready/live response42 and actual mapped sidecar/ELF
+verified in `build/exl3-hc/deployment-001/STATE.json`; about28.2GiB available.
+
+C2/native262144, two-context FP16 KV pool14,408,908,800bytes, MTP7,
+medium thinking, temperature0.9/topk20/topp0.95 and0.0.0.0:18740 remain unchanged.
+No time/output caps. Old-weight conversation caches have a distinct identity.
+Full-body calibration remains2M; HC uses1024 bounded rows/site, separately held
+873 rows. Prefill KL−4.75%, bounded scalar KL−9.72%point (CI includes0);
+NLL mixed. PP/AR/deepMTP within0.4%, shallowMTP−3.27% on changed text/acceptance.
+Logical C2/RAMcache/vision/MTP smoke passed; physical C2 batching not claimed.
+[Detailed protocol and limits](HC-Q8-CALIBRATION.md).
+
+Rollback: stop `llm`, move both model `hc_q8/` and `hc_q8.json` aside (preserve
+artifacts), install the previous serving revision `d01fd32a008ff81f7d60bbb6ddcd4b841ca1bc8e` with
+`tools/serving/flash_next/install.py`, then `llm start`. The previous B10 binary
+remains in `~/.local/share/gufo/runtime-b9-20261108/`. Do not edit a live model.
+
+## Previous default: c03 Gufo B10 runtime, 2026-11-08
+
+The previous service ran `9eb3cbdb` (B9 structure split `b56b9f54` plus the GDN k.q
 order fix; sha256 `1d35af4f…`, 129,058,712 B, build `build/b1`
 RelWithDebInfo gfx1151, pinned Nix ROCm 10.1) from
 `~/.local/share/gufo/runtime-b9-20261108/` (`RUNTIME.json`), driven by the
@@ -23,10 +47,6 @@ Rollback: the B5 runtime (`31cee0b6`) is in
 
 ## Open
 
-- HC Q8 calibration: all200 matrices generated from BF16, production sidecar
-  loader and cache identity built; final quality/decode/throughput validation
-  active. See [HC-Q8-CALIBRATION.md](HC-Q8-CALIBRATION.md). Reuse saved captures,
-  H and baselines; do not start another GPU job or assume this is deployed yet.
 
 - Session test `CheckBatchedSessions` / `CheckLookupBatch`: serial and
   batched decode leave different snapshot bytes (7–23,822 bytes, all in the
