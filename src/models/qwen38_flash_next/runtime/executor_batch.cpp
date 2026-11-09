@@ -355,8 +355,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
         // scratch; separate EXL3 K/V already use RowScratch's strides.
         view.qg = base.qg + std::size_t{offsets[i]} * 2 * c.AttentionKvDim();
         UseScratch(view);
-        if (!StoreMtpKv(l, session, n, l.attn_qkv.empty() ? yarn_ : YarnRope{},
-                        error))
+        if (!StoreMtpKv(l, session, n, yarn_, error))
           return false;
         StoreRows(base.ik + std::size_t{offsets[i]} * c.indexer_head_dim,
                   session.mtp_.index_k, n, c.indexer_head_dim,
@@ -364,13 +363,13 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
         if (session.mtp_.position + n > c.indexer_top_k) {
           const auto pool = (session.mtp_.position + n) / c.compress_ratio -
                             session.mtp_.blocks;
-          PoolIndexerBlocks(
-              session.mtp_.index_k, l.indexer_k_norm.f32(),
-              session.mtp_.block_k, &session.control_->mtp_blocks,
-              &session.control_->mtp_position, n, pool, c.compress_ratio,
-              c.indexer_head_dim, c.rotary_dim, c.rope_theta, c.rms_eps,
-              capacity, stream_, session.vision_input_.rope(),
-              l.attn_qkv.empty() ? yarn_ : YarnRope{}, session.mtp_.kv_blocks);
+          PoolIndexerBlocks(session.mtp_.index_k, l.indexer_k_norm.f32(),
+                            session.mtp_.block_k, &session.control_->mtp_blocks,
+                            &session.control_->mtp_position, n, pool,
+                            c.compress_ratio, c.indexer_head_dim, c.rotary_dim,
+                            c.rope_theta, c.rms_eps, capacity, stream_,
+                            session.vision_input_.rope(), yarn_,
+                            session.mtp_.kv_blocks);
         }
       }
       return true;
