@@ -13,6 +13,7 @@
 | [exl3/B-SERIES-SUMMARY.md](exl3/B-SERIES-SUMMARY.md) | Flash-Next B1–B10 최적화·정리·GPU 패스 묶음 색인(브리프와 GPU 패스 링크) |
 | [exl3/HC-Q8-CALIBRATION.md](exl3/HC-Q8-CALIBRATION.md) | BF16 원본 기반 HC Q8 보정 및 코드·스케일 반복 보정 비교. 변환 도구로 이관, GPU 수집·실제 품질 검증 준비 중 |
 | [upstream-sync/PLAN.md](upstream-sync/PLAN.md) | upstream gufo(v0.31.0)·Kyojin main에서 가져올 수정·기능·성능 항목 U1–U5. 전체 merge 대신 골라 가져오기 |
+| [upstream-sync/CLEANUP.md](upstream-sync/CLEANUP.md) | 기존 runtime 정적 감사에서 나온 작은 문제 C1–C7 정리 계획 (batched MTP draft 경로, staging 옵션 제거, cache identity 등) |
 
 ## Archive (끝났거나 접은 계획)
 
