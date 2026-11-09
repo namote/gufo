@@ -747,7 +747,6 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
     return Err(400, "Bad Request", error->message.c_str(),
                "invalid_request_error", error->code.c_str());
   }
-  WarnUnsupportedTypicalAcceptance(body, backend);
   return std::nullopt;
 }
 
@@ -869,6 +868,7 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
   }
   if (const auto error = ParseLogprobs(body, false, &sampling_config))
     return InvalidCompatibilityRequest(error->message);
+  WarnUnsupportedTypicalAcceptance(RequestsTypicalAcceptance(body), b);
   const auto* stream_field = body.find("stream");
   const bool stream = stream_field != nullptr && stream_field->as_bool();
   bool include_usage = false;
@@ -1160,6 +1160,7 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
   if (auto error =
           ReadOpenAiResponseChat(body, b, &chat, &max_tokens, &sampling_config))
     return std::move(*error);
+  WarnUnsupportedTypicalAcceptance(RequestsTypicalAcceptance(body), b);
   chat.client_id = req.client_id;
   return CreateOpenAiResponse(
       req, b, chat, max_tokens, sampling_config,
@@ -1332,6 +1333,7 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
   if (auto error =
           ReadAnthropicChat(body, b, &chat, &max_tokens, &sampling_config))
     return std::move(*error);
+  WarnUnsupportedTypicalAcceptance(RequestsTypicalAcceptance(body), b);
   chat.client_id = req.client_id;
   return CreateAnthropicMessage(
       req, b, chat, max_tokens, sampling_config,
@@ -1435,6 +1437,7 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
           b.reasoning_defaults().enabled, {.stop_field = "stop"})) {
     return std::move(*error);
   }
+  WarnUnsupportedTypicalAcceptance(RequestsTypicalAcceptance(body), b);
 
   const auto* input = body.find("prompt");
   if (input == nullptr || !input->is_string() || input->str().empty()) {

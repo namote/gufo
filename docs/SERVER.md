@@ -980,7 +980,8 @@ answers unchanged and slightly longer, slightly more repetitive text. Request
 `typical_acceptance: false` (a boolean; `null` inherits) or start the server
 with `--typical-acceptance off` for the exact rule. Greedy requests never
 reach it; other models and Flash-Next without MTP ignore it, and only an
-explicit request or option asking for it on them logs a warning.
+explicit generating request (once per process) or option asking for it on
+them logs a warning. Traces record the applied value, as `/props` does.
 
 Tool calls are emitted only for declared functions when `tool_choice` allows
 calling tools. With `auto`, ordinary text and reasoning remain allowed; once a

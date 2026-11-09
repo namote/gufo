@@ -3308,6 +3308,15 @@ struct InferenceBackend::Impl {
     ReasoningOptions reasoning_defaults;
     std::string model_path;
     std::string build_info;
+
+    /// The sampling the runner applies: typical acceptance stays on only
+    /// where verification uses it, so traces report what /props reports.
+    [[nodiscard]] sampling::SamplingConfig Applied(
+        sampling::SamplingConfig config) const {
+      config.typical_acceptance =
+          config.typical_acceptance && supports_typical_acceptance;
+      return config;
+    }
   };
 
   class ScheduledGenerationRequest final : public GenerationRequest {
@@ -3382,8 +3391,8 @@ struct InferenceBackend::Impl {
     }
 
     auto request = current->scheduler->Submit(
-        std::move(prompt_tokens), max_tokens, sampling, is_cancelled,
-        static_cast<bool>(on_token),
+        std::move(prompt_tokens), max_tokens, current->Applied(sampling),
+        is_cancelled, static_cast<bool>(on_token),
         TextRequestMetadata{
             .client_id = std::move(client_id),
             .deadline = std::nullopt,
@@ -4300,8 +4309,8 @@ InferenceBackend::start_complete(
   }
   auto prompt_tokens = state->scheduler->runner().Tokenize(prompt);
   auto scheduled_request = state->scheduler->Submit(
-      std::move(prompt_tokens), max_tokens, sampling_config, is_cancelled,
-      stream_output,
+      std::move(prompt_tokens), max_tokens, state->Applied(sampling_config),
+      is_cancelled, stream_output,
       TextRequestMetadata{
           .client_id = client_id.empty() ? "anonymous" : std::string(client_id),
           .deadline = std::nullopt,
@@ -4361,8 +4370,8 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
   const std::size_t system_prefix_tokens =
       request.cache_prompt ? prompt->system_prefix_tokens : 0;
   auto scheduled_request = state->scheduler->Submit(
-      std::move(prompt->tokens), max_tokens, effective_sampling, is_cancelled,
-      stream_output,
+      std::move(prompt->tokens), max_tokens, state->Applied(effective_sampling),
+      is_cancelled, stream_output,
       TextRequestMetadata{
           .client_id = client_id,
           .deadline = std::nullopt,

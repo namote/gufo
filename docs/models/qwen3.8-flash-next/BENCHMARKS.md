@@ -37,6 +37,9 @@ Neither is in a deployed runtime. Details and the deploy blockers:
 [know-how](../../GFX1151-KNOWHOW.md), `plan/upstream-sync/PLAN.md` "U5 결과".
 Evidence: `build/b1/u5-20261109/`.
 
+Sampled Flash-Next MTP `bench` rows are comparable with older rows only when
+run with `--typical-acceptance off`; greedy rows are unaffected.
+
 ## Original BF16 / pure F16 HC comparison, November 9, 2026
 
 Only200 HC down/up matrices differ; c03 body/MTP, FP16 KV, Nix10.1,

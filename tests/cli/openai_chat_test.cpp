@@ -1762,31 +1762,45 @@ void TestModelSamplingDefaults() {
   // reaches requests through the backend defaults, as below.
   Expect(!config.typical_acceptance,
          "The library sampling default keeps the exact rule");
-  config = send(R"(,"typical_acceptance":true)");
-  Expect(config.typical_acceptance, "Requests opt into typical acceptance");
   {
-    // Only an explicit request on a backend that never applies the rule
-    // warns; the inherited default and an explicit false stay quiet.
-    const auto warnings = [&](std::string fields) {
+    // Only a generating request that explicitly asks for the rule on a
+    // backend that never applies it warns, once per process; the inherited
+    // default, an explicit false and token counting stay quiet.
+    const auto logged = [&](const auto& run) {
       std::ostringstream log;
       auto* previous = std::clog.rdbuf(log.rdbuf());
-      send(std::move(fields));
+      run();
       std::clog.rdbuf(previous);
       return log.str().find("event=typical_acceptance_unsupported") !=
              std::string::npos;
     };
+    const auto warns = [&](std::string fields) {
+      return logged([&] { send(std::move(fields)); });
+    };
     backend.defaults.sampling.typical_acceptance = true;
-    Expect(warnings(R"(,"typical_acceptance":true)"),
-           "An explicit request on an unsupported backend warns");
-    Expect(!warnings(""), "The inherited default does not warn");
-    Expect(!warnings(R"(,"typical_acceptance":false)"),
+    Expect(!warns(""), "The inherited default does not warn");
+    Expect(!warns(R"(,"typical_acceptance":false)"),
            "An explicit opt-out does not warn");
+    Expect(!logged([&] {
+      gufo::server::HandleOpenAiChatInputTokens(
+          Request(R"({"model":"test-model","messages":[{"role":)"
+                  R"("user","content":"hello"}],)"
+                  R"("typical_acceptance":true})"),
+          backend);
+    }),
+           "Token counting does not warn");
     backend.typical_support = true;
-    Expect(!warnings(R"(,"typical_acceptance":true)"),
+    Expect(!warns(R"(,"typical_acceptance":true)"),
            "A supporting backend does not warn");
     backend.typical_support = false;
+    Expect(warns(R"(,"typical_acceptance":true)"),
+           "An explicit request on an unsupported backend warns");
+    Expect(!warns(R"(,"typical_acceptance":true)"),
+           "The unsupported-backend warning is logged once per process");
     backend.defaults.sampling.typical_acceptance = false;
   }
+  config = send(R"(,"typical_acceptance":true)");
+  Expect(config.typical_acceptance, "Requests opt into typical acceptance");
   backend.defaults.sampling.typical_acceptance = true;
   config = send("");
   Expect(config.typical_acceptance,
