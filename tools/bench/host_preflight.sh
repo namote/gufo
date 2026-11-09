@@ -31,7 +31,9 @@ note "thp.defrag $(cat /sys/kernel/mm/transparent_hugepage/defrag)"
 # No other GPU users or heavy CPU jobs (builds contaminate shared LPDDR timing).
 gpu_ctr=$(docker ps --format '{{.Names}} {{.Image}}' | grep -Ei 'gufo|rocm|llama|vllm' || true)
 [ -z "$gpu_ctr" ] || bad "GPU containers running: $gpu_ctr"
-heavy=$(ps -eo pcpu=,comm= --sort=-pcpu | awk '$1 > 50 {print}' | head -5)
+# %CPU is a lifetime average, so a just-started process (this ps, awk) reads
+# near 100; only count processes older than 5 s.
+heavy=$(ps -eo pcpu=,etimes=,comm= --sort=-pcpu | awk '$1 > 50 && $2 >= 5 {print $1, $3}' | head -5)
 [ -z "$heavy" ] || bad "busy processes: $heavy"
 note "load $(cut -d' ' -f1-3 /proc/loadavg)"
 

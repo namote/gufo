@@ -1,5 +1,67 @@
 # gfx1151 optimization know-how
 
+## Upstream U8 post-reboot GPU pass, November 10, 2026 (not deployed)
+
+Evidence is under `build/b1/u8-20261110/` (README.txt). First controlled
+window after the apt full-upgrade and reboot: kernel 7.0.0-38 to 7.0.0-43;
+linux-firmware 20260319, MES 0x86, cwsr_enable=1,
+queue_preemption_timeout_ms=9000, THP madvise/madvise and mesa are all
+unchanged (`environment-diff.txt`). Proactiveness is 20, uptime was 18 min,
+and production was stopped. `tools/bench/host_preflight.sh` printed PREFLIGHT
+OK before every timing block (drop+compact; about 29.4K free blocks of order
+9 or more). Binaries: base `166953f0`, cand2 `6588c56c`, cand4 `9ac49a5f`,
+cand7 `d6a8c242`.
+- **Preflight fix.** The busy-process check flagged its own `ps` (a lifetime
+  %CPU near 100 for a just-started process). It now counts only processes
+  older than 5 s.
+- **S1 closed: base MTP is back at the 11/08 qualification.** Alternated
+  B C B C, U7 argv, the same work and hashes in every run (d0 38 cycles
+  90/114 `adfde744`; d32K base 17 cycles 111/111, cand7 10 cycles 118/118,
+  `d856f78e`):
+
+  | Run | base d0 | base d32K | cand7 d0 | cand7 d32K |
+  |---|---|---|---|---|
+  | 1 | 65.48 | 104.42 | 64.05 ± 3.16 | 118.71 |
+  | 2 | 66.14 | 104.25 | 65.69 | 118.63 |
+
+  The 11/08 qualification was 65.7/104.4; U6 (proactiveness 20, after
+  drop+compact) was about 59/94-99 and U7 (proactiveness 0) 57.5/90-93. The
+  update and the reboot came together, so the cause of the U6/U7 gap
+  (the 22-day host state or the kernel) is not separated; firmware did not
+  change. cand7 vs base: d0 -1.4 % (neutral), d32K +13.7 % (U4-3 wide pass).
+- **S3: cand7 is slower than cand2 in every run.** Decode sum over the 24
+  U7 short rows (`s3_sum.py`, flags vs U6 base rpb at 5 %/10 ms):
+
+  | Run | cand2 | cand7 | cand4 |
+  |---|---|---|---|
+  | 1 | 2700 (2 flags) | 3089 (8) | 2870 (7, one round) |
+  | 2 | 2613 (4) | 3088 (8) | |
+
+  - cand7 is about +16 % on the sum and repeats to the millisecond, with the
+    same 8 flagged rows (`p18bd29`, `pcf8269` 97/114 to 191-192 ms;
+    `p3aca8b`, `p745bd8`, `p7d5f06`, `pb62dd8`, `rb62dd8`, `re3f167`).
+  - The draft work differs in 12 of 24 rows between arms. On the rows whose
+    draft rounds, accepted tokens and physical width match in every run
+    (`s3-matched.txt`), width 1 (8 rows) is equal on all arms (634-641 ms).
+    Width 2 (4 rows) is cand2 551-552, cand4 624 (+13 %) and cand7 571
+    (+3.5 %).
+  - So most of cand7's excess is on rows where it does different draft work
+    (for example `p18bd29`/`pcf8269`: one round accepting 1 token, 191 ms,
+    against 3 accepted at 67/97-120 ms on cand2). It is not the C4 per-step
+    event alone: cand4 has no C4 change and is also slower. Not resolved; a
+    pass-level look at those two pair rows is the next step.
+- **The U4-3 queue stall persists on 7.0.0-43.** cand2 FP16 hang loop (U6
+  `hang_loop.sh`, no warm-up, no poke until a stall): stalled in round 10,
+  on a 1066-token rewrite prompt (request 111) at 443 decode tokens, as in
+  U6 c2L. The decode thread waits in `hipStreamSynchronize` at
+  `ForwardBatchImpl(wide=true)` (executor_batch.cpp:1391) from
+  `ForwardWide`. The KFD HQDs are frozen over 10 s, and there is no fault or
+  reset in dmesg. **Unlike U6 h5p, the poke (`cand2-gufo diagnose` in a
+  second container) did not release it within 180 s.** The server did not
+  stop within 30 s of SIGTERM, so docker killed it; the GPU was idle
+  afterwards. The strided grid (cand3 and later) stays. cand7 was not
+  looped (clean in U6).
+
 ## Upstream U7b pre-reboot follow-up, November 10, 2026 (not deployed)
 
 Evidence is under `build/b1/u7b-20261110/` (bin/SHA256SUMS, correct/, c4/,
