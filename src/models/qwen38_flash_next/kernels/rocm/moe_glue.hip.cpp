@@ -66,6 +66,23 @@ __device__ __forceinline__ void RouterTopKBody(
         index = oi;
       }
     }
+    // Every unused probability is NaN (any NaN or +Inf logit, or all -Inf):
+    // take the lowest unused expert at weight 0, so no ID reaches past
+    // n_experts.
+    // The reduction above leaves the same index in every lane, and finite
+    // rows never enter this branch.
+    if (index == 0xffffffffu) {
+      best = 0.0f;
+#pragma unroll
+      for (unsigned j = Items; j-- > 0;) {
+        unsigned e = threadIdx.x + j * 32;
+        if (e < n_experts && !(values[j] == -1.0f))
+          index = e;
+      }
+#pragma unroll
+      for (int offset = 16; offset > 0; offset >>= 1)
+        index = min(index, XorLane(index, offset));
+    }
     if (threadIdx.x == 0) {
       chosen[slot] = index;
       chosen_p[slot] = best;

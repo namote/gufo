@@ -7,9 +7,11 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -1598,6 +1600,53 @@ void QualifyFlashNextExl3PrefillAdapter(gpu::Exl3BucketGemm gemm, int bits) {
   ExpertInvariance(true, gemm, bits);
 }
 
+using TileKey = std::vector<std::uint32_t>;
+
+/// BuildTiles' grouping of `ids` as sorted keys {expert, count, slots...}:
+/// per expert, consecutive runs of tile_rows assignments in assignment
+/// order. `split` reports an expert spread over several tiles.
+std::vector<TileKey> ExpectedTiles(std::span<const std::int32_t> ids,
+                                   unsigned experts, unsigned tile_rows,
+                                   bool* split = nullptr) {
+  std::vector<TileKey> expected;
+  for (unsigned e = 0; e < experts; ++e) {
+    TileKey tile{e, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    for (unsigned i = 0; i < ids.size(); ++i) {
+      if (ids[i] != static_cast<int>(e))
+        continue;
+      tile[2 + tile[1]++] = i;
+      if (tile[1] == tile_rows) {
+        expected.push_back(tile);
+        tile = TileKey{e, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        if (split != nullptr)
+          *split = true;
+      }
+    }
+    if (tile[1] != 0)
+      expected.push_back(tile);
+  }
+  std::sort(expected.begin(), expected.end());
+  return expected;
+}
+
+/// The device tiles as sorted ExpectedTiles keys. RouterTopKTiles zeroes
+/// slots past a tile's count; BuildTiles leaves them stale, so `live_only`
+/// compares only the live slots.
+std::vector<TileKey> ActualTiles(const gpu::Exl3RouteTile* tiles,
+                                 const std::uint32_t* count,
+                                 bool live_only = false) {
+  std::vector<TileKey> actual;
+  for (const auto& t : Read(tiles, Read(count, 1)[0])) {
+    TileKey k{t.expert, t.count};
+    k.insert(k.end(), std::begin(t.slots), std::end(t.slots));
+    for (unsigned r = t.count; live_only && r < 8; ++r)
+      k[2 + r] = 0;
+    actual.push_back(k);
+  }
+  std::sort(actual.begin(), actual.end());
+  return actual;
+}
+
 /// RouterTopKTiles at the production expert count with skewed routing: its
 /// IDs equal RouterTopK's and its tiles equal BuildTiles' grouping (per
 /// expert, consecutive runs of tile_rows assignments in assignment order)
@@ -1636,34 +1685,11 @@ void RouterTilesSet(unsigned rows, unsigned used) {
   Require(std::memcmp(w0.data(), w1.data(), w0.size() * sizeof(float)) == 0,
           "router tiles changed weights");
   Require(Read(arrivals, 1)[0] == 0, "router tile arrivals not reset");
-  using Key = std::vector<std::uint32_t>;
-  std::vector<Key> expected;
   bool split = false;
-  for (unsigned e = 0; e < experts; ++e) {
-    Key tile{e, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-    for (unsigned i = 0; i < assignments; ++i) {
-      if (host_ids[i] != static_cast<int>(e))
-        continue;
-      tile[2 + tile[1]++] = i;
-      if (tile[1] == tile_rows) {
-        expected.push_back(tile);
-        tile = Key{e, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-        split = true;
-      }
-    }
-    if (tile[1] != 0)
-      expected.push_back(tile);
-  }
-  const auto n = Read(count, 1)[0];
-  Require(n == expected.size(), "router tile count differs from BuildTiles");
-  std::vector<Key> actual;
-  for (const auto& t : Read(tiles, n)) {
-    Key k{t.expert, t.count};
-    k.insert(k.end(), std::begin(t.slots), std::end(t.slots));
-    actual.push_back(k);
-  }
-  std::sort(expected.begin(), expected.end());
-  std::sort(actual.begin(), actual.end());
+  const auto expected = ExpectedTiles(host_ids, experts, tile_rows, &split);
+  const auto actual = ActualTiles(tiles, count);
+  Require(actual.size() == expected.size(),
+          "router tile count differs from BuildTiles");
   Require(actual == expected, "router tiles differ from BuildTiles grouping");
   Require(split || assignments < tile_rows * 2,
           "router tile fixture never split an expert");
@@ -1674,7 +1700,9 @@ void RouterTilesSet(unsigned rows, unsigned used) {
 // width 640, ten experts per token): gate/up, the scaled down projection
 // and its widened FP32 control, every tile-row cap R = 1..8, distinct and
 // shared experts (1..8-row tiles), K4 and K3.5.
-void RoutedReference(unsigned rows, bool shared, int bits, bool half) {
+/// A non-empty `routed` replaces the synthetic IDs (rows * used entries).
+void RoutedReference(unsigned rows, bool shared, int bits, bool half,
+                     std::span<const std::int32_t> routed = {}) {
   namespace ref = gufo::tests::exl3_routed_reference;
   constexpr unsigned k = 2560, ff = 640, used = 10, experts = 24;
   const unsigned assignments = rows * used;
@@ -1695,6 +1723,10 @@ void RoutedReference(unsigned rows, bool shared, int bits, bool half) {
   std::vector<std::int32_t> ids(assignments);
   for (unsigned i = 0; i < assignments; ++i)
     ids[i] = shared ? i % used : (i * 7 + i / used) % experts;
+  if (!routed.empty()) {
+    Require(routed.size() == assignments, "routed reference ID count");
+    ids.assign(routed.begin(), routed.end());
+  }
   auto* dx = buffers.Copy(input);
   auto* di = buffers.Copy(ids);
   auto* g = buffers.Make<float>(assignments * ff);
@@ -1762,6 +1794,177 @@ void RoutedReference(unsigned rows, bool shared, int bits, bool half) {
                       nullptr);
   Check(hipDeviceSynchronize());
   same(w_out, w_ref, assignments * k, "production widened down");
+}
+
+/// Routed rows of `logits` through the fused router tiles against the
+/// unfused route, on the model's shapes (hidden 2560, expert width 640, ten
+/// of 24 experts): RouterTopKTiles, launched twice on one zero-initialized
+/// arrival counter, must keep RouterTopK's IDs and weights, build
+/// BuildTiles' grouping, return the counter to zero and, through
+/// tiles_ready, give Exl3RoutedMlp's BuildTiles rows bit for bit.
+/// Returns the router IDs.
+std::vector<std::int32_t> FusedRouterRows(const std::vector<float>& logits,
+                                          unsigned rows, const char* what) {
+  constexpr unsigned k = 2560, ff = 640, used = 10, experts = 24;
+  const unsigned assignments = rows * used;
+  const unsigned tile_rows = gpu::Exl3RouteTileRows(rows);
+  const std::string name =
+      std::string(what) + " rows=" + std::to_string(rows) + ": ";
+  const auto require = [&](bool value, const char* message) {
+    Require(value, (name + message).c_str());
+  };
+  Buffers buffers;
+  Bank gate(buffers, k, ff, experts, 21, false, 4, false),
+      up(buffers, k, ff, experts, 22, false, 4, false),
+      down(buffers, ff, k, experts, 23, false, 4, false);
+  gpu::DeviceLayer layer;
+  layer.ffn_gate_exps = gate.weight;
+  layer.ffn_up_exps = up.weight;
+  layer.ffn_down_exps = down.weight;
+  std::vector<float> input(rows * k);
+  std::mt19937 rng(41 + rows);
+  for (auto& v : input)
+    v = (int(rng() % 2000) - 1000) * 0.0005F;
+  auto* dx = buffers.Copy(input);
+  auto* dl = buffers.Copy(logits);
+  auto* ref_ids = buffers.Make<std::int32_t>(assignments);
+  auto* ref_w = buffers.Make<float>(assignments);
+  gpu::RouterTopK(dl, experts + 1, ref_ids, ref_w, rows, experts, used,
+                  nullptr);
+  gpu::Exl3Scratch s;
+  s.tiles = buffers.Make<gpu::Exl3RouteTile>(assignments);
+  s.tile_count = buffers.Make<std::uint32_t>(1);
+  s.down_exponents = buffers.Make<std::int32_t>(assignments);
+  s.routed_input =
+      buffers.Make<std::uint16_t>(assignments * std::max(2 * k, ff));
+  auto* g = buffers.Make<float>(assignments * ff);
+  auto* u = buffers.Make<float>(assignments * ff);
+  auto* built = buffers.Make<float>(assignments * k);
+  gpu::Exl3RoutedMlp(layer, dx, ref_ids, g, u, built, rows, used, s, nullptr);
+  const auto host_ids = Read(ref_ids, assignments);
+  for (const auto id : host_ids)
+    require(id >= 0 && id < static_cast<int>(experts),
+            "router ID outside the experts");
+  require(ActualTiles(s.tiles, s.tile_count, true) ==
+              ExpectedTiles(host_ids, experts, tile_rows),
+          "BuildTiles grouping");
+  auto* arrivals = buffers.Make<std::uint32_t>(1);
+  auto* ids = buffers.Make<std::int32_t>(assignments);
+  auto* weights = buffers.Make<float>(assignments);
+  auto* fused = buffers.Make<float>(assignments * k);
+  const auto a = Read(built, assignments * k);
+  for (unsigned launch = 0; launch < 2; ++launch) {
+    // Stale tiles from BuildTiles (or the last launch) must be replaced,
+    // not merged.
+    gpu::RouterTopKTiles(dl, experts + 1, ids, weights, rows, experts, used,
+                         s.tiles, s.tile_count, arrivals, tile_rows, nullptr);
+    require(Read(arrivals, 1)[0] == 0, "arrivals did not return to zero");
+    require(Read(ids, assignments) == host_ids, "fused router changed IDs");
+    const auto w0 = Read(ref_w, assignments), w1 = Read(weights, assignments);
+    require(std::memcmp(w0.data(), w1.data(), w0.size() * sizeof(float)) == 0,
+            "fused router changed weights");
+    require(ActualTiles(s.tiles, s.tile_count) ==
+                ExpectedTiles(host_ids, experts, tile_rows),
+            "fused router tiles differ from BuildTiles grouping");
+    Check(hipMemset(fused, 0xFF, std::size_t{assignments} * k * sizeof(float)));
+    gpu::Exl3RoutedMlp(layer, dx, ids, g, u, fused, rows, used, s, nullptr,
+                       nullptr, true);
+    Check(hipDeviceSynchronize());
+    const auto b = Read(fused, assignments * k);
+    require(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0,
+            "tiles_ready routed rows differ from BuildTiles rows");
+  }
+  return host_ids;
+}
+
+/// Concentrated routing of a wide copy verification's 9..25-row segments:
+/// identical router rows (every row picks the same ten experts, so each
+/// fills consecutive eight-row tiles) and rows on a few overlapping hot
+/// experts. Fused router tiles match BuildTiles, and the routed GEMV on
+/// those IDs matches the frozen kernel.
+void ConcentratedRouting(unsigned rows, bool identical) {
+  constexpr unsigned experts = 24, used = 10;
+  std::vector<float> logits(rows * (experts + 1));
+  std::mt19937 rng(rows * 7 + (identical ? 1 : 2));
+  for (unsigned t = 0; t < rows; ++t)
+    for (unsigned e = 0; e <= experts; ++e) {
+      if (identical && t != 0) {
+        logits[t * (experts + 1) + e] = logits[e];
+        continue;
+      }
+      float v = (int(rng() % 2000) - 1000) * 0.001F;
+      // Overlapping rows share a hot set of 13 experts, each row ranking
+      // them differently.
+      if (!identical && e < used + 3)
+        v += 4.0F + static_cast<float>((e * 5 + t * 3) % 7) * 0.5F;
+      logits[t * (experts + 1) + e] = v;
+    }
+  const auto ids = FusedRouterRows(
+      logits, rows, identical ? "identical routing" : "hot routing");
+  if (identical) {
+    const auto tiles =
+        ExpectedTiles(ids, experts, gpu::Exl3RouteTileRows(rows));
+    Require(tiles.size() == used * ((rows + 7) / 8),
+            "identical routing fixture is not concentrated");
+  }
+  RoutedReference(rows, false, 4, false, ids);
+}
+
+/// Router rows without a finite softmax (all NaN, a +Inf or a NaN logit,
+/// all -Inf) take the lowest experts at weight 0 instead of ID -1; finite
+/// rows keep their IDs and weights, and the fused tiles and routed rows
+/// still match the unfused route.
+void RouterNonFinite() {
+  constexpr unsigned experts = 24, used = 10, rows = 6;
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const float inf = std::numeric_limits<float>::infinity();
+  std::vector<float> logits(rows * (experts + 1));
+  std::mt19937 rng(5);
+  for (auto& v : logits)
+    v = (int(rng() % 2000) - 1000) * 0.003F;
+  const auto row = [&](unsigned t) {
+    return logits.begin() + t * (experts + 1);
+  };
+  std::fill_n(row(1), experts + 1, nan);
+  row(2)[7] = inf;
+  row(3)[11] = nan;
+  std::fill_n(row(5), experts + 1, -inf);
+  // Finite rows 0 and 4 alone.
+  std::vector<float> finite(row(0), row(1));
+  finite.insert(finite.end(), row(4), row(5));
+  Buffers buffers;
+  auto* dl = buffers.Copy(logits);
+  auto* df = buffers.Copy(finite);
+  auto* ids = buffers.Make<std::int32_t>(rows * used);
+  auto* weights = buffers.Make<float>(rows * used);
+  auto* fids = buffers.Make<std::int32_t>(2 * used);
+  auto* fweights = buffers.Make<float>(2 * used);
+  gpu::RouterTopK(dl, experts + 1, ids, weights, rows, experts, used, nullptr);
+  gpu::RouterTopK(df, experts + 1, fids, fweights, 2, experts, used, nullptr);
+  const auto i = Read(ids, rows * used), fi = Read(fids, 2 * used);
+  const auto w = Read(weights, rows * used), fw = Read(fweights, 2 * used);
+  for (unsigned t = 0; t < rows; ++t) {
+    const bool bad = t == 1 || t == 2 || t == 3 || t == 5;
+    const auto f = t == 0 ? 0U : 1U;
+    for (unsigned slot = 0; slot < used; ++slot) {
+      const auto id = i[t * used + slot];
+      const auto weight = w[t * used + slot];
+      Require(id >= 0 && id < static_cast<int>(experts),
+              "non-finite router row emitted an invalid expert ID");
+      if (bad) {
+        Require(id == static_cast<int>(slot) && weight == 0.0F &&
+                    !std::signbit(weight),
+                "non-finite router row must take the lowest experts at 0");
+      } else {
+        Require(id == fi[f * used + slot] &&
+                    std::bit_cast<std::uint32_t>(weight) ==
+                        std::bit_cast<std::uint32_t>(fw[f * used + slot]),
+                "finite router row changed beside non-finite rows");
+      }
+    }
+  }
+  const auto fused = FusedRouterRows(logits, rows, "non-finite routing");
+  Require(fused == i, "fused non-finite routing differs from RouterTopK");
 }
 
 // The scaled down projection on DownFixtures' edge rows (signed zeros,
@@ -1898,6 +2101,10 @@ int main(int argc, char** argv) {
          {std::pair{1U, 10U}, std::pair{3U, 10U}, std::pair{8U, 10U},
           std::pair{25U, 10U}, std::pair{64U, 4U}})
       RouterTilesSet(rows, used);
+    RouterNonFinite();
+    for (unsigned rows = 9; rows <= 25; ++rows)
+      for (bool identical : {true, false})
+        ConcentratedRouting(rows, identical);
     PrefillCombineFrozenRows();
     PrefillCombineFrozenRows(true);
     FusedProducer(3, true, 4, 3, 7);  // Different rates in distinct banks.

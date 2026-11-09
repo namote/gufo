@@ -815,6 +815,9 @@ void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,
 
 /// Softmax over `n_experts` logits per token (rows `stride` apart), top-k
 /// selection, renormalized weights. ids [t][k] int32, weights [t][k] f32.
+/// A row whose softmax is NaN (any NaN or +Inf logit, or all -Inf) takes
+/// the lowest unused experts at weight 0, so every ID is below n_experts
+/// when k <= n_experts.
 void RouterTopK(const float* logits, std::uint32_t stride, std::int32_t* ids,
                 float* weights, std::uint32_t n_tokens, std::uint32_t n_experts,
                 std::uint32_t k, hipStream_t stream);
