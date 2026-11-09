@@ -257,6 +257,9 @@ std::unique_ptr<Slot> FakeAdapter::CreateSlot(MutationGuard& guard) {
 void FakeAdapter::SetCheckpointPrediction(bool predict) {
   predict_checkpoints_ = predict;
 }
+void FakeAdapter::SetCheckpointPredictionRefused(bool refuse) {
+  refuse_checkpoints_ = refuse;
+}
 void FakeAdapter::SetPrefillPassRows(Rows rows) {
   if (!rows)
     throw std::invalid_argument("empty prefill pass");
@@ -288,6 +291,8 @@ std::vector<ComponentPosition> FakeAdapter::PrefillCheckpointPositions(
     const Slot& slot, Rows boundary) const {
   if (!predict_checkpoints_)
     return {};
+  if (refuse_checkpoints_)
+    throw std::invalid_argument("unsupported fake in-pass boundary");
   const auto& state = AsSlot(slot);
   if (!slot.IsValid() || state.Busy() || boundary <= state.target.size())
     throw std::invalid_argument("invalid fake in-pass boundary");

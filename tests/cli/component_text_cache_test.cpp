@@ -395,6 +395,67 @@ void AlignedPrefillKeepsAlignedBoundaries() {
   assert(Generate(retry) == expected);
   retry.Invalidate();
 }
+// A state that cannot checkpoint inside a pass (Flash-Next shared KV pool)
+// has no in-pass prediction. A warm turn neither fails nor splits its pass
+// for the aligned prompt tail: it keeps the complete prompt, which an
+// unchanged retry restores without prefill.
+void AlignedTailWithoutInPassPrediction() {
+  std::vector<TextRunnerToken> prompt(41);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  auto runner = std::make_shared<Runner>();
+  runner->alignment = 4;
+  TextRunnerPool pool(runner, 2);
+  runner->adapter->SetCheckpointPredictionRefused(true);
+  auto seed =
+      pool.Acquire(prompt, sampling::SamplingConfig{}, {}, {}, true, 35);
+  while (!seed.prefill_complete())
+    (void)seed.Prefill(10);
+  (void)Generate(seed);
+  (void)seed.Commit();
+  auto branch = prompt;
+  branch[40] = 999;
+  runner->pass_ends.clear();
+  auto restored =
+      pool.Acquire(branch, sampling::SamplingConfig{}, {}, {}, true, 35);
+  assert(restored.cached_prompt_tokens() == 32);
+  while (!restored.prefill_complete())
+    (void)restored.Prefill(16);
+  assert((runner->pass_ends == std::vector<std::size_t>{41}));
+  const auto expected = Generate(restored);
+  (void)restored.Commit();
+  // The live frontier moved on past the prompt; the retry restores the
+  // complete prompt checkpoint without prefill.
+  auto retry =
+      pool.Acquire(branch, sampling::SamplingConfig{}, {}, {}, true, 35);
+  assert(retry.cached_prompt_tokens() == branch.size());
+  assert(retry.prefill_complete());
+  assert(Generate(retry) == expected);
+  retry.Invalidate();
+  // A longer prompt restores the aligned stable boundary 32, not the
+  // unaligned complete prompt (the cost of not splitting).
+  auto longer = branch;
+  longer.insert(longer.end(), {7, 8, 9});
+  auto extended =
+      pool.Acquire(longer, sampling::SamplingConfig{}, {}, {}, true, 35);
+  assert(extended.cached_prompt_tokens() == 32);
+  extended.Invalidate();
+  // A raw completion has no stable boundary: it splits at the aligned tail
+  // so a longer raw prompt keeps its reuse.
+  std::vector<TextRunnerToken> raw(41);
+  std::iota(raw.begin(), raw.end(), 500);
+  runner->pass_ends.clear();
+  auto seed_raw = pool.Acquire(raw, sampling::SamplingConfig{});
+  while (!seed_raw.prefill_complete())
+    (void)seed_raw.Prefill(64);
+  assert((runner->pass_ends == std::vector<std::size_t>{40, 41}));
+  (void)Generate(seed_raw);
+  (void)seed_raw.Commit();
+  auto longer_raw = raw;
+  longer_raw.insert(longer_raw.end(), {7, 8, 9});
+  auto extended_raw = pool.Acquire(longer_raw, sampling::SamplingConfig{});
+  assert(extended_raw.cached_prompt_tokens() == 40);
+  extended_raw.Invalidate();
+}
 // A request that stops at an unaligned prompt end before advancing a token
 // (one-token completions) drops its live frontier there, but still publishes
 // the complete prompt, which an unchanged retry restores without prefill.
@@ -3302,6 +3363,7 @@ int main() {
   BudgetUsesAllocatedSlotsInsteadOfLazyStateClaim();
   InPassCapturePreservesBoundaryAndLiveTail();
   AlignedPrefillKeepsAlignedBoundaries();
+  AlignedTailWithoutInPassPrediction();
   UnalignedPromptEndPublishesBeforeDroppingTheFrontier();
   UnalignedRawPromptKeepsAnAlignedContinuation();
   ColdAcquireResetsOnce();

@@ -946,12 +946,7 @@ struct TextRunnerPool::Request::Impl {
         count = std::max(Aligned(count), prefill_offset);
       } else if (const auto aligned = Aligned(count);
                  aligned > prefill_offset && aligned < count &&
-                 (!lease.component() ||
-                  lease.TryReserveSnapshot(
-                      lease.CaptureBytes(aligned), aligned, retain_fallback,
-                      SnapshotPurpose::kContinuation,
-                      std::span<const TextRunnerToken>(prompt).first(
-                          aligned)))) {
+                 (!lease.component() || KeepsAlignedTail(aligned))) {
         // A disabled cache (or a refused disk-only capture) must not prepare
         // checkpoint scratch or split a pass for a fallback it cannot keep.
         count = aligned;
@@ -1020,6 +1015,28 @@ struct TextRunnerPool::Request::Impl {
 
   [[nodiscard]] std::size_t Aligned(std::size_t position) const noexcept {
     return position - position % alignment;
+  }
+
+  /// Whether to capture the aligned prompt tail `aligned` as well. A state
+  /// that checkpoints inside the pass reserves it now. One that cannot
+  /// (Flash-Next shared KV pool, KVarN or image sessions, whose adapter has
+  /// no in-pass prediction) must split the pass there, which costs a pass
+  /// over the whole context and moves the complete prompt capture to the
+  /// aligned tail (an unchanged retry then re-prefills its last rows). A chat
+  /// turn keeps the complete prompt instead: a longer prompt restores the
+  /// live frontier copies (kGenerated) or this turn's aligned stable
+  /// boundary, at most kNearbyStableTokens back. A raw completion has no
+  /// stable boundary, so it still splits rather than lose all reuse.
+  [[nodiscard]] bool KeepsAlignedTail(std::size_t aligned) {
+    std::size_t bytes;
+    try {
+      bytes = lease.CaptureBytes(aligned);
+    } catch (const std::invalid_argument&) {
+      return !retain_fallback && !lease.CaptureRefused(aligned);
+    }
+    return lease.TryReserveSnapshot(
+        bytes, aligned, retain_fallback, SnapshotPurpose::kContinuation,
+        std::span<const TextRunnerToken>(prompt).first(aligned));
   }
 
   ~Impl() {

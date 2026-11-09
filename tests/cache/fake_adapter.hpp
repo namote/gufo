@@ -59,6 +59,10 @@ public:
   void SetExecutionComplete(Slot&, bool);
   // Without it the adapter offers no in-pass checkpoint prediction.
   void SetCheckpointPrediction(bool);
+  /// Refuse every in-pass prediction, as an adapter whose states cannot
+  /// checkpoint inside a pass does (Flash-Next shared KV pool). Applies
+  /// only while predictions are enabled (SetCheckpointPrediction).
+  void SetCheckpointPredictionRefused(bool);
   [[nodiscard]] std::vector<ComponentPosition> PrefillCheckpointPositions(
       const Slot&, Rows boundary) const override;
   void BeginRestore(Slot&, std::span<const ComponentPosition>) override;
@@ -139,6 +143,7 @@ private:
   std::array<ComponentDescriptor, 3> components_;
   bool fail_allocation_{false};
   bool predict_checkpoints_{true};
+  bool refuse_checkpoints_{};
   bool retain_rows_{false};
   Rows retained_row_limit_{};
   Rows retained_row_first_{};
