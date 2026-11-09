@@ -143,3 +143,57 @@ void WideVerification() {
   }
   Require(equal, "wide copy verification differs from eight-row passes");
 }
+
+/// ReserveDecodeScratch moves the decode batch and wide verification storage
+/// for max_copy_rows() out of DeferredScratchBytes, and later wide passes of
+/// every segment count (9..64 rows) allocate none of it. The session's own
+/// rollback rows are allocated before the pass (EnsureRollback), as an
+/// earlier ordinary verification would.
+void WideDecodeAllocations() {
+  BeginCase("executor EXL3 wide verification allocates no device memory");
+  MtpExecutorFixture f(64, 128, 6, true, 0, 512, 8);
+  auto& exec = *f.exec;
+  const auto vocab = f.config.vocab_size;
+  using Access = gpu::ExecutorTestAccess;
+  Require(exec.max_copy_rows() == 64, "fixture must allow 64-row copies");
+  std::string error;
+  const auto deferred = exec.DeferredScratchBytes();
+  Require(exec.ReserveDecodeScratch(&error), error);
+  Require(deferred - exec.DeferredScratchBytes() ==
+              Access::ReservedDecodeBytes(exec),
+          "reserved decode scratch left the deferred budget unbalanced");
+  const auto reserved = Access::DecodeAllocations(exec);
+  const auto reserved_deferred = exec.DeferredScratchBytes();
+  Require(exec.ReserveDecodeScratch(&error), error);
+  Require(Access::DecodeAllocations(exec) == reserved,
+          "a second reservation allocated again");
+  for (const std::uint32_t n : {9U, 16U, 17U, 25U, 40U, 64U}) {
+    auto session =
+        exec.CreateSession(gufo::core::SessionMode::kSpeculative, 512, &error);
+    Require(session != nullptr, error);
+    std::vector<std::int32_t> prompt(40);
+    for (std::uint32_t t = 0; t < prompt.size(); ++t)
+      prompt[t] =
+          static_cast<std::int32_t>(1 + (t * 2246822519U + 29U) % (vocab - 2));
+    std::vector<float> logits(vocab);
+    Require(
+        exec.Forward(*session, prompt, 1, logits.data(),
+                     gpu::Executor::ForwardMode::kPrefill, &error) &&
+            exec.EnsureRollback(*session, exec.max_speculative() - 1, &error),
+        error);
+    const auto session_bytes = session->AllocatedBytes();
+    std::vector<std::int32_t> chain(n);
+    for (std::uint32_t t = 0; t < n; ++t)
+      chain[t] = static_cast<std::int32_t>(1 + (t * 40503U + n) % (vocab - 2));
+    Require(exec.ForwardWide(*session, chain, &error) &&
+                exec.Rollback(*session, n / 2, &error),
+            error);
+    const auto name = "rows=" + std::to_string(n);
+    Require(Access::DecodeAllocations(exec) == reserved &&
+                exec.DeferredScratchBytes() == reserved_deferred,
+            name + ": wide pass allocated executor decode storage");
+    Require(session->AllocatedBytes() == session_bytes,
+            name + ": wide pass allocated session storage");
+    std::cout << "PASS " << name << " no decode allocation\n";
+  }
+}

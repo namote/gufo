@@ -132,6 +132,10 @@ public:
   /// Caps wide copy verification (Executor::LimitCopyRows); call before any
   /// session is created.
   void LimitCopyRows(std::uint32_t rows) noexcept;
+  /// Allocates the decode batch and wide verification scratch now
+  /// (Executor::ReserveDecodeScratch); call after LimitCopyRows and before
+  /// any session decodes.
+  [[nodiscard]] bool ReserveDecodeScratch(std::string* error_msg);
   [[nodiscard]] const std::shared_ptr<qwen::vision::Encoder>& VisionEncoder()
       const noexcept {
     return vision_;

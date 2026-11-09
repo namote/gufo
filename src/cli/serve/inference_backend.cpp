@@ -3583,6 +3583,24 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
           break;
       }
     }
+    // Allocate the decode batch and wide verification scratch before any
+    // session, so no decode pass allocates device memory. What it allocates
+    // leaves DeferredScratchBytes, so the budgets keep their totals. On
+    // failure the passes still allocate on first use.
+    {
+      const auto deferred = model->DeferredScratchBytes();
+      std::string reserve_error;
+      if (model->ReserveDecodeScratch(&reserve_error))
+        Logger::Info(
+            "loader",
+            "event=decode_scratch_reserved bytes=" +
+                std::to_string(deferred - model->DeferredScratchBytes()) + " " +
+                Logger::MemoryStatus());
+      else
+        Logger::Warn("loader",
+                     "event=decode_scratch_reserved status=deferred reason=" +
+                         reserve_error);
+    }
     if (rope_scaling) {
       Logger::Info(
           "loader",

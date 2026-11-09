@@ -344,6 +344,10 @@ void Model::LimitCopyRows(std::uint32_t rows) noexcept {
   executor_->LimitCopyRows(rows);
 }
 
+bool Model::ReserveDecodeScratch(std::string* error_msg) {
+  return executor_->ReserveDecodeScratch(error_msg);
+}
+
 std::size_t Session::AllocatedBytes() const noexcept {
   return session_->AllocatedBytes();
 }

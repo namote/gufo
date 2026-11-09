@@ -197,6 +197,32 @@ struct ExecutorTestAccess {
       return (entry.first & (std::uint64_t{1} << 45)) != 0;
     });
   }
+  /// Executor-owned decode and wide verification storage: a pass that
+  /// allocated any of it lazily would change this tuple.
+  static auto DecodeAllocations(const Executor& exec) {
+    return std::tuple(static_cast<const void*>(exec.batch_logits_),
+                      static_cast<const void*>(exec.batch_controls_),
+                      static_cast<const void*>(exec.batch_candidates_host_),
+                      static_cast<const void*>(exec.batch_gdn_host_),
+                      static_cast<const void*>(exec.wide_controls_),
+                      exec.wide_allocations_.size(), exec.wide_segments_.size(),
+                      exec.wide_state_.size(),
+                      static_cast<const void*>(exec.verification_penalties_),
+                      exec.verification_penalty_capacity_);
+  }
+  /// Device bytes ReserveDecodeScratch moves out of DeferredScratchBytes:
+  /// the batch logits and the wide segments past the first and their state.
+  static std::size_t ReservedDecodeBytes(const Executor& exec) {
+    const auto segments =
+        (exec.max_copy_rows() + Executor::kWideSegmentRows - 1) /
+        Executor::kWideSegmentRows;
+    return std::size_t{8} * std::min(8U, exec.options_.max_logit_rows) *
+               exec.config().vocab_size * sizeof(float) +
+           (segments > 1 ? ((segments - 1) * exec.WideSegmentFloats() +
+                            exec.WideStateFloats()) *
+                               sizeof(float)
+                         : 0);
+  }
   static void PoisonSelection(const Executor& exec) {
     Hip(hipMemsetAsync(exec.s_.mask, 0xFF,
                        exec.mask_words_ * sizeof(std::uint32_t),
@@ -690,6 +716,7 @@ inline void SameBits(const std::vector<T>& a, const std::vector<T>& b,
 // exl3_ops_test.cpp main().
 void MtpExecutorCatchUp(bool batched);
 void WideVerification();
+void WideDecodeAllocations();
 void NarrowIndexerPrefill();
 void DensePrefillProjection();
 void PlainOperandPrecision();

@@ -129,13 +129,57 @@ void Executor::UseScratch(const Scratch& scratch) const {
 }
 
 bool Executor::AllocateBatch(std::string* error) const {
-  return batch_logits_ != nullptr ||
-         Check(hip::AllocateDevice(
-                   &batch_logits_,
-                   static_cast<std::size_t>(kBatchSessions) *
-                       std::min(kDecodeRows, options_.max_logit_rows) *
-                       config().vocab_size * sizeof(float)),
-               error);
+  const Config& c = config();
+  if (batch_logits_ == nullptr &&
+      !Check(hip::AllocateDevice(
+                 &batch_logits_,
+                 static_cast<std::size_t>(kBatchSessions) *
+                     std::min(kDecodeRows, options_.max_logit_rows) *
+                     c.vocab_size * sizeof(float)),
+             error))
+    return false;
+  if (batch_controls_ == nullptr &&
+      !Check(host_allocations_.Allocate(
+                 &batch_controls_, kBatchSessions * sizeof(Session::Control)),
+             error))
+    return false;
+  if (has_mtp() && batch_candidates_host_ == nullptr) {
+    if (!Check(host_allocations_.Allocate(
+                   &batch_candidates_host_,
+                   kBatchSessions * sizeof(MtpCandidateLogits)),
+               error))
+      return false;
+    for (std::uint32_t i = 0; i < kBatchSessions; ++i)
+      std::construct_at(batch_candidates_host_ + i);
+  }
+  // Mapped GDN descriptors of a multi-session batch (ForwardBatchImpl).
+  if (c.ssm_head_dim == 128 && c.ssm_conv_kernel == 4) {
+    const std::size_t bytes =
+        std::size_t{c.num_layers} * kBatchSessions * sizeof(GdnBatchItem);
+    if ((batch_gdn_host_ == nullptr &&
+         !Check(host_allocations_.Allocate(&batch_gdn_host_, bytes,
+                                           hipHostMallocMapped),
+                error)) ||
+        (batch_gdn_ == nullptr &&
+         !Check(hipHostGetDevicePointer(reinterpret_cast<void**>(&batch_gdn_),
+                                        batch_gdn_host_, 0),
+                error)))
+      return false;
+  }
+  return true;
+}
+
+bool Executor::ReserveDecodeScratch(std::string* error) const {
+  const auto rows = max_copy_rows();
+  if (AllocateBatch(error) &&
+      (rows <= kWideSegmentRows ||
+       EnsureWideSegments((rows + kWideSegmentRows - 1) / kWideSegmentRows - 1,
+                          error)))
+    return true;
+  // The caller continues with lazy allocation; a failed allocation must not
+  // leave a sticky error for the next launch check.
+  (void)hipGetLastError();
+  return false;
 }
 
 bool Executor::HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
@@ -274,11 +318,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
     if (!item.session->Cancelled())
       item.session->PreserveSnapshots(item.session->position_,
                                       item.session->mtp_.position);
-  if (!AllocateBatch(error) ||
-      (batch_controls_ == nullptr &&
-       !Check(host_allocations_.Allocate(
-                  &batch_controls_, kBatchSessions * sizeof(Session::Control)),
-              error))) {
+  if (!AllocateBatch(error)) {
     return false;
   }
   for (std::size_t i = 0; i < items.size(); ++i) {
@@ -545,15 +585,6 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
   }
   if (!AllocateBatch(error)) {
     return false;
-  }
-  if (batch_candidates_host_ == nullptr) {
-    if (!Check(host_allocations_.Allocate(
-                   &batch_candidates_host_,
-                   kBatchSessions * sizeof(MtpCandidateLogits)),
-               error))
-      return false;
-    for (std::uint32_t i = 0; i < kBatchSessions; ++i)
-      std::construct_at(batch_candidates_host_ + i);
   }
   const auto n = static_cast<std::uint32_t>(items.size());
   // Each request keeps the head it chose. A small-head row's logits are the
@@ -1017,27 +1048,8 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
   if (!AllocateBatch(error)) {
     return false;
   }
-  if (batch_controls_ == nullptr &&
-      !Check(host_allocations_.Allocate(
-                 &batch_controls_, kBatchSessions * sizeof(Session::Control)),
-             error)) {
-    return false;
-  }
   const bool batch_gdn =
       items.size() > 1 && c.ssm_head_dim == 128 && c.ssm_conv_kernel == 4;
-  if (batch_gdn) {
-    const std::size_t bytes =
-        std::size_t{c.num_layers} * kBatchSessions * sizeof(GdnBatchItem);
-    if ((batch_gdn_host_ == nullptr &&
-         !Check(host_allocations_.Allocate(&batch_gdn_host_, bytes,
-                                           hipHostMallocMapped),
-                error)) ||
-        (batch_gdn_ == nullptr &&
-         !Check(hipHostGetDevicePointer(reinterpret_cast<void**>(&batch_gdn_),
-                                        batch_gdn_host_, 0),
-                error)))
-      return false;
-  }
   if (ple_pending_ && !WaitPle(error)) {
     return false;
   }

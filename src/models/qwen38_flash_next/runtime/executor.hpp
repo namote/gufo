@@ -432,6 +432,12 @@ public:
   /// Caps max_copy_rows() before any session is created, so the wide
   /// verification scratch fits beside the configured sessions.
   void LimitCopyRows(std::uint32_t rows) noexcept { copy_rows_cap_ = rows; }
+  /// Allocates the decode batch buffers and the wide verification scratch
+  /// for max_copy_rows() now, so that no later decode, verification or wide
+  /// pass allocates them; DeferredScratchBytes drops by the batch logits and
+  /// wide segment bytes it allocates. Call after LimitCopyRows, before
+  /// decoding. Without it the passes allocate on first use.
+  [[nodiscard]] bool ReserveDecodeScratch(std::string* error_msg) const;
   /// Whether a sampled verification of `rows` rows can stay compact.
   [[nodiscard]] static bool CanCompactWideVerification(
       const sampling::SamplerState& sampler, std::size_t rows);
@@ -1038,8 +1044,9 @@ private:
   /// before the pass as for an ordinary verification. For the production
   /// geometry (36 linear layers) that is 45.7 MiB per segment past the first
   /// plus 108 MiB of wide_state_, 428 MiB at 64 rows (WideSegmentFloats,
-  /// WideStateFloats), allocated on first use and reserved with the other
-  /// lazy scratch (DeferredScratchBytes).
+  /// WideStateFloats), allocated by ReserveDecodeScratch or else on first
+  /// use, and until then reserved with the other lazy scratch
+  /// (DeferredScratchBytes).
   struct WideSegment {
     std::vector<RollbackRows> conv;   ///< per layer, linear layers only
     std::vector<RollbackRows> state;  ///< per layer, linear layers only
