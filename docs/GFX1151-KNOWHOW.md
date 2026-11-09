@@ -1,5 +1,70 @@
 # gfx1151 optimization know-how
 
+## Upstream U7b pre-reboot follow-up, November 10, 2026 (not deployed)
+
+Evidence is under `build/b1/u7b-20261110/` (bin/SHA256SUMS, correct/, c4/,
+func/, tools/). No update, no reboot, production stopped.
+- **`vm.compaction_proactiveness` was reverted by the user on 2026-11-10.**
+  `/etc/sysctl.d/60-gufo-compaction.conf` is deleted and the runtime value
+  is the default 20 (verified, not changed in this pass). THP stays
+  madvise/madvise. S3 and the MTP pre-reboot reference were not run: the
+  user moved all small-margin timing to after the update and reboot, under a
+  scripted preflight, because disk state, page cache and fragmentation on the
+  22-day host are not controlled.
+- **cand6** = HEAD `3f0a4eb1` (cand5 plus the C1 test and its test-only
+  atomic counter), built incrementally in `build/u7c6` (a copy of the
+  `build/u7c5` objects), gufo `c820c722`. The C1 test commit needed a
+  clang-format reflow (clang-format 21.1.8 from the build image's Nix store).
+- **C1 passes on cand6.** `qwen38_flash_next_session_test` rc 0 in 559 s:
+  `batch mixed_kv_only_cohorts=5`, `independent_state_exact=1`, lookup C2-C8
+  `tokens_logits_RNG_exact=1`, `snapshots_exact=1`.
+- **C4 cause (bpftrace timeline on cand6, `--sessions 2`, A 2.3K tokens
+  while B cold-prefills 24K).** A's 1.82 s is not `RetainRows`: no
+  `RetainRows` call took 50 ms or more, and no full-stream fallback was seen.
+  It has two layers:
+  - **Scheduler.** One scheduler thread runs every pass. When a step starts
+    an asynchronous capture, A is parked in `capturing` at once and the loop
+    runs B's bounded 512-token pass (about 455 ms, ending in a stream sync).
+    Captures are polled only between passes. A makes about 4 captures (the
+    2048 boundary, the aligned prefix and the prompt end), and each waits
+    one B pass: 4 x 455 = 1.82 s. `cache_snapshot_ms` was measured until the
+    scheduler joined the capture, so it included B's passes.
+  - **Hardware queue.** The server caps `GPU_MAX_HW_QUEUES=2`. The capture's
+    copy kernel, on a transfer-pool stream, did not run during B's pass: each
+    `Lease::Capture` took about 445 ms, of which 410 ms was the transfer-event
+    wait. With `GPU_MAX_HW_QUEUES=4` captures took 2-8 ms, but A's
+    `cache_snapshot_ms` was still 1.40 s because of the scheduler layer.
+- **C4 fix (cand7 `d6a8c242`).** After a step, the scheduler waits up to
+  `TextSchedulerPolicy::capture_settle_wait` (50 ms) for a capture that the
+  step started before parking the request. The executor is idle during that
+  wait, so the copy finishes in milliseconds. A prompt capture's time now ends
+  when its worker finishes. Result on the same scenario, against cand5:
+  - A capture 7.1-9.2 ms, against 1817-1832 ms (alone 8.5-9.5 ms).
+  - A TTFT 3.18-3.29 s, against 4.09-4.18 s. The rest above the alone
+    1.85 s is queueing behind B's current chunk (0.39-0.51 s) plus B's
+    interleaved passes. That is prefill fairness, not capture.
+  - B TTFT 21.15-21.28 s, against 21.03-21.43 s (unchanged).
+  - The server samples at T 0.9, so A's text hashes vary on both binaries;
+    correctness comes from the tests below.
+  - `cache_snapshot_ms` values from before 2026-11-10 are not comparable
+    with newer ones (the definition changed).
+  - Correctness on cand7: the continuation adapter test and the session test
+    pass (rc 0, `mixed_kv_only_cohorts=5`). Functional `cache` passes all 10
+    suites, and all 41 output hashes equal cand5 f5. Four rows after a cancel
+    reuse more (708 to 711, 668 to 711, 712 to 736, 708 to 709 cached
+    tokens), because the capture now finishes before the cancel lands. The
+    harness reports "unmatched baseline environment" for the timing
+    comparison only.
+  - A new CPU test, `TestBriefCaptureSettlesBeforePeerWork`, shows peer
+    prefill during a capture with a wait of 0, and none with the wait.
+- **Tooling: a bpftrace `uretprobe` breaks C++ exception unwinding.**
+  A uretprobe on `ComponentTextCache::Lease::Capture` replaced the return
+  address with the `[uprobes]` trampoline (0x7fffffffe000). The rethrow of a
+  refused capture (`ResourceExhausted`, 24K-token prompt end) then found no
+  handler, and the server aborted with `std::terminate` in 3 of 3 traced runs.
+  Untraced cand5 and cand7 ran the same scenario cleanly. Put uretprobes only
+  on functions that never throw, or use entry uprobes.
+
 ## Upstream U7 pre-reboot GPU pass, November 9, 2026 (not deployed)
 
 Evidence is under `build/b1/u7-20261109/` (README.txt lists every file).
