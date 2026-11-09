@@ -721,8 +721,11 @@ int RunStableCase(std::uint32_t kTokens, bool route_equality = false) {
     std::vector<float> out, state, conv;
   };
   // Tokens [first, first + count) of the batch, continuing the state.
+  // A non-null `old_route` (Q8_1 rows of out) keeps the separate gate,
+  // recurrence and epilogue launches, which still write F32 out.
   const auto call = [&](std::uint32_t first, std::uint32_t count,
-                        q::RollbackRows conv_rows) {
+                        q::RollbackRows conv_rows, void* old_route = nullptr,
+                        q::GdnCheckpoint checkpoint = {}) {
     q::GatedDeltaNet(
         d_qkv.get() + static_cast<std::size_t>(first) * kChannels, kChannels,
         d_z.get() + static_cast<std::size_t>(first) * kZ, kZ,
@@ -732,15 +735,15 @@ int RunStableCase(std::uint32_t kTokens, bool route_equality = false) {
         d_raw.get(), d_state.get(),
         d_out.get() + static_cast<std::size_t>(first) * kZ, nullptr, {},
         conv_rows, count, kKHeads, kVHeads, kDim, kKernel, true, false, kEps,
-        nullptr, nullptr, {}, 0, nullptr, nullptr, true);
+        nullptr, nullptr, checkpoint, 0, old_route, nullptr, true);
   };
   const auto run = [&](const std::vector<std::uint32_t>& chunks,
-                       q::RollbackRows conv_rows) {
+                       q::RollbackRows conv_rows, void* old_route = nullptr) {
     Upload(&d_conv_state, conv_state);
     Upload(&d_state, state);
     std::uint32_t first = 0;
     for (const auto count : chunks) {
-      call(first, count, conv_rows);
+      call(first, count, conv_rows, old_route);
       first += count;
     }
     CheckHip(hipDeviceSynchronize(), "stable GDN synchronization");
@@ -757,6 +760,31 @@ int RunStableCase(std::uint32_t kTokens, bool route_equality = false) {
            bytes_equal(x.conv, y.conv);
   };
   const Result fused = run({kTokens}, {});
+  if (!route_equality) {
+    // The one-launch EXL3 prefill (GdnPrefillKernel) against the separate
+    // GdnPrepAb, GdnRowSplit<true> and GdnEpilogue launches it replaces:
+    // outputs, state, history and a checkpoint, byte for byte.
+    HipBuffer<float> q8_1(2 * kOut + 64);
+    if (!same(fused, run({kTokens}, {}, q8_1.get())))
+      throw std::runtime_error(
+          "one-launch GDN prefill differs from the "
+          "separate launches");
+    for (const std::uint32_t at : {1U, (kTokens + 1) / 2, kTokens}) {
+      std::array<std::vector<float>, 2> captured;
+      for (int route = 0; route < 2; ++route) {
+        HipBuffer<float> cp_state(kStateCount);
+        HipBuffer<float> cp_history(kConvState);
+        Upload(&d_conv_state, conv_state);
+        Upload(&d_state, state);
+        call(0, kTokens, {}, route == 0 ? nullptr : q8_1.get(),
+             {cp_state.get(), cp_history.get(), at});
+        CheckHip(hipDeviceSynchronize(), "GDN route checkpoint");
+        captured[route] = Download(&cp_state, kStateCount);
+      }
+      if (!bytes_equal(captured[0], captured[1]))
+        throw std::runtime_error("one-launch GDN prefill checkpoint differs");
+    }
+  }
   if (route_equality) {
     if (kTokens > 8)
       return 0;
@@ -1000,7 +1028,8 @@ int main(int argc, char** argv) {
     }
     if (RunCase(1, true) != 0 || RunCase(8, true) != 0)
       return 1;
-    for (std::uint32_t n : {1u, 2u, 3u, 5u, 8u, 37u, 99u}) {
+    for (std::uint32_t n :
+         {1u, 2u, 3u, 4u, 5u, 8u, 9u, 12u, 13u, 37u, 65u, 99u}) {
       std::cout << "stable n=" << n << '\n';
       if (RunStableCase(n) != 0)
         return 1;
