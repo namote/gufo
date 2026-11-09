@@ -272,14 +272,26 @@ void CheckSlotReuse(const std::shared_ptr<qfn::Model>& model, bool mtp) {
                     fresh->Statistics().accepted - fresh_before.accepted,
             "retained slot scratch changed draft acceptance");
   }
+  // A request stopped by cancellation leaves the session invalid but keeps
+  // its rollback scratch for the next request on the slot (0e0ebad8).
+  const auto cancel_bytes = reused.AllocatedBytes();
+  if (mtp)
+    Require(cancel_bytes > empty_bytes,
+            "cancelled slot had no rollback scratch to retain");
   reused.SetCancellationCheck([] { return true; });
   Require(!reused.Evaluate(first.front(), &error) && !reused.IsValid(),
           "cancelled slot remained valid");
   reused.SetCancellationCheck({});
-  Require(adapter.Invalidate(*slot) && reused.AllocatedBytes() == empty_bytes,
-          "failed slot retained rollback scratch");
-  Require(reused.Sync(next, &error), error);
-  (void)Decode(reused, 16);
+  Require(adapter.Invalidate(*slot), "cancelled slot reassignment failed");
+  Require(reused.Position() == 0 && reused.Tokens().empty(),
+          "cancelled slot reassignment retained logical state");
+  Require(reused.AllocatedBytes() == cancel_bytes,
+          "cancelled slot reassignment discarded reusable rollback");
+  fresh->Reset();
+  Require(reused.Sync(next, &error) && fresh->Sync(next, &error), error);
+  SameLogits(reused, *fresh);
+  Require(Decode(reused, 16) == Decode(*fresh, 16),
+          "retained cancelled-slot scratch changed continuation tokens");
   reused.Reset();
   Require(reused.AllocatedBytes() == empty_bytes,
           "explicit reset retained rollback scratch");
