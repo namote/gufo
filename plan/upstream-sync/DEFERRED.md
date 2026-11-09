@@ -25,6 +25,7 @@
 | D5 | C3 hash를 SHF_ALLOC section만으로 정밀하게 | 지금은 줄 번호만 바뀌어도 캐시가 무효가 된다. 안전한 쪽이라 낮다 |
 | D6 | C1 테스트 보강(kv_only가 둘 이상 섞인 cohort) | CPU/GPU session test 추가 **완료**: `1d6faa94`/`18081f1c`, U7b cand6 session test에서 `batch mixed_kv_only_cohorts=5` |
 | D7 | cand4 배포 | 사용자 결정. 배포하면 supervisor(C2, `prepare_memory`)를 같이 설치해야 한다 |
+| D8 | 긴 prefill 옆 요청의 TTFT 공정성 | C4 수정 뒤에도 A TTFT가 혼자 약 2.0 s에서, B의 약 24K cold prefill 중 3.2~3.3 s다. A가 B의 512 token pass(약 455 ms) 뒤에 줄을 서고, prefill pass가 번갈아 돈다. capture 문제가 아니라 scheduler 순서 문제이고 base에도 있다. 짧은 prompt 우선, B chunk 크기 조정, decode/짧은 prefill 끼워 넣기 같은 정책 후보를 설계하고, 사전 점검을 통과한 재부팅 뒤 창에서 A/B TTFT로 잰다 |
 
 ## GPU 패스 구성 (한 번에)
 
