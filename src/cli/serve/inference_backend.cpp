@@ -3580,6 +3580,25 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                "Failed to create Qwen3.8-Flash-Next model: " + load_error);
       return false;
     }
+    // Wide copy verification (Executor::ForwardWide) reserves its lazy
+    // segment scratch beside the sessions (ResourceClaim). Narrow the width
+    // until the configured sessions fit, rather than refusing a session
+    // count the ordinary verifier width fits.
+    if (std::size_t free_bytes = 0, total_bytes = 0;
+        speculative_config.backend == TextSpeculativeBackend::kMtp &&
+        hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
+      const std::size_t sessions = std::max<std::size_t>(session_count, 1);
+      for (std::uint32_t rows = models::qwen38_flash_next::Model::kWideCopyRows;
+           ; rows -= 8) {
+        model->LimitCopyRows(rows);
+        if (rows == 8 ||
+            sessions * model->SessionBytes(core::SessionMode::kSpeculative,
+                                           max_context) +
+                    model->DeferredScratchBytes() <=
+                free_bytes)
+          break;
+      }
+    }
     if (rope_scaling) {
       Logger::Info(
           "loader",

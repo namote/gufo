@@ -170,6 +170,8 @@ bool Executor::CommitGdnStates(Session& session, std::uint32_t keep,
                                std::uint32_t n, std::string* error_msg) const {
   if (n <= 1)
     return true;  // a one-token batch updates its state in place
+  if (n > kWideSegmentRows)
+    return RollbackWide(session, keep, n, error_msg);
   const Config& c = config();
   for (auto& l : session.linear_) {
     if (l.state == nullptr)
@@ -177,6 +179,89 @@ bool Executor::CommitGdnStates(Session& session, std::uint32_t keep,
     RestoreGdnState(l.state, l.state_snapshots, keep, n, c.ssm_num_k_heads,
                     c.ssm_num_v_heads, stream_);
     if (!Check(hipGetLastError(), "state commit", error_msg))
+      return false;
+  }
+  return true;
+}
+
+bool Executor::RollbackWide(Session& session, std::uint32_t keep,
+                            std::uint32_t n, std::string* error_msg) const {
+  // ForwardWide ran consecutive segments of kWideSegmentRows rows (the last
+  // may be shorter). Segment 0 used the session's rollback rows and the
+  // live state; segment s >= 1 used wide_segments_[s - 1] and started from
+  // wide_state_, which after the pass holds the last segment's start (its
+  // end, for a one-row last segment, which updated it in place).
+  constexpr std::uint32_t kRows = kWideSegmentRows;
+  const std::uint32_t last = (n - 1) / kRows;
+  if (wide_owner_ != &session || keep == 0 || keep > n ||
+      wide_segments_.size() < last || wide_state_.empty()) {
+    AssignError(error_msg, "rollback outside the wide verification");
+    return false;
+  }
+  wide_owner_ = nullptr;
+  const Config& c = config();
+  const std::uint32_t segment = (keep - 1) / kRows;
+  const std::uint32_t local = keep - segment * kRows;
+  const auto count = [&](std::uint32_t s) {
+    return std::min(kRows, n - s * kRows);
+  };
+  const std::size_t state_bytes = std::size_t{c.ssm_num_v_heads} *
+                                  c.ssm_head_dim * c.ssm_head_dim *
+                                  sizeof(float);
+  const std::size_t conv_bytes =
+      std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels() * sizeof(float);
+  const auto records = [&](std::uint32_t s, std::size_t il) -> RollbackRows {
+    return s == 0 ? session.linear_[il].state_snapshots
+                  : wide_segments_[s - 1].state[il];
+  };
+  // Whole kept segment: its end history is the next segment's start, or
+  // the live history after the last one. Otherwise that segment's row.
+  const bool whole = local == count(segment);
+  for (std::size_t il = 0; il < session.linear_.size(); ++il) {
+    auto& l = session.linear_[il];
+    if (l.state == nullptr)
+      continue;
+    // The live state holds its value before the pass. Replay the same
+    // commits wide_state_ received, then the kept part of the last segment.
+    if (segment == last) {
+      if (!Check(hipMemcpyAsync(l.state, wide_state_[il], state_bytes,
+                                hipMemcpyDeviceToDevice, stream_),
+                 "wide state commit", error_msg))
+        return false;
+    } else {
+      for (std::uint32_t s = 0; s < segment; ++s)
+        RestoreGdnState(l.state, records(s, il), kRows, kRows,
+                        c.ssm_num_k_heads, c.ssm_num_v_heads, stream_);
+    }
+    if (count(segment) > 1 || segment != last)
+      RestoreGdnState(l.state, records(segment, il), local, count(segment),
+                      c.ssm_num_k_heads, c.ssm_num_v_heads, stream_);
+    if (!Check(hipGetLastError(), "wide state commit", error_msg))
+      return false;
+    const float* conv =
+        whole ? (segment == last ? nullptr
+                                 : wide_segments_[segment].conv_start[il])
+              : (segment == 0 ? l.conv_snapshots
+                              : wide_segments_[segment - 1].conv[il])
+                    .rows[local - 1];
+    if (conv != nullptr &&
+        !Check(hipMemcpyAsync(l.conv_state, conv, conv_bytes,
+                              hipMemcpyDeviceToDevice, stream_),
+               "wide conv rollback", error_msg))
+      return false;
+  }
+  if (session.ple_history_ != nullptr) {
+    const float* ple =
+        whole ? (segment == last ? nullptr : wide_segments_[segment].ple_start)
+              : (segment == 0 ? session.ple_snapshots_
+                              : wide_segments_[segment - 1].ple)
+                    .rows[local - 1];
+    if (ple != nullptr &&
+        !Check(hipMemcpyAsync(
+                   session.ple_history_, ple,
+                   std::size_t{c.PleConvHistory()} * c.HcDim() * sizeof(float),
+                   hipMemcpyDeviceToDevice, stream_),
+               "wide PLE rollback", error_msg))
       return false;
   }
   return true;

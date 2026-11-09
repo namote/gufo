@@ -689,6 +689,7 @@ inline void SameBits(const std::vector<T>& a, const std::vector<T>& b,
 // Cases defined in exl3_prefill_ops.cpp and exl3_mtp_ops.cpp, run from
 // exl3_ops_test.cpp main().
 void MtpExecutorCatchUp(bool batched);
+void WideVerification();
 void NarrowIndexerPrefill();
 void DensePrefillProjection();
 void PlainOperandPrecision();

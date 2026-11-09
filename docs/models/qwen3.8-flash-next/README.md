@@ -127,6 +127,29 @@ All-copy batches retain full width; sampled proposal streams are unchanged.
 Timings report
 `lookup_n` / `lookup_n_accepted`.
 
+A request decoding alone can verify a copy wider than the MTP chain (upstream
+#961, #993): greedy requests, and sampled ones without a seed whose rows verify
+compactly. Copy-only cycles start at the ordinary eight rows; two whole copies
+in a row at the current width double it, up to 64 rows, and any rejected copy
+returns it to eight. The wide pass (`Executor::ForwardWide`) runs the
+projections, routed experts and head once over every row on the decode batch
+route, and the recurrent state, attention and PLE as consecutive segments of
+at most eight rows, so each row's logits equal those of consecutive ordinary
+verifications (`qwen38_flash_next.exl3_wide_verification` checks logits,
+hidden rows, state and continuation after cutting back to any kept prefix).
+Later segments keep their deferred GDN update records and convolution/PLE
+prefix rows in executor-owned buffers and start their recurrence from one
+executor-owned state per linear layer; a rollback replays the committed
+segments' records into the live state. That is 45.7 MiB per segment past the
+first plus 108 MiB, 428 MiB at 64 rows, allocated on first use and reserved
+with the other lazy scratch. When the configured sessions leave less device
+memory, the load narrows the widest pass to what fits instead of refusing the
+session count. When more than eight rows are kept, the draft block catches up
+on all but the last of them at once (K/V only, as for prompt rows), so
+snapshots and batched cycles still hold at most eight hidden rows. Seeded
+sampled requests and batched cycles keep the ordinary width, so their
+proposals and random draws do not depend on scheduling.
+
 The official template defaults to thinking on, `xhigh` effort and preserving
 prior reasoning. Use the [reasoning controls](../../SERVER.md#reasoning-controls)
 for explicit effort/thinking overrides. Native context is 262144. A larger
