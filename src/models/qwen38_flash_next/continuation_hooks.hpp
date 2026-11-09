@@ -12,6 +12,9 @@ class ContinuationHooks {
 public:
   virtual ~ContinuationHooks() = default;
   virtual void BeforeExecution() = 0;
+  /// Runs on the host after an execution that called BeforeExecution has
+  /// submitted its device work, whether it succeeded or not.
+  virtual void AfterExecution() noexcept {}
   virtual void BeforeWrite(bool draft, std::uint32_t first, std::uint32_t end,
                            std::uint32_t first_block,
                            std::uint32_t end_block) = 0;

@@ -107,6 +107,8 @@ public:
     BeforeRelease();
     session->continuation_hooks_ = nullptr;
     session->session_->continuation_hooks_ = nullptr;
+    if (written != nullptr)
+      (void)hipEventDestroy(written);
   }
   bool IsValid() const noexcept override {
     return !restoring && !failed && (guarding || session->IsValid());
@@ -114,6 +116,45 @@ public:
   void BeforeExecution() override {
     if (!IsValid() || pending || checkpoint)
       throw std::logic_error("Flash-Next slot is not ready for execution");
+  }
+  void AfterExecution() noexcept override {
+    // Mark the end of this session's device work on the shared executor
+    // stream, so RetainRows waits for it and not for a peer's later passes.
+    if (!adapter.kv_pool_)
+      return;
+    const std::lock_guard lock(written_mutex);
+    if (written == nullptr &&
+        hipEventCreateWithFlags(&written, hipEventDisableTiming) != hipSuccess)
+      written = nullptr;
+    if (written != nullptr &&
+        hipEventRecord(written, adapter.model_->executor_->stream()) ==
+            hipSuccess)
+      unrecorded = false;
+    else
+      unrecorded = true;
+  }
+  // Blocks until every write this session submitted to the executor stream
+  // has finished. Without a recorded event covering all of them (a write
+  // outside BeforeExecution/AfterExecution, a restore, a reset or a failed
+  // record), it drains the whole stream as before.
+  void WaitForWrites() const {
+    const auto stream = adapter.model_->executor_->stream();
+    hipEvent_t event = nullptr;
+    {
+      const std::lock_guard lock(written_mutex);
+      if (!unrecorded)
+        event = written;
+    }
+    if (event != nullptr) {
+      Check(hipEventSynchronize(event));
+      return;
+    }
+    if (hipStreamQuery(stream) != hipSuccess)
+      Check(hipStreamSynchronize(stream));
+  }
+  void MarkUnrecorded() noexcept {
+    const std::lock_guard lock(written_mutex);
+    unrecorded = true;
   }
   void BeforeWrite(bool draft, std::uint32_t first, std::uint32_t end,
                    std::uint32_t first_block,
@@ -123,6 +164,7 @@ public:
     // every native write, including graph replay and speculative rollback.
     if (restoring || failed || pending || checkpoint)
       throw std::logic_error("Flash-Next slot is not ready for mutation");
+    MarkUnrecorded();
     CaptureDuringGuard readable(*this);
     for (const auto& component : adapter.layout_.Components()) {
       if (component.descriptor.kind != cache::ComponentKind::kAppendRows ||
@@ -150,6 +192,7 @@ public:
           (end_block + 1) * adapter.model_->config().compress_ratio);
   }
   void BeforeReset() override {
+    MarkUnrecorded();
     if (invalidating)
       return;
     if (restoring || pending || checkpoint)
@@ -162,6 +205,7 @@ public:
     Check(hipStreamSynchronize(adapter.model_->executor_->stream()));
   }
   void BeforeRestore() override {
+    MarkUnrecorded();
     BeforeExecution();
     GuardAll();
   }
@@ -203,6 +247,11 @@ public:
     State& state;
     bool previous;
   };
+  // Event recorded after this session's last execution, and whether a write
+  // may have been submitted after it (guarded by written_mutex).
+  mutable std::mutex written_mutex;
+  hipEvent_t written{nullptr};
+  bool unrecorded{true};
   bool restoring{false}, guarding{false}, invalidating{false};
   std::atomic<bool> failed{false};
   std::atomic<std::size_t> pending{0};
@@ -318,6 +367,9 @@ void ContinuationAdapter::PrefillThrough(cache::Slot& slot,
         state.guarding = guarding;
       }
     } scope(state, checkpoint);
+    // Every write up to the checkpoint is submitted: mark it so retained
+    // rows wait for this pass, not a peer's. The next write marks it stale.
+    state.AfterExecution();
     capture();
     if (state.pending)
       throw std::logic_error("in-pass capture returned with pending transfers");
@@ -513,6 +565,7 @@ void ContinuationAdapter::BeginRestore(
           : 0,
       State::Restored::kNone);
   state.GuardAll();
+  state.MarkUnrecorded();
   Check(hipStreamSynchronize(model_->executor_->stream()));
   state.session->session_->PrepareKvRestoreRows(target);
   state.restored_blocks = std::move(restored);
@@ -915,9 +968,15 @@ cache::Adapter::RetainedRows ContinuationAdapter::RetainRows(
     if (retained_.size() != kv_pool_->blocks())
       retained_.resize(kv_pool_->blocks());
     retained = retained_[physical].lock();
+  }
+  if (!retained) {
+    // A new retention exposes the block to independent streams. Wait for
+    // this session's own writes, outside the lock: draining the shared
+    // executor stream here made the capture wait for a peer's prefill.
+    state.WaitForWrites();
+    const std::lock_guard lock(retained_mutex_);
+    retained = retained_[physical].lock();
     if (!retained) {
-      if (hipStreamQuery(model_->executor_->stream()) != hipSuccess)
-        Check(hipStreamSynchronize(model_->executor_->stream()));
       kv_pool_->Retain(std::span(&physical, 1));
       try {
         retained = std::make_shared<RetainedBlock>(kv_pool_, physical);

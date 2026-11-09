@@ -71,6 +71,26 @@ std::uint64_t SessionSnapshotHostBytes(std::uint32_t token_count,
          std::uint64_t{vocab_size} * sizeof(float);
 }
 
+// Brackets one public execution with the continuation hooks. AfterExecution
+// also runs when the execution fails or throws: it only marks the device
+// work submitted so far.
+class ExecutionScope {
+public:
+  explicit ExecutionScope(ContinuationHooks* hooks) : hooks_(hooks) {
+    if (hooks_)
+      hooks_->BeforeExecution();
+  }
+  ~ExecutionScope() {
+    if (hooks_)
+      hooks_->AfterExecution();
+  }
+  ExecutionScope(const ExecutionScope&) = delete;
+  ExecutionScope& operator=(const ExecutionScope&) = delete;
+
+private:
+  ContinuationHooks* hooks_;
+};
+
 }  // namespace
 
 Model::~Model() = default;
@@ -401,8 +421,7 @@ bool Session::SyncDraftVocab(std::string* error_msg) {
 Session::~Session() = default;
 
 void Session::ResetDraftPolicy() {
-  if (continuation_hooks_)
-    continuation_hooks_->BeforeExecution();
+  const ExecutionScope execution(continuation_hooks_);
   draft_length_.Reset();
   // A fully reused prompt can start decoding without SyncImpl. It still
   // starts a new request: do not inherit a copy cursor or widen its first step.
@@ -456,8 +475,7 @@ void Session::SetCancellationCheck(std::function<bool()> check) {
 
 void Session::ConfigureVision(
     std::shared_ptr<const qwen::vision::Prompt> prompt) {
-  if (continuation_hooks_)
-    continuation_hooks_->BeforeExecution();
+  const ExecutionScope execution(continuation_hooks_);
   const auto identity = prompt ? prompt->IdentityForPrefix(tokens_.size())
                                : std::span<const std::uint8_t>{};
   if (!tokens_.empty() &&
@@ -755,8 +773,7 @@ bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
 
 bool Session::ProbeDraftChain(std::int32_t anchor, std::uint32_t depth,
                               DraftProbe* probe, std::string* error_msg) {
-  if (continuation_hooks_)
-    continuation_hooks_->BeforeExecution();
+  const ExecutionScope execution(continuation_hooks_);
   if (!valid_ || probe == nullptr || !MtpEnabled() || tokens_.empty() ||
       depth == 0 || depth > kMaxMtpDraftTokens) {
     AssignError(error_msg,
@@ -922,8 +939,7 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
 
 bool Session::Sync(std::span<const std::int32_t> prompt, std::string* error_msg,
                    std::span<const std::int32_t> next) {
-  if (continuation_hooks_)
-    continuation_hooks_->BeforeExecution();
+  const ExecutionScope execution(continuation_hooks_);
   return SyncImpl(prompt, error_msg, 0, nullptr, nullptr, next);
 }
 
@@ -931,8 +947,7 @@ bool Session::SyncThrough(std::span<const std::int32_t> prompt,
                           std::uint32_t boundary,
                           std::unique_ptr<SessionSnapshot>* checkpoint,
                           std::string* error_msg, double* capture_ms) {
-  if (continuation_hooks_)
-    continuation_hooks_->BeforeExecution();
+  const ExecutionScope execution(continuation_hooks_);
   if (!checkpoint || boundary == 0 || boundary > prompt.size() ||
       prompt.size() - boundary > model_->PrefillCheckpointTail() ||
       boundary <= tokens_.size()) {
@@ -950,8 +965,7 @@ bool Session::SyncThroughComponents(std::span<const std::int32_t> prompt,
                                     std::uint32_t boundary,
                                     const PrefillCapture& capture,
                                     std::string* error_msg) {
-  if (continuation_hooks_)
-    continuation_hooks_->BeforeExecution();
+  const ExecutionScope execution(continuation_hooks_);
   if (!capture || boundary == 0 || boundary > prompt.size() ||
       prompt.size() - boundary > model_->PrefillCheckpointTail() ||
       boundary <= tokens_.size()) {
@@ -1003,8 +1017,7 @@ bool Session::SyncImpl(std::span<const std::int32_t> prompt,
 }
 
 bool Session::Evaluate(std::int32_t token, std::string* error_msg) {
-  if (continuation_hooks_)
-    continuation_hooks_->BeforeExecution();
+  const ExecutionScope execution(continuation_hooks_);
   if (!valid_) {
     AssignError(error_msg,
                 "session needs a successful Sync after a failed operation");
@@ -1557,8 +1570,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
                          sampling::SamplerState& sampler, DecodeResult* result,
                          std::string* error_msg, bool stop_at_eos,
                          std::uint32_t occupancy, std::uint32_t residents) {
-  if (continuation_hooks_)
-    continuation_hooks_->BeforeExecution();
+  const ExecutionScope execution(continuation_hooks_);
   if (!valid_) {
     AssignError(error_msg,
                 "session needs a successful Sync after a failed operation");
@@ -1617,6 +1629,17 @@ bool Session::RunIsolatedBatch(std::span<const Request> requests,
   std::array<speculative::PromptLookup<>::State, 8> lookup_states{};
   std::vector<Request> active;
   active.reserve(requests.size());
+  // Every session whose BeforeExecution succeeded may have batch work
+  // submitted; mark the end of it once the batch and its retries return.
+  struct AfterBatch {
+    std::span<const Request> requests;
+    std::array<bool, 8> executed{};
+    ~AfterBatch() {
+      for (std::size_t i = 0; i < requests.size(); ++i)
+        if (executed[i])
+          requests[i].session->continuation_hooks_->AfterExecution();
+    }
+  } after_batch{requests};
   Model* model = nullptr;
   for (std::size_t i = 0; i < requests.size(); ++i) {
     const auto& r = requests[i];
@@ -1648,8 +1671,10 @@ bool Session::RunIsolatedBatch(std::span<const Request> requests,
       continue;
     }
     try {
-      if (r.session->continuation_hooks_)
+      if (r.session->continuation_hooks_) {
         r.session->continuation_hooks_->BeforeExecution();
+        after_batch.executed[i] = true;
+      }
     } catch (const std::exception& exception) {
       outcome.error = exception.what();
       continue;
