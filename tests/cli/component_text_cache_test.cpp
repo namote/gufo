@@ -3322,7 +3322,128 @@ void SiblingDoesNotAdoptAnotherExecutionsCheckpoint() {
   assert(files() - before - sibling > sibling);
   std::filesystem::remove_all(directory);
 }
+// U5: an unchanged retry restores the complete prompt it selected even when
+// the same request's cold assignment first captures the replaced slot's
+// uncovered frontier and that capture needs the space. The selected record
+// is pinned through the restore; the pin goes when the restore ends, whether
+// it restored, failed or was cancelled.
+void SelectedCheckpointSurvivesReassignmentCapture() {
+  enum class Retry { kRestores, kFails, kCancelled };
+  for (const auto mode : {Retry::kRestores, Retry::kFails, Retry::kCancelled}) {
+    auto runner = std::make_shared<Runner>();
+    // Room for two retained private states: the stable boundary and the
+    // complete prompt. A third capture must evict one.
+    runner->private_blocks = 2;
+    ComponentTextCache cache(runner, 1, 1 << 22, {});
+    std::vector<TextRunnerToken> prompt(20);
+    std::iota(prompt.begin(), prompt.end(), 10);
+    constexpr std::size_t stable = 12;
+    const auto publish = [&](ComponentTextCache::Lease& lease,
+                             std::size_t boundary, SnapshotPurpose purpose) {
+      const std::vector<TextRunnerToken> tokens(prompt.begin(),
+                                                prompt.begin() + boundary);
+      assert(lease.TryReserveSnapshot(lease.CaptureBytes(), boundary, false,
+                                      purpose, tokens));
+      assert(lease.PublishSnapshot(tokens, lease.Capture(), false));
+    };
+    {
+      auto seed = cache.Acquire(prompt, {}, {}, true, stable, true);
+      auto& state = dynamic_cast<State&>(seed->state());
+      const auto head = std::span(prompt).first(stable);
+      runner->adapter->Append(state.slot, head, head);
+      publish(*seed, stable, SnapshotPurpose::kContinuation);
+      const auto rest = std::span(prompt).subspan(stable);
+      runner->adapter->Append(state.slot, rest, rest);
+      // The complete prompt, covered by its stable boundary: retry rank 0.
+      publish(*seed, prompt.size(), SnapshotPurpose::kRetry);
+      (void)seed->Commit({}, {}, prompt);
+    }
+    const auto turn = [&](const std::vector<TextRunnerToken>& tokens) {
+      auto lease = cache.Acquire(tokens, {}, {}, true, 0, true);
+      auto& state = dynamic_cast<State&>(lease->state());
+      const auto tail = std::span(tokens).subspan(lease->cached_tokens());
+      runner->adapter->Append(state.slot, tail, tail);
+      (void)lease->Commit({}, {}, tokens);
+    };
+    // Another conversation takes the only slot; its frontier is uncovered.
+    std::vector<TextRunnerToken> other(80);
+    std::iota(other.begin(), other.end(), 5000);
+    turn(other);
+    // The reassignment capture below is refused before any transfer (no
+    // private block is free and the pinned retry cannot give its own), so
+    // the injected failure hits the restore.
+    if (mode == Retry::kFails)
+      runner->adapter->FailNextTransfer();
+    // Acquire checks once on entry, then before each restore candidate.
+    std::size_t checks = 0;
+    const ContinuationCache::CancellationCheck cancelled = [&] {
+      return mode == Retry::kCancelled && checks++ > 0;
+    };
+    {
+      auto retry = cache.Acquire(prompt, cancelled, {}, true, stable, true);
+      // A failed restore goes on to the next candidate, the stable boundary.
+      assert(retry->cached_tokens() == (mode == Retry::kRestores ? prompt.size()
+                                        : mode == Retry::kFails  ? stable
+                                                                 : 0));
+      // The capture was refused instead: the complete prompt stays retained.
+      assert(cache.CachedPrefixTokens(prompt, nullptr, false) == prompt.size());
+      auto& state = dynamic_cast<State&>(retry->state());
+      // Leave an uncovered frontier of this conversation behind.
+      const auto tail = std::span(prompt).subspan(retry->cached_tokens());
+      runner->adapter->Append(state.slot, tail, tail);
+      std::vector<TextRunnerToken> live = prompt;
+      for (TextRunnerToken token = 0; token < 70; ++token)
+        live.push_back(9000 + token);
+      const auto generated = std::span(live).subspan(prompt.size());
+      runner->adapter->Append(state.slot, generated, generated);
+      (void)retry->Commit({}, {}, live);
+    }
+    // Without its pin the complete prompt gives way to the next frontier
+    // capture, and the retry falls back to the stable boundary.
+    std::vector<TextRunnerToken> third(80);
+    std::iota(third.begin(), third.end(), 7000);
+    turn(third);
+    auto again = cache.Acquire(prompt, {}, {}, true, stable, true);
+    assert(again->cached_tokens() == stable);
+    again->Invalidate();
+  }
+}
+// A warm chat turn whose prompt ends on the alignment captures no separate
+// aligned prompt tail: it would be the complete prompt's own state. One
+// ending off the alignment checkpoints the aligned tail inside its pass.
+void AlignedPromptEndCapturesNoSeparateTail() {
+  for (const std::size_t extra : {7, 6}) {
+    auto runner = std::make_shared<Runner>();
+    runner->alignment = 4;
+    runner->in_pass = true;
+    TextRunnerPool pool(runner, 1);
+    std::vector<TextRunnerToken> prompt(40);
+    std::iota(prompt.begin(), prompt.end(), 10);
+    auto first = pool.Acquire(prompt, {}, {}, {}, true, 36);
+    Prefill(first);
+    prompt.push_back(Generate(first));
+    (void)first.Commit();
+    const auto cached = prompt.size();
+    for (std::size_t i = 0; i < extra; ++i)
+      prompt.push_back(static_cast<TextRunnerToken>(1000 + i));
+    runner->pass_ends.clear();
+    runner->in_pass_points.clear();
+    auto turn = pool.Acquire(prompt, {}, {}, {}, true, cached + 2);
+    assert(turn.cached_prompt_tokens() == cached);
+    Prefill(turn);
+    assert((runner->pass_ends == std::vector<std::size_t>{prompt.size()}));
+    if (prompt.size() % 4 == 0)
+      assert(runner->in_pass_points.empty());
+    else
+      assert((runner->in_pass_points ==
+              std::vector<std::size_t>{prompt.size() / 4 * 4}));
+    (void)Generate(turn);
+    turn.Invalidate();
+  }
+}
 int main() {
+  SelectedCheckpointSurvivesReassignmentCapture();
+  AlignedPromptEndCapturesNoSeparateTail();
   FailedWriteBackKeepsTheLiveFrontier();
   QueuedWriteBackFailureUncoversTheFrontier();
   ScatteredRowsWriteBackChunkByChunk();

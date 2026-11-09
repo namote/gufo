@@ -140,6 +140,15 @@ struct RetentionRequest {
 // then its shallowest history boundary, which other prompts may share. A
 // reused conversation gives up covered records, then leaves. In both, a
 // fork that two continuations extended directly outlives those leaves.
+// Whenever a complete-prompt retry copy would go, its turn's aligned prompt
+// tail goes instead (a continuation strictly between the retry's stable
+// boundary and its end, which nothing but the retry extends): an unchanged
+// retry needs the complete prompt, while the tail only bounds the prefill of
+// a next turn that diverges inside the assistant framing. This holds even
+// for a retry-priority admission that may otherwise displace only optional
+// copies. A tail that is pinned, protected, persisting, forked, the request
+// source or continued by the incoming request stays, as does one freeing
+// less than half the retry's unique payload.
 class RetentionPolicy {
 public:
   static constexpr std::size_t kRecordLimit = 128;
@@ -167,6 +176,15 @@ public:
   [[nodiscard]] bool ReclaimWhere(
       const std::function<bool(const Checkpoint&)>& holds);
   void Touch(CheckpointId);
+  // False, and no effect, when the record is no longer retained (an exact
+  // replacement or explicit removal published since it was looked up).
+  [[nodiscard]] bool TryTouch(CheckpointId) noexcept;
+  // Keeps a looked-up record from eviction (admission, Reclaim, ReclaimWhere)
+  // until each Pin is matched by Unpin, as while a request restores it.
+  // Explicit Remove and exact replacement still apply. Unknown ids are
+  // ignored; pins go with their record.
+  void Pin(CheckpointId) noexcept;
+  void Unpin(CheckpointId) noexcept;
   void Remove(CheckpointId);
   [[nodiscard]] std::uint32_t Rank(CheckpointId) const;
   [[nodiscard]] std::size_t Size() const { return size_; }
@@ -183,6 +201,8 @@ private:
     std::optional<std::uint64_t> reused_at;
     // Two continuations once extended this record directly.
     bool forked{false};
+    // Outstanding Pin calls (beside `forked`, in its padding).
+    std::uint32_t pins{};
     // Retained records extending this one, by slot.
     std::bitset<kRecordLimit> below;
   };
@@ -198,6 +218,7 @@ private:
   std::size_t UniquePayloadBytes(std::size_t) const noexcept;
   bool Persisting(std::size_t) const;
   std::size_t Victim(const RetentionRequest&, bool records) const;
+  std::size_t AlignedTail(std::size_t retry, const RetentionRequest&) const;
   void Erase(std::size_t, RetentionReason, std::uint32_t rank);
   void Emit(RetentionAction, RetentionReason, CheckpointId, Rows,
             RetentionPurpose, std::uint32_t, std::uint64_t,

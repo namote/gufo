@@ -1566,6 +1566,31 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
   if (cancelled && cancelled())
     return {};
   auto input = Inputs(prompt.size(), context.get());
+  // Pins the RAM checkpoints Lookup selected until this request's restore
+  // ends: admission in between (CaptureBeforeReset below, or a concurrent
+  // request) must not evict the record the restore is about to read.
+  struct RestorePins {
+    Impl* cache;
+    std::vector<cache::CheckpointId> ids;
+    // Under the cache mutex.
+    void Hold(const cache::PrefixLookup& found) {
+      for (const auto& candidate : found.candidates)
+        if (candidate.checkpoint) {
+          ids.push_back(candidate.checkpoint->Id());
+          cache->retention.Pin(ids.back());
+        }
+    }
+    // Without the cache mutex.
+    void Release() noexcept {
+      if (ids.empty())
+        return;
+      const std::lock_guard lock(cache->mutex);
+      for (const auto id : ids)
+        cache->retention.Unpin(id);
+      ids.clear();
+    }
+    ~RestorePins() { Release(); }
+  } restore_pins{impl_.get(), {}};
   cache::PrefixLookup found;
   Impl::Entry* entry = nullptr;
   std::optional<cache::BorrowedLocation> live;
@@ -1681,6 +1706,8 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     }
     if (!entry)
       throw cache::SlotBusy();
+    restore_pins.ids.reserve(found.candidates.size());
+    restore_pins.Hold(found);
     entry->busy = true;
     entry->holds_rows = true;
     entry->used = ++impl_->clock;
@@ -1861,9 +1888,22 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           entry->history = std::make_unique<cache::ExecutionHistory>(
               cache::ExecutionHistory::Restored(impl_->ledger, checkpoint));
           request.source = checkpoint.Id();
+          bool retained;
           {
             const std::lock_guard lock(impl_->mutex);
-            impl_->retention.Touch(checkpoint.Id());
+            retained = impl_->retention.TryTouch(checkpoint.Id());
+          }
+          // The pin kept it from eviction; only an exact replacement or
+          // explicit removal ends the record. The validated state is still
+          // the prompt prefix it restored.
+          if (!retained) {
+            try {
+              Logger::Info("cache",
+                           "schema=component-cache-v1 event=restore_untracked "
+                           "tokens=" +
+                               std::to_string(candidate.boundary));
+            } catch (...) {
+            }
           }
           restored = true;
         } else if (candidate.durable && impl_->streaming) {
@@ -1945,6 +1985,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
                                         impl_->resources->adapter->Components(),
                                         impl_->identity));
     }
+    restore_pins.Release();
     // Restore/reset may clear the attachment; install this request again.
     impl_->runner->SetPromptContext(*request.state, context);
     impl_->runner->ReconcileComponentState(*request.state, request.cached);

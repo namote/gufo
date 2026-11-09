@@ -1150,7 +1150,124 @@ void RealCapacityAndUniqueAdmission() {
   }
 }
 }  // namespace
+// Record pressure takes the aligned tail before its retry, too.
+void AlignedTailGoesFirstUnderRecordPressure() {
+  Fixture f(4);
+  const std::vector<Token> prompt{1, 2, 3, 4, 5, 6};
+  f.Add({1, 2});
+  const auto tail = f.Add({1, 2, 3, 4});
+  const auto retry = f.Add(prompt, RetentionPurpose::kRetry, 2);
+  f.Add({9, 9});
+  assert(f.policy.Rank(retry) == 0);
+  std::vector<Token> other{8, 8};
+  assert(f.policy.Admit({other, {1}, {}, RetentionPurpose::kContinuation},
+                        [&] { return IndexCheckpoint(f.ledger, other); }));
+  assert(f.log.events[f.log.events.size() - 2].checkpoint == tail);
+  assert(f.Cached(prompt) == prompt.size());
+}
+// A request restoring a looked-up record pins it: no admission, Reclaim or
+// device reclaim removes it until every pin is released.
+void PinnedRecordIsNotAVictim() {
+  PressureFixture f;
+  const auto other = f.Add(Conversation(1, 16));
+  const auto stable = Conversation(2, 8);
+  f.Add(stable);
+  auto prompt = stable;
+  prompt.push_back(5);
+  RetentionRequest retry_request{prompt, {1}, {}, RetentionPurpose::kRetry, 8};
+  assert(f.policy.Admit(retry_request, [&] {
+    return IndexCheckpoint(f.ledger, prompt, {1}, {}, kPressureComponents);
+  }));
+  const auto retry = f.log.events.back().checkpoint;
+  assert(f.policy.Rank(retry) == 0);
+  f.policy.Pin(retry);
+  f.policy.Pin(retry);
+  f.policy.Pin({999999});  // unknown: ignored
+  std::vector<Token> incoming{99, 99, 99, 99, 99, 99, 99, 99, 99};
+  // A retry-priority copy may only take rank 0: the pinned retry is not one.
+  RetentionRequest copy{incoming, {1}, {}, RetentionPurpose::kRetry};
+  assert(!f.policy.Reclaim(copy));
+  assert(!f.policy.ReclaimWhere(
+      [&](const Checkpoint& c) { return c.Id() == retry; }));
+  assert(f.Reclaim() == other);
+  f.policy.Unpin(retry);
+  assert(!f.policy.Reclaim(copy));
+  f.policy.Unpin(retry);
+  f.policy.Unpin(retry);  // more releases than pins: no effect
+  assert(f.policy.Reclaim(copy));
+  assert(f.log.events.back().checkpoint == retry);
+  assert(!f.policy.TryTouch(retry));
+  f.policy.Unpin(retry);  // removed: ignored
+  // Record pressure skips a pinned record, too.
+  Fixture g(2);
+  const auto oldest = g.Add({1, 2});
+  const auto newer = g.Add({3, 4});
+  g.policy.Pin(oldest);
+  g.Add({5, 6});
+  assert(g.log.events[g.log.events.size() - 2].checkpoint == newer);
+  assert(g.policy.TryTouch(oldest));
+}
+// A turn whose prompt ends off the prefill alignment keeps its aligned prompt
+// tail beside the complete prompt. Under pressure the tail goes first: an
+// unchanged retry needs the complete prompt, while the tail only bounds a
+// next turn that diverges inside the assistant framing.
+void AlignedTailGoesBeforeItsRetry() {
+  enum class Case { kAlone, kDiverged, kPinned, kContinued, kSource, kRecords };
+  for (const auto c : {Case::kAlone, Case::kDiverged, Case::kPinned,
+                       Case::kContinued, Case::kSource, Case::kRecords}) {
+    PressureFixture f;
+    (void)f.Add(Conversation(1, 16));
+    const auto prompt = Conversation(2, 18);
+    (void)f.Add({prompt.begin(), prompt.begin() + 8});
+    const auto tail = f.Add({prompt.begin(), prompt.begin() + 16});
+    RetentionRequest request{prompt, {1}, {}, RetentionPurpose::kRetry, 12};
+    assert(f.policy.Admit(request, [&] {
+      return IndexCheckpoint(f.ledger, prompt, {1}, {}, kPressureComponents);
+    }));
+    const auto retry = f.log.events.back().checkpoint;
+    auto next = std::vector<Token>(prompt.begin(), prompt.begin() + 16);
+    next.insert(next.end(), {77, 78, 79, 80});
+    switch (c) {
+      case Case::kAlone:
+        assert(f.Reclaim() == tail);
+        assert(f.Reclaim() == retry);
+        // A boundary at or before the retry's stable position is never
+        // taken as its tail.
+        assert(f.Cached(prompt) == 8);
+        break;
+      case Case::kDiverged:
+        // Another turn continued the tail apart from the retry: it restores
+        // from the tail, which stays ahead of the retry copy.
+        (void)f.Add(next);
+        assert(f.Reclaim() == retry);
+        break;
+      case Case::kPinned:
+        f.policy.Pin(tail);
+        assert(f.Reclaim() == retry);
+        break;
+      case Case::kSource: {
+        // A request that restored the tail keeps it as its source.
+        std::vector<Token> incoming{99, 99, 99, 99, 99, 99, 99, 99, 99};
+        RetentionRequest from_tail{incoming, {1}, {}};
+        from_tail.source = tail;
+        assert(f.policy.Reclaim(from_tail));
+        assert(f.log.events.back().checkpoint == retry);
+        break;
+      }
+      case Case::kRecords:
+        break;
+      case Case::kContinued:
+        // The incoming request continues the tail.
+        assert(f.policy.Reclaim({next, {1}, {}}));
+        assert(f.log.events.back().checkpoint == retry);
+        break;
+    }
+  }
+}
 int main() {
+  AlignedTailGoesFirstUnderRecordPressure();
+  PinnedRecordIsNotAVictim();
+  AlignedTailGoesBeforeItsRetry();
   Planning();
   Branches();
   RanksAndSources();

@@ -413,6 +413,7 @@ std::size_t RetentionPolicy::Victim(const RetentionRequest& r,
       std::ranges::find(r.protected_checkpoints,
                         records_[source].checkpoint->Id()) ==
           r.protected_checkpoints.end() &&
+      !records_[source].pins &&
       records_[source].checkpoint->Compatibility() == r.compatibility &&
       records_[source].checkpoint->Input() == r.input &&
       records_[source].checkpoint->Boundary() < r.tokens.size() &&
@@ -434,7 +435,7 @@ std::size_t RetentionPolicy::Victim(const RetentionRequest& r,
                 resumed_tail
             ? 2
             : MaxRank(r.purpose);
-    if (!records_[i].checkpoint || Persisting(i) ||
+    if (!records_[i].checkpoint || records_[i].pins || Persisting(i) ||
         std::ranges::find(r.protected_checkpoints,
                           records_[i].checkpoint->Id()) !=
             r.protected_checkpoints.end())
@@ -508,7 +509,47 @@ std::size_t RetentionPolicy::Victim(const RetentionRequest& r,
       ((!record_pressure && !r.preserve_source) ||
        (record_pressure && limit_ == 1 && Continuation(r.purpose))))
     return source;
-  return target;
+  return target == limit_ ? target : AlignedTail(target, r);
+}
+std::size_t RetentionPolicy::AlignedTail(std::size_t retry,
+                                         const RetentionRequest& r) const {
+  const auto& e = records_[retry];
+  if (e.purpose != RetentionPurpose::kRetry || retry == Find(r.source))
+    return retry;
+  const auto source = Find(r.source);
+  std::size_t tail = limit_;
+  for (std::size_t i = 0; i < limit_; ++i) {
+    const auto& t = records_[i];
+    // below[retry] implies the same compatibility and input, and a strict
+    // token prefix of the retry.
+    if (!t.checkpoint || t.purpose != RetentionPurpose::kContinuation ||
+        !t.below[retry] || i == source || t.pins || t.forked || Persisting(i) ||
+        Branch(i) || t.checkpoint->Boundary() <= e.stable ||
+        std::ranges::find(r.protected_checkpoints, t.checkpoint->Id()) !=
+            r.protected_checkpoints.end())
+      continue;
+    // The incoming request continues it.
+    if (t.checkpoint->Compatibility() == r.compatibility &&
+        t.checkpoint->Input() == r.input &&
+        Prefix(t.checkpoint->Tokens(), r.tokens))
+      continue;
+    // Only the retry, or records extending it, may extend the tail: another
+    // turn that diverged inside it restores from it.
+    bool only_retry = true;
+    for (std::size_t j = 0; j < limit_ && only_retry; ++j)
+      only_retry = !t.below[j] || j == retry || e.below[j];
+    if (only_retry &&
+        (tail == limit_ ||
+         t.checkpoint->Boundary() > records_[tail].checkpoint->Boundary()))
+      tail = i;
+  }
+  // The tail shares the retry's prefix rows. Under byte pressure take it
+  // only when it frees about as much (its private state dominates), or the
+  // next round takes the retry as well and the turn keeps neither.
+  if (tail != limit_ &&
+      UniquePayloadBytes(tail) * 2 < UniquePayloadBytes(retry))
+    return retry;
+  return tail == limit_ ? retry : tail;
 }
 void RetentionPolicy::Emit(RetentionAction action, RetentionReason reason,
                            CheckpointId id, Rows boundary,
@@ -567,7 +608,7 @@ bool RetentionPolicy::ReclaimWhere(
   std::tuple<bool, std::uint32_t, std::uint64_t> lowest{};
   for (std::size_t i = 0; i < limit_; ++i) {
     const auto& e = records_[i];
-    if (!e.checkpoint || !holds(*e.checkpoint))
+    if (!e.checkpoint || e.pins || !holds(*e.checkpoint))
       continue;
     const std::tuple order{Persisting(i), Priority(i), e.last_used};
     if (victim == limit_ || order < lowest) {
@@ -676,6 +717,7 @@ bool RetentionPolicy::Admit(const RetentionRequest& r, const Capture& capture) {
     } catch (const ResourceExhausted&) {
       auto target = limit_;
       if (exact != limit_ && records_[exact].checkpoint &&
+          !records_[exact].pins &&
           (records_[exact].checkpoint->Id() != r.source ||
            !r.preserve_source) &&
           std::ranges::find(r.protected_checkpoints,
@@ -771,6 +813,21 @@ void RetentionPolicy::Touch(CheckpointId id) {
   e.reused_at = admitted_bytes_;
   Emit(RetentionAction::kTouched, RetentionReason::kExplicit, id,
        e.checkpoint->Boundary(), e.purpose, Priority(i), e.last_used);
+}
+bool RetentionPolicy::TryTouch(CheckpointId id) noexcept {
+  const auto i = Find(id);
+  if (i == limit_)
+    return false;
+  Touch(id);
+  return true;
+}
+void RetentionPolicy::Pin(CheckpointId id) noexcept {
+  if (const auto i = Find(id); i != limit_)
+    ++records_[i].pins;
+}
+void RetentionPolicy::Unpin(CheckpointId id) noexcept {
+  if (const auto i = Find(id); i != limit_ && records_[i].pins)
+    --records_[i].pins;
 }
 void RetentionPolicy::Remove(CheckpointId id) {
   const auto i = Find(id);
