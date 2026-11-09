@@ -185,7 +185,7 @@ U1~U3과 같은 방식(구현 → `build/b1` 빌드 → 관련 CPU 테스트 →
 | functional | 최종 후보에서 conversation·batch·long-context·tool-type-unions·logprobs·responses-logprobs·openai-count-tokens·tool-schema-edges 통과. cache-growth·cache-shared-prefix·cache(+persist)·`cache_alignment_qwen38.py`는 U4-1이 있던 이전 빌드에서 통과(호스트 캐시 코드는 같다). tool-reasoning은 기준과 후보가 같은 곳(`literal_protocol_raw_xml`, greedy 거부)에서 실패: 기존 모델 동작 |
 | 성능 (5%/10 ms, B C 교대) | PP2048 −0.04/−1.2%, PP8192 +0.6/+0.5%, AR d0·d32K ±0.4% 안, MTP d0 +2.2/−0.3/+0.4%(work 같음), MTP d32K +5.7/+5.2/+9.7%(U4-3 덕분, 10 대 17 cycle, hash 같음). 이번 창의 MTP 절대값은 모든 binary에서 B10보다 약 30% 낮았다(같은 argv·work, AR·PP는 같음): 환경 원인, 설명 못 함 |
 | U4-1 | 되돌림(`4f49f025`), byte 동일이 아님 |
-| U4-3 | **되돌림.** 측정은 좋았다: greedy rewrite 24/24가 u13과 token 동일(FP16·K4V4 두 번씩), decode −12~−35%, Pi turn decode 최대 −22%. 그러나 두 번째 K4V4 실행에서 `docstring-admission` greedy decode가 114 token에서 10분 멈췄다(GPU 100%, `ForwardBatchImpl(wide=true)`의 `hipStreamSynchronize`, `serve/hang-k4v4-gdb.txt`). 같은 요청이 첫 실행에서는 통과했다. 원인은 못 찾았다. 다시 들이려면 한 세션 64행 pass의 반복 stress 실행이 먼저 필요하다. 후보 전용 cold prefill 지연(+73~150 ms, 36개 중 약 8개, u13은 2개)도 판단 보류로 남았다 |
+| U4-3 | **되돌림.** 측정은 좋았다: greedy rewrite 24/24가 u13과 token 동일(FP16·K4V4 두 번씩), decode −12~−35%, Pi turn decode 최대 −22%. 그러나 두 번째 K4V4 실행에서 `docstring-admission` greedy decode가 114 token 뒤 약 6분 멈췄다(마지막 진행 05:00:03, 종료 신호 05:06:11 UTC)(GPU 100%, `ForwardBatchImpl(wide=true)`의 `hipStreamSynchronize`, `serve/hang-k4v4-gdb.txt`). 같은 요청이 첫 실행에서는 통과했다. 원인은 못 찾았다(정적 조사와 GPU 실험 계획은 아래 "U4-3 hang 조사", U4-3R). 다시 들이려면 한 세션 64행 pass의 반복 stress 실행이 먼저 필요하다. 후보 전용 cold prefill 지연(+73~150 ms, 36개 중 약 8개, u13은 2개)도 판단 보류로 남았다 |
 | U4-4 | opt-in 유지, 기본값은 그대로. 꺼짐(생략·false) 36/36이 u13과 text·draft·accept·round까지 같음. 켜짐: sampled 18/18 요청이 빨라짐 +2.5~+27.6%(chat 중앙값 약 +21%, code 약 +17%, prose +8~+26%). 품질: 산수 30/30 둘 다, 평균 길이 147→162.7(중앙값 141→143.5), 4-gram 반복 0.0070→0.0084(최대 0.040→0.034), tool-schema-edges 통과, tool-reasoning은 꺼짐과 같은 greedy 검사에서 실패. 기본값은 사용자가 정한다 |
 | U4-5 | 기각(현재 형태). bench 버그를 먼저 고쳤다(`c05c8e49`). byte 동일, mixer당 production/fused 45.88/41.23, 46.87/42.99, 49.27/46.35, 54.27/52.99 µs. 후보에 없는 slab 회전 launch(약 2 µs)를 빼면 +2.65/+1.88/+0.92/−0.72 µs라 8 token에서 진다. 회전을 넣어도 TG 1% 미만이 상한. B3/B4 tail 융합 손해와 같은 결론 |
 | Pi (같은 경로) | 5 case 모두 통과. 첫 8 turn은 출력·재사용·prefill token이 같다. 9번째 turn(같은 비정렬 live frontier 2186에서 74-token pass)부터 greedy 출력이 갈린다: U2-3의 짧은 pass HC inject 순서 차이로 보이며 둘 다 유효한 출력이다 |
@@ -206,7 +206,41 @@ U1~U3과 같은 방식(구현 → `build/b1` 빌드 → 관련 CPU 테스트 →
 ### U5가 끝내지 못한 것
 - 요청 취소 케이스 decode 지연: conversation·batch 재실행에서는 방향이 쌍마다 뒤바뀌어(scheduling) 후보 탓이 아니다. 처음 본 219→327 ms(cache suite thinking-tool-cancel)는 다시 돌리지 않아 판단 보류.
 - 이번 창의 MTP 절대 속도 저하(모든 binary 약 −30%)와 두 binary 모두에서 한 번씩 본 약 30초 decode 멈춤: 환경 원인으로 보이나 확인 못 함.
-- U4-3 hang의 원인과 후보 전용 prefill 지연.
+- U4-3 hang의 원인과 후보 전용 prefill 지연. hang은 아래 "U4-3 hang 조사"(U4-3R)에서 정적으로 좁혔고, 원인 확정은 GPU 실험으로 넘겼다.
+
+### U4-3 hang 조사 (U4-3R, 2026-11-09, 정적 감사만, GPU 실행 없음)
+
+**결론: 정적으로는 원인을 찾지 못했다. U4-3은 다시 들이지 않았다.** 아래 GPU 실험으로 가설을 가린다.
+
+로그에서 나온 것:
+- **이 요청의 입력에 결정적으로 달린 버그가 아니다.** 첫 실행(`serve/cand-rewrite-k4v4`)과 hang 난 두 번째 실행(`serve/cand-rewrite2-k4v4`)은 binary(`cand-gufo`, `8f700bdf`), argv, 요청 순서, 메모리 예산(`deferred_scratch_budget_bytes` 866,463,744 → 첫 wide pass 뒤 354,443,264, 두 실행 같음)이 같고, 캐시 디렉터리는 실행마다 지웠으며(`stage3_serve.sh`), 모든 요청이 cache=miss라 hang 난 요청도 cold prefill(279 token)에서 시작했다. 그 요청(`docstring-admission` greedy)은 두 실행에서 57 token(51/53 accepted/proposed)과 114 token(96/130) 진행 기록까지 draft 수가 같다. 첫 실행은 같은 prompt·token·pass 폭을 통과했다(다음 기록 162 token, 끝 250). 그러므로 이 요청의 행 수, group·ring 경계, 위치 문턱, 정렬 안 된 시작만으로 정해지는 조건은 원인이 아니다. 다만 두 실행이 완전히 같지는 않다. 앞선 sampled 요청이 갈렸고(r7 1091 대 1099 token, 그래서 slot 2 frontier 2159 대 2167, rename sampled 44 대 45 round, `session_graph_count` 24 대 23), r12 admission에서 첫 실행만 `live_frontier_written_back slot=1`, retention 두 건, `published tokens=511`을 더 남겼다. 두 번째 실행은 272-token checkpoint를 멈추기 약 1초 전에 publish했고, 첫 실행은 114 token 뒤에 했다. 남은 차이는 다른 slot의 상태, graph cache, 같은 시각의 캐시 capture·publish 복사다.
+- 진행 기록은 생성 token이 50의 배수를 넘을 때만 남는다(`text_generation_scheduler.cpp`). 114 뒤 150 전에 pass가 여러 번 있었을 수 있어, 멈춘 pass는 위치 약 392~428에서 시작하고 끝은 약 492 이하다. KVarN group 경계(384, 512)는 이 범위에 없다.
+- 커널 로그(journalctl -k, 13:58~14:10 KST)에 amdgpu 메시지가 없다: page fault, MES timeout, reset 모두 없다.
+- gdb(`serve/hang-k4v4-gdb.txt`): decode thread만 `hipStreamSynchronize`에서 기다린다. cache idle-spill·persistence·n-gram thread는 모두 condvar 대기라 다른 stream에 걸린 host 작업이 없다.
+- 같은 창에서 기준 binary도 약 30초 decode 멈춤을 한 번 냈고, 모든 binary의 MTP 절대 속도가 약 30% 낮았다. 배포 서버가 같은 GPU에서 돌고 있었다.
+
+정적 감사(K4V4에서 `ForwardWide`/`ForwardBatchImpl(wide=true)`가 실행하는 것, narrow verify와 비교):
+- **대기하는 kernel이 없다.** Flash-Next·EXL3·KVarN kernel 어디에도 spin-wait나 flag 대기가 없다. 다른 block을 기다리는 곳은 모두 "마지막에 도착한 block이 epilogue" 방식(EXL3 GEMV segment counter, `RouterTopKTilesKernel` arrivals)이라 counter가 틀려도 결과만 틀린다. 데이터에 달린 loop(attention tile 순회, `next_block`, `BucketExpert`, `BuildTiles`, mmq stream-K fixup, KVarN 양자화의 8회 반복)는 모두 유한하다.
+- **shape.** wide segment는 8행이라 attention·GDN·PLE kernel의 shape은 narrow verify와 같다. 64행으로 도는 것은 projection·HC mix·MoE·head(decode batch 경로)이고, 8세션×8행 batch와 같은 shape이다. 다만 `--sessions 2` 서비스에서는 이전에 16행까지만 돌았다. 17~64행 decode batch(라우터 tile 융합은 25행까지라 26행부터 `BuildTiles` 경로)는 서비스에서 이번에 처음 돌았다.
+- **workspace.** `wide_controls_`(8개, segment s<8), `batch_controls_`(8개), `mtp_.target_hidden`(64행), token·n-gram 행·mapped n-gram buffer·mask(max_batch행), attention partials/lists/counts(8행, segment마다 같은 stream에서 차례로)는 모두 범위 안이다. 새 할당(`wide_state_`, `wide_segments_`)은 읽기 전에 쓴다. controls·token pinned buffer는 pass 시작에 쓰고 pass 끝 동기화 전에는 다시 쓰지 않는다.
+- **KVarN.** 64행 pass는 `PlanKvarnPass`(128행 이하)로 계획하고, segment 안의 group 끝은 `KvarnQuantizePassBoundary`(segment 위치를 device에서 읽는다), segment 끝이 group 끝이면 다음 segment 전에 그 layer의 group을 양자화한다. 64행은 ring 한도(129행) 안이고, rollback 뒤 양자화된 group을 다시 여는 경로도 ring이 그 행을 갖고 있다. 출력이 24/24 token 동일한 것과 맞는다.
+- **이전 pass가 남긴 것.** `RollbackWide`·`KeepHiddenRow`는 동기화 없이 같은 stream에 쌓여 순서가 지켜진다. 넓은 copy 뒤 MTP kv_only catch-up(63행 이하)은 `Run`이 동기화하므로, 그것이 멈췄다면 거기서 멈췄을 것이다.
+
+가설(가능성 순):
+1. **H1, GPU queue·scheduler 정지(kernel 논리 아님).** 64행 pass 하나가 host 동기화 없이 dispatch 수천 개, pass 중간 D2D `hipMemcpyAsync` 약 300개(segment 1~7의 linear layer conv 시작 history 252개, segment 1의 layer당 3 MiB recurrent state 36개, PLE history), MoE layer마다 side stream fork/join 48번을 넣는다. fork/join은 EXL3 decode·narrow verify에서도 매번 한다(`exl3_decode_overlap`). wide만의 새 패턴은 pass 중간 copy와 긴 무동기 구간이다. narrow verify에는 pass 중간 copy가 없다. 다른 process(배포 서버)가 같은 GPU를 쓰는 상황에서, 기준에서도 본 30초 멈춤이 길게 간 것일 수 있다. 근거: 비결정적, 대기 kernel 없음, 커널 로그 없음, 기준의 30초 멈춤.
+2. **H2, 캐시 capture·publish 복사가 wide pass와 겹침.** 두 실행에서 다른 것은 이것과 다른 slot의 상태뿐이다(위). 두 번째 실행은 멈추기 약 1초 전에 같은 session의 272-token checkpoint를 publish했다. 정적으로는 capture stream이 executor stream이나 scratch를 공유하는 곳을 찾지 못했다. 실험에서 멈춤 직전의 `[cache]` 로그를 함께 본다.
+3. **H3, 26~64행 decode batch 경로의 드문 순서 문제.** 서비스에서 처음 쓴 행 수(EXL3 `BuildTiles` routed MLP, side stream shared MLP와 겹침)라 후보다. 같은 경로를 쓴 FP16 두 실행은 멈추지 않았고, 정적으로는 stream 사이 scratch 충돌을 찾지 못했다(shared MLP는 projection fast slab, routed는 routed_input·tiles만 쓴다).
+4. **H4, device control·count가 깨져 loop 상한이 수십억이 됨.** 깨지는 경로를 찾지 못했다. 그런 위치라면 FP16 KV와 KVarN record 읽기가 범위를 벗어나 fault가 났을 텐데 커널 로그가 없다. 낮다.
+5. **H5, KVarN 경계·ring 처리 오류.** 위 감사, 멈춘 범위에 경계가 없는 점, 같은 순서를 첫 실행이 통과한 점으로 사실상 배제한다.
+
+GPU 실험(통합 패스에서, 다른 GPU 측정 창과 겹치지 않게). 스크립트는 `build/b1/u5-20261109/tools/u43_stress.sh`(`u43_replay.py`: 같은 12 요청, prompt 원본은 `0c784b00`에 고정, 서버 로그가 90초 멈추면 hang, 요청마다 서버 로그의 가장 긴 공백을 남기고 20초를 넘으면 표시(기준의 30초 멈춤 대조), `u43_diag.sh`: gdb·`gpu_busy_percent`·커널 로그·캐시 로그 끝, `ROCGDB`가 있으면 `info dispatches`/`info waves`, sudo가 되면 KFD hqd. umr wave 정지는 배포 서버까지 멈추므로 `U43_UMR=1`일 때만). binary는 멈췄던 `bin/cand-gufo` 그대로 쓴다. 결과는 `build/b1/u5-20261109/u43r/`.
+- E1 `u43_stress.sh replay-k4v4 6`: 새 K4V4 서버 6개, 각각 12 요청 전체. 재현율을 잰다(hang은 두 번째 서버의 11번째 요청이었다).
+- E2 `u43_stress.sh focus-k4v4 100`: 서버 하나에서 순서 한 번, 그 뒤 `docstring-admission` greedy 100번. 64행 pass를 가장 많이 돈다.
+- E3 `u43_stress.sh replay-fp16 6`: KVarN이 필요한지.
+- E4 `u43_stress.sh focus-u13 100`: U4-3이 없는 u13으로 같은 부하. 멈춤이 나오면 H1의 환경 쪽이다.
+- 재현되면 `VARIANT=nosdma`(`HSA_ENABLE_SDMA=0`)와 `VARIANT=serial`(`AMD_SERIALIZE_KERNEL=3`, `AMD_SERIALIZE_COPY=3`, 멈추면 gdb의 decode frame이 멈춘 launch를 가리킨다)로 다시 돌린다. wave가 상주하면 kernel 문제(H3/H4), 없으면 queue 정지(H1)다. 같은 device의 D2D copy는 보통 blit kernel이라 `nosdma`는 H2D/D2H(캐시 복사, H2)만 바꾼다. 사용자가 허락하면 배포 서버를 멈춘 창에서 E1을 한 번 더 돌린다(H1의 다중 process 조건).
+- greedy 행은 모두 `serve/cand-rewrite-<kv>/rows.json`의 sha와 비교해 남긴다.
+- 다시 들이는 조건: 원인을 확정해 고치거나, E1·E2에서 수천 번의 wide pass가 무재현이고 E4 대조가 깨끗할 때. 다시 들일 때는 `b9cbf5a1`을 되돌린다(`5dd394d8`, `0c784b00`, `faefb63e`).
 
 ## 하지 않는 것
 
