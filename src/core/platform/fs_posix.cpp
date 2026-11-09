@@ -278,17 +278,55 @@ bool SyncAncestors(const Directory& dir, std::error_code& ec) noexcept {
   }
 }
 
-void Advise(PlatformFile file, AdviseHint hint, std::uint64_t offset,
+bool Advise(PlatformFile file, AdviseHint hint, std::uint64_t offset,
             std::uint64_t length) noexcept {
   const auto max_offset =
       static_cast<std::uint64_t>(std::numeric_limits<off_t>::max());
   if (offset > max_offset)
-    return;
+    return false;
   const auto clamped = std::min<std::uint64_t>(length, max_offset - offset);
   const int advice =
       hint == AdviseHint::kDontNeed ? POSIX_FADV_DONTNEED : POSIX_FADV_WILLNEED;
-  (void)::posix_fadvise(file, static_cast<off_t>(offset),
-                        static_cast<off_t>(clamped), advice);
+  // posix_fadvise reports its error as the return value, not errno.
+  return ::posix_fadvise(file, static_cast<off_t>(offset),
+                         static_cast<off_t>(clamped), advice) == 0;
+}
+
+bool WriteBack(PlatformFile file, WriteBackMode mode, std::uint64_t offset,
+               std::uint64_t length, std::error_code& ec) noexcept {
+  ec.clear();
+#if defined(__linux__)
+  const auto max_offset =
+      static_cast<std::uint64_t>(std::numeric_limits<off_t>::max());
+  if (offset > max_offset) {
+    ec = std::make_error_code(std::errc::invalid_argument);
+    return false;
+  }
+  const auto clamped = std::min<std::uint64_t>(length, max_offset - offset);
+  // WAIT_BEFORE also covers pages a previous kStart already queued.
+  const unsigned flags = mode == WriteBackMode::kStart
+                             ? SYNC_FILE_RANGE_WRITE
+                             : SYNC_FILE_RANGE_WAIT_BEFORE |
+                                   SYNC_FILE_RANGE_WRITE |
+                                   SYNC_FILE_RANGE_WAIT_AFTER;
+  int result;
+  do {
+    result = ::sync_file_range(file, static_cast<off_t>(offset),
+                               static_cast<off_t>(clamped), flags);
+  } while (result < 0 && errno == EINTR);
+  if (result < 0) {
+    ec = Errno();
+    return false;
+  }
+  return true;
+#else
+  (void)file;
+  (void)mode;
+  (void)offset;
+  (void)length;
+  ec = std::make_error_code(std::errc::not_supported);
+  return false;
+#endif
 }
 
 bool ListDirectory(

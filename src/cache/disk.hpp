@@ -242,6 +242,10 @@ public:
   void PrefetchPayload(const DiskSnapshot&, bool private_file,
                        const DiskPayload&, std::uint64_t bytes,
                        std::span<std::uint8_t> scratch = {}) const;
+  // Drops the page-cache copy of one dependency, as for a prefetched payload
+  // the reader never consumed. Best effort; errors are ignored.
+  void DropPayloadCache(const DiskSnapshot&, bool private_file,
+                        const DiskPayload&) const noexcept;
   // Reads one dependency, invokes consume only with complete pieces, and
   // checks its CRC and stable file identity before returning. Consumers must
   // keep their destination non-executable until every dependency has passed.

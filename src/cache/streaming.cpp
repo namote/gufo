@@ -102,6 +102,9 @@ void Accumulate(TransferTiming& destination, const TransferTiming& source) {
 // page cache: 1.9 GB/s with four, 4.1 GB/s with eight (measured). Helpers
 // warm whole files up to a bounded byte window ahead of the reader, which
 // still reads, checks and copies every file in order.
+// Warmed pages leave the page cache once the reader has consumed them: the
+// reader drops what it reads, and helpers drop what they warmed too late for
+// that (after the reader started the file) or that the reader never reached.
 class Prefetcher {
 public:
   struct Item {
@@ -110,40 +113,102 @@ public:
   };
   Prefetcher(const DiskStore& disk, const DiskSnapshot& snapshot,
              std::vector<Item> items)
-      : disk_(disk), snapshot_(snapshot), items_(std::move(items)) {
+      : disk_(disk),
+        snapshot_(snapshot),
+        items_(std::move(items)),
+        warmed_(items_.size(), Warm::kNone) {
     offsets_.reserve(items_.size() + 1);
     offsets_.push_back(0);
     for (const auto& item : items_)
       offsets_.push_back(offsets_.back() + item.payload->bytes);
+    drops_.reserve(items_.size());
     for (auto& thread : threads_)
       thread = std::jthread([this](std::stop_token stop) { Run(stop); });
   }
-  // The reader is about to read item `index`.
+  Prefetcher(const Prefetcher&) = delete;
+  Prefetcher& operator=(const Prefetcher&) = delete;
+  ~Prefetcher() {
+    // Stop every helper first so their exit sweeps run in parallel.
+    for (auto& thread : threads_)
+      thread.request_stop();
+    for (auto& thread : threads_)
+      if (thread.joinable())
+        thread.join();
+  }
+  // The reader is about to read item `index`, and has consumed every item
+  // before it; `index == items.size()` reports that it consumed them all.
   void Reading(std::size_t index) {
     {
       const std::lock_guard lock(mutex_);
+      // A file warmed while the reader was in it may have been re-cached
+      // after the reader's drop; a helper drops it again.
+      for (std::size_t i = reader_; i < std::min(index, items_.size()); ++i)
+        if (warmed_[i] == Warm::kStraddled) {
+          warmed_[i] = Warm::kNone;
+          drops_.push_back(i);
+        }
       reader_ = index;
     }
     wake_.notify_all();
   }
 
 private:
+  enum class Warm : std::uint8_t {
+    kNone,       // Not warmed, or its pages are handled.
+    kWarmed,     // Warmed before the reader started it; the reader drops it.
+    kStraddled,  // Warmed while the reader was in it.
+  };
   static constexpr std::uint64_t kWindowBytes = 64 << 20;
   static constexpr std::size_t kScratchBytes = 256 << 10;
+  void Drop(std::size_t i) const noexcept {
+    disk_.DropPayloadCache(snapshot_, items_[i].private_file,
+                           *items_[i].payload);
+  }
   void Run(std::stop_token stop) {
     std::vector<std::uint8_t> scratch(kScratchBytes);
+    // Reserved up front: the exit sweep runs under the lock and must not throw.
+    std::vector<std::size_t> leftovers;
+    leftovers.reserve(items_.size());
     while (true) {
-      std::size_t i;
+      std::size_t i{};
+      bool drop{}, exit{};
       {
         std::unique_lock lock(mutex_);
-        if (!wake_.wait(lock, stop, [&] {
-              // Items the reader already passed need no warming.
-              next_ = std::max(next_, reader_);
-              return next_ < items_.size() &&
-                     offsets_[next_] - offsets_[reader_] < kWindowBytes;
-            }))
-          return;
-        i = next_++;
+        const bool ready = wake_.wait(lock, stop, [&] {
+          if (!drops_.empty())
+            return true;
+          // Items the reader already passed need no warming.
+          next_ = std::max(next_, reader_);
+          return next_ < items_.size() &&
+                 offsets_[next_] - offsets_[reader_] < kWindowBytes;
+        });
+        if (!drops_.empty()) {
+          i = drops_.back();
+          drops_.pop_back();
+          drop = true;
+        } else if (ready && !stop.stop_requested()) {
+          i = next_++;
+        } else {
+          // Stopping: drop what was warmed but never consumed. Completed
+          // restores report every item consumed, so this finds nothing.
+          // Each helper sweeps after its own last warm-up.
+          exit = true;
+          for (std::size_t j = std::min(reader_, items_.size());
+               j < items_.size(); ++j)
+            if (warmed_[j] != Warm::kNone) {
+              warmed_[j] = Warm::kNone;
+              leftovers.push_back(j);
+            }
+        }
+      }
+      if (drop) {
+        Drop(i);
+        continue;
+      }
+      if (exit) {
+        for (const auto j : leftovers)
+          Drop(j);
+        return;
       }
       try {
         disk_.PrefetchPayload(snapshot_, items_[i].private_file,
@@ -152,6 +217,15 @@ private:
       } catch (...) {
         // A hint only; the reader validates every dependency it reads.
       }
+      {
+        const std::lock_guard lock(mutex_);
+        if (reader_ > i)
+          drop = true;  // The reader consumed it while this was warming.
+        else
+          warmed_[i] = reader_ == i ? Warm::kStraddled : Warm::kWarmed;
+      }
+      if (drop)
+        Drop(i);
     }
   }
   const DiskStore& disk_;
@@ -161,6 +235,8 @@ private:
   std::mutex mutex_;
   std::condition_variable_any wake_;
   std::size_t next_{}, reader_{};
+  std::vector<Warm> warmed_;
+  std::vector<std::size_t> drops_;
   std::array<std::jthread, 8> threads_;
 };
 bool SameJob(const DiskManifest& a, const DiskManifest& b) {
@@ -726,6 +802,7 @@ bool StreamedStore::Restore(
       }
       flush();
     }
+    prefetch.Reading(reading);
     CheckStop(stop);
     if (!adapter.Validate(slot, positions))
       throw std::runtime_error("checkpoint position validation failed");

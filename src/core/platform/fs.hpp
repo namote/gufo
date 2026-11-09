@@ -180,11 +180,25 @@ bool SyncDirectory(const Directory& dir, std::error_code& ec) noexcept;
 /// `ec` on failure.
 bool SyncAncestors(const Directory& dir, std::error_code& ec) noexcept;
 
-/// Page-cache hints for an open file. Both are best effort: platforms
-/// without the call, or ranges the OS refuses, are silently ignored.
+/// Page-cache hints for an open file over `[offset, offset + length)`; a zero
+/// `length` reaches the end of the file. Both are best effort and never
+/// change file contents. kDontNeed drops only clean pages, so callers issue it
+/// after the range is written back. Returns false when the OS refuses the
+/// hint; platforms without the call (Windows) do nothing and return true.
 enum class AdviseHint { kWillNeed, kDontNeed };
-void Advise(PlatformFile file, AdviseHint hint, std::uint64_t offset,
+bool Advise(PlatformFile file, AdviseHint hint, std::uint64_t offset,
             std::uint64_t length) noexcept;
+
+/// Range write-back for a file being written, without the metadata flush of
+/// SyncFile. kStart queues the dirty pages of the range for write-back and
+/// returns without waiting; kWait additionally waits until every page of the
+/// range that was dirty when the call began is on the device, so a following
+/// kDontNeed can drop it. Neither is a durability barrier. Linux uses
+/// sync_file_range(2). Platforms without a range write-back return false
+/// with `ec` set to std::errc::not_supported and write nothing back.
+enum class WriteBackMode { kStart, kWait };
+bool WriteBack(PlatformFile file, WriteBackMode mode, std::uint64_t offset,
+               std::uint64_t length, std::error_code& ec) noexcept;
 
 /// Calls `visit(name, info)` for every entry of `dir` except "." and "..".
 /// `info` describes the entry without following symlinks. Returns false and

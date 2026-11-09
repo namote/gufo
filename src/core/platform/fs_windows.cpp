@@ -343,8 +343,17 @@ bool SyncAncestors(const Directory&, std::error_code& ec) noexcept {
   return true;
 }
 
-void Advise(PlatformFile, AdviseHint, std::uint64_t, std::uint64_t) noexcept {
+bool Advise(PlatformFile, AdviseHint, std::uint64_t, std::uint64_t) noexcept {
   // Windows exposes no page-cache hint for a file handle.
+  return true;
+}
+
+bool WriteBack(PlatformFile, WriteBackMode, std::uint64_t, std::uint64_t,
+               std::error_code& ec) noexcept {
+  // Windows has no range write-back; FlushFileBuffers flushes the whole file
+  // and is SyncFile's job.
+  ec = std::make_error_code(std::errc::not_supported);
+  return false;
 }
 
 bool ListDirectory(

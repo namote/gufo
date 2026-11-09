@@ -107,6 +107,15 @@ if (NOT WIN32)
   add_test(NAME cache_tiered_test COMMAND cache_tiered_test)
   set_tests_properties(cache_tiered_test PROPERTIES LABELS "cpu;cache" TIMEOUT 30)
 
+  add_executable(cache_page_cache_test page_cache_test.cpp)
+  target_link_libraries(cache_page_cache_test PRIVATE gufo_cache)
+  target_compile_options(cache_page_cache_test PRIVATE -UNDEBUG)
+  target_link_options(cache_page_cache_test PRIVATE
+    -Wl,--wrap=write -Wl,--wrap=fsync -Wl,--wrap=sync_file_range
+    -Wl,--wrap=posix_fadvise -Wl,--wrap=close)
+  add_test(NAME cache_page_cache_test COMMAND cache_page_cache_test)
+  set_tests_properties(cache_page_cache_test PROPERTIES LABELS "cpu;cache" TIMEOUT 60)
+
   add_executable(cache_disk_publication_test disk_publication_test.cpp)
   target_link_libraries(cache_disk_publication_test PRIVATE gufo_cache)
   target_link_options(cache_disk_publication_test PRIVATE

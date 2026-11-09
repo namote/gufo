@@ -17,6 +17,7 @@
 #include <system_error>
 #include <utility>
 
+#include "src/cache/page_cache.hpp"
 #include "src/core/platform/fs.hpp"
 
 namespace gufo::cache {
@@ -984,6 +985,11 @@ struct DiskStore::Impl {
       allocated.resize(65536);
       staging = allocated;
     }
+    // Verified or not, drop the pages this re-read brings in.
+    Finally drop{[&] {
+      CostTimer timer(publication_stats.filesystem_ns);
+      DropCleanPages(fd.Get(), 0, 0);
+    }};
     std::uint64_t remaining = payload.bytes, crc{};
     while (remaining) {
       Finally release{[&] {
@@ -1019,11 +1025,6 @@ struct DiskStore::Impl {
         !(st == after))
       DependencyFailure(private_file, payload.file);
     RememberVerified(key, identity);
-    {
-      // Verified; drop the pages this re-read brought in.
-      CostTimer timer(publication_stats.filesystem_ns);
-      platform::Advise(fd.Get(), platform::AdviseHint::kDontNeed, 0, 0);
-    }
   }
   void Publish(DiskFileId file, const DiskManifest& m,
                std::span<const DiskWriteBuffer> buffers,
@@ -1240,8 +1241,17 @@ struct DiskStore::Impl {
               return b.private_file == key.first && b.file == p.file;
             });
         auto fd = Create(payload_name);
+        // Write-behind keeps each payload's page-cache footprint bounded.
+        WriteBehind behind(fd.Get());
         if (it != buffers.end()) {
-          WriteFile(fd.Get(), it->bytes);
+          for (auto rest = it->bytes; !rest.empty();) {
+            const auto piece = rest.first(static_cast<std::size_t>(
+                std::min<std::uint64_t>(rest.size(), kPageCacheWindowBytes)));
+            WriteFile(fd.Get(), piece);
+            rest = rest.subspan(piece.size());
+            CostTimer timer(publication_stats.filesystem_ns);
+            behind.Wrote(piece.size());
+          }
         } else {
           auto source =
               std::find_if(sources.begin(), sources.end(), [&](const auto& s) {
@@ -1251,21 +1261,28 @@ struct DiskStore::Impl {
           const auto piece_bytes =
               staging.size() / source->alignment * source->alignment;
           while (offset < p.bytes) {
-            Finally release{[&] {
-              if (access)
-                access->release();
-            }};
-            if (access)
-              access->acquire();
-            auto piece = staging.first(
-                std::min<std::uint64_t>(piece_bytes, p.bytes - offset));
-            source->read(offset, piece);
+            std::size_t written;
             {
-              CostTimer timer(publication_stats.checksum_ns);
-              crc = DiskChecksum(piece, crc);
+              Finally release{[&] {
+                if (access)
+                  access->release();
+              }};
+              if (access)
+                access->acquire();
+              auto piece = staging.first(
+                  std::min<std::uint64_t>(piece_bytes, p.bytes - offset));
+              source->read(offset, piece);
+              {
+                CostTimer timer(publication_stats.checksum_ns);
+                crc = DiskChecksum(piece, crc);
+              }
+              WriteFile(fd.Get(), piece);
+              written = piece.size();
             }
-            WriteFile(fd.Get(), piece);
-            offset += piece.size();
+            offset += written;
+            // Outside the staging lease: write-behind may wait on the device.
+            CostTimer timer(publication_stats.filesystem_ns);
+            behind.Wrote(written);
           }
           if (p.checksum && p.checksum != crc)
             Invalid();
@@ -1284,11 +1301,13 @@ struct DiskStore::Impl {
         }
         DISK_STEP(kPayloadWritten);
         Sync(fd.Get());
+        if (const auto error = behind.WriteBackError())
+          IoError("write back cache file", error);
         {
           // The payload is durable; drop its clean pages so multi-GB snapshots
           // don't accumulate in the page cache.
           CostTimer timer(publication_stats.filesystem_ns);
-          platform::Advise(fd.Get(), platform::AdviseHint::kDontNeed, 0, 0);
+          behind.Synced();
         }
         DISK_STEP(kPayloadSynced);
         Rename(dir, payload_name);
@@ -1600,6 +1619,22 @@ void DiskStore::PrefetchPayload(const DiskSnapshot& snapshot, bool private_file,
     offset += n;
   }
 }
+void DiskStore::DropPayloadCache(const DiskSnapshot& snapshot,
+                                 bool private_file,
+                                 const DiskPayload& payload) const noexcept {
+  if (snapshot.store_ != impl_.get() || !snapshot.pin_ ||
+      !Contains(snapshot.manifest_, private_file, payload))
+    return;
+  const auto& directory = private_file ? impl_->private_files : impl_->chunks;
+  try {
+    std::error_code ec;
+    Fd file(platform::OpenAt(directory, DiskFileName(payload.file),
+                             platform::FileMode::kRead, ec));
+    DropCleanPages(file.Get(), 0, 0);
+  } catch (...) {
+    // A hint only: a failed name allocation leaves the pages cached.
+  }
+}
 DiskReadStats DiskStore::ReadPayload(
     const DiskSnapshot& snapshot, bool private_file, const DiskPayload& payload,
     std::span<std::uint8_t> staging,
@@ -1627,6 +1662,14 @@ DiskReadStats DiskStore::ReadPayload(
   std::error_code ec;
   Fd file(platform::OpenAt(directory, DiskFileName(payload.file),
                            platform::FileMode::kRead, ec));
+  // The consumer holds the bytes it was given; drop the page-cache copy
+  // behind the read, and the rest on every exit, failures included.
+  std::uint64_t dropped{};
+  bool drop_pending = true;
+  Finally drop{[&] {
+    if (drop_pending)
+      DropCleanPages(file.Get(), PageCacheDropStart(dropped), 0);
+  }};
   platform::FileInfo before{}, after{};
   if (!platform::FileValid(file.Get()) ||
       !platform::Stat(file.Get(), &before, ec) || !Regular(before) ||
@@ -1660,14 +1703,21 @@ DiskReadStats DiskStore::ReadPayload(
     stats.bytes += piece.size();
     consume(offset, piece);
     offset += piece.size();
+    if (offset - dropped >= kPageCacheWindowBytes) {
+      begin = Clock::now();
+      const auto start = PageCacheDropStart(dropped);
+      DropCleanPages(file.Get(), start, offset - start);
+      dropped = offset;
+      stats.filesystem_ns += elapsed(begin);
+    }
   }
   begin = Clock::now();
   if (!platform::Stat(file.Get(), &after, ec) || !Regular(after) ||
       identity.info != after ||
       (!stats.verification_cached && checksum != payload.checksum))
     impl_->DependencyFailure(private_file, payload.file);
-  // The consumer holds the bytes now; drop the page-cache copy.
-  platform::Advise(file.Get(), platform::AdviseHint::kDontNeed, 0, 0);
+  drop_pending = false;
+  DropCleanPages(file.Get(), PageCacheDropStart(dropped), 0);
   stats.filesystem_ns += elapsed(begin);
   if (!stats.verification_cached)
     impl_->RememberVerified(key, identity);

@@ -28,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cache/page_cache.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/platform/fs.hpp"
 #include "src/core/platform/os_info.hpp"
@@ -790,9 +791,23 @@ struct ContinuationDiskStore::Impl {
       return false;
     }
     image->resize(static_cast<std::size_t>(status.size));
-    if (!ReadAll(file.get(), *image)) {
-      *failure_reason = ContinuationDiskEventReason::kIoFailure;
-      return false;
+    // Restore uses the in-memory copy: drop the page-cache one behind the
+    // read, and the rest on every exit, failures included.
+    struct DropRest {
+      platform::PlatformFile file;
+      std::uint64_t dropped = 0;
+      ~DropRest() { cache::DropCleanPages(file, dropped, 0); }
+    } drop{file.get()};
+    for (std::span<std::uint8_t> rest(*image); !rest.empty();) {
+      const auto piece = rest.first(static_cast<std::size_t>(
+          std::min<std::uint64_t>(rest.size(), cache::kPageCacheWindowBytes)));
+      if (!ReadAll(file.get(), piece)) {
+        *failure_reason = ContinuationDiskEventReason::kIoFailure;
+        return false;
+      }
+      rest = rest.subspan(piece.size());
+      cache::DropCleanPages(file.get(), drop.dropped, piece.size());
+      drop.dropped += piece.size();
     }
     std::uint8_t trailing = 0;
     while (true) {
@@ -810,8 +825,6 @@ struct ContinuationDiskStore::Impl {
       }
       break;
     }
-    // Restore uses the in-memory copy; drop the page-cache one.
-    platform::Advise(file.get(), platform::AdviseHint::kDontNeed, 0, 0);
     return true;
   }
 
@@ -1065,6 +1078,8 @@ struct ContinuationDiskStore::Impl {
       return false;
     }
     bool valid = true;
+    // Write-behind keeps the image's page-cache footprint bounded.
+    cache::WriteBehind behind(temporary.get());
     try {
       crypto::Sha256Hasher hasher;
       std::size_t written = 0;
@@ -1076,6 +1091,7 @@ struct ContinuationDiskStore::Impl {
           if (!WriteAll(temporary.get(), chunk)) {
             throw std::runtime_error("continuation disk write failed");
           }
+          behind.Wrote(chunk.size());
           hasher.Update(chunk);
           bytes = bytes.subspan(chunk.size());
         }
@@ -1101,11 +1117,14 @@ struct ContinuationDiskStore::Impl {
     } catch (...) {
       valid = false;
     }
-    valid = valid && platform::SyncFile(temporary.get(), ec);
+    // A write-back error consumed by write-behind fails the save like a
+    // failed sync would.
+    valid = valid && !behind.WriteBackError() &&
+            platform::SyncFile(temporary.get(), ec);
     if (valid) {
       // The image is durable now. Drop its clean pages so multi-GB snapshots
       // don't accumulate in the page cache.
-      platform::Advise(temporary.get(), platform::AdviseHint::kDontNeed, 0, 0);
+      behind.Synced();
     }
     platform::CloseFile(temporary.release());
     if (!valid) {
