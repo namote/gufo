@@ -317,6 +317,11 @@ public:
   }
   /// Whether the loaded backend accepts image inputs in chat requests.
   [[nodiscard]] virtual bool supports_images() const { return false; }
+  /// Whether sampled speculative verification applies
+  /// SamplingConfig::typical_acceptance (Flash-Next with MTP loaded).
+  [[nodiscard]] virtual bool supports_typical_acceptance() const {
+    return false;
+  }
   /// The served model file and build revision, as llama-server's /props
   /// reports them. Empty when unknown.
   [[nodiscard]] virtual std::string model_path() const { return {}; }

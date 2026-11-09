@@ -50,7 +50,9 @@ correct/). Not deployed: one reproduced per-request regression below.
   ~+21 %, code ~+17 %, prose +8…+26 %); acceptance e.g. prose 0.616→0.736.
   Gate: arithmetic 30/30 both; mean length 147→162.7 tokens (median
   141→143.5), 4-gram repeat 0.0070→0.0084 (max 0.040→0.034); tool-schema-edges
-  pass and tool-reasoning fails at the same greedy check as off. Kept opt-in.
+  pass and tool-reasoning fails at the same greedy check as off. Kept opt-in
+  in U5; afterwards made the default on these results (`--typical-acceptance
+  off` or request `false` keeps the exact rule; no new measurement).
 - **U4-5 one-launch decode HC mixer (#894): rejected as-is.** Bench bug fixed
   first (`c05c8e49`: `HcMixEpilogue` returns whether it rotated EXL3 slabs).
   Bytes identical at 1/2/4/8 tokens; production/fused 45.88/41.23,

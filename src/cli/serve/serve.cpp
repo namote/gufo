@@ -1607,8 +1607,18 @@ int RunServe(std::span<const char* const> args) {
         << " repeat_last_n=" << effective_sampling.repeat_last_n
         << " frequency_penalty=" << effective_sampling.frequency_penalty
         << " presence_penalty=" << effective_sampling.presence_penalty
-        << " typical_acceptance=" << effective_sampling.typical_acceptance;
+        << " typical_acceptance="
+        << (effective_sampling.typical_acceptance &&
+            backend->supports_typical_acceptance());
     server::Logger::Info("sampling", sampling_log.str());
+    if (llm_parser.WasSupplied("--typical-acceptance") &&
+        sampling_config.typical_acceptance &&
+        !backend->supports_typical_acceptance()) {
+      server::Logger::Warn(
+          "sampling",
+          "event=typical_acceptance_unsupported detail=--typical-acceptance "
+          "on applies only to Flash-Next MTP; ignored");
+    }
     const char* speculation =
         speculative_config.backend == server::TextSpeculativeBackend::kDFlash
             ? "dflash2"

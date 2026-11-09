@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -212,6 +213,10 @@ public:
   }
   [[nodiscard]] bool supports_images() const override { return image_support; }
   bool image_support{true};
+  [[nodiscard]] bool supports_typical_acceptance() const override {
+    return typical_support;
+  }
+  bool typical_support{false};
 
   bool WaitForFirstPiece() {
     std::unique_lock<std::mutex> lock(mutex);
@@ -1753,9 +1758,35 @@ void TestModelSamplingDefaults() {
   Expect(config.temperature == 0.0F && config.presence_penalty == 0.0F &&
              config.top_k == 40,
          "Explicit request zero overrides server and model presets");
-  Expect(!config.typical_acceptance, "Typical acceptance is off by default");
+  // The library default keeps the exact rule; the serve CLI default (on)
+  // reaches requests through the backend defaults, as below.
+  Expect(!config.typical_acceptance,
+         "The library sampling default keeps the exact rule");
   config = send(R"(,"typical_acceptance":true)");
   Expect(config.typical_acceptance, "Requests opt into typical acceptance");
+  {
+    // Only an explicit request on a backend that never applies the rule
+    // warns; the inherited default and an explicit false stay quiet.
+    const auto warnings = [&](std::string fields) {
+      std::ostringstream log;
+      auto* previous = std::clog.rdbuf(log.rdbuf());
+      send(std::move(fields));
+      std::clog.rdbuf(previous);
+      return log.str().find("event=typical_acceptance_unsupported") !=
+             std::string::npos;
+    };
+    backend.defaults.sampling.typical_acceptance = true;
+    Expect(warnings(R"(,"typical_acceptance":true)"),
+           "An explicit request on an unsupported backend warns");
+    Expect(!warnings(""), "The inherited default does not warn");
+    Expect(!warnings(R"(,"typical_acceptance":false)"),
+           "An explicit opt-out does not warn");
+    backend.typical_support = true;
+    Expect(!warnings(R"(,"typical_acceptance":true)"),
+           "A supporting backend does not warn");
+    backend.typical_support = false;
+    backend.defaults.sampling.typical_acceptance = false;
+  }
   backend.defaults.sampling.typical_acceptance = true;
   config = send("");
   Expect(config.typical_acceptance,

@@ -968,15 +968,19 @@ penalties `[-2, 2]`. Top-p zero keeps the highest-probability token (or
 `min_keep` tokens). Setting temperature to zero retains configured penalties;
 omitted controls keep their model/CLI defaults.
 
-`typical_acceptance: true` (or `--typical-acceptance` for the server default;
-`false` and `null` as usual) speeds up speculative decoding of random-sampling
-requests on Qwen3.8-Flash-Next with MTP: a draft or copied token the exact
-rejection test turns down is still kept when its probability p under the
-request's sampling distribution (after its filters, penalties and temperature)
-satisfies p >= min(0.09, 0.3 * exp(-H)), H being that distribution's entropy
-(Medusa's typical acceptance). Tokens the filters remove are never kept. The
-output then no longer follows the sampling distribution exactly, which is why
-it is off by default. Greedy requests and other models ignore it.
+Typical acceptance is on by default and speeds up speculative decoding of
+random-sampling requests on Qwen3.8-Flash-Next with MTP: a draft or copied
+token the exact rejection test turns down is still kept when its probability p
+under the request's sampling distribution (after its filters, penalties and
+temperature) satisfies p >= min(0.09, 0.3 * exp(-H)), H being that
+distribution's entropy (Medusa's typical acceptance). Tokens the filters
+remove are never kept. The output then no longer follows the sampling
+distribution exactly; it was measured +2.5–27.6% faster with arithmetic
+answers unchanged and slightly longer, slightly more repetitive text. Request
+`typical_acceptance: false` (a boolean; `null` inherits) or start the server
+with `--typical-acceptance off` for the exact rule. Greedy requests never
+reach it; other models and Flash-Next without MTP ignore it, and only an
+explicit request or option asking for it on them logs a warning.
 
 Tool calls are emitted only for declared functions when `tool_choice` allows
 calling tools. With `auto`, ordinary text and reasoning remain allowed; once a
@@ -1429,7 +1433,9 @@ the version and revision `gufo --version` prints, `total_slots` the
 `--sessions` count, `default_generation_settings.n_ctx` the per-session context
 and `default_generation_settings.params` the sampling a request without
 sampling fields gets, with `n_predict` and `max_tokens` -1 when no default
-limit is set. `modalities.vision` is true only when a vision encoder
+limit is set. Its Gufo `typical_acceptance` is what such a request gets: true
+only when the default is on and the backend applies it (Flash-Next with MTP).
+`modalities.vision` is true only when a vision encoder
 loaded. Fields the server cannot report are omitted rather than sent as zero.
 
 `POST /apply-template` takes a Chat Completions body and returns

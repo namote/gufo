@@ -549,7 +549,30 @@ void TestLlamaProps() {
   assert(params->contains("temperature"));
   assert(params->find("n_predict")->as_double() == -1.0);
   assert(params->find("max_tokens")->as_double() == -1.0);
+  assert(!params->find("typical_acceptance")->as_bool(true));
   assert(!bare.find("modalities")->find("vision")->as_bool(true));
+
+  // Typical acceptance is reported as a request without the field gets it:
+  // on only when the default asks for it and the backend applies it.
+  server.backend->defaults.sampling.typical_acceptance = true;
+  assert(!props("/props")
+              .find("default_generation_settings")
+              ->find("params")
+              ->find("typical_acceptance")
+              ->as_bool(true));
+  server.backend->typical_support = true;
+  assert(props("/props")
+             .find("default_generation_settings")
+             ->find("params")
+             ->find("typical_acceptance")
+             ->as_bool());
+  server.backend->defaults.sampling.typical_acceptance = false;
+  assert(!props("/props")
+              .find("default_generation_settings")
+              ->find("params")
+              ->find("typical_acceptance")
+              ->as_bool(true));
+  server.backend->typical_support = false;
 
   server.backend->served_path = "/models/model-00001-of-00002.gguf";
   server.backend->served_build = "0.2.0 (abc1234)";

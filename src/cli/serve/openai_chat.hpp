@@ -41,6 +41,10 @@ bool ParseOpenAiResponseMessage(const json::Value& item,
                                 std::string* error);
 /// Shared effort names; each API applies its own thinking and alias rules.
 std::optional<ReasoningEffort> ParseReasoningEffortName(std::string_view value);
+/// Logs a warning when a request explicitly asks for typical acceptance and
+/// the loaded backend never applies it. The inherited default never warns.
+void WarnUnsupportedTypicalAcceptance(const json::Value& body,
+                                      const TextGenerationBackend& backend);
 
 /// Messages tools and tool_choice, mapped onto the Chat tool declarations so
 /// framing, schema constraints and replayed tool turns match Chat.

@@ -747,6 +747,7 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
     return Err(400, "Bad Request", error->message.c_str(),
                "invalid_request_error", error->code.c_str());
   }
+  WarnUnsupportedTypicalAcceptance(body, backend);
   return std::nullopt;
 }
 
@@ -1524,6 +1525,10 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
   params["repeat_last_n"] = sampling.repeat_last_n;
   params["frequency_penalty"] = static_cast<double>(sampling.frequency_penalty);
   params["presence_penalty"] = static_cast<double>(sampling.presence_penalty);
+  // Gufo extension: whether such a request keeps typical rejected MTP
+  // proposals. False on backends that never apply it.
+  params["typical_acceptance"] =
+      sampling.typical_acceptance && b.supports_typical_acceptance();
   // -1 means no default limit, as in llama-server, which reports both keys.
   const auto n_predict = defaults.max_tokens > 0
                              ? static_cast<std::int64_t>(defaults.max_tokens)

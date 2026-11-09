@@ -90,6 +90,10 @@ public:
   bool device_lost() const override { return lost.load(); }
   bool supports_images() const override { return image_support.load(); }
   std::atomic<bool> image_support{false};
+  bool supports_typical_acceptance() const override {
+    return typical_support.load();
+  }
+  std::atomic<bool> typical_support{false};
   std::uint32_t max_context() const override { return 65536; }
   std::vector<SessionState> session_states() const override { return sessions; }
   std::vector<SessionState> sessions;

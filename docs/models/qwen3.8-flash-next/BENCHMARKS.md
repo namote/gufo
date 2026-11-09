@@ -30,7 +30,9 @@ unexplained, so only the relative comparison holds.
 Served U4-3 rewrite workloads (greedy, two files, rewrite/rename/docstring)
 were token-identical to the pre-U4 build with 12–35% lower decode time,
 but U4-3 hung once on K4V4 and was reverted. U4-4 typical acceptance
-(opt-in) gave +2.5–27.6% sampled MTP decode with the default off unchanged.
+gave +2.5–27.6% sampled MTP decode with off unchanged; it is now on by
+default (not distribution-exact; `--typical-acceptance off` restores the
+exact rule), so sampled MTP rows measured before it ran with it off.
 Neither is in a deployed runtime. Details and the deploy blockers:
 [know-how](../../GFX1151-KNOWHOW.md), `plan/upstream-sync/PLAN.md` "U5 결과".
 Evidence: `build/b1/u5-20261109/`.

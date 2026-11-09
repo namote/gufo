@@ -61,6 +61,18 @@ std::optional<ReasoningEffort> ParseReasoningEffortName(
   return std::nullopt;
 }
 
+void WarnUnsupportedTypicalAcceptance(const json::Value& body,
+                                      const TextGenerationBackend& backend) {
+  const auto* value = body.find("typical_acceptance");
+  if (value != nullptr && value->is_bool() && value->as_bool() &&
+      !backend.supports_typical_acceptance()) {
+    Logger::Warn(
+        "sampling",
+        "event=typical_acceptance_unsupported model=" + backend.model_id() +
+            " detail=only Flash-Next MTP applies it; ignored");
+  }
+}
+
 namespace {
 
 struct ParsedChatRequest {
@@ -1027,6 +1039,7 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
     return Error(400, "Bad Request", sampling_error->message,
                  sampling_error->code.c_str());
   }
+  WarnUnsupportedTypicalAcceptance(body, backend);
   output->sampling = parsed_sampling;
 
   if (const json::Value* choices = body.find("n");

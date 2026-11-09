@@ -3304,6 +3304,7 @@ struct InferenceBackend::Impl {
     SamplingDefaults sampling_defaults;
     std::uint32_t max_context{0};
     bool supports_images{false};
+    bool supports_typical_acceptance{false};
     ReasoningOptions reasoning_defaults;
     std::string model_path;
     std::string build_info;
@@ -3970,6 +3971,8 @@ bool InferenceBackend::load(
     new_state->sampling_defaults.model = sampling::TextModelPreset::kQwen38;
     new_state->sampling_defaults.supplied = {};
     new_state->supports_images = model->VisionEncoder() != nullptr;
+    new_state->supports_typical_acceptance =
+        speculative_config.backend == TextSpeculativeBackend::kMtp;
     auto runner = std::make_shared<QwenFlashNextTextRunner>(
         std::move(model), max_context,
         speculative_config.backend == TextSpeculativeBackend::kMtp,
@@ -4048,6 +4051,15 @@ bool InferenceBackend::supports_images() const {
 #if defined(ENGINE_ENABLE_HIP)
   const auto state = impl_->Snapshot();
   return state != nullptr && state->supports_images;
+#else
+  return false;
+#endif
+}
+
+bool InferenceBackend::supports_typical_acceptance() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state != nullptr && state->supports_typical_acceptance;
 #else
   return false;
 #endif

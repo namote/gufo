@@ -484,7 +484,7 @@ void CheckVerificationBoundaries() {
   }
 }
 
-// Typical acceptance (opt-in) keeps a rejected proposal whose target
+// Typical acceptance (the CLIs' default) keeps a rejected proposal whose target
 // probability p reaches min(eps, delta * exp(-H)); otherwise, and always with
 // the option off, verification is the exact rule above, RNG included.
 void CheckTypicalAcceptance() {
@@ -497,6 +497,7 @@ void CheckTypicalAcceptance() {
        {std::pair{0.7F, 3}, std::pair{1.0F, 3}, std::pair{1.0F, 0}}) {
     sampling::SamplingConfig config{.temperature = temperature, .seed = 41};
     config.top_k = top_k;
+    config.typical_acceptance = false;  // the off path, stated explicitly
     sampling::SamplerState exact(config);
     config.typical_acceptance = true;
     sampling::SamplerState typical(config);

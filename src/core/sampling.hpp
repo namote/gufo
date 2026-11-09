@@ -55,6 +55,8 @@ struct SamplingConfig {
   /// rejected proposal whose target probability is typical (Medusa's rule).
   /// Faster, but the output no longer follows the target distribution
   /// exactly. Greedy decoding ignores it. Only Flash-Next MTP applies it.
+  /// The library default is the exact rule; the serve, prompt and bench
+  /// CLIs default it on (RegisterSamplingOptions, --typical-acceptance).
   bool typical_acceptance{false};
 
   void Validate() const;
