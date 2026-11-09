@@ -1,5 +1,88 @@
 # gfx1151 optimization know-how
 
+## Upstream U7 pre-reboot GPU pass, November 9, 2026 (not deployed)
+
+Evidence is under `build/b1/u7-20261109/` (README.txt lists every file).
+Binaries: base `166953f0`, cand2 `6588c56c`, cand4 `9ac49a5f`, and cand5
+`6078356b` (HEAD `567fc9a8`: cand4 plus B1 owned-session scratch, C4 event
+wait and the C8a eight-worker logprobs cap). The argv matches U6. No update
+or reboot was done. Kernel 7.0.0-38 (7.0.0-42 is installed but not booted),
+linux-firmware 20260319.git217ca6e4, MES 0x86, cwsr_enable=1,
+queue_preemption_timeout_ms=9000, THP madvise/madvise.
+- **`vm.compaction_proactiveness=50` (M1 measure 2) costs MTP about 18 %.**
+  The same base binary did identical work (38/17 cycles, same hashes) in
+  every run. Proactiveness was alternated 50/0/50/0/50 within 15 minutes,
+  each run after drop+compact:
+  - At 50: d0 45.8–48.1 tok/s with ±4–7 between repetitions. d32K
+    81.7–86.7 tok/s (5 runs).
+  - At 0: d0 57.3–57.8 tok/s with ±0.3–1.1. d32K 89.9–93.0 tok/s
+    (4 runs).
+  - AR is not affected: 32.85/32.55 at 50, against 32.63/32.13 in U6.
+  - The buddyinfo looked healthy in both states (about 17.5K order-10
+    blocks). A 20 s vmstat window during an MTP run showed no
+    compaction or migration. The mechanism is still unknown. The symptom
+    matches the U6 fragmentation case: host and driver latency hurts MTP
+    but not AR.
+  - The runtime value was restored to 50 after each diagnostic. The
+    `/etc/sysctl.d` file was not changed.
+- **S1 remaining gap, at proactiveness 0:** base 57.5/91 tok/s against
+  U6 58.9/94–99 and the 11/08 qualification 65.7/104.4. About 12 % on d0
+  is still unexplained before the reboot.
+- **cand5 vs base MTP, alternated at 0 (2 pairs):** d0 57.57/57.50 vs
+  57.58/57.45 (neutral). d32K 105.45/102.68 vs 90.80/91.34 (+14 %, U4-3
+  wide pass: 10 vs 17 cycles, same hash). At 50, 3 pairs gave d0
+  47.9 vs 47.2 and d32K 91.0 vs 86.0, inside the noise.
+- **cand5 correctness:**
+  - The continuation adapter test passes (rc 0). This includes the
+    owned-session cancel step in `slot_reuse`.
+  - Functional `batch`+`cache` on FP16 passes. Its coverage changes
+    against U6 base are the known U2-2 alignment set, plus one improvement:
+    after a cancel, thinking-tool-cancel r88 reuses all 709 tokens live
+    instead of restoring 672. The output hash is the same.
+  - No `capture_fail` or `restore_failed` lines appear.
+  - Served logprobs equal u13: text 8/8, logprobs sha `1258b5fd` in 2/2.
+    The rewrite logprobs sha `8c366923` equals cand2.
+  - A 63-row wide logprobs chain raised peak threads from 136 to 143
+    (+7; cand2 went 136 to 198). RSS still peaks about +100 MiB on that
+    row (cand2 +98 MiB), so the RSS growth was not thread stacks.
+- **B1 KVarN (cand5, K4V4 batch):** 0 of 15 admissions after a cancel
+  had `session_rollback_bytes=0`. cand2 fk42 had 19 of 19. The
+  cancelled_peer_isolation peer decode dropped from 594/1355 ms (fk42)
+  to 432/847 ms.
+- **C4 is not fixed.** A's capture is 9.3–9.6 ms alone. While B
+  cold-prefills about 24K tokens, it is 1827–1834 ms, and A's TTFT goes
+  from 1.94–2.01 s to 4.17–4.33 s. U6 measured 1829–1841 ms with
+  cand2, and base had the same delay. The wait is still there with the
+  per-slot event in place. It comes from somewhere other than the
+  `RetainRows` stream drain, or from B's work queued on the shared
+  executor stream ahead of A's event. A pass-level profile is needed.
+- **S2 f64690 (`batch_c2_greedy_short_pairs_match_serial`):** the
+  239 ms seen once on cand4 did not reproduce. Decode was 90.7–138.0 ms
+  on cand2 (5 runs), 90.7–136.6 ms on cand5 (8 runs) and 102–147 ms on
+  cand4 (3 runs), against base 92.3. The row is bimodal (about 91 or
+  about 135 ms) on every arm. Closed with no per-pass trace.
+- **S3 concurrent short replies/pairs:** the decode sum over 24 matched
+  short rows was cand2 2633–2755 ms (5 runs), cand4 2756–2823 ms (3
+  runs) and cand5 2769–3070 ms (8 runs; every cand5 run is above every
+  cand2 run, median +8.7 %). Against U6 base rpb, cand2 flagged 6–8 rows
+  and cand5 8–16. The work was the same (median draft rounds differ in
+  3 of 24 rows). This was measured at proactiveness 50, so it is
+  inconclusive but consistent in direction. Suspects: the per-step
+  `hipEventRecord` (C4) and the cand3/cand4 strided grid and residents
+  gate.
+- **S4 / B3 confirmed (base rpb vs cand5 f5).** On every `*-disk` row
+  whose prompt end is not a multiple of 4, cand5 logs an extra
+  `persistence_refused tokens=<aligned>` before the prefill finishes:
+  184/186, 216/217, 708/709, 740/743 and 708/711. These rows have
+  `cache_captures=2` (base 1), and the restore lands on the aligned
+  boundary (172 vs 173, 668 vs 670, so 1–2 more prefill tokens).
+  - Rows with the same token counts: prefill +13–14 ms, snapshot
+    3.2 → 5.2 ms.
+  - The aligned 736-token row has no extra capture: +6 ms, snapshot
+    3.2/3.2.
+  - One row had a +180 ms outlier.
+  - The B3 option was not implemented.
+
 ## Upstream U6 combined GPU pass, November 9, 2026 (not deployed)
 
 Evidence is under `build/b1/u6-20261109/` (chain*.log, perf/, serve/, func/,
