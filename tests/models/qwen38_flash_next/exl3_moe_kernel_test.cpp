@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -12,6 +14,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1967,6 +1970,240 @@ void RouterNonFinite() {
   Require(fused == i, "fused non-finite routing differs from RouterTopK");
 }
 
+/// Waits at most one second for `stream`. A stalled launch ends the process
+/// at once: a hung kernel would block every later HIP call, teardown too.
+void Watchdog(hipStream_t stream, const std::string& what) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  for (;;) {
+    const auto status = hipStreamQuery(stream);
+    if (status == hipSuccess)
+      return;
+    if (status != hipErrorNotReady)
+      Check(status);
+    if (std::chrono::steady_clock::now() > deadline) {
+      std::cerr << "watchdog: " << what << " did not finish within 1 s\n";
+      std::_Exit(3);
+    }
+    std::this_thread::yield();
+  }
+}
+
+/// A routed decode layer on the model's shapes (hidden 2560, expert width
+/// 640, ten of `experts` experts per row) with router-built IDs on `hot`
+/// overlapping experts, as copy verification produces them.
+struct RoutedPass {
+  static constexpr unsigned k = 2560, ff = 640, used = 10;
+  unsigned rows, experts, assignments;
+  Buffers buffers;
+  Bank gate, up, down;
+  gpu::DeviceLayer layer;
+  float* x;
+  std::int32_t* ids;
+  float *g, *u, *out;
+  gpu::Exl3Scratch s;
+  RoutedPass(unsigned rows, unsigned experts, unsigned hot, unsigned seed)
+      : rows(rows),
+        experts(experts),
+        assignments(rows * used),
+        gate(buffers, k, ff, experts, seed, false, 4, false),
+        up(buffers, k, ff, experts, seed + 1, false, 4, false),
+        down(buffers, ff, k, experts, seed + 2, false, 4, false) {
+    layer.ffn_gate_exps = gate.weight;
+    layer.ffn_up_exps = up.weight;
+    layer.ffn_down_exps = down.weight;
+    std::mt19937 rng(seed);
+    std::vector<float> input(rows * k);
+    for (auto& v : input)
+      v = (int(rng() % 2000) - 1000) * 0.0005F;
+    std::vector<float> logits(rows * (experts + 1));
+    for (unsigned t = 0; t < rows; ++t)
+      for (unsigned e = 0; e <= experts; ++e) {
+        float v = (int(rng() % 2000) - 1000) * 0.001F;
+        if (e < hot)
+          v += 4.0F + static_cast<float>((e * 5 + t * 3) % 7) * 0.5F;
+        logits[t * (experts + 1) + e] = v;
+      }
+    x = buffers.Copy(input);
+    ids = buffers.Make<std::int32_t>(assignments);
+    gpu::RouterTopK(buffers.Copy(logits), experts + 1, ids,
+                    buffers.Make<float>(assignments), rows, experts, used,
+                    nullptr);
+    g = buffers.Make<float>(assignments * ff);
+    u = buffers.Make<float>(assignments * ff);
+    out = buffers.Make<float>(assignments * k);
+    s.tiles = buffers.Make<gpu::Exl3RouteTile>(assignments);
+    s.tile_count = buffers.Make<std::uint32_t>(1);
+    s.down_exponents = buffers.Make<std::int32_t>(assignments);
+    s.routed_input =
+        buffers.Make<std::uint16_t>(assignments * std::max(2 * k, ff));
+  }
+  /// Exl3RoutedMlp's routed rows with `grid_rows` blocks in y (0: default).
+  std::vector<float> Run(std::uint32_t grid_rows, bool scaled, bool raw_down,
+                         bool tiles_ready = false, hipStream_t stream = nullptr,
+                         const std::string& what = "routed pass") {
+    auto scratch = s;
+    scratch.routed_grid_rows = grid_rows;
+    if (!scaled)
+      scratch.down_exponents = nullptr;
+    Check(hipMemsetAsync(out, 0xFF, std::size_t{assignments} * k * 4, stream));
+    gpu::Exl3RoutedMlp(layer, x, ids, g, u, out, rows, used, scratch, stream,
+                       nullptr, tiles_ready, raw_down);
+    Watchdog(stream, what);
+    Check(hipStreamSynchronize(stream));
+    return Read(out, assignments * k);
+  }
+};
+
+bool SameFloats(const std::vector<float>& a, const std::vector<float>& b) {
+  return a.size() == b.size() &&
+         std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+}
+
+/// The persistent routed grid against one block per live route tile (the
+/// old launch's blocks past the tile count exited at once; its full height
+/// is the wide grid under suspicion, so it is not relaunched): one block,
+/// odd strides and the default cap give the same bytes, for the scaled and
+/// widened down routes, restored and raw.
+void RoutedGridIdentity(unsigned rows) {
+  RoutedPass pass(rows, 24, 20, 61 + rows);
+  const auto prefix = "routed grid rows=" + std::to_string(rows);
+  (void)pass.Run(0, true, false, false, nullptr, prefix + " tiles");
+  const auto live = Read(pass.s.tile_count, 1)[0];
+  for (const bool scaled : {true, false})
+    for (const bool raw : {false, true}) {
+      const auto route = std::string(scaled ? " scaled" : " widened") +
+                         (raw ? " raw" : " restored");
+      const auto old_grid = pass.Run(live, scaled, raw, false, nullptr,
+                                     prefix + route + " per-tile grid");
+      for (const std::uint32_t grid : {0U, 1U, 7U, 33U}) {
+        const auto name = prefix + route + " grid=" + std::to_string(grid);
+        Require(SameFloats(old_grid,
+                           pass.Run(grid, scaled, raw, false, nullptr, name)),
+                (name + ": persistent grid changed bytes").c_str());
+      }
+    }
+}
+
+/// Test A: a 64-row copy verification layer's route tiles (~100-200 tiles,
+/// as in production), replayed through tiles_ready many times;
+/// every launch finishes within the watchdog and repeats the bytes.
+void RoutedWideReplay() {
+  // 64 hot experts: about ten assignments, two tiles, each.
+  RoutedPass pass(64, 80, 64, 71);
+  const auto reference = pass.Run(0, true, false);
+  const auto n = Read(pass.s.tile_count, 1)[0];
+  const auto tiles = Read(pass.s.tiles, n);
+  std::cout << "CASE routed wide replay tiles=" << n << '\n';
+  Require(n > gpu::kExl3RoutedGridRows && n <= pass.assignments,
+          "wide replay fixture must exceed the routed grid");
+  hipStream_t stream;
+  Check(hipStreamCreate(&stream));
+  for (unsigned launch = 0; launch < 200; ++launch) {
+    Check(hipMemcpyAsync(pass.s.tiles, tiles.data(),
+                         tiles.size() * sizeof(tiles[0]), hipMemcpyHostToDevice,
+                         stream));
+    Check(hipMemcpyAsync(pass.s.tile_count, &n, sizeof(n),
+                         hipMemcpyHostToDevice, stream));
+    const auto name = "routed wide replay launch " + std::to_string(launch);
+    Require(SameFloats(reference,
+                       pass.Run(0, true, false, true, stream, name.c_str())),
+            (name + " changed bytes").c_str());
+  }
+  Check(hipStreamDestroy(stream));
+}
+
+/// Test B: adversarial route tiles for the routed down GEMV (production
+/// expert width 640 -> 2560): an empty tile, a count of 9 (past any tile
+/// row cap; read as 8), every assignment on one expert, a NaN input row,
+/// and tile counts of 0 and of 640 one-row tiles. Every launch finishes in
+/// the watchdog and the persistent grid repeats the bytes of one block per
+/// tile up to 160 tiles (the old launch's live blocks), strided beyond.
+void RoutedAdversarialTiles() {
+  constexpr unsigned k = 640, n = 2560, experts = 8, assignments = 640;
+  Buffers buffers;
+  Bank down(buffers, k, n, experts, 81, false, 4, false);
+  std::vector<std::uint16_t> input(assignments * k);
+  std::mt19937 rng(82);
+  for (auto& v : input)
+    v = ex::HalfFromDouble((int(rng() % 2000) - 1000) * 0.0005);
+  std::fill_n(input.begin() + 5 * k, k, std::uint16_t{0x7e00});  // NaN row
+  hipStream_t stream;
+  Check(hipStreamCreate(&stream));
+  const auto run = [&](const std::vector<gpu::Exl3RouteTile>& tiles,
+                       std::uint32_t count, std::uint32_t grid, bool scaled,
+                       const std::string& what) {
+    gpu::Exl3Scratch s;
+    s.tiles = buffers.Copy(tiles);
+    s.tile_count = buffers.Copy(std::vector<std::uint32_t>{count});
+    s.down_exponents =
+        scaled ? buffers.Make<std::int32_t>(assignments) : nullptr;
+    s.routed_grid_rows = grid;
+    auto* in = buffers.Copy(input);  // the scaled route rescales in place
+    auto* out = buffers.Make<float>(std::size_t{assignments} * n);
+    Check(hipMemsetAsync(out, 0xFF, std::size_t{assignments} * n * 4, stream));
+    gpu::Exl3RoutedDown(down.weight, in, out, assignments, 8, s, stream);
+    Watchdog(stream, what);
+    Check(hipStreamSynchronize(stream));
+    return Read(out, std::size_t{assignments} * n);
+  };
+  const auto tile = [](unsigned expert, unsigned count, unsigned first) {
+    gpu::Exl3RouteTile t{};
+    t.expert = expert;
+    t.count = count;
+    for (unsigned r = 0; r < 8; ++r)
+      t.slots[r] = first + r;
+    return t;
+  };
+  std::vector<std::pair<std::string, std::vector<gpu::Exl3RouteTile>>> sets;
+  // Empty and over-full tiles beside ordinary ones (and the NaN row 5).
+  sets.push_back({"mixed",
+                  {tile(0, 0, 0), tile(1, 9, 0), tile(2, 3, 8), tile(3, 8, 16),
+                   tile(4, 1, 40)}});
+  // Every assignment on one expert, eight per tile.
+  std::vector<gpu::Exl3RouteTile> one;
+  for (unsigned first = 0; first < assignments; first += 8)
+    one.push_back(tile(6, 8, first));
+  sets.push_back({"one expert", one});
+  // 640 one-row tiles, the old grid's full height.
+  std::vector<gpu::Exl3RouteTile> single;
+  for (unsigned i = 0; i < assignments; ++i)
+    single.push_back(tile(i % experts, 1, i));
+  sets.push_back({"640 one-row tiles", single});
+  for (const auto& [name, tiles] : sets)
+    for (const bool scaled : {false, true}) {
+      const auto count = static_cast<std::uint32_t>(tiles.size());
+      const auto label = name + (scaled ? " scaled" : " widened");
+      // One block per tile up to 160 tiles, strided beyond: short of the
+      // 640-row grid under suspicion.
+      const auto old_grid = run(tiles, count, std::min(count, 160U), scaled,
+                                label + " per-tile grid");
+      for (const std::uint32_t grid : {0U, 1U, 7U})
+        Require(
+            SameFloats(old_grid, run(tiles, count, grid, scaled,
+                                     label + " grid " + std::to_string(grid))),
+            (label + ": persistent grid changed bytes").c_str());
+      // No tiles: nothing is written.
+      const auto none = run(tiles, 0, 0, scaled, label + " count 0");
+      for (const float v : none)
+        Require(std::bit_cast<std::uint32_t>(v) == 0xFFFFFFFFU,
+                "a zero tile count wrote routed rows");
+    }
+  // The empty tile writes nothing and the count-9 tile is its first eight
+  // rows (the generic body, against the eight-row body when scaled): the
+  // mixed set equals the set with those tiles corrected.
+  auto fixed = sets[0].second;
+  fixed[1].count = 8;
+  fixed.erase(fixed.begin());
+  for (const bool scaled : {false, true}) {
+    const auto mixed = run(sets[0].second, 5, 0, scaled, "mixed check");
+    const auto corrected = run(fixed, 4, 0, scaled, "corrected check");
+    Require(SameFloats(mixed, corrected),
+            "empty or over-full route tiles changed other rows");
+  }
+  Check(hipStreamDestroy(stream));
+}
+
 // The scaled down projection on DownFixtures' edge rows (signed zeros,
 // subnormals, overflow headroom: exponents 0, 10 and -1, i.e. packed,
 // scaled and widened-fallback rows) at the model's shape, against the
@@ -2102,6 +2339,10 @@ int main(int argc, char** argv) {
           std::pair{25U, 10U}, std::pair{64U, 4U}})
       RouterTilesSet(rows, used);
     RouterNonFinite();
+    for (unsigned rows : {3U, 8U, 9U, 16U, 25U, 64U})
+      RoutedGridIdentity(rows);
+    RoutedWideReplay();
+    RoutedAdversarialTiles();
     for (unsigned rows = 9; rows <= 25; ++rows)
       for (bool identical : {true, false})
         ConcentratedRouting(rows, identical);

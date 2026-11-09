@@ -74,28 +74,30 @@ __global__ void RotateAssignments(const ex::DeviceLinear* gate,
                                   const std::int32_t* ids, const float* x,
                                   std::uint16_t* output, unsigned used,
                                   unsigned width, unsigned assignments) {
-  const unsigned assignment = blockIdx.y;
-  const unsigned projection = blockIdx.z;
-  const auto& l = (projection == 0 ? gate : up)[ids[assignment]];
-  const unsigned lane = threadIdx.x;
-  const unsigned first = blockIdx.x * 128 + lane * 4;
-  const auto* suh = reinterpret_cast<const _Float16*>(l.suh);
-  const auto row = assignment / used;
-  float v[4];
+  for (unsigned assignment = blockIdx.y; assignment < assignments;
+       assignment += gridDim.y) {
+    const unsigned projection = blockIdx.z;
+    const auto& l = (projection == 0 ? gate : up)[ids[assignment]];
+    const unsigned lane = threadIdx.x;
+    const unsigned first = blockIdx.x * 128 + lane * 4;
+    const auto* suh = reinterpret_cast<const _Float16*>(l.suh);
+    const auto row = assignment / used;
+    float v[4];
 #pragma unroll
-  for (unsigned j = 0; j < 4; ++j) {
-    v[j] = x[std::size_t{row} * width + first + j] *
-           static_cast<float>(suh[first + j]);
-    asm volatile("" : "+v"(v[j]));
-  }
-  arithmetic::Butterfly128(v, lane);
-  auto* out = reinterpret_cast<_Float16*>(output) +
-              (std::size_t{projection} * assignments + assignment) * width;
+    for (unsigned j = 0; j < 4; ++j) {
+      v[j] = x[std::size_t{row} * width + first + j] *
+             static_cast<float>(suh[first + j]);
+      asm volatile("" : "+v"(v[j]));
+    }
+    arithmetic::Butterfly128(v, lane);
+    auto* out = reinterpret_cast<_Float16*>(output) +
+                (std::size_t{projection} * assignments + assignment) * width;
 #pragma unroll
-  for (unsigned j = 0; j < 4; ++j) {
-    float scaled = v[j] * arithmetic::kHadamardScale;
-    asm volatile("" : "+v"(scaled));
-    out[first + j] = static_cast<_Float16>(scaled);
+    for (unsigned j = 0; j < 4; ++j) {
+      float scaled = v[j] * arithmetic::kHadamardScale;
+      asm volatile("" : "+v"(scaled));
+      out[first + j] = static_cast<_Float16>(scaled);
+    }
   }
 }
 
@@ -142,13 +144,12 @@ template<int Bits, bool FullPrecision, unsigned MaxRows = 8,
          bool Scaled = false, bool ExactRows = false, unsigned Tiles = 1>
 __device__ __forceinline__ void RoutedGemvBody(
     const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
-    const Exl3RouteTile* tiles, const unsigned* count,
-    const std::uint16_t* input, float* gate_y, float* up_y, unsigned k,
-    unsigned n, unsigned assignments, const std::int32_t* exponents,
-    _Float16* stage) {
-  if (blockIdx.y >= *count)
-    return;
-  const auto tile_rows = tiles[blockIdx.y];
+    const Exl3RouteTile* tiles, unsigned tile, const std::uint16_t* input,
+    float* gate_y, float* up_y, unsigned k, unsigned n, unsigned assignments,
+    const std::int32_t* exponents, _Float16* stage) {
+  // A count past MaxRows (never built) would stage past `stage`.
+  auto tile_rows = tiles[tile];
+  tile_rows.count = min(tile_rows.count, MaxRows);
   const unsigned projection = blockIdx.z;
   const auto& l = (projection == 0 ? gate : up)[tile_rows.expert];
   const unsigned lane = threadIdx.x % 32;
@@ -364,28 +365,21 @@ __device__ __forceinline__ void RoutedGemvBody(
 // The generic body remains for MaxRows 1/2 and unscaled full-precision down.
 template<int Bits, bool FullPrecision, unsigned MaxRows = 8,
          bool Scaled = false, unsigned Tiles = 1>
-__global__ void RoutedGemv(const ex::DeviceLinear* gate,
-                           const ex::DeviceLinear* up,
-                           const Exl3RouteTile* tiles, const unsigned* count,
-                           const std::uint16_t* input, float* gate_y,
-                           float* up_y, unsigned k, unsigned n,
-                           unsigned assignments,
-                           const std::int32_t* exponents) {
-  if (blockIdx.y >= *count)
-    return;
-  // One staging buffer for whichever row body the tile selects.
-  __shared__
-      __attribute__((aligned(16))) _Float16 stage[RoutedStageHalves(MaxRows)];
+__device__ __forceinline__ void RoutedGemvTile(
+    const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
+    const Exl3RouteTile* tiles, unsigned tile, const std::uint16_t* input,
+    float* gate_y, float* up_y, unsigned k, unsigned n, unsigned assignments,
+    const std::int32_t* exponents, _Float16* stage) {
   if constexpr (!FullPrecision &&
                 (MaxRows == 3 || MaxRows == 4 || MaxRows == 8)) {
     // Each live-row body runs exactly the generic body's arithmetic for the
     // tile's rows; R5-R8 verify tiles (MaxRows 8) mostly hold 1-2 rows.
     const auto exact = [&]<unsigned Rows>() __attribute__((always_inline)) {
       RoutedGemvBody<Bits, FullPrecision, Rows, Scaled, true, Tiles>(
-          gate, up, tiles, count, input, gate_y, up_y, k, n, assignments,
+          gate, up, tiles, tile, input, gate_y, up_y, k, n, assignments,
           exponents, stage);
     };
-    switch (tiles[blockIdx.y].count) {
+    switch (tiles[tile].count) {
       case 1:
         exact.template operator()<1>();
         return;
@@ -430,27 +424,57 @@ __global__ void RoutedGemv(const ex::DeviceLinear* gate,
     }
   }
   RoutedGemvBody<Bits, FullPrecision, MaxRows, Scaled, false, Tiles>(
-      gate, up, tiles, count, input, gate_y, up_y, k, n, assignments, exponents,
+      gate, up, tiles, tile, input, gate_y, up_y, k, n, assignments, exponents,
       stage);
+}
+
+// Persistent over the route tiles: gridDim.y blocks stride the tile list
+// (LaunchRouted caps it at the widest ordinary verification's tiles), so a
+// wide verification launches no more blocks than an eight-row pass; the
+// 64-row grid of one block per assignment (12800 gate/up blocks) stalled
+// in the hardware queue. Each tile is still computed by exactly one block
+// with the same arithmetic. The tile index and count are uniform over the
+// block, so all its waves run the same iterations and reach every staging
+// barrier together; the next tile's first staging barrier also orders its
+// LDS writes after the previous tile's reads.
+template<int Bits, bool FullPrecision, unsigned MaxRows = 8,
+         bool Scaled = false, unsigned Tiles = 1>
+__global__ void RoutedGemv(const ex::DeviceLinear* gate,
+                           const ex::DeviceLinear* up,
+                           const Exl3RouteTile* tiles, const unsigned* count,
+                           const std::uint16_t* input, float* gate_y,
+                           float* up_y, unsigned k, unsigned n,
+                           unsigned assignments,
+                           const std::int32_t* exponents) {
+  // One staging buffer for whichever row body the tile selects.
+  __shared__
+      __attribute__((aligned(16))) _Float16 stage[RoutedStageHalves(MaxRows)];
+  // The old grid of `assignments` rows also bounded the tiles read.
+  const unsigned tiles_n = min(*count, assignments);
+  for (unsigned tile = blockIdx.y; tile < tiles_n; tile += gridDim.y)
+    RoutedGemvTile<Bits, FullPrecision, MaxRows, Scaled, Tiles>(
+        gate, up, tiles, tile, input, gate_y, up_y, k, n, assignments,
+        exponents, stage);
 }
 
 __global__ void RestoreDownAssignments(const ex::DeviceLinear* down,
                                        const std::int32_t* ids, float* output,
-                                       unsigned width) {
-  const unsigned row = blockIdx.y;
-  const unsigned lane = threadIdx.x;
-  const unsigned first = blockIdx.x * 128 + lane * 4;
-  const auto* svh = reinterpret_cast<const _Float16*>(down[ids[row]].svh);
-  const auto offset = std::size_t{row} * width + first;
-  float v[4];
+                                       unsigned width, unsigned assignments) {
+  for (unsigned row = blockIdx.y; row < assignments; row += gridDim.y) {
+    const unsigned lane = threadIdx.x;
+    const unsigned first = blockIdx.x * 128 + lane * 4;
+    const auto* svh = reinterpret_cast<const _Float16*>(down[ids[row]].svh);
+    const auto offset = std::size_t{row} * width + first;
+    float v[4];
 #pragma unroll
-  for (unsigned j = 0; j < 4; ++j)
-    v[j] = output[offset + j];
-  arithmetic::Butterfly128(v, lane);
+    for (unsigned j = 0; j < 4; ++j)
+      v[j] = output[offset + j];
+    arithmetic::Butterfly128(v, lane);
 #pragma unroll
-  for (unsigned j = 0; j < 4; ++j)
-    output[offset + j] = (v[j] * arithmetic::kHadamardScale) *
-                         static_cast<float>(svh[first + j]);
+    for (unsigned j = 0; j < 4; ++j)
+      output[offset + j] = (v[j] * arithmetic::kHadamardScale) *
+                           static_cast<float>(svh[first + j]);
+  }
 }
 
 // Scale only the already-rounded FP16 values. min/max are absolute FP16
@@ -519,43 +543,45 @@ __global__ void RestoreActivateRotate(const ex::DeviceLinear* gate,
                                       const ex::DeviceLinear* down,
                                       const std::int32_t* ids, float* gate_y,
                                       const float* up_y, std::uint16_t* output,
-                                      unsigned width) {
-  const unsigned row = blockIdx.y, lane = threadIdx.x;
-  const unsigned first = blockIdx.x * 128 + lane * 4;
-  const auto& g = gate[ids[row]];
-  const auto& u = up[ids[row]];
-  const auto& d = down[ids[row]];
-  const auto* gs = reinterpret_cast<const _Float16*>(g.svh);
-  const auto* us = reinterpret_cast<const _Float16*>(u.svh);
-  const auto* ds = reinterpret_cast<const _Float16*>(d.suh);
-  const auto offset = std::size_t{row} * width + first;
-  float gv[4], uv[4];
+                                      unsigned width, unsigned assignments) {
+  const unsigned lane = threadIdx.x;
+  for (unsigned row = blockIdx.y; row < assignments; row += gridDim.y) {
+    const unsigned first = blockIdx.x * 128 + lane * 4;
+    const auto& g = gate[ids[row]];
+    const auto& u = up[ids[row]];
+    const auto& d = down[ids[row]];
+    const auto* gs = reinterpret_cast<const _Float16*>(g.svh);
+    const auto* us = reinterpret_cast<const _Float16*>(u.svh);
+    const auto* ds = reinterpret_cast<const _Float16*>(d.suh);
+    const auto offset = std::size_t{row} * width + first;
+    float gv[4], uv[4];
 #pragma unroll
-  for (unsigned j = 0; j < 4; ++j) {
-    gv[j] = gate_y[offset + j];
-    uv[j] = up_y[offset + j];
-  }
-  arithmetic::Butterfly128(gv, lane);
-  arithmetic::Butterfly128(uv, lane);
+    for (unsigned j = 0; j < 4; ++j) {
+      gv[j] = gate_y[offset + j];
+      uv[j] = up_y[offset + j];
+    }
+    arithmetic::Butterfly128(gv, lane);
+    arithmetic::Butterfly128(uv, lane);
 #pragma unroll
-  for (unsigned j = 0; j < 4; ++j) {
-    const float value = (gv[j] * arithmetic::kHadamardScale) *
-                        static_cast<float>(gs[first + j]);
-    const float other = (uv[j] * arithmetic::kHadamardScale) *
-                        static_cast<float>(us[first + j]);
-    float activation = (value / (1.0F + expf(-value))) * other;
-    asm volatile("" : "+v"(activation));
-    gate_y[offset + j] = activation;
-    gv[j] = activation * static_cast<float>(ds[first + j]);
-    asm volatile("" : "+v"(gv[j]));
-  }
-  arithmetic::Butterfly128(gv, lane);
+    for (unsigned j = 0; j < 4; ++j) {
+      const float value = (gv[j] * arithmetic::kHadamardScale) *
+                          static_cast<float>(gs[first + j]);
+      const float other = (uv[j] * arithmetic::kHadamardScale) *
+                          static_cast<float>(us[first + j]);
+      float activation = (value / (1.0F + expf(-value))) * other;
+      asm volatile("" : "+v"(activation));
+      gate_y[offset + j] = activation;
+      gv[j] = activation * static_cast<float>(ds[first + j]);
+      asm volatile("" : "+v"(gv[j]));
+    }
+    arithmetic::Butterfly128(gv, lane);
 #pragma unroll
-  for (unsigned j = 0; j < 4; ++j) {
-    float scaled = gv[j] * arithmetic::kHadamardScale;
-    asm volatile("" : "+v"(scaled));
-    reinterpret_cast<_Float16*>(output)[offset + j] =
-        static_cast<_Float16>(scaled);
+    for (unsigned j = 0; j < 4; ++j) {
+      float scaled = gv[j] * arithmetic::kHadamardScale;
+      asm volatile("" : "+v"(scaled));
+      reinterpret_cast<_Float16*>(output)[offset + j] =
+          static_cast<_Float16>(scaled);
+    }
   }
 }
 
@@ -1390,6 +1416,14 @@ unsigned TileRows(unsigned rows) {
   return Exl3RouteTileRows(rows);
 }
 
+// Blocks in y of a routed decode launch over `assignments` route tiles or
+// assignment rows; its blocks stride the rest.
+unsigned RoutedGridRows(unsigned assignments, const Exl3Scratch& scratch) {
+  const unsigned cap = scratch.routed_grid_rows != 0 ? scratch.routed_grid_rows
+                                                     : kExl3RoutedGridRows;
+  return std::max(1U, std::min(assignments, cap));
+}
+
 template<bool FullPrecision, bool Scaled = false, unsigned Tiles = 1>
 void LaunchRouted(const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
                   const std::uint16_t* input, float* gate_y, float* up_y,
@@ -1403,12 +1437,13 @@ void LaunchRouted(const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
       // need 125-146 VGPRs with two.
       constexpr unsigned kTiles = R <= 4 ? Tiles : 1;
       constexpr unsigned kBlockTiles = kRoutedWaves * kTiles;
-      hipLaunchKernelGGL((RoutedGemv<Bits, FullPrecision, R, Scaled, kTiles>),
-                         dim3((n / 16 + kBlockTiles - 1) / kBlockTiles,
-                              assignments, projections),
-                         dim3(32 * kRoutedWaves), 0, stream, gate, up,
-                         scratch.tiles, scratch.tile_count, input, gate_y, up_y,
-                         k, n, assignments, scratch.down_exponents);
+      hipLaunchKernelGGL(
+          (RoutedGemv<Bits, FullPrecision, R, Scaled, kTiles>),
+          dim3((n / 16 + kBlockTiles - 1) / kBlockTiles,
+               RoutedGridRows(assignments, scratch), projections),
+          dim3(32 * kRoutedWaves), 0, stream, gate, up, scratch.tiles,
+          scratch.tile_count, input, gate_y, up_y, k, n, assignments,
+          scratch.down_exponents);
     };
     switch (tile_rows) {
       case 1:
@@ -1901,7 +1936,9 @@ void Exl3RoutedMlp(const DeviceLayer& l, const float* x,
                        stream, ids, assignments, s.tiles, s.tile_count,
                        g.experts, tile_rows);
   }
-  hipLaunchKernelGGL(RotateAssignments, dim3(g.cols / 128, assignments, 2),
+  // The assignment-row launches stride their rows like LaunchRouted.
+  const unsigned grid_rows = RoutedGridRows(assignments, s);
+  hipLaunchKernelGGL(RotateAssignments, dim3(g.cols / 128, grid_rows, 2),
                      dim3(32), 0, stream, g.device_exl3, u.device_exl3, ids, x,
                      s.routed_input, used, g.cols, assignments);
   if (trace != nullptr)
@@ -1937,9 +1974,10 @@ void Exl3RoutedMlp(const DeviceLayer& l, const float* x,
                        u.device_exl3, d.device_exl3, ids, gate, up,
                        s.routed_input, s.down_exponents, d.cols);
   else
-    hipLaunchKernelGGL(RestoreActivateRotate, dim3(g.rows / 128, assignments),
+    hipLaunchKernelGGL(RestoreActivateRotate, dim3(g.rows / 128, grid_rows),
                        dim3(32), 0, stream, g.device_exl3, u.device_exl3,
-                       d.device_exl3, ids, gate, up, s.routed_input, g.rows);
+                       d.device_exl3, ids, gate, up, s.routed_input, g.rows,
+                       assignments);
   if (trace != nullptr)
     snapshot(trace->activation, gate,
              std::size_t{assignments} * g.rows * sizeof(float));
@@ -1963,8 +2001,9 @@ void Exl3RoutedMlp(const DeviceLayer& l, const float* x,
     snapshot(trace->down_inner, out,
              std::size_t{assignments} * d.rows * sizeof(float));
   if (!raw_down)
-    hipLaunchKernelGGL(RestoreDownAssignments, dim3(d.rows / 128, assignments),
-                       dim3(32), 0, stream, d.device_exl3, ids, out, d.rows);
+    hipLaunchKernelGGL(RestoreDownAssignments, dim3(d.rows / 128, grid_rows),
+                       dim3(32), 0, stream, d.device_exl3, ids, out, d.rows,
+                       assignments);
   Check();
 }
 

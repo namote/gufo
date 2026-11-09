@@ -40,6 +40,10 @@ struct Exl3Scratch {
   /// so other fast launches between producer and consumer cannot clobber it.
   std::uint16_t* rotated_input{nullptr};
   std::size_t rotated_input_elements{0};
+  /// Blocks in y of the routed decode launches (route tiles or assignment
+  /// rows, which the blocks stride); 0 means kExl3RoutedGridRows. Outputs do
+  /// not depend on it; operator tests vary it.
+  std::uint32_t routed_grid_rows{0};
 };
 
 /// Rows per routed decode tile for a call of `rows` tokens. R=3 does not
@@ -47,6 +51,10 @@ struct Exl3Scratch {
 constexpr std::uint32_t Exl3RouteTileRows(std::uint32_t rows) {
   return rows <= 3 ? rows : rows <= 4 ? 4 : 8;
 }
+/// Blocks in y of a routed decode launch: the assignments of the widest
+/// ordinary verification (eight rows, ten experts). Wider passes stride
+/// their route tiles over them instead of launching a block per assignment.
+constexpr std::uint32_t kExl3RoutedGridRows = 80;
 /// Largest assignment count whose tiles RouterTopKTiles builds.
 constexpr std::uint32_t kExl3FusedTileAssignments = 256;
 
