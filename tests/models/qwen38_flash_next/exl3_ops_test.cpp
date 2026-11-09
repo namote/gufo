@@ -789,10 +789,6 @@ int main(int argc, char** argv) {
       MtpExecutorCatchUp(true);
       return 0;
     }
-    if (argc == 2 && std::string(argv[1]) == "--wide-verification") {
-      WideVerification();
-      return 0;
-    }
     if (argc == 2 && std::string(argv[1]) == "--mtp-kv-group") {
       MtpKvGroup();
       return 0;

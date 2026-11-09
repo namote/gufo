@@ -11,8 +11,7 @@ bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
       session.position_ == 0 || hidden.empty() ||
       hidden.size() % config().HcDim() != 0 ||
       hidden.size() / config().HcDim() >
-          std::min(session.position_,
-                   std::max(options_.max_speculative, max_copy_rows()))) {
+          std::min(session.position_, options_.max_speculative)) {
     AssignError(error_msg, "invalid trunk hidden diagnostic input");
     return false;
   }
@@ -132,7 +131,6 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   const bool speculative = mode == ForwardMode::kVerify;
   PrefillPhase phase(mode == ForwardMode::kPrefill);
   selected_logits_ = nullptr;
-  wide_rows_ = 0;
   DropReadyQ8();
   const Config& c = config();
   const auto n = static_cast<std::uint32_t>(tokens.size());
@@ -552,11 +550,8 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
     const std::size_t conv_elems =
         static_cast<std::size_t>(c.ssm_conv_kernel - 1) * c.SsmConvChannels();
     const std::size_t slot = keep - 1;
-    // A wide batch's convolution and PLE histories were cut back with its
-    // recurrent states (RollbackWide).
-    const bool wide = n > kWideSegmentRows;
     for (auto& l : session.linear_) {
-      if (l.state == nullptr || wide) {
+      if (l.state == nullptr) {
         continue;
       }
       if (!Check(hipMemcpyAsync(l.conv_state, l.conv_snapshots.rows[slot],
@@ -569,8 +564,7 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
     if (session.ple_history_ != nullptr) {
       const std::size_t hist =
           static_cast<std::size_t>(c.PleConvHistory()) * c.HcDim();
-      if (!wide &&
-          !Check(hipMemcpyAsync(
+      if (!Check(hipMemcpyAsync(
                      session.ple_history_, session.ple_snapshots_.rows[slot],
                      hist * sizeof(float), hipMemcpyDeviceToDevice, stream_),
                  "PLE rollback", error_msg)) {
@@ -624,9 +618,9 @@ bool Executor::ReplayOutputHead(std::uint32_t batch_rows,
 bool Executor::ReadVerificationRows(std::uint32_t row, std::span<float> logits,
                                     std::string* error_msg) const {
   const auto vocab = config().vocab_size;
-  const auto rows = std::max(options_.max_speculative, wide_rows_);
-  if (row >= rows || logits.empty() || logits.size() % vocab != 0 ||
-      logits.size() / vocab > rows - row) {
+  if (row >= options_.max_speculative || logits.empty() ||
+      logits.size() % vocab != 0 ||
+      logits.size() / vocab > options_.max_speculative - row) {
     AssignError(error_msg, "invalid verification row");
     return false;
   }

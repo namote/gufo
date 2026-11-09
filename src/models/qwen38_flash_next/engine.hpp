@@ -127,11 +127,6 @@ public:
   [[nodiscard]] std::size_t BaseSessionBytes(
       core::SessionMode mode, std::uint32_t context) const noexcept;
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
-  /// Widest copy verification (Executor::kWideRows).
-  static constexpr std::uint32_t kWideCopyRows = 64;
-  /// Caps wide copy verification (Executor::LimitCopyRows); call before any
-  /// session is created.
-  void LimitCopyRows(std::uint32_t rows) noexcept;
   [[nodiscard]] const std::shared_ptr<qwen::vision::Encoder>& VisionEncoder()
       const noexcept {
     return vision_;
@@ -385,13 +380,6 @@ private:
   MtpLengthController draft_length_;
   /// Index of tokens_ for prompt lookup (single-session MTP drafts).
   speculative::PromptLookup<> lookup_;
-  /// Verification rows (anchor included) the next copy-only cycle of a
-  /// session decoding alone may use; 0 before the first. Two whole copies
-  /// in a row at this width double it up to max_copy_rows(); any rejected
-  /// copy returns it to the ordinary verifier width.
-  std::uint32_t copy_rows_{0};
-  /// Whole copies accepted in a row at copy_rows_ (two widen it).
-  std::uint32_t copy_streak_{0};
   SpeculativeStats stats_;
   std::shared_ptr<const qwen::vision::Prompt> image_prompt_;
   [[nodiscard]] std::span<const std::uint8_t> ImageIdentity(

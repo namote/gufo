@@ -5,7 +5,6 @@
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 
-#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -415,40 +414,6 @@ public:
   [[nodiscard]] bool SelectBatchLogits(std::uint32_t offset, std::uint32_t rows,
                                        float* logits,
                                        std::string* error_msg) const;
-  /// Rows a single session may verify at once when every proposal after the
-  /// anchor is copied from its history (ForwardWide), or 0 without MTP.
-  static constexpr std::uint32_t kWideRows = 64;
-  /// Rows of one wide segment: the ordinary verifier's batch rows.
-  static constexpr std::uint32_t kWideSegmentRows = 8;
-  /// Segment 0 uses the session's rollback rows, so the verifier width must
-  /// be exactly one segment (kWideSegmentRows).
-  [[nodiscard]] std::uint32_t max_copy_rows() const noexcept {
-    return has_mtp() && options_.max_speculative == kWideSegmentRows
-               ? std::min({kWideRows, options_.max_batch,
-                           8 * std::min(8U, options_.max_logit_rows),
-                           copy_rows_cap_})
-               : 0;
-  }
-  /// Caps max_copy_rows() before any session is created, so the wide
-  /// verification scratch fits beside the configured sessions.
-  void LimitCopyRows(std::uint32_t rows) noexcept { copy_rows_cap_ = rows; }
-  /// Whether a sampled verification of `rows` rows can stay compact.
-  [[nodiscard]] static bool CanCompactWideVerification(
-      const sampling::SamplerState& sampler, std::size_t rows);
-  /// Verifies one session's chain of up to max_copy_rows() tokens in one
-  /// pass. The shared projections, routed experts and head read their
-  /// weights once for every row (the decode batch route); the recurrent
-  /// state, attention and PLE run as consecutive segments of at most eight
-  /// rows, so every row has the arithmetic of consecutive ordinary
-  /// verifications. Logit rows are selected as after ForwardBatch, and
-  /// Rollback() cuts the chain back to any kept prefix.
-  [[nodiscard]] bool ForwardWide(Session& session,
-                                 std::span<const std::int32_t> tokens,
-                                 std::string* error_msg) const;
-  /// Moves kept trunk hidden row `row` to row 0 (the draft block caught up
-  /// to it, so the rows before it are no longer needed).
-  [[nodiscard]] bool KeepHiddenRow(Session& session, std::uint32_t row,
-                                   std::string* error_msg) const;
   [[nodiscard]] bool ReadVerificationRows(std::uint32_t row,
                                           std::span<float> logits,
                                           std::string* error_msg) const;
@@ -1027,46 +992,6 @@ private:
   mutable GdnBatchItem* batch_gdn_host_{nullptr};
   mutable GdnBatchItem* batch_gdn_{nullptr};
   mutable std::uint32_t batch_rows_{0};
-  /// Rollback rows of a wide verification's later segments (ForwardWide).
-  /// Only the session decoding alone verifies wide, and its Forward/Rollback
-  /// pair completes before another pass, so the executor owns them. Segment
-  /// s >= 1 uses wide_segments_[s - 1]: its own GDN update records and
-  /// convolution/PLE prefix rows, and the convolution/PLE history at its
-  /// start. The recurrence of segments s >= 1 starts from wide_state_ (one
-  /// state per linear layer): the state before the pass with the records of
-  /// every earlier segment committed, so the live state keeps its value
-  /// before the pass as for an ordinary verification. For the production
-  /// geometry (36 linear layers) that is 45.7 MiB per segment past the first
-  /// plus 108 MiB of wide_state_, 428 MiB at 64 rows (WideSegmentFloats,
-  /// WideStateFloats), allocated on first use and reserved with the other
-  /// lazy scratch (DeferredScratchBytes).
-  struct WideSegment {
-    std::vector<RollbackRows> conv;   ///< per layer, linear layers only
-    std::vector<RollbackRows> state;  ///< per layer, linear layers only
-    std::vector<float*> conv_start;   ///< per layer
-    RollbackRows ple;
-    float* ple_start{nullptr};
-  };
-  mutable std::vector<WideSegment> wide_segments_;
-  mutable std::vector<float*> wide_state_;  ///< per layer, linear layers only
-  mutable std::vector<float*> wide_allocations_;
-  mutable Session::Control* wide_controls_{nullptr};
-  /// Rows of the completed wide verification, or 0.
-  mutable std::uint32_t wide_rows_{0};
-  /// The session whose pending speculative batch is wide (compared only).
-  mutable const Session* wide_owner_{nullptr};
-  std::uint32_t copy_rows_cap_{kWideRows};
-  /// Compact sampled candidates of a wide verification's rows.
-  mutable std::vector<std::vector<sampling::LogitCandidate>> wide_candidates_;
-  bool EnsureWideSegments(std::uint32_t segments, std::string* error) const;
-  [[nodiscard]] std::size_t WideSegmentFloats() const;
-  [[nodiscard]] std::size_t WideStateFloats() const;
-  bool ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
-                        std::string* error) const;
-  /// Commits or cuts back the recurrent, convolution and PLE state of a
-  /// pending wide batch of `n` rows to `keep` (Rollback).
-  bool RollbackWide(Session& session, std::uint32_t keep, std::uint32_t n,
-                    std::string* error_msg) const;
   mutable const float* selected_logits_{nullptr};
   [[nodiscard]] const float* VerificationLogits() const {
     return selected_logits_ != nullptr ? selected_logits_ : s_.logits;

@@ -370,9 +370,6 @@ Executor::~Executor() {
     (void)ngram_->WaitRead();
   }
   (void)hipFree(batch_logits_);
-  (void)hipFree(wide_controls_);
-  for (float* p : wide_allocations_)
-    (void)hipFree(p);
   (void)hipFree(verification_penalties_);
   for (void* p : allocations_) {
     (void)hipFree(p);
@@ -980,13 +977,9 @@ std::unique_ptr<Session> Executor::CreateSession(
   }
   s->control_ = Alloc<Session::Control>(a, 1, error_msg, &s->allocated_bytes_);
   if (s->mtp_enabled_) {
-    // Wide copy verification keeps every row for the draft catch-up.
-    s->mtp_.target_hidden =
-        Alloc<float>(a,
-                     static_cast<std::size_t>(
-                         std::max(options_.max_speculative, max_copy_rows())) *
-                         c.HcDim(),
-                     error_msg, &s->allocated_bytes_);
+    s->mtp_.target_hidden = Alloc<float>(
+        a, static_cast<std::size_t>(options_.max_speculative) * c.HcDim(),
+        error_msg, &s->allocated_bytes_);
     // The draft block's FP16 K/V follow the trunk's FP16 layers, or are the
     // only FP16 layer of a KVarN session.
     const std::uint32_t draft_slot = layout.fp16_trunk ? kv_slot : 0;
@@ -1174,16 +1167,14 @@ std::size_t Executor::SessionBytes(
                 (rollback_depth - 1) *
                     GdnRollbackRowFloats(1, c.ssm_num_k_heads,
                                          c.ssm_num_v_heads, c.ssm_head_dim);
-  // MTP keeps every verified trunk hidden row (target_hidden: the verifier
-  // width, or a wide copy's) plus the draft block's own row (h).
-  const std::size_t hidden_rows =
-      std::size_t{std::max(options_.max_speculative, max_copy_rows())} + 1;
   return ((linear * conv + ple) * (rollback_depth + 1) +
           linear * (state + rollback_state)) *
              sizeof(float) +
          kv_blocks + attention * index + sizeof(Session::Control) +
          (mode == core::SessionMode::kSpeculative
-              ? index + hidden_rows * c.HcDim() * sizeof(float) +
+              ? index +
+                    std::size_t{options_.max_speculative + 1} * c.HcDim() *
+                        sizeof(float) +
                     (model_->draft_output().empty()
                          ? 0
                          : std::size_t{kMtpDraftExtraRows} *
@@ -1213,115 +1204,8 @@ std::size_t Executor::DeferredScratchBytes() const {
                                          c.HcDim() * sizeof(float)
                                    : 0);
   }
-  // Rollback rows and the starting states of a wide copy verification's
-  // later segments (ForwardWide), allocated on first use.
-  const std::size_t wide_segments =
-      (max_copy_rows() + kWideSegmentRows - 1) / kWideSegmentRows;
-  if (wide_segments > 1 + wide_segments_.size())
-    bytes += (wide_segments - 1 - wide_segments_.size()) * WideSegmentFloats() *
-             sizeof(float);
-  if (wide_segments > 1 && wide_state_.empty())
-    bytes += WideStateFloats() * sizeof(float);
   // Committed spare blocks for captures, whether or not they exist yet.
   return bytes + SnapshotAllocator::SpareBytes(mutable_bytes);
-}
-
-std::size_t Executor::WideStateFloats() const {
-  const auto& c = config();
-  const std::size_t linear =
-      c.num_layers - c.num_layers / c.full_attention_interval;
-  return linear * c.ssm_num_v_heads * c.ssm_head_dim * c.ssm_head_dim;
-}
-
-std::size_t Executor::WideSegmentFloats() const {
-  const auto& c = config();
-  const std::size_t conv =
-      std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels();
-  const std::size_t ple =
-      c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
-  constexpr std::uint32_t kRows = kWideSegmentRows - 1;
-  std::size_t floats = ple * (kRows + 1);
-  for (std::uint32_t il = 0; il < c.num_layers; ++il) {
-    if (!c.IsLinearLayer(il))
-      continue;
-    floats += conv * (kRows + 1);
-    for (std::uint32_t row = 0; row < kRows; ++row)
-      floats += GdnRollbackRowFloats(row, c.ssm_num_k_heads, c.ssm_num_v_heads,
-                                     c.ssm_head_dim);
-  }
-  return floats;
-}
-
-bool Executor::EnsureWideSegments(std::uint32_t segments,
-                                  std::string* error_msg) const {
-  if (segments == 0)
-    return true;
-  const auto& c = config();
-  if (wide_controls_ == nullptr &&
-      !Check(hip::AllocateDevice(&wide_controls_,
-                                 std::size_t{kWideRows / kWideSegmentRows} *
-                                     sizeof(Session::Control)),
-             "wide verification controls", error_msg))
-    return false;
-  if (wide_state_.empty()) {
-    float* allocation = nullptr;
-    if (!Check(
-            hip::AllocateDevice(&allocation, WideStateFloats() * sizeof(float)),
-            "wide verification state", error_msg))
-      return false;
-    wide_allocations_.push_back(allocation);
-    wide_state_.assign(c.num_layers, nullptr);
-    const std::size_t state =
-        std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
-    for (std::uint32_t il = 0; il < c.num_layers; ++il) {
-      if (!c.IsLinearLayer(il))
-        continue;
-      wide_state_[il] = allocation;
-      allocation += state;
-    }
-  }
-  const std::size_t conv =
-      std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels();
-  const std::size_t ple =
-      c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
-  constexpr std::uint32_t kRows = kWideSegmentRows - 1;
-  static_assert(kRows == std::size(RollbackRows{}.rows));
-  while (wide_segments_.size() < segments) {
-    float* allocation = nullptr;
-    if (!Check(hip::AllocateDevice(&allocation,
-                                   WideSegmentFloats() * sizeof(float)),
-               "wide rollback allocation", error_msg))
-      return false;
-    wide_allocations_.push_back(allocation);
-    WideSegment seg;
-    seg.conv.resize(c.num_layers);
-    seg.state.resize(c.num_layers);
-    seg.conv_start.resize(c.num_layers, nullptr);
-    auto* next = allocation;
-    for (std::uint32_t il = 0; il < c.num_layers; ++il) {
-      if (!c.IsLinearLayer(il))
-        continue;
-      seg.conv_start[il] = next;
-      next += conv;
-      for (std::uint32_t row = 0; row < kRows; ++row) {
-        seg.conv[il].rows[row] = next;
-        next += conv;
-        seg.state[il].rows[row] = next;
-        next += GdnRollbackRowFloats(row, c.ssm_num_k_heads, c.ssm_num_v_heads,
-                                     c.ssm_head_dim);
-      }
-    }
-    if (ple != 0) {
-      seg.ple_start = next;
-      next += ple;
-      for (std::uint32_t row = 0; row < kRows; ++row) {
-        seg.ple.rows[row] = next;
-        next += ple;
-      }
-    }
-    wide_segments_.push_back(std::move(seg));
-  }
-  return true;
 }
 
 bool Executor::SideCapturing() const {
