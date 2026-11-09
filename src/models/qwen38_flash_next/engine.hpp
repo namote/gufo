@@ -107,6 +107,10 @@ public:
     return options_.max_context;
   }
   [[nodiscard]] bool HasMtp() const noexcept;
+  /// Test statistic: batched MTP catch-ups whose cohort mixed two or more
+  /// KV-only sessions with proposing ones (counted when received; models
+  /// with a KV-only route then run them as their own sub-batch).
+  [[nodiscard]] std::uint64_t MixedKvOnlyCohorts() const noexcept;
   [[nodiscard]] bool IsNativeExl3() const noexcept;
   /// Whether sessions keep trunk K/V as KVarN k4v4 (ModelOptions::kvarn).
   [[nodiscard]] bool Kvarn() const noexcept { return options_.kvarn; }

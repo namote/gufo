@@ -310,6 +310,10 @@ bool Model::HasMtp() const noexcept {
   return device_->has_mtp();
 }
 
+std::uint64_t Model::MixedKvOnlyCohorts() const noexcept {
+  return executor_->MixedKvOnlyCohorts();
+}
+
 bool Model::InDraftSubset(std::int32_t token) const {
   return token >= 0 && (static_cast<std::uint32_t>(token) < kMtpDraftVocab ||
                         tokenizer_->IsSpecialToken(

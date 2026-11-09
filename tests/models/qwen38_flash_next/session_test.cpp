@@ -749,6 +749,7 @@ void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
   std::size_t sampled_rejections = 0;
   std::size_t sampled_acceptances = 0;
   std::size_t sampled_small_head = 0;
+  const auto mixed_kv_only_before = model->MixedKvOnlyCohorts();
   std::vector<std::unique_ptr<qfn::Session>> serial, batched;
   std::vector<sampling::SamplerState> serial_samplers, batch_samplers;
   const auto cases = gufo::test::QwenSamplingCases();
@@ -831,13 +832,17 @@ void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
       }
     }
     // Different budgets create ragged chains and include ordinary one-token
-    // decoding in the same batch as speculative verification.
+    // decoding in the same batch as speculative verification. A budget of
+    // one only catches up the draft KV: rows 2 and 3 of cycle 0 both do, so
+    // whenever a peer proposes, C4..C8 run a catch-up cohort mixing two
+    // KV-only sessions with proposing ones (row 4 of cycle 1 adds one).
     for (unsigned cycle = 0; cycle < 2; ++cycle) {
       std::vector<qfn::Session::DecodeResult> expected(width), actual(width);
       std::vector<qfn::Session::DecodeRequest> requests;
       std::vector<qfn::Session::SpeculativeStats> before;
       for (std::size_t i = 0; i < width; ++i) {
-        const std::size_t budget = 1 + (i * 3 + cycle * 5 + 7) % 8;
+        const std::size_t budget =
+            cycle == 0 && i == 2 ? 1 : 1 + (i * 3 + cycle * 5 + 7) % 8;
         before.push_back(serial[i]->Statistics());
         // Unplanned greedy rows price drafts at the cohort width.
         Require(serial[i]->DecodeStep(budget, serial_samplers[i], &expected[i],
@@ -914,6 +919,14 @@ void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
             << " rejected_cycles=" << sampled_rejections
             << " sampled_small_head_cycles=" << sampled_small_head
             << " history_and_residual_exact=1\n"
+            << std::flush;
+  // The exact comparisons above cover a catch-up cohort with several
+  // KV-only sessions only if one ran.
+  const auto mixed_kv_only =
+      model->MixedKvOnlyCohorts() - mixed_kv_only_before;
+  Require(!model->HasMtp() || mixed_kv_only > 0,
+          "batch test never mixed two KV-only catch-ups with proposals");
+  std::cout << "batch mixed_kv_only_cohorts=" << mixed_kv_only << '\n'
             << std::flush;
   // A complete state comparison catches recurrent/hidden differences that a
   // short output comparison could miss.

@@ -280,6 +280,8 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
                         (l.attn_k.exl3 != nullptr && l.attn_v.exl3 != nullptr);
   const auto kv_only_items = static_cast<std::size_t>(std::ranges::count_if(
       items, [](const auto& item) { return item.kv_only; }));
+  if (kv_only_items >= 2 && kv_only_items != items.size())
+    mixed_kv_only_cohorts_.fetch_add(1, std::memory_order_relaxed);
   if (kv_route && kv_only_items != 0 && kv_only_items != items.size()) {
     // A session catching up only its draft KV takes the KV-only route
     // whatever its peers do, so its rows match a step it runs alone. The

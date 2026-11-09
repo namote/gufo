@@ -6,6 +6,7 @@
 #include <hipblas/hipblas.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -514,6 +515,12 @@ public:
   /// private attention caches, positions and carried hidden states.
   [[nodiscard]] bool MtpForwardBatch(std::span<const MtpBatchItem> items,
                                      std::string* error_msg) const;
+  /// Test statistic: MtpForwardBatch cohorts that mixed two or more KV-only
+  /// catch-ups with sessions that also propose, counted once per validated
+  /// top-level call whether or not the model splits it.
+  [[nodiscard]] std::uint64_t MixedKvOnlyCohorts() const noexcept {
+    return mixed_kv_only_cohorts_.load(std::memory_order_relaxed);
+  }
   /// Projects each session's carried draft hidden state with shared weights.
   [[nodiscard]] bool MtpHeads(std::span<const MtpHeadItem> items,
                               std::string* error_msg) const;
@@ -987,6 +994,7 @@ private:
   /// The scratch Dense's EXL3 projections use (exl3_ unless ForkSide).
   mutable const Exl3Scratch* dense_exl3_{nullptr};
   mutable std::uint64_t side_branches_{0};  ///< ForkSide calls (tests)
+  mutable std::atomic<std::uint64_t> mixed_kv_only_cohorts_{0};  ///< tests
   gufo::hip::Exl3RotateProblem* exl3_dense_rotations_{nullptr};
   gufo::hip::Exl3GemmProblem* exl3_dense_gemms_{nullptr};
   struct Exl3DenseWorkspace {
