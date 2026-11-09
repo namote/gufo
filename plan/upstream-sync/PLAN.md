@@ -115,6 +115,12 @@ decode_attn_bench, hip_weight_upload)은 빌드만 했다. 이번 작업과 무�
 
 ### U5가 GPU에서 확인할 것
 
+- **우리 캐시 기능 재사용 비교 (먼저 본다)**: U2-2(정렬)와 U3-3(cache_persist)은 fork에서 바꾼 캐시 코드와 직접 맞물리고, CPU 테스트만 통과했다. 같은 workload를 `runtime-hc-20261108`과 후보에 돌려 기능별로 재사용 토큰 수, hit/miss, warm turn prefill 시간, 출력 일치를 비교한다. 재사용이 줄거나 출력이 다르면 배포하지 않고 원인을 고친다.
+  - **블록 KV 공유(paged KV, copy-on-write prefix 공유)**: 같은 prefix의 두 세션이 블록을 공유하는지, 공유 블록 수가 줄지 않았는지. ShareCheckpoint slack 경로는 이제 정렬된 frontier에서만 공유하므로 공유 실패가 늘지 않는지 본다. K4V4 두 256K 문맥의 pool 사용량(4.62 GiB)도 그대로인지 본다.
+  - **라이브 프런티어 저장(CaptureBeforeReset, WriteBackIdle)**: `CheckpointPurpose::kGenerated`로 발행돼 비정렬 위치에서도 복원되는지. 세션 리셋 뒤 다음 턴, 유휴 write-back 뒤 다음 턴이 전과 같은 길이를 재사용하는지 본다.
+  - **RAM/디스크 continuation cache**: RAM hit, 디스크 hit(v19로 새로 쓴 것), 재시작 뒤 디스크 복원(이전 0.486 s 기록과 비교). v18 파일이 남아 있어도 오작동 없이 무시되고 LRU로 정리되는지 본다.
+  - **`cache_persist=false`**: 그 요청의 prompt와 live frontier가 디스크에 안 써지는지(`Entry::live_persist`), RAM 재사용은 그대로인지 본다.
+  - **에이전트 tool 루프**: `pi_agent.py` 재사용률과 턴별 prefill 토큰 수를 기준 런타임과 턴 단위로 비교한다.
 - **bit가 바뀔 수 있는 것**
   - U2-2: 캐시 복원·용량 분할 뒤 prefill이 정렬 위치에서 시작하므로 restore 결과가 cold와 같아져야 한다(기대: 바뀜 → 일치). cold 한 pass prefill logits sha(B10 `d051e822…`)는 그대로여야 한다. 2 K 넘는 prompt의 여러 pass cold prefill은 pass 경계가 이미 4의 배수(2048)라 그대로여야 한다.
   - U2-3: `HcMixEpilogueF16Kernel`이 바뀜 → 96행 미만 prefill pass(짧은 꼬리, 복원 뒤 짧은 pass)의 inject partial 마지막 bit. 넓은 pass는 그대로.
@@ -128,11 +134,12 @@ decode_attn_bench, hip_weight_upload)은 빌드만 했다. 이번 작업과 무�
 ## U5 통합 GPU 패스 (한 번)
 
 1. 서버 정지(사용자 확인 후). HC 보정 세션의 GPU 작업과 겹치지 않게 한다.
-2. Flash-Next GPU CTest 전체, `qwen38_flash_next_model_tests`(session·snapshot·adapter), `tests/functional`의 `conversation`·`batch`·`long-context`·`cache`·tool-schema 관련 suite.
-3. prefill logits sha 비교(B10 `d051e822…`). 바뀌면 품질 검사.
-4. B10 대비 성능 한 창(PP2048/8192, AR·MTP d0/d32K). 5%/10 ms 판정.
-5. 통과하면 새 runtime 배포(B10은 `_backup`으로), `llm status`, 텍스트·이미지 smoke.
-6. KNOWHOW·BENCHMARKS·HANDOFF·이 문서 갱신, 커밋.
+2. 우리 캐시 기능 재사용 비교(위 "U5가 GPU에서 확인할 것" 첫 항목). 여기서 문제가 나오면 나머지 단계 전에 고친다.
+3. Flash-Next GPU CTest 전체, `qwen38_flash_next_model_tests`(session·snapshot·adapter), `tests/functional`의 `conversation`·`batch`·`long-context`·`cache`·tool-schema 관련 suite.
+4. prefill logits sha 비교(B10 `d051e822…`). 바뀌면 품질 검사.
+5. `runtime-hc-20261108` 대비 성능 한 창(PP2048/8192, AR·MTP d0/d32K). 5%/10 ms 판정.
+6. 통과하면 새 runtime 배포(`runtime-hc-20261108`은 `_backup`으로), `llm status`, 텍스트·이미지 smoke.
+7. KNOWHOW·BENCHMARKS·HANDOFF·이 문서 갱신, 커밋.
 
 ## 하지 않는 것
 
