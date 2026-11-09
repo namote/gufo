@@ -1,5 +1,139 @@
 # gfx1151 optimization know-how
 
+## Upstream U6 combined GPU pass, November 9, 2026 (not deployed)
+
+Evidence is under `build/b1/u6-20261109/` (chain*.log, perf/, serve/, func/,
+correct/, correct2/, cache/, cached.log). The binaries are:
+- **base:** the deployed `runtime-hc-20261108` (`166953f0`).
+- **cand:** the `22705f7b` build (`6e6574ca`, U4-3 reverted).
+- **cand2:** the `21c138cc` build (`6588c56c`). It re-lands U4-3 and adds M1
+  page-cache I/O.
+
+All runs use c03 + all200 HC Q8 with the deployed FP16 argv (`--sessions 2`,
+MTP 7, a 14.4 GB pool). Candidates run with `--typical-acceptance off` for
+matched rows. Production was stopped from 16:33 KST, and nothing else used the
+GPU.
+- **Host memory fragmentation explains the U5 "MTP about 30 % low" anomaly.**
+  After 22 days of uptime, the Normal zone had 1 free order-10 block (3846
+  order-9 blocks). The work was identical in every run: d0 had 38 cycles with
+  90/114 accepted and hash `adfde744`, and d32K had 17 cycles with 111/111
+  accepted and hash `d856f78e`.
+  - **Before the drop:** base MTP d0/d32K was 39.09/68.39 and 39.91/68.80
+    tok/s. AR d0 was 31.76/31.48. The first-row PP2048 values were 1266/1323.
+  - **After the drop:** `sync; drop_caches=3; compact_memory=1` left 15209
+    order-10 blocks; the power profile stayed "balanced". Base MTP was
+    58.90/98.74 and 59.33/94.18, AR was 32.63/32.13, and PP was 1502/1545 and
+    1503/1548.
+  - **Remaining gap:** the 11/08 qualification measured 65.69/104.39, so about
+    10 % is still missing after compaction alone.
+  - **Why MTP drops and PP/AR do not:** MTP pays about +35 ms per cycle in the
+    fragmented state. MTP is bound by host and driver latency: each cycle
+    issues many small launches, syncs and pinned copies. PP and AR are not.
+  - **Comparability:** rows from before the drop are not comparable with rows
+    after it. Only the post-drop rows are used below.
+  - **Kept measures:** the supervisor drops and compacts memory before the
+    server allocates (`6415dab8`), and disk-cache I/O stays out of the page
+    cache (M1, `bc13fb23`).
+- **Timing on the cleaned host (5 %/10 ms).** Base rows (Br3/Br4, 16:51–17:04)
+  were reused for cand2 (Dr1, 18:22–18:26, after a second compaction).
+  - cand vs base: PP2048 +0.9/+0.7 %, PP8192 −0.3/−0.2 %, AR d0/d32K
+    +0.1/−0.2 %, MTP d0 +0.6/+0.2 %, MTP d32K −2.6/+0.1 %.
+  - cand2 vs base: PP2048 1522.9 (+1.4 %), PP8192 1555.3 (+0.6 %), AR
+    32.92/32.54 (+0.9/+1.3 %), MTP d0 60.68 (+2.3/+3.0 %, same work). MTP d32K
+    is 105.73 (+7.1/+12.3 %, about −90/−148 ms): U4-3 takes 10 instead of 17
+    cycles, 118/118 accepted, same hash.
+  - No row is slower.
+- **Sampled MTP (typical acceptance off).** Base and cand2 are identical in
+  text, drafts, accepts and rounds on 18/18 requests, and cand is identical too.
+  Per-request decode on cand2: no row slower; 4 rows faster at −7…−17 %
+  (U4-3's compact sampled wide pass).
+  - **Typical acceptance on** (cand, the default; request `false` reproduces
+    server-off text 18/18): 17/18 requests faster at +4.3…+28.4 %, and one
+    is −1.3 %. Median chat tok/s goes 44.3→54.0 and 45.2→52.7, code
+    61.6→67.3 and 55.4→63.8, prose 41.5→43.1 and 44.4→55.4.
+  - **Startup:** the log shows `typical_acceptance=1` and `/props` reports it.
+- **U4-3 wide copy verification hang: a queue-level stall, reproduced in FP16
+  on cand2 on the cleaned host.** Neither fragmentation nor KVarN is needed.
+  There were 5 stalls across 4 servers in about 35 served rewrite rounds:
+  - c2L r55: a 1066-token rename.
+  - h1 r52, h2s r88: `docstring-admission`, as in U5.
+  - h3a r129.
+  - h5p, request 125.
+  - **Serialized stacks:** with AMD_SERIALIZE_KERNEL=3, and with =2 (wait
+    after each kernel, so one dispatch outstanding), the routed gate/up
+    RoutedGemv<…,8> (`LaunchRouted`, exl3_moe.hip.cpp:1406) never completes.
+    That holds for both the 16-row fused-router-tile path and the 64-row
+    BuildTiles path.
+  - **No sign of a fault or allocation:** the KFD HQD dumps are frozen for
+    10 s (on a healthy server they change within 5 s). The amdgpu tracepoints
+    show the process's last EOP interrupt at the stall and no BO move, create
+    or map in the 7 min before it. There are no fault interrupts.
+  - **Starting another GPU process resumed it:** in h3a, decode resumed at
+    normal speed about 13 s after a second process opened the GPU, 185 s
+    into the stall. In h5p a deliberate poke (`gufo diagnose` in a second
+    container) released a 122 s stall within 1 s. c2L finished about 14 s after SIGTERM, while h1 sat
+    for more than 5 min untouched.
+  - **Reading:** a dispatch preempted or not rescheduled by MES/CWSR until
+    the queue set changes, not a kernel that never terminates. The desktop
+    (kwin_wayland) shares the GPU. The environment was cwsr_enable=1,
+    queue_preemption_timeout_ms=9000, MES fw 0x86.
+  - **Other wide-pass measurements:** a K4V4 rewrite (two runs, 24 greedy
+    rows) is token-identical to u13, with up to 43.5 accepted tokens per
+    round. A logprobs greedy long copy (wide, 23 rounds) raised peak threads
+    from 136 to 198 (the C8a `std::async` fan-out) and RSS by about 95 MiB.
+- **U4-3 hang mitigation candidates.** Both were built by another agent and
+  only GPU-checked here.
+  - **cand3 (`a0d951dd`, `f36e6fb8`).** Changes:
+    - routed decode launches stride over a grid capped at y = 80 (64-row
+      gate/up drops from 12,800 to 1,600 blocks, bit-identical)
+    - non-finite router rows go to valid experts at zero weight
+    - decode and wide scratch are reserved at load
+      (`decode_scratch_reserved bytes=512020480`)
+  - **cand3 hang loops:** FP16 ran 24 rounds and K4V4 10 rounds (408
+    rewrite requests) with no stall. Greedy output is identical to u13
+    in 144/144 and 60/60 rows. Decode medians are −1.2…−7.1 % (FP16) and
+    −3.0…+4.0 % (K4V4) against cand2.
+  - **cand3 cost:** RoutedGemv VGPRs rise by up to +37 (max 117 → 154).
+    There is no scratch, and LDS is unchanged.
+  - **cand3 single bench after compaction:** MTP d0/d32K 57.85/101.72 vs
+    cand2 60.68/105.73 (inside 5 %). The work and hashes are equal.
+  - **cand4 (`7c3e300b`, `9ac49a5f`).** It is cand3 plus three changes:
+    - the routed grid cap is raised to 160
+    - rollback scratch is kept on cancel (`0e0ebad8`)
+    - wide verification is skipped while another request is admitted
+      (`6e2c504e`)
+  - **cand4 hang loops:** FP16 24 rounds and K4V4 10 rounds, no stall.
+    Greedy output is identical to u13 in 144/144 and 60/60 rows. Decode
+    medians are −5.1…+2.1 % (FP16) and −3.2…+4.9 % (K4V4) against cand2.
+  - **cand4 MTP pairs after compaction (cand2 → cand4):**
+
+    | Pair | d0 | d32K |
+    |---|---|---|
+    | 1 | 58.58 → 58.40 | 102.44 → 105.39 |
+    | 2 | 59.47 → 58.67 | 105.91 → 104.40 |
+    | 3 | 58.81 → 58.74 | 105.74 → 105.47 |
+
+    All pairs are within ±3 %, so neutral.
+  - **cand4 functional batch:** 43 concurrent short reply, pair and
+    cancelled-peer rows sum to 6,932 ms (base 7,269, cand2 8,718).
+  - **cand4 adapter test:** fails at "failed slot retained rollback
+    scratch". That contract conflicts with `0e0ebad8`.
+- **C4: a capture waits behind another session's prefill.** Session A's
+  checkpoint capture (`cache_snapshot_ms`) takes 7.4–9.7 ms alone and
+  1829.6/1835.9/1839.1 ms while session B runs a ~21 K-token cold prefill (cand2;
+  cand 1832.8/1836.8/1841.6). A's TTFT rises from 1.87–1.99 s to 4.1–4.4 s.
+  `RetainRows` syncs the shared stream under `retained_mutex_`.
+- **C1:** the session test passes in full (`independent_state_exact=1`,
+  lookup `snapshots_exact=1`, all serving sampling replays exact). The mixed
+  catch-up cohort rows serve identical greedy text; their drafts and rounds
+  differ from base by design.
+- **Unchanged:** the prefill logits hash with the sidecar is `df1b3e0c…`. CTest
+  (42), snapshot, adapter, the 27B adapter text sections and the cache label
+  (25, then 26 with M1) pass.
+- **mtp_audit fails, identically on both candidates.** attention-state
+  relative RMS is 0.0070984, against a tolerance of 0.002. This EXL3 oracle gap
+  has been known since F1; no baseline control was run.
+
 ## Upstream U5 combined GPU pass, November 9, 2026 (not deployed)
 
 Candidate `0c784b00` build (`cand-gufo` sha `8f700bdf…`; device code identical

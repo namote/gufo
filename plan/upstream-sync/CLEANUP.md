@@ -22,4 +22,37 @@ U5가 끝난 뒤 시작한다. U5 GPU 측정이 도는 동안에는 빌드하지
 | C9 | U5에서 원인을 밝히지 못한 채 남을 수 있는 것: 같은 요청을 다시 보냈을 때 재사용이 4860 대 4867로 갈린 경우(RAM 캐시 evict로 보인다), 요청 취소 케이스의 decode 지연, timing 판단 보류 건 | 모름 | 모름 | U5 보고서를 받은 뒤 U5가 정리하지 못한 것만 여기로 옮긴다 |
 | M1 | U6 GPU 패스(2026-11-09)에서 찾은 것: 22일 동안 떠 있던 host의 메모리 단편화 때문에 같은 작업의 MTP decode가 최대 40% 느려졌다. `drop_caches`와 `compact_memory`로 대부분 돌아왔다. 큰 page cache 출처 하나가 디스크 continuation store다. checkpoint payload를 최대 50 GiB(하나에 약 145 MB) 1 MiB 단위로 쓰고 읽는다 | 중 | 있다. 오래 떠 있는 서버의 decode 속도 | 사용자가 승인한 세 가지: (1) supervisor가 서버를 띄우기 전에 `drop_caches`와 `compact_memory`를 한다. `tools/serving/flash_next/gufo-server.py`에 넣었고, 설치본에는 다음 배포 때 반영한다. (2) `/etc/sysctl.d/60-gufo-compaction.conf`에 `vm.compaction_proactiveness=50`. U6 뒤에 적용한다. (3) 디스크 캐시 I/O를 page cache 밖에 둔다 **완료(GPU 확인 전)** `bc13fb23`: 기존 코드도 payload를 fsync한 뒤와 다 읽은 뒤에 파일 전체를 DONTNEED했지만, 쓰는 동안과 읽는 동안에는 파일 전체가 cache에 쌓였고, 실패한 읽기와 prefetch가 미리 읽고 소비되지 않은 파일은 cache에 남았다. 이제 platform leaf `WriteBack`(Linux `sync_file_range`, Windows는 not_supported)과 bool을 돌려주는 `Advise`를 쓴다. `cache::WriteBehind`가 8 MiB window마다 write-back을 걸고, 최근 두 window는 진행 중으로 두고 그보다 오래된 window만 write-back을 기다린 뒤에 DONTNEED한다(dirty page는 drop하지 않는다). 그래서 파일 하나가 cache에 차지하는 양이 약 24 MiB로 묶인다. 기다림은 writer thread에서만, staging lease 밖에서 한다. 기다림이 받은 device 오류(EIO 등)는 뒤의 fsync가 다시 보고하지 않으므로, `WriteBackError()`로 넘겨 fsync 실패처럼 publish·save를 실패시킨다(리뷰 지적). component cache(`DiskStore` Publish/PublishStream)와 legacy store(`ContinuationDiskStore::Save`) 둘 다 쓴다. 읽기(`ReadPayload`, `Verify`, legacy 복원)는 소비한 범위를 8 MiB마다 drop하고, 예외를 포함한 모든 종료에서 나머지를 drop한다. restore prefetcher는 reader가 이미 지난 뒤에 데운 파일과, 중단돼 reader가 닿지 않은 파일을 helper thread에서 drop한다. hint 실패는 쓰기나 복원을 실패시키지 않고 `cache::PageCacheHintFailures()`로 센다. O_DIRECT는 정렬된 buffer가 필요하고 오류 동작이 바뀌어 쓰지 않았다. CPU: `cache_page_cache_test`(syscall wrap으로 written-back 범위만 drop하는지, 쓰는 동안 footprint, 읽기 drop-behind와 실패 경로 drop, 거부된 hint에도 byte 동일), cache label. **GPU 확인은 통합 패스로 미룬다**: functional `cache`·`persist` suite 통과, 디스크 restore timing이 나빠지지 않는다(restore `filesystem_ns` 포함: 8 MiB마다 DONTNEED가 다른 CPU LRU batch를 비울 수 있다), publish 속도가 나빠지지 않는다(write-behind 기다림이 `fsync_ns`에서 `filesystem_ns`로 옮겨 간다), 긴 디스크 캐시 workload 동안 `/proc/meminfo`의 `Cached`가 평평하게 유지된다. 남은 것: Prefetcher drop과 legacy write-behind 전용 CPU 테스트는 없다(기존 streaming·legacy store suite는 통과) |
 
+## U6 GPU 확인 결과 (2026-11-09)
+
+자세한 내용은 [PLAN.md](PLAN.md) "U6 통합 GPU 패스"에 있다. binary는 다음 둘이다:
+- cand: `22705f7b` 빌드
+- cand2: `21c138cc` 빌드. U4-3을 다시 들였고 M1이 들어 있다
+
+| # | U6 판정 |
+|---|---|
+| R1 | 통과. retry 행의 prefill·cached token이 base와 같다. `restore_untracked`·`restore_failed`는 모든 후보 로그에서 0건이다 |
+| U4-3R | **2026-11-09 사용자 결정으로 다시 들였다(`21c138cc`).** E1~E4 replay는 미뤘다. hang은 처음에 단편화된 메모리 창 탓으로 잠정했지만, cand2(정리된 host, FP16)에서 서버 4개에 걸쳐 5번 재현했다. queue 수준의 정지이고, 다른 GPU process가 queue 집합을 바꾸면 풀린다. 완화 후보 cand3(`a0d951dd`: strided routed grid, 유한하지 않은 router 행 처리, scratch를 load할 때 잡음)와 cand4(`7c3e300b`: grid 160, cancel scratch 유지, 다른 요청이 admission돼 있으면 wide 건너뜀)는 FP16 24 round와 K4V4 10 round에서 멈추지 않았고, greedy 출력이 u13과 같았다. 남은 것: cand4 continuation adapter test가 `0e0ebad8`과 test 계약이 충돌해 실패한다(PLAN "U4-3 완화 후보") |
+| C1 | 통과. session test 전체, `independent_state_exact=1`, lookup `snapshots_exact=1`. 섞인 cohort 시간은 판단 보류다(draft 수가 설계상 base와 다르다) |
+| C2 | 통과. 이 옵션을 주면 weight를 읽기 전에 거부하고, 옵션 없이는 정상이다 |
+| C3 | 통과. `event=device_code_identity sha256=84fdeb4f…`가 나오고, 재시작 뒤 disk restore가 된다 |
+| C4 | 의미 있다. capture가 7~10 ms에서 다른 세션의 약 21K token prefill 동안 약 1.83 s로 늘고, TTFT도 +2.2 s다. base에도 같은 지연이 있다. 이번 패스에서는 고치지 않았다 |
+| C5 | 통과(Flash-Next continuation adapter test) |
+| C6 | F1·F2: 27B adapter text section 통과. 27B KVarN + DFlash2 `cache`·`long-context` 결과는 PLAN U6에 있다. F3·F4: cache label 통과. S2: `capture_failure` 0건 |
+| C8 | (a): logprobs 값이 u13과 같다. peer stall은 판단 보류이고, 63행 fan-out은 thread 136→198, RSS 약 +95 MiB였다. (c): `/props`와 startup 로그 확인. (d): 결과는 PLAN U6에 있다 |
+| C9 | cancel decode 행이 219.2→219.4 ms로 재현되지 않았다 |
+| batch | 두 후보 모두 base 대비 동시 short reply decode가 +20~+137% 늘었다(cand2 합계 8,718 ms, base 7,269 ms). cand4(`6e2c504e`, `0e0ebad8`)에서 6,932 ms로 돌아왔다. 정리 내용은 아래 "U6 batch 회귀 정리" |
+| M1 | cache·persist suite 동안 `Cached`가 약 3.8 GiB로 평평했다. disk restore timing은 PLAN U6의 matched 재측정에 있다 |
+
+이 패스에 포함되지 않은 것: `6415dab8`(supervisor `prepare_memory`, binary가 아님). `bc13fb23`/`1e95b022`(M1)는 cand2에 들어 있다.
+
 순서: R1 → C2 → C5 → C8(c, d) → C3 → C1 → C6(병렬로) → C4(GPU 측정 뒤 결정) → C8(a) → C9. GPU 확인은 C1(session 테스트 전체와 sampled restore 비교)과 C4(capture 지연)를 한 번에 묶는다. U4-3R(`u43_stress.sh`)도 같은 통합 패스에서 돌린다.
+
+## U6 batch 회귀 정리 (2026-11-09)
+
+U6 functional `batch` 회귀를 로그로 나눴다(`build/b1/u6-20261109/func/`, `batch-regression/`). C1은 원인이 아니다: C1이 들어 있는 cand(rpc)의 short reply decode 합은 base와 같고(+2.8%), 느린 모드(170 ms 초과) 행 수는 base 5/16, cand 6/16, cand2 11~12/16이다.
+
+| # | 문제 | 처리 |
+|---|---|---|
+| B1 | 취소된 요청이 pass 중간에 멈추면 세션이 invalid로 남고, slot을 돌려줄 때 `ContinuationAdapter::Invalidate`가 `ResetImpl(false)`로 rollback 행(43 MB)과 verifier graph를 모두 풀었다. 다음 요청이 hipMalloc과 graph 녹화를 다시 해서 옆 세션 decode까지 멈췄다(cancelled_peer_isolation +350~600 ms, admission 로그 `session_rollback_bytes=0 session_graph_count=9`). base에도 있고 timing에 따라 나온다(fb·fc2·rpc·rpc2·fk42에서 나옴, rpb·fpool2에서 안 나옴) | **고침** `0e0ebad8`: 취소를 관찰한 세션은 scratch를 유지한다(`Session::ObservedCancellation`). 출력 bit는 같다. **남은 것**: component cache가 없는 owned session 경로(KVarN, `inference_backend.cpp` `QwenFlashNextTextRunnerState::Invalidate`의 `session_->Reset()`)는 아직 취소 뒤 모두 푼다. 같은 조건으로 `ResetImpl(IsValid() || ObservedCancellation())`를 쓰면 된다 |
+| B2 | cand2(U4-3)에서 short reply가 옆 anchor의 64행 wide copy 검증을 기다린다. serve 경로가 `DecodeStep`에 occupancy 기본값 1을 넘겨, 다른 요청이 대기·prefill 중이어도 wide를 탔다 | scheduler가 잡고 있는 요청 수(`TextRunnerState::SetResidentRequests`)를 engine `residents`로 넘기고, wide는 residents 1일 때만 탄다. occupancy(head·가격·confidence rule)는 그대로 둔다 |
+| B3 | `*-disk` 행 prefill +10~15 ms. U5 후보부터 있다. warm prompt 끝이 4의 배수가 아니면 U2-2 정렬 tail capture가 kv_pool(in-pass checkpoint 꺼짐)에서 prefill을 짧은 pass 하나로 더 나눈다(RAM suite +7 ms, 재시작 직후 더 크다). 정렬 경계 복원으로 1~3 token을 더 prefill하는 것도 있다 | 지금은 둔다(U5에서 받아들인 비용). 선택지: (1) kv_pool에서도 in-pass checkpoint를 지원한다(큰 변경). (2) 정렬되지 않은 tail이 몇 token뿐이면 따로 capture하지 않는다(재사용 일부 손해) |

@@ -185,7 +185,7 @@ U1~U3과 같은 방식(구현 → `build/b1` 빌드 → 관련 CPU 테스트 →
 | functional | 최종 후보에서 conversation·batch·long-context·tool-type-unions·logprobs·responses-logprobs·openai-count-tokens·tool-schema-edges 통과. cache-growth·cache-shared-prefix·cache(+persist)·`cache_alignment_qwen38.py`는 U4-1이 있던 이전 빌드에서 통과(호스트 캐시 코드는 같다). tool-reasoning은 기준과 후보가 같은 곳(`literal_protocol_raw_xml`, greedy 거부)에서 실패: 기존 모델 동작 |
 | 성능 (5%/10 ms, B C 교대) | PP2048 −0.04/−1.2%, PP8192 +0.6/+0.5%, AR d0·d32K ±0.4% 안, MTP d0 +2.2/−0.3/+0.4%(work 같음), MTP d32K +5.7/+5.2/+9.7%(U4-3 덕분, 10 대 17 cycle, hash 같음). 이번 창의 MTP 절대값은 모든 binary에서 B10보다 약 30% 낮았다(같은 argv·work, AR·PP는 같음): 환경 원인, 설명 못 함 |
 | U4-1 | 되돌림(`4f49f025`), byte 동일이 아님 |
-| U4-3 | **되돌림.** 측정은 좋았다: greedy rewrite 24/24가 u13과 token 동일(FP16·K4V4 두 번씩), decode −12~−35%, Pi turn decode 최대 −22%. 그러나 두 번째 K4V4 실행에서 `docstring-admission` greedy decode가 114 token 뒤 약 6분 멈췄다(마지막 진행 05:00:03, 종료 신호 05:06:11 UTC)(GPU 100%, `ForwardBatchImpl(wide=true)`의 `hipStreamSynchronize`, `serve/hang-k4v4-gdb.txt`). 같은 요청이 첫 실행에서는 통과했다. 원인은 못 찾았다(정적 조사와 GPU 실험 계획은 아래 "U4-3 hang 조사", U4-3R). 다시 들이려면 한 세션 64행 pass의 반복 stress 실행이 먼저 필요하다. 후보 전용 cold prefill 지연(+73~150 ms, 36개 중 약 8개, u13은 2개)도 판단 보류로 남았다 |
+| U4-3 | **되돌림.** (2026-11-09 갱신: 사용자 결정으로 다시 들였다(`21c138cc`). hang은 처음에 단편화된 메모리 창 탓으로 잠정했지만 U6에서 정리된 host에서도 재현했다. E1~E4는 미뤘다. U6 결과는 아래 "U6 통합 GPU 패스"에 있다.) 측정은 좋았다: greedy rewrite 24/24가 u13과 token 동일(FP16·K4V4 두 번씩), decode −12~−35%, Pi turn decode 최대 −22%. 그러나 두 번째 K4V4 실행에서 `docstring-admission` greedy decode가 114 token 뒤 약 6분 멈췄다(마지막 진행 05:00:03, 종료 신호 05:06:11 UTC)(GPU 100%, `ForwardBatchImpl(wide=true)`의 `hipStreamSynchronize`, `serve/hang-k4v4-gdb.txt`). 같은 요청이 첫 실행에서는 통과했다. 원인은 못 찾았다(정적 조사와 GPU 실험 계획은 아래 "U4-3 hang 조사", U4-3R). 다시 들이려면 한 세션 64행 pass의 반복 stress 실행이 먼저 필요하다. 후보 전용 cold prefill 지연(+73~150 ms, 36개 중 약 8개, u13은 2개)도 판단 보류로 남았다 |
 | U4-4 | opt-in 유지, 기본값은 그대로. 꺼짐(생략·false) 36/36이 u13과 text·draft·accept·round까지 같음. 켜짐: sampled 18/18 요청이 빨라짐 +2.5~+27.6%(chat 중앙값 약 +21%, code 약 +17%, prose +8~+26%). 품질: 산수 30/30 둘 다, 평균 길이 147→162.7(중앙값 141→143.5), 4-gram 반복 0.0070→0.0084(최대 0.040→0.034), tool-schema-edges 통과, tool-reasoning은 꺼짐과 같은 greedy 검사에서 실패. 기본값은 사용자가 정한다 |
 | U4-5 | 기각(현재 형태). bench 버그를 먼저 고쳤다(`c05c8e49`). byte 동일, mixer당 production/fused 45.88/41.23, 46.87/42.99, 49.27/46.35, 54.27/52.99 µs. 후보에 없는 slab 회전 launch(약 2 µs)를 빼면 +2.65/+1.88/+0.92/−0.72 µs라 8 token에서 진다. 회전을 넣어도 TG 1% 미만이 상한. B3/B4 tail 융합 손해와 같은 결론 |
 | Pi (같은 경로) | 5 case 모두 통과. 첫 8 turn은 출력·재사용·prefill token이 같다. 9번째 turn(같은 비정렬 live frontier 2186에서 74-token pass)부터 greedy 출력이 갈린다: U2-3의 짧은 pass HC inject 순서 차이로 보이며 둘 다 유효한 출력이다 |
@@ -210,7 +210,7 @@ U1~U3과 같은 방식(구현 → `build/b1` 빌드 → 관련 CPU 테스트 →
 
 ### U4-3 hang 조사 (U4-3R, 2026-11-09, 정적 감사만, GPU 실행 없음)
 
-**결론: 정적으로는 원인을 찾지 못했다. U4-3은 다시 들이지 않았다.** 아래 GPU 실험으로 가설을 가린다.
+**결론: 정적으로는 원인을 찾지 못했다. U4-3은 다시 들이지 않았다.** (2026-11-09 갱신: 사용자 결정으로 다시 들였다(`21c138cc`). hang은 처음에 단편화된 메모리 창 탓으로 잠정했지만 U6에서 정리된 host에서도 재현했다. E1~E4는 미뤘다. U6 결과는 아래 "U6 통합 GPU 패스"에 있다.)  아래 GPU 실험으로 가설을 가린다.
 
 로그에서 나온 것:
 - **이 요청의 입력에 결정적으로 달린 버그가 아니다.** 첫 실행(`serve/cand-rewrite-k4v4`)과 hang 난 두 번째 실행(`serve/cand-rewrite2-k4v4`)은 binary(`cand-gufo`, `8f700bdf`), argv, 요청 순서, 메모리 예산(`deferred_scratch_budget_bytes` 866,463,744 → 첫 wide pass 뒤 354,443,264, 두 실행 같음)이 같고, 캐시 디렉터리는 실행마다 지웠으며(`stage3_serve.sh`), 모든 요청이 cache=miss라 hang 난 요청도 cold prefill(279 token)에서 시작했다. 그 요청(`docstring-admission` greedy)은 두 실행에서 57 token(51/53 accepted/proposed)과 114 token(96/130) 진행 기록까지 draft 수가 같다. 첫 실행은 같은 prompt·token·pass 폭을 통과했다(다음 기록 162 token, 끝 250). 그러므로 이 요청의 행 수, group·ring 경계, 위치 문턱, 정렬 안 된 시작만으로 정해지는 조건은 원인이 아니다. 다만 두 실행이 완전히 같지는 않다. 앞선 sampled 요청이 갈렸고(r7 1091 대 1099 token, 그래서 slot 2 frontier 2159 대 2167, rename sampled 44 대 45 round, `session_graph_count` 24 대 23), r12 admission에서 첫 실행만 `live_frontier_written_back slot=1`, retention 두 건, `published tokens=511`을 더 남겼다. 두 번째 실행은 272-token checkpoint를 멈추기 약 1초 전에 publish했고, 첫 실행은 114 token 뒤에 했다. 남은 차이는 다른 slot의 상태, graph cache, 같은 시각의 캐시 capture·publish 복사다.
@@ -240,7 +240,105 @@ GPU 실험(통합 패스에서, 다른 GPU 측정 창과 겹치지 않게). 스�
 - E4 `u43_stress.sh focus-u13 100`: U4-3이 없는 u13으로 같은 부하. 멈춤이 나오면 H1의 환경 쪽이다.
 - 재현되면 `VARIANT=nosdma`(`HSA_ENABLE_SDMA=0`)와 `VARIANT=serial`(`AMD_SERIALIZE_KERNEL=3`, `AMD_SERIALIZE_COPY=3`, 멈추면 gdb의 decode frame이 멈춘 launch를 가리킨다)로 다시 돌린다. wave가 상주하면 kernel 문제(H3/H4), 없으면 queue 정지(H1)다. 같은 device의 D2D copy는 보통 blit kernel이라 `nosdma`는 H2D/D2H(캐시 복사, H2)만 바꾼다. 사용자가 허락하면 배포 서버를 멈춘 창에서 E1을 한 번 더 돌린다(H1의 다중 process 조건).
 - greedy 행은 모두 `serve/cand-rewrite-<kv>/rows.json`의 sha와 비교해 남긴다.
-- 다시 들이는 조건: 원인을 확정해 고치거나, E1·E2에서 수천 번의 wide pass가 무재현이고 E4 대조가 깨끗할 때. 다시 들일 때는 `b9cbf5a1`을 되돌린다(`5dd394d8`, `0c784b00`, `faefb63e`).
+- 2026-11-09: 사용자 결정으로 다시 들였다(`21c138cc`). E1~E4는 미뤘다(정리되거나 재부팅한 host에서 나중에 돌린다). U6 결과는 아래에 있다. 원래 조건: 원인을 확정해 고치거나, E1·E2에서 수천 번의 wide pass가 무재현이고 E4 대조가 깨끗할 때. 다시 들일 때는 `b9cbf5a1`을 되돌린다(`5dd394d8`, `0c784b00`, `faefb63e`).
+
+## U6 통합 GPU 패스 (2026-11-09, 배포 없음)
+
+사용자가 이번에는 배포하지 않기로 했다. 그래서 게이트 결과만 남긴다. 증거는 `build/b1/u6-20261109/`(chain*.log, perf/, serve/, func/, correct/, correct2/, cache/, hang/, cached.log)에 있다. 측정 수치는 [GFX1151-KNOWHOW](../../docs/GFX1151-KNOWHOW.md) "Upstream U6 combined GPU pass"에 있다.
+binary는 셋이다:
+- base: 배포 중인 `runtime-hc-20261108`(`166953f0`)
+- cand: `22705f7b` 빌드(`6e6574ca`, U4-3 되돌림 상태)
+- cand2: `21c138cc` 빌드(`6588c56c`). U4-3을 다시 들였고 M1이 들어 있다.
+
+조건은 c03 + all200 HC Q8, 배포 argv(FP16 KV, pool 14.4 GB, `--sessions 2`, MTP 7)이고, 후보는 `--typical-acceptance off`로 맞췄다. `6415dab8`(supervisor prepare_memory)는 binary에 들어가지 않아 이 패스에서 다루지 않는다.
+
+**환경.** 22일 동안 떠 있던 host의 메모리 단편화가 U5에서 본 "MTP 약 30% 저하"의 원인이었다. drop_caches와 compact_memory 뒤에 base MTP d0이 39→59 tok/s, d32K가 68→94~99 tok/s로 돌아왔다. work는 같았다(KNOWHOW). 그래서 timing은 정리한 뒤의 행만 쓴다.
+- base 행은 재사용했다. bench는 16:51~17:04에 잰 Br3/Br4 행, serve는 17:33~17:59에 잰 bL1·bL2·bT 행, functional은 17:59~18:07에 잰 fb 행이다.
+- cand2는 18:10에 다시 compaction한 뒤에 쟀다.
+- 5%/10 ms를 넘는 행만 B/C 한 쌍을 다시 쟀다: serve cohort는 b2R 대 c2L2, functional batch·cache는 rpb 대 rpc2·rpc.
+- 정확성 출력은 기록해 둔 hash와 비교했다: U5·U6 base, U5 u13의 rewrite sha, U5 fnn-cand의 logprobs.
+
+| gate | 결과 |
+|---|---|
+| R1 retry | cand2 functional `batch`: retry 행의 prefill·cached token이 base와 같다. complete prompt를 복원했고, 정렬 경계에서 다시 prefill하지 않았다. cache stage(재시작 포함) 로그에 `restore_untracked` 0건, `restore_failed` 0건. 통과 |
+| C1 | session test 전체 통과(cand·cand2 모두 rc 0): `batch independent_state_exact=1`, lookup C2/C4/C6/C8 `tokens_logits_RNG_exact=1`, `snapshots_exact=1`, serving replay 전부 exact. 섞인 cohort의 peer A decode는 base 대비 +0.8/+2.8%로 중립이다. 따라잡는 B 행은 draft 수가 base와 달라(설계상) +19/+13/+6/+15%와 −6/−9%로 섞였다. 판단 보류 |
+| typical | cand2 startup 로그에 `typical_acceptance=1`, `/props` `typical_acceptance: true`. off일 때 sampled 18/18이 base와 text·work까지 같다. on(cand): 17/18 요청이 +4.3~+28.4% 빨라지고 1건 −1.3% |
+| C2 | `--cache-disk-staging-bytes 268435456`을 주면 weight를 읽기 전에 오류로 거부된다(`--cache-disk-staging-bytes applies only to DeepSeek's disk cache...`). 이 옵션 없이 띄운 서버는 모두 정상 |
+| C3 | startup 로그에 `event=device_code_identity sha256=84fdeb4f…`. 같은 build로 재시작한 뒤 disk restore가 된다: A4-disk 7348 token(restore 100 ms), D2-disk 7204 token, D1 shared prefix |
+| C4 | 의미 있다. 혼자일 때 A의 capture는 7.4~9.9 ms다. B가 약 21K token을 cold prefill하는 동안에는 1829~1841 ms이고, A의 TTFT가 1.9 s에서 4.1~4.4 s로 늘어난다. base도 1406~1836 ms로 같아서 기존 결함이다. 이번 패스에서는 고치지 않았다(event 대기로 바꾸는 구조 변경이다) |
+| C5 | Flash-Next continuation adapter test 통과(cand) |
+| C6 F1·F2 | 27B adapter의 text section(guard, boundaries, shared pool, retained blocks, prefill cancel, batch admission) 통과. image section은 테스트가 `mmproj-BF16.gguf` 이름을 요구해서 실패했다(하드링크 디렉터리로 재실행 준비함). 27B KVarN K4V4 + DFlash2(cand2): `cache`(persist·disk 포함, 10개 case)와 `long-context` 모두 통과. 27B Flash-Next식 MTP는 HTTP에서 지원하지 않아, 27B의 추측 디코드는 DFlash2다. group 끝을 넘는 거부를 일부러 만든 case는 없다. 거부는 DFlash2 draft에서 자연스럽게 생긴다 |
+| C6 S1·S2 | S2: Flash-Next cache·persist·pi 로그에 `capture_failure`/`capture_failed` 0건. S1(27B payload 크기): 27B 실행 결과로 판단 |
+| C8a | logprobs 값이 u13과 같다(served sha 4/4). functional `logprobs`·`responses-logprobs` 출력은 U5의 C8a 이전 후보와 17/17, 18/18 동일. logprobs B가 있을 때 peer A의 decode는 u13 9426/8884 ms, cand2 9034/8777 ms로 draft 수가 달라 판단 보류. 63행 fan-out: wide logprobs long copy에서 thread 136→198, RSS 약 +95 MiB |
+| C8d | 통과. cand2로 `cache`+`batch`를 14.4 GB FP16 pool(fpool2)과 KVarN K4V4(fk42)에서 돌렸다. `capture_failure`·`restore_untracked` 0건 |
+| C9 | cache suite `thinking-tool-cancel`의 cancel decode 행은 base 219.2 ms, cand2 219.4 ms로 중립이다. U5의 219→327은 재현되지 않았다 |
+| M1 | 통과. cache·persist suite 동안 `Cached`가 3.8 GiB 안팎으로 평평했다(서버를 띄울 때 model을 읽느라 잠깐 5.6~6.0 GiB). cache label 26/26(`cache_page_cache_test` 포함). 같은 상태에서 matched로 다시 잰 cand(M1 없음) 대 cand2(M1)의 disk restore·prefill 행: `cache_restore_ms` −8~+9%, prefill −13~+0.2%로 나빠지지 않았다 |
+| 정확성 | CTest 42/42, cache label, snapshot, Flash-Next adapter, prefill logits `df1b3e0c…`(U5와 같다). 이것들은 cand에서 쟀고, U4-3·M1이 닿지 않는 경로라 cand2에서는 재사용했다. cand2: session test 전체, `exl3_wide_verification`·`mtp_kv_executor`·`verification_sampling`, cache label 통과. `mtp_audit`은 두 후보 모두 attention-state rms 0.0070984(허용치 0.002)로 실패한다. F1부터 알려진 EXL3 oracle 차이이고 base 대조는 하지 않았다 |
+| 성능 (cand2 대 base, 정리한 뒤) | PP2048 +1.4%, PP8192 +0.6%, AR d0/d32K +0.9/+1.3%, MTP d0 +2.3/+3.0%(work 같음), MTP d32K +7.1/+12.3%(U4-3: 10 대 17 cycle, hash 같음). 느려진 행 없음. sampled 18/18 동일, 4건 −7~−17% |
+| align·pi | `cache_alignment_qwen38.py` 통과(cand2). Pi 같은 경로 5/5 통과. 다만 출력은 U5와 비교할 수 없다(작업 경로 이름 u5→u6이 prompt에 들어간다) |
+| batch 회귀(남음) | functional `batch`의 동시 short greedy pair·reply decode가 base 대비 +20~+137%(약 +30~200 ms) 늘었다. matched 두 쌍(rpb 대 rpc2, rpb 대 rpc)에서 방향이 같고 두 후보 모두에서 나온다. C1의 kv_only 하위 batch 분리가 의심된다. `*-disk` restore 뒤 prefill 행이 두 후보 모두에서 +10~15 ms 늘었다(M1 탓은 아니다). 원인은 아직 모른다 |
+| U4-3 | **cand2 FP16에서 hang을 재현했다.** 아래 "U4-3 hang, U6" 참고. 배포 후보가 아니다 |
+
+### U4-3 hang, U6
+
+사용자 결정으로 2026-11-09에 다시 들였다(`21c138cc`). 처음에는 단편화된 메모리 창 탓으로 잠정했지만, cand2(`6588c56c`)에서 정리된 host, FP16 KV로 재현했다. 다른 GPU 사용자는 없었다. 따라서 메모리 단편화와 KVarN은 필요 조건이 아니다. E1~E4 replay는 미뤘다. 대신 `tools/hang_loop.sh`로 같은 서버에서 `rewrite.py --sampled`를 계속 돌렸다.
+
+| 실행 | 조건 | 결과 |
+|---|---|---|
+| c2L | 일반, load·typical 뒤 rewrite | 18:32, r55 rename-cache_persist greedy(1066 token), 123 token에서 멈춤. gdb 실패(ptrace) |
+| c2L2 | 같은 순서 | 2 round 무재현 |
+| h1 | 일반, load·typical 뒤 | round 1, r52 docstring-admission greedy(279), 57 token. decode thread는 `ForwardBatchImpl` executor_batch.cpp:1391(wide=true)의 `hipStreamSynchronize`. kfd hqds·mqds가 10초 간격 두 번 byte 동일(정상일 때는 5초 안에 바뀐다). 5분 넘게 회복하지 않음 |
+| h2s | `AMD_SERIALIZE_KERNEL=3`/`COPY=3` | round 4, r88 docstring-admission. `LaunchRouted`(RoutedGemv) launch의 serialize 대기, `Exl3Experts` rows=16(fused router tile) |
+| h3a | `AMD_SERIALIZE_KERNEL=2`/`COPY=2`(각 kernel 뒤 대기) | round 9, r129(1066 token rename 다음 요청). RoutedGemv<…,8> gate/up(k 2560, n 640, assignments 640, BuildTiles, rows=64) 자체가 끝나지 않는다. amdgpu tracepoint로 본 것: 마지막 EOP interrupt가 멈춘 시각이고, 그 전 약 7분 동안 BO 이동·생성·map이 없었고, fault interrupt도 없었다. **185초 뒤, 다른 GPU process가 시작되자 약 13초 만에 decode가 정상 속도로 이어졌다** |
+| h5p | 일반 argv, 멈춘 뒤 진단하고 일부러 두 번째 GPU process(`cand2-gufo diagnose`, 1초 안에 끝남)를 띄움 | round 11, request 125(prompt 1068). 129 token에서 약 122초 동안 멈췄다. poke 뒤 1초 안에 decode가 다시 진행됐다(554→984 token, 70~183 tok/s). **queue 집합이 바뀌면 풀린다는 것을 확인했다** |
+
+판정:
+- 결론은 kernel이 끝나지 않는 것이 아니라 queue 수준의 정지다. 근거:
+  - dispatch가 하나만 남아 있어도(serialize after) 멈춘다.
+  - HQD가 움직이지 않는다.
+  - fault가 없다.
+  - 다른 process가 queue 집합을 바꾸면 풀린다. c2L도 SIGTERM 약 14초 뒤에 요청이 끝났다.
+- 가장 그럴듯한 기전은 MES/CWSR 선점이다. 이 host에는 kwin_wayland desktop이 같은 GPU에 떠 있다. wide pass의 큰 RoutedGemv dispatch(640×2 grid)가 선점된 뒤 queue 재배치가 있을 때까지 다시 schedule되지 않는다는 설명이다.
+- 배제한 것:
+  - EnsureWideSegments 지연 할당: 같은 서버의 앞 round에서 같은 요청이 통과했고, trace에 BO 활동이 없다.
+  - 동시 stream 조건: serialize 상태에서도 멈춘다.
+  - 64행 BuildTiles 경로에만 있는 문제: 16행 fused tile 경로에서도 멈춘다.
+- 환경(`build/b1/u6-20261109/hang/environment.txt`): kernel 7.0.0-38, amdgpu `cwsr_enable=1`, `queue_preemption_timeout_ms=9000`, `sched_policy=0`, MES fw 0x86, MES_KIQ 0x6f, MEC 0x22.
+- 배포 후보가 아니다. 완화 설계(kick/watchdog, 긴 dispatch 분할, cwsr 설정)는 coordinator가 맡는다.
+
+### U6 남은 것
+
+- batch 동시 short reply decode 회귀(C1 의심)와 `*-disk` prefill +10~15 ms
+- C4: capture가 다른 세션의 prefill을 기다린다(base에도 있다)
+- mtp_audit의 base 대조
+- 27B adapter image section: 테스트가 `mmproj-BF16.gguf` 이름을 요구한다
+- U4-3 hang 완화 빌드 검증(아래 "U4-3 완화 후보")
+
+### U4-3 완화 후보 (cand3, cand4)
+
+사용자가 workaround를 승인했다. 다른 agent가 코드를 만들었고, 이 패스에서는 GPU 검증만 했다.
+
+- **cand3** = `a0d951dd`(gufo `f36e6fb8`). `21c138cc`에 세 커밋을 더했다.
+  - `c897aa51`: 유한하지 않은 router 행을 weight 0으로 유효한 expert에 보낸다.
+  - `8a18e528`: routed decode launch를 grid y 80으로 고정한 strided grid로 돈다. 64행 gate/up이 12,800에서 1,600 block으로 준다. 출력 bit는 같다.
+  - `a0d951dd`: decode·wide scratch를 load할 때 잡는다.
+- **cand4** = `7c3e300b`(gufo `9ac49a5f`). cand3에 세 커밋을 더했다.
+  - grid cap을 160으로 올렸다.
+  - `0e0ebad8`: 취소된 세션의 rollback scratch를 slot을 놓을 때 지우지 않고 유지한다.
+  - `6e2c504e`: 다른 요청이 admission돼 있으면 wide 검증을 하지 않는다(batch 회귀 수정).
+
+cand3 결과:
+- **GPU test:** `exl3_ops_test --wide-verification`(WideDecodeAllocations 포함) 통과. session test 전체 통과(출력이 cand2와 같다). `exl3_moe_kernel_test`의 RouterTilesSet·RouterNonFinite·RoutedGridIdentity는 통과했지만, test fixture 버그(`cae407c4`에서 고침)로 RoutedWideReplay 다음에 중단됐다.
+- **hang 반복:** FP16 일반 argv, poke 없이 24 round(rewrite 요청 288개)에서 멈추지 않았다. cand2는 같은 loop가 round 1~11 안에 멈췄다. greedy 출력이 u13과 144/144 같다. 요청별 decode 중앙값은 cand2 기준 round(c2L2) 대비 −1.2~−7.1%다. K4V4 loop는 10 round(요청 120개)에서 멈추지 않았고, greedy가 u13과 60/60 같았다. decode 중앙값은 cand2 c2K 대비 −3.0~+4.0%다.
+- **startup:** `decode_scratch_reserved bytes=512020480`. KV pool(14.4 GB, 2050 block)과 admission 정상.
+- **ISA:** RoutedGemv VGPR가 최대 +37(117→154), scratch spill 없음, LDS 같음. cand2 ISA는 21c138cc source를 HEAD header로 컴파일한 것이다.
+- **bench(정리 뒤 1회):** MTP d0/d32K 57.85/101.72(cand2 60.68/105.73, −4.7/−3.8%, 5% 안). AR 32.78/32.52, PP 1513/1548. work·hash는 같다.
+
+cand4 결과:
+- **GPU test:** `exl3_moe_kernel_test` 전체 통과. 546 CASE를 출력했고, routed wide replay(tile 113), adversarial tiles, concentrated routing 9~25행이 들어 있다. `exl3_ops_test --wide-verification` 통과. session test 전체 통과(출력이 cand2와 같다). continuation adapter test는 rc 1로 실패했다(`failed slot retained rollback scratch`, test.cpp:279). 이 test는 취소된 slot을 Invalidate하면 rollback scratch를 해제해야 한다고 요구하는데, `0e0ebad8`은 일부러 그 scratch를 남긴다. test 계약을 고칠지, 변경을 되돌릴지 결정해야 한다. 그 행 전까지의 section은 모두 PASS다.
+- **hang 반복:** FP16 24 round와 K4V4 10 round(요청 408개)에서 멈추지 않았다. greedy가 u13과 144/144, 60/60 같다. decode 중앙값은 cand2 대비 FP16 −5.1~+2.1%, K4V4 −3.2~+4.9%다. U4-3의 단독 wide 속도 향상은 그대로 남아 있다.
+- **MTP 쌍(정리 뒤, cand2→cand4 교대 3쌍):** d0 58.58→58.40, 59.47→58.67, 58.81→58.74. d32K 102.44→105.39, 105.91→104.40, 105.74→105.47. 모두 ±3% 안이라 중립이다. work·hash는 같다. cand3 1회 측정에서 본 −4.7/−3.8%는 교대 쌍에서 재현되지 않았다.
+- **functional `batch`+`cache`(rpc4, base rpb 재사용):** functional 통과(tool·cache 모두). batch 동시 short reply·pair와 cancelled_peer 행 43개의 decode 합계는 base 7,269 ms, cand2 8,718 ms, cand4 6,932 ms다. batch decode_ms flag는 57개 가운데 cand 16, cand2 22, cand4 14개다. 남은 flag는 대부분 replies 행의 +5~+25 ms이고, pairs 한 행(f64690)만 92→239 ms다. cancelled_peer_isolation 01f1bb는 731/1332/619 ms다. `session_rollback_bytes=0`은 cancel 뒤에는 나오지 않는다. 처음 admission 6건에만 있다(base 49건, cand2 51건).
 
 ## 하지 않는 것
 

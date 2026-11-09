@@ -6,6 +6,29 @@ preserved in `models/eval/flash-next/hc-history-20261109` outside this repo.
 Old evidence paths map into that archive; experimental ELF/H/build intermediates
 are no longer retained. [Archive mapping and cleanup receipt](../../../plan/exl3/HANDOFF.md).
 
+## Upstream U6 candidates (not deployed), November 9, 2026
+
+These rows were measured on a cleaned host, after `sync`, `drop_caches=3` and `compact_memory=1`. After 22 days of uptime, host memory fragmentation had cut MTP by up to 40 %, and the same binary did the same work in both states (see KNOWHOW "Upstream U6 combined GPU pass").
+
+- **Binaries:** B is the deployed `runtime-hc-20261108`, measured 16:51–17:04. C is `22705f7b` (`6e6574ca`, U4-3 reverted). D is `21c138cc` (`6588c56c`, U4-3 re-landed plus M1), measured 18:22–18:26 after a second compaction.
+- **Setup:** c03 + all200 HC Q8, FP16 KV, r2, temperature 0, seed 314159, draft 7. Values are tok/s per run.
+
+| Case | B | C | D | D vs B |
+| --- | ---: | ---: | ---: | ---: |
+| PP2048 | 1502.36, 1502.67 | 1515.35, 1512.46 | 1522.92 | +1.4 % |
+| PP8192 | 1544.54, 1548.19 | 1539.86, 1544.62 | 1555.33 | +0.6 % |
+| AR128 d0 | 32.63 | 32.67 | 32.92 | +0.9 % |
+| AR128 d32768 | 32.13 | 32.05 | 32.54 | +1.3 % |
+| MTP128 d0 | 58.90, 59.33 | 59.28, 59.46 | 60.68 | +2.3/+3.0 % |
+| MTP128 d32768 | 98.74, 94.18 | 96.22, 94.24 | 105.73 | +7.1/+12.3 % |
+
+- **Same output:** the output hashes are equal in every run. MTP d0 work is equal (38 cycles, 90/114 accepted). At d32K, U4-3 ran 10 cycles instead of 17 (118/118 accepted, 108 of them lookup).
+- **Fragmented host, same base binary:** MTP d0/d32K was 39.09/68.39 and 39.91/68.80, and AR was 31.76/31.48.
+- **Served sampled MTP** (typical acceptance off, 18 requests): the text and work are identical to B. D has no slower request and is 7–17 % faster on 4 of them.
+- **Typical acceptance on** (the C default): 17/18 requests are 4.3–28.4 % faster.
+
+U4-3 is not deployable: its wide pass stalls on a queue until the queue set changes. Evidence: `build/b1/u6-20261109/`.
+
 ## Upstream U5 candidate (not deployed), November 9, 2026
 
 Same window, B C alternation, deployed `runtime-hc-20261108` (B) vs candidate

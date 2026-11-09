@@ -1,4 +1,11 @@
-# EXL3 / Flash-Next handoff (updated 2026-11-09; all200 HC Q8 retained; U5 not deployed)
+# EXL3 / Flash-Next handoff (updated 2026-11-09; all200 HC Q8 retained; U5/U6 not deployed; production stopped)
+
+## Upstream U6 pass, 2026-11-09: not deployed, production stopped
+
+- **Production is stopped.** It was stopped at 16:33 KST for the pass. The user cancelled the auto-restore, so it stays stopped until the user says otherwise. The installed runtime is unchanged: `runtime-hc-20261108`, sha `166953f0`.
+- **Candidates:** `22705f7b` (`6e6574ca`) and `21c138cc` (`6588c56c`, U4-3 re-landed plus M1). Evidence is in `build/b1/u6-20261109/`. Results are in [PLAN.md](../upstream-sync/PLAN.md) "U6 통합 GPU 패스" and the KNOWHOW "Upstream U6 combined GPU pass".
+- **Fragmentation:** 22 days of host memory fragmentation explained the U5 MTP slowdown. The supervisor now runs `drop_caches` + `compact_memory` before the server allocates (`6415dab8`, not installed yet).
+- **U4-3 hang:** U4-3's wide pass stalls on a queue until the queue set changes. A second GPU process releases it. It is not deployable as is. A workaround (strided RoutedGemv grid, -1 expert-id fix, scratch reserved at load) was in progress at the time of writing.
 
 ## HC experiment artifacts archived, 2026-11-09
 
