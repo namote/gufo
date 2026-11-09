@@ -292,6 +292,25 @@ void CheckSlotReuse(const std::shared_ptr<qfn::Model>& model, bool mtp) {
   SameLogits(reused, *fresh);
   Require(Decode(reused, 16) == Decode(*fresh, 16),
           "retained cancelled-slot scratch changed continuation tokens");
+  // Owned sessions without a component cache (KVarN) reassign through
+  // ResetForReuse and keep the same scratch after a cancellation.
+  const auto owned_bytes = fresh->AllocatedBytes();
+  if (mtp)
+    Require(owned_bytes > empty_bytes,
+            "cancelled owned session had no rollback scratch to retain");
+  fresh->SetCancellationCheck([] { return true; });
+  Require(!fresh->Evaluate(next.front(), &error) && !fresh->IsValid(),
+          "cancelled owned session remained valid");
+  fresh->SetCancellationCheck({});
+  fresh->ResetForReuse();
+  Require(fresh->Position() == 0 && fresh->Tokens().empty() &&
+              fresh->AllocatedBytes() == owned_bytes,
+          "cancelled owned-session reset discarded reusable rollback");
+  reused.Reset();
+  Require(reused.Sync(next, &error) && fresh->Sync(next, &error), error);
+  SameLogits(reused, *fresh);
+  Require(Decode(reused, 16) == Decode(*fresh, 16),
+          "retained owned-session scratch changed continuation tokens");
   reused.Reset();
   Require(reused.AllocatedBytes() == empty_bytes,
           "explicit reset retained rollback scratch");

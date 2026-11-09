@@ -250,6 +250,11 @@ public:
                   : std::span<const std::int32_t>{};
   }
   void Reset();
+  /// Clears the context for the next request on the same slot. A valid
+  /// session, or one whose request stopped for cancellation, keeps its MTP
+  /// rollback rows and verifier graphs; any other invalid session releases
+  /// all scratch like Reset().
+  void ResetForReuse();
   /// Cancellation is checked at model, layer and snapshot-copy boundaries.
   void SetCancellationCheck(std::function<bool()> check);
   [[nodiscard]] bool IsValid() const noexcept { return valid_; }
@@ -326,6 +331,8 @@ private:
   friend class ContinuationAdapter;
   Session(std::shared_ptr<Model> model, std::unique_ptr<rocm::Session> session);
   void ResetImpl(bool reuse_mtp);
+  /// Whether a reset for slot reuse may keep this session's scratch.
+  [[nodiscard]] bool ScratchReusable() const noexcept;
 
   using PrefillCapture = std::function<void(const rocm::PrefillCheckpoint&)>;
   bool SyncThroughComponents(std::span<const std::int32_t>, std::uint32_t,

@@ -2490,7 +2490,7 @@ public:
     if (adapter_ != nullptr)
       (void)adapter_->Invalidate(*slot_);
     else
-      session_->Reset();
+      session_->ResetForReuse();
     position_ = 0;
   }
   void SetCancellationCheck(const CancellationCheck& check) override {

@@ -422,6 +422,18 @@ void Session::Reset() {
   ResetImpl(false);
 }
 
+bool Session::ScratchReusable() const noexcept {
+  // A request that stopped for cancellation leaves the session invalid but
+  // its scratch intact. Releasing it made the next request on the slot
+  // allocate the rollback rows and record the verifier graphs again, and
+  // those device allocations stalled the peer decoding beside it.
+  return IsValid() || session_->ObservedCancellation();
+}
+
+void Session::ResetForReuse() {
+  ResetImpl(ScratchReusable());
+}
+
 void Session::ResetImpl(bool reuse_mtp) {
   if (continuation_hooks_)
     continuation_hooks_->BeforeReset();
