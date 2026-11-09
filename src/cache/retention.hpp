@@ -214,6 +214,19 @@ private:
     // Retained records extending this one, by slot.
     std::bitset<kRecordLimit> below;
   };
+  // aligned_tail and pins fill the padding after forked: the metadata the
+  // constructor charges (sizeof *this) is what it was without them.
+  struct RecordLayoutWithoutPins {
+    std::shared_ptr<const Checkpoint> checkpoint;
+    IndexEntryId entry;
+    RetentionPurpose purpose{};
+    Rows stable{};
+    std::uint64_t last_used{};
+    std::optional<std::uint64_t> reused_at;
+    bool forked{false};
+    std::bitset<kRecordLimit> below;
+  };
+  static_assert(sizeof(Record) == sizeof(RecordLayoutWithoutPins));
   std::size_t Find(CheckpointId) const;
   bool Branch(std::size_t) const;
   std::uint32_t Priority(std::size_t, const RetentionRequest* = nullptr) const;

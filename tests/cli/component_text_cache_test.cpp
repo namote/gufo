@@ -3468,6 +3468,41 @@ void ExactReplacementDuringRestoreKeepsTheRestore() {
          runner->adapter->RecurrentHash(state.slot));
   assert(cache.CachedPrefixTokens(prompt, nullptr, false) == prompt.size());
 }
+// The aligned tail a warm chat turn checkpoints before its unaligned prompt
+// end is published as one (MarkAlignedTail): under pressure it goes before
+// the turn's complete prompt, which an unchanged retry restores.
+void WarmTurnTailGoesBeforeItsRetry() {
+  auto runner = std::make_shared<Runner>();
+  runner->alignment = 4;
+  runner->in_pass = true;
+  // Room for the seed prompt, the tail and the retry copy only.
+  runner->private_blocks = 3;
+  TextRunnerPool pool(runner, 1);
+  std::vector<TextRunnerToken> prompt(40);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  auto seed = pool.Acquire(prompt);
+  Prefill(seed);
+  prompt.push_back(Generate(seed));
+  (void)seed.Commit();
+  const auto cached = prompt.size();
+  for (std::size_t i = 0; i < 6; ++i)
+    prompt.push_back(static_cast<TextRunnerToken>(1000 + i));
+  runner->in_pass_points.clear();
+  auto turn = pool.Acquire(prompt, {}, {}, {}, true, cached + 2);
+  assert(turn.cached_prompt_tokens() == cached);
+  Prefill(turn);
+  assert((runner->in_pass_points == std::vector<std::size_t>{44}));
+  (void)Generate(turn);
+  (void)turn.Commit();
+  // An unrelated prompt takes the slot and needs a private state.
+  auto unrelated = pool.Acquire({999, 998, 997, 996, 995, 994, 993, 992});
+  Prefill(unrelated);
+  (void)Generate(unrelated);
+  (void)unrelated.Commit();
+  auto retry = pool.Acquire(prompt, {}, {}, {}, true, cached + 2);
+  assert(retry.cached_prompt_tokens() == prompt.size());
+  retry.Invalidate();
+}
 // A warm chat turn whose prompt ends on the alignment captures no separate
 // aligned prompt tail: it would be the complete prompt's own state. One
 // ending off the alignment checkpoints the aligned tail inside its pass.
@@ -3502,6 +3537,7 @@ void AlignedPromptEndCapturesNoSeparateTail() {
   }
 }
 int main() {
+  WarmTurnTailGoesBeforeItsRetry();
   SelectedCheckpointSurvivesReassignmentCapture();
   ExactReplacementDuringRestoreKeepsTheRestore();
   AlignedPromptEndCapturesNoSeparateTail();
