@@ -72,6 +72,9 @@ void Session::ConfigureVision(
 }
 
 void Session::SetCancellationCheck(std::function<bool()> check) {
+  // Installing a check starts a new record. Clearing it keeps whether the
+  // request observed cancellation until Reset or the next installed check.
+  last_request_cancelled_ = !check && (last_request_cancelled_ || cancelled_);
   cancelled_ = false;
   is_cancelled_ = std::move(check);
   vision_input_.SetCancellationCheck(is_cancelled_);
@@ -331,6 +334,7 @@ void Session::Reset(bool reuse_mtp) {
   // bound is already included in speculative SessionBytes and AllocatedBytes.
   if (!reuse_mtp || !mtp_enabled_)
     TrimRollback(0);
+  last_request_cancelled_ = false;
   snapshot_lineage_.reset();
   position_ = 0;
   spec_tokens_ = 0;

@@ -1151,8 +1151,15 @@ bool ContinuationAdapter::Invalidate(cache::Slot& slot) noexcept {
     } reset_scope{state.invalidating};
     state.invalidating = true;
     // Reassign a healthy resident slot without rebuilding its MTP graphs.
-    // Failed state and explicit Session::Reset still release all scratch.
-    state.session->ResetImpl(!state.failed && state.session->IsValid());
+    // A request that stopped for cancellation leaves the session invalid but
+    // its scratch intact: releasing it made the next request on this slot
+    // allocate the rollback rows and record the verifier graphs again, and
+    // those device allocations stalled the peer decoding beside it. Adapter
+    // failure (`failed`) takes precedence, and explicit Session::Reset still
+    // releases all scratch.
+    state.session->ResetImpl(!state.failed &&
+                             (state.session->IsValid() ||
+                              state.session->session_->ObservedCancellation()));
     state.failed = false;
     state.restoring = false;
     state.expected.clear();

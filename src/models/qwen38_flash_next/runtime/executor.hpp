@@ -154,6 +154,13 @@ public:
   void SetCancellationCheck(std::function<bool()> check);
   [[nodiscard]] bool CheckCancellation(std::string* error) const;
   [[nodiscard]] bool Cancelled() const noexcept { return cancelled_; }
+  /// Whether the current or last request observed cancellation. Clearing
+  /// the check (SetCancellationCheck({})) clears Cancelled() but keeps this
+  /// until Reset or until a non-empty check is installed: an operation that
+  /// stopped for cancellation leaves the state invalid, not the scratch.
+  [[nodiscard]] bool ObservedCancellation() const noexcept {
+    return cancelled_ || last_request_cancelled_;
+  }
   [[nodiscard]] std::uint64_t MutationEpoch() const noexcept {
     return mutation_epoch_;
   }
@@ -242,6 +249,7 @@ private:
   };
 
   mutable bool cancelled_{false};
+  bool last_request_cancelled_{false};
   std::uint64_t mutation_epoch_{0};
   const Executor* owner_{nullptr};
   qwen::vision::DeviceInput vision_input_;
