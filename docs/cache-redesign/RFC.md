@@ -1938,11 +1938,13 @@ not a source of hard-coded production defaults.
 | Chunk files instead of one file | +13% write time, +13% cold-read time (72 × 56 MiB vs 4 GiB) | diskbench.py | Compaction may reduce it; qualification required |
 | Prefill N tokens on D cached | Flash-Next 0.36 s + 0.79 ms/token + small depth term; 27B 0.52 s + 2.66 ms/token + 16.5 ns × N × (D + N/2) | [fit_prefill.py](https://github.com/gufo-org/gufo/blob/b9ca6b4e18abe50d4d446f5460823b7bcb4cdb33/docs/cache-redesign/scripts/fit_prefill.py), 150 requests each; median error 9.8% and 3.9% | Simulated prefill time matches measured within 3–8% (E7) |
 
-`cache_snapshot_ms` in `usage.gufo` is not used as a capture cost. It is
-measured from capture start to when the capture is joined
-(`src/cli/serve/text_model_runner.cpp:913`), so it includes overlapped wall
-time. Its medians (0.3–0.5 s per request on Flash-Next, about 1 s on 27B) are
-an upper bound, not time on the critical path.
+`cache_snapshot_ms` in `usage.gufo` was not used as a capture cost. When
+these medians were taken (0.3–0.5 s per request on Flash-Next, about 1 s on
+27B) it ran from capture start to when the capture was joined, so it included
+overlapped wall time and was an upper bound, not time on the critical path.
+Since 2026-11-10 (C4) a prompt capture's time ends when its worker finishes,
+and the scheduler waits briefly for a capture before queuing peer work, so
+newer values are the capture's own time and are not comparable with these.
 
 ### Per-operation costs
 

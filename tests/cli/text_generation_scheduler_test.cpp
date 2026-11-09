@@ -851,6 +851,50 @@ void TestSharedPrefixWaitRequiresSnapshots() {
          "runners without snapshots never park concurrent requests");
 }
 
+// C4: a capture that finishes within capture_settle_wait completes before the
+// scheduler queues a peer's prefill. Parking at once ran the peer's whole pass
+// first, whose device work delayed the capture's copy on the GPU.
+std::size_t CapturesOverlappingPeerWork(std::chrono::milliseconds settle) {
+  auto control = SharedPrefixControl(true);
+  std::atomic<std::size_t> captures{0}, overlapped{0};
+  control->snapshot_callback = [&] {
+    const auto before = control->Events().size();
+    // Without a settle wait, give the scheduler time to start peer work;
+    // with one, a brief capture must finish first.
+    const auto until = std::chrono::steady_clock::now() +
+                       (settle.count() == 0 ? std::chrono::milliseconds(1000)
+                                            : std::chrono::milliseconds(5));
+    while (std::chrono::steady_clock::now() < until &&
+           (settle.count() != 0 || control->Events().size() == before))
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    captures.fetch_add(1);
+    if (control->Events().size() != before)
+      overlapped.fetch_add(1);
+  };
+  TextSchedulerPolicy policy;
+  policy.capture_settle_wait = settle;
+  auto scheduler = MakeScheduler(control, 2, {}, policy);
+  const auto prompt = [](TextRunnerToken label, std::size_t size) {
+    std::vector<TextRunnerToken> tokens{label};
+    for (std::size_t index = 1; index < size; ++index)
+      tokens.push_back(label * 10000 + static_cast<TextRunnerToken>(index));
+    return tokens;
+  };
+  auto peer = scheduler->Submit(prompt(2, 3000), 2, 0.0F);
+  auto first = scheduler->Submit(prompt(1, 300), 2, 0.0F);
+  (void)first.Wait();
+  (void)peer.Wait();
+  Expect(captures.load() > 0, "the requests capture checkpoints");
+  return overlapped.load();
+}
+
+void TestBriefCaptureSettlesBeforePeerWork() {
+  Expect(CapturesOverlappingPeerWork(std::chrono::milliseconds(0)) > 0,
+         "without a settle wait, peer prefill runs during a capture");
+  Expect(CapturesOverlappingPeerWork(std::chrono::milliseconds(500)) == 0,
+         "a brief capture finishes before the scheduler queues peer work");
+}
+
 void TestParkedFollowersReserveVisibleSessions() {
   namespace metrics = gufo::server::detail;
   auto control = SharedPrefixControl(true);
@@ -3363,6 +3407,7 @@ int main() {
   TestParkedFollowerSurvivesLeaderCancellation();
   TestSharedPrefixWaitRequiresSnapshots();
   TestParkedFollowersReserveVisibleSessions();
+  TestBriefCaptureSettlesBeforePeerWork();
   TestRetainedHistoryBeatsSharedPrefixWait();
   TestAwaitedCheckpointSurvivesCachePressure();
   TestRunnerCanSkipUnusedFinalAdvance();

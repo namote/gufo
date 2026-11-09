@@ -45,6 +45,10 @@ struct TextSchedulerPolicy {
   std::chrono::milliseconds device_probe_interval{std::chrono::seconds(5)};
   // Idle time before idle sessions' live frontiers are written to disk.
   std::chrono::milliseconds idle_write_back_delay{std::chrono::seconds(2)};
+  /// Internal bound on waiting for a capture the last step started before
+  /// queuing other work. The executor is idle then, so the copy finishes in
+  /// milliseconds; behind a peer's prefill pass it waited for the whole pass.
+  std::chrono::milliseconds capture_settle_wait{50};
   /// Internal bound after which a still-queued stream reports its start, so
   /// transports can keep the connection alive while it waits.
   std::chrono::milliseconds stream_start_delay{std::chrono::seconds(5)};

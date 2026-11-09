@@ -725,6 +725,9 @@ public:
     /// Starts capture and polls completion without blocking other sessions.
     [[nodiscard]] bool PreparePromptSnapshot();
     [[nodiscard]] bool SnapshotPending() const;
+    /// Waits until `deadline` for a pending capture; true if still pending.
+    [[nodiscard]] bool SnapshotPendingUntil(
+        std::chrono::steady_clock::time_point deadline) const;
     void Invalidate() noexcept;
 
   private:

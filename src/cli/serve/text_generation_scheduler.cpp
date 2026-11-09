@@ -1398,6 +1398,20 @@ struct TextGenerationScheduler::Impl {
     }
   }
 
+  // A capture the last step started copies device state on a transfer stream
+  // while no device work is queued. Parked at once, it waited behind a peer's
+  // whole prefill pass (C4): the copy can share a capped hardware queue with
+  // the executor stream, and the scheduler polls captures only between passes.
+  // A brief wait finishes the usual capture first; slower ones still park.
+  [[nodiscard]] Clock::time_point CaptureSettleDeadline() const {
+    return Clock::now() + scheduler_policy.capture_settle_wait;
+  }
+  [[nodiscard]] static bool CapturePending(
+      const std::shared_ptr<ScheduledRequest>& request,
+      Clock::time_point deadline) {
+    return request->runner_request.SnapshotPendingUntil(deadline);
+  }
+
   [[nodiscard]] std::optional<Clock::time_point> PrepareDecode(
       const std::shared_ptr<ScheduledRequest>& request) {
     if (CompleteIfStopped(request)) {
@@ -2242,7 +2256,7 @@ struct TextGenerationScheduler::Impl {
         prefilling.pop_front();
         StepPrefill(request, true);
         if (!IsTerminal(request)) {
-          if (request->runner_request.SnapshotPending()) {
+          if (CapturePending(request, CaptureSettleDeadline())) {
             capturing.push_back(std::move(request));
           } else if (request->runner_request.prefill_complete()) {
             decoding.push_back(std::move(request));
@@ -2282,9 +2296,10 @@ struct TextGenerationScheduler::Impl {
                             capturing.size() + waiting.size() +
                             kv_waiting.size() + queued;
         StepDecodeBatch(batch);
+        const auto settle = CaptureSettleDeadline();
         for (auto& request : batch) {
           if (!IsTerminal(request)) {
-            if (request->runner_request.SnapshotPending())
+            if (CapturePending(request, settle))
               capturing.push_back(std::move(request));
             else
               decoding.push_back(std::move(request));
@@ -2307,7 +2322,7 @@ struct TextGenerationScheduler::Impl {
           request, false, !capturing.empty() || short_peer_waiting,
           prefilling.size() + capturing.size() + 1 < runner_pool->capacity());
       if (!IsTerminal(request)) {
-        if (request->runner_request.SnapshotPending()) {
+        if (CapturePending(request, CaptureSettleDeadline())) {
           capturing.push_back(std::move(request));
         } else if (request->runner_request.prefill_complete()) {
           request->decode_due = true;

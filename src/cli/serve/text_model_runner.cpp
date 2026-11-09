@@ -1193,6 +1193,12 @@ struct TextRunnerPool::Request::Impl {
       snapshot_future =
           std::async(wait ? std::launch::deferred : std::launch::async,
                      [this, owner = runner, state, persist = bool(disk_store)] {
+                       // Report the capture's own time, not how long the
+                       // scheduler took to look at it (a peer's prefill pass).
+                       const struct Done {
+                         std::chrono::steady_clock::time_point& at;
+                         ~Done() { at = std::chrono::steady_clock::now(); }
+                       } done{snapshot_done};
                        if (lease.component())
                          return lease.Capture();
                        return persist ? owner->SnapshotForPersistence(*state)
@@ -1212,9 +1218,10 @@ struct TextRunnerPool::Request::Impl {
     } catch (...) {
       prompt_snapshot.reset();
     }
+    // The worker's completion time is visible after get().
     snapshot_metrics.snapshot_ms +=
         std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - snapshot_start)
+            std::max(snapshot_done, snapshot_start) - snapshot_start)
             .count();
     if (prompt_snapshot == nullptr) {
       disk_capture.reset();
@@ -1433,6 +1440,8 @@ struct TextRunnerPool::Request::Impl {
   std::size_t snapshot_bytes{0};
   bool retain_snapshot{false};
   std::chrono::steady_clock::time_point snapshot_start;
+  // Written by the capture worker; read only after its future settles.
+  std::chrono::steady_clock::time_point snapshot_done;
   std::unique_ptr<ContinuationDiskStore::CaptureReservation> disk_capture;
   std::future<std::unique_ptr<TextRunnerSnapshot>> snapshot_future;
 };
@@ -1456,6 +1465,13 @@ bool TextRunnerPool::Request::PreparePromptSnapshot() {
 bool TextRunnerPool::Request::SnapshotPending() const {
   return impl_ && impl_->snapshot_future.valid() &&
          impl_->snapshot_future.wait_for(std::chrono::seconds(0)) !=
+             std::future_status::ready;
+}
+
+bool TextRunnerPool::Request::SnapshotPendingUntil(
+    std::chrono::steady_clock::time_point deadline) const {
+  return impl_ && impl_->snapshot_future.valid() &&
+         impl_->snapshot_future.wait_until(deadline) !=
              std::future_status::ready;
 }
 
