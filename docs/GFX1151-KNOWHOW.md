@@ -1,5 +1,83 @@
 # gfx1151 optimization know-how
 
+## Upstream U5 combined GPU pass, November 9, 2026 (not deployed)
+
+Candidate `0c784b00` build (`cand-gufo` sha `8f700bdf…`; device code identical
+to `84fd6206` after reverting U4-1) vs the deployed `runtime-hc-20261108`
+(`166953f0`), c03 + all200 HC Q8, deployed FP16 argv; evidence
+`build/b1/u5-20261109/` (perf.json, serve/, pisame/, func/timing-fr.json,
+correct/). Not deployed: one reproduced per-request regression below.
+- **Correctness.** Flash-Next GPU CTest, snapshot, continuation adapter and
+  session `--logprobs-only` pass. Prefill logits unchanged: sidecar
+  `df1b3e0c…` (= deployed), no sidecar `d051e822…` (= B10), so no quality run.
+  Functional conversation/batch/long-context/tool-type-unions/logprobs/
+  responses-logprobs/openai-count-tokens/tool-schema-edges pass on the final
+  candidate; cache-growth/cache-shared-prefix/cache(+persist) and
+  `cache_alignment_qwen38.py` passed on the earlier build that still had U4-1
+  (host cache code identical; baseline fails the alignment test). tool-reasoning fails
+  at `literal_protocol_raw_xml` identically on base and candidate (greedy
+  model refusal to echo an `<invoke>` literal, pre-existing).
+- **Timing (5 %/10 ms, alternated B C pairs).** PP2048 −0.04/−1.2 %, PP8192
+  +0.6/+0.5 %, AR128 d0/d32K within ±0.4 %, MTP128 d0 +2.2/−0.3/+0.4 % (same
+  work 38/114/90), MTP128 d32K +5.7/+5.2/+9.7 % (U4-3: 10 instead of 17
+  cycles, same output hash). Absolute MTP rates were about 30 % under B10/HC
+  qualification for every binary in this window (base 44.6–48.4 vs 65.7–67.0
+  tok/s at d0, same argv and work), while AR/PP matched: environmental,
+  unexplained; relative comparisons only.
+- **U4-1 fused GDN prefill (#895): reverted** (`4f49f025`), not byte-identical
+  to the separate launches.
+- **U4-3 wide copy verification (#961/#993): reverted after a GPU hang.** In
+  the second served K4V4 rewrite run the candidate never finished a greedy
+  decode (`docstring-admission`, stuck at 114 tokens for 10 min, GPU 100 %
+  busy): the decode thread waited in `hipStreamSynchronize` at
+  `executor_batch.cpp:1376` (`ForwardBatchImpl(wide=true)` from `ForwardWide`),
+  so a kernel on the wide path never completed (stack:
+  `serve/hang-k4v4-gdb.txt`). The first K4V4 run of the same request passed.
+  Killing the process freed the GPU without a reset. Root cause not found;
+  before U4-3 the 9–64-row decode-batch kernels ran only as up to 8 sessions
+  x 8 rows, so a one-session 64-row pass needs its own repeated stress run
+  before any re-adoption. Before the hang
+  it measured as follows. Greedy rewrite,
+  rename and docstring rewrites of two files are token-identical to u13
+  (`84fd6206`) in FP16 and K4V4, two runs each (24/24); decode −12…−35 %
+  per request (e.g. 129→23 rounds, 109→156 tok/s). Same-path Pi turns with
+  identical work decode up to 22 % faster. Open: candidate-only cold prefill
+  spikes +73…+150 ms on about 8 of 36 rewrite requests (u13 2/36); one FP16
+  request reproduced twice, K4V4 rerun clean. Inconclusive.
+- **U4-4 typical acceptance (Kyojin d8dbb75), opt-in.** Off (omitted or
+  false): 36/36 sampled requests identical to u13 in text, drafts, accepts
+  and rounds. On: all 18 sampled requests faster, +2.5…+27.6 % (median chat
+  ~+21 %, code ~+17 %, prose +8…+26 %); acceptance e.g. prose 0.616→0.736.
+  Gate: arithmetic 30/30 both; mean length 147→162.7 tokens (median
+  141→143.5), 4-gram repeat 0.0070→0.0084 (max 0.040→0.034); tool-schema-edges
+  pass and tool-reasoning fails at the same greedy check as off. Kept opt-in.
+- **U4-5 one-launch decode HC mixer (#894): rejected as-is.** Bench bug fixed
+  first (`c05c8e49`: `HcMixEpilogue` returns whether it rotated EXL3 slabs).
+  Bytes identical at 1/2/4/8 tokens; production/fused 45.88/41.23,
+  46.87/42.99, 49.27/46.35, 54.27/52.99 µs per mixer. Net of the ~2 µs slab
+  rotation launch the candidate lacks: +2.65/+1.88/+0.92/−0.72 µs, so it
+  loses at 8 tokens; ceiling under 1 % TG even with rotation folded in. Same
+  conclusion as the B3/B4 tail-fusion losses.
+- **Regression (blocks deploy).** Unchanged retries under a full 2 GiB RAM
+  cache (functional `batch`) re-prefill 2–10 tokens from an aligned boundary
+  (18→16, 18→8, 322→312) instead of the complete prompt: +75…+150 ms TTFT,
+  reproduced in both pairs. Cause (static trace + logs): U2-2's aligned
+  prompt-tail capture on warm chat turns doubles the RAM checkpoints per
+  turn, and retention evicts the rank-0 complete-prompt (kRetry) records
+  first. Base's complete-prompt reuse was exact. Fix candidates in
+  `plan/upstream-sync/PLAN.md` (U5 results); each trades retry cost against
+  next-turn reuse.
+- **Batched-vs-serial MTP draft K/V (pre-existing).** With the snapshot-tail
+  checks reporting instead of aborting, every session section passes. Serial
+  and batched snapshots differ in 2–124 B (one 22,102 B) in the final ~0.4 %
+  (draft K/V rows, dead draft residual); restoring either and decoding
+  greedy MTP gives identical tokens, logits and acceptance. Forcing the full
+  MTP route on both paths (diagnostic `GUFO_DIAG_MTP_FULL`, uncommitted) makes
+  them byte-identical: the cause is `MtpForwardBatch` taking the kv_only route
+  only when the whole cohort is kv_only. Greedy is unaffected; sampled
+  proposals can depend on peer scheduling. Fix direction: run catching-up
+  sessions as their own kv_only sub-batch.
+
 ## Upstream U4 imports, device-code delta, November 9, 2026
 
 No GPU run (measurement deferred to U5, `plan/upstream-sync/PLAN.md`).

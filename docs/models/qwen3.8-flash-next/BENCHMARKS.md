@@ -1,5 +1,34 @@
 # Qwen3.8 Flash-Next benchmarks
 
+## Upstream U5 candidate (not deployed), November 9, 2026
+
+Same window, B C alternation, deployed `runtime-hc-20261108` (B) vs candidate
+`8f700bdf` (C), c03 + all200 HC Q8, FP16 KV, r2, temperature0, seed314159,
+draft7. tok/s per round; no averaging across requests.
+
+| Case | B rounds | C rounds | C vs B per pair |
+| --- | ---: | ---: | ---: |
+| PP2048 | 1522.51, 1433.14 | 1521.87, 1416.48 | −0.04%, −1.2% |
+| PP8192 | 1543.00, 1544.12 | 1552.38, 1551.81 | +0.6%, +0.5% |
+| AR128 d0 | 32.19, 31.98 | 32.27, 32.02 | +0.2%, +0.1% |
+| AR128 d32768 | 31.81, 31.43 | 31.83, 31.55 | +0.1%, +0.4% |
+| MTP128 d0 | 48.39, 44.55, 44.87 | 49.45, 44.42, 45.07 | +2.2%, −0.3%, +0.4% |
+| MTP128 d32768 | 86.29, 80.30, 78.68 | 91.19, 84.51, 86.30 | +5.7%, +5.2%, +9.7% |
+
+Output hashes equal at both depths. MTP d0 work is equal (38/114/90). At d32K,
+U4-3 wide copy verification ran 10 cycles instead of 17. MTP absolute rates in this
+window are about 30% under the HC qualification (65.69/104.39) for every binary,
+including the unchanged baseline; AR/PP match. This is environmental and
+unexplained, so only the relative comparison holds.
+
+Served U4-3 rewrite workloads (greedy, two files, rewrite/rename/docstring)
+were token-identical to the pre-U4 build with 12–35% lower decode time,
+but U4-3 hung once on K4V4 and was reverted. U4-4 typical acceptance
+(opt-in) gave +2.5–27.6% sampled MTP decode with the default off unchanged.
+Neither is in a deployed runtime. Details and the deploy blockers:
+[know-how](../../GFX1151-KNOWHOW.md), `plan/upstream-sync/PLAN.md` "U5 결과".
+Evidence: `build/b1/u5-20261109/`.
+
 ## Original BF16 / pure F16 HC comparison, November 9, 2026
 
 Only200 HC down/up matrices differ; c03 body/MTP, FP16 KV, Nix10.1,

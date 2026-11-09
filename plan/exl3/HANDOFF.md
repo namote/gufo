@@ -1,4 +1,19 @@
-# EXL3 / Flash-Next handoff (updated 2026-11-09; all200 HC Q8 retained)
+# EXL3 / Flash-Next handoff (updated 2026-11-09; all200 HC Q8 retained; U5 not deployed)
+
+## Upstream U5 pass, 2026-11-09: not deployed
+
+The active runtime is unchanged: `~/.local/share/gufo/runtime-hc-20261108/gufo`
+(sha `166953f0…`). Rollback is unchanged too. The U-series candidate (`0c784b00`,
+`8f700bdf…`) passed correctness, logits identity and the PP/AR/MTP window, but it
+was not deployed:
+- U4-3 wide copy verification hung on the GPU once, and was reverted.
+- U2-2 alignment makes unchanged retries under a full RAM cache re-prefill
+  2–10 tokens (+75–150 ms TTFT, reproduced). The fix trade-off is for the user.
+
+The batched/serial MTP snapshot-tail difference ("Open" below) is now
+diagnosed. It is a route difference: `MtpForwardBatch` takes the kv_only
+route only for an all-kv_only cohort. Greedy is unaffected. See
+`plan/upstream-sync/PLAN.md` "U5 결과" and CLEANUP.md C1.
 
 ## Active default: c03 + calibrated HC Q8, 2026-11-08
 
