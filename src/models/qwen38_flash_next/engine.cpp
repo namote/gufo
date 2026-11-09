@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <future>
 #include <limits>
 #include <optional>
 #include <type_traits>
@@ -1398,14 +1399,28 @@ bool Session::FinishDecode(const DecodeRequest& request,
     std::vector<float> raw(rows * vocab);
     if (rows && !exec.ReadVerificationRows(0, raw, error_msg))
       return false;
-    for (std::uint32_t i = 1; i < keep; ++i)
-      result->logprobs.push_back(*sampling::CollectLogprobs(
-          std::span<const float>(raw).subspan((i - 1) * vocab, vocab), chain[i],
-          sampler.config().logprobs));
+    // Each row runs the same serial full-vocabulary reduction wherever it
+    // runs, so the values stay bit-identical. Running the rows concurrently
+    // keeps a long accepted chain from holding its batch peers once per row.
+    const auto row = [&](std::uint32_t i) {
+      return sampling::CollectLogprobs(
+          std::span<const float>(raw).subspan(std::size_t{i} * vocab, vocab),
+          i + 1 < keep ? chain[i + 1] : *stop_token, sampler.config().logprobs);
+    };
+    std::vector<std::future<std::optional<sampling::TokenLogprobs>>> others;
+    for (std::uint32_t i = 1; i < rows; ++i)
+      others.push_back(
+          std::async(std::launch::async | std::launch::deferred, row, i));
+    std::vector<std::optional<sampling::TokenLogprobs>> values;
+    values.reserve(rows);
+    if (rows)
+      values.push_back(row(0));
+    for (auto& other : others)
+      values.push_back(other.get());
+    for (std::uint32_t i = 0; i + 1 < keep; ++i)
+      result->logprobs.push_back(std::move(*values[i]));
     if (stop_token)
-      result->terminal_logprobs = sampling::CollectLogprobs(
-          std::span<const float>(raw).subspan((keep - 1) * vocab, vocab),
-          *stop_token, sampler.config().logprobs);
+      result->terminal_logprobs = std::move(values[keep - 1]);
   }
   if (!exec.Rollback(
           *session_, keep, error_msg,
