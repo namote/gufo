@@ -26,6 +26,8 @@ pins, and `TryTouch`.
 
 ### F1 (low, latent): 27B does not keep the ring-reach invariant that the KVarN rewind guard relies on
 
+**Status: fixed in 64b36cd8 (option a).** `KvarnRingReach` (kvarn_layout.hpp) raises `written_end` after a 27B prompt chunk that quantized groups from staging (`PrepareKvarnPrefill`) and in `KvarnRestoredTail`. CPU: `kvarn_layout_test` `TestRingReach`, `qwen27b_continuation_layout_test`. HIP build compiles. GPU check pending in the combined pass.
+
 - **Where.** The guard is `src/core/hip/kvarn_layout.hpp:183-191`
   (`PlanKvarnPass`) and `:239-248` (`PlanKvarnPrefill`). It refuses a rewind
   only when `reopened + 256 < written_end`, which assumes the tail ring holds
@@ -87,6 +89,8 @@ pins, and `TryTouch`.
 
 ### F2 (low, latent): the 27B write guard and unshare range miss the lagging group that a pass flushes first
 
+**Status: fixed in 64b36cd8.** `BeforeWrite` guards records from `KvarnWriteFirst(first, flushed_end)` and unshares from `min(first, flushed_end)`; `ReserveKvRows` charges from the same row. CPU: `kvarn_layout_test` `TestWriteFirst`. The adapter-level fake-tail test needs a HIP executor and is left to the combined GPU pass.
+
 - **Where.**
   - `src/models/qwen/continuation_adapter.cpp:208-216` guards records only from
     `floor(first)` and calls `UnshareKvRows(first, end)`.
@@ -128,6 +132,8 @@ pins, and `TryTouch`.
 
 ### F3 (low): retention's `forked` flag depends on admission order and is never cleared
 
+**Status: fixed in 2eaf2004.** Fork status comes from the current `below` bits (`Direct`, `Forked`); `forked` stays as a history bit, now order-independent, kept across exact replacement and cleared when a record has no extensions. `AlignedTail` reads the current `Forked`. CPU: `cache_retention_test` `ForkStatusIgnoresAdmissionOrder`, `ForkHistorySurvivesRepublication`, `AlignedTailAfterItsSiblingGoes`.
+
 - **Where.**
   - `src/cache/retention.cpp:227-249` (`Relate`) sets `forked` only on the
     deepest retained prefix of the record being added. It does so only when a
@@ -165,6 +171,8 @@ pins, and `TryTouch`.
   treated as a fork.
 
 ### F4 (very low, hardening): `Admit` indexes `records_[victim]` without checking `victim != limit_`
+
+**Status: fixed in 2eaf2004.** The record-capacity victim is chosen before `index_.Insert`; no victim refuses without indexing. CPU: `RecordCapacityRefusalLeavesNoIndexEntry`.
 
 - **Where.** `src/cache/retention.cpp:689-700`. Under record pressure, the
   victim comes from `Victim(r, true)`, which can return `limit_`. That would be
