@@ -95,6 +95,31 @@ def inspect_owned(state):
     return info
 
 
+def large_free_blocks():
+    """Free order>=9 (2 MiB+) blocks per /proc/buddyinfo, summed over zones."""
+    total = 0
+    for line in Path('/proc/buddyinfo').read_text().splitlines():
+        counts = line.split()[4:]
+        total += sum(int(c) for c in counts[9:])
+    return total
+
+
+def prepare_memory():
+    """Drop the page cache and compact memory before the server allocates.
+
+    Long uptime fragments host memory; the GPU allocations the server makes at
+    start then land on small pages and MTP decode ran up to 40 % slower with
+    the same work (docs/GFX1151-KNOWHOW.md, U6). Failure only logs: serving
+    still starts on fragmented memory.
+    """
+    before = large_free_blocks()
+    result = subprocess.run(['sh', '-c', 'sync && sudo -n sh -c '
+                             '"echo 3 > /proc/sys/vm/drop_caches && echo 1 > /proc/sys/vm/compact_memory"'],
+                            capture_output=True, text=True, timeout=300)
+    return {'returncode': result.returncode, 'stderr': result.stderr.strip()[-500:],
+            'large_free_blocks_before': before, 'large_free_blocks_after': large_free_blocks()}
+
+
 def build_command(state):
     identifier = state['run_id']
     command = ['docker', 'run', '--rm', '--name', state['container'], '--label', 'gufo.run=' + identifier,
@@ -182,6 +207,7 @@ def supervise():
         state['pre']['disk_cache_credit_bytes'] = min(cache_allocated, DISK_CACHE_BYTES)
         assert disk_admitted(state['pre']['disk_free'], cache_allocated), (
             'Disk reserve requires 100 GiB free and 150 GiB including existing cache (credit capped at 50 GiB)')
+        state['pre']['memory_prepare'] = diagnostic_only(prepare_memory)
         with socket.socket() as sock:
             # Match the HTTP listener: allow our recently closed connections
             # in TIME_WAIT, while still rejecting an active listener.
