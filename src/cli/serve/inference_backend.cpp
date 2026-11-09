@@ -3097,8 +3097,12 @@ public:
     // Use the same request policy as SelectNext and the batched MTP path.
     // The engine bounds the physical block and stops at EOS. Preserve the
     // remaining request budget so its policy can recognize a short tail.
+    // A step taken while the scheduler holds another request never verifies
+    // wide: the peer would wait for the whole pass.
+    const auto residents = static_cast<std::uint32_t>(std::min<std::size_t>(
+        qfn.resident_requests(), std::numeric_limits<std::uint32_t>::max()));
     if (!qfn.session().DecodeStep(max_tokens, working_sampler, &decoded, &error,
-                                  qfn.stop_at_eos())) {
+                                  qfn.stop_at_eos(), 1, residents)) {
       throw std::runtime_error("Qwen3.8-Flash-Next MTP decode failed: " +
                                error);
     }

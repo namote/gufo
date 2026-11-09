@@ -1872,7 +1872,8 @@ void TextRunnerPool::Request::Advance() {
   impl_->state_reusable = true;
 }
 
-TextDecodeStep TextRunnerPool::Request::DecodeStep(std::size_t max_tokens) {
+TextDecodeStep TextRunnerPool::Request::DecodeStep(
+    std::size_t max_tokens, std::size_t resident_requests) {
   if (!*this) {
     throw std::logic_error("text runner request is empty");
   }
@@ -1894,9 +1895,9 @@ TextDecodeStep TextRunnerPool::Request::DecodeStep(std::size_t max_tokens) {
 
   impl_->CapturePromptSnapshot();
   impl_->state_reusable = false;
-  auto step = impl_->runner->DecodeStep(
-      dynamic_cast<TextRunnerState&>(impl_->lease.state()), max_tokens,
-      impl_->sampler);
+  auto& state = dynamic_cast<TextRunnerState&>(impl_->lease.state());
+  state.SetResidentRequests(std::max<std::size_t>(resident_requests, 1));
+  auto step = impl_->runner->DecodeStep(state, max_tokens, impl_->sampler);
   if (step.selections.size() > max_tokens ||
       (step.selections.empty() && !step.stop)) {
     throw std::runtime_error("text runner returned an invalid decode step");

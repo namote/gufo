@@ -199,6 +199,8 @@ struct FakeControl {
   bool vocabulary_failure{false};
   std::atomic<std::size_t> vocabulary_builds{0};
   std::atomic<std::size_t> decode_calls{0};
+  std::mutex decode_residents_mutex;
+  std::vector<std::size_t> decode_residents;  ///< per multi-token DecodeStep
   std::atomic<std::size_t> batch_preparations{0};
   std::atomic<std::int64_t> first_request_advance_ns{0};
   bool incremental_prefill{true};
@@ -587,6 +589,10 @@ public:
     auto& fake = RequireFakeState(state);
     if (!fake.frontier.has_value()) {
       throw std::logic_error("scheduler fake has no multi-token frontier");
+    }
+    {
+      const std::lock_guard lock(control_->decode_residents_mutex);
+      control_->decode_residents.push_back(state.resident_requests());
     }
     const std::size_t count = std::min<std::size_t>(max_tokens, 3);
     TextDecodeStep step;
@@ -1169,6 +1175,44 @@ void TestMultiTokenRunnerCanSwitchToBatchedExecution() {
          "target batching bypasses per-request draft steps");
   Expect(control->batch_preparations.load(std::memory_order_relaxed) >= 2,
          "both resident states are prepared before target batching");
+}
+
+void TestSerialDecodeStepReportsResidentRequests() {
+  auto control = std::make_shared<FakeControl>();
+  control->multi_token_decode = true;
+  control->prefix_reuse = false;
+  const auto residents = [&] {
+    const std::lock_guard lock(control->decode_residents_mutex);
+    auto copy = control->decode_residents;
+    control->decode_residents.clear();
+    return copy;
+  };
+  auto scheduler = MakeScheduler(control, 2);
+
+  const auto alone = scheduler->Submit({3, 30}, 6, 0.0F).Wait();
+  Expect(alone.tokens == ExpectedTokens(3, 6), "a lone request decodes");
+  const auto solo = residents();
+  Expect(
+      !solo.empty() && std::ranges::all_of(
+                           solo, [](std::size_t count) { return count == 1; }),
+      "a request decoding alone reports one resident request");
+
+  // The second request arrives while the first one prefills, so the first
+  // one's serial decode steps run while the second is held.
+  control->block_prefill_label = 1;
+  auto request_a = scheduler->Submit({1, 10}, 6, 0.0F);
+  control->WaitForPrefill(1);
+  auto request_b = scheduler->Submit({2, 20}, 6, 0.0F);
+  control->ReleasePrefill();
+  const auto result_a = request_a.Wait();
+  const auto result_b = request_b.Wait();
+  Expect(result_a.tokens == ExpectedTokens(1, 6) &&
+             result_b.tokens == ExpectedTokens(2, 6),
+         "serial decode with a held peer preserves both trajectories");
+  const auto shared = residents();
+  Expect(
+      std::ranges::any_of(shared, [](std::size_t count) { return count >= 2; }),
+      "a serial decode step reports the peer the scheduler holds");
 }
 
 void TestBatchFailureIsolation() {
@@ -3327,6 +3371,7 @@ int main() {
   TestMultiTokenDecodePublishesDraftMetricsAndDisablesPrefixReuse();
   TestRequestTotalsDoNotNeedAConsumer();
   TestMultiTokenRunnerCanSwitchToBatchedExecution();
+  TestSerialDecodeStepReportsResidentRequests();
   TestModelOwnedBatchMetrics();
   TestBatchFailureIsolation();
   TestBatchDeviceLossFailsSuccessfulPeers();

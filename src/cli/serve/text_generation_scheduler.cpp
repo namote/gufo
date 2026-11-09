@@ -1572,7 +1572,8 @@ struct TextGenerationScheduler::Impl {
           request->token_limit - request->result.tokens.size() +
           (request->preview_token.has_value() ? 1 : 0);
       const auto step = request->runner_request.DecodeStep(
-          std::min(remaining, request->runner_request.ReservedDecodeTokens()));
+          std::min(remaining, request->runner_request.ReservedDecodeTokens()),
+          resident_requests);
       request->result.draft_rounds += step.draft_rounds;
       request->result.draft_tokens += step.draft_tokens;
       request->result.draft_accepted_tokens += step.draft_accepted_tokens;
@@ -2272,6 +2273,14 @@ struct TextGenerationScheduler::Impl {
           request->decode_due = false;
           batch.push_back(std::move(request));
         }
+        std::size_t queued = 0;
+        {
+          const std::lock_guard<std::mutex> lock(queue_mutex);
+          queued = queued_count;
+        }
+        resident_requests = batch.size() + decoding.size() + prefilling.size() +
+                            capturing.size() + waiting.size() +
+                            kv_waiting.size() + queued;
         StepDecodeBatch(batch);
         for (auto& request : batch) {
           if (!IsTerminal(request)) {
@@ -2339,6 +2348,10 @@ struct TextGenerationScheduler::Impl {
           TextGenerationErrorCode::kDeviceLost, kDeviceLostMessage));
   std::vector<std::shared_ptr<ScheduledRequest>> device_lost_requests;
   std::size_t consecutive_active_prefill_chunks{0};
+  /// Requests held while the current decode step runs, the stepped ones
+  /// included: queued, waiting for admission or rows, prefilling, capturing
+  /// or decoding. Every serial multi-token step passes it to the runner.
+  std::size_t resident_requests{1};
   std::uint64_t last_prefill_request_id{0};
   std::atomic<std::uint64_t> next_request_id{1};
   // Written by the scheduler thread and read by the stall monitor. `progress`

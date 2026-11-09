@@ -264,6 +264,17 @@ public:
     return prefill_lookahead_;
   }
 
+  /// Requests the scheduler holds during the next DecodeStep, this one
+  /// included: queued, waiting for admission or rows, prefilling, capturing
+  /// or decoding. A runner may keep a step that only pays off alone (a wide
+  /// verification) for when it is 1.
+  void SetResidentRequests(std::size_t count) noexcept {
+    resident_requests_ = count;
+  }
+  [[nodiscard]] std::size_t resident_requests() const noexcept {
+    return resident_requests_;
+  }
+
   /// Installs a request-scoped cancellation check for model calls that can
   /// yield internally. Implementations that only yield between work units may
   /// keep the default no-op behavior.
@@ -277,6 +288,7 @@ public:
 
 private:
   bool stop_at_eos_{true};
+  std::size_t resident_requests_{1};
   std::span<const TextRunnerToken> prefill_lookahead_;
 };
 
@@ -694,7 +706,10 @@ public:
     [[nodiscard]] TextPrefillStep Prefill(std::size_t max_input_tokens);
     [[nodiscard]] TextDecodeSelection SelectNext();
     void Advance();
-    [[nodiscard]] TextDecodeStep DecodeStep(std::size_t max_tokens);
+    /// `resident_requests` counts what the scheduler holds, this request
+    /// included (TextRunnerState::SetResidentRequests).
+    [[nodiscard]] TextDecodeStep DecodeStep(std::size_t max_tokens,
+                                            std::size_t resident_requests = 1);
 
     /// Publishes a reusable continuation boundary.
     ///

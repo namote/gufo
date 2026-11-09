@@ -1096,7 +1096,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
                             PendingDecode* pending, std::string* error_msg,
                             bool defer_head,
                             std::optional<std::uint32_t> batch_drafts,
-                            std::uint32_t occupancy) {
+                            std::uint32_t occupancy, std::uint32_t residents) {
   const auto max_tokens = request.max_tokens;
   auto& sampler = *request.sampler;
   auto* result = request.result;
@@ -1214,8 +1214,11 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   // rows verify compactly on the device. Batched cycles (defer_head) and
   // seeded requests keep the ordinary width, so their proposals and draws
   // do not depend on scheduling. A serial step priced for a cohort
-  // (occupancy > 1) keeps it too, matching its batched execution.
-  pending->wide = !defer_head && occupancy <= 1 && pending->lookup_cap != 0 &&
+  // (occupancy > 1) keeps it too, matching its batched execution. So does
+  // a step taken while the server holds another request (residents > 1):
+  // a peer that is queued or prefilling would wait for the whole wide pass.
+  pending->wide = !defer_head && occupancy <= 1 && residents <= 1 &&
+                  pending->lookup_cap != 0 &&
                   (gpu_greedy || (sampled && sampler.config().seed < 0 &&
                                   rocm::Executor::CanCompactWideVerification(
                                       sampler, exec.max_copy_rows())));
@@ -1541,7 +1544,7 @@ bool Session::FinishDecode(const DecodeRequest& request,
 bool Session::DecodeStep(std::size_t max_tokens,
                          sampling::SamplerState& sampler, DecodeResult* result,
                          std::string* error_msg, bool stop_at_eos,
-                         std::uint32_t occupancy) {
+                         std::uint32_t occupancy, std::uint32_t residents) {
   if (continuation_hooks_)
     continuation_hooks_->BeforeExecution();
   if (!valid_) {
@@ -1553,7 +1556,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
   const DecodeRequest request{this, max_tokens, &sampler, result, stop_at_eos};
   PendingDecode pending;
   if (!PrepareDecode(request, &pending, error_msg, false, std::nullopt,
-                     occupancy)) {
+                     occupancy, residents)) {
     return false;
   }
   if (pending.chain.empty()) {
@@ -1654,7 +1657,8 @@ bool Session::RunIsolatedBatch(std::span<const Request> requests,
   try {
     if (!active.empty()) {
       if constexpr (std::is_same_v<Request, DecodeRequest>)
-        (void)DecodeBatchImpl(active, &shared_error);
+        (void)DecodeBatchImpl(active, &shared_error,
+                              static_cast<std::uint32_t>(requests.size()));
       else
         (void)EvaluateBatchImpl(active, &shared_error);
     }
@@ -1679,9 +1683,9 @@ bool Session::RunIsolatedBatch(std::span<const Request> requests,
         }
         try {
           if constexpr (std::is_same_v<Request, DecodeRequest>)
-            outcome.completed =
-                session.DecodeStep(r.max_tokens, *r.sampler, r.result,
-                                   &outcome.error, r.stop_at_eos);
+            outcome.completed = session.DecodeStep(
+                r.max_tokens, *r.sampler, r.result, &outcome.error,
+                r.stop_at_eos, 1, static_cast<std::uint32_t>(requests.size()));
           else
             outcome.completed = session.Evaluate(r.token, &outcome.error);
         } catch (const std::exception& exception) {
@@ -1720,11 +1724,13 @@ bool Session::EvaluateBatch(std::span<const AdvanceRequest> requests,
 }
 
 bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
-                              std::string* error_msg) {
+                              std::string* error_msg, std::uint32_t residents) {
   if (requests.size() == 1) {
+    // A cohort that lost its peers keeps their count: they are still held.
     const auto& r = requests.front();
-    r.outcome->completed = r.session->DecodeStep(
-        r.max_tokens, *r.sampler, r.result, &r.outcome->error, r.stop_at_eos);
+    r.outcome->completed =
+        r.session->DecodeStep(r.max_tokens, *r.sampler, r.result,
+                              &r.outcome->error, r.stop_at_eos, 1, residents);
     return r.outcome->completed;
   }
   auto& exec = *requests.front().session->model_->executor_;

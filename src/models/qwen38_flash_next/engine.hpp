@@ -205,13 +205,17 @@ public:
   /// one-token budget or a model without MTP uses ordinary decoding.
   /// Benchmarks may continue past EOS by setting stop_at_eos to false.
   /// A greedy step prices its drafts as one of `occupancy` decoding requests,
-  /// as DecodeBatch does for an unplanned cohort of that width.
+  /// as DecodeBatch does for an unplanned cohort of that width. `residents`
+  /// counts the requests the server holds, this one included (see
+  /// TextRunnerState::SetResidentRequests); a copy verifies wide only when it
+  /// is 1, so a long wide pass never delays a peer.
   [[nodiscard]] bool DecodeStep(std::size_t max_tokens,
                                 sampling::SamplerState& sampler,
                                 DecodeResult* result,
                                 std::string* error_msg = nullptr,
                                 bool stop_at_eos = true,
-                                std::uint32_t occupancy = 1);
+                                std::uint32_t occupancy = 1,
+                                std::uint32_t residents = 1);
   struct BatchOutcome {
     bool completed{false};
     std::string error{};
@@ -364,14 +368,14 @@ private:
   static bool RunIsolatedBatch(std::span<const Request> requests,
                                std::string* error_msg);
   static bool DecodeBatchImpl(std::span<const DecodeRequest> requests,
-                              std::string* error_msg);
+                              std::string* error_msg, std::uint32_t residents);
   static bool EvaluateBatchImpl(std::span<const AdvanceRequest> requests,
                                 std::string* error_msg);
   struct PendingDecode;
   bool PrepareDecode(const DecodeRequest& request, PendingDecode* pending,
                      std::string* error_msg, bool defer_head = false,
                      std::optional<std::uint32_t> batch_drafts = {},
-                     std::uint32_t occupancy = 1);
+                     std::uint32_t occupancy = 1, std::uint32_t residents = 1);
   static void AppendDraft(PendingDecode& pending);
   /// Appends copies within the prepared budget, stopping at EOG when enabled.
   bool AppendLookup(PendingDecode& pending, bool stop_at_eos,
