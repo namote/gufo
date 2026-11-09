@@ -1473,21 +1473,27 @@ bool Session::FinishDecode(const DecodeRequest& request,
     // Each row runs the same serial full-vocabulary reduction wherever it
     // runs, so the values stay bit-identical. Running the rows concurrently
     // keeps a long accepted chain from holding its batch peers once per row.
-    const auto row = [&](std::uint32_t i) {
-      return sampling::CollectLogprobs(
-          std::span<const float>(raw).subspan(std::size_t{i} * vocab, vocab),
-          i + 1 < keep ? chain[i + 1] : *stop_token, sampler.config().logprobs);
+    // A fixed number of workers takes interleaved rows: a 63-row wide chain
+    // with one thread per row added 62 threads and about 95 MiB of RSS.
+    constexpr std::uint32_t kLogprobWorkers = 8;
+    std::vector<std::optional<sampling::TokenLogprobs>> values(rows);
+    const auto workers = std::min(rows, kLogprobWorkers);
+    const auto work = [&](std::uint32_t first) {
+      for (auto i = first; i < rows; i += workers)
+        values[i] = sampling::CollectLogprobs(
+            std::span<const float>(raw).subspan(std::size_t{i} * vocab, vocab),
+            i + 1 < keep ? chain[i + 1] : *stop_token,
+            sampler.config().logprobs);
     };
-    std::vector<std::future<std::optional<sampling::TokenLogprobs>>> others;
-    for (std::uint32_t i = 1; i < rows; ++i)
+    std::vector<std::future<void>> others;
+    others.reserve(workers ? workers - 1 : 0);
+    for (std::uint32_t w = 1; w < workers; ++w)
       others.push_back(
-          std::async(std::launch::async | std::launch::deferred, row, i));
-    std::vector<std::optional<sampling::TokenLogprobs>> values;
-    values.reserve(rows);
-    if (rows)
-      values.push_back(row(0));
+          std::async(std::launch::async | std::launch::deferred, work, w));
+    if (workers)
+      work(0);
     for (auto& other : others)
-      values.push_back(other.get());
+      other.get();
     for (std::uint32_t i = 0; i + 1 < keep; ++i)
       result->logprobs.push_back(std::move(*values[i]));
     if (stop_token)
