@@ -762,11 +762,13 @@ int main(int argc, char** argv) {
                              lo_cols, prod.lo_q8, stream) ||
           qfn_mmq_q8_0_dense_vec_preq(up[c], nullptr, prod.lo_q8, prod.gate,
                                       kDim, static_cast<int>(n), kRank,
-                                      stream) != 0 ||
-          !q::HcMixEpilogue(prod.xn, prod.gate, inject_w, prod.mixed,
-                            prod.inject, n, kHidden, kStreams, stream,
-                            prod.mixed_q8))
+                                      stream) != 0)
         throw std::runtime_error("production mixer rejected");
+      // HcMixEpilogue always launches; its result only reports whether it
+      // also rotated `mixed` into EXL3 input slabs, which this bench omits.
+      q::HcMixEpilogue(prod.xn, prod.gate, inject_w, prod.mixed, prod.inject,
+                       n, kHidden, kStreams, stream, prod.mixed_q8);
+      CheckHip(hipGetLastError(), "production epilogue");
     };
     const auto candidate = [&](std::uint32_t n, int c) {
       const cand::HcFusedMix mix{
@@ -778,6 +780,7 @@ int main(int argc, char** argv) {
           1.0F / kStreams};
       if (!cand::HcMixQ8Fused(state, mix, n, stream))
         throw std::runtime_error("fused mixer rejected");
+      CheckHip(hipGetLastError(), "fused mixer");
     };
     std::printf("tokens  production_us  fused_us  speedup  bytes\n");
     for (const std::uint32_t n : {1U, 2U, 4U, 8U}) {
