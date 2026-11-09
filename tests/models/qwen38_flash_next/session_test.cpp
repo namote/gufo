@@ -922,8 +922,7 @@ void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
             << std::flush;
   // The exact comparisons above cover a catch-up cohort with several
   // KV-only sessions only if one ran.
-  const auto mixed_kv_only =
-      model->MixedKvOnlyCohorts() - mixed_kv_only_before;
+  const auto mixed_kv_only = model->MixedKvOnlyCohorts() - mixed_kv_only_before;
   Require(!model->HasMtp() || mixed_kv_only > 0,
           "batch test never mixed two KV-only catch-ups with proposals");
   std::cout << "batch mixed_kv_only_cohorts=" << mixed_kv_only << '\n'
