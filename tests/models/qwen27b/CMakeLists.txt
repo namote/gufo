@@ -105,7 +105,8 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/cli/serve/component_text_cache.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/text_model_runner.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/text_generation_scheduler.cpp
-    ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp)
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/persistence_identity.cpp)
   target_link_libraries(qwen_serving_test_support PUBLIC gufo_logging gufo_model_artifact
     gufo_core gufo_kv_cache_type gufo_deepseek_v4_flash gufo_qwen38_flash_next gufo_cache_hip hip::host)
   add_executable(inference_backend_gpu_test serving_test.cpp)

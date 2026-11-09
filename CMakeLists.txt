@@ -302,6 +302,7 @@ add_subdirectory(src/core/platform)
 add_library(gufo_core STATIC
   src/core/image.cpp
   src/core/crypto/sha256.cpp
+  src/core/device_code_identity.cpp
   src/core/gguf_reader.cpp
   src/core/gguf_identity.cpp
   src/core/json_constraint.cpp
@@ -444,6 +445,7 @@ add_executable(gufo
   src/cli/serve/text_model_runner.cpp
   src/cli/serve/text_generation_scheduler.cpp
   src/cli/serve/inference_backend.cpp
+  src/cli/serve/persistence_identity.cpp
   src/eval/http_client.cpp
 )
 target_link_libraries(gufo PRIVATE gufo_cache gufo_diagnostics gufo_core gufo_llm_cli gufo_http CURL::libcurl)
@@ -816,6 +818,13 @@ if (BUILD_TESTING)
   target_link_libraries(component_text_cache_test PRIVATE gufo_cache_fake gufo_core gufo_logging)
   add_test(NAME component_text_cache_test COMMAND component_text_cache_test)
   set_tests_properties(component_text_cache_test PROPERTIES LABELS "cpu;server;cache;state;lifecycle")
+
+  add_executable(persistence_identity_test
+    tests/cli/persistence_identity_test.cpp
+    src/cli/serve/persistence_identity.cpp)
+  target_link_libraries(persistence_identity_test PRIVATE gufo_core)
+  add_test(NAME persistence_identity_test COMMAND persistence_identity_test)
+  set_tests_properties(persistence_identity_test PROPERTIES LABELS "cpu;server;cache")
 
   add_executable(row_block_admission_test tests/cli/row_block_admission_test.cpp)
   target_include_directories(row_block_admission_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
+#include <filesystem>
 #include <optional>
 #include <span>
 #include <string>
@@ -88,6 +89,11 @@ PageFaults ReadPageFaults() noexcept;
 
 /// Fills `out` with OS-provided cryptographically random bytes.
 bool FillRandomBytes(std::span<std::uint8_t> out) noexcept;
+
+/// A path that opens the running executable's image: /proc/self/exe on
+/// Linux (it stays the running image even after the file is replaced),
+/// GetModuleFileNameW on Windows. Returns nullopt when the OS cannot say.
+std::optional<std::filesystem::path> RunningExecutablePath();
 
 }  // namespace gufo::platform
 

@@ -24,9 +24,11 @@
 #include "src/cli/model_artifact.hpp"
 #include "src/cli/serve/component_text_cache.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/persistence_identity.hpp"
 #include "src/cli/serve/request_memory_budget.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
+#include "src/core/device_code_identity.hpp"
 #include "src/core/gguf_identity.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/json.hpp"
@@ -255,13 +257,6 @@ bool DiskCacheEnabled(const TextDiskCacheConfig& config) noexcept {
   return !config.directory.empty();
 }
 
-bool IsSha256Hex(std::string_view value) noexcept {
-  return value.size() == 64 && std::ranges::all_of(value, [](char character) {
-           return (character >= '0' && character <= '9') ||
-                  (character >= 'a' && character <= 'f');
-         });
-}
-
 std::vector<std::uint8_t> DeepSeekCompatibilityIdentity(
     std::string_view artifact_fingerprint, std::string_view support_fingerprint,
     std::uint32_t max_context, std::uint32_t max_draft_tokens) {
@@ -291,47 +286,6 @@ std::vector<std::uint8_t> DeepSeekCompatibilityIdentity(
            << support_fingerprint << '\n'
            << "max_draft_tokens=" << max_draft_tokens << '\n'
            << "draft_policy=dspark-cost-v5-window128\n";
-  const std::string canonical = identity.str();
-  return {canonical.begin(), canonical.end()};
-}
-
-std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
-    std::string_view artifact_fingerprint, std::string_view mtp_fingerprint,
-    bool has_mtp, std::uint32_t max_context, std::uint32_t max_draft_tokens,
-    std::uint32_t decode_concurrency, std::string_view position_policy,
-    bool native) {
-  if (!IsSha256Hex(artifact_fingerprint)) {
-    throw std::invalid_argument(
-        "Qwen3.8-Flash-Next disk cache requires an artifact fingerprint");
-  }
-  if (has_mtp && !IsSha256Hex(mtp_fingerprint)) {
-    throw std::invalid_argument(
-        "Qwen3.8-Flash-Next MTP disk cache requires a draft artifact "
-        "fingerprint");
-  }
-  const auto scheme =
-      native ? core::kNativeIdentityScheme : core::kGgufIdentityScheme;
-  std::ostringstream identity;
-  identity << "schema=gufo-text-continuation-v2\n"
-           << "model_kind=qwen38-flash-next\n"
-           << "artifact_id=" << scheme << ':' << artifact_fingerprint << '\n'
-           << "tokenizer=embedded-in-artifact\n"
-           << "chat_template=qwen38-reasoning-compiled-v3\n"
-           << "chat_template_reference_sha256="
-           << tokenization::QwenChatTemplate::OfficialTemplateSha256() << '\n'
-           << "state_abi=qwen38-flash-next-rocm-session-v1\n"
-           << "payload_layout=qfn-rocm-session-snapshot-v"
-           << models::qwen38_flash_next::Session::kSnapshotPayloadVersion
-           << '\n'
-           << "context_tokens=" << max_context << '\n'
-           << "position_policy=" << position_policy << '\n'
-           << "adapters=none\n";
-  if (has_mtp) {
-    identity << "draft_backend=qfn-mtp-v1\n"
-             << "draft_artifact_id=" << scheme << ':' << mtp_fingerprint << '\n'
-             << "draft_max_tokens=" << max_draft_tokens << '\n'
-             << "draft_cost_concurrency=" << decode_concurrency << '\n';
-  }
   const std::string canonical = identity.str();
   return {canonical.begin(), canonical.end()};
 }
@@ -2627,6 +2581,17 @@ public:
     // lifetime is an exact process-local identity; durable caches still
     // require the validated full artifact fingerprints below.
     if (!artifact_fingerprint.empty()) {
+      // Flash-Next always embeds device code: an empty hash means it could
+      // not be read, and disk states of other kernel builds would match.
+      const auto& device_code = core::ExecutableDeviceCodeSha256();
+      if (device_code.empty())
+        Logger::Warn("cache",
+                     "event=device_code_identity status=unknown reason="
+                     "unreadable_executable: disk checkpoints are not tied to "
+                     "this build's kernels");
+      else
+        Logger::Info("cache",
+                     "event=device_code_identity sha256=" + device_code);
       persistence_ = TextRunnerPersistenceDescriptor{
           .compatibility_identity = QwenFlashNextCompatibilityIdentity(
               artifact_fingerprint, use_mtp_ ? mtp_fingerprint : std::string{},
@@ -2634,7 +2599,9 @@ public:
               model_->DecodeConcurrency(),
               models::qwen38_flash_next::RopePositionPolicy(
                   model_->config().rope_scaling),
-              model_->IsNativeExl3()),
+              model_->IsNativeExl3(),
+              models::qwen38_flash_next::Session::kSnapshotPayloadVersion,
+              device_code),
           .payload_version =
               models::qwen38_flash_next::Session::kSnapshotPayloadVersion,
       };

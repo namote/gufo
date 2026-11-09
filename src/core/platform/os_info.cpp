@@ -223,4 +223,29 @@ bool FillRandomBytes(std::span<std::uint8_t> out) noexcept {
 #endif
 }
 
+std::optional<std::filesystem::path> RunningExecutablePath() {
+#if defined(_WIN32)
+  std::wstring path(MAX_PATH, L'\0');
+  for (;;) {
+    const DWORD length = GetModuleFileNameW(nullptr, path.data(),
+                                            static_cast<DWORD>(path.size()));
+    if (length == 0)
+      return std::nullopt;
+    if (length < path.size()) {
+      path.resize(length);
+      return std::filesystem::path(path);
+    }
+    if (path.size() >= 32768)
+      return std::nullopt;
+    path.resize(path.size() * 2);
+  }
+#else
+  std::error_code error;
+  const std::filesystem::path path("/proc/self/exe");
+  if (!std::filesystem::exists(path, error) || error)
+    return std::nullopt;
+  return path;
+#endif
+}
+
 }  // namespace gufo::platform
