@@ -2576,6 +2576,36 @@ void RefusedCaptureIsKnownBeforePrefill() {
   runner->adapter->Append(small_state.slot, head, head);
   assert(!small->CaptureRefused(prompt.size()));
   small->Invalidate();
+  // A state that refuses the in-pass prediction (Flash-Next shared KV pool,
+  // KVarN or image sessions) is bounded by its frontier the same way.
+  runner->adapter->SetCheckpointPrediction(true);
+  runner->adapter->SetCheckpointPredictionRefused(true);
+  auto refused = cache.Acquire(prompt, {}, {}, true, 0, true);
+  auto& refused_state = dynamic_cast<State&>(refused->state());
+  runner->adapter->Append(refused_state.slot, body, body);
+  assert(refused->CaptureRefused(prompt.size()));
+  refused->Invalidate();
+  // The frontier bounds only boundaries past the reused prefix: one at or
+  // before it is not known refused, even past an over-budget frontier.
+  auto seed = cache.Acquire(prompt, {}, {}, true, 0, true);
+  auto& seed_state = dynamic_cast<State&>(seed->state());
+  runner->adapter->Append(seed_state.slot, head, head);
+  (void)seed->Commit({}, {}, {head.begin(), head.end()});
+  auto warm = cache.Acquire(prompt, {}, {}, true, 0, true);
+  assert(warm->cached_tokens() == head.size());
+  auto& warm_state = dynamic_cast<State&>(warm->state());
+  const auto rest =
+      std::span(prompt).subspan(head.size(), body.size() - head.size());
+  runner->adapter->Append(warm_state.slot, rest, rest);
+  assert(warm->CaptureRefused(prompt.size()));
+  assert(!warm->CaptureRefused(head.size() - 4));
+  warm->Invalidate();
+  auto fits = cache.Acquire(prompt, {}, {}, true, 0, true);
+  auto& fits_state = dynamic_cast<State&>(fits->state());
+  runner->adapter->Append(fits_state.slot, head, head);
+  assert(!fits->CaptureRefused(prompt.size()));
+  fits->Invalidate();
+  runner->adapter->SetCheckpointPredictionRefused(false);
 }
 void WriteBackReusesPersistedChunks() {
   // The prompt boundary goes to disk from a RAM checkpoint; the write-back of

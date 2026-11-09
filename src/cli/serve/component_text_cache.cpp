@@ -2162,9 +2162,22 @@ bool ComponentTextCache::Lease::CaptureRefused(std::size_t boundary) const {
   try {
     const auto& adapter = *cache.resources->adapter;
     const auto& slot = impl_->slot.Execution();
-    auto positions = adapter.PrefillCheckpointPositions(slot, boundary);
-    // An adapter without an in-pass prediction: the frontier the boundary
-    // lies past is a lower bound of the capture.
+    std::vector<cache::ComponentPosition> positions;
+    try {
+      positions = adapter.PrefillCheckpointPositions(slot, boundary);
+    } catch (const std::invalid_argument&) {
+      // No in-pass prediction for this boundary (Flash-Next shared KV pool,
+      // KVarN or image sessions; also a boundary past the context, which is
+      // never captured): the capture would follow a split pass. Fall back to
+      // the frontier below, which bounds it only while the boundary lies past
+      // the reused prefix (callers ask before prefill). For rows retained as
+      // device references only the partial tail chunk counts, so the frontier
+      // may exceed the boundary's cost by less than one chunk per component.
+      if (boundary <= impl_->cached)
+        return false;
+    }
+    // Without an in-pass prediction, the frontier the boundary lies past is a
+    // lower bound of the capture.
     if (positions.empty())
       positions = adapter.Positions(slot);
     bytes = cache.RamPayloadBytes(*impl_->entry->history, positions);
