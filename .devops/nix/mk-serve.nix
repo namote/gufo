@@ -54,7 +54,7 @@
   preserveThinking ? null, # "on", "off", "auto"
   cacheDisk ? null,
   cacheDiskBytes ? null,
-  cacheDiskStagingBytes ? null,
+  cacheDiskStagingBytes ? null, # DeepSeek only; Qwen27B and Flash-Next reject it
   speculative ? null, # "dspark", "dflash2", "mtp", "off"
   dflashModel ? null,
   dsparkModel ? null,

@@ -41,7 +41,6 @@ SESSIONS = 2
 # 7,028,736 bytes/block. Two 256K contexts with one guard each use 2,050 blocks.
 KV_POOL_BYTES = 14_408_908_800
 DISK_CACHE_BYTES = 50 * 2**30
-DISK_STAGING_BYTES = 256 * 2**20
 CACHE_ROOT = ROOT / 'cache-c03'
 
 # Keep an idle admission reserve of 80 GiB; active KV/state uses more RAM.
@@ -119,7 +118,6 @@ def build_command(state):
                 '--kv-cache-type', 'fp16',
                 '--kv-pool-bytes', str(KV_POOL_BYTES), '--cache-ram-bytes', str(RAM_CACHE_BYTES),
                 '--cache-disk', '/cache/continuations', '--cache-disk-bytes', str(DISK_CACHE_BYTES),
-                '--cache-disk-staging-bytes', str(DISK_STAGING_BYTES),
                 '--temperature', str(TEMPERATURE), '--top-k', '20', '--top-p', '0.95', '--min-p', '0',
                 '--repeat-penalty', '1',
                 '--presence-penalty', '0', '--frequency-penalty', '0', '--max-tokens', '-1',

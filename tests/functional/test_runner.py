@@ -1899,6 +1899,8 @@ sys.exit({exit_code})
                 self.assertEqual(report["suites"]["cache-persist"]["status"],
                                  "passed" if not exit_code and spacing_exact else "failed")
                 self.assertIn("--cache-disk", report["command"])
+                # Flash-Next and Qwen27B reject the legacy staging option.
+                self.assertNotIn("--cache-disk-staging-bytes", report["command"])
                 self.assertFalse((root / "report/disk").exists())
                 self.assertTrue((root / "report/text-cancel.json").is_file())
 

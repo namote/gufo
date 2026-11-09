@@ -563,11 +563,11 @@ unchanged retries expect full reuse.
 
 Repeat `--suite` to select affected tests; `--suite all` explicitly runs all. For long
 contexts, use server `--context 32768`; actual prompt depth is recorded. `cache`
-uses its own 8 GiB disk budget and 1 GiB staging area inside the output directory;
-the runner removes that disk cache when the run ends, keeping reports and logs.
-Flash-Next allocates that staging as pinned host memory at startup, beyond its
-RAM budget, although its default 1 MiB transfer buffer suffices. The runner
-keeps 1 GiB so results stay comparable with retained runs and other models.
+uses its own 8 GiB disk budget inside the output directory; the runner removes
+that disk cache when the run ends, keeping reports and logs. With
+`--sampling-preset deepseek4` it also passes a 1 GiB
+`--cache-disk-staging-bytes`. Flash-Next and Qwen27B reject that option and
+stream through their internal 1 MiB buffer, so qwen38 runs omit it.
 For timing controls on revisions predating progress, use `--allow-missing-progress`
 with `--record-baseline`. Candidate qualification always requires progress events.
 Model runs stay outside hosted CI; CI checks the runner and measurement logic.
@@ -796,9 +796,12 @@ not evidence. `--publication-timeout 300` allows the large checkpoint to finish
 before the deliberate crash without changing request timing gates. The
 oversized case waits for the deep publication before graceful shutdown and
 still uses 1 MiB staging. Keep the same explicit RAM limit in both modes.
-Use `--staging-bytes` to match the staging budget of a reported restart,
-tiered or crash workload (default: 2 GiB). This value is recorded in the
-report; the oversized case always keeps its 1 MiB staging allocation.
+`--model-kind` (default `flash-next`; also `qwen27b`, `deepseek`) selects the
+staging rule. Flash-Next and Qwen27B reject `--cache-disk-staging-bytes`, so the
+runner omits it and every case uses their internal 1 MiB transfer buffer.
+For `deepseek`, use `--staging-bytes` to match the staging budget of a reported
+restart, tiered or crash workload (default: 2 GiB). This value is recorded in
+the report; the oversized case always keeps its 1 MiB staging allocation.
 For checkpoints larger than committed RAM, use `--require-over-ram` with
 `--case oversized` or `--case side-traffic`. For example, Flash-Next at context 262144 with
 `--seed-lines 12500 --minimum-published-tokens 174000` and

@@ -35,9 +35,11 @@ def main():
     if len(command) < 3 or command[1] != "serve" or "llm" not in command:
         parser.error("pass a production gufo serve llm command after --")
     for flag in ("--host", "--port", "--api-key", "--cache-disk",
-                 "--cache-disk-bytes", "--cache-disk-staging-bytes"):
+                 "--cache-disk-bytes"):
         if option(command, flag) is not None:
             parser.error(f"the runner owns {flag}; omit it")
+    if option(command, "--cache-disk-staging-bytes") is not None:
+        parser.error(f"{args.model_kind} rejects --cache-disk-staging-bytes; omit it")
     mode = option(command, "--speculative", "off")
     modes = ("off", "mtp") if args.model_kind == "flash-next" else ("off", "dflash2")
     if mode not in modes:

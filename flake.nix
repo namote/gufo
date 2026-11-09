@@ -574,13 +574,14 @@
                 preserveThinking = "auto";
                 cacheDisk = "/var/cache/gufo";
                 cacheDiskBytes = 1024;
-                cacheDiskStagingBytes = 512;
               };
               dsparkCmd = mkServe {
                 model = "/var/models/ds4.gguf";
                 speculative = "dspark";
                 dsparkModel = "/var/models/dspark.gguf";
                 draftTokens = 3;
+                # Only DeepSeek's legacy disk store takes a staging budget.
+                cacheDiskStagingBytes = 512;
               };
               mtpCmd = mkServe {
                 model = "/var/models/qwen-flash.gguf";
@@ -623,7 +624,6 @@
               echo "$cmd_str" | grep -F -- "--preserve-thinking auto"
               echo "$cmd_str" | grep -F -- "--cache-disk /var/cache/gufo"
               echo "$cmd_str" | grep -F -- "--cache-disk-bytes 1024"
-              echo "$cmd_str" | grep -F -- "--cache-disk-staging-bytes 512"
 
               tts_str="${ttsCmd}"
               echo "$tts_str" | grep -F -- "--port 9100 tts"
@@ -644,6 +644,7 @@
               echo "$dspark_cmd" | grep -F -- "--speculative dspark"
               echo "$dspark_cmd" | grep -F -- "--dspark-model /var/models/dspark.gguf"
               echo "$dspark_cmd" | grep -F -- "--draft-tokens 3"
+              echo "$dspark_cmd" | grep -F -- "--cache-disk-staging-bytes 512"
               if echo "$dspark_cmd" | grep -E -- '--mtp-model|--draft-policy'; then
                 exit 1
               fi

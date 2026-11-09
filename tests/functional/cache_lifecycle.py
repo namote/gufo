@@ -24,6 +24,9 @@ from run import execution_coverage, option, provenance, server, write_json
 CASES = ("restart", "tiered", "oversized", "crash", "side-traffic")
 DISK_BYTES = 8 * 1024**3
 STAGING_BYTES = 2 * 1024**3
+# Flash-Next and Qwen27B reject --cache-disk-staging-bytes and stream every
+# checkpoint through this internal pinned buffer.
+COMPONENT_STAGING_BYTES = 1024**2
 
 
 def published_tokens(log):
@@ -45,7 +48,7 @@ def wait_until(predicate, description, timeout=30):
 class Lifecycle:
     def __init__(self, command, output, timeout, library, seed_lines=160,
                  minimum_published_tokens=0, publication_timeout=30,
-                 require_over_ram=False, staging_bytes=STAGING_BYTES):
+                 require_over_ram=False, staging_bytes=None):
         self.command, self.output, self.timeout, self.library = command, output, timeout, library
         self.seed_lines = seed_lines
         self.minimum_published_tokens = minimum_published_tokens
@@ -61,6 +64,7 @@ class Lifecycle:
                        "publication_timeout": publication_timeout,
                        "require_over_ram": require_over_ram,
                        "staging_bytes": staging_bytes,
+                       "legacy_staging": staging_bytes is not None,
                        "status": "running", "cases": {}}
         source = hashlib.sha256()
         source.update(self.report["harness_sha256"].encode())
@@ -72,13 +76,16 @@ class Lifecycle:
 
     @contextmanager
     def stage(self, name, staging=None, environment=None):
-        if staging is None:
-            staging = self.staging_bytes
         self.stage_path = self.output / self.case / name
         self.stage_path.mkdir()
         command = [*self.command, "--host", "127.0.0.1", "--port", str(self.port),
-                   "--cache-disk", str(self.disk), "--cache-disk-bytes", str(DISK_BYTES),
-                   "--cache-disk-staging-bytes", str(staging)]
+                   "--cache-disk", str(self.disk), "--cache-disk-bytes", str(DISK_BYTES)]
+        if self.staging_bytes is None:
+            staging = COMPONENT_STAGING_BYTES
+        else:
+            if staging is None:
+                staging = self.staging_bytes
+            command += ["--cache-disk-staging-bytes", str(staging)]
         continuation.TRACE = Recorder(self.stage_path / "requests.requests.json")
         record = {"command": command, "status": "running", "staging_bytes": staging}
         self.row["stages"][name] = record
@@ -314,12 +321,22 @@ def main():
                         help="Seconds to await publication before a deliberate crash")
     parser.add_argument("--require-over-ram", action="store_true",
                         help="Require oversized/side-traffic publication to exceed actual committed RAM backing")
-    parser.add_argument("--staging-bytes", type=int, default=STAGING_BYTES,
-                        help="Staging budget for restart, tiered and crash (oversized always uses 1 MiB)")
+    parser.add_argument("--model-kind", choices=("flash-next", "qwen27b", "deepseek"),
+                        default="flash-next",
+                        help="flash-next and qwen27b use the component cache's fixed 1 MiB "
+                             "transfer buffer; deepseek uses the legacy staging budget")
+    parser.add_argument("--staging-bytes", type=int,
+                        help="deepseek only: staging budget for restart, tiered and crash "
+                             f"(default: {STAGING_BYTES}; oversized always uses 1 MiB)")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if args.model_kind != "deepseek" and args.staging_bytes is not None:
+        parser.error(f"{args.model_kind} rejects --cache-disk-staging-bytes; omit --staging-bytes")
+    if args.model_kind == "deepseek" and args.staging_bytes is None:
+        args.staging_bytes = STAGING_BYTES
     if args.seed_lines <= 0 or args.minimum_published_tokens < 0 \
-            or args.publication_timeout <= 0 or args.staging_bytes <= 0:
+            or args.publication_timeout <= 0 \
+            or (args.staging_bytes is not None and args.staging_bytes <= 0):
         parser.error("seed lines, publication timeout and staging bytes must be positive; "
                      "depth must be nonnegative")
     if args.require_over_ram and args.case and not set(args.case) & {"oversized", "side-traffic"}:

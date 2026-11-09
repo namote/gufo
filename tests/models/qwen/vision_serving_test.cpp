@@ -549,7 +549,6 @@ int main(int argc, char** argv) {
     server::TextDiskCacheConfig cache{
         .directory = cache_root.path(),
         .capacity_bytes = std::size_t{2} << 30,
-        .staging_capacity_bytes = std::size_t{512} << 20,
         .model_artifact_fingerprint = core::GgufIdentityHex(*reader)};
     if (!draft.empty()) {
       auto draft_reader = core::GgufReader::OpenFile(draft, &error);

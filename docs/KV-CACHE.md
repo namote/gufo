@@ -377,7 +377,7 @@ captured; RAM-retained snapshots and their captures in progress share the RAM bu
 | Retained snapshot bytes, RAM | smaller of 32 GiB and half the available host RAM; an explicit value up to the available host RAM minus 4 GiB; 27B also checks HIP free memory | `--cache-ram-bytes` |
 | RAM checkpoint records | 128, independent of `--sessions` | internal safety limit |
 | Disk bytes | 8 GiB | `--cache-disk-bytes` |
-| Disk staging bytes | smaller of `MemAvailable / 8` and the disk budget | `--cache-disk-staging-bytes` |
+| Disk staging bytes (DeepSeek; Qwen27B and Flash-Next reject the option) | smaller of `MemAvailable / 8` and the disk budget | `--cache-disk-staging-bytes` |
 | Paged KV pool bytes, device (Qwen27B, FP16 attention KV) | every session's full context | `--kv-pool-bytes` |
 | Tail checkpoints per long prompt | 3, where checkpoints keep KV as pool blocks | `--cache-tail-checkpoints` |
 
@@ -463,8 +463,9 @@ conversations:
 - Run fewer `--sessions`: each Flash-Next session at 262144 context holds about
   6.3 GB of state that the cache can use instead.
 - Add `--cache-disk` so checkpoints that leave RAM can still be restored from
-  disk. The other models also need `--cache-disk-staging-bytes` above the
-  snapshot size; Flash-Next streams any size through its default buffer.
+  disk. DeepSeek also needs `--cache-disk-staging-bytes` above the
+  snapshot size; Qwen27B and Flash-Next stream any size through their
+  internal buffer and reject the option.
 
 See #343.
 
@@ -485,7 +486,7 @@ Qwen27B and Flash-Next use the same options with these meanings:
 | --- | --- |
 | `--cache-ram-bytes` | The automatic and explicit sizing above, as a cap. Pinned 64 KiB pages for up to about 89% of it are committed as captures need them, in equal steps of about 1 GiB, and stay committed; the rest is reserved for cache metadata, which grows with use. The pages hold checkpoint state, KV rows, partial tails and idle-session spill. There is no separate spill budget. |
 | `--cache-disk-bytes` | Counts referenced, temporary and orphaned files. A lower budget at startup removes temporaries and orphans, then the oldest checkpoints by creation order: use history does not survive a restart. |
-| `--cache-disk-staging-bytes` | Ignored, with an `event=option_ignored` warning. Disk transfers use an internal 1 MiB pinned buffer; checkpoints of any size stream through it. Its size did not change restore or write speed (#562), and a larger value only took pinned RAM and device heap. Earlier advice to raise staging no longer applies. |
+| `--cache-disk-staging-bytes` | Rejected: startup fails before any weights load. Disk transfers use an internal 1 MiB pinned buffer; checkpoints of any size stream through it. Its size did not change restore or write speed (#562), and a larger value only took pinned RAM and device heap. Earlier advice to raise staging no longer applies. |
 | `--cache-disk DIR` | Owned by one Qwen27B or Flash-Next server. A second one fails at startup, before committing its RAM budget, with an ownership error naming the directory. Other models do not take this lock. Startup removes earlier-release `*.kvc` and `.tmp-*` files from the directory, including those of another model's server sharing it. |
 
 The 128-record limit stays internal. The following measured sizes and timings
@@ -640,7 +641,6 @@ a top-level `cache_persist`; see [the server guide](SERVER.md).
 | `schema=component-cache-v1 event=backing_grown` | Flash-Next: a capture committed another segment of cache pages (about 1 GiB); reports `committed_bytes`, `segments` and the capture's `acquire_ms` |
 | `schema=component-cache-v1 event=backing_limited reason=host_reserve` | Flash-Next: the cache stopped growing below its budget because the host would keep less than 4 GiB available |
 | `schema=component-cache-v1 event=backing_limited reason=device_heap_reserve` | Flash-Next: the cache stopped growing because its pinned pages would leave the device heap less than its 4 GiB dispatch reserve, which would push session and scratch allocations onto managed memory (#460) |
-| `schema=component-cache-v1 event=option_ignored option=--cache-disk-staging-bytes` | Flash-Next: the staging option is ignored; disk transfers use the internal buffer |
 | `schema=component-cache-v1 event=disk_evicted reason=budget` | Flash-Next: startup removed the oldest checkpoints (creation order) to fit a lowered `--cache-disk-bytes` |
 | `schema=component-cache-v1 event=disk_over_budget` | Flash-Next: the directory still exceeds `--cache-disk-bytes` after startup reclamation and eviction; publication is refused until it fits |
 | `schema=component-cache-v1 event=published` | A checkpoint finished disk publication; `checkpoint_id` identifies the capture and `tokens` its boundary |

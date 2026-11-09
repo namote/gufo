@@ -17,6 +17,7 @@ from cache_growth import check_messages_growth, check_unchanged_retry
 from cache_workloads import Workload, check_cache_transforms, check_cache_pressure
 from cache_messages_loop import check_cache_messages_loop, chat_messages
 from cache_lifecycle import Lifecycle, published_tokens
+from run import option
 
 
 def reply(total, cached, code="ALPHA", tools=None):
@@ -280,6 +281,33 @@ class CacheWorkloadsTest(unittest.TestCase):
                 else:
                     with self.assertRaises(AssertionError):
                         check_unchanged_retry("failed", retry, 7, log, 0, log.stat().st_size)
+
+    def test_lifecycle_passes_staging_only_to_the_legacy_store(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # An explicit stage value (oversized's 1 MiB) reaches only the legacy store.
+            for staging, passed in ((None, False), (4096, True)):
+                output = root / str(staging)
+                (output / "case").mkdir(parents=True)
+                with patch("cache_lifecycle.provenance", return_value={"harness_sha256": "fixture"}):
+                    runner = Lifecycle(["gufo", "serve", "llm", "--speculative", "off"],
+                                       output, 1, root / "library.so", staging_bytes=staging)
+                runner.case, runner.port, runner.disk = "case", 1, root / "disk"
+                runner.row = {"stages": {}}
+                commands = []
+
+                def server(command, log, timeout, environment):
+                    commands.append(command)
+                    return contextlib.nullcontext()
+
+                with patch("cache_lifecycle.server", side_effect=server), \
+                        patch("cache_lifecycle.join_server_timings"), \
+                        patch("cache_lifecycle.execution_coverage", return_value={}):
+                    with runner.stage("initial", 1024**2 if staging else None):
+                        pass
+                self.assertEqual(option(commands[0], "--cache-disk-staging-bytes"),
+                                 "1048576" if passed else None)
+                self.assertEqual(runner.row["stages"]["initial"]["staging_bytes"], 1024**2)
 
     def test_lifecycle_removes_its_disk_after_a_failed_stage(self):
         with tempfile.TemporaryDirectory() as directory:

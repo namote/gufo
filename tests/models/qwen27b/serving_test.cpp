@@ -1104,7 +1104,6 @@ int main(int argc, const char* const* argv) {
       const gufo::server::TextDiskCacheConfig disk_cache{
           .directory = cache_directory.path(),
           .capacity_bytes = 1024ULL * 1024ULL * 1024ULL,
-          .staging_capacity_bytes = 512ULL * 1024ULL * 1024ULL,
           .model_artifact_fingerprint = std::string(64, 'a'),
           .draft_model_artifact_fingerprint = {},
       };

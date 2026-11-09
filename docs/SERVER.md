@@ -319,11 +319,13 @@ The first start on a directory written by an earlier release removes its old
 checkpoint files (`*.kvc`), and the cache refills as conversations run. Do not
 share a directory with another model server; the component cache removes
 their checkpoint and temporary files too, including writes in progress.
-Qwen27B and Flash-Next ignore `--cache-disk-staging-bytes` and logs
-`event=option_ignored`. Writes and restores stream each checkpoint through an
-internal 1 MiB pinned buffer, piece by piece; a larger buffer did not change
-restore or write speed and took pinned RAM and device heap from the cache and
-the sessions. Remove the option from Qwen27B and Flash-Next command lines.
+Qwen27B and Flash-Next reject `--cache-disk-staging-bytes`, with or without
+`--cache-disk`: startup fails with an error naming the option, before any
+weights load. Writes and restores
+stream each checkpoint through an internal 1 MiB pinned buffer, piece by piece;
+a larger buffer did not change restore or write speed and took pinned RAM and
+device heap from the cache and the sessions. Remove the option from Qwen27B and
+Flash-Next command lines.
 
 For DeepSeek, `--cache-disk-staging-bytes 0` (the default) selects the
 smaller of one eighth of available host RAM after model/session loading

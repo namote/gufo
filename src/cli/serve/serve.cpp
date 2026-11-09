@@ -748,10 +748,10 @@ void PrintServeHelp(std::string_view program_name,
                      "Cache", &cache_disk_bytes);
     parser.AddOption(
         "", "--cache-disk-staging-bytes", "N",
-        "Flash-Next: pinned disk transfer buffer allocated at startup within "
-        "the RAM ceiling, not a checkpoint size limit (default: 0 = 1 MiB). "
-        "Other models: RAM limit for queued snapshots and each disk read "
-        "(default: 0 = auto, at most the disk budget and 1/8 available RAM)",
+        "DeepSeek: RAM limit for queued snapshots and each disk read "
+        "(default: 0 = auto, at most the disk budget and 1/8 available RAM). "
+        "Qwen27B and Flash-Next reject it: their disk transfers use an "
+        "internal 1 MiB buffer",
         "Cache", &cache_disk_staging_bytes);
     parser.AddFlag("", "--log-progress",
                    "Log live prefill and decode progress (needs "
@@ -1393,10 +1393,10 @@ int RunServe(std::span<const char* const> args) {
                          "Cache", &cache_disk_bytes);
     llm_parser.AddOption(
         "", "--cache-disk-staging-bytes", "N",
-        "Flash-Next: pinned disk transfer buffer allocated at startup within "
-        "the RAM ceiling, not a checkpoint size limit (default: 0 = 1 MiB). "
-        "Other models: RAM limit for queued snapshots and each disk read "
-        "(default: 0 = auto, at most the disk budget and 1/8 available RAM)",
+        "DeepSeek: RAM limit for queued snapshots and each disk read "
+        "(default: 0 = auto, at most the disk budget and 1/8 available RAM). "
+        "Qwen27B and Flash-Next reject it: their disk transfers use an "
+        "internal 1 MiB buffer",
         "Cache", &cache_disk_staging_bytes);
     llm_parser.AddFlag("", "--log-progress",
                        "Log live prefill and decode progress (needs "

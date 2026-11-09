@@ -350,8 +350,11 @@ def main():
             command += [flag, default]
     if disk_enabled:
         command += ["--cache-disk", str(output / "disk"),
-                    "--cache-disk-bytes", str(8 * 1024**3),
-                    "--cache-disk-staging-bytes", str(1024**3)]
+                    "--cache-disk-bytes", str(8 * 1024**3)]
+        # Flash-Next and Qwen27B reject the staging option; only the legacy
+        # continuation disk store (DeepSeek) takes it.
+        if args.sampling_preset == "deepseek4":
+            command += ["--cache-disk-staging-bytes", str(1024**3)]
     model = option(command, "--served-model-name")
     vision = option(command, "--mmproj") is not None
     speculative = option(command, "--speculative",

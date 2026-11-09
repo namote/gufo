@@ -355,12 +355,8 @@ struct ComponentTextCache::Impl {
                                "-byte cache row exceeds the disk staging "
                                "buffer");
       if (options->staging_capacity_bytes)
-        Logger::Warn("cache",
-                     "schema=component-cache-v1 event=option_ignored "
-                     "option=--cache-disk-staging-bytes requested_bytes=" +
-                         std::to_string(options->staging_capacity_bytes) +
-                         " staging_capacity_bytes=" +
-                         std::to_string(ledger.Limits().staging_bytes));
+        throw std::invalid_argument(
+            std::string(kComponentCacheRejectsDiskStaging));
       // Take directory ownership before slots and backing commit, so a
       // second server fails without claiming its RAM budget first.
       disk = std::make_unique<cache::DiskStore>(ledger, options->directory,

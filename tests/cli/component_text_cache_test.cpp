@@ -1228,8 +1228,7 @@ void RestartAndCorruption() {
   const TemporaryDirectory temp("gufo-component-serving-test");
   const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
-                                        .capacity_bytes = 1 << 20,
-                                        .staging_capacity_bytes = 7};
+                                        .capacity_bytes = 1 << 20};
   const std::vector<TextRunnerToken> prompt{10, 11, 12, 13, 14, 15, 16, 17, 18};
   TextRunnerToken token;
   {
@@ -1456,8 +1455,7 @@ void DiskBudgetEvictsAnUnpinnedConversation() {
   const TemporaryDirectory temp("gufo-component-budget-test");
   const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
-                                        .capacity_bytes = 1024,
-                                        .staging_capacity_bytes = 7};
+                                        .capacity_bytes = 1024};
   const std::vector<TextRunnerToken> first{10, 11, 12, 13, 14, 15, 16, 17, 18};
   auto second = first;
   second.front() = 999;
@@ -1540,8 +1538,7 @@ void UnpersistedRequestStaysOffDisk() {
 void UnpersistedLiveFrontierStaysOffDisk() {
   const TemporaryDirectory temp("gufo-component-unpersisted-live-test");
   const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
-                                        .capacity_bytes = 1 << 22,
-                                        .staging_capacity_bytes = 7};
+                                        .capacity_bytes = 1 << 22};
   std::vector<TextRunnerToken> conversation(100);
   std::iota(conversation.begin(), conversation.end(), 10);
   {
@@ -1601,8 +1598,7 @@ void LoweredDiskBudgetEvictsOldestAtStartup() {
   const TemporaryDirectory temp("gufo-component-lowered-budget-test");
   const std::filesystem::path directory = temp.path();
   TextRunnerDiskCacheOptions disk{.directory = directory.string(),
-                                  .capacity_bytes = 1 << 20,
-                                  .staging_capacity_bytes = 7};
+                                  .capacity_bytes = 1 << 20};
   const std::vector<TextRunnerToken> first{10, 11, 12, 13, 14, 15, 16, 17, 18};
   auto second = first;
   second.front() = 999;
@@ -1634,8 +1630,7 @@ void OrphansLeaveBeforeCheckpoints() {
   const TemporaryDirectory temp("gufo-component-orphan-test");
   const std::filesystem::path directory = temp.path();
   TextRunnerDiskCacheOptions disk{.directory = directory.string(),
-                                  .capacity_bytes = 1 << 20,
-                                  .staging_capacity_bytes = 7};
+                                  .capacity_bytes = 1 << 20};
   const std::vector<TextRunnerToken> first{10, 11, 12, 13, 14, 15, 16, 17, 18};
   auto second = first;
   second.front() = 999;
@@ -1666,11 +1661,10 @@ void OrphansLeaveBeforeCheckpoints() {
 void StagingIsInternal() {
   const TemporaryDirectory temp("gufo-component-staging-test");
   const std::filesystem::path directory = temp.path();
-  // The legacy option is ignored: even a value below one four-byte row
-  // still writes and restores through the internal staging buffer.
+  // Without the legacy option (rejected here), disk writes and restores
+  // stream through the internal staging buffer.
   TextRunnerDiskCacheOptions disk{.directory = directory.string(),
-                                  .capacity_bytes = 1 << 20,
-                                  .staging_capacity_bytes = 3};
+                                  .capacity_bytes = 1 << 20};
   const std::vector<TextRunnerToken> prompt{10, 11, 12, 13, 14, 15, 16, 17, 18};
   {
     TextRunnerPool pool(std::make_shared<Runner>(), 1, disk);
@@ -1709,14 +1703,27 @@ void StagingCountsAgainstRamCeiling() {
   const TemporaryDirectory temp("gufo-component-ceiling-test");
   const std::filesystem::path directory = temp.path();
   // Pinned staging and RAM share the ceiling: an explicit 4 MiB beside the
-  // internal 1 MiB of staging commits 3 MiB, whatever the ignored option says.
-  for (const std::size_t option : {std::size_t{0}, std::size_t{4} << 20}) {
+  // internal 1 MiB of staging commits 3 MiB.
+  {
     TextRunnerDiskCacheOptions disk{.directory = directory.string(),
-                                    .capacity_bytes = 1 << 20,
-                                    .staging_capacity_bytes = option};
+                                    .capacity_bytes = 1 << 20};
     auto runner = std::make_shared<CeilingRunner>();
     TextRunnerPool pool(runner, 1, disk, {.capacity_bytes = 4 << 20});
     assert(runner->committed == 3 << 20);
+  }
+  // The staging option has no meaning here: it is rejected, not ignored.
+  {
+    TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                    .capacity_bytes = 1 << 20,
+                                    .staging_capacity_bytes = 4 << 20};
+    auto runner = std::make_shared<CeilingRunner>();
+    try {
+      TextRunnerPool pool(runner, 1, disk, {.capacity_bytes = 4 << 20});
+      assert(false && "a component cache accepted --cache-disk-staging-bytes");
+    } catch (const std::invalid_argument& e) {
+      assert(std::string_view(e.what()) == kComponentCacheRejectsDiskStaging);
+    }
+    assert(runner->committed == 0);
   }
   std::filesystem::remove_all(directory);
 }
@@ -1845,8 +1852,7 @@ void DiskDirectoryHasOneOwner() {
   const TemporaryDirectory temp("gufo-component-owner-test");
   const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
-                                        .capacity_bytes = 1 << 20,
-                                        .staging_capacity_bytes = 7};
+                                        .capacity_bytes = 1 << 20};
   {
     TextRunnerPool owner(std::make_shared<CommitRunner>(), 1, disk);
     auto second_runner = std::make_shared<CommitRunner>();
@@ -1873,8 +1879,7 @@ void GridDoesNotSuppressFirstDiskPrompt() {
   const TemporaryDirectory temp("gufo-component-spacing-test");
   const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
-                                        .capacity_bytes = 1 << 20,
-                                        .staging_capacity_bytes = 7};
+                                        .capacity_bytes = 1 << 20};
   std::vector<TextRunnerToken> prompt(42);
   std::iota(prompt.begin(), prompt.end(), 10);
   std::uint64_t hash;
@@ -1918,7 +1923,6 @@ void PublishedResidentCheckpointKeepsDiskStep() {
   const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1 << 20,
-                                        .staging_capacity_bytes = 7,
                                         .min_checkpoint_step_tokens = 16};
   std::vector<TextRunnerToken> prompt(48);
   std::iota(prompt.begin(), prompt.end(), 10);
@@ -1963,7 +1967,6 @@ void LearnedBoundaryLeavesTheNextStep() {
   const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1 << 20,
-                                        .staging_capacity_bytes = 7,
                                         .min_checkpoint_step_tokens = 16};
   std::vector<TextRunnerToken> prompt(48);
   std::iota(prompt.begin(), prompt.end(), 10);
@@ -2001,8 +2004,7 @@ void NearTailDiskBranchSurvivesRestart() {
   const TemporaryDirectory temp("gufo-component-branch-test");
   const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
-                                        .capacity_bytes = 1 << 20,
-                                        .staging_capacity_bytes = 7};
+                                        .capacity_bytes = 1 << 20};
   std::vector<TextRunnerToken> seed(1100);
   std::iota(seed.begin(), seed.end(), 10);
   auto branch = seed;
@@ -2062,7 +2064,6 @@ void UnbackedDeepRowsSurviveDiskRestart() {
   const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1 << 20,
-                                        .staging_capacity_bytes = 8,
                                         .min_checkpoint_step_tokens = 1};
   std::vector<TextRunnerToken> prompt(5001);
   std::iota(prompt.begin(), prompt.end(), 10);
@@ -2469,8 +2470,7 @@ void UnalignedLiveFrontierCopiesRestore() {
   }
   const TemporaryDirectory temp("gufo-component-unaligned-frontier-test");
   const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
-                                        .capacity_bytes = 1 << 22,
-                                        .staging_capacity_bytes = 7};
+                                        .capacity_bytes = 1 << 22};
   {
     auto runner = std::make_shared<Runner>();
     runner->alignment = 4;
@@ -2509,8 +2509,7 @@ void IdleWriteBackResumesFromLastTurn() {
     const TemporaryDirectory temp("gufo-component-write-back-test");
     const std::filesystem::path directory = temp.path();
     const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
-                                          .capacity_bytes = 1 << 22,
-                                          .staging_capacity_bytes = 7};
+                                          .capacity_bytes = 1 << 22};
     {
       auto runner = std::make_shared<Runner>();
       ComponentTextCache cache(runner, 2, 1 << 22, disk);
@@ -2584,8 +2583,7 @@ void WriteBackReusesPersistedChunks() {
   const TemporaryDirectory temp("gufo-component-write-back-reuse");
   const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
-                                        .capacity_bytes = 1 << 22,
-                                        .staging_capacity_bytes = 7};
+                                        .capacity_bytes = 1 << 22};
   const auto files = [&] {
     std::size_t n = 0;
     for (const auto& f :
@@ -2646,8 +2644,7 @@ void ShutdownWriteBackSharesQueuedCheckpoint() {
     const TemporaryDirectory temp("gufo-component-shutdown-write-back");
     const std::filesystem::path directory = temp.path();
     const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
-                                          .capacity_bytes = 1 << 22,
-                                          .staging_capacity_bytes = 7};
+                                          .capacity_bytes = 1 << 22};
     {
       auto runner = std::make_shared<Runner>();
       ComponentTextCache cache(runner, 2, 1 << 22, disk);
@@ -2703,8 +2700,7 @@ void ReassignmentWritesUncoveredFrontier() {
   const TemporaryDirectory temp("gufo-component-reassignment-write");
   const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
-                                        .capacity_bytes = 1 << 22,
-                                        .staging_capacity_bytes = 7};
+                                        .capacity_bytes = 1 << 22};
   std::vector<TextRunnerToken> conversation(200);
   std::iota(conversation.begin(), conversation.end(), 10);
   const std::vector<TextRunnerToken> head(conversation.begin(),
@@ -2761,8 +2757,7 @@ void SharedLineageCoversOnlyItsOwnFrontier() {
   const TemporaryDirectory temp("gufo-component-shared-lineage");
   const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
-                                        .capacity_bytes = 1 << 22,
-                                        .staging_capacity_bytes = 7};
+                                        .capacity_bytes = 1 << 22};
   std::vector<TextRunnerToken> a(200), b(200);
   std::iota(a.begin(), a.end(), 10);
   std::iota(b.begin(), b.end(), 10);
@@ -2860,8 +2855,7 @@ void RetainedChunksReachDisk() {
   const TemporaryDirectory temp("gufo-component-retained-disk");
   const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
-                                        .capacity_bytes = 1 << 22,
-                                        .staging_capacity_bytes = 7};
+                                        .capacity_bytes = 1 << 22};
   std::vector<TextRunnerToken> prompt(120);
   std::iota(prompt.begin(), prompt.end(), 10);
   const std::vector<TextRunnerToken> side(12, 5);
@@ -3130,8 +3124,7 @@ void FailedWriteBackKeepsTheLiveFrontier() {
   const TemporaryDirectory temp("gufo-component-write-back-failure");
   const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
-                                        .capacity_bytes = 1 << 22,
-                                        .staging_capacity_bytes = 7};
+                                        .capacity_bytes = 1 << 22};
   std::vector<TextRunnerToken> conversation(100);
   std::iota(conversation.begin(), conversation.end(), 10);
   auto runner = std::make_shared<Runner>();
@@ -3167,8 +3160,7 @@ void ScatteredRowsWriteBackChunkByChunk() {
   const TemporaryDirectory temp("gufo-component-scattered-write-back");
   const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
-                                        .capacity_bytes = 1 << 22,
-                                        .staging_capacity_bytes = 7};
+                                        .capacity_bytes = 1 << 22};
   std::vector<TextRunnerToken> conversation(100);
   std::iota(conversation.begin(), conversation.end(), 10);
   {
@@ -3203,8 +3195,7 @@ void QueuedWriteBackFailureUncoversTheFrontier() {
   const TemporaryDirectory temp("gufo-component-write-back-late-failure");
   const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
-                                        .capacity_bytes = 1,
-                                        .staging_capacity_bytes = 7};
+                                        .capacity_bytes = 1};
   std::vector<TextRunnerToken> conversation(100);
   std::iota(conversation.begin(), conversation.end(), 10);
   auto runner = std::make_shared<Runner>();
@@ -3279,7 +3270,6 @@ void SiblingDoesNotAdoptAnotherExecutionsCheckpoint() {
   const std::filesystem::path directory = temp.path();
   const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
                                         .capacity_bytes = 1 << 22,
-                                        .staging_capacity_bytes = 7,
                                         .min_checkpoint_step_tokens = 0};
   const auto files = [&] {
     std::size_t n = 0;

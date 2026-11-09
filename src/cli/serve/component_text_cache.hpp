@@ -20,6 +20,13 @@ class TextRunnerSnapshot;
 struct TextRunnerDiskCacheOptions;
 struct TextPromptContext;
 
+// Component-cache runners (Qwen27B, Flash-Next) stream every disk transfer
+// through a fixed internal buffer, so they refuse the legacy staging option.
+inline constexpr std::string_view kComponentCacheRejectsDiskStaging =
+    "--cache-disk-staging-bytes applies only to DeepSeek's disk cache; "
+    "Qwen27B and Flash-Next stream checkpoints of any size through an "
+    "internal 1 MiB buffer, so omit the option";
+
 // Model-independent serving orchestration; the model supplies physical storage
 // and binds its ordinary execution facade to adapter-owned slots.
 struct ComponentCaptureBuffer {

@@ -3444,6 +3444,13 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     SetError(error, "--enable-yarn applies only to Qwen3.8-Flash-Next");
     return false;
   }
+  // Every architecture but DeepSeek serves through the component cache.
+  // Checked before any weights load.
+  if (disk_cache_config.staging_capacity_bytes != 0 &&
+      architecture != "deepseek4") {
+    SetError(error, std::string(kComponentCacheRejectsDiskStaging));
+    return false;
+  }
   std::optional<cli::KvCacheType> resolved_kv_cache_type;
   if (!cli::ResolveKvCacheType(architecture, kv_cache_type,
                                &resolved_kv_cache_type, &load_error)) {
