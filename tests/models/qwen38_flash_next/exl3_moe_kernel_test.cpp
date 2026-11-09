@@ -1793,8 +1793,9 @@ void RoutedReference(unsigned rows, bool shared, int bits, bool half,
   auto* w_out = buffers.Make<float>(assignments * k);
   gpu::Exl3Scratch plain = s;
   plain.down_exponents = nullptr;
-  gpu::Exl3RoutedDown(down.weight, widened_in, w_out, assignments, rows, plain,
-                      nullptr);
+  // The tile-row cap, not the row count (equal up to eight rows).
+  gpu::Exl3RoutedDown(down.weight, widened_in, w_out, assignments, tile_rows,
+                      plain, nullptr);
   Check(hipDeviceSynchronize());
   same(w_out, w_ref, assignments * k, "production widened down");
 }
@@ -1886,6 +1887,8 @@ std::vector<std::int32_t> FusedRouterRows(const std::vector<float>& logits,
 /// experts. Fused router tiles match BuildTiles, and the routed GEMV on
 /// those IDs matches the frozen kernel.
 void ConcentratedRouting(unsigned rows, bool identical) {
+  std::cout << "CASE concentrated routing rows=" << rows
+            << (identical ? " identical\n" : " hot\n");
   constexpr unsigned experts = 24, used = 10;
   std::vector<float> logits(rows * (experts + 1));
   std::mt19937 rng(rows * 7 + (identical ? 1 : 2));
@@ -2120,6 +2123,7 @@ void RoutedWideReplay() {
 /// the watchdog and the persistent grid repeats the bytes of one block per
 /// tile up to 160 tiles (the old launch's live blocks), strided beyond.
 void RoutedAdversarialTiles() {
+  std::cout << "CASE routed adversarial tiles\n";
   constexpr unsigned k = 640, n = 2560, experts = 8, assignments = 640;
   Buffers buffers;
   Bank down(buffers, k, n, experts, 81, false, 4, false);
