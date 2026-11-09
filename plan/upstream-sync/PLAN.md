@@ -75,7 +75,7 @@ U2-2와 U2-3은 prefill bit가 바뀔 수 있다. 바뀌면 U5에서 품질 검�
 | U4-4 | Kyojin `d8dbb75` (`spec_sample.py:typical_rows`) | sampled 요청용 typical acceptance (opt-in, 분포 비보존) | sampled MTP +~7%, greedy 0 | 옵션 이름과 품질 게이트 정의 |
 | U4-5 | upstream eb1d52e6 (#894) | decode HC combine·Q8_0·SiLU·epilogue 한 launch | TG +≤1% (B3/B4 tail fusion 손해 기록 있음) | `hc_mix_bench`로 screen만 |
 
-U4는 U1~U3과 U5가 끝난 뒤 사용자와 범위를 다시 정한다.
+U4는 아래 "U4 진행 상황"대로 구현했다(측정은 U5).
 
 ## U1~U3 진행 상황 (2026-11-09, GPU 실행 없음)
 
@@ -129,7 +129,36 @@ decode_attn_bench, hip_weight_upload)은 빌드만 했다. 이번 작업과 무�
 - **테스트**: Flash-Next GPU CTest 전체(특히 `attention_ops`·`select_ops`·`mtp_ops`의 새 경계 검사, `hc_mix_ops`의 `CheckFusedInjectPartials`, `blaslt_ops`의 split 검사, `projection_ops`의 arena 검사), `hip_weight_upload_test`, `qwen38_flash_next_session_test`(새 `CheckUnalignedContinuationPasses`, `--logprobs-only`), `snapshot_test`(새 11행 in-pass tail 검사), functional `cache`·`long-context`·`conversation`·`batch`·`tool-type-unions`·`logprobs`·`responses-logprobs`·`openai-count-tokens`·cache_persist·`cache_alignment_qwen38.py`.
 - **성능**: PP2048/8192, AR·MTP d0/d32K를 `runtime-hc-20261108` 대비 한 창. 특히 U2-2의 정렬로 생기는 추가 분할/캡처(nearby-stable warm turn의 aligned prompt tail snapshot, kv_pool 사용 시 in-pass 불가로 final pass 분할)와 tool-loop 재사용률(`pi_agent.py`)을 본다. U1-7의 SharedScope는 정상 경로 동작이 같아 decode 변화가 없어야 한다.
 - **열린 문제**: `CheckBatchedSessions`/`CheckLookupBatch` snapshot 꼬리 차이는 U2-1과 원인이 같지 않다(U2-1 수정은 이미 있었다). U5에서 bisect한다.
+- **U4 항목 (U1~U3 확인 뒤 같은 창에서)**. 성공한 최적화는 스위치 없이 기본값으로 둔다. 실패하면 되돌린다(U4-4만 opt-in).
+  - **U4-1 fused GDN prefill** (`c5657c82`)
+    - 정확성(먼저): `qwen38_flash_next_gdn_ops_test`(새 one-launch 대 분리 경로 byte 비교, n=1..99, checkpoint), `qwen38_flash_next.gdn_stable_route_equality`, `exl3_gdn_prefill`, `exl3_prefill_overlap`. `qwen38_flash_next_gdn_prefill_bench`의 출력·state·checkpoint hash가 기준 binary(`runtime-hc-20261108`) 빌드와 같아야 한다. prefill logits sha가 B10 `d051e822…`와 같아야 한다. 하나라도 다르면 채택하지 않는다(무손실 항목이다).
+    - 연산자: 같은 bench로 2048-token chunk의 µs/call 기준 대 후보(교대, 5회 이상). `check-kernel-resources`와 `tools/prof/isa_mix.py`로 `GdnPrefillKernel`의 VGPR·scratch를 본다(48 block / 20 WGP 불균형, epilogue z load가 window 경로에 있음 → 느리면 z를 window 앞서 load하는 수정을 먼저 시도).
+    - 전체: PP2048/8192 기준 대비 한 창. 채택 기준: 출력 동일 + PP8192가 잡음 밖으로 빠르거나(upstream +1.7%) 최소한 느려지지 않을 것(5%/10 ms 규칙, 요청·phase별). 느리면 되돌린다.
+  - **U4-3 wide copy verification** (`5dd394d8`)
+    - 정확성: `qwen38_flash_next.exl3_wide_verification`(logits·hidden·state·continuation이 8행 연속 검증과 bit 동일). 실모델(K4V4 운영 설정과 FP16 둘 다): 같은 rewrite prompt를 greedy로 wide 켠 세션과 `LimitCopyRows(8)` 세션에서 decode해 token 동일. 64행 copy가 128-token KVarN group 끝을 segment 경계에서 지나는 경우를 반드시 포함(segment 사이 양자화는 upstream에 없는 코드). PLE·dense→sparse 전환(2048 근처)·logprobs(>8행)·seed 없는 sampled long copy도 확인. session test 전체(`CheckLookupBatch`·`CheckBatchedSessions`의 serial 대 batch 비교가 그대로인지), snapshot test.
+    - 메모리: 첫 wide pass 뒤 할당 428 MiB, `DeferredScratchBytes`가 예약하는지, 두 256K K4V4 세션 설정에서 시작 시 width가 64로 남는지(`LimitCopyRows` 축소가 일어나면 로그로 확인).
+    - 성능: `pi_agent.py` 코드 재작성/편집 workload와 functional rewrite(파일 다시 쓰기, rename, docstring)에서 decode tok/s와 cycle 수(`lookup_n`/`lookup_n_accepted`), 기준 대비. prose/code/chat MTP d0/d32K는 그대로여야 한다(5%/10 ms). 채택 기준: 출력 동일 + rewrite workload decode가 빨라지고 다른 workload가 느려지지 않음.
+  - **U4-4 typical acceptance** (`da021c03`, opt-in이라 기본값은 바꾸지 않는다)
+    - 꺼짐: greedy·seeded sampled 출력 hash와 MTP work 수가 기준과 같아야 한다(`typical_acceptance` 생략, false 둘 다).
+    - 켜짐 성능: sampled MTP(T 0.7 top-k 20 thinking-off preset, T 1.0 thinking-on preset) prose/code/chat·Pi 에이전트 turn에서 decode tok/s와 수락률, 기준(꺼짐) 대비. Kyojin 보고 +~7%.
+    - 켜짐 품질 게이트(분포를 바꾸므로 통과해야만 문서에서 권장): functional `tool-reasoning`·tool-schema suite가 sampled 설정에서 꺼짐과 같은 통과율(tool call 형식·JSON 유효성 실패가 늘지 않음), 작은 정답형 세트(GSM8K식 수학·코드 단위 테스트, seed 여러 개)의 정답률이 꺼짐 대비 잡음 안, 출력 길이·반복률(n-gram 반복) 비교. 하나라도 나빠지면 opt-in으로만 두고 문서에 결과를 적는다.
+  - **U4-5 HC combine fusion screen** (`c776e86d`, production 아님)
+    - `qwen38_flash_next_hc_mix_fused_bench`를 한 번 돌린다(기본 48 mixer, 16 copy). 결과 열 `bytes`가 DIFFER면 후보는 이 tree의 산술과 다르므로 이식하려면 kernel을 다시 맞춰야 한다. 채택 검토 조건: byte 동일이고 1/2/4/8 token 모두에서 production 대비 µs/mixer가 회전 launch 비용(launch + gap 약 2 µs, production epilogue 안 회전 비용만큼은 덜 엄격)을 빼고도 빠를 것. 아니면 KNOWHOW에 기각으로 기록하고 끝낸다(B3/B4 tail 융합 손해 기록과 같은 결론인지 적는다). 빠르더라도 production 연결은 별도 작업(EXL3 slab 회전 포함, decode AR/MTP d0/d32K 창 필요).
 - **남은 low 항목(리뷰어)**: 복원된 비정렬 complete prompt에서 토큰 없이 commit한 live frontier는 정렬 규칙 밖에서 이어질 수 있다(upstream과 같음, 드묾). logprobs 요청 하나가 batch decode 동료를 늦춘다(동기 row download + CPU log-softmax, opt-in).
+
+## U4 진행 상황 (2026-11-09, GPU 실행 없음)
+
+U1~U3과 같은 방식(구현 → `build/b1` 빌드 → 관련 CPU 테스트 → 별도 리뷰어 검토 → 수정 → 재검토)으로 했다. 측정은 모두 U5로 미룬다. device code 비교 기준은 `build/b1/u/final-gufo`(`84fd6206`)다.
+
+| 항목 | 출처 | 커밋 | 상태 | 비고 |
+|---|---|---|---|---|
+| U4-3 | #961, #993 | `5dd394d8` | 구현 | 손 이식. 혼자 decode하는 세션(occupancy 1, defer_head 아님)의 copy-only cycle이 greedy 또는 seed 없는 compact sampled일 때 최대 64행을 `Executor::ForwardWide` 한 pass로 검증. projection·routed expert·head는 decode batch 경로(EXL3 9~64행 경로는 8세션×8행 batch가 이미 쓰는 것)로 한 번, GDN·attention·PLE는 8행 segment로 나눠 연속 검증과 같은 산술. 포크 차이: GDN 검증이 deferred record 방식이라 upstream의 segment별 full-state 스냅샷 대신 executor 소유 `wide_state_`(layer당 state 하나)에서 이후 segment를 시작하고, rollback은 record를 live state에 replay(`RollbackWide`). 메모리: segment당 45.7 MiB + 108 MiB, 64행에서 428 MiB(upstream 1.9 GiB), 처음 쓸 때 할당하고 `DeferredScratchBytes`에 예약. KVarN: segment 끝이 128-token group 끝이면 다음 segment 전에 그 layer의 group을 양자화(upstream에 없는 코드). 리뷰 수정: `max_speculative != 8`이면 wide 비활성(HIGH, draft 7 미만에서 decode 실패), 실패한 pass도 `wide_owner_`가 record를 소유. host만 바뀜(7,059/7,059 동일). GPU 테스트 `qwen38_flash_next.exl3_wide_verification`(합성 EXL3: GDN+sparse attention+MTP, 9/17/20/64행, keep 1..n, next-forward commit)은 빌드만 |
+| U4-1 | #895 | `c5657c82` | 구현 | EXL3 prefill GDN(`fused_conv`, F32 출력)을 layer당 launch 하나(`GdnPrefillKernel`)로: head당 block 하나(8 wave, 128행), q|k/v 채널 convolution, gate(GdnPrepAb 식), row-split recurrence, LDS의 raw 행으로 epilogue. 없어지는 launch: GdnPrepAb, GdnRowSplit<true>, GdnEpilogue(raw 행 F32 쓰기·읽기). 대상 출력 byte 동일(각 식을 분리 kernel과 같게 씀). 비교: 우리 `GdnRowSplitKernel<true>`는 grid (2, 48) 4 wave였다. 새 grid는 48 block이라 20 WGP에서 3 block을 받는 WGP가 생긴다(upstream도 같은 지적). device code: `GdnPrefillKernel` 추가만, 기존 7,059 symbol 동일(fallback으로 남은 `GdnRowSplitKernel<true>`도 그대로). 리뷰 수정: 피연산자 load 위치를 분리 kernel과 같게(fast-math 재결합 방지), epilogue의 z·norm load를 store 앞으로, `__restrict__`, n=0 guard, 새 경로 대 분리 경로 byte 비교 테스트(`gdn_ops_test`, n=1..99, checkpoint) |
+| U4-2 | Kyojin `0e03454`, `656dab5` | — | 하지 않음 | 이전 기각 이유가 그대로다. (1) 손실: F16 Q/K/T/P WMMA의 layer 오차가 FP32 recurrence의 약 500배(2.6e-4 대 5.1e-7), 299-token tool prompt에서 greedy literal echo가 바뀌었고 chat NLL +0.0145(EXPERIMENTS "Chunked DeltaNet removed", "Chunked GDN prefill"). Kyojin 16행판도 F16 연산이고 KLD 0.006을 스스로 보고한다. (2) 구조: chunk 산술은 pass가 어디서 나뉘는지에 따라 달라진다. U2-2가 막 세운 계약(캐시 복원·용량 분할 뒤 prefill = cold와 bit 동일, 4 정렬)과 pass 안 checkpoint(임의의 4 정렬 위치의 state)를 16행 chunk는 지킬 수 없다. (2)는 품질 게이트로 풀리는 문제가 아니라 bench 후보도 만들지 않았다. U4-1(무손실)만 U5에서 잰다 |
+| U4-4 | Kyojin `d8dbb75` | `da021c03` | 구현 | opt-in, 이름 하나: 요청 `typical_acceptance`(bool, null은 기본값 상속, 그 외 400), 서버 기본값 `--typical-acceptance`(공유 sampling 옵션, model preset이 유지). random sampling 요청의 MTP draft·lookup copy가 정확한 p/q 검사에서 거절돼도 target 분포(필터·penalty·temperature 뒤)의 p가 p > 0이고 p ≥ min(0.09, 0.3·exp(−H))면 유지(Medusa 규칙, Kyojin 상수). 끄면 token·RNG 소비가 bit 단위로 같고, greedy는 이 경로를 지나지 않는다. trace·시작 로그에 기록. CPU 테스트: mtp_sampling(임계값 양쪽, RNG), openai_chat(요청·기본값·preset·400). host만 |
+| U4-5 | #894 | `c776e86d` | screen만 | production에 넣지 않음. `qwen38_flash_next_hc_mix_fused_bench`(`tools/qwen38_flash_next/bench/experiments/hc_mix_fused_bench.hip`): upstream `HcMixQ8Fused`(work-list 한 launch, phase counter 대기) 복사본 대 우리 production decode mixer(HcCombineQ8_1 → HcDownSiluQ8_1 → Q8_0 up GEMV → HcMixEpilogue), graph replay, 1/2/4/8 token, byte 비교. 설계상 불리한 점: (a) B3 G1·B4에서 last-block tail 융합은 직렬 tail이 gap보다 비싸 되돌렸다(KNOWHOW B3/B4). 이 후보는 block 간 대기를 phase마다 둔다. (b) 우리 chain은 이미 B4 H3로 down+SiLU가 한 launch라 없앨 gap이 upstream(5 launch)보다 적다. (c) production EXL3 epilogue는 `mixed`를 다음 projection slab으로 회전한다(Exl3InputSlabs). 후보엔 없어서 채택하려면 그 회전 launch가 다시 생기거나 후보에 넣어야 한다. bench는 둘 다 회전을 빼서 후보 수치가 상한이다. 리뷰 수정: 후보의 1-token down 반올림을 이 tree(폭과 무관한 한 가지 반올림)에 맞춤(안 하면 n=1이 항상 DIFFER), xn/lo Q8_1도 비교, 최대 차이 출력, inject 입력을 0이 아닌 값으로 |
+
+반복 중 CPU 테스트: prompt_lookup, flash_next_serving, text_model_runner, text_generation_scheduler, openai_chat, http_server, sampling, qwen38_flash_next.config·continuation_layout·mtp_sampling·draft_vocab·exl3_prefill_scratch 통과. GPU 테스트 target(`qwen38_flash_next_exl3_ops_test`의 `--wide-verification`, `gdn_ops_test`, `gdn_prefill_bench`, session/snapshot test, `hc_mix_fused_bench`)은 빌드만 했다. U4 전체 device code: `GdnPrefillKernel` 추가 외 7,059 symbol 동일.
 
 ## U5 통합 GPU 패스 (한 번)
 
@@ -137,7 +166,7 @@ decode_attn_bench, hip_weight_upload)은 빌드만 했다. 이번 작업과 무�
 2. 우리 캐시 기능 재사용 비교(위 "U5가 GPU에서 확인할 것" 첫 항목). 여기서 문제가 나오면 나머지 단계 전에 고친다.
 3. Flash-Next GPU CTest 전체, `qwen38_flash_next_model_tests`(session·snapshot·adapter), `tests/functional`의 `conversation`·`batch`·`long-context`·`cache`·tool-schema 관련 suite.
 4. prefill logits sha 비교(B10 `d051e822…`). 바뀌면 품질 검사.
-5. `runtime-hc-20261108` 대비 성능 한 창(PP2048/8192, AR·MTP d0/d32K). 5%/10 ms 판정.
+5. `runtime-hc-20261108` 대비 성능 한 창(PP2048/8192, AR·MTP d0/d32K). 5%/10 ms 판정. U4 항목은 위 "U4 항목" 목록의 연산자·전체·품질 검사를 같은 창에서 한다.
 6. 통과하면 새 runtime 배포(`runtime-hc-20261108`은 `_backup`으로), `llm status`, 텍스트·이미지 smoke.
 7. KNOWHOW·BENCHMARKS·HANDOFF·이 문서 갱신, 커밋.
 

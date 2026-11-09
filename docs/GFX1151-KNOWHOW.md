@@ -1,5 +1,21 @@
 # gfx1151 optimization know-how
 
+## Upstream U4 imports, device-code delta, November 9, 2026
+
+No GPU run (measurement deferred to U5, `plan/upstream-sync/PLAN.md`).
+`build/b1/cmp/kerncmp.py` from `84fd6206` to the U4 tree: all 7,059 existing
+gfx1151 symbols identical; one kernel added, `GdnPrefillKernel` (#895's
+one-launch EXL3 prefill GDN: gates, recurrence and epilogue per head, 8 waves,
+grid 48). Wide copy verification (#961/#993) and typical acceptance (Kyojin
+d8dbb75) are host-only. Unmeasured design notes for U5: the fused GDN grid of
+48 head blocks leaves 8 of 20 WGPs with three blocks (upstream measured 40 → 48
+blocks at 1.28×), and its epilogue's z loads sit on the window path. Not
+imported: Kyojin's chunked F16 WMMA GDN (the existing rejection still applies:
+F16 operand error and pass-split dependence, see "Chunked GDN prefill"). #894's
+one-launch decode HC mixer is only a bench candidate
+(`qwen38_flash_next_hc_mix_fused_bench`), given the B3/B4 tail-fusion losses
+above and the EXL3 epilogue's slab rotation it lacks.
+
 ## Upstream U1-U3 imports, device-code delta, November 9, 2026
 
 No GPU run (measurement deferred to U5, `plan/upstream-sync/PLAN.md`).
