@@ -205,11 +205,13 @@ private:
     std::uint64_t last_used{};
     // admitted_bytes_ at the last reuse of this record's conversation.
     std::optional<std::uint64_t> reused_at;
-    // Two continuations once extended this record directly.
+    // Forked (two direct extensions) at some point since this record last
+    // had none; kept by an exact replacement. Fan-out parents then outlive
+    // all their children, not only the first to go.
     bool forked{false};
-    // RetentionRequest::aligned_tail; beside `forked`, in its padding.
+    // RetentionRequest::aligned_tail, in the padding before `below`.
     bool aligned_tail{false};
-    // Outstanding Pin calls (beside `forked`, in its padding).
+    // Outstanding Pin calls, in the same padding.
     std::uint32_t pins{};
     // Retained records extending this one, by slot.
     std::bitset<kRecordLimit> below;
@@ -229,6 +231,12 @@ private:
   static_assert(sizeof(Record) == sizeof(RecordLayoutWithoutPins));
   std::size_t Find(CheckpointId) const;
   bool Branch(std::size_t) const;
+  // Two retained records extend this one directly: it is their deepest
+  // retained common prefix. From the current relations, whatever the
+  // admission order, and no longer once either goes (Record::forked keeps
+  // the history).
+  bool Forked(std::size_t) const;
+  std::bitset<kRecordLimit> Direct(std::size_t) const;
   std::uint32_t Priority(std::size_t, const RetentionRequest* = nullptr) const;
   bool Related(std::size_t, std::size_t) const;
   void Relate(std::size_t);

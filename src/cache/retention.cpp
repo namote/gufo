@@ -226,7 +226,6 @@ bool RetentionPolicy::Related(std::size_t root, std::size_t peer) const {
 }
 void RetentionPolicy::Relate(std::size_t added) {
   auto& e = records_[added];
-  std::size_t parent = limit_;
   for (std::size_t j = 0; j < limit_; ++j) {
     if (j == added || !records_[j].checkpoint)
       continue;
@@ -234,18 +233,36 @@ void RetentionPolicy::Relate(std::size_t added) {
       e.below.set(j);
     } else if (Related(j, added)) {
       records_[j].below.set(added);
-      if (parent == limit_ || records_[j].checkpoint->Boundary() >
-                                  records_[parent].checkpoint->Boundary())
-        parent = j;
     }
   }
-  // The deepest retained prefix forks when another record extends it apart
-  // from this one; no deeper record can be prefix to both.
-  if (parent != limit_)
-    for (std::size_t j = 0; j < limit_; ++j)
-      if (j != added && records_[parent].below[j] && !e.below[j] &&
-          !records_[j].below[added])
-        records_[parent].forked = true;
+  // Only the added record and its prefixes gain extensions. A prefix whose
+  // extensions all now pass through an added record that forks itself no
+  // longer forks: the fork it recorded is the added record's, admitted after
+  // its children. A history fork (one child left) stays where it was.
+  const bool added_forks = Direct(added).count() >= 2;
+  for (std::size_t j = 0; j < limit_; ++j) {
+    if (j != added && !records_[j].below[added])
+      continue;
+    const auto direct = Direct(j);
+    if (direct.count() >= 2)
+      records_[j].forked = true;
+    else if (j != added && added_forks && direct.count() == 1 && direct[added])
+      records_[j].forked = false;
+  }
+}
+std::bitset<RetentionPolicy::kRecordLimit> RetentionPolicy::Direct(
+    std::size_t i) const {
+  // Extensions no other extension of this record precedes. Two of them never
+  // extend one another.
+  const auto& below = records_[i].below;
+  std::bitset<kRecordLimit> indirect;
+  for (std::size_t j = 0; j < limit_; ++j)
+    if (below[j])
+      indirect |= records_[j].below;
+  return below & ~indirect;
+}
+bool RetentionPolicy::Forked(std::size_t i) const {
+  return records_[i].below.count() >= 2 && Direct(i).count() >= 2;
 }
 std::array<std::uint64_t, 4> RetentionPolicy::PressureOrder(
     std::size_t i, const RetentionRequest& r, std::uint32_t priority) const {
@@ -525,7 +542,7 @@ std::size_t RetentionPolicy::AlignedTail(std::size_t retry,
     // token prefix of the retry.
     if (!t.checkpoint || t.purpose != RetentionPurpose::kContinuation ||
         !t.aligned_tail || !t.below[retry] || i == source || t.pins ||
-        t.forked || Persisting(i) || Branch(i) ||
+        Persisting(i) || Forked(i) || Branch(i) ||
         t.checkpoint->Boundary() <= e.stable ||
         std::ranges::find(r.protected_checkpoints, t.checkpoint->Id()) !=
             r.protected_checkpoints.end())
@@ -584,8 +601,20 @@ void RetentionPolicy::Erase(std::size_t i, RetentionReason reason,
   const auto used = e.last_used;
   index_.DropResident(e.entry);
   e = {};
-  for (auto& peer : records_)
+  std::bitset<kRecordLimit> prefixes;
+  for (std::size_t j = 0; j < limit_; ++j) {
+    auto& peer = records_[j];
+    prefixes[j] = peer.below[i];
     peer.below.reset(i);
+    // A record nothing extends any more is a leaf again.
+    if (peer.below.none())
+      peer.forked = false;
+  }
+  // Removing a record between a prefix and two of its extensions makes that
+  // prefix their fork, as admitting them without it would have.
+  for (std::size_t j = 0; j < limit_; ++j)
+    if (prefixes[j] && Forked(j))
+      records_[j].forked = true;
   --size_;
   if (retained_payload_bytes_)
     *retained_payload_bytes_ -= unique;
@@ -662,6 +691,10 @@ bool RetentionPolicy::Admit(const RetentionRequest& r, const Capture& capture) {
     return refuse(RetentionReason::kRecordCapacity);
   // An exact replacement keeps its conversation's reuse.
   std::optional<std::uint64_t> reused_at;
+  // An exact replacement keeps every record's fork history: the relations
+  // are the same before and after.
+  std::optional<std::bitset<kRecordLimit>> forked_before;
+  std::size_t forked_slot = limit_;
   while (true) {
     if (r.stop.stop_requested())
       return refuse(RetentionReason::kCancelled);
@@ -678,16 +711,28 @@ bool RetentionPolicy::Admit(const RetentionRequest& r, const Capture& capture) {
         checkpoint.reset();
         return refuse(RetentionReason::kCancelled);
       }
+      // Choose the record-capacity victim before indexing the checkpoint: a
+      // refusal after Insert would leave a resident entry with no record.
+      const bool replaces = exact != limit_ && records_[exact].checkpoint;
+      const auto victim =
+          !replaces && size_ == limit_ ? Victim(r, true) : limit_;
+      if (!replaces && size_ == limit_ && victim == limit_) {
+        checkpoint.reset();
+        return refuse(RetentionReason::kRecordCapacity);
+      }
       std::vector<ComponentAvailability> available;
       for (const auto& c : checkpoint->Components())
         available.push_back({c.descriptor.id, true, false});
       const auto entry =
           index_.Insert(checkpoint, std::move(available), r.stable);
-      if (exact != limit_ && records_[exact].checkpoint) {
+      if (replaces) {
         reused_at = records_[exact].reused_at;
+        forked_before.emplace();
+        for (std::size_t j = 0; j < limit_; ++j)
+          (*forked_before)[j] = records_[j].forked;
+        forked_slot = exact;
         Erase(exact, RetentionReason::kExactReplacement, Priority(exact, &r));
       } else if (size_ == limit_) {
-        const auto victim = Victim(r, true);
         const auto source = Find(r.source);
         const bool edited =
             source != limit_ &&
@@ -713,6 +758,13 @@ bool RetentionPolicy::Admit(const RetentionRequest& r, const Capture& capture) {
         *retained_payload_bytes_ += UniquePayloadBytes(target);
       admitted_bytes_ += UniqueBytes(target);
       Relate(target);
+      // Its extensions are unchanged: so is its fork history.
+      if (forked_before) {
+        for (std::size_t j = 0; j < limit_; ++j)
+          if (j != target && records_[j].checkpoint)
+            records_[j].forked = (*forked_before)[j];
+        e.forked = (*forked_before)[forked_slot];
+      }
       if (r.reused || reused_at)
         e.reused_at = r.reused ? admitted_bytes_ : reused_at;
       Emit(RetentionAction::kAdmitted, RetentionReason::kCaptured,

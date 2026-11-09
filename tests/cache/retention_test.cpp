@@ -1324,8 +1324,149 @@ void SmallAlignedTailUnderPressure() {
     }
   }
 }
+// F3: fork status follows the current relations, not admission order. A
+// fan-out parent admitted after its children, or republished exactly, still
+// outlives both of them (ForkedParentOutlivesItsChildren).
+void ForkStatusIgnoresAdmissionOrder() {
+  enum class Order { kParentFirst, kParentLast, kReplaced };
+  for (const auto order :
+       {Order::kParentFirst, Order::kParentLast, Order::kReplaced}) {
+    PressureFixture f;
+    auto parent = Conversation(1, 12);
+    const auto prior = f.Add({parent.begin(), parent.begin() + 8},
+                             RetentionPurpose::kContinuation, true);
+    std::array<std::vector<Token>, 2> child_tokens;
+    for (Token child = 0; child < 2; ++child) {
+      child_tokens[child] = parent;
+      child_tokens[child].insert(child_tokens[child].end(),
+                                 {500, 501, Token(600 + child), 502});
+    }
+    CheckpointId fork{};
+    std::array<CheckpointId, 2> children;
+    if (order != Order::kParentLast)
+      fork = f.Add(parent, RetentionPurpose::kContinuation, true);
+    for (std::size_t child = 0; child < 2; ++child)
+      children[child] =
+          f.Add(child_tokens[child], RetentionPurpose::kContinuation, true);
+    if (order != Order::kParentFirst)
+      fork = f.Add(parent, RetentionPurpose::kContinuation, true);
+    // Same recency in every order.
+    for (const auto id : {prior, fork, children[0], children[1]})
+      f.policy.Touch(id);
+    assert(f.Reclaim() == prior);
+    assert(f.Reclaim() == children[0] && f.Reclaim() == children[1]);
+    assert(f.Reclaim() == fork);
+  }
+}
+// F3: the fork history survives the changes that keep the relations: an
+// exact republication of the parent or of its remaining child, and a record
+// inserted between the parent and that child. Erasing a record between a
+// prefix and two extensions makes the prefix their fork.
+void ForkHistorySurvivesRepublication() {
+  enum class Change { kParent, kChild, kBetween };
+  for (const auto change :
+       {Change::kParent, Change::kChild, Change::kBetween}) {
+    PressureFixture f;
+    auto parent = Conversation(1, 12);
+    const auto fork = f.Add(parent, RetentionPurpose::kContinuation, true);
+    std::array<std::vector<Token>, 2> tokens;
+    std::array<CheckpointId, 2> children;
+    for (Token child = 0; child < 2; ++child) {
+      tokens[child] = parent;
+      tokens[child].insert(tokens[child].end(),
+                           {500, 501, Token(600 + child), 502});
+      children[child] =
+          f.Add(tokens[child], RetentionPurpose::kContinuation, true);
+    }
+    f.policy.Remove(children[0]);
+    auto kept = fork;
+    auto child = children[1];
+    if (change == Change::kParent)
+      kept = f.Add(parent, RetentionPurpose::kContinuation, true);
+    else if (change == Change::kChild)
+      child = f.Add(tokens[1], RetentionPurpose::kContinuation, true);
+    else
+      (void)f.Add({tokens[1].begin(), tokens[1].begin() + 13},
+                  RetentionPurpose::kContinuation, true);
+    f.policy.Touch(kept);
+    f.policy.Touch(child);
+    // The fan-out parent outlives its remaining child.
+    for (std::size_t left = f.policy.Size(); left > 1; --left)
+      assert(f.Reclaim() != kept);
+  }
+  // j -> m -> {c1, c2}: removing m makes j the fork of c1 and c2.
+  std::array<std::vector<CheckpointId>, 2> orders;
+  for (const bool middle : {true, false}) {
+    PressureFixture f;
+    auto parent = Conversation(1, 12);
+    const auto j = f.Add({parent.begin(), parent.begin() + 8},
+                         RetentionPurpose::kContinuation, true);
+    const auto m = middle ? f.Add(parent, RetentionPurpose::kContinuation, true)
+                          : CheckpointId{};
+    std::array<CheckpointId, 2> c;
+    for (Token child = 0; child < 2; ++child) {
+      auto tokens = parent;
+      tokens.insert(tokens.end(), {500, Token(600 + child)});
+      c[child] = f.Add(tokens, RetentionPurpose::kContinuation, true);
+    }
+    if (middle)
+      f.policy.Remove(m);
+    for (const auto id : {j, c[0], c[1]})
+      f.policy.Touch(id);
+    for (int k = 0; k < 3; ++k) {
+      const auto id = f.Reclaim();
+      orders[middle].push_back(id == j      ? CheckpointId{1}
+                               : id == c[0] ? CheckpointId{2}
+                                            : CheckpointId{3});
+    }
+  }
+  assert(orders[0] == orders[1] && orders[0].back() == CheckpointId{1});
+}
+// F3: a tail whose diverging sibling has gone is no fork any more, so it is
+// again the turn's aligned tail.
+void AlignedTailAfterItsSiblingGoes() {
+  PressureFixture f;
+  (void)f.Add(Conversation(1, 16));
+  const auto prompt = Conversation(2, 18);
+  (void)f.Add({prompt.begin(), prompt.begin() + 8});
+  const auto tail = f.Add({prompt.begin(), prompt.begin() + 16},
+                          RetentionPurpose::kContinuation, false, true);
+  RetentionRequest request{prompt, {1}, {}, RetentionPurpose::kRetry, 12};
+  assert(f.policy.Admit(request, [&] {
+    return IndexCheckpoint(f.ledger, prompt, {1}, {}, kPressureComponents);
+  }));
+  auto next = std::vector<Token>(prompt.begin(), prompt.begin() + 16);
+  next.insert(next.end(), {77, 78, 79, 80});
+  const auto sibling = f.Add(next);
+  f.policy.Remove(sibling);
+  assert(f.Reclaim() == tail);
+}
+// F4: a record-capacity admission that finds no victim once its capture
+// returns (here a pin taken meanwhile) is refused without indexing the new
+// checkpoint.
+void RecordCapacityRefusalLeavesNoIndexEntry() {
+  Fixture f(1);
+  const auto only = f.Add({1, 2});
+  const auto charged = f.ledger.Snapshot().total_bytes;
+  std::vector<Token> tokens{3, 4};
+  assert(
+      !f.policy.Admit({tokens, {1}, {}, RetentionPurpose::kContinuation}, [&] {
+        f.policy.Pin(only);
+        return IndexCheckpoint(f.ledger, tokens);
+      }));
+  assert(f.log.events.back().action == RetentionAction::kRefused &&
+         f.log.events.back().reason == RetentionReason::kRecordCapacity);
+  assert(f.policy.Size() == 1 && f.Cached({3, 4, 5}) == 0 &&
+         f.Cached({1, 2, 3}) == 2);
+  // Nothing of the refused checkpoint stays charged.
+  assert(f.ledger.Snapshot().total_bytes == charged);
+}
 }  // namespace
 int main() {
+  ForkStatusIgnoresAdmissionOrder();
+  ForkHistorySurvivesRepublication();
+  AlignedTailAfterItsSiblingGoes();
+  RecordCapacityRefusalLeavesNoIndexEntry();
   SmallAlignedTailUnderPressure();
   AlignedTailGoesFirstUnderRecordPressure();
   PinnedRecordIsNotAVictim();
