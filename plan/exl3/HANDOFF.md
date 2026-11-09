@@ -89,7 +89,10 @@ Logical C2/RAMcache/vision/MTP smoke passed; physical C2 batching not claimed.
 Rollback: stop `llm`, move both model `hc_q8/` and `hc_q8.json` aside (preserve
 artifacts), install the previous serving revision `d01fd32a008ff81f7d60bbb6ddcd4b841ca1bc8e` with
 `tools/serving/flash_next/install.py`, then `llm start`. The previous B10 binary
-remains in `~/.local/share/gufo/runtime-b9-20261108/`. Do not edit a live model.
+is in `~/projects/_backup/runtime-b9-20261108/` (moved there on 2026-11-09,
+CLEANUP C7): move it back to `~/.local/share/gufo/runtime-b9-20261108/`
+before `llm start`, because the `d01fd32a` supervisor runs that path. Do not
+edit a live model.
 
 ### Original BF16 / pure F16 HC comparison (November 9, 2026)
 
@@ -131,7 +134,8 @@ and has not been started. No full16-bit quality/speed claim.
 The previous service ran `9eb3cbdb` (B9 structure split `b56b9f54` plus the GDN k.q
 order fix; sha256 `1d35af4f…`, 129,058,712 B, build `build/b1`
 RelWithDebInfo gfx1151, pinned Nix ROCm 10.1) from
-`~/.local/share/gufo/runtime-b9-20261108/` (`RUNTIME.json`), driven by the
+`~/.local/share/gufo/runtime-b9-20261108/` (`RUNTIME.json`; now in
+`~/projects/_backup/runtime-b9-20261108/`), driven by the
 supervisor installed from `tools/serving/flash_next/` at `d01fd32a`. Model,
 C2/native262144 FP16 pool, MTP and sampling settings are unchanged from the c03
 section below. The B10 pass ([brief](archive/B10-GPU-PASS-BRIEF.md), evidence
@@ -141,11 +145,9 @@ timing window (PP +0.2/+0.3%, decode unchanged); results are in
 [docs/GFX1151-KNOWHOW.md](../../docs/GFX1151-KNOWHOW.md), batch index
 [B-SERIES-SUMMARY.md](B-SERIES-SUMMARY.md).
 
-Rollback: the B5 runtime (`31cee0b6`) is in
-`~/projects/_backup/runtime-b5-20261108/`; the recipe is in
-`~/projects/_backup/README.md` (move it back, restore the B5-pointing
-`gufo-server.py` from `_backup/gufo-serving-20261108T105540Z-d01fd32a/`,
-`llm start`).
+Rollback: the B5 runtime (`31cee0b6`) and its supervisor copy were deleted
+from `~/projects/_backup/` on 2026-11-09 at the user's request; B5 can no
+longer be restored from a backup.
 
 ## Open
 
