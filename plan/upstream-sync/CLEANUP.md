@@ -16,4 +16,7 @@ U5가 끝난 뒤 시작한다. U5 GPU 측정이 도는 동안에는 빌드하지
 | C6 | 감사가 다루지 못한 부분: KVarN k4v4/k6v6에서 되돌린 뒤 그룹 경계를 다시 양자화하는 경로. `retention.cpp`, `checkpoint.cpp`, `ledger.cpp`도 대충만 봤다 | 모름 | 지금 서비스는 FP16 KV라 낮다 | 코드만 읽는 감사를 한 번 더 한다(빌드 없이 다른 작업과 병렬로 할 수 있다) |
 | C7 | 운영 정리: `~/.local/share/gufo/runtime-b9-20261108`이 backup 위치 규칙(`~/projects/_backup`)을 어기고 있다. `README.txt`의 runtime 줄도 예전 값이다 | 낮음 | 없다 | U5에서 배포할 때 HANDOFF rollback 기록과 함께 옮기고 고친다. U5가 하지 않으면 여기서 한다 |
 
-순서: C2 → C5 → C3 → C1 → C6(병렬로) → C4(GPU 측정 뒤 결정). GPU 확인은 C1(session 테스트 전체와 sampled restore 비교)과 C4(capture 지연)를 한 번에 묶는다.
+| C8 | U1~U4 리뷰에서 "낮음"으로 미뤄 둔 것: (a) logprobs 요청 하나가 같은 batch의 다른 요청 decode를 늦춘다(행을 동기로 내려받아 CPU에서 log-softmax를 한다. opt-in 기능이다). (b) 정렬 안 된 complete prompt에서 복원한 뒤 토큰 없이 commit한 live frontier는 정렬 규칙 밖에서 이어질 수 있다(드물고, upstream도 같다). (c) typical acceptance가 `/props`에 안 나오고, Flash-Next가 아닌 모델에서 경고가 없고, CLI 파싱 테스트가 없고, functional `run.py` sampling map에도 없다. (d) 993d2441: `!CaptureRefused(aligned)`가 이 세션들에서는 항상 참이고, `invalid_argument`만 잡는다 | 낮음 | (a)만 있다. logprobs를 요청할 때만 | (c)와 (d)는 바로 정리한다. (a)는 log-softmax를 GPU로 옮기거나 비동기로 내려받는 방법을 검토한다. (b)는 기록만 남긴다 |
+| C9 | U5에서 원인을 밝히지 못한 채 남을 수 있는 것: 같은 요청을 다시 보냈을 때 재사용이 4860 대 4867로 갈린 경우(RAM 캐시 evict로 보인다), 요청 취소 케이스의 decode 지연, timing 판단 보류 건 | 모름 | 모름 | U5 보고서를 받은 뒤 U5가 정리하지 못한 것만 여기로 옮긴다 |
+
+순서: C2 → C5 → C8(c, d) → C3 → C1 → C6(병렬로) → C4(GPU 측정 뒤 결정) → C8(a) → C9. GPU 확인은 C1(session 테스트 전체와 sampled restore 비교)과 C4(capture 지연)를 한 번에 묶는다.
