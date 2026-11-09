@@ -118,6 +118,11 @@ GPU.
     cancelled-peer rows sum to 6,932 ms (base 7,269, cand2 8,718).
   - **cand4 adapter test:** fails at "failed slot retained rollback
     scratch". That contract conflicts with `0e0ebad8`.
+    Follow-up: the test was updated to the new contract (Invalidate
+    succeeds, logical state cleared, `AllocatedBytes()` unchanged by a
+    cancel and above empty in MTP mode, next Sync/Decode equal to a fresh
+    session). Rebuilt at `8a76234d`, it passes (rc 0, every section PASS,
+    `correct4/adapter-rerun/`).
 - **C4: a capture waits behind another session's prefill.** Session A's
   checkpoint capture (`cache_snapshot_ms`) takes 7.4–9.7 ms alone and
   1829.6/1835.9/1839.1 ms while session B runs a ~21 K-token cold prefill (cand2;
