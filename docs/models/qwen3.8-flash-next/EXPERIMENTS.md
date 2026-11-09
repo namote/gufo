@@ -1,5 +1,11 @@
 # Qwen3.8 Flash-Next experiments
 
+Artifact retention, November9: `build/exl3-hc` was removed after completion at
+user request. All24 logits/metadata and compact source/log/result evidence are
+preserved in `models/eval/flash-next/hc-history-20261109` outside this repo.
+Old evidence paths map into that archive; experimental ELF/H/build intermediates
+are no longer retained. [Archive mapping and cleanup receipt](../../../plan/exl3/HANDOFF.md).
+
 ## BF16-source all200 HC Q8 calibration, November 8, 2026
 
 Completed GPU FP64 full-H GPTQ for194 main and6 MTP matrices using bounded

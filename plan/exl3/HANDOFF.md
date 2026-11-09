@@ -1,5 +1,31 @@
 # EXL3 / Flash-Next handoff (updated 2026-11-09; all200 HC Q8 retained; U5 not deployed)
 
+## HC experiment artifacts archived, 2026-11-09
+
+User requested removal of `build/exl3-hc` after completed deployment/comparison.
+The directory is deleted;105.01GiB reclaimed (230.27GiB free immediately after).
+Its apparent217GiB included live-model hardlinks: only experiment links were
+unlinked, with deployed model/HC sidecar/runtime inode identities unchanged.
+Service stayed running and ready; no restart or GPU work was performed.
+
+Permanent archive (763MiB):
+`/home/m2on/projects/models/eval/flash-next/hc-history-20261109/`
+
+- `evidence.tar.gz`:26198 small source/log/JSON/receipt files, with original
+  paths relative to `build/exl3-hc`. Tar payloads verified before deletion.
+- `baselines/<old-relative-path>`:all24 `logits.bin` files and paired metadata,
+  including hybrid, legacy, refinements and pure16 comparisons; hashes verified.
+  Reuse these saved outputs instead of repeating baseline forwards.
+- `FILE-INVENTORY.json`, `PROTECTED.json`, `CLEANUP.json`:removed-file inventory,
+  protected installed identities and independent-review/post-delete receipts.
+
+Historical evidence citations below and in model docs use the old relative
+paths; resolve them through this archive. Large H/capture/quant intermediates,
+experimental ELF files and build objects were removed. Earlier statements that
+those build artifacts were retained describe their state before this cleanup.
+Future runtime experiments require a new incremental build directory; the
+installed qualified runtime remains in `~/.local/share/gufo/runtime-hc-20261108`.
+
 ## Upstream U5 pass, 2026-11-09: not deployed
 
 The active runtime is unchanged: `~/.local/share/gufo/runtime-hc-20261108/gufo`

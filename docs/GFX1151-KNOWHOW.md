@@ -3192,3 +3192,12 @@ not merely source-manifest hashes. Preserve the unrelated stdout/stderr
 interleaved-SHA parser failure and strict CPU recovery; no successful GPU
 stage repeated. Evidence:`build/exl3-hc/precision-001`; full scope/numbers in
 Flash-Next QUALITY/BENCHMARKS/EXPERIMENTS.
+
+
+HC artifact retention update, November9: user-authorized cleanup removed
+`build/exl3-hc` after completion;105.01GiB reclaimed without stopping service.
+All24 logits/metadata plus compact source/log/receipts remain in
+`/home/m2on/projects/models/eval/flash-next/hc-history-20261109` (763MiB).
+Earlier build evidence paths resolve through `evidence.tar.gz` or `baselines/`;
+large H/capture intermediates and experimental ELF/objects were removed.
+Installed model/sidecar/runtime protected and ready. See EXL3 HANDOFF mapping.

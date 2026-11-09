@@ -1,5 +1,11 @@
 # Qwen3.8 Flash-Next benchmarks
 
+Artifact retention, November9: `build/exl3-hc` was removed after completion at
+user request. All24 logits/metadata and compact source/log/result evidence are
+preserved in `models/eval/flash-next/hc-history-20261109` outside this repo.
+Old evidence paths map into that archive; experimental ELF/H/build intermediates
+are no longer retained. [Archive mapping and cleanup receipt](../../../plan/exl3/HANDOFF.md).
+
 ## Upstream U5 candidate (not deployed), November 9, 2026
 
 Same window, B C alternation, deployed `runtime-hc-20261108` (B) vs candidate

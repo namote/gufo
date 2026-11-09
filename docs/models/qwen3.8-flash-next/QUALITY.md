@@ -1,5 +1,11 @@
 # Qwen3.8 Flash-Next quality
 
+Artifact retention, November9: `build/exl3-hc` was removed after completion at
+user request. All24 logits/metadata and compact source/log/result evidence are
+preserved in `models/eval/flash-next/hc-history-20261109` outside this repo.
+Old evidence paths map into that archive; experimental ELF/H/build intermediates
+are no longer retained. [Archive mapping and cleanup receipt](../../../plan/exl3/HANDOFF.md).
+
 ## Original BF16 / pure F16 HC comparison, November 9, 2026
 
 Fixed c03 body/MTP weights, FP16 KV and Nix10.1; only the200 HC down/up
