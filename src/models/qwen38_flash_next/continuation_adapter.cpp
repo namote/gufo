@@ -71,9 +71,10 @@ public:
     std::optional<cache::Completion> completion;
     std::optional<TransferResult> result;
     mutable std::mutex mutex;
+    // Never blocks: a job locked by its submit counts as unsettled.
     bool Settled() const noexcept {
-      const std::lock_guard lock(mutex);
-      return result.has_value();
+      const std::unique_lock lock(mutex, std::try_to_lock);
+      return lock.owns_lock() && result.has_value();
     }
     bool Ready() const noexcept {
       const std::lock_guard lock(mutex);
@@ -536,8 +537,16 @@ cache::Completion ContinuationAdapter::Transfer(
   job->owner = &state;
   job->load = load;
   auto signal = std::make_unique<State::Signal>(job);
+  // Hold the job's lock from before publication until it has a completion or
+  // a result: a boundary scope on another thread may Wait on it as soon as it
+  // is listed. Readers lock jobs_mutex, then a job's mutex; taking jobs_mutex
+  // here while holding this job's mutex cannot deadlock, since no reader can
+  // reach this job before it is listed, and submit takes neither lock.
+  const std::lock_guard job_lock(job->mutex);
   {
     const std::lock_guard lock(state.jobs_mutex);
+    // A job still being submitted elsewhere is not settled; skip it rather
+    // than wait for its submit while holding jobs_mutex.
     std::erase_if(state.jobs,
                   [](const auto& previous) { return previous->Settled(); });
     state.jobs.push_back(job);
