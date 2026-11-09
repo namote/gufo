@@ -1,5 +1,12 @@
 # HC Q8_0 calibration and refinement
 
+Retention update, November9: completed HC build/intermediate files, including
+older artifacts outside `build/exl3-hc`, have been cleaned. Historical paths below
+map to `/home/m2on/projects/models/eval/flash-next/hc-history-20261109/`;
+old `_backup/gufo-hc-q8-20261108` records are in its `outside-build-20261109`
+archive. Numerical baselines, small input datasets and deployed files remain.
+See [HANDOFF](HANDOFF.md) for the exact archive mappings and retained scope.
+
 2026-11-08. User approved BF16-source calibration files, then a comparison of
 code-only and code-plus-scale refinement. GPU collection followed the completed
 B10 optimization benchmark handoff. Only the owned server was temporarily stopped

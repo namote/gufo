@@ -41,6 +41,32 @@ diagnosed. It is a route difference: `MtpForwardBatch` takes the kv_only
 route only for an all-kv_only cohort. Greedy is unaffected. See
 `plan/upstream-sync/PLAN.md` "U5 결과" and CLEANUP.md C1.
 
+## HC-wide residual cleanup, 2026-11-09
+
+The cleanup scope was widened from one directory to the completed HC work.
+Additional leftovers existed outside `build/exl3-hc`: the retired `_ai.tools`
+B5 HC sidecar prototype, `fn-q-hc` retained build and three older HC operator
+builds, old preparation records, three `/tmp` helpers, package bytecode and a
+never-started Docker precision-audit container. All were inactive and reviewed.
+Seven exact directories and the temporary helpers were removed after preserving
+2034 non-build files (including numeric fixtures) with per-file hash verification;
+423 rebuildable files were discarded, approximately2.295GiB allocated space.
+The cleanup helper itself was archived and removed. Only the identified Created
+container was removed; no image/volume prune and no service interruption.
+
+Additional archive and exact path inventory:
+`/home/m2on/projects/models/eval/flash-next/hc-history-20261109/outside-build-20261109/`
+(`records-and-inputs.tar.gz`, `INVENTORY.json`, `CLEANUP.json`). The previous
+`projects/_backup/gufo-hc-q8-20261108` evidence is now inside this archive.
+The second archive uses original absolute paths with the leading slash removed.
+
+Intentionally retained: deployed HC/model/runtime, canonical HC source/tests,
+`hc-holdout`244KiB and `hc-pilot-001`40KiB input datasets, all archived baselines,
+older `fn-hc2..9` numeric/profile baselines, operational service logs, and current
+`build/b1/u5-20261109`/Claude scratch used by the separate ongoing optimization.
+These are not classified as disposable completed-HC intermediates. Installed45
+file identities and HC/ELF hashes remain unchanged; service remains ready.
+
 ## Active default: c03 + calibrated HC Q8, 2026-11-08
 
 All200 HC matrices (main194/MTP6) are loaded from original-BF16-source GPTQ
