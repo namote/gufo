@@ -35,6 +35,18 @@ void WideVerification() {
                            first + count == length ? logits.data() : nullptr,
                            gpu::Executor::ForwardMode::kPrefill, &error),
               error);
+      // The draft block consumes an intermediate pass before the next one
+      // (Forward requires it), at the row and position the engine uses.
+      if (first + count < length) {
+        const auto next = prompt[first + count];
+        Require(exec.MtpForward(*session, std::span(&next, 1),
+                                static_cast<std::int32_t>(
+                                    std::min<std::size_t>(
+                                        count, exec.max_speculative()) -
+                                    1),
+                                {}, &error),
+                error);
+      }
     }
     return session;
   };
