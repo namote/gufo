@@ -231,6 +231,25 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
   }
   if (rows > options_.max_batch)
     return Fail(error, "MTP body batch exceeds executor capacity");
+  const auto& l = model_->mtp();
+  const bool kv_route = !l.attn_qkv.empty() ||
+                        (l.attn_k.exl3 != nullptr && l.attn_v.exl3 != nullptr);
+  const auto kv_only_items = static_cast<std::size_t>(std::ranges::count_if(
+      items, [](const auto& item) { return item.kv_only; }));
+  if (kv_route && kv_only_items != 0 && kv_only_items != items.size()) {
+    // A session catching up only its draft KV takes the KV-only route
+    // whatever its peers do, so its rows match a step it runs alone. The
+    // mixed cohort runs as two sub-batches; each synchronizes its stream
+    // before the next reuses the pinned token and control buffers.
+    std::array<MtpBatchItem, kBatchSessions> split{};
+    std::ranges::partition_copy(items, split.begin(),
+                                split.begin() + kv_only_items,
+                                [](const auto& item) { return item.kv_only; });
+    return MtpForwardBatch(std::span(split.data(), kv_only_items), error) &&
+           MtpForwardBatch(std::span(split.data() + kv_only_items,
+                                     items.size() - kv_only_items),
+                           error);
+  }
   if (!AnyActive(items))
     return true;
   if (items.size() == 1) {
@@ -272,11 +291,8 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
               tokens_host_ + offsets[i]);
   }
   const Scratch base = s_;
-  const auto& l = model_->mtp();
-  const bool cache_only =
-      (!l.attn_qkv.empty() ||
-       (l.attn_k.exl3 != nullptr && l.attn_v.exl3 != nullptr)) &&
-      std::ranges::all_of(items, [](const auto& item) { return item.kv_only; });
+  // A mixed cohort was split above, so every row shares one route.
+  const bool cache_only = kv_route && kv_only_items == items.size();
   const auto body = [&]() {
     if (!AnyActive(items))
       return true;
