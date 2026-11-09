@@ -51,6 +51,17 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen38_flash_next_hc_decode_bench PRIVATE
     gufo_qwen38_flash_next)
 
+  # U4-5 screen: upstream #894's one-launch decode HC mixer (a copy, not
+  # production) against the production decode mixer sequence.
+  add_executable(qwen38_flash_next_hc_mix_fused_bench EXCLUDE_FROM_ALL
+    ${QFN_BENCH_DIR}/experiments/hc_mix_fused_bench.hip)
+  set_source_files_properties(
+    ${QFN_BENCH_DIR}/experiments/hc_mix_fused_bench.hip
+    PROPERTIES LANGUAGE HIP
+    COMPILE_OPTIONS "-O3;-ffast-math;-fno-finite-math-only")
+  target_link_libraries(qwen38_flash_next_hc_mix_fused_bench PRIVATE
+    gufo_qwen38_flash_next)
+
   # Prefill MoE glue, plain-store kernel copies vs production (tools/qwen38_flash_next/bench).
   # The copies compile with the production library's HIP flags.
   add_executable(qwen38_flash_next_moe_glue_bench EXCLUDE_FROM_ALL
