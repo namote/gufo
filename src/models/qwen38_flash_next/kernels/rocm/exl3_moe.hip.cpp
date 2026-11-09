@@ -429,14 +429,14 @@ __device__ __forceinline__ void RoutedGemvTile(
 }
 
 // Persistent over the route tiles: gridDim.y blocks stride the tile list
-// (LaunchRouted caps it at the widest ordinary verification's tiles), so a
-// wide verification launches no more blocks than an eight-row pass; the
-// 64-row grid of one block per assignment (12800 gate/up blocks) stalled
-// in the hardware queue. Each tile is still computed by exactly one block
-// with the same arithmetic. The tile index and count are uniform over the
-// block, so all its waves run the same iterations and reach every staging
-// barrier together; the next tile's first staging barrier also orders its
-// LDS writes after the previous tile's reads.
+// (LaunchRouted caps it at kExl3RoutedGridRows, 160), so a wide
+// verification launches no more blocks than a 16-row pass; the 64-row grid of
+// one block per assignment (12800 gate/up blocks) stalled in the hardware
+// queue. Each tile is still computed by exactly one block with the same
+// arithmetic. The tile index and count are uniform over the block, so all its
+// waves run the same iterations and reach every staging barrier together; the
+// next tile's first staging barrier also orders its LDS writes after the
+// previous tile's reads.
 template<int Bits, bool FullPrecision, unsigned MaxRows = 8,
          bool Scaled = false, unsigned Tiles = 1>
 __global__ void RoutedGemv(const ex::DeviceLinear* gate,

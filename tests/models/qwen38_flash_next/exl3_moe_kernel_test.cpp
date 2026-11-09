@@ -2089,17 +2089,20 @@ void RoutedGridIdentity(unsigned rows) {
 }
 
 /// Test A: a 64-row copy verification layer's route tiles (~100-200 tiles,
-/// as in production), replayed through tiles_ready many times;
-/// every launch finishes within the watchdog and repeats the bytes.
+/// as in production), replayed through tiles_ready many times, alternately
+/// on 80 strided rows and on the default grid; every launch finishes within
+/// the watchdog and repeats the bytes of one block per tile.
 void RoutedWideReplay() {
   // 64 hot experts: about ten assignments, two tiles, each.
   RoutedPass pass(64, 80, 64, 71);
-  const auto reference = pass.Run(0, true, false);
+  constexpr std::uint32_t kStrided = 80;
+  (void)pass.Run(0, true, false);
   const auto n = Read(pass.s.tile_count, 1)[0];
   const auto tiles = Read(pass.s.tiles, n);
   std::cout << "CASE routed wide replay tiles=" << n << '\n';
-  Require(n > gpu::kExl3RoutedGridRows && n <= pass.assignments,
-          "wide replay fixture must exceed the routed grid");
+  Require(n > kStrided && n <= pass.assignments,
+          "wide replay fixture must exceed the strided grid");
+  const auto reference = pass.Run(n, true, false, true);
   hipStream_t stream;
   Check(hipStreamCreate(&stream));
   for (unsigned launch = 0; launch < 200; ++launch) {
@@ -2109,8 +2112,8 @@ void RoutedWideReplay() {
     Check(hipMemcpyAsync(pass.s.tile_count, &n, sizeof(n),
                          hipMemcpyHostToDevice, stream));
     const auto name = "routed wide replay launch " + std::to_string(launch);
-    Require(SameFloats(reference,
-                       pass.Run(0, true, false, true, stream, name.c_str())),
+    Require(SameFloats(reference, pass.Run(launch % 2 == 0 ? kStrided : 0, true,
+                                           false, true, stream, name.c_str())),
             (name + " changed bytes").c_str());
   }
   Check(hipStreamDestroy(stream));

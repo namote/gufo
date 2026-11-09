@@ -51,10 +51,11 @@ struct Exl3Scratch {
 constexpr std::uint32_t Exl3RouteTileRows(std::uint32_t rows) {
   return rows <= 3 ? rows : rows <= 4 ? 4 : 8;
 }
-/// Blocks in y of a routed decode launch: the assignments of the widest
-/// ordinary verification (eight rows, ten experts). Wider passes stride
-/// their route tiles over them instead of launching a block per assignment.
-constexpr std::uint32_t kExl3RoutedGridRows = 80;
+/// Blocks in y of a routed decode launch: twice the assignments of the
+/// widest ordinary verification (eight rows, ten experts), so launches of up
+/// to 16 rows keep a block per assignment. Wider passes stride their route
+/// tiles over them instead of launching a block per assignment.
+constexpr std::uint32_t kExl3RoutedGridRows = 160;
 /// Largest assignment count whose tiles RouterTopKTiles builds.
 constexpr std::uint32_t kExl3FusedTileAssignments = 256;
 
