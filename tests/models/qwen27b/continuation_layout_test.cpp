@@ -1,5 +1,6 @@
 #include "src/models/qwen/continuation_layout.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -154,7 +155,15 @@ void CheckKvarnRows() {
        }) {
     Require(qwen::KvarnRowsAt(position, flushed) == rows, "KVarN rows");
     const auto tail = qwen::KvarnRestoredTail(position, rows);
-    Require(tail && tail->written_end == position &&
+    // The ring holds only [base, position): a rewind before base is refused.
+    Require(tail &&
+                (tail->flushed_end <= 128
+                     ? tail->written_end == position
+                     : tail->written_end ==
+                               std::max<std::uint64_t>(
+                                   position, tail->flushed_end + 129) &&
+                           !hip::PlanKvarnPass(*tail, tail->flushed_end - 1, 1)
+                                .error.empty()) &&
                 tail->flushed_end == (position < 128 ? 128 : rows.records) &&
                 qwen::KvarnRowsAt(position, tail->flushed_end) == rows,
             "KVarN restored tail");

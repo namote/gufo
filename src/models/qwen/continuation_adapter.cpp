@@ -201,21 +201,25 @@ public:
     if (first > end || end > adapter.context_)
       throw std::invalid_argument("Qwen mutation exceeds context");
     Readable readable(*this);
+    // A KVarN write first quantizes the group a pass ending at a group end
+    // left in the ring, then reopens the group holding `first`.
+    auto& arena = executor->arena_;
+    const auto flushed_end =
+        arena.UsesKvarn() ? arena.kvarn_.tail.flushed_end : first;
+    const auto records_first = hip::KvarnWriteFirst(first, flushed_end);
     for (const auto& component : adapter.layout_.Components()) {
       if (component.descriptor.kind != cache::ComponentKind::kAppendRows ||
           first >= end)
         continue;
-      // A KVarN write reopens and requantizes the group holding `first`.
-      guard.BeforeOverwrite(
-          component.descriptor.id,
-          component.part == ContinuationPart::kKvarnRecords
-              ? first >> hip::kKvarnGroupShift << hip::kKvarnGroupShift
-              : first,
-          end);
+      guard.BeforeOverwrite(component.descriptor.id,
+                            component.part == ContinuationPart::kKvarnRecords
+                                ? records_first
+                                : first,
+                            end);
     }
     // Shared pool: copy blocks a checkpoint still holds, then map the rows,
     // before any submission writes them.
-    executor->arena_.UnshareKvRows(first, end);
+    arena.UnshareKvRows(std::min(first, flushed_end), end);
     executor->arena_.EnsureKvRows(end);
   }
   void AfterWrite(std::uint32_t end, bool logits) noexcept override {
@@ -448,9 +452,13 @@ std::uint32_t ContinuationAdapter::ReserveKvRows(cache::Slot& slot,
                                                  std::uint32_t rows,
                                                  std::uint32_t margin) {
   auto& state = As(slot);
-  // Writes resume at the session's position.
-  return state.executor->arena_.ReserveKvRows(
-      rows, margin, static_cast<std::uint32_t>(state.position));
+  // Writes resume at the session's position; a KVarN pass first quantizes
+  // the group a pass ending at a group end left in the ring (BeforeWrite).
+  auto& arena = state.executor->arena_;
+  auto first = static_cast<std::uint32_t>(state.position);
+  if (arena.UsesKvarn())
+    first = std::min(first, arena.kvarn_.tail.flushed_end);
+  return arena.ReserveKvRows(rows, margin, first);
 }
 std::uint32_t ContinuationAdapter::ReleaseKvReservation(
     cache::Slot& slot) noexcept {
@@ -739,6 +747,8 @@ cache::Completion ContinuationAdapter::CapturePrivatePiece(
         .version = 2,
         .flushed_end = static_cast<std::uint32_t>(
             KvarnTailBase(state.position, arena.kvarn_.tail.flushed_end)),
+        // The position, not the tail's written_end: the restore derives that
+        // from the rows (KvarnRestoredTail).
         .written_end = state.position};
     std::memcpy(host.data(), &header, sizeof(header));
     const auto segments =

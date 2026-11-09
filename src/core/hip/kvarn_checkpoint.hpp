@@ -38,7 +38,9 @@ struct KvarnCheckpointRows {
   return {.records = base, .sink = kKvarnSinkTokens, .tail = position - base};
 }
 // The tail of a slot restored from `rows` at `position`; empty when no
-// checkpoint at `position` holds those rows.
+// checkpoint at `position` holds those rows. The ring holds only
+// [base, position), so written_end refuses a rewind before base
+// (KvarnRingReach), as for a Flash-Next restore.
 [[nodiscard]] constexpr std::optional<KvarnTail> KvarnRestoredTail(
     std::uint64_t position, const KvarnCheckpointRows& rows) {
   const auto base = position < kKvarnSinkTokens
@@ -47,8 +49,10 @@ struct KvarnCheckpointRows {
   if (rows.tail > kKvarnTailRingTokens || base < kKvarnSinkTokens ||
       base % kKvarnGroupTokens != 0 || KvarnRowsAt(position, base) != rows)
     return std::nullopt;
-  return KvarnTail{.flushed_end = static_cast<std::uint32_t>(base),
-                   .written_end = static_cast<std::uint32_t>(position)};
+  return KvarnTail{
+      .flushed_end = static_cast<std::uint32_t>(base),
+      .written_end = KvarnRingReach(static_cast<std::uint32_t>(base),
+                                    static_cast<std::uint32_t>(position))};
 }
 }  // namespace gufo::hip
 

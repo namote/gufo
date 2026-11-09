@@ -145,6 +145,28 @@ struct KvarnTail {
   std::uint32_t written_end{0};
 };
 
+/// The written_end of a tail whose ring holds FP16 rows only from `held` on,
+/// because the groups before it were quantized without passing through the
+/// ring (a 27B prompt chunk quantizes them from staging) or were restored
+/// as records. PlanKvarnPass and PlanKvarnPrefill then refuse a rewind into
+/// any group before `held`, and still reopen `held` and later groups.
+[[nodiscard]] constexpr std::uint32_t KvarnRingReach(
+    std::uint32_t held, std::uint32_t written_end) {
+  return held <= kKvarnSinkTokens
+             ? written_end
+             : std::max(written_end,
+                        held + kKvarnTailRingTokens - kKvarnGroupTokens + 1);
+}
+
+/// First record row a write starting at `first` changes: a pass first
+/// quantizes the groups [flushed_end, floor(first)) a pass ending exactly at
+/// a group end left in the ring, then reopens the group holding `first`.
+[[nodiscard]] constexpr std::uint32_t KvarnWriteFirst(
+    std::uint32_t first, std::uint32_t flushed_end) {
+  const auto row = first < flushed_end ? first : flushed_end;
+  return row >> kKvarnGroupShift << kKvarnGroupShift;
+}
+
 /// Most rows of one pass: a pass meets at most one group end.
 inline constexpr std::uint32_t kKvarnMaxPassRows = kKvarnGroupTokens;
 

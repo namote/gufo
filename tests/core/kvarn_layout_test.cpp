@@ -3,6 +3,7 @@
 // are covered by tests/models/qwen/hip/kvarn_layout_test.cpp.
 #include "src/core/hip/kvarn_layout.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <string_view>
@@ -87,13 +88,87 @@ void TestSharedPlanners() {
       "checkpoint rows");
   const auto restored = KvarnRestoredTail(300, rows);
   Expect(restored.has_value() && restored->flushed_end == 256 &&
-             restored->written_end == 300,
+             restored->written_end ==
+                 256 + kKvarnTailRingTokens - kKvarnGroupTokens + 1,
          "restored tail");
+}
+
+// C6-AUDIT F1: the ring holds FP16 rows only from where a 27B prompt chunk
+// stopped quantizing from staging, or from a restored base. A rewind into a
+// group before that is refused instead of requantizing rows never written.
+void TestRingReach() {
+  // A prompt chunk over [0, 1000) quantizes groups 1..6 from staging; the
+  // ring holds rows 896..999 (QwenGpuArena::PrepareKvarnPrefill).
+  KvarnTail tail{.flushed_end = kKvarnSinkTokens, .written_end = 0};
+  const auto chunk = PlanKvarnPrefill(tail, 0, 1000);
+  Expect(chunk.error.empty() && chunk.flushed_end == 896, "prompt chunk");
+  tail.flushed_end = chunk.flushed_end;
+  tail.written_end = KvarnRingReach(chunk.flushed_end, 1000);
+  Expect(!PlanKvarnPass(tail, 800, 8).error.empty(),
+         "a rewind before the chunk's ring rows is refused");
+  Expect(!PlanKvarnPrefill(tail, 800, 8).error.empty(),
+         "a prompt rewind before the chunk's ring rows is refused");
+  const auto apply = [](KvarnTail& t, std::uint32_t start, std::uint32_t n) {
+    const auto plan = PlanKvarnPass(t, start, n);
+    Expect(plan.error.empty(), "pass");
+    t.flushed_end = plan.flushed_end;
+    t.written_end = std::max(t.written_end, start + n);
+  };
+  // Verification crosses 1024, then drafts are rejected: the rewinds into
+  // the ring's group 896 still reopen it; one into group 768 does not.
+  apply(tail, 1020, 8);
+  Expect(tail.flushed_end == 1024, "verification crosses a group end");
+  Expect(PlanKvarnPass(tail, 1000, 8).error.empty() &&
+             PlanKvarnPass(tail, 896, 8).error.empty(),
+         "the ring's group still reopens");
+  Expect(!PlanKvarnPass(tail, 895, 1).error.empty(),
+         "the group before it does not");
+  // A restore at 1024 holds no ring rows before its base.
+  const auto rows = KvarnRowsAt(1024, 1024);
+  const auto restored = KvarnRestoredTail(1024, rows);
+  Expect(
+      restored.has_value() && !PlanKvarnPass(*restored, 1023, 1).error.empty(),
+      "a rewind before a restored base is refused");
+  Expect(PlanKvarnPass(*restored, 1024, 8).error.empty(),
+         "a restored slot continues");
+  auto mid = KvarnRestoredTail(1100, KvarnRowsAt(1100, 1024));
+  Expect(mid.has_value() && mid->written_end == 1024 + 129,
+         "a restored tail reaches its base");
+  // Verification from the restored position crosses 1152 and is rejected:
+  // the rewind into the restored group reopens it, one before it does not.
+  apply(*mid, 1100, 60);
+  Expect(mid->flushed_end == 1152, "verification crosses a group end");
+  Expect(PlanKvarnPass(*mid, 1101, 8).error.empty(),
+         "a rewind into the restored group");
+  Expect(!PlanKvarnPass(*mid, 1023, 1).error.empty(),
+         "a rewind before the restored base is refused");
+  // Before the first group the sink is the whole ring.
+  Expect(KvarnRingReach(kKvarnSinkTokens, 70) == 70, "sink only");
+}
+
+// C6-AUDIT F2: a write first quantizes the group a pass ending at a group end
+// left in the ring, so it changes records from that group on.
+void TestWriteFirst() {
+  KvarnTail tail;
+  const auto pass =
+      PlanKvarnPass(KvarnTail{.flushed_end = 384, .written_end = 500}, 500, 12);
+  Expect(pass.error.empty() && pass.flushed_end == 384 && pass.boundary == 0,
+         "a pass ending at a group end leaves its group in the ring");
+  tail = {.flushed_end = pass.flushed_end, .written_end = 512};
+  const auto next = PlanKvarnPass(tail, 512, 1);
+  Expect(next.first_group == 3 && next.groups == 1, "the next pass flushes it");
+  Expect(KvarnWriteFirst(512, tail.flushed_end) == 384,
+         "the write guard starts at the flushed group");
+  Expect(KvarnWriteFirst(520, 512) == 512 && KvarnWriteFirst(500, 512) == 384,
+         "otherwise at the group holding the write");
+  Expect(KvarnWriteFirst(70, kKvarnSinkTokens) == 0, "sink rows");
 }
 
 }  // namespace
 
 int main() {
+  TestRingReach();
+  TestWriteFirst();
   static_assert(
       gufo::hip::KvarnRecord(6, gufo::hip::KvarnValueOrder::kTokenMajor, 6)
           .bytes == 51456);

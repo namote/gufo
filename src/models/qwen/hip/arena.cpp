@@ -1381,6 +1381,11 @@ KvarnPrefillPlan QwenGpuArena::PrepareKvarnPrefill(std::uint32_t start,
                    plan.first_group, plan.groups, pass_stream);
   kvarn_.tail.flushed_end = plan.flushed_end;
   kvarn_.tail.written_end = std::max(kvarn_.tail.written_end, start + rows);
+  // The chunk quantizes the groups completing inside it from staging; the
+  // ring gets only its rows from plan.flushed_end on.
+  if (plan.flushed_end > plan.target)
+    kvarn_.tail.written_end =
+        KvarnRingReach(plan.flushed_end, kvarn_.tail.written_end);
   return plan;
 }
 
