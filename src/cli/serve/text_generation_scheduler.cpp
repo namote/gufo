@@ -416,6 +416,7 @@ GenerationTrace StartGenerationTrace(const ScheduledRequest& request,
   sampling["frequency_penalty"] =
       TraceFloat(request.sampling.frequency_penalty);
   sampling["presence_penalty"] = TraceFloat(request.sampling.presence_penalty);
+  sampling["typical_acceptance"] = request.sampling.typical_acceptance;
   sampling["constrained"] = request.sampling.constraint != nullptr;
   trace.record["sampling"] = std::move(sampling);
   return trace;

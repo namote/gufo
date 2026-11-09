@@ -1753,6 +1753,27 @@ void TestModelSamplingDefaults() {
   Expect(config.temperature == 0.0F && config.presence_penalty == 0.0F &&
              config.top_k == 40,
          "Explicit request zero overrides server and model presets");
+  Expect(!config.typical_acceptance, "Typical acceptance is off by default");
+  config = send(R"(,"typical_acceptance":true)");
+  Expect(config.typical_acceptance, "Requests opt into typical acceptance");
+  backend.defaults.sampling.typical_acceptance = true;
+  config = send("");
+  Expect(config.typical_acceptance,
+         "Model presets keep the server's typical acceptance");
+  config = send(R"(,"typical_acceptance":false)");
+  Expect(!config.typical_acceptance,
+         "Requests opt out of the server's typical acceptance");
+  config = send(R"(,"typical_acceptance":null)");
+  Expect(config.typical_acceptance, "Null inherits typical acceptance");
+  backend.defaults.sampling.typical_acceptance = false;
+  {
+    const auto response = gufo::server::HandleOpenAiChat(
+        Request(R"({"model":"test-model","messages":[{"role":"user",)"
+                R"("content":"hello"}],"typical_acceptance":1})"),
+        backend);
+    Expect(response.status == 400,
+           "Non-boolean typical acceptance is rejected");
+  }
   backend.defaults.model = TextModelPreset::kDeepSeekV4Flash;
   backend.defaults.supplied = {};
   for (const bool thinking : {false, true}) {

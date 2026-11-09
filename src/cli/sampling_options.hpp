@@ -93,6 +93,11 @@ inline void RegisterSamplingOptions(ArgParser& parser,
           : "One-time penalty for tokens already generated in this response "
             "(default: 0.0 = disabled)",
       group, &config->presence_penalty);
+  parser.AddFlag("", "--typical-acceptance",
+                 "Sampled speculative decoding also keeps typical rejected "
+                 "proposals: faster, but outputs no longer follow the exact "
+                 "sampling distribution (Flash-Next MTP; default: off)",
+                 group, &config->typical_acceptance);
 }
 
 }  // namespace gufo::cli

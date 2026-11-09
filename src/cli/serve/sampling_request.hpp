@@ -295,6 +295,16 @@ inline std::optional<SamplingRequestError> ParseSamplingConfig(
                                              &output->presence_penalty, true)) {
     return error;
   }
+  if (const auto* typical = body.find("typical_acceptance");
+      typical != nullptr && !typical->is_null()) {
+    if (!typical->is_bool()) {
+      return SamplingRequestError{
+          .message = "'typical_acceptance' must be a boolean",
+          .code = "invalid_typical_acceptance",
+      };
+    }
+    output->typical_acceptance = typical->as_bool();
+  }
 
   // Check the original JSON number, not the narrowed float: 1.00000001 must
   // not round into the permitted top-p range. Native sampler controls may

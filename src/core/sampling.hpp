@@ -51,6 +51,11 @@ struct SamplingConfig {
   std::shared_ptr<const TokenConstraint> constraint;
   /// Set only for requests that start in their reasoning phase.
   std::shared_ptr<const ReasoningBudget> reasoning_budget;
+  /// Speculative decoding of a random-sampling request also keeps a
+  /// rejected proposal whose target probability is typical (Medusa's rule).
+  /// Faster, but the output no longer follows the target distribution
+  /// exactly. Greedy decoding ignores it. Only Flash-Next MTP applies it.
+  bool typical_acceptance{false};
 
   void Validate() const;
 

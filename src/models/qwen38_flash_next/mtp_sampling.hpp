@@ -1,6 +1,7 @@
 #ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_MTP_SAMPLING_HPP_
 #define GUFO_MODELS_QWEN38_FLASH_NEXT_MTP_SAMPLING_HPP_
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -73,8 +74,34 @@ struct MtpVerification {
   bool accepted;
 };
 
+/// Typical acceptance (SamplingConfig::typical_acceptance; Medusa, Cai et
+/// al. 2024, arXiv 2401.10774, with Kyojin d8dbb75's thresholds): a proposal
+/// the exact test rejected is still kept when its probability p under the
+/// target sampling distribution (after its filters, penalties and
+/// temperature) satisfies p > 0 and p >= min(eps, delta * exp(-H)), H being
+/// that distribution's entropy in nats. Filtered tokens (p = 0) are never
+/// kept. This does not preserve the target distribution.
+inline constexpr double kTypicalEpsilon = 0.09;
+inline constexpr double kTypicalDelta = 0.3;
+
+inline bool TypicalProposal(const sampling::SamplingDistribution& target,
+                            sampling::TokenId token) {
+  const double p = target.probability(token);
+  if (!(p > 0))
+    return false;
+  if (p >= kTypicalEpsilon)
+    return true;  // min(eps, ...) <= eps: no entropy pass needed
+  double entropy = 0;
+  for (const auto& entry : target.entries())
+    if (entry.value > 0)
+      entropy -= entry.value * std::log(entry.value);
+  return p >= std::min(kTypicalEpsilon, kTypicalDelta * std::exp(-entropy));
+}
+
 /// The same FP64 target distribution drives AR draws, support, acceptance
 /// and residual correction. Only proposal q uses the compact F32 masses.
+/// A typical-acceptance request (TypicalProposal) also keeps a rejected
+/// proposal of typical probability; its uniform draw is consumed either way.
 template<typename Target>
 inline MtpVerification VerifyMtpTarget(std::size_t vocab,
                                        const MtpProposal& proposal,
@@ -99,6 +126,9 @@ inline MtpVerification VerifyMtpTarget(std::size_t vocab,
   const auto target = distribution();
   if (sampler.Uniform() * proposal.probability <
       target.probability(proposal.token))
+    return {proposal.token, true};
+  if (sampler.config().typical_acceptance &&
+      TypicalProposal(target, proposal.token))
     return {proposal.token, true};
   return {target.SampleResidual(
               std::span(proposal.ids).first(proposal.size),

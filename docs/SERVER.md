@@ -968,6 +968,16 @@ penalties `[-2, 2]`. Top-p zero keeps the highest-probability token (or
 `min_keep` tokens). Setting temperature to zero retains configured penalties;
 omitted controls keep their model/CLI defaults.
 
+`typical_acceptance: true` (or `--typical-acceptance` for the server default;
+`false` and `null` as usual) speeds up speculative decoding of random-sampling
+requests on Qwen3.8-Flash-Next with MTP: a draft or copied token the exact
+rejection test turns down is still kept when its probability p under the
+request's sampling distribution (after its filters, penalties and temperature)
+satisfies p >= min(0.09, 0.3 * exp(-H)), H being that distribution's entropy
+(Medusa's typical acceptance). Tokens the filters remove are never kept. The
+output then no longer follows the sampling distribution exactly, which is why
+it is off by default. Greedy requests and other models ignore it.
+
 Tool calls are emitted only for declared functions when `tool_choice` allows
 calling tools. With `auto`, ordinary text and reasoning remain allowed; once a
 call starts, decoding constrains its name and argument format. As in llama.cpp,

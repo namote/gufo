@@ -1606,7 +1606,8 @@ int RunServe(std::span<const char* const> args) {
         << " repeat_penalty=" << effective_sampling.repeat_penalty
         << " repeat_last_n=" << effective_sampling.repeat_last_n
         << " frequency_penalty=" << effective_sampling.frequency_penalty
-        << " presence_penalty=" << effective_sampling.presence_penalty;
+        << " presence_penalty=" << effective_sampling.presence_penalty
+        << " typical_acceptance=" << effective_sampling.typical_acceptance;
     server::Logger::Info("sampling", sampling_log.str());
     const char* speculation =
         speculative_config.backend == server::TextSpeculativeBackend::kDFlash
