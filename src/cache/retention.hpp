@@ -123,6 +123,10 @@ struct RetentionRequest {
   // Frontier actually reused by this turn, before its new prefill. This
   // distinguishes a short retry tail from a larger continuation/compaction.
   Rows reused_tokens{};
+  // A continuation captured at the aligned boundary before an unaligned
+  // prompt end (prefill alignment): the only kind AlignedTail substitutes
+  // for its turn's retry copy.
+  bool aligned_tail{false};
 };
 // Caller serializes policy, index and history operations. Ledger and index
 // outlive this object; sink, if present, does too. Callbacks/sinks cannot
@@ -141,14 +145,15 @@ struct RetentionRequest {
 // reused conversation gives up covered records, then leaves. In both, a
 // fork that two continuations extended directly outlives those leaves.
 // Whenever a complete-prompt retry copy would go, its turn's aligned prompt
-// tail goes instead (a continuation strictly between the retry's stable
-// boundary and its end, which nothing but the retry extends): an unchanged
+// tail goes instead (a continuation admitted as RetentionRequest::aligned_tail
+// strictly between the retry's stable boundary and its end, which nothing but
+// the retry extends): an unchanged
 // retry needs the complete prompt, while the tail only bounds the prefill of
 // a next turn that diverges inside the assistant framing. This holds even
 // for a retry-priority admission that may otherwise displace only optional
 // copies. A tail that is pinned, protected, persisting, forked, the request
-// source or continued by the incoming request stays, as does one freeing
-// less than half the retry's unique payload.
+// source or continued by the incoming request stays, as does, under byte
+// pressure only, one freeing less than half the retry's unique payload.
 class RetentionPolicy {
 public:
   static constexpr std::size_t kRecordLimit = 128;
@@ -178,6 +183,7 @@ public:
   void Touch(CheckpointId);
   // False, and no effect, when the record is no longer retained (an exact
   // replacement or explicit removal published since it was looked up).
+  // noexcept: Touch throws only for an unknown id, which this rules out.
   [[nodiscard]] bool TryTouch(CheckpointId) noexcept;
   // Keeps a looked-up record from eviction (admission, Reclaim, ReclaimWhere)
   // until each Pin is matched by Unpin, as while a request restores it.
@@ -201,6 +207,8 @@ private:
     std::optional<std::uint64_t> reused_at;
     // Two continuations once extended this record directly.
     bool forked{false};
+    // RetentionRequest::aligned_tail; beside `forked`, in its padding.
+    bool aligned_tail{false};
     // Outstanding Pin calls (beside `forked`, in its padding).
     std::uint32_t pins{};
     // Retained records extending this one, by slot.
@@ -218,7 +226,8 @@ private:
   std::size_t UniquePayloadBytes(std::size_t) const noexcept;
   bool Persisting(std::size_t) const;
   std::size_t Victim(const RetentionRequest&, bool records) const;
-  std::size_t AlignedTail(std::size_t retry, const RetentionRequest&) const;
+  std::size_t AlignedTail(std::size_t retry, const RetentionRequest&,
+                          bool records) const;
   void Erase(std::size_t, RetentionReason, std::uint32_t rank);
   void Emit(RetentionAction, RetentionReason, CheckpointId, Rows,
             RetentionPurpose, std::uint32_t, std::uint64_t,

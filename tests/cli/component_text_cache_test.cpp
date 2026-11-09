@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <numeric>
@@ -15,6 +16,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 
 #include "src/cache/retention.hpp"
 #include "src/cli/serve/logging.hpp"
@@ -39,6 +41,11 @@ public:
   mutable FakeAdapter* adapter{};
   mutable std::size_t captures{};
   bool defer_idle{};
+  // Throws once from SetPromptContext, as an Acquire failure after restore
+  // candidates are pinned.
+  mutable bool fail_context{};
+  // Runs once on the next transfer stream request (cleared before it runs).
+  mutable std::function<void()> on_stream;
   bool in_pass{};
   bool partial{};
   std::size_t alignment{1};
@@ -97,7 +104,10 @@ public:
   // Image prompts carry their cache identity in the context.
   void SetPromptContext(
       TextRunnerState&,
-      std::shared_ptr<const TextPromptContext>) const override {}
+      std::shared_ptr<const TextPromptContext>) const override {
+    if (std::exchange(fail_context, false))
+      throw std::runtime_error("prompt context failed");
+  }
   std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
       cache::ResourceLedger& ledger, std::size_t) const override {
     struct Block {
@@ -131,6 +141,8 @@ public:
         -> std::unique_ptr<cache::Stream> {
       if (defer_idle && std::this_thread::get_id() != foreground)
         return {};
+      if (on_stream)
+        std::exchange(on_stream, {})();
       return std::make_unique<FakeStream>(true);
     };
     resources->transfer_batch_size = 4;
@@ -3328,8 +3340,9 @@ void SiblingDoesNotAdoptAnotherExecutionsCheckpoint() {
 // is pinned through the restore; the pin goes when the restore ends, whether
 // it restored, failed or was cancelled.
 void SelectedCheckpointSurvivesReassignmentCapture() {
-  enum class Retry { kRestores, kFails, kCancelled };
-  for (const auto mode : {Retry::kRestores, Retry::kFails, Retry::kCancelled}) {
+  enum class Retry { kRestores, kFails, kCancelled, kThrows };
+  for (const auto mode :
+       {Retry::kRestores, Retry::kFails, Retry::kCancelled, Retry::kThrows}) {
     auto runner = std::make_shared<Runner>();
     // Room for two retained private states: the stable boundary and the
     // complete prompt. A third capture must evict one.
@@ -3379,7 +3392,23 @@ void SelectedCheckpointSurvivesReassignmentCapture() {
     const ContinuationCache::CancellationCheck cancelled = [&] {
       return mode == Retry::kCancelled && checks++ > 0;
     };
-    {
+    if (mode == Retry::kThrows) {
+      // An exception after the pins are taken (here installing the prompt
+      // context) leaves Acquire; the pins go with it.
+      runner->fail_context = true;
+      bool threw = false;
+      try {
+        (void)cache.Acquire(prompt, {}, {}, true, stable, true);
+      } catch (const std::runtime_error&) {
+        threw = true;
+      }
+      assert(threw);
+      assert(cache.CachedPrefixTokens(prompt, nullptr, false) == prompt.size());
+      // Leave another uncovered frontier for the capture below.
+      std::vector<TextRunnerToken> next(80);
+      std::iota(next.begin(), next.end(), 6000);
+      turn(next);
+    } else {
       auto retry = cache.Acquire(prompt, cancelled, {}, true, stable, true);
       // A failed restore goes on to the next candidate, the stable boundary.
       assert(retry->cached_tokens() == (mode == Retry::kRestores ? prompt.size()
@@ -3407,6 +3436,37 @@ void SelectedCheckpointSurvivesReassignmentCapture() {
     assert(again->cached_tokens() == stable);
     again->Invalidate();
   }
+}
+// A record replaced exactly while a request restores it (here by the busy
+// source republishing the same prompt) no longer exists when the restore
+// finishes. The validated restore still counts (event=restore_untracked).
+void ExactReplacementDuringRestoreKeepsTheRestore() {
+  auto runner = std::make_shared<Runner>();
+  ComponentTextCache cache(runner, 2, 1 << 22, {});
+  std::vector<TextRunnerToken> prompt(20);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  auto source = cache.Acquire(prompt, {}, {}, true, 0, true);
+  auto& state = dynamic_cast<State&>(source->state());
+  runner->adapter->Append(state.slot, prompt, prompt);
+  const auto publish = [&] {
+    assert(source->TryReserveSnapshot(source->CaptureBytes(), prompt.size(),
+                                      false, SnapshotPurpose::kContinuation,
+                                      {}));
+    assert(source->PublishSnapshot(prompt, source->Capture(), false));
+  };
+  publish();
+  bool replaced = false;
+  runner->on_stream = [&] {
+    publish();
+    replaced = true;
+  };
+  auto peer = cache.Acquire(prompt, {}, {}, true, 0, true);
+  assert(replaced);
+  assert(peer->cached_tokens() == prompt.size());
+  auto& restored = dynamic_cast<State&>(peer->state());
+  assert(runner->adapter->RecurrentHash(restored.slot) ==
+         runner->adapter->RecurrentHash(state.slot));
+  assert(cache.CachedPrefixTokens(prompt, nullptr, false) == prompt.size());
 }
 // A warm chat turn whose prompt ends on the alignment captures no separate
 // aligned prompt tail: it would be the complete prompt's own state. One
@@ -3443,6 +3503,7 @@ void AlignedPromptEndCapturesNoSeparateTail() {
 }
 int main() {
   SelectedCheckpointSurvivesReassignmentCapture();
+  ExactReplacementDuringRestoreKeepsTheRestore();
   AlignedPromptEndCapturesNoSeparateTail();
   FailedWriteBackKeepsTheLiveFrontier();
   QueuedWriteBackFailureUncoversTheFrontier();

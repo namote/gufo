@@ -950,6 +950,8 @@ struct TextRunnerPool::Request::Impl {
         // A disabled cache (or a refused disk-only capture) must not prepare
         // checkpoint scratch or split a pass for a fallback it cannot keep.
         count = aligned;
+        // Retention gives it up before this turn's complete prompt.
+        lease.MarkAlignedTail(aligned);
       }
     }
     snapshot_tokens.reserve(prompt.size());

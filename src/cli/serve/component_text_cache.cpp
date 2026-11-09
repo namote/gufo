@@ -821,6 +821,8 @@ struct ComponentTextCache::Lease::Impl {
   cache::InputIdentity input;
   std::vector<cache::Token> prompt;
   std::size_t cached{}, restored{}, stable{}, capture_boundary{};
+  // MarkAlignedTail.
+  std::size_t aligned_tail{};
   double restore_time{};
   bool disk_hit{}, active{true}, preserve_source{};
   // False keeps every checkpoint this lease captures in RAM only.
@@ -873,7 +875,8 @@ struct ComponentTextCache::Lease::Impl {
             .protected_checkpoints =
                 std::span(edit_boundaries).first(edit_boundary_count),
             .reused = cached != 0,
-            .reused_tokens = cached};
+            .reused_tokens = cached,
+            .aligned_tail = aligned_tail && tokens.size() == aligned_tail};
   }
   std::unique_ptr<TextRunnerSnapshot> CaptureDurable();
 };
@@ -1572,10 +1575,14 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
   struct RestorePins {
     Impl* cache;
     std::vector<cache::CheckpointId> ids;
-    // Under the cache mutex.
-    void Hold(const cache::PrefixLookup& found) {
+    // Under the cache mutex. Only candidates the restore loop below may
+    // read: it skips an unaligned boundary short of the prompt.
+    void Hold(const cache::PrefixLookup& found, std::size_t alignment,
+              std::size_t prompt) {
       for (const auto& candidate : found.candidates)
-        if (candidate.checkpoint) {
+        if (candidate.checkpoint && !candidate.live &&
+            (candidate.boundary % alignment == 0 ||
+             candidate.boundary >= prompt || AnyPosition(candidate))) {
           ids.push_back(candidate.checkpoint->Id());
           cache->retention.Pin(ids.back());
         }
@@ -1596,6 +1603,12 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
   std::optional<cache::BorrowedLocation> live;
   std::optional<Impl::Uncovered> evicted;
   std::size_t common = 0;
+  // Prefill continues a checkpoint exactly only from an aligned position.
+  // The complete prompt stays off the alignment for an unchanged retry,
+  // which continues it without prefill; a longer prompt takes an aligned
+  // boundary instead (TextRunnerCapabilities::prefill_alignment).
+  const std::size_t alignment = std::max<std::size_t>(
+      1, impl_->runner->Descriptor().capabilities.prefill_alignment);
   {
     const std::lock_guard lock(impl_->mutex);
     if (impl_->catalog)
@@ -1707,7 +1720,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     if (!entry)
       throw cache::SlotBusy();
     restore_pins.ids.reserve(found.candidates.size());
-    restore_pins.Hold(found);
+    restore_pins.Hold(found, alignment, prompt.size());
     entry->busy = true;
     entry->holds_rows = true;
     entry->used = ++impl_->clock;
@@ -1767,12 +1780,6 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     bool restored = bool(live);
     if (live)
       request.cached = found.selected->boundary;
-    // Prefill continues a checkpoint exactly only from an aligned position.
-    // The complete prompt stays off the alignment for an unchanged retry,
-    // which continues it without prefill; a longer prompt takes an aligned
-    // boundary instead (TextRunnerCapabilities::prefill_alignment).
-    const std::size_t alignment = std::max<std::size_t>(
-        1, impl_->runner->Descriptor().capabilities.prefill_alignment);
     for (const auto& candidate : found.candidates) {
       if (restored || (cancelled && cancelled()))
         break;
@@ -2629,6 +2636,13 @@ std::size_t ServingCacheLease::CaptureBytes() const {
 }
 std::size_t ServingCacheLease::CaptureBytes(std::size_t boundary) const {
   return component_->CaptureBytes(boundary);
+}
+void ComponentTextCache::Lease::MarkAlignedTail(std::size_t boundary) noexcept {
+  impl_->aligned_tail = boundary;
+}
+void ServingCacheLease::MarkAlignedTail(std::size_t boundary) noexcept {
+  if (component_)
+    component_->MarkAlignedTail(boundary);
 }
 bool ServingCacheLease::CaptureRefused(std::size_t boundary) const {
   return component_ && component_->CaptureRefused(boundary);

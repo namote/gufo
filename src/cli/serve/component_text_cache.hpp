@@ -104,6 +104,9 @@ public:
     [[nodiscard]] ComponentCacheMetrics Metrics() const;
     [[nodiscard]] PlannedCapturePoints PlannedCaptures(std::size_t stable,
                                                        std::size_t tail) const;
+    // The capture at `boundary` is the aligned prompt tail before an
+    // unaligned prompt end; retention gives it up before the turn's retry.
+    void MarkAlignedTail(std::size_t boundary) noexcept;
 
   private:
     friend class ComponentTextCache;
@@ -239,6 +242,8 @@ public:
   [[nodiscard]] std::optional<ComponentCacheMetrics> Metrics() const;
   [[nodiscard]] PlannedCapturePoints PlannedCaptures(std::size_t stable,
                                                      std::size_t tail) const;
+  // No effect on a legacy lease.
+  void MarkAlignedTail(std::size_t boundary) noexcept;
 
 private:
   ContinuationCache::Lease legacy_;

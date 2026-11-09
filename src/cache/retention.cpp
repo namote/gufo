@@ -509,10 +509,11 @@ std::size_t RetentionPolicy::Victim(const RetentionRequest& r,
       ((!record_pressure && !r.preserve_source) ||
        (record_pressure && limit_ == 1 && Continuation(r.purpose))))
     return source;
-  return target == limit_ ? target : AlignedTail(target, r);
+  return target == limit_ ? target : AlignedTail(target, r, record_pressure);
 }
 std::size_t RetentionPolicy::AlignedTail(std::size_t retry,
-                                         const RetentionRequest& r) const {
+                                         const RetentionRequest& r,
+                                         bool record_pressure) const {
   const auto& e = records_[retry];
   if (e.purpose != RetentionPurpose::kRetry || retry == Find(r.source))
     return retry;
@@ -523,8 +524,9 @@ std::size_t RetentionPolicy::AlignedTail(std::size_t retry,
     // below[retry] implies the same compatibility and input, and a strict
     // token prefix of the retry.
     if (!t.checkpoint || t.purpose != RetentionPurpose::kContinuation ||
-        !t.below[retry] || i == source || t.pins || t.forked || Persisting(i) ||
-        Branch(i) || t.checkpoint->Boundary() <= e.stable ||
+        !t.aligned_tail || !t.below[retry] || i == source || t.pins ||
+        t.forked || Persisting(i) || Branch(i) ||
+        t.checkpoint->Boundary() <= e.stable ||
         std::ranges::find(r.protected_checkpoints, t.checkpoint->Id()) !=
             r.protected_checkpoints.end())
       continue;
@@ -545,8 +547,9 @@ std::size_t RetentionPolicy::AlignedTail(std::size_t retry,
   }
   // The tail shares the retry's prefix rows. Under byte pressure take it
   // only when it frees about as much (its private state dominates), or the
-  // next round takes the retry as well and the turn keeps neither.
-  if (tail != limit_ &&
+  // next round takes the retry as well and the turn keeps neither. Record
+  // pressure needs one record, which the tail is.
+  if (tail != limit_ && !record_pressure &&
       UniquePayloadBytes(tail) * 2 < UniquePayloadBytes(retry))
     return retry;
   return tail == limit_ ? retry : tail;
@@ -701,6 +704,8 @@ bool RetentionPolicy::Admit(const RetentionRequest& r, const Capture& capture) {
         ++target;
       auto& e = records_[target];
       e = {std::move(checkpoint), entry, purpose, r.stable, ++clock_};
+      e.aligned_tail =
+          r.aligned_tail && purpose == RetentionPurpose::kContinuation;
       ++size_;
       // Keep each event's exact total without recounting every retained
       // checkpoint after each individual eviction or insertion.

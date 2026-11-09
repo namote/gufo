@@ -352,17 +352,19 @@ struct PressureFixture {
   PrefixIndex index{ledger};
   Log log;
   RetentionPolicy policy;
-  explicit PressureFixture(std::size_t ram = 1ULL << 30)
-      : ledger({ram, ram, 0, ram}), policy(ledger, index, &log) {
+  explicit PressureFixture(std::size_t ram = 1ULL << 30,
+                           std::size_t records = RetentionPolicy::kRecordLimit)
+      : ledger({ram, ram, 0, ram}), policy(ledger, index, &log, records) {
     index.Register({1}, kPressureComponents);
   }
   // Each conversation executes separately, so no two share chunks. Admission
   // reclaims through the byte-pressure order when the ledger is full.
   CheckpointId Add(std::vector<Token> tokens,
                    RetentionPurpose purpose = RetentionPurpose::kContinuation,
-                   bool reused = false) {
+                   bool reused = false, bool aligned_tail = false) {
     RetentionRequest request{tokens, {1}, {}, purpose};
     request.reused = reused;
+    request.aligned_tail = aligned_tail;
     assert(policy.Admit(request, [&] {
       return IndexCheckpoint(ledger, tokens, {1}, {}, kPressureComponents);
     }));
@@ -1149,21 +1151,30 @@ void RealCapacityAndUniqueAdmission() {
            f.Cached({129}) == 1);
   }
 }
-}  // namespace
-// Record pressure takes the aligned tail before its retry, too.
+// Record pressure takes the aligned tail before its retry, too. An untagged
+// continuation in the same place (a frozen reused frontier) is not a tail.
 void AlignedTailGoesFirstUnderRecordPressure() {
-  Fixture f(4);
-  const std::vector<Token> prompt{1, 2, 3, 4, 5, 6};
-  f.Add({1, 2});
-  const auto tail = f.Add({1, 2, 3, 4});
-  const auto retry = f.Add(prompt, RetentionPurpose::kRetry, 2);
-  f.Add({9, 9});
-  assert(f.policy.Rank(retry) == 0);
-  std::vector<Token> other{8, 8};
-  assert(f.policy.Admit({other, {1}, {}, RetentionPurpose::kContinuation},
-                        [&] { return IndexCheckpoint(f.ledger, other); }));
-  assert(f.log.events[f.log.events.size() - 2].checkpoint == tail);
-  assert(f.Cached(prompt) == prompt.size());
+  for (const bool tagged : {true, false}) {
+    Fixture f(4);
+    const std::vector<Token> prompt{1, 2, 3, 4, 5, 6};
+    f.Add({1, 2});
+    std::vector<Token> tail_tokens{1, 2, 3, 4};
+    RetentionRequest tail_request{
+        tail_tokens, {1}, {}, RetentionPurpose::kContinuation};
+    tail_request.aligned_tail = tagged;
+    assert(f.policy.Admit(
+        tail_request, [&] { return IndexCheckpoint(f.ledger, tail_tokens); }));
+    const auto tail = f.log.events.back().checkpoint;
+    const auto retry = f.Add(prompt, RetentionPurpose::kRetry, 2);
+    f.Add({9, 9});
+    assert(f.policy.Rank(retry) == 0);
+    std::vector<Token> other{8, 8};
+    assert(f.policy.Admit({other, {1}, {}, RetentionPurpose::kContinuation},
+                          [&] { return IndexCheckpoint(f.ledger, other); }));
+    assert(f.log.events[f.log.events.size() - 2].checkpoint ==
+           (tagged ? tail : retry));
+    assert(f.Cached(prompt) == (tagged ? prompt.size() : 4));
+  }
 }
 // A request restoring a looked-up record pins it: no admission, Reclaim or
 // device reclaim removes it until every pin is released.
@@ -1206,20 +1217,37 @@ void PinnedRecordIsNotAVictim() {
   g.Add({5, 6});
   assert(g.log.events[g.log.events.size() - 2].checkpoint == newer);
   assert(g.policy.TryTouch(oldest));
+  // An exact replacement still ends a pinned record: the request restoring
+  // it sees TryTouch fail, and the new record serves the same prompt.
+  const auto replaced = g.Add({1, 2});
+  assert(replaced != oldest && !g.policy.TryTouch(oldest));
+  assert(g.policy.TryTouch(replaced) && g.Cached({1, 2, 3}) == 2);
 }
 // A turn whose prompt ends off the prefill alignment keeps its aligned prompt
 // tail beside the complete prompt. Under pressure the tail goes first: an
 // unchanged retry needs the complete prompt, while the tail only bounds a
 // next turn that diverges inside the assistant framing.
 void AlignedTailGoesBeforeItsRetry() {
-  enum class Case { kAlone, kDiverged, kPinned, kContinued, kSource, kRecords };
-  for (const auto c : {Case::kAlone, Case::kDiverged, Case::kPinned,
-                       Case::kContinued, Case::kSource, Case::kRecords}) {
-    PressureFixture f;
+  enum class Case {
+    kAlone,
+    kDiverged,
+    kPinned,
+    kContinued,
+    kSource,
+    kRecords,
+    kUntagged
+  };
+  for (const auto c :
+       {Case::kAlone, Case::kDiverged, Case::kPinned, Case::kContinued,
+        Case::kSource, Case::kRecords, Case::kUntagged}) {
+    // kRecords: room for exactly these four records.
+    PressureFixture f(1ULL << 30, c == Case::kRecords ? 4 : 128);
     (void)f.Add(Conversation(1, 16));
     const auto prompt = Conversation(2, 18);
     (void)f.Add({prompt.begin(), prompt.begin() + 8});
-    const auto tail = f.Add({prompt.begin(), prompt.begin() + 16});
+    const auto tail =
+        f.Add({prompt.begin(), prompt.begin() + 16},
+              RetentionPurpose::kContinuation, false, c != Case::kUntagged);
     RetentionRequest request{prompt, {1}, {}, RetentionPurpose::kRetry, 12};
     assert(f.policy.Admit(request, [&] {
       return IndexCheckpoint(f.ledger, prompt, {1}, {}, kPressureComponents);
@@ -1255,16 +1283,50 @@ void AlignedTailGoesBeforeItsRetry() {
         break;
       }
       case Case::kRecords:
+        // The fifth record evicts the tail, not the retry.
+        (void)f.Add(Conversation(5, 16));
+        assert(f.log.events[f.log.events.size() - 2].checkpoint == tail);
+        assert(f.Cached(prompt) == prompt.size());
         break;
       case Case::kContinued:
         // The incoming request continues the tail.
         assert(f.policy.Reclaim({next, {1}, {}}));
         assert(f.log.events.back().checkpoint == retry);
         break;
+      case Case::kUntagged:
+        // A continuation not captured as the aligned tail stays.
+        assert(f.Reclaim() == retry);
+        break;
     }
   }
 }
+// Byte pressure keeps a tail that frees less than half its retry: taking it
+// would leave the next round to take the retry as well. Record pressure needs
+// one record and still takes the tail.
+void SmallAlignedTailUnderPressure() {
+  for (const bool records : {false, true}) {
+    PressureFixture f(1ULL << 30, records ? 4 : 128);
+    (void)f.Add(Conversation(1, 16));
+    const auto prompt = Conversation(2, 200);
+    (void)f.Add({prompt.begin(), prompt.begin() + 8});
+    const auto tail = f.Add({prompt.begin(), prompt.begin() + 16},
+                            RetentionPurpose::kContinuation, false, true);
+    RetentionRequest request{prompt, {1}, {}, RetentionPurpose::kRetry, 12};
+    assert(f.policy.Admit(request, [&] {
+      return IndexCheckpoint(f.ledger, prompt, {1}, {}, kPressureComponents);
+    }));
+    const auto retry = f.log.events.back().checkpoint;
+    if (records) {
+      (void)f.Add(Conversation(5, 16));
+      assert(f.log.events[f.log.events.size() - 2].checkpoint == tail);
+    } else {
+      assert(f.Reclaim() == retry);
+    }
+  }
+}
+}  // namespace
 int main() {
+  SmallAlignedTailUnderPressure();
   AlignedTailGoesFirstUnderRecordPressure();
   PinnedRecordIsNotAVictim();
   AlignedTailGoesBeforeItsRetry();
