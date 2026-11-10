@@ -172,6 +172,19 @@ void QwenGpuExecutor::Reset() noexcept {
   graph_executor_.Reset();
 }
 
+void QwenGpuExecutor::ConfigureAbliteration(bool enabled, bool state_reset) {
+  if (enabled && model_->Abliteration() == nullptr)
+    throw std::invalid_argument("abliteration profile is not loaded");
+  if (enabled == abliteration_enabled_)
+    return;
+  // A failed reset is rethrown by the next operation (CheckReset).
+  if (!state_reset)
+    Reset();
+  // The captured decode graph bakes the projections (or their absence).
+  graph_executor_.Reset();
+  abliteration_enabled_ = enabled;
+}
+
 std::unique_ptr<QwenGpuSnapshot> QwenGpuExecutor::SaveSnapshot(
     std::uint32_t valid_context) {
   CheckReset();

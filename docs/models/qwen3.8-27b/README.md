@@ -111,3 +111,5 @@ Image numbering is off by default; `--add-vision-id` or
 `chat_template_kwargs: {"add_vision_id": true}` adds `Picture N:` prefixes.
 Cache identity includes processed pixels, placement, preprocessing version and
 projector contents. See [vision checks and limits](QUALITY.md#vision).
+
+Optional runtime intervention: [abliteration architecture and preparation](ABLITERATION.md) (GPU qualification pending).

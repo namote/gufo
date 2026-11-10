@@ -14,6 +14,7 @@
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/exl3_dispatch.hpp"
 #include "src/models/qwen/hip/ops.hpp"
+#include "src/models/qwen/hip/ops/abliteration.hpp"
 #include "src/models/qwen/hip/ops/hadamard.hpp"
 
 namespace gufo::hip {
@@ -40,6 +41,8 @@ private:
 };
 
 constexpr std::size_t kMaxDecodeBatch = 8;
+// One masked projection launch covers every session of a batched pass.
+static_assert(kMaxDecodeBatch <= kQwenAbliterationMaxSpans);
 
 // Batched RMSNorm; a rotated input group gets the rotated row instead.
 void LaunchGroupNorm(const float* hidden, const float* weight, float* normed,
@@ -365,6 +368,22 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
                              hipMemcpyHostToDevice, arena.stream));
   }
 
+  // Each session's row takes its own mode; nothing launches without a loaded
+  // profile or while every session is OFF.
+  const float* abliteration_direction =
+      coordinator->model_->AbliterationDirection();
+  const auto project = [&](float* rows, std::uint32_t layer, bool mlp) {
+    if (abliteration_direction == nullptr)
+      return;
+    std::array<QwenAbliterationSpan, kMaxDecodeBatch> spans{};
+    for (std::size_t row = 0; row < batch_size; ++row)
+      spans[row] = {static_cast<std::uint32_t>(row + 1),
+                    items[row].executor->AbliterationWeight(layer, mlp)};
+    LaunchQwenAbliterateRows(
+        rows, abliteration_direction, std::span(spans.data(), batch_size),
+        static_cast<std::uint32_t>(batch_size),
+        static_cast<std::uint32_t>(hidden_size), arena.stream);
+  };
   EmitDecodeRouteTelemetry(weights, coordinator->policy_);
   for (std::uint32_t layer_index = 0; layer_index < config.num_layers;
        ++layer_index) {
@@ -472,6 +491,7 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
                        ssm_inner_size, arena.stream, arena.Exl3Scratch());
     }
 
+    project(scratch.attention.output.data(), layer_index, false);
     LaunchBatchedResidualAdd(
         scratch.decode.hidden.data(), scratch.attention.output.data(),
         scratch.decode.hidden.data(), batch_size, hidden_size, arena.stream);
@@ -482,6 +502,7 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
 
     LaunchFfn(layer, config, scratch, batch_size, arena.stream,
               arena.Exl3Scratch());
+    project(scratch.ffn.out.data(), layer_index, true);
     LaunchBatchedResidualAdd(
         scratch.decode.hidden.data(), scratch.ffn.out.data(),
         scratch.decode.hidden.data(), batch_size, hidden_size, arena.stream);
@@ -696,6 +717,24 @@ QwenGpuExecutor::ForwardVerificationBatch(
                            host_positions.data(),
                            batch_size * sizeof(std::uint32_t),
                            hipMemcpyHostToDevice, arena_.stream));
+  // Each session's rows take its own mode, so target verification uses the
+  // intervention (drafts stay unmodified); nothing launches without a loaded
+  // profile or while every session is OFF.
+  const float* abliteration_direction =
+      coordinator.model_->AbliterationDirection();
+  const auto project = [&](float* rows, std::uint32_t layer, bool mlp) {
+    if (abliteration_direction == nullptr)
+      return;
+    std::array<QwenAbliterationSpan, kMaxDecodeBatch> spans{};
+    for (std::size_t index = 0; index < items.size(); ++index)
+      spans[index] = {static_cast<std::uint32_t>(offsets[index] +
+                                                 items[index].tokens.size()),
+                      items[index].executor->AbliterationWeight(layer, mlp)};
+    LaunchQwenAbliterateRows(
+        rows, abliteration_direction, std::span(spans.data(), items.size()),
+        static_cast<std::uint32_t>(batch_size),
+        static_cast<std::uint32_t>(hidden_size), arena_.stream);
+  };
   EmitDecodeRouteTelemetry(weights_, coordinator.policy_);
   for (std::uint32_t layer_index = 0; layer_index < config.num_layers;
        ++layer_index) {
@@ -887,6 +926,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
                        ssm_inner_size, arena_.stream, arena_.Exl3Scratch());
     }
 
+    project(scratch.attention.output.data(), layer_index, false);
     LaunchBatchedResidualAdd(
         scratch.decode.hidden.data(), scratch.attention.output.data(),
         scratch.decode.hidden.data(), batch_size, hidden_size, arena_.stream);
@@ -897,6 +937,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
 
     LaunchFfn(layer, config, scratch, batch_size, arena_.stream,
               arena_.Exl3Scratch());
+    project(scratch.ffn.out.data(), layer_index, true);
     LaunchBatchedResidualAdd(
         scratch.decode.hidden.data(), scratch.ffn.out.data(),
         scratch.decode.hidden.data(), batch_size, hidden_size, arena_.stream);

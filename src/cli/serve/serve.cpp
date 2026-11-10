@@ -633,9 +633,10 @@ void PrintServeHelp(std::string_view program_name,
                    "Flash-Next: static YaRN, required for --context above the "
                    "native 262144; it applies to every request",
                    "Model", &enable_yarn);
-    parser.AddOption("", "--abliteration-profile", "FILE",
-                     "Flash-Next: load optional projection profile", "Model",
-                     &abliteration_profile);
+    parser.AddOption(
+        "", "--abliteration-profile", "FILE",
+        "Qwen3.8-27B, Flash-Next: load optional projection profile", "Model",
+        &abliteration_profile);
     RegisterKvCacheTypeOption(parser, &kv_cache_type, "Model");
 
     // Sampling Defaults
@@ -1288,7 +1289,8 @@ int RunServe(std::span<const char* const> args) {
                        "Model", &enable_yarn);
     llm_parser.AddOption(
         "", "--abliteration-profile", "FILE",
-        "Flash-Next: load optional request-selectable projection profile",
+        "Qwen3.8-27B, Flash-Next: load optional request-selectable "
+        "projection profile",
         "Model", &abliteration_profile);
     RegisterKvCacheTypeOption(llm_parser, &kv_cache_type, "Model");
     llm_parser.AddOption(

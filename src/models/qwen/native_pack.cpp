@@ -326,4 +326,10 @@ std::string NativeArtifactIdentity(const core::GgufReader& metadata) {
   return result;
 }
 
+std::string ArtifactIdentity(const core::GgufReader& reader) {
+  return reader.GetMetadataBool(quant::exl3::kNativeKey).value_or(false)
+             ? NativeArtifactIdentity(reader)
+             : core::GgufIdentityHex(reader);
+}
+
 }  // namespace gufo::models::qwen

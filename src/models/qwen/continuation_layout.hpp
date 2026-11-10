@@ -1,12 +1,16 @@
 #ifndef GUFO_MODELS_QWEN_CONTINUATION_LAYOUT_HPP_
 #define GUFO_MODELS_QWEN_CONTINUATION_LAYOUT_HPP_
 
+#include <array>
+#include <cstddef>
+#include <cstdint>
 #include <span>
 #include <vector>
 
 #include "src/cache/types.hpp"
 #include "src/core/hip/kvarn_checkpoint.hpp"
 #include "src/core/model_config.hpp"
+#include "src/models/qwen/abliteration.hpp"
 #include "src/models/qwen/hip/execution_policy.hpp"
 
 namespace gufo::models::qwen {
@@ -41,6 +45,30 @@ struct ContinuationComponent {
 };
 
 inline constexpr std::size_t kContinuationMetadataBytes = 64;
+/// The kMetadata component. A capture zero-fills the bytes after it.
+struct ContinuationMetadata {
+  std::uint32_t version{1}, position{}, logits_valid{}, has_next{}, next{},
+      image_bytes{};
+  /// Raw image identity OFF; salted with the profile identity ON.
+  std::array<std::uint8_t, 32> image{};
+  /// AbliterationContinuationRecord::mode. Appended in four bytes every
+  /// earlier capture zero-filled, so OFF (0) entries keep their bytes.
+  std::uint32_t abliteration{};
+
+  /// Records `identity` (empty or 32 bytes) and the capture's mode; `active`
+  /// is the slot's profile while abliteration is ON, else null.
+  void RecordImage(std::span<const std::uint8_t> identity,
+                   const AbliterationProfile* active);
+  /// Whether this entry restores into a slot whose image identity at its
+  /// position is `identity` and whose active profile is `active`.
+  [[nodiscard]] bool ImageMatches(std::span<const std::uint8_t> identity,
+                                  const AbliterationProfile* active) const;
+};
+static_assert(offsetof(ContinuationMetadata, abliteration) == 56 &&
+              offsetof(ContinuationMetadata, abliteration) ==
+                  offsetof(ContinuationMetadata, image) +
+                      sizeof(ContinuationMetadata::image));
+static_assert(sizeof(ContinuationMetadata) <= kContinuationMetadataBytes);
 inline constexpr std::size_t kContinuationFrontierMetadataBytes = 96;
 inline constexpr std::size_t kContinuationPendingTokens = 9;
 // Leads the kKvarnTail state: version, flushed_end, written_end.

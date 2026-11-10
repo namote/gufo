@@ -20,6 +20,7 @@
 #include "src/models/qwen/exl3_weights.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
+#include "src/models/qwen/native_pack.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -413,19 +414,25 @@ QwenGpuModel::QwenGpuModel(
     std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
     std::vector<QwenGpuWeightRegion> weight_regions,
     std::shared_ptr<models::qwen::vision::Encoder> vision, void* rotation_signs,
-    std::size_t exl3_bytes)
+    std::size_t exl3_bytes,
+    std::shared_ptr<const models::qwen::AbliterationProfile> abliteration,
+    float* abliteration_direction)
     : reader_(std::move(reader)),
       weights_(std::move(weights)),
       tokenizer_(std::move(tokenizer)),
       weight_regions_(std::move(weight_regions)),
       vision_(std::move(vision)),
       rotation_signs_(rotation_signs),
-      exl3_bytes_(exl3_bytes) {}
+      exl3_bytes_(exl3_bytes),
+      abliteration_(std::move(abliteration)),
+      abliteration_direction_(abliteration_direction) {}
 
 QwenGpuModel::~QwenGpuModel() {
   if (rotation_signs_ != nullptr) {
     (void)hipFree(rotation_signs_);
   }
+  if (abliteration_direction_ != nullptr)
+    (void)hipFree(abliteration_direction_);
   ReleaseWeightRegions(weight_regions_);
 }
 
@@ -442,13 +449,16 @@ std::size_t QwenGpuModel::GetResidentBytes() const noexcept {
 
 std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
     std::shared_ptr<const core::GgufReader> reader, std::string* error_msg,
-    std::shared_ptr<models::qwen::vision::Encoder> vision) {
+    std::shared_ptr<models::qwen::vision::Encoder> vision,
+    const std::string& abliteration_profile) {
   if (reader == nullptr) {
     if (error_msg != nullptr) {
       *error_msg = "GGUF reader must not be null";
     }
     return nullptr;
   }
+  // The artifact as opened: a native pack's reader is replaced below.
+  const auto artifact = reader;
 
   if (!tokenization::QwenChatTemplate::ValidateGgufTemplate(*reader,
                                                             error_msg)) {
@@ -474,6 +484,20 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
     weights_opt = models::QwenModelWeights::LoadFromGguf(*reader, error_msg);
   }
   if (!weights_opt.has_value()) {
+    return nullptr;
+  }
+  std::shared_ptr<const models::qwen::AbliterationProfile> abliteration;
+  try {
+    // Only the explicit option loads a profile; none is discovered.
+    if (!abliteration_profile.empty())
+      abliteration = models::qwen::LoadAbliterationOption(
+          abliteration_profile, weights_opt->config.hidden_size,
+          weights_opt->config.num_layers,
+          models::qwen::ArtifactIdentity(*artifact),
+          models::qwen::kAbliterationWriterBeforeResidual);
+  } catch (const std::exception& e) {
+    if (error_msg != nullptr)
+      *error_msg = e.what();
     return nullptr;
   }
 
@@ -530,11 +554,34 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
     return nullptr;
   }
 
+  float* abliteration_direction = nullptr;
+  if (abliteration != nullptr) {
+    const auto bytes = abliteration->direction.size() * sizeof(float);
+    void* direction = nullptr;
+    hipError_t status = hipMalloc(&direction, bytes);
+    if (status == hipSuccess)
+      status = hipMemcpy(direction, abliteration->direction.data(), bytes,
+                         hipMemcpyHostToDevice);
+    if (status != hipSuccess) {
+      if (direction != nullptr)
+        (void)hipFree(direction);
+      if (rotation_signs != nullptr)
+        (void)hipFree(rotation_signs);
+      ReleaseWeightRegions(weight_regions);
+      if (error_msg != nullptr)
+        *error_msg = std::string("abliteration direction upload failed: ") +
+                     hipGetErrorString(status);
+      return nullptr;
+    }
+    abliteration_direction = static_cast<float*>(direction);
+  }
+
   std::shared_ptr<const tokenization::QwenTokenizer> shared_tokenizer(
       std::move(tokenizer));
   return std::make_shared<const QwenGpuModel>(
       std::move(reader), std::move(*weights_opt), std::move(shared_tokenizer),
-      std::move(weight_regions), std::move(vision), rotation_signs, exl3_bytes);
+      std::move(weight_regions), std::move(vision), rotation_signs, exl3_bytes,
+      std::move(abliteration), abliteration_direction);
 }
 
 std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::Create(

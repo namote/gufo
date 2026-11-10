@@ -20,6 +20,8 @@ add_qwen27b_test(qwen27b_continuation_layout_test continuation_layout_test.cpp
   "cpu;correctness")
 add_qwen27b_test(qwen27b_rotation_binding_test rotation_binding_test.cpp
   "cpu;rotation;correctness")
+add_qwen27b_test(qwen27b_abliteration_test abliteration_test.cpp
+  "cpu;abliteration;correctness")
 
 add_qwen27b_test(qwen_mtp_reference_test mtp_reference_test.cpp
   "cpu;mtp;external-model")
@@ -59,6 +61,15 @@ if (ENGINE_ENABLE_HIP)
   add_qwen27b_test(qwen27b_rotation_kernels_test rotation_kernels_test.hip
     "hip;gpu;rotation;kernels;correctness")
   target_link_libraries(qwen27b_rotation_kernels_test PRIVATE hip::host)
+  add_qwen27b_test(qwen27b_abliteration_ops_test abliteration_ops_test.hip
+    "hip;gpu;abliteration;kernels;correctness")
+  target_link_libraries(qwen27b_abliteration_ops_test PRIVATE hip::host)
+  # Native activation/evaluation collector for profile preparation
+  # (tools/qwen27b/abliteration); needs a model and a dataset, so no CTest.
+  add_executable(qwen27b_abliteration_collect EXCLUDE_FROM_ALL
+    ${PROJECT_SOURCE_DIR}/tools/qwen27b/abliteration/collect.cpp)
+  target_link_libraries(qwen27b_abliteration_collect PRIVATE gufo_core
+    gufo_model_artifact)
   add_qwen27b_test(qwen27b_exl3_reference_test exl3_reference_test.hip
     "hip;gpu;exl3;correctness")
   target_link_libraries(qwen27b_exl3_reference_test PRIVATE hip::host)

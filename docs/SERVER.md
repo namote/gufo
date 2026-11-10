@@ -469,6 +469,20 @@ The server uses compiled model-specific formatters and validates recognized
 artifact template hashes during model loading. It does not accept custom Jinja
 or claim to enforce a reasoning-token budget.
 
+### Runtime abliteration
+
+Qwen3.8-27B and Qwen3.8-Flash-Next support an optional, request-selectable
+runtime projection. `--abliteration-profile FILE` loads one model-bound
+profile; nothing is discovered beside the model, and other models reject the
+option. Chat Completions, Responses and Messages requests select it with
+`{"abliteration":{"enabled":true,"profile":"default"}}`; omitting the object or
+`"enabled":false` is OFF. Raw completions do not accept it, and an unloaded
+profile or unknown member returns `invalid_abliteration`. ON and OFF requests,
+and different profiles, never share cached or continued state; OFF behaves and
+caches exactly as without a profile. Preparation and qualification are
+model-specific: see [Qwen3.8-27B](models/qwen3.8-27b/ABLITERATION.md) and
+[Flash-Next](models/qwen3.8-flash-next/ABLITERATION.md).
+
 Diagnostic telemetry is limited to status, token counts, timing, and
 cancellation state. It must not contain prompt text, model paths, machine
 identity, request IDs, or token IDs.

@@ -1,4 +1,5 @@
 target_sources(gufo_core PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/models/qwen/abliteration.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/continuation_layout.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/vision/exl3_weights.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/vision/image_cache.cpp
@@ -37,6 +38,7 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/vision/device_input.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/attention.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/batched_ssm.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/abliteration.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_embed.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_gemm.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_quant_gemm.hip

@@ -9,7 +9,10 @@
 
 namespace gufo::models {
 struct QwenModelWeights;
+namespace qwen {
+struct AbliterationProfile;
 }
+}  // namespace gufo::models
 
 namespace gufo::hip {
 
@@ -24,15 +27,18 @@ void EmitDecodeRouteTelemetry(const models::QwenModelWeights& weights,
 /// Runs one graph-capture-safe decode layer stack using stable arena storage.
 /// `recurrent_state` is the pass's QwenGpuArena::BeginRecurrentWrite result;
 /// a captured graph bakes its pointers, so the graph key must carry
-/// QwenGpuArena::RecurrentIoIdentity.
-void ExecuteDecodeStep(QwenGpuArena& arena,
-                       const models::QwenModelWeights& weights,
-                       const QwenExecutionPolicy& policy,
-                       tokenization::TokenId token_id, std::uint32_t pos,
-                       bool compute_logits,
-                       QwenRecurrentStateIo recurrent_state,
-                       models::qwen::vision::DeviceInput* image_input = nullptr,
-                       std::uint32_t kvarn_groups = 0);
+/// QwenGpuArena::RecurrentIoIdentity. `abliteration` (null OFF) projects
+/// `abliteration_direction` out of each attention/GDN and MLP writer output
+/// before its residual add; the graph key must distinguish it as well.
+void ExecuteDecodeStep(
+    QwenGpuArena& arena, const models::QwenModelWeights& weights,
+    const QwenExecutionPolicy& policy, tokenization::TokenId token_id,
+    std::uint32_t pos, bool compute_logits,
+    QwenRecurrentStateIo recurrent_state,
+    models::qwen::vision::DeviceInput* image_input = nullptr,
+    std::uint32_t kvarn_groups = 0,
+    const models::qwen::AbliterationProfile* abliteration = nullptr,
+    const float* abliteration_direction = nullptr);
 
 }  // namespace gufo::hip
 

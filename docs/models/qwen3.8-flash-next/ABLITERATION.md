@@ -7,8 +7,9 @@ This is a reversible inference intervention, not a weight conversion.
 
 ## Ownership and execution
 
-- `abliteration.{hpp,cpp}` owns the versioned, immutable, model-bound profile and
-  cache identity. It has no HIP dependency.
+- `abliteration.{hpp,cpp}` binds the shared Qwen profile
+  (`src/models/qwen/abliteration`: versioned, immutable, model-bound, with its
+  cache identity) to this placement. It has no HIP dependency.
 - The model loads one direction once; the executor keeps its GPU copy. Each
   session owns its ON/OFF state. There is no server-global mutable toggle.
 - The hook acts on the attention/GDN output projection and the **aggregated**
@@ -38,7 +39,9 @@ The GPU operation is `y -= strength * direction * dot(direction, y)` with an
 FP32 reduction and unit direction. The file carries separate per-layer attention
 and MLP strengths. Versioning the placement and dimensions allows future
 architectures to implement their own adapter rather than scatter model-specific
-conditions through the server. This implementation supports Flash-Next only.
+conditions through the server. Flash-Next and
+[Qwen3.8-27B](../qwen3.8-27b/ABLITERATION.md) (`writer-before-residual`)
+implement it.
 
 ## Profile and API
 

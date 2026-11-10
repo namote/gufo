@@ -84,6 +84,11 @@ struct QwenImageContext : TextPromptContext {
   std::shared_ptr<const models::qwen::vision::Prompt> prompt;
 };
 
+/// A request with runtime abliteration ON (Flash-Next, Qwen3.8-27B).
+struct AbliterationPromptContext final : QwenImageContext {
+  bool abliteration{false};
+};
+
 tokenization::ChatTemplateOptions QwenChatOptions(const ChatRequest& request,
                                                   std::uint32_t max_context) {
   auto options = tokenization::ResolveQwenChatOptions(request.reasoning,
@@ -200,6 +205,42 @@ std::shared_ptr<const models::qwen::vision::Prompt> QwenPrompt(
   if (!image)
     throw std::invalid_argument("invalid Qwen prompt context");
   return image->prompt;
+}
+
+/// Selects the runtime projection for one request. OFF returns `result`
+/// unchanged. ON records the mode and salts the text and every image-prefix
+/// cache identity with the profile identity, so ON/OFF or different profiles
+/// never share cached state.
+TextPreparedPrompt SelectAbliteration(
+    TextPreparedPrompt result, const ChatRequest& request,
+    const models::qwen::AbliterationProfile* profile) {
+  if (!request.abliteration)
+    return result;
+  if (!profile)
+    throw std::invalid_argument(
+        "abliteration profile is not loaded; prepare it first");
+  auto context = std::make_shared<AbliterationPromptContext>();
+  context->abliteration = true;
+  if (result.context) {
+    context->prompt = QwenPrompt(result.context);
+    context->cache_identity = result.context->cache_identity;
+    context->cache_prefixes = result.context->cache_prefixes;
+  }
+  context->cache_identity = models::qwen::AbliterationInputIdentity(
+      context->cache_identity, profile->identity);
+  for (auto& prefix : context->cache_prefixes)
+    prefix.identity = models::qwen::AbliterationInputIdentity(
+        prefix.identity, profile->identity);
+  result.context = std::move(context);
+  return result;
+}
+
+/// Whether a request's prompt context selects runtime abliteration.
+bool AbliterationSelected(
+    const std::shared_ptr<const TextPromptContext>& context) {
+  const auto* selection =
+      dynamic_cast<const AbliterationPromptContext*>(context.get());
+  return selection && selection->abliteration;
 }
 
 // The Han tokens (--han-scale) of a runner whose samplers apply them, built
@@ -444,8 +485,10 @@ public:
   };
   [[nodiscard]] PrefillScope BeginPrefill() { return PrefillScope(*this); }
 
-  void Invalidate() noexcept override {
-    (void)adapter_->Invalidate(*slot_);
+  void Invalidate() noexcept override { (void)InvalidateChecked(); }
+  /// Invalidate, returning whether the slot (target and draft) was reset.
+  [[nodiscard]] bool InvalidateChecked() noexcept {
+    const bool reset = adapter_->Invalidate(*slot_);
     sequence_.clear();
     position_ = 0;
     frontier_.reset();
@@ -455,6 +498,7 @@ public:
     rollback_position_.reset();
     rollback_tokens_.clear();
     rollback_logits_.clear();
+    return reset;
   }
 
   [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
@@ -1303,9 +1347,10 @@ public:
 
   [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
       const ChatRequest& request) const override {
-    return PrepareQwenPrompt(request, model_->GetTokenizer(),
-                             model_->VisionEncoder(), max_context_,
-                             image_cache_);
+    return SelectAbliteration(
+        PrepareQwenPrompt(request, model_->GetTokenizer(),
+                          model_->VisionEncoder(), max_context_, image_cache_),
+        request, model_->Abliteration());
   }
 
   [[nodiscard]] std::optional<std::size_t> CountPromptTokens(
@@ -1323,8 +1368,20 @@ public:
   void SetPromptContext(
       TextRunnerState& state,
       std::shared_ptr<const TextPromptContext> context) const override {
-    RequireQwenState(state).executor().ConfigureVision(QwenPrompt(context),
-                                                       model_->VisionEncoder());
+    auto& qwen = RequireQwenState(state);
+    const bool abliteration = AbliterationSelected(context);
+    if (qwen.executor().AbliterationEnabled() != abliteration) {
+      // Neither the target nor the draft keeps rows of the other mode. A
+      // matched (live or restored) slot already has this request's mode: its
+      // cache identity carries the mode and profile.
+      if (!qwen.InvalidateChecked())
+        throw std::runtime_error(
+            "Qwen slot could not be reset for an abliteration mode change");
+      qwen.executor().ConfigureAbliteration(abliteration,
+                                            /*state_reset=*/true);
+    }
+    qwen.executor().ConfigureVision(QwenPrompt(context),
+                                    model_->VisionEncoder());
   }
 
   [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
@@ -2561,10 +2618,6 @@ const QwenFlashNextTextRunnerState& RequireQwenFlashNextState(
   return *qfn;
 }
 
-struct FlashNextPromptContext final : QwenImageContext {
-  bool abliteration{false};
-};
-
 class QwenFlashNextTextRunner final : public HipTextModelRunner {
 public:
   sampling::JsonConstraint::ToolFormat ToolFormat() const override {
@@ -2890,30 +2943,10 @@ public:
 
   [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
       const ChatRequest& request) const override {
-    auto result =
+    return SelectAbliteration(
         PrepareQwenPrompt(request, model_->tokenizer(), model_->VisionEncoder(),
-                          max_context_, image_cache_);
-    if (!request.abliteration)
-      return result;
-    const auto* profile = model_->Abliteration();
-    if (!profile)
-      throw std::invalid_argument(
-          "abliteration profile is not loaded; prepare it first");
-    auto context = std::make_shared<FlashNextPromptContext>();
-    context->abliteration = true;
-    if (result.context) {
-      context->prompt = QwenPrompt(result.context);
-      context->cache_identity = result.context->cache_identity;
-      context->cache_prefixes = result.context->cache_prefixes;
-    }
-    context->cache_identity =
-        models::qwen38_flash_next::AbliterationInputIdentity(
-            context->cache_identity, profile->identity);
-    for (auto& prefix : context->cache_prefixes)
-      prefix.identity = models::qwen38_flash_next::AbliterationInputIdentity(
-          prefix.identity, profile->identity);
-    result.context = std::move(context);
-    return result;
+                          max_context_, image_cache_),
+        request, model_->Abliteration());
   }
 
   [[nodiscard]] std::optional<std::size_t> CountPromptTokens(
@@ -2932,9 +2965,7 @@ public:
       TextRunnerState& state,
       std::shared_ptr<const TextPromptContext> context) const override {
     auto& session = RequireQwenFlashNextState(state).session();
-    const auto* selection =
-        dynamic_cast<const FlashNextPromptContext*>(context.get());
-    session.ConfigureAbliteration(selection && selection->abliteration);
+    session.ConfigureAbliteration(AbliterationSelected(context));
     session.ConfigureVision(QwenPrompt(context));
   }
 
@@ -3462,8 +3493,11 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
   const auto architecture =
       reader->GetMetadataString("general.architecture").value_or("");
-  if (!abliteration_profile.empty() && architecture != "qwen4exp") {
-    SetError(error, "--abliteration-profile applies only to Flash-Next");
+  if (!abliteration_profile.empty() && architecture != "qwen4exp" &&
+      architecture != "qwen35") {
+    SetError(error,
+             "--abliteration-profile applies only to Qwen3.8-27B and "
+             "Flash-Next");
     return false;
   }
   if (enable_yarn && architecture != "qwen4exp") {
@@ -3716,8 +3750,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   }
   Logger::Info("loader", "event=load_phase phase=target_weights " +
                              Logger::MemoryStatus());
-  auto model =
-      hip::QwenGpuModel::CreateFromGguf(reader, &load_error, std::move(vision));
+  auto model = hip::QwenGpuModel::CreateFromGguf(
+      reader, &load_error, std::move(vision), abliteration_profile);
   if (model == nullptr) {
     SetError(error, "Failed to create GPU model: " + load_error);
     return false;
@@ -3871,6 +3905,7 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
         sampling::TextPreset(model->GetConfig());
     new_state->sampling_defaults.supplied = {};
     new_state->supports_images = model->VisionEncoder() != nullptr;
+    new_state->supports_abliteration = model->Abliteration() != nullptr;
     auto runner = std::make_shared<QwenTextRunner>(
         std::move(model), max_context, std::move(dflash_model),
         speculative_options, disk_cache_config.model_artifact_fingerprint,

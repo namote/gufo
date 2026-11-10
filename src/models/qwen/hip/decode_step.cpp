@@ -7,6 +7,7 @@
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/exl3_dispatch.hpp"
 #include "src/models/qwen/hip/ops.hpp"
+#include "src/models/qwen/hip/ops/abliteration.hpp"
 #include "src/models/qwen/hip/ops/hadamard.hpp"
 #include "src/models/qwen/hip/output_head.hpp"
 #include "src/models/qwen/modules/modules.hpp"
@@ -57,7 +58,9 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
                        bool compute_logits,
                        QwenRecurrentStateIo recurrent_state,
                        models::qwen::vision::DeviceInput* image_input,
-                       std::uint32_t kvarn_groups) {
+                       std::uint32_t kvarn_groups,
+                       const models::qwen::AbliterationProfile* abliteration,
+                       const float* abliteration_direction) {
   const auto* rope = image_input != nullptr ? image_input->rope() : nullptr;
   (void)token_id;
   const auto& config = weights.config;
@@ -305,6 +308,11 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
 
     bool ffn_rotated = false;
     {
+      if (abliteration != nullptr)
+        LaunchQwenAbliterateRows(
+            attention_scratch.output.data(), abliteration_direction,
+            abliteration->attention[l], 1,
+            static_cast<std::uint32_t>(hidden_size), arena.stream);
       gufo::models::qwen::ResidualAdd(module_ctx, decode_scratch.hidden,
                                       attention_scratch.output);
 
@@ -362,6 +370,10 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
     }
 
     // Residual Add
+    if (abliteration != nullptr)
+      LaunchQwenAbliterateRows(
+          ffn_scratch.out.data(), abliteration_direction, abliteration->mlp[l],
+          1, static_cast<std::uint32_t>(hidden_size), arena.stream);
     gufo::models::qwen::ResidualAdd(module_ctx, decode_scratch.hidden,
                                     ffn_scratch.out);
 

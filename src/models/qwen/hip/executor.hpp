@@ -17,6 +17,7 @@
 
 #include "src/core/model_config.hpp"
 #include "src/core/quant/exl3/reference.hpp"
+#include "src/models/qwen/abliteration.hpp"
 #include "src/models/qwen/continuation_hooks.hpp"
 #include "src/models/qwen/forward.hpp"
 #include "src/models/qwen/generator.hpp"
@@ -96,7 +97,10 @@ public:
                std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
                std::vector<QwenGpuWeightRegion> weight_regions,
                std::shared_ptr<models::qwen::vision::Encoder> vision = {},
-               void* rotation_signs = nullptr, std::size_t exl3_bytes = 0);
+               void* rotation_signs = nullptr, std::size_t exl3_bytes = 0,
+               std::shared_ptr<const models::qwen::AbliterationProfile>
+                   abliteration = {},
+               float* abliteration_direction = nullptr);
   ~QwenGpuModel();
 
   QwenGpuModel(const QwenGpuModel&) = delete;
@@ -104,10 +108,24 @@ public:
   QwenGpuModel(QwenGpuModel&&) = delete;
   QwenGpuModel& operator=(QwenGpuModel&&) = delete;
 
+  /// `abliteration_profile`: the explicit `--abliteration-profile` file,
+  /// bound to this artifact's identity and the `writer-before-residual`
+  /// placement. Empty loads none and allocates nothing.
   [[nodiscard]] static std::shared_ptr<const QwenGpuModel> CreateFromGguf(
       std::shared_ptr<const core::GgufReader> reader,
       std::string* error_msg = nullptr,
-      std::shared_ptr<models::qwen::vision::Encoder> vision = {});
+      std::shared_ptr<models::qwen::vision::Encoder> vision = {},
+      const std::string& abliteration_profile = {});
+
+  /// The loaded runtime projection profile, or null.
+  [[nodiscard]] const models::qwen::AbliterationProfile* Abliteration()
+      const noexcept {
+    return abliteration_.get();
+  }
+  /// Device copy of Abliteration()->direction; null without a profile.
+  [[nodiscard]] const float* AbliterationDirection() const noexcept {
+    return abliteration_direction_;
+  }
 
   [[nodiscard]] const std::shared_ptr<models::qwen::vision::Encoder>&
   VisionEncoder() const noexcept {
@@ -140,6 +158,8 @@ private:
   void* rotation_signs_{nullptr};
   // Device bytes of the EXL3 projections (QwenModelWeights::exl3_storage).
   std::size_t exl3_bytes_{0};
+  std::shared_ptr<const models::qwen::AbliterationProfile> abliteration_;
+  float* abliteration_direction_{nullptr};
 };
 
 class QwenGpuSnapshot final {
@@ -723,6 +743,30 @@ public:
     return policy_;
   }
 
+  /// Selects this session's runtime projection, the model's profile. Throws
+  /// std::invalid_argument enabling it without a loaded profile. A change
+  /// resets the session (computed rows of one mode never serve the other) and
+  /// its captured decode graph; callers that track the session's state, such
+  /// as a component-cache slot with a draft, invalidate it first and pass
+  /// `state_reset` true after a successful invalidation.
+  void ConfigureAbliteration(bool enabled, bool state_reset = false);
+  [[nodiscard]] bool AbliterationEnabled() const noexcept {
+    return abliteration_enabled_;
+  }
+  /// The model's profile while this session has abliteration ON, else null.
+  [[nodiscard]] const models::qwen::AbliterationProfile* ActiveAbliteration()
+      const noexcept {
+    return abliteration_enabled_ ? model_->Abliteration() : nullptr;
+  }
+  using ActivationObserver =
+      std::function<void(std::uint32_t, std::span<const float>)>;
+  /// Standalone collector only: after each layer of a prompt pass, the
+  /// residual row of the pass's final token (FP32, synchronous). Empty
+  /// disables it. Not for serving: every layer synchronizes the stream.
+  void SetActivationObserver(ActivationObserver observer) {
+    activation_observer_ = std::move(observer);
+  }
+
   /// Runs one single token forward step on GPU, returning next token ID.
   [[nodiscard]] tokenization::TokenId ForwardToken(
       tokenization::TokenId token_id, std::uint32_t pos,
@@ -925,6 +969,16 @@ private:
   std::optional<tokenization::TokenId> next_token_;
   bool capture_prompt_hidden_{false};
   bool replaying_ssm_state_{false};
+  bool abliteration_enabled_{false};
+  ActivationObserver activation_observer_;
+  /// This session's projection strength at `layer`'s attention/GDN (`mlp`
+  /// false) or MLP writer; zero while OFF.
+  [[nodiscard]] float AbliterationWeight(std::uint32_t layer,
+                                         bool mlp) const noexcept {
+    const auto* profile = ActiveAbliteration();
+    return profile ? (mlp ? profile->mlp[layer] : profile->attention[layer])
+                   : 0.0F;
+  }
 };
 
 }  // namespace gufo::hip

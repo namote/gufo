@@ -10,6 +10,7 @@
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/exl3_dispatch.hpp"
 #include "src/models/qwen/hip/ops.hpp"
+#include "src/models/qwen/hip/ops/abliteration.hpp"
 #include "src/models/qwen/hip/ops/hadamard.hpp"
 #include "src/models/qwen/hip/ops/prefill_fp16.hpp"
 #include "src/models/qwen/hip/output_head.hpp"
@@ -121,7 +122,18 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
   vision_input_.Inject(scratch.decode.hidden.data(), start_pos, batch_size,
                        hidden_size, 1, arena_.stream);
 
-  const bool half_prefill = UseQwen27bFp16Prefill(weights_, batch_size);
+  // ON projects the attention/GDN and MLP writer outputs before their residual
+  // add, which the FP16 prefill fuses into its GEMMs; it takes the FP32 path.
+  const auto* abliteration = ActiveAbliteration();
+  const auto project = [&](float* rows, float weight) {
+    if (abliteration != nullptr)
+      LaunchQwenAbliterateRows(rows, model_->AbliterationDirection(), weight,
+                               static_cast<std::uint32_t>(batch_size),
+                               static_cast<std::uint32_t>(hidden_size),
+                               arena_.stream);
+  };
+  const bool half_prefill =
+      abliteration == nullptr && UseQwen27bFp16Prefill(weights_, batch_size);
   const auto gemm_weight = [&](const models::QwenTensorRef& w,
                                const void* bf16_input, const float* fp32_input,
                                float* output, std::size_t m, std::size_t k,
@@ -599,6 +611,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                     arena_.d_scratch_q8_act);
       }
     }
+    // Every branch below adds d_attn_out to the residual (never FP16 when ON).
+    project(arena_.d_attn_out, AbliterationWeight(l, false));
 
     if (half_prefill) {
       if (rotation.ffn_in != nullptr) {
@@ -781,9 +795,18 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       gemm_weight(layer.ffn_down, ffn_down_input, arena_.d_ffn_act,
                   arena_.d_ffn_out, hidden_size, intermediate_size,
                   ffn_down_q8_act);
+      project(arena_.d_ffn_out, AbliterationWeight(l, true));
       LaunchBatchedResidualAdd(arena_.d_hidden, arena_.d_ffn_out,
                                arena_.d_hidden, batch_size, hidden_size,
                                arena_.stream);
+    }
+    if (activation_observer_) {
+      std::vector<float> row(hidden_size);
+      HIP_CHECK(hipMemcpyAsync(
+          row.data(), arena_.d_hidden + (batch_size - 1) * hidden_size,
+          hidden_size * sizeof(float), hipMemcpyDeviceToHost, arena_.stream));
+      HIP_CHECK(hipStreamSynchronize(arena_.stream));
+      activation_observer_(l, row);
     }
 
     if (capture_prompt_hidden_) {

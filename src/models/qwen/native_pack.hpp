@@ -92,6 +92,10 @@ void ValidateNativeSources(const core::GgufReader& metadata);
 [[nodiscard]] std::string NativeArtifactIdentity(
     const core::GgufReader& metadata);
 
+/// Content identity of an opened model artifact: NativeArtifactIdentity for
+/// a native metadata reader, else the GGUF identity.
+[[nodiscard]] std::string ArtifactIdentity(const core::GgufReader& reader);
+
 }  // namespace gufo::models::qwen
 
 #endif  // GUFO_MODELS_QWEN_NATIVE_PACK_HPP_

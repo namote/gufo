@@ -68,12 +68,7 @@ bool Covered(Coverage ranges, std::size_t end) {
   }
   return frontier == end;
 }
-struct Metadata {
-  std::uint32_t version{1}, position{}, logits_valid{}, has_next{}, next{},
-      image_bytes{};
-  std::array<std::uint8_t, 32> image{};
-};
-static_assert(sizeof(Metadata) <= kContinuationMetadataBytes);
+using Metadata = ContinuationMetadata;
 struct DraftMetadata {
   std::uint32_t version{2}, injected{}, pending_rows{}, primed{};
   float controller{};
@@ -699,12 +694,8 @@ cache::Completion ContinuationAdapter::CapturePrivatePiece(
     const auto identity = attachment
                               ? attachment->IdentityForPrefix(state.position)
                               : std::span<const std::uint8_t>{};
-    if (!identity.empty()) {
-      if (identity.size() != metadata.image.size())
-        throw std::logic_error("invalid Qwen image identity");
-      metadata.image_bytes = 32;
-      std::ranges::copy(identity, metadata.image.begin());
-    }
+    // The captured state's own mode: a mode change invalidates the slot.
+    metadata.RecordImage(identity, executor.ActiveAbliteration());
     std::memcpy(host.data(), &metadata, sizeof(metadata));
     source = host.data();
     is_host = true;
@@ -1325,10 +1316,10 @@ bool ContinuationAdapter::Validate(
     const auto identity = attachment
                               ? attachment->IdentityForPrefix(metadata.position)
                               : std::span<const std::uint8_t>{};
+    // A mode or profile other than the slot's is a cache miss.
+    if (!metadata.ImageMatches(identity, executor.ActiveAbliteration()))
+      return refuse();
     if (metadata.image_bytes) {
-      if (identity.size() != 32 ||
-          !std::ranges::equal(identity, metadata.image))
-        return refuse();
       executor.vision_input_.RestoreLayout(attachment->rope,
                                            executor.arena_.stream);
     } else if (attachment && identity.empty()) {

@@ -72,6 +72,13 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
   }
   graph_key.workload_identity = ExtendQwenGraphWorkloadIdentity(
       graph_key.workload_identity, arena_.RecurrentIoIdentity());
+  // ON captures the projections; OFF keeps the original key and launches.
+  const auto* abliteration = ActiveAbliteration();
+  const float* abliteration_direction =
+      abliteration != nullptr ? model_->AbliterationDirection() : nullptr;
+  if (abliteration != nullptr)
+    graph_key.workload_identity =
+        ExtendQwenGraphWorkloadIdentity(graph_key.workload_identity, 1);
   const QwenGraphRejection graph_rejections = ResolveQwenGraphRejections(
       compute_logits, use_split_k_decode,
       graph_executor_.IsEnabled() &&
@@ -99,19 +106,21 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
           graph_executor_.TryCapture(arena_.stream, graph_key, [&]() {
             ExecuteDecodeStep(arena_, weights_, policy_, token_id, pos,
                               compute_logits, recurrent_state, &vision_input_,
-                              kvarn_groups);
+                              kvarn_groups, abliteration,
+                              abliteration_direction);
           });
       if (ok) {
         launch_captured_graph();
       } else {
         ExecuteDecodeStep(arena_, weights_, policy_, token_id, pos,
                           compute_logits, recurrent_state, &vision_input_,
-                          kvarn_groups);
+                          kvarn_groups, abliteration, abliteration_direction);
       }
     }
   } else {
     ExecuteDecodeStep(arena_, weights_, policy_, token_id, pos, compute_logits,
-                      recurrent_state, &vision_input_, kvarn_groups);
+                      recurrent_state, &vision_input_, kvarn_groups,
+                      abliteration, abliteration_direction);
   }
 
   if (!compute_logits) {

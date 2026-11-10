@@ -11,6 +11,22 @@ from pathlib import Path
 import tarfile
 
 SCHEMA = 'gufo-abliteration-v1'
+# Each model's collector readout names the placement its runtime applies:
+# Flash-Next before HC injection, Qwen3.8-27B before the plain residual add.
+PLACEMENTS = {
+    'last-prompt-token-post-layer-hc-mean-fp32-v1': 'writer-before-hc',
+    'last-prompt-token-post-layer-fp32-v1': 'writer-before-residual',
+}
+
+
+def placement(manifest):
+    """The capture's placement; a recorded one must agree with its readout."""
+    expected = PLACEMENTS.get(manifest.get('readout'))
+    if expected is None:
+        raise ValueError('unknown capture readout; fit only collector captures')
+    if manifest.get('placement', expected) != expected:
+        raise ValueError('capture placement does not match its readout')
+    return expected
 
 
 def sha(data):
@@ -83,7 +99,9 @@ def fit(collection, output, strengths=(0.5, 1.0)):
     manifest = json.loads((collection / 'manifest.json').read_text())
     if manifest['split'] != 'collection':
         raise ValueError('fit only collection split, never tuning/evaluation')
+    # Geometry and placement come from the capture, never from one model.
     hidden, layers = manifest['hidden'], manifest['layers']
+    site = placement(manifest)
     sums = {g: np.zeros((layers, hidden), dtype=np.float64)
             for g in ('refusal', 'ordinary')}
     counts = dict.fromkeys(sums, 0)
@@ -118,7 +136,7 @@ def fit(collection, output, strengths=(0.5, 1.0)):
                        for i in range(layers)]
             save(output / f'layer{layer}-strength{strength:g}.json', dict(
                 schema=SCHEMA, model_identity=manifest['model_identity'],
-                hidden=hidden, layers=layers, placement='writer-before-hc',
+                hidden=hidden, layers=layers, placement=site,
                 direction=direction.tolist(), attention=weights, mlp=weights,
                 status='candidate-not-qualified', collection_sha256=sha(
                     (collection / 'manifest.json').read_bytes()),
