@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstddef>
@@ -62,25 +61,6 @@ std::optional<ReasoningEffort> ParseReasoningEffortName(
   return std::nullopt;
 }
 
-bool RequestsTypicalAcceptance(const json::Value& body) {
-  const auto* value = body.find("typical_acceptance");
-  return value != nullptr && value->is_bool() && value->as_bool();
-}
-
-void WarnUnsupportedTypicalAcceptance(bool requested,
-                                      const TextGenerationBackend& backend) {
-  // Once per process: a client that always sends it must not flood the log.
-  static std::atomic<bool> warned{false};
-  if (requested && !backend.supports_typical_acceptance() &&
-      !warned.exchange(true)) {
-    Logger::Warn(
-        "sampling",
-        "event=typical_acceptance_unsupported model=" + backend.model_id() +
-            " detail=only Flash-Next MTP applies it; ignored, and later "
-            "requests are not logged");
-  }
-}
-
 namespace {
 
 struct ParsedChatRequest {
@@ -90,7 +70,6 @@ struct ParsedChatRequest {
   sampling::SamplingConfig sampling;
   bool stream{false};
   bool include_usage{false};
-  bool typical_acceptance_requested{false};
 };
 
 struct ParsedToolCall {
@@ -1050,7 +1029,6 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
     return Error(400, "Bad Request", sampling_error->message,
                  sampling_error->code.c_str());
   }
-  output->typical_acceptance_requested = RequestsTypicalAcceptance(body);
   output->sampling = parsed_sampling;
 
   if (const json::Value* choices = body.find("n");
@@ -4150,8 +4128,6 @@ HttpResponse HandleOpenAiChat(const HttpRequest& request,
   if (auto error = ParseRequest(request, backend, &parsed); error.has_value()) {
     return std::move(*error);
   }
-  WarnUnsupportedTypicalAcceptance(parsed.typical_acceptance_requested,
-                                   backend);
   try {
     const auto initial_output_state = backend.initial_output_state(parsed.chat);
     auto generation =

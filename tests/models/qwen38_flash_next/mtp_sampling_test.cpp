@@ -484,49 +484,28 @@ void CheckVerificationBoundaries() {
   }
 }
 
-// Typical acceptance (the CLIs' default) keeps a rejected proposal whose target
-// probability p reaches min(eps, delta * exp(-H)); otherwise, and always with
-// the option off, verification is the exact rule above, RNG included.
-void CheckTypicalAcceptance() {
+// Sampled verification is the exact rule: a proposal is kept when the
+// uniform draw times q falls below its target probability p; otherwise the
+// residual is sampled. A rejection consumes exactly the uniform draw and the
+// residual sample.
+void CheckExactRejection() {
   const std::array<float, 5> logits{0.3F, -0.2F, 1.1F, 0.7F, -1.0F};
-  // top-k 3 keeps tokens 2, 3 and 0 (1 and 4 have p = 0; every kept p is
-  // above eps). Without top-k at temperature 1, H is about 1.415, so the
-  // threshold is the delta side (about 0.073) and token 4 (p about 0.049)
-  // is atypical although p > 0.
+  // top-k 3 gives tokens 1 and 4 p = 0; without top-k every token has p > 0.
   for (const auto& [temperature, top_k] :
        {std::pair{0.7F, 3}, std::pair{1.0F, 3}, std::pair{1.0F, 0}}) {
     sampling::SamplingConfig config{.temperature = temperature, .seed = 41};
     config.top_k = top_k;
-    config.typical_acceptance = false;  // the off path, stated explicitly
     sampling::SamplerState exact(config);
-    config.typical_acceptance = true;
-    sampling::SamplerState typical(config);
     const auto target = exact.Distribution(logits);
-    double entropy = 0;
-    for (const auto& entry : target.entries())
-      entropy -= entry.value * std::log(entry.value);
-    const double threshold =
-        std::min(qfn::kTypicalEpsilon, qfn::kTypicalDelta * std::exp(-entropy));
     for (sampling::TokenId copied = 0; copied < logits.size(); ++copied) {
       qfn::MtpProposal proposal;
       proposal.size = 1;
       proposal.ids[0] = proposal.token = copied;
       proposal.probabilities[0] = proposal.probability = 1;
       const double p = target.probability(copied);
-      const bool keeps = p > 0 && p >= threshold;
-      Require(qfn::TypicalProposal(target, copied) == keeps,
-              "typical rule threshold");
-      if (top_k == 0)
-        Require(threshold < qfn::kTypicalEpsilon && keeps == (copied != 4),
-                "the entropy side of the typical threshold");
       for (unsigned draw = 0; draw < 256; ++draw) {
-        // Both samplers start each draw from the same random state.
-        *typical.mutable_rng_state() = exact.rng_state();
         auto reference = exact;
-        auto with_option = typical;
         const auto a = qfn::VerifyMtpProposal(logits, proposal, exact);
-        const auto b = qfn::VerifyMtpProposal(logits, proposal, typical);
-        // Without the option nothing changed: the exact rule, its draws.
         const bool accepted = reference.Uniform() < p;
         Require(a.accepted == accepted &&
                     (accepted ||
@@ -535,18 +514,7 @@ void CheckTypicalAcceptance() {
                                     std::span(proposal.probabilities).first(1),
                                     reference.mutable_rng_state())) &&
                     exact.rng_state() == reference.rng_state(),
-                "typical acceptance changed the exact rule when off");
-        if (keeps) {
-          Require(b.accepted && b.token == copied,
-                  "typical proposal must be kept");
-          Require(with_option.Uniform() >= 0 &&
-                      typical.rng_state() == with_option.rng_state(),
-                  "typical acceptance consumes exactly the uniform draw");
-        } else {
-          Require(b.accepted == accepted && b.token == a.token &&
-                      typical.rng_state() == exact.rng_state(),
-                  "an atypical proposal keeps the exact rule and draws");
-        }
+                "sampled verification must follow the exact rule");
       }
     }
   }
@@ -613,7 +581,7 @@ int main() {
     CheckCompactProposals();
     CheckSampledOutputFrequencies();
     CheckPointMassFrequencies();
-    CheckTypicalAcceptance();
+    CheckExactRejection();
     const std::array<float, 5> logits{0.3F, -0.2F, 1.1F, 0.7F, -1.0F};
     const std::array<sampling::TokenId, 4> history{2, 3, 2, 0};
     for (const auto& test : gufo::test::QwenSamplingCases()) {

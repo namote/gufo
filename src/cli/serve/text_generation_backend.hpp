@@ -320,11 +320,6 @@ public:
   /// Whether the loaded backend accepts image inputs in chat requests.
   [[nodiscard]] virtual bool supports_images() const { return false; }
   [[nodiscard]] virtual bool supports_abliteration() const { return false; }
-  /// Whether sampled speculative verification applies
-  /// SamplingConfig::typical_acceptance (Flash-Next with MTP loaded).
-  [[nodiscard]] virtual bool supports_typical_acceptance() const {
-    return false;
-  }
   /// Whether requests apply SamplingConfig::han_scale (Qwen 27B and
   /// Flash-Next, whose runners build a Han token set).
   [[nodiscard]] virtual bool supports_han_scale() const { return false; }

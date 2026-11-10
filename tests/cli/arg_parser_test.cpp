@@ -105,34 +105,16 @@ void TestUnexpectedPositionalsAndParserReuse() {
   assert(!parser.WasSupplied("--text"));
 }
 
-// The shared sampling CLIs default typical acceptance on; one MODE option
-// turns it off, and nothing else spells it.
-void TestTypicalAcceptanceOption() {
+// Sampled speculative decoding has one acceptance rule, the exact one: the
+// shared sampling CLIs register no option to change it.
+void TestNoTypicalAcceptanceOption() {
   gufo::cli::ArgParser parser("test_serve");
   gufo::sampling::SamplingConfig config;
-  assert(!config.typical_acceptance);
   gufo::cli::RegisterSamplingOptions(parser, &config, "Sampling", false, true);
-  assert(config.typical_acceptance);
   std::string error;
-  const char* none[] = {"--seed", "1"};
-  assert(parser.Parse(none, &error));
-  assert(config.typical_acceptance &&
-         !parser.WasSupplied("--typical-acceptance"));
-  const char* off[] = {"--typical-acceptance", "off"};
-  assert(parser.Parse(off, &error));
-  assert(!config.typical_acceptance &&
-         parser.WasSupplied("--typical-acceptance"));
-  const char* on[] = {"--typical-acceptance=on"};
-  assert(parser.Parse(on, &error));
-  assert(config.typical_acceptance);
-  const char* invalid[] = {"--typical-acceptance", "true"};
-  assert(!parser.Parse(invalid, &error));
-  assert(error.find("on or off") != std::string::npos);
-  const char* bare[] = {"--typical-acceptance"};
-  assert(!parser.Parse(bare, &error));
-  const char* alias[] = {"--no-typical-acceptance"};
-  assert(!parser.Parse(alias, &error));
-  assert(parser.FormatHelp().find("(default: on)") != std::string::npos);
+  const char* removed[] = {"--typical-acceptance", "off"};
+  assert(!parser.Parse(removed, &error));
+  assert(parser.FormatHelp().find("typical") == std::string::npos);
 }
 
 int main() {
@@ -141,7 +123,7 @@ int main() {
   TestPositionals();
   TestHelpFormatting();
   TestUnexpectedPositionalsAndParserReuse();
-  TestTypicalAcceptanceOption();
+  TestNoTypicalAcceptanceOption();
   std::cout << "All ArgParser tests passed.\n";
   return 0;
 }

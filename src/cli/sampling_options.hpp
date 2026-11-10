@@ -2,7 +2,6 @@
 #define GUFO_CLI_SAMPLING_OPTIONS_HPP_
 
 #include <stdexcept>
-#include <string>
 #include <string_view>
 
 #include "src/cli/arg_parser.hpp"
@@ -94,24 +93,6 @@ inline void RegisterSamplingOptions(ArgParser& parser,
           : "One-time penalty for tokens already generated in this response "
             "(default: 0.0 = disabled)",
       group, &config->presence_penalty);
-  // The CLI default is on: the library SamplingConfig default stays the
-  // exact rule, and these CLIs choose speed. "off" restores the exact rule.
-  config->typical_acceptance = true;
-  parser.AddCustomOption(
-      "", "--typical-acceptance", "MODE",
-      "Sampled speculative decoding also keeps typical rejected proposals: "
-      "faster, but outputs no longer follow the exact sampling distribution "
-      "(Flash-Next MTP): on or off (default: on)",
-      group,
-      [config](std::string_view, std::string_view value, std::string* error) {
-        if (value == "on" || value == "off") {
-          config->typical_acceptance = value == "on";
-          return true;
-        }
-        if (error != nullptr)
-          *error = "--typical-acceptance must be on or off";
-        return false;
-      });
 }
 
 /// The serve-only Han-script scale. It needs a model's Han token set, which

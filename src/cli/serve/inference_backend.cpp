@@ -3325,19 +3325,15 @@ struct InferenceBackend::Impl {
     std::uint32_t max_context{0};
     bool supports_images{false};
     bool supports_abliteration{false};
-    bool supports_typical_acceptance{false};
     /// The runner's Han tokens; null where its samplers ignore han_scale.
     std::shared_ptr<const sampling::TokenSet> han_tokens;
     ReasoningOptions reasoning_defaults;
     std::string model_path;
     std::string build_info;
 
-    /// The sampling the runner applies: typical acceptance stays on only
-    /// where verification uses it, so traces report what /props reports.
+    /// The sampling the runner applies, so traces report what it uses.
     [[nodiscard]] sampling::SamplingConfig Applied(
         sampling::SamplingConfig config) const {
-      config.typical_acceptance =
-          config.typical_acceptance && supports_typical_acceptance;
       // Without a set the scale stays inactive (SamplingConfig::han_bias).
       config.han_tokens = han_tokens;
       return config;
@@ -4058,8 +4054,6 @@ bool InferenceBackend::load(
     new_state->sampling_defaults.supplied = {};
     new_state->supports_images = model->VisionEncoder() != nullptr;
     new_state->supports_abliteration = model->Abliteration() != nullptr;
-    new_state->supports_typical_acceptance =
-        speculative_config.backend == TextSpeculativeBackend::kMtp;
     auto runner = std::make_shared<QwenFlashNextTextRunner>(
         std::move(model), max_context,
         speculative_config.backend == TextSpeculativeBackend::kMtp,
@@ -4157,15 +4151,6 @@ bool InferenceBackend::supports_han_scale() const {
 #if defined(ENGINE_ENABLE_HIP)
   const auto state = impl_->Snapshot();
   return state != nullptr && state->han_tokens != nullptr;
-#else
-  return false;
-#endif
-}
-
-bool InferenceBackend::supports_typical_acceptance() const {
-#if defined(ENGINE_ENABLE_HIP)
-  const auto state = impl_->Snapshot();
-  return state != nullptr && state->supports_typical_acceptance;
 #else
   return false;
 #endif

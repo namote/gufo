@@ -1619,24 +1619,14 @@ int RunServe(std::span<const char* const> args) {
         << " frequency_penalty=" << effective_sampling.frequency_penalty
         << " presence_penalty=" << effective_sampling.presence_penalty
         << " han_scale="
-        << (backend->supports_han_scale() ? effective_sampling.han_scale : 1.0F)
-        << " typical_acceptance="
-        << (effective_sampling.typical_acceptance &&
-            backend->supports_typical_acceptance());
+        << (backend->supports_han_scale() ? effective_sampling.han_scale
+                                          : 1.0F);
     server::Logger::Info("sampling", sampling_log.str());
     if (sampling_config.han_scale != 1.0F && !backend->supports_han_scale()) {
       server::Logger::Warn(
           "sampling",
           "event=han_scale_unsupported detail=--han-scale applies only to "
           "Qwen 27B and Flash-Next; ignored");
-    }
-    if (llm_parser.WasSupplied("--typical-acceptance") &&
-        sampling_config.typical_acceptance &&
-        !backend->supports_typical_acceptance()) {
-      server::Logger::Warn(
-          "sampling",
-          "event=typical_acceptance_unsupported detail=--typical-acceptance "
-          "on applies only to Flash-Next MTP; ignored");
     }
     const char* speculation =
         speculative_config.backend == server::TextSpeculativeBackend::kDFlash

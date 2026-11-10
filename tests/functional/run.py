@@ -43,14 +43,7 @@ SAMPLING = {
     "--frequency-penalty": ("frequency_penalty", float),
     "--repeat-penalty": ("repeat_penalty", float),
     "--repeat-last-n": ("repeat_last_n", int),
-    "--typical-acceptance": ("typical_acceptance", lambda mode: on_off(mode)),
 }
-
-
-def on_off(mode):
-    if mode not in ("on", "off"):
-        raise ValueError(f"--typical-acceptance must be on or off, not {mode!r}")
-    return mode == "on"
 COMPARISON_FIELDS = ("comparison_command", "sampling_preset", "sampling_overrides", "request_timeout", "tier",
                      "vision", "speculative", "environment", "harness_sha256", "build_inputs_sha256",
                      "expected_input_modalities")

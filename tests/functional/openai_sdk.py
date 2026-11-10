@@ -350,11 +350,9 @@ def check_sampling_defaults(client, model, checks, preset, overrides, vision=Fal
             "frequency_penalty": 0.,
             "seed": 73,
         }
-        # Typical acceptance is on by default; models without Flash-Next MTP
-        # ignore it, so writing it out must not change their output either.
         native = {"top_k": 20 if preset == "qwen38" else 0,
                   "min_p": 0., "min_keep": 0, "repeat_penalty": 1.,
-                  "repeat_last_n": 64, "typical_acceptance": True}
+                  "repeat_last_n": 64}
         assert overrides.keys() <= (expected.keys() | native.keys()), overrides
         expected.update({key: value for key, value in overrides.items() if key in expected})
         native.update({key: value for key, value in overrides.items() if key in native})
@@ -390,7 +388,6 @@ def check_sampling_defaults(client, model, checks, preset, overrides, vision=Fal
             ("temperature_only", {"temperature": .4}, {}),
             ("top_p_only", {"top_p": .6}, {}),
             ("top_k_only", {}, {"top_k": 0}),
-            ("typical_off", {}, {"typical_acceptance": False}),
             ("presence_only", {"presence_penalty": 0}, {}),
             ("frequency_only", {"frequency_penalty": .2}, {}),
             ("greedy", {"temperature": 0, "presence_penalty": 0}, {"top_k": 0}),

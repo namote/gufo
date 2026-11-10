@@ -108,12 +108,9 @@ back into the prompt's chat wrapper; a common tool header alone must not
 qualify as a long matching answer. Copies
 are verified like any draft: greedy text is byte-identical, and sampled
 requests treat each copied token as a point-mass proposal under the same
-rejection sampling, so with `--typical-acceptance off` outputs keep the
-target distribution (a seeded sampled stream differs from one without copies,
-because random draws are consumed at different points). By default typical
-acceptance also keeps a rejected draft or copy whose target probability is
-typical; this is faster but no longer exactly the target distribution
-([server](../../SERVER.md)). Shorter matches
+rejection sampling, so outputs keep the target distribution (a seeded
+sampled stream differs from one without copies, because random draws are
+consumed at different points). Shorter matches
 propose nothing; at temperature 1 an ungated 3-token rule displaced accepted
 MTP drafts and was slower on every workload measured. A recently accepted
 passage can resume after an edit with a five-token match; fewer than half of

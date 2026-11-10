@@ -45,10 +45,9 @@ inline SamplingConfig ResolveTextSampling(TextModelPreset model,
   if (model == TextModelPreset::kUnspecified)
     return configured;
   SamplingConfig result;
-  // Presets change sampling controls, never the caller's output grammar,
-  // its speculative acceptance rule or its Han scale.
+  // Presets change sampling controls, never the caller's output grammar
+  // or its Han scale.
   result.constraint = configured.constraint;
-  result.typical_acceptance = configured.typical_acceptance;
   result.han_scale = configured.han_scale;
   result.han_tokens = configured.han_tokens;
   result.temperature = 1.0F;

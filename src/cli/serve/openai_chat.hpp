@@ -46,14 +46,6 @@ std::optional<HttpResponse> ParseAbliterationControl(
 
 /// Shared effort names; each API applies its own thinking and alias rules.
 std::optional<ReasoningEffort> ParseReasoningEffortName(std::string_view value);
-/// True when a request body explicitly sets `typical_acceptance: true`.
-bool RequestsTypicalAcceptance(const json::Value& body);
-/// Logs a warning, once per process, when a generating request explicitly
-/// asked for typical acceptance and the loaded backend never applies it.
-/// The inherited default never warns; endpoints that only count or render
-/// do not call this.
-void WarnUnsupportedTypicalAcceptance(bool requested,
-                                      const TextGenerationBackend& backend);
 
 /// Messages tools and tool_choice, mapped onto the Chat tool declarations so
 /// framing, schema constraints and replayed tool turns match Chat.

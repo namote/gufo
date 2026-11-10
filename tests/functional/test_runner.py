@@ -1708,10 +1708,6 @@ class FunctionalRunnerTest(unittest.TestCase):
              "presence_penalty": 0, "seed": 123})
         with self.assertRaises(ValueError):
             functional.sampling_overrides(["--temperature", "0", "--temperature=1"])
-        self.assertEqual(functional.sampling_overrides(["--typical-acceptance", "off"]),
-                         {"typical_acceptance": False})
-        self.assertEqual(functional.sampling_overrides(["--typical-acceptance=on"]),
-                         {"typical_acceptance": True})
 
     def test_runner_requires_explicit_suites_before_starting_server(self):
         args = ["run.py", "--record-baseline", "--output", "/unused",

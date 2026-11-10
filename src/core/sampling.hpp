@@ -64,13 +64,6 @@ struct SamplingConfig {
   std::shared_ptr<const TokenConstraint> constraint;
   /// Set only for requests that start in their reasoning phase.
   std::shared_ptr<const ReasoningBudget> reasoning_budget;
-  /// Speculative decoding of a random-sampling request also keeps a
-  /// rejected proposal whose target probability is typical (Medusa's rule).
-  /// Faster, but the output no longer follows the target distribution
-  /// exactly. Greedy decoding ignores it. Only Flash-Next MTP applies it.
-  /// The library default is the exact rule; the serve, prompt and bench
-  /// CLIs default it on (RegisterSamplingOptions, --typical-acceptance).
-  bool typical_acceptance{false};
   /// Han-script probability scale in (0, 1] (serve --han-scale, request
   /// han_scale); 1 disables it. Every token in han_tokens has
   /// han_bias() = ln(han_scale) added to its logit after the penalties and

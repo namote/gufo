@@ -871,7 +871,6 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
   }
   if (const auto error = ParseLogprobs(body, false, &sampling_config))
     return InvalidCompatibilityRequest(error->message);
-  WarnUnsupportedTypicalAcceptance(RequestsTypicalAcceptance(body), b);
   const auto* stream_field = body.find("stream");
   const bool stream = stream_field != nullptr && stream_field->as_bool();
   bool include_usage = false;
@@ -1165,7 +1164,6 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
   if (auto error =
           ReadOpenAiResponseChat(body, b, &chat, &max_tokens, &sampling_config))
     return std::move(*error);
-  WarnUnsupportedTypicalAcceptance(RequestsTypicalAcceptance(body), b);
   chat.client_id = req.client_id;
   return CreateOpenAiResponse(
       req, b, chat, max_tokens, sampling_config,
@@ -1340,7 +1338,6 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
   if (auto error =
           ReadAnthropicChat(body, b, &chat, &max_tokens, &sampling_config))
     return std::move(*error);
-  WarnUnsupportedTypicalAcceptance(RequestsTypicalAcceptance(body), b);
   chat.client_id = req.client_id;
   return CreateAnthropicMessage(
       req, b, chat, max_tokens, sampling_config,
@@ -1444,7 +1441,6 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
           b.reasoning_defaults().enabled, {.stop_field = "stop"})) {
     return std::move(*error);
   }
-  WarnUnsupportedTypicalAcceptance(RequestsTypicalAcceptance(body), b);
 
   const auto* input = body.find("prompt");
   if (input == nullptr || !input->is_string() || input->str().empty()) {
@@ -1535,10 +1531,6 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
   params["repeat_last_n"] = sampling.repeat_last_n;
   params["frequency_penalty"] = static_cast<double>(sampling.frequency_penalty);
   params["presence_penalty"] = static_cast<double>(sampling.presence_penalty);
-  // Gufo extension: whether such a request keeps typical rejected MTP
-  // proposals. False on backends that never apply it.
-  params["typical_acceptance"] =
-      sampling.typical_acceptance && b.supports_typical_acceptance();
   // Gufo extension: the default Han-script scale; 1 where it never applies.
   params["han_scale"] =
       static_cast<double>(b.supports_han_scale() ? sampling.han_scale : 1.0F);

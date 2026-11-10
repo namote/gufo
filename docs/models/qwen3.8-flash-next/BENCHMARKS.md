@@ -25,7 +25,7 @@ These rows were measured on a cleaned host, after `sync`, `drop_caches=3` and `c
 - **Same output:** the output hashes are equal in every run. MTP d0 work is equal (38 cycles, 90/114 accepted). At d32K, U4-3 ran 10 cycles instead of 17 (118/118 accepted, 108 of them lookup).
 - **Fragmented host, same base binary:** MTP d0/d32K was 39.09/68.39 and 39.91/68.80, and AR was 31.76/31.48.
 - **Served sampled MTP** (typical acceptance off, 18 requests): the text and work are identical to B. D has no slower request and is 7–17 % faster on 4 of them.
-- **Typical acceptance on** (the C default): 17/18 requests are 4.3–28.4 % faster.
+- **Typical acceptance on** (the C default at the time, since removed): 17/18 requests are 4.3–28.4 % faster.
 
 U4-3 is not deployable: its wide pass stalls on a queue until the queue set changes. Evidence: `build/b1/u6-20261109/`.
 
@@ -53,15 +53,14 @@ unexplained, so only the relative comparison holds.
 Served U4-3 rewrite workloads (greedy, two files, rewrite/rename/docstring)
 were token-identical to the pre-U4 build with 12–35% lower decode time,
 but U4-3 hung once on K4V4 and was reverted. U4-4 typical acceptance
-gave +2.5–27.6% sampled MTP decode with off unchanged; it is now on by
-default (not distribution-exact; `--typical-acceptance off` restores the
-exact rule), so sampled MTP rows measured before it ran with it off.
-Neither is in a deployed runtime. Details and the deploy blockers:
+gave +2.5–27.6% sampled MTP decode with off unchanged, but made sampled
+replies loop and was removed (November 10, 2026); sampled MTP uses only the
+exact rule. Neither is in a deployed runtime. Details and the deploy blockers:
 [know-how](../../GFX1151-KNOWHOW.md), `plan/upstream-sync/PLAN.md` "U5 결과".
 Evidence: `build/b1/u5-20261109/`.
 
-Sampled Flash-Next MTP `bench` rows are comparable with older rows only when
-run with `--typical-acceptance off`; greedy rows are unaffected.
+Sampled Flash-Next MTP `bench` rows measured with typical acceptance on are
+not comparable with other rows; greedy rows are unaffected.
 
 ## Original BF16 / pure F16 HC comparison, November 9, 2026
 
