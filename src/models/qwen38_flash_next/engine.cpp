@@ -501,15 +501,17 @@ void Session::SetActivationObserver(ActivationObserver observer) {
   session_->SetActivationObserver(std::move(observer));
 }
 
-void Session::ConfigureAbliteration(bool enabled) {
+void Session::ConfigureAbliteration(
+    std::shared_ptr<const AbliterationSettings> settings) {
   const ExecutionScope execution(continuation_hooks_);
-  if (enabled == session_->AbliterationEnabled())
+  const auto* active = session_->Abliteration();
+  if (settings ? active && active->identity == settings->identity : !active)
     return;
-  if (enabled && !model_->Abliteration())
+  if (settings && !model_->Abliteration())
     throw std::invalid_argument("abliteration profile is not loaded");
   if (!tokens_.empty())
     Reset();
-  session_->ConfigureAbliteration(enabled);
+  session_->ConfigureAbliteration(std::move(settings));
 }
 
 void Session::ConfigureVision(
@@ -534,16 +536,16 @@ std::span<const std::uint8_t> Session::ImageIdentity(
                        : std::span<const std::uint8_t>{};
 }
 
-const AbliterationProfile* Session::ActiveAbliteration() const {
-  return session_->AbliterationEnabled() ? model_->Abliteration() : nullptr;
+const AbliterationSettings* Session::ActiveAbliteration() const {
+  return session_->Abliteration();
 }
 
 std::vector<std::uint8_t> Session::ContinuationIdentity(
     std::size_t tokens) const {
   const auto image = ImageIdentity(tokens);
-  const auto* profile = ActiveAbliteration();
-  return profile ? AbliterationInputIdentity(image, profile->identity)
-                 : std::vector<std::uint8_t>(image.begin(), image.end());
+  const auto* settings = ActiveAbliteration();
+  return settings ? AbliterationInputIdentity(image, settings->identity)
+                  : std::vector<std::uint8_t>(image.begin(), image.end());
 }
 
 std::uint32_t Session::KeptHiddenRows() const noexcept {

@@ -411,7 +411,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       // block_out.
       Combine(s_.res, l.hc_ffn.norm.f32(), rows, InjectWeights(l.hc_ffn),
               l.ffn_gate_exps.exl3 != nullptr,
-              AbliterationWeight(session, il, false));
+              AbliterationAt(session, il, false));
       const DeviceTensor* const shared_rotate[] = {&l.shexp_gate, &l.shexp_up};
       if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, rows, error_msg,
                  false, no_f32, shared_rotate))
@@ -424,7 +424,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       if (!moe_ok)
         return false;
       Combine(s_.res, next_norm, rows, next_inject, false,
-              AbliterationWeight(session, il, true));
+              AbliterationAt(session, il, true));
       return true;
     };
     if (skipped != 0) {

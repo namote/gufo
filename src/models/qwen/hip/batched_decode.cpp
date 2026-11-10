@@ -370,18 +370,18 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
 
   // Each session's row takes its own mode; nothing launches without a loaded
   // profile or while every session is OFF.
-  const float* abliteration_direction =
-      coordinator->model_->AbliterationDirection();
+  const float* abliteration_directions =
+      coordinator->model_->AbliterationDirections();
   const auto project = [&](float* rows, std::uint32_t layer, bool mlp) {
-    if (abliteration_direction == nullptr)
+    if (abliteration_directions == nullptr)
       return;
     std::array<QwenAbliterationSpan, kMaxDecodeBatch> spans{};
     for (std::size_t row = 0; row < batch_size; ++row)
       spans[row] = {static_cast<std::uint32_t>(row + 1),
-                    items[row].executor->AbliterationWeight(layer, mlp)};
+                    items[row].executor->AbliterationDeviceSettings()};
     LaunchQwenAbliterateRows(
-        rows, abliteration_direction, std::span(spans.data(), batch_size),
-        static_cast<std::uint32_t>(batch_size),
+        rows, abliteration_directions, std::span(spans.data(), batch_size),
+        layer, mlp, config.num_layers, static_cast<std::uint32_t>(batch_size),
         static_cast<std::uint32_t>(hidden_size), arena.stream);
   };
   EmitDecodeRouteTelemetry(weights, coordinator->policy_);
@@ -720,19 +720,19 @@ QwenGpuExecutor::ForwardVerificationBatch(
   // Each session's rows take its own mode, so target verification uses the
   // intervention (drafts stay unmodified); nothing launches without a loaded
   // profile or while every session is OFF.
-  const float* abliteration_direction =
-      coordinator.model_->AbliterationDirection();
+  const float* abliteration_directions =
+      coordinator.model_->AbliterationDirections();
   const auto project = [&](float* rows, std::uint32_t layer, bool mlp) {
-    if (abliteration_direction == nullptr)
+    if (abliteration_directions == nullptr)
       return;
     std::array<QwenAbliterationSpan, kMaxDecodeBatch> spans{};
     for (std::size_t index = 0; index < items.size(); ++index)
       spans[index] = {static_cast<std::uint32_t>(offsets[index] +
                                                  items[index].tokens.size()),
-                      items[index].executor->AbliterationWeight(layer, mlp)};
+                      items[index].executor->AbliterationDeviceSettings()};
     LaunchQwenAbliterateRows(
-        rows, abliteration_direction, std::span(spans.data(), items.size()),
-        static_cast<std::uint32_t>(batch_size),
+        rows, abliteration_directions, std::span(spans.data(), items.size()),
+        layer, mlp, config.num_layers, static_cast<std::uint32_t>(batch_size),
         static_cast<std::uint32_t>(hidden_size), arena_.stream);
   };
   EmitDecodeRouteTelemetry(weights_, coordinator.policy_);

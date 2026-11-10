@@ -416,7 +416,7 @@ QwenGpuModel::QwenGpuModel(
     std::shared_ptr<models::qwen::vision::Encoder> vision, void* rotation_signs,
     std::size_t exl3_bytes,
     std::shared_ptr<const models::qwen::AbliterationProfile> abliteration,
-    float* abliteration_direction)
+    float* abliteration_directions)
     : reader_(std::move(reader)),
       weights_(std::move(weights)),
       tokenizer_(std::move(tokenizer)),
@@ -425,14 +425,14 @@ QwenGpuModel::QwenGpuModel(
       rotation_signs_(rotation_signs),
       exl3_bytes_(exl3_bytes),
       abliteration_(std::move(abliteration)),
-      abliteration_direction_(abliteration_direction) {}
+      abliteration_directions_(abliteration_directions) {}
 
 QwenGpuModel::~QwenGpuModel() {
   if (rotation_signs_ != nullptr) {
     (void)hipFree(rotation_signs_);
   }
-  if (abliteration_direction_ != nullptr)
-    (void)hipFree(abliteration_direction_);
+  if (abliteration_directions_ != nullptr)
+    (void)hipFree(abliteration_directions_);
   ReleaseWeightRegions(weight_regions_);
 }
 
@@ -554,13 +554,15 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
     return nullptr;
   }
 
-  float* abliteration_direction = nullptr;
+  float* abliteration_directions = nullptr;
   if (abliteration != nullptr) {
-    const auto bytes = abliteration->direction.size() * sizeof(float);
+    // Every direction row at once (64 x 5120 floats for a v2 27B profile),
+    // so a request switches direction without an upload.
+    const auto bytes = abliteration->directions.size() * sizeof(float);
     void* direction = nullptr;
     hipError_t status = hipMalloc(&direction, bytes);
     if (status == hipSuccess)
-      status = hipMemcpy(direction, abliteration->direction.data(), bytes,
+      status = hipMemcpy(direction, abliteration->directions.data(), bytes,
                          hipMemcpyHostToDevice);
     if (status != hipSuccess) {
       if (direction != nullptr)
@@ -569,11 +571,11 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
         (void)hipFree(rotation_signs);
       ReleaseWeightRegions(weight_regions);
       if (error_msg != nullptr)
-        *error_msg = std::string("abliteration direction upload failed: ") +
+        *error_msg = std::string("abliteration directions upload failed: ") +
                      hipGetErrorString(status);
       return nullptr;
     }
-    abliteration_direction = static_cast<float*>(direction);
+    abliteration_directions = static_cast<float*>(direction);
   }
 
   std::shared_ptr<const tokenization::QwenTokenizer> shared_tokenizer(
@@ -581,7 +583,7 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
   return std::make_shared<const QwenGpuModel>(
       std::move(reader), std::move(*weights_opt), std::move(shared_tokenizer),
       std::move(weight_regions), std::move(vision), rotation_signs, exl3_bytes,
-      std::move(abliteration), abliteration_direction);
+      std::move(abliteration), abliteration_directions);
 }
 
 std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::Create(

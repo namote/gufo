@@ -87,7 +87,11 @@ int main(int argc, char** argv) {
     auto session = model->CreateSession(
         gufo::core::SessionMode::kAutoregressive, options.max_context, &error);
     Require(bool(session), error);
-    session->ConfigureAbliteration(enabled);
+    // The profile defaults; a v2 profile's per-request settings are a
+    // server feature.
+    session->ConfigureAbliteration(
+        enabled ? q::ResolveAbliterationSettings(*model->Abliteration())
+                : nullptr);
     const auto& config = model->config();
     std::ifstream input(argv[2]);
     Require(bool(input), "cannot open dataset");

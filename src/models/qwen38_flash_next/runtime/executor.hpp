@@ -139,9 +139,17 @@ public:
   /// Drops every token; the next Forward starts at position 0. Cache slot
   /// reassignment may retain bounded MTP scratch and its recorded graphs.
   void Reset(bool reuse_mtp = false);
-  void ConfigureAbliteration(bool enabled);
+  /// Null turns the projection OFF. Turning it ON or OFF drops recorded
+  /// graphs; other settings are written in place to this session's device
+  /// copy, which captured graphs read at run time, so graphs are kept.
+  void ConfigureAbliteration(
+      std::shared_ptr<const qwen::AbliterationSettings> settings);
   [[nodiscard]] bool AbliterationEnabled() const {
-    return abliteration_enabled_;
+    return abliteration_ != nullptr;
+  }
+  /// The session's effective settings while ON, else null.
+  [[nodiscard]] const qwen::AbliterationSettings* Abliteration() const {
+    return abliteration_.get();
   }
   /// Standalone collection only: called on the last row after each target
   /// layer.
@@ -260,7 +268,10 @@ private:
   qwen::vision::DeviceInput vision_input_;
   std::uint32_t max_context_{0};
   bool mtp_enabled_{false};
-  bool abliteration_enabled_{false};
+  std::shared_ptr<const qwen::AbliterationSettings> abliteration_;
+  /// qwen::AbliterationDeviceWords floats, allocated when first turned ON
+  /// and kept (graph arguments point at it). Shared with checkpoint views.
+  std::shared_ptr<float> abliteration_device_;
   ActivationObserver activation_observer_;
   std::uint32_t index_capacity_{0};  ///< power-of-two raw indexer ring rows
   std::uint32_t position_{0};
@@ -670,16 +681,25 @@ public:
 private:
   Executor() = default;
   std::shared_ptr<const AbliterationProfile> abliteration_;
-  float* abliteration_direction_{nullptr};
-  float AbliterationWeight(const Session& session, std::uint32_t layer,
-                           bool mlp) const {
-    return session.abliteration_enabled_ && abliteration_
-               ? (mlp ? abliteration_->mlp[layer]
-                      : abliteration_->attention[layer])
-               : 0;
+  /// Every profile direction, [rows][hidden], uploaded once at load.
+  float* abliteration_directions_{nullptr};
+  /// One writer's projection site: the session's device settings (null OFF).
+  /// `{}` is OFF. No member initializers: a default argument below uses it
+  /// inside this class.
+  struct AbliterationSite {
+    const float* settings;
+    std::uint32_t layer;
+    bool mlp;
+  };
+  AbliterationSite AbliterationAt(const Session& session, std::uint32_t layer,
+                                  bool mlp) const {
+    return {abliteration_ && session.abliteration_
+                ? session.abliteration_device_.get()
+                : nullptr,
+            layer, mlp};
   }
   void ProjectAbliteration(float* output, std::uint32_t rows,
-                           float weight) const;
+                           AbliterationSite site) const;
   friend struct ExecutorTestAccess;
 
   enum class DiagnosticStage { kTarget, kDraft, kHead, kCatchUp };
@@ -789,7 +809,7 @@ private:
   /// may then leave its update to them (exl3_res_pending_).
   void Combine(float* res, const float* gamma, std::uint32_t n_tokens,
                const float* inject_w = nullptr, bool defer_res = false,
-               float ablation_weight = 0) const;
+               AbliterationSite ablation = {}) const;
   /// An EXL3 prefill combine's residual update left out of `res` for the
   /// FFN mixer's recomputed norm and the next combine.
   struct PendingResidual {

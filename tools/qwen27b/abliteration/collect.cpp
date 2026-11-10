@@ -105,7 +105,10 @@ int main(int argc, char** argv) {
     Require(model != nullptr, error);
     auto executor = hip::QwenGpuExecutor::Create(model, &error, context);
     Require(executor != nullptr, error);
-    executor->ConfigureAbliteration(enabled);
+    // The profile defaults.
+    executor->ConfigureAbliteration(
+        enabled ? qwen::ResolveAbliterationSettings(*model->Abliteration())
+                : nullptr);
     const auto& config = model->GetConfig();
     std::ifstream input(argv[2]);
     Require(bool(input), "cannot open dataset");

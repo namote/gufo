@@ -21,7 +21,7 @@ std::size_t Product(std::initializer_list<std::size_t> factors) {
 }  // namespace
 
 void ContinuationMetadata::RecordImage(std::span<const std::uint8_t> identity,
-                                       const AbliterationProfile* active) {
+                                       const AbliterationSettings* active) {
   // Rejects an identity other than 32 bytes. OFF keeps the raw identity.
   const auto record = RecordAbliterationContinuation(identity, active);
   image_bytes = static_cast<std::uint32_t>(identity.size());
@@ -31,7 +31,7 @@ void ContinuationMetadata::RecordImage(std::span<const std::uint8_t> identity,
 
 bool ContinuationMetadata::ImageMatches(
     std::span<const std::uint8_t> identity,
-    const AbliterationProfile* active) const {
+    const AbliterationSettings* active) const {
   return AbliterationContinuationMatches(abliteration, image_bytes, image,
                                          identity, active);
 }

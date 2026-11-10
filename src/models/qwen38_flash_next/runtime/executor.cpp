@@ -313,45 +313,82 @@ std::uint32_t Session::ReleaseKvReservation() noexcept {
   return unused;
 }
 
-void Session::ConfigureAbliteration(bool enabled) {
-  if (enabled && !owner_->Abliteration())
+void Session::ConfigureAbliteration(
+    std::shared_ptr<const qwen::AbliterationSettings> settings) {
+  const auto* profile = owner_->Abliteration();
+  if (settings && !profile)
     throw std::invalid_argument("abliteration profile is not loaded");
-  if (enabled == abliteration_enabled_)
+  if (settings && (settings->attention.size() != profile->layers ||
+                   settings->mlp.size() != profile->layers ||
+                   settings->direction_row >= profile->direction_rows()))
+    throw std::invalid_argument("abliteration settings do not fit the profile");
+  if (settings && abliteration_ &&
+      settings->identity == abliteration_->identity)
     return;
-  for (const auto& [key, graph] : graphs_)
-    (void)hipGraphExecDestroy(graph);
-  graphs_.clear();
-  warmed_.clear();
-  abliteration_enabled_ = enabled;
+  if (!settings && !abliteration_)
+    return;
+  if (settings) {
+    const auto words = settings->DeviceWords();
+    const auto bytes = words.size() * sizeof(float);
+    if (!abliteration_device_) {
+      void* data = nullptr;
+      if (hip::AllocateDevice(&data, bytes) != hipSuccess)
+        throw std::runtime_error("abliteration settings allocation failed");
+      abliteration_device_.reset(static_cast<float*>(data),
+                                 [](float* p) { (void)hipFree(p); });
+    }
+    // In place, ordered after every pass already queued on the shared executor
+    // stream (the synchronization waits for other sessions' queued work too,
+    // once per settings change). Like ConfigureVision from the same call
+    // site, this assumes it runs between passes, not while a graph is being
+    // captured on that stream; captured graphs read the new values at their
+    // next launch.
+    if (hipMemcpyAsync(abliteration_device_.get(), words.data(), bytes,
+                       hipMemcpyHostToDevice, owner_->stream()) != hipSuccess ||
+        hipStreamSynchronize(owner_->stream()) != hipSuccess)
+      throw std::runtime_error("abliteration settings upload failed");
+  }
+  if (!settings || !abliteration_) {
+    // ON/OFF changes which kernels a pass launches.
+    for (const auto& [key, graph] : graphs_)
+      (void)hipGraphExecDestroy(graph);
+    graphs_.clear();
+    warmed_.clear();
+  }
+  abliteration_ = std::move(settings);
 }
 
 bool Executor::LoadAbliteration(
     std::shared_ptr<const AbliterationProfile> profile, std::string* error) {
-  if (abliteration_ || !profile ||
-      profile->direction.size() != config().hidden_size) {
+  if (abliteration_ || !profile || profile->hidden != config().hidden_size ||
+      profile->layers != config().num_layers ||
+      profile->direction_rows() == 0 ||
+      profile->directions.size() !=
+          std::size_t{profile->direction_rows()} * profile->hidden) {
     AssignError(error, "invalid or repeated abliteration profile load");
     return false;
   }
   void* data = nullptr;
-  const auto bytes = profile->direction.size() * sizeof(float);
-  if (!Check(hip::AllocateDevice(&data, bytes), "abliteration direction",
+  const auto bytes = profile->directions.size() * sizeof(float);
+  if (!Check(hip::AllocateDevice(&data, bytes), "abliteration directions",
              error))
     return false;
   allocations_.push_back(data);
-  abliteration_direction_ = static_cast<float*>(data);
-  if (!Check(hipMemcpy(data, profile->direction.data(), bytes,
+  abliteration_directions_ = static_cast<float*>(data);
+  if (!Check(hipMemcpy(data, profile->directions.data(), bytes,
                        hipMemcpyHostToDevice),
-             "abliteration direction upload", error))
+             "abliteration directions upload", error))
     return false;
   abliteration_ = std::move(profile);
   return true;
 }
 
 void Executor::ProjectAbliteration(float* output, std::uint32_t rows,
-                                   float weight) const {
-  if (weight != 0)
-    AbliterateRows(output, abliteration_direction_, weight, rows,
-                   config().hidden_size, stream_);
+                                   AbliterationSite site) const {
+  if (site.settings != nullptr)
+    AbliterateRows(output, abliteration_directions_, site.settings, site.layer,
+                   site.mlp, config().num_layers, rows, config().hidden_size,
+                   stream_);
 }
 
 void Session::Reset(bool reuse_mtp) {

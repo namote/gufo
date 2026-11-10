@@ -51,16 +51,13 @@ void EmitDecodeRouteTelemetry(const models::QwenModelWeights& weights,
   }
 }
 
-void ExecuteDecodeStep(QwenGpuArena& arena,
-                       const models::QwenModelWeights& weights,
-                       const QwenExecutionPolicy& policy,
-                       tokenization::TokenId token_id, std::uint32_t pos,
-                       bool compute_logits,
-                       QwenRecurrentStateIo recurrent_state,
-                       models::qwen::vision::DeviceInput* image_input,
-                       std::uint32_t kvarn_groups,
-                       const models::qwen::AbliterationProfile* abliteration,
-                       const float* abliteration_direction) {
+void ExecuteDecodeStep(
+    QwenGpuArena& arena, const models::QwenModelWeights& weights,
+    const QwenExecutionPolicy& policy, tokenization::TokenId token_id,
+    std::uint32_t pos, bool compute_logits,
+    QwenRecurrentStateIo recurrent_state,
+    models::qwen::vision::DeviceInput* image_input, std::uint32_t kvarn_groups,
+    const float* abliteration_settings, const float* abliteration_directions) {
   const auto* rope = image_input != nullptr ? image_input->rope() : nullptr;
   (void)token_id;
   const auto& config = weights.config;
@@ -308,10 +305,10 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
 
     bool ffn_rotated = false;
     {
-      if (abliteration != nullptr)
+      if (abliteration_settings != nullptr)
         LaunchQwenAbliterateRows(
-            attention_scratch.output.data(), abliteration_direction,
-            abliteration->attention[l], 1,
+            attention_scratch.output.data(), abliteration_directions,
+            abliteration_settings, l, false, config.num_layers, 1,
             static_cast<std::uint32_t>(hidden_size), arena.stream);
       gufo::models::qwen::ResidualAdd(module_ctx, decode_scratch.hidden,
                                       attention_scratch.output);
@@ -370,10 +367,11 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
     }
 
     // Residual Add
-    if (abliteration != nullptr)
+    if (abliteration_settings != nullptr)
       LaunchQwenAbliterateRows(
-          ffn_scratch.out.data(), abliteration_direction, abliteration->mlp[l],
-          1, static_cast<std::uint32_t>(hidden_size), arena.stream);
+          ffn_scratch.out.data(), abliteration_directions,
+          abliteration_settings, l, true, config.num_layers, 1,
+          static_cast<std::uint32_t>(hidden_size), arena.stream);
     gufo::models::qwen::ResidualAdd(module_ctx, decode_scratch.hidden,
                                     ffn_scratch.out);
 

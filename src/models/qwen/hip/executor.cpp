@@ -96,6 +96,8 @@ QwenGpuExecutor::~QwenGpuExecutor() {
   if (d_verification_logits_ != nullptr) {
     (void)hipFree(d_verification_logits_);
   }
+  if (abliteration_device_ != nullptr)
+    (void)hipFree(abliteration_device_);
   FreeGpuSamplingWorkspace(&sampling_workspace_);
 }
 
@@ -172,17 +174,45 @@ void QwenGpuExecutor::Reset() noexcept {
   graph_executor_.Reset();
 }
 
-void QwenGpuExecutor::ConfigureAbliteration(bool enabled, bool state_reset) {
-  if (enabled && model_->Abliteration() == nullptr)
+void QwenGpuExecutor::ConfigureAbliteration(
+    std::shared_ptr<const models::qwen::AbliterationSettings> settings,
+    bool state_reset) {
+  const auto* profile = model_->Abliteration();
+  if (settings && profile == nullptr)
     throw std::invalid_argument("abliteration profile is not loaded");
-  if (enabled == abliteration_enabled_)
+  if (settings ? abliteration_ && abliteration_->identity == settings->identity
+               : !abliteration_)
     return;
+  if (settings && (settings->attention.size() != profile->layers ||
+                   settings->mlp.size() != profile->layers ||
+                   settings->direction_row >= profile->direction_rows()))
+    throw std::invalid_argument("abliteration settings do not fit the profile");
   // A failed reset is rethrown by the next operation (CheckReset).
   if (!state_reset)
     Reset();
-  // The captured decode graph bakes the projections (or their absence).
-  graph_executor_.Reset();
-  abliteration_enabled_ = enabled;
+  if (settings) {
+    const auto words = settings->DeviceWords();
+    const auto bytes = words.size() * sizeof(float);
+    if (abliteration_device_ == nullptr) {
+      void* data = nullptr;
+      if (hipMalloc(&data, bytes) != hipSuccess)
+        throw std::runtime_error("abliteration settings allocation failed");
+      abliteration_device_ = static_cast<float*>(data);
+    }
+    // In place, after every queued pass of this session's stream; a captured
+    // decode graph reads the new values at its next launch. Batched passes
+    // run on the coordinator's stream: this relies on a slot never being
+    // reconfigured while it is part of an in-flight batch.
+    if (hipMemcpyAsync(abliteration_device_, words.data(), bytes,
+                       hipMemcpyHostToDevice, arena_.stream) != hipSuccess ||
+        hipStreamSynchronize(arena_.stream) != hipSuccess)
+      throw std::runtime_error("abliteration settings upload failed");
+  }
+  // The captured decode graph contains the projections only while ON (Reset
+  // above has usually dropped it already).
+  if (!settings || !abliteration_)
+    graph_executor_.Reset();
+  abliteration_ = std::move(settings);
 }
 
 std::unique_ptr<QwenGpuSnapshot> QwenGpuExecutor::SaveSnapshot(

@@ -1,17 +1,32 @@
 #include <hip/hip_fp16.h>
 
 #include <array>
+#include <bit>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
 
+#include "src/models/qwen/abliteration.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/runtime/executor.hpp"
 namespace q = gufo::models::qwen38_flash_next::rocm;
 void Check(hipError_t x) {
   if (x != hipSuccess)
     throw std::runtime_error(hipGetErrorString(x));
+}
+// One layer's device settings (AbliterationSettings::DeviceWords), written
+// independently: direction row bits, attention strength, mlp strength.
+std::vector<float> Settings(std::uint32_t row, float attention, float mlp) {
+  return {std::bit_cast<float>(row), attention, mlp};
+}
+float* Upload(const std::vector<float>& values) {
+  float* device = nullptr;
+  Check(hipMalloc(&device, values.size() * sizeof(float)));
+  Check(hipMemcpy(device, values.data(), values.size() * sizeof(float),
+                  hipMemcpyHostToDevice));
+  return device;
 }
 // Seed the production deferred-MoE path without loading a model. This catches
 // projection before aggregation and double application of the prior residual.
@@ -54,10 +69,13 @@ struct ExecutorTestAccess {
       down[i] = __float2half(down_float[i]);
     Check(hipMemcpy(executor.s_.down_e, down.data(), sizeof(down),
                     hipMemcpyHostToDevice));
-    executor.abliteration_direction_ = alloc({.5f, .5f, .5f, .5f});
+    executor.abliteration_directions_ = alloc({.5f, .5f, .5f, .5f});
+    // One layer: direction row 0, attention strength .75.
+    const float* settings = alloc(Settings(0, .75f, 0.f));
     executor.moe_pending_ = true;
     executor.res_deferred_ = true;
-    executor.Combine(executor.s_.res, nullptr, 1, nullptr, false, .75f);
+    executor.Combine(executor.s_.res, nullptr, 1, nullptr, false,
+                     {settings, 0, false});
     std::array<float, 16> result;
     Check(hipMemcpy(result.data(), executor.s_.res, sizeof(result),
                     hipMemcpyDeviceToHost));
@@ -82,18 +100,17 @@ struct ExecutorTestAccess {
 }  // namespace gufo::models::qwen38_flash_next::rocm
 int main() {
   for (unsigned hidden : {3u, 255u, 256u, 257u, 2560u}) {
-    std::vector<float> direction(hidden);
+    // Row 1 is the session's direction; row 0 must never be read.
+    std::vector<float> directions(2 * hidden, 1e30f);
     double norm = 0;
     for (unsigned j = 0; j < hidden; ++j) {
-      direction[j] = std::sin(float(j + 1));
-      norm += double(direction[j]) * direction[j];
+      directions[hidden + j] = std::sin(float(j + 1));
+      norm += double(directions[hidden + j]) * directions[hidden + j];
     }
-    for (auto& x : direction)
-      x /= std::sqrt(norm);
-    float* d = nullptr;
-    Check(hipMalloc(&d, hidden * sizeof(float)));
-    Check(hipMemcpy(d, direction.data(), hidden * sizeof(float),
-                    hipMemcpyHostToDevice));
+    for (unsigned j = 0; j < hidden; ++j)
+      directions[hidden + j] /= std::sqrt(norm);
+    const float* direction = directions.data() + hidden;
+    float* d = Upload(directions);
     for (unsigned rows : {1u, 8u, 9u, 33u}) {
       std::vector<float> input(rows * hidden), result(input.size()),
           expected(input.size());
@@ -112,9 +129,12 @@ int main() {
             expected[r * hidden + h] = float(
                 input[r * hidden + h] - double(weight) * dot * direction[h]);
         }
-        q::AbliterateRows(y, d, weight, rows, hidden, nullptr);
+        // The attention strength of layer 0; the mlp strength differs.
+        float* settings = Upload(Settings(1, weight, 3.f));
+        q::AbliterateRows(y, d, settings, 0, false, 1, rows, hidden, nullptr);
         Check(hipMemcpy(result.data(), y, result.size() * sizeof(float),
                         hipMemcpyDeviceToHost));
+        Check(hipFree(settings));
         for (unsigned i = 0; i < result.size(); ++i)
           if (!std::isfinite(result[i]) ||
               std::abs(result[i] - expected[i]) > 2e-7f ||
@@ -126,26 +146,56 @@ int main() {
     Check(hipFree(d));
   }
   q::ExecutorTestAccess::DeferredMoe();
-  // Mixed sessions: OFF rows must retain their original bytes.
+  // Mixed sessions with their own directions and strengths: OFF rows must
+  // retain their original bytes.
   float* y = nullptr;
-  float* d = nullptr;
   Check(hipMalloc(&y, 12 * sizeof(float)));
-  Check(hipMalloc(&d, 4 * sizeof(float)));
   std::array<float, 12> mixed;
   mixed.fill(1.f);
-  const std::array<float, 4> direction{.5f, .5f, .5f, .5f};
+  float* d = Upload({.5f, .5f, .5f, .5f, 1.f, 0.f, 0.f, 0.f});
+  float* a = Upload(Settings(0, 1.f, 0.f));
+  float* b = Upload(Settings(1, .5f, 0.f));
   Check(hipMemcpy(y, mixed.data(), sizeof(mixed), hipMemcpyHostToDevice));
-  Check(
-      hipMemcpy(d, direction.data(), sizeof(direction), hipMemcpyHostToDevice));
   const std::array<q::AbliterationSpan, 3> spans{
-      {{1, 0.f}, {2, 1.f}, {3, .5f}}};
-  q::AbliterateBatchRows(y, d, spans, 3, 4, nullptr);
+      {{1, nullptr}, {2, a}, {3, b}}};
+  q::AbliterateBatchRows(y, d, spans, 0, false, 1, 3, 4, nullptr);
+  // Their mlp strengths are zero: nothing changes.
+  q::AbliterateBatchRows(y, d, spans, 0, true, 1, 3, 4, nullptr);
   Check(hipMemcpy(mixed.data(), y, sizeof(mixed), hipMemcpyDeviceToHost));
-  for (unsigned i = 0; i < 12; ++i)
-    if (mixed[i] != (i < 4 ? 1.f : i < 8 ? 0.f : .5f))
-      throw std::runtime_error("mixed row mask mismatch");
-  Check(hipFree(y));
-  Check(hipFree(d));
-  std::cout << "FP64 formula, deferred HC, mixed rows, tails, OFF preservation "
-               "PASS\n";
+  const std::array<float, 12> want{1, 1, 1, 1, 0, 0, 0, 0, .5f, 1, 1, 1};
+  if (mixed != want)
+    throw std::runtime_error("mixed row settings mismatch");
+  // A captured graph reads the settings at launch: an in-place strength
+  // update changes its result without recapture.
+  hipStream_t stream = nullptr;
+  Check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+  mixed.fill(1.f);
+  Check(hipMemcpy(y, mixed.data(), sizeof(mixed), hipMemcpyHostToDevice));
+  Check(hipMemcpy(a, Settings(0, 0.f, 0.f).data(), 3 * sizeof(float),
+                  hipMemcpyHostToDevice));
+  hipGraph_t graph = nullptr;
+  hipGraphExec_t exec = nullptr;
+  Check(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal));
+  q::AbliterateRows(y, d, a, 0, false, 1, 1, 4, stream);
+  Check(hipStreamEndCapture(stream, &graph));
+  Check(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+  Check(hipGraphLaunch(exec, stream));
+  Check(hipStreamSynchronize(stream));
+  Check(hipMemcpy(mixed.data(), y, sizeof(mixed), hipMemcpyDeviceToHost));
+  if (mixed[0] != 1.f)
+    throw std::runtime_error("zero strength changed a row");
+  Check(hipMemcpy(a, Settings(1, 1.f, 0.f).data(), 3 * sizeof(float),
+                  hipMemcpyHostToDevice));
+  Check(hipGraphLaunch(exec, stream));
+  Check(hipStreamSynchronize(stream));
+  Check(hipMemcpy(mixed.data(), y, sizeof(mixed), hipMemcpyDeviceToHost));
+  if (mixed[0] != 0.f || mixed[1] != 1.f)
+    throw std::runtime_error("graph ignored an in-place settings update");
+  Check(hipGraphExecDestroy(exec));
+  Check(hipGraphDestroy(graph));
+  Check(hipStreamDestroy(stream));
+  for (float* p : {y, d, a, b})
+    Check(hipFree(p));
+  std::cout << "FP64 formula, deferred HC, mixed rows, tails, OFF "
+               "preservation, in-place graph settings PASS\n";
 }

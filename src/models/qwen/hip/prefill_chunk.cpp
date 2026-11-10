@@ -124,13 +124,13 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
 
   // ON projects the attention/GDN and MLP writer outputs before their residual
   // add, which the FP16 prefill fuses into its GEMMs; it takes the FP32 path.
-  const auto* abliteration = ActiveAbliteration();
-  const auto project = [&](float* rows, float weight) {
+  const float* abliteration = AbliterationDeviceSettings();
+  const auto project = [&](float* rows, std::uint32_t layer, bool mlp) {
     if (abliteration != nullptr)
-      LaunchQwenAbliterateRows(rows, model_->AbliterationDirection(), weight,
-                               static_cast<std::uint32_t>(batch_size),
-                               static_cast<std::uint32_t>(hidden_size),
-                               arena_.stream);
+      LaunchQwenAbliterateRows(
+          rows, model_->AbliterationDirections(), abliteration, layer, mlp,
+          config.num_layers, static_cast<std::uint32_t>(batch_size),
+          static_cast<std::uint32_t>(hidden_size), arena_.stream);
   };
   const bool half_prefill =
       abliteration == nullptr && UseQwen27bFp16Prefill(weights_, batch_size);
@@ -612,7 +612,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       }
     }
     // Every branch below adds d_attn_out to the residual (never FP16 when ON).
-    project(arena_.d_attn_out, AbliterationWeight(l, false));
+    project(arena_.d_attn_out, l, false);
 
     if (half_prefill) {
       if (rotation.ffn_in != nullptr) {
@@ -795,7 +795,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       gemm_weight(layer.ffn_down, ffn_down_input, arena_.d_ffn_act,
                   arena_.d_ffn_out, hidden_size, intermediate_size,
                   ffn_down_q8_act);
-      project(arena_.d_ffn_out, AbliterationWeight(l, true));
+      project(arena_.d_ffn_out, l, true);
       LaunchBatchedResidualAdd(arena_.d_hidden, arena_.d_ffn_out,
                                arena_.d_hidden, batch_size, hidden_size,
                                arena_.stream);

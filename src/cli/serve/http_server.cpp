@@ -1552,6 +1552,40 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
   modalities["video"] = false;
   modalities["audio"] = false;
   resp["modalities"] = std::move(modalities);
+
+  // Gufo extension: the loaded abliteration profile's geometry and request
+  // defaults, never its direction vectors. A uniform strength is one number.
+  if (const auto info = b.abliteration_info()) {
+    const auto strengths = [](const std::vector<float>& values) {
+      if (!values.empty() &&
+          std::ranges::all_of(values, [&](float x) { return x == values[0]; }))
+        return json::Value(static_cast<double>(values[0]));
+      json::Value array = json::Value::array();
+      for (const float x : values)
+        array.push_back(static_cast<double>(x));
+      return array;
+    };
+    json::Value abliteration = json::Value::object();
+    abliteration["profile"] = "default";
+    abliteration["schema"] = info->schema;
+    abliteration["identity"] = info->identity;
+    abliteration["layers"] = static_cast<unsigned long long>(info->layers);
+    // Layers a request may name in `direction_layer`; none for v1.
+    json::Value direction_layers = json::Value::array();
+    if (info->direction_layer)
+      for (std::uint32_t layer = 0; layer < info->layers; ++layer)
+        direction_layers.push_back(static_cast<unsigned long long>(layer));
+    abliteration["direction_layers"] = std::move(direction_layers);
+    abliteration["direction_layer"] =
+        info->direction_layer ? json::Value(static_cast<unsigned long long>(
+                                    *info->direction_layer))
+                              : json::Value(nullptr);
+    abliteration["attention"] = strengths(info->attention);
+    abliteration["mlp"] = strengths(info->mlp);
+    abliteration["max_strength"] =
+        static_cast<double>(models::qwen::kAbliterationMaxWeight);
+    resp["abliteration"] = std::move(abliteration);
+  }
   return Ok(resp);
 }
 

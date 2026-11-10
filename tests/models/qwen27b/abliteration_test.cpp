@@ -12,8 +12,11 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <vector>
 
 #include "src/core/json.hpp"
 #include "src/models/qwen/continuation_layout.hpp"
@@ -66,6 +69,150 @@ qwen::ContinuationMetadata Current(std::uint32_t position) {
   metadata.next = 7;
   return metadata;
 }
+
+std::uint32_t Bits(float x) {
+  std::uint32_t bits = 0;
+  std::memcpy(&bits, &x, sizeof(bits));
+  return bits;
+}
+
+// A v1 profile: its defaults, strength overrides, and no direction choice.
+void TestV1Settings(const qwen::AbliterationProfile& profile) {
+  const auto defaults = qwen::ResolveAbliterationSettings(profile);
+  Require(!defaults->direction_layer && defaults->direction_row == 0 &&
+              defaults->attention == profile.attention &&
+              defaults->mlp == profile.mlp && defaults->identity.size() == 64,
+          "v1 default settings");
+  Require(Rejects([&] {
+            (void)qwen::ResolveAbliterationSettings(profile,
+                                                    {.direction_layer = 0});
+          }),
+          "v1 profile accepted a direction layer");
+  const auto scaled =
+      qwen::ResolveAbliterationSettings(profile, {.attention = {2}});
+  Require(scaled->attention == std::vector<float>{2, 2} &&
+              scaled->mlp == profile.mlp &&
+              scaled->identity != defaults->identity,
+          "v1 strength override");
+}
+
+// Schema v2: every layer's direction plus request defaults, validated like
+// v1; per-request settings and their identities.
+void TestV2Profile(const std::filesystem::path& path, std::string_view site) {
+  const auto v2 = json::parse(
+      R"({"schema":"gufo-abliteration-v2","placement":"writer-before-residual",
+      "model_identity":"fixture","hidden":3,"layers":2,
+      "directions":[[0.6,0.8,0],[0,0,1]],"direction_layer":1,
+      "attention":[1,0],"mlp":[0,0.5]})");
+  const auto write = [&](const json::Value& value) {
+    std::ofstream(path) << value.dump();
+  };
+  write(v2);
+  const auto profile =
+      qwen::AbliterationProfile::Load(path, 3, 2, "fixture", site);
+  Require(profile.schema == 2 && profile.direction_rows() == 2 &&
+              profile.directions.size() == 6 && profile.directions[5] == 1 &&
+              profile.direction_layer == 1u && profile.selectable_direction(),
+          "v2 profile load");
+  const auto rejects = [&](const char* key, const char* raw) {
+    auto invalid = v2;
+    invalid[key] = json::parse(raw);
+    write(invalid);
+    return Rejects([&] {
+      (void)qwen::AbliterationProfile::Load(path, 3, 2, "fixture", site);
+    });
+  };
+  Require(rejects("directions", "[[0.6,0.8,0]]") &&
+              rejects("directions", "[[0.6,0.8,0],[1,1,0]]") &&
+              rejects("directions", "[[0.6,0.8,0],[0,1]]") &&
+              rejects("directions", "[[0.6,0.8,0],[0,0,\"1\"]]") &&
+              rejects("direction_layer", "2") &&
+              rejects("direction_layer", "-1") &&
+              rejects("direction_layer", "0.5") &&
+              rejects("direction_layer", "\"1\"") &&
+              rejects("attention", "[1,-0.5]") &&
+              rejects("attention", "[1,4.5]") && rejects("mlp", "[1]") &&
+              rejects("schema", "\"gufo-abliteration-v3\""),
+          "invalid v2 profile loaded");
+  // v2 without `directions` (a v1 body) and v1 with them are rejected.
+  auto mixed = v2;
+  mixed["schema"] = "gufo-abliteration-v1";
+  write(mixed);
+  Require(Rejects([&] {
+            (void)qwen::AbliterationProfile::Load(path, 3, 2, "fixture", site);
+          }),
+          "v1 schema with v2 members loaded");
+
+  const auto defaults = qwen::ResolveAbliterationSettings(profile);
+  Require(defaults->direction_layer == 1u && defaults->direction_row == 1 &&
+              defaults->attention == profile.attention &&
+              defaults->mlp == profile.mlp,
+          "v2 default settings");
+  // Identity covers only the effective values: explicit defaults match.
+  const auto explicit_defaults = qwen::ResolveAbliterationSettings(
+      profile, {.direction_layer = 1, .attention = {1, 0}, .mlp = {0, 0.5F}});
+  Require(explicit_defaults->identity == defaults->identity,
+          "explicit defaults changed the identity");
+  const auto layer0 =
+      qwen::ResolveAbliterationSettings(profile, {.direction_layer = 0});
+  const auto scalar = qwen::ResolveAbliterationSettings(profile, {.mlp = {2}});
+  const auto array =
+      qwen::ResolveAbliterationSettings(profile, {.mlp = {2, 2}});
+  const auto nudged =
+      qwen::ResolveAbliterationSettings(profile, {.mlp = {0, 0.50001F}});
+  const auto negative_zero =
+      qwen::ResolveAbliterationSettings(profile, {.attention = {1, -0.0F}});
+  Require(layer0->direction_row == 0 && scalar->mlp == std::vector<float>{2, 2},
+          "v2 overrides");
+  Require(layer0->identity != defaults->identity &&
+              scalar->identity != defaults->identity &&
+              scalar->identity == array->identity &&
+              nudged->identity != defaults->identity &&
+              negative_zero->identity == defaults->identity,
+          "settings identities");
+  // Another profile file with the same values is other settings.
+  auto renamed = v2;
+  renamed["note"] = "other file bytes";
+  write(renamed);
+  const auto other =
+      qwen::AbliterationProfile::Load(path, 3, 2, "fixture", site);
+  Require(
+      qwen::ResolveAbliterationSettings(other)->identity != defaults->identity,
+      "settings identity ignores the profile identity");
+  for (const auto& overrides : std::vector<qwen::AbliterationOverrides>{
+           {.direction_layer = 2},
+           {.attention = {1, 1, 1}},
+           {.mlp = {-1}},
+           {.mlp = {4.5F}},
+           {.mlp = {std::numeric_limits<float>::quiet_NaN()}},
+           {.mlp = {std::numeric_limits<float>::infinity(), 0}}}) {
+    Require(Rejects([&] {
+              (void)qwen::ResolveAbliterationSettings(profile, overrides);
+            }),
+            "invalid settings resolved");
+  }
+  // Device words: direction row bits, then attention, then mlp per layer.
+  const auto words = layer0->DeviceWords();
+  Require(words.size() == qwen::AbliterationDeviceWords(2) &&
+              Bits(words[0]) == 0 && Bits(defaults->DeviceWords()[0]) == 1 &&
+              words[qwen::AbliterationWeightIndex(2, 0, false)] == 1 &&
+              words[qwen::AbliterationWeightIndex(2, 1, false)] == 0 &&
+              words[qwen::AbliterationWeightIndex(2, 1, true)] == 0.5F &&
+              qwen::AbliterationWeightIndex(2, 0, true) == 3,
+          "device settings layout");
+  // ON metadata is bound to the settings: other strengths are a miss.
+  auto metadata = Current(4);
+  metadata.RecordImage({}, defaults.get());
+  Require(metadata.ImageMatches({}, defaults.get()) &&
+              metadata.ImageMatches({}, explicit_defaults.get()) &&
+              !metadata.ImageMatches({}, nudged.get()) &&
+              !metadata.ImageMatches({}, layer0.get()) &&
+              !metadata.ImageMatches({}, nullptr),
+          "settings-bound continuation guard");
+  // A 27B-sized v2 profile written by prepare.py fits the size cap.
+  Require(qwen::kAbliterationMaxProfileBytes >= 64ull * 5120 * 14,
+          "size cap below a 27B v2 profile");
+}
 }  // namespace
 
 int main() {
@@ -90,8 +237,10 @@ int main() {
   constexpr auto kResidual = qwen::kAbliterationWriterBeforeResidual;
   const auto profile =
       qwen::AbliterationProfile::Load(path, 3, 2, "fixture", kResidual);
-  Require(profile.direction.size() == 3 && profile.identity.size() == 64 &&
-              profile.placement == kResidual && profile.mlp[1] == 0.5F,
+  Require(profile.directions.size() == 3 && profile.schema == 1 &&
+              !profile.selectable_direction() &&
+              profile.identity.size() == 64 && profile.placement == kResidual &&
+              profile.mlp[1] == 0.5F,
           "27B profile load");
   // A Flash-Next placement never loads into 27B and vice versa, before the
   // model identity check.
@@ -134,6 +283,10 @@ int main() {
   const auto loaded =
       qwen::LoadAbliterationOption(path.string(), 3, 2, "fixture", kResidual);
   Require(loaded && loaded->identity == profile.identity, "option load");
+  TestV1Settings(profile);
+  TestV2Profile(path, kResidual);
+  // The ON settings the metadata guard binds: the v1 profile defaults.
+  const auto settings = qwen::ResolveAbliterationSettings(profile);
 
   // Metadata layout: OFF bytes equal pre-abliteration captures exactly.
   std::array<std::uint8_t, 32> raw{};
@@ -151,42 +304,42 @@ int main() {
           "OFF round trip");
 
   auto on_text = Current(5);
-  on_text.RecordImage(none, &profile);
+  on_text.RecordImage(none, settings.get());
   auto on_image = Current(9);
-  on_image.RecordImage(raw, &profile);
+  on_image.RecordImage(raw, settings.get());
   Require(on_text.abliteration == 1 && on_image.abliteration == 1 &&
               on_text.image_bytes == 0 && on_image.image_bytes == 32,
           "ON mode recorded");
   Require(std::ranges::equal(on_image.image, qwen::AbliterationInputIdentity(
-                                                 raw, profile.identity)) &&
+                                                 raw, settings->identity)) &&
               on_image.image != raw && on_text.image != on_image.image,
           "ON image identity salted");
-  Require(on_text.ImageMatches(none, &profile) &&
-              on_image.ImageMatches(raw, &profile),
+  Require(on_text.ImageMatches(none, settings.get()) &&
+              on_image.ImageMatches(raw, settings.get()),
           "ON round trip");
-  auto other = profile;
+  auto other = *settings;
   other.identity = std::string(64, '0');
   // Mode mismatch either way, another profile or another image are misses.
-  Require(!off_text.ImageMatches(none, &profile) &&
-              !off_image.ImageMatches(raw, &profile) &&
+  Require(!off_text.ImageMatches(none, settings.get()) &&
+              !off_image.ImageMatches(raw, settings.get()) &&
               !on_text.ImageMatches(none, nullptr) &&
               !on_image.ImageMatches(raw, nullptr) &&
               !on_text.ImageMatches(none, &other) &&
               !on_image.ImageMatches(raw, &other) &&
-              !on_image.ImageMatches(none, &profile),
+              !on_image.ImageMatches(none, settings.get()),
           "mismatched mode, profile or image restored");
   auto changed = raw;
   changed[0] ^= 1;
   Require(!off_image.ImageMatches(changed, nullptr) &&
-              !on_image.ImageMatches(changed, &profile),
+              !on_image.ImageMatches(changed, settings.get()),
           "changed image restored");
   // A pre-abliteration capture (mode bytes zero) restores OFF only.
   qwen::ContinuationMetadata legacy;
   const auto legacy_bytes = Legacy(9, raw);
   std::memcpy(&legacy, legacy_bytes.data(), sizeof(legacy));
-  Require(
-      legacy.ImageMatches(raw, nullptr) && !legacy.ImageMatches(raw, &profile),
-      "legacy capture guard");
+  Require(legacy.ImageMatches(raw, nullptr) &&
+              !legacy.ImageMatches(raw, settings.get()),
+          "legacy capture guard");
   Require(Rejects([&] {
             const std::array<std::uint8_t, 3> short_image{1, 2, 3};
             auto metadata = Current(1);

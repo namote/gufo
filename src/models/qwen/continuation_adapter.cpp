@@ -1316,7 +1316,7 @@ bool ContinuationAdapter::Validate(
     const auto identity = attachment
                               ? attachment->IdentityForPrefix(metadata.position)
                               : std::span<const std::uint8_t>{};
-    // A mode or profile other than the slot's is a cache miss.
+    // A mode or settings other than the slot's are a cache miss.
     if (!metadata.ImageMatches(identity, executor.ActiveAbliteration()))
       return refuse();
     if (metadata.image_bytes) {

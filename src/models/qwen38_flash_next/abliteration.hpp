@@ -22,7 +22,10 @@ struct AbliterationProfile : qwen::AbliterationProfile {
 using qwen::AbliterationContinuationMatches;
 using qwen::AbliterationContinuationRecord;
 using qwen::AbliterationInputIdentity;
+using qwen::AbliterationOverrides;
+using qwen::AbliterationSettings;
 using qwen::RecordAbliterationContinuation;
+using qwen::ResolveAbliterationSettings;
 
 /// Loads the explicit `--abliteration-profile` file. An empty option loads
 /// none; no file beside the model is ever picked up implicitly.

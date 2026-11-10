@@ -84,10 +84,27 @@ struct QwenImageContext : TextPromptContext {
   std::shared_ptr<const models::qwen::vision::Prompt> prompt;
 };
 
-/// A request with runtime abliteration ON (Flash-Next, Qwen3.8-27B).
+/// A request with runtime abliteration ON (Flash-Next, Qwen3.8-27B): its
+/// effective settings.
 struct AbliterationPromptContext final : QwenImageContext {
-  bool abliteration{false};
+  std::shared_ptr<const models::qwen::AbliterationSettings> settings;
 };
+
+std::optional<AbliterationInfo> DescribeAbliteration(
+    const models::qwen::AbliterationProfile* profile) {
+  if (profile == nullptr)
+    return std::nullopt;
+  return AbliterationInfo{
+      .schema = std::string(profile->schema == 2
+                                ? models::qwen::kAbliterationSchemaV2
+                                : models::qwen::kAbliterationSchemaV1),
+      .identity = profile->identity,
+      .layers = profile->layers,
+      .direction_layer = profile->direction_layer,
+      .attention = profile->attention,
+      .mlp = profile->mlp,
+  };
+}
 
 tokenization::ChatTemplateOptions QwenChatOptions(const ChatRequest& request,
                                                   std::uint32_t max_context) {
@@ -208,9 +225,11 @@ std::shared_ptr<const models::qwen::vision::Prompt> QwenPrompt(
 }
 
 /// Selects the runtime projection for one request. OFF returns `result`
-/// unchanged. ON records the mode and salts the text and every image-prefix
-/// cache identity with the profile identity, so ON/OFF or different profiles
-/// never share cached state.
+/// unchanged: no new context, identity or bytes. ON resolves the request's
+/// effective settings on the profile defaults and salts the text and every
+/// image-prefix cache identity with their identity (profile, direction layer
+/// and exact strengths), so ON/OFF or different settings never share cached
+/// state.
 TextPreparedPrompt SelectAbliteration(
     TextPreparedPrompt result, const ChatRequest& request,
     const models::qwen::AbliterationProfile* profile) {
@@ -220,27 +239,29 @@ TextPreparedPrompt SelectAbliteration(
     throw std::invalid_argument(
         "abliteration profile is not loaded; prepare it first");
   auto context = std::make_shared<AbliterationPromptContext>();
-  context->abliteration = true;
+  context->settings = models::qwen::ResolveAbliterationSettings(
+      *profile, request.abliteration_overrides);
+  const auto& identity = context->settings->identity;
   if (result.context) {
     context->prompt = QwenPrompt(result.context);
     context->cache_identity = result.context->cache_identity;
     context->cache_prefixes = result.context->cache_prefixes;
   }
   context->cache_identity = models::qwen::AbliterationInputIdentity(
-      context->cache_identity, profile->identity);
+      context->cache_identity, identity);
   for (auto& prefix : context->cache_prefixes)
-    prefix.identity = models::qwen::AbliterationInputIdentity(
-        prefix.identity, profile->identity);
+    prefix.identity =
+        models::qwen::AbliterationInputIdentity(prefix.identity, identity);
   result.context = std::move(context);
   return result;
 }
 
-/// Whether a request's prompt context selects runtime abliteration.
-bool AbliterationSelected(
+/// The settings a request's prompt context selects; null for OFF.
+std::shared_ptr<const models::qwen::AbliterationSettings> AbliterationSelected(
     const std::shared_ptr<const TextPromptContext>& context) {
   const auto* selection =
       dynamic_cast<const AbliterationPromptContext*>(context.get());
-  return selection && selection->abliteration;
+  return selection ? selection->settings : nullptr;
 }
 
 // The Han tokens (--han-scale) of a runner whose samplers apply them, built
@@ -1369,15 +1390,17 @@ public:
       TextRunnerState& state,
       std::shared_ptr<const TextPromptContext> context) const override {
     auto& qwen = RequireQwenState(state);
-    const bool abliteration = AbliterationSelected(context);
-    if (qwen.executor().AbliterationEnabled() != abliteration) {
-      // Neither the target nor the draft keeps rows of the other mode. A
-      // matched (live or restored) slot already has this request's mode: its
-      // cache identity carries the mode and profile.
+    auto abliteration = AbliterationSelected(context);
+    const auto* active = qwen.executor().ActiveAbliteration();
+    if (abliteration ? !active || active->identity != abliteration->identity
+                     : active != nullptr) {
+      // Neither the target nor the draft keeps rows of other settings. A
+      // matched (live or restored) slot already has this request's settings:
+      // its cache identity carries them.
       if (!qwen.InvalidateChecked())
         throw std::runtime_error(
-            "Qwen slot could not be reset for an abliteration mode change");
-      qwen.executor().ConfigureAbliteration(abliteration,
+            "Qwen slot could not be reset for an abliteration settings change");
+      qwen.executor().ConfigureAbliteration(std::move(abliteration),
                                             /*state_reset=*/true);
     }
     qwen.executor().ConfigureVision(QwenPrompt(context),
@@ -3355,7 +3378,8 @@ struct InferenceBackend::Impl {
     SamplingDefaults sampling_defaults;
     std::uint32_t max_context{0};
     bool supports_images{false};
-    bool supports_abliteration{false};
+    /// The loaded abliteration profile; empty without one.
+    std::optional<AbliterationInfo> abliteration;
     /// The runner's Han tokens; null where its samplers ignore han_scale.
     std::shared_ptr<const sampling::TokenSet> han_tokens;
     ReasoningOptions reasoning_defaults;
@@ -3905,7 +3929,7 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
         sampling::TextPreset(model->GetConfig());
     new_state->sampling_defaults.supplied = {};
     new_state->supports_images = model->VisionEncoder() != nullptr;
-    new_state->supports_abliteration = model->Abliteration() != nullptr;
+    new_state->abliteration = DescribeAbliteration(model->Abliteration());
     auto runner = std::make_shared<QwenTextRunner>(
         std::move(model), max_context, std::move(dflash_model),
         speculative_options, disk_cache_config.model_artifact_fingerprint,
@@ -4088,7 +4112,7 @@ bool InferenceBackend::load(
     new_state->sampling_defaults.model = sampling::TextModelPreset::kQwen38;
     new_state->sampling_defaults.supplied = {};
     new_state->supports_images = model->VisionEncoder() != nullptr;
-    new_state->supports_abliteration = model->Abliteration() != nullptr;
+    new_state->abliteration = DescribeAbliteration(model->Abliteration());
     auto runner = std::make_shared<QwenFlashNextTextRunner>(
         std::move(model), max_context,
         speculative_config.backend == TextSpeculativeBackend::kMtp,
@@ -4164,12 +4188,12 @@ bool InferenceBackend::device_lost() const {
 #endif
 }
 
-bool InferenceBackend::supports_abliteration() const {
+std::optional<AbliterationInfo> InferenceBackend::abliteration_info() const {
 #if defined(ENGINE_ENABLE_HIP)
   const auto state = impl_->Snapshot();
-  return state && state->supports_abliteration;
+  return state ? state->abliteration : std::nullopt;
 #else
-  return false;
+  return std::nullopt;
 #endif
 }
 
@@ -4378,7 +4402,7 @@ InferenceBackend::Result InferenceBackend::chat(
   auto effective_sampling = sampling_config;
   auto constrained = ConstrainChatRequest(request, state->scheduler->runner(),
                                           &effective_sampling);
-  if (request.abliteration && !state->supports_abliteration)
+  if (request.abliteration && !state->abliteration)
     throw std::invalid_argument(
         "abliteration profile is not available on this backend");
   const auto& effective_request = constrained ? *constrained : request;
@@ -4470,7 +4494,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
   std::optional<sampling::JsonConstraint::ToolFormat> tool_format;
   auto constrained = ConstrainChatRequest(request, state->scheduler->runner(),
                                           &effective_sampling, &tool_format);
-  if (request.abliteration && !state->supports_abliteration)
+  if (request.abliteration && !state->abliteration)
     throw std::invalid_argument(
         "abliteration profile is not available on this backend");
   const auto& effective_request = constrained ? *constrained : request;
@@ -4547,7 +4571,7 @@ std::optional<std::size_t> InferenceBackend::count_chat_tokens(
   auto sampling = sampling::SamplingConfig{};
   auto constrained =
       ConstrainChatRequest(request, state->scheduler->runner(), &sampling);
-  if (request.abliteration && !state->supports_abliteration)
+  if (request.abliteration && !state->abliteration)
     throw std::invalid_argument(
         "abliteration profile is not available on this backend");
   const auto& effective_request = constrained ? *constrained : request;
@@ -4570,7 +4594,7 @@ std::optional<std::string> InferenceBackend::render_chat_prompt(
   auto sampling = sampling::SamplingConfig{};
   auto constrained =
       ConstrainChatRequest(request, state->scheduler->runner(), &sampling);
-  if (request.abliteration && !state->supports_abliteration)
+  if (request.abliteration && !state->abliteration)
     throw std::invalid_argument(
         "abliteration profile is not available on this backend");
   const auto& effective_request = constrained ? *constrained : request;

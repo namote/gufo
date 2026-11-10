@@ -49,20 +49,20 @@ inline constexpr std::size_t kContinuationMetadataBytes = 64;
 struct ContinuationMetadata {
   std::uint32_t version{1}, position{}, logits_valid{}, has_next{}, next{},
       image_bytes{};
-  /// Raw image identity OFF; salted with the profile identity ON.
+  /// Raw image identity OFF; salted with the settings identity ON.
   std::array<std::uint8_t, 32> image{};
   /// AbliterationContinuationRecord::mode. Appended in four bytes every
   /// earlier capture zero-filled, so OFF (0) entries keep their bytes.
   std::uint32_t abliteration{};
 
   /// Records `identity` (empty or 32 bytes) and the capture's mode; `active`
-  /// is the slot's profile while abliteration is ON, else null.
+  /// is the slot's settings while abliteration is ON, else null.
   void RecordImage(std::span<const std::uint8_t> identity,
-                   const AbliterationProfile* active);
+                   const AbliterationSettings* active);
   /// Whether this entry restores into a slot whose image identity at its
-  /// position is `identity` and whose active profile is `active`.
+  /// position is `identity` and whose active settings are `active`.
   [[nodiscard]] bool ImageMatches(std::span<const std::uint8_t> identity,
-                                  const AbliterationProfile* active) const;
+                                  const AbliterationSettings* active) const;
 };
 static_assert(offsetof(ContinuationMetadata, abliteration) == 56 &&
               offsetof(ContinuationMetadata, abliteration) ==

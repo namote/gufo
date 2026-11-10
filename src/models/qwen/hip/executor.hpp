@@ -100,7 +100,7 @@ public:
                void* rotation_signs = nullptr, std::size_t exl3_bytes = 0,
                std::shared_ptr<const models::qwen::AbliterationProfile>
                    abliteration = {},
-               float* abliteration_direction = nullptr);
+               float* abliteration_directions = nullptr);
   ~QwenGpuModel();
 
   QwenGpuModel(const QwenGpuModel&) = delete;
@@ -122,9 +122,10 @@ public:
       const noexcept {
     return abliteration_.get();
   }
-  /// Device copy of Abliteration()->direction; null without a profile.
-  [[nodiscard]] const float* AbliterationDirection() const noexcept {
-    return abliteration_direction_;
+  /// Device copy of every Abliteration()->directions row; null without a
+  /// profile.
+  [[nodiscard]] const float* AbliterationDirections() const noexcept {
+    return abliteration_directions_;
   }
 
   [[nodiscard]] const std::shared_ptr<models::qwen::vision::Encoder>&
@@ -159,7 +160,7 @@ private:
   // Device bytes of the EXL3 projections (QwenModelWeights::exl3_storage).
   std::size_t exl3_bytes_{0};
   std::shared_ptr<const models::qwen::AbliterationProfile> abliteration_;
-  float* abliteration_direction_{nullptr};
+  float* abliteration_directions_{nullptr};
 };
 
 class QwenGpuSnapshot final {
@@ -692,6 +693,9 @@ public:
       std::shared_ptr<QwenSharedPassScratch> pass_scratch = nullptr,
       std::shared_ptr<KvBlockPool> kv_pool = nullptr);
   ~QwenGpuExecutor();
+  // Owns device allocations (the arena, abliteration settings).
+  QwenGpuExecutor(const QwenGpuExecutor&) = delete;
+  QwenGpuExecutor& operator=(const QwenGpuExecutor&) = delete;
 
   [[nodiscard]] static std::unique_ptr<QwenGpuExecutor> Create(
       std::shared_ptr<const QwenGpuModel> model,
@@ -743,20 +747,30 @@ public:
     return policy_;
   }
 
-  /// Selects this session's runtime projection, the model's profile. Throws
-  /// std::invalid_argument enabling it without a loaded profile. A change
-  /// resets the session (computed rows of one mode never serve the other) and
-  /// its captured decode graph; callers that track the session's state, such
-  /// as a component-cache slot with a draft, invalidate it first and pass
-  /// `state_reset` true after a successful invalidation.
-  void ConfigureAbliteration(bool enabled, bool state_reset = false);
+  /// Selects this session's runtime projection settings (null OFF), resolved
+  /// on the model's profile. Throws std::invalid_argument enabling it without
+  /// a loaded profile. A change resets the session (computed rows of other
+  /// settings never serve these); callers that track the session's state,
+  /// such as a component-cache slot with a draft, invalidate it first and
+  /// pass `state_reset` true after a successful invalidation. The settings
+  /// are written in place to this session's device copy, which the decode
+  /// graph reads at run time, so no graph key carries their values; the
+  /// session reset still drops the captured graph, as every Reset() does.
+  void ConfigureAbliteration(
+      std::shared_ptr<const models::qwen::AbliterationSettings> settings,
+      bool state_reset = false);
   [[nodiscard]] bool AbliterationEnabled() const noexcept {
-    return abliteration_enabled_;
+    return abliteration_ != nullptr;
   }
-  /// The model's profile while this session has abliteration ON, else null.
-  [[nodiscard]] const models::qwen::AbliterationProfile* ActiveAbliteration()
+  /// This session's effective settings while abliteration is ON, else null.
+  [[nodiscard]] const models::qwen::AbliterationSettings* ActiveAbliteration()
       const noexcept {
-    return abliteration_enabled_ ? model_->Abliteration() : nullptr;
+    return abliteration_.get();
+  }
+  /// The device copy of ActiveAbliteration() the projection kernels read
+  /// (AbliterationSettings::DeviceWords); null while OFF.
+  [[nodiscard]] const float* AbliterationDeviceSettings() const noexcept {
+    return abliteration_ ? abliteration_device_ : nullptr;
   }
   using ActivationObserver =
       std::function<void(std::uint32_t, std::span<const float>)>;
@@ -969,16 +983,11 @@ private:
   std::optional<tokenization::TokenId> next_token_;
   bool capture_prompt_hidden_{false};
   bool replaying_ssm_state_{false};
-  bool abliteration_enabled_{false};
+  std::shared_ptr<const models::qwen::AbliterationSettings> abliteration_;
+  /// AbliterationDeviceWords floats, allocated when first turned ON and kept
+  /// until destruction (a captured graph points at it).
+  float* abliteration_device_{nullptr};
   ActivationObserver activation_observer_;
-  /// This session's projection strength at `layer`'s attention/GDN (`mlp`
-  /// false) or MLP writer; zero while OFF.
-  [[nodiscard]] float AbliterationWeight(std::uint32_t layer,
-                                         bool mlp) const noexcept {
-    const auto* profile = ActiveAbliteration();
-    return profile ? (mlp ? profile->mlp[layer] : profile->attention[layer])
-                   : 0.0F;
-  }
 };
 
 }  // namespace gufo::hip

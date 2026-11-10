@@ -476,11 +476,24 @@ runtime projection. `--abliteration-profile FILE` loads one model-bound
 profile; nothing is discovered beside the model, and other models reject the
 option. Chat Completions, Responses and Messages requests select it with
 `{"abliteration":{"enabled":true,"profile":"default"}}`; omitting the object or
-`"enabled":false` is OFF. Raw completions do not accept it, and an unloaded
-profile or unknown member returns `invalid_abliteration`. ON and OFF requests,
-and different profiles, never share cached or continued state; OFF behaves and
-caches exactly as without a profile. Preparation and qualification are
-model-specific: see [Qwen3.8-27B](models/qwen3.8-27b/ABLITERATION.md) and
+`"enabled":false` is OFF. An ON request may also set its own settings:
+`direction_layer` (an integer in [0, layers), only with a
+`gufo-abliteration-v2` profile, which carries every layer's direction), and
+`attention` and `mlp`, each one number for every layer or an array of exactly
+`layers` numbers in [0, 4]; omitted members keep the profile defaults, for
+example `{"abliteration":{"enabled":true,"direction_layer":36,"attention":2,
+"mlp":0.5}}`. Raw completions do not accept it, and an unloaded profile,
+unknown member, invalid setting or setting sent with `"enabled":false` returns
+`invalid_abliteration`. ON and OFF requests, and different profiles or
+settings, never share cached or continued state; OFF behaves and caches exactly
+as without a profile. Changing settings needs no reload; only switching a
+session between ON and OFF re-records its graphs. `GET /props` reports the
+loaded profile as `abliteration`: `schema`, `identity`, `layers`, the
+`direction_layers` a request may name (empty for v1), the default
+`direction_layer` (null for v1), the default `attention` and `mlp` (one number
+when uniform) and `max_strength`; never the direction vectors. Preparation,
+qualification and the automatic strength search are model-specific: see
+[Qwen3.8-27B](models/qwen3.8-27b/ABLITERATION.md) and
 [Flash-Next](models/qwen3.8-flash-next/ABLITERATION.md).
 
 Diagnostic telemetry is limited to status, token counts, timing, and
@@ -1457,7 +1470,8 @@ sampling fields gets, with `n_predict` and `max_tokens` -1 when no default
 limit is set.
 Its Gufo `han_scale` is the default Han scale, 1 on models that ignore it.
 `modalities.vision` is true only when a vision encoder
-loaded. Fields the server cannot report are omitted rather than sent as zero.
+loaded. Gufo's `abliteration` object is present only with a loaded
+[runtime abliteration](#runtime-abliteration) profile. Fields the server cannot report are omitted rather than sent as zero.
 
 `POST /apply-template` takes a Chat Completions body and returns
 `{"prompt": "..."}`, the text the model's compiled chat template renders it

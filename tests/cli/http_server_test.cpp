@@ -571,6 +571,30 @@ void TestLlamaProps() {
   assert(named.member_str("model") == "alias");
   assert(named.member_str("model_alias") == "test");
   assert(named.member_str("build_info") == "0.2.0 (abc1234)");
+
+  // A loaded abliteration profile: geometry and defaults, no vectors.
+  assert(!named.contains("abliteration"));
+  server.backend->abliteration =
+      AbliterationInfo{.schema = "gufo-abliteration-v2",
+                       .identity = std::string(64, 'b'),
+                       .layers = 3,
+                       .direction_layer = 2,
+                       .attention = {2, 2, 2},
+                       .mlp = {0, 0.5F, 0}};
+  const auto ablated = props("/props");
+  const auto* abliteration = ablated.find("abliteration");
+  assert(abliteration != nullptr);
+  assert(abliteration->member_str("schema") == "gufo-abliteration-v2");
+  assert(abliteration->member_size("layers") == 3);
+  assert(abliteration->member_size("direction_layer") == 2);
+  assert(abliteration->find("direction_layers")->size() == 3);
+  assert(abliteration->find("attention")->as_double() == 2.0);
+  assert(abliteration->find("mlp")->size() == 3);
+  assert(!abliteration->contains("directions"));
+  server.backend->abliteration->direction_layer.reset();
+  const auto v1 = props("/props")["abliteration"];
+  assert(v1.find("direction_layer")->is_null());
+  assert(v1.find("direction_layers")->empty());
 }
 
 void TestApplyTemplate() {

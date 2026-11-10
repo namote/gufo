@@ -21,17 +21,28 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/exl3_prefill_combine.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
+/// Rows [previous span's end_row, end_row) use one session's device
+/// settings (qwen::AbliterationSettings::DeviceWords); null leaves them
+/// unchanged.
 struct AbliterationSpan {
   std::uint32_t end_row;
-  float weight;
+  const float* settings;
 };
-void AbliterateBatchRows(float* output, const float* direction,
+/// In place, per row of an ON span: y -= w * d * dot(d, y), where d is the
+/// session's direction row of `directions` ([rows][hidden], unit) and w its
+/// strength for `layer`'s attention (`mlp` false) or MLP writer, both read on
+/// the device at run time. Launches nothing when every span is OFF; an ON
+/// span launches even at strength 0, so strength updates never change a
+/// captured graph.
+void AbliterateBatchRows(float* output, const float* directions,
                          std::span<const AbliterationSpan> spans,
+                         std::uint32_t layer, bool mlp, std::uint32_t layers,
                          std::uint32_t rows, std::uint32_t hidden,
                          hipStream_t stream);
-void AbliterateRows(float* output, const float* direction, float weight,
-                    std::uint32_t rows, std::uint32_t hidden,
-                    hipStream_t stream);
+void AbliterateRows(float* output, const float* directions,
+                    const float* settings, std::uint32_t layer, bool mlp,
+                    std::uint32_t layers, std::uint32_t rows,
+                    std::uint32_t hidden, hipStream_t stream);
 
 struct Exl3RouteTile;  // exl3_moe.hpp
 

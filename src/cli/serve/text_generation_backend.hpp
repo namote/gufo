@@ -20,6 +20,7 @@
 #include "src/core/reasoning.hpp"
 #include "src/core/sampling.hpp"
 #include "src/core/text_sampling_defaults.hpp"
+#include "src/models/qwen/abliteration.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 
@@ -34,6 +35,20 @@ enum class TextGenerationErrorCode : std::uint8_t {
   kSchedulerStopping,
   kToolChoiceUnsatisfied,
   kDeviceLost,
+};
+
+/// The loaded runtime abliteration profile as requests and /props see it:
+/// geometry and defaults, never the direction vectors.
+struct AbliterationInfo {
+  std::string schema;
+  /// SHA-256 of the profile file.
+  std::string identity;
+  std::uint32_t layers{0};
+  /// The default direction layer; empty for a v1 profile, whose one direction
+  /// cannot be changed per request.
+  std::optional<std::uint32_t> direction_layer;
+  std::vector<float> attention;
+  std::vector<float> mlp;
 };
 
 /// Client-facing message for a GPU context that can no longer execute work.
@@ -118,6 +133,9 @@ struct ChatRequest {
   bool add_vision_id{false};
   /// Target-model execution transform, independent of sampling/thinking.
   bool abliteration{false};
+  /// Per-request settings while `abliteration` is ON; empty members keep the
+  /// profile defaults.
+  models::qwen::AbliterationOverrides abliteration_overrides;
   /// Bypass prompt reuse for this request; its completed state may be retained.
   bool cache_prompt{true};
   /// False keeps this request's checkpoints out of the disk cache; it may
@@ -319,7 +337,15 @@ public:
   }
   /// Whether the loaded backend accepts image inputs in chat requests.
   [[nodiscard]] virtual bool supports_images() const { return false; }
-  [[nodiscard]] virtual bool supports_abliteration() const { return false; }
+  /// The loaded abliteration profile; empty without one or on a backend that
+  /// cannot apply it.
+  [[nodiscard]] virtual std::optional<AbliterationInfo> abliteration_info()
+      const {
+    return std::nullopt;
+  }
+  [[nodiscard]] bool supports_abliteration() const {
+    return abliteration_info().has_value();
+  }
   /// Whether requests apply SamplingConfig::han_scale (Qwen 27B and
   /// Flash-Next, whose runners build a Han token set).
   [[nodiscard]] virtual bool supports_han_scale() const { return false; }

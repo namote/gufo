@@ -760,9 +760,8 @@ cache::Completion ContinuationAdapter::CapturePrivatePiece(
     const auto identity = session.ImageIdentity(native.position_);
     metadata.image_bytes = static_cast<std::uint32_t>(identity.size());
     // The captured state's own mode: a prefill checkpoint view copies it.
-    const auto record = RecordAbliterationContinuation(
-        identity,
-        native.AbliterationEnabled() ? model_->Abliteration() : nullptr);
+    const auto record =
+        RecordAbliterationContinuation(identity, native.Abliteration());
     metadata.image = record.image;
     metadata.abliteration = record.mode;
     std::memcpy(host_metadata.data(), &metadata, sizeof(metadata));
@@ -1150,7 +1149,7 @@ bool ContinuationAdapter::Validate(
                           metadata.draft_blocks) != state.expected)
       return refuse();
     const auto identity = session.ImageIdentity(metadata.target);
-    // A mode or profile other than the session's is a cache miss.
+    // A mode or settings other than the session's are a cache miss.
     if (!AbliterationContinuationMatches(
             metadata.abliteration, metadata.image_bytes, metadata.image,
             identity, session.ActiveAbliteration()))

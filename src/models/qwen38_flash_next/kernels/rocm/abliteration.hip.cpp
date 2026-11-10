@@ -1,3 +1,5 @@
+#include "src/models/qwen/abliteration.hpp"
+
 #include <algorithm>
 #include <array>
 #include <stdexcept>
@@ -6,21 +8,29 @@
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
-struct RowWeights {
+struct RowSettings {
   std::array<AbliterationSpan, 8> spans;
   unsigned count;
 };
 // One block per row, FP32 dot product and projection. No intermediate tensor.
-__global__ void Project(float* output, const float* direction,
-                        RowWeights weights, std::uint32_t hidden) {
-  float weight = 0;
-  for (unsigned i = 0; i < weights.count; ++i)
-    if (blockIdx.x < weights.spans[i].end_row) {
-      weight = weights.spans[i].weight;
+// Each row reads its session's device settings at run time (direction row and
+// this writer's strength), so captured graphs follow in-place updates.
+__global__ void Project(float* output, const float* directions,
+                        RowSettings rows, std::uint32_t weight_index,
+                        std::uint32_t hidden) {
+  const float* settings = nullptr;
+  for (unsigned i = 0; i < rows.count; ++i)
+    if (blockIdx.x < rows.spans[i].end_row) {
+      settings = rows.spans[i].settings;
       break;
     }
+  if (settings == nullptr)
+    return;
+  const float weight = settings[weight_index];
   if (weight == 0)
     return;
+  const float* direction =
+      directions + std::size_t{__float_as_uint(settings[0])} * hidden;
   __shared__ float partial[256];
   float* row = output + std::size_t{blockIdx.x} * hidden;
   float sum = 0;
@@ -39,26 +49,31 @@ __global__ void Project(float* output, const float* direction,
 }
 }  // namespace
 
-void AbliterateBatchRows(float* output, const float* direction,
+void AbliterateBatchRows(float* output, const float* directions,
                          std::span<const AbliterationSpan> spans,
+                         std::uint32_t layer, bool mlp, std::uint32_t layers,
                          std::uint32_t rows, std::uint32_t hidden,
                          hipStream_t stream) {
   if (spans.size() > 8)
     throw std::invalid_argument("abliteration batch exceeds eight sessions");
-  if (!rows ||
-      std::ranges::none_of(spans, [](const auto& s) { return s.weight != 0; }))
+  if (layer >= layers)
+    throw std::invalid_argument("abliteration layer out of range");
+  if (!rows || std::ranges::none_of(
+                   spans, [](const auto& s) { return s.settings != nullptr; }))
     return;
-  RowWeights weights{};
-  weights.count = spans.size();
-  std::copy(spans.begin(), spans.end(), weights.spans.begin());
+  RowSettings settings{};
+  settings.count = spans.size();
+  std::copy(spans.begin(), spans.end(), settings.spans.begin());
   hipLaunchKernelGGL(Project, dim3(rows), dim3(256), 0, stream, output,
-                     direction, weights, hidden);
+                     directions, settings,
+                     qwen::AbliterationWeightIndex(layers, layer, mlp), hidden);
 }
-void AbliterateRows(float* output, const float* direction, float weight,
-                    std::uint32_t rows, std::uint32_t hidden,
-                    hipStream_t stream) {
-  const AbliterationSpan span{rows, weight};
-  AbliterateBatchRows(output, direction, std::span(&span, 1), rows, hidden,
-                      stream);
+void AbliterateRows(float* output, const float* directions,
+                    const float* settings, std::uint32_t layer, bool mlp,
+                    std::uint32_t layers, std::uint32_t rows,
+                    std::uint32_t hidden, hipStream_t stream) {
+  const AbliterationSpan span{rows, settings};
+  AbliterateBatchRows(output, directions, std::span(&span, 1), layer, mlp,
+                      layers, rows, hidden, stream);
 }
 }  // namespace gufo::models::qwen38_flash_next::rocm

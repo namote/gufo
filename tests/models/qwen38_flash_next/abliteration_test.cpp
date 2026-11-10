@@ -35,7 +35,9 @@ int main() {
   };
   write(original);
   const auto profile = q::AbliterationProfile::Load(path, 3, 2, "fixture");
-  Require(profile.direction.size() == 3 && profile.identity.size() == 64);
+  Require(profile.directions.size() == 3 && profile.identity.size() == 64 &&
+          profile.placement == "writer-before-hc");
+  const auto settings = q::ResolveAbliterationSettings(profile);
   Require(q::AbliterationProfile::Load(path, 3, 2, "fixture").identity ==
           profile.identity);
   const std::vector<std::uint8_t> image{1, 2, 3};
@@ -71,38 +73,38 @@ int main() {
           std::ranges::all_of(off_text.image, [](auto b) { return b == 0; }));
   const auto off_image = q::RecordAbliterationContinuation(raw, nullptr);
   Require(off_image.mode == 0 && off_image.image == raw);
-  auto other = profile;
+  auto other = *settings;
   other.identity = std::string(64, '0');
-  const auto on_text = q::RecordAbliterationContinuation(none, &profile);
-  const auto on_image = q::RecordAbliterationContinuation(raw, &profile);
+  const auto on_text = q::RecordAbliterationContinuation(none, settings.get());
+  const auto on_image = q::RecordAbliterationContinuation(raw, settings.get());
   Require(on_text.mode == Record::kOn && on_image.mode == Record::kOn);
   Require(std::ranges::equal(
-      on_image.image, q::AbliterationInputIdentity(raw, profile.identity)));
+      on_image.image, q::AbliterationInputIdentity(raw, settings->identity)));
   Require(on_text.image != on_image.image && on_image.image != raw);
   const auto matches = [](const Record& r, std::uint32_t image_bytes,
                           std::span<const std::uint8_t> image,
-                          const q::AbliterationProfile* active) {
+                          const q::AbliterationSettings* active) {
     return q::AbliterationContinuationMatches(r.mode, image_bytes, r.image,
                                               image, active);
   };
   // Round trips.
   Require(matches(off_text, 0, none, nullptr));
   Require(matches(off_image, 32, raw, nullptr));
-  Require(matches(on_text, 0, none, &profile));
-  Require(matches(on_image, 32, raw, &profile));
+  Require(matches(on_text, 0, none, settings.get()));
+  Require(matches(on_image, 32, raw, settings.get()));
   // Mode mismatch either way, other profile and other image are misses.
-  Require(!matches(off_text, 0, none, &profile));
-  Require(!matches(off_image, 32, raw, &profile));
+  Require(!matches(off_text, 0, none, settings.get()));
+  Require(!matches(off_image, 32, raw, settings.get()));
   Require(!matches(on_text, 0, none, nullptr));
   Require(!matches(on_image, 32, raw, nullptr));
   Require(!matches(on_text, 0, none, &other));
   Require(!matches(on_image, 32, raw, &other));
-  Require(!matches(on_text, 0, raw, &profile));
-  Require(!matches(on_image, 32, none, &profile));
+  Require(!matches(on_text, 0, raw, settings.get()));
+  Require(!matches(on_image, 32, none, settings.get()));
   auto changed = raw;
   changed[0] ^= 1;
   Require(!matches(off_image, 32, changed, nullptr));
-  Require(!matches(on_image, 32, changed, &profile));
+  Require(!matches(on_image, 32, changed, settings.get()));
   bool invalid_image = false;
   try {
     const std::array<std::uint8_t, 3> short_image{1, 2, 3};
@@ -136,7 +138,8 @@ int main() {
     }
     Require(rejected);
   }
-  std::ofstream(path) << std::string(1024 * 1024 + 1, ' ');
+  std::ofstream(path) << std::string(
+      gufo::models::qwen::kAbliterationMaxProfileBytes + 1, ' ');
   bool rejected = false;
   try {
     (void)q::AbliterationProfile::Load(path, 3, 2, "fixture");
@@ -144,5 +147,21 @@ int main() {
     rejected = true;
   }
   Require(rejected);
+
+  // Schema v2 through the Flash-Next placement: every layer's direction.
+  std::ofstream(path)
+      << R"({"schema":"gufo-abliteration-v2","placement":"writer-before-hc",
+      "model_identity":"fixture","hidden":3,"layers":2,
+      "directions":[[0,1,0],[0.6,0.8,0]],"direction_layer":0,
+      "attention":[2,2],"mlp":[0.5,0.5]})";
+  const auto v2 = q::AbliterationProfile::Load(path, 3, 2, "fixture");
+  Require(v2.schema == 2 && v2.direction_rows() == 2 &&
+          v2.direction_layer == 0u);
+  const auto chosen = q::ResolveAbliterationSettings(
+      v2, {.direction_layer = 1, .attention = {1}});
+  Require(chosen->direction_row == 1 &&
+          chosen->attention == std::vector<float>{1, 1} &&
+          chosen->mlp == v2.mlp &&
+          chosen->identity != q::ResolveAbliterationSettings(v2)->identity);
   std::cout << "profile and cache identity PASS\n";
 }

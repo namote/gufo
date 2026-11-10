@@ -93,8 +93,11 @@ private:
 
 class FakeBackend final : public gufo::server::TextGenerationBackend {
 public:
-  bool abliteration_available{false};
-  bool supports_abliteration() const override { return abliteration_available; }
+  std::optional<gufo::server::AbliterationInfo> abliteration;
+  std::optional<gufo::server::AbliterationInfo> abliteration_info()
+      const override {
+    return abliteration;
+  }
   std::vector<gufo::server::DecodedLogprobs> logprob_pieces;
   [[nodiscard]] std::string model_id() const override { return "test-model"; }
   [[nodiscard]] std::vector<std::string> model_ids() const override {
@@ -6967,19 +6970,72 @@ void TestAbliterationControls() {
   Expect(!parse("{}") && !request.abliteration, "abliteration defaults off");
   Expect(parse(R"({"abliteration":{"enabled":true}})").has_value(),
          "unloaded profile rejected");
-  backend.abliteration_available = true;
+  // A three-layer v2 profile.
+  backend.abliteration =
+      gufo::server::AbliterationInfo{.schema = "gufo-abliteration-v2",
+                                     .identity = std::string(64, 'a'),
+                                     .layers = 3,
+                                     .direction_layer = 1,
+                                     .attention = {1, 1, 1},
+                                     .mlp = {0, 0.5F, 0}};
   Expect(!parse(R"({"abliteration":{"enabled":true,"profile":"default"}})") &&
-             request.abliteration,
-         "loaded profile selects target transform");
-  Expect(
-      !parse(R"({"abliteration":{"enabled":false}})") && !request.abliteration,
-      "explicit off replaces enabled");
-  for (const auto* body :
-       {R"({"abliteration":true})", R"({"abliteration":{}})",
-        R"({"abliteration":{"enabled":1}})",
-        R"({"abliteration":{"enabled":true,"profile":"/tmp/x"}})",
-        R"({"abliteration":{"enabled":true,"strength":2}})"})
-    Expect(parse(body).has_value(), "invalid transform controls rejected");
+             request.abliteration &&
+             !request.abliteration_overrides.direction_layer &&
+             request.abliteration_overrides.attention.empty() &&
+             request.abliteration_overrides.mlp.empty(),
+         "loaded profile selects target transform with its defaults");
+  Expect(!parse(R"({"abliteration":{"enabled":true,"direction_layer":2,
+             "attention":2,"mlp":[0,0.5,4]}})") &&
+             request.abliteration &&
+             request.abliteration_overrides.direction_layer == 2u &&
+             request.abliteration_overrides.attention ==
+                 std::vector<float>{2.0F} &&
+             request.abliteration_overrides.mlp ==
+                 std::vector<float>{0.0F, 0.5F, 4.0F},
+         "scalar and per-layer strengths with a direction layer");
+  Expect(!parse(R"({"abliteration":{"enabled":false}})") &&
+             !request.abliteration &&
+             !request.abliteration_overrides.direction_layer &&
+             request.abliteration_overrides.mlp.empty(),
+         "explicit off replaces enabled and its settings");
+  for (const auto* body : {
+           R"({"abliteration":true})",
+           R"({"abliteration":{}})",
+           R"({"abliteration":{"enabled":1}})",
+           R"({"abliteration":{"enabled":true,"profile":"/tmp/x"}})",
+           R"({"abliteration":{"enabled":true,"strength":2}})",
+           // Bounds, types and lengths.
+           R"({"abliteration":{"enabled":true,"direction_layer":3}})",
+           R"({"abliteration":{"enabled":true,"direction_layer":-1}})",
+           R"({"abliteration":{"enabled":true,"direction_layer":1.5}})",
+           R"({"abliteration":{"enabled":true,"direction_layer":"1"}})",
+           R"({"abliteration":{"enabled":true,"attention":-0.5}})",
+           R"({"abliteration":{"enabled":true,"attention":4.5}})",
+           R"({"abliteration":{"enabled":true,"attention":"2"}})",
+           R"({"abliteration":{"enabled":true,"mlp":[1,1]}})",
+           R"({"abliteration":{"enabled":true,"mlp":[1,1,1,1]}})",
+           R"({"abliteration":{"enabled":true,"mlp":[1,-1,1]}})",
+           R"({"abliteration":{"enabled":true,"mlp":[1,null,1]}})",
+           R"({"abliteration":{"enabled":true,"mlp":[]}})",
+           R"({"abliteration":{"enabled":true,"mlp":{}}})",
+           // Settings without ON.
+           R"({"abliteration":{"enabled":false,"attention":1}})",
+       }) {
+    const auto error = parse(body);
+    Expect(error.has_value() && error->status == 400 &&
+               error->body.find("invalid_abliteration") != std::string::npos,
+           "invalid transform controls rejected");
+  }
+  // v1: one fixed direction; strengths still apply.
+  backend.abliteration->schema = "gufo-abliteration-v1";
+  backend.abliteration->direction_layer.reset();
+  Expect(parse(R"({"abliteration":{"enabled":true,"direction_layer":1}})")
+             .has_value(),
+         "v1 profile rejects a direction layer");
+  Expect(!parse(R"({"abliteration":{"enabled":true,"attention":[0,1,2]}})") &&
+             request.abliteration_overrides.attention ==
+                 std::vector<float>{0.0F, 1.0F, 2.0F},
+         "v1 profile accepts strengths");
 }
 
 int main() {

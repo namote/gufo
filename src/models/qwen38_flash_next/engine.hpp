@@ -276,9 +276,12 @@ public:
   };
   [[nodiscard]] MemoryUsage Memory() const noexcept;
   void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt);
-  void ConfigureAbliteration(bool enabled);
-  /// The model's profile while this session has abliteration ON, else null.
-  [[nodiscard]] const AbliterationProfile* ActiveAbliteration() const;
+  /// Null turns the projection OFF. Different settings never share token
+  /// state: a change resets a non-empty session.
+  void ConfigureAbliteration(
+      std::shared_ptr<const AbliterationSettings> settings);
+  /// The session's effective settings while abliteration is ON, else null.
+  [[nodiscard]] const AbliterationSettings* ActiveAbliteration() const;
   [[nodiscard]] std::vector<std::uint8_t> ContinuationIdentity(
       std::size_t tokens) const;
   using ActivationObserver =

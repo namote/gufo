@@ -10,30 +10,43 @@ This is a reversible inference intervention, not a weight conversion.
 - `abliteration.{hpp,cpp}` binds the shared Qwen profile
   (`src/models/qwen/abliteration`: versioned, immutable, model-bound, with its
   cache identity) to this placement. It has no HIP dependency.
-- The model loads one direction once; the executor keeps its GPU copy. Each
-  session owns its ON/OFF state. There is no server-global mutable toggle.
+- The model uploads every profile direction once at load (48 x 2560 floats
+  for a v2 profile); the executor keeps the GPU copy. Each session owns its
+  effective settings (OFF, or a direction layer and per-layer attention/MLP
+  strengths) and, from its first ON request, a small device copy of them
+  (1 + 2 x layers words). There is no server-global mutable toggle.
 - The hook acts on the attention/GDN output projection and the **aggregated**
   routed-plus-shared MoE output, immediately before HC/residual injection.
   It does not project the accumulated residual, per-layer embedding (PLE)
   contributions (injected into the residual directly), attention
   probabilities, logits, or every expert separately. MTP drafts remain
   unchanged; target verification uses the selected intervention.
-- A zero layer strength launches no projection. With all sessions OFF, no
-  projection kernel launches. With mixed sessions, one masked kernel covers
-  up to eight sessions at each selected boundary. It updates the existing
-  output in place, without a second activation tensor or per-token upload.
+- With all sessions OFF, no projection kernel launches. An ON session launches
+  the projection at every writer, also where its strength is zero (the kernel
+  then returns at once), so its launches do not depend on strength values.
+  With mixed sessions, one masked kernel covers up to eight sessions at each
+  selected boundary; each row reads its session's direction row and strength
+  from that session's device settings. It updates the existing output in
+  place, without a second activation tensor or per-token upload.
 - ON materializes deferred MoE outputs where necessary before projection; this
-  can lose an existing fusion. Actual end-to-end overhead remains unmeasured.
-  Small operator cost is not evidence of negligible complete-request overhead.
-- Mode changes invalidate session execution graphs and resident token history.
-  Profile identity salts text and every image-prefix cache identity. Matching
-  mode caches can be reused; ON/OFF or different profiles cannot share states.
-  Two independent guards also check each restored state. Component-cache
-  continuation metadata records the mode and, ON, the image identity salted
-  with the full profile identity; a mismatch is a cache miss. Engine
-  snapshots record the mode in their header and the salted identity likewise.
-  OFF records mode 0 in bytes every earlier capture zero-filled, so existing
-  OFF caches remain valid byte for byte.
+  can lose an existing fusion, on every layer of an ON session. Actual
+  end-to-end overhead remains unmeasured. Small operator cost is not evidence
+  of negligible complete-request overhead.
+- ON/OFF changes invalidate session execution graphs. Other settings changes
+  are written in place to the session's device copy (an ordered upload on the
+  executor stream, then a stream synchronization) and keep recorded graphs,
+  which read the settings when they run. Any settings change drops resident
+  token history. The settings identity, SHA-256 over the profile identity,
+  the direction layer and the exact float bytes of every attention and MLP
+  strength, salts text and every image-prefix cache identity: matching
+  settings can reuse caches; ON/OFF or different settings cannot share
+  states. Two independent guards also check each restored state.
+  Component-cache continuation metadata records the mode and, ON, the image
+  identity salted with the settings identity; a mismatch is a cache miss.
+  Engine snapshots record the mode in their header and the salted identity
+  likewise. OFF records mode 0 in bytes every earlier capture zero-filled, so
+  existing OFF caches remain valid byte for byte, and OFF requests allocate,
+  upload and launch nothing new.
 
 The GPU operation is `y -= strength * direction * dot(direction, y)` with an
 FP32 reduction and unit direction. The file carries separate per-layer attention
@@ -45,11 +58,17 @@ implement it.
 
 ## Profile and API
 
-A profile is a small JSON file with schema `gufo-abliteration-v1`, placement
-`writer-before-hc`, `model_identity`, `hidden`, `layers`, `direction`, `attention`
-and `mlp`. It must match the loaded artifact; nonfinite values, nonunit vectors,
-incompatible dimensions and oversized files are rejected. Candidate provenance
-can be stored as additional fields. Structural loading does not certify quality.
+A profile is a JSON file with schema `gufo-abliteration-v2`, placement
+`writer-before-hc`, `model_identity`, `hidden`, `layers`, `directions` (one unit
+vector of `hidden` floats per layer, `[layers][hidden]`), and the request
+defaults `direction_layer`, `attention[layers]` and `mlp[layers]` (strengths
+in [0, 4]). A v2 Flash-Next profile is about 1.6 MB as written by
+`prepare.py`. Schema `gufo-abliteration-v1` (one `direction`, whose source
+layer is unknown) still loads: requests may change its strengths but not its
+direction. Profiles must match the loaded artifact; nonfinite values, nonunit
+vectors, out-of-range layers or strengths, incompatible dimensions and files
+over 16 MiB are rejected. Candidate provenance can be stored as additional
+fields. Structural loading does not certify quality.
 
 Load a chosen file with `gufo serve llm ... --abliteration-profile /path/profile.json`.
 This option is the only way to load one: nothing beside the model (such as an
@@ -63,9 +82,23 @@ Supported chat-style requests (Chat Completions, Responses, Messages):
 {"abliteration": {"enabled": true, "profile": "default"}}
 ```
 
-Omit the object or send `{"abliteration":{"enabled":false}}` for OFF.
-Unknown fields, profile names/paths and unsupported backends are rejected;
-clients cannot load arbitrary local files through requests. Raw completions do
+uses the profile defaults. Each request can also choose its own settings,
+without reloading anything:
+
+```json
+{"abliteration": {"enabled": true, "direction_layer": 36,
+                  "attention": 2.0, "mlp": 0.5}}
+```
+
+`direction_layer` is an integer in [0, layers) and needs a v2 profile.
+`attention` and `mlp` are each one number for every layer or an array of
+exactly `layers` numbers, each in [0, 4]. Omitted members keep the profile
+defaults. Sessions in one batch may run different settings. Omit the object or
+send `{"abliteration":{"enabled":false}}` for OFF; settings with
+`"enabled": false` are rejected. Unknown fields, profile names/paths, invalid
+settings and unsupported backends are rejected with `invalid_abliteration`;
+clients cannot load arbitrary local files through requests. `GET /props`
+reports the loaded profile under `abliteration`. Raw completions do
 not accept this control. The option is independent of thinking and Han-token
 sampling controls. Existing clients need to send this additional JSON field;
 this change does not add a DSH UI control.
@@ -88,11 +121,20 @@ The Python fitter needs NumPy; it does not run GPU work.
    intervention. Prompts over 2048 tokens are rejected, never silently clipped.
 3. `prepare.py fit --collection CAPTURE --output NEW_CANDIDATES` computes
    refusal-minus-ordinary means and unit directions. A bounded screen varies
-   source layer and strength; files remain `candidate-not-qualified`.
+   the default direction layer and strength; every candidate is a v2 profile
+   with all directions, and files remain `candidate-not-qualified`.
+   `prepare.py make-profile --fit NEW_CANDIDATES --direction-layer 36
+   --attention 2 --mlp 0.5 --output NEW.json` (or `--profile V2.json` to
+   re-default an existing profile) writes one v2 profile. `--attention` and
+   `--mlp` take one number, `layers` comma-separated numbers, or a curve
+   `max_w=2,peak=36,min_w=0.5,width=10`: weight(i) = max_w + (min_w - max_w)
+   * |i - peak| / width when |i - peak| <= width, else 0 (Heretic's form).
 4. `collector MODEL DATA/tuning.jsonl OFF evaluate --max-new-tokens 1024` stores
    an OFF reference. Candidate runs use a **different** output directory and
    `--profile CANDIDATE.json`. Reuse each successful collection/reference;
    resume verifies model, executable, device code, dataset, profile and settings.
+   Alternatively, serve a v2 candidate and let `search.py` choose settings
+   over HTTP (see below); it also uses tuning only.
 5. Select using tuning only. Evaluate the selected candidate and OFF on untouched
    evaluation inputs; inspect complete answers for refusal behavior and ordinary
    capability. The collector saves first-next-token logits, generated text and
@@ -109,11 +151,50 @@ The collector never starts the production service, overwrites model weights,
 installs profiles or interprets dataset prompts as host instructions. Concurrent
 collectors must use separate output directories and coordinate GPU ownership.
 
+## Automatic strength search
+
+`search.py` (shared with Qwen3.8-27B; standard library only) drives a running
+server with a v2 profile through per-request settings. Each trial picks a
+direction layer and Heretic curves (max_w, peak, min_w, width) for attention
+and MLP, then counts refusals on harmful tuning prompts (greedy, short
+`--max-tokens`, a phrase heuristic on the final answer) and the mean
+first-token KL(OFF || ON) on ordinary tuning prompts from the server's 20
+`top_logprobs`, which are raw model log-probabilities after the in-forward
+projection. The KL is approximated on the union of both top-20 sets, each
+side's missing tokens sharing its leftover mass, both renormalized over the
+union (see the script's docstring). An empty final answer counts as a
+refusal, so a broken model never scores well. Trial 0 is the profile defaults,
+then `--initial` random samples, then Gaussian perturbations of the current
+Pareto front. Thinking is explicit (`--thinking off|on|both`, sent as
+`chat_template_kwargs.enable_thinking`); thinking prompts need a larger
+budget, and answers still empty at the budget are also reported as
+unfinished. `--base-profile` must be the file the server loaded (its SHA-256
+is the profile identity in `/props`). Every
+trial is appended to `--log` (rerunning resumes); the end prints the Pareto
+front and writes the trial with the fewest refusals within `--kl-budget` as a
+new v2 profile:
+
+```sh
+python3 tools/qwen38_flash_next/abliteration/search.py \
+  --base-url http://127.0.0.1:8080 --model gufo \
+  --data NEW_DATA_DIR/tuning.jsonl --refusal-prompts 24 --ordinary-prompts 24 \
+  --thinking off --max-tokens 64 --trials 80 --initial 20 \
+  --log SEARCH/trials.jsonl --kl-budget 0.1 \
+  --base-profile SERVED_V2.json --output SEARCH/chosen.json
+```
+
+The chosen profile is still a tuning result: evaluate it on held-out inputs
+as in step 5.
+
 ## Focused checks
 
-CPU: `qwen38_flash_next.abliteration`, `openai_chat_test`, and
-`python3 tools/qwen38_flash_next/abliteration/test_prepare.py`.
+CPU: `qwen38_flash_next.abliteration`, `qwen27b_abliteration_test` (shared v2
+profile, settings and identity contracts), `openai_chat_test`,
+`http_server_test`,
+`python3 tools/qwen38_flash_next/abliteration/test_prepare.py` (NumPy) and
+`python3 tools/qwen38_flash_next/abliteration/test_search.py`.
 GPU: `qwen38_flash_next.abliteration_ops` covers an independent FP64 formula,
-unaligned dimensions, mixed ON/OFF rows and the production deferred-attention /
-MoE / projection / HC order. Build it during iteration; run it with the final
+unaligned dimensions, mixed rows with their own directions and strengths,
+in-place settings updates under a captured graph and the production
+deferred-attention / MoE / projection / HC order. Build it during iteration; run it with the final
 combined GPU checks after the serving GPU is available.

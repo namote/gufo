@@ -73,9 +73,11 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
   graph_key.workload_identity = ExtendQwenGraphWorkloadIdentity(
       graph_key.workload_identity, arena_.RecurrentIoIdentity());
   // ON captures the projections; OFF keeps the original key and launches.
-  const auto* abliteration = ActiveAbliteration();
-  const float* abliteration_direction =
-      abliteration != nullptr ? model_->AbliterationDirection() : nullptr;
+  // The kernels read the session's settings on the device, so strength and
+  // direction changes keep the captured graph.
+  const float* abliteration = AbliterationDeviceSettings();
+  const float* abliteration_directions =
+      abliteration != nullptr ? model_->AbliterationDirections() : nullptr;
   if (abliteration != nullptr)
     graph_key.workload_identity =
         ExtendQwenGraphWorkloadIdentity(graph_key.workload_identity, 1);
@@ -107,20 +109,20 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
             ExecuteDecodeStep(arena_, weights_, policy_, token_id, pos,
                               compute_logits, recurrent_state, &vision_input_,
                               kvarn_groups, abliteration,
-                              abliteration_direction);
+                              abliteration_directions);
           });
       if (ok) {
         launch_captured_graph();
       } else {
         ExecuteDecodeStep(arena_, weights_, policy_, token_id, pos,
                           compute_logits, recurrent_state, &vision_input_,
-                          kvarn_groups, abliteration, abliteration_direction);
+                          kvarn_groups, abliteration, abliteration_directions);
       }
     }
   } else {
     ExecuteDecodeStep(arena_, weights_, policy_, token_id, pos, compute_logits,
                       recurrent_state, &vision_input_, kvarn_groups,
-                      abliteration, abliteration_direction);
+                      abliteration, abliteration_directions);
   }
 
   if (!compute_logits) {

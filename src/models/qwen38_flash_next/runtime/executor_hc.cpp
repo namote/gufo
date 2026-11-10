@@ -13,7 +13,7 @@ void Executor::ApplyPendingResidual() const {
 
 void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
                        const float* inject_w, bool defer_res,
-                       float ablation_weight) const {
+                       AbliterationSite ablation) const {
   const Config& c = config();
   inject_fused_ = nullptr;
   xn_deferred_ = {};  // s_.xn is rewritten (or left stale) below
@@ -27,11 +27,12 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
     exl3_moe_pending_ = {};
     const auto& d = pending.layer->ffn_down_exps;
     const auto scratch = Exl3PrefillView();
-    exl3_moe_fused =
-        ablation_weight == 0 && prefill_phase && pending.rows == n_tokens &&
-        c.hc_count == 4 && c.hidden_size % 128 == 0 && c.hidden_size <= 2560 &&
-        d.rows == c.hidden_size && !moe_pending_ && !res_deferred_ &&
-        !(wide_mixer_ && MatrixRows(n_tokens) && gamma != nullptr);
+    exl3_moe_fused = ablation.settings == nullptr && prefill_phase &&
+                     pending.rows == n_tokens && c.hc_count == 4 &&
+                     c.hidden_size % 128 == 0 && c.hidden_size <= 2560 &&
+                     d.rows == c.hidden_size && !moe_pending_ &&
+                     !res_deferred_ &&
+                     !(wide_mixer_ && MatrixRows(n_tokens) && gamma != nullptr);
     if (!exl3_moe_fused || exl3_res_pending_.res != res ||
         exl3_res_pending_.rows != n_tokens)
       ApplyPendingResidual();  // the combine below rewrites block_out
@@ -77,7 +78,7 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
     moe_pending_ = false;
     const auto* down = reinterpret_cast<const __half*>(s_.down_e);
     const float* fused_w = deferred ? fused_inject : nullptr;
-    if (ablation_weight == 0 && wide_mixer_ && MatrixRows(n_tokens) &&
+    if (ablation.settings == nullptr && wide_mixer_ && MatrixRows(n_tokens) &&
         HcCombineMoeF16(
             res, down, s_.weights, s_.shexp_out, s_.router + c.num_experts,
             c.num_experts + 1, c.num_experts_used, s_.inject, inject_parts_,
@@ -103,7 +104,7 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
     HcApplyDeferred(res, s_.block_out, s_.hc_defer_w, n_tokens, c.hidden_size,
                     stream_);
   }
-  ProjectAbliteration(s_.block_out, n_tokens, ablation_weight);
+  ProjectAbliteration(s_.block_out, n_tokens, ablation);
   if (xn_half_) {
     // The FFN combine that follows rereads this block output (42 MB at
     // 4,096 tokens) instead of this combine writing the residual and the

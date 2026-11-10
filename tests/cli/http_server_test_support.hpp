@@ -28,6 +28,7 @@
 namespace {
 namespace net = gufo::net;
 
+using gufo::server::AbliterationInfo;
 using gufo::server::HttpServer;
 using gufo::server::TextGenerationBackend;
 
@@ -90,6 +91,10 @@ public:
   bool device_lost() const override { return lost.load(); }
   bool supports_images() const override { return image_support.load(); }
   std::atomic<bool> image_support{false};
+  std::optional<AbliterationInfo> abliteration_info() const override {
+    return abliteration;
+  }
+  std::optional<AbliterationInfo> abliteration;
   std::uint32_t max_context() const override { return 65536; }
   std::vector<SessionState> session_states() const override { return sessions; }
   std::vector<SessionState> sessions;

@@ -3368,19 +3368,81 @@ std::optional<HttpResponse> ParseAbliterationControl(
   };
   if (!value->is_object())
     return invalid("'abliteration' must be an object");
-  for (const auto& [key, ignored] : value->members())
-    if (key != "enabled" && key != "profile")
+  bool overrides = false;
+  for (const auto& [key, ignored] : value->members()) {
+    if (key != "enabled" && key != "profile" && key != "direction_layer" &&
+        key != "attention" && key != "mlp")
       return invalid("unsupported abliteration member: " + key);
+    overrides = overrides || (key != "enabled" && key != "profile");
+  }
   const auto* enabled = value->find("enabled");
   if (!enabled || !enabled->is_bool())
     return invalid("'abliteration.enabled' must be a boolean");
   if (const auto* profile = value->find("profile");
       profile && (!profile->is_string() || profile->str() != "default"))
     return invalid("only abliteration profile 'default' is registered");
-  if (enabled->as_bool() && !backend.supports_abliteration())
+  if (!enabled->as_bool()) {
+    if (overrides)
+      return invalid(
+          "'abliteration.direction_layer', 'attention' and 'mlp' need "
+          "'enabled': true");
+    chat->abliteration = false;
+    chat->abliteration_overrides = {};
+    return {};
+  }
+  const auto info = backend.abliteration_info();
+  if (!info)
     return invalid(
         "abliteration profile is not loaded or backend is unsupported");
-  chat->abliteration = enabled->as_bool();
+  const auto layers = info->layers;
+  models::qwen::AbliterationOverrides parsed;
+  if (const auto* layer = value->find("direction_layer")) {
+    if (!info->direction_layer)
+      return invalid(
+          "'abliteration.direction_layer' needs a gufo-abliteration-v2 "
+          "profile; the loaded v1 profile has one fixed direction");
+    const double x = layer->is_number() ? layer->as_double() : -1;
+    if (!(x >= 0) || x >= layers || x != std::floor(x))
+      return invalid(
+          "'abliteration.direction_layer' must be an integer in "
+          "[0, " +
+          std::to_string(layers) + ")");
+    parsed.direction_layer = static_cast<std::uint32_t>(x);
+  }
+  // One number for every layer, or exactly one number per layer.
+  const auto strengths = [&](const char* name, std::vector<float>* out) {
+    const auto* member = value->find(name);
+    if (!member)
+      return std::optional<HttpResponse>{};
+    const std::string field = std::string("'abliteration.") + name + "'";
+    const auto read = [&](const json::Value& item) {
+      const double x = item.is_number() ? item.as_double() : -1;
+      if (!std::isfinite(x) || x < 0 ||
+          x > models::qwen::kAbliterationMaxWeight)
+        return false;
+      out->push_back(static_cast<float>(x));
+      return true;
+    };
+    if (member->is_number()) {
+      if (!read(*member))
+        return std::optional(invalid(field + " must be in [0, 4]"));
+      return std::optional<HttpResponse>{};
+    }
+    if (!member->is_array() || member->size() != layers)
+      return std::optional(invalid(field +
+                                   " must be one number or an array of " +
+                                   std::to_string(layers) + " numbers"));
+    for (const auto& item : member->items())
+      if (!read(item))
+        return std::optional(invalid(field + " values must be in [0, 4]"));
+    return std::optional<HttpResponse>{};
+  };
+  if (auto error = strengths("attention", &parsed.attention))
+    return error;
+  if (auto error = strengths("mlp", &parsed.mlp))
+    return error;
+  chat->abliteration = true;
+  chat->abliteration_overrides = std::move(parsed);
   return {};
 }
 
