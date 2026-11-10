@@ -575,6 +575,11 @@ std::shared_ptr<const Checkpoint> ExecutionHistory::Capture(
         // Every descriptor/range occurs once in this capture, so only the
         // published history can contain a shared predecessor.
         auto chunk = chunks.Find(first);
+        // A shared predecessor whose borrowed rows retired (a failed release
+        // preservation in its source slot) is a hole like an expired one:
+        // this slot still holds the rows, so capture them again.
+        if (chunk && !chunk->storage.IsValid())
+          chunk.reset();
         if (!chunk) {
           replace_entries();
           const PayloadRequest r{d.id, ResourceCategory::kBackingAssigned,
@@ -586,8 +591,7 @@ std::shared_ptr<const Checkpoint> ExecutionHistory::Capture(
               ResourceCharge{}, lineage_, d.id, r.first, r.end, Payload{});
           save(chunk->storage, r);
           chunk->metadata = metadata_reservation.Convert();
-        } else if (!chunk->storage.IsValid())
-          throw std::invalid_argument("cannot publish retired checkpoint rows");
+        }
         if (!reuse_entries)
           entries.push_back({chunk->metadata, d.id, first, chunk});
         component.chunks.push_back(CheckpointChunk(std::move(chunk)));
@@ -698,9 +702,8 @@ std::size_t ExecutionHistory::NewPayloadBytes(
     auto chunks = Chunks(d.id);
     for (Rows first = 0; first < full; first += d.rows_per_chunk) {
       const auto chunk = chunks.Find(first);
-      if (chunk && !chunk->storage.IsValid())
-        throw std::invalid_argument("cannot estimate retired rows");
-      if (!chunk)
+      // Capture replaces a retired predecessor like an expired one.
+      if (!chunk || !chunk->storage.IsValid())
         bytes = Add(bytes, Bytes(d.rows_per_chunk, d.row_bytes));
     }
   }

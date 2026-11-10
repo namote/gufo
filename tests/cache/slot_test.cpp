@@ -3,6 +3,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <barrier>
@@ -349,6 +350,113 @@ void RestoreAndContinue() {
   assert(f.adapter.RecurrentHash(restored.Execution()) ==
          f.adapter.RecurrentHash(f.lease.Execution()));
 }
+void RetiredPredecessorIsRecaptured() {
+  // A slot restored from a checkpoint shares its chunks. When the source slot
+  // then fails to preserve a borrowed chunk on release, the chunk retires
+  // while the checkpoint still holds it. The restored slot still has the
+  // rows, so its next capture copies the chunk again instead of refusing.
+  Fixture f;
+  auto history = ExecutionHistory::Cold(f.ledger, f.adapter.Components(),
+                                        f.adapter.CompatibilityIdentity());
+  auto checkpoint = f.Capture(history);
+  FakeStream stream;
+  LeasedSlot destination(f.ledger, f.adapter, stream, SlotId{2});
+  auto restored = destination.Acquire();
+  std::vector<ComponentPosition> positions;
+  for (const auto& c : checkpoint->Components())
+    positions.push_back(c.position);
+  f.adapter.BeginRestore(restored.Execution(), positions);
+  for (const auto& c : checkpoint->Components()) {
+    auto load = [&](const Payload& p, Rows first, Rows end) {
+      auto bytes = f.Read(p, c.descriptor.id, first, end);
+      auto copy = f.adapter.CopyRowsIn(restored.Execution(), c.descriptor.id,
+                                       first, end, bytes, stream);
+      assert(copy.Wait() == TransferResult::kSucceeded);
+    };
+    for (const auto& chunk : c.chunks)
+      load(chunk.Storage(), chunk.First(), chunk.End());
+    if (c.tail)
+      load(*c.tail,
+           c.position.valid_rows -
+               c.position.valid_rows % c.descriptor.rows_per_chunk,
+           c.position.valid_rows);
+    if (c.private_state) {
+      auto pin = c.private_state->PinRows();
+      auto buffer =
+          std::static_pointer_cast<const std::vector<std::byte>>(pin.Owner());
+      auto copy = f.adapter.LoadPrivate(restored.Execution(), c.descriptor.id,
+                                        *buffer, stream);
+      assert(copy.Wait() == TransferResult::kSucceeded);
+    }
+  }
+  assert(f.adapter.Validate(restored.Execution(), positions));
+  auto continuation = ExecutionHistory::Restored(f.ledger, *checkpoint);
+  const auto read = [&](ComponentId c, Rows first, Rows end) {
+    const auto components = f.adapter.Components();
+    const auto d = *std::find_if(components.begin(), components.end(),
+                                 [&](const auto& d) { return d.id == c; });
+    std::vector<std::byte> bytes((end - first) * d.row_bytes);
+    auto copy = f.adapter.CopyRowsOut(restored.Execution(), c, first, end,
+                                      bytes, stream);
+    assert(copy.Wait() == TransferResult::kSucceeded);
+    return bytes;
+  };
+  const auto expected = read(kTarget, 0, 4);
+  // The first borrowed range the source releases is the target chunk.
+  f.adapter.FailNextTransfer();
+  f.lease.Reset();
+  const auto& retired = checkpoint->Components()[0].chunks[0];
+  assert(!retired.Storage().IsValid());
+  assert(!checkpoint->IsValid());
+  const auto save = [&](const PayloadRequest& r) {
+    auto admission = f.ledger.Reserve(ResourceCategory::kBackingFree, r.bytes);
+    auto buffer = std::make_shared<std::vector<std::byte>>(r.bytes);
+    auto pool = admission.Convert();
+    auto reservation = pool.ReserveBacking(r.category);
+    f.pools.push_back(pool);
+    auto copy = r.category == ResourceCategory::kPrivateState
+                    ? f.adapter.CapturePrivate(restored.Execution(),
+                                               r.component, *buffer, stream)
+                    : f.adapter.CopyRowsOut(restored.Execution(), r.component,
+                                            r.first, r.end, *buffer, stream);
+    assert(copy.Wait() == TransferResult::kSucceeded);
+    return Payload::Committed(reservation.Convert(), buffer);
+  };
+  std::array<Token, 2> suffix{7, 8};
+  f.adapter.Append(restored.Execution(), suffix, suffix);
+  auto tokens = f.tokens;
+  tokens.insert(tokens.end(), suffix.begin(), suffix.end());
+  const auto now = f.adapter.Positions(restored.Execution());
+  // The estimate counts the retired chunk as new rows, as it does a hole.
+  std::size_t full = 0;
+  for (const auto& d : f.adapter.Components()) {
+    const auto p = *std::find_if(now.begin(), now.end(),
+                                 [&](const auto& p) { return p.id == d.id; });
+    full += d.kind == ComponentKind::kPrivateState ? d.state_bytes
+                                                   : p.valid_rows * d.row_bytes;
+  }
+  const auto draft_shared =
+      checkpoint->Components()[1].chunks[0].Storage().IsValid();
+  assert(draft_shared);
+  assert(continuation.NewPayloadBytes(now) ==
+         full - 4 * f.adapter.Components()[1].row_bytes);
+  auto next = continuation.Capture({tokens, InputIdentity(tokens.size()), now,
+                                    CheckpointPurpose::kPrompt, 1},
+                                   save);
+  assert(next->IsValid());
+  const auto& target = next->Components()[0].chunks[0];
+  assert(target.Id() != retired.Id());
+  assert(*std::static_pointer_cast<const std::vector<std::byte>>(
+             target.Storage().Owner()) == expected);
+  // A predecessor that stayed valid is still shared.
+  assert(next->Components()[1].chunks[0].Id() ==
+         checkpoint->Components()[1].chunks[0].Id());
+  // The recaptured chunk is the history's predecessor from now on.
+  auto again = continuation.Capture({tokens, InputIdentity(tokens.size()), now,
+                                     CheckpointPurpose::kPrompt, 1},
+                                    save);
+  assert(again->Components()[0].chunks[0].Id() == target.Id());
+}
 void CancellationSteps() {
   for (int phase = 0; phase < 3; ++phase) {
     Fixture f;
@@ -634,6 +742,7 @@ int main() {
   PinsAndCancellation();
   Leases();
   RestoreAndContinue();
+  RetiredPredecessorIsRecaptured();
   CancellationSteps();
   TeardownAndCancelledAdmission();
   ConcurrentValidityDuringTeardown();
