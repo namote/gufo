@@ -28,6 +28,8 @@ built in `build/han`, kernel 7.0.0-43, production stopped, preflight OK.
 - **Override.** A server started with `--han-scale 0.2` applies 0.2 to
   requests without the field, and a request with `han_scale: 1.0` gets
   exactly the 1.0 output.
+- **Deployed 2026-11-10** with `--han-scale 0.2` (runtime-upsync-20261110,
+  sha `a2a18991…`, supervisor `5d0129d3`).
 - **Default.** Recommended production default is 0.2 (soft): it removes
   habitual Han with no seen quality loss. Use 0.1 for stronger effect on 27B.
 
