@@ -255,9 +255,9 @@ public:
   }
   void Reset();
   /// Clears the context for the next request on the same slot. A valid
-  /// session, or one whose request stopped for cancellation, keeps its MTP
-  /// rollback rows and verifier graphs; any other invalid session releases
-  /// all scratch like Reset().
+  /// session keeps its MTP rollback rows and verifier graphs; an invalid one
+  /// (a failed, stopped or cancelled request) releases all scratch like
+  /// Reset().
   void ResetForReuse();
   /// Cancellation is checked at model, layer and snapshot-copy boundaries.
   void SetCancellationCheck(std::function<bool()> check);

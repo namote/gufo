@@ -1209,10 +1209,9 @@ bool ContinuationAdapter::Invalidate(cache::Slot& slot) noexcept {
       ~ResetScope() { active = false; }
     } reset_scope{state.invalidating};
     state.invalidating = true;
-    // Reassign a healthy resident slot without rebuilding its MTP graphs.
-    // A session stopped by cancellation keeps its scratch too
-    // (Session::ScratchReusable). Adapter failure (`failed`) takes
-    // precedence, and explicit Session::Reset still releases all scratch.
+    // Reassign a healthy resident slot without rebuilding its MTP graphs
+    // (Session::ScratchReusable). An invalid session, adapter failure
+    // (`failed`) and explicit Session::Reset release all scratch.
     state.session->ResetImpl(!state.failed && state.session->ScratchReusable());
     state.failed = false;
     state.restoring = false;

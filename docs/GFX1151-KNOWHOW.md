@@ -1,5 +1,79 @@
 # gfx1151 optimization know-how
 
+## Upstream S3 batch regression, November 10, 2026 (not deployed)
+
+Evidence is under `build/b1/s3-20261110/` (tools/, trace/, func/,
+memstate.log). Same host state as U8 (kernel 7.0.0-43, proactiveness 20,
+production stopped), with `tools/bench/host_preflight.sh` PREFLIGHT OK before
+every run. FP16 `batch` suite, U8 argv. Sums are from `s3_sum.py` (24 rows);
+latency is the sum of `server_duration_ms` over the 16 pair rows and over the 16
+short replies that run beside the anchor.
+- **The residents gate (`6e2c504e`) is not the cause.** Entry-only bpftrace
+  uprobes recorded every pass on cand2, cand7 and base (`trace/diag-*.cond`):
+  `Request::DecodeStep` and its residents count, `PrepareDecode`
+  (defer/occupancy/residents), `Executor::Forward` and `ForwardBatchImpl`
+  (wide flag, rows). No arm takes a single `ForwardWide` pass in the whole
+  suite, so the gate never changes a step here.
+  - Pair members are always batched once both are decoding, which already
+    rules out wide verification (`defer_head`).
+  - The wide flag only matters for copy chains longer than eight rows.
+- **The pair decode-sum excess on cand7 is accounting from C4.** On cand2 one
+  member decodes alone first (4-row verify, about 45 ms). Meanwhile the other
+  member waits about 55 ms in `capturing`, and that wait is not counted in
+  `decode_ms`. With the C4 settle wait (cand7), both members start in a
+  lockstep w2 batch (2-3 drafts each), and every shared cycle is charged to
+  both of them. Pair latency is unchanged: cand2 6580-6722 against cand7
+  6726-6752 on the same day.
+- **The real regression is `0e0ebad8` (B1, keep scratch after a
+  cancellation).** Short prefill is bimodal, at about 127 ms (fast) or about
+  135 ms (slow) for 22 tokens. Every binary that has B1 (cand4, cand5 and cand7)
+  is slow in all 21 of its FP16 runs, from U6 to today. The U6 cand3 binary
+  (`a0d951dd` + grid 80, no B1) is fast throughout its one run today. Binaries without
+  B1 (base, cand2) sometimes start slow, but they turn fast once a slot's
+  scratch is released and reallocated. In the HIP trace, the slow mode is
+  host-side: the same 2622 launches and 941 syncs per prefill step, but
+  launch API time is 8.2 vs 5.4 ms and the span is +7.7 ms. GPU sync time is
+  equal (12.9/12.8 ms). The same mode slows the replies section. Bisection
+  experiments on cand7 (`bin/e*-gufo`):
+
+  | Build | Change | Short prefill | Pairs latency | Replies latency |
+  |---|---|---|---|---|
+  | cand7 | none | 135 | 6726-6752 | 5525-5680 |
+  | e1 | routed grid cap 80 | 135 | 6711 | 5598 |
+  | e4 | drop graphs on cancelled reuse | 135 | 6722 | 5597 |
+  | e3 | `ScratchReusable() = IsValid()` | 127 | 6235-6262 | 5176-5299 |
+
+  Batched cycle GPU time is equal across arms, for example 4+4 rows at
+  66.6 vs 69.6 ms of sync (`tools/hip.py`). The mechanism inside the retained
+  rollback rows is not identified. Reallocated rows get the same virtual
+  addresses, and dropping only the graphs does not help.
+- **Fix, cand8 (`009b9ffa` measured; the committed source differs only in a
+  comment and the adapter test, and builds `812e8027`).** Only a valid session
+  keeps its MTP scratch on slot reuse. This is the pre-B1 rule for the adapter
+  path; the owned (KVarN) path still keeps scratch for valid sessions.
+  - S3 decode sum, alternated with cand2 (both arms after preflight): cand2
+    2628/2600, cand8 3009/2857.
+  - Latency, cand2 → cand8: pairs 6648 → 6714 and 6276 → 6251, replies
+    5265 → 5279 and 5481 → 5182.
+  - cand8 run 1 started in the slow mode and turned fast at the first
+    release, as cand2 does. The decode sum stays above cand2 because of the C4
+    accounting above, not because of latency.
+  - The cancelled peer did not regress. FP16 peer decode/duration on e3/cand8
+    was 446-476/597-636 ms, against cand7 473-478/634-636. KVarN K4V4 was e3
+    432/711 against cand7 436/714, with the same prefill (202 ms) and S3
+    (2835/2836). The B1 stall did not recur.
+  - Greedy outputs: all 25 greedy rows have the same hashes as cand7, and the
+    suite passes.
+  - The continuation adapter test passes (rc 0), including the rewritten
+    slot reuse step. That step checks that a cancelled slot or owned session
+    releases its scratch and a valid owned session keeps it, with logits and
+    tokens equal to a fresh session. The session test was not rerun.
+  - Measured but not kept: e1 (grid cap 80) and e4 (graph drop).
+- **Tooling.** Read stack arguments as `*(uint32*)(reg("sp")+8)`, because
+  bpftrace 0.25 has no `sarg`. A by-value return shifts `arg0` to the sret
+  pointer. `rocprofv3` in the build image cannot load the pinned HIP
+  runtime (`libsqlite3.so.0`).
+
 ## Upstream U8 post-reboot GPU pass, November 10, 2026 (not deployed)
 
 Evidence is under `build/b1/u8-20261110/` (README.txt). First controlled
@@ -309,7 +383,8 @@ GPU.
     cand2 60.68/105.73 (inside 5 %). The work and hashes are equal.
   - **cand4 (`7c3e300b`, `9ac49a5f`).** It is cand3 plus three changes:
     - the routed grid cap is raised to 160
-    - rollback scratch is kept on cancel (`0e0ebad8`)
+    - rollback scratch is kept on cancel (`0e0ebad8`; reverted on
+      2026-11-10, see "Upstream S3 batch regression")
     - wide verification is skipped while another request is admitted
       (`6e2c504e`)
   - **cand4 hang loops:** FP16 24 rounds and K4V4 10 rounds, no stall.

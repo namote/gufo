@@ -446,11 +446,13 @@ void Session::Reset() {
 }
 
 bool Session::ScratchReusable() const noexcept {
-  // A request that stopped for cancellation leaves the session invalid but
-  // its scratch intact. Releasing it made the next request on the slot
-  // allocate the rollback rows and record the verifier graphs again, and
-  // those device allocations stalled the peer decoding beside it.
-  return IsValid() || session_->ObservedCancellation();
+  // Only a valid session keeps its MTP scratch for the next request. Keeping
+  // it after a stopped or cancelled request as well (0e0ebad8) left every
+  // later short prefill about 7 ms (5 %) slower on gfx1151 and slowed
+  // concurrent short replies 6-7 % (S3, docs/GFX1151-KNOWHOW.md). The
+  // cancelled-peer stall it targeted did not recur without it (four FP16
+  // runs and one KVarN K4V4 run, 2026-11-10).
+  return IsValid();
 }
 
 void Session::ResetForReuse() {

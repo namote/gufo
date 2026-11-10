@@ -324,7 +324,7 @@ binary는 셋이다:
   - `a0d951dd`: decode·wide scratch를 load할 때 잡는다.
 - **cand4** = `7c3e300b`(gufo `9ac49a5f`). cand3에 세 커밋을 더했다.
   - grid cap을 160으로 올렸다.
-  - `0e0ebad8`: 취소된 세션의 rollback scratch를 slot을 놓을 때 지우지 않고 유지한다.
+  - `0e0ebad8`: 취소된 세션의 rollback scratch를 slot을 놓을 때 지우지 않고 유지한다. **2026-11-10 S3에서 되돌림**: 이후 짧은 prefill을 약 7 ms 느리게 묶었다. 이제 valid 세션만 유지하고, adapter test도 취소 시 해제를 기대하도록 다시 고쳤다(KNOWHOW "Upstream S3 batch regression").
   - `6e2c504e`: 다른 요청이 admission돼 있으면 wide 검증을 하지 않는다(batch 회귀 수정).
 
 cand3 결과:

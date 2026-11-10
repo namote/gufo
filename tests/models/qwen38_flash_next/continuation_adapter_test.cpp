@@ -241,6 +241,7 @@ void CheckSlotReuse(const std::shared_ptr<qfn::Model>& model, bool mtp) {
   auto fresh = model->CreateSession(mode, 4096, &error);
   Require(bool(fresh), error);
   const auto empty_bytes = reused.AllocatedBytes();
+  const auto fresh_empty_bytes = fresh->AllocatedBytes();
   const auto first = model->Tokenize("Continue: red, blue, red, blue,");
   const auto next = model->Tokenize(
       "Write a Python function that retries a failed request three times.");
@@ -272,12 +273,12 @@ void CheckSlotReuse(const std::shared_ptr<qfn::Model>& model, bool mtp) {
                     fresh->Statistics().accepted - fresh_before.accepted,
             "retained slot scratch changed draft acceptance");
   }
-  // A request stopped by cancellation leaves the session invalid but keeps
-  // its rollback scratch for the next request on the slot (0e0ebad8).
-  const auto cancel_bytes = reused.AllocatedBytes();
+  // A request stopped by cancellation leaves the session invalid, and an
+  // invalid session releases its rollback scratch when the slot is reused:
+  // keeping it slowed later short prefills on gfx1151 (S3).
   if (mtp)
-    Require(cancel_bytes > empty_bytes,
-            "cancelled slot had no rollback scratch to retain");
+    Require(reused.AllocatedBytes() > empty_bytes,
+            "cancelled slot had no rollback scratch to release");
   reused.SetCancellationCheck([] { return true; });
   Require(!reused.Evaluate(first.front(), &error) && !reused.IsValid(),
           "cancelled slot remained valid");
@@ -285,32 +286,42 @@ void CheckSlotReuse(const std::shared_ptr<qfn::Model>& model, bool mtp) {
   Require(adapter.Invalidate(*slot), "cancelled slot reassignment failed");
   Require(reused.Position() == 0 && reused.Tokens().empty(),
           "cancelled slot reassignment retained logical state");
-  Require(reused.AllocatedBytes() == cancel_bytes,
-          "cancelled slot reassignment discarded reusable rollback");
+  Require(reused.AllocatedBytes() == empty_bytes,
+          "cancelled slot reassignment retained rollback scratch");
   fresh->Reset();
   Require(reused.Sync(next, &error) && fresh->Sync(next, &error), error);
   SameLogits(reused, *fresh);
   Require(Decode(reused, 16) == Decode(*fresh, 16),
-          "retained cancelled-slot scratch changed continuation tokens");
+          "cancelled-slot reassignment changed continuation tokens");
   // Owned sessions without a component cache (KVarN) reassign through
-  // ResetForReuse and keep the same scratch after a cancellation.
+  // ResetForReuse: a valid one keeps its scratch, a cancelled one releases
+  // it.
   const auto owned_bytes = fresh->AllocatedBytes();
   if (mtp)
-    Require(owned_bytes > empty_bytes,
-            "cancelled owned session had no rollback scratch to retain");
+    Require(owned_bytes > fresh_empty_bytes,
+            "owned session had no rollback scratch to keep");
+  fresh->ResetForReuse();
+  Require(fresh->Position() == 0 && fresh->Tokens().empty() &&
+              fresh->AllocatedBytes() == owned_bytes,
+          "valid owned-session reset discarded reusable rollback");
+  reused.Reset();
+  Require(reused.Sync(next, &error) && fresh->Sync(next, &error), error);
+  SameLogits(reused, *fresh);
+  Require(Decode(reused, 16) == Decode(*fresh, 16),
+          "retained owned-session scratch changed continuation tokens");
   fresh->SetCancellationCheck([] { return true; });
   Require(!fresh->Evaluate(next.front(), &error) && !fresh->IsValid(),
           "cancelled owned session remained valid");
   fresh->SetCancellationCheck({});
   fresh->ResetForReuse();
   Require(fresh->Position() == 0 && fresh->Tokens().empty() &&
-              fresh->AllocatedBytes() == owned_bytes,
-          "cancelled owned-session reset discarded reusable rollback");
+              fresh->AllocatedBytes() == fresh_empty_bytes,
+          "cancelled owned-session reset retained rollback scratch");
   reused.Reset();
   Require(reused.Sync(next, &error) && fresh->Sync(next, &error), error);
   SameLogits(reused, *fresh);
   Require(Decode(reused, 16) == Decode(*fresh, 16),
-          "retained owned-session scratch changed continuation tokens");
+          "owned-session reassignment changed continuation tokens");
   reused.Reset();
   Require(reused.AllocatedBytes() == empty_bytes,
           "explicit reset retained rollback scratch");
