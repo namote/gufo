@@ -36,13 +36,13 @@ for w in json.loads(Path(sys.argv[1]).read_text()):
 print("\n".join(bad) or "wheels verified", file=sys.stderr if bad else sys.stdout)
 sys.exit(1 if bad else 0)
 PY
-mkdir -p "$RT/site" "$RT/home"
+mkdir -p "$RT/site" "$RT/home" "$RT/tmp"
 docker run --rm --pull never --network none --user 1000:1000 --memory 20g --memory-swap 20g \
   --tmpfs /tmp:rw,size=2g --mount "type=bind,src=$RT,dst=/runtime" --mount "type=bind,src=$WH,dst=/wheels,readonly" \
-  -e "WHEELS=$NAMES" --entrypoint /bin/bash "$IMAGE" -c '
+  -e "WHEELS=$NAMES" -e TMPDIR=/runtime/tmp -e PIP_CACHE_DIR=/runtime/tmp/pip --entrypoint /bin/bash "$IMAGE" -c '
 set -euo pipefail
 ROOT=/runtime
-/opt/venv/bin/python -m pip install --no-deps --no-index --no-compile --target "$ROOT/site" $(for w in $WHEELS; do echo "/wheels/$w"; done)
+/opt/venv/bin/python -m pip install --no-deps --no-index --no-build-isolation --no-compile --target "$ROOT/site" $(for w in $WHEELS; do echo "/wheels/$w"; done)
 export PYTHONPATH="$ROOT/site" PATH="$ROOT/site/bin:/opt/venv/bin:$PATH"
 export EXL3_ROCM_SDK="$ROOT/site/_rocm_sdk_devel" EXL3_VENV=/opt/venv EXL3_ROOT="$ROOT/source"
 export PYTORCH_ROCM_ARCH=gfx1151 MAX_JOBS=4 EXL3_HIP_DEFINES=EXL3_HIP_STG_PAD HOME="$ROOT/home"
