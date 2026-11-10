@@ -38,6 +38,11 @@ struct Exl3Storage {
 /// Load optional hc_q8/ only when complete and bound to this pack.
 void PrepareExl3HcQ8(Exl3Storage& storage, const Config& config,
                      const std::filesystem::path& model);
+/// Applies `mode` to the pack's calibrated HC sidecar: q8-calibrated loads it
+/// through PrepareExl3HcQ8 and throws when it is absent or invalid; fp16 and
+/// q8 never read it, present or not.
+void ApplyExl3HcMode(Exl3Storage& storage, const Config& config,
+                     const std::filesystem::path& model, HcMode mode);
 
 /// Bind actual per-tensor K3..K8 or K3.5 rates. Every expert in this bank
 /// must agree; different banks/projections may use different rates.
@@ -53,9 +58,10 @@ void PrepareExl3MtpMixer(Exl3Storage& storage, const Config& config,
 /// Binds the native EXL3 pack directory `path` whose metadata
 /// OpenArtifactMetadata built. Header/metadata validation only; projection
 /// payloads remain demand mapped.
+/// `hc_mode` selects the mixers' weights (ApplyExl3HcMode).
 [[nodiscard]] std::optional<ModelWeights> LoadExl3Model(
     const std::filesystem::path& path, const core::GgufReader& metadata,
-    std::string* error);
+    HcMode hc_mode, std::string* error);
 /// The MTP block of the same native pack as `trunk`.
 [[nodiscard]] std::optional<MtpWeights> LoadExl3Mtp(
     const std::filesystem::path& path, const core::GgufReader& metadata,

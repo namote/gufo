@@ -15,6 +15,7 @@
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/models/qwen/dflash_policy.hpp"
+#include "src/models/qwen38_flash_next/hc_mode.hpp"
 
 namespace gufo::hip {
 class QwenGpuModel;
@@ -78,18 +79,20 @@ public:
   /// Loads weights from a GGUF file. Returns false and sets *error on failure.
   /// `enable_yarn` opts Flash-Next into static YaRN, required for (and only
   /// accepted with) a `max_context` above its native context. An empty
-  /// `kv_cache_type` selects the model's default KV storage.
-  bool load(const std::string& model_path, std::string* error,
-            std::uint32_t max_context = 0, std::size_t session_count = 1,
-            TextPrefillPolicy prefill_policy = {},
-            TextSchedulerPolicy scheduler_policy = {},
-            const TextSpeculativeConfig& speculative_config = {},
-            const TextDiskCacheConfig& disk_cache_config = {},
-            const std::string& vision_model_path = {},
-            TextRunnerRamCacheOptions ram_cache_config = {},
-            bool enable_yarn = false,
-            std::optional<cli::KvCacheType> kv_cache_type = std::nullopt,
-            const std::string& abliteration_profile = {});
+  /// `kv_cache_type` selects the model's default KV storage. `hc_mode` is
+  /// Flash-Next's `--hc-mode` (empty: fp16); other models reject it.
+  bool load(
+      const std::string& model_path, std::string* error,
+      std::uint32_t max_context = 0, std::size_t session_count = 1,
+      TextPrefillPolicy prefill_policy = {},
+      TextSchedulerPolicy scheduler_policy = {},
+      const TextSpeculativeConfig& speculative_config = {},
+      const TextDiskCacheConfig& disk_cache_config = {},
+      const std::string& vision_model_path = {},
+      TextRunnerRamCacheOptions ram_cache_config = {}, bool enable_yarn = false,
+      std::optional<cli::KvCacheType> kv_cache_type = std::nullopt,
+      const std::string& abliteration_profile = {},
+      std::optional<models::qwen38_flash_next::HcMode> hc_mode = std::nullopt);
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.
@@ -135,6 +138,7 @@ public:
   [[nodiscard]] std::optional<AbliterationInfo> abliteration_info()
       const override;
   [[nodiscard]] bool supports_han_scale() const override;
+  [[nodiscard]] std::string hc_mode() const override;
   [[nodiscard]] std::string model_path() const override;
   [[nodiscard]] std::string build_info() const override;
   [[nodiscard]] SamplingDefaults sampling_defaults() const override;

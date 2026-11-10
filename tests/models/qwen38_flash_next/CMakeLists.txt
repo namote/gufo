@@ -27,6 +27,7 @@ add_qwen38_flash_next_test(ngram gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(native gufo_qwen38_flash_next "cpu;exl3")
 add_qwen38_flash_next_test(mtp_sampling gufo_core "cpu")
 add_qwen38_flash_next_test(rope_scaling gufo_qwen38_flash_next "cpu")
+add_qwen38_flash_next_test(hc_mode gufo_core "cpu")
 # The HF-oracle/off-bit-identity checks link the scalar model oracle, so
 # (like ngram) this stays out of cmake/Checks.cmake's hosted check-pr set.
 add_qwen38_flash_next_test(rope_scaling_oracle

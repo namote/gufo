@@ -217,6 +217,28 @@ void TestKvCacheTypeFlag() {
   assert(err.find("--kv-cache-type must be") != std::string::npos);
 }
 
+void TestHcModeFlag() {
+  using gufo::models::qwen38_flash_next::HcMode;
+  const auto absent = gufo::cli::ParsePromptOptions(std::array{"Hello"});
+  assert(absent && !absent->hc_mode.has_value());
+  const auto q8 =
+      gufo::cli::ParsePromptOptions(std::array{"--hc-mode", "q8", "Hello"});
+  assert(q8 && q8->hc_mode == HcMode::kQ8 && q8->prompt_text == "Hello");
+  const auto calibrated = gufo::cli::ParsePromptOptions(
+      std::array{"--hc-mode=q8-calibrated", "Hi"});
+  assert(calibrated && calibrated->hc_mode == HcMode::kQ8Calibrated);
+  const auto fp16 =
+      gufo::cli::ParsePromptOptions(std::array{"--hc-mode", "fp16", "Hi"});
+  assert(fp16 && fp16->hc_mode == HcMode::kFp16);
+  for (const char* bad : {"f16", "Q8", "q8_0", "calibrated"}) {
+    std::string err;
+    assert(!gufo::cli::ParsePromptOptions(std::array{"--hc-mode", bad, "Hi"},
+                                          &err));
+    assert(err.find("--hc-mode must be fp16, q8 or q8-calibrated") !=
+           std::string::npos);
+  }
+}
+
 int main() {
   TestDefaultOptions();
   TestExplicitFlags();
@@ -225,6 +247,7 @@ int main() {
   TestImageFlags();
   TestInvalidFlags();
   TestKvCacheTypeFlag();
+  TestHcModeFlag();
   std::cout << "All prompt CLI tests passed.\n";
   return 0;
 }

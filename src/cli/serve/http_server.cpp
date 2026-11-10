@@ -1517,6 +1517,10 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
   if (const auto sessions = b.session_states().size(); sessions > 0) {
     resp["total_slots"] = sessions;
   }
+  // Gufo extension: Flash-Next's HyperConnection compute mode.
+  if (auto hc_mode = b.hc_mode(); !hc_mode.empty()) {
+    resp["hc_mode"] = std::move(hc_mode);
+  }
 
   // What a request without sampling fields gets.
   const auto defaults = b.sampling_defaults();

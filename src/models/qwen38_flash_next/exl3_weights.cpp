@@ -395,9 +395,29 @@ std::uint32_t Exl3VHeadDestination(std::uint32_t index, std::uint32_t dim,
       ex::TiledVHeadIndex(index, dim, c.ssm_num_k_heads, c.ssm_num_v_heads));
 }
 
+void ApplyExl3HcMode(Exl3Storage& storage, const Config& config,
+                     const std::filesystem::path& model, HcMode mode) {
+  storage.hc_q8.reset();
+  if (mode != HcMode::kQ8Calibrated)
+    return;
+  // Never fall back to another mode: an absent or invalid sidecar fails.
+  try {
+    PrepareExl3HcQ8(storage, config, model);
+  } catch (const std::exception& error) {
+    storage.hc_q8.reset();
+    throw std::runtime_error(std::string("--hc-mode q8-calibrated: ") +
+                             error.what());
+  }
+  if (!storage.hc_q8)
+    Fail(
+        "--hc-mode q8-calibrated requires the calibrated sidecar hc_q8/ and "
+        "hc_q8.json in " +
+        model.string());
+}
+
 std::optional<ModelWeights> LoadExl3Model(const std::filesystem::path& path,
                                           const core::GgufReader& metadata,
-                                          std::string* error) {
+                                          HcMode hc_mode, std::string* error) {
   try {
     ModelWeights w;
     auto config = Config::FromGguf(metadata, true, error);
@@ -406,7 +426,8 @@ std::optional<ModelWeights> LoadExl3Model(const std::filesystem::path& path,
     w.config = *config;
     w.exl3_storage = Open(path, metadata, w.config, false);
     auto& storage = *w.exl3_storage;
-    PrepareExl3HcQ8(storage, w.config, path);
+    ApplyExl3HcMode(storage, w.config, path, hc_mode);
+    w.hc_mode = hc_mode;
     Binder b{storage, w.config};
     w.token_embd = b.Plain("model.language_model.embed_tokens.weight",
                            w.config.hidden_size, w.config.vocab_size);

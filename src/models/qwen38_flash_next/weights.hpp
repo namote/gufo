@@ -12,6 +12,7 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
+#include "src/models/qwen38_flash_next/hc_mode.hpp"
 
 namespace gufo::models::qwen38_flash_next {
 
@@ -82,7 +83,8 @@ struct HcMixer {
   TensorRef down;    ///< [hc_dim -> low_rank]
   TensorRef up;      ///< [low_rank -> hc_dim]
   TensorRef inject;  ///< [hc_dim -> hc_count], empty on the head mixer.
-  /// Optional calibrated Q8 copies; original F16 operands stay available.
+  /// Calibrated Q8 copies, bound only under HcMode::kQ8Calibrated; the
+  /// original F16 operands stay available.
   TensorRef down_q8, up_q8;
 };
 
@@ -148,6 +150,9 @@ struct ModelWeights {
   HcMixer hc_head;       ///< Final mixer, doubles as the output norm.
   TensorRef ple_table;   ///< [ple_head_dim, ple_rows], read from disk only.
   std::vector<LayerWeights> layers;
+  /// The mixers' compute mode; the GPU upload places the trunk and draft
+  /// mixers by it (PlanHcMixer).
+  HcMode hc_mode{kDefaultHcMode};
 
   /// Binds and validates the trunk artifact. Tensor payloads stay mapped and
   /// untouched; only headers are read.

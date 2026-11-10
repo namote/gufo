@@ -22,6 +22,7 @@
 #include "src/models/qwen38_flash_next/abliteration.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
+#include "src/models/qwen38_flash_next/hc_mode.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
@@ -73,6 +74,9 @@ struct ModelOptions {
   /// `--abliteration-profile`. Empty loads none: nothing is discovered beside
   /// the model. Loading never enables it.
   std::string abliteration_profile;
+  /// `--hc-mode`: the hyper-connection mixers' weights. q8-calibrated needs a
+  /// native EXL3 pack with a valid sidecar; loading fails otherwise.
+  HcMode hc_mode = kDefaultHcMode;
 };
 
 class Session;
@@ -121,6 +125,8 @@ public:
   /// Whether sessions keep trunk K/V as KVarN k4v4 (ModelOptions::kvarn).
   [[nodiscard]] bool Kvarn() const noexcept { return options_.kvarn; }
   [[nodiscard]] int KvarnBits() const noexcept { return options_.kvarn_bits; }
+  /// The mixers' compute mode (ModelOptions::hc_mode).
+  [[nodiscard]] HcMode hc_mode() const noexcept { return options_.hc_mode; }
   [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {
     return options_.decode_concurrency;
   }

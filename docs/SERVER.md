@@ -76,6 +76,7 @@ Text serving defaults match llama.cpp for context and generation length:
 | `--context` | `0`: native context from model metadata, per session |
 | `--enable-yarn` | Off; Flash-Next requires it for `--context` above 262144 |
 | `--kv-cache-type` | Model default: `kvarn-k4v2` on Qwen3.8-27B, `fp16` on Flash-Next, FP8 (not selectable) on DeepSeek |
+| `--hc-mode` | `fp16`; Flash-Next only |
 | `--max-tokens` | `-1`: until EOS or remaining context is exhausted |
 | `--sessions` | `1` |
 | Thinking / reasoning effort | Enabled; Qwen `xhigh`, DeepSeek `high` |
@@ -195,6 +196,21 @@ the
 [accuracy check](https://github.com/gufo-org/gufo/pull/350#issuecomment-6234093998)
 and [Qwen3.8 Flash-Next](models/qwen3.8-flash-next/README.md) for the memory
 cost.
+
+`--hc-mode fp16|q8|q8-calibrated` selects how Flash-Next's hyper-connection
+mixers compute their down/up projections. `fp16` (default) keeps the stored F16
+weights. `q8` rounds them to Q8_0 at load without calibration (native EXL3
+packs; GGUF mixers stay as stored). `q8-calibrated`
+reads only the calibrated `hc_q8/` and `hc_q8.json` sidecar in the model
+directory; when it is missing or does not validate, the server refuses to
+start instead of switching mode. `fp16` and `q8` never read the sidecar, even
+when it is present. The Q8 modes read about half the HC bytes per token, so
+they decode faster (HC was 3.42 ms of each decode token in the 2026-11-07
+profile with Q8 weights), at some cost in accuracy (`q8` more than
+`q8-calibrated`). Other models refuse the option. The startup log
+(`event=hc_mode`) and `GET /props` report the mode, and the continuation
+identity includes it (`hc_mode=`), so states computed in one mode are never
+restored into another.
 
 Each model chooses its prefill chunk. `--prefill-chunk` limits prompt work
 between active decode rounds without changing a lone request's kernel policy.
@@ -1482,7 +1498,8 @@ limit is set.
 Its Gufo `han_scale` is the default Han scale, 1 on models that ignore it.
 `modalities.vision` is true only when a vision encoder
 loaded. Gufo's `abliteration` object is present only with a loaded
-[runtime abliteration](#runtime-abliteration) profile. Fields the server cannot report are omitted rather than sent as zero.
+[runtime abliteration](#runtime-abliteration) profile. Gufo's `hc_mode` is
+Flash-Next's `--hc-mode`, absent on other models. Fields the server cannot report are omitted rather than sent as zero.
 
 `POST /apply-template` takes a Chat Completions body and returns
 `{"prompt": "..."}`, the text the model's compiled chat template renders it

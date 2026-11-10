@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
+#include "src/cli/hc_mode_option.hpp"
 #include "src/cli/model_artifact.hpp"
 #include "src/cli/sampling_options.hpp"
 #include "src/core/crypto/sha256.hpp"
@@ -249,6 +250,7 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
                  "generation exceeds the native 262144",
                  "Model", &opt.enable_yarn);
   RegisterKvCacheTypeOption(parser, &opt.kv_cache_type, "Model");
+  RegisterHcModeOption(parser, &opt.hc_mode, "Model");
   parser.AddFlag("-v", "--verbose",
                  "Print detailed timing, latency breakdown, and tok/s metrics",
                  "General", &opt.verbose);
@@ -948,6 +950,7 @@ int RunQwen38FlashNextBenchmark(
                    options.kv_cache_type == KvCacheType::kKvarnK6V6,
           .kvarn_bits =
               options.kv_cache_type == KvCacheType::kKvarnK6V6 ? 6 : 4,
+          .hc_mode = options.hc_mode.value_or(qfn::kDefaultHcMode),
       },
       &error);
   if (model == nullptr) {
@@ -961,6 +964,7 @@ int RunQwen38FlashNextBenchmark(
                     ? (model->KvarnBits() == 6 ? "kvarn-k6v6" : "kvarn-k4v4")
                     : "fp16")
             << '\n';
+  std::cout << "HC mode: " << qfn::HcModeName(model->hc_mode()) << '\n';
   if (rope_scaling) {
     std::cout << "[YaRN]: factor=" << rope_scaling->factor
               << " original_context=" << qwen4exp_native_context
@@ -1330,6 +1334,10 @@ int RunBench(std::span<const char* const> args) {
 #if defined(ENGINE_ENABLE_HIP)
   if (opt.enable_yarn && !IsQwen38FlashNext(*reader)) {
     std::cerr << "Error: --enable-yarn applies only to Qwen3.8-Flash-Next\n";
+    return 1;
+  }
+  if (opt.hc_mode && !IsQwen38FlashNext(*reader)) {
+    std::cerr << "Error: --hc-mode applies only to Qwen3.8-Flash-Next\n";
     return 1;
   }
   if (IsDeepSeekV4Flash(*reader)) {

@@ -281,6 +281,17 @@ void CalibratedHc() {
   Require(storage.hc_q8 && storage.hc_q8->tensors().size() == 12,
           "complete sidecar not retained");
   storage.hc_q8.reset();
+  // --hc-mode: only q8-calibrated reads the sidecar; fp16 and q8 ignore a
+  // valid one.
+  for (const auto mode : {q::HcMode::kFp16, q::HcMode::kQ8}) {
+    q::ApplyExl3HcMode(storage, c, directory.path, mode);
+    Require(!storage.hc_q8, "fp16/q8 read the calibrated sidecar");
+  }
+  q::ApplyExl3HcMode(storage, c, directory.path, q::HcMode::kQ8Calibrated);
+  Require(storage.hc_q8 && storage.hc_q8->tensors().size() == 12,
+          "q8-calibrated did not load the sidecar");
+  q::ApplyExl3HcMode(storage, c, directory.path, q::HcMode::kFp16);
+  Require(!storage.hc_q8, "fp16 kept a previously loaded sidecar");
   const auto key = names.front() + ".input_mix_weight_down.weight";
   entries[key]["target_weight_sha256"] = std::string(64, '0');
   manifest["tensors"] = entries;
@@ -309,6 +320,39 @@ void CalibratedHc() {
   std::ofstream(directory.path / "hc_q8.json") << manifest.dump();
   Reject([&] { q::PrepareExl3HcQ8(storage, c, directory.path); },
          "model identity");
+  // An invalid sidecar fails q8-calibrated, naming the mode; the other modes
+  // never open it.
+  Reject(
+      [&] {
+        q::ApplyExl3HcMode(storage, c, directory.path,
+                           q::HcMode::kQ8Calibrated);
+      },
+      "--hc-mode q8-calibrated: Flash-Next HC Q8: manifest schema/model "
+      "identity");
+  // The message carries one prefix.
+  try {
+    q::ApplyExl3HcMode(storage, c, directory.path, q::HcMode::kQ8Calibrated);
+  } catch (const std::exception& error) {
+    Require(std::string_view(error.what()).starts_with("--hc-mode "),
+            "q8-calibrated error lost its mode prefix");
+  }
+  Require(!storage.hc_q8, "a rejected sidecar stayed bound");
+  for (const auto mode : {q::HcMode::kFp16, q::HcMode::kQ8})
+    q::ApplyExl3HcMode(storage, c, directory.path, mode);
+  // Without a sidecar q8-calibrated fails instead of switching modes.
+  std::filesystem::remove_all(sidecar);
+  std::filesystem::remove(directory.path / "hc_q8.json");
+  Reject(
+      [&] {
+        q::ApplyExl3HcMode(storage, c, directory.path,
+                           q::HcMode::kQ8Calibrated);
+      },
+      "--hc-mode q8-calibrated requires the calibrated sidecar");
+  Require(!storage.hc_q8, "absent sidecar bound calibrated weights");
+  for (const auto mode : {q::HcMode::kFp16, q::HcMode::kQ8}) {
+    q::ApplyExl3HcMode(storage, c, directory.path, mode);
+    Require(!storage.hc_q8, "fp16/q8 bound calibrated weights");
+  }
 }
 }  // namespace
 int main() {

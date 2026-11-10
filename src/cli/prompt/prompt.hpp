@@ -12,6 +12,7 @@
 #include "src/cli/kv_cache_type.hpp"
 #include "src/core/sampling.hpp"
 #include "src/core/text_sampling_defaults.hpp"
+#include "src/models/qwen38_flash_next/hc_mode.hpp"
 
 namespace gufo::cli {
 
@@ -45,6 +46,8 @@ struct PromptOptions {
   std::uint32_t min_draft_tokens = 1;
   // Empty: the model default.
   std::optional<KvCacheType> kv_cache_type;
+  // Flash-Next `--hc-mode`; empty: fp16. Other models reject a value.
+  std::optional<models::qwen38_flash_next::HcMode> hc_mode;
 };
 
 /// Prints help for `gufo prompt`.

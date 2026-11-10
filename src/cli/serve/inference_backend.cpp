@@ -2703,7 +2703,8 @@ public:
                   model_->config().rope_scaling),
               model_->IsNativeExl3(),
               models::qwen38_flash_next::Session::kSnapshotPayloadVersion,
-              device_code),
+              device_code,
+              models::qwen38_flash_next::HcModeName(model_->hc_mode())),
           .payload_version =
               models::qwen38_flash_next::Session::kSnapshotPayloadVersion,
       };
@@ -2716,6 +2717,9 @@ public:
                << "mtp=" << use_mtp_ << '\n'
                << "draft_max_tokens=" << max_draft_tokens_ << '\n'
                << "draft_cost_concurrency=" << model_->DecodeConcurrency()
+               << '\n'
+               << "hc_mode="
+               << models::qwen38_flash_next::HcModeName(model_->hc_mode())
                << '\n';
       const auto canonical = identity.str();
       component_identity_.assign(canonical.begin(), canonical.end());
@@ -3381,6 +3385,8 @@ struct InferenceBackend::Impl {
     bool supports_images{false};
     /// The loaded abliteration profile; empty without one.
     std::optional<AbliterationInfo> abliteration;
+    /// Flash-Next's HyperConnection mode name; empty for other models.
+    std::string hc_mode;
     /// The runner's Han tokens; null where its samplers ignore han_scale.
     std::shared_ptr<const sampling::TokenSet> han_tokens;
     ReasoningOptions reasoning_defaults;
@@ -3495,18 +3501,17 @@ InferenceBackend::InferenceBackend() : impl_(std::make_unique<Impl>()) {}
 
 InferenceBackend::~InferenceBackend() = default;
 
-bool InferenceBackend::load(const std::string& model_path, std::string* error,
-                            std::uint32_t max_context,
-                            std::size_t session_count,
-                            TextPrefillPolicy prefill_policy,
-                            TextSchedulerPolicy scheduler_policy,
-                            const TextSpeculativeConfig& speculative_config,
-                            const TextDiskCacheConfig& disk_cache_config,
-                            const std::string& vision_model_path,
-                            TextRunnerRamCacheOptions ram_cache_config,
-                            bool enable_yarn,
-                            std::optional<cli::KvCacheType> kv_cache_type,
-                            const std::string& abliteration_profile) {
+bool InferenceBackend::load(
+    const std::string& model_path, std::string* error,
+    std::uint32_t max_context, std::size_t session_count,
+    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
+    const TextSpeculativeConfig& speculative_config,
+    const TextDiskCacheConfig& disk_cache_config,
+    const std::string& vision_model_path,
+    TextRunnerRamCacheOptions ram_cache_config, bool enable_yarn,
+    std::optional<cli::KvCacheType> kv_cache_type,
+    const std::string& abliteration_profile,
+    std::optional<models::qwen38_flash_next::HcMode> hc_mode) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
@@ -3523,6 +3528,10 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     SetError(error,
              "--abliteration-profile applies only to Qwen3.8-27B and "
              "Flash-Next");
+    return false;
+  }
+  if (hc_mode && architecture != "qwen4exp") {
+    SetError(error, "--hc-mode applies only to Qwen3.8-Flash-Next");
     return false;
   }
   if (enable_yarn && architecture != "qwen4exp") {
@@ -3676,6 +3685,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .kvarn_bits =
                 resolved_kv_cache_type == cli::KvCacheType::kKvarnK6V6 ? 6 : 4,
             .abliteration_profile = abliteration_profile,
+            .hc_mode =
+                hc_mode.value_or(models::qwen38_flash_next::kDefaultHcMode),
         },
         &load_error);
     if (model == nullptr) {
@@ -3720,6 +3731,10 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                      "event=decode_scratch_reserved status=deferred reason=" +
                          reserve_error);
     }
+    Logger::Info("loader",
+                 "event=hc_mode mode=" +
+                     std::string(models::qwen38_flash_next::HcModeName(
+                         model->hc_mode())));
     if (rope_scaling) {
       Logger::Info(
           "loader",
@@ -3805,6 +3820,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   (void)enable_yarn;
   (void)abliteration_profile;
   (void)kv_cache_type;
+  (void)hc_mode;
   SetError(error, "HTTP inference requires the HIP backend");
   return false;
 #endif
@@ -4114,6 +4130,8 @@ bool InferenceBackend::load(
     new_state->sampling_defaults.supplied = {};
     new_state->supports_images = model->VisionEncoder() != nullptr;
     new_state->abliteration = DescribeAbliteration(model->Abliteration());
+    new_state->hc_mode =
+        models::qwen38_flash_next::HcModeName(model->hc_mode());
     auto runner = std::make_shared<QwenFlashNextTextRunner>(
         std::move(model), max_context,
         speculative_config.backend == TextSpeculativeBackend::kMtp,
@@ -4204,6 +4222,15 @@ bool InferenceBackend::supports_images() const {
   return state != nullptr && state->supports_images;
 #else
   return false;
+#endif
+}
+
+std::string InferenceBackend::hc_mode() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state != nullptr ? state->hc_mode : std::string{};
+#else
+  return {};
 #endif
 }
 

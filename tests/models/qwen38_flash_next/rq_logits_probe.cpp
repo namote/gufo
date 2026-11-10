@@ -363,8 +363,9 @@ int main(int argc, char** argv) {
     Require(bool(reader), error);
     const bool exl3 =
         reader->FindMetadata(gufo::quant::exl3::kCheckpointKey) != nullptr;
-    auto weights = exl3 ? q::LoadExl3Model(model_path, *reader, &error)
-                        : q::ModelWeights::Bind(*reader, &error);
+    auto weights =
+        exl3 ? q::LoadExl3Model(model_path, *reader, q::kDefaultHcMode, &error)
+             : q::ModelWeights::Bind(*reader, &error);
     Require(bool(weights), error);
     const auto& c = weights->config;
     Require(c.vocab_size == 248320, "unexpected Flash-Next vocabulary");

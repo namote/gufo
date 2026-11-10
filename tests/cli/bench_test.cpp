@@ -233,6 +233,26 @@ void TestKvCacheTypeOption() {
          "benchmark KV type aliases are rejected");
 }
 
+void TestHcModeOption() {
+  using gufo::models::qwen38_flash_next::HcMode;
+  const auto absent = gufo::cli::ParseBenchOptions(std::array{"model.gguf"});
+  Expect(absent && !absent->hc_mode, "no HC mode selects fp16");
+  const auto calibrated = gufo::cli::ParseBenchOptions(
+      std::array{"--hc-mode", "q8-calibrated", "model.gguf"});
+  Expect(calibrated && calibrated->hc_mode == HcMode::kQ8Calibrated &&
+             calibrated->model_path == "model.gguf",
+         "benchmark HC mode parses");
+  const auto fp16 =
+      gufo::cli::ParseBenchOptions(std::array{"--hc-mode=fp16", "model.gguf"});
+  Expect(fp16 && fp16->hc_mode == HcMode::kFp16, "explicit fp16 parses");
+  std::string error;
+  Expect(!gufo::cli::ParseBenchOptions(
+             std::array{"--hc-mode", "q8_0", "model.gguf"}, &error) &&
+             error.find("--hc-mode must be fp16, q8 or q8-calibrated") !=
+                 std::string::npos,
+         "benchmark HC mode aliases are rejected");
+}
+
 int main() {
   TestDefaultOptions();
   TestDs4SamplingOptions();
@@ -242,6 +262,7 @@ int main() {
   TestInvalidWorkload();
   TestFlashNextYarnRule();
   TestKvCacheTypeOption();
+  TestHcModeOption();
   std::cout << "All benchmark CLI tests passed.\n";
   return 0;
 }

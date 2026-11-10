@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
+#include "src/cli/hc_mode_option.hpp"
 #include "src/cli/kv_cache_type.hpp"
 #include "src/cli/sampling_options.hpp"
 #include "src/cli/serve/asr_service.hpp"
@@ -609,6 +610,7 @@ void PrintServeHelp(std::string_view program_name,
     bool enable_yarn = false;
     std::string abliteration_profile;
     std::optional<KvCacheType> kv_cache_type;
+    std::optional<models::qwen38_flash_next::HcMode> hc_mode;
     std::string trace_path;
 
     gufo::cli::ArgParser parser(
@@ -638,6 +640,7 @@ void PrintServeHelp(std::string_view program_name,
         "Qwen3.8-27B, Flash-Next: load optional projection profile", "Model",
         &abliteration_profile);
     RegisterKvCacheTypeOption(parser, &kv_cache_type, "Model");
+    RegisterHcModeOption(parser, &hc_mode, "Model");
 
     // Sampling Defaults
     parser.AddOption(
@@ -1252,6 +1255,7 @@ int RunServe(std::span<const char* const> args) {
     bool enable_yarn = false;
     std::string abliteration_profile;
     std::optional<KvCacheType> kv_cache_type;
+    std::optional<models::qwen38_flash_next::HcMode> hc_mode;
     std::string trace_path;
 
     gufo::cli::ArgParser llm_parser(
@@ -1293,6 +1297,7 @@ int RunServe(std::span<const char* const> args) {
         "projection profile",
         "Model", &abliteration_profile);
     RegisterKvCacheTypeOption(llm_parser, &kv_cache_type, "Model");
+    RegisterHcModeOption(llm_parser, &hc_mode, "Model");
     llm_parser.AddOption(
         "-n", "--max-tokens", "N",
         "Default new-token limit (default: -1 = until EOS or context full)",
@@ -1581,7 +1586,7 @@ int RunServe(std::span<const char* const> args) {
             .capacity_bytes = cache_ram_bytes,
             .kv_pool_bytes = kv_pool_bytes,
             .tail_checkpoints = cache_tail_checkpoints},
-        enable_yarn, kv_cache_type, abliteration_profile);
+        enable_yarn, kv_cache_type, abliteration_profile, hc_mode);
     loading.stop();
     if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";

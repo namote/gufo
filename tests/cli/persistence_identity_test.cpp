@@ -17,11 +17,25 @@ namespace {
 using gufo::core::FindElfSection;
 using gufo::server::QwenFlashNextCompatibilityIdentity;
 
-std::string Identity(std::string_view device_code) {
+std::string Identity(std::string_view device_code,
+                     std::string_view hc_mode = "fp16") {
   const auto bytes = QwenFlashNextCompatibilityIdentity(
       std::string(64, 'a'), std::string(64, 'b'), true, 8192, 7, 2,
-      "absolute-v1", true, 19, device_code);
+      "absolute-v1", true, 19, device_code, hc_mode);
   return {bytes.begin(), bytes.end()};
+}
+
+// Each --hc-mode computes different states: none restores into another.
+void HcModeChangesTheIdentity() {
+  const std::string code(64, '1');
+  const auto fp16 = Identity(code, "fp16");
+  const auto q8 = Identity(code, "q8");
+  const auto calibrated = Identity(code, "q8-calibrated");
+  assert(fp16 != q8 && fp16 != calibrated && q8 != calibrated);
+  assert(fp16.find("hc_mode=fp16\n") != std::string::npos);
+  assert(q8.find("hc_mode=q8\n") != std::string::npos);
+  assert(calibrated.find("hc_mode=q8-calibrated\n") != std::string::npos);
+  assert(Identity(code, "q8") == q8);
 }
 
 // A kernel change alters the device code hash and with it the identity, so
@@ -117,6 +131,7 @@ int main(int argc, char** argv) {
     return section ? 0 : 1;
   }
   DeviceCodeHashChangesTheIdentity();
+  HcModeChangesTheIdentity();
   FindsElfSections();
   ExecutableHashIsStable();
   std::cout << "persistence identity tests passed\n";

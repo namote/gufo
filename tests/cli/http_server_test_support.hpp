@@ -95,6 +95,8 @@ public:
     return abliteration;
   }
   std::optional<AbliterationInfo> abliteration;
+  std::string hc_mode() const override { return served_hc_mode; }
+  std::string served_hc_mode;
   std::uint32_t max_context() const override { return 65536; }
   std::vector<SessionState> session_states() const override { return sessions; }
   std::vector<SessionState> sessions;

@@ -57,8 +57,11 @@ struct Uploader {
   std::deque<std::vector<quant::exl3::DeviceLinear>>& descriptors;
   std::map<const Exl3HostLinear*, DeviceTensor> linear_cache;
   std::uint32_t checkpoint_base{0}, mtp_checkpoint_base{0};
-  /// EXL3 pack: its F16 HC up weights are replaced by Q8_0 copies.
+  /// EXL3 pack: under HcMode::kQ8 its F16 HC up weights are replaced by
+  /// Q8_0 copies.
   bool exl3_model{false};
+  /// Places every mixer's down/up weights, the draft block's included.
+  HcMode hc_mode{kDefaultHcMode};
   bool ok{true};
   std::uint32_t shard_base{0};
   std::uint64_t requested{0};
@@ -394,31 +397,42 @@ struct Uploader {
   }
 
   DeviceMixer Mixer(const HcMixer& m) {
-    const bool calibrated = !m.down_q8.empty() && !m.up_q8.empty();
     if (m.down_q8.empty() != m.up_q8.empty()) {
       Fail("incomplete calibrated HC pair");
       return {};
     }
+    const auto f16 = [](const TensorRef& t) {
+      return !t.empty() && t.exl3.empty() && t.type == core::GgmlType::kF16 &&
+             t.cols % 32 == 0;
+    };
+    const HcMixerPlan plan = PlanHcMixer(hc_mode, !m.down_q8.empty(),
+                                         f16(m.down), f16(m.up), exl3_model);
+    if (!plan.valid) {
+      Fail("HC mixer weights do not match --hc-mode " +
+           std::string(HcModeName(hc_mode)));
+      return {};
+    }
     DeviceMixer d{Copy(m.norm),
                   Copy(m.down),
-                  Copy(calibrated ? m.up_q8 : m.up),
+                  Copy(plan.calibrated ? m.up_q8 : m.up),
                   Copy(m.inject),
                   {}};
-    if (calibrated) {
+    if (plan.calibrated) {
       d.down_q8 = Copy(m.down_q8);
       return d;
     }
-    // The EXL3 down projection runs W8A8 (prefill) or the Q8_0 GEMV
-    // (decode/verify) on a Q8_0 copy, as the GGUF route's Q8_0 mixer
-    // weights do; an unnormed prefill input still reads the F16 rows.
-    if (!ok || m.down.empty() || !m.down.exl3.empty() ||
-        m.down.type != core::GgmlType::kF16 || m.down.cols % 32 != 0)
+    // fp16, GGUF and stored non-F16 operands keep the uploaded weights:
+    // every HC reader takes F16 down and up (executor_hc.cpp HcMix,
+    // HcMixBatch).
+    if (!ok || !plan.convert_down)
       return d;
+    // q8: the EXL3 down projection runs W8A8 (prefill) or the Q8_0 GEMV
+    // (decode/verify) on a Q8_0 copy; an unnormed prefill input still reads
+    // the F16 rows.
     d.down_q8 = Q8Copy(d.down, m.down, false);
-    // Every up reader (the Q8_0 GEMV of decode, the Q8_0 x F16 GEMM of
-    // prefill) takes Q8_0 weights, so the F16 rows are replaced.
-    if (ok && exl3_model && !m.up.empty() && m.up.exl3.empty() &&
-        m.up.type == core::GgmlType::kF16 && m.up.cols % 32 == 0) {
+    // The up projection then reads Q8_0 weights in place of the F16 rows
+    // (the Q8_0 GEMV of decode, the Q8_0 x F16 GEMM of prefill).
+    if (ok && plan.convert_up) {
       const DeviceTensor up = Q8Copy(d.up, m.up, true);
       if (up.data != nullptr)
         d.up = up;
@@ -620,6 +634,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     measure.checkpoint_base = checkpoint_base;
     measure.mtp_checkpoint_base = mtp_checkpoint_base;
     measure.exl3_model = w.exl3_storage != nullptr;
+    measure.hc_mode = w.hc_mode;
     (void)measure.Model(w, mtp, shard_count);
     if (!measure.ok) {
       return nullptr;
@@ -634,6 +649,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   up.checkpoint_base = checkpoint_base;
   up.mtp_checkpoint_base = mtp_checkpoint_base;
   up.exl3_model = w.exl3_storage != nullptr;
+  up.hc_mode = w.hc_mode;
   Uploaded uploaded = up.Model(w, mtp, shard_count);
   if (!up.ok || !stager->Finish(error_msg)) {
     return nullptr;

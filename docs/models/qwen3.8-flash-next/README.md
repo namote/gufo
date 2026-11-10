@@ -51,6 +51,28 @@ vision fails instead of silently selecting a different encoder.
 See [native text qualification](../../../plan/exl3/archive/F3-NATIVE-PACK.md) and
 [native vision qualification](../../../plan/exl3/archive/F3-VISION-NATIVE.md).
 
+### HyperConnection mode
+
+`--hc-mode` (on `serve llm`, `prompt`, `chat` and `bench`) selects the
+weights of the hyper-connection mixers' down/up projections, in the trunk,
+the head and the MTP block alike:
+
+| Mode | Weights | Sidecar |
+| --- | --- | --- |
+| `fp16` (default) | The pack's F16 weights, unconverted | Not read |
+| `q8` | Q8_0, rounded from F16 at load without calibration | Not read |
+| `q8-calibrated` | The calibrated Q8_0 sidecar | `hc_q8/` and `hc_q8.json` in the model directory; required |
+
+`q8-calibrated` fails the load when the sidecar is absent, does not match this
+pack or holds invalid Q8 values; it never falls back to another mode. A GGUF
+model keeps its stored mixer weights under `fp16` and `q8` and, having no
+sidecar, refuses `q8-calibrated`. The trade-off is speed
+against accuracy: F16 reads twice the HC bytes per token. In the 2026-11-07
+decode profile the Q8 HC projections took 3.42 ms of each token (about 11 %),
+so `fp16` decodes more slowly than either Q8 mode. `q8` rounds without
+calibration and drifts most. The modes give different numbers, so the cache
+identity carries the mode and states are never shared between them.
+
 ## GGUF load and run
 
 ```sh

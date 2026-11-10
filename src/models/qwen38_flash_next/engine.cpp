@@ -131,11 +131,20 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   }
   const bool exl3 =
       m->reader_->FindMetadata(quant::exl3::kCheckpointKey) != nullptr;
-  auto weights = exl3 ? LoadExl3Model(model_path, *m->reader_, error_msg)
-                      : ModelWeights::Bind(*m->reader_, error_msg);
+  // The calibrated sidecar exists only beside a native EXL3 pack.
+  if (!exl3 && options.hc_mode == HcMode::kQ8Calibrated) {
+    AssignError(error_msg,
+                "--hc-mode q8-calibrated requires a native EXL3 pack with its "
+                "calibrated hc_q8/ sidecar");
+    return nullptr;
+  }
+  auto weights =
+      exl3 ? LoadExl3Model(model_path, *m->reader_, options.hc_mode, error_msg)
+           : ModelWeights::Bind(*m->reader_, error_msg);
   if (!weights) {
     return nullptr;
   }
+  weights->hc_mode = options.hc_mode;
   m->weights_ = std::make_unique<ModelWeights>(std::move(*weights));
   if (options.rope_scaling.has_value()) {
     if (!ValidateRopeScaling(*options.rope_scaling,

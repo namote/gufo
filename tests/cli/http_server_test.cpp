@@ -543,6 +543,7 @@ void TestLlamaProps() {
   assert(!bare.contains("model_path"));
   assert(!bare.contains("build_info"));
   assert(!bare.contains("total_slots"));
+  assert(!bare.contains("hc_mode"));
   const auto* generation = bare.find("default_generation_settings");
   assert(generation != nullptr && generation->member_size("n_ctx") == 65536);
   const auto* params = generation->find("params");
@@ -557,7 +558,9 @@ void TestLlamaProps() {
   server.backend->sessions.resize(2);
   server.backend->image_support = true;
   server.backend->defaults.max_tokens = 512;
+  server.backend->served_hc_mode = "q8-calibrated";
   const auto full = props("/props");
+  assert(full.member_str("hc_mode") == "q8-calibrated");
   assert(full.member_str("model_path") == "/models/model-00001-of-00002.gguf");
   assert(full.member_str("build_info") == "0.2.0 (abc1234)");
   assert(full.member_size("total_slots") == 2);

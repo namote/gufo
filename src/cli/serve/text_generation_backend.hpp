@@ -350,6 +350,9 @@ public:
   /// Whether requests apply SamplingConfig::han_scale (Qwen 27B and
   /// Flash-Next, whose runners build a Han token set).
   [[nodiscard]] virtual bool supports_han_scale() const { return false; }
+  /// Flash-Next's loaded HyperConnection mode (`--hc-mode`); empty for other
+  /// models.
+  [[nodiscard]] virtual std::string hc_mode() const { return {}; }
   /// The served model file and build revision, as llama-server's /props
   /// reports them. Empty when unknown.
   [[nodiscard]] virtual std::string model_path() const { return {}; }

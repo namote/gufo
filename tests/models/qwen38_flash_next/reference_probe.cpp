@@ -120,8 +120,9 @@ int main(int argc, char** argv) {
   }
   const bool exl3 =
       reader->FindMetadata(gufo::quant::exl3::kCheckpointKey) != nullptr;
-  auto weights = exl3 ? q::LoadExl3Model(model_path, *reader, &error)
-                      : q::ModelWeights::Bind(*reader, &error);
+  auto weights =
+      exl3 ? q::LoadExl3Model(model_path, *reader, q::kDefaultHcMode, &error)
+           : q::ModelWeights::Bind(*reader, &error);
   if (!weights) {
     std::fprintf(stderr, "bind failed: %s\n", error.c_str());
     return 1;

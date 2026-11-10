@@ -20,7 +20,7 @@ def run(binary, model, output):
     output=Path(output);output.mkdir(parents=True,exist_ok=False)
     url='http://127.0.0.1:18741'
     command=[binary,'serve','llm','--model',model,'--served-model-name','hc-test','--host','127.0.0.1','--port','18741',
-             '--sessions','2','--context','4096','--kv-cache-type','fp16','--kv-pool-bytes','268435456',
+             '--sessions','2','--context','4096','--kv-cache-type','fp16','--hc-mode','q8-calibrated','--kv-pool-bytes','268435456',
              '--cache-ram-bytes','2147483648','--think','off','--speculative','mtp','--mtp-model',model,
              '--draft-tokens','7','--temperature','0','--top-p','1','--top-k','0']
     (output/'ARGV.json').write_text(json.dumps(command,indent=2)+'\n')

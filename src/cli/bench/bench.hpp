@@ -11,6 +11,7 @@
 
 #include "src/cli/kv_cache_type.hpp"
 #include "src/core/sampling.hpp"
+#include "src/models/qwen38_flash_next/hc_mode.hpp"
 #include "src/models/qwen38_flash_next/rope_scaling.hpp"
 
 namespace gufo::cli {
@@ -35,6 +36,8 @@ struct BenchOptions {
   bool verbose{false};
   // Empty: the model default.
   std::optional<KvCacheType> kv_cache_type;
+  // Flash-Next `--hc-mode`; empty: fp16. Other models reject a value.
+  std::optional<models::qwen38_flash_next::HcMode> hc_mode;
 };
 
 /// Context a Flash-Next benchmark reserves for its largest workload: depth

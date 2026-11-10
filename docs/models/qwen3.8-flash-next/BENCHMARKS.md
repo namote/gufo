@@ -11,7 +11,7 @@ are no longer retained. [Archive mapping and cleanup receipt](../../../plan/exl3
 These rows were measured on a cleaned host, after `sync`, `drop_caches=3` and `compact_memory=1`. After 22 days of uptime, host memory fragmentation had cut MTP by up to 40 %, and the same binary did the same work in both states (see KNOWHOW "Upstream U6 combined GPU pass").
 
 - **Binaries:** B is the deployed `runtime-hc-20261108`, measured 16:51–17:04. C is `22705f7b` (`6e6574ca`, U4-3 reverted). D is `21c138cc` (`6588c56c`, U4-3 re-landed plus M1), measured 18:22–18:26 after a second compaction.
-- **Setup:** c03 + all200 HC Q8, FP16 KV, r2, temperature 0, seed 314159, draft 7. Values are tok/s per run.
+- **Setup:** c03 + all200 HC Q8 (now `--hc-mode q8-calibrated`; the default is `fp16`), FP16 KV, r2, temperature 0, seed 314159, draft 7. Values are tok/s per run.
 
 | Case | B | C | D | D vs B |
 | --- | ---: | ---: | ---: | ---: |

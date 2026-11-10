@@ -92,6 +92,14 @@ def main():
         check(["serve", "llm", "--kv-cache-type", bad, "--model",
                "missing.gguf"], 2,
               "--kv-cache-type must be fp16, kvarn-k4v2 or kvarn-k4v4")
+    # Flash-Next HyperConnection mode: one spelling each, fp16 by default.
+    assert "--hc-mode" in help_text
+    for mode in ("fp16", "q8", "q8-calibrated"):
+        check(["serve", "llm", "--hc-mode", mode, "--model", "missing.gguf"],
+              1, "Error loading model 'missing.gguf'")
+    for bad in ("f16", "Q8", "q8_0", "calibrated"):
+        check(["serve", "llm", "--hc-mode", bad, "--model", "missing.gguf"], 2,
+              "--hc-mode must be fp16, q8 or q8-calibrated")
     # One process can answer under several names; the first is primary.
     name_help = next(line for line in help_text.splitlines()
                      if "--served-model-name" in line)

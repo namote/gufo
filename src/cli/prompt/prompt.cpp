@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
+#include "src/cli/hc_mode_option.hpp"
 #include "src/cli/model_artifact.hpp"
 #include "src/cli/sampling_options.hpp"
 #include "src/core/crypto/sha256.hpp"
@@ -202,6 +203,7 @@ static void RegisterTextOptions(ArgParser& parser, PromptOptions& opt,
       });
 
   RegisterKvCacheTypeOption(parser, &opt.kv_cache_type, "Model");
+  RegisterHcModeOption(parser, &opt.hc_mode, "Model");
   parser.AddFlag("", "--cpu",
                  "Force CPU OpenMP execution fallback instead of GPU ROCm",
                  "Hardware", &opt.force_cpu);
@@ -320,6 +322,17 @@ bool ResolvePromptKvCacheType(const core::GgufReader& reader,
           opt.kv_cache_type, resolved, &error))
     return true;
   std::cerr << "Error: " << error << '\n';
+  return false;
+}
+
+// --hc-mode applies only to Flash-Next. False: refused, reason printed.
+bool CheckPromptHcMode(const core::GgufReader& reader,
+                       const PromptOptions& opt) {
+  if (!opt.hc_mode ||
+      reader.GetMetadataString("general.architecture").value_or("") ==
+          "qwen4exp")
+    return true;
+  std::cerr << "Error: --hc-mode applies only to Qwen3.8-Flash-Next\n";
   return false;
 }
 
@@ -699,7 +712,9 @@ std::shared_ptr<models::qwen38_flash_next::Model> LoadFlashNextModel(
        // ResolvePromptKvCacheType accepted the request before the load.
        .kvarn = opt.kv_cache_type == KvCacheType::kKvarnK4V4 ||
                 opt.kv_cache_type == KvCacheType::kKvarnK6V6,
-       .kvarn_bits = opt.kv_cache_type == KvCacheType::kKvarnK6V6 ? 6 : 4},
+       .kvarn_bits = opt.kv_cache_type == KvCacheType::kKvarnK6V6 ? 6 : 4,
+       .hc_mode =
+           opt.hc_mode.value_or(models::qwen38_flash_next::kDefaultHcMode)},
       &error);
   PrintModelLoadTime(load_start, model != nullptr);
   if (!model)
@@ -1035,7 +1050,8 @@ int RunPrompt(std::span<const char* const> args) {
       std::move(reader_owner));
   ResolvePromptSampling(*reader, &opt);
   std::optional<KvCacheType> kv_cache_type;
-  if (!ResolvePromptKvCacheType(*reader, opt, &kv_cache_type)) {
+  if (!ResolvePromptKvCacheType(*reader, opt, &kv_cache_type) ||
+      !CheckPromptHcMode(*reader, opt)) {
     PrintModelLoadTime(model_load_start, false);
     return 1;
   }
@@ -1266,7 +1282,8 @@ int RunChat(std::span<const char* const> args) {
       std::move(reader_owner));
   ResolvePromptSampling(*reader, &opt);
   std::optional<KvCacheType> kv_cache_type;
-  if (!ResolvePromptKvCacheType(*reader, opt, &kv_cache_type)) {
+  if (!ResolvePromptKvCacheType(*reader, opt, &kv_cache_type) ||
+      !CheckPromptHcMode(*reader, opt)) {
     PrintModelLoadTime(model_load_start, false);
     return 1;
   }
