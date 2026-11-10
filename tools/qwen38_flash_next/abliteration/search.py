@@ -21,7 +21,8 @@ Each trial scores two objectives, both minimized:
   projection). The divergence is approximated on the union U of both top-k
   sets: each side's tokens missing from its own top-k share that side's
   leftover mass (1 - its top-k sum) evenly, each capped at its smallest
-  reported probability (the true value cannot exceed it); both sides are then
+  reported probability (the true value cannot exceed it) and floored at a
+  thousandth of it when no mass is left; both sides are then
   renormalized over U and KL = sum over U of p * log(p / q). Mass outside U is
   ignored, so the value estimates the head of the distribution, comparable between
   trials. OFF baselines are fetched once and cached beside the log.
@@ -101,7 +102,11 @@ def first_token_kl(off, on):
         known = {k: math.exp(v) for k, v in top.items()}
         missing = keys - set(known)
         leftover = max(1.0 - sum(known.values()), 0.0)
-        share = min(min(known.values()), leftover / len(missing)) if missing else 0
+        floor = min(known.values())
+        # A top-k summing to ~1 (rounding) leaves no mass: keep missing tokens
+        # at a thousandth of the floor instead of near zero.
+        share = (max(min(floor, leftover / len(missing)), floor * 1e-3)
+                 if missing else 0)
         values = {k: max(known.get(k, share), MIN_PROBABILITY) for k in keys}
         total = sum(values.values())
         return {k: v / total for k, v in values.items()}
