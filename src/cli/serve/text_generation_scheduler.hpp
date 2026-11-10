@@ -52,6 +52,12 @@ struct TextSchedulerPolicy {
   /// Internal bound after which a still-queued stream reports its start, so
   /// transports can keep the connection alive while it waits.
   std::chrono::milliseconds stream_start_delay{std::chrono::seconds(5)};
+  /// Internal: a prefill with at most this many tokens left runs before a
+  /// longer peer's next chunk, which is then bounded like a decode-active
+  /// chunk. Such out-of-turn picks start only while fewer than this many
+  /// tokens have bypassed the long prefill since its last turn, so it waits
+  /// at most this bound plus one pass. Zero disables the priority.
+  std::size_t short_prefill_priority_tokens{4096};
   std::size_t max_pending_requests{16};
   std::size_t max_pending_requests_per_client{4};
   std::size_t max_output_bytes_per_request{kDefaultMaxOutputBytes};

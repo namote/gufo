@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -181,6 +182,11 @@ struct FakeControl {
   std::vector<std::vector<TextRunnerToken>> advance_batches;
   std::optional<TextRunnerToken> block_advance_label;
   std::optional<TextRunnerToken> block_prefill_label;
+  /// Further gates, used in order once `block_prefill_label`'s was released:
+  /// each blocks the first prefill of its label starting at or after its
+  /// prompt position. Each needs its own WaitForPrefill and ReleasePrefill;
+  /// consecutive gates use different labels so each wait sees its own gate.
+  std::deque<std::pair<TextRunnerToken, std::size_t>> next_prefill_gates;
   std::optional<TextRunnerToken> throw_advance_label;
   std::atomic<bool> device_usable{true};
   std::atomic<std::size_t> device_probes{0};
@@ -435,8 +441,10 @@ public:
           .index = fake.position,
           .count = consumed,
       });
+      bool gated = false;
       if (control_->block_prefill_label == fake.label &&
           !control_->prefill_gate_entered) {
+        gated = true;
         control_->prefill_gate_entered = true;
         control_->prefill_gate_label = fake.label;
         control_->condition.notify_all();
@@ -445,6 +453,27 @@ public:
         if (!released) {
           throw std::runtime_error("prefill gate timed out");
         }
+        if (!control_->next_prefill_gates.empty()) {
+          control_->prefill_gate_entered = false;
+          control_->release_prefill = false;
+          control_->block_prefill_label.reset();
+        }
+      }
+      if (!gated && !control_->block_prefill_label &&
+          !control_->next_prefill_gates.empty() &&
+          control_->next_prefill_gates.front().first == fake.label &&
+          fake.position >= control_->next_prefill_gates.front().second) {
+        control_->next_prefill_gates.pop_front();
+        control_->prefill_gate_entered = true;
+        control_->prefill_gate_label = fake.label;
+        control_->condition.notify_all();
+        const bool released = control_->condition.wait_for(
+            lock, kTestTimeout, [&] { return control_->release_prefill; });
+        if (!released) {
+          throw std::runtime_error("prefill gate timed out");
+        }
+        control_->prefill_gate_entered = false;
+        control_->release_prefill = false;
       }
     }
 
@@ -1512,6 +1541,126 @@ void TestShortArrivalBehindWaitingPrefill() {
              EventIndex(events, EventKind::kAdvance, 3) <
                  EventIndex(events, EventKind::kPrefill, 1, 1),
          "the short newcomer gets its first token without repeating the round");
+}
+
+std::vector<TextRunnerToken> LabeledPrompt(TextRunnerToken label,
+                                           std::size_t size) {
+  std::vector<TextRunnerToken> prompt{label};
+  for (std::size_t index = 1; index < size; ++index)
+    prompt.push_back(label * 1000 + static_cast<TextRunnerToken>(index));
+  return prompt;
+}
+
+TextSchedulerPolicy ShortPriorityPolicy(std::size_t tokens) {
+  TextSchedulerPolicy policy;
+  policy.short_prefill_priority_tokens = tokens;
+  return policy;
+}
+
+void TestShortPrefillRunsBeforeLongChunks() {
+  for (const std::size_t priority : {6U, 0U}) {
+    auto control = std::make_shared<FakeControl>();
+    control->prefill_capacity = 4;
+    control->block_prefill_label = 1;
+    auto scheduler = MakeScheduler(control, 2, {.decode_active_tokens = 2},
+                                   ShortPriorityPolicy(priority));
+    auto long_request = scheduler->Submit(LabeledPrompt(1, 20), 2, 0.0F);
+    control->WaitForPrefill(1);
+    auto short_request = scheduler->Submit(LabeledPrompt(2, 5), 1, 0.0F);
+    control->ReleasePrefill();
+    Expect(short_request.Wait().tokens == ExpectedTokens(2, 1) &&
+               long_request.Wait().tokens == ExpectedTokens(1, 2),
+           "prioritized prefills preserve both outputs");
+    const auto events = control->Events();
+    const auto next_long = EventIndex(events, EventKind::kPrefill, 1, 1);
+    Expect(next_long < events.size(), "the long prefill takes a second turn");
+    if (priority != 0) {
+      Expect(PrefillChunks(*control, 2) == std::vector<std::size_t>({4, 1}) &&
+                 EventIndex(events, EventKind::kAdvance, 2) < next_long,
+             "a short prefill finishes before the long prefill's next chunk");
+      Expect(events[next_long].count == 4,
+             "the long prefill resumes wide chunks once no short peer waits");
+    } else {
+      Expect(next_long < EventIndex(events, EventKind::kPrefill, 2, 1) &&
+                 events[next_long].count == 2,
+             "a zero limit keeps round-robin turns");
+    }
+  }
+}
+
+void TestShortPriorityBypassIsBounded() {
+  auto control = std::make_shared<FakeControl>();
+  control->prefill_capacity = 4;
+  control->block_prefill_label = 1;
+  auto scheduler = MakeScheduler(control, 4, {.decode_active_tokens = 2},
+                                 ShortPriorityPolicy(6));
+  auto long_request = scheduler->Submit(LabeledPrompt(1, 30), 2, 0.0F);
+  control->WaitForPrefill(1);
+  std::vector<TextGenerationScheduler::Request> shorts;
+  for (const TextRunnerToken label : {2, 3, 4})
+    shorts.push_back(scheduler->Submit(LabeledPrompt(label, 6), 1, 0.0F));
+  control->ReleasePrefill();
+  for (std::size_t index = 0; index < shorts.size(); ++index)
+    Expect(shorts[index].Wait().tokens ==
+               ExpectedTokens(static_cast<TextRunnerToken>(index + 2), 1),
+           "each short request keeps its output");
+  Expect(long_request.Wait().tokens == ExpectedTokens(1, 2),
+         "the bypassed long request keeps its output");
+  const auto events = control->Events();
+  const auto long_turn = EventIndex(events, EventKind::kPrefill, 1, 1);
+  Expect(long_turn < events.size(), "the long prefill takes a second turn");
+  Expect(EventIndex(events, EventKind::kAdvance, 2) < long_turn &&
+             EventIndex(events, EventKind::kAdvance, 3) < long_turn,
+         "short prefills run out of turn ahead of the long prefill");
+  // Requests 2 and 3 ran 2 + 4 tokens out of turn; request 4 still waits.
+  Expect(PrefillChunks(*control, 2) == std::vector<std::size_t>({4, 2}) &&
+             PrefillChunks(*control, 3) == std::vector<std::size_t>({2, 4}),
+         "short prefills run out of turn up to the bypass limit");
+  Expect(events[long_turn].count == 2 &&
+             long_turn < EventIndex(events, EventKind::kPrefill, 4, 1),
+         "after the bypass limit the long prefill gets one bounded turn");
+  const auto long_chunks = PrefillChunks(*control, 1);
+  Expect(long_chunks.size() > 2 && long_chunks[2] == 4,
+         "the long prefill widens again once every short peer is done");
+}
+
+void TestCancelledShortPickIsNotCounted() {
+  auto control = std::make_shared<FakeControl>();
+  control->prefill_capacity = 4;
+  control->block_prefill_label = 1;
+  control->next_prefill_gates = {{2, 4}};
+  auto scheduler = MakeScheduler(control, 4, {.decode_active_tokens = 2},
+                                 ShortPriorityPolicy(6));
+  auto long_request = scheduler->Submit(LabeledPrompt(1, 30), 2, 0.0F);
+  control->WaitForPrefill(1);
+  auto cancelled = scheduler->Submit(LabeledPrompt(2, 9), 1, 0.0F);
+  auto finished = scheduler->Submit(LabeledPrompt(3, 6), 1, 0.0F);
+  control->ReleasePrefill();
+  // Request 3 (6 tokens) runs both passes out of turn ahead of request 2 (9
+  // tokens, over the limit), which then takes its own turn. Its second pass
+  // is an out-of-turn pick ahead of the long prefill; were it counted,
+  // request 4 would reach the limit before its last token.
+  control->WaitForPrefill(2);
+  auto waiting = scheduler->Submit(LabeledPrompt(4, 5), 1, 0.0F);
+  cancelled.Cancel();
+  control->ReleasePrefill();
+  Expect(cancelled.Wait().cancelled, "the short prefill is cancelled");
+  Expect(finished.Wait().tokens == ExpectedTokens(3, 1) &&
+             waiting.Wait().tokens == ExpectedTokens(4, 1) &&
+             long_request.Wait().tokens == ExpectedTokens(1, 2),
+         "the remaining requests keep their outputs");
+  const auto events = control->Events();
+  Expect(PrefillChunks(*control, 3) == std::vector<std::size_t>({4, 2}) &&
+             PrefillChunks(*control, 2) == std::vector<std::size_t>({4, 4}) &&
+             EventIndex(events, EventKind::kPrefill, 3, 1) <
+                 EventIndex(events, EventKind::kPrefill, 2),
+         "the shorter request runs out of turn before the cancelled one");
+  Expect(PrefillChunks(*control, 4) == std::vector<std::size_t>({4, 1}),
+         "the waiting request finishes with out-of-turn picks");
+  const auto long_turn = EventIndex(events, EventKind::kPrefill, 1, 1);
+  Expect(long_turn < events.size() &&
+             EventIndex(events, EventKind::kAdvance, 4) < long_turn,
+         "a cancelled pick leaves the waiting short request its priority");
 }
 
 void TestDecodeActivePrefillIsBounded(bool multi_token, bool batched) {
@@ -3426,6 +3575,9 @@ int main() {
   TestArrivalDoesNotWaitForAnotherLongChunk();
   TestLongPrefillsKeepWideFairTurns();
   TestShortArrivalBehindWaitingPrefill();
+  TestShortPrefillRunsBeforeLongChunks();
+  TestShortPriorityBypassIsBounded();
+  TestCancelledShortPickIsNotCounted();
   for (const bool multi_token : {false, true}) {
     for (const bool batched : {false, true}) {
       if (batched && !multi_token)

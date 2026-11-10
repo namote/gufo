@@ -1325,6 +1325,80 @@ struct TextGenerationScheduler::Impl {
     }
   }
 
+  using PrefillQueue = std::deque<std::shared_ptr<ScheduledRequest>>;
+
+  [[nodiscard]] static std::size_t RemainingPrefill(
+      const std::shared_ptr<ScheduledRequest>& request) {
+    return request->runner_request.prompt_tokens() -
+           request->runner_request.prefill_position();
+  }
+
+  [[nodiscard]] bool ShortPrefill(
+      const std::shared_ptr<ScheduledRequest>& request) const {
+    const std::size_t limit = scheduler_policy.short_prefill_priority_tokens;
+    return limit != 0 && RemainingPrefill(request) <= limit;
+  }
+
+  // Round-robin order, except that a long front yields its turn to the peer
+  // with the fewest tokens left at or under the priority limit (queue order
+  // breaks ties) until that many tokens have bypassed it since its last turn.
+  // Both-short and both-long queues keep their round-robin turns.
+  [[nodiscard]] PrefillQueue::iterator SelectPrefill(
+      PrefillQueue& prefilling) const {
+    const std::size_t limit = scheduler_policy.short_prefill_priority_tokens;
+    const auto front = prefilling.begin();
+    if (limit == 0 || short_priority_bypassed_tokens >= limit ||
+        ShortPrefill(*front))
+      return front;
+    auto selected = front;
+    for (auto peer = std::next(front); peer != prefilling.end(); ++peer) {
+      if (ShortPrefill(*peer) &&
+          (selected == front ||
+           RemainingPrefill(*peer) < RemainingPrefill(*selected)))
+        selected = peer;
+    }
+    return selected;
+  }
+
+  // Steps the selected prefill and accounts for the long front it bypassed.
+  // A long step starts a new bypass window, and so does any step while no
+  // long prefill is queued (one that was cancelled, failed or became short).
+  // A cancelled out-of-turn pick bypassed nothing.
+  std::shared_ptr<ScheduledRequest> StepSelectedPrefill(
+      PrefillQueue& prefilling, PrefillQueue::iterator selected,
+      bool decoder_runnable, const PrefillQueue& capturing) {
+    const bool priority_pick = selected != prefilling.begin();
+    const bool long_step = !ShortPrefill(*selected);
+    auto request = std::move(*selected);
+    prefilling.erase(selected);
+    const std::size_t prefilled = request->result.prefill_tokens;
+    if (decoder_runnable) {
+      StepPrefill(request, true);
+    } else {
+      // A short peer bounds the step; so does any prioritized peer when the
+      // step is a long prefill's turn, so its turn costs one bounded chunk.
+      const bool short_peer_waiting = std::any_of(
+          prefilling.begin(), prefilling.end(), [&](const auto& peer) {
+            return RemainingPrefill(peer) <=
+                       prefill_policy.decode_active_tokens ||
+                   (long_step && ShortPrefill(peer));
+          });
+      // Requests can arrive during the step, so an empty queue does not
+      // keep the whole pass.
+      StepPrefill(
+          request, false, !capturing.empty() || short_peer_waiting,
+          prefilling.size() + capturing.size() + 1 < runner_pool->capacity());
+    }
+    if (long_step ||
+        std::all_of(prefilling.begin(), prefilling.end(),
+                    [&](const auto& peer) { return ShortPrefill(peer); }))
+      short_priority_bypassed_tokens = 0;
+    else if (priority_pick && !IsTerminal(request))
+      short_priority_bypassed_tokens +=
+          request->result.prefill_tokens - prefilled;
+    return request;
+  }
+
   void StepPrefill(const std::shared_ptr<ScheduledRequest>& request,
                    bool decoder_runnable, bool peer_waiting = false,
                    bool session_free = false) {
@@ -2240,11 +2314,13 @@ struct TextGenerationScheduler::Impl {
       // Give simultaneous new requests one bounded chunk to form their first
       // batch. Once decoding starts, every due decoder runs before more
       // prefill.
+      // The request the decode-present branch below would step.
+      const auto next_prefill =
+          prefilling.empty() ? prefilling.end() : SelectPrefill(prefilling);
       const bool assemble_initial_batch =
           preparing_multi_token_batch &&
           consecutive_active_prefill_chunks == 0 &&
-          prefilling.front()->runner_request.prompt_tokens() -
-                  prefilling.front()->runner_request.prefill_position() <=
+          RemainingPrefill(*next_prefill) <=
               prefill_policy.decode_active_tokens &&
           std::all_of(decoding.begin(), decoding.end(),
                       [](const auto& request) {
@@ -2252,9 +2328,8 @@ struct TextGenerationScheduler::Impl {
                       });
       if (!prefilling.empty() && !decoding.empty() &&
           (!due_decoder || assemble_initial_batch)) {
-        auto request = std::move(prefilling.front());
-        prefilling.pop_front();
-        StepPrefill(request, true);
+        auto request =
+            StepSelectedPrefill(prefilling, next_prefill, true, capturing);
         if (!IsTerminal(request)) {
           if (CapturePending(request, CaptureSettleDeadline())) {
             capturing.push_back(std::move(request));
@@ -2308,19 +2383,8 @@ struct TextGenerationScheduler::Impl {
         continue;
       }
 
-      auto request = std::move(prefilling.front());
-      prefilling.pop_front();
-      const bool short_peer_waiting = std::any_of(
-          prefilling.begin(), prefilling.end(), [&](const auto& peer) {
-            return peer->runner_request.prompt_tokens() -
-                       peer->runner_request.prefill_position() <=
-                   prefill_policy.decode_active_tokens;
-          });
-      // Requests can arrive during the step, so an empty queue does not
-      // keep the whole pass.
-      StepPrefill(
-          request, false, !capturing.empty() || short_peer_waiting,
-          prefilling.size() + capturing.size() + 1 < runner_pool->capacity());
+      auto request = StepSelectedPrefill(prefilling, SelectPrefill(prefilling),
+                                         false, capturing);
       if (!IsTerminal(request)) {
         if (CapturePending(request, CaptureSettleDeadline())) {
           capturing.push_back(std::move(request));
@@ -2363,6 +2427,9 @@ struct TextGenerationScheduler::Impl {
           TextGenerationErrorCode::kDeviceLost, kDeviceLostMessage));
   std::vector<std::shared_ptr<ScheduledRequest>> device_lost_requests;
   std::size_t consecutive_active_prefill_chunks{0};
+  /// Prefill tokens that short peers ran out of turn since the long front of
+  /// the prefill queue last stepped.
+  std::size_t short_priority_bypassed_tokens{0};
   /// Requests held while the current decode step runs, the stepped ones
   /// included: queued, waiting for admission or rows, prefilling, capturing
   /// or decoding. Every serial multi-token step passes it to the runner.
