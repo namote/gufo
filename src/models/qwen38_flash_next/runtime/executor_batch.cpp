@@ -1362,6 +1362,16 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
                       error)) {
         return false;
       }
+      if (abliteration_) {
+        std::array<AbliterationSpan, kBatchSessions> spans{};
+        for (std::size_t i = 0; i < items.size(); ++i)
+          spans[i] = {
+              offsets[i] + static_cast<std::uint32_t>(items[i].tokens.size()),
+              AbliterationWeight(*items[i].session, il, false)};
+        AbliterateBatchRows(base.block_out, abliteration_direction_,
+                            std::span(spans.data(), items.size()), rows,
+                            c.hidden_size, stream_);
+      }
       CombineBatch(base.res, l.hc_ffn.norm.f32(), rows);
       if (!HcMixBatch(l.hc_ffn, base.res, true, base.mixed, base.inject, rows,
                       error))
@@ -1374,6 +1384,16 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
                                       : layers[il + 1].hc_attn.norm.f32())
               : model_->hc_head().norm.f32();
       UseScratch(base);
+      if (abliteration_) {
+        std::array<AbliterationSpan, kBatchSessions> spans{};
+        for (std::size_t i = 0; i < items.size(); ++i)
+          spans[i] = {
+              offsets[i] + static_cast<std::uint32_t>(items[i].tokens.size()),
+              AbliterationWeight(*items[i].session, il, true)};
+        AbliterateBatchRows(base.block_out, abliteration_direction_,
+                            std::span(spans.data(), items.size()), rows,
+                            c.hidden_size, stream_);
+      }
       CombineBatch(base.res, next_norm, rows);
       normed = next_norm != nullptr;
     }

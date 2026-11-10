@@ -28,7 +28,7 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
                    bool synchronize) const {
   // Host counters must observe each executed operation. Captured/replayed
   // bodies would either duplicate or omit them, as with MtpTrace copies.
-  graph = graph && !diagnostics_active_;
+  graph = graph && !diagnostics_active_ && !session.activation_observer_;
   // A batch shape runs eagerly once before it is captured: the first pass
   // grows the GEMM tier's arena, which capture forbids.
   if (graph && session.warmed_.contains(key)) {
@@ -410,7 +410,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       // EXL3 experts settle or consume the deferred update before writing
       // block_out.
       Combine(s_.res, l.hc_ffn.norm.f32(), rows, InjectWeights(l.hc_ffn),
-              l.ffn_gate_exps.exl3 != nullptr);
+              l.ffn_gate_exps.exl3 != nullptr,
+              AbliterationWeight(session, il, false));
       const DeviceTensor* const shared_rotate[] = {&l.shexp_gate, &l.shexp_up};
       if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, rows, error_msg,
                  false, no_f32, shared_rotate))
@@ -422,7 +423,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       exl3_moe_defer_ = false;
       if (!moe_ok)
         return false;
-      Combine(s_.res, next_norm, rows, next_inject);
+      Combine(s_.res, next_norm, rows, next_inject, false,
+              AbliterationWeight(session, il, true));
       return true;
     };
     if (skipped != 0) {
@@ -439,6 +441,19 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
         return false;
     } else if (!finish(n)) {
       return false;
+    }
+    if (session.activation_observer_) {
+      ApplyPendingResidual();
+      std::vector<float> row(c.HcDim());
+      if (!Check(hipMemcpyAsync(row.data(),
+                                s_.res + std::size_t{n - 1} * c.HcDim(),
+                                row.size() * sizeof(float),
+                                hipMemcpyDeviceToHost, stream_),
+                 "activation collection", error_msg) ||
+          !Check(hipStreamSynchronize(stream_), "activation collection",
+                 error_msg))
+        return false;
+      session.activation_observer_(il, row);
     }
     normed = next_norm != nullptr;
   }

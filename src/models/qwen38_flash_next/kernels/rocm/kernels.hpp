@@ -21,6 +21,17 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/exl3_prefill_combine.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
+struct AbliterationSpan {
+  std::uint32_t end_row;
+  float weight;
+};
+void AbliterateBatchRows(float* output, const float* direction,
+                         std::span<const AbliterationSpan> spans,
+                         std::uint32_t rows, std::uint32_t hidden,
+                         hipStream_t stream);
+void AbliterateRows(float* output, const float* direction, float weight,
+                    std::uint32_t rows, std::uint32_t hidden,
+                    hipStream_t stream);
 
 struct Exl3RouteTile;  // exl3_moe.hpp
 

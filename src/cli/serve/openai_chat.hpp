@@ -39,6 +39,11 @@ bool ParseOpenAiResponseMessage(const json::Value& item,
                                 tokenization::ChatMessage* message,
                                 core::ImageReadBudget& budget,
                                 std::string* error);
+/// Gufo request-local target transform, shared across chat dialects.
+std::optional<HttpResponse> ParseAbliterationControl(
+    const json::Value& body, const TextGenerationBackend& backend,
+    ChatRequest* chat);
+
 /// Shared effort names; each API applies its own thinking and alias rules.
 std::optional<ReasoningEffort> ParseReasoningEffortName(std::string_view value);
 /// True when a request body explicitly sets `typical_acceptance: true`.

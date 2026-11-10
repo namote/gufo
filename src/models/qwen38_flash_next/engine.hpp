@@ -19,6 +19,7 @@
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen/vision/encoder.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
+#include "src/models/qwen38_flash_next/abliteration.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
@@ -69,6 +70,9 @@ struct ModelOptions {
   /// FP16.
   bool kvarn = false;
   int kvarn_bits = 4;
+  /// Empty discovers <model>/abliteration/default.json; loading never enables
+  /// it.
+  std::string abliteration_profile;
 };
 
 class Session;
@@ -107,6 +111,8 @@ public:
     return options_.max_context;
   }
   [[nodiscard]] bool HasMtp() const noexcept;
+  [[nodiscard]] const AbliterationProfile* Abliteration() const;
+  [[nodiscard]] std::string ArtifactIdentity() const;
   /// Test statistic: batched MTP catch-ups whose cohort mixed two or more
   /// KV-only sessions with proposing ones (counted when received; models
   /// with a KV-only route then run them as their own sub-batch).
@@ -270,6 +276,13 @@ public:
   };
   [[nodiscard]] MemoryUsage Memory() const noexcept;
   void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt);
+  void ConfigureAbliteration(bool enabled);
+  [[nodiscard]] std::vector<std::uint8_t> ContinuationIdentity(
+      std::size_t tokens) const;
+  using ActivationObserver =
+      std::function<void(std::uint32_t, std::span<const float>)>;
+  /// Standalone collector, no concurrent requests. Captures only target layers.
+  void SetActivationObserver(ActivationObserver observer);
   /// A new request reusing cached context starts its own acceptance history.
   void ResetDraftPolicy();
 

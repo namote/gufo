@@ -94,6 +94,8 @@ private:
 
 class FakeBackend final : public gufo::server::TextGenerationBackend {
 public:
+  bool abliteration_available{false};
+  bool supports_abliteration() const override { return abliteration_available; }
   std::vector<gufo::server::DecodedLogprobs> logprob_pieces;
   [[nodiscard]] std::string model_id() const override { return "test-model"; }
   [[nodiscard]] std::vector<std::string> model_ids() const override {
@@ -7012,7 +7014,33 @@ void TestChatUsageReportsReasoningTokens() {
   }
 }
 
+void TestAbliterationControls() {
+  FakeBackend backend;
+  gufo::server::ChatRequest request;
+  const auto parse = [&](const char* body) {
+    return gufo::server::ParseAbliterationControl(gufo::json::parse(body),
+                                                  backend, &request);
+  };
+  Expect(!parse("{}") && !request.abliteration, "abliteration defaults off");
+  Expect(parse(R"({"abliteration":{"enabled":true}})").has_value(),
+         "unloaded profile rejected");
+  backend.abliteration_available = true;
+  Expect(!parse(R"({"abliteration":{"enabled":true,"profile":"default"}})") &&
+             request.abliteration,
+         "loaded profile selects target transform");
+  Expect(
+      !parse(R"({"abliteration":{"enabled":false}})") && !request.abliteration,
+      "explicit off replaces enabled");
+  for (const auto* body :
+       {R"({"abliteration":true})", R"({"abliteration":{}})",
+        R"({"abliteration":{"enabled":1}})",
+        R"({"abliteration":{"enabled":true,"profile":"/tmp/x"}})",
+        R"({"abliteration":{"enabled":true,"strength":2}})"})
+    Expect(parse(body).has_value(), "invalid transform controls rejected");
+}
+
 int main() {
+  TestAbliterationControls();
   TestLogprobs();
   TestToolCallRenderParseRoundTrip();
   TestToolTagBoundaries();

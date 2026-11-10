@@ -26,6 +26,7 @@
 #include "src/core/session_mode.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
 #include "src/models/qwen/vision/device_input.hpp"
+#include "src/models/qwen38_flash_next/abliteration.hpp"
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
@@ -138,6 +139,17 @@ public:
   /// Drops every token; the next Forward starts at position 0. Cache slot
   /// reassignment may retain bounded MTP scratch and its recorded graphs.
   void Reset(bool reuse_mtp = false);
+  void ConfigureAbliteration(bool enabled);
+  [[nodiscard]] bool AbliterationEnabled() const {
+    return abliteration_enabled_;
+  }
+  /// Standalone collection only: called on the last row after each target
+  /// layer.
+  using ActivationObserver =
+      std::function<void(std::uint32_t, std::span<const float>)>;
+  void SetActivationObserver(ActivationObserver observer) {
+    activation_observer_ = std::move(observer);
+  }
   // Stable device table; only newly mapped entries are uploaded before writes.
   void EnsureKvRows(std::uint32_t rows);
   void TrimKvRows(std::uint32_t rows);
@@ -248,6 +260,8 @@ private:
   qwen::vision::DeviceInput vision_input_;
   std::uint32_t max_context_{0};
   bool mtp_enabled_{false};
+  bool abliteration_enabled_{false};
+  ActivationObserver activation_observer_;
   std::uint32_t index_capacity_{0};  ///< power-of-two raw indexer ring rows
   std::uint32_t position_{0};
   ContinuationHooks* continuation_hooks_{nullptr};
@@ -337,6 +351,11 @@ public:
 
   ~Executor();
   [[nodiscard]] hipStream_t stream() const noexcept { return stream_; }
+  bool LoadAbliteration(std::shared_ptr<const AbliterationProfile> profile,
+                        std::string* error);
+  const AbliterationProfile* Abliteration() const {
+    return abliteration_.get();
+  }
   Executor(const Executor&) = delete;
   Executor& operator=(const Executor&) = delete;
 
@@ -650,6 +669,17 @@ public:
 
 private:
   Executor() = default;
+  std::shared_ptr<const AbliterationProfile> abliteration_;
+  float* abliteration_direction_{nullptr};
+  float AbliterationWeight(const Session& session, std::uint32_t layer,
+                           bool mlp) const {
+    return session.abliteration_enabled_ && abliteration_
+               ? (mlp ? abliteration_->mlp[layer]
+                      : abliteration_->attention[layer])
+               : 0;
+  }
+  void ProjectAbliteration(float* output, std::uint32_t rows,
+                           float weight) const;
   friend struct ExecutorTestAccess;
 
   enum class DiagnosticStage { kTarget, kDraft, kHead, kCatchUp };
@@ -758,7 +788,8 @@ private:
   /// prefill attention combine); a four-lane combine with a deferred norm
   /// may then leave its update to them (exl3_res_pending_).
   void Combine(float* res, const float* gamma, std::uint32_t n_tokens,
-               const float* inject_w = nullptr, bool defer_res = false) const;
+               const float* inject_w = nullptr, bool defer_res = false,
+               float ablation_weight = 0) const;
   /// An EXL3 prefill combine's residual update left out of `res` for the
   /// FFN mixer's recomputed norm and the next combine.
   struct PendingResidual {

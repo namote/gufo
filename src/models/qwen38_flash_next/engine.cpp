@@ -5,11 +5,13 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <future>
 #include <limits>
 #include <optional>
 #include <type_traits>
 
+#include "src/core/gguf_identity.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/quant/exl3/layout.hpp"
 #include "src/models/qwen/native_pack.hpp"
@@ -227,6 +229,24 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     return nullptr;
   }
   try {
+    auto profile_path = std::filesystem::path(options.abliteration_profile);
+    if (profile_path.empty()) {
+      const auto directory =
+          std::filesystem::is_directory(model_path)
+              ? std::filesystem::path(model_path)
+              : std::filesystem::path(model_path).parent_path();
+      const auto bundled = directory / "abliteration/default.json";
+      if (std::filesystem::exists(bundled))
+        profile_path = bundled;
+    }
+    if (!profile_path.empty()) {
+      const auto& c = m->config();
+      auto profile = std::make_shared<AbliterationProfile>(
+          AbliterationProfile::Load(profile_path, c.hidden_size, c.num_layers,
+                                    m->ArtifactIdentity()));
+      if (!m->executor_->LoadAbliteration(std::move(profile), error_msg))
+        return nullptr;
+    }
     qwen::ValidateNativeSources(*m->reader_);
     if (m->mtp_reader_)
       qwen::ValidateNativeSources(*m->mtp_reader_);
@@ -479,6 +499,31 @@ void Session::SetCancellationCheck(std::function<bool()> check) {
   session_->SetCancellationCheck(std::move(check));
 }
 
+std::string Model::ArtifactIdentity() const {
+  return reader_->GetMetadataBool(quant::exl3::kNativeKey).value_or(false)
+             ? qwen::NativeArtifactIdentity(*reader_)
+             : core::GgufIdentityHex(*reader_);
+}
+
+const AbliterationProfile* Model::Abliteration() const {
+  return executor_->Abliteration();
+}
+
+void Session::SetActivationObserver(ActivationObserver observer) {
+  session_->SetActivationObserver(std::move(observer));
+}
+
+void Session::ConfigureAbliteration(bool enabled) {
+  const ExecutionScope execution(continuation_hooks_);
+  if (enabled == session_->AbliterationEnabled())
+    return;
+  if (enabled && !model_->Abliteration())
+    throw std::invalid_argument("abliteration profile is not loaded");
+  if (!tokens_.empty())
+    Reset();
+  session_->ConfigureAbliteration(enabled);
+}
+
 void Session::ConfigureVision(
     std::shared_ptr<const qwen::vision::Prompt> prompt) {
   const ExecutionScope execution(continuation_hooks_);
@@ -501,6 +546,15 @@ std::span<const std::uint8_t> Session::ImageIdentity(
                        : std::span<const std::uint8_t>{};
 }
 
+std::vector<std::uint8_t> Session::ContinuationIdentity(
+    std::size_t tokens) const {
+  const auto image = ImageIdentity(tokens);
+  return session_->AbliterationEnabled()
+             ? AbliterationInputIdentity(image,
+                                         model_->Abliteration()->identity)
+             : std::vector<std::uint8_t>(image.begin(), image.end());
+}
+
 std::uint32_t Session::KeptHiddenRows() const noexcept {
   return MtpEnabled()
              ? static_cast<std::uint32_t>(tokens_.size() - hidden_base_)
@@ -512,7 +566,7 @@ std::uint64_t Session::SnapshotBytes() const {
     return 0;
   return SessionSnapshotHostBytes(static_cast<std::uint32_t>(tokens_.size()),
                                   model_->VocabSize(),
-                                  ImageIdentity(tokens_.size()).size()) +
+                                  ContinuationIdentity(tokens_.size()).size()) +
          model_->executor_->SnapshotBytes(*session_, KeptHiddenRows());
 }
 
@@ -521,9 +575,11 @@ std::uint64_t Session::PrefillCheckpointBytes(std::uint32_t position) const {
     return 0;
   const auto payload =
       model_->executor_->PrefillCheckpointBytes(*session_, position);
-  return payload ? SessionSnapshotHostBytes(position, model_->VocabSize(), 0) +
-                       payload
-                 : 0;
+  return payload
+             ? SessionSnapshotHostBytes(position, model_->VocabSize(),
+                                        ContinuationIdentity(position).size()) +
+                   payload
+             : 0;
 }
 
 std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(
@@ -544,7 +600,7 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshotImpl(
     std::span<const float> logits, std::uint32_t hidden_rows,
     std::string* error_msg, SnapshotMode mode) const {
   const auto token_count = static_cast<std::uint32_t>(tokens.size());
-  const auto identity = ImageIdentity(token_count);
+  const auto identity = ContinuationIdentity(token_count);
   const std::uint64_t executor_bytes =
       model_->executor_->SnapshotBytes(state, hidden_rows);
   const std::uint64_t host_bytes = SessionSnapshotHostBytes(
@@ -562,6 +618,7 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshotImpl(
       .draft_policy = draft_length_.State(),
       .image_identity_bytes = static_cast<std::uint32_t>(identity.size()),
       .policy_concurrency = model_->DecodeConcurrency(),
+      .reserved = state.AbliterationEnabled() ? 1u : 0u,
       .lookup = lookup_.Save(),
   };
   std::memcpy(out, &header, sizeof(header));
@@ -624,6 +681,7 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
   }
   if (header.vocab_size != model_->VocabSize() || header.token_count == 0 ||
       header.policy_concurrency != model_->DecodeConcurrency() ||
+      header.reserved != (session_->AbliterationEnabled() ? 1u : 0u) ||
       header.token_count > ContextSize() ||
       (header.image_identity_bytes != 0 && header.image_identity_bytes != 32) ||
       payload.size() != SessionSnapshotHostBytes(header.token_count,
@@ -646,7 +704,8 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
   std::vector<std::uint8_t> image_identity(in,
                                            in + header.image_identity_bytes);
   if (!image_identity.empty() &&
-      !std::ranges::equal(image_identity, ImageIdentity(header.token_count))) {
+      !std::ranges::equal(image_identity,
+                          ContinuationIdentity(header.token_count))) {
     AssignError(error_msg,
                 "image snapshot requires its matching prompt attachment");
     return false;

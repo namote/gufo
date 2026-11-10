@@ -116,6 +116,8 @@ struct ChatRequest {
   bool parallel_tool_calls{true};
   ReasoningOptions reasoning;
   bool add_vision_id{false};
+  /// Target-model execution transform, independent of sampling/thinking.
+  bool abliteration{false};
   /// Bypass prompt reuse for this request; its completed state may be retained.
   bool cache_prompt{true};
   /// False keeps this request's checkpoints out of the disk cache; it may
@@ -317,6 +319,7 @@ public:
   }
   /// Whether the loaded backend accepts image inputs in chat requests.
   [[nodiscard]] virtual bool supports_images() const { return false; }
+  [[nodiscard]] virtual bool supports_abliteration() const { return false; }
   /// Whether sampled speculative verification applies
   /// SamplingConfig::typical_acceptance (Flash-Next with MTP loaded).
   [[nodiscard]] virtual bool supports_typical_acceptance() const {

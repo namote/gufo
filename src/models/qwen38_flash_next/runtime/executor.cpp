@@ -313,6 +313,47 @@ std::uint32_t Session::ReleaseKvReservation() noexcept {
   return unused;
 }
 
+void Session::ConfigureAbliteration(bool enabled) {
+  if (enabled && !owner_->Abliteration())
+    throw std::invalid_argument("abliteration profile is not loaded");
+  if (enabled == abliteration_enabled_)
+    return;
+  for (const auto& [key, graph] : graphs_)
+    (void)hipGraphExecDestroy(graph);
+  graphs_.clear();
+  warmed_.clear();
+  abliteration_enabled_ = enabled;
+}
+
+bool Executor::LoadAbliteration(
+    std::shared_ptr<const AbliterationProfile> profile, std::string* error) {
+  if (abliteration_ || !profile ||
+      profile->direction.size() != config().hidden_size) {
+    AssignError(error, "invalid or repeated abliteration profile load");
+    return false;
+  }
+  void* data = nullptr;
+  const auto bytes = profile->direction.size() * sizeof(float);
+  if (!Check(hip::AllocateDevice(&data, bytes), "abliteration direction",
+             error))
+    return false;
+  allocations_.push_back(data);
+  abliteration_direction_ = static_cast<float*>(data);
+  if (!Check(hipMemcpy(data, profile->direction.data(), bytes,
+                       hipMemcpyHostToDevice),
+             "abliteration direction upload", error))
+    return false;
+  abliteration_ = std::move(profile);
+  return true;
+}
+
+void Executor::ProjectAbliteration(float* output, std::uint32_t rows,
+                                   float weight) const {
+  if (weight != 0)
+    AbliterateRows(output, abliteration_direction_, weight, rows,
+                   config().hidden_size, stream_);
+}
+
 void Session::Reset(bool reuse_mtp) {
   if (kv_pool_) {
     const auto result = hipStreamSynchronize(owner_->stream());

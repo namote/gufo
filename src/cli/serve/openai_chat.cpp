@@ -913,6 +913,8 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
   } catch (const std::exception& error) {
     return Error(400, "Bad Request", error.what(), "invalid_response_format");
   }
+  if (auto error = ParseAbliterationControl(body, backend, &output->chat))
+    return error;
   output->chat.client_id = request.client_id;
   // As in llama-server, null keeps the default.
   if (const auto* cache_prompt = body.find("cache_prompt");
@@ -3375,6 +3377,33 @@ bool ParseOpenAiResponseMessage(const json::Value& item,
     converted["content"] = std::move(content);
   }
   return ParseMessage(converted, message, budget, error);
+}
+
+std::optional<HttpResponse> ParseAbliterationControl(
+    const json::Value& body, const TextGenerationBackend& backend,
+    ChatRequest* chat) {
+  const auto* value = body.find("abliteration");
+  if (!value)
+    return {};
+  const auto invalid = [](const std::string& reason) {
+    return Error(400, "Bad Request", reason, "invalid_abliteration");
+  };
+  if (!value->is_object())
+    return invalid("'abliteration' must be an object");
+  for (const auto& [key, ignored] : value->members())
+    if (key != "enabled" && key != "profile")
+      return invalid("unsupported abliteration member: " + key);
+  const auto* enabled = value->find("enabled");
+  if (!enabled || !enabled->is_bool())
+    return invalid("'abliteration.enabled' must be a boolean");
+  if (const auto* profile = value->find("profile");
+      profile && (!profile->is_string() || profile->str() != "default"))
+    return invalid("only abliteration profile 'default' is registered");
+  if (enabled->as_bool() && !backend.supports_abliteration())
+    return invalid(
+        "abliteration profile is not loaded or backend is unsupported");
+  chat->abliteration = enabled->as_bool();
+  return {};
 }
 
 std::optional<HttpResponse> ParseOpenAiResponseControls(const json::Value& body,

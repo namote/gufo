@@ -705,6 +705,7 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
                                   "reasoning",
                                   "reasoning_effort",
                                   "thinking",
+                                  "abliteration",
                                   "chat_template_kwargs",
                                   "previous_response_id",
                                   "conversation",
@@ -717,6 +718,8 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
         !(field == "ignore_eos" && allowances.ignore_eos) &&
         !(field == "logprobs" && allowances.logprobs) &&
         !(field == "thinking" && allowances.thinking) &&
+        !(field == "abliteration" &&
+          (allowances.response_controls || allowances.tools)) &&
         !(field == "output_config" && allowances.output_config) &&
         !((field == "tools" || field == "tool_choice") && allowances.tools) &&
         body.contains(field) &&
@@ -1108,6 +1111,8 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
 std::optional<HttpResponse> ReadOpenAiResponseChat(
     const json::Value& body, TextGenerationBackend& b, ChatRequest* chat,
     std::size_t* max_tokens, sampling::SamplingConfig* sampling_config) {
+  if (auto error = ParseAbliterationControl(body, b, chat))
+    return error;
   chat->reasoning = b.reasoning_defaults();
   if (auto error = ParseOpenAiResponseControls(body, chat))
     return error;
@@ -1272,6 +1277,8 @@ std::optional<HttpResponse> ReadMessagesOutputConfig(
 std::optional<HttpResponse> ReadAnthropicChat(
     const json::Value& body, TextGenerationBackend& b, ChatRequest* chat,
     std::size_t* max_tokens, sampling::SamplingConfig* sampling_config) {
+  if (auto error = ParseAbliterationControl(body, b, chat))
+    return error;
   chat->reasoning = b.reasoning_defaults();
   if (body.is_object()) {
     if (auto error = ReadThinking(body, &chat->reasoning))

@@ -21,6 +21,7 @@ add_qwen38_flash_next_test(exl3_reference gufo_qwen38_flash_next_reference "cpu;
 add_qwen38_flash_next_test(exl3_loader gufo_qwen38_flash_next "cpu;exl3")
 
 add_qwen38_flash_next_test(config gufo_qwen38_flash_next "cpu")
+add_qwen38_flash_next_test(abliteration gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(continuation_layout gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(ngram gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(native gufo_qwen38_flash_next "cpu;exl3")
@@ -38,6 +39,11 @@ target_link_libraries(qwen38_flash_next_reference_probe PRIVATE
 set_source_files_properties(reference_probe.cpp PROPERTIES COMPILE_OPTIONS "-O2")
 
 if (ENGINE_ENABLE_HIP)
+  add_executable(qwen38_flash_next_abliteration_collect EXCLUDE_FROM_ALL
+    ${PROJECT_SOURCE_DIR}/tools/qwen38_flash_next/abliteration/collect.cpp)
+  target_link_libraries(qwen38_flash_next_abliteration_collect PRIVATE gufo_qwen38_flash_next)
+  add_qwen38_flash_next_test(abliteration_ops gufo_qwen38_flash_next "hip;gpu")
+  set_source_files_properties(abliteration_ops_test.cpp PROPERTIES LANGUAGE HIP)
   add_executable(qwen38_flash_next_rq_logits_probe EXCLUDE_FROM_ALL rq_logits_probe.cpp)
   target_link_libraries(qwen38_flash_next_rq_logits_probe PRIVATE
     gufo_qwen38_flash_next hip::host)

@@ -88,7 +88,8 @@ public:
             const std::string& vision_model_path = {},
             TextRunnerRamCacheOptions ram_cache_config = {},
             bool enable_yarn = false,
-            std::optional<cli::KvCacheType> kv_cache_type = std::nullopt);
+            std::optional<cli::KvCacheType> kv_cache_type = std::nullopt,
+            const std::string& abliteration_profile = {});
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.
@@ -131,6 +132,7 @@ public:
   [[nodiscard]] bool ready() const override;
   [[nodiscard]] bool device_lost() const override;
   [[nodiscard]] bool supports_images() const override;
+  [[nodiscard]] bool supports_abliteration() const override;
   [[nodiscard]] bool supports_typical_acceptance() const override;
   [[nodiscard]] bool supports_han_scale() const override;
   [[nodiscard]] std::string model_path() const override;
