@@ -397,6 +397,11 @@ struct Uploader {
   }
 
   DeviceMixer Mixer(const HcMixer& m) {
+    // An absent mixer (a trunk layer's nextn_head) has no weights under any
+    // mode.
+    if (m.norm.empty() && m.down.empty() && m.up.empty() && m.inject.empty() &&
+        m.down_q8.empty() && m.up_q8.empty())
+      return {};
     if (m.down_q8.empty() != m.up_q8.empty()) {
       Fail("incomplete calibrated HC pair");
       return {};
