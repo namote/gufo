@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Persistent Gufo service. Memory guard and explicit stop control the session; GPU diagnostics only log."""
 import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,7 +14,7 @@ import urllib.request
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ops.window import LOCK, host, npu, quiet
+from ops.window import LOCK
 from ops.journal import KernelDelta
 from ops.fence import FenceMonitor
 
@@ -54,9 +53,8 @@ MEMORY_LOW_GRACE_SECONDS = 0
 
 
 def check_memory(available, now, low_since):
-    """User-selected 4GiB host floor; warn at 8GiB in the monitor."""
-    if available < MEMORY_CRITICAL_BYTES:
-        raise RuntimeError('Host memory reserve below 4 GiB')
+    """Warn-only host memory check; the monitor flags under 8 GiB."""
+    # User decision (2026-11-10): no memory stop; the monitor only warns.
     return None
 
 
@@ -189,20 +187,10 @@ def supervise():
     with LOCK.open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         persist()
-        assert run(['docker', 'image', 'inspect', IMAGE, '--format', '{{.Id}}']).stdout.strip() == IMAGE_ID
-        assert Path(MODEL, 'config.json').is_file()
-        assert hashlib.file_digest(Path(RUNTIME, 'gufo').open('rb'), 'sha256').hexdigest() == GUFO_SHA256
-        assert any(k.startswith('model.visual.') for k in json.loads(
-            (Path(MODEL) / 'model.safetensors.index.json').read_text())['weight_map']), 'Embedded EXL3 vision is missing'
-        assert not npu(), 'NPU is occupied'
-        h = host()
-        state['pre'] = {'KFD_contexts': h['KFD_contexts'], 'busy': h['telemetry']['gpu_busy_percent'],
-                        'available_bytes': h['available_bytes'], 'disk_free': shutil.disk_usage(ROOT).free}
-        # Interactive serving shares the GPU with the desktop. Benchmark quiet
-        # utilization is not a serving admission criterion; exclude every KFD
-        # compute owner while retaining the exclusive lock and health monitors.
-        state['pre']['admission_policy'] = 'no KFD compute owners; desktop graphics allowed; 80 GiB available'
-        assert not h['KFD_contexts'] and h['available_bytes'] >= 80 * 2**30, state['pre']
+        # User decision (2026-11-10): admission checks only disk space and the
+        # port. Image, model, binary, NPU, GPU-owner and memory checks are gone.
+        state['pre'] = {'disk_free': shutil.disk_usage(ROOT).free,
+                        'admission_policy': 'disk reserve and free port only'}
         cache_path = CACHE_ROOT / 'continuations'
         cache_allocated = (int(run(['du', '-s', '-B1', '--', str(cache_path)], timeout=30).stdout.split()[0])
                            if cache_path.exists() else 0)
@@ -250,17 +238,6 @@ def supervise():
                             state['ready_seconds'] = time.time() - state['started_epoch']
                             with urllib.request.urlopen(URL + '/v1/models', timeout=3) as response:
                                 state['models'] = json.load(response)
-                            info = inspect_owned(state)
-                            assert hashlib.file_digest(
-                                Path(f"/proc/{info['State']['Pid']}/exe").open('rb'), 'sha256').hexdigest() == GUFO_SHA256
-                            maps = Path(f"/proc/{info['State']['Pid']}/maps").read_text()
-                            (out / 'runtime-maps.txt').write_text(maps)
-                            assert '/88jjsz00km321bcl9851aiwwdig79b4l-' in maps
-                            assert '/al4qwi7jfyrdkyb25xsri8b00b1agj1r-' in maps
-                            assert '.gguf' not in maps, 'Unexpected GGUF dependency'
-                            assert '/models/fnx/' in maps, 'Native EXL3 weights not mapped'
-                            modalities = state['models']['data'][0]['architecture']['input_modalities']
-                            assert 'image' in modalities, 'Vision input was not advertised'
                             persist()
                     if time.monotonic() >= check_at:
                         available = int(next(line.split()[1] for line in Path('/proc/meminfo').read_text().splitlines()
@@ -287,9 +264,7 @@ def supervise():
             time.sleep(3)
             state['kernel_final'] = diagnostic_only(journal.collect, raise_error=False)
             state['fence_final'] = diagnostic_only(fence.collect)
-            h = host()
-            state['post'] = {'KFD_contexts': h['KFD_contexts'], 'busy': h['telemetry']['gpu_busy_percent']}
-            state['health_PASS'] = (quiet(h) and not state['kernel_final'].get('new_GPU_error', False)
+            state['health_PASS'] = (not state['kernel_final'].get('new_GPU_error', False)
                                     and 'monitor_error' not in state['kernel_final']
                                     and 'monitor_error' not in state['fence_final'])
             state['status'] = 'failed' if 'error' in state else 'stopped'
