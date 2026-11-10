@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstring>
 #include <mutex>
 #include <optional>
@@ -40,8 +41,15 @@ struct Metadata {
   NgramHistory ngram;
   MtpLengthState policy;
   speculative::PromptLookup<>::State lookup;
+  /// Raw image identity OFF; salted with the profile identity ON.
   std::array<std::uint8_t, 32> image{};
+  /// AbliterationContinuationRecord::mode. Appended in the four bytes that
+  /// every earlier capture zero-filled, so OFF (0) entries keep their bytes.
+  std::uint32_t abliteration{};
 };
+static_assert(offsetof(Metadata, abliteration) == 156 &&
+              offsetof(Metadata, abliteration) ==
+                  offsetof(Metadata, image) + sizeof(Metadata::image));
 static_assert(sizeof(Metadata) <= kContinuationMetadataBytes);
 using Coverage = std::vector<std::pair<std::size_t, std::size_t>>;
 bool Covered(Coverage ranges, std::size_t end) {
@@ -751,11 +759,12 @@ cache::Completion ContinuationAdapter::CapturePrivatePiece(
     metadata.lookup = session.lookup_.Save();
     const auto identity = session.ImageIdentity(native.position_);
     metadata.image_bytes = static_cast<std::uint32_t>(identity.size());
-    if (!identity.empty()) {
-      if (identity.size() != metadata.image.size())
-        throw std::logic_error("invalid Flash-Next image identity");
-      std::ranges::copy(identity, metadata.image.begin());
-    }
+    // The captured state's own mode: a prefill checkpoint view copies it.
+    const auto record = RecordAbliterationContinuation(
+        identity,
+        native.AbliterationEnabled() ? model_->Abliteration() : nullptr);
+    metadata.image = record.image;
+    metadata.abliteration = record.mode;
     std::memcpy(host_metadata.data(), &metadata, sizeof(metadata));
   }
   auto region = PrivateRegion(state, component, false);
@@ -1141,8 +1150,10 @@ bool ContinuationAdapter::Validate(
                           metadata.draft_blocks) != state.expected)
       return refuse();
     const auto identity = session.ImageIdentity(metadata.target);
-    if (metadata.image_bytes && (identity.size() != 32 ||
-                                 !std::ranges::equal(identity, metadata.image)))
+    // A mode or profile other than the session's is a cache miss.
+    if (!AbliterationContinuationMatches(
+            metadata.abliteration, metadata.image_bytes, metadata.image,
+            identity, session.ActiveAbliteration()))
       return refuse();
     if (metadata.image_bytes || (session.image_prompt_ && identity.empty())) {
       // Preserve the attached request's future images as well as its matching

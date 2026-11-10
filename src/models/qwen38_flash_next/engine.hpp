@@ -70,8 +70,8 @@ struct ModelOptions {
   /// FP16.
   bool kvarn = false;
   int kvarn_bits = 4;
-  /// Empty discovers <model>/abliteration/default.json; loading never enables
-  /// it.
+  /// `--abliteration-profile`. Empty loads none: nothing is discovered beside
+  /// the model. Loading never enables it.
   std::string abliteration_profile;
 };
 
@@ -277,6 +277,8 @@ public:
   [[nodiscard]] MemoryUsage Memory() const noexcept;
   void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt);
   void ConfigureAbliteration(bool enabled);
+  /// The model's profile while this session has abliteration ON, else null.
+  [[nodiscard]] const AbliterationProfile* ActiveAbliteration() const;
   [[nodiscard]] std::vector<std::uint8_t> ContinuationIdentity(
       std::size_t tokens) const;
   using ActivationObserver =

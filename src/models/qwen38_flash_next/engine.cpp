@@ -5,7 +5,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
-#include <filesystem>
 #include <future>
 #include <limits>
 #include <optional>
@@ -229,24 +228,13 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     return nullptr;
   }
   try {
-    auto profile_path = std::filesystem::path(options.abliteration_profile);
-    if (profile_path.empty()) {
-      const auto directory =
-          std::filesystem::is_directory(model_path)
-              ? std::filesystem::path(model_path)
-              : std::filesystem::path(model_path).parent_path();
-      const auto bundled = directory / "abliteration/default.json";
-      if (std::filesystem::exists(bundled))
-        profile_path = bundled;
-    }
-    if (!profile_path.empty()) {
-      const auto& c = m->config();
-      auto profile = std::make_shared<AbliterationProfile>(
-          AbliterationProfile::Load(profile_path, c.hidden_size, c.num_layers,
-                                    m->ArtifactIdentity()));
-      if (!m->executor_->LoadAbliteration(std::move(profile), error_msg))
-        return nullptr;
-    }
+    const auto& c = m->config();
+    if (auto profile =
+            LoadAbliterationOption(options.abliteration_profile, c.hidden_size,
+                                   c.num_layers, m->ArtifactIdentity());
+        profile &&
+        !m->executor_->LoadAbliteration(std::move(profile), error_msg))
+      return nullptr;
     qwen::ValidateNativeSources(*m->reader_);
     if (m->mtp_reader_)
       qwen::ValidateNativeSources(*m->mtp_reader_);
@@ -546,13 +534,16 @@ std::span<const std::uint8_t> Session::ImageIdentity(
                        : std::span<const std::uint8_t>{};
 }
 
+const AbliterationProfile* Session::ActiveAbliteration() const {
+  return session_->AbliterationEnabled() ? model_->Abliteration() : nullptr;
+}
+
 std::vector<std::uint8_t> Session::ContinuationIdentity(
     std::size_t tokens) const {
   const auto image = ImageIdentity(tokens);
-  return session_->AbliterationEnabled()
-             ? AbliterationInputIdentity(image,
-                                         model_->Abliteration()->identity)
-             : std::vector<std::uint8_t>(image.begin(), image.end());
+  const auto* profile = ActiveAbliteration();
+  return profile ? AbliterationInputIdentity(image, profile->identity)
+                 : std::vector<std::uint8_t>(image.begin(), image.end());
 }
 
 std::uint32_t Session::KeptHiddenRows() const noexcept {

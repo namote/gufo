@@ -13,9 +13,10 @@ This is a reversible inference intervention, not a weight conversion.
   session owns its ON/OFF state. There is no server-global mutable toggle.
 - The hook acts on the attention/GDN output projection and the **aggregated**
   routed-plus-shared MoE output, immediately before HC/residual injection.
-  It does not project the accumulated residual, attention probabilities, logits,
-  or every expert separately. MTP drafts remain unchanged; target verification
-  uses the selected intervention.
+  It does not project the accumulated residual, per-layer embedding (PLE)
+  contributions (injected into the residual directly), attention
+  probabilities, logits, or every expert separately. MTP drafts remain
+  unchanged; target verification uses the selected intervention.
 - A zero layer strength launches no projection. With all sessions OFF, no
   projection kernel launches. With mixed sessions, one masked kernel covers
   up to eight sessions at each selected boundary. It updates the existing
@@ -26,7 +27,12 @@ This is a reversible inference intervention, not a weight conversion.
 - Mode changes invalidate session execution graphs and resident token history.
   Profile identity salts text and every image-prefix cache identity. Matching
   mode caches can be reused; ON/OFF or different profiles cannot share states.
-  Engine snapshots also check the mode and identity.
+  Two independent guards also check each restored state. Component-cache
+  continuation metadata records the mode and, ON, the image identity salted
+  with the full profile identity; a mismatch is a cache miss. Engine
+  snapshots record the mode in their header and the salted identity likewise.
+  OFF records mode 0 in bytes every earlier capture zero-filled, so existing
+  OFF caches remain valid byte for byte.
 
 The GPU operation is `y -= strength * direction * dot(direction, y)` with an
 FP32 reduction and unit direction. The file carries separate per-layer attention
@@ -43,10 +49,10 @@ incompatible dimensions and oversized files are rejected. Candidate provenance
 can be stored as additional fields. Structural loading does not certify quality.
 
 Load a chosen file with `gufo serve llm ... --abliteration-profile /path/profile.json`.
-Alternatively the model loader discovers `abliteration/default.json` under the
-model directory (beside the artifact for GGUF). Loading never enables it by
-itself. A cache directory can be used with the explicit path option. Do not copy
-an unqualified candidate into the default location.
+This option is the only way to load one: nothing beside the model (such as an
+`abliteration/` directory) is discovered, so a file in a shared models
+directory never makes the control available to clients or affects other
+models. Loading never enables it by itself.
 
 Supported chat-style requests (Chat Completions, Responses, Messages):
 

@@ -1,5 +1,6 @@
 #include "src/models/qwen38_flash_next/abliteration.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <iterator>
@@ -73,5 +74,46 @@ std::vector<std::uint8_t> AbliterationInputIdentity(
   hash.Update(input);
   const auto digest = hash.Finish();
   return {digest.begin(), digest.end()};
+}
+
+std::shared_ptr<const AbliterationProfile> LoadAbliterationOption(
+    const std::string& option, std::uint32_t hidden, std::uint32_t layers,
+    std::string_view model_identity) {
+  if (option.empty())
+    return nullptr;
+  return std::make_shared<const AbliterationProfile>(
+      AbliterationProfile::Load(option, hidden, layers, model_identity));
+}
+
+AbliterationContinuationRecord RecordAbliterationContinuation(
+    std::span<const std::uint8_t> image, const AbliterationProfile* active) {
+  AbliterationContinuationRecord record;
+  if (!image.empty() && image.size() != record.image.size())
+    throw std::logic_error("invalid Flash-Next image identity");
+  if (!active) {
+    std::ranges::copy(image, record.image.begin());
+    return record;
+  }
+  record.mode = AbliterationContinuationRecord::kOn;
+  const auto salted = AbliterationInputIdentity(image, active->identity);
+  std::ranges::copy(salted, record.image.begin());
+  return record;
+}
+
+bool AbliterationContinuationMatches(std::uint32_t mode,
+                                     std::uint32_t image_bytes,
+                                     std::span<const std::uint8_t, 32> recorded,
+                                     std::span<const std::uint8_t> image,
+                                     const AbliterationProfile* active) {
+  if (!active) {
+    // The unchanged OFF contract: an imageless entry checks no identity.
+    return mode == AbliterationContinuationRecord::kOff &&
+           (image_bytes == 0 || (image.size() == recorded.size() &&
+                                 std::ranges::equal(image, recorded)));
+  }
+  return mode == AbliterationContinuationRecord::kOn &&
+         image_bytes == image.size() &&
+         std::ranges::equal(AbliterationInputIdentity(image, active->identity),
+                            recorded);
 }
 }  // namespace gufo::models::qwen38_flash_next
