@@ -1759,6 +1759,30 @@ void TestModelSamplingDefaults() {
              config.top_k == 40,
          "Explicit request zero overrides server and model presets");
   {
+    // The Han scale scope: request names, null inherits, presets keep the
+    // server default, and other spellings are rejected.
+    using gufo::sampling::HanScaleScope;
+    config = send(R"(,"han_scale_scope":"answer")");
+    Expect(config.han_scale_scope == HanScaleScope::kAnswer,
+           "A request selects the answer scope");
+    backend.defaults.sampling.han_scale_scope = HanScaleScope::kAnswer;
+    config = send(R"(,"han_scale_scope":null)");
+    Expect(config.han_scale_scope == HanScaleScope::kAnswer,
+           "A null scope inherits the server default through presets");
+    config = send(R"(,"han_scale_scope":"all")");
+    Expect(config.han_scale_scope == HanScaleScope::kAll,
+           "A request overrides the server scope");
+    backend.defaults.sampling.han_scale_scope = HanScaleScope::kAll;
+    const auto response = gufo::server::HandleOpenAiChat(
+        Request(R"({"model":"test-model","messages":[{"role":"user",)"
+                R"("content":"hello"}],"han_scale_scope":"thinking"})"),
+        backend);
+    Expect(
+        response.status == 400 &&
+            response.body.find("invalid_han_scale_scope") != std::string::npos,
+        "An unknown scope is rejected");
+  }
+  {
     // The removed typical acceptance field is an unknown field: ignored.
     const auto response = gufo::server::HandleOpenAiChat(
         Request(R"({"model":"test-model","messages":[{"role":"user",)"

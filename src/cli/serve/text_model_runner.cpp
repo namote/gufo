@@ -811,6 +811,9 @@ TextModelRunner::BuildReasoningBudget(
       std::ranges::find(prompt.rbegin(), prompt.rend(), start.front());
   if (opened != prompt.rend())
     budget->prompt.assign(opened.base(), prompt.end());
+  // A phase-only budget never forces, so it needs no UTF-8 table.
+  if (tokens == sampling::ReasoningBudget::kUnlimited)
+    return budget;
   const std::lock_guard lock(constraint_mutex_);
   if (!partial_utf8_ && VocabularySize() != 0) {
     auto partial = std::make_shared<std::vector<bool>>(VocabularySize());

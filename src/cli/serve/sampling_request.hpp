@@ -309,6 +309,20 @@ inline std::optional<SamplingRequestError> ParseSamplingConfig(
         .code = "invalid_han_scale",
     };
   }
+  // Gufo extension: where the Han scale applies; null inherits.
+  if (const auto* scope = body.find("han_scale_scope");
+      scope != nullptr && !scope->is_null()) {
+    const auto parsed = scope->is_string()
+                            ? sampling::ParseHanScaleScope(scope->str())
+                            : std::nullopt;
+    if (!parsed) {
+      return SamplingRequestError{
+          .message = "'han_scale_scope' must be \"all\" or \"answer\"",
+          .code = "invalid_han_scale_scope",
+      };
+    }
+    output->han_scale_scope = *parsed;
+  }
 
   // Check the original JSON number, not the narrowed float: 1.00000001 must
   // not round into the permitted top-p range. Native sampler controls may

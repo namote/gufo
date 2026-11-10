@@ -2,6 +2,7 @@
 #define GUFO_CLI_SAMPLING_OPTIONS_HPP_
 
 #include <stdexcept>
+#include <string>
 #include <string_view>
 
 #include "src/cli/arg_parser.hpp"
@@ -95,8 +96,8 @@ inline void RegisterSamplingOptions(ArgParser& parser,
       group, &config->presence_penalty);
 }
 
-/// The serve-only Han-script scale. It needs a model's Han token set, which
-/// only the Qwen server runners build (SamplingConfig::han_tokens).
+/// The serve-only Han-script scale and its scope. It needs a model's Han token
+/// set, which only the Qwen server runners build (SamplingConfig::han_tokens).
 inline void RegisterHanScaleOption(ArgParser& parser,
                                    sampling::SamplingConfig* config,
                                    std::string_view group = "Sampling") {
@@ -108,6 +109,23 @@ inline void RegisterHanScaleOption(ArgParser& parser,
       "Multiply the probability of tokens that write CJK ideographs (Han) "
       "by X in (0, 1]; Qwen 27B and Flash-Next (default: 1.0 = disabled)",
       group, &config->han_scale);
+  parser.AddCustomOption(
+      "", "--han-scale-scope", "SCOPE",
+      "Where --han-scale applies: all (every token) or answer (none while "
+      "the reply reasons, before </think>) (default: all)",
+      group,
+      [config](std::string_view flag, std::string_view value,
+               std::string* error) {
+        const auto scope = sampling::ParseHanScaleScope(value);
+        if (!scope) {
+          if (error != nullptr)
+            *error = "Invalid value for " + std::string(flag) + ": " +
+                     std::string(value) + " (expected all or answer)";
+          return false;
+        }
+        config->han_scale_scope = *scope;
+        return true;
+      });
 }
 
 }  // namespace gufo::cli

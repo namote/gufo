@@ -551,6 +551,9 @@ void TestLlamaProps() {
   assert(params->find("n_predict")->as_double() == -1.0);
   assert(params->find("max_tokens")->as_double() == -1.0);
   assert(!params->contains("typical_acceptance"));
+  // The Han scale and its scope where the backend never applies them.
+  assert(params->find("han_scale")->as_double() == 1.0);
+  assert(params->member_str("han_scale_scope") == "all");
   assert(!bare.find("modalities")->find("vision")->as_bool(true));
 
   server.backend->served_path = "/models/model-00001-of-00002.gguf";
@@ -1152,6 +1155,20 @@ void TestCompatibilityRequests() {
                                : "invalid_prompt") != std::string::npos);
     }
     server.backend->failure = 0;
+    assert(last.sampling.han_scale_scope ==
+           gufo::sampling::HanScaleScope::kAll);
+    {
+      // The Gufo han_scale_scope field: a scope name, or null to inherit.
+      auto scoped = body;
+      scoped["han_scale_scope"] = "answer";
+      response_body(server.Post(endpoint.path, scoped.dump()));
+      assert(server.backend->LastCall().sampling.han_scale_scope ==
+             gufo::sampling::HanScaleScope::kAnswer);
+      scoped["han_scale_scope"] = gufo::json::Value();
+      response_body(server.Post(endpoint.path, scoped.dump()));
+      assert(server.backend->LastCall().sampling.han_scale_scope ==
+             gufo::sampling::HanScaleScope::kAll);
+    }
     assert(last.client_id == "127.0.0.1");
     assert(last.max_tokens == 1 && last.sampling.temperature == 0.6F &&
            last.sampling.top_k == 40 && last.sampling.top_p == 0.9F &&
@@ -1180,6 +1197,13 @@ void TestCompatibilityRequests() {
       auto invalid = body;
       invalid[field] = value;
       ExpectStatus(server.Post(endpoint.path, invalid.dump()), 400);
+    }
+    for (const auto value : {"\"thinking\"", "\"Answer\"", "1", "true"}) {
+      auto invalid = body;
+      invalid["han_scale_scope"] = parse(value);
+      const auto rejected = server.Post(endpoint.path, invalid.dump());
+      ExpectStatus(rejected, 400);
+      assert(rejected.find("invalid_han_scale_scope") != std::string::npos);
     }
     for (const auto value : {"0", "-1", "1.5", "1e100", "\"1\"", "null"}) {
       auto invalid = body;

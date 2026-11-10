@@ -1061,6 +1061,22 @@ Qwen 27B and Qwen3.8-Flash-Next apply it; other models ignore it, and the
 option logs a warning there. The loader logs `event=han_tokens_prepared` with
 the vocabulary's Han token count.
 
+`--han-scale-scope SCOPE` and the request field `han_scale_scope` (a Gufo
+extension; `null` inherits) choose where the scale applies: `all` (the
+default) offsets every generated token, `answer` none while the reply is
+still in its reasoning phase and `ln(X)` from the token after reasoning ends.
+Reasoning ends where a reasoning budget would stop counting: at Qwen's
+`</think>` or `<tool_call>` token, at a forced budget end, or where a tool or
+response-format grammar leaves its reasoning phase (a close spelled as text).
+Only Chat, Responses and Messages requests that start in their reasoning phase
+(thinking on) have one; a reply without reasoning, and a `/completion` prompt,
+are all answer. Speculative decoding applies the offset of each position:
+when a draft contains the reasoning end, the rows after it are verified, and
+Flash-Next MTP and 27B DFlash drafts ranked, with the answer offset, so
+outputs follow the scoped distribution exactly. The scope changes sampling
+only, never cached KV state. Traces record the applied scope: `all` for a
+request without a tracked reasoning phase.
+
 Tool calls are emitted only for declared functions when `tool_choice` allows
 calling tools. With `auto`, ordinary text and reasoning remain allowed; once a
 call starts, decoding constrains its name and argument format. As in llama.cpp,
@@ -1513,7 +1529,8 @@ the version and revision `gufo --version` prints, `total_slots` the
 and `default_generation_settings.params` the sampling a request without
 sampling fields gets, with `n_predict` and `max_tokens` -1 when no default
 limit is set.
-Its Gufo `han_scale` is the default Han scale, 1 on models that ignore it.
+Its Gufo `han_scale` is the default Han scale, 1 on models that ignore it,
+and `han_scale_scope` its default scope, `all` on those models.
 `modalities.vision` is true only when a vision encoder
 loaded. Gufo's `abliteration` object is present only with a loaded
 [runtime abliteration](#runtime-abliteration) profile. Gufo's `hc_mode` is

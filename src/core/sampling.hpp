@@ -3,9 +3,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -35,6 +37,10 @@ struct TokenSet {
 /// constraint grammar leaving its reasoning phase. Later tokens are answer
 /// content, including literal reasoning tags, as in Gufo's response framing.
 struct ReasoningBudget {
+  /// A budget of this many tokens never runs out: it only tracks the
+  /// reasoning phase (the Han scale's answer scope) and never forces.
+  static constexpr std::size_t kUnlimited =
+      std::numeric_limits<std::size_t>::max();
   std::size_t tokens{0};
   std::vector<TokenId> forced;
   std::vector<TokenId> ends;
@@ -42,6 +48,16 @@ struct ReasoningBudget {
   /// Indexed by token: its text ends inside a UTF-8 character.
   std::shared_ptr<const std::vector<bool>> partial_utf8;
 };
+
+/// Where the Han scale applies (serve --han-scale-scope, request
+/// han_scale_scope): every sampled token, or only tokens after the reply's
+/// reasoning phase ends.
+enum class HanScaleScope : std::uint8_t { kAll, kAnswer };
+
+/// "all" or "answer"; nullopt for any other spelling.
+[[nodiscard]] std::optional<HanScaleScope> ParseHanScaleScope(
+    std::string_view text) noexcept;
+[[nodiscard]] std::string_view HanScaleScopeName(HanScaleScope scope) noexcept;
 
 /// Model-independent controls for selecting a token from a logit row.
 ///
@@ -62,7 +78,9 @@ struct SamplingConfig {
   float frequency_penalty{0.0F};
   float presence_penalty{0.0F};
   std::shared_ptr<const TokenConstraint> constraint;
-  /// Set only for requests that start in their reasoning phase.
+  /// Set only for requests that start in their reasoning phase: a token
+  /// budget, or an unlimited one (ReasoningBudget::kUnlimited) that only
+  /// tracks the phase for han_scale_scope kAnswer.
   std::shared_ptr<const ReasoningBudget> reasoning_budget;
   /// Han-script probability scale in (0, 1] (serve --han-scale, request
   /// han_scale); 1 disables it. Every token in han_tokens has
@@ -75,11 +93,16 @@ struct SamplingConfig {
   /// The model's Han tokens (src/core/han_script.hpp). A null set leaves
   /// han_scale inactive: models whose samplers do not apply it get none.
   std::shared_ptr<const TokenSet> han_tokens{};
+  /// kAnswer applies no Han offset while the reply is in its reasoning
+  /// phase (SamplerState::han_bias). That phase is tracked only when
+  /// reasoning_budget is set; without it the whole reply is the answer.
+  HanScaleScope han_scale_scope{HanScaleScope::kAll};
 
   void Validate() const;
 
-  /// The logit offset of a Han token: ln(han_scale), or zero when the scale
-  /// is inactive. Never positive.
+  /// The logit offset of a Han token in the answer: ln(han_scale), or zero
+  /// when the scale is inactive. Never positive. SamplerState::han_bias is
+  /// the offset at the sampler's position, which han_scale_scope can zero.
   [[nodiscard]] double han_bias() const noexcept;
   /// True when penalties or the Han scale adjust logits before filtering.
   /// Fast paths that take an unmodified argmax or skip the adjustment must
@@ -165,7 +188,12 @@ public:
 
   [[nodiscard]] const SamplingConfig& config() const noexcept;
   /// Draft q may remain unconstrained; target p always uses this request's
-  /// grammar.
+  /// grammar. While a scoped Han offset depends on the reasoning phase, the
+  /// copy keeps following the grammar's end of reasoning (a close spelled
+  /// as text), so each tentative row's offset matches the target's; a
+  /// token the grammar rejects ends that tracking in the copy. Once the
+  /// copy's reasoning ends it drops the grammar, so ResetHistory on such a
+  /// copy tracks only end tokens.
   [[nodiscard]] SamplerState WithoutConstraint() const;
   /// A finite argmax can bypass downloading logits if it satisfies the grammar.
   /// Set penalties_applied only for a winner computed with this state's exact
@@ -182,6 +210,17 @@ public:
   [[nodiscard]] std::optional<TokenId> ForcedToken() const noexcept;
   [[nodiscard]] std::span<const TokenPenalty> penalties() const noexcept {
     return penalty_counts_;
+  }
+  /// Whether the next token is still in the reply's reasoning phase. Always
+  /// false without SamplingConfig::reasoning_budget.
+  [[nodiscard]] bool InReasoning() const noexcept {
+    return reasoning_phase_ != ReasoningPhase::kOff;
+  }
+  /// The Han offset of the next token: config().han_bias(), or zero while
+  /// reasoning when han_scale_scope is kAnswer. Every sampling path and
+  /// each GPU row uses the value of the state that samples it.
+  [[nodiscard]] double han_bias() const noexcept {
+    return reasoning_scoped_ && InReasoning() ? 0 : han_bias_;
   }
   [[nodiscard]] std::uint64_t rng_state() const noexcept;
   [[nodiscard]] std::uint64_t* mutable_rng_state() noexcept;
@@ -248,6 +287,11 @@ private:
 
   SamplingConfig config_;
   double han_bias_{0};  ///< config_.han_bias(), fixed with config_
+  /// han_bias_ != 0 and han_scale_scope kAnswer: reasoning zeroes the offset.
+  bool reasoning_scoped_{false};
+  /// A WithoutConstraint copy's grammar, kept only to end its reasoning
+  /// phase as the target does; constraint_state_ is then its state.
+  std::shared_ptr<const TokenConstraint> reasoning_grammar_;
   JsonConstraint::State constraint_state_;
   mutable std::shared_ptr<const std::vector<std::uint8_t>> constraint_mask_;
   mutable bool constraint_restricts_{false};

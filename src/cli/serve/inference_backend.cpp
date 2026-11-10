@@ -298,6 +298,23 @@ std::shared_ptr<const sampling::TokenSet> PrepareHanTokens(
   return set;
 }
 
+// The reasoning phase a request that starts reasoning tracks: its token
+// budget, or, when only the Han scale's answer scope needs that phase, an
+// unlimited budget that marks where reasoning ends and never forces.
+std::shared_ptr<const sampling::ReasoningBudget> RequestReasoning(
+    const ChatRequest& request, const sampling::SamplingConfig& sampling,
+    const std::shared_ptr<const sampling::TokenSet>& han_tokens,
+    const TextModelRunner& runner, std::span<const TextRunnerToken> prompt) {
+  if (request.reasoning.budget_tokens)
+    return runner.BuildReasoningBudget(*request.reasoning.budget_tokens,
+                                       prompt);
+  if (sampling.han_scale_scope == sampling::HanScaleScope::kAnswer &&
+      sampling.han_scale != 1.0F && han_tokens && han_tokens->count != 0)
+    return runner.BuildReasoningBudget(sampling::ReasoningBudget::kUnlimited,
+                                       prompt);
+  return nullptr;
+}
+
 // Hash the sidecar and upload its weights while the model loads, before the
 // runner claims state capacity and the RAM cache is sized. Otherwise the first
 // image request hashes the whole sidecar in its queue time and uploads the
@@ -4453,11 +4470,10 @@ InferenceBackend::Result InferenceBackend::chat(
   }
   const auto initial =
       state->scheduler->runner().InitialOutputState(effective_request);
-  if (request.reasoning.budget_tokens &&
-      initial == TextGenerationBackend::InitialOutputState::kReasoning)
+  if (initial == TextGenerationBackend::InitialOutputState::kReasoning)
     effective_sampling.reasoning_budget =
-        state->scheduler->runner().BuildReasoningBudget(
-            *request.reasoning.budget_tokens, prompt->tokens);
+        RequestReasoning(request, effective_sampling, state->han_tokens,
+                         state->scheduler->runner(), prompt->tokens);
   const std::size_t system_prefix_tokens =
       request.cache_prompt ? prompt->system_prefix_tokens : 0;
   return impl_->GenerateScheduled(
@@ -4547,11 +4563,10 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
 
   const auto initial =
       state->scheduler->runner().InitialOutputState(effective_request);
-  if (request.reasoning.budget_tokens &&
-      initial == TextGenerationBackend::InitialOutputState::kReasoning)
+  if (initial == TextGenerationBackend::InitialOutputState::kReasoning)
     effective_sampling.reasoning_budget =
-        state->scheduler->runner().BuildReasoningBudget(
-            *request.reasoning.budget_tokens, prompt->tokens);
+        RequestReasoning(request, effective_sampling, state->han_tokens,
+                         state->scheduler->runner(), prompt->tokens);
   const std::string client_id =
       request.client_id.empty() ? "anonymous" : request.client_id;
   // Before Submit moves the tokens: argument evaluation order is unspecified.

@@ -1538,6 +1538,10 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
   // Gufo extension: the default Han-script scale; 1 where it never applies.
   params["han_scale"] =
       static_cast<double>(b.supports_han_scale() ? sampling.han_scale : 1.0F);
+  // Gufo extension: where that scale applies; "all" where it never applies.
+  params["han_scale_scope"] = std::string(gufo::sampling::HanScaleScopeName(
+      b.supports_han_scale() ? sampling.han_scale_scope
+                             : gufo::sampling::HanScaleScope::kAll));
   // -1 means no default limit, as in llama-server, which reports both keys.
   const auto n_predict = defaults.max_tokens > 0
                              ? static_cast<std::int64_t>(defaults.max_tokens)

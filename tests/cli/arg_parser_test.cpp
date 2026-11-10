@@ -117,6 +117,27 @@ void TestNoTypicalAcceptanceOption() {
   assert(parser.FormatHelp().find("typical") == std::string::npos);
 }
 
+// --han-scale-scope takes all or answer; all is the default.
+void TestHanScaleScopeOption() {
+  using gufo::sampling::HanScaleScope;
+  gufo::cli::ArgParser parser("test_serve");
+  gufo::sampling::SamplingConfig config;
+  gufo::cli::RegisterHanScaleOption(parser, &config);
+  std::string error;
+  assert(config.han_scale_scope == HanScaleScope::kAll);
+  const char* answer[] = {"--han-scale", "0.2", "--han-scale-scope", "answer"};
+  assert(parser.Parse(answer, &error));
+  assert(config.han_scale == 0.2F &&
+         config.han_scale_scope == HanScaleScope::kAnswer);
+  const char* all[] = {"--han-scale-scope=all"};
+  assert(parser.Parse(all, &error));
+  assert(config.han_scale_scope == HanScaleScope::kAll);
+  const char* bad[] = {"--han-scale-scope", "thinking"};
+  assert(!parser.Parse(bad, &error));
+  assert(error.find("--han-scale-scope") != std::string::npos);
+  assert(parser.FormatHelp().find("--han-scale-scope") != std::string::npos);
+}
+
 int main() {
   TestBasicFlagsAndOptions();
   TestListParsing();
@@ -124,6 +145,7 @@ int main() {
   TestHelpFormatting();
   TestUnexpectedPositionalsAndParserReuse();
   TestNoTypicalAcceptanceOption();
+  TestHanScaleScopeOption();
   std::cout << "All ArgParser tests passed.\n";
   return 0;
 }

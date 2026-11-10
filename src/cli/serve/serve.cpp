@@ -1626,8 +1626,12 @@ int RunServe(std::span<const char* const> args) {
         << " frequency_penalty=" << effective_sampling.frequency_penalty
         << " presence_penalty=" << effective_sampling.presence_penalty
         << " han_scale="
-        << (backend->supports_han_scale() ? effective_sampling.han_scale
-                                          : 1.0F);
+        << (backend->supports_han_scale() ? effective_sampling.han_scale : 1.0F)
+        << " han_scale_scope="
+        << gufo::sampling::HanScaleScopeName(
+               backend->supports_han_scale()
+                   ? effective_sampling.han_scale_scope
+                   : gufo::sampling::HanScaleScope::kAll);
     server::Logger::Info("sampling", sampling_log.str());
     if (sampling_config.han_scale != 1.0F && !backend->supports_han_scale()) {
       server::Logger::Warn(

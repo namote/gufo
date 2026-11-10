@@ -276,6 +276,192 @@ void TestReasoningBudgetFollowsGrammarEnd() {
          "a native call header ends the budget too, got " + called);
 }
 
+// Bitwise equality of two distributions: same tokens, same FP64 values.
+bool SameDistribution(const gufo::sampling::SamplingDistribution& a,
+                      const gufo::sampling::SamplingDistribution& b) {
+  if (a.entries().size() != b.entries().size())
+    return false;
+  for (std::size_t i = 0; i < a.entries().size(); ++i)
+    if (a.entries()[i].token != b.entries()[i].token ||
+        std::bit_cast<std::uint64_t>(a.entries()[i].value) !=
+            std::bit_cast<std::uint64_t>(b.entries()[i].value))
+      return false;
+  return true;
+}
+
+// The Han scale's scope. Token 1 is Han and token 3 stands for </think>.
+void TestHanScaleScope() {
+  using gufo::sampling::HanScaleScope;
+  using gufo::sampling::ParseHanScaleScope;
+  Expect(ParseHanScaleScope("all") == HanScaleScope::kAll &&
+             ParseHanScaleScope("answer") == HanScaleScope::kAnswer &&
+             !ParseHanScaleScope("Answer") && !ParseHanScaleScope("") &&
+             !ParseHanScaleScope("thinking"),
+         "only all and answer name a scope");
+  Expect(
+      gufo::sampling::HanScaleScopeName(HanScaleScope::kAll) == "all" &&
+          gufo::sampling::HanScaleScopeName(HanScaleScope::kAnswer) == "answer",
+      "scope names round-trip");
+  Expect(SamplingConfig{}.han_scale_scope == HanScaleScope::kAll,
+         "the default scope is all");
+
+  auto han = std::make_shared<gufo::sampling::TokenSet>();
+  han->words = {1U << 1U};
+  han->count = 1;
+  // Token 1 (Han) leads token 0 by 0.5 nats; ln 0.5 = -0.69 reverses them.
+  const std::vector<float> logits{1.0F, 1.5F, -1.0F, 0.0F, 0.2F, 0, 0, 0};
+  const auto config = [&](float temperature, HanScaleScope scope,
+                          std::shared_ptr<const ReasoningBudget> budget) {
+    SamplingConfig result;
+    result.temperature = temperature;
+    result.han_scale = 0.5F;
+    result.han_tokens = han;
+    result.han_scale_scope = scope;
+    result.reasoning_budget = std::move(budget);
+    return result;
+  };
+  const auto unlimited = Budget(ReasoningBudget::kUnlimited);
+  const double answer = std::log(0.5);
+
+  for (const float temperature : {0.0F, 0.8F}) {
+    // scope all: the offset ignores the phase, exactly as without a scope.
+    SamplerState plain(config(temperature, HanScaleScope::kAll, nullptr));
+    SamplerState all(config(temperature, HanScaleScope::kAll, Budget(100)));
+    Expect(all.InReasoning() && all.han_bias() == answer &&
+               plain.han_bias() == answer,
+           "scope all offsets reasoning tokens");
+    Expect(
+        SameDistribution(all.Distribution(logits), plain.Distribution(logits)),
+        "scope all reasoning matches the unscoped distribution bit for bit");
+    Expect(all.WithoutConstraint().han_bias() == answer,
+           "scope all tentative copies keep the offset");
+
+    // scope answer: no offset before </think>, ln x after it.
+    auto unscaled_config = config(temperature, HanScaleScope::kAll, nullptr);
+    unscaled_config.han_scale = 1.0F;
+    SamplerState unscaled(unscaled_config);
+    SamplerState scoped(config(temperature, HanScaleScope::kAnswer, unlimited));
+    Expect(scoped.InReasoning() && scoped.han_bias() == 0,
+           "reasoning under the answer scope has no offset");
+    Expect(scoped.config().penalties_enabled() &&
+               !scoped.config().can_use_unmodified_argmax(),
+           "the scoped request keeps the adjusted sampling path");
+    Expect(SameDistribution(scoped.Distribution(logits),
+                            unscaled.Distribution(logits)),
+           "reasoning samples as Han scale 1");
+    if (temperature == 0.0F)
+      Expect(scoped.Sample(logits) == 1, "the Han argmax survives reasoning");
+    scoped.Accept(std::vector<TokenId>{0, 2, 4, 1});
+    Expect(scoped.InReasoning() && !scoped.ForcedToken(),
+           "an unlimited budget only tracks the phase");
+    scoped.Accept(TokenId{3});
+    Expect(!scoped.InReasoning() && scoped.han_bias() == answer,
+           "the token after </think> gets ln x");
+    SamplerState after(config(temperature, HanScaleScope::kAll, nullptr));
+    after.Accept(std::vector<TokenId>{0, 2, 4, 1, 3});
+    Expect(SameDistribution(scoped.Distribution(logits),
+                            after.Distribution(logits)),
+           "the answer samples as scope all");
+    if (temperature == 0.0F)
+      Expect(scoped.Sample(logits) == 0, "the answer argmax is offset");
+    // The compact rows MTP drafts and verifies with follow the phase too.
+    const std::vector<float> compact{1.5F, 1.0F};
+    const std::vector<TokenId> ids{1, 0};
+    SamplerState fresh(config(temperature, HanScaleScope::kAnswer, unlimited));
+    Expect(SameDistribution(
+               fresh.Distribution(compact, ids),
+               SamplerState(unscaled_config).Distribution(compact, ids)),
+           "compact reasoning rows have no offset");
+    Expect(SameDistribution(scoped.Distribution(compact, ids),
+                            after.Distribution(compact, ids)),
+           "compact answer rows have ln x");
+    scoped.ResetHistory({});
+    Expect(scoped.InReasoning() && scoped.han_bias() == 0,
+           "a restart reasons again");
+  }
+
+  {
+    // A verification span with </think> in the middle: each tentative row
+    // (the state GPU verification builds per row) has its own offset.
+    SamplerState sampler(config(0.0F, HanScaleScope::kAnswer, unlimited));
+    const std::vector<TokenId> drafts{1, 3, 1, 0};
+    auto tentative = sampler.WithoutConstraint();
+    std::vector<double> biases;
+    for (const auto draft : drafts) {
+      biases.push_back(tentative.han_bias());
+      tentative.Accept(draft);
+    }
+    Expect(biases == std::vector<double>{0, 0, answer, answer},
+           "rows after a drafted </think> use the answer offset");
+    // The target row by row agrees with the tentative offsets.
+    for (std::size_t row = 0; row < drafts.size(); ++row) {
+      Expect(sampler.han_bias() == biases[row], "target rows match drafts");
+      sampler.Accept(drafts[row]);
+    }
+  }
+  {
+    // A Qwen budget with the answer scope: the forced end starts the answer.
+    auto budget = std::make_shared<ReasoningBudget>(*Budget(1, {4, 3}));
+    SamplerState sampler(config(0.0F, HanScaleScope::kAnswer, budget));
+    sampler.Accept(sampler.Sample(logits));
+    Expect(sampler.ForcedToken() == TokenId{4} && sampler.han_bias() == 0,
+           "the forced end is still reasoning");
+    sampler.Accept(sampler.Sample(logits));
+    sampler.Accept(sampler.Sample(logits));
+    Expect(!sampler.ForcedToken() && !sampler.InReasoning() &&
+               sampler.han_bias() == answer,
+           "the answer after a forced end has ln x");
+  }
+  {
+    // A grammar ends reasoning at a close spelled as text. Tentative copies
+    // drop the grammar but still follow that end, as the target does.
+    const std::vector<std::string> pieces{
+        "thinking", "</", "think>", "{\"x\":", "true}", "", "</think>", "x"};
+    auto binding = std::make_shared<TokenConstraint>();
+    binding->grammar = JsonConstraint::WithReasoning(JsonConstraint::Object());
+    binding->vocabulary = std::make_shared<ConstraintVocabulary>(
+        pieces.size(), [&](std::uint32_t i) {
+          return ConstraintVocabulary::Piece{pieces[i], pieces[i].empty()};
+        });
+    auto scoped_config = config(0.0F, HanScaleScope::kAnswer, nullptr);
+    scoped_config.constraint = binding;
+    auto ends = std::make_shared<ReasoningBudget>(*unlimited);
+    ends->ends = {6};
+    scoped_config.reasoning_budget = ends;
+    SamplerState target(scoped_config);
+    auto tentative = target.WithoutConstraint();
+    const std::vector<TokenId> drafts{0, 1, 2, 3};
+    for (const auto draft : drafts) {
+      Expect(tentative.han_bias() == target.han_bias(),
+             "a tentative copy follows the grammar's end of reasoning");
+      tentative.Accept(draft);
+      target.Accept(draft);
+    }
+    Expect(!target.InReasoning() && !tentative.InReasoning() &&
+               tentative.han_bias() == answer,
+           "a close spelled as text starts the answer in both");
+    Expect(!tentative.NeedsConstraintMask(),
+           "the tentative copy stays unconstrained");
+    // A draft the grammar rejects ends tracking in the copy: the target can
+    // never accept it, so its later rows are discarded.
+    auto rejected = SamplerState(scoped_config).WithoutConstraint();
+    rejected.Accept(TokenId{0});
+    rejected.Accept(TokenId{5});
+    Expect(!rejected.InReasoning(), "a rejected draft ends tentative tracking");
+    // So does a padded head ID outside the grammar's vocabulary.
+    auto padded = SamplerState(scoped_config).WithoutConstraint();
+    padded.Accept(TokenId{20});
+    Expect(!padded.InReasoning(), "an out-of-vocabulary draft does not throw");
+    // Scope all copies keep no grammar: unchanged from before the scope.
+    auto all_config = scoped_config;
+    all_config.han_scale_scope = HanScaleScope::kAll;
+    auto all = SamplerState(all_config).WithoutConstraint();
+    all.Accept(std::vector<TokenId>{0, 1, 2});
+    Expect(all.InReasoning() && all.han_bias() == answer,
+           "scope all copies do not follow the grammar");
+  }
+}
+
 void TestCompactTargetContract() {
   using gufo::sampling::LogitCandidate;
   const std::vector<float> logits{0.0F, 0.75F, -1.0F, 0.75F, 3.0F, 0.1F};
@@ -397,6 +583,7 @@ int main() {
   TestReasoningBudgetKeepsLiteralAnswer();
   TestReasoningBudgetWithGrammar();
   TestReasoningBudgetFollowsGrammarEnd();
+  TestHanScaleScope();
   TestCompactTargetContract();
   std::cout << "sampling_test passed\n";
   return 0;

@@ -81,10 +81,16 @@ struct DFlashSampling {
   std::uint32_t penalty_count{0};
   const sampling::TokenId* history{nullptr};
   std::uint32_t history_count{0};
-  /// SamplingConfig::han_bias for every token of this device set, added
-  /// after the penalties; a null set skips it.
+  /// The Han offset for every token of this device set, added after the
+  /// penalties; a null set skips it. Proposals start with han_bias (the
+  /// sampler's, zero while reasoning under the answer scope) and switch to
+  /// han_answer_bias once an earlier proposal of the block is one of
+  /// han_ends, as the target's per-row samplers do.
   const std::uint32_t* han_tokens{nullptr};
   float han_bias{0.0F};
+  float han_answer_bias{0.0F};
+  std::uint32_t han_end_count{0};
+  std::uint32_t han_ends[2]{};
 };
 
 struct DFlashSelectorSequence {

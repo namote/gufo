@@ -965,7 +965,18 @@ kernels::DFlashSampling QwenDFlashGpuExecutor::PrepareDraftSampling(
   if (config.han_bias() != 0) {
     han.han_tokens = han_tokens_.Get(config.han_tokens,
                                      model_->GetConfig().vocab_size, stream);
-    han.han_bias = static_cast<float>(config.han_bias());
+    han.han_bias = static_cast<float>(sampler->han_bias());
+    han.han_answer_bias = static_cast<float>(config.han_bias());
+    // While reasoning under the answer scope, a proposed end token switches
+    // later proposals to the answer offset. Drafts only rank with it; the
+    // target rows verify with each row's exact sampler state.
+    if (han.han_bias != han.han_answer_bias && config.reasoning_budget) {
+      for (const auto end : config.reasoning_budget->ends) {
+        if (han.han_end_count == std::size(han.han_ends))
+          break;
+        han.han_ends[han.han_end_count++] = end;
+      }
+    }
   }
   result = han;
   // The selector already restricts q to a small lattice. Filtering that

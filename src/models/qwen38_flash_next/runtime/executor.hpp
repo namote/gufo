@@ -1096,7 +1096,8 @@ private:
   mutable std::vector<sampling::TokenPenalty> verification_penalty_host_;
   /// The request's Han set on the device, uploaded once per model set.
   mutable gufo::hip::DeviceTokenSet han_tokens_;
-  /// Sets the Han offset of `rows` from the sampler (none when inactive).
+  /// Sets the Han set of `rows` when the sampler's scale is active; callers
+  /// set each row's offset from that row's tentative state.
   bool SetHanRows(const sampling::SamplerState& sampler,
                   GreedyPenaltyRows* rows, std::string* error_msg) const;
   /// Allocated only when concurrent decoding is first requested.

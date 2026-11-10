@@ -6,6 +6,7 @@
 #include <initializer_list>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -520,6 +521,82 @@ void CheckExactRejection() {
   }
 }
 
+// The Han scale's answer scope across an MTP chain whose drafts contain the
+// reasoning end (token 3): the draft proposal and the target verification of
+// each row use that row's offset, so outputs follow the scoped distribution.
+void CheckScopedHanChain() {
+  const std::array<float, 5> logits{0.3F, 1.1F, -0.2F, 0.7F, -1.0F};
+  auto han = std::make_shared<sampling::TokenSet>();
+  han->words = {1U << 1U};  // token 1 is Han
+  han->count = 1;
+  auto phase = std::make_shared<sampling::ReasoningBudget>();
+  phase->tokens = sampling::ReasoningBudget::kUnlimited;
+  phase->forced = {3};
+  phase->ends = {3};
+  sampling::SamplingConfig config;
+  config.temperature = 1.0F;
+  config.seed = 17;
+  config.han_scale = 0.2F;
+  config.han_tokens = han;
+  const auto unscoped = config;  // scope all, no phase
+  config.han_scale_scope = sampling::HanScaleScope::kAnswer;
+  config.reasoning_budget = phase;
+  auto unscaled = unscoped;
+  unscaled.han_scale = 1.0F;
+
+  qfn::MtpCandidateLogits candidates;
+  candidates.size = 4;
+  candidates.ids = {1, 0, 3, 2};
+  candidates.logits = {1.1F, 0.3F, 0.7F, -0.2F};
+  const auto masses = [&](const sampling::SamplerState& state) {
+    std::uint64_t rng = 5;
+    const auto proposal = qfn::SampleMtpProposal(candidates, state, &rng);
+    return std::vector<float>(proposal.probabilities.begin(),
+                              proposal.probabilities.begin() + proposal.size);
+  };
+
+  // PrepareDecode: the draft sampler accepts the anchor (0), then drafts.
+  sampling::SamplerState target(config);
+  auto draft = target.WithoutConstraint();
+  draft.Accept(0);
+  Require(masses(draft) == masses(sampling::SamplerState(unscaled)),
+          "a reasoning draft row ranks without the Han offset");
+  draft.Accept(3);
+  sampling::SamplerState answer(unscoped);
+  answer.Accept(std::vector<sampling::TokenId>{0, 3});
+  Require(masses(draft) == masses(answer),
+          "the draft row after a drafted end ranks with the answer offset");
+
+  // FinishDecode: the target accepts the anchor and verifies row by row.
+  target.Accept(0);
+  const auto reasoning_p =
+      sampling::SamplerState(unscaled).Distribution(logits);
+  const auto answer_p = answer.Distribution(logits);
+  Require(answer_p.probability(1) < 0.5 * reasoning_p.probability(1),
+          "the test needs the offset to matter");
+  constexpr unsigned trials = 100000;
+  for (const bool after_end : {false, true}) {
+    auto row = target;
+    if (after_end)
+      row.Accept(3);
+    const auto& p = after_end ? answer_p : reasoning_p;
+    qfn::MtpProposal proposal;  // a point mass on the Han token
+    proposal.size = 1;
+    proposal.ids[0] = proposal.token = 1;
+    proposal.probabilities[0] = proposal.probability = 1;
+    std::array<unsigned, 5> counts{};
+    for (unsigned trial = 0; trial < trials; ++trial) {
+      auto state = row;
+      state.SetRngState(sampling::NextRandom(row.mutable_rng_state()));
+      ++counts[qfn::VerifyMtpProposal(logits, proposal, state).token];
+    }
+    for (unsigned token = 0; token < counts.size(); ++token)
+      Require(std::abs(double(counts[token]) / trials - p.probability(token)) <
+                  0.008,
+              "each verified row must follow its scoped distribution");
+  }
+}
+
 void CheckConfidenceRule() {
   // Three shallow depths continue at 0.6 and keep at 0.3 (Kyojin TierRule),
   // deeper ones continue at 0.9 and keep at 0.4; the first draft is always
@@ -582,6 +659,7 @@ int main() {
     CheckSampledOutputFrequencies();
     CheckPointMassFrequencies();
     CheckExactRejection();
+    CheckScopedHanChain();
     const std::array<float, 5> logits{0.3F, -0.2F, 1.1F, 0.7F, -1.0F};
     const std::array<sampling::TokenId, 4> history{2, 3, 2, 0};
     for (const auto& test : gufo::test::QwenSamplingCases()) {

@@ -917,10 +917,12 @@ void Argmax(const float* logits, ArgmaxCandidate* scratch, std::int32_t* out,
 struct GreedyPenaltyRows {
   const sampling::TokenPenalty* penalties;
   std::uint32_t offsets[8]{};
-  /// SamplingConfig::han_bias, added in FP64 after the penalties to every
-  /// token of this device set (sampling::TokenSet layout); null skips it.
+  /// The Han offset of each row (SamplerState::han_bias of that row's
+  /// tentative state, so a row after a drafted reasoning end gets the
+  /// answer offset), added in FP64 after the penalties to every token of
+  /// this device set (sampling::TokenSet layout); a null set skips it.
   const std::uint32_t* han_tokens{nullptr};
-  double han_bias{0};
+  double han_bias[7]{};
 };
 struct PenaltyArgmaxCandidate {
   double value;

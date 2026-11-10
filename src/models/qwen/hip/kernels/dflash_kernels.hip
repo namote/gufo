@@ -610,6 +610,14 @@ __device__ __forceinline__ void FinalizeSelector(
     top_ids[index] = shared_ids[index];
   }
 
+  // A reasoning end proposed earlier in this block starts the answer.
+  float han_bias = sampling.han_bias;
+  for (uint32_t i = 0; i < previous_count && han_bias != sampling.han_answer_bias;
+       ++i)
+    for (uint32_t end = 0; end < sampling.han_end_count; ++end)
+      if (previous_tokens[i] == sampling.han_ends[end])
+        han_bias = sampling.han_answer_bias;
+
   float best_score = -INFINITY;
   uint32_t best_index = 0;
   float path_scores[kMaxSelectorTopK];
@@ -662,7 +670,7 @@ __device__ __forceinline__ void FinalizeSelector(
     }
     if (sampling.han_tokens != nullptr &&
         ((sampling.han_tokens[id / 32U] >> (id % 32U)) & 1U))
-      score += sampling.han_bias;
+      score += han_bias;
     path_scores[candidate_index] = score;
     if (score > best_score) {
       best_score = score;

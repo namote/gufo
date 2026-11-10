@@ -399,6 +399,9 @@ tokenization::TokenId QwenGpuExecutor::SampleCachedLogits(
 GpuSamplingParameters QwenGpuExecutor::PrepareGpuSamplingParameters(
     const sampling::SamplerState& sampler) {
   const auto& config = sampler.config();
+  // The offset at this sampler's position: zero while a reply reasons under
+  // the answer scope. Each verification row samples with its own state.
+  const double han_bias = sampler.han_bias();
 
   return GpuSamplingParameters{
       .temperature = config.temperature,
@@ -409,12 +412,11 @@ GpuSamplingParameters QwenGpuExecutor::PrepareGpuSamplingParameters(
       .repeat_penalty = config.repeat_penalty,
       .frequency_penalty = config.frequency_penalty,
       .presence_penalty = config.presence_penalty,
-      .han_tokens =
-          config.han_bias() != 0
-              ? han_tokens_.Get(config.han_tokens, weights_.config.vocab_size,
-                                arena_.stream)
-              : nullptr,
-      .han_bias = static_cast<float>(config.han_bias()),
+      .han_tokens = han_bias != 0 ? han_tokens_.Get(config.han_tokens,
+                                                    weights_.config.vocab_size,
+                                                    arena_.stream)
+                                  : nullptr,
+      .han_bias = static_cast<float>(han_bias),
   };
 }
 

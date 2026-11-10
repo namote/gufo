@@ -197,8 +197,7 @@ bool Executor::KeepHiddenRow(Session& session, std::uint32_t row,
 bool Executor::SetHanRows(const sampling::SamplerState& sampler,
                           GreedyPenaltyRows* rows,
                           std::string* error_msg) const {
-  const double bias = sampler.config().han_bias();
-  if (bias == 0)
+  if (sampler.config().han_bias() == 0)
     return true;
   try {
     rows->han_tokens = han_tokens_.Get(sampler.config().han_tokens,
@@ -207,7 +206,6 @@ bool Executor::SetHanRows(const sampling::SamplerState& sampler,
     AssignError(error_msg, exception.what());
     return false;
   }
-  rows->han_bias = bias;
   return true;
 }
 
@@ -255,6 +253,8 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
       const auto counts = tentative.penalties();
       penalties.insert(penalties.end(), counts.begin(), counts.end());
       batch.offsets[row + 1] = static_cast<std::uint32_t>(penalties.size());
+      // Each row's own offset: a drafted reasoning end starts the answer.
+      batch.han_bias[row] = tentative.han_bias();
       if (row + 1 < rows)
         tentative.Accept(static_cast<sampling::TokenId>(drafts[row]));
     }
@@ -370,6 +370,8 @@ bool Executor::SampledMtpCandidates(
     const auto counts = tentative.penalties();
     penalties.insert(penalties.end(), counts.begin(), counts.end());
     batch.offsets[row + 1] = penalties.size();
+    // Each row's own offset: a drafted reasoning end starts the answer.
+    batch.han_bias[row] = tentative.han_bias();
     if (row + 1 < rows)
       tentative.Accept(static_cast<sampling::TokenId>(drafts[row]));
   }

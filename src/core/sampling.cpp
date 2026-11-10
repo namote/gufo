@@ -89,9 +89,8 @@ double ScaleHan(double logit, TokenId token, const SamplingConfig& config,
 /// Candidate tokens index `token_ids` when it is nonempty (compact rows).
 void ApplyPenalties(std::vector<Candidate>* candidates,
                     const SamplingConfig& config,
-                    std::span<const TokenPenalty> penalties,
+                    std::span<const TokenPenalty> penalties, double han_bias,
                     std::span<const TokenId> token_ids = {}) {
-  const double han_bias = config.han_bias();
   if (penalties.empty() && han_bias == 0)
     return;
   for (auto& candidate : *candidates) {
@@ -276,6 +275,19 @@ void SamplingConfig::Validate() const {
   }
 }
 
+std::optional<HanScaleScope> ParseHanScaleScope(
+    std::string_view text) noexcept {
+  if (text == "all")
+    return HanScaleScope::kAll;
+  if (text == "answer")
+    return HanScaleScope::kAnswer;
+  return std::nullopt;
+}
+
+std::string_view HanScaleScopeName(HanScaleScope scope) noexcept {
+  return scope == HanScaleScope::kAnswer ? "answer" : "all";
+}
+
 double SamplingConfig::han_bias() const noexcept {
   // A fixed logit offset ln(x), applied before temperature like the
   // penalties: the temperature-1 probability times x. At temperature T the
@@ -440,7 +452,7 @@ TokenId SamplingDistribution::SampleResidual(
 
 static SamplingDistribution DistributionWithPenalties(
     std::span<const float> logits, const SamplingConfig& config,
-    std::span<const TokenPenalty> penalties,
+    std::span<const TokenPenalty> penalties, double han_bias,
     std::span<const TokenId> token_ids = {}) {
   config.Validate();
   if (logits.empty()) {
@@ -465,7 +477,7 @@ static SamplingDistribution DistributionWithPenalties(
     throw std::runtime_error("logit distribution contains no finite values");
   }
 
-  ApplyPenalties(&candidates, config, penalties, token_ids);
+  ApplyPenalties(&candidates, config, penalties, han_bias, token_ids);
   ApplyTopK(&candidates, config);
   if (config.temperature == 0.0F) {
     return SamplingDistribution(
@@ -518,13 +530,16 @@ SamplingDistribution BuildDistribution(
   for (const auto& [token, penalty] : counts)
     penalties.push_back(penalty);
   std::ranges::sort(penalties, {}, &TokenPenalty::token);
-  return DistributionWithPenalties(logits, config, penalties);
+  return DistributionWithPenalties(logits, config, penalties,
+                                   config.han_bias());
 }
 
 SamplerState::SamplerState(SamplingConfig config,
                            std::span<const TokenId> initial_history)
     : config_(config),
       han_bias_(config.han_bias()),
+      reasoning_scoped_(han_bias_ != 0 &&
+                        config.han_scale_scope == HanScaleScope::kAnswer),
       history_(initial_history.begin(), initial_history.end()),
       rng_state_(InitialRngState(config.seed)) {
   config_.Validate();
@@ -538,6 +553,8 @@ SamplerState::SamplerState(SamplingConfig config,
 SamplerState::SamplerState(const SamplerState& other)
     : config_(other.config_),
       han_bias_(other.han_bias_),
+      reasoning_scoped_(other.reasoning_scoped_),
+      reasoning_grammar_(other.reasoning_grammar_),
       constraint_state_(other.constraint_state_),
       constraint_mask_(other.constraint_mask_),
       constraint_restricts_(other.constraint_restricts_),
@@ -555,6 +572,8 @@ SamplerState& SamplerState::operator=(const SamplerState& other) {
   }
   config_ = other.config_;
   han_bias_ = other.han_bias_;
+  reasoning_scoped_ = other.reasoning_scoped_;
+  reasoning_grammar_ = other.reasoning_grammar_;
   constraint_state_ = other.constraint_state_;
   constraint_mask_ = other.constraint_mask_;
   constraint_restricts_ = other.constraint_restricts_;
@@ -572,8 +591,13 @@ SamplerState& SamplerState::operator=(const SamplerState& other) {
 SamplerState SamplerState::WithoutConstraint() const {
   auto copy = *this;
   copy.config_.constraint.reset();
-  copy.constraint_state_.clear();
   copy.constraint_mask_.reset();
+  // A scoped Han offset changes where reasoning ends, which a grammar may
+  // decide. Keep its state to follow that end; drop it otherwise.
+  if (reasoning_scoped_ && InReasoning() && config_.constraint)
+    copy.reasoning_grammar_ = config_.constraint;
+  if (!copy.reasoning_grammar_)
+    copy.constraint_state_.clear();
   return copy;
 }
 
@@ -639,6 +663,8 @@ void SamplerState::CopyDrawStateFrom(const SamplerState& other) noexcept {
 void SamplerState::ResetHistory(std::span<const TokenId> tokens) {
   if (config_.constraint)
     constraint_state_ = config_.constraint->grammar->Start();
+  else if (reasoning_grammar_)
+    constraint_state_ = reasoning_grammar_->grammar->Start();
   constraint_mask_.reset();
   pending_sample_.reset();
   StartReasoning();
@@ -695,7 +721,8 @@ void SamplerState::AdvanceReasoning(TokenId token) {
                         token >= budget.partial_utf8->size() ||
                         !(*budget.partial_utf8)[token];
   if (reasoning_phase_ == ReasoningPhase::kCounting &&
-      --reasoning_remaining_ != 0)
+      (budget.tokens == ReasoningBudget::kUnlimited ||
+       --reasoning_remaining_ != 0))
     return;
   if (complete) {
     reasoning_phase_ = ReasoningPhase::kForcing;
@@ -713,11 +740,29 @@ void SamplerState::Accept(std::span<const TokenId> tokens) {
           *config_.constraint->grammar, next, token);
     if (reasoning_phase_ == ReasoningPhase::kOff)
       continue;
+    // A tentative copy follows its dropped grammar only to end reasoning.
+    // A draft the grammar rejects never reaches the target's later rows.
+    bool rejected = false;
+    if (reasoning_grammar_) {
+      // Includes a token outside the grammar's vocabulary (out_of_range).
+      try {
+        next = reasoning_grammar_->vocabulary->Accept(
+            *reasoning_grammar_->grammar, next, token);
+      } catch (const std::exception&) {
+        rejected = true;
+      }
+    }
     AdvanceReasoning(token);
     // A grammar also ends reasoning on a close spelled as text or a call
     // header; the budget must not force its end into the answer after that.
-    if (config_.constraint && !config_.constraint->grammar->InReasoning(next))
+    const auto* grammar = config_.constraint ? config_.constraint.get()
+                                             : reasoning_grammar_.get();
+    if (rejected || (grammar && !grammar->grammar->InReasoning(next)))
       reasoning_phase_ = ReasoningPhase::kOff;
+  }
+  if (reasoning_grammar_ && reasoning_phase_ == ReasoningPhase::kOff) {
+    reasoning_grammar_.reset();
+    next.clear();
   }
   if (next != constraint_state_) {
     constraint_state_ = std::move(next);
@@ -843,7 +888,8 @@ SamplingDistribution SamplerState::Distribution(
       penalties.push_back(penalty);
     }
   }
-  return DistributionWithPenalties(logits, config_, penalties, token_ids);
+  return DistributionWithPenalties(logits, config_, penalties, han_bias(),
+                                   token_ids);
 }
 
 void SamplerState::DeferSample(TokenId token) {
@@ -939,12 +985,12 @@ double SamplerState::AdjustedLogit(TokenId token, float logit) const noexcept {
   return ScaleHan(found == penalty_counts_.end() || found->token != token
                       ? static_cast<double>(logit)
                       : Penalize(logit, config_, *found),
-                  token, config_, han_bias_);
+                  token, config_, han_bias());
 }
 
 TokenId SamplerState::SampleGreedy(std::span<const float> logits) const {
   // The Han offset is never positive, so a block maximum still bounds it.
-  const double han_bias = han_bias_;
+  const double han_bias = this->han_bias();
   double best_logit = -std::numeric_limits<double>::infinity();
   TokenId best_token = 0;
   bool found = false;
@@ -997,7 +1043,7 @@ TokenId SamplerState::SampleConstrainedGreedy(
         "JSON constraint vocabulary differs from logits");
   // Read the mask directly: greedy constraints need neither a copied vocabulary
   // of masked logits nor a cloned sampler/history. Preserve token-ID tie order.
-  const bool adjusted = !penalty_counts_.empty() || han_bias_ != 0;
+  const bool adjusted = !penalty_counts_.empty() || han_bias() != 0;
   double best_logit = -std::numeric_limits<double>::infinity();
   TokenId best_token = 0;
   bool found = false;
@@ -1025,7 +1071,7 @@ SamplingDistribution SamplerState::LinearDistribution(
   std::vector<Probability> candidates;
   candidates.reserve(logits.size());
   double maximum = -std::numeric_limits<double>::infinity();
-  const bool adjusted = !penalty_counts_.empty() || han_bias_ != 0;
+  const bool adjusted = !penalty_counts_.empty() || han_bias() != 0;
   for (std::size_t i = 0; i < logits.size(); ++i) {
     if (!std::isfinite(logits[i]))
       continue;
@@ -1060,7 +1106,7 @@ void SamplerState::PrepareSelected(std::span<const float> logits) {
   candidate_scratch_.clear();
   // A block skip below compares the raw block maximum: the Han offset is
   // never positive, so that maximum still bounds every adjusted logit.
-  const double han_bias = han_bias_;
+  const double han_bias = this->han_bias();
   // Vocabulary IDs and sparse penalties are both sorted. Walk them together
   // instead of searching the penalties for every vocabulary entry.
   const auto adjusted_at = [&](std::size_t index, auto& penalty) {

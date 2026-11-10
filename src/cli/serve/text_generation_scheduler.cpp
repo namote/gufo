@@ -419,6 +419,13 @@ GenerationTrace StartGenerationTrace(const ScheduledRequest& request,
   // The applied scale: 1 when no Han set makes it active.
   sampling["han_scale"] = TraceFloat(
       request.sampling.han_bias() != 0 ? request.sampling.han_scale : 1.0F);
+  // The applied scope: answer only when the request tracks a reasoning
+  // phase for it; otherwise every token is answer.
+  sampling["han_scale_scope"] = std::string(gufo::sampling::HanScaleScopeName(
+      request.sampling.han_bias() != 0 &&
+              request.sampling.reasoning_budget != nullptr
+          ? request.sampling.han_scale_scope
+          : gufo::sampling::HanScaleScope::kAll));
   sampling["constrained"] = request.sampling.constraint != nullptr;
   trace.record["sampling"] = std::move(sampling);
   return trace;

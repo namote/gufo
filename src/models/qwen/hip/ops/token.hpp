@@ -59,8 +59,9 @@ struct GpuSamplingParameters {
   float frequency_penalty{0.0F};
   float presence_penalty{0.0F};
   double uniform{0.0};
-  /// SamplingConfig::han_bias added to every token of the device set
-  /// han_tokens after the penalties; zero (or a null set) skips it.
+  /// SamplerState::han_bias (the offset at the sampled position) added to
+  /// every token of the device set han_tokens after the penalties; zero (or
+  /// a null set) skips it.
   const std::uint32_t* han_tokens{nullptr};
   float han_bias{0.0F};
 };
