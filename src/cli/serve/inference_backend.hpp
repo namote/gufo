@@ -132,6 +132,7 @@ public:
   [[nodiscard]] bool device_lost() const override;
   [[nodiscard]] bool supports_images() const override;
   [[nodiscard]] bool supports_typical_acceptance() const override;
+  [[nodiscard]] bool supports_han_scale() const override;
   [[nodiscard]] std::string model_path() const override;
   [[nodiscard]] std::string build_info() const override;
   [[nodiscard]] SamplingDefaults sampling_defaults() const override;

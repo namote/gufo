@@ -1045,6 +1045,9 @@ struct Session::PendingDecode {
   std::uint32_t base{0};
   bool speculative{false};
   bool sampled{false};
+  /// A greedy chain under an active Han scale: its heads also return
+  /// candidates and each draft is their adjusted argmax (AppendDraft).
+  bool scaled_greedy{false};
   bool gpu_greedy{false};
   bool gpu_verification{false};
   std::size_t width{0};
@@ -1066,7 +1069,25 @@ struct Session::PendingDecode {
   bool wide{false};
 };
 
+void Session::SelectScaledDraft(PendingDecode& pending) {
+  // The device head takes the raw argmax. Rank the head's top candidates as
+  // the target does, so its Han offset (and penalties) cannot reject every
+  // Han draft. Idempotent until the next head overwrites the candidates.
+  const auto size = pending.candidates.size;
+  const auto best =
+      pending.draft_sampler
+          ->Distribution(std::span(pending.candidates.logits).first(size),
+                         std::span(pending.candidates.ids).first(size))
+          .best_token();
+  pending.draft = static_cast<std::int32_t>(pending.candidates.ids[best]);
+}
+
 void Session::AppendDraft(PendingDecode& pending) {
+  if (pending.scaled_greedy) {
+    SelectScaledDraft(pending);
+    pending.draft_sampler->Accept(
+        static_cast<sampling::TokenId>(pending.draft));
+  }
   if (pending.sampled) {
     pending.proposals.push_back(SampleMtpProposal(
         pending.candidates, *pending.draft_sampler, &pending.draft_rng));
@@ -1223,6 +1244,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   pending->base = base;
   pending->speculative = true;
   pending->sampled = sampled;
+  pending->scaled_greedy = !sampled && sampler.config().han_bias() != 0;
   pending->gpu_greedy = gpu_greedy;
   pending->gpu_verification = gpu_verification;
   if (!gpu_verification &&
@@ -1290,10 +1312,11 @@ bool Session::PrepareDecode(const DecodeRequest& request,
         1 + draft_length_.Choose(static_cast<std::uint32_t>(cap - 1), base,
                                  pending->policy_concurrency, true);
   }
-  const bool candidates = sampled || confidence_rule;
+  const bool candidates = sampled || confidence_rule || pending->scaled_greedy;
   if (!defer_head && !DraftCatchUp(anchor, true, error_msg,
                                    candidates ? &pending->candidates : nullptr,
-                                   pending->draft_subset, confidence_rule)) {
+                                   pending->draft_subset,
+                                   confidence_rule || pending->scaled_greedy)) {
     return false;
   }
   pending->draft = draft_token_;
@@ -1302,6 +1325,9 @@ bool Session::PrepareDecode(const DecodeRequest& request,
     while (pending->chain.size() < pending->width) {
       bool more = true;
       if (confidence_rule) {
+        // Judge the token AppendDraft will append.
+        if (pending->scaled_greedy)
+          SelectScaledDraft(*pending);
         const auto step =
             rule.Step(static_cast<std::uint32_t>(pending->chain.size() - 1),
                       DraftConfidence(pending->candidates, pending->draft));
@@ -1839,10 +1865,12 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
       auto& p = pending[i];
       if (!requests[i].session->session_->Cancelled() && p.speculative &&
           p.chain.size() < p.width) {
-        heads.push_back({requests[i].session->session_.get(),
-                         {.token = p.sampled ? nullptr : &p.draft,
-                          .candidates = p.sampled ? &p.candidates : nullptr,
-                          .draft_subset = p.draft_subset}});
+        heads.push_back(
+            {requests[i].session->session_.get(),
+             {.token = p.sampled ? nullptr : &p.draft,
+              .candidates =
+                  p.sampled || p.scaled_greedy ? &p.candidates : nullptr,
+              .draft_subset = p.draft_subset}});
       }
     }
     if (heads.empty())

@@ -1032,6 +1032,11 @@ private:
   sampling::LogitCandidate* verification_candidates_{nullptr};
   sampling::LogitCandidate* verification_candidates_host_{nullptr};
   mutable std::vector<sampling::TokenPenalty> verification_penalty_host_;
+  /// The request's Han set on the device, uploaded once per model set.
+  mutable gufo::hip::DeviceTokenSet han_tokens_;
+  /// Sets the Han offset of `rows` from the sampler (none when inactive).
+  bool SetHanRows(const sampling::SamplerState& sampler,
+                  GreedyPenaltyRows* rows, std::string* error_msg) const;
   /// Allocated only when concurrent decoding is first requested.
   mutable float* batch_logits_{nullptr};
   mutable Session::Control* batch_controls_{nullptr};

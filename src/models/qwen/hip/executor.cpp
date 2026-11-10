@@ -366,6 +366,12 @@ GpuSamplingParameters QwenGpuExecutor::PrepareGpuSamplingParameters(
       .repeat_penalty = config.repeat_penalty,
       .frequency_penalty = config.frequency_penalty,
       .presence_penalty = config.presence_penalty,
+      .han_tokens =
+          config.han_bias() != 0
+              ? han_tokens_.Get(config.han_tokens, weights_.config.vocab_size,
+                                arena_.stream)
+              : nullptr,
+      .han_bias = static_cast<float>(config.han_bias()),
   };
 }
 

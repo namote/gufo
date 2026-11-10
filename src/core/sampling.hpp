@@ -15,6 +15,18 @@ namespace gufo::sampling {
 
 using TokenId = std::uint32_t;
 
+/// A set of vocabulary token IDs: bit (id % 32) of words[id / 32]. The
+/// layout is the device layout, so GPU samplers upload `words` unchanged.
+struct TokenSet {
+  std::vector<std::uint32_t> words;
+  std::size_t count{0};
+
+  [[nodiscard]] bool Contains(TokenId token) const noexcept {
+    const std::size_t word = token / 32U;
+    return word < words.size() && ((words[word] >> (token % 32U)) & 1U) != 0;
+  }
+};
+
 /// A reasoning token budget, enforced like llama.cpp's reasoning-budget
 /// sampler (#266). Tokens are counted after the reasoning start, including
 /// reasoning text already in the prompt. Once the budget is spent, and the
@@ -33,8 +45,9 @@ struct ReasoningBudget {
 
 /// Model-independent controls for selecting a token from a logit row.
 ///
-/// Filters run in this order: penalties, temperature, top-k, top-p, min-p.
-/// The defaults preserve Gufo's existing greedy decoding behavior.
+/// Filters run in this order: penalties, Han scale, temperature, top-k,
+/// top-p, min-p. The defaults preserve Gufo's existing greedy decoding
+/// behavior.
 struct SamplingConfig {
   /// Observational raw target log probabilities; null disables collection.
   std::optional<std::uint32_t> logprobs;
@@ -58,9 +71,26 @@ struct SamplingConfig {
   /// The library default is the exact rule; the serve, prompt and bench
   /// CLIs default it on (RegisterSamplingOptions, --typical-acceptance).
   bool typical_acceptance{false};
+  /// Han-script probability scale in (0, 1] (serve --han-scale, request
+  /// han_scale); 1 disables it. Every token in han_tokens has
+  /// han_bias() = ln(han_scale) added to its logit after the penalties and
+  /// before temperature and the filters: its temperature-1 probability is
+  /// multiplied by han_scale (renormalized), its probability at
+  /// temperature T by han_scale^(1/T). Greedy takes the argmax of the
+  /// offset logits.
+  float han_scale{1.0F};
+  /// The model's Han tokens (src/core/han_script.hpp). A null set leaves
+  /// han_scale inactive: models whose samplers do not apply it get none.
+  std::shared_ptr<const TokenSet> han_tokens{};
 
   void Validate() const;
 
+  /// The logit offset of a Han token: ln(han_scale), or zero when the scale
+  /// is inactive. Never positive.
+  [[nodiscard]] double han_bias() const noexcept;
+  /// True when penalties or the Han scale adjust logits before filtering.
+  /// Fast paths that take an unmodified argmax or skip the adjustment must
+  /// treat both alike.
   [[nodiscard]] bool penalties_enabled() const noexcept;
   [[nodiscard]] bool uses_random_sampling() const noexcept;
   [[nodiscard]] bool can_use_unmodified_argmax() const noexcept;
@@ -224,6 +254,7 @@ private:
   void AdvanceReasoning(TokenId token);
 
   SamplingConfig config_;
+  double han_bias_{0};  ///< config_.han_bias(), fixed with config_
   JsonConstraint::State constraint_state_;
   mutable std::shared_ptr<const std::vector<std::uint8_t>> constraint_mask_;
   mutable bool constraint_restricts_{false};

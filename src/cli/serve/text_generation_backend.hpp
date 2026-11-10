@@ -322,6 +322,9 @@ public:
   [[nodiscard]] virtual bool supports_typical_acceptance() const {
     return false;
   }
+  /// Whether requests apply SamplingConfig::han_scale (Qwen 27B and
+  /// Flash-Next, whose runners build a Han token set).
+  [[nodiscard]] virtual bool supports_han_scale() const { return false; }
   /// The served model file and build revision, as llama-server's /props
   /// reports them. Empty when unknown.
   [[nodiscard]] virtual std::string model_path() const { return {}; }

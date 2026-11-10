@@ -960,6 +960,14 @@ kernels::DFlashSampling QwenDFlashGpuExecutor::PrepareDraftSampling(
   if (sampler == nullptr)
     return result;
   const auto& config = sampler->config();
+  // The Han set is resident, so it survives the scratch-capacity fallback.
+  kernels::DFlashSampling han;
+  if (config.han_bias() != 0) {
+    han.han_tokens = han_tokens_.Get(config.han_tokens,
+                                     model_->GetConfig().vocab_size, stream);
+    han.han_bias = static_cast<float>(config.han_bias());
+  }
+  result = han;
   // The selector already restricts q to a small lattice. Filtering that
   // lattice a second time lost useful coverage on short sampled completions.
   result.repeat_penalty = config.repeat_penalty;
@@ -980,7 +988,7 @@ kernels::DFlashSampling QwenDFlashGpuExecutor::PrepareDraftSampling(
   // Context projection has finished; reuse its input scratch for this proposal.
   // An unusually large policy can always retain the original valid q.
   if (bytes > capacity)
-    return {};
+    return han;
   if (!penalties.empty()) {
     HIP_CHECK(hipMemcpyAsync(d_target_features_, penalties.data(),
                              penalties.size_bytes(), hipMemcpyHostToDevice,

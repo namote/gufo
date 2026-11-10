@@ -81,6 +81,10 @@ struct DFlashSampling {
   std::uint32_t penalty_count{0};
   const sampling::TokenId* history{nullptr};
   std::uint32_t history_count{0};
+  /// SamplingConfig::han_bias for every token of this device set, added
+  /// after the penalties; a null set skips it.
+  const std::uint32_t* han_tokens{nullptr};
+  float han_bias{0.0F};
 };
 
 struct DFlashSelectorSequence {

@@ -387,6 +387,7 @@ private:
                      std::string* error_msg, bool defer_head = false,
                      std::optional<std::uint32_t> batch_drafts = {},
                      std::uint32_t occupancy = 1, std::uint32_t residents = 1);
+  static void SelectScaledDraft(PendingDecode& pending);
   static void AppendDraft(PendingDecode& pending);
   /// Appends copies within the prepared budget, stopping at EOG when enabled.
   bool AppendLookup(PendingDecode& pending, bool stop_at_eos,

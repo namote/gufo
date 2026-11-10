@@ -660,6 +660,9 @@ __device__ __forceinline__ void FinalizeSelector(
       if (generated != 0)
         score -= sampling.presence_penalty;
     }
+    if (sampling.han_tokens != nullptr &&
+        ((sampling.han_tokens[id / 32U] >> (id % 32U)) & 1U))
+      score += sampling.han_bias;
     path_scores[candidate_index] = score;
     if (score > best_score) {
       best_score = score;

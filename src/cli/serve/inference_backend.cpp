@@ -31,6 +31,7 @@
 #include "src/core/device_code_identity.hpp"
 #include "src/core/gguf_identity.hpp"
 #include "src/core/gguf_reader.hpp"
+#include "src/core/han_script.hpp"
 #include "src/core/json.hpp"
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/chat_template.hpp"
@@ -199,6 +200,26 @@ std::shared_ptr<const models::qwen::vision::Prompt> QwenPrompt(
   if (!image)
     throw std::invalid_argument("invalid Qwen prompt context");
   return image->prompt;
+}
+
+// The Han tokens (--han-scale) of a runner whose samplers apply them, built
+// once from the vocabulary while the model loads.
+std::shared_ptr<const sampling::TokenSet> PrepareHanTokens(
+    const TextModelRunner& runner) {
+  const auto started = Clock::now();
+  auto set = sampling::BuildHanTokens(runner.VocabularySize(),
+                                      [&](sampling::TokenId token) {
+                                        const TextRunnerToken id = token;
+                                        return runner.Decode(std::span(&id, 1));
+                                      });
+  using Milliseconds = std::chrono::duration<double, std::milli>;
+  Logger::Info(
+      "loader",
+      "event=han_tokens_prepared vocabulary_tokens=" +
+          std::to_string(runner.VocabularySize()) +
+          " han_tokens=" + std::to_string(set->count) + " prepare_ms=" +
+          std::to_string(Milliseconds(Clock::now() - started).count()));
+  return set;
 }
 
 // Hash the sidecar and upload its weights while the model loads, before the
@@ -3276,6 +3297,8 @@ struct InferenceBackend::Impl {
     std::uint32_t max_context{0};
     bool supports_images{false};
     bool supports_typical_acceptance{false};
+    /// The runner's Han tokens; null where its samplers ignore han_scale.
+    std::shared_ptr<const sampling::TokenSet> han_tokens;
     ReasoningOptions reasoning_defaults;
     std::string model_path;
     std::string build_info;
@@ -3286,6 +3309,8 @@ struct InferenceBackend::Impl {
         sampling::SamplingConfig config) const {
       config.typical_acceptance =
           config.typical_acceptance && supports_typical_acceptance;
+      // Without a set the scale stays inactive (SamplingConfig::han_bias).
+      config.han_tokens = han_tokens;
       return config;
     }
   };
@@ -3819,6 +3844,7 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
         speculative_options, disk_cache_config.model_artifact_fingerprint,
         disk_cache_config.draft_model_artifact_fingerprint, session_count,
         ram_cache_config.kv_pool_bytes, execution_policy);
+    new_state->han_tokens = PrepareHanTokens(*runner);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
@@ -4004,6 +4030,7 @@ bool InferenceBackend::load(
         disk_cache_config.model_artifact_fingerprint,
         disk_cache_config.draft_model_artifact_fingerprint,
         ram_cache_config.kv_pool_bytes);
+    new_state->han_tokens = PrepareHanTokens(*runner);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
@@ -4075,6 +4102,15 @@ bool InferenceBackend::supports_images() const {
 #if defined(ENGINE_ENABLE_HIP)
   const auto state = impl_->Snapshot();
   return state != nullptr && state->supports_images;
+#else
+  return false;
+#endif
+}
+
+bool InferenceBackend::supports_han_scale() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state != nullptr && state->han_tokens != nullptr;
 #else
   return false;
 #endif

@@ -662,6 +662,11 @@ if (BUILD_TESTING)
   add_test(NAME sampling_test COMMAND sampling_test)
   set_tests_properties(sampling_test PROPERTIES LABELS "cpu;sampling")
 
+  add_executable(han_script_test tests/core/han_script_test.cpp)
+  target_link_libraries(han_script_test PRIVATE gufo_core)
+  add_test(NAME han_script_test COMMAND han_script_test)
+  set_tests_properties(han_script_test PROPERTIES LABELS "cpu;sampling")
+
   add_executable(logprobs_test tests/cli/logprobs_test.cpp)
   target_link_libraries(logprobs_test PRIVATE gufo_core)
   add_test(NAME logprobs_test COMMAND logprobs_test)

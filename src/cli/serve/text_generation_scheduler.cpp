@@ -417,6 +417,9 @@ GenerationTrace StartGenerationTrace(const ScheduledRequest& request,
       TraceFloat(request.sampling.frequency_penalty);
   sampling["presence_penalty"] = TraceFloat(request.sampling.presence_penalty);
   sampling["typical_acceptance"] = request.sampling.typical_acceptance;
+  // The applied scale: 1 when no Han set makes it active.
+  sampling["han_scale"] = TraceFloat(
+      request.sampling.han_bias() != 0 ? request.sampling.han_scale : 1.0F);
   sampling["constrained"] = request.sampling.constraint != nullptr;
   trace.record["sampling"] = std::move(sampling);
   return trace;

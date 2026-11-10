@@ -114,6 +114,21 @@ inline void RegisterSamplingOptions(ArgParser& parser,
       });
 }
 
+/// The serve-only Han-script scale. It needs a model's Han token set, which
+/// only the Qwen server runners build (SamplingConfig::han_tokens).
+inline void RegisterHanScaleOption(ArgParser& parser,
+                                   sampling::SamplingConfig* config,
+                                   std::string_view group = "Sampling") {
+  if (config == nullptr) {
+    throw std::invalid_argument("sampling CLI config must not be null");
+  }
+  parser.AddOption(
+      "", "--han-scale", "X",
+      "Multiply the probability of tokens that write CJK ideographs (Han) "
+      "by X in (0, 1]; Qwen 27B and Flash-Next (default: 1.0 = disabled)",
+      group, &config->han_scale);
+}
+
 }  // namespace gufo::cli
 
 #endif  // GUFO_CLI_SAMPLING_OPTIONS_HPP_

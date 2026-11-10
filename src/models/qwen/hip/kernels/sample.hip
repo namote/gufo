@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <hipcub/hipcub.hpp>
 #include <stdexcept>
+#include <vector>
 
 #include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
@@ -161,6 +162,15 @@ __global__ void PrepareCandidateLogitsKernel(const float* logits, float* scores,
     scores[i] = isfinite(logits[i]) ? logits[i] : -INFINITY;
     ids[i] = static_cast<std::uint32_t>(i);
   }
+}
+
+__global__ void TokenSetBiasKernel(float* __restrict__ logits,
+                                   const std::uint32_t* __restrict__ tokens,
+                                   float bias, std::size_t vocab_size) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < vocab_size && ((tokens[index / 32U] >> (index % 32U)) & 1U))
+    logits[index] += bias;
 }
 
 __global__ void ApplySparsePenaltiesKernel(
@@ -1244,6 +1254,50 @@ void LaunchGPUSortLogits(const float* logits, GpuSamplingWorkspace* workspace,
   SortSamplingLogits(workspace, keep, stream);
 }
 
+DeviceTokenSet::~DeviceTokenSet() {
+  if (words_ != nullptr)
+    (void)hipFree(words_);
+}
+
+const std::uint32_t* DeviceTokenSet::Get(
+    const std::shared_ptr<const sampling::TokenSet>& set,
+    std::size_t vocab_size, hipStream_t stream) {
+  if (set == nullptr || set->words.empty() || vocab_size == 0)
+    return nullptr;
+  if (set == source_ && vocab_size == vocab_size_)
+    return words_;
+  // The previous copy may still be read by queued work.
+  HIP_CHECK(hipStreamSynchronize(stream));
+  if (words_ != nullptr) {
+    HIP_CHECK(hipFree(words_));
+    words_ = nullptr;
+    source_.reset();
+  }
+  std::vector<std::uint32_t> words((vocab_size + 31) / 32, 0);
+  std::copy_n(set->words.begin(), std::min(words.size(), set->words.size()),
+              words.begin());
+  const auto bytes = words.size() * sizeof(std::uint32_t);
+  HIP_CHECK(hipMalloc(&words_, bytes));
+  HIP_CHECK(hipMemcpyAsync(words_, words.data(), bytes,
+                           hipMemcpyHostToDevice, stream));
+  HIP_CHECK(hipStreamSynchronize(stream));
+  source_ = set;
+  vocab_size_ = vocab_size;
+  return words_;
+}
+
+void LaunchTokenSetBias(float* logits, const std::uint32_t* tokens,
+                        float bias, std::size_t vocab_size,
+                        hipStream_t stream) {
+  if (logits == nullptr || tokens == nullptr || vocab_size == 0)
+    throw std::invalid_argument("invalid token set bias launch");
+  TokenSetBiasKernel<<<static_cast<unsigned int>(
+                           (vocab_size + kSamplingThreads - 1U) /
+                           kSamplingThreads),
+                       kSamplingThreads, 0, stream>>>(logits, tokens, bias,
+                                                      vocab_size);
+}
+
 void LaunchGPUSampling(const float* logits, std::uint32_t* out_token,
                        std::size_t vocab_size,
                        const GpuSamplingParameters& parameters,
@@ -1260,11 +1314,13 @@ void LaunchGPUSampling(const float* logits, std::uint32_t* out_token,
   }
 
   const bool has_penalties = penalty_count > 0;
+  const bool has_han =
+      parameters.han_bias != 0.0F && parameters.han_tokens != nullptr;
   const bool needs_ordering =
       parameters.top_k > 0 || parameters.top_p < 1.0F ||
       (parameters.min_p > 0.0F && parameters.min_keep > 1);
   const float* sampling_logits = logits;
-  if (has_penalties || needs_ordering) {
+  if (has_penalties || has_han || needs_ordering) {
     const std::size_t blocks =
         (vocab_size + kSamplingThreads - 1U) / kSamplingThreads;
     PrepareSamplingKernel<<<static_cast<unsigned int>(blocks), kSamplingThreads,
@@ -1284,6 +1340,10 @@ void LaunchGPUSampling(const float* logits, std::uint32_t* out_token,
         vocab_size, parameters.repeat_penalty, parameters.frequency_penalty,
         parameters.presence_penalty);
   }
+  // After the penalties, as SamplerState: repeat penalty reads the raw sign.
+  if (has_han)
+    LaunchTokenSetBias(workspace->adjusted_logits, parameters.han_tokens,
+                       parameters.han_bias, vocab_size, stream);
 
   if (parameters.temperature <= 0.0F) {
     LaunchGPUArgmax(sampling_logits, out_token, vocab_size, stream);
@@ -1343,11 +1403,13 @@ void LaunchGPUSpeculativeSampling(
       draft_candidate_count * sizeof(float), hipMemcpyHostToDevice, stream));
 
   const bool has_penalties = penalty_count > 0;
+  const bool has_han =
+      parameters.han_bias != 0.0F && parameters.han_tokens != nullptr;
   const bool needs_ordering =
       parameters.top_k > 0 || parameters.top_p < 1.0F ||
       (parameters.min_p > 0.0F && parameters.min_keep > 1);
   const float* sampling_logits = logits;
-  if (has_penalties || needs_ordering) {
+  if (has_penalties || has_han || needs_ordering) {
     const std::size_t blocks =
         (vocab_size + kSamplingThreads - 1U) / kSamplingThreads;
     PrepareSamplingKernel<<<static_cast<unsigned int>(blocks), kSamplingThreads,
@@ -1367,6 +1429,10 @@ void LaunchGPUSpeculativeSampling(
         vocab_size, parameters.repeat_penalty, parameters.frequency_penalty,
         parameters.presence_penalty);
   }
+  // After the penalties, as SamplerState: repeat penalty reads the raw sign.
+  if (has_han)
+    LaunchTokenSetBias(workspace->adjusted_logits, parameters.han_tokens,
+                       parameters.han_bias, vocab_size, stream);
 
   if (needs_ordering) {
     SortSamplingLogits(workspace, SamplingTopCount(parameters, vocab_size),

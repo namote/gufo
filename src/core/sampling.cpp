@@ -79,16 +79,30 @@ double Penalize(double logit, const SamplingConfig& config,
   return logit;
 }
 
+/// Adds the Han offset (SamplingConfig::han_bias) to a penalized logit.
+double ScaleHan(double logit, TokenId token, const SamplingConfig& config,
+                double han_bias) noexcept {
+  return han_bias != 0 && config.han_tokens->Contains(token) ? logit + han_bias
+                                                             : logit;
+}
+
+/// Candidate tokens index `token_ids` when it is nonempty (compact rows).
 void ApplyPenalties(std::vector<Candidate>* candidates,
                     const SamplingConfig& config,
-                    std::span<const TokenPenalty> penalties) {
-  if (penalties.empty())
+                    std::span<const TokenPenalty> penalties,
+                    std::span<const TokenId> token_ids = {}) {
+  const double han_bias = config.han_bias();
+  if (penalties.empty() && han_bias == 0)
     return;
   for (auto& candidate : *candidates) {
     const auto found = std::ranges::lower_bound(penalties, candidate.token, {},
                                                 &TokenPenalty::token);
     if (found != penalties.end() && found->token == candidate.token)
       candidate.logit = Penalize(candidate.logit, config, *found);
+    candidate.logit = ScaleHan(
+        candidate.logit,
+        token_ids.empty() ? candidate.token : token_ids[candidate.token],
+        config, han_bias);
   }
 }
 
@@ -257,11 +271,28 @@ void SamplingConfig::Validate() const {
   if (!std::isfinite(presence_penalty)) {
     throw std::invalid_argument("sampling presence penalty must be finite");
   }
+  if (!std::isfinite(han_scale) || han_scale <= 0.0F || han_scale > 1.0F) {
+    throw std::invalid_argument("sampling Han scale must be in (0, 1]");
+  }
+}
+
+double SamplingConfig::han_bias() const noexcept {
+  // A fixed logit offset ln(x), applied before temperature like the
+  // penalties: the temperature-1 probability times x. At temperature T the
+  // tempered weight scales by x^(1/T). The offset is the same for greedy,
+  // top-k 1 and every temperature, so the effect is continuous as T -> 0
+  // and stronger, not weaker, at the low temperatures chat uses. (ln(x) * T
+  // would scale every tempered distribution by exactly x but vanish as
+  // T -> 0 while greedy kept the full offset.)
+  if (han_scale == 1.0F || !han_tokens || han_tokens->count == 0)
+    return 0;
+  return std::log(static_cast<double>(han_scale));
 }
 
 bool SamplingConfig::penalties_enabled() const noexcept {
   return repeat_penalty != 1.0F || frequency_penalty != 0.0F ||
-         presence_penalty != 0.0F;
+         presence_penalty != 0.0F ||
+         (han_scale != 1.0F && han_tokens && han_tokens->count != 0);
 }
 
 bool SamplingConfig::uses_random_sampling() const noexcept {
@@ -409,7 +440,8 @@ TokenId SamplingDistribution::SampleResidual(
 
 static SamplingDistribution DistributionWithPenalties(
     std::span<const float> logits, const SamplingConfig& config,
-    std::span<const TokenPenalty> penalties) {
+    std::span<const TokenPenalty> penalties,
+    std::span<const TokenId> token_ids = {}) {
   config.Validate();
   if (logits.empty()) {
     throw std::invalid_argument("cannot sample an empty logit distribution");
@@ -433,7 +465,7 @@ static SamplingDistribution DistributionWithPenalties(
     throw std::runtime_error("logit distribution contains no finite values");
   }
 
-  ApplyPenalties(&candidates, config, penalties);
+  ApplyPenalties(&candidates, config, penalties, token_ids);
   ApplyTopK(&candidates, config);
   if (config.temperature == 0.0F) {
     return SamplingDistribution(
@@ -492,6 +524,7 @@ SamplingDistribution BuildDistribution(
 SamplerState::SamplerState(SamplingConfig config,
                            std::span<const TokenId> initial_history)
     : config_(config),
+      han_bias_(config.han_bias()),
       history_(initial_history.begin(), initial_history.end()),
       rng_state_(InitialRngState(config.seed)) {
   config_.Validate();
@@ -504,6 +537,7 @@ SamplerState::SamplerState(SamplingConfig config,
 
 SamplerState::SamplerState(const SamplerState& other)
     : config_(other.config_),
+      han_bias_(other.han_bias_),
       constraint_state_(other.constraint_state_),
       constraint_mask_(other.constraint_mask_),
       constraint_restricts_(other.constraint_restricts_),
@@ -520,6 +554,7 @@ SamplerState& SamplerState::operator=(const SamplerState& other) {
     return *this;
   }
   config_ = other.config_;
+  han_bias_ = other.han_bias_;
   constraint_state_ = other.constraint_state_;
   constraint_mask_ = other.constraint_mask_;
   constraint_restricts_ = other.constraint_restricts_;
@@ -808,7 +843,7 @@ SamplingDistribution SamplerState::Distribution(
       penalties.push_back(penalty);
     }
   }
-  return DistributionWithPenalties(logits, config_, penalties);
+  return DistributionWithPenalties(logits, config_, penalties, token_ids);
 }
 
 void SamplerState::DeferSample(TokenId token) {
@@ -901,12 +936,15 @@ void SamplerState::RebuildPenaltyCounts() {
 double SamplerState::AdjustedLogit(TokenId token, float logit) const noexcept {
   const auto found = std::ranges::lower_bound(penalty_counts_, token, {},
                                               &TokenPenalty::token);
-  return found == penalty_counts_.end() || found->token != token
-             ? static_cast<double>(logit)
-             : Penalize(logit, config_, *found);
+  return ScaleHan(found == penalty_counts_.end() || found->token != token
+                      ? static_cast<double>(logit)
+                      : Penalize(logit, config_, *found),
+                  token, config_, han_bias_);
 }
 
 TokenId SamplerState::SampleGreedy(std::span<const float> logits) const {
+  // The Han offset is never positive, so a block maximum still bounds it.
+  const double han_bias = han_bias_;
   double best_logit = -std::numeric_limits<double>::infinity();
   TokenId best_token = 0;
   bool found = false;
@@ -930,9 +968,10 @@ TokenId SamplerState::SampleGreedy(std::span<const float> logits) const {
       while (penalty != penalty_counts_.end() && penalty->token < index)
         ++penalty;
       const double adjusted =
-          penalty != penalty_counts_.end() && penalty->token == index
-              ? Penalize(logits[index], config_, *penalty)
-              : static_cast<double>(logits[index]);
+          ScaleHan(penalty != penalty_counts_.end() && penalty->token == index
+                       ? Penalize(logits[index], config_, *penalty)
+                       : static_cast<double>(logits[index]),
+                   static_cast<TokenId>(index), config_, han_bias);
       if (!std::isfinite(adjusted)) {
         throw std::runtime_error(
             "sampling penalties produced a non-finite logit");
@@ -958,15 +997,15 @@ TokenId SamplerState::SampleConstrainedGreedy(
         "JSON constraint vocabulary differs from logits");
   // Read the mask directly: greedy constraints need neither a copied vocabulary
   // of masked logits nor a cloned sampler/history. Preserve token-ID tie order.
+  const bool adjusted = !penalty_counts_.empty() || han_bias_ != 0;
   double best_logit = -std::numeric_limits<double>::infinity();
   TokenId best_token = 0;
   bool found = false;
   for (std::size_t index = 0; index < logits.size(); ++index) {
     if (!(*mask)[index] || !std::isfinite(logits[index]))
       continue;
-    const double value = penalty_counts_.empty()
-                             ? static_cast<double>(logits[index])
-                             : AdjustedLogit(index, logits[index]);
+    const double value = adjusted ? AdjustedLogit(index, logits[index])
+                                  : static_cast<double>(logits[index]);
     if (!std::isfinite(value))
       throw std::runtime_error(
           "sampling penalties produced a non-finite logit");
@@ -986,13 +1025,13 @@ SamplingDistribution SamplerState::LinearDistribution(
   std::vector<Probability> candidates;
   candidates.reserve(logits.size());
   double maximum = -std::numeric_limits<double>::infinity();
+  const bool adjusted = !penalty_counts_.empty() || han_bias_ != 0;
   for (std::size_t i = 0; i < logits.size(); ++i) {
     if (!std::isfinite(logits[i]))
       continue;
-    const double value =
-        penalty_counts_.empty()
-            ? static_cast<double>(logits[i])
-            : AdjustedLogit(static_cast<TokenId>(i), logits[i]);
+    const double value = adjusted
+                             ? AdjustedLogit(static_cast<TokenId>(i), logits[i])
+                             : static_cast<double>(logits[i]);
     if (!std::isfinite(value))
       throw std::runtime_error(
           "sampling penalties produced a non-finite logit");
@@ -1019,14 +1058,20 @@ SamplingDistribution SamplerState::LinearDistribution(
 
 void SamplerState::PrepareSelected(std::span<const float> logits) {
   candidate_scratch_.clear();
+  // A block skip below compares the raw block maximum: the Han offset is
+  // never positive, so that maximum still bounds every adjusted logit.
+  const double han_bias = han_bias_;
   // Vocabulary IDs and sparse penalties are both sorted. Walk them together
   // instead of searching the penalties for every vocabulary entry.
   const auto adjusted_at = [&](std::size_t index, auto& penalty) {
     while (penalty != penalty_counts_.end() && penalty->token < index)
       ++penalty;
     if (penalty == penalty_counts_.end() || penalty->token != index)
-      return static_cast<double>(logits[index]);
-    const double adjusted = Penalize(logits[index], config_, *penalty);
+      return ScaleHan(static_cast<double>(logits[index]),
+                      static_cast<TokenId>(index), config_, han_bias);
+    const double adjusted =
+        ScaleHan(Penalize(logits[index], config_, *penalty),
+                 static_cast<TokenId>(index), config_, han_bias);
     if (!std::isfinite(adjusted)) {
       throw std::runtime_error(
           "sampling penalties produced a non-finite logit");

@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <stdexcept>
 
@@ -58,7 +59,39 @@ struct GpuSamplingParameters {
   float frequency_penalty{0.0F};
   float presence_penalty{0.0F};
   double uniform{0.0};
+  /// SamplingConfig::han_bias added to every token of the device set
+  /// han_tokens after the penalties; zero (or a null set) skips it.
+  const std::uint32_t* han_tokens{nullptr};
+  float han_bias{0.0F};
 };
+
+/// A device copy of a host TokenSet (same bit layout). Get uploads a set on
+/// first use and returns the retained copy while the same set is supplied.
+/// The copy covers `vocab_size` tokens, zero-padded when the host set (built
+/// from the tokenizer) is shorter than the logit rows, so kernels index it
+/// without bounds checks. The upload synchronizes `stream`; never call it
+/// during graph capture.
+class DeviceTokenSet {
+public:
+  DeviceTokenSet() = default;
+  ~DeviceTokenSet();
+  DeviceTokenSet(const DeviceTokenSet&) = delete;
+  DeviceTokenSet& operator=(const DeviceTokenSet&) = delete;
+
+  [[nodiscard]] const std::uint32_t* Get(
+      const std::shared_ptr<const sampling::TokenSet>& set,
+      std::size_t vocab_size, hipStream_t stream);
+
+private:
+  std::shared_ptr<const sampling::TokenSet> source_;
+  std::uint32_t* words_{nullptr};
+  std::size_t vocab_size_{0};
+};
+
+/// Adds `bias` to logits[t] of every token t in the device set `tokens`
+/// (one row of `vocab_size` logits).
+void LaunchTokenSetBias(float* logits, const std::uint32_t* tokens, float bias,
+                        std::size_t vocab_size, hipStream_t stream = nullptr);
 
 void AllocateGpuSamplingWorkspace(GpuSamplingWorkspace* workspace,
                                   std::size_t vocab_size,

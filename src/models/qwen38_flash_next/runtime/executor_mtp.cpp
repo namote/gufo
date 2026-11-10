@@ -194,6 +194,23 @@ bool Executor::KeepHiddenRow(Session& session, std::uint32_t row,
       "kept hidden row", error_msg);
 }
 
+bool Executor::SetHanRows(const sampling::SamplerState& sampler,
+                          GreedyPenaltyRows* rows,
+                          std::string* error_msg) const {
+  const double bias = sampler.config().han_bias();
+  if (bias == 0)
+    return true;
+  try {
+    rows->han_tokens = han_tokens_.Get(sampler.config().han_tokens,
+                                       config().vocab_size, stream_);
+  } catch (const std::exception& exception) {
+    AssignError(error_msg, exception.what());
+    return false;
+  }
+  rows->han_bias = bias;
+  return true;
+}
+
 bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
                                     const sampling::SamplerState& sampler,
                                     std::span<const std::int32_t> drafts,
@@ -253,6 +270,8 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
       verification_penalty_capacity_ = capacity;
     }
     batch.penalties = verification_penalties_;
+    if (!SetHanRows(sampler, &batch, error_msg))
+      return false;
     if (!penalties.empty() &&
         !Check(hipMemcpyAsync(verification_penalties_, penalties.data(),
                               penalties.size() * sizeof(penalties.front()),
@@ -297,7 +316,13 @@ bool Executor::CanCompactMtpVerification(
          std::size_t(config.top_k) <= kMtpCandidates &&
          config.min_keep <= kMtpCandidates &&
          sampler.penalties().size() + 8 <= kCompactPenaltyLimit &&
-         !sampler.NeedsConstraintMask();
+         !sampler.NeedsConstraintMask() &&
+         // The candidate tiles rank logit + Han offset as F32 keys; keep a
+         // rank of margin so rounding at the boundary cannot drop the
+         // target's last top-k member.
+         (config.han_bias() == 0 ||
+          (std::size_t(config.top_k) < kMtpCandidates &&
+           config.min_keep < kMtpCandidates));
 }
 
 bool Executor::SampledMtpCandidates(
@@ -349,6 +374,8 @@ bool Executor::SampledMtpCandidates(
       tentative.Accept(static_cast<sampling::TokenId>(drafts[row]));
   }
   batch.penalties = verification_penalties_;
+  if (!SetHanRows(sampler, &batch, error_msg))
+    return false;
   if (!penalties.empty() &&
       !Check(hipMemcpyAsync(verification_penalties_, penalties.data(),
                             penalties.size() * sizeof(penalties[0]),

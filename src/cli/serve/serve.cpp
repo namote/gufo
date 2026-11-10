@@ -641,6 +641,7 @@ void PrintServeHelp(std::string_view program_name,
         "Sampling Defaults", &max_tokens);
     RegisterSamplingOptions(parser, &sampling_config, "Sampling Defaults", true,
                             true);
+    RegisterHanScaleOption(parser, &sampling_config, "Sampling Defaults");
 
     // Reasoning Defaults
     parser.AddOption(
@@ -1287,6 +1288,7 @@ int RunServe(std::span<const char* const> args) {
         "Sampling Defaults", &max_tokens);
     RegisterSamplingOptions(llm_parser, &sampling_config, "Sampling Defaults",
                             true, true);
+    RegisterHanScaleOption(llm_parser, &sampling_config, "Sampling Defaults");
     llm_parser.AddOption(
         "", "--think", "MODE",
         "Default reasoning mode: on, off, or auto (default: model)",
@@ -1607,10 +1609,18 @@ int RunServe(std::span<const char* const> args) {
         << " repeat_last_n=" << effective_sampling.repeat_last_n
         << " frequency_penalty=" << effective_sampling.frequency_penalty
         << " presence_penalty=" << effective_sampling.presence_penalty
+        << " han_scale="
+        << (backend->supports_han_scale() ? effective_sampling.han_scale : 1.0F)
         << " typical_acceptance="
         << (effective_sampling.typical_acceptance &&
             backend->supports_typical_acceptance());
     server::Logger::Info("sampling", sampling_log.str());
+    if (sampling_config.han_scale != 1.0F && !backend->supports_han_scale()) {
+      server::Logger::Warn(
+          "sampling",
+          "event=han_scale_unsupported detail=--han-scale applies only to "
+          "Qwen 27B and Flash-Next; ignored");
+    }
     if (llm_parser.WasSupplied("--typical-acceptance") &&
         sampling_config.typical_acceptance &&
         !backend->supports_typical_acceptance()) {

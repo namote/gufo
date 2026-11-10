@@ -295,6 +295,20 @@ inline std::optional<SamplingRequestError> ParseSamplingConfig(
                                              &output->presence_penalty, true)) {
     return error;
   }
+  if (auto error = detail::ReadSamplingFloat(body, "han_scale",
+                                             &output->han_scale, true))
+    return error;
+  // Gufo extension: (0, 1], checked on the JSON number like the bounds below
+  // and on the float, which a tiny positive number rounds to zero.
+  if (const auto* scale = body.find("han_scale");
+      scale && scale->is_number() &&
+      !(scale->as_double() > 0.0 && scale->as_double() <= 1.0 &&
+        output->han_scale > 0.0F)) {
+    return SamplingRequestError{
+        .message = "'han_scale' must be greater than 0 and at most 1",
+        .code = "invalid_han_scale",
+    };
+  }
   if (const auto* typical = body.find("typical_acceptance");
       typical != nullptr && !typical->is_null()) {
     if (!typical->is_bool()) {

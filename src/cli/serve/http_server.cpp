@@ -1532,6 +1532,9 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
   // proposals. False on backends that never apply it.
   params["typical_acceptance"] =
       sampling.typical_acceptance && b.supports_typical_acceptance();
+  // Gufo extension: the default Han-script scale; 1 where it never applies.
+  params["han_scale"] =
+      static_cast<double>(b.supports_han_scale() ? sampling.han_scale : 1.0F);
   // -1 means no default limit, as in llama-server, which reports both keys.
   const auto n_predict = defaults.max_tokens > 0
                              ? static_cast<std::int64_t>(defaults.max_tokens)

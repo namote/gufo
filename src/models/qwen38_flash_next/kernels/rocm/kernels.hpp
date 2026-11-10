@@ -881,6 +881,10 @@ void Argmax(const float* logits, ArgmaxCandidate* scratch, std::int32_t* out,
 struct GreedyPenaltyRows {
   const sampling::TokenPenalty* penalties;
   std::uint32_t offsets[8]{};
+  /// SamplingConfig::han_bias, added in FP64 after the penalties to every
+  /// token of this device set (sampling::TokenSet layout); null skips it.
+  const std::uint32_t* han_tokens{nullptr};
+  double han_bias{0};
 };
 struct PenaltyArgmaxCandidate {
   double value;
@@ -898,8 +902,11 @@ void GatherArgmaxCandidates(const float* logits, const std::uint32_t* ids,
 
 /// Exact top-64 unpenalized tokens plus every penalized token, retaining
 /// original F32 logits. This union contains the target's complete top-k for
-/// k <= 64, even when penalties promote tokens. The CPU keeps its existing
-/// FP64 penalties, filtering, normalization and rejection sampler.
+/// k <= 64, even when penalties promote tokens. The top 64 rank the Han
+/// offset, so lowered Han tokens cannot crowd out the target's top-k either.
+/// That key is F32 and can reorder near-equal keys, so an active Han scale
+/// compacts only k <= 63 (CanCompactMtpVerification). The CPU keeps its
+/// existing FP64 penalties, filtering, normalization and rejection sampler.
 /// Each ID workspace holds rows * MtpCandidateWorkspaceSize(vocab) entries.
 /// Output row r starts at r * 64 + penalties.offsets[r]; invalid IDs have
 /// -infinity logits.
