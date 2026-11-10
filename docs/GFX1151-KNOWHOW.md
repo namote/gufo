@@ -69,6 +69,11 @@ short replies that run beside the anchor.
     releases its scratch and a valid owned session keeps it, with logits and
     tokens equal to a fresh session. The session test was not rerun.
   - Measured but not kept: e1 (grid cap 80) and e4 (graph drop).
+- **Decision (2026-11-10).** The user kept cand8: B1's retention of scratch
+  after a cancel stays removed. To bring it back, first find the slow-mode
+  mechanism. From now on, compare S3 by the per-request `server_duration_ms`
+  sums (pairs and replies), not by the decode sum. Since C4, the decode sum
+  counts each shared lockstep cycle for both members.
 - **Tooling.** Read stack arguments as `*(uint32*)(reg("sp")+8)`, because
   bpftrace 0.25 has no `sarg`. A by-value return shifts `arg0` to the sret
   pointer. `rocprofv3` in the build image cannot load the pinned HIP
