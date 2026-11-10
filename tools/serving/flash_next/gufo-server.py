@@ -24,9 +24,11 @@ STATE = ROOT / 'server-state.json'
 IMAGE = 'ai-tools/gufo-eval:native-exl3-vision-rocm101'
 IMAGE_ID = 'sha256:e7a761a40187efb13515a0275362ab09d084a129f4544aa4300ec5cccb8c7468'
 MODEL = '/home/m2on/projects/models/llm/flash-next-exl3-gufo-c03'
-RUNTIME = '/home/m2on/.local/share/gufo/runtime-hc-20261108'
-GUFO_SHA256 = '166953f072272e931328f93aafa9e417f2919a331f0933755584c127fcceca1c'
+RUNTIME = '/home/m2on/.local/share/gufo/runtime-upsync-20261110'
+GUFO_SHA256 = 'a2a1899172b1a3e54d292220d9c63334541f051ccd7a158f7c0839fd9689b09b'
 TEMPERATURE = 0.9
+# Scale Han-ideograph token probability by 0.2 (docs/SERVER.md --han-scale); requests may override.
+HAN_SCALE = 0.2
 VISION = MODEL + ' (embedded EXL3 vision)'
 URL = 'http://127.0.0.1:18740'
 BIND_HOST = '0.0.0.0'
@@ -144,7 +146,7 @@ def build_command(state):
                 '--kv-pool-bytes', str(KV_POOL_BYTES), '--cache-ram-bytes', str(RAM_CACHE_BYTES),
                 '--cache-disk', '/cache/continuations', '--cache-disk-bytes', str(DISK_CACHE_BYTES),
                 '--temperature', str(TEMPERATURE), '--top-k', '20', '--top-p', '0.95', '--min-p', '0',
-                '--repeat-penalty', '1',
+                '--repeat-penalty', '1', '--han-scale', str(HAN_SCALE),
                 '--presence-penalty', '0', '--frequency-penalty', '0', '--max-tokens', '-1',
                 '--request-timeout-ms', '0', '--stall-timeout-ms', '0',
                 '--max-output-bytes', '9223372036854775807',
@@ -159,6 +161,7 @@ def supervise():
     state = {'run_id': identifier, 'container': 'gufo-' + identifier,
              'pid': os.getpid(), 'status': 'preflight', 'image': IMAGE, 'image_id': IMAGE_ID,
              'model': MODEL, 'runtime': RUNTIME, 'elf_sha256': GUFO_SHA256, 'temperature': TEMPERATURE,
+             'han_scale': HAN_SCALE,
              'draft_tokens': 7, 'url': URL, 'bind_host': BIND_HOST, 'logs': str(out), 'seconds': None,
              'supervisor_script': str(Path(__file__).resolve()),
              'request_timeout_ms': 0, 'stall_timeout_ms': 0, 'max_tokens': -1,
@@ -364,7 +367,7 @@ def status():
         print('Not started')
         return
     info = inspect_owned(state)
-    keys = ['status', 'model', 'temperature', 'draft_tokens', 'url', 'bind_host', 'context_per_session', 'sessions',
+    keys = ['status', 'model', 'temperature', 'han_scale', 'draft_tokens', 'url', 'bind_host', 'context_per_session', 'sessions',
             'kv_pool_bytes', 'kv_cache_type', 'disk_cache_bytes', 'thinking',
             'reasoning_effort', 'request_timeout_ms', 'stall_timeout_ms',
             'max_tokens', 'max_output_bytes', 'max_request_bytes', 'expires_epoch', 'logs', 'error']

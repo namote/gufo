@@ -161,6 +161,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(argv[argv.index('--entrypoint') + 1], '/candidate/gufo')
         self.assertIn(f'type=bind,src={server.MODEL},dst=/models/fnx,readonly', argv)
         self.assertEqual(argv[argv.index('--kv-pool-bytes') + 1], str(server.KV_POOL_BYTES))
+        self.assertEqual(argv[argv.index('--han-scale') + 1], str(server.HAN_SCALE))
         self.assertEqual(argv[-1], '--log-progress')
 
 
