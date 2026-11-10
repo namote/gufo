@@ -1,5 +1,53 @@
 # gfx1151 optimization know-how
 
+## Upstream D8 short-prefill priority, November 10, 2026 (not deployed)
+
+Evidence is under `build/b1/d8-20261110/` (README.txt). Same host state as S3
+(kernel 7.0.0-43, proactiveness 20, production stopped), with
+`tools/bench/host_preflight.sh` PREFLIGHT OK before every timing run (about
+29.2-29.4K free blocks of order 9 or more). cand9 = `37c96630` (cand8 plus D8),
+gufo `27dac789`, built incrementally in `build/d8c9`; cand8 = `812e8027`.
+- **Change.** `TextSchedulerPolicy::short_prefill_priority_tokens` (internal,
+  default 4096, 0 disables). A prefill with at most that many tokens left
+  runs before a longer front's next chunk. Once that many tokens have
+  bypassed the long prefill since its last turn, out-of-turn picks stop, so
+  the long one waits at most the limit plus one pass. A long turn taken
+  while such a short peer waits is bounded to `decode_active_tokens`.
+  Admission, the capture requeue and the 2048-token admission interval are
+  unchanged (the 2048→1024 option was not taken).
+- **C4, alternated cand8/cand9 x2 (`--sessions 2`, TTFT s):**
+
+  | Run | A alone | A with B | B |
+  |---|---|---|---|
+  | cand8-1 | 1.86 1.87 1.87 | 3.30 3.19 3.20 | 20.97 21.11 20.94 |
+  | cand9-1 | 1.86 1.86 1.87 | 2.40 2.27 2.28 | 20.72 20.97 20.68 |
+  | cand8-2 | 1.86 1.87 1.87 | 3.31 3.22 3.20 | 21.04 21.15 20.96 |
+  | cand9-2 | 1.87 1.87 1.87 | 2.39 2.27 2.28 | 20.90 20.65 20.69 |
+
+  A's three prefill passes (2048, 288, 8 tokens) now run back to back after
+  B's lone 2048-token pass. The remaining ~0.4 s over alone is that
+  un-preemptible pass, which was left as it is. B is about 0.26 s faster
+  (mean 21.03 → 20.77 s): its 512-token passes beside A are gone.
+- **S3 FP16 batch, latency sums (`server_duration_ms`, width-2 rows):**
+  pairs cand8 6721/6723, cand9 6224/6234; replies 5393/5958 against
+  5299/5313. cand8 ran in the slow short-prefill mode in both runs (pair
+  prefill median 135.1 ms), and cand9 ran in the fast mode in both
+  (127.5/127.8 ms). Against cand8's own fast-mode run from S3 (`v-cand8-2`,
+  6251/5182 at 128.2 ms), cand9 is equal. The gap is the known bimodal
+  slow mode, not D8: pair and reply prefills are all short, so they keep
+  round-robin. No regression.
+- **Correctness.** The continuation adapter test passes (rc 0). The session
+  test passes (rc 0, `batch mixed_kv_only_cohorts=5`,
+  `independent_state_exact=1`, all serving replays exact). Functional
+  `cache` (cand8 and cand9): every suite passes, and all 29 outputs are
+  equal, also to cand7 `c7cache`. Functional `batch`: passes in all four
+  runs, with all 41 outputs equal to S3 `v-cand8-1`.
+- **D3: the `mtp_audit` failure predates the upstream sync.** A
+  `qwen38_flash_next_gpu_probe` built from the base controller commit
+  `284b2378` (git archive into a copy of the s3c8 build dir) gives exactly the
+  U6 candidate numbers: attention-state relative RMS 0.0070984, max_abs
+  0.0403644, against a 0.002 tolerance. It is the known EXL3 oracle gap.
+
 ## Upstream S3 batch regression, November 10, 2026 (not deployed)
 
 Evidence is under `build/b1/s3-20261110/` (tools/, trace/, func/,

@@ -20,12 +20,12 @@
 |---|---|---|
 | D1 | U4-3 E1~E4 replay | hang 재현 도구. 우회가 통하므로 급하지 않다. `u6-rocgdb-nix` docker volume을 남겨 뒀다 |
 | D2 | AMD에 MES queue 정지 버그 보고 초안 | 외부 공개라 사용자가 원할 때만 한다. 증거: `build/b1/u6-20261109/hang/` |
-| D3 | `mtp_audit` base 대조 | 모든 후보에서 attention-state 0.0071(기준 0.002)로 실패한다. base에서 한 번 돌려 기존 차이인지 확인한다 |
+| D3 | `mtp_audit` base 대조 | 모든 후보에서 attention-state 0.0071(기준 0.002)로 실패한다. base에서 한 번 돌려 기존 차이인지 확인한다 **완료**: base 소스(`284b2378`)로 만든 gpu_probe도 0.0070984로 똑같이 실패한다. upstream sync 이전부터 있던 EXL3 oracle 차이다 |
 | D4 | 27B adapter image section | `mmproj-BF16.gguf` 파일이 필요하다(모델 폴더 확인) |
 | D5 | C3 hash를 SHF_ALLOC section만으로 정밀하게 | 지금은 줄 번호만 바뀌어도 캐시가 무효가 된다. 안전한 쪽이라 낮다 |
 | D6 | C1 테스트 보강(kv_only가 둘 이상 섞인 cohort) | CPU/GPU session test 추가 **완료**: `1d6faa94`/`18081f1c`, U7b cand6 session test에서 `batch mixed_kv_only_cohorts=5` |
 | D7 | cand4 배포 | 사용자 결정. 배포하면 supervisor(C2, `prepare_memory`)를 같이 설치해야 한다 |
-| D8 | 긴 prefill 옆 요청의 TTFT 공정성 | C4 수정 뒤에도 A TTFT가 혼자 약 2.0 s에서, B의 약 24K cold prefill 중 3.2~3.3 s다. A가 B의 512 token pass(약 455 ms) 뒤에 줄을 서고, prefill pass가 번갈아 돈다. capture 문제가 아니라 scheduler 순서 문제이고 base에도 있다. 짧은 prompt 우선, B chunk 크기 조정, decode/짧은 prefill 끼워 넣기 같은 정책 후보를 설계하고, 사전 점검을 통과한 재부팅 뒤 창에서 A/B TTFT로 잰다 |
+| D8 | 긴 prefill 옆 요청의 TTFT 공정성 | C4 수정 뒤에도 A TTFT가 혼자 약 2.0 s에서, B의 약 24K cold prefill 중 3.2~3.3 s다. A가 B의 512 token pass(약 455 ms) 뒤에 줄을 서고, prefill pass가 번갈아 돈다. capture 문제가 아니라 scheduler 순서 문제이고 base에도 있다. 짧은 prompt 우선, B chunk 크기 조정, decode/짧은 prefill 끼워 넣기 같은 정책 후보를 설계하고, 사전 점검을 통과한 재부팅 뒤 창에서 A/B TTFT로 잰다 **완료**(`37c96630`, 1안만 적용; 2048→1024 admission 변경은 하지 않음): 남은 token이 4096 이하인 prefill이 긴 prefill의 다음 chunk보다 먼저 돈다. 차례를 건너뛰는 양은 긴 prefill 한 차례마다 4096 token(+한 pass)까지로 제한한다. C4에서 A TTFT(B와 함께)는 3.19~3.31 s에서 2.27~2.40 s로 줄었고, A 혼자일 때(1.86~1.87 s)는 그대로다. B는 약 0.26 s 빨라졌다. S3 지연 합계는 회귀가 없다(차이는 slow/fast mode 때문이다). 남은 약 0.4 s는 B의 2048 token pass를 기다리는 시간이다 |
 
 ## GPU 패스 구성 (한 번에)
 
