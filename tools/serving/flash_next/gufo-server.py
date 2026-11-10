@@ -29,8 +29,10 @@ GUFO_SHA256 = '02dce1230c37d9b7075e7ac098761fe2e8d4cfee6de4f1ea5c5e398f14ea2c4a'
 # attention 2, mlp 0.5). Loaded only; requests enable it per call.
 ABLITERATION_PROFILE = '/candidate/abliteration-fnx.json'
 TEMPERATURE = 0.75
-# Scale Han-ideograph token probability by 0.2 (docs/SERVER.md --han-scale); requests may override.
-HAN_SCALE = 0.2
+# Scale Han-ideograph token probability by 0.1 in the final answer only, not in thinking
+# (docs/SERVER.md --han-scale, --han-scale-scope); requests may override.
+HAN_SCALE = 0.1
+HAN_SCALE_SCOPE = 'answer'
 VISION = MODEL + ' (embedded EXL3 vision)'
 URL = 'http://127.0.0.1:18740'
 BIND_HOST = '0.0.0.0'
@@ -148,6 +150,7 @@ def build_command(state):
                 '--cache-disk', '/cache/continuations', '--cache-disk-bytes', str(DISK_CACHE_BYTES),
                 '--temperature', str(TEMPERATURE), '--top-k', '20', '--top-p', '0.95', '--min-p', '0',
                 '--repeat-penalty', '1', '--han-scale', str(HAN_SCALE),
+                '--han-scale-scope', HAN_SCALE_SCOPE,
                 '--abliteration-profile', ABLITERATION_PROFILE,
                 '--presence-penalty', '0', '--frequency-penalty', '0', '--max-tokens', '-1',
                 '--request-timeout-ms', '0', '--stall-timeout-ms', '0',
@@ -163,7 +166,7 @@ def supervise():
     state = {'run_id': identifier, 'container': 'gufo-' + identifier,
              'pid': os.getpid(), 'status': 'preflight', 'image': IMAGE, 'image_id': IMAGE_ID,
              'model': MODEL, 'runtime': RUNTIME, 'elf_sha256': GUFO_SHA256, 'temperature': TEMPERATURE,
-             'han_scale': HAN_SCALE,
+             'han_scale': HAN_SCALE, 'han_scale_scope': HAN_SCALE_SCOPE,
              'draft_tokens': 7, 'url': URL, 'bind_host': BIND_HOST, 'logs': str(out), 'seconds': None,
              'supervisor_script': str(Path(__file__).resolve()),
              'request_timeout_ms': 0, 'stall_timeout_ms': 0, 'max_tokens': -1,
