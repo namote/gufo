@@ -1,5 +1,39 @@
 # gfx1151 optimization know-how
 
+## Flash-Next quality versus Kyojin: typical acceptance and HC Q8, November 10, 2026
+
+Evidence is under `build/b1/quality-20261110/` (`runs.jsonl`, `text.jsonl`,
+request scripts, `hcf16.patch`). Correctness only, no timing.
+- **Setup.** One image: a deliberately misspelled Korean lodging review (the
+  user's report: loops, Chinese/English drift, invented topics). Same c03 pack.
+  Gufo `00675d01` deployed argv; Kyojin v1.8.6 (`tools/serving/kyojin/`, mix
+  speculation, plain HC: no `hc_gs_sidecar`). The score is whether the reply
+  identifies lodging (the true topic).
+- **Typical acceptance caused the loops.** xhigh, seeds 1–4, typical on: 2/4
+  finished, 3/4 looped (one line 38 times; two hit 6,000 tokens). Request
+  `typical_acceptance:false`: 4/4 finished, no loop. Kyojin: 4/4 finished.
+  User decision: production now runs `--typical-acceptance off` and the
+  feature is being removed (D10).
+- **Removing `hc_q8/` does not give F16 HC.** The GPU loader quantizes F16 HC
+  down/up to uncalibrated Q8_0 (`device_model.cpp` Mixer). With that path,
+  lodging was identified 0/9 times; the replies invented a bar, salon,
+  bathhouse or public toilet.
+- **F16 HC versus calibrated Q8, typical off, medium.** F16 (experimental
+  `GUFO_FNX_HC_F16=1`, not committed): 2/5. Calibrated `hc_q8`: 1/5. Kyojin:
+  2/3. Most other replies had the right gist (old, dirty, stairs, do not
+  stay). Five samples do not separate F16 from calibrated Q8. The 11/7 KL
+  check (uncalibrated Q8 HC, KL256 0.0415 to 0.0417) also showed no
+  difference.
+- **Speed.** Uncontrolled single runs: F16 HC about 37 tok/s, calibrated Q8
+  about 41 tok/s (about +10%). These are not timing evidence.
+- **Other findings.**
+  - Kyojin adds a medium-effort system instruction that the model's own
+    template leaves empty.
+  - Image prompts tokenize to 239 in Gufo and 241 in Kyojin with the same
+    text; text-only prompts match at 227.
+  - Text-only at xhigh is hard for both engines: Gufo 0/4 and Kyojin 1/4
+    finished within 6,000 tokens.
+
 ## Han scale (`--han-scale`), November 10, 2026 (not deployed)
 
 Evidence is under `build/b1/han-20261110/` (README.txt): source `9bd4feeb`,
