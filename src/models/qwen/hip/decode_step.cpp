@@ -57,7 +57,8 @@ void ExecuteDecodeStep(
     std::uint32_t pos, bool compute_logits,
     QwenRecurrentStateIo recurrent_state,
     models::qwen::vision::DeviceInput* image_input, std::uint32_t kvarn_groups,
-    const float* abliteration_settings, const float* abliteration_directions) {
+    const float* abliteration_settings, const float* abliteration_directions,
+    bool abliteration_residual) {
   const auto* rope = image_input != nullptr ? image_input->rope() : nullptr;
   (void)token_id;
   const auto& config = weights.config;
@@ -374,6 +375,13 @@ void ExecuteDecodeStep(
           static_cast<std::uint32_t>(hidden_size), arena.stream);
     gufo::models::qwen::ResidualAdd(module_ctx, decode_scratch.hidden,
                                     ffn_scratch.out);
+    // The post-layer residual: where the collector reads the directions and
+    // what the next layer, the feature tap and the head read.
+    if (abliteration_settings != nullptr && abliteration_residual)
+      LaunchQwenAbliterateResidualRows(
+          decode_scratch.hidden.data(), abliteration_directions,
+          abliteration_settings, l, config.num_layers, 1,
+          static_cast<std::uint32_t>(hidden_size), arena.stream);
 
     if (const auto tap_index = arena.GetTargetLayerCaptureIndex(l);
         tap_index.has_value()) {

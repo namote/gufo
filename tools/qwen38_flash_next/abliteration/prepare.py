@@ -3,11 +3,18 @@
 Import pinned datasets with source notices, split before tuning, and fit
 candidate unit directions from Gufo's native per-prompt activation collector.
 `fit` writes gufo-abliteration-v2 candidates: every layer's direction plus
-default settings. `make-profile` writes one v2 profile with chosen defaults.
-Candidates are not installed automatically: held-out behavior and quality must
-be checked.
+default settings (writer candidates per layer and strength, and one
+residual-stream candidate per layer: residual 1 on every layer, writers 0).
+`make-profile` writes one v2 profile with chosen defaults. Candidates are not
+installed automatically: held-out behavior and quality must be checked.
 
-Strength curves (`make-profile --attention/--mlp`, search.py) follow Heretic:
+Writer strengths (`attention`, `mlp`) project a layer's attention/GDN and
+MLP outputs before they reach the residual; `residual` strengths project the
+post-layer residual itself, where the collector measured the directions, so
+strength 1 leaves no component along the direction there.
+
+Strength curves (`make-profile --attention/--mlp/--residual`, search.py)
+follow Heretic:
 for layer i, distance d = |i - peak|,
 
     weight(i) = max_w + (min_w - max_w) * d / width   if d <= width
@@ -115,9 +122,11 @@ def parse_weights(spec, layers):
     return check_weights(values * layers if len(values) == 1 else values, layers)
 
 
-def make_profile(base, direction_layer, attention, mlp, **extra):
+def make_profile(base, direction_layer, attention, mlp, residual=None, **extra):
     """A v2 profile from `base` (model_identity, hidden, layers, placement,
-    directions) with the given defaults; validated like the runtime loader."""
+    directions) with the given defaults; validated like the runtime loader.
+    `residual` (post-layer residual strengths) is optional: None omits the
+    member, which the runtime reads as all zero (writer-only, as before)."""
     hidden, layers = base['hidden'], base['layers']
     directions = base['directions']
     if len(directions) != layers:
@@ -133,6 +142,8 @@ def make_profile(base, direction_layer, attention, mlp, **extra):
                    directions=directions, direction_layer=direction_layer,
                    attention=check_weights(attention, layers),
                    mlp=check_weights(mlp, layers))
+    if residual is not None:
+        profile['residual'] = check_weights(residual, layers)
     profile.update(extra)
     return profile
 
@@ -251,10 +262,11 @@ def fit(collection, output, strengths=(0.5, 1.0)):
     # evaluation. Every candidate carries all directions, so a server can try
     # another direction layer per request.
     selected = sorted(set(int(round((layers - 1) * f)) for f in (.4, .6, .8)))
+    for strength in strengths:
+        if not 0 <= strength <= MAX_WEIGHT:
+            raise ValueError('strength must be in [0, 4]')
     for layer in selected:
         for strength in strengths:
-            if not 0 <= strength <= MAX_WEIGHT:
-                raise ValueError('strength must be in [0, 4]')
             # Restrict to a neighborhood of the candidate layer initially.
             weights = [float(strength if abs(i - layer) <= 3 else 0)
                        for i in range(layers)]
@@ -263,6 +275,16 @@ def fit(collection, output, strengths=(0.5, 1.0)):
                                       status='candidate-not-qualified',
                                       collection_sha256=collection_sha,
                                       strength=strength))
+        # Residual-stream directional ablation: the layer's direction removed
+        # from the post-layer residual at every layer (strength 1 leaves no
+        # component where the collector measured it), writers off.
+        zeros = [0.0] * layers
+        save_profile(output / f'layer{layer}-residual1.json',
+                     make_profile(base, layer, zeros, zeros,
+                                  residual=[1.0] * layers,
+                                  status='candidate-not-qualified',
+                                  collection_sha256=collection_sha,
+                                  strength=1.0))
     save(output / 'SUMMARY.json', dict(binding, counts=counts,
                                      candidate_layers=selected,
                                      collection_sha256=collection_sha,
@@ -284,9 +306,13 @@ def main():
     source.add_argument('--fit', help='a fit output directory (statistics.npz)')
     source.add_argument('--profile', help='an existing v2 profile to re-default')
     make.add_argument('--direction-layer', type=int, required=True)
-    make.add_argument('--attention', required=True,
-                      help='2.0 | w0,...,wN-1 | max_w=..,peak=..,min_w=..,width=..')
-    make.add_argument('--mlp', required=True, help='as --attention')
+    make.add_argument('--attention', default='0',
+                      help='2.0 | w0,...,wN-1 | max_w=..,peak=..,min_w=..,width=.. '
+                           '(default 0)')
+    make.add_argument('--mlp', default='0', help='as --attention (default 0)')
+    make.add_argument('--residual',
+                      help='post-layer residual strengths, as --attention '
+                           '(default: omitted, read as 0)')
     make.add_argument('--output', required=True)
     args = parser.parse_args()
     if args.command == 'import-data':
@@ -301,7 +327,10 @@ def main():
             raise SystemExit('use a new output path; existing profiles are preserved')
         save_profile(output, make_profile(
             base, args.direction_layer, parse_weights(args.attention, layers),
-            parse_weights(args.mlp, layers), status='candidate-not-qualified'))
+            parse_weights(args.mlp, layers),
+            residual=(None if args.residual is None
+                      else parse_weights(args.residual, layers)),
+            status='candidate-not-qualified'))
         print(output)
 
 

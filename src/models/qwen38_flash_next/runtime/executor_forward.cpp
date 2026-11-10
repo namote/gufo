@@ -382,8 +382,13 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       return false;
     }
 
+    // Nonzero residual strengths project the post-layer residual after the
+    // FFN combine. That combine then forms no norm (nor inject partials) of
+    // the next mixer, as before a PLE layer: the next mixer normalizes the
+    // projected residual itself.
+    const float* const residual_settings = ResidualAbliteration(session);
     const float* next_norm =
-        il + 1 < c.num_layers
+        il + 1 < c.num_layers && residual_settings == nullptr
             ? (c.IsPleLayer(il + 1) ? nullptr
                                     : layers[il + 1].hc_attn.norm.f32())
             : nullptr;
@@ -425,6 +430,16 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
         return false;
       Combine(s_.res, next_norm, rows, next_inject, false,
               AbliterationAt(session, il, true));
+      if (residual_settings != nullptr) {
+        // ON disables the deferring MoE combine and this combine defers
+        // nothing; settle any update still pending regardless, so the
+        // projection reads the materialized residual of every HC stream.
+        ApplyPendingResidual();
+        const AbliterationSpan span{rows, residual_settings};
+        AbliterateResidualBatchRows(s_.res, abliteration_directions_,
+                                    std::span(&span, 1), il, c.num_layers, rows,
+                                    c.hidden_size, c.hc_count, stream_);
+      }
       return true;
     };
     if (skipped != 0) {

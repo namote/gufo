@@ -163,5 +163,25 @@ int main() {
           chosen->attention == std::vector<float>{1, 1} &&
           chosen->mlp == v2.mlp &&
           chosen->identity != q::ResolveAbliterationSettings(v2)->identity);
+  // Without `residual` the profile keeps writer-only behavior.
+  Require(v2.residual == std::vector<float>{0, 0} &&
+          !q::ResolveAbliterationSettings(v2)->ResidualActive());
+  // Post-layer residual strengths (each HC stream) through this placement.
+  std::ofstream(path)
+      << R"({"schema":"gufo-abliteration-v2","placement":"writer-before-hc",
+      "model_identity":"fixture","hidden":3,"layers":2,
+      "directions":[[0,1,0],[0.6,0.8,0]],"direction_layer":1,
+      "attention":[0,0],"mlp":[0,0],"residual":[1,0.5]})";
+  const auto residual = q::AbliterationProfile::Load(path, 3, 2, "fixture");
+  const auto residual_defaults = q::ResolveAbliterationSettings(residual);
+  Require(residual.residual == std::vector<float>{1, 0.5F} &&
+          residual_defaults->ResidualActive());
+  const auto words = residual_defaults->DeviceWords();
+  Require(words.size() == gufo::models::qwen::AbliterationDeviceWords(2) &&
+          words.size() == 7 && words[5] == 1 && words[6] == 0.5F);
+  const auto writer_only =
+      q::ResolveAbliterationSettings(residual, {.residual = {0}});
+  Require(!writer_only->ResidualActive() &&
+          writer_only->identity != residual_defaults->identity);
   std::cout << "profile and cache identity PASS\n";
 }

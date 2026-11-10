@@ -1582,6 +1582,7 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
                               : json::Value(nullptr);
     abliteration["attention"] = strengths(info->attention);
     abliteration["mlp"] = strengths(info->mlp);
+    abliteration["residual"] = strengths(info->residual);
     abliteration["max_strength"] =
         static_cast<double>(models::qwen::kAbliterationMaxWeight);
     resp["abliteration"] = std::move(abliteration);

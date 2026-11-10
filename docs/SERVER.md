@@ -479,19 +479,28 @@ option. Chat Completions, Responses and Messages requests select it with
 `"enabled":false` is OFF. An ON request may also set its own settings:
 `direction_layer` (an integer in [0, layers), only with a
 `gufo-abliteration-v2` profile, which carries every layer's direction), and
-`attention` and `mlp`, each one number for every layer or an array of exactly
-`layers` numbers in [0, 4]; omitted members keep the profile defaults, for
-example `{"abliteration":{"enabled":true,"direction_layer":36,"attention":2,
-"mlp":0.5}}`. Raw completions do not accept it, and an unloaded profile,
+`attention`, `mlp` and `residual`, each one number for every layer or an
+array of exactly `layers` numbers in [0, 4]; omitted members keep the profile
+defaults, for example `{"abliteration":{"enabled":true,"direction_layer":36,
+"attention":0,"mlp":0,"residual":1}}`. `attention` and `mlp` are writer
+strengths: each layer's attention/GatedDeltaNet and MLP output loses
+`s * d * dot(d, y)` before it reaches the residual. `residual` acts on the
+residual itself after each layer (on Flash-Next, each hyper-connection
+stream), exactly where the profile's directions were measured, so `residual`
+1 leaves no component along the direction there, including what entered
+through the embedding or earlier layers, which writer strengths cannot reach.
+The two kinds may be combined; profiles without `residual` default it to 0.
+Raw completions do not accept it, and an unloaded profile,
 unknown member, invalid setting or setting sent with `"enabled":false` returns
 `invalid_abliteration`. ON and OFF requests, and different profiles or
 settings, never share cached or continued state; OFF behaves and caches exactly
 as without a profile. Changing settings needs no reload; only switching a
-session between ON and OFF re-records its graphs. `GET /props` reports the
+session between ON and OFF, or between all-zero and nonzero `residual`
+strengths, re-records its graphs. `GET /props` reports the
 loaded profile as `abliteration`: `schema`, `identity`, `layers`, the
 `direction_layers` a request may name (empty for v1), the default
-`direction_layer` (null for v1), the default `attention` and `mlp` (one number
-when uniform) and `max_strength`; never the direction vectors. Preparation,
+`direction_layer` (null for v1), the default `attention`, `mlp` and `residual`
+(one number when uniform) and `max_strength`; never the direction vectors. Preparation,
 qualification and the automatic strength search are model-specific: see
 [Qwen3.8-27B](models/qwen3.8-27b/ABLITERATION.md) and
 [Flash-Next](models/qwen3.8-flash-next/ABLITERATION.md).

@@ -18,6 +18,7 @@
 #include <string_view>
 #include <vector>
 
+#include "src/core/crypto/sha256.hpp"
 #include "src/core/json.hpp"
 #include "src/models/qwen/continuation_layout.hpp"
 
@@ -94,6 +95,160 @@ void TestV1Settings(const qwen::AbliterationProfile& profile) {
               scaled->mlp == profile.mlp &&
               scaled->identity != defaults->identity,
           "v1 strength override");
+}
+
+void HashU32(gufo::crypto::Sha256Hasher& hash, std::uint32_t value) {
+  const std::array<std::uint8_t, 4> bytes{
+      static_cast<std::uint8_t>(value), static_cast<std::uint8_t>(value >> 8),
+      static_cast<std::uint8_t>(value >> 16),
+      static_cast<std::uint8_t>(value >> 24)};
+  hash.Update(bytes);
+}
+
+// The settings identity, recomputed independently from its documented
+// layout: SHA-256 of "gufo-abliteration-settings-v2:<profile identity>:", the
+// direction layer (0xFFFFFFFF for v1) and the layer count as little-endian
+// u32, then the float bits of attention, mlp and residual.
+std::string ExpectedIdentity(const qwen::AbliterationProfile& profile,
+                             const qwen::AbliterationSettings& settings) {
+  gufo::crypto::Sha256Hasher hash;
+  const std::string prefix =
+      "gufo-abliteration-settings-v2:" + profile.identity + ":";
+  hash.Update(std::span(reinterpret_cast<const std::uint8_t*>(prefix.data()),
+                        prefix.size()));
+  HashU32(hash, settings.direction_layer.value_or(0xFFFFFFFFU));
+  HashU32(hash, profile.layers);
+  for (const auto* values :
+       {&settings.attention, &settings.mlp, &settings.residual})
+    for (float x : *values)
+      HashU32(hash, Bits(x));
+  return hash.FinishHex();
+}
+
+// Post-layer residual strengths (D16): optional v2 member, request
+// overrides, identity and device words.
+void TestResidual(const std::filesystem::path& path, std::string_view site,
+                  const json::Value& v2,
+                  const qwen::AbliterationSettings& writer_defaults) {
+  const auto write = [&](const json::Value& value) {
+    std::ofstream(path) << value.dump();
+  };
+  // Absent: all zero, so a profile written before D16 behaves as before.
+  write(v2);
+  const auto plain =
+      qwen::AbliterationProfile::Load(path, 3, 2, "fixture", site);
+  Require(
+      plain.residual == std::vector<float>{0, 0} &&
+          !writer_defaults.ResidualActive() &&
+          writer_defaults.residual == std::vector<float>{0, 0} &&
+          writer_defaults.identity == ExpectedIdentity(plain, writer_defaults),
+      "v2 profile without residual");
+  auto with = v2;
+  with["residual"] = json::parse("[0,1]");
+  write(with);
+  const auto profile =
+      qwen::AbliterationProfile::Load(path, 3, 2, "fixture", site);
+  Require(profile.residual == std::vector<float>{0, 1}, "v2 residual load");
+  const auto defaults = qwen::ResolveAbliterationSettings(profile);
+  Require(defaults->residual == profile.residual &&
+              defaults->ResidualActive() &&
+              defaults->identity == ExpectedIdentity(profile, *defaults),
+          "v2 residual defaults");
+  for (const char* raw : {"[1,-0.5]", "[1,4.5]", "[1]", "[1,1,1]", "1",
+                          "[1,\"1\"]", "[1,null]"}) {
+    auto invalid = v2;
+    invalid["residual"] = json::parse(raw);
+    write(invalid);
+    Require(Rejects([&] {
+              (void)qwen::AbliterationProfile::Load(path, 3, 2, "fixture",
+                                                    site);
+            }),
+            "invalid v2 residual loaded");
+  }
+  // v1 never carries residual strengths.
+  auto v1 = json::parse(
+      R"({"schema":"gufo-abliteration-v1","placement":"","model_identity":
+      "fixture","hidden":3,"layers":2,"direction":[0.6,0.8,0],
+      "attention":[1,0],"mlp":[0,0.5]})");
+  v1["placement"] = std::string(site);
+  write(v1);
+  const auto v1_profile =
+      qwen::AbliterationProfile::Load(path, 3, 2, "fixture", site);
+  Require(v1_profile.residual == std::vector<float>{0, 0}, "v1 residual zero");
+  v1["residual"] = json::parse("[0,0]");
+  write(v1);
+  Require(Rejects([&] {
+            (void)qwen::AbliterationProfile::Load(path, 3, 2, "fixture", site);
+          }),
+          "v1 profile with residual loaded");
+  // Requests: a scalar, an array, -0 folding and bounds.
+  const auto scalar =
+      qwen::ResolveAbliterationSettings(profile, {.residual = {1}});
+  const auto array =
+      qwen::ResolveAbliterationSettings(profile, {.residual = {1, 1}});
+  const auto off =
+      qwen::ResolveAbliterationSettings(profile, {.residual = {0}});
+  const auto negative_zero =
+      qwen::ResolveAbliterationSettings(profile, {.residual = {-0.0F, 0}});
+  Require(scalar->residual == std::vector<float>{1, 1} &&
+              scalar->identity == array->identity &&
+              scalar->identity != defaults->identity &&
+              scalar->attention == profile.attention &&
+              scalar->mlp == profile.mlp,
+          "residual overrides");
+  Require(!off->ResidualActive() && !negative_zero->ResidualActive() &&
+              off->identity == negative_zero->identity &&
+              Bits(negative_zero->residual[0]) == 0 &&
+              off->identity == ExpectedIdentity(profile, *off),
+          "residual zero folding");
+  // Residual and writer strengths are separate settings: moving a strength
+  // from one to another is another identity.
+  const auto writer_one = qwen::ResolveAbliterationSettings(
+      profile, {.attention = {1}, .mlp = {0}, .residual = {0}});
+  const auto residual_one = qwen::ResolveAbliterationSettings(
+      profile, {.attention = {0}, .mlp = {0}, .residual = {1}});
+  Require(writer_one->identity != residual_one->identity,
+          "residual and writer identities");
+  for (const auto& overrides : std::vector<qwen::AbliterationOverrides>{
+           {.residual = {-1}},
+           {.residual = {4.5F}},
+           {.residual = {1, 1, 1}},
+           {.residual = {std::numeric_limits<float>::quiet_NaN()}}}) {
+    Require(Rejects([&] {
+              (void)qwen::ResolveAbliterationSettings(profile, overrides);
+            }),
+            "invalid residual settings resolved");
+  }
+  // Device words: 1 + 3 x layers; the residual block follows mlp.
+  const auto words = residual_one->DeviceWords();
+  using enum qwen::AbliterationPoint;
+  Require(qwen::AbliterationDeviceWords(2) == 7 && words.size() == 7 &&
+              qwen::AbliterationWeightIndex(2, 0, kAttention) == 1 &&
+              qwen::AbliterationWeightIndex(2, 1, kMlp) == 4 &&
+              qwen::AbliterationWeightIndex(2, 0, kResidual) == 5 &&
+              qwen::AbliterationWeightIndex(2, 1, kResidual) == 6 &&
+              qwen::AbliterationWeightIndex(2, 1, true) ==
+                  qwen::AbliterationWeightIndex(2, 1, kMlp) &&
+              qwen::AbliterationWeightIndex(2, 1, false) ==
+                  qwen::AbliterationWeightIndex(2, 1, kAttention) &&
+              words[5] == 1 && words[6] == 1 && words[1] == 0 &&
+              words[2] == 0 && words[3] == 0 && words[4] == 0,
+          "residual device words");
+  const auto mixed = qwen::ResolveAbliterationSettings(
+      profile, {.attention = {2, 3}, .mlp = {0.5F, 0.25F}, .residual = {0, 4}});
+  const auto mixed_words = mixed->DeviceWords();
+  Require(mixed_words[1] == 2 && mixed_words[2] == 3 &&
+              mixed_words[3] == 0.5F && mixed_words[4] == 0.25F &&
+              mixed_words[5] == 0 && mixed_words[6] == 4 &&
+              Bits(mixed_words[0]) == 1,
+          "mixed device words");
+  // ON metadata is bound to the residual strengths too.
+  auto metadata = Current(4);
+  metadata.RecordImage({}, residual_one.get());
+  Require(metadata.ImageMatches({}, residual_one.get()) &&
+              !metadata.ImageMatches({}, writer_one.get()) &&
+              !metadata.ImageMatches({}, nullptr),
+          "residual-bound continuation guard");
 }
 
 // Schema v2: every layer's direction plus request defaults, validated like
@@ -209,6 +364,7 @@ void TestV2Profile(const std::filesystem::path& path, std::string_view site) {
               !metadata.ImageMatches({}, layer0.get()) &&
               !metadata.ImageMatches({}, nullptr),
           "settings-bound continuation guard");
+  TestResidual(path, site, v2, *defaults);
   // A 27B-sized v2 profile written by prepare.py fits the size cap.
   Require(qwen::kAbliterationMaxProfileBytes >= 64ull * 5120 * 14,
           "size cap below a 27B v2 profile");

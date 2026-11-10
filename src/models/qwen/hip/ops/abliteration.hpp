@@ -38,6 +38,20 @@ void LaunchQwenAbliterateRows(float* rows, const float* directions,
                               bool mlp, std::uint32_t layers,
                               std::uint32_t row_count, std::uint32_t hidden,
                               hipStream_t stream);
+/// The same projection of the post-layer residual rows with each session's
+/// `residual` strength for `layer`: r -= w * d * dot(d, r), so w = 1 leaves
+/// no component along d. Callers launch it only for sessions whose settings
+/// are AbliterationSettings::ResidualActive (null spans otherwise).
+void LaunchQwenAbliterateResidualRows(
+    float* rows, const float* directions,
+    std::span<const QwenAbliterationSpan> spans, std::uint32_t layer,
+    std::uint32_t layers, std::uint32_t row_count, std::uint32_t hidden,
+    hipStream_t stream);
+void LaunchQwenAbliterateResidualRows(float* rows, const float* directions,
+                                      const float* settings,
+                                      std::uint32_t layer, std::uint32_t layers,
+                                      std::uint32_t row_count,
+                                      std::uint32_t hidden, hipStream_t stream);
 
 }  // namespace gufo::hip
 

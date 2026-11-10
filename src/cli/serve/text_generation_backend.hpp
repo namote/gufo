@@ -49,6 +49,7 @@ struct AbliterationInfo {
   std::optional<std::uint32_t> direction_layer;
   std::vector<float> attention;
   std::vector<float> mlp;
+  std::vector<float> residual;
 };
 
 /// Client-facing message for a GPU context that can no longer execute work.

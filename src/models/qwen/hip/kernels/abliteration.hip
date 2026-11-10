@@ -56,13 +56,10 @@ __launch_bounds__(kAbliterationThreads) __global__
     row[i] -= amount * direction[i];
 }
 
-}  // namespace
-
-void LaunchQwenAbliterateRows(float* rows, const float* directions,
-                              std::span<const QwenAbliterationSpan> spans,
-                              std::uint32_t layer, bool mlp,
-                              std::uint32_t layers, std::uint32_t row_count,
-                              std::uint32_t hidden, hipStream_t stream) {
+void Launch(float* rows, const float* directions,
+            std::span<const QwenAbliterationSpan> spans, std::uint32_t layer,
+            models::qwen::AbliterationPoint point, std::uint32_t layers,
+            std::uint32_t row_count, std::uint32_t hidden, hipStream_t stream) {
   if (spans.size() > kQwenAbliterationMaxSpans)
     throw std::invalid_argument("abliteration batch exceeds eight sessions");
   if (layer >= layers)
@@ -76,7 +73,23 @@ void LaunchQwenAbliterateRows(float* rows, const float* directions,
   std::ranges::copy(spans, sessions.spans.begin());
   AbliterateRowsKernel<<<row_count, kAbliterationThreads, 0, stream>>>(
       rows, directions, sessions,
-      models::qwen::AbliterationWeightIndex(layers, layer, mlp), hidden);
+      models::qwen::AbliterationWeightIndex(layers, layer, point), hidden);
+}
+
+models::qwen::AbliterationPoint Writer(bool mlp) {
+  return mlp ? models::qwen::AbliterationPoint::kMlp
+             : models::qwen::AbliterationPoint::kAttention;
+}
+
+}  // namespace
+
+void LaunchQwenAbliterateRows(float* rows, const float* directions,
+                              std::span<const QwenAbliterationSpan> spans,
+                              std::uint32_t layer, bool mlp,
+                              std::uint32_t layers, std::uint32_t row_count,
+                              std::uint32_t hidden, hipStream_t stream) {
+  Launch(rows, directions, spans, layer, Writer(mlp), layers, row_count,
+         hidden, stream);
 }
 
 void LaunchQwenAbliterateRows(float* rows, const float* directions,
@@ -85,8 +98,29 @@ void LaunchQwenAbliterateRows(float* rows, const float* directions,
                               std::uint32_t row_count, std::uint32_t hidden,
                               hipStream_t stream) {
   const QwenAbliterationSpan span{row_count, settings};
-  LaunchQwenAbliterateRows(rows, directions, std::span(&span, 1), layer, mlp,
-                           layers, row_count, hidden, stream);
+  Launch(rows, directions, std::span(&span, 1), layer, Writer(mlp), layers,
+         row_count, hidden, stream);
+}
+
+void LaunchQwenAbliterateResidualRows(
+    float* rows, const float* directions,
+    std::span<const QwenAbliterationSpan> spans, std::uint32_t layer,
+    std::uint32_t layers, std::uint32_t row_count, std::uint32_t hidden,
+    hipStream_t stream) {
+  Launch(rows, directions, spans, layer,
+         models::qwen::AbliterationPoint::kResidual, layers, row_count, hidden,
+         stream);
+}
+
+void LaunchQwenAbliterateResidualRows(float* rows, const float* directions,
+                                      const float* settings,
+                                      std::uint32_t layer, std::uint32_t layers,
+                                      std::uint32_t row_count,
+                                      std::uint32_t hidden,
+                                      hipStream_t stream) {
+  const QwenAbliterationSpan span{row_count, settings};
+  LaunchQwenAbliterateResidualRows(rows, directions, std::span(&span, 1),
+                                   layer, layers, row_count, hidden, stream);
 }
 
 }  // namespace gufo::hip

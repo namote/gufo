@@ -700,6 +700,17 @@ private:
   }
   void ProjectAbliteration(float* output, std::uint32_t rows,
                            AbliterationSite site) const;
+  /// The session's device settings while ON with a nonzero residual strength
+  /// (qwen::AbliterationSettings::ResidualActive), else null. Only such a
+  /// session projects the post-layer residual, and it then takes the unfused
+  /// layer end: the FFN combine computes no norm of the next mixer, so nothing
+  /// derived from the residual predates the projection.
+  const float* ResidualAbliteration(const Session& session) const {
+    return abliteration_ && session.abliteration_ &&
+                   session.abliteration_->ResidualActive()
+               ? session.abliteration_device_.get()
+               : nullptr;
+  }
   friend struct ExecutorTestAccess;
 
   enum class DiagnosticStage { kTarget, kDraft, kHead, kCatchUp };

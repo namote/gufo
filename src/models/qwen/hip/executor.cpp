@@ -185,6 +185,7 @@ void QwenGpuExecutor::ConfigureAbliteration(
     return;
   if (settings && (settings->attention.size() != profile->layers ||
                    settings->mlp.size() != profile->layers ||
+                   settings->residual.size() != profile->layers ||
                    settings->direction_row >= profile->direction_rows()))
     throw std::invalid_argument("abliteration settings do not fit the profile");
   // A failed reset is rethrown by the next operation (CheckReset).
@@ -208,9 +209,11 @@ void QwenGpuExecutor::ConfigureAbliteration(
         hipStreamSynchronize(arena_.stream) != hipSuccess)
       throw std::runtime_error("abliteration settings upload failed");
   }
-  // The captured decode graph contains the projections only while ON (Reset
-  // above has usually dropped it already).
-  if (!settings || !abliteration_)
+  // The captured decode graph contains the projections only while ON, and
+  // the residual projections only with nonzero residual strengths (Reset
+  // above has usually dropped it already; the graph key also carries both).
+  if (!settings || !abliteration_ ||
+      settings->ResidualActive() != abliteration_->ResidualActive())
     graph_executor_.Reset();
   abliteration_ = std::move(settings);
 }

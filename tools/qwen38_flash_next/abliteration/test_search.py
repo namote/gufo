@@ -40,9 +40,14 @@ class FakeClient:
         a = body['abliteration']
         if not a['enabled']:
             return 0.0
-        attention = a.get('attention', [1.0] * LAYERS)
-        mlp = a.get('mlp', [0, 0.5, 0, 0])
-        return sum(attention) + sum(mlp)
+
+        def total(name, default):
+            value = a.get(name, default)
+            return sum(value) if isinstance(value, list) else value * LAYERS
+
+        # A residual strength removes the direction more completely: weight 2.
+        return (total('attention', [1.0] * LAYERS) + total('mlp', [0, 0.5, 0, 0]) +
+                2 * total('residual', 0.0))
 
     def chat(self, body):
         self.requests.append(body)
@@ -148,6 +153,35 @@ class OfflineLogicTest(unittest.TestCase):
         self.assertEqual(values['direction_layer'], 1)
         self.assertEqual(values['attention'], [1.5, 2.0, 1.5, 1.0])
         self.assertEqual(values['mlp'], [0.0] * LAYERS)
+        # Writer mode turns residual strengths off explicitly.
+        self.assertEqual(values['residual'], 0.0)
+
+    def test_residual_mode_settings_and_bounds(self):
+        box = search.bounds(LAYERS, [1, 2], 4.0, 'residual')
+        self.assertEqual(set(box), {'direction_layer', 'residual.max_w',
+                                    'residual.peak', 'residual.min_frac',
+                                    'residual.width'})
+        params = {'direction_layer': 2, 'residual.max_w': 1.0,
+                  'residual.peak': 3.0, 'residual.min_frac': 0.5,
+                  'residual.width': 2.0}
+        values = search.settings(params, LAYERS, 'residual')
+        self.assertEqual(values, {'direction_layer': 2, 'attention': 0.0,
+                                  'mlp': 0.0, 'residual': [0.0, 0.5, 0.75, 1.0]})
+        both = search.bounds(LAYERS, [0, 3], 4.0, 'both')
+        self.assertEqual(len(both), 1 + 3 * 4)
+        rng = search.random.Random(1)
+        sampled = search.settings(search.sample(both, rng), LAYERS, 'both')
+        for part in ('attention', 'mlp', 'residual'):
+            self.assertEqual(len(sampled[part]), LAYERS)
+            self.assertTrue(all(0 <= w <= 4 for w in sampled[part]))
+        # Proposals stay in the residual box.
+        history = [dict(trial=0, params=None, refusals=5, kl=0.0)]
+        for i in range(1, 20):
+            p = search.propose(i, history, box, 4, 20, seed=5)
+            self.assertEqual(set(p), set(box))
+            for key, (lo, hi) in box.items():
+                self.assertTrue(lo <= p[key] <= hi, key)
+            history.append(dict(trial=i, params=p, refusals=i % 3, kl=1 / i))
 
     def test_proposals_stay_in_bounds_and_are_deterministic(self):
         box = search.bounds(LAYERS, [1, 2], 4.0)
@@ -159,6 +193,23 @@ class OfflineLogicTest(unittest.TestCase):
             for key, (lo, hi) in box.items():
                 self.assertTrue(lo <= params[key] <= hi, key)
             history.append(dict(trial=i, params=params, refusals=i % 4, kl=1 / i))
+
+    def test_fingerprint_modes(self):
+        prompts = {'refusal': [dict(id='r', text='x', thinking=False)],
+                   'ordinary': [dict(id='o', text='y', thinking=False)]}
+        info = FakeClient().props()['abliteration']
+
+        def fingerprint(mode):
+            return search.Search(FakeClient(), 'gufo', prompts, info, 'log.jsonl', 8,
+                                 out=io.StringIO(), mode=mode).fingerprint
+
+        # Writer mode keeps the D15 fingerprint (earlier logs resume).
+        d15 = hashlib.sha256(json.dumps(dict(
+            model='gufo', profile=info['identity'], layers=LAYERS, max_tokens=8,
+            prompts={'refusal': ['r'], 'ordinary': ['o']}),
+            sort_keys=True).encode()).hexdigest()
+        self.assertEqual(fingerprint('writer'), d15)
+        self.assertEqual(len({fingerprint(m) for m in ('writer', 'residual', 'both')}), 3)
 
     def test_prompt_sampling(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -185,11 +236,63 @@ class SearchRunTest(unittest.TestCase):
                               *extra], client=client, out=out)
         return chosen, out.getvalue()
 
+    def test_residual_mode_requests_log_and_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient()
+            # The default mode.
+            chosen, text = self.run_search(root, client, 5)
+            on = [r['abliteration'] for r in client.requests if r['abliteration']['enabled']]
+            self.assertEqual(set(on[0]), {'enabled', 'profile'})  # trial 0: defaults
+            later = on[-1]
+            self.assertEqual(set(later), {'enabled', 'profile', 'direction_layer',
+                                          'attention', 'mlp', 'residual'})
+            self.assertEqual((later['attention'], later['mlp']), (0.0, 0.0))
+            self.assertEqual(len(later['residual']), LAYERS)
+            self.assertTrue(all(0 <= w <= 4 for w in later['residual']))
+            log = root / 'log' / 'trials.jsonl'
+            records = [json.loads(l) for l in log.read_text().splitlines()]
+            self.assertEqual(records[0]['mode'], 'residual')
+            self.assertTrue(all(set(r['params']) == {
+                'direction_layer', 'residual.max_w', 'residual.peak',
+                'residual.min_frac', 'residual.width'} for r in records[2:]))
+            # The same log under another mode is another search.
+            with self.assertRaises(SystemExit):
+                self.run_search(root, FakeClient(), 6, ('--mode', 'writer'))
+            with self.assertRaises(SystemExit):
+                self.run_search(root, FakeClient(), 6, ('--mode', 'both'))
+            # Resume in the same mode evaluates only new trials.
+            client2 = FakeClient()
+            self.run_search(root, client2, 6)
+            self.assertEqual(len(client2.requests), 5)
+            # Without a base profile the make-profile command carries --residual.
+            self.assertIn('--residual ', text)
+            # With one, the chosen residual curve becomes the profile default.
+            base = root / 'base.json'
+            search.prepare.save_profile(base, dict(
+                schema='gufo-abliteration-v2', model_identity='m', hidden=2,
+                layers=LAYERS, placement='writer-before-residual',
+                directions=[[0.0, 1.0]] * LAYERS, direction_layer=2,
+                attention=[1.0] * LAYERS, mlp=[0, 0.5, 0, 0]))
+            served = FakeClient()
+            served.IDENTITY = hashlib.sha256(base.read_bytes()).hexdigest()
+            (root / 'log').rename(root / 'log-old')
+            output = root / 'chosen.json'
+            chosen, _ = self.run_search(root, served, 6, (
+                '--base-profile', str(base), '--output', str(output)))
+            profile = json.loads(output.read_text())
+            self.assertEqual(len(profile['residual']), LAYERS)
+            if chosen['settings']:
+                self.assertEqual(profile['attention'], [0.0] * LAYERS)
+                self.assertEqual(profile['residual'], chosen['settings']['residual'])
+            else:  # the defaults: writer strengths, residual 0
+                self.assertEqual(profile['residual'], [0.0] * LAYERS)
+
     def test_search_requests_log_resume_and_profile(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             client = FakeClient()
-            chosen, text = self.run_search(root, client, 4)
+            chosen, text = self.run_search(root, client, 4, ('--mode', 'writer'))
             self.assertIn('Pareto front', text)
             # Baseline OFF logprobs, then per trial 3 generations + 2 logprob calls.
             off = [r for r in client.requests if not r['abliteration']['enabled']]
@@ -214,7 +317,7 @@ class SearchRunTest(unittest.TestCase):
             self.assertEqual(records[1]['refusals'], 3)  # defaults: strength 4.5
             # Resume: only new trials are evaluated, the baseline is cached.
             client2 = FakeClient()
-            self.run_search(root, client2, 6)
+            self.run_search(root, client2, 6, ('--mode', 'writer'))
             self.assertEqual(len(client2.requests), 2 * 5)
             self.assertTrue(all(r['abliteration']['enabled'] for r in client2.requests))
             # A chosen trial becomes a v2 profile with its settings as defaults.
@@ -228,13 +331,13 @@ class SearchRunTest(unittest.TestCase):
             # Another file than the served profile is refused up front.
             with self.assertRaises(SystemExit):
                 self.run_search(root, FakeClient(), 6, (
-                    '--base-profile', str(base), '--output', str(output)))
+                    '--mode', 'writer', '--base-profile', str(base), '--output', str(output)))
             served = FakeClient()
             served.IDENTITY = hashlib.sha256(base.read_bytes()).hexdigest()
             # Another served profile is another search: a new log.
             (root / 'log').rename(root / 'log-old')
             chosen, text = self.run_search(root, served, 6, (
-                '--base-profile', str(base), '--output', str(output)))
+                '--mode', 'writer', '--base-profile', str(base), '--output', str(output)))
             profile = json.loads(output.read_text())
             self.assertEqual(profile['schema'], 'gufo-abliteration-v2')
             expected = chosen['settings'] or {}

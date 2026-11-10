@@ -384,6 +384,20 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
         layer, mlp, config.num_layers, static_cast<std::uint32_t>(batch_size),
         static_cast<std::uint32_t>(hidden_size), arena.stream);
   };
+  // The post-layer residual of sessions with nonzero residual strengths;
+  // launches nothing when no session has one.
+  const auto project_residual = [&](float* rows, std::uint32_t layer) {
+    if (abliteration_directions == nullptr)
+      return;
+    std::array<QwenAbliterationSpan, kMaxDecodeBatch> spans{};
+    for (std::size_t row = 0; row < batch_size; ++row)
+      spans[row] = {static_cast<std::uint32_t>(row + 1),
+                    items[row].executor->AbliterationResidualDeviceSettings()};
+    LaunchQwenAbliterateResidualRows(
+        rows, abliteration_directions, std::span(spans.data(), batch_size),
+        layer, config.num_layers, static_cast<std::uint32_t>(batch_size),
+        static_cast<std::uint32_t>(hidden_size), arena.stream);
+  };
   EmitDecodeRouteTelemetry(weights, coordinator->policy_);
   for (std::uint32_t layer_index = 0; layer_index < config.num_layers;
        ++layer_index) {
@@ -506,6 +520,7 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
     LaunchBatchedResidualAdd(
         scratch.decode.hidden.data(), scratch.ffn.out.data(),
         scratch.decode.hidden.data(), batch_size, hidden_size, arena.stream);
+    project_residual(scratch.decode.hidden.data(), layer_index);
 
     for (std::size_t row = 0; row < batch_size; ++row) {
       auto& state_arena = items[row].executor->arena_;
@@ -735,6 +750,22 @@ QwenGpuExecutor::ForwardVerificationBatch(
         layer, mlp, config.num_layers, static_cast<std::uint32_t>(batch_size),
         static_cast<std::uint32_t>(hidden_size), arena_.stream);
   };
+  // The post-layer residual of sessions with nonzero residual strengths;
+  // launches nothing when no session has one.
+  const auto project_residual = [&](float* rows, std::uint32_t layer) {
+    if (abliteration_directions == nullptr)
+      return;
+    std::array<QwenAbliterationSpan, kMaxDecodeBatch> spans{};
+    for (std::size_t index = 0; index < items.size(); ++index)
+      spans[index] = {
+          static_cast<std::uint32_t>(offsets[index] +
+                                     items[index].tokens.size()),
+          items[index].executor->AbliterationResidualDeviceSettings()};
+    LaunchQwenAbliterateResidualRows(
+        rows, abliteration_directions, std::span(spans.data(), items.size()),
+        layer, config.num_layers, static_cast<std::uint32_t>(batch_size),
+        static_cast<std::uint32_t>(hidden_size), arena_.stream);
+  };
   EmitDecodeRouteTelemetry(weights_, coordinator.policy_);
   for (std::uint32_t layer_index = 0; layer_index < config.num_layers;
        ++layer_index) {
@@ -941,6 +972,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
     LaunchBatchedResidualAdd(
         scratch.decode.hidden.data(), scratch.ffn.out.data(),
         scratch.decode.hidden.data(), batch_size, hidden_size, arena_.stream);
+    project_residual(scratch.decode.hidden.data(), layer_index);
     if (capture_prompt_hidden_) {
       if (const auto tap = arena_.GetTargetLayerCaptureIndex(layer_index);
           tap.has_value()) {

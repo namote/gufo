@@ -22,15 +22,19 @@ namespace gufo::models::qwen {
 inline constexpr std::string_view kAbliterationSchemaV1 =
     "gufo-abliteration-v1";
 /// v2: `directions` holds one unit direction per layer ([layers][hidden]);
-/// `direction_layer`, `attention` and `mlp` are the request defaults.
+/// `direction_layer`, `attention`, `mlp` and the optional `residual` (absent:
+/// all zero) are the request defaults.
 inline constexpr std::string_view kAbliterationSchemaV2 =
     "gufo-abliteration-v2";
 /// Qwen3.8-Flash-Next: attention/GDN and aggregated MoE outputs, immediately
-/// before hyper-connection injection.
+/// before hyper-connection injection; `residual` strengths act on each of the
+/// HC residual streams after the layer. The name predates residual strengths.
 inline constexpr std::string_view kAbliterationWriterBeforeHc =
     "writer-before-hc";
 /// Qwen3.8-27B (plain residual): attention/GDN output projection and MLP down
-/// projection outputs, immediately before their residual add.
+/// projection outputs, immediately before their residual add; `residual`
+/// strengths act on the residual after the layer's MLP add. The name predates
+/// residual strengths.
 inline constexpr std::string_view kAbliterationWriterBeforeResidual =
     "writer-before-residual";
 /// Request and v2 profile strengths are in [0, kAbliterationMaxWeight].
@@ -51,9 +55,11 @@ struct AbliterationProfile {
   std::vector<float> directions;
   /// The default direction row's source layer; empty for v1.
   std::optional<std::uint32_t> direction_layer;
-  /// Default per-layer strengths.
+  /// Default per-layer strengths. `residual` is all zero for v1 and for a v2
+  /// profile without that member.
   std::vector<float> attention;
   std::vector<float> mlp;
+  std::vector<float> residual;
   /// SHA-256 of the exact profile file bytes.
   std::string identity;
   std::string model_identity;
@@ -83,24 +89,46 @@ struct AbliterationSettings {
   std::uint32_t direction_row{0};
   std::vector<float> attention;
   std::vector<float> mlp;
+  /// Post-layer residual strengths: r -= s * d * dot(d, r) at the point the
+  /// collectors read the directions, so s = 1 zeroes that component there.
+  std::vector<float> residual;
   /// 64 lowercase hex characters: SHA-256 over the profile identity, the
-  /// direction layer and the exact float bytes of `attention` and `mlp`.
+  /// direction layer and the exact float bytes of `attention`, `mlp` and
+  /// `residual`.
   std::string identity;
 
   /// The device copy each ON session owns: AbliterationDeviceWords(layers)
   /// 32-bit words, read by the projection kernels at launch time. Word 0 is
   /// `direction_row` (as integer bits); word AbliterationWeightIndex(...) is
-  /// one writer's strength.
+  /// one site's strength.
   [[nodiscard]] std::vector<float> DeviceWords() const;
+  /// Whether any residual strength is nonzero. Only then do the models launch
+  /// the residual projection (at every layer, zero strengths included) and
+  /// leave fusions that derive values from the post-layer residual. Like
+  /// ON/OFF, a change of this bit changes which kernels a pass launches.
+  [[nodiscard]] bool ResidualActive() const noexcept;
 };
 
+/// Where a strength applies; also its block of the device words.
+enum class AbliterationPoint : std::uint32_t {
+  kAttention = 0,  ///< attention/GDN writer output
+  kMlp = 1,        ///< MLP/MoE writer output
+  kResidual = 2,   ///< post-layer residual (each HC stream on Flash-Next)
+};
 [[nodiscard]] constexpr std::size_t AbliterationDeviceWords(
     std::uint32_t layers) noexcept {
-  return 1 + 2 * std::size_t{layers};
+  return 1 + 3 * std::size_t{layers};
+}
+[[nodiscard]] constexpr std::uint32_t AbliterationWeightIndex(
+    std::uint32_t layers, std::uint32_t layer,
+    AbliterationPoint point) noexcept {
+  return 1 + static_cast<std::uint32_t>(point) * layers + layer;
 }
 [[nodiscard]] constexpr std::uint32_t AbliterationWeightIndex(
     std::uint32_t layers, std::uint32_t layer, bool mlp) noexcept {
-  return 1 + (mlp ? layers : 0) + layer;
+  return AbliterationWeightIndex(
+      layers, layer,
+      mlp ? AbliterationPoint::kMlp : AbliterationPoint::kAttention);
 }
 
 /// The request's members of `{"abliteration": {...}}`. Empty strength vectors
@@ -110,6 +138,7 @@ struct AbliterationOverrides {
   std::optional<std::uint32_t> direction_layer;
   std::vector<float> attention;
   std::vector<float> mlp;
+  std::vector<float> residual;
 };
 
 /// The effective settings of `overrides` on `profile`'s defaults. Throws

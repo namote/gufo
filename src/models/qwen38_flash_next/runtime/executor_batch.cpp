@@ -1396,6 +1396,35 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
       }
       CombineBatch(base.res, next_norm, rows);
       normed = next_norm != nullptr;
+      if (abliteration_) {
+        // Sessions with nonzero residual strengths project their post-layer
+        // residual rows (every HC stream), then renormalize exactly those
+        // rows for the next mixer; every other session keeps the norm the
+        // combine wrote.
+        std::array<AbliterationSpan, kBatchSessions> spans{};
+        bool any = false;
+        for (std::size_t i = 0; i < items.size(); ++i) {
+          spans[i] = {
+              offsets[i] + static_cast<std::uint32_t>(items[i].tokens.size()),
+              ResidualAbliteration(*items[i].session)};
+          any = any || spans[i].settings != nullptr;
+        }
+        if (any) {
+          AbliterateResidualBatchRows(base.res, abliteration_directions_,
+                                      std::span(spans.data(), items.size()), il,
+                                      c.num_layers, rows, c.hidden_size,
+                                      c.hc_count, stream_);
+          // The head normalizes the residual itself (unnormed HcMixBatch).
+          const bool renorm = normed && il + 1 < c.num_layers;
+          for (std::size_t i = 0; renorm && i < items.size(); ++i)
+            if (spans[i].settings != nullptr)
+              RmsNormRows(base.res + std::size_t{offsets[i]} * c.HcDim(),
+                          next_norm,
+                          base.xn + std::size_t{offsets[i]} * c.HcDim(),
+                          static_cast<std::uint32_t>(items[i].tokens.size()),
+                          c.HcDim(), c.hc_count, c.rms_eps, stream_);
+        }
+      }
     }
     for (std::size_t i = 0; i < items.size(); ++i) {
       const auto n = static_cast<std::uint32_t>(items[i].tokens.size());

@@ -3,7 +3,9 @@
 // with their own directions and strengths, rows past the last span, OFF
 // launching nothing, in-place settings updates under a captured graph, and
 // the production order (project the writer output, then the residual add),
-// which must leave the accumulated residual itself unprojected.
+// which must leave the accumulated residual itself unprojected. The
+// post-layer residual projection (D16) gets the same checks with its own
+// strengths, and the full writer, add, residual order.
 #include <hip/hip_runtime.h>
 
 #include <array>
@@ -233,6 +235,149 @@ void ProductionOrder(std::mt19937& rng) {
   CheckClose(device_residual.Read(residual.size()), expected,
              "writer projection then residual add differs");
 }
+// One layer with a residual strength: direction row bits, attention, mlp,
+// residual (AbliterationSettings::DeviceWords, 1 + 3 x layers words).
+std::vector<float> Settings3(std::uint32_t row, float attention, float mlp,
+                             float residual) {
+  return {std::bit_cast<float>(row), attention, mlp, residual};
+}
+// Two layers: direction row bits, attention[2], mlp[2], residual[2].
+std::vector<float> Settings6(std::uint32_t row, std::array<float, 2> residual) {
+  return {std::bit_cast<float>(row), 9, 9, 7, 7, residual[0], residual[1]};
+}
+
+// The post-layer residual projection reads only the residual strengths:
+// mixed sessions, rows past the last span, zero strength an exact no-op.
+void ResidualFormula(std::uint32_t hidden, std::mt19937& rng) {
+  const auto direction = UnitDirection(hidden, rng);
+  const auto other = UnitDirection(hidden, rng);
+  std::vector<float> directions(other);
+  directions.insert(directions.end(), direction.begin(), direction.end());
+  // Read at layer 1: two rows at 1.0, one OFF row, two rows at 2.5, one row
+  // whose layer-1 residual strength is 0 (layer 0's is not), one row past
+  // every span. Writer strengths (9, 7) must not apply.
+  const Device full(Settings6(1, {3, 1.0F})), over(Settings6(1, {0, 2.5F})),
+      zero(Settings6(0, {4, 0}));
+  const std::vector<hip::QwenAbliterationSpan> spans{
+      {2, full.data}, {3, nullptr}, {5, over.data}, {6, zero.data}};
+  const std::vector<float> row_weights{1, 1, 0, 2.5F, 2.5F, 0, 0};
+  const auto rows = static_cast<std::uint32_t>(row_weights.size());
+  std::normal_distribution<float> normal(0.F, 3.F);
+  std::vector<float> values(std::size_t{rows} * hidden);
+  for (auto& x : values)
+    x = normal(rng);
+  const Device device_rows(values), device_directions(directions);
+  hip::LaunchQwenAbliterateResidualRows(device_rows.data,
+                                        device_directions.data, spans, 1, 2,
+                                        rows, hidden, nullptr);
+  Check(hipDeviceSynchronize());
+  const auto actual = device_rows.Read(values.size());
+  CheckClose(actual, Reference(values, direction, row_weights, hidden),
+             "residual projection differs from the FP64 formula");
+  for (std::size_t r = 0; r < rows; ++r)
+    if (row_weights[r] == 0)
+      for (std::uint32_t i = 0; i < hidden; ++i)
+        Require(actual[r * hidden + i] == values[r * hidden + i],
+                "an OFF or zero-strength residual row changed");
+  for (std::size_t r = 0; r < 2; ++r) {
+    double dot = 0;
+    for (std::uint32_t i = 0; i < hidden; ++i)
+      dot += double{direction[i]} * actual[r * hidden + i];
+    Require(std::abs(dot) < 1e-3, "residual strength 1 left the direction");
+  }
+  // No residual session: nothing launches (a null direction would fault).
+  const std::vector<hip::QwenAbliterationSpan> off{{rows, nullptr}};
+  hip::LaunchQwenAbliterateResidualRows(device_rows.data, nullptr, off, 1, 2,
+                                        rows, hidden, nullptr);
+  Check(hipDeviceSynchronize());
+  Require(device_rows.Read(values.size()) == actual,
+          "OFF residual launch changed rows");
+}
+
+// A captured residual projection follows in-place residual updates.
+void ResidualGraphFollowsSettings(std::mt19937& rng) {
+  const std::uint32_t hidden = 257;
+  const auto first = UnitDirection(hidden, rng);
+  const auto second = UnitDirection(hidden, rng);
+  std::vector<float> directions(first);
+  directions.insert(directions.end(), second.begin(), second.end());
+  std::normal_distribution<float> normal(0.F, 1.F);
+  std::vector<float> values(hidden);
+  for (auto& x : values)
+    x = normal(rng);
+  const Device rows(values), device_directions(directions),
+      settings(Settings3(0, 0, 0, 0));
+  hipStream_t stream = nullptr;
+  Check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+  hipGraph_t graph = nullptr;
+  hipGraphExec_t exec = nullptr;
+  Check(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal));
+  hip::LaunchQwenAbliterateResidualRows(rows.data, device_directions.data,
+                                        settings.data, 0, 1, 1, hidden, stream);
+  Check(hipStreamEndCapture(stream, &graph));
+  Check(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+  const auto run = [&](const std::vector<float>& words) {
+    Check(hipMemcpy(rows.data, values.data(), hidden * sizeof(float),
+                    hipMemcpyHostToDevice));
+    Check(hipMemcpy(settings.data, words.data(), words.size() * sizeof(float),
+                    hipMemcpyHostToDevice));
+    Check(hipGraphLaunch(exec, stream));
+    Check(hipStreamSynchronize(stream));
+    return rows.Read(hidden);
+  };
+  Require(run(Settings3(0, 2, 2, 0)) == values,
+          "zero residual strength changed a row");
+  CheckClose(run(Settings3(0, 0, 0, 1)), Reference(values, first, {1}, hidden),
+             "graph ignored an in-place residual update");
+  CheckClose(run(Settings3(1, 0, 0, .5F)),
+             Reference(values, second, {.5F}, hidden),
+             "graph ignored an in-place direction update");
+  Check(hipGraphExecDestroy(exec));
+  Check(hipGraphDestroy(graph));
+  Check(hipStreamDestroy(stream));
+}
+
+// The D16 order: writer projections, the residual add, then the residual
+// projection. Residual strength 1 removes the component however it entered
+// (here mostly through the incoming residual, which writer projection can
+// never reach).
+void ResidualProductionOrder(std::mt19937& rng) {
+  const std::uint32_t hidden = 5120, rows = 3;
+  const auto direction = UnitDirection(hidden, rng);
+  std::normal_distribution<float> normal(0.F, 1.F);
+  std::vector<float> residual(std::size_t{rows} * hidden),
+      writer(residual.size());
+  for (std::size_t i = 0; i < residual.size(); ++i)
+    residual[i] = normal(rng) + 4 * direction[i % hidden];
+  for (auto& x : writer)
+    x = normal(rng);
+  const Device device_residual(residual), device_writer(writer),
+      device_direction(direction), settings(Settings3(0, 0, 0.5F, 1));
+  hip::LaunchQwenAbliterateRows(device_writer.data, device_direction.data,
+                                settings.data, 0, true, 1, rows, hidden,
+                                nullptr);
+  hip::LaunchBatchedResidualAdd(device_residual.data, device_writer.data,
+                                device_residual.data, rows, hidden, nullptr);
+  hip::LaunchQwenAbliterateResidualRows(device_residual.data,
+                                        device_direction.data, settings.data,
+                                        0, 1, rows, hidden, nullptr);
+  Check(hipDeviceSynchronize());
+  const auto projected =
+      Reference(writer, direction, std::vector<float>(rows, .5F), hidden);
+  std::vector<float> added(residual.size());
+  for (std::size_t i = 0; i < added.size(); ++i)
+    added[i] = static_cast<float>(residual[i] + projected[i]);
+  const auto actual = device_residual.Read(residual.size());
+  CheckClose(actual,
+             Reference(added, direction, std::vector<float>(rows, 1), hidden),
+             "writer, residual add, residual projection differs");
+  for (std::uint32_t r = 0; r < rows; ++r) {
+    double dot = 0;
+    for (std::uint32_t i = 0; i < hidden; ++i)
+      dot += double{direction[i]} * actual[std::size_t{r} * hidden + i];
+    Require(std::abs(dot) < 1e-3, "post-layer residual kept the direction");
+  }
+}
 }  // namespace
 
 int main() {
@@ -248,6 +393,10 @@ int main() {
     OffLaunchesNothing(rng);
     GraphFollowsSettings(rng);
     ProductionOrder(rng);
+    for (const std::uint32_t hidden : {5120U, 13U, 257U})
+      ResidualFormula(hidden, rng);
+    ResidualGraphFollowsSettings(rng);
+    ResidualProductionOrder(rng);
   } catch (const std::exception& e) {
     std::cerr << "FAIL: " << e.what() << '\n';
     return 1;

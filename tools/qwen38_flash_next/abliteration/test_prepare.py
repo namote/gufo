@@ -1,6 +1,9 @@
 """CPU contracts for saved collection integrity and train/evaluation separation."""
+import contextlib
 import importlib.util
+import io
 import json
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -153,6 +156,55 @@ class ProfileTest(unittest.TestCase):
         broken['directions'] = [[1, 1, 0], [0, 0, 1]]
         with self.assertRaises(ValueError):
             prepare.make_profile(broken, 0, [1, 1], [1, 1])
+
+    def test_make_profile_residual(self):
+        # Absent unless given: the runtime reads a missing member as zeros.
+        plain = prepare.make_profile(self.base(), 0, [1, 1], [0, 0])
+        self.assertNotIn('residual', plain)
+        curve = prepare.parse_weights('max_w=1,peak=1,min_w=0.5,width=2', 2)
+        self.assertEqual(curve, [0.75, 1.0])
+        profile = prepare.make_profile(self.base(), 1, [0, 0], [0, 0], residual=curve)
+        self.assertEqual(profile['residual'], [0.75, 1.0])
+        for bad in ([1], [1, 4.5], [1, -1], [1, float('nan')]):
+            with self.assertRaises(ValueError):
+                prepare.make_profile(self.base(), 0, [0, 0], [0, 0], residual=bad)
+
+    def test_make_profile_cli_residual(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / 'base.json'
+            prepare.save_profile(source, prepare.make_profile(
+                self.base(), 0, [1, 1], [0, 0]))
+            output = Path(tmp) / 'residual.json'
+            argv = sys.argv
+            sys.argv = ['prepare.py', 'make-profile', '--profile', str(source),
+                        '--direction-layer', '1', '--residual',
+                        'max_w=1,peak=1,min_w=0.5,width=2', '--output', str(output)]
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    prepare.main()
+            finally:
+                sys.argv = argv
+            profile = json.loads(output.read_text())
+            # Writers default to 0 when only --residual is given.
+            self.assertEqual(profile['attention'], [0, 0])
+            self.assertEqual(profile['mlp'], [0, 0])
+            self.assertEqual(profile['residual'], [0.75, 1.0])
+            self.assertEqual(profile['direction_layer'], 1)
+
+    def test_fit_residual_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prepare.fit(PreparationTest().fixture(root), root / 'candidates')
+            residual = sorted((root / 'candidates').glob('layer*-residual1.json'))
+            self.assertTrue(residual)
+            for path in residual:
+                candidate = json.loads(path.read_text())
+                self.assertEqual(candidate['residual'], [1.0] * 4)
+                self.assertEqual(candidate['attention'], [0.0] * 4)
+                self.assertEqual(candidate['mlp'], [0.0] * 4)
+            # Writer candidates keep their D14 shape: no residual member.
+            for path in (root / 'candidates').glob('layer*-strength*.json'):
+                self.assertNotIn('residual', json.loads(path.read_text()))
 
     def test_make_profile_from_fit(self):
         with tempfile.TemporaryDirectory() as tmp:

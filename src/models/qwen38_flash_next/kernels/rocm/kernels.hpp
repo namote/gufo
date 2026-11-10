@@ -43,6 +43,17 @@ void AbliterateRows(float* output, const float* directions,
                     const float* settings, std::uint32_t layer, bool mlp,
                     std::uint32_t layers, std::uint32_t rows,
                     std::uint32_t hidden, hipStream_t stream);
+/// The post-layer residual `res` ([tokens][streams][hidden]): each stream
+/// row of an ON span's tokens loses w * d * dot(d, row), w being the session's
+/// `residual` strength for `layer`. Projecting every stream also removes the
+/// stream mean's component (what the collector measured): with w = 1 none is
+/// left. Span end rows count tokens. Callers pass only sessions whose
+/// residual strengths are not all zero (null otherwise).
+void AbliterateResidualBatchRows(float* res, const float* directions,
+                                 std::span<const AbliterationSpan> spans,
+                                 std::uint32_t layer, std::uint32_t layers,
+                                 std::uint32_t tokens, std::uint32_t hidden,
+                                 std::uint32_t streams, hipStream_t stream);
 
 struct Exl3RouteTile;  // exl3_moe.hpp
 

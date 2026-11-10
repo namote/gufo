@@ -580,7 +580,8 @@ void TestLlamaProps() {
                        .layers = 3,
                        .direction_layer = 2,
                        .attention = {2, 2, 2},
-                       .mlp = {0, 0.5F, 0}};
+                       .mlp = {0, 0.5F, 0},
+                       .residual = {0, 1, 1}};
   const auto ablated = props("/props");
   const auto* abliteration = ablated.find("abliteration");
   assert(abliteration != nullptr);
@@ -590,6 +591,8 @@ void TestLlamaProps() {
   assert(abliteration->find("direction_layers")->size() == 3);
   assert(abliteration->find("attention")->as_double() == 2.0);
   assert(abliteration->find("mlp")->size() == 3);
+  assert(abliteration->find("residual")->size() == 3);
+  assert(abliteration->find("residual")->items()[1].as_double() == 1.0);
   assert(!abliteration->contains("directions"));
   server.backend->abliteration->direction_layer.reset();
   const auto v1 = props("/props")["abliteration"];

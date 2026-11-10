@@ -103,6 +103,7 @@ std::optional<AbliterationInfo> DescribeAbliteration(
       .direction_layer = profile->direction_layer,
       .attention = profile->attention,
       .mlp = profile->mlp,
+      .residual = profile->residual,
   };
 }
 

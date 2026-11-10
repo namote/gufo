@@ -3371,7 +3371,7 @@ std::optional<HttpResponse> ParseAbliterationControl(
   bool overrides = false;
   for (const auto& [key, ignored] : value->members()) {
     if (key != "enabled" && key != "profile" && key != "direction_layer" &&
-        key != "attention" && key != "mlp")
+        key != "attention" && key != "mlp" && key != "residual")
       return invalid("unsupported abliteration member: " + key);
     overrides = overrides || (key != "enabled" && key != "profile");
   }
@@ -3384,7 +3384,8 @@ std::optional<HttpResponse> ParseAbliterationControl(
   if (!enabled->as_bool()) {
     if (overrides)
       return invalid(
-          "'abliteration.direction_layer', 'attention' and 'mlp' need "
+          "'abliteration.direction_layer', 'attention', 'mlp' and "
+          "'residual' need "
           "'enabled': true");
     chat->abliteration = false;
     chat->abliteration_overrides = {};
@@ -3440,6 +3441,8 @@ std::optional<HttpResponse> ParseAbliterationControl(
   if (auto error = strengths("attention", &parsed.attention))
     return error;
   if (auto error = strengths("mlp", &parsed.mlp))
+    return error;
+  if (auto error = strengths("residual", &parsed.residual))
     return error;
   chat->abliteration = true;
   chat->abliteration_overrides = std::move(parsed);

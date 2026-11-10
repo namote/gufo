@@ -6993,6 +6993,22 @@ void TestAbliterationControls() {
              request.abliteration_overrides.mlp ==
                  std::vector<float>{0.0F, 0.5F, 4.0F},
          "scalar and per-layer strengths with a direction layer");
+  Expect(request.abliteration_overrides.residual.empty(),
+         "omitted residual keeps the profile default");
+  Expect(
+      !parse(R"({"abliteration":{"enabled":true,"residual":1}})") &&
+          request.abliteration &&
+          request.abliteration_overrides.residual == std::vector<float>{1.0F} &&
+          request.abliteration_overrides.attention.empty() &&
+          request.abliteration_overrides.mlp.empty(),
+      "scalar residual strength");
+  Expect(
+      !parse(R"({"abliteration":{"enabled":true,"direction_layer":1,
+             "attention":0,"mlp":0,"residual":[0,1,4]}})") &&
+          request.abliteration_overrides.residual ==
+              std::vector<float>{0.0F, 1.0F, 4.0F} &&
+          request.abliteration_overrides.attention == std::vector<float>{0.0F},
+      "per-layer residual strengths with writers off");
   Expect(!parse(R"({"abliteration":{"enabled":false}})") &&
              !request.abliteration &&
              !request.abliteration_overrides.direction_layer &&
@@ -7018,8 +7034,15 @@ void TestAbliterationControls() {
            R"({"abliteration":{"enabled":true,"mlp":[1,null,1]}})",
            R"({"abliteration":{"enabled":true,"mlp":[]}})",
            R"({"abliteration":{"enabled":true,"mlp":{}}})",
+           R"({"abliteration":{"enabled":true,"residual":-0.5}})",
+           R"({"abliteration":{"enabled":true,"residual":4.5}})",
+           R"({"abliteration":{"enabled":true,"residual":"1"}})",
+           R"({"abliteration":{"enabled":true,"residual":[1,1]}})",
+           R"({"abliteration":{"enabled":true,"residual":[1,1e9,1]}})",
+           R"({"abliteration":{"enabled":true,"residual":null}})",
            // Settings without ON.
            R"({"abliteration":{"enabled":false,"attention":1}})",
+           R"({"abliteration":{"enabled":false,"residual":1}})",
        }) {
     const auto error = parse(body);
     Expect(error.has_value() && error->status == 400 &&

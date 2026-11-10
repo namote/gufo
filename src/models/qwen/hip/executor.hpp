@@ -772,6 +772,15 @@ public:
   [[nodiscard]] const float* AbliterationDeviceSettings() const noexcept {
     return abliteration_ ? abliteration_device_ : nullptr;
   }
+  /// The same device settings while ON with a nonzero residual strength
+  /// (AbliterationSettings::ResidualActive), else null: only such sessions
+  /// launch the post-layer residual projection.
+  [[nodiscard]] const float* AbliterationResidualDeviceSettings()
+      const noexcept {
+    return abliteration_ && abliteration_->ResidualActive()
+               ? abliteration_device_
+               : nullptr;
+  }
   using ActivationObserver =
       std::function<void(std::uint32_t, std::span<const float>)>;
   /// Standalone collector only: after each layer of a prompt pass, the

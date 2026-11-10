@@ -78,9 +78,13 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
   const float* abliteration = AbliterationDeviceSettings();
   const float* abliteration_directions =
       abliteration != nullptr ? model_->AbliterationDirections() : nullptr;
+  // Nonzero residual strengths add the post-layer residual projections: a
+  // second mode bit. Writer-only ON keeps its key and launches.
+  const bool abliteration_residual =
+      AbliterationResidualDeviceSettings() != nullptr;
   if (abliteration != nullptr)
-    graph_key.workload_identity =
-        ExtendQwenGraphWorkloadIdentity(graph_key.workload_identity, 1);
+    graph_key.workload_identity = ExtendQwenGraphWorkloadIdentity(
+        graph_key.workload_identity, abliteration_residual ? 3 : 1);
   const QwenGraphRejection graph_rejections = ResolveQwenGraphRejections(
       compute_logits, use_split_k_decode,
       graph_executor_.IsEnabled() &&
@@ -109,20 +113,22 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
             ExecuteDecodeStep(arena_, weights_, policy_, token_id, pos,
                               compute_logits, recurrent_state, &vision_input_,
                               kvarn_groups, abliteration,
-                              abliteration_directions);
+                              abliteration_directions, abliteration_residual);
           });
       if (ok) {
         launch_captured_graph();
       } else {
         ExecuteDecodeStep(arena_, weights_, policy_, token_id, pos,
                           compute_logits, recurrent_state, &vision_input_,
-                          kvarn_groups, abliteration, abliteration_directions);
+                          kvarn_groups, abliteration, abliteration_directions,
+                          abliteration_residual);
       }
     }
   } else {
     ExecuteDecodeStep(arena_, weights_, policy_, token_id, pos, compute_logits,
                       recurrent_state, &vision_input_, kvarn_groups,
-                      abliteration, abliteration_directions);
+                      abliteration, abliteration_directions,
+                      abliteration_residual);
   }
 
   if (!compute_logits) {

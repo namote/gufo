@@ -87,6 +87,10 @@ AbliterationProfile AbliterationProfile::Load(const std::filesystem::path& path,
                  kAbliterationMaxWeight, false, &result.attention);
     AppendVector(root.find("mlp"), "mlp", layers, kAbliterationMaxWeight, false,
                  &result.mlp);
+    // Residual strengths are a v2 member only.
+    if (root.find("residual"))
+      Invalid("residual (needs gufo-abliteration-v2)");
+    result.residual.assign(layers, 0.0F);
   } else {
     result.schema = 2;
     const auto* directions = root.find("directions");
@@ -111,6 +115,13 @@ AbliterationProfile AbliterationProfile::Load(const std::filesystem::path& path,
                  kAbliterationMaxWeight, true, &result.attention);
     AppendVector(root.find("mlp"), "mlp", layers, kAbliterationMaxWeight, true,
                  &result.mlp);
+    // Optional: profiles written before residual strengths existed load with
+    // all zeros, so their behavior is unchanged.
+    if (const auto* residual = root.find("residual"))
+      AppendVector(residual, "residual", layers, kAbliterationMaxWeight, true,
+                   &result.residual);
+    else
+      result.residual.assign(layers, 0.0F);
   }
   result.identity = crypto::Sha256Hex(std::span(
       reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()));
@@ -118,16 +129,23 @@ AbliterationProfile AbliterationProfile::Load(const std::filesystem::path& path,
 }
 
 std::vector<float> AbliterationSettings::DeviceWords() const {
-  if (attention.size() != mlp.size())
+  if (attention.size() != mlp.size() || attention.size() != residual.size())
     throw std::logic_error("abliteration settings are inconsistent");
   const auto layers = static_cast<std::uint32_t>(attention.size());
   std::vector<float> words(AbliterationDeviceWords(layers));
   words[0] = std::bit_cast<float>(direction_row);
+  using enum AbliterationPoint;
   for (std::uint32_t layer = 0; layer < layers; ++layer) {
-    words[AbliterationWeightIndex(layers, layer, false)] = attention[layer];
-    words[AbliterationWeightIndex(layers, layer, true)] = mlp[layer];
+    words[AbliterationWeightIndex(layers, layer, kAttention)] =
+        attention[layer];
+    words[AbliterationWeightIndex(layers, layer, kMlp)] = mlp[layer];
+    words[AbliterationWeightIndex(layers, layer, kResidual)] = residual[layer];
   }
   return words;
+}
+
+bool AbliterationSettings::ResidualActive() const noexcept {
+  return std::ranges::any_of(residual, [](float x) { return x != 0; });
 }
 
 std::shared_ptr<const AbliterationSettings> ResolveAbliterationSettings(
@@ -176,14 +194,18 @@ std::shared_ptr<const AbliterationSettings> ResolveAbliterationSettings(
   result->attention =
       strengths(overrides.attention, profile.attention, "attention");
   result->mlp = strengths(overrides.mlp, profile.mlp, "mlp");
+  result->residual =
+      strengths(overrides.residual, profile.residual, "residual");
   crypto::Sha256Hasher hash;
+  // v2: the residual strengths follow the writer strengths.
   const std::string prefix =
-      "gufo-abliteration-settings-v1:" + profile.identity + ":";
+      "gufo-abliteration-settings-v2:" + profile.identity + ":";
   hash.Update(std::span(reinterpret_cast<const std::uint8_t*>(prefix.data()),
                         prefix.size()));
   AppendU32(hash, result->direction_layer.value_or(0xFFFFFFFFU));
   AppendU32(hash, layers);
-  for (const auto* values : {&result->attention, &result->mlp})
+  for (const auto* values :
+       {&result->attention, &result->mlp, &result->residual})
     for (float x : *values)
       AppendU32(hash, std::bit_cast<std::uint32_t>(x));
   result->identity = hash.FinishHex();

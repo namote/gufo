@@ -3,8 +3,18 @@
 
 Shared by Qwen3.8-Flash-Next and Qwen3.8-27B. The server must run the model
 with a gufo-abliteration-v2 `--abliteration-profile`; every trial is one set
-of per-request settings (`direction_layer`, per-layer `attention` and `mlp`),
-so nothing reloads. Pure standard library; no GPU work of its own.
+of per-request settings (`direction_layer`, per-layer `attention`, `mlp` and
+`residual`), so nothing reloads. Pure standard library; no GPU work of its
+own.
+
+`--mode` picks the strengths searched (the others are sent as 0):
+
+* `residual` (default): the post-layer residual curve. The direction is
+  removed from the residual after each layer, where the collector measured
+  it, so strength 1 leaves no component there whatever its source.
+* `writer`: the attention and mlp writer curves (the D15 search; its logs
+  keep their fingerprint and resume).
+* `both`: all three curves.
 
 Each trial scores two objectives, both minimized:
 
@@ -31,9 +41,9 @@ Strategy (deterministic for a seed): trial 0 is the profile defaults, the next
 `--initial` trials are uniform random samples of the parameter box, and each
 later trial perturbs a random point of the current Pareto front (refusals vs
 KL) with Gaussian steps whose width shrinks from 0.25 to 0.05 of each
-parameter's range. Parameters: the direction layer and, for attention and mlp
-each, Heretic's curve max_w, peak, min_w (as a fraction of max_w) and width
-(prepare.py documents the curve). Every trial is appended to the `--log`
+parameter's range. Parameters: the direction layer and, for each searched
+strength (attention, mlp, residual), Heretic's curve max_w, peak, min_w (as a
+fraction of max_w) and width (prepare.py documents the curve). Every trial is appended to the `--log`
 JSONL file; rerunning the same command resumes after the last recorded trial.
 
 At the end the Pareto front is printed and the trial with the fewest refusals
@@ -48,7 +58,7 @@ Example:
       --base-url http://127.0.0.1:8080 --model gufo \\
       --data DATA_DIR/tuning.jsonl --refusal-prompts 24 --ordinary-prompts 24 \\
       --thinking off --max-tokens 64 --trials 80 --initial 20 \\
-      --log SEARCH/trials.jsonl --kl-budget 0.1 \\
+      --mode residual --log SEARCH/trials.jsonl --kl-budget 0.1 \\
       --base-profile PROFILE.json --output SEARCH/chosen.json
 """
 import argparse
@@ -134,10 +144,19 @@ def choose(trials, kl_budget):
 
 # Parameter space ---------------------------------------------------------------
 
-def bounds(layers, direction_layers, max_weight):
+# The strengths each --mode searches; the others are sent as 0.
+MODES = {
+    'writer': ('attention', 'mlp'),
+    'residual': ('residual',),
+    'both': ('attention', 'mlp', 'residual'),
+}
+STRENGTHS = ('attention', 'mlp', 'residual')
+
+
+def bounds(layers, direction_layers, max_weight, mode='writer'):
     first, last = min(direction_layers), max(direction_layers)
     box = {'direction_layer': (first, last)}
-    for part in ('attention', 'mlp'):
+    for part in MODES[mode]:
         box[part + '.max_w'] = (0.0, max_weight)
         box[part + '.peak'] = (0.0, layers - 1.0)
         box[part + '.min_frac'] = (0.0, 1.0)
@@ -162,10 +181,14 @@ def perturb(parent, box, rng, scale):
                  for k, (lo, hi) in box.items()}, box)
 
 
-def settings(params, layers):
-    """Per-request settings of one parameter point."""
+def settings(params, layers, mode='writer'):
+    """Per-request settings of one parameter point: the searched strengths
+    as curves, the others 0 (so profile defaults never leak into a trial)."""
     result = {'direction_layer': params['direction_layer']}
-    for part in ('attention', 'mlp'):
+    for part in STRENGTHS:
+        if part not in MODES[mode]:
+            result[part] = 0.0
+            continue
         max_w = params[part + '.max_w']
         result[part] = prepare.curve_weights(
             layers, max_w=max_w, peak=params[part + '.peak'],
@@ -285,17 +308,23 @@ def load_prompts(paths, split, thinking, counts, seed):
 
 class Search:
     def __init__(self, client, model, prompts, info, log, max_tokens,
-                 concurrency=1, out=sys.stdout):
+                 concurrency=1, out=sys.stdout, mode='writer'):
         self.client, self.model, self.prompts = client, model, prompts
         self.layers = info['layers']
         self.max_tokens, self.concurrency, self.out = max_tokens, concurrency, out
         self.log = Path(log)
         self.info = info
-        self.fingerprint = hashlib.sha256(json.dumps(dict(
+        self.mode = mode
+        identity = dict(
             model=model, profile=info.get('identity'), layers=self.layers,
             max_tokens=max_tokens,
-            prompts={g: [r['id'] for r in rows] for g, rows in prompts.items()}),
-            sort_keys=True).encode()).hexdigest()
+            prompts={g: [r['id'] for r in rows] for g, rows in prompts.items()})
+        # Writer mode keeps the D15 fingerprint, so its earlier logs resume;
+        # the other modes search another space and need their own log.
+        if mode != 'writer':
+            identity['mode'] = mode
+        self.fingerprint = hashlib.sha256(
+            json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
     def _map(self, fn, items):
         if self.concurrency <= 1:
@@ -344,8 +373,8 @@ class Search:
             record = json.loads(line)
             if record.get('type') == 'header':
                 if record['fingerprint'] != self.fingerprint:
-                    raise SystemExit('the log belongs to another model, profile or '
-                                     'prompt sample; use a new --log')
+                    raise SystemExit('the log belongs to another model, profile, '
+                                     'prompt sample or --mode; use a new --log')
             else:
                 trials.append(record)
         return trials
@@ -359,7 +388,7 @@ class Search:
         history = self.history()
         if not self.log.exists() or not self.log.read_text().strip():
             self.append(dict(type='header', fingerprint=self.fingerprint,
-                             seed=seed, layers=self.layers))
+                             seed=seed, layers=self.layers, mode=self.mode))
         baseline = self.baseline()
         for index in range(len(history), trials):
             started = time.monotonic()
@@ -368,7 +397,7 @@ class Search:
                 params, values = None, {}
             else:
                 params = propose(index, history, box, initial, trials, seed)
-                values = settings(params, self.layers)
+                values = settings(params, self.layers, self.mode)
             result = self.evaluate(values, baseline)
             record = dict(trial=index, params=params, settings=values,
                           elapsed_s=round(time.monotonic() - started, 3), **result)
@@ -393,8 +422,10 @@ def describe(trial, layers, info):
 def write_choice(trial, info, base_profile, output, out=sys.stdout):
     s = trial['settings']
     layer = s.get('direction_layer', info.get('direction_layer'))
-    attention = s.get('attention', info['attention'])
-    mlp = s.get('mlp', info['mlp'])
+    layers = info['layers']
+    attention = as_list(s.get('attention', info['attention']), layers)
+    mlp = as_list(s.get('mlp', info['mlp']), layers)
+    residual = as_list(s.get('residual', info['residual']), layers)
     if base_profile and output:
         output = Path(output)
         if output.exists():
@@ -402,7 +433,8 @@ def write_choice(trial, info, base_profile, output, out=sys.stdout):
         check_base(base_profile, info)
         base = prepare.load_base(profile=base_profile)
         prepare.save_profile(output, prepare.make_profile(
-            base, layer, attention, mlp, status='candidate-not-qualified',
+            base, layer, attention, mlp, residual=residual,
+            status='candidate-not-qualified',
             search_trial=trial['trial'], search_refusals=trial['refusals'],
             search_kl=trial['kl']))
         print(f'wrote {output}', file=out)
@@ -410,7 +442,9 @@ def write_choice(trial, info, base_profile, output, out=sys.stdout):
         print('make the profile with:\n  python3 tools/qwen38_flash_next/abliteration/'
               f'prepare.py make-profile --profile BASE_V2.json --direction-layer {layer} '
               f'--attention {",".join(f"{w:g}" for w in attention)} '
-              f'--mlp {",".join(f"{w:g}" for w in mlp)} --output NEW.json', file=out)
+              f'--mlp {",".join(f"{w:g}" for w in mlp)} '
+              f'--residual {",".join(f"{w:g}" for w in residual)} --output NEW.json',
+              file=out)
 
 
 def check_base(base_profile, info):
@@ -443,6 +477,10 @@ def main(argv=None, client=None, out=sys.stdout):
     parser.add_argument('--concurrency', type=int, default=1,
                         help='parallel requests (at most the server --sessions)')
     parser.add_argument('--direction-layers', help='FIRST-LAST to search (default all)')
+    parser.add_argument('--mode', choices=tuple(MODES), default='residual',
+                        help='strengths to search: residual (post-layer residual '
+                             'curve, writers 0; default), writer (attention and '
+                             'mlp curves, residual 0) or both')
     parser.add_argument('--log', required=True)
     parser.add_argument('--kl-budget', type=float, required=True)
     parser.add_argument('--base-profile', help='the v2 profile the server loaded')
@@ -455,8 +493,10 @@ def main(argv=None, client=None, out=sys.stdout):
     if args.base_profile:
         check_base(args.base_profile, info)  # before any trial runs
     layers = info['layers']
+    # A server without residual strengths reports none: all zero.
     info = dict(info, attention=as_list(info['attention'], layers),
-                mlp=as_list(info['mlp'], layers))
+                mlp=as_list(info['mlp'], layers),
+                residual=as_list(info.get('residual', 0.0), layers))
     available = info.get('direction_layers') or []
     if not available:
         raise SystemExit('the loaded profile is v1 (one fixed direction); '
@@ -469,9 +509,10 @@ def main(argv=None, client=None, out=sys.stdout):
     prompts = load_prompts(args.data, args.split, args.thinking,
                            {'refusal': args.refusal_prompts,
                             'ordinary': args.ordinary_prompts}, args.seed)
-    box = bounds(layers, available, float(info.get('max_strength', prepare.MAX_WEIGHT)))
+    box = bounds(layers, available, float(info.get('max_strength', prepare.MAX_WEIGHT)),
+                 args.mode)
     search = Search(client, args.model, prompts, info, args.log, args.max_tokens,
-                    args.concurrency, out)
+                    args.concurrency, out, args.mode)
     history = search.run(args.trials, args.initial, args.seed, box)
     print('Pareto front (refusals vs KL):', file=out)
     for trial in pareto_front(history):

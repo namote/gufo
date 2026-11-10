@@ -125,6 +125,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
   // ON projects the attention/GDN and MLP writer outputs before their residual
   // add, which the FP16 prefill fuses into its GEMMs; it takes the FP32 path.
   const float* abliteration = AbliterationDeviceSettings();
+  // Nonzero residual strengths also project the post-layer residual.
+  const float* abliteration_residual = AbliterationResidualDeviceSettings();
   const auto project = [&](float* rows, std::uint32_t layer, bool mlp) {
     if (abliteration != nullptr)
       LaunchQwenAbliterateRows(
@@ -799,6 +801,14 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       LaunchBatchedResidualAdd(arena_.d_hidden, arena_.d_ffn_out,
                                arena_.d_hidden, batch_size, hidden_size,
                                arena_.stream);
+      // The post-layer residual (FP32, never the FP16 path while ON), before
+      // the observer, the feature tap and the next layer's norm read it.
+      if (abliteration_residual != nullptr)
+        LaunchQwenAbliterateResidualRows(
+            arena_.d_hidden, model_->AbliterationDirections(),
+            abliteration_residual, l, config.num_layers,
+            static_cast<std::uint32_t>(batch_size),
+            static_cast<std::uint32_t>(hidden_size), arena_.stream);
     }
     if (activation_observer_) {
       std::vector<float> row(hidden_size);

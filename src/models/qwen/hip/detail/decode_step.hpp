@@ -27,8 +27,11 @@ void EmitDecodeRouteTelemetry(const models::QwenModelWeights& weights,
 /// QwenGpuArena::RecurrentIoIdentity. `abliteration_settings` (the session's
 /// device settings, null OFF) projects its row of `abliteration_directions`
 /// out of each attention/GDN and MLP writer output before its residual add;
-/// the graph key must distinguish ON from OFF. The kernels read the settings
-/// at run time, so their values need no graph key.
+/// the graph key must distinguish ON from OFF. `abliteration_residual` (only
+/// with settings whose residual strengths are not all zero) also projects the
+/// residual after each layer's MLP add; the graph key must distinguish it as
+/// well. The kernels read the settings at run time, so their values need no
+/// graph key.
 void ExecuteDecodeStep(QwenGpuArena& arena,
                        const models::QwenModelWeights& weights,
                        const QwenExecutionPolicy& policy,
@@ -38,7 +41,8 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
                        models::qwen::vision::DeviceInput* image_input = nullptr,
                        std::uint32_t kvarn_groups = 0,
                        const float* abliteration_settings = nullptr,
-                       const float* abliteration_directions = nullptr);
+                       const float* abliteration_directions = nullptr,
+                       bool abliteration_residual = false);
 
 }  // namespace gufo::hip
 

@@ -320,6 +320,7 @@ void Session::ConfigureAbliteration(
     throw std::invalid_argument("abliteration profile is not loaded");
   if (settings && (settings->attention.size() != profile->layers ||
                    settings->mlp.size() != profile->layers ||
+                   settings->residual.size() != profile->layers ||
                    settings->direction_row >= profile->direction_rows()))
     throw std::invalid_argument("abliteration settings do not fit the profile");
   if (settings && abliteration_ &&
@@ -348,8 +349,10 @@ void Session::ConfigureAbliteration(
         hipStreamSynchronize(owner_->stream()) != hipSuccess)
       throw std::runtime_error("abliteration settings upload failed");
   }
-  if (!settings || !abliteration_) {
-    // ON/OFF changes which kernels a pass launches.
+  if (!settings || !abliteration_ ||
+      settings->ResidualActive() != abliteration_->ResidualActive()) {
+    // ON/OFF changes which kernels a pass launches, and so do nonzero
+    // residual strengths (their projection and the unfused layer end).
     for (const auto& [key, graph] : graphs_)
       (void)hipGraphExecDestroy(graph);
     graphs_.clear();
