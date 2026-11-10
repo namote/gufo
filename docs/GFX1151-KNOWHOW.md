@@ -1,5 +1,36 @@
 # gfx1151 optimization know-how
 
+## Qwen3.8 27B EXL3 5.00bpw versus Q4_K_XL, AR and DFlash2, November 11, 2026
+
+Build `int-20261111` (HEAD `dd055f12` code, release), after `host_preflight.sh`
+OK, `tools/bench/model-bench.py` single-user tables with an override config
+(`build/b1/q27speed-20261111/bench.json`): pp2048/tg128, C1, greedy, thinking
+off, `--kv-cache-type fp16`, context 40960, Q4_K_M DFlash2 draft, one sample
+per cell, EXL3 and Q4 run back to back on the same host state.
+
+| Target / mode | Depth | pp (tok/s) | tg (tok/s) | accepted/step |
+| --- | ---: | ---: | ---: | ---: |
+| EXL3 AR | 0 | 495.31 | 12.45 | |
+| EXL3 AR | 32K | 374.88 | 11.10 | |
+| Q4_K_XL AR | 0 | 653.30 | 11.98 | |
+| Q4_K_XL AR | 32K | 450.26 | 10.70 | |
+| EXL3 DFlash2 mixed | 0 | 463.06 | 26.02 | 1.61 |
+| EXL3 DFlash2 mixed | 32K | 351.76 | 21.60 | 1.56 |
+| EXL3 DFlash2 repetitive | 0 | 462.66 | 80.46 | 6.11 |
+| EXL3 DFlash2 repetitive | 32K | 327.51 | 55.77 | 5.40 |
+| Q4_K_XL DFlash2 mixed | 0 | 602.53 | 26.55 | 1.72 |
+| Q4_K_XL DFlash2 mixed | 32K | 417.20 | 21.46 | 1.61 |
+| Q4_K_XL DFlash2 repetitive | 0 | 599.23 | 75.16 | 6.11 |
+| Q4_K_XL DFlash2 repetitive | 32K | 352.84 | 52.23 | 5.40 |
+
+EXL3 prefill is 24% (d0) and 17% (32K) below Q4_K_XL; decode is equal or
+slightly faster despite more bits. Q4 is not a regression against the October
+21 rows (AR pp d0 634.6 → 653.3, DFlash2 mixed tg d0 26.9 → 26.6). EXL3 mixed
+acceptance is a little lower (1.61 vs 1.72), so its DFlash2 decode gain over
+AR (2.09x) is below Q4's (2.22x). Next prefill lever for 27B is the EXL3
+prefill GEMM/rotation path (rotation optimization not yet ported from
+Flash-Next). Evidence: `build/b1/q27speed-20261111/` (artifacts, server logs).
+
 ## Combined GPU pass and deployment, November 11, 2026 (deployed)
 
 Evidence: `build/b1/int-20261111/` (kernel, functional, speed, D18 search
