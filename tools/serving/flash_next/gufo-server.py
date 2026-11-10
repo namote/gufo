@@ -22,12 +22,12 @@ ROOT = Path(__file__).resolve().parent
 STATE = ROOT / 'server-state.json'
 IMAGE = 'ai-tools/gufo-eval:native-exl3-vision-rocm101'
 IMAGE_ID = 'sha256:e7a761a40187efb13515a0275362ab09d084a129f4544aa4300ec5cccb8c7468'
-MODEL = '/home/m2on/projects/models/llm/flash-next-exl3-gufo-c03'
+MODEL = '/home/m2on/projects/models/llm/qwen-3.8-flash-next-exl3-5.05'
 RUNTIME = '/home/m2on/.local/share/gufo/runtime-20261111'
 GUFO_SHA256 = '02dce1230c37d9b7075e7ac098761fe2e8d4cfee6de4f1ea5c5e398f14ea2c4a'
 # Runtime abliteration profile shipped in RUNTIME (writer, layer-36 direction,
 # attention 2, mlp 0.5). Loaded only; requests enable it per call.
-ABLITERATION_PROFILE = '/candidate/abliteration-fnx.json'
+ABLITERATION_PROFILE = '/candidate/abliteration-fnx505.json'
 TEMPERATURE = 0.75
 # Scale Han-ideograph token probability by 0.1 in the final answer only, not in thinking
 # (docs/SERVER.md --han-scale, --han-scale-scope); requests may override.
