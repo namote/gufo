@@ -6,6 +6,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "src/core/crypto/sha256.hpp"
@@ -118,10 +119,14 @@ void Binding() {
   }
   f.Linear("mixed.0", 4);
   f.Linear("mixed.1", 6);
-  f.Linear("unsupported2", 2);
+  f.Linear("integer1", 1);
+  f.Linear("integer2", 2);
   f.Linear("fractional", 3, true, false, true);
+  f.Linear("fractional1", 1, true, false, true);
   f.Linear("fractional2", 2, true, false, true);
   f.Linear("codebook", 4, false);
+  f.Linear("mixedcb.0", 4);
+  f.Linear("mixedcb.1", 4, false);
   f.Linear("biased", 4, true, true);
   auto storage = directory.Open(f);
   // A global bits=5.05 setting must not override any actual tensor rate.
@@ -137,20 +142,32 @@ void Binding() {
       Require(member.view.rate == ex::BitRate{bits, false},
               "uniform bank rate was not retained");
   }
-  // K3.5 (Vemloir gate/up experts) is the one supported half-integer rate.
-  Require(q::BindExl3LinearBank(storage, "fractional", 128, 128)
+  // Every format of the checkpoint has fast kernels: K1, K2 and every
+  // half-integer rate of mul1, and the 3inst codebook (no marker).
+  for (const auto& [name, rate] :
+       {std::pair<const char*, ex::BitRate>{"integer1", {1, false}},
+        {"integer2", {2, false}},
+        {"fractional", {3, true}},
+        {"fractional1", {1, true}},
+        {"fractional2", {2, true}}})
+    Require(q::BindExl3LinearBank(storage, name, 128, 128).exl3[0].view.rate ==
+                rate,
+            "projection rate was not retained");
+  Require(q::BindExl3LinearBank(storage, "codebook", 128, 128)
                   .exl3[0]
-                  .view.rate == ex::BitRate{3, true},
-          "K3.5 projection rate was not retained");
+                  .view.codebook == ex::Codebook::k3Inst,
+          "3inst projection codebook was not retained");
   const auto retained = storage.linears.size();
   Reject([&] { (void)q::BindExl3LinearBank(storage, "mixed.{}", 128, 128, 2); },
-         "mixed expert rates");
+         "mixed expert formats");
+  Reject(
+      [&] { (void)q::BindExl3LinearBank(storage, "mixedcb.{}", 128, 128, 2); },
+      "mixed expert formats");
   Require(
       storage.linears.size() == retained && first.exl3[0].view.rate.bits == 3,
       "failed bank binding invalidated retained descriptors");
-  for (const char* name : {"unsupported2", "fractional2", "codebook", "biased"})
-    Reject([&] { (void)q::BindExl3LinearBank(storage, name, 128, 128); },
-           "invalid projection");
+  Reject([&] { (void)q::BindExl3LinearBank(storage, "biased", 128, 128); },
+         "invalid projection");
   Reject([&] { (void)q::BindExl3LinearBank(storage, "projection4", 256, 128); },
          "invalid projection");
   Reject([&] { (void)q::BindExl3LinearBank(storage, "mixed", 128, 128, 2); },

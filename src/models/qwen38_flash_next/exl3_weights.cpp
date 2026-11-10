@@ -9,6 +9,7 @@
 #include <stdexcept>
 
 #include "src/core/json.hpp"
+#include "src/core/quant/exl3/coverage.hpp"
 #include "src/core/quant/exl3/layout.hpp"
 
 namespace gufo::models::qwen38_flash_next {
@@ -262,13 +263,13 @@ TensorRef BindExl3LinearBank(Exl3Storage& storage, const std::string& module,
     if (name.find("{}") != std::string::npos)
       name.replace(name.find("{}"), 2, std::to_string(e));
     const auto lin = storage.checkpoint->GetLinear(name);
+    // Every format of the checkpoint (ex::Supports) has fast kernels.
     if (lin.in_features != k || lin.out_features != n ||
-        (lin.rate.half && lin.rate.bits != 3) || lin.rate.bits < 3 ||
-        lin.rate.bits > 8 || lin.codebook != ex::Codebook::kMul1 ||
-        lin.bias != nullptr)
+        !ex::Supports(lin.codebook, lin.rate) || lin.bias != nullptr)
       Fail("invalid projection geometry/rate/codebook " + name);
-    if (!bank.empty() && lin.rate != bank.front().view.rate)
-      Fail("mixed expert rates in bank " + module + " at " + name);
+    if (!bank.empty() && (lin.rate != bank.front().view.rate ||
+                          lin.codebook != bank.front().view.codebook))
+      Fail("mixed expert formats in bank " + module + " at " + name);
     const auto* trellis = storage.checkpoint->Find(name + ".trellis");
     const auto* suh = storage.checkpoint->Find(name + ".suh");
     const auto* svh = storage.checkpoint->Find(name + ".svh");
@@ -415,6 +416,17 @@ void ApplyExl3HcMode(Exl3Storage& storage, const Config& config,
         model.string());
 }
 
+namespace {
+// One startup line per load naming the projections no fast kernel takes.
+void LogKernelCoverage(std::string_view model, const Exl3Storage& storage) {
+  std::vector<const ex::DeviceLinear*> views;
+  for (const auto& bank : storage.linears)
+    for (const auto& host : bank)
+      views.push_back(&host.view);
+  ex::LogReferencePath(model, views);
+}
+}  // namespace
+
 std::optional<ModelWeights> LoadExl3Model(const std::filesystem::path& path,
                                           const core::GgufReader& metadata,
                                           HcMode hc_mode, std::string* error) {
@@ -437,6 +449,7 @@ std::optional<ModelWeights> LoadExl3Model(const std::filesystem::path& path,
     w.hc_head = b.Mixer("model.language_model.hyper_connection_mixer.", false);
     for (std::uint32_t i = 0; i < w.config.num_layers; ++i)
       w.layers.push_back(b.Layer(i, false));
+    LogKernelCoverage("qwen38_flash_next", storage);
     return w;
   } catch (const std::exception& e) {
     if (error)
@@ -469,6 +482,7 @@ std::optional<MtpWeights> LoadExl3Mtp(const std::filesystem::path& path,
     w.exl3_storage->hc_q8 = trunk.exl3_storage->hc_q8;
     Binder b{*w.exl3_storage, w.config};
     w.block = b.Layer(0, true);
+    LogKernelCoverage("qwen38_flash_next_mtp", *w.exl3_storage);
     return w;
   } catch (const std::exception& e) {
     if (error)

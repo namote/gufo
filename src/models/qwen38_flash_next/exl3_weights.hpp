@@ -44,8 +44,9 @@ void PrepareExl3HcQ8(Exl3Storage& storage, const Config& config,
 void ApplyExl3HcMode(Exl3Storage& storage, const Config& config,
                      const std::filesystem::path& model, HcMode mode);
 
-/// Bind actual per-tensor K3..K8 or K3.5 rates. Every expert in this bank
-/// must agree; different banks/projections may use different rates.
+/// Bind actual per-tensor formats (any codebook and rate the checkpoint
+/// supports). Every expert in this bank must agree; different
+/// banks/projections may use different formats.
 [[nodiscard]] TensorRef BindExl3LinearBank(Exl3Storage& storage,
                                            const std::string& module,
                                            std::uint32_t k, std::uint32_t n,

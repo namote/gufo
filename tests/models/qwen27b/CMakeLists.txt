@@ -76,6 +76,12 @@ if (ENGINE_ENABLE_HIP)
   add_qwen27b_test(qwen27b_exl3_kernel_test exl3_kernel_test.hip
     "hip;gpu;exl3;kernels;correctness")
   target_link_libraries(qwen27b_exl3_kernel_test PRIVATE hip::host)
+  # Every codebook x rate through every shared EXL3 fast path (synthetic
+  # weights).
+  add_test(NAME qwen27b_exl3_kernel_format_matrix
+    COMMAND qwen27b_exl3_kernel_test --format-matrix)
+  set_tests_properties(qwen27b_exl3_kernel_format_matrix PROPERTIES
+    LABELS "qwen27b;hip;gpu;exl3;kernels;correctness" SKIP_RETURN_CODE 77)
   add_qwen27b_test(qwen27b_plain_prefill_stable_test
     plain_prefill_stable_test.hip "hip;gpu;kernels;correctness")
   # The verbatim SmallGemmStable reference keeps Flash-Next's kernel flags.

@@ -332,12 +332,15 @@ add_library(gufo_core STATIC
   src/core/quant/rotation.cpp
   src/core/quant/exl3/format.cpp
   src/core/quant/exl3/checkpoint.cpp
+  src/core/quant/exl3/coverage.cpp
 )
 target_include_directories(gufo_core PUBLIC ${CMAKE_SOURCE_DIR})
 target_compile_definitions(gufo_core PRIVATE
   GUFO_FFMPEG_EXECUTABLE="${GUFO_FFMPEG_EXECUTABLE}"
   GUFO_FFPROBE_EXECUTABLE="${GUFO_FFPROBE_EXECUTABLE}")
-target_link_libraries(gufo_core PUBLIC gufo_platform ICU::uc ICU::i18n
+# gufo_logging: model loads report their EXL3 kernel coverage
+# (src/core/quant/exl3/coverage.cpp).
+target_link_libraries(gufo_core PUBLIC gufo_platform gufo_logging ICU::uc ICU::i18n
   Threads::Threads PNG::PNG JPEG::JPEG PkgConfig::WEBP CURL::libcurl
   OpenSSL::Crypto)
 
@@ -403,6 +406,7 @@ endif()
 add_library(gufo_logging STATIC src/cli/serve/logging.cpp src/cli/serve/trace.cpp)
 target_include_directories(gufo_logging PUBLIC ${PROJECT_SOURCE_DIR})
 target_compile_features(gufo_logging PUBLIC cxx_std_20)
+target_link_libraries(gufo_logging PUBLIC gufo_platform)
 
 # The imported DeepSeek V4 Flash runtime routes its informational messages
 # through the shared logger instead of writing to stderr directly, so it needs
@@ -674,7 +678,6 @@ if (BUILD_TESTING)
 
   add_executable(openai_chat_test
     tests/cli/openai_chat_test.cpp
-    src/cli/serve/logging.cpp
     src/cli/serve/openai_chat.cpp
     src/models/deepseek_v4_flash/chat_template.cpp
     src/models/deepseek_v4_flash/tool_calls.cpp
@@ -1157,6 +1160,13 @@ if (BUILD_TESTING)
   target_link_libraries(quant_exl3_format_test PRIVATE gufo_core)
   add_test(NAME quant_exl3_format_test COMMAND quant_exl3_format_test)
   set_tests_properties(quant_exl3_format_test PROPERTIES
+    LABELS "cpu;core;quant;exl3")
+
+  add_executable(quant_exl3_coverage_test
+    tests/core/quant/exl3_coverage_test.cpp)
+  target_link_libraries(quant_exl3_coverage_test PRIVATE gufo_core)
+  add_test(NAME quant_exl3_coverage_test COMMAND quant_exl3_coverage_test)
+  set_tests_properties(quant_exl3_coverage_test PROPERTIES
     LABELS "cpu;core;quant;exl3")
 
   # Upstream ExLlamaV3 comparison (tools/qwen27b/rq_quality/exl3/dump_ref.py).

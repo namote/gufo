@@ -1222,8 +1222,8 @@ void RoutedShape(const char* shape, unsigned k, unsigned n, int projections,
           gufo::hip::LaunchExl3PrefillBucketInnerHalf(
               banks[p].device, buckets, bucket_count, max_buckets, kTileRows,
               reinterpret_cast<const std::uint16_t*>(input),
-              reinterpret_cast<std::uint16_t*>(dst[p]), k, n, rate, exps,
-              stream);
+              reinterpret_cast<std::uint16_t*>(dst[p]), k, n, rate,
+              ex::Codebook::kMul1, exps, stream);
       };
       const auto args_for = [&](int p, _Float16* dst, bool half) {
         Args a{};
@@ -1329,7 +1329,8 @@ void DenseShape(const char* shape, unsigned k, unsigned n,
     std::printf("\n%s K%u->N%u K%d, %u rows\n", shape, k, n, Code, rows);
     const auto production = [&] {
       gufo::hip::LaunchExl3PrefillGemmGrouped(problems, 1, rows, k, n, rate,
-                                              false, stream);
+                                              ex::Codebook::kMul1, false,
+                                              stream);
     };
     Ck(hipMemsetAsync(ref, 0xFF, out_count * 4, stream), "sentinel");
     production();

@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "src/core/hip/detail/exl3_gemv.hpp"
+#include "src/core/quant/exl3/coverage.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "tests/models/qwen38_flash_next/exl3_routed_reference.hpp"
@@ -82,9 +83,14 @@ void Near(std::span<const float> actual, std::span<const float> expected,
   Require(relative <= 1e-5, message);
 }
 
+// The codebook of every Bank a test builds (--format-matrix sets it per
+// format; mul1 otherwise).
+ex::Codebook bank_codebook = ex::Codebook::kMul1;
+
 struct Bank {
   unsigned k, n, experts;
   ex::BitRate rate;
+  ex::Codebook codebook = bank_codebook;
   std::vector<ex::DeviceLinear> descriptors;
   std::vector<std::uint16_t> trellis, suh, svh, inner;
   gpu::DeviceTensor weight;
@@ -110,11 +116,10 @@ struct Bank {
     auto* ds = buffers.Copy(suh);
     auto* dv = buffers.Copy(svh);
     for (unsigned e = 0; e < experts; ++e) {
-      descriptors.push_back({dt + e * words, ds + e * k, dv + e * n, k, n, rate,
-                             ex::Codebook::kMul1});
+      descriptors.push_back(
+          {dt + e * words, ds + e * k, dv + e * n, k, n, rate, codebook});
       if (decode)
-        ex::DequantInner(trellis.data() + e * words, k, n, rate,
-                         ex::Codebook::kMul1,
+        ex::DequantInner(trellis.data() + e * words, k, n, rate, codebook,
                          inner.data() + std::size_t{e} * k * n);
     }
     weight.cols = k;
@@ -190,9 +195,9 @@ void HalfBucketStaging(int bits, bool half = false, unsigned k = 256) {
     auto* count = buffers.Copy(std::vector<std::uint32_t>{1});
     auto* control = buffers.Make<float>((rows + 1) * n);
     const unsigned tile_rows = rows <= 16 ? 16 : rows <= 32 ? 32 : 64;
-    gufo::hip::LaunchExl3PrefillBucketInner(bank.weight.device_exl3, buckets,
-                                            count, 2, tile_rows, x, control, k,
-                                            n, bank.rate, nullptr);
+    gufo::hip::LaunchExl3PrefillBucketInner(
+        bank.weight.device_exl3, buckets, count, 2, tile_rows, x, control, k, n,
+        bank.rate, bank.codebook, nullptr);
     const auto dots = Read(control, (rows + 1) * n);
     for (unsigned r = 1; r <= rows; ++r)
       Near(std::span(dots).subspan(r * n, n), bank.Dot(0, input.data() + r * k),
@@ -210,7 +215,8 @@ void HalfBucketStaging(int bits, bool half = false, unsigned k = 256) {
                         hipMemcpyHostToDevice));
         gufo::hip::LaunchExl3PrefillBucketInnerHalf(
             bank.weight.device_exl3, buckets, count, 2, tile_rows, x,
-            output + 1, k, n, bank.rate, scaled ? e : nullptr, nullptr);
+            output + 1, k, n, bank.rate, bank.codebook, scaled ? e : nullptr,
+            nullptr);
         const auto actual = Read(output, poison.size());
         for (unsigned i = 0; i <= n; ++i)
           Require(actual[i] == sentinel, "half bucket prefix guard");
@@ -578,8 +584,9 @@ void ControlGemm(const ex::DeviceLinear* bank,
                  const std::uint32_t* count, std::uint32_t capacity,
                  std::uint32_t tile_rows, const std::uint16_t* input,
                  float* output, std::uint32_t k, std::uint32_t n,
-                 ex::BitRate rate, hipStream_t stream) {
-  Require(!rate.half && rate.bits >= 3 && rate.bits <= 8, "control bank rate");
+                 ex::BitRate rate, ex::Codebook codebook, hipStream_t stream) {
+  // The control reads the CPU-decoded weights: any format.
+  Require(ex::Supports(codebook, rate), "control bank format");
   Require(tile_rows == 16 || tile_rows == 32 || tile_rows == 64,
           "adapter tile row contract");
   unsigned index = 0;
@@ -598,10 +605,10 @@ void ObservedGemm(const ex::DeviceLinear* bank,
                   const std::uint32_t* count, std::uint32_t capacity,
                   std::uint32_t tile_rows, const std::uint16_t* input,
                   float* output, std::uint32_t k, std::uint32_t n,
-                  ex::BitRate rate, hipStream_t stream) {
+                  ex::BitRate rate, ex::Codebook codebook, hipStream_t stream) {
   ++control_calls;
   candidate_gemm(bank, buckets, count, capacity, tile_rows, input, output, k, n,
-                 rate, stream);
+                 rate, codebook, stream);
   if (poison_exponents != nullptr && bank == control_banks[2])
     hipLaunchKernelGGL(PoisonUnsafeDots, dim3(poison_rows), dim3(256), 0,
                        stream, poison_exponents, poison_rows, n, output);
@@ -674,13 +681,13 @@ void PrefillDispatch(gpu::Exl3BucketGemm gemm, int bits, int up_bits = 0,
   auto* control_down = buffers.Make<float>(assignments * k);
   ControlGemm(gate.weight.device_exl3, s.buckets, s.bucket_count, s.max_buckets,
               tile_rows, trace.gate_up_input, control_gate, k, ff,
-              {bits, false}, nullptr);
+              {bits, false}, gate.codebook, nullptr);
   ControlGemm(up.weight.device_exl3, s.buckets, s.bucket_count, s.max_buckets,
               tile_rows, trace.gate_up_input + assignments * k, control_up, k,
-              ff, up.descriptors[0].rate, nullptr);
+              ff, up.descriptors[0].rate, up.codebook, nullptr);
   ControlGemm(down.weight.device_exl3, s.buckets, s.bucket_count, s.max_buckets,
               tile_rows, s.input, control_down, ff, k, down.descriptors[0].rate,
-              nullptr);
+              down.codebook, nullptr);
   const auto control_gate_inner = Read(control_gate, assignments * ff);
   const auto control_up_inner = Read(control_up, assignments * ff);
   const auto control_down_inner = Read(control_down, assignments * k);
@@ -1469,8 +1476,8 @@ void DenseTraversalRates(const char* evidence) {
     gufo::hip::Exl3GemmProblem problem{l.trellis, l.svh, dx, y, rows, 0};
     auto* dp = buffers.Copy(std::vector{problem});
     const auto launch = [&] {
-      gufo::hip::LaunchExl3PrefillGemmGrouped(dp, 1, rows, k, n, bank.rate,
-                                              false, nullptr);
+      gufo::hip::LaunchExl3PrefillGemmGrouped(
+          dp, 1, rows, k, n, bank.rate, ex::Codebook::kMul1, false, nullptr);
     };
     for (int repeat = 0; repeat < 2; ++repeat) {
       launch();
@@ -2267,8 +2274,47 @@ void RoutedDownReference(int bits, bool half) {
   }
 }
 
+// Every codebook x rate (synthetic banks) through the Flash-Next expert
+// kernels against FP64: the bucket WMMA (FP32 and FP16 outputs), the routed
+// down decode (scaled and widened), the MTP draft head, the routed gate/up/
+// down decode at 1, 2 and 8 rows (one and many experts), the prefill expert
+// dispatch and the bucket partitions.
+void FormatMatrix() {
+  for (const auto cb :
+       {ex::Codebook::kMcg, ex::Codebook::k3Inst, ex::Codebook::kMul1}) {
+    bank_codebook = cb;
+    for (int bits = 1; bits <= 8; ++bits) {
+      for (const bool half : {false, true}) {
+        if (!ex::Supports(cb, {bits, half}))
+          continue;
+        std::cout << "CASE format " << ex::CodebookName(cb) << ' '
+                  << ex::RateName({bits, half}) << '\n';
+        HalfBucketStaging(bits, half);
+        DownFixtures(bits, half);
+        SelectedHeadRate(bits, half);
+        for (unsigned rows : {1U, 2U, 8U})
+          for (bool shared : {false, true})
+            FusedProducer(rows, shared, bits, 0, 0, half);
+        ExpertInvariance(false, nullptr, bits, half);
+        if (!half) {
+          PrefillDispatch(gpu::Exl3PrefillBucketInner, bits);
+          for (unsigned tile_rows : {16U, 64U})
+            for (bool shared : {false, true})
+              Buckets(17, shared, tile_rows, bits);
+        }
+      }
+    }
+  }
+  bank_codebook = ex::Codebook::kMul1;
+}
+
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::string(argv[1]) == "--format-matrix") {
+      FormatMatrix();
+      std::cout << "Flash-Next EXL3 format matrix passed\n";
+      return 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--head-generalization") {
       for (int bits = 3; bits <= 8; ++bits)
         SelectedHeadRate(bits);
@@ -2292,7 +2338,8 @@ int main(int argc, char** argv) {
       bool rejected = false;
       try {
         gpu::Exl3PrefillBucketInner(nullptr, nullptr, nullptr, 1, 16, nullptr,
-                                    nullptr, 128, 128, {bits, false}, nullptr);
+                                    nullptr, 128, 128, {bits, false},
+                                    ex::Codebook::kMul1, nullptr);
       } catch (const std::invalid_argument&) {
         rejected = true;
       }

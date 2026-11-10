@@ -1,6 +1,8 @@
 // Dense projections: Q8 activation inputs, GGUF/F16/EXL3 dense GEMM
 // routes, EXL3 rotated-input slabs and grouped projections.
 
+#include <tuple>
+
 #include "src/models/qwen38_flash_next/runtime/executor_internal.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
@@ -214,9 +216,12 @@ bool Executor::Exl3DensePrefill(
       return true;
     // q/k/v have different N; K/V and gate/up can share a GEMM launch.
     // All three still rotate together, each with its own checkpoint suh.
+    // Equal formats sort together (the grouped launch takes one format).
     std::sort(targets.begin(), targets.begin() + count, [](auto a, auto b) {
-      return std::pair{a.weight->exl3->n, a.weight->exl3->rate.bits} <
-             std::pair{b.weight->exl3->n, b.weight->exl3->rate.bits};
+      const auto key = [](const quant::exl3::DeviceLinear& l) {
+        return std::tuple{l.n, l.rate.bits, l.rate.half, l.codebook};
+      };
+      return key(*a.weight->exl3) < key(*b.weight->exl3);
     });
     // Main-stream dense work reuses the larger routed/decode FP16 slab.
     // Concurrent shared experts supply their own operands and descriptors.
@@ -249,7 +254,8 @@ bool Executor::Exl3DensePrefill(
             exl3_.slice_elements < std::size_t{n} * l.n)
           throw std::runtime_error("EXL3 dense prefill slice exceeds scratch");
         const auto begin = direct_slice ? t.weight->output_begin : 0;
-        problems[i] = {l.trellis + std::size_t{begin} * l.rate.bits,
+        // An aligned slice starts begin / 16 tiles into every K step.
+        problems[i] = {l.trellis + std::size_t{begin} / 16 * l.rate.TileWords(),
                        l.suh,
                        l.svh + begin,
                        x + std::size_t{first} * k,
@@ -268,14 +274,15 @@ bool Executor::Exl3DensePrefill(
         const auto& l = *targets[begin].weight->exl3;
         auto end = begin + 1;
         while (end < count && targets[end].weight->exl3->n == l.n &&
-               targets[end].weight->exl3->rate == l.rate)
+               targets[end].weight->exl3->rate == l.rate &&
+               targets[end].weight->exl3->codebook == l.codebook)
           ++end;
         // Always X3, including a singleton/tail; a GEMV row threshold would
         // change the reduction tree when a prompt/checkpoint chunk moves.
         gufo::hip::LaunchExl3PrefillGemmGrouped(
             gemms + begin, end - begin, n, k,
-            direct_slice ? targets[begin].weight->rows : l.n, l.rate, false,
-            execution, direct_slice);
+            direct_slice ? targets[begin].weight->rows : l.n, l.rate,
+            l.codebook, false, execution, direct_slice);
         if (diagnostics_active_)
           ++cycle_diagnostics_.prefill_dense_gemm_groups;
         begin = end;
@@ -319,7 +326,7 @@ Exl3InputSlabs Executor::Exl3Slabs(
     if (l == nullptr || first == nullptr || w->experts != 1 ||
         w->output_begin != 0 || w->rows != l->n || w->cols != l->k ||
         !gufo::hip::Exl3FastSupported(*l) || l->k != first->k ||
-        !(l->rate == first->rate))
+        !(l->rate == first->rate) || l->codebook != first->codebook)
       return {};
     slabs.suh[slabs.count++] = l->suh;
   }

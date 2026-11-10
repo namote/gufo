@@ -287,7 +287,11 @@ __device__ __forceinline__ void RoutedGemvBody(
 #pragma unroll
               for (unsigned t = 0; t < Tiles; ++t) {
                 Half2 w[4];
-                {
+                if constexpr (arithmetic::CodeCodebook(Bits) ==
+                              arithmetic::kCodebookMul1) {
+                  // The mul1 decode as written before the other codebooks
+                  // (DecodeLaneDwords' values; this spelling keeps the
+                  // kernels' register allocation byte for byte).
                   std::uint32_t state[8];
                   arithmetic::LaneStates<Bits>(raw[u][t][0], raw[u][t][1],
                                                raw[u][t][2], lw.shift, state);
@@ -298,6 +302,9 @@ __device__ __forceinline__ void RoutedGemvBody(
 #pragma unroll
                   for (int q = 0; q < 4; ++q)
                     w[q] = arithmetic::DecodePairMul1(p[2 * q], p[2 * q + 1]);
+                } else {
+                  arithmetic::DecodeLaneDwords<Bits>(raw[u][t][0], raw[u][t][1],
+                                                     raw[u][t][2], lw.shift, w);
                 }
         // Fixed row indices keep the accumulators and route slots in VGPRs.
         // A dynamically indexed local array otherwise promotes to 40 KiB LDS
@@ -1101,7 +1108,7 @@ __global__ void BucketDownFallback(const ex::DeviceLinear* bank,
       float a = 0, b = 0;
       for (unsigned kt = 0; kt < k / 16; ++kt) {
         Half2 w[4];
-        arithmetic::DecodeLaneMul1<Bits>(
+        arithmetic::DecodeLane<Bits>(
             trellis + (std::size_t{kt} * (n / 16) + nt) *
                           arithmetic::TileDwords(Bits),
             lw, w);
@@ -1223,10 +1230,9 @@ __global__ void HeadGemv(ex::DeviceLinear l, const std::uint16_t* input,
   float a = 0, b = 0;
   for (unsigned kt = 0; kt < l.k / 16; ++kt) {
     Half2 w[4];
-    arithmetic::DecodeLaneMul1<Bits>(
-        trellis +
-            (std::size_t{kt} * (l.n / 16) + nt) * arithmetic::TileDwords(Bits),
-        lw, w);
+    arithmetic::DecodeLane<Bits>(trellis + (std::size_t{kt} * (l.n / 16) + nt) *
+                                               arithmetic::TileDwords(Bits),
+                                 lw, w);
     const auto offset = arithmetic::LaneMajorOffset(kt * 16 + r0, 0, 1);
     const auto* group = x + offset;
     const Half2 v01{group[0], group[1]}, v89{group[2], group[3]};
@@ -1374,41 +1380,21 @@ void Exl3Scatter(const float* x, const std::int32_t* slots, float* out,
 }
 
 namespace {
+// f.template operator()<Code>() at the trellis code of `codebook` and
+// `rate` (every format of the checkpoint loader).
 template<class F>
-void WithRate(ex::BitRate rate, F&& f) {
-  if (rate.half) {
-    if (rate.bits != 3)
-      throw std::invalid_argument("Flash-Next experts need K3..K8 or K3.5");
-    f.template operator()<arithmetic::RateCode(3, true)>();
-    return;
-  }
-  switch (rate.bits) {
-    case 3:
-      f.template operator()<3>();
-      break;
-    case 4:
-      f.template operator()<4>();
-      break;
-    case 5:
-      f.template operator()<5>();
-      break;
-    case 6:
-      f.template operator()<6>();
-      break;
-    case 7:
-      f.template operator()<7>();
-      break;
-    case 8:
-      f.template operator()<8>();
-      break;
-    default:
-      throw std::invalid_argument("Flash-Next experts need K3..K8 or K3.5");
-  }
+void WithFormat(ex::Codebook codebook, ex::BitRate rate, F&& f) {
+  arithmetic::DispatchTrellisCode(codebook, rate, f);
 }
 ex::BitRate BankRate(const DeviceTensor& bank) {
   if (bank.exl3 == nullptr || bank.experts == 0)
     throw std::invalid_argument("missing Flash-Next expert host descriptors");
   return bank.exl3[0].rate;
+}
+ex::Codebook BankCodebook(const DeviceTensor& bank) {
+  if (bank.exl3 == nullptr || bank.experts == 0)
+    throw std::invalid_argument("missing Flash-Next expert host descriptors");
+  return bank.exl3[0].codebook;
 }
 
 // The tile builders use the same cap (Exl3RouteTileRows).
@@ -1430,8 +1416,8 @@ void LaunchRouted(const ex::DeviceLinear* gate, const ex::DeviceLinear* up,
                   unsigned k, unsigned n, unsigned assignments,
                   unsigned projections, unsigned tile_rows,
                   const Exl3Scratch& scratch, hipStream_t stream,
-                  ex::BitRate rate) {
-  WithRate(rate, [&]<int Bits>() {
+                  ex::BitRate rate, ex::Codebook codebook) {
+  WithFormat(codebook, rate, [&]<int Bits>() {
     const auto launch = [&]<unsigned R>() {
       // The eight-row kernel keeps one tile: its widest row body would
       // need 125-146 VGPRs with two.
@@ -1492,12 +1478,12 @@ void RoutedDown(const DeviceTensor& down, std::uint16_t* input, float* out,
     LaunchRouted<false, true, kDownTiles>(
         down.device_exl3, down.device_exl3, input, out, out, down.cols,
         down.rows, assignments, 1, TileRows(max_tile_rows), scratch, stream,
-        BankRate(down));
+        BankRate(down), BankCodebook(down));
   } else {
     LaunchRouted<true, false, kDownTiles>(
         down.device_exl3, down.device_exl3, input, out, out, down.cols,
         down.rows, assignments, 1, TileRows(max_tile_rows), scratch, stream,
-        BankRate(down));
+        BankRate(down), BankCodebook(down));
   }
   Check();
 }
@@ -1572,18 +1558,16 @@ void Exl3PrefillBucketInner(const ex::DeviceLinear* bank,
                             std::uint32_t max_buckets, std::uint32_t tile_rows,
                             const std::uint16_t* input, float* inner,
                             std::uint32_t k, std::uint32_t n, ex::BitRate rate,
-                            hipStream_t stream) {
+                            ex::Codebook codebook, hipStream_t stream) {
   if (max_buckets > 65535 || k == 0 || n == 0 || k % 128 || n % 128 ||
       bank == nullptr || buckets == nullptr || bucket_count == nullptr ||
       input == nullptr || inner == nullptr ||
       (tile_rows != 16 && tile_rows != 32 && tile_rows != 64))
     throw std::invalid_argument("invalid Flash-Next bucket shape");
-  // The shared X3 bucket WMMA takes every integer rate (K3..K8 here).
-  WithRate(rate, [&]<int Bits>() {
-    gufo::hip::LaunchExl3PrefillBucketInner(bank, buckets, bucket_count,
-                                            max_buckets, tile_rows, input,
-                                            inner, k, n, rate, stream);
-  });
+  // The shared X3 bucket WMMA takes every format.
+  gufo::hip::LaunchExl3PrefillBucketInner(bank, buckets, bucket_count,
+                                          max_buckets, tile_rows, input, inner,
+                                          k, n, rate, codebook, stream);
   Check();
 }
 
@@ -1624,16 +1608,16 @@ void Exl3PrefillDown(const DeviceTensor& down, std::uint32_t assignments,
         down.device_exl3, scratch.buckets, scratch.bucket_count,
         scratch.max_buckets, tile_rows, scratch.input,
         reinterpret_cast<std::uint16_t*>(scratch.out), down.cols, down.rows,
-        BankRate(down), scratch.down_exponents, stream);
+        BankRate(down), BankCodebook(down), scratch.down_exponents, stream);
   else
     gemm(down.device_exl3, scratch.buckets, scratch.bucket_count,
          scratch.max_buckets, tile_rows, scratch.input, scratch.out, down.cols,
-         down.rows, BankRate(down), stream);
+         down.rows, BankRate(down), BankCodebook(down), stream);
   auto* counts = trace == nullptr ? nullptr : trace->fallback_counts;
   if (counts != nullptr &&
       hipMemsetAsync(counts, 0, 2 * sizeof(unsigned), stream) != hipSuccess)
     throw std::runtime_error("EXL3 fallback trace reset failed");
-  WithRate(BankRate(down), [&]<int Bits>() {
+  WithFormat(BankCodebook(down), BankRate(down), [&]<int Bits>() {
     if (raw_only)
       hipLaunchKernelGGL((BucketDownFallback<Bits, _Float16>),
                          dim3(std::min(assignments, 256U)), dim3(256), 0,
@@ -1751,7 +1735,7 @@ void PrefillExperts(const DeviceLayer& layer, const float* x,
   const auto projection = [&](const DeviceTensor& bank, float* target) {
     gemm(bank.device_exl3, scratch.buckets, scratch.bucket_count,
          scratch.max_buckets, tile_rows, scratch.input, target, bank.cols,
-         bank.rows, BankRate(bank), stream);
+         bank.rows, BankRate(bank), BankCodebook(bank), stream);
   };
   // One gathered read of x feeds both rotations. The up rows go to
   // scratch.out, free until the down projection writes it (it holds
@@ -1781,7 +1765,7 @@ void PrefillExperts(const DeviceLayer& layer, const float* x,
         bank.device_exl3, scratch.buckets, scratch.bucket_count,
         scratch.max_buckets, tile_rows, input,
         reinterpret_cast<std::uint16_t*>(target), bank.cols, bank.rows,
-        BankRate(bank), nullptr, stream);
+        BankRate(bank), BankCodebook(bank), nullptr, stream);
   };
   if (raw_only)
     half_projection(g, scratch.input, scratch.gate);
@@ -1799,7 +1783,7 @@ void PrefillExperts(const DeviceLayer& layer, const float* x,
   else
     gemm(u.device_exl3, scratch.buckets, scratch.bucket_count,
          scratch.max_buckets, tile_rows, up_input, scratch.up, u.cols, u.rows,
-         BankRate(u), stream);
+         BankRate(u), BankCodebook(u), stream);
   if (trace != nullptr)
     PrefillSnapshot(trace->up_inner, scratch.up,
                     std::size_t{assignments} * u.rows * sizeof(float), stream);
@@ -1944,18 +1928,18 @@ void Exl3RoutedMlp(const DeviceLayer& l, const float* x,
   if (trace != nullptr)
     snapshot(trace->gate_up_input, s.routed_input,
              std::size_t{2} * assignments * g.cols * sizeof(std::uint16_t));
-  if (BankRate(g) == BankRate(u)) {
+  if (BankRate(g) == BankRate(u) && BankCodebook(g) == BankCodebook(u)) {
     LaunchRouted<false>(g.device_exl3, u.device_exl3, s.routed_input, gate, up,
                         g.cols, g.rows, assignments, 2, tile_rows, s, stream,
-                        BankRate(g));
+                        BankRate(g), BankCodebook(g));
   } else {
     LaunchRouted<false>(g.device_exl3, g.device_exl3, s.routed_input, gate,
                         gate, g.cols, g.rows, assignments, 1, tile_rows, s,
-                        stream, BankRate(g));
+                        stream, BankRate(g), BankCodebook(g));
     LaunchRouted<false>(u.device_exl3, u.device_exl3,
                         s.routed_input + std::size_t{assignments} * g.cols, up,
                         up, u.cols, u.rows, assignments, 1, tile_rows, s,
-                        stream, BankRate(u));
+                        stream, BankRate(u), BankCodebook(u));
   }
   if (trace != nullptr) {
     snapshot(trace->gate_inner, gate,
@@ -1988,13 +1972,13 @@ void Exl3RoutedMlp(const DeviceLayer& l, const float* x,
     LaunchRouted<false>(d.device_exl3, d.device_exl3, s.routed_input,
                         trace->down_packed_inner, trace->down_packed_inner,
                         d.cols, d.rows, assignments, 1, tile_rows, s, stream,
-                        BankRate(d));
+                        BankRate(d), BankCodebook(d));
   }
   if (trace != nullptr && trace->down_widened_inner != nullptr)
     LaunchRouted<true>(d.device_exl3, d.device_exl3, s.routed_input,
                        trace->down_widened_inner, trace->down_widened_inner,
                        d.cols, d.rows, assignments, 1, tile_rows, s, stream,
-                       BankRate(d));
+                       BankRate(d), BankCodebook(d));
   RoutedDown(d, s.routed_input, out, assignments, tile_rows, s, stream,
              prescaled);
   if (trace != nullptr)
@@ -2049,17 +2033,17 @@ void Exl3DraftHead(const DeviceTensor& head, const float* x, float* logits,
                    std::uint32_t extras, const Exl3Scratch& s,
                    hipStream_t stream) {
   const auto& l = *head.exl3;
-  if (prefix % 128 != 0 || prefix > l.n || (l.rate.half && l.rate.bits != 3) ||
-      l.rate.bits < 3 || l.rate.bits > 8 || l.codebook != ex::Codebook::kMul1)
+  if (prefix % 128 != 0 || prefix > l.n ||
+      !arithmetic::TrellisSupported(l.codebook, l.rate))
     throw std::runtime_error(
-        "EXL3 draft head needs a complete K3..K8 or K3.5 prefix");
+        "EXL3 draft head needs a complete prefix of a supported format");
   if (prefix == 0 && extras == 0)
     return;
   hipLaunchKernelGGL(SelectSegments, dim3(1), dim3(1), 0, stream, ids, extras,
                      prefix, l.n, s.head_segments);
   hipLaunchKernelGGL(HeadInput, dim3(l.k / 128), dim3(32), 0, stream, l, x,
                      s.projection.fast_input);
-  WithRate(l.rate, [&]<int Bits>() {
+  WithFormat(l.codebook, l.rate, [&]<int Bits>() {
     hipLaunchKernelGGL((HeadGemv<Bits>), dim3(8, prefix / 128 + extras),
                        dim3(32), 0, stream, l, s.projection.fast_input,
                        s.head_values, prefix / 128, s.head_segments);

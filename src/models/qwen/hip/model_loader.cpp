@@ -15,6 +15,7 @@
 #include "src/core/platform/mapped_file.hpp"
 #include "src/core/platform/pages.hpp"
 #include "src/core/platform/prefault.hpp"
+#include "src/core/quant/exl3/coverage.hpp"
 #include "src/core/quant/exl3/layout.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/exl3_weights.hpp"
@@ -403,6 +404,11 @@ std::size_t UploadExl3(models::QwenModelWeights& weights,
     return 0;
   }
   weights.exl3_storage = storage;  // releases the host copies
+  std::vector<const quant::exl3::DeviceLinear*> views;
+  views.reserve(storage->device.size());
+  for (const auto& view : storage->device)
+    views.push_back(&view);
+  quant::exl3::LogReferencePath("qwen", views);
   return storage->device_bytes;
 }
 

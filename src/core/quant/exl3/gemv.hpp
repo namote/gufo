@@ -85,13 +85,15 @@ void LaunchExl3RotateRows(const float* x, std::size_t x_stride,
                           const std::uint16_t* suh, std::uint16_t* out,
                           hipStream_t stream);
 
-/// Whether the fast path takes `linear` (mul1 codebook, integer K 1..8).
+/// Whether the fast path takes `linear`: every format of the checkpoint
+/// loader (K1..K8 of mul1, mcg and 3inst; K1.5..K3.5 of mul1) with k and n
+/// multiples of 128.
 [[nodiscard]] bool Exl3FastSupported(
     const quant::exl3::DeviceLinear& linear) noexcept;
 
 /// Whether one launch can carry `targets`: 1..kExl3FastMaxGroup supported
-/// matrices of the same k and bit rate (each still reads its own suh), with
-/// a rotated-input slab per matrix and counters for all of them in
+/// matrices of the same k, bit rate and codebook (each still reads its own
+/// suh), with a rotated-input slab per matrix and counters for all of them in
 /// `workspace`.
 [[nodiscard]] bool Exl3FastGroupSupported(
     std::span<const Exl3FastTarget> targets,

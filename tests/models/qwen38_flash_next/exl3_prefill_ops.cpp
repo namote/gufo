@@ -24,7 +24,8 @@ void NarrowIndexerPrefill() {
   auto* descriptors = buffers.Copy(chunks);
   for (unsigned i = 0; i < chunks.size(); ++i)
     gufo::hip::LaunchExl3PrefillGemmGrouped(descriptors + i, 1, chunks[i].rows,
-                                            k, n, weight.rate, false, nullptr);
+                                            k, n, weight.rate, weight.codebook,
+                                            false, nullptr);
   const auto expected = Access::Read<float>(reference, rows * n);
   Require(
       std::ranges::all_of(expected, [](float v) { return std::isfinite(v); }) &&
@@ -37,7 +38,8 @@ void NarrowIndexerPrefill() {
     const std::vector<gufo::hip::Exl3GemmProblem> problem{
         {weight.trellis, weight.svh, x, output, count, 0}};
     gufo::hip::LaunchExl3PrefillGemmGrouped(buffers.Copy(problem), 1, count, k,
-                                            n, weight.rate, false, nullptr);
+                                            n, weight.rate, weight.codebook,
+                                            false, nullptr);
     const auto actual = Access::Read<float>(output, count * n);
     Require(std::memcmp(expected.data(), actual.data(),
                         actual.size() * sizeof(float)) == 0,

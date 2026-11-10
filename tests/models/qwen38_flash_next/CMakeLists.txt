@@ -118,6 +118,11 @@ if (ENGINE_ENABLE_HIP)
   # Match production device arithmetic while keeping CPU oracles strict.
   set_source_files_properties(exl3_moe_kernel_test.cpp PROPERTIES
     COMPILE_OPTIONS "-O3;-Xarch_device;-ffast-math;-fno-finite-math-only")
+  # Every codebook x rate through the expert kernels (synthetic banks).
+  add_test(NAME qwen38_flash_next.exl3_format_matrix
+    COMMAND qwen38_flash_next_exl3_moe_kernel_test --format-matrix)
+  set_tests_properties(qwen38_flash_next.exl3_format_matrix PROPERTIES
+    LABELS "qwen38_flash_next;hip;gpu;gfx1151;exl3")
   add_test(NAME qwen38_flash_next.exl3_shared_invariance
     COMMAND qwen38_flash_next_exl3_ops_test --shared-invariance-only)
   set_tests_properties(qwen38_flash_next.exl3_shared_invariance PROPERTIES

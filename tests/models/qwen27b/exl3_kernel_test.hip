@@ -7,7 +7,10 @@
 // plus every row count 1..64 (passes of 8, padded row tiles), input and
 // output strides, the self-resetting segment counters, graph replay,
 // shared-input groups of two and three matrices in one launch, and the fused
-// SwiGLU MLP against its unfused launches (bits).
+// SwiGLU MLP against its unfused launches (bits). --format-matrix runs every
+// codebook x rate (mcg, 3inst and mul1 K1..K8, mul1 K1.5..K3.5) through the
+// decode GEMV, groups, the fused MLP, the WMMA prefill tiles, the grouped
+// GEMM and the buckets, and against the reference kernel.
 
 #include <hip/hip_runtime.h>
 
@@ -81,7 +84,18 @@ std::vector<std::uint16_t> RandomScales(std::mt19937& rng, std::size_t n,
 struct Problem {
   std::size_t k, n;
   int bits;
+  bool half = false;
+  Codebook cb = Codebook::kMul1;
 };
+
+// "K5", "mcg K3", "K3.5": the format of a test name (mul1 unnamed, as the
+// tests named it before the other codebooks).
+std::string FormatName(int bits, bool half, Codebook cb) {
+  const std::string prefix = cb == Codebook::kMul1  ? ""
+                             : cb == Codebook::kMcg ? "mcg "
+                                                    : "3inst ";
+  return prefix + "K" + std::to_string(bits) + (half ? ".5" : "");
+}
 
 double RelL2(const std::vector<double>& want, const std::vector<float>& got,
              std::size_t rows, std::size_t n, std::size_t stride) {
@@ -141,7 +155,7 @@ std::vector<double> ProjectRotated(const std::vector<double>& rot,
 
 void TestProblem(const Problem& p, std::mt19937& rng) {
   constexpr std::size_t kMaxRowsTested = 64;
-  const BitRate rate{p.bits, false};
+  const BitRate rate{p.bits, p.half};
   std::vector<std::uint16_t> trellis((p.k / 16) * (p.n / 16) *
                                      rate.TileWords());
   for (auto& w : trellis)
@@ -157,7 +171,7 @@ void TestProblem(const Problem& p, std::mt19937& rng) {
 
   // FP64 references for every row.
   std::vector<std::uint16_t> inner(p.k * p.n);
-  DequantInner(trellis.data(), p.k, p.n, rate, Codebook::kMul1, inner.data());
+  DequantInner(trellis.data(), p.k, p.n, rate, p.cb, inner.data());
   std::vector<double> exact(kMaxRowsTested * p.n);
   std::vector<double> fp16_input(kMaxRowsTested * p.n);
   for (std::size_t r = 0; r < kMaxRowsTested; ++r) {
@@ -196,12 +210,12 @@ void TestProblem(const Problem& p, std::mt19937& rng) {
                          static_cast<std::uint32_t>(p.k),
                          static_cast<std::uint32_t>(p.n),
                          rate,
-                         Codebook::kMul1};
+                         p.cb};
   Expect(gufo::hip::Exl3FastSupported(lin), "fast path supports the problem");
 
   const std::string name = "k=" + std::to_string(p.k) +
-                           " n=" + std::to_string(p.n) +
-                           " K=" + std::to_string(p.bits);
+                           " n=" + std::to_string(p.n) + " " +
+                           FormatName(p.bits, p.half, p.cb);
   double worst_exact = 0.0;
   double worst_fp16 = 0.0;
   for (std::size_t rows : {1, 2, 3, 4, 5, 8, 9, 17, 64}) {
@@ -293,9 +307,10 @@ void TestProblem(const Problem& p, std::mt19937& rng) {
 // every slot against its FP64 reference fed the kernel's rotated input, and
 // nothing written outside any slot's window.
 void TestGroup(std::size_t k, std::vector<std::size_t> ns, int bits,
-               std::mt19937& rng) {
+               std::mt19937& rng, bool half = false,
+               Codebook cb = Codebook::kMul1) {
   constexpr std::size_t kRows = 17;
-  const BitRate rate{bits, false};
+  const BitRate rate{bits, half};
   const std::size_t x_stride = k + 64;
   std::normal_distribution<float> normal;
   std::vector<float> x(kRows * x_stride);
@@ -320,8 +335,7 @@ void TestGroup(std::size_t k, std::vector<std::size_t> ns, int bits,
     sl.suh = RandomScales(rng, k, 0x3800);
     sl.svh = RandomScales(rng, n, 0x2000);
     sl.inner.resize(k * n);
-    DequantInner(sl.trellis.data(), k, n, rate, Codebook::kMul1,
-                 sl.inner.data());
+    DequantInner(sl.trellis.data(), k, n, rate, cb, sl.inner.data());
     sl.d_trellis = Upload(sl.trellis);
     sl.d_suh = Upload(sl.suh);
     sl.d_svh = Upload(sl.svh);
@@ -333,7 +347,7 @@ void TestGroup(std::size_t k, std::vector<std::size_t> ns, int bits,
                           static_cast<std::uint32_t>(k),
                           static_cast<std::uint32_t>(n),
                           rate,
-                          Codebook::kMul1};
+                          cb};
     counters += n / 128;
   }
   gufo::hip::Exl3FastWorkspace ws;
@@ -402,9 +416,10 @@ void TestGroup(std::size_t k, std::vector<std::size_t> ns, int bits,
 // The fused MLP (gate/up epilogue writes the down input) against the same
 // three projections with the SwiGLU kernel in between: bit-identical outputs.
 void TestMlp(std::size_t hidden, std::size_t inter, int bits,
-             std::mt19937& rng) {
+             std::mt19937& rng, bool half = false,
+             Codebook cb = Codebook::kMul1) {
   constexpr std::size_t kRows = 17;
-  const BitRate rate{bits, false};
+  const BitRate rate{bits, half};
   auto make = [&](std::size_t k, std::size_t n, std::vector<void*>& owned) {
     std::vector<std::uint16_t> trellis((k / 16) * (n / 16) * rate.TileWords());
     for (auto& w : trellis)
@@ -419,7 +434,7 @@ void TestMlp(std::size_t hidden, std::size_t inter, int bits,
                         static_cast<std::uint32_t>(k),
                         static_cast<std::uint32_t>(n),
                         rate,
-                        Codebook::kMul1};
+                        cb};
   };
   std::vector<void*> owned;
   const DeviceLinear gate = make(hidden, inter, owned);
@@ -451,8 +466,8 @@ void TestMlp(std::size_t hidden, std::size_t inter, int bits,
                                    d_up,  d_fused, hidden};
   Expect(gufo::hip::Exl3FastMlpSupported(mlp, ws), "fused MLP supported");
   const std::string name = "mlp hidden=" + std::to_string(hidden) +
-                           " inter=" + std::to_string(inter) +
-                           " K=" + std::to_string(bits);
+                           " inter=" + std::to_string(inter) + " " +
+                           FormatName(bits, half, cb);
   bool same = true;
   for (std::size_t rows : {1, 3, 8, 17}) {
     gufo::hip::LaunchExl3FastMlp(mlp, d_x, hidden, rows, ws, nullptr);
@@ -609,7 +624,43 @@ __global__ void DecodeAllStates(std::uint32_t* out) {
   out[s] = __builtin_bit_cast(std::uint32_t, v);
 }
 
+// DecodeAllStates for the codebook of index CB through the WMMA producer's
+// helpers (HashStatePacked, DecodePair).
+template<int CB>
+__global__ void DecodeAllStatesCodebook(std::uint32_t* out) {
+  const unsigned s = blockIdx.x * blockDim.x + threadIdx.x;
+  if (s >= 65536)
+    return;
+  const unsigned s2 = (s * 40503U + 12345U) & 0xffffU;
+  const auto v = gufo::hip::exl3::DecodePair<CB>(
+      gufo::hip::exl3::HashStatePacked<CB>(s | (s2 << 16)),
+      gufo::hip::exl3::HashStatePacked<CB>(s2 | (s << 16)));
+  out[s] = __builtin_bit_cast(std::uint32_t, v);
+}
+
+template<int CB>
+void TestPackedHashCodebook(Codebook cb) {
+  std::uint32_t* d = nullptr;
+  Check(hipMalloc(&d, 65536 * 4));
+  hipLaunchKernelGGL(DecodeAllStatesCodebook<CB>, dim3(256), dim3(256), 0, 0,
+                     d);
+  const auto got = Download(d, 65536);
+  std::size_t diff = 0;
+  for (std::uint32_t s = 0; s < 65536; ++s) {
+    const std::uint32_t s2 = (s * 40503U + 12345U) & 0xffffU;
+    diff += (got[s] & 0xffffU) != DecodeState(s, cb) ||
+            (got[s] >> 16) != DecodeState(s2, cb);
+  }
+  Expect(diff == 0, "packed hash decode (codebook " + std::to_string(CB) +
+                        ") differs in " + std::to_string(diff) + " states");
+  std::cout << "packed hash codebook " << CB << ": " << diff
+            << " / 65536 states differ\n";
+  Check(hipFree(d));
+}
+
 void TestPackedHash() {
+  TestPackedHashCodebook<gufo::hip::exl3::kCodebookMcg>(Codebook::kMcg);
+  TestPackedHashCodebook<gufo::hip::exl3::kCodebook3Inst>(Codebook::k3Inst);
   std::uint32_t* d = nullptr;
   Check(hipMalloc(&d, 65536 * 4));
   hipLaunchKernelGGL(DecodeAllStates, dim3(256), dim3(256), 0, 0, d);
@@ -680,8 +731,9 @@ double GgufWmmaError(std::size_t k, const std::vector<std::uint16_t>& xh,
 // FP32 contract (FP16 bytes), then store and residual GEMMs against FP64 fed
 // that rotated input (relative L2 within (k / 16) * 2^-23, finite).
 void TestPrefill(std::size_t k, std::size_t n, int bits, std::size_t rows,
-                 std::mt19937& rng) {
-  const BitRate rate{bits, false};
+                 std::mt19937& rng, bool half = false,
+                 Codebook cb = Codebook::kMul1) {
+  const BitRate rate{bits, half};
   std::vector<std::uint16_t> trellis((k / 16) * (n / 16) * rate.TileWords());
   for (auto& w : trellis)
     w = static_cast<std::uint16_t>(rng());
@@ -694,7 +746,7 @@ void TestPrefill(std::size_t k, std::size_t n, int bits, std::size_t rows,
   for (auto& v : y0)
     v = normal(rng);
   std::vector<std::uint16_t> inner(k * n);
-  DequantInner(trellis.data(), k, n, rate, Codebook::kMul1, inner.data());
+  DequantInner(trellis.data(), k, n, rate, cb, inner.data());
   std::vector<double> want(rows * n);
   std::size_t rot_diff = 0;
   auto* d_x = Upload(x);
@@ -719,10 +771,11 @@ void TestPrefill(std::size_t k, std::size_t n, int bits, std::size_t rows,
                          static_cast<std::uint32_t>(k),
                          static_cast<std::uint32_t>(n),
                          rate,
-                         Codebook::kMul1};
-  const std::string name =
-      "prefill k=" + std::to_string(k) + " n=" + std::to_string(n) +
-      " K=" + std::to_string(bits) + " rows=" + std::to_string(rows);
+                         cb};
+  const std::string name = "prefill k=" + std::to_string(k) +
+                           " n=" + std::to_string(n) + " " +
+                           FormatName(bits, half, cb) +
+                           " rows=" + std::to_string(rows);
   Expect(gufo::hip::Exl3PrefillSupported(lin), name + ": supported");
   auto* d_y = Upload(y0);
   gufo::hip::LaunchExl3PrefillGemm(lin, d_rot, d_y, rows, false, nullptr);
@@ -975,9 +1028,10 @@ void TestDispatch(std::mt19937& rng) {
     Check(hipFree(p));
 }
 
-// Every rate's lane decode (DecodeLaneMul1, the GEMV producer; K7 and K8
+// Every format's lane decode (DecodeLane, the GEMV producer; K7 and K8
 // through the third dword, K + 0.5 through the 0xAAAA position widths)
-// against the CPU dequant, FP16 bits. K is a rate code (exl3::RateCode).
+// against the CPU dequant, FP16 bits. K is a trellis code
+// (exl3::TrellisCode).
 template<int K>
 __global__ void DecodeTilesKernel(const std::uint16_t* trellis, unsigned,
                                   unsigned n, std::uint16_t* out) {
@@ -986,7 +1040,7 @@ __global__ void DecodeTilesKernel(const std::uint16_t* trellis, unsigned,
   const unsigned kt = tile / n_tiles, nt = tile % n_tiles;
   const auto lw = gufo::hip::exl3::MakeLaneWindow<K>(lane);
   gufo::hip::exl3::Half2 w[4];
-  gufo::hip::exl3::DecodeLaneMul1<K>(
+  gufo::hip::exl3::DecodeLane<K>(
       reinterpret_cast<const std::uint32_t*>(trellis) +
           std::size_t(tile) * gufo::hip::exl3::TileDwords(K),
       lw, w);
@@ -1012,7 +1066,8 @@ std::size_t DecodeTilesDiff(std::mt19937& rng) {
   for (auto& w : trellis)
     w = static_cast<std::uint16_t>(rng());
   std::vector<std::uint16_t> want(k * n);
-  DequantInner(trellis.data(), k, n, rate, Codebook::kMul1, want.data());
+  DequantInner(trellis.data(), k, n, rate,
+               gufo::hip::exl3::CodeCodebookEnum(K), want.data());
   auto* d_t = Upload(trellis);
   std::uint16_t* d_out = nullptr;
   Check(hipMalloc(&d_out, k * n * 2));
@@ -1051,15 +1106,33 @@ void TestDecodeTiles(std::mt19937& rng) {
             << half[1] << "/" << half[2] << " values differ\n";
 }
 
+// Every format's lane decode (every listed trellis code) against the CPU.
+void TestDecodeTilesFormats(std::mt19937& rng) {
+  [&]<std::size_t... I>(std::index_sequence<I...>) {
+    constexpr int kCodes[] = {gufo::hip::exl3::kTrellisCodes[I]...};
+    const std::size_t d[] = {DecodeTilesDiff<kCodes[I]>(rng)...};
+    std::size_t total = 0;
+    for (std::size_t i = 0; i < sizeof...(I); ++i) {
+      Expect(d[i] == 0, "lane decode code " + std::to_string(kCodes[i]) +
+                            ": " + std::to_string(d[i]) +
+                            " FP16 values differ");
+      total += d[i];
+    }
+    std::cout << "lane decode, every format vs CPU: " << total
+              << " values differ\n";
+  }(std::make_index_sequence<gufo::hip::exl3::kTrellisCodeCount>{});
+}
+
 // Grouped rotation (gathered rows) and grouped GEMM over expert-like buckets
 // with ragged rows: every problem against its FP64 reference at the WMMA
 // bound, finite, and rotated rows against the FP32 contract. With residual
 // the outputs start from a known prior; the zero-row problem's output must
 // stay untouched (sentinel). max_rows picks the tile (<= 64: narrow).
 void TestGrouped(std::mt19937& rng, const std::size_t (&rows)[4],
-                 std::size_t max_rows, bool residual) {
-  constexpr std::size_t k = 2560, n = 640, source_rows = 400;
-  const BitRate rate{5, false};
+                 std::size_t max_rows, bool residual,
+                 BitRate rate = {5, false}, Codebook cb = Codebook::kMul1,
+                 std::size_t k = 2560, std::size_t n = 640) {
+  constexpr std::size_t source_rows = 400;
   constexpr std::size_t count = 4;
   constexpr std::uint32_t kSentinel = 0x7fc0beefU;
   std::normal_distribution<float> normal;
@@ -1084,7 +1157,7 @@ void TestGrouped(std::mt19937& rng, const std::size_t (&rows)[4],
     h.suh = RandomScales(rng, k, 0x3800);
     h.svh = RandomScales(rng, n, 0x2000);
     h.inner.resize(k * n);
-    DequantInner(h.trellis.data(), k, n, rate, Codebook::kMul1, h.inner.data());
+    DequantInner(h.trellis.data(), k, n, rate, cb, h.inner.data());
     for (std::size_t r = 0; r < rows[p]; ++r)
       h.index.push_back(static_cast<std::uint32_t>(rng() % source_rows));
     if (h.index.empty())
@@ -1116,7 +1189,7 @@ void TestGrouped(std::mt19937& rng, const std::size_t (&rows)[4],
   auto* d_gemm = Upload(gemm);
   gufo::hip::LaunchExl3RotateRowsGrouped(d_rot, count, max_rows, k, nullptr);
   gufo::hip::LaunchExl3PrefillGemmGrouped(d_gemm, count, max_rows, k, n, rate,
-                                          residual, nullptr);
+                                          cb, residual, nullptr);
   Check(hipDeviceSynchronize());
   const double bar = static_cast<double>(k) / 16.0 * std::ldexp(1.0, -23);
   for (std::size_t p = 0; p < count; ++p) {
@@ -1173,9 +1246,10 @@ void TestGrouped(std::mt19937& rng, const std::size_t (&rows)[4],
 // with ragged per-expert rows split into 16/32/64-row tiles. Every
 // partition gives bit-identical values; each against the FP64 inner product
 // at the WMMA bound; rows outside every bucket and descriptors past the
-// device count stay untouched; a bank entry of the wrong rate writes NaN.
+// device count stay untouched; a bank entry of the wrong rate or codebook
+// writes NaN.
 void TestBuckets(std::size_t k, std::size_t n, BitRate rate,
-                 std::mt19937& rng) {
+                 std::mt19937& rng, Codebook cb = Codebook::kMul1) {
   constexpr std::size_t kExperts = 4;
   const int bits = rate.bits;
   const std::size_t expert_rows[kExperts] = {1, 37, 0, 70};
@@ -1193,8 +1267,7 @@ void TestBuckets(std::size_t k, std::size_t n, BitRate rate,
       w = static_cast<std::uint16_t>(rng());
     if (e < kExperts) {
       inner[e].resize(k * n);
-      DequantInner(trellis.data(), k, n, rate, Codebook::kMul1,
-                   inner[e].data());
+      DequantInner(trellis.data(), k, n, rate, cb, inner[e].data());
     }
     auto* d_t = Upload(trellis);
     owned.push_back(d_t);
@@ -1202,7 +1275,7 @@ void TestBuckets(std::size_t k, std::size_t n, BitRate rate,
     bank[e].k = static_cast<std::uint32_t>(k);
     bank[e].n = static_cast<std::uint32_t>(n);
     bank[e].rate = r;
-    bank[e].codebook = Codebook::kMul1;
+    bank[e].codebook = cb;
   }
   std::normal_distribution<double> normal;
   std::vector<std::uint16_t> input(total * k);
@@ -1241,11 +1314,11 @@ void TestBuckets(std::size_t k, std::size_t n, BitRate rate,
     gufo::hip::LaunchExl3PrefillBucketInner(
         d_bank, d_buckets, d_count, static_cast<std::uint32_t>(buckets.size()),
         tile_rows, d_input, d_inner, static_cast<std::uint32_t>(k),
-        static_cast<std::uint32_t>(n), rate, nullptr);
+        static_cast<std::uint32_t>(n), rate, cb, nullptr);
     Check(hipDeviceSynchronize());
     const auto got = Download(d_inner, total * n);
     const std::string name =
-        "bucket K" + std::to_string(bits) + (rate.half ? ".5" : "") +
+        "bucket " + FormatName(bits, rate.half, cb) +
         " k=" + std::to_string(k) + " n=" + std::to_string(n) +
         " partition=" + std::to_string(partition);
     bool untouched = true;
@@ -1291,8 +1364,16 @@ void TestBuckets(std::size_t k, std::size_t n, BitRate rate,
     Check(hipFree(d_buckets));
     Check(hipFree(d_count));
   }
-  {
-    // A K6 bank entry under the K5 entry point poisons its rows only.
+  for (const bool codebook_violation : {false, true}) {
+    // A K6 bank entry under the K5 entry point poisons its rows only; so
+    // does an entry of the right rate and another codebook.
+    if (codebook_violation) {
+      DeviceLinear other = bank[kExperts];
+      other.rate = rate;
+      other.codebook = cb == Codebook::kMul1 ? Codebook::kMcg : Codebook::kMul1;
+      Check(hipMemcpy(d_bank + kExperts, &other, sizeof(other),
+                      hipMemcpyHostToDevice));
+    }
     std::vector<gufo::hip::Exl3PrefillBucket> buckets{
         {static_cast<std::uint32_t>(kExperts), 3, 1}};
     auto* d_buckets = Upload(buckets);
@@ -1302,7 +1383,7 @@ void TestBuckets(std::size_t k, std::size_t n, BitRate rate,
     gufo::hip::LaunchExl3PrefillBucketInner(
         d_bank, d_buckets, d_count, 1, 16, d_input, d_inner,
         static_cast<std::uint32_t>(k), static_cast<std::uint32_t>(n), rate,
-        nullptr);
+        cb, nullptr);
     Check(hipDeviceSynchronize());
     const auto got = Download(d_inner, total * n);
     bool poisoned = true, rest = true;
@@ -1314,7 +1395,9 @@ void TestBuckets(std::size_t k, std::size_t n, BitRate rate,
       else
         rest = rest && std::bit_cast<std::uint32_t>(got[i]) == kSentinel;
     }
-    Expect(poisoned && rest, "bucket rate mismatch: rows not poisoned alone");
+    Expect(poisoned && rest, std::string("bucket ") +
+                                 (codebook_violation ? "codebook" : "rate") +
+                                 " mismatch: rows not poisoned alone");
     Check(hipFree(d_buckets));
     Check(hipFree(d_count));
   }
@@ -1323,6 +1406,118 @@ void TestBuckets(std::size_t k, std::size_t n, BitRate rate,
   Check(hipFree(d_bank));
   Check(hipFree(d_input));
   Check(hipFree(d_inner));
+}
+
+// The fast decode GEMV (rows 1, 2, 8) and the WMMA prefill GEMM (17 and 80
+// rows) of one format against the reference kernel
+// (quant::exl3::LaunchReferenceProjection, correct for every format): they
+// differ only by the FP16 rounding of the rotated input (the reference keeps
+// it in FP32), the TestProblem "vs exact" bar.
+void TestReferenceAgreement(BitRate rate, Codebook cb, std::mt19937& rng) {
+  constexpr std::size_t k = 512, n = 384, kRows = 80;
+  std::vector<std::uint16_t> trellis((k / 16) * (n / 16) * rate.TileWords());
+  for (auto& w : trellis)
+    w = static_cast<std::uint16_t>(rng());
+  std::normal_distribution<float> normal;
+  std::vector<float> x(kRows * k);
+  for (auto& v : x)
+    v = normal(rng);
+  auto* d_t = Upload(trellis);
+  auto* d_suh = Upload(RandomScales(rng, k, 0x3800));
+  auto* d_svh = Upload(RandomScales(rng, n, 0x2000));
+  auto* d_x = Upload(x);
+  const DeviceLinear lin{d_t,
+                         d_suh,
+                         d_svh,
+                         static_cast<std::uint32_t>(k),
+                         static_cast<std::uint32_t>(n),
+                         rate,
+                         cb};
+  ReferenceScratch scratch;
+  scratch.rotated_elements = kRows * k;
+  Check(hipMalloc(&scratch.rotated, scratch.rotated_elements * 4));
+  scratch.weight_elements = k * n;
+  Check(hipMalloc(&scratch.weight, scratch.weight_elements * 4));
+  gufo::hip::Exl3FastWorkspace ws;
+  ws.input_elements = 8 * k;
+  Check(hipMalloc(&ws.input, ws.input_elements * 2));
+  ws.counter_count = n / 128;
+  Check(hipMalloc(&ws.counters, ws.counter_count * 4));
+  Check(hipMemset(ws.counters, 0, ws.counter_count * 4));
+  std::uint16_t* d_rot = nullptr;
+  Check(hipMalloc(&d_rot, kRows * k * 2));
+  float *d_ref = nullptr, *d_fast = nullptr;
+  Check(hipMalloc(&d_ref, kRows * n * 4));
+  Check(hipMalloc(&d_fast, kRows * n * 4));
+  LaunchReferenceProjection(lin, d_x, k, kRows, d_ref, n, scratch, nullptr);
+  Check(hipDeviceSynchronize());
+  const auto ref = Download(d_ref, kRows * n);
+  const std::vector<double> want(ref.begin(), ref.end());
+  const std::string name = "reference agreement " +
+                           FormatName(rate.bits, rate.half, cb) +
+                           " k=" + std::to_string(k) + " n=" + std::to_string(n);
+  Expect(gufo::hip::Exl3FastSupported(lin) &&
+             gufo::hip::Exl3PrefillSupported(lin),
+         name + ": fast paths take the format");
+  double worst = 0.0;
+  for (std::size_t rows : {1, 2, 8}) {
+    gufo::hip::LaunchExl3FastProjection(lin, d_x, k, rows, d_fast, n, ws,
+                                        nullptr);
+    Check(hipDeviceSynchronize());
+    const auto got = Download(d_fast, rows * n);
+    const double rel = RelL2(want, got, rows, n, n);
+    Expect(rel < 1e-3, name + " GEMV rows=" + std::to_string(rows) +
+                           " relative L2 " + std::to_string(rel));
+    worst = std::max(worst, rel);
+  }
+  for (std::size_t rows : {17, 80}) {
+    gufo::hip::LaunchExl3RotateRows(d_x, k, rows, k, d_suh, d_rot, nullptr);
+    gufo::hip::LaunchExl3PrefillGemm(lin, d_rot, d_fast, rows, false, nullptr);
+    Check(hipDeviceSynchronize());
+    const auto got = Download(d_fast, rows * n);
+    const double rel = RelL2(want, got, rows, n, n);
+    Expect(rel < 1e-3, name + " WMMA rows=" + std::to_string(rows) +
+                           " relative L2 " + std::to_string(rel));
+    worst = std::max(worst, rel);
+  }
+  std::cout << name << ": worst relative L2 vs reference kernel " << worst
+            << "\n";
+  for (void* p : {static_cast<void*>(d_t), static_cast<void*>(d_suh),
+                  static_cast<void*>(d_svh), static_cast<void*>(d_x),
+                  static_cast<void*>(scratch.rotated),
+                  static_cast<void*>(scratch.weight),
+                  static_cast<void*>(ws.input), static_cast<void*>(ws.counters),
+                  static_cast<void*>(d_rot), static_cast<void*>(d_ref),
+                  static_cast<void*>(d_fast)})
+    Check(hipFree(p));
+}
+
+// Every codebook x every rate (synthetic weights) through every shared fast
+// path: the decode GEMV (1..64 rows, FP64 references), a shared-input group,
+// the fused MLP (bits against the unfused launches), the WMMA prefill (narrow,
+// wide and 128 x 256 tiles), the grouped WMMA GEMM, the expert buckets and the
+// reference kernel.
+void TestFormatMatrix(std::mt19937& rng) {
+  for (const Codebook cb :
+       {Codebook::kMul1, Codebook::kMcg, Codebook::k3Inst}) {
+    for (int bits = 1; bits <= 8; ++bits) {
+      for (const bool half : {false, true}) {
+        const BitRate rate{bits, half};
+        if (!Supports(cb, rate))
+          continue;
+        TestProblem({256, 384, bits, half, cb}, rng);
+        TestGroup(256, {256, 128}, bits, rng, half, cb);
+        TestMlp(256, 512, bits, rng, half, cb);
+        TestPrefill(512, 256, bits, 17, rng, half, cb);
+        TestPrefill(512, 512, bits, 80, rng, half, cb);
+        TestPrefill(512, 384, bits, 80, rng, half, cb);
+        TestGrouped(rng, {0, 7, 33, 80}, 80, false, rate, cb, 512, 256);
+        TestGrouped(rng, {5, 0, 64, 1}, 64, true, rate, cb, 512, 256);
+        TestBuckets(512, 256, rate, rng, cb);
+        TestReferenceAgreement(rate, cb, rng);
+      }
+    }
+  }
 }
 
 // A subset of a grouped launch (Flash-Next MTP cache-only catch-up: k and v
@@ -1415,10 +1610,26 @@ void TestShapeBasis(std::size_t q_n, std::mt19937& rng) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   // Flush every line, so a later abort keeps the earlier results.
   std::cout << std::unitbuf;
   std::mt19937 rng(20261030);
+  if (argc == 2 && std::string(argv[1]) == "--format-matrix") {
+    TestPackedHash();
+    TestDecodeTilesFormats(rng);
+    TestFormatMatrix(rng);
+    if (failures != 0) {
+      std::cerr << failures << " failure(s)\n";
+      return 1;
+    }
+    std::cout << "qwen27b_exl3_kernel_test --format-matrix: all checks "
+                 "passed\n";
+    return 0;
+  }
+  if (argc != 1) {
+    std::cerr << "usage: qwen27b_exl3_kernel_test [--format-matrix]\n";
+    return 2;
+  }
   // Narrow and wide outputs cover the 16-, 8- and 4-wave launch shapes.
   const Problem problems[] = {{1024, 2048, 5},
                               {6144, 1024, 5},

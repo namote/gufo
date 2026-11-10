@@ -280,7 +280,8 @@ int main(int argc, char** argv) {
             gufo::hip::LaunchExl3PrefillBucketInner(d_bank, d_buckets, d_count,
                                                     max_buckets, tile_rows, xh,
                                                     y, k, n,
-                                                    BitRate{5, false}, nullptr);
+                                                    BitRate{5, false},
+                                                    Codebook::kMul1, nullptr);
           },
           reps);
       const double flop = 2.0 * assignments * k * n;

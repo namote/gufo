@@ -10,6 +10,7 @@
 
 #include "src/core/hip/detail/exl3_gemv.hpp"
 #include "src/core/hip/hip_utils.hpp"
+#include "src/core/quant/exl3/coverage.hpp"
 #include "src/core/quant/exl3/gemv.hpp"
 
 namespace gufo::hip {
@@ -266,7 +267,7 @@ constexpr int kSwiGLUDown = 1;
 // in place.
 template<int K, unsigned M, unsigned W, unsigned TN, int kEpilogue>
 __global__ __launch_bounds__(W * 32) void Exl3GemvKernel(GemvArgs args) {
-  constexpr unsigned kTileDwords = 8 * K;
+  constexpr unsigned kTileDwords = exl3::TileDwords(K);
   __shared__ float red[W][TN][M][16];
   __shared__ unsigned last_block;
 
@@ -319,7 +320,7 @@ __global__ __launch_bounds__(W * 32) void Exl3GemvKernel(GemvArgs args) {
           base +
           (static_cast<std::size_t>(kt) * n_tiles + nt0 + t) * kTileDwords;
       Half2 w[4];
-      exl3::DecodeLaneMul1<K>(tile, lw, w);
+      exl3::DecodeLane<K>(tile, lw, w);
 #pragma unroll
       for (unsigned r = 0; r < M; ++r) {
         acc_a[t][r] = __builtin_amdgcn_fdot2(w[0], a01[r], acc_a[t][r], false);
@@ -502,35 +503,15 @@ void LaunchGemvRows(const GemvArgs& args, const LaunchShape& shape,
   }
 }
 
+// The GEMV of `linear`'s format (exl3::DispatchTrellisCode; every slot of
+// the launch shares it).
 template<unsigned M, int kEpilogue = kStore>
-void LaunchGemvBits(int bits, const GemvArgs& args, const LaunchShape& shape,
-                    hipStream_t stream) {
-  switch (bits) {
-    case 1:
-      LaunchGemvRows<1, M, kEpilogue>(args, shape, stream);
-      break;
-    case 2:
-      LaunchGemvRows<2, M, kEpilogue>(args, shape, stream);
-      break;
-    case 3:
-      LaunchGemvRows<3, M, kEpilogue>(args, shape, stream);
-      break;
-    case 4:
-      LaunchGemvRows<4, M, kEpilogue>(args, shape, stream);
-      break;
-    case 5:
-      LaunchGemvRows<5, M, kEpilogue>(args, shape, stream);
-      break;
-    case 7:
-      LaunchGemvRows<7, M, kEpilogue>(args, shape, stream);
-      break;
-    case 8:
-      LaunchGemvRows<8, M, kEpilogue>(args, shape, stream);
-      break;
-    default:
-      LaunchGemvRows<6, M, kEpilogue>(args, shape, stream);
-      break;
-  }
+void LaunchGemvFormat(const quant::exl3::DeviceLinear& linear,
+                      const GemvArgs& args, const LaunchShape& shape,
+                      hipStream_t stream) {
+  exl3::DispatchTrellisCode(linear.codebook, linear.rate, [&]<int Code>() {
+    LaunchGemvRows<Code, M, kEpilogue>(args, shape, stream);
+  });
 }
 
 template<unsigned M>
@@ -576,8 +557,8 @@ void LaunchPass(std::span<const Exl3FastTarget> targets, const float* x,
     // output exactly as that group's launch does.
     blocks_two_tiles = static_cast<unsigned>(shape_basis_n / 32);
   }
-  LaunchGemvBits<M>(first.rate.bits, gemv,
-                    PickShape(first.k / 16, blocks_two_tiles), stream);
+  LaunchGemvFormat<M>(first, gemv,
+                      PickShape(first.k / 16, blocks_two_tiles), stream);
   HIP_CHECK(hipGetLastError());
 }
 
@@ -622,8 +603,8 @@ void LaunchMlpPass(const Exl3FastMlp& mlp, const float* x, std::size_t x_stride,
                        dim3(kRotateWaves * 32), 0, stream, x, x_stride, rows,
                        gate.k, rotate);
   }
-  LaunchGemvBits<M, kSwiGLUDown>(
-      gate.rate.bits, gemv, PickShape(gate.k / 16, 2 * (gate.n / 32)), stream);
+  LaunchGemvFormat<M, kSwiGLUDown>(
+      gate, gemv, PickShape(gate.k / 16, 2 * (gate.n / 32)), stream);
   GemvArgs down_args{};
   down_args.slots = 1;
   down_args.k = down.k;
@@ -636,8 +617,8 @@ void LaunchMlpPass(const Exl3FastMlp& mlp, const float* x, std::size_t x_stride,
   slot.y = mlp.out + first_row * slot.y_stride;
   slot.counters = ws.counters;
   slot.n = down.n;
-  LaunchGemvBits<M>(down.rate.bits, down_args,
-                    PickShape(down.k / 16, down.n / 32), stream);
+  LaunchGemvFormat<M>(down, down_args,
+                      PickShape(down.k / 16, down.n / 32), stream);
   HIP_CHECK(hipGetLastError());
 }
 
@@ -674,9 +655,8 @@ void LaunchExl3RotateRows(const float* x, std::size_t x_stride,
 }
 
 bool Exl3FastSupported(const quant::exl3::DeviceLinear& linear) noexcept {
-  return linear.codebook == quant::exl3::Codebook::kMul1 && !linear.rate.half &&
-         linear.rate.bits >= 1 && linear.rate.bits <= 8 &&
-         linear.k % exl3::kSegment == 0 && linear.n % exl3::kSegment == 0;
+  return quant::exl3::FastKernelsSupport(linear.codebook, linear.rate,
+                                         linear.k, linear.n);
 }
 
 bool Exl3FastGroupSupported(std::span<const Exl3FastTarget> targets,
@@ -688,7 +668,8 @@ bool Exl3FastGroupSupported(std::span<const Exl3FastTarget> targets,
   std::size_t counters = 0;
   for (const Exl3FastTarget& t : targets) {
     if (!Exl3FastSupported(*t.linear) || t.linear->k != first.k ||
-        !(t.linear->rate == first.rate)) {
+        !(t.linear->rate == first.rate) ||
+        t.linear->codebook != first.codebook) {
       return false;
     }
     counters += t.linear->n / exl3::kSegment;
@@ -743,7 +724,8 @@ bool Exl3FastMlpSupported(const Exl3FastMlp& mlp,
   const auto& down = *mlp.down;
   return Exl3FastSupported(gate) && Exl3FastSupported(up) &&
          Exl3FastSupported(down) && up.k == gate.k && up.n == gate.n &&
-         up.rate == gate.rate && down.k == gate.n &&
+         up.rate == gate.rate && up.codebook == gate.codebook &&
+         down.k == gate.n &&
          workspace.down_input != nullptr &&
          workspace.input_elements >=
              2 * exl3::kMaxRows * static_cast<std::size_t>(gate.k) &&

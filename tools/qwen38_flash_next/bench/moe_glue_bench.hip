@@ -376,10 +376,10 @@ int main() {
                              const std::uint16_t* uin) {
       gufo::hip::LaunchExl3PrefillBucketInnerHalf(
           d_gate, buckets, bucket_count, max_buckets, kTileRows, gin, gate_y,
-          kHidden, kFf, rate, nullptr, stream);
+          kHidden, kFf, rate, ex::Codebook::kMul1, nullptr, stream);
       gufo::hip::LaunchExl3PrefillBucketInnerHalf(
           d_up, buckets, bucket_count, max_buckets, kTileRows, uin, up_y,
-          kHidden, kFf, rate, nullptr, stream);
+          kHidden, kFf, rate, ex::Codebook::kMul1, nullptr, stream);
     };
     const auto old_restore = [&] {
       hipLaunchKernelGGL(
@@ -397,7 +397,7 @@ int main() {
     const auto down_gemm = [&](const std::uint16_t* in, const std::int32_t* e) {
       gufo::hip::LaunchExl3PrefillBucketInnerHalf(
           d_down, buckets, bucket_count, max_buckets, kTileRows, in, down_out,
-          kFf, kHidden, rate, e, stream);
+          kFf, kHidden, rate, ex::Codebook::kMul1, e, stream);
     };
 
     // Equality first: rotations, then (from the same GEMM outputs) the

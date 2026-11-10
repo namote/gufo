@@ -4,6 +4,7 @@
 #include "src/core/hip/detail/exl3_gemv.hpp"
 #include "src/core/hip/detail/hadamard.hpp"
 #include "src/core/hip/hip_utils.hpp"
+#include "src/core/quant/exl3/coverage.hpp"
 #include "src/models/qwen/hip/kernels/prefill_quant_gemm.hpp"
 #include "src/models/qwen/hip/ops/hadamard.hpp"
 #include "src/models/qwen/hip/ops/prefill_fp16.hpp"
@@ -223,8 +224,9 @@ enum class HalfEpilogue { kStore, kSwiGLU, kGateUp, kResidual };
 
 // Fully scaled FP16 weights and activations; FP32 accumulation in K16 order.
 // TrellisBits > 0 (EXL3, plan/exl3/archive/X3-DESIGN.md) replaces the GGUF
-// weight producer by the trellis decode (mul1 codebook, TrellisBits the rate
-// code exl3::RateCode: K, or kHalfRate + K for K + 0.5): w is the trellis
+// weight producer by the trellis decode (TrellisBits the trellis code
+// exl3::TrellisCode: codebook and rate, the rate K or kHalfRate + K for
+// K + 0.5; a mul1 code is its rate code): w is the trellis
 // [k/16][m/16][TileDwords], each 16 x 16 tile one weight sub-tile of s_a,
 // decoded bit for bit as src/core/quant/exl3 DequantTile. The activations,
 // the WMMA loop and the K16 order are unchanged; the epilogue then rotates
@@ -364,8 +366,9 @@ __launch_bounds__(WM * WN * 32) __global__ void HalfPrefillGemmKernel(
     } else {
       y += static_cast<std::size_t>(bucket.first) * m;
     }
-    if (linear.codebook != quant::exl3::Codebook::kMul1 ||
-        exl3::RateCode(linear.rate.bits, linear.rate.half) != TrellisBits ||
+    if (linear.codebook != exl3::CodeCodebookEnum(TrellisBits) ||
+        exl3::RateCode(linear.rate.bits, linear.rate.half) !=
+            exl3::CodeRate(TrellisBits) ||
         linear.k != unsigned(k) || linear.n != unsigned(m)) {
       // Contract violation: poison this bucket's block of outputs.
       for (int i = tid; i < BM * BN; i += kThreads) {
@@ -412,6 +415,7 @@ __launch_bounds__(WM * WN * 32) __global__ void HalfPrefillGemmKernel(
   // Trellis producer: lane L decodes positions 8L .. 8L + 7 of a tile
   // (src/core/hip/detail/exl3_gemv.hpp), TPW tiles per wave and stage.
   constexpr int kTrellisK = Trellis ? TrellisBits : 1;
+  constexpr int kTrellisCb = exl3::CodeCodebook(kTrellisK);
   constexpr int TPW = (BK * RS) / (WM * WN);
   static_assert(!Trellis || ((BK * RS) % (WM * WN) == 0 && !Paired));
   [[maybe_unused]] const exl3::LaneWindow lw = [&] {
@@ -610,7 +614,7 @@ __launch_bounds__(WM * WN * 32) __global__ void HalfPrefillGemmKernel(
                                     lw.shift, hashed);
 #pragma unroll
         for (int j = 0; j < 8; ++j)
-          hashed[j] = exl3::HashMul1Packed(hashed[j]);
+          hashed[j] = exl3::HashStatePacked<kTrellisCb>(hashed[j]);
         // Column c of the tile is weight row rt * 16 + c; rows r0, r0 + 1
         // (16-byte group 0) and r0 + 8, r0 + 9 (group 1) are k positions.
 #pragma unroll
@@ -621,9 +625,11 @@ __launch_bounds__(WM * WN * 32) __global__ void HalfPrefillGemmKernel(
           auto* pairs = reinterpret_cast<exl3::Half2*>(
               &s_a[ks][placed / 16][placed % 16][0]);
           pairs[((0 ^ shift) * 8 + r0) / 2] =
-              exl3::DecodePairMul1(hashed[4 * half], hashed[4 * half + 1]);
+              exl3::DecodePair<kTrellisCb>(hashed[4 * half],
+                                           hashed[4 * half + 1]);
           pairs[((1 ^ shift) * 8 + r0) / 2] =
-              exl3::DecodePairMul1(hashed[4 * half + 2], hashed[4 * half + 3]);
+              exl3::DecodePair<kTrellisCb>(hashed[4 * half + 2],
+                                           hashed[4 * half + 3]);
         }
       }
     } else {
@@ -1179,9 +1185,7 @@ bool Exl3PrefillSupported(const quant::exl3::DeviceLinear& linear) noexcept {
 bool Exl3GemmShapeSupported(std::uint32_t k, std::uint32_t n,
                             quant::exl3::BitRate rate,
                             quant::exl3::Codebook codebook) noexcept {
-  return codebook == quant::exl3::Codebook::kMul1 && !rate.half &&
-         rate.bits >= 1 && rate.bits <= 8 && n > 0 && k > 0 && n % 128 == 0 &&
-         k % 128 == 0;
+  return quant::exl3::FastKernelsSupport(codebook, rate, k, n);
 }
 
 namespace {
@@ -1224,7 +1228,7 @@ void LaunchExl3Tile(Exl3Tile tile, const void* w, const void* x, float* y,
            256, 256, 1024);
       break;
     case Exl3Tile::kWideHalf:
-      if constexpr (Bits == 5 && Grouped == 1 &&
+      if constexpr (exl3::CodeRate(Bits) == 5 && Grouped == 1 &&
                     Epilogue == HalfEpilogue::kStore) {
         // A single Flash-Next indexer parent underfills the 32-wave tile.
         // K32 staging and eight waves retain the ascending K16 chain and
@@ -1245,44 +1249,20 @@ void LaunchExl3Tile(Exl3Tile tile, const void* w, const void* x, float* y,
 }
 
 template<int Grouped>
-void LaunchExl3Bits(int bits, bool residual, Exl3Tile tile, const void* w,
-                    const void* x, float* y, std::size_t rows, std::uint32_t n,
-                    std::uint32_t k, const void* svh, const void* problems,
-                    unsigned count, hipStream_t stream) {
-  const auto epilogue = [&]<int Bits>() {
+void LaunchExl3Format(quant::exl3::Codebook codebook, quant::exl3::BitRate rate,
+                      bool residual, Exl3Tile tile, const void* w,
+                      const void* x, float* y, std::size_t rows,
+                      std::uint32_t n, std::uint32_t k, const void* svh,
+                      const void* problems, unsigned count,
+                      hipStream_t stream) {
+  exl3::DispatchTrellisCode(codebook, rate, [&]<int Code>() {
     if (residual)
-      LaunchExl3Tile<Bits, HalfEpilogue::kResidual, Grouped>(
+      LaunchExl3Tile<Code, HalfEpilogue::kResidual, Grouped>(
           tile, w, x, y, rows, n, k, svh, problems, count, stream);
     else
-      LaunchExl3Tile<Bits, HalfEpilogue::kStore, Grouped>(
+      LaunchExl3Tile<Code, HalfEpilogue::kStore, Grouped>(
           tile, w, x, y, rows, n, k, svh, problems, count, stream);
-  };
-  switch (bits) {
-    case 1:
-      epilogue.template operator()<1>();
-      break;
-    case 2:
-      epilogue.template operator()<2>();
-      break;
-    case 3:
-      epilogue.template operator()<3>();
-      break;
-    case 4:
-      epilogue.template operator()<4>();
-      break;
-    case 5:
-      epilogue.template operator()<5>();
-      break;
-    case 6:
-      epilogue.template operator()<6>();
-      break;
-    case 7:
-      epilogue.template operator()<7>();
-      break;
-    default:
-      epilogue.template operator()<8>();
-      break;
-  }
+  });
 }
 
 }  // namespace
@@ -1293,45 +1273,38 @@ void LaunchExl3PrefillGemm(const quant::exl3::DeviceLinear& linear,
   if (!Exl3PrefillSupported(linear) || batch == 0) {
     throw std::invalid_argument("EXL3 prefill GEMM: unsupported projection");
   }
-  LaunchExl3Bits<0>(linear.rate.bits, residual, PickExl3Tile(batch, linear.n),
-                    linear.trellis, x, y, batch, linear.n, linear.k, linear.svh,
-                    nullptr, 1, stream);
+  LaunchExl3Format<0>(linear.codebook, linear.rate, residual,
+                      PickExl3Tile(batch, linear.n), linear.trellis, x, y,
+                      batch, linear.n, linear.k, linear.svh, nullptr, 1,
+                      stream);
   HIP_CHECK(hipGetLastError());
 }
 
 void LaunchExl3PrefillGemmGrouped(const Exl3GemmProblem* problems,
                                   std::size_t count, std::size_t max_rows,
                                   std::uint32_t k, std::uint32_t n,
-                                  quant::exl3::BitRate rate, bool residual,
-                                  hipStream_t stream, bool strided_trellis) {
-  if (!Exl3GemmShapeSupported(k, n, rate, quant::exl3::Codebook::kMul1) ||
+                                  quant::exl3::BitRate rate,
+                                  quant::exl3::Codebook codebook,
+                                  bool residual, hipStream_t stream,
+                                  bool strided_trellis) {
+  if (!Exl3GemmShapeSupported(k, n, rate, codebook) ||
       count == 0 || count > 65535) {
     throw std::invalid_argument("EXL3 grouped GEMM: unsupported problem set");
   }
   if (max_rows == 0)
     return;
   if (strided_trellis)
-    LaunchExl3Bits<4>(rate.bits, residual, PickExl3Tile(max_rows, n), nullptr,
-                      nullptr, nullptr, max_rows, n, k, nullptr, problems,
-                      static_cast<unsigned>(count), stream);
+    LaunchExl3Format<4>(codebook, rate, residual, PickExl3Tile(max_rows, n),
+                        nullptr, nullptr, nullptr, max_rows, n, k, nullptr,
+                        problems, static_cast<unsigned>(count), stream);
   else
-    LaunchExl3Bits<1>(rate.bits, residual, PickExl3Tile(max_rows, n), nullptr,
-                      nullptr, nullptr, max_rows, n, k, nullptr, problems,
-                      static_cast<unsigned>(count), stream);
+    LaunchExl3Format<1>(codebook, rate, residual, PickExl3Tile(max_rows, n),
+                        nullptr, nullptr, nullptr, max_rows, n, k, nullptr,
+                        problems, static_cast<unsigned>(count), stream);
   HIP_CHECK(hipGetLastError());
 }
 
 namespace {
-
-// Expert buckets also take K3.5 (Vemloir Flash-Next gate/up experts).
-bool Exl3BucketShapeSupported(std::uint32_t k, std::uint32_t n,
-                              quant::exl3::BitRate rate) noexcept {
-  return rate.half
-             ? rate.bits == 3 &&
-                   Exl3GemmShapeSupported(k, n, {3, false},
-                                          quant::exl3::Codebook::kMul1)
-             : Exl3GemmShapeSupported(k, n, rate, quant::exl3::Codebook::kMul1);
-}
 
 template<int Bits, int Mode = 2>
 void LaunchBucketTiles(const quant::exl3::DeviceLinear* device_bank,
@@ -1387,8 +1360,9 @@ void LaunchExl3PrefillBucketInnerHalf(
     const std::uint32_t* device_bucket_count, std::uint32_t max_buckets,
     std::uint32_t tile_rows, const std::uint16_t* input, std::uint16_t* inner,
     std::uint32_t k, std::uint32_t n, quant::exl3::BitRate rate,
-    const std::int32_t* row_exponents, hipStream_t stream) {
-  if (!Exl3BucketShapeSupported(k, n, rate) || tile_rows == 0 ||
+    quant::exl3::Codebook codebook, const std::int32_t* row_exponents,
+    hipStream_t stream) {
+  if (!Exl3GemmShapeSupported(k, n, rate, codebook) || tile_rows == 0 ||
       tile_rows > 64 || max_buckets > 65535 || device_bank == nullptr ||
       device_buckets == nullptr || device_bucket_count == nullptr ||
       input == nullptr || inner == nullptr) {
@@ -1397,42 +1371,11 @@ void LaunchExl3PrefillBucketInnerHalf(
   if (max_buckets == 0)
     return;
   auto* out = reinterpret_cast<float*>(inner);
-  const auto launch = [&]<int Bits>() {
-    LaunchBucketTiles<Bits, 3>(device_bank, device_buckets, device_bucket_count,
+  exl3::DispatchTrellisCode(codebook, rate, [&]<int Code>() {
+    LaunchBucketTiles<Code, 3>(device_bank, device_buckets, device_bucket_count,
                                max_buckets, tile_rows, input, out, k, n, stream,
                                row_exponents);
-  };
-  if (rate.half) {
-    launch.template operator()<exl3::RateCode(3, true)>();
-    HIP_CHECK(hipGetLastError());
-    return;
-  }
-  switch (rate.bits) {
-    case 1:
-      launch.template operator()<1>();
-      break;
-    case 2:
-      launch.template operator()<2>();
-      break;
-    case 3:
-      launch.template operator()<3>();
-      break;
-    case 4:
-      launch.template operator()<4>();
-      break;
-    case 5:
-      launch.template operator()<5>();
-      break;
-    case 6:
-      launch.template operator()<6>();
-      break;
-    case 7:
-      launch.template operator()<7>();
-      break;
-    default:
-      launch.template operator()<8>();
-      break;
-  }
+  });
   HIP_CHECK(hipGetLastError());
 }
 
@@ -1444,8 +1387,9 @@ void LaunchExl3PrefillBucketInner(const quant::exl3::DeviceLinear* device_bank,
                                   const std::uint16_t* input, float* inner,
                                   std::uint32_t k, std::uint32_t n,
                                   quant::exl3::BitRate rate,
+                                  quant::exl3::Codebook codebook,
                                   hipStream_t stream) {
-  if (!Exl3BucketShapeSupported(k, n, rate) || tile_rows == 0 ||
+  if (!Exl3GemmShapeSupported(k, n, rate, codebook) || tile_rows == 0 ||
       tile_rows > 64 || max_buckets > 65535 || device_bank == nullptr ||
       device_buckets == nullptr || device_bucket_count == nullptr ||
       input == nullptr || inner == nullptr) {
@@ -1453,41 +1397,10 @@ void LaunchExl3PrefillBucketInner(const quant::exl3::DeviceLinear* device_bank,
   }
   if (max_buckets == 0)
     return;
-  const auto launch = [&]<int Bits>() {
-    LaunchBucketTiles<Bits>(device_bank, device_buckets, device_bucket_count,
+  exl3::DispatchTrellisCode(codebook, rate, [&]<int Code>() {
+    LaunchBucketTiles<Code>(device_bank, device_buckets, device_bucket_count,
                             max_buckets, tile_rows, input, inner, k, n, stream);
-  };
-  if (rate.half) {
-    launch.template operator()<exl3::RateCode(3, true)>();
-    HIP_CHECK(hipGetLastError());
-    return;
-  }
-  switch (rate.bits) {
-    case 1:
-      launch.template operator()<1>();
-      break;
-    case 2:
-      launch.template operator()<2>();
-      break;
-    case 3:
-      launch.template operator()<3>();
-      break;
-    case 4:
-      launch.template operator()<4>();
-      break;
-    case 5:
-      launch.template operator()<5>();
-      break;
-    case 6:
-      launch.template operator()<6>();
-      break;
-    case 7:
-      launch.template operator()<7>();
-      break;
-    default:
-      launch.template operator()<8>();
-      break;
-  }
+  });
   HIP_CHECK(hipGetLastError());
 }
 

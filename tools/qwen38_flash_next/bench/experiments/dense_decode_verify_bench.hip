@@ -113,7 +113,7 @@ void LaunchGemvShape(const std::vector<DeviceLinear>& g, float* const (&y)[3],
     slot.n = g[s].n;
     counter += g[s].n / exl3::kSegment;
   }
-  LaunchGemvBits<M>(g[0].rate.bits, gemv, shape, nullptr);
+  LaunchGemvFormat<M>(g[0], gemv, shape, nullptr);
 }
 
 void LaunchGemvShapeRows(const std::vector<DeviceLinear>& g,
