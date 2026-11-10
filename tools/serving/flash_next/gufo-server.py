@@ -23,8 +23,11 @@ STATE = ROOT / 'server-state.json'
 IMAGE = 'ai-tools/gufo-eval:native-exl3-vision-rocm101'
 IMAGE_ID = 'sha256:e7a761a40187efb13515a0275362ab09d084a129f4544aa4300ec5cccb8c7468'
 MODEL = '/home/m2on/projects/models/llm/flash-next-exl3-gufo-c03'
-RUNTIME = '/home/m2on/.local/share/gufo/runtime-upsync-20261110'
-GUFO_SHA256 = 'a2a1899172b1a3e54d292220d9c63334541f051ccd7a158f7c0839fd9689b09b'
+RUNTIME = '/home/m2on/.local/share/gufo/runtime-20261111'
+GUFO_SHA256 = '02dce1230c37d9b7075e7ac098761fe2e8d4cfee6de4f1ea5c5e398f14ea2c4a'
+# Runtime abliteration profile shipped in RUNTIME (writer, layer-36 direction,
+# attention 2, mlp 0.5). Loaded only; requests enable it per call.
+ABLITERATION_PROFILE = '/candidate/abliteration-fnx.json'
 TEMPERATURE = 0.75
 # Scale Han-ideograph token probability by 0.2 (docs/SERVER.md --han-scale); requests may override.
 HAN_SCALE = 0.2
@@ -145,6 +148,7 @@ def build_command(state):
                 '--cache-disk', '/cache/continuations', '--cache-disk-bytes', str(DISK_CACHE_BYTES),
                 '--temperature', str(TEMPERATURE), '--top-k', '20', '--top-p', '0.95', '--min-p', '0',
                 '--repeat-penalty', '1', '--han-scale', str(HAN_SCALE),
+                '--abliteration-profile', ABLITERATION_PROFILE,
                 '--presence-penalty', '0', '--frequency-penalty', '0', '--max-tokens', '-1',
                 '--request-timeout-ms', '0', '--stall-timeout-ms', '0',
                 '--max-output-bytes', '9223372036854775807',
