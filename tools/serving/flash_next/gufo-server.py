@@ -25,7 +25,7 @@ IMAGE_ID = 'sha256:e7a761a40187efb13515a0275362ab09d084a129f4544aa4300ec5cccb8c7
 MODEL = '/home/m2on/projects/models/llm/flash-next-exl3-gufo-c03'
 RUNTIME = '/home/m2on/.local/share/gufo/runtime-upsync-20261110'
 GUFO_SHA256 = 'a2a1899172b1a3e54d292220d9c63334541f051ccd7a158f7c0839fd9689b09b'
-TEMPERATURE = 0.9
+TEMPERATURE = 0.75
 # Scale Han-ideograph token probability by 0.2 (docs/SERVER.md --han-scale); requests may override.
 HAN_SCALE = 0.2
 VISION = MODEL + ' (embedded EXL3 vision)'
