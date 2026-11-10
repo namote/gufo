@@ -1,5 +1,59 @@
 # gfx1151 optimization know-how
 
+## Combined GPU pass and deployment, November 11, 2026 (deployed)
+
+Evidence: `build/b1/int-20261111/` (kernel, functional, speed, D18 search
+logs; `tools/chain.sh`), `build/b1/ablit-20261110/` (abliteration data,
+collections, candidates, evaluations, searches), `build/b1/q27ab-20261110/`
+(27B greedy A/B). Build `5dd6df9e`+fixes (`871727da`, `b40b1cc3`), binary
+sha `02dce123…`, kernel 7.0.0-43, preflight OK before timing.
+- **Kernels.** 27B `exl3_kernel_test` default and `--format-matrix` (27
+  formats: mul1/mcg/3inst K1–8, mul1 K1.5–3.5) pass; reference agreement
+  ≤2.1e-4 relative L2. Flash-Next `exl3_moe_kernel_test` default and
+  `--format-matrix` pass after the test fix (`b40b1cc3`: K2.5 became a
+  supported head rate; the stale negative case launched with null scratch).
+  Both abliteration ops tests pass (FP64 reference, k ∈ {1,2,5,8}, norm
+  preservation, mixed sessions, graph replay). The D17 author compared 750
+  pre-existing EXL3 kernels: instruction-identical. Binary 132→157 MB;
+  `exl3_moe.hip.cpp` compiles in about 12 min.
+- **HC mode (D12).** `q8-calibrated` failed to load until `871727da` (empty
+  per-layer `nextn_head` mixers were planned as missing calibration). After
+  the fix, 3 greedy chats are byte-identical to the previous production
+  binary `a2a18991…`. Functional `batch`/`cache` (q8-calibrated) and `batch`
+  (fp16) pass functionally; baseline comparison is "unmatched command"
+  because the baselines carried the removed `--typical-acceptance off`.
+- **HC speed, 512 tokens greedy MTP d0, same window.** q8-calibrated
+  46.55/46.35 tok/s (MTP 241/380, equal to the 11/10 baseline 46.5/45.7),
+  q8 46.18/45.96 (228/334), **fp16 44.41/44.34 (263/414), about −4.5%**. The
+  earlier estimate of −10% was too high. Outputs differ per mode, so
+  acceptance differs.
+- **27B greedy loops are the model.** The World Cup coach prompt (thinking
+  off, greedy) loops "구자철이 아니라 구자철이 아닙니다…" identically in
+  Kyojin/exllamav3 on the same EXL3 pack, in gufo EXL3 and in gufo GGUF
+  Q8_0; thinking on answers 히딩크 everywhere. No 27B code bug.
+- **Abliteration (D14–D18), refusal count on 16 harmful prompts (64-token
+  greedy) and first-token KL on 16 ordinary prompts.**
+  - Flash-Next best: writer, layer-36 mean-difference direction, attention
+    2, MLP 0.5 (1/16, KL 0.187). Residual-stream search: 5/16 at KL 0.142,
+    0/16 only at KL 1.2. D18 variants (projected, k up to 4, norm
+    preservation; 48 trials) did not beat it (best 0/16 at KL 0.84). On 48
+    tuning prompts (768 tokens) it drops refusals 24→2 with ordinary answers
+    unchanged; political censorship mostly lifts (Tiananmen, Xinjiang, Pooh,
+    Hong Kong, Cultural Revolution; Taiwan unchanged); fake-premise probes
+    unchanged (9/10 corrected both ways).
+  - 27B: writer layer-59 direction at strength 2 collapsed the model
+    (`専門専門`); residual search found no middle ground (0/16 only at KL
+    2.83). D18 projected + norm preservation (trial 42: layer 36, curves in
+    `q27/q27-d18-t42.json`) gives 0/16 at KL 0.248; on 768-token answers
+    refusals 23→10/24, Korean Tiananmen/Xinjiang/Pooh uncensored, more
+    hallucination on fake premises (Busan flood invented). 27B is not
+    deployed; the profile is a candidate only.
+- **Deployed 2026-11-11** `runtime-20261111` (supervisor `6757aee2`): HC fp16,
+  no typical acceptance, temperature 0.75, Han 0.2 (scope all), EXL3 all
+  formats, Flash-Next profile loaded and OFF unless a request sends
+  `{"abliteration":{"enabled":true}}`. Smoke: Korean chat 41 tok/s,
+  Tiananmen refused OFF and answered ON, image review interpreted.
+
 ## Flash-Next quality versus Kyojin: typical acceptance and HC Q8, November 10, 2026
 
 Evidence is under `build/b1/quality-20261110/` (`runs.jsonl`, `text.jsonl`,
@@ -14,12 +68,12 @@ request scripts, `hcf16.patch`). Correctness only, no timing.
   `typical_acceptance:false`: 4/4 finished, no loop. Kyojin: 4/4 finished.
   User decision: production now runs `--typical-acceptance off` and the
   feature is being removed (D10).
-- **Removing `hc_q8/` does not give F16 HC.** The GPU loader quantizes F16 HC
-  down/up to uncalibrated Q8_0 (`device_model.cpp` Mixer). With that path,
+- **Removing `hc_q8/` did not give F16 HC** (before D12 `--hc-mode`). The GPU
+  loader quantized F16 HC down/up to uncalibrated Q8_0 (`device_model.cpp` Mixer). With that path,
   lodging was identified 0/9 times; the replies invented a bar, salon,
   bathhouse or public toilet.
 - **F16 HC versus calibrated Q8, typical off, medium.** F16 (experimental
-  `GUFO_FNX_HC_F16=1`, not committed): 2/5. Calibrated `hc_q8`: 1/5. Kyojin:
+  `GUFO_FNX_HC_F16=1`, now `--hc-mode fp16`): 2/5. Calibrated `hc_q8`: 1/5. Kyojin:
   2/3. Most other replies had the right gist (old, dirty, stairs, do not
   stay). Five samples do not separate F16 from calibrated Q8. The 11/7 KL
   check (uncalibrated Q8 HC, KL256 0.0415 to 0.0417) also showed no
