@@ -195,6 +195,8 @@ pins, and `TryTouch`.
 
 ### S1: the eviction order differs because 27B leaves 128 FP16 rows in checkpoints at group ends
 
+**Status: measured, no change (2026-11-10, `build/b1/c6-20261110/`).** The estimate below has the wrong sign. The KVarN tail state has a fixed size (64 + 256 FP16 rows of 64 KiB), so the 128 FP16 rows cost nothing extra. A lagging group-end checkpoint holds one group of records *fewer*: 2,244,608 B at K4V4, which is exactly the step published payloads show per 128 tokens. That is 0.6–0.8 % of a 273–385 MB payload, too little to flip the R1 half-size test. In the 27B KVarN `cache` run, none of the 42 admitted positions was a multiple of 128 (U6 run: none of 55). The `FinishKvarn`-style flush is not worth a decode-path change.
+
 A 27B checkpoint at a group end that a pass reached exactly has
 `base = flushed_end = P − 128`. Its records stop one group short, and it
 carries 128 FP16 tail rows: 128 × 2 planes × layers × kv_width bytes. A
@@ -207,6 +209,8 @@ restores correctly. However, it makes such 27B checkpoints larger, by about
 affect correctness. Fixing F2 the `FinishKvarn` way would remove it.
 
 ### S2: capture refuses instead of recapturing when a shared chunk has retired
+
+**Status: reachable, fixed (CPU).** A chunk borrowed from slot A retires when A's release-time preservation fails (`BeforeRelease` → `Preserve(release=true)` → `kRetired`). A slot B restored from a checkpoint that shares that chunk keeps it in its history while the checkpoint is retained, so every later capture on B threw. `Capture` and `NewPayloadBytes` now treat an invalid predecessor like an expired one and copy it again from B's own rows, which it restored. `cache_slot_test` `RetiredPredecessorIsRecaptured` fails at HEAD and passes with the fix. A chunk of the slot's own history retires only on a reset to position 0, where the "rewound without restore" check refuses first. The cache run logged 0 `capture_failure`.
 
 `ExecutionHistory::Capture` (`src/cache/checkpoint.cpp:589-590`) and
 `NewPayloadBytes` (`:701-702`) both throw when a predecessor chunk is still
@@ -357,6 +361,11 @@ add a CPU test that invalidates a borrowed chunk and captures again.
   other way round.
 
 ## What static reading could not verify, and the check that would
+
+**Status (2026-11-10, `build/b1/c6-20261110/`): all four are settled.**
+- Rows 1–2: GPU byte-exact. `kvarn_ops_test` `TestRewindRequantize` passes 14/14 for k4v2 and k4v4 (27B has no K6V6). `qwen27b_kvarn_decode_test --rejection-only` passes 10/10: a rejection crossing a group end, then decode, equals a cold AR replay in all 117 components, and the logits are exact. HTTP cannot force such a rejection, since 27B speculation over HTTP is DFlash2, so the executor-level test stands in. A KVarN draft *model* is not involved: the DFlash2 draft executor (`src/models/qwen/hip/dflash`) has no KVarN path.
+- Row 3: S2 is fixed (see S2). There were 0 `capture_failure` in the 27B KVarN `cache` run.
+- Row 4: S1 does not matter (see S1).
 
 | Question | Check |
 | --- | --- |

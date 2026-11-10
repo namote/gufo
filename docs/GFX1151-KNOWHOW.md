@@ -1,5 +1,49 @@
 # gfx1151 optimization know-how
 
+## Upstream C6 KVarN rewind and cache checks, November 10, 2026 (not deployed)
+
+Evidence is under `build/b1/c6-20261110/` (README.txt): correctness only, no
+timing, kernel 7.0.0-43, production stopped, built incrementally in `build/c6`
+(a copy of `build/d8c9`). These close the runtime questions of
+`plan/upstream-sync/C6-AUDIT.md`.
+- **27B requantization after a rollback is byte-exact (kept, test only).**
+  `qwen_attention_kvarn_ops_test` `TestRewindRequantize`, k4v2 and k4v4: a
+  verification pass whose drafts cross a group end (its boundary flush
+  quantizes the group from rejected rows), a commit inside that group, then a
+  rewrite by row writes, a pass or a prompt chunk, then decode passes. Records
+  and FP16 ring rows equal a cold fill byte for byte in 14 of 14 cases,
+  including the lagging group (a pass ending at a group end), a 300-row prompt
+  chunk from inside the reopened group, and 16K. K6V6 is Flash-Next only: 27B
+  takes k4v2 and k4v4.
+- **27B speculative rejection over a group end equals a cold AR replay
+  (kept, test only).** `qwen27b_kvarn_decode_test --rejection-only`
+  (Q4_K_M, k4v2 and k4v4): verification of 8 drafts at 632-636 with rejected
+  rows past group end 640, the accepted rows committed as `SpeculativeVerifier`
+  does (SaveState, RestoreState, Commit, FinishVerification), optionally a
+  fully accepted second chunk, then decode to 660. All 117 continuation
+  components (records, sink, recurrent and conv state, logits; the tail state
+  by header and valid ring rows) equal a cold AR replay, and the logits are
+  exact, in 10 of 10 cases. So verification rows and the SSM replay write what
+  decode writes. Over HTTP this cannot be forced: 27B speculation there is
+  DFlash2, whose rejections land where they land.
+- **S1, 27B group-end checkpoints, does not matter (rejected change).** A 27B
+  checkpoint at a group end that a pass reached exactly holds records to
+  P - 128 and those 128 rows in its tail state. That state has a fixed size
+  (64 + 256 x 64 KiB), so such a checkpoint is one group of records *smaller*
+  (2,244,608 B at K4V4: published payloads step by exactly that per 128 tokens),
+  not larger. It is 0.6-0.8 % of a 273-385 MB payload, and it moves which side
+  of the chunk/private-tail split those rows fall on, too little to change the
+  R1 half-size test. In the 27B KVarN `cache` run (10/10 passed) none of 42
+  admitted positions was a multiple of 128 (U6: none of 55). A Flash-Next-style
+  group-end flush (`FinishKvarn`) for 27B is therefore not worth a decode-path
+  change.
+- **S2 fixed (CPU).** A history chunk shared from another slot whose borrowed
+  rows retired (a failed release preservation there) made every later capture
+  on the restored slot throw until it restored again. Capture and
+  `NewPayloadBytes` now treat it as a hole and copy it again from the slot's
+  own rows. `cache_slot_test` `RetiredPredecessorIsRecaptured` fails before
+  and passes after. The cache run logged no `capture_failure`.
+
 ## Upstream D8 short-prefill priority, November 10, 2026 (not deployed)
 
 Evidence is under `build/b1/d8-20261110/` (README.txt). Same host state as S3
