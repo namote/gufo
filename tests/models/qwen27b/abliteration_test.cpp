@@ -106,14 +106,16 @@ void HashU32(gufo::crypto::Sha256Hasher& hash, std::uint32_t value) {
 }
 
 // The settings identity, recomputed independently from its documented
-// layout: SHA-256 of "gufo-abliteration-settings-v2:<profile identity>:", the
+// layout: SHA-256 of "gufo-abliteration-settings-v3:<profile identity>:", the
 // direction layer (0xFFFFFFFF for v1) and the layer count as little-endian
-// u32, then the float bits of attention, mlp and residual.
+// u32, the float bits of attention, mlp and residual, then the direction
+// kind (0 mean_diff, 1 projected), the direction count and norm
+// preservation (0/1) as u32.
 std::string ExpectedIdentity(const qwen::AbliterationProfile& profile,
                              const qwen::AbliterationSettings& settings) {
   gufo::crypto::Sha256Hasher hash;
   const std::string prefix =
-      "gufo-abliteration-settings-v2:" + profile.identity + ":";
+      "gufo-abliteration-settings-v3:" + profile.identity + ":";
   hash.Update(std::span(reinterpret_cast<const std::uint8_t*>(prefix.data()),
                         prefix.size()));
   HashU32(hash, settings.direction_layer.value_or(0xFFFFFFFFU));
@@ -122,7 +124,277 @@ std::string ExpectedIdentity(const qwen::AbliterationProfile& profile,
        {&settings.attention, &settings.mlp, &settings.residual})
     for (float x : *values)
       HashU32(hash, Bits(x));
+  HashU32(hash, static_cast<std::uint32_t>(settings.direction_kind));
+  HashU32(hash, settings.direction_count);
+  HashU32(hash, settings.preserve_norm ? 1 : 0);
   return hash.FinishHex();
+}
+
+// Standard padded base64 of little-endian float32 values, written
+// independently of the loader's decoder.
+std::string Base64(const std::vector<float>& values) {
+  constexpr char kAlphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::vector<std::uint8_t> bytes;
+  for (float x : values)
+    for (int b = 0; b < 4; ++b)
+      bytes.push_back(static_cast<std::uint8_t>(Bits(x) >> (8 * b)));
+  std::string text;
+  for (std::size_t i = 0; i < bytes.size(); i += 3) {
+    const std::size_t n = std::min<std::size_t>(3, bytes.size() - i);
+    std::uint32_t group = 0;
+    for (std::size_t j = 0; j < 3; ++j)
+      group = group << 8 | (j < n ? bytes[i + j] : 0U);
+    for (std::size_t j = 0; j < 4; ++j)
+      text += j <= n ? kAlphabet[(group >> (18 - 6 * j)) & 63] : '=';
+  }
+  return text;
+}
+
+json::Value Strings(const std::vector<std::vector<float>>& rows) {
+  json::Value array = json::Value::array();
+  for (const auto& row : rows)
+    array.push_back(Base64(row));
+  return array;
+}
+
+// Projected, multi-direction and norm-preserving settings: the optional v2
+// members, their validation, request overrides, device word 0, identities,
+// and the unchanged behavior of a profile without them.
+void TestSubspace(const std::filesystem::path& path, std::string_view site,
+                  const json::Value& v2) {
+  const auto write = [&](const json::Value& value) {
+    std::ofstream(path) << value.dump();
+  };
+  const auto load = [&] {
+    return qwen::AbliterationProfile::Load(path, 3, 2, "fixture", site);
+  };
+  // Backward compatibility: rank 1, mean difference, no norm preservation;
+  // the rows and device word 0 are exactly the single-direction ones.
+  write(v2);
+  const auto legacy = load();
+  const auto legacy_defaults = qwen::ResolveAbliterationSettings(legacy);
+  Require(
+      legacy.rank == 1 && legacy.kinds == 1 && legacy.directions.size() == 6 &&
+          legacy.directions[5] == 1 &&
+          legacy.direction_kind == qwen::AbliterationDirectionKind::kMeanDiff &&
+          legacy.direction_count == 1 && !legacy.preserve_norm &&
+          legacy.subspace_method.empty() &&
+          legacy_defaults->direction_row == 1 &&
+          legacy_defaults->direction_count == 1 &&
+          !legacy_defaults->preserve_norm &&
+          Bits(legacy_defaults->DeviceWords()[0]) == 1 &&
+          legacy_defaults->identity ==
+              ExpectedIdentity(legacy, *legacy_defaults),
+      "profile without subspace members");
+  Require(Rejects([&] {
+            (void)qwen::ResolveAbliterationSettings(
+                legacy, {.direction_kind =
+                             qwen::AbliterationDirectionKind::kProjected});
+          }) &&
+              Rejects([&] {
+                (void)qwen::ResolveAbliterationSettings(legacy,
+                                                        {.direction_count = 2});
+              }),
+          "legacy profile accepted a missing kind or rank");
+  const auto legacy_norm =
+      qwen::ResolveAbliterationSettings(legacy, {.preserve_norm = true});
+  Require(legacy_norm->identity != legacy_defaults->identity &&
+              Bits(legacy_norm->DeviceWords()[0]) ==
+                  (1U | qwen::kAbliterationPreserveNormBit),
+          "norm preservation on a rank-1 profile");
+
+  // Rank 2 with both kinds. Mean difference: directions[l] then
+  // subspace_directions[l]; projected: projected_directions[l] (2 rows).
+  auto full = v2;
+  full["rank"] = 2;
+  full["subspace_directions"] = Strings({{-0.8F, 0.6F, 0}, {1, 0, 0}});
+  full["projected_directions"] =
+      Strings({{0, 0, 1, 1, 0, 0}, {0, 1, 0, 1, 0, 0}});
+  full["subspace_method"] = "som";
+  write(full);
+  const auto profile = load();
+  Require(profile.rank == 2 && profile.kinds == 2 &&
+              profile.direction_rows() == 8 &&
+              profile.subspace_method == "som" &&
+              profile.has_kind(qwen::AbliterationDirectionKind::kProjected),
+          "rank-2 profile load");
+  // Rows: [kind][layer][rank]: kind 0 layer 1 starts at row 2, kind 1
+  // layer 0 at row 4, kind 1 layer 1 at row 6.
+  const auto row = [&](std::size_t r) {
+    return std::vector<float>(profile.directions.begin() + r * 3,
+                              profile.directions.begin() + r * 3 + 3);
+  };
+  Require(row(0) == std::vector<float>{0.6F, 0.8F, 0} &&
+              row(1) == std::vector<float>{-0.8F, 0.6F, 0} &&
+              row(2) == std::vector<float>{0, 0, 1} &&
+              row(3) == std::vector<float>{1, 0, 0} &&
+              row(4) == std::vector<float>{0, 0, 1} &&
+              row(6) == std::vector<float>{0, 1, 0} &&
+              row(7) == std::vector<float>{1, 0, 0},
+          "rank-2 row layout");
+  using enum qwen::AbliterationDirectionKind;
+  const auto defaults = qwen::ResolveAbliterationSettings(profile);
+  Require(defaults->direction_row == 2 && defaults->direction_count == 1 &&
+              defaults->direction_kind == kMeanDiff &&
+              Bits(defaults->DeviceWords()[0]) == 2 &&
+              defaults->identity == ExpectedIdentity(profile, *defaults),
+          "rank-2 defaults");
+  const auto all =
+      qwen::ResolveAbliterationSettings(profile, {.direction_layer = 0,
+                                                  .direction_kind = kProjected,
+                                                  .direction_count = 2,
+                                                  .preserve_norm = true});
+  Require(all->direction_row == 4 && all->direction_count == 2 &&
+              all->preserve_norm &&
+              Bits(all->DeviceWords()[0]) ==
+                  (4U | 1U << qwen::kAbliterationCountShift |
+                   qwen::kAbliterationPreserveNormBit) &&
+              all->identity == ExpectedIdentity(profile, *all) &&
+              qwen::AbliterationSettingsFit(profile, *all),
+          "projected rank-2 settings");
+  // Each option is its own identity; explicit defaults are the defaults.
+  const auto projected = qwen::ResolveAbliterationSettings(
+      profile, {.direction_kind = kProjected});
+  const auto two =
+      qwen::ResolveAbliterationSettings(profile, {.direction_count = 2});
+  const auto norm =
+      qwen::ResolveAbliterationSettings(profile, {.preserve_norm = true});
+  const auto explicit_defaults =
+      qwen::ResolveAbliterationSettings(profile, {.direction_kind = kMeanDiff,
+                                                  .direction_count = 1,
+                                                  .preserve_norm = false});
+  Require(projected->identity != defaults->identity &&
+              two->identity != defaults->identity &&
+              norm->identity != defaults->identity &&
+              projected->identity != two->identity &&
+              two->identity != norm->identity &&
+              explicit_defaults->identity == defaults->identity &&
+              projected->direction_row == 6 && two->direction_row == 2,
+          "option identities");
+  for (const auto& overrides : std::vector<qwen::AbliterationOverrides>{
+           {.direction_count = 0}, {.direction_count = 3}}) {
+    Require(Rejects([&] {
+              (void)qwen::ResolveAbliterationSettings(profile, overrides);
+            }),
+            "direction count outside [1, rank] resolved");
+  }
+  auto misfit = *two;
+  misfit.direction_count = 3;
+  Require(!qwen::AbliterationSettingsFit(profile, misfit) &&
+              !qwen::AbliterationSettingsFit(legacy, *two),
+          "settings fit");
+  // The continuation guard binds the options too.
+  auto metadata = Current(4);
+  metadata.RecordImage({}, norm.get());
+  Require(metadata.ImageMatches({}, norm.get()) &&
+              !metadata.ImageMatches({}, defaults.get()),
+          "option-bound continuation guard");
+
+  // Profile defaults of the options.
+  auto defaulted = full;
+  defaulted["direction_kind"] = "projected";
+  defaulted["direction_count"] = 2;
+  defaulted["preserve_norm"] = true;
+  write(defaulted);
+  const auto with_defaults = load();
+  const auto resolved = qwen::ResolveAbliterationSettings(with_defaults);
+  Require(with_defaults.direction_kind == kProjected &&
+              with_defaults.direction_count == 2 &&
+              with_defaults.preserve_norm && resolved->direction_row == 6 &&
+              resolved->direction_count == 2 && resolved->preserve_norm &&
+              qwen::ResolveAbliterationSettings(with_defaults,
+                                                {.direction_kind = kMeanDiff,
+                                                 .direction_count = 1,
+                                                 .preserve_norm = false})
+                      ->direction_row == 2,
+          "profile option defaults");
+
+  // Invalid members.
+  const auto rejects = [&](json::Value value) {
+    write(value);
+    return Rejects(load);
+  };
+  const auto with = [&](const char* key, json::Value value) {
+    auto result = full;
+    result[key] = std::move(value);
+    return result;
+  };
+  auto rank_only = v2;
+  rank_only["rank"] = 2;
+  auto subspace_only = v2;
+  subspace_only["subspace_directions"] = full["subspace_directions"];
+  auto projected_rank1 = v2;
+  projected_rank1["projected_directions"] =
+      Strings({{0, 0, 1}, {0, 1, 0, 1, 0, 0}});
+  auto kind_only = v2;
+  kind_only["direction_kind"] = "projected";
+  auto count_only = v2;
+  count_only["direction_count"] = 2;
+  std::string bad_char = Base64({-0.8F, 0.6F, 0});
+  bad_char[0] = '*';
+  std::string bad_padding = Base64({-0.8F, 0.6F, 0});
+  bad_padding[4] = '=';
+  // Layer 0's string as given, layer 1's valid.
+  const auto texts = [](const std::string& first) {
+    json::Value array = json::Value::array();
+    array.push_back(first);
+    array.push_back(Base64({1, 0, 0}));
+    return array;
+  };
+  Require(!Rejects([&] {
+    auto valid = full;
+    valid["subspace_directions"] = texts(Base64({-0.8F, 0.6F, 0}));
+    write(valid);
+    (void)load();
+  }),
+          "valid subspace strings rejected");
+  Require(
+      rejects(with("rank", 9)) && rejects(with("rank", 0)) &&
+          rejects(with("rank", 1.5)) && rejects(with("rank", "2")) &&
+          rejects(rank_only) && rejects(subspace_only) &&
+          rejects(projected_rank1) && rejects(kind_only) &&
+          rejects(count_only) &&
+          rejects(with("subspace_directions",
+                       Strings({{0.6F, 0.8F, 0}, {1, 0, 0}}))) &&
+          rejects(with("subspace_directions",
+                       Strings({{-0.8F, 0.6F}, {1, 0, 0}}))) &&
+          rejects(with("subspace_directions", Strings({{-0.8F, 0.6F, 0}}))) &&
+          rejects(with("subspace_directions",
+                       Strings({{-0.8F, 0.6F, 0}, {1, 1, 0}}))) &&
+          rejects(with("subspace_directions",
+                       json::parse(R"([[-0.8,0.6,0],[1,0,0]])"))) &&
+          rejects(with("subspace_directions", texts(bad_char))) &&
+          rejects(with("subspace_directions", texts(bad_padding))) &&
+          rejects(with("projected_directions",
+                       Strings({{0, 0, 1, 0, 0, 1}, {0, 1, 0, 1, 0, 0}}))) &&
+          rejects(
+              with("projected_directions", Strings({{0, 0, 1, 1, 0, 0}}))) &&
+          rejects(with("direction_kind", "pca")) &&
+          rejects(with("direction_kind", 1)) &&
+          rejects(with("direction_count", 3)) &&
+          rejects(with("direction_count", 0)) &&
+          rejects(with("preserve_norm", "yes")) &&
+          rejects(with("subspace_method", "kmeans")),
+      "invalid subspace members loaded");
+  // NaN bits in a base64 row.
+  Require(rejects(with("subspace_directions",
+                       Strings({{std::numeric_limits<float>::quiet_NaN(), 0, 0},
+                                {1, 0, 0}}))),
+          "nonfinite subspace loaded");
+  // v1 never carries them.
+  auto v1 = json::parse(
+      R"({"schema":"gufo-abliteration-v1","placement":"","model_identity":
+      "fixture","hidden":3,"layers":2,"direction":[0.6,0.8,0],
+      "attention":[1,0],"mlp":[0,0.5]})");
+  v1["placement"] = std::string(site);
+  for (const char* key : {"rank", "preserve_norm", "direction_kind"}) {
+    auto invalid = v1;
+    invalid[key] = key == std::string_view("preserve_norm") ? json::Value(true)
+                   : key == std::string_view("rank")        ? json::Value(1)
+                                                     : json::Value("mean_diff");
+    Require(rejects(invalid), "v1 profile with a subspace member loaded");
+  }
 }
 
 // Post-layer residual strengths (D16): optional v2 member, request
@@ -365,6 +637,7 @@ void TestV2Profile(const std::filesystem::path& path, std::string_view site) {
               !metadata.ImageMatches({}, nullptr),
           "settings-bound continuation guard");
   TestResidual(path, site, v2, *defaults);
+  TestSubspace(path, site, v2);
   // A 27B-sized v2 profile written by prepare.py fits the size cap.
   Require(qwen::kAbliterationMaxProfileBytes >= 64ull * 5120 * 14,
           "size cap below a 27B v2 profile");

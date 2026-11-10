@@ -28,12 +28,14 @@ struct AbliterationSpan {
   std::uint32_t end_row;
   const float* settings;
 };
-/// In place, per row of an ON span: y -= w * d * dot(d, y), where d is the
-/// session's direction row of `directions` ([rows][hidden], unit) and w its
-/// strength for `layer`'s attention (`mlp` false) or MLP writer, both read on
-/// the device at run time. Launches nothing when every span is OFF; an ON
-/// span launches even at strength 0, so strength updates never change a
-/// captured graph.
+/// In place, per row of an ON span: y -= w * sum_j d_j * dot(d_j, y), where
+/// d_j are the session's direction_count orthonormal rows of `directions`
+/// ([rows][hidden]) and w its strength for `layer`'s attention (`mlp` false)
+/// or MLP writer; with preserve_norm the row is then rescaled to its former
+/// L2 norm. All of it is read on the device at run time. One direction
+/// without norm preservation is the single-direction projection, bit for
+/// bit. Launches nothing when every span is OFF; an ON span launches even at
+/// strength 0, so settings updates never change a captured graph.
 void AbliterateBatchRows(float* output, const float* directions,
                          std::span<const AbliterationSpan> spans,
                          std::uint32_t layer, bool mlp, std::uint32_t layers,
@@ -44,8 +46,9 @@ void AbliterateRows(float* output, const float* directions,
                     std::uint32_t layers, std::uint32_t rows,
                     std::uint32_t hidden, hipStream_t stream);
 /// The post-layer residual `res` ([tokens][streams][hidden]): each stream
-/// row of an ON span's tokens loses w * d * dot(d, row), w being the session's
-/// `residual` strength for `layer`. Projecting every stream also removes the
+/// row of an ON span's tokens loses w * sum_j d_j * dot(d_j, row) (and keeps
+/// its own norm with preserve_norm), w being the session's `residual`
+/// strength for `layer`. Projecting every stream also removes the
 /// stream mean's component (what the collector measured): with w = 1 none is
 /// left. Span end rows count tokens. Callers pass only sessions whose
 /// residual strengths are not all zero (null otherwise).

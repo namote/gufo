@@ -5,9 +5,13 @@
 // the production order (project the writer output, then the residual add),
 // which must leave the accumulated residual itself unprojected. The
 // post-layer residual projection (D16) gets the same checks with its own
-// strengths, and the full writer, add, residual order.
+// strengths, and the full writer, add, residual order. Subspace projection
+// (k in {1, 2, 5, 8} orthonormal directions) and norm preservation are checked
+// against FP64 with mixed sessions, one direction against the D16 kernel bit
+// for bit, and in-place count/norm updates under a captured graph.
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -19,6 +23,7 @@
 
 #include "src/models/qwen/hip/ops/abliteration.hpp"
 #include "src/models/qwen/hip/ops/norm_residual.hpp"
+#include "tests/models/qwen/support/abliteration_subspace.hpp"
 
 namespace {
 namespace hip = gufo::hip;
@@ -378,6 +383,200 @@ void ResidualProductionOrder(std::mt19937& rng) {
     Require(std::abs(dot) < 1e-3, "post-layer residual kept the direction");
   }
 }
+namespace sub = gufo::tests::qwen_abliteration;
+
+// Two layers' settings with a packed word 0 and the writer/residual
+// strengths of layer 1 (AbliterationSettings::DeviceWords: 1 + 3 x layers).
+std::vector<float> PackedSettings(std::uint32_t row, std::uint32_t count,
+                                  bool preserve, float mlp, float residual) {
+  return {sub::Word0(row, count, preserve), 0, 0, 0, mlp, 0, residual};
+}
+
+void CheckRows(const std::vector<float>& actual,
+               const std::vector<double>& expected, double tolerance,
+               const char* message) {
+  for (std::size_t i = 0; i < actual.size(); ++i)
+    Require(std::abs(actual[i] - expected[i]) <=
+                tolerance * (1 + std::abs(expected[i])),
+            message);
+}
+
+// Subspace projection (k orthonormal rows of a rank-8 layout) against FP64
+// for the MLP writer and the post-layer residual: mixed sessions with their
+// own first row, count, norm preservation and strength, an OFF row, a
+// zero-strength row (bit-identical even with norm preservation) and a row
+// past every span.
+void SubspaceFormula(std::uint32_t hidden, std::uint32_t k, bool residual,
+                     std::mt19937& rng) {
+  constexpr std::uint32_t kRank = 8;
+  // Three blocks of eight rows: sessions start at row 8 or 16.
+  std::vector<float> directions;
+  for (int block = 0; block < 3; ++block) {
+    const auto rows = sub::OrthonormalRows(kRank, hidden, rng);
+    directions.insert(directions.end(), rows.begin(), rows.end());
+  }
+  const std::uint32_t other_k = k == kRank ? 3 : k + 1;
+  const Device full(PackedSettings(8, k, false, 1, 1)),
+      half_norm(PackedSettings(8, k, true, .5F, .5F)),
+      strong(PackedSettings(16, other_k, false, 2, 2)),
+      zero(PackedSettings(16, k, true, 0, 0));
+  const std::vector<hip::QwenAbliterationSpan> spans{{2, full.data},
+                                                     {3, nullptr},
+                                                     {5, half_norm.data},
+                                                     {6, strong.data},
+                                                     {7, zero.data}};
+  struct Row {
+    std::uint32_t first, count;
+    double weight;
+    bool preserve;
+  };
+  const std::vector<Row> expected_rows{
+      {8, k, 1, false},  {8, k, 1, false},        {0, 1, 0, false},
+      {8, k, .5, true},  {8, k, .5, true},        {16, other_k, 2, false},
+      {16, k, 0, true},  {0, 1, 0, false}};
+  const auto rows = static_cast<std::uint32_t>(expected_rows.size());
+  std::normal_distribution<float> normal(0.F, 3.F);
+  std::vector<float> values(std::size_t{rows} * hidden);
+  for (auto& x : values)
+    x = normal(rng);
+  // Give the ON rows a large component in their subspace.
+  for (std::uint32_t r = 0; r < rows; ++r)
+    for (std::uint32_t j = 0; j < expected_rows[r].count; ++j)
+      for (std::uint32_t i = 0; i < hidden; ++i)
+        values[std::size_t{r} * hidden + i] +=
+            4 * directions[(std::size_t{expected_rows[r].first} + j) * hidden +
+                           i];
+  const Device device_rows(values), device_directions(directions);
+  if (residual)
+    hip::LaunchQwenAbliterateResidualRows(device_rows.data,
+                                          device_directions.data, spans, 1, 2,
+                                          rows, hidden, nullptr);
+  else
+    hip::LaunchQwenAbliterateRows(device_rows.data, device_directions.data,
+                                  spans, 1, true, 2, rows, hidden, nullptr);
+  Check(hipDeviceSynchronize());
+  const auto actual = device_rows.Read(values.size());
+  for (std::uint32_t r = 0; r < rows; ++r) {
+    const auto& row = expected_rows[r];
+    const auto* y = values.data() + std::size_t{r} * hidden;
+    const std::vector<float> got(actual.begin() + std::size_t{r} * hidden,
+                                 actual.begin() + std::size_t{r + 1} * hidden);
+    if (row.weight == 0) {
+      Require(std::equal(got.begin(), got.end(), y),
+              "an OFF or zero-strength row changed");
+      continue;
+    }
+    CheckRows(got,
+              sub::ReferenceRow(y,
+                                directions.data() +
+                                    std::size_t{row.first} * hidden,
+                                row.count, row.weight, row.preserve, hidden),
+              5e-5, "subspace projection differs from the FP64 formula");
+    double before = 0, after = 0;
+    for (std::uint32_t i = 0; i < hidden; ++i) {
+      before += double{y[i]} * y[i];
+      after += double{got[i]} * got[i];
+    }
+    if (row.preserve)
+      Require(std::abs(std::sqrt(after) - std::sqrt(before)) <=
+                  3e-5 * std::sqrt(before),
+              "norm preservation changed the row norm");
+    // Strength 1 leaves no component in the subspace.
+    if (row.weight == 1)
+      for (std::uint32_t j = 0; j < row.count; ++j) {
+        double dot = 0;
+        for (std::uint32_t i = 0; i < hidden; ++i)
+          dot += double{got[i]} *
+                 directions[(std::size_t{row.first} + j) * hidden + i];
+        Require(std::abs(dot) < 1e-3, "strength 1 left a subspace component");
+      }
+  }
+}
+
+// One direction without norm preservation is the D16 kernel, bit for bit,
+// for the writer and residual entry points.
+void SingleDirectionMatchesD16(std::uint32_t hidden, std::mt19937& rng) {
+  const std::uint32_t rows = 5;
+  auto directions = sub::OrthonormalRows(3, hidden, rng);
+  std::normal_distribution<float> normal(0.F, 2.F);
+  std::vector<float> values(std::size_t{rows} * hidden);
+  for (auto& x : values)
+    x = normal(rng);
+  // Row 2 as the session's direction; strengths 0.75 (mlp), 1.25 (residual).
+  const auto words = PackedSettings(2, 1, false, .75F, 1.25F);
+  Require(std::bit_cast<std::uint32_t>(words[0]) == 2,
+          "single-direction word 0 is not the bare row");
+  const Device settings(words), device_directions(directions);
+  for (const bool residual : {false, true}) {
+    const Device current(values), reference(values);
+    if (residual)
+      hip::LaunchQwenAbliterateResidualRows(current.data,
+                                            device_directions.data,
+                                            settings.data, 1, 2, rows, hidden,
+                                            nullptr);
+    else
+      hip::LaunchQwenAbliterateRows(current.data, device_directions.data,
+                                    settings.data, 1, true, 2, rows, hidden,
+                                    nullptr);
+    sub::D16AbliterateRows<<<rows, 256>>>(reference.data,
+                                          device_directions.data,
+                                          settings.data, residual ? 6 : 4,
+                                          hidden);
+    Check(hipGetLastError());
+    Check(hipDeviceSynchronize());
+    const auto a = current.Read(values.size());
+    const auto b = reference.Read(values.size());
+    for (std::size_t i = 0; i < a.size(); ++i)
+      Require(std::bit_cast<std::uint32_t>(a[i]) ==
+                  std::bit_cast<std::uint32_t>(b[i]),
+              "single direction differs from the D16 kernel");
+  }
+}
+
+// A captured graph follows in-place changes of the direction count and norm
+// preservation (word 0) as well as the strength.
+void SubspaceGraphFollowsSettings(std::mt19937& rng) {
+  const std::uint32_t hidden = 257;
+  const auto directions = sub::OrthonormalRows(8, hidden, rng);
+  std::normal_distribution<float> normal(0.F, 1.F);
+  std::vector<float> values(hidden);
+  for (auto& x : values)
+    x = normal(rng);
+  const Device rows(values), device_directions(directions),
+      settings(PackedSettings(0, 1, false, 0, 0));
+  hipStream_t stream = nullptr;
+  Check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+  hipGraph_t graph = nullptr;
+  hipGraphExec_t exec = nullptr;
+  Check(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal));
+  hip::LaunchQwenAbliterateResidualRows(rows.data, device_directions.data,
+                                        settings.data, 1, 2, 1, hidden,
+                                        stream);
+  Check(hipStreamEndCapture(stream, &graph));
+  Check(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+  const auto run = [&](const std::vector<float>& words) {
+    Check(hipMemcpy(rows.data, values.data(), hidden * sizeof(float),
+                    hipMemcpyHostToDevice));
+    Check(hipMemcpy(settings.data, words.data(), words.size() * sizeof(float),
+                    hipMemcpyHostToDevice));
+    Check(hipGraphLaunch(exec, stream));
+    Check(hipStreamSynchronize(stream));
+    return rows.Read(hidden);
+  };
+  Require(run(PackedSettings(0, 4, true, 0, 0)) == values,
+          "zero strength changed a row");
+  CheckRows(run(PackedSettings(0, 4, false, 0, 1)),
+            sub::ReferenceRow(values.data(), directions.data(), 4, 1, false,
+                              hidden),
+            5e-5, "graph ignored an in-place direction count");
+  CheckRows(run(PackedSettings(2, 6, true, 0, .5F)),
+            sub::ReferenceRow(values.data(), directions.data() + 2 * hidden,
+                              6, .5, true, hidden),
+            5e-5, "graph ignored in-place norm preservation");
+  Check(hipGraphExecDestroy(exec));
+  Check(hipGraphDestroy(graph));
+  Check(hipStreamDestroy(stream));
+}
 }  // namespace
 
 int main() {
@@ -397,6 +596,13 @@ int main() {
       ResidualFormula(hidden, rng);
     ResidualGraphFollowsSettings(rng);
     ResidualProductionOrder(rng);
+    for (const std::uint32_t hidden : {5120U, 13U, 257U})
+      for (const std::uint32_t k : {1U, 2U, 5U, 8U})
+        for (const bool residual : {false, true})
+          SubspaceFormula(hidden, k, residual, rng);
+    for (const std::uint32_t hidden : {5120U, 13U, 257U})
+      SingleDirectionMatchesD16(hidden, rng);
+    SubspaceGraphFollowsSettings(rng);
   } catch (const std::exception& e) {
     std::cerr << "FAIL: " << e.what() << '\n';
     return 1;

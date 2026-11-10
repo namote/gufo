@@ -1587,6 +1587,21 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
     abliteration["attention"] = strengths(info->attention);
     abliteration["mlp"] = strengths(info->mlp);
     abliteration["residual"] = strengths(info->residual);
+    // Projection options: the kinds a request may choose, the stored
+    // subspace rank (the largest `directions`) and the defaults.
+    json::Value kinds = json::Value::array();
+    for (const auto& kind : info->direction_kinds)
+      kinds.push_back(kind);
+    abliteration["direction_kinds"] = std::move(kinds);
+    abliteration["direction_kind"] = info->direction_kind;
+    abliteration["max_directions"] =
+        static_cast<unsigned long long>(info->rank);
+    abliteration["directions"] =
+        static_cast<unsigned long long>(info->direction_count);
+    abliteration["preserve_norm"] = info->preserve_norm;
+    abliteration["subspace_method"] = info->subspace_method.empty()
+                                          ? json::Value(nullptr)
+                                          : json::Value(info->subspace_method);
     abliteration["max_strength"] =
         static_cast<double>(models::qwen::kAbliterationMaxWeight);
     resp["abliteration"] = std::move(abliteration);

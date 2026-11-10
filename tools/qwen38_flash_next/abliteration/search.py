@@ -18,6 +18,21 @@ own.
   strengths (D16).
 * `both`: all three curves.
 
+Projection options (any mode), searched when the server reports them in
+/props (`direction_kinds`, `max_directions`, `preserve_norm`):
+
+* `direction_kind`: `--direction-kinds` (default: every kind the profile
+  stores), a categorical axis when there are two.
+* `directions` (subspace rank k): an integer axis 1..`--max-directions`
+  (default: the profile's stored rank).
+* `preserve_norm`: `--preserve-norm search` (default) is a boolean axis;
+  `on`/`off` fix it.
+
+Every trial on such a server sends all three explicitly, so profile defaults
+never leak in. With one kind, at most one direction and `--preserve-norm off`
+(the single-direction space) the log fingerprint is the one before these
+options existed, so earlier logs resume; any other choice is another search.
+
 Each trial scores two objectives, both minimized:
 
 * refusals: harmful ("refusal" group) prompts answered greedily with a short
@@ -153,9 +168,36 @@ MODES = {
     'both': ('attention', 'mlp', 'residual'),
 }
 STRENGTHS = ('attention', 'mlp', 'residual')
+# Integer parameters: rounded after sampling and perturbation.
+DISCRETE = ('direction_layer', 'direction_kind', 'directions', 'preserve_norm')
+# The single-direction space of servers and logs before projection options.
+LEGACY_AXES = dict(kinds=['mean_diff'], max_directions=1, preserve_norm=[False])
 
 
-def bounds(layers, direction_layers, max_weight, mode):
+def projection_axes(info, kinds=None, max_directions=None, preserve='search'):
+    """The searched projection options, or None when the server reports none
+    (then nothing new is sent). `kinds` and `max_directions` default to what
+    the loaded profile offers; `preserve` is search, on or off."""
+    offered = info.get('direction_kinds')
+    if offered is None:
+        if (kinds not in (None, ['mean_diff']) or max_directions not in (None, 1) or
+                preserve == 'on'):
+            raise SystemExit('the server reports no direction kinds, subspace or '
+                             'norm preservation; drop those options')
+        return None
+    kinds = list(offered) if kinds is None else kinds
+    unknown = [k for k in kinds if k not in offered]
+    if not kinds or unknown:
+        raise SystemExit(f'--direction-kinds must name kinds the profile stores: {offered}')
+    rank = int(info.get('max_directions', 1))
+    max_directions = rank if max_directions is None else max_directions
+    if not 1 <= max_directions <= rank:
+        raise SystemExit(f'--max-directions must be in [1, {rank}]')
+    options = {'search': [False, True], 'on': [True], 'off': [False]}[preserve]
+    return dict(kinds=kinds, max_directions=max_directions, preserve_norm=options)
+
+
+def bounds(layers, direction_layers, max_weight, mode, axes=None):
     first, last = min(direction_layers), max(direction_layers)
     box = {'direction_layer': (first, last)}
     for part in MODES[mode]:
@@ -163,6 +205,15 @@ def bounds(layers, direction_layers, max_weight, mode):
         box[part + '.peak'] = (0.0, layers - 1.0)
         box[part + '.min_frac'] = (0.0, 1.0)
         box[part + '.width'] = (1.0, float(layers))
+    if axes:
+        # Integer options span [low - 0.5, high + 0.5], so every value gets
+        # the same share of a uniform sample (clip rounds into [low, high]).
+        if len(axes['kinds']) > 1:
+            box['direction_kind'] = (-0.5, len(axes['kinds']) - 0.5)
+        if axes['max_directions'] > 1:
+            box['directions'] = (0.5, axes['max_directions'] + 0.5)
+        if len(axes['preserve_norm']) > 1:
+            box['preserve_norm'] = (-0.5, 1.5)
     return box
 
 
@@ -170,7 +221,12 @@ def clip(params, box):
     out = {}
     for key, (low, high) in box.items():
         value = min(max(params[key], low), high)
-        out[key] = int(round(value)) if key == 'direction_layer' else float(value)
+        if key in DISCRETE:
+            value = min(max(int(math.floor(value + 0.5)), math.ceil(low)),
+                        math.floor(high))
+            out[key] = int(value)
+        else:
+            out[key] = float(value)
     return out
 
 
@@ -183,10 +239,17 @@ def perturb(parent, box, rng, scale):
                  for k, (lo, hi) in box.items()}, box)
 
 
-def settings(params, layers, mode):
+def settings(params, layers, mode, axes=None):
     """Per-request settings of one parameter point: the searched strengths
-    as curves, the others 0 (so profile defaults never leak into a trial)."""
+    as curves, the others 0, and with `axes` every projection option (so
+    profile defaults never leak into a trial)."""
     result = {'direction_layer': params['direction_layer']}
+    if axes:
+        result['direction_kind'] = axes['kinds'][params.get('direction_kind', 0)]
+        result['directions'] = params.get('directions', 1)
+        result['preserve_norm'] = (bool(params['preserve_norm'])
+                                   if 'preserve_norm' in params
+                                   else axes['preserve_norm'][0])
     for part in STRENGTHS:
         if part not in MODES[mode]:
             result[part] = 0.0
@@ -310,13 +373,14 @@ def load_prompts(paths, split, thinking, counts, seed):
 
 class Search:
     def __init__(self, client, model, prompts, info, log, max_tokens,
-                 concurrency=1, out=sys.stdout, mode='residual'):
+                 concurrency=1, out=sys.stdout, mode='residual', axes=None):
         self.client, self.model, self.prompts = client, model, prompts
         self.layers = info['layers']
         self.max_tokens, self.concurrency, self.out = max_tokens, concurrency, out
         self.log = Path(log)
         self.info = info
         self.mode = mode
+        self.axes = axes
         identity = dict(
             model=model, profile=info.get('identity'), layers=self.layers,
             max_tokens=max_tokens,
@@ -325,6 +389,9 @@ class Search:
         # the other modes search another space and need their own log.
         if mode != 'writer':
             identity['mode'] = mode
+        # The single-direction space keeps the earlier fingerprint.
+        if axes and axes != LEGACY_AXES:
+            identity['axes'] = axes
         self.fingerprint = hashlib.sha256(
             json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
@@ -399,7 +466,7 @@ class Search:
                 params, values = None, {}
             else:
                 params = propose(index, history, box, initial, trials, seed)
-                values = settings(params, self.layers, self.mode)
+                values = settings(params, self.layers, self.mode, self.axes)
             result = self.evaluate(values, baseline)
             record = dict(trial=index, params=params, settings=values,
                           elapsed_s=round(time.monotonic() - started, 3), **result)
@@ -416,9 +483,14 @@ class Search:
 def describe(trial, layers, info):
     s = trial['settings']
     layer = s.get('direction_layer', info.get('direction_layer'))
+    options = ''
+    if 'direction_kinds' in info:
+        options = (f" {s.get('direction_kind', info.get('direction_kind'))} "
+                   f"k={s.get('directions', info.get('directions'))} "
+                   f"preserve_norm={s.get('preserve_norm', info.get('preserve_norm'))}")
     return (f"trial {trial['trial']}: refusals {trial['refusals']}/"
-            f"{trial['refusal_prompts']} KL {trial['kl']:.4f} layer {layer} "
-            f"params {json.dumps(trial['params'])}")
+            f"{trial['refusal_prompts']} KL {trial['kl']:.4f} layer {layer}"
+            f"{options} params {json.dumps(trial['params'])}")
 
 
 def write_choice(trial, info, base_profile, output, out=sys.stdout):
@@ -428,6 +500,12 @@ def write_choice(trial, info, base_profile, output, out=sys.stdout):
     attention = as_list(s.get('attention', info['attention']), layers)
     mlp = as_list(s.get('mlp', info['mlp']), layers)
     residual = as_list(s.get('residual', info['residual']), layers)
+    # The chosen projection options (the served defaults for trial 0); None
+    # on a server without them keeps the base profile's values.
+    supported = 'direction_kinds' in info
+    kind = s.get('direction_kind', info.get('direction_kind')) if supported else None
+    count = s.get('directions', info.get('directions')) if supported else None
+    preserve = s.get('preserve_norm', info.get('preserve_norm')) if supported else None
     if base_profile and output:
         output = Path(output)
         if output.exists():
@@ -436,6 +514,7 @@ def write_choice(trial, info, base_profile, output, out=sys.stdout):
         base = prepare.load_base(profile=base_profile)
         prepare.save_profile(output, prepare.make_profile(
             base, layer, attention, mlp, residual=residual,
+            direction_kind=kind, direction_count=count, preserve_norm=preserve,
             status='candidate-not-qualified',
             search_trial=trial['trial'], search_refusals=trial['refusals'],
             search_kl=trial['kl']))
@@ -445,8 +524,10 @@ def write_choice(trial, info, base_profile, output, out=sys.stdout):
               f'prepare.py make-profile --profile BASE_V2.json --direction-layer {layer} '
               f'--attention {",".join(f"{w:g}" for w in attention)} '
               f'--mlp {",".join(f"{w:g}" for w in mlp)} '
-              f'--residual {",".join(f"{w:g}" for w in residual)} --output NEW.json',
-              file=out)
+              f'--residual {",".join(f"{w:g}" for w in residual)}'
+              + (f' --direction-kind {kind} --directions {count} '
+                 f'--preserve-norm {"on" if preserve else "off"}' if supported else '')
+              + ' --output NEW.json', file=out)
 
 
 def check_base(base_profile, info):
@@ -483,6 +564,14 @@ def main(argv=None, client=None, out=sys.stdout):
                         help='strengths to search: residual (post-layer residual '
                              'curve, writers 0; default), writer (attention and '
                              'mlp curves, residual 0) or both')
+    parser.add_argument('--direction-kinds',
+                        help='comma-separated kinds to search (mean_diff, projected; '
+                             'default: every kind the profile stores)')
+    parser.add_argument('--max-directions', type=int,
+                        help='largest subspace rank k to search (default: the '
+                             "profile's stored rank)")
+    parser.add_argument('--preserve-norm', choices=('search', 'on', 'off'),
+                        default='search', help='norm preservation axis')
     parser.add_argument('--log', required=True)
     parser.add_argument('--kl-budget', type=float, required=True)
     parser.add_argument('--base-profile', help='the v2 profile the server loaded')
@@ -511,10 +600,13 @@ def main(argv=None, client=None, out=sys.stdout):
     prompts = load_prompts(args.data, args.split, args.thinking,
                            {'refusal': args.refusal_prompts,
                             'ordinary': args.ordinary_prompts}, args.seed)
+    axes = projection_axes(
+        info, args.direction_kinds.split(',') if args.direction_kinds else None,
+        args.max_directions, args.preserve_norm)
     box = bounds(layers, available, float(info.get('max_strength', prepare.MAX_WEIGHT)),
-                 args.mode)
+                 args.mode, axes)
     search = Search(client, args.model, prompts, info, args.log, args.max_tokens,
-                    args.concurrency, out, args.mode)
+                    args.concurrency, out, args.mode, axes)
     history = search.run(args.trials, args.initial, args.seed, box)
     print('Pareto front (refusals vs KL):', file=out)
     for trial in pareto_front(history):

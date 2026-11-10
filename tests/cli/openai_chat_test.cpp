@@ -7049,6 +7049,62 @@ void TestAbliterationControls() {
                error->body.find("invalid_abliteration") != std::string::npos,
            "invalid transform controls rejected");
   }
+  // Projection options (D18) on a profile with one kind and rank 1: only
+  // the legacy values are accepted.
+  Expect(!parse(R"({"abliteration":{"enabled":true,
+             "direction_kind":"mean_diff","directions":1,
+             "preserve_norm":true}})") &&
+             request.abliteration_overrides.direction_kind ==
+                 gufo::models::qwen::AbliterationDirectionKind::kMeanDiff &&
+             request.abliteration_overrides.direction_count == 1u &&
+             request.abliteration_overrides.preserve_norm == true,
+         "legacy projection options");
+  Expect(!parse(R"({"abliteration":{"enabled":true}})") &&
+             !request.abliteration_overrides.direction_kind &&
+             !request.abliteration_overrides.direction_count &&
+             !request.abliteration_overrides.preserve_norm,
+         "omitted projection options keep the profile defaults");
+  for (const auto* body : {
+           R"({"abliteration":{"enabled":true,"direction_kind":"projected"}})",
+           R"({"abliteration":{"enabled":true,"directions":2}})",
+       }) {
+    Expect(parse(body).has_value(), "option the profile lacks rejected");
+  }
+  backend.abliteration->direction_kinds = {"mean_diff", "projected"};
+  backend.abliteration->rank = 4;
+  Expect(
+      !parse(R"({"abliteration":{"enabled":true,
+             "direction_kind":"projected","directions":4,
+             "preserve_norm":false,"residual":1}})") &&
+          request.abliteration_overrides.direction_kind ==
+              gufo::models::qwen::AbliterationDirectionKind::kProjected &&
+          request.abliteration_overrides.direction_count == 4u &&
+          request.abliteration_overrides.preserve_norm == false &&
+          request.abliteration_overrides.residual == std::vector<float>{1.0F},
+      "projected rank-4 options");
+  for (const auto* body : {
+           R"({"abliteration":{"enabled":true,"direction_kind":"pca"}})",
+           R"({"abliteration":{"enabled":true,"direction_kind":1}})",
+           R"({"abliteration":{"enabled":true,"direction_kind":null}})",
+           R"({"abliteration":{"enabled":true,"directions":0}})",
+           R"({"abliteration":{"enabled":true,"directions":5}})",
+           R"({"abliteration":{"enabled":true,"directions":1.5}})",
+           R"({"abliteration":{"enabled":true,"directions":"2"}})",
+           R"({"abliteration":{"enabled":true,"directions":[1,2]}})",
+           R"({"abliteration":{"enabled":true,"preserve_norm":1}})",
+           R"({"abliteration":{"enabled":true,"preserve_norm":"true"}})",
+           R"({"abliteration":{"enabled":false,"directions":2}})",
+           R"({"abliteration":{"enabled":false,"preserve_norm":true}})",
+           R"({"abliteration":{"enabled":false,
+               "direction_kind":"projected"}})",
+       }) {
+    const auto error = parse(body);
+    Expect(error.has_value() && error->status == 400 &&
+               error->body.find("invalid_abliteration") != std::string::npos,
+           "invalid projection options rejected");
+  }
+  backend.abliteration->direction_kinds = {"mean_diff"};
+  backend.abliteration->rank = 1;
   // v1: one fixed direction; strengths still apply.
   backend.abliteration->schema = "gufo-abliteration-v1";
   backend.abliteration->direction_layer.reset();

@@ -23,7 +23,10 @@ inline constexpr std::string_view kAbliterationSchemaV1 =
     "gufo-abliteration-v1";
 /// v2: `directions` holds one unit direction per layer ([layers][hidden]);
 /// `direction_layer`, `attention`, `mlp` and the optional `residual` (absent:
-/// all zero) are the request defaults.
+/// all zero) are the request defaults. Optional D18 members add a projected
+/// direction kind, a rank-k subspace per layer and kind, and their defaults
+/// (`direction_kind`, `direction_count`, `preserve_norm`); a v2 profile
+/// without them is rank 1, mean-difference, no norm preservation.
 inline constexpr std::string_view kAbliterationSchemaV2 =
     "gufo-abliteration-v2";
 /// Qwen3.8-Flash-Next: attention/GDN and aggregated MoE outputs, immediately
@@ -40,8 +43,40 @@ inline constexpr std::string_view kAbliterationWriterBeforeResidual =
 /// Request and v2 profile strengths are in [0, kAbliterationMaxWeight].
 inline constexpr float kAbliterationMaxWeight = 4.0F;
 /// A v2 27B profile (64 x 5120 directions) is about 4.5 MB of JSON when
-/// written with float32 round-trip precision (prepare.py).
-inline constexpr std::size_t kAbliterationMaxProfileBytes = 16 << 20;
+/// written with float32 round-trip precision (prepare.py); the D18 members
+/// are base64 float32, so rank 8 with both kinds adds about 26 MB.
+inline constexpr std::size_t kAbliterationMaxProfileBytes = 48 << 20;
+/// The largest subspace rank (orthonormal directions per layer and kind).
+/// The projection kernel keeps one FP32 dot accumulator per direction in
+/// registers and reduces all of them in one 8 x 256-float shared block, and a
+/// 27B rank-8 profile with both kinds already holds 64 x 2 x 8 x 5120 floats
+/// (21 MB on the device). Refusal subspaces reported in the literature are
+/// low-dimensional; beyond a few directions ablation approaches removing a
+/// generic subspace and the KL to OFF grows.
+inline constexpr std::uint32_t kAbliterationMaxDirections = 8;
+
+/// Which direction family a request projects (D18).
+enum class AbliterationDirectionKind : std::uint32_t {
+  /// refusal mean minus ordinary mean (the D14/D16 direction)
+  kMeanDiff = 0,
+  /// the same with its component along the normalized ordinary mean removed
+  /// (projected abliteration)
+  kProjected = 1,
+};
+/// "mean_diff" or "projected".
+[[nodiscard]] std::string_view AbliterationDirectionKindName(
+    AbliterationDirectionKind kind) noexcept;
+/// The kind named `name`; empty for an unknown name.
+[[nodiscard]] std::optional<AbliterationDirectionKind>
+ParseAbliterationDirectionKind(std::string_view name) noexcept;
+
+/// Device word 0 of a session's settings: the first direction row (bits
+/// 0-23), the number of directions minus one (bits 24-26) and the
+/// norm-preservation flag (bit 27). One direction without norm preservation
+/// is the bare row index, exactly the D16 word.
+inline constexpr std::uint32_t kAbliterationRowMask = (1U << 24) - 1;
+inline constexpr std::uint32_t kAbliterationCountShift = 24;
+inline constexpr std::uint32_t kAbliterationPreserveNormBit = 1U << 27;
 
 /// Immutable, model-bound runtime projection. No model weights are edited.
 /// JSON keeps this sidecar independent of the weight shard loader.
@@ -50,11 +85,24 @@ struct AbliterationProfile {
   std::uint32_t schema{0};
   std::uint32_t hidden{0};
   std::uint32_t layers{0};
-  /// Unit directions, row-major [rows][hidden]. v2: `layers` rows, row l
-  /// measured at layer l. v1: one row of unknown source layer.
+  /// Orthonormal directions per layer and kind (1 without D18 members).
+  std::uint32_t rank{1};
+  /// Direction kinds stored: 1 (mean difference) or 2 (also projected).
+  std::uint32_t kinds{1};
+  /// Unit directions, row-major [rows][hidden]: DirectionRow(kind, layer)
+  /// starts `rank` orthonormal rows; the first is the kind's single
+  /// direction. v2 rank 1 with one kind: `layers` rows, row l measured at
+  /// layer l. v1: one row of unknown source layer.
   std::vector<float> directions;
   /// The default direction row's source layer; empty for v1.
   std::optional<std::uint32_t> direction_layer;
+  /// Request defaults of the D18 options.
+  AbliterationDirectionKind direction_kind{
+      AbliterationDirectionKind::kMeanDiff};
+  std::uint32_t direction_count{1};
+  bool preserve_norm{false};
+  /// How the subspace was fitted ("pca", "som"); empty when not recorded.
+  std::string subspace_method;
   /// Default per-layer strengths. `residual` is all zero for v1 and for a v2
   /// profile without that member.
   std::vector<float> attention;
@@ -72,6 +120,16 @@ struct AbliterationProfile {
   [[nodiscard]] bool selectable_direction() const noexcept {
     return direction_layer.has_value();
   }
+  [[nodiscard]] bool has_kind(AbliterationDirectionKind kind) const noexcept {
+    return static_cast<std::uint32_t>(kind) < kinds;
+  }
+  /// The first of `rank` rows of `kind` measured at `layer` (0 for v1).
+  [[nodiscard]] std::uint32_t DirectionRow(AbliterationDirectionKind kind,
+                                           std::uint32_t layer) const noexcept {
+    return direction_layer
+               ? (static_cast<std::uint32_t>(kind) * layers + layer) * rank
+               : 0;
+  }
 
   static AbliterationProfile Load(const std::filesystem::path& path,
                                   std::uint32_t hidden, std::uint32_t layers,
@@ -85,22 +143,33 @@ struct AbliterationProfile {
 struct AbliterationSettings {
   /// The chosen direction's source layer; empty for a v1 profile.
   std::optional<std::uint32_t> direction_layer;
-  /// Row of AbliterationProfile::directions.
+  /// First row of AbliterationProfile::directions; the projection uses
+  /// `direction_count` consecutive orthonormal rows from it.
   std::uint32_t direction_row{0};
+  AbliterationDirectionKind direction_kind{
+      AbliterationDirectionKind::kMeanDiff};
+  /// In [1, profile rank]: y -= s * sum_j d_j * dot(d_j, y).
+  std::uint32_t direction_count{1};
+  /// After the projection, rescale each projected row (writer output row,
+  /// residual row or HC stream) to its L2 norm before the projection.
+  bool preserve_norm{false};
   std::vector<float> attention;
   std::vector<float> mlp;
   /// Post-layer residual strengths: r -= s * d * dot(d, r) at the point the
   /// collectors read the directions, so s = 1 zeroes that component there.
   std::vector<float> residual;
   /// 64 lowercase hex characters: SHA-256 over the profile identity, the
-  /// direction layer and the exact float bytes of `attention`, `mlp` and
-  /// `residual`.
+  /// direction layer, the exact float bytes of `attention`, `mlp` and
+  /// `residual`, the direction kind, count and norm preservation
+  /// (gufo-abliteration-settings-v3).
   std::string identity;
 
   /// The device copy each ON session owns: AbliterationDeviceWords(layers)
-  /// 32-bit words, read by the projection kernels at launch time. Word 0 is
-  /// `direction_row` (as integer bits); word AbliterationWeightIndex(...) is
-  /// one site's strength.
+  /// 32-bit words, read by the projection kernels at launch time. Word 0
+  /// packs `direction_row`, `direction_count` and `preserve_norm` as integer
+  /// bits (kAbliterationRowMask and below; exactly `direction_row` for one
+  /// direction without norm preservation); word AbliterationWeightIndex(...)
+  /// is one site's strength.
   [[nodiscard]] std::vector<float> DeviceWords() const;
   /// Whether any residual strength is nonzero. Only then do the models launch
   /// the residual projection (at every layer, zero strengths included) and
@@ -139,14 +208,24 @@ struct AbliterationOverrides {
   std::vector<float> attention;
   std::vector<float> mlp;
   std::vector<float> residual;
+  /// D18: `direction_kind`, `directions` (count) and `preserve_norm`.
+  std::optional<AbliterationDirectionKind> direction_kind;
+  std::optional<std::uint32_t> direction_count;
+  std::optional<bool> preserve_norm;
 };
 
 /// The effective settings of `overrides` on `profile`'s defaults. Throws
 /// std::invalid_argument on an out-of-range layer, a direction layer on a v1
-/// profile, a wrong strength count, or a strength outside [0, 4].
+/// profile, a wrong strength count, a strength outside [0, 4], a kind the
+/// profile does not store, or a direction count outside [1, rank].
 std::shared_ptr<const AbliterationSettings> ResolveAbliterationSettings(
     const AbliterationProfile& profile,
     const AbliterationOverrides& overrides = {});
+
+/// Whether `settings` index only `profile`'s layers and direction rows.
+[[nodiscard]] bool AbliterationSettingsFit(
+    const AbliterationProfile& profile,
+    const AbliterationSettings& settings) noexcept;
 
 /// Domain-separated input identity; OFF callers keep their original bytes.
 /// `settings_identity` is AbliterationSettings::identity.

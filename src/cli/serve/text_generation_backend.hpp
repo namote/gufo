@@ -50,6 +50,15 @@ struct AbliterationInfo {
   std::vector<float> attention;
   std::vector<float> mlp;
   std::vector<float> residual;
+  /// Direction kinds a request may name in `direction_kind`; `rank` bounds
+  /// the request's `directions`; then the profile defaults.
+  std::vector<std::string> direction_kinds{"mean_diff"};
+  std::uint32_t rank{1};
+  std::string direction_kind{"mean_diff"};
+  std::uint32_t direction_count{1};
+  bool preserve_norm{false};
+  /// "pca", "som" or empty.
+  std::string subspace_method;
 };
 
 /// Client-facing message for a GPU context that can no longer execute work.

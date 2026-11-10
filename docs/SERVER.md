@@ -507,18 +507,36 @@ stream), exactly where the profile's directions were measured, so `residual`
 through the embedding or earlier layers, which writer strengths cannot reach.
 The two kinds may be combined; profiles without `residual` (and every v1
 profile, whose single direction a request may still apply to the residual)
-default it to 0.
+default it to 0. Three projection options apply to every site:
+`direction_kind` (`"mean_diff"`, the refusal-minus-ordinary mean, or
+`"projected"`, the same with its component along the ordinary mean removed,
+when the profile stores it; projected abliteration, arXiv 2512.13655),
+`directions` (an integer k in [1, the profile's stored rank, at most 8]: the
+site loses `s * sum_j d_j * dot(d_j, y)` over k orthonormal directions, a
+refusal subspace after Wollschlaeger et al., "The Geometry of Refusal in Large
+Language Models: Concept Cones and Representational Independence", ICML 2025,
+and arXiv 2603.22061) and `preserve_norm` (a boolean: each projected row, or
+hyper-connection stream, is rescaled to its norm before the projection; the
+activation-space analogue of norm-preserving biprojected abliteration, which
+edits weights instead). Profiles without these members behave as before:
+`mean_diff`, one direction, no norm preservation, for example
+`{"abliteration":{"enabled":true,"residual":1,"direction_kind":"projected",
+"directions":4,"preserve_norm":true}}`.
 Raw completions do not accept it, and an unloaded profile,
 unknown member, invalid setting or setting sent with `"enabled":false` returns
 `invalid_abliteration`. ON and OFF requests, and different profiles or
 settings, never share cached or continued state; OFF behaves and caches exactly
 as without a profile. Changing settings needs no reload; only switching a
 session between ON and OFF, or between all-zero and nonzero `residual`
-strengths, re-records its graphs. `GET /props` reports the
+strengths, re-records its graphs; kind, count and norm preservation are values
+in the session's device settings like the strengths. `GET /props` reports the
 loaded profile as `abliteration`: `schema`, `identity`, `layers`, the
 `direction_layers` a request may name (empty for v1), the default
 `direction_layer` (null for v1), the default `attention`, `mlp` and `residual`
-(one number when uniform) and `max_strength`; never the direction vectors. Preparation,
+(one number when uniform), the `direction_kinds` a request may name, the
+default `direction_kind`, `max_directions` (the stored rank), the default
+`directions` count, `preserve_norm`, `subspace_method` (`pca`, `som` or null)
+and `max_strength`; never the direction vectors. Preparation,
 qualification and the automatic strength search are model-specific: see
 [Qwen3.8-27B](models/qwen3.8-27b/ABLITERATION.md) and
 [Flash-Next](models/qwen3.8-flash-next/ABLITERATION.md).

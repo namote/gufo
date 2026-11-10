@@ -318,10 +318,7 @@ void Session::ConfigureAbliteration(
   const auto* profile = owner_->Abliteration();
   if (settings && !profile)
     throw std::invalid_argument("abliteration profile is not loaded");
-  if (settings && (settings->attention.size() != profile->layers ||
-                   settings->mlp.size() != profile->layers ||
-                   settings->residual.size() != profile->layers ||
-                   settings->direction_row >= profile->direction_rows()))
+  if (settings && !qwen::AbliterationSettingsFit(*profile, *settings))
     throw std::invalid_argument("abliteration settings do not fit the profile");
   if (settings && abliteration_ &&
       settings->identity == abliteration_->identity)

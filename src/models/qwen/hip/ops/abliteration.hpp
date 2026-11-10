@@ -20,13 +20,17 @@ struct QwenAbliterationSpan {
 /// One masked launch covers the sessions of a batched pass.
 inline constexpr std::size_t kQwenAbliterationMaxSpans = 8;
 
-/// In place, per row of an ON span: y -= w * d * dot(d, y), with an FP32
-/// reduction. d is the session's direction row of `directions`
-/// ([rows][hidden], unit) and w its strength for `layer`'s attention/GDN
-/// (`mlp` false) or MLP writer; both are read on the device at run time, so a
-/// captured graph follows in-place settings updates. Launches nothing when
-/// every span is OFF; an ON span launches even at strength 0. Throws
-/// std::invalid_argument past kQwenAbliterationMaxSpans spans.
+/// In place, per row of an ON span: y -= w * sum_j d_j * dot(d_j, y), with
+/// FP32 reductions of dots taken from the unprojected row. d_j are the
+/// session's direction_count orthonormal rows of `directions`
+/// ([rows][hidden]) and w its strength for `layer`'s attention/GDN (`mlp`
+/// false) or MLP writer; with preserve_norm the row is then rescaled to its
+/// former L2 norm. All of it is read on the device at run time
+/// (models::qwen::AbliterationSettings::DeviceWords), so a captured graph
+/// follows in-place settings updates. One direction without norm
+/// preservation is the single-direction projection, bit for bit. Launches
+/// nothing when every span is OFF; an ON span launches even at strength 0.
+/// Throws std::invalid_argument past kQwenAbliterationMaxSpans spans.
 void LaunchQwenAbliterateRows(float* rows, const float* directions,
                               std::span<const QwenAbliterationSpan> spans,
                               std::uint32_t layer, bool mlp,
@@ -39,9 +43,10 @@ void LaunchQwenAbliterateRows(float* rows, const float* directions,
                               std::uint32_t row_count, std::uint32_t hidden,
                               hipStream_t stream);
 /// The same projection of the post-layer residual rows with each session's
-/// `residual` strength for `layer`: r -= w * d * dot(d, r), so w = 1 leaves
-/// no component along d. Callers launch it only for sessions whose settings
-/// are AbliterationSettings::ResidualActive (null spans otherwise).
+/// `residual` strength for `layer`: r -= w * sum_j d_j * dot(d_j, r), so
+/// w = 1 leaves no component in the subspace (before any norm rescale). Callers
+/// launch it only for sessions whose settings are
+/// AbliterationSettings::ResidualActive (null spans otherwise).
 void LaunchQwenAbliterateResidualRows(
     float* rows, const float* directions,
     std::span<const QwenAbliterationSpan> spans, std::uint32_t layer,

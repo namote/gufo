@@ -13,7 +13,8 @@ what differs for the dense Qwen3.8-27B (`qwen35`, GGUF or native EXL3 pack).
   model-bound profile, its cache identity and the continuation record. Flash-Next
   binds the same code to its own placement. It has no HIP dependency.
 - `QwenGpuModel` loads one profile once and keeps all its directions on the
-  GPU (64 x 5120 floats, 1.25 MiB, for a v2 profile). Each session
+  GPU (64 x 5120 floats, 1.25 MiB, for a rank-1 v2 profile; 20 MiB at rank 8
+  with both direction kinds). Each session
   (`QwenGpuExecutor`) owns its effective settings (OFF, or a direction layer
   and per-layer strengths) and, from its first ON request, a device copy of
   them (1 + 3 x 64 = 193 words); there is no server-global mutable toggle.
@@ -57,9 +58,10 @@ what differs for the dense Qwen3.8-27B (`qwen35`, GGUF or native EXL3 pack).
   synchronization), which the decode graph reads when it runs, so no key
   carries their values. Unlike Flash-Next, the 27B session reset itself drops
   the captured decode graph (as for every reset), so the next decode records
-  it once again. The settings identity (SHA-256, `gufo-abliteration-settings-v2`,
-  over the profile identity, the direction layer and the exact float bytes of
-  every attention, MLP and residual strength, -0 folded into +0)
+  it once again. The settings identity (SHA-256, `gufo-abliteration-settings-v3`,
+  over the profile identity, the direction layer, the exact float bytes of
+  every attention, MLP and residual strength, -0 folded into +0, the direction
+  kind, the direction count and norm preservation)
   salts the text and every image-prefix cache identity, so ON/OFF or different
   settings never share a state. Continuation metadata records the mode in four
   bytes every earlier capture zero-filled, and ON salts the image identity
@@ -67,8 +69,16 @@ what differs for the dense Qwen3.8-27B (`qwen35`, GGUF or native EXL3 pack).
   the earlier bytes and allocates, uploads or launches nothing new, so
   existing caches remain valid.
 
-The GPU operation is `y -= strength * direction * dot(direction, y)` with an
-FP32 reduction and unit direction, on a writer output or on the residual.
+The GPU operation is `y -= strength * sum_j d_j * dot(d_j, y)` over the
+session's k orthonormal directions (k = 1 by default) with FP32 reductions,
+optionally followed by rescaling the row to its former norm, on a writer
+output or on the residual. Direction kinds (`mean_diff`, `projected`),
+subspaces (`directions`) and norm preservation (`preserve_norm`) are those of
+[Flash-Next](../qwen3.8-flash-next/ABLITERATION.md#direction-kinds-subspaces-and-norm-preservation),
+shared code included; one direction without norm preservation is
+bit-identical to the single-direction kernel. The kind, count and norm flag
+live in word 0 of the session's device settings, so changing them re-records
+nothing.
 
 ### Writer or residual strengths
 
@@ -94,7 +104,11 @@ per-layer `attention` (attention and GDN layers alike), `mlp` and optional
 `residual` strengths in [0, 4]. A profile without `residual` (every profile
 written before it existed) reads it as all zero and behaves as before; v1
 profiles cannot carry it. `prepare.py` writes it as compact JSON of float32 round-trip values,
-about 4.5 MB; the loader accepts files up to 16 MiB. The schema and its v1
+about 4.5 MB at rank 1; the optional `rank`, `subspace_directions`,
+`projected_directions`, `direction_kind`, `direction_count`, `preserve_norm`
+and `subspace_method` members (base64 float32 rows) bring a rank-4 profile
+with both kinds to about 17 MB and a rank-8 one to about 31 MB; the loader
+accepts files up to 48 MiB. The schema and its v1
 compatibility (one fixed `direction`) are those of
 [Flash-Next](../qwen3.8-flash-next/ABLITERATION.md#profile-and-api).
 Flash-Next profiles (`writer-before-hc`) and profiles of another artifact are
@@ -123,8 +137,15 @@ settings exactly as for Flash-Next (Chat Completions, Responses, Messages):
                   "mlp": 0, "residual": 1}}
 ```
 
+```json
+{"abliteration": {"enabled": true, "direction_layer": 40, "residual": 1,
+                  "direction_kind": "projected", "directions": 4,
+                  "preserve_norm": true}}
+```
+
 `tools/qwen38_flash_next/abliteration/search.py` searches settings over HTTP
-for either model (by default the residual curve, `--mode residual`); see
+for either model (by default the residual curve, `--mode residual`, plus the
+direction kind, count and norm preservation axes the profile offers); see
 [Flash-Next](../qwen3.8-flash-next/ABLITERATION.md#automatic-strength-search).
 
 ## Prepare once, retain receipts
@@ -143,7 +164,7 @@ PREP=tools/qwen38_flash_next/abliteration/prepare.py
 MODEL=/models/q27   # the EXL3 5.00bpw pack directory
 python3 $PREP import-data --archive KYOJIN.tar.gz --output DATA
 $COLLECT $MODEL DATA/collection.jsonl CAPTURE collect
-python3 $PREP fit --collection CAPTURE --output CANDIDATES
+python3 $PREP fit --collection CAPTURE --output CANDIDATES --rank 4 --method pca
 $COLLECT $MODEL DATA/tuning.jsonl OFF evaluate --max-new-tokens 1024
 $COLLECT $MODEL DATA/tuning.jsonl ON-L38-S1 evaluate --max-new-tokens 1024 \
   --profile CANDIDATES/layer38-strength1.json
@@ -154,7 +175,10 @@ python3 $PREP make-profile --fit CANDIDATES --direction-layer 38 \
 ```
 
 `fit` also writes `layerL-residual1.json` per screened layer: residual 1 on
-every layer, writers 0.
+every layer, writers 0. Its candidates default to the projected kind, one
+direction and no norm preservation; `make-profile --direction-kind
+--directions --preserve-norm` changes those defaults. With 616 refusal
+prompts `fit` holds about 0.8 GB of refusal activations.
 
 The collector applies a profile's defaults; per-request settings are a
 server feature.
@@ -171,7 +195,9 @@ incomplete answer is inconclusive) are those of the Flash-Next workflow.
 CPU: `qwen27b_abliteration_test` (profile binding, placement, v1 and v2
 loading, optional residual strengths, settings resolution and identities
 recomputed from their documented layout, device-word layout, OFF metadata
-bytes, mode and settings mismatch), `openai_chat_test`, `http_server_test`,
+bytes, mode and settings mismatch; the direction members, their
+validation, kind/count/norm overrides and identities, and unchanged rank-1
+behavior), `openai_chat_test`, `http_server_test`,
 `python3 tools/qwen38_flash_next/abliteration/test_prepare.py` and
 `test_search.py`.
 GPU: `qwen27b_abliteration_ops_test` covers an independent FP64 formula,
@@ -180,7 +206,10 @@ in-place settings updates under a captured graph and the writer-then-residual
 order; and for the residual projection the FP64 formula with mixed sessions,
 zero-strength rows left bit-identical, graph replay with in-place updates, and
 the writer, add, residual-projection order removing a component the incoming
-residual carried. Run it
+residual carried; the subspace projection with k in {1, 2, 5, 8} against
+FP64 for writer and residual rows with mixed sessions and norm preservation,
+one direction bit-identical to the single-direction kernel, and graph replay
+with in-place count and norm updates. Run it
 with the final combined GPU checks: OFF preservation, ON/OFF C2, graph replay,
 batched decode, DFlash2 verification, text/image continuation, cache
 reload/fork and per-request timings.

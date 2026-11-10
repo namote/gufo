@@ -1,6 +1,7 @@
 """CPU contracts of search.py: KL approximation, Pareto front, refusal
 heuristic, request shapes and a resumable search against an injected client
 and a local HTTP server. Standard library only."""
+import base64
 import hashlib
 import http.server
 import importlib.util
@@ -8,6 +9,7 @@ import io
 import json
 import math
 from pathlib import Path
+import struct
 import tempfile
 import threading
 import unittest
@@ -364,6 +366,171 @@ class SearchRunTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, self.assertRaises(SystemExit):
             self.run_search(Path(tmp), client, 1)
 
+
+
+def encode(values):
+    """Base64 little-endian float32, as prepare.py stores subspace rows."""
+    return base64.b64encode(struct.pack(f'<{len(values)}f', *values)).decode()
+
+
+class SubspaceClient(FakeClient):
+    """A server whose profile stores both kinds at rank 2; norm preservation
+    and a second direction lower refusals in this toy model."""
+
+    def props(self):
+        info = super().props()
+        info['abliteration'].update(direction_kinds=['mean_diff', 'projected'],
+                                    direction_kind='projected', max_directions=2,
+                                    directions=1, preserve_norm=False,
+                                    subspace_method='pca')
+        return info
+
+    @staticmethod
+    def strength(body):
+        a = body['abliteration']
+        bonus = (a.get('directions', 1) - 1) + (2 if a.get('preserve_norm') else 0)
+        return FakeClient.strength(body) + (bonus if a['enabled'] else 0)
+
+
+class ProjectionAxesTest(unittest.TestCase):
+    def test_axes_from_props(self):
+        legacy = FakeClient().props()['abliteration']
+        self.assertIsNone(search.projection_axes(legacy))
+        self.assertIsNone(search.projection_axes(legacy, ['mean_diff'], 1, 'off'))
+        for kwargs in (dict(kinds=['projected']), dict(max_directions=2),
+                       dict(preserve='on')):
+            with self.assertRaises(SystemExit):
+                search.projection_axes(legacy, **kwargs)
+        info = SubspaceClient().props()['abliteration']
+        self.assertEqual(search.projection_axes(info), dict(
+            kinds=['mean_diff', 'projected'], max_directions=2,
+            preserve_norm=[False, True]))
+        self.assertEqual(search.projection_axes(info, ['projected'], 1, 'on'), dict(
+            kinds=['projected'], max_directions=1, preserve_norm=[True]))
+        for kwargs in (dict(kinds=['pca']), dict(kinds=[]), dict(max_directions=3),
+                       dict(max_directions=0)):
+            with self.assertRaises(SystemExit):
+                search.projection_axes(info, **kwargs)
+
+    def test_bounds_settings_and_proposals(self):
+        info = SubspaceClient().props()['abliteration']
+        axes = search.projection_axes(info)
+        for mode in search.MODES:
+            box = search.bounds(LAYERS, [0, 3], 4.0, mode, axes)
+            self.assertEqual(box['direction_kind'], (-0.5, 1.5))
+            self.assertEqual(box['directions'], (0.5, 2.5))
+            self.assertEqual(box['preserve_norm'], (-0.5, 1.5))
+            history = [dict(trial=0, params=None, refusals=5, kl=0.0)]
+            for i in range(1, 25):
+                params = search.propose(i, history, box, 6, 25, seed=2)
+                self.assertEqual(params, search.propose(i, history, box, 6, 25, seed=2))
+                for key in ('direction_kind', 'directions', 'preserve_norm'):
+                    self.assertIsInstance(params[key], int)
+                    low, high = box[key]
+                    self.assertTrue(math.ceil(low) <= params[key] <= math.floor(high))
+                values = search.settings(params, LAYERS, mode, axes)
+                self.assertIn(values['direction_kind'], ('mean_diff', 'projected'))
+                self.assertIn(values['directions'], (1, 2))
+                self.assertIsInstance(values['preserve_norm'], bool)
+                history.append(dict(trial=i, params=params, refusals=i % 3, kl=1 / i))
+        # Fixed options are sent, not searched.
+        fixed = search.projection_axes(info, ['mean_diff'], 1, 'on')
+        box = search.bounds(LAYERS, [0, 3], 4.0, 'residual', fixed)
+        self.assertFalse({'direction_kind', 'directions', 'preserve_norm'} & set(box))
+        values = search.settings(search.sample(box, search.random.Random(0)), LAYERS,
+                                 'residual', fixed)
+        self.assertEqual((values['direction_kind'], values['directions'],
+                          values['preserve_norm']), ('mean_diff', 1, True))
+        # Without axes nothing new is sent.
+        plain = search.settings(search.sample(box, search.random.Random(0)), LAYERS,
+                                'residual')
+        self.assertFalse({'direction_kind', 'directions', 'preserve_norm'} & set(plain))
+
+    def test_integer_axes_sample_uniformly(self):
+        axes = dict(kinds=['mean_diff'], max_directions=4, preserve_norm=[False])
+        box = search.bounds(LAYERS, [0, 3], 4.0, 'residual', axes)
+        rng = search.random.Random(4)
+        counts = [0] * 5
+        for _ in range(4000):
+            counts[search.sample(box, rng)['directions']] += 1
+        self.assertEqual(counts[0], 0)
+        for k in range(1, 5):
+            self.assertTrue(850 < counts[k] < 1150, counts)
+
+    def test_fingerprints(self):
+        prompts = {'refusal': [dict(id='r', text='x', thinking=False)],
+                   'ordinary': [dict(id='o', text='y', thinking=False)]}
+        info = SubspaceClient().props()['abliteration']
+
+        def fingerprint(axes, mode='writer'):
+            return search.Search(SubspaceClient(), 'gufo', prompts, info, 'log.jsonl', 8,
+                                 out=io.StringIO(), mode=mode, axes=axes).fingerprint
+
+        legacy = search.projection_axes(info, ['mean_diff'], 1, 'off')
+        self.assertEqual(fingerprint(legacy), fingerprint(None))
+        self.assertEqual(fingerprint(legacy, 'residual'), fingerprint(None, 'residual'))
+        others = [search.projection_axes(info),
+                  search.projection_axes(info, ['projected'], 1, 'off'),
+                  search.projection_axes(info, ['mean_diff'], 2, 'off'),
+                  search.projection_axes(info, ['mean_diff'], 1, 'on')]
+        prints = {fingerprint(a) for a in others}
+        self.assertEqual(len(prints), 4)
+        self.assertNotIn(fingerprint(None), prints)
+
+    def test_search_over_projection_options(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / 'base.json'
+            search.prepare.save_profile(base, dict(
+                schema='gufo-abliteration-v2', model_identity='m', hidden=2,
+                layers=LAYERS, placement='writer-before-residual',
+                directions=[[0.0, 1.0]] * LAYERS, direction_layer=2,
+                attention=[1.0] * LAYERS, mlp=[0, 0.5, 0, 0], rank=2,
+                subspace_directions=[encode([1.0, 0.0])] * LAYERS,
+                projected_directions=[encode([1.0, 0.0, 0.0, 1.0])] * LAYERS,
+                subspace_method='pca', direction_kind='projected'))
+            client = SubspaceClient()
+            client.IDENTITY = hashlib.sha256(base.read_bytes()).hexdigest()
+            output = root / 'chosen.json'
+            out = io.StringIO()
+            chosen = search.main(['--data', str(data_file(root)), '--log',
+                                  str(root / 'log' / 'trials.jsonl'), '--trials', '8',
+                                  '--initial', '4', '--refusal-prompts', '3',
+                                  '--ordinary-prompts', '2', '--kl-budget', '10',
+                                  '--base-profile', str(base), '--output', str(output)],
+                                 client=client, out=out)
+            on = [r['abliteration'] for r in client.requests if r['abliteration']['enabled']]
+            self.assertEqual(set(on[0]), {'enabled', 'profile'})  # trial 0: defaults
+            for request in on[5:]:
+                self.assertIn(request['direction_kind'], ('mean_diff', 'projected'))
+                self.assertIn(request['directions'], (1, 2))
+                self.assertIsInstance(request['preserve_norm'], bool)
+            records = [json.loads(l) for l in
+                       (root / 'log' / 'trials.jsonl').read_text().splitlines()]
+            self.assertEqual(records[0]['type'], 'header')
+            self.assertTrue(all({'direction_kind', 'directions', 'preserve_norm'} <=
+                                set(r['params']) for r in records[2:]))
+            profile = json.loads(output.read_text())
+            expected = chosen['settings']
+            self.assertEqual(profile['direction_kind'],
+                             expected.get('direction_kind', 'projected'))
+            self.assertEqual(profile['direction_count'], expected.get('directions', 1))
+            self.assertEqual(profile['preserve_norm'], expected.get('preserve_norm', False))
+            # The stored rows pass through unchanged.
+            self.assertEqual(profile['subspace_directions'], [encode([1.0, 0.0])] * LAYERS)
+            self.assertEqual(profile['rank'], 2)
+            self.assertIn('k=', out.getvalue())
+            # Without a base profile the command carries the options.
+            (root / 'log').rename(root / 'log-old')
+            out = io.StringIO()
+            search.main(['--data', str(data_file(root)), '--log',
+                         str(root / 'log' / 'trials.jsonl'), '--trials', '3',
+                         '--initial', '2', '--refusal-prompts', '3',
+                         '--ordinary-prompts', '2', '--kl-budget', '10',
+                         '--preserve-norm', 'on', '--max-directions', '1'],
+                        client=SubspaceClient(), out=out)
+            self.assertIn('--direction-kind ', out.getvalue())
+            self.assertIn('--preserve-norm ', out.getvalue())
 
 class HttpClientTest(unittest.TestCase):
     def test_round_trip_and_errors(self):

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstddef>
 #include <fstream>
 #include <iterator>
 #include <stdexcept>
@@ -41,13 +42,175 @@ void RequireUnit(std::span<const float> direction, const char* name) {
                                 " must have unit norm");
 }
 
+// Standard base64 (exact length, padding only at the end) of little-endian
+// float32 values; unused low bits of a padded group are ignored.
+std::vector<float> DecodeFloats(const json::Value& value,
+                                const std::string& name, std::size_t count) {
+  constexpr std::string_view kAlphabet =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  if (!value.is_string())
+    Invalid(name);
+  const std::string_view text = value.str();
+  const std::size_t bytes = count * sizeof(float);
+  if (text.size() != (bytes + 2) / 3 * 4)
+    Invalid(name);
+  std::vector<std::uint8_t> raw;
+  raw.reserve(text.size() / 4 * 3);
+  for (std::size_t i = 0; i < text.size(); i += 4) {
+    std::uint32_t group = 0;
+    std::size_t padding = 0;
+    for (std::size_t j = 0; j < 4; ++j) {
+      const char c = text[i + j];
+      if (c == '=' && i + 4 == text.size() && j >= 2) {
+        ++padding;
+        group <<= 6;
+        continue;
+      }
+      const auto digit = kAlphabet.find(c);
+      if (digit == std::string_view::npos || padding)
+        Invalid(name);
+      group = group << 6 | static_cast<std::uint32_t>(digit);
+    }
+    for (std::size_t j = 0; j < 3 - padding; ++j)
+      raw.push_back(static_cast<std::uint8_t>(group >> (16 - 8 * j)));
+  }
+  if (raw.size() != bytes)
+    Invalid(name);
+  std::vector<float> result(count);
+  for (std::size_t i = 0; i < count; ++i) {
+    std::uint32_t bits = 0;
+    for (std::size_t b = 0; b < 4; ++b)
+      bits |= std::uint32_t{raw[i * 4 + b]} << (8 * b);
+    result[i] = std::bit_cast<float>(bits);
+    if (!std::isfinite(result[i]) || std::abs(result[i]) > 1)
+      Invalid(name);
+  }
+  return result;
+}
+
+// Consecutive rows of `hidden` floats must be orthonormal: the subspace
+// projection removes sum_j d_j dot(d_j, y) in one pass.
+void RequireOrthonormal(std::span<const float> block, std::size_t hidden,
+                        const std::string& name) {
+  const std::size_t rows = block.size() / hidden;
+  for (std::size_t a = 0; a < rows; ++a) {
+    RequireUnit(block.subspan(a * hidden, hidden), name.c_str());
+    for (std::size_t b = 0; b < a; ++b) {
+      double dot = 0;
+      for (std::size_t i = 0; i < hidden; ++i)
+        dot += double{block[a * hidden + i]} * block[b * hidden + i];
+      if (std::abs(dot) > 1e-4)
+        throw std::invalid_argument("abliteration: " + name +
+                                    " must be orthonormal");
+    }
+  }
+}
+
+// A JSON integer in [low, high].
+std::uint32_t ReadCount(const json::Value* value, const char* name,
+                        std::uint32_t low, std::uint32_t high) {
+  if (!value || !value->is_number() || !(value->as_double() >= low) ||
+      value->as_double() > high ||
+      value->as_double() != std::floor(value->as_double()))
+    Invalid(name);
+  return static_cast<std::uint32_t>(value->as_double());
+}
+
 void AppendU32(crypto::Sha256Hasher& hash, std::uint32_t value) {
   std::array<std::uint8_t, 4> bytes{};
   for (std::size_t i = 0; i < bytes.size(); ++i)
     bytes[i] = static_cast<std::uint8_t>(value >> (8 * i));
   hash.Update(bytes);
 }
+// The optional subspace members of a v2 profile; `result` holds the rank-1
+// mean-difference rows on entry and the complete row layout on return.
+void LoadSubspace(const json::Value& root, AbliterationProfile* result) {
+  const auto hidden = std::size_t{result->hidden};
+  const auto layers = result->layers;
+  if (const auto* rank = root.find("rank"))
+    result->rank = ReadCount(rank, "rank", 1, kAbliterationMaxDirections);
+  const auto rank = result->rank;
+  const std::vector<float> first = std::move(result->directions);
+  result->directions.assign(std::size_t{layers} * rank * hidden, 0.0F);
+  const auto* subspace = root.find("subspace_directions");
+  if ((rank > 1) != (subspace != nullptr) ||
+      (subspace && (!subspace->is_array() || subspace->size() != layers)))
+    Invalid("subspace_directions (one string per layer, only when rank > 1)");
+  for (std::uint32_t layer = 0; layer < layers; ++layer) {
+    float* block =
+        result->directions.data() + std::size_t{layer} * rank * hidden;
+    std::copy_n(first.begin() + static_cast<std::ptrdiff_t>(layer * hidden),
+                hidden, block);
+    const std::string name =
+        "subspace_directions[" + std::to_string(layer) + "]";
+    if (rank > 1) {
+      const auto rest =
+          DecodeFloats(subspace->items()[layer], name, (rank - 1) * hidden);
+      std::ranges::copy(rest, block + hidden);
+      RequireOrthonormal(std::span<const float>(block, rank * hidden), hidden,
+                         name);
+    }
+  }
+  if (const auto* projected = root.find("projected_directions")) {
+    if (!projected->is_array() || projected->size() != layers)
+      Invalid("projected_directions");
+    result->kinds = 2;
+    result->directions.reserve(result->directions.size() * 2);
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+      const std::string name =
+          "projected_directions[" + std::to_string(layer) + "]";
+      const auto block =
+          DecodeFloats(projected->items()[layer], name, rank * hidden);
+      RequireOrthonormal(block, hidden, name);
+      result->directions.insert(result->directions.end(), block.begin(),
+                                block.end());
+    }
+  }
+  if (const auto* kind = root.find("direction_kind")) {
+    const auto parsed = kind->is_string()
+                            ? ParseAbliterationDirectionKind(kind->str())
+                            : std::nullopt;
+    if (!parsed || !result->has_kind(*parsed))
+      Invalid(
+          "direction_kind (mean_diff, or projected with "
+          "projected_directions)");
+    result->direction_kind = *parsed;
+  }
+  if (const auto* count = root.find("direction_count"))
+    result->direction_count = ReadCount(count, "direction_count", 1, rank);
+  if (const auto* preserve = root.find("preserve_norm")) {
+    if (!preserve->is_bool())
+      Invalid("preserve_norm");
+    result->preserve_norm = preserve->as_bool();
+  }
+  if (const auto* method = root.find("subspace_method")) {
+    if (!method->is_string() ||
+        (method->str() != "pca" && method->str() != "som"))
+      Invalid("subspace_method");
+    result->subspace_method = method->str();
+  }
+}
+
+constexpr std::array<std::string_view, 7> kSubspaceMembers{
+    "rank",           "subspace_directions", "projected_directions",
+    "direction_kind", "direction_count",     "preserve_norm",
+    "subspace_method"};
 }  // namespace
+
+std::string_view AbliterationDirectionKindName(
+    AbliterationDirectionKind kind) noexcept {
+  return kind == AbliterationDirectionKind::kProjected ? "projected"
+                                                       : "mean_diff";
+}
+
+std::optional<AbliterationDirectionKind> ParseAbliterationDirectionKind(
+    std::string_view name) noexcept {
+  if (name == "mean_diff")
+    return AbliterationDirectionKind::kMeanDiff;
+  if (name == "projected")
+    return AbliterationDirectionKind::kProjected;
+  return std::nullopt;
+}
 
 AbliterationProfile AbliterationProfile::Load(const std::filesystem::path& path,
                                               std::uint32_t hidden,
@@ -61,7 +224,7 @@ AbliterationProfile AbliterationProfile::Load(const std::filesystem::path& path,
   file.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
   bytes.resize(static_cast<std::size_t>(file.gcount()));
   if (bytes.size() > kAbliterationMaxProfileBytes)
-    throw std::invalid_argument("abliteration: profile exceeds 16 MiB");
+    throw std::invalid_argument("abliteration: profile exceeds 48 MiB");
   const auto root = json::parse(bytes);
   const auto schema = root.member_str("schema");
   if ((schema != kAbliterationSchemaV1 && schema != kAbliterationSchemaV2) ||
@@ -87,9 +250,12 @@ AbliterationProfile AbliterationProfile::Load(const std::filesystem::path& path,
                  kAbliterationMaxWeight, false, &result.attention);
     AppendVector(root.find("mlp"), "mlp", layers, kAbliterationMaxWeight, false,
                  &result.mlp);
-    // Residual strengths are a v2 member only.
+    // Residual strengths and the subspace members are v2 only.
     if (root.find("residual"))
       Invalid("residual (needs gufo-abliteration-v2)");
+    for (const auto member : kSubspaceMembers)
+      if (root.find(std::string(member)))
+        Invalid(std::string(member) + " (needs gufo-abliteration-v2)");
     result.residual.assign(layers, 0.0F);
   } else {
     result.schema = 2;
@@ -122,6 +288,9 @@ AbliterationProfile AbliterationProfile::Load(const std::filesystem::path& path,
                    &result.residual);
     else
       result.residual.assign(layers, 0.0F);
+    // Optional: without them, rank 1, mean difference, no norm preservation,
+    // and `directions` keeps exactly its rows.
+    LoadSubspace(root, &result);
   }
   result.identity = crypto::Sha256Hex(std::span(
       reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()));
@@ -132,8 +301,13 @@ std::vector<float> AbliterationSettings::DeviceWords() const {
   if (attention.size() != mlp.size() || attention.size() != residual.size())
     throw std::logic_error("abliteration settings are inconsistent");
   const auto layers = static_cast<std::uint32_t>(attention.size());
+  if (direction_row > kAbliterationRowMask || direction_count == 0 ||
+      direction_count > kAbliterationMaxDirections)
+    throw std::logic_error("abliteration settings are inconsistent");
   std::vector<float> words(AbliterationDeviceWords(layers));
-  words[0] = std::bit_cast<float>(direction_row);
+  words[0] = std::bit_cast<float>(
+      direction_row | (direction_count - 1) << kAbliterationCountShift |
+      (preserve_norm ? kAbliterationPreserveNormBit : 0U));
   using enum AbliterationPoint;
   for (std::uint32_t layer = 0; layer < layers; ++layer) {
     words[AbliterationWeightIndex(layers, layer, kAttention)] =
@@ -166,10 +340,24 @@ std::shared_ptr<const AbliterationSettings> ResolveAbliterationSettings(
   } else {
     result->direction_layer = profile.direction_layer;
   }
-  // v2 rows are indexed by layer; v1 has its one row.
-  result->direction_row = result->direction_layer.value_or(0);
-  if (result->direction_row >= profile.direction_rows())
-    throw std::logic_error("abliteration direction row out of range");
+  result->direction_kind =
+      overrides.direction_kind.value_or(profile.direction_kind);
+  if (!profile.has_kind(result->direction_kind))
+    throw std::invalid_argument(
+        "abliteration: the loaded profile has no '" +
+        std::string(AbliterationDirectionKindName(result->direction_kind)) +
+        "' directions");
+  result->direction_count =
+      overrides.direction_count.value_or(profile.direction_count);
+  if (result->direction_count < 1 || result->direction_count > profile.rank)
+    throw std::invalid_argument(
+        "abliteration: 'directions' must be an integer in [1, " +
+        std::to_string(profile.rank) + "]");
+  result->preserve_norm =
+      overrides.preserve_norm.value_or(profile.preserve_norm);
+  // v2 rows are indexed by kind, layer and rank; v1 has its one row.
+  result->direction_row = profile.DirectionRow(
+      result->direction_kind, result->direction_layer.value_or(0));
   const auto strengths = [&](const std::vector<float>& requested,
                              const std::vector<float>& defaults,
                              const char* name) {
@@ -196,10 +384,13 @@ std::shared_ptr<const AbliterationSettings> ResolveAbliterationSettings(
   result->mlp = strengths(overrides.mlp, profile.mlp, "mlp");
   result->residual =
       strengths(overrides.residual, profile.residual, "residual");
+  if (!AbliterationSettingsFit(profile, *result))
+    throw std::logic_error("abliteration direction row out of range");
   crypto::Sha256Hasher hash;
-  // v2: the residual strengths follow the writer strengths.
+  // v2: the residual strengths follow the writer strengths. v3: then the
+  // direction kind, the direction count and norm preservation.
   const std::string prefix =
-      "gufo-abliteration-settings-v2:" + profile.identity + ":";
+      "gufo-abliteration-settings-v3:" + profile.identity + ":";
   hash.Update(std::span(reinterpret_cast<const std::uint8_t*>(prefix.data()),
                         prefix.size()));
   AppendU32(hash, result->direction_layer.value_or(0xFFFFFFFFU));
@@ -208,8 +399,23 @@ std::shared_ptr<const AbliterationSettings> ResolveAbliterationSettings(
        {&result->attention, &result->mlp, &result->residual})
     for (float x : *values)
       AppendU32(hash, std::bit_cast<std::uint32_t>(x));
+  AppendU32(hash, static_cast<std::uint32_t>(result->direction_kind));
+  AppendU32(hash, result->direction_count);
+  AppendU32(hash, result->preserve_norm ? 1U : 0U);
   result->identity = hash.FinishHex();
   return result;
+}
+
+bool AbliterationSettingsFit(const AbliterationProfile& profile,
+                             const AbliterationSettings& settings) noexcept {
+  return settings.attention.size() == profile.layers &&
+         settings.mlp.size() == profile.layers &&
+         settings.residual.size() == profile.layers &&
+         settings.direction_count >= 1 &&
+         settings.direction_count <= profile.rank &&
+         settings.direction_row <= kAbliterationRowMask &&
+         std::size_t{settings.direction_row} + settings.direction_count <=
+             profile.direction_rows();
 }
 
 std::vector<std::uint8_t> AbliterationInputIdentity(

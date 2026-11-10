@@ -94,6 +94,12 @@ std::optional<AbliterationInfo> DescribeAbliteration(
     const models::qwen::AbliterationProfile* profile) {
   if (profile == nullptr)
     return std::nullopt;
+  using models::qwen::AbliterationDirectionKind;
+  std::vector<std::string> kinds;
+  for (const auto kind : {AbliterationDirectionKind::kMeanDiff,
+                          AbliterationDirectionKind::kProjected})
+    if (profile->has_kind(kind))
+      kinds.emplace_back(models::qwen::AbliterationDirectionKindName(kind));
   return AbliterationInfo{
       .schema = std::string(profile->schema == 2
                                 ? models::qwen::kAbliterationSchemaV2
@@ -104,6 +110,13 @@ std::optional<AbliterationInfo> DescribeAbliteration(
       .attention = profile->attention,
       .mlp = profile->mlp,
       .residual = profile->residual,
+      .direction_kinds = std::move(kinds),
+      .rank = profile->rank,
+      .direction_kind = std::string(
+          models::qwen::AbliterationDirectionKindName(profile->direction_kind)),
+      .direction_count = profile->direction_count,
+      .preserve_norm = profile->preserve_norm,
+      .subspace_method = profile->subspace_method,
   };
 }
 

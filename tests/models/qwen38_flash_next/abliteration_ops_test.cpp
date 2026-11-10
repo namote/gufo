@@ -6,12 +6,14 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <random>
 #include <stdexcept>
 #include <vector>
 
 #include "src/models/qwen/abliteration.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/runtime/executor.hpp"
+#include "tests/models/qwen/support/abliteration_subspace.hpp"
 namespace q = gufo::models::qwen38_flash_next::rocm;
 void Check(hipError_t x) {
   if (x != hipSuccess)
@@ -230,6 +232,125 @@ void ResidualStreams() {
   }
 }
 
+namespace sub = gufo::tests::qwen_abliteration;
+
+// Subspace projection of the HC residual and the writer rows: each of the
+// four streams of a token is its own row (projected and, with norm
+// preservation, rescaled to its own norm), sessions mix their first row,
+// count, norm preservation and strength, and one direction without norm
+// preservation is the D16 kernel bit for bit.
+void SubspaceStreams() {
+  constexpr unsigned kStreams = 4, kRank = 8;
+  std::mt19937 rng(38);
+  for (unsigned hidden : {13u, 257u, 2560u})
+    for (unsigned k : {1u, 2u, 5u, 8u}) {
+      // Two rank-8 blocks; sessions start at row 0 or 8.
+      auto directions = sub::OrthonormalRows(kRank, hidden, rng);
+      const auto second = sub::OrthonormalRows(kRank, hidden, rng);
+      directions.insert(directions.end(), second.begin(), second.end());
+      struct Token {
+        unsigned first, count;
+        double weight;
+        bool preserve;
+      };
+      const unsigned other_k = k == kRank ? 2 : k + 1;
+      // Two tokens of session A, one OFF, two of session B, one of a
+      // zero-strength session with norm preservation, one past every span.
+      const std::vector<Token> tokens{
+          {8, k, 1, false},       {8, k, 1, false},       {0, 1, 0, false},
+          {0, other_k, .5, true}, {0, other_k, .5, true}, {8, k, 0, true},
+          {0, 1, 0, false}};
+      // Two layers; layer 1's residual strength (word 6), writer strengths
+      // that must not apply.
+      const auto words = [](unsigned row, unsigned count, bool preserve,
+                            float residual) {
+        return std::vector<float>{
+            sub::Word0(row, count, preserve), 5, 5, 6, 6, 9, residual};
+      };
+      float* a = Upload(words(8, k, false, 1));
+      float* b = Upload(words(0, other_k, true, .5f));
+      float* c = Upload(words(8, k, true, 0));
+      const std::array<q::AbliterationSpan, 4> spans{
+          {{2, a}, {3, nullptr}, {5, b}, {6, c}}};
+      std::normal_distribution<float> normal(0.f, 2.f);
+      std::vector<float> input(tokens.size() * kStreams * hidden);
+      for (auto& x : input)
+        x = normal(rng);
+      float* res = Upload(input);
+      float* d = Upload(directions);
+      q::AbliterateResidualBatchRows(res, d, spans, 1, 2, tokens.size(), hidden,
+                                     kStreams, nullptr);
+      Check(hipDeviceSynchronize());
+      std::vector<float> output(input.size());
+      Check(hipMemcpy(output.data(), res, output.size() * sizeof(float),
+                      hipMemcpyDeviceToHost));
+      for (unsigned t = 0; t < tokens.size(); ++t)
+        for (unsigned s = 0; s < kStreams; ++s) {
+          const std::size_t offset = (std::size_t{t} * kStreams + s) * hidden;
+          const float* y = input.data() + offset;
+          const float* got = output.data() + offset;
+          if (tokens[t].weight == 0) {
+            if (!std::equal(got, got + hidden, y))
+              throw std::runtime_error("OFF or zero-strength stream changed");
+            continue;
+          }
+          const auto expected = sub::ReferenceRow(
+              y, directions.data() + std::size_t{tokens[t].first} * hidden,
+              tokens[t].count, tokens[t].weight, tokens[t].preserve, hidden);
+          double before = 0, after = 0;
+          for (unsigned i = 0; i < hidden; ++i) {
+            if (std::abs(got[i] - expected[i]) >
+                5e-5 * (1 + std::abs(expected[i])))
+              throw std::runtime_error("subspace stream differs from FP64");
+            before += double{y[i]} * y[i];
+            after += double{got[i]} * got[i];
+          }
+          if (tokens[t].preserve &&
+              std::abs(std::sqrt(after) - std::sqrt(before)) >
+                  3e-5 * std::sqrt(before))
+            throw std::runtime_error("stream norm not preserved");
+        }
+      // One direction, no norm preservation: bit-identical to D16 for the
+      // residual streams and the writer rows.
+      float* single = Upload(words(8, 1, false, 1.25f));
+      if (std::bit_cast<std::uint32_t>(words(8, 1, false, 1)[0]) != 8)
+        throw std::runtime_error("single-direction word 0 is not the row");
+      const unsigned rows = 3 * kStreams;
+      const std::vector<float> slice(
+          input.begin(), input.begin() + std::size_t{rows} * hidden);
+      for (const bool residual : {true, false}) {
+        float* current = Upload(slice);
+        float* reference = Upload(slice);
+        if (residual) {
+          const std::array<q::AbliterationSpan, 1> all{{{3, single}}};
+          q::AbliterateResidualBatchRows(current, d, all, 1, 2, 3, hidden,
+                                         kStreams, nullptr);
+        } else {
+          q::AbliterateRows(current, d, single, 1, false, 2, rows, hidden,
+                            nullptr);
+        }
+        // Word 6 is layer 1's residual strength, word 2 its attention one.
+        sub::D16AbliterateRowsUnbounded<<<rows, 256>>>(
+            reference, d, single, residual ? 6 : 2, hidden);
+        Check(hipGetLastError());
+        Check(hipDeviceSynchronize());
+        std::vector<float> x(slice.size()), y(slice.size());
+        Check(hipMemcpy(x.data(), current, x.size() * sizeof(float),
+                        hipMemcpyDeviceToHost));
+        Check(hipMemcpy(y.data(), reference, y.size() * sizeof(float),
+                        hipMemcpyDeviceToHost));
+        for (std::size_t i = 0; i < x.size(); ++i)
+          if (std::bit_cast<std::uint32_t>(x[i]) !=
+              std::bit_cast<std::uint32_t>(y[i]))
+            throw std::runtime_error("single direction differs from D16");
+        Check(hipFree(current));
+        Check(hipFree(reference));
+      }
+      for (float* p : {a, b, c, res, d, single})
+        Check(hipFree(p));
+    }
+}
+
 int main() {
   for (unsigned hidden : {3u, 255u, 256u, 257u, 2560u}) {
     // Row 1 is the session's direction; row 0 must never be read.
@@ -329,7 +450,8 @@ int main() {
   for (float* p : {y, d, a, b})
     Check(hipFree(p));
   ResidualStreams();
+  SubspaceStreams();
   std::cout << "FP64 formula, deferred HC, mixed rows, tails, OFF "
-               "preservation, in-place graph settings, HC residual streams "
-               "PASS\n";
+               "preservation, in-place graph settings, HC residual streams, "
+               "subspace and norm preservation, D16 bit identity PASS\n";
 }

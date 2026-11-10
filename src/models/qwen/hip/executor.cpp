@@ -183,10 +183,7 @@ void QwenGpuExecutor::ConfigureAbliteration(
   if (settings ? abliteration_ && abliteration_->identity == settings->identity
                : !abliteration_)
     return;
-  if (settings && (settings->attention.size() != profile->layers ||
-                   settings->mlp.size() != profile->layers ||
-                   settings->residual.size() != profile->layers ||
-                   settings->direction_row >= profile->direction_rows()))
+  if (settings && !models::qwen::AbliterationSettingsFit(*profile, *settings))
     throw std::invalid_argument("abliteration settings do not fit the profile");
   // A failed reset is rethrown by the next operation (CheckReset).
   if (!state_reset)

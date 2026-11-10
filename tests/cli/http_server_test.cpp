@@ -596,7 +596,30 @@ void TestLlamaProps() {
   assert(abliteration->find("mlp")->size() == 3);
   assert(abliteration->find("residual")->size() == 3);
   assert(abliteration->find("residual")->items()[1].as_double() == 1.0);
-  assert(!abliteration->contains("directions"));
+  // A profile without subspace members: one kind, rank 1. `directions` is
+  // the default direction count, never vectors.
+  assert(abliteration->find("direction_kinds")->size() == 1);
+  assert(abliteration->member_str("direction_kind") == "mean_diff");
+  assert(abliteration->member_size("max_directions") == 1);
+  assert(abliteration->find("directions")->is_number());
+  assert(abliteration->member_size("directions") == 1);
+  assert(abliteration->find("preserve_norm")->is_bool() &&
+         !abliteration->find("preserve_norm")->as_bool());
+  assert(abliteration->find("subspace_method")->is_null());
+  server.backend->abliteration->direction_kinds = {"mean_diff", "projected"};
+  server.backend->abliteration->direction_kind = "projected";
+  server.backend->abliteration->rank = 4;
+  server.backend->abliteration->direction_count = 2;
+  server.backend->abliteration->preserve_norm = true;
+  server.backend->abliteration->subspace_method = "pca";
+  const auto subspace = props("/props")["abliteration"];
+  assert(subspace.find("direction_kinds")->size() == 2);
+  assert(subspace.find("direction_kinds")->items()[1].str() == "projected");
+  assert(subspace.member_str("direction_kind") == "projected");
+  assert(subspace.member_size("max_directions") == 4);
+  assert(subspace.member_size("directions") == 2);
+  assert(subspace.find("preserve_norm")->as_bool());
+  assert(subspace.member_str("subspace_method") == "pca");
   server.backend->abliteration->direction_layer.reset();
   const auto v1 = props("/props")["abliteration"];
   assert(v1.find("direction_layer")->is_null());

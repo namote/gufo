@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -183,5 +185,38 @@ int main() {
       q::ResolveAbliterationSettings(residual, {.residual = {0}});
   Require(!writer_only->ResidualActive() &&
           writer_only->identity != residual_defaults->identity);
+  // Word 0 of a profile without subspace members is the bare direction row.
+  Require(residual.rank == 1 && residual.kinds == 1 &&
+          std::bit_cast<std::uint32_t>(words[0]) == 1);
+  // Rank 2 with projected directions through this placement (base64
+  // little-endian float32: [1,0,0], [0,0,1]; projected [0,0,1],[1,0,0] and
+  // [1,0,0],[0,1,0]).
+  std::ofstream(path)
+      << R"({"schema":"gufo-abliteration-v2","placement":"writer-before-hc",
+      "model_identity":"fixture","hidden":3,"layers":2,
+      "directions":[[0,1,0],[0.6,0.8,0]],"direction_layer":1,
+      "attention":[0,0],"mlp":[0,0],"residual":[1,1],"rank":2,
+      "subspace_directions":["AACAPwAAAAAAAAAA","AAAAAAAAAAAAAIA/"],
+      "projected_directions":["AAAAAAAAAAAAAIA/AACAPwAAAAAAAAAA",
+      "AACAPwAAAAAAAAAAAAAAAAAAgD8AAAAA"],"subspace_method":"pca",
+      "direction_kind":"projected","direction_count":2,"preserve_norm":true})";
+  const auto subspace = q::AbliterationProfile::Load(path, 3, 2, "fixture");
+  const auto subspace_defaults = q::ResolveAbliterationSettings(subspace);
+  namespace qwen = gufo::models::qwen;
+  Require(subspace.rank == 2 && subspace.kinds == 2 &&
+          subspace.direction_rows() == 8 &&
+          subspace.directions[3 * 3 + 2] == 1 &&
+          subspace.directions[7 * 3 + 1] == 1 &&
+          subspace_defaults->direction_row == 6 &&
+          std::bit_cast<std::uint32_t>(subspace_defaults->DeviceWords()[0]) ==
+              (6U | 1U << qwen::kAbliterationCountShift |
+               qwen::kAbliterationPreserveNormBit));
+  const auto single = q::ResolveAbliterationSettings(
+      subspace, {.direction_kind = qwen::AbliterationDirectionKind::kMeanDiff,
+                 .direction_count = 1,
+                 .preserve_norm = false});
+  Require(single->direction_row == 2 &&
+          std::bit_cast<std::uint32_t>(single->DeviceWords()[0]) == 2 &&
+          single->identity != subspace_defaults->identity);
   std::cout << "profile and cache identity PASS\n";
 }

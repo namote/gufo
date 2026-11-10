@@ -6,21 +6,24 @@
 #include <stdexcept>
 
 #include "src/models/qwen/abliteration.hpp"
+#include "src/models/qwen/hip/kernels/abliteration_row.hpp"
 #include "src/models/qwen/hip/ops/abliteration.hpp"
 
 namespace gufo::hip {
 namespace {
 
-constexpr unsigned kAbliterationThreads = 256;
+constexpr unsigned kAbliterationThreads =
+    models::qwen::hip_detail::kAbliterationRowThreads;
 
 struct RowSettings {
   std::array<QwenAbliterationSpan, kQwenAbliterationMaxSpans> spans;
   unsigned count;
 };
 
-// One block per row: an FP32 dot product with the session's direction, then
-// the projection removed in place. No intermediate tensor. The direction row
-// and strength are read from the session's device settings at run time.
+// One block per row: the session's direction(s) projected out in place
+// (hip_detail::AbliterateRow). No intermediate tensor. The direction rows,
+// count, norm preservation and strength are read from the session's device
+// settings at run time.
 __launch_bounds__(kAbliterationThreads) __global__
     void AbliterateRowsKernel(float* __restrict__ rows,
                               const float* __restrict__ directions,
@@ -34,26 +37,9 @@ __launch_bounds__(kAbliterationThreads) __global__
     }
   if (settings == nullptr)
     return;
-  const float weight = settings[weight_index];
-  if (weight == 0)
-    return;
-  const float* direction =
-      directions + std::size_t{__float_as_uint(settings[0])} * hidden;
-  __shared__ float partial[kAbliterationThreads];
-  float* row = rows + std::size_t{blockIdx.x} * hidden;
-  float sum = 0;
-  for (std::uint32_t i = threadIdx.x; i < hidden; i += blockDim.x)
-    sum += row[i] * direction[i];
-  partial[threadIdx.x] = sum;
-  __syncthreads();
-  for (unsigned step = kAbliterationThreads / 2; step; step >>= 1) {
-    if (threadIdx.x < step)
-      partial[threadIdx.x] += partial[threadIdx.x + step];
-    __syncthreads();
-  }
-  const float amount = weight * partial[0];
-  for (std::uint32_t i = threadIdx.x; i < hidden; i += blockDim.x)
-    row[i] -= amount * direction[i];
+  models::qwen::hip_detail::AbliterateRow(
+      rows + std::size_t{blockIdx.x} * hidden, directions, settings,
+      weight_index, hidden);
 }
 
 void Launch(float* rows, const float* directions,

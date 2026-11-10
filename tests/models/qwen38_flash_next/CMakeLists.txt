@@ -44,7 +44,10 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/tools/qwen38_flash_next/abliteration/collect.cpp)
   target_link_libraries(qwen38_flash_next_abliteration_collect PRIVATE gufo_qwen38_flash_next)
   add_qwen38_flash_next_test(abliteration_ops gufo_qwen38_flash_next "hip;gpu")
-  set_source_files_properties(abliteration_ops_test.cpp PROPERTIES LANGUAGE HIP)
+  # Match production device arithmetic (the single-direction reference kernel
+  # must compile like the library) while keeping CPU oracles strict.
+  set_source_files_properties(abliteration_ops_test.cpp PROPERTIES LANGUAGE HIP
+    COMPILE_OPTIONS "-O3;-Xarch_device;-ffast-math;-fno-finite-math-only")
   add_executable(qwen38_flash_next_rq_logits_probe EXCLUDE_FROM_ALL rq_logits_probe.cpp)
   target_link_libraries(qwen38_flash_next_rq_logits_probe PRIVATE
     gufo_qwen38_flash_next hip::host)

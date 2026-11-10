@@ -3371,7 +3371,9 @@ std::optional<HttpResponse> ParseAbliterationControl(
   bool overrides = false;
   for (const auto& [key, ignored] : value->members()) {
     if (key != "enabled" && key != "profile" && key != "direction_layer" &&
-        key != "attention" && key != "mlp" && key != "residual")
+        key != "attention" && key != "mlp" && key != "residual" &&
+        key != "direction_kind" && key != "directions" &&
+        key != "preserve_norm")
       return invalid("unsupported abliteration member: " + key);
     overrides = overrides || (key != "enabled" && key != "profile");
   }
@@ -3384,9 +3386,9 @@ std::optional<HttpResponse> ParseAbliterationControl(
   if (!enabled->as_bool()) {
     if (overrides)
       return invalid(
-          "'abliteration.direction_layer', 'attention', 'mlp' and "
-          "'residual' need "
-          "'enabled': true");
+          "'abliteration.direction_layer', 'attention', 'mlp', "
+          "'residual', 'direction_kind', 'directions' and 'preserve_norm' "
+          "need 'enabled': true");
     chat->abliteration = false;
     chat->abliteration_overrides = {};
     return {};
@@ -3444,6 +3446,33 @@ std::optional<HttpResponse> ParseAbliterationControl(
     return error;
   if (auto error = strengths("residual", &parsed.residual))
     return error;
+  if (const auto* kind = value->find("direction_kind")) {
+    const auto parsed_kind =
+        kind->is_string()
+            ? models::qwen::ParseAbliterationDirectionKind(kind->str())
+            : std::nullopt;
+    if (!parsed_kind ||
+        std::ranges::find(info->direction_kinds,
+                          models::qwen::AbliterationDirectionKindName(
+                              *parsed_kind)) == info->direction_kinds.end())
+      return invalid(
+          "'abliteration.direction_kind' must be one of the loaded "
+          "profile's kinds: 'mean_diff', or 'projected' when it stores "
+          "projected directions");
+    parsed.direction_kind = parsed_kind;
+  }
+  if (const auto* count = value->find("directions")) {
+    const double x = count->is_number() ? count->as_double() : 0;
+    if (!(x >= 1) || x > info->rank || x != std::floor(x))
+      return invalid("'abliteration.directions' must be an integer in [1, " +
+                     std::to_string(info->rank) + "]");
+    parsed.direction_count = static_cast<std::uint32_t>(x);
+  }
+  if (const auto* preserve = value->find("preserve_norm")) {
+    if (!preserve->is_bool())
+      return invalid("'abliteration.preserve_norm' must be a boolean");
+    parsed.preserve_norm = preserve->as_bool();
+  }
   chat->abliteration = true;
   chat->abliteration_overrides = std::move(parsed);
   return {};

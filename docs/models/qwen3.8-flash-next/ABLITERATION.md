@@ -11,10 +11,14 @@ This is a reversible inference intervention, not a weight conversion.
   (`src/models/qwen/abliteration`: versioned, immutable, model-bound, with its
   cache identity) to this placement. It has no HIP dependency.
 - The model uploads every profile direction once at load (48 x 2560 floats
-  for a v2 profile); the executor keeps the GPU copy. Each session owns its
-  effective settings (OFF, or a direction layer and per-layer attention, MLP
-  and residual strengths) and, from its first ON request, a small device copy
-  of them (1 + 3 x layers words). There is no server-global mutable toggle.
+  for a rank-1 v2 profile; kinds x 48 x rank x 2560 with the subspace
+  members, 7.5 MiB at rank 8 with both kinds); the executor keeps the GPU
+  copy. Each session owns its effective settings (OFF, or a direction layer,
+  kind, direction count, norm preservation and per-layer attention, MLP and
+  residual strengths) and, from its first ON request, a small device copy of
+  them (1 + 3 x layers words; word 0 packs the first direction row, the
+  count and the norm flag, and is the bare row index for one direction
+  without norm preservation). There is no server-global mutable toggle.
 - Writer strengths (`attention`, `mlp`) act on the attention/GDN output
   projection and the **aggregated** routed-plus-shared MoE output,
   immediately before HC/residual injection. They cannot reach per-layer
@@ -67,9 +71,13 @@ This is a reversible inference intervention, not a weight conversion.
   are written in place to the session's device copy (an ordered upload on the
   executor stream, then a stream synchronization) and keep recorded graphs,
   which read the settings when they run. Any settings change drops resident
-  token history. The settings identity (`gufo-abliteration-settings-v2`),
-  SHA-256 over the profile identity, the direction layer and the exact float
-  bytes of every attention, MLP and residual strength (-0 folded into +0), salts text and every image-prefix cache identity: matching
+  token history. The settings identity (`gufo-abliteration-settings-v3`),
+  SHA-256 over the profile identity, the direction layer, the exact float
+  bytes of every attention, MLP and residual strength (-0 folded into +0),
+  the direction kind, the direction count and norm preservation, salts text
+  and every image-prefix cache identity (v3 replaced v2 when these options
+  arrived, so ON states cached by earlier builds are misses; OFF is
+  unchanged): matching
   settings can reuse caches; ON/OFF or different settings cannot share
   states. Two independent guards also check each restored state.
   Component-cache continuation metadata records the mode and, ON, the image
@@ -79,8 +87,13 @@ This is a reversible inference intervention, not a weight conversion.
   existing OFF caches remain valid byte for byte, and OFF requests allocate,
   upload and launch nothing new.
 
-The GPU operation is `y -= strength * direction * dot(direction, y)` with an
-FP32 reduction and unit direction. The file carries separate per-layer attention,
+The GPU operation is `y -= strength * sum_j d_j * dot(d_j, y)` over the
+session's k orthonormal directions (k = 1 by default), every dot product
+taken from the unprojected row with FP32 sums and a fixed reduction order,
+then, with norm preservation, `y *= |y_before| / |y_after|` per row (per HC
+stream for the residual). One direction without norm preservation runs the
+same arithmetic in the same order as the single-direction kernel, so it is
+bit-identical to it. The file carries separate per-layer attention,
 MLP and residual strengths. Writer strength 1 under-removes, because the
 direction measured on the residual also enters through the embedding and PLE,
 which is why writer strength 2 was needed here; residual strength 1 is the
@@ -90,6 +103,47 @@ conditions through the server. Flash-Next and
 [Qwen3.8-27B](../qwen3.8-27b/ABLITERATION.md) (`writer-before-residual`)
 implement it.
 
+## Direction kinds, subspaces and norm preservation
+
+Three options refine the direction(s) a site removes. All are optional
+profile members and per-request settings; without them a profile behaves
+exactly as before (mean difference, one direction, no norm preservation).
+
+- `direction_kind`: `mean_diff` is r = mean(refusal) - mean(ordinary) at the
+  layer, normalized. `projected` removes from r its component along the
+  normalized ordinary mean h (Gram-Schmidt): p = r - (r . h) h, normalized
+  (projected abliteration, arXiv 2512.13655; Heretic's default; Kyojin's
+  "minus harmless-mean component" preset). The ordinary mean is what every
+  prompt shares; removing p instead of r leaves that shared part alone, which
+  those sources report keeps ordinary behavior closer to the original at the
+  same refusal reduction. `prepare.py fit` therefore makes `projected` the
+  default of new profiles whenever every layer has one (a refusal direction
+  lying along the ordinary mean has none; `fit` then stores only
+  `mean_diff`).
+- `directions` (rank k): refusal is not always one direction (Wollschlaeger et
+  al., "The Geometry of Refusal in Large Language Models: Concept Cones and
+  Representational Independence", ICML 2025; multi-directional refusal found
+  with a self-organizing map, arXiv 2603.22061). `fit --rank K` stores, per
+  layer and kind, K orthonormal rows whose first is the kind's single
+  direction; a request removes the first k (1 <= k <= K). The remaining rows
+  come from the per-prompt deviations x_i - mean(ordinary) of the refusal
+  prompts: `--method pca` takes their top right singular vectors,
+  `--method som` the prototypes of a small batch self-organizing map
+  (g x g units, g = ceil(sqrt(2K)), seeded) most aligned with r. Gram-Schmidt
+  (FP64, twice) orthonormalizes them after the first row, also against h for
+  `projected`; dependent data yields fewer rows (the rank `fit` reports).
+  K is at most 8: the kernel keeps one FP32 dot sum per direction in
+  registers and reduces all of them in one shared block, a rank-8 profile
+  with both kinds is already 2 x 8 times the rank-1 directions, and the
+  refusal subspaces in the work above are low-dimensional, while removing
+  more directions approaches removing a generic subspace.
+- `preserve_norm`: after the projection each row (writer output row, or each
+  HC stream of the residual) is rescaled to its L2 norm before the
+  projection. This is the activation-space analogue of grimjim's
+  norm-preserving biprojected abliteration, which edits the weights so that
+  their norms are kept; Gufo edits no weights and only keeps each projected
+  activation's norm.
+
 ## Profile and API
 
 A profile is a JSON file with schema `gufo-abliteration-v2`, placement
@@ -97,12 +151,27 @@ A profile is a JSON file with schema `gufo-abliteration-v2`, placement
 vector of `hidden` floats per layer, `[layers][hidden]`), and the request
 defaults `direction_layer`, `attention[layers]`, `mlp[layers]` and the
 optional `residual[layers]` (strengths in [0, 4]; absent means all zero, so
-every earlier v2 profile behaves as before; v1 cannot carry it). A v2 Flash-Next profile is about 1.6 MB as written by
-`prepare.py`. Schema `gufo-abliteration-v1` (one `direction`, whose source
+every earlier v2 profile behaves as before; v1 cannot carry it). A rank-1 v2 Flash-Next profile is about 1.6 MB as written by
+`prepare.py`. The optional direction members (v2 only; none may appear in v1):
+
+| Member | Meaning |
+| --- | --- |
+| `rank` | K, an integer in [1, 8]; absent is 1 |
+| `subspace_directions` | with K > 1 only: `layers` strings, each base64 of (K - 1) x `hidden` little-endian float32, rows 1..K-1 of `mean_diff` (row 0 is `directions[l]`) |
+| `projected_directions` | optional: `layers` strings, each base64 of K x `hidden` float32, the `projected` rows |
+| `direction_kind` | default kind, `mean_diff` (absent) or `projected` (needs `projected_directions`) |
+| `direction_count` | default k in [1, K]; absent is 1 |
+| `preserve_norm` | default boolean; absent is false |
+| `subspace_method` | `pca` or `som`, informational |
+
+Each layer's block of each kind must be orthonormal (unit rows, pairwise
+dot products within 1e-4). Base64 keeps a rank-8 27B profile with both kinds
+near 31 MB, where JSON numbers would need about 60 MB and far more memory to
+parse. Schema `gufo-abliteration-v1` (one `direction`, whose source
 layer is unknown) still loads: requests may change its strengths but not its
 direction. Profiles must match the loaded artifact; nonfinite values, nonunit
-vectors, out-of-range layers or strengths, incompatible dimensions and files
-over 16 MiB are rejected. Candidate provenance can be stored as additional
+vectors or blocks, out-of-range layers, strengths, ranks or counts, unknown
+kinds, incompatible dimensions and files over 48 MiB are rejected. Candidate provenance can be stored as additional
 fields. Structural loading does not certify quality.
 
 Load a chosen file with `gufo serve llm ... --abliteration-profile /path/profile.json`.
@@ -132,15 +201,27 @@ or residual-stream ablation:
                   "attention": 0, "mlp": 0, "residual": 1}}
 ```
 
+or a projected rank-4 subspace with norm preservation:
+
+```json
+{"abliteration": {"enabled": true, "direction_layer": 36, "residual": 1,
+                  "direction_kind": "projected", "directions": 4,
+                  "preserve_norm": true}}
+```
+
 `direction_layer` is an integer in [0, layers) and needs a v2 profile.
 `attention`, `mlp` and `residual` are each one number for every layer or an
-array of exactly `layers` numbers, each in [0, 4]. Omitted members keep the profile
+array of exactly `layers` numbers, each in [0, 4]. `direction_kind` is
+`mean_diff` or, when the profile stores it, `projected`; `directions` is an
+integer in [1, rank]; `preserve_norm` is a boolean. Omitted members keep the profile
 defaults. Sessions in one batch may run different settings. Omit the object or
 send `{"abliteration":{"enabled":false}}` for OFF; settings with
 `"enabled": false` are rejected. Unknown fields, profile names/paths, invalid
 settings and unsupported backends are rejected with `invalid_abliteration`;
 clients cannot load arbitrary local files through requests. `GET /props`
-reports the loaded profile under `abliteration`. Raw completions do
+reports the loaded profile under `abliteration`, including
+`direction_kinds`, `direction_kind`, `max_directions` (the rank),
+`directions`, `preserve_norm` and `subspace_method`. Raw completions do
 not accept this control. The option is independent of thinking and Han-token
 sampling controls. Existing clients need to send this additional JSON field;
 this change does not add a DSH UI control.
@@ -162,15 +243,22 @@ The Python fitter needs NumPy; it does not run GPU work.
    strengths act), averaged over HC streams in FP32.
    It uses the model's native template, medium reasoning, no draft and no
    intervention. Prompts over 2048 tokens are rejected, never silently clipped.
-3. `prepare.py fit --collection CAPTURE --output NEW_CANDIDATES` computes
-   refusal-minus-ordinary means and unit directions. A bounded screen varies
-   the default direction layer and strength; every candidate is a v2 profile
-   with all directions, and files remain `candidate-not-qualified`.
+3. `prepare.py fit --collection CAPTURE --output NEW_CANDIDATES [--rank 4]
+   [--method pca|som] [--seed 0]` computes refusal-minus-ordinary means, unit
+   directions, the projected kind and the rank-K subspace of both (rank 4
+   and PCA by default; `SUMMARY.json` records the rank reached). It keeps the
+   refusal prompts' activations in memory (prompts x layers x hidden FP32).
+   A bounded screen varies the default direction layer and strength; every
+   candidate is a v2 profile with all directions, both kinds and the
+   subspace, defaulting to `projected`, one direction and no norm
+   preservation, and files remain `candidate-not-qualified`.
    `fit` also writes `layerL-residual1.json` per screened layer (residual 1
    on every layer, writers 0).
    `prepare.py make-profile --fit NEW_CANDIDATES --direction-layer 36
    --residual 1 --output NEW.json` (or `--profile V2.json` to re-default an
-   existing profile) writes one v2 profile. `--attention`, `--mlp` and
+   existing profile) writes one v2 profile; `--direction-kind`,
+   `--directions` and `--preserve-norm on|off` set the option defaults (each
+   omitted one keeps the base value). `--attention`, `--mlp` and
    `--residual` (each omitted one keeps the `--profile` value; from a fit, 0,
    with no `residual` member) take one number, `layers` comma-separated
    numbers, or a curve
@@ -212,7 +300,14 @@ first-token KL(OFF || ON) on ordinary tuning prompts from the server's 20
 projection. The KL is approximated on the union of both top-20 sets, each
 side's missing tokens sharing its leftover mass, both renormalized over the
 union (see the script's docstring). An empty final answer counts as a
-refusal, so a broken model never scores well. Trial 0 is the profile defaults,
+refusal, so a broken model never scores well. On a server whose `/props`
+reports them, every mode also searches the projection options: the
+direction kind (`--direction-kinds`, default every stored kind), the
+direction count k in 1..`--max-directions` (default the stored rank) and
+norm preservation (`--preserve-norm search|on|off`, default search); trials
+send all three explicitly. With one kind, one direction and
+`--preserve-norm off` the log fingerprint is the earlier one, so earlier
+logs resume. Trial 0 is the profile defaults,
 then `--initial` random samples, then Gaussian perturbations of the current
 Pareto front. Thinking is explicit (`--thinking off|on|both`, sent as
 `chat_template_kwargs.enable_thinking`); thinking prompts need a larger
@@ -241,7 +336,9 @@ as in step 5.
 CPU: `qwen38_flash_next.abliteration`, `qwen27b_abliteration_test` (shared v2
 profile, settings and identity contracts), `openai_chat_test`,
 `http_server_test`,
-`python3 tools/qwen38_flash_next/abliteration/test_prepare.py` (NumPy) and
+`python3 tools/qwen38_flash_next/abliteration/test_prepare.py` (NumPy;
+projected, PCA and SOM math on planted data, orthonormality, SOM
+determinism, profile members) and
 `python3 tools/qwen38_flash_next/abliteration/test_search.py`.
 GPU: `qwen38_flash_next.abliteration_ops` covers an independent FP64 formula,
 unaligned dimensions, mixed rows with their own directions and strengths,
@@ -249,5 +346,8 @@ in-place settings updates under a captured graph and the production
 deferred-attention / MoE / projection / HC order; and for the residual
 projection, all four HC streams against an FP64 reference with mixed
 sessions, the stream mean's component removed at strength 1, zero-strength
-and OFF tokens left bit-identical, and graph replay with in-place updates. Build it during iteration; run it with the final
+and OFF tokens left bit-identical, and graph replay with in-place updates;
+and the subspace projection with k in {1, 2, 5, 8} for every HC stream
+against FP64 with mixed sessions and norm preservation, plus one direction
+bit-identical to the single-direction kernel for streams and writer rows. Build it during iteration; run it with the final
 combined GPU checks after the serving GPU is available.
