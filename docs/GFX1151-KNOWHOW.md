@@ -1,5 +1,19 @@
 # gfx1151 optimization know-how
 
+## Upstream D4 27B adapter image section, November 10, 2026 (not deployed)
+
+Evidence is under `build/b1/d4-20261110/` (README.txt): correctness only, no
+timing, kernel 7.0.0-43, production stopped, `cf336304` built in `build/c6`.
+- **The 27B continuation adapter image section passes; the earlier failure
+  was the fixture, not code.** `vision::Encoder::Open` opens only a file
+  named `mmproj-BF16.gguf` beside the model (or one level up); the
+  `qwen-3.8-27b-gguf` folder names its projector
+  `mmproj-Qwen3.8-27B-BF16.gguf`, so no encoder opened. With the verified
+  unsloth sidecar (`qwen-3.8-27b-mmproj-bf16-gguf`, sha256 `83ee4f4f…`)
+  hardlinked beside the model in a scratch dir: full test on Q4_K_M rc 0
+  (all text sections, `images`, `image_suffix`), and `--image-only` on its
+  declared pair UD-Q4_K_M rc 0.
+
 ## Upstream C6 KVarN rewind and cache checks, November 10, 2026 (not deployed)
 
 Evidence is under `build/b1/c6-20261110/` (README.txt): correctness only, no

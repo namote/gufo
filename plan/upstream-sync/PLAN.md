@@ -267,7 +267,7 @@ binary는 셋이다:
 | C3 | startup 로그에 `event=device_code_identity sha256=84fdeb4f…`. 같은 build로 재시작한 뒤 disk restore가 된다: A4-disk 7348 token(restore 100 ms), D2-disk 7204 token, D1 shared prefix |
 | C4 | 의미 있다. 혼자일 때 A의 capture는 7.4~9.9 ms다. B가 약 21K token을 cold prefill하는 동안에는 1829~1841 ms이고, A의 TTFT가 1.9 s에서 4.1~4.4 s로 늘어난다. base도 1406~1836 ms로 같아서 기존 결함이다. 이번 패스에서는 고치지 않았다(event 대기로 바꾸는 구조 변경이다) |
 | C5 | Flash-Next continuation adapter test 통과(cand) |
-| C6 F1·F2 | 27B adapter의 text section(guard, boundaries, shared pool, retained blocks, prefill cancel, batch admission) 통과. image section은 테스트가 `mmproj-BF16.gguf` 이름을 요구해서 실패했다(하드링크 디렉터리로 재실행 준비함). 27B KVarN K4V4 + DFlash2(cand2): `cache`(persist·disk 포함, 10개 case)와 `long-context` 모두 통과. 27B Flash-Next식 MTP는 HTTP에서 지원하지 않아, 27B의 추측 디코드는 DFlash2다. group 끝을 넘는 거부를 HTTP로는 만들 수 없어(거부 위치는 DFlash2가 정한다) executor 수준 테스트로 확인했다(2026-11-10, `build/b1/c6-20261110/`): `qwen27b_kvarn_decode_test --rejection-only`가 k4v2·k4v4에서 640을 넘는 거부(632~636에서 8행 검증, 1~5행 채택, 재검증 포함) 뒤 660까지 decode한 상태를 cold AR replay와 비교해 117개 component 모두 byte 동일, logits exact(10/10). `kvarn_ops_test` 재양자화 case 14/14 byte 동일 |
+| C6 F1·F2 | 27B adapter의 text section(guard, boundaries, shared pool, retained blocks, prefill cancel, batch admission) 통과. image section은 테스트가 `mmproj-BF16.gguf` 이름을 요구해서 실패했다. D4에서 검증된 sidecar를 하드링크로 두고 다시 돌려 통과했다(Q4_K_M 전체 rc 0, UD-Q4_K_M `--image-only` rc 0, `build/b1/d4-20261110/`). 27B KVarN K4V4 + DFlash2(cand2): `cache`(persist·disk 포함, 10개 case)와 `long-context` 모두 통과. 27B Flash-Next식 MTP는 HTTP에서 지원하지 않아, 27B의 추측 디코드는 DFlash2다. group 끝을 넘는 거부를 HTTP로는 만들 수 없어(거부 위치는 DFlash2가 정한다) executor 수준 테스트로 확인했다(2026-11-10, `build/b1/c6-20261110/`): `qwen27b_kvarn_decode_test --rejection-only`가 k4v2·k4v4에서 640을 넘는 거부(632~636에서 8행 검증, 1~5행 채택, 재검증 포함) 뒤 660까지 decode한 상태를 cold AR replay와 비교해 117개 component 모두 byte 동일, logits exact(10/10). `kvarn_ops_test` 재양자화 case 14/14 byte 동일 |
 | C6 S1·S2 | S2: Flash-Next cache·persist·pi 로그에 `capture_failure`/`capture_failed` 0건. 다른 slot의 보존 실패로 retire된 공유 chunk가 이후 capture를 막는 경로가 있어 고쳤다(다시 잡는다, CPU 테스트). S1: 27B KVarN K4V4 `cache`(10/10 통과)에서 admit된 42개 위치 중 128 배수는 0개. payload는 128 token마다 정확히 2,244,608 B(record 한 group)씩 늘고, group 끝 checkpoint는 tail state가 고정 크기라 오히려 그만큼 작다(payload의 0.6~0.8 %). 고치지 않는다 |
 | C8a | logprobs 값이 u13과 같다(served sha 4/4). functional `logprobs`·`responses-logprobs` 출력은 U5의 C8a 이전 후보와 17/17, 18/18 동일. logprobs B가 있을 때 peer A의 decode는 u13 9426/8884 ms, cand2 9034/8777 ms로 draft 수가 달라 판단 보류. 63행 fan-out: wide logprobs long copy에서 thread 136→198, RSS 약 +95 MiB |
 | C8d | 통과. cand2로 `cache`+`batch`를 14.4 GB FP16 pool(fpool2)과 KVarN K4V4(fk42)에서 돌렸다. `capture_failure`·`restore_untracked` 0건 |
@@ -311,7 +311,7 @@ binary는 셋이다:
 - batch 동시 short reply decode 회귀(C1 의심)와 `*-disk` prefill +10~15 ms
 - C4: capture가 다른 세션의 prefill을 기다린다(base에도 있다)
 - mtp_audit의 base 대조
-- 27B adapter image section: 테스트가 `mmproj-BF16.gguf` 이름을 요구한다
+- ~~27B adapter image section: 테스트가 `mmproj-BF16.gguf` 이름을 요구한다~~ D4에서 통과(2026-11-10, 코드 변경 없음)
 - U4-3 hang 완화 빌드 검증(아래 "U4-3 완화 후보")
 
 ### U4-3 완화 후보 (cand3, cand4)

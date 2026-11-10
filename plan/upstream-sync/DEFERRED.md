@@ -21,7 +21,7 @@
 | D1 | U4-3 E1~E4 replay | hang 재현 도구. 우회가 통하므로 급하지 않다. `u6-rocgdb-nix` docker volume을 남겨 뒀다 |
 | D2 | AMD에 MES queue 정지 버그 보고 초안 | 외부 공개라 사용자가 원할 때만 한다. 증거: `build/b1/u6-20261109/hang/` |
 | D3 | `mtp_audit` base 대조 | 모든 후보에서 attention-state 0.0071(기준 0.002)로 실패한다. base에서 한 번 돌려 기존 차이인지 확인한다 **완료**: base 소스(`284b2378`)로 만든 gpu_probe도 0.0070984로 똑같이 실패한다. upstream sync 이전부터 있던 EXL3 oracle 차이다 |
-| D4 | 27B adapter image section | `mmproj-BF16.gguf` 파일이 필요하다(모델 폴더 확인) |
+| D4 | 27B adapter image section | `mmproj-BF16.gguf` 파일이 필요하다(모델 폴더 확인) **완료**(2026-11-10, `build/b1/d4-20261110/`, 코드 변경 없음): encoder는 모델 옆(또는 한 단계 위)의 `mmproj-BF16.gguf` 이름만 연다. `qwen-3.8-27b-gguf` 폴더의 projector 이름이 `mmproj-Qwen3.8-27B-BF16.gguf`라 실패했다. 검증된 unsloth sidecar(`qwen-3.8-27b-mmproj-bf16-gguf`, sha256 `83ee4f4f…`)를 scratch 폴더에 모델과 하드링크로 두고 돌렸다: Q4_K_M 전체 테스트 rc 0(text section 모두, `images`, `image_suffix` 통과), 짝인 UD-Q4_K_M `--image-only` rc 0 |
 | D5 | C3 hash를 SHF_ALLOC section만으로 정밀하게 | 지금은 줄 번호만 바뀌어도 캐시가 무효가 된다. 안전한 쪽이라 낮다 |
 | D6 | C1 테스트 보강(kv_only가 둘 이상 섞인 cohort) | CPU/GPU session test 추가 **완료**: `1d6faa94`/`18081f1c`, U7b cand6 session test에서 `batch mixed_kv_only_cohorts=5` |
 | D7 | cand4 배포 | 사용자 결정. 배포하면 supervisor(C2, `prepare_memory`)를 같이 설치해야 한다 |
