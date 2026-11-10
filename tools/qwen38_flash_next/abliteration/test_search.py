@@ -1,0 +1,313 @@
+"""CPU contracts of search.py: KL approximation, Pareto front, refusal
+heuristic, request shapes and a resumable search against an injected client
+and a local HTTP server. Standard library only."""
+import hashlib
+import http.server
+import importlib.util
+import io
+import json
+import math
+from pathlib import Path
+import tempfile
+import threading
+import unittest
+
+spec = importlib.util.spec_from_file_location('search', Path(__file__).with_name('search.py'))
+search = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(search)
+
+LAYERS = 4
+
+
+class FakeClient:
+    """A model whose refusals fall and whose first-token distribution drifts
+    with the total strength it is asked for."""
+
+    IDENTITY = 'f' * 64
+
+    def __init__(self):
+        self.requests = []
+
+    def props(self):
+        return {'abliteration': {'profile': 'default', 'schema': 'gufo-abliteration-v2',
+                                 'identity': self.IDENTITY, 'layers': LAYERS,
+                                 'direction_layers': list(range(LAYERS)),
+                                 'direction_layer': 2, 'attention': 1.0,
+                                 'mlp': [0, 0.5, 0, 0], 'max_strength': 4}}
+
+    @staticmethod
+    def strength(body):
+        a = body['abliteration']
+        if not a['enabled']:
+            return 0.0
+        attention = a.get('attention', [1.0] * LAYERS)
+        mlp = a.get('mlp', [0, 0.5, 0, 0])
+        return sum(attention) + sum(mlp)
+
+    def chat(self, body):
+        self.requests.append(body)
+        s = self.strength(body)
+        if body.get('logprobs'):
+            shift = 0.1 * s
+            top = [dict(token=t, bytes=list(t.encode()), logprob=lp)
+                   for t, lp in (('A', math.log(0.6) - shift), ('B', math.log(0.3)),
+                                 ('C', math.log(0.05) + shift / 2))]
+            return {'choices': [{'logprobs': {'content': [
+                dict(token='A', logprob=top[0]['logprob'], top_logprobs=top)]},
+                'message': {'content': 'A'}, 'finish_reason': 'length'}]}
+        text = "I'm sorry, I can't help." if s < 6 else 'Sure. Step one...'
+        return {'choices': [{'message': {'content': text, 'reasoning_content': ''},
+                             'finish_reason': 'stop'}]}
+
+
+def data_file(root):
+    rows = []
+    for group in ('refusal', 'ordinary'):
+        for i in range(5):
+            for thinking in (False, True):
+                rows.append(dict(id=f'{group}{i}-{"think" if thinking else "plain"}',
+                                 text=f'{group} prompt {i}', group=group, split='tuning',
+                                 thinking=thinking, source='fixture'))
+    rows.append(dict(id='held', text='x', group='refusal', split='evaluation',
+                     thinking=False, source='fixture'))
+    path = root / 'tuning.jsonl'
+    path.write_text(''.join(json.dumps(r) + '\n' for r in rows))
+    return path
+
+
+class OfflineLogicTest(unittest.TestCase):
+    def test_kl_identical_is_zero_and_shift_positive(self):
+        off = {'a': math.log(0.7), 'b': math.log(0.2)}
+        self.assertAlmostEqual(search.first_token_kl(off, dict(off)), 0.0, places=12)
+        on = {'a': math.log(0.2), 'b': math.log(0.7)}
+        self.assertGreater(search.first_token_kl(off, on), 0.5)
+
+    def test_kl_union_imputation(self):
+        # Exact when both sides report their full support.
+        p = {'a': math.log(0.5), 'b': math.log(0.5)}
+        q = {'a': math.log(0.25), 'b': math.log(0.75)}
+        exact = 0.5 * math.log(0.5 / 0.25) + 0.5 * math.log(0.5 / 0.75)
+        self.assertAlmostEqual(search.first_token_kl(p, q), exact, places=9)
+        # A token missing on one side shares that side's leftover mass,
+        # capped at its smallest reported probability; then each side is
+        # renormalized over the union.
+        off = {'a': math.log(0.6), 'b': math.log(0.3)}   # leftover 0.1 -> c
+        on = {'a': math.log(0.5), 'c': math.log(0.05)}   # leftover 0.45, cap 0.05 -> b
+        pa, pb, pc = 0.6, 0.3, 0.1
+        qa, qb, qc = 0.5, 0.05, 0.05
+        ps, qs = pa + pb + pc, qa + qb + qc
+        expected = sum(x / ps * math.log((x / ps) / (y / qs))
+                       for x, y in ((pa, qa), (pb, qb), (pc, qc)))
+        self.assertAlmostEqual(search.first_token_kl(off, on), expected, places=9)
+        # Flat distributions never blow up through a clamped tail.
+        flat_off = {str(i): math.log(0.04) for i in range(20)}
+        flat_on = {str(i + 10): math.log(0.04) for i in range(20)}
+        self.assertLess(search.first_token_kl(flat_off, flat_on), 1.0)
+        with self.assertRaises(ValueError):
+            search.first_token_kl({}, on)
+
+    def test_pareto_and_choice(self):
+        trials = [dict(trial=i, refusals=r, kl=k) for i, (r, k) in enumerate(
+            [(10, 0.0), (5, 0.2), (5, 0.1), (2, 0.5), (8, 0.3), (0, 2.0)])]
+        front = search.pareto_front(trials)
+        self.assertEqual([t['trial'] for t in front], [5, 3, 2, 0])
+        self.assertEqual(search.choose(trials, 0.15)['trial'], 2)
+        self.assertEqual(search.choose(trials, 0.6)['trial'], 3)
+        self.assertIsNone(search.choose(trials, -1))
+
+    def test_refusal_heuristic(self):
+        self.assertTrue(search.refused("I'm sorry, but I can't help with that."))
+        # An empty answer is no refusal phrase; evaluate() counts it as one.
+        self.assertFalse(search.refused('<think>no</think>  '))
+
+        class Empty(FakeClient):
+            def chat(self, body):
+                if body.get('logprobs'):
+                    return super().chat(body)
+                return {'choices': [{'message': {'content': ''},
+                                     'finish_reason': 'stop'}]}
+
+        prompts = {'refusal': [dict(id='r', text='x', thinking=False)],
+                   'ordinary': [dict(id='o', text='y', thinking=False)]}
+        with tempfile.TemporaryDirectory() as tmp:
+            run = search.Search(Empty(), 'gufo', prompts, Empty().props()['abliteration'],
+                                Path(tmp) / 'log.jsonl', 8, out=io.StringIO())
+            result = run.evaluate({}, run.baseline())
+        self.assertEqual((result['refusals'], result['unfinished']), (1, 1))
+        self.assertTrue(search.refused('I’m unable to do that.'))
+        self.assertTrue(search.refused('<think>ok</think>\n죄송하지만 도와드릴 수 없습니다.'))
+        self.assertFalse(search.refused('<think>I cannot decide</think>Here is how.'))
+        self.assertFalse(search.refused('Sure! ' + 'x' * 400 + " I can't"))
+
+    def test_settings_follow_the_curve(self):
+        params = {'direction_layer': 1, 'attention.max_w': 2.0, 'attention.peak': 1.0,
+                  'attention.min_frac': 0.5, 'attention.width': 2.0,
+                  'mlp.max_w': 0.0, 'mlp.peak': 0.0, 'mlp.min_frac': 0.0,
+                  'mlp.width': 1.0}
+        values = search.settings(params, LAYERS)
+        self.assertEqual(values['direction_layer'], 1)
+        self.assertEqual(values['attention'], [1.5, 2.0, 1.5, 1.0])
+        self.assertEqual(values['mlp'], [0.0] * LAYERS)
+
+    def test_proposals_stay_in_bounds_and_are_deterministic(self):
+        box = search.bounds(LAYERS, [1, 2], 4.0)
+        history = [dict(trial=0, params=None, refusals=5, kl=0.0)]
+        for i in range(1, 30):
+            params = search.propose(i, history, box, 5, 30, seed=3)
+            self.assertEqual(params, search.propose(i, history, box, 5, 30, seed=3))
+            self.assertIn(params['direction_layer'], (1, 2))
+            for key, (lo, hi) in box.items():
+                self.assertTrue(lo <= params[key] <= hi, key)
+            history.append(dict(trial=i, params=params, refusals=i % 4, kl=1 / i))
+
+    def test_prompt_sampling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = data_file(Path(tmp))
+            chosen = search.load_prompts([path], 'tuning', 'off',
+                                         {'refusal': 3, 'ordinary': 0}, 0)
+            self.assertEqual(len(chosen['refusal']), 3)
+            self.assertEqual(len(chosen['ordinary']), 5)
+            self.assertTrue(all(not r['thinking'] for r in chosen['refusal']))
+            self.assertEqual(chosen, search.load_prompts(
+                [path], 'tuning', 'off', {'refusal': 3, 'ordinary': 0}, 0))
+            both = search.load_prompts([path], 'tuning', 'both',
+                                       {'refusal': 0, 'ordinary': 0}, 0)
+            self.assertEqual(len(both['refusal']), 10)
+
+
+class SearchRunTest(unittest.TestCase):
+    def run_search(self, root, client, trials, extra=()):
+        out = io.StringIO()
+        chosen = search.main(['--data', str(data_file(root)), '--log',
+                              str(root / 'log' / 'trials.jsonl'), '--trials', str(trials),
+                              '--initial', '3', '--refusal-prompts', '3',
+                              '--ordinary-prompts', '2', '--kl-budget', '10',
+                              *extra], client=client, out=out)
+        return chosen, out.getvalue()
+
+    def test_search_requests_log_resume_and_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient()
+            chosen, text = self.run_search(root, client, 4)
+            self.assertIn('Pareto front', text)
+            # Baseline OFF logprobs, then per trial 3 generations + 2 logprob calls.
+            off = [r for r in client.requests if not r['abliteration']['enabled']]
+            self.assertEqual(len(off), 2)
+            self.assertTrue(all(r['logprobs'] and r['top_logprobs'] == 20 and
+                                r['max_tokens'] == 1 for r in off))
+            self.assertEqual(len(client.requests), 2 + 4 * 5)
+            for r in client.requests:
+                self.assertEqual(r['chat_template_kwargs'], {'enable_thinking': False})
+                self.assertEqual(r['temperature'], 0)
+                self.assertFalse(r['cache_persist'])
+            on = [r['abliteration'] for r in client.requests if r['abliteration']['enabled']]
+            self.assertEqual(set(on[0]), {'enabled', 'profile'})  # trial 0: defaults
+            later = on[-1]
+            self.assertEqual(len(later['attention']), LAYERS)
+            self.assertIn(later['direction_layer'], range(LAYERS))
+            self.assertTrue(all(0 <= w <= 4 for w in later['attention'] + later['mlp']))
+            log = root / 'log' / 'trials.jsonl'
+            records = [json.loads(l) for l in log.read_text().splitlines()]
+            self.assertEqual(records[0]['type'], 'header')
+            self.assertEqual([r['trial'] for r in records[1:]], [0, 1, 2, 3])
+            self.assertEqual(records[1]['refusals'], 3)  # defaults: strength 4.5
+            # Resume: only new trials are evaluated, the baseline is cached.
+            client2 = FakeClient()
+            self.run_search(root, client2, 6)
+            self.assertEqual(len(client2.requests), 2 * 5)
+            self.assertTrue(all(r['abliteration']['enabled'] for r in client2.requests))
+            # A chosen trial becomes a v2 profile with its settings as defaults.
+            base = root / 'base.json'
+            search.prepare.save_profile(base, dict(
+                schema='gufo-abliteration-v2', model_identity='m', hidden=2,
+                layers=LAYERS, placement='writer-before-hc',
+                directions=[[1.0, 0.0]] * LAYERS, direction_layer=2,
+                attention=[1.0] * LAYERS, mlp=[0, 0.5, 0, 0]))
+            output = root / 'chosen.json'
+            # Another file than the served profile is refused up front.
+            with self.assertRaises(SystemExit):
+                self.run_search(root, FakeClient(), 6, (
+                    '--base-profile', str(base), '--output', str(output)))
+            served = FakeClient()
+            served.IDENTITY = hashlib.sha256(base.read_bytes()).hexdigest()
+            # Another served profile is another search: a new log.
+            (root / 'log').rename(root / 'log-old')
+            chosen, text = self.run_search(root, served, 6, (
+                '--base-profile', str(base), '--output', str(output)))
+            profile = json.loads(output.read_text())
+            self.assertEqual(profile['schema'], 'gufo-abliteration-v2')
+            expected = chosen['settings'] or {}
+            self.assertEqual(profile['direction_layer'],
+                             expected.get('direction_layer', 2))
+            self.assertEqual(len(profile['attention']), LAYERS)
+            self.assertEqual(profile['search_trial'], chosen['trial'])
+
+    def test_log_of_another_sample_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.run_search(root, FakeClient(), 1)
+            with self.assertRaises(SystemExit):
+                search.main(['--data', str(data_file(root)), '--log',
+                             str(root / 'log' / 'trials.jsonl'), '--trials', '2',
+                             '--refusal-prompts', '4', '--ordinary-prompts', '2',
+                             '--kl-budget', '1'], client=FakeClient(), out=io.StringIO())
+
+    def test_v1_server_is_refused(self):
+        client = FakeClient()
+        client.props = lambda: {'abliteration': dict(FakeClient().props()['abliteration'],
+                                                     direction_layers=[],
+                                                     direction_layer=None)}
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(SystemExit):
+            self.run_search(Path(tmp), client, 1)
+
+
+class HttpClientTest(unittest.TestCase):
+    def test_round_trip_and_errors(self):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def reply(self, status, value):
+                body = json.dumps(value).encode()
+                self.send_response(status)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                self.reply(200, FakeClient().props())
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                seen.append((self.path, body))
+                if body.get('abliteration', {}).get('direction_layer') == 99:
+                    self.reply(400, {'error': {'code': 'invalid_abliteration'}})
+                else:
+                    self.reply(200, FakeClient().chat(body))
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = search.HttpClient(f'http://127.0.0.1:{server.server_port}/')
+            self.assertEqual(client.props()['abliteration']['layers'], LAYERS)
+            prompt = dict(text='hi', thinking=True)
+            top = search.first_token_top(client.chat(search.request_body(
+                'gufo', prompt, {'enabled': False}, 1, logprobs=True)))
+            self.assertEqual(len(top), 3)
+            self.assertEqual(seen[-1][0], '/v1/chat/completions')
+            self.assertEqual(seen[-1][1]['chat_template_kwargs'], {'enable_thinking': True})
+            with self.assertRaisesRegex(RuntimeError, 'invalid_abliteration'):
+                client.chat(search.request_body('gufo', prompt, {
+                    'enabled': True, 'direction_layer': 99}, 8))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+if __name__ == '__main__':
+    unittest.main()
