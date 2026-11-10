@@ -1,5 +1,36 @@
 # gfx1151 optimization know-how
 
+## Han scale (`--han-scale`), November 10, 2026 (not deployed)
+
+Evidence is under `build/b1/han-20261110/` (README.txt): source `9bd4feeb`,
+built in `build/han`, kernel 7.0.0-43, production stopped, preflight OK.
+- **Mechanism.** The Han-token logits get ln(x) added after the penalties
+  and before temperature and the filters (probability × x at T=1, x^(1/T)
+  at temperature T, and greedy takes the shifted argmax). It covers every
+  Qwen 27B and Flash-Next sampling path, including the MTP/DFlash target
+  and draft. logprobs stay raw. At x=1 every new branch is skipped.
+  55,659 of 248,320 tokens are classed as Han on both models (7 ms at load).
+- **Off is exact.** With x=1, Flash-Next functional `batch` and `cache`
+  outputs equal D8 cand9 (41/41 and 41/41).
+- **Speed.** On a 512-token d0 run with no Han text, x=1.0 gives 46.5/45.7
+  tok/s and x=0.2 gives 45.2/45.6, with MTP accepted 241/380 at both
+  (identical output). No measurable cost.
+- **Effect.** It removes habitual Han but leaves Han that the prompt asks
+  for. Prompts: 사자성어, 조선 관직, 불교 용어, two others.
+  - Flash-Next greedy, 관직 prompt: Han 24 → 16 at x≤0.5.
+    `장원(状元), 방안(榜眼), 탐화(探花)` becomes `장원(1등), 방안(2등),
+    탐화(3등)`, and the Korean stays natural.
+  - 사자성어 / 불교 prompts are unchanged even at 0.1 (`온고지신(溫故知新)`).
+    The model is confident far beyond ln(0.1) there.
+  - 27B greedy: prompt p1 4 → 0 at x≤0.5; prompt p2 11 → 0 only at 0.1.
+  - Chinese prompt: still Chinese (Han 358 → 355 at 0.2). No broken output
+    was seen at any scale.
+- **Override.** A server started with `--han-scale 0.2` applies 0.2 to
+  requests without the field, and a request with `han_scale: 1.0` gets
+  exactly the 1.0 output.
+- **Default.** Recommended production default is 0.2 (soft): it removes
+  habitual Han with no seen quality loss. Use 0.1 for stronger effect on 27B.
+
 ## Upstream D4 27B adapter image section, November 10, 2026 (not deployed)
 
 Evidence is under `build/b1/d4-20261110/` (README.txt): correctness only, no

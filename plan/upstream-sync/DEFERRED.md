@@ -26,6 +26,7 @@
 | D6 | C1 테스트 보강(kv_only가 둘 이상 섞인 cohort) | CPU/GPU session test 추가 **완료**: `1d6faa94`/`18081f1c`, U7b cand6 session test에서 `batch mixed_kv_only_cohorts=5` |
 | D7 | cand4 배포 | 사용자 결정. 배포하면 supervisor(C2, `prepare_memory`)를 같이 설치해야 한다 |
 | D8 | 긴 prefill 옆 요청의 TTFT 공정성 | C4 수정 뒤에도 A TTFT가 혼자 약 2.0 s에서, B의 약 24K cold prefill 중 3.2~3.3 s다. A가 B의 512 token pass(약 455 ms) 뒤에 줄을 서고, prefill pass가 번갈아 돈다. capture 문제가 아니라 scheduler 순서 문제이고 base에도 있다. 짧은 prompt 우선, B chunk 크기 조정, decode/짧은 prefill 끼워 넣기 같은 정책 후보를 설계하고, 사전 점검을 통과한 재부팅 뒤 창에서 A/B TTFT로 잰다 **완료**(`37c96630`, 1안만 적용; 2048→1024 admission 변경은 하지 않음): 남은 token이 4096 이하인 prefill이 긴 prefill의 다음 chunk보다 먼저 돈다. 차례를 건너뛰는 양은 긴 prefill 한 차례마다 4096 token(+한 pass)까지로 제한한다. C4에서 A TTFT(B와 함께)는 3.19~3.31 s에서 2.27~2.40 s로 줄었고, A 혼자일 때(1.86~1.87 s)는 그대로다. B는 약 0.26 s 빨라졌다. S3 지연 합계는 회귀가 없다(차이는 slow/fast mode 때문이다). 남은 약 0.4 s는 B의 2048 token pass를 기다리는 시간이다 |
+| D9 | 한국어 답변에 섞이는 한자 억제(`--han-scale`, 요청 `han_scale`) | **완료**(2026-11-10, `9bd4feeb`): 한자 token(55,659/248,320)의 logit에 ln(x)를 더한다. 1.0이면 출력이 cand9과 같고(batch·cache 41/41), 속도 차이 없음. 습관성 한자는 줄고(관직 prompt 24→16, `장원(状元)`→`장원(1등)`), 질문이 요구하는 한자(사자성어)는 0.1에서도 남는다. 27B도 같은 경향. 요청별 덮어쓰기 확인. 운영 기본값 추천 0.2. 증거 `build/b1/han-20261110/` |
 
 ## GPU 패스 구성 (한 번에)
 
