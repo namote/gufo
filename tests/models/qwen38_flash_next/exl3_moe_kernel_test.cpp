@@ -1412,7 +1412,12 @@ void SelectedHeadRate(int bits, bool half = false, unsigned k = 128) {
     else
       Require(Read(y, n) == std::vector<float>(n), "empty head wrote output");
   }
-  for (ex::BitRate invalid : {ex::BitRate{2, true}, ex::BitRate{4, true}}) {
+  // Formats no kernel takes for this codebook (K2.5 is a mul1 format since
+  // every EXL3 codebook and rate run on the fast kernels).
+  for (ex::BitRate invalid :
+       {ex::BitRate{2, true}, ex::BitRate{4, true}, ex::BitRate{9, false}}) {
+    if (ex::Supports(bank.codebook, invalid))
+      continue;
     auto descriptor = bank.descriptors[0];
     descriptor.rate = invalid;
     auto weight = bank.weight;
@@ -1424,7 +1429,7 @@ void SelectedHeadRate(int bits, bool half = false, unsigned k = 128) {
     } catch (const std::runtime_error&) {
       rejected = true;
     }
-    Require(rejected, "unsupported fractional head accepted");
+    Require(rejected, "unsupported head format accepted");
   }
   std::cout << "selected head K=" << bits << (half ? ".5" : "") << " passed\n";
 }

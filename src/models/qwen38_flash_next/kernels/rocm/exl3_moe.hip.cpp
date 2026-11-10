@@ -2039,6 +2039,10 @@ void Exl3DraftHead(const DeviceTensor& head, const float* x, float* logits,
         "EXL3 draft head needs a complete prefix of a supported format");
   if (prefix == 0 && extras == 0)
     return;
+  if (x == nullptr || logits == nullptr || (extras != 0 && ids == nullptr) ||
+      s.head_segments == nullptr || s.head_values == nullptr ||
+      s.projection.fast_input == nullptr)
+    throw std::invalid_argument("EXL3 draft head: missing buffers");
   hipLaunchKernelGGL(SelectSegments, dim3(1), dim3(1), 0, stream, ids, extras,
                      prefix, l.n, s.head_segments);
   hipLaunchKernelGGL(HeadInput, dim3(l.k / 128), dim3(32), 0, stream, l, x,
