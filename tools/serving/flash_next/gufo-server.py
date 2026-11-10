@@ -145,6 +145,9 @@ def build_command(state):
                 '--cache-disk', '/cache/continuations', '--cache-disk-bytes', str(DISK_CACHE_BYTES),
                 '--temperature', str(TEMPERATURE), '--top-k', '20', '--top-p', '0.95', '--min-p', '0',
                 '--repeat-penalty', '1', '--han-scale', str(HAN_SCALE),
+                # User decision (2026-11-10): typical acceptance made sampled
+                # replies loop; it is off until D10 removes the feature.
+                '--typical-acceptance', 'off',
                 '--presence-penalty', '0', '--frequency-penalty', '0', '--max-tokens', '-1',
                 '--request-timeout-ms', '0', '--stall-timeout-ms', '0',
                 '--max-output-bytes', '9223372036854775807',
