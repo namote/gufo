@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/core/hip/kvarn_layout.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "tests/models/qwen27b/kvarn_session.hpp"
 
@@ -540,6 +541,119 @@ void CheckCompact(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
             << " KV), round trip and decode exact\n";
 }
 
+// A speculative rejection at a group end (C6): a verification pass of 8 rows
+// writes drafts past a group end, so its boundary flush quantizes that group
+// from rejected rows (632 + 8 ends exactly at the group end instead, which
+// stays in the ring); only `committed` rows are kept. The slot
+// then decodes on (or verifies again, all rows accepted, when `reverify`)
+// past the group end, which reopens and requantizes the group. Every
+// retained component (records, sink rows, recurrent state, logits) must
+// equal a cold autoregressive replay of the accepted tokens byte for byte,
+// and the tail state in its header and its valid ring rows [base, position).
+// Draft rows come from the verification GEMMs, which CheckStorage shows read
+// and write as decode steps do (logits exact).
+void CheckRejectionReplay(
+    const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
+    QwenKvCacheStorage storage) {
+  constexpr std::uint32_t kContext = 1024, kPrompt = 600, kEnd = 660;
+  auto policy = gufo::hip::QwenExecutionPolicy::Production();
+  policy.kv_cache_storage = storage;
+  const std::string name(gufo::hip::QwenKvCacheStorageName(storage));
+  gufo::testing::kvarn::Session cold(model, kContext, policy);
+  const auto tokens = Fixture(cold.Executor(), kEnd + 8);
+  (void)cold.Executor().ForwardPromptBatch(std::span(tokens).first(kPrompt));
+  for (std::uint32_t pos = kPrompt; pos < kEnd; ++pos)
+    (void)cold.Executor().ForwardToken(tokens[pos], pos);
+  const auto expected = cold.Capture();
+  const auto expected_logits = Logits(cold.Executor());
+  // Rejected drafts: tokens of the same fixture from elsewhere.
+  const auto wrong = [&](std::uint32_t pos) { return tokens[pos - 300]; };
+  struct Case {
+    std::uint32_t start, committed;
+    bool reverify;
+  };
+  for (const Case c :
+       {Case{636, 2, false}, Case{636, 1, false}, Case{636, 2, true},
+        Case{632, 3, false}, Case{634, 5, true}}) {
+    const std::string label =
+        name + " rejection at " + std::to_string(c.start) + " + " +
+        std::to_string(c.committed) + " of 8" + (c.reverify ? " reverify" : "");
+    gufo::testing::kvarn::Session session(model, kContext, policy);
+    auto& executor = session.Executor();
+    (void)executor.ForwardPromptBatch(std::span(tokens).first(kPrompt));
+    for (std::uint32_t pos = kPrompt; pos < c.start; ++pos)
+      (void)executor.ForwardToken(tokens[pos], pos);
+    std::vector<Token> drafts(tokens.begin() + c.start,
+                              tokens.begin() + c.start + 8);
+    for (std::uint32_t r = c.committed; r < 8; ++r) {
+      const auto right = tokens[c.start + r];
+      drafts[r] = wrong(c.start + r) != right ? wrong(c.start + r)
+                                              : static_cast<Token>(right + 1);
+    }
+    // As SpeculativeVerifier drives it: a rejection restores the saved
+    // recurrent state and commits the accepted rows; a fully accepted chunk
+    // only finishes.
+    executor.SaveState(c.start);
+    (void)executor.ForwardVerificationChunk(drafts, c.start);
+    executor.RestoreState();
+    executor.CommitVerificationChunk(
+        std::span(tokens).subspan(c.start, c.committed), c.start);
+    executor.FinishVerification();
+    std::uint32_t position = c.start + c.committed;
+    if (c.reverify) {
+      executor.SaveState(position);
+      (void)executor.ForwardVerificationChunk(
+          std::span(tokens).subspan(position, 8), position);
+      executor.FinishVerification();
+      position += 8;
+    }
+    for (; position < kEnd; ++position)
+      (void)executor.ForwardToken(tokens[position], position);
+    const auto actual = session.Capture();
+    Expect(actual.positions == expected.positions,
+           label + ": positions differ from the cold replay");
+    constexpr std::size_t kLine = 4ULL * 256 * 2, kRing = 256 * kLine;
+    constexpr std::size_t kTailState = 64 + 2ULL * 16 * kRing;
+    std::size_t differing = 0, tail_states = 0;
+    std::string which;
+    for (std::size_t i = 0; i < expected.components.size(); ++i) {
+      const auto& a = actual.components[i];
+      const auto& b = expected.components[i];
+      bool same = a.size() == b.size();
+      if (same && !session.IsRows(i) && a.size() == kTailState) {
+        ++tail_states;
+        std::array<std::uint32_t, 3> header{};
+        std::memcpy(header.data(), b.data(), sizeof(header));
+        same = std::memcmp(a.data(), b.data(), sizeof(header)) == 0;
+        for (std::uint32_t t = header[1]; same && t < kEnd; ++t)
+          for (std::size_t segment = 0; segment < 32; ++segment) {
+            const std::size_t at =
+                64 + segment * kRing +
+                std::size_t{gufo::hip::KvarnFp16Row(t) - 128} * kLine;
+            same =
+                same && std::memcmp(a.data() + at, b.data() + at, kLine) == 0;
+          }
+      } else if (same) {
+        same = std::memcmp(a.data(), b.data(), a.size()) == 0;
+      }
+      if (!same) {
+        ++differing;
+        which += " " + std::to_string(i);
+      }
+    }
+    Expect(tail_states == 1, label + ": expected one KVarN tail state");
+    const auto logits = Logits(executor);
+    const bool logits_exact = std::memcmp(logits.data(), expected_logits.data(),
+                                          logits.size() * sizeof(float)) == 0;
+    std::cout << label << " vs cold AR replay to " << kEnd << ": "
+              << expected.components.size() << " components, " << differing
+              << " differ [" << which << " ] logits exact=" << logits_exact
+              << '\n';
+    Expect(differing == 0 && logits_exact,
+           label + ": state differs from the cold replay");
+  }
+}
+
 }  // namespace
 
 int main(int argc, const char* const* argv) {
@@ -560,10 +674,15 @@ int main(int argc, const char* const* argv) {
            "the KVarN check requires Qwen3.8 27B");
     const bool continuation_only =
         argc > 2 && std::string_view(argv[2]) == "--continuation-only";
+    const bool rejection_only =
+        argc > 2 && std::string_view(argv[2]) == "--rejection-only";
     bool failed = false;
     for (const auto storage :
          {QwenKvCacheStorage::kKvarnK4V2, QwenKvCacheStorage::kKvarnK4V4}) {
       try {
+        CheckRejectionReplay(model, storage);
+        if (rejection_only)
+          continue;
         // Inside the sink; at its end; inside a group; at the block boundary
         // 512 with rows reaching into a block without records (the K2 bug);
         // at a group end the next pass flushes (128 tail rows); and with a

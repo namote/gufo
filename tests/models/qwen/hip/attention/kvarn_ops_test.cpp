@@ -859,6 +859,186 @@ void TestPrefill(int bits, unsigned start, unsigned rows) {
   Check(error < 2e-3 && record_diff == 0 && row_diff == 0, line);
 }
 
+// How a write stores rows: decode-style row writes and a boundary flush
+// (Pass), a multi-row pass (verification, LaunchKvarnPassAttention), or a
+// prompt chunk (LaunchKvarnPrefillAttention). The tail follows the arena's
+// PrepareKvarnPass / PrepareKvarnPrefill.
+enum class StoreKind { kRows, kPass, kPrefill };
+
+void Store(Storage& storage, gufo::hip::KvarnTail& tail,
+           const DeviceBuffer<float>& k, const DeviceBuffer<float>& v,
+           unsigned start, unsigned n, StoreKind kind) {
+  if (kind == StoreKind::kRows) {
+    (void)Pass(storage, tail, k, v, start, n);
+    HIP_CHECK(hipDeviceSynchronize());
+    return;
+  }
+  const std::size_t width = std::size_t{kHeads} * kDim;
+  const auto q = RandomFloats(std::size_t{n} * width, 23 + start, 1.0F);
+  const auto gate = RandomFloats(q.size(), 24 + start, 1.0F);
+  DeviceBuffer<float> dq(q), dgate(gate), out(q.size());
+  const float* kp = k.data() + std::size_t{start} * kRowWidth;
+  const float* vp = v.data() + std::size_t{start} * kRowWidth;
+  if (kind == StoreKind::kPass) {
+    const auto plan = gufo::hip::PlanKvarnPass(tail, start, n);
+    if (!plan.error.empty())
+      throw std::logic_error(std::string(plan.error));
+    gufo::hip::LaunchKvarnFlush(storage.View(), kLayers, plan.first_group,
+                                plan.groups, nullptr);
+    tail.flushed_end = plan.flushed_end;
+    tail.written_end = std::max(tail.written_end, start + n);
+    DeviceBuffer<float> scratch(
+        gufo::hip::KvarnScratchElements(n, gufo::hip::kKvarnMaxSplits));
+    for (unsigned layer = 0; layer < kLayers; ++layer)
+      gufo::hip::LaunchKvarnPassAttention(
+          dq.data(), kp, vp, dgate.data(), storage.View(), out.data(), layer,
+          start, n, plan, {scratch.data(), scratch.size()}, nullptr);
+  } else {
+    const auto plan = gufo::hip::PlanKvarnPrefill(tail, start, n);
+    if (!plan.error.empty())
+      throw std::logic_error(std::string(plan.error));
+    gufo::hip::LaunchKvarnFlush(storage.View(), kLayers, plan.first_group,
+                                plan.groups, nullptr);
+    tail.flushed_end = plan.flushed_end;
+    tail.written_end = std::max(tail.written_end, start + n);
+    if (plan.flushed_end > plan.target)
+      tail.written_end =
+          gufo::hip::KvarnRingReach(plan.flushed_end, tail.written_end);
+    const unsigned length = start + n;
+    const std::size_t padded = (length + 15U) & ~std::size_t{15};
+    DeviceBuffer<float> packed_k(std::size_t{kKvHeads} * length * kDim / 2 +
+                                 64);
+    DeviceBuffer<float> packed_v(std::size_t{kKvHeads} * padded * kDim / 2 +
+                                 64);
+    DeviceBuffer<std::uint16_t> staging(2 * gufo::hip::KvarnStagingRows(n) *
+                                        kRowWidth);
+    for (unsigned layer = 0; layer < kLayers; ++layer)
+      gufo::hip::LaunchKvarnPrefillAttention(
+          dq.data(), kp, vp, dgate.data(), storage.View(), out.data(), layer,
+          start, n, plan, {packed_k.data(), packed_k.size()},
+          {packed_v.data(), packed_v.size()}, {staging.data(), staging.size()},
+          0, nullptr);
+  }
+  HIP_CHECK(hipDeviceSynchronize());
+}
+
+// Requantization after a rollback equals a cold fill byte for byte. After
+// history [0, draft_start) (decode passes), a verification pass writes
+// `draft_rows` draft rows that cross a group end, so its boundary flush
+// quantizes that group from them. Verification accepts only up to `commit`
+// (inside that group); nothing is rolled back eagerly. The next write starts
+// at `commit` with the accepted continuation (the same rows when `same`,
+// else rows that differ from the rejected drafts), reopens the group and
+// requantizes it, and decode passes run on to `length`. Every record and
+// FP16 ring row must then equal a cold decode fill of the accepted rows.
+void TestRewindRequantize(int bits, unsigned draft_start, unsigned draft_rows,
+                          unsigned commit, unsigned rewrite_rows,
+                          StoreKind rewrite, bool same, unsigned length) {
+  const auto truth = RandomRows(length, 301 + draft_start + commit + bits);
+  auto drafts = truth;
+  if (!same) {
+    const auto other = RandomRows(length, 907 + draft_start + bits);
+    for (std::size_t i = std::size_t{commit} * kRowWidth;
+         i < std::size_t{draft_start + draft_rows} * kRowWidth; ++i) {
+      drafts.k[i] = other.k[i];
+      drafts.v[i] = other.v[i];
+    }
+  }
+  DeviceBuffer<float> k(truth.k), v(truth.v), dk(drafts.k), dv(drafts.v);
+  const unsigned blocks = length / 256 + 1;
+
+  Storage cold(bits, blocks);
+  gufo::hip::KvarnTail cold_tail;
+  Feed(cold, cold_tail, k, v, 0, length);
+  const unsigned complete = length / kGroup * kGroup;
+  const auto finish = [&](Storage& storage, gufo::hip::KvarnTail& tail) {
+    if (complete > tail.flushed_end)
+      gufo::hip::LaunchKvarnFlush(
+          storage.View(), kLayers, tail.flushed_end / kGroup,
+          (complete - tail.flushed_end) / kGroup, nullptr);
+    HIP_CHECK(hipDeviceSynchronize());
+  };
+  finish(cold, cold_tail);
+
+  Storage rewound(bits, blocks);
+  gufo::hip::KvarnTail tail;
+  Feed(rewound, tail, k, v, 0, draft_start);
+  const auto draft_plan =
+      gufo::hip::PlanKvarnPass(tail, draft_start, draft_rows);
+  Store(rewound, tail, dk, dv, draft_start, draft_rows, StoreKind::kPass);
+  const unsigned crossed = draft_plan.boundary;
+  // The drafts' boundary flush really wrote the group the rewind reopens.
+  const std::size_t record_bytes = KvarnRecord(bits).bytes;
+  const auto group_differs = [&](unsigned group) {
+    const auto a = rewound.records.CopyToHost();
+    const auto b = cold.records.CopyToHost();
+    std::size_t differ = 0;
+    for (unsigned layer = 0; layer < kLayers; ++layer)
+      for (unsigned kv = 0; kv < kKvHeads; ++kv)
+        differ += std::memcmp(a.data() + rewound.RecordOffset(layer, group, kv),
+                              b.data() + cold.RecordOffset(layer, group, kv),
+                              record_bytes) != 0;
+    return differ;
+  };
+  const unsigned reopened = commit / kGroup;
+  const std::size_t stale = crossed != 0 && crossed / kGroup - 1 == reopened
+                                ? group_differs(reopened)
+                                : 0;
+  Store(rewound, tail, k, v, commit, rewrite_rows, rewrite);
+  Feed(rewound, tail, k, v, commit + rewrite_rows, length);
+  finish(rewound, tail);
+
+  const auto a = rewound.records.CopyToHost();
+  const auto b = cold.records.CopyToHost();
+  std::size_t record_diff = 0, row_diff = 0;
+  for (unsigned layer = 0; layer < kLayers; ++layer)
+    for (unsigned g = 1; g < complete / kGroup; ++g)
+      for (unsigned kv = 0; kv < kKvHeads; ++kv)
+        record_diff +=
+            std::memcmp(a.data() + rewound.RecordOffset(layer, g, kv),
+                        b.data() + cold.RecordOffset(layer, g, kv),
+                        record_bytes) != 0;
+  const auto rk = rewound.k_rows.CopyToHost(), ck = cold.k_rows.CopyToHost();
+  const auto rv = rewound.v_rows.CopyToHost(), cv = cold.v_rows.CopyToHost();
+  for (unsigned layer = 0; layer < kLayers; ++layer)
+    for (unsigned t = 0; t < length; ++t) {
+      if (t >= kGroup && t < complete)
+        continue;
+      const std::size_t at =
+          layer * kFp16LayerElements + std::size_t{KvarnFp16Row(t)} * kRowWidth;
+      row_diff +=
+          std::memcmp(rk.data() + at, ck.data() + at, kRowWidth * 2) != 0 ||
+          std::memcmp(rv.data() + at, cv.data() + at, kRowWidth * 2) != 0;
+    }
+  static constexpr const char* kKinds[] = {"rows", "pass", "prefill"};
+  char line[320];
+  std::snprintf(line, sizeof(line),
+                "rewind requantize k4v%d drafts=%u+%u boundary=%u commit=%u "
+                "rewrite=%s %u%s length=%u stale_records=%zu "
+                "record_diff=%zu row_diff=%zu",
+                bits, draft_start, draft_rows, crossed, commit,
+                kKinds[static_cast<int>(rewrite)], rewrite_rows,
+                same ? " same" : "", length, stale, record_diff, row_diff);
+  // A rewrite of different rows must have had a stale group to replace.
+  const bool meaningful = same || crossed == 0 || stale != 0;
+  Check(meaningful && record_diff == 0 && row_diff == 0, line);
+}
+
+// Rollback then requantization of the group a rejected draft closed.
+void TestRewindCases(int bits) {
+  using enum StoreKind;
+  TestRewindRequantize(bits, 636, 8, 637, 8, kPass, false, 900);
+  TestRewindRequantize(bits, 636, 8, 636, 8, kPass, false, 900);
+  TestRewindRequantize(bits, 636, 8, 638, 8, kRows, true, 900);
+  TestRewindRequantize(bits, 636, 8, 637, 1, kRows, false, 900);
+  // A pass ending at a group end leaves the group in the ring (lagging
+  // flushed_end); the rejection lands inside it.
+  TestRewindRequantize(bits, 500, 12, 505, 8, kPass, false, 700);
+  // A long draft pass, then a prompt chunk from inside the group.
+  TestRewindRequantize(bits, 600, 100, 610, 300, kPrefill, false, 1000);
+  TestRewindRequantize(bits, 16300, 128, 16380, 16, kPass, false, 16500);
+}
+
 // `time`: microseconds per attention launch at the production split policy,
 // for comparison with the K1b prototype sweep (KVARN.md). Inputs cycle
 // through copies of at least 256 MiB, past the 32 MiB MALL, and the timed
@@ -1022,6 +1202,16 @@ int main(int argc, char** argv) {
     TimeAttention(0);
     return 0;
   }
+  if (argc > 1 && std::string_view(argv[1]) == "rewind") {
+    try {
+      for (const int bits : {2, 4})
+        TestRewindCases(bits);
+    } catch (const std::exception& error) {
+      std::cerr << "Qwen KVarN ops test: " << error.what() << '\n';
+      return 1;
+    }
+    return failures == 0 ? 0 : 1;
+  }
   if (argc > 1 && std::string_view(argv[1]) == "verify") {
     for (const int bits : {2, 4})
       for (const auto [start, rows] :
@@ -1080,6 +1270,7 @@ int main(int argc, char** argv) {
       TestVerifyMatchesDecode(bits, 600, 100);    // across the end of group 4
       TestVerifyMatchesDecode(bits, 1000, 128);   // the longest pass
       TestVerifyMatchesDecode(bits, 16300, 128);  // 20 splits, a group end
+      TestRewindCases(bits);
     }
   } catch (const std::exception& error) {
     std::cerr << "Qwen KVarN ops test: " << error.what() << '\n';
