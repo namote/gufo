@@ -148,7 +148,7 @@ $COLLECT $MODEL DATA/tuning.jsonl OFF evaluate --max-new-tokens 1024
 $COLLECT $MODEL DATA/tuning.jsonl ON-L38-S1 evaluate --max-new-tokens 1024 \
   --profile CANDIDATES/layer38-strength1.json
 python3 $PREP make-profile --fit CANDIDATES --direction-layer 38 \
-  --residual 1 --output NEW.json   # residual-only; writers default to 0
+  --residual 1 --output NEW.json   # residual-only; writers 0 from a fit
 python3 $PREP make-profile --fit CANDIDATES --direction-layer 38 \
   --attention max_w=1.5,peak=38,min_w=0.5,width=12 --mlp 0.5 --output NEW2.json
 ```

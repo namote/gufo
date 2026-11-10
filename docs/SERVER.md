@@ -489,7 +489,9 @@ residual itself after each layer (on Flash-Next, each hyper-connection
 stream), exactly where the profile's directions were measured, so `residual`
 1 leaves no component along the direction there, including what entered
 through the embedding or earlier layers, which writer strengths cannot reach.
-The two kinds may be combined; profiles without `residual` default it to 0.
+The two kinds may be combined; profiles without `residual` (and every v1
+profile, whose single direction a request may still apply to the residual)
+default it to 0.
 Raw completions do not accept it, and an unloaded profile,
 unknown member, invalid setting or setting sent with `"enabled":false` returns
 `invalid_abliteration`. ON and OFF requests, and different profiles or

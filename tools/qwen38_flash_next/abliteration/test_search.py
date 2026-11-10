@@ -149,7 +149,7 @@ class OfflineLogicTest(unittest.TestCase):
                   'attention.min_frac': 0.5, 'attention.width': 2.0,
                   'mlp.max_w': 0.0, 'mlp.peak': 0.0, 'mlp.min_frac': 0.0,
                   'mlp.width': 1.0}
-        values = search.settings(params, LAYERS)
+        values = search.settings(params, LAYERS, 'writer')
         self.assertEqual(values['direction_layer'], 1)
         self.assertEqual(values['attention'], [1.5, 2.0, 1.5, 1.0])
         self.assertEqual(values['mlp'], [0.0] * LAYERS)
@@ -184,7 +184,7 @@ class OfflineLogicTest(unittest.TestCase):
             history.append(dict(trial=i, params=p, refusals=i % 3, kl=1 / i))
 
     def test_proposals_stay_in_bounds_and_are_deterministic(self):
-        box = search.bounds(LAYERS, [1, 2], 4.0)
+        box = search.bounds(LAYERS, [1, 2], 4.0, 'writer')
         history = [dict(trial=0, params=None, refusals=5, kl=0.0)]
         for i in range(1, 30):
             params = search.propose(i, history, box, 5, 30, seed=3)

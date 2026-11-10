@@ -306,13 +306,13 @@ def main():
     source.add_argument('--fit', help='a fit output directory (statistics.npz)')
     source.add_argument('--profile', help='an existing v2 profile to re-default')
     make.add_argument('--direction-layer', type=int, required=True)
-    make.add_argument('--attention', default='0',
+    make.add_argument('--attention',
                       help='2.0 | w0,...,wN-1 | max_w=..,peak=..,min_w=..,width=.. '
-                           '(default 0)')
-    make.add_argument('--mlp', default='0', help='as --attention (default 0)')
+                           '(default: the --profile value, else 0)')
+    make.add_argument('--mlp', help='as --attention')
     make.add_argument('--residual',
                       help='post-layer residual strengths, as --attention '
-                           '(default: omitted, read as 0)')
+                           '(default: the --profile value, else omitted = 0)')
     make.add_argument('--output', required=True)
     args = parser.parse_args()
     if args.command == 'import-data':
@@ -325,11 +325,19 @@ def main():
         output = Path(args.output)
         if output.exists():
             raise SystemExit('use a new output path; existing profiles are preserved')
+        # An omitted strength keeps the base profile's default (zero, or no
+        # residual member, for a fit output), so re-defaulting one member
+        # never silently clears the others.
+        def strength(spec, name, fallback):
+            if spec is not None:
+                return parse_weights(spec, layers)
+            return base.get(name, fallback)
+
         save_profile(output, make_profile(
-            base, args.direction_layer, parse_weights(args.attention, layers),
-            parse_weights(args.mlp, layers),
-            residual=(None if args.residual is None
-                      else parse_weights(args.residual, layers)),
+            base, args.direction_layer,
+            strength(args.attention, 'attention', [0.0] * layers),
+            strength(args.mlp, 'mlp', [0.0] * layers),
+            residual=strength(args.residual, 'residual', None),
             status='candidate-not-qualified'))
         print(output)
 

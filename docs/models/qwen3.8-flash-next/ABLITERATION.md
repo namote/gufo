@@ -37,11 +37,13 @@ This is a reversible inference intervention, not a weight conversion.
 | Mixed batch, up to eight sessions | `runtime/executor_batch.cpp` | `runtime/executor_batch.cpp`, after the FFN `CombineBatch` |
 
 - The FFN combine normally also writes the next mixer's grouped norm (F32,
-  F16, tiled Q8, inject partials) and may leave its residual update deferred.
+  F16, tiled Q8, inject partials), and it settles any update the attention
+  combine deferred.
   A session with a nonzero residual strength takes the unfused layer end
   instead: the combine gets no next norm (as before a PLE layer), any pending
-  residual update is applied, all four streams are projected in place, and
-  the next mixer normalizes the projected residual itself. ON already
+  residual update is applied (none should remain), all four streams are
+  projected in place, and the next mixer normalizes the projected residual
+  itself. ON already
   disables the deferring MoE combines. In a mixed batch the combine writes
   every session's norm, then only the rows of sessions with residual
   strengths are projected and renormalized; other sessions keep exactly the
@@ -168,9 +170,10 @@ The Python fitter needs NumPy; it does not run GPU work.
    on every layer, writers 0).
    `prepare.py make-profile --fit NEW_CANDIDATES --direction-layer 36
    --residual 1 --output NEW.json` (or `--profile V2.json` to re-default an
-   existing profile) writes one v2 profile. `--attention`, `--mlp` (default 0)
-   and `--residual` (default omitted, read as 0) take one number, `layers`
-   comma-separated numbers, or a curve
+   existing profile) writes one v2 profile. `--attention`, `--mlp` and
+   `--residual` (each omitted one keeps the `--profile` value; from a fit, 0,
+   with no `residual` member) take one number, `layers` comma-separated
+   numbers, or a curve
    `max_w=2,peak=36,min_w=0.5,width=10`: weight(i) = max_w + (min_w - max_w)
    * |i - peak| / width when |i - peak| <= width, else 0 (Heretic's form).
 4. `collector MODEL DATA/tuning.jsonl OFF evaluate --max-new-tokens 1024` stores

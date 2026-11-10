@@ -13,7 +13,9 @@ own.
   removed from the residual after each layer, where the collector measured
   it, so strength 1 leaves no component there whatever its source.
 * `writer`: the attention and mlp writer curves (the D15 search; its logs
-  keep their fingerprint and resume).
+  keep their fingerprint and resume). Trials send `residual: 0` so profile
+  residual defaults never leak in, which needs a server with residual
+  strengths (D16).
 * `both`: all three curves.
 
 Each trial scores two objectives, both minimized:
@@ -153,7 +155,7 @@ MODES = {
 STRENGTHS = ('attention', 'mlp', 'residual')
 
 
-def bounds(layers, direction_layers, max_weight, mode='writer'):
+def bounds(layers, direction_layers, max_weight, mode):
     first, last = min(direction_layers), max(direction_layers)
     box = {'direction_layer': (first, last)}
     for part in MODES[mode]:
@@ -181,7 +183,7 @@ def perturb(parent, box, rng, scale):
                  for k, (lo, hi) in box.items()}, box)
 
 
-def settings(params, layers, mode='writer'):
+def settings(params, layers, mode):
     """Per-request settings of one parameter point: the searched strengths
     as curves, the others 0 (so profile defaults never leak into a trial)."""
     result = {'direction_layer': params['direction_layer']}
@@ -308,7 +310,7 @@ def load_prompts(paths, split, thinking, counts, seed):
 
 class Search:
     def __init__(self, client, model, prompts, info, log, max_tokens,
-                 concurrency=1, out=sys.stdout, mode='writer'):
+                 concurrency=1, out=sys.stdout, mode='residual'):
         self.client, self.model, self.prompts = client, model, prompts
         self.layers = info['layers']
         self.max_tokens, self.concurrency, self.out = max_tokens, concurrency, out

@@ -174,22 +174,35 @@ class ProfileTest(unittest.TestCase):
             source = Path(tmp) / 'base.json'
             prepare.save_profile(source, prepare.make_profile(
                 self.base(), 0, [1, 1], [0, 0]))
-            output = Path(tmp) / 'residual.json'
-            argv = sys.argv
-            sys.argv = ['prepare.py', 'make-profile', '--profile', str(source),
-                        '--direction-layer', '1', '--residual',
-                        'max_w=1,peak=1,min_w=0.5,width=2', '--output', str(output)]
-            try:
-                with contextlib.redirect_stdout(io.StringIO()):
-                    prepare.main()
-            finally:
-                sys.argv = argv
-            profile = json.loads(output.read_text())
-            # Writers default to 0 when only --residual is given.
+            def make(output, *flags):
+                argv = sys.argv
+                sys.argv = ['prepare.py', 'make-profile', '--profile', str(source),
+                            '--direction-layer', '1', *flags, '--output', str(output)]
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        prepare.main()
+                finally:
+                    sys.argv = argv
+                return json.loads(output.read_text())
+
+            profile = make(Path(tmp) / 'residual.json', '--attention', '0',
+                           '--residual', 'max_w=1,peak=1,min_w=0.5,width=2')
             self.assertEqual(profile['attention'], [0, 0])
+            # Omitted strengths keep the base profile's defaults.
             self.assertEqual(profile['mlp'], [0, 0])
             self.assertEqual(profile['residual'], [0.75, 1.0])
             self.assertEqual(profile['direction_layer'], 1)
+            # Re-defaulting from that profile keeps its residual curve.
+            source = Path(tmp) / 'residual.json'
+            again = make(Path(tmp) / 'again.json', '--mlp', '0.5')
+            self.assertEqual(again['attention'], [0, 0])
+            self.assertEqual(again['mlp'], [0.5, 0.5])
+            self.assertEqual(again['residual'], [0.75, 1.0])
+            # A base without residual keeps it absent (read as 0).
+            source = Path(tmp) / 'base.json'
+            plain = make(Path(tmp) / 'plain.json')
+            self.assertEqual(plain['attention'], [1, 1])
+            self.assertNotIn('residual', plain)
 
     def test_fit_residual_candidates(self):
         with tempfile.TemporaryDirectory() as tmp:
