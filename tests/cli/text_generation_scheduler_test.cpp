@@ -188,6 +188,11 @@ struct FakeControl {
   /// consecutive gates use different labels so each wait sees its own gate.
   std::deque<std::pair<TextRunnerToken, std::size_t>> next_prefill_gates;
   std::optional<TextRunnerToken> throw_advance_label;
+  /// Wall time each prefill chunk of `slow_prefill_label` takes.
+  std::optional<TextRunnerToken> slow_prefill_label;
+  std::chrono::milliseconds slow_prefill_time{0};
+  /// Wall time each decode advance takes.
+  std::chrono::milliseconds slow_advance_time{0};
   std::atomic<bool> device_usable{true};
   std::atomic<std::size_t> device_probes{0};
   std::atomic<std::size_t> idle_probes{0};
@@ -432,6 +437,8 @@ public:
     fake.label = prompt.front();
     const std::size_t consumed = std::min(
         {max_input_tokens, prompt.size() - offset, control_->prefill_capacity});
+    if (control_->slow_prefill_label == fake.label)
+      std::this_thread::sleep_for(control_->slow_prefill_time);
 
     {
       std::unique_lock<std::mutex> lock(control_->mutex);
@@ -594,6 +601,8 @@ public:
       });
     }
 
+    if (control_->slow_advance_time.count() > 0)
+      std::this_thread::sleep_for(control_->slow_advance_time);
     fake.EnsureRows(fake.position + 1);
     ++fake.position;
     ++fake.decode_count;
@@ -1764,6 +1773,61 @@ void TestPrefillYieldsToEveryDueDecoder(bool multi_token, bool batched) {
   }
   Expect(result_c.max_consecutive_active_prefill_chunks == 1,
          "scheduler never runs consecutive chunks while decode is due");
+}
+
+void TestSlowPrefillChunkBuysDecodeTime(bool multi_token, bool batched) {
+  auto control = std::make_shared<FakeControl>();
+  control->multi_token_decode = multi_token;
+  control->batched_multi_token_decode = batched;
+  control->supports_batched_advance = multi_token;
+  control->block_advance_label = 1;
+  // Each prompt chunk of B costs far more device time than a decode round,
+  // as a bounded chunk deep in a long prompt does on the GPU.
+  control->slow_prefill_label = 2;
+  control->slow_prefill_time = std::chrono::milliseconds(60);
+  control->slow_advance_time = std::chrono::milliseconds(5);
+  auto scheduler =
+      MakeScheduler(control, 2,
+                    {.decode_active_tokens = 2,
+                     .decode_time_share_min = std::chrono::milliseconds(10)});
+
+  // Within the fake 128 context; the fake emits one token per advance, so A
+  // outlasts B's four chunks.
+  const std::size_t output_tokens = 100;
+  auto request_a = scheduler->Submit({1}, output_tokens, 0.0F);
+  control->WaitForAdvance(1);
+  auto request_b = scheduler->Submit({2, 20, 21, 22, 23, 24, 25}, 2, 0.0F);
+  control->ReleaseAdvance();
+
+  const auto result_a = request_a.Wait();
+  const auto result_b = request_b.Wait();
+  Expect(result_a.tokens == ExpectedTokens(1, output_tokens) &&
+             result_b.tokens == ExpectedTokens(2, 2),
+         "time-shared decode keeps both trajectories isolated");
+
+  const auto events = control->Events();
+  std::vector<std::size_t> b_chunks;
+  std::size_t last_a = 0;
+  for (std::size_t index = 0; index < events.size(); ++index) {
+    if (events[index].kind == EventKind::kPrefill && events[index].label == 2)
+      b_chunks.push_back(index);
+    if (events[index].kind == EventKind::kAdvance && events[index].label == 1)
+      last_a = index;
+  }
+  Expect(b_chunks.size() == 4, "B prefills in bounded chunks");
+  Expect(b_chunks.back() < last_a,
+         "B's prompt finishes while A is still decoding");
+  for (std::size_t chunk = 1; chunk < b_chunks.size(); ++chunk) {
+    std::size_t a_rounds = 0;
+    for (std::size_t index = b_chunks[chunk - 1] + 1; index < b_chunks[chunk];
+         ++index) {
+      a_rounds +=
+          events[index].kind == EventKind::kAdvance && events[index].label == 1;
+    }
+    // A 60 ms chunk buys about 12 rounds of 5 ms; allow host jitter.
+    Expect(a_rounds > 1, "a slow prefill chunk gives the decoder more rounds");
+    Expect(a_rounds <= 40, "the decoder's turn ends when its time is spent");
+  }
 }
 
 void TestNonIncrementalRunnerFallsBackSafely() {
@@ -3584,6 +3648,7 @@ int main() {
         continue;
       TestDecodeActivePrefillIsBounded(multi_token, batched);
       TestPrefillYieldsToEveryDueDecoder(multi_token, batched);
+      TestSlowPrefillChunkBuysDecodeTime(multi_token, batched);
     }
   }
   TestNonIncrementalRunnerFallsBackSafely();

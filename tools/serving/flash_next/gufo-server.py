@@ -23,8 +23,8 @@ STATE = ROOT / 'server-state.json'
 IMAGE = 'ai-tools/gufo-eval:native-exl3-vision-rocm101'
 IMAGE_ID = 'sha256:e7a761a40187efb13515a0275362ab09d084a129f4544aa4300ec5cccb8c7468'
 MODEL = '/home/m2on/projects/models/llm/flash-next-exl3-gufo-c03'
-RUNTIME = '/home/m2on/.local/share/gufo/runtime-20261111'
-GUFO_SHA256 = '02dce1230c37d9b7075e7ac098761fe2e8d4cfee6de4f1ea5c5e398f14ea2c4a'
+RUNTIME = '/home/m2on/.local/share/gufo/runtime-20261111b'
+GUFO_SHA256 = '868b34a46ba5a3823644b528c872ec8b60fcc5e35948e3b6fdb32add6ac5f081'
 # Runtime abliteration profile shipped in RUNTIME (writer, layer-36 direction,
 # attention 2, mlp 0.5). Loaded only; requests enable it per call.
 ABLITERATION_PROFILE = '/candidate/abliteration-fnx.json'
@@ -45,8 +45,9 @@ ENABLE_YARN = CONTEXT > 262144
 RAM_CACHE_BYTES = 4 * 2**30
 SESSIONS = 2
 KV_CACHE_TYPE = 'kvarn-k4v4'
-# 0: the server sizes the pool for every session's full context (startup line
-# reports automatic_bytes). K4V4 holds about 3.7x the FP16 tokens per byte.
+# 0: no shared pool on Flash-Next; each session allocates its full-context KV.
+# K4V4 is about 2,420,736 B per 256-token block (records + FP16 MTP KV + pooled
+# keys): 4,097 blocks ~ 9.24 GiB per 1M session, ~18.5 GiB for two.
 KV_POOL_BYTES = 0
 # Checkpoints keep K4V4 records (about 3.7x FP16 tokens per byte), so for the
 # 4x context (256K -> 1M) RAM 2 -> 4 GiB and disk 50 -> 100 GiB cover about

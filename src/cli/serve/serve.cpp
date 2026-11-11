@@ -1557,6 +1557,7 @@ int RunServe(std::span<const char* const> args) {
         model, &err, max_context, session_count,
         server::TextPrefillPolicy{
             .decode_active_tokens = prefill_chunk_tokens,
+            .decode_time_share_min = std::chrono::milliseconds(10),
         },
         server::TextSchedulerPolicy{
             .max_pending_requests = max_pending_requests,

@@ -81,12 +81,13 @@ Text serving defaults match llama.cpp for context and generation length:
 | `--sessions` | `1` |
 | Thinking / reasoning effort | Enabled; Qwen `xhigh`, DeepSeek `high` |
 
-`--kv-cache-type fp16|kvarn-k4v2|kvarn-k4v4` selects attention KV storage; a
+`--kv-cache-type fp16|kvarn-k4v2|kvarn-k4v4|kvarn-k6v6` selects attention KV storage; a
 model takes an explicit value only when it stores KV that way. Qwen3.8-27B
 defaults to `kvarn-k4v2` and serves the KVarN values: the prefix cache, RAM and disk checkpoints keep the
 quantized group records and only the valid FP16 sink and tail rows (layout
 versions 5 and 6; checkpoints of the earlier 3 and 4 are refused), and `--kv-pool-bytes` holds about 4.9 (k4v2) or
-3.7 (k4v4) times the FP16 tokens. Flash-Next stores FP16 KV and accepts only `fp16`.
+3.7 (k4v4) times the FP16 tokens. Flash-Next defaults to FP16 KV and also accepts
+`kvarn-k4v4` and `kvarn-k6v6`; with `--kv-pool-bytes 0` each session allocates its own full-context KV.
 DeepSeek V4 Flash keeps FP8 KV and refuses any value: `DeepSeek V4 Flash does
 not take --kv-cache-type (its KV cache is FP8)`. The type is part of the Qwen
 continuation identity (`kv_storage=` and the state ABI), so checkpoints made
@@ -214,6 +215,11 @@ restored into another.
 
 Each model chooses its prefill chunk. `--prefill-chunk` limits prompt work
 between active decode rounds without changing a lone request's kernel policy.
+Prompt chunks and active decoders share device time, not turns: after a chunk
+that took at least 10 ms, decoders keep running until they have used as much
+time as the chunk (at most 1 s), so a long prompt prefills at about half speed
+while anything decodes. A different short prompt waiting for its priority turn
+ends the decoders' share early.
 
 Qwen image requests reuse decoded and resized RGB pixels using a fast lookup
 hash and exact encoded-byte comparison under the preprocessing version and

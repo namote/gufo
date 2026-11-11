@@ -146,7 +146,7 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(server.disk_admitted(100 * gib, 100 * gib))
         self.assertFalse(server.disk_admitted(100 * gib, 99 * gib))
         self.assertFalse(server.disk_admitted(99 * gib, 500 * gib))
-        self.assertFalse(server.disk_admitted(99 * gib + 1, 101 * gib))  # credit capped at 100 GiB
+        self.assertFalse(server.disk_admitted(99 * gib + 1, 101 * gib))  # 100 GiB hard floor
         self.assertTrue(server.disk_admitted(101 * gib, 500 * gib))
 
     def test_command_pins_runtime_and_model(self):

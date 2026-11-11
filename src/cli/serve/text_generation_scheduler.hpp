@@ -38,6 +38,12 @@ inline constexpr std::size_t kDefaultMaxBufferedOutputBytesTotal =
 
 struct TextPrefillPolicy {
   std::size_t decode_active_tokens{kDefaultDecodeActivePrefillTokens};
+  /// Share device time rather than turns with decoders: an active-decode
+  /// prefill chunk that took at least this long lets the decoders keep
+  /// running until they have used as much time (capped at
+  /// decode_time_share_max). Zero keeps one decode round per chunk.
+  std::chrono::milliseconds decode_time_share_min{0};
+  std::chrono::milliseconds decode_time_share_max{std::chrono::seconds(1)};
 };
 
 struct TextSchedulerPolicy {

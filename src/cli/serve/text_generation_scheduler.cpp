@@ -2335,10 +2335,30 @@ struct TextGenerationScheduler::Impl {
                       [](const auto& request) {
                         return request->result.tokens.empty();
                       });
+      if (prefilling.empty() || decoding.empty())
+        decode_time_credit_ms = 0.0;
       if (!prefilling.empty() && !decoding.empty() &&
           (!due_decoder || assemble_initial_batch)) {
+        const auto prefill_start = Clock::now();
         auto request =
             StepSelectedPrefill(prefilling, next_prefill, true, capturing);
+        // Share device time, not turns: a bounded chunk deep in a long
+        // prompt can take hundreds of milliseconds while one decode round
+        // takes tens, so decoders keep running until they have used as much
+        // time as the chunk did (one capped chunk at most, never carried
+        // further). A long prompt then prefills at about half speed while
+        // anything decodes. Shorter chunks keep strict alternation.
+        const std::chrono::duration<double, std::milli> prefill_time =
+            Clock::now() - prefill_start;
+        const auto share_min = prefill_policy.decode_time_share_min;
+        decode_time_credit_ms =
+            share_min.count() > 0 && prefill_time >= share_min
+                ? std::min(prefill_time.count(),
+                           std::chrono::duration<double, std::milli>(
+                               prefill_policy.decode_time_share_max)
+                               .count())
+                : 0.0;
+        decode_credit_earner = request->id;
         if (!IsTerminal(request)) {
           if (CapturePending(request, CaptureSettleDeadline())) {
             capturing.push_back(std::move(request));
@@ -2379,7 +2399,11 @@ struct TextGenerationScheduler::Impl {
         resident_requests = batch.size() + decoding.size() + prefilling.size() +
                             capturing.size() + waiting.size() +
                             kv_waiting.size() + queued;
+        const auto decode_start = Clock::now();
         StepDecodeBatch(batch);
+        decode_time_credit_ms -= std::chrono::duration<double, std::milli>(
+                                     Clock::now() - decode_start)
+                                     .count();
         const auto settle = CaptureSettleDeadline();
         for (auto& request : batch) {
           if (!IsTerminal(request)) {
@@ -2389,6 +2413,18 @@ struct TextGenerationScheduler::Impl {
               decoding.push_back(std::move(request));
           }
         }
+        // Decoders still owed time against the last prefill chunk stay due,
+        // so they run again before the prompt takes its next chunk. Another
+        // short prompt waiting for its priority turn ends the credit.
+        const bool short_waiting = std::any_of(
+            prefilling.begin(), prefilling.end(), [&](const auto& peer) {
+              return peer->id != decode_credit_earner && ShortPrefill(peer);
+            });
+        if (decode_time_credit_ms > 0.0 && !prefilling.empty() &&
+            !short_waiting)
+          MarkAllDecodersDue(decoding);
+        else
+          decode_time_credit_ms = 0.0;
         continue;
       }
 
@@ -2436,6 +2472,11 @@ struct TextGenerationScheduler::Impl {
           TextGenerationErrorCode::kDeviceLost, kDeviceLostMessage));
   std::vector<std::shared_ptr<ScheduledRequest>> device_lost_requests;
   std::size_t consecutive_active_prefill_chunks{0};
+  /// Device time decoders may still use before the next active-decode
+  /// prefill chunk: set to that chunk's wall time, spent by decode rounds.
+  double decode_time_credit_ms{0.0};
+  /// Id of the prefill whose chunk set the credit.
+  decltype(ScheduledRequest::id) decode_credit_earner{};
   /// Prefill tokens that short peers ran out of turn since the long front of
   /// the prefill queue last stepped.
   std::size_t short_priority_bypassed_tokens{0};
