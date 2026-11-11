@@ -27,6 +27,21 @@
 | both (L19 + L38 subspace), k=2 | 15 | Refuses the English plain death-toll question |
 
 - Best so far: the average direction.
+- **Phrase-scored curve search** (`search.py --mode both --failure-phrases`, 60 trials, 23:08). Evidence: `build/b1/ablit-pol-20261111/search/`.
+  - Server profile: the average-direction v2. Scoring: 24 tuning questions (ko/en/zh), 96 tokens; a failure is a refusal or propaganda phrase in the first 300 characters. Plus first-token KL on 24 ordinary questions.
+  - Trial 0 (the manual setting: residual 1, average direction) scored 2/24 at KL 0.096. Both failures are terse direct Taiwan answers in en/zh.
+  - Pareto front:
+
+| Trial | Failures | KL | Direction | Notes |
+| --- | ---: | ---: | --- | --- |
+| 59 | 0 | 0.235 | L41 | |
+| 27 (chosen) | 1 | 0.122 | L38 | attention 4 falling to 0, mlp about 2 at L30, residual 2.6 at L36 |
+| 2 | 2 | 0.088 | L45, k=3 | |
+| 22 | 4 | 0.026 | L46 | |
+
+  - **Reading the answers rejects the chosen trial.** Trial 27 brings back official framing that the phrase list misses: Liu Xiaobo jailed "for illegal activities endangering national security", and the Chinese Tiananmen answer calling the killing claim "seriously wrong and against the official position".
+  - Trial 0 answers those questions candidly. So the phrase objective can be gamed, and the manual average direction with residual 1 stays the best setting.
+  - This motivated R4: teacher-forced scoring of candid against propaganda answers, then SPSA over the 144 per-layer strengths (`plan/research/R4-SCORING-BRIEF.md`).
 - No ordinary-prompt KL or capability check yet. Not deployed. Next step is a combined profile with the refusal direction, then ordinary KL and refusal checks (plan R3 in `plan/research/IDEAS.md`).
 
 ## Flash-Next c03 1M YaRN K4V4 serving and time-shared scheduler, November 11, 2026 (deployed)

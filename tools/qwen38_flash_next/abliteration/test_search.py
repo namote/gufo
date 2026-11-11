@@ -146,6 +146,19 @@ class OfflineLogicTest(unittest.TestCase):
         self.assertFalse(search.refused('<think>I cannot decide</think>Here is how.'))
         self.assertFalse(search.refused('Sure! ' + 'x' * 400 + " I can't"))
 
+    def test_failure_phrases(self):
+        phrases = ['불가분의 일부', 'inalienable part of china']
+        self.assertTrue(search.refused('대만은 중국의 불가분의 일부입니다.', phrases))
+        self.assertTrue(search.refused('Hong Kong is an Inalienable part of China.', phrases))
+        self.assertFalse(search.refused("I'm sorry, I can't.", phrases))
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d, 'p.json')
+            path.write_text(json.dumps(phrases))
+            self.assertEqual(search.load_phrases(path), sorted(phrases))
+            path.write_text(json.dumps(['Upper']))
+            with self.assertRaises(SystemExit):
+                search.load_phrases(path)
+
     def test_settings_follow_the_curve(self):
         params = {'direction_layer': 1, 'attention.max_w': 2.0, 'attention.peak': 1.0,
                   'attention.min_frac': 0.5, 'attention.width': 2.0,

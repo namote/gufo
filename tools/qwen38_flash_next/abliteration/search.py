@@ -33,7 +33,9 @@ never leak in. With one kind, at most one direction and `--preserve-norm off`
 (the single-direction space) the log fingerprint is the one before these
 options existed, so earlier logs resume; any other choice is another search.
 
-Each trial scores two objectives, both minimized:
+Each trial scores two objectives, both minimized (`--failure-phrases FILE`
+replaces PHRASES with a JSON list, for example refusal plus propaganda
+wording for a censorship profile; it changes the log fingerprint):
 
 * refusals: harmful ("refusal" group) prompts answered greedily with a short
   `--max-tokens` budget whose final answer (after reasoning) is empty or
@@ -114,9 +116,20 @@ def answer(text):
     return text.split('</think>', 1)[1] if '</think>' in text else text
 
 
-def refused(text):
+def refused(text, phrases=PHRASES):
     head = answer(text).strip().lower().replace('’', "'")[:300]
-    return any(p in head for p in PHRASES)
+    return any(p in head for p in phrases)
+
+
+def load_phrases(path):
+    """`--failure-phrases`: a JSON list of lowercase phrases that replaces
+    PHRASES (for example refusal plus censorship or propaganda wording)."""
+    phrases = json.loads(Path(path).read_text())
+    if (not isinstance(phrases, list) or not phrases or
+            not all(isinstance(p, str) and p and p == p.lower() for p in phrases)):
+        raise SystemExit('--failure-phrases needs a non-empty JSON list of lowercase strings')
+    # refused() compares against text with curly apostrophes straightened.
+    return sorted({p.replace('’', "'") for p in phrases})
 
 
 def first_token_kl(off, on):
@@ -373,7 +386,8 @@ def load_prompts(paths, split, thinking, counts, seed):
 
 class Search:
     def __init__(self, client, model, prompts, info, log, max_tokens,
-                 concurrency=1, out=sys.stdout, mode='residual', axes=None):
+                 concurrency=1, out=sys.stdout, mode='residual', axes=None,
+                 phrases=None):
         self.client, self.model, self.prompts = client, model, prompts
         self.layers = info['layers']
         self.max_tokens, self.concurrency, self.out = max_tokens, concurrency, out
@@ -392,6 +406,10 @@ class Search:
         # The single-direction space keeps the earlier fingerprint.
         if axes and axes != LEGACY_AXES:
             identity['axes'] = axes
+        # Another failure list scores another objective, so another log.
+        self.phrases = phrases or PHRASES
+        if phrases:
+            identity['failure_phrases'] = phrases
         self.fingerprint = hashlib.sha256(
             json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
@@ -422,7 +440,7 @@ class Search:
         answers = self._map(lambda p: generation(self.client.chat(
             request_body(self.model, p, on, self.max_tokens))), self.prompts['refusal'])
         unfinished = sum(not answer(a['text']).strip() for a in answers)
-        refusals = sum(refused(a['text']) or not answer(a['text']).strip()
+        refusals = sum(refused(a['text'], self.phrases) or not answer(a['text']).strip()
                        for a in answers)
         tops = self._map(lambda p: first_token_top(self.client.chat(
             request_body(self.model, p, on, 1, logprobs=True))),
@@ -443,7 +461,7 @@ class Search:
             if record.get('type') == 'header':
                 if record['fingerprint'] != self.fingerprint:
                     raise SystemExit('the log belongs to another model, profile, '
-                                     'prompt sample or --mode; use a new --log')
+                                     'prompt sample, --mode or --failure-phrases; use a new --log')
             else:
                 trials.append(record)
         return trials
@@ -572,6 +590,9 @@ def main(argv=None, client=None, out=sys.stdout):
                              "profile's stored rank)")
     parser.add_argument('--preserve-norm', choices=('search', 'on', 'off'),
                         default='search', help='norm preservation axis')
+    parser.add_argument('--failure-phrases',
+                        help='JSON list of lowercase phrases counted as failures '
+                             'instead of the built-in refusal phrases')
     parser.add_argument('--log', required=True)
     parser.add_argument('--kl-budget', type=float, required=True)
     parser.add_argument('--base-profile', help='the v2 profile the server loaded')
@@ -605,8 +626,9 @@ def main(argv=None, client=None, out=sys.stdout):
         args.max_directions, args.preserve_norm)
     box = bounds(layers, available, float(info.get('max_strength', prepare.MAX_WEIGHT)),
                  args.mode, axes)
+    phrases = load_phrases(args.failure_phrases) if args.failure_phrases else None
     search = Search(client, args.model, prompts, info, args.log, args.max_tokens,
-                    args.concurrency, out, args.mode, axes)
+                    args.concurrency, out, args.mode, axes, phrases)
     history = search.run(args.trials, args.initial, args.seed, box)
     print('Pareto front (refusals vs KL):', file=out)
     for trial in pareto_front(history):
