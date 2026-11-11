@@ -1,4 +1,30 @@
-# EXL3 / Flash-Next handoff (updated 2026-11-09; all200 HC Q8 retained; U5/U6 not deployed; production stopped)
+# EXL3 / Flash-Next handoff (updated 2026-11-11; production running c03 1M K4V4)
+
+## Current state, 2026-11-11 (read this first; sections below are history)
+
+- **Production runs.** Supervisor `tools/serving/flash_next/gufo-server.py`, installed from `9910a9f4` and later. Check with `llm status`.
+  - Model: our c03 pack (`flash-next-exl3-gufo-c03`, 4.04 bpw).
+  - Runtime: `~/.local/share/gufo/runtime-20261111b` (time-shared scheduler).
+  - Context 1048576 per session with static YaRN factor 4, 2 sessions, `kvarn-k4v4`, `--kv-pool-bytes 0` (about 18.5 GiB KV).
+  - RAM cache 4 GiB, disk cache 100 GiB (`cache-c03`).
+  - HC fp16, MTP draft 7, temperature 0.75, Han scale 0.1 (answer only).
+  - Abliteration profile `abliteration-fnx.json`, OFF unless a request enables it.
+- **History of today's switches:**
+  - 5.05 (turboderp) ran from 11:44 to 17:25, then the user moved back to c03.
+  - The time-shared scheduler (`9910a9f4`) fixes decode starvation behind long prefills: 3.5 to 17.5 tok/s.
+- **Concurrency:** S0 matrix and chunk/stage studies are in KNOWHOW "S0 concurrency matrix". Mixed batching was dropped. The fixed prefill cost is the MoE expert weight stream, about 148 ms per pass. Plan: `plan/serving/CONCURRENCY-PLAN.md`.
+- **Rollback:**
+  - Scheduler: set `RUNTIME` back to `runtime-20261111` in `gufo-server.py`, then install and restart.
+  - Model or settings: install an earlier revision (`install.py --rev <sha>`). Backups are in `~/projects/_backup/gufo-serving-*`.
+- **Research queue:** `plan/research/IDEAS.md`.
+  - R2 dynamic multi-profile abliteration, with detector scores carried with the logits and a fused projection.
+  - R3 political-sensitivity profile (average of L19 and L38, detector at L38).
+  - R1 EoRA and adapters (waiting).
+- **Open checks:**
+  - Upstream #866 (attention past 262K) and #905 (YaRN session factor) were skipped while we served at most 256K (`plan/upstream-sync/PLAN.md` "하지 않는 것"). We now serve 1M, so re-check them.
+  - YaRN quality at factor 4 will be measured by the user against their own workload.
+- **Upstream sync:** U1-U8 and D1-D18 are closed or deployed (`plan/upstream-sync/DEFERRED.md`). Still on hold: C8a (a logprobs row slows its batch peers), C9, S4/B3 (disk restore prefill +10-15 ms, cause known), and the root cause of the U4-3 queue stall (the workaround is deployed).
+
 
 ## Upstream U6 pass, 2026-11-09: not deployed, production stopped
 
