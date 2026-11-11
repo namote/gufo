@@ -1208,6 +1208,54 @@ with `logprobs: 0`:
 {"index":0,"text":"Hi","logprobs":{"tokens":["Hi"],"token_logprobs":[-0.5],"top_logprobs":[{"Hi":-0.5}],"text_offset":[0]},"finish_reason":null}
 ```
 
+### Assistant-message scoring
+
+Chat Completions accepts the gufo extension `score_assistant: true` on
+Qwen3.8-Flash-Next (other models return `unsupported_score_assistant`). The
+last message must be an `assistant` message with non-empty text `content`;
+the server scores that content token by token after the rest of the
+conversation (teacher forcing) instead of generating. Each token's value is
+the same raw full-vocabulary log-softmax as generated-token `logprobs`
+(no temperature, penalties, Han scale or constraints; below -9999 serialized
+as -9999). The request's `abliteration` object applies as in generation.
+
+The conversation before the scored message is rendered as for a new reply
+with thinking disabled: the prompt ends with the template's empty thinking
+block, `<|im_start|>assistant\n<think>\n\n</think>\n\n`, and the content
+follows it exactly as the template renders the completed turn. The content
+is tokenized as message text (control-token spellings stay literal); the
+closing `<|im_end|>` is not scored. A greedy thinking-disabled reply to the
+same conversation therefore scores, token for token, the `logprobs` it was
+generated with, within verifier arithmetic differences.
+
+```json
+{"model":"gufo","messages":[{"role":"user","content":"Capital of France?"},{"role":"assistant","content":"Paris."}],"score_assistant":true,"max_tokens":0}
+```
+
+The response is a `chat.completion` whose choice has empty `content` and
+`finish_reason: "stop"`, plus a top-level `score`:
+
+```json
+{"score":{"tokens":[{"token":"Paris","id":59604,"logprob":-0.03},{"token":".","id":13,"logprob":-0.41}],"token_count":2,"logprob_sum":-0.44}}
+```
+
+`usage.completion_tokens` is 0 and `cache_persist` is `false`.
+
+Limits: at most 1024 scored tokens; the prompt plus all but the last scored
+token must fit the context. `max_tokens`/`max_completion_tokens` must be 0
+or omitted. `stream`, `stop`, `tools`, `response_format`, images, `n > 1`,
+explicitly enabled thinking and a scored message with `reasoning_content` or
+`tool_calls` return 400.
+
+Execution: the prompt prefills as usual (prefix reuse applies). The scored
+tokens then pass through the model in passes of at most eight rows (MTP
+verifier arithmetic; one decode row per token without MTP), and row r's
+logits score token r+1; the first token is scored on the prompt's last row.
+A 64-token answer costs eight passes after prefill, run as one work unit
+between other requests' decode rounds. Only a prompt checkpoint may be
+retained in RAM, as with `cache_persist: false`; the scored tokens are never
+published to the continuation cache or written to disk.
+
 llama.cpp sampler fields that gufo does not implement (`mirostat`,
 `mirostat_tau`, `mirostat_eta`, `typical_p`, `tfs_z`, `dynatemp_range`,
 `dynatemp_exponent`, `top_n_sigma`, `xtc_probability`, `xtc_threshold`,

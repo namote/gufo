@@ -931,3 +931,16 @@ nix develop -c python3 tests/functional/embedding_audio.py \
   --base-url http://127.0.0.1:8080/v1 --server-log /path/to/server.log \
   --output /tmp/audio-embeddings.json
 ```
+
+## Assistant-message scoring
+
+`score_assistant.py` checks the `score_assistant` exactness contract against a
+running Flash-Next test server: a greedy thinking-disabled reply's `logprobs`
+must match the scores of the same tokens, per token, within `--tolerance`.
+`--abliteration` repeats the check with the loaded profile's defaults. It never
+starts a server; point it at a test instance, not production.
+
+```sh
+nix develop -c python3 tests/functional/score_assistant.py \
+  --base-url http://127.0.0.1:8080 --model gufo --abliteration
+```
