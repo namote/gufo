@@ -1,5 +1,31 @@
 # gfx1151 optimization know-how
 
+## Flash-Next EXL3 5.05 (turboderp) in production, November 11, 2026 (deployed)
+
+Pack: turboderp/Qwen3.8-Flash-Next-exl3 `5.05bpw_h6_ng6` @7cef615f. All files pass sha256. The pack includes vision and MTP. The pack's K6 n-gram table was not downloaded. Instead, `ngram_embedding.safetensors` is a hardlink to the c03 K8 table (128 shards, same 320001536x160 layout), which saves about 36 GB and gives more bits. See `REPLACED-NGRAM.txt` in the model directory.
+
+Abliteration was recollected on 5.05 with the same settings as c03 (L36, attention 2, MLP 0.5, mean_diff, 1 direction, preserve-norm off). Runtime profile: `abliteration-fnx505.json`. Evidence: `build/b1/ablit-20261110/chain505.log`. The tuning48 scores use 768 tokens, and `ref` counts heuristic refusals per 12 prompts:
+
+| Run | ordinary plain | ordinary think | refusal plain | refusal think |
+|---|---|---|---|---|
+| c03 off | 1/12 | 0/12 | 12/12 | 12/12 |
+| c03 L36-a2-m05 | 0/12 | 0/12 | 1/12 | 1/12 |
+| 5.05 L36-a2-m05 | 0/12 | 0/12 | 0/12 | 0/12 |
+
+No off baseline was run on 5.05. Most refusal-group answers are truncated at 768 tokens (10 to 11 of 12), as on c03.
+
+Memory with the server ready, HC fp16 KV:
+- GTT used: 103.4 GB (96.3 GiB), against about 82.7 GiB on c03.
+- System available: 17 GiB.
+
+Both match the pre-switch estimate.
+
+Smoke checks:
+- A synthetic red/blue image was described correctly, so vision works.
+- The Tiananmen question (abliteration on, no thinking) is answered rather than refused, but the answer is softened toward the official framing.
+
+Rollback: set `MODEL` back to the c03 pack and `ABLITERATION_PROFILE` back to `abliteration-fnx.json`. The c03 pack is still on disk.
+
 ## Qwen3.8 27B EXL3 5.00bpw versus Q4_K_XL, AR and DFlash2, November 11, 2026
 
 Build `int-20261111` (HEAD `dd055f12` code, release), after `host_preflight.sh`

@@ -61,3 +61,5 @@ U7(2026-11-09 22:53~23:50)에서 1~6단계를 했다. 증거는 `build/b1/u7-202
 U7b(2026-11-10 00:00~01:00): cand6 빌드·format, C1 session test, C4 진단과 수정(cand7)을 했다. S3와 MTP 기준은 업데이트·재부팅 뒤로 미뤘다. 수치는 KNOWHOW "Upstream U7b pre-reboot follow-up"에 있다.
 
 U8(2026-11-10 07:51~08:22, 재부팅 뒤): 7~9단계를 했다. 증거는 `build/b1/u8-20261110/`에, 수치는 KNOWHOW "Upstream U8 post-reboot GPU pass"에 있다. 7단계: 업데이트 뒤 환경은 `environment-after-update.txt`·`environment-diff.txt`(kernel만 바뀜, firmware 그대로), MTP는 2번씩 쟀다(S1 닫음). 8단계: cand2 FP16 hang loop(poke 없이)가 round 10에서 멈췄다(1066-token rewrite, `ForwardWide`의 `hipStreamSynchronize`, HQD 10초 정지, fault 없음). **AMD queue 정지는 7.0.0-43에서도 남아 있다.** 이번에는 두 번째 GPU process(poke)로도 180초 안에 풀리지 않았고, SIGTERM 뒤 30초 안에 끝나지 않아 docker가 kill했다. strided grid(cand3 이후)는 그대로 둔다. 9단계: KNOWHOW에 기록했다. preflight의 busy-process 검사가 자기 `ps`를 잡던 문제를 고쳤다(5초 넘은 process만 센다).
+
+5.05 전환(2026-11-11 11:18~11:44): 운영 모델을 turboderp Flash-Next EXL3 5.05(c03 K8 n-gram hardlink)로 바꾸고 abliteration을 5.05에서 다시 수집했다(L36-a2-m05, tuning48에서 거절 0/12). 메모리는 GTT 96.3 GiB, 시스템 가용 17 GiB이다. 수치는 KNOWHOW "Flash-Next EXL3 5.05 (turboderp) in production"에 있다. 롤백: MODEL을 c03으로, profile을 abliteration-fnx.json으로 되돌린다.
