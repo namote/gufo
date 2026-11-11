@@ -207,6 +207,15 @@ public:
                                  double* capture_ms = nullptr);
   [[nodiscard]] bool Evaluate(std::int32_t token,
                               std::string* error_msg = nullptr);
+  /// Teacher forcing: the raw log-softmax (sampling::CollectLogprobs) of
+  /// each of `tokens` given the session and the tokens before it. The first
+  /// is scored on the current frontier logits; the rest are fed in passes of
+  /// at most max_speculative() rows (verification arithmetic, as MTP
+  /// decoding returns its logprobs) or one decode row without MTP. The last
+  /// token is scored but not fed. The session ends at the fed tokens.
+  [[nodiscard]] bool ScoreTokens(std::span<const std::int32_t> tokens,
+                                 std::vector<sampling::TokenLogprobs>* scored,
+                                 std::string* error_msg = nullptr);
   struct DecodeResult {
     std::vector<std::int32_t> tokens;
     bool stop{false};

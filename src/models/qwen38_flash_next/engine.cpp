@@ -1100,6 +1100,73 @@ bool Session::Evaluate(std::int32_t token, std::string* error_msg) {
   return ok;
 }
 
+bool Session::ScoreTokens(std::span<const std::int32_t> tokens,
+                          std::vector<sampling::TokenLogprobs>* scored,
+                          std::string* error_msg) {
+  const ExecutionScope execution(continuation_hooks_);
+  if (!valid_ || tokens_.empty()) {
+    AssignError(error_msg, "scoring needs a prefilled session");
+    return false;
+  }
+  if (tokens.empty()) {
+    AssignError(error_msg, "no tokens to score");
+    return false;
+  }
+  const auto vocab = model_->VocabSize();
+  for (const auto token : tokens) {
+    if (token < 0 || static_cast<std::uint32_t>(token) >= vocab) {
+      AssignError(error_msg, "scored token out of range");
+      return false;
+    }
+  }
+  if (tokens_.size() + tokens.size() - 1 > ContextSize()) {
+    AssignError(error_msg, "scored tokens exceed the session context");
+    return false;
+  }
+  scored->clear();
+  scored->reserve(tokens.size());
+  // count 0: the selected token only, as `logprobs` without top_logprobs.
+  scored->push_back(*sampling::CollectLogprobs(
+      logits_, static_cast<sampling::TokenId>(tokens[0]), 0U));
+  auto& exec = *model_->executor_;
+  const bool verify = MtpEnabled() && exec.max_speculative() > 1;
+  const std::size_t rows = verify ? exec.max_speculative() : 1;
+  const auto fed = tokens.first(tokens.size() - 1);
+  valid_ = false;
+  for (std::size_t off = 0; off < fed.size();) {
+    const auto n = std::min(rows, fed.size() - off);
+    const auto chunk = fed.subspan(off, n);
+    // Keep the draft block trailing the trunk as Feed does, so the session
+    // stays usable after scoring.
+    if (MtpEnabled() && !DraftCatchUp(chunk[0], false, error_msg))
+      return false;
+    const auto base = static_cast<std::uint32_t>(tokens_.size());
+    verify_logits_.resize(std::max(verify_logits_.size(), n * vocab));
+    if (!exec.Forward(*session_, chunk, static_cast<std::uint32_t>(n),
+                      verify_logits_.data(),
+                      verify ? rocm::Executor::ForwardMode::kVerify
+                             : rocm::Executor::ForwardMode::kDecode,
+                      error_msg))
+      return false;
+    // Keep every row, as a fully accepted verification does.
+    if (verify &&
+        !exec.Rollback(*session_, static_cast<std::uint32_t>(n), error_msg))
+      return false;
+    // Row r follows chunk[r] = tokens[off + r] and scores its successor.
+    for (std::size_t r = 0; r < n; ++r)
+      scored->push_back(*sampling::CollectLogprobs(
+          std::span<const float>(verify_logits_).subspan(r * vocab, vocab),
+          static_cast<sampling::TokenId>(tokens[off + r + 1]), 0U));
+    std::copy_n(verify_logits_.data() + (n - 1) * vocab, vocab,
+                logits_.begin());
+    hidden_base_ = base;
+    tokens_.insert(tokens_.end(), chunk.begin(), chunk.end());
+    off += n;
+  }
+  valid_ = true;
+  return true;
+}
+
 struct Session::PendingDecode {
   std::vector<std::int32_t> chain;
   std::vector<MtpProposal> proposals;
