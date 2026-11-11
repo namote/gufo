@@ -1953,6 +1953,9 @@ std::vector<sampling::TokenLogprobs> TextRunnerPool::Request::Score(
   if (tokens.size() - 1 > ReservedDecodeTokens()) {
     throw std::length_error("scored tokens exceed the reserved rows");
   }
+  // Capture the complete prompt as a decode step does, and join any capture
+  // still copying this state, before the scored tail is written.
+  impl_->CapturePromptSnapshot();
   // The scored tail is not prompt state: nothing may publish it.
   impl_->stopped = true;
   impl_->state_reusable = false;

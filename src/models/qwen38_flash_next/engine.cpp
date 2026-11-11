@@ -1103,6 +1103,19 @@ bool Session::Evaluate(std::int32_t token, std::string* error_msg) {
 bool Session::ScoreTokens(std::span<const std::int32_t> tokens,
                           std::vector<sampling::TokenLogprobs>* scored,
                           std::string* error_msg) {
+  try {
+    return ScoreTokensImpl(tokens, scored, error_msg);
+  } catch (const std::exception& error) {
+    // CollectLogprobs refuses non-finite logits.
+    valid_ = false;
+    AssignError(error_msg, error.what());
+    return false;
+  }
+}
+
+bool Session::ScoreTokensImpl(std::span<const std::int32_t> tokens,
+                              std::vector<sampling::TokenLogprobs>* scored,
+                              std::string* error_msg) {
   const ExecutionScope execution(continuation_hooks_);
   if (!valid_ || tokens_.empty()) {
     AssignError(error_msg, "scoring needs a prefilled session");

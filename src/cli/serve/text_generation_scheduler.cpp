@@ -1780,6 +1780,8 @@ struct TextGenerationScheduler::Impl {
       request->result.decode_ms +=
           std::chrono::duration<double, std::milli>(Clock::now() - start)
               .count();
+      if (CompleteIfStopped(request))
+        return;
       for (std::size_t index = 0; index < scored.size(); ++index) {
         RetainLogprobs(request, scored[index]);
         request->result.tokens.push_back(request->score_tokens[index]);

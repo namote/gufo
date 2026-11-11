@@ -737,8 +737,8 @@ public:
                                             std::size_t resident_requests = 1);
 
     /// Scores `tokens` after the complete prompt (TextModelRunner::
-    /// ScoreTokens). The request then holds no reusable state: release it
-    /// with Invalidate.
+    /// ScoreTokens), after capturing the complete prompt checkpoint. The live
+    /// state is then not reusable: Cancel keeps only prompt checkpoints.
     [[nodiscard]] std::vector<sampling::TokenLogprobs> Score(
         std::span<const TextRunnerToken> tokens);
 

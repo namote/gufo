@@ -7,6 +7,14 @@ generated tokens' text with `score_assistant` and compares token IDs and
 logprobs. Generation that ends by length keeps every generated token visible,
 so the scored content is the concatenation of the generated token strings.
 
+Run it with no other load on the server: a generated token's logprob comes
+from the pass that produced it (one decode row, an MTP verifier pass, a wide
+copy pass or a batched pass with peers), while scoring always uses verifier
+passes of up to eight rows, so small arithmetic differences are expected and
+bounded by --tolerance. A generated split that re-tokenization does not
+reproduce (a non-canonical BPE split or a token ending inside a UTF-8
+character) is reported as a tokenization difference, not a scoring error.
+
 The server is not started here; point --base-url at a test instance, never
 at the production one.
 """

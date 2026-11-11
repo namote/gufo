@@ -1239,7 +1239,9 @@ The response is a `chat.completion` whose choice has empty `content` and
 {"score":{"tokens":[{"token":"Paris","id":59604,"logprob":-0.03},{"token":".","id":13,"logprob":-0.41}],"token_count":2,"logprob_sum":-0.44}}
 ```
 
-`usage.completion_tokens` is 0 and `cache_persist` is `false`.
+`usage.completion_tokens` is 0 and `cache_persist` is `false`. `logprobs`
+and `top_logprobs` do not apply: each scored token reports its own logprob
+only.
 
 Limits: at most 1024 scored tokens; the prompt plus all but the last scored
 token must fit the context. `max_tokens`/`max_completion_tokens` must be 0

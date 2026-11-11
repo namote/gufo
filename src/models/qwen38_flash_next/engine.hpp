@@ -381,6 +381,9 @@ private:
             double* capture_ms = nullptr,
             std::span<const std::int32_t> after = {},
             const PrefillCapture& capture = {});
+  bool ScoreTokensImpl(std::span<const std::int32_t> tokens,
+                       std::vector<sampling::TokenLogprobs>* scored,
+                       std::string* error_msg);
   bool SyncImpl(std::span<const std::int32_t> prompt, std::string* error_msg,
                 std::uint32_t boundary,
                 std::unique_ptr<SessionSnapshot>* checkpoint,
