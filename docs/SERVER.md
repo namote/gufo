@@ -1250,10 +1250,16 @@ explicitly enabled thinking and a scored message with `reasoning_content` or
 `tool_calls` return 400.
 
 Execution: the prompt prefills as usual (prefix reuse applies). The scored
-tokens then pass through the model in passes of at most eight rows (MTP
-verifier arithmetic; one decode row per token without MTP), and row r's
-logits score token r+1; the first token is scored on the prompt's last row.
-A 64-token answer costs eight passes after prefill, run as one work unit
+tokens then pass through the model in wide verification passes of up to 64
+rows, the width a single session's copied draft chain verifies at: each pass
+reads the shared projections, routed experts and head once for all its rows,
+while every row keeps the arithmetic of consecutive eight-row MTP
+verifications. A remainder of at most eight rows takes one ordinary
+verification; without MTP, each token takes one decode row. Row r's logits
+score token r+1; the first token is scored on the prompt's last row. Each
+pass downloads its full logit rows and reduces them on the CPU as generated
+`logprobs` are. A 64-token answer costs one pass after prefill and a
+1024-token answer 16 (eight-row passes took 8 and 128), run as one work unit
 between other requests' decode rounds. Only a prompt checkpoint may be
 retained in RAM, as with `cache_persist: false`; the scored tokens are never
 published to the continuation cache or written to disk.

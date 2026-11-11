@@ -92,6 +92,39 @@ private:
   ContinuationHooks* hooks_;
 };
 
+/// sampling::CollectLogprobs of `rows` consecutive `vocab`-wide rows of
+/// `raw`, row i selecting target(i) with `count` alternatives. Each row runs
+/// the same serial full-vocabulary reduction wherever it runs, so the values
+/// stay bit-identical. Running the rows concurrently keeps a long chain from
+/// holding the executor once per row. A fixed number of workers takes
+/// interleaved rows: a 63-row wide chain with one thread per row added 62
+/// threads and about 95 MiB of RSS. A non-finite row throws.
+template<class Target>
+std::vector<std::optional<sampling::TokenLogprobs>> CollectRowLogprobs(
+    std::span<const float> raw, std::size_t vocab, std::uint32_t rows,
+    const Target& target, std::optional<std::uint32_t> count) {
+  constexpr std::uint32_t kLogprobWorkers = 8;
+  std::vector<std::optional<sampling::TokenLogprobs>> values(rows);
+  const auto workers = std::min(rows, kLogprobWorkers);
+  const auto work = [&](std::uint32_t first) {
+    for (auto i = first; i < rows; i += workers)
+      values[i] = sampling::CollectLogprobs(
+          raw.subspan(std::size_t{i} * vocab, vocab),
+          static_cast<sampling::TokenId>(target(i)), count);
+  };
+  std::vector<std::future<void>> others;
+  others.reserve(workers ? workers - 1 : 0);
+  for (std::uint32_t w = 1; w < workers; ++w)
+    others.push_back(
+        std::async(std::launch::async | std::launch::deferred, work, w));
+  // If a row throws, the remaining futures join as they are destroyed.
+  if (workers)
+    work(0);
+  for (auto& other : others)
+    other.get();
+  return values;
+}
+
 }  // namespace
 
 Model::~Model() = default;
@@ -1143,7 +1176,19 @@ bool Session::ScoreTokensImpl(std::span<const std::int32_t> tokens,
       logits_, static_cast<sampling::TokenId>(tokens[0]), 0U));
   auto& exec = *model_->executor_;
   const bool verify = MtpEnabled() && exec.max_speculative() > 1;
-  const std::size_t rows = verify ? exec.max_speculative() : 1;
+  // With MTP, a pass verifies up to max_copy_rows() (64) rows wide
+  // (Executor::ForwardWide): the shared projections, routed experts and head
+  // read their weights once for all of them, while every row keeps the
+  // arithmetic of consecutive ordinary verifications. Chunks of at most
+  // max_speculative() rows take the ordinary verifier. The full logit rows
+  // come to the host and reduce on the CPU as generated logprobs do
+  // (FinishDecode), so scoring and generation share one log-softmax. A
+  // device log-softmax gather would add a kernel only to save the 64-row
+  // download (about 64 MB at 248320 columns, a few milliseconds on unified
+  // memory), small beside one pass over the experts.
+  const std::size_t wide = verify ? exec.max_copy_rows() : 0;
+  const std::size_t rows =
+      std::max<std::size_t>(wide, verify ? exec.max_speculative() : 1);
   const auto fed = tokens.first(tokens.size() - 1);
   valid_ = false;
   for (std::size_t off = 0; off < fed.size();) {
@@ -1154,26 +1199,46 @@ bool Session::ScoreTokensImpl(std::span<const std::int32_t> tokens,
     if (MtpEnabled() && !DraftCatchUp(chunk[0], false, error_msg))
       return false;
     const auto base = static_cast<std::uint32_t>(tokens_.size());
+    const bool wide_pass = n > exec.max_speculative();
     verify_logits_.resize(std::max(verify_logits_.size(), n * vocab));
-    if (!exec.Forward(*session_, chunk, static_cast<std::uint32_t>(n),
-                      verify_logits_.data(),
-                      verify ? rocm::Executor::ForwardMode::kVerify
-                             : rocm::Executor::ForwardMode::kDecode,
-                      error_msg))
+    if (wide_pass) {
+      if (!exec.ForwardWide(*session_, chunk, error_msg) ||
+          !exec.SelectBatchLogits(0, static_cast<std::uint32_t>(n),
+                                  verify_logits_.data(), error_msg))
+        return false;
+    } else if (!exec.Forward(*session_, chunk, static_cast<std::uint32_t>(n),
+                             verify_logits_.data(),
+                             verify ? rocm::Executor::ForwardMode::kVerify
+                                    : rocm::Executor::ForwardMode::kDecode,
+                             error_msg)) {
       return false;
+    }
     // Keep every row, as a fully accepted verification does.
     if (verify &&
         !exec.Rollback(*session_, static_cast<std::uint32_t>(n), error_msg))
       return false;
     // Row r follows chunk[r] = tokens[off + r] and scores its successor.
-    for (std::size_t r = 0; r < n; ++r)
-      scored->push_back(*sampling::CollectLogprobs(
-          std::span<const float>(verify_logits_).subspan(r * vocab, vocab),
-          static_cast<sampling::TokenId>(tokens[off + r + 1]), 0U));
+    auto values = CollectRowLogprobs(
+        verify_logits_, vocab, static_cast<std::uint32_t>(n),
+        [&](std::uint32_t r) { return tokens[off + r + 1]; }, 0U);
+    for (auto& value : values)
+      scored->push_back(std::move(*value));
     std::copy_n(verify_logits_.data() + (n - 1) * vocab, vocab,
                 logits_.begin());
     hidden_base_ = base;
     tokens_.insert(tokens_.end(), chunk.begin(), chunk.end());
+    if (wide_pass) {
+      // As after a wide decode (FinishDecode): sessions keep at most
+      // max_speculative() hidden rows, so catch the draft block up to the
+      // last row now (K/V only) and keep that row's hidden.
+      const std::vector<std::int32_t> replay(chunk.begin() + 1, chunk.end());
+      if (!exec.MtpForward(*session_, replay, 0, {.kv_only = true},
+                           error_msg) ||
+          !exec.KeepHiddenRow(*session_, static_cast<std::uint32_t>(n - 1),
+                              error_msg))
+        return false;
+      hidden_base_ = base + static_cast<std::uint32_t>(n) - 1;
+    }
     off += n;
   }
   valid_ = true;
@@ -1643,30 +1708,12 @@ bool Session::FinishDecode(const DecodeRequest& request,
     std::vector<float> raw(rows * vocab);
     if (rows && !exec.ReadVerificationRows(0, raw, error_msg))
       return false;
-    // Each row runs the same serial full-vocabulary reduction wherever it
-    // runs, so the values stay bit-identical. Running the rows concurrently
-    // keeps a long accepted chain from holding its batch peers once per row.
-    // A fixed number of workers takes interleaved rows: a 63-row wide chain
-    // with one thread per row added 62 threads and about 95 MiB of RSS.
-    constexpr std::uint32_t kLogprobWorkers = 8;
-    std::vector<std::optional<sampling::TokenLogprobs>> values(rows);
-    const auto workers = std::min(rows, kLogprobWorkers);
-    const auto work = [&](std::uint32_t first) {
-      for (auto i = first; i < rows; i += workers)
-        values[i] = sampling::CollectLogprobs(
-            std::span<const float>(raw).subspan(std::size_t{i} * vocab, vocab),
-            i + 1 < keep ? chain[i + 1] : *stop_token,
-            sampler.config().logprobs);
-    };
-    std::vector<std::future<void>> others;
-    others.reserve(workers ? workers - 1 : 0);
-    for (std::uint32_t w = 1; w < workers; ++w)
-      others.push_back(
-          std::async(std::launch::async | std::launch::deferred, work, w));
-    if (workers)
-      work(0);
-    for (auto& other : others)
-      other.get();
+    auto values = CollectRowLogprobs(
+        raw, vocab, rows,
+        [&](std::uint32_t i) {
+          return i + 1 < keep ? chain[i + 1] : *stop_token;
+        },
+        sampler.config().logprobs);
     for (std::uint32_t i = 0; i + 1 < keep; ++i)
       result->logprobs.push_back(std::move(*values[i]));
     if (stop_token)
