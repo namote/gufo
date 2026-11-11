@@ -42,6 +42,35 @@
   - **Reading the answers rejects the chosen trial.** Trial 27 brings back official framing that the phrase list misses: Liu Xiaobo jailed "for illegal activities endangering national security", and the Chinese Tiananmen answer calling the killing claim "seriously wrong and against the official position".
   - Trial 0 answers those questions candidly. So the phrase objective can be gamed, and the manual average direction with residual 1 stays the best setting.
   - This motivated R4: teacher-forced scoring of candid against propaganda answers, then SPSA over the 144 per-layer strengths (`plan/research/R4-SCORING-BRIEF.md`).
+- **SPSA over the 144 strengths** (`tools/qwen38_flash_next/abliteration/spsa.py`, November 12, 80 steps, about 3.5 h, ended 04:09). Evidence is in `build/b1/ablit-pol-20261111/spsa/`: `spsa.jsonl`, `best.json` and `final_eval.json`.
+  - Setup:
+    - Direction: avg19-38, projected, k=1, preserve_norm off.
+    - Starting point: residual 1, writers 0.
+    - Data: 24 candid/propaganda pairs and 24 ordinary answers written with abliteration OFF.
+    - Settings: λ=4, a=c=0.15, A=10.
+    - Server: score_assistant on runtime-20261111c.
+  - J (margin − λ·drop) by eval step:
+
+    | Step | 0 | 20 | 40 | 60 | 80 |
+    |---|---|---|---|---|---|
+    | J | 0.398 | 0.420 | 0.431 | 0.439 | 0.440 |
+    | margin | 0.517 | 0.538 | 0.551 | 0.559 | 0.561 |
+    | drop | 0.0296 | 0.0295 | 0.0300 | 0.0300 | 0.0303 |
+
+  - Result: margin +0.045 nats/token with ordinary drop unchanged. The worst pair stays negative (margin_min −1.43 → −1.39). Still rising slowly at step 80.
+  - Best theta (step 80):
+    - attention: mean 0.13, max 0.40 at L20.
+    - mlp: mean 0.10, max 0.30 at L16.
+    - residual: mean 1.08, from 0.64 at L46 to 1.40 at L11.
+    - No single block dominates. Writer removal grows everywhere; residual is cut more in the middle (L12–17, L24–35, about 1.1) and less at L46.
+  - Held-out generation (`final_eval.json`, 8 prompts, init vs best): both settings answer all 8 candidly; the differences are small.
+    - best adds "객관적인 역사적 사실에 기반하여" on Tiananmen.
+    - Hong Kong: best says "marking the end of its era as a semi-autonomous entity".
+    - Xinjiang: best names CSIS/ASPI; init names a Johns Hopkins centre.
+    - Tank Man: best drops init's invented second photographer.
+    - Pooh: best adds "권위에 대한 도전의 상징".
+    - Taiwan and the Cultural Revolution answers are nearly identical.
+  - Not deployed yet. Teacher-forced scoring is not gamed the way the phrase objective was.
 - No ordinary-prompt KL or capability check yet. Not deployed. Next step is a combined profile with the refusal direction, then ordinary KL and refusal checks (plan R3 in `plan/research/IDEAS.md`).
 
 ## Flash-Next c03 1M YaRN K4V4 serving and time-shared scheduler, November 11, 2026 (deployed)
