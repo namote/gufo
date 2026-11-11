@@ -1243,8 +1243,13 @@ The response is a `chat.completion` whose choice has empty `content` and
 and `top_logprobs` do not apply: each scored token reports its own logprob
 only.
 
-Limits: at most 1024 scored tokens; the prompt plus all but the last scored
-token must fit the context. `max_tokens`/`max_completion_tokens` must be 0
+`score_max_tokens` (an integer from 1 to 1024, only with `score_assistant`)
+scores only the first that many tokens of the content as the server
+tokenizes it; `tokens` and `token_count` then cover those tokens. Shorter
+content scores every token.
+
+Limits: at most 1024 scored tokens (after `score_max_tokens`); the prompt
+plus all but the last scored token must fit the context. `max_tokens`/`max_completion_tokens` must be 0
 or omitted. `stream`, `stop`, `tools`, `response_format`, images, `n > 1`,
 explicitly enabled thinking and a scored message with `reasoning_content` or
 `tool_calls` return 400.

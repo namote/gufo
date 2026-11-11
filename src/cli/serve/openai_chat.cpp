@@ -28,6 +28,7 @@
 #include "src/cli/serve/response_format.hpp"
 #include "src/cli/serve/responses_logprobs.hpp"
 #include "src/cli/serve/sampling_request.hpp"
+#include "src/cli/serve/score_assistant.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/core/image.hpp"
 #include "src/core/json.hpp"
@@ -933,6 +934,22 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
     return Error(400, "Bad Request",
                  "'stop' is not supported with 'score_assistant'",
                  "invalid_score_assistant");
+  if (const auto* limit = body.find("score_max_tokens");
+      limit != nullptr && !limit->is_null()) {
+    if (!scoring)
+      return Error(400, "Bad Request",
+                   "'score_max_tokens' requires 'score_assistant'",
+                   "invalid_score_max_tokens");
+    const double value = limit->is_number() ? limit->as_double() : 0.0;
+    if (!limit->is_number() || !std::isfinite(value) ||
+        std::floor(value) != value || value < 1.0 ||
+        value > static_cast<double>(kMaxScoredTokens))
+      return Error(400, "Bad Request",
+                   "'score_max_tokens' must be an integer from 1 to " +
+                       std::to_string(kMaxScoredTokens),
+                   "invalid_score_max_tokens");
+    output->chat.score_max_tokens = static_cast<std::size_t>(value);
+  }
 
   const json::Value* messages = body.find("messages");
   if (messages == nullptr || !messages->is_array() || messages->empty()) {

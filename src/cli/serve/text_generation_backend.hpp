@@ -154,6 +154,9 @@ struct ChatRequest {
   /// Score the final assistant message's content token by token (teacher
   /// forcing) instead of generating; see score_assistant.hpp.
   bool score_assistant{false};
+  /// With score_assistant: score only the first this many content tokens
+  /// (1..kMaxScoredTokens); unset scores all of them.
+  std::optional<std::size_t> score_max_tokens;
   /// Optional streaming prompt progress; never changes prompt or cache
   /// identity.
   bool return_progress{false};

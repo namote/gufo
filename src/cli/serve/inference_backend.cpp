@@ -283,12 +283,7 @@ TextScoringPrompt PrepareQwenScoring(
   tokenization::TokenizerOptions content;
   content.parse_special_tokens = false;
   auto answer = tokenizer.Encode(split.answer, content);
-  if (answer.empty())
-    throw std::invalid_argument("score_assistant content has no tokens");
-  if (answer.size() > kMaxScoredTokens)
-    throw std::invalid_argument(
-        "score_assistant content has " + std::to_string(answer.size()) +
-        " tokens; the limit is " + std::to_string(kMaxScoredTokens));
+  LimitScoredTokens(&answer, request);
   return {SelectAbliteration(PrepareQwenPrompt(split.prompt, tokenizer, encoder,
                                                max_context, image_cache),
                              split.prompt, profile),

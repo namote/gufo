@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "src/cli/serve/text_generation_backend.hpp"
 
@@ -60,7 +61,23 @@ struct ScoringSplit {
   split.prompt.return_progress = false;
   split.prompt.cache_persist = false;
   split.prompt.score_assistant = false;
+  split.prompt.score_max_tokens.reset();
   return split;
+}
+
+/// Cuts the tokenized scored content to the request's `score_max_tokens`
+/// and enforces the scored-token limits. Throws std::invalid_argument for
+/// content without tokens or more than kMaxScoredTokens after the cut.
+template<class Token>
+void LimitScoredTokens(std::vector<Token>* answer, const ChatRequest& request) {
+  if (answer->empty())
+    throw std::invalid_argument("score_assistant content has no tokens");
+  if (request.score_max_tokens && answer->size() > *request.score_max_tokens)
+    answer->resize(*request.score_max_tokens);
+  if (answer->size() > kMaxScoredTokens)
+    throw std::invalid_argument(
+        "score_assistant content has " + std::to_string(answer->size()) +
+        " tokens; the limit is " + std::to_string(kMaxScoredTokens));
 }
 
 }  // namespace gufo::server

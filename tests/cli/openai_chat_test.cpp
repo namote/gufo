@@ -7215,6 +7215,42 @@ void TestScoreAssistant() {
     Expect(gufo::server::HandleOpenAiChat(Request(body), backend).status == 400,
            "score_assistant must be a boolean");
   }
+  // score_max_tokens: an integer 1..kMaxScoredTokens, with scoring only.
+  {
+    auto body = scored_body;
+    body.insert(body.rfind('}'), R"(,"score_max_tokens":1)");
+    Expect(
+        gufo::server::HandleOpenAiChat(Request(body), backend).status == 200 &&
+            backend.last_request.score_max_tokens == 1U,
+        "score_max_tokens reaches the request");
+    body = scored_body;
+    body.insert(body.rfind('}'), R"(,"score_max_tokens":null)");
+    Expect(
+        gufo::server::HandleOpenAiChat(Request(body), backend).status == 200 &&
+            !backend.last_request.score_max_tokens,
+        "a null score_max_tokens scores every token");
+  }
+  for (const auto* limit : {"0", "1.5", "1025", "\"2\"", "true"}) {
+    auto body = scored_body;
+    body.insert(body.rfind('}'), std::string(",\"score_max_tokens\":") + limit);
+    const auto response =
+        gufo::server::HandleOpenAiChat(Request(body), backend);
+    Expect(
+        response.status == 400 &&
+            response.body.find("invalid_score_max_tokens") != std::string::npos,
+        std::string("score_max_tokens refuses ") + limit);
+  }
+  {
+    const auto response =
+        gufo::server::HandleOpenAiChat(Request(R"({"model":"test-model",
+          "messages":[{"role":"user","content":"Q?"}],
+          "score_max_tokens":4})"),
+                                       backend);
+    Expect(
+        response.status == 400 &&
+            response.body.find("invalid_score_max_tokens") != std::string::npos,
+        "score_max_tokens requires score_assistant");
+  }
 
   // The split behind every scoring runner.
   gufo::server::ChatRequest request(
@@ -7273,6 +7309,37 @@ void TestScoreAssistant() {
   bad = request;
   bad.messages.erase(bad.messages.begin(), bad.messages.end() - 1);
   Expect(refuses(bad), "something must precede the scored message");
+
+  // The scored-token cut and limits behind every scoring runner.
+  const auto limited = [&](std::size_t count,
+                           std::optional<std::size_t> limit) {
+    auto limited_request = request;
+    limited_request.score_max_tokens = limit;
+    std::vector<int> answer(count);
+    for (std::size_t i = 0; i < count; ++i)
+      answer[i] = static_cast<int>(i);
+    try {
+      gufo::server::LimitScoredTokens(&answer, limited_request);
+    } catch (const std::invalid_argument&) {
+      return std::optional<std::vector<int>>();
+    }
+    return std::optional(answer);
+  };
+  Expect(limited(5, 3) == std::vector<int>{0, 1, 2},
+         "score_max_tokens keeps the first tokens");
+  Expect(limited(2, 3) == std::vector<int>{0, 1},
+         "a shorter answer keeps every token");
+  Expect(limited(gufo::server::kMaxScoredTokens, std::nullopt).has_value() &&
+             !limited(gufo::server::kMaxScoredTokens + 1, std::nullopt) &&
+             limited(gufo::server::kMaxScoredTokens + 1,
+                     gufo::server::kMaxScoredTokens)
+                     ->size() == gufo::server::kMaxScoredTokens,
+         "the token limit applies after the cut");
+  Expect(!limited(0, 3), "content without tokens is refused");
+  auto capped = request;
+  capped.score_max_tokens = 2;
+  Expect(!gufo::server::SplitScoringRequest(capped).prompt.score_max_tokens,
+         "the split prompt carries no scoring limit");
 }
 
 int main() {
