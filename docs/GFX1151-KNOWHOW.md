@@ -1,5 +1,34 @@
 # gfx1151 optimization know-how
 
+## Flash-Next political-sensitivity direction (CCP topics), November 11, 2026 (experiment, not deployed)
+
+**Collection** (`build/b1/ablit-pol-20261111/`, c03, the existing collector and `prepare.py fit`, no code change):
+- "refusal" group: 36 CCP-sensitive topics x 2 templates x ko/en/zh x think on/off, 216 prompts.
+- "ordinary" group: 216 matched controls, the same templates on comparable non-China political events (Gwangju, Kent State, Prague Spring, apartheid, Chernobyl, Navalny, ...) plus 4 non-sensitive China topics.
+- The fit screened layers 19, 28 and 38.
+
+**Direction geometry (cosine):**
+- Political L19 vs L38: 0.352 (projected), 0.342 (mean_diff).
+- Political vs refusal mean_diff at the same layer: L19 0.455, L28 0.447, L36 0.571, L38 0.588.
+- So the deeper political direction overlaps the refusal direction more.
+
+**Evaluation:** `data/politics.jsonl`, 8 prompts x think on/off, greedy, 768 tokens. Residual 1 on every layer with the projected kind.
+- Reference runs:
+  - OFF: the propaganda line on Tiananmen, Taiwan, Xinjiang, Hong Kong and Pooh.
+  - The production refusal profile (L36 a2 m05): fixes most answers, but Taiwan still answers "an inseparable part of China".
+- Political candidates:
+
+| Profile | Candid answers (of 16) | Notes |
+| --- | ---: | --- |
+| pol L19 | 15 | Taiwan de facto independent; Tank Man by Jeff Widener (AP). Refuses the English plain death-toll question |
+| pol L28 | weak | Taiwan and Hong Kong stay on the official line |
+| pol L38 | 15 | Strongest framing change. Refuses the English plain death-toll question; Widener's employer wrong in plain mode |
+| avg(L19, L38), k=1 | **16** | Answers the English death-toll question too (military crackdown). Tank Man plain says the photographer is unconfirmed |
+| both (L19 + L38 subspace), k=2 | 15 | Refuses the English plain death-toll question |
+
+- Best so far: the average direction.
+- No ordinary-prompt KL or capability check yet. Not deployed. Next step is a combined profile with the refusal direction, then ordinary KL and refusal checks (plan R3 in `plan/research/IDEAS.md`).
+
 ## Flash-Next c03 1M YaRN K4V4 serving and time-shared scheduler, November 11, 2026 (deployed)
 
 **Production change:** back to our c03 pack (4.04 bpw), at the user's request ("5.05 is not noticeably better"). Runs as `e015a85d`, then runtime `runtime-20261111b` (`9910a9f4`).
