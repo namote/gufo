@@ -142,11 +142,12 @@ class ServerTest(unittest.TestCase):
     def test_disk_admission(self):
         server = load_server()
         gib = 2**30
-        self.assertTrue(server.disk_admitted(150 * gib, 0))
-        self.assertTrue(server.disk_admitted(100 * gib, 50 * gib))
-        self.assertFalse(server.disk_admitted(100 * gib, 49 * gib))
+        self.assertTrue(server.disk_admitted(200 * gib, 0))
+        self.assertTrue(server.disk_admitted(100 * gib, 100 * gib))
+        self.assertFalse(server.disk_admitted(100 * gib, 99 * gib))
         self.assertFalse(server.disk_admitted(99 * gib, 500 * gib))
-        self.assertTrue(server.disk_admitted(101 * gib, 500 * gib))  # credit capped at 50 GiB
+        self.assertFalse(server.disk_admitted(99 * gib + 1, 101 * gib))  # credit capped at 100 GiB
+        self.assertTrue(server.disk_admitted(101 * gib, 500 * gib))
 
     def test_command_pins_runtime_and_model(self):
         server = load_server()
@@ -162,6 +163,9 @@ class ServerTest(unittest.TestCase):
         self.assertIn(f'type=bind,src={server.MODEL},dst=/models/fnx,readonly', argv)
         self.assertEqual(argv[argv.index('--kv-pool-bytes') + 1], str(server.KV_POOL_BYTES))
         self.assertEqual(argv[argv.index('--han-scale') + 1], str(server.HAN_SCALE))
+        self.assertEqual(argv[argv.index('--kv-cache-type') + 1], server.KV_CACHE_TYPE)
+        self.assertEqual(argv[argv.index('--context') + 1], str(server.CONTEXT))
+        self.assertEqual('--enable-yarn' in argv, server.CONTEXT > 262144)
         self.assertEqual(argv[-1], '--log-progress')
 
 

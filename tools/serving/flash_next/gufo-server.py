@@ -22,12 +22,12 @@ ROOT = Path(__file__).resolve().parent
 STATE = ROOT / 'server-state.json'
 IMAGE = 'ai-tools/gufo-eval:native-exl3-vision-rocm101'
 IMAGE_ID = 'sha256:e7a761a40187efb13515a0275362ab09d084a129f4544aa4300ec5cccb8c7468'
-MODEL = '/home/m2on/projects/models/llm/qwen-3.8-flash-next-exl3-5.05'
+MODEL = '/home/m2on/projects/models/llm/flash-next-exl3-gufo-c03'
 RUNTIME = '/home/m2on/.local/share/gufo/runtime-20261111'
 GUFO_SHA256 = '02dce1230c37d9b7075e7ac098761fe2e8d4cfee6de4f1ea5c5e398f14ea2c4a'
 # Runtime abliteration profile shipped in RUNTIME (writer, layer-36 direction,
 # attention 2, mlp 0.5). Loaded only; requests enable it per call.
-ABLITERATION_PROFILE = '/candidate/abliteration-fnx505.json'
+ABLITERATION_PROFILE = '/candidate/abliteration-fnx.json'
 TEMPERATURE = 0.75
 # Scale Han-ideograph token probability by 0.1 in the final answer only, not in thinking
 # (docs/SERVER.md --han-scale, --han-scale-scope); requests may override.
@@ -36,17 +36,22 @@ HAN_SCALE_SCOPE = 'answer'
 VISION = MODEL + ' (embedded EXL3 vision)'
 URL = 'http://127.0.0.1:18740'
 BIND_HOST = '0.0.0.0'
-CONTEXT = 262144
+# Native context is 262144; 1M needs static YaRN (factor CONTEXT / 262144 = 4).
+CONTEXT = 1048576
 MAX_REQUEST_BYTES = 64 * 2**20
-DISK_EMPTY_CACHE_RESERVE_BYTES = 150 * 2**30
+DISK_EMPTY_CACHE_RESERVE_BYTES = 200 * 2**30
 DISK_MIN_FREE_BYTES = 100 * 2**30
-ENABLE_YARN = False
-RAM_CACHE_BYTES = 2 * 2**30
+ENABLE_YARN = CONTEXT > 262144
+RAM_CACHE_BYTES = 4 * 2**30
 SESSIONS = 2
-# Twelve target and one MTP FP16 KV layers plus thirteen pooled-key planes:
-# 7,028,736 bytes/block. Two 256K contexts with one guard each use 2,050 blocks.
-KV_POOL_BYTES = 14_408_908_800
-DISK_CACHE_BYTES = 50 * 2**30
+KV_CACHE_TYPE = 'kvarn-k4v4'
+# 0: the server sizes the pool for every session's full context (startup line
+# reports automatic_bytes). K4V4 holds about 3.7x the FP16 tokens per byte.
+KV_POOL_BYTES = 0
+# Checkpoints keep K4V4 records (about 3.7x FP16 tokens per byte), so for the
+# 4x context (256K -> 1M) RAM 2 -> 4 GiB and disk 50 -> 100 GiB cover about
+# 1.85x the old FP16 token share.
+DISK_CACHE_BYTES = 100 * 2**30
 CACHE_ROOT = ROOT / 'cache-c03'
 
 # Keep an idle admission reserve of 80 GiB; active KV/state uses more RAM.
@@ -74,7 +79,7 @@ def diagnostic_only(collect, **kwargs):
 
 
 def disk_admitted(free_bytes, cache_allocated):
-    # 150GiB before cache growth; the configured 50GiB cache consumes part
+    # 200GiB before cache growth; the configured 100GiB cache consumes part
     # of that reserve. Count only already allocated cache, never prospective
     # space or unrelated files, and retain a hard 100GiB free floor.
     return (free_bytes >= DISK_MIN_FREE_BYTES and
@@ -145,7 +150,7 @@ def build_command(state):
                 '--speculative', 'mtp', '--mtp-model', '/models/fnx/', '--draft-tokens', '7', '--think', 'on',
                 '--reasoning-effort', 'medium',
                 *(['--enable-yarn'] if ENABLE_YARN else []), '--context', str(CONTEXT), '--sessions', str(SESSIONS),
-                '--kv-cache-type', 'fp16',
+                '--kv-cache-type', KV_CACHE_TYPE,
                 '--kv-pool-bytes', str(KV_POOL_BYTES), '--cache-ram-bytes', str(RAM_CACHE_BYTES),
                 '--cache-disk', '/cache/continuations', '--cache-disk-bytes', str(DISK_CACHE_BYTES),
                 '--temperature', str(TEMPERATURE), '--top-k', '20', '--top-p', '0.95', '--min-p', '0',
@@ -175,8 +180,8 @@ def supervise():
              'context_per_session': CONTEXT, 'sessions': SESSIONS, 'active_reserve_bytes': ACTIVE_RESERVE_BYTES,
              'memory_critical_bytes': MEMORY_CRITICAL_BYTES, 'memory_low_grace_seconds': MEMORY_LOW_GRACE_SECONDS,
              'gpu_diagnostics_policy': 'log_only', 'runtime_resource_stop_guard': 'host_memory',
-             'kv_pool_bytes': KV_POOL_BYTES, 'kv_cache_type': 'fp16',
-             'enable_yarn': ENABLE_YARN, 'yarn_factor': 2 if ENABLE_YARN else 1, 'ram_cache_bytes': RAM_CACHE_BYTES,
+             'kv_pool_bytes': KV_POOL_BYTES, 'kv_cache_type': KV_CACHE_TYPE,
+             'enable_yarn': ENABLE_YARN, 'yarn_factor': CONTEXT / 262144 if ENABLE_YARN else 1, 'ram_cache_bytes': RAM_CACHE_BYTES,
              'thinking': 'on', 'reasoning_effort': 'medium', 'vision_model': VISION,
              'disk_cache_bytes': DISK_CACHE_BYTES, 'disk_cache_directory': str(CACHE_ROOT / 'continuations')}
     def persist():
@@ -204,7 +209,7 @@ def supervise():
         state['pre']['disk_cache_allocated_bytes'] = cache_allocated
         state['pre']['disk_cache_credit_bytes'] = min(cache_allocated, DISK_CACHE_BYTES)
         assert disk_admitted(state['pre']['disk_free'], cache_allocated), (
-            'Disk reserve requires 100 GiB free and 150 GiB including existing cache (credit capped at 50 GiB)')
+            'Disk reserve requires 100 GiB free and 200 GiB including existing cache (credit capped at 100 GiB)')
         state['pre']['memory_prepare'] = diagnostic_only(prepare_memory)
         with socket.socket() as sock:
             # Match the HTTP listener: allow our recently closed connections
