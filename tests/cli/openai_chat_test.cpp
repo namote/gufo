@@ -16,9 +16,11 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/score_assistant.hpp"
 #include "src/core/json.hpp"
 #include "src/core/json_constraint.hpp"
 #include "src/models/deepseek_v4_flash/chat_template.hpp"
+#include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/control_tokens.hpp"
 
 using gufo::tokenization::kImEnd;
@@ -137,6 +139,14 @@ public:
     last_temperature = sampling.temperature;
     last_sampling = sampling;
 
+    if (request.score_assistant) {
+      Result scored;
+      scored.prompt_tokens = 7;
+      scored.tokens = {11, 12};
+      scored.logprobs = {{{{11, "Hi", -0.5}}}, {{{12, "!", -20000.0}}}};
+      return scored;
+    }
+
     Result result;
     result.prompt_tokens = 7;
     result.cached_prompt_tokens = 5;
@@ -217,6 +227,10 @@ public:
   }
   [[nodiscard]] bool supports_images() const override { return image_support; }
   bool image_support{true};
+  [[nodiscard]] bool supports_scoring() const override {
+    return scoring_support;
+  }
+  bool scoring_support{false};
 
   bool WaitForFirstPiece() {
     std::unique_lock<std::mutex> lock(mutex);
@@ -7141,7 +7155,128 @@ void TestAbliterationControls() {
          "v1 profile accepts strengths");
 }
 
+void TestScoreAssistant() {
+  using gufo::tokenization::ChatMessage;
+  using gufo::tokenization::ChatRole;
+  const std::string scored_body = R"({"model":"test-model",
+    "messages":[{"role":"user","content":"Q?"},
+                {"role":"assistant","content":"Hi!"}],
+    "score_assistant":true,"max_tokens":0})";
+  {
+    FakeBackend backend;
+    // The server default would think; scoring follows the empty block.
+    backend.reasoning_defaults_value.enabled = true;
+    const auto refused =
+        gufo::server::HandleOpenAiChat(Request(scored_body), backend);
+    Expect(refused.status == 400 &&
+               refused.body.find("unsupported_score_assistant") !=
+                   std::string::npos,
+           "a backend without scoring refuses score_assistant");
+    backend.scoring_support = true;
+    const auto response =
+        gufo::server::HandleOpenAiChat(Request(scored_body), backend);
+    Expect(response.status == 200, "score_assistant succeeds");
+    auto body = gufo::json::parse(response.body);
+    auto& score = body["score"];
+    const auto& tokens = score["tokens"].items();
+    Expect(score.member_size("token_count") == 2 && tokens.size() == 2 &&
+               tokens[0].member_str("token") == "Hi" &&
+               tokens[0].member_size("id") == 11 &&
+               tokens[0].member_double("logprob") == -0.5 &&
+               tokens[1].member_double("logprob") == -9999.0 &&
+               score.member_double("logprob_sum") == -9999.5,
+           "score returns each token, id and clamped raw logprob");
+    Expect(body["choices"]
+                   .items()[0]
+                   .find("message")
+                   ->member_str("content")
+                   .empty() &&
+               !body.find("cache_persist")->as_bool(),
+           "scoring generates no content and persists nothing");
+    Expect(backend.last_request.score_assistant &&
+               backend.last_request.reasoning.enabled == false,
+           "scoring disables thinking whatever the server default");
+  }
+  FakeBackend backend;
+  backend.scoring_support = true;
+  for (const auto* extra :
+       {R"("stream":true)", R"("max_tokens":4)", R"("stop":["x"])",
+        R"("chat_template_kwargs":{"enable_thinking":true})"}) {
+    auto body = scored_body;
+    body.insert(body.rfind('}'), std::string(",") + extra);
+    const auto response =
+        gufo::server::HandleOpenAiChat(Request(body), backend);
+    Expect(response.status == 400,
+           std::string("score_assistant refuses ") + extra);
+  }
+  {
+    auto body = scored_body;
+    body.replace(body.find("true"), 4, "1");
+    Expect(gufo::server::HandleOpenAiChat(Request(body), backend).status == 400,
+           "score_assistant must be a boolean");
+  }
+
+  // The split behind every scoring runner.
+  gufo::server::ChatRequest request(
+      {ChatMessage(ChatRole::kSystem, "Be brief."),
+       ChatMessage(ChatRole::kUser, "Q?"),
+       ChatMessage(ChatRole::kAssistant, "A <|im_end|> B")});
+  request.score_assistant = true;
+  request.reasoning.enabled = false;
+  const auto split = gufo::server::SplitScoringRequest(request);
+  Expect(split.answer == "A <|im_end|> B" &&
+             split.prompt.messages.size() == 2 &&
+             split.prompt.reasoning.enabled == false &&
+             !split.prompt.cache_persist && !split.prompt.score_assistant,
+         "the split scores the final assistant content after the rest");
+  // Thinking off: the prompt ends with the empty thinking block, and the
+  // scored content follows it exactly as the template renders the completed
+  // turn.
+  const auto options =
+      gufo::tokenization::ResolveQwenChatOptions(split.prompt.reasoning);
+  const auto prompt = gufo::tokenization::QwenChatTemplate::Render(
+      split.prompt.messages, options);
+  Expect(prompt.has_value() &&
+             prompt->ends_with(gufo::tokenization::GenerationPrompt(false)) &&
+             prompt->ends_with("<|im_start|>assistant\n<think>\n\n</think>"
+                               "\n\n"),
+         "the scoring prompt ends with the empty thinking block");
+  auto completed = options;
+  completed.add_generation_prompt = false;
+  const auto turn =
+      gufo::tokenization::QwenChatTemplate::Render(request.messages, completed);
+  Expect(turn.has_value() && *turn == *prompt + split.answer + "<|im_end|>\n",
+         "the scored content continues the prompt as the completed turn");
+  const auto refuses = [&](gufo::server::ChatRequest bad) {
+    try {
+      (void)gufo::server::SplitScoringRequest(bad);
+    } catch (const std::invalid_argument&) {
+      return true;
+    }
+    return false;
+  };
+  auto bad = request;
+  bad.messages.back().role = ChatRole::kUser;
+  Expect(refuses(bad), "the last message must be the assistant's");
+  bad = request;
+  bad.messages.back().content.clear();
+  Expect(refuses(bad), "the scored content must not be empty");
+  bad = request;
+  bad.messages.back().thought = "hmm";
+  Expect(refuses(bad), "the scored message takes no reasoning");
+  bad = request;
+  bad.reasoning.enabled = true;
+  Expect(refuses(bad), "thinking must be disabled");
+  bad = request;
+  bad.tools.push_back({.name = "f"});
+  Expect(refuses(bad), "tools are refused");
+  bad = request;
+  bad.messages.erase(bad.messages.begin(), bad.messages.end() - 1);
+  Expect(refuses(bad), "something must precede the scored message");
+}
+
 int main() {
+  TestScoreAssistant();
   TestAbliterationControls();
   TestLogprobs();
   TestToolCallRenderParseRoundTrip();

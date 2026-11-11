@@ -26,6 +26,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/persistence_identity.hpp"
 #include "src/cli/serve/request_memory_budget.hpp"
+#include "src/cli/serve/score_assistant.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/device_code_identity.hpp"
@@ -268,6 +269,30 @@ TextPreparedPrompt SelectAbliteration(
         models::qwen::AbliterationInputIdentity(prefix.identity, identity);
   result.context = std::move(context);
   return result;
+}
+
+/// A Qwen `score_assistant` request: the prompt before the final assistant
+/// content, as generation prepares it (abliteration included), and that
+/// content tokenized as message text, never as framing (#383).
+TextScoringPrompt PrepareQwenScoring(
+    const ChatRequest& request, const tokenization::QwenTokenizer& tokenizer,
+    const std::shared_ptr<models::qwen::vision::Encoder>& encoder,
+    std::uint32_t max_context, models::qwen::vision::ImageCache& image_cache,
+    const models::qwen::AbliterationProfile* profile) {
+  auto split = SplitScoringRequest(request);
+  tokenization::TokenizerOptions content;
+  content.parse_special_tokens = false;
+  auto answer = tokenizer.Encode(split.answer, content);
+  if (answer.empty())
+    throw std::invalid_argument("score_assistant content has no tokens");
+  if (answer.size() > kMaxScoredTokens)
+    throw std::invalid_argument(
+        "score_assistant content has " + std::to_string(answer.size()) +
+        " tokens; the limit is " + std::to_string(kMaxScoredTokens));
+  return {SelectAbliteration(PrepareQwenPrompt(split.prompt, tokenizer, encoder,
+                                               max_context, image_cache),
+                             split.prompt, profile),
+          {answer.begin(), answer.end()}};
 }
 
 /// The settings a request's prompt context selects; null for OFF.
@@ -3007,6 +3032,29 @@ public:
         request, model_->Abliteration());
   }
 
+  [[nodiscard]] bool SupportsScoring() const override { return true; }
+  [[nodiscard]] TextScoringPrompt PrepareScoring(
+      const ChatRequest& request) const override {
+    return PrepareQwenScoring(request, model_->tokenizer(),
+                              model_->VisionEncoder(), max_context_,
+                              image_cache_, model_->Abliteration());
+  }
+
+  [[nodiscard]] std::vector<sampling::TokenLogprobs> ScoreTokens(
+      TextRunnerState& state,
+      std::span<const TextRunnerToken> tokens) const override {
+    auto& qfn = RequireQwenFlashNextState(state);
+    std::vector<sampling::TokenLogprobs> scored;
+    std::string error;
+    if (!qfn.session().ScoreTokens(QwenFlashNextEngineTokens(tokens), &scored,
+                                   &error)) {
+      qfn.set_position(0);
+      throw std::runtime_error("Qwen3.8-Flash-Next scoring failed: " + error);
+    }
+    qfn.set_position(qfn.session().Position());
+    return scored;
+  }
+
   [[nodiscard]] std::optional<std::size_t> CountPromptTokens(
       const ChatRequest& request) const override {
     return CountQwenPromptTokens(request, model_->tokenizer(),
@@ -3520,6 +3568,43 @@ struct InferenceBackend::Impl {
     ScheduledGenerationRequest generation(std::move(current),
                                           std::move(request), initial);
     return generation.Wait(on_token, {}, {});
+  }
+
+  /// A `score_assistant` request: prefill the prompt, then score the final
+  /// assistant content (TextRequestMetadata::score_tokens).
+  std::shared_ptr<GenerationRequest> StartScoring(
+      std::shared_ptr<const State> current, const ChatRequest& request,
+      Clock::time_point request_start, const CancellationCheck& is_cancelled,
+      bool stream_output) const {
+    if (stream_output)
+      throw std::invalid_argument("score_assistant does not support streaming");
+    if (request.abliteration && !current->abliteration)
+      throw std::invalid_argument(
+          "abliteration profile is not available on this backend");
+    const auto& runner = current->scheduler->runner();
+    if (!runner.SupportsScoring())
+      throw std::invalid_argument("model does not support score_assistant");
+    auto scoring = runner.PrepareScoring(request);
+    const std::size_t system_prefix_tokens =
+        request.cache_prompt ? scoring.prompt.system_prefix_tokens : 0;
+    const auto count = scoring.answer.size();
+    auto scheduled = current->scheduler->Submit(
+        std::move(scoring.prompt.tokens), count, sampling::SamplingConfig{},
+        is_cancelled, false,
+        TextRequestMetadata{
+            .client_id =
+                request.client_id.empty() ? "anonymous" : request.client_id,
+            .deadline = std::nullopt,
+            .request_start = request_start,
+            .prompt_context = std::move(scoring.prompt.context),
+            .cache_prompt = request.cache_prompt,
+            .cache_persist = false,
+            .cache_prefix_tokens = scoring.prompt.cache_prefix_tokens,
+            .system_prefix_tokens = system_prefix_tokens,
+            .score_tokens = std::move(scoring.answer),
+        });
+    return std::make_shared<ScheduledGenerationRequest>(std::move(current),
+                                                        std::move(scheduled));
   }
 
   mutable std::mutex state_mutex;
@@ -4273,6 +4358,15 @@ bool InferenceBackend::supports_han_scale() const {
 #endif
 }
 
+bool InferenceBackend::supports_scoring() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state != nullptr && state->scheduler->runner().SupportsScoring();
+#else
+  return false;
+#endif
+}
+
 std::uint32_t InferenceBackend::max_context() const {
 #if defined(ENGINE_ENABLE_HIP)
   const auto state = impl_->Snapshot();
@@ -4457,6 +4551,10 @@ InferenceBackend::Result InferenceBackend::chat(
   if (state == nullptr) {
     return {};
   }
+  if (request.score_assistant)
+    return impl_
+        ->StartScoring(state, request, request_start, is_cancelled, false)
+        ->Wait(on_token, {}, {});
   auto effective_sampling = sampling_config;
   auto constrained = ConstrainChatRequest(request, state->scheduler->runner(),
                                           &effective_sampling);
@@ -4546,6 +4644,10 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
     return TextGenerationBackend::start_chat(
         request, max_tokens, sampling_config, is_cancelled, stream_output);
   }
+
+  if (request.score_assistant)
+    return impl_->StartScoring(state, request, request_start, is_cancelled,
+                               stream_output);
 
   auto effective_sampling = sampling_config;
   std::optional<sampling::JsonConstraint::ToolFormat> tool_format;

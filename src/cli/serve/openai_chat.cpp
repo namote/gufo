@@ -917,6 +917,22 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
                              &output->chat.stop_sequences)) {
     return Error(400, "Bad Request", *error, "invalid_stop");
   }
+  if (const auto* score = body.find("score_assistant");
+      score != nullptr && !score->is_null()) {
+    if (!score->is_bool())
+      return Error(400, "Bad Request", "'score_assistant' must be a boolean",
+                   "invalid_score_assistant");
+    output->chat.score_assistant = score->as_bool();
+  }
+  const bool scoring = output->chat.score_assistant;
+  if (scoring && !backend.supports_scoring())
+    return Error(400, "Bad Request",
+                 "'score_assistant' is not supported by this model",
+                 "unsupported_score_assistant");
+  if (scoring && !output->chat.stop_sequences.empty())
+    return Error(400, "Bad Request",
+                 "'stop' is not supported with 'score_assistant'",
+                 "invalid_score_assistant");
 
   const json::Value* messages = body.find("messages");
   if (messages == nullptr || !messages->is_array() || messages->empty()) {
@@ -945,6 +961,16 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
   }
   if (auto error = ParseReasoningBudget(body, &output->chat.reasoning))
     return error;
+  // Scoring follows the template's empty thinking block (score_assistant.hpp)
+  // rather than the server's reasoning default.
+  if (scoring) {
+    if (output->chat.reasoning.enabled.value_or(false))
+      return Error(400, "Bad Request",
+                   "'score_assistant' scores the reply after an empty "
+                   "thinking block; thinking must be disabled",
+                   "invalid_score_assistant");
+    output->chat.reasoning.enabled = false;
+  }
   if (const auto* kwargs = body.find("chat_template_kwargs")) {
     if (const auto* vision_id = kwargs->find("add_vision_id")) {
       if (!vision_id->is_bool())
@@ -976,6 +1002,10 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
     }
     output->stream = stream->as_bool();
   }
+  if (scoring && output->stream)
+    return Error(400, "Bad Request",
+                 "'stream' is not supported with 'score_assistant'",
+                 "invalid_score_assistant");
   if (const json::Value* progress = body.find("return_progress");
       progress != nullptr && !progress->is_null()) {
     if (!progress->is_bool()) {
@@ -1009,16 +1039,24 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
   if (max_tokens != nullptr && !max_tokens->is_null()) {
     const double value =
         max_tokens->is_number() ? max_tokens->as_double() : 0.0;
-    if (!max_tokens->is_number() || !std::isfinite(value) ||
-        std::floor(value) != value || value < 1.0 ||
-        value >
-            static_cast<double>(std::numeric_limits<std::uint32_t>::max())) {
+    if (scoring) {
+      // Scoring generates nothing.
+      if (!max_tokens->is_number() || value != 0.0)
+        return Error(400, "Bad Request",
+                     "'" + std::string(max_tokens_field) +
+                         "' must be 0 or omitted with 'score_assistant'",
+                     "invalid_max_tokens");
+    } else if (!max_tokens->is_number() || !std::isfinite(value) ||
+               std::floor(value) != value || value < 1.0 ||
+               value > static_cast<double>(
+                           std::numeric_limits<std::uint32_t>::max())) {
       return Error(
           400, "Bad Request",
           "'" + std::string(max_tokens_field) + "' must be a positive integer",
           "invalid_max_tokens");
+    } else {
+      output->max_tokens = max_tokens->as_size();
     }
-    output->max_tokens = max_tokens->as_size();
   }
 
   sampling::SamplingConfig parsed_sampling;
@@ -4213,6 +4251,70 @@ HttpResponse CreateAnthropicMessage(const HttpRequest& request,
       request, backend, chat, max_tokens, sampling, stream, model);
 }
 
+namespace {
+
+// `score_assistant`: the final assistant content's tokens with their raw
+// logprobs, as `logprobs` defines them, and their sum. No text is generated.
+HttpResponse ScoringResponse(
+    const ParsedChatRequest& request,
+    const std::shared_ptr<TextGenerationBackend::GenerationRequest>&
+        generation) {
+  const auto result = generation->Wait();
+  if (result.cancelled)
+    return Error(499, "Client Closed Request", "scoring was cancelled",
+                 "cancelled");
+  if (result.tokens.size() != result.logprobs.size())
+    return Error(500, "Internal Server Error",
+                 "scoring returned no logprob for some tokens",
+                 "scoring_failed");
+  json::Value tokens = json::Value::array();
+  double sum = 0;
+  for (std::size_t index = 0; index < result.tokens.size(); ++index) {
+    const auto& entry = result.logprobs[index].entries.at(0);
+    json::Value token = json::Value::object();
+    token["token"] = entry.token;
+    token["id"] = static_cast<std::size_t>(result.tokens[index]);
+    token["logprob"] = std::max(entry.logprob, -9999.0);
+    sum += std::max(entry.logprob, -9999.0);
+    tokens.push_back(std::move(token));
+  }
+  json::Value score = json::Value::object();
+  score["tokens"] = std::move(tokens);
+  score["token_count"] = result.tokens.size();
+  score["logprob_sum"] = sum;
+
+  json::Value response = json::Value::object();
+  response["id"] = RandomId("chatcmpl-");
+  response["object"] = "chat.completion";
+  response["created"] = Now();
+  response["model"] = request.model;
+  json::Value choice = json::Value::object();
+  choice["index"] = 0;
+  json::Value message = json::Value::object();
+  message["role"] = "assistant";
+  message["content"] = "";
+  choice["message"] = std::move(message);
+  choice["finish_reason"] = "stop";
+  json::Value choices = json::Value::array();
+  choices.push_back(std::move(choice));
+  response["choices"] = std::move(choices);
+  response["score"] = std::move(score);
+  response["usage"] = Usage(result);
+  response["timings"] = GenerationTimings(result);
+  response["cache_persist"] = false;
+  RecordServerMetrics(result);
+  return {
+      .status = 200,
+      .reason = "OK",
+      .body = response.dump(),
+      .headers = {},
+      .streaming_body = {},
+      .log_details = GenerationLogDetails(result),
+  };
+}
+
+}  // namespace
+
 HttpResponse HandleOpenAiChat(const HttpRequest& request,
                               TextGenerationBackend& backend) {
   ParsedChatRequest parsed;
@@ -4227,6 +4329,8 @@ HttpResponse HandleOpenAiChat(const HttpRequest& request,
     auto generation =
         backend.start_chat(parsed.chat, parsed.max_tokens, parsed.sampling,
                            request.is_cancelled, parsed.stream);
+    if (parsed.chat.score_assistant)
+      return ScoringResponse(parsed, generation);
     if (parsed.stream) {
       return StreamingResponse(parsed, backend, std::move(generation),
                                initial_output_state);

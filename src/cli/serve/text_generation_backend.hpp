@@ -151,6 +151,9 @@ struct ChatRequest {
   /// False keeps this request's checkpoints out of the disk cache; it may
   /// still read existing disk checkpoints and use the RAM cache.
   bool cache_persist{true};
+  /// Score the final assistant message's content token by token (teacher
+  /// forcing) instead of generating; see score_assistant.hpp.
+  bool score_assistant{false};
   /// Optional streaming prompt progress; never changes prompt or cache
   /// identity.
   bool return_progress{false};
@@ -359,6 +362,9 @@ public:
   /// Whether requests apply SamplingConfig::han_scale (Qwen 27B and
   /// Flash-Next, whose runners build a Han token set).
   [[nodiscard]] virtual bool supports_han_scale() const { return false; }
+  /// Whether chat requests may set `score_assistant` (teacher-forced
+  /// logprobs of the final assistant message instead of generation).
+  [[nodiscard]] virtual bool supports_scoring() const { return false; }
   /// Flash-Next's loaded HyperConnection mode (`--hc-mode`); empty for other
   /// models.
   [[nodiscard]] virtual std::string hc_mode() const { return {}; }
