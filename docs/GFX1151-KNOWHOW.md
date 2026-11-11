@@ -90,6 +90,23 @@
 
     - That is about 0.2 s for the prompt plus about 4.5 ms per answer token, the same rate as ordinary 8-row verification (about 36 ms per 8 rows).
     - A 64-row batch-path pass costs about as much as eight narrow passes, because the batch MoE pays its fixed weight stream per pass (see the stage split, about 148 ms). So the wide pass does not pay off for scoring.
+  - **Prefill-route scoring** (230048e3, runtime-20261111e; November 12, after preflight). The training server runs at 8k context with native RoPE (no YaRN), 2 sessions, K4V4, and SPSA uses concurrency 2. The workload is the same 312 scorings.
+
+    | Runtime | Answer | Time | Per scoring |
+    |---|---|---|---|
+    | d (8-row verify scoring) | whole | 249.1 s | 0.80 s |
+    | e (256-row prefill scoring) | whole | 166.7 s | 0.53 s |
+    | e | first 64 tokens | 133.8 s | 0.43 s |
+
+    - Gain: 1.5× on whole answers, 1.9× with `--answer-tokens 64`.
+    - The fixed cost per pass (about 0.2 s for the prompt pass plus 0.2 s for the answer pass) now dominates.
+    - Exactness against generated logprobs (`score_assistant.py`):
+      - OFF: max|Δ| 1e-6 to 0.0214 nats.
+      - ON: max|Δ| up to 0.00064 nats.
+      - This fails the 1e-3 tolerance. It is prefill arithmetic against verify arithmetic, as expected, not misalignment: short answers and the first token match.
+      - The test answers were at most 21 tokens, so a multi-pass answer (over 256 tokens) was not exercised.
+    - SPSA signal is unaffected. One step's J⁺−J⁻ was −0.0054 on d and −0.0063 on e; the init eval J was 0.4307 against 0.4313.
+    - A normal generation after scoring on the same server was correct.
   - Remaining levers:
     - Fewer answer tokens: `--answer-tokens 64` is about 2× faster.
     - Packing many scoring requests into one batch pass, so they share the 0.2 s fixed cost. One eval is about 72 × 150 tokens, about 9 s at 0.8 ms per token, against about 60 s now.
