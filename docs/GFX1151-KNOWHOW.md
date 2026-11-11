@@ -71,6 +71,28 @@
     - Pooh: best adds "권위에 대한 도전의 상징".
     - Taiwan and the Cultural Revolution answers are nearly identical.
   - Not deployed yet. Teacher-forced scoring is not gamed the way the phrase objective was.
+- **Scoring speed** (November 12; runtime-20261111c, then runtime-20261111d with 6b394afb wide scoring, parallel row log-softmax and 72df8818 `score_max_tokens`). The workload is one SPSA step with an eval: 312 scorings of 24 pairs and 24 ordinary answers.
+
+  | Runtime | Server | Time | Values |
+  |---|---|---|---|
+  | c | production args, 1M YaRN, 2 sessions | 400.8 s (1.28 s per scoring) | |
+  | d | same | 246.2 s | bit-identical to c |
+  | d | 1 session (preflight run) | 237.8 s | bit-identical to c |
+  | d | 64k context, no YaRN, 1 session | 236 s, median 859 ms per request | |
+
+  - Under production args the wide pass never ran. The serve startup loop (`inference_backend.cpp` ~3807) narrows `LimitCopyRows` to 8 when 1M K4V4 sessions leave no room for the wide scratch. Bit-identical values confirm the ordinary 8-row verifier.
+  - The 1.6× gain therefore comes from the 8-worker row log-softmax (`CollectRowLogprobs`). Before, scoring reduced every row on one thread.
+  - Cost against answer length (64k server, one request, long ordinary answer, 3 runs each):
+
+    | Answer tokens | 1 | 8 | 16 | 64 | 128 |
+    |---|---|---|---|---|---|
+    | ms | 117–263 | 184–299 | 229–345 | 421–538 | 734–850 |
+
+    - That is about 0.2 s for the prompt plus about 4.5 ms per answer token, the same rate as ordinary 8-row verification (about 36 ms per 8 rows).
+    - A 64-row batch-path pass costs about as much as eight narrow passes, because the batch MoE pays its fixed weight stream per pass (see the stage split, about 148 ms). So the wide pass does not pay off for scoring.
+  - Remaining levers:
+    - Fewer answer tokens: `--answer-tokens 64` is about 2× faster.
+    - Packing many scoring requests into one batch pass, so they share the 0.2 s fixed cost. One eval is about 72 × 150 tokens, about 9 s at 0.8 ms per token, against about 60 s now.
 - No ordinary-prompt KL or capability check yet. Not deployed. Next step is a combined profile with the refusal direction, then ordinary KL and refusal checks (plan R3 in `plan/research/IDEAS.md`).
 
 ## Flash-Next c03 1M YaRN K4V4 serving and time-shared scheduler, November 11, 2026 (deployed)
