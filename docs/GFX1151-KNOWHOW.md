@@ -73,6 +73,21 @@ Goals 1-3 of the plan (single speed, batched decode gain, prefill share at least
   - DraftCatchUp: 0.4 ms. PlanKvarn/FinishKvarn: 0.1 ms or less. PLE fetch: 0.6 ms or less.
 - So the fixed cost is inside the trunk pass. The likely cause is that a prefill-sized pass touches every expert, so it streams the full 64 GB of weights once whatever the row count. This is an inference and was not profiled per kernel.
 
+**Trunk stage split** (second experiment-only build, not committed). Stream sync after each stage, summed over layers, same 128K run. Evidence: `build/b1/conc-20261111/stage_exp.server.log`.
+
+| Stage | 2048 rows at about 78K (ms) | 512 rows at about 64K (ms) | ms/token, 2048 / 512 |
+| --- | ---: | ---: | --- |
+| HC mix (attention) | 151.7 | 42.8 | 0.074 / 0.084 |
+| GDN | 357.2 | 92.8 | 0.174 / 0.181 |
+| Attention | 414.4 | 104.4 | 0.202 / 0.204 |
+| HC mix (FFN) | 168.0 | 51.1 | 0.082 / 0.100 |
+| **MoE** | **589.5** | **258.0** | **0.288 / 0.504** |
+| Tail combine | 84.6 | 19.8 | 0.041 / 0.039 |
+
+- Every stage scales with rows except MoE. A two-point fit gives MoE ≈ 148 ms + 0.216 ms/row per pass, about 3.1 ms per layer.
+- At 512 rows every expert is routed, so the pass streams all EXL3 expert weights once. That is about bandwidth speed, so the fixed cost is the weight stream itself and cannot be removed by scheduling or kernel tuning.
+- Small chunks lose efficiency only because they amortize this stream over fewer rows.
+
 **Mixed batching (plan S3) dropped on this evidence.**
 - A mixed pass carries the same fixed weight stream as a prefill chunk.
 - So a decoder in a mixed pass gets about 3.5 tokens per pass of at least 0.2 s, at most about 15 tok/s even with tiny chunks, and 6 tok/s at 512.
