@@ -37,6 +37,48 @@
 - Decode took about 47% of wall time, close to the intended 50/50 split. The long prompt still answered `PELICAN-88` correctly at an average of 898.2 tok/s.
 - Next steps are in `plan/serving/CONCURRENCY-PLAN.md`: S0 baseline matrix, then batched decode, prefill fairness and mixed batching.
 
+### S0 concurrency matrix, November 11, 2026 (runtime-20261111b)
+
+**Setup:** `host_preflight.sh` passed (server stopped, then restarted). Harness: `plan/serving/concurrency_bench.py`. Greedy, thinking off, `cache_prompt:false`, fresh salt per prompt, one sample per cell. Evidence: `build/b1/conc-20261111/s0.jsonl`.
+
+| Case | Result |
+| --- | --- |
+| Single prefill 2K / 32K / 128K | 1181.7 / 1211.1 / 1135.0 tok/s |
+| Single decode (512 tokens) | 42.2 tok/s |
+| Two decodes (512 tokens each) | `batched-w2`: 32.0 + 30.4 = 62.4 tok/s, 1.48x single |
+| Two prefills, 32K each | 46.5 s and 50.6 s wall; effective 677 and 622 tok/s per request. Target 605 (single/2) met |
+| Two prefills, 128K each | 215.9 s and 223.4 s wall; effective 598 and 578 tok/s. Target 567 met |
+| 128K prefill + decode starting at 15 s | decode 20.2 wall tok/s (TTFT 3.4 s); prefill 142.7 s, against 113.9 s alone |
+
+Goals 1-3 of the plan (single speed, batched decode gain, prefill share at least max/N) are met with no further change.
+
+**Chunk-size sweep** (`--prefill-chunk`, experiment containers). 128K prompt, decode of 512 tokens starts at 50 s (about 55K depth). Evidence: `build/b1/conc-20261111/chunk_exp.jsonl` and `chunk_exp_*.server.log`.
+
+| Chunk | Chunk speed at 55-70K | Long wall | Decode wall tok/s | Gap p99 / max |
+| ---: | ---: | ---: | ---: | --- |
+| 256 | 640 tok/s (56%) | 131.6 s | 21.59 | 0.45 / 0.47 s |
+| 512 | 872 tok/s (76%) | 130.0 s | 20.62 | 0.64 / 0.68 s |
+| 1024 | 1027 tok/s (89%) | 128.9 s | 18.81 | 1.05 / 1.13 s |
+| 2048 | 1129 tok/s (98%) | 127.4 s | 13.86 (1 s credit cap) | 1.87 / 1.89 s |
+
+- Chunk time fits about 0.2 s plus 0.8 ms per token.
+- Kept at 512. Larger chunks save at most about 2.6 s on a 130 s prompt but double the decode stalls.
+
+**Where the 0.2 s per chunk goes.** Experiment-only build, not committed, with stream syncs at each stage of `Executor::Forward`. Evidence: `build/b1/conc-20261111/timing_exp.server.log`.
+- The whole pass is spent in the trunk `ForwardBody`:
+  - 2048 rows at 57K: 1750 ms (0.85 ms/token).
+  - 512 rows at 68K: 575 ms (1.12 ms/token).
+- Everything else is small:
+  - MTP kv_only: 53 ms per 2048 rows, 13 ms per 512 rows.
+  - DraftCatchUp: 0.4 ms. PlanKvarn/FinishKvarn: 0.1 ms or less. PLE fetch: 0.6 ms or less.
+- So the fixed cost is inside the trunk pass. The likely cause is that a prefill-sized pass touches every expert, so it streams the full 64 GB of weights once whatever the row count. This is an inference and was not profiled per kernel.
+
+**Mixed batching (plan S3) dropped on this evidence.**
+- A mixed pass carries the same fixed weight stream as a prefill chunk.
+- So a decoder in a mixed pass gets about 3.5 tokens per pass of at least 0.2 s, at most about 15 tok/s even with tiny chunks, and 6 tok/s at 512.
+- Time-sharing gives 20 tok/s.
+- Mixed batching would only move the trade-off: faster prefill, slower decode. It cannot beat time-sharing on decode latency here.
+
 ## Flash-Next EXL3 5.05 (turboderp) in production, November 11, 2026 (deployed)
 
 Pack: turboderp/Qwen3.8-Flash-Next-exl3 `5.05bpw_h6_ng6` @7cef615f. All files pass sha256. The pack includes vision and MTP. The pack's K6 n-gram table was not downloaded. Instead, `ngram_embedding.safetensors` is a hardlink to the c03 K8 table (128 shards, same 320001536x160 layout), which saves about 36 GB and gives more bits. See `REPLACED-NGRAM.txt` in the model directory.
