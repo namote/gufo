@@ -34,6 +34,8 @@ for fmt in ("qwen", "deepseek"):
             key = (label, f"cand{i}"); cls = classes[key[1]]
             if label.split("/")[-1] in ("one_of", "pattern_tag", "untyped", "not_null", "str_null", "all_of_str", "string", "format", "pattern") and cls == "invalid_value":
                 cls = "valid"  # these candidates repeat a schema-valid value
+            if label.startswith("digits/") and cls == "invalid_value":
+                cls = "beyond_16_digits"  # past llama.cpp's integral/decimal part
             lv, gv = ll[key], gg[key]
             prop = label.split("/")[-1]
             note = ""
