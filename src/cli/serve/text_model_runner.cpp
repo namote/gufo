@@ -1934,6 +1934,41 @@ TextDecodeStep TextRunnerPool::Request::DecodeStep(
   return step;
 }
 
+std::vector<sampling::TokenLogprobs> TextRunnerPool::Request::Score(
+    std::span<const TextRunnerToken> tokens) {
+  if (!*this) {
+    throw std::logic_error("text runner request is empty");
+  }
+  if (!impl_->decode_ready) {
+    throw std::logic_error("text runner cannot score before prefill completes");
+  }
+  if (impl_->pending_selection.has_value() || !impl_->generated.empty() ||
+      impl_->stopped) {
+    throw std::logic_error("text runner can score only an undecoded prompt");
+  }
+  if (tokens.empty()) {
+    throw std::invalid_argument("text runner has no tokens to score");
+  }
+  // The last token is scored, not written.
+  if (tokens.size() - 1 > ReservedDecodeTokens()) {
+    throw std::length_error("scored tokens exceed the reserved rows");
+  }
+  // The scored tail is not prompt state: nothing may publish it.
+  impl_->stopped = true;
+  impl_->state_reusable = false;
+  auto& state = dynamic_cast<TextRunnerState&>(impl_->lease.state());
+  state.SetResidentRequests(1);
+  auto scored = impl_->runner->ScoreTokens(state, tokens);
+  if (scored.size() != tokens.size()) {
+    throw std::runtime_error("text runner returned an invalid score count");
+  }
+  for (std::size_t index = 0; index < tokens.size(); ++index) {
+    if (scored[index].selected.token != tokens[index])
+      throw std::runtime_error("text runner scored a different token");
+  }
+  return scored;
+}
+
 TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
   if (!*this) {
     throw std::logic_error("text runner request is empty");

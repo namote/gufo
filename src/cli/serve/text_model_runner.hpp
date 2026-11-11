@@ -52,6 +52,13 @@ struct TextPreparedPrompt {
   std::size_t system_prefix_tokens{0};
 };
 
+/// A `score_assistant` request: the prompt before the scored assistant
+/// content, and that content's tokens.
+struct TextScoringPrompt {
+  TextPreparedPrompt prompt;
+  std::vector<TextRunnerToken> answer;
+};
+
 struct TextRunnerRamCacheOptions {
   static constexpr std::size_t kAutomaticMaxBytes = std::size_t{32} << 30;
   static constexpr std::size_t kMaxEntries = 128;
@@ -398,6 +405,24 @@ public:
       return std::nullopt;
     return TextPreparedPrompt{std::move(*tokens), {}};
   }
+  /// Whether PrepareScoring and ScoreTokens are implemented.
+  [[nodiscard]] virtual bool SupportsScoring() const { return false; }
+  /// Splits a `score_assistant` request (SplitScoringRequest) into the
+  /// prompt its model renders before the final assistant content and that
+  /// content's tokens. Throws std::invalid_argument for a request it cannot
+  /// score.
+  [[nodiscard]] virtual TextScoringPrompt PrepareScoring(
+      const ChatRequest&) const {
+    throw std::invalid_argument("model does not support score_assistant");
+  }
+  /// Teacher forcing from a decode-ready state: the raw log-softmax of each
+  /// of `tokens` given the prompt and the tokens before it, with no sampling
+  /// transformation (the `logprobs` definition). The state is left past the
+  /// prompt and must not be published.
+  [[nodiscard]] virtual std::vector<sampling::TokenLogprobs> ScoreTokens(
+      TextRunnerState&, std::span<const TextRunnerToken>) const {
+    throw std::logic_error("runner does not support scoring");
+  }
   /// Size a prompt without execution-context admission or inference. Image
   /// runners override this to include their model's visual token expansion.
   [[nodiscard]] virtual std::optional<std::size_t> CountPromptTokens(
@@ -710,6 +735,12 @@ public:
     /// included (TextRunnerState::SetResidentRequests).
     [[nodiscard]] TextDecodeStep DecodeStep(std::size_t max_tokens,
                                             std::size_t resident_requests = 1);
+
+    /// Scores `tokens` after the complete prompt (TextModelRunner::
+    /// ScoreTokens). The request then holds no reusable state: release it
+    /// with Invalidate.
+    [[nodiscard]] std::vector<sampling::TokenLogprobs> Score(
+        std::span<const TextRunnerToken> tokens);
 
     /// Publishes a reusable continuation boundary.
     ///

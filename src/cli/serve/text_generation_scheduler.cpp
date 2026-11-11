@@ -95,6 +95,7 @@ struct ScheduledRequest {
   std::size_t cache_prefix_tokens{0};
   std::size_t system_prefix_tokens{0};
   bool stop_at_eos{true};
+  std::vector<TextRunnerToken> score_tokens;
   std::size_t token_limit{1};
   sampling::SamplingConfig sampling;
   TextGenerationScheduler::CancellationCheck external_cancellation;
@@ -1761,8 +1762,63 @@ struct TextGenerationScheduler::Impl {
     return PublishSelection(request, selection);
   }
 
+  // Teacher-forced scoring runs as one work unit after prefill. The prompt
+  // checkpoint is captured first, as before a first decode step; the scored
+  // tail is never published.
+  void StepScore(const std::shared_ptr<ScheduledRequest>& request) {
+    consecutive_active_prefill_chunks = 0;
+    try {
+      if (CompleteIfStopped(request))
+        return;
+      request->phase.store(TextRequestPhase::kDecoding,
+                           std::memory_order_release);
+      if (!request->runner_request.PreparePromptSnapshot() ||
+          CompleteIfStopped(request))
+        return;
+      const auto start = Clock::now();
+      const auto scored = request->runner_request.Score(request->score_tokens);
+      request->result.decode_ms +=
+          std::chrono::duration<double, std::milli>(Clock::now() - start)
+              .count();
+      for (std::size_t index = 0; index < scored.size(); ++index) {
+        RetainLogprobs(request, scored[index]);
+        request->result.tokens.push_back(request->score_tokens[index]);
+      }
+      const auto ngram = request->runner_request.ngram_rows();
+      request->result.ngram_rows = ngram.rows;
+      request->result.ngram_dedup_rows = ngram.dedup_rows;
+      request->result.ngram_cache_hits = ngram.cache_hits;
+      request->result.ngram_disk_reads = ngram.disk_reads;
+      // Keeps only the prompt checkpoint; the scored state is dropped.
+      const auto retained = request->runner_request.Cancel();
+      request->result.component_cache = retained.component_cache;
+      request->result.cache_snapshot_bytes = retained.snapshot_bytes;
+      request->result.cache_snapshot_ms = retained.snapshot_ms;
+      request->result.finish_reason =
+          TextGenerationBackend::FinishReason::kStop;
+      request->result.completion_tokens = 0;
+      LogDecodeProgress(request, true);
+      RecordRequestMetrics(request->result);
+      PublishTerminal(request);
+    } catch (...) {
+      const auto failure = std::current_exception();
+      if (!CompleteIfStopped(request))
+        CompleteFailure(request, failure);
+    }
+  }
+
   void StepDecodeBatch(
-      const std::vector<std::shared_ptr<ScheduledRequest>>& requests) {
+      const std::vector<std::shared_ptr<ScheduledRequest>>& batch) {
+    std::vector<std::shared_ptr<ScheduledRequest>> requests;
+    requests.reserve(batch.size());
+    for (const auto& request : batch) {
+      if (request->score_tokens.empty())
+        requests.push_back(request);
+      else
+        StepScore(request);
+    }
+    if (requests.empty())
+      return;
     const auto selected_plan = runner_pool->SelectDecodePlan(requests.size());
     if (batched_multi_token_decode &&
         (batched_multi_token_decode_max_width == 0 ||
@@ -2708,6 +2764,19 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
                             "; increase --context or shorten the conversation");
   }
   const std::size_t available = context - prompt.size();
+  const bool scoring = !metadata.score_tokens.empty();
+  if (scoring) {
+    // The last scored token is not written.
+    if (metadata.score_tokens.size() - 1 > available)
+      throw std::length_error(
+          "prompt and scored tokens exceed the context of " +
+          std::to_string(context) + " tokens");
+    if (publish_token_pieces || !metadata.stop_sequences.empty() ||
+        metadata.return_progress)
+      throw std::invalid_argument(
+          "scoring does not stream and takes no stop sequences");
+    metadata.cache_persist = false;
+  }
   sampling.Validate();
   ValidateStopSequences(metadata.stop_sequences);
   if (!metadata.stop_sequences.empty() && !impl_->incremental_text_is_exact)
@@ -2735,8 +2804,10 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   request->cache_prefix_tokens = metadata.cache_prefix_tokens;
   request->system_prefix_tokens = metadata.system_prefix_tokens;
   request->stop_at_eos = metadata.stop_at_eos;
-  request->token_limit =
-      max_tokens > 0 ? std::min(max_tokens, available) : available;
+  request->token_limit = scoring          ? metadata.score_tokens.size()
+                         : max_tokens > 0 ? std::min(max_tokens, available)
+                                          : available;
+  request->score_tokens = std::move(metadata.score_tokens);
   request->sampling = sampling;
   request->external_cancellation = is_cancelled;
   request->publish_token_pieces = publish_token_pieces;

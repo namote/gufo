@@ -107,6 +107,11 @@ public:
     bool stop_at_eos{true};
     std::vector<std::string> stop_sequences;
     bool return_progress{false};
+    /// Non-empty: score these tokens after the prompt (`score_assistant`)
+    /// instead of generating. Result::tokens and Result::logprobs then hold
+    /// them and their raw logprobs; nothing is generated, streamed or
+    /// written to the disk cache, and only a prompt checkpoint is retained.
+    std::vector<TextRunnerToken> score_tokens;
   };
 
   class Request {

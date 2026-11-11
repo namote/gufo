@@ -104,6 +104,7 @@ void TestPublicationWaitUsesRecentSubstantialPrefill() {
 enum class EventKind : std::uint8_t {
   kPrefill,
   kAdvance,
+  kScore,
 };
 
 struct Event {
@@ -527,6 +528,27 @@ public:
         .piece = std::to_string(*fake.frontier),
         .logprobs = probabilities,
     };
+  }
+
+  // Scores token t at -t/100 and records each scored token as an event.
+  [[nodiscard]] std::vector<gufo::sampling::TokenLogprobs> ScoreTokens(
+      TextRunnerState& state,
+      std::span<const TextRunnerToken> tokens) const override {
+    auto& fake = RequireFakeState(state);
+    if (!fake.frontier.has_value())
+      throw std::logic_error("scheduler fake scores without a frontier");
+    std::vector<gufo::sampling::TokenLogprobs> scored;
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+      control_->Log({.kind = EventKind::kScore,
+                     .label = fake.label,
+                     .index = index,
+                     .count = 1});
+      scored.push_back(
+          {{tokens[index], -static_cast<double>(tokens[index]) / 100.0}, {}});
+    }
+    fake.position += tokens.size() - 1;
+    fake.frontier.reset();
+    return scored;
   }
 
   [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
@@ -3549,8 +3571,73 @@ void TestTokenLogprobs() {
   }
 }
 
+void TestScoringReturnsRawLogprobsWithoutDecoding() {
+  for (const bool speculative : {false, true}) {
+    auto control = std::make_shared<FakeControl>();
+    control->multi_token_decode = speculative;
+    auto scheduler = MakeScheduler(control, 2);
+    auto metadata = ClientMetadata("scorer");
+    metadata.score_tokens = {7, 8, 9};
+    // A generating peer shares the decode round with the scoring request.
+    auto peer = scheduler->Submit({2, 20}, 4, 0.0F);
+    auto scoring = scheduler->Submit({1, 10, 11}, 0, 0.0F, {}, false, metadata);
+    const auto scored = scoring.Wait();
+    const auto generated = peer.Wait();
+    Expect(scored.tokens == std::vector<gufo::tokenization::TokenId>{7, 8, 9},
+           "scoring returns the scored token ids");
+    Expect(scored.logprobs.size() == 3 &&
+               scored.logprobs[0].entries.size() == 1 &&
+               scored.logprobs[0].entries[0].id == 7 &&
+               scored.logprobs[2].entries[0].logprob == -0.09,
+           "scoring returns the runner's raw logprob per token");
+    Expect(scored.completion_tokens == 0 && scored.text.empty() &&
+               scored.finish_reason ==
+                   gufo::server::TextGenerationBackend::FinishReason::kStop,
+           "scoring generates nothing");
+    Expect(generated.tokens == ExpectedTokens(2, 4),
+           "a peer decodes normally beside a scoring request");
+    const auto events = control->Events();
+    Expect(std::none_of(events.begin(), events.end(),
+                        [](const Event& event) {
+                          return event.kind == EventKind::kAdvance &&
+                                 event.label == 1;
+                        }),
+           "a scoring request never advances a sampled token");
+    Expect(std::count_if(events.begin(), events.end(),
+                         [](const Event& event) {
+                           return event.kind == EventKind::kScore;
+                         }) == 3,
+           "each scored token is scored once");
+    // The scored tail is never published: the same prompt prefills again
+    // and decodes from its own frontier.
+    const auto again = scheduler->Submit({1, 10, 11}, 2, 0.0F).Wait();
+    Expect(again.tokens == ExpectedTokens(1, 2),
+           "a later request does not continue the scored state");
+  }
+  auto control = std::make_shared<FakeControl>();
+  auto scheduler = MakeScheduler(control, 1);
+  auto metadata = ClientMetadata("scorer");
+  metadata.score_tokens = {7};
+  bool refused = false;
+  try {
+    (void)scheduler->Submit({1, 10}, 0, 0.0F, {}, true, metadata);
+  } catch (const std::invalid_argument&) {
+    refused = true;
+  }
+  Expect(refused, "scoring refuses streaming");
+  metadata.score_tokens.assign(control->max_context, 7);
+  refused = false;
+  try {
+    (void)scheduler->Submit({1, 10}, 0, 0.0F, {}, false, metadata);
+  } catch (const std::length_error&) {
+    refused = true;
+  }
+  Expect(refused, "scoring refuses tokens past the context");
+}
+
 int main() {
   TestTokenLogprobs();
+  TestScoringReturnsRawLogprobsWithoutDecoding();
   TestPublicationWaitUsesRecentSubstantialPrefill();
   // Log assertions in this binary match the plain "[LEVEL] [component]" text
   // captured from a redirected sink; a TTY stderr would tint the level tag.
