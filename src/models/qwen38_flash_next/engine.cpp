@@ -1175,70 +1175,46 @@ bool Session::ScoreTokensImpl(std::span<const std::int32_t> tokens,
   scored->push_back(*sampling::CollectLogprobs(
       logits_, static_cast<sampling::TokenId>(tokens[0]), 0U));
   auto& exec = *model_->executor_;
-  const bool verify = MtpEnabled() && exec.max_speculative() > 1;
-  // With MTP, a pass verifies up to max_copy_rows() (64) rows wide
-  // (Executor::ForwardWide): the shared projections, routed experts and head
-  // read their weights once for all of them, while every row keeps the
-  // arithmetic of consecutive ordinary verifications. Chunks of at most
-  // max_speculative() rows take the ordinary verifier. The full logit rows
-  // come to the host and reduce on the CPU as generated logprobs do
-  // (FinishDecode), so scoring and generation share one log-softmax. A
-  // device log-softmax gather would add a kernel only to save the 64-row
-  // download (about 64 MB at 248320 columns, a few milliseconds on unified
-  // memory), small beside one pass over the experts.
-  const std::size_t wide = verify ? exec.max_copy_rows() : 0;
-  const std::size_t rows =
-      std::max<std::size_t>(wide, verify ? exec.max_speculative() : 1);
+  // The fed tokens take prompt (kPrefill) passes of up to max_score_rows()
+  // rows that return the logits of every row (Executor::ForwardScoreRows).
+  // A prefill pass streams the routed experts once for all its rows, so one
+  // pass costs about a fixed 0.2 s plus 0.8 ms per row, where 8-row
+  // verification costs about 4.5 ms per row at any width (GFX1151-KNOWHOW
+  // "Scoring speed"). Rows carry prompt arithmetic: the first token is
+  // scored on prefill logits as generation samples it, and the rest agree
+  // with generated (verification) logprobs to numerical error. The rows
+  // reduce on the host with the log-softmax generated logprobs use; a device
+  // gather would save only the download of about 1 MB per row, a few
+  // milliseconds on unified memory, against a kernel the CPU checks cannot
+  // run.
+  const std::size_t ratio =
+      std::max<std::uint32_t>(1, model_->config().compress_ratio);
   const auto fed = tokens.first(tokens.size() - 1);
   valid_ = false;
   for (std::size_t off = 0; off < fed.size();) {
-    const auto n = std::min(rows, fed.size() - off);
+    std::size_t n =
+        std::min<std::size_t>(exec.max_score_rows(), fed.size() - off);
+    // As in Feed: a following pass starts on a selection block.
+    if (const auto end = tokens_.size() + n;
+        off + n < fed.size() && end % ratio != 0 && n > end % ratio)
+      n -= end % ratio;
     const auto chunk = fed.subspan(off, n);
-    // Keep the draft block trailing the trunk as Feed does, so the session
-    // stays usable after scoring.
+    // Prefill needs the draft block caught up to the frontier (Feed).
     if (MtpEnabled() && !DraftCatchUp(chunk[0], false, error_msg))
       return false;
-    const auto base = static_cast<std::uint32_t>(tokens_.size());
-    const bool wide_pass = n > exec.max_speculative();
-    verify_logits_.resize(std::max(verify_logits_.size(), n * vocab));
-    if (wide_pass) {
-      if (!exec.ForwardWide(*session_, chunk, error_msg) ||
-          !exec.SelectBatchLogits(0, static_cast<std::uint32_t>(n),
-                                  verify_logits_.data(), error_msg))
-        return false;
-    } else if (!exec.Forward(*session_, chunk, static_cast<std::uint32_t>(n),
-                             verify_logits_.data(),
-                             verify ? rocm::Executor::ForwardMode::kVerify
-                                    : rocm::Executor::ForwardMode::kDecode,
-                             error_msg)) {
-      return false;
-    }
-    // Keep every row, as a fully accepted verification does.
-    if (verify &&
-        !exec.Rollback(*session_, static_cast<std::uint32_t>(n), error_msg))
+    std::span<const float> rows;
+    if (!exec.ForwardScoreRows(*session_, chunk, &rows, error_msg))
       return false;
     // Row r follows chunk[r] = tokens[off + r] and scores its successor.
     auto values = CollectRowLogprobs(
-        verify_logits_, vocab, static_cast<std::uint32_t>(n),
+        rows, vocab, static_cast<std::uint32_t>(n),
         [&](std::uint32_t r) { return tokens[off + r + 1]; }, 0U);
     for (auto& value : values)
       scored->push_back(std::move(*value));
-    std::copy_n(verify_logits_.data() + (n - 1) * vocab, vocab,
-                logits_.begin());
-    hidden_base_ = base;
+    std::copy_n(rows.data() + (n - 1) * vocab, vocab, logits_.begin());
+    hidden_base_ = static_cast<std::uint32_t>(
+        tokens_.size() + n - std::min<std::size_t>(n, exec.max_speculative()));
     tokens_.insert(tokens_.end(), chunk.begin(), chunk.end());
-    if (wide_pass) {
-      // As after a wide decode (FinishDecode): sessions keep at most
-      // max_speculative() hidden rows, so catch the draft block up to the
-      // last row now (K/V only) and keep that row's hidden.
-      const std::vector<std::int32_t> replay(chunk.begin() + 1, chunk.end());
-      if (!exec.MtpForward(*session_, replay, 0, {.kv_only = true},
-                           error_msg) ||
-          !exec.KeepHiddenRow(*session_, static_cast<std::uint32_t>(n - 1),
-                              error_msg))
-        return false;
-      hidden_base_ = base + static_cast<std::uint32_t>(n) - 1;
-    }
     off += n;
   }
   valid_ = true;

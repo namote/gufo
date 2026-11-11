@@ -448,6 +448,7 @@ Executor::~Executor() {
     (void)ngram_->WaitRead();
   }
   (void)hipFree(batch_logits_);
+  (void)hipFree(score_logits_);
   (void)hipFree(wide_controls_);
   for (float* p : wide_allocations_)
     (void)hipFree(p);

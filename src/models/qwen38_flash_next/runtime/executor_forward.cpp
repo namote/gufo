@@ -148,7 +148,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     AssignError(error_msg, "token batch is empty or exceeds the batch limit");
     return false;
   }
-  if (n_logits > n || n_logits > options_.max_logit_rows) {
+  if (n_logits > n ||
+      n_logits > (score_pass_ ? max_score_rows() : options_.max_logit_rows)) {
     AssignError(error_msg, "requested logit rows exceed the batch or limit");
     return false;
   }
@@ -252,7 +253,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
                             (static_cast<std::uint64_t>(n_logits) << 16) |
                             (static_cast<std::uint64_t>(speculative) << 32) |
                             (static_cast<std::uint64_t>(sparse) << 33) |
-                            (std::uint64_t{logits != nullptr} << 34);
+                            (std::uint64_t{logits != nullptr} << 34) |
+                            (std::uint64_t{score_pass_} << 36);
   // PLE first consumes the disk rows at its injection layer. Queue the
   // preceding layers before waiting, including on captured graph replay.
   // Both pieces use the same stream and arithmetic as the unsplit graph.
@@ -269,9 +271,10 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     }
   }
   const auto body = [&] {
-    return ForwardBody(session, n, n_logits, logits != nullptr, speculative,
-                       sparse, start_pos, graph ? graph_pool_grid : pool_grid,
-                       first_layer, c.num_layers, error_msg, checkpoint, graph);
+    return ForwardBody(session, n, n_logits, logits != nullptr || score_pass_,
+                       speculative, sparse, start_pos,
+                       graph ? graph_pool_grid : pool_grid, first_layer,
+                       c.num_layers, error_msg, checkpoint, graph);
   };
   // The prefix is already queued. Wait once before the suffix so recording
   // its graph can reuse these pinned rows while the eager pass executes.
@@ -304,6 +307,50 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
       return false;
   }
   pinned_inputs.completed = true;
+  return true;
+}
+
+bool Executor::ForwardScoreRows(Session& session,
+                                std::span<const std::int32_t> tokens,
+                                std::span<const float>* rows,
+                                std::string* error_msg) const {
+  *rows = {};
+  const Config& c = config();
+  const auto n = static_cast<std::uint32_t>(tokens.size());
+  if (n == 0 || n > max_score_rows()) {
+    AssignError(error_msg, "scoring pass is empty or exceeds its row limit");
+    return false;
+  }
+  // One head buffer of max_score_rows() rows serves every pass. On this
+  // unified-memory target the download is a few milliseconds per hundred
+  // rows, small beside the pass; the rows then reduce on the host with the
+  // log-softmax generated logprobs use (sampling::CollectLogprobs).
+  const std::size_t floats = std::size_t{max_score_rows()} * c.vocab_size;
+  // A failed allocation must not leave a sticky error for the next launch.
+  if (score_logits_ == nullptr &&
+      !Check(hip::AllocateDevice(&score_logits_, floats * sizeof(float)),
+             "scoring logits", error_msg)) {
+    (void)hipGetLastError();
+    return false;
+  }
+  if (score_logits_host_ == nullptr) {
+    void* host = nullptr;
+    if (!Check(host_allocations_.Allocate(&host, floats * sizeof(float)),
+               "pinned scoring logits", error_msg)) {
+      (void)hipGetLastError();
+      return false;
+    }
+    score_logits_host_ = static_cast<float*>(host);
+  }
+  struct ScorePass {
+    bool& flag;
+    explicit ScorePass(bool& f) : flag(f) { flag = true; }
+    ~ScorePass() { flag = false; }
+  } pass{score_pass_};
+  if (!Forward(session, tokens, n, nullptr, ForwardMode::kPrefill, error_msg))
+    return false;
+  *rows =
+      std::span<const float>(score_logits_host_, std::size_t{n} * c.vocab_size);
   return true;
 }
 
@@ -521,11 +568,13 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     const DeviceMixer& head = model_->hc_head();
     if (!HcMix(head, s_.res + skip * c.HcDim(), false, s_.mixed, nullptr,
                n_logits, error_msg) ||
-        !Dense(model_->output(), s_.mixed, s_.logits, n_logits, error_msg)) {
+        !Dense(model_->output(), s_.mixed,
+               score_pass_ ? score_logits_ : s_.logits, n_logits, error_msg)) {
       return false;
     }
     if (download_logits &&
-        !Check(hipMemcpyAsync(logits_host_, s_.logits,
+        !Check(hipMemcpyAsync(score_pass_ ? score_logits_host_ : logits_host_,
+                              score_pass_ ? score_logits_ : s_.logits,
                               static_cast<std::size_t>(n_logits) *
                                   c.vocab_size * sizeof(float),
                               hipMemcpyDeviceToHost, stream_),

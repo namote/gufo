@@ -209,13 +209,11 @@ public:
                               std::string* error_msg = nullptr);
   /// Teacher forcing: the raw log-softmax (sampling::CollectLogprobs) of
   /// each of `tokens` given the session and the tokens before it. The first
-  /// is scored on the current frontier logits; the rest are fed in passes of
-  /// up to max_copy_rows() rows (wide verification, Executor::ForwardWide),
-  /// or max_speculative() rows when wide verification is unavailable
-  /// (verification arithmetic, as MTP decoding returns its logprobs), or one
-  /// decode row without MTP. The last token is scored but not fed. The
-  /// session ends at the fed tokens, its draft block caught up as after
-  /// decoding.
+  /// is scored on the current frontier logits; the rest are fed in prompt
+  /// (kPrefill) passes of up to Executor::max_score_rows() rows that return
+  /// every row's logits (Executor::ForwardScoreRows). The last token is
+  /// scored but not fed. The session ends at the fed tokens, its draft block
+  /// caught up as after a prefill.
   [[nodiscard]] bool ScoreTokens(std::span<const std::int32_t> tokens,
                                  std::vector<sampling::TokenLogprobs>* scored,
                                  std::string* error_msg = nullptr);

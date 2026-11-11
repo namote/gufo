@@ -1226,7 +1226,7 @@ follows it exactly as the template renders the completed turn. The content
 is tokenized as message text (control-token spellings stay literal); the
 closing `<|im_end|>` is not scored. A greedy thinking-disabled reply to the
 same conversation therefore scores, token for token, the `logprobs` it was
-generated with, within verifier arithmetic differences.
+generated with, within prompt-versus-verification arithmetic differences.
 
 ```json
 {"model":"gufo","messages":[{"role":"user","content":"Capital of France?"},{"role":"assistant","content":"Paris."}],"score_assistant":true,"max_tokens":0}
@@ -1255,19 +1255,36 @@ explicitly enabled thinking and a scored message with `reasoning_content` or
 `tool_calls` return 400.
 
 Execution: the prompt prefills as usual (prefix reuse applies). The scored
-tokens then pass through the model in wide verification passes of up to 64
-rows, the width a single session's copied draft chain verifies at: each pass
-reads the shared projections, routed experts and head once for all its rows,
-while every row keeps the arithmetic of consecutive eight-row MTP
-verifications. A remainder of at most eight rows takes one ordinary
-verification; without MTP, each token takes one decode row. Row r's logits
-score token r+1; the first token is scored on the prompt's last row. Each
-pass downloads its full logit rows and reduces them on the CPU as generated
-`logprobs` are. A 64-token answer costs one pass after prefill and a
-1024-token answer 16 (eight-row passes took 8 and 128), run as one work unit
-between other requests' decode rounds. Only a prompt checkpoint may be
-retained in RAM, as with `cache_persist: false`; the scored tokens are never
-published to the continuation cache or written to disk.
+tokens then pass through the model in prompt (prefill) passes of up to 256
+rows that return the logits of every row. A prefill pass streams the routed
+experts once for all its rows, so a pass costs about 0.2 s plus 0.8 ms per
+row, where verification passes cost about 4.5 ms per row at any width. Row
+r's logits score token r+1; the first token is scored on the prompt's last
+row. The rows therefore carry prompt arithmetic: they agree with the
+`logprobs` of a greedy generation (verification arithmetic) to numerical
+error, not bit for bit. Each pass downloads its logit rows (about 1 MB per
+row) and reduces them on the CPU as generated `logprobs` are. A 150-token
+answer costs one pass after the prompt, a 1024-token answer four or five (a
+pass that another follows ends on a selection block), run as one
+work unit between other requests' decode rounds. The first scoring request
+allocates the 256-row head output and its pinned host copy (about 254 MB
+each); a server that never scores never allocates them. Only a prompt
+checkpoint may be retained in RAM, as with `cache_persist: false`; the scored
+tokens are never published to the continuation cache or written to disk.
+
+A server dedicated to scoring (for example SPSA training with
+`tools/qwen38_flash_next/abliteration/spsa.py`) does not need the production
+context. Scoring passes run one at a time on the GPU, so a few sessions are
+enough to keep the next request's prompt admitted while one scores:
+
+```sh
+gufo serve --sessions 2 llm --model <model> --context 8192 \
+  --kv-cache-type kvarn-k4v4
+```
+
+without `--enable-yarn` (native RoPE; scores then differ from a 1M YaRN
+server's by the RoPE scaling) and with the default `--kv-pool-bytes 0`. Run
+the client with `--concurrency` equal to `--sessions`.
 
 llama.cpp sampler fields that gufo does not implement (`mirostat`,
 `mirostat_tau`, `mirostat_eta`, `typical_p`, `tfs_z`, `dynatemp_range`,

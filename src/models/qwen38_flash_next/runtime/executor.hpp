@@ -425,6 +425,24 @@ public:
                              PrefillCheckpoint* checkpoint = nullptr,
                              std::span<const std::int32_t> next = {}) const;
 
+  /// Rows a scoring pass (ForwardScoreRows) may return logits for. Kept
+  /// apart from max_logit_rows, which also bounds speculative verification.
+  static constexpr std::uint32_t kScoreRows = 256;
+  [[nodiscard]] std::uint32_t max_score_rows() const noexcept {
+    return std::min(kScoreRows, options_.max_batch);
+  }
+  /// A kPrefill Forward of `tokens` (at most max_score_rows()) that returns
+  /// the logits of every row: `rows` points at tokens.size() * vocab floats
+  /// in executor-owned pinned memory, valid until the next scoring pass. The
+  /// head output and its host copy are allocated on the first call (about
+  /// 1 MB per row each) and are not part of DeferredScratchBytes, so serving
+  /// budgets stay as they were for servers that never score. Teacher-forced
+  /// scoring uses it; a packed pass of several sequences could reuse it.
+  [[nodiscard]] bool ForwardScoreRows(Session& session,
+                                      std::span<const std::int32_t> tokens,
+                                      std::span<const float>* rows,
+                                      std::string* error_msg) const;
+
   /// Quality-probe replay of the last Forward's output head, with the same
   /// batch width and requested tail. Call immediately after an AR Forward,
   /// before any other executor operation reuses scratch. Does not advance
@@ -1206,6 +1224,12 @@ private:
   mutable std::uint32_t routed_tile_rows_{48};  ///< token rows per tile
   mutable int routed_tile_cols_{0};
   float* logits_host_{nullptr};
+  /// ForwardScoreRows: max_score_rows() head rows on the device and their
+  /// pinned host copy, allocated on first use. score_pass_ routes the head of
+  /// the running Forward there.
+  mutable float* score_logits_{nullptr};
+  mutable float* score_logits_host_{nullptr};
+  mutable bool score_pass_{false};
   std::int32_t* mtp_token_host_{nullptr};
   MtpCandidateLogits* mtp_candidates_host_{nullptr};
   /// The model geometry allows the wide mixer route (see Combine).
