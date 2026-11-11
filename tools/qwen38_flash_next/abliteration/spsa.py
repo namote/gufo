@@ -33,6 +33,7 @@ import json
 import math
 from pathlib import Path
 import random
+import re
 import sys
 import urllib.request
 
@@ -130,6 +131,20 @@ class Objective:
                     drop_max=max(drops), margin_min=min(margins))
 
 
+_SENTENCE_END = re.compile(r'(?:[.!?。！？]|다\.|요\.)(?=\s|$)|\n')
+
+
+def shorten(text, limit):
+    """Cut text to at most limit characters at the last sentence end (or line
+    break) inside the limit, else at the limit; 0 keeps the text."""
+    if not limit or len(text) <= limit:
+        return text
+    head = text[:limit]
+    ends = [m.end() for m in _SENTENCE_END.finditer(head)]
+    cut = ends[-1] if ends and ends[-1] >= limit // 3 else limit
+    return head[:cut].rstrip()
+
+
 def clip(theta, high):
     return [min(max(x, 0.0), high) for x in theta]
 
@@ -156,6 +171,9 @@ def main(argv=None):
     ap.add_argument('--eval-every', type=int, default=5)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--concurrency', type=int, default=2)
+    ap.add_argument('--answer-chars', type=int, default=0,
+                    help='score only the first N characters of every answer, cut at a sentence end '
+                         '(scoring cost grows with answer length); 0 scores whole answers')
     ap.add_argument('--log', required=True)
     ap.add_argument('--output', help='write the best theta as JSON settings')
     args = ap.parse_args(argv)
@@ -171,6 +189,11 @@ def main(argv=None):
     theta = clip(theta, args.max_strength)
     pairs = load_jsonl(args.pairs, ('id', 'prompt', 'candid', 'propaganda'))
     ordinary = load_jsonl(args.ordinary, ('id', 'prompt', 'answer'))
+    for p in pairs:
+        p['candid'] = shorten(p['candid'], args.answer_chars)
+        p['propaganda'] = shorten(p['propaganda'], args.answer_chars)
+    for o in ordinary:
+        o['answer'] = shorten(o['answer'], args.answer_chars)
     objective = Objective(args, pairs, ordinary, n)
 
     log = Path(args.log)

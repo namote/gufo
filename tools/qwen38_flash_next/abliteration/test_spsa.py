@@ -41,6 +41,14 @@ class Fake(http.server.BaseHTTPRequestHandler):
 
 
 class SpsaTest(unittest.TestCase):
+    def test_shorten_cuts_at_sentence_end(self):
+        self.assertEqual(spsa.shorten('abc', 0), 'abc')
+        self.assertEqual(spsa.shorten('abc', 10), 'abc')
+        self.assertEqual(spsa.shorten('First one. Second sentence here.', 20), 'First one.')
+        self.assertEqual(spsa.shorten('천안문 사건입니다. 이 사건은 무력 진압', 16), '천안문 사건입니다.')
+        self.assertEqual(spsa.shorten('a b c d e f g h', 9), 'a b c d e')
+        self.assertEqual(spsa.shorten('v1.2 is out', 6), 'v1.2 i')
+
     def test_learns_and_resumes(self):
         server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Fake)
         threading.Thread(target=server.serve_forever, daemon=True).start()
