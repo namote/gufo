@@ -33,7 +33,6 @@ import json
 import math
 from pathlib import Path
 import random
-import re
 import sys
 import urllib.request
 
@@ -46,10 +45,12 @@ def post(base_url, body, timeout=600):
         return json.load(response)
 
 
-def score_body(model, prompt, answer, abliteration):
+def score_body(model, prompt, answer, abliteration, answer_tokens=0):
     body = {'model': model, 'score_assistant': True, 'max_tokens': 0,
             'messages': [{'role': 'user', 'content': prompt},
                          {'role': 'assistant', 'content': answer}]}
+    if answer_tokens:
+        body['score_max_tokens'] = answer_tokens
     if abliteration is not None:
         body['abliteration'] = abliteration
     return body
@@ -87,12 +88,13 @@ class Objective:
         path = Path(self.args.log + '.off.json')
         key = hashlib.sha256(json.dumps(
             [self.args.model, [(o['id'], o['prompt'], o['answer']) for o in self.ordinary]]
+            + ([self.args.answer_tokens] if self.args.answer_tokens else [])
         ).encode()).hexdigest()
         if path.exists():
             cached = json.loads(path.read_text())
             if cached.get('key') == key:
                 return cached['off']
-        replies = self._map([score_body(self.args.model, o['prompt'], o['answer'], None)
+        replies = self._map([score_body(self.args.model, o['prompt'], o['answer'], None, self.args.answer_tokens)
                              for o in self.ordinary])
         off = {o['id']: mean_logprob(r)[0] for o, r in zip(self.ordinary, replies)}
         path.write_text(json.dumps(dict(key=key, off=off)) + '\n')
@@ -112,9 +114,9 @@ class Objective:
         on = self.settings(theta)
         bodies = []
         for p in self.pairs:
-            bodies.append(score_body(self.args.model, p['prompt'], p['candid'], on))
-            bodies.append(score_body(self.args.model, p['prompt'], p['propaganda'], on))
-        bodies += [score_body(self.args.model, o['prompt'], o['answer'], on)
+            bodies.append(score_body(self.args.model, p['prompt'], p['candid'], on, self.args.answer_tokens))
+            bodies.append(score_body(self.args.model, p['prompt'], p['propaganda'], on, self.args.answer_tokens))
+        bodies += [score_body(self.args.model, o['prompt'], o['answer'], on, self.args.answer_tokens)
                    for o in self.ordinary]
         replies = self._map(bodies)
         margins = []
@@ -129,20 +131,6 @@ class Objective:
         drop = sum(drops) / len(drops)
         return dict(j=margin - self.args.lam * drop, margin=margin, drop=drop,
                     drop_max=max(drops), margin_min=min(margins))
-
-
-_SENTENCE_END = re.compile(r'(?:[.!?。！？]|다\.|요\.)(?=\s|$)|\n')
-
-
-def shorten(text, limit):
-    """Cut text to at most limit characters at the last sentence end (or line
-    break) inside the limit, else at the limit; 0 keeps the text."""
-    if not limit or len(text) <= limit:
-        return text
-    head = text[:limit]
-    ends = [m.end() for m in _SENTENCE_END.finditer(head)]
-    cut = ends[-1] if ends and ends[-1] >= limit // 3 else limit
-    return head[:cut].rstrip()
 
 
 def clip(theta, high):
@@ -171,15 +159,19 @@ def main(argv=None):
     ap.add_argument('--eval-every', type=int, default=5)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--concurrency', type=int, default=2)
-    ap.add_argument('--answer-chars', type=int, default=0,
-                    help='score only the first N characters of every answer, cut at a sentence end '
-                         '(scoring cost grows with answer length); 0 scores whole answers')
+    ap.add_argument('--answer-tokens', type=int, default=0,
+                    help='score only the first N answer tokens (server score_max_tokens, 1..1024); '
+                         'scoring cost grows with answer length; 0 scores whole answers')
     ap.add_argument('--log', required=True)
     ap.add_argument('--output', help='write the best theta as JSON settings')
     args = ap.parse_args(argv)
+    if not 0 <= args.answer_tokens <= 1024:
+        ap.error('--answer-tokens must be 0..1024')
 
     n = args.layers
     init = json.loads(Path(args.init).read_text()) if Path(args.init).exists() else json.loads(args.init)
+    if isinstance(init, dict) and 'settings' in init:  # a previous --output
+        init = init['settings']
     if isinstance(init, (int, float)):
         theta = [float(init)] * (3 * n)
     else:
@@ -189,15 +181,11 @@ def main(argv=None):
     theta = clip(theta, args.max_strength)
     pairs = load_jsonl(args.pairs, ('id', 'prompt', 'candid', 'propaganda'))
     ordinary = load_jsonl(args.ordinary, ('id', 'prompt', 'answer'))
-    for p in pairs:
-        p['candid'] = shorten(p['candid'], args.answer_chars)
-        p['propaganda'] = shorten(p['propaganda'], args.answer_chars)
-    for o in ordinary:
-        o['answer'] = shorten(o['answer'], args.answer_chars)
     objective = Objective(args, pairs, ordinary, n)
 
     log = Path(args.log)
-    header = dict(type='header', args={k: v for k, v in vars(args).items() if k not in ('log', 'output', 'steps', 'concurrency', 'base_url')},
+    header = dict(type='header', args={k: v for k, v in vars(args).items() if k not in ('log', 'output', 'steps', 'concurrency', 'base_url')
+                                 and not (k == 'answer_tokens' and not v)},
                   pairs=[p['id'] for p in pairs], ordinary=[o['id'] for o in ordinary])
     records = []
     if log.exists():
