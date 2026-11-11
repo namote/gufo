@@ -1,5 +1,42 @@
 # gfx1151 optimization know-how
 
+## Flash-Next c03 1M YaRN K4V4 serving and time-shared scheduler, November 11, 2026 (deployed)
+
+**Production change:** back to our c03 pack (4.04 bpw), at the user's request ("5.05 is not noticeably better"). Runs as `e015a85d`, then runtime `runtime-20261111b` (`9910a9f4`).
+- Context 1048576 per session, `--enable-yarn` (factor 4).
+- `--kv-cache-type kvarn-k4v4`, `--kv-pool-bytes 0`, 2 sessions.
+- RAM cache 4 GiB, disk cache 100 GiB; disk admission reserve 200 GiB.
+- Old FP16 continuation cache (34 GB) deleted: KV type is part of the identity, so it could never be restored.
+- Flash-Next has no shared pool at 0: each session allocates full-context KV. The reviewer estimates 2,420,736 B per 256-token block, which comes to about 9.24 GiB per 1M session.
+
+**Measured (uncontrolled host, desktop on, no preflight):**
+- Ready in 38 s. GTT 87.3 GiB (5.05 + FP16 256K was 96.3 GiB). MemAvailable 26.5 GiB, and at least 24.6 GiB during a 425K prompt.
+- Short prompts with YaRN factor 4 answer correctly:
+  - Korean fact: Hiddink, 39 tok/s
+  - Canberra: 60 tok/s
+  - Python reverse: 52 tok/s
+  - red/blue image: correct, 42 tok/s
+- Needle test: a 424,921-token prompt (needle at 37%) returns `MANGO-7421` correctly. Prefill averages 887.9 tok/s, with user requests interleaved for part of it; decode runs at 55 tok/s.
+- No quality score (KL/NLL) at factor 4 yet.
+
+**Scheduler starvation found:**
+- With one long prefill and one decoder, the scheduler alternated one 512-token chunk (about 0.6 s at 80K+ depth) with one decode round (about 25 ms).
+- The decoder ran 107 tokens in 31 s, 3.5 tok/s of wall time, against 36 tok/s alone.
+- Fix `9910a9f4`: after an active-decode chunk of 10 ms or more, decoders keep running until they have used the chunk's wall time (capped at 1 s). A different short prompt waiting ends the credit.
+  - Policy fields: `TextPrefillPolicy::decode_time_share_min/max`.
+  - Test: `TestSlowPrefillChunkBuysDecodeTime`.
+
+**Result** (same host, desktop on): during a 415,826-token prefill, two sequential 300-token answers:
+
+| | wall tok/s | TTFT | decode_ms |
+|---|---|---|---|
+| answer 1 | 17.37 | 0.68 s | 8.2 s of 17.3 s |
+| answer 2 | 17.71 | 1.25 s | 7.8 s of 16.9 s |
+
+- That is 5.0x the 3.5 tok/s before the fix.
+- Decode took about 47% of wall time, close to the intended 50/50 split. The long prompt still answered `PELICAN-88` correctly at an average of 898.2 tok/s.
+- Next steps are in `plan/serving/CONCURRENCY-PLAN.md`: S0 baseline matrix, then batched decode, prefill fairness and mixed batching.
+
 ## Flash-Next EXL3 5.05 (turboderp) in production, November 11, 2026 (deployed)
 
 Pack: turboderp/Qwen3.8-Flash-Next-exl3 `5.05bpw_h6_ng6` @7cef615f. All files pass sha256. The pack includes vision and MTP. The pack's K6 n-gram table was not downloaded. Instead, `ngram_embedding.safetensors` is a hardlink to the c03 K8 table (128 shards, same 320001536x160 layout), which saves about 36 GB and gives more bits. See `REPLACED-NGRAM.txt` in the model directory.
