@@ -157,6 +157,28 @@
       - The server log shows 12,010 requests received and 12,010 completed, with no error lines.
       - The HTTP server answers overload with a 503, not a reset.
       - The cause is open. spsa now retries dropped connections (c445043f); that retry is not yet exercised on the GPU.
+  - **Where scoring time goes** (runtime g, November 12): GPU busy sampled from sysfs every 0.2 s.
+    - Prompt-only scoring (22.5 s): 93.8% mean, 100 median.
+    - 64-token scoring (47.1 s): 99.0% mean.
+    - gufo used about 120% CPU.
+    - Scoring is GPU-bound, so host work is not the lever.
+    - The likely cost is the per-segment attention, GDN and mixer launches on about 50-row segments, plus prefill kernel rate. A rocprofv3 profile is needed: rocprofiler-sdk is not built in the store.
+  - **Connection resets, cause found:**
+    - The listen backlog was 16. `ss` showed `LISTEN 0 16`, nstat showed 1053 ListenOverflows and 3 SyncookiesFailed, and the kernel logged SYN flooding on 18740.
+    - Fixed in 7203a1f5: SOMAXCONN backlog, and draining rejected connections before closing.
+  - **Main SPSA run** (runtime g, 48 sessions, `--minibatch 8 --answer-tokens 64`, 200 steps from `v-base.json`, eval every 10): 1,675 s (8.4 s/step), no retries.
+    - J 0.4770 → 0.5015 (step 200, still rising).
+    - Margin 0.657 → 0.688; drop 0.0450 → 0.0466; drop_max 0.237.
+    - From the hand setting (common eval J 0.4581) the total gain is +0.043.
+    - Best theta:
+      - attention: mean 0.26, max 0.75 at L16.
+      - mlp: mean 0.28, max 0.78 at L33.
+      - residual: mean 1.15, from 0.30 at L46 to 2.0 at L31.
+    - Held-out generation (`final_eval3.json`, 8 prompts, hand setting against best3): all 8 are candid under both settings.
+      - Xinjiang: best3 leads with the 2022 OHCHR report.
+      - Tank Man: both still say the photographer is unconfirmed and add a wrong second name. best3 says Marc Riboud; the hand setting says Charlie Cole, who did photograph it.
+      - The other answers are near identical.
+    - No ordinary-prompt generation check yet. Check it before use, given drop_max 0.237.
   - Remaining levers:
     - Fewer answer tokens: `--answer-tokens 64` is about 2× faster.
     - Packing many scoring requests into one batch pass, so they share the 0.2 s fixed cost. One eval is about 72 × 150 tokens, about 9 s at 0.8 ms per token, against about 60 s now.
