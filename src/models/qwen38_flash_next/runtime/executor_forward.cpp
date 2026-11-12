@@ -518,7 +518,9 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     // Keep aligned tiles and at least 96 rows to retain the wide arithmetic.
     const auto needed =
         std::max({96U, n_logits, checkpoint ? n - checkpoint->tokens + 1 : 0U});
+    // An all-rows observer reads every row of the last layer too.
     const auto skipped = prefill_phase && !session.mtp_enabled_ &&
+                                 !session.observe_all_rows_ &&
                                  il + 1 == c.num_layers && n > needed
                              ? (n - needed) / 128 * 128
                              : 0U;
@@ -554,10 +556,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
         // nothing; settle any update still pending regardless, so the
         // projection reads the materialized residual of every HC stream.
         ApplyPendingResidual();
-        const AbliterationSpan span{rows, ResidualAbliterationAt(session, il)};
-        AbliterateResidualBatchRows(s_.res, abliteration_directions_,
-                                    std::span(&span, 1), il, c.num_layers, rows,
-                                    c.hidden_size, c.hc_count, stream_);
+        ProjectResidual(s_.res, session, il, rows);
       }
       return true;
     };
@@ -578,9 +577,10 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     }
     if (session.activation_observer_) {
       ApplyPendingResidual();
-      std::vector<float> row(c.HcDim());
+      const std::uint32_t observed = session.observe_all_rows_ ? n : 1;
+      std::vector<float> row(std::size_t{observed} * c.HcDim());
       if (!Check(hipMemcpyAsync(row.data(),
-                                s_.res + std::size_t{n - 1} * c.HcDim(),
+                                s_.res + std::size_t{n - observed} * c.HcDim(),
                                 row.size() * sizeof(float),
                                 hipMemcpyDeviceToHost, stream_),
                  "activation collection", error_msg) ||

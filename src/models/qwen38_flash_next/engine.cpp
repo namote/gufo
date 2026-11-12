@@ -615,8 +615,9 @@ std::shared_ptr<DynamicAbliteration> Model::StartDynamicAbliteration() const {
       });
 }
 
-void Session::SetActivationObserver(ActivationObserver observer) {
-  session_->SetActivationObserver(std::move(observer));
+void Session::SetActivationObserver(ActivationObserver observer,
+                                    bool all_rows) {
+  session_->SetActivationObserver(std::move(observer), all_rows);
 }
 
 void Session::ConfigureAbliteration(

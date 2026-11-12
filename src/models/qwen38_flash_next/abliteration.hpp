@@ -66,11 +66,12 @@ struct AbliterationPlan {
   std::vector<std::int16_t> sites;
 };
 
-/// The blocks of several suppression profiles ON together (`parts` in load
-/// order, all of `loaded`'s geometry). At each site the profiles with a
-/// strength there are ordered by descending strength (ties: load order) and
-/// their direction rows orthonormalized in that order
-/// (qwen::OrthonormalizeDirections); each basis row keeps the strength of
+/// The blocks of several profiles ON together (`parts` in load order, all
+/// of `loaded`'s geometry). Additive profiles (R5) take no part in a site's
+/// projection: they add afterwards, one block each, counted in the limit. At
+/// each site the profiles with a strength there are ordered by descending
+/// strength (ties: load order) and their direction rows orthonormalized in that
+/// order (qwen::OrthonormalizeDirections); each basis row keeps the strength of
 /// the profile that introduced it, so a component two profiles share is
 /// removed once, at the stronger one's strength, and each profile's own
 /// remaining directions at its own. Sites with the same ordered profiles

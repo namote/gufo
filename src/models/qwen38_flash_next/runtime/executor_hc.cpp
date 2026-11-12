@@ -27,12 +27,11 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
     exl3_moe_pending_ = {};
     const auto& d = pending.layer->ffn_down_exps;
     const auto scratch = Exl3PrefillView();
-    exl3_moe_fused = ablation.settings == nullptr && prefill_phase &&
-                     pending.rows == n_tokens && c.hc_count == 4 &&
-                     c.hidden_size % 128 == 0 && c.hidden_size <= 2560 &&
-                     d.rows == c.hidden_size && !moe_pending_ &&
-                     !res_deferred_ &&
-                     !(wide_mixer_ && MatrixRows(n_tokens) && gamma != nullptr);
+    exl3_moe_fused =
+        !ablation.on() && prefill_phase && pending.rows == n_tokens &&
+        c.hc_count == 4 && c.hidden_size % 128 == 0 && c.hidden_size <= 2560 &&
+        d.rows == c.hidden_size && !moe_pending_ && !res_deferred_ &&
+        !(wide_mixer_ && MatrixRows(n_tokens) && gamma != nullptr);
     if (!exl3_moe_fused || exl3_res_pending_.res != res ||
         exl3_res_pending_.rows != n_tokens)
       ApplyPendingResidual();  // the combine below rewrites block_out
@@ -78,7 +77,7 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
     moe_pending_ = false;
     const auto* down = reinterpret_cast<const __half*>(s_.down_e);
     const float* fused_w = deferred ? fused_inject : nullptr;
-    if (ablation.settings == nullptr && wide_mixer_ && MatrixRows(n_tokens) &&
+    if (!ablation.on() && wide_mixer_ && MatrixRows(n_tokens) &&
         HcCombineMoeF16(
             res, down, s_.weights, s_.shexp_out, s_.router + c.num_experts,
             c.num_experts + 1, c.num_experts_used, s_.inject, inject_parts_,

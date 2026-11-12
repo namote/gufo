@@ -889,6 +889,42 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
   return true;
 }
 
+std::array<bool, 8> Executor::AddBatchSites(
+    std::span<const BatchItem> items, std::span<const std::uint32_t> offsets,
+    float* output, std::uint32_t layer, std::uint32_t site, std::uint32_t rows,
+    bool residual) const {
+  const Config& c = config();
+  std::array<bool, 8> added{};
+  // One launch per additive slot any session uses at this site.
+  for (std::uint32_t a = 0; a < 8; ++a) {
+    std::array<AbliterationSpan, kBatchSessions> spans{};
+    bool used = false;
+    for (std::size_t i = 0; i < items.size(); ++i) {
+      const auto [adds, mask] = SiteAdds(*items[i].session, site);
+      const bool on = mask >> a & 1U;
+      spans[i] = {
+          offsets[i] + static_cast<std::uint32_t>(items[i].tokens.size()),
+          on ? adds + a * qwen::AbliterationWeightedWords(c.num_layers)
+             : nullptr};
+      used = used || on;
+      added[i] = added[i] || on;
+    }
+    if (!used)
+      continue;
+    if (residual)
+      AbliterateResidualBatchRows(output, abliteration_directions_,
+                                  std::span(spans.data(), items.size()), layer,
+                                  c.num_layers, rows, c.hidden_size, c.hc_count,
+                                  stream_);
+    else
+      AbliterateBatchRows(output, abliteration_directions_,
+                          std::span(spans.data(), items.size()), layer,
+                          site >= c.num_layers, c.num_layers, rows,
+                          c.hidden_size, stream_);
+  }
+  return added;
+}
+
 bool Executor::ForwardBatch(std::span<const BatchItem> items,
                             std::string* error) const {
   return ForwardBatchImpl(items, false, error);
@@ -1375,6 +1411,8 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
         AbliterateBatchRows(base.block_out, abliteration_directions_,
                             std::span(spans.data(), items.size()), il, false,
                             c.num_layers, rows, c.hidden_size, stream_);
+        (void)AddBatchSites(items, offsets, base.block_out, il,
+                            (false ? c.num_layers : 0) + il, rows, false);
       }
       CombineBatch(base.res, l.hc_ffn.norm.f32(), rows);
       if (!HcMixBatch(l.hc_ffn, base.res, true, base.mixed, base.inject, rows,
@@ -1397,6 +1435,8 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
         AbliterateBatchRows(base.block_out, abliteration_directions_,
                             std::span(spans.data(), items.size()), il, true,
                             c.num_layers, rows, c.hidden_size, stream_);
+        (void)AddBatchSites(items, offsets, base.block_out, il,
+                            (true ? c.num_layers : 0) + il, rows, false);
       }
       CombineBatch(base.res, next_norm, rows);
       normed = next_norm != nullptr;
@@ -1413,15 +1453,24 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
               ResidualAbliterationAt(*items[i].session, il)};
           any = any || spans[i].settings != nullptr;
         }
-        if (any) {
+        if (any)
           AbliterateResidualBatchRows(base.res, abliteration_directions_,
                                       std::span(spans.data(), items.size()), il,
                                       c.num_layers, rows, c.hidden_size,
                                       c.hc_count, stream_);
+        // Additive profiles (R5) add after the projection.
+        const auto added = AddBatchSites(items, offsets, base.res, il,
+                                         2 * c.num_layers + il, rows, true);
+        std::array<bool, kBatchSessions> changed{};
+        for (std::size_t i = 0; i < items.size(); ++i) {
+          changed[i] = spans[i].settings != nullptr || added[i];
+          any = any || changed[i];
+        }
+        if (any) {
           // The head normalizes the residual itself (unnormed HcMixBatch).
           const bool renorm = normed && il + 1 < c.num_layers;
           for (std::size_t i = 0; renorm && i < items.size(); ++i)
-            if (spans[i].settings != nullptr)
+            if (changed[i])
               RmsNormRows(base.res + std::size_t{offsets[i]} * c.HcDim(),
                           next_norm,
                           base.xn + std::size_t{offsets[i]} * c.HcDim(),

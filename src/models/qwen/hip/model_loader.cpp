@@ -502,6 +502,10 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
           models::qwen::ArtifactIdentity(*artifact),
           models::qwen::kAbliterationWriterBeforeResidual);
     // Detection (dynamic profiles) runs only in the Flash-Next engine.
+    if (abliteration && abliteration->additive)
+      throw std::invalid_argument(
+          "abliteration: Qwen3.8-27B applies no additive (\"mode\": \"add\") "
+          "profile");
     if (abliteration && abliteration->trigger)
       throw std::invalid_argument(
           "abliteration: Qwen3.8-27B applies no profile 'trigger'; "

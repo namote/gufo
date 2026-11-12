@@ -235,9 +235,14 @@ AbliterationTrigger LoadTrigger(const json::Value& value,
   return trigger;
 }
 
-constexpr std::array<std::string_view, 7> kSubspaceMembers{
-    "rank",           "subspace_directions", "projected_directions",
-    "direction_kind", "direction_count",     "preserve_norm",
+constexpr std::array<std::string_view, 8> kSubspaceMembers{
+    "mode",
+    "rank",
+    "subspace_directions",
+    "projected_directions",
+    "direction_kind",
+    "direction_count",
+    "preserve_norm",
     "subspace_method"};
 }  // namespace
 
@@ -331,20 +336,32 @@ AbliterationProfile AbliterationProfile::Load(const std::filesystem::path& path,
         layer->as_double() != std::floor(layer->as_double()))
       Invalid("direction_layer");
     result.direction_layer = static_cast<std::uint32_t>(layer->as_double());
-    AppendVector(root.find("attention"), "attention", layers,
-                 kAbliterationMaxWeight, true, &result.attention);
-    AppendVector(root.find("mlp"), "mlp", layers, kAbliterationMaxWeight, true,
+    // `"mode": "add"`: steering strengths may be negative.
+    if (const auto* mode = root.find("mode")) {
+      if (!mode->is_string() ||
+          (mode->str() != "add" && mode->str() != "suppress"))
+        Invalid("mode (\"suppress\" or \"add\")");
+      result.additive = mode->str() == "add";
+    }
+    const double bound =
+        result.additive ? kAbliterationMaxAddWeight : kAbliterationMaxWeight;
+    AppendVector(root.find("attention"), "attention", layers, bound,
+                 !result.additive, &result.attention);
+    AppendVector(root.find("mlp"), "mlp", layers, bound, !result.additive,
                  &result.mlp);
     // Optional: profiles written before residual strengths existed load with
     // all zeros, so their behavior is unchanged.
     if (const auto* residual = root.find("residual"))
-      AppendVector(residual, "residual", layers, kAbliterationMaxWeight, true,
+      AppendVector(residual, "residual", layers, bound, !result.additive,
                    &result.residual);
     else
       result.residual.assign(layers, 0.0F);
     // Optional: without them, rank 1, mean difference, no norm preservation,
     // and `directions` keeps exactly its rows.
     LoadSubspace(root, &result);
+    if (result.additive &&
+        (result.direction_count != 1 || result.preserve_norm))
+      Invalid("mode \"add\" (one direction, no norm preservation)");
     if (const auto* trigger = root.find("trigger"))
       result.trigger = LoadTrigger(*trigger, result);
   }
@@ -364,10 +381,19 @@ std::vector<float> AbliterationSettings::DeviceWords(
       direction_count == 0 || direction_count > kAbliterationMaxDirections)
     throw std::logic_error("abliteration settings are inconsistent");
   std::vector<float> words(AbliterationDeviceWords(layers));
-  words[0] =
-      std::bit_cast<float>((direction_row + row_offset) |
-                           (direction_count - 1) << kAbliterationCountShift |
-                           (preserve_norm ? kAbliterationPreserveNormBit : 0U));
+  if (additive) {
+    if (direction_stride == 0 || direction_stride > kAbliterationMaxDirections)
+      throw std::logic_error("abliteration settings are inconsistent");
+    words[0] =
+        std::bit_cast<float>((direction_row + row_offset) |
+                             (direction_stride - 1) << kAbliterationCountShift |
+                             kAbliterationAddBit);
+  } else {
+    words[0] = std::bit_cast<float>(
+        (direction_row + row_offset) |
+        (direction_count - 1) << kAbliterationCountShift |
+        (preserve_norm ? kAbliterationPreserveNormBit : 0U));
+  }
   using enum AbliterationPoint;
   for (std::uint32_t layer = 0; layer < layers; ++layer) {
     words[AbliterationWeightIndex(layers, layer, kAttention)] =
@@ -503,6 +529,13 @@ std::shared_ptr<const AbliterationSettings> ResolveAbliterationSettings(
   const auto layers = profile.layers;
   auto result = std::make_shared<AbliterationSettings>();
   result->profile = profile.name;
+  if (profile.additive && (overrides.direction_layer ||
+                           overrides.direction_count.value_or(1) != 1 ||
+                           overrides.preserve_norm.value_or(false)))
+    throw std::invalid_argument(
+        "abliteration: an additive profile adds each layer's own direction; "
+        "'direction_layer', 'directions' above 1 and 'preserve_norm' do not "
+        "apply");
   if (overrides.direction_layer) {
     if (!profile.selectable_direction())
       throw std::invalid_argument(
@@ -531,9 +564,16 @@ std::shared_ptr<const AbliterationSettings> ResolveAbliterationSettings(
         std::to_string(profile.rank) + "]");
   result->preserve_norm =
       overrides.preserve_norm.value_or(profile.preserve_norm);
-  // v2 rows are indexed by kind, layer and rank; v1 has its one row.
+  // v2 rows are indexed by kind, layer and rank; v1 has its one row. An
+  // additive profile starts at layer 0's row and steps by the rank.
+  result->additive = profile.additive;
+  result->direction_stride = profile.additive ? profile.rank : 0;
   result->direction_row = profile.DirectionRow(
-      result->direction_kind, result->direction_layer.value_or(0));
+      result->direction_kind,
+      profile.additive ? 0 : result->direction_layer.value_or(0));
+  const float low = profile.additive ? -kAbliterationMaxAddWeight : 0.0F;
+  const float high =
+      profile.additive ? kAbliterationMaxAddWeight : kAbliterationMaxWeight;
   const auto strengths = [&](const std::vector<float>& requested,
                              const std::vector<float>& defaults,
                              const char* name) {
@@ -544,9 +584,11 @@ std::shared_ptr<const AbliterationSettings> ResolveAbliterationSettings(
                                   "' must be one number or " +
                                   std::to_string(layers) + " numbers");
     for (float x : requested)
-      if (!std::isfinite(x) || x < 0 || x > kAbliterationMaxWeight)
+      if (!std::isfinite(x) || x < low || x > high)
         throw std::invalid_argument(std::string("abliteration: '") + name +
-                                    "' strengths must be in [0, 4]");
+                                    (profile.additive
+                                         ? "' strengths must be in [-64, 64]"
+                                         : "' strengths must be in [0, 4]"));
     // -0 and +0 are one strength, so they share one identity.
     auto result = requested.size() == 1
                       ? std::vector<float>(layers, requested[0])
@@ -578,6 +620,9 @@ std::shared_ptr<const AbliterationSettings> ResolveAbliterationSettings(
   AppendU32(hash, static_cast<std::uint32_t>(result->direction_kind));
   AppendU32(hash, result->direction_count);
   AppendU32(hash, result->preserve_norm ? 1U : 0U);
+  // Additive settings only: suppression identities keep their bytes.
+  if (result->additive)
+    AppendU32(hash, 0x41444431U);  // "ADD1"
   result->identity = hash.FinishHex();
   return result;
 }
@@ -613,8 +658,16 @@ bool AbliterationSettingsFit(const AbliterationProfile& profile,
          settings.direction_count >= 1 &&
          settings.direction_count <= profile.rank &&
          settings.direction_row <= kAbliterationRowMask &&
-         std::size_t{settings.direction_row} + settings.direction_count <=
-             profile.direction_rows();
+         settings.additive == profile.additive &&
+         (settings.additive
+              ? settings.direction_stride == profile.rank &&
+                    std::size_t{settings.direction_row} +
+                            std::size_t{profile.layers - 1} * profile.rank +
+                            1 <=
+                        profile.direction_rows()
+              : std::size_t{settings.direction_row} +
+                        settings.direction_count <=
+                    profile.direction_rows());
 }
 
 std::vector<std::uint8_t> AbliterationInputIdentity(

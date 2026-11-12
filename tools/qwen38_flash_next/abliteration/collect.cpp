@@ -1,5 +1,15 @@
 // Standalone native activation/evaluation collector. No HTTP service and no
 // weight edits; completed prompt receipts are reused after interruption.
+//
+// Modes:
+//   collect   the last prompt token's post-layer residual per layer (HC mean)
+//   answers   the MEAN over a teacher-forced answer's tokens of the same
+//             readout (R5 steering): records carry `text` (the user turn),
+//             `answer` (the assistant content), `group` ("exemplar" or
+//             "own") and `pair` (the question both answers share). The
+//             prompt is framed as score_assistant frames it (thinking off,
+//             the empty thinking block, then the content tokenized as text).
+//   evaluate  generation with an optional profile
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -53,10 +63,11 @@ void Floats(const fs::path& path, std::span<const float> values) {
 int main(int argc, char** argv) {
   try {
     Require(argc >= 5,
-            "usage: collector MODEL DATA.jsonl OUTPUT collect|evaluate "
+            "usage: collector MODEL DATA.jsonl OUTPUT collect|answers|evaluate "
             "[--profile FILE] [--max-new-tokens N]");
     const fs::path output = argv[3];
-    const bool collect = std::string_view(argv[4]) == "collect";
+    const bool answers = std::string_view(argv[4]) == "answers";
+    const bool collect = answers || std::string_view(argv[4]) == "collect";
     Require(collect || std::string_view(argv[4]) == "evaluate", "invalid mode");
     std::string profile;
     unsigned max_new_tokens = 1024;
@@ -79,7 +90,7 @@ int main(int argc, char** argv) {
             "collection must use the unedited model");
     const bool enabled = !profile.empty();
     q::ModelOptions options;
-    options.max_context = 2048 + (collect ? 0 : max_new_tokens);
+    options.max_context = (answers ? 8192 : 2048) + (collect ? 0 : max_new_tokens);
     if (enabled)
       options.abliteration_profiles = {profile};
     std::string error;
@@ -111,10 +122,19 @@ int main(int argc, char** argv) {
           !id.empty() && id.find_first_not_of("0123456789abcdef-plainthk") ==
                              std::string::npos,
           "invalid record ID");
-      Require(record.member_str("group") == "refusal" ||
-                  record.member_str("group") == "ordinary",
-              "invalid record class");
-      Require(record.find("thinking") && record.find("thinking")->is_bool(),
+      if (answers)
+        Require((record.member_str("group") == "exemplar" ||
+                 record.member_str("group") == "own") &&
+                    !record.member_str("pair").empty() &&
+                    !record.member_str("text").empty() &&
+                    !record.member_str("answer").empty(),
+                "answers need group exemplar|own, pair, text and answer");
+      else
+        Require(record.member_str("group") == "refusal" ||
+                    record.member_str("group") == "ordinary",
+                "invalid record class");
+      Require(answers ||
+                  (record.find("thinking") && record.find("thinking")->is_bool()),
               "missing thinking mode");
       records.push_back(std::move(record));
     }
@@ -128,10 +148,12 @@ int main(int argc, char** argv) {
     manifest["context"] = static_cast<unsigned long long>(options.max_context);
     manifest["max_new_tokens"] =
         static_cast<unsigned long long>(collect ? 0 : max_new_tokens);
-    manifest["template"] = "gufo-qwen-native-medium-v1";
-    manifest["readout"] = collect
-                              ? "last-prompt-token-post-layer-hc-mean-fp32-v1"
-                              : "first-next-token-logits-fp32-v1";
+    manifest["template"] = answers ? "gufo-qwen-native-scoring-v1"
+                                   : "gufo-qwen-native-medium-v1";
+    manifest["readout"] =
+        answers   ? "answer-tokens-mean-post-layer-hc-mean-fp32-v1"
+        : collect ? "last-prompt-token-post-layer-hc-mean-fp32-v1"
+                  : "first-next-token-logits-fp32-v1";
     manifest["data_sha256"] = gufo::crypto::Sha256FileHex(argv[2]);
     manifest["hidden"] = static_cast<unsigned long long>(config.hidden_size);
     manifest["layers"] = static_cast<unsigned long long>(config.num_layers);
@@ -150,19 +172,35 @@ int main(int argc, char** argv) {
     std::vector<float> activations(std::size_t{config.num_layers} *
                                    config.hidden_size);
     std::vector<bool> captured(config.num_layers);
+    // Answers: FP64 sums over every answer row of each layer's HC mean.
+    std::vector<double> sums(answers ? activations.size() : 0);
+    std::vector<std::size_t> rows_seen(config.num_layers);
+    bool observing = !answers;
     if (collect)
-      session->SetActivationObserver([&](std::uint32_t layer,
-                                         std::span<const float> row) {
-        Require(row.size() == config.HcDim(), "collector HC layout mismatch");
-        for (std::size_t h = 0; h < config.hidden_size; ++h) {
-          double sum = 0;
-          for (std::size_t c = 0; c < config.hc_count; ++c)
-            sum += row[c * config.hidden_size + h];
-          activations[std::size_t{layer} * config.hidden_size + h] =
-              float(sum / config.hc_count);
-        }
-        captured[layer] = true;
-      });
+      session->SetActivationObserver(
+          [&](std::uint32_t layer, std::span<const float> rows) {
+            if (!observing)
+              return;
+            Require(rows.size() % config.HcDim() == 0 &&
+                        (answers || rows.size() == config.HcDim()),
+                    "collector HC layout mismatch");
+            for (std::size_t r = 0; r < rows.size() / config.HcDim(); ++r) {
+              const auto row = rows.subspan(r * config.HcDim(), config.HcDim());
+              for (std::size_t h = 0; h < config.hidden_size; ++h) {
+                double sum = 0;
+                for (std::size_t c = 0; c < config.hc_count; ++c)
+                  sum += row[c * config.hidden_size + h];
+                const auto index = std::size_t{layer} * config.hidden_size + h;
+                if (answers)
+                  sums[index] += sum / config.hc_count;
+                else
+                  activations[index] = float(sum / config.hc_count);
+              }
+              ++rows_seen[layer];
+            }
+            captured[layer] = true;
+          },
+          answers);
     std::size_t done = 0;
     for (const auto& record : records.items()) {
       const auto id = record.member_str("id");
@@ -178,11 +216,14 @@ int main(int argc, char** argv) {
       }
       session->Reset();
       std::fill(captured.begin(), captured.end(), false);
+      std::fill(rows_seen.begin(), rows_seen.end(), 0);
+      std::fill(sums.begin(), sums.end(), 0.0);
       gufo::tokenization::ChatMessage message;
       message.role = gufo::tokenization::ChatRole::kUser;
       message.content = record.member_str("text");
       gufo::tokenization::ChatTemplateOptions chat;
-      chat.enable_thinking = record.find("thinking")->as_bool();
+      // Answers are framed as score_assistant scores them: thinking off.
+      chat.enable_thinking = !answers && record.find("thinking")->as_bool();
       chat.reasoning_effort = gufo::tokenization::QwenReasoningEffort::kMedium;
       auto tokens = gufo::tokenization::QwenChatTemplate::RenderAndTokenize(
           model->tokenizer(), std::span(&message, 1), chat, &error);
@@ -190,11 +231,36 @@ int main(int argc, char** argv) {
           bool(tokens) && !tokens->empty() && tokens->size() <= 2048,
           "prompt invalid/too long; no silent truncation: " + id + " " + error);
       const std::vector<std::int32_t> prompt(tokens->begin(), tokens->end());
+      observing = !answers;
       Require(session->Sync(prompt, &error), error);
       auto result = json::Value::object();
       result["id"] = id;
       result["prompt_tokens"] = tokens->size();
-      if (collect) {
+      if (answers) {
+        // Teacher forcing: the answer's tokens as message text after the
+        // prompt, in the passes that feed them; their rows are averaged.
+        gufo::tokenization::TokenizerOptions content;
+        content.parse_special_tokens = false;
+        const auto answer =
+            model->tokenizer().Encode(record.member_str("answer"), content);
+        Require(!answer.empty() && prompt.size() + answer.size() <=
+                                       options.max_context,
+                "answer empty or too long: " + id);
+        std::vector<std::int32_t> full = prompt;
+        full.insert(full.end(), answer.begin(), answer.end());
+        observing = true;
+        Require(session->Sync(full, &error), error);
+        observing = false;
+        for (std::uint32_t layer = 0; layer < config.num_layers; ++layer)
+          Require(rows_seen[layer] == answer.size(),
+                  "answer rows missing: " + id);
+        for (std::size_t i = 0; i < activations.size(); ++i)
+          activations[i] = float(sums[i] / double(answer.size()));
+        result["answer_tokens"] = answer.size();
+        result["pair"] = record.member_str("pair");
+        result["group"] = record.member_str("group");
+        Floats(data, activations);
+      } else if (collect) {
         Require(std::ranges::all_of(captured, [](bool x) { return x; }),
                 "missing target layer capture");
         Floats(data, activations);

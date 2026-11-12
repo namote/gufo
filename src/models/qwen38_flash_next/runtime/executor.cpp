@@ -351,6 +351,8 @@ void Session::ConfigureAbliteration(
           owner->ReleaseUnion(key);
     }
   } guard{owner_, &unions};
+  std::vector<std::uint8_t> add_sites;
+  std::uint32_t add_first = 0;
   if (settings) {
     // One profile: its block at every site. Several: a weighted block per
     // distinct ordered set of profiles active at a site
@@ -359,7 +361,8 @@ void Session::ConfigureAbliteration(
     if (parts.size() == 1)
       words = parts[0]->DeviceWords(owner_->AbliterationRow(parts[0]->profile));
     else
-      owner_->CombineAbliterationBlocks(parts, &words, &sites, &unions);
+      owner_->CombineAbliterationBlocks(parts, &words, &sites, &unions,
+                                        &add_first, &add_sites);
     const auto bytes = words.size() * sizeof(float);
     if (!abliteration_device_) {
       void* data = nullptr;
@@ -397,6 +400,8 @@ void Session::ConfigureAbliteration(
   abliteration_sites_ = std::move(sites);
   // Keep the new union rows; release the old ones.
   abliteration_unions_.swap(unions);
+  abliteration_add_sites_ = std::move(add_sites);
+  abliteration_add_first_ = add_first;
 }
 
 bool Executor::LoadAbliteration(AbliterationProfileSet profiles,
@@ -559,10 +564,24 @@ const qwen::AbliterationProfile* Executor::FindAbliteration(
 void Executor::CombineAbliterationBlocks(
     std::span<const qwen::AbliterationSettings* const> parts,
     std::vector<float>* words, std::vector<std::int16_t>* sites,
-    std::vector<std::string>* unions) const {
+    std::vector<std::string>* unions, std::uint32_t* add_first,
+    std::vector<std::uint8_t>* add_sites) const {
+  // Suppression profiles project per site first (PlanAbliteration); then
+  // each additive profile (R5) adds at its sites.
+  std::vector<const qwen::AbliterationSettings*> adds;
+  for (const auto* part : parts)
+    if (part->additive)
+      adds.push_back(part);
+  const auto layers = config().num_layers;
+  const std::uint32_t site_count = 3 * layers;
   const auto plan = PlanAbliteration(parts, abliteration_);
-  const auto stride = qwen::AbliterationWeightedWords(config().num_layers);
-  words->assign(plan.blocks.size() * stride, 0.0F);
+  const auto stride = qwen::AbliterationWeightedWords(layers);
+  if (adds.size() > 8)
+    throw std::invalid_argument("abliteration: more than 8 additive profiles");
+  if (plan.blocks.size() + adds.size() > kAbliterationMaxBlocks)
+    throw std::invalid_argument(
+        "abliteration: the profiles need more than 16 blocks");
+  words->assign((plan.blocks.size() + adds.size()) * stride, 0.0F);
   for (std::size_t b = 0; b < plan.blocks.size(); ++b) {
     const auto& block = plan.blocks[b];
     std::uint32_t row = 0;
@@ -580,6 +599,25 @@ void Executor::CombineAbliterationBlocks(
     std::copy(block.weights.begin(), block.weights.end(), out + 1);
   }
   *sites = plan.sites;
+  *add_first = static_cast<std::uint32_t>(plan.blocks.size());
+  add_sites->clear();
+  if (adds.empty())
+    return;
+  add_sites->assign(site_count, 0);
+  for (std::size_t a = 0; a < adds.size(); ++a) {
+    const auto block = adds[a]->DeviceWords(AbliterationRow(adds[a]->profile));
+    std::copy(block.begin(), block.end(),
+              words->begin() +
+                  static_cast<std::ptrdiff_t>((*add_first + a) * stride));
+    for (std::uint32_t site = 0; site < site_count; ++site) {
+      const auto layer = site % layers;
+      const float weight = site < layers       ? adds[a]->attention[layer]
+                           : site < 2 * layers ? adds[a]->mlp[layer]
+                                               : adds[a]->residual[layer];
+      if (weight != 0)
+        (*add_sites)[site] |= static_cast<std::uint8_t>(1U << a);
+    }
+  }
 }
 
 std::uint32_t Executor::AcquireUnion(const std::string& key,
@@ -636,6 +674,34 @@ void Executor::ProjectAbliteration(float* output, std::uint32_t rows,
     AbliterateRows(output, abliteration_directions_, site.settings, site.layer,
                    site.mlp, config().num_layers, rows, config().hidden_size,
                    stream_);
+  // A combination's additive profiles add after the suppression.
+  for (std::uint32_t a = 0; site.add_mask >> a; ++a)
+    if (site.add_mask >> a & 1U)
+      AbliterateRows(
+          output, abliteration_directions_,
+          site.adds + a * qwen::AbliterationWeightedWords(config().num_layers),
+          site.layer, site.mlp, config().num_layers, rows, config().hidden_size,
+          stream_);
+}
+
+void Executor::ProjectResidual(float* res, const Session& session,
+                               std::uint32_t layer, std::uint32_t rows) const {
+  const Config& c = config();
+  const AbliterationSpan span{rows, ResidualAbliterationAt(session, layer)};
+  AbliterateResidualBatchRows(res, abliteration_directions_,
+                              std::span(&span, 1), layer, c.num_layers, rows,
+                              c.hidden_size, c.hc_count, stream_);
+  if (!ResidualAbliteration(session))
+    return;
+  const auto [adds, mask] = SiteAdds(session, 2 * c.num_layers + layer);
+  for (std::uint32_t a = 0; mask >> a; ++a)
+    if (mask >> a & 1U) {
+      const AbliterationSpan add{
+          rows, adds + a * qwen::AbliterationWeightedWords(c.num_layers)};
+      AbliterateResidualBatchRows(res, abliteration_directions_,
+                                  std::span(&add, 1), layer, c.num_layers, rows,
+                                  c.hidden_size, c.hc_count, stream_);
+    }
 }
 
 void Session::Reset(bool reuse_mtp) {

@@ -362,8 +362,11 @@ public:
       std::size_t tokens) const;
   using ActivationObserver =
       std::function<void(std::uint32_t, std::span<const float>)>;
-  /// Standalone collector, no concurrent requests. Captures only target layers.
-  void SetActivationObserver(ActivationObserver observer);
+  /// Standalone collector, no concurrent requests. The observer receives
+  /// each layer's post-layer residual ([rows][hc_dim]) of every trunk pass:
+  /// its last row, or with `all_rows` every row.
+  void SetActivationObserver(ActivationObserver observer,
+                             bool all_rows = false);
   /// A new request reusing cached context starts its own acceptance history.
   void ResetDraftPolicy();
 

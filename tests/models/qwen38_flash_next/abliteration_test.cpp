@@ -457,5 +457,53 @@ int main() {
             dynamic_set->identity != set->identity);
   }
   TestPlan();
+  // Additive (steering, R5) profiles: signed strengths, each layer's own
+  // direction, a distinct identity.
+  {
+    std::ofstream(path)
+        << R"({"schema":"gufo-abliteration-v2","placement":"writer-before-hc",
+        "model_identity":"fixture","hidden":3,"layers":2,"mode":"add",
+        "directions":[[0,1,0],[0.6,0.8,0]],"direction_layer":0,
+        "attention":[0,0],"mlp":[0,0],"residual":[-2.5,8]})";
+    const auto add = q::AbliterationProfile::Load(path, 3, 2, "fixture");
+    Require(add.additive && add.residual == std::vector<float>{-2.5F, 8});
+    const auto settings = q::ResolveAbliterationSettings(add);
+    const auto word = std::bit_cast<std::uint32_t>(settings->DeviceWords(4)[0]);
+    Require(settings->additive && settings->direction_stride == 1 &&
+            word == (4U | qwen::kAbliterationAddBit) &&
+            settings->ResidualActive());
+    const auto negative =
+        q::ResolveAbliterationSettings(add, {.residual = {-64.0F}});
+    Require(negative->residual == std::vector<float>{-64.0F, -64.0F});
+    Require(throws([&] {
+      (void)q::ResolveAbliterationSettings(add, {.residual = {-64.5F}});
+    }));
+    Require(throws([&] {
+      (void)q::ResolveAbliterationSettings(add, {.direction_layer = 1});
+    }));
+    Require(throws([&] {
+      (void)q::ResolveAbliterationSettings(add, {.preserve_norm = true});
+    }));
+    // The same numbers as a suppression profile: another identity.
+    std::ofstream(path)
+        << R"({"schema":"gufo-abliteration-v2","placement":"writer-before-hc",
+        "model_identity":"fixture","hidden":3,"layers":2,
+        "directions":[[0,1,0],[0.6,0.8,0]],"direction_layer":0,
+        "attention":[0,0],"mlp":[0,0],"residual":[2.5,3]})";
+    Require(q::ResolveAbliterationSettings(
+                q::AbliterationProfile::Load(path, 3, 2, "fixture"))
+                ->identity != settings->identity);
+    for (const auto* bad :
+         {R"("mode":"amplify",)", R"("mode":"add","preserve_norm":true,)",
+          R"("mode":"add","residual":[1,65],)"}) {
+      std::ofstream(path)
+          << R"({"schema":"gufo-abliteration-v2","placement":"writer-before-hc",
+          "model_identity":"fixture","hidden":3,"layers":2,)"
+          << bad << R"("directions":[[0,1,0],[0.6,0.8,0]],"direction_layer":0,
+          "attention":[0,0],"mlp":[0,0]})";
+      Require(throws(
+          [&] { (void)q::AbliterationProfile::Load(path, 3, 2, "fixture"); }));
+    }
+  }
   std::cout << "profile and cache identity PASS\n";
 }

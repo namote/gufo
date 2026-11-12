@@ -93,7 +93,8 @@ __device__ void WeightedRow(float* __restrict__ row,
 
 __global__ void Project(float* output, const float* directions,
                         RowSettings rows, std::uint32_t weight_index,
-                        std::uint32_t hidden, std::uint32_t streams) {
+                        std::uint32_t layer, std::uint32_t hidden,
+                        std::uint32_t streams) {
   const unsigned token = blockIdx.x / streams;
   const float* settings = nullptr;
   for (unsigned i = 0; i < rows.count; ++i)
@@ -106,6 +107,23 @@ __global__ void Project(float* output, const float* directions,
   if (__float_as_uint(settings[0]) & qwen::kAbliterationWeightedBit) {
     WeightedRow(output + std::size_t{blockIdx.x} * hidden, directions, settings,
                 weight_index, hidden);
+    return;
+  }
+  const std::uint32_t word = __float_as_uint(settings[0]);
+  if (word & qwen::kAbliterationAddBit) {
+    // Additive (R5): y += w * d_layer, the layer's own direction row.
+    const float weight = settings[weight_index];
+    if (weight == 0)
+      return;
+    const std::uint32_t stride =
+        ((word >> qwen::kAbliterationCountShift) & 7U) + 1;
+    const float* direction =
+        directions +
+        std::size_t{(word & qwen::kAbliterationRowMask) + layer * stride} *
+            hidden;
+    float* row = output + std::size_t{blockIdx.x} * hidden;
+    for (std::uint32_t i = threadIdx.x; i < hidden; i += blockDim.x)
+      row[i] += weight * direction[i];
     return;
   }
   qwen::hip_detail::AbliterateRow(output + std::size_t{blockIdx.x} * hidden,
@@ -133,7 +151,7 @@ void Launch(float* output, const float* directions,
   hipLaunchKernelGGL(Project, dim3(tokens * streams),
                      dim3(qwen::hip_detail::kAbliterationRowThreads), 0, stream,
                      output, directions, settings,
-                     qwen::AbliterationWeightIndex(layers, layer, point),
+                     qwen::AbliterationWeightIndex(layers, layer, point), layer,
                      hidden, streams);
 }
 }  // namespace

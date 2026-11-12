@@ -438,9 +438,38 @@ void WeightedRows() {
   Check(hipFree(y));
 }
 
+// An additive (R5) block: layer L adds strength * row (first + L * stride),
+// with a negative strength too.
+void AdditiveRows() {
+  constexpr unsigned kHidden = 5, kRows = 2, kLayers = 2;
+  std::vector<float> directions(3 * kHidden, 0.f);
+  directions[1 * kHidden + 2] = 1.f;  // layer 0's row
+  directions[2 * kHidden + 3] = 1.f;  // layer 1's row
+  // Words: 0, then attention[2], mlp[2], residual[2].
+  std::vector<float> settings(1 + 3 * kLayers, 0.f);
+  settings[0] = std::bit_cast<float>(1U | (1U << 28));
+  settings[1 + 1] = -1.5f;  // attention, layer 1
+  std::vector<float> input(kRows * kHidden, 1.f);
+  float* d = Upload(directions);
+  float* w = Upload(settings);
+  float* y = Upload(input);
+  q::AbliterateRows(y, d, w, 1, false, kLayers, kRows, kHidden, nullptr);
+  std::vector<float> result(input.size());
+  Check(hipMemcpy(result.data(), y, result.size() * sizeof(float),
+                  hipMemcpyDeviceToHost));
+  for (unsigned r = 0; r < kRows; ++r)
+    for (unsigned h = 0; h < kHidden; ++h)
+      if (result[r * kHidden + h] != (h == 3 ? -.5f : 1.f))
+        throw std::runtime_error("additive block mismatch");
+  Check(hipFree(d));
+  Check(hipFree(w));
+  Check(hipFree(y));
+}
+
 int main() {
   DetectorScores();
   WeightedRows();
+  AdditiveRows();
   for (unsigned hidden : {3u, 255u, 256u, 257u, 2560u}) {
     // Row 1 is the session's direction; row 0 must never be read.
     std::vector<float> directions(2 * hidden, 1e30f);

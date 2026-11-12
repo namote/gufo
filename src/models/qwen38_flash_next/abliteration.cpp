@@ -72,9 +72,11 @@ AbliterationPlan PlanAbliteration(
   std::vector<std::vector<std::size_t>> orders;
   std::vector<std::vector<std::size_t>> row_owner;
   for (std::uint32_t site = 0; site < site_count; ++site) {
+    // Suppression profiles only: additive ones (R5) add after the site's
+    // projection, one block each (the executor appends them).
     std::vector<std::size_t> order;
     for (std::size_t p = 0; p < parts.size(); ++p)
-      if (strength(p, site) > 0)
+      if (!parts[p]->additive && strength(p, site) > 0)
         order.push_back(p);
     if (order.empty())
       continue;
@@ -142,6 +144,12 @@ AbliterationPlan PlanAbliteration(
           strength(row_owner[index][j], site);
     plan.sites[site] = static_cast<std::int16_t>(index);
   }
+  const auto adds = static_cast<std::size_t>(std::ranges::count_if(
+      parts, [](const auto* part) { return part->additive; }));
+  if (adds > 8 || plan.blocks.size() + adds > kAbliterationMaxBlocks)
+    throw std::invalid_argument(
+        "abliteration: the profiles need more than 16 blocks (or more than "
+        "8 additive profiles)");
   return plan;
 }
 

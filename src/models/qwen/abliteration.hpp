@@ -42,6 +42,12 @@ inline constexpr std::string_view kAbliterationWriterBeforeResidual =
     "writer-before-residual";
 /// Request and v2 profile strengths are in [0, kAbliterationMaxWeight].
 inline constexpr float kAbliterationMaxWeight = 4.0F;
+/// Additive (steering, R5) profiles: `y += alpha * d` with alpha in
+/// [-kAbliterationMaxAddWeight, kAbliterationMaxAddWeight] per site. The
+/// directions are unit vectors, so alpha is in hidden-activation units along
+/// d; a negative alpha moves against d. The bound is well above the per-layer
+/// norms of measured mean differences.
+inline constexpr float kAbliterationMaxAddWeight = 64.0F;
 /// A v2 27B profile (64 x 5120 directions) is about 4.5 MB of JSON when
 /// written with float32 round-trip precision (prepare.py); the D18 members
 /// are base64 float32, so rank 8 with both kinds adds about 26 MB.
@@ -113,6 +119,10 @@ inline constexpr std::uint32_t kAbliterationWeightedBit = 1U << 29;
     std::uint32_t layers) noexcept {
   return 1 + 3 * std::size_t{layers} * 8;
 }
+/// Word 0 of an additive profile's settings: the row of layer 0's direction
+/// (bits 0-23), the row stride between layers minus one (bits 24-26) and this
+/// bit. A site at layer L adds strength * row (first + L * stride).
+inline constexpr std::uint32_t kAbliterationAddBit = 1U << 28;
 
 /// Immutable, model-bound runtime projection. No model weights are edited.
 /// JSON keeps this sidecar independent of the weight shard loader.
@@ -139,6 +149,12 @@ struct AbliterationProfile {
   bool preserve_norm{false};
   /// How the subspace was fitted ("pca", "som"); empty when not recorded.
   std::string subspace_method;
+  /// v2 member `"mode": "add"` (R5 steering): each site adds its layer's own
+  /// direction (`directions[L]`, or its projected row) times the site's
+  /// strength, which may be negative ([-kAbliterationMaxAddWeight,
+  /// kAbliterationMaxAddWeight]); one direction, no norm preservation.
+  /// Default "suppress": the projection.
+  bool additive{false};
   /// Default per-layer strengths. `residual` is all zero for v1 and for a v2
   /// profile without that member.
   std::vector<float> attention;
@@ -196,6 +212,11 @@ struct AbliterationSettings {
   /// After the projection, rescale each projected row (writer output row,
   /// residual row or HC stream) to its L2 norm before the projection.
   bool preserve_norm{false};
+  /// An additive profile's settings (AbliterationProfile::additive):
+  /// `direction_row` is layer 0's row of the chosen kind and
+  /// `direction_stride` the rows between layers.
+  bool additive{false};
+  std::uint32_t direction_stride{0};
   std::vector<float> attention;
   std::vector<float> mlp;
   /// Post-layer residual strengths: r -= s * d * dot(d, r) at the point the

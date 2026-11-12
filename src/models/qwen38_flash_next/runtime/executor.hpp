@@ -175,12 +175,15 @@ public:
             std::span<const float>(detect_scores_)
                 .first(std::size_t{detect_rows_} * kDetectorColumns)};
   }
-  /// Standalone collection only: called on the last row after each target
-  /// layer.
+  /// Standalone collection only: called after each layer with the pass's
+  /// post-layer residual rows ([rows][hc_dim]): the last row, or with
+  /// `all_rows` every row of the pass (answer-token collection, R5).
   using ActivationObserver =
       std::function<void(std::uint32_t, std::span<const float>)>;
-  void SetActivationObserver(ActivationObserver observer) {
+  void SetActivationObserver(ActivationObserver observer,
+                             bool all_rows = false) {
     activation_observer_ = std::move(observer);
+    observe_all_rows_ = all_rows;
   }
   // Stable device table; only newly mapped entries are uploaded before writes.
   void EnsureKvRows(std::uint32_t rows);
@@ -305,6 +308,12 @@ private:
   /// released when the settings change or the session ends. Never copied to
   /// checkpoint views.
   std::vector<std::string> abliteration_unions_;
+  /// A combination's additive profiles (R5): their blocks start at
+  /// abliteration_add_first_ (one per profile, load order), and each site's
+  /// mask names those with a nonzero strength there; they add after the
+  /// site's suppression block.
+  std::vector<std::uint8_t> abliteration_add_sites_;
+  std::uint32_t abliteration_add_first_{0};
   /// SetDetection and the last scored pass (DetectorPass).
   bool detect_{false};
   std::vector<float> detect_scores_;
@@ -313,6 +322,7 @@ private:
   bool detect_prefill_{false};
   std::uint64_t detect_pass_{0};
   ActivationObserver activation_observer_;
+  bool observe_all_rows_{false};
   std::uint32_t index_capacity_{0};  ///< power-of-two raw indexer ring rows
   std::uint32_t position_{0};
   ContinuationHooks* continuation_hooks_{nullptr};
@@ -420,13 +430,17 @@ public:
   static constexpr std::uint32_t kAbliterationUnionRows = 256;
   /// Several profiles ON together: the weighted device blocks of
   /// PlanAbliteration (qwen::kAbliterationWeightedBit, one strength per
-  /// direction and site), each kAbliterationWeightedWords long, with union
-  /// bases uploaded into reference-counted rows the session then holds
-  /// (`unions`). Fills `words` and each site's block (`sites`).
+  /// direction and site) for the suppression profiles, each
+  /// kAbliterationWeightedWords long, with union bases uploaded into
+  /// reference-counted rows the session then holds (`unions`); then one
+  /// block per additive profile (R5), added at its sites after the
+  /// suppression. Fills `words`, each site's suppression block (`sites`), the
+  /// first additive block and each site's mask of additive blocks.
   void CombineAbliterationBlocks(
       std::span<const qwen::AbliterationSettings* const> parts,
       std::vector<float>* words, std::vector<std::int16_t>* sites,
-      std::vector<std::string>* unions) const;
+      std::vector<std::string>* unions, std::uint32_t* add_first,
+      std::vector<std::uint8_t>* add_sites) const;
   /// The first row of the union basis `key`, uploading it on first use; each
   /// call takes one reference. Throws std::runtime_error when the reserved
   /// rows are exhausted.
@@ -840,11 +854,29 @@ private:
   /// One writer's projection site: the session's device settings (null OFF).
   /// `{}` is OFF. No member initializers: a default argument below uses it
   /// inside this class.
+  /// `adds`/`add_mask`: a combination's additive blocks (consecutive from
+  /// `adds`) that add at this site after `settings` projects.
   struct AbliterationSite {
     const float* settings;
     std::uint32_t layer;
     bool mlp;
+    const float* adds;
+    std::uint32_t add_mask;
+    [[nodiscard]] bool on() const noexcept {
+      return settings != nullptr || add_mask != 0;
+    }
   };
+  /// A combination's additive blocks at site `site`: the first block and the
+  /// mask of those adding there.
+  std::pair<const float*, std::uint32_t> SiteAdds(const Session& session,
+                                                  std::uint32_t site) const {
+    if (!session.abliteration_ || session.abliteration_add_sites_.empty())
+      return {nullptr, 0};
+    return {session.abliteration_device_.get() +
+                std::size_t{session.abliteration_add_first_} *
+                    qwen::AbliterationWeightedWords(config().num_layers),
+            session.abliteration_add_sites_[site]};
+  }
   /// The block projecting at site `site` (AbliterationWeightIndex - 1).
   const float* SiteAbliteration(const Session& session,
                                 std::uint32_t site) const {
@@ -861,8 +893,9 @@ private:
   }
   AbliterationSite AbliterationAt(const Session& session, std::uint32_t layer,
                                   bool mlp) const {
-    return {SiteAbliteration(session, (mlp ? config().num_layers : 0) + layer),
-            layer, mlp};
+    const auto site = (mlp ? config().num_layers : 0) + layer;
+    const auto [adds, mask] = SiteAdds(session, site);
+    return {SiteAbliteration(session, site), layer, mlp, adds, mask};
   }
   void ProjectAbliteration(float* output, std::uint32_t rows,
                            AbliterationSite site) const;
@@ -895,6 +928,18 @@ private:
   mutable std::unordered_map<std::string, UnionRows> union_rows_;
   mutable std::vector<bool> union_used_;
   std::uint32_t union_first_{0};
+  /// Projects (then adds to) `session`'s post-layer residual rows of
+  /// `layer`, every HC stream: one session's whole residual site.
+  void ProjectResidual(float* res, const Session& session, std::uint32_t layer,
+                       std::uint32_t rows) const;
+  /// A decode batch's additive profiles (R5) at `site` (writer or residual
+  /// rows of `layer`), after its projection: one launch per additive slot
+  /// any session uses. Returns which sessions added.
+  std::array<bool, 8> AddBatchSites(std::span<const BatchItem> items,
+                                    std::span<const std::uint32_t> offsets,
+                                    float* output, std::uint32_t layer,
+                                    std::uint32_t site, std::uint32_t rows,
+                                    bool residual) const;
   friend struct ExecutorTestAccess;
 
   enum class DiagnosticStage { kTarget, kDraft, kHead, kCatchUp };
