@@ -76,7 +76,9 @@ void DynamicAbliteration::Observe(const DetectorPass& pass,
 
 std::shared_ptr<const qwen::AbliterationSettings> DynamicAbliteration::Engage(
     std::uint32_t position) {
-  if (engaged_ || !pending_)
+  // A prefill detection is served by readmitting the request ON
+  // (TextModelRunner::PrefillReadmission), never by switching mid-request.
+  if (engaged_ || !pending_ || pending_prefill_)
     return nullptr;
   engaged_ = true;
   position_ = position;

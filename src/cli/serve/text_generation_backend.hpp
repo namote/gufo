@@ -79,11 +79,15 @@ struct AbliterationReport {
   std::vector<std::pair<std::string, float>> scores;
   /// Per dynamic profile: the largest score of any committed row.
   std::vector<std::pair<std::string, float>> max_scores;
-  /// The first token position computed ON (the prompt length when the last
-  /// prompt row crossed); empty while OFF.
+  /// The first token position computed ON: 0 after a prefill detection
+  /// (A2: the whole request ran ON), the switch point of a decode one;
+  /// empty while OFF.
   std::optional<std::size_t> position;
   /// "prefill" or "decode"; empty while OFF.
   std::string phase;
+  /// Prompt tokens prefilled again ON after a prefill detection (A2); the
+  /// rest came from an ON checkpoint.
+  std::size_t reprefill_tokens{0};
 };
 
 /// Client-facing message for a GPU context that can no longer execute work.

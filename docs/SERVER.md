@@ -594,26 +594,26 @@ the scored pass of its last token. The scores
 travel with the pass's logits download, with no extra synchronization. A
 server without a dynamic profile runs no detector kernel.
 
-Before the next decode pass, a last prompt row above a profile's `threshold`
-(or a kept generated row above its `decode_threshold`) turns that profile ON
-with its defaults, sticky for the rest of the request (A1). The prompt state
-computed OFF is kept: a detection on the last prompt row turns the profile
-ON from the first generated token's pass on (so the first generated token
-itself was sampled OFF), and a detection during decoding turns it ON from the
-following pass. One profile is ON at a time: when several cross on one row,
-the largest margin wins, and detection stops once a profile is ON.
+**Prompt-row detection (A2).** When the last prompt row scores above a
+profile's `threshold` (one profile: the largest margin `score − threshold`
+wins), the request runs again as an explicit ON request with that profile's
+defaults, exactly as `{"abliteration":{"enabled":true,"profile":NAME}}`
+would: the scheduler commits the OFF state (its prompt checkpoint stays
+cached for OFF requests), admits the request again under the ON settings and
+their cache identity, restores the longest ON checkpoint (shared with
+earlier ON and readmitted requests), and prefills the rest of the prompt ON
+in ordinary bounded steps, honoring cancellation. Generation then starts
+from ON logits; the OFF pass costs one extra prefill of the uncached prompt
+(none of it is decoded). The first token is never sampled from the OFF
+detecting pass: a mid-request switch at the prompt left the first token and
+the prompt K/V OFF, and the GPU check showed that keeps refusals and the
+official framing.
 
-Re-running the last prompt token ON after a prefill detection, so the first
-token also comes from ON logits, is not implemented. The pass that scores
-that token has already advanced every GatedDeltaNet, convolution, PLE and
-n-gram state and written its K/V; the executor can roll a verification pass
-back only to its first row kept (`Rollback` keeps at least one), and a
-prefill pass keeps no rollback rows at all. Undoing it would need a
-pre-token copy of every recurrent state (plus the MTP draft state and KVarN
-records) on each detecting request, or running that token in a verification
-pass, whose arithmetic differs from the prefill readout the threshold was
-fitted on. Re-prefilling the whole prompt ON (A2) is the cleaner remedy if
-the GPU quality comparison shows the OFF first token matters.
+**Generated-row detection (A1).** Only a profile whose trigger has a
+`decode_threshold` acts on generated rows: before the next decode pass, a
+kept generated row above it turns the profile ON with its defaults from that
+pass on, sticky for the rest of the request; the computed tokens keep their
+OFF state. Detection stops once a profile is ON.
 
 A request with an `abliteration` member never detects: `"enabled":true` is
 the explicit ON above and `"enabled":false` is a plain OFF. Scoring requests
@@ -626,21 +626,27 @@ Completions, the terminal streaming chunk, Responses and Messages):
 ```json
 {"abliteration": {"triggered": ["pol-avg"],
                   "scores": {"pol-avg": 1.83},
-                  "max_scores": {"pol-avg": 1.83},
-                  "position": 412, "phase": "prefill"}}
+                  "max_scores": {},
+                  "position": 0, "phase": "prefill",
+                  "reprefill_tokens": 412}}
 ```
 
 `triggered` lists the profile detection selected (empty without a
-crossing; listed even when the request ended before a pass ran ON);
-`scores` holds the scores of the crossing row, or else of the last prompt
-row; `max_scores` the largest score of any kept generated row (empty when
-none was generated before a switch); `position` is the first token position
-computed ON, or that would have been (the prompt length for `prefill`; null
-without a crossing) and `phase` is `prefill` or `decode` (null without one).
+crossing; for a generated-row crossing listed even when the request ended
+before a pass ran ON); `scores` holds the scores of the crossing row, or else
+of the last prompt row; `max_scores` the largest score of any kept generated
+row of the OFF run (empty when it generated none, as after a readmission);
+`position` is the first token position computed ON: 0 after a prompt-row
+detection, the switch point of a generated-row one, null without a crossing;
+`phase` is `prefill` or `decode` (null without one); `reprefill_tokens` is
+the number of prompt tokens prefilled again ON after a readmission (the
+rest came from an ON checkpoint; 0 otherwise).
 
-Cache and continuation: the request's checkpoints up to `position` are OFF
-states and are shared with OFF requests. A state that includes tokens
-computed after the switch carries an identity salted with the profile
+Cache and continuation: a readmitted request is an explicit ON request from
+its readmission on, so its checkpoints are ON checkpoints that later ON and
+readmitted requests share. After a generated-row switch, the request's
+checkpoints up to `position` are OFF states shared with OFF requests; a
+state that includes tokens computed after the switch carries an identity salted with the profile
 settings and the switch position, so no OFF request, explicit ON request or
 other switch point restores it; the request's live frontier is not kept for
 the next turn. The next turn therefore continues from the last OFF checkpoint

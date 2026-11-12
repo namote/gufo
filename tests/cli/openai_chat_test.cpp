@@ -615,15 +615,18 @@ void TestAbliterationReport() {
       .triggered = {"pol-avg"},
       .scores = {{"pol-avg", 1.5F}, {"fnx", 0.25F}},
       .max_scores = {{"pol-avg", 2.0F}, {"fnx", 0.5F}},
-      .position = 412,
-      .phase = "prefill"};
+      .position = 0,
+      .phase = "prefill",
+      .reprefill_tokens = 412};
   const auto on = chat()["abliteration"];
   Expect(on.find("triggered")->size() == 1 &&
              on.find("triggered")->items()[0].str() == "pol-avg" &&
              on.find("scores")->member_double("pol-avg") == 1.5 &&
              on.find("scores")->member_double("fnx") == 0.25 &&
              on.find("max_scores")->member_double("pol-avg") == 2.0 &&
-             on.member_size("position") == 412 &&
+             on.find("position")->is_number() &&
+             on.member_size("position") == 0 &&
+             on.member_size("reprefill_tokens") == 412 &&
              on.member_str("phase") == "prefill",
          "a switched request reports its profile, scores and position");
   backend.abliteration_report = gufo::server::AbliterationReport{

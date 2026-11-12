@@ -58,7 +58,7 @@ std::vector<float> Rows(std::initializer_list<std::array<float, 2>> rows) {
 }
 
 void PrefillTrigger() {
-  auto dynamic = Make();
+  auto dynamic = Make(true);
   dynamic.SetPromptLength(100);
   // An intermediate prefill chunk is replaced by the final one; Observe only
   // sees the pass the session kept.
@@ -69,14 +69,10 @@ void PrefillTrigger() {
                    .prefill = true,
                    .scores = scores},
                   100);
-  const auto settings = dynamic.Engage(100);
-  Require(
-      settings && settings->profile == "pol" && settings->dynamic_from == 100u,
-      "the last prompt row turns the crossing profile ON from generation");
-  Require(settings->identity != std::string(64, 'a'),
-          "a dynamic switch has its own identity");
-  Require(dynamic.engaged() && !dynamic.Engage(101), "sticky, engaged once");
-  // Later rows are no longer scored: even a larger fnx score changes nothing.
+  // A2: the server readmits the request ON; nothing switches mid-request.
+  Require(!dynamic.Engage(100) && !dynamic.engaged(),
+          "a prompt-row detection never switches the OFF state");
+  // Later rows keep the first detection, even a larger generated-row one.
   const auto later = Rows({{9.0F, 0.0F}});
   dynamic.Observe({.id = 8,
                    .first_position = 100,
@@ -84,6 +80,7 @@ void PrefillTrigger() {
                    .prefill = false,
                    .scores = later},
                   101);
+  Require(!dynamic.Engage(101), "the prompt-row detection stays selected");
   const auto report = dynamic.Report();
   Require(report.triggered == std::vector<std::string>{"pol"} &&
               report.position == 100u && report.phase == "prefill",
@@ -92,8 +89,6 @@ void PrefillTrigger() {
               report.scores[0].second == 1.5F &&
               report.scores[1].second == 0.5F,
           "scores of the crossing row");
-  Require(report.max_scores.empty(),
-          "max covers generated rows, none scored before ON");
 }
 
 void PrefillDetectionReportedBeforeAnyOnPass() {

@@ -61,26 +61,30 @@ struct DynamicAbliterationReport {
   std::string phase;
 };
 
-/// Per-request detection state (A1, sticky, one profile at a time).
+/// Per-request detection state (sticky, one profile at a time).
 ///
 /// Observe() reads a pass's rows that the session committed (positions below
 /// `committed`; rows a verification rolled back are ignored). The last
 /// prompt row is compared with each candidate's `threshold`; generated rows
 /// only with a `decode_threshold` (none by default: they are scored for
 /// `max_scores` only). The first row on which a candidate crosses selects
-/// the one with the largest margin (score - threshold). Engage() hands its
-/// settings, made dynamic at the session's committed length, to the caller
-/// before the next trunk pass; from then on the profile stays ON for the rest
-/// of the request and later rows are no longer scored. Prompt rows already
-/// computed keep their OFF state.
+/// the one with the largest margin (score - threshold). A crossing on the
+/// last prompt row is only reported: the server then runs the request again
+/// as an explicit ON request (A2, TextModelRunner::PrefillReadmission). A
+/// crossing on a generated row (A1): Engage() hands its settings, made
+/// dynamic at the session's committed length, to the caller before the next
+/// trunk pass; from then on the profile stays ON for the rest of the request
+/// and later rows are no longer scored. Rows already computed keep their OFF
+/// state.
 class DynamicAbliteration {
 public:
   explicit DynamicAbliteration(std::vector<DynamicAbliterationCandidate> c);
 
   /// Ignores a pass already observed (same id) and passes after engagement.
   void Observe(const DetectorPass& pass, std::uint32_t committed);
-  /// The settings to turn ON from `position` (the committed length), once;
-  /// null when no row crossed or after the first call that returned them.
+  /// The settings to turn ON from `position` (the committed length), once,
+  /// after a generated row crossed; null otherwise (also after a prompt-row
+  /// crossing, which readmission serves).
   [[nodiscard]] std::shared_ptr<const qwen::AbliterationSettings> Engage(
       std::uint32_t position);
   /// Prefill rows count only at the last prompt token (position

@@ -558,6 +558,18 @@ public:
     (void)state;
     return {};
   }
+  /// After the prompt's final prefill step: the context the request is to be
+  /// admitted again under, from its first prompt token (R2 A2: a dynamic
+  /// abliteration profile detected on the last prompt row runs the request
+  /// as an explicit ON request). Null keeps the request as it is.
+  [[nodiscard]] virtual std::shared_ptr<const TextPromptContext>
+  PrefillReadmission(
+      TextRunnerState& state,
+      const std::shared_ptr<const TextPromptContext>& context) const {
+    (void)state;
+    (void)context;
+    return nullptr;
+  }
   /// The request's dynamic abliteration report; empty when it ran no
   /// detection.
   [[nodiscard]] virtual std::optional<AbliterationReport> DynamicAbliteration(
@@ -736,6 +748,9 @@ public:
     [[nodiscard]] TextRunnerNgramRows ngram_rows() const;
     /// TextModelRunner::DynamicAbliteration of the leased state.
     [[nodiscard]] std::optional<AbliterationReport> abliteration_report() const;
+    /// TextModelRunner::PrefillReadmission once prefill is complete and
+    /// nothing was generated; null otherwise.
+    [[nodiscard]] std::shared_ptr<const TextPromptContext> readmission() const;
     [[nodiscard]] std::optional<ComponentCacheMetrics> component_cache_metrics()
         const;
     [[nodiscard]] std::size_t prompt_tokens() const noexcept;

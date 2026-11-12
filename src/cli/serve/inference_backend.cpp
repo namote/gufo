@@ -280,6 +280,28 @@ std::shared_ptr<const models::qwen::vision::Prompt> QwenPrompt(
 /// image-prefix cache identity with their identity (profile, direction layer
 /// and exact strengths), so ON/OFF or different settings never share cached
 /// state.
+/// The ON context of `settings` over an OFF prompt context `base` (null for
+/// a text-only prompt): the same image prompt, the text and every
+/// image-prefix cache identity salted with the settings identity.
+std::shared_ptr<const AbliterationPromptContext> AbliterationContext(
+    const std::shared_ptr<const TextPromptContext>& base,
+    std::shared_ptr<const models::qwen::AbliterationSettings> settings) {
+  auto context = std::make_shared<AbliterationPromptContext>();
+  context->settings = std::move(settings);
+  const auto& identity = context->settings->identity;
+  if (base) {
+    context->prompt = QwenPrompt(base);
+    context->cache_identity = base->cache_identity;
+    context->cache_prefixes = base->cache_prefixes;
+  }
+  context->cache_identity = models::qwen::AbliterationInputIdentity(
+      context->cache_identity, identity);
+  for (auto& prefix : context->cache_prefixes)
+    prefix.identity =
+        models::qwen::AbliterationInputIdentity(prefix.identity, identity);
+  return context;
+}
+
 TextPreparedPrompt SelectAbliteration(TextPreparedPrompt result,
                                       const ChatRequest& request,
                                       const AbliterationProfileList& profiles,
@@ -316,21 +338,9 @@ TextPreparedPrompt SelectAbliteration(TextPreparedPrompt result,
   if (!profile)
     throw std::invalid_argument("abliteration: unknown profile '" +
                                 request.abliteration_overrides.profile + "'");
-  auto context = std::make_shared<AbliterationPromptContext>();
-  context->settings = models::qwen::ResolveAbliterationSettings(
-      *profile, request.abliteration_overrides);
-  const auto& identity = context->settings->identity;
-  if (result.context) {
-    context->prompt = QwenPrompt(result.context);
-    context->cache_identity = result.context->cache_identity;
-    context->cache_prefixes = result.context->cache_prefixes;
-  }
-  context->cache_identity = models::qwen::AbliterationInputIdentity(
-      context->cache_identity, identity);
-  for (auto& prefix : context->cache_prefixes)
-    prefix.identity =
-        models::qwen::AbliterationInputIdentity(prefix.identity, identity);
-  result.context = std::move(context);
+  result.context = AbliterationContext(
+      result.context, models::qwen::ResolveAbliterationSettings(
+                          *profile, request.abliteration_overrides));
   return result;
 }
 
@@ -3178,6 +3188,26 @@ public:
         dynamic_cast<const DynamicAbliterationContext*>(context.get())
             ? model_->StartDynamicAbliteration()
             : nullptr);
+  }
+
+  // A2: a profile detected on the last prompt row runs the request again as
+  // an explicit ON request with the profile's defaults (the context
+  // `{"abliteration":{"enabled":true,"profile":NAME}}` selects), sharing its
+  // checkpoints.
+  [[nodiscard]] std::shared_ptr<const TextPromptContext> PrefillReadmission(
+      TextRunnerState& state,
+      const std::shared_ptr<const TextPromptContext>& context) const override {
+    if (!dynamic_cast<const DynamicAbliterationContext*>(context.get()))
+      return nullptr;
+    const auto report =
+        RequireQwenFlashNextState(state).session().DynamicReport();
+    if (!report || report->phase != "prefill" || report->triggered.empty())
+      return nullptr;
+    for (const auto& profile : model_->AbliterationProfiles())
+      if (profile->name == report->triggered.front())
+        return AbliterationContext(
+            context, models::qwen::ResolveAbliterationSettings(*profile));
+    throw std::logic_error("detected abliteration profile is not loaded");
   }
 
   [[nodiscard]] std::optional<AbliterationReport> DynamicAbliteration(

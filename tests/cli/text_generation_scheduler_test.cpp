@@ -228,6 +228,9 @@ struct FakeControl {
   std::size_t actual_batch_width{4};
   bool prefix_reuse{true};
   bool preview_first_token{false};
+  /// A request with this label detects a dynamic abliteration profile on
+  /// its last prompt row: it is readmitted under another context (A2).
+  std::optional<TextRunnerToken> readmit_label;
   std::vector<std::string> output_pieces;
   std::uint32_t max_context{128};
   std::shared_ptr<gufo::hip::KvBlockAllocator> row_pool;
@@ -427,6 +430,39 @@ public:
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
     control_->states_created.fetch_add(1, std::memory_order_relaxed);
     return std::make_unique<FakeState>(control_);
+  }
+
+  [[nodiscard]] std::shared_ptr<const gufo::server::TextPromptContext>
+  PrefillReadmission(
+      TextRunnerState& state,
+      const std::shared_ptr<const gufo::server::TextPromptContext>& context)
+      const override {
+    if (context || RequireFakeState(state).label != control_->readmit_label)
+      return nullptr;
+    auto on = std::make_shared<gufo::server::TextPromptContext>();
+    on->cache_identity = {0x0a};
+    return on;
+  }
+
+  // The readmitted ON context is the only one these tests attach.
+  void SetPromptContext(TextRunnerState&,
+                        std::shared_ptr<const gufo::server::TextPromptContext>
+                            context) const override {
+    if (context && context->cache_identity != std::vector<std::uint8_t>{0x0a})
+      throw std::invalid_argument("model does not support this prompt context");
+  }
+
+  [[nodiscard]] std::optional<gufo::server::AbliterationReport>
+  DynamicAbliteration(TextRunnerState& state) const override {
+    const auto& fake = RequireFakeState(state);
+    if (fake.label != control_->readmit_label)
+      return std::nullopt;
+    gufo::server::AbliterationReport report;
+    report.triggered = {"pol"};
+    report.scores = {{"pol", 1.5F}};
+    report.position = fake.position;
+    report.phase = "prefill";
+    return report;
   }
 
   void PrepareBatchExecution(TextRunnerState& state) const override {
@@ -1100,6 +1136,31 @@ void TestIdlePrefillUsesBulkWorkUnit() {
              result.physical_execution_width == 1 &&
              result.execution_plan == "serial-c1",
          "C=1 telemetry reports immediate serial dispatch");
+}
+
+void TestPrefillDetectionReadmitsTheRequestOn() {
+  auto control = std::make_shared<FakeControl>();
+  control->readmit_label = 9;
+  auto scheduler = MakeScheduler(control, 1);
+  const auto result = scheduler->Submit({9, 90, 91, 92}, 2, 0.0F).Wait();
+  std::vector<std::size_t> prefills;
+  for (const auto& event : control->Events())
+    if (event.kind == EventKind::kPrefill && event.label == 9)
+      prefills.push_back(event.index);
+  Expect(prefills == std::vector<std::size_t>({0, 0}),
+         "the readmitted request prefills its prompt again from the start");
+  Expect(result.prefill_tokens == 8 && result.tokens == ExpectedTokens(9, 2),
+         "both prefills are counted and generation follows the second");
+  Expect(
+      result.abliteration &&
+          result.abliteration->triggered == std::vector<std::string>{"pol"} &&
+          result.abliteration->phase == "prefill" &&
+          result.abliteration->position == 0u &&
+          result.abliteration->reprefill_tokens == 4,
+      "the report says the whole request ran ON after a re-prefill");
+  const auto plain = scheduler->Submit({8, 80}, 1, 0.0F).Wait();
+  Expect(!plain.abliteration && plain.prefill_tokens == 2,
+         "other requests are not readmitted");
 }
 
 void TestRunnerCanSkipUnusedFinalAdvance() {
@@ -3962,6 +4023,7 @@ int main() {
   TestRetainedHistoryBeatsSharedPrefixWait();
   TestAwaitedCheckpointSurvivesCachePressure();
   TestRunnerCanSkipUnusedFinalAdvance();
+  TestPrefillDetectionReadmitsTheRequestOn();
   TestRunnerCanReuseExactIncrementalText();
   TestGenerationTraceRecordsPromptAndOutput();
   TestMultiTokenDecodePublishesDraftMetricsAndDisablesPrefixReuse();

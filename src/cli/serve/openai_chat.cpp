@@ -66,6 +66,8 @@ void AddAbliterationReport(const TextGenerationBackend::Result& result,
           : json::Value(nullptr);
   value["phase"] =
       report.phase.empty() ? json::Value(nullptr) : json::Value(report.phase);
+  value["reprefill_tokens"] =
+      static_cast<unsigned long long>(report.reprefill_tokens);
   out["abliteration"] = std::move(value);
 }
 }  // namespace

@@ -1543,6 +1543,14 @@ TextRunnerNgramRows TextRunnerPool::Request::ngram_rows() const {
           now.cache_hits - base.cache_hits, now.disk_reads - base.disk_reads};
 }
 
+std::shared_ptr<const TextPromptContext> TextRunnerPool::Request::readmission()
+    const {
+  if (impl_ == nullptr || !impl_->decode_ready || !impl_->generated.empty())
+    return nullptr;
+  return impl_->runner->PrefillReadmission(
+      dynamic_cast<TextRunnerState&>(impl_->lease.state()), impl_->context);
+}
+
 std::optional<AbliterationReport> TextRunnerPool::Request::abliteration_report()
     const {
   if (impl_ == nullptr)
