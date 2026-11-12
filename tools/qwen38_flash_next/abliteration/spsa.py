@@ -206,8 +206,8 @@ def compress(theta, layers, block):
     return out
 
 
-def clip(theta, high):
-    return [min(max(x, 0.0), high) for x in theta]
+def clip(theta, high, low=0.0):
+    return [min(max(x, low), high) for x in theta]
 
 
 def main(argv=None):
@@ -230,6 +230,9 @@ def main(argv=None):
     ap.add_argument('--init', required=True,
                     help='JSON {"attention": [...], "mlp": [...], "residual": [...]} or a number for all')
     ap.add_argument('--max-strength', type=float, default=4.0)
+    ap.add_argument('--min-strength', type=float, default=0.0,
+                    help='lowest strength; negative for an additive ("mode": "add") '
+                         'profile, whose runtime range is [-64, 64]')
     ap.add_argument('--steps', type=int, default=100)
     ap.add_argument('--a', type=float, default=0.15, help='step size scale (strength units)')
     ap.add_argument('--c', type=float, default=0.15, help='perturbation size (strength units)')
@@ -252,6 +255,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if not 0 <= args.answer_tokens <= 1024:
         ap.error('--answer-tokens must be 0..1024')
+    if args.min_strength > args.max_strength:
+        ap.error('--min-strength must not exceed --max-strength')
     if args.block_size < 1 or args.minibatch < 0:
         ap.error('--block-size must be at least 1 and --minibatch at least 0')
 
@@ -265,7 +270,7 @@ def main(argv=None):
         theta = [float(x) for part in ('attention', 'mlp', 'residual') for x in init[part]]
     if len(theta) != 3 * n:
         raise SystemExit('init needs layers values for attention, mlp and residual')
-    theta = clip(compress(theta, n, args.block_size), args.max_strength)
+    theta = clip(compress(theta, n, args.block_size), args.max_strength, args.min_strength)
     pairs = load_jsonl(args.pairs, ('id', 'prompt', 'candid', 'propaganda'))
     ordinary = load_jsonl(args.ordinary, ('id', 'prompt', 'answer'))
     facts = load_jsonl(args.facts, ('id', 'prompt', 'correct', 'wrong')) if args.facts else []
@@ -275,6 +280,7 @@ def main(argv=None):
     header = dict(type='header', args={k: v for k, v in vars(args).items() if k not in ('log', 'output', 'steps', 'concurrency', 'base_url')
                                  and not (k in ('answer_tokens', 'minibatch') and not v)
                                  and not (k == 'block_size' and v == 1)
+                                 and not (k == 'min_strength' and v == 0.0)
                                  and not (k in ('facts', 'mu', 'fact_margin') and not args.facts)},
                   pairs=[p['id'] for p in pairs], ordinary=[o['id'] for o in ordinary])
     if facts:
@@ -309,8 +315,8 @@ def main(argv=None):
         ck = args.c / (k + 1) ** 0.101
         ak = args.a / (k + 1 + args.A) ** 0.602
         delta = [1.0 if rng.random() < 0.5 else -1.0 for _ in range(dim)]
-        plus = clip([t + ck * d for t, d in zip(theta, delta)], args.max_strength)
-        minus = clip([t - ck * d for t, d in zip(theta, delta)], args.max_strength)
+        plus = clip([t + ck * d for t, d in zip(theta, delta)], args.max_strength, args.min_strength)
+        minus = clip([t - ck * d for t, d in zip(theta, delta)], args.max_strength, args.min_strength)
         pair_idx = ord_idx = fact_idx = None
         if args.minibatch:
             pick = random.Random(f'{args.seed}:{k}')  # per step, so resume draws the same subset
@@ -321,7 +327,7 @@ def main(argv=None):
         jp, jm = objective.evaluate([plus, minus], pair_idx, ord_idx, fact_idx)
         g = [(jp['j'] - jm['j']) / (2 * ck) * d for d in delta]
         rms = math.sqrt(sum(x * x for x in g) / len(g)) or 1.0
-        theta = clip([t + ak * x / rms for t, x in zip(theta, g)], args.max_strength)
+        theta = clip([t + ak * x / rms for t, x in zip(theta, g)], args.max_strength, args.min_strength)
         record = dict(step=k, plus=jp, minus=jm, theta=theta)
         if (k + 1) % args.eval_every == 0 or k + 1 == args.steps:
             record['eval'] = objective(theta)

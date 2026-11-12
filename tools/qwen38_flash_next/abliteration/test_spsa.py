@@ -45,6 +45,11 @@ class Fake(http.server.BaseHTTPRequestHandler):
 
 
 class SpsaTest(unittest.TestCase):
+    def test_signed_strengths_for_additive_profiles(self):
+        self.assertEqual(spsa.clip([-5.0, 1.0, 70.0], 4.0), [0.0, 1.0, 4.0])
+        self.assertEqual(spsa.clip([-70.0, -5.0, 70.0], 64.0, -64.0),
+                         [-64.0, -5.0, 64.0])
+
     def test_blocks_round_trip(self):
         theta = [float(i) for i in range(3 * 5)]
         params = spsa.compress(theta, 5, 2)

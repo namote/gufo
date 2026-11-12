@@ -379,6 +379,43 @@ server also scores every decoded row). Thresholds therefore transfer only
 between captures with the same readout
 (`last-prompt-token-post-layer-hc-mean-fp32-v1`) and model.
 
+## Steering profiles (R5)
+
+An additive profile (`"mode": "add"`, see `docs/SERVER.md`) adds
+`a_L * d_L` instead of projecting. Preparation:
+
+1. Collect answer-token activations, teacher-forced:
+
+   ```sh
+   qwen38_flash_next_abliteration_collect MODEL ANSWERS.jsonl OUT answers
+   ```
+
+   Each JSONL record has `id` (hex, as for `collect`), `group` (`exemplar`
+   for the reference answer, `own` for the model's), `pair` (the question
+   both answers share), `text` (the user turn) and `answer` (the assistant
+   content). The prompt is framed as `score_assistant` frames it (thinking
+   off, the empty thinking block), the answer tokenized as message text, and
+   each record saves the per-layer mean over the answer tokens of the
+   post-layer residual averaged over the HC streams (48 x 2560 FP32, readout
+   `answer-tokens-mean-post-layer-hc-mean-fp32-v1`), with `answer_tokens`
+   in its receipt. The collector reads every row of the passes that feed
+   the answer, so no last-layer rows are skipped.
+2. Fit the profile:
+
+   ```sh
+   python3 tools/qwen38_flash_next/abliteration/fit_steering.py \
+     --collection OUT --kind projected --alpha 0 --output PROFILES_DIR/name.json
+   ```
+
+   `d_L` is the mean over questions of (mean exemplar - mean own) answers at
+   layer L; `--kind projected` removes the component along the own answers'
+   mean, `--rank k` stores k-1 further rows (only the first is applied).
+   Directions are stored as unit vectors with their norms in `magnitudes`;
+   `--alpha` sets the default residual strengths to alpha * |d_L| (0: neutral).
+3. Learn the strengths with `spsa.py --min-strength -64 --max-strength 64`
+   against held-out exemplar answers (`score_assistant` scores additive
+   profiles like any other).
+
 ## Focused checks
 
 CPU: `qwen38_flash_next.abliteration`, `qwen27b_abliteration_test` (shared v2
@@ -389,7 +426,9 @@ projected, PCA and SOM math on planted data, orthonormality, SOM
 determinism, profile members),
 `python3 tools/qwen38_flash_next/abliteration/test_search.py` and
 `python3 tools/qwen38_flash_next/abliteration/test_fit_trigger.py` (topic
-folds, per-set threshold, profile copy).
+folds, per-set threshold, profile copy) and
+`python3 tools/qwen38_flash_next/abliteration/test_fit_steering.py` (paired
+steering directions, kinds, strengths).
 GPU: `qwen38_flash_next.abliteration_ops` covers an independent FP64 formula,
 unaligned dimensions, mixed rows with their own directions and strengths,
 in-place settings updates under a captured graph and the production
