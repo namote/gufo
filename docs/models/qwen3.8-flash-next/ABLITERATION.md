@@ -360,6 +360,8 @@ python3 tools/qwen38_flash_next/abliteration/fit_trigger.py \
   in one fold; `--topics none` groups only the two thinking modes of one text
   (records the map omits fall back the same way, or to their own `topic`).
   The map's SHA-256 is recorded in the report's `sources`.
+- `--threshold X` replaces the fitted threshold with an explicit one (the
+  report keeps `fitted_threshold` and marks `threshold_source` "override").
 - `threshold` is for the last prompt row. Generated rows turn a profile ON
   only with a separately fitted `decode_threshold` (not written by this
   tool; see `docs/SERVER.md`).

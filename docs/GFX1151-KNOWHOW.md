@@ -249,6 +249,7 @@
       - The Xinjiang answer keeps the PRC framing.
       - Explicit ON answers all 8 candidly.
       - The OFF prompt KV and the OFF first token decide the answer. A1 is not enough, so re-prefill ON (A2) is needed.
+  - **Threshold 0.7 chosen for `dynamic/profiles-pol/`** (`fit_trigger.py --threshold 0.7`, fitted 1.199 kept in the report): GPU recall is 80% at 0.7, ordinary prompts score at most 0.33, and explicit ON did not degrade ordinary answers in the ordcheck, so a false trigger is cheap. Offline at 0.7: recall 92.1%, controls 4.2% and harmless 1.3% false positives (`dynamic/fit-pol-0.7.json`). Prompt-row detections now readmit the request ON (A2); untested on the GPU.
   - **Deploy note (R2-5):** `--abliteration-profiles DIR` replaced `--abliteration-profile FILE`. The pinned runtime (runtime-20261111b in `tools/serving/flash_next/gufo-server.py`) predates it. A deploy must bump `RUNTIME`, `GUFO_SHA256` and the option together, and create the profiles directory inside the new runtime (only profiles in it: every `*.json` there loads). Production runs its own copy of the launcher under `~/.local/share/gufo`.
 
 ## Flash-Next c03 1M YaRN K4V4 serving and time-shared scheduler, November 11, 2026 (deployed)

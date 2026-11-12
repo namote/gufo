@@ -112,6 +112,20 @@ class FitTriggerTest(unittest.TestCase):
                              fit_trigger.sha(topics.read_bytes()))
             self.assertEqual(report['counts']['target_topics'], 4)
 
+    def test_threshold_override_is_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            collection = separable(Path(tmp) / 'c')
+            _, fitted, _ = fit_trigger.fit(collection, 'refusal', 0, topics_path='none',
+                                           folds=4)
+            self.assertEqual(fitted['threshold_source'], 'fit')
+            self.assertEqual(fitted['fitted_threshold'], fitted['threshold'])
+            _, report, _ = fit_trigger.fit(collection, 'refusal', 0, topics_path='none',
+                                           folds=4, threshold_override=5.0)
+            self.assertEqual(report['threshold'], 5.0)
+            self.assertEqual(report['threshold_source'], 'override')
+            self.assertEqual(report['fitted_threshold'], fitted['threshold'])
+            self.assertEqual(report['recall'], 0.0)
+
     def test_rejects_topic_with_both_groups(self):
         with tempfile.TemporaryDirectory() as tmp:
             rows = [(f'r{i}', 'refusal', [1, 0, 0, 0], 'same', False)

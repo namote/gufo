@@ -36,6 +36,10 @@ the other folds' negatives only and evaluates it on the fold, so its recall
 and false-positive rate are not tuned on the data that reports them. The
 deployed direction is fitted on every topic.
 
+`--threshold X` replaces the fitted threshold with an explicit one (for
+example chosen from server measurements); the report keeps the fitted value
+as `fitted_threshold` and marks `threshold_source` "override".
+
 The output is the input profile with a `trigger` member; the input file is
 never modified, and an existing output is refused.
 """
@@ -179,7 +183,7 @@ def rate(values, threshold):
 
 
 def fit(collection, target, layer, negatives=(), topics_path=None, folds=6,
-        max_false_positive=0.01, seed=0):
+        max_false_positive=0.01, seed=0, threshold_override=None):
     topics = load_topics(topics_path)
     rows, names, keys, thinking, manifest = load_collection(
         collection, layer, {target, 'ordinary'}, topics)
@@ -221,6 +225,12 @@ def fit(collection, target, layer, negatives=(), topics_path=None, folds=6,
     # Each negative set (held-out ordinary, every extra collection) stays
     # within the false-positive budget on its own.
     threshold = threshold_for([ordinary] + extra_oof, max_false_positive)
+    # An explicit threshold (for example chosen from server measurements)
+    # replaces the fitted one; recall and false positives below are reported
+    # at it, the nested estimate stays the fitted rule's.
+    fitted_threshold = threshold
+    if threshold_override is not None:
+        threshold = float(threshold_override)
     # Nested: each fold's threshold from the other folds' negatives.
     nested_tp = nested_fp = 0
     nested_pos = nested_neg = 0
@@ -253,6 +263,8 @@ def fit(collection, target, layer, negatives=(), topics_path=None, folds=6,
         auc_extra_negatives=auc(positive, harmless) if extra else None,
         auc_all_negatives=auc(positive, pooled_negative),
         threshold=threshold,
+        threshold_source='override' if threshold_override is not None else 'fit',
+        fitted_threshold=fitted_threshold,
         recall=rate(positive, threshold),
         false_positive_ordinary=rate(ordinary, threshold),
         false_positive_extra=rate(harmless, threshold) if extra else None,
@@ -333,6 +345,9 @@ def main():
     parser.add_argument('--folds', type=int, default=6)
     parser.add_argument('--max-false-positive', type=float, default=0.01)
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--threshold', type=float,
+                        help='explicit threshold replacing the fitted one (recorded '
+                             'as threshold_source "override" beside fitted_threshold)')
     parser.add_argument('--profile', help='runtime profile to copy the trigger into')
     parser.add_argument('--output', help='new profile path (requires --profile)')
     args = parser.parse_args()
@@ -344,7 +359,8 @@ def main():
         parser.error('--max-false-positive must be in [0, 1)')
     final, report, manifest = fit(
         args.collection, args.target_group, args.layer, args.negatives,
-        args.topics, args.folds, args.max_false_positive, args.seed)
+        args.topics, args.folds, args.max_false_positive, args.seed,
+        args.threshold)
     print(json.dumps(report, indent=2))
     if args.profile:
         write_profile(args.profile, args.output, final, report, manifest)
