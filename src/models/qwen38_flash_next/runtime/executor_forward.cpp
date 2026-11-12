@@ -312,12 +312,14 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
 
 bool Executor::ForwardScoreRows(Session& session,
                                 std::span<const std::int32_t> tokens,
+                                std::uint32_t logit_rows,
                                 std::span<const float>* rows,
                                 std::string* error_msg) const {
   *rows = {};
   const Config& c = config();
   const auto n = static_cast<std::uint32_t>(tokens.size());
-  if (n == 0 || n > max_score_rows()) {
+  if (n == 0 || n > options_.max_batch || logit_rows > n ||
+      logit_rows > max_score_rows()) {
     AssignError(error_msg, "scoring pass is empty or exceeds its row limit");
     return false;
   }
@@ -347,10 +349,11 @@ bool Executor::ForwardScoreRows(Session& session,
     explicit ScorePass(bool& f) : flag(f) { flag = true; }
     ~ScorePass() { flag = false; }
   } pass{score_pass_};
-  if (!Forward(session, tokens, n, nullptr, ForwardMode::kPrefill, error_msg))
+  if (!Forward(session, tokens, logit_rows, nullptr, ForwardMode::kPrefill,
+               error_msg))
     return false;
-  *rows =
-      std::span<const float>(score_logits_host_, std::size_t{n} * c.vocab_size);
+  *rows = std::span<const float>(score_logits_host_,
+                                 std::size_t{logit_rows} * c.vocab_size);
   return true;
 }
 

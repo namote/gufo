@@ -217,6 +217,15 @@ public:
   [[nodiscard]] bool ScoreTokens(std::span<const std::int32_t> tokens,
                                  std::vector<sampling::TokenLogprobs>* scored,
                                  std::string* error_msg = nullptr);
+  /// Scores `tokens` after `prompt` as ScoreTokens does, first making the
+  /// session hold `prompt` as Sync would (keeping a common prefix). The
+  /// unfed prompt tail and the fed scored tokens share the same passes, so a
+  /// short prompt and its answer take one pass; the first token is scored on
+  /// the prompt's last row of that pass.
+  [[nodiscard]] bool ScorePrompt(std::span<const std::int32_t> prompt,
+                                 std::span<const std::int32_t> tokens,
+                                 std::vector<sampling::TokenLogprobs>* scored,
+                                 std::string* error_msg = nullptr);
   struct DecodeResult {
     std::vector<std::int32_t> tokens;
     bool stop{false};
@@ -382,7 +391,8 @@ private:
             double* capture_ms = nullptr,
             std::span<const std::int32_t> after = {},
             const PrefillCapture& capture = {});
-  bool ScoreTokensImpl(std::span<const std::int32_t> tokens,
+  bool ScorePromptImpl(std::span<const std::int32_t> prompt,
+                       std::span<const std::int32_t> tokens,
                        std::vector<sampling::TokenLogprobs>* scored,
                        std::string* error_msg);
   bool SyncImpl(std::span<const std::int32_t> prompt, std::string* error_msg,

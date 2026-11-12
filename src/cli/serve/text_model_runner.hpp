@@ -415,12 +415,15 @@ public:
       const ChatRequest&) const {
     throw std::invalid_argument("model does not support score_assistant");
   }
-  /// Teacher forcing from a decode-ready state: the raw log-softmax of each
-  /// of `tokens` given the prompt and the tokens before it, with no sampling
-  /// transformation (the `logprobs` definition). The state is left past the
+  /// Teacher forcing: the raw log-softmax of each of `tokens` given
+  /// `prompt` and the tokens before it, with no sampling transformation (the
+  /// `logprobs` definition). The state may hold any prefix of `prompt`
+  /// (CheckpointPosition); the runner feeds the rest of the prompt with the
+  /// scored tokens, sharing passes where it can. The state is left past the
   /// prompt and must not be published.
   [[nodiscard]] virtual std::vector<sampling::TokenLogprobs> ScoreTokens(
-      TextRunnerState&, std::span<const TextRunnerToken>) const {
+      TextRunnerState&, std::span<const TextRunnerToken>,
+      std::span<const TextRunnerToken>) const {
     throw std::logic_error("runner does not support scoring");
   }
   /// Size a prompt without execution-context admission or inference. Image
@@ -737,8 +740,10 @@ public:
                                             std::size_t resident_requests = 1);
 
     /// Scores `tokens` after the complete prompt (TextModelRunner::
-    /// ScoreTokens), after capturing the complete prompt checkpoint. The live
-    /// state is then not reusable: Cancel keeps only prompt checkpoints.
+    /// ScoreTokens). The prompt may still be partly unfed: the runner feeds
+    /// its rest with the scored tokens. A completely prefilled prompt has its
+    /// checkpoint captured first. The live state is then not reusable: Cancel
+    /// keeps only prompt checkpoints.
     [[nodiscard]] std::vector<sampling::TokenLogprobs> Score(
         std::span<const TextRunnerToken> tokens);
 

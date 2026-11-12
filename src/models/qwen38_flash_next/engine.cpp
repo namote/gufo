@@ -1136,8 +1136,21 @@ bool Session::Evaluate(std::int32_t token, std::string* error_msg) {
 bool Session::ScoreTokens(std::span<const std::int32_t> tokens,
                           std::vector<sampling::TokenLogprobs>* scored,
                           std::string* error_msg) {
+  if (!valid_ || tokens_.empty()) {
+    AssignError(error_msg, "scoring needs a prefilled session");
+    return false;
+  }
+  const std::vector<std::int32_t> prompt = tokens_;
+  return ScorePrompt(prompt, tokens, scored, error_msg);
+}
+
+bool Session::ScorePrompt(std::span<const std::int32_t> prompt,
+                          std::span<const std::int32_t> tokens,
+                          std::vector<sampling::TokenLogprobs>* scored,
+                          std::string* error_msg) {
+  const ExecutionScope execution(continuation_hooks_);
   try {
-    return ScoreTokensImpl(tokens, scored, error_msg);
+    return ScorePromptImpl(prompt, tokens, scored, error_msg);
   } catch (const std::exception& error) {
     // CollectLogprobs refuses non-finite logits.
     valid_ = false;
@@ -1146,12 +1159,12 @@ bool Session::ScoreTokens(std::span<const std::int32_t> tokens,
   }
 }
 
-bool Session::ScoreTokensImpl(std::span<const std::int32_t> tokens,
+bool Session::ScorePromptImpl(std::span<const std::int32_t> prompt,
+                              std::span<const std::int32_t> tokens,
                               std::vector<sampling::TokenLogprobs>* scored,
                               std::string* error_msg) {
-  const ExecutionScope execution(continuation_hooks_);
-  if (!valid_ || tokens_.empty()) {
-    AssignError(error_msg, "scoring needs a prefilled session");
+  if (prompt.empty()) {
+    AssignError(error_msg, "scoring needs a prompt");
     return false;
   }
   if (tokens.empty()) {
@@ -1165,57 +1178,102 @@ bool Session::ScoreTokensImpl(std::span<const std::int32_t> tokens,
       return false;
     }
   }
-  if (tokens_.size() + tokens.size() - 1 > ContextSize()) {
+  if (prompt.size() + tokens.size() - 1 > ContextSize()) {
     AssignError(error_msg, "scored tokens exceed the session context");
     return false;
   }
+  // As SyncImpl: keep the longest common prefix; recurrent state cannot be
+  // rewound, so any divergence restarts the session.
+  lookup_.BeginRequest();
+  copy_rows_ = 0;
+  copy_streak_ = 0;
+  if (!valid_)
+    Reset();
+  std::size_t common = 0;
+  while (common < tokens_.size() && common < prompt.size() &&
+         tokens_[common] == prompt[common])
+    ++common;
+  if (common != tokens_.size()) {
+    Reset();
+    common = 0;
+  }
   scored->clear();
   scored->reserve(tokens.size());
-  // count 0: the selected token only, as `logprobs` without top_logprobs.
-  scored->push_back(*sampling::CollectLogprobs(
-      logits_, static_cast<sampling::TokenId>(tokens[0]), 0U));
+  // Global row `first` is the first whose logits score a token: the
+  // prompt's last row, or after it when the session already holds the whole
+  // prompt and its frontier logits.
+  std::size_t first = prompt.size() - 1;
+  if (common == prompt.size()) {
+    // count 0: the selected token only, as `logprobs` without top_logprobs.
+    scored->push_back(*sampling::CollectLogprobs(
+        logits_, static_cast<sampling::TokenId>(tokens[0]), 0U));
+    ++first;
+  }
+  // The unfed prompt and every scored token but the last take prompt
+  // (kPrefill) passes that return the logits of their rows from `first` on
+  // (Executor::ForwardScoreRows), so a short prompt and its answer share one
+  // pass. A prefill pass streams the routed experts once for all its rows:
+  // about a fixed 0.2 s plus 0.8 ms per row, where 8-row verification costs
+  // about 4.5 ms per row at any width (GFX1151-KNOWHOW "Scoring speed").
+  // Rows carry prompt arithmetic: the first token is scored on a prefill row
+  // as generation samples it, and the rest agree with generated
+  // (verification) logprobs to numerical error. The rows reduce on the host
+  // with the log-softmax generated logprobs use; a device gather would save
+  // only the download of about 1 MB per row, a few milliseconds on unified
+  // memory, against a kernel the CPU checks cannot run.
+  std::vector<std::int32_t> fed(prompt.begin() + common, prompt.end());
+  fed.insert(fed.end(), tokens.begin(), tokens.end() - 1);
+  // Global row g scores sequence token g + 1: prompt, then `tokens`.
+  const auto target = [&](std::size_t g) {
+    return g + 1 < prompt.size() ? prompt[g + 1]
+                                 : tokens[g + 1 - prompt.size()];
+  };
   auto& exec = *model_->executor_;
-  // The fed tokens take prompt (kPrefill) passes of up to max_score_rows()
-  // rows that return the logits of every row (Executor::ForwardScoreRows).
-  // A prefill pass streams the routed experts once for all its rows, so one
-  // pass costs about a fixed 0.2 s plus 0.8 ms per row, where 8-row
-  // verification costs about 4.5 ms per row at any width (GFX1151-KNOWHOW
-  // "Scoring speed"). Rows carry prompt arithmetic: the first token is
-  // scored on prefill logits as generation samples it, and the rest agree
-  // with generated (verification) logprobs to numerical error. The rows
-  // reduce on the host with the log-softmax generated logprobs use; a device
-  // gather would save only the download of about 1 MB per row, a few
-  // milliseconds on unified memory, against a kernel the CPU checks cannot
-  // run.
   const std::size_t ratio =
       std::max<std::uint32_t>(1, model_->config().compress_ratio);
-  const auto fed = tokens.first(tokens.size() - 1);
   valid_ = false;
   for (std::size_t off = 0; off < fed.size();) {
-    std::size_t n =
-        std::min<std::size_t>(exec.max_score_rows(), fed.size() - off);
+    const std::size_t start = tokens_.size();
+    const std::size_t logit_from = std::max(start, first);
+    const auto remaining = fed.size() - off;
+    // Feed's chunking, bounded so the logit rows fit the scoring head.
+    std::size_t n = std::min<std::size_t>(
+        {remaining,
+         remaining <= exec.max_batch() ? exec.max_batch()
+                                       : model_->PrefillCapacity(),
+         logit_from - start + exec.max_score_rows()});
     // As in Feed: a following pass starts on a selection block.
-    if (const auto end = tokens_.size() + n;
+    if (const auto end = start + n;
         off + n < fed.size() && end % ratio != 0 && n > end % ratio)
       n -= end % ratio;
-    const auto chunk = fed.subspan(off, n);
+    const auto chunk = std::span<const std::int32_t>(fed).subspan(off, n);
+    const auto logit_rows =
+        start + n > logit_from ? start + n - logit_from : std::size_t{0};
     // Prefill needs the draft block caught up to the frontier (Feed).
-    if (MtpEnabled() && !DraftCatchUp(chunk[0], false, error_msg))
+    if (MtpEnabled() && !tokens_.empty() &&
+        !DraftCatchUp(chunk[0], false, error_msg))
       return false;
     std::span<const float> rows;
-    if (!exec.ForwardScoreRows(*session_, chunk, &rows, error_msg))
+    if (!exec.ForwardScoreRows(*session_, chunk,
+                               static_cast<std::uint32_t>(logit_rows), &rows,
+                               error_msg))
       return false;
-    // Row r follows chunk[r] = tokens[off + r] and scores its successor.
     auto values = CollectRowLogprobs(
-        rows, vocab, static_cast<std::uint32_t>(n),
-        [&](std::uint32_t r) { return tokens[off + r + 1]; }, 0U);
+        rows, vocab, static_cast<std::uint32_t>(logit_rows),
+        [&](std::uint32_t r) { return target(logit_from + r); }, 0U);
     for (auto& value : values)
       scored->push_back(std::move(*value));
-    std::copy_n(rows.data() + (n - 1) * vocab, vocab, logits_.begin());
+    if (logit_rows != 0)
+      std::copy_n(rows.data() + (logit_rows - 1) * vocab, vocab,
+                  logits_.begin());
     hidden_base_ = static_cast<std::uint32_t>(
-        tokens_.size() + n - std::min<std::size_t>(n, exec.max_speculative()));
+        start + n - std::min<std::size_t>(n, exec.max_speculative()));
     tokens_.insert(tokens_.end(), chunk.begin(), chunk.end());
     off += n;
+  }
+  if (scored->size() != tokens.size()) {
+    AssignError(error_msg, "scoring returned an incomplete row set");
+    return false;
   }
   valid_ = true;
   return true;

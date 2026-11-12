@@ -33,6 +33,8 @@ namespace {
 
 constexpr std::size_t kDecodeProgressInterval = 50;
 constexpr std::size_t kKvDecodeWindow = 4096;
+/// Prompt tokens a scoring request leaves for its scoring passes.
+constexpr std::size_t kScoringPromptTailTokens = 1024;
 constexpr std::size_t kNoSession = std::numeric_limits<std::size_t>::max();
 
 struct OutputBudget {
@@ -1311,11 +1313,11 @@ struct TextGenerationScheduler::Impl {
         PublishPromptProgress(request);
         request->phase.store(TextRequestPhase::kAdmitted,
                              std::memory_order_release);
-        request->phase.store(request->runner_request.prefill_complete()
+        request->phase.store(DecodeReady(request)
                                  ? TextRequestPhase::kDecodeReady
                                  : TextRequestPhase::kPrefilling,
                              std::memory_order_release);
-        if (request->runner_request.prefill_complete()) {
+        if (DecodeReady(request)) {
           request->decode_due = true;
           decoding.push_back(std::move(request));
         } else {
@@ -1341,6 +1343,21 @@ struct TextGenerationScheduler::Impl {
       const std::shared_ptr<ScheduledRequest>& request) {
     return request->runner_request.prompt_tokens() -
            request->runner_request.prefill_position();
+  }
+
+  // A scoring request leaves at most kScoringPromptTailTokens of its prompt
+  // unfed: the scoring work unit feeds them in the same passes as the scored
+  // tokens (TextModelRunner::ScoreTokens), so a short prompt costs no pass of
+  // its own. Longer prompts prefill down to that tail in ordinary chunks,
+  // between other requests' work.
+  [[nodiscard]] static bool ScoringReady(
+      const std::shared_ptr<ScheduledRequest>& request) {
+    return !request->score_tokens.empty() &&
+           RemainingPrefill(request) <= kScoringPromptTailTokens;
+  }
+  [[nodiscard]] static bool DecodeReady(
+      const std::shared_ptr<ScheduledRequest>& request) {
+    return request->runner_request.prefill_complete() || ScoringReady(request);
   }
 
   [[nodiscard]] bool ShortPrefill(
@@ -1432,6 +1449,10 @@ struct TextGenerationScheduler::Impl {
         budget = kAdmissionPrefillTokens -
                  request->runner_request.prefill_position() %
                      kAdmissionPrefillTokens;
+      // A scoring prompt stops at its tail (ScoringReady).
+      if (!request->score_tokens.empty())
+        budget = std::min(budget,
+                          RemainingPrefill(request) - kScoringPromptTailTokens);
       if ((decoder_runnable || runner_pool->capacity() > 1) &&
           !incremental_prefill_supported) {
         request->result.prefill_fallback_reason =
@@ -1762,9 +1783,10 @@ struct TextGenerationScheduler::Impl {
     return PublishSelection(request, selection);
   }
 
-  // Teacher-forced scoring runs as one work unit after prefill. The prompt
-  // checkpoint is captured first, as before a first decode step; the scored
-  // tail is never published.
+  // Teacher-forced scoring runs as one work unit once at most
+  // kScoringPromptTailTokens of the prompt remain; that unit feeds them with
+  // the scored tokens. Any pending prompt capture finishes first, as before a
+  // first decode step; the scored tail is never published.
   void StepScore(const std::shared_ptr<ScheduledRequest>& request) {
     consecutive_active_prefill_chunks = 0;
     try {
@@ -2282,7 +2304,7 @@ struct TextGenerationScheduler::Impl {
         }
         progress.fetch_add(1, std::memory_order_relaxed);
         if (!CompleteIfStopped(request)) {
-          if (request->runner_request.prefill_complete()) {
+          if (DecodeReady(request)) {
             // Its capture already waited through peer prefill. Resume it
             // before another bounded chunk, as for any due decoder, and with
             // the resident decoders so it shares their step.
@@ -2420,7 +2442,7 @@ struct TextGenerationScheduler::Impl {
         if (!IsTerminal(request)) {
           if (CapturePending(request, CaptureSettleDeadline())) {
             capturing.push_back(std::move(request));
-          } else if (request->runner_request.prefill_complete()) {
+          } else if (DecodeReady(request)) {
             decoding.push_back(std::move(request));
           } else {
             prefilling.push_back(std::move(request));
@@ -2491,7 +2513,7 @@ struct TextGenerationScheduler::Impl {
       if (!IsTerminal(request)) {
         if (CapturePending(request, CaptureSettleDeadline())) {
           capturing.push_back(std::move(request));
-        } else if (request->runner_request.prefill_complete()) {
+        } else if (DecodeReady(request)) {
           request->decode_due = true;
           decoding.push_back(std::move(request));
         } else {

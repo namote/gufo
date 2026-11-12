@@ -1939,9 +1939,6 @@ std::vector<sampling::TokenLogprobs> TextRunnerPool::Request::Score(
   if (!*this) {
     throw std::logic_error("text runner request is empty");
   }
-  if (!impl_->decode_ready) {
-    throw std::logic_error("text runner cannot score before prefill completes");
-  }
   if (impl_->pending_selection.has_value() || !impl_->generated.empty() ||
       impl_->stopped) {
     throw std::logic_error("text runner can score only an undecoded prompt");
@@ -1953,18 +1950,19 @@ std::vector<sampling::TokenLogprobs> TextRunnerPool::Request::Score(
   if (tokens.size() - 1 > ReservedDecodeTokens()) {
     throw std::length_error("scored tokens exceed the reserved rows");
   }
-  // Join any capture still copying this state, then take the remaining
-  // prompt targets (fallback, stable prefix, complete prompt): each call
-  // captures the current one and advances to the next. Requests that score
-  // several answers to one prompt then restore its complete checkpoint.
-  for (int target = 0; target < 3; ++target)
+  // Join any capture still copying this state. A complete prompt then takes
+  // its remaining targets (fallback, stable prefix, complete prompt): each
+  // call captures the current one and advances to the next. A partly fed
+  // prompt is completed by the scoring passes themselves, so it keeps only
+  // what its prefill steps captured.
+  for (int target = 0; target < (impl_->decode_ready ? 3 : 1); ++target)
     impl_->CapturePromptSnapshot();
   // The scored tail is not prompt state: nothing may publish it.
   impl_->stopped = true;
   impl_->state_reusable = false;
   auto& state = dynamic_cast<TextRunnerState&>(impl_->lease.state());
   state.SetResidentRequests(1);
-  auto scored = impl_->runner->ScoreTokens(state, tokens);
+  auto scored = impl_->runner->ScoreTokens(state, impl_->prompt, tokens);
   if (scored.size() != tokens.size()) {
     throw std::runtime_error("text runner returned an invalid score count");
   }

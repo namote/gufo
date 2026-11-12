@@ -431,15 +431,17 @@ public:
   [[nodiscard]] std::uint32_t max_score_rows() const noexcept {
     return std::min(kScoreRows, options_.max_batch);
   }
-  /// A kPrefill Forward of `tokens` (at most max_score_rows()) that returns
-  /// the logits of every row: `rows` points at tokens.size() * vocab floats
-  /// in executor-owned pinned memory, valid until the next scoring pass. The
+  /// A kPrefill Forward of `tokens` (at most max_batch()) that returns the
+  /// logits of its last `logit_rows` rows (at most max_score_rows(), may be
+  /// zero): `rows` points at logit_rows * vocab floats in executor-owned
+  /// pinned memory, valid until the next scoring pass. The
   /// head output and its host copy are allocated on the first call (about
   /// 1 MB per row each) and are not part of DeferredScratchBytes, so serving
   /// budgets stay as they were for servers that never score. Teacher-forced
   /// scoring uses it; a packed pass of several sequences could reuse it.
   [[nodiscard]] bool ForwardScoreRows(Session& session,
                                       std::span<const std::int32_t> tokens,
+                                      std::uint32_t logit_rows,
                                       std::span<const float>* rows,
                                       std::string* error_msg) const;
 

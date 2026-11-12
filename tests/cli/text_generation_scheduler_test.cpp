@@ -105,6 +105,7 @@ enum class EventKind : std::uint8_t {
   kPrefill,
   kAdvance,
   kScore,
+  kScorePrompt,
 };
 
 struct Event {
@@ -530,13 +531,23 @@ public:
     };
   }
 
-  // Scores token t at -t/100 and records each scored token as an event.
+  // Feeds the rest of the prompt as one kScorePrompt event, then scores
+  // token t at -t/100 and records each scored token as an event.
   [[nodiscard]] std::vector<gufo::sampling::TokenLogprobs> ScoreTokens(
-      TextRunnerState& state,
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
       std::span<const TextRunnerToken> tokens) const override {
     auto& fake = RequireFakeState(state);
-    if (!fake.frontier.has_value())
-      throw std::logic_error("scheduler fake scores without a frontier");
+    if (prompt.empty() || fake.position > prompt.size())
+      throw std::logic_error("invalid scheduler fake scoring");
+    if (fake.position < prompt.size()) {
+      fake.label = prompt.front();
+      control_->Log({.kind = EventKind::kScorePrompt,
+                     .label = fake.label,
+                     .index = fake.position,
+                     .count = prompt.size() - fake.position});
+      fake.EnsureRows(prompt.size());
+      fake.position = prompt.size();
+    }
     std::vector<gufo::sampling::TokenLogprobs> scored;
     for (std::size_t index = 0; index < tokens.size(); ++index) {
       control_->Log({.kind = EventKind::kScore,
@@ -3608,11 +3619,52 @@ void TestScoringReturnsRawLogprobsWithoutDecoding() {
                            return event.kind == EventKind::kScore;
                          }) == 3,
            "each scored token is scored once");
+    Expect(std::none_of(events.begin(), events.end(),
+                        [](const Event& event) {
+                          return event.kind == EventKind::kPrefill &&
+                                 event.label == 1;
+                        }) &&
+               std::count_if(events.begin(), events.end(),
+                             [](const Event& event) {
+                               return event.kind == EventKind::kScorePrompt &&
+                                      event.label == 1 && event.index == 0 &&
+                                      event.count == 3;
+                             }) == 1,
+           "a short scoring prompt is fed by its scoring work unit");
     // The scored tail is never published: the same prompt prefills again
     // and decodes from its own frontier.
     const auto again = scheduler->Submit({1, 10, 11}, 2, 0.0F).Wait();
     Expect(again.tokens == ExpectedTokens(1, 2),
            "a later request does not continue the scored state");
+  }
+  {
+    // A long scoring prompt prefills in ordinary steps down to the tail
+    // its scoring work unit feeds.
+    auto control = std::make_shared<FakeControl>();
+    control->max_context = 4096;
+    auto scheduler = MakeScheduler(control, 1);
+    auto metadata = ClientMetadata("scorer");
+    metadata.score_tokens = {7, 8};
+    std::vector<TextRunnerToken> prompt(1500, 30);
+    prompt.front() = 3;
+    const auto scored =
+        scheduler->Submit(prompt, 0, 0.0F, {}, false, metadata).Wait();
+    Expect(scored.tokens == std::vector<gufo::tokenization::TokenId>{7, 8},
+           "a long scoring prompt still scores its tokens");
+    std::size_t prefilled = 0;
+    std::size_t fed = 0;
+    for (const auto& event : control->Events()) {
+      if (event.label != 3)
+        continue;
+      if (event.kind == EventKind::kPrefill)
+        prefilled += event.count;
+      else if (event.kind == EventKind::kScorePrompt) {
+        Expect(event.index == prefilled, "scoring continues the prefill");
+        fed += event.count;
+      }
+    }
+    Expect(prefilled == 1500 - 1024 && fed == 1024,
+           "a scoring prompt prefills only to its scored tail");
   }
   auto control = std::make_shared<FakeControl>();
   auto scheduler = MakeScheduler(control, 1);

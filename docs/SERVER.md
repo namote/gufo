@@ -1254,23 +1254,27 @@ or omitted. `stream`, `stop`, `tools`, `response_format`, images, `n > 1`,
 explicitly enabled thinking and a scored message with `reasoning_content` or
 `tool_calls` return 400.
 
-Execution: the prompt prefills as usual (prefix reuse applies). The scored
-tokens then pass through the model in prompt (prefill) passes of up to 256
-rows that return the logits of every row. A prefill pass streams the routed
+Execution: a prompt of at most 1024 unfed tokens (after any reused prefix)
+is not prefilled on its own. The scoring work unit feeds it together with
+the scored tokens in prompt (prefill) passes that return the logits of every
+row from the prompt's last row on, at most 256 logit rows per pass; a longer
+prompt first prefills in ordinary chunks, between other requests' work, down
+to its last 1024 tokens. A prefill pass streams the routed
 experts once for all its rows, so a pass costs about 0.2 s plus 0.8 ms per
 row, where verification passes cost about 4.5 ms per row at any width. Row
 r's logits score token r+1; the first token is scored on the prompt's last
 row. The rows therefore carry prompt arithmetic: they agree with the
 `logprobs` of a greedy generation (verification arithmetic) to numerical
 error, not bit for bit. Each pass downloads its logit rows (about 1 MB per
-row) and reduces them on the CPU as generated `logprobs` are. A 150-token
-answer costs one pass after the prompt, a 1024-token answer four or five (a
+row) and reduces them on the CPU as generated `logprobs` are. A short prompt
+and a 150-token answer cost one pass, a 1024-token answer four or five (a
 pass that another follows ends on a selection block), run as one
 work unit between other requests' decode rounds. The first scoring request
 allocates the 256-row head output and its pinned host copy (about 254 MB
-each); a server that never scores never allocates them. Only a prompt
-checkpoint may be retained in RAM, as with `cache_persist: false`; the scored
-tokens are never published to the continuation cache or written to disk.
+each); a server that never scores never allocates them. Only checkpoints of
+a prefilled prompt may be retained in RAM, as with `cache_persist: false`; a
+prompt fed with its scored tokens leaves none, and the scored tokens are
+never published to the continuation cache or written to disk.
 
 A server dedicated to scoring (for example SPSA training with
 `tools/qwen38_flash_next/abliteration/spsa.py`) does not need the production

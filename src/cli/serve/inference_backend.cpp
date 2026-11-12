@@ -3036,12 +3036,16 @@ public:
   }
 
   [[nodiscard]] std::vector<sampling::TokenLogprobs> ScoreTokens(
-      TextRunnerState& state,
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
       std::span<const TextRunnerToken> tokens) const override {
     auto& qfn = RequireQwenFlashNextState(state);
+    if (qfn.position() > prompt.size())
+      throw std::logic_error(
+          "Qwen3.8-Flash-Next scoring state is past its prompt");
     std::vector<sampling::TokenLogprobs> scored;
     std::string error;
-    if (!qfn.session().ScoreTokens(QwenFlashNextEngineTokens(tokens), &scored,
+    if (!qfn.session().ScorePrompt(QwenFlashNextEngineTokens(prompt),
+                                   QwenFlashNextEngineTokens(tokens), &scored,
                                    &error)) {
       qfn.set_position(0);
       throw std::runtime_error("Qwen3.8-Flash-Next scoring failed: " + error);
