@@ -40,15 +40,28 @@ import math
 from pathlib import Path
 import random
 import sys
+import time
+import urllib.error
 import urllib.request
 
 
-def post(base_url, body, timeout=600):
-    request = urllib.request.Request(base_url.rstrip('/') + '/v1/chat/completions',
-                                     json.dumps(body).encode(),
-                                     {'Content-Type': 'application/json'})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.load(response)
+def post(base_url, body, timeout=600, attempts=4):
+    """POST one request; a dropped connection or an unreadable reply is retried
+    (scoring is idempotent), an HTTP error status is not."""
+    data = json.dumps(body).encode()
+    for attempt in range(attempts):
+        request = urllib.request.Request(base_url.rstrip('/') + '/v1/chat/completions', data,
+                                         {'Content-Type': 'application/json'})
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.load(response)
+        except urllib.error.HTTPError:
+            raise
+        except (OSError, ValueError) as error:  # reset, broken pipe, truncated or empty body
+            if attempt + 1 == attempts:
+                raise
+            print(f'retrying a scoring request after: {error!r}', file=sys.stderr, flush=True)
+            time.sleep(0.5 * (attempt + 1))
 
 
 def score_body(model, prompt, answer, abliteration, answer_tokens=0):
