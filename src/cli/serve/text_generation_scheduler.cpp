@@ -1591,6 +1591,11 @@ struct TextGenerationScheduler::Impl {
     std::vector<TextRunnerToken> tokens(prompt.begin(), prompt.end());
     const auto committed = request->runner_request.Commit();
     request->result.cache_snapshot_bytes += committed.snapshot_bytes;
+    // Without its lease the request can guarantee no pool rows: drop the
+    // guarantee so RenewRows promotes a resident and the request is
+    // re-admitted as an ordinary borrower.
+    if (kv_guarantor.lock() == request)
+      kv_guarantor.reset();
     request->prompt = std::move(tokens);
     request->prompt_context = std::move(context);
     request->readmitting = true;
