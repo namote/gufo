@@ -22,6 +22,7 @@ add_qwen38_flash_next_test(exl3_loader gufo_qwen38_flash_next "cpu;exl3")
 
 add_qwen38_flash_next_test(config gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(abliteration gufo_qwen38_flash_next "cpu")
+add_qwen38_flash_next_test(dynamic_abliteration gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(continuation_layout gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(ngram gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(native gufo_qwen38_flash_next "cpu;exl3")

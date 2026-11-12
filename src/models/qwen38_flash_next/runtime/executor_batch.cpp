@@ -1098,6 +1098,10 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
   }
 
   const Scratch base = s_;
+  // Detectors score every row of the batch when any session detects; each
+  // detecting session keeps its own rows (as a single-session pass would).
+  const bool detect = std::ranges::any_of(
+      items, [&](const BatchItem& item) { return Detects(*item.session); });
   // Every exit restores the ordinary single-session scratch view. Enqueued
   // work is drained before a caller can reuse its pinned staging buffers.
   const auto body = [&]() -> bool {
@@ -1425,6 +1429,8 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
                           c.HcDim(), c.hc_count, c.rms_eps, stream_);
         }
       }
+      if (detect)
+        ScoreDetectors(il, base.res, 0, rows);
     }
     for (std::size_t i = 0; i < items.size(); ++i) {
       const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
@@ -1441,7 +1447,9 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
     UseScratch(base);
     return HcMixBatch(model_->hc_head(), base.res, false, base.mixed, nullptr,
                       rows, error) &&
-           DenseBatch(model_->output(), base.mixed, batch_logits_, rows, error);
+           DenseBatch(model_->output(), base.mixed, batch_logits_, rows,
+                      error) &&
+           (!detect || DownloadDetectorScores(rows, error));
   };
   bool ok = false;
   try {
@@ -1461,6 +1469,10 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
       cycle_diagnostics_.verify_rows += items[i].tokens.size();
     if (items[i].session->Cancelled())
       continue;
+    if (detect && Detects(*items[i].session))
+      KeepDetectorScores(*items[i].session, offsets[i],
+                         static_cast<std::uint32_t>(items[i].tokens.size()),
+                         items[i].session->position_, false);
     items[i].session->position_ += items[i].tokens.size();
     if (sparse[i]) {
       items[i].session->blocks_ = complete[i];

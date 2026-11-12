@@ -397,9 +397,106 @@ bool Executor::LoadAbliteration(AbliterationProfileSet profiles,
   if (!Check(hipMemcpy(data, table.data(), bytes, hipMemcpyHostToDevice),
              "abliteration directions upload", error))
     return false;
+  // Detectors: one direction row and score column per profile with a
+  // trigger, in load order.
+  std::vector<float> detector_table;
+  std::vector<Detector> detectors;
+  for (const auto& profile : profiles)
+    if (profile->trigger) {
+      if (profile->trigger->direction.size() != config().hidden_size ||
+          profile->trigger->layer >= config().num_layers) {
+        AssignError(error, "invalid abliteration trigger");
+        return false;
+      }
+      detector_table.insert(detector_table.end(),
+                            profile->trigger->direction.begin(),
+                            profile->trigger->direction.end());
+      detectors.push_back({profile->trigger->layer, profile->name});
+    }
+  if (!detectors.empty()) {
+    void* directions = nullptr;
+    void* scores = nullptr;
+    void* host = nullptr;
+    const auto score_bytes =
+        std::size_t{options_.max_batch} * kDetectorColumns * sizeof(float);
+    if (!Check(hip::AllocateDevice(&directions,
+                                   detector_table.size() * sizeof(float)),
+               "abliteration detectors", error))
+      return false;
+    allocations_.push_back(directions);
+    if (!Check(hip::AllocateDevice(&scores, score_bytes),
+               "abliteration detector scores", error))
+      return false;
+    allocations_.push_back(scores);
+    if (!Check(host_allocations_.Allocate(&host, score_bytes),
+               "pinned abliteration detector scores", error))
+      return false;
+    if (!Check(hipMemcpy(directions, detector_table.data(),
+                         detector_table.size() * sizeof(float),
+                         hipMemcpyHostToDevice),
+               "abliteration detectors upload", error) ||
+        !Check(hipMemset(scores, 0, score_bytes),
+               "abliteration detector scores", error))
+      return false;
+    detector_directions_ = static_cast<float*>(directions);
+    detector_scores_ = static_cast<float*>(scores);
+    detector_scores_host_ = static_cast<float*>(host);
+  }
   abliteration_ = std::move(profiles);
   abliteration_rows_ = std::move(offsets);
+  detectors_ = std::move(detectors);
   return true;
+}
+
+std::optional<std::uint32_t> Executor::DetectorColumn(
+    std::string_view name) const {
+  for (std::size_t i = 0; i < detectors_.size(); ++i)
+    if (detectors_[i].profile == name)
+      return static_cast<std::uint32_t>(i);
+  return std::nullopt;
+}
+
+void Executor::ScoreDetectors(std::uint32_t layer, const float* res,
+                              std::uint32_t first, std::uint32_t rows) const {
+  std::array<std::uint32_t, kDetectorColumns> ids{};
+  std::size_t count = 0;
+  for (std::size_t i = 0; i < detectors_.size(); ++i)
+    if (detectors_[i].layer == layer)
+      ids[count++] = static_cast<std::uint32_t>(i);
+  if (count == 0)
+    return;
+  // The detector index is its score column.
+  const auto list = std::span<const std::uint32_t>(ids.data(), count);
+  // The residual must hold every HC stream's final value, as the collector
+  // reads it (a deferred update is settled first).
+  ApplyPendingResidual();
+  AbliterationDetectorScores(
+      res, detector_directions_, list, list,
+      detector_scores_ + std::size_t{first} * kDetectorColumns,
+      kDetectorColumns, rows, config().hidden_size, config().hc_count, stream_);
+}
+
+bool Executor::DownloadDetectorScores(std::uint32_t rows,
+                                      std::string* error) const {
+  return Check(
+      hipMemcpyAsync(detector_scores_host_, detector_scores_,
+                     std::size_t{rows} * kDetectorColumns * sizeof(float),
+                     hipMemcpyDeviceToHost, stream_),
+      "detector scores download", error);
+}
+
+void Executor::KeepDetectorScores(Session& session, std::uint32_t first_row,
+                                  std::uint32_t rows,
+                                  std::uint32_t first_position,
+                                  bool prefill) const {
+  const float* begin =
+      detector_scores_host_ + std::size_t{first_row} * kDetectorColumns;
+  session.detect_scores_.assign(begin,
+                                begin + std::size_t{rows} * kDetectorColumns);
+  session.detect_first_ = first_position;
+  session.detect_rows_ = rows;
+  session.detect_prefill_ = prefill;
+  session.detect_pass_ = ++detector_passes_;
 }
 
 const qwen::AbliterationProfile* Executor::FindAbliteration(

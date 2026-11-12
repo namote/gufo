@@ -254,7 +254,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
                             (static_cast<std::uint64_t>(speculative) << 32) |
                             (static_cast<std::uint64_t>(sparse) << 33) |
                             (std::uint64_t{logits != nullptr} << 34) |
-                            (std::uint64_t{score_pass_} << 36);
+                            (std::uint64_t{score_pass_} << 36) |
+                            (std::uint64_t{Detects(session)} << 38);
   // PLE first consumes the disk rows at its injection layer. Queue the
   // preceding layers before waiting, including on captured graph replay.
   // Both pieces use the same stream and arithmetic as the unsplit graph.
@@ -286,6 +287,13 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   if (n_logits > 0 && logits != nullptr) {
     std::copy_n(logits_host_, static_cast<std::size_t>(n_logits) * c.vocab_size,
                 logits);
+  }
+  // The pass downloaded its detector scores with its logits: a prefill pass
+  // scores its last row, any other pass every row.
+  if (Detects(session)) {
+    const bool prefill = mode == ForwardMode::kPrefill;
+    KeepDetectorScores(session, 0, prefill ? 1 : n,
+                       prefill ? start_pos + n - 1 : start_pos, prefill);
   }
 
   session.position_ += n;
@@ -422,6 +430,12 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                            bool embeddings_ready) const {
   const Config& c = config();
   exl3_res_pending_ = {};  // only a failed earlier pass can leave one
+  // Dynamic-abliteration detectors read the residual exactly where the
+  // collector does (the observer below): after the layer's last combine and
+  // any residual projection, the last row of a prefill pass, every row
+  // otherwise.
+  const bool detect = Detects(session);
+  const std::uint32_t detect_rows = prefill_phase ? 1 : n;
   if (first_layer == 0) {
     if (!Check(hipMemcpyAsync(session.control_, control_host_,
                               sizeof(Session::Control), hipMemcpyHostToDevice,
@@ -575,6 +589,9 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
         return false;
       session.activation_observer_(il, row);
     }
+    if (detect)
+      ScoreDetectors(il, s_.res + std::size_t{n - detect_rows} * c.HcDim(), 0,
+                     detect_rows);
     normed = next_norm != nullptr;
   }
   // Every layer's FFN combine consumes its deferred update; never leave one
@@ -639,7 +656,9 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       return false;
     }
   }
-  return true;
+  // On the same stream as the logits: the pass's own synchronization
+  // covers it.
+  return !detect || DownloadDetectorScores(detect_rows, error_msg);
 }
 
 bool Executor::CommitPendingSpeculation(Session& session,

@@ -80,6 +80,63 @@ void AbliterateRows(float* output, const float* directions,
   AbliterateBatchRows(output, directions, std::span(&span, 1), layer, mlp,
                       layers, rows, hidden, stream);
 }
+namespace {
+struct DetectorList {
+  std::array<std::uint32_t, qwen::kAbliterationMaxProfiles> detector;
+  std::array<std::uint32_t, qwen::kAbliterationMaxProfiles> column;
+};
+// One block per (row, detector): the HC-stream mean's dot with the detector
+// direction, as the sum over streams of each stream's dot divided by the
+// stream count.
+__global__ void DetectorScores(const float* __restrict__ res,
+                               const float* __restrict__ directions,
+                               DetectorList list, float* __restrict__ scores,
+                               std::uint32_t stride, std::uint32_t hidden,
+                               std::uint32_t streams) {
+  constexpr unsigned kThreads = qwen::hip_detail::kAbliterationRowThreads;
+  __shared__ float partial[kThreads];
+  const std::uint32_t row = blockIdx.x;
+  const std::uint32_t which = blockIdx.y;
+  const float* direction =
+      directions + std::size_t{list.detector[which]} * hidden;
+  const float* x = res + std::size_t{row} * streams * hidden;
+  float sum = 0;
+  for (std::uint32_t s = 0; s < streams; ++s)
+    for (std::uint32_t i = threadIdx.x; i < hidden; i += kThreads)
+      sum += x[std::size_t{s} * hidden + i] * direction[i];
+  partial[threadIdx.x] = sum;
+  __syncthreads();
+  for (unsigned step = kThreads / 2; step; step >>= 1) {
+    if (threadIdx.x < step)
+      partial[threadIdx.x] += partial[threadIdx.x + step];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0)
+    scores[std::size_t{row} * stride + list.column[which]] =
+        partial[0] / static_cast<float>(streams);
+}
+}  // namespace
+
+void AbliterationDetectorScores(const float* res, const float* directions,
+                                std::span<const std::uint32_t> detectors,
+                                std::span<const std::uint32_t> columns,
+                                float* scores, std::uint32_t stride,
+                                std::uint32_t rows, std::uint32_t hidden,
+                                std::uint32_t streams, hipStream_t stream) {
+  if (detectors.size() != columns.size() ||
+      detectors.size() > qwen::kAbliterationMaxProfiles || streams == 0)
+    throw std::invalid_argument("invalid abliteration detector list");
+  if (!rows || detectors.empty())
+    return;
+  DetectorList list{};
+  std::ranges::copy(detectors, list.detector.begin());
+  std::ranges::copy(columns, list.column.begin());
+  hipLaunchKernelGGL(DetectorScores,
+                     dim3(rows, static_cast<unsigned>(detectors.size())),
+                     dim3(qwen::hip_detail::kAbliterationRowThreads), 0, stream,
+                     res, directions, list, scores, stride, hidden, streams);
+}
+
 void AbliterateResidualBatchRows(float* res, const float* directions,
                                  std::span<const AbliterationSpan> spans,
                                  std::uint32_t layer, std::uint32_t layers,

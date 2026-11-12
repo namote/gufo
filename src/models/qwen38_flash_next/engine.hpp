@@ -22,6 +22,7 @@
 #include "src/models/qwen38_flash_next/abliteration.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
+#include "src/models/qwen38_flash_next/dynamic_abliteration.hpp"
 #include "src/models/qwen38_flash_next/hc_mode.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
@@ -121,6 +122,10 @@ public:
   [[nodiscard]] std::span<
       const std::shared_ptr<const qwen::AbliterationProfile>>
   AbliterationProfiles() const;
+  /// A request's detection state over every profile with a `trigger`
+  /// (Session::ConfigureDynamicAbliteration); null when none is loaded.
+  [[nodiscard]] std::shared_ptr<DynamicAbliteration> StartDynamicAbliteration()
+      const;
   [[nodiscard]] std::string ArtifactIdentity() const;
   /// Test statistic: batched MTP catch-ups whose cohort mixed two or more
   /// KV-only sessions with proposing ones (counted when received; models
@@ -176,6 +181,8 @@ private:
   std::unique_ptr<rocm::Executor> executor_;
   std::shared_ptr<qwen::vision::Encoder> vision_;
   MtpBatchController batch_policy_;
+  /// One per loaded profile with a `trigger`, its defaults as ON settings.
+  std::vector<DynamicAbliterationCandidate> dynamic_candidates_;
   /// MTP drafts may use the small head (draft_vocab.hpp).
   bool draft_subset_{false};
   /// Special tokens at the start of every session's draft table.
@@ -331,6 +338,16 @@ public:
       std::shared_ptr<const AbliterationSettings> settings);
   /// The session's effective settings while abliteration is ON, else null.
   [[nodiscard]] const AbliterationSettings* ActiveAbliteration() const;
+  /// Dynamic abliteration (R2 A1) for the request that follows; null turns
+  /// detection off. The session must be OFF. Its trunk passes then score the
+  /// loaded detectors; before each decode pass (Evaluate, DecodeStep and the
+  /// batched forms) the rows committed so far are checked, and the first
+  /// crossing profile turns ON for every later pass without resetting the
+  /// computed tokens (ActiveAbliteration then carries `dynamic_from`).
+  void ConfigureDynamicAbliteration(std::shared_ptr<DynamicAbliteration> state);
+  /// The request's detection report after its last pass; empty without
+  /// dynamic detection.
+  [[nodiscard]] std::optional<DynamicAbliterationReport> DynamicReport();
   [[nodiscard]] std::vector<std::uint8_t> ContinuationIdentity(
       std::size_t tokens) const;
   using ActivationObserver =
@@ -499,6 +516,10 @@ private:
       std::size_t token_count) const;
   bool valid_{true};
   ContinuationHooks* continuation_hooks_{nullptr};
+  std::shared_ptr<DynamicAbliteration> dynamic_;
+  /// Before a trunk decode pass: observes the committed rows and turns the
+  /// chosen profile ON.
+  void ApplyDynamicAbliteration();
   /// This request's draft vocabulary; the device table follows it.
   MtpDraftVocab draft_vocab_;
   bool draft_vocab_stale_{false};

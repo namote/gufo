@@ -291,6 +291,13 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
         !profiles.empty() &&
         !m->executor_->LoadAbliteration(std::move(profiles), error_msg))
       return nullptr;
+    // Each dynamic profile turns ON with its defaults.
+    for (const auto& profile : m->executor_->AbliterationProfiles())
+      if (profile->trigger)
+        m->dynamic_candidates_.push_back(
+            {profile->name, *m->executor_->DetectorColumn(profile->name),
+             profile->trigger->threshold,
+             ResolveAbliterationSettings(*profile)});
     qwen::ValidateNativeSources(*m->reader_);
     if (m->mtp_reader_)
       qwen::ValidateNativeSources(*m->mtp_reader_);
@@ -554,6 +561,12 @@ Model::AbliterationProfiles() const {
   return executor_->AbliterationProfiles();
 }
 
+std::shared_ptr<DynamicAbliteration> Model::StartDynamicAbliteration() const {
+  return dynamic_candidates_.empty()
+             ? nullptr
+             : std::make_shared<DynamicAbliteration>(dynamic_candidates_);
+}
+
 void Session::SetActivationObserver(ActivationObserver observer) {
   session_->SetActivationObserver(std::move(observer));
 }
@@ -597,10 +610,43 @@ const AbliterationSettings* Session::ActiveAbliteration() const {
   return session_->Abliteration();
 }
 
+void Session::ConfigureDynamicAbliteration(
+    std::shared_ptr<DynamicAbliteration> state) {
+  if (state && session_->Abliteration())
+    throw std::logic_error(
+        "dynamic abliteration starts on a session that is OFF");
+  dynamic_ = std::move(state);
+  session_->SetDetection(dynamic_ != nullptr);
+}
+
+void Session::ApplyDynamicAbliteration() {
+  if (!dynamic_ || dynamic_->engaged())
+    return;
+  const auto committed = static_cast<std::uint32_t>(tokens_.size());
+  dynamic_->Observe(session_->DetectorScores(), committed);
+  auto settings = dynamic_->Engage(committed);
+  if (!settings)
+    return;
+  // A1: the committed tokens keep their OFF state (no reset); every later
+  // trunk pass projects. Detection stops: one profile at a time, sticky.
+  session_->SetDetection(false);
+  session_->ConfigureAbliteration(std::move(settings));
+}
+
+std::optional<DynamicAbliterationReport> Session::DynamicReport() {
+  if (!dynamic_)
+    return std::nullopt;
+  if (!dynamic_->engaged())
+    dynamic_->Observe(session_->DetectorScores(),
+                      static_cast<std::uint32_t>(tokens_.size()));
+  return dynamic_->Report();
+}
+
 std::vector<std::uint8_t> Session::ContinuationIdentity(
     std::size_t tokens) const {
   const auto image = ImageIdentity(tokens);
-  const auto* settings = ActiveAbliteration();
+  // Up to a dynamic profile's switch point the tokens were computed OFF.
+  const auto* settings = session_->AbliterationFor(tokens);
   return settings ? AbliterationInputIdentity(image, settings->identity)
                   : std::vector<std::uint8_t>(image.begin(), image.end());
 }
@@ -668,7 +714,7 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshotImpl(
       .draft_policy = draft_length_.State(),
       .image_identity_bytes = static_cast<std::uint32_t>(identity.size()),
       .policy_concurrency = model_->DecodeConcurrency(),
-      .reserved = state.AbliterationEnabled() ? 1u : 0u,
+      .reserved = state.AbliterationFor(token_count) ? 1u : 0u,
       .lookup = lookup_.Save(),
   };
   std::memcpy(out, &header, sizeof(header));
@@ -1138,6 +1184,7 @@ bool Session::Evaluate(std::int32_t token, std::string* error_msg) {
                 "session needs a successful Sync after a failed operation");
     return false;
   }
+  ApplyDynamicAbliteration();
   if (tokens_.size() >= ContextSize()) {
     AssignError(error_msg, "session context is full");
     return false;
@@ -2018,6 +2065,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
                 "session needs a successful Sync after a failed operation");
     return false;
   }
+  ApplyDynamicAbliteration();
   valid_ = false;
   const DecodeRequest request{this, max_tokens, &sampler, result, stop_at_eos};
   PendingDecode pending;
@@ -2213,6 +2261,9 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
     return r.outcome->completed;
   }
   auto& exec = *requests.front().session->model_->executor_;
+  // Before any of this cycle's trunk work, as DecodeStep does.
+  for (const auto& r : requests)
+    r.session->ApplyDynamicAbliteration();
   std::optional<std::uint32_t> batch_drafts;
   std::uint32_t batch_context = 0;
   auto& policy = requests.front().session->model_->batch_policy_;
@@ -2391,6 +2442,8 @@ bool Session::EvaluateBatchImpl(std::span<const AdvanceRequest> requests,
     return r.outcome->completed;
   }
   auto& exec = *requests.front().session->model_->executor_;
+  for (const auto& r : requests)
+    r.session->ApplyDynamicAbliteration();
   if (!DraftCatchUpBatch(requests, error_msg))
     return false;
   std::vector<rocm::Executor::BatchItem> items;

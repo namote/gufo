@@ -449,6 +449,29 @@ std::shared_ptr<const AbliterationSettings> ResolveAbliterationSettings(
   return result;
 }
 
+std::shared_ptr<const AbliterationSettings> DynamicAbliterationSettings(
+    const AbliterationSettings& base, std::uint32_t position) {
+  if (base.dynamic_from)
+    throw std::logic_error("abliteration settings are already dynamic");
+  auto result = std::make_shared<AbliterationSettings>(base);
+  result->dynamic_from = position;
+  crypto::Sha256Hasher hash;
+  const std::string prefix =
+      "gufo-abliteration-dynamic-v1:" + base.identity + ":";
+  hash.Update(std::span(reinterpret_cast<const std::uint8_t*>(prefix.data()),
+                        prefix.size()));
+  AppendU32(hash, position);
+  result->identity = hash.FinishHex();
+  return result;
+}
+
+const AbliterationSettings* AbliterationForState(
+    const AbliterationSettings* active, std::size_t tokens) noexcept {
+  if (active && active->dynamic_from && tokens <= *active->dynamic_from)
+    return nullptr;
+  return active;
+}
+
 bool AbliterationSettingsFit(const AbliterationProfile& profile,
                              const AbliterationSettings& settings) noexcept {
   return settings.attention.size() == profile.layers &&

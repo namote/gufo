@@ -14,8 +14,10 @@
 #include <initializer_list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -28,6 +30,7 @@
 #include "src/models/qwen/vision/device_input.hpp"
 #include "src/models/qwen38_flash_next/abliteration.hpp"
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
+#include "src/models/qwen38_flash_next/dynamic_abliteration.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/exl3_moe.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
@@ -151,6 +154,27 @@ public:
   [[nodiscard]] const qwen::AbliterationSettings* Abliteration() const {
     return abliteration_.get();
   }
+  /// The settings that computed this session's first `tokens` tokens: null
+  /// for OFF, also before a dynamic profile's switch point
+  /// (qwen::AbliterationForState).
+  [[nodiscard]] const qwen::AbliterationSettings* AbliterationFor(
+      std::size_t tokens) const noexcept {
+    return qwen::AbliterationForState(abliteration_.get(), tokens);
+  }
+  /// Dynamic abliteration (R2): while set and OFF, this session's trunk
+  /// passes score the loaded detectors (Executor::Detects) and keep the last
+  /// pass's rows (DetectorScores). Either call drops the kept rows.
+  void SetDetection(bool on) {
+    detect_ = on;
+    detect_rows_ = 0;
+  }
+  /// The last scored pass; `id` 0 before any.
+  [[nodiscard]] DetectorPass DetectorScores() const {
+    return {detect_rows_ ? detect_pass_ : 0, detect_first_, detect_rows_,
+            detect_prefill_,
+            std::span<const float>(detect_scores_)
+                .first(std::size_t{detect_rows_} * kDetectorColumns)};
+  }
   /// Standalone collection only: called on the last row after each target
   /// layer.
   using ActivationObserver =
@@ -272,6 +296,13 @@ private:
   /// qwen::AbliterationDeviceWords floats, allocated when first turned ON
   /// and kept (graph arguments point at it). Shared with checkpoint views.
   std::shared_ptr<float> abliteration_device_;
+  /// SetDetection and the last scored pass (DetectorPass).
+  bool detect_{false};
+  std::vector<float> detect_scores_;
+  std::uint32_t detect_first_{0};
+  std::uint32_t detect_rows_{0};
+  bool detect_prefill_{false};
+  std::uint64_t detect_pass_{0};
   ActivationObserver activation_observer_;
   std::uint32_t index_capacity_{0};  ///< power-of-two raw indexer ring rows
   std::uint32_t position_{0};
@@ -375,6 +406,13 @@ public:
       std::string_view name) const;
   /// The first direction row of the loaded profile `name`.
   [[nodiscard]] std::uint32_t AbliterationRow(std::string_view name) const;
+  /// The score column of profile `name`'s detector; empty for a profile
+  /// without `trigger`.
+  [[nodiscard]] std::optional<std::uint32_t> DetectorColumn(
+      std::string_view name) const;
+  [[nodiscard]] bool HasDetectors() const noexcept {
+    return !detectors_.empty();
+  }
   Executor(const Executor&) = delete;
   Executor& operator=(const Executor&) = delete;
 
@@ -738,6 +776,38 @@ private:
   AbliterationProfileSet abliteration_;
   /// First row of each profile in abliteration_directions_.
   std::vector<std::uint32_t> abliteration_rows_;
+  /// Dynamic-abliteration detectors (profiles with `trigger`): detector i
+  /// reads layer detectors_[i].layer, direction row i of
+  /// detector_directions_, and writes score column i.
+  struct Detector {
+    std::uint32_t layer;
+    std::string profile;
+  };
+  std::vector<Detector> detectors_;
+  float* detector_directions_{nullptr};
+  /// [max_batch][kDetectorColumns] scores of the last pass, and its pinned
+  /// host copy (downloaded with the pass's logits, no extra sync).
+  float* detector_scores_{nullptr};
+  float* detector_scores_host_{nullptr};
+  mutable std::uint64_t detector_passes_{0};
+  /// Whether `session`'s passes score detectors now: detection set, OFF,
+  /// detectors loaded and not a scoring pass.
+  [[nodiscard]] bool Detects(const Session& session) const noexcept {
+    return session.detect_ && !session.abliteration_ && !detectors_.empty() &&
+           !score_pass_;
+  }
+  /// Launches the detectors of `layer` on `rows` residual rows at `res`,
+  /// writing score rows [first, first + rows).
+  void ScoreDetectors(std::uint32_t layer, const float* res,
+                      std::uint32_t first, std::uint32_t rows) const;
+  /// Queues the download of score rows [0, rows) (with the pass's logits).
+  [[nodiscard]] bool DownloadDetectorScores(std::uint32_t rows,
+                                            std::string* error) const;
+  /// After the pass synchronized: keeps score rows [first_row, first_row +
+  /// rows) as `session`'s last pass, row 0 at token `first_position`.
+  void KeepDetectorScores(Session& session, std::uint32_t first_row,
+                          std::uint32_t rows, std::uint32_t first_position,
+                          bool prefill) const;
   /// Every profile direction, [rows][hidden], uploaded once at load.
   float* abliteration_directions_{nullptr};
   /// One writer's projection site: the session's device settings (null OFF).

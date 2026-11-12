@@ -187,6 +187,10 @@ struct AbliterationSettings {
   /// Post-layer residual strengths: r -= s * d * dot(d, r) at the point the
   /// collectors read the directions, so s = 1 zeroes that component there.
   std::vector<float> residual;
+  /// Set on settings a dynamic profile turned ON in the middle of a request
+  /// (DynamicAbliterationSettings): the session's first this-many tokens were
+  /// computed OFF, so a state of at most this many tokens is an OFF state.
+  std::optional<std::uint32_t> dynamic_from;
   /// 64 lowercase hex characters: SHA-256 over the profile identity, the
   /// direction layer, the exact float bytes of `attention`, `mlp` and
   /// `residual`, the direction kind, count and norm preservation
@@ -255,6 +259,20 @@ struct AbliterationOverrides {
 std::shared_ptr<const AbliterationSettings> ResolveAbliterationSettings(
     const AbliterationProfile& profile,
     const AbliterationOverrides& overrides = {});
+
+/// `base` turned ON by a detector at `position` (R2 A1): the same
+/// projection, `dynamic_from` = position and an identity salted with the
+/// position (gufo-abliteration-dynamic-v1), so a state that mixes OFF and ON
+/// tokens never matches an explicit ON request, another switch point or
+/// OFF. States of at most `position` tokens are OFF states
+/// (AbliterationForState).
+std::shared_ptr<const AbliterationSettings> DynamicAbliterationSettings(
+    const AbliterationSettings& base, std::uint32_t position);
+/// The settings that computed a state of `tokens` tokens of a session whose
+/// active settings are `active`: null for OFF, and for a dynamic switch at
+/// or after `tokens`.
+[[nodiscard]] const AbliterationSettings* AbliterationForState(
+    const AbliterationSettings* active, std::size_t tokens) noexcept;
 
 /// Whether `settings` index only `profile`'s layers and direction rows.
 [[nodiscard]] bool AbliterationSettingsFit(

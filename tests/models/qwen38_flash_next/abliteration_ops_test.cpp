@@ -351,7 +351,60 @@ void SubspaceStreams() {
     }
 }
 
+// Dynamic-abliteration detector scores (R2): the HC-stream mean's dot with
+// each listed detector direction, into its own column of each row, against
+// an FP64 reference; unlisted columns stay untouched.
+void DetectorScores() {
+  for (unsigned hidden : {3u, 257u, 2560u}) {
+    constexpr unsigned kStreams = 4, kRows = 5, kStride = 8;
+    std::vector<float> directions(3 * hidden);
+    for (unsigned d = 0; d < 3; ++d) {
+      double norm = 0;
+      for (unsigned j = 0; j < hidden; ++j) {
+        directions[d * hidden + j] = std::sin(float((d + 1) * (j + 1)));
+        norm += double(directions[d * hidden + j]) * directions[d * hidden + j];
+      }
+      for (unsigned j = 0; j < hidden; ++j)
+        directions[d * hidden + j] /= std::sqrt(norm);
+    }
+    std::vector<float> res(kRows * kStreams * hidden);
+    for (unsigned i = 0; i < res.size(); ++i)
+      res[i] = std::cos(float(i) * .37f) * (1.f + float(i % 7));
+    float* dev_d = Upload(directions);
+    float* dev_res = Upload(res);
+    float* dev_scores = Upload(std::vector<float>(kRows * kStride, -7.f));
+    // Detectors 2 and 0 into columns 2 and 0; column 1 stays -7.
+    const std::array<std::uint32_t, 2> list{2, 0};
+    q::AbliterationDetectorScores(dev_res, dev_d, list, list, dev_scores,
+                                  kStride, kRows, hidden, kStreams, nullptr);
+    std::vector<float> scores(kRows * kStride);
+    Check(hipMemcpy(scores.data(), dev_scores, scores.size() * sizeof(float),
+                    hipMemcpyDeviceToHost));
+    for (unsigned r = 0; r < kRows; ++r)
+      for (unsigned d = 0; d < 3; ++d) {
+        // FP32 accumulation: bound the error by the terms' magnitude.
+        double mean_dot = 0, magnitude = 0;
+        for (unsigned s = 0; s < kStreams; ++s)
+          for (unsigned j = 0; j < hidden; ++j) {
+            const double term = double(res[(r * kStreams + s) * hidden + j]) *
+                                directions[d * hidden + j];
+            mean_dot += term;
+            magnitude += std::abs(term);
+          }
+        mean_dot /= kStreams;
+        const float got = scores[r * kStride + d];
+        if (d == 1 ? got != -7.f
+                   : !(std::abs(got - mean_dot) <= 1e-6 * (1 + magnitude)))
+          throw std::runtime_error("detector score mismatch");
+      }
+    Check(hipFree(dev_d));
+    Check(hipFree(dev_res));
+    Check(hipFree(dev_scores));
+  }
+}
+
 int main() {
+  DetectorScores();
   for (unsigned hidden : {3u, 255u, 256u, 257u, 2560u}) {
     // Row 1 is the session's direction; row 0 must never be read.
     std::vector<float> directions(2 * hidden, 1e30f);

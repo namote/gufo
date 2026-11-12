@@ -759,9 +759,10 @@ cache::Completion ContinuationAdapter::CapturePrivatePiece(
     metadata.lookup = session.lookup_.Save();
     const auto identity = session.ImageIdentity(native.position_);
     metadata.image_bytes = static_cast<std::uint32_t>(identity.size());
-    // The captured state's own mode: a prefill checkpoint view copies it.
-    const auto record =
-        RecordAbliterationContinuation(identity, native.Abliteration());
+    // The captured state's own mode: a prefill checkpoint view copies it. A
+    // dynamic profile's state up to its switch point is an OFF state.
+    const auto record = RecordAbliterationContinuation(
+        identity, native.AbliterationFor(native.position_));
     metadata.image = record.image;
     metadata.abliteration = record.mode;
     std::memcpy(host_metadata.data(), &metadata, sizeof(metadata));

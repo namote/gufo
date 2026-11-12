@@ -58,6 +58,20 @@ void AbliterateResidualBatchRows(float* res, const float* directions,
                                  std::uint32_t tokens, std::uint32_t hidden,
                                  std::uint32_t streams, hipStream_t stream);
 
+/// Dynamic-abliteration detector scores (R2): for each of `rows` token rows
+/// of the post-layer residual `res` ([tokens][streams][hidden]) and each
+/// listed detector d, scores[row * stride + column] = mean over the HC
+/// streams of dot(stream row, direction d), which equals dot(stream mean,
+/// d): the collector's readout. `columns[i]` is detector `detectors[i]`'s
+/// output column; at most kAbliterationMaxProfiles detectors. FP32 sums with
+/// a fixed tree reduction (deterministic).
+void AbliterationDetectorScores(const float* res, const float* directions,
+                                std::span<const std::uint32_t> detectors,
+                                std::span<const std::uint32_t> columns,
+                                float* scores, std::uint32_t stride,
+                                std::uint32_t rows, std::uint32_t hidden,
+                                std::uint32_t streams, hipStream_t stream);
+
 struct Exl3RouteTile;  // exl3_moe.hpp
 
 /// A four-lane combine's residual update left out of res (HcCombine

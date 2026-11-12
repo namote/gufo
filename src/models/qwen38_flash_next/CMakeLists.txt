@@ -2,6 +2,7 @@
 # only by explicit validation targets, not by production or routine checks.
 add_library(gufo_qwen38_flash_next STATIC
   abliteration.cpp
+  dynamic_abliteration.cpp
   exl3_hc_q8.cpp
   exl3_ngram.cpp
   exl3_weights.cpp
