@@ -3435,25 +3435,41 @@ std::optional<HttpResponse> ParseAbliterationControl(
   const auto* enabled = value->find("enabled");
   if (!enabled || !enabled->is_bool())
     return invalid("'abliteration.enabled' must be a boolean");
-  if (const auto* profile = value->find("profile");
-      profile && (!profile->is_string() || profile->str() != "default"))
-    return invalid("only abliteration profile 'default' is registered");
+  const auto* profile = value->find("profile");
+  if (profile && !profile->is_string())
+    return invalid("'abliteration.profile' must be a string");
   if (!enabled->as_bool()) {
-    if (overrides)
+    if (overrides || profile)
       return invalid(
-          "'abliteration.direction_layer', 'attention', 'mlp', "
+          "'abliteration.profile', 'direction_layer', 'attention', 'mlp', "
           "'residual', 'direction_kind', 'directions' and 'preserve_norm' "
           "need 'enabled': true");
+    // Explicit OFF: no projection and no dynamic detection.
     chat->abliteration = false;
+    chat->abliteration_specified = true;
     chat->abliteration_overrides = {};
     return {};
   }
-  const auto info = backend.abliteration_info();
-  if (!info)
+  const auto profiles = backend.abliteration_profiles();
+  if (profiles.empty())
     return invalid(
         "abliteration profile is not loaded or backend is unsupported");
+  const std::string name = profile ? profile->str() : std::string{};
+  const auto info = backend.abliteration_profile(name);
+  if (!info) {
+    std::string loaded;
+    for (const auto& item : profiles)
+      loaded += (loaded.empty() ? "'" : ", '") + item.name + "'";
+    return invalid(name.empty()
+                       ? "name one of the loaded abliteration profiles in "
+                         "'abliteration.profile': " +
+                             loaded
+                       : "unknown abliteration profile '" + name +
+                             "'; loaded: " + loaded);
+  }
   const auto layers = info->layers;
   models::qwen::AbliterationOverrides parsed;
+  parsed.profile = info->name;
   if (const auto* layer = value->find("direction_layer")) {
     if (!info->direction_layer)
       return invalid(
@@ -3529,6 +3545,7 @@ std::optional<HttpResponse> ParseAbliterationControl(
     parsed.preserve_norm = preserve->as_bool();
   }
   chat->abliteration = true;
+  chat->abliteration_specified = true;
   chat->abliteration_overrides = std::move(parsed);
   return {};
 }

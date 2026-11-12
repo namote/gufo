@@ -581,7 +581,8 @@ void TestLlamaProps() {
   // A loaded abliteration profile: geometry and defaults, no vectors.
   assert(!named.contains("abliteration"));
   server.backend->abliteration =
-      AbliterationInfo{.schema = "gufo-abliteration-v2",
+      AbliterationInfo{.name = "pol",
+                       .schema = "gufo-abliteration-v2",
                        .identity = std::string(64, 'b'),
                        .layers = 3,
                        .direction_layer = 2,
@@ -592,6 +593,11 @@ void TestLlamaProps() {
   const auto* abliteration = ablated.find("abliteration");
   assert(abliteration != nullptr);
   assert(abliteration->member_str("schema") == "gufo-abliteration-v2");
+  assert(abliteration->member_str("profile") == "pol");
+  assert(abliteration->find("trigger")->is_null());
+  assert(abliteration->find("profiles")->size() == 1);
+  assert(abliteration->find("profiles")->items()[0].member_str("identity") ==
+         std::string(64, 'b'));
   assert(abliteration->member_size("layers") == 3);
   assert(abliteration->member_size("direction_layer") == 2);
   assert(abliteration->find("direction_layers")->size() == 3);
@@ -627,6 +633,27 @@ void TestLlamaProps() {
   const auto v1 = props("/props")["abliteration"];
   assert(v1.find("direction_layer")->is_null());
   assert(v1.find("direction_layers")->empty());
+  // Several profiles: only the list, each with its detector or null.
+  server.backend->more_abliteration = {
+      AbliterationInfo{.name = "fnx",
+                       .schema = "gufo-abliteration-v2",
+                       .identity = std::string(64, 'c'),
+                       .layers = 3,
+                       .direction_layer = 0,
+                       .attention = {0, 0, 0},
+                       .mlp = {0, 0, 0},
+                       .residual = {1, 1, 1},
+                       .trigger_layer = 2,
+                       .trigger_threshold = 1.25F}};
+  const auto both = props("/props")["abliteration"];
+  assert(!both.contains("profile") && !both.contains("schema"));
+  const auto& listed = both.find("profiles")->items();
+  assert(listed.size() == 2);
+  assert(listed[0].member_str("profile") == "pol");
+  assert(listed[0].find("trigger")->is_null());
+  assert(listed[1].member_str("profile") == "fnx");
+  assert(listed[1].find("trigger")->member_size("layer") == 2);
+  assert(listed[1].find("trigger")->find("threshold")->as_double() == 1.25);
 }
 
 void TestApplyTemplate() {

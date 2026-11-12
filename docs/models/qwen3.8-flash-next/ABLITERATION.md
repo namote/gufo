@@ -174,7 +174,9 @@ vectors or blocks, out-of-range layers, strengths, ranks or counts, unknown
 kinds, incompatible dimensions and files over 48 MiB are rejected. Candidate provenance can be stored as additional
 fields. Structural loading does not certify quality.
 
-Load a chosen file with `gufo serve llm ... --abliteration-profile /path/profile.json`.
+Load chosen files with `gufo serve llm ... --abliteration-profiles DIR`, where
+DIR holds them (every `*.json` file in it loads; the file name without `.json`
+is the profile name).
 This option is the only way to load one: nothing beside the model (such as an
 `abliteration/` directory) is discovered, so a file in a shared models
 directory never makes the control available to clients or affects other
@@ -183,10 +185,11 @@ models. Loading never enables it by itself.
 Supported chat-style requests (Chat Completions, Responses, Messages):
 
 ```json
-{"abliteration": {"enabled": true, "profile": "default"}}
+{"abliteration": {"enabled": true, "profile": "pol-avg"}}
 ```
 
-uses the profile defaults. Each request can also choose its own settings,
+uses the defaults of the profile named `pol-avg` (file `pol-avg.json`);
+`profile` may be omitted when one profile is loaded. Each request can also choose its own settings,
 without reloading anything:
 
 ```json
@@ -214,12 +217,17 @@ or a projected rank-4 subspace with norm preservation:
 array of exactly `layers` numbers, each in [0, 4]. `direction_kind` is
 `mean_diff` or, when the profile stores it, `projected`; `directions` is an
 integer in [1, rank]; `preserve_norm` is a boolean. Omitted members keep the profile
-defaults. Sessions in one batch may run different settings. Omit the object or
-send `{"abliteration":{"enabled":false}}` for OFF; settings with
-`"enabled": false` are rejected. Unknown fields, profile names/paths, invalid
+defaults. Sessions in one batch may run different settings. Send
+`{"abliteration":{"enabled":false}}` for OFF; settings with
+`"enabled": false` are rejected. Omitting the object is OFF too unless a
+loaded profile has a `trigger`, which then decides per request
+([dynamic detectors](#dynamic-detectors-trigger)). Unknown fields, unknown
+profile names or paths, invalid
 settings and unsupported backends are rejected with `invalid_abliteration`;
 clients cannot load arbitrary local files through requests. `GET /props`
-reports the loaded profile under `abliteration`, including
+lists the loaded profiles under `abliteration.profiles` (with the only one
+also at the top level of `abliteration`), each with its `trigger` (layer and
+threshold, or null), and
 `direction_kinds`, `direction_kind`, `max_directions` (the rank),
 `directions`, `preserve_norm` and `subspace_method`. Raw completions do
 not accept this control. The option is independent of thinking and Han-token

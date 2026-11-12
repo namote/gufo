@@ -71,9 +71,11 @@ struct ModelOptions {
   /// FP16.
   bool kvarn = false;
   int kvarn_bits = 4;
-  /// `--abliteration-profile`. Empty loads none: nothing is discovered beside
-  /// the model. Loading never enables it.
-  std::string abliteration_profile;
+  /// Profile files (`--abliteration-profiles DIR`, listed by
+  /// qwen::ListAbliterationProfiles). Empty loads none: nothing is discovered
+  /// beside the model. Loading enables none; a profile with a `trigger`
+  /// turns ON only in sessions whose detection selects it.
+  std::vector<std::string> abliteration_profiles;
   /// `--hc-mode`: the hyper-connection mixers' weights. q8-calibrated needs a
   /// native EXL3 pack with a valid sidecar; loading fails otherwise.
   HcMode hc_mode = kDefaultHcMode;
@@ -115,7 +117,10 @@ public:
     return options_.max_context;
   }
   [[nodiscard]] bool HasMtp() const noexcept;
-  [[nodiscard]] const AbliterationProfile* Abliteration() const;
+  /// The loaded profiles, in file-name order.
+  [[nodiscard]] std::span<
+      const std::shared_ptr<const qwen::AbliterationProfile>>
+  AbliterationProfiles() const;
   [[nodiscard]] std::string ArtifactIdentity() const;
   /// Test statistic: batched MTP catch-ups whose cohort mixed two or more
   /// KV-only sessions with proposing ones (counted when received; models

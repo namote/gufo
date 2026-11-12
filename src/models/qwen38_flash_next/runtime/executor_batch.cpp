@@ -1362,7 +1362,7 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
                       error)) {
         return false;
       }
-      if (abliteration_) {
+      if (!abliteration_.empty()) {
         std::array<AbliterationSpan, kBatchSessions> spans{};
         for (std::size_t i = 0; i < items.size(); ++i)
           spans[i] = {
@@ -1384,7 +1384,7 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
                                       : layers[il + 1].hc_attn.norm.f32())
               : model_->hc_head().norm.f32();
       UseScratch(base);
-      if (abliteration_) {
+      if (!abliteration_.empty()) {
         std::array<AbliterationSpan, kBatchSessions> spans{};
         for (std::size_t i = 0; i < items.size(); ++i)
           spans[i] = {
@@ -1396,7 +1396,7 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
       }
       CombineBatch(base.res, next_norm, rows);
       normed = next_norm != nullptr;
-      if (abliteration_) {
+      if (!abliteration_.empty()) {
         // Sessions with nonzero residual strengths project their post-layer
         // residual rows (every HC stream), then renormalize exactly those
         // rows for the next mixer; every other session keeps the norm the

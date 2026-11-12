@@ -91,10 +91,16 @@ public:
   bool device_lost() const override { return lost.load(); }
   bool supports_images() const override { return image_support.load(); }
   std::atomic<bool> image_support{false};
-  std::optional<AbliterationInfo> abliteration_info() const override {
-    return abliteration;
+  std::vector<AbliterationInfo> abliteration_profiles() const override {
+    std::vector<AbliterationInfo> result;
+    if (abliteration)
+      result.push_back(*abliteration);
+    result.insert(result.end(), more_abliteration.begin(),
+                  more_abliteration.end());
+    return result;
   }
   std::optional<AbliterationInfo> abliteration;
+  std::vector<AbliterationInfo> more_abliteration;
   std::string hc_mode() const override { return served_hc_mode; }
   std::string served_hc_mode;
   std::uint32_t max_context() const override { return 65536; }

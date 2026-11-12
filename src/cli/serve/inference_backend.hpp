@@ -91,7 +91,7 @@ public:
       const std::string& vision_model_path = {},
       TextRunnerRamCacheOptions ram_cache_config = {}, bool enable_yarn = false,
       std::optional<cli::KvCacheType> kv_cache_type = std::nullopt,
-      const std::string& abliteration_profile = {},
+      const std::string& abliteration_profiles = {},
       std::optional<models::qwen38_flash_next::HcMode> hc_mode = std::nullopt);
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -135,7 +135,7 @@ public:
   [[nodiscard]] bool ready() const override;
   [[nodiscard]] bool device_lost() const override;
   [[nodiscard]] bool supports_images() const override;
-  [[nodiscard]] std::optional<AbliterationInfo> abliteration_info()
+  [[nodiscard]] std::vector<AbliterationInfo> abliteration_profiles()
       const override;
   [[nodiscard]] bool supports_han_scale() const override;
   [[nodiscard]] bool supports_scoring() const override;

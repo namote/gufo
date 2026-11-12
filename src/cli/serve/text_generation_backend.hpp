@@ -37,9 +37,11 @@ enum class TextGenerationErrorCode : std::uint8_t {
   kDeviceLost,
 };
 
-/// The loaded runtime abliteration profile as requests and /props see it:
+/// A loaded runtime abliteration profile as requests and /props see it:
 /// geometry and defaults, never the direction vectors.
 struct AbliterationInfo {
+  /// The profile file name without `.json`; requests select it by this.
+  std::string name;
   std::string schema;
   /// SHA-256 of the profile file.
   std::string identity;
@@ -59,6 +61,10 @@ struct AbliterationInfo {
   bool preserve_norm{false};
   /// "pca", "som" or empty.
   std::string subspace_method;
+  /// A dynamic profile's detector layer and threshold; empty for a profile
+  /// that turns ON only when a request asks for it.
+  std::optional<std::uint32_t> trigger_layer;
+  std::optional<float> trigger_threshold;
 };
 
 /// Client-facing message for a GPU context that can no longer execute work.
@@ -143,6 +149,9 @@ struct ChatRequest {
   bool add_vision_id{false};
   /// Target-model execution transform, independent of sampling/thinking.
   bool abliteration{false};
+  /// Whether the request carried an `abliteration` member: an explicit ON or
+  /// OFF overrides dynamic detection.
+  bool abliteration_specified{false};
   /// Per-request settings while `abliteration` is ON; empty members keep the
   /// profile defaults.
   models::qwen::AbliterationOverrides abliteration_overrides;
@@ -353,14 +362,27 @@ public:
   }
   /// Whether the loaded backend accepts image inputs in chat requests.
   [[nodiscard]] virtual bool supports_images() const { return false; }
-  /// The loaded abliteration profile; empty without one or on a backend that
-  /// cannot apply it.
-  [[nodiscard]] virtual std::optional<AbliterationInfo> abliteration_info()
+  /// The loaded abliteration profiles (`--abliteration-profiles`), in file
+  /// name order; empty without one or on a backend that cannot apply them.
+  [[nodiscard]] virtual std::vector<AbliterationInfo> abliteration_profiles()
       const {
+    return {};
+  }
+  /// The profile a request's `abliteration.profile` names; an empty name
+  /// selects the only loaded profile. Empty when no profile matches.
+  [[nodiscard]] std::optional<AbliterationInfo> abliteration_profile(
+      std::string_view name) const {
+    auto profiles = abliteration_profiles();
+    if (name.empty())
+      return profiles.size() == 1 ? std::optional(std::move(profiles.front()))
+                                  : std::nullopt;
+    for (auto& profile : profiles)
+      if (profile.name == name)
+        return std::move(profile);
     return std::nullopt;
   }
   [[nodiscard]] bool supports_abliteration() const {
-    return abliteration_info().has_value();
+    return !abliteration_profiles().empty();
   }
   /// Whether requests apply SamplingConfig::han_scale (Qwen 27B and
   /// Flash-Next, whose runners build a Han token set).

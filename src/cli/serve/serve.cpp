@@ -608,7 +608,7 @@ void PrintServeHelp(std::string_view program_name,
     std::size_t cache_disk_staging_bytes = 0;
     bool log_progress = false;
     bool enable_yarn = false;
-    std::string abliteration_profile;
+    std::string abliteration_profiles;
     std::optional<KvCacheType> kv_cache_type;
     std::optional<models::qwen38_flash_next::HcMode> hc_mode;
     std::string trace_path;
@@ -636,9 +636,10 @@ void PrintServeHelp(std::string_view program_name,
                    "native 262144; it applies to every request",
                    "Model", &enable_yarn);
     parser.AddOption(
-        "", "--abliteration-profile", "FILE",
-        "Qwen3.8-27B, Flash-Next: load optional projection profile", "Model",
-        &abliteration_profile);
+        "", "--abliteration-profiles", "DIR",
+        "Qwen3.8-27B (one profile), Flash-Next: load the projection "
+        "profiles (*.json) in DIR",
+        "Model", &abliteration_profiles);
     RegisterKvCacheTypeOption(parser, &kv_cache_type, "Model");
     RegisterHcModeOption(parser, &hc_mode, "Model");
 
@@ -1253,7 +1254,7 @@ int RunServe(std::span<const char* const> args) {
     std::size_t cache_disk_staging_bytes = 0;
     bool log_progress = false;
     bool enable_yarn = false;
-    std::string abliteration_profile;
+    std::string abliteration_profiles;
     std::optional<KvCacheType> kv_cache_type;
     std::optional<models::qwen38_flash_next::HcMode> hc_mode;
     std::string trace_path;
@@ -1292,10 +1293,11 @@ int RunServe(std::span<const char* const> args) {
                        "the native 262144; it applies to every request",
                        "Model", &enable_yarn);
     llm_parser.AddOption(
-        "", "--abliteration-profile", "FILE",
-        "Qwen3.8-27B, Flash-Next: load optional request-selectable "
-        "projection profile",
-        "Model", &abliteration_profile);
+        "", "--abliteration-profiles", "DIR",
+        "Qwen3.8-27B (one profile), Flash-Next: load the projection "
+        "profiles (*.json) in DIR; a profile with a 'trigger' turns ON by "
+        "itself for requests that do not set 'abliteration'",
+        "Model", &abliteration_profiles);
     RegisterKvCacheTypeOption(llm_parser, &kv_cache_type, "Model");
     RegisterHcModeOption(llm_parser, &hc_mode, "Model");
     llm_parser.AddOption(
@@ -1587,7 +1589,7 @@ int RunServe(std::span<const char* const> args) {
             .capacity_bytes = cache_ram_bytes,
             .kv_pool_bytes = kv_pool_bytes,
             .tail_checkpoints = cache_tail_checkpoints},
-        enable_yarn, kv_cache_type, abliteration_profile, hc_mode);
+        enable_yarn, kv_cache_type, abliteration_profiles, hc_mode);
     loading.stop();
     if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";

@@ -108,9 +108,10 @@ public:
   QwenGpuModel(QwenGpuModel&&) = delete;
   QwenGpuModel& operator=(QwenGpuModel&&) = delete;
 
-  /// `abliteration_profile`: the explicit `--abliteration-profile` file,
-  /// bound to this artifact's identity and the `writer-before-residual`
-  /// placement. Empty loads none and allocates nothing.
+  /// `abliteration_profile`: the one profile file of
+  /// `--abliteration-profiles` (no `trigger`), bound to this artifact's
+  /// identity and the `writer-before-residual` placement. Empty loads none and
+  /// allocates nothing.
   [[nodiscard]] static std::shared_ptr<const QwenGpuModel> CreateFromGguf(
       std::shared_ptr<const core::GgufReader> reader,
       std::string* error_msg = nullptr,

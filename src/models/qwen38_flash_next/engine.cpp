@@ -285,11 +285,11 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   }
   try {
     const auto& c = m->config();
-    if (auto profile =
-            LoadAbliterationOption(options.abliteration_profile, c.hidden_size,
-                                   c.num_layers, m->ArtifactIdentity());
-        profile &&
-        !m->executor_->LoadAbliteration(std::move(profile), error_msg))
+    if (auto profiles = LoadAbliterationProfiles(options.abliteration_profiles,
+                                                 c.hidden_size, c.num_layers,
+                                                 m->ArtifactIdentity());
+        !profiles.empty() &&
+        !m->executor_->LoadAbliteration(std::move(profiles), error_msg))
       return nullptr;
     qwen::ValidateNativeSources(*m->reader_);
     if (m->mtp_reader_)
@@ -549,8 +549,9 @@ std::string Model::ArtifactIdentity() const {
              : core::GgufIdentityHex(*reader_);
 }
 
-const AbliterationProfile* Model::Abliteration() const {
-  return executor_->Abliteration();
+std::span<const std::shared_ptr<const qwen::AbliterationProfile>>
+Model::AbliterationProfiles() const {
+  return executor_->AbliterationProfiles();
 }
 
 void Session::SetActivationObserver(ActivationObserver observer) {
@@ -563,7 +564,7 @@ void Session::ConfigureAbliteration(
   const auto* active = session_->Abliteration();
   if (settings ? active && active->identity == settings->identity : !active)
     return;
-  if (settings && !model_->Abliteration())
+  if (settings && !model_->executor_->FindAbliteration(settings->profile))
     throw std::invalid_argument("abliteration profile is not loaded");
   if (!tokens_.empty())
     Reset();

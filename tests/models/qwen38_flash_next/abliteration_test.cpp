@@ -9,6 +9,10 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 #include "src/core/json.hpp"
 
@@ -59,9 +63,46 @@ int main() {
   } dir_cleanup{model_dir};
   std::filesystem::create_directories(model_dir / "abliteration");
   std::filesystem::copy_file(path, model_dir / "abliteration/default.json");
-  Require(q::LoadAbliterationOption("", 3, 2, "fixture") == nullptr);
-  const auto loaded = q::LoadAbliterationOption(path.string(), 3, 2, "fixture");
-  Require(loaded && loaded->identity == profile.identity);
+  namespace qwen = gufo::models::qwen;
+  Require(qwen::ListAbliterationProfiles("").empty());
+  Require(q::LoadAbliterationProfiles({}, 3, 2, "fixture").empty());
+  const std::vector<std::string> files{path.string()};
+  const auto loaded = q::LoadAbliterationProfiles(files, 3, 2, "fixture");
+  Require(loaded.size() == 1 && loaded[0]->identity == profile.identity &&
+          loaded[0]->name == path.stem().string() && !loaded[0]->trigger);
+  // `--abliteration-profiles DIR`: its *.json files in name order, nothing
+  // else; two files of one name cannot load together.
+  const auto listed =
+      qwen::ListAbliterationProfiles((model_dir / "abliteration").string());
+  Require(listed.size() == 1 && listed[0].ends_with("default.json"));
+  std::ofstream(model_dir / "abliteration/notes.txt") << "x";
+  std::filesystem::copy_file(path, model_dir / "abliteration/a.json");
+  const auto two =
+      qwen::ListAbliterationProfiles((model_dir / "abliteration").string());
+  Require(two.size() == 2 && two[0].ends_with("a.json") &&
+          two[1].ends_with("default.json"));
+  const auto pair = q::LoadAbliterationProfiles(two, 3, 2, "fixture");
+  Require(pair.size() == 2 && pair[0]->name == "a" &&
+          pair[1]->name == "default");
+  Require(&qwen::SelectAbliterationProfile(pair, "default") == pair[1].get());
+  const auto throws = [](const auto& f) {
+    try {
+      f();
+    } catch (const std::exception&) {
+      return true;
+    }
+    return false;
+  };
+  Require(throws([&] { (void)qwen::SelectAbliterationProfile(pair, ""); }));
+  Require(throws([&] { (void)qwen::SelectAbliterationProfile(pair, "b"); }));
+  Require(&qwen::SelectAbliterationProfile(loaded, "") == loaded[0].get());
+  const std::vector<std::string> twice{path.string(), path.string()};
+  Require(throws(
+      [&] { (void)q::LoadAbliterationProfiles(twice, 3, 2, "fixture"); }));
+  Require(throws([&] {
+    (void)qwen::ListAbliterationProfiles((model_dir / "none").string());
+  }));
+  Require(throws([&] { (void)qwen::ListAbliterationProfiles(path.string()); }));
 
   // Component-cache record: OFF keeps the pre-abliteration bytes (mode 0,
   // raw or zero image identity); ON is bound to the full profile identity.
@@ -202,7 +243,6 @@ int main() {
       "direction_kind":"projected","direction_count":2,"preserve_norm":true})";
   const auto subspace = q::AbliterationProfile::Load(path, 3, 2, "fixture");
   const auto subspace_defaults = q::ResolveAbliterationSettings(subspace);
-  namespace qwen = gufo::models::qwen;
   Require(subspace.rank == 2 && subspace.kinds == 2 &&
           subspace.direction_rows() == 8 &&
           subspace.directions[3 * 3 + 2] == 1 &&
@@ -218,5 +258,51 @@ int main() {
   Require(single->direction_row == 2 &&
           std::bit_cast<std::uint32_t>(single->DeviceWords()[0]) == 2 &&
           single->identity != subspace_defaults->identity);
+  // A profile's rows start at its own offset in a shared direction table;
+  // the identity does not depend on where it is loaded.
+  Require(std::bit_cast<std::uint32_t>(single->DeviceWords(5)[0]) == 7 &&
+          single->profile == path.stem().string());
+  Require(
+      throws([&] { (void)single->DeviceWords(qwen::kAbliterationRowMask); }));
+
+  // A dynamic profile's detector (`trigger`): layer, unit direction (base64
+  // float32 [0,0,1]), threshold and the placement's collector readout.
+  const auto with_trigger = [&](const std::string& trigger) {
+    std::ofstream(path)
+        << R"({"schema":"gufo-abliteration-v2","placement":"writer-before-hc",
+        "model_identity":"fixture","hidden":3,"layers":2,
+        "directions":[[0,1,0],[0.6,0.8,0]],"direction_layer":1,
+        "attention":[0,0],"mlp":[0,0],"residual":[1,1],"trigger":)"
+        << trigger << "}";
+    return q::AbliterationProfile::Load(path, 3, 2, "fixture");
+  };
+  const std::string trigger =
+      R"({"schema":"gufo-abliteration-trigger-v1","layer":1,
+      "readout":"last-prompt-token-post-layer-hc-mean-fp32-v1",
+      "direction":"AAAAAAAAAAAAAIA/","threshold":1.25,"fit":{"auc":0.99}})";
+  const auto dynamic = with_trigger(trigger);
+  Require(dynamic.trigger && dynamic.trigger->layer == 1 &&
+          dynamic.trigger->threshold == 1.25F &&
+          dynamic.trigger->direction == std::vector<float>{0, 0, 1});
+  for (const auto& [from, to] :
+       std::initializer_list<std::pair<std::string_view, std::string_view>>{
+           {R"("layer":1)", R"("layer":2)"},
+           {R"("layer":1)", R"("layer":-1)"},
+           {"hc-mean-fp32", "fp32"},
+           {"trigger-v1", "trigger-v2"},
+           {"AAAAAAAAAAAAAIA/", "AAAAAAAAAAAAAAA/"},
+           {"AAAAAAAAAAAAAIA/", "AAAAAAAAAAAAAIA"},
+           {"1.25", "\"x\""},
+       }) {
+    auto text = trigger;
+    text.replace(text.find(from), from.size(), to);
+    Require(throws([&] { (void)with_trigger(text); }));
+  }
+  Require(throws([&] { (void)with_trigger("1"); }));
+  auto v1_trigger = original;
+  v1_trigger["trigger"] = json::parse(trigger);
+  write(v1_trigger);
+  Require(throws(
+      [&] { (void)q::AbliterationProfile::Load(path, 3, 2, "fixture"); }));
   std::cout << "profile and cache identity PASS\n";
 }

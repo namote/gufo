@@ -2,7 +2,7 @@
 """Search runtime abliteration settings over a running Gufo server (Heretic-style).
 
 Shared by Qwen3.8-Flash-Next and Qwen3.8-27B. The server must run the model
-with a gufo-abliteration-v2 `--abliteration-profile`; every trial is one set
+with one gufo-abliteration-v2 profile (`--abliteration-profiles`); every trial is one set
 of per-request settings (`direction_layer`, per-layer `attention`, `mlp` and
 `residual`), so nothing reloads. Pure standard library; no GPU work of its
 own.
@@ -436,7 +436,9 @@ class Search:
         return top
 
     def evaluate(self, values, baseline):
-        on = dict(enabled=True, profile='default', **values)
+        on = dict(enabled=True, **values)
+        if self.info.get('profile'):
+            on['profile'] = self.info['profile']
         answers = self._map(lambda p: generation(self.client.chat(
             request_body(self.model, p, on, self.max_tokens))), self.prompts['refusal'])
         unfinished = sum(not answer(a['text']).strip() for a in answers)

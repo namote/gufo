@@ -362,11 +362,19 @@ public:
 
   ~Executor();
   [[nodiscard]] hipStream_t stream() const noexcept { return stream_; }
-  bool LoadAbliteration(std::shared_ptr<const AbliterationProfile> profile,
-                        std::string* error);
-  const AbliterationProfile* Abliteration() const {
-    return abliteration_.get();
+  /// Uploads every profile's directions into one table (each profile's rows
+  /// start at its own offset). Call once, before any session exists.
+  bool LoadAbliteration(AbliterationProfileSet profiles, std::string* error);
+  [[nodiscard]] std::span<
+      const std::shared_ptr<const qwen::AbliterationProfile>>
+  AbliterationProfiles() const {
+    return abliteration_;
   }
+  /// The loaded profile named `name`, or null.
+  [[nodiscard]] const qwen::AbliterationProfile* FindAbliteration(
+      std::string_view name) const;
+  /// The first direction row of the loaded profile `name`.
+  [[nodiscard]] std::uint32_t AbliterationRow(std::string_view name) const;
   Executor(const Executor&) = delete;
   Executor& operator=(const Executor&) = delete;
 
@@ -727,7 +735,9 @@ public:
 
 private:
   Executor() = default;
-  std::shared_ptr<const AbliterationProfile> abliteration_;
+  AbliterationProfileSet abliteration_;
+  /// First row of each profile in abliteration_directions_.
+  std::vector<std::uint32_t> abliteration_rows_;
   /// Every profile direction, [rows][hidden], uploaded once at load.
   float* abliteration_directions_{nullptr};
   /// One writer's projection site: the session's device settings (null OFF).
@@ -740,10 +750,9 @@ private:
   };
   AbliterationSite AbliterationAt(const Session& session, std::uint32_t layer,
                                   bool mlp) const {
-    return {abliteration_ && session.abliteration_
-                ? session.abliteration_device_.get()
-                : nullptr,
-            layer, mlp};
+    return {
+        session.abliteration_ ? session.abliteration_device_.get() : nullptr,
+        layer, mlp};
   }
   void ProjectAbliteration(float* output, std::uint32_t rows,
                            AbliterationSite site) const;
@@ -753,8 +762,7 @@ private:
   /// layer end: the FFN combine computes no norm of the next mixer, so nothing
   /// derived from the residual predates the projection.
   const float* ResidualAbliteration(const Session& session) const {
-    return abliteration_ && session.abliteration_ &&
-                   session.abliteration_->ResidualActive()
+    return session.abliteration_ && session.abliteration_->ResidualActive()
                ? session.abliteration_device_.get()
                : nullptr;
   }

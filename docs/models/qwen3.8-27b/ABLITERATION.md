@@ -116,11 +116,12 @@ rejected, as are nonfinite values, nonunit vectors, out-of-range layers or
 strengths and incompatible dimensions.
 
 ```sh
-gufo serve llm --model models/qwen3.8-27b-exl3 --abliteration-profile PROFILE.json
+gufo serve llm --model models/qwen3.8-27b-exl3 --abliteration-profiles PROFILE_DIR
 ```
 
-The option is the only way to load one; nothing beside the model is
-discovered, and loading never enables it. Requests select it and their own
+PROFILE_DIR holds exactly one profile without a `trigger` (detection runs
+only on Flash-Next). The option is the only way to load one; nothing beside
+the model is discovered, and loading never enables it. Requests select it and their own
 settings exactly as for Flash-Next (Chat Completions, Responses, Messages):
 
 ```json

@@ -315,7 +315,8 @@ std::uint32_t Session::ReleaseKvReservation() noexcept {
 
 void Session::ConfigureAbliteration(
     std::shared_ptr<const qwen::AbliterationSettings> settings) {
-  const auto* profile = owner_->Abliteration();
+  const auto* profile =
+      settings ? owner_->FindAbliteration(settings->profile) : nullptr;
   if (settings && !profile)
     throw std::invalid_argument("abliteration profile is not loaded");
   if (settings && !qwen::AbliterationSettingsFit(*profile, *settings))
@@ -326,7 +327,8 @@ void Session::ConfigureAbliteration(
   if (!settings && !abliteration_)
     return;
   if (settings) {
-    const auto words = settings->DeviceWords();
+    const auto words =
+        settings->DeviceWords(owner_->AbliterationRow(settings->profile));
     const auto bytes = words.size() * sizeof(float);
     if (!abliteration_device_) {
       void* data = nullptr;
@@ -358,29 +360,61 @@ void Session::ConfigureAbliteration(
   abliteration_ = std::move(settings);
 }
 
-bool Executor::LoadAbliteration(
-    std::shared_ptr<const AbliterationProfile> profile, std::string* error) {
-  if (abliteration_ || !profile || profile->hidden != config().hidden_size ||
-      profile->layers != config().num_layers ||
-      profile->direction_rows() == 0 ||
-      profile->directions.size() !=
-          std::size_t{profile->direction_rows()} * profile->hidden) {
+bool Executor::LoadAbliteration(AbliterationProfileSet profiles,
+                                std::string* error) {
+  std::size_t rows = 0;
+  bool valid = abliteration_.empty() && !profiles.empty() &&
+               profiles.size() <= qwen::kAbliterationMaxProfiles;
+  for (const auto& profile : profiles) {
+    valid = valid && profile && profile->hidden == config().hidden_size &&
+            profile->layers == config().num_layers &&
+            profile->direction_rows() != 0 &&
+            profile->directions.size() ==
+                std::size_t{profile->direction_rows()} * profile->hidden;
+    if (valid)
+      rows += profile->direction_rows();
+  }
+  if (!valid || rows > qwen::kAbliterationRowMask) {
     AssignError(error, "invalid or repeated abliteration profile load");
     return false;
   }
+  std::vector<float> table;
+  table.reserve(rows * config().hidden_size);
+  std::vector<std::uint32_t> offsets;
+  for (const auto& profile : profiles) {
+    offsets.push_back(
+        static_cast<std::uint32_t>(table.size() / config().hidden_size));
+    table.insert(table.end(), profile->directions.begin(),
+                 profile->directions.end());
+  }
   void* data = nullptr;
-  const auto bytes = profile->directions.size() * sizeof(float);
+  const auto bytes = table.size() * sizeof(float);
   if (!Check(hip::AllocateDevice(&data, bytes), "abliteration directions",
              error))
     return false;
   allocations_.push_back(data);
   abliteration_directions_ = static_cast<float*>(data);
-  if (!Check(hipMemcpy(data, profile->directions.data(), bytes,
-                       hipMemcpyHostToDevice),
+  if (!Check(hipMemcpy(data, table.data(), bytes, hipMemcpyHostToDevice),
              "abliteration directions upload", error))
     return false;
-  abliteration_ = std::move(profile);
+  abliteration_ = std::move(profiles);
+  abliteration_rows_ = std::move(offsets);
   return true;
+}
+
+const qwen::AbliterationProfile* Executor::FindAbliteration(
+    std::string_view name) const {
+  for (const auto& profile : abliteration_)
+    if (profile->name == name)
+      return profile.get();
+  return nullptr;
+}
+
+std::uint32_t Executor::AbliterationRow(std::string_view name) const {
+  for (std::size_t i = 0; i < abliteration_.size(); ++i)
+    if (abliteration_[i]->name == name)
+      return abliteration_rows_[i];
+  throw std::invalid_argument("abliteration profile is not loaded");
 }
 
 void Executor::ProjectAbliteration(float* output, std::uint32_t rows,

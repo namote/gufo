@@ -4,8 +4,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "src/models/qwen/abliteration.hpp"
 
@@ -27,11 +29,17 @@ using qwen::AbliterationSettings;
 using qwen::RecordAbliterationContinuation;
 using qwen::ResolveAbliterationSettings;
 
-/// Loads the explicit `--abliteration-profile` file. An empty option loads
-/// none; no file beside the model is ever picked up implicitly.
-std::shared_ptr<const AbliterationProfile> LoadAbliterationOption(
-    const std::string& option, std::uint32_t hidden, std::uint32_t layers,
-    std::string_view model_identity);
+using qwen::AbliterationTrigger;
+using qwen::SelectAbliterationProfile;
+using AbliterationProfileSet =
+    std::vector<std::shared_ptr<const qwen::AbliterationProfile>>;
+
+/// Loads the profile files (qwen::ListAbliterationProfiles of
+/// `--abliteration-profiles`), each bound to this model. Names must be
+/// unique. No file beside the model is ever picked up implicitly.
+AbliterationProfileSet LoadAbliterationProfiles(
+    std::span<const std::string> files, std::uint32_t hidden,
+    std::uint32_t layers, std::string_view model_identity);
 
 }  // namespace gufo::models::qwen38_flash_next
 #endif

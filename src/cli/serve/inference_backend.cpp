@@ -91,34 +91,61 @@ struct AbliterationPromptContext final : QwenImageContext {
   std::shared_ptr<const models::qwen::AbliterationSettings> settings;
 };
 
-std::optional<AbliterationInfo> DescribeAbliteration(
+/// The profiles a model holds, in load order; Qwen3.8-27B holds at most one.
+using AbliterationProfileList =
+    std::vector<const models::qwen::AbliterationProfile*>;
+
+AbliterationProfileList ListProfiles(
     const models::qwen::AbliterationProfile* profile) {
-  if (profile == nullptr)
-    return std::nullopt;
+  return profile ? AbliterationProfileList{profile} : AbliterationProfileList{};
+}
+AbliterationProfileList ListProfiles(
+    std::span<const std::shared_ptr<const models::qwen::AbliterationProfile>>
+        profiles) {
+  AbliterationProfileList list;
+  for (const auto& profile : profiles)
+    list.push_back(profile.get());
+  return list;
+}
+
+std::vector<AbliterationInfo> DescribeAbliteration(
+    const AbliterationProfileList& profiles) {
   using models::qwen::AbliterationDirectionKind;
-  std::vector<std::string> kinds;
-  for (const auto kind : {AbliterationDirectionKind::kMeanDiff,
-                          AbliterationDirectionKind::kProjected})
-    if (profile->has_kind(kind))
-      kinds.emplace_back(models::qwen::AbliterationDirectionKindName(kind));
-  return AbliterationInfo{
-      .schema = std::string(profile->schema == 2
-                                ? models::qwen::kAbliterationSchemaV2
-                                : models::qwen::kAbliterationSchemaV1),
-      .identity = profile->identity,
-      .layers = profile->layers,
-      .direction_layer = profile->direction_layer,
-      .attention = profile->attention,
-      .mlp = profile->mlp,
-      .residual = profile->residual,
-      .direction_kinds = std::move(kinds),
-      .rank = profile->rank,
-      .direction_kind = std::string(
-          models::qwen::AbliterationDirectionKindName(profile->direction_kind)),
-      .direction_count = profile->direction_count,
-      .preserve_norm = profile->preserve_norm,
-      .subspace_method = profile->subspace_method,
-  };
+  std::vector<AbliterationInfo> result;
+  for (const auto* profile : profiles) {
+    std::vector<std::string> kinds;
+    for (const auto kind : {AbliterationDirectionKind::kMeanDiff,
+                            AbliterationDirectionKind::kProjected})
+      if (profile->has_kind(kind))
+        kinds.emplace_back(models::qwen::AbliterationDirectionKindName(kind));
+    result.push_back(AbliterationInfo{
+        .name = profile->name,
+        .schema = std::string(profile->schema == 2
+                                  ? models::qwen::kAbliterationSchemaV2
+                                  : models::qwen::kAbliterationSchemaV1),
+        .identity = profile->identity,
+        .layers = profile->layers,
+        .direction_layer = profile->direction_layer,
+        .attention = profile->attention,
+        .mlp = profile->mlp,
+        .residual = profile->residual,
+        .direction_kinds = std::move(kinds),
+        .rank = profile->rank,
+        .direction_kind =
+            std::string(models::qwen::AbliterationDirectionKindName(
+                profile->direction_kind)),
+        .direction_count = profile->direction_count,
+        .preserve_norm = profile->preserve_norm,
+        .subspace_method = profile->subspace_method,
+        .trigger_layer = profile->trigger
+                             ? std::optional(profile->trigger->layer)
+                             : std::nullopt,
+        .trigger_threshold = profile->trigger
+                                 ? std::optional(profile->trigger->threshold)
+                                 : std::nullopt,
+    });
+  }
+  return result;
 }
 
 tokenization::ChatTemplateOptions QwenChatOptions(const ChatRequest& request,
@@ -245,14 +272,28 @@ std::shared_ptr<const models::qwen::vision::Prompt> QwenPrompt(
 /// image-prefix cache identity with their identity (profile, direction layer
 /// and exact strengths), so ON/OFF or different settings never share cached
 /// state.
-TextPreparedPrompt SelectAbliteration(
-    TextPreparedPrompt result, const ChatRequest& request,
-    const models::qwen::AbliterationProfile* profile) {
+TextPreparedPrompt SelectAbliteration(TextPreparedPrompt result,
+                                      const ChatRequest& request,
+                                      const AbliterationProfileList& profiles) {
   if (!request.abliteration)
     return result;
-  if (!profile)
+  if (profiles.empty())
     throw std::invalid_argument(
         "abliteration profile is not loaded; prepare it first");
+  const models::qwen::AbliterationProfile* profile = nullptr;
+  if (request.abliteration_overrides.profile.empty()) {
+    if (profiles.size() != 1)
+      throw std::invalid_argument(
+          "abliteration: name one of the loaded profiles in "
+          "'abliteration.profile'");
+    profile = profiles.front();
+  }
+  for (const auto* candidate : profiles)
+    if (candidate->name == request.abliteration_overrides.profile)
+      profile = candidate;
+  if (!profile)
+    throw std::invalid_argument("abliteration: unknown profile '" +
+                                request.abliteration_overrides.profile + "'");
   auto context = std::make_shared<AbliterationPromptContext>();
   context->settings = models::qwen::ResolveAbliterationSettings(
       *profile, request.abliteration_overrides);
@@ -278,7 +319,7 @@ TextScoringPrompt PrepareQwenScoring(
     const ChatRequest& request, const tokenization::QwenTokenizer& tokenizer,
     const std::shared_ptr<models::qwen::vision::Encoder>& encoder,
     std::uint32_t max_context, models::qwen::vision::ImageCache& image_cache,
-    const models::qwen::AbliterationProfile* profile) {
+    const AbliterationProfileList& profiles) {
   auto split = SplitScoringRequest(request);
   tokenization::TokenizerOptions content;
   content.parse_special_tokens = false;
@@ -286,7 +327,7 @@ TextScoringPrompt PrepareQwenScoring(
   LimitScoredTokens(&answer, request);
   return {SelectAbliteration(PrepareQwenPrompt(split.prompt, tokenizer, encoder,
                                                max_context, image_cache),
-                             split.prompt, profile),
+                             split.prompt, profiles),
           {answer.begin(), answer.end()}};
 }
 
@@ -1422,7 +1463,7 @@ public:
     return SelectAbliteration(
         PrepareQwenPrompt(request, model_->GetTokenizer(),
                           model_->VisionEncoder(), max_context_, image_cache_),
-        request, model_->Abliteration());
+        request, ListProfiles(model_->Abliteration()));
   }
 
   [[nodiscard]] std::optional<std::size_t> CountPromptTokens(
@@ -3024,15 +3065,15 @@ public:
     return SelectAbliteration(
         PrepareQwenPrompt(request, model_->tokenizer(), model_->VisionEncoder(),
                           max_context_, image_cache_),
-        request, model_->Abliteration());
+        request, ListProfiles(model_->AbliterationProfiles()));
   }
 
   [[nodiscard]] bool SupportsScoring() const override { return true; }
   [[nodiscard]] TextScoringPrompt PrepareScoring(
       const ChatRequest& request) const override {
-    return PrepareQwenScoring(request, model_->tokenizer(),
-                              model_->VisionEncoder(), max_context_,
-                              image_cache_, model_->Abliteration());
+    return PrepareQwenScoring(
+        request, model_->tokenizer(), model_->VisionEncoder(), max_context_,
+        image_cache_, ListProfiles(model_->AbliterationProfiles()));
   }
 
   [[nodiscard]] std::vector<sampling::TokenLogprobs> ScoreTokens(
@@ -3497,8 +3538,8 @@ struct InferenceBackend::Impl {
     SamplingDefaults sampling_defaults;
     std::uint32_t max_context{0};
     bool supports_images{false};
-    /// The loaded abliteration profile; empty without one.
-    std::optional<AbliterationInfo> abliteration;
+    /// The loaded abliteration profiles; empty without one.
+    std::vector<AbliterationInfo> abliteration;
     /// Flash-Next's HyperConnection mode name; empty for other models.
     std::string hc_mode;
     /// The runner's Han tokens; null where its samplers ignore han_scale.
@@ -3614,7 +3655,7 @@ struct InferenceBackend::Impl {
       bool stream_output) const {
     if (stream_output)
       throw std::invalid_argument("score_assistant does not support streaming");
-    if (request.abliteration && !current->abliteration)
+    if (request.abliteration && current->abliteration.empty())
       throw std::invalid_argument(
           "abliteration profile is not available on this backend");
     const auto& runner = current->scheduler->runner();
@@ -3661,11 +3702,19 @@ bool InferenceBackend::load(
     const std::string& vision_model_path,
     TextRunnerRamCacheOptions ram_cache_config, bool enable_yarn,
     std::optional<cli::KvCacheType> kv_cache_type,
-    const std::string& abliteration_profile,
+    const std::string& abliteration_profiles,
     std::optional<models::qwen38_flash_next::HcMode> hc_mode) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
+  std::vector<std::string> profile_files;
+  try {
+    profile_files =
+        models::qwen::ListAbliterationProfiles(abliteration_profiles);
+  } catch (const std::exception& e) {
+    SetError(error, e.what());
+    return false;
+  }
   auto reader_owner = cli::OpenModelArtifact(model_path, &load_error);
   if (reader_owner == nullptr) {
     SetError(error, "Failed to open model: " + load_error);
@@ -3674,11 +3723,18 @@ bool InferenceBackend::load(
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
   const auto architecture =
       reader->GetMetadataString("general.architecture").value_or("");
-  if (!abliteration_profile.empty() && architecture != "qwen4exp" &&
+  if (!profile_files.empty() && architecture != "qwen4exp" &&
       architecture != "qwen35") {
     SetError(error,
-             "--abliteration-profile applies only to Qwen3.8-27B and "
+             "--abliteration-profiles applies only to Qwen3.8-27B and "
              "Flash-Next");
+    return false;
+  }
+  // Qwen3.8-27B holds one request-selectable profile.
+  if (profile_files.size() > 1 && architecture == "qwen35") {
+    SetError(error,
+             "Qwen3.8-27B loads one profile; --abliteration-profiles holds " +
+                 std::to_string(profile_files.size()));
     return false;
   }
   if (hc_mode && architecture != "qwen4exp") {
@@ -3835,7 +3891,7 @@ bool InferenceBackend::load(
                      resolved_kv_cache_type == cli::KvCacheType::kKvarnK6V6,
             .kvarn_bits =
                 resolved_kv_cache_type == cli::KvCacheType::kKvarnK6V6 ? 6 : 4,
-            .abliteration_profile = abliteration_profile,
+            .abliteration_profiles = profile_files,
             .hc_mode =
                 hc_mode.value_or(models::qwen38_flash_next::kDefaultHcMode),
         },
@@ -3942,7 +3998,8 @@ bool InferenceBackend::load(
   Logger::Info("loader", "event=load_phase phase=target_weights " +
                              Logger::MemoryStatus());
   auto model = hip::QwenGpuModel::CreateFromGguf(
-      reader, &load_error, std::move(vision), abliteration_profile);
+      reader, &load_error, std::move(vision),
+      profile_files.empty() ? std::string{} : profile_files.front());
   if (model == nullptr) {
     SetError(error, "Failed to create GPU model: " + load_error);
     return false;
@@ -3969,7 +4026,7 @@ bool InferenceBackend::load(
   (void)vision_model_path;
   (void)ram_cache_config;
   (void)enable_yarn;
-  (void)abliteration_profile;
+  (void)abliteration_profiles;
   (void)kv_cache_type;
   (void)hc_mode;
   SetError(error, "HTTP inference requires the HIP backend");
@@ -4097,7 +4154,8 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
         sampling::TextPreset(model->GetConfig());
     new_state->sampling_defaults.supplied = {};
     new_state->supports_images = model->VisionEncoder() != nullptr;
-    new_state->abliteration = DescribeAbliteration(model->Abliteration());
+    new_state->abliteration =
+        DescribeAbliteration(ListProfiles(model->Abliteration()));
     auto runner = std::make_shared<QwenTextRunner>(
         std::move(model), max_context, std::move(dflash_model),
         speculative_options, disk_cache_config.model_artifact_fingerprint,
@@ -4280,7 +4338,8 @@ bool InferenceBackend::load(
     new_state->sampling_defaults.model = sampling::TextModelPreset::kQwen38;
     new_state->sampling_defaults.supplied = {};
     new_state->supports_images = model->VisionEncoder() != nullptr;
-    new_state->abliteration = DescribeAbliteration(model->Abliteration());
+    new_state->abliteration =
+        DescribeAbliteration(ListProfiles(model->AbliterationProfiles()));
     new_state->hc_mode =
         models::qwen38_flash_next::HcModeName(model->hc_mode());
     auto runner = std::make_shared<QwenFlashNextTextRunner>(
@@ -4358,12 +4417,12 @@ bool InferenceBackend::device_lost() const {
 #endif
 }
 
-std::optional<AbliterationInfo> InferenceBackend::abliteration_info() const {
+std::vector<AbliterationInfo> InferenceBackend::abliteration_profiles() const {
 #if defined(ENGINE_ENABLE_HIP)
   const auto state = impl_->Snapshot();
-  return state ? state->abliteration : std::nullopt;
+  return state ? state->abliteration : std::vector<AbliterationInfo>{};
 #else
-  return std::nullopt;
+  return {};
 #endif
 }
 
@@ -4594,7 +4653,7 @@ InferenceBackend::Result InferenceBackend::chat(
   auto effective_sampling = sampling_config;
   auto constrained = ConstrainChatRequest(request, state->scheduler->runner(),
                                           &effective_sampling);
-  if (request.abliteration && !state->abliteration)
+  if (request.abliteration && state->abliteration.empty())
     throw std::invalid_argument(
         "abliteration profile is not available on this backend");
   const auto& effective_request = constrained ? *constrained : request;
@@ -4689,7 +4748,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
   std::optional<sampling::JsonConstraint::ToolFormat> tool_format;
   auto constrained = ConstrainChatRequest(request, state->scheduler->runner(),
                                           &effective_sampling, &tool_format);
-  if (request.abliteration && !state->abliteration)
+  if (request.abliteration && state->abliteration.empty())
     throw std::invalid_argument(
         "abliteration profile is not available on this backend");
   const auto& effective_request = constrained ? *constrained : request;
@@ -4765,7 +4824,7 @@ std::optional<std::size_t> InferenceBackend::count_chat_tokens(
   auto sampling = sampling::SamplingConfig{};
   auto constrained =
       ConstrainChatRequest(request, state->scheduler->runner(), &sampling);
-  if (request.abliteration && !state->abliteration)
+  if (request.abliteration && state->abliteration.empty())
     throw std::invalid_argument(
         "abliteration profile is not available on this backend");
   const auto& effective_request = constrained ? *constrained : request;
@@ -4788,7 +4847,7 @@ std::optional<std::string> InferenceBackend::render_chat_prompt(
   auto sampling = sampling::SamplingConfig{};
   auto constrained =
       ConstrainChatRequest(request, state->scheduler->runner(), &sampling);
-  if (request.abliteration && !state->abliteration)
+  if (request.abliteration && state->abliteration.empty())
     throw std::invalid_argument(
         "abliteration profile is not available on this backend");
   const auto& effective_request = constrained ? *constrained : request;

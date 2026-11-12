@@ -96,9 +96,15 @@ private:
 class FakeBackend final : public gufo::server::TextGenerationBackend {
 public:
   std::optional<gufo::server::AbliterationInfo> abliteration;
-  std::optional<gufo::server::AbliterationInfo> abliteration_info()
+  std::vector<gufo::server::AbliterationInfo> more_abliteration;
+  std::vector<gufo::server::AbliterationInfo> abliteration_profiles()
       const override {
-    return abliteration;
+    std::vector<gufo::server::AbliterationInfo> result;
+    if (abliteration)
+      result.push_back(*abliteration);
+    result.insert(result.end(), more_abliteration.begin(),
+                  more_abliteration.end());
+    return result;
   }
   std::vector<gufo::server::DecodedLogprobs> logprob_pieces;
   [[nodiscard]] std::string model_id() const override { return "test-model"; }
@@ -7010,14 +7016,18 @@ void TestAbliterationControls() {
          "unloaded profile rejected");
   // A three-layer v2 profile.
   backend.abliteration =
-      gufo::server::AbliterationInfo{.schema = "gufo-abliteration-v2",
+      gufo::server::AbliterationInfo{.name = "pol",
+                                     .schema = "gufo-abliteration-v2",
                                      .identity = std::string(64, 'a'),
                                      .layers = 3,
                                      .direction_layer = 1,
                                      .attention = {1, 1, 1},
                                      .mlp = {0, 0.5F, 0}};
-  Expect(!parse(R"({"abliteration":{"enabled":true,"profile":"default"}})") &&
-             request.abliteration &&
+  Expect(!parse("{}") && !request.abliteration_specified,
+         "an absent member leaves the request to dynamic detection");
+  Expect(!parse(R"({"abliteration":{"enabled":true,"profile":"pol"}})") &&
+             request.abliteration && request.abliteration_specified &&
+             request.abliteration_overrides.profile == "pol" &&
              !request.abliteration_overrides.direction_layer &&
              request.abliteration_overrides.attention.empty() &&
              request.abliteration_overrides.mlp.empty(),
@@ -7047,8 +7057,12 @@ void TestAbliterationControls() {
               std::vector<float>{0.0F, 1.0F, 4.0F} &&
           request.abliteration_overrides.attention == std::vector<float>{0.0F},
       "per-layer residual strengths with writers off");
+  Expect(!parse(R"({"abliteration":{"enabled":true}})") &&
+             request.abliteration_overrides.profile == "pol",
+         "the only loaded profile is the default");
   Expect(!parse(R"({"abliteration":{"enabled":false}})") &&
-             !request.abliteration &&
+             !request.abliteration && request.abliteration_specified &&
+             request.abliteration_overrides.profile.empty() &&
              !request.abliteration_overrides.direction_layer &&
              request.abliteration_overrides.mlp.empty(),
          "explicit off replaces enabled and its settings");
@@ -7057,6 +7071,9 @@ void TestAbliterationControls() {
            R"({"abliteration":{}})",
            R"({"abliteration":{"enabled":1}})",
            R"({"abliteration":{"enabled":true,"profile":"/tmp/x"}})",
+           R"({"abliteration":{"enabled":true,"profile":"default"}})",
+           R"({"abliteration":{"enabled":true,"profile":1}})",
+           R"({"abliteration":{"enabled":false,"profile":"pol"}})",
            R"({"abliteration":{"enabled":true,"strength":2}})",
            // Bounds, types and lengths.
            R"({"abliteration":{"enabled":true,"direction_layer":3}})",
@@ -7153,6 +7170,33 @@ void TestAbliterationControls() {
              request.abliteration_overrides.attention ==
                  std::vector<float>{0.0F, 1.0F, 2.0F},
          "v1 profile accepts strengths");
+  // Two profiles: a request names one; each is checked against its own
+  // geometry.
+  backend.more_abliteration = {
+      gufo::server::AbliterationInfo{.name = "fnx",
+                                     .schema = "gufo-abliteration-v2",
+                                     .identity = std::string(64, 'c'),
+                                     .layers = 2,
+                                     .direction_layer = 0,
+                                     .attention = {1, 1},
+                                     .mlp = {0, 0},
+                                     .trigger_layer = 1,
+                                     .trigger_threshold = 0.5F}};
+  Expect(parse(R"({"abliteration":{"enabled":true}})").has_value(),
+         "several profiles need a name");
+  Expect(parse(R"({"abliteration":{"enabled":true,"profile":"x"}})")
+                 ->body.find("'pol', 'fnx'") != std::string::npos,
+         "an unknown name lists the loaded profiles");
+  Expect(
+      !parse(R"({"abliteration":{"enabled":true,"profile":"fnx",
+             "mlp":[1,2]}})") &&
+          request.abliteration_overrides.profile == "fnx" &&
+          request.abliteration_overrides.mlp == std::vector<float>{1.0F, 2.0F},
+      "a named profile's own layer count");
+  Expect(parse(R"({"abliteration":{"enabled":true,"profile":"fnx",
+             "mlp":[1,2,3]}})")
+             .has_value(),
+         "another profile's layer count rejected");
 }
 
 void TestScoreAssistant() {

@@ -1570,9 +1570,12 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
   modalities["audio"] = false;
   resp["modalities"] = std::move(modalities);
 
-  // Gufo extension: the loaded abliteration profile's geometry and request
-  // defaults, never its direction vectors. A uniform strength is one number.
-  if (const auto info = b.abliteration_info()) {
+  // Gufo extension: the loaded abliteration profiles' geometry, request
+  // defaults and detectors, never their direction vectors. A uniform
+  // strength is one number. The only loaded profile's members also sit at
+  // the top level, where a request without 'abliteration.profile' finds
+  // them.
+  if (const auto profiles = b.abliteration_profiles(); !profiles.empty()) {
     const auto strengths = [](const std::vector<float>& values) {
       if (!values.empty() &&
           std::ranges::all_of(values, [&](float x) { return x == values[0]; }))
@@ -1582,41 +1585,63 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
         array.push_back(static_cast<double>(x));
       return array;
     };
+    const auto describe = [&](const AbliterationInfo& info,
+                              json::Value& abliteration) {
+      abliteration["profile"] = info.name;
+      abliteration["schema"] = info.schema;
+      abliteration["identity"] = info.identity;
+      abliteration["layers"] = static_cast<unsigned long long>(info.layers);
+      // Layers a request may name in `direction_layer`; none for v1.
+      json::Value direction_layers = json::Value::array();
+      if (info.direction_layer)
+        for (std::uint32_t layer = 0; layer < info.layers; ++layer)
+          direction_layers.push_back(static_cast<unsigned long long>(layer));
+      abliteration["direction_layers"] = std::move(direction_layers);
+      abliteration["direction_layer"] =
+          info.direction_layer ? json::Value(static_cast<unsigned long long>(
+                                     *info.direction_layer))
+                               : json::Value(nullptr);
+      abliteration["attention"] = strengths(info.attention);
+      abliteration["mlp"] = strengths(info.mlp);
+      abliteration["residual"] = strengths(info.residual);
+      // Projection options: the kinds a request may choose, the stored
+      // subspace rank (the largest `directions`) and the defaults.
+      json::Value kinds = json::Value::array();
+      for (const auto& kind : info.direction_kinds)
+        kinds.push_back(kind);
+      abliteration["direction_kinds"] = std::move(kinds);
+      abliteration["direction_kind"] = info.direction_kind;
+      abliteration["max_directions"] =
+          static_cast<unsigned long long>(info.rank);
+      abliteration["directions"] =
+          static_cast<unsigned long long>(info.direction_count);
+      abliteration["preserve_norm"] = info.preserve_norm;
+      abliteration["subspace_method"] = info.subspace_method.empty()
+                                            ? json::Value(nullptr)
+                                            : json::Value(info.subspace_method);
+      // A dynamic profile turns ON by itself when its score exceeds the
+      // threshold; null for a profile only requests turn ON.
+      if (info.trigger_layer && info.trigger_threshold) {
+        json::Value trigger = json::Value::object();
+        trigger["layer"] = static_cast<unsigned long long>(*info.trigger_layer);
+        trigger["threshold"] = static_cast<double>(*info.trigger_threshold);
+        abliteration["trigger"] = std::move(trigger);
+      } else {
+        abliteration["trigger"] = nullptr;
+      }
+      abliteration["max_strength"] =
+          static_cast<double>(models::qwen::kAbliterationMaxWeight);
+    };
     json::Value abliteration = json::Value::object();
-    abliteration["profile"] = "default";
-    abliteration["schema"] = info->schema;
-    abliteration["identity"] = info->identity;
-    abliteration["layers"] = static_cast<unsigned long long>(info->layers);
-    // Layers a request may name in `direction_layer`; none for v1.
-    json::Value direction_layers = json::Value::array();
-    if (info->direction_layer)
-      for (std::uint32_t layer = 0; layer < info->layers; ++layer)
-        direction_layers.push_back(static_cast<unsigned long long>(layer));
-    abliteration["direction_layers"] = std::move(direction_layers);
-    abliteration["direction_layer"] =
-        info->direction_layer ? json::Value(static_cast<unsigned long long>(
-                                    *info->direction_layer))
-                              : json::Value(nullptr);
-    abliteration["attention"] = strengths(info->attention);
-    abliteration["mlp"] = strengths(info->mlp);
-    abliteration["residual"] = strengths(info->residual);
-    // Projection options: the kinds a request may choose, the stored
-    // subspace rank (the largest `directions`) and the defaults.
-    json::Value kinds = json::Value::array();
-    for (const auto& kind : info->direction_kinds)
-      kinds.push_back(kind);
-    abliteration["direction_kinds"] = std::move(kinds);
-    abliteration["direction_kind"] = info->direction_kind;
-    abliteration["max_directions"] =
-        static_cast<unsigned long long>(info->rank);
-    abliteration["directions"] =
-        static_cast<unsigned long long>(info->direction_count);
-    abliteration["preserve_norm"] = info->preserve_norm;
-    abliteration["subspace_method"] = info->subspace_method.empty()
-                                          ? json::Value(nullptr)
-                                          : json::Value(info->subspace_method);
-    abliteration["max_strength"] =
-        static_cast<double>(models::qwen::kAbliterationMaxWeight);
+    if (profiles.size() == 1)
+      describe(profiles.front(), abliteration);
+    json::Value list = json::Value::array();
+    for (const auto& info : profiles) {
+      json::Value item = json::Value::object();
+      describe(info, item);
+      list.push_back(std::move(item));
+    }
+    abliteration["profiles"] = std::move(list);
     resp["abliteration"] = std::move(abliteration);
   }
   return Ok(resp);

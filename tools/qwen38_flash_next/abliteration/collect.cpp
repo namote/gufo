@@ -80,7 +80,8 @@ int main(int argc, char** argv) {
     const bool enabled = !profile.empty();
     q::ModelOptions options;
     options.max_context = 2048 + (collect ? 0 : max_new_tokens);
-    options.abliteration_profile = profile;
+    if (enabled)
+      options.abliteration_profiles = {profile};
     std::string error;
     auto model = q::Model::Load(argv[1], options, &error);
     Require(bool(model), error);
@@ -90,7 +91,8 @@ int main(int argc, char** argv) {
     // The profile defaults; a v2 profile's per-request settings are a
     // server feature.
     session->ConfigureAbliteration(
-        enabled ? q::ResolveAbliterationSettings(*model->Abliteration())
+        enabled ? q::ResolveAbliterationSettings(
+                      *model->AbliterationProfiles().front())
                 : nullptr);
     const auto& config = model->config();
     std::ifstream input(argv[2]);
@@ -135,7 +137,8 @@ int main(int argc, char** argv) {
     manifest["layers"] = static_cast<unsigned long long>(config.num_layers);
     manifest["split"] = split;
     manifest["mode"] = argv[4];
-    manifest["profile"] = enabled ? model->Abliteration()->identity : "off";
+    manifest["profile"] =
+        enabled ? model->AbliterationProfiles().front()->identity : "off";
     manifest["records"] = records;
     fs::create_directories(output);
     if (fs::exists(output / "manifest.json"))

@@ -131,12 +131,17 @@ class Objective:
         n = self.layers
         theta = expand(params, n, self.args.block_size)
         a = self.args
-        return dict(enabled=True, profile='default', direction_layer=a.direction_layer,
-                    direction_kind=a.direction_kind, directions=a.directions,
-                    preserve_norm=a.preserve_norm == 'on',
-                    attention=[round(x, 5) for x in theta[:n]],
-                    mlp=[round(x, 5) for x in theta[n:2 * n]],
-                    residual=[round(x, 5) for x in theta[2 * n:]])
+        settings = dict(enabled=True, direction_layer=a.direction_layer,
+                        direction_kind=a.direction_kind, directions=a.directions,
+                        preserve_norm=a.preserve_norm == 'on',
+                        attention=[round(x, 5) for x in theta[:n]],
+                        mlp=[round(x, 5) for x in theta[n:2 * n]],
+                        residual=[round(x, 5) for x in theta[2 * n:]])
+        # A server with several profiles needs the name; with one it is the
+        # default.
+        if a.profile:
+            settings['profile'] = a.profile
+        return settings
 
     def __call__(self, theta):
         return self.evaluate([theta])[0]
@@ -217,6 +222,8 @@ def main(argv=None):
                     help='summed log-probability lead (nats) a correct fact answer needs over the wrong one')
     ap.add_argument('--layers', type=int, default=48)
     ap.add_argument('--direction-layer', type=int, required=True)
+    ap.add_argument('--profile', default='',
+                    help='loaded profile name (needed when the server loads several)')
     ap.add_argument('--direction-kind', default='projected')
     ap.add_argument('--directions', type=int, default=1)
     ap.add_argument('--preserve-norm', choices=('on', 'off'), default='off')

@@ -90,7 +90,7 @@ def main() -> int:
     args = parser.parse_args()
     settings = [None]
     if args.abliteration:
-        settings.append({"enabled": True, "profile": "default"})
+        settings.append({"enabled": True})
     failures = []
     for ablation in settings:
         for prompt in PROMPTS:

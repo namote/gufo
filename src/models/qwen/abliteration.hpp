@@ -55,6 +55,28 @@ inline constexpr std::size_t kAbliterationMaxProfileBytes = 48 << 20;
 /// generic subspace and the KL to OFF grows.
 inline constexpr std::uint32_t kAbliterationMaxDirections = 8;
 
+/// The most profiles one server loads (`--abliteration-profiles`).
+inline constexpr std::size_t kAbliterationMaxProfiles = 8;
+/// A dynamic profile's detector schema (fit_trigger.py).
+inline constexpr std::string_view kAbliterationTriggerSchema =
+    "gufo-abliteration-trigger-v1";
+/// The collector readout a placement's detector must be fitted on: the
+/// post-layer residual of the last prompt token, averaged over the HC
+/// streams on Flash-Next.
+[[nodiscard]] std::string_view AbliterationReadout(
+    std::string_view placement) noexcept;
+
+/// A profile's detector (R2 dynamic abliteration): the server scores
+/// <h, direction> on the post-layer residual of `layer`, read exactly where
+/// the collector reads it, and turns the profile ON for the rest of a request
+/// whose score exceeds `threshold`.
+struct AbliterationTrigger {
+  std::uint32_t layer{0};
+  /// Unit vector of the profile's hidden size.
+  std::vector<float> direction;
+  float threshold{0};
+};
+
 /// Which direction family a request projects (D18).
 enum class AbliterationDirectionKind : std::uint32_t {
   /// refusal mean minus ordinary mean (the D14/D16 direction)
@@ -112,6 +134,10 @@ struct AbliterationProfile {
   std::string identity;
   std::string model_identity;
   std::string placement;
+  /// The file name without `.json`; requests select the profile by it.
+  std::string name;
+  /// Optional v2 member `trigger`: only such a profile turns ON by itself.
+  std::optional<AbliterationTrigger> trigger;
 
   [[nodiscard]] std::uint32_t direction_rows() const noexcept {
     return hidden ? static_cast<std::uint32_t>(directions.size() / hidden) : 0;
@@ -141,6 +167,9 @@ struct AbliterationProfile {
 /// strengths, with an identity that salts its cache state. A null settings
 /// pointer everywhere means OFF.
 struct AbliterationSettings {
+  /// AbliterationProfile::name of the profile these settings resolve; not
+  /// part of `identity`, which already covers the profile's bytes.
+  std::string profile;
   /// The chosen direction's source layer; empty for a v1 profile.
   std::optional<std::uint32_t> direction_layer;
   /// First row of AbliterationProfile::directions; the projection uses
@@ -170,7 +199,10 @@ struct AbliterationSettings {
   /// bits (kAbliterationRowMask and below; exactly `direction_row` for one
   /// direction without norm preservation); word AbliterationWeightIndex(...)
   /// is one site's strength.
-  [[nodiscard]] std::vector<float> DeviceWords() const;
+  /// `row_offset` is added to the direction row: a model holding several
+  /// profiles in one direction table passes the profile's first row.
+  [[nodiscard]] std::vector<float> DeviceWords(
+      std::uint32_t row_offset = 0) const;
   /// Whether any residual strength is nonzero. Only then do the models launch
   /// the residual projection (at every layer, zero strengths included) and
   /// leave fusions that derive values from the post-layer residual. Like
@@ -204,6 +236,8 @@ enum class AbliterationPoint : std::uint32_t {
 /// keep the profile defaults; one value applies to every layer; otherwise
 /// exactly `layers` values.
 struct AbliterationOverrides {
+  /// AbliterationProfile::name; empty selects the only loaded profile.
+  std::string profile;
   std::optional<std::uint32_t> direction_layer;
   std::vector<float> attention;
   std::vector<float> mlp;
@@ -232,11 +266,23 @@ std::shared_ptr<const AbliterationSettings> ResolveAbliterationSettings(
 std::vector<std::uint8_t> AbliterationInputIdentity(
     std::span<const std::uint8_t> input, std::string_view settings_identity);
 
-/// Loads the explicit `--abliteration-profile` file. An empty option loads
-/// none; no file beside the model is ever picked up implicitly.
+/// Loads one profile file. An empty path loads none; no file beside the
+/// model is ever picked up implicitly.
 std::shared_ptr<const AbliterationProfile> LoadAbliterationOption(
     const std::string& option, std::uint32_t hidden, std::uint32_t layers,
     std::string_view model_identity, std::string_view placement);
+
+/// The profile files of `--abliteration-profiles DIR`: every regular
+/// `*.json` file directly in DIR, sorted by name. An empty option lists none.
+/// Throws std::invalid_argument for a missing directory, one without
+/// profiles, or more than kAbliterationMaxProfiles.
+std::vector<std::string> ListAbliterationProfiles(const std::string& option);
+
+/// The profile `name` selects among `profiles` (empty: the only one).
+/// Throws std::invalid_argument naming the loaded profiles otherwise.
+const AbliterationProfile& SelectAbliterationProfile(
+    std::span<const std::shared_ptr<const AbliterationProfile>> profiles,
+    std::string_view name);
 
 /// Mode and settings recorded in a component-cache continuation: a guard
 /// independent of the salted context identity. OFF (`active` null) records

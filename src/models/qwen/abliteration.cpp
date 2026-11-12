@@ -191,11 +191,45 @@ void LoadSubspace(const json::Value& root, AbliterationProfile* result) {
   }
 }
 
+// The optional v2 `trigger` member (fit_trigger.py).
+AbliterationTrigger LoadTrigger(const json::Value& value,
+                                const AbliterationProfile& profile) {
+  if (!value.is_object() ||
+      value.member_str("schema") != kAbliterationTriggerSchema)
+    Invalid("trigger (schema gufo-abliteration-trigger-v1)");
+  if (value.member_str("readout") != AbliterationReadout(profile.placement))
+    Invalid("trigger.readout (not this placement's collector readout)");
+  AbliterationTrigger trigger;
+  trigger.layer =
+      ReadCount(value.find("layer"), "trigger.layer", 0, profile.layers - 1);
+  const auto* direction = value.find("direction");
+  if (!direction)
+    Invalid("trigger.direction");
+  trigger.direction =
+      DecodeFloats(*direction, "trigger.direction", profile.hidden);
+  RequireUnit(trigger.direction, "trigger.direction");
+  const auto* threshold = value.find("threshold");
+  if (!threshold || !threshold->is_number() ||
+      !std::isfinite(threshold->as_double()) ||
+      std::abs(threshold->as_double()) > 1e6)
+    Invalid("trigger.threshold");
+  trigger.threshold = static_cast<float>(threshold->as_double());
+  return trigger;
+}
+
 constexpr std::array<std::string_view, 7> kSubspaceMembers{
     "rank",           "subspace_directions", "projected_directions",
     "direction_kind", "direction_count",     "preserve_norm",
     "subspace_method"};
 }  // namespace
+
+std::string_view AbliterationReadout(std::string_view placement) noexcept {
+  if (placement == kAbliterationWriterBeforeHc)
+    return "last-prompt-token-post-layer-hc-mean-fp32-v1";
+  if (placement == kAbliterationWriterBeforeResidual)
+    return "last-prompt-token-post-layer-fp32-v1";
+  return {};
+}
 
 std::string_view AbliterationDirectionKindName(
     AbliterationDirectionKind kind) noexcept {
@@ -256,6 +290,8 @@ AbliterationProfile AbliterationProfile::Load(const std::filesystem::path& path,
     for (const auto member : kSubspaceMembers)
       if (root.find(std::string(member)))
         Invalid(std::string(member) + " (needs gufo-abliteration-v2)");
+    if (root.find("trigger"))
+      Invalid("trigger (needs gufo-abliteration-v2)");
     result.residual.assign(layers, 0.0F);
   } else {
     result.schema = 2;
@@ -291,23 +327,29 @@ AbliterationProfile AbliterationProfile::Load(const std::filesystem::path& path,
     // Optional: without them, rank 1, mean difference, no norm preservation,
     // and `directions` keeps exactly its rows.
     LoadSubspace(root, &result);
+    if (const auto* trigger = root.find("trigger"))
+      result.trigger = LoadTrigger(*trigger, result);
   }
+  result.name = path.stem().string();
   result.identity = crypto::Sha256Hex(std::span(
       reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()));
   return result;
 }
 
-std::vector<float> AbliterationSettings::DeviceWords() const {
+std::vector<float> AbliterationSettings::DeviceWords(
+    std::uint32_t row_offset) const {
   if (attention.size() != mlp.size() || attention.size() != residual.size())
     throw std::logic_error("abliteration settings are inconsistent");
   const auto layers = static_cast<std::uint32_t>(attention.size());
-  if (direction_row > kAbliterationRowMask || direction_count == 0 ||
-      direction_count > kAbliterationMaxDirections)
+  if (row_offset > kAbliterationRowMask ||
+      direction_row > kAbliterationRowMask - row_offset ||
+      direction_count == 0 || direction_count > kAbliterationMaxDirections)
     throw std::logic_error("abliteration settings are inconsistent");
   std::vector<float> words(AbliterationDeviceWords(layers));
-  words[0] = std::bit_cast<float>(
-      direction_row | (direction_count - 1) << kAbliterationCountShift |
-      (preserve_norm ? kAbliterationPreserveNormBit : 0U));
+  words[0] =
+      std::bit_cast<float>((direction_row + row_offset) |
+                           (direction_count - 1) << kAbliterationCountShift |
+                           (preserve_norm ? kAbliterationPreserveNormBit : 0U));
   using enum AbliterationPoint;
   for (std::uint32_t layer = 0; layer < layers; ++layer) {
     words[AbliterationWeightIndex(layers, layer, kAttention)] =
@@ -327,6 +369,7 @@ std::shared_ptr<const AbliterationSettings> ResolveAbliterationSettings(
     const AbliterationOverrides& overrides) {
   const auto layers = profile.layers;
   auto result = std::make_shared<AbliterationSettings>();
+  result->profile = profile.name;
   if (overrides.direction_layer) {
     if (!profile.selectable_direction())
       throw std::invalid_argument(
@@ -437,6 +480,59 @@ std::shared_ptr<const AbliterationProfile> LoadAbliterationOption(
     return nullptr;
   return std::make_shared<const AbliterationProfile>(AbliterationProfile::Load(
       option, hidden, layers, model_identity, placement));
+}
+
+std::vector<std::string> ListAbliterationProfiles(const std::string& option) {
+  if (option.empty())
+    return {};
+  namespace fs = std::filesystem;
+  std::error_code error;
+  if (!fs::is_directory(option, error))
+    throw std::invalid_argument(
+        "abliteration: --abliteration-profiles needs a directory");
+  std::vector<std::string> files;
+  for (const auto& entry : fs::directory_iterator(option)) {
+    if (entry.path().extension() != ".json")
+      continue;
+    if (!entry.is_regular_file())
+      throw std::invalid_argument("abliteration: profile " +
+                                  entry.path().filename().string() +
+                                  " is not a regular file");
+    files.push_back(entry.path().string());
+  }
+  if (files.empty())
+    throw std::invalid_argument(
+        "abliteration: no *.json profile in --abliteration-profiles");
+  if (files.size() > kAbliterationMaxProfiles)
+    throw std::invalid_argument("abliteration: more than " +
+                                std::to_string(kAbliterationMaxProfiles) +
+                                " profiles");
+  std::ranges::sort(files);
+  return files;
+}
+
+const AbliterationProfile& SelectAbliterationProfile(
+    std::span<const std::shared_ptr<const AbliterationProfile>> profiles,
+    std::string_view name) {
+  const auto names = [&] {
+    std::string list;
+    for (const auto& profile : profiles)
+      list += (list.empty() ? "'" : ", '") + profile->name + "'";
+    return list.empty() ? std::string("none") : list;
+  };
+  if (name.empty()) {
+    if (profiles.size() == 1)
+      return *profiles.front();
+    throw std::invalid_argument(
+        "abliteration: name one of the loaded profiles in "
+        "'abliteration.profile': " +
+        names());
+  }
+  for (const auto& profile : profiles)
+    if (profile->name == name)
+      return *profile;
+  throw std::invalid_argument("abliteration: unknown profile '" +
+                              std::string(name) + "'; loaded: " + names());
 }
 
 AbliterationContinuationRecord RecordAbliterationContinuation(
