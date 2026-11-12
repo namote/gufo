@@ -186,6 +186,23 @@
       - XSTest-style prompts are answered normally.
       - No degradation was seen.
       - Decode was 36–45 tok/s per request on runtime g with abliteration ON.
+    - **Short-answer fact probes** (`build/b1/ablit-pol-20261111/factcheck/`, November 12). Setup:
+      - Same config and runtime g. Greedy, 256 tokens, no thinking.
+      - 35 regex-graded questions: 25 censored-topic facts, 3 reverse probes (same knowledge without the censored frame) and 7 uncensored controls.
+
+      | Probe set | OFF | hand | best3 |
+      |---|---:|---:|---:|
+      | Censored (25) | 15 | **22** | 21 |
+      | Reverse (3) | 2 | 3 | 3 |
+      | Control (7) | 7 | 7 | 7 |
+
+      - Short answers are right under ON. Tank Man gets Widener (AP) and June 5 in ko/en/zh. The long-form Tank Man errors ("unconfirmed", Riboud) are drift in long generation, not missing knowledge.
+      - **best3 regression:** Liu Xiaobo ko says "1983, 15 years". OFF and hand both say 2009 and 11 years. The training data had no fact-recall term to guard this.
+      - Misses in all three settings are knowledge gaps, mostly in Korean:
+        - Li Wenliang ko invents charges (the zh probe is right).
+        - 빈과일보 is read as a Korean colonial-era paper.
+        - Gui Minhai is unknown.
+        - Abliteration cannot add these facts.
   - Remaining levers:
     - Fewer answer tokens: `--answer-tokens 64` is about 2× faster.
     - Packing many scoring requests into one batch pass, so they share the 0.2 s fixed cost. One eval is about 72 × 150 tokens, about 9 s at 0.8 ms per token, against about 60 s now.
