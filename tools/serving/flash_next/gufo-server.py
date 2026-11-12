@@ -25,12 +25,9 @@ IMAGE_ID = 'sha256:e7a761a40187efb13515a0275362ab09d084a129f4544aa4300ec5cccb8c7
 MODEL = '/home/m2on/projects/models/llm/flash-next-exl3-gufo-c03'
 RUNTIME = '/home/m2on/.local/share/gufo/runtime-20261111b'
 GUFO_SHA256 = '868b34a46ba5a3823644b528c872ec8b60fcc5e35948e3b6fdb32add6ac5f081'
-# Runtime abliteration profiles shipped in RUNTIME/abliteration/ (every *.json
-# there loads; a binary from before --abliteration-profiles took one file).
-# A profile without `trigger` is loaded only and requests enable it per call;
-# one with `trigger` turns ON by itself for requests that do not set
-# `abliteration`.
-ABLITERATION_PROFILES = '/candidate/abliteration'
+# Runtime abliteration profile shipped in RUNTIME (writer, layer-36 direction,
+# attention 2, mlp 0.5). Loaded only; requests enable it per call.
+ABLITERATION_PROFILE = '/candidate/abliteration-fnx.json'
 TEMPERATURE = 0.75
 # Scale Han-ideograph token probability by 0.1 in the final answer only, not in thinking
 # (docs/SERVER.md --han-scale, --han-scale-scope); requests may override.
@@ -160,7 +157,7 @@ def build_command(state):
                 '--temperature', str(TEMPERATURE), '--top-k', '20', '--top-p', '0.95', '--min-p', '0',
                 '--repeat-penalty', '1', '--han-scale', str(HAN_SCALE),
                 '--han-scale-scope', HAN_SCALE_SCOPE,
-                '--abliteration-profiles', ABLITERATION_PROFILES,
+                '--abliteration-profile', ABLITERATION_PROFILE,
                 '--presence-penalty', '0', '--frequency-penalty', '0', '--max-tokens', '-1',
                 '--request-timeout-ms', '0', '--stall-timeout-ms', '0',
                 '--max-output-bytes', '9223372036854775807',

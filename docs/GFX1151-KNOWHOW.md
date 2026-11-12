@@ -232,7 +232,10 @@
   - Recall is what drops: the political controls (Gwangju, Tiananmen-like events elsewhere) are hard negatives. With the threshold set on the pooled negatives instead, the political detector reaches 90.7% recall at 2.3% FP on the controls.
   - The fold directions agree with the deployed direction to cosine ≥ 0.997.
   - Profiles: `dynamic/profiles-pol/` (pol-avg with trigger) and `dynamic/profiles-pol-fnx/` (also fnx with trigger). The sources in `~/.local/share/gufo/runtime-20261111g/` are unchanged.
+  - The fnx detector uses `--topics none` (its advbench/harmbench/alpaca/xstest prompts have no cheap paraphrase map), so only the two thinking modes of one text share a fold.
+  - Thresholds are for the last prompt row only. A `decode_threshold` for generated rows is still to be fitted from `max_scores` of ordinary generations in the GPU pass.
   - No GPU check yet; R2-4 measures detection on the server.
+  - **Deploy note (R2-5):** `--abliteration-profiles DIR` replaced `--abliteration-profile FILE`. The pinned runtime (runtime-20261111b in `tools/serving/flash_next/gufo-server.py`) predates it. A deploy must bump `RUNTIME`, `GUFO_SHA256` and the option together, and create the profiles directory inside the new runtime (only profiles in it: every `*.json` there loads). Production runs its own copy of the launcher under `~/.local/share/gufo`.
 
 ## Flash-Next c03 1M YaRN K4V4 serving and time-shared scheduler, November 11, 2026 (deployed)
 
