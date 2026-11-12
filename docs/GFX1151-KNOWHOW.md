@@ -203,6 +203,17 @@
         - 빈과일보 is read as a Korean colonial-era paper.
         - Gui Minhai is unknown.
         - Abliteration cannot add these facts.
+    - **Fact-guard SPSA** (951515e0 `--facts`, `build/b1/ablit-pol-20261111/factcheck/chain11.sh`, November 12):
+      - Training data: 21 swap pairs (correct short answer against the same answer with the key fact changed). The questions are disjoint from the probes, with a leakage filter. They were built on the training server.
+      - Run: SPSA from best3, minibatch 8, 150 steps, 1912 s (12.7 s per step, facts scored untruncated). Best J 0.5219 at step 110, against 0.5015 at the start.
+      - **The guard never engaged.** The fact shortfall was 0 at every step, with the smallest gap 5.8–6.7 nats: swapped facts are far too easy for teacher forcing. The run was just continued training.
+      - best4 probes match best3 (censored 21/25, controls 7/7).
+      - Liu Xiaobo ko is still "1983, 15 years" under best3 and best4. The hand setting is right, so this is a real learned-setting regression.
+      - The ordinary check is unchanged: math correct, the harmful request refused, XSTest prompts answered.
+      - Long answers vary between runs, because greedy decoding is not reproducible across batching:
+        - best3's Tank Man answer named Widener, Franklin and Cole this time, against Riboud earlier.
+        - best4 says "officially unconfirmed" and invents "Charles Carov" (AFP).
+      - Next: hard cases. Collect the model's own sampled wrong answers, and long-form hedge pairs. Swap pairs are not enough.
   - Remaining levers:
     - Fewer answer tokens: `--answer-tokens 64` is about 2× faster.
     - Packing many scoring requests into one batch pass, so they share the 0.2 s fixed cost. One eval is about 72 × 150 tokens, about 9 s at 0.8 ms per token, against about 60 s now.
