@@ -225,6 +225,17 @@ class GenerateTest(unittest.TestCase):
         self.assertEqual(body['steering'], {'profile': 'x'})
         self.assertEqual(body['messages'], [{'role': 'user', 'content': PROBLEM['prompt']}])
 
+    def test_system_message_is_sent_and_recorded(self):
+        body = generate.request_body(PROBLEM, 'm', 600, {'enabled': False}, system='Be brief.')
+        self.assertEqual(body['messages'], [{'role': 'system', 'content': 'Be brief.'},
+                                            {'role': 'user', 'content': PROBLEM['prompt']}])
+        response = {'choices': [{'message': {'content': 'x'}, 'finish_reason': 'stop'}]}
+        record = generate.answer_record(PROBLEM, 'c', body, response, 1.0)
+        self.assertEqual(record['settings']['system'], 'Be brief.')
+        plain = generate.answer_record(
+            PROBLEM, 'c', generate.request_body(PROBLEM, 'm', 600, {}), response, 1.0)
+        self.assertNotIn('system', plain['settings'])
+
     def test_resume_and_score_keep_other_lines(self):
         calls = []
 

@@ -7,8 +7,9 @@ Run on the GPU pass against a running Gufo server (one request at a time):
         --set build/b1/r5-coding --config base
 
 Each request is greedy, thinking off, 600 tokens, with dynamic abliteration
-off ({"enabled": false}); --extra-body merges further request fields (for
-example a steering profile) and --config names the run. Answers are appended
+off ({"enabled": false}); --system adds a system message, --extra-body merges
+further request fields (for example a steering profile) and --config names
+the run. Answers are appended
 to <set>/results/<config>.jsonl one problem per line, so an interrupted run
 resumes where it stopped. After generation the code blocks are extracted and
 the hidden tests run in the Docker sandbox (no network, read-only); the score
@@ -31,10 +32,13 @@ DEFAULT_SERVER = 'http://127.0.0.1:18740'
 DEFAULT_MODEL = 'gufo-flash-next'
 
 
-def request_body(problem, model, max_tokens, abliteration, extra=None):
+def request_body(problem, model, max_tokens, abliteration, extra=None, system=None):
+    messages = [{'role': 'user', 'content': problem['prompt']}]
+    if system:
+        messages.insert(0, {'role': 'system', 'content': system})
     body = {
         'model': model,
-        'messages': [{'role': 'user', 'content': problem['prompt']}],
+        'messages': messages,
         'max_tokens': max_tokens,
         'temperature': 0,
         'chat_template_kwargs': {'enable_thinking': False},
@@ -64,6 +68,9 @@ def answer_record(problem, config, body, response, elapsed):
     choice = response['choices'][0]
     message = choice.get('message') or {}
     settings = {k: v for k, v in body.items() if k != 'messages'}
+    system = [m['content'] for m in body['messages'] if m['role'] == 'system']
+    if system:
+        settings['system'] = system[0]
     return dict(id=problem['id'], split=problem['split'], lang=problem['lang'],
                 category=problem['category'], config=config,
                 text=message.get('content') or '',
@@ -80,14 +87,14 @@ def done_ids(path):
 
 
 def generate(problems, out, config, server, model, max_tokens, abliteration, extra,
-             timeout, post=post_chat, log=print):
+             timeout, post=post_chat, log=print, system=None):
     sandbox.drop_torn_tail(out)
     finished = done_ids(out)
     todo = [p for p in problems if p['id'] not in finished]
     log(f'{config}: {len(todo)} to generate, {len(finished)} already in {out}')
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     for number, problem in enumerate(todo, 1):
-        body = request_body(problem, model, max_tokens, abliteration, extra)
+        body = request_body(problem, model, max_tokens, abliteration, extra, system)
         start = time.monotonic()
         response = post(server, body, timeout)
         record = answer_record(problem, config, body, response, time.monotonic() - start)
@@ -132,6 +139,7 @@ def main():
                         help='JSON for the request\'s abliteration field')
     parser.add_argument('--extra-body', default='{}',
                         help='JSON object merged into every request body')
+    parser.add_argument('--system', help='system message sent before every problem')
     parser.add_argument('--request-timeout', type=float, default=600)
     parser.add_argument('--no-score', action='store_true')
     parser.add_argument('--image', default=sandbox.DEFAULT_IMAGE)
@@ -148,13 +156,14 @@ def main():
     extra = json.loads(args.extra_body)
     if args.dry_run:
         print(json.dumps(request_body(problems[0], args.model, args.max_tokens,
-                                      abliteration, extra), ensure_ascii=False, indent=2))
+                                      abliteration, extra, args.system),
+                         ensure_ascii=False, indent=2))
         return 0
     runner = None
     if not args.no_score:  # check the sandbox before spending GPU time
         runner = sandbox.make_runner('docker', image=args.image)
     generate(problems, out, args.config, args.server, args.model, args.max_tokens,
-             abliteration, extra, args.request_timeout)
+             abliteration, extra, args.request_timeout, system=args.system)
     if runner is not None:
         score_file(out, problems, runner, args.test_timeout, args.jobs)
     return 0
