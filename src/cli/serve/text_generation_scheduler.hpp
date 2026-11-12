@@ -29,6 +29,13 @@ inline constexpr std::size_t kDefaultDecodeActivePrefillTokens = 512;
 // prefill stops on this absolute interval, the cache grid's spacing, so an
 // arrival's wait does not depend on how many grid points the RAM budget keeps.
 inline constexpr std::size_t kAdmissionPrefillTokens = 2048;
+// R2 A2: a dynamic abliteration detection readmits its request ON only when
+// at most this many prompt tokens remain to prefill ON after the longest
+// cached ON checkpoint (RAM estimate). At the measured ~900-1000 tok/s of
+// deep-context prefill on gfx1151 that bounds the extra latency near 35 s;
+// a first detection deep in a long conversation stays OFF and is reported
+// with `skipped: "reprefill_cap"`.
+inline constexpr std::size_t kMaxAbliterationReprefillTokens = 32768;
 inline constexpr std::size_t kDefaultMaxOutputBytes =
     static_cast<std::size_t>(1024) * 1024;
 inline constexpr std::size_t kDefaultMaxBufferedOutputBytes =

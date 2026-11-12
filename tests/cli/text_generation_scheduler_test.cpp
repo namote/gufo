@@ -1163,6 +1163,31 @@ void TestPrefillDetectionReadmitsTheRequestOn() {
          "other requests are not readmitted");
 }
 
+void TestLongReprefillStaysOff() {
+  auto control = std::make_shared<FakeControl>();
+  control->readmit_label = 9;
+  control->max_context = 40000;
+  auto scheduler = MakeScheduler(control, 1);
+  std::vector<TextRunnerToken> prompt(
+      gufo::server::kMaxAbliterationReprefillTokens + 1, 7);
+  prompt.front() = 9;
+  const auto result = scheduler->Submit(prompt, 2, 0.0F).Wait();
+  std::size_t prefills = 0, consumed = 0;
+  for (const auto& event : control->Events())
+    if (event.kind == EventKind::kPrefill && event.label == 9) {
+      ++prefills;
+      consumed += event.count;
+    }
+  Expect(consumed == prompt.size() && result.tokens == ExpectedTokens(9, 2),
+         "a detection past the re-prefill cap is served OFF once");
+  Expect(result.abliteration &&
+             result.abliteration->skipped == "reprefill_cap" &&
+             !result.abliteration->position &&
+             result.abliteration->triggered == std::vector<std::string>{"pol"},
+         "the capped detection is reported without an ON position");
+  (void)prefills;
+}
+
 void TestRunnerCanSkipUnusedFinalAdvance() {
   auto control = std::make_shared<FakeControl>();
   control->final_token_advance_required = false;
@@ -4024,6 +4049,7 @@ int main() {
   TestAwaitedCheckpointSurvivesCachePressure();
   TestRunnerCanSkipUnusedFinalAdvance();
   TestPrefillDetectionReadmitsTheRequestOn();
+  TestLongReprefillStaysOff();
   TestRunnerCanReuseExactIncrementalText();
   TestGenerationTraceRecordsPromptAndOutput();
   TestMultiTokenDecodePublishesDraftMetricsAndDisablesPrefixReuse();

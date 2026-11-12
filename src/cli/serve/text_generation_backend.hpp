@@ -88,6 +88,9 @@ struct AbliterationReport {
   /// Prompt tokens prefilled again ON after a prefill detection (A2); the
   /// rest came from an ON checkpoint.
   std::size_t reprefill_tokens{0};
+  /// Why a prefill detection did not readmit the request ON
+  /// ("reprefill_cap"); empty otherwise.
+  std::string skipped;
 };
 
 /// Client-facing message for a GPU context that can no longer execute work.

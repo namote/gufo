@@ -118,12 +118,14 @@ struct ScheduledRequest {
   std::atomic<TextRequestPhase> phase{TextRequestPhase::kQueued};
 
   TextRunnerPool::Request runner_request;
-  /// The lease's cancellation check and row reservation from admission,
-  /// reused when the request is admitted again (A2 readmission).
-  std::function<bool()> lease_cancellation;
-  std::size_t row_limit{0};
-  /// The OFF detection that readmitted the request ON (R2 A2); its report.
+  /// R2 A2: the OFF detection that sent the request back to admission under
+  /// the ON context (`prompt_context`), or that the re-prefill cap refused
+  /// (`skipped`); set before the request leaves its lease.
   std::optional<AbliterationReport> readmitted_abliteration;
+  /// Waiting for its ON admission; cleared once admitted.
+  bool readmitting{false};
+  /// prefill_tokens before the ON admission: prompt progress restarts there.
+  std::size_t progress_base{0};
   TextGenerationScheduler::Result result;
   std::optional<TextGenerationScheduler::Clock::time_point> previous_token;
   std::chrono::duration<double, std::milli> inter_token_total{0};
@@ -363,7 +365,10 @@ void PublishPromptProgress(const std::shared_ptr<ScheduledRequest>& request) {
   const TextGenerationBackend::PromptProgress progress{
       .total = total,
       .cache = cache,
-      .processed = std::min(cache + request->result.prefill_tokens, total),
+      // A readmitted request (R2 A2) restarts at its ON admission.
+      .processed = std::min(
+          cache + request->result.prefill_tokens - request->progress_base,
+          total),
       .time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                      now - *request->prefill_start)
                      .count(),
@@ -996,9 +1001,17 @@ struct TextGenerationScheduler::Impl {
     request->result.ngram_cache_hits = ngram.cache_hits;
     request->result.ngram_disk_reads = ngram.disk_reads;
     request->result.abliteration =
-        request->readmitted_abliteration
-            ? request->readmitted_abliteration
-            : request->runner_request.abliteration_report();
+        request->runner_request.abliteration_report();
+    if (request->readmitted_abliteration &&
+        (!request->result.abliteration ||
+         request->readmitted_abliteration->skipped.empty()))
+      // Readmitted: the ON lease detects nothing; report the OFF detection.
+      request->result.abliteration = request->readmitted_abliteration;
+    else if (request->readmitted_abliteration) {
+      // Capped: the OFF run's own report (with its generated-row scores).
+      request->result.abliteration->position.reset();
+      request->result.abliteration->skipped = "reprefill_cap";
+    }
     const auto cache_commit =
         finish_reason == TextGenerationBackend::FinishReason::kStopSequence
             ? request->runner_request.Cancel()
@@ -1278,18 +1291,17 @@ struct TextGenerationScheduler::Impl {
         }
 
         const std::weak_ptr<ScheduledRequest> weak_request = request;
-        request->lease_cancellation = [weak_request, stop_token] {
-          const auto request = weak_request.lock();
-          return stop_token.stop_requested() || request == nullptr ||
-                 CancellationRequested(request) || DeadlineExceeded(request);
-        };
-        request->row_limit = row_limit;
         request->runner_request = runner_pool->Acquire(
             std::move(request->prompt), request->sampling,
-            request->lease_cancellation, std::move(request->prompt_context),
-            request->cache_prompt, request->cache_prefix_tokens,
-            request->stop_at_eos, request->system_prefix_tokens,
-            request->cache_persist);
+            [weak_request, stop_token] {
+              const auto request = weak_request.lock();
+              return stop_token.stop_requested() || request == nullptr ||
+                     CancellationRequested(request) ||
+                     DeadlineExceeded(request);
+            },
+            std::move(request->prompt_context), request->cache_prompt,
+            request->cache_prefix_tokens, request->stop_at_eos,
+            request->system_prefix_tokens, request->cache_persist);
         // Each admission may restore or capture a checkpoint of its own.
         progress.fetch_add(1, std::memory_order_relaxed);
         if (!request->runner_request) {
@@ -1320,12 +1332,29 @@ struct TextGenerationScheduler::Impl {
             request->runner_request.cache_disk_hit();
         request->result.incremental_prefill_supported =
             incremental_prefill_supported;
-        request->result.queue_ms = std::chrono::duration<double, std::milli>(
-                                       Clock::now() - request->request_start)
-                                       .count();
-        request->result.resident_requests_at_admission =
-            prefilling.size() + decoding.size() + capturing.size() +
-            kv_waiting_count + 1;
+        if (request->readmitting) {
+          // The cache fields above now describe the ON lease; queue time and
+          // residency stay those of the first admission.
+          request->readmitting = false;
+          request->readmitted_abliteration->reprefill_tokens =
+              request->runner_request.prompt_tokens() -
+              request->runner_request.cached_prompt_tokens();
+          Logger::Info(
+              "abliteration",
+              "event=readmitted request=" + std::to_string(request->id) +
+                  " cached_tokens=" +
+                  std::to_string(request->result.cached_prompt_tokens) +
+                  " reprefill_tokens=" +
+                  std::to_string(
+                      request->readmitted_abliteration->reprefill_tokens));
+        } else {
+          request->result.queue_ms = std::chrono::duration<double, std::milli>(
+                                         Clock::now() - request->request_start)
+                                         .count();
+          request->result.resident_requests_at_admission =
+              prefilling.size() + decoding.size() + capturing.size() +
+              kv_waiting_count + 1;
+        }
         request->runner_request.LogMemory("admission", true);
         PublishAdmission(request);
         PublishPromptProgress(request);
@@ -1509,10 +1538,11 @@ struct TextGenerationScheduler::Impl {
       if (CompleteIfStopped(request)) {
         return;
       }
-      const bool decode_ready = step.decode_ready && !Readmit(request);
+      if (step.decode_ready && Readmit(request))
+        return;
 
-      request->phase.store(decode_ready ? TextRequestPhase::kDecodeReady
-                                        : TextRequestPhase::kPrefilling,
+      request->phase.store(step.decode_ready ? TextRequestPhase::kDecodeReady
+                                             : TextRequestPhase::kPrefilling,
                            std::memory_order_release);
     } catch (...) {
       const auto failure = std::current_exception();
@@ -1523,43 +1553,61 @@ struct TextGenerationScheduler::Impl {
   }
 
   // R2 A2: a dynamic abliteration profile detected on the last prompt row
-  // runs the request again as an explicit ON request. The OFF lease is
-  // committed (its prompt state stays cached for OFF requests) and the
-  // request is admitted again under the runner's ON context, restoring the
-  // longest ON checkpoint; the rest of the prompt then prefills ON in
-  // ordinary bounded steps. Returns whether the request still has ON prompt
-  // tokens to prefill.
+  // (TextModelRunner::PrefillReadmission) runs the request again as an
+  // explicit ON request. This is the only path for a prompt-row detection:
+  // the engine never switches it mid-request (DynamicAbliteration::Engage
+  // refuses one). The OFF lease is committed (its prompt state stays cached
+  // for OFF requests; Commit joins the prompt checkpoint's capture, one
+  // component copy, on this step) and the request goes back to the front of
+  // admission with the ON context, where the usual readiness checks (rows,
+  // memory, publication waits) and cancellation apply; it then restores the
+  // longest ON checkpoint and prefills the rest ON in ordinary bounded steps.
+  // Returns whether the request left its lease.
   bool Readmit(const std::shared_ptr<ScheduledRequest>& request) {
     auto context = request->runner_request.readmission();
     if (!context)
       return false;
     auto report = request->runner_request.abliteration_report();
+    if (!report)
+      report.emplace();
     const auto prompt = request->runner_request.prompt();
+    const auto cached = std::min(
+        runner_pool->CachedPrefixTokens(prompt, context.get()), prompt.size());
+    const auto remaining = prompt.size() - cached;
+    if (remaining > kMaxAbliterationReprefillTokens) {
+      // The request stays OFF; the detection is still reported.
+      report->position.reset();
+      report->skipped = "reprefill_cap";
+      request->readmitted_abliteration = std::move(report);
+      Logger::Info(
+          "abliteration",
+          "event=readmit_skipped request=" + std::to_string(request->id) +
+              " reprefill_tokens=" + std::to_string(remaining));
+      return false;
+    }
+    report->position = 0;
+    report->reprefill_tokens = remaining;
+    request->readmitted_abliteration = std::move(report);
     std::vector<TextRunnerToken> tokens(prompt.begin(), prompt.end());
     const auto committed = request->runner_request.Commit();
     request->result.cache_snapshot_bytes += committed.snapshot_bytes;
-    request->runner_request = runner_pool->Acquire(
-        std::move(tokens), request->sampling, request->lease_cancellation,
-        std::move(context), request->cache_prompt, request->cache_prefix_tokens,
-        request->stop_at_eos, request->system_prefix_tokens,
-        request->cache_persist);
+    request->prompt = std::move(tokens);
+    request->prompt_context = std::move(context);
+    request->readmitting = true;
+    // Prompt progress restarts for the ON pass; prefill_tokens and
+    // prefill_ms keep both passes (their rate stays one rate of real work).
+    request->progress_base = request->result.prefill_tokens;
+    request->prefill_start.reset();
+    request->phase.store(TextRequestPhase::kQueued, std::memory_order_release);
     progress.fetch_add(1, std::memory_order_relaxed);
-    if (!request->runner_request)
-      throw std::runtime_error("generation cancelled");
-    request->runner_request.ReserveRows(request->row_limit);
-    if (!report)
-      report.emplace();
-    report->position = 0;
-    report->reprefill_tokens = request->runner_request.prompt_tokens() -
-                               request->runner_request.cached_prompt_tokens();
     Logger::Info(
         "abliteration",
         "event=readmit request=" + std::to_string(request->id) + " profile=" +
-            (report->triggered.empty() ? std::string("none")
-                                       : report->triggered.front()) +
-            " reprefill_tokens=" + std::to_string(report->reprefill_tokens));
-    request->readmitted_abliteration = std::move(report);
-    return !request->runner_request.prefill_complete();
+            (request->readmitted_abliteration->triggered.empty()
+                 ? std::string("none")
+                 : request->readmitted_abliteration->triggered[0]) +
+            " estimated_reprefill_tokens=" + std::to_string(remaining));
+    return true;
   }
 
   // A capture the last step started copies device state on a transfer stream
@@ -2581,7 +2629,10 @@ struct TextGenerationScheduler::Impl {
                 : 0.0;
         decode_credit_earner = request->id;
         if (!IsTerminal(request)) {
-          if (CapturePending(request, CaptureSettleDeadline())) {
+          if (!request->runner_request) {
+            // Readmitted (Readmit): back to the front of admission.
+            waiting.push_front(std::move(request));
+          } else if (CapturePending(request, CaptureSettleDeadline())) {
             capturing.push_back(std::move(request));
           } else if (DecodeReady(request)) {
             decoding.push_back(std::move(request));
@@ -2694,7 +2745,10 @@ struct TextGenerationScheduler::Impl {
       auto request = StepSelectedPrefill(prefilling, SelectPrefill(prefilling),
                                          false, capturing);
       if (!IsTerminal(request)) {
-        if (CapturePending(request, CaptureSettleDeadline())) {
+        if (!request->runner_request) {
+          // Readmitted (Readmit): back to the front of admission.
+          waiting.push_front(std::move(request));
+        } else if (CapturePending(request, CaptureSettleDeadline())) {
           capturing.push_back(std::move(request));
         } else if (DecodeReady(request)) {
           request->decode_due = true;

@@ -599,12 +599,25 @@ profile's `threshold` (one profile: the largest margin `score − threshold`
 wins), the request runs again as an explicit ON request with that profile's
 defaults, exactly as `{"abliteration":{"enabled":true,"profile":NAME}}`
 would: the scheduler commits the OFF state (its prompt checkpoint stays
-cached for OFF requests), admits the request again under the ON settings and
-their cache identity, restores the longest ON checkpoint (shared with
-earlier ON and readmitted requests), and prefills the rest of the prompt ON
-in ordinary bounded steps, honoring cancellation. Generation then starts
-from ON logits; the OFF pass costs one extra prefill of the uncached prompt
-(none of it is decoded). The first token is never sampled from the OFF
+cached for OFF requests; the commit joins that checkpoint's capture, one
+state copy, inside the step) and puts the request back at the front of
+admission under the ON settings and their cache identity. Admission then
+applies its usual readiness checks (KV rows, request memory, publication
+waits) and cancellation, restores the longest ON checkpoint (shared with
+earlier ON and readmitted requests) and prefills the rest of the prompt ON in
+ordinary bounded steps. Generation starts from ON logits; the OFF pass costs
+one extra prefill of the uncached prompt (none of it is decoded). The
+response's cache fields (`cached_prompt_tokens`, cache hit, lookup, restore)
+describe the ON admission; `prefill_tokens` and the prefill time count both
+passes, so their rate stays the rate of work done; streamed prompt progress
+restarts with the ON pass.
+
+The re-prefill is capped: when more than 32768 prompt tokens
+(`kMaxAbliterationReprefillTokens`, about 35 s at the ~900–1000 tok/s of
+deep-context prefill) would remain to prefill ON after the longest cached ON
+checkpoint (a RAM estimate), the request stays OFF and its report says
+`"skipped": "reprefill_cap"` with a null `position`. A first detection deep in
+a long conversation therefore does not re-prefill the whole history. The first token is never sampled from the OFF
 detecting pass: a mid-request switch at the prompt left the first token and
 the prompt K/V OFF, and the GPU check showed that keeps refusals and the
 official framing.
@@ -640,7 +653,8 @@ row of the OFF run (empty when it generated none, as after a readmission);
 detection, the switch point of a generated-row one, null without a crossing;
 `phase` is `prefill` or `decode` (null without one); `reprefill_tokens` is
 the number of prompt tokens prefilled again ON after a readmission (the
-rest came from an ON checkpoint; 0 otherwise).
+rest came from an ON checkpoint; 0 otherwise); `skipped` is
+`"reprefill_cap"` when the cap kept a prompt-row detection OFF, else null.
 
 Cache and continuation: a readmitted request is an explicit ON request from
 its readmission on, so its checkpoints are ON checkpoints that later ON and

@@ -68,6 +68,8 @@ void AddAbliterationReport(const TextGenerationBackend::Result& result,
       report.phase.empty() ? json::Value(nullptr) : json::Value(report.phase);
   value["reprefill_tokens"] =
       static_cast<unsigned long long>(report.reprefill_tokens);
+  value["skipped"] = report.skipped.empty() ? json::Value(nullptr)
+                                            : json::Value(report.skipped);
   out["abliteration"] = std::move(value);
 }
 }  // namespace
