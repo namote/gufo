@@ -37,31 +37,39 @@ This is a reversible inference intervention, not a weight conversion.
 
 | Path | Writers | Post-layer residual |
 | --- | --- | --- |
-| Single session (prompt, decode graphs, verification) | `runtime/executor_hc.cpp` `Combine` | `runtime/executor_forward.cpp` `ForwardBody`, after the FFN `Combine` |
-| Mixed batch, up to eight sessions | `runtime/executor_batch.cpp` | `runtime/executor_batch.cpp`, after the FFN `CombineBatch` |
+| Single session (prompt, decode graphs, verification) | `runtime/executor_hc.cpp` `Combine` | the same FFN `Combine` (`residual`), from `runtime/executor_forward.cpp` `ForwardBody` |
+| Mixed batch, up to eight sessions | `runtime/executor_batch.cpp` `CombineBatch` | the same FFN `CombineBatch` |
 
-- The FFN combine normally also writes the next mixer's grouped norm (F32,
-  F16, tiled Q8, inject partials), and it settles any update the attention
-  combine deferred.
-  A session with a nonzero residual strength takes the unfused layer end
-  instead: the combine gets no next norm (as before a PLE layer), any pending
-  residual update is applied (none should remain), all four streams are
-  projected in place, and the next mixer normalizes the projected residual
-  itself. ON already
-  disables the deferring MoE combines. In a mixed batch the combine writes
-  every session's norm, then only the rows of sessions with residual
-  strengths are projected and renormalized; other sessions keep exactly the
-  norm they had.
-- With all sessions OFF, no projection kernel launches. An ON session launches
-  the projection at every writer, also where its strength is zero (the kernel
-  then returns at once), so its launches do not depend on strength values.
-  Residual projections (and the unfused layer end) run only for a session
-  with a nonzero residual strength, then at every layer; writer-only ON
-  settings launch and fuse exactly as before residual strengths existed.
-  With mixed sessions, one masked kernel covers up to eight sessions at each
-  selected boundary; each row reads its session's direction row and strength
-  from that session's device settings. It updates the existing output in
-  place, without a second activation tensor or per-token upload.
+- **Fused decode combine (R2-3).** Where the combine runs its
+  one-block-per-stream kernel (decode, MTP verification and every mixed
+  batch; `PerStreamCombine`, `HcCombinePerStream`), the projections run
+  inside it (`HcCombineAbliterateKernel`, `HcAbliteration`): each stream
+  block projects the block output row it already holds in registers with
+  the writer strength, adds it to its stream, projects that stream with
+  the residual strength, then stores it and forms the next mixer's norm
+  (F32 and, for a decode batch, Q8_1 rows) from the projected values. An
+  ON pass there launches exactly the kernels of an OFF pass; the
+  projection is `qwen::hip_detail::AbliterateHeldRow`, the separate
+  kernel's operations in its order. Zero strengths skip their projection on
+  the device. OFF batches launch the unchanged plain kernel; OFF rows of a
+  mixed batch take the fused kernel without a projection.
+- Elsewhere (wide prefill routes: the F16 and four-lane combines) the
+  projections stay separate kernels. The FFN combine normally also writes
+  the next mixer's grouped norm (F32, F16, tiled Q8, inject partials), and
+  it settles any update the attention combine deferred. A session with a
+  nonzero residual strength takes the unfused layer end there: the combine
+  gets no next norm (as before a PLE layer), any pending residual update is
+  applied (none should remain), all four streams are projected in place,
+  and the next mixer normalizes the projected residual itself. ON already
+  disables the deferring MoE combines.
+- With all sessions OFF, no projection runs. On the unfused routes an ON
+  session launches the projection at every writer, also where its strength
+  is zero (the kernel then returns at once), so its launches do not depend
+  on strength values; residual projections (and the unfused layer end) run
+  only for a session with a nonzero residual strength, then at every layer.
+  Each row reads its session's direction row and strength from that
+  session's device settings, in place, without a second activation tensor
+  or per-token upload.
 - ON materializes deferred MoE outputs where necessary before projection; this
   can lose an existing fusion, on every layer of an ON session. Actual
   end-to-end overhead remains unmeasured. Small operator cost is not evidence
@@ -396,5 +404,10 @@ sessions, the stream mean's component removed at strength 1, zero-strength
 and OFF tokens left bit-identical, and graph replay with in-place updates;
 and the subspace projection with k in {1, 2, 5, 8} for every HC stream
 against FP64 with mixed sessions and norm preservation, plus one direction
-bit-identical to the single-direction kernel for streams and writer rows. Build it during iteration; run it with the final
+bit-identical to the single-direction kernel for streams and writer rows;
+and the fused decode combine (both launchers, with and without the next
+norm, 96- and 2,560-wide rows, k = 1 and k = 3 with norm preservation)
+against FP64 and the separate kernels, OFF, past-span and zero-strength
+rows byte-identical to the plain combine, plus `Executor::Combine`'s norm
+route with a residual site. Build it during iteration; run it with the final
 combined GPU checks after the serving GPU is available.
