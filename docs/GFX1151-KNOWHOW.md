@@ -127,6 +127,36 @@
     - Generation after scoring is correct.
     - Not exercised: the failed-pack fallback, cancellation, and production K4V4 throughput with runtime f.
     - Values on this FP16 server differ from the K4V4 runs (init J 0.4581 against 0.4658), so compare only runs on the same server.
+  - **Device scoring log-softmax** (e3d1b48a, runtime-20261111g; November 12, after preflight). The server runs 48 sessions with `--max-connections 160` and `--max-pending 160`, otherwise the same 8k native-RoPE FP16 configuration. SPSA sends θ⁺ and θ⁻ in one burst.
+    - Times for the same 312 scorings:
+
+      | Run | Before | Now |
+      |---|---|---|
+      | `--answer-tokens 64` | 50.1 s (runtime f) | **47.2 s** |
+      | whole answers | 67.6 s | 62.7 s |
+      | `--answer-tokens 1` (prompt only) | | **22.4 s** |
+
+    - Values equal runtime f to 6 decimals.
+    - `score_assistant.py --tolerance 0.04` passes, and generation after scoring is correct.
+    - **Where the time goes:**
+      - The CPU reduction was only about 3 s. The 20 s overhead lies elsewhere.
+      - Prompt-only work is 22.4 s for about 16k prompt rows, against about 13 s at prefill rate.
+      - The 64 answer tokens add 25 s for 19.7k rows (1.25 ms per row).
+      - Requests report about 2,400 n-gram rows each, about 12% of them disk reads.
+      - Not yet profiled.
+    - **SPSA variants**, 30 steps each from `best.json` at concurrency 48:
+
+      | Variant | Steps done | Time per step | Result |
+      |---|---|---|---|
+      | base (64 tokens) | 30 | 23 s | eval J 0.4581 → 0.4598 (step 10) → 0.4735 (step 20) → 0.4770 (step 30). Common eval 0.4770, margin 0.657, drop 0.045 |
+      | t32 (32 tokens) | 25 | 15.8 s | its own 32-token J 0.6254 → 0.6389 at step 20; not comparable to the others |
+      | mb8 (minibatch 8) | 12 | about 10 s | eval J 0.4581 → 0.4633 at step 10 (base was 0.4598 at step 10) |
+      | blk6 (block size 6) | 9 | | compressing the per-layer `best.json` to block means drops the start to J 0.4460, so blocks only suit fresh starts |
+
+    - **Connection resets:** t32, mb8 and blk6 stopped on client-side `ConnectionResetError` in getresponse.
+      - The server log shows 12,010 requests received and 12,010 completed, with no error lines.
+      - The HTTP server answers overload with a 503, not a reset.
+      - The cause is open. spsa now retries dropped connections (c445043f); that retry is not yet exercised on the GPU.
   - Remaining levers:
     - Fewer answer tokens: `--answer-tokens 64` is about 2× faster.
     - Packing many scoring requests into one batch pass, so they share the 0.2 s fixed cost. One eval is about 72 × 150 tokens, about 9 s at 0.8 ms per token, against about 60 s now.
