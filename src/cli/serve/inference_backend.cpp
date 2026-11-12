@@ -3200,9 +3200,9 @@ public:
   // A detecting request reuses at most prompt.size() - 1 cached tokens: its
   // last prompt token must run the scored pass (an exact repeat of a cached
   // prompt would otherwise skip detection).
-  [[nodiscard]] bool HasDecodeFrontier(
-      const TextRunnerState& state) const override {
-    return !RequireQwenFlashNextState(state).session().Detecting();
+  [[nodiscard]] bool ReusesWholePrompt(
+      const TextPromptContext* context) const override {
+    return dynamic_cast<const DynamicAbliterationContext*>(context) == nullptr;
   }
 
   [[nodiscard]] bool LiveStateReusable(
@@ -3273,6 +3273,7 @@ public:
                                       ? model_->PrefillThroughCapacity()
                                       : model_->PrefillCapacity()})));
     std::string error;
+    qfn.session().SetDynamicPromptLength(prompt.size());
     if (!qfn.session().Sync(prefix, &error, next)) {
       qfn.set_position(0);
       throw std::runtime_error("Qwen3.8-Flash-Next prefill failed: " + error);
@@ -3313,6 +3314,7 @@ public:
     const auto next_position = offset + consumed;
     const auto prefix = QwenFlashNextEngineTokens(prompt.first(next_position));
     double capture_ms = 0;
+    qfn.session().SetDynamicPromptLength(prompt.size());
     try {
       qfn.adapter().PrefillThrough(
           qfn.slot(), prefix, static_cast<std::uint32_t>(boundary), [&] {

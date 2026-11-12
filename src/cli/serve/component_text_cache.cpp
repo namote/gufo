@@ -1761,9 +1761,12 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     bool clean = !live;
     // A frontier captured between prefill passes cannot select the next token
     // of a prompt that ends there; serve that prompt from a shallower boundary.
+    // A request whose last prompt token must run (a detecting dynamic
+    // abliteration request) reuses at most all but that token.
+    const bool whole_prompt = impl_->runner->ReusesWholePrompt(context.get());
     const auto decodable = [&](std::size_t boundary) {
       return boundary < prompt.size() ||
-             impl_->runner->HasDecodeFrontier(*request.state);
+             (whole_prompt && impl_->runner->HasDecodeFrontier(*request.state));
     };
     if (live && !decodable(found.selected->boundary)) {
       live.reset();
@@ -1779,7 +1782,9 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     for (const auto& candidate : found.candidates) {
       if (restored || (cancelled && cancelled()))
         break;
+      // Never load a whole-prompt candidate the request cannot use.
       if (candidate.live ||
+          (!whole_prompt && candidate.boundary >= prompt.size()) ||
           (candidate.boundary % alignment != 0 &&
            candidate.boundary < prompt.size() && !AnyPosition(candidate)))
         continue;
@@ -2084,8 +2089,12 @@ std::size_t ComponentTextCache::CachedPrefixTokens(
   const auto input = Inputs(prompt.size(), context);
   const std::lock_guard lock(impl_->mutex);
   const cache::PrefixQuery query{impl_->identity, prompt, input};
-  return common ? impl_->index.CommonPrefixTokens(query)
-                : impl_->index.CachedPrefixTokens(query);
+  if (common)
+    return impl_->index.CommonPrefixTokens(query);
+  const auto cached = impl_->index.CachedPrefixTokens(query);
+  return cached >= prompt.size() && !impl_->runner->ReusesWholePrompt(context)
+             ? prompt.size() - 1
+             : cached;
 }
 ComponentTextCache::Lease::Lease(std::unique_ptr<Impl> impl)
     : impl_(std::move(impl)) {}

@@ -1002,6 +1002,47 @@ void PartialFrontierDoesNotServeAnEqualPrompt() {
     resend.Invalidate();
   }
 }
+void PartialReuseRequestsRunTheirLastPromptToken() {
+  // A runner that must run every request's last prompt token (Flash-Next's
+  // detecting dynamic abliteration requests): neither a live frontier nor a
+  // checkpoint of the whole prompt is reused, and the estimate agrees.
+  class LastTokenRunner final : public Runner {
+  public:
+    bool ReusesWholePrompt(const TextPromptContext*) const override {
+      return false;
+    }
+  };
+  auto runner = std::make_shared<LastTokenRunner>();
+  TextRunnerPool pool(runner, 1);
+  std::vector<TextRunnerToken> prompt(40);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  {
+    auto first = pool.Acquire(prompt, {}, {}, {}, true, 0);
+    Prefill(first);
+    (void)first.Commit();
+  }
+  assert(pool.CachedPrefixTokens(prompt, nullptr) < prompt.size());
+  {
+    auto live = pool.Acquire(prompt, {}, {}, {}, true, 0);
+    assert(live.cached_prompt_tokens() < prompt.size());
+    Prefill(live);
+    (void)live.Commit();
+  }
+  // Replace the slot so only the whole-prompt checkpoint and shorter ones
+  // remain.
+  auto unrelated = prompt;
+  unrelated.front() = 999;
+  {
+    auto other = pool.Acquire(unrelated, {}, {}, {}, true, 0);
+    Prefill(other);
+    (void)other.Commit();
+  }
+  auto replay = pool.Acquire(prompt, {}, {}, {}, true, 0);
+  assert(replay.cached_prompt_tokens() < prompt.size());
+  Prefill(replay);
+  replay.Invalidate();
+}
+
 void CompletedCancelledPromptGetsARetrySnapshot() {
   auto runner = std::make_shared<Runner>();
   runner->partial = true;
@@ -3598,6 +3639,7 @@ int main() {
   PrefillLookaheadReachesTheNextFrontier();
   PartialFrontierDoesNotServeAnEqualPrompt();
   CompletedCancelledPromptGetsARetrySnapshot();
+  PartialReuseRequestsRunTheirLastPromptToken();
   BudgetUsesAllocatedSlotsInsteadOfLazyStateClaim();
   InPassCapturePreservesBoundaryAndLiveTail();
   AlignedPrefillKeepsAlignedBoundaries();

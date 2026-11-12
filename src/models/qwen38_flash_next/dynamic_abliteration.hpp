@@ -83,6 +83,12 @@ public:
   /// null when no row crossed or after the first call that returned them.
   [[nodiscard]] std::shared_ptr<const qwen::AbliterationSettings> Engage(
       std::uint32_t position);
+  /// Prefill rows count only at the last prompt token (position
+  /// tokens - 1): a crossing mid-prompt (a request cancelled between prefill
+  /// chunks) never selects a profile. Zero (unset) ignores prefill rows.
+  void SetPromptLength(std::uint32_t tokens) noexcept {
+    prompt_length_ = tokens;
+  }
   [[nodiscard]] bool engaged() const noexcept { return engaged_; }
   [[nodiscard]] bool detecting() const noexcept { return !engaged_; }
   [[nodiscard]] const std::vector<DynamicAbliterationCandidate>& candidates()
@@ -94,6 +100,7 @@ public:
 private:
   std::vector<DynamicAbliterationCandidate> candidates_;
   std::uint64_t observed_{0};
+  std::uint32_t prompt_length_{0};
   /// Scores of the row that crossed, else of the last prompt row.
   std::vector<float> row_scores_;
   bool have_row_{false};

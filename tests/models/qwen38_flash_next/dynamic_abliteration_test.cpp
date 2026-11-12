@@ -59,6 +59,7 @@ std::vector<float> Rows(std::initializer_list<std::array<float, 2>> rows) {
 
 void PrefillTrigger() {
   auto dynamic = Make();
+  dynamic.SetPromptLength(100);
   // An intermediate prefill chunk is replaced by the final one; Observe only
   // sees the pass the session kept.
   const auto scores = Rows({{0.5F, 1.5F}});
@@ -97,6 +98,7 @@ void PrefillTrigger() {
 
 void PrefillDetectionReportedBeforeAnyOnPass() {
   auto dynamic = Make();
+  dynamic.SetPromptLength(42);
   const auto scores = Rows({{0.5F, 1.5F}});
   dynamic.Observe({.id = 9,
                    .first_position = 41,
@@ -112,8 +114,26 @@ void PrefillDetectionReportedBeforeAnyOnPass() {
           "a detection is reported even without an ON pass");
 }
 
+void MidPromptCrossingIgnored() {
+  auto dynamic = Make();
+  dynamic.SetPromptLength(50);
+  // A prefill chunk ended at 20 and the request was cancelled there.
+  const auto scores = Rows({{5.0F, 5.0F}});
+  dynamic.Observe({.id = 11,
+                   .first_position = 19,
+                   .rows = 1,
+                   .prefill = true,
+                   .scores = scores},
+                  20);
+  const auto report = dynamic.Report();
+  Require(report.triggered.empty() && report.scores.empty() &&
+              !report.position && !dynamic.Engage(20),
+          "a crossing before the last prompt token selects nothing");
+}
+
 void DecodeRowsNeedADecodeThreshold() {
   auto dynamic = Make();
+  dynamic.SetPromptLength(10);
   const auto prompt = Rows({{0.0F, 0.2F}});
   dynamic.Observe({.id = 1,
                    .first_position = 9,
@@ -139,6 +159,7 @@ void DecodeRowsNeedADecodeThreshold() {
 
 void DecodeTriggerIgnoresRolledBackRows() {
   auto dynamic = Make(true);
+  dynamic.SetPromptLength(10);
   const auto prompt = Rows({{0.0F, 0.2F}});
   dynamic.Observe({.id = 1,
                    .first_position = 9,
@@ -189,6 +210,7 @@ void DecodeTriggerIgnoresRolledBackRows() {
 
 void ReportWithoutTrigger() {
   auto dynamic = Make(true);
+  dynamic.SetPromptLength(1);
   Require(dynamic.Report().scores.empty() &&
               dynamic.Report().triggered.empty() && !dynamic.Report().position,
           "empty before any pass");
@@ -276,6 +298,7 @@ int main() {
     DecodeTriggerIgnoresRolledBackRows();
     PrefillDetectionReportedBeforeAnyOnPass();
     DecodeRowsNeedADecodeThreshold();
+    MidPromptCrossingIgnored();
     ReportWithoutTrigger();
     Identities();
     bool rejected = false;

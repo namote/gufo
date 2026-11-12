@@ -348,11 +348,11 @@ public:
   /// The request's detection report after its last pass; empty without
   /// dynamic detection.
   [[nodiscard]] std::optional<DynamicAbliterationReport> DynamicReport();
-  /// Whether this request still detects (configured and not ON). Its last
-  /// prompt token must then run a scored pass, so a cached frontier at the
-  /// whole prompt is not reused.
-  [[nodiscard]] bool Detecting() const noexcept {
-    return dynamic_ && dynamic_->detecting();
+  /// The request's prompt length: only a prefill row at its last token
+  /// (DynamicAbliteration::SetPromptLength) can turn a profile ON.
+  void SetDynamicPromptLength(std::size_t tokens) {
+    if (dynamic_)
+      dynamic_->SetPromptLength(static_cast<std::uint32_t>(tokens));
   }
   [[nodiscard]] std::vector<std::uint8_t> ContinuationIdentity(
       std::size_t tokens) const;

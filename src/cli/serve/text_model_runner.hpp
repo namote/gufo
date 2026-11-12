@@ -488,6 +488,14 @@ public:
   [[nodiscard]] virtual bool HasDecodeFrontier(const TextRunnerState&) const {
     return true;
   }
+  /// Whether a request with this context may reuse a cached state of its
+  /// whole prompt. False makes its last prompt token run a pass (a
+  /// detecting dynamic abliteration request scores it).
+  [[nodiscard]] virtual bool ReusesWholePrompt(
+      const TextPromptContext* context) const {
+    (void)context;
+    return true;
+  }
 
   /// Paged model rows: states take fixed-size blocks of rows from one pool
   /// shared by all states as they write, instead of a whole context each.

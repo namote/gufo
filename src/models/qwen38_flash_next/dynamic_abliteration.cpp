@@ -30,6 +30,9 @@ void DynamicAbliteration::Observe(const DetectorPass& pass,
     const std::uint32_t position = pass.first_position + r;
     if (position >= committed)
       break;
+    // A prefill row counts only at the request's last prompt token.
+    if (pass.prefill && position + 1 != prompt_length_)
+      continue;
     const auto row = pass.scores.subspan(std::size_t{r} * kDetectorColumns,
                                          kDetectorColumns);
     if (!pass.prefill) {
