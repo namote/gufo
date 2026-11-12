@@ -15,7 +15,9 @@ LAYERS = 4
 
 class Fake(http.server.BaseHTTPRequestHandler):
     """Candid answers gain likelihood with mlp strength at layer 2; ordinary
-    answers lose likelihood with any residual strength."""
+    answers lose likelihood with any residual strength; the correct fact
+    answer loses its lead over the wrong one with attention strength at
+    layer 0, which nothing else rewards or penalizes."""
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
@@ -25,8 +27,10 @@ class Fake(http.server.BaseHTTPRequestHandler):
         residual = sum(ab['residual']) if ab else 0.0
         if answer.startswith('candid'):
             value = -2.0 + 0.5 * min(mlp, 2.0)
-        elif answer.startswith('prop'):
+        elif answer.startswith('prop') or answer.startswith('wrong'):
             value = -1.0
+        elif answer.startswith('right'):
+            value = -1.0 + 2.0 * (1.0 - (ab['attention'][0] if ab else 0.0))
         else:
             value = -1.0 - 0.2 * residual
         reply = json.dumps({'score': {'token_count': 1, 'logprob_sum': value}}).encode()
@@ -77,6 +81,41 @@ class SpsaTest(unittest.TestCase):
             self.assertEqual([r['step'] for r in records], list(range(-1, 22)))
         server.shutdown()
 
+    def test_facts_guard(self):
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Fake)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        url = f'http://127.0.0.1:{server.server_address[1]}'
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / 'pairs.jsonl').write_text(json.dumps(
+                {'id': 'p', 'prompt': 'q', 'candid': 'candid a', 'propaganda': 'prop a'}) + '\n')
+            (d / 'ord.jsonl').write_text(json.dumps({'id': 'o', 'prompt': 'q', 'answer': 'plain'}) + '\n')
+            (d / 'facts.jsonl').write_text(''.join(json.dumps(
+                {'id': f'f{i}', 'prompt': f'fq{i}', 'correct': 'right a', 'wrong': 'wrong a'}) + '\n'
+                for i in range(3)))
+            run = lambda log, steps: spsa.main([
+                '--base-url', url, '--pairs', str(d / 'pairs.jsonl'), '--ordinary', str(d / 'ord.jsonl'),
+                '--facts', str(d / 'facts.jsonl'), '--mu', '1', '--layers', str(LAYERS),
+                '--direction-layer', '1', '--init', '0.5', '--log', str(d / log),
+                '--concurrency', '4', '--eval-every', '5', '--a', '0.3', '--c', '0.2', '--seed', '3',
+                '--minibatch', '2', '--steps', str(steps)])
+            self.assertEqual(run('log.jsonl', 10), 0)
+            self.assertEqual(run('log.jsonl', 20), 0)   # resumed
+            lines = [json.loads(l) for l in (d / 'log.jsonl').read_text().splitlines()]
+            self.assertEqual(lines[0]['facts'], ['f0', 'f1', 'f2'])
+            self.assertEqual([r['step'] for r in lines[1:]], list(range(-1, 20)))
+            self.assertEqual(run('straight.jsonl', 20), 0)
+            straight = (d / 'straight.jsonl').read_text().splitlines()
+            self.assertEqual(json.loads(straight[-1])['theta'], lines[-1]['theta'])
+            first, last = lines[1], lines[-1]
+            # attention 0.5 at layer 0: gap 1 nat, shortfall 1 against the 2-nat margin.
+            self.assertAlmostEqual(first['eval']['fact_shortfall'], 1.0)
+            self.assertEqual(first['eval']['fact_right'], 3)
+            self.assertAlmostEqual(first['eval']['j'], first['eval']['margin'] - 4 * first['eval']['drop'] - 1.0)
+            self.assertLess(last['theta'][0], 0.25)              # attention at layer 0 falls
+            self.assertLess(last['eval']['fact_shortfall'], 0.5)
+        server.shutdown()
+
     def test_learns_and_resumes(self):
         server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Fake)
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -91,6 +130,9 @@ class SpsaTest(unittest.TestCase):
                     '--log', str(d / 'log.jsonl'), '--concurrency', '1', '--eval-every', '5',
                     '--a', '0.3', '--c', '0.2', '--seed', '3']
             self.assertEqual(spsa.main(base + ['--steps', '20']), 0)
+            header = json.loads((d / 'log.jsonl').read_text().splitlines()[0])
+            self.assertNotIn('facts', header)   # logs of runs without --facts keep their old header
+            self.assertFalse({'facts', 'mu', 'fact_margin'} & set(header['args']))
             records = [json.loads(l) for l in (d / 'log.jsonl').read_text().splitlines()[1:]]
             self.assertEqual(records[0]['step'], -1)
             last = records[-1]['theta']
