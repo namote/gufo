@@ -21,6 +21,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <stop_token>
+#include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -51,6 +53,13 @@
 
 namespace gufo::server {
 namespace {
+
+// Pending-connection queue for the listeners. A queue of 16 overflowed when a
+// client pool opened dozens of connections at once: the kernel dropped the
+// excess SYNs (connect retry delays) or answered with SYN cookies, and a
+// cookie handshake that failed validation was reset (ECONNRESET in the
+// client) before the server accepted the connection. The OS caps this value.
+constexpr int kListenBacklog = SOMAXCONN;
 
 std::atomic<int> shutdown_signal{0};
 static_assert(std::atomic<int>::is_always_lock_free);
@@ -1870,7 +1879,7 @@ LoadingResponder::LoadingResponder(const std::string& host, int port) {
   }
   if ((addr.ss_family == AF_INET6 && !net::ClearIpv6Only(fd)) ||
       ::bind(fd, reinterpret_cast<sockaddr*>(&addr), addr_length) < 0 ||
-      ::listen(fd, 16) < 0) {
+      ::listen(fd, kListenBacklog) < 0) {
     const int error = net::LastSocketError();
     Logger::Debug("server", "event=loading_listener_unavailable host=" + host +
                                 " port=" + std::to_string(port) +
@@ -1896,53 +1905,73 @@ void LoadingResponder::stop() {
   }
 }
 
+namespace {
+// The reply to a connection over the connection limit.
+const std::string& OverloadedReply() {
+  static const std::string reply = [] {
+    HttpResponse response =
+        Err(503, "Service Unavailable", "connection limit reached",
+            "server_error", "overloaded");
+    response.headers.emplace_back("Retry-After", "1");
+    return BuildResponse(response);
+  }();
+  return reply;
+}
+
+// Replies to a connection the server will not serve. Reads the request head
+// before replying, and after replying reads what the client still sends (a
+// request body) until it closes: closing with unread data resets the
+// connection, and the client can lose the reply. Both waits are bounded so a
+// client that connects and sends nothing, or stop(), cannot hold it.
+void ReplyAndDrain(int client_fd, std::string_view reply,
+                   const std::atomic<bool>& stopped) {
+  constexpr auto kRequestWait = std::chrono::milliseconds(500);
+  // Appends one read to `into` (when set); false once the deadline passes,
+  // the client closes or stop() runs.
+  const auto receive = [&](std::chrono::steady_clock::time_point deadline,
+                           std::string* into) {
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now())
+            .count();
+    if (stopped.load(std::memory_order_acquire) || remaining <= 0 ||
+        net::PollReadable(client_fd, static_cast<int>(remaining)) <= 0)
+      return false;
+    char buffer[4096];
+    const std::intptr_t received =
+        net::Receive(client_fd, buffer, sizeof(buffer), 0);
+    if (received <= 0)
+      return false;
+    if (into != nullptr)
+      into->append(buffer, static_cast<std::size_t>(received));
+    return true;
+  };
+  std::string head;
+  const auto head_deadline = std::chrono::steady_clock::now() + kRequestWait;
+  while (head.find("\r\n\r\n") == std::string::npos && head.size() < 8192 &&
+         receive(head_deadline, &head)) {
+  }
+  (void)SendAll(client_fd, reply);
+  (void)net::ShutdownSocket(client_fd, net::ShutdownHow::kWrite);
+  const auto drain_deadline = std::chrono::steady_clock::now() + kRequestWait;
+  while (receive(drain_deadline, nullptr)) {
+  }
+}
+}  // namespace
+
 void LoadingResponder::serve() {
   HttpResponse loading = Err(503, "Service Unavailable", "Loading model",
                              "unavailable_error", "loading");
   loading.headers.emplace_back("Retry-After", "1");
   const std::string reply = BuildResponse(loading);
-  // One connection at a time is enough for probes. Read the request head
-  // before replying, and after replying read what the client still sends (a
-  // request body) until it closes: closing with unread data resets the
-  // connection, and the client can lose the reply. Bound both waits: a client
-  // that connects and sends nothing must not delay stop().
-  constexpr auto kRequestWait = std::chrono::milliseconds(500);
+  // One connection at a time is enough for probes.
   while (!stopped_.load(std::memory_order_acquire)) {
     if (net::PollReadable(listen_fd_, 100) <= 0)
       continue;
     const int client_fd = static_cast<int>(net::AcceptClientSocket(listen_fd_));
     if (client_fd < 0)
       continue;
-    // Appends one read to `into` (when set); false once the deadline passes,
-    // the client closes or stop() runs.
-    const auto receive = [&](std::chrono::steady_clock::time_point deadline,
-                             std::string* into) {
-      const auto remaining =
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              deadline - std::chrono::steady_clock::now())
-              .count();
-      if (stopped_.load(std::memory_order_acquire) || remaining <= 0 ||
-          net::PollReadable(client_fd, static_cast<int>(remaining)) <= 0)
-        return false;
-      char buffer[4096];
-      const std::intptr_t received =
-          net::Receive(client_fd, buffer, sizeof(buffer), 0);
-      if (received <= 0)
-        return false;
-      if (into != nullptr)
-        into->append(buffer, static_cast<std::size_t>(received));
-      return true;
-    };
-    std::string head;
-    const auto head_deadline = std::chrono::steady_clock::now() + kRequestWait;
-    while (head.find("\r\n\r\n") == std::string::npos && head.size() < 8192 &&
-           receive(head_deadline, &head)) {
-    }
-    (void)SendAll(client_fd, reply);
-    (void)net::ShutdownSocket(client_fd, net::ShutdownHow::kWrite);
-    const auto drain_deadline = std::chrono::steady_clock::now() + kRequestWait;
-    while (receive(drain_deadline, nullptr)) {
-    }
+    ReplyAndDrain(client_fd, reply, stopped_);
     net::CloseSocket(client_fd);
   }
 }
@@ -1988,6 +2017,8 @@ struct HttpServer::ConnectionWorker {
   // limit.
   std::atomic<bool> response_sent{false};
   std::atomic<bool> done{false};
+  // Answers 503 and drains the request instead of serving it.
+  bool rejection{false};
   std::jthread thread;
 };
 
@@ -2110,7 +2141,7 @@ bool HttpServer::start(std::string* error) {
     listen_fd_ = -1;
     return false;
   }
-  if (::listen(listen_fd_, 16) < 0) {
+  if (::listen(listen_fd_, kListenBacklog) < 0) {
     if (error != nullptr)
       *error = "listen() failed";
     net::CloseSocket(listen_fd_);
@@ -2194,35 +2225,59 @@ void HttpServer::run(bool handle_signals) {
     auto worker = std::make_unique<ConnectionWorker>();
     ConnectionWorker* const worker_ptr = worker.get();
     bool overloaded = false;
+    bool drain = false;
     {
       const std::lock_guard<std::mutex> lock(workers_mutex_);
-      const auto serving = static_cast<std::size_t>(std::ranges::count_if(
-          workers_, [](const std::unique_ptr<ConnectionWorker>& existing) {
-            return !existing->response_sent.load(std::memory_order_acquire);
-          }));
+      std::size_t serving = 0;
+      std::size_t rejecting = 0;
+      for (const auto& existing : workers_) {
+        if (existing->rejection)
+          ++rejecting;
+        else if (!existing->response_sent.load(std::memory_order_acquire))
+          ++serving;
+      }
       overloaded = stopped_.load(std::memory_order_acquire) ||
                    serving >= options_.max_connections;
-      if (!overloaded) {
+      // A rejection worker is bounded (about a second); cap how many run so a
+      // connection flood cannot grow threads without limit.
+      drain = overloaded && rejecting < options_.max_connections;
+      if (!overloaded || drain) {
         worker_ptr->fd = client_fd;
-        worker_ptr->thread = std::jthread([this, worker_ptr, client_fd] {
-          handle_connection(client_fd, worker_ptr->response_sent);
-          {
-            const std::lock_guard<std::mutex> lock(workers_mutex_);
-            net::CloseSocket(worker_ptr->fd);
-            worker_ptr->fd = -1;
-          }
-          worker_ptr->done.store(true, std::memory_order_release);
-        });
+        worker_ptr->rejection = overloaded;
+        if (overloaded)
+          worker_ptr->response_sent.store(true, std::memory_order_release);
+        worker_ptr->thread =
+            std::jthread([this, worker_ptr, client_fd, overloaded] {
+              if (overloaded)
+                ReplyAndDrain(client_fd, OverloadedReply(), stopped_);
+              else
+                handle_connection(client_fd, worker_ptr->response_sent);
+              {
+                const std::lock_guard<std::mutex> lock(workers_mutex_);
+                net::CloseSocket(worker_ptr->fd);
+                worker_ptr->fd = -1;
+              }
+              worker_ptr->done.store(true, std::memory_order_release);
+            });
         workers_.push_back(std::move(worker));
       }
     }
     if (overloaded) {
-      HttpResponse response =
-          Err(503, "Service Unavailable", "connection limit reached",
-              "server_error", "overloaded");
-      response.headers.emplace_back("Retry-After", "1");
-      (void)SendAll(client_fd, BuildResponse(response));
-      net::CloseSocket(client_fd);
+      // Rejected before a request id exists; log it so a client error has a
+      // server-side counterpart.
+      const char* const reason = stopped_.load(std::memory_order_acquire)
+                                     ? "stopping"
+                                 : drain ? "connection_limit"
+                                         : "rejection_limit";
+      Logger::Warn("server", std::string("event=connection_rejected reason=") +
+                                 reason + " max_connections=" +
+                                 std::to_string(options_.max_connections));
+      if (!drain) {
+        // Too many rejections are already draining: answer without reading.
+        // The client may see a reset instead of this reply.
+        (void)SendAll(client_fd, OverloadedReply());
+        net::CloseSocket(client_fd);
+      }
     }
   }
   reap_workers();

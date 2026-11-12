@@ -2795,6 +2795,22 @@ void TestConnectionLimitIgnoresClosingConnections() {
     assert(refusal.find("connection limit reached") != std::string::npos);
     net::CloseSocket(refused);
 
+    // A refused client that sent its request before reading still gets the
+    // 503 and an orderly close: the server drains the request instead of
+    // closing with unread bytes, which would reset the connection.
+    const int eager = server.Connect();
+    const std::string eager_request =
+        "POST /echo HTTP/1.1\r\nContent-Length: 4096\r\n\r\n" +
+        std::string(4096, 'x');
+    assert(
+        net::SendNoSignal(eager, eager_request.data(), eager_request.size()) ==
+        static_cast<ssize_t>(eager_request.size()));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ExpectStatus(ReadFramedResponse(eager), 503);
+    char tail = 0;
+    assert(::read(eager, &tail, 1) == 0);
+    net::CloseSocket(eager);
+
     const std::string request =
         "POST /echo HTTP/1.1\r\nContent-Length: 4\r\n\r\nping";
     assert(net::SendNoSignal(answered, request.data(), request.size()) ==
@@ -2817,6 +2833,27 @@ void TestConnectionLimitIgnoresClosingConnections() {
     net::CloseSocket(idle);
   }
   std::clog.rdbuf(previous_sink);
+}
+
+// A burst of connections larger than the old 16-entry listen queue is held
+// by the kernel until the accept loop reaches it. With a short queue the
+// excess SYNs were dropped or answered with cookies, and clients saw connect
+// timeouts or resets under load.
+void TestListenBacklogHoldsConnectionBurst() {
+  HttpServer server("127.0.0.1", 0, nullptr);
+  std::string error;
+  assert(server.start(&error));
+  // run() is not called: nothing accepts, so every connection waits in the
+  // listen queue.
+  std::vector<net::Socket> clients;
+  // A connect beyond a short queue times out (ConnectTo's 3 s) and fails.
+  for (int index = 0; index < 64; ++index) {
+    const net::Socket fd = ConnectTo("127.0.0.1", server.port());
+    assert(fd != net::kInvalidSocket);
+    clients.push_back(fd);
+  }
+  for (const net::Socket fd : clients)
+    net::CloseSocket(fd);
 }
 
 void TestPeerDisconnect() {
@@ -3663,6 +3700,7 @@ int main() {
   TestCompatibilityThinkingDefaults();
   TestResponseSamplingDefaults();
   TestCompatibilityUtf8();
+  TestListenBacklogHoldsConnectionBurst();
   TestPeerDisconnect();
   TestConnectionLimitIgnoresClosingConnections();
   TestStreamingFraming();
