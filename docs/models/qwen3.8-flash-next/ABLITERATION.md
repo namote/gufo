@@ -331,6 +331,36 @@ python3 tools/qwen38_flash_next/abliteration/search.py \
 The chosen profile is still a tuning result: evaluate it on held-out inputs
 as in step 5.
 
+## Dynamic detectors (`trigger`)
+
+A profile may carry a detector so the server turns it ON only for requests
+that need it (see `docs/SERVER.md`, `--abliteration-profiles`).
+`fit_trigger.py` fits one from collector output (CPU, NumPy) and writes a
+copy of the profile with a `trigger` member; the input profile is unchanged:
+
+```sh
+python3 tools/qwen38_flash_next/abliteration/fit_trigger.py \
+  --collection COLLECTION --target-group refusal --layer 38 \
+  --topics TOPICS.jsonl --negatives HARMLESS_COLLECTION:ordinary \
+  --profile SERVED_V2.json --output PROFILES_DIR/name.json
+```
+
+- Direction: mean(target group) − mean(ordinary) at `--layer`, normalized.
+  Extra negatives never enter it.
+- Validation is grouped by topic (`--topics` JSONL `{"id", "topic"}`, a
+  record's `topic`, else the ID without `-plain`/`-think`), so paraphrases of
+  one question never sit on both sides of a fold.
+- The threshold keeps the out-of-fold false-positive rate at or below
+  `--max-false-positive` (default 1%) on each negative set separately. The
+  report also gives AUC, recall (by thinking mode) and a nested estimate
+  whose threshold never saw the fold it is scored on.
+
+The score is read where the collector reads: the post-layer residual of the
+detector layer, averaged over the HC streams, at the last prompt row (the
+server also scores every decoded row). Thresholds therefore transfer only
+between captures with the same readout
+(`last-prompt-token-post-layer-hc-mean-fp32-v1`) and model.
+
 ## Focused checks
 
 CPU: `qwen38_flash_next.abliteration`, `qwen27b_abliteration_test` (shared v2
@@ -338,8 +368,10 @@ profile, settings and identity contracts), `openai_chat_test`,
 `http_server_test`,
 `python3 tools/qwen38_flash_next/abliteration/test_prepare.py` (NumPy;
 projected, PCA and SOM math on planted data, orthonormality, SOM
-determinism, profile members) and
-`python3 tools/qwen38_flash_next/abliteration/test_search.py`.
+determinism, profile members),
+`python3 tools/qwen38_flash_next/abliteration/test_search.py` and
+`python3 tools/qwen38_flash_next/abliteration/test_fit_trigger.py` (topic
+folds, per-set threshold, profile copy).
 GPU: `qwen38_flash_next.abliteration_ops` covers an independent FP64 formula,
 unaligned dimensions, mixed rows with their own directions and strengths,
 in-place settings updates under a captured graph and the production

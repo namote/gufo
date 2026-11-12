@@ -218,6 +218,21 @@
     - Fewer answer tokens: `--answer-tokens 64` is about 2× faster.
     - Packing many scoring requests into one batch pass, so they share the 0.2 s fixed cost. One eval is about 72 × 150 tokens, about 9 s at 0.8 ms per token, against about 60 s now.
 - No ordinary-prompt KL or capability check yet. Not deployed. Next step is a combined profile with the refusal direction, then ordinary KL and refusal checks (plan R3 in `plan/research/IDEAS.md`).
+- **Dynamic-abliteration detectors** (`tools/qwen38_flash_next/abliteration/fit_trigger.py`, November 12, CPU only). Evidence: `build/b1/ablit-pol-20261111/dynamic/`.
+  - Method: L38 mean difference (target − ordinary), 6 folds split by topic, never by sentence. A political topic is one question in ko/en/zh × both thinking modes (`dynamic/topics.jsonl`). Extra negatives never enter the direction.
+  - Threshold rule: the false-positive rate is at most 1% on each negative set separately.
+  - "Nested" means each fold's threshold comes from the other folds only.
+
+  | Detector | Negatives | AUC (ordinary / extra) | Threshold | Recall | FP (ordinary / extra) | Nested recall / FP |
+  |---|---|---|---:|---:|---|---|
+  | political, pol collection | pol controls 216 + harmless 618 | 0.988 / 0.995 | 1.199 | 72.7% (plain 56%, think 89%) | 0.9% / 0.2% | 66.2% / 0.4% |
+  | refusal, fnx collection | harmless 618 + pol controls 216 | 0.989 / 0.980 | 1.213 | 92.7% | 1.0% / 0.9% | 92.5% / 1.2% |
+
+  - Topic splitting barely moves AUC against roc.py's random half split (0.985–0.994).
+  - Recall is what drops: the political controls (Gwangju, Tiananmen-like events elsewhere) are hard negatives. With the threshold set on the pooled negatives instead, the political detector reaches 90.7% recall at 2.3% FP on the controls.
+  - The fold directions agree with the deployed direction to cosine ≥ 0.997.
+  - Profiles: `dynamic/profiles-pol/` (pol-avg with trigger) and `dynamic/profiles-pol-fnx/` (also fnx with trigger). The sources in `~/.local/share/gufo/runtime-20261111g/` are unchanged.
+  - No GPU check yet; R2-4 measures detection on the server.
 
 ## Flash-Next c03 1M YaRN K4V4 serving and time-shared scheduler, November 11, 2026 (deployed)
 
