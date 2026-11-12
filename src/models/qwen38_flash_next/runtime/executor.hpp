@@ -459,7 +459,10 @@ public:
   /// run on its own rows and state, as a single-session prefill of those
   /// rows would. The draft block is not run: the caller must reset the
   /// sessions before decoding from them. KVarN and image sessions are
-  /// refused. A failure may leave every session partly advanced.
+  /// refused. Any member's cancellation, checked before the pass and at
+  /// every layer, fails the pack. A failure may leave every session partly
+  /// advanced; Session::ScoreBatch then scores each request on its own, so
+  /// only the cancelled one fails.
   [[nodiscard]] bool ForwardScorePack(std::span<const ScorePackItem> items,
                                       const ScoreRowsConsumer& consume,
                                       std::string* error_msg) const;

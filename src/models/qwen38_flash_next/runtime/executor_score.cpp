@@ -89,6 +89,9 @@ bool Executor::ForwardScorePack(std::span<const ScorePackItem> items,
     (void)hipGetLastError();
     return false;
   }
+  for (const auto& item : items)
+    if (!item.session->CheckCancellation(error_msg))
+      return false;
   if (ple_pending_ && !WaitPle(error_msg))
     return false;
   FinishPrefetch();
@@ -241,6 +244,11 @@ bool Executor::ForwardScorePack(std::span<const ScorePackItem> items,
                 base.tokens, base.res, rows, c.hidden_size, c.hc_count,
                 stream_);
     for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+      // As ForwardBody checks each layer: a cancelled (or timed-out) member
+      // stops the whole pack, whose caller then scores the others alone.
+      for (const auto& item : items)
+        if (!item.session->CheckCancellation(error_msg))
+          return false;
       if (c.IsPleLayer(il) && !WaitPle(error_msg))
         return false;
       for (std::size_t i = 0; i < items.size(); ++i) {
