@@ -156,21 +156,29 @@ bool Executor::ForwardScorePack(std::span<const ScorePackItem> items,
   std::array<bool, kScorePackSessions> normed{};
   const auto& layers = model_->layers();
   // The FFN combine of layer `il` for segment i: the MoE output rows the
-  // segment's view names, the session's residual projection and the next
-  // mixer's norm (Combine drops it when that projection cannot be fused).
+  // segment's view names, the next mixer's norm (unless the session
+  // projects its residual), and that projection.
   const auto ffn_combine = [&](std::size_t i, std::uint32_t il) {
     auto& session = *items[i].session;
     const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
+    const float* const residual_settings = ResidualAbliteration(session);
     const float* next_norm =
-        il + 1 < c.num_layers
+        il + 1 < c.num_layers && residual_settings == nullptr
             ? (c.IsPleLayer(il + 1) ? nullptr
                                     : layers[il + 1].hc_attn.norm.f32())
             : nullptr;
     const float* next_inject =
         next_norm != nullptr ? InjectWeights(layers[il + 1].hc_attn) : nullptr;
-    normed[i] = Combine(s_.res, next_norm, n, next_inject, false,
-                        AbliterationAt(session, il, true),
-                        ResidualAbliteration(session));
+    Combine(s_.res, next_norm, n, next_inject, false,
+            AbliterationAt(session, il, true));
+    if (residual_settings != nullptr) {
+      ApplyPendingResidual();
+      const AbliterationSpan span{n, residual_settings};
+      AbliterateResidualBatchRows(s_.res, abliteration_directions_,
+                                  std::span(&span, 1), il, c.num_layers, n,
+                                  c.hidden_size, c.hc_count, stream_);
+    }
+    normed[i] = next_norm != nullptr;
   };
   // Layer `il` of segment i up to its FFN mixer.
   const auto mixer_block = [&](std::size_t i, std::uint32_t il) {

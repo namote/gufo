@@ -828,11 +828,9 @@ private:
                            AbliterationSite site) const;
   /// The session's device settings while ON with a nonzero residual strength
   /// (qwen::AbliterationSettings::ResidualActive), else null. Only such a
-  /// session projects the post-layer residual (Combine's `residual`): the
-  /// per-stream combine projects each stream before it forms the next
-  /// mixer's norm; any other route takes the unfused layer end, whose FFN
-  /// combine computes no norm of the next mixer, so nothing derived from the
-  /// residual predates the projection.
+  /// session projects the post-layer residual, and it then takes the unfused
+  /// layer end: the FFN combine computes no norm of the next mixer, so nothing
+  /// derived from the residual predates the projection.
   const float* ResidualAbliteration(const Session& session) const {
     return session.abliteration_ && session.abliteration_->ResidualActive()
                ? session.abliteration_device_.get()
@@ -937,12 +935,7 @@ private:
   bool HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
                   float* mixed, float* inject, std::uint32_t rows,
                   std::string* error) const;
-  /// The decode combine (per-stream kernel). A non-null `abliteration`
-  /// (spans of ON sessions; HcAbliteration) projects the block output and,
-  /// with a residual site, each updated stream before the norm: the batch's
-  /// writer and residual projections in the combine's own pass.
-  void CombineBatch(float* res, const float* gamma, std::uint32_t rows,
-                    const HcAbliteration* abliteration = nullptr) const;
+  void CombineBatch(float* res, const float* gamma, std::uint32_t rows) const;
   /// Residual update by the block output plus the grouped norm for the next
   /// mixer (`gamma`); wide batches write it as F16 and tiled Q8. With that
   /// mixer's F32 `inject_w`, the fused MoE combine also leaves its inject
@@ -950,28 +943,9 @@ private:
   /// defer_res: the caller's next mixer and combine read res (EXL3
   /// prefill attention combine); a four-lane combine with a deferred norm
   /// may then leave its update to them (exl3_res_pending_).
-  /// `ablation` projects the block output (the writer site) and a non-null
-  /// `residual` (ResidualAbliteration) each post-layer HC stream of layer
-  /// `ablation.layer`. The per-stream kernel does both in registers; any
-  /// other route projects block_out before and res after the combine, and
-  /// with `residual` then drops `gamma` (and `inject_w`) so the next mixer
-  /// normalizes the projected residual itself. Returns whether the next
-  /// mixer's norm was formed here (`gamma` kept).
-  bool Combine(float* res, const float* gamma, std::uint32_t n_tokens,
+  void Combine(float* res, const float* gamma, std::uint32_t n_tokens,
                const float* inject_w = nullptr, bool defer_res = false,
-               AbliterationSite ablation = {},
-               const float* residual = nullptr) const;
-  /// Combine's routes. `ablation` is projected by its own kernel first;
-  /// `on` (an ON session) keeps the MoE-fused combines out; `fused` goes to
-  /// the per-stream kernel.
-  void CombineRows(float* res, const float* gamma, std::uint32_t n_tokens,
-                   const float* inject_w, bool defer_res,
-                   AbliterationSite ablation, bool on,
-                   const HcAbliteration* fused) const;
-  /// Whether Combine with `gamma` over `n_tokens` rows takes the
-  /// per-stream kernel (HcCombineKernel), which fuses abliteration.
-  [[nodiscard]] bool PerStreamCombine(std::uint32_t n_tokens,
-                                      const float* gamma) const;
+               AbliterationSite ablation = {}) const;
   /// An EXL3 prefill combine's residual update left out of `res` for the
   /// FFN mixer's recomputed norm and the next combine.
   struct PendingResidual {

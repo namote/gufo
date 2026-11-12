@@ -58,30 +58,6 @@ void AbliterateResidualBatchRows(float* res, const float* directions,
                                  std::uint32_t tokens, std::uint32_t hidden,
                                  std::uint32_t streams, hipStream_t stream);
 
-/// Abliteration fused into the one-block-per-stream HC combine (HcCombine's
-/// per-stream route, HcCombineQ8_1): token t uses the settings of its span
-/// (spans[0, count), end rows counting tokens; null settings: no projection).
-/// The block output row first loses the `writer` site's projection (weight
-/// index qwen::AbliterationWeightIndex, AbliterateBatchRows' formula), each
-/// updated stream row then the `residual` one (AbliterateResidualBatchRows'
-/// formula, per stream) before it is stored and normalized for the next
-/// mixer. kNone skips a site; zero strengths skip their projection on the
-/// device. Rows at most kHcAbliterationMaxHidden wide.
-struct HcAbliteration {
-  static constexpr std::uint32_t kNone = ~0U;
-  static constexpr std::uint32_t kMaxSpans = 8;
-  const float* directions{nullptr};
-  AbliterationSpan spans[kMaxSpans]{};
-  std::uint32_t count{0};
-  std::uint32_t writer{kNone};
-  std::uint32_t residual{kNone};
-};
-inline constexpr std::uint32_t kHcAbliterationMaxHidden = 2560;
-/// Whether HcCombine with these arguments takes its one-block-per-stream
-/// kernel (the route that can fuse HcAbliteration).
-bool HcCombinePerStream(std::uint32_t n_tokens, std::uint32_t hidden,
-                        std::uint32_t streams, bool decode, bool any_width);
-
 /// Dynamic-abliteration detector scores (R2): for each of `rows` token rows
 /// of the post-layer residual `res` ([tokens][streams][hidden]) and each
 /// listed detector d, scores[row * stride + column] = mean over the HC
@@ -355,8 +331,7 @@ bool HcCombine(float* res, const float* block_out, const float* inject,
                bool decode = false, bool any_width = false,
                __half* xn_half = nullptr, float* xn_scale = nullptr,
                const Exl3PrefillMoeRows* moe = nullptr, void* xn_q8t = nullptr,
-               float* defer_w = nullptr, DeferredResidual prior = {},
-               const HcAbliteration* abliteration = nullptr);
+               float* defer_w = nullptr, DeferredResidual prior = {});
 /// The F32 norm HcCombine left out (four streams): res * scale * gamma in
 /// the combine's own expression.
 void HcNormFromRes(const float* res, const float* gamma, const float* xn_scale,
@@ -378,14 +353,10 @@ void HcMixEpilogueVec4FromRes(const float* res, const float* gamma,
 /// qfn_mmq_quantize_q8_1 would) to `xn_q8` for a small-batch mixer down
 /// projection. False, with nothing launched, without `gamma` or unless
 /// hidden % 32 == 0.
-/// A non-null `abliteration` with an ON span projects as HcAbliteration
-/// describes, here and on HcCombine's per-stream route (HcCombine throws on
-/// another route); without one the plain kernel runs.
 bool HcCombineQ8_1(float* res, const float* block_out, const float* inject,
                    std::uint32_t inject_parts, const float* gamma, float* xn,
                    void* xn_q8, std::uint32_t n_tokens, std::uint32_t hidden,
-                   std::uint32_t streams, float eps, hipStream_t stream,
-                   const HcAbliteration* abliteration = nullptr);
+                   std::uint32_t streams, float eps, hipStream_t stream);
 /// HcCombine writing the normalized output as F16, the width the next
 /// mixer's projection and epilogue consume on the F16 mixer input route.
 /// A non-null `xn_q8` also receives the norm quantized into the tiled Q8

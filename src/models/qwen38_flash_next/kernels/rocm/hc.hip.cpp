@@ -2,7 +2,6 @@
 // updates and the norm read back from the residual.
 // HIP kernels follow the layouts and operator formulas in reference.cpp.
 
-#include "src/models/qwen/hip/kernels/abliteration_row.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels_internal.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
@@ -461,14 +460,6 @@ struct InjectParts {
   }
 };
 
-/// Row elements each thread of the per-stream combines holds in registers
-/// (HcCombineKernel's held route, HcCombineAbliterateKernel).
-constexpr std::uint32_t kCombineHeld = 10;
-static_assert(kThreads == qwen::hip_detail::kAbliterationRowThreads,
-              "AbliterateHeldRow's reductions assume the combine's block");
-static_assert(kCombineHeld * kThreads >= kHcAbliterationMaxHidden,
-              "the fused combine holds every element of its rows");
-
 /// grid (tokens, streams): one block owns one residual stream, so the
 /// grouped norm of the next mixer reduces over exactly its own elements.
 /// `XnT` is float for the reference route and __half for the F16 mixer
@@ -496,7 +487,7 @@ __global__ void HcCombineKernel(float* res, const float* block_out,
   // clamped indices (a load under `i < hidden` is a branch of its own, and
   // the compiler waits for it there). Lanes past `hidden` never use theirs.
   // Same arithmetic, same order.
-  constexpr std::uint32_t kHeld = kCombineHeld;
+  constexpr std::uint32_t kHeld = 10;
   if (hidden != 0 && hidden <= kHeld * blockDim.x) {
     const InjectParts inject_sum(parts, inject_parts);
     float r[kHeld];
@@ -566,90 +557,6 @@ __global__ void HcCombineKernel(float* res, const float* block_out,
     }
     if (xn_q8 != nullptr) {
       QuantizeQ8TiledLane(v, xn_q8, t, s, i, hidden, streams);
-    }
-  }
-}
-
-/// HcCombineKernel's held route (float norm, optional Q8_1 rows) with
-/// HcAbliteration fused in: token t's block output row loses the writer
-/// site's projection, each updated stream row the residual one, both in
-/// registers (qwen::hip_detail::AbliterateHeldRow), before the row is stored
-/// and normalized. A kernel of its own, so the OFF combine above keeps its
-/// code; the launcher keeps rows to kHcAbliterationMaxHidden. Every stream
-/// block of a token projects the same block output row the same way: the
-/// four blocks run side by side, so sharing it would only add a dependency.
-__global__ void HcCombineAbliterateKernel(float* res, const float* block_out,
-                                          const float* inject,
-                                          std::uint32_t inject_parts,
-                                          const float* gamma, float* xn,
-                                          std::uint32_t hidden,
-                                          std::uint32_t streams, float eps,
-                                          void* xn_q8_1, HcAbliteration ab) {
-  constexpr std::uint32_t kHeld = kCombineHeld;
-  __shared__ float shared[32];
-  const std::uint32_t t = blockIdx.x;
-  const std::uint32_t s = blockIdx.y;
-  const float* parts =
-      inject + (static_cast<std::size_t>(t) * streams + s) * inject_parts;
-  const std::size_t base = (static_cast<std::size_t>(t) * streams + s) * hidden;
-  float* dst = res + base;
-  const float* src = block_out + static_cast<std::size_t>(t) * hidden;
-  const float* g = gamma + static_cast<std::size_t>(s) * hidden;
-  // HcCombineKernel's loads: inject partials first, then the rows at
-  // clamped indices; the projections ignore lanes past `hidden`.
-  const InjectParts inject_sum(parts, inject_parts);
-  float r[kHeld];
-  float b[kHeld];
-  float gv[kHeld];
-#pragma unroll
-  for (std::uint32_t c = 0; c < kHeld; ++c) {
-    const std::uint32_t i = threadIdx.x + c * blockDim.x;
-    const std::uint32_t k = i < hidden ? i : hidden - 1;
-    r[c] = dst[k];
-    b[c] = src[k];
-    gv[c] = gamma != nullptr ? g[k] : 0.0f;
-  }
-  const float* settings = nullptr;
-  for (std::uint32_t k = 0; k < ab.count; ++k)
-    if (t < ab.spans[k].end_row) {
-      settings = ab.spans[k].settings;
-      break;
-    }
-  if (settings != nullptr && ab.writer != HcAbliteration::kNone)
-    qwen::hip_detail::AbliterateHeldRow(b, ab.directions, settings, ab.writer,
-                                        hidden);
-  const float w =
-      2.0f * SigmoidF(inject_sum.Sum() / static_cast<float>(streams));
-#pragma unroll
-  for (std::uint32_t c = 0; c < kHeld; ++c)
-    if (threadIdx.x + c * blockDim.x < hidden)
-      r[c] = r[c] + b[c] * w;
-  if (settings != nullptr && ab.residual != HcAbliteration::kNone)
-    qwen::hip_detail::AbliterateHeldRow(r, ab.directions, settings, ab.residual,
-                                        hidden);
-  float ss = 0.0f;
-#pragma unroll
-  for (std::uint32_t c = 0; c < kHeld; ++c) {
-    const std::uint32_t i = threadIdx.x + c * blockDim.x;
-    if (i < hidden) {
-      dst[i] = r[c];
-      ss = Materialize(ss + r[c] * r[c]);
-    }
-  }
-  if (gamma == nullptr) {
-    return;
-  }
-  ss = BlockSum(ss, shared);
-  const float scale = rsqrtf(ss / static_cast<float>(hidden) + eps);
-#pragma unroll
-  for (std::uint32_t c = 0; c < kHeld; ++c) {
-    const std::uint32_t i = threadIdx.x + c * blockDim.x;
-    if (i < hidden) {
-      const float v = r[c] * scale * gv[c];
-      xn[base + i] = v;
-      if (xn_q8_1 != nullptr) {
-        QuantizeQ8_1Lane(v, xn_q8_1, base + i);
-      }
     }
   }
 }
@@ -1305,56 +1212,17 @@ void HcMixEpilogueVec4F16(const __half* xn, const float* gate,
   }
 }
 
-bool HcCombinePerStream(std::uint32_t n_tokens, std::uint32_t hidden,
-                        std::uint32_t streams, bool decode, bool any_width) {
-  // One block per token wants a batch: a decode step keeps the
-  // one-block-per-stream kernel's parallelism.
-  return !(!decode && (n_tokens >= 16 || any_width) && streams == 4 &&
-           hidden % 128 == 0 && hidden <= 2560);
-}
-
-namespace {
-/// Whether `ab` asks for any projection (an ON span and a site).
-bool Projects(const HcAbliteration* ab) {
-  if (ab == nullptr || (ab->writer == HcAbliteration::kNone &&
-                        ab->residual == HcAbliteration::kNone))
-    return false;
-  if (ab->count > HcAbliteration::kMaxSpans)
-    throw std::invalid_argument("HC combine: too many abliteration spans");
-  for (std::uint32_t i = 0; i < ab->count; ++i)
-    if (ab->spans[i].settings != nullptr)
-      return true;
-  return false;
-}
-void LaunchAbliterate(float* res, const float* block_out, const float* inject,
-                      std::uint32_t inject_parts, const float* gamma, float* xn,
-                      void* xn_q8_1, std::uint32_t n_tokens,
-                      std::uint32_t hidden, std::uint32_t streams, float eps,
-                      hipStream_t stream, const HcAbliteration& ab) {
-  if (hidden == 0 || hidden > kHcAbliterationMaxHidden ||
-      ab.directions == nullptr)
-    throw std::invalid_argument(
-        "HC combine: abliteration needs rows of at "
-        "most 2,560 and directions");
-  hipLaunchKernelGGL(HcCombineAbliterateKernel, dim3(n_tokens, streams),
-                     dim3(kThreads), 0, stream, res, block_out, inject,
-                     inject_parts, gamma, xn, hidden, streams, eps, xn_q8_1,
-                     ab);
-}
-}  // namespace
-
 bool HcCombine(float* res, const float* block_out, const float* inject,
                std::uint32_t inject_parts, const float* gamma, float* xn,
                std::uint32_t n_tokens, std::uint32_t hidden,
                std::uint32_t streams, float eps, hipStream_t stream,
                bool decode, bool any_width, __half* xn_half, float* xn_scale,
                const Exl3PrefillMoeRows* moe, void* xn_q8t, float* defer_w,
-               DeferredResidual prior, const HcAbliteration* abliteration) {
-  const bool project = Projects(abliteration);
-  if (!HcCombinePerStream(n_tokens, hidden, streams, decode, any_width)) {
-    if (project)
-      throw std::invalid_argument(
-          "HC combine: abliteration needs the per-stream kernel");
+               DeferredResidual prior) {
+  // One block per token wants a batch: a decode step keeps the
+  // one-block-per-stream kernel's parallelism.
+  if (!decode && (n_tokens >= 16 || any_width) && streams == 4 &&
+      hidden % 128 == 0 && hidden <= 2560) {
     xn_half = gamma != nullptr ? xn_half : nullptr;
     xn_q8t = gamma != nullptr ? xn_q8t : nullptr;
     const bool side = xn_half != nullptr || xn_q8t != nullptr;
@@ -1388,11 +1256,6 @@ bool HcCombine(float* res, const float* block_out, const float* inject,
     throw std::invalid_argument(
         "HC combine: fused MoE and deferred updates need the four-lane "
         "prefill kernel");
-  if (project) {
-    LaunchAbliterate(res, block_out, inject, inject_parts, gamma, xn, nullptr,
-                     n_tokens, hidden, streams, eps, stream, *abliteration);
-    return false;
-  }
   hipLaunchKernelGGL(HcCombineKernel<float>, dim3(n_tokens, streams),
                      dim3(kThreads), 0, stream, res, block_out, inject,
                      inject_parts, gamma, xn, nullptr, hidden, streams, eps,
@@ -1403,15 +1266,9 @@ bool HcCombine(float* res, const float* block_out, const float* inject,
 bool HcCombineQ8_1(float* res, const float* block_out, const float* inject,
                    std::uint32_t inject_parts, const float* gamma, float* xn,
                    void* xn_q8, std::uint32_t n_tokens, std::uint32_t hidden,
-                   std::uint32_t streams, float eps, hipStream_t stream,
-                   const HcAbliteration* abliteration) {
+                   std::uint32_t streams, float eps, hipStream_t stream) {
   if (gamma == nullptr || hidden % 32 != 0) {
     return false;
-  }
-  if (Projects(abliteration)) {
-    LaunchAbliterate(res, block_out, inject, inject_parts, gamma, xn, xn_q8,
-                     n_tokens, hidden, streams, eps, stream, *abliteration);
-    return true;
   }
   hipLaunchKernelGGL(HcCombineKernel<float>, dim3(n_tokens, streams),
                      dim3(kThreads), 0, stream, res, block_out, inject,

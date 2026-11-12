@@ -11,68 +11,9 @@ void Executor::ApplyPendingResidual() const {
                     config().hidden_size, stream_);
 }
 
-bool Executor::PerStreamCombine(std::uint32_t n_tokens,
-                                const float* gamma) const {
-  const Config& c = config();
-  if (c.hidden_size > kHcAbliterationMaxHidden)
-    return false;
-  // The wide F16 combine (xn_half_ below).
-  if (wide_mixer_ && MatrixRows(n_tokens) && gamma != nullptr)
-    return false;
-  const bool exl3 = model_->output().exl3 != nullptr;
-  // HcCombineQ8_1.
-  if (!(prefill_phase && exl3) && !MatrixRows(n_tokens) &&
-      UnpaddedQ8(c.HcDim()) && gamma != nullptr && c.hidden_size % 32 == 0)
-    return true;
-  return HcCombinePerStream(n_tokens, c.hidden_size, c.hc_count,
-                            exl3 && !prefill_phase, exl3 && prefill_phase);
-}
-
-bool Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
+void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
                        const float* inject_w, bool defer_res,
-                       AbliterationSite ablation, const float* residual) const {
-  const Config& c = config();
-  // A residual projection the combine cannot fuse follows it: nothing the
-  // combine derives from res (the next mixer's norm) may predate it.
-  if (residual != nullptr && !PerStreamCombine(n_tokens, gamma)) {
-    gamma = nullptr;
-    inject_w = nullptr;
-  }
-  const bool on = ablation.settings != nullptr || residual != nullptr;
-  const bool fuse = on && PerStreamCombine(n_tokens, gamma);
-  HcAbliteration fused{};
-  if (fuse) {
-    fused.directions = abliteration_directions_;
-    fused.spans[0] = {
-        n_tokens, ablation.settings != nullptr ? ablation.settings : residual};
-    fused.count = 1;
-    if (ablation.settings != nullptr)
-      fused.writer = qwen::AbliterationWeightIndex(c.num_layers, ablation.layer,
-                                                   ablation.mlp);
-    if (residual != nullptr)
-      fused.residual = qwen::AbliterationWeightIndex(
-          c.num_layers, ablation.layer, qwen::AbliterationPoint::kResidual);
-  }
-  CombineRows(res, gamma, n_tokens, inject_w, defer_res,
-              fuse ? AbliterationSite{} : ablation, on,
-              fuse ? &fused : nullptr);
-  if (residual != nullptr && !fuse) {
-    // ON disables the deferring MoE combine and this combine defers
-    // nothing; settle any update still pending regardless, so the
-    // projection reads the materialized residual of every HC stream.
-    ApplyPendingResidual();
-    const AbliterationSpan span{n_tokens, residual};
-    AbliterateResidualBatchRows(
-        res, abliteration_directions_, std::span(&span, 1), ablation.layer,
-        c.num_layers, n_tokens, c.hidden_size, c.hc_count, stream_);
-  }
-  return gamma != nullptr;
-}
-
-void Executor::CombineRows(float* res, const float* gamma,
-                           std::uint32_t n_tokens, const float* inject_w,
-                           bool defer_res, AbliterationSite ablation, bool on,
-                           const HcAbliteration* fused) const {
+                       AbliterationSite ablation) const {
   const Config& c = config();
   inject_fused_ = nullptr;
   xn_deferred_ = {};  // s_.xn is rewritten (or left stale) below
@@ -86,10 +27,11 @@ void Executor::CombineRows(float* res, const float* gamma,
     exl3_moe_pending_ = {};
     const auto& d = pending.layer->ffn_down_exps;
     const auto scratch = Exl3PrefillView();
-    exl3_moe_fused = !on && prefill_phase && pending.rows == n_tokens &&
-                     c.hc_count == 4 && c.hidden_size % 128 == 0 &&
-                     c.hidden_size <= 2560 && d.rows == c.hidden_size &&
-                     !moe_pending_ && !res_deferred_ &&
+    exl3_moe_fused = ablation.settings == nullptr && prefill_phase &&
+                     pending.rows == n_tokens && c.hc_count == 4 &&
+                     c.hidden_size % 128 == 0 && c.hidden_size <= 2560 &&
+                     d.rows == c.hidden_size && !moe_pending_ &&
+                     !res_deferred_ &&
                      !(wide_mixer_ && MatrixRows(n_tokens) && gamma != nullptr);
     if (!exl3_moe_fused || exl3_res_pending_.res != res ||
         exl3_res_pending_.rows != n_tokens)
@@ -136,7 +78,7 @@ void Executor::CombineRows(float* res, const float* gamma,
     moe_pending_ = false;
     const auto* down = reinterpret_cast<const __half*>(s_.down_e);
     const float* fused_w = deferred ? fused_inject : nullptr;
-    if (!on && wide_mixer_ && MatrixRows(n_tokens) &&
+    if (ablation.settings == nullptr && wide_mixer_ && MatrixRows(n_tokens) &&
         HcCombineMoeF16(
             res, down, s_.weights, s_.shexp_out, s_.router + c.num_experts,
             c.num_experts + 1, c.num_experts_used, s_.inject, inject_parts_,
@@ -185,7 +127,7 @@ void Executor::CombineRows(float* res, const float* gamma,
       !MatrixRows(n_tokens) && UnpaddedQ8(c.HcDim()) &&
       HcCombineQ8_1(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn,
                     s_.xn_q8_1, n_tokens, c.hidden_size, c.hc_count, c.rms_eps,
-                    stream_, fused)) {
+                    stream_)) {
     xn_q8_ready_ = {s_.xn, s_.xn_q8_1, n_tokens, c.HcDim()};
     return;
   }
@@ -220,7 +162,7 @@ void Executor::CombineRows(float* res, const float* gamma,
           half_norm && !q8_norm ? static_cast<__half*>(s_.x_half) : nullptr,
           xn_scale, exl3_moe_fused ? &exl3_moe : nullptr,
           q8_norm ? s_.xn_q8t : nullptr, defer_now ? s_.hc_defer_w : nullptr,
-          prior, fused)) {
+          prior)) {
     if (defer_now)
       exl3_res_pending_ = {res, {s_.block_out, s_.hc_defer_w}, n_tokens};
     if (q8_norm) {

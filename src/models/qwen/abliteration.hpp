@@ -210,12 +210,10 @@ struct AbliterationSettings {
   /// profiles in one direction table passes the profile's first row.
   [[nodiscard]] std::vector<float> DeviceWords(
       std::uint32_t row_offset = 0) const;
-  /// Whether any residual strength is nonzero. Only then do the models
-  /// project the residual (at every layer, zero strengths included; on
-  /// Flash-Next inside its per-stream decode combine where that route runs)
-  /// and leave fusions that derive values from the post-layer residual
-  /// unless they follow the projection. Like ON/OFF, a change of this bit
-  /// can change which kernels a pass launches.
+  /// Whether any residual strength is nonzero. Only then do the models launch
+  /// the residual projection (at every layer, zero strengths included) and
+  /// leave fusions that derive values from the post-layer residual. Like
+  /// ON/OFF, a change of this bit changes which kernels a pass launches.
   [[nodiscard]] bool ResidualActive() const noexcept;
 };
 

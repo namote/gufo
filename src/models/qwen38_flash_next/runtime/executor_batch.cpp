@@ -13,7 +13,6 @@ namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
 
 constexpr std::uint32_t kBatchSessions = 8;
-static_assert(kBatchSessions <= HcAbliteration::kMaxSpans);
 constexpr std::uint32_t kDecodeRows = 8;
 
 bool Fail(std::string* error, const std::string& message) {
@@ -224,13 +223,12 @@ bool Executor::HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
   return true;
 }
 
-void Executor::CombineBatch(float* res, const float* gamma, std::uint32_t rows,
-                            const HcAbliteration* abliteration) const {
+void Executor::CombineBatch(float* res, const float* gamma,
+                            std::uint32_t rows) const {
   const auto& c = config();
   DropReadyQ8();
   HcCombine(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn, rows,
-            c.hidden_size, c.hc_count, c.rms_eps, stream_, true, false, nullptr,
-            nullptr, nullptr, nullptr, nullptr, {}, abliteration);
+            c.hidden_size, c.hc_count, c.rms_eps, stream_, true);
 }
 
 bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
@@ -1368,31 +1366,17 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
                       error)) {
         return false;
       }
-      // ON sessions' writer and residual projections run in the decode
-      // combine itself (HcAbliteration), before it forms the next mixer's
-      // norm; OFF rows take no projection.
-      const auto ablation = [&](bool mlp, bool residual) {
-        HcAbliteration a{};
-        if (abliteration_.empty())
-          return a;
-        a.directions = abliteration_directions_;
-        a.count = static_cast<std::uint32_t>(items.size());
-        a.writer = qwen::AbliterationWeightIndex(c.num_layers, il, mlp);
-        bool any_residual = false;
-        for (std::size_t i = 0; i < items.size(); ++i) {
-          a.spans[i] = {
+      if (!abliteration_.empty()) {
+        std::array<AbliterationSpan, kBatchSessions> spans{};
+        for (std::size_t i = 0; i < items.size(); ++i)
+          spans[i] = {
               offsets[i] + static_cast<std::uint32_t>(items[i].tokens.size()),
-              AbliterationAt(*items[i].session, il, mlp).settings};
-          any_residual = any_residual ||
-                         ResidualAbliteration(*items[i].session) != nullptr;
-        }
-        if (residual && any_residual)
-          a.residual = qwen::AbliterationWeightIndex(
-              c.num_layers, il, qwen::AbliterationPoint::kResidual);
-        return a;
-      };
-      const HcAbliteration attention_ablation = ablation(false, false);
-      CombineBatch(base.res, l.hc_ffn.norm.f32(), rows, &attention_ablation);
+              AbliterationAt(*items[i].session, il, false).settings};
+        AbliterateBatchRows(base.block_out, abliteration_directions_,
+                            std::span(spans.data(), items.size()), il, false,
+                            c.num_layers, rows, c.hidden_size, stream_);
+      }
+      CombineBatch(base.res, l.hc_ffn.norm.f32(), rows);
       if (!HcMixBatch(l.hc_ffn, base.res, true, base.mixed, base.inject, rows,
                       error))
         return false;
@@ -1404,9 +1388,47 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
                                       : layers[il + 1].hc_attn.norm.f32())
               : model_->hc_head().norm.f32();
       UseScratch(base);
-      const HcAbliteration mlp_ablation = ablation(true, true);
-      CombineBatch(base.res, next_norm, rows, &mlp_ablation);
+      if (!abliteration_.empty()) {
+        std::array<AbliterationSpan, kBatchSessions> spans{};
+        for (std::size_t i = 0; i < items.size(); ++i)
+          spans[i] = {
+              offsets[i] + static_cast<std::uint32_t>(items[i].tokens.size()),
+              AbliterationAt(*items[i].session, il, true).settings};
+        AbliterateBatchRows(base.block_out, abliteration_directions_,
+                            std::span(spans.data(), items.size()), il, true,
+                            c.num_layers, rows, c.hidden_size, stream_);
+      }
+      CombineBatch(base.res, next_norm, rows);
       normed = next_norm != nullptr;
+      if (!abliteration_.empty()) {
+        // Sessions with nonzero residual strengths project their post-layer
+        // residual rows (every HC stream), then renormalize exactly those
+        // rows for the next mixer; every other session keeps the norm the
+        // combine wrote.
+        std::array<AbliterationSpan, kBatchSessions> spans{};
+        bool any = false;
+        for (std::size_t i = 0; i < items.size(); ++i) {
+          spans[i] = {
+              offsets[i] + static_cast<std::uint32_t>(items[i].tokens.size()),
+              ResidualAbliteration(*items[i].session)};
+          any = any || spans[i].settings != nullptr;
+        }
+        if (any) {
+          AbliterateResidualBatchRows(base.res, abliteration_directions_,
+                                      std::span(spans.data(), items.size()), il,
+                                      c.num_layers, rows, c.hidden_size,
+                                      c.hc_count, stream_);
+          // The head normalizes the residual itself (unnormed HcMixBatch).
+          const bool renorm = normed && il + 1 < c.num_layers;
+          for (std::size_t i = 0; renorm && i < items.size(); ++i)
+            if (spans[i].settings != nullptr)
+              RmsNormRows(base.res + std::size_t{offsets[i]} * c.HcDim(),
+                          next_norm,
+                          base.xn + std::size_t{offsets[i]} * c.HcDim(),
+                          static_cast<std::uint32_t>(items[i].tokens.size()),
+                          c.HcDim(), c.hc_count, c.rms_eps, stream_);
+        }
+      }
       if (detect)
         ScoreDetectors(il, base.res, 0, rows);
     }
