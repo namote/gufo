@@ -262,6 +262,21 @@
       - exact repeat: 1.38 s, re-prefilling 0 tokens from the ON checkpoint;
       - explicit ON: 1.25 s.
     - Streaming a triggered prompt gives the same text as non-streaming, and the terminal chunk carries the report.
+- **Fused HC-combine projection (R2-3), rejected** (b239d759 and 79cdd119, reverted in 8adb87c9; `build/b1/ablit-pol-20261111/fuse/chain14.sh`, November 12).
+  - The idea: fold the writer and residual projections into `HcCombineAbliterateKernel`, which would remove up to about 238 extra launches per ON decode pass.
+  - Setup: production config, runtime i (main) against runtime j (fused), 256 tokens, 4 runs each. Host preflight failed only on disk free (148 G < 150 G).
+
+    | Setting | main | fused |
+    |---|---|---|
+    | OFF | 54.45/53.98/54.13/53.96 | 54.40/54.07/53.11/53.79 |
+    | fnx | 55.26/55.07/55.11/55.10 | 55.24/54.92/54.92/54.79 |
+    | pol-avg | 52.60/52.48/52.54/52.46 | 52.07/51.89/52.24/52.30 |
+    | best3 | 57.03/56.96/56.89/56.98 | 56.83/56.99/57.08/57.14 |
+
+  - **No gain.** The ON answers (8 pol-avg, 8 best3, 12 OFF) and the detector scores are byte-identical between the two runtimes.
+  - The −8.5% ON cost recorded in plan R2 (c03, refusal profile) is gone on current main: fnx and best3 ON decode as fast as OFF or faster. Their text differs from OFF, so MTP acceptance differs too.
+  - pol-avg is about 3% under OFF on different text.
+  - The fused ops test also aborted ("HC combine: abliteration needs rows of at most 2,560 and directions …"). It was dropped with the revert.
   - **Threshold 0.7 for `dynamic/profiles-pol/`** (signed off; `fit_trigger.py --threshold 0.7`, the fitted 1.199 kept in the report as `fitted_threshold`, evidence `dynamic/fit-pol-0.7.json`):
     - Offline at 0.7: recall 92.1%; false positives 4.2% on the hard political controls (Gwangju, Tiananmen-like events elsewhere) and 1.3% on harmless prompts.
     - GPU (R2-4): recall 80% of 75 political prompts; 0/38 ordinary prompts trigger, ordinary max 0.33.
