@@ -7238,6 +7238,31 @@ void TestAbliterationControls() {
              "mlp":[1,2,3]}})")
              .has_value(),
          "another profile's layer count rejected");
+  // An additive (steering) profile takes signed strengths in [-64, 64].
+  backend.more_abliteration.push_back(
+      gufo::server::AbliterationInfo{.name = "steer",
+                                     .schema = "gufo-abliteration-v2",
+                                     .identity = std::string(64, 'd'),
+                                     .layers = 2,
+                                     .direction_layer = 0,
+                                     .attention = {0, 0},
+                                     .mlp = {0, 0},
+                                     .additive = true});
+  Expect(!parse(R"({"abliteration":{"enabled":true,"profile":"steer",
+             "residual":[-3.5,64]}})") &&
+             request.abliteration_overrides.residual ==
+                 std::vector<float>({-3.5F, 64.0F}),
+         "additive profiles take signed strengths");
+  for (const auto* body : {
+           R"({"abliteration":{"enabled":true,"profile":"steer",
+               "residual":-65}})",
+           R"({"abliteration":{"enabled":true,"profile":"steer",
+               "direction_layer":1}})",
+           R"({"abliteration":{"enabled":true,"profile":"fnx",
+               "residual":-1}})",
+       })
+    Expect(parse(body).has_value(), "additive bounds and members checked");
+  backend.more_abliteration.pop_back();
   // Several profiles in one request: an array of names, settings per name.
   Expect(!parse(R"({"abliteration":{"enabled":true,
              "profile":["fnx","pol"],"overrides":{"fnx":{"mlp":[1,2]}}}})") &&

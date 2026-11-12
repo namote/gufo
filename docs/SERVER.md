@@ -609,9 +609,35 @@ stays OFF with `"skipped": "union"`. Union bases live in 256 reserved
 direction rows shared by reference count: sessions running the same
 combination share rows, and rows are freed when the last session using them
 changes settings or ends, so only many distinct combinations active at once
-can exhaust them (that request then fails at admission). Only suppression
-exists: every strength is in [0, 4], and the rule is defined for removing
-directions only (additive steering profiles, R5, are not supported here).
+can exhaust them (that request then fails at admission).
+
+#### Additive (steering) profiles
+
+A Flash-Next v2 profile with `"mode": "add"` (R5, written by
+`tools/qwen38_flash_next/abliteration/fit_steering.py`) adds instead of
+removing: at each site of layer L, `y += a_L * d_L`, where `d_L` is that
+layer's own direction (`directions[L]`, or its projected row with
+`direction_kind: "projected"`) and `a_L` the site's strength (`attention`,
+`mlp` or `residual`). Strengths are signed, in [-64, 64]; the directions are
+unit vectors, so a strength is in hidden-activation units along `d_L`, and a
+negative one moves the activation against the direction (the bound is well
+above the per-layer norms of measured mean differences, recorded in the
+profile's `magnitudes`). An additive profile uses one direction and no norm
+preservation; requests cannot set `direction_layer`, `directions` or
+`preserve_norm` for it. `/props` reports `mode` (`"suppress"` or `"add"`) and
+`max_strength` (64 for an additive profile, which also takes negative
+strengths). Its settings identity differs from a suppression profile's with
+the same numbers.
+
+An additive profile works wherever a suppression profile does: requested
+alone or in an array with other profiles, turned ON by its own `trigger` or
+as a `with` companion, and in `score_assistant` scoring (SPSA can learn its
+signed strengths: `spsa.py --min-strength -64 --max-strength 64`). Where
+suppression and additive profiles act at one site, the site first projects
+the suppression profiles (their weighted union as above) and then adds each
+additive profile's term; additions commute, so their order does not matter.
+A combination holds at most 8 additive profiles, and they count toward the
+16 blocks. Qwen3.8-27B loads no additive profile.
 
 #### Dynamic abliteration
 

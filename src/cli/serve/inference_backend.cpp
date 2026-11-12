@@ -141,6 +141,7 @@ std::vector<AbliterationInfo> DescribeAbliteration(
                 profile->direction_kind)),
         .direction_count = profile->direction_count,
         .preserve_norm = profile->preserve_norm,
+        .additive = profile->additive,
         .subspace_method = profile->subspace_method,
         .trigger_with = profile->trigger ? profile->trigger->with
                                          : std::vector<std::string>{},

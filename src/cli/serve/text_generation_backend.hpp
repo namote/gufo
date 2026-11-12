@@ -59,6 +59,8 @@ struct AbliterationInfo {
   std::string direction_kind{"mean_diff"};
   std::uint32_t direction_count{1};
   bool preserve_norm{false};
+  /// An additive (steering, R5) profile: signed strengths.
+  bool additive{false};
   /// "pca", "som" or empty.
   std::string subspace_method;
   /// Profiles a detection of this profile turns ON with it (`trigger.with`).

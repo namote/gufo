@@ -1637,8 +1637,12 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
       } else {
         abliteration["trigger"] = nullptr;
       }
-      abliteration["max_strength"] =
-          static_cast<double>(models::qwen::kAbliterationMaxWeight);
+      // "suppress" (projection, strengths [0, max_strength]) or "add"
+      // (steering, strengths [-max_strength, max_strength]).
+      abliteration["mode"] = info.additive ? "add" : "suppress";
+      abliteration["max_strength"] = static_cast<double>(
+          info.additive ? models::qwen::kAbliterationMaxAddWeight
+                        : models::qwen::kAbliterationMaxWeight);
     };
     json::Value abliteration = json::Value::object();
     if (profiles.size() == 1)

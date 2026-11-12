@@ -3525,6 +3525,12 @@ std::optional<HttpResponse> ParseAbliterationControl(
       -> std::optional<HttpResponse> {
     const auto layers = info.layers;
     parsed.profile = info.name;
+    if (info.additive &&
+        (source.find("direction_layer") || source.find("directions") ||
+         source.find("preserve_norm")))
+      return invalid(
+          "an additive profile adds each layer's own direction; "
+          "'direction_layer', 'directions' and 'preserve_norm' do not apply");
     if (const auto* layer = source.find("direction_layer")) {
       if (!info.direction_layer)
         return invalid(
@@ -3544,17 +3550,24 @@ std::optional<HttpResponse> ParseAbliterationControl(
       if (!member)
         return std::optional<HttpResponse>{};
       const std::string field = std::string("'abliteration.") + name + "'";
+      // Additive profiles (R5) take signed strengths.
+      const double high = info.additive
+                              ? models::qwen::kAbliterationMaxAddWeight
+                              : models::qwen::kAbliterationMaxWeight;
+      const double low = info.additive ? -high : 0.0;
+      const std::string range = info.additive ? "[-64, 64]" : "[0, 4]";
       const auto read = [&](const json::Value& item) {
-        const double x = item.is_number() ? item.as_double() : -1;
-        if (!std::isfinite(x) || x < 0 ||
-            x > models::qwen::kAbliterationMaxWeight)
+        if (!item.is_number())
+          return false;
+        const double x = item.as_double();
+        if (!std::isfinite(x) || x < low || x > high)
           return false;
         out->push_back(static_cast<float>(x));
         return true;
       };
       if (member->is_number()) {
         if (!read(*member))
-          return std::optional(invalid(field + " must be in [0, 4]"));
+          return std::optional(invalid(field + " must be in " + range));
         return std::optional<HttpResponse>{};
       }
       if (!member->is_array() || member->size() != layers)
@@ -3563,7 +3576,7 @@ std::optional<HttpResponse> ParseAbliterationControl(
                                      std::to_string(layers) + " numbers"));
       for (const auto& item : member->items())
         if (!read(item))
-          return std::optional(invalid(field + " values must be in [0, 4]"));
+          return std::optional(invalid(field + " values must be in " + range));
       return std::optional<HttpResponse>{};
     };
     if (auto error = strengths("attention", &parsed.attention))
