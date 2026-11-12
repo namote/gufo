@@ -19,8 +19,11 @@ class Fake(http.server.BaseHTTPRequestHandler):
     answer loses its lead over the wrong one with attention strength at
     layer 0, which nothing else rewards or penalizes."""
 
+    bodies = []
+
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        Fake.bodies.append(body.get('abliteration'))
         answer = body['messages'][-1]['content']
         ab = body.get('abliteration')
         mlp = ab['mlp'][2] if ab else 0.0
@@ -49,6 +52,33 @@ class SpsaTest(unittest.TestCase):
         self.assertEqual(spsa.clip([-5.0, 1.0, 70.0], 4.0), [0.0, 1.0, 4.0])
         self.assertEqual(spsa.clip([-70.0, -5.0, 70.0], 64.0, -64.0),
                          [-64.0, -5.0, 64.0])
+
+    def test_additive_requests_carry_only_strengths(self):
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Fake)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        url = f'http://127.0.0.1:{server.server_address[1]}'
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / 'pairs.jsonl').write_text(json.dumps(
+                {'id': 'p', 'prompt': 'q', 'candid': 'candid a', 'propaganda': 'prop a'}) + '\n')
+            (d / 'ord.jsonl').write_text(json.dumps({'id': 'o', 'prompt': 'q', 'answer': 'plain'}) + '\n')
+            base = ['--base-url', url, '--pairs', str(d / 'pairs.jsonl'), '--ordinary', str(d / 'ord.jsonl'),
+                    '--layers', str(LAYERS), '--init', '-1', '--log', str(d / 'log.jsonl'),
+                    '--concurrency', '1', '--eval-every', '5', '--seed', '3']
+            with self.assertRaises(SystemExit):   # a suppression run needs its layer
+                spsa.main(base + ['--steps', '1'])
+            Fake.bodies.clear()
+            self.assertEqual(spsa.main(base + ['--additive', '--profile', 'steer',
+                                               '--min-strength', '-64', '--max-strength', '64',
+                                               '--steps', '2']), 0)
+            sent = [b for b in Fake.bodies if b]
+            self.assertTrue(sent)
+            for body in sent:
+                self.assertEqual(set(body), {'enabled', 'profile', 'attention', 'mlp', 'residual'})
+            self.assertTrue(any(min(b['attention']) < 0 for b in sent))  # signed strengths kept
+            header = json.loads((d / 'log.jsonl').read_text().splitlines()[0])
+            self.assertTrue(header['args']['additive'])
+        server.shutdown()
 
     def test_blocks_round_trip(self):
         theta = [float(i) for i in range(3 * 5)]

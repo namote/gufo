@@ -61,10 +61,21 @@ class FitSteeringTest(unittest.TestCase):
             self.assertGreater(d[0, 0], 0)
             self.assertLess(d[1, 1], 0)
             np.testing.assert_allclose(profile['magnitudes'], [2.0, 1.0], rtol=1e-3)
+            # Increments along each d_L: layer 0 adds 2*0.5; layer 1's
+            # direction is orthogonal to layer 0's, so its increment is 1*0.5.
             np.testing.assert_allclose(profile['residual'], [1.0, 0.5], rtol=1e-3)
+            self.assertEqual(profile['steering_fit']['skipped_questions'], 1)
             self.assertEqual(profile['attention'], [0.0, 0.0])
             self.assertEqual(profile['direction_count'], 1)
             self.assertFalse(profile['preserve_norm'])
+
+    def test_defaults_do_not_compound(self):
+        # The same shift at both layers: layer 1 adds nothing new.
+        d = np.array([[2.0, 0, 0, 0], [2.0, 0, 0, 0]])
+        np.testing.assert_allclose(fit_steering.default_strengths(d, 1.0), [2.0, 0.0])
+        np.testing.assert_allclose(fit_steering.default_strengths(d, 1.0, 1), [0.0, 2.0])
+        grows = np.array([[1.0, 0, 0, 0], [3.0, 0, 0, 0]])
+        np.testing.assert_allclose(fit_steering.default_strengths(grows, 0.5), [0.5, 1.0])
 
     def test_projected_removes_the_shared_mean(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -81,7 +92,7 @@ class FitSteeringTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             shift = np.full((LAYERS, HIDDEN), 100.0)
             profile = fit_steering.fit(collection(Path(tmp) / 'c', shift), alpha=1)
-            self.assertEqual(max(profile['residual']), 64.0)
+            self.assertEqual(profile['residual'][0], 64.0)
             one = write(Path(tmp) / 'one', [
                 ('aa', 'own', 'q', np.zeros((LAYERS, HIDDEN))),
                 ('ab', 'exemplar', 'q', np.ones((LAYERS, HIDDEN)))])

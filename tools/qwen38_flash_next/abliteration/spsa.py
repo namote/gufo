@@ -4,7 +4,7 @@
 The server runs Qwen3.8-Flash-Next with a gufo-abliteration-v2 profile and the
 Chat Completions `score_assistant` extension. The direction is fixed (the
 request settings `direction_layer`, `direction_kind`, `directions`,
-`preserve_norm`); the parameters are the 3 x layers strengths `attention`,
+`preserve_norm`; an additive profile, `--additive`, takes none of them); the parameters are the 3 x layers strengths `attention`,
 `mlp` and `residual` (each in [0, max]), sent per request so nothing reloads.
 
 Objective (maximized), from teacher-forced log-probabilities (no generation):
@@ -131,10 +131,15 @@ class Objective:
         n = self.layers
         theta = expand(params, n, self.args.block_size)
         a = self.args
-        settings = dict(enabled=True, direction_layer=a.direction_layer,
-                        direction_kind=a.direction_kind, directions=a.directions,
-                        preserve_norm=a.preserve_norm == 'on',
-                        attention=[round(x, 5) for x in theta[:n]],
+        settings = dict(enabled=True)
+        # An additive profile ("mode": "add") adds each layer's own
+        # direction: the server rejects the direction options for it.
+        if not a.additive:
+            settings.update(direction_layer=a.direction_layer,
+                            direction_kind=a.direction_kind,
+                            directions=a.directions,
+                            preserve_norm=a.preserve_norm == 'on')
+        settings.update(attention=[round(x, 5) for x in theta[:n]],
                         mlp=[round(x, 5) for x in theta[n:2 * n]],
                         residual=[round(x, 5) for x in theta[2 * n:]])
         # A server with several profiles needs the name; with one it is the
@@ -221,7 +226,11 @@ def main(argv=None):
     ap.add_argument('--fact-margin', type=float, default=2.0,
                     help='summed log-probability lead (nats) a correct fact answer needs over the wrong one')
     ap.add_argument('--layers', type=int, default=48)
-    ap.add_argument('--direction-layer', type=int, required=True)
+    ap.add_argument('--direction-layer', type=int,
+                    help='the direction layer (suppression profiles; required there)')
+    ap.add_argument('--additive', action='store_true',
+                    help='the profile is additive ("mode": "add"): send only the '
+                         'strengths; use with --min-strength below 0')
     ap.add_argument('--profile', default='',
                     help='loaded profile name (needed when the server loads several)')
     ap.add_argument('--direction-kind', default='projected')
@@ -255,6 +264,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if not 0 <= args.answer_tokens <= 1024:
         ap.error('--answer-tokens must be 0..1024')
+    if not args.additive and args.direction_layer is None:
+        ap.error('--direction-layer is required for a suppression profile')
     if args.min_strength > args.max_strength:
         ap.error('--min-strength must not exceed --max-strength')
     if args.block_size < 1 or args.minibatch < 0:
@@ -281,6 +292,8 @@ def main(argv=None):
                                  and not (k in ('answer_tokens', 'minibatch') and not v)
                                  and not (k == 'block_size' and v == 1)
                                  and not (k == 'min_strength' and v == 0.0)
+                                 and not (k == 'additive' and not v)
+                                 and not (k == 'direction_layer' and v is None)
                                  and not (k in ('facts', 'mu', 'fact_margin') and not args.facts)},
                   pairs=[p['id'] for p in pairs], ordinary=[o['id'] for o in ordinary])
     if facts:

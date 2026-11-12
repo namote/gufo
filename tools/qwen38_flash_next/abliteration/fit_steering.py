@@ -4,8 +4,9 @@ CPU only (NumPy); never starts a server or a GPU job.
 
 Input: a collector `answers` collection (collect.cpp; readout
 `answer-tokens-mean-post-layer-hc-mean-fp32-v1`). Each record is one
-teacher-forced answer, saved as the per-layer mean over its answer tokens of
-the post-layer residual averaged over the HC streams, with its `group`
+teacher-forced answer, saved as the per-layer mean over the rows that predict
+its tokens of the post-layer residual averaged over the HC streams, with its
+`group`
 ("exemplar" or "own") and `pair` (the question both answers share).
 
 Direction per layer, paired by question so topic differences cancel:
@@ -20,10 +21,21 @@ per layer and kind from the per-pair differences (PCA, or a SOM with
 `y += alpha_L * d_L` at layer L's sites.
 
 Directions are stored as unit vectors (the runtime contract); `magnitudes`
-records |d_L| per layer. Default strengths: residual alpha_L =
-`--alpha` * |d_L| (so `--alpha 1` adds the full measured mean shift at every
-layer, 0 leaves the profile neutral until a request or SPSA sets strengths),
-attention and MLP 0. Strengths are clamped to the runtime bound [-64, 64].
+records |d_L| per layer.
+
+Default strengths. d_L is the cumulative shift at layer L, and the residual
+carries every earlier addition forward, so adding |d_L| at every layer would
+add the shift many times over. The default residual strength of layer L is
+therefore its own increment along its direction,
+
+    a_L = alpha * (d_L - d_{L-1}) . d_L / |d_L|      (d_{-1} = 0)
+
+so `--alpha 1` makes the residual after layer L carry roughly the measured
+shift along d_L (exactly when the directions agree across layers), and 0
+leaves the profile neutral until a request or SPSA sets strengths.
+`--single-layer L` instead puts the whole shift on one layer:
+a_L = alpha * |d_L| there and 0 elsewhere. Attention and MLP strengths are
+0. Strengths are clamped to the runtime bound [-64, 64].
 
 The output is a gufo-abliteration-v2 profile with `"mode": "add"`.
 """
@@ -69,12 +81,14 @@ def load(collection):
 
 
 def paired_differences(pairs):
-    """[pairs][layers][hidden] differences and the own-answer mean; questions
-    lacking either group are skipped."""
+    """[pairs][layers][hidden] differences, the own-answer mean and the number
+    of questions skipped for lacking either group."""
     diffs, own = [], []
+    skipped = 0
     for name in sorted(pairs):
         groups = pairs[name]
         if 'exemplar' not in groups or 'own' not in groups:
+            skipped += 1
             continue
         exemplar = np.mean(groups['exemplar'], axis=0)
         mine = np.mean(groups['own'], axis=0)
@@ -82,12 +96,28 @@ def paired_differences(pairs):
         own.append(mine)
     if len(diffs) < 2:
         raise ValueError('need at least two questions with both groups')
-    return np.stack(diffs), np.mean(own, axis=0)
+    return np.stack(diffs), np.mean(own, axis=0), skipped
 
 
-def fit(collection, kind='mean_diff', rank=1, method='pca', seed=0, alpha=0.0):
+def default_strengths(d, alpha, single_layer=None):
+    """Residual strengths per layer from the cumulative shifts d [layers][hidden]
+    (see the module docstring)."""
+    norms = np.linalg.norm(d, axis=1)
+    if single_layer is not None:
+        if not 0 <= single_layer < len(d):
+            raise ValueError('--single-layer is out of range')
+        out = np.zeros(len(d))
+        out[single_layer] = alpha * norms[single_layer]
+        return out
+    previous = np.vstack([np.zeros_like(d[:1]), d[:-1]])
+    increments = ((d - previous) * d).sum(axis=1) / norms
+    return alpha * increments
+
+
+def fit(collection, kind='mean_diff', rank=1, method='pca', seed=0, alpha=0.0,
+        single_layer=None):
     manifest, pairs = load(collection)
-    diffs, own_mean = paired_differences(pairs)
+    diffs, own_mean, skipped = paired_differences(pairs)
     # fit_bases takes per-sample activations and the reference mean; the
     # paired differences on top of the own mean give mean d_L exactly.
     mean_diff, projected, reached = prepare.fit_bases(
@@ -114,11 +144,12 @@ def fit(collection, kind='mean_diff', rank=1, method='pca', seed=0, alpha=0.0):
                                    direction_count=1, preserve_norm=False)
     profile['mode'] = 'add'
     profile['residual'] = [prepare.float32_text(float(np.clip(
-        alpha * m, -MAX_ADD, MAX_ADD))) for m in magnitudes]
+        a, -MAX_ADD, MAX_ADD))) for a in default_strengths(d, alpha, single_layer)]
     profile['magnitudes'] = [prepare.float32_text(float(m)) for m in magnitudes]
     profile['steering_fit'] = dict(
-        pairs=int(diffs.shape[0]), kind=kind, rank=int(reached), method=method,
-        seed=seed, alpha=alpha,
+        pairs=int(diffs.shape[0]), skipped_questions=skipped, kind=kind,
+        rank=int(reached), method=method, seed=seed, alpha=alpha,
+        single_layer=single_layer,
         collection_sha256=sha((Path(collection) / 'manifest.json').read_bytes()))
     return profile
 
@@ -132,8 +163,10 @@ def main(argv=None):
     parser.add_argument('--method', choices=prepare.METHODS, default='pca')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--alpha', type=float, default=0.0,
-                        help='default residual strength per layer as a multiple '
-                             'of |d_L| (0: neutral)')
+                        help='scale of the default residual strengths: each '
+                             "layer's increment along d_L (0: neutral)")
+    parser.add_argument('--single-layer', type=int,
+                        help='put the whole default shift on this layer only')
     parser.add_argument('--output', required=True)
     args = parser.parse_args(argv)
     output = Path(args.output)
@@ -142,7 +175,7 @@ def main(argv=None):
     if not np.isfinite(args.alpha):
         raise SystemExit('--alpha must be finite')
     profile = fit(args.collection, args.kind, args.rank, args.method, args.seed,
-                  args.alpha)
+                  args.alpha, args.single_layer)
     prepare.save_profile(output, profile)
     print(output)
 

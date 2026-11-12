@@ -395,11 +395,15 @@ An additive profile (`"mode": "add"`, see `docs/SERVER.md`) adds
    both answers share), `text` (the user turn) and `answer` (the assistant
    content). The prompt is framed as `score_assistant` frames it (thinking
    off, the empty thinking block), the answer tokenized as message text, and
-   each record saves the per-layer mean over the answer tokens of the
-   post-layer residual averaged over the HC streams (48 x 2560 FP32, readout
-   `answer-tokens-mean-post-layer-hc-mean-fp32-v1`), with `answer_tokens`
-   in its receipt. The collector reads every row of the passes that feed
-   the answer, so no last-layer rows are skipped.
+   each record saves the per-layer mean of the post-layer residual averaged
+   over the HC streams (48 x 2560 FP32, readout
+   `answer-tokens-mean-post-layer-hc-mean-fp32-v1`) over the n rows that
+   predict the answer's n tokens: positions P-1 (the last prompt token)
+   through P+n-2, the rows score_assistant scores and generation produces
+   the answer from; the answer's last token is never fed. `answer_tokens` is
+   in the receipt. The collector reads every row of those passes: no
+   last-layer row is skipped and the last attention layer computes every
+   query.
 2. Fit the profile:
 
    ```sh
@@ -410,11 +414,16 @@ An additive profile (`"mode": "add"`, see `docs/SERVER.md`) adds
    `d_L` is the mean over questions of (mean exemplar - mean own) answers at
    layer L; `--kind projected` removes the component along the own answers'
    mean, `--rank k` stores k-1 further rows (only the first is applied).
-   Directions are stored as unit vectors with their norms in `magnitudes`;
-   `--alpha` sets the default residual strengths to alpha * |d_L| (0: neutral).
-3. Learn the strengths with `spsa.py --min-strength -64 --max-strength 64`
-   against held-out exemplar answers (`score_assistant` scores additive
-   profiles like any other).
+   Directions are stored as unit vectors with their norms in `magnitudes`.
+   Because `d_L` is cumulative and the residual carries every addition
+   forward, the default residual strength of layer L is `--alpha` times its
+   own increment along its direction, `(d_L - d_{L-1}) . d_L / |d_L|`, not
+   `|d_L|`; `--single-layer L` puts `alpha * |d_L|` on one layer instead
+   (0 alpha: neutral).
+3. Learn the strengths with `spsa.py --additive --min-strength -64
+   --max-strength 64` against held-out exemplar answers (`score_assistant`
+   scores additive profiles like any other; `--additive` sends only the
+   strengths, and `--direction-layer` is not needed).
 
 ## Focused checks
 
