@@ -1041,8 +1041,11 @@ struct TextGenerationScheduler::Impl {
       std::span<const std::deque<std::shared_ptr<ScheduledRequest>>* const>
           residents,
       std::size_t waiting) {
+    // Scoring requests neither wait for nor lead a shared prefix: a short
+    // scoring prompt is never prefilled to the shared checkpoint, and
+    // waiting would keep it out of the next scoring unit.
     if (std::exchange(request->prefix_considered, true) ||
-        !request->cache_prompt ||
+        !request->cache_prompt || !request->score_tokens.empty() ||
         // Parked requests hold no runner lease; bound their reservations like
         // admitted ones.
         waiting + 1 >= runner_pool->capacity())
@@ -1053,7 +1056,8 @@ struct TextGenerationScheduler::Impl {
     for (const auto* list : residents) {
       for (const auto& resident : *list) {
         if (IsTerminal(resident) || !resident->runner_request ||
-            resident->runner_request.prefill_complete())
+            resident->runner_request.prefill_complete() ||
+            !resident->score_tokens.empty())
           continue;
         const auto other = resident->runner_request.prompt();
         const auto shared = static_cast<std::size_t>(
