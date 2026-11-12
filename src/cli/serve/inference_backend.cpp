@@ -3054,6 +3054,43 @@ public:
     return scored;
   }
 
+  [[nodiscard]] std::size_t ScoringPackRows() const override {
+    return QwenFlashNextSession::ScorePackRows(*model_);
+  }
+
+  // Requests whose rest fits one pass share prompt passes
+  // (QwenFlashNextSession::ScoreBatch).
+  void ScoreBatch(std::span<const TextRunnerScoring> requests) const override {
+    std::vector<std::vector<std::int32_t>> prompts;
+    std::vector<std::vector<std::int32_t>> tokens;
+    std::vector<std::string> errors(requests.size());
+    const auto ok = std::make_unique<bool[]>(requests.size());
+    std::vector<QwenFlashNextSession::ScoreRequest> items;
+    prompts.reserve(requests.size());
+    tokens.reserve(requests.size());
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+      auto& qfn = RequireQwenFlashNextState(requests[i].state.get());
+      prompts.push_back(QwenFlashNextEngineTokens(requests[i].prompt));
+      tokens.push_back(QwenFlashNextEngineTokens(requests[i].tokens));
+      items.push_back({&qfn.session(), prompts.back(), tokens.back(),
+                       requests[i].scored, &errors[i], &ok[i]});
+    }
+    QwenFlashNextSession::ScoreBatch(items);
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+      auto& qfn = RequireQwenFlashNextState(requests[i].state.get());
+      if (ok[i]) {
+        qfn.set_position(qfn.session().Position());
+        continue;
+      }
+      qfn.set_position(0);
+      auto failure = std::make_exception_ptr(std::runtime_error(
+          "Qwen3.8-Flash-Next scoring failed: " + errors[i]));
+      if (!requests[i].failure)
+        std::rethrow_exception(failure);
+      *requests[i].failure = failure;
+    }
+  }
+
   [[nodiscard]] std::optional<std::size_t> CountPromptTokens(
       const ChatRequest& request) const override {
     return CountQwenPromptTokens(request, model_->tokenizer(),

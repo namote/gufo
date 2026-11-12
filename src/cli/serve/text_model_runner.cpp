@@ -560,6 +560,20 @@ void TextModelRunner::AdvanceBatch(
   }
 }
 
+void TextModelRunner::ScoreBatch(
+    std::span<const TextRunnerScoring> requests) const {
+  for (const auto& request : requests) {
+    try {
+      *request.scored =
+          ScoreTokens(request.state.get(), request.prompt, request.tokens);
+    } catch (...) {
+      if (!request.failure)
+        throw;
+      *request.failure = std::current_exception();
+    }
+  }
+}
+
 TextDecodeStep TextModelRunner::DecodeStep(
     TextRunnerState& state, std::size_t max_tokens,
     sampling::SamplerState& sampler) const {
@@ -1934,7 +1948,7 @@ TextDecodeStep TextRunnerPool::Request::DecodeStep(
   return step;
 }
 
-std::vector<sampling::TokenLogprobs> TextRunnerPool::Request::Score(
+TextRunnerState& TextRunnerPool::Request::PrepareScore(
     std::span<const TextRunnerToken> tokens) {
   if (!*this) {
     throw std::logic_error("text runner request is empty");
@@ -1962,7 +1976,12 @@ std::vector<sampling::TokenLogprobs> TextRunnerPool::Request::Score(
   impl_->state_reusable = false;
   auto& state = dynamic_cast<TextRunnerState&>(impl_->lease.state());
   state.SetResidentRequests(1);
-  auto scored = impl_->runner->ScoreTokens(state, impl_->prompt, tokens);
+  return state;
+}
+
+void TextRunnerPool::Request::CheckScores(
+    std::span<const TextRunnerToken> tokens,
+    std::span<const sampling::TokenLogprobs> scored) {
   if (scored.size() != tokens.size()) {
     throw std::runtime_error("text runner returned an invalid score count");
   }
@@ -1970,6 +1989,13 @@ std::vector<sampling::TokenLogprobs> TextRunnerPool::Request::Score(
     if (scored[index].selected.token != tokens[index])
       throw std::runtime_error("text runner scored a different token");
   }
+}
+
+std::vector<sampling::TokenLogprobs> TextRunnerPool::Request::Score(
+    std::span<const TextRunnerToken> tokens) {
+  auto& state = PrepareScore(tokens);
+  auto scored = impl_->runner->ScoreTokens(state, impl_->prompt, tokens);
+  CheckScores(tokens, scored);
   return scored;
 }
 
@@ -2336,6 +2362,53 @@ TextExecutionPlan TextRunnerPool::SelectDecodePlan(
     return *widest_available;
   }
   return *serial;
+}
+
+std::size_t TextRunnerPool::ScoringPackRows() const {
+  return impl_->validated.runner->ScoringPackRows();
+}
+
+std::vector<std::exception_ptr> TextRunnerPool::ScoreBatch(
+    std::span<Request*> requests,
+    std::span<const std::span<const TextRunnerToken>> tokens,
+    std::vector<std::vector<sampling::TokenLogprobs>>* scored) {
+  if (requests.size() != tokens.size() || scored == nullptr)
+    throw std::invalid_argument("scoring batch sizes differ");
+  std::vector<std::exception_ptr> failures(requests.size());
+  scored->assign(requests.size(), {});
+  std::vector<TextRunnerScoring> items;
+  std::vector<std::size_t> owners;
+  for (std::size_t index = 0; index < requests.size(); ++index) {
+    auto* request = requests[index];
+    if (request == nullptr || !*request ||
+        request->impl_->runner != impl_->validated.runner ||
+        std::find(requests.begin(), requests.begin() + index, request) !=
+            requests.begin() + index)
+      throw std::logic_error("invalid request in a scoring batch");
+    try {
+      auto& state = request->PrepareScore(tokens[index]);
+      items.push_back({.state = state,
+                       .prompt = request->impl_->prompt,
+                       .tokens = tokens[index],
+                       .scored = &(*scored)[index],
+                       .failure = &failures[index]});
+      owners.push_back(index);
+    } catch (...) {
+      failures[index] = std::current_exception();
+    }
+  }
+  if (!items.empty())
+    impl_->validated.runner->ScoreBatch(items);
+  for (const auto index : owners) {
+    if (failures[index])
+      continue;
+    try {
+      Request::CheckScores(tokens[index], (*scored)[index]);
+    } catch (...) {
+      failures[index] = std::current_exception();
+    }
+  }
+  return failures;
 }
 
 std::vector<std::exception_ptr> TextRunnerPool::AdvanceBatch(

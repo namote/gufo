@@ -55,6 +55,7 @@ using gufo::server::TextRunnerCapabilities;
 using gufo::server::TextRunnerDescriptor;
 using gufo::server::TextRunnerPool;
 using gufo::server::TextRunnerResourceClaim;
+using gufo::server::TextRunnerScoring;
 using gufo::server::TextRunnerState;
 using gufo::server::TextRunnerToken;
 using gufo::server::TextSchedulerPolicy;
@@ -234,6 +235,9 @@ struct FakeControl {
   std::optional<std::size_t> stop_after;
   std::optional<std::size_t> eos_after;
   std::function<void()> snapshot_callback;
+  /// Nonzero: ScoreBatch shares passes of this many rows (ScoringPackRows).
+  std::size_t scoring_pack_rows{0};
+  std::vector<std::size_t> score_batches;  ///< requests per ScoreBatch call
 };
 
 class FakeState final : public TextRunnerState {
@@ -560,6 +564,18 @@ public:
     fake.position += tokens.size() - 1;
     fake.frontier.reset();
     return scored;
+  }
+
+  [[nodiscard]] std::size_t ScoringPackRows() const override {
+    return control_->scoring_pack_rows;
+  }
+
+  void ScoreBatch(std::span<const TextRunnerScoring> requests) const override {
+    {
+      const std::lock_guard<std::mutex> lock(control_->mutex);
+      control_->score_batches.push_back(requests.size());
+    }
+    TextModelRunner::ScoreBatch(requests);
   }
 
   [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
@@ -3582,6 +3598,65 @@ void TestTokenLogprobs() {
   }
 }
 
+void TestScoringRequestsShareAWorkUnit() {
+  for (const bool shared : {true, false}) {
+    auto control = std::make_shared<FakeControl>();
+    control->scoring_pack_rows = shared ? 64 : 0;
+    control->block_prefill_label = 1;
+    auto scheduler = MakeScheduler(control, 4);
+    // A generating request holds the scheduler while the scoring requests
+    // arrive, so all three are resident when it scores.
+    auto peer = scheduler->Submit({1, 10}, 1, 0.0F);
+    control->WaitForPrefill(1);
+    std::vector<gufo::server::TextGenerationScheduler::Request> scorers;
+    for (TextRunnerToken label : {2, 3, 4}) {
+      auto metadata = ClientMetadata("scorer");
+      metadata.score_tokens = {7, 8};
+      scorers.push_back(
+          scheduler->Submit({label, 20, 21}, 0, 0.0F, {}, false, metadata));
+    }
+    control->ReleasePrefill();
+    for (auto& scorer : scorers) {
+      const auto scored = scorer.Wait();
+      Expect(scored.tokens == std::vector<gufo::tokenization::TokenId>{7, 8},
+             "each request of a scoring unit returns its own scores");
+    }
+    (void)peer.Wait();
+    const auto batches = [&] {
+      const std::lock_guard<std::mutex> lock(control->mutex);
+      return control->score_batches;
+    }();
+    if (shared)
+      Expect(batches == std::vector<std::size_t>{3},
+             "resident scoring requests share one unit");
+    else
+      Expect(batches == std::vector<std::size_t>{1, 1, 1},
+             "a runner without shared passes scores one request per unit");
+  }
+  // The pack bounds a unit: each request feeds 4 rows (3 prompt, 1 scored),
+  // so a 5-row pack holds one.
+  auto control = std::make_shared<FakeControl>();
+  control->scoring_pack_rows = 5;
+  control->block_prefill_label = 1;
+  auto scheduler = MakeScheduler(control, 4);
+  auto peer = scheduler->Submit({1, 10}, 1, 0.0F);
+  control->WaitForPrefill(1);
+  std::vector<gufo::server::TextGenerationScheduler::Request> scorers;
+  for (TextRunnerToken label : {2, 3, 4}) {
+    auto metadata = ClientMetadata("scorer");
+    metadata.score_tokens = {7, 8};
+    scorers.push_back(
+        scheduler->Submit({label, 20, 21}, 0, 0.0F, {}, false, metadata));
+  }
+  control->ReleasePrefill();
+  for (auto& scorer : scorers)
+    (void)scorer.Wait();
+  (void)peer.Wait();
+  const std::lock_guard<std::mutex> lock(control->mutex);
+  Expect(control->score_batches == std::vector<std::size_t>{1, 1, 1},
+         "a scoring unit holds no more rows than the pack");
+}
+
 void TestScoringReturnsRawLogprobsWithoutDecoding() {
   for (const bool speculative : {false, true}) {
     auto control = std::make_shared<FakeControl>();
@@ -3690,6 +3765,7 @@ void TestScoringReturnsRawLogprobsWithoutDecoding() {
 int main() {
   TestTokenLogprobs();
   TestScoringReturnsRawLogprobsWithoutDecoding();
+  TestScoringRequestsShareAWorkUnit();
   TestPublicationWaitUsesRecentSubstantialPrefill();
   // Log assertions in this binary match the plain "[LEVEL] [component]" text
   // captured from a redirected sink; a TTY stderr would tint the level tag.

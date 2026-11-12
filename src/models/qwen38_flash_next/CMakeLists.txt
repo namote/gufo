@@ -86,6 +86,7 @@ if (ENGINE_ENABLE_HIP)
     ${QFN_RUNTIME_DIR}/executor_attention.cpp
     ${QFN_RUNTIME_DIR}/executor_moe.cpp
     ${QFN_RUNTIME_DIR}/executor_forward.cpp
+    ${QFN_RUNTIME_DIR}/executor_score.cpp
     ${QFN_RUNTIME_DIR}/executor_mtp.cpp
     ${QFN_RUNTIME_DIR}/executor_batch.cpp)
   set(QFN_HIP_SOURCES

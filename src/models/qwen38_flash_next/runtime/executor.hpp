@@ -439,6 +439,30 @@ public:
   /// 1 MB per row each) and are not part of DeferredScratchBytes, so serving
   /// budgets stay as they were for servers that never score. Teacher-forced
   /// scoring uses it; a packed pass of several sequences could reuse it.
+  /// One session's rows in a scoring pack: its next `tokens` and how many of
+  /// their last rows return logits.
+  struct ScorePackItem {
+    Session* session;
+    std::span<const std::int32_t> tokens;
+    std::uint32_t logit_rows;
+  };
+  static constexpr std::uint32_t kScorePackSessions = 32;
+  /// Receives packed logit rows [first, first + rows / vocab): every item's
+  /// logit rows in item order. The rows are valid only during the call.
+  using ScoreRowsConsumer = std::function<bool(
+      std::uint32_t first, std::span<const float> rows, std::string* error)>;
+  /// Prompt (kPrefill) rows of up to kScorePackSessions sessions in one
+  /// pass, at most max_batch() rows in all. Row-wise work (embedding, routed
+  /// and shared experts, output head) runs once over every row, so the
+  /// expert weights stream once for the pack; each session's mixers,
+  /// attention or GatedDeltaNet, PLE and combines (with its abliteration)
+  /// run on its own rows and state, as a single-session prefill of those
+  /// rows would. The draft block is not run: the caller must reset the
+  /// sessions before decoding from them. KVarN and image sessions are
+  /// refused. A failure may leave every session partly advanced.
+  [[nodiscard]] bool ForwardScorePack(std::span<const ScorePackItem> items,
+                                      const ScoreRowsConsumer& consume,
+                                      std::string* error_msg) const;
   [[nodiscard]] bool ForwardScoreRows(Session& session,
                                       std::span<const std::int32_t> tokens,
                                       std::uint32_t logit_rows,
@@ -1231,6 +1255,10 @@ private:
   /// the running Forward there.
   mutable float* score_logits_{nullptr};
   mutable float* score_logits_host_{nullptr};
+  /// ForwardScorePack: pinned per-session controls and the shared MoE
+  /// output rows (max_batch() rows), allocated on first use.
+  mutable Session::Control* score_controls_{nullptr};
+  mutable float* score_moe_out_{nullptr};
   mutable bool score_pass_{false};
   std::int32_t* mtp_token_host_{nullptr};
   MtpCandidateLogits* mtp_candidates_host_{nullptr};

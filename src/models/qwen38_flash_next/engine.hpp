@@ -226,6 +226,25 @@ public:
                                  std::span<const std::int32_t> tokens,
                                  std::vector<sampling::TokenLogprobs>* scored,
                                  std::string* error_msg = nullptr);
+  /// One request of ScoreBatch: ScorePrompt's arguments and its outcome.
+  struct ScoreRequest {
+    Session* session;
+    std::span<const std::int32_t> prompt;
+    std::span<const std::int32_t> tokens;
+    std::vector<sampling::TokenLogprobs>* scored;
+    std::string* error;
+    bool* ok;
+  };
+  /// ScorePrompt for several sessions of one model. Requests whose unfed
+  /// rows fit one pass share prompt passes of up to ScorePackRows() rows
+  /// and Executor::kScorePackSessions sessions (Executor::ForwardScorePack):
+  /// the expert weights stream once per pack. Their sessions skip the draft
+  /// block and are left invalid (the next Sync resets them); scoring
+  /// requests publish nothing. KVarN and image sessions, and longer
+  /// sequences, take ScorePrompt. Each request reports its own outcome.
+  static void ScoreBatch(std::span<const ScoreRequest> requests);
+  /// Rows one scoring pack may hold.
+  [[nodiscard]] static std::size_t ScorePackRows(const Model& model) noexcept;
   struct DecodeResult {
     std::vector<std::int32_t> tokens;
     bool stop{false};
@@ -391,6 +410,16 @@ private:
             double* capture_ms = nullptr,
             std::span<const std::int32_t> after = {},
             const PrefillCapture& capture = {});
+  struct ScorePlan {
+    std::vector<std::int32_t> fed;  ///< unfed prompt, then tokens but the last
+    std::size_t first{0};           ///< first global row that scores a token
+  };
+  /// ScorePrompt's checks and prefix sync; scores the first token on the
+  /// frontier when the session already holds the whole prompt.
+  bool BeginScore(std::span<const std::int32_t> prompt,
+                  std::span<const std::int32_t> tokens,
+                  std::vector<sampling::TokenLogprobs>* scored, ScorePlan* plan,
+                  std::string* error_msg);
   bool ScorePromptImpl(std::span<const std::int32_t> prompt,
                        std::span<const std::int32_t> tokens,
                        std::vector<sampling::TokenLogprobs>* scored,

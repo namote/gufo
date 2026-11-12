@@ -1276,19 +1276,32 @@ a prefilled prompt may be retained in RAM, as with `cache_persist: false`; a
 prompt fed with its scored tokens leaves none, and the scored tokens are
 never published to the continuation cache or written to disk.
 
+Scoring requests ready at the same time run as one work unit of up to 32
+requests whose unfed rows (prompt rest plus scored tokens but the last) fit
+one prefill pass (4,224 rows, or the context if smaller). Flash-Next scores
+such a unit in packed passes: the embedding, routed and shared experts and
+output head run once over every request's rows, so the expert weights stream
+once per pass instead of once per request, while each request's mixers,
+attention or GatedDeltaNet, PLE and combines (with its own `abliteration`
+settings) run on its own rows and session state as its own prefill pass
+would. Values therefore match unpacked scoring to numerical error. Packed
+sessions skip the MTP draft block and are reset before their next request.
+KVarN (`--kv-cache-type kvarn-*`) and image sessions, and a request longer
+than one pass, are scored on their own. The head rows reduce on the CPU 256
+at a time after the pass.
+
 A server dedicated to scoring (for example SPSA training with
 `tools/qwen38_flash_next/abliteration/spsa.py`) does not need the production
-context. Scoring passes run one at a time on the GPU, so a few sessions are
-enough to keep the next request's prompt admitted while one scores:
+context, and packing needs many resident sessions:
 
 ```sh
-gufo serve --sessions 2 llm --model <model> --context 8192 \
-  --kv-cache-type kvarn-k4v4
+gufo serve --sessions 32 llm --model <model> --context 8192
 ```
 
-without `--enable-yarn` (native RoPE; scores then differ from a 1M YaRN
-server's by the RoPE scaling) and with the default `--kv-pool-bytes 0`. Run
-the client with `--concurrency` equal to `--sessions`.
+with native RoPE (no `--enable-yarn`; scores then differ from a 1M YaRN
+server's by the RoPE scaling), the default FP16 KV (packing refuses KVarN)
+and the default `--kv-pool-bytes 0`. Run the client with `--concurrency`
+equal to `--sessions` so that many requests are resident together.
 
 llama.cpp sampler fields that gufo does not implement (`mirostat`,
 `mirostat_tau`, `mirostat_eta`, `typical_p`, `tfs_z`, `dynatemp_range`,

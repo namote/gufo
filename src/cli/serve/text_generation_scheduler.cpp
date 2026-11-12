@@ -35,6 +35,8 @@ constexpr std::size_t kDecodeProgressInterval = 50;
 constexpr std::size_t kKvDecodeWindow = 4096;
 /// Prompt tokens a scoring request leaves for its scoring passes.
 constexpr std::size_t kScoringPromptTailTokens = 1024;
+/// Scoring requests one work unit takes at most.
+constexpr std::size_t kScoringBatchRequests = 32;
 constexpr std::size_t kNoSession = std::numeric_limits<std::size_t>::max();
 
 struct OutputBudget {
@@ -1787,48 +1789,115 @@ struct TextGenerationScheduler::Impl {
   // kScoringPromptTailTokens of the prompt remain; that unit feeds them with
   // the scored tokens. Any pending prompt capture finishes first, as before a
   // first decode step; the scored tail is never published.
-  void StepScore(const std::shared_ptr<ScheduledRequest>& request) {
+  // Scoring requests ready together run as one work unit: the runner may
+  // share passes between them (TextModelRunner::ScoreBatch). A request whose
+  // prompt capture is still pending waits for a later unit.
+  void StepScoreBatch(
+      const std::vector<std::shared_ptr<ScheduledRequest>>& batch) {
     consecutive_active_prefill_chunks = 0;
-    try {
-      if (CompleteIfStopped(request))
-        return;
-      request->phase.store(TextRequestPhase::kDecoding,
-                           std::memory_order_release);
-      if (!request->runner_request.PreparePromptSnapshot() ||
-          CompleteIfStopped(request))
-        return;
-      const auto start = Clock::now();
-      const auto scored = request->runner_request.Score(request->score_tokens);
-      request->result.decode_ms +=
-          std::chrono::duration<double, std::milli>(Clock::now() - start)
-              .count();
-      if (CompleteIfStopped(request))
-        return;
-      for (std::size_t index = 0; index < scored.size(); ++index) {
-        RetainLogprobs(request, scored[index]);
-        request->result.tokens.push_back(request->score_tokens[index]);
+    std::vector<std::shared_ptr<ScheduledRequest>> ready;
+    for (const auto& request : batch) {
+      try {
+        if (CompleteIfStopped(request))
+          continue;
+        request->phase.store(TextRequestPhase::kDecoding,
+                             std::memory_order_release);
+        if (!request->runner_request.PreparePromptSnapshot() ||
+            CompleteIfStopped(request))
+          continue;
+        ready.push_back(request);
+      } catch (...) {
+        const auto failure = std::current_exception();
+        if (!CompleteIfStopped(request))
+          CompleteFailure(request, failure);
       }
-      const auto ngram = request->runner_request.ngram_rows();
-      request->result.ngram_rows = ngram.rows;
-      request->result.ngram_dedup_rows = ngram.dedup_rows;
-      request->result.ngram_cache_hits = ngram.cache_hits;
-      request->result.ngram_disk_reads = ngram.disk_reads;
-      // Keeps only the prompt checkpoint; the scored state is dropped.
-      const auto retained = request->runner_request.Cancel();
-      request->result.component_cache = retained.component_cache;
-      request->result.cache_snapshot_bytes = retained.snapshot_bytes;
-      request->result.cache_snapshot_ms = retained.snapshot_ms;
-      request->result.finish_reason =
-          TextGenerationBackend::FinishReason::kStop;
-      request->result.completion_tokens = 0;
-      LogDecodeProgress(request, true);
-      RecordRequestMetrics(request->result);
-      PublishTerminal(request);
-    } catch (...) {
-      const auto failure = std::current_exception();
-      if (!CompleteIfStopped(request))
-        CompleteFailure(request, failure);
     }
+    if (ready.empty())
+      return;
+    std::vector<TextRunnerPool::Request*> requests;
+    std::vector<std::span<const TextRunnerToken>> tokens;
+    for (const auto& request : ready) {
+      requests.push_back(&request->runner_request);
+      tokens.push_back(request->score_tokens);
+    }
+    std::vector<std::vector<sampling::TokenLogprobs>> scored;
+    std::vector<std::exception_ptr> failures;
+    const auto start = Clock::now();
+    try {
+      failures = runner_pool->ScoreBatch(requests, tokens, &scored);
+    } catch (...) {
+      failures.assign(ready.size(), std::current_exception());
+      scored.assign(ready.size(), {});
+    }
+    const double ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+    for (std::size_t i = 0; i < ready.size(); ++i) {
+      const auto& request = ready[i];
+      try {
+        // Every request of the unit waited for all of it.
+        request->result.decode_ms += ms;
+        if (failures[i])
+          std::rethrow_exception(failures[i]);
+        if (CompleteIfStopped(request))
+          continue;
+        for (std::size_t index = 0; index < scored[i].size(); ++index) {
+          RetainLogprobs(request, scored[i][index]);
+          request->result.tokens.push_back(request->score_tokens[index]);
+        }
+        const auto ngram = request->runner_request.ngram_rows();
+        request->result.ngram_rows = ngram.rows;
+        request->result.ngram_dedup_rows = ngram.dedup_rows;
+        request->result.ngram_cache_hits = ngram.cache_hits;
+        request->result.ngram_disk_reads = ngram.disk_reads;
+        // Keeps only the prompt checkpoint; the scored state is dropped.
+        const auto retained = request->runner_request.Cancel();
+        request->result.component_cache = retained.component_cache;
+        request->result.cache_snapshot_bytes = retained.snapshot_bytes;
+        request->result.cache_snapshot_ms = retained.snapshot_ms;
+        request->result.finish_reason =
+            TextGenerationBackend::FinishReason::kStop;
+        request->result.completion_tokens = 0;
+        LogDecodeProgress(request, true);
+        RecordRequestMetrics(request->result);
+        PublishTerminal(request);
+      } catch (...) {
+        const auto failure = std::current_exception();
+        if (!CompleteIfStopped(request))
+          CompleteFailure(request, failure);
+      }
+    }
+  }
+
+  // Takes the scoring requests in `decoding` that one scoring unit holds:
+  // up to kScoringBatchRequests, and, when the runner shares passes, rows
+  // (prompt rest and scored tokens) within its pack. A runner that shares
+  // no passes scores one request per unit, between other requests' work.
+  std::vector<std::shared_ptr<ScheduledRequest>> TakeScoring(
+      std::deque<std::shared_ptr<ScheduledRequest>>& decoding) const {
+    std::vector<std::shared_ptr<ScheduledRequest>> taken;
+    const std::size_t pack_rows = runner_pool->ScoringPackRows();
+    std::size_t rows = 0;
+    for (auto it = decoding.begin(); it != decoding.end();) {
+      const auto& request = *it;
+      if (request->score_tokens.empty() || IsTerminal(request)) {
+        ++it;
+        continue;
+      }
+      const auto request_rows =
+          RemainingPrefill(request) + request->score_tokens.size() - 1;
+      const bool fits =
+          taken.empty() ||
+          (pack_rows != 0 && taken.size() < kScoringBatchRequests &&
+           rows + request_rows <= pack_rows);
+      if (!fits) {
+        ++it;
+        continue;
+      }
+      rows += request_rows;
+      taken.push_back(*it);
+      it = decoding.erase(it);
+    }
+    return taken;
   }
 
   void StepDecodeBatch(
@@ -1839,7 +1908,7 @@ struct TextGenerationScheduler::Impl {
       if (request->score_tokens.empty())
         requests.push_back(request);
       else
-        StepScore(request);
+        StepScoreBatch({request});
     }
     if (requests.empty())
       return;
@@ -2108,6 +2177,13 @@ struct TextGenerationScheduler::Impl {
         CompleteFailure(item.request, std::current_exception());
       }
     }
+  }
+
+  [[nodiscard]] static bool HasScoring(
+      const std::deque<std::shared_ptr<ScheduledRequest>>& decoding) {
+    return std::any_of(
+        decoding.begin(), decoding.end(),
+        [](const auto& request) { return !request->score_tokens.empty(); });
   }
 
   [[nodiscard]] static bool HasDueDecoder(
@@ -2449,6 +2525,21 @@ struct TextGenerationScheduler::Impl {
           }
         }
         MarkAllDecodersDue(decoding);
+        continue;
+      }
+
+      if (!decoding.empty() && HasScoring(decoding)) {
+        auto batch = TakeScoring(decoding);
+        StepScoreBatch(batch);
+        const auto settle = CaptureSettleDeadline();
+        for (auto& request : batch) {
+          if (!IsTerminal(request)) {
+            if (CapturePending(request, settle))
+              capturing.push_back(std::move(request));
+            else
+              decoding.push_back(std::move(request));
+          }
+        }
         continue;
       }
 

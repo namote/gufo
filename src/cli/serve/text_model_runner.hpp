@@ -320,6 +320,14 @@ struct TextRunnerAdvance {
   std::exception_ptr* failure{nullptr};
 };
 
+struct TextRunnerScoring {
+  std::reference_wrapper<TextRunnerState> state;
+  std::span<const TextRunnerToken> prompt;
+  std::span<const TextRunnerToken> tokens;
+  std::vector<sampling::TokenLogprobs>* scored{nullptr};
+  std::exception_ptr* failure{nullptr};
+};
+
 struct TextRunnerDecode {
   std::reference_wrapper<TextRunnerState> state;
   std::size_t max_tokens{0};
@@ -426,6 +434,13 @@ public:
       std::span<const TextRunnerToken>) const {
     throw std::logic_error("runner does not support scoring");
   }
+  /// ScoreTokens for several requests, each with its own state; each failure
+  /// goes to its own `failure`. Runners may share passes between them
+  /// (ScoringPackRows); the default scores one after another.
+  virtual void ScoreBatch(std::span<const TextRunnerScoring> requests) const;
+  /// Unfed rows (prompt rest and scored tokens) one shared scoring pass may
+  /// hold across requests; zero when ScoreBatch shares no passes.
+  [[nodiscard]] virtual std::size_t ScoringPackRows() const { return 0; }
   /// Size a prompt without execution-context admission or inference. Image
   /// runners override this to include their model's visual token expansion.
   [[nodiscard]] virtual std::optional<std::size_t> CountPromptTokens(
@@ -747,6 +762,14 @@ public:
     [[nodiscard]] std::vector<sampling::TokenLogprobs> Score(
         std::span<const TextRunnerToken> tokens);
 
+  private:
+    /// Score's checks and prompt captures; marks the state unpublishable.
+    TextRunnerState& PrepareScore(std::span<const TextRunnerToken> tokens);
+    /// Checks a runner's scores against `tokens`.
+    static void CheckScores(std::span<const TextRunnerToken> tokens,
+                            std::span<const sampling::TokenLogprobs> scored);
+
+  public:
     /// Publishes a reusable continuation boundary.
     ///
     /// Snapshot-capable runners keep the immutable prompt frontier and the
@@ -818,6 +841,15 @@ public:
       const TextExecutionPlan& plan);
   std::vector<std::exception_ptr> AdvanceBatch(std::span<Request*> requests,
                                                const TextExecutionPlan& plan);
+  /// Request::Score for several requests through TextModelRunner::
+  /// ScoreBatch; `scored[i]` receives request i's scores, and failure i its
+  /// error. Throws only for an invalid call.
+  std::vector<std::exception_ptr> ScoreBatch(
+      std::span<Request*> requests,
+      std::span<const std::span<const TextRunnerToken>> tokens,
+      std::vector<std::vector<sampling::TokenLogprobs>>* scored);
+  /// TextModelRunner::ScoringPackRows.
+  [[nodiscard]] std::size_t ScoringPackRows() const;
   [[nodiscard]] Request Acquire(
       std::vector<TextRunnerToken> prompt,
       const sampling::SamplingConfig& sampling,

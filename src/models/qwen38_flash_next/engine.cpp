@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <future>
 #include <limits>
 #include <optional>
@@ -1159,10 +1160,10 @@ bool Session::ScorePrompt(std::span<const std::int32_t> prompt,
   }
 }
 
-bool Session::ScorePromptImpl(std::span<const std::int32_t> prompt,
-                              std::span<const std::int32_t> tokens,
-                              std::vector<sampling::TokenLogprobs>* scored,
-                              std::string* error_msg) {
+bool Session::BeginScore(std::span<const std::int32_t> prompt,
+                         std::span<const std::int32_t> tokens,
+                         std::vector<sampling::TokenLogprobs>* scored,
+                         ScorePlan* plan, std::string* error_msg) {
   if (prompt.empty()) {
     AssignError(error_msg, "scoring needs a prompt");
     return false;
@@ -1202,27 +1203,41 @@ bool Session::ScorePromptImpl(std::span<const std::int32_t> prompt,
   // Global row `first` is the first whose logits score a token: the
   // prompt's last row, or after it when the session already holds the whole
   // prompt and its frontier logits.
-  std::size_t first = prompt.size() - 1;
+  plan->first = prompt.size() - 1;
   if (common == prompt.size()) {
     // count 0: the selected token only, as `logprobs` without top_logprobs.
     scored->push_back(*sampling::CollectLogprobs(
         logits_, static_cast<sampling::TokenId>(tokens[0]), 0U));
-    ++first;
+    ++plan->first;
   }
-  // The unfed prompt and every scored token but the last take prompt
-  // (kPrefill) passes that return the logits of their rows from `first` on
-  // (Executor::ForwardScoreRows), so a short prompt and its answer share one
-  // pass. A prefill pass streams the routed experts once for all its rows:
-  // about a fixed 0.2 s plus 0.8 ms per row, where 8-row verification costs
-  // about 4.5 ms per row at any width (GFX1151-KNOWHOW "Scoring speed").
-  // Rows carry prompt arithmetic: the first token is scored on a prefill row
-  // as generation samples it, and the rest agree with generated
-  // (verification) logprobs to numerical error. The rows reduce on the host
-  // with the log-softmax generated logprobs use; a device gather would save
-  // only the download of about 1 MB per row, a few milliseconds on unified
-  // memory, against a kernel the CPU checks cannot run.
-  std::vector<std::int32_t> fed(prompt.begin() + common, prompt.end());
-  fed.insert(fed.end(), tokens.begin(), tokens.end() - 1);
+  // The unfed prompt and every scored token but the last.
+  plan->fed.assign(prompt.begin() + common, prompt.end());
+  plan->fed.insert(plan->fed.end(), tokens.begin(), tokens.end() - 1);
+  return true;
+}
+
+bool Session::ScorePromptImpl(std::span<const std::int32_t> prompt,
+                              std::span<const std::int32_t> tokens,
+                              std::vector<sampling::TokenLogprobs>* scored,
+                              std::string* error_msg) {
+  ScorePlan plan;
+  if (!BeginScore(prompt, tokens, scored, &plan, error_msg))
+    return false;
+  const auto vocab = model_->VocabSize();
+  const auto first = plan.first;
+  const auto& fed = plan.fed;
+  // The fed rows take prompt (kPrefill) passes that return the logits of
+  // their rows from `first` on (Executor::ForwardScoreRows), so a short
+  // prompt and its answer share one pass. A prefill pass streams the routed
+  // experts once for all its rows: about a fixed 0.2 s plus 0.8 ms per row,
+  // where 8-row verification costs about 4.5 ms per row at any width
+  // (GFX1151-KNOWHOW "Scoring speed"). Rows carry prompt arithmetic: the
+  // first token is scored on a prefill row as generation samples it, and the
+  // rest agree with generated (verification) logprobs to numerical error.
+  // The rows reduce on the host with the log-softmax generated logprobs use;
+  // a device gather would save only the download of about 1 MB per row, a
+  // few milliseconds on unified memory, against a kernel the CPU checks
+  // cannot run.
   // Global row g scores sequence token g + 1: prompt, then `tokens`.
   const auto target = [&](std::size_t g) {
     return g + 1 < prompt.size() ? prompt[g + 1]
@@ -1277,6 +1292,161 @@ bool Session::ScorePromptImpl(std::span<const std::int32_t> prompt,
   }
   valid_ = true;
   return true;
+}
+
+std::size_t Session::ScorePackRows(const Model& model) noexcept {
+  return model.executor_->max_batch();
+}
+
+void Session::ScoreBatch(std::span<const ScoreRequest> requests) {
+  if (requests.empty())
+    return;
+  const auto fail = [](const ScoreRequest& r, const std::string& error) {
+    r.scored->clear();
+    if (r.error)
+      *r.error = error;
+    *r.ok = false;
+  };
+  struct Packed {
+    const ScoreRequest* request;
+    ScorePlan plan;
+    std::uint32_t logit_rows{0};
+  };
+  std::vector<Packed> packable;
+  for (const auto& r : requests) {
+    *r.ok = false;
+    if (r.session == nullptr || r.scored == nullptr) {
+      if (r.scored)
+        fail(r, "invalid scoring request");
+      continue;
+    }
+    auto& session = *r.session;
+    const bool distinct =
+        std::ranges::count_if(requests, [&](const ScoreRequest& other) {
+          return other.session == r.session;
+        }) == 1;
+    // KVarN and image sessions, a model whose sessions differ, and a
+    // sequence longer than one pass score on their own.
+    auto& exec = *session.model_->executor_;
+    const bool alone =
+        !distinct || session.model_->Kvarn() ||
+        session.session_->VisionLayout().PrefixLength() != 0 ||
+        session.model_.get() != requests.front().session->model_.get();
+    if (alone) {
+      *r.ok = distinct &&
+              session.ScorePrompt(r.prompt, r.tokens, r.scored, r.error);
+      if (!distinct)
+        fail(r, "a scoring batch names a session twice");
+      continue;
+    }
+    Packed item{&r, {}};
+    try {
+      const ExecutionScope execution(session.continuation_hooks_);
+      if (!session.BeginScore(r.prompt, r.tokens, r.scored, &item.plan,
+                              r.error)) {
+        *r.ok = false;
+        continue;
+      }
+    } catch (const std::exception& error) {
+      session.valid_ = false;
+      fail(r, error.what());
+      continue;
+    }
+    const auto start = session.tokens_.size();
+    const auto end = start + item.plan.fed.size();
+    if (item.plan.fed.empty()) {
+      // The frontier already scored the only token.
+      session.valid_ = true;
+      *r.ok = true;
+      continue;
+    }
+    if (item.plan.fed.size() > exec.max_batch()) {
+      *r.ok = session.ScorePrompt(r.prompt, r.tokens, r.scored, r.error);
+      continue;
+    }
+    item.logit_rows =
+        static_cast<std::uint32_t>(end - std::max(start, item.plan.first));
+    packable.push_back(std::move(item));
+  }
+  if (packable.empty())
+    return;
+  auto& exec = *packable.front().request->session->model_->executor_;
+  const auto vocab = packable.front().request->session->model_->VocabSize();
+  // Greedy packs of at most max_batch() rows and kScorePackSessions sessions.
+  for (std::size_t begin = 0; begin < packable.size();) {
+    std::size_t end = begin;
+    std::size_t rows = 0;
+    while (end < packable.size() &&
+           end - begin < rocm::Executor::kScorePackSessions &&
+           rows + packable[end].plan.fed.size() <= exec.max_batch())
+      rows += packable[end++].plan.fed.size();
+    const auto pack = std::span(packable).subspan(begin, end - begin);
+    begin = end;
+    std::vector<rocm::Executor::ScorePackItem> items;
+    std::vector<std::uint32_t> logit_offsets;
+    std::uint32_t logit_rows = 0;
+    std::deque<ExecutionScope> scopes;
+    std::string pack_error;
+    bool ok = true;
+    try {
+      for (auto& p : pack) {
+        auto& session = *p.request->session;
+        scopes.emplace_back(session.continuation_hooks_);
+        session.valid_ = false;
+        items.push_back({session.session_.get(), p.plan.fed, p.logit_rows});
+        logit_offsets.push_back(logit_rows);
+        logit_rows += p.logit_rows;
+      }
+      // Packed logit row q belongs to the item whose offset range holds it;
+      // its global row scores the sequence token after it.
+      const auto consume = [&](std::uint32_t first, std::span<const float> raw,
+                               std::string*) {
+        const auto count = static_cast<std::uint32_t>(raw.size() / vocab);
+        const auto owner = [&](std::uint32_t q) {
+          return static_cast<std::size_t>(
+              std::ranges::upper_bound(logit_offsets, q) -
+              logit_offsets.begin() - 1);
+        };
+        auto values = CollectRowLogprobs(
+            raw, vocab, count,
+            [&](std::uint32_t r) {
+              const auto q = first + r;
+              const auto& p = pack[owner(q)];
+              const auto& request = *p.request;
+              const auto start = p.request->session->tokens_.size();
+              const auto end = start + p.plan.fed.size();
+              const auto g = end - p.logit_rows + (q - logit_offsets[owner(q)]);
+              return g + 1 < request.prompt.size()
+                         ? request.prompt[g + 1]
+                         : request.tokens[g + 1 - request.prompt.size()];
+            },
+            0U);
+        for (std::uint32_t r = 0; r < count; ++r)
+          pack[owner(first + r)].request->scored->push_back(
+              std::move(*values[r]));
+        return true;
+      };
+      ok = exec.ForwardScorePack(items, consume, &pack_error);
+    } catch (const std::exception& error) {
+      ok = false;
+      pack_error = error.what();
+    }
+    for (auto& p : pack) {
+      const auto& r = *p.request;
+      auto& session = *r.session;
+      if (ok && r.scored->size() == r.tokens.size()) {
+        session.tokens_.insert(session.tokens_.end(), p.plan.fed.begin(),
+                               p.plan.fed.end());
+        // The draft block did not run: the session must reset before
+        // decoding (ForwardScorePack).
+        session.valid_ = false;
+        *r.ok = true;
+      } else {
+        session.valid_ = false;
+        fail(r, pack_error.empty() ? "scoring pack failed" : pack_error);
+      }
+    }
+  }
 }
 
 struct Session::PendingDecode {
