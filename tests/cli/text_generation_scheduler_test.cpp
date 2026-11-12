@@ -3715,6 +3715,69 @@ void TestScoringTakesTurnsWithDecoding() {
          "scoring units alternate with the generator's decode steps");
 }
 
+void TestScoringTakesTurnsWithPrefill() {
+  // Scoring requests keep arriving while a long prompt prefills in chunks:
+  // the two take turns, so the prompt finishes while scoring continues.
+  auto control = std::make_shared<FakeControl>();
+  control->scoring_pack_rows = 64;
+  control->max_context = 4096;
+  control->prefill_capacity = 256;
+  control->slow_prefill_label = 1;
+  control->slow_prefill_time = std::chrono::milliseconds(2);
+  auto scheduler = MakeScheduler(control, 4);
+  std::vector<TextRunnerToken> prompt(3000, 10);
+  prompt.front() = 1;
+  std::atomic<bool> done{false};
+  std::atomic<bool> started{false};
+  std::vector<gufo::server::TextGenerationScheduler::Request> scorers;
+  std::thread submitter([&] {
+    std::size_t waited = 0;
+    for (TextRunnerToken label = 2; !done.load() && label < 4000; ++label) {
+      // Four clients: each may queue only a few requests.
+      auto metadata = ClientMetadata("scorer" + std::to_string(label % 4));
+      metadata.score_tokens = {7, 8};
+      scorers.push_back(
+          scheduler->Submit({label, 20, 21}, 0, 0.0F, {}, false, metadata));
+      started = true;
+      // More in flight than free sessions: a scoring request is admitted
+      // as soon as a unit frees one, so scoring is always resident.
+      if (scorers.size() - waited > 8)
+        (void)scorers[waited++].Wait();
+    }
+    while (waited < scorers.size())
+      (void)scorers[waited++].Wait();
+  });
+  while (!started.load())
+    std::this_thread::yield();
+  const auto generated = scheduler->Submit(prompt, 2, 0.0F).Wait();
+  done = true;
+  submitter.join();
+  Expect(generated.tokens == ExpectedTokens(1, 2),
+         "a long prompt completes while scoring requests keep arriving");
+  const auto events = control->Events();
+  const auto prefill = [](const Event& event) {
+    return event.kind == EventKind::kPrefill && event.label == 1;
+  };
+  const auto first = std::find_if(events.begin(), events.end(), prefill);
+  const auto last = std::find_if(events.rbegin(), events.rend(), prefill);
+  std::size_t units = 0;
+  std::size_t chunks = 0;
+  bool consecutive = false;
+  bool previous_unit = false;
+  for (auto it = first; first != events.end() && it != last.base(); ++it) {
+    if (prefill(*it)) {
+      ++chunks;
+      previous_unit = false;
+    } else if (it->kind == EventKind::kScoreUnit) {
+      ++units;
+      consecutive = consecutive || previous_unit;
+      previous_unit = true;
+    }
+  }
+  Expect(units > 0 && chunks > 1 && !consecutive,
+         "scoring units alternate with a long prompt's prefill chunks");
+}
+
 void TestScoringReturnsRawLogprobsWithoutDecoding() {
   for (const bool speculative : {false, true}) {
     auto control = std::make_shared<FakeControl>();
@@ -3825,6 +3888,7 @@ int main() {
   TestScoringReturnsRawLogprobsWithoutDecoding();
   TestScoringRequestsShareAWorkUnit();
   TestScoringTakesTurnsWithDecoding();
+  TestScoringTakesTurnsWithPrefill();
   TestPublicationWaitUsesRecentSubstantialPrefill();
   // Log assertions in this binary match the plain "[LEVEL] [component]" text
   // captured from a redirected sink; a TTY stderr would tint the level tag.

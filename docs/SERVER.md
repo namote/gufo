@@ -1292,7 +1292,9 @@ at a time after the pass. A scoring unit takes turns with generating requests as
 chunk does: it runs when no generator is due or once their decode time from
 the previous unit is spent, and a unit at least the prefill policy's
 `decode_time_share_min` long buys them as much decode time, capped at
-`decode_time_share_max`. Scoring requests
+`decode_time_share_max`. Scoring units and other requests' prefill chunks
+alternate, so neither holds the other back; with nothing prefilling, scoring
+units run back to back. Scoring requests
 neither wait for nor lead a shared prompt prefix.
 
 A server dedicated to scoring (for example SPSA training with
