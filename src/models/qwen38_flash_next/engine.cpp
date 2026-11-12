@@ -126,6 +126,19 @@ std::vector<std::optional<sampling::TokenLogprobs>> CollectRowLogprobs(
   return values;
 }
 
+/// Appends rows the device scored (Executor::ForwardScoreRows/ScorePack) for
+/// `targets`, refusing a non-finite row as sampling::CollectLogprobs does.
+void AppendScored(std::span<const rocm::ScoredLogprob> rows,
+                  std::span<const std::int32_t> targets,
+                  std::vector<sampling::TokenLogprobs>* scored) {
+  for (std::size_t i = 0; i < rows.size(); ++i) {
+    if (rows[i].nonfinite != 0)
+      throw std::runtime_error("non-finite target logits");
+    scored->push_back({.selected = {static_cast<sampling::TokenId>(targets[i]),
+                                    rows[i].logprob}});
+  }
+}
+
 }  // namespace
 
 Model::~Model() = default;
@@ -1225,21 +1238,19 @@ bool Session::ScorePromptImpl(std::span<const std::int32_t> prompt,
   ScorePlan plan;
   if (!BeginScore(prompt, tokens, scored, &plan, error_msg))
     return false;
-  const auto vocab = model_->VocabSize();
   const auto first = plan.first;
   const auto& fed = plan.fed;
-  // The fed rows take prompt (kPrefill) passes that return the logits of
-  // their rows from `first` on (Executor::ForwardScoreRows), so a short
-  // prompt and its answer share one pass. A prefill pass streams the routed
-  // experts once for all its rows: about a fixed 0.2 s plus 0.8 ms per row,
-  // where 8-row verification costs about 4.5 ms per row at any width
+  // The fed rows take prompt (kPrefill) passes whose rows from `first` on
+  // score their successor (Executor::ForwardScoreRows), so a short prompt
+  // and its answer share one pass. A prefill pass streams the routed experts
+  // once for all its rows: about a fixed 0.2 s plus 0.8 ms per row, where
+  // 8-row verification costs about 4.5 ms per row at any width
   // (GFX1151-KNOWHOW "Scoring speed"). Rows carry prompt arithmetic: the
   // first token is scored on a prefill row as generation samples it, and the
   // rest agree with generated (verification) logprobs to numerical error.
-  // The rows reduce on the host with the log-softmax generated logprobs use;
-  // a device gather would save only the download of about 1 MB per row, a
-  // few milliseconds on unified memory, against a kernel the CPU checks
-  // cannot run.
+  // The device reduces each row to its target's log-softmax (ScoreLogprobs,
+  // within about 1e-5 of sampling::CollectLogprobs' FP64 value), so only
+  // those values and the frontier row come to the host.
   // Global row g scores sequence token g + 1: prompt, then `tokens`.
   const auto target = [&](std::size_t g) {
     return g + 1 < prompt.size() ? prompt[g + 1]
@@ -1270,19 +1281,17 @@ bool Session::ScorePromptImpl(std::span<const std::int32_t> prompt,
     if (MtpEnabled() && !tokens_.empty() &&
         !DraftCatchUp(chunk[0], false, error_msg))
       return false;
-    std::span<const float> rows;
-    if (!exec.ForwardScoreRows(*session_, chunk,
-                               static_cast<std::uint32_t>(logit_rows), &rows,
-                               error_msg))
+    std::vector<std::int32_t> targets(logit_rows);
+    for (std::size_t r = 0; r < logit_rows; ++r)
+      targets[r] = target(logit_from + r);
+    std::span<const rocm::ScoredLogprob> rows;
+    // The last pass also keeps its frontier row, as Feed does.
+    if (!exec.ForwardScoreRows(
+            *session_, chunk, targets, &rows,
+            off + n == fed.size() && logit_rows != 0 ? logits_.data() : nullptr,
+            error_msg))
       return false;
-    auto values = CollectRowLogprobs(
-        rows, vocab, static_cast<std::uint32_t>(logit_rows),
-        [&](std::uint32_t r) { return target(logit_from + r); }, 0U);
-    for (auto& value : values)
-      scored->push_back(std::move(*value));
-    if (logit_rows != 0)
-      std::copy_n(rows.data() + (logit_rows - 1) * vocab, vocab,
-                  logits_.begin());
+    AppendScored(rows, targets, scored);
     hidden_base_ = static_cast<std::uint32_t>(
         start + n - std::min<std::size_t>(n, exec.max_speculative()));
     tokens_.insert(tokens_.end(), chunk.begin(), chunk.end());
@@ -1312,7 +1321,6 @@ void Session::ScoreBatch(std::span<const ScoreRequest> requests) {
   struct Packed {
     const ScoreRequest* request;
     ScorePlan plan;
-    std::uint32_t logit_rows{0};
   };
   std::vector<Packed> packable;
   // The model packs share: the first request's that names a session.
@@ -1360,8 +1368,6 @@ void Session::ScoreBatch(std::span<const ScoreRequest> requests) {
       fail(r, error.what());
       continue;
     }
-    const auto start = session.tokens_.size();
-    const auto end = start + item.plan.fed.size();
     if (item.plan.fed.empty()) {
       // The frontier already scored the only token.
       session.valid_ = true;
@@ -1372,14 +1378,11 @@ void Session::ScoreBatch(std::span<const ScoreRequest> requests) {
       *r.ok = session.ScorePrompt(r.prompt, r.tokens, r.scored, r.error);
       continue;
     }
-    item.logit_rows =
-        static_cast<std::uint32_t>(end - std::max(start, item.plan.first));
     packable.push_back(std::move(item));
   }
   if (packable.empty())
     return;
   auto& exec = *packable.front().request->session->model_->executor_;
-  const auto vocab = packable.front().request->session->model_->VocabSize();
   // Greedy packs of at most max_batch() rows and kScorePackSessions sessions.
   for (std::size_t begin = 0; begin < packable.size();) {
     std::size_t end = begin;
@@ -1391,8 +1394,6 @@ void Session::ScoreBatch(std::span<const ScoreRequest> requests) {
     const auto pack = std::span(packable).subspan(begin, end - begin);
     begin = end;
     std::vector<rocm::Executor::ScorePackItem> items;
-    std::vector<std::uint32_t> logit_offsets;
-    std::uint32_t logit_rows = 0;
     std::deque<ExecutionScope> scopes;
     std::string pack_error;
     bool ok = true;
@@ -1401,40 +1402,19 @@ void Session::ScoreBatch(std::span<const ScoreRequest> requests) {
         auto& session = *p.request->session;
         scopes.emplace_back(session.continuation_hooks_);
         session.valid_ = false;
-        items.push_back({session.session_.get(), p.plan.fed, p.logit_rows});
-        logit_offsets.push_back(logit_rows);
-        logit_rows += p.logit_rows;
+        // Its rows score the tokens BeginScore left, in order.
+        items.push_back(
+            {session.session_.get(), p.plan.fed,
+             std::span(p.request->tokens).subspan(p.request->scored->size())});
       }
-      // Packed logit row q belongs to the item whose offset range holds it;
-      // its global row scores the sequence token after it.
-      const auto consume = [&](std::uint32_t first, std::span<const float> raw,
-                               std::string*) {
-        const auto count = static_cast<std::uint32_t>(raw.size() / vocab);
-        const auto owner = [&](std::uint32_t q) {
-          return static_cast<std::size_t>(
-              std::ranges::upper_bound(logit_offsets, q) -
-              logit_offsets.begin() - 1);
-        };
-        auto values = CollectRowLogprobs(
-            raw, vocab, count,
-            [&](std::uint32_t r) {
-              const auto q = first + r;
-              const auto& p = pack[owner(q)];
-              const auto& request = *p.request;
-              const auto start = p.request->session->tokens_.size();
-              const auto end = start + p.plan.fed.size();
-              const auto g = end - p.logit_rows + (q - logit_offsets[owner(q)]);
-              return g + 1 < request.prompt.size()
-                         ? request.prompt[g + 1]
-                         : request.tokens[g + 1 - request.prompt.size()];
-            },
-            0U);
-        for (std::uint32_t r = 0; r < count; ++r)
-          pack[owner(first + r)].request->scored->push_back(
-              std::move(*values[r]));
-        return true;
-      };
-      ok = exec.ForwardScorePack(items, consume, &pack_error);
+      std::span<const rocm::ScoredLogprob> rows;
+      ok = exec.ForwardScorePack(items, &rows, &pack_error);
+      for (std::size_t i = 0, q = 0; ok && i < pack.size(); ++i) {
+        const auto count = items[i].targets.size();
+        AppendScored(rows.subspan(q, count), items[i].targets,
+                     pack[i].request->scored);
+        q += count;
+      }
     } catch (const std::exception& error) {
       ok = false;
       pack_error = error.what();

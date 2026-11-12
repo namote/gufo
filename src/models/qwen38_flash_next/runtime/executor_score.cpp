@@ -5,9 +5,10 @@
 namespace gufo::models::qwen38_flash_next::rocm {
 
 bool Executor::ForwardScorePack(std::span<const ScorePackItem> items,
-                                const ScoreRowsConsumer& consume,
+                                std::span<const ScoredLogprob>* results,
                                 std::string* error_msg) const {
   const Config& c = config();
+  *results = {};
   PrefillPhase phase(true);
   selected_logits_ = nullptr;
   wide_rows_ = 0;
@@ -26,7 +27,7 @@ bool Executor::ForwardScorePack(std::span<const ScorePackItem> items,
     const auto& item = items[i];
     const auto n = static_cast<std::uint32_t>(item.tokens.size());
     if (item.session == nullptr || item.session->owner_ != this || n == 0 ||
-        item.logit_rows > n || item.session->kvarn_ ||
+        item.targets.size() > n || item.session->kvarn_ ||
         item.session->VisionLayout().PrefixLength() != 0 ||
         item.session->position_ + n > item.session->max_context_) {
       AssignError(error_msg, "invalid session or rows in a scoring pack");
@@ -45,7 +46,7 @@ bool Executor::ForwardScorePack(std::span<const ScorePackItem> items,
     offsets[i] = rows;
     logit_offsets[i] = logit_rows;
     rows += n;
-    logit_rows += item.logit_rows;
+    logit_rows += static_cast<std::uint32_t>(item.targets.size());
     const auto end = item.session->position_ + n;
     sparse[i] = c.compress_ratio > 0 && end > c.indexer_top_k;
     complete[i] = c.compress_ratio > 0 ? end / c.compress_ratio : 0;
@@ -54,9 +55,8 @@ bool Executor::ForwardScorePack(std::span<const ScorePackItem> items,
     AssignError(error_msg, "a scoring pack exceeds the executor's rows");
     return false;
   }
-  // Pinned per-session controls, the head output and its host copy, and the
-  // shared MoE output, allocated on first use (see ForwardScoreRows).
-  const std::size_t head_floats = std::size_t{max_score_rows()} * c.vocab_size;
+  // Pinned per-session controls and the shared MoE output, allocated on first
+  // use, beside the scoring buffers (EnsureScoreBuffers).
   const auto allocate = [&] {
     if (score_controls_ == nullptr) {
       void* controls = nullptr;
@@ -72,23 +72,17 @@ bool Executor::ForwardScorePack(std::span<const ScorePackItem> items,
                                        c.hidden_size * sizeof(float)),
                "scoring MoE output", error_msg))
       return false;
-    if (score_logits_ == nullptr &&
-        !Check(hip::AllocateDevice(&score_logits_, head_floats * sizeof(float)),
-               "scoring logits", error_msg))
-      return false;
-    if (score_logits_host_ == nullptr) {
-      void* host = nullptr;
-      if (!Check(host_allocations_.Allocate(&host, head_floats * sizeof(float)),
-                 "pinned scoring logits", error_msg))
-        return false;
-      score_logits_host_ = static_cast<float*>(host);
-    }
     return true;
   };
   if (!allocate()) {
     (void)hipGetLastError();
     return false;
   }
+  if (!EnsureScoreBuffers(error_msg))
+    return false;
+  for (std::size_t i = 0; i < items.size(); ++i)
+    std::copy(items[i].targets.begin(), items[i].targets.end(),
+              score_targets_host_ + logit_offsets[i]);
   for (const auto& item : items)
     if (!item.session->CheckCancellation(error_msg))
       return false;
@@ -272,7 +266,7 @@ bool Executor::ForwardScorePack(std::span<const ScorePackItem> items,
     // Each segment's head rows, packed into the mixed rows in item order.
     PrefillPhase head_phase(false);
     for (std::size_t i = 0; i < items.size(); ++i) {
-      const auto k = items[i].logit_rows;
+      const auto k = static_cast<std::uint32_t>(items[i].targets.size());
       if (k == 0)
         continue;
       const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
@@ -283,8 +277,31 @@ bool Executor::ForwardScorePack(std::span<const ScorePackItem> items,
                  nullptr, k, error_msg))
         return false;
     }
+    // The head in groups of max_score_rows() rows (the head output buffer),
+    // each reduced on the device to its rows' target log-softmax before the
+    // next group overwrites it; only the reduced rows come to the host.
+    if (logit_rows != 0 &&
+        !Check(hipMemcpyAsync(score_targets_, score_targets_host_,
+                              std::size_t{logit_rows} * sizeof(std::int32_t),
+                              hipMemcpyHostToDevice, stream_),
+               "scoring target upload", error_msg))
+      return false;
+    for (std::uint32_t first = 0; first < logit_rows;) {
+      const auto count = std::min(max_score_rows(), logit_rows - first);
+      UseScratch(base);
+      if (!Dense(model_->output(),
+                 base.mixed + std::size_t{first} * c.hidden_size, score_logits_,
+                 count, error_msg) ||
+          !ScoreHeadRows(first, count, error_msg))
+        return false;
+      first += count;
+    }
     UseScratch(base);
-    return true;
+    return logit_rows == 0 ||
+           Check(hipMemcpyAsync(score_results_host_, score_results_,
+                                std::size_t{logit_rows} * sizeof(ScoredLogprob),
+                                hipMemcpyDeviceToHost, stream_),
+                 "scoring results download", error_msg);
   };
   bool ok = false;
   try {
@@ -304,29 +321,7 @@ bool Executor::ForwardScorePack(std::span<const ScorePackItem> items,
     if (sparse[i])
       session.blocks_ = complete[i];
   }
-  // The head in groups of at most max_score_rows() rows, each reduced by
-  // the caller before the next overwrites the host rows.
-  PrefillPhase head_phase(false);
-  for (std::uint32_t first = 0; first < logit_rows;) {
-    const auto count = std::min(max_score_rows(), logit_rows - first);
-    UseScratch(base);
-    if (!Dense(model_->output(),
-               base.mixed + std::size_t{first} * c.hidden_size, score_logits_,
-               count, error_msg) ||
-        !Check(hipMemcpyAsync(score_logits_host_, score_logits_,
-                              std::size_t{count} * c.vocab_size * sizeof(float),
-                              hipMemcpyDeviceToHost, stream_),
-               "scoring logits download", error_msg) ||
-        !Check(hipStreamSynchronize(stream_), "scoring head", error_msg))
-      return false;
-    if (!consume(first,
-                 std::span<const float>(score_logits_host_,
-                                        std::size_t{count} * c.vocab_size),
-                 error_msg))
-      return false;
-    first += count;
-  }
-  UseScratch(base);
+  *results = std::span<const ScoredLogprob>(score_results_host_, logit_rows);
   return true;
 }
 

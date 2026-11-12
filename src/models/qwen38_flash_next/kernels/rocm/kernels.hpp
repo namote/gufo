@@ -899,6 +899,22 @@ void MtpAddEmbedding(const float* embedding, float* residual,
                      std::uint32_t n_tokens, std::uint32_t hidden,
                      std::uint32_t streams, hipStream_t stream);
 
+/// One teacher-forced row's raw log-softmax at its target token.
+struct ScoredLogprob {
+  double logprob;
+  /// The row holds NaN or +inf, has no finite value, or the target is out of
+  /// range (sampling::CollectLogprobs refuses such rows); logprob is then 0.
+  std::uint32_t nonfinite;
+};
+/// out[r] = logits[r][targets[r]] - max_r - log(sum exp(logits[r] - max_r)):
+/// sampling::CollectLogprobs' selected value with the sum of FP32
+/// exponentials accumulated in FP64. Expected difference from that FP64
+/// reference: below 1e-5 (exponential rounding, about 1e-7 relative per
+/// term, plus FP32 rounding of x - max for terms that contribute).
+void ScoreLogprobs(const float* logits, const std::int32_t* targets,
+                   ScoredLogprob* out, std::uint32_t rows, std::uint32_t vocab,
+                   hipStream_t stream);
+
 inline constexpr std::uint32_t kArgmaxParts = 64;
 struct ArgmaxCandidate {
   float value;

@@ -364,6 +364,67 @@ __global__ void GatherVerificationCandidatesKernel(
   }
 }
 
+/// ScoreLogprobs: one block per row. Pass 1 takes the row maximum and flags
+/// NaN or +inf; pass 2 sums exp(x - max) in FP64 from FP32 exponentials, so
+/// the sum carries only the exponentials' rounding (about 1e-7 relative),
+/// not the order of about 250k additions. The target term is formed in FP64
+/// from the original logits, as sampling::CollectLogprobs does.
+__global__ void ScoreLogprobsKernel(const float* logits,
+                                    const std::int32_t* targets,
+                                    ScoredLogprob* out, std::uint32_t vocab) {
+  __shared__ float shared_max[kThreads / 32];
+  __shared__ unsigned shared_bad[kThreads / 32];
+  __shared__ double shared_sum[kThreads / 32];
+  const std::uint32_t r = blockIdx.x;
+  const float* row = logits + static_cast<std::size_t>(r) * vocab;
+  const unsigned lane = threadIdx.x & 31u;
+  const unsigned wave = threadIdx.x >> 5u;
+  float maximum = -INFINITY;
+  unsigned bad = 0;
+  for (std::uint32_t i = threadIdx.x; i < vocab; i += kThreads) {
+    const float x = row[i];
+    bad |= (isnan(x) || x == INFINITY) ? 1u : 0u;
+    maximum = fmaxf(maximum, x);
+  }
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    maximum = fmaxf(maximum, XorLane(maximum, offset));
+    bad |= XorLane(bad, offset);
+  }
+  if (lane == 0) {
+    shared_max[wave] = maximum;
+    shared_bad[wave] = bad;
+  }
+  __syncthreads();
+  maximum = shared_max[0];
+  bad = shared_bad[0];
+  for (unsigned w = 1; w < kThreads / 32; ++w) {
+    maximum = fmaxf(maximum, shared_max[w]);
+    bad |= shared_bad[w];
+  }
+  double sum = 0.0;
+  for (std::uint32_t i = threadIdx.x; i < vocab; i += kThreads)
+    sum += static_cast<double>(expf(row[i] - maximum));
+  for (int offset = 16; offset > 0; offset >>= 1)
+    sum += __shfl_xor(sum, offset);
+  if (lane == 0)
+    shared_sum[wave] = sum;
+  __syncthreads();
+  if (threadIdx.x != 0)
+    return;
+  sum = 0.0;
+  for (unsigned w = 0; w < kThreads / 32; ++w)
+    sum += shared_sum[w];
+  const std::int32_t target = targets[r];
+  const bool valid = bad == 0 && isfinite(maximum) && target >= 0 &&
+                     static_cast<std::uint32_t>(target) < vocab;
+  out[r].nonfinite = valid ? 0u : 1u;
+  out[r].logprob =
+      valid
+          ? (static_cast<double>(row[target]) - static_cast<double>(maximum)) -
+                log(sum)
+          : 0.0;
+}
+
 }  // namespace
 
 void MtpHidden(const float* base, const float* alt, const std::int32_t* row,
@@ -558,6 +619,15 @@ void MtpTopCandidates(const float* logits, std::uint32_t* ids,
     throw std::invalid_argument("invalid MTP candidate scores");
   SelectMtpCandidates<kMtpCandidates>(logits, ids, scratch_ids, scores, vocab,
                                       stream);
+}
+
+void ScoreLogprobs(const float* logits, const std::int32_t* targets,
+                   ScoredLogprob* out, std::uint32_t rows, std::uint32_t vocab,
+                   hipStream_t stream) {
+  if (rows == 0)
+    return;
+  hipLaunchKernelGGL(ScoreLogprobsKernel, dim3(rows), dim3(kThreads), 0, stream,
+                     logits, targets, out, vocab);
 }
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

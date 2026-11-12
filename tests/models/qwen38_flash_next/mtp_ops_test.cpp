@@ -9,6 +9,7 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -410,11 +411,76 @@ void CheckRemapDraftIds() {
                "table passed\n";
 }
 
+// ScoreLogprobs against sampling::CollectLogprobs' FP64 reduction: rows of
+// mixed magnitude within 1e-5, and rows CollectLogprobs refuses (NaN, +inf,
+// all -inf) or an out-of-range target flagged non-finite.
+void CheckScoreLogprobs(std::uint32_t vocab) {
+  namespace sampling = gufo::sampling;
+  constexpr std::uint32_t kRows = 7;
+  std::vector<float> logits(std::size_t{kRows} * vocab);
+  std::vector<std::int32_t> targets(kRows);
+  std::uint64_t state = 0x9e3779b97f4a7c15ULL ^ vocab;
+  const auto next = [&] {
+    state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+    return static_cast<float>((state >> 40) & 0xFFFFFF) / 16777216.0F;
+  };
+  for (std::uint32_t r = 0; r < kRows; ++r) {
+    auto row = std::span(logits).subspan(std::size_t{r} * vocab, vocab);
+    const float scale = r == 0 ? 0.0F : r == 1 ? 40.0F : 8.0F;
+    for (auto& value : row)
+      value = scale * (next() - 0.5F) - (r == 2 ? 30.0F : 0.0F);
+    targets[r] = static_cast<std::int32_t>((r * 7919U) % vocab);
+  }
+  // Refused rows: NaN, +inf, every value -inf, and a target past the vocab.
+  logits[std::size_t{3} * vocab + vocab / 2] =
+      std::numeric_limits<float>::quiet_NaN();
+  logits[std::size_t{4} * vocab] = std::numeric_limits<float>::infinity();
+  std::fill_n(logits.begin() + std::size_t{5} * vocab, vocab,
+              -std::numeric_limits<float>::infinity());
+  targets[6] = static_cast<std::int32_t>(vocab);
+  auto device_logits = Allocate<float>(logits.size());
+  auto device_targets = Allocate<std::int32_t>(kRows);
+  auto device_out = Allocate<q::ScoredLogprob>(kRows);
+  CheckHip(hipMemcpy(device_logits.get(), logits.data(),
+                     logits.size() * sizeof(float), hipMemcpyHostToDevice),
+           "score logits");
+  CheckHip(hipMemcpy(device_targets.get(), targets.data(),
+                     kRows * sizeof(std::int32_t), hipMemcpyHostToDevice),
+           "score targets");
+  q::ScoreLogprobs(device_logits.get(), device_targets.get(), device_out.get(),
+                   kRows, vocab, nullptr);
+  std::vector<q::ScoredLogprob> actual(kRows);
+  CheckHip(hipMemcpy(actual.data(), device_out.get(),
+                     kRows * sizeof(q::ScoredLogprob), hipMemcpyDeviceToHost),
+           "score results");
+  for (std::uint32_t r = 0; r < kRows; ++r) {
+    const bool refused = r >= 3;
+    if ((actual[r].nonfinite != 0) != refused)
+      throw std::runtime_error("score row " + std::to_string(r) +
+                               ": wrong non-finite flag");
+    if (refused)
+      continue;
+    const auto expected = sampling::CollectLogprobs(
+        std::span<const float>(logits).subspan(std::size_t{r} * vocab, vocab),
+        static_cast<sampling::TokenId>(targets[r]), 0U);
+    const double error =
+        std::abs(actual[r].logprob - expected->selected.logprob);
+    if (!(error <= 1e-5))
+      throw std::runtime_error("score row " + std::to_string(r) +
+                               ": expected " +
+                               std::to_string(expected->selected.logprob) +
+                               " actual " + std::to_string(actual[r].logprob));
+  }
+  std::cout << "Score log-softmax vocab=" << vocab << " passed\n";
+}
+
 }  // namespace
 
 int main() {
   try {
     CheckRemapDraftIds();
+    CheckScoreLogprobs(257);
+    CheckScoreLogprobs(248320);
     CheckPenaltyArgmax(257);
     CheckPenaltyArgmax(248320);
     CheckArgmax(1);

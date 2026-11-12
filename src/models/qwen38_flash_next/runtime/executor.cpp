@@ -449,6 +449,8 @@ Executor::~Executor() {
   }
   (void)hipFree(batch_logits_);
   (void)hipFree(score_logits_);
+  (void)hipFree(score_targets_);
+  (void)hipFree(score_results_);
   (void)hipFree(score_moe_out_);
   (void)hipFree(wide_controls_);
   for (float* p : wide_allocations_)

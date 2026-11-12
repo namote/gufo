@@ -19,7 +19,7 @@ holds one stage:
 | `attention_prep.hip.cpp` | Q/gate unpack, RoPE, K/V stores, KVarN rotation and quantization |
 | `attention_select.hip.cpp` | Sparse-attention indexer: key rows, pooled blocks, block selection |
 | `attention.hip.cpp` | Selected-block decode attention and WMMA causal prefill attention |
-| `mtp.hip.cpp` | MTP head glue, argmax, draft logits, candidate selection |
+| `mtp.hip.cpp` | MTP head glue, argmax, draft logits, candidate selection, scoring log-softmax |
 | `kernels_internal.hpp` | Private device helpers shared by the TUs above |
 | `mmq/` | Quantized GEMMs adapted from llama.cpp ([VENDOR.md](mmq/VENDOR.md)) |
 

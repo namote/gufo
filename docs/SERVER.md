@@ -1265,13 +1265,17 @@ row, where verification passes cost about 4.5 ms per row at any width. Row
 r's logits score token r+1; the first token is scored on the prompt's last
 row. The rows therefore carry prompt arithmetic: they agree with the
 `logprobs` of a greedy generation (verification arithmetic) to numerical
-error, not bit for bit. Each pass downloads its logit rows (about 1 MB per
-row) and reduces them on the CPU as generated `logprobs` are. A short prompt
+error, not bit for bit. The device reduces each logit row to its target's
+log-softmax (the row maximum, then the sum of FP32 exponentials accumulated
+in FP64, then the target term in FP64), within about 1e-5 of the FP64
+reduction generated `logprobs` use; a row holding NaN or +inf, or no finite
+value, fails the request as it would there. Only those values, and the
+frontier row, come to the host. A short prompt
 and a 150-token answer cost one pass, a 1024-token answer four or five (a
 pass that another follows ends on a selection block), run as one
 work unit between other requests' decode rounds. The first scoring request
-allocates the 256-row head output and its pinned host copy (about 254 MB
-each); a server that never scores never allocates them. Only checkpoints of
+allocates the 256-row head output (about 254 MB) and per-row target and
+result arrays; a server that never scores never allocates them. Only checkpoints of
 a prefilled prompt may be retained in RAM, as with `cache_persist: false`; a
 prompt fed with its scored tokens leaves none, and the scored tokens are
 never published to the continuation cache or written to disk.
@@ -1287,8 +1291,8 @@ settings) run on its own rows and session state as its own prefill pass
 would. Values therefore match unpacked scoring to numerical error. Packed
 sessions skip the MTP draft block and are reset before their next request.
 KVarN (`--kv-cache-type kvarn-*`) and image sessions, and a request longer
-than one pass, are scored on their own. The head rows reduce on the CPU 256
-at a time after the pass. A scoring unit takes turns with generating requests as a prefill
+than one pass, are scored on their own. The packed head runs 256 rows at a
+time, each group reduced on the device before the next. A scoring unit takes turns with generating requests as a prefill
 chunk does: it runs when no generator is due or once their decode time from
 the previous unit is spent, and a unit at least the prefill policy's
 `decode_time_share_min` long buys them as much decode time, capped at

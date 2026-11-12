@@ -431,26 +431,23 @@ public:
   [[nodiscard]] std::uint32_t max_score_rows() const noexcept {
     return std::min(kScoreRows, options_.max_batch);
   }
-  /// A kPrefill Forward of `tokens` (at most max_batch()) that returns the
-  /// logits of its last `logit_rows` rows (at most max_score_rows(), may be
-  /// zero): `rows` points at logit_rows * vocab floats in executor-owned
-  /// pinned memory, valid until the next scoring pass. The
-  /// head output and its host copy are allocated on the first call (about
-  /// 1 MB per row each) and are not part of DeferredScratchBytes, so serving
-  /// budgets stay as they were for servers that never score. Teacher-forced
-  /// scoring uses it; a packed pass of several sequences could reuse it.
-  /// One session's rows in a scoring pack: its next `tokens` and how many of
-  /// their last rows return logits.
+  /// A kPrefill Forward of `tokens` (at most max_batch()) whose last
+  /// targets.size() rows (at most max_score_rows(), may be zero) each score
+  /// their target token: `results` points at one ScoredLogprob per row (the
+  /// raw log-softmax at the target, ScoreLogprobs) in executor-owned pinned
+  /// memory, valid until the next scoring pass. With `last_logits`, the last
+  /// row's full logits (vocab floats) are copied there too. The head output,
+  /// targets and results are allocated on the first call (about 1 MB per
+  /// head row) and are not part of DeferredScratchBytes, so serving budgets
+  /// stay as they were for servers that never score.
+  /// One session's rows in a scoring pack: its next `tokens` and the target
+  /// token of each of their last targets.size() rows.
   struct ScorePackItem {
     Session* session;
     std::span<const std::int32_t> tokens;
-    std::uint32_t logit_rows;
+    std::span<const std::int32_t> targets;
   };
   static constexpr std::uint32_t kScorePackSessions = 32;
-  /// Receives packed logit rows [first, first + rows / vocab): every item's
-  /// logit rows in item order. The rows are valid only during the call.
-  using ScoreRowsConsumer = std::function<bool(
-      std::uint32_t first, std::span<const float> rows, std::string* error)>;
   /// Prompt (kPrefill) rows of up to kScorePackSessions sessions in one
   /// pass, at most max_batch() rows in all. Row-wise work (embedding, routed
   /// and shared experts, output head) runs once over every row, so the
@@ -463,13 +460,16 @@ public:
   /// every layer, fails the pack. A failure may leave every session partly
   /// advanced; Session::ScoreBatch then scores each request on its own, so
   /// only the cancelled one fails.
+  /// `results` then points at every item's scored rows in item order
+  /// (ScoredLogprob, pinned, valid until the next scoring pass).
   [[nodiscard]] bool ForwardScorePack(std::span<const ScorePackItem> items,
-                                      const ScoreRowsConsumer& consume,
+                                      std::span<const ScoredLogprob>* results,
                                       std::string* error_msg) const;
   [[nodiscard]] bool ForwardScoreRows(Session& session,
                                       std::span<const std::int32_t> tokens,
-                                      std::uint32_t logit_rows,
-                                      std::span<const float>* rows,
+                                      std::span<const std::int32_t> targets,
+                                      std::span<const ScoredLogprob>* results,
+                                      float* last_logits,
                                       std::string* error_msg) const;
 
   /// Quality-probe replay of the last Forward's output head, with the same
@@ -1253,11 +1253,20 @@ private:
   mutable std::uint32_t routed_tile_rows_{48};  ///< token rows per tile
   mutable int routed_tile_cols_{0};
   float* logits_host_{nullptr};
-  /// ForwardScoreRows: max_score_rows() head rows on the device and their
-  /// pinned host copy, allocated on first use. score_pass_ routes the head of
-  /// the running Forward there.
+  /// Scoring passes: max_score_rows() head rows on the device, and
+  /// max_batch() targets and results on the device and pinned host,
+  /// allocated on first use (EnsureScoreBuffers). score_pass_ routes the head
+  /// of the running Forward into score_logits_.
   mutable float* score_logits_{nullptr};
-  mutable float* score_logits_host_{nullptr};
+  mutable std::int32_t* score_targets_{nullptr};
+  mutable std::int32_t* score_targets_host_{nullptr};
+  mutable ScoredLogprob* score_results_{nullptr};
+  mutable ScoredLogprob* score_results_host_{nullptr};
+  bool EnsureScoreBuffers(std::string* error_msg) const;
+  /// Reduces head rows [0, rows) of score_logits_ into results [first, ...)
+  /// against targets [first, ...) (ScoreLogprobs).
+  bool ScoreHeadRows(std::uint32_t first, std::uint32_t rows,
+                     std::string* error_msg) const;
   /// ForwardScorePack: pinned per-session controls and the shared MoE
   /// output rows (max_batch() rows), allocated on first use.
   mutable Session::Control* score_controls_{nullptr};

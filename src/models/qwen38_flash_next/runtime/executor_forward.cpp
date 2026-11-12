@@ -271,10 +271,9 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     }
   }
   const auto body = [&] {
-    return ForwardBody(session, n, n_logits, logits != nullptr || score_pass_,
-                       speculative, sparse, start_pos,
-                       graph ? graph_pool_grid : pool_grid, first_layer,
-                       c.num_layers, error_msg, checkpoint, graph);
+    return ForwardBody(session, n, n_logits, logits != nullptr, speculative,
+                       sparse, start_pos, graph ? graph_pool_grid : pool_grid,
+                       first_layer, c.num_layers, error_msg, checkpoint, graph);
   };
   // The prefix is already queued. Wait once before the suffix so recording
   // its graph can reuse these pinned rows while the eager pass executes.
@@ -310,50 +309,106 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   return true;
 }
 
+bool Executor::EnsureScoreBuffers(std::string* error_msg) const {
+  const Config& c = config();
+  const auto fail = [&] {
+    // A failed allocation must not leave a sticky error for the next launch.
+    (void)hipGetLastError();
+    return false;
+  };
+  const std::size_t rows = options_.max_batch;
+  if (score_logits_ == nullptr &&
+      !Check(
+          hip::AllocateDevice(&score_logits_, std::size_t{max_score_rows()} *
+                                                  c.vocab_size * sizeof(float)),
+          "scoring logits", error_msg))
+    return fail();
+  if (score_targets_ == nullptr &&
+      !Check(hip::AllocateDevice(&score_targets_, rows * sizeof(std::int32_t)),
+             "scoring targets", error_msg))
+    return fail();
+  if (score_results_ == nullptr &&
+      !Check(hip::AllocateDevice(&score_results_, rows * sizeof(ScoredLogprob)),
+             "scoring results", error_msg))
+    return fail();
+  if (score_targets_host_ == nullptr) {
+    void* host = nullptr;
+    if (!Check(host_allocations_.Allocate(&host, rows * sizeof(std::int32_t)),
+               "pinned scoring targets", error_msg))
+      return fail();
+    score_targets_host_ = static_cast<std::int32_t*>(host);
+  }
+  if (score_results_host_ == nullptr) {
+    void* host = nullptr;
+    if (!Check(host_allocations_.Allocate(&host, rows * sizeof(ScoredLogprob)),
+               "pinned scoring results", error_msg))
+      return fail();
+    score_results_host_ = static_cast<ScoredLogprob*>(host);
+  }
+  return true;
+}
+
+bool Executor::ScoreHeadRows(std::uint32_t first, std::uint32_t rows,
+                             std::string* error_msg) const {
+  // The device reduces each row to its target's log-softmax: a row's full
+  // logits (about 1 MB) never leave the device, and the reduction runs at
+  // device bandwidth instead of on host threads after the pass.
+  ScoreLogprobs(score_logits_, score_targets_ + first, score_results_ + first,
+                rows, config().vocab_size, stream_);
+  return Check(hipGetLastError(), "scoring log-softmax", error_msg);
+}
+
 bool Executor::ForwardScoreRows(Session& session,
                                 std::span<const std::int32_t> tokens,
-                                std::uint32_t logit_rows,
-                                std::span<const float>* rows,
+                                std::span<const std::int32_t> targets,
+                                std::span<const ScoredLogprob>* results,
+                                float* last_logits,
                                 std::string* error_msg) const {
-  *rows = {};
+  *results = {};
   const Config& c = config();
   const auto n = static_cast<std::uint32_t>(tokens.size());
+  const auto logit_rows = static_cast<std::uint32_t>(targets.size());
   if (n == 0 || n > options_.max_batch || logit_rows > n ||
       logit_rows > max_score_rows()) {
     AssignError(error_msg, "scoring pass is empty or exceeds its row limit");
     return false;
   }
-  // One head buffer of max_score_rows() rows serves every pass. On this
-  // unified-memory target the download is a few milliseconds per hundred
-  // rows, small beside the pass; the rows then reduce on the host with the
-  // log-softmax generated logprobs use (sampling::CollectLogprobs).
-  const std::size_t floats = std::size_t{max_score_rows()} * c.vocab_size;
-  // A failed allocation must not leave a sticky error for the next launch.
-  if (score_logits_ == nullptr &&
-      !Check(hip::AllocateDevice(&score_logits_, floats * sizeof(float)),
-             "scoring logits", error_msg)) {
-    (void)hipGetLastError();
+  if (!EnsureScoreBuffers(error_msg))
     return false;
-  }
-  if (score_logits_host_ == nullptr) {
-    void* host = nullptr;
-    if (!Check(host_allocations_.Allocate(&host, floats * sizeof(float)),
-               "pinned scoring logits", error_msg)) {
-      (void)hipGetLastError();
+  std::copy(targets.begin(), targets.end(), score_targets_host_);
+  {
+    struct ScorePass {
+      bool& flag;
+      explicit ScorePass(bool& f) : flag(f) { flag = true; }
+      ~ScorePass() { flag = false; }
+    } pass{score_pass_};
+    if (!Forward(session, tokens, logit_rows, nullptr, ForwardMode::kPrefill,
+                 error_msg))
       return false;
-    }
-    score_logits_host_ = static_cast<float*>(host);
   }
-  struct ScorePass {
-    bool& flag;
-    explicit ScorePass(bool& f) : flag(f) { flag = true; }
-    ~ScorePass() { flag = false; }
-  } pass{score_pass_};
-  if (!Forward(session, tokens, logit_rows, nullptr, ForwardMode::kPrefill,
-               error_msg))
+  if (logit_rows == 0)
+    return true;
+  if (!Check(hipMemcpyAsync(score_targets_, score_targets_host_,
+                            logit_rows * sizeof(std::int32_t),
+                            hipMemcpyHostToDevice, stream_),
+             "scoring target upload", error_msg) ||
+      !ScoreHeadRows(0, logit_rows, error_msg) ||
+      !Check(hipMemcpyAsync(score_results_host_, score_results_,
+                            logit_rows * sizeof(ScoredLogprob),
+                            hipMemcpyDeviceToHost, stream_),
+             "scoring results download", error_msg) ||
+      (last_logits != nullptr &&
+       !Check(hipMemcpyAsync(
+                  logits_host_,
+                  score_logits_ + std::size_t{logit_rows - 1} * c.vocab_size,
+                  std::size_t{c.vocab_size} * sizeof(float),
+                  hipMemcpyDeviceToHost, stream_),
+              "scoring frontier download", error_msg)) ||
+      !Check(hipStreamSynchronize(stream_), "scoring", error_msg))
     return false;
-  *rows = std::span<const float>(score_logits_host_,
-                                 std::size_t{logit_rows} * c.vocab_size);
+  if (last_logits != nullptr)
+    std::copy_n(logits_host_, c.vocab_size, last_logits);
+  *results = std::span<const ScoredLogprob>(score_results_host_, logit_rows);
   return true;
 }
 
@@ -576,8 +631,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       return false;
     }
     if (download_logits &&
-        !Check(hipMemcpyAsync(score_pass_ ? score_logits_host_ : logits_host_,
-                              score_pass_ ? score_logits_ : s_.logits,
+        !Check(hipMemcpyAsync(logits_host_, s_.logits,
                               static_cast<std::size_t>(n_logits) *
                                   c.vocab_size * sizeof(float),
                               hipMemcpyDeviceToHost, stream_),
