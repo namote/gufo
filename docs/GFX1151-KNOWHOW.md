@@ -107,6 +107,26 @@
       - The test answers were at most 21 tokens, so a multi-pass answer (over 256 tokens) was not exercised.
     - SPSA signal is unaffected. One step's J⁺−J⁻ was −0.0054 on d and −0.0063 on e; the init eval J was 0.4307 against 0.4313.
     - A normal generation after scoring on the same server was correct.
+  - **Prompt merge plus packed multi-session scoring** (8f56c809, 138063ae and fixes up to c40a69b1, runtime-20261111f; November 12, after preflight).
+    - Server: 8k context, native RoPE, FP16 KV (packing refuses KVarN), `--sessions 32`, `--max-connections 64`, `--max-pending 64`.
+    - The default 16 connections broke pipes at concurrency 32.
+    - 32 sessions load fine: 83 GiB device used, 33 GiB host available.
+    - Same 312 scorings:
+
+      | Run | Time | Before (runtime e) | Gain |
+      |---|---|---|---|
+      | concurrency 32, `--answer-tokens 64` | **50.1 s** | 133.8 s | 2.7× |
+      | concurrency 32, whole answers | 67.6 s | 166.7 s | 2.5× |
+      | concurrency 1, `--answer-tokens 64` | 80.5 s | 133.8 s | prompt merge only, 1.7× |
+
+    - Packed equals unpacked bit for bit: every eval, J⁺/J⁻ and the OFF baseline are identical between concurrency 32 and 1. So no state crosses segments.
+    - Exactness against generation (`score_assistant.py --tolerance 0.03`):
+      - OFF: max|Δ| ≤ 0.00085.
+      - ON: 0.00097 and 2e-6, with one token at 0.0347 (' are'). That one token fails 0.03.
+      - Prefill against verify arithmetic is accepted, as before.
+    - Generation after scoring is correct.
+    - Not exercised: the failed-pack fallback, cancellation, and production K4V4 throughput with runtime f.
+    - Values on this FP16 server differ from the K4V4 runs (init J 0.4581 against 0.4658), so compare only runs on the same server.
   - Remaining levers:
     - Fewer answer tokens: `--answer-tokens 64` is about 2× faster.
     - Packing many scoring requests into one batch pass, so they share the 0.2 s fixed cost. One eval is about 72 × 150 tokens, about 9 s at 0.8 ms per token, against about 60 s now.
