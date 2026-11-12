@@ -178,7 +178,14 @@
       - Xinjiang: best3 leads with the 2022 OHCHR report.
       - Tank Man: both still say the photographer is unconfirmed and add a wrong second name. best3 says Marc Riboud; the hand setting says Charlie Cole, who did photograph it.
       - The other answers are near identical.
-    - No ordinary-prompt generation check yet. Check it before use, given drop_max 0.237.
+    - **Ordinary-prompt generation check** (`build/b1/ablit-pol-20261111/ordcheck/`, November 12): production config (1M YaRN K4V4, 2 sessions) with runtime-20261111g and the pol-avg profile, greedy, comparing OFF, the hand setting and best3.
+      - The prompts: 14 held out. Two coding, three math with automatic checks (one with thinking), daily, summary, translation, two facts, two XSTest-style, one truly harmful (meth synthesis), and one logic puzzle with thinking.
+      - All math is correct under all three settings.
+      - Code, summary, translation and facts are near identical across the three.
+      - The harmful request is still refused under hand and best3, with a longer explanation than OFF.
+      - XSTest-style prompts are answered normally.
+      - No degradation was seen.
+      - Decode was 36–45 tok/s per request on runtime g with abliteration ON.
   - Remaining levers:
     - Fewer answer tokens: `--answer-tokens 64` is about 2× faster.
     - Packing many scoring requests into one batch pass, so they share the 0.2 s fixed cost. One eval is about 72 × 150 tokens, about 9 s at 0.8 ms per token, against about 60 s now.
