@@ -2190,6 +2190,30 @@ struct TextGenerationScheduler::Impl {
         [](const auto& request) { return !request->score_tokens.empty(); });
   }
 
+  [[nodiscard]] static bool HasDueGenerator(
+      const std::deque<std::shared_ptr<ScheduledRequest>>& decoding) {
+    return std::any_of(
+        decoding.begin(), decoding.end(), [](const auto& request) {
+          return request->score_tokens.empty() && request->decode_due;
+        });
+  }
+
+  // PopDecoder over generating requests only; at least one must be queued.
+  [[nodiscard]] static std::shared_ptr<ScheduledRequest> PopGenerator(
+      std::deque<std::shared_ptr<ScheduledRequest>>& decoding,
+      bool require_due) {
+    for (const bool due : {require_due, false}) {
+      for (auto it = decoding.begin(); it != decoding.end(); ++it) {
+        if ((*it)->score_tokens.empty() && (!due || (*it)->decode_due)) {
+          auto request = std::move(*it);
+          decoding.erase(it);
+          return request;
+        }
+      }
+    }
+    throw std::logic_error("no generating request to decode");
+  }
+
   [[nodiscard]] static bool HasDueDecoder(
       const std::deque<std::shared_ptr<ScheduledRequest>>& decoding) {
     return std::any_of(decoding.begin(), decoding.end(),
@@ -2495,7 +2519,7 @@ struct TextGenerationScheduler::Impl {
                       [](const auto& request) {
                         return request->result.tokens.empty();
                       });
-      if (prefilling.empty() || decoding.empty())
+      if ((prefilling.empty() && !HasScoring(decoding)) || decoding.empty())
         decode_time_credit_ms = 0.0;
       if (!prefilling.empty() && !decoding.empty() &&
           (!due_decoder || assemble_initial_batch)) {
@@ -2532,9 +2556,30 @@ struct TextGenerationScheduler::Impl {
         continue;
       }
 
-      if (!decoding.empty() && HasScoring(decoding)) {
+      // A scoring unit takes turns with generating decoders as a prefill
+      // chunk does: it runs when no generator is due, or once their time
+      // credit from the previous unit is spent; a long unit then buys them as
+      // much decode time (decode_time_share_min/max). Its remaining peers
+      // wait for the next turn, so prompts keep their turns as well.
+      if (HasScoring(decoding) &&
+          (!HasDueGenerator(decoding) ||
+           (decode_time_credit_ms <= 0.0 && !last_unit_scoring))) {
+        const auto scoring_start = Clock::now();
         auto batch = TakeScoring(decoding);
         StepScoreBatch(batch);
+        const std::chrono::duration<double, std::milli> scoring_time =
+            Clock::now() - scoring_start;
+        const auto share_min = prefill_policy.decode_time_share_min;
+        decode_time_credit_ms =
+            share_min.count() > 0 && scoring_time >= share_min
+                ? std::min(scoring_time.count(),
+                           std::chrono::duration<double, std::milli>(
+                               prefill_policy.decode_time_share_max)
+                               .count())
+                : 0.0;
+        decode_credit_earner =
+            std::numeric_limits<decltype(ScheduledRequest::id)>::max();
+        last_unit_scoring = true;
         const auto settle = CaptureSettleDeadline();
         for (auto& request : batch) {
           if (!IsTerminal(request)) {
@@ -2544,16 +2589,21 @@ struct TextGenerationScheduler::Impl {
               decoding.push_back(std::move(request));
           }
         }
+        for (const auto& request : decoding)
+          request->decode_due = request->score_tokens.empty();
         continue;
       }
 
       if (!decoding.empty()) {
+        last_unit_scoring = false;
+        // Only generating requests decode; scoring ones wait for a unit.
+        const bool due_generator = HasDueGenerator(decoding);
         const std::size_t candidate_count =
-            due_decoder
-                ? static_cast<std::size_t>(std::count_if(
-                      decoding.begin(), decoding.end(),
-                      [](const auto& request) { return request->decode_due; }))
-                : decoding.size();
+            static_cast<std::size_t>(std::count_if(
+                decoding.begin(), decoding.end(), [&](const auto& request) {
+                  return request->score_tokens.empty() &&
+                         (!due_generator || request->decode_due);
+                }));
         const auto plan = runner_pool->SelectDecodePlan(candidate_count);
         const std::size_t batch_size =
             plan.kind == TextExecutionPlanKind::kBatched
@@ -2562,7 +2612,7 @@ struct TextGenerationScheduler::Impl {
         std::vector<std::shared_ptr<ScheduledRequest>> batch;
         batch.reserve(batch_size);
         for (std::size_t index = 0; index < batch_size; ++index) {
-          auto request = PopDecoder(decoding, due_decoder);
+          auto request = PopGenerator(decoding, due_generator);
           request->decode_due = false;
           batch.push_back(std::move(request));
         }
@@ -2595,8 +2645,8 @@ struct TextGenerationScheduler::Impl {
             prefilling.begin(), prefilling.end(), [&](const auto& peer) {
               return peer->id != decode_credit_earner && ShortPrefill(peer);
             });
-        if (decode_time_credit_ms > 0.0 && !prefilling.empty() &&
-            !short_waiting)
+        if (decode_time_credit_ms > 0.0 &&
+            (!prefilling.empty() || HasScoring(decoding)) && !short_waiting)
           MarkAllDecodersDue(decoding);
         else
           decode_time_credit_ms = 0.0;
@@ -2650,6 +2700,8 @@ struct TextGenerationScheduler::Impl {
   /// Device time decoders may still use before the next active-decode
   /// prefill chunk: set to that chunk's wall time, spent by decode rounds.
   double decode_time_credit_ms{0.0};
+  /// The last decode-side work unit scored (StepScoreBatch).
+  bool last_unit_scoring{false};
   /// Id of the prefill whose chunk set the credit.
   decltype(ScheduledRequest::id) decode_credit_earner{};
   /// Prefill tokens that short peers ran out of turn since the long front of

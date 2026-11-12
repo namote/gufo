@@ -107,6 +107,7 @@ enum class EventKind : std::uint8_t {
   kAdvance,
   kScore,
   kScorePrompt,
+  kScoreUnit,
 };
 
 struct Event {
@@ -575,6 +576,10 @@ public:
       const std::lock_guard<std::mutex> lock(control_->mutex);
       control_->score_batches.push_back(requests.size());
     }
+    control_->Log({.kind = EventKind::kScoreUnit,
+                   .label = 0,
+                   .index = 0,
+                   .count = requests.size()});
     TextModelRunner::ScoreBatch(requests);
   }
 
@@ -3657,6 +3662,59 @@ void TestScoringRequestsShareAWorkUnit() {
          "a scoring unit holds no more rows than the pack");
 }
 
+void TestScoringTakesTurnsWithDecoding() {
+  // Scoring requests keep arriving while a request generates: each scoring
+  // unit is followed by a decode step, so the generator keeps advancing.
+  auto control = std::make_shared<FakeControl>();
+  control->scoring_pack_rows = 64;
+  control->slow_advance_time = std::chrono::milliseconds(2);
+  auto scheduler = MakeScheduler(control, 4);
+  auto generator = scheduler->Submit({1, 10}, 24, 0.0F);
+  std::atomic<bool> done{false};
+  std::vector<gufo::server::TextGenerationScheduler::Request> scorers;
+  std::thread submitter([&] {
+    // Keep a few requests in flight, as a scoring client does.
+    std::size_t waited = 0;
+    for (TextRunnerToken label = 2; !done.load() && label < 2000; ++label) {
+      auto metadata = ClientMetadata("scorer");
+      metadata.score_tokens = {7, 8};
+      scorers.push_back(
+          scheduler->Submit({label, 20, 21}, 0, 0.0F, {}, false, metadata));
+      if (scorers.size() - waited > 3)
+        (void)scorers[waited++].Wait();
+    }
+    while (waited < scorers.size())
+      (void)scorers[waited++].Wait();
+  });
+  const auto generated = generator.Wait();
+  done = true;
+  submitter.join();
+  Expect(generated.tokens == ExpectedTokens(1, 24),
+         "a generator completes while scoring requests keep arriving");
+  const auto events = control->Events();
+  const auto advance = [](const Event& event) {
+    return event.kind == EventKind::kAdvance && event.label == 1;
+  };
+  const auto first = std::find_if(events.begin(), events.end(), advance);
+  const auto last = std::find_if(events.rbegin(), events.rend(), advance);
+  std::size_t units = 0;
+  std::size_t advances = 0;
+  bool consecutive = false;
+  bool previous_unit = false;
+  for (auto it = first; first != events.end() && it != last.base(); ++it) {
+    if (advance(*it)) {
+      ++advances;
+      previous_unit = false;
+    } else if (it->kind == EventKind::kScoreUnit) {
+      ++units;
+      consecutive = consecutive || previous_unit;
+      previous_unit = true;
+    }
+  }
+  Expect(units > 0 && !consecutive && units <= advances,
+         "scoring units alternate with the generator's decode steps");
+}
+
 void TestScoringReturnsRawLogprobsWithoutDecoding() {
   for (const bool speculative : {false, true}) {
     auto control = std::make_shared<FakeControl>();
@@ -3766,6 +3824,7 @@ int main() {
   TestTokenLogprobs();
   TestScoringReturnsRawLogprobsWithoutDecoding();
   TestScoringRequestsShareAWorkUnit();
+  TestScoringTakesTurnsWithDecoding();
   TestPublicationWaitUsesRecentSubstantialPrefill();
   // Log assertions in this binary match the plain "[LEVEL] [component]" text
   // captured from a redirected sink; a TTY stderr would tint the level tag.

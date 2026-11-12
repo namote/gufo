@@ -1288,7 +1288,12 @@ would. Values therefore match unpacked scoring to numerical error. Packed
 sessions skip the MTP draft block and are reset before their next request.
 KVarN (`--kv-cache-type kvarn-*`) and image sessions, and a request longer
 than one pass, are scored on their own. The head rows reduce on the CPU 256
-at a time after the pass.
+at a time after the pass. A scoring unit takes turns with generating requests as a prefill
+chunk does: it runs when no generator is due or once their decode time from
+the previous unit is spent, and a unit at least the prefill policy's
+`decode_time_share_min` long buys them as much decode time, capped at
+`decode_time_share_max`. Scoring requests
+neither wait for nor lead a shared prompt prefix.
 
 A server dedicated to scoring (for example SPSA training with
 `tools/qwen38_flash_next/abliteration/spsa.py`) does not need the production
