@@ -4,10 +4,12 @@
 
 #include "src/models/qwen38_flash_next/dynamic_abliteration.hpp"
 
+#include <algorithm>
 #include <array>
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -32,17 +34,35 @@ std::shared_ptr<const qwen::AbliterationSettings> Settings(
   return settings;
 }
 
+// Load order fnx, pol, ref: the resolver combines named profiles' defaults
+// in that order, as the engine does.
+std::shared_ptr<const qwen::AbliterationSettings> Resolve(
+    std::span<const std::string> names) {
+  std::vector<std::shared_ptr<const qwen::AbliterationSettings>> parts;
+  for (const auto* name : {"fnx", "pol", "ref"})
+    if (std::ranges::find(names, std::string(name)) != names.end())
+      parts.push_back(Settings(name, std::string(64, name[0])));
+  return parts.size() == 1 ? parts.front()
+                           : qwen::CombineAbliterationSettings(parts);
+}
+
 // Two candidates: "pol" in column 1 (threshold 1), "fnx" in column 0
 // (threshold 2). With `decode`, generated rows use the same thresholds;
-// without, only the last prompt row can turn a profile ON.
-q::DynamicAbliteration Make(bool decode = false) {
+// without, only the last prompt row can turn a profile ON. `with` gives pol
+// the companion "ref".
+q::DynamicAbliteration Make(bool decode = false, bool with = false) {
   const auto on = [&](float x) {
     return decode ? std::optional(x) : std::nullopt;
   };
-  return q::DynamicAbliteration({
-      {"pol", 1, 1.0F, on(1.0F), Settings("pol", std::string(64, 'a'))},
-      {"fnx", 0, 2.0F, on(2.0F), Settings("fnx", std::string(64, 'b'))},
-  });
+  std::vector<std::string> pol{"pol"};
+  if (with)
+    pol.push_back("ref");
+  return q::DynamicAbliteration(
+      {
+          {"pol", 1, 1.0F, on(1.0F), pol},
+          {"fnx", 0, 2.0F, on(2.0F), {"fnx"}},
+      },
+      Resolve);
 }
 
 // Rows of (fnx, pol) scores laid out in kDetectorColumns columns.
@@ -107,6 +127,35 @@ void PrefillDetectionReportedBeforeAnyOnPass() {
               report.position == 42u && report.phase == "prefill" &&
               !dynamic.engaged(),
           "a detection is reported even without an ON pass");
+}
+
+void CompanionsAndUnion() {
+  auto dynamic = Make(false, true);
+  dynamic.SetPromptLength(5);
+  // Only pol crosses: pol and its companion ref.
+  const auto pol = Rows({{1.0F, 1.5F}});
+  dynamic.Observe(
+      {.id = 1, .first_position = 4, .rows = 1, .prefill = true, .scores = pol},
+      5);
+  auto report = dynamic.Report();
+  Require(report.triggered == std::vector<std::string>({"pol", "ref"}) &&
+              report.crossed == std::vector<std::string>{"pol"},
+          "a crossing turns its companions ON with it");
+  // Both cross: the union without duplicates, in load order.
+  auto both = Make(false, true);
+  both.SetPromptLength(5);
+  const auto scores = Rows({{2.5F, 1.5F}});
+  both.Observe({.id = 1,
+                .first_position = 4,
+                .rows = 1,
+                .prefill = true,
+                .scores = scores},
+               5);
+  report = both.Report();
+  Require(report.triggered == std::vector<std::string>({"fnx", "pol", "ref"}) &&
+              report.crossed == std::vector<std::string>({"pol", "fnx"}) &&
+              report.scores.size() == 2,
+          "several crossing profiles: the union, every score reported");
 }
 
 void MidPromptCrossingIgnored() {
@@ -182,7 +231,7 @@ void DecodeTriggerIgnoresRolledBackRows() {
                    .scores = verify},
                   14);
   Require(!dynamic.Engage(14), "a pass is observed once");
-  // Both cross on one row: the larger margin wins (fnx 3.5 - 2 > pol 2 - 1).
+  // Both cross on one row: both turn ON together.
   const auto both = Rows({{3.5F, 2.0F}});
   dynamic.Observe({.id = 3,
                    .first_position = 14,
@@ -191,12 +240,13 @@ void DecodeTriggerIgnoresRolledBackRows() {
                    .scores = both},
                   15);
   const auto settings = dynamic.Engage(15);
-  Require(
-      settings && settings->profile == "fnx" && settings->dynamic_from == 15u,
-      "largest margin, ON from the next token");
+  Require(settings && settings->profile == "fnx+pol" &&
+              settings->parts.size() == 2 && settings->dynamic_from == 15u,
+          "every crossing profile, ON from the next token");
   const auto report = dynamic.Report();
   Require(report.phase == "decode" && report.position == 15u &&
-              report.triggered == std::vector<std::string>{"fnx"},
+              report.triggered == std::vector<std::string>({"fnx", "pol"}) &&
+              report.crossed == std::vector<std::string>({"pol", "fnx"}),
           "decode report");
   Require(report.max_scores[0].second == 2.0F &&
               report.max_scores[1].second == 3.5F,
@@ -294,11 +344,12 @@ int main() {
     PrefillDetectionReportedBeforeAnyOnPass();
     DecodeRowsNeedADecodeThreshold();
     MidPromptCrossingIgnored();
+    CompanionsAndUnion();
     ReportWithoutTrigger();
     Identities();
     bool rejected = false;
     try {
-      q::DynamicAbliteration({});
+      q::DynamicAbliteration({}, Resolve);
     } catch (const std::invalid_argument&) {
       rejected = true;
     }

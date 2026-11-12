@@ -296,6 +296,11 @@ private:
   /// qwen::AbliterationDeviceWords floats, allocated when first turned ON
   /// and kept (graph arguments point at it). Shared with checkpoint views.
   std::shared_ptr<float> abliteration_device_;
+  /// Several profiles ON (Executor::CombineAbliterationBlocks): the device
+  /// block projecting at each site (AbliterationWeightIndex - 1), -1 where
+  /// no profile has a strength. Empty for one profile, whose single block
+  /// runs at every site.
+  std::vector<std::int16_t> abliteration_sites_;
   /// SetDetection and the last scored pass (DetectorPass).
   bool detect_{false};
   std::vector<float> detect_scores_;
@@ -406,6 +411,19 @@ public:
       std::string_view name) const;
   /// The first direction row of the loaded profile `name`.
   [[nodiscard]] std::uint32_t AbliterationRow(std::string_view name) const;
+  /// Device blocks of a combined session (several profiles ON).
+  static constexpr std::uint32_t kAbliterationMaxBlocks = 16;
+  /// Rows reserved for the orthonormalized unions of combined profiles.
+  static constexpr std::uint32_t kAbliterationComboRows = 64;
+  /// Several profiles ON together: one device block per distinct set of
+  /// profiles with a nonzero strength at a site. Each block projects onto
+  /// the orthonormal basis of the union of that set's directions (one
+  /// profile: its own rows) with, at each of its sites, the largest strength
+  /// any profile of the set has there, and preserves norms when any of them
+  /// does. Appends the blocks to `words` and each site's block to `sites`.
+  void CombineAbliterationBlocks(
+      std::span<const qwen::AbliterationSettings* const> parts,
+      std::vector<float>* words, std::vector<std::int16_t>* sites) const;
   /// The score column of profile `name`'s detector; empty for a profile
   /// without `trigger`.
   [[nodiscard]] std::optional<std::uint32_t> DetectorColumn(
@@ -818,11 +836,24 @@ private:
     std::uint32_t layer;
     bool mlp;
   };
+  /// The block projecting at site `site` (AbliterationWeightIndex - 1).
+  const float* SiteAbliteration(const Session& session,
+                                std::uint32_t site) const {
+    if (!session.abliteration_)
+      return nullptr;
+    if (session.abliteration_sites_.empty())
+      return session.abliteration_device_.get();
+    const auto block = session.abliteration_sites_[site];
+    return block < 0
+               ? nullptr
+               : session.abliteration_device_.get() +
+                     std::size_t(block) *
+                         qwen::AbliterationDeviceWords(config().num_layers);
+  }
   AbliterationSite AbliterationAt(const Session& session, std::uint32_t layer,
                                   bool mlp) const {
-    return {
-        session.abliteration_ ? session.abliteration_device_.get() : nullptr,
-        layer, mlp};
+    return {SiteAbliteration(session, (mlp ? config().num_layers : 0) + layer),
+            layer, mlp};
   }
   void ProjectAbliteration(float* output, std::uint32_t rows,
                            AbliterationSite site) const;
@@ -836,6 +867,22 @@ private:
                ? session.abliteration_device_.get()
                : nullptr;
   }
+  /// The block projecting the post-layer residual of `layer`: one profile's
+  /// block at every layer while ResidualAbliteration; a combination's block
+  /// only at layers with a residual strength.
+  const float* ResidualAbliterationAt(const Session& session,
+                                      std::uint32_t layer) const {
+    return ResidualAbliteration(session)
+               ? SiteAbliteration(session, 2 * config().num_layers + layer)
+               : nullptr;
+  }
+  /// Combined unions' rows by key (CombineAbliterationBlocks), uploaded once
+  /// into the reserved rows after the profiles'.
+  mutable std::unordered_map<std::string,
+                             std::pair<std::uint32_t, std::uint32_t>>
+      combo_rows_;
+  std::uint32_t combo_first_{0};
+  mutable std::uint32_t combo_used_{0};
   friend struct ExecutorTestAccess;
 
   enum class DiagnosticStage { kTarget, kDraft, kHead, kCatchUp };

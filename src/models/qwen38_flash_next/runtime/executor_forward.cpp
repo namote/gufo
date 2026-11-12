@@ -554,7 +554,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
         // nothing; settle any update still pending regardless, so the
         // projection reads the materialized residual of every HC stream.
         ApplyPendingResidual();
-        const AbliterationSpan span{rows, residual_settings};
+        const AbliterationSpan span{rows, ResidualAbliterationAt(session, il)};
         AbliterateResidualBatchRows(s_.res, abliteration_directions_,
                                     std::span(&span, 1), il, c.num_layers, rows,
                                     c.hidden_size, c.hc_count, stream_);

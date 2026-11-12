@@ -1410,7 +1410,7 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
         for (std::size_t i = 0; i < items.size(); ++i) {
           spans[i] = {
               offsets[i] + static_cast<std::uint32_t>(items[i].tokens.size()),
-              ResidualAbliteration(*items[i].session)};
+              ResidualAbliterationAt(*items[i].session, il)};
           any = any || spans[i].settings != nullptr;
         }
         if (any) {

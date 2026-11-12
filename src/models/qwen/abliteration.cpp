@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iterator>
 #include <stdexcept>
+#include <utility>
 
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/json.hpp"
@@ -220,6 +221,17 @@ AbliterationTrigger LoadTrigger(const json::Value& value,
       Invalid("trigger.decode_threshold");
     trigger.decode_threshold = static_cast<float>(decode->as_double());
   }
+  // Companions: names of other loaded profiles (checked when loaded).
+  if (const auto* with = value.find("with")) {
+    if (!with->is_array() || with->size() >= kAbliterationMaxProfiles)
+      Invalid("trigger.with (an array of up to 7 profile names)");
+    for (const auto& item : with->items()) {
+      if (!item.is_string() || item.str().empty() ||
+          std::ranges::find(trigger.with, item.str()) != trigger.with.end())
+        Invalid("trigger.with (distinct profile names)");
+      trigger.with.push_back(item.str());
+    }
+  }
   return trigger;
 }
 
@@ -367,7 +379,119 @@ std::vector<float> AbliterationSettings::DeviceWords(
 }
 
 bool AbliterationSettings::ResidualActive() const noexcept {
+  if (!parts.empty())
+    return std::ranges::any_of(
+        parts, [](const auto& part) { return part->ResidualActive(); });
   return std::ranges::any_of(residual, [](float x) { return x != 0; });
+}
+
+std::shared_ptr<const AbliterationSettings> CombineAbliterationSettings(
+    std::vector<std::shared_ptr<const AbliterationSettings>> parts) {
+  if (parts.size() < 2 || parts.size() > kAbliterationMaxProfiles)
+    throw std::invalid_argument("abliteration: combine 2..8 profiles");
+  auto result = std::make_shared<AbliterationSettings>();
+  crypto::Sha256Hasher hash;
+  const std::string prefix = "gufo-abliteration-combined-v1";
+  hash.Update(std::span(reinterpret_cast<const std::uint8_t*>(prefix.data()),
+                        prefix.size()));
+  for (std::size_t i = 0; i < parts.size(); ++i) {
+    const auto& part = parts[i];
+    if (!part || !part->parts.empty() || part->dynamic_from ||
+        part->attention.size() != parts.front()->attention.size())
+      throw std::invalid_argument("abliteration: invalid combined part");
+    for (std::size_t j = 0; j < i; ++j)
+      if (parts[j]->profile == part->profile)
+        throw std::invalid_argument("abliteration: profile '" + part->profile +
+                                    "' named twice");
+    result->profile += (i ? "+" : "") + part->profile;
+    const std::string item = ":" + part->identity;
+    hash.Update(std::span(reinterpret_cast<const std::uint8_t*>(item.data()),
+                          item.size()));
+  }
+  result->identity = hash.FinishHex();
+  result->parts = std::move(parts);
+  return result;
+}
+
+std::shared_ptr<const AbliterationSettings> ResolveAbliterationSet(
+    std::span<const AbliterationProfile* const> loaded,
+    std::span<const AbliterationOverrides> requested) {
+  if (requested.empty())
+    throw std::invalid_argument("abliteration: no profile requested");
+  std::vector<std::pair<std::size_t, const AbliterationOverrides*>> chosen;
+  for (const auto& overrides : requested) {
+    std::optional<std::size_t> index;
+    if (overrides.profile.empty()) {
+      if (requested.size() != 1 || loaded.size() != 1)
+        throw std::invalid_argument(
+            "abliteration: name one of the loaded profiles in "
+            "'abliteration.profile'");
+      index = 0;
+    }
+    for (std::size_t i = 0; !index && i < loaded.size(); ++i)
+      if (loaded[i]->name == overrides.profile)
+        index = i;
+    if (!index)
+      throw std::invalid_argument("abliteration: unknown profile '" +
+                                  overrides.profile + "'");
+    for (const auto& [other, ignored] : chosen)
+      if (other == *index)
+        throw std::invalid_argument("abliteration: profile '" +
+                                    loaded[*index]->name + "' named twice");
+    chosen.emplace_back(*index, &overrides);
+  }
+  std::ranges::sort(chosen, {}, [](const auto& c) { return c.first; });
+  std::vector<std::shared_ptr<const AbliterationSettings>> parts;
+  for (const auto& [index, overrides] : chosen)
+    parts.push_back(ResolveAbliterationSettings(*loaded[index], *overrides));
+  return parts.size() == 1 ? parts.front()
+                           : CombineAbliterationSettings(std::move(parts));
+}
+
+std::vector<float> OrthonormalizeDirections(std::span<const float> rows,
+                                            std::size_t hidden) {
+  if (hidden == 0 || rows.size() % hidden != 0)
+    throw std::invalid_argument("abliteration: invalid direction rows");
+  std::vector<std::vector<double>> basis;
+  for (std::size_t r = 0; r < rows.size() / hidden; ++r) {
+    std::vector<double> v(rows.begin() + r * hidden,
+                          rows.begin() + (r + 1) * hidden);
+    double original = 0;
+    for (double x : v)
+      original += x * x;
+    for (int pass = 0; pass < 2; ++pass)
+      for (const auto& q : basis) {
+        double dot = 0;
+        for (std::size_t i = 0; i < hidden; ++i)
+          dot += v[i] * q[i];
+        for (std::size_t i = 0; i < hidden; ++i)
+          v[i] -= dot * q[i];
+      }
+    double norm = 0;
+    for (double x : v)
+      norm += x * x;
+    if (!(original > 0) || norm <= 1e-12 * original)
+      continue;  // in the span already
+    for (double& x : v)
+      x /= std::sqrt(norm);
+    basis.push_back(std::move(v));
+  }
+  std::vector<float> result;
+  result.reserve(basis.size() * hidden);
+  for (const auto& q : basis)
+    for (double x : q)
+      result.push_back(static_cast<float>(x));
+  return result;
+}
+
+std::vector<const AbliterationSettings*> AbliterationParts(
+    const AbliterationSettings& settings) {
+  if (settings.parts.empty())
+    return {&settings};
+  std::vector<const AbliterationSettings*> result;
+  for (const auto& part : settings.parts)
+    result.push_back(part.get());
+  return result;
 }
 
 std::shared_ptr<const AbliterationSettings> ResolveAbliterationSettings(

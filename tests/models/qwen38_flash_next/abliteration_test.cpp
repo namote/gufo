@@ -4,6 +4,7 @@
 #include <array>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -312,5 +313,71 @@ int main() {
   write(v1_trigger);
   Require(throws(
       [&] { (void)q::AbliterationProfile::Load(path, 3, 2, "fixture"); }));
+  // Companions (`trigger.with`): distinct names.
+  {
+    auto text = trigger;
+    text.insert(text.find(R"("threshold")"), R"("with":["fnx"],)");
+    Require(with_trigger(text).trigger->with ==
+            std::vector<std::string>{"fnx"});
+    for (const auto* bad : {R"("with":"fnx",)", R"("with":["fnx","fnx"],)",
+                            R"("with":[""],)", R"("with":[1],)"}) {
+      auto invalid = trigger;
+      invalid.insert(invalid.find(R"("threshold")"), bad);
+      Require(throws([&] { (void)with_trigger(invalid); }));
+    }
+  }
+
+  // Several profiles ON together: load order, one identity per set.
+  {
+    auto a = residual;
+    a.name = "a";
+    a.identity = std::string(64, 'a');
+    auto b = residual;
+    b.name = "b";
+    b.identity = std::string(64, 'b');
+    const std::array<const qwen::AbliterationProfile*, 2> loaded{&a, &b};
+    const std::vector<qwen::AbliterationOverrides> ab{{.profile = "a"},
+                                                      {.profile = "b"}};
+    const std::vector<qwen::AbliterationOverrides> ba{{.profile = "b"},
+                                                      {.profile = "a"}};
+    const auto set = qwen::ResolveAbliterationSet(loaded, ab);
+    const auto reversed = qwen::ResolveAbliterationSet(loaded, ba);
+    Require(set->identity == reversed->identity && set->parts.size() == 2 &&
+            set->parts[0]->profile == "a" && set->profile == "a+b" &&
+            qwen::AbliterationParts(*set).size() == 2 && set->ResidualActive());
+    const std::vector<qwen::AbliterationOverrides> one{{.profile = "b"}};
+    const auto single_b = qwen::ResolveAbliterationSet(loaded, one);
+    Require(single_b->parts.empty() &&
+            single_b->identity ==
+                qwen::ResolveAbliterationSettings(b)->identity &&
+            qwen::AbliterationParts(*single_b).front() == single_b.get());
+    const std::vector<qwen::AbliterationOverrides> stronger{
+        {.profile = "a"}, {.profile = "b", .residual = {0.5F}}};
+    Require(qwen::ResolveAbliterationSet(loaded, stronger)->identity !=
+            set->identity);
+    for (const auto& bad :
+         std::vector<std::vector<qwen::AbliterationOverrides>>{
+             {{.profile = "a"}, {.profile = "a"}},
+             {{.profile = "c"}},
+             {{.profile = ""}},
+             {}}) {
+      Require(throws([&] { (void)qwen::ResolveAbliterationSet(loaded, bad); }));
+    }
+    // Orthonormal union: a shared direction counts once, and the span
+    // does not depend on the order.
+    const std::vector<float> rows{1, 0, 0, 0.6F, 0.8F, 0, 0, 1, 0};
+    const auto basis = qwen::OrthonormalizeDirections(rows, 3);
+    Require(basis.size() == 6 && std::abs(basis[0] - 1) < 1e-6F &&
+            std::abs(basis[4] - 1) < 1e-6F && std::abs(basis[2]) < 1e-6F);
+    const std::vector<float> reordered{0, 1, 0, 1, 0, 0, 0.6F, 0.8F, 0};
+    const auto other = qwen::OrthonormalizeDirections(reordered, 3);
+    // Same projector: both bases span the xy plane.
+    Require(other.size() == 6 && std::abs(other[2]) < 1e-6F &&
+            std::abs(other[5]) < 1e-6F);
+    // A dynamic switch keeps the parts and salts the combined identity.
+    const auto dynamic_set = qwen::DynamicAbliterationSettings(*set, 4);
+    Require(dynamic_set->parts.size() == 2 &&
+            dynamic_set->identity != set->identity);
+  }
   std::cout << "profile and cache identity PASS\n";
 }

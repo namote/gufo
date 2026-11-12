@@ -173,7 +173,7 @@ bool Executor::ForwardScorePack(std::span<const ScorePackItem> items,
             AbliterationAt(session, il, true));
     if (residual_settings != nullptr) {
       ApplyPendingResidual();
-      const AbliterationSpan span{n, residual_settings};
+      const AbliterationSpan span{n, ResidualAbliterationAt(session, il)};
       AbliterateResidualBatchRows(s_.res, abliteration_directions_,
                                   std::span(&span, 1), il, c.num_layers, n,
                                   c.hidden_size, c.hc_count, stream_);

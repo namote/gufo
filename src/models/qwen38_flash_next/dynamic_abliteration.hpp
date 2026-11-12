@@ -2,6 +2,7 @@
 #define GUFO_MODELS_QWEN38_FLASH_NEXT_DYNAMIC_ABLITERATION_HPP_
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -17,8 +18,8 @@ inline constexpr std::uint32_t kDetectorColumns =
     static_cast<std::uint32_t>(qwen::kAbliterationMaxProfiles);
 
 /// One dynamic profile a request may turn ON (R2): its detector's score
-/// column and threshold, and the settings it runs with once ON (the profile
-/// defaults).
+/// column and thresholds, and the profiles a crossing turns ON (itself, then
+/// its `trigger.with` companions), each with its defaults.
 struct DynamicAbliterationCandidate {
   std::string profile;
   std::uint32_t column{0};
@@ -26,8 +27,14 @@ struct DynamicAbliterationCandidate {
   float threshold{0};
   /// For generated rows; without one they never turn the profile ON.
   std::optional<float> decode_threshold;
-  std::shared_ptr<const qwen::AbliterationSettings> settings;
+  std::vector<std::string> profiles;
 };
+
+/// The settings of a set of profile names with their defaults (load order,
+/// combined when several: qwen::ResolveAbliterationSet).
+using AbliterationResolver =
+    std::function<std::shared_ptr<const qwen::AbliterationSettings>(
+        std::span<const std::string>)>;
 
 /// The detector scores one trunk pass produced for a session. Row r belongs
 /// to the token at position `first_position + r`: the last prompt row of a
@@ -44,9 +51,12 @@ struct DetectorPass {
 
 /// What a request reports as `abliteration` (docs/SERVER.md).
 struct DynamicAbliterationReport {
-  /// The profile detection selected (at most one; see DynamicAbliteration),
-  /// also when the request ended before a pass ran with it ON.
+  /// Every profile the detection turns ON (the crossing ones and their
+  /// companions, load order), also when the request ended before a pass
+  /// ran with them ON.
   std::vector<std::string> triggered;
+  /// The profiles whose detectors crossed on that row.
+  std::vector<std::string> crossed;
   /// Per candidate: the score of the row that crossed, else of the last
   /// prompt row; empty before any scored row.
   std::vector<std::pair<std::string, float>> scores;
@@ -61,14 +71,15 @@ struct DynamicAbliterationReport {
   std::string phase;
 };
 
-/// Per-request detection state (sticky, one profile at a time).
+/// Per-request detection state (sticky).
 ///
 /// Observe() reads a pass's rows that the session committed (positions below
 /// `committed`; rows a verification rolled back are ignored). The last
 /// prompt row is compared with each candidate's `threshold`; generated rows
 /// only with a `decode_threshold` (none by default: they are scored for
-/// `max_scores` only). The first row on which a candidate crosses selects
-/// the one with the largest margin (score - threshold). A crossing on the
+/// `max_scores` only). The first row on which candidates cross turns ON all
+/// of them and their companions together (a union without duplicates). A
+/// crossing on the
 /// last prompt row is only reported: the server then runs the request again
 /// as an explicit ON request (A2, TextModelRunner::PrefillReadmission). A
 /// crossing on a generated row (A1): Engage() hands its settings, made
@@ -78,7 +89,8 @@ struct DynamicAbliterationReport {
 /// state.
 class DynamicAbliteration {
 public:
-  explicit DynamicAbliteration(std::vector<DynamicAbliterationCandidate> c);
+  DynamicAbliteration(std::vector<DynamicAbliterationCandidate> c,
+                      AbliterationResolver resolve);
 
   /// Ignores a pass already observed (same id) and passes after engagement.
   void Observe(const DetectorPass& pass, std::uint32_t committed);
@@ -103,6 +115,7 @@ public:
 
 private:
   std::vector<DynamicAbliterationCandidate> candidates_;
+  AbliterationResolver resolve_;
   std::uint64_t observed_{0};
   std::uint32_t prompt_length_{0};
   /// Scores of the row that crossed, else of the last prompt row.
@@ -110,7 +123,10 @@ private:
   bool have_row_{false};
   std::vector<float> max_scores_;
   bool have_max_{false};
-  std::optional<std::size_t> pending_;
+  /// Candidates crossing on the first crossing row, and their union's
+  /// settings.
+  std::vector<std::size_t> pending_;
+  std::shared_ptr<const qwen::AbliterationSettings> union_;
   bool pending_prefill_{false};
   bool engaged_{false};
   std::uint32_t pending_position_{0};

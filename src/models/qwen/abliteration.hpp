@@ -78,6 +78,9 @@ struct AbliterationTrigger {
   std::vector<float> direction;
   float threshold{0};
   std::optional<float> decode_threshold;
+  /// Companion profiles (loaded names, `with`) turned ON together with this
+  /// one when it triggers; they need no trigger of their own.
+  std::vector<std::string> with;
 };
 
 /// Which direction family a request projects (D18).
@@ -190,6 +193,12 @@ struct AbliterationSettings {
   /// Post-layer residual strengths: r -= s * d * dot(d, r) at the point the
   /// collectors read the directions, so s = 1 zeroes that component there.
   std::vector<float> residual;
+  /// Several profiles ON together (CombineAbliterationSettings): their own
+  /// single-profile settings in profile load order, each applied at every
+  /// site after the ones before it. Empty for one profile, whose members
+  /// above are the projection; a combination keeps only `profile` (the
+  /// names joined by '+'), `parts`, `dynamic_from` and `identity`.
+  std::vector<std::shared_ptr<const AbliterationSettings>> parts;
   /// Set on settings a dynamic profile turned ON in the middle of a request
   /// (DynamicAbliterationSettings): the session's first this-many tokens were
   /// computed OFF, so a state of at most this many tokens is an OFF state.
@@ -262,6 +271,33 @@ struct AbliterationOverrides {
 std::shared_ptr<const AbliterationSettings> ResolveAbliterationSettings(
     const AbliterationProfile& profile,
     const AbliterationOverrides& overrides = {});
+
+/// Several single-profile settings ON together, `parts` already in profile
+/// load order (2..kAbliterationMaxProfiles, distinct profiles). The identity
+/// (gufo-abliteration-combined-v1) covers every part's identity in order, so
+/// one set of profiles and settings always has one identity, whichever way a
+/// request named it. Throws std::invalid_argument otherwise.
+std::shared_ptr<const AbliterationSettings> CombineAbliterationSettings(
+    std::vector<std::shared_ptr<const AbliterationSettings>> parts);
+/// The settings of `requested` (one entry per profile, each naming it in
+/// `profile` with its overrides) over the `loaded` profiles (load order):
+/// one profile resolves exactly as ResolveAbliterationSettings, several are
+/// put in load order and combined (CombineAbliterationSettings). An empty
+/// name selects the only loaded profile and only when it is the one entry.
+/// Throws std::invalid_argument on an unknown or repeated name.
+std::shared_ptr<const AbliterationSettings> ResolveAbliterationSet(
+    std::span<const AbliterationProfile* const> loaded,
+    std::span<const AbliterationOverrides> requested);
+/// An orthonormal basis (rows of `hidden` floats) of the span of `rows`, by
+/// modified Gram-Schmidt in FP64 (twice), dropping rows whose remainder is
+/// below 1e-6 of their norm. The projector onto it does not depend on the
+/// input order.
+[[nodiscard]] std::vector<float> OrthonormalizeDirections(
+    std::span<const float> rows, std::size_t hidden);
+/// The single-profile settings `settings` applies, in order: its `parts`, or
+/// itself.
+[[nodiscard]] std::vector<const AbliterationSettings*> AbliterationParts(
+    const AbliterationSettings& settings);
 
 /// `base` turned ON by a detector at `position` (R2 A1): the same
 /// projection, `dynamic_from` = position and an identity salted with the

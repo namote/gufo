@@ -2,6 +2,10 @@
 // sizing, K/V row management, rollback depth, KVarN planning, the side
 // stream and MTP cycle diagnostics, vision input and cancellation.
 
+#include <algorithm>
+#include <bit>
+#include <iterator>
+
 #include "src/models/qwen38_flash_next/runtime/executor_snapshot.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
@@ -315,24 +319,38 @@ std::uint32_t Session::ReleaseKvReservation() noexcept {
 
 void Session::ConfigureAbliteration(
     std::shared_ptr<const qwen::AbliterationSettings> settings) {
-  const auto* profile =
-      settings ? owner_->FindAbliteration(settings->profile) : nullptr;
-  if (settings && !profile)
-    throw std::invalid_argument("abliteration profile is not loaded");
-  if (settings && !qwen::AbliterationSettingsFit(*profile, *settings))
-    throw std::invalid_argument("abliteration settings do not fit the profile");
+  const auto parts = settings
+                         ? qwen::AbliterationParts(*settings)
+                         : std::vector<const qwen::AbliterationSettings*>{};
+  for (const auto* part : parts) {
+    const auto* profile = owner_->FindAbliteration(part->profile);
+    if (!profile)
+      throw std::invalid_argument("abliteration profile is not loaded");
+    if (!qwen::AbliterationSettingsFit(*profile, *part))
+      throw std::invalid_argument(
+          "abliteration settings do not fit the profile");
+  }
   if (settings && abliteration_ &&
       settings->identity == abliteration_->identity)
     return;
   if (!settings && !abliteration_)
     return;
+  std::vector<std::int16_t> sites;
   if (settings) {
-    const auto words =
-        settings->DeviceWords(owner_->AbliterationRow(settings->profile));
+    // One profile: its block at every site. Several: a block per distinct
+    // set of profiles active at a site (CombineAbliterationBlocks).
+    std::vector<float> words;
+    if (parts.size() == 1)
+      words = parts[0]->DeviceWords(owner_->AbliterationRow(parts[0]->profile));
+    else
+      owner_->CombineAbliterationBlocks(parts, &words, &sites);
     const auto bytes = words.size() * sizeof(float);
     if (!abliteration_device_) {
       void* data = nullptr;
-      if (hip::AllocateDevice(&data, bytes) != hipSuccess)
+      if (hip::AllocateDevice(&data, Executor::kAbliterationMaxBlocks *
+                                         qwen::AbliterationDeviceWords(
+                                             owner_->config().num_layers) *
+                                         sizeof(float)) != hipSuccess)
         throw std::runtime_error("abliteration settings allocation failed");
       abliteration_device_.reset(static_cast<float*>(data),
                                  [](float* p) { (void)hipFree(p); });
@@ -349,15 +367,18 @@ void Session::ConfigureAbliteration(
       throw std::runtime_error("abliteration settings upload failed");
   }
   if (!settings || !abliteration_ ||
-      settings->ResidualActive() != abliteration_->ResidualActive()) {
+      settings->ResidualActive() != abliteration_->ResidualActive() ||
+      !sites.empty() || !abliteration_sites_.empty()) {
     // ON/OFF changes which kernels a pass launches, and so do nonzero
-    // residual strengths (their projection and the unfused layer end).
+    // residual strengths (their projection and the unfused layer end) and
+    // a combination's sites (it launches only where a block projects).
     for (const auto& [key, graph] : graphs_)
       (void)hipGraphExecDestroy(graph);
     graphs_.clear();
     warmed_.clear();
   }
   abliteration_ = std::move(settings);
+  abliteration_sites_ = std::move(sites);
 }
 
 bool Executor::LoadAbliteration(AbliterationProfileSet profiles,
@@ -378,8 +399,15 @@ bool Executor::LoadAbliteration(AbliterationProfileSet profiles,
     AssignError(error, "invalid or repeated abliteration profile load");
     return false;
   }
+  // Several profiles may be ON together: reserve rows for the unions of
+  // their directions (CombineAbliterationBlocks).
+  const std::size_t combo = profiles.size() > 1 ? kAbliterationComboRows : 0;
+  if (rows + combo > qwen::kAbliterationRowMask) {
+    AssignError(error, "abliteration direction table is too large");
+    return false;
+  }
   std::vector<float> table;
-  table.reserve(rows * config().hidden_size);
+  table.reserve((rows + combo) * config().hidden_size);
   std::vector<std::uint32_t> offsets;
   for (const auto& profile : profiles) {
     offsets.push_back(
@@ -387,6 +415,8 @@ bool Executor::LoadAbliteration(AbliterationProfileSet profiles,
     table.insert(table.end(), profile->directions.begin(),
                  profile->directions.end());
   }
+  combo_first_ = static_cast<std::uint32_t>(rows);
+  table.resize((rows + combo) * config().hidden_size, 0.0F);
   void* data = nullptr;
   const auto bytes = table.size() * sizeof(float);
   if (!Check(hip::AllocateDevice(&data, bytes), "abliteration directions",
@@ -505,6 +535,107 @@ const qwen::AbliterationProfile* Executor::FindAbliteration(
     if (profile->name == name)
       return profile.get();
   return nullptr;
+}
+
+void Executor::CombineAbliterationBlocks(
+    std::span<const qwen::AbliterationSettings* const> parts,
+    std::vector<float>* words, std::vector<std::int16_t>* sites) const {
+  const auto layers = config().num_layers;
+  const auto hidden = std::size_t{config().hidden_size};
+  const auto stride = qwen::AbliterationDeviceWords(layers);
+  const std::uint32_t site_count = 3 * layers;
+  if (parts.size() > 16)
+    throw std::invalid_argument("too many abliteration profiles");
+  const auto strength = [&](const qwen::AbliterationSettings& part,
+                            std::uint32_t site) {
+    const auto layer = site % layers;
+    switch (site / layers) {
+      case 0:
+        return part.attention.at(layer);
+      case 1:
+        return part.mlp.at(layer);
+      default:
+        return part.residual.at(layer);
+    }
+  };
+  std::vector<std::uint32_t> masks;
+  words->clear();
+  sites->assign(site_count, -1);
+  for (std::uint32_t site = 0; site < site_count; ++site) {
+    std::uint32_t mask = 0;
+    for (std::size_t p = 0; p < parts.size(); ++p)
+      if (strength(*parts[p], site) > 0)
+        mask |= 1U << p;
+    if (mask == 0)
+      continue;
+    auto found = std::ranges::find(masks, mask);
+    if (found == masks.end()) {
+      if (masks.size() == kAbliterationMaxBlocks)
+        throw std::invalid_argument(
+            "abliteration: the profiles' strengths form too many site sets");
+      masks.push_back(mask);
+      found = std::prev(masks.end());
+      std::uint32_t row = 0, count = 0;
+      bool preserve = false;
+      if (std::popcount(mask) == 1) {
+        // One profile at these sites: its own rows, as when it is alone.
+        const auto& part = *parts[std::countr_zero(mask)];
+        row = AbliterationRow(part.profile) + part.direction_row;
+        count = part.direction_count;
+        preserve = part.preserve_norm;
+      } else {
+        // The union's orthonormal basis: a component the profiles share is
+        // removed once, whatever their order.
+        std::vector<float> gathered;
+        std::string key;
+        for (std::size_t p = 0; p < parts.size(); ++p) {
+          if (!(mask >> p & 1U))
+            continue;
+          const auto& part = *parts[p];
+          const auto* profile = FindAbliteration(part.profile);
+          const auto first = std::size_t{part.direction_row} * hidden;
+          gathered.insert(gathered.end(), profile->directions.begin() + first,
+                          profile->directions.begin() + first +
+                              part.direction_count * hidden);
+          key += part.profile + ":" + std::to_string(part.direction_row) + ":" +
+                 std::to_string(part.direction_count) + ";";
+          preserve = preserve || part.preserve_norm;
+        }
+        auto cached = combo_rows_.find(key);
+        if (cached == combo_rows_.end()) {
+          const auto basis = qwen::OrthonormalizeDirections(gathered, hidden);
+          const auto rank = static_cast<std::uint32_t>(basis.size() / hidden);
+          if (rank == 0 || rank > qwen::kAbliterationMaxDirections)
+            throw std::invalid_argument(
+                "abliteration: combined profiles span more than 8 "
+                "directions at one site");
+          if (combo_used_ + rank > kAbliterationComboRows)
+            throw std::runtime_error(
+                "abliteration: combined direction rows exhausted");
+          const auto first_row = combo_first_ + combo_used_;
+          if (hipMemcpy(abliteration_directions_ + first_row * hidden,
+                        basis.data(), basis.size() * sizeof(float),
+                        hipMemcpyHostToDevice) != hipSuccess)
+            throw std::runtime_error("combined abliteration upload failed");
+          combo_used_ += rank;
+          cached = combo_rows_.emplace(key, std::pair(first_row, rank)).first;
+        }
+        row = cached->second.first;
+        count = cached->second.second;
+      }
+      words->resize(words->size() + stride, 0.0F);
+      (*words)[(masks.size() - 1) * stride] = std::bit_cast<float>(
+          row | (count - 1) << qwen::kAbliterationCountShift |
+          (preserve ? qwen::kAbliterationPreserveNormBit : 0U));
+    }
+    const auto block = static_cast<std::size_t>(found - masks.begin());
+    // The strongest of the profiles active here.
+    float weight = 0;
+    for (std::size_t p = 0; p < parts.size(); ++p)
+      weight = std::max(weight, strength(*parts[p], site));
+    (*words)[block * stride + 1 + site] = weight;
+    (*sites)[site] = static_cast<std::int16_t>(block);
+  }
 }
 
 std::uint32_t Executor::AbliterationRow(std::string_view name) const {

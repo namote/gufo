@@ -126,6 +126,10 @@ public:
   /// (Session::ConfigureDynamicAbliteration); null when none is loaded.
   [[nodiscard]] std::shared_ptr<DynamicAbliteration> StartDynamicAbliteration()
       const;
+  /// The settings of the named loaded profiles with their defaults (load
+  /// order; combined when several), as an explicit request naming them.
+  [[nodiscard]] std::shared_ptr<const AbliterationSettings>
+  ResolveAbliterationDefaults(std::span<const std::string> names) const;
   [[nodiscard]] std::string ArtifactIdentity() const;
   /// Test statistic: batched MTP catch-ups whose cohort mixed two or more
   /// KV-only sessions with proposing ones (counted when received; models

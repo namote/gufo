@@ -338,6 +338,7 @@ std::unique_ptr<PrefillCheckpoint> Executor::MakePrefillCheckpoint(
   view.mtp_enabled_ = source.mtp_enabled_;
   view.abliteration_ = source.abliteration_;
   view.abliteration_device_ = source.abliteration_device_;
+  view.abliteration_sites_ = source.abliteration_sites_;
   view.attention_ = source.attention_;
   view.linear_.resize(source.linear_.size());
   view.blocks_ = c.compress_ratio > 0 && view.position_ > c.indexer_top_k

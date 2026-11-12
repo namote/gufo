@@ -291,13 +291,28 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
         !profiles.empty() &&
         !m->executor_->LoadAbliteration(std::move(profiles), error_msg))
       return nullptr;
-    // Each dynamic profile turns ON with its defaults.
+    // Each dynamic profile turns ON with its defaults, together with its
+    // companions (`trigger.with`, their defaults), exactly as an explicit
+    // request naming the same profiles would.
+    std::vector<const qwen::AbliterationProfile*> loaded;
     for (const auto& profile : m->executor_->AbliterationProfiles())
-      if (profile->trigger)
+      loaded.push_back(profile.get());
+    for (const auto* profile : loaded)
+      if (profile->trigger) {
+        std::vector<std::string> names{profile->name};
+        for (const auto& name : profile->trigger->with) {
+          if (name == profile->name)
+            throw std::invalid_argument("abliteration: profile '" + name +
+                                        "' names itself in trigger.with");
+          names.push_back(name);
+        }
+        // Checks every companion is loaded and the set combines.
+        (void)m->ResolveAbliterationDefaults(names);
         m->dynamic_candidates_.push_back(
             {profile->name, *m->executor_->DetectorColumn(profile->name),
              profile->trigger->threshold, profile->trigger->decode_threshold,
-             ResolveAbliterationSettings(*profile)});
+             std::move(names)});
+      }
     qwen::ValidateNativeSources(*m->reader_);
     if (m->mtp_reader_)
       qwen::ValidateNativeSources(*m->mtp_reader_);
@@ -561,10 +576,25 @@ Model::AbliterationProfiles() const {
   return executor_->AbliterationProfiles();
 }
 
+std::shared_ptr<const AbliterationSettings> Model::ResolveAbliterationDefaults(
+    std::span<const std::string> names) const {
+  std::vector<const qwen::AbliterationProfile*> loaded;
+  for (const auto& profile : executor_->AbliterationProfiles())
+    loaded.push_back(profile.get());
+  std::vector<qwen::AbliterationOverrides> set;
+  for (const auto& name : names)
+    set.push_back({.profile = name});
+  return qwen::ResolveAbliterationSet(loaded, set);
+}
+
 std::shared_ptr<DynamicAbliteration> Model::StartDynamicAbliteration() const {
-  return dynamic_candidates_.empty()
-             ? nullptr
-             : std::make_shared<DynamicAbliteration>(dynamic_candidates_);
+  if (dynamic_candidates_.empty())
+    return nullptr;
+  // The model outlives every session and its requests.
+  return std::make_shared<DynamicAbliteration>(
+      dynamic_candidates_, [this](std::span<const std::string> names) {
+        return ResolveAbliterationDefaults(names);
+      });
 }
 
 void Session::SetActivationObserver(ActivationObserver observer) {
@@ -577,8 +607,10 @@ void Session::ConfigureAbliteration(
   const auto* active = session_->Abliteration();
   if (settings ? active && active->identity == settings->identity : !active)
     return;
-  if (settings && !model_->executor_->FindAbliteration(settings->profile))
-    throw std::invalid_argument("abliteration profile is not loaded");
+  if (settings)
+    for (const auto* part : qwen::AbliterationParts(*settings))
+      if (!model_->executor_->FindAbliteration(part->profile))
+        throw std::invalid_argument("abliteration profile is not loaded");
   if (!tokens_.empty())
     Reset();
   session_->ConfigureAbliteration(std::move(settings));
