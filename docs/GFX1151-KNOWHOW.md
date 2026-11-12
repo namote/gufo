@@ -326,6 +326,25 @@
     - The ops test did not run: gpu-run `raw` mode with no arguments fails in pinned_rocm101.
     - fit_steering failed under `python3 -I` (no script directory on `sys.path`, so `import prepare` fails); it was rerun with `-s`. The coding direction magnitudes rise from 0.03 at L0 to 2.84 at L47, median 0.185.
     - The coding SPSA got a 400 because the training server started before coding.json existed. Rerun in stage 3.
+  - **Stages 3–5 (R5 coding steering; `build/b1/pass15/stage{3,4,5}.sh`, November 13).**
+    - **Ops test (env mode):** rc 0, all checks PASS, including OFF preservation, subspace and norm preservation, and D16 bit identity.
+    - **Coding SPSA** (additive, from 0, 120 steps, a 0.093, c 0.056, training server, 6,450 s): J started at −0.684 (margin −0.684, drop 0). Evaluations ranged from −0.706 to −0.764, and **the best was step 0, so all strengths stayed 0.** A negative margin means the model prefers its own answers to the references under teacher forcing, and no small move along the coding direction changes that. Teacher-forced margin is not a usable objective for this direction.
+    - **Zero strengths** (`coding-best.json`, the SPSA output) give answers byte-identical to OFF on all 45 eval+strength problems. The ordinary check is byte-identical too, because the profile file itself has zero strengths.
+    - **Fitted direction at k × the per-layer increments** (`coding-incr.json`: L0–L33 below 0.07, L34–L47 0.05–2.42, sum 10.5; the profile magnitudes peak at 7.67, not 2.84 as stage 2 said). Eval+strength, 45 problems, greedy, 600 tokens:
+
+      | Setting | All-pass | Tests % | Truncated | Median chars | Fixed/broken vs base |
+      |---|---:|---:|---:|---:|---|
+      | base (OFF) | 38/45 (84.4%) | 91.4 | 4 | 1356 | |
+      | k 0.25 | 37/45 | 93.7 | 3 | 1181 | 1 / 2 |
+      | **k 0.5** | **38/45** | **98.2** | **0** | 923 | 1 / 1 |
+      | mid only (L≤40, k 1) | 37/45 | 95.3 | 0 | 794 | 2 / 3 |
+      | k 1 | 13/45 | 35.9 | 4 | 525 | 0 / 25 |
+      | k 2 | 0/45 | 0 | 28 | 387 | 0 / 38 |
+      | k 4 | 0/45 | 0 | 45 | 600 | |
+
+      - At k ≥ 1 the output degenerates into repetition (for example "뒤 뒤 … … …" or runs of backticks).
+      - **The k 0.5 gain is length, not care.** Five of the seven differing problems are base answers truncated at 600 tokens (date-08, math-12, parse-08, parse-09) that k 0.5 finishes, and parse-03 gains 5 tests. date-05 and parse-13 each lose one test. All-pass is unchanged, and raise/isinstance markers stay ≥92%. The direction mostly encodes "shorter, like the references", which is the length confound expected in stage 1.
+    - **Not adopted.** To steer care rather than length, the pairs need length-matched references, or the direction must be fitted on edge-case code tokens only. Also judge with a larger token cap so truncation does not decide.
   - **Combined profile for the English Tiananmen gap** (not measured): `dynamic/profiles-pol-fnx2/` holds `pol-avg` (byte-identical to production's except `trigger.with: ["fnx"]`, threshold 0.7) and production's `fnx` (no trigger). A pol-avg detection then turns both ON; where both have strength at a site, they project onto the orthonormal union of their directions with the larger strength (docs/SERVER.md, several profiles).
   - **Threshold 0.7 for `dynamic/profiles-pol/`** (signed off; `fit_trigger.py --threshold 0.7`, the fitted 1.199 kept in the report as `fitted_threshold`, evidence `dynamic/fit-pol-0.7.json`):
     - Offline at 0.7: recall 92.1%; false positives 4.2% on the hard political controls (Gwangju, Tiananmen-like events elsewhere) and 1.3% on harmless prompts.
