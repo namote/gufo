@@ -234,7 +234,21 @@
   - Profiles: `dynamic/profiles-pol/` (pol-avg with trigger) and `dynamic/profiles-pol-fnx/` (also fnx with trigger). The sources in `~/.local/share/gufo/runtime-20261111g/` are unchanged.
   - The fnx detector uses `--topics none` (its advbench/harmbench/alpaca/xstest prompts have no cheap paraphrase map), so only the two thinking modes of one text share a fold.
   - Thresholds are for the last prompt row only. A `decode_threshold` for generated rows is still to be fitted from `max_scores` of ordinary generations in the GPU pass.
-  - No GPU check yet; R2-4 measures detection on the server.
+  - **GPU check (R2-4, `build/b1/ablit-pol-20261111/dyncheck/chain12.sh`, November 12):**
+    - Setup: production config (1M YaRN K4V4, 2 sessions), runtime-20261111h at 6c73c9bb. The dyn server loads `pol-avg` (with trigger) and `fnx` (without); the ctl server loads both without triggers. Greedy.
+    - **OFF cost: none measured.** Decode is 54.0 tok/s on both (ctl 54.29/54.15/53.99/53.51, dyn 54.13/54.13/54.05/53.75; 256 tokens, 4 runs).
+    - An exact repeat re-scores the last prompt token (1.2303 both times) and triggers both times.
+    - **False triggers: 0/38.** Ordinary prompt scores reach at most 0.33. The meth refusal prompt scores 1.08, still under 1.199.
+    - **Recall at 1.199: 43%** of 75 political prompts (politics 9/16, pairs 10/24, probes 9/25 censored). It is low in plain mode: the Taiwan prompts score 0.76–0.89.
+      - Recall by threshold: 0.6 → 82%, 0.7 → 80%, 0.8 → 74%, 1.0 → 58%.
+      - Controls: Berlin, Chernobyl, Gwangju, Watergate and Apollo score −0.6 to −0.4; 2·28 scores 0.69 and Taiwan 1996 1.03.
+      - Tank Man prompts score negative (−0.47 to −1.12) and are never caught.
+    - **Decode rows cannot carry a trigger.** The max decode-row score is 1.19 on ordinary answers against 1.23–1.51 on political ones, so the two overlap.
+    - **A1 quality fails.** Of 8 held-out political prompts, 3 triggered:
+      - The English Tiananmen answer stays a refusal ("As an AI assistant, I must emphasize…"): the first token comes from OFF.
+      - The Xinjiang answer keeps the PRC framing.
+      - Explicit ON answers all 8 candidly.
+      - The OFF prompt KV and the OFF first token decide the answer. A1 is not enough, so re-prefill ON (A2) is needed.
   - **Deploy note (R2-5):** `--abliteration-profiles DIR` replaced `--abliteration-profile FILE`. The pinned runtime (runtime-20261111b in `tools/serving/flash_next/gufo-server.py`) predates it. A deploy must bump `RUNTIME`, `GUFO_SHA256` and the option together, and create the profiles directory inside the new runtime (only profiles in it: every `*.json` there loads). Production runs its own copy of the launcher under `~/.local/share/gufo`.
 
 ## Flash-Next c03 1M YaRN K4V4 serving and time-shared scheduler, November 11, 2026 (deployed)
