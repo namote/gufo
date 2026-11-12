@@ -760,6 +760,16 @@ if (BUILD_TESTING)
       -s ${CMAKE_CURRENT_SOURCE_DIR}/tools/serving/flash_next -p "test_*.py")
   set_tests_properties(flash_next_serving_test PROPERTIES LABELS "cpu;tools" TIMEOUT 30)
 
+  # R5 coding-set evaluation tools (tools/qwen38_flash_next/coding_eval): code
+  # extraction, the test harness on our own snippets, scoring and the request
+  # contract; no Docker or server. Standard library only, POSIX process groups.
+  if (NOT WIN32)
+  add_test(NAME flash_next_coding_eval_test
+    COMMAND ${Python3_EXECUTABLE} -B -m unittest discover
+      -s ${CMAKE_CURRENT_SOURCE_DIR}/tools/qwen38_flash_next/coding_eval -p "test_*.py")
+  set_tests_properties(flash_next_coding_eval_test PROPERTIES LABELS "cpu;tools" TIMEOUT 60)
+  endif()
+
   # Pinned ROCm 10.1 Docker environment (tools/docker); standard library only.
   add_test(NAME pinned_rocm101_test
     COMMAND ${Python3_EXECUTABLE}
