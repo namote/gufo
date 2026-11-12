@@ -448,11 +448,12 @@ std::shared_ptr<const AbliterationSettings> ResolveAbliterationSet(
                            : CombineAbliterationSettings(std::move(parts));
 }
 
-std::vector<float> OrthonormalizeDirections(std::span<const float> rows,
-                                            std::size_t hidden) {
+OrthonormalRows OrthonormalizeDirections(std::span<const float> rows,
+                                         std::size_t hidden) {
   if (hidden == 0 || rows.size() % hidden != 0)
     throw std::invalid_argument("abliteration: invalid direction rows");
   std::vector<std::vector<double>> basis;
+  OrthonormalRows result;
   for (std::size_t r = 0; r < rows.size() / hidden; ++r) {
     std::vector<double> v(rows.begin() + r * hidden,
                           rows.begin() + (r + 1) * hidden);
@@ -470,17 +471,19 @@ std::vector<float> OrthonormalizeDirections(std::span<const float> rows,
     double norm = 0;
     for (double x : v)
       norm += x * x;
-    if (!(original > 0) || norm <= 1e-12 * original)
-      continue;  // in the span already
+    // Relative norm left below the tolerance: in the span already.
+    if (!(original > 0) || norm <= kAbliterationSpanTolerance *
+                                       kAbliterationSpanTolerance * original)
+      continue;
     for (double& x : v)
       x /= std::sqrt(norm);
     basis.push_back(std::move(v));
+    result.origins.push_back(static_cast<std::uint32_t>(r));
   }
-  std::vector<float> result;
-  result.reserve(basis.size() * hidden);
+  result.basis.reserve(basis.size() * hidden);
   for (const auto& q : basis)
     for (double x : q)
-      result.push_back(static_cast<float>(x));
+      result.basis.push_back(static_cast<float>(x));
   return result;
 }
 

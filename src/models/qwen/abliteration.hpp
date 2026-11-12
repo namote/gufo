@@ -105,6 +105,14 @@ ParseAbliterationDirectionKind(std::string_view name) noexcept;
 inline constexpr std::uint32_t kAbliterationRowMask = (1U << 24) - 1;
 inline constexpr std::uint32_t kAbliterationCountShift = 24;
 inline constexpr std::uint32_t kAbliterationPreserveNormBit = 1U << 27;
+/// Word 0 of a combination's block: each direction has its own strength per
+/// site, at words 1 + site * kAbliterationMaxDirections + j.
+inline constexpr std::uint32_t kAbliterationWeightedBit = 1U << 29;
+/// Words of one weighted block (1 + 3 * layers * kAbliterationMaxDirections).
+[[nodiscard]] constexpr std::size_t AbliterationWeightedWords(
+    std::uint32_t layers) noexcept {
+  return 1 + 3 * std::size_t{layers} * 8;
+}
 
 /// Immutable, model-bound runtime projection. No model weights are edited.
 /// JSON keeps this sidecar independent of the weight shard loader.
@@ -194,10 +202,13 @@ struct AbliterationSettings {
   /// collectors read the directions, so s = 1 zeroes that component there.
   std::vector<float> residual;
   /// Several profiles ON together (CombineAbliterationSettings): their own
-  /// single-profile settings in profile load order, each applied at every
-  /// site after the ones before it. Empty for one profile, whose members
-  /// above are the projection; a combination keeps only `profile` (the
-  /// names joined by '+'), `parts`, `dynamic_from` and `identity`.
+  /// single-profile settings in profile load order. At each site the
+  /// profiles with a strength there project together onto the orthonormal
+  /// basis of their directions, each basis row with the strength of the
+  /// profile that introduced it (rocm PlanAbliteration). Empty for one
+  /// profile, whose members above are the projection; a combination keeps
+  /// only `profile` (the names joined by '+'), `parts`, `dynamic_from` and
+  /// `identity`.
   std::vector<std::shared_ptr<const AbliterationSettings>> parts;
   /// Set on settings a dynamic profile turned ON in the middle of a request
   /// (DynamicAbliterationSettings): the session's first this-many tokens were
@@ -288,11 +299,18 @@ std::shared_ptr<const AbliterationSettings> CombineAbliterationSettings(
 std::shared_ptr<const AbliterationSettings> ResolveAbliterationSet(
     std::span<const AbliterationProfile* const> loaded,
     std::span<const AbliterationOverrides> requested);
-/// An orthonormal basis (rows of `hidden` floats) of the span of `rows`, by
-/// modified Gram-Schmidt in FP64 (twice), dropping rows whose remainder is
-/// below 1e-6 of their norm. The projector onto it does not depend on the
-/// input order.
-[[nodiscard]] std::vector<float> OrthonormalizeDirections(
+/// Gram-Schmidt over `rows` (each `hidden` floats) in the given order, in
+/// FP64 (twice): `basis` holds one orthonormal row per input row that keeps
+/// at least kAbliterationSpanTolerance of its norm after removing the rows
+/// before it, and `origins[j]` names the input row basis row j came from.
+/// A nearly parallel row (|cos| above about 0.99995 to the span before it)
+/// adds no row, so it never becomes a spurious extra direction.
+struct OrthonormalRows {
+  std::vector<float> basis;
+  std::vector<std::uint32_t> origins;
+};
+inline constexpr double kAbliterationSpanTolerance = 1e-2;
+[[nodiscard]] OrthonormalRows OrthonormalizeDirections(
     std::span<const float> rows, std::size_t hidden);
 /// The single-profile settings `settings` applies, in order: its `parts`, or
 /// itself.

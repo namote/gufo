@@ -301,6 +301,10 @@ private:
   /// no profile has a strength. Empty for one profile, whose single block
   /// runs at every site.
   std::vector<std::int16_t> abliteration_sites_;
+  /// Union rows this session's combination holds (Executor::AcquireUnion),
+  /// released when the settings change or the session ends. Never copied to
+  /// checkpoint views.
+  std::vector<std::string> abliteration_unions_;
   /// SetDetection and the last scored pass (DetectorPass).
   bool detect_{false};
   std::vector<float> detect_scores_;
@@ -411,19 +415,24 @@ public:
       std::string_view name) const;
   /// The first direction row of the loaded profile `name`.
   [[nodiscard]] std::uint32_t AbliterationRow(std::string_view name) const;
-  /// Device blocks of a combined session (several profiles ON).
-  static constexpr std::uint32_t kAbliterationMaxBlocks = 16;
-  /// Rows reserved for the orthonormalized unions of combined profiles.
-  static constexpr std::uint32_t kAbliterationComboRows = 64;
-  /// Several profiles ON together: one device block per distinct set of
-  /// profiles with a nonzero strength at a site. Each block projects onto
-  /// the orthonormal basis of the union of that set's directions (one
-  /// profile: its own rows) with, at each of its sites, the largest strength
-  /// any profile of the set has there, and preserves norms when any of them
-  /// does. Appends the blocks to `words` and each site's block to `sites`.
+  /// Rows reserved for the orthonormalized unions of combined profiles,
+  /// shared by reference count (AcquireUnion/ReleaseUnion).
+  static constexpr std::uint32_t kAbliterationUnionRows = 256;
+  /// Several profiles ON together: the weighted device blocks of
+  /// PlanAbliteration (qwen::kAbliterationWeightedBit, one strength per
+  /// direction and site), each kAbliterationWeightedWords long, with union
+  /// bases uploaded into reference-counted rows the session then holds
+  /// (`unions`). Fills `words` and each site's block (`sites`).
   void CombineAbliterationBlocks(
       std::span<const qwen::AbliterationSettings* const> parts,
-      std::vector<float>* words, std::vector<std::int16_t>* sites) const;
+      std::vector<float>* words, std::vector<std::int16_t>* sites,
+      std::vector<std::string>* unions) const;
+  /// The first row of the union basis `key`, uploading it on first use; each
+  /// call takes one reference. Throws std::runtime_error when the reserved
+  /// rows are exhausted.
+  std::uint32_t AcquireUnion(const std::string& key,
+                             std::span<const float> basis) const;
+  void ReleaseUnion(const std::string& key) const noexcept;
   /// The score column of profile `name`'s detector; empty for a profile
   /// without `trigger`.
   [[nodiscard]] std::optional<std::uint32_t> DetectorColumn(
@@ -848,7 +857,7 @@ private:
                ? nullptr
                : session.abliteration_device_.get() +
                      std::size_t(block) *
-                         qwen::AbliterationDeviceWords(config().num_layers);
+                         qwen::AbliterationWeightedWords(config().num_layers);
   }
   AbliterationSite AbliterationAt(const Session& session, std::uint32_t layer,
                                   bool mlp) const {
@@ -876,13 +885,16 @@ private:
                ? SiteAbliteration(session, 2 * config().num_layers + layer)
                : nullptr;
   }
-  /// Combined unions' rows by key (CombineAbliterationBlocks), uploaded once
-  /// into the reserved rows after the profiles'.
-  mutable std::unordered_map<std::string,
-                             std::pair<std::uint32_t, std::uint32_t>>
-      combo_rows_;
-  std::uint32_t combo_first_{0};
-  mutable std::uint32_t combo_used_{0};
+  /// Union bases in the reserved rows after the profiles': first row, row
+  /// count and references by key; `union_used_` marks occupied rows.
+  struct UnionRows {
+    std::uint32_t first;
+    std::uint32_t count;
+    std::uint32_t references;
+  };
+  mutable std::unordered_map<std::string, UnionRows> union_rows_;
+  mutable std::vector<bool> union_used_;
+  std::uint32_t union_first_{0};
   friend struct ExecutorTestAccess;
 
   enum class DiagnosticStage { kTarget, kDraft, kHead, kCatchUp };

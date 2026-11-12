@@ -581,23 +581,35 @@ together. One profile keeps exactly its single-profile identity, kernels and
 speed.
 
 How several profiles project. Profile directions are not orthogonal (the
-political and refusal directions share components), so at each site
-(attention and MLP writers, post-layer residual, per layer) the profiles
-with a nonzero strength there act through one projection onto the
-orthonormal basis of the union of their directions (modified Gram-Schmidt in
-FP64 on the host, once per request settings; rows already in the span are
-dropped). A shared component is then removed once, and the result does not
-depend on the profiles' order. The strength there is the largest of those
-profiles' strengths at that site, and norms are preserved when any of them
-preserves them. A site where one profile acts uses that profile's own
-directions and strength, exactly as when it is ON alone; a site where none
-acts runs no kernel. The union at one site may span at most 8 directions.
-Taking the largest strength means no profile removes less of its own
-direction than it asked for, and the shared part is removed once instead of
-twice; the alternative, each profile's strength on its own orthogonal
-complement, depends on the order the complements are taken in. Sets of
-profiles active at the same sites share one precomputed device block, so a
-pass runs one projection per site as with one profile. Only suppression
+political and refusal directions share components). At each site (attention
+and MLP writers, post-layer residual, per layer) the profiles with a nonzero
+strength there are ordered by descending strength (ties: load order) and
+their direction rows orthonormalized in that order by modified Gram-Schmidt
+in FP64 on the host, once per request settings. Each basis row keeps the
+strength of the profile that introduced it, and the site runs one
+projection `y -= sum_j s_j d_j (d_j . y)`. A component two profiles share is
+therefore removed once, at the stronger profile's strength, and every other
+direction at its own profile's strength: no profile's direction is projected
+with another profile's strength (a strength above 1 reflects, below 1 removes
+partly, as for that profile alone). A row whose remaining norm after the
+stronger profiles' rows is below 1% of its own (|cos| above about 0.99995 to
+their span) adds no direction, so a nearly parallel duplicate never becomes
+a spurious full-strength direction. A site where one profile acts uses that
+profile's own rows and strengths, exactly as when it is ON alone; a site
+where none acts runs no kernel. Norm preservation is per block: profiles
+acting at one site must agree on `preserve_norm`.
+
+Limits, checked before a request reaches a session: the union at one site
+spans at most 8 directions, and the distinct ordered sets of profiles over
+all sites form at most 16 blocks. An explicit request breaking them gets
+`invalid_abliteration` (400); a profile directory where a trigger's set, or
+the union of every trigger's set, breaks them fails to load; a detection
+whose set breaks them (impossible after that load check, kept as a guard)
+stays OFF with `"skipped": "union"`. Union bases live in 256 reserved
+direction rows shared by reference count: sessions running the same
+combination share rows, and rows are freed when the last session using them
+changes settings or ends, so only many distinct combinations active at once
+can exhaust them (that request then fails at admission). Only suppression
 exists: every strength is in [0, 4], and the rule is defined for removing
 directions only (additive steering profiles, R5, are not supported here).
 
@@ -707,7 +719,8 @@ detection, the switch point of a generated-row one, null without a crossing;
 `phase` is `prefill` or `decode` (null without one); `reprefill_tokens` is
 the number of prompt tokens prefilled again ON after a readmission (the
 rest came from an ON checkpoint; 0 otherwise); `skipped` is
-`"reprefill_cap"` when the cap kept a prompt-row detection OFF, else null.
+`"reprefill_cap"` when the cap kept a prompt-row detection OFF, `"union"`
+when the detected set could not run together, else null.
 
 Cache and continuation: a readmitted request is an explicit ON request from
 its readmission on, so its checkpoints are ON checkpoints that later ON and

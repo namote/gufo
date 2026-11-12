@@ -313,6 +313,24 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
              profile->trigger->threshold, profile->trigger->decode_threshold,
              std::move(names)});
       }
+    // Every set a detection can turn ON, and the union of all of them (all
+    // triggers crossing at once), must form device blocks: refuse a profile
+    // directory where one cannot, instead of failing a request.
+    std::vector<std::string> all;
+    const auto check = [&](std::span<const std::string> names) {
+      const auto settings = m->ResolveAbliterationDefaults(names);
+      if (settings->parts.size() > 1)
+        (void)PlanAbliteration(qwen::AbliterationParts(*settings),
+                               m->executor_->AbliterationProfiles());
+    };
+    for (const auto& candidate : m->dynamic_candidates_) {
+      check(candidate.profiles);
+      for (const auto& name : candidate.profiles)
+        if (std::ranges::find(all, name) == all.end())
+          all.push_back(name);
+    }
+    if (!all.empty())
+      check(all);
     qwen::ValidateNativeSources(*m->reader_);
     if (m->mtp_reader_)
       qwen::ValidateNativeSources(*m->mtp_reader_);

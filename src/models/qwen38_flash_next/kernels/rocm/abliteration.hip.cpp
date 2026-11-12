@@ -20,6 +20,77 @@ struct RowSettings {
 // updates. Spans count tokens; each token owns `streams` consecutive rows (1
 // for writer outputs, the HC streams for the residual), each projected and
 // norm-preserved on its own.
+// A combination's block (qwen::kAbliterationWeightedBit): count orthonormal
+// rows from the packed row, each with its own strength at this site,
+//   y -= sum_j w_j * d_j * dot(d_j, y),
+// every dot from the unprojected row (FP32 per-thread sums, fixed tree
+// reduction), then the norm restored when the block preserves norms.
+__device__ void WeightedRow(float* __restrict__ row,
+                            const float* __restrict__ directions,
+                            const float* __restrict__ settings,
+                            std::uint32_t weight_index, std::uint32_t hidden) {
+  constexpr unsigned kThreads = qwen::hip_detail::kAbliterationRowThreads;
+  constexpr unsigned kMax = qwen::kAbliterationMaxDirections;
+  __shared__ float partial[kMax + 2][kThreads];
+  const std::uint32_t word = __float_as_uint(settings[0]);
+  const std::uint32_t first = word & qwen::kAbliterationRowMask;
+  const unsigned count = ((word >> qwen::kAbliterationCountShift) & 7U) + 1;
+  const bool preserve = word & qwen::kAbliterationPreserveNormBit;
+  const float* weights = settings + 1 + (weight_index - 1) * kMax;
+  bool any = false;
+  for (unsigned j = 0; j < count; ++j)
+    any = any || weights[j] != 0;
+  if (!any)
+    return;
+  float sums[kMax + 1] = {};
+  for (std::uint32_t i = threadIdx.x; i < hidden; i += kThreads) {
+    const float y = row[i];
+    for (unsigned j = 0; j < count; ++j)
+      sums[j] += y * directions[std::size_t{first + j} * hidden + i];
+    sums[kMax] += y * y;
+  }
+  for (unsigned j = 0; j < count; ++j)
+    partial[j][threadIdx.x] = sums[j];
+  partial[kMax][threadIdx.x] = sums[kMax];
+  __syncthreads();
+  for (unsigned step = kThreads / 2; step; step >>= 1) {
+    if (threadIdx.x < step) {
+      for (unsigned j = 0; j < count; ++j)
+        partial[j][threadIdx.x] += partial[j][threadIdx.x + step];
+      partial[kMax][threadIdx.x] += partial[kMax][threadIdx.x + step];
+    }
+    __syncthreads();
+  }
+  float amounts[kMax];
+  for (unsigned j = 0; j < count; ++j)
+    amounts[j] = weights[j] * partial[j][0];
+  const float before = partial[kMax][0];
+  float after = 0;
+  for (std::uint32_t i = threadIdx.x; i < hidden; i += kThreads) {
+    float y = row[i];
+    for (unsigned j = 0; j < count; ++j)
+      y -= amounts[j] * directions[std::size_t{first + j} * hidden + i];
+    row[i] = y;
+    after += y * y;
+  }
+  if (!preserve)
+    return;
+  __syncthreads();
+  partial[kMax + 1][threadIdx.x] = after;
+  __syncthreads();
+  for (unsigned step = kThreads / 2; step; step >>= 1) {
+    if (threadIdx.x < step)
+      partial[kMax + 1][threadIdx.x] += partial[kMax + 1][threadIdx.x + step];
+    __syncthreads();
+  }
+  const float total = partial[kMax + 1][0];
+  if (total <= 0)
+    return;
+  const float scale = sqrtf(before / total);
+  for (std::uint32_t i = threadIdx.x; i < hidden; i += kThreads)
+    row[i] *= scale;
+}
+
 __global__ void Project(float* output, const float* directions,
                         RowSettings rows, std::uint32_t weight_index,
                         std::uint32_t hidden, std::uint32_t streams) {
@@ -32,6 +103,11 @@ __global__ void Project(float* output, const float* directions,
     }
   if (settings == nullptr)
     return;
+  if (__float_as_uint(settings[0]) & qwen::kAbliterationWeightedBit) {
+    WeightedRow(output + std::size_t{blockIdx.x} * hidden, directions, settings,
+                weight_index, hidden);
+    return;
+  }
   qwen::hip_detail::AbliterateRow(output + std::size_t{blockIdx.x} * hidden,
                                   directions, settings, weight_index, hidden);
 }

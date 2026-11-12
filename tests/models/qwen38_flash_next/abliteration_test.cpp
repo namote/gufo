@@ -23,6 +23,78 @@ void Require(bool b) {
   if (!b)
     throw std::runtime_error("abliteration contract failed");
 }
+namespace {
+namespace qwen = gufo::models::qwen;
+// Two one-layer profiles over hidden 3: "p" (direction x) and "r" (direction
+// (0.6, 0.8, 0), sharing x with p), with their own site strengths.
+std::shared_ptr<const qwen::AbliterationProfile> Fixture(
+    const std::string& name, std::vector<float> direction, float attention,
+    float residual, bool preserve = false) {
+  auto profile = std::make_shared<qwen::AbliterationProfile>();
+  profile->schema = 2;
+  profile->hidden = 3;
+  profile->layers = 1;
+  profile->directions = std::move(direction);
+  profile->direction_layer = 0;
+  profile->attention = {attention};
+  profile->mlp = {0};
+  profile->residual = {residual};
+  profile->preserve_norm = preserve;
+  profile->name = name;
+  profile->identity = std::string(64, name[0]);
+  return profile;
+}
+
+void TestPlan() {
+  const auto throws = [](const auto& f) {
+    try {
+      f();
+    } catch (const std::invalid_argument&) {
+      return true;
+    }
+    return false;
+  };
+  const q::AbliterationProfileSet loaded{
+      Fixture("p", {1, 0, 0}, 0.5F, 1.0F),
+      Fixture("r", {0.6F, 0.8F, 0}, 2.0F, 0)};
+  const auto p = q::ResolveAbliterationSettings(*loaded[0]);
+  const auto r = q::ResolveAbliterationSettings(*loaded[1]);
+  const std::vector<const qwen::AbliterationSettings*> parts{p.get(), r.get()};
+  const auto plan = q::PlanAbliteration(parts, loaded);
+  // Site 0 (attention): both act, r stronger: r's row first at 2, then p's
+  // remainder (the z-free part orthogonal to r) at 0.5. Site 2 (residual):
+  // p alone, its own row at 1. The MLP site runs nothing.
+  Require(plan.sites.size() == 3 && plan.sites[1] == -1 &&
+          plan.blocks.size() == 2);
+  const auto& both = plan.blocks[static_cast<std::size_t>(plan.sites[0])];
+  Require(both.count == 2 && both.basis.size() == 6 &&
+          std::abs(both.basis[0] - 0.6F) < 1e-6F &&
+          std::abs(both.basis[1] - 0.8F) < 1e-6F && both.weights[0] == 2.0F &&
+          both.weights[1] == 0.5F && both.weights[8 * 2] == 0);
+  const auto& alone = plan.blocks[static_cast<std::size_t>(plan.sites[2])];
+  Require(alone.basis.empty() && alone.profile == "p" && alone.count == 1 &&
+          alone.weights[8 * 2] == 1.0F && alone.weights[0] == 0);
+  // Norm preservation must agree where profiles share a site.
+  const q::AbliterationProfileSet mixed{Fixture("p", {1, 0, 0}, 1, 0, true),
+                                        Fixture("r", {0, 1, 0}, 1, 0)};
+  const auto mp = q::ResolveAbliterationSettings(*mixed[0]);
+  const auto mr = q::ResolveAbliterationSettings(*mixed[1]);
+  const std::vector<const qwen::AbliterationSettings*> disagree{mp.get(),
+                                                                mr.get()};
+  Require(throws([&] { (void)q::PlanAbliteration(disagree, mixed); }));
+  // Parallel directions: one row, the stronger profile's strength.
+  const q::AbliterationProfileSet same{Fixture("p", {1, 0, 0}, 1, 0),
+                                       Fixture("r", {1, 0, 0}, 0.5F, 0)};
+  const auto sp = q::ResolveAbliterationSettings(*same[0]);
+  const auto sr = q::ResolveAbliterationSettings(*same[1]);
+  const std::vector<const qwen::AbliterationSettings*> parallel{sp.get(),
+                                                                sr.get()};
+  const auto merged = q::PlanAbliteration(parallel, same);
+  Require(merged.blocks.size() == 1 && merged.blocks[0].count == 1 &&
+          merged.blocks[0].weights[0] == 1.0F);
+}
+}  // namespace
+
 int main() {
   const auto path =
       std::filesystem::temp_directory_path() /
@@ -367,17 +439,23 @@ int main() {
     // does not depend on the order.
     const std::vector<float> rows{1, 0, 0, 0.6F, 0.8F, 0, 0, 1, 0};
     const auto basis = qwen::OrthonormalizeDirections(rows, 3);
-    Require(basis.size() == 6 && std::abs(basis[0] - 1) < 1e-6F &&
-            std::abs(basis[4] - 1) < 1e-6F && std::abs(basis[2]) < 1e-6F);
+    Require(basis.basis.size() == 6 && std::abs(basis.basis[0] - 1) < 1e-6F &&
+            std::abs(basis.basis[4] - 1) < 1e-6F &&
+            std::abs(basis.basis[2]) < 1e-6F &&
+            basis.origins == std::vector<std::uint32_t>({0, 1}));
     const std::vector<float> reordered{0, 1, 0, 1, 0, 0, 0.6F, 0.8F, 0};
     const auto other = qwen::OrthonormalizeDirections(reordered, 3);
-    // Same projector: both bases span the xy plane.
-    Require(other.size() == 6 && std::abs(other[2]) < 1e-6F &&
-            std::abs(other[5]) < 1e-6F);
+    // Same span: both bases span the xy plane.
+    Require(other.basis.size() == 6 && std::abs(other.basis[2]) < 1e-6F &&
+            std::abs(other.basis[5]) < 1e-6F);
+    // A nearly parallel row (cos 0.99999) adds no spurious direction.
+    const std::vector<float> near{1, 0, 0, 0.99999F, 0.0044721F, 0};
+    Require(qwen::OrthonormalizeDirections(near, 3).origins.size() == 1);
     // A dynamic switch keeps the parts and salts the combined identity.
     const auto dynamic_set = qwen::DynamicAbliterationSettings(*set, 4);
     Require(dynamic_set->parts.size() == 2 &&
             dynamic_set->identity != set->identity);
   }
+  TestPlan();
   std::cout << "profile and cache identity PASS\n";
 }

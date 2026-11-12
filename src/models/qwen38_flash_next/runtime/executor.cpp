@@ -15,6 +15,9 @@ namespace gufo::models::qwen38_flash_next::rocm {
 constinit thread_local bool prefill_phase = false;
 
 Session::~Session() {
+  if (owner_)
+    for (const auto& key : abliteration_unions_)
+      owner_->ReleaseUnion(key);
   if (kv_pool_) {
     (void)hipStreamSynchronize(owner_->stream());
     ReleaseMappedKvBlocks();
@@ -336,19 +339,32 @@ void Session::ConfigureAbliteration(
   if (!settings && !abliteration_)
     return;
   std::vector<std::int16_t> sites;
+  std::vector<std::string> unions;
+  // Union rows of the new settings are taken before the old ones are let go,
+  // and given back if anything below fails.
+  struct UnionGuard {
+    const Executor* owner;
+    std::vector<std::string>* keys;
+    ~UnionGuard() {
+      if (keys)
+        for (const auto& key : *keys)
+          owner->ReleaseUnion(key);
+    }
+  } guard{owner_, &unions};
   if (settings) {
-    // One profile: its block at every site. Several: a block per distinct
-    // set of profiles active at a site (CombineAbliterationBlocks).
+    // One profile: its block at every site. Several: a weighted block per
+    // distinct ordered set of profiles active at a site
+    // (CombineAbliterationBlocks).
     std::vector<float> words;
     if (parts.size() == 1)
       words = parts[0]->DeviceWords(owner_->AbliterationRow(parts[0]->profile));
     else
-      owner_->CombineAbliterationBlocks(parts, &words, &sites);
+      owner_->CombineAbliterationBlocks(parts, &words, &sites, &unions);
     const auto bytes = words.size() * sizeof(float);
     if (!abliteration_device_) {
       void* data = nullptr;
-      if (hip::AllocateDevice(&data, Executor::kAbliterationMaxBlocks *
-                                         qwen::AbliterationDeviceWords(
+      if (hip::AllocateDevice(&data, kAbliterationMaxBlocks *
+                                         qwen::AbliterationWeightedWords(
                                              owner_->config().num_layers) *
                                          sizeof(float)) != hipSuccess)
         throw std::runtime_error("abliteration settings allocation failed");
@@ -379,6 +395,8 @@ void Session::ConfigureAbliteration(
   }
   abliteration_ = std::move(settings);
   abliteration_sites_ = std::move(sites);
+  // Keep the new union rows; release the old ones.
+  abliteration_unions_.swap(unions);
 }
 
 bool Executor::LoadAbliteration(AbliterationProfileSet profiles,
@@ -401,7 +419,7 @@ bool Executor::LoadAbliteration(AbliterationProfileSet profiles,
   }
   // Several profiles may be ON together: reserve rows for the unions of
   // their directions (CombineAbliterationBlocks).
-  const std::size_t combo = profiles.size() > 1 ? kAbliterationComboRows : 0;
+  const std::size_t combo = profiles.size() > 1 ? kAbliterationUnionRows : 0;
   if (rows + combo > qwen::kAbliterationRowMask) {
     AssignError(error, "abliteration direction table is too large");
     return false;
@@ -415,7 +433,8 @@ bool Executor::LoadAbliteration(AbliterationProfileSet profiles,
     table.insert(table.end(), profile->directions.begin(),
                  profile->directions.end());
   }
-  combo_first_ = static_cast<std::uint32_t>(rows);
+  union_first_ = static_cast<std::uint32_t>(rows);
+  union_used_.assign(combo, false);
   table.resize((rows + combo) * config().hidden_size, 0.0F);
   void* data = nullptr;
   const auto bytes = table.size() * sizeof(float);
@@ -539,103 +558,69 @@ const qwen::AbliterationProfile* Executor::FindAbliteration(
 
 void Executor::CombineAbliterationBlocks(
     std::span<const qwen::AbliterationSettings* const> parts,
-    std::vector<float>* words, std::vector<std::int16_t>* sites) const {
-  const auto layers = config().num_layers;
-  const auto hidden = std::size_t{config().hidden_size};
-  const auto stride = qwen::AbliterationDeviceWords(layers);
-  const std::uint32_t site_count = 3 * layers;
-  if (parts.size() > 16)
-    throw std::invalid_argument("too many abliteration profiles");
-  const auto strength = [&](const qwen::AbliterationSettings& part,
-                            std::uint32_t site) {
-    const auto layer = site % layers;
-    switch (site / layers) {
-      case 0:
-        return part.attention.at(layer);
-      case 1:
-        return part.mlp.at(layer);
-      default:
-        return part.residual.at(layer);
+    std::vector<float>* words, std::vector<std::int16_t>* sites,
+    std::vector<std::string>* unions) const {
+  const auto plan = PlanAbliteration(parts, abliteration_);
+  const auto stride = qwen::AbliterationWeightedWords(config().num_layers);
+  words->assign(plan.blocks.size() * stride, 0.0F);
+  for (std::size_t b = 0; b < plan.blocks.size(); ++b) {
+    const auto& block = plan.blocks[b];
+    std::uint32_t row = 0;
+    if (block.basis.empty()) {
+      row = AbliterationRow(block.profile) + block.row;
+    } else {
+      row = AcquireUnion(block.key, block.basis);
+      unions->push_back(block.key);
     }
-  };
-  std::vector<std::uint32_t> masks;
-  words->clear();
-  sites->assign(site_count, -1);
-  for (std::uint32_t site = 0; site < site_count; ++site) {
-    std::uint32_t mask = 0;
-    for (std::size_t p = 0; p < parts.size(); ++p)
-      if (strength(*parts[p], site) > 0)
-        mask |= 1U << p;
-    if (mask == 0)
-      continue;
-    auto found = std::ranges::find(masks, mask);
-    if (found == masks.end()) {
-      if (masks.size() == kAbliterationMaxBlocks)
-        throw std::invalid_argument(
-            "abliteration: the profiles' strengths form too many site sets");
-      masks.push_back(mask);
-      found = std::prev(masks.end());
-      std::uint32_t row = 0, count = 0;
-      bool preserve = false;
-      if (std::popcount(mask) == 1) {
-        // One profile at these sites: its own rows, as when it is alone.
-        const auto& part = *parts[std::countr_zero(mask)];
-        row = AbliterationRow(part.profile) + part.direction_row;
-        count = part.direction_count;
-        preserve = part.preserve_norm;
-      } else {
-        // The union's orthonormal basis: a component the profiles share is
-        // removed once, whatever their order.
-        std::vector<float> gathered;
-        std::string key;
-        for (std::size_t p = 0; p < parts.size(); ++p) {
-          if (!(mask >> p & 1U))
-            continue;
-          const auto& part = *parts[p];
-          const auto* profile = FindAbliteration(part.profile);
-          const auto first = std::size_t{part.direction_row} * hidden;
-          gathered.insert(gathered.end(), profile->directions.begin() + first,
-                          profile->directions.begin() + first +
-                              part.direction_count * hidden);
-          key += part.profile + ":" + std::to_string(part.direction_row) + ":" +
-                 std::to_string(part.direction_count) + ";";
-          preserve = preserve || part.preserve_norm;
-        }
-        auto cached = combo_rows_.find(key);
-        if (cached == combo_rows_.end()) {
-          const auto basis = qwen::OrthonormalizeDirections(gathered, hidden);
-          const auto rank = static_cast<std::uint32_t>(basis.size() / hidden);
-          if (rank == 0 || rank > qwen::kAbliterationMaxDirections)
-            throw std::invalid_argument(
-                "abliteration: combined profiles span more than 8 "
-                "directions at one site");
-          if (combo_used_ + rank > kAbliterationComboRows)
-            throw std::runtime_error(
-                "abliteration: combined direction rows exhausted");
-          const auto first_row = combo_first_ + combo_used_;
-          if (hipMemcpy(abliteration_directions_ + first_row * hidden,
-                        basis.data(), basis.size() * sizeof(float),
-                        hipMemcpyHostToDevice) != hipSuccess)
-            throw std::runtime_error("combined abliteration upload failed");
-          combo_used_ += rank;
-          cached = combo_rows_.emplace(key, std::pair(first_row, rank)).first;
-        }
-        row = cached->second.first;
-        count = cached->second.second;
-      }
-      words->resize(words->size() + stride, 0.0F);
-      (*words)[(masks.size() - 1) * stride] = std::bit_cast<float>(
-          row | (count - 1) << qwen::kAbliterationCountShift |
-          (preserve ? qwen::kAbliterationPreserveNormBit : 0U));
-    }
-    const auto block = static_cast<std::size_t>(found - masks.begin());
-    // The strongest of the profiles active here.
-    float weight = 0;
-    for (std::size_t p = 0; p < parts.size(); ++p)
-      weight = std::max(weight, strength(*parts[p], site));
-    (*words)[block * stride + 1 + site] = weight;
-    (*sites)[site] = static_cast<std::int16_t>(block);
+    float* out = words->data() + b * stride;
+    out[0] = std::bit_cast<float>(
+        row | (block.count - 1) << qwen::kAbliterationCountShift |
+        (block.preserve_norm ? qwen::kAbliterationPreserveNormBit : 0U) |
+        qwen::kAbliterationWeightedBit);
+    std::copy(block.weights.begin(), block.weights.end(), out + 1);
   }
+  *sites = plan.sites;
+}
+
+std::uint32_t Executor::AcquireUnion(const std::string& key,
+                                     std::span<const float> basis) const {
+  const auto hidden = std::size_t{config().hidden_size};
+  if (auto found = union_rows_.find(key); found != union_rows_.end()) {
+    ++found->second.references;
+    return found->second.first;
+  }
+  const auto count = static_cast<std::uint32_t>(basis.size() / hidden);
+  // First fit among the reserved rows.
+  std::uint32_t first = 0;
+  for (;; ++first) {
+    if (first + count > union_used_.size())
+      throw std::runtime_error(
+          "abliteration: union rows exhausted (too many distinct profile "
+          "combinations active at once)");
+    bool free = true;
+    for (std::uint32_t r = 0; r < count && free; ++r)
+      free = !union_used_[first + r];
+    if (free)
+      break;
+  }
+  if (hipMemcpy(
+          abliteration_directions_ + std::size_t{union_first_ + first} * hidden,
+          basis.data(), basis.size() * sizeof(float),
+          hipMemcpyHostToDevice) != hipSuccess)
+    throw std::runtime_error("combined abliteration upload failed");
+  for (std::uint32_t r = 0; r < count; ++r)
+    union_used_[first + r] = true;
+  union_rows_.emplace(key, UnionRows{union_first_ + first, count, 1});
+  return union_first_ + first;
+}
+
+void Executor::ReleaseUnion(const std::string& key) const noexcept {
+  const auto found = union_rows_.find(key);
+  if (found == union_rows_.end() || --found->second.references != 0)
+    return;
+  for (std::uint32_t r = 0; r < found->second.count; ++r)
+    union_used_[found->second.first - union_first_ + r] = false;
+  union_rows_.erase(found);
 }
 
 std::uint32_t Executor::AbliterationRow(std::string_view name) const {

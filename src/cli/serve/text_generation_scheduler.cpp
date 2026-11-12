@@ -1010,7 +1010,8 @@ struct TextGenerationScheduler::Impl {
     else if (request->readmitted_abliteration) {
       // Capped: the OFF run's own report (with its generated-row scores).
       request->result.abliteration->position.reset();
-      request->result.abliteration->skipped = "reprefill_cap";
+      request->result.abliteration->skipped =
+          request->readmitted_abliteration->skipped;
     }
     const auto cache_commit =
         finish_reason == TextGenerationBackend::FinishReason::kStopSequence
@@ -1564,7 +1565,24 @@ struct TextGenerationScheduler::Impl {
   // longest ON checkpoint and prefills the rest ON in ordinary bounded steps.
   // Returns whether the request left its lease.
   bool Readmit(const std::shared_ptr<ScheduledRequest>& request) {
-    auto context = request->runner_request.readmission();
+    std::shared_ptr<const TextPromptContext> context;
+    try {
+      context = request->runner_request.readmission();
+    } catch (const std::invalid_argument& error) {
+      // The detected set cannot run together (PlanAbliteration): stay OFF
+      // and report it, as the re-prefill cap does.
+      auto report = request->runner_request.abliteration_report();
+      if (!report)
+        report.emplace();
+      report->position.reset();
+      report->skipped = "union";
+      request->readmitted_abliteration = std::move(report);
+      Logger::Warn(
+          "abliteration",
+          "event=readmit_skipped request=" + std::to_string(request->id) +
+              " reason=union detail=\"" + error.what() + "\"");
+      return false;
+    }
     if (!context)
       return false;
     auto report = request->runner_request.abliteration_report();

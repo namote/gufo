@@ -403,8 +403,44 @@ void DetectorScores() {
   }
 }
 
+// A combination's weighted block (kAbliterationWeightedBit): two
+// orthonormal rows with their own strengths at the site, against FP64.
+void WeightedRows() {
+  constexpr unsigned kHidden = 257, kRows = 3;
+  std::vector<float> directions(3 * kHidden, 0.f);
+  directions[1 * kHidden + 0] = 1.f;  // row 1: e0
+  directions[2 * kHidden + 1] = 1.f;  // row 2: e1
+  // One layer: word 0 then 3 sites x 8 weights; attention site weights
+  // 2 (row 1) and 0.5 (row 2).
+  std::vector<float> settings(1 + 3 * 8, 0.f);
+  settings[0] = std::bit_cast<float>(1U | 1U << 24 | (1U << 29));
+  settings[1] = 2.f;
+  settings[2] = .5f;
+  std::vector<float> input(kRows * kHidden);
+  for (unsigned i = 0; i < input.size(); ++i)
+    input[i] = std::cos(float(i) * .29f);
+  float* d = Upload(directions);
+  float* w = Upload(settings);
+  float* y = Upload(input);
+  q::AbliterateRows(y, d, w, 0, false, 1, kRows, kHidden, nullptr);
+  std::vector<float> result(input.size());
+  Check(hipMemcpy(result.data(), y, result.size() * sizeof(float),
+                  hipMemcpyDeviceToHost));
+  for (unsigned r = 0; r < kRows; ++r)
+    for (unsigned h = 0; h < kHidden; ++h) {
+      const double x = input[r * kHidden + h];
+      const double want = h == 0 ? x - 2.0 * x : h == 1 ? x - .5 * x : x;
+      if (std::abs(result[r * kHidden + h] - want) > 1e-5)
+        throw std::runtime_error("weighted block mismatch");
+    }
+  Check(hipFree(d));
+  Check(hipFree(w));
+  Check(hipFree(y));
+}
+
 int main() {
   DetectorScores();
+  WeightedRows();
   for (unsigned hidden : {3u, 255u, 256u, 257u, 2560u}) {
     // Row 1 is the session's direction; row 0 must never be read.
     std::vector<float> directions(2 * hidden, 1e30f);

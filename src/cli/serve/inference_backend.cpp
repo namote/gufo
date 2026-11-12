@@ -3089,10 +3089,24 @@ public:
 
   [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
       const ChatRequest& request) const override {
-    return SelectAbliteration(
+    auto prepared = SelectAbliteration(
         PrepareQwenPrompt(request, model_->tokenizer(), model_->VisionEncoder(),
                           max_context_, image_cache_),
         request, ListProfiles(model_->AbliterationProfiles()), true);
+    // An unworkable combination is a 400 here, not a failure at admission.
+    ValidateCombination(prepared.context.get());
+    return prepared;
+  }
+
+  /// Plans a combination's device blocks (PlanAbliteration) without a
+  /// session: throws std::invalid_argument for a set no session can run.
+  void ValidateCombination(const TextPromptContext* context) const {
+    const auto* selected =
+        dynamic_cast<const AbliterationPromptContext*>(context);
+    if (selected && selected->settings->parts.size() > 1)
+      (void)models::qwen38_flash_next::PlanAbliteration(
+          models::qwen::AbliterationParts(*selected->settings),
+          model_->AbliterationProfiles());
   }
 
   [[nodiscard]] bool SupportsScoring() const override { return true; }
@@ -3205,8 +3219,12 @@ public:
     for (const auto& name : report->triggered)
       set.push_back({.profile = name});
     const auto loaded = ListProfiles(model_->AbliterationProfiles());
-    return AbliterationContext(
+    auto on = AbliterationContext(
         context, models::qwen::ResolveAbliterationSet(loaded, set));
+    // std::invalid_argument: the scheduler keeps the request OFF
+    // (`skipped: "union"`).
+    ValidateCombination(on.get());
+    return on;
   }
 
   [[nodiscard]] std::optional<AbliterationReport> DynamicAbliteration(
