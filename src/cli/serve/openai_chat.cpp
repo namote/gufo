@@ -39,6 +39,37 @@
 
 namespace gufo::server {
 
+namespace {
+/// Gufo extension: a request's dynamic abliteration (`abliteration` in
+/// responses), present only when detection ran.
+void AddAbliterationReport(const TextGenerationBackend::Result& result,
+                           json::Value& out) {
+  if (!result.abliteration)
+    return;
+  const auto& report = *result.abliteration;
+  json::Value value = json::Value::object();
+  json::Value triggered = json::Value::array();
+  for (const auto& name : report.triggered)
+    triggered.push_back(name);
+  value["triggered"] = std::move(triggered);
+  const auto scores = [](const auto& pairs) {
+    json::Value object = json::Value::object();
+    for (const auto& [name, score] : pairs)
+      object[name] = static_cast<double>(score);
+    return object;
+  };
+  value["scores"] = scores(report.scores);
+  value["max_scores"] = scores(report.max_scores);
+  value["position"] =
+      report.position
+          ? json::Value(static_cast<unsigned long long>(*report.position))
+          : json::Value(nullptr);
+  value["phase"] =
+      report.phase.empty() ? json::Value(nullptr) : json::Value(report.phase);
+  out["abliteration"] = std::move(value);
+}
+}  // namespace
+
 std::optional<ReasoningEffort> ParseReasoningEffortName(
     std::string_view value) {
   if (value == "minimal") {
@@ -2950,6 +2981,7 @@ public:
     usage["total_tokens"] = result.prompt_tokens + result.completion_tokens;
     response_["usage"] = std::move(usage);
     response_["timings"] = GenerationTimings(result);
+    AddAbliterationReport(result, response_);
     response_["cache_persist"] = cache_persist_;
     Lifecycle(limited || unfinished_tool_ ? "response.incomplete"
                                           : "response.completed");
@@ -3110,6 +3142,7 @@ HttpResponse NonStreamingResponse(
   response["choices"] = std::move(choices);
   response["usage"] = Usage(result);
   response["timings"] = GenerationTimings(result);
+  AddAbliterationReport(result, response);
   response["cache_persist"] = request.chat.cache_persist;
   RecordServerMetrics(result);
 
@@ -3281,6 +3314,7 @@ HttpResponse StreamingResponse(
               // of the optional OpenAI usage chunk. Proxies need these even
               // when a client does not request stream_options.include_usage.
               terminal_chunk["timings"] = GenerationTimings(result);
+              AddAbliterationReport(result, terminal_chunk);
               terminal_chunk["cache_persist"] = request.chat.cache_persist;
               if (!writer(Sse(terminal_chunk))) {
                 return;
@@ -4004,6 +4038,7 @@ public:
     usage["cache_read_input_tokens"] = result.cached_prompt_tokens;
     message_["usage"] = usage;
     message_["timings"] = GenerationTimings(result);
+    AddAbliterationReport(result, message_);
     auto delta = Event("message_delta");
     delta["delta"]["stop_reason"] = message_["stop_reason"];
     delta["delta"]["stop_sequence"] = message_["stop_sequence"];

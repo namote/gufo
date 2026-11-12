@@ -67,6 +67,22 @@ struct AbliterationInfo {
   std::optional<float> trigger_threshold;
 };
 
+/// A request's dynamic abliteration (`abliteration` in its response): the
+/// profiles detection turned ON, the detector scores and where it switched.
+struct AbliterationReport {
+  std::vector<std::string> triggered;
+  /// Per dynamic profile: the score of the row that turned it ON, else of
+  /// the last prompt row.
+  std::vector<std::pair<std::string, float>> scores;
+  /// Per dynamic profile: the largest score of any committed row.
+  std::vector<std::pair<std::string, float>> max_scores;
+  /// The first token position computed ON (the prompt length when the last
+  /// prompt row crossed); empty while OFF.
+  std::optional<std::size_t> position;
+  /// "prefill" or "decode"; empty while OFF.
+  std::string phase;
+};
+
 /// Client-facing message for a GPU context that can no longer execute work.
 inline constexpr const char* kDeviceLostMessage =
     "GPU context lost; restart required";
@@ -299,6 +315,8 @@ public:
     std::size_t cache_checkpoint_tokens{0};
     FinishReason finish_reason{FinishReason::kStop};
     std::string stop_sequence;
+    /// Set when the request ran dynamic abliteration detection.
+    std::optional<AbliterationReport> abliteration;
     bool incremental_prefill_supported{false};
     bool cache_hit{false};
     bool cache_disk_hit{false};

@@ -91,6 +91,11 @@ struct AbliterationPromptContext final : QwenImageContext {
   std::shared_ptr<const models::qwen::AbliterationSettings> settings;
 };
 
+/// A Flash-Next request without an `abliteration` member while a profile
+/// with a `trigger` is loaded: it starts OFF (the OFF cache identity) and
+/// its detectors may turn one profile ON mid-request (R2 A1).
+struct DynamicAbliterationContext final : QwenImageContext {};
+
 /// The profiles a model holds, in load order; Qwen3.8-27B holds at most one.
 using AbliterationProfileList =
     std::vector<const models::qwen::AbliterationProfile*>;
@@ -274,9 +279,23 @@ std::shared_ptr<const models::qwen::vision::Prompt> QwenPrompt(
 /// state.
 TextPreparedPrompt SelectAbliteration(TextPreparedPrompt result,
                                       const ChatRequest& request,
-                                      const AbliterationProfileList& profiles) {
-  if (!request.abliteration)
+                                      const AbliterationProfileList& profiles,
+                                      bool dynamic = false) {
+  if (!request.abliteration) {
+    // An explicit OFF, and scoring (dynamic false), never detect.
+    if (!dynamic || request.abliteration_specified ||
+        std::ranges::none_of(profiles,
+                             [](const auto* p) { return bool(p->trigger); }))
+      return result;
+    auto context = std::make_shared<DynamicAbliterationContext>();
+    if (result.context) {
+      context->prompt = QwenPrompt(result.context);
+      context->cache_identity = result.context->cache_identity;
+      context->cache_prefixes = result.context->cache_prefixes;
+    }
+    result.context = std::move(context);
     return result;
+  }
   if (profiles.empty())
     throw std::invalid_argument(
         "abliteration profile is not loaded; prepare it first");
@@ -3065,7 +3084,7 @@ public:
     return SelectAbliteration(
         PrepareQwenPrompt(request, model_->tokenizer(), model_->VisionEncoder(),
                           max_context_, image_cache_),
-        request, ListProfiles(model_->AbliterationProfiles()));
+        request, ListProfiles(model_->AbliterationProfiles()), true);
   }
 
   [[nodiscard]] bool SupportsScoring() const override { return true; }
@@ -3150,6 +3169,36 @@ public:
     auto& session = RequireQwenFlashNextState(state).session();
     session.ConfigureAbliteration(AbliterationSelected(context));
     session.ConfigureVision(QwenPrompt(context));
+    // Detection only for a request that left `abliteration` out; an
+    // explicit ON or OFF and scoring requests run none.
+    session.ConfigureDynamicAbliteration(
+        dynamic_cast<const DynamicAbliterationContext*>(context.get())
+            ? model_->StartDynamicAbliteration()
+            : nullptr);
+  }
+
+  [[nodiscard]] std::optional<AbliterationReport> DynamicAbliteration(
+      TextRunnerState& state) const override {
+    const auto report =
+        RequireQwenFlashNextState(state).session().DynamicReport();
+    if (!report)
+      return std::nullopt;
+    return AbliterationReport{
+        .triggered = report->triggered,
+        .scores = report->scores,
+        .max_scores = report->max_scores,
+        .position = report->position
+                        ? std::optional<std::size_t>(*report->position)
+                        : std::nullopt,
+        .phase = report->phase,
+    };
+  }
+
+  [[nodiscard]] bool LiveStateReusable(
+      const TextRunnerState& state) const override {
+    const auto* active =
+        RequireQwenFlashNextState(state).session().ActiveAbliteration();
+    return !(active && active->dynamic_from);
   }
 
   [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(

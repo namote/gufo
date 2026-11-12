@@ -493,12 +493,17 @@ or claim to enforce a reasoning-token budget.
 
 ### Runtime abliteration
 
-Qwen3.8-27B and Qwen3.8-Flash-Next support an optional, request-selectable
-runtime projection. `--abliteration-profile FILE` loads one model-bound
-profile; nothing is discovered beside the model, and other models reject the
-option. Chat Completions, Responses and Messages requests select it with
-`{"abliteration":{"enabled":true,"profile":"default"}}`; omitting the object or
-`"enabled":false` is OFF. An ON request may also set its own settings:
+Qwen3.8-27B and Qwen3.8-Flash-Next support an optional runtime projection.
+`--abliteration-profiles DIR` loads every `*.json` file directly in DIR
+(at most 8) as a model-bound profile named after its file (`pol-avg.json` is
+`pol-avg`); nothing is discovered beside the model, other models reject the
+option, and Qwen3.8-27B takes exactly one profile. Chat Completions,
+Responses and Messages requests select a profile with
+`{"abliteration":{"enabled":true,"profile":"pol-avg"}}` (`profile` may be
+omitted when one profile is loaded); `"enabled":false` is OFF. A request
+without the object is OFF unless a loaded profile has a `trigger`
+([dynamic abliteration](#dynamic-abliteration)). An ON request may also set
+its own settings:
 `direction_layer` (an integer in [0, layers), only with a
 `gufo-abliteration-v2` profile, which carries every layer's direction), and
 `attention`, `mlp` and `residual`, each one number for every layer or an
@@ -528,24 +533,100 @@ edits weights instead). Profiles without these members behave as before:
 `mean_diff`, one direction, no norm preservation, for example
 `{"abliteration":{"enabled":true,"residual":1,"direction_kind":"projected",
 "directions":4,"preserve_norm":true}}`.
-Raw completions do not accept it, and an unloaded profile,
-unknown member, invalid setting or setting sent with `"enabled":false` returns
-`invalid_abliteration`. ON and OFF requests, and different profiles or
-settings, never share cached or continued state; OFF behaves and caches exactly
-as without a profile. Changing settings needs no reload; only switching a
+Raw completions do not accept it, and an unloaded or unknown profile,
+unknown member, invalid setting, or `profile` or a setting sent with
+`"enabled":false` returns `invalid_abliteration`; with several profiles
+loaded an ON request must name one. ON and OFF requests, and different
+profiles or settings, never share cached or continued state; OFF behaves and
+caches exactly as without a profile. Changing settings needs no reload; only switching a
 session between ON and OFF, or between all-zero and nonzero `residual`
 strengths, re-records its graphs; kind, count and norm preservation are values
-in the session's device settings like the strengths. `GET /props` reports the
-loaded profile as `abliteration`: `schema`, `identity`, `layers`, the
+in the session's device settings like the strengths. `GET /props` lists the
+loaded profiles in `abliteration.profiles`, in file name order; when exactly
+one is loaded its members also sit directly in `abliteration`. Each entry
+has `profile` (the name), `schema`, `identity`, `layers`, the
 `direction_layers` a request may name (empty for v1), the default
 `direction_layer` (null for v1), the default `attention`, `mlp` and `residual`
 (one number when uniform), the `direction_kinds` a request may name, the
 default `direction_kind`, `max_directions` (the stored rank), the default
 `directions` count, `preserve_norm`, `subspace_method` (`pca`, `som` or null)
-and `max_strength`; never the direction vectors. Preparation,
-qualification and the automatic strength search are model-specific: see
+`max_strength` and `trigger` (`{"layer", "threshold"}`, or null); never the
+direction vectors. Preparation, qualification and the automatic strength
+search are model-specific: see
 [Qwen3.8-27B](models/qwen3.8-27b/ABLITERATION.md) and
 [Flash-Next](models/qwen3.8-flash-next/ABLITERATION.md).
+
+#### Dynamic abliteration
+
+On Flash-Next a profile may carry a detector, the optional v2 member
+`trigger` written by `tools/qwen38_flash_next/abliteration/fit_trigger.py`:
+
+```json
+{"trigger": {"schema": "gufo-abliteration-trigger-v1", "layer": 38,
+             "readout": "last-prompt-token-post-layer-hc-mean-fp32-v1",
+             "direction": "<base64 little-endian float32, hidden values>",
+             "threshold": 1.199, "fit": {}}}
+```
+
+`direction` is a unit vector; `readout` must be the collector readout of the
+profile's placement; `fit` (the fit report) and other members are ignored.
+Profiles without `trigger` are only turned ON by requests, as above.
+
+A Chat Completions, Responses or Messages request **without** an
+`abliteration` member starts OFF, as an OFF request with the same cache
+identity. While it runs, each trunk pass also scores every loaded
+detector: the score is `<h, direction>`, where `h` is the post-layer residual
+of the detector's layer averaged over the four HC streams, read at the same
+point as the activation collector (after the layer's last combine and any
+residual projection; `rocm::Executor::ForwardBody` and
+`tools/qwen38_flash_next/abliteration/collect.cpp`). A prefill pass scores
+its last row (the last prompt token once the prompt is complete); decode,
+batched decode, MTP verification and wide copy verification score every row,
+and only rows the session keeps count (rejected drafts do not). The scores
+travel with the pass's logits download, with no extra synchronization. A
+server without a dynamic profile runs no detector kernel.
+
+Before the next decode pass, the first kept row whose score exceeds a
+profile's `threshold` turns that profile ON with its defaults, sticky for the
+rest of the request (A1). The prompt state computed OFF is kept: a detection
+on the last prompt row turns the profile ON from the first generated token's
+pass on (so the first generated token itself was sampled OFF), and a
+detection during decoding turns it ON from the following pass. One profile is
+ON at a time: when several cross on one row, the largest margin
+(`score − threshold`) wins, and detection stops once a profile is ON.
+
+A request with an `abliteration` member never detects: `"enabled":true` is
+the explicit ON above and `"enabled":false` is a plain OFF. Scoring requests
+(`score_assistant`) use only an explicit member and never detect, so training
+scores stay reproducible.
+
+A request that ran detection reports it in the response (non-streaming Chat
+Completions, the terminal streaming chunk, Responses and Messages):
+
+```json
+{"abliteration": {"triggered": ["pol-avg"],
+                  "scores": {"pol-avg": 1.83},
+                  "max_scores": {"pol-avg": 1.83},
+                  "position": 412, "phase": "prefill"}}
+```
+
+`triggered` lists the profile turned ON (empty while OFF); `scores` holds the
+scores of the row that turned it ON, or else of the last prompt row;
+`max_scores` the largest score of any kept row; `position` is the first token
+position computed ON (the prompt length for `prefill`; null while OFF) and
+`phase` is `prefill` or `decode` (null while OFF).
+
+Cache and continuation: the request's checkpoints up to `position` are OFF
+states and are shared with OFF requests. A state that includes tokens
+computed after the switch carries an identity salted with the profile
+settings and the switch position, so no OFF request, explicit ON request or
+other switch point restores it; the request's live frontier is not kept for
+the next turn. The next turn therefore continues from the last OFF checkpoint
+(normally its prompt), prefills the previous answer OFF and detects afresh.
+Reusing the switched state instead would hand the next request an answer
+whose state was computed ON while its own request starts OFF. An exact repeat
+of a cached prompt skips the prefill pass and so its prompt-row detection;
+such a request detects from its decode rows only.
 
 Diagnostic telemetry is limited to status, token counts, timing, and
 cancellation state. It must not contain prompt text, model paths, machine
@@ -1217,7 +1298,9 @@ the server scores that content token by token after the rest of the
 conversation (teacher forcing) instead of generating. Each token's value is
 the same raw full-vocabulary log-softmax as generated-token `logprobs`
 (no temperature, penalties, Han scale or constraints; below -9999 serialized
-as -9999). The request's `abliteration` object applies as in generation.
+as -9999). The request's `abliteration` object applies as in generation;
+without one, scoring is OFF and runs no
+[dynamic detection](#dynamic-abliteration).
 
 The conversation before the scored message is rendered as for a new reply
 with thinking disabled: the prompt ends with the template's empty thinking
@@ -1644,8 +1727,8 @@ limit is set.
 Its Gufo `han_scale` is the default Han scale, 1 on models that ignore it,
 and `han_scale_scope` its default scope, `all` on those models.
 `modalities.vision` is true only when a vision encoder
-loaded. Gufo's `abliteration` object is present only with a loaded
-[runtime abliteration](#runtime-abliteration) profile. Gufo's `hc_mode` is
+loaded. Gufo's `abliteration` object is present only with loaded
+[runtime abliteration](#runtime-abliteration) profiles. Gufo's `hc_mode` is
 Flash-Next's `--hc-mode`, absent on other models. Fields the server cannot report are omitted rather than sent as zero.
 
 `POST /apply-template` takes a Chat Completions body and returns

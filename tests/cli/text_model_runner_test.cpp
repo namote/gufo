@@ -32,6 +32,7 @@ using gufo::tokenization::kImStart;
 
 namespace {
 
+using gufo::server::AbliterationReport;
 using gufo::server::ChatRequest;
 using gufo::server::TextDecodeSelection;
 using gufo::server::TextExecutionPlan;
@@ -911,6 +912,69 @@ void TestSnapshotRetentionUsesPromptBoundary() {
     Expect(extension.SelectNext().token == 90,
            "extended reuse preserves the rebuilt decode frontier");
     extension.Invalidate();
+  }
+}
+
+// A runner whose dynamic abliteration turns ON after the first decoded
+// token: the prompt checkpoint (computed OFF) is retained, the live frontier
+// is not, and the report reaches the request.
+class SwitchingRunner final : public SnapshotRunner {
+public:
+  using SnapshotRunner::SnapshotRunner;
+  [[nodiscard]] bool LiveStateReusable(
+      const TextRunnerState& state) const override {
+    return RequireFakeState(state).decode_count == 0;
+  }
+  [[nodiscard]] std::optional<AbliterationReport> DynamicAbliteration(
+      TextRunnerState& state) const override {
+    const auto& fake = RequireFakeState(state);
+    AbliterationReport report;
+    report.scores = {{"pol", 1.5F}};
+    report.max_scores = {{"pol", 1.5F}};
+    if (fake.decode_count > 0) {
+      report.triggered = {"pol"};
+      report.position = fake.position - fake.decode_count + 1;
+      report.phase = "decode";
+    }
+    return report;
+  }
+};
+
+void TestDynamicAbliterationKeepsOnlyTheOffPrefix() {
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<SwitchingRunner>(stats);
+  TextRunnerPool pool(runner, 1);
+  {
+    auto root = pool.Acquire({1, 2, 3, 4});
+    Expect(root.Prefill(4).decode_ready, "switching root prefill");
+    const auto before = root.abliteration_report();
+    Expect(before && before->triggered.empty() && !before->position,
+           "OFF before the switch");
+    (void)root.SelectNext();
+    root.Advance();
+    (void)root.SelectNext();
+    root.Advance();
+    const auto after = root.abliteration_report();
+    Expect(after && after->triggered == std::vector<std::string>{"pol"} &&
+               after->position == 5u && after->phase == "decode",
+           "the report reaches the request");
+    root.Commit();
+  }
+  {
+    auto next = pool.Acquire({1, 2, 3, 4, 90, 91, 7});
+    Expect(next.cache_hit() && next.cached_prompt_tokens() == 4,
+           "the next turn continues from the OFF prompt checkpoint, not the "
+           "switched live frontier");
+    next.Invalidate();
+  }
+  // Without a switch the live frontier stays reusable.
+  {
+    auto root = pool.Acquire({5, 6});
+    Expect(root.Prefill(2).decode_ready, "unswitched prefill");
+    root.Commit();
+    auto next = pool.Acquire({5, 6, 7});
+    Expect(next.cached_prompt_tokens() == 2, "an OFF frontier stays live");
+    next.Invalidate();
   }
 }
 
@@ -2565,6 +2629,7 @@ int main() {
   TestInPassFailureRetainsOnlyCompletedCheckpoints();
   TestNewImageGetsAStableCheckpoint();
   TestGeneratedFrontierForksBeforeMutation();
+  TestDynamicAbliterationKeepsOnlyTheOffPrefix();
   TestGeneratedFrontierPersistsForForks();
   TestCancellationRetainsOnlyCompletedWork();
   TestCancelledPrefillRetainsCompletedChunks();

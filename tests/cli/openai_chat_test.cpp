@@ -107,6 +107,7 @@ public:
     return result;
   }
   std::vector<gufo::server::DecodedLogprobs> logprob_pieces;
+  std::optional<gufo::server::AbliterationReport> abliteration_report;
   [[nodiscard]] std::string model_id() const override { return "test-model"; }
   [[nodiscard]] std::vector<std::string> model_ids() const override {
     return names;
@@ -173,6 +174,7 @@ public:
     result.execution_plan = "serial-fallback";
     result.cache_hit = cache_miss_reason.empty();
     result.cache_miss_reason = cache_miss_reason;
+    result.abliteration = abliteration_report;
     if (!result.cache_hit) {
       result.cached_prompt_tokens = 0;
       result.prefill_tokens = result.prompt_tokens;
@@ -595,6 +597,42 @@ void TestUtf8Output() {
     check({"\xF4\x90\x80\x80"},
           replacement + replacement + replacement + replacement, reasoning);
   }
+}
+
+void TestAbliterationReport() {
+  FakeBackend backend;
+  backend.pieces = {"ok"};
+  const auto chat = [&] {
+    return gufo::json::parse(
+        gufo::server::HandleOpenAiChat(Request(R"({"model":"test-model",
+                "messages":[{"role":"user","content":"hello"}]})"),
+                                       backend)
+            .body);
+  };
+  Expect(!chat().contains("abliteration"),
+         "no report without dynamic detection");
+  backend.abliteration_report = gufo::server::AbliterationReport{
+      .triggered = {"pol-avg"},
+      .scores = {{"pol-avg", 1.5F}, {"fnx", 0.25F}},
+      .max_scores = {{"pol-avg", 2.0F}, {"fnx", 0.5F}},
+      .position = 412,
+      .phase = "prefill"};
+  const auto on = chat()["abliteration"];
+  Expect(on.find("triggered")->size() == 1 &&
+             on.find("triggered")->items()[0].str() == "pol-avg" &&
+             on.find("scores")->member_double("pol-avg") == 1.5 &&
+             on.find("scores")->member_double("fnx") == 0.25 &&
+             on.find("max_scores")->member_double("pol-avg") == 2.0 &&
+             on.member_size("position") == 412 &&
+             on.member_str("phase") == "prefill",
+         "a switched request reports its profile, scores and position");
+  backend.abliteration_report = gufo::server::AbliterationReport{
+      .scores = {{"pol-avg", 0.5F}}, .max_scores = {{"pol-avg", 0.75F}}};
+  const auto off = chat()["abliteration"];
+  Expect(off.find("triggered")->empty() && off.find("position")->is_null() &&
+             off.find("phase")->is_null() &&
+             off.find("scores")->member_double("pol-avg") == 0.5,
+         "an OFF detection reports its scores");
 }
 
 void TestCachedPrefillMetrics() {
@@ -7430,6 +7468,7 @@ int main() {
   TestStreamingWithoutUsage();
   TestUtf8Output();
   TestCachedPrefillMetrics();
+  TestAbliterationReport();
   TestBackendSamplingDefaults();
   TestModelSamplingDefaults();
   TestCompleteToolDefinitionsReachTemplate();

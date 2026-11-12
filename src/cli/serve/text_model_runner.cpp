@@ -1543,6 +1543,14 @@ TextRunnerNgramRows TextRunnerPool::Request::ngram_rows() const {
           now.cache_hits - base.cache_hits, now.disk_reads - base.disk_reads};
 }
 
+std::optional<AbliterationReport> TextRunnerPool::Request::abliteration_report()
+    const {
+  if (impl_ == nullptr)
+    return std::nullopt;
+  return impl_->runner->DynamicAbliteration(
+      dynamic_cast<TextRunnerState&>(impl_->lease.state()));
+}
+
 bool TextRunnerPool::Request::cache_disk_hit() const noexcept {
   return impl_ != nullptr && impl_->lease.restored_from_disk();
 }
@@ -2041,10 +2049,12 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
   checkpoint.resize(position);
   // As in Cancel: an unaligned prefill frontier is not kept live. The lease
   // drops a component state after publishing the prompt snapshot, which
-  // reads its positions; other states are reset here.
-  if (position % impl_->alignment != 0 &&
-      position > impl_->lease.cached_tokens() &&
-      position <= impl_->prefill_offset) {
+  // reads its positions; other states are reset here. Neither is a state a
+  // dynamic profile turned ON in (LiveStateReusable).
+  if ((position % impl_->alignment != 0 &&
+       position > impl_->lease.cached_tokens() &&
+       position <= impl_->prefill_offset) ||
+      !impl_->runner->LiveStateReusable(state)) {
     checkpoint.clear();
     if (!impl_->lease.component())
       state.Invalidate();
@@ -2111,10 +2121,12 @@ TextRunnerPool::Request::Cancel() noexcept {
       checkpoint.resize(position);
       // This request's prefill frontier off the alignment cannot continue the
       // prompt exactly; a decoded or reused frontier is kept there. As in
-      // Commit, the lease drops a component state after publishing.
-      if (position % impl_->alignment != 0 &&
-          position > impl_->lease.cached_tokens() &&
-          position <= impl_->prefill_offset) {
+      // Commit, the lease drops a component state after publishing, and a
+      // state a dynamic profile turned ON in is never kept live.
+      if ((position % impl_->alignment != 0 &&
+           position > impl_->lease.cached_tokens() &&
+           position <= impl_->prefill_offset) ||
+          !impl_->runner->LiveStateReusable(state)) {
         checkpoint.clear();
         if (!impl_->lease.component())
           state.Invalidate();

@@ -550,6 +550,22 @@ public:
     (void)state;
     return {};
   }
+  /// The request's dynamic abliteration report; empty when it ran no
+  /// detection.
+  [[nodiscard]] virtual std::optional<AbliterationReport> DynamicAbliteration(
+      TextRunnerState& state) const {
+    (void)state;
+    return std::nullopt;
+  }
+  /// Whether the state may stay live for the next request under this
+  /// request's input identity. A dynamic profile that turned ON mid-request
+  /// leaves a state whose tail no OFF request may continue; its prompt
+  /// checkpoint (computed OFF) is still retained.
+  [[nodiscard]] virtual bool LiveStateReusable(
+      const TextRunnerState& state) const {
+    (void)state;
+    return true;
+  }
   /// Tells a request state that its next execution will use a multi-request
   /// batch. Runners with request-local speculative state may discard work that
   /// the batched path cannot consume.
@@ -710,6 +726,8 @@ public:
     [[nodiscard]] bool cache_disk_hit() const noexcept;
     /// N-gram rows gathered since this request leased its state.
     [[nodiscard]] TextRunnerNgramRows ngram_rows() const;
+    /// TextModelRunner::DynamicAbliteration of the leased state.
+    [[nodiscard]] std::optional<AbliterationReport> abliteration_report() const;
     [[nodiscard]] std::optional<ComponentCacheMetrics> component_cache_metrics()
         const;
     [[nodiscard]] std::size_t prompt_tokens() const noexcept;

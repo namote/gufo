@@ -988,6 +988,8 @@ struct TextGenerationScheduler::Impl {
     request->result.ngram_dedup_rows = ngram.dedup_rows;
     request->result.ngram_cache_hits = ngram.cache_hits;
     request->result.ngram_disk_reads = ngram.disk_reads;
+    request->result.abliteration =
+        request->runner_request.abliteration_report();
     const auto cache_commit =
         finish_reason == TextGenerationBackend::FinishReason::kStopSequence
             ? request->runner_request.Cancel()
