@@ -41,6 +41,42 @@ class Fake(http.server.BaseHTTPRequestHandler):
 
 
 class SpsaTest(unittest.TestCase):
+    def test_blocks_round_trip(self):
+        theta = [float(i) for i in range(3 * 5)]
+        params = spsa.compress(theta, 5, 2)
+        self.assertEqual(params, [0.5, 2.5, 4.0, 5.5, 7.5, 9.0, 10.5, 12.5, 14.0])
+        self.assertEqual(spsa.expand(params, 5, 2)[:5], [0.5, 0.5, 2.5, 2.5, 4.0])
+        self.assertEqual(spsa.expand(spsa.compress(theta, 5, 1), 5, 1), theta)
+
+    def test_blocks_and_minibatch_learn(self):
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Fake)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        url = f'http://127.0.0.1:{server.server_address[1]}'
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / 'pairs.jsonl').write_text(''.join(json.dumps(
+                {'id': f'p{i}', 'prompt': f'q{i}', 'candid': 'candid a', 'propaganda': 'prop a'}) + '\n'
+                for i in range(4)))
+            (d / 'ord.jsonl').write_text(''.join(json.dumps(
+                {'id': f'o{i}', 'prompt': f'q{i}', 'answer': 'plain'}) + '\n' for i in range(4)))
+            base = ['--base-url', url, '--pairs', str(d / 'pairs.jsonl'), '--ordinary', str(d / 'ord.jsonl'),
+                    '--layers', str(LAYERS), '--direction-layer', '1', '--init', '0.5',
+                    '--log', str(d / 'log.jsonl'), '--concurrency', '4', '--eval-every', '5',
+                    '--a', '0.3', '--c', '0.2', '--seed', '3', '--block-size', '2', '--minibatch', '2']
+            self.assertEqual(spsa.main(base + ['--steps', '20', '--output', str(d / 'best.json')]), 0)
+            records = [json.loads(l) for l in (d / 'log.jsonl').read_text().splitlines()[1:]]
+            self.assertEqual(len(records[-1]['theta']), 3 * LAYERS // 2)
+            best = json.loads((d / 'best.json').read_text())['settings']
+            self.assertEqual(len(best['mlp']), LAYERS)
+            self.assertEqual(best['mlp'][2], best['mlp'][3])     # one block
+            self.assertGreater(best['mlp'][2], 0.5)               # the block holding layer 2 grows
+            self.assertLess(sum(best['residual']), 0.5 * LAYERS)
+            # The resumed run reproduces the same subsets and stream.
+            self.assertEqual(spsa.main(base + ['--steps', '22']), 0)
+            records = [json.loads(l) for l in (d / 'log.jsonl').read_text().splitlines()[1:]]
+            self.assertEqual([r['step'] for r in records], list(range(-1, 22)))
+        server.shutdown()
+
     def test_learns_and_resumes(self):
         server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Fake)
         threading.Thread(target=server.serve_forever, daemon=True).start()

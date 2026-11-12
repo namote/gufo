@@ -24,6 +24,12 @@ theta += a_k * g / rms(g), so the step size is set by a_k, not by the
 objective's scale. c_k = c / (k + 1)^0.101, a_k = a / (k + 1 + A)^0.602.
 Every `--eval-every` steps theta itself is scored and the best evaluated theta
 is kept. Every step is appended to `--log` (JSONL); rerunning resumes.
+
+Speed: theta+ and theta- are scored in one request burst, so a packing server
+(`--sessions` and `--concurrency` near 2 x 72) fills its packs. `--minibatch`
+scores a per-step random subset; `--block-size` shares a strength across
+consecutive layers (log thetas are then block parameters; `--output` and the
+request settings are always per layer, and `--init` may be per layer).
 Standard library only.
 """
 import argparse
@@ -100,8 +106,9 @@ class Objective:
         path.write_text(json.dumps(dict(key=key, off=off)) + '\n')
         return off
 
-    def settings(self, theta):
+    def settings(self, params):
         n = self.layers
+        theta = expand(params, n, self.args.block_size)
         a = self.args
         return dict(enabled=True, profile='default', direction_layer=a.direction_layer,
                     direction_kind=a.direction_kind, directions=a.directions,
@@ -111,26 +118,54 @@ class Objective:
                     residual=[round(x, 5) for x in theta[2 * n:]])
 
     def __call__(self, theta):
-        on = self.settings(theta)
+        return self.evaluate([theta])[0]
+
+    def evaluate(self, thetas, pair_idx=None, ord_idx=None):
+        """Score every theta (layer strengths) on the pairs and ordinary answers
+        (all, or the given index subsets) in one request burst, so the server
+        can pack the requests of all thetas together."""
+        pairs = self.pairs if pair_idx is None else [self.pairs[i] for i in pair_idx]
+        ordinary = self.ordinary if ord_idx is None else [self.ordinary[i] for i in ord_idx]
+        t = self.args.answer_tokens
         bodies = []
-        for p in self.pairs:
-            bodies.append(score_body(self.args.model, p['prompt'], p['candid'], on, self.args.answer_tokens))
-            bodies.append(score_body(self.args.model, p['prompt'], p['propaganda'], on, self.args.answer_tokens))
-        bodies += [score_body(self.args.model, o['prompt'], o['answer'], on, self.args.answer_tokens)
-                   for o in self.ordinary]
+        for theta in thetas:
+            on = self.settings(theta)
+            for p in pairs:
+                bodies.append(score_body(self.args.model, p['prompt'], p['candid'], on, t))
+                bodies.append(score_body(self.args.model, p['prompt'], p['propaganda'], on, t))
+            bodies += [score_body(self.args.model, o['prompt'], o['answer'], on, t) for o in ordinary]
         replies = self._map(bodies)
-        margins = []
-        for i in range(len(self.pairs)):
-            candid = mean_logprob(replies[2 * i])[0]
-            propaganda = mean_logprob(replies[2 * i + 1])[0]
-            margins.append(candid - propaganda)
-        drops = []
-        for o, r in zip(self.ordinary, replies[2 * len(self.pairs):]):
-            drops.append(max(0.0, self.off[o['id']] - mean_logprob(r)[0]))
-        margin = sum(margins) / len(margins)
-        drop = sum(drops) / len(drops)
-        return dict(j=margin - self.args.lam * drop, margin=margin, drop=drop,
-                    drop_max=max(drops), margin_min=min(margins))
+        per = 2 * len(pairs) + len(ordinary)
+        results = []
+        for k in range(len(thetas)):
+            part = replies[k * per:(k + 1) * per]
+            margins = [mean_logprob(part[2 * i])[0] - mean_logprob(part[2 * i + 1])[0]
+                       for i in range(len(pairs))]
+            drops = [max(0.0, self.off[o['id']] - mean_logprob(r)[0])
+                     for o, r in zip(ordinary, part[2 * len(pairs):])]
+            margin = sum(margins) / len(margins)
+            drop = sum(drops) / len(drops)
+            results.append(dict(j=margin - self.args.lam * drop, margin=margin, drop=drop,
+                                drop_max=max(drops), margin_min=min(margins)))
+        return results
+
+
+def expand(params, layers, block):
+    """Per-layer strengths [attention, mlp, residual] from block parameters
+    (one value per `block` consecutive layers and site kind)."""
+    nb = -(-layers // block)
+    return [params[kind * nb + layer // block] for kind in range(3) for layer in range(layers)]
+
+
+def compress(theta, layers, block):
+    """Block parameters as the mean of each block's per-layer strengths."""
+    nb = -(-layers // block)
+    out = []
+    for kind in range(3):
+        for j in range(nb):
+            values = theta[kind * layers + j * block:kind * layers + min((j + 1) * block, layers)]
+            out.append(sum(values) / len(values))
+    return out
 
 
 def clip(theta, high):
@@ -162,11 +197,19 @@ def main(argv=None):
     ap.add_argument('--answer-tokens', type=int, default=0,
                     help='score only the first N answer tokens (server score_max_tokens, 1..1024); '
                          'scoring cost grows with answer length; 0 scores whole answers')
+    ap.add_argument('--block-size', type=int, default=1,
+                    help='share one strength per site kind across this many consecutive layers '
+                         '(fewer parameters, fewer steps); 1 learns every layer')
+    ap.add_argument('--minibatch', type=int, default=0,
+                    help='score a random subset of this many pairs and this many ordinary answers '
+                         'per step (the same subset for theta+ and theta-); evals use all; 0 uses all')
     ap.add_argument('--log', required=True)
     ap.add_argument('--output', help='write the best theta as JSON settings')
     args = ap.parse_args(argv)
     if not 0 <= args.answer_tokens <= 1024:
         ap.error('--answer-tokens must be 0..1024')
+    if args.block_size < 1 or args.minibatch < 0:
+        ap.error('--block-size must be at least 1 and --minibatch at least 0')
 
     n = args.layers
     init = json.loads(Path(args.init).read_text()) if Path(args.init).exists() else json.loads(args.init)
@@ -178,14 +221,15 @@ def main(argv=None):
         theta = [float(x) for part in ('attention', 'mlp', 'residual') for x in init[part]]
     if len(theta) != 3 * n:
         raise SystemExit('init needs layers values for attention, mlp and residual')
-    theta = clip(theta, args.max_strength)
+    theta = clip(compress(theta, n, args.block_size), args.max_strength)
     pairs = load_jsonl(args.pairs, ('id', 'prompt', 'candid', 'propaganda'))
     ordinary = load_jsonl(args.ordinary, ('id', 'prompt', 'answer'))
     objective = Objective(args, pairs, ordinary, n)
 
     log = Path(args.log)
     header = dict(type='header', args={k: v for k, v in vars(args).items() if k not in ('log', 'output', 'steps', 'concurrency', 'base_url')
-                                 and not (k == 'answer_tokens' and not v)},
+                                 and not (k in ('answer_tokens', 'minibatch') and not v)
+                                 and not (k == 'block_size' and v == 1)},
                   pairs=[p['id'] for p in pairs], ordinary=[o['id'] for o in ordinary])
     records = []
     if log.exists():
@@ -210,15 +254,21 @@ def main(argv=None):
             best = r
     start = sum(1 for r in records if r['step'] >= 0)
     rng = random.Random(args.seed)
-    for _ in range(start * 3 * n):  # replay the Rademacher stream for resume
+    dim = len(theta)
+    for _ in range(start * dim):  # replay the Rademacher stream for resume
         rng.random()
     for k in range(start, args.steps):
         ck = args.c / (k + 1) ** 0.101
         ak = args.a / (k + 1 + args.A) ** 0.602
-        delta = [1.0 if rng.random() < 0.5 else -1.0 for _ in range(3 * n)]
+        delta = [1.0 if rng.random() < 0.5 else -1.0 for _ in range(dim)]
         plus = clip([t + ck * d for t, d in zip(theta, delta)], args.max_strength)
         minus = clip([t - ck * d for t, d in zip(theta, delta)], args.max_strength)
-        jp, jm = objective(plus), objective(minus)
+        pair_idx = ord_idx = None
+        if args.minibatch:
+            pick = random.Random(f'{args.seed}:{k}')  # per step, so resume draws the same subset
+            pair_idx = sorted(pick.sample(range(len(pairs)), min(args.minibatch, len(pairs))))
+            ord_idx = sorted(pick.sample(range(len(ordinary)), min(args.minibatch, len(ordinary))))
+        jp, jm = objective.evaluate([plus, minus], pair_idx, ord_idx)
         g = [(jp['j'] - jm['j']) / (2 * ck) * d for d in delta]
         rms = math.sqrt(sum(x * x for x in g) / len(g)) or 1.0
         theta = clip([t + ak * x / rms for t, x in zip(theta, g)], args.max_strength)
