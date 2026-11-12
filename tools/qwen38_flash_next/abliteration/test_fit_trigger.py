@@ -94,6 +94,24 @@ class FitTriggerTest(unittest.TestCase):
             self.assertEqual(report['counts']['extra_negatives'], 12)
             self.assertEqual(report['counts']['target_topics'], 8)
 
+    def test_topic_map_is_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            collection = separable(root / 'c')
+            _, report, _ = fit_trigger.fit(collection, 'refusal', 0, topics_path='none',
+                                           folds=4)
+            self.assertEqual(report['sources']['topics'], 'none')
+            topics = root / 'topics.jsonl'
+            # Pair refusal topics 0/1, 2/3, ...: four target topics remain.
+            topics.write_text(''.join(
+                json.dumps(dict(id=f'refusal{t}x{i}-plain', topic=f'pair{t // 2}')) + '\n'
+                for t in range(8) for i in range(3)))
+            _, report, _ = fit_trigger.fit(collection, 'refusal', 0,
+                                           topics_path=str(topics), folds=4)
+            self.assertEqual(report['sources']['topics'],
+                             fit_trigger.sha(topics.read_bytes()))
+            self.assertEqual(report['counts']['target_topics'], 4)
+
     def test_rejects_topic_with_both_groups(self):
         with tempfile.TemporaryDirectory() as tmp:
             rows = [(f'r{i}', 'refusal', [1, 0, 0, 0], 'same', False)

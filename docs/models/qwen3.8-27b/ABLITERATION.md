@@ -125,7 +125,7 @@ the model is discovered, and loading never enables it. Requests select it and th
 settings exactly as for Flash-Next (Chat Completions, Responses, Messages):
 
 ```json
-{"abliteration": {"enabled": true, "profile": "default"}}
+{"abliteration": {"enabled": true}}
 ```
 
 ```json

@@ -355,9 +355,14 @@ python3 tools/qwen38_flash_next/abliteration/fit_trigger.py \
 
 - Direction: mean(target group) − mean(ordinary) at `--layer`, normalized.
   Extra negatives never enter it.
-- Validation is grouped by topic (`--topics` JSONL `{"id", "topic"}`, a
-  record's `topic`, else the ID without `-plain`/`-think`), so paraphrases of
-  one question never sit on both sides of a fold.
+- Validation is grouped by topic. `--topics` is required: a JSONL map
+  `{"id", "topic"}` puts paraphrases of one question (languages, templates)
+  in one fold; `--topics none` groups only the two thinking modes of one text
+  (records the map omits fall back the same way, or to their own `topic`).
+  The map's SHA-256 is recorded in the report's `sources`.
+- `threshold` is for the last prompt row. Generated rows turn a profile ON
+  only with a separately fitted `decode_threshold` (not written by this
+  tool; see `docs/SERVER.md`).
 - The threshold keeps the out-of-fold false-positive rate at or below
   `--max-false-positive` (default 1%) on each negative set separately. The
   report also gives AUC, recall (by thinking mode) and a nested estimate

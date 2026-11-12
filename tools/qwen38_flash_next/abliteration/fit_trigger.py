@@ -13,12 +13,15 @@ the rest of the request when the score exceeds `threshold`.
     d = normalize(mean(target group) - mean(ordinary)),  score = <h, d>
 
 Validation is split by topic, never by sentence: the prompts of one topic
-(the same question in several languages, templates and thinking modes) all
-fall into one fold, so a held-out score never comes from a direction that
-saw a paraphrase of the same question. Topics come from `--topics` (JSONL
-`{"id": ..., "topic": ...}`), else from a record's own `topic` member, else
-from the record ID without its `-plain`/`-think` suffix (the two thinking
-modes of one text).
+all fall into one fold, so a held-out score never comes from a direction
+that saw a paraphrase of the same question. What a topic is must be stated:
+`--topics FILE` (JSONL `{"id": ..., "topic": ...}`) maps records to topics,
+for example the same question in several languages and templates;
+`--topics none` uses no map. Records the map does not name (all of them with
+`none`) take a record's own `topic` member, else the record ID without its
+`-plain`/`-think` suffix: only the two thinking modes of one text share a
+topic, while language and template variants of a question are separate
+topics and may straddle folds.
 
 Grouped k-fold: each fold's direction is fitted on the other folds' topics
 of the collection (target group against its `ordinary` group) and scores the
@@ -69,7 +72,7 @@ def topic_of(record, topics):
 
 def load_topics(path):
     topics = {}
-    if path is None:
+    if path is None or path == 'none':
         return topics
     for line in Path(path).read_text().splitlines():
         if line.strip():
@@ -273,6 +276,8 @@ def fit(collection, target, layer, negatives=(), topics_path=None, folds=6,
         plain=rate(positive[~think], threshold),
         think=rate(positive[think], threshold))
     sources = dict(collection=sha((Path(collection) / 'manifest.json').read_bytes()),
+                   topics=(sha(Path(topics_path).read_bytes())
+                           if topics_path not in (None, 'none') else 'none'),
                    negatives=[dict(spec=spec, manifest_sha256=sha(
                        (Path(spec.partition(':')[0]) / 'manifest.json').read_bytes()))
                        for spec, _, _ in extra])
@@ -322,7 +327,9 @@ def main():
     parser.add_argument('--negatives', action='append', default=[],
                         help='DIR[:GROUP] extra negatives (default group ordinary); '
                              'repeatable, never used for the direction')
-    parser.add_argument('--topics', help='JSONL {"id", "topic"} topic map')
+    parser.add_argument('--topics', required=True,
+                        help='JSONL {"id", "topic"} topic map, or "none" (thinking '
+                             'modes of one text only)')
     parser.add_argument('--folds', type=int, default=6)
     parser.add_argument('--max-false-positive', type=float, default=0.01)
     parser.add_argument('--seed', type=int, default=0)

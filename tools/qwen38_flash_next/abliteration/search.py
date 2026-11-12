@@ -598,12 +598,22 @@ def main(argv=None, client=None, out=sys.stdout):
     parser.add_argument('--log', required=True)
     parser.add_argument('--kl-budget', type=float, required=True)
     parser.add_argument('--base-profile', help='the v2 profile the server loaded')
+    parser.add_argument('--profile', default='',
+                        help='loaded profile name (needed when the server loads several)')
     parser.add_argument('--output', help='new v2 profile with the chosen defaults')
     args = parser.parse_args(argv)
     client = client or HttpClient(args.base_url)
     info = client.props().get('abliteration')
     if not info:
         raise SystemExit('the server has no abliteration profile loaded')
+    if args.profile:
+        # /props lists every profile; the top level holds only a lone one.
+        named = [p for p in info.get('profiles', [info]) if p.get('profile') == args.profile]
+        if not named:
+            raise SystemExit(f'the server has no abliteration profile {args.profile!r}')
+        info = named[0]
+    elif 'layers' not in info:
+        raise SystemExit('the server loads several profiles; name one with --profile')
     if args.base_profile:
         check_base(args.base_profile, info)  # before any trial runs
     layers = info['layers']
