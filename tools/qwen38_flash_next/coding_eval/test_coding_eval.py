@@ -23,6 +23,7 @@ def load(name):
 
 generate = load('generate')
 evaluate = load('evaluate')
+check_references = load('check_references')
 
 PROBLEM = dict(
     id='list-01', split='eval', lang='en', category='list', difficulty='easy',
@@ -282,6 +283,20 @@ class EvaluateTest(unittest.TestCase):
         pairs = evaluate.paired(settings, problems)
         self.assertIn('| steer | 1 | 0 | +1 | list-01 | - |', pairs)
         self.assertIn('| list-01 | eval | en | 3/4 | P |', evaluate.matrix(settings, problems))
+
+
+class CheckReferencesTest(unittest.TestCase):
+    def test_references_required_unless_the_set_has_none(self):
+        problems = [dict(PROBLEM, split='direction')]
+        solutions = [dict(id='list-01', split='direction',
+                          code=GOOD + 'if __name__ == "__main__":\n    assert head([1], 1) == [1]\n')]
+        runner = sandbox.LocalRunner(trusted=True)
+        rows, failures = check_references.check(problems, solutions, [], runner, workers=1)
+        self.assertEqual(failures, ['list-01: no reference answer'])
+        rows, failures = check_references.check(problems, solutions, [], runner, workers=1,
+                                                need_references=False)
+        self.assertEqual(failures, [])
+        self.assertTrue(rows[0]['all_pass'])
 
 
 if __name__ == '__main__':
