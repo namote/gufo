@@ -1149,8 +1149,10 @@ bool Session::ScorePrompt(std::span<const std::int32_t> prompt,
                           std::span<const std::int32_t> tokens,
                           std::vector<sampling::TokenLogprobs>* scored,
                           std::string* error_msg) {
-  const ExecutionScope execution(continuation_hooks_);
   try {
+    // A hook refusing execution (an invalid continuation slot) fails this
+    // request like any other error.
+    const ExecutionScope execution(continuation_hooks_);
     return ScorePromptImpl(prompt, tokens, scored, error_msg);
   } catch (const std::exception& error) {
     // CollectLogprobs refuses non-finite logits.
@@ -1438,7 +1440,9 @@ void Session::ScoreBatch(std::span<const ScoreRequest> requests) {
       pack_error = error.what();
     }
     scopes.clear();
-    for (auto& p : pack) {
+    std::vector<std::size_t> retry;
+    for (std::size_t i = 0; i < pack.size(); ++i) {
+      const auto& p = pack[i];
       const auto& r = *p.request;
       auto& session = *r.session;
       // The draft block did not run, and a failed pack may have advanced any
@@ -1450,10 +1454,26 @@ void Session::ScoreBatch(std::span<const ScoreRequest> requests) {
         *r.ok = true;
         continue;
       }
-      // One request's failure (cancellation, KV rows, a non-finite row)
-      // fails the pack: score each of its requests on its own, from a reset
-      // session, so that only the offending one fails.
-      *r.ok = session.ScorePrompt(r.prompt, r.tokens, r.scored, r.error);
+      retry.push_back(i);
+    }
+    // One request's failure (cancellation, KV rows, a non-finite row) fails
+    // the pack: score each of its requests on its own so that only the
+    // offending one fails. Reset every one first, so the rows the pack wrote
+    // return to a shared KV pool before any retry claims rows, and each
+    // retry starts from a valid, empty session.
+    for (const auto i : retry) {
+      const auto& r = *pack[i].request;
+      try {
+        r.session->Reset();
+      } catch (const std::exception& error) {
+        fail(r, error.what());
+      }
+    }
+    for (const auto i : retry) {
+      const auto& r = *pack[i].request;
+      if (!r.session->valid_)
+        continue;  // its reset failed above
+      *r.ok = r.session->ScorePrompt(r.prompt, r.tokens, r.scored, r.error);
       if (!*r.ok && r.error && r.error->empty())
         *r.error = pack_error.empty() ? "scoring failed" : pack_error;
     }
