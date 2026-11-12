@@ -1313,6 +1313,13 @@ void Session::ScoreBatch(std::span<const ScoreRequest> requests) {
     std::uint32_t logit_rows{0};
   };
   std::vector<Packed> packable;
+  // The model packs share: the first request's that names a session.
+  const Model* model = nullptr;
+  for (const auto& r : requests)
+    if (r.session != nullptr) {
+      model = r.session->model_.get();
+      break;
+    }
   for (const auto& r : requests) {
     *r.ok = false;
     if (r.session == nullptr || r.scored == nullptr) {
@@ -1328,10 +1335,9 @@ void Session::ScoreBatch(std::span<const ScoreRequest> requests) {
     // KVarN and image sessions, a model whose sessions differ, and a
     // sequence longer than one pass score on their own.
     auto& exec = *session.model_->executor_;
-    const bool alone =
-        !distinct || session.model_->Kvarn() ||
-        session.session_->VisionLayout().PrefixLength() != 0 ||
-        session.model_.get() != requests.front().session->model_.get();
+    const bool alone = !distinct || session.model_->Kvarn() ||
+                       session.session_->VisionLayout().PrefixLength() != 0 ||
+                       session.model_.get() != model;
     if (alone) {
       *r.ok = distinct &&
               session.ScorePrompt(r.prompt, r.tokens, r.scored, r.error);
