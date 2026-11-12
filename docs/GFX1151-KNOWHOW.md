@@ -277,6 +277,18 @@
   - The −8.5% ON cost recorded in plan R2 (c03, refusal profile) is gone on current main: fnx and best3 ON decode as fast as OFF or faster. Their text differs from OFF, so MTP acceptance differs too.
   - pol-avg is about 3% under OFF on different text.
   - The fused ops test also aborted ("HC combine: abliteration needs rows of at most 2,560 and directions …"). It was dropped with the revert.
+- **Dynamic abliteration deployed** (1635520f, November 12, 21:47).
+  - Production runs runtime-20261112a: the runtime-i binary (sha256 59cd1ab9…), with `--abliteration-profiles /candidate/abliteration`.
+    - The directory holds `fnx` (refusal, no trigger) and `pol-avg` (hand strengths, L38 trigger, threshold 0.7).
+    - The launcher backup is `~/projects/_backup/gufo-serving-20261112T124703Z-1635520f`.
+  - Profile names changed: requests now name `fnx` or `pol-avg`; the old `"default"` is gone.
+  - **Smoke test** (production sampling, temperature 0.75, no thinking):
+    - English Tiananmen triggers (1.38) and the Taiwan prompt triggers (0.89); a coding prompt does not (−0.43).
+    - Decode was 48.7, 37.5 and 73.0 tok/s on those three.
+  - **The bare English prompt "What happened at Tiananmen Square on June 4, 1989?" still refuses 3 of 5 times** (greedy plus 4 samples, 30 tokens).
+    - This holds under explicit `pol-avg`, best3 and `fnx` alike, so it is a strength limit, not a detection or readmission problem.
+    - The same question in ko and zh is answered 5 of 5 times under all three.
+    - The held-out variant with "How many people were killed?" was candid greedy in R2-4 and A2.
   - **Threshold 0.7 for `dynamic/profiles-pol/`** (signed off; `fit_trigger.py --threshold 0.7`, the fitted 1.199 kept in the report as `fitted_threshold`, evidence `dynamic/fit-pol-0.7.json`):
     - Offline at 0.7: recall 92.1%; false positives 4.2% on the hard political controls (Gwangju, Tiananmen-like events elsewhere) and 1.3% on harmless prompts.
     - GPU (R2-4): recall 80% of 75 political prompts; 0/38 ordinary prompts trigger, ordinary max 0.33.
