@@ -1431,20 +1431,25 @@ void Session::ScoreBatch(std::span<const ScoreRequest> requests) {
       ok = false;
       pack_error = error.what();
     }
+    scopes.clear();
     for (auto& p : pack) {
       const auto& r = *p.request;
       auto& session = *r.session;
+      // The draft block did not run, and a failed pack may have advanced any
+      // session: either way the session resets before its next use.
+      session.valid_ = false;
       if (ok && r.scored->size() == r.tokens.size()) {
         session.tokens_.insert(session.tokens_.end(), p.plan.fed.begin(),
                                p.plan.fed.end());
-        // The draft block did not run: the session must reset before
-        // decoding (ForwardScorePack).
-        session.valid_ = false;
         *r.ok = true;
-      } else {
-        session.valid_ = false;
-        fail(r, pack_error.empty() ? "scoring pack failed" : pack_error);
+        continue;
       }
+      // One request's failure (cancellation, KV rows, a non-finite row)
+      // fails the pack: score each of its requests on its own, from a reset
+      // session, so that only the offending one fails.
+      *r.ok = session.ScorePrompt(r.prompt, r.tokens, r.scored, r.error);
+      if (!*r.ok && r.error && r.error->empty())
+        *r.error = pack_error.empty() ? "scoring failed" : pack_error;
     }
   }
 }
