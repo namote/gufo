@@ -447,6 +447,9 @@ public:
   std::uint32_t AcquireUnion(const std::string& key,
                              std::span<const float> basis) const;
   void ReleaseUnion(const std::string& key) const noexcept;
+  /// Whether `plan`'s union bases fit now: cached ones or free rows (a
+  /// check before admission; a later admission can still take the rows).
+  [[nodiscard]] bool UnionRowsAvailable(const AbliterationPlan& plan) const;
   /// The score column of profile `name`'s detector; empty for a profile
   /// without `trigger`.
   [[nodiscard]] std::optional<std::uint32_t> DetectorColumn(
@@ -925,6 +928,9 @@ private:
     std::uint32_t count;
     std::uint32_t references;
   };
+  /// Guards union_rows_ and union_used_: sessions take rows on the scheduler
+  /// thread while request preparation checks them on HTTP threads.
+  mutable std::mutex union_mutex_;
   mutable std::unordered_map<std::string, UnionRows> union_rows_;
   mutable std::vector<bool> union_used_;
   std::uint32_t union_first_{0};

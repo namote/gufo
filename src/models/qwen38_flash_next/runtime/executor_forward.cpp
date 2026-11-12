@@ -478,10 +478,13 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       return false;
     }
     // The last target layer's query outputs have no later cache consumer.
-    // Preserve all K/V/indexer rows and the final query's original tile.
+    // Preserve all K/V/indexer rows and the final query's original tile. An
+    // all-rows observer (answer collection) reads every row of every layer:
+    // no shortcut computes only the last ones.
+    const bool every_row = session.observe_all_rows_;
     const bool last_attention = WidePrefill(n) && !session.mtp_enabled_ &&
                                 il + 1 == c.num_layers && n_logits == 1 &&
-                                checkpoint == nullptr;
+                                checkpoint == nullptr && !every_row;
     if (l.linear) {
       const auto capture =
           checkpoint ? GdnCheckpoint{checkpoint->state->linear_[il].state,
@@ -519,8 +522,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     const auto needed =
         std::max({96U, n_logits, checkpoint ? n - checkpoint->tokens + 1 : 0U});
     // An all-rows observer reads every row of the last layer too.
-    const auto skipped = prefill_phase && !session.mtp_enabled_ &&
-                                 !session.observe_all_rows_ &&
+    const auto skipped = prefill_phase && !session.mtp_enabled_ && !every_row &&
                                  il + 1 == c.num_layers && n > needed
                              ? (n - needed) / 128 * 128
                              : 0U;

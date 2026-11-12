@@ -605,6 +605,18 @@ std::shared_ptr<const AbliterationSettings> Model::ResolveAbliterationDefaults(
   return qwen::ResolveAbliterationSet(loaded, set);
 }
 
+void Model::CheckAbliterationCombination(
+    const AbliterationSettings& settings) const {
+  if (settings.parts.size() < 2)
+    return;
+  const auto plan = PlanAbliteration(qwen::AbliterationParts(settings),
+                                     executor_->AbliterationProfiles());
+  if (!executor_->UnionRowsAvailable(plan))
+    throw std::invalid_argument(
+        "abliteration: no free direction rows for this combination now "
+        "(too many distinct combinations are active)");
+}
+
 std::shared_ptr<DynamicAbliteration> Model::StartDynamicAbliteration() const {
   if (dynamic_candidates_.empty())
     return nullptr;

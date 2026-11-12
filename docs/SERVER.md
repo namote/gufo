@@ -608,8 +608,11 @@ whose set breaks them (impossible after that load check, kept as a guard)
 stays OFF with `"skipped": "union"`. Union bases live in 256 reserved
 direction rows shared by reference count: sessions running the same
 combination share rows, and rows are freed when the last session using them
-changes settings or ends, so only many distinct combinations active at once
-can exhaust them (that request then fails at admission).
+changes settings or ends. Free rows are checked when the request is
+prepared, so many distinct combinations active at once refuse an explicit
+request with 400 and keep a detection OFF with `"skipped": "union"`; a
+request admitted just after another took the last rows still fails at
+admission.
 
 #### Additive (steering) profiles
 
@@ -632,7 +635,8 @@ the same numbers.
 An additive profile works wherever a suppression profile does: requested
 alone or in an array with other profiles, turned ON by its own `trigger` or
 as a `with` companion, and in `score_assistant` scoring (SPSA can learn its
-signed strengths: `spsa.py --min-strength -64 --max-strength 64`). Where
+signed strengths: `spsa.py --additive --min-strength -64 --max-strength
+64`, which sends only the strengths). Where
 suppression and additive profiles act at one site, the site first projects
 the suppression profiles (their weighted union as above) and then adds each
 additive profile's term; additions commute, so their order does not matter.

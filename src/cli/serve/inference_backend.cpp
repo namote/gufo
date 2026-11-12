@@ -3104,10 +3104,8 @@ public:
   void ValidateCombination(const TextPromptContext* context) const {
     const auto* selected =
         dynamic_cast<const AbliterationPromptContext*>(context);
-    if (selected && selected->settings->parts.size() > 1)
-      (void)models::qwen38_flash_next::PlanAbliteration(
-          models::qwen::AbliterationParts(*selected->settings),
-          model_->AbliterationProfiles());
+    if (selected)
+      model_->CheckAbliterationCombination(*selected->settings);
   }
 
   [[nodiscard]] bool SupportsScoring() const override { return true; }

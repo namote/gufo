@@ -620,8 +620,32 @@ void Executor::CombineAbliterationBlocks(
   }
 }
 
+bool Executor::UnionRowsAvailable(const AbliterationPlan& plan) const {
+  const std::lock_guard lock(union_mutex_);
+  auto used = union_used_;
+  for (const auto& block : plan.blocks) {
+    if (block.basis.empty() || union_rows_.contains(block.key))
+      continue;
+    // The same first fit AcquireUnion takes.
+    std::size_t first = 0;
+    for (;; ++first) {
+      if (first + block.count > used.size())
+        return false;
+      bool free = true;
+      for (std::uint32_t r = 0; r < block.count && free; ++r)
+        free = !used[first + r];
+      if (free)
+        break;
+    }
+    for (std::uint32_t r = 0; r < block.count; ++r)
+      used[first + r] = true;
+  }
+  return true;
+}
+
 std::uint32_t Executor::AcquireUnion(const std::string& key,
                                      std::span<const float> basis) const {
+  const std::lock_guard lock(union_mutex_);
   const auto hidden = std::size_t{config().hidden_size};
   if (auto found = union_rows_.find(key); found != union_rows_.end()) {
     ++found->second.references;
@@ -653,6 +677,7 @@ std::uint32_t Executor::AcquireUnion(const std::string& key,
 }
 
 void Executor::ReleaseUnion(const std::string& key) const noexcept {
+  const std::lock_guard lock(union_mutex_);
   const auto found = union_rows_.find(key);
   if (found == union_rows_.end() || --found->second.references != 0)
     return;

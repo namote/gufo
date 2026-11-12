@@ -30,21 +30,27 @@ inline constexpr unsigned kAbliterationRowThreads = 256;
 /// its output stays bit-identical to the single-direction kernel even where
 /// the library compiles with -ffast-math. Strength 0 returns before touching
 /// the row.
-__device__ inline void AbliterateRow(float* __restrict__ row,
-                                     const float* __restrict__ directions,
-                                     const float* __restrict__ settings,
-                                     std::uint32_t weight_index,
-                                     std::uint32_t hidden) {
+/// The block-shared scratch of AbliterateRowIn. Slots 0..kMax-1 of
+/// `partial`: dot products; kMax: |y|^2 before; kMax + 1: after. A kernel
+/// with other row paths declares it once and shares it between them.
+using AbliterationRowPartial =
+    float[kAbliterationMaxDirections + 2][kAbliterationRowThreads];
+using AbliterationRowSingle = float[kAbliterationRowThreads];
+
+__device__ inline void AbliterateRowIn(AbliterationRowPartial& partial,
+                                       AbliterationRowSingle& single,
+                                       float* __restrict__ row,
+                                       const float* __restrict__ directions,
+                                       const float* __restrict__ settings,
+                                       std::uint32_t weight_index,
+                                       std::uint32_t hidden) {
   constexpr unsigned kMax = kAbliterationMaxDirections;
-  // Slots 0..kMax-1: dot products; kMax: |y|^2 before; kMax + 1: after.
-  __shared__ float partial[kMax + 2][kAbliterationRowThreads];
   const float weight = settings[weight_index];
   if (weight == 0)
     return;
   const std::uint32_t word = __float_as_uint(settings[0]);
   if (word <= kAbliterationRowMask) {
     // The single-direction projection, unchanged.
-    __shared__ float single[kAbliterationRowThreads];
     const float* direction = directions + std::size_t{word} * hidden;
     float sum = 0;
     for (std::uint32_t i = threadIdx.x; i < hidden; i += blockDim.x)
@@ -131,6 +137,18 @@ __device__ inline void AbliterateRow(float* __restrict__ row,
   const float scale = sqrtf(squared_before / squared_after);
   for (std::uint32_t i = t; i < hidden; i += blockDim.x)
     row[i] *= scale;
+}
+
+/// AbliterateRowIn with its own block-shared scratch.
+__device__ inline void AbliterateRow(float* __restrict__ row,
+                                     const float* __restrict__ directions,
+                                     const float* __restrict__ settings,
+                                     std::uint32_t weight_index,
+                                     std::uint32_t hidden) {
+  __shared__ AbliterationRowPartial partial;
+  __shared__ AbliterationRowSingle single;
+  AbliterateRowIn(partial, single, row, directions, settings, weight_index,
+                  hidden);
 }
 
 }  // namespace gufo::models::qwen::hip_detail

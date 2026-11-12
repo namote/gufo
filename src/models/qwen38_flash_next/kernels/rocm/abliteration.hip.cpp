@@ -25,13 +25,15 @@ struct RowSettings {
 //   y -= sum_j w_j * d_j * dot(d_j, y),
 // every dot from the unprojected row (FP32 per-thread sums, fixed tree
 // reduction), then the norm restored when the block preserves norms.
-__device__ void WeightedRow(float* __restrict__ row,
+// `partial` is the kernel's one row scratch, shared with AbliterateRowIn so
+// the single-profile kernel keeps its LDS.
+__device__ void WeightedRow(qwen::hip_detail::AbliterationRowPartial& partial,
+                            float* __restrict__ row,
                             const float* __restrict__ directions,
                             const float* __restrict__ settings,
                             std::uint32_t weight_index, std::uint32_t hidden) {
   constexpr unsigned kThreads = qwen::hip_detail::kAbliterationRowThreads;
   constexpr unsigned kMax = qwen::kAbliterationMaxDirections;
-  __shared__ float partial[kMax + 2][kThreads];
   const std::uint32_t word = __float_as_uint(settings[0]);
   const std::uint32_t first = word & qwen::kAbliterationRowMask;
   const unsigned count = ((word >> qwen::kAbliterationCountShift) & 7U) + 1;
@@ -104,9 +106,12 @@ __global__ void Project(float* output, const float* directions,
     }
   if (settings == nullptr)
     return;
+  // One scratch for every row path (AbliterateRowIn, WeightedRow).
+  __shared__ qwen::hip_detail::AbliterationRowPartial partial;
+  __shared__ qwen::hip_detail::AbliterationRowSingle single;
   if (__float_as_uint(settings[0]) & qwen::kAbliterationWeightedBit) {
-    WeightedRow(output + std::size_t{blockIdx.x} * hidden, directions, settings,
-                weight_index, hidden);
+    WeightedRow(partial, output + std::size_t{blockIdx.x} * hidden, directions,
+                settings, weight_index, hidden);
     return;
   }
   const std::uint32_t word = __float_as_uint(settings[0]);
@@ -126,8 +131,9 @@ __global__ void Project(float* output, const float* directions,
       row[i] += weight * direction[i];
     return;
   }
-  qwen::hip_detail::AbliterateRow(output + std::size_t{blockIdx.x} * hidden,
-                                  directions, settings, weight_index, hidden);
+  qwen::hip_detail::AbliterateRowIn(partial, single,
+                                    output + std::size_t{blockIdx.x} * hidden,
+                                    directions, settings, weight_index, hidden);
 }
 
 void Launch(float* output, const float* directions,

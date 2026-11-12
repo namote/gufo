@@ -3,8 +3,9 @@
 //
 // Modes:
 //   collect   the last prompt token's post-layer residual per layer (HC mean)
-//   answers   the MEAN over a teacher-forced answer's tokens of the same
-//             readout (R5 steering): records carry `text` (the user turn),
+//   answers   the MEAN over a teacher-forced answer of the same readout
+//             (R5 steering), over the n rows that predict its n tokens
+//             (positions P-1 .. P+n-2, as score_assistant scores them): records carry `text` (the user turn),
 //             `answer` (the assistant content), `group` ("exemplar" or
 //             "own") and `pair` (the question both answers share). The
 //             prompt is framed as score_assistant frames it (thinking off,
@@ -232,13 +233,22 @@ int main(int argc, char** argv) {
           "prompt invalid/too long; no silent truncation: " + id + " " + error);
       const std::vector<std::int32_t> prompt(tokens->begin(), tokens->end());
       observing = !answers;
-      Require(session->Sync(prompt, &error), error);
+      // Answers: the prompt but its last token first; that token's row
+      // predicts the first answer token (see below).
+      Require(session->Sync(answers ? std::span<const std::int32_t>(prompt).first(
+                                          prompt.size() - 1)
+                                    : std::span<const std::int32_t>(prompt),
+                            &error),
+              error);
       auto result = json::Value::object();
       result["id"] = id;
       result["prompt_tokens"] = tokens->size();
       if (answers) {
-        // Teacher forcing: the answer's tokens as message text after the
-        // prompt, in the passes that feed them; their rows are averaged.
+        // Teacher forcing: the rows that predict the answer's tokens, as
+        // score_assistant scores them and generation produces them: the
+        // last prompt token's row (position P-1) through the row of the
+        // answer's second to last token (P+n-2), n rows, are averaged. The
+        // answer's last token is never fed.
         gufo::tokenization::TokenizerOptions content;
         content.parse_special_tokens = false;
         const auto answer =
@@ -247,7 +257,7 @@ int main(int argc, char** argv) {
                                        options.max_context,
                 "answer empty or too long: " + id);
         std::vector<std::int32_t> full = prompt;
-        full.insert(full.end(), answer.begin(), answer.end());
+        full.insert(full.end(), answer.begin(), answer.end() - 1);
         observing = true;
         Require(session->Sync(full, &error), error);
         observing = false;
