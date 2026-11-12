@@ -40,6 +40,10 @@ deployed direction is fitted on every topic.
 example chosen from server measurements); the report keeps the fitted value
 as `fitted_threshold` and marks `threshold_source` "override".
 
+`--with NAME` (repeatable) names companion profiles the server turns ON
+together with this one when it triggers (`trigger.with`); they need no
+trigger of their own.
+
 The output is the input profile with a `trigger` member; the input file is
 never modified, and an existing output is refused.
 """
@@ -304,7 +308,7 @@ def encode(values):
     return base64.b64encode(np.asarray(values, dtype='<f4').tobytes()).decode()
 
 
-def write_profile(source, output, final, report, manifest):
+def write_profile(source, output, final, report, manifest, with_profiles=()):
     source, output = Path(source), Path(output)
     if output.exists():
         raise SystemExit('use a new output path; existing profiles are preserved')
@@ -323,7 +327,15 @@ def write_profile(source, output, final, report, manifest):
         direction=encode(final),
         threshold=float('%.9g' % report['threshold']),
         fit=report,
+
     )
+    if with_profiles:
+        # Companions the server turns ON with this profile when it triggers.
+        names = list(with_profiles)
+        if len(set(names)) != len(names) or output.stem in names or \
+                any(not n for n in names):
+            raise SystemExit('--with names distinct other profiles')
+        profile['trigger']['with'] = names
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(output.suffix + '.tmp')
     temporary.write_text(json.dumps(profile, ensure_ascii=False,
@@ -348,6 +360,9 @@ def main():
     parser.add_argument('--folds', type=int, default=6)
     parser.add_argument('--max-false-positive', type=float, default=0.01)
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--with', dest='with_profiles', action='append', default=[],
+                        help='companion profile (file name without .json) the server '
+                             'turns ON with this one when it triggers; repeatable')
     parser.add_argument('--threshold', type=float,
                         help='explicit threshold replacing the fitted one (recorded '
                              'as threshold_source "override" beside fitted_threshold)')
@@ -368,7 +383,8 @@ def main():
         args.threshold)
     print(json.dumps(report, indent=2))
     if args.profile:
-        write_profile(args.profile, args.output, final, report, manifest)
+        write_profile(args.profile, args.output, final, report, manifest,
+                      args.with_profiles)
         print(args.output)
 
 

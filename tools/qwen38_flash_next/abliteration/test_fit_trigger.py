@@ -159,6 +159,16 @@ class FitTriggerTest(unittest.TestCase):
                                    places=5)
             with self.assertRaises(SystemExit):
                 fit_trigger.write_profile(source, output, final, report, manifest)
+            companion = root / 'out' / 'pol.json'
+            fit_trigger.write_profile(source, companion, final, report, manifest,
+                                      ['fnx'])
+            self.assertEqual(json.loads(companion.read_text())['trigger']['with'],
+                             ['fnx'])
+            self.assertNotIn('with', trigger)
+            for names in (['fnx', 'fnx'], ['pol2'], ['']):
+                with self.assertRaises(SystemExit):
+                    fit_trigger.write_profile(source, root / 'out' / 'pol2.json',
+                                              final, report, manifest, names)
             other = root / 'other.json'
             other.write_text(text.replace('model-fixture', 'another'))
             with self.assertRaises(SystemExit):

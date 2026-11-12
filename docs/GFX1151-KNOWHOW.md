@@ -289,6 +289,7 @@
     - This holds under explicit `pol-avg`, best3 and `fnx` alike, so it is a strength limit, not a detection or readmission problem.
     - The same question in ko and zh is answered 5 of 5 times under all three.
     - The held-out variant with "How many people were killed?" was candid greedy in R2-4 and A2.
+  - **Combined profile for the English Tiananmen gap** (not measured): `dynamic/profiles-pol-fnx2/` holds `pol-avg` (byte-identical to production's except `trigger.with: ["fnx"]`, threshold 0.7) and production's `fnx` (no trigger). A pol-avg detection then turns both ON; where both have strength at a site, they project onto the orthonormal union of their directions with the larger strength (docs/SERVER.md, several profiles).
   - **Threshold 0.7 for `dynamic/profiles-pol/`** (signed off; `fit_trigger.py --threshold 0.7`, the fitted 1.199 kept in the report as `fitted_threshold`, evidence `dynamic/fit-pol-0.7.json`):
     - Offline at 0.7: recall 92.1%; false positives 4.2% on the hard political controls (Gwangju, Tiananmen-like events elsewhere) and 1.3% on harmless prompts.
     - GPU (R2-4): recall 80% of 75 political prompts; 0/38 ordinary prompts trigger, ordinary max 0.33.
