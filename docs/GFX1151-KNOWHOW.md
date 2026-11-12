@@ -249,6 +249,19 @@
       - The Xinjiang answer keeps the PRC framing.
       - Explicit ON answers all 8 candidly.
       - The OFF prompt KV and the OFF first token decide the answer. A1 is not enough, so re-prefill ON (A2) is needed.
+  - **A2 GPU check** (`dyncheck/chain13.sh`, results in `dyncheck/r13/`, November 12). Setup: runtime-20261111i at 94ac2cab; scheduler readmission, threshold 0.7, re-prefill cap 32768; same config and sets as R2-4.
+    - **OFF cost: none.** Decode is 54.1 tok/s with no detector (54.39/53.97/54.03/54.09) and 54.1 with it (54.39/53.95/54.00/54.02).
+    - **Quality:** every triggered held-out political answer (6/8) is byte-identical to explicit ON, including English Tiananmen and Xinjiang. The two misses are Tank Man (prompt score negative) and Pooh (0.51–0.76).
+    - **Recall 52/65 (80%)** on political prompts: politics 13/16, pairs 22/24, censored probes 17/25. No request hit the cap.
+    - **False triggers:**
+      - None of the 24 ordinary prompts trigger.
+      - Of the 14 ordcheck prompts, only the meth prompt triggers (1.08), and it still refuses.
+      - Among the controls, only Taiwan 1996 triggers. Berlin, Chernobyl, Gwangju, Watergate, Apollo and 2·28 do not.
+    - **Latency** (36-token English Tiananmen prompt, 64 tokens):
+      - first triggered request: 1.65 s, re-prefilling 36 tokens;
+      - exact repeat: 1.38 s, re-prefilling 0 tokens from the ON checkpoint;
+      - explicit ON: 1.25 s.
+    - Streaming a triggered prompt gives the same text as non-streaming, and the terminal chunk carries the report.
   - **Threshold 0.7 for `dynamic/profiles-pol/`** (signed off; `fit_trigger.py --threshold 0.7`, the fitted 1.199 kept in the report as `fitted_threshold`, evidence `dynamic/fit-pol-0.7.json`):
     - Offline at 0.7: recall 92.1%; false positives 4.2% on the hard political controls (Gwangju, Tiananmen-like events elsewhere) and 1.3% on harmless prompts.
     - GPU (R2-4): recall 80% of 75 political prompts; 0/38 ordinary prompts trigger, ordinary max 0.33.
