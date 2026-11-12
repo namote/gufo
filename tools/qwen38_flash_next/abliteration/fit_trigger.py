@@ -47,6 +47,7 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -229,6 +230,8 @@ def fit(collection, target, layer, negatives=(), topics_path=None, folds=6,
     # replaces the fitted one; recall and false positives below are reported
     # at it, the nested estimate stays the fitted rule's.
     fitted_threshold = threshold
+    if threshold_override is not None and not math.isfinite(threshold_override):
+        raise ValueError('the threshold override must be finite')
     if threshold_override is not None:
         threshold = float(threshold_override)
     # Nested: each fold's threshold from the other folds' negatives.
@@ -357,6 +360,8 @@ def main():
         parser.error('--folds must be at least 2')
     if not 0 <= args.max_false_positive < 1:
         parser.error('--max-false-positive must be in [0, 1)')
+    if args.threshold is not None and not math.isfinite(args.threshold):
+        parser.error('--threshold must be finite')
     final, report, manifest = fit(
         args.collection, args.target_group, args.layer, args.negatives,
         args.topics, args.folds, args.max_false_positive, args.seed,
