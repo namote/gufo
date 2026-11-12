@@ -214,6 +214,12 @@ AbliterationTrigger LoadTrigger(const json::Value& value,
       std::abs(threshold->as_double()) > 1e6)
     Invalid("trigger.threshold");
   trigger.threshold = static_cast<float>(threshold->as_double());
+  if (const auto* decode = value.find("decode_threshold")) {
+    if (!decode->is_number() || !std::isfinite(decode->as_double()) ||
+        std::abs(decode->as_double()) > 1e6)
+      Invalid("trigger.decode_threshold");
+    trigger.decode_threshold = static_cast<float>(decode->as_double());
+  }
   return trigger;
 }
 

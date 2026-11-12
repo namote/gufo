@@ -7,6 +7,7 @@
 #include <array>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -32,11 +33,15 @@ std::shared_ptr<const qwen::AbliterationSettings> Settings(
 }
 
 // Two candidates: "pol" in column 1 (threshold 1), "fnx" in column 0
-// (threshold 2).
-q::DynamicAbliteration Make() {
+// (threshold 2). With `decode`, generated rows use the same thresholds;
+// without, only the last prompt row can turn a profile ON.
+q::DynamicAbliteration Make(bool decode = false) {
+  const auto on = [&](float x) {
+    return decode ? std::optional(x) : std::nullopt;
+  };
   return q::DynamicAbliteration({
-      {"pol", 1, 1.0F, Settings("pol", std::string(64, 'a'))},
-      {"fnx", 0, 2.0F, Settings("fnx", std::string(64, 'b'))},
+      {"pol", 1, 1.0F, on(1.0F), Settings("pol", std::string(64, 'a'))},
+      {"fnx", 0, 2.0F, on(2.0F), Settings("fnx", std::string(64, 'b'))},
   });
 }
 
@@ -86,11 +91,54 @@ void PrefillTrigger() {
               report.scores[0].second == 1.5F &&
               report.scores[1].second == 0.5F,
           "scores of the crossing row");
-  Require(report.max_scores[0].second == 1.5F, "max excludes later passes");
+  Require(report.max_scores.empty(),
+          "max covers generated rows, none scored before ON");
+}
+
+void PrefillDetectionReportedBeforeAnyOnPass() {
+  auto dynamic = Make();
+  const auto scores = Rows({{0.5F, 1.5F}});
+  dynamic.Observe({.id = 9,
+                   .first_position = 41,
+                   .rows = 1,
+                   .prefill = true,
+                   .scores = scores},
+                  42);
+  // The request ended after prefill: no Engage ran.
+  const auto report = dynamic.Report();
+  Require(report.triggered == std::vector<std::string>{"pol"} &&
+              report.position == 42u && report.phase == "prefill" &&
+              !dynamic.engaged(),
+          "a detection is reported even without an ON pass");
+}
+
+void DecodeRowsNeedADecodeThreshold() {
+  auto dynamic = Make();
+  const auto prompt = Rows({{0.0F, 0.2F}});
+  dynamic.Observe({.id = 1,
+                   .first_position = 9,
+                   .rows = 1,
+                   .prefill = true,
+                   .scores = prompt},
+                  10);
+  const auto high = Rows({{9.0F, 9.0F}, {1.0F, 0.5F}});
+  dynamic.Observe({.id = 2,
+                   .first_position = 10,
+                   .rows = 2,
+                   .prefill = false,
+                   .scores = high},
+                  12);
+  Require(!dynamic.Engage(12) && dynamic.Report().triggered.empty(),
+          "generated rows never turn a profile ON without decode_threshold");
+  const auto report = dynamic.Report();
+  Require(report.max_scores.size() == 2 &&
+              report.max_scores[0].second == 9.0F &&
+              report.scores[0].second == 0.2F,
+          "generated rows are still measured for max_scores");
 }
 
 void DecodeTriggerIgnoresRolledBackRows() {
-  auto dynamic = Make();
+  auto dynamic = Make(true);
   const auto prompt = Rows({{0.0F, 0.2F}});
   dynamic.Observe({.id = 1,
                    .first_position = 9,
@@ -136,11 +184,11 @@ void DecodeTriggerIgnoresRolledBackRows() {
           "decode report");
   Require(report.max_scores[0].second == 2.0F &&
               report.max_scores[1].second == 3.5F,
-          "max over committed rows only");
+          "max over committed generated rows only");
 }
 
 void ReportWithoutTrigger() {
-  auto dynamic = Make();
+  auto dynamic = Make(true);
   Require(dynamic.Report().scores.empty() &&
               dynamic.Report().triggered.empty() && !dynamic.Report().position,
           "empty before any pass");
@@ -165,7 +213,7 @@ void ReportWithoutTrigger() {
           "OFF scores are the last prompt row's");
   Require(report.max_scores[0].second == 0.9F &&
               report.max_scores[1].second == 1.5F,
-          "OFF max over every committed row");
+          "OFF max over every committed generated row");
   // An equal score does not cross.
   const auto equal = Rows({{2.0F, 1.0F}});
   dynamic.Observe({.id = 6,
@@ -226,6 +274,8 @@ int main() {
   try {
     PrefillTrigger();
     DecodeTriggerIgnoresRolledBackRows();
+    PrefillDetectionReportedBeforeAnyOnPass();
+    DecodeRowsNeedADecodeThreshold();
     ReportWithoutTrigger();
     Identities();
     bool rejected = false;

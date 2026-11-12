@@ -296,7 +296,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
       if (profile->trigger)
         m->dynamic_candidates_.push_back(
             {profile->name, *m->executor_->DetectorColumn(profile->name),
-             profile->trigger->threshold,
+             profile->trigger->threshold, profile->trigger->decode_threshold,
              ResolveAbliterationSettings(*profile)});
     qwen::ValidateNativeSources(*m->reader_);
     if (m->mtp_reader_)
@@ -620,7 +620,9 @@ void Session::ConfigureDynamicAbliteration(
 }
 
 void Session::ApplyDynamicAbliteration() {
-  if (!dynamic_ || dynamic_->engaged())
+  // A session left invalid by a failed operation is not decoded; its pass
+  // records are not trusted.
+  if (!valid_ || !dynamic_ || dynamic_->engaged())
     return;
   const auto committed = static_cast<std::uint32_t>(tokens_.size());
   dynamic_->Observe(session_->DetectorScores(), committed);

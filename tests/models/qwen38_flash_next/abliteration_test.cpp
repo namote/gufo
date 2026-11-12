@@ -284,6 +284,14 @@ int main() {
   Require(dynamic.trigger && dynamic.trigger->layer == 1 &&
           dynamic.trigger->threshold == 1.25F &&
           dynamic.trigger->direction == std::vector<float>{0, 0, 1});
+  Require(!dynamic.trigger->decode_threshold);
+  {
+    auto text = trigger;
+    text.insert(text.find(R"("threshold")"), R"("decode_threshold":2.5,)");
+    Require(with_trigger(text).trigger->decode_threshold == 2.5F);
+    text.replace(text.find("2.5"), 3, "\"y\"");
+    Require(throws([&] { (void)with_trigger(text); }));
+  }
   for (const auto& [from, to] :
        std::initializer_list<std::pair<std::string_view, std::string_view>>{
            {R"("layer":1)", R"("layer":2)"},

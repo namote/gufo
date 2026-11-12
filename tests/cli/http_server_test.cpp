@@ -654,6 +654,7 @@ void TestLlamaProps() {
   assert(listed[1].member_str("profile") == "fnx");
   assert(listed[1].find("trigger")->member_size("layer") == 2);
   assert(listed[1].find("trigger")->find("threshold")->as_double() == 1.25);
+  assert(listed[1].find("trigger")->find("decode_threshold")->is_null());
 }
 
 void TestApplyTemplate() {

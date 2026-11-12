@@ -22,7 +22,10 @@ inline constexpr std::uint32_t kDetectorColumns =
 struct DynamicAbliterationCandidate {
   std::string profile;
   std::uint32_t column{0};
+  /// For the last prompt row.
   float threshold{0};
+  /// For generated rows; without one they never turn the profile ON.
+  std::optional<float> decode_threshold;
   std::shared_ptr<const qwen::AbliterationSettings> settings;
 };
 
@@ -41,30 +44,35 @@ struct DetectorPass {
 
 /// What a request reports as `abliteration` (docs/SERVER.md).
 struct DynamicAbliterationReport {
-  /// Profiles turned ON by detection (at most one; see DynamicAbliteration).
+  /// The profile detection selected (at most one; see DynamicAbliteration),
+  /// also when the request ended before a pass ran with it ON.
   std::vector<std::string> triggered;
-  /// Per candidate: the score of the row that turned a profile ON, else of
-  /// the last prompt row; empty before any scored row.
+  /// Per candidate: the score of the row that crossed, else of the last
+  /// prompt row; empty before any scored row.
   std::vector<std::pair<std::string, float>> scores;
-  /// Per candidate: the largest score of any committed row.
+  /// Per candidate: the largest score of any committed generated row (the
+  /// data a `decode_threshold` is fitted on); empty before one.
   std::vector<std::pair<std::string, float>> max_scores;
-  /// The first token position computed with the profile ON (the prompt
-  /// length for a prefill detection); empty while OFF.
+  /// The first token position computed (or to be computed) with the
+  /// profile ON: the prompt length for a prefill detection; empty without
+  /// one.
   std::optional<std::uint32_t> position;
-  /// "prefill" or "decode": the pass whose row crossed; empty while OFF.
+  /// "prefill" or "decode": the pass whose row crossed; empty without one.
   std::string phase;
 };
 
 /// Per-request detection state (A1, sticky, one profile at a time).
 ///
 /// Observe() reads a pass's rows that the session committed (positions below
-/// `committed`; rows a verification rolled back are ignored). The first row
-/// on which any candidate's score exceeds its threshold selects the candidate
-/// with the largest margin (score - threshold). Engage() hands its settings,
-/// made dynamic at the session's committed length, to the caller before the
-/// next trunk pass; from then on the profile stays ON for the rest of the
-/// request and later rows are no longer scored. Prompt rows already computed
-/// keep their OFF state.
+/// `committed`; rows a verification rolled back are ignored). The last
+/// prompt row is compared with each candidate's `threshold`; generated rows
+/// only with a `decode_threshold` (none by default: they are scored for
+/// `max_scores` only). The first row on which a candidate crosses selects
+/// the one with the largest margin (score - threshold). Engage() hands its
+/// settings, made dynamic at the session's committed length, to the caller
+/// before the next trunk pass; from then on the profile stays ON for the rest
+/// of the request and later rows are no longer scored. Prompt rows already
+/// computed keep their OFF state.
 class DynamicAbliteration {
 public:
   explicit DynamicAbliteration(std::vector<DynamicAbliterationCandidate> c);
@@ -94,7 +102,7 @@ private:
   std::optional<std::size_t> pending_;
   bool pending_prefill_{false};
   bool engaged_{false};
-  std::size_t chosen_{0};
+  std::uint32_t pending_position_{0};
   std::uint32_t position_{0};
 };
 

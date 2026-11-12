@@ -565,11 +565,15 @@ On Flash-Next a profile may carry a detector, the optional v2 member
 {"trigger": {"schema": "gufo-abliteration-trigger-v1", "layer": 38,
              "readout": "last-prompt-token-post-layer-hc-mean-fp32-v1",
              "direction": "<base64 little-endian float32, hidden values>",
-             "threshold": 1.199, "fit": {}}}
+             "threshold": 1.199, "decode_threshold": 2.4, "fit": {}}}
 ```
 
 `direction` is a unit vector; `readout` must be the collector readout of the
-profile's placement; `fit` (the fit report) and other members are ignored.
+profile's placement; `threshold` applies to the last prompt row, the readout
+it was fitted on. The optional `decode_threshold` lets generated rows turn
+the profile ON too; it must be fitted separately on generated rows (for
+example from `max_scores` of ordinary generations), and without it generated
+rows never do. `fit` (the fit report) and other members are ignored.
 Profiles without `trigger` are only turned ON by requests, as above.
 
 A Chat Completions, Responses or Messages request **without** an
@@ -582,18 +586,34 @@ residual projection; `rocm::Executor::ForwardBody` and
 `tools/qwen38_flash_next/abliteration/collect.cpp`). A prefill pass scores
 its last row (the last prompt token once the prompt is complete); decode,
 batched decode, MTP verification and wide copy verification score every row,
-and only rows the session keeps count (rejected drafts do not). The scores
+and only rows the session keeps count (rejected drafts do not). Generated
+rows are always scored for the report; they act only through
+`decode_threshold`. A detecting request reuses at most all but the last
+prompt token from the cache, so even an exact repeat of a cached prompt runs
+the scored pass of its last token. The scores
 travel with the pass's logits download, with no extra synchronization. A
 server without a dynamic profile runs no detector kernel.
 
-Before the next decode pass, the first kept row whose score exceeds a
-profile's `threshold` turns that profile ON with its defaults, sticky for the
-rest of the request (A1). The prompt state computed OFF is kept: a detection
-on the last prompt row turns the profile ON from the first generated token's
-pass on (so the first generated token itself was sampled OFF), and a
-detection during decoding turns it ON from the following pass. One profile is
-ON at a time: when several cross on one row, the largest margin
-(`score − threshold`) wins, and detection stops once a profile is ON.
+Before the next decode pass, a last prompt row above a profile's `threshold`
+(or a kept generated row above its `decode_threshold`) turns that profile ON
+with its defaults, sticky for the rest of the request (A1). The prompt state
+computed OFF is kept: a detection on the last prompt row turns the profile
+ON from the first generated token's pass on (so the first generated token
+itself was sampled OFF), and a detection during decoding turns it ON from the
+following pass. One profile is ON at a time: when several cross on one row,
+the largest margin wins, and detection stops once a profile is ON.
+
+Re-running the last prompt token ON after a prefill detection, so the first
+token also comes from ON logits, is not implemented. The pass that scores
+that token has already advanced every GatedDeltaNet, convolution, PLE and
+n-gram state and written its K/V; the executor can roll a verification pass
+back only to its first row kept (`Rollback` keeps at least one), and a
+prefill pass keeps no rollback rows at all. Undoing it would need a
+pre-token copy of every recurrent state (plus the MTP draft state and KVarN
+records) on each detecting request, or running that token in a verification
+pass, whose arithmetic differs from the prefill readout the threshold was
+fitted on. Re-prefilling the whole prompt ON (A2) is the cleaner remedy if
+the GPU quality comparison shows the OFF first token matters.
 
 A request with an `abliteration` member never detects: `"enabled":true` is
 the explicit ON above and `"enabled":false` is a plain OFF. Scoring requests
@@ -610,11 +630,13 @@ Completions, the terminal streaming chunk, Responses and Messages):
                   "position": 412, "phase": "prefill"}}
 ```
 
-`triggered` lists the profile turned ON (empty while OFF); `scores` holds the
-scores of the row that turned it ON, or else of the last prompt row;
-`max_scores` the largest score of any kept row; `position` is the first token
-position computed ON (the prompt length for `prefill`; null while OFF) and
-`phase` is `prefill` or `decode` (null while OFF).
+`triggered` lists the profile detection selected (empty without a
+crossing; listed even when the request ended before a pass ran ON);
+`scores` holds the scores of the crossing row, or else of the last prompt
+row; `max_scores` the largest score of any kept generated row (empty when
+none was generated before a switch); `position` is the first token position
+computed ON, or that would have been (the prompt length for `prefill`; null
+without a crossing) and `phase` is `prefill` or `decode` (null without one).
 
 Cache and continuation: the request's checkpoints up to `position` are OFF
 states and are shared with OFF requests. A state that includes tokens
@@ -624,9 +646,7 @@ other switch point restores it; the request's live frontier is not kept for
 the next turn. The next turn therefore continues from the last OFF checkpoint
 (normally its prompt), prefills the previous answer OFF and detects afresh.
 Reusing the switched state instead would hand the next request an answer
-whose state was computed ON while its own request starts OFF. An exact repeat
-of a cached prompt skips the prefill pass and so its prompt-row detection;
-such a request detects from its decode rows only.
+whose state was computed ON while its own request starts OFF.
 
 Diagnostic telemetry is limited to status, token counts, timing, and
 cancellation state. It must not contain prompt text, model paths, machine

@@ -27,25 +27,36 @@ void DynamicAbliteration::Observe(const DetectorPass& pass,
   if (pass.scores.size() < std::size_t{pass.rows} * kDetectorColumns)
     throw std::logic_error("detector pass is shorter than its rows");
   for (std::uint32_t r = 0; r < pass.rows; ++r) {
-    if (pass.first_position + r >= committed)
+    const std::uint32_t position = pass.first_position + r;
+    if (position >= committed)
       break;
     const auto row = pass.scores.subspan(std::size_t{r} * kDetectorColumns,
                                          kDetectorColumns);
-    for (std::size_t i = 0; i < candidates_.size(); ++i) {
-      const float score = row[candidates_[i].column];
-      max_scores_[i] = have_max_ ? std::max(max_scores_[i], score) : score;
+    if (!pass.prefill) {
+      for (std::size_t i = 0; i < candidates_.size(); ++i) {
+        const float score = row[candidates_[i].column];
+        max_scores_[i] = have_max_ ? std::max(max_scores_[i], score) : score;
+      }
+      have_max_ = true;
     }
-    have_max_ = true;
     if (pending_)
       continue;
-    // The best margin among the candidates that crossed on this row.
+    // The best margin among the candidates that crossed on this row: the
+    // prompt threshold on the last prompt row, the decode threshold (when
+    // the trigger has one) on generated rows.
     std::optional<std::size_t> best;
+    float best_margin = 0;
     for (std::size_t i = 0; i < candidates_.size(); ++i) {
-      const float margin =
-          row[candidates_[i].column] - candidates_[i].threshold;
-      if (margin > 0 && (!best || margin > row[candidates_[*best].column] -
-                                               candidates_[*best].threshold))
+      const auto threshold = pass.prefill
+                                 ? std::optional(candidates_[i].threshold)
+                                 : candidates_[i].decode_threshold;
+      if (!threshold)
+        continue;
+      const float margin = row[candidates_[i].column] - *threshold;
+      if (margin > 0 && (!best || margin > best_margin)) {
         best = i;
+        best_margin = margin;
+      }
     }
     if (best || pass.prefill) {
       for (std::size_t i = 0; i < candidates_.size(); ++i)
@@ -55,6 +66,7 @@ void DynamicAbliteration::Observe(const DetectorPass& pass,
     if (best) {
       pending_ = best;
       pending_prefill_ = pass.prefill;
+      pending_position_ = position + 1;
     }
   }
 }
@@ -64,9 +76,8 @@ std::shared_ptr<const qwen::AbliterationSettings> DynamicAbliteration::Engage(
   if (engaged_ || !pending_)
     return nullptr;
   engaged_ = true;
-  chosen_ = *pending_;
   position_ = position;
-  return qwen::DynamicAbliterationSettings(*candidates_[chosen_].settings,
+  return qwen::DynamicAbliterationSettings(*candidates_[*pending_].settings,
                                            position);
 }
 
@@ -78,9 +89,11 @@ DynamicAbliterationReport DynamicAbliteration::Report() const {
     if (have_max_)
       report.max_scores.emplace_back(candidates_[i].profile, max_scores_[i]);
   }
-  if (engaged_) {
-    report.triggered.push_back(candidates_[chosen_].profile);
-    report.position = position_;
+  // A crossing reports its profile even when the request ended before a
+  // pass ran ON; the position is where ON starts (or would have started).
+  if (pending_) {
+    report.triggered.push_back(candidates_[*pending_].profile);
+    report.position = engaged_ ? position_ : pending_position_;
     report.phase = pending_prefill_ ? "prefill" : "decode";
   }
   return report;

@@ -65,6 +65,9 @@ struct AbliterationInfo {
   /// that turns ON only when a request asks for it.
   std::optional<std::uint32_t> trigger_layer;
   std::optional<float> trigger_threshold;
+  /// Its threshold for generated rows; empty: only the last prompt row
+  /// turns the profile ON.
+  std::optional<float> trigger_decode_threshold;
 };
 
 /// A request's dynamic abliteration (`abliteration` in its response): the

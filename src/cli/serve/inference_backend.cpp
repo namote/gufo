@@ -148,6 +148,9 @@ std::vector<AbliterationInfo> DescribeAbliteration(
         .trigger_threshold = profile->trigger
                                  ? std::optional(profile->trigger->threshold)
                                  : std::nullopt,
+        .trigger_decode_threshold = profile->trigger
+                                        ? profile->trigger->decode_threshold
+                                        : std::nullopt,
     });
   }
   return result;
@@ -3192,6 +3195,14 @@ public:
                         : std::nullopt,
         .phase = report->phase,
     };
+  }
+
+  // A detecting request reuses at most prompt.size() - 1 cached tokens: its
+  // last prompt token must run the scored pass (an exact repeat of a cached
+  // prompt would otherwise skip detection).
+  [[nodiscard]] bool HasDecodeFrontier(
+      const TextRunnerState& state) const override {
+    return !RequireQwenFlashNextState(state).session().Detecting();
   }
 
   [[nodiscard]] bool LiveStateReusable(

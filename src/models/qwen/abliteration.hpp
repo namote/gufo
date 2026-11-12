@@ -69,12 +69,15 @@ inline constexpr std::string_view kAbliterationTriggerSchema =
 /// A profile's detector (R2 dynamic abliteration): the server scores
 /// <h, direction> on the post-layer residual of `layer`, read exactly where
 /// the collector reads it, and turns the profile ON for the rest of a request
-/// whose score exceeds `threshold`.
+/// whose last prompt row scores above `threshold` (fitted on that readout).
+/// Generated rows turn it ON only above the optional `decode_threshold`,
+/// which needs its own fit on generated rows.
 struct AbliterationTrigger {
   std::uint32_t layer{0};
   /// Unit vector of the profile's hidden size.
   std::vector<float> direction;
   float threshold{0};
+  std::optional<float> decode_threshold;
 };
 
 /// Which direction family a request projects (D18).
