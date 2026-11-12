@@ -1625,6 +1625,10 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
         json::Value trigger = json::Value::object();
         trigger["layer"] = static_cast<unsigned long long>(*info.trigger_layer);
         trigger["threshold"] = static_cast<double>(*info.trigger_threshold);
+        json::Value with = json::Value::array();
+        for (const auto& name : info.trigger_with)
+          with.push_back(name);
+        trigger["with"] = std::move(with);
         trigger["decode_threshold"] = info.trigger_decode_threshold
                                           ? json::Value(static_cast<double>(
                                                 *info.trigger_decode_threshold))

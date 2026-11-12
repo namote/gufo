@@ -52,6 +52,10 @@ void AddAbliterationReport(const TextGenerationBackend::Result& result,
   for (const auto& name : report.triggered)
     triggered.push_back(name);
   value["triggered"] = std::move(triggered);
+  json::Value crossed = json::Value::array();
+  for (const auto& name : report.crossed)
+    crossed.push_back(name);
+  value["crossed"] = std::move(crossed);
   const auto scores = [](const auto& pairs) {
     json::Value object = json::Value::object();
     for (const auto& [name, score] : pairs)
@@ -3450,6 +3454,15 @@ bool ParseOpenAiResponseMessage(const json::Value& item,
   return ParseMessage(converted, message, budget, error);
 }
 
+namespace {
+/// A per-profile setting member of `abliteration`.
+bool IsAbliterationSetting(std::string_view key) {
+  return key == "direction_layer" || key == "attention" || key == "mlp" ||
+         key == "residual" || key == "direction_kind" || key == "directions" ||
+         key == "preserve_norm";
+}
+}  // namespace
+
 std::optional<HttpResponse> ParseAbliterationControl(
     const json::Value& body, const TextGenerationBackend& backend,
     ChatRequest* chat) {
@@ -3463,128 +3476,197 @@ std::optional<HttpResponse> ParseAbliterationControl(
     return invalid("'abliteration' must be an object");
   bool overrides = false;
   for (const auto& [key, ignored] : value->members()) {
-    if (key != "enabled" && key != "profile" && key != "direction_layer" &&
-        key != "attention" && key != "mlp" && key != "residual" &&
-        key != "direction_kind" && key != "directions" &&
-        key != "preserve_norm")
+    if (key != "enabled" && key != "profile" && key != "overrides" &&
+        !IsAbliterationSetting(key))
       return invalid("unsupported abliteration member: " + key);
-    overrides = overrides || (key != "enabled" && key != "profile");
+    overrides = overrides || IsAbliterationSetting(key);
   }
   const auto* enabled = value->find("enabled");
   if (!enabled || !enabled->is_bool())
     return invalid("'abliteration.enabled' must be a boolean");
   const auto* profile = value->find("profile");
-  if (profile && !profile->is_string())
-    return invalid("'abliteration.profile' must be a string");
+  if (profile && !profile->is_string() && !profile->is_array())
+    return invalid(
+        "'abliteration.profile' must be a profile name or an array of names");
+  const auto* per_profile = value->find("overrides");
   if (!enabled->as_bool()) {
-    if (overrides || profile)
+    if (overrides || profile || per_profile)
       return invalid(
-          "'abliteration.profile', 'direction_layer', 'attention', 'mlp', "
-          "'residual', 'direction_kind', 'directions' and 'preserve_norm' "
-          "need 'enabled': true");
+          "'abliteration.profile', 'overrides', 'direction_layer', "
+          "'attention', 'mlp', 'residual', 'direction_kind', 'directions' "
+          "and 'preserve_norm' need 'enabled': true");
     // Explicit OFF: no projection and no dynamic detection.
     chat->abliteration = false;
     chat->abliteration_specified = true;
     chat->abliteration_overrides = {};
+    chat->abliteration_profiles.clear();
     return {};
   }
   const auto profiles = backend.abliteration_profiles();
   if (profiles.empty())
     return invalid(
         "abliteration profile is not loaded or backend is unsupported");
-  const std::string name = profile ? profile->str() : std::string{};
-  const auto info = backend.abliteration_profile(name);
-  if (!info) {
-    std::string loaded;
-    for (const auto& item : profiles)
-      loaded += (loaded.empty() ? "'" : ", '") + item.name + "'";
+  std::string loaded;
+  for (const auto& item : profiles)
+    loaded += (loaded.empty() ? "'" : ", '") + item.name + "'";
+  const auto unknown = [&](const std::string& name) {
     return invalid(name.empty()
                        ? "name one of the loaded abliteration profiles in "
                          "'abliteration.profile': " +
                              loaded
                        : "unknown abliteration profile '" + name +
                              "'; loaded: " + loaded);
-  }
-  const auto layers = info->layers;
-  models::qwen::AbliterationOverrides parsed;
-  parsed.profile = info->name;
-  if (const auto* layer = value->find("direction_layer")) {
-    if (!info->direction_layer)
-      return invalid(
-          "'abliteration.direction_layer' needs a gufo-abliteration-v2 "
-          "profile; the loaded v1 profile has one fixed direction");
-    const double x = layer->is_number() ? layer->as_double() : -1;
-    if (!(x >= 0) || x >= layers || x != std::floor(x))
-      return invalid(
-          "'abliteration.direction_layer' must be an integer in "
-          "[0, " +
-          std::to_string(layers) + ")");
-    parsed.direction_layer = static_cast<std::uint32_t>(x);
-  }
-  // One number for every layer, or exactly one number per layer.
-  const auto strengths = [&](const char* name, std::vector<float>* out) {
-    const auto* member = value->find(name);
-    if (!member)
-      return std::optional<HttpResponse>{};
-    const std::string field = std::string("'abliteration.") + name + "'";
-    const auto read = [&](const json::Value& item) {
-      const double x = item.is_number() ? item.as_double() : -1;
-      if (!std::isfinite(x) || x < 0 ||
-          x > models::qwen::kAbliterationMaxWeight)
-        return false;
-      out->push_back(static_cast<float>(x));
-      return true;
-    };
-    if (member->is_number()) {
-      if (!read(*member))
-        return std::optional(invalid(field + " must be in [0, 4]"));
-      return std::optional<HttpResponse>{};
-    }
-    if (!member->is_array() || member->size() != layers)
-      return std::optional(invalid(field +
-                                   " must be one number or an array of " +
-                                   std::to_string(layers) + " numbers"));
-    for (const auto& item : member->items())
-      if (!read(item))
-        return std::optional(invalid(field + " values must be in [0, 4]"));
-    return std::optional<HttpResponse>{};
   };
-  if (auto error = strengths("attention", &parsed.attention))
-    return error;
-  if (auto error = strengths("mlp", &parsed.mlp))
-    return error;
-  if (auto error = strengths("residual", &parsed.residual))
-    return error;
-  if (const auto* kind = value->find("direction_kind")) {
-    const auto parsed_kind =
-        kind->is_string()
-            ? models::qwen::ParseAbliterationDirectionKind(kind->str())
-            : std::nullopt;
-    if (!parsed_kind ||
-        std::ranges::find(info->direction_kinds,
-                          models::qwen::AbliterationDirectionKindName(
-                              *parsed_kind)) == info->direction_kinds.end())
+  // One profile's settings (`direction_layer` ... `preserve_norm`) in
+  // `source`, checked against that profile's geometry.
+  const auto parse_one = [&](const json::Value& source,
+                             const AbliterationInfo& info,
+                             models::qwen::AbliterationOverrides& parsed)
+      -> std::optional<HttpResponse> {
+    const auto layers = info.layers;
+    parsed.profile = info.name;
+    if (const auto* layer = source.find("direction_layer")) {
+      if (!info.direction_layer)
+        return invalid(
+            "'abliteration.direction_layer' needs a gufo-abliteration-v2 "
+            "profile; the loaded v1 profile has one fixed direction");
+      const double x = layer->is_number() ? layer->as_double() : -1;
+      if (!(x >= 0) || x >= layers || x != std::floor(x))
+        return invalid(
+            "'abliteration.direction_layer' must be an integer in "
+            "[0, " +
+            std::to_string(layers) + ")");
+      parsed.direction_layer = static_cast<std::uint32_t>(x);
+    }
+    // One number for every layer, or exactly one number per layer.
+    const auto strengths = [&](const char* name, std::vector<float>* out) {
+      const auto* member = source.find(name);
+      if (!member)
+        return std::optional<HttpResponse>{};
+      const std::string field = std::string("'abliteration.") + name + "'";
+      const auto read = [&](const json::Value& item) {
+        const double x = item.is_number() ? item.as_double() : -1;
+        if (!std::isfinite(x) || x < 0 ||
+            x > models::qwen::kAbliterationMaxWeight)
+          return false;
+        out->push_back(static_cast<float>(x));
+        return true;
+      };
+      if (member->is_number()) {
+        if (!read(*member))
+          return std::optional(invalid(field + " must be in [0, 4]"));
+        return std::optional<HttpResponse>{};
+      }
+      if (!member->is_array() || member->size() != layers)
+        return std::optional(invalid(field +
+                                     " must be one number or an array of " +
+                                     std::to_string(layers) + " numbers"));
+      for (const auto& item : member->items())
+        if (!read(item))
+          return std::optional(invalid(field + " values must be in [0, 4]"));
+      return std::optional<HttpResponse>{};
+    };
+    if (auto error = strengths("attention", &parsed.attention))
+      return error;
+    if (auto error = strengths("mlp", &parsed.mlp))
+      return error;
+    if (auto error = strengths("residual", &parsed.residual))
+      return error;
+    if (const auto* kind = source.find("direction_kind")) {
+      const auto parsed_kind =
+          kind->is_string()
+              ? models::qwen::ParseAbliterationDirectionKind(kind->str())
+              : std::nullopt;
+      if (!parsed_kind ||
+          std::ranges::find(info.direction_kinds,
+                            models::qwen::AbliterationDirectionKindName(
+                                *parsed_kind)) == info.direction_kinds.end())
+        return invalid(
+            "'abliteration.direction_kind' must be one of the loaded "
+            "profile's kinds: 'mean_diff', or 'projected' when it stores "
+            "projected directions");
+      parsed.direction_kind = parsed_kind;
+    }
+    if (const auto* count = source.find("directions")) {
+      const double x = count->is_number() ? count->as_double() : 0;
+      if (!(x >= 1) || x > info.rank || x != std::floor(x))
+        return invalid("'abliteration.directions' must be an integer in [1, " +
+                       std::to_string(info.rank) + "]");
+      parsed.direction_count = static_cast<std::uint32_t>(x);
+    }
+    if (const auto* preserve = source.find("preserve_norm")) {
+      if (!preserve->is_bool())
+        return invalid("'abliteration.preserve_norm' must be a boolean");
+      parsed.preserve_norm = preserve->as_bool();
+    }
+    return {};
+  };
+  if (profile && profile->is_array()) {
+    // Several profiles ON together: their names, each with its own settings
+    // in `overrides` (an object keyed by name); no top-level settings.
+    if (overrides)
       return invalid(
-          "'abliteration.direction_kind' must be one of the loaded "
-          "profile's kinds: 'mean_diff', or 'projected' when it stores "
-          "projected directions");
-    parsed.direction_kind = parsed_kind;
+          "with several profiles, settings go in 'abliteration.overrides' "
+          "under each profile's name");
+    if (profile->size() < 2 || profile->size() > profiles.size())
+      return invalid(
+          "'abliteration.profile' arrays name 2 or more loaded profiles");
+    if (per_profile && !per_profile->is_object())
+      return invalid("'abliteration.overrides' must be an object");
+    std::vector<models::qwen::AbliterationOverrides> set;
+    for (const auto& item : profile->items()) {
+      if (!item.is_string())
+        return invalid("'abliteration.profile' names must be strings");
+      const auto info = backend.abliteration_profile(item.str());
+      if (item.str().empty() || !info)
+        return unknown(item.str());
+      for (const auto& other : set)
+        if (other.profile == info->name)
+          return invalid("abliteration profile '" + info->name +
+                         "' named twice");
+      models::qwen::AbliterationOverrides parsed;
+      const auto* own = per_profile ? per_profile->find(info->name) : nullptr;
+      if (own) {
+        if (!own->is_object())
+          return invalid("'abliteration.overrides." + info->name +
+                         "' must be an object");
+        for (const auto& [key, ignored] : own->members())
+          if (!IsAbliterationSetting(key))
+            return invalid("unsupported abliteration member: overrides." +
+                           info->name + "." + key);
+      }
+      if (auto error =
+              parse_one(own ? *own : json::Value::object(), *info, parsed))
+        return error;
+      set.push_back(std::move(parsed));
+    }
+    if (per_profile)
+      for (const auto& [key, ignored] : per_profile->members())
+        if (std::ranges::none_of(
+                set, [&](const auto& item) { return item.profile == key; }))
+          return invalid("'abliteration.overrides' names '" + key +
+                         "', which 'abliteration.profile' does not list");
+    chat->abliteration = true;
+    chat->abliteration_specified = true;
+    chat->abliteration_overrides = {};
+    chat->abliteration_profiles = std::move(set);
+    return {};
   }
-  if (const auto* count = value->find("directions")) {
-    const double x = count->is_number() ? count->as_double() : 0;
-    if (!(x >= 1) || x > info->rank || x != std::floor(x))
-      return invalid("'abliteration.directions' must be an integer in [1, " +
-                     std::to_string(info->rank) + "]");
-    parsed.direction_count = static_cast<std::uint32_t>(x);
-  }
-  if (const auto* preserve = value->find("preserve_norm")) {
-    if (!preserve->is_bool())
-      return invalid("'abliteration.preserve_norm' must be a boolean");
-    parsed.preserve_norm = preserve->as_bool();
-  }
+  if (per_profile)
+    return invalid(
+        "'abliteration.overrides' needs an array 'abliteration.profile'; "
+        "one profile takes its settings at the top level");
+  const std::string name = profile ? profile->str() : std::string{};
+  const auto info = backend.abliteration_profile(name);
+  if (!info)
+    return unknown(name);
+  models::qwen::AbliterationOverrides parsed;
+  if (auto error = parse_one(*value, *info, parsed))
+    return error;
   chat->abliteration = true;
   chat->abliteration_specified = true;
   chat->abliteration_overrides = std::move(parsed);
+  chat->abliteration_profiles.clear();
   return {};
 }
 

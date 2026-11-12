@@ -61,6 +61,8 @@ struct AbliterationInfo {
   bool preserve_norm{false};
   /// "pca", "som" or empty.
   std::string subspace_method;
+  /// Profiles a detection of this profile turns ON with it (`trigger.with`).
+  std::vector<std::string> trigger_with;
   /// A dynamic profile's detector layer and threshold; empty for a profile
   /// that turns ON only when a request asks for it.
   std::optional<std::uint32_t> trigger_layer;
@@ -73,7 +75,10 @@ struct AbliterationInfo {
 /// A request's dynamic abliteration (`abliteration` in its response): the
 /// profiles detection turned ON, the detector scores and where it switched.
 struct AbliterationReport {
+  /// Every profile turned ON: the crossing ones and their companions.
   std::vector<std::string> triggered;
+  /// The profiles whose detectors crossed.
+  std::vector<std::string> crossed;
   /// Per dynamic profile: the score of the row that turned it ON, else of
   /// the last prompt row.
   std::vector<std::pair<std::string, float>> scores;
@@ -181,6 +186,10 @@ struct ChatRequest {
   /// Per-request settings while `abliteration` is ON; empty members keep the
   /// profile defaults.
   models::qwen::AbliterationOverrides abliteration_overrides;
+  /// Several profiles ON together (`abliteration.profile` an array): one
+  /// entry per named profile with its own settings; empty for one profile,
+  /// whose settings are `abliteration_overrides`.
+  std::vector<models::qwen::AbliterationOverrides> abliteration_profiles;
   /// Bypass prompt reuse for this request; its completed state may be retained.
   bool cache_prompt{true};
   /// False keeps this request's checkpoints out of the disk cache; it may

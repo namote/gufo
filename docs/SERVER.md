@@ -550,11 +550,56 @@ has `profile` (the name), `schema`, `identity`, `layers`, the
 (one number when uniform), the `direction_kinds` a request may name, the
 default `direction_kind`, `max_directions` (the stored rank), the default
 `directions` count, `preserve_norm`, `subspace_method` (`pca`, `som` or null)
-`max_strength` and `trigger` (`{"layer", "threshold"}`, or null); never the
-direction vectors. Preparation, qualification and the automatic strength
-search are model-specific: see
+`max_strength` and `trigger` (`{"layer", "threshold", "decode_threshold",
+"with"}`, or null); never the direction vectors. Preparation, qualification
+and the automatic strength search are model-specific: see
 [Qwen3.8-27B](models/qwen3.8-27b/ABLITERATION.md) and
 [Flash-Next](models/qwen3.8-flash-next/ABLITERATION.md).
+
+#### Several profiles
+
+On Flash-Next one request may turn several loaded profiles ON together by
+naming them in an array; each keeps its own directions and default
+strengths, and its own settings go in `overrides` under its name (the
+single-profile members are then rejected at the top level):
+
+```json
+{"abliteration": {"enabled": true, "profile": ["pol-avg", "fnx"],
+                  "overrides": {"fnx": {"attention": 1.5}}}}
+```
+
+The array names two or more distinct loaded profiles; `overrides` may name
+only listed profiles and holds the same members as a single-profile request
+(`direction_layer`, `attention`, `mlp`, `residual`, `direction_kind`,
+`directions`, `preserve_norm`). A single name keeps the single form above,
+with its settings at the top level. The profiles apply in profile load
+order (file name order), whatever order the array lists them in.
+The set has one cache identity (gufo-abliteration-combined-v1 over the
+profiles' settings identities in load order), shared by every request naming
+the same profiles and settings, and by a readmission that turns them ON
+together. One profile keeps exactly its single-profile identity, kernels and
+speed.
+
+How several profiles project. Profile directions are not orthogonal (the
+political and refusal directions share components), so at each site
+(attention and MLP writers, post-layer residual, per layer) the profiles
+with a nonzero strength there act through one projection onto the
+orthonormal basis of the union of their directions (modified Gram-Schmidt in
+FP64 on the host, once per request settings; rows already in the span are
+dropped). A shared component is then removed once, and the result does not
+depend on the profiles' order. The strength there is the largest of those
+profiles' strengths at that site, and norms are preserved when any of them
+preserves them. A site where one profile acts uses that profile's own
+directions and strength, exactly as when it is ON alone; a site where none
+acts runs no kernel. The union at one site may span at most 8 directions.
+Taking the largest strength means no profile removes less of its own
+direction than it asked for, and the shared part is removed once instead of
+twice; the alternative, each profile's strength on its own orthogonal
+complement, depends on the order the complements are taken in. Sets of
+profiles active at the same sites share one precomputed device block, so a
+pass runs one projection per site as with one profile. Only suppression
+exists: every strength is in [0, 4], and the rule is defined for removing
+directions only (additive steering profiles, R5, are not supported here).
 
 #### Dynamic abliteration
 
@@ -573,8 +618,13 @@ profile's placement; `threshold` applies to the last prompt row, the readout
 it was fitted on. The optional `decode_threshold` lets generated rows turn
 the profile ON too; it must be fitted separately on generated rows (for
 example from `max_scores` of ordinary generations), and without it generated
-rows never do. `fit` (the fit report) and other members are ignored.
-Profiles without `trigger` are only turned ON by requests, as above.
+rows never do. The optional `with` lists companion profiles (loaded names,
+not the profile itself) that a detection turns ON together with this one,
+with their defaults, as an explicit array request naming all of them would;
+a companion needs no trigger of its own and turns ON by itself only if it
+has one (`fit_trigger.py --with NAME` writes the member). `fit` (the fit
+report) and other members are ignored. Profiles without `trigger` are only
+turned ON by requests, as above.
 
 A Chat Completions, Responses or Messages request **without** an
 `abliteration` member starts OFF, as an OFF request with the same cache
@@ -594,10 +644,11 @@ the scored pass of its last token. The scores
 travel with the pass's logits download, with no extra synchronization. A
 server without a dynamic profile runs no detector kernel.
 
-**Prompt-row detection (A2).** When the last prompt row scores above a
-profile's `threshold` (one profile: the largest margin `score − threshold`
-wins), the request runs again as an explicit ON request with that profile's
-defaults, exactly as `{"abliteration":{"enabled":true,"profile":NAME}}`
+**Prompt-row detection (A2).** When the last prompt row scores above one or
+more profiles' `threshold`, all of them turn ON together with their `with`
+companions (a union without duplicates, each with its defaults): the request
+runs again as an explicit ON request exactly as
+`{"abliteration":{"enabled":true,"profile":[NAMES]}}` (or the single name)
 would: the scheduler commits the OFF state (its prompt checkpoint stays
 cached for OFF requests; the commit joins that checkpoint's capture, one
 state copy, inside the step) and puts the request back at the front of
@@ -623,10 +674,11 @@ the prompt K/V OFF, and the GPU check showed that keeps refusals and the
 official framing.
 
 **Generated-row detection (A1).** Only a profile whose trigger has a
-`decode_threshold` acts on generated rows: before the next decode pass, a
-kept generated row above it turns the profile ON with its defaults from that
-pass on, sticky for the rest of the request; the computed tokens keep their
-OFF state. Detection stops once a profile is ON.
+`decode_threshold` acts on generated rows: before the next decode pass, the
+profiles crossing on the first kept generated row above their thresholds
+turn ON with their companions from that pass on, sticky for the rest of the
+request; the computed tokens keep their OFF state. Detection stops once
+profiles are ON.
 
 A request with an `abliteration` member never detects: `"enabled":true` is
 the explicit ON above and `"enabled":false` is a plain OFF. Scoring requests
@@ -637,15 +689,16 @@ A request that ran detection reports it in the response (non-streaming Chat
 Completions, the terminal streaming chunk, Responses and Messages):
 
 ```json
-{"abliteration": {"triggered": ["pol-avg"],
+{"abliteration": {"triggered": ["fnx", "pol-avg"], "crossed": ["pol-avg"],
                   "scores": {"pol-avg": 1.83},
                   "max_scores": {},
                   "position": 0, "phase": "prefill",
                   "reprefill_tokens": 412}}
 ```
 
-`triggered` lists the profile detection selected (empty without a
-crossing; for a generated-row crossing listed even when the request ended
+`triggered` lists every profile detection turned ON, the crossing ones and
+their `with` companions in load order, and `crossed` the profiles whose
+detectors crossed (both empty without a crossing; for a generated-row crossing listed even when the request ended
 before a pass ran ON); `scores` holds the scores of the crossing row, or else
 of the last prompt row; `max_scores` the largest score of any kept generated
 row of the OFF run (empty when it generated none, as after a readmission);

@@ -7238,6 +7238,42 @@ void TestAbliterationControls() {
              "mlp":[1,2,3]}})")
              .has_value(),
          "another profile's layer count rejected");
+  // Several profiles in one request: an array of names, settings per name.
+  Expect(!parse(R"({"abliteration":{"enabled":true,
+             "profile":["fnx","pol"],"overrides":{"fnx":{"mlp":[1,2]}}}})") &&
+             request.abliteration &&
+             request.abliteration_overrides.profile.empty() &&
+             request.abliteration_profiles.size() == 2 &&
+             request.abliteration_profiles[0].profile == "fnx" &&
+             request.abliteration_profiles[0].mlp ==
+                 std::vector<float>{1.0F, 2.0F} &&
+             request.abliteration_profiles[1].profile == "pol" &&
+             request.abliteration_profiles[1].mlp.empty(),
+         "an array names several profiles with their own settings");
+  Expect(!parse(R"({"abliteration":{"enabled":true,"profile":"pol"}})") &&
+             request.abliteration_profiles.empty(),
+         "a single name clears the array form");
+  for (const auto* body : {
+           R"({"abliteration":{"enabled":true,"profile":["pol"]}})",
+           R"({"abliteration":{"enabled":true,"profile":["pol","pol"]}})",
+           R"({"abliteration":{"enabled":true,"profile":["pol","x"]}})",
+           R"({"abliteration":{"enabled":true,"profile":["pol",1]}})",
+           R"({"abliteration":{"enabled":true,"profile":["pol","fnx"],
+               "mlp":1}})",
+           R"({"abliteration":{"enabled":true,"profile":["pol","fnx"],
+               "overrides":{"x":{}}}})",
+           R"({"abliteration":{"enabled":true,"profile":["pol","fnx"],
+               "overrides":{"fnx":{"mlp":[1,2,3]}}}})",
+           R"({"abliteration":{"enabled":true,"profile":["pol","fnx"],
+               "overrides":{"fnx":{"profile":"pol"}}}})",
+           R"({"abliteration":{"enabled":true,"profile":"pol",
+               "overrides":{"pol":{}}}})",
+           R"({"abliteration":{"enabled":false,"profile":["pol","fnx"]}})",
+       }) {
+    const auto error = parse(body);
+    Expect(error.has_value() && error->status == 400,
+           "invalid profile arrays rejected");
+  }
 }
 
 void TestScoreAssistant() {

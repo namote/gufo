@@ -142,6 +142,8 @@ std::vector<AbliterationInfo> DescribeAbliteration(
         .direction_count = profile->direction_count,
         .preserve_norm = profile->preserve_norm,
         .subspace_method = profile->subspace_method,
+        .trigger_with = profile->trigger ? profile->trigger->with
+                                         : std::vector<std::string>{},
         .trigger_layer = profile->trigger
                              ? std::optional(profile->trigger->layer)
                              : std::nullopt,
@@ -324,23 +326,16 @@ TextPreparedPrompt SelectAbliteration(TextPreparedPrompt result,
   if (profiles.empty())
     throw std::invalid_argument(
         "abliteration profile is not loaded; prepare it first");
-  const models::qwen::AbliterationProfile* profile = nullptr;
-  if (request.abliteration_overrides.profile.empty()) {
-    if (profiles.size() != 1)
-      throw std::invalid_argument(
-          "abliteration: name one of the loaded profiles in "
-          "'abliteration.profile'");
-    profile = profiles.front();
-  }
-  for (const auto* candidate : profiles)
-    if (candidate->name == request.abliteration_overrides.profile)
-      profile = candidate;
-  if (!profile)
-    throw std::invalid_argument("abliteration: unknown profile '" +
-                                request.abliteration_overrides.profile + "'");
+  // One profile (`profile` a name or omitted) or several (an array).
+  const auto requested =
+      request.abliteration_profiles.empty()
+          ? std::span<const models::qwen::AbliterationOverrides>(
+                &request.abliteration_overrides, 1)
+          : std::span<const models::qwen::AbliterationOverrides>(
+                request.abliteration_profiles);
   result.context = AbliterationContext(
-      result.context, models::qwen::ResolveAbliterationSettings(
-                          *profile, request.abliteration_overrides));
+      result.context,
+      models::qwen::ResolveAbliterationSet(profiles, requested));
   return result;
 }
 
@@ -3203,11 +3198,15 @@ public:
         RequireQwenFlashNextState(state).session().DynamicReport();
     if (!report || report->phase != "prefill" || report->triggered.empty())
       return nullptr;
-    for (const auto& profile : model_->AbliterationProfiles())
-      if (profile->name == report->triggered.front())
-        return AbliterationContext(
-            context, models::qwen::ResolveAbliterationSettings(*profile));
-    throw std::logic_error("detected abliteration profile is not loaded");
+    // The trigger's profile and its companions, each with its defaults: the
+    // settings (and so the cache identity) of an explicit request naming
+    // the same profiles.
+    std::vector<models::qwen::AbliterationOverrides> set;
+    for (const auto& name : report->triggered)
+      set.push_back({.profile = name});
+    const auto loaded = ListProfiles(model_->AbliterationProfiles());
+    return AbliterationContext(
+        context, models::qwen::ResolveAbliterationSet(loaded, set));
   }
 
   [[nodiscard]] std::optional<AbliterationReport> DynamicAbliteration(
@@ -3218,6 +3217,7 @@ public:
       return std::nullopt;
     return AbliterationReport{
         .triggered = report->triggered,
+        .crossed = report->crossed,
         .scores = report->scores,
         .max_scores = report->max_scores,
         .position = report->position

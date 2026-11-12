@@ -643,6 +643,7 @@ void TestLlamaProps() {
                        .attention = {0, 0, 0},
                        .mlp = {0, 0, 0},
                        .residual = {1, 1, 1},
+                       .trigger_with = {"pol"},
                        .trigger_layer = 2,
                        .trigger_threshold = 1.25F}};
   const auto both = props("/props")["abliteration"];
@@ -655,6 +656,8 @@ void TestLlamaProps() {
   assert(listed[1].find("trigger")->member_size("layer") == 2);
   assert(listed[1].find("trigger")->find("threshold")->as_double() == 1.25);
   assert(listed[1].find("trigger")->find("decode_threshold")->is_null());
+  assert(listed[1].find("trigger")->find("with")->size() == 1 &&
+         listed[1].find("trigger")->find("with")->items()[0].str() == "pol");
 }
 
 void TestApplyTemplate() {
