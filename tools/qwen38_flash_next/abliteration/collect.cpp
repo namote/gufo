@@ -10,6 +10,14 @@
 //             "own") and `pair` (the question both answers share). The
 //             prompt is framed as score_assistant frames it (thinking off,
 //             the empty thinking block, then the content tokenized as text).
+//   segments  like answers, with thinking ON framing (the reasoning is the
+//             teacher-forced continuation after the opening think tag) and
+//             the mean taken only over selected rows: `segments` is the
+//             reasoning split into strings (tokenized one by one and
+//             concatenated) and `select` lists segment indexes k whose last
+//             token's row (the row that predicts segment k+1's first token,
+//             e.g. a "\n\n" thought delimiter) is averaged. Records need
+//             group exemplar|own, pair and text, but no answer.
 //   evaluate  generation with an optional profile
 #include <algorithm>
 #include <filesystem>
@@ -64,10 +72,12 @@ void Floats(const fs::path& path, std::span<const float> values) {
 int main(int argc, char** argv) {
   try {
     Require(argc >= 5,
-            "usage: collector MODEL DATA.jsonl OUTPUT collect|answers|evaluate "
+            "usage: collector MODEL DATA.jsonl OUTPUT "
+            "collect|answers|segments|evaluate "
             "[--profile FILE] [--max-new-tokens N]");
     const fs::path output = argv[3];
-    const bool answers = std::string_view(argv[4]) == "answers";
+    const bool segments = std::string_view(argv[4]) == "segments";
+    const bool answers = segments || std::string_view(argv[4]) == "answers";
     const bool collect = answers || std::string_view(argv[4]) == "collect";
     Require(collect || std::string_view(argv[4]) == "evaluate", "invalid mode");
     std::string profile;
@@ -91,7 +101,8 @@ int main(int argc, char** argv) {
             "collection must use the unedited model");
     const bool enabled = !profile.empty();
     q::ModelOptions options;
-    options.max_context = (answers ? 8192 : 2048) + (collect ? 0 : max_new_tokens);
+    options.max_context = (segments ? 24576 : answers ? 8192 : 2048) +
+                          (collect ? 0 : max_new_tokens);
     if (enabled)
       options.abliteration_profiles = {profile};
     std::string error;
@@ -123,12 +134,25 @@ int main(int argc, char** argv) {
           !id.empty() && id.find_first_not_of("0123456789abcdef-plainthk") ==
                              std::string::npos,
           "invalid record ID");
+      if (segments) {
+        const auto* parts = record.find("segments");
+        const auto* select = record.find("select");
+        Require(parts && parts->is_array() && parts->size() >= 2 && select &&
+                    select->is_array() && select->size() >= 1,
+                "segments need a segments array (>= 2) and a select array");
+        for (const auto& part : parts->items())
+          Require(part.is_string() && !part.str().empty(),
+                  "segments must be non-empty strings");
+        for (const auto& k : select->items())
+          Require(k.is_number() && k.as_size(parts->size()) + 1 < parts->size(),
+                  "select indexes must name a segment followed by another");
+      }
       if (answers)
         Require((record.member_str("group") == "exemplar" ||
                  record.member_str("group") == "own") &&
                     !record.member_str("pair").empty() &&
                     !record.member_str("text").empty() &&
-                    !record.member_str("answer").empty(),
+                    (segments || !record.member_str("answer").empty()),
                 "answers need group exemplar|own, pair, text and answer");
       else
         Require(record.member_str("group") == "refusal" ||
@@ -149,10 +173,12 @@ int main(int argc, char** argv) {
     manifest["context"] = static_cast<unsigned long long>(options.max_context);
     manifest["max_new_tokens"] =
         static_cast<unsigned long long>(collect ? 0 : max_new_tokens);
-    manifest["template"] = answers ? "gufo-qwen-native-scoring-v1"
-                                   : "gufo-qwen-native-medium-v1";
+    manifest["template"] = segments  ? "gufo-qwen-native-thinking-medium-v1"
+                           : answers ? "gufo-qwen-native-scoring-v1"
+                                     : "gufo-qwen-native-medium-v1";
     manifest["readout"] =
-        answers   ? "answer-tokens-mean-post-layer-hc-mean-fp32-v1"
+        segments  ? "selected-segment-end-rows-mean-post-layer-hc-mean-fp32-v1"
+        : answers ? "answer-tokens-mean-post-layer-hc-mean-fp32-v1"
         : collect ? "last-prompt-token-post-layer-hc-mean-fp32-v1"
                   : "first-next-token-logits-fp32-v1";
     manifest["data_sha256"] = gufo::crypto::Sha256FileHex(argv[2]);
@@ -176,6 +202,8 @@ int main(int argc, char** argv) {
     // Answers: FP64 sums over every answer row of each layer's HC mean.
     std::vector<double> sums(answers ? activations.size() : 0);
     std::vector<std::size_t> rows_seen(config.num_layers);
+    // Segments: which observed rows (0 = the last prompt token's) are summed.
+    std::vector<bool> selected;
     bool observing = !answers;
     if (collect)
       session->SetActivationObserver(
@@ -187,7 +215,10 @@ int main(int argc, char** argv) {
                     "collector HC layout mismatch");
             for (std::size_t r = 0; r < rows.size() / config.HcDim(); ++r) {
               const auto row = rows.subspan(r * config.HcDim(), config.HcDim());
-              for (std::size_t h = 0; h < config.hidden_size; ++h) {
+              const bool keep =
+                  !segments || (rows_seen[layer] < selected.size() &&
+                                selected[rows_seen[layer]]);
+              for (std::size_t h = 0; keep && h < config.hidden_size; ++h) {
                 double sum = 0;
                 for (std::size_t c = 0; c < config.hc_count; ++c)
                   sum += row[c * config.hidden_size + h];
@@ -224,7 +255,9 @@ int main(int argc, char** argv) {
       message.content = record.member_str("text");
       gufo::tokenization::ChatTemplateOptions chat;
       // Answers are framed as score_assistant scores them: thinking off.
-      chat.enable_thinking = !answers && record.find("thinking")->as_bool();
+      // Segments continue a thinking-on generation prompt.
+      chat.enable_thinking =
+          segments || (!answers && record.find("thinking")->as_bool());
       chat.reasoning_effort = gufo::tokenization::QwenReasoningEffort::kMedium;
       auto tokens = gufo::tokenization::QwenChatTemplate::RenderAndTokenize(
           model->tokenizer(), std::span(&message, 1), chat, &error);
@@ -251,8 +284,30 @@ int main(int argc, char** argv) {
         // answer's last token is never fed.
         gufo::tokenization::TokenizerOptions content;
         content.parse_special_tokens = false;
-        const auto answer =
-            model->tokenizer().Encode(record.member_str("answer"), content);
+        std::vector<std::int32_t> answer;
+        std::size_t selected_rows = 0;
+        if (segments) {
+          // Row j predicts answer token j; row cum_k (the row of segment k's
+          // last token) predicts segment k+1's first token.
+          std::vector<std::size_t> ends;
+          for (const auto& part : record.find("segments")->items()) {
+            const auto piece = model->tokenizer().Encode(part.str(), content);
+            Require(!piece.empty(), "segment tokenizes empty: " + id);
+            answer.insert(answer.end(), piece.begin(), piece.end());
+            ends.push_back(answer.size());
+          }
+          selected.assign(answer.size(), false);
+          for (const auto& k : record.find("select")->items()) {
+            const auto row = ends[k.as_size()];
+            if (!selected[row])
+              ++selected_rows;
+            selected[row] = true;
+          }
+        } else {
+          const auto encoded =
+              model->tokenizer().Encode(record.member_str("answer"), content);
+          answer.assign(encoded.begin(), encoded.end());
+        }
         Require(!answer.empty() && prompt.size() + answer.size() <=
                                        options.max_context,
                 "answer empty or too long: " + id);
@@ -264,9 +319,14 @@ int main(int argc, char** argv) {
         for (std::uint32_t layer = 0; layer < config.num_layers; ++layer)
           Require(rows_seen[layer] == answer.size(),
                   "answer rows missing: " + id);
+        const double rows =
+            segments ? double(selected_rows) : double(answer.size());
         for (std::size_t i = 0; i < activations.size(); ++i)
-          activations[i] = float(sums[i] / double(answer.size()));
+          activations[i] = float(sums[i] / rows);
         result["answer_tokens"] = answer.size();
+        if (segments)
+          result["selected_rows"] =
+              static_cast<unsigned long long>(selected_rows);
         result["pair"] = record.member_str("pair");
         result["group"] = record.member_str("group");
         Floats(data, activations);
