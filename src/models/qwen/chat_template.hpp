@@ -190,6 +190,14 @@ inline constexpr std::size_t kMaxRenderedBytesPerToken = 128;
 /// Suffix opened for a new assistant turn, outside the stable conversation.
 [[nodiscard]] std::string_view GenerationPrompt(bool enable_thinking);
 
+/// Closes a completed assistant turn's thinking block before its answer; it
+/// starts with the newline that ends the reasoning text.
+inline constexpr std::string_view kReasoningClose = "\n</think>\n\n";
+
+/// Reasoning as a completed assistant turn renders it: stripped as Python's
+/// str.strip strips.
+[[nodiscard]] std::string_view TrimReasoning(std::string_view reasoning);
+
 /// Resolve CLI/API controls against the official Qwen3.8 template defaults.
 /// Provider-neutral minimal/high/max map to native low/xhigh/xhigh.
 [[nodiscard]] ChatTemplateOptions ResolveQwenChatOptions(

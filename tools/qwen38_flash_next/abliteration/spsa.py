@@ -24,6 +24,23 @@ uses summed (not per-token) log-probabilities, since the two answers differ
 in a few tokens, and is a hinge at `--fact-margin` kappa (nats), so it only
 guards facts the setting puts at risk instead of rewarding ones already safe.
 Facts are scored whole (keep them short); `--answer-tokens` does not apply.
+`--guard` (optional) is JSONL {"id", "prompt", "answer"} scored like the
+ordinary answers, as its own term:
+    - nu * mean over guard answers of max(0, (lp_OFF(a) - lp_ON(a)) / n_a - g)
+with `--nu` and the tolerance `--guard-margin` g (nats per token); with it,
+`--ordinary` may be left out.
+
+Reasoning rows. Any row may also carry "reasoning" (sent as the scored
+message's `reasoning_content`, the thinking before the scored text),
+"score_reasoning" (true: the scored text continues that reasoning instead of
+following it as the answer), "reasoning_effort" and "score_max_tokens" (this
+row's cut; it overrides `--answer-tokens`). See docs/SERVER.md, assistant-
+message scoring. Rows may carry "chain" (any string, for example the trace
+they come from): for each theta, the requests of one chain are sent one after
+another in ascending reasoning length, so each can resume from the prompt
+checkpoints its predecessor left instead of prefilling the shared prefix again.
+`--minibatch-chains` scores all rows of that many random chains per step (and
+every row without a chain) instead of `--minibatch`'s per-file subsets.
 
 SPSA (Spall): each step draws a Rademacher vector D, evaluates
 theta +/- c_k D (clipped), estimates g = (J+ - J-) / (2 c_k) * D and moves
@@ -37,6 +54,8 @@ Speed: theta+ and theta- are scored in one request burst, so a packing server
 scores a per-step random subset; `--block-size` shares a strength across
 consecutive layers (log thetas are then block parameters; `--output` and the
 request settings are always per layer, and `--init` may be per layer).
+`--learn` names the site kinds SPSA moves (for example `residual`); the others
+keep their `--init` strengths and are never perturbed.
 Standard library only.
 """
 import argparse
@@ -71,12 +90,25 @@ def post(base_url, body, timeout=600, attempts=4):
             time.sleep(0.5 * (attempt + 1))
 
 
-def score_body(model, prompt, answer, abliteration, answer_tokens=0):
+ROW_KEYS = ('reasoning', 'score_reasoning', 'reasoning_effort', 'score_max_tokens')
+
+
+def score_body(model, prompt, answer, abliteration, answer_tokens=0, row=None):
+    """A scoring request for `answer` after `prompt`; `row`'s reasoning keys
+    (ROW_KEYS) frame it inside or after a reasoning trace."""
+    row = row or {}
+    scored = {'role': 'assistant', 'content': answer}
+    if row.get('reasoning'):
+        scored['reasoning_content'] = row['reasoning']
     body = {'model': model, 'score_assistant': True, 'max_tokens': 0,
-            'messages': [{'role': 'user', 'content': prompt},
-                         {'role': 'assistant', 'content': answer}]}
+            'messages': [{'role': 'user', 'content': prompt}, scored]}
+    answer_tokens = row.get('score_max_tokens') or answer_tokens
     if answer_tokens:
         body['score_max_tokens'] = answer_tokens
+    if row.get('score_reasoning'):
+        body['score_reasoning'] = True
+    if row.get('reasoning_effort'):
+        body['reasoning_effort'] = row['reasoning_effort']
     if abliteration is not None:
         body['abliteration'] = abliteration
     return body
@@ -85,6 +117,11 @@ def score_body(model, prompt, answer, abliteration, answer_tokens=0):
 def mean_logprob(reply):
     score = reply['score']
     return score['logprob_sum'] / max(score['token_count'], 1), score['token_count']
+
+
+def row_extras(row):
+    """The reasoning keys a row sets (part of its identity in the OFF cache)."""
+    return {k: row[k] for k in ROW_KEYS if row.get(k)}
 
 
 def load_jsonl(path, keys):
@@ -102,30 +139,62 @@ def load_jsonl(path, keys):
 
 
 class Objective:
-    def __init__(self, args, pairs, ordinary, layers, facts=()):
+    def __init__(self, args, pairs, ordinary, layers, facts=(), guard=()):
         self.args, self.pairs, self.ordinary, self.layers = args, pairs, ordinary, layers
         self.facts = list(facts)
+        self.guard = list(guard)
         self.pool = concurrent.futures.ThreadPoolExecutor(max(1, args.concurrency))
-        self.off = self._off_baseline()
+        self.off, self.off_guard = self._off_baseline()
 
-    def _map(self, bodies):
-        return list(self.pool.map(lambda b: post(self.args.base_url, b), bodies))
+    def _map(self, bodies, chains=None):
+        """Post every body; bodies sharing a chain key (not None) run in one
+        worker, one after another in ascending reasoning length, so each can
+        resume from its predecessor's prompt checkpoints. Replies keep the
+        order of `bodies`."""
+        if chains is None:
+            return list(self.pool.map(lambda b: post(self.args.base_url, b), bodies))
+        groups, order = {}, []
+        for i, chain in enumerate(chains):
+            k = ('chain', chain) if chain is not None else ('one', i)
+            if k not in groups:
+                groups[k] = []
+                order.append(k)
+            groups[k].append(i)
+        reasoning = lambda i: len(bodies[i]['messages'][-1].get('reasoning_content', ''))
+        tasks = [sorted(groups[k], key=reasoning) for k in order]  # stable: equal prefixes keep their order
+        replies = [None] * len(bodies)
+
+        def run(task):
+            for i in task:
+                replies[i] = post(self.args.base_url, bodies[i])
+        for _ in self.pool.map(run, tasks):
+            pass
+        return replies
 
     def _off_baseline(self):
         path = Path(self.args.log + '.off.json')
+        rows = [self.ordinary, self.guard]
+        extras = any(row_extras(o) for part in rows for o in part)
+        ident = lambda o: (o['id'], o['prompt'], o['answer']) + ((row_extras(o),) if extras else ())
         key = hashlib.sha256(json.dumps(
-            [self.args.model, [(o['id'], o['prompt'], o['answer']) for o in self.ordinary]]
+            [self.args.model, [ident(o) for o in self.ordinary]]
             + ([self.args.answer_tokens] if self.args.answer_tokens else [])
+            + ([['guard', [ident(o) for o in self.guard]]] if self.guard else [])
         ).encode()).hexdigest()
         if path.exists():
             cached = json.loads(path.read_text())
             if cached.get('key') == key:
-                return cached['off']
-        replies = self._map([score_body(self.args.model, o['prompt'], o['answer'], None, self.args.answer_tokens)
-                             for o in self.ordinary])
+                return cached['off'], cached.get('guard', {})
+        both = self.ordinary + self.guard
+        replies = self._map([score_body(self.args.model, o['prompt'], o['answer'], None, self.args.answer_tokens, o)
+                             for o in both], [o.get('chain') for o in both])
         off = {o['id']: mean_logprob(r)[0] for o, r in zip(self.ordinary, replies)}
-        path.write_text(json.dumps(dict(key=key, off=off)) + '\n')
-        return off
+        off_guard = {o['id']: mean_logprob(r)[0] for o, r in zip(self.guard, replies[len(self.ordinary):])}
+        cached = dict(key=key, off=off)
+        if self.guard:
+            cached['guard'] = off_guard
+        path.write_text(json.dumps(cached) + '\n')
+        return off, off_guard
 
     def settings(self, params):
         n = self.layers
@@ -151,26 +220,35 @@ class Objective:
     def __call__(self, theta):
         return self.evaluate([theta])[0]
 
-    def evaluate(self, thetas, pair_idx=None, ord_idx=None, fact_idx=None):
-        """Score every theta (layer strengths) on the pairs, ordinary answers and
-        facts (all, or the given index subsets) in one request burst, so the
-        server can pack the requests of all thetas together."""
+    def evaluate(self, thetas, pair_idx=None, ord_idx=None, fact_idx=None, guard_idx=None):
+        """Score every theta (layer strengths) on the pairs, ordinary answers,
+        facts and guard answers (all, or the given index subsets) in one
+        request burst, so the server can pack the requests of all thetas
+        together."""
         pairs = self.pairs if pair_idx is None else [self.pairs[i] for i in pair_idx]
         ordinary = self.ordinary if ord_idx is None else [self.ordinary[i] for i in ord_idx]
         facts = self.facts if fact_idx is None else [self.facts[i] for i in fact_idx]
-        t = self.args.answer_tokens
-        bodies = []
-        for theta in thetas:
+        guard = self.guard if guard_idx is None else [self.guard[i] for i in guard_idx]
+        t, model = self.args.answer_tokens, self.args.model
+        bodies, chains = [], []
+
+        def add(row, answer, on, tokens, k):
+            bodies.append(score_body(model, row['prompt'], answer, on, tokens, row))
+            chains.append((k, row['chain']) if row.get('chain') is not None else None)
+        for k, theta in enumerate(thetas):
             on = self.settings(theta)
             for p in pairs:
-                bodies.append(score_body(self.args.model, p['prompt'], p['candid'], on, t))
-                bodies.append(score_body(self.args.model, p['prompt'], p['propaganda'], on, t))
-            bodies += [score_body(self.args.model, o['prompt'], o['answer'], on, t) for o in ordinary]
+                add(p, p['candid'], on, t, k)
+                add(p, p['propaganda'], on, t, k)
+            for o in ordinary:
+                add(o, o['answer'], on, t, k)
             for f in facts:  # whole answers: the changed fact may lie past --answer-tokens
-                bodies.append(score_body(self.args.model, f['prompt'], f['correct'], on))
-                bodies.append(score_body(self.args.model, f['prompt'], f['wrong'], on))
-        replies = self._map(bodies)
-        per = 2 * len(pairs) + len(ordinary) + 2 * len(facts)
+                add(f, f['correct'], on, 0, k)
+                add(f, f['wrong'], on, 0, k)
+            for g in guard:
+                add(g, g['answer'], on, t, k)
+        replies = self._map(bodies, chains if any(c is not None for c in chains) else None)
+        per = 2 * len(pairs) + len(ordinary) + 2 * len(facts) + len(guard)
         results = []
         for k in range(len(thetas)):
             part = replies[k * per:(k + 1) * per]
@@ -179,16 +257,22 @@ class Objective:
             nonfact = 2 * len(pairs) + len(ordinary)
             drops = [max(0.0, self.off[o['id']] - mean_logprob(r)[0])
                      for o, r in zip(ordinary, part[2 * len(pairs):nonfact])]
-            margin = sum(margins) / len(margins)
-            drop = sum(drops) / len(drops)
+            margin = sum(margins) / len(margins) if margins else 0.0  # a chain minibatch may hold no pair
+            drop = sum(drops) / len(drops) if drops else 0.0
             result = dict(j=margin - self.args.lam * drop, margin=margin, drop=drop,
-                          drop_max=max(drops), margin_min=min(margins))
+                          drop_max=max(drops, default=0.0), margin_min=min(margins, default=0.0))
             if facts:
                 gaps = [part[nonfact + 2 * i]['score']['logprob_sum'] - part[nonfact + 2 * i + 1]['score']['logprob_sum']
                         for i in range(len(facts))]
                 shortfall = sum(max(0.0, self.args.fact_margin - g) for g in gaps) / len(gaps)
                 result.update(j=result['j'] - self.args.mu * shortfall, fact_shortfall=shortfall,
                               fact_gap_min=min(gaps), fact_right=sum(g > 0 for g in gaps))
+            if guard:
+                losses = [self.off_guard[g['id']] - mean_logprob(r)[0]
+                          for g, r in zip(guard, part[nonfact + 2 * len(facts):])]
+                excess = sum(max(0.0, x - self.args.guard_margin) for x in losses) / len(losses)
+                result.update(j=result['j'] - self.args.nu * excess, guard_excess=excess,
+                              guard_drop_max=max(losses))
             results.append(result)
         return results
 
@@ -220,11 +304,17 @@ def main(argv=None):
     ap.add_argument('--base-url', default='http://127.0.0.1:18740')
     ap.add_argument('--model', default='gufo-flash-next')
     ap.add_argument('--pairs', required=True)
-    ap.add_argument('--ordinary', required=True)
+    ap.add_argument('--ordinary', help='JSONL {"id", "prompt", "answer"} the setting must not make '
+                                       'less likely (required unless --guard is given)')
     ap.add_argument('--facts', help='JSONL {"id", "prompt", "correct", "wrong"} fact-recall guard pairs')
     ap.add_argument('--mu', type=float, default=0.2, help='fact shortfall penalty weight')
     ap.add_argument('--fact-margin', type=float, default=2.0,
                     help='summed log-probability lead (nats) a correct fact answer needs over the wrong one')
+    ap.add_argument('--guard', help='JSONL {"id", "prompt", "answer"} answers guarded with their own '
+                                    'hinged drop term')
+    ap.add_argument('--nu', type=float, default=1.0, help='guard drop penalty weight')
+    ap.add_argument('--guard-margin', type=float, default=0.0,
+                    help='per-token log-likelihood drop (nats) a guard answer may lose before it costs')
     ap.add_argument('--layers', type=int, default=48)
     ap.add_argument('--direction-layer', type=int,
                     help='the direction layer (suppression profiles; required there)')
@@ -259,6 +349,11 @@ def main(argv=None):
     ap.add_argument('--minibatch', type=int, default=0,
                     help='score a random subset of this many pairs and this many ordinary answers '
                          'per step (the same subset for theta+ and theta-); evals use all; 0 uses all')
+    ap.add_argument('--minibatch-chains', type=int, default=0,
+                    help='score every row of this many random chains (rows\' "chain") per step, '
+                         'plus every row without one; evals use all; not with --minibatch')
+    ap.add_argument('--learn', default='attention,mlp,residual',
+                    help='comma-separated site kinds to learn; the others stay at --init')
     ap.add_argument('--log', required=True)
     ap.add_argument('--output', help='write the best theta as JSON settings')
     args = ap.parse_args(argv)
@@ -268,8 +363,17 @@ def main(argv=None):
         ap.error('--direction-layer is required for a suppression profile')
     if args.min_strength > args.max_strength:
         ap.error('--min-strength must not exceed --max-strength')
-    if args.block_size < 1 or args.minibatch < 0:
-        ap.error('--block-size must be at least 1 and --minibatch at least 0')
+    if args.block_size < 1 or args.minibatch < 0 or args.minibatch_chains < 0:
+        ap.error('--block-size must be at least 1 and --minibatch(-chains) at least 0')
+    if args.minibatch and args.minibatch_chains:
+        ap.error('use --minibatch or --minibatch-chains, not both')
+    if not args.ordinary and not args.guard:
+        ap.error('--ordinary is required without --guard')
+    kinds = ('attention', 'mlp', 'residual')
+    learn = [k.strip() for k in args.learn.split(',') if k.strip()]
+    if not learn or set(learn) - set(kinds):
+        ap.error(f'--learn takes a comma-separated subset of {",".join(kinds)}')
+    args.learn = ','.join(k for k in kinds if k in learn)  # canonical, for the log header
 
     n = args.layers
     init = json.loads(Path(args.init).read_text()) if Path(args.init).exists() else json.loads(args.init)
@@ -283,9 +387,10 @@ def main(argv=None):
         raise SystemExit('init needs layers values for attention, mlp and residual')
     theta = clip(compress(theta, n, args.block_size), args.max_strength, args.min_strength)
     pairs = load_jsonl(args.pairs, ('id', 'prompt', 'candid', 'propaganda'))
-    ordinary = load_jsonl(args.ordinary, ('id', 'prompt', 'answer'))
+    ordinary = load_jsonl(args.ordinary, ('id', 'prompt', 'answer')) if args.ordinary else []
     facts = load_jsonl(args.facts, ('id', 'prompt', 'correct', 'wrong')) if args.facts else []
-    objective = Objective(args, pairs, ordinary, n, facts)
+    guard = load_jsonl(args.guard, ('id', 'prompt', 'answer')) if args.guard else []
+    objective = Objective(args, pairs, ordinary, n, facts, guard)
 
     log = Path(args.log)
     header = dict(type='header', args={k: v for k, v in vars(args).items() if k not in ('log', 'output', 'steps', 'concurrency', 'base_url')
@@ -294,10 +399,15 @@ def main(argv=None):
                                  and not (k == 'min_strength' and v == 0.0)
                                  and not (k == 'additive' and not v)
                                  and not (k == 'direction_layer' and v is None)
-                                 and not (k in ('facts', 'mu', 'fact_margin') and not args.facts)},
+                                 and not (k in ('facts', 'mu', 'fact_margin') and not args.facts)
+                                 and not (k in ('guard', 'nu', 'guard_margin') and not args.guard)
+                                 and not (k == 'minibatch_chains' and not v)
+                                 and not (k == 'learn' and v == 'attention,mlp,residual')},
                   pairs=[p['id'] for p in pairs], ordinary=[o['id'] for o in ordinary])
     if facts:
         header['facts'] = [f['id'] for f in facts]
+    if guard:
+        header['guard'] = [g['id'] for g in guard]
     records = []
     if log.exists():
         lines = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
@@ -322,24 +432,37 @@ def main(argv=None):
     start = sum(1 for r in records if r['step'] >= 0)
     rng = random.Random(args.seed)
     dim = len(theta)
+    per_kind = dim // 3
+    learned = [('attention', 'mlp', 'residual')[i // per_kind] in args.learn.split(',') for i in range(dim)]
     for _ in range(start * dim):  # replay the Rademacher stream for resume
         rng.random()
     for k in range(start, args.steps):
         ck = args.c / (k + 1) ** 0.101
         ak = args.a / (k + 1 + args.A) ** 0.602
         delta = [1.0 if rng.random() < 0.5 else -1.0 for _ in range(dim)]
+        delta = [d if keep else 0.0 for d, keep in zip(delta, learned)]  # fixed kinds stay put
         plus = clip([t + ck * d for t, d in zip(theta, delta)], args.max_strength, args.min_strength)
         minus = clip([t - ck * d for t, d in zip(theta, delta)], args.max_strength, args.min_strength)
-        pair_idx = ord_idx = fact_idx = None
-        if args.minibatch:
+        pair_idx = ord_idx = fact_idx = guard_idx = None
+        if args.minibatch_chains:
+            pick = random.Random(f'{args.seed}:{k}')  # per step, so resume draws the same subset
+            names = sorted({r['chain'] for part in (pairs, ordinary, facts, guard) for r in part
+                            if r.get('chain') is not None})
+            chosen = set(pick.sample(names, min(args.minibatch_chains, len(names))))
+            within = lambda rows: [i for i, r in enumerate(rows) if r.get('chain') is None or r['chain'] in chosen]
+            pair_idx, ord_idx, fact_idx, guard_idx = (within(pairs), within(ordinary),
+                                                      within(facts), within(guard))
+        elif args.minibatch:
             pick = random.Random(f'{args.seed}:{k}')  # per step, so resume draws the same subset
             pair_idx = sorted(pick.sample(range(len(pairs)), min(args.minibatch, len(pairs))))
             ord_idx = sorted(pick.sample(range(len(ordinary)), min(args.minibatch, len(ordinary))))
             if facts:  # drawn after the others, so runs without facts keep their subsets
                 fact_idx = sorted(pick.sample(range(len(facts)), min(args.minibatch, len(facts))))
-        jp, jm = objective.evaluate([plus, minus], pair_idx, ord_idx, fact_idx)
+            if guard:  # drawn last, so runs without a guard keep their subsets
+                guard_idx = sorted(pick.sample(range(len(guard)), min(args.minibatch, len(guard))))
+        jp, jm = objective.evaluate([plus, minus], pair_idx, ord_idx, fact_idx, guard_idx)
         g = [(jp['j'] - jm['j']) / (2 * ck) * d for d in delta]
-        rms = math.sqrt(sum(x * x for x in g) / len(g)) or 1.0
+        rms = math.sqrt(sum(x * x for x, keep in zip(g, learned) if keep) / sum(learned)) or 1.0
         theta = clip([t + ak * x / rms for t, x in zip(theta, g)], args.max_strength, args.min_strength)
         record = dict(step=k, plus=jp, minus=jm, theta=theta)
         if (k + 1) % args.eval_every == 0 or k + 1 == args.steps:
@@ -351,7 +474,8 @@ def main(argv=None):
         e = record.get('eval')
         print(f'step {k + 1}/{args.steps}: J+ {jp["j"]:.4f} J- {jm["j"]:.4f}'
               + (f' | eval J {e["j"]:.4f} margin {e["margin"]:.4f} drop {e["drop"]:.4f}' if e else '')
-              + (f' facts {e["fact_right"]}/{len(facts)} shortfall {e["fact_shortfall"]:.3f}' if e and facts else ''),
+              + (f' facts {e["fact_right"]}/{len(facts)} shortfall {e["fact_shortfall"]:.3f}' if e and facts else '')
+              + (f' guard excess {e["guard_excess"]:.4f}' if e and guard else ''),
               flush=True)
     if best and args.output:
         Path(args.output).write_text(json.dumps(dict(

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 
 spec = importlib.util.spec_from_file_location('spsa', Path(__file__).with_name('spsa.py'))
@@ -47,7 +48,120 @@ class Fake(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class FakeTrace(http.server.BaseHTTPRequestHandler):
+    """Reasoning rows: a re-check opener ("Wait") loses likelihood with total
+    residual strength, its forward alternative does not, and the guard answer
+    loses likelihood once total residual strength passes 2. Records every
+    request and whether two requests of one (settings, prompt) chain were in
+    flight together."""
+
+    lock = threading.Lock()
+    bodies, active, overlap = [], {}, []
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        ab = body.get('abliteration')
+        chain = (json.dumps(ab, sort_keys=True), body['messages'][0]['content'])
+        with FakeTrace.lock:
+            FakeTrace.bodies.append(body)
+            FakeTrace.active[chain] = FakeTrace.active.get(chain, 0) + 1
+            if FakeTrace.active[chain] > 1:
+                FakeTrace.overlap.append(chain)
+        time.sleep(0.002)
+        residual = sum(ab['residual']) if ab else 0.0
+        answer = body['messages'][-1]['content']
+        if answer.startswith('Wait'):
+            value = -1.0 - 0.1 * residual
+        elif answer.startswith('Guarded'):
+            value = -0.5 - 0.3 * max(0.0, residual - 2.0)
+        else:
+            value = -1.0
+        reply = json.dumps({'score': {'token_count': 1, 'logprob_sum': value}}).encode()
+        with FakeTrace.lock:
+            FakeTrace.active[chain] -= 1
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(reply)))
+        self.end_headers()
+        self.wfile.write(reply)
+
+    def log_message(self, *args):
+        pass
+
+
 class SpsaTest(unittest.TestCase):
+    def test_reasoning_rows_chains_and_guard(self):
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), FakeTrace)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        url = f'http://127.0.0.1:{server.server_address[1]}'
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            pairs, guard = [], []
+            for t in range(3):
+                for b in (3, 1, 2):  # out of order: the chain sorts by reasoning length
+                    pairs.append({'id': f't{t}b{b}', 'prompt': f'problem {t}', 'reasoning': 'x\n\n' * b,
+                                  'score_reasoning': True, 'reasoning_effort': 'xhigh',
+                                  'score_max_tokens': 3, 'chain': f't{t}',
+                                  'candid': 'So go on.', 'propaganda': 'Wait, check.'})
+                guard.append({'id': f't{t}g', 'prompt': f'problem {t}', 'reasoning': 'x\n\n' * 9,
+                              'reasoning_effort': 'xhigh', 'chain': f't{t}', 'answer': 'Guarded answer'})
+            (d / 'pairs.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in pairs))
+            (d / 'guard.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in guard))
+            base = ['--base-url', url, '--pairs', str(d / 'pairs.jsonl'), '--guard', str(d / 'guard.jsonl'),
+                    '--nu', '4', '--layers', str(LAYERS), '--direction-layer', '1',
+                    '--log', str(d / 'log.jsonl'), '--concurrency', '6', '--eval-every', '5',
+                    '--a', '0.3', '--c', '0.2', '--seed', '3', '--answer-tokens', '64',
+                    '--learn', 'mlp,residual,mlp', '--init', '{"attention": [0.5, 0, 0, 0], "mlp": [0, 0, 0, 0], '
+                    '"residual": [0, 0, 0, 0]}']
+            with self.assertRaises(SystemExit):  # an unknown site kind
+                spsa.main(base + ['--steps', '1', '--learn', 'resid'])
+            with self.assertRaises(SystemExit):  # one minibatch kind at a time
+                spsa.main(base + ['--steps', '1', '--minibatch', '2', '--minibatch-chains', '1'])
+            with self.assertRaises(SystemExit):  # --ordinary is required without --guard
+                spsa.main(base[:4] + base[6:] + ['--steps', '1'])
+            FakeTrace.bodies.clear()
+            FakeTrace.overlap.clear()
+            self.assertEqual(spsa.main(base + ['--steps', '30', '--minibatch-chains', '2']), 0)
+            self.assertEqual(FakeTrace.overlap, [])  # a chain's requests never overlap
+            on = [b for b in FakeTrace.bodies if b.get('abliteration')]
+            opener = next(b for b in on if b.get('score_reasoning'))
+            self.assertEqual(opener['messages'][1]['reasoning_content'][:3], 'x\n\n')
+            self.assertEqual((opener['reasoning_effort'], opener['score_max_tokens']), ('xhigh', 3))
+            closed = next(b for b in on if b['messages'][1]['content'] == 'Guarded answer')
+            self.assertNotIn('score_reasoning', closed)
+            self.assertEqual(closed['score_max_tokens'], 64)  # no row cut: --answer-tokens
+            # Within a chain and a setting, requests run in ascending reasoning length.
+            seen = {}
+            for b in on:
+                k = (json.dumps(b['abliteration'], sort_keys=True), b['messages'][0]['content'])
+                seen.setdefault(k, []).append(len(b['messages'][1].get('reasoning_content', '')))
+            self.assertTrue(all(v == sorted(v) for v in seen.values()))
+            lines = [json.loads(l) for l in (d / 'log.jsonl').read_text().splitlines()]
+            header = lines[0]
+            self.assertEqual(header['guard'], ['t0g', 't1g', 't2g'])
+            self.assertEqual(header['args']['minibatch_chains'], 2)
+            self.assertEqual(header['args']['learn'], 'mlp,residual')
+            # Attention is not learned: never perturbed, kept at its init.
+            self.assertTrue(all(b['abliteration']['attention'] == [0.5, 0, 0, 0] for b in on))
+            self.assertTrue(any(max(b['abliteration']['mlp']) > 0 for b in on))
+            self.assertIsNone(header['args']['ordinary'])
+            # A chain minibatch scores every row of the chosen chains: 2 chains x (3 pairs x 2 + guard 1) x 2 thetas.
+            step_bodies = 2 * (3 * 2 + 1) * 2
+            self.assertGreaterEqual(len(on), step_bodies)
+            last = lines[-1]
+            self.assertIn('guard_excess', last['eval'])
+            self.assertEqual(last['theta'][:LAYERS], [0.5, 0.0, 0.0, 0.0])
+            total = sum(last['theta'][2 * LAYERS:])
+            self.assertGreater(total, 1.0)   # suppression grows ...
+            self.assertLess(total, 3.5)      # ... until the guard holds it near 2
+            off = json.loads((d / 'log.jsonl.off.json').read_text())
+            self.assertEqual(off['off'], {})
+            self.assertAlmostEqual(off['guard']['t0g'], -0.5)
+            # Resume keeps the header (and the OFF cache).
+            self.assertEqual(spsa.main(base + ['--steps', '32', '--minibatch-chains', '2']), 0)
+        server.shutdown()
+
+
     def test_signed_strengths_for_additive_profiles(self):
         self.assertEqual(spsa.clip([-5.0, 1.0, 70.0], 4.0), [0.0, 1.0, 4.0])
         self.assertEqual(spsa.clip([-70.0, -5.0, 70.0], 64.0, -64.0),

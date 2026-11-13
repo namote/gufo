@@ -989,6 +989,17 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
                    "invalid_score_max_tokens");
     output->chat.score_max_tokens = static_cast<std::size_t>(value);
   }
+  if (const auto* inside = body.find("score_reasoning");
+      inside != nullptr && !inside->is_null()) {
+    if (!inside->is_bool())
+      return Error(400, "Bad Request", "'score_reasoning' must be a boolean",
+                   "invalid_score_reasoning");
+    if (!scoring)
+      return Error(400, "Bad Request",
+                   "'score_reasoning' requires 'score_assistant'",
+                   "invalid_score_reasoning");
+    output->chat.score_reasoning = inside->as_bool();
+  }
 
   const json::Value* messages = body.find("messages");
   if (messages == nullptr || !messages->is_array() || messages->empty()) {
@@ -1018,14 +1029,23 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
   if (auto error = ParseReasoningBudget(body, &output->chat.reasoning))
     return error;
   // Scoring follows the template's empty thinking block (score_assistant.hpp)
-  // rather than the server's reasoning default.
+  // rather than the server's reasoning default; a scored message with
+  // reasoning_content, or score_reasoning, scores inside a thinking turn.
   if (scoring) {
-    if (output->chat.reasoning.enabled.value_or(false))
+    const bool thinking = output->chat.score_reasoning ||
+                          !output->chat.messages.back().thought.empty();
+    if (thinking && !output->chat.reasoning.enabled.value_or(true))
+      return Error(400, "Bad Request",
+                   "'score_assistant' with 'reasoning_content' or "
+                   "'score_reasoning' scores inside a thinking turn; "
+                   "thinking must be enabled",
+                   "invalid_score_assistant");
+    if (!thinking && output->chat.reasoning.enabled.value_or(false))
       return Error(400, "Bad Request",
                    "'score_assistant' scores the reply after an empty "
                    "thinking block; thinking must be disabled",
                    "invalid_score_assistant");
-    output->chat.reasoning.enabled = false;
+    output->chat.reasoning.enabled = thinking;
   }
   if (const auto* kwargs = body.find("chat_template_kwargs")) {
     if (const auto* vision_id = kwargs->find("add_vision_id")) {

@@ -221,6 +221,10 @@ struct ChatRequest {
   /// With score_assistant: score only the first this many content tokens
   /// (1..kMaxScoredTokens); unset scores all of them.
   std::optional<std::size_t> score_max_tokens;
+  /// With score_assistant: the scored content continues the scored message's
+  /// reasoning_content inside the thinking block instead of answering after
+  /// it (see score_assistant.hpp).
+  bool score_reasoning{false};
   /// Optional streaming prompt progress; never changes prompt or cache
   /// identity.
   bool return_progress{false};

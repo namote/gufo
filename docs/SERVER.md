@@ -1716,11 +1716,36 @@ scores only the first that many tokens of the content as the server
 tokenizes it; `tokens` and `token_count` then cover those tokens. Shorter
 content scores every token.
 
+Reasoning. A scored message with `reasoning_content`, or a request with
+`score_reasoning: true` (a boolean, only with `score_assistant`), scores
+inside a thinking turn: the conversation before it is rendered with thinking
+on, at the request's `reasoning_effort` or the server default, so the prompt
+ends with `<|im_start|>assistant\n<think>\n`. Then:
+
+- with `reasoning_content` and without `score_reasoning`, the reasoning
+  follows trimmed, then `\n</think>\n\n`, and the content is scored as the
+  turn's answer, exactly as the template renders the completed turn (the
+  answer after a given trace); the newline is tokenized with the reasoning,
+  as whole-text tokenization joins it to a final punctuation mark;
+- with `score_reasoning`, the reasoning follows verbatim (it may be empty)
+  and the content is scored as its continuation inside the thinking block,
+  which nothing closes (the next thought after a trace prefix).
+
+The reasoning is tokenized as message text, separately from the content: cut
+a trace where a pre-token ends (after the blank line that ends a thought, as
+`tools/qwen38_flash_next/abliteration/recheck_objective.py` does) so the two
+halves tokenize as the whole would. Thinking turned off (`reasoning_effort:
+"none"`, `enable_thinking: false`) returns 400 here, as explicitly enabled
+thinking does for a scored message without reasoning. The reasoning is part
+of the prompt (a long trace is prefilled in ordinary chunks first, and the
+prompt checkpoints it retains may serve a later request that extends it), so
+`score_max_tokens` and the 1024-token limit apply to the content alone.
+
 Limits: at most 1024 scored tokens (after `score_max_tokens`); the prompt
 plus all but the last scored token must fit the context. `max_tokens`/`max_completion_tokens` must be 0
 or omitted. `stream`, `stop`, `tools`, `response_format`, images, `n > 1`,
-explicitly enabled thinking and a scored message with `reasoning_content` or
-`tool_calls` return 400.
+explicitly enabled thinking without reasoning (above) and a scored message
+with `tool_calls` return 400.
 
 Execution: a prompt of at most 1024 unfed tokens (after any reused prefix)
 is not prefilled on its own. The scoring work unit feeds it together with

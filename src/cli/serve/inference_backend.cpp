@@ -371,7 +371,10 @@ TextPreparedPrompt SelectAbliteration(
 
 /// A Qwen `score_assistant` request: the prompt before the final assistant
 /// content, as generation prepares it (abliteration included), and that
-/// content tokenized as message text, never as framing (#383).
+/// content tokenized as message text, never as framing (#383). A
+/// thinking-turn split appends its reasoning (message text) and reasoning
+/// close (framing) to the prompt tokens; the conversation's cache prefix is
+/// unchanged, since they follow the generation prompt.
 TextScoringPrompt PrepareQwenScoring(
     const ChatRequest& request, const tokenization::QwenTokenizer& tokenizer,
     const std::shared_ptr<models::qwen::vision::Encoder>& encoder,
@@ -384,9 +387,19 @@ TextScoringPrompt PrepareQwenScoring(
   content.parse_special_tokens = false;
   auto answer = tokenizer.Encode(split.answer, content);
   LimitScoredTokens(&answer, request);
-  return {SelectAbliteration(PrepareQwenPrompt(split.prompt, tokenizer, encoder,
-                                               max_context, image_cache),
-                             split.prompt, profiles, false, table),
+  auto prompt = PrepareQwenPrompt(split.prompt, tokenizer, encoder, max_context,
+                                  image_cache);
+  if (!split.reasoning.empty()) {
+    const auto reasoning = tokenizer.Encode(split.reasoning, content);
+    prompt.tokens.insert(prompt.tokens.end(), reasoning.begin(),
+                         reasoning.end());
+  }
+  if (!split.reasoning_close.empty()) {
+    const auto close = tokenizer.Encode(split.reasoning_close);
+    prompt.tokens.insert(prompt.tokens.end(), close.begin(), close.end());
+  }
+  return {SelectAbliteration(std::move(prompt), split.prompt, profiles, false,
+                             table),
           {answer.begin(), answer.end()}};
 }
 

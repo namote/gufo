@@ -7386,6 +7386,56 @@ void TestScoreAssistant() {
             response.body.find("invalid_score_max_tokens") != std::string::npos,
         std::string("score_max_tokens refuses ") + limit);
   }
+  // A scored message with reasoning_content, or score_reasoning, scores
+  // inside a thinking turn: thinking is on (at the request's effort).
+  {
+    const std::string thought_body = R"({"model":"test-model",
+      "messages":[{"role":"user","content":"Q?"},
+                  {"role":"assistant","reasoning_content":"Think.\n\n",
+                   "content":"Wait"}],
+      "score_assistant":true,"max_tokens":0)";
+    auto response =
+        gufo::server::HandleOpenAiChat(Request(thought_body + "}"), backend);
+    Expect(response.status == 200 &&
+               backend.last_request.reasoning.enabled == true &&
+               !backend.last_request.score_reasoning &&
+               backend.last_request.messages.back().thought == "Think.\n\n",
+           "a scored message with reasoning scores with thinking on");
+    response = gufo::server::HandleOpenAiChat(
+        Request(thought_body +
+                R"(,"score_reasoning":true,"reasoning_effort":"low"})"),
+        backend);
+    Expect(response.status == 200 && backend.last_request.score_reasoning &&
+               backend.last_request.reasoning.enabled == true &&
+               backend.last_request.reasoning.effort ==
+                   gufo::ReasoningEffort::kLow,
+           "score_reasoning reaches the request with its effort");
+    response = gufo::server::HandleOpenAiChat(
+        Request(thought_body + R"(,"reasoning_effort":"none"})"), backend);
+    Expect(
+        response.status == 400 &&
+            response.body.find("invalid_score_assistant") != std::string::npos,
+        "scoring inside a thinking turn refuses thinking off");
+    auto plain = scored_body;
+    plain.insert(plain.rfind('}'), R"(,"score_reasoning":true)");
+    Expect(
+        gufo::server::HandleOpenAiChat(Request(plain), backend).status == 200 &&
+            backend.last_request.score_reasoning &&
+            backend.last_request.reasoning.enabled == true,
+        "score_reasoning without reasoning scores the first thought");
+    for (const auto* bad :
+         {R"({"model":"test-model","messages":[{"role":"user","content":"Q?"},
+             {"role":"assistant","content":"A"}],"score_assistant":true,
+             "score_reasoning":1})",
+          R"({"model":"test-model","messages":[{"role":"user","content":"Q?"}],
+             "score_reasoning":true})"}) {
+      response = gufo::server::HandleOpenAiChat(Request(bad), backend);
+      Expect(response.status == 400 &&
+                 response.body.find("invalid_score_reasoning") !=
+                     std::string::npos,
+             "score_reasoning is a boolean and requires score_assistant");
+    }
+  }
   {
     const auto response =
         gufo::server::HandleOpenAiChat(Request(R"({"model":"test-model",
@@ -7445,10 +7495,66 @@ void TestScoreAssistant() {
   Expect(refuses(bad), "the scored content must not be empty");
   bad = request;
   bad.messages.back().thought = "hmm";
-  Expect(refuses(bad), "the scored message takes no reasoning");
+  Expect(refuses(bad), "a scored message with reasoning needs thinking on");
+  bad = request;
+  bad.score_reasoning = true;
+  Expect(refuses(bad), "score_reasoning needs thinking on");
   bad = request;
   bad.reasoning.enabled = true;
-  Expect(refuses(bad), "thinking must be disabled");
+  Expect(refuses(bad), "thinking must be disabled without reasoning");
+  bad = request;
+  bad.messages.back().tool_calls.push_back({});
+  Expect(refuses(bad), "the scored message takes no tool calls");
+
+  // After a completed reasoning: the prompt ends with the open thinking
+  // block; the trimmed reasoning and its close follow, and the content is
+  // that turn's answer, exactly as the template renders the completed turn.
+  auto answered = request;
+  answered.messages.back().thought = "\n Think it over.\n\n";
+  answered.reasoning.enabled = true;
+  answered.reasoning.effort = gufo::ReasoningEffort::kXHigh;
+  const auto after = gufo::server::SplitScoringRequest(answered);
+  Expect(after.reasoning == "Think it over.\n" &&
+             after.reasoning_close == "</think>\n\n" &&
+             after.prompt.reasoning.enabled == true &&
+             after.prompt.messages.size() == 2 &&
+             after.answer == "A <|im_end|> B",
+         "a reasoning split trims the reasoning and closes it");
+  const auto thinking_options =
+      gufo::tokenization::ResolveQwenChatOptions(after.prompt.reasoning);
+  const auto thinking_prompt = gufo::tokenization::QwenChatTemplate::Render(
+      after.prompt.messages, thinking_options);
+  Expect(thinking_prompt.has_value() &&
+             thinking_prompt->ends_with("<|im_start|>assistant\n<think>\n"),
+         "the reasoning split's prompt ends with the open thinking block");
+  auto thinking_completed = thinking_options;
+  thinking_completed.add_generation_prompt = false;
+  const auto thinking_turn = gufo::tokenization::QwenChatTemplate::Render(
+      answered.messages, thinking_completed);
+  Expect(thinking_turn.has_value() &&
+             *thinking_turn == *thinking_prompt + after.reasoning +
+                                   std::string(after.reasoning_close) +
+                                   after.answer + "<|im_end|>\n",
+         "the answer after reasoning continues the prompt as the completed "
+         "turn");
+  // Inside the reasoning: verbatim (the thought boundary's blank line kept),
+  // nothing closes it, and the content continues it.
+  auto inside = answered;
+  inside.score_reasoning = true;
+  inside.messages.back().thought = "First thought.\n\n";
+  inside.messages.back().content = "Wait, check.";
+  const auto within = gufo::server::SplitScoringRequest(inside);
+  Expect(within.reasoning == "First thought.\n\n" &&
+             within.reasoning_close.empty() &&
+             within.answer == "Wait, check." &&
+             within.prompt.reasoning.enabled == true &&
+             !within.prompt.score_reasoning,
+         "score_reasoning keeps the reasoning verbatim and open");
+  inside.messages.back().thought.clear();
+  const auto first = gufo::server::SplitScoringRequest(inside);
+  Expect(first.reasoning.empty() && first.reasoning_close.empty() &&
+             first.prompt.reasoning.enabled == true,
+         "score_reasoning without reasoning scores the first thought");
   bad = request;
   bad.tools.push_back({.name = "f"});
   Expect(refuses(bad), "tools are refused");

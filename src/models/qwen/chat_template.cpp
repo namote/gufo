@@ -343,6 +343,10 @@ void AppendToolCalls(std::string& output,
 
 }  // namespace
 
+std::string_view TrimReasoning(std::string_view reasoning) {
+  return Trim(reasoning);
+}
+
 namespace {
 
 // The API surface trims framing with ASCII whitespace; the scanner keeps the
@@ -818,7 +822,7 @@ std::optional<std::string> QwenChatTemplate::Render(
         (options.preserve_thinking || message_index > last_user_index)) {
       output.append("<think>\n");
       AppendContent(output, content_spans, thought);
-      output.append("\n</think>\n\n");
+      output.append(kReasoningClose);
     }
 
     const bool has_content = AppendMessageContent(
