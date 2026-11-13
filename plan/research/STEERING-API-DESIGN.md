@@ -37,6 +37,23 @@ A separate Python tool (`tools/steer/`), which only calls the server:
 - **Train:** direction fixed; per-layer strengths by SPSA on teacher-forced scores (existing), or a generation grid on accuracy and length (as in `build/b1/think/step4.sh`).
 - **Load:** upload the result via A, without a restart.
 
+## Jobs: start with a key, poll for progress (B and C)
+
+Every long operation is a job: the start call returns at once with a key, and the page (or a script) polls with that key.
+- **Start:** `POST .../jobs` with the operation and its parameters returns `{"job": "<key>", "status": "queued"}`.
+- **Poll:** `GET .../jobs/{key}` returns `status` (queued, running, done, failed, cancelled), `progress` (done/total and the current step), `started_at`/`updated_at`, an `error` when failed, and the results so far.
+  - Collection: records done.
+  - Fit: the per-layer table, filled layer by layer.
+  - Test: per-problem rows and the running totals.
+- **Incremental polling:** `GET .../jobs/{key}?since=<n>` returns only results after sequence number n, so a page polling every second or two stays cheap. A server-sent-events stream (`GET .../jobs/{key}/events`) may come later for live push; polling is the contract.
+- **Cancel and list:** `DELETE .../jobs/{key}` cancels. `GET .../jobs` lists recent jobs with their parameters, which feeds the page's history.
+- **Lifetime:** results are kept after completion (the tool on disk; gufo in memory with a cap, documented) until deleted.
+
+Where the jobs live:
+- **gufo (B):** `POST /v1/abliteration/collect` is a job (`/v1/abliteration/jobs/{key}`), gated like A. Results are per-record per-layer means, written under the server-side directory the option names, and listed in the job.
+- **Tool (C):** fit, train (SPSA) and test (generation grid) are jobs in the tool's own HTTP API. A fit job calls gufo's collect job and polls it, and its own job reports both stages.
+- **A stays synchronous:** an upload or delete is quick and returns its result directly.
+
 ## D. Steering lab page (TODO after A–C)
 
 Requested by the user on November 13. A web page over C (and through it A and B), served by the external tool, not by gufo:
