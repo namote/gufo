@@ -13,9 +13,11 @@
 
 namespace gufo::models::qwen38_flash_next {
 
-/// Score columns per row: one per loaded detector, at most one per profile.
+/// Score columns per row: one per detector. Twice the profile cap, so a
+/// runtime update (`--allow-profile-updates`) can give a replaced trigger
+/// profile a new column while requests still read its previous one.
 inline constexpr std::uint32_t kDetectorColumns =
-    static_cast<std::uint32_t>(qwen::kAbliterationMaxProfiles);
+    2 * static_cast<std::uint32_t>(qwen::kAbliterationMaxProfiles);
 
 /// One dynamic profile a request may turn ON (R2): its detector's score
 /// column and thresholds, and the profiles a crossing turns ON (itself, then

@@ -764,6 +764,71 @@ the next turn. The next turn therefore continues from the last OFF checkpoint
 Reusing the switched state instead would hand the next request an answer
 whose state was computed ON while its own request starts OFF.
 
+#### Runtime profile updates
+
+With `--allow-profile-updates`, a Flash-Next server adds, replaces and
+removes abliteration profiles while it serves:
+
+| Method | Path | Body | Reply |
+| --- | --- | --- | --- |
+| `POST` | `/v1/abliteration/profiles/{name}` | a profile file's bytes | the profile's `/props` entry |
+| `DELETE` | `/v1/abliteration/profiles/{name}` | none | the removed profile's entry with `"deleted": true` |
+
+`name` is 1-64 letters, digits, `_`, `-` or `.`, and plays the role of the
+file name (`{name}.json`): requests select the profile by it and the set
+keeps file name order. A profile loaded at startup whose file stem breaks
+that rule cannot be replaced or removed through the API. The body is validated exactly as a file in
+`--abliteration-profiles DIR`: schema, placement, model identity, geometry,
+strengths, subspace members, additive mode and `trigger`, and the whole
+resulting set as at startup (at most 8 profiles; every `trigger.with` names a
+loaded profile other than its own; every set a detection can turn ON, and
+the union of all of them, forms device blocks). A POST naming a loaded
+profile replaces it; a DELETE that would leave another profile's
+`trigger.with` naming it is refused. The profile's `identity` is the SHA-256
+of the body. Uploads live in memory until the server restarts; nothing is
+written to disk.
+
+Errors: `invalid_profile_name` and `invalid_abliteration` (400, the set is
+unchanged), `unknown_abliteration_profile` (404, DELETE of a profile that is
+not loaded), `payload_too_large` (413), `profile_rows_busy` (409, below),
+and `unsupported_profile_update` (400) on Qwen3.8-27B and other models.
+Without the option both paths answer 404 like any unknown path. With
+`--api-key` they need the key, like every route; without a key any client
+can change the profiles every request uses (and upload 48 MiB bodies), so
+set one when the server is reachable by others.
+
+Limits: a body is at most 48 MiB (`kAbliterationMaxProfileBytes`, the
+loader's own cap); this upload alone may exceed `--max-request-bytes`, and
+only with a valid key when one is set. The server holds at most 8 profiles.
+The option reserves device memory at load for the updates: direction rows
+for 16 profiles of the largest geometry (both direction kinds, rank 8:
+`2 x layers x 8` rows each), twice the profile cap so every profile can be
+replaced while requests still use its previous version, plus the 256 union
+rows, in all `(16 x 2 x layers x 8 + 256) x hidden x 4` bytes (for
+Flash-Next on the order of 100-200 MB), and 16 detector columns (twice the
+profile cap, for the same reason; every server scores into 16 columns). A
+version stays held while a running request uses it, and also by an idle
+session that last ran it ON or detecting, until that session serves its next
+request. A POST that finds no free rows or detector column returns 409
+`profile_rows_busy`; retry later.
+
+Consistency. A request snapshots the loaded set when it is prepared (its
+prompt context holds that set) and runs with it to the end: a replace or
+delete never changes a running request, including a detecting one, whose
+crossing turns ON its snapshot's profiles and companions, and its
+readmission. Each profile version owns its own device direction rows and
+detector column; a later version gets new ones, and old rows are reused only
+after every request and session holding them let go. The device rows are
+written and the new set published between scheduler steps, never while a
+pass runs or a graph is recorded. Detectors: every pass after the update
+scores the new set's detectors (and those of older sets still held), so a
+trigger added or removed takes effect for requests prepared afterwards;
+sessions record their graphs again after the detector set changed. Cache
+identity: a profile's settings identity covers the SHA-256 of its bytes and
+union bases are keyed by it, so a replaced profile with different bytes never
+restores or shares state cached under the old one, while an identical upload
+keeps sharing it.
+
 Diagnostic telemetry is limited to status, token counts, timing, and
 cancellation state. It must not contain prompt text, model paths, machine
 identity, request IDs, or token IDs.
@@ -795,6 +860,8 @@ cache snapshots. HTTP handlers do not implement model kernels.
 | `GET` | `/health` | Process liveness and GPU context (aliases: `/v1/health`, `/healthz`) |
 | `GET` | `/ready` | Model and backend readiness (aliases: `/v1/ready`, `/readyz`) |
 | `GET` | `/metrics` | Prometheus-format operational metrics (text LLM serving only) |
+| `POST`, `DELETE` | `/v1/abliteration/profiles/{name}` | With `--allow-profile-updates`: [runtime abliteration profiles](#runtime-profile-updates) (Flash-Next) |
+| `POST`, `DELETE` | `/v1/logit-bias/profiles/{name}` | With `--allow-profile-updates`: [runtime logit-bias profiles](#logit-bias-profiles) |
 
 ### Other model services
 
@@ -1358,6 +1425,28 @@ biased distribution exactly. Returned logprobs stay raw. Traces record the
 combination as `sampling.logit_bias` (`name=bias` in name order, then the
 OpenAI map). Models without the Han scale keep rejecting a nonempty
 `logit_bias` and the profile fields as unsupported.
+
+With `--allow-profile-updates` the server also changes these profiles while
+it serves (Qwen 27B and Flash-Next):
+
+| Method | Path | Body | Reply |
+| --- | --- | --- | --- |
+| `POST` | `/v1/logit-bias/profiles/{name}` | a profile file's JSON | the profile's `logit_bias_profiles` entry |
+| `DELETE` | `/v1/logit-bias/profiles/{name}` | none | the removed profile's entry with `"deleted": true` |
+
+The body is validated exactly as a file of `--logit-bias-profiles` (format,
+keys, scope, bias, ids, strings expanded against the vocabulary) and its
+`name` must equal the path's. A POST naming a loaded profile replaces it.
+Errors: `invalid_profile_name` and `invalid_logit_bias_profile` (400),
+`unknown_logit_bias_profile` (404), `payload_too_large` (413, a body is at
+most 1 MiB) and `unsupported_profile_update` (400) on other models. The
+server holds at most 256 profiles (`kMaxLogitBiasProfiles`, as a directory).
+Each update builds a new catalog with an empty combination cache: a request
+resolves its offsets when it is parsed and keeps them, so a running request
+never sees the change, and no later request receives an array built from a
+replaced profile (the device copies follow the new array). Uploads live in
+memory until restart. Without the option the paths answer 404; with
+`--api-key` they need the key.
 
 Tool calls are emitted only for declared functions when `tool_choice` allows
 calling tools. With `auto`, ordinary text and reasoning remain allowed; once a

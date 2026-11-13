@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <numeric>
 #include <stdexcept>
+#include <string>
+#include <utility>
 
 namespace gufo::models::qwen38_flash_next {
 
@@ -15,6 +17,133 @@ AbliterationProfile AbliterationProfile::Load(const std::filesystem::path& path,
       qwen::AbliterationProfile::Load(path, hidden, layers, model_identity,
                                       qwen::kAbliterationWriterBeforeHc);
   return result;
+}
+
+AbliterationProfile AbliterationProfile::Parse(
+    std::string_view bytes, std::string name, std::uint32_t hidden,
+    std::uint32_t layers, std::string_view model_identity) {
+  AbliterationProfile result;
+  static_cast<qwen::AbliterationProfile&>(result) =
+      qwen::AbliterationProfile::Parse(bytes, std::move(name), hidden, layers,
+                                       model_identity,
+                                       qwen::kAbliterationWriterBeforeHc);
+  return result;
+}
+
+AbliterationProfileSet WithAbliterationProfile(
+    const AbliterationProfileSet& profiles,
+    std::shared_ptr<const qwen::AbliterationProfile> profile) {
+  if (!profile)
+    throw std::invalid_argument("abliteration: no profile");
+  AbliterationProfileSet result;
+  for (const auto& loaded : profiles)
+    if (loaded->name != profile->name)
+      result.push_back(loaded);
+  if (result.size() >= qwen::kAbliterationMaxProfiles)
+    throw std::invalid_argument("abliteration: more than " +
+                                std::to_string(qwen::kAbliterationMaxProfiles) +
+                                " profiles");
+  // File name order: `a.json` sorts before `a-b.json` ('.' > '-'), so compare
+  // the names as file names.
+  const auto file = [](const auto& p) { return p->name + ".json"; };
+  const auto at = std::ranges::upper_bound(result, file(profile), {}, file);
+  result.insert(at, std::move(profile));
+  return result;
+}
+
+AbliterationProfileSet WithoutAbliterationProfile(
+    const AbliterationProfileSet& profiles, std::string_view name) {
+  AbliterationProfileSet result;
+  for (const auto& loaded : profiles)
+    if (loaded->name != name)
+      result.push_back(loaded);
+  if (result.size() == profiles.size())
+    throw std::out_of_range("abliteration: no profile is named '" +
+                            std::string(name) + "'");
+  return result;
+}
+
+std::shared_ptr<const qwen::AbliterationSettings> ResolveAbliterationDefaults(
+    std::span<const std::shared_ptr<const qwen::AbliterationProfile>> profiles,
+    std::span<const std::string> names) {
+  std::vector<const qwen::AbliterationProfile*> loaded;
+  for (const auto& profile : profiles)
+    loaded.push_back(profile.get());
+  std::vector<qwen::AbliterationOverrides> set;
+  for (const auto& name : names)
+    set.push_back({.profile = name});
+  return qwen::ResolveAbliterationSet(loaded, set);
+}
+
+std::vector<DynamicAbliterationCandidate> PlanAbliterationTriggers(
+    const AbliterationProfileSet& profiles) {
+  if (profiles.size() > qwen::kAbliterationMaxProfiles)
+    throw std::invalid_argument("abliteration: too many profiles");
+  for (std::size_t i = 0; i < profiles.size(); ++i)
+    for (std::size_t j = 0; j < i; ++j)
+      if (profiles[i]->name == profiles[j]->name)
+        throw std::invalid_argument("abliteration: two profiles are named '" +
+                                    profiles[i]->name + "'");
+  // Each dynamic profile turns ON with its defaults, together with its
+  // companions (`trigger.with`, their defaults), exactly as an explicit
+  // request naming the same profiles would.
+  std::vector<DynamicAbliterationCandidate> candidates;
+  for (const auto& profile : profiles)
+    if (profile->trigger) {
+      std::vector<std::string> names{profile->name};
+      for (const auto& name : profile->trigger->with) {
+        if (name == profile->name)
+          throw std::invalid_argument("abliteration: profile '" + name +
+                                      "' names itself in trigger.with");
+        names.push_back(name);
+      }
+      // Checks every companion is loaded and the set combines.
+      (void)ResolveAbliterationDefaults(profiles, names);
+      candidates.push_back({profile->name, 0, profile->trigger->threshold,
+                            profile->trigger->decode_threshold,
+                            std::move(names)});
+    }
+  // Every set a detection can turn ON, and the union of all of them (all
+  // triggers crossing at once), must form device blocks: refuse a profile
+  // set where one cannot, instead of failing a request.
+  std::vector<std::string> all;
+  const auto check = [&](std::span<const std::string> names) {
+    const auto settings = ResolveAbliterationDefaults(profiles, names);
+    if (settings->parts.size() > 1)
+      (void)PlanAbliteration(qwen::AbliterationParts(*settings), profiles);
+  };
+  for (const auto& candidate : candidates) {
+    check(candidate.profiles);
+    for (const auto& name : candidate.profiles)
+      if (std::ranges::find(all, name) == all.end())
+        all.push_back(name);
+  }
+  if (!all.empty())
+    check(all);
+  return candidates;
+}
+
+const qwen::AbliterationProfile* AbliterationTable::Find(
+    std::string_view name) const noexcept {
+  for (const auto& profile : profiles)
+    if (profile->name == name)
+      return profile.get();
+  return nullptr;
+}
+
+std::uint32_t AbliterationTable::Row(std::string_view name) const {
+  for (std::size_t i = 0; i < profiles.size(); ++i)
+    if (profiles[i]->name == name)
+      return rows.at(i);
+  throw std::invalid_argument("abliteration profile is not loaded");
+}
+
+std::vector<const qwen::AbliterationProfile*> AbliterationTable::List() const {
+  std::vector<const qwen::AbliterationProfile*> list;
+  list.reserve(profiles.size());
+  for (const auto& profile : profiles)
+    list.push_back(profile.get());
+  return list;
 }
 
 AbliterationProfileSet LoadAbliterationProfiles(
@@ -117,7 +246,9 @@ AbliterationPlan PlanAbliteration(
                           profiles[p]->directions.begin() + first +
                               std::size_t{part->direction_count} * hidden);
           source_owner.insert(source_owner.end(), part->direction_count, p);
-          block.key += part->profile + ":" +
+          // The profile's bytes, not its name: a replaced profile of the
+          // same name never shares a cached basis.
+          block.key += profiles[p]->identity + ":" +
                        std::to_string(part->direction_row) + ":" +
                        std::to_string(part->direction_count) + ";";
         }

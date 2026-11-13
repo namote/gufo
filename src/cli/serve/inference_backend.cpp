@@ -90,12 +90,31 @@ struct QwenImageContext : TextPromptContext {
 /// effective settings.
 struct AbliterationPromptContext final : QwenImageContext {
   std::shared_ptr<const models::qwen::AbliterationSettings> settings;
+  /// Flash-Next: the profiles the settings resolved against, snapshotted
+  /// when the request was prepared (a later profile update never changes
+  /// it); null for Qwen3.8-27B.
+  std::shared_ptr<const models::qwen38_flash_next::AbliterationTable> table;
 };
 
 /// A Flash-Next request without an `abliteration` member while a profile
 /// with a `trigger` is loaded: it starts OFF (the OFF cache identity) and
 /// its detectors may turn one profile ON mid-request (R2 A1).
-struct DynamicAbliterationContext final : QwenImageContext {};
+struct DynamicAbliterationContext final : QwenImageContext {
+  /// The profiles (and detectors) snapshotted when the request was
+  /// prepared.
+  std::shared_ptr<const models::qwen38_flash_next::AbliterationTable> table;
+};
+
+/// The profile table a request's context snapshotted; null without one.
+std::shared_ptr<const models::qwen38_flash_next::AbliterationTable>
+ContextAbliterationTable(const TextPromptContext* context) {
+  if (const auto* on = dynamic_cast<const AbliterationPromptContext*>(context))
+    return on->table;
+  if (const auto* dynamic =
+          dynamic_cast<const DynamicAbliterationContext*>(context))
+    return dynamic->table;
+  return nullptr;
+}
 
 /// The profiles a model holds, in load order; Qwen3.8-27B holds at most one.
 using AbliterationProfileList =
@@ -289,9 +308,12 @@ std::shared_ptr<const models::qwen::vision::Prompt> QwenPrompt(
 /// image-prefix cache identity salted with the settings identity.
 std::shared_ptr<const AbliterationPromptContext> AbliterationContext(
     const std::shared_ptr<const TextPromptContext>& base,
-    std::shared_ptr<const models::qwen::AbliterationSettings> settings) {
+    std::shared_ptr<const models::qwen::AbliterationSettings> settings,
+    std::shared_ptr<const models::qwen38_flash_next::AbliterationTable> table =
+        nullptr) {
   auto context = std::make_shared<AbliterationPromptContext>();
   context->settings = std::move(settings);
+  context->table = std::move(table);
   const auto& identity = context->settings->identity;
   if (base) {
     context->prompt = QwenPrompt(base);
@@ -306,10 +328,11 @@ std::shared_ptr<const AbliterationPromptContext> AbliterationContext(
   return context;
 }
 
-TextPreparedPrompt SelectAbliteration(TextPreparedPrompt result,
-                                      const ChatRequest& request,
-                                      const AbliterationProfileList& profiles,
-                                      bool dynamic = false) {
+TextPreparedPrompt SelectAbliteration(
+    TextPreparedPrompt result, const ChatRequest& request,
+    const AbliterationProfileList& profiles, bool dynamic = false,
+    const std::shared_ptr<const models::qwen38_flash_next::AbliterationTable>&
+        table = nullptr) {
   if (!request.abliteration) {
     // An explicit OFF, and scoring (dynamic false), never detect.
     if (!dynamic || request.abliteration_specified ||
@@ -317,6 +340,7 @@ TextPreparedPrompt SelectAbliteration(TextPreparedPrompt result,
                              [](const auto* p) { return bool(p->trigger); }))
       return result;
     auto context = std::make_shared<DynamicAbliterationContext>();
+    context->table = table;
     if (result.context) {
       context->prompt = QwenPrompt(result.context);
       context->cache_identity = result.context->cache_identity;
@@ -336,8 +360,8 @@ TextPreparedPrompt SelectAbliteration(TextPreparedPrompt result,
           : std::span<const models::qwen::AbliterationOverrides>(
                 request.abliteration_profiles);
   result.context = AbliterationContext(
-      result.context,
-      models::qwen::ResolveAbliterationSet(profiles, requested));
+      result.context, models::qwen::ResolveAbliterationSet(profiles, requested),
+      table);
   return result;
 }
 
@@ -348,7 +372,9 @@ TextScoringPrompt PrepareQwenScoring(
     const ChatRequest& request, const tokenization::QwenTokenizer& tokenizer,
     const std::shared_ptr<models::qwen::vision::Encoder>& encoder,
     std::uint32_t max_context, models::qwen::vision::ImageCache& image_cache,
-    const AbliterationProfileList& profiles) {
+    const AbliterationProfileList& profiles,
+    const std::shared_ptr<const models::qwen38_flash_next::AbliterationTable>&
+        table = nullptr) {
   auto split = SplitScoringRequest(request);
   tokenization::TokenizerOptions content;
   content.parse_special_tokens = false;
@@ -356,7 +382,7 @@ TextScoringPrompt PrepareQwenScoring(
   LimitScoredTokens(&answer, request);
   return {SelectAbliteration(PrepareQwenPrompt(split.prompt, tokenizer, encoder,
                                                max_context, image_cache),
-                             split.prompt, profiles),
+                             split.prompt, profiles, false, table),
           {answer.begin(), answer.end()}};
 }
 
@@ -3093,10 +3119,13 @@ public:
 
   [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
       const ChatRequest& request) const override {
+    // The request keeps this table: a profile update after this point never
+    // changes what it runs.
+    const auto table = model_->Abliteration();
     auto prepared = SelectAbliteration(
         PrepareQwenPrompt(request, model_->tokenizer(), model_->VisionEncoder(),
                           max_context_, image_cache_),
-        request, ListProfiles(model_->AbliterationProfiles()), true);
+        request, TableProfiles(table), true, table);
     // An unworkable combination is a 400 here, not a failure at admission.
     ValidateCombination(prepared.context.get());
     return prepared;
@@ -3108,15 +3137,23 @@ public:
     const auto* selected =
         dynamic_cast<const AbliterationPromptContext*>(context);
     if (selected)
-      model_->CheckAbliterationCombination(*selected->settings);
+      model_->CheckAbliterationCombination(*selected->settings,
+                                           selected->table.get());
+  }
+
+  static AbliterationProfileList TableProfiles(
+      const std::shared_ptr<const models::qwen38_flash_next::AbliterationTable>&
+          table) {
+    return table ? table->List() : AbliterationProfileList{};
   }
 
   [[nodiscard]] bool SupportsScoring() const override { return true; }
   [[nodiscard]] TextScoringPrompt PrepareScoring(
       const ChatRequest& request) const override {
-    return PrepareQwenScoring(
-        request, model_->tokenizer(), model_->VisionEncoder(), max_context_,
-        image_cache_, ListProfiles(model_->AbliterationProfiles()));
+    const auto table = model_->Abliteration();
+    return PrepareQwenScoring(request, model_->tokenizer(),
+                              model_->VisionEncoder(), max_context_,
+                              image_cache_, TableProfiles(table), table);
   }
 
   [[nodiscard]] std::vector<sampling::TokenLogprobs> ScoreTokens(
@@ -3191,14 +3228,19 @@ public:
       TextRunnerState& state,
       std::shared_ptr<const TextPromptContext> context) const override {
     auto& session = RequireQwenFlashNextState(state).session();
-    session.ConfigureAbliteration(AbliterationSelected(context));
+    // The request's own snapshot of the profiles, never the current one.
+    auto table = ContextAbliterationTable(context.get());
+    session.ConfigureAbliteration(AbliterationSelected(context), table);
     session.ConfigureVision(QwenPrompt(context));
     // Detection only for a request that left `abliteration` out; an
     // explicit ON or OFF and scoring requests run none.
+    const bool detects =
+        dynamic_cast<const DynamicAbliterationContext*>(context.get()) && table;
     session.ConfigureDynamicAbliteration(
-        dynamic_cast<const DynamicAbliterationContext*>(context.get())
-            ? model_->StartDynamicAbliteration()
-            : nullptr);
+        detects
+            ? models::qwen38_flash_next::Model::StartDynamicAbliteration(table)
+            : nullptr,
+        detects ? table : nullptr);
   }
 
   // A2: a profile detected on the last prompt row runs the request again as
@@ -3220,9 +3262,11 @@ public:
     std::vector<models::qwen::AbliterationOverrides> set;
     for (const auto& name : report->triggered)
       set.push_back({.profile = name});
-    const auto loaded = ListProfiles(model_->AbliterationProfiles());
+    // The profiles the detecting request was admitted with.
+    const auto table = ContextAbliterationTable(context.get());
     auto on = AbliterationContext(
-        context, models::qwen::ResolveAbliterationSet(loaded, set));
+        context,
+        models::qwen::ResolveAbliterationSet(TableProfiles(table), set), table);
     // std::invalid_argument: the scheduler keeps the request OFF
     // (`skipped: "union"`).
     ValidateCombination(on.get());
@@ -3642,6 +3686,10 @@ std::shared_ptr<TextModelRunner> CreateQwenFlashNextTextRunner(
 #endif
 
 struct InferenceBackend::Impl {
+  /// `--allow-profile-updates` (set_profile_updates).
+  bool profile_updates{false};
+  /// Serializes runtime profile updates.
+  std::mutex update_mutex;
 #if defined(ENGINE_ENABLE_HIP)
   struct State {
     std::shared_ptr<TextGenerationScheduler> scheduler;
@@ -3654,6 +3702,9 @@ struct InferenceBackend::Impl {
     std::vector<AbliterationInfo> abliteration;
     /// Flash-Next's HyperConnection mode name; empty for other models.
     std::string hc_mode;
+    /// The Flash-Next model, whose profiles runtime updates replace; null
+    /// for other models.
+    std::shared_ptr<models::qwen38_flash_next::Model> flash_next;
     /// The runner's Han tokens; null where its samplers ignore han_scale.
     std::shared_ptr<const sampling::TokenSet> han_tokens;
     /// The runner's logit-bias profiles (none until
@@ -4007,6 +4058,7 @@ bool InferenceBackend::load(
             .kvarn_bits =
                 resolved_kv_cache_type == cli::KvCacheType::kKvarnK6V6 ? 6 : 4,
             .abliteration_profiles = profile_files,
+            .abliteration_updates = impl_->profile_updates,
             .hc_mode =
                 hc_mode.value_or(models::qwen38_flash_next::kDefaultHcMode),
         },
@@ -4457,6 +4509,7 @@ bool InferenceBackend::load(
     new_state->supports_images = model->VisionEncoder() != nullptr;
     new_state->abliteration =
         DescribeAbliteration(ListProfiles(model->AbliterationProfiles()));
+    new_state->flash_next = model;
     new_state->hc_mode =
         models::qwen38_flash_next::HcModeName(model->hc_mode());
     auto runner = std::make_shared<QwenFlashNextTextRunner>(
@@ -4613,11 +4666,10 @@ bool InferenceBackend::load_logit_bias_profiles(
             " bias=" + std::to_string(profile.bias) +
             " tokens=" + std::to_string(profile.tokens.size()) +
             " string_tokens=" + std::to_string(profile.string_matches));
-  Logger::Info("loader",
-               "event=logit_bias_profiles_loaded profiles=" +
-                   std::to_string(profiles.size()) + " prepare_ms=" +
-                   std::to_string(
-                       Milliseconds(Clock::now() - started).count()));
+  Logger::Info("loader", "event=logit_bias_profiles_loaded profiles=" +
+                             std::to_string(profiles.size()) + " prepare_ms=" +
+                             std::to_string(
+                                 Milliseconds(Clock::now() - started).count()));
   auto updated = std::make_shared<Impl::State>(*impl_->state);
   updated->logit_bias = std::make_shared<const sampling::LogitBiasCatalog>(
       runner.VocabularySize(), std::move(profiles));
@@ -4630,6 +4682,227 @@ bool InferenceBackend::load_logit_bias_profiles(
   return false;
 #endif
 }
+
+void InferenceBackend::set_profile_updates(bool enabled) {
+  impl_->profile_updates = enabled;
+}
+
+#if defined(ENGINE_ENABLE_HIP)
+namespace {
+/// `profiles` with `profile` in file name order (the name followed by
+/// `.json`), replacing the one of its name.
+std::vector<sampling::LogitBiasProfile> WithLogitBiasProfile(
+    std::span<const sampling::LogitBiasProfile> profiles,
+    sampling::LogitBiasProfile profile) {
+  std::vector<sampling::LogitBiasProfile> result;
+  for (const auto& loaded : profiles)
+    if (loaded.name != profile.name)
+      result.push_back(loaded);
+  if (result.size() >= sampling::kMaxLogitBiasProfiles)
+    throw ProfileUpdateError(
+        400, "invalid_logit_bias_profile",
+        "more than " + std::to_string(sampling::kMaxLogitBiasProfiles) +
+            " logit-bias profiles");
+  const auto file = [](const sampling::LogitBiasProfile& p) {
+    return p.name + ".json";
+  };
+  const auto at = std::ranges::upper_bound(result, file(profile), {}, file);
+  result.insert(at, std::move(profile));
+  return result;
+}
+}  // namespace
+#endif
+
+AbliterationInfo InferenceBackend::put_abliteration_profile(
+    std::string_view name, std::string_view body) {
+#if defined(ENGINE_ENABLE_HIP)
+  namespace fn = models::qwen38_flash_next;
+  const std::lock_guard<std::mutex> update(impl_->update_mutex);
+  const auto state = impl_->Snapshot();
+  const auto model = state ? state->flash_next : nullptr;
+  if (!model || !model->AbliterationUpdatable())
+    throw ProfileUpdateError(
+        400, "unsupported_profile_update",
+        "runtime abliteration profiles apply only to Qwen3.8-Flash-Next");
+  if (!models::qwen::ValidAbliterationProfileName(name))
+    throw ProfileUpdateError(400, "invalid_profile_name",
+                             "a profile name is 1-64 letters, digits, '_', "
+                             "'-' or '.'");
+  fn::AbliterationProfileSet profiles;
+  std::string identity;
+  try {
+    const auto& config = model->config();
+    auto profile = std::make_shared<const fn::AbliterationProfile>(
+        fn::AbliterationProfile::Parse(body, std::string(name),
+                                       config.hidden_size, config.num_layers,
+                                       model->ArtifactIdentity()));
+    identity = profile->identity;
+    profiles = fn::WithAbliterationProfile(model->AbliterationProfiles(),
+                                           std::move(profile));
+    (void)fn::PlanAbliterationTriggers(profiles);
+  } catch (const std::invalid_argument& e) {
+    throw ProfileUpdateError(400, "invalid_abliteration", e.what());
+  }
+  ApplyAbliterationProfiles(profiles, "put", name);
+  for (auto& info : abliteration_profiles())
+    if (info.name == name)
+      return info;
+  throw ProfileUpdateError(500, "internal_error",
+                           "the updated profile is missing");
+#else
+  return TextGenerationBackend::put_abliteration_profile(name, body);
+#endif
+}
+
+AbliterationInfo InferenceBackend::delete_abliteration_profile(
+    std::string_view name) {
+#if defined(ENGINE_ENABLE_HIP)
+  namespace fn = models::qwen38_flash_next;
+  const std::lock_guard<std::mutex> update(impl_->update_mutex);
+  const auto state = impl_->Snapshot();
+  const auto model = state ? state->flash_next : nullptr;
+  if (!model || !model->AbliterationUpdatable())
+    throw ProfileUpdateError(
+        400, "unsupported_profile_update",
+        "runtime abliteration profiles apply only to Qwen3.8-Flash-Next");
+  std::optional<AbliterationInfo> removed;
+  for (const auto& info : state->abliteration)
+    if (info.name == name)
+      removed = info;
+  fn::AbliterationProfileSet profiles;
+  try {
+    profiles =
+        fn::WithoutAbliterationProfile(model->AbliterationProfiles(), name);
+    // A remaining profile's trigger.with may still name it.
+    (void)fn::PlanAbliterationTriggers(profiles);
+  } catch (const std::out_of_range& e) {
+    throw ProfileUpdateError(404, "unknown_abliteration_profile", e.what());
+  } catch (const std::invalid_argument& e) {
+    throw ProfileUpdateError(400, "invalid_abliteration", e.what());
+  }
+  ApplyAbliterationProfiles(profiles, "delete", name);
+  if (!removed)
+    throw ProfileUpdateError(500, "internal_error",
+                             "the removed profile had no summary");
+  return *removed;
+#else
+  return TextGenerationBackend::delete_abliteration_profile(name);
+#endif
+}
+
+#if defined(ENGINE_ENABLE_HIP)
+void InferenceBackend::ApplyAbliterationProfiles(
+    const models::qwen38_flash_next::AbliterationProfileSet& profiles,
+    std::string_view action, std::string_view name) {
+  const auto state = impl_->Snapshot();
+  const auto model = state->flash_next;
+  // Device rows are written and the table swapped between scheduler steps,
+  // never while a pass runs or a graph is recorded.
+  try {
+    state->scheduler->RunBetweenSteps(
+        [&] { model->ReplaceAbliteration(profiles); });
+  } catch (const std::invalid_argument& e) {
+    throw ProfileUpdateError(400, "invalid_abliteration", e.what());
+  } catch (const std::length_error& e) {
+    throw ProfileUpdateError(409, "profile_rows_busy", e.what());
+  } catch (const std::exception& e) {
+    throw ProfileUpdateError(503, "model_unavailable", e.what());
+  }
+  {
+    const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+    auto updated = std::make_shared<Impl::State>(*impl_->state);
+    updated->abliteration = DescribeAbliteration(ListProfiles(profiles));
+    impl_->state = std::move(updated);
+  }
+  Logger::Info("server", "event=abliteration_profile_update action=" +
+                             std::string(action) +
+                             " name=" + std::string(name) +
+                             " profiles=" + std::to_string(profiles.size()));
+}
+#endif
+
+sampling::LogitBiasProfile InferenceBackend::put_logit_bias_profile(
+    std::string_view name, std::string_view body) {
+#if defined(ENGINE_ENABLE_HIP)
+  const std::lock_guard<std::mutex> update(impl_->update_mutex);
+  const auto state = impl_->Snapshot();
+  if (state == nullptr || state->logit_bias == nullptr)
+    throw ProfileUpdateError(
+        400, "unsupported_profile_update",
+        "logit-bias profiles apply only to Qwen 27B and Flash-Next");
+  if (body.size() > kMaxLogitBiasProfileBytes)
+    throw ProfileUpdateError(413, "payload_too_large",
+                             "a logit-bias profile is at most 1 MiB");
+  const auto& runner = state->scheduler->runner();
+  sampling::LogitBiasProfile profile;
+  try {
+    profile = sampling::ParseLogitBiasProfile(body, "request body");
+    if (profile.name != name)
+      throw std::invalid_argument("logit bias: the body names profile '" +
+                                  profile.name + "', the path '" +
+                                  std::string(name) + "'");
+    sampling::ResolveLogitBiasProfiles(
+        std::span(&profile, 1), runner.VocabularySize(),
+        [&](sampling::TokenId token) {
+          const TextRunnerToken id = token;
+          return runner.Decode(std::span(&id, 1));
+        });
+  } catch (const std::invalid_argument& e) {
+    throw ProfileUpdateError(400, "invalid_logit_bias_profile", e.what());
+  }
+  auto profiles = WithLogitBiasProfile(state->logit_bias->profiles(), profile);
+  ReplaceLogitBiasProfiles(std::move(profiles), "put", name);
+  return profile;
+#else
+  return TextGenerationBackend::put_logit_bias_profile(name, body);
+#endif
+}
+
+sampling::LogitBiasProfile InferenceBackend::delete_logit_bias_profile(
+    std::string_view name) {
+#if defined(ENGINE_ENABLE_HIP)
+  const std::lock_guard<std::mutex> update(impl_->update_mutex);
+  const auto state = impl_->Snapshot();
+  if (state == nullptr || state->logit_bias == nullptr)
+    throw ProfileUpdateError(
+        400, "unsupported_profile_update",
+        "logit-bias profiles apply only to Qwen 27B and Flash-Next");
+  const auto* removed = state->logit_bias->Find(name);
+  if (removed == nullptr)
+    throw ProfileUpdateError(
+        404, "unknown_logit_bias_profile",
+        "no logit-bias profile is named '" + std::string(name) + "'");
+  auto result = *removed;
+  std::vector<sampling::LogitBiasProfile> profiles;
+  for (const auto& profile : state->logit_bias->profiles())
+    if (profile.name != name)
+      profiles.push_back(profile);
+  ReplaceLogitBiasProfiles(std::move(profiles), "delete", name);
+  return result;
+#else
+  return TextGenerationBackend::delete_logit_bias_profile(name);
+#endif
+}
+
+#if defined(ENGINE_ENABLE_HIP)
+void InferenceBackend::ReplaceLogitBiasProfiles(
+    std::vector<sampling::LogitBiasProfile> profiles, std::string_view action,
+    std::string_view name) {
+  const auto count = profiles.size();
+  const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+  auto updated = std::make_shared<Impl::State>(*impl_->state);
+  // A new catalog with an empty combination cache: requests already
+  // admitted keep the offsets they resolved, later ones never see an array
+  // built from the replaced profile.
+  updated->logit_bias = std::make_shared<const sampling::LogitBiasCatalog>(
+      updated->logit_bias->vocabulary_size(), std::move(profiles));
+  impl_->state = std::move(updated);
+  Logger::Info("server",
+               "event=logit_bias_profile_update action=" + std::string(action) +
+                   " name=" + std::string(name) +
+                   " profiles=" + std::to_string(count));
+}
+#endif
 
 bool InferenceBackend::supports_scoring() const {
 #if defined(ENGINE_ENABLE_HIP)

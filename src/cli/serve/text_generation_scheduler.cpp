@@ -10,6 +10,7 @@
 #include <exception>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iomanip>
 #include <iterator>
 #include <limits>
@@ -2498,6 +2499,7 @@ struct TextGenerationScheduler::Impl {
       if (device_lost.load(std::memory_order_acquire))
         break;
       loop_working.store(true, std::memory_order_relaxed);
+      RunBetweenStepsTasks();
       ProcessQueuedCancellations();
       if (const auto now = Clock::now(); now >= write_back_check) {
         (void)runner_pool->WriteBackIdle(
@@ -2541,6 +2543,7 @@ struct TextGenerationScheduler::Impl {
         std::unique_lock<std::mutex> lock(queue_mutex);
         const auto wake = [&] {
           return stop_token.stop_requested() || stopping ||
+                 !between_steps.empty() ||
                  (queued_count != 0 &&
                   capturing.size() + waiting.size() + kv_waiting.size() <
                       runner_pool->capacity());
@@ -2790,6 +2793,36 @@ struct TextGenerationScheduler::Impl {
     for (auto& request : capturing)
       decoding.push_back(std::move(request));
     CancelRemaining(prefilling, decoding, waiting);
+    // Tasks still waiting fail: no step follows.
+    std::deque<BetweenStepsTask> abandoned;
+    {
+      const std::lock_guard<std::mutex> lock(queue_mutex);
+      between_steps_closed = true;
+      abandoned.swap(between_steps);
+    }
+    for (auto& task : abandoned)
+      task.done.set_exception(std::make_exception_ptr(std::runtime_error(
+          "text generation scheduler stopped before the task ran")));
+  }
+
+  /// Runs the tasks RunBetweenSteps queued, on the scheduler thread with no
+  /// pass in flight.
+  void RunBetweenStepsTasks() {
+    std::deque<BetweenStepsTask> tasks;
+    {
+      const std::lock_guard<std::mutex> lock(queue_mutex);
+      if (between_steps.empty())
+        return;
+      tasks.swap(between_steps);
+    }
+    for (auto& task : tasks) {
+      try {
+        task.run();
+        task.done.set_value();
+      } catch (...) {
+        task.done.set_exception(std::current_exception());
+      }
+    }
   }
 
   std::weak_ptr<ScheduledRequest> kv_guarantor;
@@ -2810,6 +2843,13 @@ struct TextGenerationScheduler::Impl {
   std::deque<PendingClient> queued_clients;
   std::size_t queued_count{0};
   bool stopping{false};
+  struct BetweenStepsTask {
+    std::function<void()> run;
+    std::promise<void> done;
+  };
+  /// RunBetweenSteps tasks (queue_mutex); closed once the loop has ended.
+  std::deque<BetweenStepsTask> between_steps;
+  bool between_steps_closed{false};
   std::atomic<bool> device_lost{false};
   const std::exception_ptr device_lost_failure =
       std::make_exception_ptr(TextGenerationError(
@@ -3005,6 +3045,21 @@ TextGenerationScheduler::TextGenerationScheduler(
                                    scheduler_policy)) {}
 
 TextGenerationScheduler::~TextGenerationScheduler() = default;
+
+void TextGenerationScheduler::RunBetweenSteps(std::function<void()> task) {
+  std::future<void> done;
+  {
+    const std::lock_guard<std::mutex> lock(impl_->queue_mutex);
+    if (impl_->stopping || impl_->between_steps_closed ||
+        impl_->device_lost.load(std::memory_order_acquire))
+      throw std::runtime_error("text generation scheduler is not running");
+    Impl::BetweenStepsTask entry{std::move(task), {}};
+    done = entry.done.get_future();
+    impl_->between_steps.push_back(std::move(entry));
+  }
+  impl_->queue_condition.notify_all();
+  done.get();
+}
 
 const TextModelRunner& TextGenerationScheduler::runner() const noexcept {
   return impl_->runner_pool->runner();

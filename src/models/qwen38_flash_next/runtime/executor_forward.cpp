@@ -29,6 +29,18 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
   // Host counters must observe each executed operation. Captured/replayed
   // bodies would either duplicate or omit them, as with MtpTrace copies.
   graph = graph && !diagnostics_active_ && !session.activation_observer_;
+  // A detecting graph captured the detector list; after a profile update
+  // changed it (PublishAbliteration), record this session's graphs again.
+  if (session.detector_generation_ != detector_generation_) {
+    if (!session.graphs_.empty()) {
+      if (!Check(hipStreamSynchronize(stream_), "graph reset", error_msg))
+        return false;
+      for (const auto& [recorded, exec] : session.graphs_)
+        (void)hipGraphExecDestroy(exec);
+      session.graphs_.clear();
+    }
+    session.detector_generation_ = detector_generation_;
+  }
   // A batch shape runs eagerly once before it is captured: the first pass
   // grows the GEMM tier's arena, which capture forbids.
   if (graph && session.warmed_.contains(key)) {

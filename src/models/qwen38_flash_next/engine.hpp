@@ -77,6 +77,13 @@ struct ModelOptions {
   /// beside the model. Loading enables none; a profile with a `trigger`
   /// turns ON only in sessions whose detection selects it.
   std::vector<std::string> abliteration_profiles;
+  /// Reserve device rows so profiles can be added, replaced and removed
+  /// while serving (ReplaceAbliteration; `--allow-profile-updates`): rows for
+  /// twice qwen::kAbliterationMaxProfiles profiles of the largest geometry
+  /// (2 kinds x layers x qwen::kAbliterationMaxDirections rows each), so every
+  /// profile can be replaced while requests still use the old one, plus the
+  /// union rows and every detector column (kDetectorColumns).
+  bool abliteration_updates = false;
   /// `--hc-mode`: the hyper-connection mixers' weights. q8-calibrated needs a
   /// native EXL3 pack with a valid sidecar; loading fails otherwise.
   HcMode hc_mode = kDefaultHcMode;
@@ -118,22 +125,39 @@ public:
     return options_.max_context;
   }
   [[nodiscard]] bool HasMtp() const noexcept;
-  /// The loaded profiles, in file-name order.
-  [[nodiscard]] std::span<
-      const std::shared_ptr<const qwen::AbliterationProfile>>
-  AbliterationProfiles() const;
-  /// A request's detection state over every profile with a `trigger`
-  /// (Session::ConfigureDynamicAbliteration); null when none is loaded.
-  [[nodiscard]] std::shared_ptr<DynamicAbliteration> StartDynamicAbliteration()
-      const;
+  /// The loaded profiles now, in load (file name) order.
+  [[nodiscard]] AbliterationProfileSet AbliterationProfiles() const;
+  /// The loaded profiles now, as a request snapshots them: a later
+  /// ReplaceAbliteration never changes a table already handed out. Null when
+  /// none was ever loaded.
+  [[nodiscard]] std::shared_ptr<const AbliterationTable> Abliteration() const;
+  /// A request's detection state over every profile of `table` with a
+  /// `trigger` (Session::ConfigureDynamicAbliteration); null when it has
+  /// none.
+  [[nodiscard]] static std::shared_ptr<DynamicAbliteration>
+  StartDynamicAbliteration(std::shared_ptr<const AbliterationTable> table);
   /// The settings of the named loaded profiles with their defaults (load
   /// order; combined when several), as an explicit request naming them.
   [[nodiscard]] std::shared_ptr<const AbliterationSettings>
   ResolveAbliterationDefaults(std::span<const std::string> names) const;
-  /// Throws std::invalid_argument when `settings` (several profiles) cannot
-  /// run: PlanAbliteration's limits, or no free rows for its union bases
-  /// right now.
-  void CheckAbliterationCombination(const AbliterationSettings& settings) const;
+  /// Throws std::invalid_argument when `settings` (several profiles of
+  /// `table`, the current table when null) cannot run: PlanAbliteration's
+  /// limits, or no free rows for its union bases right now.
+  void CheckAbliterationCombination(
+      const AbliterationSettings& settings,
+      const AbliterationTable* table = nullptr) const;
+  /// Whether ReplaceAbliteration may run (ModelOptions::abliteration_updates).
+  [[nodiscard]] bool AbliterationUpdatable() const noexcept {
+    return options_.abliteration_updates;
+  }
+  /// Makes `profiles` the loaded set: validates it as Load does
+  /// (PlanAbliterationTriggers), uploads the directions of profiles not
+  /// already loaded and publishes the new table. Running requests keep the
+  /// table they were admitted with. Call on the thread running passes,
+  /// between passes (the server's scheduler). Throws std::invalid_argument
+  /// for an invalid set, std::length_error when the reserved device rows
+  /// are held by older tables and std::runtime_error when an upload fails.
+  void ReplaceAbliteration(const AbliterationProfileSet& profiles);
   [[nodiscard]] std::string ArtifactIdentity() const;
   /// Test statistic: batched MTP catch-ups whose cohort mixed two or more
   /// KV-only sessions with proposing ones (counted when received; models
@@ -189,8 +213,6 @@ private:
   std::unique_ptr<rocm::Executor> executor_;
   std::shared_ptr<qwen::vision::Encoder> vision_;
   MtpBatchController batch_policy_;
-  /// One per loaded profile with a `trigger`, its defaults as ON settings.
-  std::vector<DynamicAbliterationCandidate> dynamic_candidates_;
   /// MTP drafts may use the small head (draft_vocab.hpp).
   bool draft_subset_{false};
   /// Special tokens at the start of every session's draft table.
@@ -342,8 +364,11 @@ public:
   void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt);
   /// Null turns the projection OFF. Different settings never share token
   /// state: a change resets a non-empty session.
+  /// `table` is the profile set the settings resolve against (the request's
+  /// snapshot, Model::Abliteration); null uses the current one.
   void ConfigureAbliteration(
-      std::shared_ptr<const AbliterationSettings> settings);
+      std::shared_ptr<const AbliterationSettings> settings,
+      std::shared_ptr<const AbliterationTable> table = nullptr);
   /// The session's effective settings while abliteration is ON, else null.
   [[nodiscard]] const AbliterationSettings* ActiveAbliteration() const;
   /// Dynamic abliteration (R2 A1) for the request that follows; null turns
@@ -352,7 +377,11 @@ public:
   /// batched forms) the rows committed so far are checked, and the first
   /// crossing profile turns ON for every later pass without resetting the
   /// computed tokens (ActiveAbliteration then carries `dynamic_from`).
-  void ConfigureDynamicAbliteration(std::shared_ptr<DynamicAbliteration> state);
+  /// `table` is the snapshot `state` was started from
+  /// (Model::StartDynamicAbliteration); null uses the current one.
+  void ConfigureDynamicAbliteration(
+      std::shared_ptr<DynamicAbliteration> state,
+      std::shared_ptr<const AbliterationTable> table = nullptr);
   /// The request's detection report after its last pass; empty without
   /// dynamic detection.
   [[nodiscard]] std::optional<DynamicAbliterationReport> DynamicReport();
@@ -534,6 +563,8 @@ private:
   bool valid_{true};
   ContinuationHooks* continuation_hooks_{nullptr};
   std::shared_ptr<DynamicAbliteration> dynamic_;
+  /// The profile table dynamic_ resolves against.
+  std::shared_ptr<const AbliterationTable> dynamic_table_;
   /// Before a trunk decode pass: observes the committed rows and turns the
   /// chosen profile ON.
   void ApplyDynamicAbliteration();

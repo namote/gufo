@@ -3689,6 +3689,157 @@ void TestEmbeddingService() {
   }
 }
 
+// POST/DELETE /v1/abliteration/profiles/{name} and
+// /v1/logit-bias/profiles/{name}: unknown paths unless the server allows
+// profile updates, then gated by the API key like every route.
+void TestProfileUpdates() {
+  const auto send = [](RunningServer& server, const std::string& method,
+                       const std::string& path, const std::string& body,
+                       const std::string& headers = {}) {
+    return server.Send(method + " " + path + " HTTP/1.1\r\n" + headers +
+                       "Content-Length: " + std::to_string(body.size()) +
+                       "\r\n\r\n" + body);
+  };
+  const auto json_body = [](const std::string& response) {
+    return gufo::json::parse(response.substr(response.find("\r\n\r\n") + 4));
+  };
+  const auto props = [&](RunningServer& server) {
+    const auto response = server.Send("GET /props HTTP/1.1\r\n\r\n");
+    ExpectStatus(response, 200);
+    return json_body(response);
+  };
+  const std::string wait =
+      R"({"format":"gufo-logit-bias-v1","name":"wait","scope":"reasoning",)"
+      R"("bias":-4,"tokens":[3,5]})";
+  {
+    // Off by default: 404 like any unknown path, and nothing changes.
+    RunningServer server;
+    server.backend->catalog =
+        std::make_shared<const gufo::sampling::LogitBiasCatalog>(
+            100, std::vector<gufo::sampling::LogitBiasProfile>{});
+    ExpectStatus(send(server, "POST", "/v1/abliteration/profiles/pol", "a"),
+                 404);
+    ExpectStatus(send(server, "DELETE", "/v1/abliteration/profiles/pol", ""),
+                 404);
+    ExpectStatus(send(server, "POST", "/v1/logit-bias/profiles/wait", wait),
+                 404);
+    assert(server.backend->more_abliteration.empty());
+    assert(server.backend->catalog->profiles().empty());
+  }
+  RunningServer server({.allow_profile_updates = true});
+  server.backend->catalog =
+      std::make_shared<const gufo::sampling::LogitBiasCatalog>(
+          100, std::vector<gufo::sampling::LogitBiasProfile>{});
+  // Only POST and DELETE, and only valid names.
+  ExpectStatus(
+      server.Send("GET /v1/abliteration/profiles/pol HTTP/1.1\r\n\r\n"), 404);
+  const auto bad_name =
+      send(server, "POST", "/v1/abliteration/profiles/a%20b", "a");
+  ExpectStatus(bad_name, 400);
+  assert(json_body(bad_name).find("error")->member_str("code") ==
+         "invalid_profile_name");
+  ExpectStatus(send(server, "POST", "/v1/abliteration/profiles/", "a"), 400);
+  ExpectStatus(send(server, "POST",
+                    "/v1/abliteration/profiles/" + std::string(65, 'x'), "a"),
+               400);
+  // Validation errors keep the loaded set.
+  const auto invalid =
+      send(server, "POST", "/v1/abliteration/profiles/pol", "invalid");
+  ExpectStatus(invalid, 400);
+  assert(json_body(invalid).find("error")->member_str("code") ==
+         "invalid_abliteration");
+  assert(!props(server).contains("abliteration"));
+  // Add: the reply is the /props entry, and /props lists it.
+  const auto added = send(server, "POST", "/v1/abliteration/profiles/pol", "a");
+  ExpectStatus(added, 200);
+  assert(json_body(added).member_str("profile") == "pol");
+  assert(json_body(added).member_str("identity") == "a");
+  assert(props(server).find("abliteration")->member_str("identity") == "a");
+  // Replace: the same name, the new profile.
+  ExpectStatus(send(server, "POST", "/v1/abliteration/profiles/pol", "b"), 200);
+  const auto replaced = props(server);
+  assert(replaced.find("abliteration")->find("profiles")->size() == 1);
+  assert(replaced.find("abliteration")->member_str("identity") == "b");
+  // Delete: the reply names what was removed; a second delete is 404.
+  const auto deleted =
+      send(server, "DELETE", "/v1/abliteration/profiles/pol", "");
+  ExpectStatus(deleted, 200);
+  assert(json_body(deleted).member_str("profile") == "pol");
+  assert(json_body(deleted).find("deleted")->as_bool());
+  assert(!props(server).contains("abliteration"));
+  const auto missing =
+      send(server, "DELETE", "/v1/abliteration/profiles/pol", "");
+  ExpectStatus(missing, 404);
+  assert(json_body(missing).find("error")->member_str("code") ==
+         "unknown_abliteration_profile");
+
+  // Logit-bias profiles: the loader's validation, then /props.
+  const auto bias = send(server, "POST", "/v1/logit-bias/profiles/wait", wait);
+  ExpectStatus(bias, 200);
+  assert(json_body(bias).member_str("name") == "wait");
+  assert(json_body(bias).member_size("tokens") == 2);
+  const auto listed = props(server);
+  const auto* entries = listed.find("logit_bias_profiles");
+  assert(entries->size() == 1 &&
+         entries->items()[0].member_str("scope") == "reasoning");
+  std::string louder = wait;
+  louder.replace(louder.find("-4"), 2, "-6");
+  ExpectStatus(send(server, "POST", "/v1/logit-bias/profiles/wait", louder),
+               200);
+  assert(props(server)
+             .find("logit_bias_profiles")
+             ->items()[0]
+             .find("bias")
+             ->as_double() == -6.0);
+  // The body must name the path's profile; out-of-vocabulary ids and unknown
+  // keys fail as at startup.
+  const auto mismatch =
+      send(server, "POST", "/v1/logit-bias/profiles/hmm", wait);
+  ExpectStatus(mismatch, 400);
+  assert(json_body(mismatch).find("error")->member_str("code") ==
+         "invalid_logit_bias_profile");
+  std::string outside = wait;
+  outside.replace(outside.find("[3,5]"), 5, "[300]");
+  ExpectStatus(send(server, "POST", "/v1/logit-bias/profiles/wait", outside),
+               400);
+  // A logit-bias profile is at most 1 MiB.
+  ExpectStatus(send(server, "POST", "/v1/logit-bias/profiles/wait",
+                    std::string((std::size_t{1} << 20) + 1, ' ')),
+               413);
+  const auto removed =
+      send(server, "DELETE", "/v1/logit-bias/profiles/wait", "");
+  ExpectStatus(removed, 200);
+  assert(json_body(removed).find("deleted")->as_bool());
+  assert(props(server).find("logit_bias_profiles")->size() == 0);
+  ExpectStatus(send(server, "DELETE", "/v1/logit-bias/profiles/wait", ""), 404);
+
+  // With an API key the updates need it. An authorized abliteration upload
+  // may exceed --max-request-bytes up to the profile cap; others may not.
+  RunningServer secured({.max_request_body_bytes = 1024,
+                         .api_key = "k",
+                         .allow_profile_updates = true});
+  const std::string large(4096, 'z');
+  ExpectStatus(send(secured, "POST", "/v1/abliteration/profiles/pol", "a"),
+               401);
+  // Rejected from its headers, before the body is read.
+  const auto announce = [&](const std::string& path,
+                            const std::string& headers) {
+    return secured.Send("POST " + path + " HTTP/1.1\r\n" + headers +
+                        "Content-Length: 4096\r\n\r\n");
+  };
+  ExpectStatus(announce("/v1/abliteration/profiles/pol", ""), 413);
+  assert(secured.backend->more_abliteration.empty());
+  const std::string auth = "Authorization: Bearer k\r\n";
+  ExpectStatus(
+      send(secured, "POST", "/v1/abliteration/profiles/pol", large, auth), 200);
+  assert(secured.backend->more_abliteration.size() == 1);
+  ExpectStatus(announce("/v1/logit-bias/profiles/wait", auth), 413);
+  ExpectStatus(send(secured, "DELETE", "/v1/abliteration/profiles/pol", ""),
+               401);
+  ExpectStatus(
+      send(secured, "DELETE", "/v1/abliteration/profiles/pol", "", auth), 200);
+}
+
 int main() {
   // The log assertions below match "[LEVEL] [component]" text written to a
   // redirected stderr sink, so the real stderr's TTY state must not add ANSI
@@ -3708,6 +3859,7 @@ int main() {
   TestExpectContinue();
   TestFallbackBackendMetrics();
   TestLlamaProps();
+  TestProfileUpdates();
   TestApplyTemplate();
   TestLlamaTokenize();
   TestOpenAiInputTokens();

@@ -38,6 +38,23 @@ enum class TextGenerationErrorCode : std::uint8_t {
   kDeviceLost,
 };
 
+/// A refused runtime profile update (`--allow-profile-updates`): the HTTP
+/// status and OpenAI-style error code the server returns.
+class ProfileUpdateError : public std::runtime_error {
+public:
+  ProfileUpdateError(int status, std::string code, const std::string& message)
+      : std::runtime_error(message), status_(status), code_(std::move(code)) {}
+  [[nodiscard]] int status() const noexcept { return status_; }
+  [[nodiscard]] const std::string& code() const noexcept { return code_; }
+
+private:
+  int status_;
+  std::string code_;
+};
+
+/// The longest logit-bias profile body a runtime update accepts.
+inline constexpr std::size_t kMaxLogitBiasProfileBytes = std::size_t{1} << 20;
+
 /// A loaded runtime abliteration profile as requests and /props see it:
 /// geometry and defaults, never the direction vectors.
 struct AbliterationInfo {
@@ -423,6 +440,39 @@ public:
   }
   [[nodiscard]] bool supports_abliteration() const {
     return !abliteration_profiles().empty();
+  }
+  /// Runtime profile updates (`--allow-profile-updates`). Each validates
+  /// `body` (a profile file's bytes) exactly as the startup loader validates
+  /// a file named `name`.json, adds it or replaces the profile `name`, and
+  /// returns its /props summary; the delete forms remove the profile and
+  /// return the summary it had. Requests already admitted keep the profiles
+  /// they were admitted with. Throws ProfileUpdateError.
+  virtual AbliterationInfo put_abliteration_profile(std::string_view name,
+                                                    std::string_view body) {
+    (void)name;
+    (void)body;
+    throw ProfileUpdateError(
+        400, "unsupported_profile_update",
+        "this model does not load abliteration profiles at runtime");
+  }
+  virtual AbliterationInfo delete_abliteration_profile(std::string_view name) {
+    (void)name;
+    throw ProfileUpdateError(
+        400, "unsupported_profile_update",
+        "this model does not load abliteration profiles at runtime");
+  }
+  virtual sampling::LogitBiasProfile put_logit_bias_profile(
+      std::string_view name, std::string_view body) {
+    (void)name;
+    (void)body;
+    throw ProfileUpdateError(400, "unsupported_profile_update",
+                             "this model does not apply logit-bias profiles");
+  }
+  virtual sampling::LogitBiasProfile delete_logit_bias_profile(
+      std::string_view name) {
+    (void)name;
+    throw ProfileUpdateError(400, "unsupported_profile_update",
+                             "this model does not apply logit-bias profiles");
   }
   /// Whether requests apply SamplingConfig::han_scale (Qwen 27B and
   /// Flash-Next, whose runners build a Han token set).

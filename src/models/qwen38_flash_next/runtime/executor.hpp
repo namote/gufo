@@ -145,8 +145,12 @@ public:
   /// Null turns the projection OFF. Turning it ON or OFF drops recorded
   /// graphs; other settings are written in place to this session's device
   /// copy, which captured graphs read at run time, so graphs are kept.
+  /// `table` is the profile set the settings resolve against (the request's
+  /// snapshot, Executor::Abliteration); the session holds it while ON, so
+  /// the direction rows its device settings name stay allocated.
   void ConfigureAbliteration(
-      std::shared_ptr<const qwen::AbliterationSettings> settings);
+      std::shared_ptr<const qwen::AbliterationSettings> settings,
+      std::shared_ptr<const AbliterationTable> table);
   [[nodiscard]] bool AbliterationEnabled() const {
     return abliteration_ != nullptr;
   }
@@ -296,6 +300,11 @@ private:
   std::uint32_t max_context_{0};
   bool mtp_enabled_{false};
   std::shared_ptr<const qwen::AbliterationSettings> abliteration_;
+  /// The profile table abliteration_ resolved against, held while ON.
+  std::shared_ptr<const AbliterationTable> abliteration_table_;
+  /// Executor::detector_generation_ when this session's graphs were
+  /// recorded; a different value drops them (Executor::Run).
+  std::uint64_t detector_generation_{0};
   /// qwen::AbliterationDeviceWords floats, allocated when first turned ON
   /// and kept (graph arguments point at it). Shared with checkpoint views.
   std::shared_ptr<float> abliteration_device_;
@@ -412,19 +421,27 @@ public:
 
   ~Executor();
   [[nodiscard]] hipStream_t stream() const noexcept { return stream_; }
-  /// Uploads every profile's directions into one table (each profile's rows
-  /// start at its own offset). Call once, before any session exists.
-  bool LoadAbliteration(AbliterationProfileSet profiles, std::string* error);
-  [[nodiscard]] std::span<
-      const std::shared_ptr<const qwen::AbliterationProfile>>
-  AbliterationProfiles() const {
-    return abliteration_;
-  }
-  /// The loaded profile named `name`, or null.
-  [[nodiscard]] const qwen::AbliterationProfile* FindAbliteration(
-      std::string_view name) const;
-  /// The first direction row of the loaded profile `name`.
-  [[nodiscard]] std::uint32_t AbliterationRow(std::string_view name) const;
+  /// Allocates the device direction table: `profile_rows` rows for profile
+  /// directions, then kAbliterationUnionRows union rows when `unions`, and
+  /// the detector buffers when `detectors`. Call once, before any session
+  /// exists.
+  bool ReserveAbliteration(std::size_t profile_rows, bool unions,
+                           bool detectors, std::string* error);
+  /// A table of `profiles` (load order): profiles of the current table keep
+  /// their rows and column; others get free rows (and a column with a
+  /// trigger) and are uploaded now. Not published. Throws
+  /// std::invalid_argument for a profile of another geometry,
+  /// std::length_error when the reserved rows or columns are exhausted
+  /// (older tables still in use hold them) and std::runtime_error when the
+  /// upload fails. Call between passes.
+  [[nodiscard]] std::shared_ptr<AbliterationTable> PrepareAbliteration(
+      const AbliterationProfileSet& profiles) const;
+  /// Makes `table` the one new requests snapshot, and scores its detectors
+  /// (with those of older tables still allocated) from the next pass on.
+  /// Call between passes, on the thread running them.
+  void PublishAbliteration(std::shared_ptr<const AbliterationTable> table);
+  /// The current table; null before any profile was loaded or reserved.
+  [[nodiscard]] std::shared_ptr<const AbliterationTable> Abliteration() const;
   /// Rows reserved for the orthonormalized unions of combined profiles,
   /// shared by reference count (AcquireUnion/ReleaseUnion).
   static constexpr std::uint32_t kAbliterationUnionRows = 256;
@@ -438,9 +455,9 @@ public:
   /// first additive block and each site's mask of additive blocks.
   void CombineAbliterationBlocks(
       std::span<const qwen::AbliterationSettings* const> parts,
-      std::vector<float>* words, std::vector<std::int16_t>* sites,
-      std::vector<std::string>* unions, std::uint32_t* add_first,
-      std::vector<std::uint8_t>* add_sites) const;
+      const AbliterationTable& table, std::vector<float>* words,
+      std::vector<std::int16_t>* sites, std::vector<std::string>* unions,
+      std::uint32_t* add_first, std::vector<std::uint8_t>* add_sites) const;
   /// The first row of the union basis `key`, uploading it on first use; each
   /// call takes one reference. Throws std::runtime_error when the reserved
   /// rows are exhausted.
@@ -450,12 +467,8 @@ public:
   /// Whether `plan`'s union bases fit now: cached ones or free rows (a
   /// check before admission; a later admission can still take the rows).
   [[nodiscard]] bool UnionRowsAvailable(const AbliterationPlan& plan) const;
-  /// The score column of profile `name`'s detector; empty for a profile
-  /// without `trigger`.
-  [[nodiscard]] std::optional<std::uint32_t> DetectorColumn(
-      std::string_view name) const;
   [[nodiscard]] bool HasDetectors() const noexcept {
-    return !detectors_.empty();
+    return !scored_detectors_.empty();
   }
   Executor(const Executor&) = delete;
   Executor& operator=(const Executor&) = delete;
@@ -817,17 +830,24 @@ public:
 
 private:
   Executor() = default;
-  AbliterationProfileSet abliteration_;
-  /// First row of each profile in abliteration_directions_.
-  std::vector<std::uint32_t> abliteration_rows_;
-  /// Dynamic-abliteration detectors (profiles with `trigger`): detector i
-  /// reads layer detectors_[i].layer, direction row i of
-  /// detector_directions_, and writes score column i.
+  /// Allocation of profile direction rows and detector columns
+  /// (executor.cpp); leases in AbliterationTable give them back.
+  struct AbliterationPool;
+  std::shared_ptr<AbliterationPool> abliteration_pool_;
+  mutable std::mutex abliteration_table_mutex_;
+  std::shared_ptr<const AbliterationTable> abliteration_table_;
+  /// Dynamic-abliteration detectors (profiles with `trigger`): each
+  /// allocated column c with its layer; detector c reads direction row c of
+  /// detector_directions_ and writes score column c. Set by
+  /// PublishAbliteration, on the thread running passes; a change bumps
+  /// detector_generation_, so recorded graphs (which captured the list) are
+  /// recorded again.
   struct Detector {
+    std::uint32_t column;
     std::uint32_t layer;
-    std::string profile;
   };
-  std::vector<Detector> detectors_;
+  std::vector<Detector> scored_detectors_;
+  std::uint64_t detector_generation_{0};
   float* detector_directions_{nullptr};
   /// [max_batch][kDetectorColumns] scores of the last pass, and its pinned
   /// host copy (downloaded with the pass's logits, no extra sync).
@@ -837,8 +857,8 @@ private:
   /// Whether `session`'s passes score detectors now: detection set, OFF,
   /// detectors loaded and not a scoring pass.
   [[nodiscard]] bool Detects(const Session& session) const noexcept {
-    return session.detect_ && !session.abliteration_ && !detectors_.empty() &&
-           !score_pass_;
+    return session.detect_ && !session.abliteration_ &&
+           !scored_detectors_.empty() && !score_pass_;
   }
   /// Launches the detectors of `layer` on `rows` residual rows at `res`,
   /// writing score rows [first, first + rows).

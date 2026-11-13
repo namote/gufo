@@ -280,9 +280,32 @@ AbliterationProfile AbliterationProfile::Load(const std::filesystem::path& path,
   std::string bytes(kAbliterationMaxProfileBytes + 1, '\0');
   file.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
   bytes.resize(static_cast<std::size_t>(file.gcount()));
+  return Parse(bytes, path.stem().string(), hidden, layers, expected,
+               placement);
+}
+
+bool ValidAbliterationProfileName(std::string_view name) noexcept {
+  return !name.empty() && name.size() <= kAbliterationMaxProfileName &&
+         std::ranges::all_of(name, [](char c) {
+           return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+         });
+}
+
+AbliterationProfile AbliterationProfile::Parse(std::string_view bytes,
+                                               std::string name,
+                                               std::uint32_t hidden,
+                                               std::uint32_t layers,
+                                               std::string_view expected,
+                                               std::string_view placement) {
   if (bytes.size() > kAbliterationMaxProfileBytes)
     throw std::invalid_argument("abliteration: profile exceeds 48 MiB");
-  const auto root = json::parse(bytes);
+  json::Value root;
+  try {
+    root = json::parse(bytes);
+  } catch (const std::runtime_error& error) {
+    throw std::invalid_argument(std::string("abliteration: ") + error.what());
+  }
   const auto schema = root.member_str("schema");
   if ((schema != kAbliterationSchemaV1 && schema != kAbliterationSchemaV2) ||
       root.member_str("model_identity") != expected || expected.empty() ||
@@ -365,7 +388,7 @@ AbliterationProfile AbliterationProfile::Load(const std::filesystem::path& path,
     if (const auto* trigger = root.find("trigger"))
       result.trigger = LoadTrigger(*trigger, result);
   }
-  result.name = path.stem().string();
+  result.name = std::move(name);
   result.identity = crypto::Sha256Hex(std::span(
       reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()));
   return result;

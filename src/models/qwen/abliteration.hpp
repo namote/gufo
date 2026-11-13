@@ -191,7 +191,20 @@ struct AbliterationProfile {
                                   std::uint32_t hidden, std::uint32_t layers,
                                   std::string_view model_identity,
                                   std::string_view placement);
+  /// The same validation over a profile's file bytes (a runtime upload),
+  /// named `name`; `identity` is the SHA-256 of `bytes`. Throws
+  /// std::invalid_argument, also for malformed JSON.
+  static AbliterationProfile Parse(std::string_view bytes, std::string name,
+                                   std::uint32_t hidden, std::uint32_t layers,
+                                   std::string_view model_identity,
+                                   std::string_view placement);
 };
+
+/// The longest profile name a runtime upload may use.
+inline constexpr std::size_t kAbliterationMaxProfileName = 64;
+/// Whether `name` may name an uploaded profile: 1-64 letters, digits, `_`,
+/// `-` and `.` (a file stem needs no such rule).
+[[nodiscard]] bool ValidAbliterationProfileName(std::string_view name) noexcept;
 
 /// One session's effective projection: the direction and every layer's
 /// strengths, with an identity that salts its cache state. A null settings

@@ -337,6 +337,7 @@ std::unique_ptr<PrefillCheckpoint> Executor::MakePrefillCheckpoint(
   view.position_ = source.position_ + prefix;
   view.mtp_enabled_ = source.mtp_enabled_;
   view.abliteration_ = source.abliteration_;
+  view.abliteration_table_ = source.abliteration_table_;
   view.abliteration_device_ = source.abliteration_device_;
   view.abliteration_sites_ = source.abliteration_sites_;
   view.abliteration_add_sites_ = source.abliteration_add_sites_;

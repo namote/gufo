@@ -75,8 +75,8 @@ std::shared_ptr<const ReasoningBudget> Unlimited() {
 
 // A small vocabulary: decoded token texts by id.
 const std::vector<std::string> kVocabulary{
-    "<s>", "Wait", " Wait", "wait", "Hmm", " Hmm,", "So", " Alternatively",
-    "  ", "\nWait", "Waiting", "Wait "};
+    "<s>", "Wait",           " Wait", "wait",   "Hmm",     " Hmm,",
+    "So",  " Alternatively", "  ",    "\nWait", "Waiting", "Wait "};
 
 std::string Decode(TokenId token) {
   return kVocabulary.at(token);
@@ -348,11 +348,33 @@ void TestCatalog() {
          "tokens beyond the vocabulary fail");
 }
 
+// A runtime update (POST /v1/logit-bias/profiles/NAME) builds a new catalog.
+// The same selection key ("wait=-4") must not return the replaced profile's
+// cached array, and a request holding the old offsets keeps them.
+void TestCatalogReplacement() {
+  const auto old_catalog = Catalog();
+  LogitBiasSelection wait;
+  wait.profiles = {{"wait", std::nullopt}};
+  const auto admitted = old_catalog.Resolve(wait);
+  std::vector<LogitBiasProfile> profiles(old_catalog.profiles().begin(),
+                                         old_catalog.profiles().end());
+  profiles[0].tokens = {3};
+  const LogitBiasCatalog new_catalog(8, std::move(profiles));
+  const auto updated = new_catalog.Resolve(wait);
+  Expect(updated != admitted && updated->key == admitted->key,
+         "a replaced profile builds new offsets under the same key");
+  Expect((*updated->reasoning)[3] == -4.0F && (*updated->reasoning)[1] == 0.0F,
+         "the new offsets follow the replaced profile");
+  Expect((*admitted->reasoning)[1] == -4.0F &&
+             (*admitted->reasoning)[3] == 0.0F &&
+             old_catalog.Resolve(wait) == admitted,
+         "the admitted request's offsets and old catalog are unchanged");
+}
+
 // Logits whose greedy winner is token 1 by one nat over token 0.
 const std::vector<float> kLogits{1.0F, 2.0F, 0.5F, 0.0F, -1.0F, 0.25F, 0, 0};
 
-SamplingConfig Config(float temperature,
-                      std::shared_ptr<const LogitBias> bias,
+SamplingConfig Config(float temperature, std::shared_ptr<const LogitBias> bias,
                       std::shared_ptr<const ReasoningBudget> budget) {
   SamplingConfig config;
   config.temperature = temperature;
@@ -402,14 +424,14 @@ void TestSamplerScopes() {
     sampler.Accept(TokenId{3});
     Expect(sampler.Sample(kLogits) == 0, "the answer suppresses token 1");
     // Without a tracked phase the whole reply is the answer.
-    Expect(SamplerState(Config(0.0F, answer, nullptr)).Sample(kLogits) == 0 &&
-               SamplerState(Config(0.0F, reasoning, nullptr))
-                       .Sample(kLogits) == 1,
-           "untracked replies are answer");
-    Expect(gufo::sampling::BuildDistribution(kLogits,
-                                             Config(0, answer, nullptr))
-                   .best_token() == 0,
-           "BuildDistribution applies the answer offsets");
+    Expect(
+        SamplerState(Config(0.0F, answer, nullptr)).Sample(kLogits) == 0 &&
+            SamplerState(Config(0.0F, reasoning, nullptr)).Sample(kLogits) == 1,
+        "untracked replies are answer");
+    Expect(
+        gufo::sampling::BuildDistribution(kLogits, Config(0, answer, nullptr))
+                .best_token() == 0,
+        "BuildDistribution applies the answer offsets");
   }
 
   // The biased distribution equals the unbiased one of offset logits, on
@@ -421,11 +443,10 @@ void TestSamplerScopes() {
     float top_p;
     float min_p;
   };
-  for (const auto filter : {Filter{0.0F, 0, 1.0F, 0.0F},
-                            Filter{0.8F, 0, 1.0F, 0.0F},
-                            Filter{0.8F, 0, 1.0F, 0.05F},
-                            Filter{0.8F, 3, 1.0F, 0.0F},
-                            Filter{0.8F, 0, 0.9F, 0.0F}}) {
+  for (const auto filter :
+       {Filter{0.0F, 0, 1.0F, 0.0F}, Filter{0.8F, 0, 1.0F, 0.0F},
+        Filter{0.8F, 0, 1.0F, 0.05F}, Filter{0.8F, 3, 1.0F, 0.0F},
+        Filter{0.8F, 0, 0.9F, 0.0F}}) {
     auto biased = Config(filter.temperature, reasoning, Unlimited());
     biased.top_k = filter.top_k;
     biased.top_p = filter.top_p;
@@ -468,9 +489,10 @@ void TestSamplerScopes() {
       rows.push_back(tentative.logit_bias());
       tentative.Accept(draft);
     }
-    Expect(rows == std::vector<const std::vector<float>*>{
-                       reasoning->reasoning.get(), reasoning->reasoning.get(),
-                       nullptr},
+    Expect(rows ==
+               std::vector<const std::vector<float>*>{
+                   reasoning->reasoning.get(), reasoning->reasoning.get(),
+                   nullptr},
            "rows after a drafted </think> use the answer offsets");
     for (const TokenId draft : {TokenId{0}, TokenId{3}}) {
       target.Accept(draft);
@@ -500,8 +522,7 @@ void TestPositiveBiasAndBlockSkips() {
   auto sampled = Config(0.7F, bias, nullptr);
   sampled.top_k = 2;
   const auto distribution = SamplerState(sampled).Distribution(logits);
-  Expect(distribution.best_token() == 300 &&
-             distribution.probability(3) > 0.0,
+  Expect(distribution.best_token() == 300 && distribution.probability(3) > 0.0,
          "top-k selection keeps a boosted later token");
   sampled.top_k = 0;
   sampled.top_p = 0.5F;
@@ -539,6 +560,7 @@ int main() {
   TestLoad();
   TestBuild();
   TestCatalog();
+  TestCatalogReplacement();
   TestSamplerScopes();
   TestPositiveBiasAndBlockSkips();
   TestHanCombines();

@@ -4,12 +4,14 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "src/models/qwen/abliteration.hpp"
+#include "src/models/qwen38_flash_next/dynamic_abliteration.hpp"
 
 namespace gufo::models::qwen38_flash_next {
 
@@ -19,6 +21,10 @@ struct AbliterationProfile : qwen::AbliterationProfile {
   static AbliterationProfile Load(const std::filesystem::path& path,
                                   std::uint32_t hidden, std::uint32_t layers,
                                   std::string_view model_identity);
+  /// A runtime upload of the same file bytes, named `name`.
+  static AbliterationProfile Parse(std::string_view bytes, std::string name,
+                                   std::uint32_t hidden, std::uint32_t layers,
+                                   std::string_view model_identity);
 };
 
 using qwen::AbliterationContinuationMatches;
@@ -40,6 +46,56 @@ using AbliterationProfileSet =
 AbliterationProfileSet LoadAbliterationProfiles(
     std::span<const std::string> files, std::uint32_t hidden,
     std::uint32_t layers, std::string_view model_identity);
+
+/// `profiles` with `profile` added, or replacing the one of its name, in
+/// load order (the file name order of `--abliteration-profiles`: the name
+/// followed by `.json`). Throws std::invalid_argument when that makes more
+/// than qwen::kAbliterationMaxProfiles profiles.
+AbliterationProfileSet WithAbliterationProfile(
+    const AbliterationProfileSet& profiles,
+    std::shared_ptr<const qwen::AbliterationProfile> profile);
+/// `profiles` without the profile `name`; throws std::out_of_range when none
+/// has it.
+AbliterationProfileSet WithoutAbliterationProfile(
+    const AbliterationProfileSet& profiles, std::string_view name);
+
+/// The settings of the named profiles of `profiles` with their defaults (load
+/// order; combined when several), as an explicit request naming them.
+std::shared_ptr<const qwen::AbliterationSettings> ResolveAbliterationDefaults(
+    std::span<const std::shared_ptr<const qwen::AbliterationProfile>> profiles,
+    std::span<const std::string> names);
+
+/// Validates a whole profile set as the model loader does: at most
+/// qwen::kAbliterationMaxProfiles distinct names, every `trigger.with` names
+/// a loaded profile other than its own, and every set a detection can turn
+/// ON, and the union of all of them, forms device blocks (PlanAbliteration).
+/// Returns one candidate per profile with a `trigger` (load order), its
+/// `column` left 0 for the caller to assign. Throws std::invalid_argument.
+std::vector<DynamicAbliterationCandidate> PlanAbliterationTriggers(
+    const AbliterationProfileSet& profiles);
+
+/// One version of a model's loaded profiles, as requests snapshot it: a
+/// request keeps the table it was admitted with, so replacing or removing a
+/// profile never changes a running request. `leases` keep each profile's
+/// device direction rows and detector column allocated while any table (or
+/// session holding one) still uses them.
+struct AbliterationTable {
+  /// Load order.
+  AbliterationProfileSet profiles;
+  /// Per profile: its first row in the model's direction table, and its
+  /// detector's score column (profiles with a `trigger`).
+  std::vector<std::uint32_t> rows;
+  std::vector<std::optional<std::uint32_t>> columns;
+  std::vector<std::shared_ptr<const void>> leases;
+  /// The dynamic profiles (PlanAbliterationTriggers) with their columns.
+  std::vector<DynamicAbliterationCandidate> candidates;
+
+  [[nodiscard]] const qwen::AbliterationProfile* Find(
+      std::string_view name) const noexcept;
+  /// Throws std::invalid_argument for a profile the table does not hold.
+  [[nodiscard]] std::uint32_t Row(std::string_view name) const;
+  [[nodiscard]] std::vector<const qwen::AbliterationProfile*> List() const;
+};
 
 /// Most device blocks of one combination, and most profiles active at one
 /// site whose rows a block combines.

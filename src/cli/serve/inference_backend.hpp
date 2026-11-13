@@ -15,6 +15,7 @@
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/models/qwen/dflash_policy.hpp"
+#include "src/models/qwen38_flash_next/abliteration.hpp"
 #include "src/models/qwen38_flash_next/hc_mode.hpp"
 
 namespace gufo::hip {
@@ -146,6 +147,16 @@ public:
   /// apply them.
   bool load_logit_bias_profiles(const std::filesystem::path& directory,
                                 std::string* error);
+  /// `--allow-profile-updates`: Flash-Next reserves device rows for runtime
+  /// abliteration profile updates. Call before load.
+  void set_profile_updates(bool enabled);
+  AbliterationInfo put_abliteration_profile(std::string_view name,
+                                            std::string_view body) override;
+  AbliterationInfo delete_abliteration_profile(std::string_view name) override;
+  sampling::LogitBiasProfile put_logit_bias_profile(
+      std::string_view name, std::string_view body) override;
+  sampling::LogitBiasProfile delete_logit_bias_profile(
+      std::string_view name) override;
   [[nodiscard]] bool supports_scoring() const override;
   [[nodiscard]] std::string hc_mode() const override;
   [[nodiscard]] std::string model_path() const override;
@@ -216,6 +227,17 @@ public:
       std::string_view text) const override;
 
 private:
+#if defined(ENGINE_ENABLE_HIP)
+  /// Publishes `profiles` on the Flash-Next model between scheduler steps,
+  /// then the /props summaries. Throws ProfileUpdateError.
+  void ApplyAbliterationProfiles(
+      const models::qwen38_flash_next::AbliterationProfileSet& profiles,
+      std::string_view action, std::string_view name);
+  /// Swaps in a new catalog of `profiles` (an empty combination cache).
+  void ReplaceLogitBiasProfiles(
+      std::vector<sampling::LogitBiasProfile> profiles, std::string_view action,
+      std::string_view name);
+#endif
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

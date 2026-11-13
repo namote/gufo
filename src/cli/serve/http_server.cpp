@@ -755,9 +755,9 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
     return InvalidCompatibilityRequest(error->message);
   }
   const auto logit_bias = backend.logit_bias_catalog();
-  if (const auto error = ParseSamplingConfig(body, defaults.Resolve(thinking),
-                                             sampling_config,
-                                             logit_bias.get())) {
+  if (const auto error =
+          ParseSamplingConfig(body, defaults.Resolve(thinking), sampling_config,
+                              logit_bias.get())) {
     return Err(400, "Bad Request", error->message.c_str(),
                "invalid_request_error", error->code.c_str());
   }
@@ -1508,6 +1508,157 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
              "invalid_prompt");
 }
 
+/// A uniform strength is one number.
+json::Value AbliterationStrengths(const std::vector<float>& values) {
+  if (!values.empty() &&
+      std::ranges::all_of(values, [&](float x) { return x == values[0]; }))
+    return json::Value(static_cast<double>(values[0]));
+  json::Value array = json::Value::array();
+  for (const float x : values)
+    array.push_back(static_cast<double>(x));
+  return array;
+}
+
+/// One loaded abliteration profile as /props lists it.
+void DescribeAbliterationProfile(const AbliterationInfo& info,
+                                 json::Value& abliteration) {
+  abliteration["profile"] = info.name;
+  abliteration["schema"] = info.schema;
+  abliteration["identity"] = info.identity;
+  abliteration["layers"] = static_cast<unsigned long long>(info.layers);
+  // Layers a request may name in `direction_layer`; none for v1.
+  json::Value direction_layers = json::Value::array();
+  if (info.direction_layer)
+    for (std::uint32_t layer = 0; layer < info.layers; ++layer)
+      direction_layers.push_back(static_cast<unsigned long long>(layer));
+  abliteration["direction_layers"] = std::move(direction_layers);
+  abliteration["direction_layer"] =
+      info.direction_layer
+          ? json::Value(static_cast<unsigned long long>(*info.direction_layer))
+          : json::Value(nullptr);
+  abliteration["attention"] = AbliterationStrengths(info.attention);
+  abliteration["mlp"] = AbliterationStrengths(info.mlp);
+  abliteration["residual"] = AbliterationStrengths(info.residual);
+  // Projection options: the kinds a request may choose, the stored
+  // subspace rank (the largest `directions`) and the defaults.
+  json::Value kinds = json::Value::array();
+  for (const auto& kind : info.direction_kinds)
+    kinds.push_back(kind);
+  abliteration["direction_kinds"] = std::move(kinds);
+  abliteration["direction_kind"] = info.direction_kind;
+  abliteration["max_directions"] = static_cast<unsigned long long>(info.rank);
+  abliteration["directions"] =
+      static_cast<unsigned long long>(info.direction_count);
+  abliteration["preserve_norm"] = info.preserve_norm;
+  abliteration["subspace_method"] = info.subspace_method.empty()
+                                        ? json::Value(nullptr)
+                                        : json::Value(info.subspace_method);
+  // A dynamic profile turns ON by itself when its score exceeds the
+  // threshold; null for a profile only requests turn ON.
+  if (info.trigger_layer && info.trigger_threshold) {
+    json::Value trigger = json::Value::object();
+    trigger["layer"] = static_cast<unsigned long long>(*info.trigger_layer);
+    trigger["threshold"] = static_cast<double>(*info.trigger_threshold);
+    json::Value with = json::Value::array();
+    for (const auto& name : info.trigger_with)
+      with.push_back(name);
+    trigger["with"] = std::move(with);
+    trigger["decode_threshold"] =
+        info.trigger_decode_threshold
+            ? json::Value(static_cast<double>(*info.trigger_decode_threshold))
+            : json::Value(nullptr);
+    abliteration["trigger"] = std::move(trigger);
+  } else {
+    abliteration["trigger"] = nullptr;
+  }
+  // "suppress" (projection, strengths [0, max_strength]) or "add"
+  // (steering, strengths [-max_strength, max_strength]).
+  abliteration["mode"] = info.additive ? "add" : "suppress";
+  abliteration["max_strength"] = static_cast<double>(
+      info.additive ? models::qwen::kAbliterationMaxAddWeight
+                    : models::qwen::kAbliterationMaxWeight);
+}
+
+/// One loaded logit-bias profile as /props lists it.
+json::Value DescribeLogitBiasProfile(
+    const gufo::sampling::LogitBiasProfile& profile) {
+  json::Value entry = json::Value::object();
+  entry["name"] = profile.name;
+  entry["scope"] =
+      std::string(gufo::sampling::LogitBiasScopeName(profile.scope));
+  entry["bias"] = static_cast<double>(profile.bias);
+  entry["tokens"] = profile.tokens.size();
+  return entry;
+}
+
+constexpr std::string_view kAbliterationProfilesPath =
+    "/v1/abliteration/profiles/";
+constexpr std::string_view kLogitBiasProfilesPath = "/v1/logit-bias/profiles/";
+
+bool IsProfileUpdatePath(std::string_view path) {
+  return path.starts_with(kAbliterationProfilesPath) ||
+         path.starts_with(kLogitBiasProfilesPath);
+}
+
+const char* StatusReason(int status) {
+  switch (status) {
+    case 400:
+      return "Bad Request";
+    case 404:
+      return "Not Found";
+    case 409:
+      return "Conflict";
+    case 413:
+      return "Payload Too Large";
+    case 503:
+      return "Service Unavailable";
+    default:
+      return "Internal Server Error";
+  }
+}
+
+/// `POST|DELETE /v1/abliteration/profiles/{name}` and
+/// `/v1/logit-bias/profiles/{name}` (`--allow-profile-updates`): add or
+/// replace a profile from a file's bytes, or remove it; the reply is the
+/// profile's /props entry (`"deleted": true` after a removal).
+HttpResponse HandleProfileUpdate(const HttpRequest& req,
+                                 TextGenerationBackend& b) {
+  const bool abliteration = req.path.starts_with(kAbliterationProfilesPath);
+  const std::string name = req.path.substr(
+      (abliteration ? kAbliterationProfilesPath : kLogitBiasProfilesPath)
+          .size());
+  if (!models::qwen::ValidAbliterationProfileName(name))
+    return Err(400, "Bad Request",
+               "a profile name is 1-64 letters, digits, '_', '-' or '.'",
+               "invalid_request_error", "invalid_profile_name");
+  const bool put = req.method == "POST";
+  const std::size_t limit = abliteration
+                                ? models::qwen::kAbliterationMaxProfileBytes
+                                : kMaxLogitBiasProfileBytes;
+  if (put && req.body.size() > limit)
+    return Err(413, "Payload Too Large", "profile body is too large",
+               "invalid_request_error", "payload_too_large");
+  try {
+    json::Value body = json::Value::object();
+    if (abliteration)
+      DescribeAbliterationProfile(
+          put ? b.put_abliteration_profile(name, req.body)
+              : b.delete_abliteration_profile(name),
+          body);
+    else
+      body = DescribeLogitBiasProfile(
+          put ? b.put_logit_bias_profile(name, req.body)
+              : b.delete_logit_bias_profile(name));
+    if (!put)
+      body["deleted"] = true;
+    return Ok(body);
+  } catch (const ProfileUpdateError& e) {
+    return Err(e.status(), StatusReason(e.status()), e.what(),
+               e.status() >= 500 ? "server_error" : "invalid_request_error",
+               e.code().c_str());
+  }
+}
+
 /// llama-server props for a single-model server: what it runs, so a client
 /// can record which model, build and settings answered it. `?model=` is
 /// accepted and not required, as in llama-server outside router mode. Fields
@@ -1537,15 +1688,8 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
   // with logit_bias_profiles; absent where requests cannot bias logits.
   if (const auto catalog = b.logit_bias_catalog()) {
     json::Value profiles = json::Value::array();
-    for (const auto& profile : catalog->profiles()) {
-      json::Value entry = json::Value::object();
-      entry["name"] = profile.name;
-      entry["scope"] =
-          std::string(gufo::sampling::LogitBiasScopeName(profile.scope));
-      entry["bias"] = static_cast<double>(profile.bias);
-      entry["tokens"] = profile.tokens.size();
-      profiles.push_back(std::move(entry));
-    }
+    for (const auto& profile : catalog->profiles())
+      profiles.push_back(DescribeLogitBiasProfile(profile));
     resp["logit_bias_profiles"] = std::move(profiles);
   }
 
@@ -1594,81 +1738,13 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
   // the top level, where a request without 'abliteration.profile' finds
   // them.
   if (const auto profiles = b.abliteration_profiles(); !profiles.empty()) {
-    const auto strengths = [](const std::vector<float>& values) {
-      if (!values.empty() &&
-          std::ranges::all_of(values, [&](float x) { return x == values[0]; }))
-        return json::Value(static_cast<double>(values[0]));
-      json::Value array = json::Value::array();
-      for (const float x : values)
-        array.push_back(static_cast<double>(x));
-      return array;
-    };
-    const auto describe = [&](const AbliterationInfo& info,
-                              json::Value& abliteration) {
-      abliteration["profile"] = info.name;
-      abliteration["schema"] = info.schema;
-      abliteration["identity"] = info.identity;
-      abliteration["layers"] = static_cast<unsigned long long>(info.layers);
-      // Layers a request may name in `direction_layer`; none for v1.
-      json::Value direction_layers = json::Value::array();
-      if (info.direction_layer)
-        for (std::uint32_t layer = 0; layer < info.layers; ++layer)
-          direction_layers.push_back(static_cast<unsigned long long>(layer));
-      abliteration["direction_layers"] = std::move(direction_layers);
-      abliteration["direction_layer"] =
-          info.direction_layer ? json::Value(static_cast<unsigned long long>(
-                                     *info.direction_layer))
-                               : json::Value(nullptr);
-      abliteration["attention"] = strengths(info.attention);
-      abliteration["mlp"] = strengths(info.mlp);
-      abliteration["residual"] = strengths(info.residual);
-      // Projection options: the kinds a request may choose, the stored
-      // subspace rank (the largest `directions`) and the defaults.
-      json::Value kinds = json::Value::array();
-      for (const auto& kind : info.direction_kinds)
-        kinds.push_back(kind);
-      abliteration["direction_kinds"] = std::move(kinds);
-      abliteration["direction_kind"] = info.direction_kind;
-      abliteration["max_directions"] =
-          static_cast<unsigned long long>(info.rank);
-      abliteration["directions"] =
-          static_cast<unsigned long long>(info.direction_count);
-      abliteration["preserve_norm"] = info.preserve_norm;
-      abliteration["subspace_method"] = info.subspace_method.empty()
-                                            ? json::Value(nullptr)
-                                            : json::Value(info.subspace_method);
-      // A dynamic profile turns ON by itself when its score exceeds the
-      // threshold; null for a profile only requests turn ON.
-      if (info.trigger_layer && info.trigger_threshold) {
-        json::Value trigger = json::Value::object();
-        trigger["layer"] = static_cast<unsigned long long>(*info.trigger_layer);
-        trigger["threshold"] = static_cast<double>(*info.trigger_threshold);
-        json::Value with = json::Value::array();
-        for (const auto& name : info.trigger_with)
-          with.push_back(name);
-        trigger["with"] = std::move(with);
-        trigger["decode_threshold"] = info.trigger_decode_threshold
-                                          ? json::Value(static_cast<double>(
-                                                *info.trigger_decode_threshold))
-                                          : json::Value(nullptr);
-        abliteration["trigger"] = std::move(trigger);
-      } else {
-        abliteration["trigger"] = nullptr;
-      }
-      // "suppress" (projection, strengths [0, max_strength]) or "add"
-      // (steering, strengths [-max_strength, max_strength]).
-      abliteration["mode"] = info.additive ? "add" : "suppress";
-      abliteration["max_strength"] = static_cast<double>(
-          info.additive ? models::qwen::kAbliterationMaxAddWeight
-                        : models::qwen::kAbliterationMaxWeight);
-    };
     json::Value abliteration = json::Value::object();
     if (profiles.size() == 1)
-      describe(profiles.front(), abliteration);
+      DescribeAbliterationProfile(profiles.front(), abliteration);
     json::Value list = json::Value::array();
     for (const auto& info : profiles) {
       json::Value item = json::Value::object();
-      describe(info, item);
+      DescribeAbliterationProfile(info, item);
       list.push_back(std::move(item));
     }
     abliteration["profiles"] = std::move(list);
@@ -2488,6 +2564,15 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       return DeviceLost();
     return response;
   }
+  // Runtime profile updates exist only with --allow-profile-updates; without
+  // it they are unknown paths, like any other.
+  if (options_.allow_profile_updates && backend_ != nullptr &&
+      (req.method == "POST" || req.method == "DELETE") &&
+      IsProfileUpdatePath(req.path)) {
+    if (device_lost())
+      return DeviceLost();
+    return HandleProfileUpdate(req, *backend_);
+  }
   for (const auto& entry : routes_) {
     if (entry.first.first == req.method && entry.first.second == req.path) {
       if (req.method == "POST" && device_lost())
@@ -2497,6 +2582,17 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
   }
   return Err(404, "Not Found", "no route for this path",
              "invalid_request_error", "not_found");
+}
+
+std::size_t HttpServer::BodyLimit(const HttpRequest& req) const {
+  // An abliteration profile may be up to 48 MiB; only an authorized upload
+  // may send that much.
+  if (options_.allow_profile_updates && req.method == "POST" &&
+      req.path.starts_with(kAbliterationProfilesPath) &&
+      IsAuthorized(req, api_key_hash_))
+    return std::max(options_.max_request_body_bytes,
+                    models::qwen::kAbliterationMaxProfileBytes);
+  return options_.max_request_body_bytes;
 }
 
 bool HttpServer::device_lost() {
@@ -2629,7 +2725,7 @@ void HttpServer::handle_connection(int client_fd,
             content_length > body.size() ? content_length - body.size() : 0;
         if (!valid_headers || !parsed_length.has_value()) {
           ok = false;
-        } else if (content_length > options_.max_request_body_bytes) {
+        } else if (content_length > BodyLimit(req)) {
           payload_too_large = true;
         } else if (content_length > 0) {
           if (remaining > 0) {

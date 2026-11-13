@@ -285,52 +285,29 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   }
   try {
     const auto& c = m->config();
-    if (auto profiles = LoadAbliterationProfiles(options.abliteration_profiles,
-                                                 c.hidden_size, c.num_layers,
-                                                 m->ArtifactIdentity());
-        !profiles.empty() &&
-        !m->executor_->LoadAbliteration(std::move(profiles), error_msg))
-      return nullptr;
-    // Each dynamic profile turns ON with its defaults, together with its
-    // companions (`trigger.with`, their defaults), exactly as an explicit
-    // request naming the same profiles would.
-    std::vector<const qwen::AbliterationProfile*> loaded;
-    for (const auto& profile : m->executor_->AbliterationProfiles())
-      loaded.push_back(profile.get());
-    for (const auto* profile : loaded)
-      if (profile->trigger) {
-        std::vector<std::string> names{profile->name};
-        for (const auto& name : profile->trigger->with) {
-          if (name == profile->name)
-            throw std::invalid_argument("abliteration: profile '" + name +
-                                        "' names itself in trigger.with");
-          names.push_back(name);
-        }
-        // Checks every companion is loaded and the set combines.
-        (void)m->ResolveAbliterationDefaults(names);
-        m->dynamic_candidates_.push_back(
-            {profile->name, *m->executor_->DetectorColumn(profile->name),
-             profile->trigger->threshold, profile->trigger->decode_threshold,
-             std::move(names)});
+    auto profiles =
+        LoadAbliterationProfiles(options.abliteration_profiles, c.hidden_size,
+                                 c.num_layers, m->ArtifactIdentity());
+    if (options.abliteration_updates) {
+      const std::size_t largest =
+          std::size_t{2} * c.num_layers * qwen::kAbliterationMaxDirections;
+      const std::size_t rows = 2 * qwen::kAbliterationMaxProfiles * largest;
+      if (!m->executor_->ReserveAbliteration(rows, true, true, error_msg))
+        return nullptr;
+      m->ReplaceAbliteration(profiles);
+    } else if (!profiles.empty()) {
+      // Exactly the loaded profiles' rows.
+      std::size_t rows = 0;
+      bool triggers = false;
+      for (const auto& profile : profiles) {
+        rows += profile->direction_rows();
+        triggers = triggers || profile->trigger.has_value();
       }
-    // Every set a detection can turn ON, and the union of all of them (all
-    // triggers crossing at once), must form device blocks: refuse a profile
-    // directory where one cannot, instead of failing a request.
-    std::vector<std::string> all;
-    const auto check = [&](std::span<const std::string> names) {
-      const auto settings = m->ResolveAbliterationDefaults(names);
-      if (settings->parts.size() > 1)
-        (void)PlanAbliteration(qwen::AbliterationParts(*settings),
-                               m->executor_->AbliterationProfiles());
-    };
-    for (const auto& candidate : m->dynamic_candidates_) {
-      check(candidate.profiles);
-      for (const auto& name : candidate.profiles)
-        if (std::ranges::find(all, name) == all.end())
-          all.push_back(name);
+      if (!m->executor_->ReserveAbliteration(rows, profiles.size() > 1,
+                                             triggers, error_msg))
+        return nullptr;
+      m->ReplaceAbliteration(profiles);
     }
-    if (!all.empty())
-      check(all);
     qwen::ValidateNativeSources(*m->reader_);
     if (m->mtp_reader_)
       qwen::ValidateNativeSources(*m->mtp_reader_);
@@ -589,42 +566,61 @@ std::string Model::ArtifactIdentity() const {
              : core::GgufIdentityHex(*reader_);
 }
 
-std::span<const std::shared_ptr<const qwen::AbliterationProfile>>
-Model::AbliterationProfiles() const {
-  return executor_->AbliterationProfiles();
+AbliterationProfileSet Model::AbliterationProfiles() const {
+  const auto table = executor_->Abliteration();
+  return table ? table->profiles : AbliterationProfileSet{};
+}
+
+std::shared_ptr<const AbliterationTable> Model::Abliteration() const {
+  return executor_->Abliteration();
 }
 
 std::shared_ptr<const AbliterationSettings> Model::ResolveAbliterationDefaults(
     std::span<const std::string> names) const {
-  std::vector<const qwen::AbliterationProfile*> loaded;
-  for (const auto& profile : executor_->AbliterationProfiles())
-    loaded.push_back(profile.get());
-  std::vector<qwen::AbliterationOverrides> set;
-  for (const auto& name : names)
-    set.push_back({.profile = name});
-  return qwen::ResolveAbliterationSet(loaded, set);
+  return qwen38_flash_next::ResolveAbliterationDefaults(AbliterationProfiles(),
+                                                        names);
 }
 
-void Model::CheckAbliterationCombination(
-    const AbliterationSettings& settings) const {
+void Model::CheckAbliterationCombination(const AbliterationSettings& settings,
+                                         const AbliterationTable* table) const {
   if (settings.parts.size() < 2)
     return;
-  const auto plan = PlanAbliteration(qwen::AbliterationParts(settings),
-                                     executor_->AbliterationProfiles());
+  const auto current = table ? nullptr : executor_->Abliteration();
+  if (!table)
+    table = current.get();
+  if (!table)
+    throw std::invalid_argument("abliteration profile is not loaded");
+  const auto plan =
+      PlanAbliteration(qwen::AbliterationParts(settings), table->profiles);
   if (!executor_->UnionRowsAvailable(plan))
     throw std::invalid_argument(
         "abliteration: no free direction rows for this combination now "
         "(too many distinct combinations are active)");
 }
 
-std::shared_ptr<DynamicAbliteration> Model::StartDynamicAbliteration() const {
-  if (dynamic_candidates_.empty())
+std::shared_ptr<DynamicAbliteration> Model::StartDynamicAbliteration(
+    std::shared_ptr<const AbliterationTable> table) {
+  if (!table || table->candidates.empty())
     return nullptr;
-  // The model outlives every session and its requests.
+  // The resolver holds the request's table: a profile replaced meanwhile
+  // never changes what this request turns ON.
+  const auto& candidates = table->candidates;
   return std::make_shared<DynamicAbliteration>(
-      dynamic_candidates_, [this](std::span<const std::string> names) {
-        return ResolveAbliterationDefaults(names);
+      candidates, [table](std::span<const std::string> names) {
+        return qwen38_flash_next::ResolveAbliterationDefaults(table->profiles,
+                                                              names);
       });
+}
+
+void Model::ReplaceAbliteration(const AbliterationProfileSet& profiles) {
+  auto candidates = PlanAbliterationTriggers(profiles);
+  auto table = executor_->PrepareAbliteration(profiles);
+  for (auto& candidate : candidates)
+    for (std::size_t i = 0; i < table->profiles.size(); ++i)
+      if (table->profiles[i]->name == candidate.profile)
+        candidate.column = table->columns[i].value();
+  table->candidates = std::move(candidates);
+  executor_->PublishAbliteration(std::move(table));
 }
 
 void Session::SetActivationObserver(ActivationObserver observer,
@@ -633,18 +629,21 @@ void Session::SetActivationObserver(ActivationObserver observer,
 }
 
 void Session::ConfigureAbliteration(
-    std::shared_ptr<const AbliterationSettings> settings) {
+    std::shared_ptr<const AbliterationSettings> settings,
+    std::shared_ptr<const AbliterationTable> table) {
   const ExecutionScope execution(continuation_hooks_);
   const auto* active = session_->Abliteration();
   if (settings ? active && active->identity == settings->identity : !active)
     return;
+  if (settings && !table)
+    table = model_->executor_->Abliteration();
   if (settings)
     for (const auto* part : qwen::AbliterationParts(*settings))
-      if (!model_->executor_->FindAbliteration(part->profile))
+      if (!table || !table->Find(part->profile))
         throw std::invalid_argument("abliteration profile is not loaded");
   if (!tokens_.empty())
     Reset();
-  session_->ConfigureAbliteration(std::move(settings));
+  session_->ConfigureAbliteration(std::move(settings), std::move(table));
 }
 
 void Session::ConfigureVision(
@@ -674,10 +673,14 @@ const AbliterationSettings* Session::ActiveAbliteration() const {
 }
 
 void Session::ConfigureDynamicAbliteration(
-    std::shared_ptr<DynamicAbliteration> state) {
+    std::shared_ptr<DynamicAbliteration> state,
+    std::shared_ptr<const AbliterationTable> table) {
   if (state && session_->Abliteration())
     throw std::logic_error(
         "dynamic abliteration starts on a session that is OFF");
+  if (state && !table)
+    table = model_->executor_->Abliteration();
+  dynamic_table_ = state ? std::move(table) : nullptr;
   dynamic_ = std::move(state);
   session_->SetDetection(dynamic_ != nullptr);
 }
@@ -695,7 +698,7 @@ void Session::ApplyDynamicAbliteration() {
   // A1: the committed tokens keep their OFF state (no reset); every later
   // trunk pass projects. Detection stops: one profile at a time, sticky.
   session_->SetDetection(false);
-  session_->ConfigureAbliteration(std::move(settings));
+  session_->ConfigureAbliteration(std::move(settings), dynamic_table_);
 }
 
 std::optional<DynamicAbliterationReport> Session::DynamicReport() {

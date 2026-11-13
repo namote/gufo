@@ -170,6 +170,11 @@ public:
   [[nodiscard]] bool device_lost() const noexcept;
   /// One entry per session; admitted requests hold one until terminal.
   [[nodiscard]] std::vector<SessionState> SessionStates() const;
+  /// Runs `task` on the scheduler thread between two steps (no pass in
+  /// flight, no graph being captured) and waits for it; rethrows what it
+  /// throws. Throws std::runtime_error when the scheduler is stopping or its
+  /// device is lost. Must not be called from the scheduler thread.
+  void RunBetweenSteps(std::function<void()> task);
   [[nodiscard]] std::size_t buffered_output_bytes() const noexcept;
   [[nodiscard]] std::size_t max_buffered_output_bytes() const noexcept;
 

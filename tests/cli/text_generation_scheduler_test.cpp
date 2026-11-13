@@ -883,6 +883,38 @@ void TestConcurrentSharedPrefixesPrefillOnce() {
          "a short shared prefix is prefilled without waiting");
 }
 
+// RunBetweenSteps (runtime profile updates) runs its task on the scheduler
+// thread, never during a pass, and rethrows what the task throws.
+void TestRunBetweenStepsWaitsForThePass() {
+  auto control = SharedPrefixControl(false);
+  auto scheduler = MakeScheduler(control, 1);
+  std::thread::id ran;
+  scheduler->RunBetweenSteps([&] { ran = std::this_thread::get_id(); });
+  Expect(ran != std::thread::id{} && ran != std::this_thread::get_id(),
+         "an idle scheduler runs the task on its own thread");
+  bool rethrown = false;
+  try {
+    scheduler->RunBetweenSteps(
+        [] { throw std::invalid_argument("rejected update"); });
+  } catch (const std::invalid_argument&) {
+    rethrown = true;
+  }
+  Expect(rethrown, "the task's exception reaches the caller");
+  control->block_prefill_label = 1;
+  auto request = scheduler->Submit(SharedPrompt(10, 7000, 5), 2, 0.0F);
+  control->WaitForPrefill(1);
+  std::atomic<bool> done{false};
+  std::thread updater(
+      [&] { scheduler->RunBetweenSteps([&] { done = true; }); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  Expect(!done.load(), "the task waits while a pass runs");
+  control->ReleasePrefill();
+  updater.join();
+  Expect(done.load(), "the task runs once the pass ends");
+  Expect(request.Wait().tokens == ExpectedTokens(1, 2),
+         "the request completes around the task");
+}
+
 // The leader is cancelled while the worker is still inside its first prefill
 // chunk, before the follower can be admitted, so the follower never waits.
 void TestLeaderCancelledBeforeFollowerIsAdmitted() {
@@ -3970,6 +4002,7 @@ void TestScoringReturnsRawLogprobsWithoutDecoding() {
 }
 
 int main() {
+  TestRunBetweenStepsWaitsForThePass();
   TestTokenLogprobs();
   TestScoringReturnsRawLogprobsWithoutDecoding();
   TestScoringRequestsShareAWorkUnit();

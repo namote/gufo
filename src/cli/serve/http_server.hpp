@@ -94,6 +94,9 @@ struct HttpServerOptions {
   std::size_t max_request_body_bytes{static_cast<std::size_t>(8) * 1024 * 1024};
   std::size_t max_connections{16};
   std::string api_key;
+  /// `--allow-profile-updates`: POST/DELETE /v1/abliteration/profiles/{name}
+  /// and /v1/logit-bias/profiles/{name}; without it those paths are 404.
+  bool allow_profile_updates{false};
   std::chrono::milliseconds sse_heartbeat_interval{std::chrono::seconds(15)};
   /// Called once, on the listener or a request thread, when the text backend or
   /// the embedding service reports a lost device. Health, readiness and
@@ -142,6 +145,9 @@ private:
 
   HttpResponse handle_request(const HttpRequest& req);
   bool device_lost();
+  /// The body bytes `req` may send: max_request_body_bytes, raised to the
+  /// abliteration profile cap for an authorized profile upload.
+  [[nodiscard]] std::size_t BodyLimit(const HttpRequest& req) const;
   void handle_connection(int client_fd, std::atomic<bool>& response_sent);
   void reap_workers();
   void register_routes();

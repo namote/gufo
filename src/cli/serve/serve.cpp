@@ -657,6 +657,13 @@ void PrintServeHelp(std::string_view program_name,
         "Qwen 27B, Flash-Next: load the logit-bias profiles (*.json) in DIR, "
         "selected per request with 'logit_bias_profiles'",
         "Sampling Defaults", &logit_bias_profiles);
+    bool allow_profile_updates = false;
+    parser.AddFlag(
+        "", "--allow-profile-updates",
+        "Enable POST/DELETE /v1/abliteration/profiles/NAME (Flash-Next) "
+        "and /v1/logit-bias/profiles/NAME (Qwen 27B, Flash-Next): add, "
+        "replace and remove profiles while serving, until restart",
+        "Server", &allow_profile_updates);
 
     // Reasoning Defaults
     parser.AddOption(
@@ -978,6 +985,7 @@ int RunServe(std::span<const char* const> args) {
   std::string parse_err;
 
   std::shared_ptr<server::InferenceBackend> backend;
+  bool allow_profile_updates = false;
   std::shared_ptr<server::VideoJobService> video_jobs;
   std::shared_ptr<server::TtsService> tts;
   std::shared_ptr<server::AsrService> asr;
@@ -1319,6 +1327,12 @@ int RunServe(std::span<const char* const> args) {
         "Qwen 27B, Flash-Next: load the logit-bias profiles (*.json) in DIR, "
         "selected per request with 'logit_bias_profiles'",
         "Sampling Defaults", &logit_bias_profiles);
+    llm_parser.AddFlag(
+        "", "--allow-profile-updates",
+        "Enable POST/DELETE /v1/abliteration/profiles/NAME (Flash-Next) "
+        "and /v1/logit-bias/profiles/NAME (Qwen 27B, Flash-Next): add, "
+        "replace and remove profiles while serving, until restart",
+        "Server", &allow_profile_updates);
     llm_parser.AddOption(
         "", "--think", "MODE",
         "Default reasoning mode: on, off, or auto (default: model)",
@@ -1563,6 +1577,7 @@ int RunServe(std::span<const char* const> args) {
     std::string err;
     ModelLoadLog load_log("text", model);
     backend = std::make_shared<server::InferenceBackend>();
+    backend->set_profile_updates(allow_profile_updates);
     // The disk snapshot tier is walked during load, which can take minutes.
     // Answer 503 `Loading model` on the port meanwhile, as llama-server does,
     // so supervisors see a loading server rather than a refused connection.
@@ -1690,6 +1705,7 @@ int RunServe(std::span<const char* const> args) {
           .max_request_body_bytes = max_request_body_bytes,
           .max_connections = max_connections,
           .api_key = std::move(api_key),
+          .allow_profile_updates = allow_profile_updates,
           .on_device_lost =
               [&device_lost] {
                 device_lost.store(true);

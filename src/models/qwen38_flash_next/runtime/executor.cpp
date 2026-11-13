@@ -321,12 +321,15 @@ std::uint32_t Session::ReleaseKvReservation() noexcept {
 }
 
 void Session::ConfigureAbliteration(
-    std::shared_ptr<const qwen::AbliterationSettings> settings) {
+    std::shared_ptr<const qwen::AbliterationSettings> settings,
+    std::shared_ptr<const AbliterationTable> table) {
   const auto parts = settings
                          ? qwen::AbliterationParts(*settings)
                          : std::vector<const qwen::AbliterationSettings*>{};
+  if (settings && !table)
+    throw std::invalid_argument("abliteration profile is not loaded");
   for (const auto* part : parts) {
-    const auto* profile = owner_->FindAbliteration(part->profile);
+    const auto* profile = table->Find(part->profile);
     if (!profile)
       throw std::invalid_argument("abliteration profile is not loaded");
     if (!qwen::AbliterationSettingsFit(*profile, *part))
@@ -359,9 +362,9 @@ void Session::ConfigureAbliteration(
     // (CombineAbliterationBlocks).
     std::vector<float> words;
     if (parts.size() == 1)
-      words = parts[0]->DeviceWords(owner_->AbliterationRow(parts[0]->profile));
+      words = parts[0]->DeviceWords(table->Row(parts[0]->profile));
     else
-      owner_->CombineAbliterationBlocks(parts, &words, &sites, &unions,
+      owner_->CombineAbliterationBlocks(parts, *table, &words, &sites, &unions,
                                         &add_first, &add_sites);
     const auto bytes = words.size() * sizeof(float);
     if (!abliteration_device_) {
@@ -396,6 +399,8 @@ void Session::ConfigureAbliteration(
     graphs_.clear();
     warmed_.clear();
   }
+  // The new settings' rows belong to `table`: hold it (OFF holds none).
+  abliteration_table_ = settings ? std::move(table) : nullptr;
   abliteration_ = std::move(settings);
   abliteration_sites_ = std::move(sites);
   // Keep the new union rows; release the old ones.
@@ -404,77 +409,78 @@ void Session::ConfigureAbliteration(
   abliteration_add_first_ = add_first;
 }
 
-bool Executor::LoadAbliteration(AbliterationProfileSet profiles,
-                                std::string* error) {
-  std::size_t rows = 0;
-  bool valid = abliteration_.empty() && !profiles.empty() &&
-               profiles.size() <= qwen::kAbliterationMaxProfiles;
-  for (const auto& profile : profiles) {
-    valid = valid && profile && profile->hidden == config().hidden_size &&
-            profile->layers == config().num_layers &&
-            profile->direction_rows() != 0 &&
-            profile->directions.size() ==
-                std::size_t{profile->direction_rows()} * profile->hidden;
-    if (valid)
-      rows += profile->direction_rows();
+struct Executor::AbliterationPool {
+  std::mutex mutex;
+  /// One flag per profile direction row (the rows before the union rows).
+  std::vector<bool> rows;
+  /// Per detector column: the layer its direction reads, while allocated.
+  std::array<std::optional<std::uint32_t>, kDetectorColumns> columns{};
+};
+
+namespace {
+/// One profile's rows and detector column; given back when the last table
+/// (or session) holding it lets go.
+struct AbliterationLease {
+  std::shared_ptr<void> pool_owner;
+  std::vector<bool>* rows{nullptr};
+  std::array<std::optional<std::uint32_t>, kDetectorColumns>* columns{nullptr};
+  std::mutex* mutex{nullptr};
+  std::uint32_t first{0};
+  std::uint32_t count{0};
+  std::optional<std::uint32_t> column;
+  AbliterationLease() = default;
+  AbliterationLease(const AbliterationLease&) = delete;
+  AbliterationLease& operator=(const AbliterationLease&) = delete;
+  ~AbliterationLease() {
+    if (!mutex)
+      return;
+    const std::lock_guard lock(*mutex);
+    for (std::uint32_t r = 0; r < count; ++r)
+      (*rows)[first + r] = false;
+    if (column)
+      (*columns)[*column].reset();
   }
-  if (!valid || rows > qwen::kAbliterationRowMask) {
-    AssignError(error, "invalid or repeated abliteration profile load");
+};
+}  // namespace
+
+bool Executor::ReserveAbliteration(std::size_t profile_rows, bool unions,
+                                   bool detectors, std::string* error) {
+  if (abliteration_directions_ != nullptr) {
+    AssignError(error, "repeated abliteration reservation");
     return false;
   }
   // Several profiles may be ON together: reserve rows for the unions of
   // their directions (CombineAbliterationBlocks).
-  const std::size_t combo = profiles.size() > 1 ? kAbliterationUnionRows : 0;
-  if (rows + combo > qwen::kAbliterationRowMask) {
+  const std::size_t combo = unions ? kAbliterationUnionRows : 0;
+  if (profile_rows + combo > qwen::kAbliterationRowMask) {
     AssignError(error, "abliteration direction table is too large");
     return false;
   }
-  std::vector<float> table;
-  table.reserve((rows + combo) * config().hidden_size);
-  std::vector<std::uint32_t> offsets;
-  for (const auto& profile : profiles) {
-    offsets.push_back(
-        static_cast<std::uint32_t>(table.size() / config().hidden_size));
-    table.insert(table.end(), profile->directions.begin(),
-                 profile->directions.end());
-  }
-  union_first_ = static_cast<std::uint32_t>(rows);
-  union_used_.assign(combo, false);
-  table.resize((rows + combo) * config().hidden_size, 0.0F);
+  const auto hidden = std::size_t{config().hidden_size};
   void* data = nullptr;
-  const auto bytes = table.size() * sizeof(float);
+  const auto bytes =
+      std::max<std::size_t>(profile_rows + combo, 1) * hidden * sizeof(float);
   if (!Check(hip::AllocateDevice(&data, bytes), "abliteration directions",
              error))
     return false;
   allocations_.push_back(data);
-  abliteration_directions_ = static_cast<float*>(data);
-  if (!Check(hipMemcpy(data, table.data(), bytes, hipMemcpyHostToDevice),
-             "abliteration directions upload", error))
+  if (!Check(hipMemset(data, 0, bytes), "abliteration directions", error))
     return false;
-  // Detectors: one direction row and score column per profile with a
-  // trigger, in load order.
-  std::vector<float> detector_table;
-  std::vector<Detector> detectors;
-  for (const auto& profile : profiles)
-    if (profile->trigger) {
-      if (profile->trigger->direction.size() != config().hidden_size ||
-          profile->trigger->layer >= config().num_layers) {
-        AssignError(error, "invalid abliteration trigger");
-        return false;
-      }
-      detector_table.insert(detector_table.end(),
-                            profile->trigger->direction.begin(),
-                            profile->trigger->direction.end());
-      detectors.push_back({profile->trigger->layer, profile->name});
-    }
-  if (!detectors.empty()) {
+  abliteration_directions_ = static_cast<float*>(data);
+  union_first_ = static_cast<std::uint32_t>(profile_rows);
+  union_used_.assign(combo, false);
+  auto pool = std::make_shared<AbliterationPool>();
+  pool->rows.assign(profile_rows, false);
+  abliteration_pool_ = std::move(pool);
+  if (detectors) {
     void* directions = nullptr;
     void* scores = nullptr;
     void* host = nullptr;
+    const auto direction_bytes =
+        std::size_t{kDetectorColumns} * hidden * sizeof(float);
     const auto score_bytes =
         std::size_t{options_.max_batch} * kDetectorColumns * sizeof(float);
-    if (!Check(hip::AllocateDevice(&directions,
-                                   detector_table.size() * sizeof(float)),
+    if (!Check(hip::AllocateDevice(&directions, direction_bytes),
                "abliteration detectors", error))
       return false;
     allocations_.push_back(directions);
@@ -485,10 +491,8 @@ bool Executor::LoadAbliteration(AbliterationProfileSet profiles,
     if (!Check(host_allocations_.Allocate(&host, score_bytes),
                "pinned abliteration detector scores", error))
       return false;
-    if (!Check(hipMemcpy(directions, detector_table.data(),
-                         detector_table.size() * sizeof(float),
-                         hipMemcpyHostToDevice),
-               "abliteration detectors upload", error) ||
+    if (!Check(hipMemset(directions, 0, direction_bytes),
+               "abliteration detectors", error) ||
         !Check(hipMemset(scores, 0, score_bytes),
                "abliteration detector scores", error))
       return false;
@@ -496,38 +500,155 @@ bool Executor::LoadAbliteration(AbliterationProfileSet profiles,
     detector_scores_ = static_cast<float*>(scores);
     detector_scores_host_ = static_cast<float*>(host);
   }
-  abliteration_ = std::move(profiles);
-  abliteration_rows_ = std::move(offsets);
-  detectors_ = std::move(detectors);
   return true;
 }
 
-std::optional<std::uint32_t> Executor::DetectorColumn(
-    std::string_view name) const {
-  for (std::size_t i = 0; i < detectors_.size(); ++i)
-    if (detectors_[i].profile == name)
-      return static_cast<std::uint32_t>(i);
-  return std::nullopt;
+std::shared_ptr<AbliterationTable> Executor::PrepareAbliteration(
+    const AbliterationProfileSet& profiles) const {
+  if (!abliteration_pool_ || abliteration_directions_ == nullptr)
+    throw std::invalid_argument("abliteration profiles cannot load now");
+  if (profiles.size() > qwen::kAbliterationMaxProfiles)
+    throw std::invalid_argument("abliteration: too many profiles");
+  const auto hidden = std::size_t{config().hidden_size};
+  const auto current = Abliteration();
+  auto table = std::make_shared<AbliterationTable>();
+  for (const auto& profile : profiles) {
+    if (!profile || profile->hidden != config().hidden_size ||
+        profile->layers != config().num_layers ||
+        profile->direction_rows() == 0 ||
+        profile->directions.size() !=
+            std::size_t{profile->direction_rows()} * profile->hidden)
+      throw std::invalid_argument("invalid abliteration profile");
+    if (profile->trigger && (profile->trigger->direction.size() != hidden ||
+                             profile->trigger->layer >= config().num_layers))
+      throw std::invalid_argument("invalid abliteration trigger");
+    // The same profile object keeps its rows: requests holding either table
+    // read identical directions.
+    std::optional<std::size_t> kept;
+    if (current)
+      for (std::size_t i = 0; i < current->profiles.size(); ++i)
+        if (current->profiles[i] == profile)
+          kept = i;
+    if (kept) {
+      table->profiles.push_back(profile);
+      table->rows.push_back(current->rows[*kept]);
+      table->columns.push_back(current->columns[*kept]);
+      table->leases.push_back(current->leases[*kept]);
+      continue;
+    }
+    auto lease = std::make_shared<AbliterationLease>();
+    const auto count = profile->direction_rows();
+    {
+      auto& pool = *abliteration_pool_;
+      const std::lock_guard lock(pool.mutex);
+      // First fit among the profile rows.
+      std::size_t first = 0;
+      for (;; ++first) {
+        if (first + count > pool.rows.size())
+          throw std::length_error(
+              "abliteration: no free direction rows (earlier versions are "
+              "still held by running requests or by the sessions that last "
+              "ran them; retry later)");
+        bool free = true;
+        for (std::uint32_t r = 0; r < count && free; ++r)
+          free = !pool.rows[first + r];
+        if (free)
+          break;
+      }
+      std::optional<std::uint32_t> column;
+      if (profile->trigger) {
+        for (std::uint32_t c = 0; c < kDetectorColumns && !column; ++c)
+          if (!pool.columns[c])
+            column = c;
+        if (!column || detector_directions_ == nullptr)
+          throw std::length_error(
+              "abliteration: no free detector column (earlier versions are "
+              "still held by running requests or by the sessions that last "
+              "ran them; retry later)");
+        pool.columns[*column] = profile->trigger->layer;
+      }
+      for (std::uint32_t r = 0; r < count; ++r)
+        pool.rows[first + r] = true;
+      lease->pool_owner = abliteration_pool_;
+      lease->rows = &pool.rows;
+      lease->columns = &pool.columns;
+      lease->mutex = &pool.mutex;
+      lease->first = static_cast<std::uint32_t>(first);
+      lease->count = count;
+      lease->column = column;
+    }
+    // Free rows and columns: no pass reads them until a table naming them
+    // is published.
+    if (hipMemcpy(abliteration_directions_ + std::size_t{lease->first} * hidden,
+                  profile->directions.data(),
+                  profile->directions.size() * sizeof(float),
+                  hipMemcpyHostToDevice) != hipSuccess ||
+        (lease->column &&
+         hipMemcpy(detector_directions_ + std::size_t{*lease->column} * hidden,
+                   profile->trigger->direction.data(), hidden * sizeof(float),
+                   hipMemcpyHostToDevice) != hipSuccess))
+      throw std::runtime_error("abliteration directions upload failed");
+    table->profiles.push_back(profile);
+    table->rows.push_back(lease->first);
+    table->columns.push_back(lease->column);
+    table->leases.push_back(std::move(lease));
+  }
+  return table;
+}
+
+void Executor::PublishAbliteration(
+    std::shared_ptr<const AbliterationTable> table) {
+  {
+    const std::lock_guard lock(abliteration_table_mutex_);
+    abliteration_table_ = std::move(table);
+  }
+  // Every allocated column is scored: older tables still held by running
+  // requests keep reading theirs.
+  std::vector<Detector> scored;
+  if (abliteration_pool_) {
+    const std::lock_guard lock(abliteration_pool_->mutex);
+    for (std::uint32_t c = 0; c < kDetectorColumns; ++c)
+      if (const auto layer = abliteration_pool_->columns[c])
+        scored.push_back({c, *layer});
+  }
+  const auto same = [](const Detector& a, const Detector& b) {
+    return a.column == b.column && a.layer == b.layer;
+  };
+  if (!std::ranges::equal(scored, scored_detectors_, same)) {
+    scored_detectors_ = std::move(scored);
+    ++detector_generation_;
+  }
+}
+
+std::shared_ptr<const AbliterationTable> Executor::Abliteration() const {
+  const std::lock_guard lock(abliteration_table_mutex_);
+  return abliteration_table_;
 }
 
 void Executor::ScoreDetectors(std::uint32_t layer, const float* res,
                               std::uint32_t first, std::uint32_t rows) const {
   std::array<std::uint32_t, kDetectorColumns> ids{};
   std::size_t count = 0;
-  for (std::size_t i = 0; i < detectors_.size(); ++i)
-    if (detectors_[i].layer == layer)
-      ids[count++] = static_cast<std::uint32_t>(i);
+  for (const auto& detector : scored_detectors_)
+    if (detector.layer == layer)
+      ids[count++] = detector.column;
   if (count == 0)
     return;
-  // The detector index is its score column.
-  const auto list = std::span<const std::uint32_t>(ids.data(), count);
   // The residual must hold every HC stream's final value, as the collector
   // reads it (a deferred update is settled first).
   ApplyPendingResidual();
-  AbliterationDetectorScores(
-      res, detector_directions_, list, list,
-      detector_scores_ + std::size_t{first} * kDetectorColumns,
-      kDetectorColumns, rows, config().hidden_size, config().hc_count, stream_);
+  // The detector index is its score column; one launch scores at most
+  // kAbliterationMaxProfiles detectors.
+  for (std::size_t at = 0; at < count; at += qwen::kAbliterationMaxProfiles) {
+    const auto list = std::span<const std::uint32_t>(
+        ids.data() + at,
+        std::min<std::size_t>(count - at, qwen::kAbliterationMaxProfiles));
+    AbliterationDetectorScores(
+        res, detector_directions_, list, list,
+        detector_scores_ + std::size_t{first} * kDetectorColumns,
+        kDetectorColumns, rows, config().hidden_size, config().hc_count,
+        stream_);
+  }
 }
 
 bool Executor::DownloadDetectorScores(std::uint32_t rows,
@@ -553,19 +674,11 @@ void Executor::KeepDetectorScores(Session& session, std::uint32_t first_row,
   session.detect_pass_ = ++detector_passes_;
 }
 
-const qwen::AbliterationProfile* Executor::FindAbliteration(
-    std::string_view name) const {
-  for (const auto& profile : abliteration_)
-    if (profile->name == name)
-      return profile.get();
-  return nullptr;
-}
-
 void Executor::CombineAbliterationBlocks(
     std::span<const qwen::AbliterationSettings* const> parts,
-    std::vector<float>* words, std::vector<std::int16_t>* sites,
-    std::vector<std::string>* unions, std::uint32_t* add_first,
-    std::vector<std::uint8_t>* add_sites) const {
+    const AbliterationTable& table, std::vector<float>* words,
+    std::vector<std::int16_t>* sites, std::vector<std::string>* unions,
+    std::uint32_t* add_first, std::vector<std::uint8_t>* add_sites) const {
   // Suppression profiles project per site first (PlanAbliteration); then
   // each additive profile (R5) adds at its sites.
   std::vector<const qwen::AbliterationSettings*> adds;
@@ -574,7 +687,7 @@ void Executor::CombineAbliterationBlocks(
       adds.push_back(part);
   const auto layers = config().num_layers;
   const std::uint32_t site_count = 3 * layers;
-  const auto plan = PlanAbliteration(parts, abliteration_);
+  const auto plan = PlanAbliteration(parts, table.profiles);
   const auto stride = qwen::AbliterationWeightedWords(layers);
   if (adds.size() > 8)
     throw std::invalid_argument("abliteration: more than 8 additive profiles");
@@ -586,7 +699,7 @@ void Executor::CombineAbliterationBlocks(
     const auto& block = plan.blocks[b];
     std::uint32_t row = 0;
     if (block.basis.empty()) {
-      row = AbliterationRow(block.profile) + block.row;
+      row = table.Row(block.profile) + block.row;
     } else {
       row = AcquireUnion(block.key, block.basis);
       unions->push_back(block.key);
@@ -605,7 +718,7 @@ void Executor::CombineAbliterationBlocks(
     return;
   add_sites->assign(site_count, 0);
   for (std::size_t a = 0; a < adds.size(); ++a) {
-    const auto block = adds[a]->DeviceWords(AbliterationRow(adds[a]->profile));
+    const auto block = adds[a]->DeviceWords(table.Row(adds[a]->profile));
     std::copy(block.begin(), block.end(),
               words->begin() +
                   static_cast<std::ptrdiff_t>((*add_first + a) * stride));
@@ -684,13 +797,6 @@ void Executor::ReleaseUnion(const std::string& key) const noexcept {
   for (std::uint32_t r = 0; r < found->second.count; ++r)
     union_used_[found->second.first - union_first_ + r] = false;
   union_rows_.erase(found);
-}
-
-std::uint32_t Executor::AbliterationRow(std::string_view name) const {
-  for (std::size_t i = 0; i < abliteration_.size(); ++i)
-    if (abliteration_[i]->name == name)
-      return abliteration_rows_[i];
-  throw std::invalid_argument("abliteration profile is not loaded");
 }
 
 void Executor::ProjectAbliteration(float* output, std::uint32_t rows,

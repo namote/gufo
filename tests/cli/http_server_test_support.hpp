@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <semaphore>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -101,6 +102,85 @@ public:
   }
   std::optional<AbliterationInfo> abliteration;
   std::vector<AbliterationInfo> more_abliteration;
+  // Runtime profile updates: a body of "invalid" fails validation; any
+  // other body becomes the profile's identity.
+  AbliterationInfo put_abliteration_profile(std::string_view name,
+                                            std::string_view body) override {
+    if (body == "invalid")
+      throw gufo::server::ProfileUpdateError(400, "invalid_abliteration",
+                                             "abliteration: invalid profile");
+    const std::lock_guard lock(mutex_);
+    AbliterationInfo info{.name = std::string(name),
+                          .schema = "gufo-abliteration-v2",
+                          .identity = std::string(body),
+                          .layers = 1};
+    std::erase_if(more_abliteration,
+                  [&](const auto& loaded) { return loaded.name == name; });
+    more_abliteration.push_back(info);
+    return info;
+  }
+  AbliterationInfo delete_abliteration_profile(std::string_view name) override {
+    const std::lock_guard lock(mutex_);
+    for (auto it = more_abliteration.begin(); it != more_abliteration.end();
+         ++it)
+      if (it->name == name) {
+        auto info = *it;
+        more_abliteration.erase(it);
+        return info;
+      }
+    throw gufo::server::ProfileUpdateError(404, "unknown_abliteration_profile",
+                                           "no such profile");
+  }
+  // Logit-bias profiles over a 100-token vocabulary, validated as the real
+  // backend does (ids only: no tokenizer here).
+  std::shared_ptr<const gufo::sampling::LogitBiasCatalog> logit_bias_catalog()
+      const override {
+    const std::lock_guard lock(mutex_);
+    return catalog;
+  }
+  gufo::sampling::LogitBiasProfile put_logit_bias_profile(
+      std::string_view name, std::string_view body) override {
+    gufo::sampling::LogitBiasProfile profile;
+    try {
+      profile = gufo::sampling::ParseLogitBiasProfile(body, "request body");
+      if (profile.name != name)
+        throw std::invalid_argument("logit bias: name mismatch");
+      gufo::sampling::ResolveLogitBiasProfiles(std::span(&profile, 1), 100, {});
+    } catch (const std::invalid_argument& e) {
+      throw gufo::server::ProfileUpdateError(400, "invalid_logit_bias_profile",
+                                             e.what());
+    }
+    const std::lock_guard lock(mutex_);
+    if (!catalog)
+      throw gufo::server::ProfileUpdateError(400, "unsupported_profile_update",
+                                             "no logit bias");
+    std::vector<gufo::sampling::LogitBiasProfile> profiles;
+    for (const auto& loaded : catalog->profiles())
+      if (loaded.name != name)
+        profiles.push_back(loaded);
+    profiles.push_back(profile);
+    catalog = std::make_shared<const gufo::sampling::LogitBiasCatalog>(
+        100, std::move(profiles));
+    return profile;
+  }
+  gufo::sampling::LogitBiasProfile delete_logit_bias_profile(
+      std::string_view name) override {
+    const std::lock_guard lock(mutex_);
+    const auto* found = catalog ? catalog->Find(name) : nullptr;
+    if (found == nullptr)
+      throw gufo::server::ProfileUpdateError(404, "unknown_logit_bias_profile",
+                                             "no such profile");
+    auto removed = *found;
+    std::vector<gufo::sampling::LogitBiasProfile> profiles;
+    for (const auto& loaded : catalog->profiles())
+      if (loaded.name != name)
+        profiles.push_back(loaded);
+    catalog = std::make_shared<const gufo::sampling::LogitBiasCatalog>(
+        100, std::move(profiles));
+    return removed;
+  }
+  /// Null: requests cannot bias logits (set it to enable them).
+  std::shared_ptr<const gufo::sampling::LogitBiasCatalog> catalog;
   std::string hc_mode() const override { return served_hc_mode; }
   std::string served_hc_mode;
   std::uint32_t max_context() const override { return 65536; }
@@ -298,7 +378,7 @@ public:
   std::binary_semaphore finished{0};
 
 private:
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
   Call last_;
   std::string output_{"ok"};
 };

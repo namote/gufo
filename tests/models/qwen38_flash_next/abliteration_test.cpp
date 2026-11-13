@@ -9,6 +9,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
+#include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -93,6 +96,113 @@ void TestPlan() {
   Require(merged.blocks.size() == 1 && merged.blocks[0].count == 1 &&
           merged.blocks[0].weights[0] == 1.0F);
 }
+
+// Runtime profile updates: the set keeps file name order and the cap,
+// validates triggers as the loader does, and a replaced profile never shares
+// a union basis with its predecessor.
+void TestRuntimeSet() {
+  const auto throws = [](const auto& f) {
+    try {
+      f();
+    } catch (const std::invalid_argument&) {
+      return true;
+    }
+    return false;
+  };
+  q::AbliterationProfileSet set;
+  for (const auto* name : {"pol", "a", "a-b"})
+    set = q::WithAbliterationProfile(set, Fixture(name, {1, 0, 0}, 1, 0));
+  // File name order: "a-b.json" < "a.json" < "pol.json".
+  Require(set.size() == 3 && set[0]->name == "a-b" && set[1]->name == "a" &&
+          set[2]->name == "pol");
+  // Replacing keeps the position and drops the old profile.
+  const auto replacement = Fixture("a", {0, 1, 0}, 1, 0);
+  const auto replaced = q::WithAbliterationProfile(set, replacement);
+  Require(replaced.size() == 3 && replaced[1] == replacement &&
+          set[1] != replacement);
+  const auto removed = q::WithoutAbliterationProfile(replaced, "a");
+  Require(removed.size() == 2 && removed[0]->name == "a-b");
+  bool missing = false;
+  try {
+    (void)q::WithoutAbliterationProfile(removed, "a");
+  } catch (const std::out_of_range&) {
+    missing = true;
+  }
+  Require(missing);
+  // At most kAbliterationMaxProfiles.
+  q::AbliterationProfileSet full;
+  for (std::size_t i = 0; i < qwen::kAbliterationMaxProfiles; ++i)
+    full = q::WithAbliterationProfile(
+        full, Fixture("p" + std::to_string(i), {1, 0, 0}, 1, 0));
+  Require(throws([&] {
+    (void)q::WithAbliterationProfile(full, Fixture("z", {1, 0, 0}, 1, 0));
+  }));
+  Require(
+      q::WithAbliterationProfile(full, Fixture("p0", {0, 1, 0}, 1, 0)).size() ==
+      qwen::kAbliterationMaxProfiles);
+
+  // Triggers: companions must be loaded and not the profile itself.
+  const auto triggered = [](const std::string& name,
+                            std::vector<std::string> with) {
+    auto profile = std::make_shared<qwen::AbliterationProfile>(
+        *Fixture(name, {1, 0, 0}, 1, 0));
+    profile->trigger =
+        qwen::AbliterationTrigger{.layer = 0,
+                                  .direction = {1, 0, 0},
+                                  .threshold = 1.5F,
+                                  .decode_threshold = std::nullopt,
+                                  .with = std::move(with)};
+    return std::shared_ptr<const qwen::AbliterationProfile>(profile);
+  };
+  const q::AbliterationProfileSet dynamic{
+      triggered("fnx", {"r"}), Fixture("r", {0.6F, 0.8F, 0}, 2.0F, 0)};
+  const auto candidates = q::PlanAbliterationTriggers(dynamic);
+  Require(candidates.size() == 1 && candidates[0].profile == "fnx" &&
+          candidates[0].threshold == 1.5F &&
+          candidates[0].profiles == std::vector<std::string>{"fnx", "r"});
+  Require(throws(
+      [&] { (void)q::PlanAbliterationTriggers({triggered("fnx", {"fnx"})}); }));
+  Require(throws([&] {
+    (void)q::PlanAbliterationTriggers({triggered("fnx", {"gone"})});
+  }));
+  // Removing a companion leaves the trigger naming an unloaded profile.
+  Require(throws([&] {
+    (void)q::PlanAbliterationTriggers(
+        q::WithoutAbliterationProfile(dynamic, "r"));
+  }));
+
+  // A request's snapshot resolves against its own profiles.
+  const auto before =
+      q::ResolveAbliterationDefaults(dynamic, std::vector<std::string>{"r"});
+  auto new_r = std::make_shared<qwen::AbliterationProfile>(
+      *Fixture("r", {0, 0, 1}, 2.0F, 0));
+  new_r->identity = std::string(64, 'n');
+  const auto after =
+      q::ResolveAbliterationDefaults(q::WithAbliterationProfile(dynamic, new_r),
+                                     std::vector<std::string>{"r"});
+  Require(before->identity != after->identity);
+
+  // Union bases are keyed by profile bytes (identity), not names.
+  const auto key = [](const q::AbliterationProfileSet& loaded) {
+    const auto p = q::ResolveAbliterationSettings(*loaded[0]);
+    const auto r = q::ResolveAbliterationSettings(*loaded[1]);
+    const std::vector<const qwen::AbliterationSettings*> parts{p.get(),
+                                                               r.get()};
+    const auto plan = q::PlanAbliteration(parts, loaded);
+    for (const auto& block : plan.blocks)
+      if (!block.key.empty())
+        return block.key;
+    return std::string{};
+  };
+  auto other_r = std::make_shared<qwen::AbliterationProfile>(
+      *Fixture("r", {0.6F, 0.8F, 0}, 2.0F, 0));
+  other_r->identity = std::string(64, 's');
+  const q::AbliterationProfileSet first{Fixture("p", {1, 0, 0}, 0.5F, 1.0F),
+                                        Fixture("r", {0.6F, 0.8F, 0}, 2.0F, 0)};
+  const q::AbliterationProfileSet second{first[0], other_r};
+  Require(!key(first).empty() && key(first) != key(second));
+  std::cout << "runtime profile set PASS\n";
+}
 }  // namespace
 
 int main() {
@@ -119,6 +229,35 @@ int main() {
   const auto settings = q::ResolveAbliterationSettings(profile);
   Require(q::AbliterationProfile::Load(path, 3, 2, "fixture").identity ==
           profile.identity);
+  // An upload of the same bytes validates and identifies the same way.
+  {
+    std::ifstream input(path, std::ios::binary);
+    const std::string bytes((std::istreambuf_iterator<char>(input)),
+                            std::istreambuf_iterator<char>());
+    const auto uploaded =
+        q::AbliterationProfile::Parse(bytes, "uploaded", 3, 2, "fixture");
+    Require(uploaded.identity == profile.identity &&
+            uploaded.name == "uploaded" &&
+            uploaded.directions == profile.directions);
+    bool rejected = false;
+    try {
+      (void)q::AbliterationProfile::Parse("{not json", "x", 3, 2, "fixture");
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    Require(rejected);
+    rejected = false;
+    try {
+      (void)q::AbliterationProfile::Parse(bytes, "x", 3, 2, "other-model");
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    Require(rejected);
+  }
+  Require(qwen::ValidAbliterationProfileName("pol-avg.v2_1") &&
+          !qwen::ValidAbliterationProfileName("") &&
+          !qwen::ValidAbliterationProfileName("a/b") &&
+          !qwen::ValidAbliterationProfileName(std::string(65, 'a')));
   const std::vector<std::uint8_t> image{1, 2, 3};
   Require(q::AbliterationInputIdentity({}, profile.identity) !=
           q::AbliterationInputIdentity(image, profile.identity));
@@ -457,6 +596,7 @@ int main() {
             dynamic_set->identity != set->identity);
   }
   TestPlan();
+  TestRuntimeSet();
   // Additive (steering, R5) profiles: signed strengths, each layer's own
   // direction, a distinct identity.
   {
