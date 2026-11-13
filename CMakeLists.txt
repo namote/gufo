@@ -426,6 +426,7 @@ add_library(gufo_http STATIC
   src/cli/serve/tts_service.cpp
   src/cli/serve/video_api.cpp
   src/cli/serve/video_jobs.cpp
+  src/cli/serve/collection_jobs.cpp
   src/cli/serve/http_server.cpp
   src/cli/serve/websocket.cpp
   src/cli/serve/asr_websocket.cpp
@@ -435,7 +436,8 @@ add_library(gufo_http STATIC
   # the engine library, so no translation unit is linked twice.
   src/models/deepseek_v4_flash/tool_calls.cpp
 )
-target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_qwen3_asr gufo_qwen_image_21 gufo_embedding_gemma2)
+target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_qwen3_asr gufo_qwen_image_21 gufo_embedding_gemma2
+  gufo_qwen38_flash_next)
 
 add_executable(gufo
   src/cli/main.cpp
@@ -715,6 +717,12 @@ if (BUILD_TESTING)
 
   # These HTTP/WebSocket suites drive raw POSIX sockets or fork() directly.
   if (NOT WIN32)
+  add_executable(collection_jobs_test tests/cli/collection_jobs_test.cpp)
+  target_link_libraries(collection_jobs_test PRIVATE gufo_http)
+  add_test(NAME collection_jobs_test COMMAND collection_jobs_test)
+  set_tests_properties(collection_jobs_test PROPERTIES
+    LABELS "cpu;server;abliteration;queue;cancellation" TIMEOUT 60)
+
   add_executable(http_server_test tests/cli/http_server_test.cpp)
   target_link_libraries(http_server_test PRIVATE gufo_http)
   add_test(NAME http_server_test COMMAND http_server_test)

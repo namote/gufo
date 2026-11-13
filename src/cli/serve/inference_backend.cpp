@@ -22,6 +22,7 @@
 #include <utility>
 
 #include "src/cli/model_artifact.hpp"
+#include "src/cli/serve/collection_jobs.hpp"
 #include "src/cli/serve/component_text_cache.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/persistence_identity.hpp"
@@ -29,12 +30,14 @@
 #include "src/cli/serve/score_assistant.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
+#include "src/core/crypto/sha256.hpp"
 #include "src/core/device_code_identity.hpp"
 #include "src/core/gguf_identity.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/han_script.hpp"
 #include "src/core/json.hpp"
 #include "src/core/logit_bias.hpp"
+#include "src/core/platform/os_info.hpp"
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/control_tokens.hpp"
@@ -56,6 +59,7 @@
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/native_pack.hpp"
+#include "src/models/qwen38_flash_next/activation_collection.hpp"
 #include "src/models/qwen38_flash_next/continuation_adapter.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #endif
@@ -4903,6 +4907,222 @@ void InferenceBackend::ReplaceLogitBiasProfiles(
                    " profiles=" + std::to_string(count));
 }
 #endif
+
+#if defined(ENGINE_ENABLE_HIP)
+namespace {
+/// In-server activation collection (`--collect-dir`) on the loaded
+/// Flash-Next model: collect.cpp's passes, one per scheduler idle turn
+/// (TextGenerationScheduler::RunWhenIdle), on a session of its own that no
+/// cache sees, abliteration OFF.
+class FlashNextCollectionRunner final : public CollectionRunner {
+public:
+  FlashNextCollectionRunner(std::shared_ptr<TextGenerationScheduler> scheduler,
+                            std::shared_ptr<QwenFlashNextModel> model)
+      : scheduler_(std::move(scheduler)),
+        model_(std::move(model)),
+        shared_(std::make_shared<Shared>()) {}
+
+  [[nodiscard]] CollectionModelIdentity Identity() const override {
+    namespace fn = models::qwen38_flash_next;
+    const auto& config = model_->config();
+    CollectionModelIdentity identity;
+    identity.model_identity = model_->ArtifactIdentity();
+    identity.device_code = core::ExecutableDeviceCodeSha256();
+    const auto executable = platform::RunningExecutablePath();
+    if (!executable)
+      throw std::runtime_error("cannot identify the server executable");
+    identity.executable_sha256 = crypto::Sha256FileHex(*executable);
+    identity.hidden = config.hidden_size;
+    identity.layers = config.num_layers;
+    identity.max_context = model_->MaxContext();
+    // collect.cpp loads FP16 K/V, the default HC mode, no YaRN, and prefill
+    // passes of up to 4224 rows.
+    if (model_->Kvarn())
+      identity.deviations.push_back(model_->KvarnBits() == 6
+                                        ? "kv-cache-type kvarn-k6v6"
+                                        : "kv-cache-type kvarn-k4v4");
+    if (model_->hc_mode() != fn::kDefaultHcMode)
+      identity.deviations.push_back(
+          "hc-mode " + std::string(fn::HcModeName(model_->hc_mode())));
+    if (config.rope_scaling.Enabled())
+      identity.deviations.push_back("yarn");
+    if (model_->PrefillThroughCapacity() < 4224)
+      identity.deviations.push_back("context below 4224 tokens");
+    return identity;
+  }
+
+  [[nodiscard]] models::qwen38_flash_next::CollectionPlan Plan(
+      models::qwen38_flash_next::CollectionMode mode,
+      const json::Value& record) const override {
+    return models::qwen38_flash_next::PlanCollectionRecord(
+        model_->tokenizer(), mode, record, Context(mode));
+  }
+
+  [[nodiscard]] std::optional<std::vector<float>> Run(
+      models::qwen38_flash_next::CollectionMode mode,
+      const models::qwen38_flash_next::CollectionPlan& plan,
+      const std::function<bool()>& cancelled,
+      const std::function<void(std::string)>& step) override {
+    namespace fn = models::qwen38_flash_next;
+    const auto& config = model_->config();
+    auto record = std::make_shared<Record>(
+        fn::CollectionFeeds(mode, plan),
+        fn::CollectionReadout(mode, config.num_layers, config.hidden_size,
+                              config.hc_count));
+    record->readout.Begin(plan);
+    const auto context = Context(mode);
+    std::size_t passes = 0;
+    while (!record->finished) {
+      step(passes == 0 ? "waiting for an idle scheduler"
+                       : "pass " + std::to_string(passes + 1) +
+                             ", waiting for an idle scheduler");
+      auto done = scheduler_->RunWhenIdle(
+          [shared = shared_, record, model = model_, context] {
+            RunPass(*shared, record, *model, context);
+          });
+      // A queued pass waits for the scheduler to be idle; poll for
+      // cancellation meanwhile. An abandoned pass does nothing if it runs.
+      while (done.wait_for(std::chrono::milliseconds(100)) !=
+             std::future_status::ready) {
+        if (cancelled()) {
+          record->abandoned = true;
+          return std::nullopt;
+        }
+      }
+      done.get();
+      ++passes;
+      if (cancelled() && !record->finished) {
+        record->abandoned = true;
+        return std::nullopt;
+      }
+    }
+    return record->readout.Finish(plan);
+  }
+
+  void Release() override {
+    // The session's device memory is freed between steps.
+    auto shared = shared_;
+    try {
+      scheduler_->RunBetweenSteps([shared] {
+        shared->session.reset();
+        shared->context = 0;
+      });
+    } catch (const std::exception&) {
+      // The scheduler is stopping or lost its device; a pass may still be
+      // running on its thread. The session dies with the last task or
+      // runner holding `shared_`, never under a running pass.
+    }
+  }
+
+private:
+  /// The session; only scheduler-thread tasks touch it.
+  struct Shared {
+    std::unique_ptr<QwenFlashNextSession> session;
+    std::uint32_t context{0};
+  };
+  struct Record {
+    Record(std::vector<models::qwen38_flash_next::CollectionFeed> feeds,
+           models::qwen38_flash_next::CollectionReadout readout)
+        : feeds(std::move(feeds)), readout(std::move(readout)) {}
+    std::vector<models::qwen38_flash_next::CollectionFeed> feeds;
+    models::qwen38_flash_next::CollectionReadout readout;
+    std::size_t feed{0};
+    /// Tokens of feeds[feed] the session holds.
+    std::size_t fed{0};
+    bool started{false};
+    bool finished{false};
+    std::atomic<bool> abandoned{false};
+  };
+
+  [[nodiscard]] std::uint32_t Context(
+      models::qwen38_flash_next::CollectionMode mode) const {
+    return std::min(models::qwen38_flash_next::CollectionContext(mode),
+                    model_->MaxContext());
+  }
+
+  /// One trunk pass of `record` on the scheduler thread: exactly the pass
+  /// collect.cpp's Sync runs at this point (Session::PrefillPassTokens).
+  static void RunPass(Shared& shared, const std::shared_ptr<Record>& owned,
+                      QwenFlashNextModel& model, std::uint32_t context) {
+    auto& record = *owned;
+    if (record.abandoned.load() || record.finished)
+      return;
+    std::string error;
+    if (!shared.session || shared.context != context) {
+      shared.session.reset();
+      const auto mode = core::SessionMode::kAutoregressive;
+      const std::size_t need = model.SessionBytes(mode, context);
+      std::size_t free = 0, total = 0;
+      // Room for the session beside what serving holds, with 1 GiB spare.
+      if (hipMemGetInfo(&free, &total) == hipSuccess &&
+          free < need + (std::size_t{1} << 30))
+        throw std::runtime_error(
+            "not enough free device memory for a collection session (needs " +
+            std::to_string(need) + " bytes, " + std::to_string(free) +
+            " free)");
+      shared.session = model.CreateSession(mode, context, &error);
+      if (!shared.session)
+        throw std::runtime_error("collection session: " + error);
+      shared.context = context;
+    }
+    auto& session = *shared.session;
+    if (!record.started) {
+      // collect.cpp: a fresh context per record, the projection OFF.
+      session.Reset();
+      session.ConfigureAbliteration(nullptr);
+      session.ConfigureDynamicAbliteration(nullptr);
+      // The observer keeps the record alive: an abandoned record's last
+      // observer stays until the next record replaces it.
+      session.SetActivationObserver(
+          [owned](std::uint32_t layer, std::span<const float> rows) {
+            owned->readout.Observe(layer, rows);
+          },
+          record.readout.all_rows());
+      record.started = true;
+    }
+    const auto& feed = record.feeds[record.feed];
+    const auto n = session.PrefillPassTokens(feed.tokens.size() - record.fed);
+    record.readout.SetObserving(feed.observed);
+    const bool ok = session.Sync(
+        std::span<const std::int32_t>(feed.tokens).first(record.fed + n),
+        &error);
+    record.readout.SetObserving(false);
+    if (!ok) {
+      session.SetActivationObserver({});
+      session.Reset();
+      throw std::runtime_error("collection pass: " + error);
+    }
+    record.fed += n;
+    if (record.fed == feed.tokens.size()) {
+      ++record.feed;
+      // The next feed extends this one (answers: the prompt's last token
+      // and the answer follow the prompt without it).
+      record.fed = record.feed < record.feeds.size() ? feed.tokens.size() : 0;
+    }
+    if (record.feed == record.feeds.size()) {
+      record.finished = true;
+      session.SetActivationObserver({});
+    }
+  }
+
+  std::shared_ptr<TextGenerationScheduler> scheduler_;
+  std::shared_ptr<QwenFlashNextModel> model_;
+  std::shared_ptr<Shared> shared_;
+};
+}  // namespace
+#endif
+
+std::shared_ptr<CollectionRunner> InferenceBackend::collection_runner() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  if (!state || !state->flash_next)
+    return nullptr;
+  return std::make_shared<FlashNextCollectionRunner>(state->scheduler,
+                                                     state->flash_next);
+#else
+  return nullptr;
+#endif
+}
 
 bool InferenceBackend::supports_scoring() const {
 #if defined(ENGINE_ENABLE_HIP)

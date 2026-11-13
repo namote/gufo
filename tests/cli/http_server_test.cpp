@@ -21,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/collection_jobs.hpp"
 #include "src/cli/serve/embedding_service.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/trace.hpp"
@@ -3840,6 +3841,112 @@ void TestProfileUpdates() {
       send(secured, "DELETE", "/v1/abliteration/profiles/pol", "", auth), 200);
 }
 
+namespace {
+/// A collection runner whose records read out zeros at once.
+class InstantCollectionRunner final : public gufo::server::CollectionRunner {
+public:
+  gufo::server::CollectionModelIdentity Identity() const override {
+    return {.model_identity = "m",
+            .device_code = "d",
+            .executable_sha256 = "e",
+            .hidden = 2,
+            .layers = 1,
+            .deviations = {}};
+  }
+  gufo::models::qwen38_flash_next::CollectionPlan Plan(
+      gufo::models::qwen38_flash_next::CollectionMode,
+      const gufo::json::Value&) const override {
+    return {.prompt = {1, 2}, .answer = {}, .selected = {}, .selected_rows = 0};
+  }
+  std::optional<std::vector<float>> Run(
+      gufo::models::qwen38_flash_next::CollectionMode,
+      const gufo::models::qwen38_flash_next::CollectionPlan&,
+      const std::function<bool()>&,
+      const std::function<void(std::string)>&) override {
+    return std::vector<float>(2, 0.0F);
+  }
+};
+}  // namespace
+
+// /v1/abliteration/jobs: unknown paths unless the server collects
+// (--collect-dir), then gated by the API key like every route.
+void TestCollectionJobs() {
+  const auto send = [](RunningServer& server, const std::string& method,
+                       const std::string& path, const std::string& body,
+                       const std::string& headers = {}) {
+    return server.Send(method + " " + path + " HTTP/1.1\r\n" + headers +
+                       "Content-Length: " + std::to_string(body.size()) +
+                       "\r\n\r\n" + body);
+  };
+  const auto json_body = [](const std::string& response) {
+    return gufo::json::parse(response.substr(response.find("\r\n\r\n") + 4));
+  };
+  const std::string job =
+      R"({"operation":"collect","mode":"collect","name":"run",)"
+      R"("records":[{"id":"a1","split":"collection","group":"refusal",)"
+      R"("thinking":true,"text":"x"}]})";
+  {
+    RunningServer server;
+    ExpectStatus(send(server, "POST", "/v1/abliteration/jobs", job), 404);
+    ExpectStatus(send(server, "GET", "/v1/abliteration/jobs", ""), 404);
+    ExpectStatus(send(server, "GET", "/v1/abliteration/jobs/abc", ""), 404);
+  }
+  const auto root =
+      std::filesystem::temp_directory_path() /
+      ("gufo-http-collect-" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  std::filesystem::create_directories(root);
+  {
+    auto service = std::make_shared<gufo::server::CollectionJobService>(
+        gufo::server::CollectionJobOptions{
+            .root = root,
+            .runner = std::make_shared<InstantCollectionRunner>()});
+    RunningServer server(
+        {.api_key = "test-secret", .collection_jobs = service});
+    const std::string key = "Authorization: Bearer test-secret\r\n";
+    ExpectStatus(send(server, "POST", "/v1/abliteration/jobs", job), 401);
+    ExpectStatus(send(server, "GET", "/v1/abliteration/jobs", ""), 401);
+    const auto bad = send(server, "POST", "/v1/abliteration/jobs",
+                          R"({"operation":"collect","mode":"x"})", key);
+    ExpectStatus(bad, 400);
+    assert(json_body(bad).find("error")->member_str("code") == "invalid_mode");
+    const auto started =
+        send(server, "POST", "/v1/abliteration/jobs", job, key);
+    ExpectStatus(started, 200);
+    const auto id = json_body(started).member_str("job");
+    assert(json_body(started).member_str("status") == "queued");
+    std::string status;
+    for (int i = 0; i < 1000 && status != "done"; ++i) {
+      const auto polled = send(
+          server, "GET", "/v1/abliteration/jobs/" + id + "?since=0", "", key);
+      ExpectStatus(polled, 200);
+      status = json_body(polled).member_str("status");
+      if (status != "done")
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    assert(status == "done");
+    const auto paged = send(
+        server, "GET", "/v1/abliteration/jobs/" + id + "?since=1", "", key);
+    assert(json_body(paged).find("results")->empty());
+    ExpectStatus(send(server, "GET",
+                      "/v1/abliteration/jobs/" + id + "?since=-1", "", key),
+                 400);
+    ExpectStatus(send(server, "GET", "/v1/abliteration/jobs/nope", "", key),
+                 404);
+    ExpectStatus(send(server, "PUT", "/v1/abliteration/jobs/" + id, "", key),
+                 405);
+    const auto listed = send(server, "GET", "/v1/abliteration/jobs", "", key);
+    assert(json_body(listed).find("data")->size() == 1);
+    assert(std::filesystem::exists(root / "run" / "a1.f32"));
+    const auto deleted =
+        send(server, "DELETE", "/v1/abliteration/jobs/" + id, "", key);
+    ExpectStatus(deleted, 200);
+    assert(json_body(deleted).find("deleted")->as_bool());
+  }
+  std::filesystem::remove_all(root);
+}
+
 int main() {
   // The log assertions below match "[LEVEL] [component]" text written to a
   // redirected stderr sink, so the real stderr's TTY state must not add ANSI
@@ -3860,6 +3967,7 @@ int main() {
   TestFallbackBackendMetrics();
   TestLlamaProps();
   TestProfileUpdates();
+  TestCollectionJobs();
   TestApplyTemplate();
   TestLlamaTokenize();
   TestOpenAiInputTokens();

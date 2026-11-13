@@ -29,6 +29,7 @@
 #include "src/cli/kv_cache_type.hpp"
 #include "src/cli/sampling_options.hpp"
 #include "src/cli/serve/asr_service.hpp"
+#include "src/cli/serve/collection_jobs.hpp"
 #include "src/cli/serve/embedding_service.hpp"
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/image_api.hpp"
@@ -664,6 +665,13 @@ void PrintServeHelp(std::string_view program_name,
         "and /v1/logit-bias/profiles/NAME (Qwen 27B, Flash-Next): add, "
         "replace and remove profiles while serving, until restart",
         "Server", &allow_profile_updates);
+    std::string collect_dir;
+    parser.AddOption(
+        "", "--collect-dir", "DIR",
+        "Flash-Next: enable /v1/abliteration/jobs, activation collection "
+        "jobs that run as low-priority work and write collections to "
+        "DIR/NAME",
+        "Server", &collect_dir);
 
     // Reasoning Defaults
     parser.AddOption(
@@ -986,6 +994,8 @@ int RunServe(std::span<const char* const> args) {
 
   std::shared_ptr<server::InferenceBackend> backend;
   bool allow_profile_updates = false;
+  std::string collect_dir;
+  std::shared_ptr<server::CollectionJobService> collection_jobs;
   std::shared_ptr<server::VideoJobService> video_jobs;
   std::shared_ptr<server::TtsService> tts;
   std::shared_ptr<server::AsrService> asr;
@@ -1334,6 +1344,12 @@ int RunServe(std::span<const char* const> args) {
         "replace and remove profiles while serving, until restart",
         "Server", &allow_profile_updates);
     llm_parser.AddOption(
+        "", "--collect-dir", "DIR",
+        "Flash-Next: enable /v1/abliteration/jobs, activation collection "
+        "jobs that run as low-priority work and write collections to "
+        "DIR/NAME",
+        "Server", &collect_dir);
+    llm_parser.AddOption(
         "", "--think", "MODE",
         "Default reasoning mode: on, off, or auto (default: model)",
         "Reasoning Defaults", &reasoning_mode);
@@ -1627,6 +1643,24 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: " << err << "\n";
       return 1;
     }
+    if (!collect_dir.empty()) {
+      auto runner = backend->collection_runner();
+      if (!runner) {
+        std::cerr << "Error: --collect-dir needs a Qwen3.8-Flash-Next model\n";
+        return 1;
+      }
+      std::error_code created;
+      std::filesystem::create_directories(collect_dir, created);
+      if (created || !std::filesystem::is_directory(collect_dir)) {
+        std::cerr << "Error: --collect-dir " << collect_dir
+                  << " is not a usable directory"
+                  << (created ? ": " + created.message() : "") << "\n";
+        return 1;
+      }
+      collection_jobs = std::make_shared<server::CollectionJobService>(
+          server::CollectionJobOptions{.root = collect_dir,
+                                       .runner = std::move(runner)});
+    }
     backend->set_model_ids(std::move(served_model_names));
     // As `gufo --version` prints it; CMake defines both for this target.
     backend->set_served_artifact(model,
@@ -1706,6 +1740,7 @@ int RunServe(std::span<const char* const> args) {
           .max_connections = max_connections,
           .api_key = std::move(api_key),
           .allow_profile_updates = allow_profile_updates,
+          .collection_jobs = collection_jobs,
           .on_device_lost =
               [&device_lost] {
                 device_lost.store(true);

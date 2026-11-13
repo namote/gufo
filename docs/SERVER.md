@@ -829,6 +829,103 @@ union bases are keyed by it, so a replaced profile with different bytes never
 restores or shares state cached under the old one, while an identical upload
 keeps sharing it.
 
+#### Activation collection jobs
+
+With `--collect-dir DIR`, a Flash-Next server collects steering and
+abliteration activations itself, on the loaded model, as keyed jobs that a
+client starts and polls. A job runs the records of
+`tools/qwen38_flash_next/abliteration/collect.cpp` in one of its modes and
+writes that tool's collection layout, so `fit_steering.py` and `prepare.py`
+read it unchanged.
+
+| Method | Path | Reply |
+| --- | --- | --- |
+| `POST` | `/v1/abliteration/jobs` | `{"job": KEY, "status": "queued"}` at once |
+| `GET` | `/v1/abliteration/jobs` | `{"object": "list", "data": [...]}`: every kept job, newest first, without results |
+| `GET` | `/v1/abliteration/jobs/{key}[?since=N]` | the job, with the results after sequence `N` (default 0) |
+| `DELETE` | `/v1/abliteration/jobs/{key}` | cancels a queued or running job (its state); forgets a finished one (`{"job": KEY, "deleted": true}`; files stay) |
+
+The start body is `{"operation": "collect", "mode": "collect|answers|segments",
+"name": NAME, "records": [...], "resume": false}`. Records are the JSON
+objects of collect.cpp's input lines for that mode (`id`, `split`, `group`,
+`text`, `thinking` for collect; `pair` and `answer` for answers; `segments`
+and `select` for segments). Every record is validated before the job is
+queued, as collect.cpp validates them, and also framed and tokenized: a
+record whose prompt exceeds 2048 tokens, or whose prompt and answer exceed
+the mode's context (collect 2048, answers 8192, segments 24576 tokens, or
+the server's `--context` when smaller), is refused with the rest of the job
+(400 `invalid_record`, naming the record). Record IDs must be unique.
+`name` follows the profile-name rule (1-64 letters, digits, `_`, `-`, `.`;
+not `.` or `..`). The job's key is 128 random bits in hex.
+
+A job's state: `status` (`queued`, `running`, `done`, `failed`,
+`cancelled`), `progress` (`done` and `total` records, and the current `step`,
+such as `record 3/40 a1b2: waiting for an idle scheduler`), `created_at`,
+`started_at`, `updated_at` (Unix seconds), `error` (null unless failed),
+`cancel_requested`, `numerics_deviations` (below), and with a key, `results`
+and `last_seq`. Each result is a finished record: `seq` (1, 2, ...), `id`,
+`group`, `pair` (null in collect mode), `rows` (rows averaged: 1, the answer
+tokens, or the selected segment rows), `activation_sha256`, `file`
+(`ID.f32`) and `resumed`. Poll with `?since=` the last `last_seq` to fetch
+only new results.
+
+Output: `DIR/NAME/manifest.json`, then per record `ID.f32` (FP32
+`[layers][hidden]`, little-endian) and its receipt `ID.json`, written as
+collect.cpp writes them (a temporary file, then a rename). The manifest has
+collect.cpp's members in its order; `executable_sha256` is the server's
+binary, `profile` is `off`, and `data_sha256` is the SHA-256 of the records
+as JSON lines (each record's compact JSON and a newline: equal to the tool's
+when its input file was written that way). An existing `NAME` is refused
+(409 `collection_exists`) unless the body sets `"resume": true`; a resumed
+job needs the same manifest (409 `collection_differs` otherwise, as
+collect.cpp refuses), reuses every record whose receipt and activation hash
+match (`resumed: true`) and fails on a record whose saved activation does not.
+A queued or running job's name is busy (409 `collection_busy`).
+
+Scheduling: one job runs at a time, the others queue in arrival order. A job
+runs one record at a time and each record one prefill pass at a time
+(`TextGenerationScheduler::RunWhenIdle`): a pass runs on the scheduler thread
+only when no request is admitted or queued. Chat requests always go first;
+one arriving during a pass waits for that pass only (at most 4224 rows). A
+collection pass never runs while a request generates, so a busy server
+collects nothing until it is idle. Collection uses its own session of the
+mode's context, allocated when the job's first pass runs and freed between
+steps when the job ends (refused when the device has less than its size
+plus 1 GiB free). That session is outside the serving memory plan: it stays
+allocated while chat requests run between passes, so leave room for it
+(up to a 24576-token session for segments) on a server near its device
+limit. No cache sees it: it never reads or writes the prompt,
+continuation, RAM or disk caches. Abliteration is OFF in it and logit bias
+does not apply (nothing is sampled).
+
+Numerics: the readout is collect.cpp's (each layer's post-layer residual,
+the mean over the HC streams in FP64, read out as FP32: the last prompt row,
+the answer rows' mean, or the selected rows' mean), with the same framing
+and teacher forcing. Its passes split the prompt exactly where collect.cpp's
+`Session::Sync` does (`Session::PrefillPassTokens`), so every pass has the
+rows the tool's has, on the same kernels. Bit equality with collect.cpp is
+therefore expected, not measured: it was not run on a GPU. It also assumes
+that load options collect.cpp does not set leave the trunk arithmetic alone:
+the server's larger model context (a larger prefill batch limit and
+scratch), an MTP sidecar (the collection session is autoregressive), the
+`--allow-profile-updates` row reservation and the loaded profiles (OFF in
+this session), and the decode concurrency. Settings known to change the
+arithmetic are reported in `numerics_deviations` (`kv-cache-type
+kvarn-k4v4`, `hc-mode q8-calibrated`, `yarn`, `context below 4224 tokens`,
+or a `--context` below the mode's, which refuses records the tool would
+take); with any of them the values are the server's own arithmetic, not the
+tool's.
+
+Errors: 400 (`invalid_json`, `unsupported_operation`, `invalid_mode`,
+`invalid_name`, `invalid_records`, `invalid_record`, `invalid_since`), 404
+`unknown_job`, 405, 409 (above), 429 `too_many_jobs`. Without the option
+these paths answer 404 like any unknown path; with `--api-key` they need the
+key. A start body may be up to 64 MiB, above `--max-request-bytes`, only with
+a valid key when one is set. The server keeps the last 64 jobs in memory
+(finished ones are forgotten oldest first to admit a new one; 429 when all
+64 are queued or running); their files stay on disk, and a restart forgets
+every job (resume it by name).
+
 Diagnostic telemetry is limited to status, token counts, timing, and
 cancellation state. It must not contain prompt text, model paths, machine
 identity, request IDs, or token IDs.
@@ -862,6 +959,8 @@ cache snapshots. HTTP handlers do not implement model kernels.
 | `GET` | `/metrics` | Prometheus-format operational metrics (text LLM serving only) |
 | `POST`, `DELETE` | `/v1/abliteration/profiles/{name}` | With `--allow-profile-updates`: [runtime abliteration profiles](#runtime-profile-updates) (Flash-Next) |
 | `POST`, `DELETE` | `/v1/logit-bias/profiles/{name}` | With `--allow-profile-updates`: [runtime logit-bias profiles](#logit-bias-profiles) |
+| `GET`, `POST` | `/v1/abliteration/jobs` | With `--collect-dir`: [activation collection jobs](#activation-collection-jobs) (Flash-Next) |
+| `GET`, `DELETE` | `/v1/abliteration/jobs/{key}` | With `--collect-dir`: poll, cancel or forget a [collection job](#activation-collection-jobs) |
 
 ### Other model services
 

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -175,6 +176,14 @@ public:
   /// throws. Throws std::runtime_error when the scheduler is stopping or its
   /// device is lost. Must not be called from the scheduler thread.
   void RunBetweenSteps(std::function<void()> task);
+  /// Low-priority work (in-server activation collection): queues `task` to
+  /// run on the scheduler thread only while no request is admitted or
+  /// queued, one task per idle turn, so a request arriving meanwhile waits
+  /// at most for the task already running. Tasks run in order. The future
+  /// reports the outcome; tasks still queued when the scheduler stops fail.
+  /// Throws std::runtime_error when the scheduler is stopping or its device
+  /// is lost.
+  [[nodiscard]] std::future<void> RunWhenIdle(std::function<void()> task);
   [[nodiscard]] std::size_t buffered_output_bytes() const noexcept;
   [[nodiscard]] std::size_t max_buffered_output_bytes() const noexcept;
 

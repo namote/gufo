@@ -24,6 +24,7 @@ class TtsService;
 class AsrService;
 class ImageService;
 class EmbeddingService;
+class CollectionJobService;
 class WebSocket;
 
 struct HttpRequest {
@@ -97,6 +98,9 @@ struct HttpServerOptions {
   /// `--allow-profile-updates`: POST/DELETE /v1/abliteration/profiles/{name}
   /// and /v1/logit-bias/profiles/{name}; without it those paths are 404.
   bool allow_profile_updates{false};
+  /// `--collect-dir`: the activation collection jobs
+  /// (/v1/abliteration/jobs); without them those paths are 404.
+  std::shared_ptr<CollectionJobService> collection_jobs{};
   std::chrono::milliseconds sse_heartbeat_interval{std::chrono::seconds(15)};
   /// Called once, on the listener or a request thread, when the text backend or
   /// the embedding service reports a lost device. Health, readiness and

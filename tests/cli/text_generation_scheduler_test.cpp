@@ -915,6 +915,69 @@ void TestRunBetweenStepsWaitsForThePass() {
          "the request completes around the task");
 }
 
+// RunWhenIdle (in-server activation collection) runs only while no request
+// is admitted or queued: a request in flight and one queued behind it both
+// finish before the task, and the task's exception reaches its future.
+void TestRunWhenIdleYieldsToRequests() {
+  auto control = SharedPrefixControl(false);
+  auto scheduler = MakeScheduler(control, 1);
+  std::thread::id ran;
+  scheduler->RunWhenIdle([&] { ran = std::this_thread::get_id(); }).get();
+  Expect(ran != std::thread::id{} && ran != std::this_thread::get_id(),
+         "an idle scheduler runs the task on its own thread");
+  bool rethrown = false;
+  try {
+    scheduler->RunWhenIdle([] { throw std::invalid_argument("failed pass"); })
+        .get();
+  } catch (const std::invalid_argument&) {
+    rethrown = true;
+  }
+  Expect(rethrown, "the task's exception reaches the future");
+  control->block_prefill_label = 1;
+  auto first = scheduler->Submit(SharedPrompt(10, 7000, 5), 2, 0.0F);
+  control->WaitForPrefill(1);
+  auto second =
+      scheduler->Submit(std::vector<TextRunnerToken>{2, 3, 4, 5}, 2, 0.0F);
+  std::atomic<bool> task_ran{false};
+  bool first_finished = false;
+  bool second_finished = false;
+  auto task = scheduler->RunWhenIdle([&] {
+    first_finished = first.phase() == TextRequestPhase::kTerminal;
+    second_finished = second.phase() == TextRequestPhase::kTerminal;
+    task_ran = true;
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  Expect(!task_ran.load(), "the task waits while a request runs");
+  control->ReleasePrefill();
+  task.get();
+  Expect(first_finished && second_finished,
+         "the running and the queued request finish before the task");
+  Expect(first.Wait().tokens == ExpectedTokens(1, 2) &&
+             second.Wait().tokens == ExpectedTokens(2, 2),
+         "both requests complete unchanged");
+  // A request arriving while a task runs is admitted before the next task.
+  std::promise<void> entered;
+  std::promise<void> leave;
+  auto hold = scheduler->RunWhenIdle([&] {
+    entered.set_value();
+    leave.get_future().wait();
+  });
+  entered.get_future().wait();
+  TextGenerationScheduler::Request third;
+  bool third_finished = false;
+  auto next = scheduler->RunWhenIdle(
+      [&] { third_finished = third.phase() == TextRequestPhase::kTerminal; });
+  third = scheduler->Submit(std::vector<TextRunnerToken>{3, 4, 5}, 2, 0.0F);
+  leave.set_value();
+  hold.get();
+  next.get();
+  Expect(third_finished,
+         "a request arriving during a task runs before the "
+         "next queued task");
+  Expect(third.Wait().tokens == ExpectedTokens(3, 2),
+         "the arrival completes unchanged");
+}
+
 // The leader is cancelled while the worker is still inside its first prefill
 // chunk, before the follower can be admitted, so the follower never waits.
 void TestLeaderCancelledBeforeFollowerIsAdmitted() {
@@ -4003,6 +4066,7 @@ void TestScoringReturnsRawLogprobsWithoutDecoding() {
 
 int main() {
   TestRunBetweenStepsWaitsForThePass();
+  TestRunWhenIdleYieldsToRequests();
   TestTokenLogprobs();
   TestScoringReturnsRawLogprobsWithoutDecoding();
   TestScoringRequestsShareAWorkUnit();

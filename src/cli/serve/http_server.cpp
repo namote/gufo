@@ -31,6 +31,7 @@
 #include "src/cli/serve/audio_asr_api.hpp"
 #include "src/cli/serve/audio_tts_api.hpp"
 #include "src/cli/serve/audio_websocket.hpp"
+#include "src/cli/serve/collection_jobs.hpp"
 #include "src/cli/serve/embedding_service.hpp"
 #include "src/cli/serve/embeddings_api.hpp"
 #include "src/cli/serve/image_api.hpp"
@@ -2564,6 +2565,13 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       return DeviceLost();
     return response;
   }
+  // Collection jobs exist only with --collect-dir; without it they are
+  // unknown paths, like any other.
+  if (options_.collection_jobs != nullptr && IsCollectionJobsPath(req.path)) {
+    if (req.method == "POST" && device_lost())
+      return DeviceLost();
+    return HandleCollectionJobsRequest(req, *options_.collection_jobs);
+  }
   // Runtime profile updates exist only with --allow-profile-updates; without
   // it they are unknown paths, like any other.
   if (options_.allow_profile_updates && backend_ != nullptr &&
@@ -2592,6 +2600,10 @@ std::size_t HttpServer::BodyLimit(const HttpRequest& req) const {
       IsAuthorized(req, api_key_hash_))
     return std::max(options_.max_request_body_bytes,
                     models::qwen::kAbliterationMaxProfileBytes);
+  // A collection job carries its records; only an authorized one that much.
+  if (options_.collection_jobs != nullptr && req.method == "POST" &&
+      req.path == "/v1/abliteration/jobs" && IsAuthorized(req, api_key_hash_))
+    return std::max(options_.max_request_body_bytes, kMaxCollectionJobBytes);
   return options_.max_request_body_bytes;
 }
 

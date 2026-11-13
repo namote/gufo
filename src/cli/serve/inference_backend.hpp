@@ -36,6 +36,8 @@ class QwenTokenizer;
 
 namespace gufo::server {
 
+class CollectionRunner;
+
 enum class TextSpeculativeBackend : std::uint8_t {
   kDisabled,
   kDFlash,
@@ -150,6 +152,10 @@ public:
   /// `--allow-profile-updates`: Flash-Next reserves device rows for runtime
   /// abliteration profile updates. Call before load.
   void set_profile_updates(bool enabled);
+  /// `--collect-dir`: in-server activation collection on the loaded
+  /// Qwen3.8-Flash-Next model (low-priority scheduler work); null for other
+  /// models. Call after load.
+  [[nodiscard]] std::shared_ptr<CollectionRunner> collection_runner() const;
   AbliterationInfo put_abliteration_profile(std::string_view name,
                                             std::string_view body) override;
   AbliterationInfo delete_abliteration_profile(std::string_view name) override;

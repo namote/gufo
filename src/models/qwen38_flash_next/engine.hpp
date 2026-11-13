@@ -400,6 +400,12 @@ public:
   /// its last row, or with `all_rows` every row.
   void SetActivationObserver(ActivationObserver observer,
                              bool all_rows = false);
+  /// The tokens the next pass of a Sync takes when `remaining` tokens follow
+  /// the session's own (no checkpoint): Sync of the session's tokens plus
+  /// exactly that many runs that one pass, so a caller may split one Sync
+  /// into several at its pass boundaries without changing any pass (the
+  /// in-server collector runs one pass per scheduler turn). Zero for zero.
+  [[nodiscard]] std::size_t PrefillPassTokens(std::size_t remaining) const;
   /// A new request reusing cached context starts its own acceptance history.
   void ResetDraftPolicy();
 
@@ -472,6 +478,9 @@ private:
   bool SyncThroughComponents(std::span<const std::int32_t>, std::uint32_t,
                              const PrefillCapture&, std::string*);
 
+  /// The tokens Feed's next pass takes when `remaining` follow tokens_.
+  [[nodiscard]] std::size_t PassTokens(std::size_t remaining,
+                                       bool prefill) const;
   bool Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
             bool prefill = false, std::uint32_t boundary = 0,
             std::unique_ptr<SessionSnapshot>* checkpoint = nullptr,

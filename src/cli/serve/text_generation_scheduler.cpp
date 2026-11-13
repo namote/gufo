@@ -2540,10 +2540,17 @@ struct TextGenerationScheduler::Impl {
       if (device_lost.load(std::memory_order_acquire))
         break;
       if (prefilling.empty() && decoding.empty()) {
+        // Low-priority work (RunWhenIdle) runs only here, with no request
+        // admitted, capturing or queued: one task, then admission again.
+        const bool idle =
+            capturing.empty() && waiting.empty() && kv_waiting.empty();
+        if (idle && RunIdleTask())
+          continue;
         std::unique_lock<std::mutex> lock(queue_mutex);
         const auto wake = [&] {
           return stop_token.stop_requested() || stopping ||
                  !between_steps.empty() ||
+                 (idle && !idle_tasks.empty() && queued_count == 0) ||
                  (queued_count != 0 &&
                   capturing.size() + waiting.size() + kv_waiting.size() <
                       runner_pool->capacity());
@@ -2799,6 +2806,9 @@ struct TextGenerationScheduler::Impl {
       const std::lock_guard<std::mutex> lock(queue_mutex);
       between_steps_closed = true;
       abandoned.swap(between_steps);
+      for (auto& task : idle_tasks)
+        abandoned.push_back(std::move(task));
+      idle_tasks.clear();
     }
     for (auto& task : abandoned)
       task.done.set_exception(std::make_exception_ptr(std::runtime_error(
@@ -2825,6 +2835,30 @@ struct TextGenerationScheduler::Impl {
     }
   }
 
+  /// Runs the oldest RunWhenIdle task when no request is queued; the
+  /// caller has checked that none is admitted. False when none ran.
+  bool RunIdleTask() {
+    BetweenStepsTask task;
+    {
+      const std::lock_guard<std::mutex> lock(queue_mutex);
+      if (idle_tasks.empty() || queued_count != 0)
+        return false;
+      task = std::move(idle_tasks.front());
+      idle_tasks.pop_front();
+    }
+    // A pass (up to a full prefill chunk) counts as progress before and
+    // after, like a work unit.
+    progress.fetch_add(1, std::memory_order_relaxed);
+    try {
+      task.run();
+      task.done.set_value();
+    } catch (...) {
+      task.done.set_exception(std::current_exception());
+    }
+    progress.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+
   std::weak_ptr<ScheduledRequest> kv_guarantor;
   std::shared_ptr<TextRunnerPool> runner_pool;
   TextPrefillPolicy prefill_policy;
@@ -2849,6 +2883,8 @@ struct TextGenerationScheduler::Impl {
   };
   /// RunBetweenSteps tasks (queue_mutex); closed once the loop has ended.
   std::deque<BetweenStepsTask> between_steps;
+  /// RunWhenIdle tasks (queue_mutex), closed with between_steps.
+  std::deque<BetweenStepsTask> idle_tasks;
   bool between_steps_closed{false};
   std::atomic<bool> device_lost{false};
   const std::exception_ptr device_lost_failure =
@@ -3059,6 +3095,22 @@ void TextGenerationScheduler::RunBetweenSteps(std::function<void()> task) {
   }
   impl_->queue_condition.notify_all();
   done.get();
+}
+
+std::future<void> TextGenerationScheduler::RunWhenIdle(
+    std::function<void()> task) {
+  std::future<void> done;
+  {
+    const std::lock_guard<std::mutex> lock(impl_->queue_mutex);
+    if (impl_->stopping || impl_->between_steps_closed ||
+        impl_->device_lost.load(std::memory_order_acquire))
+      throw std::runtime_error("text generation scheduler is not running");
+    Impl::BetweenStepsTask entry{std::move(task), {}};
+    done = entry.done.get_future();
+    impl_->idle_tasks.push_back(std::move(entry));
+  }
+  impl_->queue_condition.notify_all();
+  return done;
 }
 
 const TextModelRunner& TextGenerationScheduler::runner() const noexcept {
