@@ -345,6 +345,36 @@
       - At k ≥ 1 the output degenerates into repetition (for example "뒤 뒤 … … …" or runs of backticks).
       - **The k 0.5 gain is length, not care.** Five of the seven differing problems are base answers truncated at 600 tokens (date-08, math-12, parse-08, parse-09) that k 0.5 finishes, and parse-03 gains 5 tests. date-05 and parse-13 each lose one test. All-pass is unchanged, and raise/isinstance markers stay ≥92%. The direction mostly encodes "shorter, like the references", which is the length confound expected in stage 1.
     - **Not adopted.** To steer care rather than length, the pairs need length-matched references, or the direction must be fitted on edge-case code tokens only. Also judge with a larger token cap so truncation does not decide.
+  - **R5b (instruction-distilled coding steering; `build/b1/r5b/`, November 13).** Sets: r5-coding (105) and the new r5-trap (63 trap-heavy problems in `build/b1/r5-trap/`; all 63 naive solutions fail only through their trap). Greedy, thinking off, 2,000 tokens. Instruction runs used live production with abliteration off; steering used runtime-20261112b's eval server.
+    - **Instruction ceiling** (all-pass):
+
+      | Set | 600-token base | base | concise | trap check | both |
+      |---|---:|---:|---:|---:|---:|
+      | r5-coding (105) | 81 | 88 | 83 | **91** | 87 |
+      | r5-trap (63) | | 57 | 52 | **59** | 54 |
+
+      - The 2,000-token cap alone fixes 7 of the 600-token failures (truncation).
+      - The trap-check instruction fixes month ends, non-ASCII digits and deep nesting (7 fixed, 4 broken on r5-coding).
+      - The concise instruction removes needed checks and loses dates and strings. Answers drop from 1,566 to 729 characters.
+    - **Directions** (`dir/`): the same instructed answer, teacher-forced under instruction+prompt versus the bare prompt (instruction prepended to the user turn; the collector has no system role). Mean over answer tokens, 90 pairs (direction splits).
+      - Held-out pairs separate 90/90 at every layer. The per-layer increments sum to 1.19 (trap) and 4.82 (concise).
+      - The cosine between trap and concise is 0.3–0.46 in L0–L27 (a shared "an instruction is present" component) and −0.02 to 0.13 from L33.
+    - **Strength grid** (strength splits, 35 problems; base 30, trap instruction 31):
+
+      | Setting | All-pass | Median chars | Truncated |
+      |---|---:|---:|---:|
+      | trap ×1 | 31 | 1403 | 1 |
+      | trap ×2 | 31 | 1673 | 1 |
+      | trap ×4 | 21 | 2167 | 8 |
+      | trap ×2, L≥33 only | 29 | 1519 | 1 |
+      | trap ×2 + concise ×0.5, L≥33 | 29 | 1269 | 0 |
+
+      - ×4 over-checks: answers get longer and are truncated.
+      - Late layers alone are worse, so the middle layers carry part of the effect.
+    - **Held-out eval** (43 problems): base 40, trap instruction 41, **trap ×1 41**, trap ×2 40, concise instruction 37. On dev+eval combined (78): base 70, instruction 72, trap ×1 72.
+      - **The direction matches its instruction without the instruction tokens.** But the gain over base (+1–2 problems) is within noise: the model already passes about 90%.
+    - **Ordinary check** (14 prompts, trap ×1/×2 versus OFF): all math is correct, meth is still refused, and daily, summary and translation answers keep their content (lengths vary ±30%).
+    - **Not adopted yet.** It needs harder problems to show a margin, and a coding detector so that it acts only on coding prompts.
   - **Combined profile for the English Tiananmen gap** (not measured): `dynamic/profiles-pol-fnx2/` holds `pol-avg` (byte-identical to production's except `trigger.with: ["fnx"]`, threshold 0.7) and production's `fnx` (no trigger). A pol-avg detection then turns both ON; where both have strength at a site, they project onto the orthonormal union of their directions with the larger strength (docs/SERVER.md, several profiles).
   - **Threshold 0.7 for `dynamic/profiles-pol/`** (signed off; `fit_trigger.py --threshold 0.7`, the fitted 1.199 kept in the report as `fitted_threshold`, evidence `dynamic/fit-pol-0.7.json`):
     - Offline at 0.7: recall 92.1%; false positives 4.2% on the hard political controls (Gwangju, Tiananmen-like events elsewhere) and 1.3% on harmless prompts.
