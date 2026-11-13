@@ -173,6 +173,15 @@ __global__ void TokenSetBiasKernel(float* __restrict__ logits,
     logits[index] += bias;
 }
 
+__global__ void DenseLogitBiasKernel(float* __restrict__ logits,
+                                     const float* __restrict__ bias,
+                                     std::size_t vocab_size) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < vocab_size)
+    logits[index] += bias[index];
+}
+
 __global__ void ApplySparsePenaltiesKernel(
     float* __restrict__ logits,
     const sampling::TokenPenalty* __restrict__ penalties,
@@ -1298,6 +1307,83 @@ void LaunchTokenSetBias(float* logits, const std::uint32_t* tokens,
                                                       vocab_size);
 }
 
+DeviceLogitBias::~DeviceLogitBias() {
+  Release();
+}
+
+void DeviceLogitBias::Release() noexcept {
+  for (float** buffer : {&reasoning_buffer_, &answer_buffer_}) {
+    if (*buffer != nullptr)
+      (void)hipFree(*buffer);
+    *buffer = nullptr;
+  }
+  reasoning_ = nullptr;
+  answer_ = nullptr;
+  source_.reset();
+}
+
+DeviceLogitBias::Rows DeviceLogitBias::Get(
+    const std::shared_ptr<const sampling::LogitBias>& bias,
+    std::size_t vocab_size, hipStream_t stream) {
+  if (bias == nullptr || vocab_size == 0)
+    return {};
+  if (bias == source_ && vocab_size == vocab_size_)
+    return {reasoning_, answer_};
+  // The previous rows may still be read by queued work.
+  HIP_CHECK(hipStreamSynchronize(stream));
+  source_.reset();
+  reasoning_ = nullptr;
+  answer_ = nullptr;
+  if (vocab_size != vocab_size_) {
+    Release();
+    vocab_size_ = vocab_size;
+  }
+  // Both buffers stay allocated across combinations: a new combination only
+  // overwrites them.
+  const auto upload = [&](const std::vector<float>* host,
+                          float** buffer) -> float* {
+    if (host == nullptr)
+      return nullptr;
+    if (*buffer == nullptr)
+      HIP_CHECK(hipMalloc(buffer, vocab_size * sizeof(float)));
+    staging_.assign(vocab_size, 0.0F);
+    std::copy_n(host->begin(), std::min(vocab_size, host->size()),
+                staging_.begin());
+    HIP_CHECK(hipMemcpyAsync(*buffer, staging_.data(),
+                             vocab_size * sizeof(float), hipMemcpyHostToDevice,
+                             stream));
+    HIP_CHECK(hipStreamSynchronize(stream));
+    return *buffer;
+  };
+  reasoning_ = upload(bias->reasoning.get(), &reasoning_buffer_);
+  answer_ = bias->answer == bias->reasoning
+                ? reasoning_
+                : upload(bias->answer.get(), &answer_buffer_);
+  source_ = bias;
+  return {reasoning_, answer_};
+}
+
+const float* DeviceLogitBias::Row(
+    const std::shared_ptr<const sampling::LogitBias>& bias,
+    const std::vector<float>* phase, std::size_t vocab_size,
+    hipStream_t stream) {
+  if (bias == nullptr || phase == nullptr)
+    return nullptr;
+  const auto rows = Get(bias, vocab_size, stream);
+  return phase == bias->reasoning.get() ? rows.reasoning : rows.answer;
+}
+
+void LaunchDenseLogitBias(float* logits, const float* bias,
+                          std::size_t vocab_size, hipStream_t stream) {
+  if (logits == nullptr || bias == nullptr || vocab_size == 0)
+    throw std::invalid_argument("invalid dense logit bias launch");
+  DenseLogitBiasKernel<<<static_cast<unsigned int>(
+                             (vocab_size + kSamplingThreads - 1U) /
+                             kSamplingThreads),
+                         kSamplingThreads, 0, stream>>>(logits, bias,
+                                                        vocab_size);
+}
+
 void LaunchGPUSampling(const float* logits, std::uint32_t* out_token,
                        std::size_t vocab_size,
                        const GpuSamplingParameters& parameters,
@@ -1316,11 +1402,12 @@ void LaunchGPUSampling(const float* logits, std::uint32_t* out_token,
   const bool has_penalties = penalty_count > 0;
   const bool has_han =
       parameters.han_bias != 0.0F && parameters.han_tokens != nullptr;
+  const bool has_bias = parameters.logit_bias != nullptr;
   const bool needs_ordering =
       parameters.top_k > 0 || parameters.top_p < 1.0F ||
       (parameters.min_p > 0.0F && parameters.min_keep > 1);
   const float* sampling_logits = logits;
-  if (has_penalties || has_han || needs_ordering) {
+  if (has_penalties || has_han || has_bias || needs_ordering) {
     const std::size_t blocks =
         (vocab_size + kSamplingThreads - 1U) / kSamplingThreads;
     PrepareSamplingKernel<<<static_cast<unsigned int>(blocks), kSamplingThreads,
@@ -1344,6 +1431,9 @@ void LaunchGPUSampling(const float* logits, std::uint32_t* out_token,
   if (has_han)
     LaunchTokenSetBias(workspace->adjusted_logits, parameters.han_tokens,
                        parameters.han_bias, vocab_size, stream);
+  if (has_bias)
+    LaunchDenseLogitBias(workspace->adjusted_logits, parameters.logit_bias,
+                         vocab_size, stream);
 
   if (parameters.temperature <= 0.0F) {
     LaunchGPUArgmax(sampling_logits, out_token, vocab_size, stream);
@@ -1405,11 +1495,12 @@ void LaunchGPUSpeculativeSampling(
   const bool has_penalties = penalty_count > 0;
   const bool has_han =
       parameters.han_bias != 0.0F && parameters.han_tokens != nullptr;
+  const bool has_bias = parameters.logit_bias != nullptr;
   const bool needs_ordering =
       parameters.top_k > 0 || parameters.top_p < 1.0F ||
       (parameters.min_p > 0.0F && parameters.min_keep > 1);
   const float* sampling_logits = logits;
-  if (has_penalties || has_han || needs_ordering) {
+  if (has_penalties || has_han || has_bias || needs_ordering) {
     const std::size_t blocks =
         (vocab_size + kSamplingThreads - 1U) / kSamplingThreads;
     PrepareSamplingKernel<<<static_cast<unsigned int>(blocks), kSamplingThreads,
@@ -1433,6 +1524,9 @@ void LaunchGPUSpeculativeSampling(
   if (has_han)
     LaunchTokenSetBias(workspace->adjusted_logits, parameters.han_tokens,
                        parameters.han_bias, vocab_size, stream);
+  if (has_bias)
+    LaunchDenseLogitBias(workspace->adjusted_logits, parameters.logit_bias,
+                         vocab_size, stream);
 
   if (needs_ordering) {
     SortSamplingLogits(workspace, SamplingTopCount(parameters, vocab_size),

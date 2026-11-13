@@ -79,19 +79,25 @@ double Penalize(double logit, const SamplingConfig& config,
   return logit;
 }
 
-/// Adds the Han offset (SamplingConfig::han_bias) to a penalized logit.
+/// Adds the Han offset (SamplingConfig::han_bias) and then the phase's
+/// logit-bias offset (SamplerState::logit_bias; null adds none) to a
+/// penalized logit.
 double ScaleHan(double logit, TokenId token, const SamplingConfig& config,
-                double han_bias) noexcept {
-  return han_bias != 0 && config.han_tokens->Contains(token) ? logit + han_bias
-                                                             : logit;
+                double han_bias, const std::vector<float>* bias) noexcept {
+  if (han_bias != 0 && config.han_tokens->Contains(token))
+    logit += han_bias;
+  if (bias != nullptr && token < bias->size())
+    logit += static_cast<double>((*bias)[token]);
+  return logit;
 }
 
 /// Candidate tokens index `token_ids` when it is nonempty (compact rows).
 void ApplyPenalties(std::vector<Candidate>* candidates,
                     const SamplingConfig& config,
                     std::span<const TokenPenalty> penalties, double han_bias,
+                    const std::vector<float>* bias,
                     std::span<const TokenId> token_ids = {}) {
-  if (penalties.empty() && han_bias == 0)
+  if (penalties.empty() && han_bias == 0 && bias == nullptr)
     return;
   for (auto& candidate : *candidates) {
     const auto found = std::ranges::lower_bound(penalties, candidate.token, {},
@@ -101,7 +107,7 @@ void ApplyPenalties(std::vector<Candidate>* candidates,
     candidate.logit = ScaleHan(
         candidate.logit,
         token_ids.empty() ? candidate.token : token_ids[candidate.token],
-        config, han_bias);
+        config, han_bias, bias);
   }
 }
 
@@ -304,7 +310,8 @@ double SamplingConfig::han_bias() const noexcept {
 bool SamplingConfig::penalties_enabled() const noexcept {
   return repeat_penalty != 1.0F || frequency_penalty != 0.0F ||
          presence_penalty != 0.0F ||
-         (han_scale != 1.0F && han_tokens && han_tokens->count != 0);
+         (han_scale != 1.0F && han_tokens && han_tokens->count != 0) ||
+         logit_bias_active();
 }
 
 bool SamplingConfig::uses_random_sampling() const noexcept {
@@ -453,7 +460,7 @@ TokenId SamplingDistribution::SampleResidual(
 static SamplingDistribution DistributionWithPenalties(
     std::span<const float> logits, const SamplingConfig& config,
     std::span<const TokenPenalty> penalties, double han_bias,
-    std::span<const TokenId> token_ids = {}) {
+    const std::vector<float>* bias, std::span<const TokenId> token_ids = {}) {
   config.Validate();
   if (logits.empty()) {
     throw std::invalid_argument("cannot sample an empty logit distribution");
@@ -477,7 +484,7 @@ static SamplingDistribution DistributionWithPenalties(
     throw std::runtime_error("logit distribution contains no finite values");
   }
 
-  ApplyPenalties(&candidates, config, penalties, han_bias, token_ids);
+  ApplyPenalties(&candidates, config, penalties, han_bias, bias, token_ids);
   ApplyTopK(&candidates, config);
   if (config.temperature == 0.0F) {
     return SamplingDistribution(
@@ -530,8 +537,10 @@ SamplingDistribution BuildDistribution(
   for (const auto& [token, penalty] : counts)
     penalties.push_back(penalty);
   std::ranges::sort(penalties, {}, &TokenPenalty::token);
-  return DistributionWithPenalties(logits, config, penalties,
-                                   config.han_bias());
+  // Without a reasoning budget the whole reply is the answer.
+  return DistributionWithPenalties(
+      logits, config, penalties, config.han_bias(),
+      config.logit_bias ? config.logit_bias->answer.get() : nullptr);
 }
 
 SamplerState::SamplerState(SamplingConfig config,
@@ -592,9 +601,9 @@ SamplerState SamplerState::WithoutConstraint() const {
   auto copy = *this;
   copy.config_.constraint.reset();
   copy.constraint_mask_.reset();
-  // A scoped Han offset changes where reasoning ends, which a grammar may
-  // decide. Keep its state to follow that end; drop it otherwise.
-  if (reasoning_scoped_ && InReasoning() && config_.constraint)
+  // A scoped Han offset or logit bias changes where reasoning ends, which
+  // a grammar may decide. Keep its state to follow that end; drop it otherwise.
+  if (phase_scoped() && InReasoning() && config_.constraint)
     copy.reasoning_grammar_ = config_.constraint;
   if (!copy.reasoning_grammar_)
     copy.constraint_state_.clear();
@@ -889,7 +898,7 @@ SamplingDistribution SamplerState::Distribution(
     }
   }
   return DistributionWithPenalties(logits, config_, penalties, han_bias(),
-                                   token_ids);
+                                   logit_bias(), token_ids);
 }
 
 void SamplerState::DeferSample(TokenId token) {
@@ -985,12 +994,15 @@ double SamplerState::AdjustedLogit(TokenId token, float logit) const noexcept {
   return ScaleHan(found == penalty_counts_.end() || found->token != token
                       ? static_cast<double>(logit)
                       : Penalize(logit, config_, *found),
-                  token, config_, han_bias());
+                  token, config_, han_bias(), logit_bias());
 }
 
 TokenId SamplerState::SampleGreedy(std::span<const float> logits) const {
-  // The Han offset is never positive, so a block maximum still bounds it.
+  // The Han offset is never positive, so a block maximum plus the largest
+  // positive logit-bias offset still bounds every adjusted logit.
   const double han_bias = this->han_bias();
+  const auto* const bias = logit_bias();
+  const double bias_max = logit_bias_max();
   double best_logit = -std::numeric_limits<double>::infinity();
   TokenId best_token = 0;
   bool found = false;
@@ -1002,7 +1014,8 @@ TokenId SamplerState::SampleGreedy(std::span<const float> logits) const {
     // An unpenalized block that cannot exceed the best value is skipped; an
     // equal later value never replaces the earlier token.
     if (found && (penalty == penalty_counts_.end() || penalty->token >= end) &&
-        static_cast<double>(BlockMaximum(logits.subspan(begin, end - begin))) <=
+        static_cast<double>(BlockMaximum(logits.subspan(begin, end - begin))) +
+                bias_max <=
             best_logit)
       continue;
     for (std::size_t index = begin; index < end; ++index) {
@@ -1017,7 +1030,7 @@ TokenId SamplerState::SampleGreedy(std::span<const float> logits) const {
           ScaleHan(penalty != penalty_counts_.end() && penalty->token == index
                        ? Penalize(logits[index], config_, *penalty)
                        : static_cast<double>(logits[index]),
-                   static_cast<TokenId>(index), config_, han_bias);
+                   static_cast<TokenId>(index), config_, han_bias, bias);
       if (!std::isfinite(adjusted)) {
         throw std::runtime_error(
             "sampling penalties produced a non-finite logit");
@@ -1043,7 +1056,8 @@ TokenId SamplerState::SampleConstrainedGreedy(
         "JSON constraint vocabulary differs from logits");
   // Read the mask directly: greedy constraints need neither a copied vocabulary
   // of masked logits nor a cloned sampler/history. Preserve token-ID tie order.
-  const bool adjusted = !penalty_counts_.empty() || han_bias() != 0;
+  const bool adjusted =
+      !penalty_counts_.empty() || han_bias() != 0 || logit_bias() != nullptr;
   double best_logit = -std::numeric_limits<double>::infinity();
   TokenId best_token = 0;
   bool found = false;
@@ -1071,7 +1085,8 @@ SamplingDistribution SamplerState::LinearDistribution(
   std::vector<Probability> candidates;
   candidates.reserve(logits.size());
   double maximum = -std::numeric_limits<double>::infinity();
-  const bool adjusted = !penalty_counts_.empty() || han_bias() != 0;
+  const bool adjusted =
+      !penalty_counts_.empty() || han_bias() != 0 || logit_bias() != nullptr;
   for (std::size_t i = 0; i < logits.size(); ++i) {
     if (!std::isfinite(logits[i]))
       continue;
@@ -1104,9 +1119,12 @@ SamplingDistribution SamplerState::LinearDistribution(
 
 void SamplerState::PrepareSelected(std::span<const float> logits) {
   candidate_scratch_.clear();
-  // A block skip below compares the raw block maximum: the Han offset is
-  // never positive, so that maximum still bounds every adjusted logit.
+  // A block skip below compares the raw block maximum plus the largest
+  // positive logit-bias offset: the Han offset is never positive, so that
+  // sum still bounds every adjusted logit.
   const double han_bias = this->han_bias();
+  const auto* const bias = logit_bias();
+  const double bias_max = logit_bias_max();
   // Vocabulary IDs and sparse penalties are both sorted. Walk them together
   // instead of searching the penalties for every vocabulary entry.
   const auto adjusted_at = [&](std::size_t index, auto& penalty) {
@@ -1114,10 +1132,10 @@ void SamplerState::PrepareSelected(std::span<const float> logits) {
       ++penalty;
     if (penalty == penalty_counts_.end() || penalty->token != index)
       return ScaleHan(static_cast<double>(logits[index]),
-                      static_cast<TokenId>(index), config_, han_bias);
+                      static_cast<TokenId>(index), config_, han_bias, bias);
     const double adjusted =
         ScaleHan(Penalize(logits[index], config_, *penalty),
-                 static_cast<TokenId>(index), config_, han_bias);
+                 static_cast<TokenId>(index), config_, han_bias, bias);
     if (!std::isfinite(adjusted)) {
       throw std::runtime_error(
           "sampling penalties produced a non-finite logit");
@@ -1166,7 +1184,8 @@ void SamplerState::PrepareSelected(std::span<const float> logits) {
       if (candidate_scratch_.size() == limit &&
           (penalty == penalty_counts_.end() || penalty->token >= end)) {
         const float maximum = BlockMaximum(logits.subspan(begin, end - begin));
-        if (static_cast<double>(maximum) <= candidate_scratch_.front().value)
+        if (static_cast<double>(maximum) + bias_max <=
+            candidate_scratch_.front().value)
           continue;
       }
       for (std::size_t index = begin; index < end; ++index)

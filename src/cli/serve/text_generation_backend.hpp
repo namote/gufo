@@ -17,6 +17,7 @@
 
 #include "src/cli/serve/component_cache_metrics.hpp"
 #include "src/cli/serve/logprobs.hpp"
+#include "src/core/logit_bias.hpp"
 #include "src/core/reasoning.hpp"
 #include "src/core/sampling.hpp"
 #include "src/core/text_sampling_defaults.hpp"
@@ -426,6 +427,13 @@ public:
   /// Whether requests apply SamplingConfig::han_scale (Qwen 27B and
   /// Flash-Next, whose runners build a Han token set).
   [[nodiscard]] virtual bool supports_han_scale() const { return false; }
+  /// The loaded logit-bias profiles (`--logit-bias-profiles`, possibly none)
+  /// and the vocabulary that request logit biases index; null where the
+  /// samplers cannot apply them (every runner without the Han scale).
+  [[nodiscard]] virtual std::shared_ptr<const sampling::LogitBiasCatalog>
+  logit_bias_catalog() const {
+    return nullptr;
+  }
   /// Whether chat requests may set `score_assistant` (teacher-forced
   /// logprobs of the final assistant message instead of generation).
   [[nodiscard]] virtual bool supports_scoring() const { return false; }

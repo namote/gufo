@@ -611,12 +611,15 @@ __device__ __forceinline__ void FinalizeSelector(
   }
 
   // A reasoning end proposed earlier in this block starts the answer.
-  float han_bias = sampling.han_bias;
-  for (uint32_t i = 0; i < previous_count && han_bias != sampling.han_answer_bias;
-       ++i)
+  bool answered = false;
+  for (uint32_t i = 0; i < previous_count && !answered; ++i)
     for (uint32_t end = 0; end < sampling.han_end_count; ++end)
       if (previous_tokens[i] == sampling.han_ends[end])
-        han_bias = sampling.han_answer_bias;
+        answered = true;
+  const float han_bias =
+      answered ? sampling.han_answer_bias : sampling.han_bias;
+  const float* const logit_bias =
+      answered ? sampling.answer_logit_bias : sampling.logit_bias;
 
   float best_score = -INFINITY;
   uint32_t best_index = 0;
@@ -671,6 +674,8 @@ __device__ __forceinline__ void FinalizeSelector(
     if (sampling.han_tokens != nullptr &&
         ((sampling.han_tokens[id / 32U] >> (id % 32U)) & 1U))
       score += han_bias;
+    if (logit_bias != nullptr)
+      score += logit_bias[id];
     path_scores[candidate_index] = score;
     if (score > best_score) {
       best_score = score;

@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -59,11 +60,37 @@ enum class HanScaleScope : std::uint8_t { kAll, kAnswer };
     std::string_view text) noexcept;
 [[nodiscard]] std::string_view HanScaleScopeName(HanScaleScope scope) noexcept;
 
+/// Additive logit offsets of a request's logit-bias sets (serve
+/// --logit-bias-profiles, request logit_bias_profiles and logit_bias),
+/// dense per reply phase and indexed by vocabulary token. A null phase adds
+/// nothing there. Built once per selected combination
+/// (src/core/logit_bias.hpp) and shared by every sampler of a request.
+struct LogitBias {
+  /// Offsets while the reply is in its reasoning phase (sets with scope
+  /// all or reasoning).
+  std::shared_ptr<const std::vector<float>> reasoning;
+  /// Offsets after reasoning ends, and in replies without a reasoning phase
+  /// (sets with scope all or answer).
+  std::shared_ptr<const std::vector<float>> answer;
+  /// The largest offset of each phase, or zero when none is positive: a
+  /// raw block maximum plus this bounds every offset logit of the block.
+  float reasoning_max{0.0F};
+  float answer_max{0.0F};
+  /// Canonical description of the combination (cache key, traces).
+  std::string key;
+
+  /// Whether the offsets differ between the phases, so samplers must track
+  /// where reasoning ends (an unlimited ReasoningBudget).
+  [[nodiscard]] bool phase_dependent() const noexcept {
+    return reasoning != answer;
+  }
+};
+
 /// Model-independent controls for selecting a token from a logit row.
 ///
-/// Filters run in this order: penalties, Han scale, temperature, top-k,
-/// top-p, min-p. The defaults preserve Gufo's existing greedy decoding
-/// behavior.
+/// Filters run in this order: penalties, Han scale, logit bias, temperature,
+/// top-k, top-p, min-p. The defaults preserve Gufo's existing greedy
+/// decoding behavior.
 struct SamplingConfig {
   /// Observational raw target log probabilities; null disables collection.
   std::optional<std::uint32_t> logprobs;
@@ -97,6 +124,9 @@ struct SamplingConfig {
   /// phase (SamplerState::han_bias). That phase is tracked only when
   /// reasoning_budget is set; without it the whole reply is the answer.
   HanScaleScope han_scale_scope{HanScaleScope::kAll};
+  /// The request's logit-bias offsets, added after the Han offset; null
+  /// adds none. Only runners whose samplers apply the Han scale accept them.
+  std::shared_ptr<const LogitBias> logit_bias{};
 
   void Validate() const;
 
@@ -104,9 +134,13 @@ struct SamplingConfig {
   /// when the scale is inactive. Never positive. SamplerState::han_bias is
   /// the offset at the sampler's position, which han_scale_scope can zero.
   [[nodiscard]] double han_bias() const noexcept;
-  /// True when penalties or the Han scale adjust logits before filtering.
-  /// Fast paths that take an unmodified argmax or skip the adjustment must
-  /// treat both alike.
+  /// Whether a logit-bias set is active in either phase.
+  [[nodiscard]] bool logit_bias_active() const noexcept {
+    return logit_bias && (logit_bias->reasoning || logit_bias->answer);
+  }
+  /// True when penalties, the Han scale or a logit bias adjust logits
+  /// before filtering. Fast paths that take an unmodified argmax or skip
+  /// the adjustment must treat all three alike.
   [[nodiscard]] bool penalties_enabled() const noexcept;
   [[nodiscard]] bool uses_random_sampling() const noexcept;
   [[nodiscard]] bool can_use_unmodified_argmax() const noexcept;
@@ -188,12 +222,12 @@ public:
 
   [[nodiscard]] const SamplingConfig& config() const noexcept;
   /// Draft q may remain unconstrained; target p always uses this request's
-  /// grammar. While a scoped Han offset depends on the reasoning phase, the
-  /// copy keeps following the grammar's end of reasoning (a close spelled
-  /// as text), so each tentative row's offset matches the target's; a
-  /// token the grammar rejects ends that tracking in the copy. Once the
-  /// copy's reasoning ends it drops the grammar, so ResetHistory on such a
-  /// copy tracks only end tokens.
+  /// grammar. While a scoped Han offset or logit bias (phase_scoped)
+  /// depends on the reasoning phase, the copy keeps following the grammar's
+  /// end of reasoning (a close spelled as text), so each tentative row's
+  /// offset matches the target's; a token the grammar rejects ends that
+  /// tracking in the copy. Once the copy's reasoning ends it drops the
+  /// grammar, so ResetHistory on such a copy tracks only end tokens.
   [[nodiscard]] SamplerState WithoutConstraint() const;
   /// A finite argmax can bypass downloading logits if it satisfies the grammar.
   /// Set penalties_applied only for a winner computed with this state's exact
@@ -221,6 +255,27 @@ public:
   /// each GPU row uses the value of the state that samples it.
   [[nodiscard]] double han_bias() const noexcept {
     return reasoning_scoped_ && InReasoning() ? 0 : han_bias_;
+  }
+  /// The logit-bias offsets of the next token's phase (vocabulary-indexed),
+  /// or null when none apply there. Every sampling path and each GPU row
+  /// uses the offsets of the state that samples it.
+  [[nodiscard]] const std::vector<float>* logit_bias() const noexcept {
+    if (!config_.logit_bias)
+      return nullptr;
+    return InReasoning() ? config_.logit_bias->reasoning.get()
+                         : config_.logit_bias->answer.get();
+  }
+  /// The largest positive offset of logit_bias(), or zero.
+  [[nodiscard]] double logit_bias_max() const noexcept {
+    if (!config_.logit_bias)
+      return 0;
+    return InReasoning() ? config_.logit_bias->reasoning_max
+                         : config_.logit_bias->answer_max;
+  }
+  /// Whether an offset of the next token depends on the reasoning phase.
+  [[nodiscard]] bool phase_scoped() const noexcept {
+    return reasoning_scoped_ ||
+           (config_.logit_bias && config_.logit_bias->phase_dependent());
   }
   [[nodiscard]] std::uint64_t rng_state() const noexcept;
   [[nodiscard]] std::uint64_t* mutable_rng_state() noexcept;

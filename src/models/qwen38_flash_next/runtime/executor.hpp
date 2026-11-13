@@ -1331,10 +1331,15 @@ private:
   mutable std::vector<sampling::TokenPenalty> verification_penalty_host_;
   /// The request's Han set on the device, uploaded once per model set.
   mutable gufo::hip::DeviceTokenSet han_tokens_;
-  /// Sets the Han set of `rows` when the sampler's scale is active; callers
-  /// set each row's offset from that row's tentative state.
+  /// The request's logit-bias rows on the device, uploaded per combination.
+  mutable gufo::hip::DeviceLogitBias logit_bias_;
+  /// Sets the Han set of `rows` when the sampler's scale is active, and
+  /// each row's device logit-bias row from `row_bias` (the host phase array
+  /// of that row's tentative state); callers set each row's Han offset.
   bool SetHanRows(const sampling::SamplerState& sampler,
-                  GreedyPenaltyRows* rows, std::string* error_msg) const;
+                  GreedyPenaltyRows* rows,
+                  std::span<const std::vector<float>* const> row_bias,
+                  std::string* error_msg) const;
   /// Allocated only when concurrent decoding is first requested.
   mutable float* batch_logits_{nullptr};
   mutable Session::Control* batch_controls_{nullptr};

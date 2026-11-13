@@ -91,6 +91,11 @@ struct DFlashSampling {
   float han_answer_bias{0.0F};
   std::uint32_t han_end_count{0};
   std::uint32_t han_ends[2]{};
+  /// Dense device logit-bias rows (SamplerState::logit_bias), added after
+  /// the Han offset; null skips one. Proposals start with logit_bias and
+  /// switch to answer_logit_bias at the same han_ends as the Han offset.
+  const float* logit_bias{nullptr};
+  const float* answer_logit_bias{nullptr};
 };
 
 struct DFlashSelectorSequence {

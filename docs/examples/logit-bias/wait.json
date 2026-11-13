@@ -1,0 +1,7 @@
+{
+  "format": "gufo-logit-bias-v1",
+  "name": "wait",
+  "scope": "reasoning",
+  "bias": -4.0,
+  "strings": ["Wait", "wait", "Hmm", "hmm", "Alternatively", "alternatively"]
+}

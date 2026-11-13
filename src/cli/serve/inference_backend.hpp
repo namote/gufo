@@ -138,6 +138,14 @@ public:
   [[nodiscard]] std::vector<AbliterationInfo> abliteration_profiles()
       const override;
   [[nodiscard]] bool supports_han_scale() const override;
+  [[nodiscard]] std::shared_ptr<const sampling::LogitBiasCatalog>
+  logit_bias_catalog() const override;
+  /// Loads the logit-bias profiles (*.json) in `directory` against the
+  /// loaded model's vocabulary (`--logit-bias-profiles`). Returns false and
+  /// sets *error for an invalid profile or a model whose samplers cannot
+  /// apply them.
+  bool load_logit_bias_profiles(const std::filesystem::path& directory,
+                                std::string* error);
   [[nodiscard]] bool supports_scoring() const override;
   [[nodiscard]] std::string hc_mode() const override;
   [[nodiscard]] std::string model_path() const override;

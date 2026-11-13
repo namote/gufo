@@ -953,6 +953,10 @@ struct GreedyPenaltyRows {
   /// this device set (sampling::TokenSet layout); a null set skips it.
   const std::uint32_t* han_tokens{nullptr};
   double han_bias[7]{};
+  /// Each row's dense device logit-bias row (SamplerState::logit_bias of
+  /// that row's tentative state), added after the Han offset (FP64 in the
+  /// argmax); null skips it.
+  const float* logit_bias[7]{};
 };
 struct PenaltyArgmaxCandidate {
   double value;

@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "src/core/json.hpp"
+#include "src/core/logit_bias.hpp"
 #include "src/core/sampling.hpp"
 
 namespace gufo::server {
@@ -216,12 +217,116 @@ inline std::optional<SamplingRequestError> CheckNeutralLlamaSamplers(
   return std::nullopt;
 }
 
+/// Reads the Gufo fields logit_bias_profiles (an array of loaded profile
+/// names) and logit_bias_overrides (an object mapping a selected name to its
+/// bias), and the OpenAI logit_bias map (decimal token id string to bias).
+/// Null or absent fields select nothing; biases lie in [-100, 100].
+inline std::optional<SamplingRequestError> ParseLogitBiasSelection(
+    const json::Value& body, const sampling::LogitBiasCatalog& catalog,
+    sampling::LogitBiasSelection* output) {
+  const auto error = [](std::string message, std::string code) {
+    return SamplingRequestError{.message = std::move(message),
+                                .code = std::move(code)};
+  };
+  const auto bias = [](const json::Value& value) -> std::optional<float> {
+    if (!value.is_number() || !std::isfinite(value.as_double()) ||
+        std::abs(value.as_double()) >
+            static_cast<double>(sampling::kMaxLogitBias))
+      return std::nullopt;
+    return static_cast<float>(value.as_double());
+  };
+  if (const auto* names = body.find("logit_bias_profiles");
+      names != nullptr && !names->is_null()) {
+    if (!names->is_array())
+      return error("'logit_bias_profiles' must be an array of profile names",
+                   "invalid_logit_bias_profiles");
+    if (names->size() > sampling::kMaxRequestLogitBiasProfiles)
+      return error("'logit_bias_profiles' selects at most " +
+                       std::to_string(sampling::kMaxRequestLogitBiasProfiles) +
+                       " profiles",
+                   "invalid_logit_bias_profiles");
+    for (const auto& name : names->items()) {
+      if (!name.is_string())
+        return error("'logit_bias_profiles' must be an array of profile names",
+                     "invalid_logit_bias_profiles");
+      if (catalog.Find(name.str()) == nullptr)
+        return error("unknown logit bias profile '" + name.str() + "'",
+                     "unknown_logit_bias_profile");
+      if (std::ranges::any_of(output->profiles, [&](const auto& entry) {
+            return entry.first == name.str();
+          }))
+        return error("'logit_bias_profiles' names '" + name.str() + "' twice",
+                     "invalid_logit_bias_profiles");
+      output->profiles.emplace_back(name.str(), std::nullopt);
+    }
+  }
+  if (const auto* overrides = body.find("logit_bias_overrides");
+      overrides != nullptr && !overrides->is_null()) {
+    if (!overrides->is_object())
+      return error("'logit_bias_overrides' must map profile names to biases",
+                   "invalid_logit_bias_overrides");
+    for (const auto& [name, value] : overrides->members()) {
+      const auto found =
+          std::ranges::find_if(output->profiles, [&](const auto& entry) {
+            return entry.first == name;
+          });
+      if (found == output->profiles.end())
+        return error("'logit_bias_overrides' names '" + name +
+                         "', which 'logit_bias_profiles' does not select",
+                     "invalid_logit_bias_overrides");
+      const auto parsed = bias(value);
+      if (!parsed)
+        return error("'logit_bias_overrides." + name +
+                         "' must be a number between -100 and 100",
+                     "invalid_logit_bias_overrides");
+      found->second = *parsed;
+    }
+  }
+  if (const auto* map = body.find("logit_bias");
+      map != nullptr && !map->is_null()) {
+    if (!map->is_object())
+      return error("'logit_bias' must map token ids to biases",
+                   "invalid_logit_bias");
+    if (map->size() > sampling::kMaxRequestLogitBiasTokens)
+      return error("'logit_bias' holds at most " +
+                       std::to_string(sampling::kMaxRequestLogitBiasTokens) +
+                       " tokens",
+                   "invalid_logit_bias");
+    for (const auto& [key, value] : map->members()) {
+      // A decimal id without sign, leading zeros or spaces.
+      const bool digits =
+          !key.empty() && key.size() <= 10 &&
+          std::ranges::all_of(key,
+                              [](char c) { return c >= '0' && c <= '9'; }) &&
+          (key.size() == 1 || key.front() != '0');
+      const auto id = digits ? std::stoull(key) : 0ULL;
+      if (!digits || id >= catalog.vocabulary_size())
+        return error("'logit_bias' key '" + key +
+                         "' must be a token id below " +
+                         std::to_string(catalog.vocabulary_size()),
+                     "invalid_logit_bias");
+      const auto parsed = bias(value);
+      if (!parsed)
+        return error("'logit_bias." + key +
+                         "' must be a number between -100 and 100",
+                     "invalid_logit_bias");
+      output->tokens.emplace_back(static_cast<sampling::TokenId>(id), *parsed);
+    }
+    std::ranges::sort(output->tokens);
+  }
+  return std::nullopt;
+}
+
 }  // namespace detail
 
 /// Reads all shared sampling controls, using defaults for omitted fields.
+/// A null `logit_bias` catalog (a backend whose samplers cannot apply logit
+/// biases) rejects logit_bias_profiles, logit_bias_overrides and a nonempty
+/// logit_bias as unsupported.
 inline std::optional<SamplingRequestError> ParseSamplingConfig(
     const json::Value& body, const sampling::SamplingConfig& defaults,
-    sampling::SamplingConfig* output) {
+    sampling::SamplingConfig* output,
+    const sampling::LogitBiasCatalog* logit_bias = nullptr) {
   if (output == nullptr) {
     return SamplingRequestError{
         .message = "sampling output must not be null",
@@ -233,13 +338,16 @@ inline std::optional<SamplingRequestError> ParseSamplingConfig(
   // These controls alter proposal/target probabilities. Reject unsupported
   // spellings instead of accepting a request with a different distribution.
   for (const auto& [field, value] : body.members()) {
-    if (field == "logit_bias" &&
-        (value.is_null() || (value.is_object() && value.empty())))
+    if ((field == "logit_bias" || field == "logit_bias_profiles" ||
+         field == "logit_bias_overrides") &&
+        (logit_bias != nullptr || value.is_null() ||
+         (field == "logit_bias" && value.is_object() && value.empty())))
       continue;
     const bool draft_control = field.starts_with("draft_") ||
                                field.ends_with("_draft") || field == "draft" ||
                                field == "speculative";
-    if (draft_control || field == "samplers" || field == "logit_bias" ||
+    if (draft_control || field == "samplers" ||
+        field.starts_with("logit_bias") ||
         ((field.starts_with("xtc_") || field.starts_with("dry_")) &&
          !detail::IsLlamaSamplerField(field))) {
       return SamplingRequestError{
@@ -322,6 +430,20 @@ inline std::optional<SamplingRequestError> ParseSamplingConfig(
       };
     }
     output->han_scale_scope = *parsed;
+  }
+  if (logit_bias != nullptr) {
+    sampling::LogitBiasSelection selection;
+    if (auto error =
+            detail::ParseLogitBiasSelection(body, *logit_bias, &selection))
+      return error;
+    try {
+      output->logit_bias = logit_bias->Resolve(selection);
+    } catch (const std::invalid_argument& exception) {
+      return SamplingRequestError{
+          .message = exception.what(),
+          .code = "invalid_logit_bias",
+      };
+    }
   }
 
   // Check the original JSON number, not the narrowed float: 1.00000001 must

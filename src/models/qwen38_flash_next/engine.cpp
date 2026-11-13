@@ -1579,8 +1579,9 @@ struct Session::PendingDecode {
   std::uint32_t base{0};
   bool speculative{false};
   bool sampled{false};
-  /// A greedy chain under an active Han scale: its heads also return
-  /// candidates and each draft is their adjusted argmax (AppendDraft).
+  /// A greedy chain under an active Han scale or logit bias: its heads also
+  /// return candidates and each draft is their adjusted argmax
+  /// (AppendDraft).
   bool scaled_greedy{false};
   bool gpu_greedy{false};
   bool gpu_verification{false};
@@ -1605,8 +1606,9 @@ struct Session::PendingDecode {
 
 void Session::SelectScaledDraft(PendingDecode& pending) {
   // The device head takes the raw argmax. Rank the head's top candidates as
-  // the target does, so its Han offset (and penalties) cannot reject every
-  // Han draft. Idempotent until the next head overwrites the candidates.
+  // the target does, so its Han and logit-bias offsets (and penalties)
+  // cannot reject every biased draft. Idempotent until the next head
+  // overwrites the candidates.
   const auto size = pending.candidates.size;
   const auto best =
       pending.draft_sampler
@@ -1778,7 +1780,8 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   pending->base = base;
   pending->speculative = true;
   pending->sampled = sampled;
-  pending->scaled_greedy = !sampled && sampler.config().han_bias() != 0;
+  pending->scaled_greedy = !sampled && (sampler.config().han_bias() != 0 ||
+                                        sampler.config().logit_bias_active());
   pending->gpu_greedy = gpu_greedy;
   pending->gpu_verification = gpu_verification;
   if (!gpu_verification &&

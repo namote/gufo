@@ -373,6 +373,7 @@
       "id": "sampling",
       "paths": [
         "src/core/sampling.*",
+        "src/core/logit_bias.*",
         "src/core/text_sampling_defaults.hpp",
         "src/cli/sampling_options.hpp",
         "src/cli/serve/sampling_request.hpp"

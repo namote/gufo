@@ -308,6 +308,7 @@ add_library(gufo_core STATIC
   src/core/json_constraint.cpp
   src/core/json_schema_lexeme.cpp
   src/core/json_schema_regex.cpp
+  src/core/logit_bias.cpp
   src/core/sampling.cpp
   src/models/minimax_h3/audio_vae.cpp
   src/models/minimax_h3/denoiser.cpp
@@ -670,6 +671,18 @@ if (BUILD_TESTING)
   target_link_libraries(han_script_test PRIVATE gufo_core)
   add_test(NAME han_script_test COMMAND han_script_test)
   set_tests_properties(han_script_test PROPERTIES LABELS "cpu;sampling")
+
+  add_executable(logit_bias_test tests/core/logit_bias_test.cpp)
+  target_link_libraries(logit_bias_test PRIVATE gufo_core)
+  add_test(NAME logit_bias_test COMMAND logit_bias_test)
+  set_tests_properties(logit_bias_test PROPERTIES LABELS "cpu;sampling")
+
+  add_executable(logit_bias_request_test
+    tests/cli/logit_bias_request_test.cpp)
+  target_link_libraries(logit_bias_request_test PRIVATE gufo_core)
+  add_test(NAME logit_bias_request_test COMMAND logit_bias_request_test)
+  set_tests_properties(logit_bias_request_test PROPERTIES
+    LABELS "cpu;sampling;server")
 
   add_executable(logprobs_test tests/cli/logprobs_test.cpp)
   target_link_libraries(logprobs_test PRIVATE gufo_core)

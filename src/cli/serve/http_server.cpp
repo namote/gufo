@@ -754,8 +754,10 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
           std::size_t{std::numeric_limits<std::uint32_t>::max()}, max_tokens)) {
     return InvalidCompatibilityRequest(error->message);
   }
+  const auto logit_bias = backend.logit_bias_catalog();
   if (const auto error = ParseSamplingConfig(body, defaults.Resolve(thinking),
-                                             sampling_config)) {
+                                             sampling_config,
+                                             logit_bias.get())) {
     return Err(400, "Bad Request", error->message.c_str(),
                "invalid_request_error", error->code.c_str());
   }
@@ -1529,6 +1531,22 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
   // Gufo extension: Flash-Next's HyperConnection compute mode.
   if (auto hc_mode = b.hc_mode(); !hc_mode.empty()) {
     resp["hc_mode"] = std::move(hc_mode);
+  }
+
+  // Gufo extension: the loaded logit-bias profiles a request can select
+  // with logit_bias_profiles; absent where requests cannot bias logits.
+  if (const auto catalog = b.logit_bias_catalog()) {
+    json::Value profiles = json::Value::array();
+    for (const auto& profile : catalog->profiles()) {
+      json::Value entry = json::Value::object();
+      entry["name"] = profile.name;
+      entry["scope"] =
+          std::string(gufo::sampling::LogitBiasScopeName(profile.scope));
+      entry["bias"] = static_cast<double>(profile.bias);
+      entry["tokens"] = profile.tokens.size();
+      profiles.push_back(std::move(entry));
+    }
+    resp["logit_bias_profiles"] = std::move(profiles);
   }
 
   // What a request without sampling fields gets.

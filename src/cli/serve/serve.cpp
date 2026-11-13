@@ -609,6 +609,7 @@ void PrintServeHelp(std::string_view program_name,
     bool log_progress = false;
     bool enable_yarn = false;
     std::string abliteration_profiles;
+    std::string logit_bias_profiles;
     std::optional<KvCacheType> kv_cache_type;
     std::optional<models::qwen38_flash_next::HcMode> hc_mode;
     std::string trace_path;
@@ -651,6 +652,11 @@ void PrintServeHelp(std::string_view program_name,
     RegisterSamplingOptions(parser, &sampling_config, "Sampling Defaults", true,
                             true);
     RegisterHanScaleOption(parser, &sampling_config, "Sampling Defaults");
+    parser.AddOption(
+        "", "--logit-bias-profiles", "DIR",
+        "Qwen 27B, Flash-Next: load the logit-bias profiles (*.json) in DIR, "
+        "selected per request with 'logit_bias_profiles'",
+        "Sampling Defaults", &logit_bias_profiles);
 
     // Reasoning Defaults
     parser.AddOption(
@@ -1255,6 +1261,7 @@ int RunServe(std::span<const char* const> args) {
     bool log_progress = false;
     bool enable_yarn = false;
     std::string abliteration_profiles;
+    std::string logit_bias_profiles;
     std::optional<KvCacheType> kv_cache_type;
     std::optional<models::qwen38_flash_next::HcMode> hc_mode;
     std::string trace_path;
@@ -1307,6 +1314,11 @@ int RunServe(std::span<const char* const> args) {
     RegisterSamplingOptions(llm_parser, &sampling_config, "Sampling Defaults",
                             true, true);
     RegisterHanScaleOption(llm_parser, &sampling_config, "Sampling Defaults");
+    llm_parser.AddOption(
+        "", "--logit-bias-profiles", "DIR",
+        "Qwen 27B, Flash-Next: load the logit-bias profiles (*.json) in DIR, "
+        "selected per request with 'logit_bias_profiles'",
+        "Sampling Defaults", &logit_bias_profiles);
     llm_parser.AddOption(
         "", "--think", "MODE",
         "Default reasoning mode: on, off, or auto (default: model)",
@@ -1593,6 +1605,11 @@ int RunServe(std::span<const char* const> args) {
     loading.stop();
     if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
+      return 1;
+    }
+    if (!logit_bias_profiles.empty() &&
+        !backend->load_logit_bias_profiles(logit_bias_profiles, &err)) {
+      std::cerr << "Error: " << err << "\n";
       return 1;
     }
     backend->set_model_ids(std::move(served_model_names));

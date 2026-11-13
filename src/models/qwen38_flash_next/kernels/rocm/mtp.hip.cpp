@@ -193,6 +193,8 @@ __global__ void PenaltyArgmaxPartialKernel(const float* logits,
     if (penalties.han_tokens != nullptr &&
         ((penalties.han_tokens[token / 32U] >> (token % 32U)) & 1U))
       value = __dadd_rn(value, penalties.han_bias[row]);
+    if (penalties.logit_bias[row] != nullptr)
+      value = __dadd_rn(value, double(penalties.logit_bias[row][token]));
     best =
         BetterPenaltyCandidate(best, {value, static_cast<std::int32_t>(token)});
   }
@@ -324,10 +326,13 @@ __global__ void VerificationCandidateTileKernel(
     }
     float value =
         id < vocab ? logits[std::size_t(row) * vocab + id] : -INFINITY;
-    // Every pass ranks the same key: the logit plus its Han offset.
+    // Every pass ranks the same key: the logit plus its Han and logit-bias
+    // offsets.
     if (penalties.han_tokens != nullptr && id < vocab &&
         ((penalties.han_tokens[id / 32U] >> (id % 32U)) & 1U))
       value += static_cast<float>(penalties.han_bias[row]);
+    if (penalties.logit_bias[row] != nullptr && id < vocab)
+      value += penalties.logit_bias[row][id];
     // Drop the ID too: a subsequent pass must never resurrect an excluded
     // or nonfinite entry by reading its original logit.
     ids[j] = isfinite(value) ? id : UINT32_MAX;

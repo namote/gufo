@@ -962,20 +962,28 @@ kernels::DFlashSampling QwenDFlashGpuExecutor::PrepareDraftSampling(
   const auto& config = sampler->config();
   // The Han set is resident, so it survives the scratch-capacity fallback.
   kernels::DFlashSampling han;
+  const auto vocab_size = model_->GetConfig().vocab_size;
   if (config.han_bias() != 0) {
-    han.han_tokens = han_tokens_.Get(config.han_tokens,
-                                     model_->GetConfig().vocab_size, stream);
+    han.han_tokens = han_tokens_.Get(config.han_tokens, vocab_size, stream);
     han.han_bias = static_cast<float>(sampler->han_bias());
     han.han_answer_bias = static_cast<float>(config.han_bias());
-    // While reasoning under the answer scope, a proposed end token switches
-    // later proposals to the answer offset. Drafts only rank with it; the
-    // target rows verify with each row's exact sampler state.
-    if (han.han_bias != han.han_answer_bias && config.reasoning_budget) {
-      for (const auto end : config.reasoning_budget->ends) {
-        if (han.han_end_count == std::size(han.han_ends))
-          break;
-        han.han_ends[han.han_end_count++] = end;
-      }
+  }
+  // The logit-bias rows are resident too, as the Han set.
+  if (config.logit_bias_active()) {
+    han.logit_bias = logit_bias_.Row(*sampler, vocab_size, stream);
+    han.answer_logit_bias = logit_bias_.Row(
+        config.logit_bias, config.logit_bias->answer.get(), vocab_size, stream);
+  }
+  // While reasoning under a scoped Han offset or logit bias, a proposed end
+  // token switches later proposals to the answer offsets. Drafts only rank
+  // with them; the target rows verify with each row's exact sampler state.
+  if ((han.han_bias != han.han_answer_bias ||
+       han.logit_bias != han.answer_logit_bias) &&
+      config.reasoning_budget) {
+    for (const auto end : config.reasoning_budget->ends) {
+      if (han.han_end_count == std::size(han.han_ends))
+        break;
+      han.han_ends[han.han_end_count++] = end;
     }
   }
   result = han;

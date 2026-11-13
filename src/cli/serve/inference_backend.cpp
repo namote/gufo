@@ -34,6 +34,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/core/han_script.hpp"
 #include "src/core/json.hpp"
+#include "src/core/logit_bias.hpp"
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/control_tokens.hpp"
@@ -388,8 +389,9 @@ std::shared_ptr<const sampling::TokenSet> PrepareHanTokens(
 }
 
 // The reasoning phase a request that starts reasoning tracks: its token
-// budget, or, when only the Han scale's answer scope needs that phase, an
-// unlimited budget that marks where reasoning ends and never forces.
+// budget, or, when only the Han scale's answer scope or a phase-dependent
+// logit bias needs that phase, an unlimited budget that marks where
+// reasoning ends and never forces.
 std::shared_ptr<const sampling::ReasoningBudget> RequestReasoning(
     const ChatRequest& request, const sampling::SamplingConfig& sampling,
     const std::shared_ptr<const sampling::TokenSet>& han_tokens,
@@ -397,8 +399,9 @@ std::shared_ptr<const sampling::ReasoningBudget> RequestReasoning(
   if (request.reasoning.budget_tokens)
     return runner.BuildReasoningBudget(*request.reasoning.budget_tokens,
                                        prompt);
-  if (sampling.han_scale_scope == sampling::HanScaleScope::kAnswer &&
-      sampling.han_scale != 1.0F && han_tokens && han_tokens->count != 0)
+  if ((sampling.han_scale_scope == sampling::HanScaleScope::kAnswer &&
+       sampling.han_scale != 1.0F && han_tokens && han_tokens->count != 0) ||
+      (sampling.logit_bias && sampling.logit_bias->phase_dependent()))
     return runner.BuildReasoningBudget(sampling::ReasoningBudget::kUnlimited,
                                        prompt);
   return nullptr;
@@ -3653,6 +3656,9 @@ struct InferenceBackend::Impl {
     std::string hc_mode;
     /// The runner's Han tokens; null where its samplers ignore han_scale.
     std::shared_ptr<const sampling::TokenSet> han_tokens;
+    /// The runner's logit-bias profiles (none until
+    /// load_logit_bias_profiles); null where its samplers ignore them.
+    std::shared_ptr<const sampling::LogitBiasCatalog> logit_bias;
     ReasoningOptions reasoning_defaults;
     std::string model_path;
     std::string build_info;
@@ -4271,6 +4277,8 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
         disk_cache_config.draft_model_artifact_fingerprint, session_count,
         ram_cache_config.kv_pool_bytes, execution_policy);
     new_state->han_tokens = PrepareHanTokens(*runner);
+    new_state->logit_bias = std::make_shared<const sampling::LogitBiasCatalog>(
+        runner->VocabularySize(), std::vector<sampling::LogitBiasProfile>{});
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
@@ -4459,6 +4467,8 @@ bool InferenceBackend::load(
         disk_cache_config.draft_model_artifact_fingerprint,
         ram_cache_config.kv_pool_bytes);
     new_state->han_tokens = PrepareHanTokens(*runner);
+    new_state->logit_bias = std::make_shared<const sampling::LogitBiasCatalog>(
+        runner->VocabularySize(), std::vector<sampling::LogitBiasProfile>{});
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
@@ -4558,6 +4568,65 @@ bool InferenceBackend::supports_han_scale() const {
   const auto state = impl_->Snapshot();
   return state != nullptr && state->han_tokens != nullptr;
 #else
+  return false;
+#endif
+}
+
+std::shared_ptr<const sampling::LogitBiasCatalog>
+InferenceBackend::logit_bias_catalog() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state != nullptr ? state->logit_bias : nullptr;
+#else
+  return nullptr;
+#endif
+}
+
+bool InferenceBackend::load_logit_bias_profiles(
+    const std::filesystem::path& directory, std::string* error) {
+#if defined(ENGINE_ENABLE_HIP)
+  const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+  if (impl_->state == nullptr || impl_->state->logit_bias == nullptr) {
+    SetError(error,
+             "--logit-bias-profiles applies only to Qwen 27B and Flash-Next");
+    return false;
+  }
+  const auto started = Clock::now();
+  const auto& runner = impl_->state->scheduler->runner();
+  std::vector<sampling::LogitBiasProfile> profiles;
+  try {
+    profiles = sampling::LoadLogitBiasProfiles(
+        directory, runner.VocabularySize(), [&](sampling::TokenId token) {
+          const TextRunnerToken id = token;
+          return runner.Decode(std::span(&id, 1));
+        });
+  } catch (const std::exception& exception) {
+    SetError(error, exception.what());
+    return false;
+  }
+  using Milliseconds = std::chrono::duration<double, std::milli>;
+  for (const auto& profile : profiles)
+    Logger::Info(
+        "loader",
+        "event=logit_bias_profile name=" + profile.name + " scope=" +
+            std::string(sampling::LogitBiasScopeName(profile.scope)) +
+            " bias=" + std::to_string(profile.bias) +
+            " tokens=" + std::to_string(profile.tokens.size()) +
+            " string_tokens=" + std::to_string(profile.string_matches));
+  Logger::Info("loader",
+               "event=logit_bias_profiles_loaded profiles=" +
+                   std::to_string(profiles.size()) + " prepare_ms=" +
+                   std::to_string(
+                       Milliseconds(Clock::now() - started).count()));
+  auto updated = std::make_shared<Impl::State>(*impl_->state);
+  updated->logit_bias = std::make_shared<const sampling::LogitBiasCatalog>(
+      runner.VocabularySize(), std::move(profiles));
+  impl_->state = std::move(updated);
+  return true;
+#else
+  (void)directory;
+  SetError(error,
+           "--logit-bias-profiles applies only to Qwen 27B and Flash-Next");
   return false;
 #endif
 }

@@ -1116,10 +1116,11 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
   }
 
   sampling::SamplingConfig parsed_sampling;
+  const auto logit_bias = backend.logit_bias_catalog();
   if (const auto sampling_error = ParseSamplingConfig(
           body,
           backend.sampling_defaults().Resolve(output->chat.reasoning.enabled),
-          &parsed_sampling)) {
+          &parsed_sampling, logit_bias.get())) {
     return Error(400, "Bad Request", sampling_error->message,
                  sampling_error->code.c_str());
   }

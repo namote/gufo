@@ -247,6 +247,7 @@ private:
   // GPU Scratch buffers
   float* d_target_features_{nullptr};
   DeviceTokenSet han_tokens_;
+  DeviceLogitBias logit_bias_;
   float* d_fused_features_{nullptr};
   float* d_block_hidden_{nullptr};
   float* d_block_normed_{nullptr};

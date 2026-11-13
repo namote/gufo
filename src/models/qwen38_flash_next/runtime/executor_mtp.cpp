@@ -1,6 +1,10 @@
 // MTP: draft rows and logits, the MTP K/V projection, the MTP head, and
 // greedy/sampled draft candidates and the MTP forward pass.
 
+#include <array>
+#include <span>
+#include <vector>
+
 #include "src/models/qwen38_flash_next/runtime/executor_internal.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
@@ -194,14 +198,20 @@ bool Executor::KeepHiddenRow(Session& session, std::uint32_t row,
       "kept hidden row", error_msg);
 }
 
-bool Executor::SetHanRows(const sampling::SamplerState& sampler,
-                          GreedyPenaltyRows* rows,
-                          std::string* error_msg) const {
-  if (sampler.config().han_bias() == 0)
+bool Executor::SetHanRows(
+    const sampling::SamplerState& sampler, GreedyPenaltyRows* rows,
+    std::span<const std::vector<float>* const> row_bias,
+    std::string* error_msg) const {
+  const auto& settings = sampler.config();
+  if (settings.han_bias() == 0 && !settings.logit_bias_active())
     return true;
+  const auto vocab = config().vocab_size;
   try {
-    rows->han_tokens = han_tokens_.Get(sampler.config().han_tokens,
-                                       config().vocab_size, stream_);
+    if (settings.han_bias() != 0)
+      rows->han_tokens = han_tokens_.Get(settings.han_tokens, vocab, stream_);
+    for (std::size_t row = 0; row < row_bias.size() && row < 7; ++row)
+      rows->logit_bias[row] =
+          logit_bias_.Row(settings.logit_bias, row_bias[row], vocab, stream_);
   } catch (const std::exception& exception) {
     AssignError(error_msg, exception.what());
     return false;
@@ -249,12 +259,14 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
     // history is needed here; FinishDecode checks each winner's grammar.
     auto tentative = sampler.WithoutConstraint();
     GreedyPenaltyRows batch{};
+    std::array<const std::vector<float>*, 7> row_bias{};
     for (std::size_t row = 0; row < rows; ++row) {
       const auto counts = tentative.penalties();
       penalties.insert(penalties.end(), counts.begin(), counts.end());
       batch.offsets[row + 1] = static_cast<std::uint32_t>(penalties.size());
-      // Each row's own offset: a drafted reasoning end starts the answer.
+      // Each row's own offsets: a drafted reasoning end starts the answer.
       batch.han_bias[row] = tentative.han_bias();
+      row_bias[row] = tentative.logit_bias();
       if (row + 1 < rows)
         tentative.Accept(static_cast<sampling::TokenId>(drafts[row]));
     }
@@ -270,7 +282,8 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
       verification_penalty_capacity_ = capacity;
     }
     batch.penalties = verification_penalties_;
-    if (!SetHanRows(sampler, &batch, error_msg))
+    if (!SetHanRows(sampler, &batch, std::span(row_bias).first(rows),
+                    error_msg))
       return false;
     if (!penalties.empty() &&
         !Check(hipMemcpyAsync(verification_penalties_, penalties.data(),
@@ -317,10 +330,10 @@ bool Executor::CanCompactMtpVerification(
          config.min_keep <= kMtpCandidates &&
          sampler.penalties().size() + 8 <= kCompactPenaltyLimit &&
          !sampler.NeedsConstraintMask() &&
-         // The candidate tiles rank logit + Han offset as F32 keys; keep a
-         // rank of margin so rounding at the boundary cannot drop the
-         // target's last top-k member.
-         (config.han_bias() == 0 ||
+         // The candidate tiles rank logit + Han and logit-bias offsets as
+         // F32 keys; keep a rank of margin so rounding at the boundary
+         // cannot drop the target's last top-k member.
+         ((config.han_bias() == 0 && !config.logit_bias_active()) ||
           (std::size_t(config.top_k) < kMtpCandidates &&
            config.min_keep < kMtpCandidates));
 }
@@ -365,18 +378,20 @@ bool Executor::SampledMtpCandidates(
   auto& penalties = verification_penalty_host_;
   penalties.clear();
   GreedyPenaltyRows batch{};
+  std::array<const std::vector<float>*, 7> row_bias{};
   auto tentative = sampler.WithoutConstraint();
   for (std::size_t row = 0; row < rows; ++row) {
     const auto counts = tentative.penalties();
     penalties.insert(penalties.end(), counts.begin(), counts.end());
     batch.offsets[row + 1] = penalties.size();
-    // Each row's own offset: a drafted reasoning end starts the answer.
+    // Each row's own offsets: a drafted reasoning end starts the answer.
     batch.han_bias[row] = tentative.han_bias();
+    row_bias[row] = tentative.logit_bias();
     if (row + 1 < rows)
       tentative.Accept(static_cast<sampling::TokenId>(drafts[row]));
   }
   batch.penalties = verification_penalties_;
-  if (!SetHanRows(sampler, &batch, error_msg))
+  if (!SetHanRows(sampler, &batch, std::span(row_bias).first(rows), error_msg))
     return false;
   if (!penalties.empty() &&
       !Check(hipMemcpyAsync(verification_penalties_, penalties.data(),

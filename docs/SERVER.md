@@ -1300,6 +1300,65 @@ outputs follow the scoped distribution exactly. The scope changes sampling
 only, never cached KV state. Traces record the applied scope: `all` for a
 request without a tracked reasoning phase.
 
+### Logit-bias profiles
+
+`--logit-bias-profiles DIR` (Qwen 27B and Qwen3.8-Flash-Next; other models
+fail startup with it) loads every `*.json` file directly in DIR as one named
+token-set bias, for example
+[`docs/examples/logit-bias/wait.json`](examples/logit-bias/wait.json):
+
+```json
+{"format": "gufo-logit-bias-v1", "name": "wait", "scope": "reasoning",
+ "bias": -4.0, "strings": ["Wait", "Hmm", "Alternatively"]}
+```
+
+- `format` must be `gufo-logit-bias-v1`; `name` (1-64 letters, digits, `_`,
+  `-`, `.`) must be unique across the directory. Unknown keys, a missing
+  field, a bad scope or an out-of-range value fail startup with the file named.
+- `bias` is the additive logit offset, a number in `[-100, 100]`; negative
+  values suppress.
+- `scope`: `all` every generated token, `answer` only after the reasoning
+  phase ends (as `han_scale_scope: "answer"`), `reasoning` only inside it.
+  The phase is the one the Han scale's answer scope tracks; a reply without
+  reasoning, and a `/completion` prompt, are all answer, so `reasoning` sets
+  never apply there.
+- `tokens` lists vocabulary ids; an id outside the vocabulary fails startup.
+- `strings` expand at load time: a token matches when its decoded text, after
+  removing leading ASCII whitespace (space, tab, CR, LF), equals the string
+  exactly. Case, punctuation and trailing whitespace must match, so list each
+  variant (`"Wait"`, `"wait"`, `"Wait,"`); a word the tokenizer splits into
+  several tokens matches nothing.
+- A profile needs `tokens` or `strings` and must resolve to at least one
+  token. The loader logs `event=logit_bias_profile` with each profile's token
+  count (`string_tokens` from strings), and `/props` lists the loaded
+  profiles under Gufo's `logit_bias_profiles`.
+
+Chat Completions, Responses, Messages and `/completion` requests select up to
+8 loaded profiles with the Gufo field `logit_bias_profiles` (an array of
+names) and may replace a selected profile's bias with
+`logit_bias_overrides` (an object from a selected name to a bias in
+`[-100, 100]`):
+`{"logit_bias_profiles": ["wait", "hmm"],
+"logit_bias_overrides": {"wait": -6}}`.
+An unknown name returns 400 `unknown_logit_bias_profile`; a name selected
+twice, more than 8 names or an override of an unselected profile return 400.
+The OpenAI `logit_bias` map (a decimal token id string to a bias in
+`[-100, 100]`, at most 1024 entries) is accepted on these models as one more
+set with scope `all`; malformed keys or values and ids outside the
+vocabulary return 400 `invalid_logit_bias`. `null` fields select nothing.
+
+Overlapping sets add. The offsets are added after the penalties and the Han
+offset, before temperature and the top-k/top-p/min-p filters, exactly like
+the Han scale: greedy requests take the argmax of the offset logits, and an
+active set takes every request off the unmodified-argmax fast paths. Every
+sampling path applies them identically (CPU sampler, Qwen 27B GPU sampler and
+DFlash proposals, Flash-Next MTP proposals and verification), each
+speculative row with the offsets of its own phase, so outputs follow the
+biased distribution exactly. Returned logprobs stay raw. Traces record the
+combination as `sampling.logit_bias` (`name=bias` in name order, then the
+OpenAI map). Models without the Han scale keep rejecting a nonempty
+`logit_bias` and the profile fields as unsupported.
+
 Tool calls are emitted only for declared functions when `tool_choice` allows
 calling tools. With `auto`, ordinary text and reasoning remain allowed; once a
 call starts, decoding constrains its name and argument format. As in llama.cpp,
@@ -1353,7 +1412,9 @@ labelled executed model state. Stops must be nonempty, at most 4 KiB each and
 Nullable Chat Completions defaults retain server settings, including sampling
 and token limits. `logprobs: false`, empty `logit_bias`,
 `response_format: {"type":"text"}` and `modalities: ["text"]` are accepted.
-Token biases and audio output remain unsupported and return explicit errors.
+Token biases are supported only on Qwen 27B and Qwen3.8-Flash-Next
+([logit-bias profiles](#logit-bias-profiles)); elsewhere they, and audio
+output, return explicit errors.
 
 ### Generated-token log probabilities
 
@@ -1862,6 +1923,9 @@ sampling fields gets, with `n_predict` and `max_tokens` -1 when no default
 limit is set.
 Its Gufo `han_scale` is the default Han scale, 1 on models that ignore it,
 and `han_scale_scope` its default scope, `all` on those models.
+Gufo's `logit_bias_profiles` lists the loaded
+[logit-bias profiles](#logit-bias-profiles) (`name`, `scope`, `bias`,
+`tokens`), absent on models that cannot apply them.
 `modalities.vision` is true only when a vision encoder
 loaded. Gufo's `abliteration` object is present only with loaded
 [runtime abliteration](#runtime-abliteration) profiles. Gufo's `hc_mode` is

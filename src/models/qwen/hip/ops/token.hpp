@@ -6,6 +6,7 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <vector>
 
 #include "src/core/gguf_reader.hpp"
 #include "src/core/sampling.hpp"
@@ -64,6 +65,9 @@ struct GpuSamplingParameters {
   /// a null set) skips it.
   const std::uint32_t* han_tokens{nullptr};
   float han_bias{0.0F};
+  /// The device row of SamplerState::logit_bias (the sampled position's
+  /// phase), added after the Han offset; null skips it.
+  const float* logit_bias{nullptr};
 };
 
 /// A device copy of a host TokenSet (same bit layout). Get uploads a set on
@@ -88,6 +92,59 @@ private:
   std::uint32_t* words_{nullptr};
   std::size_t vocab_size_{0};
 };
+
+/// A device copy of a host LogitBias: one row of `vocab_size` floats per
+/// phase (one shared row when both phases share their host array),
+/// zero-padded or truncated to the logit rows so kernels index it without
+/// bounds checks. Get uploads a combination on first use and returns the
+/// retained rows while the same one is supplied; the catalog hands equal
+/// selections the same object. A new combination overwrites the retained
+/// buffers (no reallocation). The upload synchronizes `stream`; never call
+/// it during graph capture.
+class DeviceLogitBias {
+public:
+  struct Rows {
+    const float* reasoning{nullptr};
+    const float* answer{nullptr};
+  };
+
+  DeviceLogitBias() = default;
+  ~DeviceLogitBias();
+  DeviceLogitBias(const DeviceLogitBias&) = delete;
+  DeviceLogitBias& operator=(const DeviceLogitBias&) = delete;
+
+  [[nodiscard]] Rows Get(const std::shared_ptr<const sampling::LogitBias>& bias,
+                         std::size_t vocab_size, hipStream_t stream);
+  /// The device row of `phase`, one of the host arrays of `bias` (as
+  /// SamplerState::logit_bias returns it); null for a null phase.
+  [[nodiscard]] const float* Row(
+      const std::shared_ptr<const sampling::LogitBias>& bias,
+      const std::vector<float>* phase, std::size_t vocab_size,
+      hipStream_t stream);
+  /// The row of the sampler's next position.
+  [[nodiscard]] const float* Row(const sampling::SamplerState& sampler,
+                                 std::size_t vocab_size, hipStream_t stream) {
+    return Row(sampler.config().logit_bias, sampler.logit_bias(), vocab_size,
+               stream);
+  }
+
+private:
+  void Release() noexcept;
+  std::shared_ptr<const sampling::LogitBias> source_;
+  float* reasoning_buffer_{nullptr};
+  float* answer_buffer_{nullptr};
+  /// The rows of source_: buffers, the reasoning buffer for both phases
+  /// when they share one array, or null for a null phase.
+  const float* reasoning_{nullptr};
+  const float* answer_{nullptr};
+  std::size_t vocab_size_{0};
+  std::vector<float> staging_;
+};
+
+/// Adds bias[t] to logits[t] for every token of one row of `vocab_size`
+/// logits.
+void LaunchDenseLogitBias(float* logits, const float* bias,
+                          std::size_t vocab_size, hipStream_t stream = nullptr);
 
 /// Adds `bias` to logits[t] of every token t in the device set `tokens`
 /// (one row of `vocab_size` logits).

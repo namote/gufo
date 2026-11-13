@@ -443,6 +443,10 @@ GenerationTrace StartGenerationTrace(const ScheduledRequest& request,
               request.sampling.reasoning_budget != nullptr
           ? request.sampling.han_scale_scope
           : gufo::sampling::HanScaleScope::kAll));
+  // The selected logit-bias combination (profile=bias, then the OpenAI
+  // map); absent without one.
+  if (request.sampling.logit_bias_active())
+    sampling["logit_bias"] = request.sampling.logit_bias->key;
   sampling["constrained"] = request.sampling.constraint != nullptr;
   trace.record["sampling"] = std::move(sampling);
   return trace;

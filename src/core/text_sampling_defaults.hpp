@@ -46,11 +46,12 @@ inline SamplingConfig ResolveTextSampling(TextModelPreset model,
     return configured;
   SamplingConfig result;
   // Presets change sampling controls, never the caller's output grammar
-  // or its Han scale and scope.
+  // or its Han scale, scope and logit bias.
   result.constraint = configured.constraint;
   result.han_scale = configured.han_scale;
   result.han_tokens = configured.han_tokens;
   result.han_scale_scope = configured.han_scale_scope;
+  result.logit_bias = configured.logit_bias;
   result.temperature = 1.0F;
   result.top_p = 0.95F;
   if (model == TextModelPreset::kQwen38) {

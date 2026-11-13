@@ -990,6 +990,7 @@ private:
   float* d_target_layer_features_{nullptr};
   GpuSamplingWorkspace sampling_workspace_;
   DeviceTokenSet han_tokens_;
+  DeviceLogitBias logit_bias_;
   std::optional<tokenization::TokenId> next_token_;
   bool capture_prompt_hidden_{false};
   bool replaying_ssm_state_{false};
