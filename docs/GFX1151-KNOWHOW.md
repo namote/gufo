@@ -375,6 +375,22 @@
       - **The direction matches its instruction without the instruction tokens.** But the gain over base (+1–2 problems) is within noise: the model already passes about 90%.
     - **Ordinary check** (14 prompts, trap ×1/×2 versus OFF): all math is correct, meth is still refused, and daily, summary and translation answers keep their content (lengths vary ±30%).
     - **Not adopted yet.** It needs harder problems to show a margin, and a coding detector so that it acts only on coding prompts.
+  - **Thinking-depth baselines (`build/b1/think/`, November 13).** Production settings (c03, YaRN 1M, K4V4, MTP 7), thinking on, temperature 1.0 / top-p 0.95 (`think_eval.py`) or seed 7 (`generate.py`), 32768-token cap. `reasoning_effort` low, medium (the default, no instruction) and xhigh; Qwen has only these three (high and max map to xhigh). Medium AIME ran on live production (2 sessions); the rest on a 4-session copy of production (`hard2.sh`).
+    - **MATH-500 subset** (100 integer-answer level 3–5 problems, medium): 100/100, mean 1,150 tokens. Too easy to compare depths.
+    - **AIME 2025** (30 problems):
+
+      | Effort | Correct | Mean tokens | Median | Truncated at 32k | Hesitations/answer |
+      |---|---:|---:|---:|---:|---:|
+      | low | **28** | 7,738 | **3,929** | 2 | 24.0 |
+      | medium | 27 | 8,989 | 5,445 | 2 | 25.8 |
+      | xhigh | 24 | 13,447 | 9,636 | 6 | 27.0 |
+
+      - Every xhigh miss is a truncation; xhigh never stops on a wrong answer. Medium stops wrong once (problem 25: 308 versus 907); low and xhigh solve it.
+      - The per-problem best of all three efforts is 28, the same as low alone. No problem is solved only by thinking longer.
+      - Problems 14 and 15 are truncated at every effort, in re-check loops (57–98 "Wait"-type openers).
+    - **Coding:** the 23 problems that failed with thinking off at 2,000 tokens (r5-coding 17, r5-trap 6). low 19, medium 18, xhigh 19. Mean tokens 2,458 / 3,054 / 16,785. Four xhigh misses are truncations; the medium and low misses all stop on a wrong answer. Thinking alone rescues about 80%.
+    - **Concurrency:** 4 sessions is the most that fits at 1M context (9.4 GiB of state each, 44 GiB free); 8 needs a smaller context, which changes the YaRN factor. Aggregate decode with MTP rose only from about 65 tok/s (2 sessions) to 75–80 tok/s (4 sessions).
+    - **Conclusion:** on this model the extra depth costs tokens and adds re-check loops, without solving more. Low is the best default seen so far. The target for steering is the re-check loop itself, not depth.
   - **Combined profile for the English Tiananmen gap** (not measured): `dynamic/profiles-pol-fnx2/` holds `pol-avg` (byte-identical to production's except `trigger.with: ["fnx"]`, threshold 0.7) and production's `fnx` (no trigger). A pol-avg detection then turns both ON; where both have strength at a site, they project onto the orthonormal union of their directions with the larger strength (docs/SERVER.md, several profiles).
   - **Threshold 0.7 for `dynamic/profiles-pol/`** (signed off; `fit_trigger.py --threshold 0.7`, the fitted 1.199 kept in the report as `fitted_threshold`, evidence `dynamic/fit-pol-0.7.json`):
     - Offline at 0.7: recall 92.1%; false positives 4.2% on the hard political controls (Gwangju, Tiananmen-like events elsewhere) and 1.3% on harmless prompts.
