@@ -1873,6 +1873,60 @@ void UnpinnedRunnersKeepTheirLimit() {
     assert(refused);
   }
 }
+// Startup charges (the disk catalog and index of a large disk cache) that
+// fill a host-bound limit leave admission its metadata room: the cache keeps
+// it above them instead of failing every request with std::bad_alloc.
+void StartupMetadataLeavesAdmissionRoom() {
+  class ResidentRunner final : public Runner {
+  public:
+    std::size_t fill_to{};
+    mutable bool filled{};
+    mutable cache::ResourceCharge resident;
+    mutable std::size_t committed{}, headroom{};
+    TextRunnerResourceClaim ResourceClaim() const override {
+      auto claim = Runner::ResourceClaim();
+      claim.retained_snapshot_capacity_bytes = 2 << 20;
+      claim.retained_snapshot_ceiling_bytes = 4 << 20;
+      return claim;
+    }
+    std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+        cache::ResourceLedger& ledger, std::size_t ram) const override {
+      auto resources = Runner::CreateComponentCacheResources(ledger, ram);
+      // Read just before the budget is set: charge metadata up to 256 bytes
+      // short of the host-bound limit, as the disk catalog does.
+      resources->pinned_bytes = [this, &ledger] {
+        if (!std::exchange(filled, true))
+          resident = ledger
+                         .Reserve(cache::ResourceCategory::kMetadata,
+                                  fill_to - 256 - ledger.Snapshot().ram_bytes)
+                         .Convert();
+        return std::size_t{0};
+      };
+      resources->commit_backing = [this, &ledger](std::size_t budget) {
+        committed = budget;
+        headroom = ledger.Limits().ram_bytes - ledger.Snapshot().ram_bytes;
+      };
+      return resources;
+    }
+  };
+  // Automatic (half the host, 2 MiB) and an explicit budget the 4 MiB host
+  // ceiling cuts.
+  for (const auto& [requested, fill_to] :
+       {std::pair{0ULL, 2ULL << 20}, std::pair{8ULL << 20, 4ULL << 20}}) {
+    auto runner = std::make_shared<ResidentRunner>();
+    runner->fill_to = fill_to;
+    TextRunnerPool pool(runner, 2, {}, {.capacity_bytes = requested});
+    assert(runner->filled);
+    assert(runner->headroom >= (512 << 10) + (8 << 20));
+    assert(runner->committed == 8 << 20);
+    for (const TextRunnerToken first : {10, 20}) {
+      std::vector<TextRunnerToken> prompt{first, 11, 12, 13};
+      auto request = pool.Acquire(prompt);
+      Prefill(request);
+      assert(request.SelectNext().token != 0);
+    }
+  }
+}
 void DiskDirectoryHasOneOwner() {
   class CommitRunner final : public Runner {
   public:
@@ -3674,6 +3728,7 @@ int main() {
   StagingCountsAgainstRamCeiling();
   PinnedSlotBytesCountOnce();
   UnpinnedRunnersKeepTheirLimit();
+  StartupMetadataLeavesAdmissionRoom();
   DiskDirectoryHasOneOwner();
   GridDoesNotSuppressFirstDiskPrompt();
   NearTailDiskBranchSurvivesRestart();

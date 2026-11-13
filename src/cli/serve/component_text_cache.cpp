@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
@@ -28,6 +29,20 @@ std::size_t ReadAheadBytes(std::size_t ceiling) {
   return ceiling / 256 >= cache::kPersistenceReadAheadBytes
              ? cache::kPersistenceReadAheadBytes
              : 0;
+}
+// Metadata room the ledger keeps beyond its startup charges (the disk
+// catalog and index, slots, pins) whenever a host-derived budget would leave
+// less: every admission reserves its lease, lineage and history there, and a
+// ledger the disk catalog filled refuses each one (std::bad_alloc).
+constexpr std::size_t kAdmissionMetadataBytes = std::size_t{512} << 10;
+// The backing budget of such a host-bound cache: the smallest that still plans
+// whole backing blocks (ContinuationLayout::BackingPlan). Backing still grows
+// only when the host has room for it.
+constexpr std::size_t kMinimumBackingBytes = std::size_t{8} << 20;
+std::size_t SaturatingAdd(std::size_t a, std::size_t b) {
+  return a > std::numeric_limits<std::size_t>::max() - b
+             ? std::numeric_limits<std::size_t>::max()
+             : a + b;
 }
 using Clock = std::chrono::steady_clock;
 class SettledSignal final : public cache::CompletionSignal {
@@ -324,14 +339,21 @@ struct ComponentTextCache::Impl {
         // not change restore or write speed (#562), and a larger one only
         // takes pinned RAM and device heap from the cache and the sessions.
         // Writes may also queue device-read pieces ahead (ReadAheadBytes).
-        ledger({slot_ceiling + (options ? cache::kDefaultDiskStagingBytes +
-                                              ReadAheadBytes(slot_ceiling)
-                                        : 0),
-                slot_ceiling,
+        // The RAM limit leaves room to raise a host-bound budget to the
+        // admission floor (kAdmissionMetadataBytes, kMinimumBackingBytes).
+        ledger({SaturatingAdd(
+                    SaturatingAdd(slot_ceiling, kAdmissionMetadataBytes +
+                                                    kMinimumBackingBytes),
+                    options ? cache::kDefaultDiskStagingBytes +
+                                  ReadAheadBytes(slot_ceiling)
+                            : 0),
+                SaturatingAdd(slot_ceiling,
+                              kAdmissionMetadataBytes + kMinimumBackingBytes),
                 options ? cache::kDefaultDiskStagingBytes +
                               ReadAheadBytes(slot_ceiling)
                         : 0,
-                slot_ceiling}),
+                SaturatingAdd(slot_ceiling,
+                              kAdmissionMetadataBytes + kMinimumBackingBytes)}),
         resources(this->runner->CreateComponentCacheResources(ledger, ram)),
         identity(resources->adapter->CompatibilityIdentity()),
         index(ledger),
@@ -378,8 +400,25 @@ struct ComponentTextCache::Impl {
                                  resources->reassignment_batch_size});
       entries.push_back(std::move(entry));
     }
+    // The disk catalog and index charge their metadata (tens of MiB for a
+    // large disk cache) before the budget is set, so it covers them.
+    const auto load_disk_catalog = [&] {
+      if (!options)
+        return;
+      catalog = std::make_unique<cache::DiskCatalog>(ledger, *disk, index);
+      for (const auto& durable : disk->Entries()) {
+        cache::ExecutionHistory::ObserveDurableId(
+            durable.Manifest().checkpoint);
+        if (durable.Manifest().compatibility == digest)
+          (void)index.Insert(identity,
+                             catalog->Find(durable.Manifest().checkpoint));
+      }
+    };
     std::size_t automatic_bytes{}, max_bytes{}, slot_pinned_bytes{};
     if (resources->commit_backing) {
+      // An explicit budget below the ceiling the slots allocated under.
+      const bool explicit_ram = !automatic_ram && ram < slot_ceiling;
+      const auto requested_ram = ram;
       const auto claim = this->runner->ResourceClaim();
       // The claim measures the host after the slots allocated, so bytes they
       // pinned are missing from it. Add them back: in full to the ceiling,
@@ -387,6 +426,7 @@ struct ComponentTextCache::Impl {
       // The ledger charges them on top of the cache's own budget.
       const auto pinned =
           resources->pinned_bytes ? resources->pinned_bytes() : 0;
+      load_disk_catalog();
       const auto measured = claim.retained_snapshot_capacity_bytes.value_or(0);
       const auto automatic = measured + pinned / 2;
       const auto ceiling =
@@ -402,28 +442,43 @@ struct ComponentTextCache::Impl {
         ram = std::min(ram, automatic);
       // Within the host ceiling and the limit the slots allocated under. Other
       // charges above the budget are refused here, as without pins.
-      const auto limit =
-          std::min({ram + pinned, max_bytes, ledger.Limits().ram_bytes});
+      auto limit = std::min({ram + pinned, max_bytes, slot_ceiling});
+      // A host-derived limit (automatic, or below an explicit budget) must
+      // still leave admission its metadata room above what startup charged:
+      // keep that room and a minimal backing budget. Those charges are host
+      // memory already in use, and backing commits only when the host has
+      // room. An explicit budget that binds keeps its meaning.
+      const auto charged = ledger.Snapshot().ram_bytes;
+      const bool host_bound =
+          !explicit_ram || max_bytes < requested_ram + pinned;
+      if (host_bound &&
+          limit < SaturatingAdd(charged, kAdmissionMetadataBytes)) {
+        const auto floor = SaturatingAdd(
+            charged, kAdmissionMetadataBytes + kMinimumBackingBytes);
+        limit = std::min(floor, ledger.Limits().ram_bytes);
+        ram = limit - std::min(limit, charged + kAdmissionMetadataBytes);
+        Logger::Warn("cache",
+                     "schema=component-cache-v1 event=budget_raised "
+                     "reason=startup_metadata charged_bytes=" +
+                         std::to_string(charged) +
+                         " host_limit_bytes=" + std::to_string(max_bytes) +
+                         " limit_bytes=" + std::to_string(limit) +
+                         " backing_bytes=" + std::to_string(ram));
+      } else {
+        ram = std::min(ram, limit > pinned ? limit - pinned : 0);
+      }
       ledger.ConstrainLimits({limit + staging, limit, staging, limit});
-      ram = std::min(ram, limit > pinned ? limit - pinned : 0);
       resources->commit_backing(ram);
       slot_pinned_bytes = pinned;
     } else {
       // Slots allocated under the host ceiling; return to the budget. This
       // ignores pinned_bytes: a runner that pins must commit backing.
+      load_disk_catalog();
       const auto staging = ledger.Limits().staging_bytes;
       ledger.ConstrainLimits({ram + staging, ram, staging, ram});
     }
     budget = ram;
     if (options) {
-      catalog = std::make_unique<cache::DiskCatalog>(ledger, *disk, index);
-      for (const auto& durable : disk->Entries()) {
-        cache::ExecutionHistory::ObserveDurableId(
-            durable.Manifest().checkpoint);
-        if (durable.Manifest().compatibility == digest)
-          (void)index.Insert(identity,
-                             catalog->Find(durable.Manifest().checkpoint));
-      }
       streaming = std::make_unique<cache::StreamedStore>(
           ledger, *disk, cache::kDefaultDiskStagingBytes, resources->staging,
           resources->stream, ReadAheadBytes(slot_ceiling));
