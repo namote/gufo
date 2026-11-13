@@ -3,7 +3,9 @@
 CPU only (NumPy); never starts a server or a GPU job.
 
 Input: a collector `answers` collection (collect.cpp; readout
-`answer-tokens-mean-post-layer-hc-mean-fp32-v1`). Each record is one
+`answer-tokens-mean-post-layer-hc-mean-fp32-v1`), or a `segments` collection
+(readout `selected-segment-end-rows-mean-post-layer-hc-mean-fp32-v1`), whose
+records are means over selected thought-boundary rows instead. Each record is one
 teacher-forced answer, saved as the per-layer mean over the rows that predict
 its tokens of the post-layer residual averaged over the HC streams, with its
 `group`
@@ -49,6 +51,7 @@ import numpy as np
 import prepare
 
 READOUT = 'answer-tokens-mean-post-layer-hc-mean-fp32-v1'
+SEGMENT_READOUT = 'selected-segment-end-rows-mean-post-layer-hc-mean-fp32-v1'
 MAX_ADD = 64.0
 
 
@@ -60,8 +63,9 @@ def load(collection):
     """(manifest, {pair: {group: [rows [layers][hidden]]}})."""
     collection = Path(collection)
     manifest = json.loads((collection / 'manifest.json').read_text())
-    if manifest.get('readout') != READOUT:
-        raise ValueError('not an answer-token collection (collect.cpp answers)')
+    if manifest.get('readout') not in (READOUT, SEGMENT_READOUT):
+        raise ValueError('not an answer-token or segment collection '
+                         '(collect.cpp answers or segments)')
     hidden, layers = manifest['hidden'], manifest['layers']
     pairs = {}
     for record in manifest['records']:
@@ -149,7 +153,7 @@ def fit(collection, kind='mean_diff', rank=1, method='pca', seed=0, alpha=0.0,
     profile['steering_fit'] = dict(
         pairs=int(diffs.shape[0]), skipped_questions=skipped, kind=kind,
         rank=int(reached), method=method, seed=seed, alpha=alpha,
-        single_layer=single_layer,
+        single_layer=single_layer, readout=manifest['readout'],
         collection_sha256=sha((Path(collection) / 'manifest.json').read_bytes()))
     return profile
 

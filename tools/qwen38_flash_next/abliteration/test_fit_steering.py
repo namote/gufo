@@ -18,7 +18,7 @@ spec.loader.exec_module(fit_steering)
 HIDDEN, LAYERS = 4, 2
 
 
-def write(root, items):
+def write(root, items, readout=None):
     """items: (id, group, pair, [layers][hidden])."""
     root.mkdir(parents=True)
     records = []
@@ -29,7 +29,7 @@ def write(root, items):
             id=identity, activation_sha256=hashlib.sha256(raw).hexdigest())))
         records.append(dict(id=identity, group=group, pair=pair))
     (root / 'manifest.json').write_text(json.dumps(dict(
-        readout=fit_steering.READOUT, hidden=HIDDEN, layers=LAYERS,
+        readout=readout or fit_steering.READOUT, hidden=HIDDEN, layers=LAYERS,
         model_identity='m', split='collection', records=records)))
     return root
 
@@ -68,6 +68,15 @@ class FitSteeringTest(unittest.TestCase):
             self.assertEqual(profile['attention'], [0.0, 0.0])
             self.assertEqual(profile['direction_count'], 1)
             self.assertFalse(profile['preserve_norm'])
+
+    def test_accepts_segment_collections_and_rejects_unknown_readouts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            items = [('0a', 'own', 'q', np.zeros((LAYERS, HIDDEN))),
+                     ('0b', 'exemplar', 'q', np.ones((LAYERS, HIDDEN)))]
+            fit_steering.load(write(Path(tmp) / 's', items,
+                                    fit_steering.SEGMENT_READOUT))
+            with self.assertRaises(ValueError):
+                fit_steering.load(write(Path(tmp) / 'x', items, 'last-row-v1'))
 
     def test_defaults_do_not_compound(self):
         # The same shift at both layers: layer 1 adds nothing new.
