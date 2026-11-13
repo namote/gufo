@@ -69,6 +69,7 @@ std::shared_ptr<const ReasoningBudget> Unlimited() {
   auto budget = std::make_shared<ReasoningBudget>();
   budget->tokens = ReasoningBudget::kUnlimited;
   budget->ends = {3};
+  budget->forced = {3};
   return budget;
 }
 
