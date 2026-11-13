@@ -54,6 +54,19 @@ Where the jobs live:
 - **Tool (C):** fit, train (SPSA) and test (generation grid) are jobs in the tool's own HTTP API. A fit job calls gufo's collect job and polls it, and its own job reports both stages.
 - **A stays synchronous:** an upload or delete is quick and returns its result directly.
 
+## C+. Self-generated datasets (TODO, user request November 13)
+
+Data preparation becomes a job too, with the model writing its own material through gufo:
+1. **Traces from a problem set:** a `generate` job runs a problem set under given settings (effort, sampling, seeds, concurrency), keeps the reasoning traces, grades them when answers are known, and builds the dataset:
+   - thought-boundary labels: re-check against forward, and the three-way useful/harmful/neutral labeller from R9-train;
+   - a shuffled-label control.
+
+   This replaces the hand-run `think_eval.py` steps.
+2. **Instruction pairs:** the model answers each prompt under an instruction and without it. The pairs builder then makes the CAA dataset (as R5b).
+3. **Prompts themselves (later):** the model writes prompt sets for a named behavior, e.g. problems likely to cause overthinking. Deduplicate, filter by a check run, and keep evaluation sets disjoint (never generated from or graded against AIME 2025 or other held-out sets).
+
+All three are jobs with keys and polling, and feed the fit job directly.
+
 ## D. Steering lab page (TODO after A–C)
 
 Requested by the user on November 13. A web page over C (and through it A and B), served by the external tool, not by gufo:
