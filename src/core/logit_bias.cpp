@@ -102,8 +102,8 @@ LogitBiasProfile ParseLogitBiasProfile(std::string_view text,
   for (const auto& [key, value] : root.members()) {
     if (key == "format") {
       if (!value.is_string() || value.str() != kLogitBiasFormat)
-        Fail(source, "'format' must be \"" + std::string(kLogitBiasFormat) +
-                         "\"");
+        Fail(source,
+             "'format' must be \"" + std::string(kLogitBiasFormat) + "\"");
       format = true;
     } else if (key == "name") {
       if (!value.is_string() || !ValidName(value.str()))
@@ -113,8 +113,8 @@ LogitBiasProfile ParseLogitBiasProfile(std::string_view text,
       profile.name = value.str();
       name = true;
     } else if (key == "scope") {
-      const auto parsed = value.is_string() ? ParseLogitBiasScope(value.str())
-                                            : std::nullopt;
+      const auto parsed =
+          value.is_string() ? ParseLogitBiasScope(value.str()) : std::nullopt;
       if (!parsed)
         Fail(source, "'scope' must be \"all\", \"answer\" or \"reasoning\"");
       profile.scope = *parsed;
@@ -191,16 +191,15 @@ void ResolveLogitBiasProfiles(
     auto& profile = profiles[i];
     for (const auto id : profile.tokens)
       if (id >= vocabulary_size)
-        throw std::invalid_argument(
-            "logit bias: profile '" + profile.name + "': token id " +
-            std::to_string(id) + " is outside the vocabulary of " +
-            std::to_string(vocabulary_size));
+        throw std::invalid_argument("logit bias: profile '" + profile.name +
+                                    "': token id " + std::to_string(id) +
+                                    " is outside the vocabulary of " +
+                                    std::to_string(vocabulary_size));
     auto& strings = matched[i];
     std::ranges::sort(strings);
     strings.erase(std::unique(strings.begin(), strings.end()), strings.end());
     profile.string_matches = strings.size();
-    profile.tokens.insert(profile.tokens.end(), strings.begin(),
-                          strings.end());
+    profile.tokens.insert(profile.tokens.end(), strings.begin(), strings.end());
     std::ranges::sort(profile.tokens);
     profile.tokens.erase(
         std::unique(profile.tokens.begin(), profile.tokens.end()),

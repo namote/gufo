@@ -418,8 +418,8 @@ GpuSamplingParameters QwenGpuExecutor::PrepareGpuSamplingParameters(
                                   : nullptr,
       .han_bias = static_cast<float>(han_bias),
       // This position's phase offsets, as for the Han offset above.
-      .logit_bias = logit_bias_.Row(sampler, weights_.config.vocab_size,
-                                    arena_.stream),
+      .logit_bias =
+          logit_bias_.Row(sampler, weights_.config.vocab_size, arena_.stream),
   };
 }
 

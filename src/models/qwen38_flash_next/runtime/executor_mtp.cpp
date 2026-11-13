@@ -198,10 +198,10 @@ bool Executor::KeepHiddenRow(Session& session, std::uint32_t row,
       "kept hidden row", error_msg);
 }
 
-bool Executor::SetHanRows(
-    const sampling::SamplerState& sampler, GreedyPenaltyRows* rows,
-    std::span<const std::vector<float>* const> row_bias,
-    std::string* error_msg) const {
+bool Executor::SetHanRows(const sampling::SamplerState& sampler,
+                          GreedyPenaltyRows* rows,
+                          std::span<const std::vector<float>* const> row_bias,
+                          std::string* error_msg) const {
   const auto& settings = sampler.config();
   if (settings.han_bias() == 0 && !settings.logit_bias_active())
     return true;

@@ -266,10 +266,9 @@ inline std::optional<SamplingRequestError> ParseLogitBiasSelection(
       return error("'logit_bias_overrides' must map profile names to biases",
                    "invalid_logit_bias_overrides");
     for (const auto& [name, value] : overrides->members()) {
-      const auto found =
-          std::ranges::find_if(output->profiles, [&](const auto& entry) {
-            return entry.first == name;
-          });
+      const auto found = std::ranges::find_if(
+          output->profiles,
+          [&](const auto& entry) { return entry.first == name; });
       if (found == output->profiles.end())
         return error("'logit_bias_overrides' names '" + name +
                          "', which 'logit_bias_profiles' does not select",
@@ -307,9 +306,9 @@ inline std::optional<SamplingRequestError> ParseLogitBiasSelection(
                      "invalid_logit_bias");
       const auto parsed = bias(value);
       if (!parsed)
-        return error("'logit_bias." + key +
-                         "' must be a number between -100 and 100",
-                     "invalid_logit_bias");
+        return error(
+            "'logit_bias." + key + "' must be a number between -100 and 100",
+            "invalid_logit_bias");
       output->tokens.emplace_back(static_cast<sampling::TokenId>(id), *parsed);
     }
     std::ranges::sort(output->tokens);

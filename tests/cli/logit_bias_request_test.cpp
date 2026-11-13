@@ -51,8 +51,8 @@ Parsed Parse(std::string_view body, const LogitBiasCatalog* catalog) {
 
 void TestSelection() {
   const auto catalog = Catalog();
-  const auto accepted = Parse(R"({"logit_bias_profiles":["wait","hmm"]})",
-                              &catalog);
+  const auto accepted =
+      Parse(R"({"logit_bias_profiles":["wait","hmm"]})", &catalog);
   Expect(accepted.code.empty() && accepted.config.logit_bias_active(),
          "several profiles combine");
   const auto& bias = *accepted.config.logit_bias;
@@ -61,10 +61,9 @@ void TestSelection() {
              (*bias.answer)[1] == 0.0F,
          "overlapping sets add per phase");
 
-  const auto overridden =
-      Parse(R"({"logit_bias_profiles":["wait","hmm"],
+  const auto overridden = Parse(R"({"logit_bias_profiles":["wait","hmm"],
                 "logit_bias_overrides":{"wait":-6}})",
-            &catalog);
+                                &catalog);
   Expect(overridden.code.empty() &&
              (*overridden.config.logit_bias->reasoning)[1] == -6.0F &&
              (*overridden.config.logit_bias->reasoning)[3] == -2.0F,
@@ -108,10 +107,10 @@ void TestSelection() {
                            &catalog);
   Expect(nulls.code.empty() && !nulls.config.logit_bias,
          "null fields select nothing");
-  Expect(Parse(R"({"logit_bias_profiles":[]})", &catalog).code.empty() &&
-             !Parse(R"({"logit_bias_profiles":[]})", &catalog)
-                  .config.logit_bias,
-         "an empty selection adds nothing");
+  Expect(
+      Parse(R"({"logit_bias_profiles":[]})", &catalog).code.empty() &&
+          !Parse(R"({"logit_bias_profiles":[]})", &catalog).config.logit_bias,
+      "an empty selection adds nothing");
   Expect(Parse(R"({"logit_bias_other":1})", &catalog).code ==
              "unsupported_sampling",
          "other logit_bias spellings stay unsupported");
@@ -147,15 +146,13 @@ void TestOpenAiMap() {
 
 void TestUnsupportedBackend() {
   // Without a catalog the fields stay unsupported, as before.
-  for (const auto* body :
-       {R"({"logit_bias":{"1":1}})", R"({"logit_bias":0.8})",
-        R"({"logit_bias_profiles":["wait"]})",
-        R"({"logit_bias_overrides":{"wait":1}})"})
+  for (const auto* body : {R"({"logit_bias":{"1":1}})", R"({"logit_bias":0.8})",
+                           R"({"logit_bias_profiles":["wait"]})",
+                           R"({"logit_bias_overrides":{"wait":1}})"})
     Expect(Parse(body, nullptr).code == "unsupported_sampling",
            std::string("unsupported without profiles: ") + body);
-  for (const auto* body :
-       {R"({"logit_bias":{}})", R"({"logit_bias":null})",
-        R"({"logit_bias_profiles":null})"})
+  for (const auto* body : {R"({"logit_bias":{}})", R"({"logit_bias":null})",
+                           R"({"logit_bias_profiles":null})"})
     Expect(Parse(body, nullptr).code.empty(),
            std::string("neutral values stay accepted: ") + body);
 }
