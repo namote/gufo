@@ -398,6 +398,29 @@
       - **Shuffled-label control:** the same rows with labels permuted within each trace. 16–27/41 (chance) and SNR −0.2 to 0.3; |d| at L45 is 1.06, against 5.09 for A. So A is not an artefact of the pairing.
       - **B, depth:** the same medium trace, every thought end, under the low-effort instruction plus the prompt versus the bare prompt. 130/130 at every layer, SNR 2.3–4.6; increments sum to 2.7.
       - **cos(A, B)** is −0.13 to −0.19 at L44–L47 and about 0 elsewhere. The low state leans slightly away from "about to re-check", but the two are nearly independent levers.
+      - **Cross-layer cosines of A** (`xlayer.py`): there are two families, L0–L32 (0.6–0.8 between neighbours) and L36–L47 (0.74–0.96). L20 against L43 is 0.29. Held-out separation stays 36–41/41 even across families, so separation alone does not show which direction is right; the cosine does.
+    - **Re-check suppression grid** (`step4.sh`, November 13; evidence `results/aime24-low-*.jsonl`).
+      - Setup: the 15 AIME 2024 problems with the longest medium traces, low effort, 32k cap, 4 sessions. The runtime is an experiment build `rt/` at cf79d767 plus the logit-bias build. Every request sends an explicit `abliteration` member.
+      - Profiles:
+        - `recheck-pL`: the pol-avg recipe, i.e. the projected A direction from layer L, residual removal at every layer, attention/mlp 0.
+        - `rc`: the additive A profile at its fitted increments, sign flipped.
+        - `wait`: logit bias on Wait/wait/Hmm/hmm/Alternatively/alternatively (11 tokens) in the reasoning phase only.
+
+      | Setting | Correct | Mean tokens | Median | Truncated | Hesitations |
+      |---|---:|---:|---:|---:|---:|
+      | low, nothing | 13 | 10,973 | 6,663 | 1 | 37.3 |
+      | **recheck-p45, residual 1.0** | **13** | **7,298** | 5,370 | **0** | **12.9** |
+      | recheck-p45, residual 0.5 | 12 | 6,411 | 3,975 | 0 | 10.5 |
+      | recheck-p32, residual 1.0 | 11 | 10,022 | 5,710 | 2 | 33.5 |
+      | additive −0.5× | 10 | 6,371 | 5,454 | 0 | 4.1 |
+      | additive −1× | **0** | 8,798 | 4,899 | 1 | 0.1 |
+      | wait bias −2 | 12 | 12,451 | 5,880 | 3 | 27.5 |
+      | wait bias −4 | 12 | 12,223 | 6,026 | 2 | 20.7 |
+
+      - **L45 removal keeps accuracy and cuts hesitations by about 65% and tokens by about 33%.** The strength is not sensitive: 0.5 and 1.0 behave alike within 15-problem noise.
+      - **L32 barely acts.** The re-check state lives in the late family, where A separates best.
+      - **Additive steering overshoots.** At −1× the model degenerates into repeated lines and never answers (0/15). Removal stops at zero along the direction; addition has no such floor.
+      - **Banning the words is worse than nothing.** The model re-checks in other words, and traces get longer. What has to go is the state, not the tokens.
   - **Combined profile for the English Tiananmen gap** (not measured): `dynamic/profiles-pol-fnx2/` holds `pol-avg` (byte-identical to production's except `trigger.with: ["fnx"]`, threshold 0.7) and production's `fnx` (no trigger). A pol-avg detection then turns both ON; where both have strength at a site, they project onto the orthonormal union of their directions with the larger strength (docs/SERVER.md, several profiles).
   - **Threshold 0.7 for `dynamic/profiles-pol/`** (signed off; `fit_trigger.py --threshold 0.7`, the fitted 1.199 kept in the report as `fitted_threshold`, evidence `dynamic/fit-pol-0.7.json`):
     - Offline at 0.7: recall 92.1%; false positives 4.2% on the hard political controls (Gwangju, Tiananmen-like events elsewhere) and 1.3% on harmless prompts.
