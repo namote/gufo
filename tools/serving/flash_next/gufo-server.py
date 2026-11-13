@@ -152,7 +152,7 @@ def build_command(state):
     command += [IMAGE_ID, 'serve', 'llm', '--host', BIND_HOST, '--port', '18740',
                 '--model', '/models/fnx/', '--served-model-name', 'gufo-flash-next',
                 '--speculative', 'mtp', '--mtp-model', '/models/fnx/', '--draft-tokens', '7', '--think', 'on',
-                '--reasoning-effort', 'medium',
+                '--reasoning-effort', 'low',
                 *(['--enable-yarn'] if ENABLE_YARN else []), '--context', str(CONTEXT), '--sessions', str(SESSIONS),
                 '--kv-cache-type', KV_CACHE_TYPE,
                 '--kv-pool-bytes', str(KV_POOL_BYTES), '--cache-ram-bytes', str(RAM_CACHE_BYTES),
@@ -186,7 +186,7 @@ def supervise():
              'gpu_diagnostics_policy': 'log_only', 'runtime_resource_stop_guard': 'host_memory',
              'kv_pool_bytes': KV_POOL_BYTES, 'kv_cache_type': KV_CACHE_TYPE,
              'enable_yarn': ENABLE_YARN, 'yarn_factor': CONTEXT / 262144 if ENABLE_YARN else 1, 'ram_cache_bytes': RAM_CACHE_BYTES,
-             'thinking': 'on', 'reasoning_effort': 'medium', 'vision_model': VISION,
+             'thinking': 'on', 'reasoning_effort': 'low', 'vision_model': VISION,
              'disk_cache_bytes': DISK_CACHE_BYTES, 'disk_cache_directory': str(CACHE_ROOT / 'continuations')}
     def persist():
         save(out / 'RUN.json', state)

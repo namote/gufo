@@ -421,6 +421,37 @@
       - **L32 barely acts.** The re-check state lives in the late family, where A separates best.
       - **Additive steering overshoots.** At −1× the model degenerates into repeated lines and never answers (0/15). Removal stops at zero along the direction; addition has no such floor.
       - **Banning the words is worse than nothing.** The model re-checks in other words, and traces get longer. What has to go is the state, not the tokens.
+    - **Held-out AIME 2025 and fixed-direction training (R9, November 13–14; evidence `build/b1/think/results/aime25-*.jsonl`, `build/b1/r9/`).**
+      - All 30 AIME 2025 problems, 32k cap, 4 sessions, the same seeds per problem.
+      - **Training data:**
+        - xhigh traces: AIME 2024 25/30 (13,868 tokens, 5 truncated); MATH 100 98/100 (1,446 tokens).
+        - `recheck_objective.py --keep-first-confirmations` labels:
+          - AIME 2024: 103 re-checks = 0 useful, 0 harmful, 43 redundant, 60 neutral.
+          - MATH: 64 = 0 useful, 0 harmful, 17 redundant, 47 neutral.
+          - Result: 58 suppress pairs, 51 keep rows, 123 guard rows.
+        - Re-checks almost never change the answer in either direction.
+      - **SPSA (direction fixed):**
+        - Profile: `recheck-avg` (L40–L47 projected rows, sign-aligned to L45, averaged), learning residual in blocks of 4.
+        - Settings: init 0.5, 40 steps, `--minibatch-chains 12`, 2 sessions, about 5 minutes a step. Prefix reuse came from the RAM cache (20,480-token hits).
+        - Objective −1.56 → −1.50 (small).
+        - Learned residual: 0.64 at L0–L3, 0.2–0.6 in the middle, 0.21 at L44–L47.
+      - The run went entirely through the new APIs:
+        - `tools/steer train` wrapping `spsa.py`;
+        - `tools/steer unload`/`load` against `--allow-profile-updates` on the 8c45bd3d runtime, with no restart. A ninth profile is refused with HTTP 400 "more than 8 profiles", so free a slot first.
+
+      | AIME 2025 (30) | Correct | Mean tokens | Median | Truncated | Hesitations |
+      |---|---:|---:|---:|---:|---:|
+      | **low, nothing** | **28** | 7,738 | 3,929 | 2 | 24.0 |
+      | medium (production default until November 14) | 27 | 8,989 | 5,445 | 2 | 25.8 |
+      | xhigh, nothing | 24 | 13,447 | 9,636 | 6 | 27.0 |
+      | low + recheck-p45 (untrained, residual 1.0) | 22 | 7,795 | 3,578 | 4 | 12.8 |
+      | low + recheck-r9 (trained) | 25 | 7,009 | 3,076 | 2 | 10.5 |
+      | xhigh + recheck-r9 (trained) | 27 | 12,792 | 10,299 | 3 | 16.8 |
+
+      - **Training helps xhigh** (24 → 27, half the truncations, 38% fewer hesitations), **but it does not beat plain low**, which needs 40% fewer tokens.
+      - **On low, suppression costs accuracy whether trained or not** (28 → 25 / 22), while hesitations halve. Fewer hesitations is not more correctness here: low's re-checks are cheap and sometimes needed.
+      - **The AIME 2024 gain did not transfer.** The 13/13 tie on the 15-problem source set came from the direction's own year.
+      - **Decision (user, November 14):** production runs `--reasoning-effort low` with no re-check profile. Medium AIME 2025 + r9 was not run.
   - **Combined profile for the English Tiananmen gap** (not measured): `dynamic/profiles-pol-fnx2/` holds `pol-avg` (byte-identical to production's except `trigger.with: ["fnx"]`, threshold 0.7) and production's `fnx` (no trigger). A pol-avg detection then turns both ON; where both have strength at a site, they project onto the orthonormal union of their directions with the larger strength (docs/SERVER.md, several profiles).
   - **Threshold 0.7 for `dynamic/profiles-pol/`** (signed off; `fit_trigger.py --threshold 0.7`, the fitted 1.199 kept in the report as `fitted_threshold`, evidence `dynamic/fit-pol-0.7.json`):
     - Offline at 0.7: recall 92.1%; false positives 4.2% on the hard political controls (Gwangju, Tiananmen-like events elsewhere) and 1.3% on harmless prompts.
