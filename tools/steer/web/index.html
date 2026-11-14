@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Steering lab</title>
+<link rel="icon" href="/web/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/web/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">Steering lab</div>
+  <div class="status" id="status">
+    <span id="health" class="pill">service: ?</span>
+    <span id="gufo" class="pill">gufo: ?</span>
+    <span id="profiles" class="pill muted">profiles: ?</span>
+  </div>
+  <button id="theme" type="button" class="ghost" title="Switch light and dark">Theme</button>
+</header>
+<div id="banner" class="banner" hidden></div>
+<nav class="tabs" id="tabs">
+  <a href="#datasets" data-tab="datasets">Datasets</a>
+  <a href="#run" data-tab="run">Run (fit)</a>
+  <a href="#train" data-tab="train">Train</a>
+  <a href="#test" data-tab="test">Test and tune</a>
+  <a href="#pipeline" data-tab="pipeline">Pipeline</a>
+  <a href="#history" data-tab="history">History</a>
+</nav>
+<main id="main"></main>
+<div id="toast" class="toast" hidden></div>
+<script src="/web/charts.js"></script>
+<script src="/web/app.js"></script>
+</body>
+</html>

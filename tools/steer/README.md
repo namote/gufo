@@ -401,6 +401,36 @@ pairs step, keeps its finished rows (the earlier child is
 added to its `resume` list); an interrupted train step continues its spsa.py
 log when its params are unchanged, with the earlier job's recipe values.
 
+## Lab page
+
+The service also serves a single-page lab (`web/`: plain HTML, CSS and JS,
+no build step, nothing fetched from another host):
+
+```sh
+python3 -I tools/steer --work DIR --gufo-url URL --collections-dir COLLECT serve
+# then open http://127.0.0.1:18790/
+```
+
+`GET /` and `GET /web/FILE` return the files in `web/` (hidden names, `..`
+and unknown file types are refused; the page's Content-Security-Policy
+allows only this service). Every step goes through the job API above; the
+page polls `GET /jobs/{key}?since=N` every 1.5 s while a job runs.
+
+| Tab | Starts | Shows |
+| --- | --- | --- |
+| Datasets | `dataset` (traces, pairs, import), `pairs` (model-generated) | `/datasets`; records paged (`/datasets/{name}/records`); for a traces dataset, each thought boundary labelled "before a re-check" or "moving on" next to its shuffled control's label |
+| Run (fit) | `fit` | collection progress; per-layer held-out accuracy and SNR (real against control), \|mean D\|, the cross-layer cosine heat map, the real/control cosine, transfer, top layers; default profiles with upload (`POST /profiles/...` `{job, profile}`) |
+| Train | `train` | J+ and J- per step with eval J, eval margin and drop, per-layer strengths (any step, next to the best eval), warnings and recipe; `profile` (build, or build and upload) and the trained profile into a test configuration |
+| Test and tune | `test` | configurations with per-layer strength sliders (all equal, a layer range, block averages, or a train job's strengths), logit bias, effort and sampling; per-configuration totals against the baseline (the first configuration), per-problem rows with a diff of two configurations; "try next setting" clones a configuration into a new job compared with the old one |
+| Pipeline | `pipeline` (a JSON file such as `examples/r10.json`, edited in place) | each step's status and child job (`pipeline_step`), linked to its own view |
+| History | re-run with the same params | `/jobs` with cancel/delete, any job's results; objective counts; profile files with upload |
+
+The header shows the service and gufo URL, the loaded profiles
+(`/gufo/props`), and a warning when the gufo URL uses the production port
+18740 or gufo refused an upload (no `--allow-profile-updates`). Promoting a
+profile into the runtime profile directory is a production change: the page
+only shows the command to run.
+
 ## Load
 
 ```sh

@@ -247,6 +247,41 @@ def parse(body):
     return value
 
 
+WEB = Path(__file__).resolve().parent / 'web'
+WEB_TYPES = {'.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8',
+             '.js': 'text/javascript; charset=utf-8', '.json': 'application/json',
+             '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon',
+             '.txt': 'text/plain; charset=utf-8'}
+# The lab page talks only to this service: no other origin, no inline code.
+WEB_POLICY = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+              "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+
+
+def static_file(path):
+    """GET / and GET /web/FILE: the lab page's files in tools/steer/web/, as
+    (status, content type, bytes); None for every other path. Hidden names,
+    `..`, backslashes and unknown file types are refused."""
+    if path in ('', '/'):
+        name = 'index.html'
+    elif path.startswith('/web/'):
+        name = urllib.parse.unquote(path[len('/web/'):])
+    else:
+        return None
+    missing = (404, 'application/json',
+               json.dumps(dict(error=dict(code='not_found', message='no such page file'))).encode())
+    parts = name.split('/')
+    if any(not p or p.startswith('.') or any(c in p for c in '\\\0:') for p in parts):
+        return missing
+    suffix = Path(name).suffix.lower()
+    if suffix not in WEB_TYPES:
+        return missing
+    root = WEB.resolve()
+    target = (root / name).resolve()
+    if root not in target.parents or not target.is_file():
+        return missing
+    return 200, WEB_TYPES[suffix], target.read_bytes()
+
+
 def make_server(api, host='127.0.0.1', port=18790):
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
@@ -268,6 +303,18 @@ def make_server(api, host='127.0.0.1', port=18790):
                     self.close_connection = True
                     raise ApiError(413, 'payload_too_large', 'at most 64 MiB')
                 body = self.rfile.read(length) if length else b''
+                page = static_file(url.path) if method == 'GET' else None
+                if page is not None:
+                    status, content_type, payload = page
+                    self.send_response(status)
+                    self.send_header('Content-Type', content_type)
+                    self.send_header('Content-Length', str(len(payload)))
+                    self.send_header('Cache-Control', 'no-cache')
+                    self.send_header('X-Content-Type-Options', 'nosniff')
+                    self.send_header('Content-Security-Policy', WEB_POLICY)
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 status, reply = api.handle(method, url.path, urllib.parse.parse_qs(url.query),
                                            body)
             except ApiError as error:
