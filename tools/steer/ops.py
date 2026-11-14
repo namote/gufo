@@ -49,7 +49,8 @@ def _pipeline(job):
 def _profile(job):
     """Operation `profile`: the trained profile from a train job (or given
     `settings`): `base_profile` (a file or {job, profile}) with the best
-    strengths as its defaults, written to the job's profiles/NAME.json;
+    strengths as its defaults (and, for a train job with a `basis`, its tuned
+    direction), written to the job's profiles/NAME.json;
     `upload` (false) also sends it to gufo (`kind` abliteration)."""
     import training
     p = job.params
@@ -72,8 +73,10 @@ def _profile(job):
     base = p.get('base_profile') or (train.params.get('base_profile') if train else None)
     if not base:
         raise ValueError('profile needs base_profile')
-    item = training.write_profile(job, name, training.trained_profile(
-        training.load_base(job.store, base), settings))
+    # A direction run's best also carries its tuned direction (alpha).
+    best = (train.state['output']['best'] if train else None) or dict(settings=settings)
+    item = training.write_profile(job, name, training.best_profile(
+        training.load_base(job.store, base), best, train.params.get('basis') if train else None))
     output = dict(name=name, path=item['path'], uploaded=False)
     if p.get('upload'):
         reply = _upload(job, 'abliteration', name, Path(item['path']).read_bytes())
@@ -153,7 +156,8 @@ def profile_bytes(store, kind, name, body):
             if not best or not base:
                 raise ValueError(f'train job {job.key} needs best settings and a base profile '
                                  '(body "base": a file or {job, profile})')
-            profile = training.trained_profile(training.load_base(store, base), best['settings'])
+            profile = training.best_profile(training.load_base(store, base), best,
+                                            job.params.get('basis'))
             return json.dumps(profile, separators=(',', ':')).encode()
         raise FileNotFoundError(f'job {job.key} wrote no profile {profile}')
     raise ValueError('give file, job (and profile) or the profile object')

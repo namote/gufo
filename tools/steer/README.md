@@ -99,7 +99,7 @@ held-out evaluation set.
 | `fit` | `dataset`, or `collection` (+ `control_collection`) for an existing local collection; `control` (true), `collect_only`, `collection_name`, `collections_dir`, `top_n` (4), `profile_layers` (default the top 2), `alpha` (1.0), `additive_kind` (mean_diff), `prefix` | `collect`, `collection`, `layer`, `cosine`, `transfer`, `top`, `control_cosine`, `profile` | collection, pairs, top, per-layer rows, control, profile names and folder |
 | `test` | `set` {`kind` math\|coding\|prompts, `path`, `split`, `ids`, `limit`, `max_tokens`, `suffix`, `seed_base`, `splits`, `image`}, `configs`, `concurrency` (2), `model`, `request_timeout`, `resume` | `config`, `resume` (with resume), then `row` and running `totals` per finished problem | `totals` per configuration, `generations` folder, `configs`, `set_kind` |
 | `objective` | `sets` [{`name`, `kind` math\|coding, `problems`, `traces` \| `generations`+`config` \| `job`+`config`, `effort`, `splits`}], `keep_first_confirmations` (false), `max_boundaries` (8), `opener_tokens` (3), `guard_tokens` (1024), `redundant_after` (1), `seed` (0), `examples` (3), `max_prefix_tokens` (12288), `max_prefix_chars` (0), `max_guard_tokens` (12288), `max_guard_chars` (0), `guard_cap` (skip\|cut) | `objective_set` per set, `objective_rows` | `pairs`, `keep`, `guard` (paths, null when empty), `counts`, `labels`, `chains`, `longest_row_tokens`, `context_tokens`, `caps`, `effort` |
-| `train` | `objective` (job key) or `pairs`/`ordinary`/`guard` paths; `options` {spsa option: value} and/or `args` (spsa.py options; the tool sets `--base-url`, `--log`, `--output`); `fast_defaults` (true), `server_check` (warn\|off), `base_profile` (path or {`job`, `profile`}) + `profile_name`, `resume` (train job key), `python` | `warning`, `train`, `step` (one per spsa.py log line), `best`, `profile` (with `profile_name`) | `log`, `best`, `best_path`, `recipe`, `profile`, `profile_path` |
+| `train` | `objective` (job key) or `pairs`/`ordinary`/`guard` paths; `options` {spsa option: value} and/or `args` (spsa.py options; the tool sets `--base-url`, `--log`, `--output`, and `--profile-output` with `basis`); `fast_defaults` (true), `server_check` (warn\|off), `base_profile` (path or {`job`, `profile`}) + `profile_name`, `basis` (a direction basis: also learn the direction, see "R11"), `resume` (train job key), `python` | `warning`, `train`, `step` (one per spsa.py log line), `best`, `profile` (with `profile_name`) | `log`, `best`, `best_path`, `recipe`, `profile`, `profile_path` |
 | `profile` | `train` (job key) or `settings`, `base_profile` (default the train job's), `name`, `upload` (false) | `profile`, `upload` | `name`, `path`, `uploaded`, `reply` |
 | `load` | `name`, `kind` (abliteration), `file` \| `job`+`profile` (+ `base` for a train job) \| `profile` {...}, `unload` [names to delete first] | `unload`, `upload` | `kind`, `name`, `reply` |
 | `pairs` | `name`, `prompts` (JSONL) or `set`, `instruction`, `abliteration`, `reasoning_effort`, `sampling`, `mode` (answers\|segments), `concurrency`, `model`, `request_timeout`, `resume`, `max_chars`, `require_stop` (true), `contrast` (true), `exclude_ids`, `replace` | as `test` (configurations `with` and `without`), then `dataset` | `datasets`, `totals`, `generations` |
@@ -225,8 +225,8 @@ Every job result has `seq` and `type`; these are the fields per type.
 | `objective_rows` | objective | the job output (see the table above) |
 | `warning` | train | `code` (no_props, few_sessions, long_context), `message` |
 | `train` | train | `args` (the spsa.py options sent), `steps`, `layers`, `block_size`, `recipe` {`sessions`, `n_ctx`, `context_needed`, `applied` {`concurrency`, `minibatch_chains`}} |
-| `step` | train | `step` (-1 is the initial eval), `theta` (block parameters, kinds attention, mlp, residual), `strengths` {`attention`, `mlp`, `residual`: per layer}, `j_plus`, `j_minus`, `eval_j` (null between evals), `plus`, `minus`, `eval` (spsa.py's terms: `j`, `margin`, `drop`, `drop_max`, `margin_min`, `guard_excess`, `guard_drop_max`, ...) |
-| `best` | train | `step`, `eval`, `settings` (the request settings: per-layer `attention`, `mlp`, `residual`, direction options, `profile`) |
+| `step` | train | `step` (-1 is the initial eval), `theta` (block parameters, kinds attention, mlp, residual), `strengths` {`attention`, `mlp`, `residual`: per layer}, `j_plus`, `j_minus`, `eval_j` (null between evals), `plus`, `minus`, `eval` (spsa.py's terms: `j`, `margin`, `drop`, `drop_max`, `margin_min`, `guard_excess`, `guard_drop_max`, ...); with `basis` also `alpha` (basis coefficients) and `angle` (degrees to d0) |
+| `best` | train | `step`, `eval`, `settings` (the request settings: per-layer `attention`, `mlp`, `residual`, direction options, `profile` (absent with `basis`)); with `basis` also `alpha`, `angle`, `basis`, `basis_sha256` |
 | `upload`, `unload` | profile, load | `kind`, `name`, `reply` (gufo's) |
 | `server` | pipeline | `step`, `matched`, `sessions`, `n_ctx` (an `await_server` that matched) |
 | `pipeline_step` | pipeline | `index`, `name`, `operation`, `job` (the child key), `status` (running, done, failed, cancelled), `params` (resolved), and at the end `output`, `error`; `reused` (an earlier run's step), `resumed_from` (the earlier child passed as `resume`) |
@@ -400,6 +400,79 @@ changed). The first step that runs again, when it is an interrupted test or
 pairs step, keeps its finished rows (the earlier child is
 added to its `resume` list); an interrupted train step continues its spsa.py
 log when its params are unchanged, with the earlier job's recipe values.
+
+## R11: direction and strengths
+
+R10 learns per-layer residual strengths with the direction fixed to
+`recheck-avgx` (the L40-L47 projected rows of the xhigh-trace fit, averaged
+and sign-aligned to L45). R11 also moves the direction, inside a small
+subspace, starting from R10's best strengths.
+
+1. **Basis (offline, NumPy; pinned container).**
+   `tools/qwen38_flash_next/abliteration/direction_basis.py` reads the
+   collection the direction was fitted from and pools each pair's projected
+   difference at L40-L47. Each layer's rows are scaled to a unit mean and
+   sign-aligned to L45, as `build/b1/r10/newavg.py` aligns them. It removes
+   the component along d0 (the base profile's L45 row) and writes d0 and the
+   top-k principal axes of the rest, with their explained variance, as a
+   `gufo-direction-basis-v1` file:
+
+   ```sh
+   python3 -I tools/docker/pinned_rocm101.py run --build-dir build/lbias --source . -- sh -c \
+       'cd /build/source && /opt/venv/bin/python3 -s -I tools/qwen38_flash_next/abliteration/direction_basis.py \
+          --collection build/b1/r10/collect/rcx-e1142a4f3142 \
+          --base-profile build/b1/r10/rt10/abliteration/recheck-avgx.json \
+          --layers 40-47 --ref-layer 45 --direction-layer 45 -k 6 --output build/b1/r11/basis-avgx-k6.json'
+   ```
+
+2. **Training.** `spsa.py --basis` (spsa.py's docstring, "Direction")
+   learns theta = [strength blocks, alpha]. The direction is
+   d(alpha) = normalize(d0 + sum alpha_k u_k), with |alpha| capped at
+   tan(`--max-angle`), so the direction stays within that angle of d0.
+   alpha has its own perturbation and step sizes and its own random stream.
+   Before each burst, spsa.py uploads the profile of theta+ and theta- under
+   two of the `--dir-names` (the third is for evals). Each upload replaces
+   the previous one, and all are deleted at the end. The run refuses to
+   start when the loaded profiles plus these names would pass gufo's cap of
+   8 (two names then fit one more). The check runs once at start, so do
+   not upload other profiles to the training server during the run.
+   alpha = 0 keeps the base rows bit for bit, so it scores exactly as the
+   fixed direction (the upload's bytes, and so its cache identity, differ
+   from the base file's).
+
+   | Train option | spsa.py | Default |
+   | --- | --- | --- |
+   | `basis` (param) | `--basis` | (none: fixed direction) |
+   | `base_profile` (param) | `--base-profile` (set by the job) | required with `basis` |
+   | `max_angle` | `--max-angle` | 20 (degrees) |
+   | `c_dir`, `a_dir` | `--c-dir`, `--a-dir` | 0.04, 0.05 (strengths: `c` 0.15, `a` 0.15) |
+   | `dir_names` | `--dir-names` | `r11-p,r11-m,r11-e` |
+   | `init_alpha` | `--init-alpha` | 0 (or the alpha of a previous `--output` with the same basis) |
+   |  | `--profile-output` (set by the job: `best-profile.json`) | |
+
+   Leave `profile` out: a direction run scores only its own uploads. Step
+   results add `alpha` and `angle` (degrees to d0), and `best` adds
+   `alpha`, `angle`, `basis` and `basis_sha256`. The trained profile
+   (`profile_name`, the `profile` operation, `load` from the train job) holds
+   the tuned L45 row: `projected_directions[45]` and `directions[45]`, as
+   `newavg.py` writes them. The lab page's Train view adds the angle and the
+   alpha curves.
+
+3. **Pipeline.** `examples/r11.json` runs train, profile (`recheck-r11`,
+   uploaded), then AIME 2025 and the coding eval as `r10.json` does. It uses
+   R10's objective job, so run it with R10's work folder, after R10's
+   evaluation:
+
+   ```sh
+   python3 -I tools/steer --work build/b1/r10/steer10 --gufo-url $URL pipeline tools/steer/examples/r11.json
+   ```
+
+   The train step starts from R10's best (`init`:
+   `build/b1/r10/steer10/jobs/631b98c155de13d8f1ec90ee5ab4b61c/best.json`).
+   It uses the same objective rows, guard, chain ordering and minibatch (12
+   chains), 60 steps, strength `a` 0.1, eval every 10. Each theta costs one
+   upload of the 2.3 MB profile (about 1 s): two per step and one per eval,
+   on top of R10's scoring.
 
 ## Lab page
 

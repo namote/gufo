@@ -1,0 +1,131 @@
+{
+ "description": "R11: joint SPSA over the direction (6 basis vectors of the L40-L47 paired-difference residuals around recheck-avgx, at most 20 degrees from it) and the per-layer residual strengths, from R10's best strengths, on R10's objective rows (job d81b81ca5f6c3b6f0361b6b28f3f1160 in the R10 work folder build/b1/r10/steer10). Run from the repository root against that work folder: python3 -I tools/steer --work build/b1/r10/steer10 --gufo-url URL pipeline tools/steer/examples/r11.json (README.md, \"R11: direction and strengths\").",
+ "steps": [
+  {
+   "name": "train",
+   "operation": "train",
+   "await_server": {
+    "min_sessions": 16,
+    "min_context": 15360,
+    "max_context": 32768
+   },
+   "params": {
+    "objective": "d81b81ca5f6c3b6f0361b6b28f3f1160",
+    "base_profile": "build/b1/r10/rt10/abliteration/recheck-avgx.json",
+    "basis": "build/b1/r11/basis-avgx-k6.json",
+    "options": {
+     "direction_layer": 45,
+     "direction_kind": "projected",
+     "directions": 1,
+     "preserve_norm": "off",
+     "init": "build/b1/r10/steer10/jobs/631b98c155de13d8f1ec90ee5ab4b61c/best.json",
+     "learn": "residual",
+     "block_size": 4,
+     "max_strength": 2,
+     "lam": 2,
+     "nu": 4,
+     "guard_margin": 0.02,
+     "steps": 60,
+     "a": 0.1,
+     "c": 0.15,
+     "eval_every": 10,
+     "seed": 11,
+     "minibatch_chains": 12,
+     "max_angle": 20,
+     "c_dir": 0.04,
+     "a_dir": 0.05,
+     "dir_names": "r11-p,r11-m,r11-e"
+    }
+   }
+  },
+  {
+   "name": "profile",
+   "operation": "profile",
+   "await_server": {
+    "min_context": 40960
+   },
+   "params": {
+    "train": {
+     "from": "train",
+     "key": "job"
+    },
+    "name": "recheck-r11",
+    "upload": true
+   }
+  },
+  {
+   "name": "eval-aime25",
+   "operation": "test",
+   "params": {
+    "set": {
+     "kind": "math",
+     "path": "build/b1/r10/aime25.jsonl",
+     "max_tokens": 32768
+    },
+    "concurrency": 4,
+    "configs": [
+     {
+      "name": "xhigh-r11",
+      "reasoning_effort": "xhigh",
+      "abliteration": {
+       "enabled": true,
+       "profile": "recheck-r11"
+      }
+     },
+     {
+      "name": "low-r11",
+      "reasoning_effort": "low",
+      "abliteration": {
+       "enabled": true,
+       "profile": "recheck-r11"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "eval-code",
+   "operation": "test",
+   "params": {
+    "set": {
+     "kind": "coding",
+     "path": "build/b1/r5-coding",
+     "split": "eval"
+    },
+    "concurrency": 4,
+    "configs": [
+     {
+      "name": "low-off",
+      "reasoning_effort": "low",
+      "sampling": {
+       "chat_template_kwargs": {
+        "enable_thinking": true
+       },
+       "temperature": 1.0,
+       "top_p": 0.95,
+       "seed": 7,
+       "max_tokens": 32768
+      }
+     },
+     {
+      "name": "low-on",
+      "reasoning_effort": "low",
+      "sampling": {
+       "chat_template_kwargs": {
+        "enable_thinking": true
+       },
+       "temperature": 1.0,
+       "top_p": 0.95,
+       "seed": 7,
+       "max_tokens": 32768
+      },
+      "abliteration": {
+       "enabled": true,
+       "profile": "recheck-r11"
+      }
+     }
+    ]
+   }
+  }
+ ]
+}

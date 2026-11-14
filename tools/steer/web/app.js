@@ -847,6 +847,7 @@
       { key: 'guard', label: 'Guard JSONL', wide: true }, { key: 'facts', label: 'Facts JSONL', wide: true },
       { key: 'base_profile', label: 'Base profile for the trained profile (file path, or JSON {"job", "profile"})', wide: true },
       { key: 'profile_name', label: 'Trained profile name' },
+      { key: 'basis', label: 'Direction basis file (also learns the direction; needs the base profile above; options as more args)', wide: true },
       { key: 'resume', label: 'Resume from train job key' },
       { key: 'fast_defaults', label: 'Fast training-server defaults', type: 'check', value: true, omitWhen: true },
       { key: 'layers', label: 'Layers', type: 'int', value: 48 },
@@ -889,7 +890,7 @@
         args.push(...(t.startsWith('[') ? JSON.parse(t) : t.split(/\s+/)));
       }
       const p = { args };
-      for (const k of ['python', 'objective', 'pairs', 'ordinary', 'guard', 'profile_name', 'resume']) if (v[k] !== undefined) p[k] = v[k];
+      for (const k of ['python', 'objective', 'pairs', 'ordinary', 'guard', 'profile_name', 'resume', 'basis']) if (v[k] !== undefined) p[k] = v[k];
       if (v.fast_defaults === false) p.fast_defaults = false;
       if (v.base_profile) p.base_profile = v.base_profile.startsWith('{') ? JSON.parse(v.base_profile) : v.base_profile;
       return p;
@@ -911,10 +912,12 @@
       const layers = Number(head.layers || argValue(args, '--layers', 48));
       const block = Number(head.block_size || argValue(args, '--block-size', 1));
       const steps = w.of('step');
-      const jp = [], jm = [], je = [], margin = [], drop = [];
+      const jp = [], jm = [], je = [], margin = [], drop = [], angle = [], alpha = [];
       let best = null;
       for (const r of steps) {
         const x = r.step + 1;
+        if (typeof r.angle === 'number') angle.push([x, r.angle]);
+        if (Array.isArray(r.alpha)) r.alpha.forEach((a, i) => { (alpha[i] = alpha[i] || []).push([x, a]); });
         const plus = r.j_plus ?? (r.plus && r.plus.j), minus = r.j_minus ?? (r.minus && r.minus.j);
         if (typeof plus === 'number') jp.push([x, plus]);
         if (typeof minus === 'number') jm.push([x, minus]);
@@ -927,6 +930,14 @@
         { name: 'eval J (theta)', cls: 's3', points: je, dots: true }], xLabel: 'step (0 = init)', yLabel: 'J', empty: 'J per step appears as spsa.py logs it' });
       C.lines(cBox, { series: [{ name: 'eval margin', cls: 's1', points: margin, dots: true }, { name: 'eval drop', cls: 's2', points: drop, dots: true }],
         xLabel: 'step', yLabel: 'nats per token', height: 160, empty: 'evals every --eval-every steps' });
+      let dirCard = null;
+      if (angle.length) {
+        const aBox = h('div', {}), cfBox = h('div', {});
+        C.lines(aBox, { series: [{ name: 'angle to d0 (degrees)', cls: 's1', points: angle }], xLabel: 'step', yLabel: 'degrees', height: 140 });
+        C.lines(cfBox, { series: alpha.map((pts, i) => ({ name: `alpha ${i + 1}`, cls: `s${(i % 3) + 1}`, dashed: i >= 3, points: pts })),
+          xLabel: 'step', yLabel: 'coefficient', height: 160, ref: 0 });
+        dirCard = h('div', { class: 'card' }, h('h3', {}, 'Direction (basis coefficients)'), aBox, h('h4', {}, 'alpha per basis vector'), cfBox);
+      }
       // Strengths at the picked step (default: the latest), next to the best eval.
       const withTheta = steps.filter((r) => Array.isArray(r.theta));
       if (follow || pick === null || pick >= withTheta.length) pick = withTheta.length - 1;
@@ -957,7 +968,7 @@
         h('div', { class: 'card' }, h('h3', {}, `J per step (${steps.filter((r) => r.step >= 0).length}/${head.steps || '?'})`), jBox, h('h4', {}, 'Eval components'), cBox),
         h('div', { class: 'card' }, h('div', { class: 'row' }, h('h3', {}, 'Per-layer strengths'), h('span', { class: 'spacer' }),
           at ? `step ${at.step + 1}${follow ? ' (following)' : ''}` : '', scrub), h('div', { class: 'muted' }, `layers ${layers}, block size ${block}`), strengthBoxes),
-        bestCard);
+        ...(dirCard ? [dirCard] : []), bestCard);
       });
     }
     render();

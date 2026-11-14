@@ -340,6 +340,75 @@ class TrainProfileTest(CplusTest):
         self.assertEqual(train['recipe']['applied'], {})
 
 
+class TrainDirectionTest(CplusTest):
+    """The train job with a direction basis (spsa.py --basis): uploads under
+    rotating names, alpha and angle per step, the trained profile with the
+    tuned direction, and the profile operation building it again."""
+
+    def test_basis_wiring(self):
+        import training
+        df = training.direction_family
+        hidden, layer = 8, 2
+        unit = lambda i: [1.0 if j == i else 0.0 for j in range(hidden)]
+        rows = [unit(i + 3) for i in range(LAYERS)]
+        rows[layer] = unit(0)
+        base = dict(schema='gufo-abliteration-v2', model_identity='fake', hidden=hidden,
+                    layers=LAYERS, placement='writer-before-hc', directions=rows,
+                    direction_layer=layer, attention=[0.0] * LAYERS, mlp=[0.0] * LAYERS,
+                    residual=[1.0] * LAYERS, rank=1,
+                    projected_directions=[df.encode_row(r) for r in rows],
+                    direction_kind='projected', direction_count=1, preserve_norm=False)
+        (self.root / 'dbase.json').write_text(json.dumps(base))
+        basis = self.root / 'basis.json'
+        basis.write_text(json.dumps(dict(schema=df.SCHEMA, hidden=hidden, d0=unit(0),
+                                         basis=[unit(1), unit(2)])))
+        objective = TrainProfileTest.objective(self)
+        params = dict(objective=objective.key, base_profile=str(self.root / 'dbase.json'),
+                      basis=str(basis), profile_name='rc-r11',
+                      options=dict(layers=LAYERS, direction_layer=layer, direction_kind='projected',
+                                   init=0.5, block_size=2, steps=3, eval_every=1, max_strength=2,
+                                   c_dir=0.05, a_dir=0.05, max_angle=10, dir_names='t-p,t-m,t-e'))
+        _, job = self.run_job('train', params)
+        self.assertEqual(job.state['status'], 'done', job.state['error'])
+        train = [r for r in job.results if r['type'] == 'train'][0]
+        self.assertEqual(train['args'][train['args'].index('--basis') + 1], str(basis))
+        self.assertEqual(train['args'][train['args'].index('--base-profile') + 1],
+                         str(self.root / 'dbase.json'))
+        steps = [r for r in job.results if r['type'] == 'step']
+        self.assertEqual([s['step'] for s in steps], [-1, 0, 1, 2])
+        self.assertTrue(all(len(s['alpha']) == 2 and 0 <= s['angle'] <= 10 + 1e-6 for s in steps))
+        self.assertEqual(len(steps[1]['strengths']['residual']), LAYERS)
+        best = job.state['output']['best']
+        self.assertEqual(len(best['alpha']), 2)
+        # Every uploaded name was deleted again; chats named only those profiles.
+        self.assertFalse([k for k in self.fake.profiles if k[1].startswith('t-')])
+        named = {(c.get('abliteration') or {}).get('profile') for c in self.fake.chats
+                 if c.get('abliteration')}
+        self.assertEqual(named, {'t-p', 't-m', 't-e'})
+        want = df.direction(df.load_basis(basis), best['alpha'])
+        for path in (job.state['output']['profile_path'], job.dir / 'best-profile.json'):
+            profile = json.loads(Path(path).read_text())
+            row = df.decode_row(profile['projected_directions'][layer], hidden)
+            self.assertEqual(row, [df.float32(x) for x in want])
+            self.assertEqual(profile['residual'], best['settings']['residual'])
+        # The profile operation builds the same tuned profile from the train job.
+        _, built = self.run_job('profile', dict(train=job.key, name='rc-r11b'))
+        self.assertEqual(built.state['status'], 'done', built.state['error'])
+        again = json.loads(Path(built.state['output']['path']).read_text())
+        self.assertEqual(again['projected_directions'][layer],
+                         profile['projected_directions'][layer])
+        raw = ops.profile_bytes(jobs.JobStore(self.work), 'abliteration', 'x',
+                                dict(job=job.key, profile='nothing-written'))
+        self.assertEqual(json.loads(raw)['projected_directions'][layer],
+                         profile['projected_directions'][layer])
+        # The tool sets --profile-output; basis needs base_profile.
+        with self.assertRaisesRegex(ValueError, 'set by the tool'):
+            training.check_args(['--profile-output', 'x'])
+        bad = dict(params, base_profile=None, profile_name=None)
+        _, job = self.run_job('train', {k: v for k, v in bad.items() if v is not None})
+        self.assertIn('needs base_profile', job.state['error'])
+
+
 class PairsTest(CplusTest):
     def test_pairs_generation(self):
         prompts = write_jsonl(self.root / 'prompts.jsonl', [
@@ -462,6 +531,15 @@ class PipelineTest(CplusTest):
         self.assertEqual(names[-2:], ['eval-aime25', 'eval-code'])
         self.assertTrue(pipeline.held_out(r10['steps'][-1]))
         self.assertTrue(pipeline.held_out(r10['steps'][-2]))
+        r11 = json.loads((HERE / 'examples' / 'r11.json').read_text())
+        self.assertEqual(pipeline.check_steps(r11['steps']),
+                         ['train', 'profile', 'eval-aime25', 'eval-code'])
+        options = r11['steps'][0]['params']['options']
+        import training
+        flags = [a for a in training.options_args(options) if a.startswith('--')]
+        self.assertFalse(set(flags) - training.SPSA_OPTIONS)  # every option is spsa.py's
+        training.check_args(training.options_args(options))
+        self.assertNotIn('profile', options)  # a direction run scores its own profiles
 
     def test_cancel_cancels_the_child(self):
         gate = threading.Event()

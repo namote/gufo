@@ -30,6 +30,14 @@ best strengths) to `profiles/NAME.json` and emits a `profile` result.
 `resume` (an earlier train job's key) copies its spsa.py log, so spsa.py
 continues from its last step when the settings and rows are the same.
 Cancelling the job terminates the child.
+
+Direction (R11): `basis` (a direction_basis.py file) also learns the
+direction in that subspace (spsa.py `--basis`; its options `max_angle`,
+`c_dir`, `a_dir`, `dir_names`, `init_alpha` go in `options`). It needs
+`base_profile`, which the job passes as `--base-profile`; the job sets
+`--profile-output` (`best-profile.json`). Step results then carry `alpha`
+and `angle`, `best` carries `alpha`, `angle` and the basis, and the trained
+profile (here and in the profile operation) holds the tuned direction.
 """
 import json
 import math
@@ -47,12 +55,13 @@ ABLITERATION = HERE.parent / 'qwen38_flash_next' / 'abliteration'
 if str(ABLITERATION) not in sys.path:
     sys.path.insert(0, str(ABLITERATION))
 
+import direction_family  # noqa: E402
 import spsa  # noqa: E402
 
-RESERVED = ('--base-url', '--log', '--output')
+RESERVED = ('--base-url', '--log', '--output', '--profile-output')
 ROW_OPTIONS = ('--pairs', '--ordinary', '--guard')
 PARAMS = {'args', 'options', 'python', 'objective', 'pairs', 'ordinary', 'guard',
-          'base_profile', 'profile_name', 'resume', 'fast_defaults', 'server_check'}
+          'base_profile', 'profile_name', 'resume', 'fast_defaults', 'server_check', 'basis'}
 MIN_SESSIONS = 8
 MAX_CONTEXT = 65536
 KINDS = ('attention', 'mlp', 'residual')
@@ -93,7 +102,7 @@ def options_args(options):
 
 
 INSPECTED = ('--concurrency', '--minibatch-chains', '--minibatch', '--steps', '--layers',
-             '--block-size', '--pairs', '--ordinary', '--guard')
+             '--block-size', '--pairs', '--ordinary', '--guard', '--basis')
 
 
 # spsa.py's own option names (`--a`, `--c` and `--A` are full names, not prefixes of `--concurrency` or `--answer-tokens`).
@@ -148,17 +157,41 @@ def trained_profile(base, settings):
     return profile
 
 
-def load_base(store, base):
-    """A base profile: a file path or {job, profile} (a profile a job wrote)."""
+def base_path(store, base):
+    """The file of a base profile: a file path or {job, profile} (a profile
+    a job wrote)."""
     if isinstance(base, str):
-        return json.loads(Path(base).read_text())
+        return Path(base)
     if isinstance(base, dict) and base.get('job'):
         other = store.get(base['job'])
         if other is None:
             raise FileNotFoundError(f'no job {base["job"]}')
         name = data.check_name(base.get('profile') or '')
-        return json.loads((other.dir / 'profiles' / f'{name}.json').read_text())
+        return other.dir / 'profiles' / f'{name}.json'
     raise ValueError('base_profile is a path or {job, profile}')
+
+
+def load_base(store, base):
+    """A base profile: a file path or {job, profile} (a profile a job wrote)."""
+    return json.loads(base_path(store, base).read_text())
+
+
+def best_profile(base, best, basis=None):
+    """The trained profile of a train job's `best`: `base` with the best
+    strengths and, for a direction run (`alpha` in best), the tuned direction
+    from the basis (`basis`, default the one best names)."""
+    settings = best['settings']
+    if best.get('alpha') is not None:
+        path = basis or best.get('basis')
+        if not path:
+            raise ValueError('the best settings carry alpha but no basis')
+        if best.get('basis_sha256') and direction_family.file_sha256(path) != best['basis_sha256']:
+            raise ValueError(f'{path} is not the basis the run used')
+        loaded = direction_family.load_basis(path)
+        layer, kind = settings['direction_layer'], settings.get('direction_kind', 'mean_diff')
+        direction_family.check_base(base, loaded, layer, kind)
+        base = direction_family.profile_with_direction(base, loaded, best['alpha'], layer, kind)
+    return trained_profile(base, settings)
 
 
 def write_profile(job, name, profile):
@@ -271,6 +304,21 @@ def run_train_job(job):
         data.check_name(profile_name)
         if base is None:
             raise ValueError('profile_name needs base_profile')
+    basis = p.get('basis')
+    if basis is None and has_option(args, '--basis'):
+        raise ValueError('give the direction basis as the basis param, not --basis '
+                         '(the job then sets --base-profile and --profile-output)')
+    if basis is not None:
+        if not isinstance(basis, str) or not basis:
+            raise ValueError('basis is a path')
+        if has_option(args, '--basis'):
+            raise ValueError('--basis is given twice (basis and args)')
+        if base is None:
+            raise ValueError('basis needs base_profile (the profile the direction family edits)')
+        direction_family.load_basis(basis)  # fail before scoring
+        args += ['--basis', basis]
+        if not has_option(args, '--base-profile'):
+            args += ['--base-profile', str(base_path(job.store, p['base_profile']))]
     gufo = job.context.gufo
     if gufo is None:
         raise ValueError('train needs a gufo server (--gufo-url)')
@@ -293,12 +341,15 @@ def run_train_job(job):
     block = int(option_value(args, '--block-size', 1))
     log = job.dir / 'spsa.jsonl'
     best = job.dir / 'best.json'
+    tool_set = ['--base-url', gufo.base_url, '--log', str(log), '--output', str(best)]
+    if basis is not None:
+        tool_set += ['--profile-output', str(job.dir / 'best-profile.json')]
     if earlier is not None:
         for name in ('spsa.jsonl', 'spsa.jsonl.off.json'):
             if (earlier.dir / name).exists():
                 shutil.copyfile(earlier.dir / name, job.dir / name)
     command = [p.get('python') or sys.executable, '-I', str(HERE / 'spsa_child.py'),
-               '--base-url', gufo.base_url, '--log', str(log), '--output', str(best), *args]
+               *tool_set, *args]
     env = dict(os.environ)
     env.pop('STEER_GUFO_API_KEY', None)
     if gufo.api_key:
@@ -339,7 +390,7 @@ def run_train_job(job):
     summary = dict(log=str(log), best=result, best_path=str(best) if result else None,
                    recipe=recipe)
     if profile_name and result is not None:
-        item = write_profile(job, profile_name, trained_profile(base, result['settings']))
+        item = write_profile(job, profile_name, best_profile(base, result, basis))
         summary.update(profile=profile_name, profile_path=item['path'])
     job.set_output(summary)
 
