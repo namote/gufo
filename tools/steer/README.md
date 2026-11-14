@@ -470,7 +470,7 @@ subspace, starting from R10's best strengths.
    The train step starts from R10's best (`init`:
    `build/b1/r10/steer10/jobs/631b98c155de13d8f1ec90ee5ab4b61c/best.json`).
    It uses the same objective rows, guard, chain ordering and minibatch (12
-   chains), 60 steps, strength `a` 0.1, eval every 10. Each theta costs one
+   chains), 100 steps, strength `a` 0.1, eval every 20. Each theta costs one
    upload of the 2.3 MB profile (about 1 s): two per step and one per eval,
    on top of R10's scoring.
 
