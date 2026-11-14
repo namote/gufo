@@ -13,9 +13,11 @@ Each job lives in `WORK/jobs/KEY/`:
 A restart reloads every job; one that was queued or running fails with
 "interrupted by a restart" (its results so far are kept).
 
-Operations that use the gufo server (fit, test, train) run one at a time in
-arrival order, as gufo itself serves one collection job at a time; dataset
-building runs at once in its own thread.
+Operations that use the gufo server for long (fit, test, train, pairs,
+pipeline) run one at a time in arrival order, as gufo itself serves one
+collection job at a time; the quick ones (dataset, objective, profile, load)
+run at once in their own thread. A pipeline runs its steps as child jobs
+(`parent` is the pipeline's key) inside its own run.
 
 Standard library only.
 """
@@ -30,8 +32,8 @@ import traceback
 
 STATUSES = ('queued', 'running', 'done', 'failed', 'cancelled')
 FINISHED = ('done', 'failed', 'cancelled')
-HEAVY = ('fit', 'test', 'train')
-LIGHT = ('dataset',)
+HEAVY = ('fit', 'test', 'train', 'pairs', 'pipeline')
+LIGHT = ('dataset', 'objective', 'profile', 'load')
 OPERATIONS = HEAVY + LIGHT
 
 
@@ -191,7 +193,7 @@ class JobStore:
         with self.changed:
             self.changed.notify_all()
 
-    def create(self, operation, params):
+    def create(self, operation, params, parent=None):
         if operation not in OPERATIONS:
             raise ValueError(f'operation must be one of {OPERATIONS}')
         if not isinstance(params, dict):
@@ -205,7 +207,7 @@ class JobStore:
             state = dict(key=key, operation=operation, params=params, status='queued',
                          progress=dict(done=0, total=0, step='queued', stage=None),
                          created_at=now, started_at=None, updated_at=now, error=None,
-                         cancel_requested=False, last_seq=0, output=None)
+                         cancel_requested=False, last_seq=0, output=None, parent=parent)
             (self.root / key).mkdir()
             job = Job(self, state)
             job._save()

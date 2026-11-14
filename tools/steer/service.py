@@ -5,6 +5,7 @@ parameters, so never expose it to other users or hosts.
 """
 import http.server
 import json
+from pathlib import Path
 import urllib.parse
 
 import client
@@ -13,6 +14,8 @@ import jobs
 import ops
 
 MAX_BODY = 64 << 20
+PAGE_LIMIT, MAX_PAGE_LIMIT = 20, 200
+ROW_FILES = ('pairs', 'keep', 'guard')
 
 
 class ApiError(Exception):
@@ -31,17 +34,33 @@ class Api:
             return 200, dict(status='ok', gufo=self.context.gufo.describe()
                              if self.context.gufo else None)
         if parts and parts[0] == 'jobs':
+            if len(parts) >= 3:
+                return self.job_files(method, parts[1], parts[2:], query)
             return self.jobs(method, parts[1:], query, body)
         if parts and parts[0] == 'datasets':
-            return self.datasets(method, parts[1:])
+            return self.datasets(method, parts[1:], query)
+        if parts == ['profiles']:
+            if method != 'GET':
+                raise ApiError(405, 'method_not_allowed', 'GET')
+            return 200, dict(object='list', data=profile_files(self.store))
         if parts and parts[0] == 'profiles' and len(parts) == 3:
             return self.profiles(method, parts[1], parts[2], body)
+        if parts == ['gufo', 'props']:
+            if method != 'GET':
+                raise ApiError(405, 'method_not_allowed', 'GET')
+            if self.context.gufo is None:
+                raise ApiError(400, 'no_gufo', 'the tool runs without --gufo-url')
+            return 200, self.context.gufo.props()
         raise ApiError(404, 'not_found', 'unknown path')
 
     def jobs(self, method, rest, query, body):
         if not rest:
             if method == 'GET':
-                return 200, dict(object='list', data=self.store.list())
+                listed = self.store.list()
+                parent = query.get('parent', [None])[0]
+                if parent is not None:
+                    listed = [j for j in listed if j.get('parent') == parent]
+                return 200, dict(object='list', data=listed)
             if method == 'POST':
                 request = parse(body)
                 operation = request.get('operation')
@@ -76,17 +95,51 @@ class Api:
             return 200, reply
         raise ApiError(405, 'method_not_allowed', 'GET or DELETE')
 
-    def datasets(self, method, rest):
+    def datasets(self, method, rest, query=None):
         if method != 'GET':
             raise ApiError(405, 'method_not_allowed', 'GET')
         if not rest:
             return 200, dict(object='list', data=data.list_datasets(self.store.work))
+        try:
+            folder = data.dataset_dir(self.store.work, rest[0])
+        except ValueError:
+            raise ApiError(404, 'unknown_dataset', 'no such dataset') from None
+        if not (folder / 'dataset.json').exists():
+            raise ApiError(404, 'unknown_dataset', 'no such dataset')
         if len(rest) == 1:
-            try:
-                meta, _ = data.load_dataset(self.store.work, rest[0])
-            except (FileNotFoundError, ValueError):
-                raise ApiError(404, 'unknown_dataset', 'no such dataset') from None
-            return 200, meta
+            return 200, json.loads((folder / 'dataset.json').read_text())
+        if rest[1:] == ['records']:
+            return 200, page_jsonl(folder / 'records.jsonl', query or {})
+        raise ApiError(404, 'not_found', 'unknown path')
+
+    def job_files(self, method, key, rest, query):
+        """Read-only views of a job's files: generations, objective rows and
+        written profiles."""
+        if method != 'GET':
+            raise ApiError(405, 'method_not_allowed', 'GET')
+        job = self.store.get(key)
+        if job is None:
+            raise ApiError(404, 'unknown_job', 'no such job')
+        if rest == ['generations']:
+            folder = job.dir / 'generations'
+            files = sorted(folder.glob('*.jsonl')) if folder.is_dir() else []
+            return 200, dict(object='list', data=[
+                dict(config=f.stem, rows=count_lines(f), bytes=f.stat().st_size) for f in files])
+        if len(rest) == 2 and rest[0] == 'generations':
+            path = safe_child(job.dir / 'generations', rest[1], '.jsonl')
+            return 200, page_jsonl(path, query)
+        if rest == ['rows']:
+            folder = job.dir / 'rows'
+            return 200, dict(object='list', data=[
+                dict(name=n, rows=count_lines(folder / f'{n}.jsonl'))
+                for n in ROW_FILES if (folder / f'{n}.jsonl').exists()])
+        if len(rest) == 2 and rest[0] == 'rows':
+            if rest[1] not in ROW_FILES:
+                raise ApiError(404, 'not_found', 'rows are pairs, keep or guard')
+            return 200, page_jsonl(job.dir / 'rows' / f'{rest[1]}.jsonl', query)
+        if len(rest) == 2 and rest[0] == 'profiles':
+            path = safe_child(job.dir / 'profiles', rest[1], '.json')
+            return 200, json.loads(path.read_text())
         raise ApiError(404, 'not_found', 'unknown path')
 
     def profiles(self, method, kind, name, body):
@@ -108,6 +161,80 @@ class Api:
         if method == 'DELETE':
             return 200, gufo.delete_profile(kind, name)
         raise ApiError(405, 'method_not_allowed', 'POST or DELETE')
+
+
+def safe_child(folder, name, suffix):
+    """folder/NAME+suffix for a valid name that exists, else a 404."""
+    try:
+        data.check_name(name)
+    except ValueError:
+        raise ApiError(404, 'not_found', 'no such file') from None
+    path = folder / f'{name}{suffix}'
+    if not path.is_file():
+        raise ApiError(404, 'not_found', 'no such file')
+    return path
+
+
+def count_lines(path):
+    with open(path, 'rb') as handle:
+        return sum(1 for line in handle if line.strip())
+
+
+def _int_query(query, name, default, high=None):
+    try:
+        value = int(query.get(name, [default])[0])
+    except ValueError:
+        value = -1
+    if value < 0:
+        raise ApiError(400, f'invalid_{name}', f'{name} is a non-negative integer')
+    return min(value, high) if high is not None else value
+
+
+def page_jsonl(path, query):
+    """A `page` of a JSONL file: ?offset (0), ?limit (20, at most 200),
+    ?fields (comma-separated keys to keep), ?id (only rows with this id)."""
+    if not Path(path).is_file():
+        raise ApiError(404, 'not_found', 'no such file')
+    offset = _int_query(query, 'offset', 0)
+    limit = _int_query(query, 'limit', PAGE_LIMIT, MAX_PAGE_LIMIT)
+    fields = [f for f in (query.get('fields', [''])[0]).split(',') if f]
+    wanted = query.get('id', [None])[0]
+    rows = []
+    with open(path, encoding='utf-8') as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                break  # a torn last line while the job writes
+    if wanted is not None:
+        rows = [r for r in rows if r.get('id') == wanted]
+    page = rows[offset:offset + limit]
+    if fields:
+        page = [{k: r[k] for k in fields if k in r} for r in page]
+    return dict(object='page', offset=offset, limit=limit, total=len(rows), data=page)
+
+
+def profile_files(store):
+    """Every profile file a job wrote (WORK/jobs/KEY/profiles/NAME.json)."""
+    out = []
+    for state in store.list():
+        folder = store.root / state['key'] / 'profiles'
+        if not folder.is_dir():
+            continue
+        for path in sorted(folder.glob('*.json')):
+            item = dict(name=path.stem, job=state['key'], operation=state['operation'],
+                        path=str(path), bytes=path.stat().st_size, mtime=path.stat().st_mtime)
+            try:
+                profile = json.loads(path.read_text())
+                item.update(mode=profile.get('mode', 'suppress'), layers=profile.get('layers'),
+                            direction_layer=profile.get('direction_layer'),
+                            direction_kind=profile.get('direction_kind'))
+            except ValueError:
+                item['error'] = 'not JSON'
+            out.append(item)
+    return out
 
 
 def parse(body):

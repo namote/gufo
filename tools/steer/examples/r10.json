@@ -1,0 +1,447 @@
+{
+ "description": "R10: re-check suppression trained on xhigh traces of AIME 2024, MATH 100, AIME 2022-2023 and the R5 coding direction split; AIME 2025 and the coding eval split are evaluation only. Run from the repository root: python3 -I tools/steer --gufo-url URL pipeline tools/steer/examples/r10.json (README.md, \"R10 pipeline\").",
+ "steps": [
+  {
+   "name": "traces-aime24",
+   "operation": "test",
+   "params": {
+    "set": {
+     "kind": "math",
+     "path": "build/b1/think/aime24.jsonl",
+     "max_tokens": 32768
+    },
+    "configs": [
+     {
+      "name": "xhigh",
+      "reasoning_effort": "xhigh"
+     }
+    ],
+    "concurrency": 4,
+    "resume": [
+     {
+      "config": "xhigh",
+      "path": "build/b1/think/results/aime24-xhigh.jsonl"
+     }
+    ]
+   },
+   "await_server": {
+    "min_context": 40960
+   }
+  },
+  {
+   "name": "traces-math",
+   "operation": "test",
+   "params": {
+    "set": {
+     "kind": "math",
+     "path": "build/b1/think/math.jsonl",
+     "max_tokens": 32768
+    },
+    "configs": [
+     {
+      "name": "xhigh",
+      "reasoning_effort": "xhigh"
+     }
+    ],
+    "concurrency": 4,
+    "resume": [
+     {
+      "config": "xhigh",
+      "path": "build/b1/think/results/xhigh32.jsonl"
+     }
+    ]
+   }
+  },
+  {
+   "name": "traces-aime2223",
+   "operation": "test",
+   "params": {
+    "set": {
+     "kind": "math",
+     "path": "build/b1/r10/aime2223.jsonl",
+     "max_tokens": 32768
+    },
+    "configs": [
+     {
+      "name": "xhigh",
+      "reasoning_effort": "xhigh"
+     }
+    ],
+    "concurrency": 4,
+    "resume": [
+     {
+      "config": "xhigh",
+      "path": "build/b1/r10/results/aime2223-xhigh.jsonl"
+     }
+    ]
+   }
+  },
+  {
+   "name": "traces-code",
+   "operation": "test",
+   "params": {
+    "set": {
+     "kind": "coding",
+     "path": "build/b1/r5-coding",
+     "split": "direction"
+    },
+    "configs": [
+     {
+      "name": "xhigh",
+      "reasoning_effort": "xhigh",
+      "sampling": {
+       "chat_template_kwargs": {
+        "enable_thinking": true
+       },
+       "temperature": 1.0,
+       "top_p": 0.95,
+       "seed": 7,
+       "max_tokens": 32768
+      }
+     }
+    ],
+    "concurrency": 4,
+    "resume": [
+     {
+      "config": "xhigh",
+      "path": "build/b1/r5-coding/results/think-xhigh-*.jsonl"
+     },
+     {
+      "config": "xhigh",
+      "path": "build/b1/r5-coding/results/xhigh10-*.jsonl"
+     }
+    ]
+   }
+  },
+  {
+   "name": "objective",
+   "operation": "objective",
+   "params": {
+    "sets": [
+     {
+      "name": "aime24",
+      "problems": "build/b1/think/aime24.jsonl",
+      "job": {
+       "from": "traces-aime24",
+       "key": "job"
+      },
+      "config": "xhigh"
+     },
+     {
+      "name": "math",
+      "problems": "build/b1/think/math.jsonl",
+      "job": {
+       "from": "traces-math",
+       "key": "job"
+      },
+      "config": "xhigh"
+     },
+     {
+      "name": "aime2223",
+      "problems": "build/b1/r10/aime2223.jsonl",
+      "job": {
+       "from": "traces-aime2223",
+       "key": "job"
+      },
+      "config": "xhigh"
+     },
+     {
+      "name": "code",
+      "kind": "coding",
+      "problems": "build/b1/r5-coding",
+      "job": {
+       "from": "traces-code",
+       "key": "job"
+      },
+      "config": "xhigh"
+     }
+    ],
+    "keep_first_confirmations": true,
+    "max_boundaries": 8,
+    "opener_tokens": 3,
+    "guard_tokens": 1024,
+    "max_prefix_tokens": 12288,
+    "max_guard_tokens": 12288,
+    "guard_cap": "skip"
+   }
+  },
+  {
+   "name": "train",
+   "operation": "train",
+   "await_server": {
+    "min_sessions": 16,
+    "min_context": {
+     "from": "objective",
+     "key": "context_tokens"
+    },
+    "max_context": 32768
+   },
+   "params": {
+    "objective": {
+     "from": "objective",
+     "key": "job"
+    },
+    "base_profile": "build/b1/r10/rt10/abliteration/recheck-avg.json",
+    "options": {
+     "profile": "recheck-avg",
+     "direction_layer": 45,
+     "direction_kind": "projected",
+     "directions": 1,
+     "preserve_norm": "off",
+     "init": {
+      "attention": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ],
+      "mlp": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ],
+      "residual": [
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5,
+       0.5
+      ]
+     },
+     "learn": "residual",
+     "block_size": 4,
+     "max_strength": 2,
+     "lam": 2,
+     "nu": 4,
+     "guard_margin": 0.02,
+     "steps": 100,
+     "a": 0.2,
+     "c": 0.15,
+     "eval_every": 20,
+     "seed": 1
+    }
+   }
+  },
+  {
+   "name": "profile",
+   "operation": "profile",
+   "await_server": {
+    "min_context": 40960
+   },
+   "params": {
+    "train": {
+     "from": "train",
+     "key": "job"
+    },
+    "name": "recheck-r10",
+    "upload": true
+   }
+  },
+  {
+   "name": "eval-aime25",
+   "operation": "test",
+   "params": {
+    "set": {
+     "kind": "math",
+     "path": "build/b1/r10/aime25.jsonl",
+     "max_tokens": 32768
+    },
+    "concurrency": 4,
+    "configs": [
+     {
+      "name": "xhigh-r10",
+      "reasoning_effort": "xhigh",
+      "abliteration": {
+       "enabled": true,
+       "profile": "recheck-r10"
+      }
+     },
+     {
+      "name": "low-r10",
+      "reasoning_effort": "low",
+      "abliteration": {
+       "enabled": true,
+       "profile": "recheck-r10"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "eval-code",
+   "operation": "test",
+   "params": {
+    "set": {
+     "kind": "coding",
+     "path": "build/b1/r5-coding",
+     "split": "eval"
+    },
+    "concurrency": 4,
+    "configs": [
+     {
+      "name": "low-off",
+      "reasoning_effort": "low",
+      "sampling": {
+       "chat_template_kwargs": {
+        "enable_thinking": true
+       },
+       "temperature": 1.0,
+       "top_p": 0.95,
+       "seed": 7,
+       "max_tokens": 32768
+      }
+     },
+     {
+      "name": "low-on",
+      "reasoning_effort": "low",
+      "sampling": {
+       "chat_template_kwargs": {
+        "enable_thinking": true
+       },
+       "temperature": 1.0,
+       "top_p": 0.95,
+       "seed": 7,
+       "max_tokens": 32768
+      },
+      "abliteration": {
+       "enabled": true,
+       "profile": "recheck-r10"
+      }
+     }
+    ]
+   }
+  }
+ ]
+}

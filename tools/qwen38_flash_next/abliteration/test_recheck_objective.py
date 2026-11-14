@@ -145,6 +145,56 @@ class BuildTest(unittest.TestCase):
         self.assertEqual([p['id'] for p in a[0]], [p['id'] for p in b[0]])
         self.assertEqual(a[3]['s']['counts']['capped'], 11 - 4)
 
+    def test_prefix_and_guard_caps(self):
+        problems, records = self.records()
+        r1 = records[0]['reasoning']
+        cut = r1.index('Wait')  # the first pair's prefix in characters
+        pairs, _, _, report = ro.build([('s', problems, records, 'xhigh')], max_prefix_chars=cut)
+        self.assertEqual([p['chain'] for p in pairs], ['s:p1', 's:p2'])  # the later p1 pair dropped
+        self.assertEqual(report['s']['counts']['past_prefix_cap'], 1)
+        # Tokens: p1 runs at len(r1 + content) / 50 characters per token.
+        rate = (len(r1) + len(records[0]['content'])) / 50
+        pairs, _, _, _ = ro.build([('s', problems, records, 'xhigh')],
+                                  max_prefix_tokens=int(cut / rate) + 1)
+        self.assertEqual(len(pairs), 2)
+        self.assertEqual(ro.build([('s', problems, records, 'xhigh')])[3]['s']['cost']['max_row_tokens'],
+                         round(len(r1) / rate) + round(len('P1?' + ro.SUFFIX) / rate) + 1024)
+        _, _, guard, report = ro.build([('s', problems, records, 'xhigh')], max_guard_chars=cut)
+        self.assertEqual((guard, report['s']['counts']['guard_skipped']), ([], 1))
+        _, _, guard, report = ro.build([('s', problems, records, 'xhigh')], max_guard_chars=cut,
+                                       guard_cap='cut')
+        self.assertEqual(report['s']['counts']['guard_cut'], 1)
+        self.assertTrue(r1.startswith(guard[0]['reasoning']))
+        self.assertLessEqual(len(guard[0]['reasoning']), cut)
+        self.assertTrue(guard[0]['reasoning'].endswith('\n\n'))
+        with self.assertRaises(ValueError):
+            ro.build([('s', problems, records, 'xhigh')], guard_cap='trim')
+
+    def test_code_guard(self):
+        problems = {'a': dict(id='a', split='direction', prompt='PA'),
+                    'b': dict(id='b', split='direction', prompt='PB'),
+                    'c': dict(id='c', split='strength', prompt='PC'),
+                    'e': dict(id='e', split='eval', prompt='PE')}
+        x = {'reasoning_effort': 'xhigh'}
+        records = [dict(id='a', text='code a', reasoning='Ra', finish_reason='stop', settings=x,
+                        score={'all_pass': True}),
+                   dict(id='a', text='again', reasoning='R', finish_reason='stop', settings=x,
+                        score={'all_pass': True}),
+                   dict(id='b', text='code b', reasoning='Rb', finish_reason='length', settings=x,
+                        score={'all_pass': True}),
+                   dict(id='c', text='code c', reasoning='Rc', finish_reason='stop', settings=x,
+                        score={'all_pass': True}),
+                   dict(id='b', text='low', reasoning='Rb', finish_reason='stop',
+                        settings={'reasoning_effort': 'low'}, score={'all_pass': True})]
+        rows, counts = ro.build_code_guard('code', problems, records, 'xhigh')
+        # build/b1/r10/code_guard.py's row for problem a.
+        self.assertEqual(rows, [dict(id=ro.key('code-guard', 'a'), prompt='PA', answer='code a',
+                                     reasoning='Ra', reasoning_effort='xhigh',
+                                     score_max_tokens=1024, chain='code:a')])
+        self.assertEqual((counts['traces'], counts['truncated'], counts['other_split']), (2, 1, 1))
+        with self.assertRaises(SystemExit):
+            ro.build_code_guard('code', problems, records + [dict(id='e', text='t')], 'xhigh')
+
     def test_skips_non_integer_gold(self):
         problems, records = self.records()
         records[0]['answer'] = '\\frac{1}{2}'

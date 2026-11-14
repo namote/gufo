@@ -1,6 +1,6 @@
 """A small gufo HTTP client (standard library only).
 
-Only the endpoints the tool needs: Chat Completions, the activation collection
+Only the endpoints the tool needs: Chat Completions, `/props`, the activation collection
 jobs (`/v1/abliteration/jobs`) and the runtime profile updates
 (`/v1/abliteration/profiles/{name}`, `/v1/logit-bias/profiles/{name}`); see
 docs/SERVER.md. The API key, when given, is sent as a bearer token and never
@@ -77,6 +77,11 @@ class Gufo:
 
     def cancel_collect(self, key):
         return self.request('DELETE', f'/v1/abliteration/jobs/{urllib.parse.quote(key)}')
+
+    # Server state -------------------------------------------------------------
+    def props(self):
+        """GET /props: sessions (`total_slots`), context, loaded profiles."""
+        return self.request('GET', '/props', attempts=2, timeout=30)
 
     # Runtime profiles ---------------------------------------------------------
     def upload_profile(self, kind, name, data):

@@ -89,6 +89,23 @@ thought, "score_reasoning": true, "reasoning_effort" and "chain"):
             beyond --guard-margin.
 Neutral re-checks are excluded and only counted.
 
+Scoring-cost caps (all off by default; tokens are estimated per trace from
+its characters per generated token):
+  --max-prefix-tokens/--max-prefix-chars drop pairs and keep rows whose
+            reasoning before the boundary is longer (counted
+            past_prefix_cap), before the --max-boundaries sample;
+  --max-guard-tokens/--max-guard-chars bound a guard row's reasoning:
+            --guard-cap skip leaves a longer trace out (guard_skipped), cut
+            keeps its thoughts up to the last thought boundary inside the cap
+            (guard_cut; the answer then follows the shortened trace, the same
+            for the OFF baseline and every theta).
+The longest prefix bounds the training server's context (prompt + reasoning
++ scored tokens must fit), so the caps set how short that context can be.
+
+Coding guard rows (build_code_guard; build/b1/r10/code_guard.py): answers of
+a coding set that pass every hidden test and finished, scored as guard rows
+after their reasoning, one per problem id.
+
 Rows of one trace share "chain" (the trace key): spsa.py sends a chain's
 requests one after another in ascending prefix length, so each request can
 resume from the previous one's prompt checkpoints instead of prefilling the
@@ -272,6 +289,7 @@ def cost(rows, rate):
     request prefilling its whole prefix, and each chain prefilling its longest
     prefix once (checkpoint reuse along the chain), plus the scored rows."""
     tokens = lambda x: round(len(x['reasoning']) / rate[x['chain']])
+    row_tokens = lambda x: tokens(x) + round(len(x['prompt']) / rate[x['chain']]) + x['score_max_tokens']
     requests = sum(2 if 'candid' in x else 1 for x in rows)
     without = sum((2 if 'candid' in x else 1) * tokens(x) for x in rows)
     longest = {}
@@ -280,18 +298,92 @@ def cost(rows, rate):
     scored = sum((2 if 'candid' in x else 1) * x['score_max_tokens'] for x in rows)
     return dict(requests=requests, chains=len(longest), prefill_without_reuse=without,
                 prefill_with_reuse=sum(longest.values()), max_prefix=max(longest.values(), default=0),
-                scored_tokens=scored)
+                max_row_tokens=max((row_tokens(x) for x in rows), default=0), scored_tokens=scored)
+
+
+def rate_of(record):
+    """Characters per generated token of a trace (2.0 without usage)."""
+    generated = (record.get('usage') or {}).get('completion_tokens')
+    text = len(record.get('reasoning') or '') + len(record.get('content') or record.get('text') or '')
+    return text / generated if generated and text else 2.0
+
+
+def within(chars, rate, max_tokens=0, max_chars=0):
+    """Whether a reasoning prefix of `chars` characters fits the caps (0 = none)."""
+    return not ((max_chars and chars > max_chars) or (max_tokens and chars / rate > max_tokens))
+
+
+def guard_reasoning(reasoning, rate, max_tokens=0, max_chars=0, mode='skip'):
+    """(reasoning, how) for a guard row under the caps: how is None (fits),
+    'cut' (cut at the last thought boundary inside the caps) or 'skipped'
+    (reasoning None)."""
+    if within(len(reasoning), rate, max_tokens, max_chars):
+        return reasoning, None
+    if mode == 'cut':
+        starts = [s for s, _ in split_thoughts(reasoning)[1:]
+                  if within(s, rate, max_tokens, max_chars)]
+        if starts:
+            return reasoning[:starts[-1]], 'cut'
+    return None, 'skipped'
+
+
+def build_code_guard(name, problems, records, effort, guard_tokens=1024, max_guard_tokens=0,
+                     max_guard_chars=0, guard_cap='skip', splits=('direction',)):
+    """Guard rows from coding answers that pass every hidden test (record
+    `score.all_pass` from generate.py, or a test job's `correct`), finished
+    with text, at the given effort; the first record per problem id counts.
+    The eval split is refused outright (held out). Returns (rows, counts)."""
+    counts = dict(traces=0, passed=0, truncated=0, guard=0, guard_skipped=0, guard_cut=0,
+                  other_split=0)
+    rows, seen = [], set()
+    for r in records:
+        p = problems.get(r['id'])
+        if p is None or r['id'] in seen:
+            continue
+        if p.get('split') == 'eval':
+            raise SystemExit(f'{name}: {r["id"]} is in the eval split, the held-out set')
+        if p.get('split') not in splits:
+            counts['other_split'] += 1
+            continue
+        settings = r.get('settings') or {}
+        if settings.get('reasoning_effort', effort) != effort:
+            continue
+        seen.add(r['id'])
+        counts['traces'] += 1
+        if r.get('finish_reason') != 'stop':
+            counts['truncated'] += 1
+            continue
+        text = r.get('text') if r.get('text') is not None else r.get('content')
+        passed = (r.get('score') or {}).get('all_pass') if 'score' in r else r.get('correct')
+        if not passed or not (text or '').strip():
+            continue
+        counts['passed'] += 1
+        reasoning, how = guard_reasoning(r.get('reasoning') or '', rate_of(r), max_guard_tokens,
+                                         max_guard_chars, guard_cap)
+        if how:
+            counts['guard_' + how] += 1
+        if reasoning is None:
+            continue
+        rows.append(dict(id=key(f'{name}-guard', r['id']), prompt=p['prompt'], answer=text,
+                         reasoning=reasoning, reasoning_effort=effort,
+                         score_max_tokens=guard_tokens, chain=f'{name}:{r["id"]}'))
+    counts['guard'] = len(rows)
+    return rows, counts
 
 
 def build(sets, opener_tokens=3, guard_tokens=1024, max_boundaries=8, redundant_after=1, seed=0,
-          examples=3, keep_first=False):
-    """Rows and a report from [(name, problems, records, effort)]."""
+          examples=3, keep_first=False, max_prefix_tokens=0, max_prefix_chars=0,
+          max_guard_tokens=0, max_guard_chars=0, guard_cap='skip'):
+    """Rows and a report from [(name, problems, records, effort)]; the caps
+    are described in the module doc (0 = no cap)."""
+    if guard_cap not in ('skip', 'cut'):
+        raise ValueError('guard_cap must be skip or cut')
     pairs, keep, guard = [], [], []
     report = {}
     for name, problems, records, effort in sets:
         counts = dict(traces=0, rechecks=0, useful=0, harmful=0, redundant=0, neutral=0,
                       with_candidate=0, no_alternative=0, capped=0, pairs=0, keep=0, guard=0,
-                      non_integer_gold=0)
+                      non_integer_gold=0, past_prefix_cap=0, guard_skipped=0, guard_cut=0)
         shown = {k: [] for k in ('useful', 'harmful', 'redundant', 'neutral')}
         reasons = {}
         rate = {}  # characters per generated token, per chain (for the cost estimate)
@@ -308,8 +400,7 @@ def build(sets, opener_tokens=3, guard_tokens=1024, max_boundaries=8, redundant_
             counts['traces'] += 1
             prompt = p['problem'] + SUFFIX
             chain = f'{name}:{r["id"]}'
-            generated = (r.get('usage') or {}).get('completion_tokens')
-            rate[chain] = (len(reasoning) + len(r.get('content') or '')) / generated if generated else 2.0
+            rate[chain] = rate_of(r)
             final = r.get('got') if r.get('finish_reason') == 'stop' else None
             spans, labels = label_trace(reasoning, r['answer'], final, redundant_after)
             counts['rechecks'] += len(labels)
@@ -335,6 +426,11 @@ def build(sets, opener_tokens=3, guard_tokens=1024, max_boundaries=8, redundant_
                     chosen.append(('pair', lab))
                 elif lab['label'] == 'useful' or (keep_first and lab['reason'] == 'first confirmation'):
                     chosen.append(('keep', lab))
+            if max_prefix_tokens or max_prefix_chars:
+                fits = [c for c in chosen if within(spans[c[1]['j']][0], rate[chain],
+                                                    max_prefix_tokens, max_prefix_chars)]
+                counts['past_prefix_cap'] += len(chosen) - len(fits)
+                chosen = fits
             if max_boundaries and len(chosen) > max_boundaries:
                 rng = random.Random(f'{seed}:{chain}')
                 keepers = [c for c in chosen if c[0] == 'keep']  # rare: keep them all
@@ -359,10 +455,15 @@ def build(sets, opener_tokens=3, guard_tokens=1024, max_boundaries=8, redundant_
             counts['keep'] += sum(1 for kind, _ in chosen if kind == 'keep')
             content = r.get('content') or ''
             if r.get('correct') and r.get('finish_reason') == 'stop' and content.strip():
-                guard.append(dict(id=key(chain, 'g'), prompt=prompt, answer=content,
-                                  reasoning=reasoning, reasoning_effort=effort,
-                                  score_max_tokens=guard_tokens, chain=chain))
-                counts['guard'] += 1
+                kept, how = guard_reasoning(reasoning, rate[chain], max_guard_tokens,
+                                            max_guard_chars, guard_cap)
+                if how:
+                    counts['guard_' + how] += 1
+                if kept is not None:
+                    guard.append(dict(id=key(chain, 'g'), prompt=prompt, answer=content,
+                                      reasoning=kept, reasoning_effort=effort,
+                                      score_max_tokens=guard_tokens, chain=chain))
+                    counts['guard'] += 1
         counts['candidate_rate'] = round(counts['with_candidate'] / counts['rechecks'], 3) if counts['rechecks'] else None
         report[name] = dict(counts=counts, neutral_reasons=reasons, examples=shown,
                             cost=cost([x for x in pairs + keep + guard if x['chain'] in rate], rate))
@@ -382,6 +483,13 @@ def main(argv=None):
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--keep-first-confirmations', action='store_true',
                     help='also keep the openers of first confirmations of a right answer')
+    ap.add_argument('--max-prefix-tokens', type=int, default=0,
+                    help='drop boundaries with more (estimated) reasoning tokens before them; 0: no cap')
+    ap.add_argument('--max-prefix-chars', type=int, default=0)
+    ap.add_argument('--max-guard-tokens', type=int, default=0,
+                    help='guard rows with longer (estimated) reasoning are skipped or cut; 0: no cap')
+    ap.add_argument('--max-guard-chars', type=int, default=0)
+    ap.add_argument('--guard-cap', choices=('skip', 'cut'), default='skip')
     args = ap.parse_args(argv)
     if not 1 <= args.opener_tokens <= 1024 or not 1 <= args.guard_tokens <= 1024:
         ap.error('--opener-tokens and --guard-tokens must be 1..1024')
@@ -395,7 +503,11 @@ def main(argv=None):
         sets.append((name, P, R, effort))
     pairs, keep, guard, report = build(sets, args.opener_tokens, args.guard_tokens,
                                        args.max_boundaries, args.redundant_after, args.seed,
-                                       keep_first=args.keep_first_confirmations)
+                                       keep_first=args.keep_first_confirmations,
+                                       max_prefix_tokens=args.max_prefix_tokens,
+                                       max_prefix_chars=args.max_prefix_chars,
+                                       max_guard_tokens=args.max_guard_tokens,
+                                       max_guard_chars=args.max_guard_chars, guard_cap=args.guard_cap)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     for fname, rows in (('pairs.jsonl', pairs), ('keep.jsonl', keep), ('guard.jsonl', guard)):

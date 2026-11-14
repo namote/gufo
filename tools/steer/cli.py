@@ -127,6 +127,9 @@ def parser():
                     help='NAME=JSON or NAME=@FILE {abliteration, logit_bias_profiles, '
                          'logit_bias_overrides, reasoning_effort, sampling} (repeatable)')
     te.add_argument('--concurrency', type=int)
+    te.add_argument('--resume', action='append',
+                    help='an earlier test job key, or CONFIG=FILE to import finished rows '
+                         '(think_eval.py or generate.py results; repeatable)')
 
     tn = sub.add_parser('train', help='SPSA strengths (spsa.py options after --)')
     tn.add_argument('spsa_args', nargs=argparse.REMAINDER)
@@ -141,6 +144,13 @@ def parser():
     ul = sub.add_parser('unload', help='remove a runtime profile from gufo')
     ul.add_argument('--kind', choices=tuple(client.PROFILE_KINDS), default='abliteration')
     ul.add_argument('--name', required=True)
+
+    rn = sub.add_parser('run', help='any operation with its params as JSON (README.md, Jobs)')
+    rn.add_argument('operation', choices=jobs.OPERATIONS)
+    rn.add_argument('params', help='a JSON file, or the JSON object itself')
+    pl = sub.add_parser('pipeline', help='a pipeline file (steps), e.g. tools/steer/examples/r10.json')
+    pl.add_argument('file', type=Path)
+    pl.add_argument('--resume', help='an earlier pipeline job key')
 
     sv = sub.add_parser('serve', help='the HTTP job API')
     sv.add_argument('--host', default='127.0.0.1')
@@ -209,7 +219,27 @@ def params_for(args):
             p['configs'] = list(p.get('configs') or []) + args.config
         if args.concurrency:
             p['concurrency'] = args.concurrency
+        if args.resume:
+            sources = []
+            for item in args.resume:
+                config, sep, path = item.partition('=')
+                sources.append(dict(config=config, path=path) if sep else dict(job=item))
+            p['resume'] = sources
         return 'test', p
+    if args.command == 'run':
+        text = args.params
+        if not text.lstrip().startswith('{'):
+            text = Path(text).read_text()
+        value = json.loads(text)
+        if not isinstance(value, dict):
+            raise SystemExit('params must be a JSON object')
+        return args.operation, value
+    if args.command == 'pipeline':
+        value = json.loads(args.file.read_text())
+        params = dict(steps=value['steps'] if isinstance(value, dict) else value)
+        if args.resume:
+            params['resume'] = args.resume
+        return 'pipeline', params
     if args.command == 'train':
         rest = list(args.spsa_args)
         if rest and rest[0] == '--':
@@ -234,6 +264,19 @@ def describe(item):
         return (f'  {item["config"]}: {item["correct"]}/{item["n"]} correct, tokens mean '
                 f'{item["tokens_mean"]} median {item["tokens_median"]}, truncated {item["truncated"]}, '
                 f'hes {item["hesitations_mean"]}, sec {item["seconds_mean"]}')
+    if t == 'pipeline_step':
+        return (f'step {item["index"]} {item["name"]} ({item["operation"]}) {item["status"]}'
+                f'{" reused" if item.get("reused") else ""} job {item["job"]}'
+                + (f': {item["error"]}' if item.get('error') else ''))
+    if t == 'objective_set':
+        c = item['counts']
+        return (f'{item["set"]} ({item["kind"]}, {item["effort"]}): '
+                + ', '.join(f'{k} {c[k]}' for k in ('traces', 'rechecks', 'useful', 'harmful',
+                                                    'redundant', 'neutral', 'pairs', 'keep',
+                                                    'guard', 'past_prefix_cap',
+                                                    'guard_skipped', 'guard_cut') if k in c))
+    if t == 'warning':
+        return f'warning: {item["message"]}'
     if t == 'cosine':
         return f'{item["dataset"]} cross-layer cosines: {item["layers"]} x {item["layers"]}'
     if t == 'step':
@@ -243,7 +286,8 @@ def describe(item):
             line += f' J+ {item["plus"]["j"]:.4f} J- {item["minus"]["j"]:.4f}'
         return line + (f' eval J {e["j"]:.4f}' if e else '')
     short = {k: v for k, v in item.items() if k != 'seq' and not (
-        k in ('matrix', 'separated', 'residual', 'theta') and isinstance(v, (list, dict)))}
+        k in ('matrix', 'separated', 'residual', 'theta', 'strengths', 'attention', 'mlp',
+              'examples', 'output', 'params') and isinstance(v, (list, dict)))}
     return json.dumps(short, ensure_ascii=False)[:400]
 
 
