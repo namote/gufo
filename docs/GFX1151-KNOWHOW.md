@@ -375,7 +375,7 @@
       - **The direction matches its instruction without the instruction tokens.** But the gain over base (+1–2 problems) is within noise: the model already passes about 90%.
     - **Ordinary check** (14 prompts, trap ×1/×2 versus OFF): all math is correct, meth is still refused, and daily, summary and translation answers keep their content (lengths vary ±30%).
     - **Not adopted yet.** It needs harder problems to show a margin, and a coding detector so that it acts only on coding prompts.
-  - **Thinking-depth baselines (`build/b1/think/`, November 13).** Production settings (c03, YaRN 1M, K4V4, MTP 7), thinking on, temperature 1.0 / top-p 0.95 (`think_eval.py`) or seed 7 (`generate.py`), 32768-token cap. `reasoning_effort` low, medium (the default, no instruction) and xhigh; Qwen has only these three (high and max map to xhigh). Medium AIME ran on live production (2 sessions); the rest on a 4-session copy of production (`hard2.sh`).
+  - **Thinking-depth baselines (`build/b1/think/`, November 13).** Production settings (c03, YaRN 1M, K4V4, MTP 7), thinking on, the server sampling preset (temperature 0.75, top-k 20, top-p 0.95; `think_eval.py` sends only a per-problem seed) or temperature 1.0 / top-p 0.95 / seed 7 (`generate.py`, the R5 coding runs), 32768-token cap. `reasoning_effort` low, medium (the default, no instruction) and xhigh; Qwen has only these three (high and max map to xhigh). Medium AIME ran on live production (2 sessions); the rest on a 4-session copy of production (`hard2.sh`).
     - **MATH-500 subset** (100 integer-answer level 3–5 problems, medium): 100/100, mean 1,150 tokens. Too easy to compare depths.
     - **AIME 2025** (30 problems):
 
