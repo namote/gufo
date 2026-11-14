@@ -117,14 +117,6 @@
        "enabled": true,
        "profile": "recheck-r11"
       }
-     },
-     {
-      "name": "low-r11",
-      "reasoning_effort": "low",
-      "abliteration": {
-       "enabled": true,
-       "profile": "recheck-r11"
-      }
      }
     ]
    }
@@ -141,8 +133,8 @@
     "concurrency": 4,
     "configs": [
      {
-      "name": "low-off",
-      "reasoning_effort": "low",
+      "name": "xhigh-off",
+      "reasoning_effort": "xhigh",
       "sampling": {
        "chat_template_kwargs": {
         "enable_thinking": true
@@ -154,8 +146,8 @@
       }
      },
      {
-      "name": "low-on",
-      "reasoning_effort": "low",
+      "name": "xhigh-on",
+      "reasoning_effort": "xhigh",
       "sampling": {
        "chat_template_kwargs": {
         "enable_thinking": true
@@ -169,12 +161,6 @@
        "enabled": true,
        "profile": "recheck-r11"
       }
-     }
-    ],
-    "resume": [
-     {
-      "config": "low-off",
-      "path": "build/b1/r10/steer10/jobs/*/generations/low-off.jsonl"
      }
     ]
    }
