@@ -533,8 +533,8 @@ class PipelineTest(CplusTest):
         self.assertTrue(pipeline.held_out(r10['steps'][-2]))
         r11 = json.loads((HERE / 'examples' / 'r11.json').read_text())
         self.assertEqual(pipeline.check_steps(r11['steps']),
-                         ['train', 'profile', 'eval-aime25', 'eval-code'])
-        options = r11['steps'][0]['params']['options']
+                         ['objective', 'train', 'profile', 'eval-aime25', 'eval-code'])
+        options = r11['steps'][1]['params']['options']
         import training
         flags = [a for a in training.options_args(options) if a.startswith('--')]
         self.assertFalse(set(flags) - training.SPSA_OPTIONS)  # every option is spsa.py's
