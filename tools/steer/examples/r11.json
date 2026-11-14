@@ -124,6 +124,12 @@
        "profile": "recheck-r11"
       }
      }
+    ],
+    "resume": [
+     {
+      "config": "low-off",
+      "path": "build/b1/r10/steer10/jobs/*/generations/low-off.jsonl"
+     }
     ]
    }
   }
