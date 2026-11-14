@@ -174,5 +174,24 @@ class LocalOnlyTest(unittest.TestCase):
                         self.fail(f'{path.name}: remote reference: {line.strip()}')
 
 
+class OriginTest(unittest.TestCase):
+    def test_refusals(self):
+        request_refusal = service.request_refusal
+        ok = [('GET', '127.0.0.1:18790', None), ('POST', '127.0.0.1:18790', None),
+              ('POST', '127.0.0.1:18790', 'http://127.0.0.1:18790'), ('POST', 'localhost:18790', 'http://localhost:18790'),
+              ('GET', '127.0.0.1:18790', 'https://evil.example'), ('POST', None, None), ('DELETE', '[::1]:18790', None)]
+        for args in ok:
+            self.assertIsNone(request_refusal(*args), args)
+        bad = [('POST', '127.0.0.1:18790', 'https://evil.example'), ('DELETE', '127.0.0.1:18790', 'null'),
+               ('POST', '127.0.0.1:18790', 'http://127.0.0.1:9999'), ('GET', 'evil.example:18790', None),
+               ('POST', 'rebind.example:18790', 'http://rebind.example:18790')]
+        for args in bad:
+            self.assertIsNotNone(request_refusal(*args), args)
+        self.assertIsNotNone(request_refusal('GET', 'lab.lan:18790', None, '0.0.0.0'))
+        self.assertIsNone(request_refusal('GET', '192.168.1.5:18790', None, '0.0.0.0'))
+        self.assertIsNotNone(request_refusal('POST', 'rebind.example:18790', 'http://rebind.example:18790', '0.0.0.0'))
+        self.assertIsNotNone(request_refusal('POST', 'lab.lan:18790', 'https://evil.example', '0.0.0.0'))
+
+
 if __name__ == '__main__':
     unittest.main()

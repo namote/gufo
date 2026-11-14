@@ -4,6 +4,7 @@ Binds 127.0.0.1 by default. It reads and writes local files named in job
 parameters, so never expose it to other users or hosts.
 """
 import http.server
+import ipaddress
 import json
 from pathlib import Path
 import urllib.parse
@@ -282,6 +283,31 @@ def static_file(path):
     return 200, WEB_TYPES[suffix], target.read_bytes()
 
 
+LOCAL_HOSTS = ('127.0.0.1', 'localhost', '[::1]')
+
+
+def request_refusal(method, host, origin, bind='127.0.0.1'):
+    """Why a request is refused, or None. Jobs read and write local paths, so
+    a request must name a loopback Host (DNS rebinding), and a state-changing
+    request from a browser must come from this service's own origin (any page
+    the user visits could otherwise POST simple text/plain requests here)."""
+    name = (host or '').rsplit(':', 1)[0] if not (host or '').startswith('[') else (host or '').split(']')[0] + ']'
+    bare = name[1:-1] if name.startswith('[') else name
+    try:
+        ipaddress.ip_address(bare)
+        literal = True
+    except ValueError:
+        literal = False
+    open_bind = bind in ('0.0.0.0', '::', '')
+    # On an open bind any IP literal is fine (a rebinding page cannot make the browser send one); names stay refused.
+    if host is not None and not (name in LOCAL_HOSTS or bare == bind or (open_bind and literal)):
+        return f'Host {host!r} is not a loopback name or IP address'
+    if method != 'GET' and origin is not None:
+        if origin == 'null' or urllib.parse.urlsplit(origin).netloc != host:
+            return f'cross-origin {method} from {origin!r} refused'
+    return None
+
+
 def make_server(api, host='127.0.0.1', port=18790):
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
@@ -303,6 +329,9 @@ def make_server(api, host='127.0.0.1', port=18790):
                     self.close_connection = True
                     raise ApiError(413, 'payload_too_large', 'at most 64 MiB')
                 body = self.rfile.read(length) if length else b''
+                refusal = request_refusal(method, self.headers.get('Host'), self.headers.get('Origin'), host)
+                if refusal:
+                    raise ApiError(403, 'forbidden_origin', refusal)
                 page = static_file(url.path) if method == 'GET' else None
                 if page is not None:
                     status, content_type, payload = page
