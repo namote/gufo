@@ -1,16 +1,62 @@
 {
- "description": "R11: joint SPSA over the direction (6 basis vectors of the L40-L47 paired-difference residuals around recheck-avgx, at most 20 degrees from it) and the per-layer residual strengths, from R10's best strengths, on R10's objective rows (job d81b81ca5f6c3b6f0361b6b28f3f1160 in the R10 work folder build/b1/r10/steer10). Run from the repository root against that work folder: python3 -I tools/steer --work build/b1/r10/steer10 --gufo-url URL pipeline tools/steer/examples/r11.json (README.md, \"R11: direction and strengths\").",
+ "description": "R11: joint SPSA over the direction (6 basis vectors of the L40-L47 paired-difference residuals around recheck-avgx, at most 20 degrees from it) and the per-layer residual strengths, from R10's best strengths, on rows rebuilt from R10's xhigh traces with the prefix cap raised to 28672 tokens so deep re-checks in long (hard) traces are kept (R10's 12288 cap dropped 78 of them; training server 12 sessions x 32768). Run from the repository root against that work folder: python3 -I tools/steer --work build/b1/r10/steer10 --gufo-url URL pipeline tools/steer/examples/r11.json (README.md, \"R11: direction and strengths\").",
  "steps": [
+  {
+   "name": "objective",
+   "operation": "objective",
+   "params": {
+    "sets": [
+     {
+      "name": "aime24",
+      "problems": "build/b1/think/aime24.jsonl",
+      "job": "81c4460adf7a7e17c6e86fff934cde02",
+      "config": "xhigh"
+     },
+     {
+      "name": "math",
+      "problems": "build/b1/think/math.jsonl",
+      "job": "b00c323bf1b0a755b303970a94dc7a83",
+      "config": "xhigh"
+     },
+     {
+      "name": "aime2223",
+      "problems": "build/b1/r10/aime2223.jsonl",
+      "job": "c410b2711f33c668ee5a551501ebefa6",
+      "config": "xhigh"
+     },
+     {
+      "name": "code",
+      "kind": "coding",
+      "problems": "build/b1/r5-coding",
+      "job": "700eaff9c8d8b98eb41b7498cd9ca6c3",
+      "config": "xhigh"
+     }
+    ],
+    "keep_first_confirmations": true,
+    "max_boundaries": 8,
+    "opener_tokens": 3,
+    "guard_tokens": 1024,
+    "max_prefix_tokens": 28672,
+    "max_guard_tokens": 12288,
+    "guard_cap": "skip"
+   }
+  },
   {
    "name": "train",
    "operation": "train",
    "await_server": {
-    "min_sessions": 16,
-    "min_context": 15360,
+    "min_sessions": 12,
+    "min_context": {
+     "from": "objective",
+     "key": "context_tokens"
+    },
     "max_context": 32768
    },
    "params": {
-    "objective": "d81b81ca5f6c3b6f0361b6b28f3f1160",
+    "objective": {
+     "from": "objective",
+     "key": "job"
+    },
     "base_profile": "build/b1/r10/rt10/abliteration/recheck-avgx.json",
     "basis": "build/b1/r11/basis-avgx-k6.json",
     "options": {
