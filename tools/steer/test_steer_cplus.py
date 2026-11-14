@@ -321,6 +321,9 @@ class TrainProfileTest(CplusTest):
         with self.assertRaisesRegex(ValueError, 'in full'):
             import training
             training.check_args(['--conc', '4'])
+        # spsa.py's own short names are full options, not abbreviations (the R10 pipeline sets a and c)
+        training.check_args(['--a', '0.2', '--c', '0.15', '--A', '10'])
+        self.assertEqual(training.options_args(dict(a=0.2, c=0.15)), ['--a', '0.2', '--c', '0.15'])
 
     def test_short_context_fails_before_scoring(self):
         objective = self.objective()

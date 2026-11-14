@@ -33,6 +33,7 @@ Cancelling the job terminates the child.
 """
 import json
 import math
+import re
 import os
 from pathlib import Path
 import shutil
@@ -95,9 +96,15 @@ INSPECTED = ('--concurrency', '--minibatch-chains', '--minibatch', '--steps', '-
              '--block-size', '--pairs', '--ordinary', '--guard')
 
 
+# spsa.py's own option names (`--a`, `--c` and `--A` are full names, not prefixes of `--concurrency` or `--answer-tokens`).
+SPSA_OPTIONS = frozenset(re.findall(r"add_argument\('(--[A-Za-z0-9-]+)'", Path(spsa.__file__).read_text()))
+
+
 def check_args(args):
     for a in args:
         option = a.split('=', 1)[0]
+        if option in SPSA_OPTIONS and option not in RESERVED:
+            continue
         if option.startswith('--') and option not in INSPECTED and any(
                 full.startswith(option) for full in INSPECTED):
             raise ValueError(f'spell {option} in full (the tool reads it)')
