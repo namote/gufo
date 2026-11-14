@@ -215,7 +215,7 @@ def run_pipeline_job(job):
     """Operation `pipeline` (see the module doc)."""
     from ops import OPERATIONS
     p = job.params
-    unknown = set(p) - {'steps', 'resume'}
+    unknown = set(p) - {'steps', 'resume', 'description'}  # description: the pipeline file's note, kept with the job
     if unknown:
         raise ValueError(f'unknown pipeline parameters {sorted(unknown)}')
     steps = p.get('steps')
