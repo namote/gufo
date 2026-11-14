@@ -452,6 +452,27 @@
       - **On low, suppression costs accuracy whether trained or not** (28 → 25 / 22), while hesitations halve. Fewer hesitations is not more correctness here: low's re-checks are cheap and sometimes needed.
       - **The AIME 2024 gain did not transfer.** The 13/13 tie on the 15-problem source set came from the direction's own year.
       - **Decision (user, November 14):** production runs `--reasoning-effort low` with no re-check profile. Medium AIME 2025 + r9 was not run.
+- **Combined pass for the steering-API runtime** (8c45bd3d against production runtime-20261112a; `build/b1/pass-20261114/`, November 14).
+  - Setup: the production config (YaRN 1M, K4V4, MTP 7, 2 sessions, `--reasoning-effort low`), the R2-3 scripts (`ab.py`, `detect.py`). Runs alternated prod, cand, prod, cand. Host preflight failed only on fragmentation (order ≥ 9 free blocks 29,174).
+  - Decode, tok/s, 256 tokens, 4 runs each:
+
+    | Setting | prod1 | cand1 | prod2 | cand2 |
+    |---|---|---|---|---|
+    | OFF | 54.47/54.02/53.41/54.08 | 54.15/54.09/53.26/54.06 | 54.17/54.13/52.84/53.97 | 54.44/53.37/54.29/53.72 |
+    | fnx | 55.40/55.33/55.32/55.35 | 55.16/55.08/55.14/55.20 | 54.08/55.23/55.21/55.15 | 55.36/55.26/55.24/55.26 |
+    | pol-avg | 52.37/52.41/52.61/52.68 | 51.84/52.39/52.48/52.51 | 51.97/51.13/52.55/51.57 | 51.57/52.57/52.59/52.58 |
+    | best3 | 55.85/57.09/57.20/57.08 | 56.76/55.34/56.95/56.91 | 56.82/56.99/56.97/56.77 | 56.99/57.01/57.03/57.03 |
+
+    - No speed change. This covers the 16 detector columns (8 before) on the pol-avg trigger path.
+  - Answers (pol-avg, best3, OFF greedy; 28 prompts) and all 113 dynamic-detection answers are byte-identical. Detector scores are identical too; the only change is the report's new `crossed` member (6ac1e359). The mixed ON+OFF batch matches the sequential runs on both.
+  - **Collection jobs are bit-identical to collect.cpp** on matched arithmetic:
+    - Setup: fp16 KV, no YaRN, 262,144 context, `numerics_deviations` empty.
+    - Records: 6 AIME segments records of `think/dir/col-recheck` and 8 collect-mode records of `ablit-pol-20261111/collection`.
+    - On the production config, `numerics_deviations` lists `kv-cache-type kvarn-k4v4` and `yarn`, and the values move: cosine 0.997–0.999 for segments, 0.986–0.995 for collect.
+  - **`score_reasoning` matches generation.**
+    - Setup: a greedy low-thinking generation with logprobs was cut at a blank line, and the next 64 reasoning tokens were scored.
+    - All 64 token ids match, with |Δlogprob| at most 0.014 (mean 0.0005).
+    - Rescoring the same body reused 52 of 176 prompt tokens.
   - **Combined profile for the English Tiananmen gap** (not measured): `dynamic/profiles-pol-fnx2/` holds `pol-avg` (byte-identical to production's except `trigger.with: ["fnx"]`, threshold 0.7) and production's `fnx` (no trigger). A pol-avg detection then turns both ON; where both have strength at a site, they project onto the orthonormal union of their directions with the larger strength (docs/SERVER.md, several profiles).
   - **Threshold 0.7 for `dynamic/profiles-pol/`** (signed off; `fit_trigger.py --threshold 0.7`, the fitted 1.199 kept in the report as `fitted_threshold`, evidence `dynamic/fit-pol-0.7.json`):
     - Offline at 0.7: recall 92.1%; false positives 4.2% on the hard political controls (Gwangju, Tiananmen-like events elsewhere) and 1.3% on harmless prompts.
