@@ -452,6 +452,55 @@
       - **On low, suppression costs accuracy whether trained or not** (28 → 25 / 22), while hesitations halve. Fewer hesitations is not more correctness here: low's re-checks are cheap and sometimes needed.
       - **The AIME 2024 gain did not transfer.** The 13/13 tie on the 15-problem source set came from the direction's own year.
       - **Decision (user, November 14):** production runs `--reasoning-effort low` with no re-check profile. Medium AIME 2025 + r9 was not run.
+- **R10 and R11: more data, a refreshed direction, then direction + strengths together** (`build/b1/r10/`, steer tool pipelines `tools/steer/examples/r10.json` and `r11.json`, November 14–15). xhigh traces only feed training; AIME 2025 and the R5 coding eval split are evaluation-only.
+  - Data: xhigh traces of AIME 2024 (30), MATH 100, AIME 2022–23 (58, 51 correct) and R5 coding direction split (60, 57 passed).
+  - **Direction refresh** from all 46 xhigh trace pairs (gufo collection on production numerics, fit in the pinned container, L40–47 averaged, sign-aligned to L45 → `recheck-avgx`):
+    - cos 0.4917 to the R9 direction;
+    - real-label separation 46/46 (SNR 2.3–2.6), the shuffled control at chance.
+  - **Training server recipe:** 24 sessions × 16,384 context, native RoPE, fp16 KV, max connections and pending 160, concurrency 2 × sessions. It is prefill-bound (~1.2k tok/s): 2.5 min/step at 12 chains.
+  - **R10:** residual strengths only, block 4, a 0.1, c 0.15, λ 2, ν 4, guard margin 0.02, 12 chains per step. The rows were cut at a 12,288-token reasoning prefix, which dropped 78 of 373 re-check boundaries, all deep in long (hard) AIME traces.
+    - Eval J went −2.16 (init) → −1.455 (step 20) → −1.348 (step 40).
+    - It was stopped early at step 40 by the user. Strengths at L40–47 went to 0.
+  - **R11:** the direction is d(α) = normalize(d0 + Σα_k u_k), with 6 PCA residual vectors from the R10 collection (39.9% of the residual variance) and an angle cap of 20°; c_dir 0.04, a_dir 0.05.
+    - Each θ is uploaded as a runtime profile under rotating names.
+    - It started from R10's best and ran 100 steps.
+    - **The rows were rebuilt with a 28,672-token prefix cap** (user: train on hard problems): 137 pairs (AIME 2024 40, AIME 2022–23 80, MATH 17), 97 keep, 198 guard, context_tokens 31,744.
+    - Server 12 sessions × 32,768 (the same KV budget as R10). It took 4.5 min/step, and a full eval took ~65 min.
+    - The host rebooted at ~09:20 at step 77; the pipeline resume continued from the saved SPSA log.
+
+    | R11 eval | J | margin | keep drop | angle |
+    |---|---:|---:|---:|---:|
+    | start | −1.502 | −0.899 | 0.301 | 0° |
+    | step 20 | −1.430 | −0.978 | 0.226 | 6.0° |
+    | step 40 | −1.388 | −1.008 | 0.189 | 6.7° |
+    | step 60 | −1.390 | −1.013 | 0.188 | 7.7° |
+    | step 80 (best) | −1.356 | −1.053 | 0.152 | 7.5° |
+    | step 100 | −1.359 | −1.050 | 0.154 | 9.8° |
+
+    - **J rose only through the keep-row penalty.** The margin, the re-check suppression itself, got worse. With λ 2, SPSA prefers a gentler setting over stronger suppression.
+
+  - AIME 2025, the server sampling preset, 32,768-token cap:
+
+    | AIME 2025 (30) | Correct | Mean tokens | Truncated |
+    |---|---:|---:|---:|
+    | **low, nothing** | **28** | **7,738** | 2 |
+    | xhigh, nothing | 24 | 13,447 | 6 |
+    | xhigh + recheck-r10 | 24 | 13,255 | 6 |
+    | low + recheck-r10 | 27 | 9,157 | 3 |
+    | xhigh + recheck-r11 | 26 | 14,396 | 4 |
+
+    - Against R10, R11 newly solves problems 2, 28 and 30 (all near the cap, 25–32k tokens) and loses 29. Problems 14, 15 and 20 are still truncated. Its gain comes from answers that end just under the cap, not from shorter thinking.
+
+  - Coding, R5 eval split (25), thinking on, temperature 1.0 / top-p 0.95 / seed 7, 32,768-token cap:
+
+    | Coding (25) | Passed | Mean tokens | Median | Truncated | Hesitations |
+    |---|---:|---:|---:|---:|---:|
+    | **low, nothing** | **24** | **1,736** | **1,347** | 0 | 5.0 |
+    | xhigh, nothing | 24 | 8,769 | 6,456 | 1 | 13.7 |
+    | xhigh + recheck-r11 | 24 | 7,523 | 4,132 | 1 | 9.6 |
+
+    - On coding, R11 trims xhigh (−14% mean, −36% median tokens, −30% hesitations) at the same pass count, but low passes the same 24 with a quarter of the tokens.
+  - **Result:** the opener-margin proxy (R9–R11) does not make xhigh beat plain low on either set. Production stays low with no profile. The next candidate is an outcome objective: correct answers within a fixed budget on AIME 2022–24.
 - **Combined pass for the steering-API runtime** (8c45bd3d against production runtime-20261112a; `build/b1/pass-20261114/`, November 14).
   - Setup: the production config (YaRN 1M, K4V4, MTP 7, 2 sessions, `--reasoning-effort low`), the R2-3 scripts (`ab.py`, `detect.py`). Runs alternated prod, cand, prod, cand. Host preflight failed only on fragmentation (order ≥ 9 free blocks 29,174).
   - Decode, tok/s, 256 tokens, 4 runs each:
