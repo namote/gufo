@@ -515,6 +515,7 @@
     | Publication of A (324,988 tokens) | 3,215,196,304 B, filesystem 1.57 s, **stream wait 46.5 s** |
     | A second turn | 14.4 s (12 s of it waiting for the publication), `reuse=disk`, prefill 37 tokens, needle 2 correct |
     | A third turn after restart | 3.0 s, `reuse=disk`, prefill 69 tokens, needle 1 correct |
+  - Deployed the same day: production runs runtime-20261116a (fb89c1e1…, same abliteration profiles); rollback `~/projects/_backup/gufo-server-20261116-before-writeback/`.
   - **Result:** kept. A returning 325K conversation costs seconds instead of a 5.5 min re-prefill, and decode of other conversations never stalls. Open: the write waits ~46 s on the device stream while another slot decodes, so an unrelated new request that needs the held slot waits that long (C 59.8 s).
 - **Combined pass for the steering-API runtime** (8c45bd3d against production runtime-20261112a; `build/b1/pass-20261114/`, November 14).
   - Setup: the production config (YaRN 1M, K4V4, MTP 7, 2 sessions, `--reasoning-effort low`), the R2-3 scripts (`ab.py`, `detect.py`). Runs alternated prod, cand, prod, cand. Host preflight failed only on fragmentation (order ≥ 9 free blocks 29,174).
