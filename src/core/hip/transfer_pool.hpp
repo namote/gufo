@@ -44,10 +44,13 @@ class TransferPool {
 public:
   // Creates all nonblocking streams and timing-disabled events at startup.
   explicit TransferPool(std::size_t capacity);
-  // Returns null on exhaustion. No HIP allocation/stream/event creation here.
-  // A pair returns only after BOTH stream and completion release their lease.
-  // Failed pairs are quarantined rather than reused.
-  [[nodiscard]] std::unique_ptr<TransferStream> TryAcquire();
+  // Returns null on exhaustion, or when fewer than keep_free other pairs
+  // would stay free (checked and claimed under one lock). No HIP
+  // allocation/stream/event creation here. A pair returns only after BOTH
+  // stream and completion release their lease. Failed pairs are quarantined
+  // rather than reused.
+  [[nodiscard]] std::unique_ptr<TransferStream> TryAcquire(
+      std::size_t keep_free = 0);
 
 private:
   std::shared_ptr<detail::TransferPoolState> state_;

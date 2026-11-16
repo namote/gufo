@@ -195,6 +195,8 @@ public:
   [[nodiscard]] std::uint32_t Rank(CheckpointId) const;
   [[nodiscard]] std::size_t Size() const { return size_; }
   [[nodiscard]] std::size_t RetainedPayloadBytes() const noexcept;
+  // Visits every retained checkpoint. The visitor must not change retention.
+  void ForEach(const std::function<void(const Checkpoint&)>&) const;
 
 private:
   struct Record {

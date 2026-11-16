@@ -44,6 +44,14 @@ struct FileTrace {
 };
 std::mutex trace_mutex;
 std::map<int, FileTrace> open_traces;
+// Across every test file: bytes written and bytes since dropped, by path, and
+// the most written bytes not yet dropped at any one time.
+struct PathBytes {
+  std::uint64_t written{}, dropped{};
+};
+std::map<std::string, PathBytes> path_bytes;
+std::uint64_t total_written{}, total_dropped{}, peak_outstanding{};
+std::size_t peak_open_writers{};  // Test files written and still open.
 std::vector<FileTrace> closed_traces;
 bool fail_fadvise{};
 int sync_range_errno{};  // Nonzero: sync_file_range fails with it.
@@ -77,6 +85,14 @@ extern "C" ssize_t __wrap_write(int fd, const void* data, size_t size) {
     if (auto* trace = Trace(fd)) {
       trace->wrote = true;
       trace->written += static_cast<std::uint64_t>(n);
+      path_bytes[trace->path].written += static_cast<std::uint64_t>(n);
+      total_written += static_cast<std::uint64_t>(n);
+      peak_outstanding =
+          std::max(peak_outstanding, total_written - total_dropped);
+      peak_open_writers = std::max<std::size_t>(
+          peak_open_writers,
+          std::ranges::count_if(open_traces,
+                                [](const auto& t) { return t.second.wrote; }));
       trace->max_outstanding =
           std::max(trace->max_outstanding, trace->written - trace->dropped_end);
     }
@@ -141,6 +157,12 @@ extern "C" int __wrap_posix_fadvise(int fd, off_t offset, off_t bytes,
         std::abort();
       }
       trace->drops.push_back({begin, end});
+      auto& bytes = path_bytes[trace->path];
+      if (begin <= bytes.dropped &&
+          std::min(end, bytes.written) > bytes.dropped) {
+        total_dropped += std::min(end, bytes.written) - bytes.dropped;
+        bytes.dropped = std::min(end, bytes.written);
+      }
       if (begin <= trace->dropped_end)
         trace->dropped_end = std::max(trace->dropped_end, end);
       if (!trace->synced)
@@ -337,11 +359,19 @@ void DiskStoreDropsWrittenAndRestoredPayloads() {
     const auto written =
         std::find_if(traces.begin(), traces.end(),
                      [&](const auto& t) { return t.written == state.size(); });
-    assert(written != traces.end() && written->synced);
+    assert(written != traces.end());
+    // Write-behind dropped written-back windows while writing; the payload
+    // is synced and dropped whole through a later descriptor, after every
+    // payload of the publication was written.
     assert(written->drops_before_sync >= 2);
     assert(written->max_outstanding <=
            3 * kPageCacheWindowBytes + staging.size());
-    assert(Covers(written->drops, state.size()));
+    const auto synced =
+        std::find_if(written + 1, traces.end(), [&](const auto& t) {
+          return t.path == written->path && !t.wrote && t.synced;
+        });
+    assert(synced != traces.end());
+    assert(Covers(synced->drops, state.size()));
   }
   auto snapshot = disk.Open({7});
   assert(snapshot);
@@ -412,11 +442,108 @@ void DiskStoreDropsWrittenAndRestoredPayloads() {
 }
 }  // namespace
 
+void PublicationBoundsUnsyncedBytes() {
+  // Payloads sync only after every source is read; until then a publication
+  // keeps at most its write-back limit (plus the payload being written)
+  // written but not yet written back and dropped, though no single payload
+  // reaches the write-behind window.
+  Directory directory;
+  constexpr std::size_t kFiles = 24, kFileBytes = 1 << 20;
+  constexpr std::uint64_t kLimit = 4 << 20;
+  const auto chunk = Pattern(kFileBytes, 6);
+  DiskManifest manifest;
+  manifest.checkpoint = {8};
+  manifest.lineage = {4};
+  manifest.compatibility.fill(0x42);
+  manifest.tokens.assign(kFiles * 256, 7);
+  DiskComponent component{{{1}, 4, ComponentKind::kAppendRows, 4096, 256, 0},
+                          {{1}, static_cast<Rows>(kFiles * 256)},
+                          {},
+                          {},
+                          {}};
+  std::vector<DiskWriteSource> sources;
+  for (unsigned i = 0; i < kFiles; ++i) {
+    component.chunks.push_back({Id(100 + i), kFileBytes, 0});
+    sources.push_back({false, Id(100 + i), kFileBytes,
+                       [&](std::uint64_t offset, std::span<std::uint8_t> out) {
+                         std::copy_n(chunk.begin() + offset, out.size(),
+                                     out.begin());
+                       },
+                       4096});
+  }
+  manifest.components.push_back(std::move(component));
+  std::vector<std::uint8_t> staging(1 << 20);
+  DiskStore disk(ledger, directory.path, 1ULL << 30);
+  disk.SetPublicationWriteBackLimit(kLimit, kPublicationWriteBackFiles);
+  {
+    const std::lock_guard lock(trace_mutex);
+    path_bytes.clear();
+    total_written = total_dropped = peak_outstanding = 0;
+  }
+  (void)disk.PublishStream(Id(9), manifest, sources, staging);
+  (void)TakeTraces();
+  const std::lock_guard lock(trace_mutex);
+  assert(total_written >= kFiles * kFileBytes);
+  assert(peak_outstanding <= kLimit + kFileBytes);
+  // Every payload left the page cache by the end.
+  for (unsigned i = 0; i < kFiles; ++i) {
+    const auto it = std::find_if(
+        path_bytes.begin(), path_bytes.end(), [&](const auto& entry) {
+          return entry.first.ends_with(DiskFileName(Id(100 + i))) &&
+                 entry.second.written == kFileBytes;
+        });
+    assert(it != path_bytes.end() && it->second.dropped == kFileBytes);
+  }
+}
+
+void PublicationBoundsOpenPayloads() {
+  // Many small payloads never reach the byte limit; the file limit still
+  // bounds the descriptors a publication keeps open.
+  Directory directory;
+  constexpr std::size_t kFiles = 40, kFileBytes = 4096, kOpen = 4;
+  const auto chunk = Pattern(kFileBytes, 7);
+  DiskManifest manifest;
+  manifest.checkpoint = {9};
+  manifest.lineage = {5};
+  manifest.compatibility.fill(0x42);
+  manifest.tokens.assign(kFiles, 7);
+  DiskComponent component{{{1}, 4, ComponentKind::kAppendRows, 4096, 1, 0},
+                          {{1}, static_cast<Rows>(kFiles)},
+                          {},
+                          {},
+                          {}};
+  std::vector<DiskWriteSource> sources;
+  for (unsigned i = 0; i < kFiles; ++i) {
+    component.chunks.push_back({Id(200 + i), kFileBytes, 0});
+    sources.push_back({false, Id(200 + i), kFileBytes,
+                       [&](std::uint64_t offset, std::span<std::uint8_t> out) {
+                         std::copy_n(chunk.begin() + offset, out.size(),
+                                     out.begin());
+                       },
+                       4096});
+  }
+  manifest.components.push_back(std::move(component));
+  std::vector<std::uint8_t> staging(1 << 20);
+  DiskStore disk(ledger, directory.path, 1ULL << 30);
+  disk.SetPublicationWriteBackLimit(1ULL << 30, kOpen);
+  {
+    const std::lock_guard lock(trace_mutex);
+    peak_open_writers = 0;
+  }
+  (void)disk.PublishStream(Id(10), manifest, sources, staging);
+  (void)TakeTraces();
+  const std::lock_guard lock(trace_mutex);
+  // The kept files plus the one being written.
+  assert(peak_open_writers >= 2 && peak_open_writers <= kOpen + 1);
+}
+
 int main() {
   WriteBehindBoundsFootprint();
   RefusedHintsNeverFail();
   WriteBackErrorIsReported();
   DiskStoreDropsWrittenAndRestoredPayloads();
+  PublicationBoundsUnsyncedBytes();
+  PublicationBoundsOpenPayloads();
   std::cout << "page cache hints ok\n";
   return 0;
 }

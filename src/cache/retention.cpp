@@ -794,6 +794,12 @@ bool RetentionPolicy::Admit(const RetentionRequest& r, const Capture& capture) {
     }
   }
 }
+void RetentionPolicy::ForEach(
+    const std::function<void(const Checkpoint&)>& visit) const {
+  for (std::size_t i = 0; i < limit_; ++i)
+    if (records_[i].checkpoint)
+      visit(*records_[i].checkpoint);
+}
 std::size_t RetentionPolicy::RetainedPayloadBytes() const noexcept {
   if (retained_payload_bytes_)
     return *retained_payload_bytes_;

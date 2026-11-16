@@ -7,6 +7,7 @@
 #include <bit>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <future>
 #include <limits>
 #include <map>
@@ -567,6 +568,8 @@ struct DiskStore::Impl {
     // The charge returns to the ledger outside the verification lock.
     node = {};
   }
+  std::uint64_t write_back_limit = kPublicationWriteBackBytes;
+  std::size_t write_back_files = kPublicationWriteBackFiles;
 #ifdef GUFO_CACHE_TESTING
   std::function<void(DiskPublicationStep)> crash_hook;
 #define DISK_STEP(step)                      \
@@ -1231,6 +1234,36 @@ struct DiskStore::Impl {
       // Candidate is invisible to pinned snapshots until committed. Reuse from
       // filesystem existence after validating claims, never from this
       // candidate.
+      // Write every new payload first: sources are read only here. Then the
+      // caller may release them (a slot held for this write) before the
+      // durability tail of one sync per payload, which can take far longer
+      // than the reads.
+      std::vector<std::pair<const platform::Directory*, std::string>> created;
+      created.reserve(dependencies.size());
+      // Written payloads whose write-back is started but not yet waited for.
+      // Past write_back_limit, the oldest are waited for and dropped (no
+      // sync), so a large publication never sits dirty in the page cache.
+      std::deque<std::pair<Fd, std::uint64_t>> writing;
+      std::uint64_t writing_bytes{};
+      bool range_write_back = true;
+      const auto write_back = [&](platform::PlatformFile file,
+                                  platform::WriteBackMode mode,
+                                  std::uint64_t bytes) {
+        if (!range_write_back)
+          return false;
+        std::error_code ec;
+        CostTimer timer(publication_stats.filesystem_ns);
+        if (platform::WriteBack(file, mode, 0, bytes, ec))
+          return true;
+        if (ec != std::errc::not_supported &&
+            ec != std::errc::invalid_argument &&
+            ec != std::errc::invalid_seek &&
+            ec != std::errc::function_not_supported &&
+            ec != std::errc::not_enough_memory)
+          IoError("write back cache file", ec);
+        range_write_back = false;  // Hints only: the syncs below still run.
+        return false;
+      };
       for (auto& [key, p] : dependencies) {
         const platform::Directory& dir = key.first ? private_files : chunks;
         auto payload_name = DiskFileName(p.file);
@@ -1300,17 +1333,60 @@ struct DiskStore::Impl {
           }
         }
         DISK_STEP(kPayloadWritten);
-        Sync(fd.Get());
         if (const auto error = behind.WriteBackError())
           IoError("write back cache file", error);
+        created.emplace_back(&dir, std::move(payload_name));
+        (void)write_back(fd.Get(), platform::WriteBackMode::kStart, p.bytes);
+        writing.emplace_back(std::move(fd), p.bytes);
+        writing_bytes += p.bytes;
+        // Also bound the descriptors kept open for that.
+        while (writing.size() > write_back_files ||
+               (writing.size() > 1 && writing_bytes > write_back_limit)) {
+          auto& [oldest, bytes] = writing.front();
+          // Without range write-back, a sync is the only way to clean it.
+          if (!write_back(oldest.Get(), platform::WriteBackMode::kWait, bytes))
+            Sync(oldest.Get());
+          {
+            CostTimer timer(publication_stats.filesystem_ns);
+            DropCleanPages(oldest.Get(), 0, 0);
+          }
+          writing_bytes -= bytes;
+          writing.pop_front();
+        }
+      }
+      writing.clear();
+      if (access && access->sources_read)
+        access->sources_read();
+      {
+        // Best effort, not a barrier: one flush of the whole filesystem
+        // writes every payload back at once, so the per-payload syncs below
+        // find little left to write.
+        CostTimer timer(publication_stats.fsync_ns);
+        std::error_code ec;
+        if (!platform::SyncFileSystem(temporary, ec) &&
+            ec != std::errc::not_supported)
+          IoError("sync cache filesystem", ec);
+      }
+      for (const auto& [dir, name] : created) {
+        std::error_code ec;
+        platform::PlatformFile descriptor;
+        {
+          CostTimer timer(publication_stats.filesystem_ns);
+          descriptor = platform::OpenAt(temporary, name,
+                                        platform::FileMode::kWriteExisting, ec);
+        }
+        Fd fd(descriptor);
+        if (!platform::FileValid(fd.Get()))
+          IoError("reopen temporary cache file", ec);
+        Sync(fd.Get());
         {
           // The payload is durable; drop its clean pages so multi-GB snapshots
           // don't accumulate in the page cache.
           CostTimer timer(publication_stats.filesystem_ns);
-          behind.Synced();
+          DropCleanPages(fd.Get(), 0, 0);
         }
         DISK_STEP(kPayloadSynced);
-        Rename(dir, payload_name);
+        Rename(*dir, name);
         DISK_STEP(kPayloadRenamed);
       }
       Sync(temporary);
@@ -1836,6 +1912,12 @@ void DiskStore::WaitForReclamation() {
 void DiskStore::SetCrashHook(std::function<void(DiskPublicationStep)> hook) {
   std::lock_guard guard(impl_->mutex);
   impl_->crash_hook = std::move(hook);
+}
+void DiskStore::SetPublicationWriteBackLimit(std::uint64_t bytes,
+                                             std::size_t files) {
+  std::lock_guard guard(impl_->mutex);
+  impl_->write_back_limit = bytes;
+  impl_->write_back_files = files;
 }
 #endif
 }  // namespace gufo::cache

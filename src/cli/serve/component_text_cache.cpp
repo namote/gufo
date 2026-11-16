@@ -22,13 +22,15 @@
 
 namespace gufo::server {
 namespace {
-// Room for device-read pieces a disk write queues ahead. It is pinned RAM
-// under the cache ceiling, so take it only when it is a small share of that
-// ceiling; smaller caches read each piece in place.
+// Room for device-read pieces a disk write queues ahead. It is pinned RAM the
+// ledger adds on top of the slot ceiling, so take at most 1/64 of that
+// ceiling, in whole staging pieces; caches too small for two pieces read
+// each piece in place.
 std::size_t ReadAheadBytes(std::size_t ceiling) {
-  return ceiling / 256 >= cache::kPersistenceReadAheadBytes
-             ? cache::kPersistenceReadAheadBytes
-             : 0;
+  const auto bytes = std::min(cache::kPersistenceReadAheadBytes,
+                              ceiling / 64 / cache::kDefaultDiskStagingBytes *
+                                  cache::kDefaultDiskStagingBytes);
+  return bytes >= 2 * cache::kDefaultDiskStagingBytes ? bytes : 0;
 }
 // Metadata room the ledger keeps beyond its startup charges (the disk
 // catalog and index, slots, pins) whenever a host-derived budget would leave
@@ -320,6 +322,63 @@ struct ComponentTextCache::Impl {
     Entry* entry;
     cache::SlotLease slot;
   };
+  // True when some payload of `checkpoint` still borrows unpreserved rows
+  // from `slot`; stops at the first.
+  static bool BorrowsFrom(const cache::Checkpoint& checkpoint,
+                          cache::SlotId slot) {
+    const auto borrowed = [&](const cache::Payload& payload) {
+      const auto rows = payload.BorrowedStorage();
+      if (!rows)
+        return false;
+      const auto location = rows->Location();
+      return location && location->slot == slot;
+    };
+    for (const auto& component : checkpoint.Components()) {
+      for (const auto& chunk : component.chunks)
+        if (borrowed(chunk.Storage()))
+          return true;
+      for (const auto* payload : {&component.tail, &component.private_state})
+        if (*payload && borrowed(**payload))
+          return true;
+    }
+    return false;
+  }
+  // Under the mutex: this exact checkpoint (its id, tokens and input) is
+  // published on disk, so a disk restore can stand in for its RAM copy.
+  [[nodiscard]] bool DurableOnDisk(const cache::Checkpoint& checkpoint) const {
+    if (!catalog)
+      return false;
+    const auto description = catalog->Find(checkpoint.Id());
+    if (!description)
+      return false;
+    const auto& manifest = description->Manifest();
+    return manifest.checkpoint == checkpoint.Id() &&
+           manifest.input == checkpoint.Input() &&
+           std::ranges::equal(manifest.tokens, checkpoint.Tokens());
+  }
+  // Under the mutex, before a cold reassignment of `slot` preserves the rows
+  // RAM checkpoints borrow from it: a checkpoint already durable on disk is
+  // dropped from RAM instead of copied (a later hit restores it from disk).
+  // Rows another retained checkpoint also uses stay alive and are preserved.
+  // Returns whether it dropped any.
+  bool DropDurableBorrowers(cache::SlotId slot) {
+    if (!catalog)
+      return false;
+    std::vector<cache::CheckpointId> drop;
+    retention.ForEach([&](const cache::Checkpoint& checkpoint) {
+      if (DurableOnDisk(checkpoint) && BorrowsFrom(checkpoint, slot))
+        drop.push_back(checkpoint.Id());
+    });
+    for (const auto id : drop) {
+      retention.Remove(id);
+      Logger::Info("cache",
+                   "event=checkpoint_dropped reason=durable_reassignment "
+                   "checkpoint_id=" +
+                       std::to_string(id.value) +
+                       " slot=" + std::to_string(slot.value));
+    }
+    return !drop.empty();
+  }
   // Under the mutex: the entry's live frontier when no checkpoint comes within
   // kUncoveredCaptureTokens of it.
   [[nodiscard]] std::optional<Uncovered> UncoveredLive(std::size_t i) const {
@@ -525,7 +584,9 @@ struct ComponentTextCache::Impl {
     if (options) {
       streaming = std::make_unique<cache::StreamedStore>(
           ledger, *disk, cache::kDefaultDiskStagingBytes, resources->staging,
-          resources->stream, ReadAheadBytes(slot_ceiling));
+          resources->stream,
+          resources->reserve_stream ? ReadAheadBytes(slot_ceiling) : 0,
+          resources->reserve_stream);
       disk_capacity = options->capacity_bytes;
       disk_step = options->min_checkpoint_step_tokens;
       disk->ReclaimOrphans();
@@ -1820,6 +1881,7 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
                          std::move(uncovered->input), "row_capacity", false);
     {
       const std::lock_guard lock(impl_->mutex);
+      impl_->DropDurableBorrowers(cache::SlotId{slot});
       entry->branch = std::make_shared<const std::uint8_t>(0);
       entry->durable.reset();
       entry->written_back = 0;
@@ -1999,15 +2061,28 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       entry = impl_->SelectCold();
     if (!entry)
       throw cache::SlotBusy();
+    std::size_t slot_index = 0;
+    while (impl_->entries[slot_index].get() != entry)
+      ++slot_index;
+    // Whether a checkpoint covers the live frontier this replaces is decided
+    // first: a durable one dropped from RAM below still covers it on disk.
+    if (!live)
+      evicted = impl_->UncoveredLive(slot_index);
+    // Before pinning candidates: a durable checkpoint this reassignment drops
+    // from RAM is looked up again, so this request restores it from disk
+    // rather than keeping its slot rows alive for a RAM restore.
+    if (!live && impl_->DropDurableBorrowers(cache::SlotId{slot_index + 1})) {
+      found =
+          impl_->index.Lookup({impl_->identity, prompt, input, stable, reuse});
+      if (reuse && !found.selected)
+        common =
+            impl_->index.CommonPrefixTokens({impl_->identity, prompt, input});
+    }
     restore_pins.ids.reserve(found.candidates.size());
     restore_pins.Hold(found, alignment, prompt.size());
     entry->busy = true;
     entry->holds_rows = true;
     entry->used = ++impl_->clock;
-    if (!live)
-      for (std::size_t i = 0; i < impl_->entries.size(); ++i)
-        if (impl_->entries[i].get() == entry)
-          evicted = impl_->UncoveredLive(i);
   }
   // The live frontier this cold assignment replaces would otherwise be lost;
   // the next turn of that conversation then restores an older checkpoint.

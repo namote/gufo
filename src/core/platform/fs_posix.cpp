@@ -50,6 +50,8 @@ int OpenFlags(FileMode mode) noexcept {
       return O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW;
     case FileMode::kOpenOrCreate:
       return O_RDWR | O_CREAT | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW;
+    case FileMode::kWriteExisting:
+      return O_WRONLY | O_CLOEXEC | O_NOFOLLOW;
   }
   return 0;
 }
@@ -245,6 +247,21 @@ bool SyncDirectory(const Directory& dir, std::error_code& ec) noexcept {
     return false;
   }
   return true;
+}
+
+bool SyncFileSystem(const Directory& dir, std::error_code& ec) noexcept {
+  ec.clear();
+#ifdef __linux__
+  if (::syncfs(dir.fd_) != 0) {
+    ec = Errno();
+    return false;
+  }
+  return true;
+#else
+  (void)dir;
+  ec = std::make_error_code(std::errc::not_supported);
+  return false;
+#endif
 }
 
 bool SyncAncestors(const Directory& dir, std::error_code& ec) noexcept {

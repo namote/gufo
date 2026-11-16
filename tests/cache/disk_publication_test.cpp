@@ -6,12 +6,14 @@
 #include <cassert>
 #include <cerrno>
 #include <csignal>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <future>
 #include <thread>
 
 #include "src/cache/disk.hpp"
+#include "src/cache/streaming.hpp"
 
 using namespace gufo::cache;
 namespace fs = std::filesystem;
@@ -577,6 +579,64 @@ extern "C" int __wrap_unlinkat(int fd, const char* name, int flags) {
   }
   return result;
 }
+struct Idle final : Stream {
+  TransferResult Synchronize() noexcept override {
+    return TransferResult::kSucceeded;
+  }
+};
+struct Done final : CompletionSignal {
+  bool Ready() const noexcept override { return true; }
+  TransferResult Wait() noexcept override { return TransferResult::kSucceeded; }
+};
+void SyncFailureAfterSourcesRead() {
+  // A payload sync fails after every source was read: the job fails once,
+  // without a retry, and its device sources (a held slot) were already
+  // returned when the failure is reported.
+  Directory dir;
+  ResourceLedger local{{1 << 22, 1 << 21, 64, 4096}};
+  DiskStore disk(local, dir.path, 100000);
+  StreamedStore store(
+      local, disk, 64,
+      [](std::size_t bytes) {
+        auto buffer = std::make_shared<std::vector<std::uint8_t>>(bytes);
+        return StagingAllocation{buffer, *buffer};
+      },
+      [] { return std::make_unique<Idle>(); });
+  Fixture f;
+  auto hold = std::make_shared<int>(0);
+  const std::weak_ptr<int> held = hold;
+  std::atomic<int> reads{};
+  std::vector<PersistenceSource> sources;
+  for (const auto& buffer : f.buffers)
+    sources.emplace_back(
+        buffer.private_file, buffer.file, buffer.bytes.size(), 1, hold,
+        [&, bytes = buffer.bytes](std::uint64_t offset,
+                                  std::span<std::byte> destination, Stream&) {
+          ++reads;
+          std::memcpy(destination.data(), bytes.data() + offset,
+                      destination.size());
+          return Completion(std::make_unique<Done>());
+        });
+  hold.reset();
+  std::atomic<bool> reported{}, returned{};
+  PersistenceQueue queue(
+      local, store, 1, 1 << 20, [] { return true; },
+      [&](CheckpointId, bool succeeded, const TransferTiming&) {
+        reported = !succeeded;
+        returned = held.expired();
+      },
+      {}, std::chrono::milliseconds(500));
+  fail_sync = 0;  // The first sync is the first payload's, after the reads.
+  assert(queue.TrySubmit(
+      PersistenceJob(local, Id(100), f.manifest, std::move(sources))));
+  queue.Drain();
+  fail_sync = -1;
+  assert(reported && returned);
+  assert(reads == 3);  // Each payload was read once: no retry.
+  const auto stats = queue.Stats();
+  assert(stats.failed == 1 && stats.completed == 0);
+  assert(disk.Entries().empty());
+}
 int main() {
   const rlimit no_core{0, 0};
   assert(setrlimit(RLIMIT_CORE, &no_core) == 0);
@@ -593,4 +653,5 @@ int main() {
   RecoveryAndUnknowns();
   LedgerFailures();
   IoOrderingAndShortWrites();
+  SyncFailureAfterSourcesRead();
 }

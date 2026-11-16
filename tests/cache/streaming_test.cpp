@@ -2,12 +2,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <barrier>
 #include <cassert>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <mutex>
 #include <numeric>
 #include <thread>
 
@@ -477,7 +480,8 @@ void DeviceReadsQueueAheadOfTheWriter() {
   Directory dir;
   ResourceLedger ledger{{1 << 22, 1 << 21, 256 + 2048, 4096}};
   DiskStore disk(ledger, dir.path, 1 << 20);
-  StreamedStore streams(ledger, disk, 256, Allocate, Lease, 2048);
+  StreamedStore streams(ledger, disk, 256, Allocate, Lease, 2048,
+                        [](std::size_t) { return Lease(); });
   Fixture fixture(ledger);
   std::size_t issued = 0, settled = 0, ahead = 0;
   std::vector<PersistenceSource> sources;
@@ -505,6 +509,205 @@ void DeviceReadsQueueAheadOfTheWriter() {
                          *restored, timing));
   assert(fixture.adapter.RecurrentHash(*restored) == fixture.hash);
   assert(ledger.Snapshot().persistence_pinned_bytes == 0);
+}
+struct FakeSettled final : CompletionSignal {
+  bool Ready() const noexcept override { return true; }
+  TransferResult Wait() noexcept override { return TransferResult::kSucceeded; }
+};
+// A bounded pool of fake streams that counts the leases alive at once.
+struct CountingPool {
+  std::size_t capacity, live{}, peak{};
+  bool fake_only{};  // the fake adapter restores only through FakeStream
+  struct Lent final : Stream {
+    explicit Lent(CountingPool& pool) : pool(&pool) {
+      pool.peak = std::max(pool.peak, ++pool.live);
+    }
+    ~Lent() override {
+      (void)inner.Synchronize();
+      --pool->live;
+    }
+    TransferResult Synchronize() noexcept override {
+      return inner.Synchronize();
+    }
+    FakeStream inner{true};
+    CountingPool* pool;
+  };
+  std::unique_ptr<Stream> Acquire(std::size_t keep_free = 0) {
+    if (fake_only)
+      return std::make_unique<FakeStream>(true);
+    if (capacity - live <= keep_free)
+      return nullptr;
+    return std::make_unique<Lent>(*this);
+  }
+};
+struct ReadAheadRun {
+  std::size_t issued{}, settled{}, in_flight{}, sub_pieces_ahead{};
+  std::size_t foreground_refused{}, host_reads{}, skipped_copies{};
+  std::size_t peak_live{};
+};
+struct ReadAheadOptions {
+  std::size_t streams = 1000;
+  std::size_t fail_at = 0;  // fail this settled copy (0: never)
+  std::size_t stop_at = 0;  // request a stop at this issued copy (0: never)
+  bool mixed = false;       // every other source is host memory
+  bool rewrite = false;     // write the same files again under a new manifest
+};
+// Writes the fixture with 8-byte staging, so every chunk (16 bytes) and the
+// private state (32 bytes) span several pieces, and 64 bytes of read-ahead
+// (8 pieces). Every device copy also takes and returns a foreground lease,
+// as a concurrent restore or capture would.
+ReadAheadRun WriteWithReadAhead(const ReadAheadOptions& options) {
+  Directory dir;
+  ResourceLedger ledger{{1 << 22, 1 << 21, 8 + 64, 4096}};
+  DiskStore disk(ledger, dir.path, 1 << 20);
+  ReadAheadRun run;
+  CountingPool pool{options.streams};
+  StreamedStore store(
+      ledger, disk, 8, Allocate, [&] { return pool.Acquire(); }, 64,
+      [&](std::size_t keep_free) { return pool.Acquire(keep_free); });
+  assert(store.ReadAheadBytes() == 64);
+  // A rewrite first writes files 101 and up.
+  Fixture fixture(ledger, 1, options.rewrite ? 100 : 0);
+  std::stop_source stop;
+  // The rewrite keeps one shared chunk file (already on disk) and gives every
+  // other file a new ID, lower than the kept one before it and higher after
+  // it, so the store reads, skips the kept file, then reads again.
+  constexpr std::size_t kept = 2;
+  assert(!fixture.buffers[kept].private_file);
+  const auto renamed = [&](std::size_t i) {
+    return i == kept  ? fixture.buffers[i].file
+           : i < kept ? Id(1 + static_cast<unsigned>(i))
+                      : Id(200 + static_cast<unsigned>(i));
+  };
+  bool second{};
+  const auto make_sources = [&](bool rename) {
+    std::vector<PersistenceSource> sources;
+    for (std::size_t i = 0; i < fixture.buffers.size(); ++i) {
+      auto buffer = fixture.buffers[i];
+      if (rename)
+        buffer.file = renamed(i);
+      const auto* data = buffer.owner->data();
+      const bool skipped = rename && i == kept;
+      if (options.mixed && i % 2) {
+        // Host memory: read in place, settled at once.
+        sources.emplace_back(
+            buffer.private_file, buffer.file, buffer.owner->size(),
+            buffer.alignment, buffer.charge, buffer.owner,
+            [&, data](auto offset, auto bytes, Stream&) {
+              ++run.host_reads;
+              std::memcpy(bytes.data(), data + offset, bytes.size());
+              return Completion(std::make_unique<FakeSettled>());
+            });
+        continue;
+      }
+      sources.emplace_back(
+          buffer.private_file, buffer.file, buffer.owner->size(),
+          buffer.alignment, buffer.owner,
+          [&, data, skipped](auto offset, auto bytes, Stream& stream) {
+            if (skipped && second)
+              ++run.skipped_copies;
+            if (!pool.Acquire())
+              ++run.foreground_refused;
+            const auto in_flight = ++run.issued - run.settled;
+            run.in_flight = std::max(run.in_flight, in_flight);
+            if (offset && in_flight > 1)
+              ++run.sub_pieces_ahead;
+            if (run.issued == options.stop_at)
+              stop.request_stop();
+            return dynamic_cast<CountingPool::Lent&>(stream).inner.Submit(
+                [&, data, offset, bytes] {
+                  const bool fail = ++run.settled == options.fail_at;
+                  std::memcpy(bytes.data(), data + offset, bytes.size());
+                  return fail ? TransferResult::kFailed
+                              : TransferResult::kSucceeded;
+                });
+          });
+    }
+    return sources;
+  };
+  TransferTiming timing;
+  bool failed{};
+  try {
+    auto sources = make_sources(false);
+    store.Write(Id(240), fixture.manifest, sources, timing, stop.get_token());
+    if (options.rewrite) {
+      auto again = fixture.manifest;
+      again.checkpoint = {2};
+      const auto rename = [&](DiskPayload& payload) {
+        for (std::size_t i = 0; i < fixture.buffers.size(); ++i)
+          if (fixture.buffers[i].file == payload.file) {
+            payload.file = renamed(i);
+            return;
+          }
+      };
+      for (auto& component : again.components) {
+        for (auto& chunk : component.chunks)
+          rename(chunk);
+        for (auto* payload : {&component.tail, &component.private_state})
+          if (*payload)
+            rename(**payload);
+      }
+      auto repeated = make_sources(true);
+      second = true;
+      store.Write(Id(241), again, repeated, timing, stop.get_token());
+    }
+  } catch (const std::exception& error) {
+    failed = true;
+    if (!options.fail_at && !options.stop_at)
+      std::fprintf(stderr, "read-ahead write failed: %s\n", error.what());
+  } catch (...) {
+    failed = true;
+  }
+  // Every queued copy settled and returned its stream on every path, and
+  // foreground leases always found a stream.
+  assert(run.issued == run.settled);
+  assert(pool.live == 0);
+  assert(run.foreground_refused == 0);
+  assert(failed == (options.fail_at || options.stop_at));
+  run.peak_live = pool.peak;
+  if (!failed) {
+    pool.fake_only = true;
+    for (CheckpointId id : {CheckpointId{1}, CheckpointId{2}}) {
+      if (id.value == 2 && !options.rewrite)
+        continue;
+      auto restored = fixture.adapter.CreateSlot(fixture.guard);
+      assert(store.Restore(id, fixture.manifest.compatibility, fixture.adapter,
+                           *restored, timing));
+      assert(fixture.adapter.RecurrentHash(*restored) == fixture.hash);
+    }
+  }
+  return run;
+}
+void SubPiecesQueueAheadWithinBounds() {
+  // With streams to spare, the read-ahead depth bounds the copies in flight,
+  // and pieces after a file's first queue ahead too.
+  const auto wide = WriteWithReadAhead({});
+  assert(wide.in_flight >= 6 && wide.in_flight <= 8 + 1);
+  assert(wide.sub_pieces_ahead > 0);
+  // A pool with the reserve and three more lends the write three streams in
+  // all, and never the reserve (foreground leases inside each copy succeed).
+  const auto narrow =
+      WriteWithReadAhead({.streams = kReservedTransferStreams + 3});
+  assert(narrow.in_flight >= 2 && narrow.in_flight <= 3);
+  // The write's three plus one foreground lease taken inside a copy.
+  assert(narrow.peak_live <= 3 + 1);
+  // Host sources read in place; device ones still queue ahead.
+  const auto mixed = WriteWithReadAhead({.mixed = true});
+  assert(mixed.host_reads > 0 && mixed.in_flight > 1);
+  // A file already on disk between files that are read: copies queued for
+  // it are retired and settle before the buffer serves again, with streams
+  // to spare and with a pool that forces the write to settle them early.
+  for (std::size_t streams : {std::size_t{1000}, kReservedTransferStreams + 3})
+    assert(WriteWithReadAhead({.streams = streams, .rewrite = true})
+               .skipped_copies > 0);
+}
+void ReadAheadDrainsOnFailureAndStop() {
+  // A failed copy and a stop each end the write with every queued copy
+  // settled (WriteWithReadAhead asserts it).
+  for (std::size_t at : {1, 5, 20}) {
+    (void)WriteWithReadAhead({.fail_at = at});
+    (void)WriteWithReadAhead({.stop_at = at});
+  }
 }
 void BorrowedSourcesWaitWithoutBlockingForeground() {
   Directory dir;
@@ -764,6 +967,100 @@ void BusyModelYieldIsBounded() {
   assert(ledger.Snapshot().persistence_pinned_bytes == 0);
   assert(disk.Open({1}));
 }
+void HeldSourcesReturnBeforePayloadSyncs() {
+  // A write's device sources (here standing in for a held slot) are dropped
+  // once every piece is read, before the first payload sync; read-ahead
+  // copies have settled by then.
+  Directory dir;
+  ResourceLedger ledger{{1 << 22, 1 << 21, 256 + 2048, 4096}};
+  DiskStore disk(ledger, dir.path, 1 << 20);
+  StreamedStore streams(ledger, disk, 256, Allocate, Lease, 2048,
+                        [](std::size_t) { return Lease(); });
+  Fixture fixture(ledger);
+  auto hold = std::make_shared<int>(0);
+  const std::weak_ptr<int> held = hold;
+  std::size_t issued{}, settled{};
+  std::vector<PersistenceSource> sources;
+  for (const auto& buffer : fixture.buffers) {
+    const auto* data = buffer.owner->data();
+    sources.emplace_back(buffer.private_file, buffer.file, buffer.owner->size(),
+                         buffer.alignment, hold,
+                         [&, data](auto offset, auto bytes, Stream& stream) {
+                           ++issued;
+                           return dynamic_cast<FakeStream&>(stream).Submit(
+                               [&, data, offset, bytes] {
+                                 ++settled;
+                                 std::memcpy(bytes.data(), data + offset,
+                                             bytes.size());
+                                 return TransferResult::kSucceeded;
+                               });
+                         });
+  }
+  hold.reset();
+  std::size_t written{}, synced{};
+  disk.SetCrashHook([&](DiskPublicationStep step) {
+    if (step == DiskPublicationStep::kPayloadWritten) {
+      ++written;
+      assert(!held.expired() && "released before its pieces were read");
+    } else if (step == DiskPublicationStep::kPayloadSynced) {
+      if (!synced++) {
+        assert(written == fixture.buffers.size());
+        assert(issued == settled);
+      }
+      assert(held.expired() && "held through the payload syncs");
+    }
+  });
+  TransferTiming timing;
+  streams.Write(Id(100), fixture.manifest, sources, timing);
+  disk.SetCrashHook({});
+  assert(synced == fixture.buffers.size());
+  auto restored = fixture.adapter.CreateSlot(fixture.guard);
+  assert(streams.Restore({1}, fixture.manifest.compatibility, fixture.adapter,
+                         *restored, timing));
+  assert(fixture.adapter.RecurrentHash(*restored) == fixture.hash);
+}
+void SlotHoldingJobsRunFirst() {
+  // While a write runs, a slot-holding job submitted after an ordinary one
+  // starts before it, but passes it only once: a second slot-holding job
+  // waits for the ordinary one.
+  Directory dir;
+  ResourceLedger ledger{{1 << 22, 1 << 21, 16, 8192}};
+  DiskStore disk(ledger, dir.path, 1 << 20);
+  StreamedStore streams(ledger, disk, 16, Allocate, Lease);
+  Fixture first(ledger), ordinary(ledger, 2, 30), holding(ledger, 3, 60),
+      later(ledger, 4, 120);
+  std::atomic<bool> idle{}, started{};
+  std::mutex order_mutex;
+  std::vector<std::uint64_t> order;
+  PersistenceQueue queue(
+      ledger, streams, 4, 1 << 20,
+      [&] {
+        started = true;
+        return idle.load();
+      },
+      [&](CheckpointId id, bool succeeded, const TransferTiming&) {
+        assert(succeeded);
+        const std::lock_guard lock(order_mutex);
+        order.push_back(id.value);
+      },
+      {}, std::chrono::hours(1));
+  // The first job starts and yields to the busy model at its first piece.
+  assert(queue.TrySubmit(
+      PersistenceJob(ledger, Id(100), first.manifest, first.Sources())));
+  while (!started)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  assert(queue.TrySubmit(
+      PersistenceJob(ledger, Id(101), ordinary.manifest, ordinary.Sources())));
+  PersistenceJob job(ledger, Id(102), holding.manifest, holding.Sources());
+  job.KeepUnderPressure();
+  assert(queue.TrySubmit(std::move(job)));
+  PersistenceJob next(ledger, Id(103), later.manifest, later.Sources());
+  next.KeepUnderPressure();
+  assert(queue.TrySubmit(std::move(next)));
+  idle = true;
+  queue.Drain();
+  assert((order == std::vector<std::uint64_t>{1, 3, 2, 4}));
+}
 void NewestPendingFrontierSurvives() {
   for (const bool learned : {false, true}) {
     for (const bool pin_failure : {false, true}) {
@@ -932,7 +1229,9 @@ void FailedSubmission() {
     failed = true;
   }
   assert(failed && disk.Entries().empty());
-  assert(costs.filesystem_ns && costs.fsync_ns && costs.bytes == 32);
+  // Payloads sync only after every piece was read, so a read failure leaves
+  // nothing synced.
+  assert(costs.filesystem_ns && !costs.fsync_ns && costs.bytes == 32);
   assert(ledger.Snapshot().persistence_pinned_bytes == 0);
   disk.ReclaimOrphans();
   disk.WaitForReclamation();
@@ -1118,6 +1417,8 @@ int main() {
   RestoreGroupsAdjacentFilesWithinStaging();
   LiveRowsStreamWithoutWholeHistoryBacking();
   DeviceReadsQueueAheadOfTheWriter();
+  SubPiecesQueueAheadWithinBounds();
+  ReadAheadDrainsOnFailureAndStop();
   BorrowedSourcesWaitWithoutBlockingForeground();
   LiveBorrowedSourcesPublishFromSlot();
   StopWaitingBorrowedPublication(false);
@@ -1126,6 +1427,8 @@ int main() {
   CancelRestore();
   QueueBoundsAndYield();
   BusyModelYieldIsBounded();
+  HeldSourcesReturnBeforePayloadSyncs();
+  SlotHoldingJobsRunFirst();
   NewestPendingFrontierSurvives();
   FirstPendingAnchorSurvivesCoalescing();
   AdmissionFailures();

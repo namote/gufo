@@ -44,6 +44,9 @@ struct ComponentCacheResources {
   std::shared_ptr<void> owner;
   std::unique_ptr<cache::Adapter> adapter;
   cache::StreamLease stream;
+  // Optional lease from the same pool that keeps a number of streams free;
+  // disk writes queue device reads ahead only through it.
+  cache::ReserveStreamLease reserve_stream;
   std::function<ComponentCaptureBuffer(const cache::PayloadRequest&)> allocate;
   cache::StagingAllocator staging;
   // Prepare on-demand backing immediately before the next prefill chunk.

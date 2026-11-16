@@ -46,9 +46,10 @@ enum class RenameResult { kRenamed, kTargetExists, kFailed };
 /// refuse symlinks, and set close-on-exec. Create modes write only and use
 /// 0600 permissions; kOpenOrCreate reads and writes.
 enum class FileMode {
-  kRead,          ///< O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
-  kCreateNew,     ///< O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC
-  kOpenOrCreate,  ///< O_RDWR | O_CREAT | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+  kRead,           ///< O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+  kCreateNew,      ///< O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC
+  kOpenOrCreate,   ///< O_RDWR | O_CREAT | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+  kWriteExisting,  ///< O_WRONLY | O_NOFOLLOW | O_CLOEXEC; never creates
 };
 
 /// Move-only handle to an open directory. POSIX holds a directory file
@@ -89,6 +90,7 @@ private:
   friend bool MakeDirectoryAt(const Directory&, std::string_view,
                               std::error_code&) noexcept;
   friend bool SyncDirectory(const Directory&, std::error_code&) noexcept;
+  friend bool SyncFileSystem(const Directory&, std::error_code&) noexcept;
   friend bool SyncAncestors(const Directory&, std::error_code&) noexcept;
   friend bool ListDirectory(
       const Directory&,
@@ -174,6 +176,12 @@ bool SyncFile(PlatformFile file, std::error_code& ec) noexcept;
 /// platforms without a directory flush. Returns false and sets `ec` on
 /// failure.
 bool SyncDirectory(const Directory& dir, std::error_code& ec) noexcept;
+
+/// Writes back everything dirty on the filesystem that holds `dir` (Linux
+/// syncfs(2)), as one flush instead of one per file. Not a durability barrier
+/// for callers: they still sync each file. Platforms without it return false
+/// with `ec` set to std::errc::not_supported.
+bool SyncFileSystem(const Directory& dir, std::error_code& ec) noexcept;
 
 /// Flushes `dir` and every ancestor directory up to the filesystem root, so
 /// entries created beneath `dir` survive a crash. Returns false and sets

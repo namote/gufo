@@ -2017,6 +2017,141 @@ void GridDoesNotSuppressFirstDiskPrompt() {
   }
   std::filesystem::remove_all(directory);
 }
+void DurableCheckpointIsDroppedNotCopiedOnReassignment() {
+  // A RAM checkpoint borrowing its slot's rows, already published to disk as
+  // the same checkpoint, is dropped from RAM when that slot is reassigned,
+  // not copied; the next turn restores it from disk. Without the disk copy
+  // the reassignment preserves the rows as before. (Rows something else
+  // still references, here one chunk, are preserved either way.)
+  std::size_t foreground[2]{};
+  for (const bool durable : {true, false}) {
+    const TemporaryDirectory temp("gufo-component-durable-reassignment");
+    const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
+                                          .capacity_bytes = 1 << 22,
+                                          .min_checkpoint_step_tokens = 1};
+    auto runner = std::make_shared<Runner>();
+    ComponentTextCache cache(runner, 2, 1 << 22,
+                             durable ? std::optional(disk) : std::nullopt);
+    std::vector<TextRunnerToken> prompt(40);
+    std::iota(prompt.begin(), prompt.end(), 10);
+    // A busy second slot keeps idle preservation from copying the rows, as a
+    // peer's decode does.
+    std::vector<TextRunnerToken> busy_prompt(8, 3);
+    auto busy = cache.Acquire(busy_prompt, {}, {}, true, 0, false);
+    {
+      auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+      auto& state = dynamic_cast<State&>(lease->state());
+      runner->adapter->Append(state.slot, prompt, prompt);
+      assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
+                                       false, SnapshotPurpose::kContinuation,
+                                       {}));
+      assert(lease->PublishSnapshot(prompt, lease->Capture(), false));
+      (void)lease->Commit(prompt, {}, prompt);
+    }
+    if (durable) {
+      // The worker counts a job complete before it drops the job (and the
+      // rows its sources hold): wait for an empty queue.
+      bool drained = false;
+      for (int i = 0; i < 500 && !drained; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        const auto persistence = busy->Metrics().persistence;
+        drained = persistence->completed == 1 && persistence->pending == 0;
+      }
+      assert(drained);
+    }
+    auto unrelated = prompt;
+    unrelated.front() = 999;
+    {
+      // Spill metrics are cumulative: compare across the reassignment.
+      const auto before = busy->Metrics().spill.foreground_bytes;
+      auto replacement = cache.Acquire(unrelated, {}, {}, true, 0, false);
+      assert(!replacement->cache_hit());
+      foreground[durable] =
+          replacement->Metrics().spill.foreground_bytes - before;
+      (void)replacement->Commit({}, {}, {});
+    }
+    (void)busy->Commit({}, {}, {});
+    busy.reset();
+    if (durable) {
+      auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+      assert(lease->cached_tokens() == prompt.size() &&
+             lease->restored_from_disk());
+      lease->Invalidate();
+    }
+  }
+  // The control copies the checkpoint's 20 borrowed chunks (2 components x
+  // 10 chunks x 16 bytes). With the disk copy none of them is copied; at most
+  // one other 4-row range (16 bytes) that the slot lends with a disk cache
+  // is preserved.
+  assert(foreground[false] == 320 && foreground[true] <= 16);
+}
+void NonDurableSiblingKeepsItsRowsOnReassignment() {
+  // A durable checkpoint and a RAM-only extension of it share the slot's
+  // rows. Reassigning the slot drops the durable one from RAM, but the
+  // extension's rows (shared chunks included) are preserved as before: no
+  // more foreground copying than without a disk cache, and the extension
+  // still restores from RAM.
+  std::size_t foreground[2]{};
+  for (const bool durable : {true, false}) {
+    const TemporaryDirectory temp("gufo-component-durable-sibling");
+    const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
+                                          .capacity_bytes = 1 << 22,
+                                          .min_checkpoint_step_tokens = 1};
+    auto runner = std::make_shared<Runner>();
+    ComponentTextCache cache(runner, 2, 1 << 22,
+                             durable ? std::optional(disk) : std::nullopt);
+    std::vector<TextRunnerToken> longer(48);
+    std::iota(longer.begin(), longer.end(), 10);
+    const std::vector<TextRunnerToken> prompt(longer.begin(),
+                                              longer.begin() + 40);
+    const auto turn = [&](const std::vector<TextRunnerToken>& tokens,
+                          bool persist) {
+      auto lease = cache.Acquire(tokens, {}, {}, true, 0, true, persist);
+      auto& state = dynamic_cast<State&>(lease->state());
+      const auto tail = std::span(tokens).subspan(lease->cached_tokens());
+      runner->adapter->Append(state.slot, tail, tail);
+      assert(lease->TryReserveSnapshot(lease->CaptureBytes(), tokens.size(),
+                                       false, SnapshotPurpose::kContinuation,
+                                       {}));
+      assert(lease->PublishSnapshot(tokens, lease->Capture(), false));
+      (void)lease->Commit(tokens, {}, tokens);
+    };
+    // A busy second slot keeps idle preservation from copying the rows, as a
+    // peer's decode does.
+    std::vector<TextRunnerToken> busy_prompt(8, 3);
+    auto busy = cache.Acquire(busy_prompt, {}, {}, true, 0, false);
+    turn(prompt, true);
+    if (durable) {
+      // The worker counts a job complete before it drops the job (and the
+      // rows its sources hold): wait for an empty queue.
+      bool drained = false;
+      for (int i = 0; i < 500 && !drained; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        const auto persistence = busy->Metrics().persistence;
+        drained = persistence->completed == 1 && persistence->pending == 0;
+      }
+      assert(drained);
+    }
+    // The RAM-only extension continues the same slot.
+    turn(longer, false);
+    auto unrelated = prompt;
+    unrelated.front() = 999;
+    {
+      const auto before = busy->Metrics().spill.foreground_bytes;
+      auto replacement = cache.Acquire(unrelated, {}, {}, true, 0, false);
+      foreground[durable] =
+          replacement->Metrics().spill.foreground_bytes - before;
+      (void)replacement->Commit({}, {}, {});
+    }
+    (void)busy->Commit({}, {}, {});
+    busy.reset();
+    auto lease = cache.Acquire(longer, {}, {}, true, 0, true, false);
+    assert(lease->cached_tokens() == longer.size() &&
+           !lease->restored_from_disk());
+    lease->Invalidate();
+  }
+  assert(foreground[true] > 0 && foreground[true] <= foreground[false]);
+}
 void PublishedResidentCheckpointKeepsDiskStep() {
   // A published checkpoint that is still resident restores from RAM, so its
   // lookup candidate carries no disk description. The next capture within
@@ -4151,6 +4286,8 @@ int main() {
   RestoreFromBusyBorrowedSource();
   ImageAfterCachedTextPrefixCaptures();
   ColdAssignmentPrefersPreservedSlot();
+  DurableCheckpointIsDroppedNotCopiedOnReassignment();
+  NonDurableSiblingKeepsItsRowsOnReassignment();
   ColdAssignmentKeepsLiveFrontiers();
   ColdSideRequestsKeepPreservedDeepFrontier();
   ReuseAndBranches();

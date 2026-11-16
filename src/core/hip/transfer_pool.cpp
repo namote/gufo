@@ -170,8 +170,14 @@ TransferPool::TransferPool(std::size_t capacity) {
   }
   state_ = std::move(state);
 }
-std::unique_ptr<TransferStream> TransferPool::TryAcquire() {
+std::unique_ptr<TransferStream> TransferPool::TryAcquire(
+    std::size_t keep_free) {
   const std::lock_guard lock(state_->mutex);
+  const auto free = std::ranges::count_if(state_->slots, [](const auto& slot) {
+    return !slot.busy && !slot.failed;
+  });
+  if (static_cast<std::size_t>(free) <= keep_free)
+    return nullptr;
   for (std::size_t i = 0; i < state_->slots.size(); ++i) {
     auto& slot = state_->slots[i];
     if (slot.busy || slot.failed)

@@ -17,9 +17,20 @@ namespace gufo::cache {
 class BorrowedRows;
 inline constexpr std::size_t kDefaultDiskStagingBytes = 1ULL << 20;
 // Pinned room for device-read pieces queued ahead of a disk write. A piece
-// copied from a busy device waits behind model work; queuing several lets
-// those waits overlap instead of adding up chunk after chunk.
-inline constexpr std::size_t kPersistenceReadAheadBytes = 8ULL << 20;
+// copied from a busy device waits behind the model work queued before it (a
+// peer's decode round); queuing many lets one such wait drain them all.
+inline constexpr std::size_t kPersistenceReadAheadBytes = 48ULL << 20;
+// Transfer streams a disk write leaves free in the pool. Restores and
+// captures fail when they find no stream, and two slots' idle spills may hold
+// a 16-wide batch each, so keep both batches plus one more free. The
+// server's 96-stream pool, less two slot preservation leases and this
+// reserve, leaves a write more streams than the 48 pieces (48 MiB) of
+// read-ahead it queues: about 64 decode rounds, ~3.4 s at ~54 ms per round,
+// for a 3.2 GB state.
+inline constexpr std::size_t kReservedTransferStreams = 2 * 16 + 1;
+// Longest a disk write waits for foreground transfers to leave a stream it
+// may lease before it fails.
+inline constexpr std::chrono::seconds kWriteStreamWaitLimit{10};
 inline constexpr std::chrono::milliseconds kPersistenceYieldLimit{500};
 // Restores and observed-row captures move whole rows per staging piece; a
 // smaller staging budget can never restore a checkpoint of these components.
@@ -37,6 +48,10 @@ struct StagingAllocation {
 };
 using StagingAllocator = std::function<StagingAllocation(std::size_t)>;
 using StreamLease = std::function<std::unique_ptr<Stream>()>;
+// Leases a stream only while at least `keep_free` others stay free in the same
+// pool, atomically; null otherwise.
+using ReserveStreamLease =
+    std::function<std::unique_ptr<Stream>(std::size_t keep_free)>;
 
 struct TransferTiming {
   std::uint64_t allocator_ns{}, stream_acquire_ns{}, stream_wait_ns{};
@@ -109,10 +124,12 @@ private:
 class StreamedStore {
 public:
   // read_ahead_bytes, when nonzero, is a second allocation for device-read
-  // pieces a write queues ahead of the one it is writing.
+  // pieces a write queues ahead of the one it is writing. Writes queue ahead
+  // only with ahead_lease, and lease every stream through it, so that
+  // kReservedTransferStreams stay free for foreground transfers.
   StreamedStore(ResourceLedger&, DiskStore&, std::size_t staging_bytes,
-                StagingAllocator, StreamLease,
-                std::size_t read_ahead_bytes = 0);
+                StagingAllocator, StreamLease, std::size_t read_ahead_bytes = 0,
+                ReserveStreamLease ahead_lease = {});
   StreamedStore(ResourceLedger&, DiskStore&, StagingAllocator, StreamLease);
   ~StreamedStore();
   StreamedStore(const StreamedStore&) = delete;
@@ -147,11 +164,14 @@ public:
   // A job whose sources hold an exclusive slot (a slot-held capture) is
   // never replaced by a newer unrelated job under queue pressure: dropping
   // it would release the slot unwritten, and the capture would be retried.
+  // It also starts before older pending jobs, and its device sources (the
+  // slot) are released as soon as its payloads are read, before their syncs.
   void KeepUnderPressure() noexcept { keep_ = true; }
 
 private:
   friend class PersistenceQueue;
   bool keep_{};
+  bool jumped_{};  // A slot-holding job already started before it.
   ResourceCharge metadata_;
   DiskFileId file_;
   DiskManifest manifest_;

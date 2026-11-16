@@ -115,9 +115,11 @@ struct DiskReadStats {
 };
 // Optional piece lease. acquire runs before touching staging; release runs on
 // every exit, including acquire/read failure, and must not throw. Neither runs
-// under index locks.
+// under index locks. sources_read, when set, runs once after the last source
+// piece of a streamed publication was read and before its payloads are synced
+// and published; the publication reads no source after it.
 struct DiskStagingAccess {
-  std::function<void()> acquire, release;
+  std::function<void()> acquire, release, sources_read;
 };
 struct DiskPublicationStats {
   std::uint64_t fsync_calls{}, fsync_ns{};
@@ -271,6 +273,8 @@ public:
   void WaitForReclamation();
 #ifdef GUFO_CACHE_TESTING
   void SetCrashHook(std::function<void(DiskPublicationStep)>);
+  // Overrides kPublicationWriteBackBytes and kPublicationWriteBackFiles.
+  void SetPublicationWriteBackLimit(std::uint64_t bytes, std::size_t files);
 #endif
 
 private:

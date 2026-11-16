@@ -1100,7 +1100,10 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
     std::function<std::size_t()> pending_memory = {},
     std::function<std::shared_ptr<void>(std::size_t)> reserve_memory = {}) {
   struct Backing {
-    hip::TransferPool streams{64};
+    // HIP streams share the capped hardware queues (GPU_MAX_HW_QUEUES); the
+    // pool size adds none. 96 lets a disk write keep its 48 read-ahead copies
+    // in flight while kReservedTransferStreams stay free for foreground use.
+    hip::TransferPool streams{96};
     std::unique_ptr<hip::CommittedBackingPool> pool;
     std::map<std::uint32_t, std::size_t> component_classes;
   };
@@ -1214,6 +1217,10 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
   result->owner = backing;
   result->stream = [backing]() -> std::unique_ptr<cache::Stream> {
     return backing->streams.TryAcquire();
+  };
+  result->reserve_stream =
+      [backing](std::size_t keep_free) -> std::unique_ptr<cache::Stream> {
+    return backing->streams.TryAcquire(keep_free);
   };
   result->allocate = [backing](const cache::PayloadRequest& request) {
     // Bound the logical capture, then assign whole shared backing pages.

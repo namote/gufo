@@ -1,6 +1,7 @@
 #ifndef GUFO_CACHE_PAGE_CACHE_HPP_
 #define GUFO_CACHE_PAGE_CACHE_HPP_
 
+#include <cstddef>
 #include <cstdint>
 #include <system_error>
 
@@ -14,6 +15,13 @@ namespace gufo::cache {
 
 /// Write-behind and drop-behind granularity.
 inline constexpr std::uint64_t kPageCacheWindowBytes = std::uint64_t{8} << 20;
+/// Bytes of payload files a publication keeps written but not yet written
+/// back and dropped, in at most kPublicationWriteBackFiles open files. Its
+/// payloads sync only after every source is read, and files below
+/// kPageCacheWindowBytes never start write-behind on their own.
+inline constexpr std::size_t kPublicationWriteBackFiles = 64;
+inline constexpr std::uint64_t kPublicationWriteBackBytes = std::uint64_t{64}
+                                                            << 20;
 
 /// Rounds a drop start down to a page boundary. The kernel rounds a drop's
 /// start up, so a reader dropping behind itself starts at the page holding

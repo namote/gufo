@@ -186,6 +186,10 @@ PlatformFile OpenAt(const Directory& dir, std::string_view name, FileMode mode,
       access = GENERIC_READ | GENERIC_WRITE;
       disposition = OPEN_ALWAYS;
       break;
+    case FileMode::kWriteExisting:
+      access = GENERIC_WRITE;
+      disposition = OPEN_EXISTING;
+      break;
   }
   HANDLE file = CreateFileW(path.c_str(), access, kDirectoryShare, nullptr,
                             disposition, flags, nullptr);
@@ -336,6 +340,13 @@ bool SyncDirectory(const Directory&, std::error_code& ec) noexcept {
   // file-level flushes.
   ec.clear();
   return true;
+}
+
+bool SyncFileSystem(const Directory&, std::error_code& ec) noexcept {
+  // No filesystem-wide flush for an unprivileged process; files sync one by
+  // one.
+  ec = std::make_error_code(std::errc::not_supported);
+  return false;
 }
 
 bool SyncAncestors(const Directory&, std::error_code& ec) noexcept {
