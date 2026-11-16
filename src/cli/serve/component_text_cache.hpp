@@ -192,17 +192,29 @@ public:
   // slots queued. The destructor drains the queue and writes back every
   // uncovered frontier once more.
   std::size_t WriteBackIdle(std::chrono::milliseconds idle_for) noexcept;
+  // Before admitting `prompt` (same arguments as Acquire). False while the
+  // slot it would use, its live frontier's or the one cold assignment takes,
+  // is held by a queued disk write: that request waits, the other slots keep
+  // running. When cold assignment would reset an idle frontier no checkpoint
+  // covers, captures it first: to RAM, or else to disk by the queue worker,
+  // which holds the slot until it has written it (false meanwhile). Call
+  // from the scheduler thread; never writes the disk itself.
+  [[nodiscard]] bool PrepareAdmission(std::span<const ContinuationToken> prompt,
+                                      const TextPromptContext* context,
+                                      bool reuse, std::size_t stable);
   [[nodiscard]] bool WriteBackDeferred() const noexcept;
 
 private:
   // Captures the idle live frontier of slot `index` (leased exactly at
   // `location`) as a RAM checkpoint, before the caller resets the slot.
   // Optional: a refusal or failure is logged (with `reason`, the caller's
-  // cause) and the caller proceeds.
-  void CaptureBeforeReset(std::size_t index, cache::BorrowedLocation location,
+  // cause) and the caller proceeds. With `hold`, a capture RAM cannot take
+  // keeps the slot for the queue worker instead, and the result is true while
+  // that write is queued: the slot is not the caller's to reset then.
+  bool CaptureBeforeReset(std::size_t index, cache::BorrowedLocation location,
                           std::vector<cache::Token> tokens,
-                          cache::Identity input,
-                          std::string_view reason) noexcept;
+                          cache::InputIdentity input, std::string_view reason,
+                          bool hold) noexcept;
   std::unique_ptr<Impl> impl_;
 };
 

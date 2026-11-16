@@ -908,12 +908,19 @@ struct PersistenceQueue::Impl {
                 continue;
             } catch (...) {
             }
+            timing.failure = "disk_capacity";
+            break;
+          } catch (const std::exception& error) {
+            // Non-capacity failures must never evict another checkpoint.
+            timing.failure = error.what();
             break;
           } catch (...) {
-            // Non-capacity failures must never evict another checkpoint.
+            timing.failure = "non-standard exception";
             break;
           }
         }
+        if (!succeeded && timing.failure.empty())
+          timing.failure = "stopped";
         if (completed) {
           try {
             completed(active->manifest_.checkpoint, succeeded, timing);
@@ -922,14 +929,22 @@ struct PersistenceQueue::Impl {
             // if optional serving metadata cannot be admitted now.
           }
         }
+        std::unique_ptr<PersistenceJob> finished;
         {
           std::lock_guard guard(mutex);
           succeeded ? ++stats.completed : ++stats.failed;
           Accumulate(stats.timing, timing);
-          stats.pinned_bytes -= active->pinned_bytes_;
+          finished = std::move(active);
+        }
+        // Its sources may own a slot lease whose release takes the owner's
+        // locks: free it outside the queue lock, before its pin accounting
+        // and pending count are reused (Drain waits for this).
+        const auto pinned = finished->pinned_bytes_;
+        finished.reset();
+        {
+          std::lock_guard guard(mutex);
+          stats.pinned_bytes -= pinned;
           --stats.pending;
-          // Free the job before its admission/pin accounting can be reused.
-          active.reset();
         }
         wake.notify_all();
       }
@@ -951,6 +966,8 @@ PersistenceQueue::~PersistenceQueue() {
   Stop();
 }
 bool PersistenceQueue::TrySubmit(PersistenceJob job) {
+  // A replaced job is destroyed after the queue lock (see Impl's worker).
+  std::unique_ptr<PersistenceJob> replaced;
   std::unique_lock guard(impl_->mutex);
   if (impl_->stopped) {
     ++impl_->stats.skipped;
@@ -968,7 +985,8 @@ bool PersistenceQueue::TrySubmit(PersistenceJob job) {
                            [](auto& item) { return !item; });
   auto replacement = std::find_if(
       impl_->pending.begin(), impl_->pending.end(), [&](const auto& other) {
-        if (!other || other->manifest_.purpose == CheckpointPurpose::kLearned ||
+        if (!other || other->keep_ ||
+            other->manifest_.purpose == CheckpointPurpose::kLearned ||
             !Extends(job.manifest_, other->manifest_))
           return false;
         // Keep the first pending boundary until its write starts. A busy
@@ -988,8 +1006,9 @@ bool PersistenceQueue::TrySubmit(PersistenceJob job) {
       (impl_->stats.pending == impl_->pending.size() ||
        job.pinned_bytes_ > impl_->max_bytes - impl_->stats.pinned_bytes)) {
     for (auto it = impl_->pending.begin(); it != impl_->pending.end(); ++it) {
-      if (!*it || ((*it)->manifest_.purpose == CheckpointPurpose::kLearned &&
-                   job.manifest_.purpose != CheckpointPurpose::kLearned))
+      if (!*it || (*it)->keep_ ||
+          ((*it)->manifest_.purpose == CheckpointPurpose::kLearned &&
+           job.manifest_.purpose != CheckpointPurpose::kLearned))
         continue;
       if (replacement == impl_->pending.end() ||
           (*it)->submitted_ < (*replacement)->submitted_)
@@ -1017,7 +1036,10 @@ bool PersistenceQueue::TrySubmit(PersistenceJob job) {
       ++impl_->stats.superseded;
       if (redundant)
         ++impl_->stats.coalesced;
-      replacement->reset();
+      replaced = std::move(*replacement);
+      // Its pins go now; the job itself after the queue lock.
+      for (auto& source : replaced->sources_)
+        source.pin_ = {};
       slot = replacement;
     }
     for (auto& source : next->sources_)
@@ -1038,7 +1060,8 @@ bool PersistenceQueue::TrySubmit(PersistenceJob job) {
   guard.unlock();
   if (superseded && impl_->completed) {
     try {
-      impl_->completed(*superseded, false, TransferTiming{});
+      impl_->completed(*superseded, false,
+                       TransferTiming{.failure = "superseded"});
     } catch (...) {
     }
   }
@@ -1053,6 +1076,9 @@ void PersistenceQueue::Stop() {
   // Joining a jthread is not concurrently safe. Keep lifecycle serialization
   // separate from state: the worker needs the state mutex while settling.
   std::lock_guard stop_guard(impl_->stop_mutex);
+  // Dropped jobs are destroyed outside the queue lock (see Impl's worker).
+  std::vector<std::unique_ptr<PersistenceJob>> dropped;
+  dropped.reserve(impl_->pending.size());
   {
     std::lock_guard guard(impl_->mutex);
     impl_->stopped = true;
@@ -1060,11 +1086,17 @@ void PersistenceQueue::Stop() {
     for (auto& job : impl_->pending) {
       if (!job)
         continue;
-      --impl_->stats.pending;
       impl_->stats.pinned_bytes -= job->pinned_bytes_;
       ++impl_->stats.skipped;
-      job.reset();
+      dropped.push_back(std::move(job));
     }
+  }
+  // As in the worker: Drain returns only once dropped jobs are destroyed.
+  const auto count = dropped.size();
+  dropped.clear();
+  {
+    std::lock_guard guard(impl_->mutex);
+    impl_->stats.pending -= count;
   }
   impl_->wake.notify_all();
   if (impl_->worker.joinable())

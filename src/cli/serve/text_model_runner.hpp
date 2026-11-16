@@ -858,6 +858,16 @@ public:
   /// Always true without paged rows; when nothing more can free, true so that
   /// Request::ReserveRows refuses the request by name. `context`,
   /// `reuse_prompt` and `cache_prefix_tokens` are Acquire's.
+  /// False while the session `prompt` needs (its live frontier's, or the one
+  /// cold assignment takes) is held by a queued disk write; that request
+  /// waits, others may be admitted meanwhile. May hand an uncovered idle
+  /// frontier to the disk writer first (ComponentTextCache::
+  /// PrepareAdmission). Arguments as AdmissionReady's; true without a
+  /// component cache.
+  [[nodiscard]] bool SlotReady(std::span<const TextRunnerToken> prompt,
+                               const TextPromptContext* context = nullptr,
+                               bool reuse_prompt = true,
+                               std::size_t cache_prefix_tokens = 0);
   [[nodiscard]] bool AdmissionReady(std::span<const TextRunnerToken> prompt,
                                     std::size_t max_new_tokens,
                                     const TextPromptContext* context = nullptr,

@@ -2201,6 +2201,15 @@ std::size_t TextRunnerPool::AdmissionRowBlocks(std::size_t rows) const {
   return pool.AdmissionBlocks(rows, context, TextModelRunner::kRowBlockMargin);
 }
 
+bool TextRunnerPool::SlotReady(std::span<const TextRunnerToken> prompt,
+                               const TextPromptContext* context,
+                               bool reuse_prompt,
+                               std::size_t cache_prefix_tokens) {
+  return !impl_->component_cache ||
+         impl_->component_cache->PrepareAdmission(prompt, context, reuse_prompt,
+                                                  cache_prefix_tokens);
+}
+
 bool TextRunnerPool::AdmissionReady(std::span<const TextRunnerToken> prompt,
                                     std::size_t max_new_tokens,
                                     const TextPromptContext* context,

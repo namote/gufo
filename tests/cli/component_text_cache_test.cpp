@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <map>
 #include <numeric>
@@ -20,6 +21,7 @@
 
 #include "src/cache/retention.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "tests/cache/fake_adapter.hpp"
 #include "tests/support/temporary_directory.hpp"
@@ -46,6 +48,9 @@ public:
   mutable bool fail_context{};
   // Runs once on the next transfer stream request (cleared before it runs).
   mutable std::function<void()> on_stream;
+  // Runs on every transfer stream request from another thread (the disk
+  // writer, idle preservation) before it is served.
+  mutable std::function<void()> background_stream;
   bool in_pass{};
   bool partial{};
   std::size_t alignment{1};
@@ -143,6 +148,8 @@ public:
         return {};
       if (on_stream)
         std::exchange(on_stream, {})();
+      if (background_stream && std::this_thread::get_id() != foreground)
+        background_stream();
       return std::make_unique<FakeStream>(true);
     };
     resources->transfer_batch_size = 4;
@@ -2357,6 +2364,442 @@ void OverRamCaptureStagesPrivateStateUnderPressure(bool protect) {
   assert(log.find("event=capture_failed") == std::string::npos);
   std::filesystem::remove_all(directory);
 }
+// Commits `tokens` as the live frontier of a fresh lease; returns the reuse.
+std::pair<std::size_t, bool> LiveTurn(
+    ComponentTextCache& cache, Runner& runner,
+    const std::vector<TextRunnerToken>& tokens,
+    std::shared_ptr<const TextPromptContext> context = {}) {
+  auto lease = cache.Acquire(tokens, {}, std::move(context), true, 0, true);
+  const auto cached = lease->cached_tokens();
+  const bool disk_hit = lease->restored_from_disk();
+  auto& state = dynamic_cast<State&>(lease->state());
+  const auto tail = std::span(tokens).subspan(cached);
+  runner.adapter->Append(state.slot, tail, tail);
+  (void)lease->Commit({}, {}, tokens);
+  return {cached, disk_hit};
+}
+// Polls admission of `prompt` until the slot it needs is free (a queued
+// disk write holding it has finished).
+bool WaitForAdmission(ComponentTextCache& cache,
+                      const std::vector<TextRunnerToken>& prompt,
+                      std::shared_ptr<const TextPromptContext> context = {}) {
+  for (int i = 0; i < 1000; ++i) {
+    if (cache.PrepareAdmission(prompt, context.get(), true, 0))
+      return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return false;
+}
+// Blocks the first transfer stream another thread (the disk writer) asks
+// for, until released.
+struct WriterGate {
+  std::atomic<bool> first{false};
+  std::binary_semaphore entered{0}, release{0};
+  std::function<void()> Hook() {
+    return [this] {
+      if (!first.exchange(true)) {
+        entered.release();
+        release.acquire();
+      }
+    };
+  }
+};
+void HeldReassignmentWritesOnTheWriter() {
+  // A frontier RAM cannot hold (8192 rows per append component, 2048 backing
+  // blocks) sits in the only idle slot when another prompt is admitted. The
+  // admission check hands the slot to the disk writer instead of writing on
+  // the scheduler thread, and keeps the request that needs the slot waiting;
+  // the other slot keeps running. Once written, the slot is admitted and the
+  // frontier restores after a restart.
+  for (const bool lend : {true, false}) {
+    const TemporaryDirectory temp("gufo-component-held-reassignment");
+    const std::filesystem::path directory = temp.path();
+    const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                          .capacity_bytes = 1 << 22};
+    std::vector<TextRunnerToken> conversation(8192);
+    std::iota(conversation.begin(), conversation.end(), 10);
+    const std::vector<TextRunnerToken> side(12, 5), other(12, 6);
+    {
+      auto runner = std::make_shared<Runner>();
+      ComponentTextCache cache(runner, 2, 1 << 24, disk);
+      if (!lend)
+        runner->adapter->LimitBorrowedRows(1);
+      (void)LiveTurn(cache, *runner, conversation);
+      // The other slot stays busy with a running request.
+      auto running = cache.Acquire(side, {}, {}, true, 0, true);
+      WriterGate gate;
+      runner->background_stream = gate.Hook();
+      assert(!cache.PrepareAdmission(other, nullptr, true, 0));
+      assert(gate.entered.try_acquire_for(std::chrono::seconds(10)));
+      // The scheduler thread returned while the write is in flight; the
+      // request needing that slot still waits, the running one progresses.
+      assert(!cache.PrepareAdmission(other, nullptr, true, 0));
+      auto& state = dynamic_cast<State&>(running->state());
+      runner->adapter->Append(state.slot, side, side);
+      (void)running->Commit({}, {}, side);
+      gate.release.release();
+      assert(WaitForAdmission(cache, other));
+      (void)LiveTurn(cache, *runner, other);
+      runner->background_stream = {};
+    }
+    auto runner = std::make_shared<Runner>();
+    {
+      ComponentTextCache cache(runner, 1, 1 << 24, disk);
+      auto next = conversation;
+      next.push_back(7);
+      auto lease = cache.Acquire(next, {}, {}, true, 0, true);
+      assert(lease->cached_tokens() == conversation.size() &&
+             lease->restored_from_disk());
+      lease->Invalidate();
+    }
+    std::filesystem::remove_all(directory);
+  }
+}
+void FailedHeldWriteIsNotRetriedForever() {
+  // A held reassignment write the disk can never take (the frontier exceeds
+  // the whole disk budget) fails once; admission then proceeds without
+  // handing the same frontier to the writer again.
+  const TemporaryDirectory temp("gufo-component-held-failure");
+  const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
+                                        .capacity_bytes = 1024};
+  std::vector<TextRunnerToken> conversation(8192);
+  std::iota(conversation.begin(), conversation.end(), 10);
+  const std::vector<TextRunnerToken> side(12, 5), other(12, 6);
+  auto runner = std::make_shared<Runner>();
+  ComponentTextCache cache(runner, 2, 1 << 24, disk);
+  (void)LiveTurn(cache, *runner, conversation);
+  auto running = cache.Acquire(side, {}, {}, true, 0, true);
+  assert(WaitForAdmission(cache, other));
+  running->Invalidate();
+  (void)LiveTurn(cache, *runner, other);
+}
+void HeldTryIsPerExecution() {
+  // A failed held write marks only that execution's frontier. Another
+  // conversation of the same length later in the same slot is handed to the
+  // writer again instead of being reset unwritten.
+  const TemporaryDirectory temp("gufo-component-held-per-execution");
+  const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
+                                        .capacity_bytes = 1024};
+  std::vector<TextRunnerToken> first(8192), second(8192);
+  std::iota(first.begin(), first.end(), 10);
+  std::iota(second.begin(), second.end(), 20000);
+  const std::vector<TextRunnerToken> side(12, 5), other(12, 6);
+  auto runner = std::make_shared<Runner>();
+  ComponentTextCache cache(runner, 2, 1 << 24, disk);
+  (void)LiveTurn(cache, *runner, first);
+  auto running = cache.Acquire(side, {}, {}, true, 0, true);
+  // The first frontier's held write fails (larger than the whole disk).
+  assert(WaitForAdmission(cache, other));
+  (void)LiveTurn(cache, *runner, second);
+  assert(!cache.PrepareAdmission(other, nullptr, true, 0));
+  assert(WaitForAdmission(cache, other));
+  running->Invalidate();
+}
+void SchedulerAdmitsOthersWhileASlotIsHeld() {
+  // While the disk writer holds a conversation's slot, its next turn waits,
+  // and an unrelated request queued behind it runs in the other slot.
+  const TemporaryDirectory temp("gufo-component-scheduler-held");
+  const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
+                                        .capacity_bytes = 1 << 22};
+  // No private-state backing: the write-back cannot stage the recurrent
+  // state, so it keeps the slot for the writer.
+  std::vector<TextRunnerToken> conversation(4000);
+  std::iota(conversation.begin(), conversation.end(), 10);
+  auto runner = std::make_shared<Runner>();
+  runner->private_blocks = 0;
+  auto pool = std::make_shared<TextRunnerPool>(
+      runner, 2, disk, TextRunnerRamCacheOptions{.capacity_bytes = 1 << 24});
+  std::vector<TextRunnerToken> live = conversation;
+  {
+    auto request = pool->Acquire(conversation);
+    Prefill(request);
+    live.push_back(Generate(request));
+    (void)request.Commit();
+  }
+  WriterGate gate;
+  runner->background_stream = gate.Hook();
+  assert(pool->WriteBackIdle(std::chrono::milliseconds(0)) == 1);
+  assert(gate.entered.try_acquire_for(std::chrono::seconds(10)));
+  auto next = live;
+  next.push_back(7);
+  {
+    TextGenerationScheduler scheduler(pool);
+    auto held = scheduler.Submit(next, 2, 0.0F);
+    auto other = scheduler.Submit(std::vector<TextRunnerToken>(12, 5), 2, 0.0F);
+    auto done = std::async(std::launch::async, [&] { return other.Wait(); });
+    assert(done.wait_for(std::chrono::seconds(10)) ==
+           std::future_status::ready);
+    (void)done.get();
+    gate.release.release();
+    const auto result = held.Wait();
+    assert(result.cached_prompt_tokens == live.size());
+  }
+  runner->background_stream = {};
+}
+void UnlendableWriteBackStreamsFromTheSlot() {
+  // Rows the adapter neither lends nor retains, more than the RAM backing
+  // holds: the idle write-back hands the slot to the disk writer, which reads
+  // them from it through the disk staging. WriteBackIdle returns before the
+  // write; the next turn of that conversation waits for its slot and then
+  // continues the live frontier, which also restores after a restart.
+  const TemporaryDirectory temp("gufo-component-unlendable-write-back");
+  const std::filesystem::path directory = temp.path();
+  const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                        .capacity_bytes = 1 << 22};
+  std::vector<TextRunnerToken> conversation(8192);
+  std::iota(conversation.begin(), conversation.end(), 10);
+  auto next = conversation;
+  next.push_back(7);
+  {
+    auto runner = std::make_shared<Runner>();
+    ComponentTextCache cache(runner, 2, 1 << 24, disk);
+    runner->adapter->LimitBorrowedRows(1);
+    (void)LiveTurn(cache, *runner, conversation);
+    const auto copied = runner->adapter->CopiedOutRows();
+    WriterGate gate;
+    runner->background_stream = gate.Hook();
+    assert(cache.WriteBackIdle(std::chrono::milliseconds(0)) == 1);
+    assert(gate.entered.try_acquire_for(std::chrono::seconds(10)));
+    assert(!cache.PrepareAdmission(next, nullptr, true, 0));
+    // Another conversation runs in the other slot meanwhile.
+    const auto [side_cached, side_disk] =
+        LiveTurn(cache, *runner, std::vector<TextRunnerToken>(12, 5));
+    assert(side_cached == 0 && !side_disk);
+    gate.release.release();
+    assert(WaitForAdmission(cache, next));
+    runner->background_stream = {};
+    // Every row was read once, straight into the disk staging.
+    assert(runner->adapter->CopiedOutRows() - copied ==
+           2 * conversation.size());
+    const auto [cached, disk_hit] = LiveTurn(cache, *runner, next);
+    assert(cached == conversation.size() && !disk_hit);
+  }
+  auto runner = std::make_shared<Runner>();
+  {
+    ComponentTextCache cache(runner, 1, 1 << 24, disk);
+    auto lease = cache.Acquire(next, {}, {}, true, 0, true);
+    assert(lease->cached_tokens() == conversation.size() &&
+           lease->restored_from_disk());
+    lease->Invalidate();
+  }
+  std::filesystem::remove_all(directory);
+}
+void SingleWriterEvictsBetweenQueuedWrites() {
+  // Two held write-backs queue together; the disk holds one. The writer
+  // publishes the first, then evicts it for the second, with no other writer
+  // contending for the store: the second survives a restart.
+  const TemporaryDirectory temp("gufo-component-single-writer");
+  const std::filesystem::path directory = temp.path();
+  std::vector<TextRunnerToken> first(8192), second(8192);
+  std::iota(first.begin(), first.end(), 10);
+  std::iota(second.begin(), second.end(), 20000);
+  std::size_t one{};
+  {
+    // Measure one frontier on an unbounded disk.
+    const TemporaryDirectory probe("gufo-component-single-writer-probe");
+    auto runner = std::make_shared<Runner>();
+    {
+      ComponentTextCache cache(
+          runner, 1, 1 << 24,
+          TextRunnerDiskCacheOptions{.directory = probe.path().string(),
+                                     .capacity_bytes = 1 << 24});
+      runner->adapter->LimitBorrowedRows(1);
+      (void)LiveTurn(cache, *runner, first);
+      assert(cache.WriteBackIdle(std::chrono::milliseconds(0)) == 1);
+    }
+    one = ManagedBytes(probe.path());
+  }
+  const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                        .capacity_bytes = one * 3 / 2};
+  {
+    auto runner = std::make_shared<Runner>();
+    ComponentTextCache cache(runner, 2, 1 << 24, disk);
+    runner->adapter->LimitBorrowedRows(1);
+    (void)LiveTurn(cache, *runner, first);
+    (void)LiveTurn(cache, *runner, second);
+    assert(cache.WriteBackIdle(std::chrono::milliseconds(0)) == 2);
+  }
+  auto runner = std::make_shared<Runner>();
+  {
+    ComponentTextCache cache(runner, 1, 1 << 24, disk);
+    auto next = second;
+    next.push_back(7);
+    auto lease = cache.Acquire(next, {}, {}, true, 0, true);
+    assert(lease->cached_tokens() == second.size() &&
+           lease->restored_from_disk());
+    lease->Invalidate();
+  }
+  std::filesystem::remove_all(directory);
+}
+void RamRestoreKeepsTheDiskLineage() {
+  // A prompt checkpoint persisted from RAM and later restored from RAM is
+  // that execution's durable lineage: the turn's write-back reuses its chunk
+  // files (and live turns refresh its disk recency).
+  const TemporaryDirectory temp("gufo-component-ram-lineage");
+  const std::filesystem::path directory = temp.path();
+  const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                        .capacity_bytes = 1 << 22,
+                                        .min_checkpoint_step_tokens = 1};
+  std::vector<TextRunnerToken> conversation(200);
+  std::iota(conversation.begin(), conversation.end(), 10);
+  const std::vector<TextRunnerToken> head(conversation.begin(),
+                                          conversation.begin() + 100);
+  {
+    auto runner = std::make_shared<Runner>();
+    ComponentTextCache cache(runner, 1, 1 << 22, disk);
+    {
+      auto lease = cache.Acquire(head, {}, {}, true, 0, true);
+      auto& state = dynamic_cast<State&>(lease->state());
+      runner->adapter->Append(state.slot, head, head);
+      assert(lease->TryReserveSnapshot(lease->CaptureBytes(), head.size(),
+                                       false, SnapshotPurpose::kContinuation,
+                                       {}));
+      (void)lease->Commit(head, lease->Capture(), head);
+    }
+    const std::vector<TextRunnerToken> side(12, 5);
+    std::uint64_t completed = 0;
+    for (int i = 0; i < 500 && completed == 0; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      auto peek = cache.Acquire(side, {}, {}, true, 0, true);
+      completed = peek->Metrics().persistence->completed;
+      (void)peek->Commit({}, {}, {});
+    }
+    assert(completed == 1);
+    (void)LiveTurn(cache, *runner, side);
+    {
+      auto lease = cache.Acquire(conversation, {}, {}, true, 0, true);
+      assert(lease->cached_tokens() == head.size() &&
+             lease->Metrics().reuse == "ram");
+      auto& state = dynamic_cast<State&>(lease->state());
+      const auto tail = std::span(conversation).subspan(head.size());
+      runner->adapter->Append(state.slot, tail, tail);
+      (void)lease->Commit({}, {}, conversation);
+    }
+    assert(cache.WriteBackIdle(std::chrono::milliseconds(0)) == 1);
+  }
+  cache::ResourceLedger ledger({1 << 24, 1 << 24, 0, 0});
+  cache::DiskStore store(ledger, directory, disk.capacity_bytes);
+  const cache::DiskManifest* parent = nullptr;
+  const cache::DiskManifest* child = nullptr;
+  for (const auto& entry : store.Entries()) {
+    if (entry.Manifest().tokens.size() == head.size())
+      parent = &entry.Manifest();
+    else if (entry.Manifest().tokens.size() == conversation.size())
+      child = &entry.Manifest();
+  }
+  assert(parent && child);
+  for (std::size_t i = 0; i < parent->components.size(); ++i)
+    for (std::size_t j = 0; j < parent->components[i].chunks.size(); ++j)
+      assert(parent->components[i].chunks[j].file ==
+             child->components[i].chunks[j].file);
+}
+void UnlendableLargeWriteBackStagesNothingInRam() {
+  // Generic path, any adapter: rows that are neither lent nor retained and
+  // would take more than an eighth of the RAM budget to stage are written
+  // straight from the slot. No RAM backing is allocated for them at all.
+  const TemporaryDirectory temp("gufo-component-unlendable-bounded");
+  const std::filesystem::path directory = temp.path();
+  const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                        .capacity_bytes = 1 << 22};
+  std::vector<TextRunnerToken> conversation(32768);
+  std::iota(conversation.begin(), conversation.end(), 10);
+  {
+    auto runner = std::make_shared<Runner>();
+    runner->rows_per_chunk = 4096;
+    ComponentTextCache cache(runner, 2, 1 << 20, disk);
+    runner->adapter->LimitBorrowedRows(1);
+    (void)LiveTurn(cache, *runner, conversation);
+    const auto allocations = runner->captures;
+    assert(cache.WriteBackIdle(std::chrono::milliseconds(0)) == 1);
+    assert(runner->captures == allocations);
+  }
+  auto runner = std::make_shared<Runner>();
+  runner->rows_per_chunk = 4096;
+  {
+    ComponentTextCache cache(runner, 1, 1 << 24, disk);
+    auto next = conversation;
+    next.push_back(7);
+    auto lease = cache.Acquire(next, {}, {}, true, 0, true);
+    assert(lease->cached_tokens() == conversation.size() &&
+           lease->restored_from_disk());
+    lease->Invalidate();
+  }
+  std::filesystem::remove_all(directory);
+}
+void RetainedRowsWriteBackWithoutStaging() {
+  // Rows the adapter retains as device references (a shared KV pool) but
+  // does not lend are written from those references: only the draft rows,
+  // which it does not retain, are copied out.
+  const TemporaryDirectory temp("gufo-component-retained-write-back");
+  const std::filesystem::path directory = temp.path();
+  const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                        .capacity_bytes = 1 << 22};
+  std::vector<TextRunnerToken> conversation(100);
+  std::iota(conversation.begin(), conversation.end(), 10);
+  {
+    auto runner = std::make_shared<Runner>();
+    runner->retain_rows = true;
+    ComponentTextCache cache(runner, 2, 1 << 22, disk);
+    runner->adapter->LimitBorrowedRows(1);
+    (void)LiveTurn(cache, *runner, conversation);
+    const auto copied = runner->adapter->CopiedOutRows();
+    assert(cache.WriteBackIdle(std::chrono::milliseconds(0)) == 1);
+    assert(runner->adapter->CopiedOutRows() - copied == conversation.size());
+  }
+  auto runner = std::make_shared<Runner>();
+  {
+    ComponentTextCache cache(runner, 1, 1 << 22, disk);
+    auto next = conversation;
+    next.push_back(7);
+    auto lease = cache.Acquire(next, {}, {}, true, 0, true);
+    assert(lease->cached_tokens() == conversation.size() &&
+           lease->restored_from_disk());
+    lease->Invalidate();
+  }
+  std::filesystem::remove_all(directory);
+}
+void ImageFrontierCapturesAfterPrefixCheckpoint() {
+  // A conversation with an image at token 20 checkpoints at 8, before it,
+  // under the identity of the images before 8. Its live frontier keeps the
+  // image boundary, so the capture before its slot is reassigned continues
+  // that history instead of failing ("checkpoint input changed within
+  // inherited prefix"), and the next turn restores it.
+  auto context = std::make_shared<TextPromptContext>();
+  context->cache_identity = {9, 9};
+  context->cache_prefixes.push_back({20, {1}});
+  std::vector<TextRunnerToken> conversation(100);
+  std::iota(conversation.begin(), conversation.end(), 10);
+  auto runner = std::make_shared<Runner>();
+  ComponentTextCache cache(runner, 1, 1 << 22, {});
+  {
+    auto lease = cache.Acquire(conversation, {}, context, true, 0, true);
+    auto& state = dynamic_cast<State&>(lease->state());
+    const auto head = std::span(conversation).first(8);
+    runner->adapter->Append(state.slot, head, head);
+    assert(lease->TryReserveSnapshot(lease->CaptureBytes(), 8, false,
+                                     SnapshotPurpose::kHistory, {}));
+    assert(lease->PublishSnapshot({head.begin(), head.end()}, lease->Capture(),
+                                  false));
+    const auto rest = std::span(conversation).subspan(8);
+    runner->adapter->Append(state.slot, rest, rest);
+    (void)lease->Commit({}, {}, conversation);
+  }
+  const auto previous_level = Logger::Level();
+  Logger::SetLevel(LogLevel::kInfo);
+  std::ostringstream output;
+  auto* previous_sink = std::clog.rdbuf(output.rdbuf());
+  (void)LiveTurn(cache, *runner, std::vector<TextRunnerToken>(12, 5));
+  std::clog.rdbuf(previous_sink);
+  Logger::SetLevel(previous_level);
+  const auto log = output.str();
+  assert(log.find("event=live_frontier_captured reason=reassignment") !=
+         std::string::npos);
+  assert(log.find("capture_failed") == std::string::npos);
+  auto next = conversation;
+  next.push_back(7);
+  const auto [cached, disk_hit] = LiveTurn(cache, *runner, next, context);
+  assert(cached == conversation.size() && !disk_hit);
+}
 }  // namespace
 // Paged rows: admission waits while a shared row pool is short, after
 // returning the rows idle slots hold; a reservation holds blocks until the
@@ -3735,4 +4178,14 @@ int main() {
   UnbackedDeepRowsSurviveDiskRestart();
   OverRamCaptureStagesPrivateStateUnderPressure(false);
   OverRamCaptureStagesPrivateStateUnderPressure(true);
+  HeldReassignmentWritesOnTheWriter();
+  FailedHeldWriteIsNotRetriedForever();
+  HeldTryIsPerExecution();
+  SchedulerAdmitsOthersWhileASlotIsHeld();
+  UnlendableWriteBackStreamsFromTheSlot();
+  SingleWriterEvictsBetweenQueuedWrites();
+  RamRestoreKeepsTheDiskLineage();
+  UnlendableLargeWriteBackStagesNothingInRam();
+  RetainedRowsWriteBackWithoutStaging();
+  ImageFrontierCapturesAfterPrefixCheckpoint();
 }

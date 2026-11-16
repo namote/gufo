@@ -7,6 +7,7 @@
 #include <memory>
 #include <span>
 #include <stop_token>
+#include <string>
 #include <vector>
 
 #include "src/cache/adapter.hpp"
@@ -42,6 +43,9 @@ struct TransferTiming {
   std::uint64_t metadata_lock_ns{}, filesystem_ns{}, fsync_ns{}, checksum_ns{};
   std::uint64_t yield_ns{}, bytes{}, pieces{};
   std::uint64_t staging_wait_ns{}, io_lock_ns{};
+  // Why a queued job did not publish (PersistenceQueue completion only):
+  // "superseded", "stopped", "disk_capacity" or the write error.
+  std::string failure;
 };
 // Sources retain immutable storage, assigned spill backing or discardable
 // observations. Backed borrowers wait for preservation before disk work
@@ -140,9 +144,14 @@ public:
   PersistenceJob(PersistenceJob&&) noexcept = default;
   PersistenceJob& operator=(PersistenceJob&&) = delete;
   PersistenceJob(const PersistenceJob&) = delete;
+  // A job whose sources hold an exclusive slot (a slot-held capture) is
+  // never replaced by a newer unrelated job under queue pressure: dropping
+  // it would release the slot unwritten, and the capture would be retried.
+  void KeepUnderPressure() noexcept { keep_ = true; }
 
 private:
   friend class PersistenceQueue;
+  bool keep_{};
   ResourceCharge metadata_;
   DiskFileId file_;
   DiskManifest manifest_;
@@ -166,7 +175,10 @@ struct PersistenceQueueStats {
 // their newest descendant. Under pressure, recent jobs
 // may replace the oldest pending non-learned job; active writes are untouched.
 // Completion reports false for superseded work, outside the queue lock, with
-// the job's write costs (zero for work that never started).
+// the job's write costs (zero for work that never started). The worker is
+// the only disk writer of its store, so publication never races its own
+// reclamation. A finished or dropped job (and whatever its sources own) is
+// destroyed outside the queue lock, before Drain can return.
 class PersistenceQueue {
 public:
   PersistenceQueue(

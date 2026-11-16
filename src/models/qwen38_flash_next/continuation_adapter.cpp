@@ -908,8 +908,11 @@ std::span<const std::byte> ContinuationAdapter::BorrowRowsView(
   const auto& component = Component(id);
   // The host token vector can move when execution appends. Device append
   // allocations stay fixed for the session and are guarded before mutation.
-  if (component.part == ContinuationPart::kTokens || kv_pool_ ||
-      component.part == ContinuationPart::kKvarnRecords)
+  // Pooled rows lie on scattered blocks (captures retain them instead).
+  // KVarN records follow their FP16 sink group; a committed state has
+  // quantized every group its records count, and a write guards the records
+  // from the group it reopens (BeforeWrite), so lent records stay fixed.
+  if (component.part == ContinuationPart::kTokens || kv_pool_)
     return {};
   if (!state.IsValid() ||
       component.descriptor.kind != cache::ComponentKind::kAppendRows)
@@ -920,9 +923,10 @@ std::span<const std::byte> ContinuationAdapter::BorrowRowsView(
   const auto row = component.descriptor.row_bytes;
   if (position == positions.end() || first >= end || end > position->valid_rows)
     throw std::invalid_argument("invalid Flash-Next borrowed range");
+  const Rows offset = component.part == ContinuationPart::kKvarnRecords ? 1 : 0;
   return {static_cast<const std::byte*>(
               RowData(const_cast<State&>(state), component)) +
-              first * row,
+              (first + offset) * row,
           (end - first) * row};
 }
 struct ContinuationAdapter::RetainedBlock {

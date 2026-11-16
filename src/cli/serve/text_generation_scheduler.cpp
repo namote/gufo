@@ -1235,6 +1235,18 @@ struct TextGenerationScheduler::Impl {
     UpdateWaiting(waiting);
     const std::array<const std::deque<std::shared_ptr<ScheduledRequest>>*, 2>
         residents{&prefilling, &capturing};
+    // A request whose session a queued disk write holds waits for it while
+    // later ones are admitted. Each is tried once per pass and goes back to
+    // the front of `waiting`, in its order, when the pass ends.
+    struct SlotDeferred {
+      std::deque<std::shared_ptr<ScheduledRequest>>& waiting;
+      std::vector<std::shared_ptr<ScheduledRequest>> requests;
+      ~SlotDeferred() {
+        waiting.insert(waiting.begin(),
+                       std::make_move_iterator(requests.begin()),
+                       std::make_move_iterator(requests.end()));
+      }
+    } slot_deferred{waiting, {}};
     // Captures retain their runner lease until decoding resumes.
     while (!stop_token.stop_requested() && prefilling.size() + decoding.size() +
                                                    capturing.size() +
@@ -1246,7 +1258,8 @@ struct TextGenerationScheduler::Impl {
         // may resume in place, but new arrivals must respect those
         // reservations.
         if (prefilling.size() + decoding.size() + capturing.size() +
-                kv_waiting_count + waiting.size() >=
+                kv_waiting_count + waiting.size() +
+                slot_deferred.requests.size() >=
             runner_pool->capacity())
           return;
         request = PopQueued();
@@ -1287,6 +1300,12 @@ struct TextGenerationScheduler::Impl {
             : ProgressiveRows()
                 ? std::min(request->token_limit, kKvDecodeWindow)
                 : request->token_limit;
+        if (!runner_pool->SlotReady(
+                request->prompt, request->prompt_context.get(),
+                request->cache_prompt, request->cache_prefix_tokens)) {
+          slot_deferred.requests.push_back(std::move(request));
+          continue;
+        }
         if (!runner_pool->AdmissionReady(
                 request->prompt, row_limit, request->prompt_context.get(),
                 request->cache_prompt, request->cache_prefix_tokens)) {

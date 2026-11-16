@@ -39,6 +39,11 @@ constexpr std::size_t kAdmissionMetadataBytes = std::size_t{512} << 10;
 // whole backing blocks (ContinuationLayout::BackingPlan). Backing still grows
 // only when the host has room for it.
 constexpr std::size_t kMinimumBackingBytes = std::size_t{8} << 20;
+// A disk capture that may keep its slot (an idle write-back, a frontier
+// before its reset) and whose RAM staging would exceed this share of the RAM
+// cache budget keeps the slot for the writer instead (CaptureDurable):
+// staging a deep conversation would evict what the RAM cache exists for.
+constexpr std::size_t kDirectWriteBudgetShare = 8;
 std::size_t SaturatingAdd(std::size_t a, std::size_t b) {
   return a > std::numeric_limits<std::size_t>::max() - b
              ? std::numeric_limits<std::size_t>::max()
@@ -86,6 +91,9 @@ struct DurableCapture {
   std::vector<cache::PersistenceSource> sources;
   // An idle write-back of a live frontier: not limited by the disk step.
   bool write_back{};
+  // Its sources read a slot the capture keeps leased (SlotHold) until the
+  // queue worker has written them.
+  bool holds_slot{};
 };
 class ComponentSnapshot final : public TextRunnerSnapshot {
 public:
@@ -229,12 +237,26 @@ struct ComponentTextCache::Impl {
     std::shared_ptr<const cache::DiskDescription> durable;
     // The live frontier's prompt, to tell whether any checkpoint covers it.
     std::vector<cache::Token> live_tokens;
-    cache::Identity live_input;
+    // Its input identity, with the request's image-prefix boundaries: a
+    // checkpoint inside the prompt carries the identity of the images before
+    // it, so rebuilding this from the complete identity alone fails every
+    // capture whose history ends before an image.
+    cache::InputIdentity live_input;
     // Acquisition order; cold assignment replaces the oldest live frontier.
     std::uint64_t used{};
     bool busy{};
     // Paged rows: false once ReclaimRows emptied the slot, until it is leased.
     bool holds_rows{};
+    // Busy because a queued disk write keeps the slot leased (SlotHold); it
+    // returns to idle, with its live frontier, once the write finishes.
+    bool writing{};
+    // The execution (branch) and length of the live frontier admission last
+    // handed to the disk writer (PrepareAdmission). A write that failed or
+    // was dropped is not handed over again: cold assignment then captures it
+    // without the slot. Another execution of the same length is a new
+    // frontier.
+    std::shared_ptr<const void> held_branch;
+    std::size_t held_tried{};
     // Where the live frontier is, to lease it exactly for a capture.
     cache::BorrowedLocation live_location{};
     // When the live frontier was last committed.
@@ -272,17 +294,39 @@ struct ComponentTextCache::Impl {
     std::size_t index;
     cache::BorrowedLocation location;
     std::vector<cache::Token> tokens;
-    cache::Identity input;
+    cache::InputIdentity input;
+  };
+  // Keeps an idle slot leased for a queued disk write that reads it, so its
+  // rows stay unchanged; releasing it (when the worker drops the job) returns
+  // the slot, live frontier intact, to admission.
+  struct SlotHold {
+    SlotHold(Impl* cache, Entry* entry, cache::SlotLease slot)
+        : cache(cache), entry(entry), slot(std::move(slot)) {
+      const std::lock_guard lock(cache->mutex);
+      entry->writing = true;
+    }
+    SlotHold(const SlotHold&) = delete;
+    ~SlotHold() {
+      try {
+        // The write only read the slot: its generation stays valid.
+        slot.Commit();
+      } catch (...) {
+      }
+      const std::lock_guard lock(cache->mutex);
+      entry->writing = false;
+      entry->busy = false;
+    }
+    Impl* cache;
+    Entry* entry;
+    cache::SlotLease slot;
   };
   // Under the mutex: the entry's live frontier when no checkpoint comes within
   // kUncoveredCaptureTokens of it.
   [[nodiscard]] std::optional<Uncovered> UncoveredLive(std::size_t i) const {
     const auto& e = *entries[i];
     if (!e.live || e.live_tokens.size() < kUncoveredCaptureTokens ||
-        index.HasCheckpoint(
-            {identity, e.live_tokens,
-             cache::InputIdentity(e.live_tokens.size(), e.live_input)},
-            e.live_tokens.size() - kUncoveredCaptureTokens))
+        index.HasCheckpoint({identity, e.live_tokens, e.live_input},
+                            e.live_tokens.size() - kUncoveredCaptureTokens))
       return {};
     return Uncovered{i, e.live_location, e.live_tokens, e.live_input};
   }
@@ -510,103 +554,18 @@ struct ComponentTextCache::Impl {
       queue = std::make_unique<cache::PersistenceQueue>(
           ledger, *streaming, kPersistenceDepth, ram,
           [this] {
+            // A slot held for this queue's own write runs no model work.
             const std::lock_guard lock(mutex);
-            return std::ranges::none_of(
-                entries, [](const auto& entry) { return entry->busy; });
+            return std::ranges::none_of(entries, [](const auto& entry) {
+              return entry->busy && !entry->writing;
+            });
           },
           [this](cache::CheckpointId id, bool success,
                  const cache::TransferTiming& timing) {
-            const std::lock_guard lock(mutex);
-            std::shared_ptr<const void> branch;
-            for (std::size_t i = 0; i < pending.size(); ++i)
-              if (pending[i] && pending[i]->Id() == id) {
-                pending[i].reset();
-                branch = std::move(pending_branch[i]);
-              }
-            std::shared_ptr<DurableCapture> completed;
-            for (auto& capture : pending_durable)
-              if (capture && capture->manifest.checkpoint == id) {
-                completed = capture;
-                branch = capture->branch;
-                capture.reset();
-              }
-            if (!success) {
-              // A failed write-back no longer covers its frontier.
-              if (completed && completed->write_back)
-                for (auto& entry : entries)
-                  if (entry->branch == completed->branch &&
-                      entry->written_back == completed->manifest.tokens.size())
-                    entry->written_back = 0;
-              Logger::Info(
-                  "cache",
-                  "schema=component-cache-v1 event=persistence_incomplete "
-                  "checkpoint_id=" +
-                      std::to_string(id.value));
-              return;
-            }
-            catalog->Track(id);
-            if (const auto description = catalog->Find(id)) {
-              // A checkpoint persisted from RAM is the durable ancestor of the
-              // execution it came from too, so a later write-back of that
-              // slot reuses its chunk files instead of writing them again.
-              // Only that execution: conversations forked from one shared
-              // checkpoint share its lineage and may share its tokens, but
-              // computed their own rows. A busy entry's frontier is not known
-              // yet (see Covered); an idle one must still extend it.
-              const auto& tokens = description->Manifest().tokens;
-              for (auto& entry : entries)
-                if (branch && entry->branch == branch &&
-                    (entry->busy || Prefixes(tokens, entry->live_tokens)) &&
-                    (!entry->durable ||
-                     entry->durable->Manifest().tokens.size() < tokens.size()))
-                  entry->durable = description;
-              auto found = index.Lookup(
-                  {identity, description->Manifest().tokens,
-                   cache::InputIdentity(description->Manifest().tokens.size(),
-                                        description->Manifest().input)});
-              bool attached = false;
-              for (const auto& candidate : found.candidates) {
-                if (candidate.checkpoint && candidate.checkpoint->Id() == id) {
-                  index.AttachDurable(candidate.entry, description);
-                  attached = true;
-                }
-              }
-              if (!attached)
-                (void)index.Insert(identity, description);
-              Logger::Info(
-                  "cache",
-                  "schema=component-cache-v1 event=published tokens=" +
-                      std::to_string(description->Manifest().tokens.size()) +
-                      " checkpoint_id=" + std::to_string(id.value) +
-                      " payload_bytes=" +
-                      std::to_string(PayloadBytes(description->Manifest())) +
-                      " yield_ms=" + std::to_string(timing.yield_ns / 1e6) +
-                      " stream_wait_ms=" +
-                      std::to_string(timing.stream_wait_ns / 1e6) +
-                      " filesystem_ms=" +
-                      std::to_string(timing.filesystem_ns / 1e6) +
-                      " io_lock_ms=" + std::to_string(timing.io_lock_ns / 1e6));
-            }
+            Completed(id, success, timing);
           },
           [this](const cache::DiskManifest& manifest) {
-            // A checkpoint larger than the entire disk budget cannot be
-            // admitted by deleting other conversations.
-            const auto bytes = PayloadBytes(manifest);
-            if (bytes > disk_capacity)
-              return false;
-            // Startup orphan reclamation holds the store lock asynchronously
-            // and eviction only tries that lock, so a write racing it would
-            // be dropped. Only this worker joins it once the queue exists.
-            try {
-              disk->WaitForReclamation();
-            } catch (const std::exception& error) {
-              Logger::Warn("cache", std::string("schema=component-cache-v1 "
-                                                "event=disk_reclamation_failed "
-                                                "reason=") +
-                                        error.what());
-            }
-            const std::lock_guard lock(mutex);
-            return catalog->EvictOne();
+            return ReclaimDisk(manifest);
           });
     }
     Logger::Info(
@@ -628,6 +587,189 @@ struct ComponentTextCache::Impl {
       queue->Drain();
     for (auto& entry : entries)
       entry->slot->StopIdleSpill();
+  }
+  // Persistence completion of checkpoint `id` (queue worker).
+  void Completed(cache::CheckpointId id, bool success,
+                 const cache::TransferTiming& timing) {
+    const std::lock_guard lock(mutex);
+    std::shared_ptr<const void> branch;
+    for (std::size_t i = 0; i < pending.size(); ++i)
+      if (pending[i] && pending[i]->Id() == id) {
+        pending[i].reset();
+        branch = std::move(pending_branch[i]);
+      }
+    std::shared_ptr<DurableCapture> completed;
+    for (auto& capture : pending_durable)
+      if (capture && capture->manifest.checkpoint == id) {
+        completed = capture;
+        branch = capture->branch;
+        capture.reset();
+      }
+    if (!success) {
+      // A failed write-back no longer covers its frontier.
+      if (completed && completed->write_back)
+        for (auto& entry : entries)
+          if (entry->branch == completed->branch &&
+              entry->written_back == completed->manifest.tokens.size())
+            entry->written_back = 0;
+      Logger::Info("cache",
+                   "schema=component-cache-v1 event=persistence_incomplete "
+                   "checkpoint_id=" +
+                       std::to_string(id.value) + " reason=\"" +
+                       timing.failure + "\"");
+      return;
+    }
+    catalog->Track(id);
+    if (const auto description = catalog->Find(id)) {
+      // A checkpoint persisted from RAM is the durable ancestor of the
+      // execution it came from too, so a later write-back of that
+      // slot reuses its chunk files instead of writing them again.
+      // Only that execution: conversations forked from one shared
+      // checkpoint share its lineage and may share its tokens, but
+      // computed their own rows. A busy entry's frontier is not known
+      // yet (see Covered); an idle one must still extend it.
+      const auto& tokens = description->Manifest().tokens;
+      for (auto& entry : entries)
+        if (branch && entry->branch == branch &&
+            (entry->busy || Prefixes(tokens, entry->live_tokens)) &&
+            (!entry->durable ||
+             entry->durable->Manifest().tokens.size() < tokens.size()))
+          entry->durable = description;
+      auto found = index.Lookup(
+          {identity, description->Manifest().tokens,
+           cache::InputIdentity(description->Manifest().tokens.size(),
+                                description->Manifest().input)});
+      bool attached = false;
+      for (const auto& candidate : found.candidates) {
+        if (candidate.checkpoint && candidate.checkpoint->Id() == id) {
+          index.AttachDurable(candidate.entry, description);
+          attached = true;
+        }
+      }
+      if (!attached)
+        (void)index.Insert(identity, description);
+      Logger::Info(
+          "cache",
+          "schema=component-cache-v1 event=published tokens=" +
+              std::to_string(description->Manifest().tokens.size()) +
+              " checkpoint_id=" + std::to_string(id.value) + " payload_bytes=" +
+              std::to_string(PayloadBytes(description->Manifest())) +
+              " yield_ms=" + std::to_string(timing.yield_ns / 1e6) +
+              " stream_wait_ms=" + std::to_string(timing.stream_wait_ns / 1e6) +
+              " filesystem_ms=" + std::to_string(timing.filesystem_ns / 1e6) +
+              " io_lock_ms=" + std::to_string(timing.io_lock_ns / 1e6));
+    }
+  }
+  // Frees disk room for `manifest` by evicting the least recently used
+  // checkpoint. Only the queue worker writes the store, and it alone calls
+  // this, so no other publication holds the store lock meanwhile.
+  bool ReclaimDisk(const cache::DiskManifest& manifest) {
+    // A checkpoint larger than the entire disk budget cannot be admitted by
+    // deleting other conversations.
+    const auto bytes = PayloadBytes(manifest);
+    if (bytes > disk_capacity)
+      return false;
+    // Startup orphan reclamation holds the store lock asynchronously and
+    // eviction only tries that lock, so a write racing it would be dropped.
+    try {
+      disk->WaitForReclamation();
+    } catch (const std::exception& error) {
+      Logger::Warn("cache", std::string("schema=component-cache-v1 "
+                                        "event=disk_reclamation_failed "
+                                        "reason=") +
+                                error.what());
+    }
+    const std::lock_guard lock(mutex);
+    return catalog->EvictOne();
+  }
+  // Under the mutex: the idle slot a cold acquisition takes, or null.
+  Entry* SelectCold() {
+    Entry* entry = nullptr;
+    // A frontier far beyond every checkpoint of its prompt is the only
+    // copy of that work, as for a conversation larger than the RAM budget
+    // whose captures are refused: take it last. Then completed
+    // preservation first: it needs no foreground copy. Among those, a live
+    // frontier holds generated tokens no checkpoint covers, such as the
+    // tool call the next turn replays. Take a slot without one, then a
+    // shallow frontier before a deep one, then the least recently used.
+    // Faster idle preservation must not make short side requests evict a
+    // deep conversation merely because its backing copy finished earlier.
+    constexpr std::size_t kUncoveredTokens = 4096;
+    const auto uncovered = [&](const Entry& e) {
+      if (!e.live || e.live_tokens.size() <= kUncoveredTokens)
+        return false;
+      return !index.HasCheckpoint({identity, e.live_tokens, e.live_input},
+                                  e.live_tokens.size() - kUncoveredTokens);
+    };
+    using Rank = std::tuple<bool, bool, bool, bool, std::uint64_t>;
+    const auto rank = [&](const Entry& e) {
+      return Rank{uncovered(e), !e.slot->PreservationComplete(), bool(e.live),
+                  e.live_tokens.size() >= kUncoveredTokens, e.used};
+    };
+    std::optional<Rank> selected_rank;
+    for (auto& candidate : entries) {
+      if (candidate->busy)
+        continue;
+      if (!entry) {
+        entry = candidate.get();
+        continue;
+      }
+      if (!selected_rank)
+        selected_rank = rank(*entry);
+      const auto candidate_rank = rank(*candidate);
+      if (candidate_rank < *selected_rank) {
+        entry = candidate.get();
+        selected_rank = candidate_rank;
+      }
+    }
+    // Keep ordinary cold selection unchanged. Only a cancelled executor
+    // with outstanding work needs an alternative; do not query every
+    // stream or look up exact checkpoint coverage on normal admissions.
+    if (entry && !entry->slot->ExecutionComplete()) {
+      if (!selected_rank)
+        selected_rank = rank(*entry);
+      Entry* ready = nullptr;
+      std::optional<Rank> ready_rank;
+      for (auto& candidate : entries) {
+        if (candidate.get() == entry || candidate->busy ||
+            !candidate->slot->ExecutionComplete())
+          continue;
+        const auto candidate_rank = rank(*candidate);
+        // A ready slot must not sacrifice uncovered work or introduce
+        // foreground preservation. Keep a deep generated tail unless an
+        // exact checkpoint or another idle live copy still covers it.
+        const auto live_copy = [&] {
+          return candidate->history &&
+                 std::ranges::any_of(entries, [&](const auto& other) {
+                   return other != candidate && !other->busy && other->live &&
+                          other->history &&
+                          other->history->Lineage() ==
+                              candidate->history->Lineage() &&
+                          other->live_tokens == candidate->live_tokens &&
+                          other->live_input.Matches(
+                              candidate->live_input,
+                              candidate->live_tokens.size());
+                 });
+        };
+        if (std::tie(std::get<0>(candidate_rank), std::get<1>(candidate_rank)) >
+                std::tie(std::get<0>(*selected_rank),
+                         std::get<1>(*selected_rank)) ||
+            (candidate->live &&
+             candidate->live_tokens.size() >= kUncoveredTokens &&
+             !index.HasCheckpoint(
+                 {identity, candidate->live_tokens, candidate->live_input},
+                 candidate->live_tokens.size()) &&
+             !live_copy()))
+          continue;
+        if (!ready || candidate_rank < *ready_rank) {
+          ready = candidate.get();
+          ready_rank = candidate_rank;
+        }
+      }
+      if (ready)
+        entry = ready;
+    }
+    return entry;
   }
   std::unique_ptr<cache::Stream> Stream() {
     auto stream = resources->stream();
@@ -830,6 +972,8 @@ struct ComponentTextCache::Impl {
     auto job = cache::PersistenceJob(
         ledger, File(1, capture->manifest.checkpoint.value), capture->manifest,
         std::move(capture->sources));
+    if (capture->holds_slot)
+      job.KeepUnderPressure();
     std::size_t pending_slot;
     // A write-back covers its frontier from before submission: the job may
     // fail, and its callback clear the mark, before TrySubmit returns.
@@ -886,6 +1030,15 @@ struct ComponentTextCache::Lease::Impl {
   SnapshotPurpose purpose{SnapshotPurpose::kContinuation};
   // CaptureDurable for WriteBackIdle: the disk step does not apply.
   bool write_back{};
+  // CaptureBeforeReset: the slot is reset right after the capture unless the
+  // capture keeps it (hold_slot), so rows it lends would be retired unread.
+  bool before_reset{};
+  // An idle slot (WriteBackIdle, admission's reassignment capture) that a disk
+  // capture may keep leased until the writer has read it (SlotHold).
+  bool hold_slot{};
+  // CaptureDurable moved `slot` into a SlotHold: the caller neither commits
+  // it nor returns the entry to idle.
+  bool held{};
   // A copy of a live frontier (CaptureBeforeReset, WriteBackIdle), published
   // as CheckpointPurpose::kGenerated.
   bool live_frontier{};
@@ -949,6 +1102,16 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
     cache::DiskFileId file;
     bool private_file;
   };
+  // Every piece this capture writes (inherited chunks excepted), for a
+  // direct write that reads each one from the slot.
+  struct Piece {
+    cache::ComponentId component;
+    bool private_state;
+    cache::Rows first, end;
+    std::size_t bytes, alignment;
+    cache::DiskFileId file;
+    bool private_file;
+  };
   std::size_t pieces = 0;
   for (const auto& d : descriptors) {
     const auto p =
@@ -967,8 +1130,9 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
       sizeof(DurableCapture) + sizeof(ComponentSnapshot) +
           capture_tokens.size() * sizeof(cache::Token) + capture_input.size() +
           descriptors.size() * sizeof(cache::DiskComponent) +
-          pieces * (sizeof(cache::DiskPayload) +
-                    sizeof(cache::PersistenceSource) + sizeof(Copy) + 256));
+          pieces *
+              (sizeof(cache::DiskPayload) + sizeof(cache::PersistenceSource) +
+               sizeof(Copy) + sizeof(Piece) + 256));
   auto durable = std::make_shared<DurableCapture>();
   durable->metadata = admission.Convert();
   durable->write_back = write_back;
@@ -1006,6 +1170,17 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
   durable->sources.reserve(pieces);
   std::vector<Copy> copies;
   copies.reserve(pieces);
+  std::vector<Piece> all_pieces;
+  all_pieces.reserve(pieces);
+  // A capture before a reset that may keep its slot does: the writer then
+  // reads every piece from it (SlotHold). Without the slot, the reset right
+  // after would retire every row it lends, so it lends none and stages them.
+  bool direct = before_reset && hold_slot;
+  const bool lend = !before_reset;
+  const auto device_rows = [&](cache::ComponentId id) {
+    return std::ranges::find(cache->device_components, id) !=
+           cache->device_components.end();
+  };
   for (const auto& d : descriptors) {
     const auto p =
         std::ranges::find(positions, d.id, &cache::ComponentPosition::id);
@@ -1027,13 +1202,15 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
         inherited = chunks * d.rows_per_chunk;
       }
     }
-    // Completed rows are lent as one view, or chunk by chunk when they lie
-    // on several runs of device blocks; only rows the slot cannot lend are
-    // staged in RAM.
+    // Completed rows the adapter retains in device storage are written from
+    // those references, which no later mutation changes. The others are lent
+    // as one view, or chunk by chunk when they lie on several runs of device
+    // blocks; only rows the slot can neither retain nor lend are staged.
+    const bool retains = !direct && device_rows(d.id);
     std::shared_ptr<cache::BorrowedRows> rows;
     std::vector<std::shared_ptr<cache::BorrowedRows>> chunk_rows;
     if (completed) {
-      if (inherited != completed) {
+      if (inherited != completed && !direct && !retains && lend) {
         auto view = cache->resources->adapter->BorrowRowsView(
             slot.Execution(), d.id, inherited, completed);
         if (!view.empty())
@@ -1054,15 +1231,38 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
     }
     const auto capture = [&](cache::Rows first, cache::Rows end,
                              bool private_file) {
-      const auto bytes = d.kind == cache::ComponentKind::kPrivateState
-                             ? d.state_bytes
-                             : (end - first) * d.row_bytes;
+      const bool private_state = d.kind == cache::ComponentKind::kPrivateState;
+      const auto bytes =
+          private_state ? d.state_bytes : (end - first) * d.row_bytes;
       const auto file =
           cache->File(0, cache::ExecutionHistory::AllocateCheckpointId().value);
+      all_pieces.push_back({d.id, private_state, first, end, bytes,
+                            private_state ? std::size_t{1} : d.row_bytes, file,
+                            private_file});
+      if (direct)
+        return cache::DiskPayload{file, bytes, 0};
       const auto chunk =
           private_file || chunk_rows.empty()
               ? std::shared_ptr<cache::BorrowedRows>{}
               : chunk_rows[(first - inherited) / d.rows_per_chunk];
+      if (retains && !private_file) {
+        auto retained = cache->resources->adapter->RetainRows(slot.Execution(),
+                                                              d.id, first, end);
+        if (retained.owner && retained.bytes >= bytes) {
+          auto owner = std::move(retained.owner);
+          durable->sources.emplace_back(
+              false, file, bytes, d.row_bytes, owner,
+              [owner, copy = cache->resources->copy_observed_rows](
+                  std::uint64_t offset, std::span<std::byte> destination,
+                  cache::Stream& stream) {
+                return copy(
+                    {static_cast<const std::byte*>(owner.get()) + offset,
+                     destination.size()},
+                    destination, stream);
+              });
+          return cache::DiskPayload{file, bytes, 0};
+        }
+      }
       if (rows && !private_file) {
         durable->sources.emplace_back(false, file, bytes, d.row_bytes, rows,
                                       (first - inherited) * d.row_bytes,
@@ -1073,8 +1273,7 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
       } else {
         const cache::PayloadRequest request{
             d.id,
-            d.kind == cache::ComponentKind::kPrivateState
-                ? cache::ResourceCategory::kPrivateState
+            private_state  ? cache::ResourceCategory::kPrivateState
             : private_file ? cache::ResourceCategory::kPrivateTail
                            : cache::ResourceCategory::kBackingAssigned,
             first, end, bytes};
@@ -1094,10 +1293,12 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
     }
     manifest.components.push_back(std::move(component));
   }
-  // Private states, tails, and rows the slot cannot lend are staged in RAM
-  // backing. Allocate them largest first, as Capture does. Reclaim for the
-  // staged bytes only, because Reclaim refuses a request larger than RAM. The
-  // disk checkpoint does not replace a retained one, so keep the source.
+  // Private states, tails, and rows the slot can neither retain nor lend are
+  // staged in RAM backing. Allocate them largest first, as Capture does.
+  // Reclaim for the staged bytes only, because Reclaim refuses a request
+  // larger than RAM. The disk checkpoint does not replace a retained one, so
+  // keep the source. A capture that may keep its slot does so instead of
+  // staging a large share of the RAM cache, or what it cannot make room for.
   std::vector<cache::PayloadRequest> requests;
   requests.reserve(copies.size());
   std::size_t staged = 0;
@@ -1105,6 +1306,8 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
     requests.push_back(copy.request);
     staged += copy.request.bytes;
   }
+  if (hold_slot && staged > cache->budget / kDirectWriteBudgetShare)
+    direct = true;
   std::vector<std::size_t> allocation_order(copies.size());
   std::iota(allocation_order.begin(), allocation_order.end(), 0);
   std::ranges::sort(allocation_order, [&](auto a, auto b) {
@@ -1126,7 +1329,7 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
     protected_checkpoints[protected_count++] = retain.source;
   retain.protected_checkpoints =
       std::span(protected_checkpoints).first(protected_count);
-  while (!copies.empty()) {
+  while (!direct && !copies.empty()) {
     try {
       if (cache->resources->can_capture &&
           !cache->resources->can_capture(requests))
@@ -1137,10 +1340,60 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
     } catch (const cache::ResourceExhausted&) {
       for (auto& copy : copies)
         copy.buffer = {};
-      const std::lock_guard lock(cache->mutex);
-      if (!cache->retention.Reclaim(retain))
+      bool reclaimed;
+      {
+        const std::lock_guard lock(cache->mutex);
+        reclaimed = cache->retention.Reclaim(retain);
+      }
+      if (!reclaimed) {
+        if (!hold_slot)
+          throw;
+        direct = true;
+      }
+    } catch (const std::bad_alloc&) {
+      // The backing allocator found no free run for a staged piece.
+      for (auto& copy : copies)
+        copy.buffer = {};
+      if (!hold_slot)
         throw;
+      direct = true;
     }
+  }
+  if (direct) {
+    // The queue worker reads every piece from the slot through the bounded
+    // disk staging; the sources keep it leased until the job is dropped. Lent
+    // views, retained rows and staged copies taken above are released.
+    copies.clear();
+    durable->sources.clear();
+    auto* adapter = cache->resources->adapter.get();
+    auto hold = std::make_shared<ComponentTextCache::Impl::SlotHold>(
+        cache, entry, std::move(slot));
+    held = true;
+    durable->holds_slot = true;
+    for (const auto& piece : all_pieces) {
+      durable->sources.emplace_back(
+          piece.private_file, piece.file, piece.bytes, piece.alignment, hold,
+          [adapter, hold, piece](std::uint64_t offset,
+                                 std::span<std::byte> destination,
+                                 cache::Stream& stream) {
+            auto& execution = hold->slot.Execution();
+            if (piece.private_state)
+              return adapter->CapturePrivatePiece(execution, piece.component,
+                                                  offset, destination, stream);
+            const auto row = piece.bytes / (piece.end - piece.first);
+            const auto first = piece.first + offset / row;
+            return adapter->CopyRowsOut(execution, piece.component, first,
+                                        first + destination.size() / row,
+                                        destination, stream);
+          });
+    }
+    ++metrics.captures;
+    metrics.captured_checkpoint_ids.push_back(
+        durable->manifest.checkpoint.value);
+    auto snapshot = std::make_unique<ComponentSnapshot>();
+    snapshot->bytes = entry->history->NewPayloadBytes(positions);
+    snapshot->durable = std::move(durable);
+    return snapshot;
   }
   TransferBatch transfers(cache->resources->transfer_batch_size);
   for (auto& copy : copies) {
@@ -1214,11 +1467,12 @@ std::size_t ComponentTextCache::capacity() const noexcept {
   return impl_->entries.size();
 }
 
-void ComponentTextCache::CaptureBeforeReset(std::size_t index,
+bool ComponentTextCache::CaptureBeforeReset(std::size_t index,
                                             cache::BorrowedLocation location,
                                             std::vector<cache::Token> tokens,
-                                            cache::Identity input,
-                                            std::string_view reason) noexcept {
+                                            cache::InputIdentity input,
+                                            std::string_view reason,
+                                            bool hold) noexcept {
   auto* entry = impl_->entries[index].get();
   const auto started = Clock::now();
   // A write-back still queued from this slot fails once the reset retires the
@@ -1232,6 +1486,7 @@ void ComponentTextCache::CaptureBeforeReset(std::size_t index,
         persist && impl_->queue &&
         Impl::Durable(*entry) + Impl::kUncoveredCaptureTokens <= tokens.size();
   }
+  bool held = false, writing = false;
   const auto log = [&](std::string_view event, std::string_view detail) {
     Logger::Info("cache", std::string("event=") + std::string(event) +
                               " reason=" + std::string(reason) +
@@ -1242,9 +1497,11 @@ void ComponentTextCache::CaptureBeforeReset(std::size_t index,
   try {
     Lease lease(std::make_unique<Lease::Impl>(
         impl_.get(), entry, entry->slot->Acquire(location), tokens,
-        cache::InputIdentity(tokens.size(), input), tokens.size()));
+        std::move(input), tokens.size()));
     lease.impl_->write_back = write_back;
     lease.impl_->live_frontier = true;
+    lease.impl_->before_reset = true;
+    lease.impl_->hold_slot = hold;
     lease.impl_->persist = persist;
     try {
       // Retry priority: the copy may only displace other optional copies,
@@ -1278,15 +1535,70 @@ void ComponentTextCache::CaptureBeforeReset(std::size_t index,
     }
     // The capture only reads the slot, which stays valid and busy; the
     // caller's cold lease preserves the rows a new checkpoint borrows and
-    // resets it.
-    lease.impl_->slot.Commit();
+    // resets it. A held slot belongs to the queued write instead, and
+    // returns to idle when it is written (or dropped unwritten).
+    held = lease.impl_->held;
+    writing = held && lease.impl_->metrics.disk_queued_bytes != 0;
+    if (!held)
+      lease.impl_->slot.Commit();
     lease.impl_->active = false;
   } catch (const std::exception& error) {
     log("live_frontier_capture_failed", std::string(" error=") + error.what());
   }
   // A lease that could not be taken leaves the entry to the caller.
-  const std::lock_guard lock(impl_->mutex);
-  entry->busy = true;
+  if (!held) {
+    const std::lock_guard lock(impl_->mutex);
+    entry->busy = true;
+  }
+  return writing;
+}
+
+bool ComponentTextCache::PrepareAdmission(
+    std::span<const ContinuationToken> prompt, const TextPromptContext* context,
+    bool reuse, std::size_t stable) {
+  std::optional<Impl::Uncovered> uncovered;
+  Impl::Entry* entry = nullptr;
+  {
+    const std::lock_guard lock(impl_->mutex);
+    const auto found =
+        impl_->index.Lookup({impl_->identity, prompt,
+                             Inputs(prompt.size(), context), stable, reuse});
+    if (found.selected && found.selected->live) {
+      const auto& live =
+          *impl_->entries.at(found.selected->live->slot.value - 1);
+      // Its own frontier is being written: continue it once that is done.
+      if (live.writing)
+        return false;
+      if (!live.busy)
+        return true;
+    }
+    entry = impl_->SelectCold();
+    if (!entry)
+      // A finishing write returns a slot.
+      return std::ranges::none_of(impl_->entries,
+                                  [](const auto& e) { return e->writing; });
+    if (!impl_->queue)
+      return true;
+    for (std::size_t i = 0; i < impl_->entries.size(); ++i)
+      if (impl_->entries[i].get() == entry)
+        uncovered = impl_->UncoveredLive(i);
+    if (!uncovered || (entry->held_tried == uncovered->tokens.size() &&
+                       entry->held_branch == entry->branch))
+      return true;
+    entry->held_tried = uncovered->tokens.size();
+    entry->held_branch = entry->branch;
+    entry->busy = true;
+  }
+  const bool writing = CaptureBeforeReset(
+      uncovered->index, uncovered->location, std::move(uncovered->tokens),
+      std::move(uncovered->input), "reassignment", true);
+  if (!writing) {
+    // Covered in RAM now, or refused: Acquire proceeds as before.
+    const std::lock_guard lock(impl_->mutex);
+    if (!entry->writing)
+      entry->busy = false;
+  }
+  return !writing;
 }
 
 bool ComponentTextCache::WriteBackDeferred() const noexcept {
@@ -1305,7 +1617,7 @@ std::size_t ComponentTextCache::WriteBackIdle(
     auto* entry = impl_->entries[i].get();
     cache::BorrowedLocation location;
     std::vector<cache::Token> tokens;
-    cache::Identity input;
+    cache::InputIdentity input;
     {
       const std::lock_guard lock(impl_->mutex);
       const auto size = entry->live_tokens.size();
@@ -1323,7 +1635,7 @@ std::size_t ComponentTextCache::WriteBackIdle(
       // A frontier extending a checkpoint of its own lineage still queued
       // would write that checkpoint's chunks again: wait until it is durable
       // (or dropped). The cache destructor writes what is still waiting.
-      const cache::InputIdentity live(size, entry->live_input);
+      const auto& live = entry->live_input;
       const auto extends = [&](const auto& prefix, const auto& prefix_input) {
         return prefix.size() < size &&
                At(live, prefix.size()) == prefix_input &&
@@ -1352,13 +1664,14 @@ std::size_t ComponentTextCache::WriteBackIdle(
       input = entry->live_input;
     }
     const auto started = Clock::now();
-    bool submitted = false, failed = false;
+    bool submitted = false, failed = false, held = false;
     try {
       Lease lease(std::make_unique<Lease::Impl>(
           impl_.get(), entry, entry->slot->Acquire(location), tokens,
-          cache::InputIdentity(tokens.size(), input), tokens.size()));
+          std::move(input), tokens.size()));
       lease.impl_->write_back = true;
       lease.impl_->live_frontier = true;
+      lease.impl_->hold_slot = true;
       lease.impl_->capture_tokens = tokens;
       try {
         if (auto snapshot = lease.impl_->CaptureDurable()) {
@@ -1375,8 +1688,11 @@ std::size_t ComponentTextCache::WriteBackIdle(
       }
       // The capture only reads the slot. Committing keeps its generation, so
       // the live frontier stays valid for the conversation's next turn
-      // whether or not it was written.
-      lease.impl_->slot.Commit();
+      // whether or not it was written. A held slot is committed and returned
+      // to idle by its queued write (SlotHold).
+      held = lease.impl_->held;
+      if (!held)
+        lease.impl_->slot.Commit();
       lease.impl_->active = false;
       if (!failed)
         Logger::Info(
@@ -1401,7 +1717,8 @@ std::size_t ComponentTextCache::WriteBackIdle(
     // Only a queued write covers the frontier (Persist marks it); shutdown
     // retries the rest.
     entry->write_back_tried = tokens.size();
-    entry->busy = false;
+    if (!held)
+      entry->busy = false;
     queued += submitted;
   }
   impl_->write_back_deferred.store(deferred, std::memory_order_relaxed);
@@ -1448,8 +1765,7 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
       const std::lock_guard lock(impl_->mutex);
       const auto covered = [&](const Impl::Entry& e) {
         return impl_->index.HasCheckpoint(
-            {impl_->identity, e.live_tokens,
-             cache::InputIdentity(e.live_tokens.size(), e.live_input)},
+            {impl_->identity, e.live_tokens, e.live_input},
             e.live_tokens.size());
       };
       using Rank = std::tuple<bool, bool, std::uint64_t>;
@@ -1501,7 +1817,7 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
     if (uncovered)
       CaptureBeforeReset(uncovered->index, uncovered->location,
                          std::move(uncovered->tokens),
-                         std::move(uncovered->input), "row_capacity");
+                         std::move(uncovered->input), "row_capacity", false);
     {
       const std::lock_guard lock(impl_->mutex);
       entry->branch = std::make_shared<const std::uint8_t>(0);
@@ -1679,95 +1995,8 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
         live = location;
       }
     }
-    if (!entry) {
-      // A frontier far beyond every checkpoint of its prompt is the only
-      // copy of that work, as for a conversation larger than the RAM budget
-      // whose captures are refused: take it last. Then completed
-      // preservation first: it needs no foreground copy. Among those, a live
-      // frontier holds generated tokens no checkpoint covers, such as the
-      // tool call the next turn replays. Take a slot without one, then a
-      // shallow frontier before a deep one, then the least recently used.
-      // Faster idle preservation must not make short side requests evict a
-      // deep conversation merely because its backing copy finished earlier.
-      constexpr std::size_t kUncoveredTokens = 4096;
-      const auto uncovered = [&](const Impl::Entry& e) {
-        if (!e.live || e.live_tokens.size() <= kUncoveredTokens)
-          return false;
-        return !impl_->index.HasCheckpoint(
-            {impl_->identity, e.live_tokens,
-             cache::InputIdentity(e.live_tokens.size(), e.live_input)},
-            e.live_tokens.size() - kUncoveredTokens);
-      };
-      using Rank = std::tuple<bool, bool, bool, bool, std::uint64_t>;
-      const auto rank = [&](const Impl::Entry& e) {
-        return Rank{uncovered(e), !e.slot->PreservationComplete(), bool(e.live),
-                    e.live_tokens.size() >= kUncoveredTokens, e.used};
-      };
-      std::optional<Rank> selected_rank;
-      for (auto& candidate : impl_->entries) {
-        if (candidate->busy)
-          continue;
-        if (!entry) {
-          entry = candidate.get();
-          continue;
-        }
-        if (!selected_rank)
-          selected_rank = rank(*entry);
-        const auto candidate_rank = rank(*candidate);
-        if (candidate_rank < *selected_rank) {
-          entry = candidate.get();
-          selected_rank = candidate_rank;
-        }
-      }
-      // Keep ordinary cold selection unchanged. Only a cancelled executor
-      // with outstanding work needs an alternative; do not query every
-      // stream or look up exact checkpoint coverage on normal admissions.
-      if (entry && !entry->slot->ExecutionComplete()) {
-        if (!selected_rank)
-          selected_rank = rank(*entry);
-        Impl::Entry* ready = nullptr;
-        std::optional<Rank> ready_rank;
-        for (auto& candidate : impl_->entries) {
-          if (candidate.get() == entry || candidate->busy ||
-              !candidate->slot->ExecutionComplete())
-            continue;
-          const auto candidate_rank = rank(*candidate);
-          // A ready slot must not sacrifice uncovered work or introduce
-          // foreground preservation. Keep a deep generated tail unless an
-          // exact checkpoint or another idle live copy still covers it.
-          const auto live_copy = [&] {
-            return candidate->history &&
-                   std::ranges::any_of(impl_->entries, [&](const auto& other) {
-                     return other != candidate && !other->busy && other->live &&
-                            other->history &&
-                            other->history->Lineage() ==
-                                candidate->history->Lineage() &&
-                            other->live_input == candidate->live_input &&
-                            other->live_tokens == candidate->live_tokens;
-                   });
-          };
-          if (std::tie(std::get<0>(candidate_rank),
-                       std::get<1>(candidate_rank)) >
-                  std::tie(std::get<0>(*selected_rank),
-                           std::get<1>(*selected_rank)) ||
-              (candidate->live &&
-               candidate->live_tokens.size() >= kUncoveredTokens &&
-               !impl_->index.HasCheckpoint(
-                   {impl_->identity, candidate->live_tokens,
-                    cache::InputIdentity(candidate->live_tokens.size(),
-                                         candidate->live_input)},
-                   candidate->live_tokens.size()) &&
-               !live_copy()))
-            continue;
-          if (!ready || candidate_rank < *ready_rank) {
-            ready = candidate.get();
-            ready_rank = candidate_rank;
-          }
-        }
-        if (ready)
-          entry = ready;
-      }
-    }
+    if (!entry)
+      entry = impl_->SelectCold();
     if (!entry)
       throw cache::SlotBusy();
     restore_pins.ids.reserve(found.candidates.size());
@@ -1785,7 +2014,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
   if (evicted)
     CaptureBeforeReset(evicted->index, evicted->location,
                        std::move(evicted->tokens), std::move(evicted->input),
-                       "reassignment");
+                       "reassignment", false);
   {
     const std::lock_guard lock(impl_->mutex);
     if (!live) {
@@ -1832,8 +2061,15 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       entry->write_back_tried = 0;
     }
     bool restored = bool(live);
-    if (live)
+    if (live) {
       request.cached = found.selected->boundary;
+      // The disk catalog evicts least recently used first. A conversation
+      // served from its live frontier never restores its durable lineage,
+      // so mark that lineage used too.
+      const std::lock_guard lock(impl_->mutex);
+      if (impl_->catalog && entry->durable)
+        impl_->catalog->Touch(entry->durable->Manifest().checkpoint);
+    }
     for (const auto& candidate : found.candidates) {
       if (restored || (cancelled && cancelled()))
         break;
@@ -1955,6 +2191,10 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           {
             const std::lock_guard lock(impl_->mutex);
             retained = impl_->retention.TryTouch(checkpoint.Id());
+            // Its disk copy, if any, shares the ID: a RAM restore is a use
+            // of it for disk eviction order too.
+            if (impl_->catalog)
+              impl_->catalog->Touch(checkpoint.Id());
           }
           // The pin kept it from eviction; only an exact replacement or
           // explicit removal ends the record. The validated state is still
@@ -2018,7 +2258,12 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
         if (restored) {
           request.cached = candidate.boundary;
           const std::lock_guard lock(impl_->mutex);
+          // A resident checkpoint's candidate carries no disk description,
+          // but its disk copy shares the ID: keep it as this execution's
+          // durable lineage, for chunk reuse and recency of later live turns.
           entry->durable = candidate.durable;
+          if (!entry->durable && candidate.checkpoint && impl_->catalog)
+            entry->durable = impl_->catalog->Find(candidate.checkpoint->Id());
         }
       } catch (...) {
         // The next candidate is tried, so a failed restore only shortens the
@@ -2572,7 +2817,7 @@ std::size_t ComponentTextCache::Lease::Commit(
     const std::lock_guard lock(impl_->cache->mutex);
     impl_->entry->live_tokens = live;
     impl_->entry->live_persist = impl_->persist;
-    impl_->entry->live_input = At(impl_->input, impl_->prompt.size());
+    impl_->entry->live_input = impl_->input.Through(live.size());
     impl_->entry->live_location = location;
     impl_->entry->idle_since = Clock::now();
     impl_->entry->live = impl_->cache->index.Insert(cache::LiveFrontier{
