@@ -501,6 +501,21 @@
 
     - On coding, R11 trims xhigh (−14% mean, −36% median tokens, −30% hesitations) at the same pass count, but low passes the same 24 with a quarter of the tokens.
   - **Result:** the opener-margin proxy (R9–R11) does not make xhigh beat plain low on either set. Production stays low with no profile. The next candidate is an outcome objective: correct answers within a fixed budget on AIME 2022–24.
+- **Large frontier write-back on the single writer** (cd89eb6a, binary fb89c1e1…; `build/b1/pass-20261116/`, November 16).
+  - Problem in production (runtime-20261112a, 1M, 2 sessions, RAM cache 4 GiB): 340–350K-token web-chat conversations (≈3.4 GB K4V4 state, with images) were never saved when their slot was reassigned. Write-back staged the whole state in the RAM budget (`std::bad_alloc`), reassignment captures failed on a dropped image-prefix input identity ("checkpoint input changed within inherited prefix"), and queued slot reads raced the slot reset. The conversation was re-prefilled from its 9,796-token system-prompt checkpoint: 300K+ tokens at ~800 tok/s, 6–10 min, while other conversations' decode paused between prefill chunks. 13 publications against 158 `persistence_incomplete` in that run.
+  - Fix: all disk writes go through the one PersistenceQueue writer; a large capture holds the slot lease and streams pieces through bounded staging (no RAM copy); only a request needing the held slot waits; image-prefix identity kept; RAM and live reuse refresh disk recency.
+  - Pass setup: candidate on the production config, own 30 GiB disk cache; host preflight failed (rc 1, not a timing run). One conversation A of 324,993 tokens (one 1600×900 PNG + C++ source, two needles), B streaming 2,596 tokens, C a short question arriving 8 s into B, then A's next turn, then a graceful restart and A's third turn. temperature 0, effort low.
+
+    | Step | Result |
+    |---|---|
+    | A first turn | 331.3 s, prefill 984.9 tok/s, needle 1 correct |
+    | A's slot reassigned (C arrives) | held capture queued in 34 ms, 3,216,200,584 B; no `bad_alloc` in the whole run |
+    | B decode during the write | 2,593 chunks, max gap 0.085 s, none over 1 s |
+    | C (unrelated short request) | **59.8 s**: waited for the held slot until B finished |
+    | Publication of A (324,988 tokens) | 3,215,196,304 B, filesystem 1.57 s, **stream wait 46.5 s** |
+    | A second turn | 14.4 s (12 s of it waiting for the publication), `reuse=disk`, prefill 37 tokens, needle 2 correct |
+    | A third turn after restart | 3.0 s, `reuse=disk`, prefill 69 tokens, needle 1 correct |
+  - **Result:** kept. A returning 325K conversation costs seconds instead of a 5.5 min re-prefill, and decode of other conversations never stalls. Open: the write waits ~46 s on the device stream while another slot decodes, so an unrelated new request that needs the held slot waits that long (C 59.8 s).
 - **Combined pass for the steering-API runtime** (8c45bd3d against production runtime-20261112a; `build/b1/pass-20261114/`, November 14).
   - Setup: the production config (YaRN 1M, K4V4, MTP 7, 2 sessions, `--reasoning-effort low`), the R2-3 scripts (`ab.py`, `detect.py`). Runs alternated prod, cand, prod, cand. Host preflight failed only on fragmentation (order ≥ 9 free blocks 29,174).
   - Decode, tok/s, 256 tokens, 4 runs each:
