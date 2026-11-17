@@ -548,6 +548,16 @@
   - Not done: warming the arena pool while a peer decodes (pinned allocation can contend with the decoding slot's HIP calls, U4-3 class, unmeasured).
   - Deployed the same day as runtime-20261117a (bec6fb4e, 8462a679…, rebuilt byte-identical to the pass-7 binary; same abliteration profiles); rollback `~/projects/_backup/gufo-server-20261117-before-snapshot/`.
   - **Result:** kept and deployed (user accepted the one ~1 s peer pause for C 34.4 → 2.7 s). Open: the 0.43 s RAM-ancestor preservation (could join the snapshot) and the first-use allocation.
+- **Production 2 → 4 sessions** (runtime-20261117a unchanged, 1M context, K4V4, MTP 7, RAM cache 4 GiB; November 17). Story prompts, temperature 0.7, 600 tokens, low effort, decode tok/s from the first chunk, one run each, production host (not a controlled timing run).
+
+    | Streams at once | 2 sessions | 4 sessions |
+    |---|---|---|
+    | 1 | 38.3 | 36.5 |
+    | 2 | 26.3 / 28.1 | 26.4 / 27.7 |
+    | 4 | — | 17.7 / 18.5 / 18.8 / 19.6 (74.6 total) |
+  - Host `MemAvailable` with the server ready: 26.8 GB (2 sessions) → 8.6 GB (4 sessions); the two extra 1M sessions reserve ~9 GB each at startup. The rest must hold RAM-cache growth (≤ 4 GiB) and a reassignment snapshot (≤ ~3.3 GB pinned); when host room is short the snapshot falls back to the held write (C waits ~30 s again).
+  - Not measured: peer decode gaps while a third or fourth slot prefills a long prompt.
+  - **Result:** production runs 4 sessions (user, same day). Rollback `~/projects/_backup/gufo-server-20261117-before-4-sessions/`.
 - **Combined pass for the steering-API runtime** (8c45bd3d against production runtime-20261112a; `build/b1/pass-20261114/`, November 14).
   - Setup: the production config (YaRN 1M, K4V4, MTP 7, 2 sessions, `--reasoning-effort low`), the R2-3 scripts (`ab.py`, `detect.py`). Runs alternated prod, cand, prod, cand. Host preflight failed only on fragmentation (order ≥ 9 free blocks 29,174).
   - Decode, tok/s, 256 tokens, 4 runs each:
