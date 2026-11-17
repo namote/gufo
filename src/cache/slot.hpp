@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <stop_token>
 #include <thread>
+#include <vector>
 
 #include "src/cache/adapter.hpp"
 #include "src/cache/ledger.hpp"
@@ -67,10 +68,37 @@ public:
   [[nodiscard]] bool HasBacking() const;
   // Bytes a pin of rows not yet preserved exposes from their slot.
   [[nodiscard]] std::size_t SourceViewBytes() const;
+  // Observed rows (Observe) only: `bytes` at byte `offset` of these rows is
+  // a host copy that `owner` keeps unchanged. Once host copies cover every
+  // byte, the rows outlive a reset or mutation of their slot, read from
+  // those copies (CopyHosted) instead of being retired.
+  void Host(std::size_t offset, std::span<const std::byte> bytes,
+            std::shared_ptr<const void> owner);
+  struct HostCopy {
+    std::size_t offset;
+    std::span<const std::byte> bytes;
+    std::shared_ptr<const void> owner;
+  };
+  // Several at once, in any order: one lock and one coverage check.
+  void Host(std::vector<HostCopy>);
+  // Copies `destination.size()` bytes at `offset` from host copies; false
+  // when they do not cover that range.
+  [[nodiscard]] bool CopyHosted(std::size_t offset,
+                                std::span<std::byte> destination) const;
+  // A read of those bytes: copied from host copies (nullopt) when they cover
+  // them, else a pin, decided atomically with Host and slot resets.
+  [[nodiscard]] std::optional<RowPin> PinOrCopyHosted(
+      std::size_t offset, std::span<std::byte> destination,
+      std::stop_token = {}) const;
+  [[nodiscard]] ComponentId Component() const;
+  [[nodiscard]] Rows First() const;
+  [[nodiscard]] Rows End() const;
 
 private:
   friend class SlotLease;
   explicit BorrowedRows(std::shared_ptr<detail::RowState>);
+  // Pin with the rows' mutex held and no read closing.
+  [[nodiscard]] RowPin PinLocked() const;
   std::shared_ptr<detail::RowState> state_;
 };
 class SlotLease {
@@ -98,6 +126,9 @@ public:
   // under the adapter's ordinary mutation/release guards.
   [[nodiscard]] std::shared_ptr<BorrowedRows> Observe(
       ComponentId, Rows first, Rows end, std::span<const std::byte> source);
+  // Observed rows of this slot that a holder (a disk job) may still read and
+  // that host copies do not yet cover; see BorrowedRows::Host.
+  [[nodiscard]] std::vector<std::shared_ptr<BorrowedRows>> ObservedRows() const;
   void Reset();
   // Validate successful execution/restore before retaining the live frontier.
   // Commit releases this lease; no further execution is allowed through it.

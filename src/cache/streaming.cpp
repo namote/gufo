@@ -353,7 +353,11 @@ PersistenceSource::PersistenceSource(bool private_file, DiskFileId file,
               Stream& stream) {
     if (offset > bytes || destination.size() > bytes - offset)
       throw std::invalid_argument("invalid observed persistence piece");
-    auto pin = rows->Pin();
+    // Rows a slot snapshot copied to host before the slot was reset.
+    auto read = rows->PinOrCopyHosted(first_byte + offset, destination);
+    if (!read)
+      return Completion(std::make_unique<SettledSignal>());
+    auto pin = std::move(*read);
     const auto source =
         pin.Bytes().subspan(first_byte + offset, destination.size());
     auto completion = copy(source, destination, stream);
@@ -373,6 +377,24 @@ PersistenceSource::PersistenceSource(bool private_file, DiskFileId file,
       alignment_(alignment) {
   if (!owner_ || !copy_ || !alignment_ || bytes_ % alignment_)
     throw std::invalid_argument("invalid device persistence source");
+}
+PersistenceSource::PersistenceSource(bool private_file, DiskFileId file,
+                                     std::uint64_t bytes, std::size_t alignment,
+                                     std::shared_ptr<const void> owner,
+                                     std::span<const std::byte> host)
+    : owner_(std::move(owner)),
+      host_bytes_(host),
+      host_(true),
+      private_file_(private_file),
+      file_(file),
+      bytes_(bytes),
+      alignment_(alignment) {
+  if (!owner_ || !alignment_ || bytes_ % alignment_ || host.size() != bytes_)
+    throw std::invalid_argument("invalid host persistence source");
+  // Marks the source unwritten for Write; the bytes are copied in place.
+  copy_ = [](std::uint64_t, std::span<std::byte>, Stream&) -> Completion {
+    throw std::logic_error("host persistence source read through a stream");
+  };
 }
 PersistencePin PersistenceSource::Pin() const {
   if (rows_)
@@ -517,6 +539,10 @@ void StreamedStore::Write(DiskFileId file, const DiskManifest& manifest,
       Add(128, Multiply(sources.size(), sizeof(DiskWriteSource) +
                                             sizeof(PersistencePin) + 64)));
   std::optional<std::unique_lock<std::timed_mutex>> piece_lock;
+  // Settles read-ahead copies that have completed (set below), releasing
+  // their row pins: a slot reset waits for every pin, and a yielding write
+  // must not hold finished ones.
+  std::function<void()> settle_ready;
   DiskStagingAccess access{
       [&] {
         CheckStop(stop);
@@ -529,6 +555,8 @@ void StreamedStore::Write(DiskFileId file, const DiskManifest& manifest,
             std::unique_lock wait_guard(wait_mutex);
             while (!model_idle()) {
               CheckStop(stop);
+              if (settle_ready)
+                settle_ready();
               wake.wait_for(wait_guard, stop, std::chrono::milliseconds(2),
                             [] { return false; });
             }
@@ -579,7 +607,7 @@ void StreamedStore::Write(DiskFileId file, const DiskManifest& manifest,
         const auto& source = sources[i];
         const bool on_device =
             source.rows_ ? !source.rows_->HasBacking() || source.live_reads_
-                         : source.owner_ && !source.charge_;
+                         : source.owner_ && !source.charge_ && !source.host_;
         if (!on_device || !step(source))
           continue;
         device.push_back(i);
@@ -640,7 +668,17 @@ void StreamedStore::Write(DiskFileId file, const DiskManifest& manifest,
     return impl_->ahead_lease ? impl_->ahead_lease(kReservedTransferStreams)
                               : impl_->lease();
   };
+  settle_ready = [&] {
+    for (auto& entry : ahead)
+      if (entry.piece != kNone && entry.completion &&
+          entry.completion->Ready()) {
+        // Its bytes stay in the buffer for the writer.
+        Settle(std::move(*entry.completion), timing);
+        release(entry);
+      }
+  };
   const auto queue_ahead = [&] {
+    settle_ready();
     for (auto& entry : ahead) {
       if (entry.piece == kNone && entry.completion &&
           entry.completion->Ready()) {
@@ -678,6 +716,26 @@ void StreamedStore::Write(DiskFileId file, const DiskManifest& manifest,
           index = static_cast<std::size_t>(&source - sources.data())](
              auto offset, auto piece) {
            CheckStop(stop);
+           if (source_ptr->host_) {
+             // Host bytes: no device read. Their owner (a slot snapshot)
+             // goes once the last piece is read.
+             if (source_ptr->host_bytes_.size() != source_ptr->bytes_)
+               throw std::logic_error(
+                   "persistence source was already released");
+             if (offset > source_ptr->bytes_ ||
+                 piece.size() > source_ptr->bytes_ - offset)
+               throw std::invalid_argument("invalid host persistence piece");
+             std::memcpy(piece.data(), source_ptr->host_bytes_.data() + offset,
+                         piece.size());
+             if (offset + piece.size() == source_ptr->bytes_) {
+               source_ptr->copy_ = {};
+               source_ptr->host_bytes_ = {};
+               source_ptr->owner_.reset();
+             }
+             timing.bytes += piece.size();
+             ++timing.pieces;
+             return;
+           }
            const auto position =
                first_piece.empty() || first_piece[index] == kNone
                    ? kNone
@@ -773,6 +831,7 @@ void StreamedStore::Write(DiskFileId file, const DiskManifest& manifest,
     for (auto& source : sources)
       if (source.owner_ && !source.charge_) {
         source.copy_ = {};
+        source.host_bytes_ = {};
         source.owner_.reset();
       }
   };
@@ -1007,10 +1066,10 @@ struct PersistenceQueue::Impl {
           // A job that holds a slot (keep_) goes first: its slot stays
           // leased, and requests that need it wait, until it has read it.
           // Each ordinary job is passed over at most once.
-          if (!(*it)->keep_ && !(*it)->jumped_) {
+          if (!((*it)->keep_ && (*it)->jump_) && !(*it)->jumped_) {
             auto held = pending.end();
             for (auto j = pending.begin(); j != pending.end(); ++j)
-              if (*j && (*j)->keep_ &&
+              if (*j && (*j)->keep_ && (*j)->jump_ &&
                   (held == pending.end() || older(*j, *held)))
                 held = j;
             if (held != pending.end()) {
@@ -1120,9 +1179,12 @@ bool PersistenceQueue::TrySubmit(PersistenceJob job) {
   }
   auto slot = std::find_if(impl_->pending.begin(), impl_->pending.end(),
                            [](auto& item) { return !item; });
+  // A kept job (a slot hold or snapshot: a reassigned frontier, whose
+  // generated tail the next prompt need not share) never makes a pending
+  // checkpoint redundant: that one may be the prefix the next turn restores.
   auto replacement = std::find_if(
       impl_->pending.begin(), impl_->pending.end(), [&](const auto& other) {
-        if (!other || other->keep_ ||
+        if (job.keep_ || !other || other->keep_ ||
             other->manifest_.purpose == CheckpointPurpose::kLearned ||
             !Extends(job.manifest_, other->manifest_))
           return false;
@@ -1143,9 +1205,7 @@ bool PersistenceQueue::TrySubmit(PersistenceJob job) {
       (impl_->stats.pending == impl_->pending.size() ||
        job.pinned_bytes_ > impl_->max_bytes - impl_->stats.pinned_bytes)) {
     for (auto it = impl_->pending.begin(); it != impl_->pending.end(); ++it) {
-      if (!*it || (*it)->keep_ ||
-          ((*it)->manifest_.purpose == CheckpointPurpose::kLearned &&
-           job.manifest_.purpose != CheckpointPurpose::kLearned))
+      if (!*it || !Replaceable(**it, job.manifest_, job.keep_))
         continue;
       if (replacement == impl_->pending.end() ||
           (*it)->submitted_ < (*replacement)->submitted_)
@@ -1204,6 +1264,39 @@ bool PersistenceQueue::TrySubmit(PersistenceJob job) {
   }
   impl_->wake.notify_all();
   return accepted;
+}
+bool PersistenceQueue::CanAccept(const DiskManifest& manifest,
+                                 bool keep) const {
+  std::lock_guard guard(impl_->mutex);
+  if (impl_->stopped ||
+      (impl_->active && SameJob(impl_->active->manifest_, manifest)) ||
+      std::any_of(impl_->pending.begin(), impl_->pending.end(),
+                  [&](const auto& other) {
+                    return other && SameJob(other->manifest_, manifest);
+                  }))
+    return false;
+  if (impl_->stats.pending < impl_->pending.size())
+    return true;
+  return std::any_of(impl_->pending.begin(), impl_->pending.end(),
+                     [&](const auto& other) {
+                       return other && Replaceable(*other, manifest, keep);
+                     });
+}
+bool PersistenceQueue::Replaceable(const PersistenceJob& other,
+                                   const DiskManifest& manifest, bool keep) {
+  if (other.keep_ || (other.manifest_.purpose == CheckpointPurpose::kLearned &&
+                      manifest.purpose != CheckpointPurpose::kLearned))
+    return false;
+  // A kept job (a reassigned frontier) keeps its prefixes and the jobs still
+  // reading slot rows (a reset slot's prompt-end checkpoint): fail instead.
+  return !keep ||
+         (!Extends(manifest, other.manifest_) && !other.ReadsLiveRows());
+}
+bool PersistenceJob::ReadsLiveRows() const {
+  return std::ranges::any_of(sources_, [](const auto& source) {
+    return source.rows_ && !source.rows_->HasBacking() &&
+           source.rows_->Location().has_value();
+  });
 }
 void PersistenceQueue::Drain() {
   std::unique_lock guard(impl_->mutex);

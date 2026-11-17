@@ -27,6 +27,16 @@ inline constexpr std::string_view kComponentCacheRejectsDiskStaging =
     "Qwen27B and Flash-Next stream checkpoints of any size through an "
     "internal 1 MiB buffer, so omit the option";
 
+// Default room for reassignment snapshots (ComponentCacheResources): one
+// 325K-token Flash-Next state (3.2 GB) with margin. A second deep state
+// reassigned before the first is written keeps its slot instead.
+inline constexpr std::size_t kReassignmentSnapshotBytes = std::size_t{4} << 30;
+// Pooled snapshot arenas are freed after this long unused: deep conversations
+// rotating through the slots reuse them (a turn and its reassignment come
+// seconds apart), while an idle server returns the pinned memory to the host
+// and the RAM cache within a minute.
+inline constexpr std::chrono::milliseconds kReassignmentSnapshotIdle{60000};
+
 // Model-independent serving orchestration; the model supplies physical storage
 // and binds its ordinary execution facade to adapter-owned slots.
 struct ComponentCaptureBuffer {
@@ -68,6 +78,24 @@ struct ComponentCacheResources {
   // usable without a pool-capacity contract.
   std::size_t transfer_batch_size{1};
   std::size_t reassignment_batch_size{1};
+  // Host bytes (from `staging`, outside the RAM cache budget) that idle-slot
+  // states handed to the disk writer on reassignment may occupy at once.
+  // Admission copies such a state there in the foreground and releases the
+  // slot, instead of keeping it leased until the writer has read it; a state
+  // over the remaining room keeps the slot (SlotHold). Zero always keeps it.
+  std::size_t reassignment_snapshot_bytes{kReassignmentSnapshotBytes};
+  // Snapshots take arenas of this size (a larger piece takes its own), which
+  // return to a pool once written and are reused. Pooled arenas unused for
+  // reassignment_snapshot_idle are freed.
+  std::size_t reassignment_snapshot_arena_bytes{std::size_t{64} << 20};
+  std::chrono::milliseconds reassignment_snapshot_idle{
+      kReassignmentSnapshotIdle};
+  // Optional allocator of snapshot arenas, `staging` otherwise. The copy
+  // overwrites every byte the writer reads, so it need not touch the pages.
+  cache::StagingAllocator snapshot_allocate;
+  // Optional: false when the host cannot pin that many more snapshot bytes
+  // now (beyond the host ceiling every snapshot respects); the slot is kept.
+  std::function<bool(std::size_t)> snapshot_room;
 };
 // Optional prefill stops, ascending. Tails are the subset planned as tail
 // points; a stop shared with peers nearby makes them redundant.
@@ -199,9 +227,12 @@ public:
   // slot it would use, its live frontier's or the one cold assignment takes,
   // is held by a queued disk write: that request waits, the other slots keep
   // running. When cold assignment would reset an idle frontier no checkpoint
-  // covers, captures it first: to RAM, or else to disk by the queue worker,
-  // which holds the slot until it has written it (false meanwhile). Call
-  // from the scheduler thread; never writes the disk itself.
+  // covers, captures it first: to RAM, or else to disk by the queue worker.
+  // For the disk, it copies the state to host memory here, with no other
+  // model work running, and releases the slot (reassignment_snapshot_bytes);
+  // without room for that copy, the worker holds the slot until it has
+  // written it (false meanwhile). Call from the scheduler thread; never
+  // writes the disk itself.
   [[nodiscard]] bool PrepareAdmission(std::span<const ContinuationToken> prompt,
                                       const TextPromptContext* context,
                                       bool reuse, std::size_t stable);
@@ -212,8 +243,9 @@ private:
   // `location`) as a RAM checkpoint, before the caller resets the slot.
   // Optional: a refusal or failure is logged (with `reason`, the caller's
   // cause) and the caller proceeds. With `hold`, a capture RAM cannot take
-  // keeps the slot for the queue worker instead, and the result is true while
-  // that write is queued: the slot is not the caller's to reset then.
+  // goes to the queue worker as a host snapshot, or else keeps the slot for
+  // it, and the result is true while that held write is queued: the slot is
+  // not the caller's to reset then.
   bool CaptureBeforeReset(std::size_t index, cache::BorrowedLocation location,
                           std::vector<cache::Token> tokens,
                           cache::InputIdentity input, std::string_view reason,

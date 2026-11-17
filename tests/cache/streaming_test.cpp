@@ -12,6 +12,7 @@
 #include <future>
 #include <mutex>
 #include <numeric>
+#include <semaphore>
 #include <thread>
 
 #include "tests/cache/fake_adapter.hpp"
@@ -473,6 +474,78 @@ void LiveRowsStreamWithoutWholeHistoryBacking() {
     }
     assert(ledger.Snapshot().persistence_pinned_bytes == 0);
   }
+}
+void YieldingWriteHoldsNoFinishedPins() {
+  // A write that yields to the model between pieces settles its finished
+  // read-ahead copies, so it holds no row pin then: a slot reset (after host
+  // copies cover the observed rows) does not wait for the write to resume.
+  // The write then completes from the settled copies and host copies.
+  Directory dir;
+  ResourceLedger ledger{{1 << 22, 1 << 21, 256 + 2048, 4096}};
+  DiskStore disk(ledger, dir.path, 1 << 20);
+  const auto ready = [] { return std::make_unique<FakeStream>(false); };
+  StreamedStore streams(ledger, disk, 256, Allocate, ready, 2048,
+                        [&](std::size_t) { return ready(); });
+  Fixture fixture(ledger);
+  std::erase_if(fixture.buffers, [](const auto& b) { return !b.private_file; });
+  FakeStream execution;
+  LeasedSlot slot(ledger, fixture.adapter, execution, SlotId{1});
+  auto lease = slot.Acquire();
+  fixture.adapter.Append(lease.Execution(), fixture.manifest.tokens,
+                         std::span(fixture.manifest.tokens).first(36));
+  auto sources = fixture.Sources();
+  std::vector<std::pair<std::shared_ptr<BorrowedRows>,
+                        std::shared_ptr<std::vector<std::byte>>>>
+      observed;
+  for (const auto& component : fixture.manifest.components) {
+    const auto& d = component.descriptor;
+    if (d.kind != ComponentKind::kAppendRows)
+      continue;
+    const auto view = fixture.adapter.BorrowRowsView(
+        lease.Execution(), d.id, 0, component.position.valid_rows);
+    auto rows = lease.Observe(d.id, 0, component.position.valid_rows, view);
+    observed.emplace_back(rows, std::make_shared<std::vector<std::byte>>(
+                                    view.begin(), view.end()));
+    std::size_t first = 0;
+    for (const auto& chunk : component.chunks) {
+      sources.emplace_back(
+          false, chunk.file, chunk.bytes, d.row_bytes, rows, first,
+          [](auto source, auto destination, Stream& stream) {
+            return dynamic_cast<FakeStream&>(stream).Submit(
+                [source, destination] {
+                  std::memcpy(destination.data(), source.data(),
+                              destination.size());
+                  return TransferResult::kSucceeded;
+                });
+          });
+      first += chunk.bytes;
+    }
+  }
+  std::atomic<int> calls{};
+  std::atomic<bool> go{};
+  std::binary_semaphore yielding{0};
+  TransferTiming timing;
+  auto write = std::async(std::launch::async, [&] {
+    streams.Write(Id(100), fixture.manifest, sources, timing, {}, [&] {
+      const auto call = ++calls;
+      if (call == 2)
+        yielding.release();
+      return call == 1 || go.load();
+    });
+  });
+  assert(yielding.try_acquire_for(std::chrono::seconds(10)));
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  for (const auto& [rows, copy] : observed)
+    rows->Host(0, *copy, copy);
+  auto reset = std::async(std::launch::async, [&] { lease.Reset(); });
+  assert(reset.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+  reset.get();
+  go = true;
+  write.get();
+  auto restored = fixture.adapter.CreateSlot(fixture.guard);
+  assert(streams.Restore({1}, fixture.manifest.compatibility, fixture.adapter,
+                         *restored, timing));
+  assert(fixture.adapter.RecurrentHash(*restored) == fixture.hash);
 }
 void DeviceReadsQueueAheadOfTheWriter() {
   // Device-read pieces are copied ahead of the one being written, so their
@@ -1019,6 +1092,124 @@ void HeldSourcesReturnBeforePayloadSyncs() {
                          *restored, timing));
   assert(fixture.adapter.RecurrentHash(*restored) == fixture.hash);
 }
+// Host sources (a slot's foreground snapshot) holding copies of the
+// fixture's buffers, one owner each; `owners` observes them.
+std::vector<PersistenceSource> HostSources(
+    const Fixture& fixture, std::vector<std::weak_ptr<const void>>& owners) {
+  std::vector<PersistenceSource> sources;
+  for (const auto& buffer : fixture.buffers) {
+    auto copy = std::make_shared<std::vector<std::byte>>(*buffer.owner);
+    owners.push_back(copy);
+    sources.emplace_back(buffer.private_file, buffer.file, copy->size(),
+                         buffer.alignment, copy,
+                         std::span<const std::byte>(*copy));
+  }
+  return sources;
+}
+void HostSourcesWriteInPlaceAndFreeAsRead() {
+  // A write of host sources leases no transfer stream and queues no device
+  // reads; each source's memory is freed once its last piece is read, before
+  // that payload is written. The checkpoint restores byte for byte.
+  Directory dir;
+  ResourceLedger ledger{{1 << 22, 1 << 21, 256 + 2048, 4096}};
+  DiskStore disk(ledger, dir.path, 1 << 20);
+  std::atomic<std::size_t> leased{};
+  StreamedStore streams(
+      ledger, disk, 256, Allocate,
+      [&] {
+        ++leased;
+        return Lease();
+      },
+      2048,
+      [&](std::size_t) {
+        ++leased;
+        return Lease();
+      });
+  Fixture fixture(ledger);
+  std::vector<std::weak_ptr<const void>> owners;
+  auto sources = HostSources(fixture, owners);
+  std::size_t written{};
+  disk.SetCrashHook([&](DiskPublicationStep step) {
+    if (step != DiskPublicationStep::kPayloadWritten)
+      return;
+    ++written;
+    assert(static_cast<std::size_t>(std::ranges::count_if(
+               owners, [](const auto& o) { return o.expired(); })) == written);
+  });
+  TransferTiming timing;
+  streams.Write(Id(100), fixture.manifest, sources, timing);
+  disk.SetCrashHook({});
+  assert(written == fixture.buffers.size());
+  assert(leased == 0);
+  assert(
+      std::ranges::all_of(owners, [](const auto& o) { return o.expired(); }));
+  // Written once: the sources are spent.
+  bool refused = false;
+  try {
+    streams.Write(Id(101), fixture.manifest, sources, timing);
+  } catch (const std::logic_error&) {
+    refused = true;
+  }
+  assert(refused);
+  auto restored = fixture.adapter.CreateSlot(fixture.guard);
+  assert(streams.Restore({1}, fixture.manifest.compatibility, fixture.adapter,
+                         *restored, timing));
+  assert(fixture.adapter.RecurrentHash(*restored) == fixture.hash);
+  // Invalid host sources are refused.
+  const auto bytes = std::make_shared<std::vector<std::byte>>(8);
+  for (const auto size : {std::size_t{7}, std::size_t{9}}) {
+    bool invalid = false;
+    try {
+      PersistenceSource source(false, Id(1), size, 1, bytes,
+                               std::span<const std::byte>(*bytes));
+    } catch (const std::invalid_argument&) {
+      invalid = true;
+    }
+    assert(invalid);
+  }
+}
+void DroppedHostJobFreesItsMemory() {
+  // A pending host-source job dropped by Stop frees its memory unwritten.
+  Directory dir;
+  ResourceLedger ledger{{1 << 22, 1 << 21, 16, 8192}};
+  DiskStore disk(ledger, dir.path, 1 << 20);
+  StreamedStore streams(ledger, disk, 16, Allocate, Lease);
+  Fixture first(ledger), host(ledger, 2, 30);
+  std::atomic<bool> started{};
+  std::vector<CheckpointId> failed;
+  std::mutex failed_mutex;
+  PersistenceQueue queue(
+      ledger, streams, 2, 1 << 20,
+      [&] {
+        started = true;
+        return false;
+      },
+      [&](CheckpointId id, bool succeeded, const TransferTiming&) {
+        if (!succeeded) {
+          const std::lock_guard lock(failed_mutex);
+          failed.push_back(id);
+        }
+      },
+      {}, std::chrono::hours(1));
+  // The first job yields to the busy model at its first piece.
+  assert(queue.TrySubmit(
+      PersistenceJob(ledger, Id(100), first.manifest, first.Sources())));
+  while (!started)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  std::vector<std::weak_ptr<const void>> owners;
+  PersistenceJob job(ledger, Id(101), host.manifest, HostSources(host, owners));
+  job.KeepUnderPressure();
+  const auto pinned = queue.Stats().pinned_bytes;
+  assert(queue.TrySubmit(std::move(job)));
+  // Host sources pin no RAM against the queue's limit.
+  assert(queue.Stats().pinned_bytes == pinned);
+  assert(
+      std::ranges::none_of(owners, [](const auto& o) { return o.expired(); }));
+  queue.Stop();
+  assert(
+      std::ranges::all_of(owners, [](const auto& o) { return o.expired(); }));
+  assert(failed.size() == 1 && failed.front().value == 1);
+}
 void SlotHoldingJobsRunFirst() {
   // While a write runs, a slot-holding job submitted after an ordinary one
   // starts before it, but passes it only once: a second slot-holding job
@@ -1060,6 +1251,115 @@ void SlotHoldingJobsRunFirst() {
   idle = true;
   queue.Drain();
   assert((order == std::vector<std::uint64_t>{1, 3, 2, 4}));
+}
+void KeptJobsSpareTheCheckpointsOfAResetSlot() {
+  // Under queue pressure a kept job (a reassigned frontier) replaces an
+  // ordinary pending job, but neither one of its prefixes nor one still
+  // reading observed rows from a slot: it is refused (CanAccept agrees). A
+  // kept job queued without jumping starts in submission order.
+  enum class Pending { kPrefix, kLiveRows, kUnrelated };
+  for (const auto pending :
+       {Pending::kPrefix, Pending::kLiveRows, Pending::kUnrelated}) {
+    Directory dir;
+    ResourceLedger ledger{{1 << 22, 1 << 21, 16, 8192}};
+    DiskStore disk(ledger, dir.path, 1 << 20);
+    StreamedStore streams(ledger, disk, 16, Allocate, Lease);
+    // Every fixture's tokens start alike: 20 tokens are a prefix of the
+    // kept 40, and 50 are not.
+    Fixture first(ledger),
+        other(ledger, 2, 30, pending == Pending::kPrefix ? 20 : 50),
+        kept(ledger, 3, 90, 40);
+    std::atomic<bool> started{};
+    PersistenceQueue queue(
+        ledger, streams, 2, 1 << 20,
+        [&] {
+          started = true;
+          return false;
+        },
+        {}, {}, std::chrono::hours(1));
+    assert(queue.TrySubmit(
+        PersistenceJob(ledger, Id(100), first.manifest, first.Sources())));
+    while (!started)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    FakeStream execution;
+    LeasedSlot slot(ledger, other.adapter, execution, SlotId{1});
+    auto lease = slot.Acquire();
+    auto sources = other.Sources();
+    if (pending == Pending::kLiveRows) {
+      // Its chunks read observed rows still in the slot.
+      std::erase_if(other.buffers,
+                    [](const auto& b) { return !b.private_file; });
+      sources = other.Sources();
+      other.adapter.Append(lease.Execution(), other.manifest.tokens,
+                           std::span(other.manifest.tokens).first(46));
+      for (const auto& component : other.manifest.components) {
+        const auto& d = component.descriptor;
+        if (d.kind != ComponentKind::kAppendRows)
+          continue;
+        auto rows = lease.Observe(
+            d.id, 0, component.position.valid_rows,
+            other.adapter.BorrowRowsView(lease.Execution(), d.id, 0,
+                                         component.position.valid_rows));
+        std::size_t offset = 0;
+        for (const auto& chunk : component.chunks) {
+          sources.emplace_back(
+              false, chunk.file, chunk.bytes, d.row_bytes, rows, offset,
+              [](auto source, auto destination, Stream& stream) {
+                return dynamic_cast<FakeStream&>(stream).Submit(
+                    [source, destination] {
+                      std::memcpy(destination.data(), source.data(),
+                                  destination.size());
+                      return TransferResult::kSucceeded;
+                    });
+              });
+          offset += chunk.bytes;
+        }
+      }
+    }
+    assert(queue.TrySubmit(
+        PersistenceJob(ledger, Id(101), other.manifest, std::move(sources))));
+    const bool replaceable = pending == Pending::kUnrelated;
+    assert(queue.CanAccept(kept.manifest) &&
+           queue.CanAccept(kept.manifest, true) == replaceable);
+    PersistenceJob job(ledger, Id(102), kept.manifest, kept.Sources());
+    job.KeepUnderPressure();
+    assert(queue.TrySubmit(std::move(job)) == replaceable);
+    queue.Stop();
+  }
+  {
+    Directory dir;
+    ResourceLedger ledger{{1 << 22, 1 << 21, 16, 8192}};
+    DiskStore disk(ledger, dir.path, 1 << 20);
+    StreamedStore streams(ledger, disk, 16, Allocate, Lease);
+    Fixture first(ledger), ordinary(ledger, 2, 30), held(ledger, 3, 60);
+    std::atomic<bool> idle{}, started{};
+    std::mutex order_mutex;
+    std::vector<std::uint64_t> order;
+    PersistenceQueue queue(
+        ledger, streams, 4, 1 << 20,
+        [&] {
+          started = true;
+          return idle.load();
+        },
+        [&](CheckpointId id, bool succeeded, const TransferTiming&) {
+          assert(succeeded);
+          const std::lock_guard lock(order_mutex);
+          order.push_back(id.value);
+        },
+        {}, std::chrono::hours(1));
+    assert(queue.TrySubmit(
+        PersistenceJob(ledger, Id(100), first.manifest, first.Sources())));
+    while (!started)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    assert(queue.TrySubmit(PersistenceJob(ledger, Id(101), ordinary.manifest,
+                                          ordinary.Sources())));
+    PersistenceJob job(ledger, Id(102), held.manifest, held.Sources());
+    job.KeepUnderPressure(false);
+    assert(queue.TrySubmit(std::move(job)));
+    idle = true;
+    queue.Drain();
+    assert((order == std::vector<std::uint64_t>{1, 2, 3}));
+  }
 }
 void NewestPendingFrontierSurvives() {
   for (const bool learned : {false, true}) {
@@ -1416,6 +1716,7 @@ int main() {
   PrefetchDoesNotValidateOrAdmitPayload();
   RestoreGroupsAdjacentFilesWithinStaging();
   LiveRowsStreamWithoutWholeHistoryBacking();
+  YieldingWriteHoldsNoFinishedPins();
   DeviceReadsQueueAheadOfTheWriter();
   SubPiecesQueueAheadWithinBounds();
   ReadAheadDrainsOnFailureAndStop();
@@ -1428,7 +1729,10 @@ int main() {
   QueueBoundsAndYield();
   BusyModelYieldIsBounded();
   HeldSourcesReturnBeforePayloadSyncs();
+  HostSourcesWriteInPlaceAndFreeAsRead();
+  DroppedHostJobFreesItsMemory();
   SlotHoldingJobsRunFirst();
+  KeptJobsSpareTheCheckpointsOfAResetSlot();
   NewestPendingFrontierSurvives();
   FirstPendingAnchorSurvivesCoalescing();
   AdmissionFailures();

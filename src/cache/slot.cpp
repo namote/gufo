@@ -6,6 +6,8 @@
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
+#include <iterator>
 #include <limits>
 #include <list>
 #include <mutex>
@@ -40,7 +42,7 @@ struct RowState {
   std::condition_variable_any changed;
   std::size_t readers{};
   bool closing{false};
-  enum Completion : unsigned { kMaterialized = 1, kRetired = 2 };
+  enum Completion : unsigned { kMaterialized = 1, kRetired = 2, kHosted = 4 };
   // Completion bits only accumulate. Publish after the copy and accounting
   // conversion so validity checks of completed rows need no reader mutex.
   std::atomic<unsigned> completion{0};
@@ -49,6 +51,48 @@ struct RowState {
   }
   bool Retired() const {
     return completion.load(std::memory_order_relaxed) & kRetired;
+  }
+  // Observed rows whose every byte has a host copy (BorrowedRows::Host).
+  bool Hosted() const {
+    return completion.load(std::memory_order_relaxed) & kHosted;
+  }
+  // Host copies, sorted by offset. Guarded by mutex; only added, and their
+  // bytes never change, so a reader may copy from them after unlocking.
+  std::vector<BorrowedRows::HostCopy> hosted;
+  // Under mutex: the parts of the host copies holding `size` bytes at
+  // `offset`, appended to `parts`; false (parts unchanged) when they do not
+  // cover that range.
+  bool HostedParts(std::size_t offset, std::size_t size,
+                   std::vector<std::span<const std::byte>>& parts) const {
+    if (hosted.empty() || offset > bytes || size > bytes - offset)
+      return false;
+    const auto start = parts.size();
+    for (std::size_t done = 0; done < size;) {
+      const auto at = offset + done;
+      // The copy holding `at`: the last starting at or before it, or an
+      // earlier, longer one if copies overlap.
+      auto it = std::upper_bound(hosted.begin(), hosted.end(), at,
+                                 [](std::size_t value, const auto& host) {
+                                   return value < host.offset;
+                                 });
+      const BorrowedRows::HostCopy* found = nullptr;
+      while (it != hosted.begin()) {
+        --it;
+        if (at < it->offset + it->bytes.size()) {
+          found = &*it;
+          break;
+        }
+      }
+      if (!found) {
+        parts.resize(start);
+        return false;
+      }
+      const auto n =
+          std::min(size - done, found->offset + found->bytes.size() - at);
+      parts.push_back(found->bytes.subspan(at - found->offset, n));
+      done += n;
+    }
+    return true;
   }
   bool idle_copy_failed{false};
 };
@@ -206,7 +250,7 @@ struct LeaseState final : MutationGuard {
   }
   void Preserve(const std::shared_ptr<RowState>& r, bool release) {
     std::unique_lock lock(r->mutex);
-    if (r->buffer.empty()) {
+    if (r->buffer.empty() && !r->Hosted()) {
       // A discardable disk source promises no RAM preservation. Closing it
       // rejects future pieces; the one already reading must finish before the
       // adapter can overwrite/free its allocation.
@@ -214,7 +258,7 @@ struct LeaseState final : MutationGuard {
       r->closing = false;
       r->changed.notify_all();
     }
-    if (!r->Materialized() && !r->Retired()) {
+    if (!r->Materialized() && !r->Retired() && !r->Hosted()) {
       r->closing = true;
       lock.unlock();
       try {
@@ -554,12 +598,43 @@ void RowPin::Release() noexcept {
 }
 BorrowedRows::BorrowedRows(std::shared_ptr<detail::RowState> state)
     : state_(std::move(state)) {}
+namespace {
+void CopyParts(std::span<const std::span<const std::byte>> parts,
+               std::span<std::byte> destination) {
+  for (const auto& part : parts) {
+    std::memcpy(destination.data(), part.data(), part.size());
+    destination = destination.subspan(part.size());
+  }
+}
+}  // namespace
 RowPin BorrowedRows::Pin(std::stop_token stop) const {
   auto& r = *state_;
   std::unique_lock lock(r.mutex);
   if (!r.changed.wait(lock, stop, [&] { return !r.closing; }) ||
       stop.stop_requested())
     throw std::runtime_error("borrowed row read cancelled");
+  return PinLocked();
+}
+std::optional<RowPin> BorrowedRows::PinOrCopyHosted(
+    std::size_t offset, std::span<std::byte> destination,
+    std::stop_token stop) const {
+  auto& r = *state_;
+  std::unique_lock lock(r.mutex);
+  if (!r.changed.wait(lock, stop, [&] { return !r.closing; }) ||
+      stop.stop_requested())
+    throw std::runtime_error("borrowed row read cancelled");
+  // Under the same lock as Host and the reset's Preserve: either the host
+  // copies serve this read (copied after unlocking: their bytes never
+  // change), or the pin holds the reset until it is done.
+  std::vector<std::span<const std::byte>> parts;
+  if (!r.HostedParts(offset, destination.size(), parts))
+    return PinLocked();
+  lock.unlock();
+  CopyParts(parts, destination);
+  return std::nullopt;
+}
+RowPin BorrowedRows::PinLocked() const {
+  auto& r = *state_;
   if (r.Retired())
     throw std::runtime_error("borrowed rows retired");
   RowPin pin;
@@ -582,7 +657,7 @@ RowPin BorrowedRows::Pin(std::stop_token stop) const {
 }
 std::optional<BorrowedLocation> BorrowedRows::Location() const {
   std::lock_guard lock(state_->mutex);
-  return state_->Materialized() || state_->Retired()
+  return state_->Materialized() || state_->Retired() || state_->Hosted()
              ? std::nullopt
              : std::optional(state_->location);
 }
@@ -641,6 +716,60 @@ bool BorrowedRows::HasBacking() const {
 std::size_t BorrowedRows::SourceViewBytes() const {
   std::lock_guard lock(state_->mutex);
   return state_->source_bytes.size();
+}
+void BorrowedRows::Host(std::size_t offset, std::span<const std::byte> bytes,
+                        std::shared_ptr<const void> owner) {
+  std::vector<HostCopy> copies;
+  copies.push_back({offset, bytes, std::move(owner)});
+  Host(std::move(copies));
+}
+void BorrowedRows::Host(std::vector<HostCopy> copies) {
+  auto& r = *state_;
+  for (const auto& copy : copies)
+    if (!copy.owner || copy.offset > r.bytes ||
+        copy.bytes.size() > r.bytes - copy.offset)
+      throw std::invalid_argument("invalid host copy of observed rows");
+  std::ranges::sort(copies, {}, &HostCopy::offset);
+  std::lock_guard lock(r.mutex);
+  if (!r.buffer.empty())
+    throw std::invalid_argument("invalid host copy of observed rows");
+  if (r.Retired())
+    throw std::runtime_error("borrowed rows retired");
+  // One merge of two sorted runs: no per-copy sort, and the lock is held
+  // only for moving handles.
+  const auto middle = r.hosted.size();
+  r.hosted.reserve(middle + copies.size());
+  std::ranges::move(copies, std::back_inserter(r.hosted));
+  std::inplace_merge(
+      r.hosted.begin(), r.hosted.begin() + middle, r.hosted.end(),
+      [](const auto& a, const auto& b) { return a.offset < b.offset; });
+  // Covered once the copies, in offset order, leave no gap.
+  std::size_t covered = 0;
+  for (const auto& copy : r.hosted)
+    if (copy.offset <= covered)
+      covered = std::max(covered, copy.offset + copy.bytes.size());
+  if (covered >= r.bytes)
+    r.completion.fetch_or(detail::RowState::kHosted, std::memory_order_release);
+}
+bool BorrowedRows::CopyHosted(std::size_t offset,
+                              std::span<std::byte> destination) const {
+  std::vector<std::span<const std::byte>> parts;
+  {
+    std::lock_guard lock(state_->mutex);
+    if (!state_->HostedParts(offset, destination.size(), parts))
+      return false;
+  }
+  CopyParts(parts, destination);
+  return true;
+}
+ComponentId BorrowedRows::Component() const {
+  return state_->component;
+}
+Rows BorrowedRows::First() const {
+  return state_->first;
+}
+Rows BorrowedRows::End() const {
+  return state_->end;
 }
 SlotLease::SlotLease(std::shared_ptr<detail::LeaseState> state)
     : state_(std::move(state)) {}
@@ -767,6 +896,18 @@ std::shared_ptr<BorrowedRows> SlotLease::Observe(
   bound = std::max(bound, end);
   auto result = std::shared_ptr<BorrowedRows>(new BorrowedRows(rows));
   state_->rows.push_back({rows->metadata, rows, c, first, end});
+  return result;
+}
+std::vector<std::shared_ptr<BorrowedRows>> SlotLease::ObservedRows() const {
+  (void)Execution();
+  std::vector<std::shared_ptr<BorrowedRows>> result;
+  for (const auto& entry : state_->rows) {
+    auto r = entry.rows.lock();
+    if (!r || !r->buffer.empty() ||
+        r->completion.load(std::memory_order_acquire))
+      continue;
+    result.push_back(std::shared_ptr<BorrowedRows>(new BorrowedRows(r)));
+  }
   return result;
 }
 void SlotLease::Reset() {

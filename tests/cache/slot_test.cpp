@@ -626,6 +626,60 @@ void ConcurrentValidityDuringTeardown() {
     }
   }
 }
+void HostedObservationsOutliveReset() {
+  // Host copies covering every byte of observed rows keep them valid through
+  // a reset of their slot, read from the copies; partly covered rows still
+  // retire. ObservedRows lists only rows not yet covered.
+  Fixture f;
+  const auto source =
+      f.adapter.BorrowRowsView(f.lease.Execution(), kTarget, 0, 4);
+  const std::vector<std::byte> expected(source.begin(), source.end());
+  auto covered = f.lease.Observe(kTarget, 0, 4, source);
+  auto partial = f.lease.Observe(kTarget, 0, 4, source);
+  assert(f.lease.ObservedRows().size() == 2);
+  assert(covered->Component() == kTarget && covered->First() == 0 &&
+         covered->End() == 4);
+  auto copy = std::make_shared<std::vector<std::byte>>(expected);
+  const std::span<const std::byte> bytes(*copy);
+  Throws([&] { covered->Host(0, bytes, {}); });
+  Throws([&] { covered->Host(1, bytes, copy); });
+  std::vector<std::byte> read(expected.size());
+  assert(!covered->CopyHosted(0, read));
+  // Two halves, in either order, cover the rows.
+  covered->Host(8, bytes.subspan(8), copy);
+  assert(!covered->CopyHosted(0, read) && covered->Location());
+  covered->Host(0, bytes.first(8), copy);
+  assert(!covered->Location() && covered->IsValid());
+  partial->Host(0, bytes.first(8), copy);
+  assert(f.lease.ObservedRows().size() == 1);
+  f.lease.Reset();
+  assert(covered->IsValid() && !partial->IsValid());
+  assert(covered->CopyHosted(0, read) && read == expected);
+  std::vector<std::byte> middle(6);
+  assert(covered->CopyHosted(5, middle));
+  assert(std::ranges::equal(middle, std::span(expected).subspan(5, 6)));
+  assert(!covered->CopyHosted(12, middle));
+  Throws([&] { (void)partial->Pin(); });
+  Throws([&] { partial->Host(8, bytes.subspan(8), copy); });
+  {
+    // A read that found no host copy pins the slot rows; host copies added
+    // meanwhile do not let a reset pass that pin, and the next read uses
+    // them. The read decides under the rows' lock (PinOrCopyHosted).
+    Fixture g;
+    const auto view =
+        g.adapter.BorrowRowsView(g.lease.Execution(), kTarget, 0, 4);
+    auto rows = g.lease.Observe(kTarget, 0, 4, view);
+    std::vector<std::byte> out(expected.size());
+    auto early = rows->PinOrCopyHosted(0, out);
+    assert(early && early->Location());
+    rows->Host(0, bytes, copy);
+    auto reset = std::async(std::launch::async, [&] { g.lease.Reset(); });
+    assert(reset.wait_for(100ms) == std::future_status::timeout);
+    early.reset();
+    reset.get();
+    assert(!rows->PinOrCopyHosted(0, out) && out == expected);
+  }
+}
 // Simulate an adapter that resets its generation while omitting preservation.
 class BadAdapter final : public Adapter {
 public:
@@ -734,6 +788,7 @@ int main() {
                ResourceCategory::kBackingFree)] == 0);
   }
   Paths();
+  HostedObservationsOutliveReset();
   Failures();
   EveryPreservationConversion();
   ChunkPinsBlockMutation();

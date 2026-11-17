@@ -127,6 +127,10 @@ public:
   // Lends at most `rows` rows per view, standing in for rows spread over
   // device blocks; zero lends any range.
   void LimitBorrowedRows(Rows rows) noexcept { borrow_limit_ = rows; }
+  // Appends leave earlier rows in place (up to 65536 rows per component),
+  // guarding only the appended rows, as device storage does. Otherwise every
+  // append moves (and guards) all rows.
+  void SetStableAppends(bool stable) noexcept { stable_appends_ = stable; }
   // Rows copied out through CopyRowsOut, all components.
   [[nodiscard]] std::size_t CopiedOutRows() const noexcept {
     return copied_out_rows_.load(std::memory_order_relaxed);
@@ -154,6 +158,7 @@ private:
   bool fail_transfer_{false};
   std::atomic<std::size_t> invalidations_{};
   Rows borrow_limit_{0};
+  bool stable_appends_{};
   std::atomic<std::size_t> copied_out_rows_{};
   Rows prefill_pass_rows_{2048};
 };

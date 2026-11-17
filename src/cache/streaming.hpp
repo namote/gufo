@@ -84,7 +84,8 @@ public:
                     std::size_t alignment, std::shared_ptr<BorrowedRows>,
                     CopyRows read_live = {});
   // Discardable live rows, for histories exceeding RAM. Reads pin exactly
-  // one staging piece through completion; mutation retires unread sources.
+  // one staging piece through completion; mutation retires unread sources,
+  // except rows host copies cover (BorrowedRows::Host), read from those.
   // Private state/tails remain immutable committed copies. No publication
   // completes with unread retired rows. No full-history backing is assigned.
   PersistenceSource(bool private_file, DiskFileId, std::uint64_t bytes,
@@ -96,6 +97,13 @@ public:
   PersistenceSource(bool private_file, DiskFileId, std::uint64_t bytes,
                     std::size_t alignment, std::shared_ptr<const void> owner,
                     Copy);
+  // Host bytes outside the ledger that the owner keeps unchanged (a
+  // foreground snapshot of a slot). The writer copies them in place, without
+  // a device read or a transfer stream, and drops the owner as soon as their
+  // last piece is read.
+  PersistenceSource(bool private_file, DiskFileId, std::uint64_t bytes,
+                    std::size_t alignment, std::shared_ptr<const void> owner,
+                    std::span<const std::byte> host);
   PersistenceSource(PersistenceSource&&) noexcept = default;
   PersistenceSource& operator=(PersistenceSource&&) = delete;
   PersistenceSource(const PersistenceSource&) = delete;
@@ -111,6 +119,9 @@ private:
   std::shared_ptr<const void> owner_;
   std::shared_ptr<BorrowedRows> rows_;
   Copy copy_;
+  // Set by the host constructor: copy_ is unused, the bytes are read here.
+  std::span<const std::byte> host_bytes_;
+  bool host_{};
   bool live_reads_{};
   bool private_file_;
   DiskFileId file_;
@@ -166,11 +177,23 @@ public:
   // it would release the slot unwritten, and the capture would be retried.
   // It also starts before older pending jobs, and its device sources (the
   // slot) are released as soon as its payloads are read, before their syncs.
-  void KeepUnderPressure() noexcept { keep_ = true; }
+  // A host snapshot of a slot that was then reset is kept the same way: it
+  // is that state's only copy, and starting it early frees its host memory.
+  // A kept job supersedes no pending ancestor: the frontier it writes may
+  // not be a prefix of the next prompt. Under queue pressure it replaces
+  // neither such an ancestor nor a job still reading live slot rows.
+  // Without `jump`, it starts in submission order: older jobs reading rows
+  // of the slot it holds read them before the hold returns the slot.
+  void KeepUnderPressure(bool jump = true) noexcept {
+    keep_ = true;
+    jump_ = jump;
+  }
 
 private:
   friend class PersistenceQueue;
-  bool keep_{};
+  // A source reads observed rows still in their slot (no host copy).
+  [[nodiscard]] bool ReadsLiveRows() const;
+  bool keep_{}, jump_{};
   bool jumped_{};  // A slot-holding job already started before it.
   ResourceCharge metadata_;
   DiskFileId file_;
@@ -212,11 +235,19 @@ public:
   PersistenceQueue(const PersistenceQueue&) = delete;
   PersistenceQueue& operator=(const PersistenceQueue&) = delete;
   bool TrySubmit(PersistenceJob);
+  // Whether TrySubmit would accept a job of `manifest` pinning no RAM now
+  // (kept, with `keep`): not stopped, not already queued, and a free or
+  // replaceable place.
+  [[nodiscard]] bool CanAccept(const DiskManifest&, bool keep = false) const;
   void Drain();
   void Stop();
   [[nodiscard]] PersistenceQueueStats Stats() const;
 
 private:
+  // Whether a pending `other` may make room for a job of `manifest`.
+  [[nodiscard]] static bool Replaceable(const PersistenceJob& other,
+                                        const DiskManifest& manifest,
+                                        bool keep);
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

@@ -4,11 +4,14 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
+#include <stop_token>
 #include <thread>
 #include <tuple>
 #include <utility>
@@ -16,6 +19,7 @@
 #include "src/cache/disk_catalog.hpp"
 #include "src/cache/retention.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/snapshot_pool.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/platform/os_info.hpp"
@@ -96,6 +100,22 @@ struct DurableCapture {
   // Its sources read a slot the capture keeps leased (SlotHold) until the
   // queue worker has written them.
   bool holds_slot{};
+  // Its sources are a host snapshot of a slot reset right after (the only
+  // copy of that state).
+  bool host_snapshot{};
+  // A held write that may start before older jobs (KeepUnderPressure).
+  // False when older jobs still read rows of the slot it holds, which its
+  // release would let a reset retire.
+  bool jump{true};
+};
+// One piece a capture writes from a slot (inherited chunks excepted).
+struct SlotPiece {
+  cache::ComponentId component;
+  bool private_state;
+  cache::Rows first, end;
+  std::size_t bytes, alignment;
+  cache::DiskFileId file;
+  bool private_file;
 };
 class ComponentSnapshot final : public TextRunnerSnapshot {
 public:
@@ -387,6 +407,17 @@ struct ComponentTextCache::Impl {
         index.HasCheckpoint({identity, e.live_tokens, e.live_input},
                             e.live_tokens.size() - kUncoveredCaptureTokens))
       return {};
+    // A host snapshot of this frontier queued for the disk (admission's
+    // reassignment capture) reads nothing from the slot: it covers the
+    // frontier through a reset, until its write fails.
+    if (std::ranges::any_of(pending_durable, [&](const auto& capture) {
+          return capture && capture->host_snapshot &&
+                 capture->branch == e.branch &&
+                 std::ranges::equal(capture->manifest.tokens, e.live_tokens) &&
+                 capture->manifest.input ==
+                     At(e.live_input, e.live_tokens.size());
+        }))
+      return {};
     return Uncovered{i, e.live_location, e.live_tokens, e.live_input};
   }
   std::shared_ptr<TextModelRunner> runner;
@@ -425,6 +456,9 @@ struct ComponentTextCache::Impl {
   std::size_t budget{};
   // Components whose completed chunks the adapter retains in device storage.
   std::vector<cache::ComponentId> device_components;
+  // Host arenas of reassignment snapshots, null when disabled; the arenas a
+  // queued job holds keep it alive.
+  std::shared_ptr<SnapshotPool> snapshot_pool;
   cache::ResourceCharge metadata;
   // New RAM payload of a capture at `positions`.
   [[nodiscard]] std::size_t RamPayloadBytes(
@@ -463,6 +497,13 @@ struct ComponentTextCache::Impl {
         retention(ledger, index, &events) {
     metadata = ledger.Reserve(cache::ResourceCategory::kMetadata, sizeof(Impl))
                    .Convert();
+    if (resources->reassignment_snapshot_bytes &&
+        (resources->snapshot_allocate || resources->staging))
+      snapshot_pool = std::make_shared<SnapshotPool>(
+          resources->reassignment_snapshot_bytes,
+          resources->reassignment_snapshot_idle,
+          resources->snapshot_allocate ? resources->snapshot_allocate
+                                       : resources->staging);
     for (const auto& d : resources->adapter->Components())
       if (resources->adapter->RetainsRows(d.id))
         device_components.push_back(d.id);
@@ -999,6 +1040,21 @@ struct ComponentTextCache::Impl {
     }
     return bytes;
   }
+  // Whether Persist would queue `capture` now: a snapshot is not copied for
+  // a job it would refuse.
+  bool CanQueue(const DurableCapture& capture) {
+    const auto& manifest = capture.manifest;
+    if (!capture.write_back &&
+        manifest.purpose != cache::CheckpointPurpose::kLearned &&
+        WithinDiskStep(manifest.tokens, manifest.input))
+      return false;
+    {
+      const std::lock_guard lock(mutex);
+      if (std::ranges::find(pending_durable, nullptr) == pending_durable.end())
+        return false;
+    }
+    return queue->CanAccept(manifest, true);
+  }
   bool WithinDiskStep(std::span<const cache::Token> tokens,
                       const cache::Identity& input) {
     const std::lock_guard lock(mutex);
@@ -1033,8 +1089,8 @@ struct ComponentTextCache::Impl {
     auto job = cache::PersistenceJob(
         ledger, File(1, capture->manifest.checkpoint.value), capture->manifest,
         std::move(capture->sources));
-    if (capture->holds_slot)
-      job.KeepUnderPressure();
+    if (capture->holds_slot || capture->host_snapshot)
+      job.KeepUnderPressure(capture->jump);
     std::size_t pending_slot;
     // A write-back covers its frontier from before submission: the job may
     // fail, and its callback clear the mark, before TrySubmit returns.
@@ -1100,6 +1156,10 @@ struct ComponentTextCache::Lease::Impl {
   // CaptureDurable moved `slot` into a SlotHold: the caller neither commits
   // it nor returns the entry to idle.
   bool held{};
+  // Admission's reassignment capture: before keeping the slot for the
+  // writer, CaptureDurable copies its state to host memory in the
+  // foreground (SnapshotSlot), and keeps the slot only if that fails.
+  bool snapshot_slot{};
   // A copy of a live frontier (CaptureBeforeReset, WriteBackIdle), published
   // as CheckpointPurpose::kGenerated.
   bool live_frontier{};
@@ -1144,6 +1204,27 @@ struct ComponentTextCache::Lease::Impl {
             .aligned_tail = aligned_tail && tokens.size() == aligned_tail};
   }
   std::unique_ptr<TextRunnerSnapshot> CaptureDurable();
+  // Copies every piece from the slot into host arenas and adds them to
+  // `durable` as host sources. Returns why it did not (the capture then
+  // keeps the slot), or empty.
+  struct SnapshotStats {
+    double alloc_ms{}, copy_ms{};
+    std::size_t reused_bytes{}, allocated_bytes{}, arenas{};
+    // Observed rows of queued disk jobs given host copies: shared with the
+    // frontier's pieces, or read again (extra).
+    std::size_t observed{}, shared_bytes{}, extra_bytes{};
+    // The queue check, planning, and attaching host copies to observed rows.
+    double queue_ms{}, plan_ms{}, attach_ms{}, sources_ms{};
+    std::size_t pieces{};
+  };
+  std::string SnapshotSlot(std::span<const SlotPiece> pieces,
+                           DurableCapture& durable, SnapshotStats& stats);
+  // Copies `pieces` from the slot to host arenas (as host sources of
+  // `durable`, when given) and gives the slot's observed rows host copies,
+  // shared with those pieces where they hold the same rows. Returns why it
+  // did not, or empty (also when there is nothing to copy).
+  std::string HostCopy(std::span<const SlotPiece> pieces,
+                       DurableCapture* durable, SnapshotStats& stats);
 };
 
 std::unique_ptr<TextRunnerSnapshot>
@@ -1163,16 +1244,9 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
     cache::DiskFileId file;
     bool private_file;
   };
-  // Every piece this capture writes (inherited chunks excepted), for a
-  // direct write that reads each one from the slot.
-  struct Piece {
-    cache::ComponentId component;
-    bool private_state;
-    cache::Rows first, end;
-    std::size_t bytes, alignment;
-    cache::DiskFileId file;
-    bool private_file;
-  };
+  // Every piece this capture writes, for a direct write that reads each one
+  // from the slot (or its host snapshot).
+  using Piece = SlotPiece;
   std::size_t pieces = 0;
   for (const auto& d : descriptors) {
     const auto p =
@@ -1420,12 +1494,78 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
       direct = true;
     }
   }
+  if (direct && snapshot_slot) {
+    // Lent views, retained rows and staged copies taken above are released.
+    copies.clear();
+    durable->sources.clear();
+    const auto started = Clock::now();
+    std::size_t bytes = 0;
+    for (const auto& piece : all_pieces)
+      bytes += piece.bytes;
+    SnapshotStats stats;
+    const auto reason = SnapshotSlot(all_pieces, *durable, stats);
+    const auto fields =
+        " slot=" + std::to_string(slot.Location().slot.value) +
+        " tokens=" + std::to_string(capture_tokens.size()) +
+        " bytes=" + std::to_string(bytes) + " ms=" +
+        std::to_string(
+            std::chrono::duration<double, std::milli>(Clock::now() - started)
+                .count());
+    if (reason.empty()) {
+      Logger::Info(
+          "cache",
+          "event=slot_snapshot" + fields +
+              " queue_ms=" + std::to_string(stats.queue_ms) +
+              " plan_ms=" + std::to_string(stats.plan_ms) +
+              " alloc_ms=" + std::to_string(stats.alloc_ms) +
+              " copy_ms=" + std::to_string(stats.copy_ms) +
+              " attach_ms=" + std::to_string(stats.attach_ms) +
+              " sources_ms=" + std::to_string(stats.sources_ms) +
+              " pieces=" + std::to_string(stats.pieces) +
+              " arenas=" + std::to_string(stats.arenas) +
+              " reused_bytes=" + std::to_string(stats.reused_bytes) +
+              " allocated_bytes=" + std::to_string(stats.allocated_bytes) +
+              " observed_rows=" + std::to_string(stats.observed) +
+              " shared_bytes=" + std::to_string(stats.shared_bytes) +
+              " extra_bytes=" + std::to_string(stats.extra_bytes));
+      durable->host_snapshot = true;
+      ++metrics.captures;
+      metrics.captured_checkpoint_ids.push_back(
+          durable->manifest.checkpoint.value);
+      auto snapshot = std::make_unique<ComponentSnapshot>();
+      snapshot->bytes = entry->history->NewPayloadBytes(positions);
+      snapshot->durable = std::move(durable);
+      return snapshot;
+    }
+    Logger::Info("cache", "event=slot_snapshot_fallback reason=" + reason +
+                              fields + " held_write=true");
+  }
   if (direct) {
     // The queue worker reads every piece from the slot through the bounded
     // disk staging; the sources keep it leased until the job is dropped. Lent
     // views, retained rows and staged copies taken above are released.
     copies.clear();
     durable->sources.clear();
+    if (before_reset) {
+      // The slot is reset once this write has read it. Rows older jobs
+      // still read from it (a prompt-end capture) get host copies first; if
+      // they cannot, this write waits its turn so those jobs read them
+      // before the hold returns the slot.
+      SnapshotStats stats;
+      const auto reason = HostCopy({}, nullptr, stats);
+      if (!reason.empty())
+        durable->jump = false;
+      if (!reason.empty() || stats.observed)
+        Logger::Info(
+            "cache",
+            "event=held_write_observed_rows slot=" +
+                std::to_string(slot.Location().slot.value) +
+                " tokens=" + std::to_string(capture_tokens.size()) +
+                (reason.empty()
+                     ? " observed_rows=" + std::to_string(stats.observed) +
+                           " extra_bytes=" + std::to_string(stats.extra_bytes)
+                     : " in_order=true reason=" + reason));
+    }
     auto* adapter = cache->resources->adapter.get();
     auto hold = std::make_shared<ComponentTextCache::Impl::SlotHold>(
         cache, entry, std::move(slot));
@@ -1500,6 +1640,246 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
   return snapshot;
 }
 
+std::string ComponentTextCache::Lease::Impl::SnapshotSlot(
+    std::span<const SlotPiece> pieces, DurableCapture& durable,
+    SnapshotStats& stats) {
+  if (pieces.empty())
+    return "empty";
+  const auto started = Clock::now();
+  const bool queued = !cache->snapshot_pool || cache->CanQueue(durable);
+  stats.queue_ms =
+      std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+  if (!queued)
+    return "queue_full";
+  return HostCopy(pieces, &durable, stats);
+}
+std::string ComponentTextCache::Lease::Impl::HostCopy(
+    std::span<const SlotPiece> pieces, DurableCapture* durable,
+    SnapshotStats& stats) {
+  auto& resources = *cache->resources;
+  // Pack the pieces in the order the writer reads them (shared files before
+  // private, by file ID), so each arena returns as early as it can. Each
+  // piece starts on a page, keeping device reads on the fast path; a piece
+  // larger than an arena takes one of its own.
+  constexpr std::size_t kPage = 4096;
+  const auto page = [](std::size_t bytes) {
+    return (bytes + kPage - 1) / kPage * kPage;
+  };
+  const auto arena_bytes = page(
+      std::max<std::size_t>(resources.reassignment_snapshot_arena_bytes, 1));
+  // Rows of this slot that disk jobs still queued or writing observe (a
+  // prompt-end capture): the reset would retire them unread, so they get host
+  // copies too. Rows the frontier snapshot copies are shared from it; only
+  // the others (below its first row, from an older ancestor) are read again,
+  // chunk by chunk, as extra pieces after the frontier's.
+  const auto plan_started = Clock::now();
+  const auto observed = slot.ObservedRows();
+  if (pieces.empty() && observed.empty())
+    return {};
+  if (!cache->snapshot_pool)
+    return resources.reassignment_snapshot_bytes ? "no_host_allocator"
+                                                 : "disabled";
+  const auto descriptors = resources.adapter->Components();
+  // The frontier's row pieces by component and first row, for lookups.
+  std::vector<std::size_t> by_row;
+  by_row.reserve(pieces.size());
+  for (std::size_t i = 0; i < pieces.size(); ++i)
+    if (!pieces[i].private_state)
+      by_row.push_back(i);
+  const auto key = [&](std::size_t i) {
+    return std::pair(pieces[i].component.value, pieces[i].first);
+  };
+  std::ranges::sort(by_row, {}, key);
+  // The first piece of `component` ending after `row`, or none.
+  const auto next_piece = [&](cache::ComponentId component,
+                              cache::Rows row) -> const SlotPiece* {
+    auto it = std::ranges::upper_bound(by_row, std::pair(component.value, row),
+                                       {}, key);
+    if (it != by_row.begin() && pieces[*std::prev(it)].component == component &&
+        pieces[*std::prev(it)].end > row)
+      --it;
+    return it != by_row.end() && pieces[*it].component == component
+               ? &pieces[*it]
+               : nullptr;
+  };
+  struct Alias {
+    std::size_t rows, offset, piece, piece_offset, bytes;
+  };
+  std::vector<Alias> aliases;
+  std::vector<SlotPiece> extras;
+  std::vector<std::pair<std::size_t, std::size_t>> extra_targets;
+  for (std::size_t r = 0; r < observed.size(); ++r) {
+    const auto& rows = *observed[r];
+    const auto d = std::ranges::find(descriptors, rows.Component(),
+                                     &cache::ComponentDescriptor::id);
+    if (d == descriptors.end() || !d->row_bytes || !d->rows_per_chunk)
+      return "observed_rows";
+    for (auto row = rows.First(); row < rows.End();) {
+      const auto* next = next_piece(rows.Component(), row);
+      if (next && next->first <= row) {
+        const auto end = std::min(rows.End(), next->end);
+        aliases.push_back({r, (row - rows.First()) * d->row_bytes,
+                           static_cast<std::size_t>(next - pieces.data()),
+                           (row - next->first) * d->row_bytes,
+                           (end - row) * d->row_bytes});
+        row = end;
+        continue;
+      }
+      auto end = next ? std::min(rows.End(), next->first) : rows.End();
+      // Chunk-sized device reads, at chunk boundaries.
+      end = std::min(end, (row / d->rows_per_chunk + 1) * d->rows_per_chunk);
+      extras.push_back({rows.Component(),
+                        false,
+                        row,
+                        end,
+                        (end - row) * d->row_bytes,
+                        d->row_bytes,
+                        {},
+                        false});
+      extra_targets.push_back({r, (row - rows.First()) * d->row_bytes});
+      row = end;
+    }
+  }
+  // The frontier's pieces, then the extras, each on its own page.
+  std::vector<std::size_t> order(pieces.size());
+  std::iota(order.begin(), order.end(), 0);
+  std::ranges::sort(order, [&](auto a, auto b) {
+    return std::tie(pieces[a].private_file, pieces[a].file) <
+           std::tie(pieces[b].private_file, pieces[b].file);
+  });
+  for (std::size_t i = 0; i < extras.size(); ++i)
+    order.push_back(pieces.size() + i);
+  const auto item = [&](std::size_t i) -> const SlotPiece& {
+    return i < pieces.size() ? pieces[i] : extras[i - pieces.size()];
+  };
+  struct Placement {
+    std::size_t arena, offset;
+  };
+  std::vector<Placement> placement(order.size());
+  std::vector<std::size_t> sizes;
+  // End of the pieces in the last standard arena; none open at first.
+  std::optional<std::size_t> used;
+  for (const auto i : order) {
+    const auto bytes = item(i).bytes;
+    if (bytes > arena_bytes) {
+      sizes.push_back(page(bytes));
+      placement[i] = {sizes.size() - 1, 0};
+      used.reset();
+      continue;
+    }
+    if (!used || page(*used) > arena_bytes - bytes) {
+      sizes.push_back(arena_bytes);
+      used = 0;
+    }
+    placement[i] = {sizes.size() - 1, page(*used)};
+    used = page(*used) + bytes;
+  }
+  const auto started = Clock::now();
+  stats.plan_ms =
+      std::chrono::duration<double, std::milli>(started - plan_started).count();
+  stats.pieces = order.size();
+  auto taken = cache->snapshot_pool->Take(sizes, [&](std::size_t bytes) {
+    return bytes <= HostSnapshotCeilingBytes() &&
+           (!resources.snapshot_room || resources.snapshot_room(bytes));
+  });
+  stats.alloc_ms =
+      std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+  if (!taken.refused.empty()) {
+    if (!taken.error.empty())
+      Logger::Info(
+          "cache",
+          std::string("event=slot_snapshot_allocation_failed error=\"") +
+              taken.error + "\"");
+    return taken.refused;
+  }
+  stats.reused_bytes = taken.reused;
+  stats.allocated_bytes = taken.allocated;
+  stats.arenas = sizes.size();
+  const auto at = [&](std::size_t i) {
+    return taken.arenas[placement[i].arena]->Data() + placement[i].offset;
+  };
+  auto& adapter = *resources.adapter;
+  const auto copy_started = Clock::now();
+  try {
+    // The scheduler runs no other model work meanwhile, so the device reads
+    // run at full speed; batch them as the reassignment copy does.
+    TransferBatch transfers(
+        std::clamp<std::size_t>(std::max(resources.transfer_batch_size,
+                                         resources.reassignment_batch_size),
+                                1, 16));
+    for (std::size_t i = 0; i < order.size(); ++i) {
+      const auto& piece = item(i);
+      const std::span<std::byte> destination(at(i), piece.bytes);
+      transfers.Add([&] { return resources.stream(); },
+                    [&](cache::Stream& stream) {
+                      return piece.private_state
+                                 ? adapter.CapturePrivate(slot.Execution(),
+                                                          piece.component,
+                                                          destination, stream)
+                                 : adapter.CopyRowsOut(slot.Execution(),
+                                                       piece.component,
+                                                       piece.first, piece.end,
+                                                       destination, stream);
+                    });
+    }
+    transfers.Finish();
+    stats.copy_ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - copy_started)
+            .count();
+    const auto owner = [&](std::size_t i) {
+      return std::shared_ptr<const void>(taken.arenas[placement[i].arena],
+                                         at(i));
+    };
+    // Attach each observed range's copies in one call: one lock of its rows,
+    // never waiting for the writer's device reads (they hold no lock).
+    const auto attach_started = Clock::now();
+    std::vector<std::vector<cache::BorrowedRows::HostCopy>> copies(
+        observed.size());
+    for (const auto& alias : aliases) {
+      copies[alias.rows].push_back(
+          {alias.offset,
+           std::span<const std::byte>(at(alias.piece) + alias.piece_offset,
+                                      alias.bytes),
+           owner(alias.piece)});
+      stats.shared_bytes += alias.bytes;
+    }
+    for (std::size_t e = 0; e < extras.size(); ++e) {
+      const auto i = pieces.size() + e;
+      const auto [rows, offset] = extra_targets[e];
+      copies[rows].push_back(
+          {offset, std::span<const std::byte>(at(i), extras[e].bytes),
+           owner(i)});
+      stats.extra_bytes += extras[e].bytes;
+    }
+    for (std::size_t r = 0; r < observed.size(); ++r)
+      observed[r]->Host(std::move(copies[r]));
+    stats.observed = observed.size();
+    const auto sources_started = Clock::now();
+    stats.attach_ms = std::chrono::duration<double, std::milli>(
+                          sources_started - attach_started)
+                          .count();
+    for (std::size_t i = 0; durable && i < pieces.size(); ++i) {
+      const auto& piece = pieces[i];
+      const auto* data = at(i);
+      durable->sources.emplace_back(
+          piece.private_file, piece.file, piece.bytes, piece.alignment,
+          std::shared_ptr<const void>(taken.arenas[placement[i].arena], data),
+          std::span<const std::byte>(data, piece.bytes));
+    }
+    stats.sources_ms = std::chrono::duration<double, std::milli>(
+                           Clock::now() - sources_started)
+                           .count();
+  } catch (const std::exception& error) {
+    if (durable)
+      durable->sources.clear();
+    Logger::Info("cache",
+                 std::string("event=slot_snapshot_copy_failed error=\"") +
+                     error.what() + "\"");
+    return "copy_failed";
+  }
+  return {};
+}
+
 ComponentTextCache::ComponentTextCache(
     std::shared_ptr<TextModelRunner> runner, std::size_t count, std::size_t ram,
     const std::optional<TextRunnerDiskCacheOptions>& disk, bool automatic_ram,
@@ -1563,6 +1943,8 @@ bool ComponentTextCache::CaptureBeforeReset(std::size_t index,
     lease.impl_->live_frontier = true;
     lease.impl_->before_reset = true;
     lease.impl_->hold_slot = hold;
+    // Only admission holds here: copy the state out instead where it can.
+    lease.impl_->snapshot_slot = hold;
     lease.impl_->persist = persist;
     try {
       // Retry priority: the copy may only displace other optional copies,

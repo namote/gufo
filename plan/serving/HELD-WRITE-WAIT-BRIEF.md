@@ -123,3 +123,93 @@ Add a unit test: a checkpoint borrowing from a held slot becomes durable while
 the acquirer waits for the hold; on release it is dropped, not copied
 (`checkpoint_dropped` / no foreground copy bytes). Same rules as above; leave
 the diff uncommitted; report in English.
+
+## Round 4 (user, 2026-11-17): snapshot the held slot in the foreground, write later
+
+Shipped state: abba3337 (production runtime-20261116b). Pass 4
+(`build/b1/pass-20261116d/server.log`, read only): C waited 32.5 s =
+~12 s for the active prompt-end job on the single writer (A's 3.2 GB
+prompt-end capture, device reads slow while B decodes) + ~20 s for the held
+reassignment job's device reads (~270 MB/s while B decodes). On an idle GPU
+the same 3.2 GB of device reads takes ~0.13-0.2 s. Rounds 1-3 notes above.
+
+Goal: a request that needs a slot held by a pending durable write starts in
+about a second, not 30+ s, and the peer slot pauses at most ~0.5 s once
+(today's reassignment foreground copy already costs ~0.5 s; see
+`foreground_bytes`/`residual_wait_ms` in C's metrics).
+
+Design the user approved:
+1. At reassignment (where `PrepareAdmission` today captures with `hold=true`
+   and queues a slot-holding job), copy the whole state that would be held
+   (all device sources of the capture, every adapter, generic) into a
+   temporary host buffer in the foreground, the same way the existing
+   foreground row preservation runs (the scheduler does not run the peer's
+   decode meanwhile, so the GPU is idle and the copy runs at full speed).
+   Then release the slot immediately and give the payload to the persistence
+   writer, which writes it to disk from host memory without touching the
+   device. No SlotHold for this path, so C never waits on the writer queue
+   (removes both the ~12 s and the ~20 s).
+2. Temporary memory: Strix Halo has 128 GB unified memory. Bound the
+   temporary buffers with their own cap (explain the value; a few GB, enough
+   for one ~3.5 GB state plus margin), not the RAM cache budget; charge and
+   release them on every path (publish, failure, cancel, shutdown). If the
+   allocation fails or the cap is reached, fall back to today's held write
+   (SlotHold), unchanged.
+3. The writer should free each part of the buffer as soon as that part is
+   on disk if that is simple; otherwise free it at publication.
+4. Do not change stream priorities, queue counts, `GPU_MAX_HW_QUEUES` or the
+   transfer pool rules. Keep the prompt-end/write-back captures as they are
+   unless the same mechanism clearly applies; say so.
+5. Log the foreground snapshot: bytes, ms, and the fallback reason if taken.
+
+Tests (CPU, test adapter): the reassignment capture snapshots to host and
+releases the slot before the write runs (a second acquirer is not blocked by
+a slow writer); cap reached / allocation failure falls back to the held path;
+buffers are released on success, failure and cancel; restore from the
+published checkpoint is byte-identical. Same rules as above (no GPU/model/
+server runs, check-format, no commit). Report in English: the change, the
+predicted C wait and peer pause, memory cost, tests and results, open risks.
+
+## Round 5: pass 5 result and the regression it found (`build/b1/pass-20261117a/`, read only)
+
+Binary 8f5cbb4f… (round 4 + review fixes). Results:
+- C: 2.9 s total, queue 961 ms (was 34.4 s). `slot_snapshot bytes=3279220932
+  ms=627 alloc_ms=383 copy_ms=236 arenas=51 reused_bytes=0`. Publication of
+  the snapshot: stream wait 0, filesystem 1.99 s. Arenas trimmed after idle.
+- B max gap 1.172 s (one gap over 1 s): snapshot 0.63 s + C's foreground
+  preservation (`foreground_bytes=1331145216 foreground_copy_ms=252
+  residual_wait_ms=289`).
+- **Regression:** A's next turn took 192 s: `cached_tokens=163840`,
+  ~168K tokens re-prefilled. Log at 23:13:33, right after the snapshot:
+  `event=persistence_incomplete checkpoint_id=51805 reason="borrowed rows retired"`.
+  51805 is A's prompt-end capture (tokens ~331674), still queued/being
+  written on the writer and reading A's slot rows. The snapshot released and
+  reset the slot, so that job lost its rows. Only the 331721-token frontier
+  (prompt + generated reasoning, not a prefix of the next prompt) was
+  published, so the next turn fell back to an old 163840 checkpoint. Before
+  round 4 the held write kept the slot until the writer had read everything,
+  so the prompt-end job finished first.
+
+Fix (generic, all adapters), in this order of preference:
+1. In the same foreground step, before the slot is released, also copy to
+   host every device source that any queued or active persistence job reads
+   from this slot (the prompt-end job above is the usual case: it is always
+   in flight right after a long prefill). Pieces identical to ones already in
+   the frontier snapshot (same disk file id / chunk) must be shared, not
+   copied twice; only the differing pieces (e.g. its private state, tail)
+   need new bytes. Switch those jobs' sources to the host copies safely
+   while the writer may be mid-job (the active job: under the existing
+   piece/slot locks, or by pausing it at a piece boundary). Charge the pool.
+2. If that cannot be done safely or room is short, fall back to today's held
+   write for that reassignment (never lose a pending job's checkpoint).
+Also: no `persistence_incomplete reason="borrowed rows retired"` may happen
+because of a snapshot; add a test where a prompt-end job borrowing the slot
+is queued (and one where it is mid-write) when the reassignment snapshot runs,
+and both checkpoints publish and restore byte-identically.
+
+Peer pause (secondary): first-time `alloc_ms` 383 ms. Say whether the pool
+can be warmed off the scheduler thread when a long state appears (e.g. when
+a slot's state passes ~1 GB, on the trim thread), bounded by the same cap and
+idle trim; implement if simple. Do not change the 1.33 GB foreground
+preservation in this round (left for later).
+Same rules as before; do not commit; report in English.

@@ -21,6 +21,7 @@
 
 #include "src/cache/retention.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/snapshot_pool.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "tests/cache/fake_adapter.hpp"
@@ -51,6 +52,22 @@ public:
   // Runs on every transfer stream request from another thread (the disk
   // writer, idle preservation) before it is served.
   mutable std::function<void()> background_stream;
+  // ComponentCacheResources::reassignment_snapshot_bytes.
+  std::size_t snapshot_bytes{kReassignmentSnapshotBytes};
+  std::size_t snapshot_arena_bytes{64 << 10};
+  std::chrono::milliseconds snapshot_idle{kReassignmentSnapshotIdle};
+  std::function<bool(std::size_t)> snapshot_room;
+  // RAM backing refuses every capture of completed rows (can_capture), as
+  // for a state larger than it; this fake's blocks cannot hold chunks wider
+  // than 16 bytes. Private states and tails still stage.
+  bool refuse_capture{};
+  // FakeAdapter::SetStableAppends.
+  bool stable_appends{};
+  // Staging allocations fail (std::bad_alloc) while set.
+  mutable std::atomic<bool> fail_staging{};
+  // Staging bytes currently allocated (startup staging included).
+  std::shared_ptr<std::atomic<std::size_t>> staging_live =
+      std::make_shared<std::atomic<std::size_t>>();
   bool in_pass{};
   bool partial{};
   std::size_t alignment{1};
@@ -138,6 +155,7 @@ public:
     resources->adapter = std::make_unique<FakeAdapter>(rows_per_chunk);
     adapter = dynamic_cast<FakeAdapter*>(resources->adapter.get());
     adapter->SetRetainRows(retain_rows);
+    adapter->SetStableAppends(stable_appends);
     adapter->SetRetainedRowUnits(retained_row_limit, retained_tokens_per_row,
                                  retained_row_first);
     adapter->SetRetainedDraftRange(retained_draft_first, retained_draft_end);
@@ -181,10 +199,28 @@ public:
       }
       throw cache::ResourceExhausted();
     };
-    resources->staging = [](std::size_t size) {
-      auto data = std::make_shared<std::vector<std::uint8_t>>(size);
+    resources->staging = [this, live = staging_live](std::size_t size) {
+      if (fail_staging)
+        throw std::bad_alloc();
+      auto* bytes = new std::vector<std::uint8_t>(size);
+      *live += size;
+      auto data = std::shared_ptr<std::vector<std::uint8_t>>(
+          bytes, [live, size](auto* p) {
+            *live -= size;
+            delete p;
+          });
       return cache::StagingAllocation{data, *data};
     };
+    resources->reassignment_snapshot_bytes = snapshot_bytes;
+    resources->reassignment_snapshot_arena_bytes = snapshot_arena_bytes;
+    resources->reassignment_snapshot_idle = snapshot_idle;
+    resources->snapshot_room = snapshot_room;
+    if (refuse_capture)
+      resources->can_capture = [](auto requests) {
+        return std::ranges::none_of(requests, [](const auto& request) {
+          return request.category == cache::ResourceCategory::kBackingAssigned;
+        });
+      };
     resources->copy_observed_rows = [](auto source, auto destination,
                                        cache::Stream& stream) {
       return dynamic_cast<FakeStream&>(stream).Submit([source, destination] {
@@ -2539,14 +2575,31 @@ struct WriterGate {
     };
   }
 };
+// Polls until the runner's live staging bytes are `bytes`.
+bool WaitForStaging(const Runner& runner, std::size_t bytes) {
+  for (int i = 0; i < 1000; ++i) {
+    if (runner.staging_live->load() == bytes)
+      return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return false;
+}
 void HeldReassignmentWritesOnTheWriter() {
   // A frontier RAM cannot hold (8192 rows per append component, 2048 backing
-  // blocks) sits in the only idle slot when another prompt is admitted. The
+  // blocks) sits in the only idle slot when another prompt is admitted, and
+  // cannot be snapshot to host memory: the allocation fails, snapshots are
+  // disabled, a transfer stream fails mid-batch, or the host has no room. The
   // admission check hands the slot to the disk writer instead of writing on
   // the scheduler thread, and keeps the request that needs the slot waiting;
   // the other slot keeps running. Once written, the slot is admitted and the
-  // frontier restores after a restart.
-  for (const bool lend : {true, false}) {
+  // frontier restores after a restart. Snapshot memory is returned.
+  for (const std::string_view reason :
+       {"allocation_failed", "disabled", "copy_failed", "host_memory"}) {
+    const bool lend = reason == "allocation_failed" || reason == "copy_failed";
+    const auto previous_level = Logger::Level();
+    Logger::SetLevel(LogLevel::kInfo);
+    std::ostringstream output;
+    auto* previous_sink = std::clog.rdbuf(output.rdbuf());
     const TemporaryDirectory temp("gufo-component-held-reassignment");
     const std::filesystem::path directory = temp.path();
     const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
@@ -2556,7 +2609,14 @@ void HeldReassignmentWritesOnTheWriter() {
     const std::vector<TextRunnerToken> side(12, 5), other(12, 6);
     {
       auto runner = std::make_shared<Runner>();
+      if (reason == "disabled")
+        runner->snapshot_bytes = 0;
+      if (reason == "host_memory")
+        runner->snapshot_room = [](std::size_t) { return false; };
+      runner->snapshot_idle = std::chrono::milliseconds(20);
       ComponentTextCache cache(runner, 2, 1 << 24, disk);
+      const auto staged = runner->staging_live->load();
+      runner->fail_staging = reason == "allocation_failed";
       if (!lend)
         runner->adapter->LimitBorrowedRows(1);
       (void)LiveTurn(cache, *runner, conversation);
@@ -2564,7 +2624,18 @@ void HeldReassignmentWritesOnTheWriter() {
       auto running = cache.Acquire(side, {}, {}, true, 0, true);
       WriterGate gate;
       runner->background_stream = gate.Hook();
+      // The sixth stream of the snapshot copy (in its second batch of four)
+      // cannot be leased.
+      std::size_t streams = 0;
+      std::function<void()> lose_stream = [&] {
+        if (++streams == 6)
+          throw std::runtime_error("stream lost");
+        runner->on_stream = lose_stream;
+      };
+      if (reason == "copy_failed")
+        runner->on_stream = lose_stream;
       assert(!cache.PrepareAdmission(other, nullptr, true, 0));
+      assert(reason != "copy_failed" || streams == 6);
       assert(gate.entered.try_acquire_for(std::chrono::seconds(10)));
       // The scheduler thread returned while the write is in flight; the
       // request needing that slot still waits, the running one progresses.
@@ -2576,7 +2647,22 @@ void HeldReassignmentWritesOnTheWriter() {
       assert(WaitForAdmission(cache, other));
       (void)LiveTurn(cache, *runner, other);
       runner->background_stream = {};
+      // Arenas the failed copy used return to the pool and are freed idle.
+      assert(WaitForStaging(*runner, staged));
+      runner->fail_staging = false;
     }
+    std::clog.rdbuf(previous_sink);
+    Logger::SetLevel(previous_level);
+    const auto log = output.str();
+    assert(
+        log.find("event=slot_snapshot_fallback reason=" + std::string(reason) +
+                 " slot=1 tokens=8192") != std::string::npos);
+    assert(log.find("held_write=true") != std::string::npos);
+    assert(log.find("event=slot_snapshot ") == std::string::npos);
+    assert((reason == "copy_failed") ==
+           (log.find("event=slot_snapshot_copy_failed") != std::string::npos));
+    assert((reason == "copy_failed") ==
+           (log.find("event=slot_snapshot_released") != std::string::npos));
     auto runner = std::make_shared<Runner>();
     {
       ComponentTextCache cache(runner, 1, 1 << 24, disk);
@@ -2591,22 +2677,407 @@ void HeldReassignmentWritesOnTheWriter() {
   }
 }
 void FailedHeldWriteIsNotRetriedForever() {
-  // A held reassignment write the disk can never take (the frontier exceeds
-  // the whole disk budget) fails once; admission then proceeds without
-  // handing the same frontier to the writer again.
-  const TemporaryDirectory temp("gufo-component-held-failure");
-  const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
-                                        .capacity_bytes = 1024};
-  std::vector<TextRunnerToken> conversation(8192);
-  std::iota(conversation.begin(), conversation.end(), 10);
-  const std::vector<TextRunnerToken> side(12, 5), other(12, 6);
+  // A reassignment write the disk can never take (the frontier exceeds the
+  // whole disk budget) fails once, from a held slot or from a host snapshot
+  // (whose memory it then frees); admission then proceeds without handing
+  // the same frontier to the writer again.
+  for (const bool snapshot : {false, true}) {
+    const TemporaryDirectory temp("gufo-component-held-failure");
+    const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
+                                          .capacity_bytes = 1024};
+    std::vector<TextRunnerToken> conversation(8192);
+    std::iota(conversation.begin(), conversation.end(), 10);
+    const std::vector<TextRunnerToken> side(12, 5), other(12, 6);
+    auto runner = std::make_shared<Runner>();
+    if (!snapshot)
+      runner->snapshot_bytes = 0;
+    runner->snapshot_idle = std::chrono::milliseconds(20);
+    ComponentTextCache cache(runner, 2, 1 << 24, disk);
+    const auto staged = runner->staging_live->load();
+    (void)LiveTurn(cache, *runner, conversation);
+    auto running = cache.Acquire(side, {}, {}, true, 0, true);
+    assert(WaitForAdmission(cache, other));
+    assert(WaitForStaging(*runner, staged));
+    running->Invalidate();
+    (void)LiveTurn(cache, *runner, other);
+  }
+}
+void ReassignmentSnapshotReleasesTheSlotBeforeTheWrite() {
+  // Two deep frontiers RAM cannot hold sit in idle slots while a third slot
+  // runs a request. Room for one reassignment snapshot fits only the
+  // smaller: the deeper one, reassigned first, keeps its slot for the writer
+  // (cap reached), and that write stalls on the writer. The smaller is
+  // reassigned next: admission copies it to host memory (four page-aligned
+  // pieces per 16 KiB arena, four arenas), releases its slot at once, and its
+  // write queues behind the stalled one. The new request runs in that slot
+  // meanwhile, with no second capture of the frontier. Both frontiers
+  // restore byte for byte after a restart, and the snapshot memory is freed
+  // once written and idle.
+  const TemporaryDirectory temp("gufo-component-reassignment-snapshot");
+  const std::filesystem::path directory = temp.path();
+  const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                        .capacity_bytes = 1 << 22};
+  std::vector<TextRunnerToken> deep(8192), shallow(6000);
+  std::iota(deep.begin(), deep.end(), 10);
+  std::iota(shallow.begin(), shallow.end(), 100000);
+  const std::vector<TextRunnerToken> side(12, 5), first(12, 6), second(12, 8);
+  std::uint64_t deep_hash{}, shallow_hash{};
+  const auto previous_level = Logger::Level();
+  Logger::SetLevel(LogLevel::kInfo);
+  std::ostringstream output;
+  auto* previous_sink = std::clog.rdbuf(output.rdbuf());
+  {
+    auto runner = std::make_shared<Runner>();
+    // 4 KiB chunks. 6000 rows take 13 pieces (5 chunks and a tail per append
+    // component, and the recurrent state), 48032 bytes in four arenas; 8192
+    // rows take 17 pieces in five.
+    runner->rows_per_chunk = 1024;
+    runner->refuse_capture = true;
+    runner->snapshot_arena_bytes = 16 << 10;
+    runner->snapshot_bytes = 72 << 10;
+    runner->snapshot_idle = std::chrono::milliseconds(20);
+    ComponentTextCache cache(runner, 3, 1 << 24, disk);
+    const auto staged = runner->staging_live->load();
+    const auto hash = [&](const std::vector<TextRunnerToken>& tokens) {
+      auto next = tokens;
+      next.push_back(7);
+      auto lease = cache.Acquire(next, {}, {}, true, 0, true);
+      assert(lease->cached_tokens() == tokens.size());
+      const auto value = runner->adapter->RecurrentHash(
+          dynamic_cast<State&>(lease->state()).slot);
+      (void)lease->Commit({}, {}, tokens);
+      return value;
+    };
+    (void)LiveTurn(cache, *runner, deep);
+    (void)LiveTurn(cache, *runner, shallow);
+    deep_hash = hash(deep);
+    shallow_hash = hash(shallow);
+    auto running = cache.Acquire(side, {}, {}, true, 0, true);
+    WriterGate gate;
+    runner->background_stream = gate.Hook();
+    assert(!cache.PrepareAdmission(first, nullptr, true, 0));
+    assert(gate.entered.try_acquire_for(std::chrono::seconds(10)));
+    // The writer is stalled on the held write; the snapshot does not wait.
+    assert(cache.PrepareAdmission(second, nullptr, true, 0));
+    assert(runner->staging_live->load() == staged + (64 << 10));
+    const auto captures = output.str();
+    {
+      auto lease = cache.Acquire(second, {}, {}, true, 0, true);
+      assert(lease->cached_tokens() == 0);
+      auto& state = dynamic_cast<State&>(lease->state());
+      runner->adapter->Append(state.slot, second, second);
+      (void)lease->Commit({}, {}, second);
+    }
+    // Acquire captured nothing more: the queued snapshot covers the frontier.
+    assert(output.str().find("live_frontier_capture", captures.size()) ==
+           std::string::npos);
+    gate.release.release();
+    assert(WaitForAdmission(cache, first));
+    assert(WaitForStaging(*runner, staged));
+    running->Invalidate();
+    runner->background_stream = {};
+  }
+  std::clog.rdbuf(previous_sink);
+  Logger::SetLevel(previous_level);
+  const auto log = output.str();
+  assert(log.find("event=slot_snapshot_fallback reason=cap slot=") !=
+         std::string::npos);
+  assert(log.find("event=slot_snapshot slot=") != std::string::npos);
+  assert(log.find(" tokens=6000 bytes=48032 ms=") != std::string::npos);
+  assert(log.find(" arenas=4 reused_bytes=0 allocated_bytes=65536") !=
+         std::string::npos);
+  assert(log.find("event=slot_snapshot_released") != std::string::npos);
+  assert(log.find("charged_bytes=0") != std::string::npos);
   auto runner = std::make_shared<Runner>();
-  ComponentTextCache cache(runner, 2, 1 << 24, disk);
-  (void)LiveTurn(cache, *runner, conversation);
-  auto running = cache.Acquire(side, {}, {}, true, 0, true);
-  assert(WaitForAdmission(cache, other));
-  running->Invalidate();
-  (void)LiveTurn(cache, *runner, other);
+  runner->rows_per_chunk = 1024;
+  {
+    ComponentTextCache cache(runner, 1, 1 << 24, disk);
+    for (const auto* tokens : {&deep, &shallow}) {
+      auto next = *tokens;
+      next.push_back(7);
+      auto lease = cache.Acquire(next, {}, {}, true, 0, true);
+      assert(lease->cached_tokens() == tokens->size() &&
+             lease->restored_from_disk());
+      const auto& slot = dynamic_cast<State&>(lease->state()).slot;
+      assert(std::ranges::equal(runner->adapter->TargetRows(slot), *tokens));
+      assert(runner->adapter->RecurrentHash(slot) ==
+             (tokens == &deep ? deep_hash : shallow_hash));
+      lease->Invalidate();
+    }
+  }
+  std::filesystem::remove_all(directory);
+}
+void SnapshotHostsRowsQueuedJobsObserve() {
+  // A conversation's two prompt checkpoints, larger than RAM, go to the disk
+  // writer reading their rows from the slot (observed rows): the first is
+  // writing, stopped after reading two of its pieces, and the second is
+  // queued behind it. The conversation's generated frontier is then
+  // reassigned: its snapshot also gives both jobs host copies of the rows
+  // they observe, shared with its own pieces (all of them here), before the
+  // slot is reset for the new request. When the snapshot is refused, the
+  // held write gives those rows host copies of their own (read again), or,
+  // without room for them either, waits its turn behind the jobs reading
+  // them. All three checkpoints publish, none incomplete, and each restores
+  // byte for byte after a restart.
+  for (const std::string_view mode : {"snapshot", "held_hosted", "in_order"}) {
+    const TemporaryDirectory temp("gufo-component-snapshot-observed");
+    const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
+                                          .capacity_bytes = 1 << 22,
+                                          .min_checkpoint_step_tokens = 1};
+    std::vector<TextRunnerToken> prompt(6144), generated(100);
+    std::iota(prompt.begin(), prompt.end(), 10);
+    std::iota(generated.begin(), generated.end(), 50000);
+    const std::vector<TextRunnerToken> half(prompt.begin(),
+                                            prompt.begin() + 3072);
+    auto live = prompt;
+    live.insert(live.end(), generated.begin(), generated.end());
+    const std::vector<TextRunnerToken> side(12, 5), other(12, 6);
+    std::uint64_t half_hash{}, prompt_hash{}, live_hash{};
+    const auto previous_level = Logger::Level();
+    Logger::SetLevel(LogLevel::kInfo);
+    std::ostringstream output;
+    auto* previous_sink = std::clog.rdbuf(output.rdbuf());
+    {
+      auto runner = std::make_shared<Runner>();
+      runner->rows_per_chunk = 1024;
+      runner->refuse_capture = true;
+      runner->stable_appends = true;
+      runner->snapshot_arena_bytes = 16 << 10;
+      if (mode == "held_hosted")
+        // The host has no room for the frontier, then room again.
+        runner->snapshot_room = [calls = 0](std::size_t) mutable {
+          return calls++ > 0;
+        };
+      if (mode == "in_order")
+        runner->snapshot_bytes = 0;
+      ComponentTextCache cache(runner, 2, 1 << 24, disk);
+      // The writer stops at its third device read.
+      std::atomic<int> reads{};
+      std::binary_semaphore entered{0}, release{0};
+      runner->background_stream = [&] {
+        if (++reads == 3) {
+          entered.release();
+          release.acquire();
+        }
+      };
+      auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+      auto& state = dynamic_cast<State&>(lease->state());
+      const auto checkpoint = [&](const std::vector<TextRunnerToken>& tokens) {
+        assert(lease->TryReserveSnapshot(lease->CaptureBytes(), tokens.size(),
+                                         false, SnapshotPurpose::kContinuation,
+                                         tokens));
+        const auto queued = lease->Metrics().disk_queued_bytes;
+        (void)lease->PublishSnapshot(tokens, lease->Capture(), false);
+        assert(lease->Metrics().disk_queued_bytes > queued);
+      };
+      runner->adapter->Append(state.slot, half, half);
+      half_hash = runner->adapter->RecurrentHash(state.slot);
+      checkpoint(half);
+      assert(entered.try_acquire_for(std::chrono::seconds(10)));
+      const auto rest = std::span(prompt).subspan(half.size());
+      runner->adapter->Append(state.slot, rest, rest);
+      prompt_hash = runner->adapter->RecurrentHash(state.slot);
+      checkpoint(prompt);
+      runner->adapter->Append(state.slot, generated, generated);
+      live_hash = runner->adapter->RecurrentHash(state.slot);
+      (void)lease->Commit({}, {}, live);
+      lease.reset();
+      auto running = cache.Acquire(side, {}, {}, true, 0, true);
+      // A held write keeps the slot until it has read it.
+      assert(cache.PrepareAdmission(other, nullptr, true, 0) ==
+             (mode == "snapshot"));
+      if (mode != "snapshot") {
+        release.release();
+        assert(WaitForAdmission(cache, other));
+      }
+      (void)LiveTurn(cache, *runner, other);
+      if (mode == "snapshot")
+        release.release();
+      running->Invalidate();
+    }
+    std::clog.rdbuf(previous_sink);
+    Logger::SetLevel(previous_level);
+    const auto log = output.str();
+    assert(log.find("event=persistence_incomplete") == std::string::npos);
+    // Each foreground step is timed.
+    if (mode == "snapshot")
+      for (const auto* field :
+           {" queue_ms=", " plan_ms=", " alloc_ms=", " copy_ms=", " attach_ms=",
+            " sources_ms=", " pieces=15 "})
+        assert(log.find(field) != std::string::npos);
+    // Two components observed by each job, every row shared, or read again.
+    assert(log.find(mode == "snapshot"
+                        ? " observed_rows=4 shared_bytes=73728 extra_bytes=0"
+                    : mode == "held_hosted"
+                        ? "event=held_write_observed_rows slot=1 tokens=6244 "
+                          "observed_rows=4 extra_bytes=73728"
+                        : "event=held_write_observed_rows slot=1 tokens=6244 "
+                          "in_order=true reason=disabled") !=
+           std::string::npos);
+    auto runner = std::make_shared<Runner>();
+    runner->rows_per_chunk = 1024;
+    ComponentTextCache cache(runner, 1, 1 << 24, disk);
+    using Expected =
+        std::pair<const std::vector<TextRunnerToken>*, std::uint64_t>;
+    for (const auto& [tokens, hash] :
+         {Expected{&half, half_hash}, Expected{&prompt, prompt_hash},
+          Expected{&live, live_hash}}) {
+      auto next = *tokens;
+      next.push_back(7);
+      auto lease = cache.Acquire(next, {}, {}, true, 0, true);
+      assert(lease->cached_tokens() == tokens->size() &&
+             lease->restored_from_disk());
+      const auto& slot = dynamic_cast<State&>(lease->state()).slot;
+      assert(std::ranges::equal(runner->adapter->TargetRows(slot), *tokens));
+      assert(runner->adapter->RecurrentHash(slot) == hash);
+      lease->Invalidate();
+    }
+  }
+}
+void SnapshotArenasArePooledAndReused() {
+  // A snapshot's arenas return to the pool once written: the next snapshot
+  // of the same size allocates nothing, and they stay pinned until they have
+  // been idle for the configured time. Destroying the cache frees them.
+  const TemporaryDirectory temp("gufo-component-snapshot-pool");
+  const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
+                                        .capacity_bytes = 1 << 22};
+  std::vector<TextRunnerToken> a(6000), b(6000);
+  std::iota(a.begin(), a.end(), 10);
+  std::iota(b.begin(), b.end(), 100000);
+  const std::vector<TextRunnerToken> side(12, 5), first(12, 6), second(12, 8);
+  const auto previous_level = Logger::Level();
+  Logger::SetLevel(LogLevel::kInfo);
+  std::ostringstream output;
+  auto* previous_sink = std::clog.rdbuf(output.rdbuf());
+  auto runner = std::make_shared<Runner>();
+  runner->rows_per_chunk = 1024;
+  runner->refuse_capture = true;
+  runner->snapshot_arena_bytes = 16 << 10;
+  {
+    ComponentTextCache cache(runner, 2, 1 << 24, disk);
+    const auto staged = runner->staging_live->load();
+    const auto written = [&](const std::vector<TextRunnerToken>& tokens) {
+      for (int i = 0; i < 1000; ++i) {
+        if (cache.CachedPrefixTokens(tokens, nullptr) != 0)
+          return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      return false;
+    };
+    (void)LiveTurn(cache, *runner, a);
+    auto running = cache.Acquire(side, {}, {}, true, 0, true);
+    assert(cache.PrepareAdmission(first, nullptr, true, 0));
+    (void)LiveTurn(cache, *runner, first);
+    assert(written(a));
+    (void)LiveTurn(cache, *runner, b);
+    assert(cache.PrepareAdmission(second, nullptr, true, 0));
+    (void)LiveTurn(cache, *runner, second);
+    assert(written(b));
+    // Pooled, not freed: the default idle time is a minute.
+    assert(runner->staging_live->load() == staged + (64 << 10));
+    running->Invalidate();
+  }
+  assert(runner->staging_live->load() == 0);
+  std::clog.rdbuf(previous_sink);
+  Logger::SetLevel(previous_level);
+  const auto log = output.str();
+  assert(log.find(" arenas=4 reused_bytes=0 allocated_bytes=65536") !=
+         std::string::npos);
+  assert(log.find(" arenas=4 reused_bytes=65536 allocated_bytes=0") !=
+         std::string::npos);
+  assert(log.find("event=slot_snapshot_released") == std::string::npos);
+  auto restarted = std::make_shared<Runner>();
+  restarted->rows_per_chunk = 1024;
+  ComponentTextCache cache(restarted, 1, 1 << 24, disk);
+  for (const auto* tokens : {&a, &b}) {
+    auto next = *tokens;
+    next.push_back(7);
+    auto lease = cache.Acquire(next, {}, {}, true, 0, true);
+    assert(lease->cached_tokens() == tokens->size() &&
+           lease->restored_from_disk());
+    assert(std::ranges::equal(restarted->adapter->TargetRows(
+                                  dynamic_cast<State&>(lease->state()).slot),
+                              *tokens));
+    lease->Invalidate();
+  }
+}
+void SnapshotPoolCountsEvictsAndTrims() {
+  // The pool's charge counts every arena it allocated, pooled or in use.
+  // A partly failed allocation keeps what it made pooled; a cap refusal may
+  // first give up pooled arenas of other sizes, which the trim thread frees;
+  // idle arenas are freed and the charge returns to zero.
+  constexpr std::size_t kKiB = 1024;
+  auto live = std::make_shared<std::atomic<std::size_t>>();
+  std::atomic<int> fail_after{-1};
+  std::atomic<std::size_t> allocations{};
+  const auto allocate = [&, live](std::size_t bytes) {
+    if (fail_after.load() == 0)
+      throw std::bad_alloc();
+    if (fail_after.load() > 0)
+      --fail_after;
+    ++allocations;
+    *live += bytes;
+    auto data = std::shared_ptr<std::vector<std::uint8_t>>(
+        new std::vector<std::uint8_t>(bytes), [live, bytes](auto* p) {
+          *live -= bytes;
+          delete p;
+        });
+    return cache::StagingAllocation{data, *data};
+  };
+  const auto wait_live = [&](std::size_t bytes) {
+    for (int i = 0; i < 1000 && live->load() != bytes; ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    return live->load() == bytes;
+  };
+  {
+    // Partial allocation failure: the first new arena stays pooled, is
+    // reused, and is trimmed once idle.
+    auto pool = std::make_shared<SnapshotPool>(
+        64 * kKiB, std::chrono::milliseconds(50), allocate);
+    const std::array<std::size_t, 3> three{16 * kKiB, 16 * kKiB, 16 * kKiB};
+    fail_after = 1;
+    auto failed = pool->Take(three, {});
+    assert(failed.refused == "allocation_failed" && failed.arenas.empty());
+    assert(pool->Charged() == 16 * kKiB && live->load() == 16 * kKiB);
+    fail_after = -1;
+    const std::array<std::size_t, 1> one{16 * kKiB};
+    auto reused = pool->Take(one, {});
+    assert(reused.refused.empty() && reused.reused == 16 * kKiB &&
+           reused.allocated == 0 && allocations == 1);
+    reused = {};
+    assert(wait_live(0));
+    assert(pool->Charged() == 0);
+  }
+  {
+    // A room refusal gives up nothing.
+    auto pool = std::make_shared<SnapshotPool>(64 * kKiB, std::chrono::hours(1),
+                                               allocate);
+    const std::array<std::size_t, 1> small{16 * kKiB}, large{48 * kKiB},
+        middle{32 * kKiB};
+    (void)pool->Take(small, {});
+    assert(pool->Charged() == 16 * kKiB);
+    auto refused = pool->Take(large, [](std::size_t) { return false; });
+    assert(refused.refused == "host_memory");
+    assert(pool->Charged() == 16 * kKiB && live->load() == 16 * kKiB);
+    // Room for 48 KiB evicts the pooled 16 KiB arena only if needed: it
+    // fits beside it.
+    auto held = pool->Take(large, {});
+    assert(held.refused.empty() && held.allocated == 48 * kKiB);
+    assert(pool->Charged() == 64 * kKiB);
+    // 32 KiB does not fit even without the pooled arena: refused, after
+    // that arena was given up and freed by the trim thread.
+    auto capped = pool->Take(middle, {});
+    assert(capped.refused == "cap");
+    assert(pool->Charged() == 48 * kKiB);
+    assert(wait_live(48 * kKiB));
+    // Over the whole cap: refused without giving anything up.
+    const std::array<std::size_t, 1> huge{80 * kKiB};
+    assert(pool->Take(huge, {}).refused == "cap");
+    assert(pool->Charged() == 48 * kKiB);
+    held = {};
+    // Freed with the pool.
+  }
+  assert(live->load() == 0);
 }
 void HeldTryIsPerExecution() {
   // A failed held write marks only that execution's frontier. Another
@@ -2620,6 +3091,7 @@ void HeldTryIsPerExecution() {
   std::iota(second.begin(), second.end(), 20000);
   const std::vector<TextRunnerToken> side(12, 5), other(12, 6);
   auto runner = std::make_shared<Runner>();
+  runner->snapshot_bytes = 0;
   ComponentTextCache cache(runner, 2, 1 << 24, disk);
   (void)LiveTurn(cache, *runner, first);
   auto running = cache.Acquire(side, {}, {}, true, 0, true);
@@ -4316,6 +4788,10 @@ int main() {
   OverRamCaptureStagesPrivateStateUnderPressure(false);
   OverRamCaptureStagesPrivateStateUnderPressure(true);
   HeldReassignmentWritesOnTheWriter();
+  ReassignmentSnapshotReleasesTheSlotBeforeTheWrite();
+  SnapshotHostsRowsQueuedJobsObserve();
+  SnapshotArenasArePooledAndReused();
+  SnapshotPoolCountsEvictsAndTrims();
   FailedHeldWriteIsNotRetriedForever();
   HeldTryIsPerExecution();
   SchedulerAdmitsOthersWhileASlotIsHeld();

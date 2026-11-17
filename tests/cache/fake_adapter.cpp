@@ -609,13 +609,32 @@ void FakeAdapter::Append(Slot& slot, std::span<const Token> target,
       AdvanceHash(state.recurrent[2], new_target, state.target.size());
   const auto draft_hash =
       AdvanceHash(state.recurrent[3], new_draft, state.draft.size());
-  state.guard_.BeforeOverwrite(kTarget, 0, new_target.size());
-  state.guard_.BeforeOverwrite(kDraft, 0, new_draft.size());
+  if (stable_appends_) {
+    // Rows stay where they are, as on a device: only appended rows change,
+    // unless the storage must grow.
+    constexpr std::size_t kRows = 1 << 16;
+    if (state.target.empty() && state.target.capacity() < kRows)
+      state.target.reserve(kRows);
+    if (state.draft.empty() && state.draft.capacity() < kRows)
+      state.draft.reserve(kRows);
+  }
+  const bool stable = stable_appends_ &&
+                      state.target.capacity() >= new_target.size() &&
+                      state.draft.capacity() >= new_draft.size();
+  state.guard_.BeforeOverwrite(kTarget, stable ? state.target.size() : 0,
+                               new_target.size());
+  state.guard_.BeforeOverwrite(kDraft, stable ? state.draft.size() : 0,
+                               new_draft.size());
   if (state.Busy())
     throw std::logic_error(
         "guard returned with preservation transfers pending");
-  state.target = std::move(new_target);
-  state.draft = std::move(new_draft);
+  if (stable) {
+    state.target.insert(state.target.end(), target.begin(), target.end());
+    state.draft.insert(state.draft.end(), draft.begin(), draft.end());
+  } else {
+    state.target = std::move(new_target);
+    state.draft = std::move(new_draft);
+  }
   state.recurrent = {state.target.size(), state.draft.size(), target_hash,
                      draft_hash};
 }

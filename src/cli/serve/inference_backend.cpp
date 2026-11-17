@@ -1265,6 +1265,29 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
                                        request.end, request.bytes, source));
         }};
   };
+  result->snapshot_room = [pending_memory](std::size_t bytes) {
+    // As backing growth: a host snapshot pins pages from the device heap too.
+    const auto pending = pending_memory ? pending_memory() : 0;
+    const auto host_ceiling = HostSnapshotCeilingBytes();
+    std::size_t heap_free = 0, heap_total = 0;
+    return host_ceiling > pending && host_ceiling - pending >= bytes &&
+           hipMemGetInfo(&heap_free, &heap_total) == hipSuccess &&
+           heap_free >= pending &&
+           hip::HeapFitsAboveReserve(heap_free - pending, bytes);
+  };
+  result->snapshot_allocate = [](std::size_t bytes) {
+    // Pinned by hipHostMalloc itself: no page registration, and no memset,
+    // since the snapshot copy writes every byte the writer reads.
+    void* data = nullptr;
+    const auto status = hipHostMalloc(&data, bytes, hipHostMallocCoherent);
+    if (status != hipSuccess)
+      throw std::runtime_error(hipGetErrorString(status));
+    // Frees `data` itself if it cannot allocate its control block.
+    auto owner =
+        std::shared_ptr<void>(data, [](void* p) { (void)hipHostFree(p); });
+    return cache::StagingAllocation{std::move(owner),
+                                    {static_cast<std::uint8_t*>(data), bytes}};
+  };
   result->staging = [](std::size_t bytes) {
     auto allocation = std::make_shared<hip::HostAllocations>();
     void* data = nullptr;
