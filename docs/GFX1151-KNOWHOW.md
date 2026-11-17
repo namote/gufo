@@ -557,7 +557,8 @@
     | 4 | — | 17.7 / 18.5 / 18.8 / 19.6 (74.6 total) |
   - Host `MemAvailable` with the server ready: 26.8 GB (2 sessions) → 8.6 GB (4 sessions); the two extra 1M sessions reserve ~9 GB each at startup. The rest must hold RAM-cache growth (≤ 4 GiB) and a reassignment snapshot (≤ ~3.3 GB pinned); when host room is short the snapshot falls back to the held write (C waits ~30 s again).
   - Not measured: peer decode gaps while a third or fourth slot prefills a long prompt.
-  - **Result:** production runs 4 sessions (user, same day). Rollback `~/projects/_backup/gufo-server-20261117-before-4-sessions/`.
+  - **Result:** production runs 4 sessions (user, same day).
+  - Emergency buffer: 8 GiB zstd zram swap (`/etc/systemd/system/zram-swap.service`, enabled at boot). No disk swap file: it would drop free disk below the 100 GiB the supervisor requires. Only ordinary pages can swap; the server's pinned and GPU memory cannot. Rollback `~/projects/_backup/gufo-server-20261117-before-4-sessions/`.
 - **Combined pass for the steering-API runtime** (8c45bd3d against production runtime-20261112a; `build/b1/pass-20261114/`, November 14).
   - Setup: the production config (YaRN 1M, K4V4, MTP 7, 2 sessions, `--reasoning-effort low`), the R2-3 scripts (`ab.py`, `detect.py`). Runs alternated prod, cand, prod, cand. Host preflight failed only on fragmentation (order ≥ 9 free blocks 29,174).
   - Decode, tok/s, 256 tokens, 4 runs each:
