@@ -231,6 +231,22 @@ public:
     reserved_ += count;
     return {this, count};
   }
+  /// Sets `reservation` (empty, or of this allocator) to hold exactly
+  /// `count` blocks, taking only the difference from free unreserved blocks.
+  /// False, leaving the reservation unchanged, when they fall short.
+  [[nodiscard]] bool TryResize(KvBlockReservation& reservation,
+                               std::uint32_t count) {
+    if (reservation.allocator_ != nullptr && reservation.allocator_ != this)
+      throw std::invalid_argument("KV block reservation of another pool");
+    const std::lock_guard lock(mutex_);
+    const std::uint32_t held = reservation.blocks_;
+    if (count > held && count - held > free_ - reserved_)
+      return false;
+    reserved_ = reserved_ - held + count;
+    reservation.allocator_ = count != 0 ? this : nullptr;
+    reservation.blocks_ = count;
+    return true;
+  }
   /// One more reference to each block; every block must be taken.
   void Retain(std::span<const std::uint32_t> blocks) {
     const std::lock_guard lock(mutex_);

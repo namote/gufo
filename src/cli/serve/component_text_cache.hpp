@@ -249,10 +249,15 @@ private:
   // goes to the queue worker as a host snapshot, or else keeps the slot for
   // it, and the result is true while that held write is queued: the slot is
   // not the caller's to reset then.
+  // With `disk_only`, no RAM checkpoint is published: one that retains device
+  // rows would keep the very rows a row-capacity reset is to return. `held`
+  // reports whether a held write took the slot (queued or not): the caller
+  // must not reset it then.
   bool CaptureBeforeReset(std::size_t index, cache::BorrowedLocation location,
                           std::vector<cache::Token> tokens,
                           cache::InputIdentity input, std::string_view reason,
-                          bool hold) noexcept;
+                          bool hold, bool disk_only = false,
+                          bool* held = nullptr) noexcept;
   std::unique_ptr<Impl> impl_;
 };
 

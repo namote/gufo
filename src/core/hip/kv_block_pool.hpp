@@ -43,6 +43,10 @@ public:
   [[nodiscard]] KvBlockReservation TryReserve(std::uint32_t count) {
     return allocator_.TryReserve(count);
   }
+  [[nodiscard]] bool TryResize(KvBlockReservation& reservation,
+                               std::uint32_t count) {
+    return allocator_.TryResize(reservation, count);
+  }
   void Retain(std::span<const std::uint32_t> blocks) {
     allocator_.Retain(blocks);
   }

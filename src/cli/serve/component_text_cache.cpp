@@ -103,6 +103,9 @@ struct DurableCapture {
   // Its sources are a host snapshot of a slot reset right after (the only
   // copy of that state).
   bool host_snapshot{};
+  // Some sources are device rows the adapter retains for this write
+  // (RetainRows); they return to a shared pool when it ends.
+  bool device_rows{};
   // A held write that may start before older jobs (KeepUnderPressure).
   // False when older jobs still read rows of the slot it holds, which its
   // release would let a reset retire.
@@ -452,6 +455,20 @@ struct ComponentTextCache::Impl {
   std::array<std::shared_ptr<DurableCapture>, 2 * kPersistenceDepth>
       pending_durable;
   std::size_t disk_capacity{}, disk_step{};
+  // Under the mutex: a queued or active disk job reads device rows kept for
+  // it (a RAM checkpoint's device chunks, a disk-only capture's retained
+  // rows), which return to a shared pool when it ends.
+  [[nodiscard]] bool WritesHoldDeviceRows() const {
+    for (const auto& checkpoint : pending)
+      if (checkpoint)
+        for (const auto& c : checkpoint->Components())
+          for (const auto& chunk : c.chunks)
+            if (chunk.Storage().OnDevice())
+              return true;
+    return std::ranges::any_of(pending_durable, [](const auto& capture) {
+      return capture && capture->device_rows;
+    });
+  }
   // The cache's own RAM budget. The ledger limit adds what the slots pinned.
   std::size_t budget{};
   // Components whose completed chunks the adapter retains in device storage.
@@ -470,7 +487,7 @@ struct ComponentTextCache::Impl {
   Impl(std::shared_ptr<TextModelRunner> runner, std::size_t count,
        std::size_t ram, std::size_t slot_ceiling,
        const std::optional<TextRunnerDiskCacheOptions>& options,
-       bool automatic_ram)
+       bool automatic_ram, std::size_t host_ceiling)
       : runner(std::move(runner)),
         // Disk transfers lease one fixed pinned staging buffer. Its size does
         // not change restore or write speed (#562), and a larger one only
@@ -560,9 +577,6 @@ struct ComponentTextCache::Impl {
     };
     std::size_t automatic_bytes{}, max_bytes{}, slot_pinned_bytes{};
     if (resources->commit_backing) {
-      // An explicit budget below the ceiling the slots allocated under.
-      const bool explicit_ram = !automatic_ram && ram < slot_ceiling;
-      const auto requested_ram = ram;
       const auto claim = this->runner->ResourceClaim();
       // The claim measures the host after the slots allocated, so bytes they
       // pinned are missing from it. Add them back: in full to the ceiling,
@@ -581,20 +595,27 @@ struct ComponentTextCache::Impl {
       // only if both fit under the ceiling.
       const auto staging = ledger.Limits().staging_bytes;
       max_bytes = ceiling > staging ? ceiling - staging : 0;
-      ram = std::min(ram, max_bytes);
+      // Backing commits segment by segment, each only while the host keeps
+      // its reserve (commit_backing's room check, rechecked as captures
+      // need more), so an explicit budget is a target the cache grows toward
+      // as host memory allows, not a cap from the momentary headroom at
+      // startup. Captures past what the host lets it commit evict older
+      // checkpoints or are refused. The automatic budget stays host-derived.
       if (automatic_ram)
-        ram = std::min(ram, automatic);
-      // Within the host ceiling and the limit the slots allocated under. Other
-      // charges above the budget are refused here, as without pins.
-      auto limit = std::min({ram + pinned, max_bytes, slot_ceiling});
-      // A host-derived limit (automatic, or below an explicit budget) must
-      // still leave admission its metadata room above what startup charged:
-      // keep that room and a minimal backing budget. Those charges are host
-      // memory already in use, and backing commits only when the host has
-      // room. An explicit budget that binds keeps its meaning.
+        ram = std::min({ram, max_bytes, automatic});
+      // Within the limit the slots allocated under (and, automatic, the host
+      // ceiling). Other charges above the budget are refused here, as
+      // without pins.
+      auto limit = std::min(ram + pinned, slot_ceiling);
+      if (automatic_ram)
+        limit = std::min(limit, max_bytes);
+      // A host-derived (automatic) limit must still leave admission its
+      // metadata room above what startup charged: keep that room and a
+      // minimal backing budget. Those charges are host memory already in
+      // use, and backing commits only when the host has room. An explicit
+      // budget keeps its meaning.
       const auto charged = ledger.Snapshot().ram_bytes;
-      const bool host_bound =
-          !explicit_ram || max_bytes < requested_ram + pinned;
+      const bool host_bound = automatic_ram;
       if (host_bound &&
           limit < SaturatingAdd(charged, kAdmissionMetadataBytes)) {
         const auto floor = SaturatingAdd(
@@ -617,6 +638,10 @@ struct ComponentTextCache::Impl {
     } else {
       // Slots allocated under the host ceiling; return to the budget. This
       // ignores pinned_bytes: a runner that pins must commit backing.
+      // Without committed backing nothing rechecks the host as the cache
+      // fills, so the startup host ceiling caps it.
+      if (host_ceiling != 0)
+        ram = std::min(ram, host_ceiling);
       load_disk_catalog();
       const auto staging = ledger.Limits().staging_bytes;
       ledger.ConstrainLimits({ram + staging, ram, staging, ram});
@@ -1163,6 +1188,9 @@ struct ComponentTextCache::Lease::Impl {
   // A copy of a live frontier (CaptureBeforeReset, WriteBackIdle), published
   // as CheckpointPurpose::kGenerated.
   bool live_frontier{};
+  // Capture writes only a disk checkpoint (CaptureDurable), never a RAM one
+  // (CaptureBeforeReset for a row-capacity reset of retained device rows).
+  bool disk_only{};
   std::vector<cache::Token> capture_tokens;
   ContinuationLookup lookup_result;
   ComponentCacheMetrics metrics;
@@ -1384,6 +1412,7 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
         auto retained = cache->resources->adapter->RetainRows(slot.Execution(),
                                                               d.id, first, end);
         if (retained.owner && retained.bytes >= bytes) {
+          durable->device_rows = true;
           auto owner = std::move(retained.owner);
           durable->sources.emplace_back(
               false, file, bytes, d.row_bytes, owner,
@@ -1498,6 +1527,7 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
     // Lent views, retained rows and staged copies taken above are released.
     copies.clear();
     durable->sources.clear();
+    durable->device_rows = false;
     const auto started = Clock::now();
     std::size_t bytes = 0;
     for (const auto& piece : all_pieces)
@@ -1546,6 +1576,7 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
     // views, retained rows and staged copies taken above are released.
     copies.clear();
     durable->sources.clear();
+    durable->device_rows = false;
     if (before_reset) {
       // The slot is reset once this write has read it. Rows older jobs
       // still read from it (a prompt-end capture) get host copies first; if
@@ -1885,8 +1916,8 @@ ComponentTextCache::ComponentTextCache(
     const std::optional<TextRunnerDiskCacheOptions>& disk, bool automatic_ram,
     std::size_t ceiling)
     : impl_(std::make_unique<Impl>(std::move(runner), count, ram,
-                                   std::max(ram, ceiling), disk,
-                                   automatic_ram)) {}
+                                   std::max(ram, ceiling), disk, automatic_ram,
+                                   ceiling)) {}
 bool ComponentTextCache::CapturesShareRows() const {
   const auto& adapter = *impl_->resources->adapter;
   return std::ranges::any_of(adapter.Components(), [&](const auto& d) {
@@ -1912,8 +1943,9 @@ bool ComponentTextCache::CaptureBeforeReset(std::size_t index,
                                             cache::BorrowedLocation location,
                                             std::vector<cache::Token> tokens,
                                             cache::InputIdentity input,
-                                            std::string_view reason,
-                                            bool hold) noexcept {
+                                            std::string_view reason, bool hold,
+                                            bool disk_only,
+                                            bool* held_out) noexcept {
   auto* entry = impl_->entries[index].get();
   const auto started = Clock::now();
   // A write-back still queued from this slot fails once the reset retires the
@@ -1945,6 +1977,7 @@ bool ComponentTextCache::CaptureBeforeReset(std::size_t index,
     lease.impl_->hold_slot = hold;
     // Only admission holds here: copy the state out instead where it can.
     lease.impl_->snapshot_slot = hold;
+    lease.impl_->disk_only = disk_only;
     lease.impl_->persist = persist;
     try {
       // Retry priority: the copy may only displace other optional copies,
@@ -1988,6 +2021,8 @@ bool ComponentTextCache::CaptureBeforeReset(std::size_t index,
   } catch (const std::exception& error) {
     log("live_frontier_capture_failed", std::string(" error=") + error.what());
   }
+  if (held_out)
+    *held_out = held;
   // A lease that could not be taken leaves the entry to the caller.
   if (!held) {
     const std::lock_guard lock(impl_->mutex);
@@ -2180,6 +2215,7 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
     const std::function<bool()>& enough, const TextPromptContext* context,
     std::size_t stable) {
   std::vector<const Impl::Entry*> visited;
+  bool observed = false;
   std::shared_ptr<const cache::Checkpoint> protected_checkpoint;
   std::optional<cache::BorrowedLocation> protected_live;
   {
@@ -2211,6 +2247,8 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
     Impl::Entry* entry = nullptr;
     std::size_t slot = 0, live_tokens = 0;
     std::optional<Impl::Uncovered> uncovered;
+    bool live = false;
+    cache::BorrowedLocation location{};
     {
       const std::lock_guard lock(impl_->mutex);
       const auto covered = [&](const Impl::Entry& e) {
@@ -2249,25 +2287,66 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
         continue;
       }
       if (!entry)
-        return busy ? RowReclaim::kWaiting : RowReclaim::kExhausted;
+        // Rows return later only from a busy slot, a slot a queued disk job
+        // still reads, or device rows a disk job keeps until it ends.
+        return busy || observed || impl_->WritesHoldDeviceRows()
+                   ? RowReclaim::kWaiting
+                   : RowReclaim::kExhausted;
       visited.push_back(entry);
       entry->busy = true;
-      // A checkpoint of rows retained on the device would keep the very rows
-      // this reset is to return, and a disk-only copy fails once the reset
-      // retires the rows it observes: the uncovered frontier is dropped.
+      location = entry->live_location;
+      live = bool(entry->live);
+    }
+    // A queued disk job may still read rows this slot lent it: resetting
+    // would wait on the scheduler thread for an active write, or fail a
+    // queued one. Leave the slot until the job ends.
+    if (live) {
+      bool lent = false;
+      try {
+        auto lease = entry->slot->Acquire(location);
+        lent = !lease.ObservedRows().empty();
+        lease.Commit();
+      } catch (...) {
+        lent = true;
+      }
+      if (lent) {
+        const std::lock_guard lock(impl_->mutex);
+        entry->busy = false;
+        observed = true;
+        continue;
+      }
+    }
+    {
+      // A RAM checkpoint of rows retained on the device would keep the very
+      // rows this reset is to return. With a disk cache, the uncovered
+      // frontier goes to disk alone instead, copied to host memory first
+      // (or written from the slot it then keeps until the writer has read
+      // it); without one it is dropped.
+      const std::lock_guard lock(impl_->mutex);
       uncovered = impl_->UncoveredLive(slot - 1);
-      if (uncovered && !impl_->device_components.empty()) {
+      if (uncovered && !impl_->device_components.empty() &&
+          (!impl_->queue || !entry->live_persist)) {
         Logger::Info("cache",
-                     "event=live_frontier_dropped reason=row_capacity slot=" +
+                     "event=live_frontier_dropped reason=row_capacity "
+                     "cause=no_disk_cache slot=" +
                          std::to_string(slot) +
                          " tokens=" + std::to_string(uncovered->tokens.size()));
         uncovered.reset();
       }
     }
-    if (uncovered)
-      CaptureBeforeReset(uncovered->index, uncovered->location,
-                         std::move(uncovered->tokens),
-                         std::move(uncovered->input), "row_capacity", false);
+    if (uncovered) {
+      const bool device_rows = !impl_->device_components.empty();
+      bool held = false;
+      (void)CaptureBeforeReset(uncovered->index, uncovered->location,
+                               std::move(uncovered->tokens),
+                               std::move(uncovered->input), "row_capacity",
+                               device_rows, device_rows, &held);
+      // A held write keeps the slot until the writer, which yields to the
+      // model for at most kPersistenceYieldLimit, has read it; the slot then
+      // returns, its frontier covered, for a later reclaim.
+      if (held)
+        continue;
+    }
     {
       const std::lock_guard lock(impl_->mutex);
       impl_->DropDurableBorrowers(cache::SlotId{slot});
@@ -2999,7 +3078,7 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
         std::string("schema=component-cache-v1 event=capture_failed reason=") +
             error.what());
   };
-  if (bytes > cache.budget) {
+  if (bytes > cache.budget || request.disk_only) {
     try {
       return request.CaptureDurable();
     } catch (const cache::ResourceExhausted&) {

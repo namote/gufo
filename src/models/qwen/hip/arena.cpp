@@ -1574,16 +1574,14 @@ std::uint32_t QwenGpuArena::ReserveKvRows(std::uint32_t rows,
       KvBlockPool::BlocksFor(max_context_) + shared_frontier);
   const std::size_t need =
       target > kv_blocks_.size() ? target - kv_blocks_.size() : 0;
-  kv_reservation_.Reset();
-  auto reservation = kv_pool_->TryReserve(static_cast<std::uint32_t>(need));
-  if (!reservation)
+  // Resized in place: a reservation that cannot grow keeps what it held.
+  if (!kv_pool_->TryResize(kv_reservation_, static_cast<std::uint32_t>(need)))
     throw std::length_error(
         "the shared KV block pool cannot hold this request: it needs " +
         std::to_string(need) + " more blocks of " +
         std::to_string(kKvBlockTokens) + " tokens, " +
         std::to_string(kv_pool_->free_blocks()) + " of " +
         std::to_string(kv_pool_->blocks()) + " are free");
-  kv_reservation_ = std::move(reservation);
   return static_cast<std::uint32_t>(need);
 }
 

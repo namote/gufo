@@ -683,9 +683,13 @@ struct TextRunnerPool::Impl {
       // slots allocate and the cache observes remaining host capacity. Slots
       // allocate under the ceiling; what they pin is charged on top of this.
       // The state claim includes lazy image/rollback storage, not startup
-      // usage.
+      // usage. An explicit budget is passed as asked: where backing commits
+      // only while the host keeps its reserve, the cache grows toward it
+      // later; elsewhere the cache caps it at this startup ceiling.
       component_cache = std::make_unique<ComponentTextCache>(
-          validated.runner, state_count, std::min(requested, ceiling),
+          validated.runner, state_count,
+          ram_cache_options.capacity_bytes ? requested
+                                           : std::min(requested, ceiling),
           disk_cache_options, !ram_cache_options.capacity_bytes, ceiling);
       tail_checkpoints = ram_cache_options.tail_checkpoints;
       // Each tail checkpoint would otherwise copy every row up to it.
@@ -2340,9 +2344,14 @@ bool TextRunnerPool::TryGrowRows(Request& request, std::size_t max_new_tokens) {
   if (!fits())
     return false;
   // The scheduler is the only reservation writer. Reclaim/capture workers
-  // can return rows but cannot take this unreserved capacity. ReserveRows
-  // therefore cannot lose an old reservation on ordinary pool pressure.
-  request.ReserveRows(max_new_tokens);
+  // can return rows but cannot take this unreserved capacity. The runner
+  // may still need blocks `extra` does not count (copies of shared blocks):
+  // its reservation then keeps what it held and the request waits.
+  try {
+    request.ReserveRows(max_new_tokens);
+  } catch (const std::length_error&) {
+    return false;
+  }
   return true;
 }
 

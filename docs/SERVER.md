@@ -245,7 +245,12 @@ pages, such as the kernel's KHO scratch area on Ubuntu 26.04, only hold
 movable pages, not GPU allocations. 27B also checks HIP free memory. A
 positive value sets a byte cap that may exceed the automatic budget, up to the
 available host RAM minus 4 GiB; the startup line reports both as
-`automatic_bytes` and `max_bytes`.
+`automatic_bytes` and `max_bytes`. Qwen27B and Flash-Next commit the RAM cache in
+segments of at least 128 MiB (twice the largest capture piece), each only while
+the host keeps 4 GiB free (and the
+device heap its dispatch reserve), so its explicit value is a target, not cut
+to `max_bytes` measured at startup: the cache grows toward it as memory frees,
+and past what the host allows captures evict older checkpoints or are refused.
 Qwen27B sessions (FP16 rows or KVarN group records) map 256-token blocks from one device
 pool as they write; there is no switch to turn this off. The pool holds every
 session's full context unless `--kv-pool-bytes N` sizes it (0, the default,

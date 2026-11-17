@@ -567,6 +567,21 @@
   - MTP TG128 bench (U8 S1 argv, fp16 KV, alternated A B C A B C): 11/10 base 166953f0 65.99/65.98 d0, 104.47/104.72 d32K; production 8462a679 59.55/59.56, 111.88/111.76; this build 7deff214 59.59/59.50, 111.62/111.81. Today's changes do not move decode. Open: d0 is ~10 % below the 11/10 base (output changed: 38 → 39 cycles, 90 → 88 accepted, `adfde744` → `75a056e3`; ~8 % per cycle is unexplained), d32K +7 % (10 instead of 17 cycles, as cand7).
   - 3-session server with this build: 1600x900 and 3840x2176 images and a text request together all 200; an 8-frame synthetic video (ball moving right, clock 12:00-12:35, light green/yellow/red) in one request (4,257 prompt tokens, 16.4 s) answered all four temporal questions correctly.
   - **Result:** kept; production runs this build at 3 sessions.
+- **4 session slots sharing a 30 GB KV pool** (`--sessions 4 --kv-pool-bytes 30000000000`, candidate 4734e2d8; `build/b1/pool-20261118/`, November 18). Flash-Next K4V4 pools 256-token blocks of 2,420,736 B (KVarN records 1,683,456 + MTP K/V 524,288 + pooled indexer 212,992; 9,456 B/token, 9.92 GB per 1M context); ~0.22 GB per session stays outside the pool. 30 GB = 12,392 blocks, three full contexts plus ~26K tokens.
+  - Fixes in the same round: a pool reclaim writes an uncovered retained frontier to disk before resetting the slot (was dropped); `KvBlockPool::TryResize` keeps a reservation when growth fails and the request waits (was a failed request); reclaim waits only for writes that return rows and skips slots queued writes read; an explicit `--cache-ram-bytes` grows by checked segments instead of being clamped to free memory at startup (4 sessions without a pool: 300 MB of 4 GiB).
+  - Same harness as the held-write entries (A 277,875 tokens with image, B streams, C arrives 8 s into B, A's next turn), drop_caches + compact first, host preflight not run:
+
+    | Item | 3 sessions, no pool (pass 7, 2 sessions) | 4 slots + 30 GB pool |
+    |---|---|---|
+    | MemAvailable after start | 17.7 GB | 17.0 GB |
+    | RAM cache capacity | 4 GiB | 4 GiB |
+    | Decode tok/s 1 / 2 / 4 streams | 38.3 / 26.3+28.1 / — (2-session config) | 37.9 / 28.0+29.6 / 17.9+18.4+19.2+20.3 (75.8) |
+    | C (needs a slot) | 2.7 s (queue 0.82 s, slot snapshot) | 1.9 s (queue 24 ms, free slot) |
+    | B max token gap | 1.033 s | 0.222 s |
+    | A next turn | 2.6 s, 276,972 cached | 1.5 s, 277,868 cached |
+  - 1600x900 + 3840x2176 images + text together: all 200 (image 101 s / 113 s, serialized 4K encode). 8-frame video: all four temporal answers correct, 16.5 s.
+  - Not exercised: pool exhaustion (needs ~3M live tokens), reclaim under load.
+  - **Result:** kept; production runs 4 slots with the 30 GB pool.
 - **Combined pass for the steering-API runtime** (8c45bd3d against production runtime-20261112a; `build/b1/pass-20261114/`, November 14).
   - Setup: the production config (YaRN 1M, K4V4, MTP 7, 2 sessions, `--reasoning-effort low`), the R2-3 scripts (`ab.py`, `detect.py`). Runs alternated prod, cand, prod, cand. Host preflight failed only on fragmentation (order ≥ 9 free blocks 29,174).
   - Decode, tok/s, 256 tokens, 4 runs each:

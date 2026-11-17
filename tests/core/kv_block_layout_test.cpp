@@ -189,6 +189,31 @@ void TestReservation() {
   Expect(a.Allocate(1, &empty).size() == 1, "an empty reservation is none");
 }
 
+void TestResizeKeepsTheReservationOnFailure() {
+  // Growing a request's reservation takes only the difference; when the pool
+  // cannot provide it the request keeps what it held and may wait.
+  KvBlockAllocator a(8);
+  KvBlockReservation held;
+  Expect(a.TryResize(held, 3) && held.blocks() == 3 && a.free_blocks() == 5,
+         "an empty reservation grows from free blocks");
+  auto other = a.TryReserve(4);
+  Expect(bool(other) && a.free_blocks() == 1, "another owner holds four");
+  Expect(a.TryResize(held, 4) && held.blocks() == 4 && a.free_blocks() == 0,
+         "growth takes only the difference");
+  Expect(!a.TryResize(held, 6), "growth past the free blocks is refused");
+  Expect(held.blocks() == 4 && a.reserved_blocks() == 8 && a.free_blocks() == 0,
+         "a refused resize keeps the old reservation");
+  Expect(
+      a.TryResize(held, 1) && a.free_blocks() == 3 && a.reserved_blocks() == 5,
+      "shrinking returns the difference");
+  Expect(a.TryResize(held, 0) && !held && a.reserved_blocks() == 4,
+         "resizing to zero empties it");
+  KvBlockAllocator foreign(2);
+  auto theirs = foreign.TryReserve(1);
+  ExpectThrows([&] { (void)a.TryResize(theirs, 1); },
+               "a reservation of another allocator");
+}
+
 void TestReleaseIntoReservation() {
   // A restore maps a retained block instead of the one it allocated; that
   // block goes back to the restoring owner's reservation, not to others.
@@ -223,6 +248,7 @@ int main() {
     TestInvalid();
     TestAllocator();
     TestReservation();
+    TestResizeKeepsTheReservationOnFailure();
     TestReleaseIntoReservation();
   } catch (const std::exception& error) {
     std::cerr << "kv_block_layout_test: " << error.what() << '\n';

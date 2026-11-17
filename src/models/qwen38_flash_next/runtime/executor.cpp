@@ -305,13 +305,14 @@ std::uint32_t Session::ReserveKvRows(std::uint32_t rows, std::uint32_t margin) {
     copies += kv_pool_->references(kv_blocks_[i]) > 1;
   const auto need =
       (target > kv_blocks_.size() ? target - kv_blocks_.size() : 0) + copies;
-  kv_reservation_.Reset();
-  if (need) {
-    kv_reservation_ = kv_pool_->TryReserve(need);
-    if (!kv_reservation_)
-      throw std::length_error(
-          "Flash-Next shared KV pool reservation exhausted");
-  }
+  // Resized in place: a reservation that cannot grow keeps what it held, so
+  // a request whose growth must wait does not lose its guarantee.
+  if (!kv_pool_->TryResize(kv_reservation_, need))
+    throw std::length_error(
+        "Flash-Next shared KV pool reservation exhausted: " +
+        std::to_string(need) + " blocks needed, " +
+        std::to_string(kv_pool_->free_blocks() + kv_reservation_.blocks()) +
+        " available");
   return need;
 }
 std::uint32_t Session::ReleaseKvReservation() noexcept {

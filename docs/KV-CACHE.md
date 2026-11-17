@@ -374,7 +374,7 @@ captured; RAM-retained snapshots and their captures in progress share the RAM bu
 
 | Limit | Default | Set by |
 | --- | --- | --- |
-| Retained snapshot bytes, RAM | smaller of 32 GiB and half the available host RAM; an explicit value up to the available host RAM minus 4 GiB; 27B also checks HIP free memory | `--cache-ram-bytes` |
+| Retained snapshot bytes, RAM | smaller of 32 GiB and half the available host RAM; an explicit value up to the available host RAM minus 4 GiB (Qwen27B and Flash-Next: a target the backing grows toward while the host keeps 4 GiB free); 27B also checks HIP free memory | `--cache-ram-bytes` |
 | RAM checkpoint records | 128, independent of `--sessions` | internal safety limit |
 | Disk bytes | 8 GiB | `--cache-disk-bytes` |
 | Disk staging bytes (DeepSeek; Qwen27B and Flash-Next reject the option) | smaller of `MemAvailable / 8` and the disk budget | `--cache-disk-staging-bytes` |
