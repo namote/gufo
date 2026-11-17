@@ -20,6 +20,7 @@
 #include "src/cache/adapter.hpp"
 #include "src/cache/ledger.hpp"
 #include "src/cli/serve/continuation_cache.hpp"
+#include "src/cli/serve/request_memory_budget.hpp"
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_publication_wait.hpp"
 #include "src/core/sampling.hpp"
@@ -114,6 +115,9 @@ struct TextRunnerDiskCacheOptions {
 [[nodiscard]] std::uint64_t CgroupAvailableBytes(
     const std::filesystem::path& root, std::string_view membership_text,
     std::uint64_t host_available);
+/// Host RAM still available (MemAvailable), after cgroup limits.
+/// Unified-memory device allocations draw from the same RAM.
+[[nodiscard]] std::uint64_t HostAvailableBytes();
 /// Automatic snapshot budget: half the host RAM available after loading
 /// (excluding free CMA pages), after cgroup limits.
 [[nodiscard]] std::size_t HostSnapshotBudgetBytes();
@@ -691,9 +695,20 @@ public:
   /// Request-specific lazy storage, reserved before any cache restore/input
   /// allocation. Null means no additional storage. Current physical free
   /// memory must include retained idle slots, independently of this token.
-  [[nodiscard]] virtual bool RequestMemoryReady(
+  /// The request-specific storage ReserveRequestMemory would claim; empty
+  /// when none. Fixed for a context, so callers may keep it while waiting.
+  [[nodiscard]] virtual RequestMemoryClaim RequestMemoryClaimFor(
       const TextPromptContext*) const {
-    return true;
+    return {};
+  }
+  /// Whether `claim` fits now (MemoryFit::kFits for an empty claim).
+  /// `releasable_elsewhere`: memory outside this runner's claims that will be
+  /// released soon (pending cache writes' pinned host memory).
+  [[nodiscard]] virtual MemoryCheck CheckRequestMemory(
+      RequestMemoryClaim claim, bool /*releasable_elsewhere*/) const {
+    MemoryCheck check;
+    check.claim = claim;
+    return check;
   }
   [[nodiscard]] virtual std::shared_ptr<void> ReserveRequestMemory(
       const TextPromptContext*) const {
@@ -885,6 +900,9 @@ public:
   /// The last WriteBackIdle left a frontier for its own pending write; call
   /// it again later.
   [[nodiscard]] bool WriteBackDeferred() const noexcept;
+  /// Pending or active disk writes hold pinned host memory they will
+  /// release (ComponentTextCache::HostWritesPending).
+  [[nodiscard]] bool HostWritesPending() const;
   [[nodiscard]] TextExecutionPlan SelectDecodePlan(
       std::size_t ready_requests) const;
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(

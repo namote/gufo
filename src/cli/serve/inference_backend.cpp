@@ -3065,19 +3065,26 @@ public:
     }
     return claim;
   }
-  static std::size_t ImageHeadroomFor(std::size_t deferred) {
+  static MemoryHeadroom ImageHeadroomFor(std::size_t deferred) {
     std::size_t free = 0, total = 0;
     if (hipMemGetInfo(&free, &total) != hipSuccess)
       throw std::runtime_error("cannot query image memory headroom");
-    const auto reserve = kHostSnapshotHeadroomBytes + deferred;
-    const auto host = HostSnapshotCeilingBytes();
-    return std::min(host > deferred ? host - deferred : 0,
-                    free > reserve ? free - reserve : 0);
+    // Host: RAM left to the OS. Device: hip::kDispatchReserve, the device
+    // heap kept free for driver command submission (heap_placement.hpp).
+    return ComputeMemoryHeadroom(HostAvailableBytes(),
+                                 kHostSnapshotHeadroomBytes, free,
+                                 gufo::hip::kDispatchReserve, deferred);
   }
-  bool RequestMemoryReady(const TextPromptContext* context) const override {
-    return image_memory_->Ready(ImageClaim(context), [this] {
-      return ImageHeadroomFor(model_->DeferredScratchBytes());
-    });
+  RequestMemoryClaim RequestMemoryClaimFor(
+      const TextPromptContext* context) const override {
+    return ImageClaim(context);
+  }
+  MemoryCheck CheckRequestMemory(RequestMemoryClaim claim,
+                                 bool releasable_elsewhere) const override {
+    return image_memory_->Check(
+        claim,
+        [this] { return ImageHeadroomFor(model_->DeferredScratchBytes()); },
+        releasable_elsewhere);
   }
   std::shared_ptr<void> ReserveRequestMemory(
       const TextPromptContext* context) const override {

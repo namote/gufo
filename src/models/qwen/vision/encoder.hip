@@ -26,6 +26,7 @@
 #include "src/models/qwen/hip/ops/prefill_fp16.hpp"
 #include "src/models/qwen/vision/encoder.hpp"
 #include "src/models/qwen/vision/exl3_weights.hpp"
+#include "src/models/qwen/vision/memory.hpp"
 
 namespace gufo::models::qwen::vision {
 namespace {
@@ -152,11 +153,11 @@ __device__ __forceinline__ float AttentionScore(float x) {
 
 template<class T = Bf16>
 __global__ void Patchify(const std::uint8_t* pixels, T* patches, unsigned width,
-                         unsigned grid_width, unsigned count) {
+                         unsigned grid_width, unsigned begin, unsigned rows) {
   const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count * kPatchDim)
+  if (i >= rows * kPatchDim)
     return;
-  const unsigned patch = i / kPatchDim;
+  const unsigned patch = begin + i / kPatchDim;
   const unsigned element = i % kPatchDim;
   const unsigned merge = patch / 4;
   const unsigned y = (merge / (grid_width / 2)) * 2 + (patch % 4) / 2;
@@ -295,11 +296,14 @@ __global__ void Activate(const float* input, const float* bias, T* output,
 
 template<class T = Bf16>
 __global__ void QkvRope(const float* input, const float* bias, T* q, T* k, T* v,
-                        unsigned count, unsigned grid_width) {
+                        unsigned count, unsigned grid_width, unsigned begin,
+                        unsigned rows) {
   const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count * kHidden)
+  if (i >= rows * kHidden)
     return;
-  const unsigned token = i / kHidden;
+  // `input` holds this chunk's rows; Q/K/V hold all `count` tokens.
+  const unsigned local = i / kHidden;
+  const unsigned token = begin + local;
   const unsigned head = (i % kHidden) / kHeadDim;
   const unsigned d = i % kHeadDim;
   const unsigned pair = d % (kHeadDim / 2);
@@ -313,7 +317,7 @@ __global__ void QkvRope(const float* input, const float* bias, T* q, T* k, T* v,
   const float cosine = cosf(angle);
   const float sine = sinf(angle);
   const unsigned first = head * kHeadDim + pair;
-  const unsigned base = token * 3 * kHidden;
+  const unsigned base = local * 3 * kHidden;
   const float q0 = ProjectionBias<T>(input[base + first], bias[first]);
   const float q1 = ProjectionBias<T>(input[base + first + kHeadDim / 2],
                                      bias[first + kHeadDim / 2]);
@@ -899,15 +903,25 @@ std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
     throw std::invalid_argument("vision encoder requires a resized RGB32 grid");
   }
   impl_->Upload();
+  const auto plan = PlanImageEncoding(image.width, image.height);
   const auto encode = [&]<class T>() -> std::shared_ptr<const Embedding> {
     constexpr auto data_type = std::is_same_v<T, Half> ? HIP_R_16F : HIP_R_16BF;
     const auto stream = impl_->stream;
-    const unsigned count = (image.width / 16) * (image.height / 16);
+    const unsigned count = plan.count;
     const unsigned merged = count / 4;
+    // Row-local stages run in chunks of `chunk` patches, so their scratch is
+    // bounded independently of the image; one chunk is the unchunked graph.
+    const unsigned chunk = plan.chunk_rows;
+    const auto for_chunks = [&](const auto& body) {
+      for (unsigned begin = 0; begin < count; begin += chunk) {
+        check_cancelled();
+        body(begin, std::min(chunk, count - begin));
+      }
+    };
     std::unique_ptr<Impl::ProjectionScratch> projection;
     if (impl_->exl3)
       projection = std::make_unique<Impl::ProjectionScratch>(
-          count, impl_->max_inner_elements);
+          chunk, impl_->max_inner_elements);
     const auto gemm = [&](const std::string& name, const T* input,
                           float* output, unsigned rows, unsigned out,
                           unsigned in) {
@@ -916,16 +930,17 @@ std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
     const unsigned max_ffn = impl_->exl3 ? 4352U : kFfn;
     Allocation pixels(image.pixels.size());
     Allocation hidden(std::size_t{count} * kHidden * sizeof(float));
-    Allocation work(std::size_t{count} * std::max(max_ffn, 3 * kHidden) *
+    Allocation work(std::size_t{chunk} * std::max(max_ffn, 3 * kHidden) *
                     sizeof(float));
-    Allocation normalized(std::size_t{count} * std::max(max_ffn, kPatchDim) *
+    Allocation normalized(std::size_t{chunk} * std::max(max_ffn, kPatchDim) *
                           sizeof(T));
     Allocation qkv(std::size_t{3} * count * kHidden * sizeof(T));
     Allocation attention(std::size_t{count} * kHidden * sizeof(T));
     // Smaller attention tiles reduce scratch traffic for the 4096-patch
     // shape while preserving its BLAS reductions. Ragged tails require
-    // their existing GEMM shapes to preserve rounding.
-    const unsigned tile = std::min(count, count == 4096 ? 64U : 128U);
+    // their existing GEMM shapes to preserve rounding. Large images use
+    // smaller tiles so scores stay within kAttentionTileBytes.
+    const unsigned tile = plan.tile;
     Allocation scores(std::size_t{kHeads} * tile * count * sizeof(float));
     Allocation probabilities(std::size_t{kHeads} * tile * count * sizeof(T));
     Allocation output_tile(std::size_t{tile} * kHidden * sizeof(float));
@@ -935,14 +950,17 @@ std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
       PinnedUpload upload(stream, image.pixels.size());
       upload.Copy(pixels.data, image.pixels.data(), image.pixels.size());
     }
-    Patchify<<<(count * kPatchDim + kThreads - 1) / kThreads, kThreads, 0,
-               stream>>>(pixels.As<std::uint8_t>(), normalized.As<T>(),
-                         image.width, image.width / 16, count);
-    gemm("patch", normalized.As<T>(), hidden.As<float>(), count, kHidden,
-         kPatchDim);
+    float* const residual = hidden.As<float>();
+    for_chunks([&](unsigned begin, unsigned rows) {
+      Patchify<<<(rows * kPatchDim + kThreads - 1) / kThreads, kThreads, 0,
+                 stream>>>(pixels.As<std::uint8_t>(), normalized.As<T>(),
+                           image.width, image.width / 16, begin, rows);
+      gemm("patch", normalized.As<T>(), residual + begin * kHidden, rows,
+           kHidden, kPatchDim);
+    });
     PatchPosition<T>
         <<<(count * kHidden + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-            hidden.As<float>(), impl_->FloatWeight("v.patch_embd.bias"),
+            residual, impl_->FloatWeight("v.patch_embd.bias"),
             impl_->FloatWeight("v.position_embd.weight"), image.height / 16,
             image.width / 16, count, impl_->position_dtype);
     const auto observe = [&](const std::string& stage, const float* data,
@@ -955,24 +973,26 @@ std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
       Check(hipStreamSynchronize(stream));
       observer(stage, copy);
     };
-    observe("patch", hidden.As<float>(), std::size_t{count} * kHidden);
+    observe("patch", residual, std::size_t{count} * kHidden);
     for (unsigned layer = 0; layer < 27; ++layer) {
       check_cancelled();
       const auto prefix = "v.blk." + std::to_string(layer) + ".";
       const auto ffn = impl_->FfnWidth(layer);
-      LayerNorm<<<count, kThreads, 0, stream>>>(
-          hidden.As<float>(), normalized.As<T>(),
-          impl_->FloatWeight(prefix + "ln1.weight"),
-          impl_->FloatWeight(prefix + "ln1.bias"), kHidden);
-      gemm(prefix + "attn_qkv.weight", normalized.As<T>(), work.As<float>(),
-           count, 3 * kHidden, kHidden);
       auto* q = qkv.As<T>();
       auto* k = q + count * kHidden;
       auto* v = k + count * kHidden;
-      QkvRope<<<(count * kHidden + kThreads - 1) / kThreads, kThreads, 0,
-                stream>>>(work.As<float>(),
-                          impl_->FloatWeight(prefix + "attn_qkv.bias"), q, k, v,
-                          count, image.width / 16);
+      for_chunks([&](unsigned begin, unsigned rows) {
+        LayerNorm<<<rows, kThreads, 0, stream>>>(
+            residual + begin * kHidden, normalized.As<T>(),
+            impl_->FloatWeight(prefix + "ln1.weight"),
+            impl_->FloatWeight(prefix + "ln1.bias"), kHidden);
+        gemm(prefix + "attn_qkv.weight", normalized.As<T>(), work.As<float>(),
+             rows, 3 * kHidden, kHidden);
+        QkvRope<<<(rows * kHidden + kThreads - 1) / kThreads, kThreads, 0,
+                  stream>>>(work.As<float>(),
+                            impl_->FloatWeight(prefix + "attn_qkv.bias"), q, k,
+                            v, count, image.width / 16, begin, rows);
+      });
       for (unsigned begin = 0; begin < count; begin += tile) {
         check_cancelled();
         const unsigned rows = std::min(tile, count - begin);
@@ -1008,50 +1028,60 @@ std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
                         stream>>>(output_tile.As<float>(), attention.As<T>(),
                                   begin, rows);
       }
-      gemm(prefix + "attn_out.weight", attention.As<T>(), work.As<float>(),
-           count, kHidden, kHidden);
-      BiasResidual<T>
-          <<<(count * kHidden + kThreads - 1) / kThreads, kThreads, 0,
-             stream>>>(hidden.As<float>(), work.As<float>(),
-                       impl_->FloatWeight(prefix + "attn_out.bias"),
-                       count * kHidden, kHidden);
-      LayerNorm<<<count, kThreads, 0, stream>>>(
-          hidden.As<float>(), normalized.As<T>(),
-          impl_->FloatWeight(prefix + "ln2.weight"),
-          impl_->FloatWeight(prefix + "ln2.bias"), kHidden);
-      gemm(prefix + "ffn_up.weight", normalized.As<T>(), work.As<float>(),
-           count, ffn, kHidden);
-      Activate<<<(count * ffn + kThreads - 1) / kThreads, kThreads, 0,
-                 stream>>>(work.As<float>(),
-                           impl_->FloatWeight(prefix + "ffn_up.bias"),
-                           normalized.As<T>(), count * ffn, ffn, true);
-      gemm(prefix + "ffn_down.weight", normalized.As<T>(), work.As<float>(),
-           count, kHidden, ffn);
-      BiasResidual<T>
-          <<<(count * kHidden + kThreads - 1) / kThreads, kThreads, 0,
-             stream>>>(hidden.As<float>(), work.As<float>(),
-                       impl_->FloatWeight(prefix + "ffn_down.bias"),
-                       count * kHidden, kHidden);
-      observe("layer" + std::to_string(layer), hidden.As<float>(),
+      // Every token's attention is complete; the rest of the layer is
+      // row-local.
+      for_chunks([&](unsigned begin, unsigned rows) {
+        float* const row = residual + begin * kHidden;
+        gemm(prefix + "attn_out.weight", attention.As<T>() + begin * kHidden,
+             work.As<float>(), rows, kHidden, kHidden);
+        BiasResidual<T>
+            <<<(rows * kHidden + kThreads - 1) / kThreads, kThreads, 0,
+               stream>>>(row, work.As<float>(),
+                         impl_->FloatWeight(prefix + "attn_out.bias"),
+                         rows * kHidden, kHidden);
+        LayerNorm<<<rows, kThreads, 0, stream>>>(
+            row, normalized.As<T>(), impl_->FloatWeight(prefix + "ln2.weight"),
+            impl_->FloatWeight(prefix + "ln2.bias"), kHidden);
+        gemm(prefix + "ffn_up.weight", normalized.As<T>(), work.As<float>(),
+             rows, ffn, kHidden);
+        Activate<<<(rows * ffn + kThreads - 1) / kThreads, kThreads, 0,
+                   stream>>>(work.As<float>(),
+                             impl_->FloatWeight(prefix + "ffn_up.bias"),
+                             normalized.As<T>(), rows * ffn, ffn, true);
+        gemm(prefix + "ffn_down.weight", normalized.As<T>(), work.As<float>(),
+             rows, kHidden, ffn);
+        BiasResidual<T>
+            <<<(rows * kHidden + kThreads - 1) / kThreads, kThreads, 0,
+               stream>>>(row, work.As<float>(),
+                         impl_->FloatWeight(prefix + "ffn_down.bias"),
+                         rows * kHidden, kHidden);
+      });
+      observe("layer" + std::to_string(layer), residual,
               std::size_t{count} * kHidden);
     }
-    LayerNorm<<<count, kThreads, 0, stream>>>(
-        hidden.As<float>(), normalized.As<T>(),
-        impl_->FloatWeight("v.post_ln.weight"),
-        impl_->FloatWeight("v.post_ln.bias"), kHidden);
-    gemm("mm.0.weight", normalized.As<T>(), work.As<float>(), merged,
-         kMergeHidden, kMergeHidden);
-    Activate<<<(merged * kMergeHidden + kThreads - 1) / kThreads, kThreads, 0,
-               stream>>>(work.As<float>(), impl_->FloatWeight("mm.0.bias"),
-                         normalized.As<T>(), merged * kMergeHidden,
-                         kMergeHidden, impl_->exl3 != nullptr);
     auto embedding = std::shared_ptr<Embedding>(new Embedding);
     embedding->rows_ = merged;
     embedding->width_ = impl_->output_width;
     Check(hipMalloc(&embedding->data_,
                     std::size_t{merged} * embedding->width_ * sizeof(float)));
-    gemm("mm.2.weight", normalized.As<T>(), embedding->data_, merged,
-         embedding->width_, kMergeHidden);
+    // Chunks hold whole 2x2 merge groups: `rows` patches are rows / 4
+    // merged rows of kMergeHidden.
+    for_chunks([&](unsigned begin, unsigned rows) {
+      const unsigned group = rows / 4;
+      LayerNorm<<<rows, kThreads, 0, stream>>>(
+          residual + begin * kHidden, normalized.As<T>(),
+          impl_->FloatWeight("v.post_ln.weight"),
+          impl_->FloatWeight("v.post_ln.bias"), kHidden);
+      gemm("mm.0.weight", normalized.As<T>(), work.As<float>(), group,
+           kMergeHidden, kMergeHidden);
+      Activate<<<(group * kMergeHidden + kThreads - 1) / kThreads, kThreads, 0,
+                 stream>>>(work.As<float>(), impl_->FloatWeight("mm.0.bias"),
+                           normalized.As<T>(), group * kMergeHidden,
+                           kMergeHidden, impl_->exl3 != nullptr);
+      gemm("mm.2.weight", normalized.As<T>(),
+           embedding->data_ + std::size_t{begin / 4} * embedding->width_,
+           group, embedding->width_, kMergeHidden);
+    });
     Finish<T>
         <<<(merged * embedding->width_ + kThreads - 1) / kThreads, kThreads, 0,
            stream>>>(embedding->data_, impl_->FloatWeight("mm.2.bias"),

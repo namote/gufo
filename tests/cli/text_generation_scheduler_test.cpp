@@ -209,6 +209,11 @@ struct FakeControl {
   bool release_advance{false};
   bool release_prefill{false};
   std::atomic<std::size_t> invalidations{0};
+  // Requests with a prompt context claim image memory; checks report
+  // memory_fit and are counted.
+  std::atomic<gufo::server::MemoryFit> memory_fit{
+      gufo::server::MemoryFit::kFits};
+  std::atomic<std::size_t> memory_checks{0};
   std::atomic<std::size_t> states_created{0};
   bool structured_output{false};
   bool vocabulary_failure{false};
@@ -442,6 +447,21 @@ public:
     auto on = std::make_shared<gufo::server::TextPromptContext>();
     on->cache_identity = {0x0a};
     return on;
+  }
+
+  [[nodiscard]] gufo::server::RequestMemoryClaim RequestMemoryClaimFor(
+      const gufo::server::TextPromptContext* context) const override {
+    if (!context)
+      return {};
+    return {.persistent_bytes = 1, .scratch_bytes = 1};
+  }
+  [[nodiscard]] gufo::server::MemoryCheck CheckRequestMemory(
+      gufo::server::RequestMemoryClaim claim, bool) const override {
+    control_->memory_checks.fetch_add(1, std::memory_order_relaxed);
+    gufo::server::MemoryCheck check;
+    check.fit = control_->memory_fit.load();
+    check.claim = claim;
+    return check;
   }
 
   // The readmitted ON context is the only one these tests attach.
@@ -2548,6 +2568,44 @@ void TestMetricsDuringCacheAdmission() {
          "failed admission releases the session for replacement work");
 }
 
+void TestImageMemoryWaitAndRefusal() {
+  using gufo::server::MemoryFit;
+  const auto image = [] {
+    TextRequestMetadata metadata;
+    auto context = std::make_shared<gufo::server::TextPromptContext>();
+    context->cache_identity = {0x0a};
+    metadata.prompt_context = std::move(context);
+    return metadata;
+  };
+  auto control = std::make_shared<FakeControl>();
+  auto scheduler = MakeScheduler(control, 2);
+  // Nothing releasable: refused at once with the short client message.
+  control->memory_fit = MemoryFit::kRefused;
+  std::string message;
+  try {
+    (void)scheduler->Submit({5}, 1, 0.0F, {}, false, image()).Wait();
+  } catch (const std::length_error& error) {
+    message = error.what();
+  }
+  Expect(message == gufo::server::kRequestMemoryRefused,
+         "an image that cannot fit fails with the generic message");
+  // Releasable memory held: the image parks, later text is still admitted.
+  control->memory_fit = MemoryFit::kWait;
+  control->memory_checks = 0;
+  auto waiting = scheduler->Submit({6}, 1, 0.0F, {}, false, image());
+  Expect(scheduler->Submit({7}, 1, 0.0F).Wait().tokens == ExpectedTokens(7, 1),
+         "text behind a waiting image is admitted");
+  const auto start = std::chrono::steady_clock::now();
+  while (std::chrono::steady_clock::now() - start < std::chrono::seconds{2})
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+  const auto checks = control->memory_checks.load();
+  Expect(checks >= 2 && checks <= 5,
+         "a waiting image rechecks memory about once per second");
+  control->memory_fit = MemoryFit::kFits;
+  Expect(waiting.Wait().tokens == ExpectedTokens(6, 1),
+         "the waiting image proceeds once its memory fits");
+}
+
 void TestSessionStatesFollowAdmittedRequests() {
   namespace metrics = gufo::server::detail;
   const auto processing_before = metrics::RequestsProcessing().load();
@@ -4065,6 +4123,7 @@ void TestScoringReturnsRawLogprobsWithoutDecoding() {
 }
 
 int main() {
+  TestImageMemoryWaitAndRefusal();
   TestRunBetweenStepsWaitsForThePass();
   TestRunWhenIdleYieldsToRequests();
   TestTokenLogprobs();

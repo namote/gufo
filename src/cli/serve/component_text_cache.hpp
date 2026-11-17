@@ -237,6 +237,9 @@ public:
                                       const TextPromptContext* context,
                                       bool reuse, std::size_t stable);
   [[nodiscard]] bool WriteBackDeferred() const noexcept;
+  // The disk writer has pending or active jobs, whose pinned host memory
+  // (reassignment snapshots, staging) it releases when they finish.
+  [[nodiscard]] bool HostWritesPending() const;
 
 private:
   // Captures the idle live frontier of slot `index` (leased exactly at

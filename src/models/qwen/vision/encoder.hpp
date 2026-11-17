@@ -54,8 +54,9 @@ public:
   /// keep the existing upload.
   void Upload();
   /// Serialized by the owning model scheduler. Pixel grid is already resized.
-  /// Uploads the weights if Upload has not; scratch is bounded by image
-  /// dimensions.
+  /// Uploads the weights if Upload has not. Scratch follows
+  /// PlanImageEncoding (memory.hpp): row-local stages run in bounded chunks,
+  /// whole-image buffers grow linearly with the patch count.
   [[nodiscard]] std::shared_ptr<const Embedding> Encode(
       const core::Image& image, const Observer& observer = {},
       const CancellationCheck& is_cancelled = {});

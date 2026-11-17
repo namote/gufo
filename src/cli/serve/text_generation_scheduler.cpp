@@ -165,6 +165,11 @@ struct ScheduledRequest {
   std::optional<TextGenerationScheduler::Clock::time_point>
       publication_wait_start;
   bool publication_waiting{false};
+  // Request-specific memory (image input): the claim, computed once, and a
+  // bounded wait while memory others hold may be released.
+  std::optional<RequestMemoryClaim> memory_claim;
+  std::optional<TextGenerationScheduler::Clock::time_point> memory_wait_start;
+  TextGenerationScheduler::Clock::time_point memory_checked{};
   TextPendingPublication publication;
   detail::PublicationWaitEstimate::Milliseconds publication_wait_limit{};
   // The held `/slots` session while counted_processing is set. Only the
@@ -210,6 +215,33 @@ void LogPublicationWait(const std::shared_ptr<ScheduledRequest>& request,
   if (!release.empty())
     line << " release=" << release;
   Logger::Info("cache", line.str());
+}
+
+// An image whose memory may be released waits at most this long, and
+// queries host/device free memory at most once per kMemoryRecheck meanwhile.
+constexpr std::chrono::seconds kMemoryWaitLimit{30};
+constexpr std::chrono::seconds kMemoryRecheck{1};
+
+void LogMemoryWait(const ScheduledRequest& request, std::string_view stage,
+                   const MemoryCheck& check) noexcept {
+  try {
+    std::ostringstream line;
+    line << "event=image_memory_wait request=" << request.id
+         << " stage=" << stage;
+    if (request.memory_wait_start)
+      line << " wait_ms="
+           << std::chrono::duration<double, std::milli>(
+                  TextGenerationScheduler::Clock::now() -
+                  *request.memory_wait_start)
+                  .count();
+    line << ' ' << DescribeMemoryCheck(check);
+    if (check.fit == MemoryFit::kFits || stage == "start")
+      Logger::Info("memory", line.str());
+    else
+      Logger::Warn("memory", line.str());
+  } catch (...) {
+    // Observability cannot prevent admission or failure completion.
+  }
 }
 
 void EndPublicationWait(const std::shared_ptr<ScheduledRequest>& request,
@@ -1291,6 +1323,12 @@ struct TextGenerationScheduler::Impl {
           }
         }
 
+        if (!RequestMemoryReady(request)) {
+          // Parked like a slot-deferred request: later ones are still
+          // admitted, and it is tried again on the next pass.
+          slot_deferred.requests.push_back(std::move(request));
+          continue;
+        }
         const auto guarantor = kv_guarantor.lock();
         const bool full_rows =
             !ProgressiveRows() || !guarantor || IsTerminal(guarantor);
@@ -1403,10 +1441,58 @@ struct TextGenerationScheduler::Impl {
           }
           prefilling.insert(next, std::move(request));
         }
+      } catch (const RequestMemoryRefused& error) {
+        // The client gets the short message; the numbers stay in this log.
+        if (!error.logged())
+          Logger::Warn("memory", "event=image_memory_wait request=" +
+                                     std::to_string(request->id) + " " +
+                                     error.detail());
+        CompleteFailure(request, std::current_exception());
       } catch (...) {
         CompleteFailure(request, std::current_exception());
       }
     }
+  }
+
+  /// Request-specific memory (image input). True when its claim fits now.
+  /// False parks it while memory that can actually be released is held
+  /// (other image claims, pending disk writes' pinned host memory), checked
+  /// at most every kMemoryRecheck for at most kMemoryWaitLimit. Otherwise
+  /// throws RequestMemoryRefused; each start/proceed/failure is logged.
+  bool RequestMemoryReady(const std::shared_ptr<ScheduledRequest>& request) {
+    const auto& runner = runner_pool->runner();
+    if (!request->memory_claim)
+      request->memory_claim =
+          runner.RequestMemoryClaimFor(request->prompt_context.get());
+    const auto claim = *request->memory_claim;
+    if (claim.persistent_bytes == 0 && claim.scratch_bytes == 0)
+      return true;
+    const auto now = Clock::now();
+    if (request->memory_wait_start &&
+        now - request->memory_checked < kMemoryRecheck)
+      return false;
+    const auto check =
+        runner.CheckRequestMemory(claim, runner_pool->HostWritesPending());
+    request->memory_checked = now;
+    if (check.fit == MemoryFit::kFits) {
+      if (request->memory_wait_start) {
+        LogMemoryWait(*request, "proceed", check);
+        request->memory_wait_start.reset();
+      }
+      return true;
+    }
+    if (check.fit == MemoryFit::kWait) {
+      if (!request->memory_wait_start) {
+        request->memory_wait_start = now;
+        LogMemoryWait(*request, "start", check);
+        return false;
+      }
+      if (now - *request->memory_wait_start < kMemoryWaitLimit)
+        return false;
+    }
+    LogMemoryWait(*request, request->memory_wait_start ? "failed" : "refused",
+                  check);
+    throw RequestMemoryRefused(DescribeMemoryCheck(check), true);
   }
 
   using PrefillQueue = std::deque<std::shared_ptr<ScheduledRequest>>;

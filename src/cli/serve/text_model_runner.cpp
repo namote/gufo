@@ -165,10 +165,6 @@ std::uint64_t CgroupAvailableBytes(const std::filesystem::path& root,
   return available;
 }
 
-namespace {
-
-/// Host RAM still available, after cgroup limits. Unified-memory device
-/// allocations draw from the same RAM, so HIP's device capacity is not used.
 std::uint64_t HostAvailableBytes() {
   std::uint64_t available = platform::AvailableMemoryBytes();
   std::ifstream meminfo("/proc/meminfo");
@@ -182,6 +178,8 @@ std::uint64_t HostAvailableBytes() {
   return CgroupAvailableBytes("/sys/fs/cgroup", membership_text.str(),
                               available);
 }
+
+namespace {
 
 std::size_t ClampToSize(std::uint64_t bytes) {
   return static_cast<std::size_t>(
@@ -2216,8 +2214,6 @@ bool TextRunnerPool::AdmissionReady(std::span<const TextRunnerToken> prompt,
                                     bool reuse_prompt,
                                     std::size_t cache_prefix_tokens) {
   const auto& runner = *impl_->validated.runner;
-  if (!runner.RequestMemoryReady(context))
-    return false;
   std::size_t need = AdmissionRowBlocks(std::min<std::size_t>(
       impl_->validated.descriptor.max_context, prompt.size() + max_new_tokens));
   if (need == 0 || runner.RowBlocks().free_blocks >= need)
@@ -2250,6 +2246,10 @@ std::size_t TextRunnerPool::WriteBackIdle(
   return impl_->component_cache
              ? impl_->component_cache->WriteBackIdle(idle_for)
              : 0;
+}
+
+bool TextRunnerPool::HostWritesPending() const {
+  return impl_->component_cache && impl_->component_cache->HostWritesPending();
 }
 
 bool TextRunnerPool::WriteBackDeferred() const noexcept {

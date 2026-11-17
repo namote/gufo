@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -368,12 +369,40 @@ int main(int argc, char** argv) {
       std::cout << "vision input, layout and rendering: passed\n";
       return 0;
     }
+    if (argc == 6 && std::string_view(argv[1]) == "--time") {
+#if defined(ENGINE_ENABLE_HIP)
+      // Encode wall time without stage observers: one warm-up after the
+      // weight upload, then REPEATS timed encodes.
+      const auto image = ResizeImage(
+          gufo::core::DecodeImage(gufo::core::ReadImageFile(argv[3])),
+          gufo::tokenization::ChatMessage::ImageDetail::kAuto);
+      Encoder encoder(argv[2], std::stoul(argv[4]));
+      encoder.Upload();
+      (void)encoder.Encode(image);
+      const auto repeats = std::stoul(argv[5]);
+      for (unsigned long run = 0; run < repeats; ++run) {
+        const auto start = std::chrono::steady_clock::now();
+        const auto result = encoder.Encode(image);
+        const auto ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - start)
+                            .count();
+        std::cout << "encode " << image.width << 'x' << image.height
+                  << " run=" << run << " ms=" << ms
+                  << " rows=" << result->rows() << '\n';
+      }
+      return 0;
+#else
+      throw std::runtime_error("vision encoding requires HIP");
+#endif
+    }
     const bool preprocess =
         argc == 4 && std::string_view(argv[1]) == "--preprocess";
     if (!preprocess && argc != 5)
       throw std::invalid_argument(
           "usage: qwen27b_vision_test MMPROJ IMAGE OUTPUT_DIR OUTPUT_WIDTH\n"
-          "       qwen27b_vision_test --preprocess IMAGE OUTPUT_DIR");
+          "       qwen27b_vision_test --preprocess IMAGE OUTPUT_DIR\n"
+          "       qwen27b_vision_test --time MMPROJ IMAGE OUTPUT_WIDTH "
+          "REPEATS");
     const auto image =
         ResizeImage(gufo::core::DecodeImage(gufo::core::ReadImageFile(argv[2])),
                     gufo::tokenization::ChatMessage::ImageDetail::kAuto);

@@ -2044,6 +2044,13 @@ bool ComponentTextCache::PrepareAdmission(
   return !writing;
 }
 
+bool ComponentTextCache::HostWritesPending() const {
+  if (!impl_->queue)
+    return false;
+  const auto stats = impl_->queue->Stats();
+  return stats.pending != 0 || stats.pinned_bytes != 0;
+}
+
 bool ComponentTextCache::WriteBackDeferred() const noexcept {
   return impl_->write_back_deferred.load(std::memory_order_relaxed);
 }
