@@ -546,6 +546,7 @@
   - Pass 6: 1.5 s of the snapshot was scheduler-thread planning: a linear search of ~43K frontier pieces for each of ~29K aliases (443 ms in a CPU microbenchmark, 1.4 ms with a sorted binary search) and a re-sort of the host-copy list per attach. Fixed in pass 7.
   - Pass 7 gap 1.03 s = snapshot 0.56 s + C's existing foreground preservation of 1.08 GB RAM-ancestor rows (copy 204 ms + residual wait 225 ms). Allocation (0.35 s) is paid only when the pool is empty; reuse skips it. Snapshot publication: stream wait 0, filesystem 1.65 s. Peak Dirty 73 MB.
   - Not done: warming the arena pool while a peer decodes (pinned allocation can contend with the decoding slot's HIP calls, U4-3 class, unmeasured).
+  - Deployed the same day as runtime-20261117a (bec6fb4e, 8462a679…, rebuilt byte-identical to the pass-7 binary; same abliteration profiles); rollback `~/projects/_backup/gufo-server-20261117-before-snapshot/`.
   - **Result:** kept and deployed (user accepted the one ~1 s peer pause for C 34.4 → 2.7 s). Open: the 0.43 s RAM-ancestor preservation (could join the snapshot) and the first-use allocation.
 - **Combined pass for the steering-API runtime** (8c45bd3d against production runtime-20261112a; `build/b1/pass-20261114/`, November 14).
   - Setup: the production config (YaRN 1M, K4V4, MTP 7, 2 sessions, `--reasoning-effort low`), the R2-3 scripts (`ab.py`, `detect.py`). Runs alternated prod, cand, prod, cand. Host preflight failed only on fragmentation (order ≥ 9 free blocks 29,174).
