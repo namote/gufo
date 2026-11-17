@@ -581,6 +581,7 @@
     | A next turn | 2.6 s, 276,972 cached | 1.5 s, 277,868 cached |
   - 1600x900 + 3840x2176 images + text together: all 200 (image 101 s / 113 s, serialized 4K encode). 8-frame video: all four temporal answers correct, 16.5 s.
   - Not exercised: pool exhaustion (needs ~3M live tokens), reclaim under load.
+  - Deployed the same day as runtime-20261118a (622e6cf8, 4734e2d8…, the tested binary); rollback `~/projects/_backup/gufo-server-20261118-before-pool/`.
   - **Result:** kept; production runs 4 slots with the 30 GB pool.
 - **Combined pass for the steering-API runtime** (8c45bd3d against production runtime-20261112a; `build/b1/pass-20261114/`, November 14).
   - Setup: the production config (YaRN 1M, K4V4, MTP 7, 2 sessions, `--reasoning-effort low`), the R2-3 scripts (`ab.py`, `detect.py`). Runs alternated prod, cand, prod, cand. Host preflight failed only on fragmentation (order ≥ 9 free blocks 29,174).
