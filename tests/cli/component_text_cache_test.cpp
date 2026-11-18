@@ -727,8 +727,12 @@ void LongPublicationRunKeepsTheLedgerBounded() {
        at = log.find("event=published", at + 1))
     ++published;
   assert(published == 300);
-  assert(log.find("event=disk_evicted") != std::string::npos ||
-         ManagedBytes(temp.path()) <= (256 << 10));
+  // 300 publications cannot fit 256 KiB: each eviction is logged with the
+  // victim and the store's size afterwards.
+  assert(log.find("event=disk_evicted reason=lru checkpoint_id=") !=
+         std::string::npos);
+  assert(log.find(" managed_bytes=") != std::string::npos);
+  assert(ManagedBytes(temp.path()) <= (256 << 10));
   assert(log.find("persistence_incomplete") == std::string::npos);
   assert(log.find("persistence_refused") == std::string::npos);
   assert(log.find("publication_untracked") == std::string::npos);

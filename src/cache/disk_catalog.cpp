@@ -169,7 +169,7 @@ void DiskCatalog::Touch(CheckpointId id) {
   it->second.used = used;
   impl_->lru.insert(std::move(node));
 }
-bool DiskCatalog::EvictOne() {
+bool DiskCatalog::EvictOne(std::shared_ptr<const DiskDescription>* evicted) {
   Reconcile();
   for (auto it = impl_->lru.begin(); it != impl_->lru.end();) {
     auto record = impl_->records.find(it->second);
@@ -182,9 +182,13 @@ bool DiskCatalog::EvictOne() {
     if (result == DiskRetireResult::kPinned)
       continue;
     impl_->index->RemoveDurable(description);
+    auto retired = record->second.description;
     impl_->Erase(record);
-    if (result == DiskRetireResult::kRetired)
+    if (result == DiskRetireResult::kRetired) {
+      if (evicted)
+        *evicted = std::move(retired);
       return true;
+    }
   }
   return false;
 }

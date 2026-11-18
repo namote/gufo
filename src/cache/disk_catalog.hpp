@@ -20,7 +20,8 @@ public:
   void Touch(CheckpointId);
   // Evict oldest unpinned entry. Busy writers cause an immediate false result;
   // capacity is credited only after DiskStore's durable retirement succeeds.
-  bool EvictOne();
+  // `evicted`, when given, receives the retired entry's description.
+  bool EvictOne(std::shared_ptr<const DiskDescription>* evicted = nullptr);
   // Reverse dependency quarantine is immediate, with no I/O-lock wait. Retire
   // quarantined manifests at a later idle boundary after reader pins settle.
   void Invalidate(bool private_file, DiskFileId);

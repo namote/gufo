@@ -643,7 +643,23 @@ struct ComponentTextCache::Impl {
                                 error.what());
     }
     const std::lock_guard lock(mutex);
-    return catalog->EvictOne();
+    std::shared_ptr<const cache::DiskDescription> evicted;
+    if (!catalog->EvictOne(&evicted))
+      return false;
+    if (evicted) {
+      const auto& victim = evicted->Manifest();
+      Logger::Info(
+          "cache",
+          "schema=component-cache-v1 event=disk_evicted reason=lru "
+          "checkpoint_id=" +
+              std::to_string(victim.checkpoint.value) +
+              " tokens=" + std::to_string(victim.tokens.size()) +
+              " payload_bytes=" + std::to_string(PayloadBytes(victim)) +
+              " managed_bytes=" + std::to_string(disk->Stats().managed_bytes) +
+              " capacity_bytes=" + std::to_string(disk_capacity) +
+              " for_tokens=" + std::to_string(manifest.tokens.size()));
+    }
+    return true;
   }
   // Under the mutex: the idle slot a cold acquisition takes, or null.
   Entry* SelectCold() {

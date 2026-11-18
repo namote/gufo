@@ -615,13 +615,14 @@ a top-level `cache_persist`; see [the server guide](SERVER.md).
 | `schema=component-cache-v1 event=publication_untracked` | a checkpoint was written but the index could not take it; it is found again at restart |
 | `schema=component-cache-v1 event=live_frontier_unindexed` | a finished request's live frontier could not be indexed; its next turn restores from disk |
 | `schema=component-cache-v1 event=disk_evicted reason=budget` | Flash-Next: startup removed the oldest checkpoints (creation order) to fit a lowered `--cache-disk-bytes` |
+| `schema=component-cache-v1 event=disk_evicted reason=lru` | Qwen27B/Flash-Next: a publication evicted the least recently used checkpoint to stay inside `--cache-disk-bytes`: its `checkpoint_id`, `tokens`, `payload_bytes`, the store's `managed_bytes` afterwards against `capacity_bytes`, and the incoming checkpoint's `for_tokens` |
 | `schema=component-cache-v1 event=disk_over_budget` | Flash-Next: the directory still exceeds `--cache-disk-bytes` after startup reclamation and eviction; publication is refused until it fits |
 | `schema=component-cache-v1 event=published` | A checkpoint finished disk publication; `checkpoint_id` identifies the capture and `tokens` its boundary |
 | `schema=component-cache-v1 event=persistence_refused reason=min_step` | A captured checkpoint is too close to an existing publication; includes `checkpoint_id` and `tokens` |
 | `event=snapshot action=removed reason=entry_capacity` | a retained prefix was evicted because every entry was taken |
 | `event=snapshot action=skipped reason=entry_capacity` | no checkpoint record could be replaced safely for this capture |
 | `event=snapshot action=skipped reason=byte_capacity` | legacy runners: a checkpoint did not fit the RAM budget |
-| `event=disk_cache action=removed reason=lru` | a disk entry was evicted to stay inside `--cache-disk-bytes` |
+| `event=disk_cache action=removed reason=lru` | legacy runners: a disk entry was evicted to stay inside `--cache-disk-bytes` |
 | `event=disk_cache action=skipped reason=staging_capacity` | a checkpoint exceeded `--cache-disk-staging-bytes` and was never written |
 | `event=disk_cache action=skipped reason=min_step` | a checkpoint was less than 2048 tokens past a stored prefix; RAM still retains it |
 
