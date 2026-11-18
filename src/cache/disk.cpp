@@ -1347,6 +1347,11 @@ struct DiskStore::Impl {
               std::find_if(sources.begin(), sources.end(), [&](const auto& s) {
                 return s.private_file == key.first && s.file == p.file;
               });
+          // An inherited file the candidate supplies no bytes for has
+          // vanished since it was published (removed from the directory):
+          // the publication cannot be completed.
+          if (source == sources.end())
+            throw std::runtime_error("cache dependency file missing");
           std::uint64_t offset{}, crc{};
           const auto piece_bytes =
               staging.size() / source->alignment * source->alignment;

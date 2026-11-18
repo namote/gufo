@@ -12,23 +12,29 @@ def host_available_bytes(meminfo):
     return int(match[1]) * 1024
 
 
-def check_snapshot_budget(log, available_before_load, requested_bytes, sessions):
+def check_snapshot_budget(log, available_before_load, sessions):
+    # Component-cache runners (Qwen27B, Flash-Next) keep no RAM checkpoints:
+    # their startup line reports only the metadata, staging and arena limits.
+    component = re.findall(
+        r"schema=component-cache-v1 event=configured sessions=(\d+) "
+        r"metadata_limit_bytes=(\d+)\b", log)
+    if component:
+        loaded_sessions, metadata = map(int, component[0])
+        if len(component) != 1 or loaded_sessions != sessions or metadata <= 0:
+            raise ValueError(f"unexpected component cache configuration: {component}")
+        return {"capacity_bytes": 0, "metadata_limit_bytes": metadata,
+                "host_available_before_load_bytes": available_before_load}
     configured = re.findall(
         r"event=snapshot_cache_configured sessions=(\d+) snapshot_entries=(\d+) "
         r"capacity_bytes=(\d+)\b", log)
-    component = re.findall(
-        r"schema=component-cache-v1 event=configured sessions=(\d+) "
-        r"snapshot_entries=(\d+) capacity_bytes=(\d+)\b", log)
-    configured += component
     if len(configured) != 1:
         raise ValueError("expected one snapshot cache configuration at startup")
     loaded_sessions, entries, capacity = map(int, configured[0])
     # Loading weights/states consumes RAM. Sampling before load gives a
     # conservative upper bound without racing allocations after the budget
     # was chosen. Model and cgroup limits may make the real budget smaller.
-    # Automatic sizing keeps half of it free; an explicit limit keeps 4 GiB.
-    limit = (min(requested_bytes, max(available_before_load - 4 * 1024**3, 0))
-             if requested_bytes else min(available_before_load // 2, 32 * 1024**3))
+    # Legacy runners size it automatically and keep half of it free.
+    limit = min(available_before_load // 2, 32 * 1024**3)
     if loaded_sessions != sessions or entries != 128 or not 0 < capacity <= limit:
         raise ValueError(f"unsafe snapshot cache configuration: sessions={loaded_sessions}, "
                          f"entries={entries}, capacity_bytes={capacity}, upper_bound_bytes={limit}")

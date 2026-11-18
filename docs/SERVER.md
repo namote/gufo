@@ -83,7 +83,7 @@ Text serving defaults match llama.cpp for context and generation length:
 
 `--kv-cache-type fp16|kvarn-k4v2|kvarn-k4v4|kvarn-k6v6` selects attention KV storage; a
 model takes an explicit value only when it stores KV that way. Qwen3.8-27B
-defaults to `kvarn-k4v2` and serves the KVarN values: the prefix cache, RAM and disk checkpoints keep the
+defaults to `kvarn-k4v2` and serves the KVarN values: the prefix cache and disk checkpoints keep the
 quantized group records and only the valid FP16 sink and tail rows (layout
 versions 5 and 6; checkpoints of the earlier 3 and 4 are refused), and `--kv-pool-bytes` holds about 4.9 (k4v2) or
 3.7 (k4v4) times the FP16 tokens. Flash-Next defaults to FP16 KV and also accepts
@@ -238,41 +238,26 @@ hash; a new screenshot still needs vision encoding and prefill. Debug logs
 expose `event=image_cache` with whether reuse is enabled, entries, retained
 pixel/encoded bytes, hits, misses and evictions.
 
-`--cache-ram-bytes 0` (the default) selects an automatic snapshot budget capped
-at 32 GiB and half the available host RAM after model/state allocation, respecting
-container limits. Available RAM is `MemAvailable` minus `CmaFree`: free CMA
-pages, such as the kernel's KHO scratch area on Ubuntu 26.04, only hold
-movable pages, not GPU allocations. 27B also checks HIP free memory. A
-positive value sets a byte cap that may exceed the automatic budget, up to the
-available host RAM minus 4 GiB; the startup line reports both as
-`automatic_bytes` and `max_bytes`. Qwen27B and Flash-Next commit the RAM cache in
-segments of at least 128 MiB (twice the largest capture piece), each only while
-the host keeps 4 GiB free (and the
-device heap its dispatch reserve), so its explicit value is a target, not cut
-to `max_bytes` measured at startup: the cache grows toward it as memory frees,
-and past what the host allows captures evict older checkpoints or are refused.
+Qwen27B and Flash-Next keep no RAM checkpoints: a request continues its
+session's live frontier, or restores a disk checkpoint (`--cache-disk`), or
+prefills cold. Every capture goes to disk; its private state and partial tails
+are copied first into pinned host arenas (at most 4 GiB, freed after 60 s
+unused), while completed KV rows are read from the session by the disk writer.
+Without `--cache-disk` only live frontiers are reused. A cache failure on the
+request path leaves that state uncached and never fails the request. See
+[KV-CACHE.md](KV-CACHE.md#component-cache-budgets).
 Qwen27B sessions (FP16 rows or KVarN group records) map 256-token blocks from one device
 pool as they write; there is no switch to turn this off. The pool holds every
 session's full context unless `--kv-pool-bytes N` sizes it (0, the default,
 keeps that size); admission waits while it cannot hold a request.
-`--cache-tail-checkpoints K` (default 3, where checkpoints keep KV as pool
-blocks) keeps K RAM checkpoints near the end of long prompts. See
-[KV-CACHE.md](KV-CACHE.md#limits).
-On Qwen27B and Flash-Next, the pinned disk staging buffer comes out of that ceiling, and
-`max_bytes` excludes it. Other models' disk staging and temporary disk-save
-buffers are separate from this RAM budget.
-The 128 checkpoint records are independent of `--sessions`; more than one can
-belong to a conversation.
-Qwen27B and Qwen3.8-Flash-Next pin pages for up to about 89% of its budget as captures
-need them, about 1 GiB at a time, and keeps them; the rest covers cache metadata as
-it grows. The first step runs at startup and later ones on a background thread
-ahead of need. Each takes about 200 ms while the host has free pages and longer
-when the kernel must reclaim page cache. Segments use ordinary pages that are
-registered with HIP: `hipHostMalloc` asks for high-order pages, and compacting
-host memory for them stalled decode for seconds when most RAM belonged to the GPU.
-Growth stops early while the host would keep less than 4 GiB available. The pages hold checkpoint state and KV rows, partial
-tails and idle-session spill; there is no separate spill option.
-Other models allocate payloads only when captured. Under pressure, optional
+DeepSeek and other legacy runners keep an automatic RAM snapshot budget, capped
+at 32 GiB and half the available host RAM after model/state allocation,
+respecting container limits; it has no option. Available RAM is `MemAvailable`
+minus `CmaFree`: free CMA pages, such as the kernel's KHO scratch area on
+Ubuntu 26.04, only hold movable pages, not GPU allocations. Their disk staging
+and temporary disk-save buffers are separate from this RAM budget. The 128
+checkpoint records are independent of `--sessions`; more than one can belong
+to a conversation. Other models allocate payloads only when captured. Under pressure, optional
 copies give way before another conversation's last useful checkpoint.
 
 Qwen27B uses component-cache slots in both AR and DFlash2 modes. A checkpoint
@@ -293,15 +278,16 @@ also accounts for tokenization changes where adjacent user/tool turns join.
 Qwen requests retain this checkpoint with thinking enabled or disabled.
 Warm continuations preserve the reused frontier before prefill and save the
 new stable boundary too. A second full-prompt checkpoint enables exact retries
-without prefill; all copies share the same snapshot-memory budget.
+without prefill; on DeepSeek all copies share the same snapshot-memory budget.
 Exact live continuations reuse generated tokens. The server reports cached
 and newly processed tokens separately; resuming from the checkpoint processes
 the short suffix. System instructions, tool definitions and image identities
 must match the retained prefix.
 
 `cache_persist: false` on the same endpoints keeps the request's own
-checkpoints off [`--cache-disk`](KV-CACHE.md#the-disk-tier): they stay in RAM
-and leave with RAM eviction or a restart. The request can still restore disk
+checkpoints off [`--cache-disk`](KV-CACHE.md#the-disk-tier): DeepSeek keeps
+them in RAM until eviction or a restart; Qwen27B and Flash-Next take none, and
+only the session's live frontier serves the next turn. The request can still restore disk
 checkpoints that other requests wrote, and a later request without the flag
 that sends the same prefix can write its own. `null` keeps the default, `true`.
 Each response echoes the value it applied as a top-level `cache_persist`
@@ -311,7 +297,7 @@ text completions) or on the final `response` object (Responses), never on a
 content delta.
 
 Qwen image identity is checked only for images consumed before each checkpoint.
-Appending an image reuses the preceding text/image state in RAM or on disk;
+Appending an image reuses the preceding text/image state, live or on disk;
 changing, removing or moving an earlier image invalidates checkpoints after it.
 New images get a checkpoint before assistant framing so later turns do not
 encode or prefill them again.
@@ -319,8 +305,8 @@ With `preserve_thinking=false`, a new user turn removes reasoning from the
 preceding tool cycle. Gufo retains the state before that cycle and processes
 its changed suffix again.
 
-A loaded Qwen vision sidecar is prepared while the model loads, before the RAM
-cache is sized and before readiness: Gufo hashes the complete sidecar for image
+A loaded Qwen vision sidecar is prepared while the model loads, before the
+cache is configured and before readiness: Gufo hashes the complete sidecar for image
 cache identities and uploads the encoder weights, so neither happens in the
 first image request and admission's free device memory already excludes them.
 The weights stay resident even if no image arrives, including a sidecar
@@ -338,7 +324,7 @@ including temporary files of unfinished writes and files a crash left
 unreferenced. Restarting with a lower budget removes those first, then the
 oldest checkpoints by creation order, until the directory fits; use history does not
 survive a restart. One Qwen27B or Flash-Next server owns the directory: a second one fails
-at startup, after loading its model but before committing its RAM budget, with
+at startup, after loading its model but before its sessions allocate, with
 an ownership error naming the directory. The lock does not wait: a restarted
 server fails if its predecessor is still draining disk writes when the new one
 finishes loading its model. Other models do not take this lock.
@@ -351,7 +337,7 @@ Qwen27B and Flash-Next reject `--cache-disk-staging-bytes`, with or without
 weights load. Writes and restores
 stream each checkpoint through an internal 1 MiB pinned buffer, piece by piece;
 a larger buffer did not change restore or write speed and took pinned RAM and
-device heap from the cache and the sessions. Remove the option from Qwen27B and
+device heap from the sessions. Remove the option from Qwen27B and
 Flash-Next command lines.
 
 For DeepSeek, `--cache-disk-staging-bytes 0` (the default) selects the
@@ -1773,8 +1759,8 @@ and a 150-token answer cost one pass, a 1024-token answer four or five (a
 pass that another follows ends on a selection block), run as one
 work unit between other requests' decode rounds. The first scoring request
 allocates the 256-row head output (about 254 MB) and per-row target and
-result arrays; a server that never scores never allocates them. Only checkpoints of
-a prefilled prompt may be retained in RAM, as with `cache_persist: false`; a
+result arrays; a server that never scores never allocates them. Only a prefilled
+prompt may be cached, as with `cache_persist: false`; a
 prompt fed with its scored tokens leaves none, and the scored tokens are
 never published to the continuation cache or written to disk.
 

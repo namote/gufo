@@ -504,7 +504,7 @@ void EmitDiskEvent(const ContinuationDiskEvent& event) noexcept {
 }
 
 ContinuationCache::SnapshotSupport MakeSnapshotSupport(
-    ValidatedRunner* validated, TextRunnerRamCacheOptions options) {
+    ValidatedRunner* validated) {
   if (validated == nullptr || !validated->descriptor.capabilities.snapshot ||
       !validated->descriptor.capabilities.fork) {
     return {};
@@ -524,20 +524,15 @@ ContinuationCache::SnapshotSupport MakeSnapshotSupport(
             ReconcileStateBytes(validated->resources, text_state);
           },
       .capacity_bytes =
-          [validated, options] {
+          [validated] {
             const auto resources = validated->runner->ResourceClaim();
             const auto automatic =
                 resources.retained_snapshot_capacity_bytes.value_or(0);
-            validated->snapshot_automatic_bytes = std::min(
-                TextRunnerRamCacheOptions::kAutomaticMaxBytes, automatic);
+            validated->snapshot_automatic_bytes =
+                std::min(TextRunnerCacheOptions::kAutomaticMaxBytes, automatic);
             validated->snapshot_max_bytes =
                 resources.retained_snapshot_ceiling_bytes.value_or(automatic);
-            if (options.capacity_bytes == 0)
-              return validated->snapshot_automatic_bytes;
-            // An explicit limit is the operator's choice to trade headroom
-            // for retention, bounded so the host keeps a fixed reserve.
-            return std::min(options.capacity_bytes,
-                            validated->snapshot_max_bytes);
+            return validated->snapshot_automatic_bytes;
           },
       .on_event = EmitSnapshotEvent,
   };
@@ -649,8 +644,7 @@ void TextModelRunner::RestorePersistentSnapshot(
 }
 
 std::unique_ptr<ComponentCacheResources>
-TextModelRunner::CreateComponentCacheResources(cache::ResourceLedger&,
-                                               std::size_t) const {
+TextModelRunner::CreateComponentCacheResources(cache::ResourceLedger&) const {
   throw std::logic_error("text runner has no component cache provider");
 }
 std::unique_ptr<TextRunnerState> TextModelRunner::BindComponentState(
@@ -665,41 +659,16 @@ void TextModelRunner::ReconcileComponentState(TextRunnerState&,
 struct TextRunnerPool::Impl {
   static constexpr std::size_t kIntermediateCheckpoints = 4;
   Impl(std::shared_ptr<TextModelRunner> model_runner, std::size_t state_count,
-       std::optional<TextRunnerDiskCacheOptions> disk_cache_options,
-       TextRunnerRamCacheOptions ram_cache_options)
+       std::optional<TextRunnerDiskCacheOptions> disk_cache_options)
       : validated(ValidateRunner(std::move(model_runner), state_count)) {
     if (validated.runner->UsesComponentCache()) {
+      // No RAM checkpoint tier: the host ceiling bounds only what the slots
+      // pin as they allocate (ComponentTextCache).
       const auto resources = validated.runner->ResourceClaim();
-      const auto automatic =
-          resources.retained_snapshot_capacity_bytes.value_or(0);
-      const auto ceiling =
-          resources.retained_snapshot_ceiling_bytes.value_or(automatic);
-      const auto requested =
-          ram_cache_options.capacity_bytes
-              ? ram_cache_options.capacity_bytes
-              : std::min(TextRunnerRamCacheOptions::kAutomaticMaxBytes,
-                         automatic);
-      // This is an upper bound. Providers commit backing only after their
-      // slots allocate and the cache observes remaining host capacity. Slots
-      // allocate under the ceiling; what they pin is charged on top of this.
-      // The state claim includes lazy image/rollback storage, not startup
-      // usage. An explicit budget is passed as asked: where backing commits
-      // only while the host keeps its reserve, the cache grows toward it
-      // later; elsewhere the cache caps it at this startup ceiling.
+      const auto ceiling = resources.retained_snapshot_ceiling_bytes.value_or(
+          resources.retained_snapshot_capacity_bytes.value_or(0));
       component_cache = std::make_unique<ComponentTextCache>(
-          validated.runner, state_count,
-          ram_cache_options.capacity_bytes ? requested
-                                           : std::min(requested, ceiling),
-          disk_cache_options, !ram_cache_options.capacity_bytes, ceiling);
-      tail_checkpoints = ram_cache_options.tail_checkpoints;
-      // Each tail checkpoint would otherwise copy every row up to it.
-      if (tail_checkpoints != 0 && !component_cache->CapturesShareRows()) {
-        Logger::Info("cache",
-                     "event=tail_checkpoints status=not_applied "
-                     "reason=checkpoints_copy_rows requested=" +
-                         std::to_string(tail_checkpoints));
-        tail_checkpoints = 0;
-      }
+          validated.runner, state_count, disk_cache_options, ceiling);
       if (disk_cache_options) {
         shared_prefix_min_tokens = disk_cache_options->shared_prefix_min_tokens;
         shared_prefix_max_boundaries =
@@ -716,13 +685,7 @@ struct TextRunnerPool::Impl {
           ReconcileStateBytes(validated.resources, *state);
           return state;
         },
-        MakeSnapshotSupport(&validated, ram_cache_options),
-        TextRunnerRamCacheOptions::kMaxEntries);
-    if (ram_cache_options.tail_checkpoints != 0)
-      Logger::Info("cache",
-                   "event=tail_checkpoints status=not_applied "
-                   "reason=snapshots_copy_rows requested=" +
-                       std::to_string(ram_cache_options.tail_checkpoints));
+        MakeSnapshotSupport(&validated), TextRunnerCacheOptions::kMaxEntries);
     // Entry and byte limits constrain retention independently of session count.
     if (validated.descriptor.capabilities.snapshot) {
       // Report the same post-allocation limits that selected the capacity.
@@ -773,7 +736,6 @@ struct TextRunnerPool::Impl {
   // shorter system prompts prefill faster than they restore.
   std::size_t shared_prefix_min_tokens{
       TextRunnerDiskCacheOptions{}.shared_prefix_min_tokens};
-  std::size_t tail_checkpoints{0};
   std::size_t shared_prefix_max_boundaries{0};
 };
 
@@ -873,8 +835,7 @@ struct TextRunnerPool::Request::Impl {
        std::vector<std::size_t> shared_prefix_boundaries,
        const sampling::SamplingConfig& sampling_config,
        std::shared_ptr<const TextPromptContext> prompt_context,
-       std::size_t cache_prefix_tokens, bool overlap_snapshots,
-       std::size_t tail_checkpoints = 0)
+       std::size_t cache_prefix_tokens, bool overlap_snapshots)
       : runner(std::move(model_runner)),
         disk_store(std::move(persistent_store)),
         lease(std::move(state_lease)),
@@ -969,8 +930,6 @@ struct TextRunnerPool::Request::Impl {
         // A disabled cache (or a refused disk-only capture) must not prepare
         // checkpoint scratch or split a pass for a fallback it cannot keep.
         count = aligned;
-        // Retention gives it up before this turn's complete prompt.
-        lease.MarkAlignedTail(aligned);
       }
     }
     snapshot_tokens.reserve(prompt.size());
@@ -1013,25 +972,9 @@ struct TextRunnerPool::Request::Impl {
           checkpoints.push_back(position);
       }
     }
-    if (lease.component()) {
-      auto planned =
-          lease.PlannedCaptures(cache_prefix_tokens, tail_checkpoints);
-      checkpoints = std::move(planned.boundaries);
-      tail_positions = std::move(planned.tails);
-    }
-    if (alignment > 1) {
-      // Tail points are a subset of the checkpoints: align both the same way.
-      for (auto* positions : {&checkpoints, &tail_positions}) {
-        for (auto& position : *positions)
-          position = Aligned(position);
-        std::erase_if(*positions, [&](std::size_t position) {
-          return position <= prefill_offset;
-        });
-        std::ranges::sort(*positions);
-        positions->erase(std::ranges::unique(*positions).begin(),
-                         positions->end());
-      }
-    }
+    // Component caches keep no intermediate (grid or tail) checkpoints: those
+    // were RAM copies for nearby edits. Shared boundaries still stop prefill
+    // (SharedCheckpoint) and go to disk.
   }
 
   [[nodiscard]] std::size_t Aligned(std::size_t position) const noexcept {
@@ -1399,24 +1342,6 @@ struct TextRunnerPool::Request::Impl {
   std::vector<std::size_t> checkpoints;
   /// Checkpoints shared with other requests, retained like continuations.
   std::vector<std::size_t> shared_checkpoints;
-  /// Tail points among `checkpoints` (TextRunnerRamCacheOptions).
-  std::vector<std::size_t> tail_positions;
-
-  /// A checkpoint shared with peers at `position` serves later requests that
-  /// diverge there. Tail points within cache::kTailStep of it would only
-  /// leave a short pass between the two.
-  void DropTailCheckpointsNear(std::size_t position) {
-    constexpr std::size_t step = cache::kTailStep;
-    std::erase_if(tail_positions, [&](std::size_t tail) {
-      if (tail == position || tail <= prefill_offset ||
-          tail + step <= position || position + step <= tail)
-        return false;
-      if (const auto it = std::ranges::lower_bound(checkpoints, tail);
-          it != checkpoints.end() && *it == tail)
-        checkpoints.erase(it);
-      return true;
-    });
-  }
   bool boundary_capture{false};
   std::vector<TextRunnerToken> generated;
   std::size_t prefill_offset{0};
@@ -1654,10 +1579,8 @@ std::size_t TextRunnerPool::Request::ShareCheckpoint(
   if (position == target && !std::ranges::binary_search(checkpoints, target))
     checkpoints.insert(std::ranges::upper_bound(checkpoints, target), target);
   // Prompt snapshots are retained as continuation boundaries already.
-  if (std::ranges::binary_search(checkpoints, position)) {
+  if (std::ranges::binary_search(checkpoints, position))
     impl_->shared_checkpoints.push_back(position);
-    impl_->DropTailCheckpointsNear(position);
-  }
   return position;
 }
 
@@ -1791,9 +1714,6 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
   } rearm{finish_step ? &state : nullptr, &impl_->cancelled};
   if (finish_step)
     state.SetCancellationCheck({});
-  // Fallback captures and admission must finish before pinning starts. The
-  // chunk's GPU work can overlap preparation; cached decode never calls it.
-  impl_->lease.PreparePrefill(std::min(remaining, max_input_tokens));
   // The following step starts at this frontier and stops at the next one, so
   // a runner may read its inputs during this step.
   auto lookahead_end = impl_->prompt.size();
@@ -2069,11 +1989,26 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
     if (!impl_->lease.component())
       state.Invalidate();
   }
+  // Caching the finished request is optional: a cache failure here (no
+  // metadata room, a refused publication) leaves it uncached, and the
+  // request, whose output is complete, still succeeds.
+  const auto commit_failed = [&](const std::exception& error) noexcept {
+    try {
+      Logger::Info("cache",
+                   std::string("event=commit_failed reason=") + error.what());
+    } catch (...) {
+    }
+    impl_->lease.Invalidate();
+  };
   if (capabilities.snapshot && capabilities.fork) {
     CommitMetrics metrics = impl_->snapshot_metrics;
-    metrics.snapshot_bytes += impl_->lease.Commit(
-        std::move(impl_->snapshot_tokens), std::move(impl_->prompt_snapshot),
-        std::move(checkpoint));
+    try {
+      metrics.snapshot_bytes += impl_->lease.Commit(
+          std::move(impl_->snapshot_tokens), std::move(impl_->prompt_snapshot),
+          std::move(checkpoint));
+    } catch (const std::exception& error) {
+      commit_failed(error);
+    }
     metrics.component_cache = component_cache_metrics();
     if (metrics.component_cache) {
       metrics.disk_queued_bytes = metrics.component_cache->disk_queued_bytes;
@@ -2085,8 +2020,12 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
 
   std::unique_ptr<TextRunnerSnapshot> snapshot;
   CommitMetrics metrics;
-  metrics.snapshot_bytes =
-      impl_->lease.Commit(std::move(checkpoint), std::move(snapshot));
+  try {
+    metrics.snapshot_bytes =
+        impl_->lease.Commit(std::move(checkpoint), std::move(snapshot));
+  } catch (const std::exception& error) {
+    commit_failed(error);
+  }
   impl_.reset();
   return metrics;
 }
@@ -2180,10 +2119,9 @@ void TextRunnerPool::Request::Invalidate() noexcept {
 
 TextRunnerPool::TextRunnerPool(
     std::shared_ptr<TextModelRunner> runner, std::size_t state_count,
-    std::optional<TextRunnerDiskCacheOptions> disk_cache,
-    TextRunnerRamCacheOptions ram_cache)
+    std::optional<TextRunnerDiskCacheOptions> disk_cache)
     : impl_(std::make_unique<Impl>(std::move(runner), state_count,
-                                   std::move(disk_cache), ram_cache)) {}
+                                   std::move(disk_cache))) {}
 
 TextRunnerPool::~TextRunnerPool() = default;
 
@@ -2610,8 +2548,7 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
     Request request(std::make_unique<Request::Impl>(
         impl_->validated.runner, nullptr, ServingCacheLease(std::move(lease)),
         std::move(prompt), std::vector<std::size_t>{}, sampling_config,
-        std::move(context), cache_prefix_tokens, capacity() > 1,
-        impl_->tail_checkpoints));
+        std::move(context), cache_prefix_tokens, capacity() > 1));
     request.impl_->request_memory = std::move(request_memory);
     request.impl_->cancelled = is_cancelled;
     if (reuse_prompt) {

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Measure retained screenshot preparation on full continuation-cache hits (#627).
 
+Retries restore the prompt's disk checkpoint: pass --cache-disk DIR in the
+server command (Qwen27B and Flash-Next keep no RAM checkpoints).
+
 Uses only the standard library. Keeps every request/response and the server log;
 run the same command with baseline and candidate production binaries. Debug
 logging exposes the candidate's retained RGB byte count independently of RSS.
@@ -164,7 +167,10 @@ def run(args, command):
                         if repeat:
                             assert usage["cached_tokens"] == usage["prompt_tokens"], row
                             assert usage["gufo"]["prefill_tokens"] == 0, row
-                            assert usage["gufo"]["component_cache"]["reuse"] == "ram", row
+                            # No RAM checkpoint tier: an identical retry
+                            # restores the prompt's disk checkpoint, so the
+                            # command needs --cache-disk.
+                            assert usage["gufo"]["component_cache"]["reuse"] == "disk", row
                             assert result["choices"] == rows[-2]["response"]["choices"], row
                             if kind != "text" and row["image_cache"] is not None:
                                 previous = rows[-2]["image_cache"]

@@ -28,18 +28,23 @@ ability to trim a checkpoint: a saved snapshot can only be reused **whole**,
 and only when its tokens are an exact prefix of the new prompt.
 
 Qwen3.8-27B (AR and DFlash2) and Qwen3.8-Flash-Next serve through the
-component cache of the [cache redesign](cache-redesign/RFC.md). Its backing
-and disk options are described under [component-cache budgets](#component-cache-budgets).
-Qwen27B retains target KV, convolution and recurrent state, image identity,
-sampled frontier and pending output tokens. DFlash2 adds private ring KV with
+component cache of the [cache redesign](cache-redesign/RFC.md), which keeps
+**no RAM checkpoints**: a request continues its session's live frontier, or
+restores a disk checkpoint, or prefills cold. Without `--cache-disk` only live
+frontiers are reused. See [component-cache budgets](#component-cache-budgets).
+A checkpoint holds target KV, convolution and recurrent state, image identity,
+sampled frontier and pending output tokens; DFlash2 adds private ring KV with
 its own injected frontier, pending target features and draft controller state.
-Borrowed target KV rows are preserved before mutation or rollback; private
-frontiers are captured into committed host backing. Disk transfers use fixed
-1 MiB staging regardless of checkpoint size.
+Every capture is a disk capture: completed KV rows are read from the session
+(or from rows the device retains), while private states, partial tails and
+rows the session cannot lend are first copied into bounded pinned host arenas.
+Disk transfers use fixed 1 MiB staging regardless of checkpoint size.
 
-The snapshot-cache implementation below remains in use for DeepSeek. Earlier
-Qwen examples and measurements describe its former snapshot implementation;
-they are historical evidence, rather than qualification of the component path.
+The RAM snapshot cache described in the sections below (grid checkpoints, RAM
+retention priorities, the 128-record pool, automatic RAM budget) remains in
+use only for DeepSeek and other legacy runners. Earlier Qwen examples and
+measurements describe that former implementation; they are historical
+evidence, rather than qualification of the component path.
 
 ## Why it exists
 
@@ -74,9 +79,11 @@ flowchart LR
   COLD --> ALL[Prefill the whole prompt]
 ```
 
-The in-memory tier is always on. The disk tier is opt-in, adds restart safety,
-and can additionally *learn* boundaries between conversations that merely share
-a prefix.
+The in-memory tier is always on: live session frontiers for every runner,
+plus retained RAM snapshots for legacy runners (DeepSeek). Qwen27B and
+Flash-Next keep no RAM snapshots, so for them every checkpoint is on disk. The
+disk tier is opt-in, adds restart safety, and can additionally *learn*
+boundaries between conversations that merely share a prefix.
 
 ## Finding reuse
 
@@ -173,7 +180,8 @@ sequenceDiagram
    conversation continuing from its own retained turn therefore never waits
    for a newcomer that shares only its system prompt.
 3. The resident request stops its prefill at the shared position and
-   publishes a RAM checkpoint there, as for intermediate checkpoints. A
+   publishes a checkpoint there (Qwen27B and Flash-Next: a disk checkpoint;
+   the follower waits for its publication). A
    checkpoint it already plans within 64 tokens is used instead. Identical
    prompts share up to the leader's last prompt token or its stable boundary.
 4. The waiting request holds no session. Once the checkpoint is retained, or
@@ -214,17 +222,19 @@ continuation does not stop at a stable boundary within 64 tokens of its reused
 frontier: a second pass over the whole context would cost more than the few
 tokens such a boundary saves, and the complete prompt is captured instead.
 A cold assignment, or a pool reclaim, that would reset an idle slot first
-captures its live frontier as a RAM checkpoint when no checkpoint comes within
-64 tokens of it, so that conversation's next turn does not prefill its last
-reply again. The copy is retained at retry priority: it may only displace other
-optional copies and is the first to go. Logs:
-`event=live_frontier_captured`, `event=live_frontier_capture_refused`; a
-frontier a pool reclaim cannot copy without keeping the rows it frees is
-logged as `event=live_frontier_dropped`.
+writes its live frontier to disk when no checkpoint comes within 64 tokens of
+it, so that conversation's next turn does not prefill its last reply again
+(Qwen27B and Flash-Next, with `--cache-disk`). The state is copied into host
+arenas while no other model work runs, so the slot is released at once; when
+the arenas have no room the slot is held until the writer has read it. Logs:
+`event=live_frontier_captured`, `event=live_frontier_capture_refused`; without
+a disk cache the frontier is dropped, logged as `event=live_frontier_dropped`.
 Coincident RAM and disk boundaries share one copy. Admission
 remains subject to the existing byte budget, and intermediate copies preserve
-the original branching fallback. These intermediate checkpoints live in RAM;
-the disk tier continues to retain prompt and learned shared-prefix boundaries.
+the original branching fallback. These intermediate checkpoints live in RAM
+and exist only for legacy runners: Qwen27B and Flash-Next take no grid or tail
+checkpoints, and the disk tier retains prompt, learned shared-prefix and live
+frontier boundaries.
 
 ### Learned divergence points
 
@@ -258,9 +268,9 @@ Without disk, this needs no configuration.
 The system prompt is known without a second conversation. A request whose
 leading system and developer messages reach 128 tokens also keeps a checkpoint
 where they end: the first token at which its prompt and the same messages with
-an empty user turn differ. It is retained like a learned divergence point, in
-RAM and on disk, so the first conversation under the same system prompt
-restores it instead of an earlier tail checkpoint or a cold prefill.
+an empty user turn differ. It is retained like a learned divergence point
+(on disk for Qwen27B and Flash-Next), so the first conversation under the same
+system prompt restores it instead of a cold prefill.
 
 Execution and retention have separate limits. `--sessions N` allocates N
 mutable execution states and controls active request concurrency. A separate
@@ -369,17 +379,20 @@ loop stops rather than trying the next candidate, in both tiers **(source)**.
 
 ## Limits
 
-Independent limits can each bind first. Payload memory is allocated only when
-captured; RAM-retained snapshots and their captures in progress share the RAM budget.
+Independent limits can each bind first. For legacy runners, payload memory is
+allocated only when captured; RAM-retained snapshots and their captures in
+progress share the RAM budget. Qwen27B and Flash-Next keep no RAM checkpoints
+(see [component-cache budgets](#component-cache-budgets)).
 
 | Limit | Default | Set by |
 | --- | --- | --- |
-| Retained snapshot bytes, RAM | smaller of 32 GiB and half the available host RAM; an explicit value up to the available host RAM minus 4 GiB (Qwen27B and Flash-Next: a target the backing grows toward while the host keeps 4 GiB free); 27B also checks HIP free memory | `--cache-ram-bytes` |
-| RAM checkpoint records | 128, independent of `--sessions` | internal safety limit |
+| Retained snapshot bytes, RAM (legacy runners only) | smaller of 32 GiB and half the available host RAM | automatic, no option |
+| RAM checkpoint records (legacy runners only) | 128, independent of `--sessions` | internal safety limit |
+| Capture host arenas (Qwen27B, Flash-Next) | 4 GiB of pinned host memory, freed after 60 s unused | internal |
+| Cache metadata (Qwen27B, Flash-Next) | 256 MiB plus 1/64 of the disk budget, plus what the sessions pinned | internal |
 | Disk bytes | 8 GiB | `--cache-disk-bytes` |
 | Disk staging bytes (DeepSeek; Qwen27B and Flash-Next reject the option) | smaller of `MemAvailable / 8` and the disk budget | `--cache-disk-staging-bytes` |
 | Paged KV pool bytes, device (Qwen27B, FP16 attention KV) | every session's full context | `--kv-pool-bytes` |
-| Tail checkpoints per long prompt | 3, where checkpoints keep KV as pool blocks | `--cache-tail-checkpoints` |
 
 Qwen27B sessions with FP16 attention KV share one device pool of 256-token
 KV blocks instead of a full-context KV allocation each; this is always on
@@ -390,32 +403,15 @@ overcommit or larger to retain more checkpoint blocks. A session maps blocks
 as it writes; a request is admitted once the pool holds its prompt plus
 `max_tokens`, counting the blocks a continued session already maps. While the
 pool is short, idle sessions the prompt does not continue return their
-blocks: empty slots first, then RAM checkpoints holding blocks only they use,
-then live frontiers, oldest first. Otherwise admission waits for running
-requests. The pool must hold one full-context session; other models refuse a
-nonzero value. With paged KV, RAM checkpoints keep KV chunks as block
-references, so each costs its private state and tails.
+blocks: empty slots first, then live frontiers, oldest first (an uncovered
+one is written to disk first when there is a disk cache). Otherwise admission
+waits for running requests. The pool must hold one full-context session; other
+models refuse a nonzero value.
 
-`--cache-tail-checkpoints K` keeps K RAM checkpoints, one every 1024 tokens
-over the end of a long prompt, so a later prompt that differs only near its
-end restores within 1024 tokens of the difference. It applies only where
-checkpoints keep KV as pool blocks and is logged at startup as
-`event=tail_checkpoints status=not_applied` otherwise.
-
-`--cache-ram-bytes 0` selects automatic sizing. Zero does not disable reuse.
-A positive value replaces the automatic budget and may exceed it: it trades the
-free half of host RAM for retention, but always leaves 4 GiB to the OS and other
-processes. For an 8 GiB cap, use `--cache-ram-bytes 8589934592`. The startup
-line reports the selected `capacity_bytes`, the `automatic_bytes` budget and
-the `max_bytes` an explicit value may claim. With a DFlash2 draft, the
-Qwen3.8-27B sessions also pin one prompt capture of about 400 MiB at startup,
-shared by every session because prefill captures for one session at a time,
-reported as `slot_pinned_bytes`. It is charged on top of `capacity_bytes`: an
-explicit value may claim at most `max_bytes` minus `slot_pinned_bytes`, or the
-startup ceiling minus `slot_pinned_bytes` when that ceiling binds.
-`automatic_bytes` is half the available RAM measured before the pins. The
-`global_ram_bytes` gauge and the metadata category include the pins, so live
-usage can exceed `capacity_bytes`.
+The legacy RAM budget below applies only to DeepSeek and other legacy
+runners; it has no option. With a DFlash2 draft, the Qwen3.8-27B sessions pin
+one prompt capture of about 400 MiB at startup, shared by every session,
+reported as `slot_pinned_bytes`; the component-cache ledger keeps it charged.
 
 Both are sampled after weights and execution states are allocated, then fixed
 for the server run. Flash-Next and Qwen3.8-27B use half the available
@@ -427,10 +423,8 @@ Strix Halo, so HIP's free-memory estimate alone is not enough.
 For example, 44 GiB available at load gives a 22 GiB automatic RAM cache and
 allows an explicit limit of up to 40 GiB, even when HIP reports more free
 memory.
-Memory that another process claims after startup is not subtracted. When
-other GPU servers share the machine, such as an image or speech server, set an
-explicit `--cache-ram-bytes` that leaves room for their peak use; starting
-them first only accounts for what they hold at that moment.
+Memory that another process claims after startup is not subtracted; starting
+other GPU servers first only accounts for what they hold at that moment.
 The RAM payload budget excludes weights, execution states, token metadata,
 disk staging and Qwen's separate CPU image-preprocessing cache (up to 128 MiB
 of retained encoded/RGB vectors plus bounded metadata). It also excludes temporary
@@ -456,10 +450,6 @@ and retry copies are refused. This is a hardware ratio, not a cache policy:
 weights, execution states and the OS leave no more memory. To keep more deep
 conversations:
 
-- Raise `--cache-ram-bytes` towards the reported `max_bytes` (less
-  `slot_pinned_bytes` on Qwen3.8-27B): about 10.5 GB
-  here, enough for a 200k-token checkpoint plus a 50k one instead of only the
-  first.
 - Run fewer `--sessions`: each Flash-Next session at 262144 context holds about
   6.3 GB of state that the cache can use instead.
 - Add `--cache-disk` so checkpoints that leave RAM can still be restored from
@@ -480,66 +470,49 @@ global least-recently-used, without conversation or rebuild-cost awareness.
 
 ### Component-cache budgets
 
-Qwen27B and Flash-Next use the same options with these meanings:
+Qwen27B and Flash-Next keep no RAM checkpoint tier. There is no
+`--cache-ram-bytes` or `--cache-tail-checkpoints` option, no committed backing
+pool and no RAM restore (`reuse` is `live`, `disk` or `none`). Reuse order is:
+
+1. the session's live frontier, continued in place;
+2. a disk checkpoint, restored through the 1 MiB staging buffer;
+3. cold prefill.
+
+Every capture (prompt end, stable and learned shared boundaries, idle
+write-back, reassignment, pool reclaim) goes to the single disk writer.
+Completed KV rows are lent from the session, or read from rows the device
+retains, until the writer has read them. Private states (about 132 MB for a
+Flash-Next checkpoint), partial tails and rows the session cannot lend are
+copied first into pinned host arenas of 64 MiB (a larger piece takes its own),
+at most 4 GiB in all, returned when written and freed after 60 s unused. A
+capture that finds no arena room is held on its session until the writer reads
+it (idle write-back, reassignment) or is skipped (`event=capture_staging_refused`).
+A boundary within the disk step of an earlier checkpoint is not copied at all.
+
+The cache's host bookkeeping (index, histories, disk store and catalog,
+publication scratch) is charged to a ledger that holds metadata only: 256 MiB
+plus 1/64 of `--cache-disk-bytes`, plus what the sessions pinned at startup.
+No cached payload competes for it. Disk staging (1 MiB plus up to 48 MiB of
+device read-ahead) has its own limit.
+
+A cache failure on the request path never fails a request: it leaves that
+state uncached. Logs: `event=commit_failed` (release),
+`event=capture_staging_refused`, `event=capture_refused`,
+`event=persistence_refused`, `event=publication_untracked` (a written
+checkpoint the index could not take; a restart finds it),
+`event=live_frontier_unindexed` (the next turn restores from disk instead of
+continuing in place).
 
 | Option | Meaning |
 | --- | --- |
-| `--cache-ram-bytes` | The automatic and explicit sizing above, as a cap. Pinned 64 KiB pages for up to about 89% of it are committed as captures need them, in equal steps of about 1 GiB, and stay committed; the rest is reserved for cache metadata, which grows with use. The pages hold checkpoint state, KV rows, partial tails and idle-session spill. There is no separate spill budget. |
 | `--cache-disk-bytes` | Counts referenced, temporary and orphaned files. A lower budget at startup removes temporaries and orphans, then the oldest checkpoints by creation order: use history does not survive a restart. |
-| `--cache-disk-staging-bytes` | Rejected: startup fails before any weights load. Disk transfers use an internal 1 MiB pinned buffer; checkpoints of any size stream through it. Its size did not change restore or write speed (#562), and a larger value only took pinned RAM and device heap. Earlier advice to raise staging no longer applies. |
-| `--cache-disk DIR` | Owned by one Qwen27B or Flash-Next server. A second one fails at startup, before committing its RAM budget, with an ownership error naming the directory. Other models do not take this lock. Startup removes earlier-release `*.kvc` and `.tmp-*` files from the directory, including those of another model's server sharing it. |
+| `--cache-disk-staging-bytes` | Rejected: startup fails before any weights load. Disk transfers use an internal 1 MiB pinned buffer; checkpoints of any size stream through it. Its size did not change restore or write speed (#562), and a larger value only took pinned RAM and device heap. |
+| `--cache-disk DIR` | Owned by one Qwen27B or Flash-Next server. A second one fails at startup, before its sessions allocate, with an ownership error naming the directory. Other models do not take this lock. Startup removes earlier-release `*.kvc` and `.tmp-*` files from the directory, including those of another model's server sharing it. |
 
-The 128-record limit stays internal. The following measured sizes and timings
-are Flash-Next evidence; Qwen27B qualification is recorded in its model card.
-Each Flash-Next checkpoint holds about 132 MB of
-private state, so below a budget of about 19 GB that state caps the checkpoint
-count under 128; only larger explicit budgets can reach the record limit. The startup line
-`schema=component-cache-v1 event=configured` reports `capacity_bytes`,
-`automatic_bytes`, `max_bytes`, `staging_capacity_bytes`,
-`disk_capacity_bytes` and `slot_pinned_bytes` (host memory the sessions pinned
-at startup, charged on top of `capacity_bytes`).
-
-Flash-Next prepares a bounded two-segment reserve before readiness and can
-prepare the next segment before a prefill with at least 512 tokens remaining
-or when assigning backing to completed append rows. Private-state and partial-tail copies do not request speculative
-growth; a capture still commits any backing it needs.
-
-Backing excludes transparent huge pages before population and attempts a Linux
-long-term page pin before GPU registration. GPU registration alone leaves
-anonymous pages movable: ordinary memory compaction can invalidate their GPU
-mappings and pause the process's queues. Registered `io_uring` buffers supply
-the extra pin without submitting I/O or running polling threads. Their
-lifetime follows the backing, including blocks that outlive the pool facade;
-cleanup unregisters the GPU mapping and releases the pin before unmapping.
-If `io_uring` or the process's memory-lock limit refuses the pin, the existing
-registered base-page path remains available with the same cache capacity.
-`event=backing_prepared` and `event=backing_grown` report
-`long_term_pinned_bytes` alongside committed bytes, making that fallback visible.
-
-Container seccomp profiles may block `io_uring_setup` and `io_uring_register`.
-An unlimited `memlock` setting alone does not enable them. Check the pin-byte
-counter inside the running container: zero means the extra migration protection
-is unavailable. Enabling it requires allowing these two calls in the
-operator-managed syscall policy; `io_uring_enter` is not used. The registered
-base-page fallback remains compatible with restrictive container policies.
-
-A step of about 1 GiB took 56–58 ms on the capturing thread while the host had
-free pages **(measured)**. Captures run on the scheduler thread, so concurrent
-requests pause for that long too; an 8 GiB budget fills in eight steps. When the
-kernel must first reclaim page cache, such as the model files read at load, a
-step takes longer: a 157K-token turn that retained 4.8 GB right after a restart
-spent about 3.5 s growing in 256 MiB steps. The eager pool paid the same reclaim at startup; at a
-17 GiB budget model load took 29–39 s against 16 s now **(measured)**. Segments
-cannot be joined, so a payload stays within one, and each edge strands space
-that a ~140 MB private state cannot use; equal segments of about 1 GiB keep that
-small. A step is skipped while the host would keep less than 4 GiB available
-(`schema=component-cache-v1 event=backing_limited`); the cache then works within
-what it has committed, evicting as at a full budget, and tries again a second
-later. Until the cache fills, the host keeps the remaining memory, including the
-page cache that holds recent disk checkpoints, so a restore soon after a
-restart reads them from memory. A cache that has filled keeps its footprint, as
-the old cache did; the advice above on explicit budgets for co-resident servers
-still applies.
+The startup line `schema=component-cache-v1 event=configured` reports
+`metadata_limit_bytes`, `staging_capacity_bytes`, `snapshot_capacity_bytes`
+(the arena bound), `disk_capacity_bytes`, `disk_read_ahead_bytes` and
+`slot_pinned_bytes`.
 
 ## The disk tier
 
@@ -558,19 +531,18 @@ that read each file through a small buffer, up to 64 MiB ahead of the reader,
 leave it in the page cache (4.1 GB/s) **(measured, host replay of a 16K
 Qwen27B checkpoint)**.
 
-It also **learns shared-prefix boundaries** that survive restarts. RAM learns a
-divergence point from the second conversation and restores it from the third
-(see above); the disk index needs more conversations, and in one run its
-boundary became usable from the fifth **(measured)**. When both tiers choose the
-same position, one capture feeds both. See #267.
+It also **learns shared-prefix boundaries** that survive restarts. A
+divergence point is learned from the second conversation (see above); in one
+run of the former RAM-and-disk design the disk boundary became usable from the
+fifth **(measured)**. See #267.
 
 **Disk checkpoints are spaced at least 2048 tokens apart.** A conversation
 advances a few hundred tokens per turn, so writing every turn serialises, fsyncs
 and retains a nearly identical snapshot. A checkpoint less than 2048 tokens past
 the longest stored entry that is still a prefix of it is skipped and logged as
-`min_step`; the RAM tier still retains it. When RAM does not retain it either,
-the device state is not copied at all, so a skipped checkpoint costs no capture
-time on the request path. Learned shared-prefix boundaries are
+`min_step`; legacy runners still retain it in RAM. Otherwise (and always on
+Qwen27B and Flash-Next) the device state is not copied at all, so a skipped
+checkpoint costs no capture time on the request path. Learned shared-prefix boundaries are
 exempt, because they sit close to a deeper entry by construction. On a
 Qwen3.8-27B functional run this cut disk writes from 31 to 5 and written bytes
 from 6.97 GiB to 1.37 GiB **(measured)**.
@@ -580,8 +552,8 @@ once RAM evicted the conversation, a request restores the nearest stored entry
 and re-prefills up to 2048 tokens plus its own turn, instead of resuming
 exactly at the previous frontier. Greedy output is unchanged. Sampled output can
 differ from the pre-restart response, because the re-prefilled gap follows
-different chunk shapes, as with any partial hit. Plain continuation from RAM is
-unaffected.
+different chunk shapes, as with any partial hit. Continuation of a live
+frontier is unaffected; idle write-back (below) keeps the last turn on disk.
 
 **Idle and stopping sessions are written back.** With the component cache
 (Qwen27B, Flash-Next), a session idle for the write-back delay whose live
@@ -636,18 +608,19 @@ a top-level `cache_persist`; see [the server guide](SERVER.md).
 
 | Log line | Meaning |
 | --- | --- |
-| `event=snapshot_cache_configured` | retained capacity at startup, with the automatic budget and the most an explicit `--cache-ram-bytes` may claim |
-| `schema=component-cache-v1 event=configured` | Flash-Next: RAM, staging and disk budgets at startup, with the automatic budget and the most an explicit `--cache-ram-bytes` may claim |
-| `schema=component-cache-v1 event=backing_grown` | Flash-Next: a capture committed another segment of cache pages (about 1 GiB); reports `committed_bytes`, `segments` and the capture's `acquire_ms` |
-| `schema=component-cache-v1 event=backing_limited reason=host_reserve` | Flash-Next: the cache stopped growing below its budget because the host would keep less than 4 GiB available |
-| `schema=component-cache-v1 event=backing_limited reason=device_heap_reserve` | Flash-Next: the cache stopped growing because its pinned pages would leave the device heap less than its 4 GiB dispatch reserve, which would push session and scratch allocations onto managed memory (#460) |
+| `event=snapshot_cache_configured` | legacy runners: retained RAM capacity at startup, with the automatic budget |
+| `schema=component-cache-v1 event=configured` | Qwen27B/Flash-Next: metadata limit, staging, capture-arena and disk budgets at startup |
+| `schema=component-cache-v1 event=capture_staging_refused` | Qwen27B/Flash-Next: the capture arenas had no room for a capture's private state and tails; the capture is held on its session (`held_write=true`) or skipped |
+| `event=commit_failed` | a cache failure at request release; the request succeeds and its state is not cached |
+| `schema=component-cache-v1 event=publication_untracked` | a checkpoint was written but the index could not take it; it is found again at restart |
+| `schema=component-cache-v1 event=live_frontier_unindexed` | a finished request's live frontier could not be indexed; its next turn restores from disk |
 | `schema=component-cache-v1 event=disk_evicted reason=budget` | Flash-Next: startup removed the oldest checkpoints (creation order) to fit a lowered `--cache-disk-bytes` |
 | `schema=component-cache-v1 event=disk_over_budget` | Flash-Next: the directory still exceeds `--cache-disk-bytes` after startup reclamation and eviction; publication is refused until it fits |
 | `schema=component-cache-v1 event=published` | A checkpoint finished disk publication; `checkpoint_id` identifies the capture and `tokens` its boundary |
 | `schema=component-cache-v1 event=persistence_refused reason=min_step` | A captured checkpoint is too close to an existing publication; includes `checkpoint_id` and `tokens` |
 | `event=snapshot action=removed reason=entry_capacity` | a retained prefix was evicted because every entry was taken |
 | `event=snapshot action=skipped reason=entry_capacity` | no checkpoint record could be replaced safely for this capture |
-| `event=snapshot action=skipped reason=byte_capacity` | a checkpoint did not fit the RAM budget |
+| `event=snapshot action=skipped reason=byte_capacity` | legacy runners: a checkpoint did not fit the RAM budget |
 | `event=disk_cache action=removed reason=lru` | a disk entry was evicted to stay inside `--cache-disk-bytes` |
 | `event=disk_cache action=skipped reason=staging_capacity` | a checkpoint exceeded `--cache-disk-staging-bytes` and was never written |
 | `event=disk_cache action=skipped reason=min_step` | a checkpoint was less than 2048 tokens past a stored prefix; RAM still retains it |

@@ -20,7 +20,7 @@ struct ComponentCacheMetrics {
   std::uint32_t kv_layout_version{};
   std::string reuse{"none"};
   std::uint32_t selection_reason{};
-  std::size_t deepest_live{}, deepest_ram{}, deepest_disk{}, selected{};
+  std::size_t deepest_live{}, deepest_disk{}, selected{};
   std::size_t restored_bytes{}, prefilled{}, captures{}, captured_bytes{};
   std::size_t borrowed_capacity_bytes{}, copied_payload_bytes{};
   // Completed chunks the adapter retained in device storage, without RAM.
@@ -42,7 +42,6 @@ inline json::Value ComponentCacheJson(const ComponentCacheMetrics& value) {
   result["reuse"] = value.reuse;
   result["selection_reason"] = static_cast<std::size_t>(value.selection_reason);
   result["deepest_live_tokens"] = value.deepest_live;
-  result["deepest_ram_tokens"] = value.deepest_ram;
   result["deepest_disk_tokens"] = value.deepest_disk;
   result["selected_tokens"] = value.selected;
   result["restored_bytes"] = value.restored_bytes;

@@ -45,7 +45,6 @@ MAX_REQUEST_BYTES = 64 * 2**20
 DISK_EMPTY_CACHE_RESERVE_BYTES = 200 * 2**30
 DISK_MIN_FREE_BYTES = 100 * 2**30
 ENABLE_YARN = CONTEXT > 262144
-RAM_CACHE_BYTES = 4 * 2**30
 SESSIONS = 2
 KV_CACHE_TYPE = 'kvarn-k4v4'
 # 0: no shared pool on Flash-Next; each session allocates its full-context KV.
@@ -155,7 +154,7 @@ def build_command(state):
                 '--reasoning-effort', 'low',
                 *(['--enable-yarn'] if ENABLE_YARN else []), '--context', str(CONTEXT), '--sessions', str(SESSIONS),
                 '--kv-cache-type', KV_CACHE_TYPE,
-                '--kv-pool-bytes', str(KV_POOL_BYTES), '--cache-ram-bytes', str(RAM_CACHE_BYTES),
+                '--kv-pool-bytes', str(KV_POOL_BYTES),
                 '--cache-disk', '/cache/continuations', '--cache-disk-bytes', str(DISK_CACHE_BYTES),
                 '--temperature', str(TEMPERATURE), '--top-k', '20', '--top-p', '0.95', '--min-p', '0',
                 '--repeat-penalty', '1', '--han-scale', str(HAN_SCALE),
@@ -185,7 +184,7 @@ def supervise():
              'memory_critical_bytes': MEMORY_CRITICAL_BYTES, 'memory_low_grace_seconds': MEMORY_LOW_GRACE_SECONDS,
              'gpu_diagnostics_policy': 'log_only', 'runtime_resource_stop_guard': 'host_memory',
              'kv_pool_bytes': KV_POOL_BYTES, 'kv_cache_type': KV_CACHE_TYPE,
-             'enable_yarn': ENABLE_YARN, 'yarn_factor': CONTEXT / 262144 if ENABLE_YARN else 1, 'ram_cache_bytes': RAM_CACHE_BYTES,
+             'enable_yarn': ENABLE_YARN, 'yarn_factor': CONTEXT / 262144 if ENABLE_YARN else 1,
              'thinking': 'on', 'reasoning_effort': 'low', 'vision_model': VISION,
              'disk_cache_bytes': DISK_CACHE_BYTES, 'disk_cache_directory': str(CACHE_ROOT / 'continuations')}
     def persist():

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""dblaber's #562 steps C, D and E2 with a conversation larger than the RAM budget.
+"""dblaber's #562 steps C, D and E2 with a deep conversation served from disk.
+
+Originally run with a conversation larger than the RAM budget; Qwen27B now keeps
+no RAM checkpoints, so every restore below comes from the live slot or disk.
 
 C: deep turn with many new tokens, disconnect after a completed pass, then resend.
 D: three short same-system chats (sessions=3), then a deep append.
@@ -61,8 +64,6 @@ def chat(label, messages):
     usage = result["usage"]
     if args.expect_component and not usage["gufo"].get("component_cache"):
         raise RuntimeError("Candidate did not use component cache")
-    if label == "A1_cold" and args.ram_bytes != "auto" and usage["prompt_tokens"] * 65536 <= int(args.ram_bytes):
-        raise RuntimeError("Qwen FP16 KV alone did not exceed the RAM cache budget")
     if label == "C_resend":
         assert_cancelled_frontier(out, label, result, cancel_observation,
                                   component=args.expect_component)

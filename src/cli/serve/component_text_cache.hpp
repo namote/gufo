@@ -38,18 +38,11 @@ inline constexpr std::size_t kReassignmentSnapshotBytes = std::size_t{4} << 30;
 inline constexpr std::chrono::milliseconds kReassignmentSnapshotIdle{60000};
 
 // Model-independent serving orchestration; the model supplies physical storage
-// and binds its ordinary execution facade to adapter-owned slots.
-struct ComponentCaptureBuffer {
-  std::span<std::byte> bytes;
-  std::function<cache::Payload()> finish;
-  // Identity of one underlying allocation, for joining adjacent byte spans.
-  // Null providers always transfer each buffer separately.
-  const void* allocation{};
-  // Consume assigned backing without copying completed append rows. The
-  // source view is backend-native and kept immutable by the slot guard.
-  std::function<cache::Payload(cache::SlotLease&, std::span<const std::byte>)>
-      borrow;
-};
+// and binds its ordinary execution facade to adapter-owned slots. There is no
+// RAM checkpoint tier: a request continues its slot's live frontier, or
+// restores a disk checkpoint. Captures go to disk through the persistence
+// queue; private states, tails and rows the slot cannot lend are copied first
+// into the bounded host arenas of the snapshot pool.
 struct ComponentCacheResources {
   std::shared_ptr<void> owner;
   std::unique_ptr<cache::Adapter> adapter;
@@ -57,16 +50,7 @@ struct ComponentCacheResources {
   // Optional lease from the same pool that keeps a number of streams free;
   // disk writes queue device reads ahead only through it.
   cache::ReserveStreamLease reserve_stream;
-  std::function<ComponentCaptureBuffer(const cache::PayloadRequest&)> allocate;
   cache::StagingAllocator staging;
-  // Prepare on-demand backing immediately before the next prefill chunk.
-  std::function<void(std::size_t)> prepare_prefill;
-  // Optional capacity bound before assigning a complete capture. False takes
-  // the ordinary reclamation path; true still requires every allocation.
-  std::function<bool(std::span<const cache::PayloadRequest>)> can_capture;
-  // Optional initialization step after slots allocate. The provider leaves
-  // payload backing uncommitted until serving selects the post-slot budget.
-  std::function<void(std::size_t)> commit_backing;
   // Optional host bytes the slots pinned and charged to the ledger as they
   // allocated. Serving charges them on top of the cache's budget, and adds
   // them back to the runner's claim, which measures the host after them.
@@ -78,11 +62,13 @@ struct ComponentCacheResources {
   // usable without a pool-capacity contract.
   std::size_t transfer_batch_size{1};
   std::size_t reassignment_batch_size{1};
-  // Host bytes (from `staging`, outside the RAM cache budget) that idle-slot
-  // states handed to the disk writer on reassignment may occupy at once.
-  // Admission copies such a state there in the foreground and releases the
-  // slot, instead of keeping it leased until the writer has read it; a state
-  // over the remaining room keeps the slot (SlotHold). Zero always keeps it.
+  // Host bytes (snapshot arenas from `snapshot_allocate`, else `staging`)
+  // that captures handed to the disk writer may occupy at once: private
+  // states and tails of every capture, and on reassignment the whole
+  // idle-slot state, which admission copies there in the foreground before
+  // releasing the slot instead of keeping it leased until the writer has
+  // read it. A state over the remaining room keeps the slot (SlotHold) where
+  // it may, and is otherwise not captured. Zero disables the arenas.
   std::size_t reassignment_snapshot_bytes{kReassignmentSnapshotBytes};
   // Snapshots take arenas of this size (a larger piece takes its own), which
   // return to a pool once written and are reused. Pooled arenas unused for
@@ -97,13 +83,6 @@ struct ComponentCacheResources {
   // now (beyond the host ceiling every snapshot respects); the slot is kept.
   std::function<bool(std::size_t)> snapshot_room;
 };
-// Optional prefill stops, ascending. Tails are the subset planned as tail
-// points; a stop shared with peers nearby makes them redundant.
-struct PlannedCapturePoints {
-  std::vector<std::size_t> boundaries;
-  std::vector<std::size_t> tails;
-};
-
 class ComponentTextCache {
 public:
   struct Impl;
@@ -134,33 +113,23 @@ public:
     void Invalidate() noexcept;
     [[nodiscard]] std::size_t CaptureBytes() const;
     [[nodiscard]] std::size_t CaptureBytes(std::size_t boundary) const;
-    // True when a capture at `boundary` exceeds the RAM budget and the disk
-    // would not take it either (no disk cache, or within the disk step).
+    // True when the disk would not take a capture at `boundary` (no disk
+    // cache, a prompt kept off the disk, or within the disk step).
     [[nodiscard]] bool CaptureRefused(std::size_t boundary) const;
     [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Capture();
-    void PreparePrefill(std::size_t tokens);
     [[nodiscard]] ComponentCacheMetrics Metrics() const;
-    [[nodiscard]] PlannedCapturePoints PlannedCaptures(std::size_t stable,
-                                                       std::size_t tail) const;
-    // The capture at `boundary` is the aligned prompt tail before an
-    // unaligned prompt end; retention gives it up before the turn's retry.
-    void MarkAlignedTail(std::size_t boundary) noexcept;
 
   private:
     friend class ComponentTextCache;
     std::unique_ptr<Impl> impl_;
   };
-  // Slots allocate under the larger of ram_bytes and ceiling_bytes, so a
-  // smaller budget does not refuse what they pin. The RAM limit then becomes
-  // the budget plus those pins, within the host ceiling.
+  // Slots allocate under ceiling_bytes (host memory they may pin). The
+  // ledger then holds what they pinned, bounded metadata (index, histories,
+  // disk catalog) and the disk staging buffers.
   ComponentTextCache(std::shared_ptr<TextModelRunner>, std::size_t,
-                     std::size_t ram_bytes,
                      const std::optional<TextRunnerDiskCacheOptions>&,
-                     bool automatic_ram = false, std::size_t ceiling_bytes = 0);
+                     std::size_t ceiling_bytes = 0);
   ~ComponentTextCache();
-  // Captures keep completed rows as device references, not RAM copies, so a
-  // checkpoint costs its private state and tails (see Adapter::RetainRows).
-  [[nodiscard]] bool CapturesShareRows() const;
   [[nodiscard]] std::unique_ptr<Lease> Acquire(
       std::span<const ContinuationToken>,
       const ContinuationCache::CancellationCheck&,
@@ -173,6 +142,7 @@ public:
   [[nodiscard]] std::optional<TextPendingPublication> PendingPublication(
       std::span<const ContinuationToken> prompt,
       const TextPromptContext* context, std::uint64_t checkpoint_id = 0) const;
+  // Zero when the estimate itself fails (no metadata room).
   [[nodiscard]] std::size_t CachedPrefixTokens(
       std::span<const ContinuationToken>, const TextPromptContext*,
       bool common = false) const;
@@ -184,27 +154,22 @@ public:
     kExhausted,  // no slot is busy and nothing is left to return
   };
   // Returns the paged rows idle slots hold until `enough()` holds. Slots
-  // without a live frontier go first. Then checkpoints holding device rows
-  // only they use are dropped, lowest retention priority first. Then live
-  // frontiers, a frontier some checkpoint covers before the only copy of its
-  // work, oldest first; without device row retention an uncovered one is
-  // captured first. With `reuse`, only the actually selected checkpoint or
-  // live frontier is kept, using the same input identity/stable boundary as
-  // Acquire. Other token-equal histories may own duplicate physical blocks. A
-  // slot is reset at most once per call, and not again until it is leased; its
-  // borrowed checkpoint rows are preserved as on any cold reassignment.
-  // `enough` runs without the cache lock.
+  // without a live frontier go first. Then live frontiers, a frontier some
+  // disk checkpoint covers before the only copy of its work, oldest first;
+  // an uncovered one is written to disk first when there is a disk cache.
+  // With `reuse`, only the actually selected live frontier is kept, using the
+  // same input identity/stable boundary as Acquire. Other token-equal
+  // histories may own duplicate physical blocks. A slot is reset at most once
+  // per call, and not again until it is leased. `enough` runs without the
+  // cache lock.
   [[nodiscard]] RowReclaim ReclaimRows(
       std::span<const ContinuationToken>, bool reuse,
       const std::function<bool()>& enough,
       const TextPromptContext* context = nullptr, std::size_t stable = 0);
   // Rows Acquire with the same arguments would not need new paged blocks
-  // for. `live`: the idle live frontier it would continue, whose slot already
-  // maps them (a partly written last block included). Otherwise the device
-  // rows of the resident checkpoint it would restore, which the restore maps
-  // instead of copying (complete blocks only). Zero for a cold slot or a disk
-  // restore. Checkpoint rows may be disjoint; tokens is their total complete
-  // block capacity, not the end of a contiguous retained prefix.
+  // for: those of the idle live frontier it would continue, whose slot
+  // already maps them (a partly written last block included). Zero for a
+  // cold slot or a disk restore.
   struct HeldRows {
     std::size_t tokens{};
     bool live{};
@@ -227,8 +192,8 @@ public:
   // slot it would use, its live frontier's or the one cold assignment takes,
   // is held by a queued disk write: that request waits, the other slots keep
   // running. When cold assignment would reset an idle frontier no checkpoint
-  // covers, captures it first: to RAM, or else to disk by the queue worker.
-  // For the disk, it copies the state to host memory here, with no other
+  // covers, captures it first, to disk by the queue worker: it copies the
+  // state to host memory here, with no other
   // model work running, and releases the slot (reassignment_snapshot_bytes);
   // without room for that copy, the worker holds the slot until it has
   // written it (false meanwhile). Call from the scheduler thread; never
@@ -243,21 +208,25 @@ public:
 
 private:
   // Captures the idle live frontier of slot `index` (leased exactly at
-  // `location`) as a RAM checkpoint, before the caller resets the slot.
-  // Optional: a refusal or failure is logged (with `reason`, the caller's
-  // cause) and the caller proceeds. With `hold`, a capture RAM cannot take
-  // goes to the queue worker as a host snapshot, or else keeps the slot for
-  // it, and the result is true while that held write is queued: the slot is
-  // not the caller's to reset then.
-  // With `disk_only`, no RAM checkpoint is published: one that retains device
-  // rows would keep the very rows a row-capacity reset is to return. `held`
-  // reports whether a held write took the slot (queued or not): the caller
-  // must not reset it then.
+  // `location`) to disk, before the caller resets the slot. Optional: a
+  // refusal or failure is logged (with `reason`, the caller's cause) and the
+  // caller proceeds. Without `hold`, the whole state is copied into host
+  // arenas first. With `hold`, it goes to the queue worker as a host
+  // snapshot, or else keeps the slot for it, and the result is true while
+  // that held write is queued: the slot is not the caller's to reset then.
+  // `held` reports whether a held write took the slot (queued or not): the
+  // caller must not reset it then.
   bool CaptureBeforeReset(std::size_t index, cache::BorrowedLocation location,
                           std::vector<cache::Token> tokens,
                           cache::InputIdentity input, std::string_view reason,
-                          bool hold, bool disk_only = false,
-                          bool* held = nullptr) noexcept;
+                          bool hold, bool* held = nullptr) noexcept;
+  // Before a cold reset of slot `index`: rows of its live frontier that
+  // queued disk jobs still read get host copies, so the reset does not fail
+  // those jobs. Optional: a refusal is logged.
+  void HostObservedRows(std::size_t index) noexcept;
+  [[nodiscard]] std::size_t CachedPrefixTokensOrThrow(
+      std::span<const ContinuationToken>, const TextPromptContext*,
+      bool common) const;
   std::unique_ptr<Impl> impl_;
 };
 
@@ -300,12 +269,7 @@ public:
   [[nodiscard]] std::size_t CaptureBytes(std::size_t boundary) const;
   [[nodiscard]] bool CaptureRefused(std::size_t boundary) const;
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Capture();
-  void PreparePrefill(std::size_t tokens);
   [[nodiscard]] std::optional<ComponentCacheMetrics> Metrics() const;
-  [[nodiscard]] PlannedCapturePoints PlannedCaptures(std::size_t stable,
-                                                     std::size_t tail) const;
-  // No effect on a legacy lease.
-  void MarkAlignedTail(std::size_t boundary) noexcept;
 
 private:
   ContinuationCache::Lease legacy_;

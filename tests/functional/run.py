@@ -439,11 +439,14 @@ def main():
             report["startup_ms"] = (time.monotonic() - startup_started) * 1000
             if "cache-rotation" in selected:
                 report["snapshot_budget"] = check_snapshot_budget(
-                    (output / "server.log").read_text(), available_before_load,
-                    int(option(command, "--cache-ram-bytes", "0")), sessions)
-            configured = bool(set(selected) & {"cache-bridge", "cache-pressure"}) and re.search(
-                r"event=(?:snapshot_cache_configured|configured) .*?\bcapacity_bytes=(\d+)\b",
-                (output / "server.log").read_text())
+                    (output / "server.log").read_text(), available_before_load, sessions)
+            # Component caches keep no RAM checkpoints: their startup line
+            # has no capacity_bytes, and the budget is zero.
+            configured = bool(set(selected) & {"cache-bridge", "cache-pressure"}) and (
+                re.search(r"event=snapshot_cache_configured .*?\bcapacity_bytes=(\d+)\b",
+                          (output / "server.log").read_text())
+                or ("schema=component-cache-v1 event=configured "
+                    in (output / "server.log").read_text() and (None, "0")))
             for suite in selected:
                 if suite == "cache":
                     continue

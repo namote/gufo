@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Held disk publication must respect saved prefill and reclaim staging RAM.
+"""Held disk publication must respect saved prefill.
 
 Opt-in GPU test, outside hosted CI. The cap expectation is a main timing
 control; candidate correctness uses the default bounded expectation.
@@ -20,20 +20,6 @@ import time
 import urllib.request
 
 from run import option, provenance, server, write_json
-
-
-RECLAIM_RAM_BYTES = 256 * 1024**2
-
-
-def reclaim_evidence(segment):
-    """Reject a pressure case that published without exercising reclamation."""
-    events = [dict(re.findall(r"(\w+)=([^\s]+)", line))
-              for line in segment.splitlines() if "event=retention " in line]
-    removed = [event for event in events
-               if event.get("action") == "2" and event.get("reason") == "1"
-               and int(event.get("unique_bytes_freed", "0")) > 0]
-    assert removed, "deep capture did not reclaim retained RAM checkpoints"
-    return removed
 
 
 def wait_until(predicate, timeout, description):
@@ -71,7 +57,7 @@ def archive():
 
 
 def run_case(args, command, case, report):
-    publish = case in ("publish", "reclaim")
+    publish = case == "publish"
     output = args.output / case
     output.mkdir()
     disk, gate = output / "disk", output / "gate"
@@ -82,9 +68,6 @@ def run_case(args, command, case, report):
     base = f"http://127.0.0.1:{port}"
     command = [*command, "--host", "127.0.0.1", "--port", str(port),
                "--cache-disk", str(disk), "--cache-disk-bytes", str(8 * 1024**3)]
-    if option(command, "--cache-ram-bytes") is None:
-        command += ["--cache-ram-bytes", str(
-            RECLAIM_RAM_BYTES if case == "reclaim" else 1024**3)]
     environment = {**os.environ, "LD_PRELOAD": str(args.fault_library),
                    "GUFO_TEST_DISK_GATE": str(gate),
                    "GUFO_TEST_DISK_DIRECTORY": str(disk),
@@ -142,15 +125,10 @@ def run_case(args, command, case, report):
             (gate / "armed").touch()
             deep = seed + [first["choices"][0]["message"],
                 {"role": "user", "content": archive() + "\nReply with only ACK."}]
-            deep_start = log.stat().st_size
             answer = chat("deep", deep)
             assert 50000 <= answer["usage"]["prompt_tokens"] <= 60000, answer["usage"]
             wait_until(lambda: (gate / "blocked").exists(), 60, "held manifest")
             row["blocked_file"] = (gate / "blocked").read_text()
-            if case == "reclaim":
-                with log.open() as stream:
-                    stream.seek(deep_start)
-                    row["reclaimed"] = reclaim_evidence(stream.read())
             # A new user message branches before the previous assistant tail.
             # The pending semantic boundary matches but its live frontier does not.
             follow = deep + [{"role": "user", "content":
@@ -196,23 +174,9 @@ def run_case(args, command, case, report):
                 assert ended["release"] == "not_pending", ended
                 assert 0 < float(ended["wait_ms"]) < float(start["limit_ms"]), (start, ended)
                 row["wait_release"] = ended
-                if case == "reclaim":
-                    # Identify the held checkpoint itself, rather than any
-                    # unrelated or shallow publication in the same run.
-                    events = [dict(re.findall(r"(\w+)=([^\s]+)", line))
-                              for line in log.read_text().splitlines()
-                              if "event=published " in line]
-                    checkpoint = [event for event in events
-                                  if event["checkpoint_id"] == start["checkpoint_id"]]
-                    assert len(checkpoint) == 1, checkpoint
-                    row["publication"] = checkpoint[0]
-                    boundary = int(checkpoint[0]["tokens"])
-                    assert boundary == int(start["pending_tokens"]) >= 50000, checkpoint
-                    assert usage["cached_tokens"] == boundary, usage
-                    assert int(checkpoint[0]["payload_bytes"]) > RECLAIM_RAM_BYTES, checkpoint
             else:
-                # A tight RAM budget can leave only a shallow seed checkpoint
-                # on disk. The waiter may restore it, but not the held checkpoint.
+                # Only a shallow seed checkpoint may be on disk while the deep
+                # one is held. The waiter may restore it, but not the held checkpoint.
                 assert usage["cached_tokens"] < 4096, usage
                 assert timing["prefill_tokens"] > 4096, timing
                 if args.expect == "cap":
@@ -227,13 +191,11 @@ def run_case(args, command, case, report):
                 queue = timing["queue_ms"]
                 assert limit * .95 <= queue <= limit + max(3, limit * .05), (queue, limit)
                 row["wait_limit_ms"] = limit
-            # Qualify a real over-RAM publication, not just a queued job.
+            # Qualify a real deep publication, not just a queued job. There
+            # is no RAM checkpoint tier: every checkpoint is on disk only.
             payloads = [int(n) for n in re.findall(r"event=published .*payload_bytes=(\d+)", log.read_text())]
-            capacity = int(re.search(r"event=configured .*?\bcapacity_bytes=(\d+)", log.read_text())[1])
-            if case == "reclaim":
-                assert capacity == RECLAIM_RAM_BYTES, capacity
-            assert max(payloads) > capacity, (payloads, capacity)
-            row.update(status="passed", max_payload_bytes=max(payloads), ram_capacity_bytes=capacity)
+            assert payloads, "no publication"
+            row.update(status="passed", max_payload_bytes=max(payloads))
     except BaseException as exc:
         row.update(status="failed", error=repr(exc))
         raise
@@ -249,7 +211,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--fault-library", type=Path, required=True)
-    parser.add_argument("--case", action="append", choices=("bound", "publish", "reclaim"))
+    parser.add_argument("--case", action="append", choices=("bound", "publish"))
     parser.add_argument("--expect", choices=("bounded", "cap"), default="bounded")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -260,9 +222,6 @@ def main():
         parser.error("pass a production gufo serve llm command after --")
     if int(option(command, "--context", "0")) < 60000:
         parser.error("use context >= 60000 for the 55K-token controlled workload")
-    if "reclaim" in (args.case or ()) and int(option(
-            command, "--cache-ram-bytes", str(RECLAIM_RAM_BYTES))) != RECLAIM_RAM_BYTES:
-        parser.error("the reclaim case requires --cache-ram-bytes 268435456")
     for reserved in ("--host", "--port", "--cache-disk", "--cache-disk-bytes", "--api-key"):
         if option(command, reserved) is not None:
             parser.error(f"the runner owns {reserved}")

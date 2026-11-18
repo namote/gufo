@@ -406,7 +406,7 @@ class FunctionalRunnerTest(unittest.TestCase):
                     "output_sha256": "probe", "wall_ms": 1, "metrics": {}}]}))
                 join_server_timings(root)
 
-    def test_cache_rotation_checks_host_headroom_and_requested_limits(self):
+    def test_cache_rotation_checks_host_headroom(self):
         gib = 1024**3
         def log(capacity, sessions=1, entries=128):
             return (f"event=snapshot_cache_configured sessions={sessions} "
@@ -416,25 +416,20 @@ class FunctionalRunnerTest(unittest.TestCase):
         for invalid in ("", "MemAvailable: 0 kB\n", "MemAvailable: invalid kB\n"):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 host_available_bytes(invalid)
-        for available, requested, capacity in (
-            (44 * gib, 0, 22 * gib), (128 * gib, 0, 32 * gib),
-            (44 * gib, 20 * gib, 20 * gib), (44 * gib, 64 * gib, 22 * gib),
-            (44 * gib, 30 * gib, 30 * gib),  # Explicit limits may pass half.
-            (44 * gib, 64 * gib, 40 * gib), (128 * gib, 48 * gib, 48 * gib),
-        ):
-            result = check_snapshot_budget(log(capacity), available, requested, 1)
+        for available, capacity in ((44 * gib, 22 * gib), (128 * gib, 32 * gib)):
+            result = check_snapshot_budget(log(capacity), available, 1)
             self.assertEqual(result["capacity_bytes"], capacity)
-        for output, available, requested in (
-            (log(32 * gib), 44 * gib, 0),  # A fixed cap can exceed host headroom.
-            (log(64 * gib), 44 * gib, 64 * gib),  # Overrides keep 4 GiB free.
-            (log(41 * gib), 44 * gib, 64 * gib),
-            (log(48 * gib), 128 * gib, 0), (log(21 * gib), 44 * gib, 20 * gib),
-            (log(0), 44 * gib, 0), (log(20 * gib, sessions=4), 44 * gib, 0),
-            (log(20 * gib, entries=8), 44 * gib, 0), ("", 44 * gib, 0),
-            (log(20 * gib) * 2, 44 * gib, 0),
+        component = ("schema=component-cache-v1 event=configured sessions=1 "
+                     "metadata_limit_bytes=268435456 staging_capacity_bytes=1048576\n")
+        self.assertEqual(check_snapshot_budget(component, 44 * gib, 1)["capacity_bytes"], 0)
+        for output, available, sessions in (
+            (log(32 * gib), 44 * gib, 1), (log(48 * gib), 128 * gib, 1),
+            (log(0), 44 * gib, 1), (log(20 * gib, sessions=4), 44 * gib, 1),
+            (log(20 * gib, entries=8), 44 * gib, 1), ("", 44 * gib, 1),
+            (log(20 * gib) * 2, 44 * gib, 1), (component, 44 * gib, 2),
         ):
             with self.subTest(output=output), self.assertRaises(ValueError):
-                check_snapshot_budget(output, available, requested, 1)
+                check_snapshot_budget(output, available, sessions)
 
     def test_cache_persist_flags_only_its_prompt(self):
         def reply(text, total, cached, disk=False, persist=True):

@@ -7,8 +7,8 @@ server rounds prompt checkpoints and pass ends down to multiples of four
 past the 2,048-token sparse budget; four leading pads shift that boundary
 through every residue. A seeds the cache; B continues the conversation (A's
 turn, a fixed assistant reply and a new user turn) and restores A's stable
-boundary, the end of its final user turn, from RAM in the same server or from
-disk after a restart. Every greedy B (reasoning and answer) must be
+boundary, the end of its final user turn, from disk after a restart (there is
+no RAM checkpoint tier). Every greedy B (reasoning and answer) must be
 byte-identical to B on a fresh server, in the loaded mode (pass --mtp-model
 for MTP), and restore on a multiple of four.
 
@@ -150,14 +150,6 @@ def main():
             for pad in PADS:
                 cold[pad] = recorded_request(
                     port, conversation(pad, 2), args.max_tokens)
-        warm = {}
-        port, context = serve("warm-ram")
-        with context:
-            for pad in PADS:
-                seed = recorded_request(
-                    port, conversation(pad, 1), args.max_tokens)
-                warm[pad] = (seed, recorded_request(
-                    port, conversation(pad, 2), args.max_tokens))
         port, context = serve("disk-seed", ["--cache-disk", str(disk)])
         with context as process:
             seeds = {}
@@ -172,10 +164,10 @@ def main():
                 restored[pad] = recorded_request(
                     port, conversation(pad, 2), args.max_tokens)
         failures = []
-        if {warm[pad][0]["prompt_tokens"] % 4 for pad in PADS} != set(range(4)):
+        if {seeds[pad]["prompt_tokens"] % 4 for pad in PADS} != set(range(4)):
             failures.append("seed prompts do not cover all four alignment residues")
         mode = "mtp" if args.mtp_model else "off"
-        for label in ("cold", "warm-ram", "disk-seed", "disk-restore"):
+        for label in ("cold", "disk-seed", "disk-restore"):
             log = (output / f"{label}.log").read_text()
             modes = re.findall(
                 r"event=load_completed[^\n]*kind=text[^\n]*speculative=(\w+)", log)
@@ -183,10 +175,9 @@ def main():
                 failures.append(f"{label}: requested {mode}, loaded {modes}")
         for pad in PADS:
             reference = cold[pad]
-            case = {"cold": reference, "ram_seed": warm[pad][0],
-                    "ram": warm[pad][1], "disk_seed": seeds[pad],
+            case = {"cold": reference, "disk_seed": seeds[pad],
                     "disk": restored[pad]}
-            for path in ("ram", "disk"):
+            for path in ("disk",):
                 got = case[path]
                 # Assistant framing plus alignment must fit the 11-row tail;
                 # a shallow grid restore would conceal a lost stable checkpoint.
@@ -207,7 +198,7 @@ def main():
                                     f"({got['cached_tokens']} cached)")
             if reference["cached_tokens"]:
                 failures.append(f"{pad!r} cold: restored {reference['cached_tokens']}")
-            for label in ("cold", "ram_seed", "ram", "disk_seed", "disk"):
+            for label in ("cold", "disk_seed", "disk"):
                 proposed = case[label]["draft_tokens"]
                 accepted = case[label]["draft_tokens_accepted"]
                 if not 0 <= accepted <= proposed or (mode == "off" and proposed):
@@ -216,10 +207,8 @@ def main():
                     failures.append(f"{pad!r} {label}: no MTP drafts executed")
             report["cases"][pad] = case
             print(f"{pad!r}: prompt {reference['prompt_tokens']} cached "
-                  f"ram {case['ram']['cached_tokens']} disk "
-                  f"{case['disk']['cached_tokens']} identical ram "
-                  f"{case['ram_identical']} disk {case['disk_identical']}",
-                  flush=True)
+                  f"disk {case['disk']['cached_tokens']} identical "
+                  f"{case['disk_identical']}", flush=True)
         report["failures"] = failures
         report["status"] = "failed" if failures else "passed"
         save()

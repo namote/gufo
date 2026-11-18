@@ -29,6 +29,17 @@ STAGING_BYTES = 2 * 1024**3
 COMPONENT_STAGING_BYTES = 1024**2
 
 
+
+def ram_capacities(log):
+    """RAM checkpoint capacities from the component cache's startup lines.
+
+    The component cache keeps no RAM checkpoint tier now: its startup line has
+    no capacity_bytes, so every checkpoint is over (zero) committed RAM.
+    """
+    lines = re.findall(r"schema=component-cache-v1 event=configured [^\n]*", log)
+    return [int(match[1]) if (match := re.search(r"\bcapacity_bytes=(\d+)", line)) else 0
+            for line in lines]
+
 def published_tokens(log):
     legacy = re.findall(r"event=disk_cache action=stored reason=saved .*?\btokens=(\d+)\b", log)
     component = re.findall(r"schema=component-cache-v1 event=published tokens=(\d+)\b", log)
@@ -188,9 +199,7 @@ class Lifecycle:
                         "unqualified: checkpoint did not exceed staging", sizes, staging)
                     self.row["oversized_bytes"] = max(sizes)
                     if self.require_over_ram:
-                        capacities = [int(n) for n in re.findall(
-                            r"schema=component-cache-v1 event=configured .*?\bcapacity_bytes=(\d+)",
-                            log)]
+                        capacities = ram_capacities(log)
                         assert capacities and max(sizes) > max(capacities), (
                             "unqualified: checkpoint did not exceed committed RAM backing",
                             sizes, capacities)
@@ -244,9 +253,7 @@ class Lifecycle:
             if self.require_over_ram:
                 sizes = [int(n) for n in re.findall(
                     r"event=published .*?\bpayload_bytes=(\d+)", log)]
-                capacities = [int(n) for n in re.findall(
-                    r"schema=component-cache-v1 event=configured .*?\bcapacity_bytes=(\d+)",
-                    log)]
+                capacities = ram_capacities(log)
                 assert sizes and capacities and max(sizes) > max(capacities), (
                     "unqualified: checkpoint did not exceed committed RAM backing",
                     sizes, capacities)

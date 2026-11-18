@@ -19,7 +19,6 @@ def setup(kind):
     parser.add_argument('--source-revision', required=True, help='Revision used to build --binary')
     parser.add_argument('--context', type=int, default=196608 if kind == 'deep-peers' else 131072)
     parser.add_argument('--sessions', type=int, default=3)
-    parser.add_argument('--ram-bytes', default='2147483648')
     parser.add_argument('--disk-bytes', type=int, default=48 << 30)
     parser.add_argument('--expect-component', action='store_true')
     args = parser.parse_args()
@@ -31,8 +30,6 @@ def setup(kind):
         parser.error('DFlash weights must exist')
     if args.context < 1 or args.sessions < 3 or args.disk_bytes < 1:
         parser.error('Context/disk must be positive and these peer workloads require at least three sessions')
-    if args.ram_bytes != 'auto' and (not args.ram_bytes.isdecimal() or int(args.ram_bytes) < 1):
-        parser.error('--ram-bytes must be a positive integer or auto')
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
     disk = out / 'disk'
@@ -43,8 +40,6 @@ def setup(kind):
                'llm', '--model', str(args.model.resolve()), '--sessions', str(args.sessions),
                '--context', str(args.context), '--served-model-name', 'qwen27b-qualification',
                '--think', 'off', '--log-progress', '--cache-disk', str(disk), '--cache-disk-bytes', str(args.disk_bytes)]
-    if args.ram_bytes != 'auto':
-        command += ['--cache-ram-bytes', args.ram_bytes]
     if args.mode == 'ar':
         command += ['--speculative', 'off']
     if args.mode == 'dflash2':
@@ -52,7 +47,7 @@ def setup(kind):
     binary_sha = hashlib.sha256(args.binary.read_bytes()).hexdigest()
     (out / 'configuration.json').write_text(json.dumps({
         'argv': command, 'binary_sha256': binary_sha, 'mode': args.mode,
-        'expect_component': args.expect_component, 'ram_bytes': args.ram_bytes,
+        'expect_component': args.expect_component,
         'source_revision': args.source_revision,
         'context': args.context, 'sessions': args.sessions,
         'disk_bytes': args.disk_bytes,
@@ -182,18 +177,18 @@ def assert_checkpoint_selection(out, label, result, *, restart=False, minimum=1)
         checks.append({'name': name, 'passed': bool(passed), 'actual': actual})
     check('component_schema', isinstance(metrics, dict) and metrics.get('schema') == 'component-cache-v1', metrics)
     if isinstance(metrics, dict):
-        names = ['selected_tokens', 'deepest_live_tokens', 'deepest_ram_tokens', 'deepest_disk_tokens']
+        names = ['selected_tokens', 'deepest_live_tokens', 'deepest_disk_tokens']
         values = [metrics.get(name) for name in names]
         valid = all(type(value) is int and value >= 0 for value in values)
         check('integer_boundaries', valid, dict(zip(names, values)))
         if valid:
-            selected, live, ram, disk = values
-            check('newest_available_boundary', selected == max(live, ram, disk), values)
+            selected, live, disk = values
+            check('newest_available_boundary', selected == max(live, disk), values)
             check('required_depth', selected >= minimum, {'selected': selected, 'minimum': minimum})
             cached = usage.get('prompt_tokens_details', {}).get('cached_tokens')
             check('cached_matches_selection', cached == selected, {'cached': cached, 'selected': selected})
             if restart:
-                check('restart_uses_disk', metrics.get('reuse') == 'disk' and selected == disk and live == 0 and ram == 0,
+                check('restart_uses_disk', metrics.get('reuse') == 'disk' and selected == disk and live == 0,
                       {'reuse': metrics.get('reuse'), 'boundaries': values})
     destination = Path(out) / (label + '.checkpoint-assertions.json')
     if destination.exists():

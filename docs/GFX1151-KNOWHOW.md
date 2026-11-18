@@ -583,6 +583,25 @@
   - Not exercised: pool exhaustion (needs ~3M live tokens), reclaim under load.
   - Deployed the same day as runtime-20261118a (622e6cf8, 4734e2d8…, the tested binary); rollback `~/projects/_backup/gufo-server-20261118-before-pool/`.
   - **Result:** kept; production runs 4 slots with the 30 GB pool.
+- **RAM checkpoint tier removed; disk-only component cache** (candidate 234f3ef4 against production runtime-20261118b; `build/b1/pass-20261118r/`, November 18).
+  - Problem in production (runtime-20261118b, log `build/b1/stutter-20261118/server-prod-b.log`): the RAM sub-ledger sat at 4 GiB for hours. The committed backing pool takes 90% of the budget (3.80 GB) and never shrinks, so ~3 GB of free blocks stayed charged; disk-catalog metadata grew with every now-successful publication (0.27 → 0.49 GB) and filled the rest at ~05:50 UTC. Then 138 `persistence_refused`, 38 `persistence_incomplete`, 22 write-back failures, 27 `restore_failed source=ram`, and two requests failed after streaming (`[chat] cache resource exhausted` from `Lease::Commit` at release, uncaught).
+  - Change (user decision): no RAM tier and no `--cache-ram-bytes`/`--cache-tail-checkpoints`. Reuse is live slot rows, then disk. Captures go to disk through the snapshot-pool host arenas (4 GiB cap, 60 s idle trim); the ledger holds only metadata (limit 256 MiB + disk budget/64) and disk staging. Cache failures on the request path degrade to "not cached" (`commit_failed`, `lookup_failed`, `publication_untracked`, `live_frontier_unindexed`).
+  - Production config minus the RAM cache, 20 GiB test disk cache. Compared with the pool pass (runtime-20261118a config, same harness):
+
+    | Check | Pool pass (RAM 4 GiB) | Disk only |
+    |---|---|---|
+    | MemAvailable after start | 17.0 GB | 19.1 GB |
+    | Decode 1 / 2 / 4 streams, tok/s | 37.9 / 28.0+29.6 / 75.8 total | 38.8 / 27.6+28.5 / 75.3 total |
+    | Two concurrent decoders, max token gap | 0.17 / 0.13 s (production, runtime-20261118a) | 0.12 / 0.12 s |
+    | Shared 7.6K system prompt, second request | — | 1.03 s, 7,564 cached (first 10.0 s) |
+    | A1, 326,094 tokens + image | — | 332.1 s, correct |
+    | C wait / B max gap | 1.9 s / 0.222 s | 1.9 s / 0.251 s |
+    | A next turn | 1.5 s, 277,868 cached | 2.8 s, 326,088 cached, correct |
+    | A after restart (disk) | — | 3.4 s, 326,088 cached, correct |
+    | 1600 + 4K images + text / 8-frame video | all 200 / 16.5 s | all 200 (101.7 s / 112.5 s) / 16.5 s |
+
+  - Logs: 32 publications, 11 slot snapshots, 6 disk restores; no `persistence_incomplete`, `persistence_refused`, `restore_failed` or ERROR lines.
+  - Not exercised: hours of load with a full 100 GiB disk cache; check metadata plateaus in production.
 - **Disk writes failing once the RAM cache is full; decode pauses with concurrent requests** (production runtime-20261118a, 4 sessions, 30 GB pool, RAM cache 4 GiB, disk cache ~100 GiB; log `build/b1/stutter-20261118/server.log`, test `build/b1/stutter-20261118/`, November 18).
   - Symptom: every queued disk write failed (`persistence_incomplete reason="std::bad_alloc"`, 17 in 5 min, no `published` after 01:14:29 UTC). Cause: each publication rebuilt the reference catalog of the whole disk store (~296 B per reference) as RAM-ledger scratch; with the backing pool grown to its 90% plan, ~210 MB of headroom was left and the scratch outgrew it. Fix: `DiskStore` checks only the candidate's references against stored entries (`ValidateCandidate`, same conflict rules); recovery keeps the full check; `ResourceExhausted::what()` now says "cache resource exhausted". Unit test `PublicationWithFullLedger` fails on the old code with the production error and passes with the fix. The disk cache in the GPU test starts empty, so the failure does not reproduce there; check production logs after deployment.
   - `io_lock_ms=26997` on the first write after start: startup orphan reclamation holds the disk store lock while scanning the cache directory. One-off; unchanged.

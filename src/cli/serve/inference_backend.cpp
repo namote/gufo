@@ -46,7 +46,6 @@
 #include "src/models/qwen/vision/memory.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
-#include "src/core/hip/committed_backing.hpp"
 #include "src/core/hip/heap_placement.hpp"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/host_allocations.hpp"
@@ -1096,177 +1095,29 @@ private:
 
 template<typename AdapterType>
 std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
-    std::unique_ptr<AdapterType> adapter, cache::ResourceLedger& ledger,
-    std::function<std::size_t()> pending_memory = {},
-    std::function<std::shared_ptr<void>(std::size_t)> reserve_memory = {}) {
-  struct Backing {
+    std::unique_ptr<AdapterType> adapter,
+    std::function<std::size_t()> pending_memory = {}) {
+  struct Transfers {
     // HIP streams share the capped hardware queues (GPU_MAX_HW_QUEUES); the
     // pool size adds none. 96 lets a disk write keep its 48 read-ahead copies
     // in flight while kReservedTransferStreams stay free for foreground use.
     hip::TransferPool streams{96};
-    std::unique_ptr<hip::CommittedBackingPool> pool;
-    std::map<std::uint32_t, std::size_t> component_classes;
   };
   auto result = std::make_unique<ComponentCacheResources>();
   result->adapter = std::move(adapter);
-  auto backing = std::make_shared<Backing>();
+  auto transfers = std::make_shared<Transfers>();
   result->transfer_batch_size = 16;
-  const auto rounded = [](std::size_t bytes) {
-    return (bytes + 4095) / 4096 * 4096;
-  };
-  for (const auto& d : result->adapter->Components()) {
-    const auto bytes = rounded(d.kind == cache::ComponentKind::kPrivateState
-                                   ? d.state_bytes
-                                   : d.row_bytes * d.rows_per_chunk);
-    backing->component_classes.emplace(d.id.value, bytes);
-  }
-  // The remainder belongs to index, histories, disk catalog and queue
-  // metadata. The pools charge their own per-block allocator headroom.
-  result->commit_backing = [backing, &ledger, adapter = result->adapter.get(),
-                            pending_memory,
-                            reserve_memory](std::size_t budget) {
-    const auto plan = static_cast<AdapterType*>(adapter)->BackingPlan(budget);
-    if (plan.size() != 1)
-      throw std::invalid_argument("insufficient component backing budget");
-    const auto& allocation = plan.front();
-    // Pages commit as captures need them. A payload cannot span segments,
-    // so segments of about 128 MiB bound registration pauses and stranded
-    // edge space, fitting at least two of the largest payloads. Prefill
-    // chunks prepare backing before GPU work, after any fallback capture.
-    // Growth stops when the host keeps less than its reserve.
-    std::size_t largest = 0;
-    for (const auto& [id, bytes] : backing->component_classes)
-      largest = std::max(largest, bytes);
-    const auto block = allocation.block_bytes;
-    const auto target =
-        std::max<std::size_t>(std::size_t{128} << 20, 2 * largest) / block;
-    const auto parts =
-        std::max<std::size_t>((allocation.blocks + target - 1) / target, 1);
-    const auto segment = (allocation.blocks + parts - 1) / parts * block;
-    struct Limited {
-      std::mutex mutex;
-      std::chrono::steady_clock::time_point refused;
-      bool active{};
-    };
-    backing->pool = std::make_unique<hip::CommittedBackingPool>(
-        ledger,
-        hip::BackingPoolConfig{
-            allocation.blocks * allocation.block_bytes +
-                allocation.metadata_bytes,
-            allocation.block_bytes, allocation.metadata_bytes, segment,
-            [limited = std::make_shared<Limited>(),
-             pending_memory](std::size_t bytes) {
-              const std::lock_guard lock(limited->mutex);
-              const auto now = std::chrono::steady_clock::now();
-              // Pressure retries ask once per capture; recheck at most
-              // once a second while the host is short.
-              if (limited->active &&
-                  now - limited->refused < std::chrono::seconds(1))
-                return false;
-              const auto pending = pending_memory ? pending_memory() : 0;
-              const auto host_ceiling = HostSnapshotCeilingBytes();
-              const auto ceiling =
-                  host_ceiling > pending ? host_ceiling - pending : 0;
-              // Pinned host pages come out of the same device heap that
-              // session and scratch allocations draw on; keep its dispatch
-              // reserve so they do not fall back to managed memory.
-              std::size_t heap_free = 0, heap_total = 0;
-              const bool heap_fits =
-                  hipMemGetInfo(&heap_free, &heap_total) == hipSuccess &&
-                  heap_free >= pending &&
-                  hip::HeapFitsAboveReserve(heap_free - pending, bytes);
-              if (ceiling >= bytes && heap_fits) {
-                limited->active = false;
-                return true;
-              }
-              if (!limited->active)
-                Logger::Warn(
-                    "cache",
-                    "schema=component-cache-v1 "
-                    "event=backing_limited reason=" +
-                        std::string(heap_fits ? "host_reserve "
-                                              : "device_heap_reserve ") +
-                        "segment_bytes=" + std::to_string(bytes) +
-                        " host_headroom_bytes=" + std::to_string(ceiling) +
-                        " device_heap_free_bytes=" + std::to_string(heap_free));
-              limited->active = true;
-              limited->refused = now;
-              return false;
-            },
-            reserve_memory});
-    // Prepare a bounded reserve before readiness. The first shared-prefix
-    // capture needs more than one segment; preparing 2 GiB avoids moving
-    // registration onto that request's capture or decode path.
-    backing->pool->GrowAhead(2ULL << 30);
-    backing->pool->WaitForGrowth();
-    Logger::Info(
-        "cache",
-        "schema=component-cache-v1 event=backing_prepared committed_bytes=" +
-            std::to_string(backing->pool->CommittedBytes()) +
-            " long_term_pinned_bytes=" +
-            std::to_string(backing->pool->LongTermPinnedBytes()));
-  };
-  result->prepare_prefill = [backing](std::size_t tokens) {
-    // Prepare after any fallback capture, alongside actual prefill work.
-    // Short turns need a smaller reserve for private states and row tails.
-    backing->pool->GrowAhead((tokens >= 512 ? 2ULL : 1ULL) << 30);
-  };
-  result->can_capture = [backing](auto payloads) {
-    return backing->pool->CanFit(payloads);
-  };
-  result->owner = backing;
-  result->stream = [backing]() -> std::unique_ptr<cache::Stream> {
-    return backing->streams.TryAcquire();
+  result->owner = transfers;
+  result->stream = [transfers]() -> std::unique_ptr<cache::Stream> {
+    return transfers->streams.TryAcquire();
   };
   result->reserve_stream =
-      [backing](std::size_t keep_free) -> std::unique_ptr<cache::Stream> {
-    return backing->streams.TryAcquire(keep_free);
-  };
-  result->allocate = [backing](const cache::PayloadRequest& request) {
-    // Bound the logical capture, then assign whole shared backing pages.
-    const auto capacity =
-        backing->component_classes.at(request.component.value);
-    if (request.bytes > capacity)
-      throw std::logic_error("component capture exceeds its backing class");
-    const auto category =
-        request.category == cache::ResourceCategory::kBackingAssigned
-            ? cache::ResourceCategory::kBackingAssigned
-            : request.category;
-    const auto segments = backing->pool->PageCommitAllocations();
-    const auto started = std::chrono::steady_clock::now();
-    auto block = backing->pool->TryAcquire(category, request.bytes);
-    if (backing->pool->PageCommitAllocations() != segments)
-      Logger::Info(
-          "cache",
-          "schema=component-cache-v1 event=backing_grown committed_bytes=" +
-              std::to_string(backing->pool->CommittedBytes()) + " segments=" +
-              std::to_string(backing->pool->PageCommitAllocations()) +
-              " long_term_pinned_bytes=" +
-              std::to_string(backing->pool->LongTermPinnedBytes()) +
-              " acquire_ms=" +
-              std::to_string(std::chrono::duration<double, std::milli>(
-                                 std::chrono::steady_clock::now() - started)
-                                 .count()));
-    if (!block)
-      throw cache::ResourceExhausted();
-    // Do not start registration between a capture's allocations and copies.
-    // Each prefill chunk prepares its own reserve before GPU work.
-    auto owner = std::make_shared<hip::BackingBlock>(std::move(*block));
-    return ComponentCaptureBuffer{
-        owner->Bytes(),
-        [owner] {
-          owner->Convert();
-          return std::move(*owner).TakePayload();
-        },
-        backing->pool.get(),
-        [owner, request](cache::SlotLease& lease, auto source) {
-          return cache::Payload::Borrowed(
-              std::move(*owner).Borrow(lease, request.component, request.first,
-                                       request.end, request.bytes, source));
-        }};
+      [transfers](std::size_t keep_free) -> std::unique_ptr<cache::Stream> {
+    return transfers->streams.TryAcquire(keep_free);
   };
   result->snapshot_room = [pending_memory](std::size_t bytes) {
-    // As backing growth: a host snapshot pins pages from the device heap too.
+    // A host snapshot pins pages from the device heap that session and
+    // scratch allocations draw on: keep its dispatch reserve.
     const auto pending = pending_memory ? pending_memory() : 0;
     const auto host_ceiling = HostSnapshotCeilingBytes();
     std::size_t heap_free = 0, heap_total = 0;
@@ -1359,9 +1210,7 @@ public:
 
   [[nodiscard]] bool UsesComponentCache() const override { return true; }
   [[nodiscard]] std::unique_ptr<ComponentCacheResources>
-  CreateComponentCacheResources(cache::ResourceLedger& ledger,
-                                std::size_t ram) const override {
-    (void)ram;
+  CreateComponentCacheResources(cache::ResourceLedger& ledger) const override {
     auto resources = CreateHipComponentCacheResources(
         std::make_unique<models::qwen::ContinuationAdapter>(
             model_, max_context_, component_identity_, execution_policy_,
@@ -1370,8 +1219,7 @@ public:
                 .max_context = max_context_,
                 .max_draft_tokens = speculative_options_.max_draft_tokens,
                 .policy = speculative_options_.dflash_policy},
-            &ledger, pass_scratch_, kv_pool_),
-        ledger);
+            &ledger, pass_scratch_, kv_pool_));
     // Qwen's 256-row chunks are small. Preserve a bounded group before
     // waiting, instead of synchronizing every half-MiB range individually.
     resources->reassignment_batch_size = 16;
@@ -2923,27 +2771,15 @@ public:
 
   [[nodiscard]] bool UsesComponentCache() const override { return true; }
   [[nodiscard]] std::unique_ptr<ComponentCacheResources>
-  CreateComponentCacheResources(cache::ResourceLedger& ledger,
-                                std::size_t ram) const override {
-    (void)ram;
+  CreateComponentCacheResources(cache::ResourceLedger&) const override {
     return CreateHipComponentCacheResources(
         std::make_unique<models::qwen38_flash_next::ContinuationAdapter>(
             model_,
             use_mtp_ ? core::SessionMode::kSpeculative
                      : core::SessionMode::kAutoregressive,
             max_context_, component_identity_, kv_pool_),
-        ledger,
         [budget = image_memory_, deferred = model_->DeferredScratchBytes()] {
           return budget->ReservedBytes() + deferred;
-        },
-        [budget = image_memory_,
-         deferred = model_->DeferredScratchBytes()](std::size_t bytes) {
-          try {
-            return budget->Acquire(
-                {bytes, 0}, [deferred] { return ImageHeadroomFor(deferred); });
-          } catch (const std::length_error&) {
-            return std::shared_ptr<void>{};
-          }
         });
   }
   [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
@@ -3919,9 +3755,8 @@ bool InferenceBackend::load(
     TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
     const TextSpeculativeConfig& speculative_config,
     const TextDiskCacheConfig& disk_cache_config,
-    const std::string& vision_model_path,
-    TextRunnerRamCacheOptions ram_cache_config, bool enable_yarn,
-    std::optional<cli::KvCacheType> kv_cache_type,
+    const std::string& vision_model_path, TextRunnerCacheOptions cache_config,
+    bool enable_yarn, std::optional<cli::KvCacheType> kv_cache_type,
     const std::string& abliteration_profiles,
     std::optional<models::qwen38_flash_next::HcMode> hc_mode) {
 #if defined(ENGINE_ENABLE_HIP)
@@ -4061,7 +3896,7 @@ bool InferenceBackend::load(
     }
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, speculative_config,
-                std::move(resolved_disk_cache_config), ram_cache_config);
+                std::move(resolved_disk_cache_config), cache_config);
   }
   if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
@@ -4191,7 +4026,7 @@ bool InferenceBackend::load(
     }
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, speculative_config,
-                std::move(resolved_disk_cache_config), ram_cache_config);
+                std::move(resolved_disk_cache_config), cache_config);
   }
   // Refuse a storage the server's prefix cache cannot hold before mapping
   // 27B weights.
@@ -4234,7 +4069,7 @@ bool InferenceBackend::load(
   }
   return load(std::move(model), error, max_context, session_count,
               prefill_policy, scheduler_policy, speculative_config,
-              std::move(resolved_disk_cache_config), ram_cache_config,
+              std::move(resolved_disk_cache_config), cache_config,
               execution_policy);
 #else
   (void)model_path;
@@ -4245,7 +4080,7 @@ bool InferenceBackend::load(
   (void)speculative_config;
   (void)disk_cache_config;
   (void)vision_model_path;
-  (void)ram_cache_config;
+  (void)cache_config;
   (void)enable_yarn;
   (void)abliteration_profiles;
   (void)kv_cache_type;
@@ -4263,7 +4098,7 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
                             TextSchedulerPolicy scheduler_policy,
                             TextSpeculativeConfig speculative_config,
                             TextDiskCacheConfig disk_cache_config,
-                            TextRunnerRamCacheOptions ram_cache_config,
+                            TextRunnerCacheOptions cache_config,
                             hip::QwenExecutionPolicy execution_policy) {
   if (model == nullptr) {
     SetError(error, "Qwen GPU model must not be null");
@@ -4381,7 +4216,7 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
         std::move(model), max_context, std::move(dflash_model),
         speculative_options, disk_cache_config.model_artifact_fingerprint,
         disk_cache_config.draft_model_artifact_fingerprint, session_count,
-        ram_cache_config.kv_pool_bytes, execution_policy);
+        cache_config.kv_pool_bytes, execution_policy);
     new_state->han_tokens = PrepareHanTokens(*runner);
     new_state->logit_bias = std::make_shared<const sampling::LogitBiasCatalog>(
         runner->VocabularySize(), std::vector<sampling::LogitBiasProfile>{});
@@ -4398,8 +4233,7 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     Logger::Info("loader",
                  "event=load_phase phase=sessions " + Logger::MemoryStatus());
     auto runner_pool = std::make_shared<TextRunnerPool>(
-        std::move(runner), session_count, std::move(runner_disk_cache),
-        ram_cache_config);
+        std::move(runner), session_count, std::move(runner_disk_cache));
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {
@@ -4419,8 +4253,8 @@ bool InferenceBackend::load(
     TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
     TextSpeculativeConfig speculative_config,
     TextDiskCacheConfig disk_cache_config,
-    TextRunnerRamCacheOptions ram_cache_config) {
-  if (ram_cache_config.kv_pool_bytes != 0) {
+    TextRunnerCacheOptions cache_config) {
+  if (cache_config.kv_pool_bytes != 0) {
     SetError(error,
              "--kv-pool-bytes needs a runner with paged KV rows; "
              "this model keeps each session's context");
@@ -4491,8 +4325,7 @@ bool InferenceBackend::load(
       };
     }
     auto runner_pool = std::make_shared<TextRunnerPool>(
-        std::move(runner), session_count, std::move(runner_disk_cache),
-        ram_cache_config);
+        std::move(runner), session_count, std::move(runner_disk_cache));
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {
@@ -4512,7 +4345,7 @@ bool InferenceBackend::load(
     TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
     TextSpeculativeConfig speculative_config,
     TextDiskCacheConfig disk_cache_config,
-    TextRunnerRamCacheOptions ram_cache_config) {
+    TextRunnerCacheOptions cache_config) {
   if (model == nullptr) {
     SetError(error, "Qwen3.8-Flash-Next model must not be null");
     return false;
@@ -4572,7 +4405,7 @@ bool InferenceBackend::load(
         speculative_config.max_draft_tokens,
         disk_cache_config.model_artifact_fingerprint,
         disk_cache_config.draft_model_artifact_fingerprint,
-        ram_cache_config.kv_pool_bytes);
+        cache_config.kv_pool_bytes);
     new_state->han_tokens = PrepareHanTokens(*runner);
     new_state->logit_bias = std::make_shared<const sampling::LogitBiasCatalog>(
         runner->VocabularySize(), std::vector<sampling::LogitBiasProfile>{});
@@ -4587,8 +4420,7 @@ bool InferenceBackend::load(
       };
     }
     auto runner_pool = std::make_shared<TextRunnerPool>(
-        std::move(runner), session_count, std::move(runner_disk_cache),
-        ram_cache_config);
+        std::move(runner), session_count, std::move(runner_disk_cache));
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {

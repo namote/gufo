@@ -2,7 +2,7 @@
 """Check that cache_persist=false keeps a prompt off the disk cache.
 
 The runner calls this twice on its private disk cache: first to send a
-flagged conversation (twice, so RAM reuse is checked too) and an unflagged
+flagged conversation (twice, so in-memory reuse is checked too) and an unflagged
 control, then with --restore after a restart. The control must restore from
 disk, which shows the first server drained its writes; the flagged prompt
 must find nothing on disk.
@@ -46,7 +46,8 @@ def send(url, model):
     flagged = messages("Flagged")
     first_body, first = chat(url, model, flagged, persist=False)
     assert first["text"] == "BETA", first
-    # The flag only keeps checkpoints off disk; RAM reuse is unchanged.
+    # The flag only keeps checkpoints off disk; the session's live frontier
+    # (Qwen27B/Flash-Next) or RAM snapshot (legacy) still serves the next turn.
     follow = flagged + [{"role": "assistant", "content": first["text"]},
                         {"role": "user", "content": "Reply with only GAMMA."}]
     _, again = chat(url, model, follow, persist=False)

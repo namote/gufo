@@ -92,7 +92,7 @@ public:
       const TextSpeculativeConfig& speculative_config = {},
       const TextDiskCacheConfig& disk_cache_config = {},
       const std::string& vision_model_path = {},
-      TextRunnerRamCacheOptions ram_cache_config = {}, bool enable_yarn = false,
+      TextRunnerCacheOptions cache_config = {}, bool enable_yarn = false,
       std::optional<cli::KvCacheType> kv_cache_type = std::nullopt,
       const std::string& abliteration_profiles = {},
       std::optional<models::qwen38_flash_next::HcMode> hc_mode = std::nullopt);
@@ -105,7 +105,7 @@ public:
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},
             TextDiskCacheConfig disk_cache_config = {},
-            TextRunnerRamCacheOptions ram_cache_config = {},
+            TextRunnerCacheOptions cache_config = {},
             hip::QwenExecutionPolicy execution_policy =
                 hip::QwenExecutionPolicy::Production());
 
@@ -117,7 +117,7 @@ public:
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},
             TextDiskCacheConfig disk_cache_config = {},
-            TextRunnerRamCacheOptions ram_cache_config = {});
+            TextRunnerCacheOptions cache_config = {});
 
   /// Installs a previously loaded Qwen3.8-Flash-Next model with
   /// request-owned sessions, the model's tokenizer, and host-memory
@@ -129,7 +129,7 @@ public:
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},
             TextDiskCacheConfig disk_cache_config = {},
-            TextRunnerRamCacheOptions ram_cache_config = {});
+            TextRunnerCacheOptions cache_config = {});
 #endif
 
   /// Stable model identifier used in API responses.

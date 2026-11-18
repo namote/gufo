@@ -75,8 +75,6 @@ def command(group, binary, weights, output, tier="full", assets=None):
             args += ['--suite', suite]
         args += ['--'] + llm_command(key, binary, assets, mode=mode,
                                     context=settings['context'], sessions=settings['sessions'])
-        if 'cache_ram_bytes' in settings:
-            args += ['--cache-ram-bytes', str(settings['cache_ram_bytes'])]
         return args
     settings = group["settings"]
     args = [sys.executable, str(HERE / "run.py"), "--output", str(output),
@@ -90,8 +88,6 @@ def command(group, binary, weights, output, tier="full", assets=None):
              "--mtp-model", str(weights / "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"),
              "--speculative", profile.split("/")[1],
              "--context", str(settings["context"]), "--sessions", str(settings["sessions"])]
-    if "cache_ram_bytes" in settings:
-        args += ["--cache-ram-bytes", str(settings["cache_ram_bytes"])]
     return args
 
 

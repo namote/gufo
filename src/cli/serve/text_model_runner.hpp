@@ -60,26 +60,19 @@ struct TextScoringPrompt {
   std::vector<TextRunnerToken> answer;
 };
 
-struct TextRunnerRamCacheOptions {
+struct TextRunnerCacheOptions {
+  /// Legacy (non-component) runners only: their in-process snapshot cache
+  /// takes min(model snapshot budget, kAutomaticMaxBytes) after session
+  /// allocation, with at most kMaxEntries snapshots. Component-cache runners
+  /// (Qwen 27B, Flash-Next) keep no RAM checkpoints: continuations reuse the
+  /// live slot, then the disk cache.
   static constexpr std::size_t kAutomaticMaxBytes = std::size_t{32} << 30;
   static constexpr std::size_t kMaxEntries = 128;
-  /// Zero selects min(model snapshot budget, 32 GiB), after session allocation.
-  /// Explicit limits may exceed that budget up to the model's ceiling, which
-  /// keeps kHostSnapshotHeadroomBytes of host RAM free.
-  std::size_t capacity_bytes{0};
   /// Paged attention rows: bytes of the device KV block pool every session
   /// shares, taking blocks as it writes. Zero sizes the pool for every
   /// session at the full context. Runners without paged rows refuse a
   /// nonzero value at load.
   std::size_t kv_pool_bytes{0};
-  /// Long prompts also keep this many RAM checkpoints, one every
-  /// cache::kTailStep tokens over the end of the prompt, so a request that
-  /// shares all but the end of a prompt already prefilled past their
-  /// divergence restores within that step of it. Applied only where
-  /// captures keep rows as device references
-  /// (ComponentTextCache::CapturesShareRows), so each costs its private state;
-  /// otherwise logged at startup as not applied. Zero: none.
-  std::size_t tail_checkpoints{3};
 };
 
 struct TextRunnerDiskCacheOptions {
@@ -483,7 +476,7 @@ public:
 
   [[nodiscard]] virtual bool UsesComponentCache() const { return false; }
   [[nodiscard]] virtual std::unique_ptr<ComponentCacheResources>
-  CreateComponentCacheResources(cache::ResourceLedger&, std::size_t) const;
+  CreateComponentCacheResources(cache::ResourceLedger&) const;
   [[nodiscard]] virtual std::unique_ptr<TextRunnerState> BindComponentState(
       cache::Adapter&, cache::Slot&) const;
   virtual void ReconcileComponentState(TextRunnerState&, std::size_t) const;
@@ -855,8 +848,7 @@ public:
 
   TextRunnerPool(
       std::shared_ptr<TextModelRunner> runner, std::size_t state_count,
-      std::optional<TextRunnerDiskCacheOptions> disk_cache = std::nullopt,
-      TextRunnerRamCacheOptions ram_cache = {});
+      std::optional<TextRunnerDiskCacheOptions> disk_cache = std::nullopt);
   ~TextRunnerPool();
 
   TextRunnerPool(const TextRunnerPool&) = delete;
@@ -929,8 +921,9 @@ public:
       bool persist = true);
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
-  /// Longest RAM-retained prefix of prompt that Acquire could reuse, without
-  /// leasing a state. An upper bound: Acquire may still prefer a shorter one.
+  /// Longest cached (live, disk or in-process snapshot) prefix of prompt that
+  /// Acquire could reuse, without leasing a state. An upper bound: Acquire
+  /// may still prefer a shorter one.
   [[nodiscard]] std::size_t CachedPrefixTokens(
       std::span<const TextRunnerToken> prompt,
       const TextPromptContext* context) const;

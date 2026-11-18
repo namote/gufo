@@ -9,10 +9,12 @@ checkpoints and unrelated small requests compete for a full RAM budget. From
 the third turn on, each turn must restore the history before the user turn two
 turns back, less one learning step, and answer as an uncached control does.
 
-Run this suite in its own invocation with a RAM budget that holds at most
-SNAPSHOT_RATIO conversation checkpoints, such as `--cache-ram-bytes 2147483648`
-for Qwen3.8-Flash-Next at the default context; a larger budget fails as
-unqualified rather than passing without pressure.
+Legacy runners (DeepSeek) size their RAM snapshot cache automatically; run
+this suite on a host where that budget holds at most SNAPSHOT_RATIO
+conversation checkpoints, or it fails as unqualified rather than passing
+without pressure. Qwen27B and Flash-Next keep no RAM checkpoints (capacity 0):
+the suite then skips the fill and checks that the learned divergence point is
+restored from disk, so run them with `--cache-disk`.
 """
 
 from copy import deepcopy
@@ -71,7 +73,7 @@ def notice(index):
 
 
 def check_cache_bridge(client, model, checks, chat_result, capacity_bytes):
-    if not capacity_bytes:
+    if capacity_bytes is None:
         raise AssertionError("cache-bridge needs the server's snapshot capacity")
     request = dict(model=model, temperature=0, seed=31, max_completion_tokens=16,
                    reasoning_effort="none")
@@ -156,8 +158,8 @@ def check_cache_bridge(client, model, checks, chat_result, capacity_bytes):
     if largest and largest * SNAPSHOT_RATIO < capacity_bytes:
         raise AssertionError(
             f"unqualified: a {largest}-byte conversation checkpoint is less than 1/"
-            f"{SNAPSHOT_RATIO} of the {capacity_bytes}-byte budget; use a smaller "
-            "--cache-ram-bytes")
+            f"{SNAPSHOT_RATIO} of the {capacity_bytes}-byte budget; run on a host "
+            "with less available RAM")
     failures = [f"bridge turn {row['turn']}: restored {row['cached_tokens']} tokens, "
                 f"expected at least {row['floor']}: {row}"
                 for row in evidence if row["cached_tokens"] < row["floor"]]

@@ -132,8 +132,8 @@ the generated frontier. It also rejects the roughly 280 ms restore stall.
 
 Flash-Next prompt restores have a focused alignment check. Four conversations
 place the end of the final user turn on each residue modulo four past the
-sparse budget. Each continuation restores that boundary from RAM, and from
-`--cache-disk` after a restart, and must equal the same request on a fresh
+sparse budget. Each continuation restores that boundary from
+`--cache-disk` after a restart (there is no RAM checkpoint tier), and must equal the same request on a fresh
 server byte for byte, with every restore on a multiple of four:
 
 ```sh
@@ -216,9 +216,9 @@ nix develop -c python3 tests/functional/embeddings.py \
 ```
 
 Flash-Next startup identity checks use a separate runner with an initially empty
-artifact-hash cache, as on a fresh container. RAM-only serving must skip full-file
-fingerprints and still reuse its prompt. Disk serving must fingerprint the model
-and restore the same reply after a restart:
+artifact-hash cache, as on a fresh container. Disk serving must fingerprint the
+model, restore an identical retry from its disk checkpoint, and restore the same
+reply after a restart:
 
 ```sh
 nix develop -c python3 tests/functional/cache_startup.py \
@@ -227,8 +227,8 @@ nix develop -c python3 tests/functional/cache_startup.py \
   --speculative mtp --mtp-model /path/to/mtp.gguf --context 8192
 ```
 
-Run again with `--speculative off` for AR. `--case ram` or `--case disk` selects
-only that lifecycle. For Qwen 27B, add `--model-kind qwen27b` before `--`,
+Run again with `--speculative off` for AR. `--case disk` (the default) is the
+only lifecycle: without RAM checkpoints an identical retry needs the disk tier. For Qwen 27B, add `--model-kind qwen27b` before `--`,
 use its target weights, and select `--speculative off` or
 `--speculative dflash2 --dflash-model /path/to/draft.gguf` in the server command.
 Commands, startup times, request timings, responses and logs
@@ -529,12 +529,12 @@ RAM, disk and restart settings once their contracts pass.
 | `cache-growth` | Keep cache reuse advancing over several turns when the client omits reasoning; check reasoning replay and thinking-off controls, including Messages thinking blocks, and compare with uncached responses |
 | `cache-depth` | Histories beyond 16K, concurrent branches from rewritten replies, a side conversation, resume, unchanged retries and exact uncached controls; use context 32768 and also check sessions 1 |
 | `cache-stalls` | Flash-Next AR/MTP: sequential coding/planning prompts with 6.4K/25.6K/55.6K/56K padding and three repeats each, thinking on and tg128. Checks prefix reuse and exact fully cached replay; retains each request's PP/TG and maximum-gap timing gate. Public equivalents of #632, whose prompts were not attached. Use sessions 2/context 262144 to match its capacity; minimum context 65536. Explicit selection only, outside `all` |
-| `cache-rotation` | Check cache RAM limits and keep history across conversations and small side requests; compare answers with uncached controls |
+| `cache-rotation` | Check the startup cache configuration and keep history across conversations and small side requests; compare answers with uncached controls |
 | `cache-shared-prefix` | New conversations under one system prompt, one after another, with long and short tasks: from the third on they restore the whole shared prefix; compare answers with uncached controls |
-| `cache-bridge` | A chat bridge sends each user message with metadata its history copy drops, under a full RAM budget with small unrelated requests between turns: from the third turn on, reuse reaches the user turn two back; compare answers with uncached controls. Not in `all` |
+| `cache-bridge` | A chat bridge sends each user message with metadata its history copy drops, with small unrelated requests between turns (legacy runners: under a full RAM budget; Qwen27B/Flash-Next: from disk, no RAM tier): from the third turn on, reuse reaches the user turn two back; compare answers with uncached controls. Not in `all` |
 | `cache-compaction` | A tool history grows near the context limit, then a summary replaces it while system/tools stay; check shared-boundary reuse, unchanged retries, continued growth and exact uncached answers. Requires context ≥ 16384. Not in `all` |
 | `cache-transforms` | Clear an old tool result, remove a few hundred late user tokens, or retry/edit after a 10K+ result; restore coherent pre-edit boundaries and compare uncached answers. Requires context ≥ 32768. Not in `all` |
-| `cache-pressure` | Fill the RAM budget, compact an abandoned history, resume idle conversations, send volatile headers/UI tasks, then fan out children and resume their parent. Requires a small explicit RAM budget. Not in `all` |
+| `cache-pressure` | Fill the RAM budget, compact an abandoned history, resume idle conversations, send volatile headers/UI tasks, then fan out children and resume their parent. Legacy runners with a RAM snapshot cache only; Qwen27B and Flash-Next keep none and fail it as not applicable. Not in `all` |
 | `cache-messages-loop` | Twelve streamed `/v1/messages` tool-call/result cycles with actual calls and growing history; each request checks reuse and has an uncached Chat control. Requires context ≥ 16384. Not in `all` |
 | `system-injection` | System/developer messages after the conversation start, in Chat and Responses: accepted, followed by the model and equal to uncached responses; the hoisted turn's reuse is recorded and the next turn must reuse it in full |
 | `cache-concurrency` | Concurrent identical prompts, shared-system fan-out with short and long tasks, short or no shared prefixes, a retained conversation beside a newcomer, and a cancelled leader; check waits, prefill work and uncached answers |
@@ -604,14 +604,14 @@ interrupted histories, not a direct baseline for the divergent session; this
 also applies to later disk-spacing and cancellation requests in that history.
 
 For repeated screenshot preprocessing (#627), `image_history.py` measures full
-RAM-cache retries with 1, 2 and 4 synthetic 1080p screenshots, similar-token text
+disk-restored retries with 1, 2 and 4 synthetic 1080p screenshots, similar-token text
 controls and 128px image controls. It uses only the Python standard library:
 
 ```sh
 python3 tests/functional/image_history.py --output /tmp/image-history-main -- \
   /path/to/production/gufo serve llm --model /path/to/model.gguf \
   --mmproj /path/to/mmproj.gguf --sessions 1 --context 32768 \
-  --cache-ram-bytes 8589934592 --think off
+  --cache-disk /tmp/image-history-cache --think off
 ```
 
 Repeat with the candidate, identical model/mode/options and a fresh output path.
@@ -719,15 +719,18 @@ Component disk-spacing checks correlate drained publication logs with the
 checkpoint IDs captured by their own requests, excluding delayed writes from
 earlier suites even when their token counts match.
 `cache` also checks `cache_persist: false` across the same restart: a flagged
-prompt still reuses RAM within the first server and finds nothing on disk after
+prompt still reuses in-memory state (live frontier, or RAM on legacy runners)
+within the first server and finds nothing on disk after
 the restart, while an unflagged control prompt restores from disk.
 `cache-rotation` visits four conversations and eight small side requests; use
 `--sessions 1` to verify retention is independent of execution slots. It also
-checks the startup RAM cap; byte/record pressure is covered by CPU tests.
-`cache-bridge` needs RAM pressure: run it in its own invocation with a budget
-that holds at most 16 of its conversation checkpoints, such as
-`--cache-ram-bytes 2147483648` for Flash-Next at the default context.
-Background requests fill the budget first; a larger budget fails as unqualified.
+checks the startup cache configuration (legacy runners: the automatic RAM cap);
+byte/record pressure is covered by CPU tests.
+`cache-bridge` runs in its own invocation. On legacy runners it needs RAM
+pressure: their automatic budget must hold at most 16 of its conversation
+checkpoints, background requests fill it first, and a larger budget fails as
+unqualified. Qwen27B and Flash-Next have no RAM budget (capacity 0): the fill is
+skipped and the learned boundary must restore from disk, so pass `--cache-disk`.
 `cache-concurrency` sends each group at once. With `--sessions 2` or more,
 requests sharing a long prefix must wait for one prefill and then prefill only
 their own tail; groups sharing little or nothing must not wait. With
@@ -747,12 +750,12 @@ not a real client's summary generation or retention under RAM/disk pressure.
 The [card 01 results](../../docs/cache-redesign/cards/01-functional-coverage.md#results)
 record all scenario families, including failures on the legacy cache.
 
-Run `cache-transforms` with a roomy RAM budget in its own invocation. Its
+Run `cache-transforms` in its own invocation. Its
 retried prompts end with a user turn after a tool result, and Qwen templates
 place the stable boundary before such a turn, so under pressure an unchanged
 retry prefills that turn as well as the assistant opening. The suite therefore
 checks zero-prefill retries without adding pressure.
-`cache-pressure` instead runs explicitly with `--cache-ram-bytes 2147483648`,
+`cache-pressure` (legacy runners only) instead runs explicitly with
 `--context 32768`, and `--sessions 2` (also supports one session, with sequential
 children). It verifies that background requests published at least twice the
 configured budget before the measured histories. UI prompts embed actual chat
@@ -781,7 +784,7 @@ nix develop -c python3 tests/functional/cache_lifecycle.py \
 
 Repeat `--case restart|tiered|oversized|crash|side-traffic` to select cases. `restart` models
 llama-swap stopping and starting a server between turns. `tiered` first warms a
-short RAM prefix after restart, then requests a history with a deeper published
+short prefix after restart, then requests a history with a deeper published
 disk checkpoint. `oversized` uses 1 MiB staging beneath an observed larger
 checkpoint. `crash` uses the CMake-built, child-only preload helper to hold a
 private-cache file at `fsync`, verifies queued bytes and the completed HTTP
@@ -795,19 +798,19 @@ publication and disk restoration must meet that depth; line count alone is
 not evidence. `--publication-timeout 300` allows the large checkpoint to finish
 before the deliberate crash without changing request timing gates. The
 oversized case waits for the deep publication before graceful shutdown and
-still uses 1 MiB staging. Keep the same explicit RAM limit in both modes.
+still uses 1 MiB staging.
 `--model-kind` (default `flash-next`; also `qwen27b`, `deepseek`) selects the
 staging rule. Flash-Next and Qwen27B reject `--cache-disk-staging-bytes`, so the
 runner omits it and every case uses their internal 1 MiB transfer buffer.
 For `deepseek`, use `--staging-bytes` to match the staging budget of a reported
 restart, tiered or crash workload (default: 2 GiB). This value is recorded in
 the report; the oversized case always keeps its 1 MiB staging allocation.
-For checkpoints larger than committed RAM, use `--require-over-ram` with
-`--case oversized` or `--case side-traffic`. For example, Flash-Next at context 262144 with
-`--seed-lines 12500 --minimum-published-tokens 174000` and
-`--cache-ram-bytes 4593364992` exercises a 175K seed and a 186K continuation.
-The assertion compares the published payload with the server's actual
-post-allocation RAM budget; a queued job alone does not qualify the case.
+`--require-over-ram` with `--case oversized` or `--case side-traffic` requires
+the published payload to exceed the server's RAM checkpoint capacity, which is
+zero on Qwen27B and Flash-Next (no RAM tier); a queued job alone does not
+qualify the case. For example, Flash-Next at context 262144 with
+`--seed-lines 12500 --minimum-published-tokens 174000` exercises a 175K seed and
+a 186K continuation.
 `side-traffic` keeps the system prompt at at most 256 background lines and
 places the remaining seed in the user history. After publishing the deep append
 and restarting, it alternates four short conversations sharing that system with
@@ -830,36 +833,22 @@ nix develop -c python3 tests/functional/publication_wait.py \
   --mtp-model /path/to/mtp.gguf --speculative mtp --sessions 1 --context 65536
 ```
 
-The runner uses a fresh 8 GiB disk tier and a 1 GiB RAM budget unless explicitly
-set, requires an actual over-RAM publication and disk restore, and retains all
+The runner uses a fresh 8 GiB disk tier, requires an actual deep publication and
+disk restore, and retains all
 HTTP requests/responses and timings. It removes its own cache after each case.
 Use `--case bound --expect cap` only for a matched pre-fix main timing control;
 candidate correctness uses the default `bounded` expectation. The bound case
 schedules release after 130 seconds and releases earlier if the waiter finishes;
 the child-only helper has a longer safety timeout. The bound waiter re-prefills
-from the deepest checkpoint it can restore. When RAM is tight, that can be a
-shallow seed on disk, so the waiter must match the cold answer and reasoning
+from the deepest checkpoint it can restore. That can be a shallow seed on disk, so the waiter must match the cold answer and reasoning
 mode, not the full reasoning text. The retry must still match cold exactly. The
 publication case waits for the scheduler's actual park before starting its
 250 ms release timer, then checks the matching request/checkpoint release before
 its deadline and a disk restore. These checks stay outside hosted CI and the
 routine API suites.
 
-PR #677's staging-reclamation regression reuses this runner with `--case reclaim`
-before `--`. It defaults to a 256 MiB RAM cache, requires a retained checkpoint
-to release RAM during the deep request, then verifies publication and restoration
-of the exact held 50K+ token checkpoint. It also checks the loaded speculative
-mode, actual draft work, fewer than 64 prefill tokens and output against a cold
-control. A run that never reclaims RAM fails rather than passing on disk use
-alone. For example:
-
-```sh
-nix develop -c python3 tests/functional/publication_wait.py \
-  --case reclaim --output /tmp/publication-reclaim \
-  --fault-library build/cpu-test/libcache_disk_faults.so -- \
-  /path/to/production/gufo serve llm --model /path/to/flash-next.gguf \
-  --mtp-model /path/to/mtp.gguf --speculative mtp --sessions 1 --context 65536
-```
+PR #677's staging-reclamation case (`--case reclaim`) is removed: it exercised
+RAM checkpoint reclamation, and Qwen27B and Flash-Next keep no RAM checkpoints.
 
 Unchanged retries must reproduce the complete output with zero prefill. After a
 restart, disk restores may re-prefill less than one 2048-token disk step;

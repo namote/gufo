@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Qwen startup identity, RAM reuse and durable restart checks.
+"""Qwen startup identity, disk reuse and durable restart checks.
+
+Qwen27B and Flash-Next keep no RAM checkpoints: an identical retry restores the
+prompt's disk checkpoint (the live frontier also holds the reply, so it does
+not prefix the retry).
 
 Each run owns its server, disk tier and initially empty XDG cache. Select AR or
 MTP or DFlash2 in the production server command. No weights are downloaded or modified.
@@ -27,8 +31,8 @@ def main():
     parser.add_argument("--startup-timeout", type=float, default=240)
     parser.add_argument("--model-kind", choices=("flash-next", "qwen27b"),
                         default="flash-next")
-    parser.add_argument("--case", action="append", choices=("ram", "disk"),
-                        help="Default: RAM startup, then disk startup/restart")
+    parser.add_argument("--case", action="append", choices=("disk",),
+                        help="Default: disk startup, retry and restart")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -154,22 +158,17 @@ def main():
         return result
 
     try:
-        selected = set(args.case or ("ram", "disk"))
-        if "ram" in selected:
-            with stage("ram"):
-                cold = chat("cold")
-                warm = chat("retry", warm=True)
-                assert continuation.digest(cold) == continuation.digest(warm)
+        selected = set(args.case or ("disk",))
         if "disk" in selected:
             with stage("disk", disk=True):
                 cold = chat("cold")
-                warm = chat("retry", warm=True)
-                assert continuation.digest(cold) == continuation.digest(warm)
                 wait_until(lambda: any(
                     tokens >= cold["usage"]["prompt_tokens"] - 8
                     for tokens in published_tokens(
                         (stage_path / "server.log").read_text())),
-                    "the prompt's durable checkpoint before restart")
+                    "the prompt's durable checkpoint")
+                warm = chat("retry", warm=True, disk=True)
+                assert continuation.digest(cold) == continuation.digest(warm)
             with stage("restart", disk=True):
                 restored = chat("restored", warm=True, disk=True)
                 assert continuation.digest(cold) == continuation.digest(restored)

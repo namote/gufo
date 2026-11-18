@@ -154,7 +154,8 @@ def check_cache_transforms(client, model, checks, chat_result, context, server_l
 
 def fill_budget(run, label, capacity):
     if not capacity:
-        raise AssertionError("cache-pressure requires the configured RAM budget")
+        raise AssertionError("cache-pressure needs a RAM snapshot cache (legacy runners); "
+                             "Qwen27B and Flash-Next keep no RAM checkpoints")
     published = 0
     for index in range(48):
         result = run.chat(f"{label}_fill_{index:02d}", history(f"{label}_fill_{index}", 8))
