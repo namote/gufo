@@ -13,7 +13,14 @@ namespace gufo::cache {
 // Actual capacity exhaustion permits retention to reclaim eligible owners.
 // Allocation and injected failures remain ordinary bad_alloc and must not
 // trigger policy eviction. Existing bad_alloc callers remain compatible.
-class ResourceExhausted : public std::bad_alloc {};
+class ResourceExhausted : public std::bad_alloc {
+public:
+  // Distinguishes a refused admission from a host allocation failure in
+  // failure reports (persistence_incomplete).
+  [[nodiscard]] const char* what() const noexcept override {
+    return "cache resource exhausted";
+  }
+};
 
 enum class ResourceCategory : std::uint8_t {
   kBackingFree,

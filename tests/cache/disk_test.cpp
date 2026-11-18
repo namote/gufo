@@ -700,6 +700,72 @@ void VerifiedDependencies() {
   assert(rejected);
   assert(retire() == settled);
 }
+// A manifest of `chunks` full 8-byte chunks named from `first_file` on.
+DiskManifest ChunkManifest(std::uint64_t checkpoint, unsigned first_file,
+                           unsigned chunks) {
+  DiskManifest m;
+  m.checkpoint = {checkpoint};
+  m.lineage = {checkpoint};
+  m.compatibility.fill(0x42);
+  m.tokens.assign(2 * chunks, 17);
+  m.components.push_back({{{1}, 4, ComponentKind::kAppendRows, 4, 2, 0},
+                          {{1}, 2 * chunks},
+                          {},
+                          {},
+                          {}});
+  for (unsigned i = 0; i < chunks; ++i)
+    m.components[0].chunks.push_back({Id(first_file + i), 8, 99});
+  return m;
+}
+void PublicationWithFullLedger() {
+  // A publication checks its own references against the store. It used to
+  // rebuild a reference catalog of every stored manifest, which for a large
+  // disk cache needs more metadata than a full RAM cache leaves the ledger,
+  // so every write failed (ResourceExhausted) once the RAM cache filled.
+  Directory d;
+  {
+    DiskStore init(ledger, d.path, UINT64_MAX);
+  }
+  constexpr unsigned kManifests = 64, kChunks = 128;
+  for (unsigned i = 0; i < kManifests; ++i) {
+    const auto m = ChunkManifest(100 + i, 1 + i * kChunks, kChunks);
+    Payloads(d.path, m);
+    Put(d.path, m, 1 + i);
+  }
+  constexpr std::size_t kLimit = 1ULL << 30;
+  ResourceLedger full{{kLimit, kLimit, 0, kLimit}};
+  DiskStore store(full, d.path, UINT64_MAX);
+  assert(store.Entries().size() == kManifests);
+  // Leave far less than a catalog of 8,192 references needs (~2.4 MB),
+  // as a RAM cache at its budget does.
+  constexpr std::size_t kHeadroom = 256 << 10;
+  auto filler = full.Reserve(ResourceCategory::kMetadata,
+                             kLimit - full.Snapshot().ram_bytes - kHeadroom);
+  const unsigned fresh = 1 + kManifests * kChunks;
+  std::array<std::uint8_t, 8> chunk{1};
+  auto next = ChunkManifest(900, fresh, 1);
+  next.components[0].chunks[0].checksum = DiskChecksum(chunk);
+  const std::array<DiskWriteBuffer, 1> writes{{{false, Id(fresh), chunk}}};
+  store.Publish(Id(fresh + 1), next, writes);
+  assert(store.Entries().size() == kManifests + 1);
+  // The candidate check still rejects what the catalog check did: a
+  // checkpoint id already stored, and a stored chunk under another lineage.
+  auto duplicate = ChunkManifest(100, fresh + 4, 1);
+  duplicate.components[0].chunks[0].checksum = DiskChecksum(chunk);
+  const std::array<DiskWriteBuffer, 1> duplicate_writes{
+      {{false, Id(fresh + 4), chunk}}};
+  Reject([&] { store.Publish(Id(fresh + 5), duplicate, duplicate_writes); });
+  auto foreign = ChunkManifest(901, fresh, 1);
+  foreign.components[0].chunks[0].checksum = DiskChecksum(chunk);
+  Reject([&] { store.Publish(Id(fresh + 3), foreign, {}); });
+  assert(store.Entries().size() == kManifests + 1);
+  // A chunk reused under the same geometry is shared, as before.
+  auto shared = ChunkManifest(902, fresh, 1);
+  shared.lineage = next.lineage;
+  shared.components[0].chunks[0].checksum = DiskChecksum(chunk);
+  store.Publish(Id(fresh + 6), shared, {});
+  assert(store.Entries().size() == kManifests + 2);
+}
 }  // namespace
 int main() {
   Format();
@@ -716,6 +782,7 @@ int main() {
   RootSymlinks();
   ParentPathResolution();
   MetadataAdmission();
+  PublicationWithFullLedger();
   assert(ledger.Snapshot().total_bytes == 0);
   std::cout << "disk format, ownership and metadata index passed\n";
 }

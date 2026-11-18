@@ -3,6 +3,7 @@
 #include <immintrin.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -678,6 +679,62 @@ struct DiskStore::Impl {
       node = {};
     }
   }
+  // Every payload reference of manifest `m` with the geometry that names
+  // it: (private, file) and lineage, component, layout, row bytes, rows per
+  // chunk, first row, bytes and checksum.
+  using ReferenceKey = std::pair<bool, DiskFileId>;
+  using ReferenceGeometry = std::array<std::uint64_t, 8>;
+  template<class F>
+  static void ForEachReference(const DiskManifest& m, F&& f) {
+    for (const auto& c : m.components) {
+      Rows first{};
+      const auto& d = c.descriptor;
+      const auto geometry = [&](const DiskPayload& p) {
+        return ReferenceGeometry{
+            m.lineage.value,  d.id.value, d.layout_version, d.row_bytes,
+            d.rows_per_chunk, first,      p.bytes,          p.checksum};
+      };
+      for (const auto& p : c.chunks) {
+        f(ReferenceKey{false, p.file}, geometry(p));
+        first = Add(first, d.rows_per_chunk);
+      }
+      for (auto p : {c.tail, c.private_state})
+        if (p)
+          f(ReferenceKey{true, p->file}, geometry(*p));
+    }
+  }
+  // Publication's check of the candidate (entries.back()) against the store,
+  // under index_mutex: the same conflicts ValidateReferences rejects, for
+  // the candidate's own references only. Every other entry was validated at
+  // recovery or its own publication, so pairs among them cannot conflict.
+  // The scratch is the candidate's references (Publish's working admission
+  // covers it), not the whole catalog: a catalog of a large disk cache needs
+  // hundreds of MB to rebuild, which a full RAM cache leaves the ledger
+  // without, and every write then fails with ResourceExhausted.
+  void ValidateCandidate() {
+    const auto& candidate = entries.back().manifest_;
+    std::map<ReferenceKey, ReferenceGeometry> claims;
+    ForEachReference(candidate, [&](const ReferenceKey& key,
+                                    const ReferenceGeometry& geometry) {
+      const auto [it, inserted] = claims.try_emplace(key, geometry);
+      // Private bytes cannot be aliased, not even within one checkpoint.
+      if (!inserted && (key.first || it->second != geometry))
+        Invalid();
+    });
+    for (std::size_t i = 0; i + 1 < entries.size(); ++i) {
+      const auto& m = entries[i].manifest_;
+      if (m.checkpoint == candidate.checkpoint)
+        Invalid();
+      ForEachReference(
+          m, [&](const ReferenceKey& key, const ReferenceGeometry& geometry) {
+            const auto it = claims.find(key);
+            if (it != claims.end() &&
+                (key.first || m.compatibility != candidate.compatibility ||
+                 it->second != geometry))
+              Invalid();
+          });
+    }
+  }
   void ValidateReferences(bool reject = true) {
     if (entries.empty())
       return;
@@ -1229,7 +1286,7 @@ struct DiskStore::Impl {
     entries.push_back(std::move(candidate));
     bool manifest_attempted{};
     try {
-      ValidateReferences(false);
+      ValidateCandidate();
       index_guard.unlock();
       // Candidate is invisible to pinned snapshots until committed. Reuse from
       // filesystem existence after validating claims, never from this
