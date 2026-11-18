@@ -590,6 +590,7 @@
   - Combined prefill+decode pass: not pursued; a prefill-size pass streams all experts (~0.2 s fixed), so a riding decoder gets one MTP round (~3.5 tokens) per pass, below time sharing (see "Mixed batching (plan S3) dropped", November 11).
   - Rejected: shrinking active-decode prefill chunks toward a 600 ms target. 150K-token prompt while a 12K-token story decodes, candidate vs production binary: decoder max gap 0.70 / 0.715 s, gaps over 0.5 s 315 / 298, decoder 20.5 / 20.5 tok/s during the prefill, prompt ttft 380.4 / 369.9 s (prefill 818.5 / 841.1 tok/s, −2.7%). Patch kept in `~/projects/_backup/decode-active-chunk-target-20261118/`.
   - Candidate speeds (1 / 2 / 4 streams, 600 tokens): 38.0 / 29.6 + 27.5 / 18.0–19.1 each (total 74.2), same as the pool pass.
+  - Deployed the same day as runtime-20261118b (a3f775a8, 44d03e38…); rollback `~/projects/_backup/gufo-server-20261118-before-persistence/`.
   - **Result:** only the persistence fix ships.
 - **Combined pass for the steering-API runtime** (8c45bd3d against production runtime-20261112a; `build/b1/pass-20261114/`, November 14).
   - Setup: the production config (YaRN 1M, K4V4, MTP 7, 2 sessions, `--reasoning-effort low`), the R2-3 scripts (`ab.py`, `detect.py`). Runs alternated prod, cand, prod, cand. Host preflight failed only on fragmentation (order ≥ 9 free blocks 29,174).
