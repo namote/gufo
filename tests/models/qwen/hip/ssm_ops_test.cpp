@@ -316,6 +316,7 @@ void TestRecurrentForkPingPong() {
   constexpr std::uint32_t total_rows = 16, replayed_rows = 7, split_rows = 5;
   for (const auto& shape :
        {Shape{128, 256, 2, Storage::kFp32}, Shape{128, 256, 2, Storage::kBf16},
+        Shape{128, 256, 2, Storage::kFp16},
         Shape{32, 128, 4, Storage::kFp32}}) {
     auto config = gufo::models::qwen::make_small_qwen_config();
     config.ssm_state_size = shape.state_size;
@@ -337,7 +338,9 @@ void TestRecurrentForkPingPong() {
     const std::size_t delta_bytes = delta_elements * element_bytes;
     std::cout << "Recurrent fork ping-pong: key_dim=" << key_dim
               << " val_dim=" << val_dim
-              << (shape.storage == Storage::kBf16 ? " bf16\n" : " fp32\n");
+              << (shape.storage == Storage::kBf16   ? " bf16\n"
+                  : shape.storage == Storage::kFp16 ? " fp16\n"
+                                                    : " fp32\n");
 
     DeviceBuffer<float> input(values(total_rows * qkv, 1.0F, 1)),
         weights(values(qkv * 4, 0.3F, 2)),
@@ -356,6 +359,10 @@ void TestRecurrentForkPingPong() {
         if (shape.storage == Storage::kFp32) {
           std::memcpy(seed_bytes.data() + conv_bytes + i * element_bytes,
                       &delta[i], element_bytes);
+        } else if (shape.storage == Storage::kFp16) {
+          const auto half = static_cast<_Float16>(delta[i]);
+          std::memcpy(seed_bytes.data() + conv_bytes + i * element_bytes, &half,
+                      element_bytes);
         } else {
           const auto bits = gufo::test::FloatToBf16Bits(delta[i]);
           std::memcpy(seed_bytes.data() + conv_bytes + i * element_bytes, &bits,
@@ -414,7 +421,15 @@ void TestRecurrentForkPingPong() {
                unpinned.conv_out == reference.d_ssm_conv_state &&
                unpinned.recurrent_out == reference.d_ssm_deltanet_state,
            "an unpinned arena must update in place");
-    run(reference, unpinned, 0, total_rows);
+    // FP16 state rounds once per launch: its reference splits the pass where
+    // the candidate does (a ring-bound split), so the comparison checks the
+    // buffer routing rather than the split.
+    if (shape.storage == Storage::kFp16) {
+      run(reference, unpinned, 0, split_rows);
+      run(reference, unpinned.Continued(), split_rows, total_rows - split_rows);
+    } else {
+      run(reference, unpinned, 0, total_rows);
+    }
     const auto after_all = state_bytes(reference);
     seed(reference);
     run(reference, reference.BeginRecurrentWrite(), 0, replayed_rows);

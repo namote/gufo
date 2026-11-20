@@ -319,19 +319,56 @@ void QwenGpuExecutor::ReplaySsmState(std::uint32_t position,
     // Layers have independent recorded inputs and recurrent state. Replay each
     // layer's committed rows together, splitting only at ring/scratch bounds;
     // a layer's later splits continue from what its first launch wrote.
+    // FP16 state rounds once per launch, and verification ran these rows in
+    // one launch: a replay that wraps the ring stages its rows contiguously
+    // so it rounds once as well, giving the verified state.
+    const bool stage =
+        arena_.GetRecurrentStateStorage() == QwenRecurrentStateStorage::kFp16 &&
+        count <= arena_.GetScratchRows() &&
+        position % kSsmReplayCapacity + count > kSsmReplayCapacity;
+    if (stage) {
+      const std::size_t qkv = config.SsmQkvSize();
+      const std::size_t heads = config.ssm_time_step_rank;
+      for (std::uint32_t offset = 0; offset < count;) {
+        const auto start = position + offset;
+        const auto rows =
+            std::min(count - offset,
+                     static_cast<std::uint32_t>(kSsmReplayCapacity -
+                                                (start % kSsmReplayCapacity)));
+        const auto copy = [&](float* destination, const float* source,
+                              std::size_t width) {
+          HIP_CHECK(hipMemcpyAsync(destination + offset * width, source,
+                                   rows * width * sizeof(float),
+                                   hipMemcpyDeviceToDevice, arena_.stream));
+        };
+        copy(scratch.ssm.qkv.data(), arena_.GetReplayQkv(layer_idx, start),
+             qkv);
+        copy(scratch.ssm.alpha.data(), arena_.GetReplayAlpha(layer_idx, start),
+             heads);
+        copy(scratch.ssm.beta.data(), arena_.GetReplayBeta(layer_idx, start),
+             heads);
+        offset += rows;
+      }
+    }
     auto layer_state = recurrent_state;
     for (std::uint32_t offset = 0; offset < count;) {
       const auto start = position + offset;
       const auto until_wrap = static_cast<std::uint32_t>(
           kSsmReplayCapacity - (start % kSsmReplayCapacity));
       const auto rows =
-          std::min({count - offset, until_wrap,
-                    static_cast<std::uint32_t>(arena_.GetScratchRows())});
+          stage
+              ? count
+              : std::min({count - offset, until_wrap,
+                          static_cast<std::uint32_t>(arena_.GetScratchRows())});
       LaunchSSMConvRecurrenceRows(
-          arena_.GetReplayQkv(layer_idx, start),
+          stage ? scratch.ssm.qkv.data()
+                : arena_.GetReplayQkv(layer_idx, start),
           static_cast<const float*>(layer.ssm_conv1d.data), layer_state,
-          scratch.ssm.conv_out.data(), arena_.GetReplayAlpha(layer_idx, start),
-          arena_.GetReplayBeta(layer_idx, start),
+          scratch.ssm.conv_out.data(),
+          stage ? scratch.ssm.alpha.data()
+                : arena_.GetReplayAlpha(layer_idx, start),
+          stage ? scratch.ssm.beta.data()
+                : arena_.GetReplayBeta(layer_idx, start),
           static_cast<const float*>(layer.ssm_a.data),
           static_cast<const float*>(layer.ssm_dt.data), nullptr, nullptr,
           nullptr, config.SsmLayerIndex(layer_idx), config.SsmQkvSize(),
