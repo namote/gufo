@@ -863,6 +863,7 @@ struct TextGenerationScheduler::Impl {
                       TextGenerationBackend::FinishReason finish_reason) {
     request->result.completion_tokens = request->result.tokens.size();
     request->result.finish_reason = finish_reason;
+    FlushPendingLoop(request);
     request->loop_monitor.reset();  // its tables are no longer needed
     if (request->inter_token_samples > 0) {
       request->result.mean_inter_token_ms =
@@ -907,6 +908,7 @@ struct TextGenerationScheduler::Impl {
     EndPublicationWait(request, "failed");
     if (IsTerminal(request))
       return;
+    FlushPendingLoop(request);
     request->loop_monitor.reset();
     if (!classified)
       failure = ClassifyFailure(std::move(failure));
@@ -2011,8 +2013,24 @@ struct TextGenerationScheduler::Impl {
     LogLoop(request, found, action);
   }
 
-  // Each detection is logged once, from ObserveLoop or ResolveLoop: at most
-  // once per phase.
+  // A reasoning loop still pending when the request ends (EOS, a stop
+  // sequence, a limit, cancellation or failure in its step) is logged; the
+  // reply has ended, so nothing is forced.
+  static void FlushPendingLoop(
+      const std::shared_ptr<ScheduledRequest>& request) noexcept {
+    if (!request->loop_pending)
+      return;
+    const auto found = *request->loop_pending;
+    request->loop_pending.reset();
+    try {
+      LogLoop(request, found, "ended");
+    } catch (...) {
+      // Logging must not fail a completing request.
+    }
+  }
+
+  // Each detection is logged once, from ObserveLoop, ResolveLoop or
+  // FlushPendingLoop: at most once per phase.
   static void LogLoop(const std::shared_ptr<ScheduledRequest>& request,
                       const LoopDetection& found, std::string_view action) {
     Logger::Info("loop",

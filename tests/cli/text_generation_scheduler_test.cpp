@@ -1495,7 +1495,11 @@ void TestLoopGuardInSpeculativeSteps() {
         control->loop_end_at = trigger + 1;
         control->loop_end_token = which == Case::kEnd ? 8 : 11;
       }
-      auto scheduler = MakeScheduler(control, 1);
+      if (batched)
+        control->block_prefill_label = 1;
+      // Batched: a peer without the guard shares the passes and continues
+      // after the guarded request stops on its loop.
+      auto scheduler = MakeScheduler(control, batched ? 2 : 1);
       gufo::sampling::SamplingConfig sampling;
       sampling.loop_guard = true;
       sampling.temperature = 1.0F;
@@ -1513,8 +1517,26 @@ void TestLoopGuardInSpeculativeSteps() {
       sampling.reasoning_budget = budget;
       gufo::server::TextRequestMetadata metadata;
       metadata.starts_in_reasoning = true;
-      const auto result =
-          scheduler->Submit({1}, 4000, sampling, {}, false, metadata).Wait();
+      auto guarded =
+          scheduler->Submit({1}, 4000, sampling, {}, false, metadata);
+      std::optional<TextGenerationScheduler::Request> peer;
+      if (batched) {
+        control->WaitForPrefill(1);
+        gufo::sampling::SamplingConfig plain;
+        plain.temperature = 1.0F;
+        peer = scheduler->Submit({2}, 3600, plain);
+        control->ReleasePrefill();
+      }
+      const auto result = guarded.Wait();
+      if (peer) {
+        const auto other = peer->Wait();
+        Expect(result.execution_plan == "batched-w2",
+               "the guarded request decodes in a real batch");
+        Expect(other.finish_reason == Finish::kLength &&
+                   other.tokens.size() == 3600 && other.loop_detected &&
+                   other.tokens.size() > result.tokens.size(),
+               "a peer without the guard continues after its lane stops");
+      }
       const auto& tokens = result.tokens;
       Expect(result.finish_reason == Finish::kLoopDetected &&
                  tokens.size() > trigger + 1024,
@@ -1545,6 +1567,50 @@ void TestLoopGuardInSpeculativeSteps() {
       }
     }
   }
+}
+
+// A pending thinking-loop detection is logged even when the reply ends in
+// the same step (EOS), before the guard could act on it.
+void TestPendingLoopIsLoggedAtTheEnd() {
+  std::size_t period = 40;
+  while (LoopTrigger(period) % 3 != 0)
+    ++period;
+  const auto trigger = LoopTrigger(period);
+  auto control = std::make_shared<FakeControl>();
+  control->multi_token_decode = true;
+  control->prefix_reuse = false;
+  control->loop_period = period;
+  control->max_context = 8192;
+  control->eos_after = trigger + 1;  // EOS inside the detecting step
+  gufo::sampling::SamplingConfig sampling;
+  sampling.loop_guard = true;
+  sampling.temperature = 1.0F;
+  auto budget = std::make_shared<gufo::sampling::ReasoningBudget>();
+  budget->tokens = gufo::sampling::ReasoningBudget::kUnlimited;
+  budget->forced = {8};
+  budget->ends = {8};
+  sampling.reasoning_budget = budget;
+  gufo::server::TextRequestMetadata metadata;
+  metadata.starts_in_reasoning = true;
+  // The log stream is swapped only while no scheduler thread exists.
+  std::ostringstream output;
+  auto* previous = std::clog.rdbuf(output.rdbuf());
+  TextGenerationScheduler::Result result;
+  {
+    auto scheduler = MakeScheduler(control, 1);
+    result = scheduler->Submit({1}, 4000, sampling, {}, false, metadata).Wait();
+  }
+  std::clog.rdbuf(previous);
+  Expect(result.loop_detected && !result.loop_closed_reasoning &&
+             result.finish_reason ==
+                 gufo::server::TextGenerationBackend::FinishReason::kStop &&
+             result.tokens.size() == trigger + 1,
+         "the reply ends at EOS in the detecting step");
+  const auto log = output.str();
+  Expect(log.find("event=loop_detected") != std::string::npos &&
+             log.find("phase=reasoning") != std::string::npos &&
+             log.find("action=ended") != std::string::npos,
+         "the pending detection is logged when the reply ends");
 }
 
 // An armed `--trace` records each finished request under the HTTP request id
@@ -4585,6 +4651,7 @@ int main() {
   TestRunnerCanReuseExactIncrementalText();
   TestLoopGuardEndsALoopingAnswer();
   TestLoopGuardInSpeculativeSteps();
+  TestPendingLoopIsLoggedAtTheEnd();
   TestGenerationTraceRecordsPromptAndOutput();
   TestMultiTokenDecodePublishesDraftMetricsAndDisablesPrefixReuse();
   TestRequestTotalsDoNotNeedAConsumer();
