@@ -124,7 +124,9 @@ struct SamplingConfig {
   /// decoding ignores it; only Flash-Next MTP applies it. Its guards keep the
   /// exact rule for copied (prompt-lookup) drafts, while the reply reasons
   /// (tracked only with reasoning_budget), and around repetition
-  /// (TypicalGuard). Off by default.
+  /// (TypicalGuard, per request: a new continuation request seeds its
+  /// history from generated_prefix but starts without an exact window).
+  /// Off by default.
   bool typical_acceptance{false};
   /// Act on a generation loop the server detects (serve --loop-guard,
   /// request loop_guard): close an open reasoning block, or end the answer

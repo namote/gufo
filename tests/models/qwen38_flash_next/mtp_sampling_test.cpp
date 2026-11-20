@@ -747,6 +747,83 @@ void CheckTypicalGuards() {
       "typical acceptance off keeps no guard state");
 }
 
+// One speculative step as the engine runs it: the pool's sampler is copied,
+// the copy accepts the anchor and verifies an MTP draft that would complete a
+// repeated 12-gram. Full-row and compact verification refuse it alike and
+// sample the same correction; the step publishes its draws and window to
+// the pool, which accepts the anchor, so the window expires at the same
+// absolute generated count.
+void CheckTypicalChain() {
+  const std::array<float, 5> logits{0.3F, -0.2F, 1.1F, 0.7F, -1.0F};
+  sampling::SamplingConfig config{.temperature = 1.0F, .seed = 11};
+  config.top_k = 3;
+  config.typical_acceptance = true;
+  const std::array<sampling::TokenId, 11> prefix{2, 3, 2, 2, 3, 2,
+                                                 2, 2, 3, 3, 2};
+  sampling::SamplerState pool(config);
+  for (int i = 0; i < 2; ++i) {
+    pool.Accept(prefix);
+    pool.Accept(0);
+    pool.Accept(2);
+  }
+  pool.Accept(std::span(prefix).first(10));
+  const sampling::TokenId anchor = prefix[10];
+  std::vector<sampling::LogitCandidate> candidates;
+  for (sampling::TokenId id = 0; id < logits.size(); ++id)
+    candidates.push_back({id, logits[id]});
+  qfn::MtpProposal proposal;
+  proposal.size = 1;
+  proposal.ids[0] = proposal.token = 0;
+  proposal.probabilities[0] = proposal.probability = 1;
+  const double p = pool.Distribution(logits).probability(0);
+  Require(qfn::TypicalProposal(pool.Distribution(logits), 0),
+          "the draft is typical, so only the guard refuses it");
+
+  unsigned rejections = 0;
+  for (std::uint64_t state = 1; state < 64; ++state) {
+    auto working = pool;
+    working.SetRngState(state * 0x9e3779b97f4a7c15ULL);
+    working.Accept(anchor);
+    auto probe = working;
+    if (probe.Uniform() < p)
+      continue;  // the exact test accepts; no guard involved
+    ++rejections;
+    auto compact = working;
+    const auto full = qfn::VerifyMtpProposal(logits, proposal, working);
+    const auto small =
+        qfn::VerifyMtpProposal(candidates, logits.size(), proposal, compact);
+    Require(!full.accepted && full.accepted == small.accepted &&
+                full.token == small.token &&
+                working.rng_state() == compact.rng_state() &&
+                working.typical_guard().cooldown() ==
+                    compact.typical_guard().cooldown(),
+            "full and compact verification refuse the repeat alike");
+    const auto generated = working.typical_guard().generated();
+    Require(working.typical_guard().cooldown().exact_until ==
+                generated + sampling::TypicalGuard::kExactWindow,
+            "the refusal starts the window at the verified position");
+    // The engine defers the correction; the pool takes the draws and window,
+    // then accepts the step's committed anchor.
+    working.DeferSample(full.token);
+    auto committed = pool;
+    committed.CopyDrawStateFrom(working);
+    committed.Accept(anchor);
+    Require(committed.SaveDrawState().pending == full.token &&
+                committed.typical_guard().generated() == generated &&
+                committed.typical_guard().cooldown() ==
+                    working.typical_guard().cooldown(),
+            "the pool holds the deferred correction and the window");
+    for (std::size_t i = 0; i + 1 < sampling::TypicalGuard::kExactWindow; ++i)
+      committed.Accept(i % 2 == 0 ? 4 : 1);
+    Require(!committed.TypicalAcceptanceOpen(),
+            "the window holds until its absolute end");
+    committed.Accept(4);
+    Require(committed.TypicalAcceptanceOpen(),
+            "the window expires at its absolute end");
+  }
+  Require(rejections > 0, "the chain check needs rejected draws");
+}
+
 // The Han scale's answer scope across an MTP chain whose drafts contain the
 // reasoning end (token 3): the draft proposal and the target verification of
 // each row use that row's offset, so outputs follow the scoped distribution.
@@ -887,6 +964,7 @@ int main() {
     CheckPointMassFrequencies();
     CheckTypicalAcceptance();
     CheckTypicalGuards();
+    CheckTypicalChain();
     CheckScopedHanChain();
     const std::array<float, 5> logits{0.3F, -0.2F, 1.1F, 0.7F, -1.0F};
     const std::array<sampling::TokenId, 4> history{2, 3, 2, 0};
