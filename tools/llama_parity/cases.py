@@ -57,6 +57,14 @@ roots = {
  "addl_true": {"type":"object","additionalProperties":True},
  "pattern_props": {"type":"object","patternProperties":{"^x_":{"type":"integer"}}},
 }
+nested = {
+ "plain": {},
+ "addl_true": {"additionalProperties": True},
+ "addl_false": {"additionalProperties": False},
+ "addl_schema": {"additionalProperties": {"type": "integer"}},
+ "pattern_props": {"patternProperties": {"^n": {"type": "integer"}}},
+ "unevaluated_true": {"unevaluatedProperties": True},
+}
 inline = {"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}
 root_shapes = {
  "root_oneof": {"type":"object","oneOf":[inline]},
@@ -94,6 +102,20 @@ def rows(call):
     cands = [call([("v", "archive.txt\n")]), call([("v", "archive.txt" + overlap)]),
              call([]), call([("v", "archive.txt"), ("zz", "1")])]
     result.append(["delimiter_overlap", json.dumps(schema), *map(json.dumps, cands)])
+    # Nested objects (#1126): llama.cpp closes declared properties unless
+    # additionalProperties allows extras, and orders required properties
+    # first. Candidates: schema order, required-first order, no arguments and
+    # an undeclared nested key.
+    item = {"type": "object", "required": ["path"], "properties": {
+        "end_line": {"type": "integer"}, "path": {"type": "string"},
+        "start_line": {"type": "integer"}}}
+    for name, extra in nested.items():
+        schema = {"type": "object", "required": ["files"], "properties": {
+            "files": {"type": "array", "items": {**item, **extra}}}}
+        cands = [call([("files", '[{"end_line": 2, "path": "a", "start_line": 1}]')]),
+                 call([("files", '[{"path": "a", "end_line": 2, "start_line": 1}]')]),
+                 call([]), call([("files", '[{"path": "a", "note": 1}]')])]
+        result.append([f"nested/{name}", json.dumps(schema), *map(json.dumps, cands)])
     # Numbers (#1166): llama.cpp's integral-part and decimal-part stop at 16
     # digits, and its exponent is an integral part. Candidates: the longest
     # accepted value, one digit more, no arguments and an undeclared argument.
@@ -111,6 +133,15 @@ def rows(call):
         cands = [call([("v", good)]), call([("v", bad)]), call([]),
                  call([("v", good), ("zz", "1")])]
         result.append([f"digits/{name}", json.dumps(schema), *map(json.dumps, cands)])
+    item = {"type": "object", "required": ["path"], "properties": {
+        "end_line": {"type": "integer"}, "path": {"type": "string"},
+        "start_line": {"type": "integer"}}}
+    schema = {"type": "object", "required": ["files"], "properties": {
+        "files": {"type": "array", "items": item}}}
+    cands = [call([("files", f'[{{"path": "a", "start_line": {sixteen}}}]')]),
+             call([("files", f'[{{"path": "a", "start_line": {seventeen}}}]')]),
+             call([]), call([("files", '[{"path": "a", "note": 1}]')])]
+    result.append(["digits/nested", json.dumps(schema), *map(json.dumps, cands)])
     return result
 
 
