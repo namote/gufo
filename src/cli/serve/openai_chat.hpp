@@ -44,6 +44,15 @@ std::optional<HttpResponse> ParseAbliterationControl(
     const json::Value& body, const TextGenerationBackend& backend,
     ChatRequest* chat);
 
+/// Validates a continuation after the endpoint has selected its final phase.
+std::optional<HttpResponse> ValidateContinuation(
+    const ChatRequest& chat, const TextGenerationBackend& backend);
+
+/// Messages selects continuation from its final assistant block.
+std::optional<HttpResponse> ApplyMessagesPrefill(
+    const json::Value& body, ChatRequest* chat,
+    const TextGenerationBackend& backend);
+
 /// Shared effort names; each API applies its own thinking and alias rules.
 std::optional<ReasoningEffort> ParseReasoningEffortName(std::string_view value);
 

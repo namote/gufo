@@ -125,6 +125,7 @@ struct ParsedGeneration {
   std::string reasoning_content;
   std::vector<ParsedToolCall> tool_calls;
   bool hide_tool_markup{false};
+  bool reasoning_open{false};
   std::vector<TextSourceSpan> text_spans;
 };
 
@@ -964,6 +965,20 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
                    "invalid_score_assistant");
     output->chat.score_assistant = score->as_bool();
   }
+  if (const auto* value = body.find("continue_final_message")) {
+    if (!value->is_bool())
+      return Error(400, "Bad Request",
+                   "'continue_final_message' must be a boolean",
+                   "invalid_continue_final_message");
+    output->chat.continue_final_message = value->as_bool();
+  }
+  if (const auto* value = body.find("add_generation_prompt")) {
+    if (output->chat.continue_final_message && value->is_bool() &&
+        value->as_bool())
+      return Error(400, "Bad Request",
+                   "'add_generation_prompt' must be false for continuation",
+                   "invalid_continue_final_message");
+  }
   const bool scoring = output->chat.score_assistant;
   if (scoring && !backend.supports_scoring())
     return Error(400, "Bad Request",
@@ -1055,6 +1070,13 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
                      "invalid_template_options");
       output->chat.add_vision_id = vision_id->as_bool();
     }
+  }
+  if (output->chat.continue_final_message) {
+    const auto* content = messages->items().back().find("content");
+    output->chat.continue_final_reasoning =
+        content == nullptr || content->is_null();
+    if (auto error = ValidateContinuation(output->chat, backend))
+      return error;
   }
   const ReasoningOptions defaults = backend.reasoning_defaults();
   if (!output->chat.reasoning.enabled.has_value()) {
@@ -1958,6 +1980,7 @@ ParsedGeneration ParseGeneration(
       const auto marker = tool_marker(content);
       parsed.reasoning_content = std::string(Trim(content.substr(0, marker)));
       if (marker == std::string_view::npos) {
+        parsed.reasoning_open = true;
         if (enforce_required && choice == ChatRequest::ToolChoice::kRequired)
           throw TextGenerationError(
               TextGenerationErrorCode::kToolChoiceUnsatisfied,
@@ -2011,6 +2034,7 @@ ParsedGeneration ParseGeneration(
       } else {
         const auto remaining = content.substr(think_content_start);
         const auto marker = tool_marker(remaining);
+        parsed.reasoning_open = marker == std::string_view::npos;
         parsed.reasoning_content =
             std::string(Trim(remaining.substr(0, marker)));
         SetParsedText(parsed, content.substr(0, think_start), raw, track_text);
@@ -2071,6 +2095,7 @@ ParsedGeneration ParseGeneration(
       } else {
         parsed.text.clear();
         parsed.text_spans.clear();
+        parsed.reasoning_open = true;
       }
       parsed.reasoning_content =
           std::string(reasoning_call_context.substr(0, end));
@@ -2160,14 +2185,18 @@ ParsedGeneration ParseStructuredGeneration(
             ? ReasoningToolMarker(raw, ReasoningToolMarkers(markers), quotes)
             : std::string_view::npos;
     if (call < end) {
-      if (partial && quotes.UnclosedAt(call))
+      if (partial && quotes.UnclosedAt(call)) {
+        parsed.reasoning_open = true;
         return parsed;
+      }
       parsed.reasoning_content = std::string(raw.substr(0, call));
       raw.remove_prefix(call);
     } else {
       parsed.reasoning_content = std::string(raw.substr(0, end));
-      if (end == std::string_view::npos)
+      if (end == std::string_view::npos) {
+        parsed.reasoning_open = true;
         return parsed;
+      }
       raw.remove_prefix(end + 8);
       raw = AfterReasoningSeparator(raw, markers);
     }
@@ -2407,6 +2436,10 @@ json::Value ChoiceChunk(std::string_view id, long long created,
   return chunk;
 }
 
+std::string_view ContinuationPrefix(const ChatRequest& chat) {
+  return chat.ContinuationText();
+}
+
 class StreamingTextFilter {
 public:
   using EmitCallback =
@@ -2433,6 +2466,13 @@ public:
                TextGenerationBackend::InitialOutputState::kContent) {
       state_ = State::kContent;
     }
+  }
+
+  void Seed(std::string_view prefix) {
+    if (prefix.empty())
+      return;
+    prefix_bytes_ = prefix.size();
+    Push(prefix);
   }
 
   bool Push(std::string_view bytes, bool final = false) {
@@ -2501,7 +2541,7 @@ public:
       const std::size_t marker =
           found == std::string::npos ? std::string::npos : found - offset;
       if (marker < end_pos) {
-        if (marker > 0 && !Emit(pending_.substr(0, marker), true))
+        if (marker > 0 && !Emit(pending_.substr(0, marker), true, offset))
           return false;
         hidden_ = pending_.substr(marker);
         pending_.clear();
@@ -2509,7 +2549,7 @@ public:
         return true;
       }
       if (end_pos != std::string::npos) {
-        if (end_pos > 0 && !Emit(pending_.substr(0, end_pos), true)) {
+        if (end_pos > 0 && !Emit(pending_.substr(0, end_pos), true, offset)) {
           return false;
         }
         std::string_view remaining = pending_;
@@ -2532,7 +2572,7 @@ public:
           }
         }
         const std::size_t ready = pending_.size() - held;
-        if (ready > 0 && !Emit(pending_.substr(0, ready), true)) {
+        if (ready > 0 && !Emit(pending_.substr(0, ready), true, offset)) {
           return false;
         }
         pending_.erase(0, ready);
@@ -2662,10 +2702,26 @@ private:
 
   bool EmitMapped(std::string_view piece, bool reasoning,
                   std::span<const TextSourceSpan> source) {
-    if (!emit_piece_(piece, reasoning, source))
-      return false;
     if (reasoning)
       emitted_reasoning_bytes_ += piece.size();
+    if (prefix_bytes_ && !source.empty()) {
+      std::string fresh;
+      std::vector<TextSourceSpan> spans;
+      std::size_t offset = 0;
+      for (const auto& span : source) {
+        const auto skip = span.begin < prefix_bytes_
+                              ? std::min(span.size, prefix_bytes_ - span.begin)
+                              : 0;
+        fresh.append(piece.substr(offset + skip, span.size - skip));
+        if (span.size > skip)
+          spans.push_back(
+              {span.begin + skip - prefix_bytes_, span.size - skip});
+        offset += span.size;
+      }
+      return fresh.empty() || emit_piece_(fresh, reasoning, spans);
+    }
+    if (!emit_piece_(piece, reasoning, source))
+      return false;
     return true;
   }
 
@@ -2726,6 +2782,7 @@ private:
     kContent,
   };
 
+  std::size_t prefix_bytes_{0};
   EmitCallback emit_piece_;
   bool structured_started_{false};
   core::Utf8Decoder decoder_;
@@ -3124,9 +3181,12 @@ HttpResponse NonStreamingResponse(
   const auto markers = ToolMarkers(format);
   const auto closers = ToolClosers(format);
   core::Utf8Decoder decoder;
-  const auto decoded = decoder.Push(result.text, true);
+  const auto prefix = ContinuationPrefix(request.chat);
+  std::string decoded = decoder.Push(result.text, true);
+  if (!prefix.empty())
+    decoded.insert(0, prefix);
   QuoteTracker quotes;
-  const ParsedGeneration generated =
+  ParsedGeneration generated =
       request.chat.response_format || request.chat.constrained_tools
           ? ParseStructuredGeneration(
                 decoded, initial_output_state, request.chat.tools,
@@ -3134,12 +3194,48 @@ HttpResponse NonStreamingResponse(
                 result.finish_reason ==
                     TextGenerationBackend::FinishReason::kStop,
                 request.chat.constrained_tools && !request.chat.response_format,
-                markers, closers, quotes)
+                markers, closers, quotes, false,
+                request.chat.continue_final_message)
           : ParseGeneration(decoded, initial_output_state, request.chat.tools,
                             request.chat.tool_choice,
                             result.finish_reason ==
                                 TextGenerationBackend::FinishReason::kStop,
-                            markers, closers, quotes);
+                            markers, closers, quotes, false,
+                            request.chat.continue_final_message);
+  if (!prefix.empty()) {
+    std::string fresh;
+    std::size_t offset = 0;
+    for (const auto& span : generated.text_spans) {
+      const auto skip = span.begin < prefix.size()
+                            ? std::min(span.size, prefix.size() - span.begin)
+                            : 0;
+      fresh.append(generated.text.substr(offset + skip, span.size - skip));
+      offset += span.size;
+    }
+    generated.text = std::move(fresh);
+  }
+  if (request.chat.continue_final_message &&
+      request.chat.continue_final_reasoning) {
+    if (request.chat.constrained_tools) {
+      // Structured parsing retains reasoning whitespace and recognizes
+      // implicit tool boundaries using the complete quotation context.
+      generated.reasoning_content.erase(
+          0, std::min(prefix.size(), generated.reasoning_content.size()));
+    } else {
+      // Preserve whitespace after the opener stripped by ParseGeneration,
+      // while still excluding every byte supplied by the continuation.
+      const auto reasoning_begin = std::max(
+          prefix.size(), decoded.starts_with(kThinkStart) ? kThinkStart.size()
+                                                          : std::size_t{0});
+      const auto end = decoded.find(kThinkEnd);
+      const auto reasoning_end =
+          end == std::string::npos ? decoded.size() : end;
+      generated.reasoning_content =
+          reasoning_end > reasoning_begin
+              ? decoded.substr(reasoning_begin, reasoning_end - reasoning_begin)
+              : "";
+    }
+  }
 
   json::Value response = json::Value::object();
   response["id"] = RandomId("chatcmpl-");
@@ -3154,7 +3250,9 @@ HttpResponse NonStreamingResponse(
   if (!generated.reasoning_content.empty()) {
     message["reasoning_content"] = generated.reasoning_content;
   }
-  if (generated.text.empty() && !generated.tool_calls.empty()) {
+  if (generated.text.empty() &&
+      (!generated.tool_calls.empty() ||
+       (request.chat.continue_final_message && generated.reasoning_open))) {
     message["content"] = json::Value();
   } else {
     message["content"] = generated.text;
@@ -3169,6 +3267,7 @@ HttpResponse NonStreamingResponse(
   choice["finish_reason"] = FinishReason(result, !generated.tool_calls.empty());
   choices.push_back(std::move(choice));
   response["choices"] = std::move(choices);
+  response["gufo"]["reasoning_open"] = generated.reasoning_open;
   response["usage"] = Usage(result);
   response["timings"] = GenerationTimings(result);
   AddAbliterationReport(result, response);
@@ -3261,6 +3360,7 @@ HttpResponse StreamingResponse(
                 !request.chat.tools.empty() &&
                     request.chat.tool_choice != ChatRequest::ToolChoice::kNone,
                 markers, closers, request.chat.tools);
+            filter.Seed(ContinuationPrefix(request.chat));
             StreamingToolCalls tools([&](const ToolDelta& call) {
               // Completion without additional arguments needs no Chat delta.
               if (call.id.empty() && call.arguments.empty())
@@ -3328,17 +3428,21 @@ HttpResponse StreamingResponse(
                   TextGenerationBackend::FinishReason::kStop;
               const auto generated = StreamingGeneration(
                   filter, request.chat, initial_output_state, markers, closers,
-                  quotes, !interrupted);
+                  quotes, !interrupted, false,
+                  request.chat.continue_final_message);
               if (!tools.Finish(generated.tool_calls, interrupted))
                 return;
               if (!filter.Finish(generated.hide_tool_markup, generated.text,
-                                 generated.reasoning_content)) {
+                                 generated.reasoning_content,
+                                 generated.text_spans)) {
                 return;
               }
               json::Value terminal_delta = json::Value::object();
               auto terminal_chunk = ChoiceChunk(
                   id, created, model, std::move(terminal_delta),
                   FinishReason(result, !generated.tool_calls.empty()));
+              terminal_chunk["gufo"]["reasoning_open"] =
+                  generated.reasoning_open;
               // llama.cpp reports timings on the terminal choice regardless
               // of the optional OpenAI usage chunk. Proxies need these even
               // when a client does not request stream_options.include_usage.
@@ -4023,8 +4127,9 @@ namespace {
 class AnthropicOutput {
 public:
   AnthropicOutput(std::string model, HttpResponse::BodyWriter writer,
-                  const ChatRequest&)
-      : writer_(std::move(writer)) {
+                  const ChatRequest& chat)
+      : writer_(std::move(writer)),
+        preserve_reasoning_whitespace_(chat.continue_final_reasoning) {
     message_ = json::Value::object();
     message_["id"] = RandomId("msg_");
     message_["type"] = "message";
@@ -4058,7 +4163,7 @@ public:
     if ((!active_ || reasoning_ != reasoning) && !CloseBlock())
       return false;
     std::string piece;
-    if (reasoning) {
+    if (reasoning && !preserve_reasoning_whitespace_) {
       // Thinking blocks carry the reasoning trimmed as Chat reports it: drop
       // leading whitespace and hold trailing whitespace until more follows.
       if (!active_ || !reasoning_)
@@ -4240,6 +4345,7 @@ private:
   std::string held_;
   std::size_t index_{0};
   bool active_{false};
+  bool preserve_reasoning_whitespace_{false};
   bool reasoning_{false};
   bool tool_use_{false};
   bool connected_{true};
@@ -4253,7 +4359,12 @@ HttpResponse CreateCompatibilityResponse(
     const ChatRequest& chat, std::size_t max_tokens,
     const sampling::SamplingConfig& sampling, bool stream,
     std::string_view requested_model) {
-  const auto initial = backend.initial_output_state(chat);
+  const auto initial =
+      chat.continue_final_message
+          ? (chat.continue_final_reasoning
+                 ? TextGenerationBackend::InitialOutputState::kReasoning
+                 : TextGenerationBackend::InitialOutputState::kContent)
+          : backend.initial_output_state(chat);
   const bool observe =
       std::is_same_v<Output, ResponsesOutput> && sampling.logprobs.has_value();
   auto generation = backend.start_chat(chat, max_tokens, sampling,
@@ -4311,6 +4422,7 @@ HttpResponse CreateCompatibilityResponse(
         !chat.tools.empty() &&
             chat.tool_choice != ChatRequest::ToolChoice::kNone,
         markers, closers, chat.tools);
+    filter.Seed(ContinuationPrefix(chat));
     StreamingToolCalls tools([&](const ToolDelta& call) {
       if (output.Tool(call))
         return true;
@@ -4365,9 +4477,9 @@ HttpResponse CreateCompatibilityResponse(
       }
       const bool interrupted =
           result.finish_reason != TextGenerationBackend::FinishReason::kStop;
-      const auto generated =
-          StreamingGeneration(filter, chat, initial, markers, closers, quotes,
-                              !interrupted, false, observe);
+      const auto generated = StreamingGeneration(
+          filter, chat, initial, markers, closers, quotes, !interrupted, false,
+          observe || chat.continue_final_message);
       if (!tools.Finish(generated.tool_calls, interrupted)) {
         generation->Cancel();
         return json::Value();
@@ -4504,6 +4616,70 @@ HttpResponse ScoringResponse(
 
 }  // namespace
 
+std::optional<HttpResponse> ValidateContinuation(
+    const ChatRequest& chat, const TextGenerationBackend& backend) {
+  if (!chat.continue_final_message)
+    return {};
+  if (!backend.supports_continue_final_message())
+    return Error(400, "Bad Request",
+                 "this model does not support assistant prefill",
+                 "unsupported_continue_final_message");
+  if (chat.messages.empty() ||
+      chat.messages.back().role != tokenization::ChatRole::kAssistant)
+    return Error(400, "Bad Request",
+                 "continuation requires a final assistant message",
+                 "invalid_continue_final_message");
+  if (!chat.messages.back().tool_calls.empty() || chat.score_assistant ||
+      chat.response_format)
+    return Error(400, "Bad Request",
+                 "continuation supports text prefixes, without structured "
+                 "tool_calls, scoring, or response_format",
+                 "invalid_continue_final_message");
+  if (chat.constrained_tools) {
+    QuoteTracker quotes;
+    const auto format = sampling::JsonConstraint::ToolFormat::kQwen;
+    const auto prior = ParseStructuredGeneration(
+        ContinuationPrefix(chat),
+        chat.continue_final_reasoning
+            ? TextGenerationBackend::InitialOutputState::kReasoning
+            : TextGenerationBackend::InitialOutputState::kContent,
+        chat.tools, chat.tool_choice, false, true, ToolMarkers(format),
+        ToolClosers(format), quotes);
+    if (!prior.tool_calls.empty())
+      return Error(400, "Bad Request",
+                   "continuation cannot replay an already completed tool "
+                   "envelope",
+                   "invalid_continue_final_message");
+  }
+  return {};
+}
+
+std::optional<HttpResponse> ApplyMessagesPrefill(
+    const json::Value& body, ChatRequest* chat,
+    const TextGenerationBackend& backend) {
+  if (chat->messages.empty() ||
+      chat->messages.back().role != tokenization::ChatRole::kAssistant)
+    return {};
+  chat->continue_final_message = true;
+  const auto* content = body.find("messages")->items().back().find("content");
+  chat->continue_final_reasoning =
+      content && content->is_array() && !content->empty() &&
+      content->items().back().member_str("type") == "thinking";
+  if (content && content->is_array()) {
+    bool seen_text = false;
+    for (const auto& block : content->items()) {
+      const auto type = block.member_str("type");
+      if (type == "text" || type == "input_text" || type == "output_text")
+        seen_text = true;
+      else if (type == "thinking" && seen_text)
+        return Error(400, "Bad Request",
+                     "a thinking prefill must precede every answer text block",
+                     "invalid_continue_final_message");
+    }
+  }
+  return ValidateContinuation(*chat, backend);
+}
+
 HttpResponse HandleOpenAiChat(const HttpRequest& request,
                               TextGenerationBackend& backend) {
   ParsedChatRequest parsed;
@@ -4514,7 +4690,12 @@ HttpResponse HandleOpenAiChat(const HttpRequest& request,
     return std::move(*error);
   }
   try {
-    const auto initial_output_state = backend.initial_output_state(parsed.chat);
+    const auto initial_output_state =
+        parsed.chat.continue_final_message
+            ? (parsed.chat.continue_final_reasoning
+                   ? TextGenerationBackend::InitialOutputState::kReasoning
+                   : TextGenerationBackend::InitialOutputState::kContent)
+            : backend.initial_output_state(parsed.chat);
     auto generation =
         backend.start_chat(parsed.chat, parsed.max_tokens, parsed.sampling,
                            request.is_cancelled, parsed.stream);

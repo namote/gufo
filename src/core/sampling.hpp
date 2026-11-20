@@ -46,6 +46,8 @@ struct ReasoningBudget {
   std::vector<TokenId> forced;
   std::vector<TokenId> ends;
   std::vector<TokenId> prompt;
+  /// Old free-form tokens cannot consume a forced close on a lower budget.
+  bool prompt_is_continuation{false};
   /// Indexed by token: its text ends inside a UTF-8 character.
   std::shared_ptr<const std::vector<bool>> partial_utf8;
 };
@@ -105,6 +107,11 @@ struct SamplingConfig {
   float frequency_penalty{0.0F};
   float presence_penalty{0.0F};
   std::shared_ptr<const TokenConstraint> constraint;
+  /// Grammar state after an assistant prefill; shared across sampler copies.
+  std::shared_ptr<const JsonConstraint::State> constraint_initial_state;
+  /// Replayed generated tokens already in initial_history. Count for presence
+  /// and frequency penalties without accepting them into grammar/RNG/history.
+  std::shared_ptr<const std::vector<TokenId>> generated_prefix;
   /// Set only for requests that start in their reasoning phase: a token
   /// budget, or an unlimited one (ReasoningBudget::kUnlimited) that only
   /// tracks the phase for han_scale_scope kAnswer.
@@ -327,6 +334,7 @@ private:
       std::span<const float> logits, std::span<const TokenId> ids = {}) const;
   void TrimHistory();
   void RebuildPenaltyCounts();
+  void CountGeneratedTokens(std::span<const TokenId> tokens);
   [[nodiscard]] double AdjustedLogit(TokenId token, float logit) const noexcept;
   [[nodiscard]] TokenId SampleGreedy(std::span<const float> logits) const;
   [[nodiscard]] TokenId SampleConstrainedGreedy(

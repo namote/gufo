@@ -3065,6 +3065,80 @@ void TestStopSequenceChunkBoundaries() {
   check({"STOP"}, "STOP", "", "STOP");
 }
 
+void TestContinuedStopSequences() {
+  using gufo::server::StopSequenceFilter;
+  using gufo::server::StopSequenceSuffix;
+  struct Case {
+    std::vector<std::string> stops;
+    std::string prior, next, output, matched;
+  };
+  for (const auto& test :
+       std::vector<Case>{{{"END"}, "oldE", "NDtail", "", "END"},
+                         {{"END"}, "oldE", "NX", "NX", ""},
+                         {{"END"}, "oldE", "N", "N", ""},
+                         {{"END"}, "oldE", "", "", ""},
+                         {{"END"}, "END", "x", "x", ""},
+                         {{"A", "ABC"}, "AB", "C", "", "ABC"},
+                         {{"ABA", "BA"}, "A", "BA", "", "ABA"},
+                         {{"E"}, "E", "x", "x", ""},
+                         {{"終点"}, "old終", "点tail", "", "終点"}}) {
+    for (std::size_t cut = 0; cut <= test.next.size(); ++cut) {
+      StopSequenceFilter filter(test.stops, test.prior);
+      auto output = filter.Push(std::string_view(test.next).substr(0, cut));
+      output += filter.Push(std::string_view(test.next).substr(cut));
+      output += filter.Finish();
+      Expect(output == test.output && filter.stopped() == !test.matched.empty(),
+             "stop suffix participates across the cut but is never emitted");
+      if (filter.stopped())
+        Expect(filter.matched_sequence() == test.matched,
+               "completed old matches do not shadow a new crossing match");
+    }
+  }
+  using gufo::tokenization::ChatRole;
+  gufo::server::ChatRequest chat({{ChatRole::kAssistant, "", "", "oldE"}});
+  chat.continue_final_message = true;
+  chat.continue_final_reasoning = true;
+  chat.stop_sequences = {"END"};
+  Expect(
+      StopSequenceSuffix(chat.ContinuationText(), chat.stop_sequences) == "dE",
+      "thinking uses only its bounded visible suffix");
+  chat.continue_final_reasoning = false;
+  Expect(
+      StopSequenceSuffix(chat.ContinuationText(), chat.stop_sequences).empty(),
+      "empty answer never borrows a stop suffix from closed reasoning");
+  chat.messages.back().content = "answerE";
+  Expect(
+      StopSequenceSuffix(chat.ContinuationText(), chat.stop_sequences) == "rE",
+      "answer continuation selects the answer channel");
+
+  using Finish = gufo::server::TextGenerationBackend::FinishReason;
+  for (const bool publish : {false, true}) {
+    for (const bool multi : {false, true}) {
+      auto control = std::make_shared<FakeControl>();
+      control->incremental_text_is_exact = true;
+      control->multi_token_decode = multi;
+      control->snapshot_callback = [] {};
+      control->output_pieces = {"NDtail", "later", "last"};
+      auto scheduler = MakeScheduler(control, 1);
+      TextGenerationScheduler::RequestMetadata metadata;
+      metadata.stop_sequences = {"END"};
+      metadata.stop_prefix = "E";
+      std::string streamed;
+      const auto result =
+          scheduler->Submit({1, 10}, 8, 0.0F, {}, publish, metadata)
+              .Wait([&](std::string_view piece) {
+                streamed += piece;
+                return true;
+              });
+      Expect(result.finish_reason == Finish::kStopSequence &&
+                 result.stop_sequence == "END" && result.text.empty() &&
+                 streamed.empty() && result.tokens.size() == 1,
+             "scheduler consumes the crossing stop token without prior or tail "
+             "output");
+    }
+  }
+}
+
 void TestStopSequencesPreserveExecutedState() {
   using Finish = gufo::server::TextGenerationBackend::FinishReason;
   for (const bool multi : {false, true}) {
@@ -4144,6 +4218,7 @@ int main() {
   TestIgnoreEosIsRequestScoped();
   TestEmptyTokenIsPublished();
   TestStopSequenceChunkBoundaries();
+  TestContinuedStopSequences();
   TestStopSequencesPreserveExecutedState();
   TestStopPrefixFlushAndBatchIsolation();
   TestCancellationWithBufferedStopPrefix();

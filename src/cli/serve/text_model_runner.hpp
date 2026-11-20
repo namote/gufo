@@ -51,6 +51,9 @@ struct TextPreparedPrompt {
   /// Shared leading-instruction frontier, supplied by prompt preparation.
   /// Zero when the renderer cannot provide a safe token boundary.
   std::size_t system_prefix_tokens{0};
+  /// Prior generated assistant tokens, also present in the prompt, for
+  /// penalties.
+  std::shared_ptr<const std::vector<sampling::TokenId>> generated_prefix;
 };
 
 /// A `score_assistant` request: the prompt before the scored assistant
@@ -350,6 +353,10 @@ public:
   [[nodiscard]] virtual TextRunnerResourceClaim ResourceClaim() const = 0;
   [[nodiscard]] virtual std::vector<TextExecutionPlan> SupportedPlans()
       const = 0;
+
+  [[nodiscard]] virtual bool SupportsContinueFinalMessage() const {
+    return false;
+  }
 
   /// Prepared before serving and shared by all constrained requests.
   /// A null vocabulary means the runner does not support structured output.

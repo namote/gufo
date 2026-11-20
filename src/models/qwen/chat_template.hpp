@@ -163,6 +163,10 @@ enum class QwenReasoningEffort : std::uint8_t {
 /// Formatting options for rendering a conversation into a text prompt.
 struct ChatTemplateOptions {
   bool add_generation_prompt{true};
+  /// Leave the final assistant open; add_generation_prompt must be false.
+  bool continue_final_message{false};
+  /// Continue verbatim thought text instead of closing its reasoning block.
+  bool continue_final_reasoning{false};
   bool enable_thinking{true};
   QwenReasoningEffort reasoning_effort{QwenReasoningEffort::kXHigh};
   bool preserve_thinking{true};
@@ -202,6 +206,13 @@ inline constexpr std::string_view kReasoningClose = "\n</think>\n\n";
 /// Provider-neutral minimal/high/max map to native low/xhigh/xhigh.
 [[nodiscard]] ChatTemplateOptions ResolveQwenChatOptions(
     const ReasoningOptions& reasoning, bool add_vision_id = false);
+
+/// Replayed generated tokens for presence/frequency penalties. Excludes the
+/// generation prompt and includes the standard reasoning close only when the
+/// original turn generated it. Message bytes retain text-only tokenization.
+[[nodiscard]] std::vector<TokenId> EncodeAssistantContinuation(
+    const QwenTokenizer& tokenizer, const ChatMessage& message,
+    const ChatTemplateOptions& options);
 
 /// Deterministic, bounded Qwen ChatML formatter.
 class QwenChatTemplate {

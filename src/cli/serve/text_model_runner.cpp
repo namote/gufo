@@ -87,6 +87,20 @@ std::optional<ChatRequest> ConstrainChatRequest(
   if (runner.InitialOutputState(request) ==
       TextGenerationBackend::InitialOutputState::kReasoning)
     grammar = sampling::JsonConstraint::WithReasoning(grammar);
+  if (request.continue_final_message) {
+    const auto& last = request.messages.back();
+    const auto& prefix =
+        request.continue_final_reasoning ? last.thought : last.content;
+    auto state = grammar->Start();
+    for (const unsigned char byte : prefix)
+      state = grammar->Advance(state, byte);
+    if (state.empty())
+      throw std::invalid_argument(
+          "assistant prefill is not a valid prefix of the output constraint");
+    sampling->constraint_initial_state =
+        std::make_shared<const sampling::JsonConstraint::State>(
+            std::move(state));
+  }
   sampling->constraint = runner.BindConstraint(grammar);
   return constrained;
 }

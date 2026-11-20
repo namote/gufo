@@ -28,6 +28,7 @@
 #include "src/cli/serve/persistence_identity.hpp"
 #include "src/cli/serve/request_memory_budget.hpp"
 #include "src/cli/serve/score_assistant.hpp"
+#include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/crypto/sha256.hpp"
@@ -186,6 +187,9 @@ tokenization::ChatTemplateOptions QwenChatOptions(const ChatRequest& request,
                                                   std::uint32_t max_context) {
   auto options = tokenization::ResolveQwenChatOptions(request.reasoning,
                                                       request.add_vision_id);
+  options.continue_final_message = request.continue_final_message;
+  options.continue_final_reasoning = request.continue_final_reasoning;
+  options.add_generation_prompt = !request.continue_final_message;
   // gufo #285: the rendered prompt may be as long as the context can hold.
   options.max_output_bytes =
       tokenization::RenderedPromptBoundBytes(max_context);
@@ -273,8 +277,17 @@ TextPreparedPrompt PrepareQwenPrompt(
   }
   const auto cache_prefix = prompt->stable_prefix_tokens;
   const auto system_prefix = prompt->system_prefix_tokens;
+  std::shared_ptr<const std::vector<sampling::TokenId>> generated_prefix;
+  if (request.continue_final_message)
+    generated_prefix = std::make_shared<const std::vector<sampling::TokenId>>(
+        tokenization::EncodeAssistantContinuation(
+            tokenizer, request.messages.back(), options));
   if (prompt->images.empty())
-    return {std::move(prompt->tokens), {}, cache_prefix, system_prefix};
+    return {std::move(prompt->tokens),
+            {},
+            cache_prefix,
+            system_prefix,
+            std::move(generated_prefix)};
   if (!encoder)
     throw std::invalid_argument(
         "image input requires embedded EXL3 vision weights or a matching "
@@ -287,7 +300,8 @@ TextPreparedPrompt PrepareQwenPrompt(
         {image.grid.offset, {identity.begin(), identity.end()}});
   }
   context->prompt = prompt;
-  return {prompt->tokens, std::move(context), cache_prefix, system_prefix};
+  return {prompt->tokens, std::move(context), cache_prefix, system_prefix,
+          std::move(generated_prefix)};
 }
 
 std::shared_ptr<const models::qwen::vision::Prompt> QwenPrompt(
@@ -438,14 +452,22 @@ std::shared_ptr<const sampling::ReasoningBudget> RequestReasoning(
     const ChatRequest& request, const sampling::SamplingConfig& sampling,
     const std::shared_ptr<const sampling::TokenSet>& han_tokens,
     const TextModelRunner& runner, std::span<const TextRunnerToken> prompt) {
+  const auto build = [&](std::size_t tokens) {
+    auto budget = runner.BuildReasoningBudget(tokens, prompt);
+    if (budget && request.continue_final_message) {
+      auto resumed = std::make_shared<sampling::ReasoningBudget>(*budget);
+      resumed->prompt_is_continuation = true;
+      return std::shared_ptr<const sampling::ReasoningBudget>(
+          std::move(resumed));
+    }
+    return budget;
+  };
   if (request.reasoning.budget_tokens)
-    return runner.BuildReasoningBudget(*request.reasoning.budget_tokens,
-                                       prompt);
+    return build(*request.reasoning.budget_tokens);
   if ((sampling.han_scale_scope == sampling::HanScaleScope::kAnswer &&
        sampling.han_scale != 1.0F && han_tokens && han_tokens->count != 0) ||
       (sampling.logit_bias && sampling.logit_bias->phase_dependent()))
-    return runner.BuildReasoningBudget(sampling::ReasoningBudget::kUnlimited,
-                                       prompt);
+    return build(sampling::ReasoningBudget::kUnlimited);
   return nullptr;
 }
 
@@ -1451,9 +1473,15 @@ public:
                                     model_->VisionEncoder());
   }
 
+  [[nodiscard]] bool SupportsContinueFinalMessage() const override {
+    return true;
+  }
+
   [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
       const ChatRequest& request) const override {
-    return QwenChatOptions(request, max_context_).enable_thinking
+    return (request.continue_final_message
+                ? request.continue_final_reasoning
+                : QwenChatOptions(request, max_context_).enable_thinking)
                ? TextGenerationBackend::InitialOutputState::kReasoning
                : TextGenerationBackend::InitialOutputState::kContent;
   }
@@ -3196,9 +3224,15 @@ public:
     return !(active && active->dynamic_from);
   }
 
+  [[nodiscard]] bool SupportsContinueFinalMessage() const override {
+    return true;
+  }
+
   [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
       const ChatRequest& request) const override {
-    return QwenChatOptions(request, max_context_).enable_thinking
+    return (request.continue_final_message
+                ? request.continue_final_reasoning
+                : QwenChatOptions(request, max_context_).enable_thinking)
                ? TextGenerationBackend::InitialOutputState::kReasoning
                : TextGenerationBackend::InitialOutputState::kContent;
   }
@@ -3672,7 +3706,8 @@ struct InferenceBackend::Impl {
       bool cache_prompt = true, std::size_t cache_prefix_tokens = 0,
       const std::vector<std::string>& stop_sequences = {},
       InitialOutputState initial = InitialOutputState::kContent,
-      std::size_t system_prefix_tokens = 0, bool cache_persist = true) const {
+      std::size_t system_prefix_tokens = 0, bool cache_persist = true,
+      std::string stop_prefix = {}) const {
     Result result;
     result.prompt_tokens = prompt_tokens.size();
     result.client_id = client_id.empty() ? "anonymous" : client_id;
@@ -3697,6 +3732,7 @@ struct InferenceBackend::Impl {
             .cache_prefix_tokens = cache_prefix_tokens,
             .system_prefix_tokens = system_prefix_tokens,
             .stop_sequences = stop_sequences,
+            .stop_prefix = std::move(stop_prefix),
         });
     ScheduledGenerationRequest generation(std::move(current),
                                           std::move(request), initial);
@@ -5006,6 +5042,16 @@ std::shared_ptr<CollectionRunner> InferenceBackend::collection_runner() const {
 #endif
 }
 
+bool InferenceBackend::supports_continue_final_message() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state != nullptr &&
+         state->scheduler->runner().SupportsContinueFinalMessage();
+#else
+  return false;
+#endif
+}
+
 bool InferenceBackend::supports_scoring() const {
 #if defined(ENGINE_ENABLE_HIP)
   const auto state = impl_->Snapshot();
@@ -5214,6 +5260,7 @@ InferenceBackend::Result InferenceBackend::chat(
   if (!prompt.has_value() || prompt->tokens.empty()) {
     return {};
   }
+  effective_sampling.generated_prefix = prompt->generated_prefix;
   const auto initial =
       state->scheduler->runner().InitialOutputState(effective_request);
   if (initial == TextGenerationBackend::InitialOutputState::kReasoning)
@@ -5227,7 +5274,8 @@ InferenceBackend::Result InferenceBackend::chat(
       effective_sampling, is_cancelled, on_token, request.client_id,
       std::move(prompt->context), request.cache_prompt,
       prompt->cache_prefix_tokens, request.stop_sequences, initial,
-      system_prefix_tokens, request.cache_persist);
+      system_prefix_tokens, request.cache_persist,
+      StopSequenceSuffix(request.ContinuationText(), request.stop_sequences));
 #else
   (void)request;
   (void)max_tokens;
@@ -5311,6 +5359,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
         request, max_tokens, sampling_config, is_cancelled, stream_output);
   }
 
+  effective_sampling.generated_prefix = prompt->generated_prefix;
   const auto initial =
       state->scheduler->runner().InitialOutputState(effective_request);
   if (initial == TextGenerationBackend::InitialOutputState::kReasoning)
@@ -5335,6 +5384,8 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
           .cache_prefix_tokens = prompt->cache_prefix_tokens,
           .system_prefix_tokens = system_prefix_tokens,
           .stop_sequences = request.stop_sequences,
+          .stop_prefix = StopSequenceSuffix(request.ContinuationText(),
+                                            request.stop_sequences),
           .return_progress = request.return_progress,
       });
   return std::make_shared<Impl::ScheduledGenerationRequest>(

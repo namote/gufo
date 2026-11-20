@@ -1350,6 +1350,156 @@ emits, so each crossing clips the draft window. Expect decode near the
 autoregressive rate in that region, not the rate the same model reaches on an
 ordinary continuation.
 
+## Continuing a cut assistant turn
+
+Qwen-template models (including Qwen3.8 27B and Flash-Next) accept
+`continue_final_message: true` on Chat Completions. Supply the original
+conversation followed by the partial assistant message. This leaves that
+assistant turn open: no final `<|im_end|>` and no new generation prompt.
+`add_generation_prompt` is implicitly false; explicit false is accepted, while
+true conflicts and returns 400 `invalid_continue_final_message`. Without
+continuation, `add_generation_prompt` remains ignored and Chat still adds its
+normal generation prompt.
+
+```json
+{
+  "model": "served-model",
+  "messages": [
+    {"role": "user", "content": "Count from 1 to 10."},
+    {"role": "assistant", "content": "1 2 3 4"}
+  ],
+  "continue_final_message": true,
+  "stream": true,
+  "max_tokens": 128
+}
+```
+
+Partial answer whitespace is preserved, including spaces at the cut.
+The response contains only new text. Prior assistant text counts as prompt
+usage; `max_tokens` and completion usage cover the new generation. The final
+assistant's **content field presence selects the phase**:
+
+- `content` absent or null keeps reasoning open, including an empty thought.
+  Supply the prior thought as `reasoning_content`; its leading and trailing
+  whitespace is preserved verbatim. New tokens remain `reasoning_content`
+  until thinking closes. The reasoning budget includes the prior thought.
+- `content` present as a string, **even `""`**, means reasoning has closed.
+  The answer continues and no reasoning budget is started. In particular,
+  use `"content":""` for a cut immediately after the reasoning close.
+
+Chat responses report the final phase in the top-level Gufo extension
+`"gufo":{"reasoning_open":true|false}`. Streaming includes it on the final
+choice chunk (the one with `finish_reason`), independently of usage reporting.
+Use this field when saving a turn for another resume: set assistant `content`
+to null when true, or to the accumulated answer string (even `""`) when false.
+A close followed only by separator whitespace emits no content delta, so
+absence of a content delta alone cannot determine the phase. Buffered
+continuations with open reasoning return `content:null`; ordinary buffered
+responses retain their existing content values, including `""` for an open
+thought, and must be normalized using `gufo.reasoning_open` before replay.
+The OpenCode helper applies this normalization to its saved joined turn.
+If a stream disconnects before its final choice chunk, the final phase may
+be unknown when no answer text has arrived.
+
+Closed reasoning uses the completed template's trimmed reasoning and standard
+`\n</think>\n\n` close. This is the normal Qwen close; a nonstandard closing
+separator emitted by the model is not reproduced. Without reasoning, the
+partial answer follows the template's empty `<think>\n\n</think>\n\n` block.
+Keep the original thinking, effort, history-preservation, tools, sampling and
+abliteration settings to preserve the original prompt and execution context.
+
+The exactness contract is **greedy continuation for cuts inside reasoning or
+content**, subject to text-level retokenization at the cut and canonical
+closed-reasoning framing. It does not promise byte-for-byte replay for a cut
+inside a nonstandard reasoning separator. Presence/frequency penalties count
+replayed generated reasoning and answer tokens, including the standard close
+when it was generated; original user/system prompt tokens do not count as
+newly generated text. Repetition penalties retain their prompt/history window.
+A new request does not restore the original stochastic RNG position: reusing
+a seed is not sufficient for stochastic continuation equivalence.
+
+Stop matching carries at most `max_stop_length - 1` bytes from the active
+visible channel: the thought while reasoning is open, or the answer once it
+is closed. Thus prior `E` plus newly generated `ND` matches stop `END`. Prior
+bytes are never returned, even when a potential match fails or generation
+ends early. An empty answer does not inherit a suffix from closed reasoning.
+
+Partial tool syntax can be supplied as assistant **content**, including a cut
+inside `<tool_call>` or an argument. Both the parser and the constraint grammar
+consume prior plus new bytes; the response exposes reconstructed structured
+calls with complete names/arguments, while text fields never echo the prefill.
+The normal request/context limits bound the prefix. A prefix inconsistent with
+its declared tool grammar is rejected as `invalid_prompt`. Structured
+`tool_calls` on the continued message, already completed tool envelopes in its
+content, `score_assistant`, and `response_format` are rejected: they do not
+provide a supported unfinished text prefix. Earlier completed tool turns in the
+conversation remain supported. Client message text is always tokenized as text,
+including literal control-token spellings.
+
+`POST /v1/messages` automatically treats a trailing assistant message as this
+same prefill. String content or a final text block continues the answer; even
+an empty text block after thinking closes reasoning. A last `thinking` block
+continues reasoning, including an empty thinking block. Any thinking block
+after any text block (`text`, `input_text`, or `output_text`) anywhere in the
+final assistant message returns 400,
+including empty text/thinking blocks and a later return to text. Streaming
+uses `thinking_delta` until the close, then `text_delta`. The count-tokens route
+uses the same open prompt. Other model families (DeepSeek, Gemma, MiniMax)
+return 400 `unsupported_continue_final_message` for either API. Responses keeps
+its existing behavior; it has no same-turn prefill control in this adapter.
+
+Cache lookup uses the complete rendered token sequence, including the partial
+assistant turn. When its IDs match retained/live state, it can reuse that state.
+Text replay does not carry original generated token IDs: BPE may merge across
+an old token boundary or across template whitespace, and literal special-token
+spellings are intentionally encoded as ordinary text. Reuse then stops at the
+longest identical token prefix and resumes from an available checkpoint before
+it; the rest must be prefilled. This can cost more than the final token if no
+nearby checkpoint is available. Changed IDs can also change greedy output, so
+byte-level prompt equivalence alone does not guarantee identical generation.
+Raw token continuation is not implemented.
+
+`tools/serving/opencode_resume.py` is a stdlib test helper. OpenCode exports
+`{info, messages:[{info,parts}]}`, but not the final provider-transformed system
+prompt and tool schemas. The helper therefore requires the **captured original
+Chat Completions request body**, preserving its messages, tools and settings,
+and appends the exported cut assistant text/reasoning. A text part's presence,
+even when empty, creates `content` and closes reasoning; without a text part
+it omits `content`. The helper rejects reasoning after any text part. See the pinned upstream
+[export implementation](https://github.com/anomalyco/opencode/blob/3a90639cb57619a21e59f544b3e8d23ffed56f48/packages/opencode/src/cli/cmd/export.ts),
+[request preparation](https://github.com/anomalyco/opencode/blob/3a90639cb57619a21e59f544b3e8d23ffed56f48/packages/opencode/src/session/llm/request.ts),
+and [provider dispatch](https://github.com/anomalyco/opencode/blob/3a90639cb57619a21e59f544b3e8d23ffed56f48/packages/opencode/src/session/llm.ts).
+Gufo has no request-body dump option; capture the original JSON on the client or
+proxy. Exports with structured tool parts cannot recover the original raw
+partial call and are refused. The export must end at the cut assistant turn.
+
+```sh
+# Offline: prepare and inspect the reconstructed request without contacting a server.
+python3 tools/serving/opencode_resume.py ses_example --export session.json \
+  --request captured-request.json --output resumed.json --dry-run
+
+# When an inference run is permitted, remove --dry-run and supply an explicit URL:
+# --endpoint http://HOST:PORT/v1/chat/completions
+# GUFO_API_KEY supplies optional bearer authentication.
+```
+
+New reasoning/text streams to stdout. The output JSON retains the request,
+joined assistant turn, usage and finish reason; a disconnect retains the joined
+partial result with `complete: false`. It never changes OpenCode's session or
+executes returned tool calls. `complete` describes receipt of the terminal
+stream event, not whether a length-limited answer is finished.
+
+Before release, compare an uncut greedy reply against the same reply cut at N
+tokens and resumed, on both Qwen adapters: answer-only, inside reasoning,
+after reasoning, split tool tags/arguments, Korean and whitespace boundaries.
+Check new-only buffered/SSE output, prior reasoning budgets, prompt usage,
+cache hit IDs/frontiers, retained/live/disk state and retokenization costs.
+Include `long-context` and `cache` functional cases and replay the affected
+coding-agent workflow with `tests/functional/pi_agent.py`; retain sessions and
+inspect actual tool results. Use matched main controls for affected timings,
+plus numerical quality and the standard speed benchmark. These GPU/model
+checks must run in a separate authorized window, not beside live production.
+
 ## Chat Completions Adapter
 
 `POST /v1/chat/completions` accepts the common compatibility subset:

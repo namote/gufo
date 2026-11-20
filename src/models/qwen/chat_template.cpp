@@ -624,6 +624,17 @@ std::optional<std::string> QwenChatTemplate::Render(
     return std::nullopt;
   }
 
+  if (options.continue_final_message &&
+      (options.add_generation_prompt ||
+       messages.back().role != ChatRole::kAssistant ||
+       !messages.back().tool_calls.empty())) {
+    if (error_msg)
+      *error_msg =
+          "continuation requires a final assistant text message and "
+          "no generation prompt";
+    return std::nullopt;
+  }
+
   // The reference template accepts one leading system turn, but OpenAI clients
   // such as Codex send system/developer messages mid-conversation. Hoist them,
   // in order, into that turn; templates that allow them keep them in place.
@@ -758,7 +769,7 @@ std::optional<std::string> QwenChatTemplate::Render(
       break;
     }
   }
-  if (last_user_index == messages.size()) {
+  if (last_user_index == messages.size() && !options.continue_final_message) {
     if (error_msg != nullptr)
       *error_msg = "No user query found in messages.";
     return std::nullopt;
@@ -817,23 +828,38 @@ std::optional<std::string> QwenChatTemplate::Render(
     output.append(role_name);
     output.push_back('\n');
 
-    const std::string_view thought = Trim(msg.thought);
+    const bool continuing =
+        options.continue_final_message && message_index + 1 == messages.size();
+    const bool open_reasoning = continuing && options.continue_final_reasoning;
+    const std::string_view thought =
+        open_reasoning ? std::string_view(msg.thought) : Trim(msg.thought);
     if (msg.role == ChatRole::kAssistant &&
-        (options.preserve_thinking || message_index > last_user_index)) {
+        (continuing || options.preserve_thinking ||
+         message_index > last_user_index)) {
       output.append("<think>\n");
       AppendContent(output, content_spans, thought);
-      output.append(kReasoningClose);
+      if (!open_reasoning)
+        output.append(kReasoningClose);
     }
 
-    const bool has_content = AppendMessageContent(
-        output, msg, options, image_count, image_offsets, content_spans);
+    // Incomplete text must retain its boundary whitespace: it may become
+    // interior text when the reply resumes. Completed messages still trim.
+    bool has_content;
+    if (continuing) {
+      AppendContent(output, content_spans, msg.content);
+      has_content = !msg.content.empty();
+    } else {
+      has_content = AppendMessageContent(output, msg, options, image_count,
+                                         image_offsets, content_spans);
+    }
     if (msg.role == ChatRole::kAssistant && !msg.tool_calls.empty()) {
       if (has_content) {
         output.append("\n\n");
       }
       AppendToolCalls(output, msg.tool_calls, content_spans);
     }
-    output.append(kImEnd).append("\n");
+    if (!continuing)
+      output.append(kImEnd).append("\n");
 
     if (output.size() > options.max_output_bytes) {
       if (error_msg != nullptr) {
@@ -862,6 +888,26 @@ std::optional<std::string> QwenChatTemplate::Render(
   if (hoisted_instructions != nullptr)
     *hoisted_instructions = !hoisted.empty();
   return output;
+}
+
+std::vector<TokenId> EncodeAssistantContinuation(
+    const QwenTokenizer& tokenizer, const ChatMessage& message,
+    const ChatTemplateOptions& options) {
+  std::string generated;
+  std::vector<ContentSpan> spans;
+  if (options.continue_final_reasoning) {
+    AppendContent(generated, &spans, message.thought);
+  } else {
+    if (options.enable_thinking || !message.thought.empty()) {
+      AppendContent(generated, &spans, TrimReasoning(message.thought));
+      generated.append(kReasoningClose);
+    }
+    AppendContent(generated, &spans, message.content);
+  }
+  TokenizerOptions encoding;
+  encoding.parse_special_tokens = true;
+  return QwenChatTemplate::EncodeRendered(tokenizer, generated, 0,
+                                          generated.size(), spans, encoding);
 }
 
 std::string_view GenerationPrompt(bool enable_thinking) {

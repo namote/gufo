@@ -2506,6 +2506,22 @@ void TestServerInstructionsAreFraming() {
       }
     }
   }
+  {
+    ChatRequest request(
+        {{ChatRole::kUser, "Use record"}, {ChatRole::kAssistant, "<tool_"}});
+    request.tools.push_back({"record", "", "{\"type\":\"object\"}"});
+    request.continue_final_message = true;
+    request.tool_choice = ChatRequest::ToolChoice::kRequired;
+    gufo::sampling::SamplingConfig sampling;
+    const auto continued =
+        gufo::server::ConstrainChatRequest(request, native_runner, &sampling);
+    Expect(continued && sampling.constraint_initial_state != nullptr &&
+               continued->messages.front().framing_suffix.empty(),
+           "native continuation seeds the grammar without changing the prompt");
+    gufo::sampling::SamplerState sampler(sampling);
+    Expect(sampler.CanSelectArgmax('c') && !sampler.CanSelectArgmax('x'),
+           "the sampler continues the partial tool opener");
+  }
   // JSON-object prompts, schema prompts and their optional descriptions use
   // the same framing field. Native tools add no instruction or prompt work.
   for (const bool schema : {false, true}) {
@@ -2607,9 +2623,36 @@ void TestServerInstructionsAreFraming() {
   }
 }
 
+void TestReasoningBudgetIncludesAssistantPrefix() {
+  class ReasoningRunner final : public FakeRunner {
+  public:
+    ReasoningRunner() : FakeRunner(std::make_shared<FakeStats>()) {}
+    std::vector<TextRunnerToken> TokenizeControl(
+        std::string_view text) const override {
+      if (text == "<think>")
+        return {10};
+      if (text == "</think>")
+        return {11};
+      return {};
+    }
+  } runner;
+  const std::vector<TextRunnerToken> prompt{5, 10, 1, 2, 3};
+  const auto budget = runner.BuildReasoningBudget(4, prompt);
+  Expect(budget &&
+             budget->prompt == std::vector<gufo::sampling::TokenId>({1, 2, 3}),
+         "budget includes all prior reasoning after the prompt opener");
+  gufo::sampling::SamplingConfig sampling;
+  sampling.reasoning_budget = budget;
+  gufo::sampling::SamplerState sampler(sampling);
+  sampler.Accept(4);
+  Expect(sampler.ForcedToken() == gufo::sampling::TokenId{11},
+         "the runner leaves only the unused reasoning budget");
+}
+
 }  // namespace
 
 int main() {
+  TestReasoningBudgetIncludesAssistantPrefix();
   TestPromptCountingValidatesCapabilitiesBeforeInference();
   TestServerInstructionsAreFraming();
   TestPreparedConstraintVocabularyKeepsGrammarBehavior();

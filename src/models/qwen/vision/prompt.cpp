@@ -378,8 +378,11 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
       std::vector<tokenization::ChatMessage> probe(messages.begin(),
                                                    leading_end);
       probe.emplace_back(tokenization::ChatRole::kUser, "");
+      auto probe_options = options;
+      probe_options.continue_final_message = false;
+      probe_options.continue_final_reasoning = false;
       const auto tokens = tokenization::QwenChatTemplate::RenderAndTokenize(
-          tokenizer, probe, tools, options, &error);
+          tokenizer, probe, tools, probe_options, &error);
       if (!tokens)
         throw std::invalid_argument("cannot prepare hoisted system probe: " +
                                     error);

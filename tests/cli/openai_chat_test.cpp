@@ -239,6 +239,10 @@ public:
     return scoring_support;
   }
   bool scoring_support{false};
+  bool continuation_support{true};
+  bool supports_continue_final_message() const override {
+    return continuation_support;
+  }
 
   bool WaitForFirstPiece() {
     std::unique_lock<std::mutex> lock(mutex);
@@ -7594,7 +7598,391 @@ void TestScoreAssistant() {
          "the split prompt carries no scoring limit");
 }
 
+struct ContinuedOutput {
+  std::string text;
+  std::string reasoning;
+  std::vector<gufo::json::Value> calls;
+  std::optional<bool> reasoning_open;
+  bool content_present{false};
+};
+
+ContinuedOutput ReadContinuedOutput(const gufo::server::HttpResponse& response,
+                                    bool stream) {
+  Expect(response.status == 200, "continuation accepted");
+  ContinuedOutput output;
+  const auto append = [&](const gufo::json::Value& message) {
+    if (const auto* content = message.find("content"))
+      output.content_present |= content->is_string();
+    output.text += message.member_str("content");
+    output.reasoning += message.member_str("reasoning_content");
+    if (const auto* calls = message.find("tool_calls"))
+      AppendToolDeltas(output.calls, *calls, stream);
+  };
+  if (stream) {
+    response.streaming_body([&](std::string_view chunk) {
+      if (chunk != "data: [DONE]\n\n") {
+        const auto event = gufo::json::parse(chunk.substr(6));
+        if (const auto* gufo = event.find("gufo")) {
+          output.reasoning_open = gufo->find("reasoning_open")->as_bool();
+          Expect(!event.find("choices")
+                      ->items()
+                      .front()
+                      .member_str("finish_reason")
+                      .empty(),
+                 "reasoning phase is reported on the final choice chunk");
+        }
+        if (const auto* choices = event.find("choices"))
+          for (const auto& choice : choices->items())
+            if (const auto* delta = choice.find("delta"))
+              append(*delta);
+        Expect(!event.find("error"), "continued stream has no error");
+      }
+      return true;
+    });
+  } else {
+    const auto event = gufo::json::parse(response.body);
+    output.reasoning_open =
+        event.find("gufo")->find("reasoning_open")->as_bool();
+    append(*event.find("choices")->items().front().find("message"));
+  }
+  return output;
+}
+
+void TestChatFinalReasoningPhase() {
+  using gufo::server::HandleOpenAiChat;
+  for (const bool stream : {false, true}) {
+    for (const bool continued : {false, true}) {
+      for (const bool closed : {false, true}) {
+        for (const auto* prefix : {"", "old"}) {
+          FakeBackend backend;
+          backend.finish_reason = FakeBackend::FinishReason::kLength;
+          backend.pieces = {" \nmore \t"};
+          if (closed)
+            backend.pieces.insert(backend.pieces.end(),
+                                  {"</thi", "nk>", "\n\n"});
+          auto body = gufo::json::parse(R"({"model":"test-model",
+            "chat_template_kwargs":{"enable_thinking":true},
+            "messages":[{"role":"user","content":"Think"}]})");
+          body["stream"] = stream;
+          if (continued) {
+            body["continue_final_message"] = true;
+            auto assistant = gufo::json::Value::object();
+            assistant["role"] = "assistant";
+            assistant["reasoning_content"] = prefix;
+            body["messages"].push_back(std::move(assistant));
+          }
+          const auto output = ReadContinuedOutput(
+              HandleOpenAiChat(Request(body.dump()), backend), stream);
+          Expect(output.reasoning_open == !closed && output.text.empty(),
+                 "final phase distinguishes open thinking from a "
+                 "separator-only close");
+          if (continued)
+            Expect(output.reasoning == " \nmore \t",
+                   "continued reasoning preserves whitespace even with an "
+                   "empty prefix");
+          Expect(output.content_present == (!stream && (!continued || closed)),
+                 "no empty content delta is required; ordinary buffered fields "
+                 "stay unchanged");
+          if (continued) {
+            auto assistant = body["messages"].items().back();
+            assistant["reasoning_content"] =
+                std::string(prefix) + output.reasoning;
+            assistant["content"] = *output.reasoning_open
+                                       ? gufo::json::Value()
+                                       : gufo::json::Value("");
+            auto messages = gufo::json::Value::array();
+            messages.push_back(body["messages"].items().front());
+            messages.push_back(std::move(assistant));
+            body["messages"] = std::move(messages);
+            backend.pieces = {"next"};
+            const auto next = ReadContinuedOutput(
+                HandleOpenAiChat(Request(body.dump()), backend), stream);
+            Expect(backend.last_request.continue_final_reasoning == !closed &&
+                       (closed ? next.text : next.reasoning) == "next",
+                   "reported phase supports another resume without reopening "
+                   "closed thinking");
+          }
+        }
+      }
+    }
+    for (const bool structured : {false, true}) {
+      for (const bool closed : {false, true}) {
+        FakeBackend backend;
+        backend.initial_output_state_override =
+            FakeBackend::InitialOutputState::kAuto;
+        backend.finish_reason = FakeBackend::FinishReason::kLength;
+        backend.pieces = {"<think>"};
+        if (closed)
+          backend.pieces.push_back("</think>\n\n");
+        auto body = gufo::json::parse(R"({"model":"test-model",
+          "chat_template_kwargs":{"enable_thinking":true},
+          "messages":[{"role":"user","content":"Think"}]})");
+        body["stream"] = stream;
+        if (structured)
+          body["response_format"] =
+              gufo::json::parse(R"({"type":"json_object"})");
+        const auto output = ReadContinuedOutput(
+            HandleOpenAiChat(Request(body.dump()), backend), stream);
+        Expect(output.reasoning_open == !closed && output.reasoning.empty() &&
+                   output.text.empty(),
+               "automatic and structured parsers report phase even without "
+               "visible text");
+      }
+    }
+  }
+}
+
+void TestContinueFinalMessage() {
+  using gufo::server::HandleOpenAiChat;
+  const auto body = [](std::string_view assistant, bool stream,
+                       std::string_view extra = "") {
+    return std::string(R"({"model":"test-model","messages":[
+      {"role":"user","content":"Count"},)") +
+           std::string(assistant) +
+           R"(],"continue_final_message":true,"stream":)" +
+           (stream ? "true" : "false") + std::string(extra) + "}";
+  };
+  FakeBackend backend;
+  for (const bool stream : {false, true}) {
+    backend.pieces = {" 3", " 4"};
+    const auto output = ReadContinuedOutput(
+        HandleOpenAiChat(
+            Request(body(R"({"role":"assistant","content":"1 2"})", stream,
+                         R"(,"add_generation_prompt":false)")),
+            backend),
+        stream);
+    Expect(output.text == " 3 4" && output.reasoning.empty(),
+           "only new answer bytes are returned");
+    Expect(backend.last_request.continue_final_message &&
+               !backend.last_request.continue_final_reasoning,
+           "answer continuation reaches generation");
+    for (const auto* thought : {"plan", " \nplan \t"}) {
+      backend.pieces = {"<thi", "nk>", thought, "</think>\n\nanswer"};
+      const auto resumed = ReadContinuedOutput(
+          HandleOpenAiChat(
+              Request(body(R"({"role":"assistant","reasoning_content":""})",
+                           stream)),
+              backend),
+          stream);
+      Expect(resumed.reasoning == thought && resumed.text == "answer" &&
+                 resumed.reasoning_open == false,
+             "buffered and streamed continuations strip a redundant opener "
+             "without trimming reasoning whitespace");
+    }
+    for (const bool split_close : {false, true}) {
+      backend.pieces =
+          split_close
+              ? std::vector<std::string>{"nk>", "\n\nanswer"}
+              : std::vector<std::string>{" more", "</thi", "nk>", "\n\nanswer"};
+      const auto thought =
+          split_close
+              ? R"({"role":"assistant","reasoning_content":"old</thi"})"
+              : R"({"role":"assistant","content":null,"reasoning_content":"old"})";
+      const auto resumed = ReadContinuedOutput(
+          HandleOpenAiChat(Request(body(thought, stream)), backend), stream);
+      Expect(resumed.text == "answer" &&
+                 resumed.reasoning == (split_close ? "" : " more"),
+             "thinking resumes across cut and stream boundaries then closes");
+      Expect(backend.last_request.continue_final_reasoning,
+             "open reasoning reaches generation");
+    }
+    backend.pieces = {"answer"};
+    const auto just_closed = ReadContinuedOutput(
+        HandleOpenAiChat(
+            Request(body(
+                R"({"role":"assistant","content":"","reasoning_content":"done"})",
+                stream, R"(,"reasoning_budget_tokens":1)")),
+            backend),
+        stream);
+    Expect(just_closed.text == "answer" && just_closed.reasoning.empty() &&
+               !backend.last_request.continue_final_reasoning,
+           "an explicit empty content string closes thinking at the cut");
+    backend.pieces = {" answer"};
+    const auto closed = ReadContinuedOutput(
+        HandleOpenAiChat(
+            Request(body(
+                R"({"role":"assistant","content":"partial","reasoning_content":"done"})",
+                stream)),
+            backend),
+        stream);
+    Expect(closed.text == " answer" && closed.reasoning.empty() &&
+               !backend.last_request.continue_final_reasoning,
+           "partial answer follows completed reasoning");
+  }
+  const auto valid = body(R"({"role":"assistant","content":"partial"})", false);
+  for (const auto* invalid : {"42", "null", "\"true\""}) {
+    auto bad = gufo::json::parse(valid);
+    bad["continue_final_message"] = gufo::json::parse(invalid);
+    Expect(HandleOpenAiChat(Request(bad.dump()), backend).status == 400,
+           "continuation must be boolean");
+  }
+  for (const auto* extra :
+       {R"(,"add_generation_prompt":true)", R"(,"score_assistant":true)",
+        R"(,"response_format":{"type":"json_object"})"}) {
+    Expect(HandleOpenAiChat(
+               Request(body(R"({"role":"assistant","content":"partial"})",
+                            false, extra)),
+               backend)
+                   .status == 400,
+           "incompatible continuation controls rejected");
+  }
+  Expect(HandleOpenAiChat(
+             Request(body(R"({"role":"user","content":"partial"})", false)),
+             backend)
+                 .status == 400,
+         "continuation requires a final assistant");
+  for (const auto* ignored : {"false", "true", "null", "42"}) {
+    auto ordinary = gufo::json::parse(valid);
+    ordinary["continue_final_message"] = false;
+    ordinary["add_generation_prompt"] = gufo::json::parse(ignored);
+    Expect(HandleOpenAiChat(Request(ordinary.dump()), backend).status == 200 &&
+               !backend.last_request.continue_final_message,
+           "ordinary requests keep ignoring add_generation_prompt");
+  }
+  for (const auto* ignored : {"null", "42"}) {
+    auto continued = gufo::json::parse(valid);
+    continued["add_generation_prompt"] = gufo::json::parse(ignored);
+    Expect(
+        HandleOpenAiChat(Request(continued.dump()), backend).status == 200,
+        "only an explicit true generation prompt conflicts with continuation");
+  }
+  backend.continuation_support = false;
+  const auto unsupported = HandleOpenAiChat(Request(valid), backend);
+  Expect(unsupported.status == 400 &&
+             unsupported.body.find("unsupported_continue_final_message") !=
+                 std::string::npos,
+         "other model families clearly reject continuation");
+}
+
+void TestContinueToolPrefix() {
+  using gufo::server::HandleOpenAiChat;
+  FakeBackend backend;
+  backend.tool_format = gufo::sampling::JsonConstraint::ToolFormat::kQwen;
+  const std::string full =
+      "<tool_call>\n<function=f>\n<parameter=x>\nhello\n"
+      "</parameter>\n</function>\n</tool_call>";
+  for (const std::size_t cut : {6U, 46U}) {
+    for (const bool stream : {false, true}) {
+      backend.pieces = {full.substr(cut)};
+      auto body = gufo::json::parse(R"({"model":"test-model",
+        "continue_final_message":true,"tools":[{"type":"function","function":{
+          "name":"f","parameters":{"type":"object","properties":{
+            "x":{"type":"string"}},"required":["x"]}}}]})");
+      body["stream"] = stream;
+      body["messages"] =
+          gufo::json::parse(R"([{"role":"user","content":"Use f"}])");
+      auto assistant = gufo::json::Value::object();
+      assistant["role"] = "assistant";
+      assistant["content"] = full.substr(0, cut);
+      body["messages"].push_back(std::move(assistant));
+      const auto output = ReadContinuedOutput(
+          HandleOpenAiChat(Request(body.dump()), backend), stream);
+      Expect(
+          output.text.empty() && output.calls.size() == 1,
+          "split tool tag and arguments produce one call without markup echo");
+      const auto* function = output.calls.front().find("function");
+      Expect(function->member_str("name") == "f" &&
+                 gufo::json::parse(function->member_str("arguments"))
+                         .member_str("x") == "hello",
+             "tool parser sees prior and new bytes");
+    }
+  }
+}
+
+void TestMessagesPrefill() {
+  using namespace gufo::server;
+  using gufo::tokenization::ChatRole;
+  FakeBackend backend;
+  for (const bool thinking : {false, true}) {
+    for (const bool stream : {false, true}) {
+      const auto body = gufo::json::parse(
+          thinking
+              ? R"({"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"old"}]}]})"
+              : R"({"messages":[{"role":"assistant","content":[{"type":"text","text":"old"}]}]})");
+      ChatRequest chat({{ChatRole::kUser, "Continue"}});
+      gufo::core::ImageReadBudget budget;
+      std::string error;
+      Expect(ParseAnthropicToolMessage(body.find("messages")->items().back(),
+                                       &chat.messages, budget, &error),
+             "Messages assistant blocks parse");
+      Expect(!ApplyMessagesPrefill(body, &chat, backend) &&
+                 chat.continue_final_message &&
+                 chat.continue_final_reasoning == thinking,
+             "Messages final block selects the continuation phase");
+      backend.pieces =
+          thinking ? std::vector<std::string>{" more", "</think>\n\nanswer"}
+                   : std::vector<std::string>{" more"};
+      const auto response = CreateAnthropicMessage(
+          Request(body.dump()), backend, chat, 20, {}, stream);
+      Expect(response.status == 200, "Messages prefill succeeds");
+      std::string text, thought;
+      if (stream) {
+        response.streaming_body([&](std::string_view chunk) {
+          const auto start = chunk.find("data: ");
+          if (start != std::string_view::npos) {
+            const auto event = gufo::json::parse(chunk.substr(start + 6));
+            if (const auto* delta = event.find("delta")) {
+              text += delta->member_str("text");
+              thought += delta->member_str("thinking");
+            }
+          }
+          return true;
+        });
+      } else {
+        const auto result = gufo::json::parse(response.body);
+        for (const auto& block : result.find("content")->items()) {
+          text += block.member_str("text");
+          thought += block.member_str("thinking");
+        }
+      }
+      Expect(text == (thinking ? "answer" : " more") &&
+                 thought == (thinking ? " more" : ""),
+             "Messages returns only new bytes, preserving continuation spaces");
+    }
+  }
+  const auto empty = gufo::json::parse(R"({"messages":[{"role":"assistant",
+    "content":[{"type":"thinking","thinking":""}]}]})");
+  ChatRequest chat({{ChatRole::kUser, "Q"}, {ChatRole::kAssistant, ""}});
+  Expect(!ApplyMessagesPrefill(empty, &chat, backend) &&
+             chat.continue_final_reasoning,
+         "an empty last thinking block still opens reasoning");
+  const auto closed = gufo::json::parse(R"({"messages":[{"role":"assistant",
+    "content":[{"type":"thinking","thinking":"done"},
+               {"type":"text","text":""}]}]})");
+  chat.messages.back().thought = "done";
+  Expect(!ApplyMessagesPrefill(closed, &chat, backend) &&
+             !chat.continue_final_reasoning && chat.ContinuationText().empty(),
+         "an empty text block closes thinking and has no visible stop suffix");
+  for (
+      const auto* blocks :
+      {R"([{"type":"text","text":""},{"type":"thinking","thinking":"x"}])",
+       R"([{"type":"input_text","text":""},{"type":"thinking","thinking":"x"}])",
+       R"([{"type":"output_text","text":""},{"type":"thinking","thinking":"x"}])",
+       R"([{"type":"input_text","text":"a"},{"type":"thinking","thinking":"x"},{"type":"text","text":"b"}])",
+       R"([{"type":"output_text","text":"a"},{"type":"thinking","thinking":"x"},{"type":"text","text":"b"}])",
+       R"([{"type":"text","text":"a"},{"type":"thinking","thinking":"x"},{"type":"text","text":"b"}])",
+       R"([{"type":"text","text":""},{"type":"thinking","thinking":""},{"type":"text","text":""}])"}) {
+    auto invalid = gufo::json::Value::object();
+    auto assistant = gufo::json::Value::object();
+    assistant["role"] = "assistant";
+    assistant["content"] = gufo::json::parse(blocks);
+    invalid["messages"] = gufo::json::Value::array();
+    invalid["messages"].push_back(std::move(assistant));
+    const auto error = ApplyMessagesPrefill(invalid, &chat, backend);
+    Expect(error && error->status == 400,
+           "every thinking-after-text ordering is refused, including empty "
+           "blocks");
+  }
+  backend.continuation_support = false;
+  Expect(ApplyMessagesPrefill(empty, &chat, backend)->status == 400,
+         "Messages prefill rejects unsupported model families");
+}
+
 int main() {
+  TestChatFinalReasoningPhase();
+  TestMessagesPrefill();
+  TestContinueFinalMessage();
+  TestContinueToolPrefix();
   TestScoreAssistant();
   TestAbliterationControls();
   TestLogprobs();

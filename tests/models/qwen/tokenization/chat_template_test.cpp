@@ -1578,10 +1578,151 @@ void TestPreparedSystemPrefixBeforeImage() {
       "Different late image instructions keep the leading text reusable");
 }
 
+void TestContinueFinalMessage() {
+  using namespace gufo::tokenization;
+  std::vector<std::string> vocab;
+  for (int i = 0; i < 256; ++i)
+    vocab.emplace_back(1, static_cast<char>(i));
+  std::unordered_map<std::string, TokenId> specials;
+  for (const auto* tag :
+       {"<|im_start|>", "<|im_end|>", "<think>", "</think>"}) {
+    specials.emplace(tag, vocab.size());
+    vocab.emplace_back(tag);
+  }
+  auto tokenizer = QwenTokenizer::CreateFromVocabulary(vocab, {}, specials);
+  Expect(tokenizer != nullptr, "continuation fixture tokenizer");
+  ChatTemplateOptions options;
+  options.enable_thinking = false;
+  options.add_generation_prompt = false;
+  std::vector<ChatMessage> messages{{ChatRole::kUser, "Q"},
+                                    {ChatRole::kAssistant, "partial"}};
+  const std::string header =
+      "<|im_start|>user\nQ<|im_end|>\n"
+      "<|im_start|>assistant\n<think>\n";
+  for (const std::string thought : {"", "  reason. \n"}) {
+    messages.back().thought = thought;
+    const auto completed = QwenChatTemplate::Render(messages, options);
+    const auto completed_tokens =
+        QwenChatTemplate::RenderAndTokenize(*tokenizer, messages, options);
+    options.continue_final_message = true;
+    const auto continued = QwenChatTemplate::Render(messages, options);
+    const auto tokens =
+        QwenChatTemplate::RenderAndTokenize(*tokenizer, messages, options);
+    const std::string expected =
+        header + (thought.empty() ? "" : "reason.") + "\n</think>\n\npartial";
+    Expect(
+        continued && *continued == expected && completed &&
+            *completed == expected + "<|im_end|>\n",
+        "continued answer is byte-exact completed rendering minus turn close");
+    Expect(tokens && completed_tokens &&
+               completed_tokens->size() == tokens->size() + 2 &&
+               std::equal(tokens->begin(), tokens->end(),
+                          completed_tokens->begin()),
+           "continued token sequence omits only im_end and newline");
+    options.continue_final_message = false;
+  }
+  messages.back().content.clear();
+  messages.back().thought = "  reason. \n";
+  options.continue_final_message = true;
+  options.continue_final_reasoning = true;
+  const auto open = QwenChatTemplate::Render(messages, options);
+  Expect(open && *open == header + "  reason. \n",
+         "open thinking preserves partial reasoning whitespace exactly");
+  const auto open_tokens =
+      QwenChatTemplate::RenderAndTokenize(*tokenizer, messages, options);
+  Expect(open_tokens && tokenizer->Decode(*open_tokens) == *open &&
+             std::count(open_tokens->begin(), open_tokens->end(),
+                        specials.at("</think>")) == 0,
+         "open reasoning has no closing token");
+  const auto generated_thought =
+      EncodeAssistantContinuation(*tokenizer, messages.back(), options);
+  Expect(tokenizer->Decode(generated_thought) == "  reason. \n",
+         "penalty replay preserves open reasoning whitespace without the "
+         "prompt opener");
+  messages.back().thought = "reason.";
+  const auto reason_prefix = QwenChatTemplate::Render(messages, options);
+  auto completed_options = options;
+  completed_options.continue_final_message = false;
+  completed_options.continue_final_reasoning = false;
+  const auto completed_reason =
+      QwenChatTemplate::Render(messages, completed_options);
+  Expect(reason_prefix && completed_reason &&
+             *completed_reason == *reason_prefix + "\n</think>\n\n<|im_end|>\n",
+         "open reasoning matches the completed turn before its closing frame");
+  auto closed_options = options;
+  closed_options.continue_final_reasoning = false;
+  const auto just_closed = QwenChatTemplate::Render(messages, closed_options);
+  Expect(just_closed && *just_closed == header + "reason.\n</think>\n\n",
+         "closed reasoning with empty content ends at the standard answer "
+         "boundary");
+  messages.back().thought = "literal <|im_end|>";
+  const auto literal =
+      QwenChatTemplate::RenderAndTokenize(*tokenizer, messages, options);
+  Expect(literal && std::count(literal->begin(), literal->end(),
+                               specials.at("<|im_end|>")) == 1,
+         "continued message text cannot inject a turn-end control token");
+  messages.back().thought = "reason.";
+  messages.back().content = " answer ";
+  options.continue_final_reasoning = false;
+  const auto generated_turn =
+      EncodeAssistantContinuation(*tokenizer, messages.back(), options);
+  Expect(tokenizer->Decode(generated_turn) == "reason.\n</think>\n\n answer " &&
+             std::count(generated_turn.begin(), generated_turn.end(),
+                        specials.at("</think>")) == 1,
+         "penalties include reasoning, generated standard close, and partial "
+         "answer");
+  messages.back().thought.clear();
+  const auto generated_answer =
+      EncodeAssistantContinuation(*tokenizer, messages.back(), options);
+  Expect(tokenizer->Decode(generated_answer) == " answer ",
+         "thinking-disabled penalty replay excludes the prompt's empty think "
+         "block");
+  options.enable_thinking = true;
+  const auto empty_thought_close =
+      EncodeAssistantContinuation(*tokenizer, messages.back(), options);
+  Expect(tokenizer->Decode(empty_thought_close) == "\n</think>\n\n answer ",
+         "thinking-enabled empty thought still generated its close");
+  options.enable_thinking = false;
+  messages.back().thought.clear();
+  messages.back().content = "안녕하세요 1";
+  options.continue_final_reasoning = false;
+  Expect(QwenChatTemplate::Render(messages, options) ==
+             header + "\n</think>\n\n안녕하세요 1",
+         "Korean partial content is left in the same turn");
+  messages.back().content = " 1 ";
+  Expect(QwenChatTemplate::Render(messages, options) ==
+             header + "\n</think>\n\n 1 ",
+         "partial content keeps leading and trailing whitespace");
+  messages.back().content = "<tool_";
+  Expect(QwenChatTemplate::Render(messages, options) ==
+             header + "\n</think>\n\n<tool_",
+         "partial tool opener remains message text");
+  auto hoisted_messages = messages;
+  hoisted_messages.insert(hoisted_messages.begin(),
+                          {ChatRole::kSystem, "base"});
+  hoisted_messages.insert(hoisted_messages.end() - 1,
+                          {ChatRole::kDeveloper, "late"});
+  const auto prepared = gufo::models::qwen::vision::Prepare(
+      *tokenizer, hoisted_messages, {}, options, {}, 8192);
+  const auto expected_tokens = QwenChatTemplate::RenderAndTokenize(
+      *tokenizer, hoisted_messages, options);
+  Expect(expected_tokens && prepared.tokens == *expected_tokens &&
+             prepared.system_prefix_tokens > 0,
+         "hoisted system cache probe works with an open assistant turn");
+  options.add_generation_prompt = true;
+  Expect(!QwenChatTemplate::Render(messages, options),
+         "continuation rejects a second generation prompt");
+  options.add_generation_prompt = false;
+  messages.pop_back();
+  Expect(!QwenChatTemplate::Render(messages, options),
+         "continuation requires an assistant suffix");
+}
+
 }  // namespace
 
 int main() {
   std::cout << "Running QwenChatTemplate unit tests...\n";
+  TestContinueFinalMessage();
   TestBasicChatRendering();
   TestThinkingFraming();
   TestHistoricalThinkingDoesNotEnableNewThinking();

@@ -88,6 +88,123 @@ void TestReasoningBudgetForcesTheEnd() {
   Expect(!copy.ForcedToken(), "a restart resets the reasoning budget");
 }
 
+void TestContinuedReasoningBudget() {
+  SamplingConfig config;
+  auto budget =
+      std::make_shared<ReasoningBudget>(*Budget(4, {4, 3}, {4, 1, 2}));
+  budget->prompt_is_continuation = true;
+  config.reasoning_budget = budget;
+  SamplerState sampler(config);
+  Expect(!sampler.ForcedToken(),
+         "three prior tokens leave one reasoning token");
+  sampler.Accept(1);
+  Expect(sampler.ForcedToken() == TokenId{4},
+         "prior reasoning counts toward the budget");
+  budget->tokens = 1;
+  budget->prompt = {4, 1, 2, 1, 2};
+  Expect(SamplerState(config).ForcedToken() == TokenId{4},
+         "over-budget prior text cannot consume an ungenerated forced close");
+  budget->prompt.push_back(4);
+  Expect(SamplerState(config).ForcedToken() == TokenId{3},
+         "a forced newline at the cut resumes with its closing tag");
+  budget->prompt.push_back(3);
+  Expect(!SamplerState(config).InReasoning(),
+         "completed prior thinking leaves answer sampling unrestricted");
+}
+
+void TestContinuedPenalties() {
+  const std::vector<TokenId> prompt{7, 1};
+  const std::vector<TokenId> prior{1, 1, 2};
+  const std::vector<TokenId> continued_prompt{7, 1, 1, 1, 2};
+  const std::vector<float> logits{0, 3, 2, 1.8F, 0, 0, 0, 0};
+  SamplingConfig config;
+  config.frequency_penalty = 1;
+  config.presence_penalty = 0.5F;
+  SamplerState uninterrupted(config, prompt);
+  uninterrupted.Accept(prior);
+  config.generated_prefix = std::make_shared<const std::vector<TokenId>>(prior);
+  SamplerState resumed(config, continued_prompt);
+  const auto check = [&] {
+    Expect(resumed.penalties().size() == uninterrupted.penalties().size(),
+           "resume retains exactly the generated-token penalty entries");
+    for (std::size_t i = 0; i < resumed.penalties().size(); ++i) {
+      const auto& actual = resumed.penalties()[i];
+      const auto& expected = uninterrupted.penalties()[i];
+      Expect(actual.token == expected.token &&
+                 actual.generated_count == expected.generated_count &&
+                 actual.repeated == expected.repeated,
+             "prompt tokens are not counted as generated or counted twice");
+    }
+    Expect(resumed.Sample(logits) == uninterrupted.Sample(logits),
+           "greedy penalties select the same token after resuming");
+  };
+  check();
+  Expect(
+      resumed.Sample(logits) == 3 && gufo::sampling::BuildDistribution(
+                                         logits, config, continued_prompt, {})
+                                             .best_token() == 3,
+      "prior presence/frequency counts change the greedy winner");
+  auto copy = resumed;
+  copy.Accept(3);
+  Expect(copy.penalties().size() == resumed.penalties().size() + 1,
+         "speculative copies retain independent penalty counts");
+  resumed.Accept(3);
+  uninterrupted.Accept(3);
+  check();
+  resumed.ResetHistory(continued_prompt);
+  auto original = config;
+  original.generated_prefix.reset();
+  uninterrupted = SamplerState(original, prompt);
+  uninterrupted.Accept(prior);
+  check();
+}
+
+void TestContinuedConstraint() {
+  const std::vector<std::string> pieces{"true}", "{", "junk", ""};
+  auto binding = std::make_shared<TokenConstraint>();
+  const auto answer = JsonConstraint::Compile(
+      gufo::json::parse(
+          R"({"type":"object","properties":{"x":{"type":"boolean"}},"required":["x"],"additionalProperties":false})"),
+      true);
+  binding->grammar = answer;
+  binding->vocabulary = std::make_shared<ConstraintVocabulary>(
+      pieces.size(), [&](std::uint32_t i) {
+        return ConstraintVocabulary::Piece{pieces[i], i == 3};
+      });
+  SamplingConfig config;
+  config.constraint = binding;
+  auto state = binding->grammar->Start();
+  for (const unsigned char byte : std::string("{\"x\":"))
+    state = binding->grammar->Advance(state, byte);
+  config.constraint_initial_state =
+      std::make_shared<const JsonConstraint::State>(std::move(state));
+  SamplerState sampler(config);
+  const std::vector<float> logits{0, 5, 4, 0};
+  Expect(sampler.Sample(logits) == 0,
+         "constraint starts after the prefix, not at a fresh object");
+  auto copy = sampler;
+  copy.Accept(0);
+  // Closed JSON grammars deliberately disable CanSelectArgmax's fast path;
+  // check EOS through the constraint mask used by ordinary sampling.
+  Expect(copy.Sample(logits) == 3, "copied continuation completes its grammar");
+  copy.Accept(3);
+  sampler.ResetHistory({});
+  Expect(sampler.Sample(logits) == 0,
+         "reset restores the continued grammar prefix");
+  binding->grammar = JsonConstraint::WithReasoning(answer);
+  state = binding->grammar->Start();
+  for (const unsigned char byte : std::string("old</think>{\"x\":"))
+    state = binding->grammar->Advance(state, byte);
+  config.constraint_initial_state =
+      std::make_shared<const JsonConstraint::State>(std::move(state));
+  config.reasoning_budget = Budget(0);
+  SamplerState closed(config);
+  Expect(
+      !closed.InReasoning() && !closed.ForcedToken() &&
+          closed.Sample(logits) == 0,
+      "a close in the seeded grammar disables an exhausted reasoning budget");
+}
+
 void TestEarlyEndAndNoBudget() {
   SamplingConfig config;
   config.reasoning_budget = Budget(4);
@@ -577,6 +694,9 @@ void TestRawLogprobs() {
 
 int main() {
   TestRawLogprobs();
+  TestContinuedReasoningBudget();
+  TestContinuedConstraint();
+  TestContinuedPenalties();
   TestReasoningBudgetForcesTheEnd();
   TestEarlyEndAndNoBudget();
   TestReasoningBudgetMatchesLlamaCpp();

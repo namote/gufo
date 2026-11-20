@@ -164,6 +164,7 @@ public:
   sampling::LogitBiasProfile delete_logit_bias_profile(
       std::string_view name) override;
   [[nodiscard]] bool supports_scoring() const override;
+  [[nodiscard]] bool supports_continue_final_message() const override;
   [[nodiscard]] std::string hc_mode() const override;
   [[nodiscard]] std::string model_path() const override;
   [[nodiscard]] std::string build_info() const override;

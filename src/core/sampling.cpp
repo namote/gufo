@@ -507,7 +507,7 @@ SamplingDistribution BuildDistribution(
     std::span<const float> logits, const SamplingConfig& config,
     std::span<const TokenId> prompt_tokens,
     std::span<const TokenId> generated_tokens) {
-  if (config.constraint || config.reasoning_budget) {
+  if (config.constraint || config.reasoning_budget || config.generated_prefix) {
     SamplerState sampler(config, prompt_tokens);
     sampler.Accept(generated_tokens);
     return sampler.Distribution(logits);
@@ -554,8 +554,13 @@ SamplerState::SamplerState(SamplingConfig config,
   config_.Validate();
   if (config_.constraint)
     constraint_state_ = config_.constraint->grammar->Start();
+  if (config_.constraint_initial_state &&
+      (config_.constraint || reasoning_grammar_))
+    constraint_state_ = *config_.constraint_initial_state;
   StartReasoning();
   TrimHistory();
+  if (config_.generated_prefix)
+    CountGeneratedTokens(*config_.generated_prefix);
   RebuildPenaltyCounts();
 }
 
@@ -676,10 +681,15 @@ void SamplerState::ResetHistory(std::span<const TokenId> tokens) {
     constraint_state_ = reasoning_grammar_->grammar->Start();
   constraint_mask_.reset();
   pending_sample_.reset();
+  if (config_.constraint_initial_state &&
+      (config_.constraint || reasoning_grammar_))
+    constraint_state_ = *config_.constraint_initial_state;
   StartReasoning();
   penalty_counts_.clear();
   history_.assign(tokens.begin(), tokens.end());
   TrimHistory();
+  if (config_.generated_prefix)
+    CountGeneratedTokens(*config_.generated_prefix);
   RebuildPenaltyCounts();
 }
 
@@ -702,8 +712,27 @@ void SamplerState::StartReasoning() {
   reasoning_forced_ = 0;
   reasoning_phase_ = budget->tokens == 0 ? ReasoningPhase::kForcing
                                          : ReasoningPhase::kCounting;
-  for (const auto token : budget->prompt)
+  for (const auto token : budget->prompt) {
+    if (budget->prompt_is_continuation &&
+        reasoning_phase_ == ReasoningPhase::kForcing) {
+      if (std::ranges::find(budget->ends, token) != budget->ends.end()) {
+        reasoning_phase_ = ReasoningPhase::kOff;
+        continue;
+      }
+      // A lower budget on resume must not mistake old free-form reasoning
+      // for the forced closing sequence and silently turn the budget off.
+      if (token != budget->forced[reasoning_forced_]) {
+        reasoning_forced_ = 0;
+        continue;
+      }
+    }
     AdvanceReasoning(token);
+  }
+  // A prefilled native tool header (or a textual reasoning close) may have
+  // already ended the grammar's reasoning phase without a control-token ID.
+  if (config_.constraint_initial_state && config_.constraint &&
+      !config_.constraint->grammar->InReasoning(constraint_state_))
+    reasoning_phase_ = ReasoningPhase::kOff;
 }
 
 // Mirrors llama.cpp common_reasoning_budget_accept: the forcing phase advances
@@ -777,17 +806,7 @@ void SamplerState::Accept(std::span<const TokenId> tokens) {
     constraint_state_ = std::move(next);
     constraint_mask_.reset();
   }
-  if (config_.frequency_penalty != 0 || config_.presence_penalty != 0) {
-    for (const auto token : tokens) {
-      auto found = std::ranges::lower_bound(penalty_counts_, token, {},
-                                            &TokenPenalty::token);
-      if (found == penalty_counts_.end() || found->token != token)
-        found = penalty_counts_.insert(found, TokenPenalty{.token = token});
-      if (found->generated_count == std::numeric_limits<std::uint32_t>::max())
-        throw std::overflow_error("generated token count overflow");
-      ++found->generated_count;
-    }
-  }
+  CountGeneratedTokens(tokens);
   if (config_.repeat_last_n != 0) {
     history_.insert(history_.end(), tokens.begin(), tokens.end());
     TrimHistory();
@@ -966,6 +985,20 @@ void SamplerState::TrimHistory() {
     history_.erase(
         history_.begin(),
         history_.end() - static_cast<std::ptrdiff_t>(config_.repeat_last_n));
+  }
+}
+
+void SamplerState::CountGeneratedTokens(std::span<const TokenId> tokens) {
+  if (config_.frequency_penalty != 0 || config_.presence_penalty != 0) {
+    for (const auto token : tokens) {
+      auto found = std::ranges::lower_bound(penalty_counts_, token, {},
+                                            &TokenPenalty::token);
+      if (found == penalty_counts_.end() || found->token != token)
+        found = penalty_counts_.insert(found, TokenPenalty{.token = token});
+      if (found->generated_count == std::numeric_limits<std::uint32_t>::max())
+        throw std::overflow_error("generated token count overflow");
+      ++found->generated_count;
+    }
   }
 }
 

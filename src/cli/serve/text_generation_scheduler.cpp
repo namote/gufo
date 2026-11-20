@@ -3289,7 +3289,8 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
         "stop sequences require exact incremental token decoding");
 
   auto request = std::make_shared<ScheduledRequest>();
-  request->stop_filter = StopSequenceFilter(std::move(metadata.stop_sequences));
+  request->stop_filter = StopSequenceFilter(std::move(metadata.stop_sequences),
+                                            metadata.stop_prefix);
   request->id = impl_->next_request_id.fetch_add(1, std::memory_order_relaxed);
   request->client_id =
       metadata.client_id.empty() ? "anonymous" : std::move(metadata.client_id);

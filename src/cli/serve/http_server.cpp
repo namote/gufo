@@ -1327,6 +1327,8 @@ std::optional<HttpResponse> ReadAnthropicChat(
   }
 
   chat->messages = std::move(messages);
+  if (auto error = ApplyMessagesPrefill(body, chat, b))
+    return error;
   if (const auto error = ParseStopSequences(body.find("stop_sequences"),
                                             StopSequenceFormat::kAnthropic,
                                             &chat->stop_sequences))

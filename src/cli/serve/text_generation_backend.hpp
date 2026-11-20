@@ -198,6 +198,15 @@ struct ChatRequest {
   bool parallel_tool_calls{true};
   ReasoningOptions reasoning;
   bool add_vision_id{false};
+  /// Resume the final assistant turn; its text is part of the prompt.
+  bool continue_final_message{false};
+  bool continue_final_reasoning{false};
+  [[nodiscard]] std::string_view ContinuationText() const {
+    if (!continue_final_message || messages.empty())
+      return {};
+    return continue_final_reasoning ? messages.back().thought
+                                    : messages.back().content;
+  }
   /// Target-model execution transform, independent of sampling/thinking.
   bool abliteration{false};
   /// Whether the request carried an `abliteration` member: an explicit ON or
@@ -491,6 +500,9 @@ public:
   /// Whether chat requests may set `score_assistant` (teacher-forced
   /// logprobs of the final assistant message instead of generation).
   [[nodiscard]] virtual bool supports_scoring() const { return false; }
+  [[nodiscard]] virtual bool supports_continue_final_message() const {
+    return false;
+  }
   /// Flash-Next's loaded HyperConnection mode (`--hc-mode`); empty for other
   /// models.
   [[nodiscard]] virtual std::string hc_mode() const { return {}; }

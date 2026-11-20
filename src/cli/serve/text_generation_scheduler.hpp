@@ -114,6 +114,8 @@ public:
     std::size_t system_prefix_tokens{0};
     bool stop_at_eos{true};
     std::vector<std::string> stop_sequences;
+    /// Prior visible-channel suffix; participates in matching, never in output.
+    std::string stop_prefix;
     bool return_progress{false};
     /// Non-empty: score these tokens after the prompt (`score_assistant`)
     /// instead of generating. Result::tokens and Result::logprobs then hold

@@ -66,14 +66,27 @@ inline std::optional<std::string> ParseStopSequences(
   return std::nullopt;
 }
 
+/// Only this many old visible bytes can participate in a new stop match.
+inline std::string StopSequenceSuffix(
+    std::string_view prior, const std::vector<std::string>& sequences) {
+  std::size_t keep = 0;
+  for (const auto& sequence : sequences)
+    if (!sequence.empty())
+      keep = std::max(keep, sequence.size() - 1);
+  return std::string(prior.substr(prior.size() - std::min(keep, prior.size())));
+}
+
 /// Matches raw accepted output, retaining only a possible stop prefix.
 /// The first completed match wins; ties at the same end prefer the longer
 /// sequence. This is independent of how token pieces are split into chunks.
 class StopSequenceFilter {
 public:
-  explicit StopSequenceFilter(std::vector<std::string> sequences = {})
+  explicit StopSequenceFilter(std::vector<std::string> sequences = {},
+                              std::string_view prior = {})
       : sequences_(std::move(sequences)) {
     ValidateStopSequences(sequences_);
+    pending_ = StopSequenceSuffix(prior, sequences_);
+    prior_bytes_ = pending_.size();
   }
 
   [[nodiscard]] bool enabled() const noexcept { return !sequences_.empty(); }
@@ -89,7 +102,12 @@ public:
     std::size_t end = std::string::npos;
     std::size_t start = std::string::npos;
     for (std::size_t i = 0; i < sequences_.size(); ++i) {
-      const auto position = pending_.find(sequences_[i]);
+      auto position = pending_.find(sequences_[i]);
+      // A short stop wholly inside the old suffix already belongs to the
+      // previous request. Only matches consuming a new byte can stop this one.
+      while (position != std::string::npos &&
+             position + sequences_[i].size() <= prior_bytes_)
+        position = pending_.find(sequences_[i], position + 1);
       if (position == std::string::npos)
         continue;
       const auto candidate_end = position + sequences_[i].size();
@@ -100,8 +118,10 @@ public:
       }
     }
     if (stopped()) {
-      auto safe = pending_.substr(0, start);
+      const auto skip = std::min(prior_bytes_, start);
+      auto safe = pending_.substr(skip, start - skip);
       pending_.clear();
+      prior_bytes_ = 0;
       return safe;
     }
     std::size_t keep = 0;
@@ -115,16 +135,25 @@ public:
         }
       }
     }
-    auto safe = pending_.substr(0, pending_.size() - keep);
-    pending_.erase(0, safe.size());
+    const auto ready = pending_.size() - keep;
+    const auto skip = std::min(prior_bytes_, ready);
+    auto safe = pending_.substr(skip, ready - skip);
+    pending_.erase(0, ready);
+    prior_bytes_ -= skip;
     return safe;
   }
 
-  std::string Finish() { return std::exchange(pending_, {}); }
+  std::string Finish() {
+    auto safe = pending_.substr(prior_bytes_);
+    pending_.clear();
+    prior_bytes_ = 0;
+    return safe;
+  }
 
 private:
   std::vector<std::string> sequences_;
   std::string pending_;
+  std::size_t prior_bytes_{0};
   std::optional<std::size_t> match_;
 };
 
