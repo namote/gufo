@@ -28,6 +28,7 @@
 #include "src/cli/serve/generation_metrics.hpp"
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/loop_detector.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
 #include "src/core/hip/kv_block_layout.hpp"
@@ -271,6 +272,12 @@ struct FakeControl {
   bool preview_first_token{false};
   /// Nonzero: requests emit a loop of this many distinct tokens.
   std::size_t loop_period{0};
+  /// In a loop: emit `loop_end_token` (a reasoning end) as this generated
+  /// token instead.
+  std::optional<std::size_t> loop_end_at;
+  TextRunnerToken loop_end_token{8};
+  /// Reasoning also ends at "<tool_call>" (token 11), as on Qwen.
+  bool tool_call_ends_reasoning{false};
   /// A request with this label detects a dynamic abliteration profile on
   /// its last prompt row: it is readmitted under another context (A2).
   std::optional<TextRunnerToken> readmit_label;
@@ -438,6 +445,12 @@ public:
   [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
       std::string_view text) const override {
     return {static_cast<TextRunnerToken>(text.size())};
+  }
+
+  [[nodiscard]] ReasoningTags ReasoningBudgetTags() const override {
+    if (control_->tool_call_ends_reasoning)
+      return {"<think>", "</think>", {"</think>", "<tool_call>"}};
+    return TextModelRunner::ReasoningBudgetTags();
   }
 
   [[nodiscard]] std::shared_ptr<const gufo::sampling::ConstraintVocabulary>
@@ -622,6 +635,10 @@ public:
       // The loop guard's forced reasoning end ("</think>" tokenizes to 8).
       if (const auto forced = sampler.ForcedToken())
         return {.token = *forced, .piece = "</think>"};
+      if (control_->loop_end_at && fake.decode_count == *control_->loop_end_at)
+        return {.token = control_->loop_end_token,
+                .piece =
+                    control_->loop_end_token == 8 ? "</think>" : "<tool_call>"};
       const auto token = static_cast<TextRunnerToken>(
           1000 + (*fake.frontier - fake.label * 100) % control_->loop_period);
       return {.token = token, .piece = std::to_string(token)};
@@ -797,13 +814,17 @@ public:
     const std::size_t count = std::min<std::size_t>(max_tokens, 3);
     TextDecodeStep step;
     step.selections.reserve(count);
+    // As speculative runners do: a working copy accepts the step's tokens;
+    // the pool's sampler accepts them after the step.
+    auto working = sampler;
     for (std::size_t index = 0; index < count; ++index) {
-      auto selection = SelectNext(state, sampler);
+      auto selection = SelectNext(state, working);
       if (selection.stop) {
         step.stop = true;
         step.terminal_logprobs = selection.logprobs;
         break;
       }
+      working.Accept(selection.token);
       Advance(state, selection.token);
       step.selections.push_back(std::move(selection));
     }
@@ -1435,6 +1456,95 @@ void TestLoopGuardEndsALoopingAnswer() {
                                        FinishReason::kLoopDetected &&
              thinking.tokens.end() - close > 1024,
          "the answer starts fresh and is stopped by its own loop");
+}
+
+// The generated index at which a loop of `period` distinct tokens is
+// detected.
+std::size_t LoopTrigger(std::size_t period) {
+  gufo::server::TokenLoopDetector detector;
+  for (std::size_t index = 0;; ++index)
+    if (detector.Feed(static_cast<std::uint32_t>(1000 + index % period)))
+      return index;
+}
+
+// Speculative (multi-token) steps are accepted whole before publication: a
+// thinking loop detected inside a step is acted on after the step. A step
+// that itself ends reasoning after the loop (</think> or a tool call) is
+// published whole and nothing is forced; otherwise the forced end follows
+// the step, after a complete UTF-8 character. Serial and batched steps alike.
+void TestLoopGuardInSpeculativeSteps() {
+  using Finish = gufo::server::TextGenerationBackend::FinishReason;
+  // A period whose loop completes on a step's first token (steps of 3).
+  std::size_t period = 40;
+  while (LoopTrigger(period) % 3 != 0)
+    ++period;
+  const auto trigger = LoopTrigger(period);
+  for (const bool batched : {false, true}) {
+    enum class Case { kClose, kEnd, kToolCall, kUtf8 };
+    for (const auto which :
+         {Case::kClose, Case::kEnd, Case::kToolCall, Case::kUtf8}) {
+      auto control = std::make_shared<FakeControl>();
+      control->multi_token_decode = true;
+      control->batched_multi_token_decode = batched;
+      control->supports_batched_advance = batched;
+      control->prefix_reuse = false;
+      control->loop_period = period;
+      control->max_context = 8192;
+      control->tool_call_ends_reasoning = true;
+      if (which == Case::kEnd || which == Case::kToolCall) {
+        control->loop_end_at = trigger + 1;
+        control->loop_end_token = which == Case::kEnd ? 8 : 11;
+      }
+      auto scheduler = MakeScheduler(control, 1);
+      gufo::sampling::SamplingConfig sampling;
+      sampling.loop_guard = true;
+      sampling.temperature = 1.0F;
+      auto budget = std::make_shared<gufo::sampling::ReasoningBudget>();
+      budget->tokens = gufo::sampling::ReasoningBudget::kUnlimited;
+      budget->forced = {8};
+      budget->ends = {8, 11};
+      if (which == Case::kUtf8) {
+        // Odd loop tokens end inside a UTF-8 character.
+        auto partial = std::make_shared<std::vector<bool>>(1200, false);
+        for (std::size_t k = 1; k < period; k += 2)
+          (*partial)[1000 + k] = true;
+        budget->partial_utf8 = partial;
+      }
+      sampling.reasoning_budget = budget;
+      gufo::server::TextRequestMetadata metadata;
+      metadata.starts_in_reasoning = true;
+      const auto result =
+          scheduler->Submit({1}, 4000, sampling, {}, false, metadata).Wait();
+      const auto& tokens = result.tokens;
+      Expect(result.finish_reason == Finish::kLoopDetected &&
+                 tokens.size() > trigger + 1024,
+             "the answer after a thinking loop runs until its own loop");
+      const auto closes = static_cast<std::size_t>(std::ranges::count_if(
+          tokens, [](auto t) { return t == 8 || t == 11; }));
+      Expect(closes == 1, "reasoning ends exactly once");
+      const auto at = static_cast<std::size_t>(
+          std::ranges::find_if(tokens,
+                               [](auto t) { return t == 8 || t == 11; }) -
+          tokens.begin());
+      switch (which) {
+        case Case::kClose:
+          Expect(result.loop_closed_reasoning && at == trigger + 3,
+                 "the forced end follows the accepted step");
+          break;
+        case Case::kEnd:
+        case Case::kToolCall:
+          Expect(!result.loop_closed_reasoning && at == trigger + 1 &&
+                     tokens[at] == control->loop_end_token,
+                 "a step that ends reasoning itself is published whole");
+          break;
+        case Case::kUtf8:
+          Expect(result.loop_closed_reasoning && at >= trigger + 3 &&
+                     at <= trigger + 4 && (tokens[at - 1] - 1000) % 2 == 0,
+                 "the forced end never splits a UTF-8 character");
+          break;
+      }
+    }
+  }
 }
 
 // An armed `--trace` records each finished request under the HTTP request id
@@ -4474,6 +4584,7 @@ int main() {
   TestLongReprefillStaysOff();
   TestRunnerCanReuseExactIncrementalText();
   TestLoopGuardEndsALoopingAnswer();
+  TestLoopGuardInSpeculativeSteps();
   TestGenerationTraceRecordsPromptAndOutput();
   TestMultiTokenDecodePublishesDraftMetricsAndDisablesPrefixReuse();
   TestRequestTotalsDoNotNeedAConsumer();

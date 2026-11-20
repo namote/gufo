@@ -147,6 +147,10 @@ struct ScheduledRequest {
   /// Loop detection over published tokens; created with the first one.
   /// Only the scheduler thread touches it.
   std::optional<GenerationLoopMonitor> loop_monitor;
+  /// A reasoning loop the guard acts on once its step is published.
+  std::optional<LoopDetection> loop_pending;
+  /// The guard ends the reply at the token that completed an answer loop.
+  bool loop_stop{false};
 
   std::mutex output_mutex;
   std::condition_variable output_condition;
@@ -1838,6 +1842,12 @@ struct TextGenerationScheduler::Impl {
                       TextGenerationBackend::FinishReason::kStopSequence);
       return std::nullopt;
     }
+    ResolveLoop(request);
+    if (request->loop_stop) {
+      CompleteSuccess(request,
+                      TextGenerationBackend::FinishReason::kLoopDetected);
+      return std::nullopt;
+    }
     request->advance_pending = true;
     return PrepareDecode(request);
   }
@@ -1913,8 +1923,8 @@ struct TextGenerationScheduler::Impl {
     }
     if (request->stop_filter.stopped())
       request->result.stop_sequence = request->stop_filter.matched_sequence();
-    else if (!ObserveLoop(request, selection))
-      return false;
+    else
+      ObserveLoop(request, selection);
     if (CompleteIfStopped(request)) {
       return false;
     }
@@ -1939,68 +1949,87 @@ struct TextGenerationScheduler::Impl {
   }
 
   // Feeds a published token to the request's loop monitor. A detection is
-  // always logged; with the loop guard on it closes an open reasoning block
-  // (the budget's forced end follows) or ends the answer. False when the
-  // request completed here.
-  [[nodiscard]] bool ObserveLoop(
-      const std::shared_ptr<ScheduledRequest>& request,
-      const TextDecodeSelection& selection) {
+  // always logged. With the loop guard on, an answer loop sets loop_stop: the
+  // caller stops publishing at this token and completes the request after
+  // its step's accounting. A reasoning loop waits for ResolveLoop, after the
+  // whole step is published: an accepted step may itself close reasoning
+  // later on, and a forced end can only follow the accepted step.
+  void ObserveLoop(const std::shared_ptr<ScheduledRequest>& request,
+                   const TextDecodeSelection& selection) {
     if (!request->loop_monitor) {
       request->loop_monitor.emplace(
           request->prompt, request->starts_in_reasoning,
           request->starts_in_reasoning ? ReasoningEndTokens()
                                        : std::vector<std::uint32_t>{});
+      if (request->starts_in_reasoning && ReasoningEndTokens().empty() &&
+          !reasoning_ends_warned) {
+        reasoning_ends_warned = true;
+        Logger::Warn("loop",
+                     "event=reasoning_end_unknown detail=the runner's "
+                     "reasoning end tags are not single tokens; loop "
+                     "detection treats whole replies as reasoning");
+      }
     }
     const auto found =
         request->loop_monitor->Observe(selection.token, selection.piece);
-    if (request->starts_in_reasoning && ReasoningEndTokens().empty() &&
-        !reasoning_ends_warned) {
-      reasoning_ends_warned = true;
-      Logger::Warn("loop",
-                   "event=reasoning_end_unknown detail=the runner's reasoning "
-                   "end tags are not single tokens; loop detection treats "
-                   "whole replies as reasoning");
-    }
     if (!found)
-      return true;
+      return;
     request->result.loop_detected = true;
-    std::string_view action = "none";
-    bool stop = false;
     // A first-token preview is not accepted yet; one token cannot complete
     // a loop, so nothing acts there.
-    if (request->sampling.loop_guard && request->result.tokens.size() > 1) {
-      if (!found->reasoning) {
-        action = "stop";
-        stop = true;
-      } else if (request->runner_request.ForceReasoningEnd()) {
-        action = "close";
-        request->result.loop_closed_reasoning = true;
-      } else if (request->runner_request.ReasoningOpen()) {
-        action = "closing";  // the budget is already forcing its end
-      } else {
-        // No tracked phase to close (greedy, or reasoning already ended
-        // where the monitor saw no end token): end the reply instead.
-        action = "stop";
-        stop = true;
-      }
+    if (!request->sampling.loop_guard || request->result.tokens.size() <= 1) {
+      LogLoop(request, *found, "none");
+    } else if (!found->reasoning) {
+      LogLoop(request, *found, "stop");
+      request->loop_stop = true;
+    } else {
+      request->loop_pending = *found;
     }
+  }
+
+  // Acts on a reasoning loop once its step is published; the pool's sampler
+  // is then at the monitor's position.
+  void ResolveLoop(const std::shared_ptr<ScheduledRequest>& request) {
+    if (!request->loop_pending)
+      return;
+    const auto found = *request->loop_pending;
+    request->loop_pending.reset();
+    std::string_view action;
+    if (request->loop_monitor && !request->loop_monitor->reasoning()) {
+      action = "closed";  // the step itself ended reasoning
+    } else if (request->runner_request.ForceReasoningEnd()) {
+      action = "close";
+      request->result.loop_closed_reasoning = true;
+    } else if (request->runner_request.ReasoningOpen()) {
+      action = "closing";  // the budget is already forcing its end
+    } else {
+      // No tracked phase to close (greedy, or reasoning already ended where
+      // the monitor saw no end token): end the reply instead.
+      action = "stop";
+      request->loop_stop = true;
+    }
+    LogLoop(request, found, action);
+  }
+
+  // Each detection is logged once, from ObserveLoop or ResolveLoop: at most
+  // once per phase.
+  static void LogLoop(const std::shared_ptr<ScheduledRequest>& request,
+                      const LoopDetection& found, std::string_view action) {
     Logger::Info("loop",
                  "event=loop_detected request=" + std::to_string(request->id) +
-                     " phase=" + (found->reasoning ? "reasoning" : "answer") +
-                     " rule=" + std::string(found->rule) +
-                     " period=" + std::to_string(found->period) +
-                     " repeats=" + std::to_string(found->repeats) +
-                     " generated_tokens=" + std::to_string(found->tokens) +
+                     " phase=" + (found.reasoning ? "reasoning" : "answer") +
+                     " rule=" + std::string(found.rule) +
+                     " period=" + std::to_string(found.period) +
+                     " repeats=" + std::to_string(found.repeats) +
+                     " generated_tokens=" + std::to_string(found.tokens) +
                      " action=" + std::string(action));
-    if (!stop)
-      return true;
-    try {
-      CompleteSuccess(request,
-                      TextGenerationBackend::FinishReason::kLoopDetected);
-    } catch (...) {
-      CompleteFailure(request, std::current_exception());
-    }
-    return false;
+  }
+
+  // After a step's publication and accounting: stop sequences first, then a
+  // loop stop, otherwise resolve a pending reasoning loop.
+  [[nodiscard]] static bool PublicationStopped(
+      const std::shared_ptr<ScheduledRequest>& request) {
+    return request->stop_filter.stopped() || request->loop_stop;
   }
 
   void FinishAdvanced(const std::shared_ptr<ScheduledRequest>& request,
@@ -2067,7 +2096,7 @@ struct TextGenerationScheduler::Impl {
         if (!PublishDecodedSelection(request, selection)) {
           return;
         }
-        if (request->stop_filter.stopped())
+        if (PublicationStopped(request))
           break;
       }
 
@@ -2078,6 +2107,13 @@ struct TextGenerationScheduler::Impl {
       if (request->stop_filter.stopped()) {
         CompleteSuccess(request,
                         TextGenerationBackend::FinishReason::kStopSequence);
+        return;
+      }
+      if (!request->loop_stop && !step.stop)
+        ResolveLoop(request);
+      if (request->loop_stop) {
+        CompleteSuccess(request,
+                        TextGenerationBackend::FinishReason::kLoopDetected);
         return;
       }
       if (step.stop) {
@@ -2510,21 +2546,29 @@ struct TextGenerationScheduler::Impl {
           published = false;
           break;
         }
-        if (item.request->stop_filter.stopped())
+        if (PublicationStopped(item.request))
           break;
+      }
+      // A failed publication already published the terminal result, which
+      // its consumer may be reading: account only live requests.
+      if (!published || IsTerminal(item.request)) {
+        continue;
       }
       item.request->result.decode_ms +=
           std::chrono::duration<double, std::milli>(Clock::now() -
                                                     item.decode_start)
               .count();
       LogDecodeProgress(item.request);
-      if (!published || IsTerminal(item.request)) {
-        continue;
-      }
       try {
+        if (!item.request->stop_filter.stopped() && !item.request->loop_stop &&
+            !step.stop)
+          ResolveLoop(item.request);
         if (item.request->stop_filter.stopped()) {
           CompleteSuccess(item.request,
                           TextGenerationBackend::FinishReason::kStopSequence);
+        } else if (item.request->loop_stop) {
+          CompleteSuccess(item.request,
+                          TextGenerationBackend::FinishReason::kLoopDetected);
         } else if (step.stop) {
           PublishTerminalLogprobs(item.request, step.terminal_logprobs);
           CompleteSuccess(item.request,

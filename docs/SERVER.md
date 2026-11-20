@@ -1593,7 +1593,9 @@ remove are never kept. Three guards keep the exact rule (after Kyojin
   already generated (a continued reply's own text included) at least twice
   in its last 2048 tokens is not relaxed.
   That refusal also makes the next 512 generated tokens exact, a window that
-  doubles on each later refusal up to 16384.
+  doubles on each later refusal up to 16384. The window belongs to one
+  request: a continuation sent as a new request starts without one (the
+  continued text still counts toward its 12-token history).
 
 The output then no longer follows the sampling distribution exactly.
 Greedy requests never reach it; other models and Flash-Next without MTP
@@ -1612,7 +1614,10 @@ exllamav3 `805caee` and Kyojin's `loopguard`):
   generated before (answer options, list items) are transcription, not a
   loop, and over a tiny vocabulary only (near-)exact repetition counts;
 - line: inside an open thinking block, a line of at least 40 non-space
-  characters seen 3 times (outside a ``` code fence) is a loop.
+  characters seen 3 times (outside a ``` code fence) is a loop. Unlike
+  Kyojin's rule it is bounded: each sighting must come within 16 KiB of
+  thinking text after the previous one, and lines over 1 KiB are not
+  counted.
 
 Each detection is logged at INFO as `event=loop_detected request=ID
 phase=reasoning|answer rule=period|line period=N repeats=N
@@ -1623,17 +1628,22 @@ server with `--loop-guard on` or send `loop_guard: true` (a Gufo extension;
 a boolean, `null` inherits). Then a loop inside thinking closes the block:
 the next tokens are the model's forced reasoning end (Qwen's `\n</think>`,
 after the current UTF-8 character completes), as when a reasoning budget
-runs out, and the reply continues with its answer (`action=close`). Greedy
-requests keep their fast argmax paths and track no phase for the guard
-alone, so without a reasoning budget, an answer-scoped Han scale or a
-phase-dependent logit bias a looping thinking block of a greedy request
-ends the reply instead, as does
-one whose reasoning the sampler already ended where the monitor saw no end
-token. A loop in the answer
+runs out, and the reply continues with its answer (`action=close`). The
+guard needs the reasoning phase tracked, so a greedy request with the guard
+on also leaves Gufo's unmodified-argmax fast paths, as with a reasoning
+budget; requests with the guard off are unchanged. A speculative step is
+published whole first: when the step itself ends reasoning after the loop
+(a `</think>` or a tool call), nothing is forced (`action=closed`), and
+otherwise the forced end follows the step. A thinking block whose reasoning
+the sampler already ended where the monitor saw no end token (a close a
+grammar accepted as text) ends the reply instead (`action=stop`). The
+guard is per request: a continued reply (a new HTTP request) starts with
+fresh detectors, as typical acceptance starts a fresh exact window. A loop in the answer
 ends the reply (`action=stop`) with the internal finish reason
 `loop_detected`: Chat Completions and Completions report `finish_reason:
 "stop"`, Messages `stop_reason: "end_turn"` (or `tool_use`), Responses a
-completed response; the native `/completion` reports `stopped_eos: false`
+completed response (a stream whose stop cut a tool call it had already
+opened ends `incomplete`, as for a stop sequence); the native `/completion` reports `stopped_eos: false`
 and the Gufo `stopped_loop: true`. Chat usage reports Gufo `loop_detected`,
 `loop_closed_reasoning` and `loop_stopped`, traces record the finish
 `loop_detected`, and `/props` reports the default `loop_guard`. Raw

@@ -3748,6 +3748,118 @@ void TestStopInsideToolArguments() {
   }
 }
 
+// A loop the guard ended (finish reason loop_detected) is a stop in Chat.
+// Responses completes; a stream whose stop cut a tool call it had already
+// opened ends incomplete, as for a stop sequence. Calls completed before the
+// stop are kept either way.
+void TestLoopStopAcrossAdapters() {
+  using Finish = gufo::server::TextGenerationBackend::FinishReason;
+  using gufo::json::Value;
+  for (const bool responses : {false, true}) {
+    for (const bool stream : {false, true}) {
+      for (const bool interrupted : {false, true}) {
+        FakeBackend backend;
+        backend.finish_reason = Finish::kLoopDetected;
+        // A known format streams calls as they are generated.
+        backend.tool_format = gufo::sampling::JsonConstraint::ToolFormat::kQwen;
+        std::string raw =
+            "safe<tool_call>\n<function=f>\n<parameter=text>\ndone\n"
+            "</parameter>\n</function>\n</tool_call>";
+        if (interrupted)
+          raw += "<tool_call>\n<function=f>\n<parameter=text>\npart";
+        for (const char byte : raw)
+          backend.pieces.emplace_back(1, byte);
+        auto body = gufo::json::parse(
+            R"({"model":"test-model","reasoning_effort":"none",
+                "messages":[{"role":"user","content":"call f"}],
+                "tools":[{"type":"function","function":{"name":"f",
+                  "parameters":{"type":"object","properties":{
+                    "text":{"type":"string"}}},"strict":false}}],
+                "tool_choice":"auto"})");
+        body["stream"] = stream;
+        gufo::server::HttpResponse response;
+        if (responses) {
+          auto flat = *body["tools"].items()[0].find("function");
+          flat["type"] = "function";
+          body["tools"] = Value::array();
+          body["tools"].push_back(std::move(flat));
+          gufo::server::ChatRequest chat;
+          chat.reasoning.enabled = false;
+          Expect(!gufo::server::ParseOpenAiResponseControls(body, &chat),
+                 "Responses accepts the loop-stop fixture");
+          response = gufo::server::CreateOpenAiResponse(
+              Request(body.dump()), backend, chat, 256, {}, stream);
+        } else {
+          response =
+              gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+        }
+        Expect(response.status == 200, "a loop-stopped reply succeeds");
+        std::vector<Value> events;
+        if (stream)
+          response.streaming_body([&](std::string_view chunk) {
+            for (std::size_t pos = chunk.find("data: ");
+                 pos != std::string_view::npos;
+                 pos = chunk.find("data: ", pos + 6)) {
+              auto data = chunk.substr(pos + 6);
+              data = data.substr(0, data.find('\n'));
+              if (!data.starts_with("[DONE]"))
+                events.push_back(gufo::json::parse(data));
+            }
+            return true;
+          });
+        else
+          events.push_back(gufo::json::parse(response.body));
+        std::size_t calls = 0;
+        std::string status;
+        std::string finish;
+        for (const auto& event : events) {
+          if (responses) {
+            const auto* result = stream ? event.find("response") : &event;
+            const auto type = event.member_str("type");
+            if (!result || (stream && type != "response.completed" &&
+                            type != "response.incomplete"))
+              continue;
+            status = result->member_str("status");
+            for (const auto& item : result->find("output")->items())
+              calls += item.member_str("type") == "function_call" &&
+                       item.member_str("status") == "completed";
+          } else {
+            for (const auto& choice : event.find("choices")->items()) {
+              if (const auto* reason = choice.find("finish_reason");
+                  reason && reason->is_string())
+                finish = reason->str();
+              const auto* message = choice.find(stream ? "delta" : "message");
+              if (const auto* list =
+                      message ? message->find("tool_calls") : nullptr)
+                for (const auto& call : list->items())
+                  calls += !stream || call.find("id") != nullptr;
+            }
+          }
+        }
+        // A Chat stream has already sent the cut call's prefix; complete
+        // calls are what the other replies keep.
+        const std::size_t expected_calls =
+            !responses && stream && interrupted ? 2 : 1;
+        Expect(calls == expected_calls,
+               "the call completed before the loop stop is kept: " +
+                   std::to_string(calls) +
+                   (responses ? " responses" : " chat") +
+                   (stream ? " stream" : " buffered") +
+                   (interrupted ? " interrupted" : " complete") + " " + status);
+        if (responses)
+          // Only a stream has already opened the cut call's item.
+          Expect(status == (stream && interrupted ? "incomplete" : "completed"),
+                 "Responses completes unless a streamed stop cut a tool "
+                 "call: " +
+                     status + (stream ? " stream" : " buffered") +
+                     (interrupted ? " interrupted" : " complete"));
+        else
+          Expect(finish == "stop", "Chat reports a loop stop as stop");
+      }
+    }
+  }
+}
+
 void TestNativeToolImplicitReasoningEnd() {
   using Format = gufo::sampling::JsonConstraint::ToolFormat;
   using Finish = gufo::server::TextGenerationBackend::FinishReason;
@@ -8265,6 +8377,7 @@ int main() {
   TestStrictToolSchema();
   TestExplicitStopOutputFraming();
   TestStopInsideToolArguments();
+  TestLoopStopAcrossAdapters();
   TestResponsesOutput();
   TestChatUsageReportsReasoningTokens();
   TestResponsesLogprobs();

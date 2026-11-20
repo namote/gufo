@@ -481,9 +481,9 @@ std::shared_ptr<const sampling::ReasoningBudget> RequestReasoning(
        sampling.han_scale != 1.0F && han_tokens && han_tokens->count != 0) ||
       (sampling.logit_bias && sampling.logit_bias->phase_dependent()) ||
       (sampling.typical_acceptance && sampling.uses_random_sampling()) ||
-      // Greedy keeps its unmodified-argmax paths: its loop guard stops a
-      // looping reasoning block instead of closing it.
-      (sampling.loop_guard && sampling.temperature > 0.0F))
+      // Greedy too: a tracked phase leaves the unmodified-argmax paths, a
+      // cost only requests with the guard on pay.
+      sampling.loop_guard)
     return build(sampling::ReasoningBudget::kUnlimited);
   return nullptr;
 }

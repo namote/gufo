@@ -323,8 +323,12 @@ std::optional<TokenLoopDetector::Detection> TokenLoopDetector::Feed(
 bool LineRepeatDetector::Feed(std::string_view text) {
   bool found = false;
   for (const char c : text) {
+    ++offset_;
     if (c != '\n') {
-      line_.push_back(c);
+      if (line_.size() < kMaxLineBytes)
+        line_.push_back(c);
+      else
+        line_overflow_ = true;
       continue;
     }
     constexpr std::string_view kSpace = " \t\r\f\v";
@@ -335,26 +339,43 @@ bool LineRepeatDetector::Feed(std::string_view text) {
                : line.substr(first, line.find_last_not_of(kSpace) - first + 1);
     if (line.starts_with("```")) {
       fence_ = !fence_;
-    } else if (!fence_) {
+    } else if (!fence_ && !line_overflow_) {
       // Characters, not bytes: count UTF-8 lead bytes other than spaces/tabs.
       std::size_t chars = 0;
       for (const char byte : line)
         chars += byte != ' ' && byte != '\t' &&
                  (static_cast<unsigned char>(byte) & 0xC0U) != 0x80U;
-      if (chars >= kMinChars &&
-          ++seen_[std::hash<std::string_view>{}(line)] >= kRepeats &&
-          !detected_) {
-        detected_ = true;
-        found = true;
+      if (chars >= kMinChars) {
+        if (seen_.size() >= kMaxLines) {
+          // Forget lines no later sighting can count with.
+          std::erase_if(seen_, [&](const auto& entry) {
+            return offset_ - entry.second.offset > kWindowBytes;
+          });
+          if (seen_.size() >= kMaxLines)
+            seen_.clear();
+        }
+        auto& sighting = seen_[std::hash<std::string_view>{}(line)];
+        sighting.count =
+            sighting.count != 0 && offset_ - sighting.offset <= kWindowBytes
+                ? sighting.count + 1
+                : 1;
+        sighting.offset = offset_;
+        if (sighting.count >= kRepeats && !detected_) {
+          detected_ = true;
+          found = true;
+        }
       }
     }
     line_.clear();
+    line_overflow_ = false;
   }
   return found;
 }
 
 void LineRepeatDetector::Reset() {
   line_.clear();
+  line_overflow_ = false;
+  offset_ = 0;
   fence_ = false;
   detected_ = false;
   seen_.clear();

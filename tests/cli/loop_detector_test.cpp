@@ -152,6 +152,37 @@ void TestLineRule() {
          "the minimum counts characters");
 }
 
+// The line rule is bounded: sightings count only within 16 KiB of text of
+// each other, overlong lines are not counted, and the remembered lines stay
+// capped without losing a recent repeat.
+void TestLineRuleBounds() {
+  const std::string line =
+      "This sentence is long enough to count as a repeated thinking line.\n";
+  std::string filler;
+  std::size_t serial = 0;
+  while (filler.size() <= LineRepeatDetector::kWindowBytes)
+    filler += "unique filler line number " + std::to_string(serial++) +
+              " that never repeats anywhere at all\n";
+  LineRepeatDetector spread;
+  Expect(!spread.Feed(line + filler + line + filler + line + filler),
+         "sightings far apart are not a loop");
+  Expect(spread.Feed(line + line + line), "close sightings still are");
+
+  LineRepeatDetector overlong;
+  const std::string huge(LineRepeatDetector::kMaxLineBytes + 10, 'x');
+  Expect(!overlong.Feed(huge + "\n" + huge + "\n" + huge + "\n"),
+         "overlong lines are not counted");
+
+  LineRepeatDetector capped;
+  std::string many;
+  for (std::size_t i = 0; i < 3 * LineRepeatDetector::kMaxLines; ++i)
+    many += "distinct line " + std::to_string(i) +
+            " with enough text to be counted by the rule\n";
+  Expect(!capped.Feed(many), "distinct lines are not a loop");
+  Expect(capped.Feed(line + line + line),
+         "a repeat after many distinct lines is still found");
+}
+
 // The monitor applies the line rule only while reasoning, reports the phase,
 // reports once per phase and starts fresh after the reasoning end.
 void TestMonitor() {
@@ -216,6 +247,7 @@ int main() {
   TestLowDiversity();
   TestNearRepetition();
   TestLineRule();
+  TestLineRuleBounds();
   TestMonitor();
   TestPromptTranscription();
   std::cout << "All loop detector tests passed.\n";

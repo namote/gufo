@@ -107,11 +107,16 @@ private:
 /// Kyojin's long-period thinking rule (`tools/loopguard.py` LineRepeat): a
 /// complete line of at least 40 non-space characters (compared after
 /// trimming) seen 3 times is a loop. Lines inside a ``` fence are not
-/// counted: code repeats its own lines.
+/// counted: code repeats its own lines. Unlike Kyojin's rule it is bounded: a
+/// sighting counts only within 16 KiB of text after the previous one, lines
+/// over 1 KiB are not counted, and at most 1024 lines are remembered.
 class LineRepeatDetector {
 public:
   static constexpr std::size_t kMinChars = 40;
   static constexpr std::size_t kRepeats = 3;
+  static constexpr std::size_t kWindowBytes = 16384;
+  static constexpr std::size_t kMaxLineBytes = 1024;
+  static constexpr std::size_t kMaxLines = 1024;
 
   /// Returns true the first time a line reaches kRepeats sightings;
   /// detection latches until Reset.
@@ -120,10 +125,17 @@ public:
   void Reset();
 
 private:
+  struct Sighting {
+    std::size_t count{0};
+    std::uint64_t offset{0};  ///< text offset of the latest sighting
+  };
+
   std::string line_;
+  bool line_overflow_{false};
+  std::uint64_t offset_{0};
   bool fence_{false};
   bool detected_{false};
-  std::unordered_map<std::uint64_t, std::size_t> seen_;
+  std::unordered_map<std::uint64_t, Sighting> seen_;
 };
 
 /// Where a reply is when a loop is found, and which rule found it.
