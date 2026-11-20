@@ -1286,8 +1286,7 @@ void TestHistoricalTypedArgumentsUseTojson() {
       "Typed historical numbers keep their spelling");
 }
 
-// A small exponent the model spelled 1e-7 canonicalizes to 1e-07, which the
-// number grammar rejects; the check also reads the model's spelling.
+// A small exponent remains valid through recovered-call schema checking.
 void TestSchemaCheckedSmallExponentKept() {
   gufo::server::ChatRequest chat;
   chat.reasoning.enabled = true;
@@ -1363,6 +1362,72 @@ void TestSchemaCheckedNumbersKeepSpelling() {
                      R"({"count":1.0,"id":9007199254740993,"ratio":1e5})",
              "schema-checked calls keep the model's number spelling");
     }
+}
+
+void TestRecoveredNumberLeaves() {
+  struct Case {
+    std::string schema, arguments;
+    bool accepted;
+  };
+  for (
+      const auto& fixture :
+      {Case{
+           R"({"type":"object","properties":{"count":{"type":"integer"},"ratio":{"type":"number"}},"required":["count","ratio"],"additionalProperties":false})",
+           R"({"count":1.0,"ratio":1e-7})", true},
+       Case{
+           R"({"type":"object","properties":{"count":{"type":"integer"},"id":{"type":"integer","maximum":9007199254740994}},"required":["count","id"],"additionalProperties":false})",
+           R"({"count":1.0,"id":9007199254740994})", true},
+       Case{
+           R"({"type":"object","properties":{"count":{"type":"integer"},"ids":{"type":"array","items":{"type":"integer","maximum":9007199254740992}}},"required":["count","ids"],"additionalProperties":false})",
+           R"({"count":1.0,"ids":[9007199254740993]})", false},
+       Case{
+           R"({"type":"object","properties":{"count":{"type":"integer"},"ids":{"type":"array","items":{"type":"integer","minimum":9007199254740996}}},"required":["count","ids"],"additionalProperties":false})",
+           R"({"count":1.0,"ids":[9007199254740995]})", false},
+       Case{
+           R"({"type":"object","properties":{"count":{"type":"integer"},"nested":{"type":"object","properties":{"id":{"type":"integer","maximum":9007199254740994},"ratio":{"type":"number"}},"required":["id","ratio"],"additionalProperties":false}},"required":["count","nested"],"additionalProperties":false})",
+           R"({"count":1.0,"nested":{"id":9007199254740993,"ratio":1e-7}})",
+           true}}) {
+    for (const bool stream : {false, true}) {
+      gufo::server::ChatRequest chat;
+      chat.reasoning.enabled = true;
+      auto controls = gufo::json::parse(
+          R"({"tools":[{"type":"function","name":"f","parameters":)" +
+          fixture.schema + "}]}");
+      Expect(!gufo::server::ParseOpenAiResponseControls(controls, &chat),
+             "recovered number fixture has valid controls");
+      chat.constrained_tools = false;
+      FakeBackend backend;
+      backend.pieces = {
+          "Check `foo then\n<tool_call>{\"name\":\"f\",\"arguments\":" +
+          fixture.arguments + "}</tool_call>"};
+      const auto response = gufo::server::CreateOpenAiResponse(
+          Request("{}"), backend, chat, 512, {}, stream);
+      gufo::json::Value output;
+      if (!stream)
+        output = gufo::json::parse(response.body);
+      else
+        response.streaming_body([&](std::string_view chunk) {
+          const auto event =
+              gufo::json::parse(chunk.substr(chunk.find("data: ") + 6));
+          if (event.member_str("type") == "response.completed")
+            output = *event.find("response");
+          return true;
+        });
+      std::vector<std::string> arguments;
+      for (const auto& part : output.find("output")->items())
+        if (part.member_str("type") == "function_call")
+          arguments.push_back(part.member_str("arguments"));
+      if (arguments.size() != (fixture.accepted ? 1u : 0u))
+        std::cerr << "Recovered number leaves: arguments=" << fixture.arguments
+                  << " stream=" << stream << " calls=" << arguments.size()
+                  << '\n';
+      Expect(arguments.size() == (fixture.accepted ? 1u : 0u),
+             "recovered call checks each number's exact value");
+      if (fixture.accepted && arguments.size() == 1)
+        Expect(arguments.front() == fixture.arguments,
+               "recovered call preserves the original argument spelling");
+    }
+  }
 }
 
 void TestMalformedHistoricalFunctions() {
@@ -8108,6 +8173,7 @@ int main() {
   TestHistoricalTypedArgumentsUseTojson();
   TestSchemaCheckedNumbersKeepSpelling();
   TestSchemaCheckedSmallExponentKept();
+  TestRecoveredNumberLeaves();
   TestStreamingPromptProgress();
   TestResponsesPromptProgress();
   TestToolMarkersInsideConstrainedReasoning();

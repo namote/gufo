@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <optional>
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
@@ -43,8 +44,13 @@ public:
   /// How dump() and tojson() write numbers read by parse(). kCanonical
   /// spells every number from its double; kAsParsed writes the token parse()
   /// read, as llama.cpp returns tool-call arguments. Numbers built from C++
-  /// values are always canonical.
-  enum class Numbers : std::uint8_t { kCanonical, kAsParsed };
+  /// values are always canonical. kCanonicalIfExact substitutes the canonical
+  /// spelling per leaf only when its decimal value equals the parsed token.
+  enum class Numbers : std::uint8_t {
+    kCanonical,
+    kAsParsed,
+    kCanonicalIfExact
+  };
 
   Value() = default;
   Value(std::nullptr_t) {}
@@ -210,6 +216,50 @@ public:
 private:
   friend struct detail::Parser;
 
+  // Compare decimal values without rounding through double. Normalize to
+  // signed significant digits and a base-ten exponent; no powers of ten or
+  // exponent-sized buffers are needed. Unrepresentable exponents conservatively
+  // keep the parsed spelling.
+  static auto DecimalIdentity(std::string_view text)
+      -> std::optional<std::pair<std::string, std::int64_t>> {
+    const bool negative = text.starts_with('-');
+    if (negative)
+      text.remove_prefix(1);
+    const auto exponent_at = text.find_first_of("eE");
+    std::int64_t exponent = 0;
+    if (exponent_at != std::string_view::npos) {
+      auto power = text.substr(exponent_at + 1);
+      if (power.starts_with('+'))
+        power.remove_prefix(1);
+      const auto [end, error] =
+          std::from_chars(power.data(), power.data() + power.size(), exponent);
+      if (error != std::errc{} || end != power.data() + power.size())
+        return std::nullopt;
+      text = text.substr(0, exponent_at);
+    }
+    std::string digits(text);
+    if (const auto point = digits.find('.'); point != std::string::npos) {
+      const auto places = static_cast<std::int64_t>(digits.size() - point - 1);
+      if (exponent < std::numeric_limits<std::int64_t>::min() + places)
+        return std::nullopt;
+      exponent -= places;
+      digits.erase(point, 1);
+    }
+    const auto first = digits.find_first_not_of('0');
+    if (first == std::string::npos)
+      return std::pair{std::string("0"), std::int64_t{0}};
+    digits.erase(0, first);
+    while (digits.back() == '0') {
+      if (exponent == std::numeric_limits<std::int64_t>::max())
+        return std::nullopt;
+      digits.pop_back();
+      ++exponent;
+    }
+    if (negative)
+      digits.insert(digits.begin(), '-');
+    return std::pair{std::move(digits), exponent};
+  }
+
   // NOLINTNEXTLINE(misc-no-recursion)
   void dump_to(std::ostream& os, bool spaced, Numbers numbers) const {
     switch (type_) {
@@ -220,7 +270,13 @@ private:
         os << (bool_ ? "true" : "false");
         break;
       case Type::kNumber: {
-        if (numbers == Numbers::kAsParsed && !str_.empty()) {
+        // An integer token already suits the integer grammar. Even an exact
+        // double above 2^53 may serialize with a decimal point/exponent.
+        const bool parsed_integer =
+            numbers == Numbers::kCanonicalIfExact &&
+            str_.find_first_of(".eE") == std::string::npos;
+        if (!str_.empty() &&
+            (numbers == Numbers::kAsParsed || parsed_integer)) {
           os << str_;
           break;
         }
@@ -243,7 +299,21 @@ private:
         if (error != std::errc{}) {
           throw std::runtime_error("JSON number serialization failed");
         }
-        os.write(buffer, end - buffer);
+        std::string spelling(buffer, end);
+        // The native number grammar accepts e-7, but not e-07.
+        if (const auto e = spelling.find('e'); e != std::string::npos) {
+          auto digit = e + 1;
+          if (spelling[digit] == '+' || spelling[digit] == '-')
+            ++digit;
+          while (digit + 1 < spelling.size() && spelling[digit] == '0')
+            spelling.erase(digit, 1);
+        }
+        if (numbers == Numbers::kCanonicalIfExact && !str_.empty()) {
+          const auto original = DecimalIdentity(str_);
+          if (!original || original != DecimalIdentity(spelling))
+            spelling = str_;
+        }
+        os << spelling;
         break;
       }
       case Type::kString:

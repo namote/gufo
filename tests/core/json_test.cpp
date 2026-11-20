@@ -53,7 +53,7 @@ void TestNumbers() {
            {"0.5", "0.5"},
            {"12345.678", "12345.678"},
            {"1e16", "1e+16"},
-           {"1e-7", "1e-07"}}) {
+           {"1e-7", "1e-7"}}) {
     assert(parse(input).dump() == expected);
     assert(parse(input).tojson() == expected);
   }
@@ -72,6 +72,27 @@ void TestNumbers() {
   assert(parse(R"({"a":[1.0,{"b":1e5}]})").tojson(kAsParsed) ==
          R"({"a": [1.0, {"b": 1e5}]})");
   assert(parse("9007199254740993").as_double() == 9007199254740992.0);
+  constexpr auto kExact = Value::Numbers::kCanonicalIfExact;
+  for (const auto& [input, expected] :
+       std::initializer_list<std::pair<const char*, const char*>>{
+           {"1.0", "1"},
+           {"1E+05", "100000"},
+           {"1e-07", "1e-7"},
+           {"10e-8", "1e-7"},
+           {"-0.0", "-0"},
+           {"0e10", "0"},
+           {"9007199254740993", "9007199254740993"},
+           {"9007199254740994", "9007199254740994"},
+           {"9007199254740993.0", "9007199254740993.0"},
+           {"9.007199254740993e15", "9.007199254740993e15"},
+           {"0.1234567890123456789", "0.1234567890123456789"},
+           {"9007199254740992.0", "9007199254740992"}}) {
+    assert(parse(input).dump(kExact) == expected);
+    assert(parse(input).tojson(kExact) == expected);
+  }
+  assert(
+      parse(R"({"a":[1.0,{"n":9007199254740993}],"b":1e-07})").dump(kExact) ==
+      R"({"a":[1,{"n":9007199254740993}],"b":1e-7})");
   // Numbers built from C++ values, or replacing a parsed one, are canonical.
   assert(Value(1.0).dump(kAsParsed) == "1");
   auto edited = parse(R"({"n":1.0})");
