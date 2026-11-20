@@ -123,6 +123,24 @@ struct DurableCapture {
 // retain). Nothing is lent from the slot, so later execution, restores and
 // resets leave it intact. Restoring it into its slot re-maps the retained
 // rows and copies only the host pieces back.
+// Bytes charged against a counter until destroyed (or released).
+struct ArenaCharge {
+  std::atomic<std::size_t>* charged{};
+  std::size_t bytes{};
+  ArenaCharge() = default;
+  ArenaCharge(const ArenaCharge&) = delete;
+  ArenaCharge& operator=(const ArenaCharge&) = delete;
+  ~ArenaCharge() {
+    if (charged)
+      charged->fetch_sub(bytes);
+  }
+};
+// The host arenas of a rewind point, charged for whole arenas until the last
+// holder (the point's pieces, or a disk job reading them) drops them.
+struct RewindArenas {
+  std::vector<std::shared_ptr<const void>> arenas;
+  ArenaCharge charge;
+};
 struct RewindPoint {
   cache::ResourceCharge metadata;
   std::vector<cache::Token> tokens;
@@ -143,8 +161,19 @@ struct RewindPoint {
   // In component order, rows ascending.
   std::vector<Piece> pieces;
   std::size_t host_bytes{}, device_bytes{};
-  // Snapshot-arena bytes its host pieces occupy (whole arenas).
+  // Snapshot-arena bytes its host pieces occupy (whole arenas), and their
+  // holder, which each host piece's owner shares.
   std::size_t arena_bytes{};
+  std::weak_ptr<RewindArenas> arenas;
+  std::size_t host_pieces{};
+  // Under the mutex: the arena bytes dropping this point returns, which is
+  // none while a disk job still reads its pieces.
+  [[nodiscard]] std::size_t ReleasableArenaBytes() const {
+    const auto holders = arenas.use_count();
+    return holders && static_cast<std::size_t>(holders) == host_pieces
+               ? arena_bytes
+               : 0;
+  }
   // False for a request that keeps its prompt off the disk.
   bool persist{true};
   // The disk job last queued for it, while it is pending (under the cache
@@ -1784,15 +1813,17 @@ ComponentTextCache::Lease::Impl::CaptureRewind() {
   {
     const std::lock_guard lock(cache->mutex);
     if (rewind_point)
-      credit += rewind_point->arena_bytes;
+      credit += rewind_point->ReleasableArenaBytes();
     if (entry->rewind && entry->rewind != rewind_point &&
         ComponentTextCache::Impl::Prefixes(entry->rewind->tokens,
                                            capture_tokens))
-      credit += entry->rewind->arena_bytes;
+      credit += entry->rewind->ReleasableArenaBytes();
   }
   shared.clear();
   previous.reset();
-  std::size_t reserved = 0;
+  // The reservation is held from the exchange on: any later failure or
+  // exception returns it, success hands it to the arenas' holder.
+  auto arenas = std::make_shared<RewindArenas>();
   const auto admit = [&](std::size_t need) {
     auto charged = cache->rewind_arena_bytes.load();
     do {
@@ -1800,38 +1831,19 @@ ComponentTextCache::Lease::Impl::CaptureRewind() {
         return false;
     } while (!cache->rewind_arena_bytes.compare_exchange_weak(charged,
                                                               charged + need));
-    reserved = need;
+    arenas->charge.charged = &cache->rewind_arena_bytes;
+    arenas->charge.bytes = need;
     return true;
   };
   SnapshotStats stats;
   std::vector<std::shared_ptr<const void>> hosted;
   if (const auto reason =
           HostCopy(staged, nullptr, stats, false, &hosted, admit);
-      !reason.empty()) {
-    cache->rewind_arena_bytes.fetch_sub(reserved);
+      !reason.empty())
     return refused(reason, point->host_bytes);
-  }
-  // Charged for its whole arenas until the last holder (this point, or a
-  // disk job of it) drops them.
-  struct RewindArenas {
-    std::vector<std::shared_ptr<const void>> arenas;
-    std::atomic<std::size_t>* charged{};
-    std::size_t bytes{};
-    ~RewindArenas() {
-      if (charged)
-        charged->fetch_sub(bytes);
-    }
-  };
-  std::shared_ptr<RewindArenas> arenas;
-  try {
-    arenas = std::make_shared<RewindArenas>();
-  } catch (...) {
-    cache->rewind_arena_bytes.fetch_sub(reserved);
-    throw;
-  }
-  arenas->charged = &cache->rewind_arena_bytes;
-  arenas->bytes = reserved;
-  point->arena_bytes = reserved;
+  point->arena_bytes = arenas->charge.bytes;
+  point->arenas = arenas;
+  point->host_pieces = staged.size();
   for (std::size_t i = 0; i < staged.size(); ++i) {
     auto& piece = point->pieces[staged_at[i]];
     const auto* data = static_cast<const std::byte*>(hosted[i].get());

@@ -3650,6 +3650,49 @@ void RefusedReplacementKeepsTheOlderPoint() {
   const auto [cached, disk_hit] = turn(a);
   assert(cached == a_first && !disk_hit);
 }
+void QueuedWriteKeepsTheOlderPointsArenasCharged() {
+  // A replacement is credited only with arenas dropping the older point
+  // returns. While a queued disk write still reads them, the 9-arena
+  // replacement does not fit beside the 7-arena older point, so it is
+  // refused and the older point keeps serving.
+  const TemporaryDirectory temp("gufo-component-rewind-queued-test");
+  const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
+                                        .capacity_bytes = 1 << 24,
+                                        .min_checkpoint_step_tokens = 64};
+  auto runner = std::make_shared<Runner>();
+  runner->retain_rows = true;
+  runner->snapshot_bytes = 4 * (768 << 10);  // twelve 64 KiB arenas
+  TextRunnerPool pool(runner, 2, disk);
+  DroppingChat chat;
+  chat.Turn(300);
+  const auto turn = [&] {
+    auto request = ChatTurn(pool, chat);
+    const auto cached = request.cached_prompt_tokens();
+    const bool disk_hit = request.cache_disk_hit();
+    Prefill(request);
+    for (int i = 0; i < 5; ++i)
+      (void)Generate(request);
+    (void)request.Commit();
+    return std::pair(cached, disk_hit);
+  };
+  (void)turn();
+  assert(WaitWritten(pool));
+  // The writer yields (up to its limit, far beyond this test) while a peer
+  // request runs: the point's disk write stays queued.
+  std::vector<TextRunnerToken> other(64);
+  std::iota(other.begin(), other.end(), 70000);
+  auto peer = pool.Acquire(other);
+  chat.Turn(100);
+  (void)turn();  // a 7-arena point, also queued for the disk
+  const auto first = chat.stable;
+  chat.Turn(100);
+  const auto [rewound, rewound_disk] = turn();
+  assert(rewound == first && !rewound_disk);
+  chat.Turn(100);
+  const auto [cached, disk_hit] = turn();
+  assert(cached == first && !disk_hit);
+  peer.Invalidate();
+}
 void VerbatimReplayKeepsNoRewindPoint() {
   // A client that sends the reply back as generated continues the live
   // frontier: no stop at its stable boundary, no rewind point.
@@ -3791,6 +3834,7 @@ int main(int argc, char** argv) {
       CASE(FailedRewindFallsBackAndStaysExact()),
       CASE(RewindArenasAreChargedWhole()),
       CASE(RefusedReplacementKeepsTheOlderPoint()),
+      CASE(QueuedWriteKeepsTheOlderPointsArenasCharged()),
       CASE(VerbatimReplayKeepsNoRewindPoint()),
       CASE(ReassignedRewindPointReachesDisk()),
   };

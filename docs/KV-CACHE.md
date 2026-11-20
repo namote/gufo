@@ -612,7 +612,8 @@ blocks, no copy), and host copies of private states, partial tails and rows
 it cannot retain, in the snapshot arenas. Points and their queued disk
 writes together occupy at most a quarter of those arenas, counted in whole
 arenas with page padding and reserved before any arena is taken. A slot's
-new point is credited with its older point's arenas, but the older point is
+new point is credited with the arenas dropping its older point returns (none
+while a queued disk write still reads them), but the older point is
 released only once the new one is admitted and copied: a refused replacement
 keeps the older point usable. A refused point also leaves the ordinary disk
 capture of that boundary, as without rewind points. Nothing is lent from the slot, so later execution leaves
