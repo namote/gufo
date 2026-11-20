@@ -4021,6 +4021,16 @@ bool InferenceBackend::load(
                 free_bytes)
           break;
       }
+      // The 4-bit draft head copy is optional: without room for the
+      // sessions, drafts read the EXL3 head prefix instead.
+      if (sessions * model->SessionBytes(core::SessionMode::kSpeculative,
+                                         max_context) +
+              model->DeferredScratchBytes() >
+          free_bytes) {
+        if (const auto freed = model->ReleaseDraftHeadCopy())
+          Logger::Info("loader", "event=draft_head_copy_released bytes=" +
+                                     std::to_string(freed));
+      }
     }
     // Allocate the decode batch and wide verification scratch before any
     // session, so no decode pass allocates device memory. What it allocates

@@ -90,8 +90,9 @@ public:
   const Config& config() const noexcept { return config_; }
   const DeviceTensor& token_embd() const noexcept { return token_embd_; }
   const DeviceTensor& output() const noexcept { return output_; }
-  /// The leading output() rows the MTP draft head scores in place (see
-  /// draft_vocab.hpp); empty when the draft projects the full vocabulary.
+  /// The leading output() rows the MTP draft head scores (see
+  /// draft_vocab.hpp): a Q4_K copy of an EXL3 head, else those rows in
+  /// place; empty when the draft projects the full vocabulary.
   const DeviceTensor& draft_output() const noexcept { return draft_output_; }
   /// Special tokens above the prefix: the first rows of each session's
   /// draft table.
@@ -102,14 +103,21 @@ public:
   std::size_t output_row_bytes() const noexcept {
     return output_.rows == 0 ? 0 : output_bytes_ / output_.rows;
   }
-  /// Drafts score output() rows [0, prefix_rows) in place plus a
-  /// per-session table that starts with `specials`. Draft proposals only
+  /// Drafts score output() rows [0, prefix_rows) plus a per-session table
+  /// that starts with `specials`. The prefix rows of an EXL3 head are
+  /// converted to a GGML Q4_K copy once, here (draft_output() then has type
+  /// kQ4_K and no EXL3 descriptor); the table rows keep the EXL3 head; other
+  /// heads are scored in place. Draft proposals only
   /// steer speculation: the target still verifies every token, so greedy
   /// text is unchanged. Sampled text can differ: a smaller head changes
   /// acceptance, and so the later random draws.
   [[nodiscard]] bool SetDraftVocab(std::uint32_t prefix_rows,
                                    std::vector<std::int32_t> specials,
                                    std::string* error_msg);
+  /// Frees the Q4_K draft head copy, so drafts read the EXL3 prefix in
+  /// place, when the sessions would not fit beside it. Only before any
+  /// executor pass or session uses it. Returns the bytes freed.
+  std::size_t ReleaseDraftHeadCopy() noexcept;
   const DeviceMixer& hc_head() const noexcept { return hc_head_; }
   const std::vector<DeviceLayer>& layers() const noexcept { return layers_; }
   [[nodiscard]] bool has_mtp() const noexcept { return has_mtp_; }

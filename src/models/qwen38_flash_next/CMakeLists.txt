@@ -73,7 +73,8 @@ if (ENGINE_ENABLE_HIP)
     ${QFN_ROCM_DIR}/attention_select.hip.cpp
     ${QFN_ROCM_DIR}/attention.hip.cpp
     ${QFN_ROCM_DIR}/moe_glue.hip.cpp
-    ${QFN_ROCM_DIR}/mtp.hip.cpp)
+    ${QFN_ROCM_DIR}/mtp.hip.cpp
+    ${QFN_ROCM_DIR}/draft_head.hip.cpp)
   # Host runtime: the device-resident model, the executor by stage and the
   # batched multi-session decode.
   set(QFN_RUNTIME_SOURCES
@@ -103,6 +104,9 @@ if (ENGINE_ENABLE_HIP)
     ${QFN_ROCM_DIR}/w8a8_wave64.hip.cpp PROPERTIES LANGUAGE HIP)
   set_source_files_properties(${QFN_ROCM_DIR}/w8a8_wave64.hip.cpp
     PROPERTIES COMPILE_OPTIONS "-mwavefrontsize64")
+  # The draft head quantizer keeps ggml's IEEE single-precision rounding.
+  set_source_files_properties(${QFN_ROCM_DIR}/draft_head.hip.cpp
+    PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
   target_compile_definitions(gufo_qwen38_flash_next PRIVATE QFN_ROCM_BUILD=1)
   target_compile_options(gufo_qwen38_flash_next PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O2>

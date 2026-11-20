@@ -69,6 +69,20 @@ DeviceTensor Executor::DraftTable(const Session& session) const noexcept {
 bool Executor::DraftLogits(const Session& session, const float* x,
                            float* logits, std::string* error_msg) const {
   const auto& prefix = model_->draft_output();
+  if (prefix.type == core::GgmlType::kQ4_K &&
+      model_->output().exl3 != nullptr) {
+    // The 4-bit prefix copy, then the table rows from the EXL3 head alone
+    // (a zero prefix selects every table row's segment).
+    if (!DraftPrefixQ4K(x, logits, error_msg))
+      return false;
+    Exl3DraftHead(model_->output(), x, logits + prefix.rows, 0,
+                  session.mtp_.draft_ids, kMtpDraftExtraRows, exl3_, stream_);
+    if (diagnostics_active_ &&
+        !DiagnosticCount(exl3_.head_segments, &cycle_diagnostics_.head_segments,
+                         error_msg))
+      return false;
+    return true;
+  }
   if (model_->output().exl3 != nullptr) {
     Exl3DraftHead(model_->output(), x, logits, prefix.rows,
                   session.mtp_.draft_ids, kMtpDraftExtraRows, exl3_, stream_);
@@ -85,6 +99,21 @@ bool Executor::DraftLogits(const Session& session, const float* x,
     return false;
   MaskDraftLogits(logits + prefix.rows, session.mtp_.draft_ids,
                   kMtpDraftExtraRows, stream_);
+  return true;
+}
+
+bool Executor::DraftPrefixQ4K(const float* x, float* logits,
+                              std::string* error_msg) const {
+  // One routed expert of one token: each row's logits are the same in any
+  // batch.
+  const auto& prefix = model_->draft_output();
+  if (s_.draft_head_ids == nullptr ||
+      qfn_mmq_moe_vec(static_cast<int>(core::GgmlType::kQ4_K), prefix.data, x,
+                      s_.draft_head_ids, logits, static_cast<int>(prefix.rows),
+                      static_cast<int>(prefix.cols), 1, 1, 1, stream_) != 0) {
+    AssignError(error_msg, "Q4_K draft head projection failed");
+    return false;
+  }
   return true;
 }
 

@@ -1158,6 +1158,10 @@ private:
   /// slots at -infinity.
   bool DraftLogits(const Session& session, const float* x, float* logits,
                    std::string* error_msg) const;
+  /// Logits of the Q4_K draft head prefix (DeviceModel::draft_output() of
+  /// an EXL3 head) for one row `x`.
+  bool DraftPrefixQ4K(const float* x, float* logits,
+                      std::string* error_msg) const;
   /// Selects the greedy token or compact candidates from MTP draft logits.
   /// With `draft`, the logits come from that session's small head and the
   /// returned IDs are remapped to token IDs.
@@ -1289,6 +1293,8 @@ private:
     float* mtp_res;
     ArgmaxCandidate* mtp_argmax;
     std::int32_t* mtp_token;
+    /// Expert IDs (all zero) of the Q4_K draft head prefix's rows.
+    std::int32_t* draft_head_ids;
     std::uint32_t* mtp_ids;
     std::uint32_t* mtp_scratch_ids;
     float* mtp_scores;

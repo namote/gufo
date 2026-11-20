@@ -655,10 +655,19 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
       if (!DenseBatch(full_head, base.mixed, batch_logits_, n, error))
         return false;
       for (std::uint32_t i = 0; i < n; ++i) {
-        if (slot[i] < subset_rows)
-          GatherDraftLogits(logits_of(i), items[i].session->mtp_.draft_ids,
-                            static_cast<std::uint32_t>(prefix),
-                            kMtpDraftExtraRows, stream_);
+        if (slot[i] >= subset_rows)
+          continue;
+        GatherDraftLogits(logits_of(i), items[i].session->mtp_.draft_ids,
+                          static_cast<std::uint32_t>(prefix),
+                          kMtpDraftExtraRows, stream_);
+        // A 4-bit prefix scores its rows as alone, after the gather read
+        // its table rows from the full head's values.
+        if (prefix_head.type == core::GgmlType::kQ4_K &&
+            full_head.exl3 != nullptr &&
+            !DraftPrefixQ4K(
+                base.mixed + std::size_t{slot[i]} * config().hidden_size,
+                logits_of(i), error))
+          return false;
       }
     } else if (subset_rows != 0 && full_head.exl3 != nullptr) {
       for (std::uint32_t i = 0; i < n; ++i)

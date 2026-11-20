@@ -4,8 +4,10 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
 #include <initializer_list>
 #include <map>
+#include <string>
 #include <utility>
 
 #include "src/core/hip/managed_alloc.hpp"
@@ -566,11 +568,79 @@ bool DeviceModel::SetDraftVocab(std::uint32_t prefix_rows,
         static_cast<std::uint32_t>(id) >= output_.rows)
       return fail("draft special tokens must lie above the prefix");
   }
-  // The prefix is the head's own leading rows: no copy.
   draft_output_ = output_;
   draft_output_.rows = prefix_rows;
+  if (output_.exl3 != nullptr && output_.output_begin == 0 &&
+      output_.cols % 256 == 0 && output_.exl3->k == output_.cols) {
+    // Drafts read a 4-bit (GGML Q4_K) copy of the EXL3 head's prefix (upstream
+    // #1209): the head is the larger part of each draft step's weight
+    // traffic, and its proposals are verified, so this changes acceptance
+    // only. The table rows above the prefix keep the EXL3 head.
+    // Optional: without it the draft reads the EXL3 prefix in place.
+    const std::size_t bytes =
+        std::size_t{prefix_rows} * (output_.cols / 256) * 144;
+    const std::size_t scratch_floats = DraftHeadQ4KChunkFloats(output_.cols);
+    void* q4k = nullptr;
+    float* scratch_a = nullptr;
+    float* scratch_b = nullptr;
+    std::string failure;
+    if (hip::AllocateDevice(&q4k, bytes + kTailMargin) != hipSuccess ||
+        hip::AllocateDevice(&scratch_a, scratch_floats * sizeof(float)) !=
+            hipSuccess ||
+        hip::AllocateDevice(&scratch_b, scratch_floats * sizeof(float)) !=
+            hipSuccess) {
+      failure = "device allocation failed";
+    } else {
+      try {
+        BuildDraftHeadQ4K(*output_.exl3, prefix_rows, q4k, scratch_a, scratch_b,
+                          nullptr);
+        if (hipMemsetAsync(static_cast<std::uint8_t*>(q4k) + bytes, 0,
+                           kTailMargin, nullptr) != hipSuccess)
+          failure = "tail clear failed";
+      } catch (const std::exception& e) {
+        failure = e.what();
+      }
+    }
+    // Queued kernels may still read the scratch until this returns.
+    if (hipStreamSynchronize(nullptr) != hipSuccess && failure.empty())
+      failure = "quantization failed";
+    (void)hipGetLastError();
+    (void)hipFree(scratch_a);
+    (void)hipFree(scratch_b);
+    if (failure.empty()) {
+      allocations_.push_back(q4k);
+      bytes_ += bytes + kTailMargin;
+      draft_output_.data = q4k;
+      draft_output_.type = core::GgmlType::kQ4_K;
+      draft_output_.exl3 = nullptr;
+      draft_output_.device_exl3 = nullptr;
+    } else {
+      (void)hipFree(q4k);
+      std::fprintf(stderr,
+                   "qwen38_flash_next: Q4_K draft head copy skipped (%s); "
+                   "drafts read the EXL3 head prefix\n",
+                   failure.c_str());
+    }
+  }
   draft_specials_ = std::move(specials);
   return true;
+}
+
+std::size_t DeviceModel::ReleaseDraftHeadCopy() noexcept {
+  if (draft_output_.type != core::GgmlType::kQ4_K || output_.exl3 == nullptr)
+    return 0;
+  void* copy = draft_output_.data;
+  const std::size_t bytes =
+      std::size_t{draft_output_.rows} * (draft_output_.cols / 256) * 144 +
+      kTailMargin;
+  (void)hipDeviceSynchronize();
+  (void)hipFree(copy);
+  std::erase(allocations_, copy);
+  bytes_ -= bytes;
+  const auto rows = draft_output_.rows;
+  draft_output_ = output_;
+  draft_output_.rows = rows;
+  return bytes;
 }
 
 std::unique_ptr<DeviceModel> DeviceModel::Upload(

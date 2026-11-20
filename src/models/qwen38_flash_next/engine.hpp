@@ -190,6 +190,9 @@ public:
   /// Caps wide copy verification (Executor::LimitCopyRows); call before any
   /// session is created.
   void LimitCopyRows(std::uint32_t rows) noexcept;
+  /// Frees the 4-bit draft head copy (DeviceModel::ReleaseDraftHeadCopy);
+  /// call before any session exists. Returns the bytes freed.
+  std::size_t ReleaseDraftHeadCopy() noexcept;
   /// Allocates the decode batch and wide verification scratch now
   /// (Executor::ReserveDecodeScratch); call after LimitCopyRows and before
   /// any session decodes.

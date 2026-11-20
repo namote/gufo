@@ -459,6 +459,18 @@ void NarrowActivations(const float* x, void* out, bool bf16, std::size_t count,
 std::size_t Q8TiledBytes(std::size_t batch, std::size_t k);
 void QuantizeQ8Tiled(const float* x, void* out, std::size_t batch,
                      std::size_t k, hipStream_t stream);
+/// Rows of the EXL3 head the 4-bit draft copy converts per pass.
+inline constexpr std::uint32_t kDraftHeadQ4KChunkRows = 2048;
+/// Floats each of BuildDraftHeadQ4K's two scratch buffers needs.
+std::size_t DraftHeadQ4KChunkFloats(std::uint32_t cols);
+/// GGML Q4_K bytes (rows x head.k / 256 blocks of 144 bytes) of the first
+/// `rows` output rows of an EXL3 projection, quantized from its exact dense
+/// values with ggml's reference quantize_row_q4_K_ref arithmetic. For the
+/// MTP draft head prefix (DeviceModel::SetDraftVocab); head.k % 256 == 0 and
+/// rows % 128 == 0. Throws std::runtime_error on a launch failure.
+void BuildDraftHeadQ4K(const quant::exl3::DeviceLinear& head,
+                       std::uint32_t rows, void* q4k, float* scratch_a,
+                       float* scratch_b, hipStream_t stream);
 /// F16 values (count % 32 == 0) to ggml Q8_0 blocks: d = amax / 127 as
 /// F16, codes round(x * (1 / d)), each step IEEE-rounded like the host's.
 void QuantizeHalfQ8_0(const void* half, void* q8, std::size_t count,

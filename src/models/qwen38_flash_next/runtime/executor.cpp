@@ -1329,6 +1329,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     s.mtp_res = s.res;
     s.mtp_argmax = Alloc<ArgmaxCandidate>(a, kArgmaxParts, error_msg);
     s.mtp_token = Alloc<std::int32_t>(a, 1, error_msg);
+    s.draft_head_ids = Alloc<std::int32_t>(a, 1, error_msg);
     const auto candidate_ids = std::max<std::size_t>(
         MtpCandidateWorkspaceSize(c.vocab_size),
         e->options_.max_speculative * kArgmaxParts *

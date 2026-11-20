@@ -445,6 +445,10 @@ std::size_t Model::DeferredScratchBytes() const {
 
 static_assert(Model::kWideCopyRows == rocm::Executor::kWideRows);
 
+std::size_t Model::ReleaseDraftHeadCopy() noexcept {
+  return device_->ReleaseDraftHeadCopy();
+}
+
 void Model::LimitCopyRows(std::uint32_t rows) noexcept {
   executor_->LimitCopyRows(rows);
 }
