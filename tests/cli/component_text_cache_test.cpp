@@ -3604,6 +3604,52 @@ void RewindArenasAreChargedWhole() {
   const auto [b_cached, b_disk] = turn(b);
   assert(b_cached == b_stable && b_disk);
 }
+void RefusedReplacementKeepsTheOlderPoint() {
+  // With the default disk step every boundary here is within the step, so
+  // only rewind points keep them. When the arenas cannot admit a slot's new
+  // point, the older point stays and still serves the next turn in place
+  // (from its earlier boundary), rather than an older disk checkpoint.
+  const TemporaryDirectory temp("gufo-component-rewind-keep-test");
+  const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
+                                        .capacity_bytes = 1 << 24};
+  auto runner = std::make_shared<Runner>();
+  runner->retain_rows = true;
+  // Room for a 406-token point of each chat (7 arenas each) but not for a
+  // 512-token one (9 arenas) beside the other chat's.
+  runner->snapshot_bytes = 4 * (960 << 10);
+  TextRunnerPool pool(runner, 2, disk);
+  DroppingChat a, b;
+  b.next = 40000;
+  a.Turn(300);
+  b.Turn(300);
+  for (auto& token : b.prompt)
+    if (token < 900)
+      token += 50000;
+  const auto turn = [&](DroppingChat& chat) {
+    auto request = ChatTurn(pool, chat);
+    const auto cached = request.cached_prompt_tokens();
+    const bool disk_hit = request.cache_disk_hit();
+    Prefill(request);
+    for (int i = 0; i < 5; ++i)
+      (void)Generate(request);
+    (void)request.Commit();
+    assert(WaitWritten(pool));
+    return std::pair(cached, disk_hit);
+  };
+  (void)turn(a);
+  (void)turn(b);
+  a.Turn(100);
+  (void)turn(a);
+  const auto a_first = a.stable;
+  b.Turn(100);
+  (void)turn(b);
+  a.Turn(100);
+  const auto [rewound, rewound_disk] = turn(a);  // its new point is refused
+  assert(rewound == a_first && !rewound_disk);
+  a.Turn(100);
+  const auto [cached, disk_hit] = turn(a);
+  assert(cached == a_first && !disk_hit);
+}
 void VerbatimReplayKeepsNoRewindPoint() {
   // A client that sends the reply back as generated continues the live
   // frontier: no stop at its stable boundary, no rewind point.
@@ -3744,6 +3790,7 @@ int main(int argc, char** argv) {
       CASE(DroppedReplyRewindsToTheStableBoundary()),
       CASE(FailedRewindFallsBackAndStaysExact()),
       CASE(RewindArenasAreChargedWhole()),
+      CASE(RefusedReplacementKeepsTheOlderPoint()),
       CASE(VerbatimReplayKeepsNoRewindPoint()),
       CASE(ReassignedRewindPointReachesDisk()),
   };

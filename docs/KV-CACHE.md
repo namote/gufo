@@ -611,9 +611,11 @@ slot: completed KV rows the adapter retains in device storage (the slot's own
 blocks, no copy), and host copies of private states, partial tails and rows
 it cannot retain, in the snapshot arenas. Points and their queued disk
 writes together occupy at most a quarter of those arenas, counted in whole
-arenas with page padding; a new point first releases the slot's older one. A
-refused point leaves the ordinary disk capture of that boundary, as without
-rewind points. Nothing is lent from the slot, so later execution leaves
+arenas with page padding and reserved before any arena is taken. A slot's
+new point is credited with its older point's arenas, but the older point is
+released only once the new one is admitted and copied: a refused replacement
+keeps the older point usable. A refused point also leaves the ordinary disk
+capture of that boundary, as without rewind points. Nothing is lent from the slot, so later execution leaves
 the point intact. The next prompt that diverges after it restores the point
 into the same slot (retained rows re-mapped, host pieces copied back): no
 disk read, and the bytes are those a disk checkpoint of that boundary holds.

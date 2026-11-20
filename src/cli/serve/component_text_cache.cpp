@@ -143,6 +143,8 @@ struct RewindPoint {
   // In component order, rows ascending.
   std::vector<Piece> pieces;
   std::size_t host_bytes{}, device_bytes{};
+  // Snapshot-arena bytes its host pieces occupy (whole arenas).
+  std::size_t arena_bytes{};
   // False for a request that keeps its prompt off the disk.
   bool persist{true};
   // The disk job last queued for it, while it is pending (under the cache
@@ -1285,7 +1287,8 @@ struct ComponentTextCache::Lease::Impl {
   std::string HostCopy(
       std::span<const SlotPiece> pieces, DurableCapture* durable,
       SnapshotStats& stats, bool observed = true,
-      std::vector<std::shared_ptr<const void>>* hosted = nullptr);
+      std::vector<std::shared_ptr<const void>>* hosted = nullptr,
+      const std::function<bool(std::size_t)>& admit = {});
 };
 
 std::unique_ptr<TextRunnerSnapshot>
@@ -1773,29 +1776,43 @@ ComponentTextCache::Lease::Impl::CaptureRewind() {
                        point->pieces.size() * sizeof(RewindPoint::Piece))
           .Convert();
   // This point supersedes the slot's older one (and an earlier one of this
-  // request), whose device rows it already shares: their arenas return
-  // before this one takes its own. Should this capture then be refused, the
-  // boundary goes to disk instead (CaptureDurable).
+  // request), whose device rows it already shares. Their arenas are credited
+  // to its reservation, taken before any arena (reassignment snapshots share
+  // the pool), but they stay until it is admitted and copied: a refused
+  // replacement keeps the older point usable.
+  std::size_t credit = 0;
+  {
+    const std::lock_guard lock(cache->mutex);
+    if (rewind_point)
+      credit += rewind_point->arena_bytes;
+    if (entry->rewind && entry->rewind != rewind_point &&
+        ComponentTextCache::Impl::Prefixes(entry->rewind->tokens,
+                                           capture_tokens))
+      credit += entry->rewind->arena_bytes;
+  }
   shared.clear();
   previous.reset();
-  rewind_point.reset();
-  {
-    std::shared_ptr<RewindPoint> superseded;
-    {
-      const std::lock_guard lock(cache->mutex);
-      if (entry->rewind && ComponentTextCache::Impl::Prefixes(
-                               entry->rewind->tokens, capture_tokens))
-        superseded = std::exchange(entry->rewind, {});
-    }
-  }
+  std::size_t reserved = 0;
+  const auto admit = [&](std::size_t need) {
+    auto charged = cache->rewind_arena_bytes.load();
+    do {
+      if (charged + need > budget + std::min(credit, charged))
+        return false;
+    } while (!cache->rewind_arena_bytes.compare_exchange_weak(charged,
+                                                              charged + need));
+    reserved = need;
+    return true;
+  };
   SnapshotStats stats;
   std::vector<std::shared_ptr<const void>> hosted;
-  if (const auto reason = HostCopy(staged, nullptr, stats, false, &hosted);
-      !reason.empty())
+  if (const auto reason =
+          HostCopy(staged, nullptr, stats, false, &hosted, admit);
+      !reason.empty()) {
+    cache->rewind_arena_bytes.fetch_sub(reserved);
     return refused(reason, point->host_bytes);
-  // Charged for its whole arenas until the last holder (this point, its
-  // successor's shared pieces never include them, or a disk job) drops
-  // them.
+  }
+  // Charged for its whole arenas until the last holder (this point, or a
+  // disk job of it) drops them.
   struct RewindArenas {
     std::vector<std::shared_ptr<const void>> arenas;
     std::atomic<std::size_t>* charged{};
@@ -1805,21 +1822,16 @@ ComponentTextCache::Lease::Impl::CaptureRewind() {
         charged->fetch_sub(bytes);
     }
   };
-  if (cache->rewind_arena_bytes.fetch_add(stats.taken_bytes) +
-          stats.taken_bytes >
-      budget) {
-    cache->rewind_arena_bytes.fetch_sub(stats.taken_bytes);
-    return refused("arena_budget", stats.taken_bytes);
-  }
   std::shared_ptr<RewindArenas> arenas;
   try {
     arenas = std::make_shared<RewindArenas>();
   } catch (...) {
-    cache->rewind_arena_bytes.fetch_sub(stats.taken_bytes);
+    cache->rewind_arena_bytes.fetch_sub(reserved);
     throw;
   }
   arenas->charged = &cache->rewind_arena_bytes;
-  arenas->bytes = stats.taken_bytes;
+  arenas->bytes = reserved;
+  point->arena_bytes = reserved;
   for (std::size_t i = 0; i < staged.size(); ++i) {
     auto& piece = point->pieces[staged_at[i]];
     const auto* data = static_cast<const std::byte*>(hosted[i].get());
@@ -1827,7 +1839,17 @@ ComponentTextCache::Lease::Impl::CaptureRewind() {
     piece.owner = std::shared_ptr<const void>(arenas, data);
   }
   arenas->arenas = std::move(hosted);
-  rewind_point = point;
+  // Admitted: the superseded points (and their arenas) go now.
+  {
+    std::shared_ptr<RewindPoint> superseded;
+    {
+      const std::lock_guard lock(cache->mutex);
+      if (entry->rewind && ComponentTextCache::Impl::Prefixes(
+                               entry->rewind->tokens, capture_tokens))
+        superseded = std::exchange(entry->rewind, {});
+    }
+    rewind_point = point;
+  }
   metrics.captured_bytes += point->host_bytes;
   metrics.copied_payload_bytes += point->host_bytes;
   // Also on the disk when its step allows, from the same pieces.
@@ -1894,7 +1916,8 @@ std::string ComponentTextCache::Lease::Impl::SnapshotSlot(
 std::string ComponentTextCache::Lease::Impl::HostCopy(
     std::span<const SlotPiece> pieces, DurableCapture* durable,
     SnapshotStats& stats, bool with_observed,
-    std::vector<std::shared_ptr<const void>>* hosted) {
+    std::vector<std::shared_ptr<const void>>* hosted,
+    const std::function<bool(std::size_t)>& admit) {
   auto& resources = *cache->resources;
   // Pack the pieces in the order the writer reads them (shared files before
   // private, by file ID), so each arena returns as early as it can. Each
@@ -2018,6 +2041,10 @@ std::string ComponentTextCache::Lease::Impl::HostCopy(
   stats.plan_ms =
       std::chrono::duration<double, std::milli>(started - plan_started).count();
   stats.pieces = order.size();
+  // A caller's own budget, for the whole arenas, before any is taken.
+  if (admit &&
+      !admit(std::accumulate(sizes.begin(), sizes.end(), std::size_t{0})))
+    return "arena_budget";
   auto taken = cache->snapshot_pool->Take(sizes, [&](std::size_t bytes) {
     return bytes <= HostSnapshotCeilingBytes() &&
            (!resources.snapshot_room || resources.snapshot_room(bytes));
