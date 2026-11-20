@@ -67,9 +67,10 @@ DeviceTensor Executor::DraftTable(const Session& session) const noexcept {
 }
 
 bool Executor::DraftLogits(const Session& session, const float* x,
-                           float* logits, std::string* error_msg) const {
+                           float* logits, std::string* error_msg,
+                           bool q4k_prefix) const {
   const auto& prefix = model_->draft_output();
-  if (prefix.type == core::GgmlType::kQ4_K &&
+  if (q4k_prefix && prefix.type == core::GgmlType::kQ4_K &&
       model_->output().exl3 != nullptr) {
     // The 4-bit prefix copy, then the table rows from the EXL3 head alone
     // (a zero prefix selects every table row's segment).
@@ -172,7 +173,8 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
     cycle_diagnostics_.head_segments += (rows + 127) / 128;
   if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg) ||
       !(draft != nullptr
-            ? DraftLogits(*draft, s_.mixed, s_.logits, error_msg)
+            // Only sampled drafts read the 4-bit prefix copy (see MtpHeads).
+            ? DraftLogits(*draft, s_.mixed, s_.logits, error_msg, !token)
             : Dense(model_->output(), s_.mixed, s_.logits, 1, error_msg))) {
     return false;
   }

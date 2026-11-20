@@ -1155,9 +1155,10 @@ private:
   /// The session's draft table as a weight of kMtpDraftExtraRows rows.
   DeviceTensor DraftTable(const Session& session) const noexcept;
   /// Small-head draft logits: prefix rows, then the table rows with empty
-  /// slots at -infinity.
+  /// slots at -infinity. `q4k_prefix` (sampled drafts) scores the prefix
+  /// from the 4-bit copy when one exists; otherwise from the EXL3 head.
   bool DraftLogits(const Session& session, const float* x, float* logits,
-                   std::string* error_msg) const;
+                   std::string* error_msg, bool q4k_prefix) const;
   /// Logits of the Q4_K draft head prefix (DeviceModel::draft_output() of
   /// an EXL3 head) for one row `x`.
   bool DraftPrefixQ4K(const float* x, float* logits,

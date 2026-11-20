@@ -635,6 +635,14 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
   if (diagnostics_active_ && full_head.exl3 != nullptr &&
       (mixed || subset_rows == 0))
     cycle_diagnostics_.head_segments += (vocab + 127) / 128;
+  // Only sampled drafts read the 4-bit prefix copy, alone or batched, so a
+  // batch member matches its isolated session. Greedy drafts keep the EXL3
+  // prefix: batched greedy C4 lost 3-8% with the copy (V2 pass, 2026-11-20).
+  const auto Q4kDraftRow = [&](const MtpHeadItem& item) {
+    return item.output.token == nullptr &&
+           prefix_head.type == core::GgmlType::kQ4_K &&
+           full_head.exl3 != nullptr;
+  };
   const Scratch base = s_;
   const auto body = [&]() {
     if (!AnyActive(items))
@@ -660,10 +668,9 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
         GatherDraftLogits(logits_of(i), items[i].session->mtp_.draft_ids,
                           static_cast<std::uint32_t>(prefix),
                           kMtpDraftExtraRows, stream_);
-        // A 4-bit prefix scores its rows as alone, after the gather read
-        // its table rows from the full head's values.
-        if (prefix_head.type == core::GgmlType::kQ4_K &&
-            full_head.exl3 != nullptr &&
+        // A sampled row scores its prefix from the 4-bit copy, as it would
+        // alone, so seeded output does not depend on batch occupancy.
+        if (Q4kDraftRow(items[i]) &&
             !DraftPrefixQ4K(
                 base.mixed + std::size_t{slot[i]} * config().hidden_size,
                 logits_of(i), error))
@@ -674,7 +681,7 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
         if (!DraftLogits(
                 *items[i].session,
                 base.mixed + std::size_t{slot[i]} * config().hidden_size,
-                logits_of(i), error))
+                logits_of(i), error, Q4kDraftRow(items[i])))
           return false;
     } else if (subset_rows != 0) {
       float* staged = batch_logits_ + kBatchSessions * vocab -
