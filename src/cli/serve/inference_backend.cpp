@@ -1149,15 +1149,16 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
            hip::HeapFitsAboveReserve(heap_free - pending, bytes);
   };
   result->snapshot_allocate = [](std::size_t bytes) {
-    // Pinned by hipHostMalloc itself: no page registration, and no memset,
-    // since the snapshot copy writes every byte the writer reads.
+    // Long-term pinned and registered (kept out of compaction), or
+    // hipHostMalloc memory when the pin is unavailable. No memset: the
+    // snapshot copy writes every byte the writer reads.
+    auto allocation = std::make_shared<hip::HostAllocations>();
     void* data = nullptr;
-    const auto status = hipHostMalloc(&data, bytes, hipHostMallocCoherent);
+    const auto status =
+        allocation->Allocate(&data, bytes, hipHostMallocCoherent);
     if (status != hipSuccess)
       throw std::runtime_error(hipGetErrorString(status));
-    // Frees `data` itself if it cannot allocate its control block.
-    auto owner =
-        std::shared_ptr<void>(data, [](void* p) { (void)hipHostFree(p); });
+    auto owner = std::shared_ptr<void>(std::move(allocation), data);
     return cache::StagingAllocation{std::move(owner),
                                     {static_cast<std::uint8_t*>(data), bytes}};
   };

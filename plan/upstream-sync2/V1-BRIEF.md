@@ -48,4 +48,25 @@ When an item cannot be ported cleanly or turns out not to apply, skip it. Say wh
 
 ## Container notes
 
-(to be filled by V1-2)
+V1-2 makes `HostAllocations` pin GPU-visible host buffers long-term through
+io_uring buffer registration. Inside docker that needs two run flags; without
+them every buffer silently falls back to `hipHostMalloc` (the old behavior).
+
+- `--ulimit memlock=-1:-1`: registered buffers are charged to RLIMIT_MEMLOCK
+  (no CAP_IPC_LOCK in the container), and the inherited default (typically 8 MiB)
+  fails every pin larger than that.
+- `--security-opt seccomp=/home/m2on/projects/gufo/tools/serving/seccomp-io-uring.json`:
+  Docker 25+ default seccomp blocks `io_uring_setup`, `io_uring_enter` and
+  `io_uring_register`. The profile is moby/profiles `seccomp/v0.3.0`
+  (commit 4b8214fc, `seccomp/default.json`) plus one rule allowing those three
+  calls. Docker 29.9.3 here; its built-in profile may differ slightly from that tag.
+- Pinned pages also count against the container's `--memory` cgroup limit
+  (100g in the supervisors), as hipHostMalloc pages already did.
+
+Check in the GPU pass: the `memory` log line right after `event=load_completed`
+reads `event=host_pin_totals pinned_bytes=... fallback_bytes=...`. With
+both flags `fallback_bytes` should be 0 (or only small buffers). Without them
+`pinned_bytes=0`. That line counts buffers allocated up to the end of the load.
+Snapshot arenas allocated later use the same path. The supervisors
+(`tools/serving/*/gufo-server.py`) are not changed. Apply the flags to the
+candidate server only during the test window.

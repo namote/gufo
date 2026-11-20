@@ -41,6 +41,8 @@
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime_api.h>
+
+#include "src/core/hip/host_allocations.hpp"
 #endif
 #include "src/cli/serve/trace.hpp"
 #include "src/cli/serve/tts_service.hpp"
@@ -91,6 +93,22 @@ public:
     (void)gpu_loaded;
 #endif
     server::Logger::Info("loader", out.str());
+#if defined(ENGINE_ENABLE_HIP)
+    // Whether GPU-visible host buffers got their long-term pin (kept out of
+    // compaction) or fell back to hipHostMalloc, e.g. under a low
+    // RLIMIT_MEMLOCK or a seccomp profile that blocks io_uring.
+    if (gpu_loaded) {
+      const auto totals = ::gufo::hip::HostAllocations::Totals();
+      server::Logger::Info(
+          "memory",
+          "event=host_pin_totals pinned_bytes=" +
+              std::to_string(totals.pinned_bytes) +
+              " fallback_bytes=" + std::to_string(totals.fallback_bytes) +
+              " pinned_buffers=" + std::to_string(totals.pinned_allocations) +
+              " fallback_buffers=" +
+              std::to_string(totals.fallback_allocations));
+    }
+#endif
   }
 
 private:

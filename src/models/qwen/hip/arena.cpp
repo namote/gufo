@@ -1272,8 +1272,9 @@ void QwenGpuArena::AllocateKvBlocks(std::shared_ptr<KvBlockPool> shared) {
       config_.head_dim, policy_.kv_cache_storage);
   const std::uint32_t blocks = KvBlockPool::BlocksFor(max_context_);
   HIP_CHECK(hipMalloc(&d_kv_block_table_, blocks * sizeof(std::uint32_t)));
-  HIP_CHECK(hipHostMalloc(&h_kv_block_table_, blocks * sizeof(std::uint32_t),
-                          hipHostMallocDefault));
+  kv_block_table_host_ = std::make_unique<::gufo::hip::HostAllocations>();
+  HIP_CHECK(kv_block_table_host_->Allocate(&h_kv_block_table_,
+                                           blocks * sizeof(std::uint32_t)));
   if (shared != nullptr) {
     if (!std::ranges::equal(shared->geometry().planes(), planes))
       throw std::invalid_argument(
@@ -1723,6 +1724,7 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   kv_unmapped_blocks_ = std::exchange(other.kv_unmapped_blocks_, 0);
   d_kv_block_table_ = std::exchange(other.d_kv_block_table_, nullptr);
   h_kv_block_table_ = std::exchange(other.h_kv_block_table_, nullptr);
+  kv_block_table_host_ = std::move(other.kv_block_table_host_);
   kv_reservation_ = std::move(other.kv_reservation_);
   kvarn_ = std::exchange(other.kvarn_, {});
   d_ssm_conv_state = other.d_ssm_conv_state;
@@ -1837,6 +1839,7 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     kv_unmapped_blocks_ = std::exchange(other.kv_unmapped_blocks_, 0);
     d_kv_block_table_ = std::exchange(other.d_kv_block_table_, nullptr);
     h_kv_block_table_ = std::exchange(other.h_kv_block_table_, nullptr);
+    kv_block_table_host_ = std::move(other.kv_block_table_host_);
     kv_reservation_ = std::move(other.kv_reservation_);
     kvarn_ = std::exchange(other.kvarn_, {});
     d_ssm_conv_state = other.d_ssm_conv_state;
@@ -1987,8 +1990,7 @@ void QwenGpuArena::FreeAll() noexcept {
   if (d_kv_block_table_ != nullptr)
     LogCleanupError(hipFree(d_kv_block_table_));
   d_kv_block_table_ = nullptr;
-  if (h_kv_block_table_ != nullptr)
-    LogCleanupError(hipHostFree(h_kv_block_table_));
+  kv_block_table_host_.reset();
   h_kv_block_table_ = nullptr;
   if (d_target_layer_features != nullptr) {
     LogCleanupError(hipFree(d_target_layer_features));

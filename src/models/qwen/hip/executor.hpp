@@ -30,6 +30,7 @@
 #include <hipblas/hipblas.h>
 
 #include "src/core/hip/detail/hip_graph_decode_executor.hpp"
+#include "src/core/hip/host_allocations.hpp"
 #include "src/core/hip/kv_block_pool.hpp"
 #include "src/models/qwen/hip/execution_policy.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
@@ -652,8 +653,10 @@ private:
     KvarnTail tail;
   };
   KvarnStorage kvarn_;
-  // Pinned copy of the device table, the source of its async uploads.
+  // Pinned copy of the device table, the source of its async uploads. Owned
+  // by kv_block_table_host_ (long-term pinned, kept out of compaction).
   std::uint32_t* h_kv_block_table_{nullptr};
+  std::unique_ptr<::gufo::hip::HostAllocations> kv_block_table_host_;
   KvBlockReservation kv_reservation_;
   // Buffer 0 comes from the constructor; buffer 1 is allocated by the first
   // SaveState. `live_recurrent_` holds the current state, `saved_recurrent_`
