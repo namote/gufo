@@ -119,14 +119,23 @@ def check_cache_growth(client, model, checks, chat_result, server_log=None):
                 assistant["reasoning_content"] = result["reasoning"]
             messages.append(assistant)
 
-        # An identical retry must still reuse the complete prompt.
+        # An identical retry must still reuse the complete prompt, or, when
+        # disk spacing refused that copy, the boundary before the final user
+        # turn. Count that turn (plus the separator after the previous turn's
+        # end marker) independently instead of widening a fixed allowance.
+        from messages_count_tokens import assert_count_response
+        suffix = client.post("/messages/count_tokens", body={
+            "model": model, "thinking": {"type": "disabled"},
+            "messages": [messages[-2]]}, cast_to=object)
+        mutable_suffix_tokens = assert_count_response(suffix) + 1
         retry_request = deepcopy(history[-1][0])
         before_retry = log_offset(server_log)
         retry = chat("unchanged", retry_request)
         total, _, prefilled = work(retry)
         assert total == previous_total, retry
         check_unchanged_retry(label + "_unchanged", retry, prefilled,
-                              server_log, before_last, before_retry)
+                              server_log, before_last, before_retry,
+                              mutable_suffix_tokens=mutable_suffix_tokens)
         assert signature(retry) == signature(history[-1][1]), retry
 
         # Measure the whole growing history before cold controls can supply
