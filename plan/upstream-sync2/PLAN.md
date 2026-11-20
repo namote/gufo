@@ -89,6 +89,8 @@
 | V3-4 | exllamav3 0244652, Kyojin fce7501 | GDN 상태를 FP16으로 저장하고 FP32로 계산 | Kyojin 27B 8×16K decode +7.7%, KL 0.0004. 예전 BF16(#138)은 기각했으므로 27B에서 먼저 품질 확인. 캐시 형식이 바뀐다 |
 | V3-5 | 27B in-pass capture (a59df291, #1224) | 27B prefill 중 checkpoint | 600~1000줄, 지금은 효과 대비 비용이 낮음 |
 
+**V3-0 결과 (2026-11-21).** 슬롯 안에 되돌아갈 지점을 둔다. `cache-growth`의 네 경우가 모두 통과하고, 속도 손해는 없다. KNOWHOW "V3-0: in-place rewind point" 참고.
+
 ## 하지 않는 것
 
 조사 보고서의 "Rejected" 목록을 따른다. 요약하면 다음과 같다.
