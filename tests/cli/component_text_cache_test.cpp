@@ -404,6 +404,47 @@ void CancelledPrefillKeepsCompletedSteps() {
   }
 }
 
+// A short system prompt shared by many short requests is learned at its
+// divergence point on the component path, from 192 common tokens on
+// (upstream #1270).
+void ShortSharedSystemPromptIsLearned() {
+  const auto conversation = [](std::size_t shared, TextRunnerToken salt) {
+    std::vector<TextRunnerToken> prompt(shared + 300);
+    std::iota(prompt.begin(), prompt.begin() + shared, 10);
+    std::iota(prompt.begin() + shared, prompt.end(), salt);
+    return prompt;
+  };
+  for (const std::size_t shared : {300, 150}) {
+    // No RAM tier: the frontier and the learned branch point reach disk.
+    const TemporaryDirectory temp("gufo-component-short-branch-test");
+    const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
+                                          .capacity_bytes = 1 << 24};
+    auto runner = std::make_shared<Runner>();
+    TextRunnerPool pool(runner, 1, disk);
+    auto first = pool.Acquire(conversation(shared, 40000));
+    Prefill(first);
+    (void)Generate(first);
+    (void)first.Commit();
+    assert(WaitWritten(pool));
+    auto second = pool.Acquire(conversation(shared, 50000));
+    assert(second.cached_prompt_tokens() == 0);
+    const auto step = second.Prefill(4096);
+    if (shared == 300)
+      assert(step.consumed_tokens == shared && !step.decode_ready &&
+             "a 300-token shared prefix stops at its divergence point");
+    else
+      assert(step.decode_ready &&
+             "a shared prefix under 192 tokens is not worth a checkpoint");
+    Prefill(second);
+    (void)Generate(second);
+    (void)second.Commit();
+    assert(WaitWritten(pool));
+    auto third = pool.Acquire(conversation(shared, 60000));
+    assert(third.cached_prompt_tokens() == (shared == 300 ? shared : 0));
+    third.Invalidate();
+  }
+}
+
 void PartialFrontierDoesNotServeAnEqualPrompt() {
   // A prefill cancelled between steps keeps a frontier with no next token. A
   // prompt ending exactly there must recompute its tail instead of decoding
@@ -3250,6 +3291,7 @@ int main(int argc, char** argv) {
       CASE(PublishedCheckpointKeepsDiskStep()),
       CASE(LearnedBoundaryLeavesTheNextStep()),
       CASE(CancelledPrefillKeepsCompletedSteps()),
+      CASE(ShortSharedSystemPromptIsLearned()),
       CASE(PartialFrontierDoesNotServeAnEqualPrompt()),
       CASE(PartialReuseRequestsRunTheirLastPromptToken()),
       CASE(InPassCapturePreservesBoundaryAndLiveTail()),

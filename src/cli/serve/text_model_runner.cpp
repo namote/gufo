@@ -2607,14 +2607,14 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
     request.impl_->cancelled = is_cancelled;
     if (reuse_prompt) {
       // The next conversation under the same system prompt restores this
-      // one's checkpoint where they diverge, from RAM or disk; shorter system
-      // prompts prefill faster than they restore.
+      // one's checkpoint where they diverge, from a live slot or disk; shorter
+      // system prompts prefill faster than they restore.
       if (system_prefix_tokens >= impl_->shared_prefix_min_tokens)
         (void)request.ShareCheckpoint(system_prefix_tokens);
       const auto common = impl_->component_cache->CachedPrefixTokens(
           request.prompt(), request.impl_->context.get(), true);
       if (common >=
-              request.prefill_position() + Request::kSharedPrefixMinTokens &&
+              request.prefill_position() + Request::kSharedBranchMinTokens &&
           (common + Request::kSharedCheckpointSlack < request.prompt_tokens() ||
            (impl_->shared_prefix_max_boundaries &&
             common >= impl_->shared_prefix_min_tokens &&
