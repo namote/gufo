@@ -49,6 +49,10 @@
   - compaction_proactiveness 20과 50에서 MTP(V1-2), pin 성공 로그 확인.
   - U4-3 hang loop 한 번.
 
+**V1 후속 (남은 경계 사례, Codex 검토 2026-11-20).** 생각 중 따옴표가 덜 닫힌 뒤 복구한 도구 호출을 검사할 때 남은 문제다(`openai_chat.cpp` recovered-call 검사, upstream도 같음).
+- 정수 `1.0`과 `1e-7`이 한 호출에 같이 있으면 두 철자 어느 쪽으로도 통과하지 못한다. canonical 철자에서 지수 앞 0을 빼면 해결된다.
+- 2^53을 넘는 정수는 canonical double로 바뀐 값으로 경계를 검사한다. 숫자 잎마다 십진값이 그대로일 때만 canonical로 대체하면 정확해진다.
+
 ## V2 속도 개선 (2묶음, 중간 크기)
 
 | # | 출처 | 내용 | 비고 |
