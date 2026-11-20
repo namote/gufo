@@ -120,14 +120,13 @@ def check_cache_growth(client, model, checks, chat_result, server_log=None):
             messages.append(assistant)
 
         # An identical retry must still reuse the complete prompt, or, when
-        # disk spacing refused that copy, the boundary before the final user
-        # turn. Count that turn (plus the separator after the previous turn's
-        # end marker) independently instead of widening a fixed allowance.
-        from messages_count_tokens import assert_count_response
-        suffix = client.post("/messages/count_tokens", body={
-            "model": model, "thinking": {"type": "disabled"},
-            "messages": [messages[-2]]}, cast_to=object)
-        mutable_suffix_tokens = assert_count_response(suffix) + 1
+        # disk spacing refused that copy (logged), the nearest durable
+        # checkpoint: docs/KV-CACHE.md accepts re-prefilling up to one disk
+        # step plus the latest turn (its growth and assistant opening).
+        from cache_disk_spacing import MIN_STEP
+        mutable_suffix_tokens = (MIN_STEP + previous_total
+                                 - history[-2][1]["usage"]["prompt_tokens"]
+                                 + ASSISTANT_OPENING_TOKENS)
         retry_request = deepcopy(history[-1][0])
         before_retry = log_offset(server_log)
         retry = chat("unchanged", retry_request)
@@ -230,8 +229,14 @@ def check_messages_growth(client, model, checks, chat_result, failures, server_l
         retry = record("unchanged", messages_result(client, deepcopy(history[-1][0])))
         total, _, prefilled = work(retry)
         assert total == previous_total, retry
+        # As in check_cache_growth: at most one disk step plus the latest
+        # turn when disk spacing refused the complete-prompt copy.
+        from cache_disk_spacing import MIN_STEP
         check_unchanged_retry(label + "_unchanged", retry, prefilled,
-                              server_log, before_last, before_retry)
+                              server_log, before_last, before_retry,
+                              mutable_suffix_tokens=MIN_STEP + previous_total
+                              - history[-2][1]["usage"]["prompt_tokens"]
+                              + ASSISTANT_OPENING_TOKENS)
         assert (retry["text"], retry["reasoning"]) == \
             (history[-1][1]["text"], history[-1][1]["reasoning"]), retry
 

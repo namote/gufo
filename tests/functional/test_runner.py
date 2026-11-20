@@ -816,9 +816,6 @@ class FunctionalRunnerTest(unittest.TestCase):
                 self.previous = {}
 
             def post(self, path, body, cast_to):
-                if path == "/messages/count_tokens":
-                    assert cast_to is object and len(body["messages"]) == 1
-                    return {"input_tokens": 40}
                 assert path == "/messages" and cast_to is object
                 label = body["system"].splitlines()[0]
                 total = 3000 + (len(body["messages"]) - 1) * 100
