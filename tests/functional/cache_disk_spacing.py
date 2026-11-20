@@ -51,7 +51,7 @@ def grow(url, model):
         assert measured["text"] == "BETA", measured
         if turns:
             previous = turns[-1]["measured"]["total"]
-            # Short turns must keep reusing RAM even when disk skips them.
+            # Short turns must keep reusing live state even when disk skips them.
             assert measured["cached"] >= previous - 16, (turn, measured, previous)
         turns.append({"request": body, "measured": measured})
         messages.append({"role": "assistant", "content": measured["text"]})
@@ -79,11 +79,18 @@ DISK_EVENT = re.compile(r"event=disk_cache action=(\w+) reason=(\w+) .*?\btokens
 
 
 def disk_events(log):
-    events = [(action, reason, int(tokens)) for action, reason, tokens in DISK_EVENT.findall(log)]
-    events += [("stored", "saved", int(tokens)) for tokens in re.findall(
-        r"schema=component-cache-v1 event=published tokens=(\d+)\b", log)]
-    events += [("skipped", "min_step", int(tokens)) for tokens in re.findall(
-        r"schema=component-cache-v1 event=persistence_refused reason=min_step tokens=(\d+)\b", log)]
+    events = [(action, reason, int(tokens), "", None)
+              for action, reason, tokens in DISK_EVENT.findall(log)]
+    for line in log.splitlines():
+        fields = dict(re.findall(r"(?:^|\s)(\w+)=([^\s]+)", line))
+        if fields.get("schema") != "component-cache-v1":
+            continue
+        purpose = fields.get("purpose", "")  # Old logs remain non-learned.
+        checkpoint_id = int(fields["checkpoint_id"]) if "checkpoint_id" in fields else None
+        if fields.get("event") == "published":
+            events.append(("stored", "saved", int(fields["tokens"]), purpose, checkpoint_id))
+        elif fields.get("event") == "persistence_refused" and fields.get("reason") == "min_step":
+            events.append(("skipped", "min_step", int(fields["tokens"]), purpose, checkpoint_id))
     return events
 
 
@@ -101,35 +108,62 @@ def check_disk_spacing(grown_log, restored_log, report, restored_report=None):
                           for id_ in turn["measured"]["checkpoint_ids"]}
 
     def events(log, ids):
-        if ids is None:
-            return disk_events(log)
         result = []
-        for line in log.splitlines():
-            fields = dict(re.findall(r"(?:^|\s)(\w+)=([^\s]+)", line))
-            if fields.get("schema") != "component-cache-v1" or \
-                    int(fields.get("checkpoint_id", "0")) not in ids:
+        published_ids = set()
+        for event in disk_events(log):
+            action, reason, tokens, purpose, checkpoint_id = event
+            if ids is not None and checkpoint_id not in ids:
                 continue
-            if fields.get("event") == "published":
-                result.append(("stored", "saved", int(fields["tokens"])))
-            elif fields.get("event") == "persistence_refused" and \
-                    fields.get("reason") == "min_step":
-                result.append(("skipped", "min_step", int(fields["tokens"])))
+            # Learned checkpoints bypass spacing, not publication identity.
+            # Check duplicates before filtering by purpose or token window.
+            if action == "stored" and checkpoint_id is not None:
+                if checkpoint_id in published_ids:
+                    raise ValueError(f"duplicate checkpoint publication: {checkpoint_id}")
+                published_ids.add(checkpoint_id)
+            result.append(event)
         return result
 
     grown = events(grown_log, checkpoint_ids)
-    stored = sorted(tokens for action, reason, tokens in grown
-                    if (action, reason) == ("stored", "saved") and tokens in owned)
-    skipped = [tokens for action, reason, tokens in grown
+    # With checkpoint IDs, ownership is stronger than the approximate token
+    # window: an owned ordinary checkpoint just below it still participates
+    # in spacing. Learned shared boundaries are explicitly exempt and do not
+    # anchor the next ordinary checkpoint. Missing purpose means non-learned.
+    spacing_stored = sorted(tokens for action, reason, tokens, purpose, _ in grown
+                            if (action, reason) == ("stored", "saved") and
+                            purpose != "learned" and
+                            (checkpoint_ids is not None or tokens in owned))
+    stored = [tokens for tokens in spacing_stored if tokens in owned]
+    skipped = [tokens for action, reason, tokens, _, _ in grown
                if reason == "min_step" and tokens in owned]
-    summary = {"stored_tokens": stored, "min_step_skips": len(skipped)}
+    # Component caches reject a too-close boundary before allocating a
+    # checkpoint ID or copying device state. Those skips emit no publication
+    # refusal. Verify the observable contract: a warm short turn captured
+    # nothing and stays within the step of an owned durable prefix.
+    early_skips = 0
+    if checkpoint_ids is not None:
+        earlier_ids = set(report["turns"][0]["measured"]["checkpoint_ids"])
+        for index, turn in enumerate(report["turns"][1:], 1):
+            measured = turn["measured"]
+            # A later turn's capture cannot justify skipping this turn, even
+            # when its publication has a token count below this prompt's end.
+            prior = [tokens for action, reason, tokens, purpose, _ in events(grown_log, earlier_ids)
+                     if (action, reason) == ("stored", "saved") and
+                     purpose != "learned" and tokens <= measured["total"]]
+            if (measured["checkpoint_ids"] == [] and prior and
+                    measured["total"] - max(prior) < MIN_STEP and
+                    measured.get("cached", 0) >= turns[index - 1] - 16):
+                early_skips += 1
+            earlier_ids.update(measured["checkpoint_ids"])
+    summary = {"stored_tokens": spacing_stored, "min_step_skips": len(skipped),
+               "pre_capture_skips": early_skips}
     if not stored or stored[0] > first:
         raise ValueError(f"first turn was not written to disk: {summary}")
     if stored[-1] < turns[5] - 64:
         raise ValueError(f"checkpoint past the long turn was not written: {summary}")
-    gaps = [b - a for a, b in zip(stored, stored[1:])]
+    gaps = [b - a for a, b in zip(spacing_stored, spacing_stored[1:])]
     if any(gap < MIN_STEP for gap in gaps):
         raise ValueError(f"disk checkpoints closer than {MIN_STEP} tokens: {summary}")
-    if len(skipped) < 5:
+    if len(skipped) + early_skips < 5:
         raise ValueError(f"short turns were not skipped: {summary}")
     # The branch point is a learned shared boundary within one step of the
     # first checkpoint. It must be written despite the spacing gate.
@@ -139,7 +173,7 @@ def check_disk_spacing(grown_log, restored_log, report, restored_report=None):
             raise ValueError("missing restored checkpoint provenance")
         restored_ids = {id_ for phase in ("replayed", "branched")
                         for id_ in restored_report[phase]["checkpoint_ids"]}
-    branched = [tokens for action, reason, tokens in events(restored_log, restored_ids)
+    branched = [tokens for action, reason, tokens, _, _ in events(restored_log, restored_ids)
                 if (action, reason) == ("stored", "saved")
                 and stored[0] < tokens < stored[0] + MIN_STEP]
     if not branched:

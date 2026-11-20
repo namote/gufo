@@ -1856,9 +1856,12 @@ void CheckServingEos(const std::shared_ptr<qfn::Model>& model) {
             !model->IsStopToken(references[row].tokens.front()),
         "scalar MTP executed EOS or trailing work after the forced boundary");
     const auto replay = backend.complete(prompts[row], 8, config);
-    Require(
-        replay.tokens == references[row].tokens && replay.prefill_tokens == 0,
-        "scalar EOS checkpoint did not replay exactly without prefill");
+    // This backend has no disk cache. Its live frontier is past the prompt,
+    // and there is deliberately no RAM checkpoint tier to rewind it.
+    Require(replay.tokens == references[row].tokens &&
+                replay.prefill_tokens == references[row].prefill_tokens &&
+                replay.prefill_tokens > 0,
+            "scalar EOS cold replay changed tokens or prefill work");
   }
   std::array<std::future<Backend::Result>, 2> pending;
   std::latch ready(pending.size());
@@ -1874,9 +1877,9 @@ void CheckServingEos(const std::shared_ptr<qfn::Model>& model) {
     const auto result = pending[row].get();
     Require(result.logprobs.size() == 2 &&
                 model->IsStopToken(result.logprobs.back().entries.front().id),
-            "batched cached EOS must retain token metadata");
+            "batched EOS must retain token metadata");
     Require(result.tokens == references[row].tokens,
-            "batched EOS accounting differs from the scalar checkpoint");
+            "batched EOS accounting differs from scalar replay");
     batched += result.physical_execution_width > 1;
   }
   Require(batched > 0, "EOS fixture did not exercise batched MTP");

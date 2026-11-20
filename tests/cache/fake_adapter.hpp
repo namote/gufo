@@ -57,6 +57,8 @@ public:
                                               Rows end) const override;
   void SetPrefillPassRows(Rows rows);
   void SetExecutionComplete(Slot&, bool);
+  // An interrupted execution invalidates state but retains earlier row views.
+  void FailExecution(Slot&);
   // Without it the adapter offers no in-pass checkpoint prediction.
   void SetCheckpointPrediction(bool);
   /// Refuse every in-pass prediction, as an adapter whose states cannot

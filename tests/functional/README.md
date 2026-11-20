@@ -562,8 +562,10 @@ assistant opening again. Select `image-detail` after `image-count`, whose
 unchanged retries expect full reuse.
 
 Repeat `--suite` to select affected tests; `--suite all` explicitly runs all. For long
-contexts, use server `--context 32768`; actual prompt depth is recorded. `cache`
-uses its own 8 GiB disk budget inside the output directory; the runner removes
+contexts, use server `--context 32768`; actual prompt depth is recorded. Every run
+uses its own 8 GiB disk budget inside the output directory, regardless of suite
+selection, matching production persistence (component caches have no RAM tier).
+The runner removes
 that disk cache when the run ends, keeping reports and logs. With
 `--sampling-preset deepseek4` it also passes a 1 GiB
 `--cache-disk-staging-bytes`. Flash-Next and Qwen27B reject that option and

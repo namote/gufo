@@ -45,7 +45,7 @@ from cache_compaction import check_cache_compaction
 from cache_workloads import check_cache_transforms, check_cache_pressure
 from cache_messages_loop import check_cache_messages_loop
 from system_injection import check_system_injection
-from cache_growth import check_cache_growth, check_unchanged_retry, log_offset
+from cache_growth import ASSISTANT_OPENING_TOKENS, check_cache_growth, check_unchanged_retry, log_offset
 from messages_tools import check_messages_tools
 from reasoning_budget import check_reasoning_budget
 from messages_count_tokens import check_messages_count_tokens, check_messages_image_counts
@@ -1085,6 +1085,18 @@ def check_long_context(client, model, checks, context, vision=False, server_log=
     def signature(result):
         return result["text"], result["reasoning"].strip(), result["finish"], result["tools"]
 
+    # The learned boundary ends at the system turn's end marker, so the
+    # mutable suffix is the newline after it plus the final user turn and its
+    # assistant opening. Count that turn independently, as the agent-history
+    # checks do, and add the one separator token the lone count omits.
+    mutable_suffix_tokens = ASSISTANT_OPENING_TOKENS
+    if not vision:
+        from messages_count_tokens import assert_count_response
+        suffix = client.post("/messages/count_tokens", body={
+            "model": model, "thinking": {"type": "disabled"},
+            "messages": [messages[-1]]}, cast_to=object)
+        checks["long_schema_mutable_suffix_count"] = suffix
+        mutable_suffix_tokens = assert_count_response(suffix) + 1
     replay_start = log_offset(server_log)
     first = chat("long_schema_cold", request)
     assert json.loads(first["text"]) == {"keyword": "LANTERN"}, first
@@ -1098,7 +1110,8 @@ def check_long_context(client, model, checks, context, vision=False, server_log=
     assert usage["prompt_tokens"] == depth, replay
     assert usage["cached_tokens"] + prefilled == depth, replay
     check_unchanged_retry("long_schema_cached", replay, prefilled,
-                          server_log, replay_start, replay_end)
+                          server_log, replay_start, replay_end,
+                          mutable_suffix_tokens=mutable_suffix_tokens)
 
     # Reuse the same multimodal history through the Responses SDK, with sampled
     # output and a new turn. JSON validity alone would not catch lost memory.

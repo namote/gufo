@@ -308,7 +308,6 @@ def main():
                     and (suite not in ("image-inputs", "image-count", "tool-images", "image-detail")
                          or option(command, "--mmproj") is not None)]
     selected = [suite for suite in dict.fromkeys(selected) if INCLUDED_IN.get(suite) not in selected]
-    disk_enabled = bool(set(selected) & {"cache", "image-count"})
     try:
         overrides = sampling_overrides(command)
         sessions = int(option(command, "--sessions", "4"))
@@ -341,13 +340,14 @@ def main():
                           ("--max-pending-per-client", str(max(4, sessions)))):
         if option(command, flag) is None:
             command += [flag, default]
-    if disk_enabled:
-        command += ["--cache-disk", str(output / "disk"),
-                    "--cache-disk-bytes", str(8 * 1024**3)]
-        # Flash-Next and Qwen27B reject the staging option; only the legacy
-        # continuation disk store (DeepSeek) takes it.
-        if args.sampling_preset == "deepseek4":
-            command += ["--cache-disk-staging-bytes", str(1024**3)]
+    # Production uses disk persistence; component caches have no RAM tier.
+    # Keep the cache configuration identical across suite selections.
+    command += ["--cache-disk", str(output / "disk"),
+                "--cache-disk-bytes", str(8 * 1024**3)]
+    # Flash-Next and Qwen27B reject the staging option; only the legacy
+    # continuation disk store (DeepSeek) takes it.
+    if args.sampling_preset == "deepseek4":
+        command += ["--cache-disk-staging-bytes", str(1024**3)]
     model = option(command, "--served-model-name")
     vision = option(command, "--mmproj") is not None
     speculative = option(command, "--speculative",
@@ -531,9 +531,8 @@ def main():
         raise
     finally:
         # The servers have exited. Each run's snapshots can fill the whole
-        # disk budget, and the restart checks were their only reader.
-        if disk_enabled:
-            shutil.rmtree(output / "disk", ignore_errors=True)
+        # disk budget; keep only the reports and logs after the run.
+        shutil.rmtree(output / "disk", ignore_errors=True)
     report["status"] = ("passed" if report["suites"] and "error" not in report
                         and all(row["status"] == "passed" for row in report["suites"].values())
                         else "failed")

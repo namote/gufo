@@ -529,6 +529,32 @@ class FunctionalRunnerTest(unittest.TestCase):
                 check_unchanged_retry("history", retry, 24, log, 0, log.stat().st_size,
                                       mutable_suffix_tokens=24)
 
+    def test_retry_accepts_explicit_disk_spacing_within_suffix_bound(self):
+        from cache_growth import check_unchanged_retry
+        retry = {"usage": {"prompt_tokens": 300}}
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "server.log"
+            log.write_text("schema=component-cache-v1 event=capture_refused "
+                           "reason=min_step tokens=300\n")
+            check_unchanged_retry("uri", retry, 8, log, 0, log.stat().st_size)
+            with self.assertRaises(AssertionError):
+                check_unchanged_retry("uri", retry, 17, log, 0, log.stat().st_size)
+            for event in (
+                "event=capture_refused reason=min_step tokens=3000",
+                "event=capture_refused reason=min_step tokens=292",
+                "event=snapshot_skipped reason=3 tokens=300",
+                "event=capture_failed reason=unknown tokens=300",
+                "event=capture_refused reason=byte_capacity tokens=292",
+            ):
+                log.write_text("schema=component-cache-v1 " + event + "\n")
+                with self.subTest(event=event), self.assertRaises(AssertionError):
+                    check_unchanged_retry("uri", retry, 8, log, 0, log.stat().st_size)
+            log.write_text("schema=component-cache-v1 event=capture_refused "
+                           "reason=min_step tokens=300\n")
+            end = log.stat().st_size
+            with self.assertRaises(AssertionError):
+                check_unchanged_retry("uri", retry, 8, log, end, end)
+
     def test_disk_spacing_uses_capture_ids_for_delayed_publications(self):
         totals = (2400, 2680, 2960, 3240, 3520, 5960, 6240)
         report = {"turns": [{"measured": {"total": total, "checkpoint_ids": [i + 1]}}
@@ -555,9 +581,86 @@ class FunctionalRunnerTest(unittest.TestCase):
         # Ownership must still reject a real too-close fixture checkpoint and
         # duplicate publications. Foreign refusals cannot satisfy coverage.
         for bad in (grown + event(3, 2956), grown + event(1, 2396),
+                    grown + event(3, 2048),
                     event(1, 2396) + event(6, 5956) + event(90, 2680, True) * 5):
             with self.subTest(log=bad), self.assertRaises(ValueError):
                 check_disk_spacing(bad, restored, report, restored_report)
+
+    def test_disk_spacing_accepts_pre_capture_skips(self):
+        totals = (2400, 2680, 2960, 3240, 3520, 5960, 6240)
+        report = {"turns": [{"measured": {
+            "total": total, "cached": totals[i - 1] if i else 0,
+            "checkpoint_ids": [i + 1] if i in (0, 5) else []}}
+            for i, total in enumerate(totals)]}
+        grown = ("schema=component-cache-v1 event=published tokens=2396 checkpoint_id=1\n"
+                 "schema=component-cache-v1 event=published tokens=5956 checkpoint_id=6\n")
+        restored = "schema=component-cache-v1 event=published tokens=3012 checkpoint_id=41\n"
+        restored_report = {"replayed": {"checkpoint_ids": []},
+                           "branched": {"checkpoint_ids": [41]}}
+        summary = check_disk_spacing(grown, restored, report, restored_report)
+        self.assertEqual(summary["min_step_skips"], 0)
+        self.assertEqual(summary["pre_capture_skips"], 5)
+        for kind in ("cold", "failed capture", "extra publication", "later anchor"):
+            bad = deepcopy(report)
+            log = grown
+            if kind == "later anchor":
+                bad["turns"][5]["measured"]["checkpoint_ids"] = []
+                bad["turns"][6]["measured"]["checkpoint_ids"] = [6]
+            elif kind == "cold":
+                bad["turns"][2]["measured"]["cached"] = 0
+            else:
+                bad["turns"][2]["measured"]["checkpoint_ids"] = [3]
+                if kind == "extra publication":
+                    log += "schema=component-cache-v1 event=published tokens=2956 checkpoint_id=3\n"
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                check_disk_spacing(log, restored, bad, restored_report)
+
+    def test_disk_spacing_exempts_learned_publications(self):
+        totals = (2400, 2680, 2960, 3240, 3520, 5960, 6240)
+        report = {"turns": [{"measured": {
+            "total": total, "cached": totals[i - 1] if i else 0,
+            "checkpoint_ids": [1, 50] if i == 0 else [6] if i == 5 else []}}
+            for i, total in enumerate(totals)]}
+        restored_report = {"replayed": {"checkpoint_ids": []},
+                           "branched": {"checkpoint_ids": [41]}}
+
+        def event(id_, tokens, purpose=""):
+            return (f"schema=component-cache-v1 event=published tokens={tokens} "
+                    f"checkpoint_id={id_}" + (f" purpose={purpose}" if purpose else "") + "\n")
+
+        ordinary = event(1, 2396, "prompt") + event(6, 5956, "prompt")
+        restored = event(41, 3012, "learned")
+        # A learned system boundary is exempt both outside and inside the
+        # approximate token window, even when captured by the first turn.
+        for tokens in (2252, 2390):
+            learned = event(50, tokens, "learned")
+            with self.subTest(tokens=tokens):
+                result = check_disk_spacing(ordinary + learned, restored, report, restored_report)
+                self.assertEqual(result["stored_tokens"], [2396, 5956])
+                self.assertEqual(result["pre_capture_skips"], 5)
+                self.assertEqual(result["shared_boundary_tokens"], [3012])
+                # Ownership still excludes foreign publications and duplicates.
+                foreign = event(90, tokens, "learned") * 2
+                self.assertEqual(check_disk_spacing(ordinary + learned + foreign, restored,
+                                                    report, restored_report), result)
+                # A missing or unknown purpose never grants the exemption.
+                for extra in (learned * 2, event(50, tokens), event(50, tokens, "unknown")):
+                    with self.subTest(extra=extra), self.assertRaises(ValueError):
+                        check_disk_spacing(ordinary + extra, restored, report, restored_report)
+                with self.assertRaises(ValueError):
+                    check_disk_spacing(ordinary + learned, restored * 2, report, restored_report)
+
+        # The fourth short turn is within 2048 of the learned boundary but
+        # beyond 2048 of the ordinary one. The learned point cannot justify
+        # a pre-capture skip, despite belonging to an earlier turn.
+        anchor_totals = (2400, 2600, 3000, 3500, 4410, 7000, 7250)
+        bad = deepcopy(report)
+        for i, turn in enumerate(bad["turns"]):
+            turn["measured"].update(total=anchor_totals[i],
+                                    cached=anchor_totals[i - 1] if i else 0)
+        grown = event(1, 2336, "prompt") + event(50, 2396, "learned") + event(6, 6996, "prompt")
+        with self.assertRaises(ValueError):
+            check_disk_spacing(grown, restored, bad, restored_report)
 
     def run_cache_depth(self, lost=False, retry_work=False, contaminated=False,
                         recorder=None, concurrency=4):
@@ -1745,14 +1848,29 @@ p.with_suffix(".requests.json").write_text(json.dumps({{
                         "--suite", "responses"]
                 args += ["--baseline", str(baseline)] if baseline else ["--record-baseline"]
                 args += ["--", sys.executable, "serve", "llm", "--model", "fixture.gguf"]
+                def server(command, log, timeout):
+                    # Even a non-cache suite uses a runner-owned disk cache.
+                    disk = Path(functional.option(command, "--cache-disk"))
+                    self.assertEqual(disk, root / name / "disk")
+                    self.assertEqual(functional.option(command, "--cache-disk-bytes"),
+                                     str(8 * 1024**3))
+                    self.assertNotIn("--cache-disk-staging-bytes", command)
+                    disk.mkdir()
+                    (disk / "entry.kvc").write_bytes(b"fixture")
+                    return contextlib.nullcontext()
+
                 with patch.object(sys, "argv", args), patch.object(functional, "TESTS", root), \
-                     patch.object(functional, "server", return_value=contextlib.nullcontext()), \
+                     patch.object(functional, "server", side_effect=server), \
                      patch.object(functional, "provenance", return_value={}), \
                      patch.object(functional, "join_server_timings"), \
                      patch.object(functional, "execution_coverage", return_value={}), \
                      contextlib.redirect_stdout(io.StringIO()):
                     code = functional.main()
-                return code, json.loads((root / name / "report.json").read_text())
+                self.assertFalse((root / name / "disk").exists())
+                report = json.loads((root / name / "report.json").read_text())
+                self.assertEqual(functional.option(report["comparison_command"], "--cache-disk"),
+                                 "<runner-owned>")
+                return code, report
 
             self.assertEqual(run("main", 100)[0], 0)
             code, report = run("pr", 150, baseline=root / "main")

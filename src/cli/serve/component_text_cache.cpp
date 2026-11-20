@@ -137,6 +137,19 @@ bool AnyPosition(const cache::PrefixCandidate& candidate) {
   return candidate.durable && candidate.durable->Manifest().purpose ==
                                   cache::CheckpointPurpose::kGenerated;
 }
+std::string_view PurposeName(cache::CheckpointPurpose purpose) {
+  switch (purpose) {
+    case cache::CheckpointPurpose::kPrompt:
+      return "prompt";
+    case cache::CheckpointPurpose::kGenerated:
+      return "generated";
+    case cache::CheckpointPurpose::kGrid:
+      return "grid";
+    case cache::CheckpointPurpose::kLearned:
+      return "learned";
+  }
+  return "unknown";
+}
 bool SpacingAnchor(cache::CheckpointPurpose purpose) {
   return purpose != cache::CheckpointPurpose::kLearned;
 }
@@ -617,6 +630,8 @@ struct ComponentTextCache::Impl {
               std::to_string(description->Manifest().tokens.size()) +
               " checkpoint_id=" + std::to_string(id.value) + " payload_bytes=" +
               std::to_string(PayloadBytes(description->Manifest())) +
+              " purpose=" +
+              std::string(PurposeName(description->Manifest().purpose)) +
               " yield_ms=" + std::to_string(timing.yield_ns / 1e6) +
               " stream_wait_ms=" + std::to_string(timing.stream_wait_ns / 1e6) +
               " filesystem_ms=" + std::to_string(timing.filesystem_ns / 1e6) +
@@ -928,8 +943,13 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
     throw cache::ResourceExhausted();
   const auto capture_input = At(input, capture_tokens.size());
   if (purpose != SnapshotPurpose::kBranchPoint && !write_back &&
-      cache->WithinDiskStep(capture_tokens, capture_input))
+      cache->WithinDiskStep(capture_tokens, capture_input)) {
+    Logger::Info("cache",
+                 "schema=component-cache-v1 event=capture_refused "
+                 "reason=min_step tokens=" +
+                     std::to_string(capture_tokens.size()));
     return {};
+  }
   const auto positions = cache->resources->adapter->Positions(slot.Execution());
   const auto descriptors = cache->resources->adapter->Components();
   struct Copy {
@@ -1444,6 +1464,12 @@ std::string ComponentTextCache::Lease::Impl::HostCopy(
   try {
     // The scheduler runs no other model work meanwhile, so the device reads
     // run at full speed; batch them as the reassignment copy does.
+    // An interrupted decode can invalidate the execution state without
+    // overwriting its observed prefix rows. Read those through their pinned
+    // views, like the disk writer, rather than the adapter's state capture.
+    // Pins outlive transfers even when a submission or completion throws.
+    std::vector<cache::RowPin> pins;
+    pins.reserve(extras.size());
     TransferBatch transfers(
         std::clamp<std::size_t>(std::max(resources.transfer_batch_size,
                                          resources.reassignment_batch_size),
@@ -1451,6 +1477,20 @@ std::string ComponentTextCache::Lease::Impl::HostCopy(
     for (std::size_t i = 0; i < order.size(); ++i) {
       const auto& piece = item(i);
       const std::span<std::byte> destination(at(i), piece.bytes);
+      if (i >= pieces.size()) {
+        const auto [rows, offset] = extra_targets[i - pieces.size()];
+        auto pin = observed[rows]->PinOrCopyHosted(offset, destination);
+        if (!pin)
+          continue;
+        const auto source = pin->Bytes().subspan(offset, piece.bytes);
+        pins.push_back(std::move(*pin));
+        transfers.Add([&] { return resources.stream(); },
+                      [&](cache::Stream& stream) {
+                        return resources.copy_observed_rows(source, destination,
+                                                            stream);
+                      });
+        continue;
+      }
       transfers.Add([&] { return resources.stream(); },
                     [&](cache::Stream& stream) {
                       return piece.private_state
@@ -2294,9 +2334,14 @@ std::optional<TextPendingPublication> ComponentTextCache::PendingPublication(
         capture->manifest.input != At(input, tokens.size()) ||
         !std::equal(tokens.begin(), tokens.end(), prompt.begin()))
       continue;
-    TextPendingPublication candidate{id, best, tokens.size()};
-    if (!checkpoint_id &&
-        candidate.Gain() <= TextPendingPublication::kMinimumGainTokens)
+    // The queued capture is already known, independently of the live slot.
+    // A retry can arrive before the source's cancellation settles or while
+    // it still decodes. Waiting is bounded by the scheduler in either case.
+    const bool short_replay =
+        best == 0 &&
+        prompt.size() <= TextPendingPublication::kMinimumGainTokens;
+    TextPendingPublication candidate{id, best, tokens.size(), short_replay};
+    if (!checkpoint_id && !candidate.WorthWaiting())
       continue;
     if (!selected || candidate.pending_tokens > selected->pending_tokens ||
         (candidate.pending_tokens == selected->pending_tokens &&

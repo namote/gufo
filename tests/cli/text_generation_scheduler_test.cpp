@@ -74,6 +74,8 @@ void TestPublicationWaitUsesRecentSubstantialPrefill() {
   PublicationWaitEstimate estimate;
   Expect(!estimate.Limit(55000),
          "an uncalibrated model must not park admission");
+  Expect(estimate.ShortReplayLimit(300) == std::chrono::seconds(2),
+         "an uncalibrated short retry waits at most two seconds");
   for (const auto milliseconds :
        {0.0, -1.0, std::numeric_limits<double>::infinity(),
         std::numeric_limits<double>::quiet_NaN()})
@@ -98,6 +100,40 @@ void TestPublicationWaitUsesRecentSubstantialPrefill() {
     estimate.Observe(4096, 100);
   Expect(estimate.Limit(8192)->count() == 200,
          "recent prefill replaces stale startup measurements");
+  Expect(estimate.ShortReplayLimit(300).count() > 7.3 &&
+             estimate.ShortReplayLimit(300).count() < 7.4,
+         "a short retry uses its cheaper estimated prefill cost");
+  // A 61-token cold prompt first prefills its 52-token stable boundary.
+  // Bulk throughput predicted only 66.8 ms; its measured cold step takes
+  // 167 ms. Warm tails still pass through Observe and cannot replace it.
+  PublicationWaitEstimate short_model;
+  short_model.Observe(4096, 5260);
+  Expect(short_model.ShortReplayLimit(52).count() < 67,
+         "bulk extrapolation underestimates the short cold step");
+  short_model.ObserveColdShort(52, 167);
+  short_model.ObserveColdShort(120, 240);
+  short_model.Observe(9, 100);
+  Expect(short_model.ShortReplayLimit(52).count() == 167,
+         "the nearest short cold sample determines the cost bound");
+  short_model.ObserveColdShort(52, 180);
+  Expect(short_model.ShortReplayLimit(52).count() == 180,
+         "the newest matching short sample wins");
+  Expect(short_model.Limit(8192)->count() == 10520,
+         "short cold samples do not inflate long-request estimates");
+  for (int i = 0; i < 8; ++i)
+    short_model.ObserveColdShort(52, 20);
+  Expect(short_model.ShortReplayLimit(52).count() == 20,
+         "recent fast cold samples replace stale short timings");
+  PublicationWaitEstimate short_only;
+  short_only.ObserveColdShort(52, 5000);
+  Expect(short_only.ShortReplayLimit(52) == std::chrono::seconds(2),
+         "short cold measurements cannot exceed the two-second cap");
+  Expect(!short_only.Limit(8192),
+         "a short sample cannot calibrate a long publication wait");
+  PublicationWaitEstimate slow_model;
+  slow_model.Observe(256, 10000);
+  Expect(slow_model.ShortReplayLimit(300) == std::chrono::seconds(2),
+         "a slow prefill estimate cannot extend the short retry cap");
   PublicationWaitEstimate other_model;
   Expect(!other_model.Limit(8192), "another model/pool starts uncalibrated");
 }

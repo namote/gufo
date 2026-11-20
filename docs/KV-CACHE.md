@@ -197,6 +197,21 @@ waits at most once, and at most `--sessions - 1` requests wait at a time. With
 `--sessions 1` nothing waits, because a second request is never admitted
 while the first prefills.
 
+A short retry can arrive before its checkpoint reaches disk, including while
+its source still decodes or settles cancellation. If a prompt of at most 4,096
+tokens has no usable prefix and a compatible publication is already queued,
+admission waits for that checkpoint. The wait is bounded by the smaller of two
+seconds and the estimated saved prefill time, using two seconds when no timing
+sample exists. For gains below 256 tokens, the estimate uses the nearest recent
+first prefill step of a cold short prompt when available; warm suffixes and later
+checkpoint tails do not calibrate it. This accounts for short-prefill overhead
+that large-chunk throughput underestimates. Its deadline can shorten but never
+extend. Publication failure,
+cancellation or expiry releases the request; expiry is checked between scheduler
+work units. Parked retries reserve admission capacity within that bound. Ordinary
+warm requests keep the existing cost-bounded wait policy. This does not change
+disk checkpoint spacing or restore a RAM checkpoint tier.
+
 Measured on Flash-Next with `--sessions 4` and a 3.8k-token shared system
 prompt, four concurrent requests took 13.4 s with each prefilling 3.9k tokens.
 Prefilling the shared prefix once and restoring it took 4.6 s, each request
@@ -490,7 +505,18 @@ copied first into pinned host arenas of 64 MiB (a larger piece takes its own),
 at most 4 GiB in all, returned when written and freed after 60 s unused. A
 capture that finds no arena room is held on its session until the writer reads
 it (idle write-back, reassignment) or is skipped (`event=capture_staging_refused`).
-A boundary within the disk step of an earlier checkpoint is not copied at all.
+A boundary within the disk step of an earlier checkpoint is not copied at all
+(`event=capture_refused reason=min_step tokens=...`). This includes a complete
+prompt just beyond its stable boundary: an unchanged retry restores that boundary
+and prefills its mutable suffix, rather than requiring a second disk publication.
+The functional checker requires that exact prompt-length refusal and keeps the
+assistant-opening or independently counted user-suffix bound.
+
+Cancellation after interrupted execution preserves queued captures before the
+component lease resets the slot. Their observed prefix rows are read through
+pinned views, which remain valid even if the execution state cannot be resumed;
+no new live-state snapshot is taken. Preservation remains bounded by the existing
+host snapshot arenas, and a capacity refusal can still leave the capture uncached.
 
 The cache's host bookkeeping (index, histories, disk store and catalog,
 publication scratch) is charged to a ledger that holds metadata only: 256 MiB
@@ -620,7 +646,8 @@ a top-level `cache_persist`; see [the server guide](SERVER.md).
 | `schema=component-cache-v1 event=disk_evicted reason=budget` | Flash-Next: startup removed the oldest checkpoints (creation order) to fit a lowered `--cache-disk-bytes` |
 | `schema=component-cache-v1 event=disk_evicted reason=lru` | Qwen27B/Flash-Next: a publication evicted the least recently used checkpoint to stay inside `--cache-disk-bytes`: its `checkpoint_id`, `tokens`, `payload_bytes`, the store's `managed_bytes` afterwards against `capacity_bytes`, and the incoming checkpoint's `for_tokens` |
 | `schema=component-cache-v1 event=disk_over_budget` | Flash-Next: the directory still exceeds `--cache-disk-bytes` after startup reclamation and eviction; publication is refused until it fits |
-| `schema=component-cache-v1 event=published` | A checkpoint finished disk publication; `checkpoint_id` identifies the capture and `tokens` its boundary |
+| `schema=component-cache-v1 event=published` | A checkpoint finished disk publication; `checkpoint_id` identifies the capture, `tokens` its boundary, and `purpose` is `prompt`, `generated`, `grid` or `learned`. Learned shared-prefix checkpoints bypass ordinary disk spacing and do not anchor it. Older logs without `purpose` are treated as non-learned by the spacing checker. |
+| `schema=component-cache-v1 event=capture_refused reason=min_step` | A planned capture was skipped before copying because a compatible published or queued checkpoint anchors the disk spacing; `tokens` identifies the requested boundary. Learned captures are exempt. |
 | `schema=component-cache-v1 event=persistence_refused reason=min_step` | A captured checkpoint is too close to an existing publication; includes `checkpoint_id` and `tokens` |
 | `event=snapshot action=removed reason=entry_capacity` | a retained prefix was evicted because every entry was taken |
 | `event=snapshot action=skipped reason=entry_capacity` | no checkpoint record could be replaced safely for this capture |

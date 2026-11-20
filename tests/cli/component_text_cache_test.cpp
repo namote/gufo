@@ -12,6 +12,7 @@
 #include <future>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <semaphore>
 #include <sstream>
@@ -1129,6 +1130,214 @@ void NearTailDiskBranchSurvivesRestart() {
   }
   std::filesystem::remove_all(directory);
 }
+void ShortReplayWaitsForPublication() {
+  // Below both the 4096-token optional-wait gate and the 256-token
+  // estimator floor. Hold the writer so neither reuse nor failure depends
+  // on the filesystem winning a race with admission.
+  enum Mode {
+    kRetry,
+    kCancelledSource,
+    kCancellingSource,
+    kInterruptedDecodeSource,
+    kTimeout,
+    kCancelWait,
+    kFailedWrite,
+    kBypass,
+    kWarm
+  };
+  for (const auto mode :
+       {kRetry, kCancelledSource, kCancellingSource, kInterruptedDecodeSource,
+        kTimeout, kCancelWait, kFailedWrite, kBypass, kWarm}) {
+    struct Gate {
+      std::atomic<bool> entered{false};
+      std::binary_semaphore reading{0}, release{0};
+      bool fail{};
+      std::mutex mutex;
+      std::thread::id writer;
+    };
+    struct HeldRunner final : Runner {
+      std::shared_ptr<Gate> gate = std::make_shared<Gate>();
+      bool interrupt_decode{};
+      mutable bool fail_decode{};
+      TextDecodeStep DecodeStep(
+          TextRunnerState& state, std::size_t max_tokens,
+          sampling::SamplerState& sampler) const override {
+        if (!std::exchange(fail_decode, false))
+          return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+        auto& s = dynamic_cast<State&>(state);
+        // Like Flash-Next cancellation mid-verification: execution is
+        // unusable, but no mutation has overwritten the captured prefix.
+        s.adapter.FailExecution(s.slot);
+        throw std::runtime_error("interrupted decode");
+      }
+      std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+          cache::ResourceLedger& ledger) const override {
+        auto resources = Runner::CreateComponentCacheResources(ledger);
+        if (interrupt_decode) {
+          // The first observed-row read identifies the disk writer. Its
+          // next stream acquisition stops before another reader pin is
+          // taken; capture workers must remain free to finish prefill.
+          resources->copy_observed_rows =
+              [gate = gate, copy = resources->copy_observed_rows](
+                  auto source, auto destination, cache::Stream& stream) {
+                {
+                  const std::lock_guard lock(gate->mutex);
+                  if (gate->writer == std::thread::id{})
+                    gate->writer = std::this_thread::get_id();
+                }
+                return copy(source, destination, stream);
+              };
+          resources->stream = [gate = gate, stream = resources->stream]() {
+            bool writer;
+            {
+              const std::lock_guard lock(gate->mutex);
+              writer = gate->writer == std::this_thread::get_id();
+            }
+            if (writer && !gate->entered.exchange(true)) {
+              gate->reading.release();
+              gate->release.acquire();
+            }
+            return stream();
+          };
+          return resources;
+        }
+        resources->copy_observed_rows =
+            [gate = gate, copy = resources->copy_observed_rows](
+                auto source, auto destination, cache::Stream& stream) {
+              if (!gate->entered.exchange(true)) {
+                gate->reading.release();
+                gate->release.acquire();
+                if (gate->fail)
+                  throw std::runtime_error("injected publication failure");
+              }
+              return copy(source, destination, stream);
+            };
+        return resources;
+      }
+    };
+    const TemporaryDirectory temp("gufo-component-short-replay");
+    const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
+                                          .capacity_bytes = 1 << 22};
+    auto runner = std::make_shared<HeldRunner>();
+    runner->gate->fail = mode == kFailedWrite;
+    runner->interrupt_decode = mode == kInterruptedDecodeSource;
+    auto pool = std::make_shared<TextRunnerPool>(runner, 4, disk);
+    std::vector<TextRunnerToken> prompt(192);
+    std::iota(prompt.begin(), prompt.end(), 10);
+    auto live = prompt;
+    std::atomic<bool> cancel_source{false};
+    auto first = pool->Acquire(
+        prompt, {}, [&] { return cancel_source.load(); }, {}, true, 184);
+    Prefill(first);
+    live.push_back(Generate(first));
+    if (mode == kCancelledSource)
+      (void)first.Cancel();
+    else if (mode != kCancellingSource && mode != kInterruptedDecodeSource)
+      (void)first.Commit();
+    assert(runner->gate->reading.try_acquire_for(std::chrono::seconds(5)));
+    if (mode == kInterruptedDecodeSource) {
+      runner->fail_decode = true;
+      bool interrupted = false;
+      try {
+        (void)first.DecodeStep(1);
+      } catch (const std::runtime_error&) {
+        interrupted = true;
+      }
+      assert(interrupted);
+    }
+    if (mode == kCancelledSource || mode == kCancellingSource ||
+        mode == kInterruptedDecodeSource) {
+      // A client replay can rewrite the cancelled assistant opening; the
+      // earlier stable boundary must remain usable.
+      prompt.resize(186);
+      prompt[185] = 900000;
+    }
+    const auto pending = pool->PendingPublication(prompt, nullptr);
+    assert(pending && pending->short_replay && pending->WorthWaiting() &&
+           pending->pending_tokens == 184);
+    if (mode == kRetry) {
+      // Once parked, another continuation of the producer's live branch
+      // must not turn this tracked wait back into a cold admission.
+      live.push_back(900001);
+      auto active = pool->Acquire(live, {}, {}, {}, true, 193);
+      assert(active.cached_prompt_tokens() == 193);
+      const auto tracked =
+          pool->PendingPublication(prompt, nullptr, pending->checkpoint_id);
+      assert(tracked && tracked->short_replay && tracked->WorthWaiting());
+      (void)active.Cancel();
+    }
+    if (mode == kWarm) {
+      auto warm = pool->Acquire({prompt.begin(), prompt.begin() + 100}, {}, {},
+                                {}, false, 0, true, 0, false);
+      Prefill(warm);
+      (void)warm.Commit();
+      assert(!pool->PendingPublication(prompt, nullptr));
+    }
+    // Warm side work demonstrates independent admission without feeding a
+    // tiny cold timing sample into the parked retry's cost estimate.
+    auto side_prefix = pool->Acquire(std::vector<TextRunnerToken>(12, 5), {},
+                                     {}, {}, false, 0, true, 0, false);
+    Prefill(side_prefix);
+    (void)side_prefix.Commit();
+    {
+      TextGenerationScheduler scheduler(pool);
+      TextRequestMetadata metadata;
+      metadata.cache_prompt = mode != kBypass;
+      // Model a socket disconnect followed immediately by a retry: the
+      // source's cancellation flag is set, but its lease is still busy and
+      // Cancel() has not committed or invalidated it yet.
+      if (mode == kCancellingSource || mode == kInterruptedDecodeSource)
+        cancel_source = true;
+      auto replay = scheduler.Submit(prompt, 2, 0.0F, {}, false, metadata);
+      auto done = std::async(std::launch::async, [&] { return replay.Wait(); });
+      // A later independent request completes while this replay is parked.
+      TextRequestMetadata side_metadata;
+      side_metadata.cache_persist = false;
+      auto side = scheduler.Submit(std::vector<TextRunnerToken>(13, 5), 2, 0.0F,
+                                   {}, false, side_metadata);
+      (void)side.Wait();
+      if (mode == kBypass || mode == kWarm) {
+        assert(done.wait_for(std::chrono::seconds(5)) ==
+               std::future_status::ready);
+        assert(done.get().cached_prompt_tokens == (mode == kWarm ? 100 : 0));
+      } else {
+        assert(done.wait_for(std::chrono::milliseconds(100)) ==
+               std::future_status::timeout);
+        assert(replay.phase() == TextRequestPhase::kQueued);
+        if (mode == kCancellingSource || mode == kInterruptedDecodeSource) {
+          scheduler.RunBetweenSteps([&] { (void)first.Cancel(); });
+          assert(done.wait_for(std::chrono::milliseconds(100)) ==
+                 std::future_status::timeout);
+        }
+        if (mode == kCancelWait) {
+          replay.Cancel();
+          assert(done.wait_for(std::chrono::seconds(5)) ==
+                 std::future_status::ready);
+          assert(done.get().cancelled);
+        }
+      }
+      if (mode == kTimeout) {
+        // The writer stays blocked: expiry must admit cold instead of
+        // waiting for the old 120-second cap or publication completion.
+        assert(done.wait_for(std::chrono::seconds(5)) ==
+               std::future_status::ready);
+        assert(done.get().cached_prompt_tokens == 0);
+      }
+      runner->gate->release.release();
+      if (mode != kCancelWait && mode != kBypass && mode != kWarm &&
+          mode != kTimeout) {
+        assert(done.wait_for(std::chrono::seconds(10)) ==
+               std::future_status::ready);
+        const auto result = done.get();
+        assert(result.cached_prompt_tokens == (mode == kFailedWrite ? 0 : 184));
+        assert(result.prefill_tokens ==
+               prompt.size() - result.cached_prompt_tokens);
+        assert(result.cache_disk_hit == (mode != kFailedWrite));
+      }
+    }
+  }
+}
+
 void UnbackedDeepRowsSurviveDiskRestart() {
   struct Gate {
     std::atomic<bool> entered{false};
@@ -3058,6 +3267,7 @@ int main(int argc, char** argv) {
       CASE(DiskDirectoryHasOneOwner()),
       CASE(NearTailDiskBranchSurvivesRestart()),
       CASE(UnbackedDeepRowsSurviveDiskRestart()),
+      CASE(ShortReplayWaitsForPublication()),
       CASE(HeldReassignmentWritesOnTheWriter()),
       CASE(ReassignmentSnapshotReleasesTheSlotBeforeTheWrite()),
       CASE(SnapshotHostsRowsQueuedJobsObserve()),

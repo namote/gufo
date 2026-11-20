@@ -268,6 +268,9 @@ void FakeAdapter::SetPrefillPassRows(Rows rows) {
 void FakeAdapter::SetExecutionComplete(Slot& slot, bool complete) {
   AsSlot(slot).execution_complete = complete;
 }
+void FakeAdapter::FailExecution(Slot& slot) {
+  AsSlot(slot).valid = false;
+}
 std::vector<Rows> FakeAdapter::PlanPrefill(const Slot& slot, Rows first,
                                            Rows end) const {
   if (!slot.IsValid() || first > end)

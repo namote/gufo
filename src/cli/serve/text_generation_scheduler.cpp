@@ -1186,6 +1186,15 @@ struct TextGenerationScheduler::Impl {
                request->prefix_position;
   }
 
+  [[nodiscard]] std::optional<detail::PublicationWaitEstimate::Milliseconds>
+  PublicationLimit(const TextPendingPublication& pending) const {
+    // A short retry must not wait behind a large active disk write longer
+    // than cold prefill would cost (or two seconds without a timing sample).
+    if (pending.short_replay)
+      return publication_prefill.ShortReplayLimit(pending.Gain());
+    return publication_prefill.Limit(pending.Gain());
+  }
+
   /// Drops stopped parked requests and releases settled ones in arrival
   /// order. Released requests are admitted before newer queued ones.
   void UpdateWaiting(std::deque<std::shared_ptr<ScheduledRequest>>& waiting) {
@@ -1220,22 +1229,24 @@ struct TextGenerationScheduler::Impl {
           EndPublicationWait(request, "not_pending");
         } else {
           request->publication = *pending;
-          if (pending->Gain() <= TextPendingPublication::kMinimumGainTokens) {
+          if (!pending->WorthWaiting()) {
             EndPublicationWait(request, "available");
-          } else if (const auto limit =
-                         publication_prefill.Limit(pending->Gain())) {
+          } else if (const auto limit = PublicationLimit(*pending)) {
             // Better usable cache or faster recent prefill may shorten the
             // original deadline. Neither slower samples nor a new disk job
             // may extend it or restart this request's one publication wait.
             request->publication_wait_limit =
                 std::min(request->publication_wait_limit, *limit);
             if (Clock::now() - *request->publication_wait_start >=
-                request->publication_wait_limit)
-              EndPublicationWait(
-                  request, request->publication_wait_limit ==
-                                   detail::PublicationWaitEstimate::kMaximumWait
-                               ? "cap"
-                               : "cost_bound");
+                request->publication_wait_limit) {
+              const auto cap =
+                  pending->short_replay
+                      ? detail::PublicationWaitEstimate::kShortReplayMaximumWait
+                      : detail::PublicationWaitEstimate::kMaximumWait;
+              EndPublicationWait(request, request->publication_wait_limit == cap
+                                              ? "cap"
+                                              : "cost_bound");
+            }
           } else {
             EndPublicationWait(request, "no_estimate");
           }
@@ -1288,7 +1299,9 @@ struct TextGenerationScheduler::Impl {
       if (request == nullptr) {
         // Parked followers already reserve a visible admission session. They
         // may resume in place, but new arrivals must respect those
-        // reservations.
+        // reservations. Short publication waits reserve capacity too; their
+        // non-extending deadline is at most two seconds, checked between work
+        // units, so a busy writer cannot reserve admission indefinitely.
         if (prefilling.size() + decoding.size() + capturing.size() +
                 kv_waiting_count + waiting.size() +
                 slot_deferred.requests.size() >=
@@ -1311,7 +1324,7 @@ struct TextGenerationScheduler::Impl {
           if (const auto pending = runner_pool->PendingPublication(
                   request->prompt, request->prompt_context.get())) {
             request->publication = *pending;
-            if (const auto limit = publication_prefill.Limit(pending->Gain())) {
+            if (const auto limit = PublicationLimit(*pending)) {
               request->publication_wait_limit = *limit;
               request->publication_wait_start = Clock::now();
               request->publication_waiting = true;
@@ -1616,6 +1629,8 @@ struct TextGenerationScheduler::Impl {
         request->result.prefill_fallback_reason =
             "incremental_prefill_unavailable";
       }
+      const bool cold_short = request->runner_request.prefill_position() == 0 &&
+                              request->runner_request.prompt_tokens() < 256;
       const auto start = Clock::now();
       const auto step = request->runner_request.Prefill(budget);
       const double step_ms =
@@ -1623,8 +1638,11 @@ struct TextGenerationScheduler::Impl {
               .count();
       request->result.prefill_ms += step_ms;
       request->result.prefill_tokens += step.consumed_tokens;
-      if (!decoder_runnable && !peer_waiting)
+      if (!decoder_runnable && !peer_waiting) {
         publication_prefill.Observe(step.consumed_tokens, step_ms);
+        if (cold_short)
+          publication_prefill.ObserveColdShort(step.consumed_tokens, step_ms);
+      }
       request->live_prefill_tokens.store(request->result.prefill_tokens,
                                          std::memory_order_relaxed);
       detail::TotalPromptTokens().fetch_add(step.consumed_tokens,

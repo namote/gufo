@@ -49,13 +49,13 @@
   - compaction_proactiveness 20과 50에서 MTP(V1-2), pin 성공 로그 확인.
   - U4-3 hang loop 한 번.
 
-**V1 후속 (남은 경계 사례, Codex 검토 2026-11-20).** 생각 중 따옴표가 덜 닫힌 뒤 복구한 도구 호출을 검사할 때 남은 문제다(`openai_chat.cpp` recovered-call 검사, upstream도 같음).
-- 정수 `1.0`과 `1e-7`이 한 호출에 같이 있으면 두 철자 어느 쪽으로도 통과하지 못한다. canonical 철자에서 지수 앞 0을 빼면 해결된다.
-- 2^53을 넘는 정수는 canonical double로 바뀐 값으로 경계를 검사한다. 숫자 잎마다 십진값이 그대로일 때만 canonical로 대체하면 정확해진다.
-
-**V1 패스에서 새로 찾은 기존 문제 (2026-11-20, V1과 관계없음).** 운영 runtime-20261120a에서도 똑같이 실패한다.
-- 짧은 대화를 다시 보내면 캐시를 다시 쓰지 못한다(`cached_tokens` 0). 끊긴 대화를 이어 갈 때도 앞부분을 잃는다(functional `tools`, `structured*`, `tool-schema-edges`, `*-cancel`). 11-18 RAM 층 제거(c597eed1) 뒤부터인 것으로 보이며, 원인 조사가 필요하다.
-- `qwen38_flash_next_session_test` `CheckServingEos`는 캐시 없는 backend에서 prefill 0 재생을 기대한다. 시험을 디스크 캐시 기준으로 고치거나, 위 문제와 함께 다룬다.
+**V1 후속 (2026-11-20 완료).** 지시서는 `V1-FOLLOWUP-BRIEF.md`, 결과는 KNOWHOW "Short-replay and cancelled-conversation cache misses fixed".
+- 짧은 대화를 다시 보내거나 끊긴 대화를 이어 갈 때 캐시를 놓치던 문제를 고쳤다. 원인은 두 가지였다.
+  - 저장이 끝나기 전에 재요청이 들어와 그냥 처리됐다.
+  - 생성을 끊으면 저장 대기 중이던 사본이 먼저 지워졌다.
+- functional runner는 이제 항상 디스크 캐시를 켠다.
+- `CheckServingEos`의 기대값을 지금 구조에 맞게 고쳤다.
+- 복구한 도구 호출의 숫자는 숫자마다 정확한 canonical 철자로 검사한다(`1.0`과 `1e-7`을 함께 쓴 경우, 2^53을 넘는 정수).
 
 ## V2 속도 개선 (2묶음, 중간 크기)
 

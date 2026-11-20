@@ -14,8 +14,8 @@ def log_offset(server_log):
 
 
 def retry_copy_refused(server_log, start, end, prompt_tokens):
-    """Whether memory pressure refused a complete-prompt copy in a log window.
-    Failed captures are not pressure and do not count."""
+    """Whether pressure or component disk spacing refused a complete-prompt copy.
+    Failed captures and unrelated token counts do not count."""
     if server_log is None:
         return False
     with server_log.open("rb") as log:
@@ -24,16 +24,16 @@ def retry_copy_refused(server_log, start, end, prompt_tokens):
     legacy = re.search(r"event=snapshot action=skipped reason=(?:byte|entry)_capacity "
                        rf"bytes=\d+ tokens={prompt_tokens} ", window)
     component = re.search(r"schema=component-cache-v1 event=capture_refused "
-                          rf"reason=(?:byte|entry)_capacity tokens={prompt_tokens}(?:\s|$)", window)
+                          rf"reason=(?:(?:byte|entry)_capacity|min_step) tokens={prompt_tokens}(?:\s|$)", window)
     return legacy is not None or component is not None
 
 
 def check_unchanged_retry(label, retry, prefilled, server_log, start, end, *,
                           mutable_suffix_tokens=ASSISTANT_OPENING_TOKENS):
-    """An unchanged retry reuses the complete prompt. Under memory pressure the
-    previous request's complete-prompt copy is refused rather than displace
-    another conversation's last checkpoint (docs/KV-CACHE.md); the retry then
-    restores the stable boundary and prefills only the mutable suffix. For
+    """An unchanged retry reuses the complete prompt or a nearby stable boundary.
+    A complete-prompt copy may be refused under memory pressure or by component
+    disk spacing (docs/KV-CACHE.md); the retry then restores the stable boundary
+    and prefills only the mutable suffix. Both require explicit log evidence. For
     agent histories that includes the last user turn; its bound is measured
     separately with the count-tokens endpoint, not padded with extra slack."""
     if not prefilled:
@@ -43,7 +43,7 @@ def check_unchanged_retry(label, retry, prefilled, server_log, start, end, *,
     assert type(mutable_suffix_tokens) is int and mutable_suffix_tokens > 0
     assert prefilled <= mutable_suffix_tokens and \
         retry_copy_refused(server_log, start, end, total), retry
-    print(f"NOTE {label}: retry copy refused under memory pressure; "
+    print(f"NOTE {label}: retry copy refused by pressure or disk spacing; "
           f"prefilled {prefilled} of {total} tokens", file=sys.stderr, flush=True)
 
 

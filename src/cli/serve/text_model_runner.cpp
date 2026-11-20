@@ -2131,9 +2131,12 @@ TextRunnerPool::Request::Cancel() noexcept {
         if (!impl_->lease.component())
           state.Invalidate();
       }
-    } else {
+    } else if (!impl_->lease.component()) {
       state.Invalidate();
     }
+    // An interrupted decode may leave the live state unusable, but its
+    // earlier prompt captures still borrow valid prefix rows. Let the
+    // component lease host those rows before resetting the slot in Commit.
     CommitMetrics metrics = impl_->snapshot_metrics;
     if (capabilities.snapshot && capabilities.fork) {
       metrics.snapshot_bytes += impl_->lease.Commit(
