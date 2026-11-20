@@ -422,7 +422,10 @@ device memory. CPU and GPU allocations compete for the same physical RAM on
 Strix Halo, so HIP's free-memory estimate alone is not enough.
 For example, 44 GiB available at load gives a 22 GiB automatic RAM cache and
 allows an explicit limit of up to 40 GiB, even when HIP reports more free
-memory.
+memory. Free CMA pages never count as available, but they do hold the 4 GiB
+reserve an explicit limit leaves the host: the ceiling subtracts the larger
+of `CmaFree` and 4 GiB, not both. Inside a cgroup limit the full 4 GiB
+reserve still applies below that limit.
 Memory that another process claims after startup is not subtracted; starting
 other GPU servers first only accounts for what they hold at that moment.
 The RAM payload budget excludes weights, execution states, token metadata,

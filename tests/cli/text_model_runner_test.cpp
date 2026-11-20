@@ -8,6 +8,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <semaphore>
@@ -2166,6 +2167,65 @@ void TestMeminfoAvailableExcludesFreeCma() {
          "missing MemAvailable keeps the caller's fallback");
 }
 
+/// The host reserve and free CMA pages overlap (upstream #1198): the OS keeps
+/// its reserve in pages pins cannot take, so the ceiling subtracts the larger
+/// of the two, never their sum, and still never counts CMA pages as pinnable.
+void TestSnapshotCeilingOverlapsCmaWithReserve() {
+  using gufo::server::HostMemorySample;
+  using gufo::server::MeminfoSample;
+  using gufo::server::PinnableBytes;
+  using gufo::server::SnapshotBudgetBytes;
+  using gufo::server::SnapshotCeilingBytes;
+  constexpr std::uint64_t gib = std::uint64_t{1} << 30;
+  constexpr std::uint64_t reserve = gufo::server::kHostSnapshotHeadroomBytes;
+  // A cold boot on Ubuntu 26.04: 8.74 GiB of KHO scratch reported as CmaFree.
+  const auto parsed = MeminfoSample(
+      "MemTotal:       131072000 kB\n"
+      "MemAvailable:    9437184 kB\n"
+      "CmaTotal:               0 kB\n"
+      "CmaFree:         9164288 kB\n");
+  Expect(parsed && parsed->available == 9437184ULL * 1024 &&
+             parsed->cma_free == 9164288ULL * 1024,
+         "MemAvailable and CmaFree parse in bytes");
+  Expect(parsed->cgroup_available == std::numeric_limits<std::uint64_t>::max(),
+         "parsed meminfo has no cgroup limit");
+  Expect(!MeminfoSample("MemTotal: 4000 kB\nCmaFree: 10 kB\n"),
+         "missing MemAvailable keeps the caller's fallback");
+  Expect(MeminfoSample("MemAvailable: 8 kB\n")->cma_free == 0,
+         "no CmaFree line means no free CMA pages");
+
+  // 40 GiB available, 8 GiB of it free CMA: pins may take 32 GiB, the OS
+  // keeps the 8 GiB of CMA pages, which covers its 4 GiB reserve.
+  HostMemorySample kho{.available = 40 * gib, .cma_free = 8 * gib};
+  Expect(SnapshotCeilingBytes(kho) == 32 * gib,
+         "free CMA pages larger than the reserve are subtracted once");
+  Expect(PinnableBytes(kho) == 32 * gib && SnapshotBudgetBytes(kho) == 16 * gib,
+         "the automatic budget stays half of the non-CMA pages");
+  // Less free CMA than the reserve: the reserve decides.
+  HostMemorySample small{.available = 40 * gib, .cma_free = 1 * gib};
+  Expect(SnapshotCeilingBytes(small) == 40 * gib - reserve,
+         "a reserve larger than free CMA is subtracted once");
+  // Without CMA the ceiling is unchanged.
+  HostMemorySample none{.available = 40 * gib};
+  Expect(SnapshotCeilingBytes(none) == 36 * gib,
+         "no CMA leaves available minus the reserve");
+  // CmaFree beyond MemAvailable leaves nothing for pins.
+  HostMemorySample over{.available = 4 * gib, .cma_free = 9 * gib};
+  Expect(SnapshotCeilingBytes(over) == 0 && PinnableBytes(over) == 0,
+         "free CMA beyond MemAvailable saturates at zero");
+
+  // A cgroup limit gives no CMA credit: its own reserve applies in full.
+  HostMemorySample limited = kho;
+  limited.cgroup_available = 20 * gib;
+  Expect(SnapshotCeilingBytes(limited) == 20 * gib - reserve,
+         "a cgroup limit keeps the full reserve below it");
+  Expect(PinnableBytes(limited) == 20 * gib,
+         "a cgroup limit bounds pinnable memory");
+  limited.cgroup_available = 2 * gib;
+  Expect(SnapshotCeilingBytes(limited) == 0,
+         "a cgroup below the reserve leaves no ceiling");
+}
+
 void TestCgroupAvailableCountsReclaimableCache() {
   namespace fs = std::filesystem;
   using gufo::server::CgroupAvailableBytes;
@@ -2703,6 +2763,7 @@ int main() {
 
   TestSnapshotCacheCapacityIsReportedAtStartup();
   TestMeminfoAvailableExcludesFreeCma();
+  TestSnapshotCeilingOverlapsCmaWithReserve();
   TestCgroupAvailableCountsReclaimableCache();
   TestSnapshotStartupReportsSelectedLimits();
   TestPersistentSnapshotRestoresAcrossPools();
