@@ -117,6 +117,13 @@ public:
     /// Prior visible-channel suffix; participates in matching, never in output.
     std::string stop_prefix;
     bool return_progress{false};
+    /// A chat template rendered the prompt, trimming whitespace from the
+    /// edges of message content.
+    bool chat_template{false};
+    /// False keeps the prompt's own tokens: a continued final assistant
+    /// message (continue_final_message) has a reasoning budget and penalty
+    /// history computed from them before Submit.
+    bool align_live_frontier{true};
     /// Non-empty: score these tokens after the prompt (`score_assistant`)
     /// instead of generating. Result::tokens and Result::logprobs then hold
     /// them and their raw logprobs; nothing is generated, streamed or

@@ -1491,6 +1491,9 @@ public:
       std::span<const TextRunnerToken> tokens) const override {
     return model_->GetTokenizer().Decode(tokens);
   }
+  [[nodiscard]] bool IsControlToken(TextRunnerToken token) const override {
+    return model_->GetTokenizer().IsSpecialToken(token);
+  }
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
     throw std::logic_error(
@@ -3242,6 +3245,9 @@ public:
       std::span<const TextRunnerToken> tokens) const override {
     return model_->tokenizer().Decode(tokens);
   }
+  [[nodiscard]] bool IsControlToken(TextRunnerToken token) const override {
+    return model_->tokenizer().IsSpecialToken(token);
+  }
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
     throw std::logic_error(
@@ -3708,7 +3714,8 @@ struct InferenceBackend::Impl {
       const std::vector<std::string>& stop_sequences = {},
       InitialOutputState initial = InitialOutputState::kContent,
       std::size_t system_prefix_tokens = 0, bool cache_persist = true,
-      std::string stop_prefix = {}) const {
+      std::string stop_prefix = {}, bool chat_template = false,
+      bool align_live_frontier = true) const {
     Result result;
     result.prompt_tokens = prompt_tokens.size();
     result.client_id = client_id.empty() ? "anonymous" : client_id;
@@ -3734,6 +3741,8 @@ struct InferenceBackend::Impl {
             .system_prefix_tokens = system_prefix_tokens,
             .stop_sequences = stop_sequences,
             .stop_prefix = std::move(stop_prefix),
+            .chat_template = chat_template,
+            .align_live_frontier = align_live_frontier,
         });
     ScheduledGenerationRequest generation(std::move(current),
                                           std::move(request), initial);
@@ -5276,7 +5285,9 @@ InferenceBackend::Result InferenceBackend::chat(
       std::move(prompt->context), request.cache_prompt,
       prompt->cache_prefix_tokens, request.stop_sequences, initial,
       system_prefix_tokens, request.cache_persist,
-      StopSequenceSuffix(request.ContinuationText(), request.stop_sequences));
+      StopSequenceSuffix(request.ContinuationText(), request.stop_sequences),
+      /*chat_template=*/true,
+      /*align_live_frontier=*/!request.continue_final_message);
 #else
   (void)request;
   (void)max_tokens;
@@ -5388,6 +5399,8 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
           .stop_prefix = StopSequenceSuffix(request.ContinuationText(),
                                             request.stop_sequences),
           .return_progress = request.return_progress,
+          .chat_template = true,
+          .align_live_frontier = !request.continue_final_message,
       });
   return std::make_shared<Impl::ScheduledGenerationRequest>(
       state, std::move(scheduled_request), initial, tool_format);

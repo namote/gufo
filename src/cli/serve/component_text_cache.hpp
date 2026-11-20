@@ -146,6 +146,20 @@ public:
   [[nodiscard]] std::size_t CachedPrefixTokens(
       std::span<const ContinuationToken>, const TextPromptContext*,
       bool common = false) const;
+  // Re-tokenizing a conversation can split a previous answer differently from
+  // the tokens the model sampled, and a recurrent frontier cannot rewind to
+  // the first difference (upstream #1154). When the prompt repeats the whole
+  // text of an idle text-only live frontier, replace that part with the
+  // frontier's own tokens. With `trimmed` (a chat template rendered the
+  // prompt), whitespace it trimmed from the edges of a reply stays as the
+  // model generated it; whitespace missing anywhere else is an edit. A
+  // frontier ending inside a prompt token continues with the rest of that
+  // token. The first `keep` prompt tokens never change; `stable` follows the
+  // rewrite, and the prompt stays below `max_tokens`. Returns whether the
+  // prompt changed.
+  bool AlignToLiveFrontier(std::vector<ContinuationToken>& prompt,
+                           std::size_t& stable, std::size_t keep,
+                           std::size_t max_tokens, bool trimmed) const;
   [[nodiscard]] std::size_t capacity() const noexcept;
   // Outcome of ReclaimRows.
   enum class RowReclaim : std::uint8_t {

@@ -3293,6 +3293,16 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   if (prompt.empty()) {
     throw std::invalid_argument("text scheduler prompt must not be empty");
   }
+  // A client replays the previous answer as text, and the next prompt's
+  // tokenization of it need not match the sampled tokens (upstream #1154).
+  // Comparing that text needs exact per-token decoding. Scoring keeps the
+  // prompt exactly as prepared.
+  if (metadata.cache_prompt && metadata.align_live_frontier &&
+      metadata.prompt_context == nullptr && metadata.score_tokens.empty() &&
+      impl_->incremental_text_is_exact)
+    (void)impl_->runner_pool->AlignToLiveFrontier(
+        prompt, metadata.cache_prefix_tokens, metadata.system_prefix_tokens,
+        metadata.chat_template);
   const auto context = impl_->runner_pool->runner().Descriptor().max_context;
   if (prompt.size() >= context) {
     throw std::length_error("prompt has " + std::to_string(prompt.size()) +

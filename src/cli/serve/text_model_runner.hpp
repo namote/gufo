@@ -509,6 +509,13 @@ public:
   }
   [[nodiscard]] virtual std::string Decode(
       std::span<const TextRunnerToken> tokens) const = 0;
+  /// Whether `token` is a control (special) token: template framing such as
+  /// an end of turn, never text a client wrote even when spelled the same.
+  /// Cache alignment matches these only by ID (AlignToLiveFrontier). The
+  /// default counts every token, which disables that alignment.
+  [[nodiscard]] virtual bool IsControlToken(TextRunnerToken) const {
+    return true;
+  }
 
   [[nodiscard]] virtual std::unique_ptr<TextRunnerState> CreateState()
       const = 0;
@@ -973,6 +980,15 @@ public:
   [[nodiscard]] std::size_t CachedPrefixTokens(
       std::span<const TextRunnerToken> prompt,
       const TextPromptContext* context) const;
+  /// When a text-only prompt repeats an idle live frontier's text, uses that
+  /// frontier's tokens for it, so a different split of a previous answer does
+  /// not lose the frontier (upstream #1154). Keeps the first `keep_tokens`
+  /// and moves `cache_prefix_tokens` with the rewrite. `chat_template` allows
+  /// whitespace the template trimmed from the edges of a reply. Only the
+  /// component cache (Flash-Next) aligns.
+  bool AlignToLiveFrontier(std::vector<TextRunnerToken>& prompt,
+                           std::size_t& cache_prefix_tokens,
+                           std::size_t keep_tokens, bool chat_template) const;
   /// A disk job is still writing a prefix of prompt much deeper than any
   /// restorable checkpoint; admission may wait for it instead of prefilling.
   [[nodiscard]] std::optional<TextPendingPublication> PendingPublication(
