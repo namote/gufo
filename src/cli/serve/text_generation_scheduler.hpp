@@ -124,6 +124,9 @@ public:
     /// message (continue_final_message) has a reasoning budget and penalty
     /// history computed from them before Submit.
     bool align_live_frontier{true};
+    /// The reply starts in its reasoning phase (an open thinking block): the
+    /// loop monitor follows that phase until the runner's reasoning end.
+    bool starts_in_reasoning{false};
     /// Non-empty: score these tokens after the prompt (`score_assistant`)
     /// instead of generating. Result::tokens and Result::logprobs then hold
     /// them and their raw logprobs; nothing is generated, streamed or

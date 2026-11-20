@@ -692,7 +692,48 @@ void TestRawLogprobs() {
   }
 }
 
+// The loop guard ends an open reasoning phase early: the budget's forced end
+// follows, after the last token completes its UTF-8 character.
+void TestForceReasoningEnd() {
+  auto budget = std::make_shared<gufo::sampling::ReasoningBudget>();
+  budget->tokens = gufo::sampling::ReasoningBudget::kUnlimited;
+  budget->forced = {7, 8};
+  budget->ends = {8};
+  auto partial = std::make_shared<std::vector<bool>>(10, false);
+  (*partial)[5] = true;  // token 5 ends inside a UTF-8 character
+  budget->partial_utf8 = partial;
+  gufo::sampling::SamplingConfig config;
+  config.temperature = 1.0F;
+  config.reasoning_budget = budget;
+  gufo::sampling::SamplerState sampler(config);
+  Expect(sampler.InReasoning() && !sampler.ForcedToken(),
+         "an unlimited budget only tracks the phase");
+  auto complete = sampler;
+  complete.Accept(1);
+  Expect(complete.ForceReasoningEnd(1) && complete.ForcedToken() == 7,
+         "after a complete character the forced end starts at once");
+  Expect(!complete.ForceReasoningEnd(1), "a forced end is not forced again");
+  complete.Accept(7);
+  Expect(complete.ForcedToken() == 8, "the forced end continues");
+  complete.Accept(8);
+  Expect(!complete.InReasoning() && !complete.ForcedToken() &&
+             !complete.ForceReasoningEnd(8),
+         "the forced end closes reasoning");
+  auto split = sampler;
+  split.Accept(5);
+  Expect(split.ForceReasoningEnd(5) && !split.ForcedToken(),
+         "a split character finishes first");
+  split.Accept(6);
+  Expect(split.ForcedToken() == 7, "then the forced end follows");
+  gufo::sampling::SamplingConfig plain;
+  plain.temperature = 1.0F;
+  gufo::sampling::SamplerState untracked(plain);
+  Expect(!untracked.ForceReasoningEnd(std::nullopt),
+         "without a tracked phase nothing is forced");
+}
+
 int main() {
+  TestForceReasoningEnd();
   TestRawLogprobs();
   TestContinuedReasoningBudget();
   TestContinuedConstraint();

@@ -153,6 +153,9 @@ inline std::string GenerationLogDetails(
           : result.finish_reason ==
                   TextGenerationBackend::FinishReason::kStopSequence
               ? "stop_sequence"
+          : result.finish_reason ==
+                  TextGenerationBackend::FinishReason::kLoopDetected
+              ? "loop_detected"
               : "stop")
       << " cache="
       << (result.cache_disk_hit ? "disk"

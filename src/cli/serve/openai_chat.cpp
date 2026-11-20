@@ -2345,8 +2345,11 @@ ParsedGeneration ParseStructuredGeneration(
 
 const char* FinishReason(const TextGenerationBackend::Result& result,
                          bool has_tool_calls) {
+  // A loop the guard ended has no Chat reason of its own: a stop.
   if (result.finish_reason ==
-      TextGenerationBackend::FinishReason::kStopSequence)
+          TextGenerationBackend::FinishReason::kStopSequence ||
+      result.finish_reason ==
+          TextGenerationBackend::FinishReason::kLoopDetected)
     return "stop";
   if (result.finish_reason == TextGenerationBackend::FinishReason::kLength) {
     return "length";
@@ -2423,6 +2426,10 @@ json::Value Usage(const TextGenerationBackend::Result& result) {
   metrics["mean_inter_token_ms"] = result.mean_inter_token_ms;
   metrics["max_inter_token_ms"] = result.max_inter_token_ms;
   metrics["execution_plan"] = result.execution_plan;
+  metrics["loop_detected"] = result.loop_detected;
+  metrics["loop_closed_reasoning"] = result.loop_closed_reasoning;
+  metrics["loop_stopped"] = result.finish_reason ==
+                            TextGenerationBackend::FinishReason::kLoopDetected;
   usage["gufo"] = std::move(metrics);
   return usage;
 }

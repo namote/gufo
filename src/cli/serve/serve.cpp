@@ -670,6 +670,7 @@ void PrintServeHelp(std::string_view program_name,
     RegisterHanScaleOption(parser, &sampling_config, "Sampling Defaults");
     RegisterTypicalAcceptanceOption(parser, &sampling_config,
                                     "Sampling Defaults");
+    RegisterLoopGuardOption(parser, &sampling_config, "Sampling Defaults");
     parser.AddOption(
         "", "--logit-bias-profiles", "DIR",
         "Qwen 27B, Flash-Next: load the logit-bias profiles (*.json) in DIR, "
@@ -1335,6 +1336,7 @@ int RunServe(std::span<const char* const> args) {
     RegisterHanScaleOption(llm_parser, &sampling_config, "Sampling Defaults");
     RegisterTypicalAcceptanceOption(llm_parser, &sampling_config,
                                     "Sampling Defaults");
+    RegisterLoopGuardOption(llm_parser, &sampling_config, "Sampling Defaults");
     llm_parser.AddOption(
         "", "--logit-bias-profiles", "DIR",
         "Qwen 27B, Flash-Next: load the logit-bias profiles (*.json) in DIR, "
@@ -1690,7 +1692,8 @@ int RunServe(std::span<const char* const> args) {
                    : gufo::sampling::HanScaleScope::kAll)
         << " typical_acceptance="
         << (effective_sampling.typical_acceptance &&
-            backend->supports_typical_acceptance());
+            backend->supports_typical_acceptance())
+        << " loop_guard=" << effective_sampling.loop_guard;
     server::Logger::Info("sampling", sampling_log.str());
     if (sampling_config.han_scale != 1.0F && !backend->supports_han_scale()) {
       server::Logger::Warn(

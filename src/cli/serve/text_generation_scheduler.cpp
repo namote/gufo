@@ -27,6 +27,7 @@
 
 #include "src/cli/serve/generation_metrics.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/loop_detector.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
 
@@ -141,6 +142,11 @@ struct ScheduledRequest {
   std::size_t generated_output_bytes{0};
   StopSequenceFilter stop_filter;
   LogprobDecoder logprob_decoder;
+  /// Starts in an open reasoning block (RequestMetadata).
+  bool starts_in_reasoning{false};
+  /// Loop detection over published tokens; created with the first one.
+  /// Only the scheduler thread touches it.
+  std::optional<GenerationLoopMonitor> loop_monitor;
 
   std::mutex output_mutex;
   std::condition_variable output_condition;
@@ -469,6 +475,7 @@ GenerationTrace StartGenerationTrace(const ScheduledRequest& request,
   // The applied rule: greedy requests never relax.
   sampling["typical_acceptance"] = request.sampling.typical_acceptance &&
                                    request.sampling.uses_random_sampling();
+  sampling["loop_guard"] = request.sampling.loop_guard;
   // The applied scale: 1 when no Han set makes it active.
   sampling["han_scale"] = TraceFloat(
       request.sampling.han_bias() != 0 ? request.sampling.han_scale : 1.0F);
@@ -501,6 +508,8 @@ const char* FinishName(const TextGenerationScheduler::Result& result) {
       return "length";
     case TextGenerationBackend::FinishReason::kCancelled:
       return "cancelled";
+    case TextGenerationBackend::FinishReason::kLoopDetected:
+      return "loop_detected";
   }
   return "stop";
 }
@@ -523,6 +532,10 @@ void WriteGenerationTrace(GenerationTrace trace,
   }
   record["generated_tokens"] = result.tokens.size();
   record["finish"] = FinishName(result);
+  if (result.loop_detected) {
+    record["loop_detected"] = true;
+    record["loop_closed_reasoning"] = result.loop_closed_reasoning;
+  }
   if (!result.stop_sequence.empty()) {
     record["stop_sequence"] = Trace::Text(result.stop_sequence);
   }
@@ -846,6 +859,7 @@ struct TextGenerationScheduler::Impl {
                       TextGenerationBackend::FinishReason finish_reason) {
     request->result.completion_tokens = request->result.tokens.size();
     request->result.finish_reason = finish_reason;
+    request->loop_monitor.reset();  // its tables are no longer needed
     if (request->inter_token_samples > 0) {
       request->result.mean_inter_token_ms =
           request->inter_token_total.count() /
@@ -889,6 +903,7 @@ struct TextGenerationScheduler::Impl {
     EndPublicationWait(request, "failed");
     if (IsTerminal(request))
       return;
+    request->loop_monitor.reset();
     if (!classified)
       failure = ClassifyFailure(std::move(failure));
     if (request->runner_request) {
@@ -1053,8 +1068,11 @@ struct TextGenerationScheduler::Impl {
       request->result.abliteration->skipped =
           request->readmitted_abliteration->skipped;
     }
+    // A stop sequence or loop stop may cut inside an executed step.
     const auto cache_commit =
-        finish_reason == TextGenerationBackend::FinishReason::kStopSequence
+        finish_reason == TextGenerationBackend::FinishReason::kStopSequence ||
+                finish_reason ==
+                    TextGenerationBackend::FinishReason::kLoopDetected
             ? request->runner_request.Cancel()
             : request->runner_request.Commit();
     request->result.component_cache = cache_commit.component_cache;
@@ -1895,10 +1913,94 @@ struct TextGenerationScheduler::Impl {
     }
     if (request->stop_filter.stopped())
       request->result.stop_sequence = request->stop_filter.matched_sequence();
+    else if (!ObserveLoop(request, selection))
+      return false;
     if (CompleteIfStopped(request)) {
       return false;
     }
     return true;
+  }
+
+  const std::vector<std::uint32_t>& ReasoningEndTokens() {
+    if (!reasoning_end_tokens) {
+      std::vector<std::uint32_t> ends;
+      try {
+        const auto& runner = runner_pool->runner();
+        for (const auto end : runner.ReasoningBudgetTags().ends)
+          if (const auto tokens = runner.TokenizeControl(end);
+              tokens.size() == 1)
+            ends.push_back(tokens.front());
+      } catch (const std::exception&) {
+        // A runner that cannot tokenize its tags leaves the phase open.
+      }
+      reasoning_end_tokens = std::move(ends);
+    }
+    return *reasoning_end_tokens;
+  }
+
+  // Feeds a published token to the request's loop monitor. A detection is
+  // always logged; with the loop guard on it closes an open reasoning block
+  // (the budget's forced end follows) or ends the answer. False when the
+  // request completed here.
+  [[nodiscard]] bool ObserveLoop(
+      const std::shared_ptr<ScheduledRequest>& request,
+      const TextDecodeSelection& selection) {
+    if (!request->loop_monitor) {
+      request->loop_monitor.emplace(
+          request->prompt, request->starts_in_reasoning,
+          request->starts_in_reasoning ? ReasoningEndTokens()
+                                       : std::vector<std::uint32_t>{});
+    }
+    const auto found =
+        request->loop_monitor->Observe(selection.token, selection.piece);
+    if (request->starts_in_reasoning && ReasoningEndTokens().empty() &&
+        !reasoning_ends_warned) {
+      reasoning_ends_warned = true;
+      Logger::Warn("loop",
+                   "event=reasoning_end_unknown detail=the runner's reasoning "
+                   "end tags are not single tokens; loop detection treats "
+                   "whole replies as reasoning");
+    }
+    if (!found)
+      return true;
+    request->result.loop_detected = true;
+    std::string_view action = "none";
+    bool stop = false;
+    // A first-token preview is not accepted yet; one token cannot complete
+    // a loop, so nothing acts there.
+    if (request->sampling.loop_guard && request->result.tokens.size() > 1) {
+      if (!found->reasoning) {
+        action = "stop";
+        stop = true;
+      } else if (request->runner_request.ForceReasoningEnd()) {
+        action = "close";
+        request->result.loop_closed_reasoning = true;
+      } else if (request->runner_request.ReasoningOpen()) {
+        action = "closing";  // the budget is already forcing its end
+      } else {
+        // No tracked phase to close (greedy, or reasoning already ended
+        // where the monitor saw no end token): end the reply instead.
+        action = "stop";
+        stop = true;
+      }
+    }
+    Logger::Info("loop",
+                 "event=loop_detected request=" + std::to_string(request->id) +
+                     " phase=" + (found->reasoning ? "reasoning" : "answer") +
+                     " rule=" + std::string(found->rule) +
+                     " period=" + std::to_string(found->period) +
+                     " repeats=" + std::to_string(found->repeats) +
+                     " generated_tokens=" + std::to_string(found->tokens) +
+                     " action=" + std::string(action));
+    if (!stop)
+      return true;
+    try {
+      CompleteSuccess(request,
+                      TextGenerationBackend::FinishReason::kLoopDetected);
+    } catch (...) {
+      CompleteFailure(request, std::current_exception());
+    }
+    return false;
   }
 
   void FinishAdvanced(const std::shared_ptr<ScheduledRequest>& request,
@@ -3002,6 +3104,9 @@ struct TextGenerationScheduler::Impl {
   bool incremental_prefill_supported{false};
   bool final_token_advance_required{true};
   bool incremental_text_is_exact{false};
+  /// The runner's single-token reasoning ends, resolved on first use.
+  std::optional<std::vector<std::uint32_t>> reasoning_end_tokens;
+  bool reasoning_ends_warned{false};
   bool multi_token_decode{false};
   bool batched_multi_token_decode{false};
   std::size_t batched_multi_token_decode_max_width{0};
@@ -3355,6 +3460,7 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   request->cache_prefix_tokens = metadata.cache_prefix_tokens;
   request->system_prefix_tokens = metadata.system_prefix_tokens;
   request->stop_at_eos = metadata.stop_at_eos;
+  request->starts_in_reasoning = metadata.starts_in_reasoning;
   request->token_limit = scoring          ? metadata.score_tokens.size()
                          : max_tokens > 0 ? std::min(max_tokens, available)
                                           : available;

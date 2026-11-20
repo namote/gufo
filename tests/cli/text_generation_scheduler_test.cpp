@@ -269,6 +269,8 @@ struct FakeControl {
   std::size_t actual_batch_width{4};
   bool prefix_reuse{true};
   bool preview_first_token{false};
+  /// Nonzero: requests emit a loop of this many distinct tokens.
+  std::size_t loop_period{0};
   /// A request with this label detects a dynamic abliteration profile on
   /// its last prompt row: it is readmitted under another context (A2).
   std::optional<TextRunnerToken> readmit_label;
@@ -616,6 +618,14 @@ public:
     if (control_->eos_after && fake.decode_count >= *control_->eos_after &&
         fake.stop_at_eos())
       return {.stop = true};
+    if (control_->loop_period != 0) {
+      // The loop guard's forced reasoning end ("</think>" tokenizes to 8).
+      if (const auto forced = sampler.ForcedToken())
+        return {.token = *forced, .piece = "</think>"};
+      const auto token = static_cast<TextRunnerToken>(
+          1000 + (*fake.frontier - fake.label * 100) % control_->loop_period);
+      return {.token = token, .piece = std::to_string(token)};
+    }
     if (!control_->output_pieces.empty()) {
       const auto index =
           static_cast<std::size_t>(*fake.frontier - fake.label * 100);
@@ -724,7 +734,8 @@ public:
   void Advance(TextRunnerState& state, TextRunnerToken token) const override {
     const auto started = std::chrono::steady_clock::now();
     auto& fake = RequireFakeState(state);
-    if (!fake.frontier.has_value() || token != *fake.frontier) {
+    if (!fake.frontier.has_value() ||
+        (token != *fake.frontier && control_->loop_period == 0)) {
       throw std::logic_error("scheduler fake frontier mismatch");
     }
 
@@ -760,7 +771,7 @@ public:
     if (fake.label == 1 && fake.decode_count == 12000 &&
         control_->cancel_borrower)
       control_->cancel_borrower();
-    fake.frontier = token + 1;
+    fake.frontier = *fake.frontier + 1;
     if (fake.label == 1)
       control_->first_request_advance_ns.fetch_add(
           std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1373,6 +1384,57 @@ void TestRunnerCanReuseExactIncrementalText() {
          "exact incremental pieces form the final response text");
   Expect(control->decode_calls.load(std::memory_order_relaxed) == 0,
          "exact incremental text avoids duplicate final decoding");
+}
+
+// A loop is logged and reported whether or not the loop guard acts; with the
+// guard on, a looping answer ends with finish reason loop_detected.
+void TestLoopGuardEndsALoopingAnswer() {
+  auto control = std::make_shared<FakeControl>();
+  control->loop_period = 50;
+  control->max_context = 4096;
+  auto scheduler = MakeScheduler(control, 1);
+  gufo::sampling::SamplingConfig sampling;
+  const auto off = scheduler->Submit({1}, 3000, sampling).Wait();
+  Expect(off.loop_detected && off.tokens.size() == 3000 &&
+             off.finish_reason ==
+                 gufo::server::TextGenerationBackend::FinishReason::kLength,
+         "without the guard a detected loop is only reported");
+  sampling.loop_guard = true;
+  const auto on = scheduler->Submit({2}, 3000, sampling).Wait();
+  Expect(on.loop_detected &&
+             on.finish_reason == gufo::server::TextGenerationBackend::
+                                     FinishReason::kLoopDetected &&
+             on.tokens.size() >= 1024 && on.tokens.size() < 1200,
+         "the guard ends a looping answer once it is detected");
+  sampling.loop_guard = false;
+  control->loop_period = 0;
+  const auto plain = scheduler->Submit({3}, 2000, sampling).Wait();
+  Expect(!plain.loop_detected && plain.tokens.size() == 2000,
+         "text without a loop is not reported");
+
+  // Inside thinking the guard closes the block: the forced end follows and
+  // the answer goes on, until the answer loops too.
+  control->loop_period = 50;
+  sampling.loop_guard = true;
+  sampling.temperature = 1.0F;
+  auto budget = std::make_shared<gufo::sampling::ReasoningBudget>();
+  budget->tokens = gufo::sampling::ReasoningBudget::kUnlimited;
+  budget->forced = {8};
+  budget->ends = {8};
+  sampling.reasoning_budget = budget;
+  gufo::server::TextRequestMetadata metadata;
+  metadata.starts_in_reasoning = true;
+  const auto thinking =
+      scheduler->Submit({4}, 3500, sampling, {}, false, metadata).Wait();
+  const auto close = std::ranges::find(thinking.tokens, 8U);
+  Expect(thinking.loop_closed_reasoning && close != thinking.tokens.end() &&
+             close - thinking.tokens.begin() >= 1024 &&
+             close - thinking.tokens.begin() < 1200,
+         "a thinking loop is closed once it is detected");
+  Expect(thinking.finish_reason == gufo::server::TextGenerationBackend::
+                                       FinishReason::kLoopDetected &&
+             thinking.tokens.end() - close > 1024,
+         "the answer starts fresh and is stopped by its own loop");
 }
 
 // An armed `--trace` records each finished request under the HTTP request id
@@ -4411,6 +4473,7 @@ int main() {
   TestPrefillDetectionReadmitsTheRequestOn();
   TestLongReprefillStaysOff();
   TestRunnerCanReuseExactIncrementalText();
+  TestLoopGuardEndsALoopingAnswer();
   TestGenerationTraceRecordsPromptAndOutput();
   TestMultiTokenDecodePublishesDraftMetricsAndDisablesPrefixReuse();
   TestRequestTotalsDoNotNeedAConsumer();

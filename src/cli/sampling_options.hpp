@@ -153,6 +153,31 @@ inline void RegisterTypicalAcceptanceOption(
       });
 }
 
+/// The serve-only loop guard (SamplingConfig::loop_guard). Detection and its
+/// log line run either way; this chooses whether the server acts.
+inline void RegisterLoopGuardOption(ArgParser& parser,
+                                    sampling::SamplingConfig* config,
+                                    std::string_view group = "Sampling") {
+  if (config == nullptr) {
+    throw std::invalid_argument("sampling CLI config must not be null");
+  }
+  parser.AddCustomOption(
+      "", "--loop-guard", "MODE",
+      "On a detected generation loop, close an open thinking block or end "
+      "the answer (finish reason loop_detected); loops are logged either "
+      "way: on or off (default: off)",
+      group,
+      [config](std::string_view, std::string_view value, std::string* error) {
+        if (value == "on" || value == "off") {
+          config->loop_guard = value == "on";
+          return true;
+        }
+        if (error != nullptr)
+          *error = "--loop-guard must be on or off";
+        return false;
+      });
+}
+
 }  // namespace gufo::cli
 
 #endif  // GUFO_CLI_SAMPLING_OPTIONS_HPP_

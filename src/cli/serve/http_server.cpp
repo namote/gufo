@@ -1495,7 +1495,11 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
       res.finish_reason == TextGenerationBackend::FinishReason::kLength;
   const bool matched =
       res.finish_reason == TextGenerationBackend::FinishReason::kStopSequence;
-  resp["stopped_eos"] = !limited && !res.cancelled && !matched;
+  const bool looped =
+      res.finish_reason == TextGenerationBackend::FinishReason::kLoopDetected;
+  resp["stopped_eos"] = !limited && !res.cancelled && !matched && !looped;
+  // Gufo extension: the loop guard ended the reply.
+  resp["stopped_loop"] = looped;
   resp["stopped_length"] = limited;
   resp["stopped_word"] = matched;
   resp["stopped_limit"] = limited;
@@ -1718,6 +1722,8 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
   params["typical_acceptance"] = sampling.typical_acceptance &&
                                  sampling.uses_random_sampling() &&
                                  b.supports_typical_acceptance();
+  // Gufo extension: whether such a request acts on a detected loop.
+  params["loop_guard"] = sampling.loop_guard;
   // Gufo extension: the default Han-script scale; 1 where it never applies.
   params["han_scale"] =
       static_cast<double>(b.supports_han_scale() ? sampling.han_scale : 1.0F);

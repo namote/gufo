@@ -140,6 +140,22 @@ void TestTypicalAcceptanceOption() {
   assert(parser.FormatHelp().find("(default: off)") != std::string::npos);
 }
 
+// The serve loop guard: one on/off option, off by default.
+void TestLoopGuardOption() {
+  gufo::cli::ArgParser parser("test_serve");
+  gufo::sampling::SamplingConfig config;
+  gufo::cli::RegisterLoopGuardOption(parser, &config);
+  assert(!config.loop_guard);
+  std::string error;
+  const char* on[] = {"--loop-guard", "on"};
+  assert(parser.Parse(on, &error) && config.loop_guard);
+  const char* off[] = {"--loop-guard=off"};
+  assert(parser.Parse(off, &error) && !config.loop_guard);
+  const char* invalid[] = {"--loop-guard", "yes"};
+  assert(!parser.Parse(invalid, &error));
+  assert(error.find("on or off") != std::string::npos);
+}
+
 // --han-scale-scope takes all or answer; all is the default.
 void TestHanScaleScopeOption() {
   using gufo::sampling::HanScaleScope;
@@ -168,6 +184,7 @@ int main() {
   TestHelpFormatting();
   TestUnexpectedPositionalsAndParserReuse();
   TestTypicalAcceptanceOption();
+  TestLoopGuardOption();
   TestHanScaleScopeOption();
   std::cout << "All ArgParser tests passed.\n";
   return 0;

@@ -826,8 +826,9 @@ std::size_t TextModelRunner::PrepareConstraintVocabulary() const {
 }
 
 std::shared_ptr<const sampling::ReasoningBudget>
-TextModelRunner::BuildReasoningBudget(
-    std::size_t tokens, std::span<const TextRunnerToken> prompt) const {
+TextModelRunner::BuildReasoningBudget(std::size_t tokens,
+                                      std::span<const TextRunnerToken> prompt,
+                                      bool may_force) const {
   const auto tags = ReasoningBudgetTags();
   const auto start = TokenizeControl(tags.start);
   auto forced = TokenizeControl(tags.forced_end);
@@ -849,7 +850,7 @@ TextModelRunner::BuildReasoningBudget(
   if (opened != prompt.rend())
     budget->prompt.assign(opened.base(), prompt.end());
   // A phase-only budget never forces, so it needs no UTF-8 table.
-  if (tokens == sampling::ReasoningBudget::kUnlimited)
+  if (tokens == sampling::ReasoningBudget::kUnlimited && !may_force)
     return budget;
   const std::lock_guard lock(constraint_mutex_);
   if (!partial_utf8_ && VocabularySize() != 0) {
@@ -1884,6 +1885,20 @@ TextDecodeSelection TextRunnerPool::Request::SelectNext() {
   impl_->generated.push_back(selection.token);
   impl_->pending_selection = selection;
   return selection;
+}
+
+bool TextRunnerPool::Request::ForceReasoningEnd() {
+  if (!*this || impl_->stopped)
+    return false;
+  const std::optional<sampling::TokenId> last =
+      impl_->generated.empty()
+          ? std::nullopt
+          : std::optional<sampling::TokenId>(impl_->generated.back());
+  return impl_->sampler.ForceReasoningEnd(last);
+}
+
+bool TextRunnerPool::Request::ReasoningOpen() const noexcept {
+  return *this && impl_->sampler.InReasoning();
 }
 
 void TextRunnerPool::Request::Advance() {

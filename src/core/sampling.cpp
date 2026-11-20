@@ -756,6 +756,18 @@ void SamplerState::StartReasoning() {
     reasoning_phase_ = ReasoningPhase::kOff;
 }
 
+bool SamplerState::ForceReasoningEnd(std::optional<TokenId> last) {
+  if (reasoning_phase_ != ReasoningPhase::kCounting)
+    return false;
+  const auto& partial = config_.reasoning_budget->partial_utf8;
+  const bool complete =
+      !last || !partial || *last >= partial->size() || !(*partial)[*last];
+  reasoning_forced_ = 0;
+  reasoning_phase_ =
+      complete ? ReasoningPhase::kForcing : ReasoningPhase::kWaitingUtf8;
+  return true;
+}
+
 // Mirrors llama.cpp common_reasoning_budget_accept: the forcing phase advances
 // one forced token per accepted token, and a spent budget waits for a token
 // that completes its UTF-8 character.

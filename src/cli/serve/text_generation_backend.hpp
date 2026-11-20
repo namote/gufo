@@ -283,6 +283,9 @@ public:
     kStopSequence,
     kLength,
     kCancelled,
+    /// The loop guard ended a looping answer (SamplingConfig::loop_guard).
+    /// APIs without such a reason report a stop.
+    kLoopDetected,
   };
 
   enum class InitialOutputState : std::uint8_t {
@@ -367,6 +370,11 @@ public:
     std::size_t cache_checkpoint_tokens{0};
     FinishReason finish_reason{FinishReason::kStop};
     std::string stop_sequence;
+    /// The loop monitor detected a loop (logged as event=loop_detected),
+    /// whether or not the loop guard acted on it.
+    bool loop_detected{false};
+    /// The loop guard closed a looping reasoning block.
+    bool loop_closed_reasoning{false};
     /// Set when the request ran dynamic abliteration detection.
     std::optional<AbliterationReport> abliteration;
     bool incremental_prefill_supported{false};

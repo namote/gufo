@@ -441,6 +441,17 @@ inline std::optional<SamplingRequestError> ParseSamplingConfig(
     }
     output->typical_acceptance = typical->as_bool();
   }
+  // Gufo extension: act on a detected generation loop; null inherits.
+  if (const auto* guard = body.find("loop_guard");
+      guard != nullptr && !guard->is_null()) {
+    if (!guard->is_bool()) {
+      return SamplingRequestError{
+          .message = "'loop_guard' must be a boolean",
+          .code = "invalid_loop_guard",
+      };
+    }
+    output->loop_guard = guard->as_bool();
+  }
   if (logit_bias != nullptr) {
     sampling::LogitBiasSelection selection;
     if (auto error =

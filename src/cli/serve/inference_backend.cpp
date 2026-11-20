@@ -457,14 +457,16 @@ std::shared_ptr<const sampling::TokenSet> PrepareHanTokens(
 
 // The reasoning phase a request that starts reasoning tracks: its token
 // budget, or, when only the Han scale's answer scope, a phase-dependent
-// logit bias or typical acceptance (exact while reasoning) needs that phase,
-// an unlimited budget that marks where reasoning ends and never forces.
+// logit bias, typical acceptance (exact while reasoning) or the loop guard
+// (which closes a looping reasoning block) needs that phase, an unlimited
+// budget that marks where reasoning ends and forces only for the loop guard.
 std::shared_ptr<const sampling::ReasoningBudget> RequestReasoning(
     const ChatRequest& request, const sampling::SamplingConfig& sampling,
     const std::shared_ptr<const sampling::TokenSet>& han_tokens,
     const TextModelRunner& runner, std::span<const TextRunnerToken> prompt) {
   const auto build = [&](std::size_t tokens) {
-    auto budget = runner.BuildReasoningBudget(tokens, prompt);
+    auto budget =
+        runner.BuildReasoningBudget(tokens, prompt, sampling.loop_guard);
     if (budget && request.continue_final_message) {
       auto resumed = std::make_shared<sampling::ReasoningBudget>(*budget);
       resumed->prompt_is_continuation = true;
@@ -478,7 +480,10 @@ std::shared_ptr<const sampling::ReasoningBudget> RequestReasoning(
   if ((sampling.han_scale_scope == sampling::HanScaleScope::kAnswer &&
        sampling.han_scale != 1.0F && han_tokens && han_tokens->count != 0) ||
       (sampling.logit_bias && sampling.logit_bias->phase_dependent()) ||
-      (sampling.typical_acceptance && sampling.uses_random_sampling()))
+      (sampling.typical_acceptance && sampling.uses_random_sampling()) ||
+      // Greedy keeps its unmodified-argmax paths: its loop guard stops a
+      // looping reasoning block instead of closing it.
+      (sampling.loop_guard && sampling.temperature > 0.0F))
     return build(sampling::ReasoningBudget::kUnlimited);
   return nullptr;
 }
@@ -3765,6 +3770,7 @@ struct InferenceBackend::Impl {
             .stop_prefix = std::move(stop_prefix),
             .chat_template = chat_template,
             .align_live_frontier = align_live_frontier,
+            .starts_in_reasoning = initial == InitialOutputState::kReasoning,
         });
     ScheduledGenerationRequest generation(std::move(current),
                                           std::move(request), initial);
@@ -5442,6 +5448,8 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
           .return_progress = request.return_progress,
           .chat_template = true,
           .align_live_frontier = !request.continue_final_message,
+          .starts_in_reasoning =
+              initial == TextGenerationBackend::InitialOutputState::kReasoning,
       });
   return std::make_shared<Impl::ScheduledGenerationRequest>(
       state, std::move(scheduled_request), initial, tool_format);

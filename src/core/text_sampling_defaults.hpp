@@ -46,9 +46,11 @@ inline SamplingConfig ResolveTextSampling(TextModelPreset model,
     return configured;
   SamplingConfig result;
   // Presets change sampling controls, never the caller's output grammar,
-  // its speculative acceptance rule or its Han scale, scope and logit bias.
+  // its speculative acceptance rule, its loop guard or its Han scale, scope
+  // and logit bias.
   result.constraint = configured.constraint;
   result.typical_acceptance = configured.typical_acceptance;
+  result.loop_guard = configured.loop_guard;
   result.han_scale = configured.han_scale;
   result.han_tokens = configured.han_tokens;
   result.han_scale_scope = configured.han_scale_scope;

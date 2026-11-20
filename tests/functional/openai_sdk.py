@@ -350,11 +350,13 @@ def check_sampling_defaults(client, model, checks, preset, overrides, vision=Fal
             "frequency_penalty": 0.,
             "seed": 73,
         }
-        # Typical acceptance is off by default; models without Flash-Next MTP
-        # ignore it, so writing it out must not change their output either.
+        # Typical acceptance and the loop guard are off by default; models
+        # without Flash-Next MTP ignore the former, so writing them out must
+        # not change their output either.
         native = {"top_k": 20 if preset == "qwen38" else 0,
                   "min_p": 0., "min_keep": 0, "repeat_penalty": 1.,
-                  "repeat_last_n": 64, "typical_acceptance": False}
+                  "repeat_last_n": 64, "typical_acceptance": False,
+                  "loop_guard": False}
         assert overrides.keys() <= (expected.keys() | native.keys()), overrides
         expected.update({key: value for key, value in overrides.items() if key in expected})
         native.update({key: value for key, value in overrides.items() if key in native})

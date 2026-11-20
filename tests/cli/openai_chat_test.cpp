@@ -2079,6 +2079,26 @@ void TestModelSamplingDefaults() {
   config = send(R"(,"typical_acceptance":null)");
   Expect(config.typical_acceptance, "Null inherits typical acceptance");
   backend.defaults.sampling.typical_acceptance = false;
+  // The loop guard: request opt-in, server default through presets, null
+  // inherits, and only a boolean is accepted.
+  Expect(!send("").loop_guard, "The loop guard is off by default");
+  Expect(send(R"(,"loop_guard":true)").loop_guard,
+         "Requests opt into the loop guard");
+  backend.defaults.sampling.loop_guard = true;
+  Expect(send("").loop_guard && send(R"(,"loop_guard":null)").loop_guard,
+         "Presets and null keep the server's loop guard");
+  Expect(!send(R"(,"loop_guard":false)").loop_guard,
+         "Requests opt out of the server's loop guard");
+  backend.defaults.sampling.loop_guard = false;
+  {
+    const auto response = gufo::server::HandleOpenAiChat(
+        Request(R"({"model":"test-model","messages":[{"role":"user",)"
+                R"("content":"hello"}],"loop_guard":"on"})"),
+        backend);
+    Expect(response.status == 400 &&
+               response.body.find("invalid_loop_guard") != std::string::npos,
+           "A non-boolean loop guard is rejected");
+  }
   {
     const auto response = gufo::server::HandleOpenAiChat(
         Request(R"({"model":"test-model","messages":[{"role":"user",)"

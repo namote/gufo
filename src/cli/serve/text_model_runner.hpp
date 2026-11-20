@@ -428,9 +428,12 @@ public:
   [[nodiscard]] virtual std::uint32_t VocabularySize() const { return 0; }
   /// A budget for a prompt that opens reasoning, or null when the tags are not
   /// single tokens in this vocabulary.
+  /// `may_force` keeps the UTF-8 table an unlimited budget otherwise skips,
+  /// for a request whose loop guard may force the end (ForceReasoningEnd).
   [[nodiscard]] std::shared_ptr<const sampling::ReasoningBudget>
   BuildReasoningBudget(std::size_t tokens,
-                       std::span<const TextRunnerToken> prompt) const;
+                       std::span<const TextRunnerToken> prompt,
+                       bool may_force = false) const;
 
   [[nodiscard]] virtual std::vector<TextRunnerToken> Tokenize(
       std::string_view text) const = 0;
@@ -859,6 +862,13 @@ public:
     /// included (TextRunnerState::SetResidentRequests).
     [[nodiscard]] TextDecodeStep DecodeStep(std::size_t max_tokens,
                                             std::size_t resident_requests = 1);
+    /// Makes the next tokens the reasoning budget's forced end
+    /// (SamplerState::ForceReasoningEnd), as after an exhausted budget.
+    /// False when the request does not track an open reasoning phase.
+    bool ForceReasoningEnd();
+    /// Whether the request's sampler still tracks an open reasoning phase,
+    /// its forced end included.
+    [[nodiscard]] bool ReasoningOpen() const noexcept;
 
     /// Scores `tokens` after the complete prompt (TextModelRunner::
     /// ScoreTokens). The prompt may still be partly unfed: the runner feeds

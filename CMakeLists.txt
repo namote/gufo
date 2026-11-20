@@ -405,7 +405,10 @@ if(ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_llm_cli PUBLIC gufo_deepseek_v4_flash)
 endif()
 
-add_library(gufo_logging STATIC src/cli/serve/logging.cpp src/cli/serve/trace.cpp)
+# Also the serve loop detector (src/cli/serve/loop_detector.cpp): every
+# scheduler user links gufo_logging.
+add_library(gufo_logging STATIC src/cli/serve/logging.cpp src/cli/serve/trace.cpp
+  src/cli/serve/loop_detector.cpp)
 target_include_directories(gufo_logging PUBLIC ${PROJECT_SOURCE_DIR})
 target_compile_features(gufo_logging PUBLIC cxx_std_20)
 target_link_libraries(gufo_logging PUBLIC gufo_platform)
@@ -708,6 +711,11 @@ if (BUILD_TESTING)
   add_test(NAME openai_chat_test COMMAND openai_chat_test)
   set_tests_properties(openai_chat_test PROPERTIES
     LABELS "cpu;server;api;openai;streaming;tools")
+
+  add_executable(loop_detector_test tests/cli/loop_detector_test.cpp)
+  target_link_libraries(loop_detector_test PRIVATE gufo_logging)
+  add_test(NAME loop_detector_test COMMAND loop_detector_test)
+  set_tests_properties(loop_detector_test PROPERTIES LABELS "cpu;server")
 
   add_executable(quote_tracker_test tests/cli/quote_tracker_test.cpp)
   target_link_libraries(quote_tracker_test PRIVATE gufo_core)

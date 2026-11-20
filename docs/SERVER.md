@@ -1601,6 +1601,45 @@ ignore it, and only an explicit generating request (once per process) or the
 server option asking for it on them logs a warning. Traces record the
 applied value, as `/props` does: false for greedy sampling.
 
+Every text request's reply is watched for generation loops, in the shared
+scheduler path, so Qwen 27B and Flash-Next behave alike. Two rules run (after
+exllamav3 `805caee` and Kyojin's `loopguard`):
+
+- period: rolling hashes of 6-token sequences find candidate repeat periods,
+  allowing 5% drift between copies (edits). A run is a loop after 8
+  repetitions spanning at least 8192 tokens, or 4 (near-)exact repetitions
+  spanning at least 1024 tokens. Copies that differ by prompt content not
+  generated before (answer options, list items) are transcription, not a
+  loop, and over a tiny vocabulary only (near-)exact repetition counts;
+- line: inside an open thinking block, a line of at least 40 non-space
+  characters seen 3 times (outside a ``` code fence) is a loop.
+
+Each detection is logged at INFO as `event=loop_detected request=ID
+phase=reasoning|answer rule=period|line period=N repeats=N
+generated_tokens=N action=...`, at most once per phase, also when nothing
+acts on it, so logs show how often the guard would fire. The loop guard is
+off by default, because code and JSON can repeat legitimately: start the
+server with `--loop-guard on` or send `loop_guard: true` (a Gufo extension;
+a boolean, `null` inherits). Then a loop inside thinking closes the block:
+the next tokens are the model's forced reasoning end (Qwen's `\n</think>`,
+after the current UTF-8 character completes), as when a reasoning budget
+runs out, and the reply continues with its answer (`action=close`). Greedy
+requests keep their fast argmax paths and track no phase for the guard
+alone, so without a reasoning budget, an answer-scoped Han scale or a
+phase-dependent logit bias a looping thinking block of a greedy request
+ends the reply instead, as does
+one whose reasoning the sampler already ended where the monitor saw no end
+token. A loop in the answer
+ends the reply (`action=stop`) with the internal finish reason
+`loop_detected`: Chat Completions and Completions report `finish_reason:
+"stop"`, Messages `stop_reason: "end_turn"` (or `tool_use`), Responses a
+completed response; the native `/completion` reports `stopped_eos: false`
+and the Gufo `stopped_loop: true`. Chat usage reports Gufo `loop_detected`,
+`loop_closed_reasoning` and `loop_stopped`, traces record the finish
+`loop_detected`, and `/props` reports the default `loop_guard`. Raw
+`/completion` and `/v1/completions` prompts never track reasoning: their
+whole output is answer, so a loop there stops the reply.
+
 The Han scale lowers the probability of CJK ideographs, for example Chinese
 characters in Korean replies. Start the server with `--han-scale X` or send
 `han_scale` (a Gufo extension; `null` inherits) with X in `(0, 1]`; 1 disables

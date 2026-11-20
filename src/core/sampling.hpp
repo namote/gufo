@@ -126,6 +126,11 @@ struct SamplingConfig {
   /// (tracked only with reasoning_budget), and around repetition
   /// (TypicalGuard). Off by default.
   bool typical_acceptance{false};
+  /// Act on a generation loop the server detects (serve --loop-guard,
+  /// request loop_guard): close an open reasoning block, or end the answer
+  /// with finish reason loop_detected. Detections are logged either way.
+  /// Not a token filter: the scheduler applies it. Off by default.
+  bool loop_guard{false};
   /// Han-script probability scale in (0, 1] (serve --han-scale, request
   /// han_scale); 1 disables it. Every token in han_tokens has
   /// han_bias() = ln(han_scale) added to its logit after the penalties and
@@ -326,6 +331,11 @@ public:
     return typical_guard_;
   }
 
+  /// Ends an open reasoning phase early (the loop guard): the budget's forced
+  /// end becomes the next tokens, as when its tokens run out, after `last`
+  /// (the last accepted token) completes its UTF-8 character. False when no
+  /// reasoning phase is open or its end is already being forced.
+  bool ForceReasoningEnd(std::optional<TokenId> last);
   /// Starts a request: tokens initialize repetition only; generated counts
   /// reset.
   void ResetHistory(std::span<const TokenId> tokens);
