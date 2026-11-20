@@ -1604,6 +1604,7 @@ struct Session::PendingDecode {
   std::int32_t draft{0};
   bool draft_subset{false};  ///< this cycle drafts through the subset head
   bool sampled_subset_cost{false};
+  bool planned_greedy{false};
   /// Trailing chain tokens copied by prompt lookup (after the MTP drafts).
   std::uint32_t lookup{0};
   /// Committed index the copied tokens were taken from.
@@ -1726,6 +1727,8 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   pending->policy_concurrency = MtpPolicyConcurrency(
       sampler.config().uses_random_sampling(), sampler.config().seed >= 0,
       batch_drafts.has_value(), occupancy);
+  pending->planned_greedy =
+      batch_drafts.has_value() && !sampler.config().uses_random_sampling();
   // A lone greedy request on a single-session model stops its chain by draft
   // confidence (MtpConfidenceRule) once the request has observed acceptance.
   // Until then the length controller's conservative first width applies, as
@@ -2109,9 +2112,10 @@ bool Session::FinishDecode(const DecodeRequest& request,
   const std::uint32_t observed = mtp_all ? keep - 1 : mtp_accepted;
   // A target stop ends the request; it does not classify the remaining
   // proposals as failed predictions.
-  draft_length_.Observe(
-      observed, result->stop || mtp_all ? observed : mtp_drafts, base,
-      pending.policy_concurrency, pending.sampled_subset_cost);
+  draft_length_.Observe(observed,
+                        result->stop || mtp_all ? observed : mtp_drafts, base,
+                        pending.policy_concurrency, pending.sampled_subset_cost,
+                        pending.planned_greedy);
 
   // The next call knows the next sampled anchor. Defer draft catch-up until
   // then, retaining this session's target hidden rows across interleaving.
