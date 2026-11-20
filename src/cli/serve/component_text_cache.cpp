@@ -180,6 +180,10 @@ struct RewindPoint {
   // mutex). Coverage is rechecked otherwise: a failed, superseded or
   // evicted write leaves the point to be written again.
   std::uint64_t pending_checkpoint{};
+  // One submitted idle write per committed turn, shared by write-back
+  // and release maintenance. Even a failed/untracked/evicted publication
+  // consumes it; another turn enables another attempt.
+  std::optional<Clock::time_point> idle_attempt;
 };
 // One piece a capture writes from a slot (inherited chunks excepted).
 struct SlotPiece {
@@ -349,6 +353,9 @@ struct ComponentTextCache::Impl {
     // keep rewind points, and its idle and reassignment writes take the
     // rewind point instead of the frontier no later prompt continues.
     bool drops_reply{};
+    // The current rewind boundary was published and released. Its generated
+    // reply frontier must not become a replacement disk write on idle/reset.
+    bool frontier_dead{};
   };
   // Under the mutex: the idle slot whose rewind point serves `prompt`
   // deepest, beyond `live_floor` and at least at `floor`, with its boundary.
@@ -479,7 +486,8 @@ struct ComponentTextCache::Impl {
   // kUncoveredCaptureTokens of it.
   [[nodiscard]] std::optional<Uncovered> UncoveredLive(std::size_t i) const {
     const auto& e = *entries[i];
-    if (!e.live || e.live_tokens.size() < kUncoveredCaptureTokens ||
+    if (e.frontier_dead || !e.live ||
+        e.live_tokens.size() < kUncoveredCaptureTokens ||
         index.HasCheckpoint({identity, e.live_tokens, e.live_input},
                             e.live_tokens.size() - kUncoveredCaptureTokens))
       return {};
@@ -1049,8 +1057,8 @@ struct ComponentTextCache::Impl {
   // queued, zero when refused or failed (logged).
   std::size_t PersistRewind(Entry& entry,
                             const std::shared_ptr<RewindPoint>& point,
-                            bool step_exempt,
-                            std::string_view reason) noexcept {
+                            bool step_exempt, std::string_view reason,
+                            bool exact_boundary = false) noexcept {
     if (!point || !point->persist || !queue || !resources->copy_observed_rows)
       return 0;
     const auto n = point->tokens.size();
@@ -1068,7 +1076,12 @@ struct ComponentTextCache::Impl {
                                  })) ||
             index.HasCheckpoint(
                 {identity, point->tokens, point->inputs},
-                n > kUncoveredCaptureTokens ? n - kUncoveredCaptureTokens : 0))
+                exact_boundary
+                    ? n
+                    : (n > kUncoveredCaptureTokens ? n - kUncoveredCaptureTokens
+                                                   : 0)))
+          return 0;
+        if (reason == "idle" && point->idle_attempt == entry.idle_since)
           return 0;
         ancestor = entry.durable;
         branch = entry.branch;
@@ -1184,6 +1197,10 @@ struct ComponentTextCache::Impl {
       if (queued) {
         const std::lock_guard lock(mutex);
         point->pending_checkpoint = checkpoint;
+        // Refusal before submission leaves the idle allowance available.
+        // A job that already completed (even failed) still consumes it.
+        if (reason == "idle")
+          point->idle_attempt = entry.idle_since;
       }
       Logger::Info(
           "cache",
@@ -2220,6 +2237,11 @@ bool ComponentTextCache::CaptureBeforeReset(std::size_t index,
     std::shared_ptr<RewindPoint> point;
     {
       const std::lock_guard lock(impl_->mutex);
+      if (entry->frontier_dead) {
+        if (held_out)
+          *held_out = false;
+        return false;
+      }
       if (entry->drops_reply && entry->rewind &&
           Impl::RewindCurrent(*entry, *entry->rewind))
         point = entry->rewind;
@@ -2413,6 +2435,67 @@ bool ComponentTextCache::WriteBackDeferred() const noexcept {
   return impl_->write_back_deferred.load(std::memory_order_relaxed);
 }
 
+std::size_t ComponentTextCache::ReleaseIdleRewinds(
+    std::chrono::milliseconds idle_for) {
+  if (!impl_->queue)
+    return 0;
+  const auto now = Clock::now();
+  std::size_t released = 0;
+  for (auto& entry : impl_->entries) {
+    std::shared_ptr<RewindPoint> uncovered, retired;
+    {
+      const std::lock_guard lock(impl_->mutex);
+      // The scheduler observes no queued requests before maintenance.
+      // Be conservative for callers outside it: no slot may be in use.
+      if (std::ranges::any_of(impl_->entries,
+                              [](const auto& e) { return e->busy; }))
+        return released;
+      auto& point = entry->rewind;
+      if (!point || !point->persist || now - entry->idle_since < idle_for ||
+          !entry->live || !entry->holds_rows ||
+          !Impl::Prefixes(point->tokens, entry->live_tokens))
+        continue;
+      // Publication can precede the writer dropping its sources. Neither a
+      // pending job nor shared arenas count as memory we can release yet.
+      if (std::ranges::any_of(impl_->pending_durable,
+                              [&](const auto& capture) {
+                                return capture &&
+                                       capture->manifest.checkpoint.value ==
+                                           point->pending_checkpoint;
+                              }) ||
+          point->ReleasableArenaBytes() != point->arena_bytes)
+        continue;
+      if (!impl_->index.HasCheckpoint(
+              {impl_->identity, point->tokens, point->inputs},
+              point->tokens.size())) {
+        uncovered = point;
+      } else {
+        const auto idle_seconds =
+            std::chrono::duration_cast<std::chrono::seconds>(now -
+                                                             entry->idle_since)
+                .count();
+        Logger::Info("cache",
+                     "schema=component-cache-v1 event=rewind_released "
+                     "reason=idle host_bytes=" +
+                         std::to_string(point->host_bytes) +
+                         " idle_s=" + std::to_string(idle_seconds));
+        // Only the retained references go away; the slot still owns its KV
+        // rows and live frontier. ArenaCharge follows the last arena owner.
+        if (Impl::RewindCurrent(*entry, *point))
+          entry->frontier_dead = true;
+        retired = std::exchange(point, {});
+        ++released;
+      }
+    }
+    // Unlike ordinary write-back's nearby coverage, release requires this
+    // exact boundary. Failures retain the point; PersistRewind bounds idle
+    // attempts until another turn commits.
+    if (uncovered)
+      (void)impl_->PersistRewind(*entry, uncovered, true, "idle", true);
+  }
+  return released;
+}
+
 std::size_t ComponentTextCache::WriteBackIdle(
     std::chrono::milliseconds idle_for) noexcept {
   impl_->write_back_deferred.store(false, std::memory_order_relaxed);
@@ -2438,7 +2521,9 @@ std::size_t ComponentTextCache::WriteBackIdle(
           point = entry->rewind;
       }
       if (point) {
-        queued += impl_->PersistRewind(*entry, point, true, "idle") != 0;
+        const auto reason =
+            idle_for == std::chrono::milliseconds::zero() ? "shutdown" : "idle";
+        queued += impl_->PersistRewind(*entry, point, true, reason) != 0;
         continue;
       }
     }
@@ -2451,8 +2536,9 @@ std::size_t ComponentTextCache::WriteBackIdle(
           idle_for == std::chrono::milliseconds::zero()
               ? Impl::Covered(*entry)
               : std::max(Impl::Covered(*entry), entry->write_back_tried);
-      if (entry->busy || !entry->live || !entry->holds_rows ||
-          !entry->live_persist || now - entry->idle_since < idle_for ||
+      if (entry->frontier_dead || entry->busy || !entry->live ||
+          !entry->holds_rows || !entry->live_persist ||
+          now - entry->idle_since < idle_for ||
           size < Impl::kUncoveredCaptureTokens ||
           (covered && covered + Impl::kUncoveredCaptureTokens > size))
         continue;
@@ -2667,6 +2753,7 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
       entry->durable.reset();
       entry->written_back = 0;
       entry->write_back_tried = 0;
+      entry->frontier_dead = false;
       live_tokens = entry->live_tokens.size();
       if (entry->live) {
         impl_->index.Erase(*entry->live);
@@ -2812,6 +2899,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       entry->durable.reset();
       entry->written_back = 0;
       entry->write_back_tried = 0;
+      entry->frontier_dead = false;
       entry->drops_reply = false;
     }
     if (entry->live) {
@@ -2865,6 +2953,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       entry->durable.reset();
       entry->written_back = 0;
       entry->write_back_tried = 0;
+      entry->frontier_dead = false;
     }
     if (rewind) {
       // Rows of the frontier past the point are overwritten: disk jobs
@@ -2905,6 +2994,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           entry->durable.reset();
         entry->written_back = 0;
         entry->write_back_tried = 0;
+        entry->frontier_dead = false;
         // Reply edges past the point belong to the abandoned frontier.
         std::erase_if(reply_starts, [&](std::size_t at) { return at >= n; });
         std::erase_if(reply_ends, [&](std::size_t at) { return at > n; });
@@ -2930,6 +3020,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
         entry->durable.reset();
         entry->written_back = 0;
         entry->write_back_tried = 0;
+        entry->frontier_dead = false;
       }
     }
     bool restored = bool(live);
@@ -3578,6 +3669,8 @@ std::size_t ComponentTextCache::Lease::Commit(
     impl_->entry->live_persist = impl_->persist;
     impl_->entry->live_stable = impl_->stable;
     impl_->entry->drops_reply = impl_->rewind_wanted;
+    // A completed turn establishes a new frontier, even on a live continue.
+    impl_->entry->frontier_dead = false;
     // An earlier point of this execution stays valid: the slot only appended
     // after it.
     if (impl_->rewind_point)
@@ -3649,6 +3742,7 @@ void ComponentTextCache::Lease::Invalidate() noexcept {
     impl_->entry->branch.reset();
     impl_->entry->durable.reset();
     impl_->entry->written_back = 0;
+    impl_->entry->frontier_dead = false;
     impl_->entry->write_back_tried = 0;
     impl_->entry->busy = false;
   } catch (...) {

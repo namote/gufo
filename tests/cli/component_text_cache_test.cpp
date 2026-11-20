@@ -3519,6 +3519,236 @@ void DroppedReplyRewindsToTheStableBoundary() {
   assert(Generate(cold) == token);
   cold.Invalidate();
 }
+// Exercise the release path with already published and still uncovered points.
+void IdleRewindRelease(bool covered, bool fail_write,
+                       bool refuse_submission = false) {
+  const TemporaryDirectory temp("gufo-component-idle-rewind");
+  const TextRunnerDiskCacheOptions disk{
+      .directory = temp.path().string(),
+      .capacity_bytes = 1 << 24,
+      .min_checkpoint_step_tokens = covered ? 64U : 4096U};
+  auto runner = std::make_shared<Runner>();
+  runner->retain_rows = true;
+  TextRunnerPool pool(runner, 2, disk);
+  DroppingChat chat;
+  const auto turn = [&] {
+    auto request = ChatTurn(pool, chat);
+    Prefill(request);
+    for (int i = 0; i < 5; ++i)
+      (void)Generate(request);
+    (void)request.Commit();
+    assert(WaitWritten(pool));
+  };
+  chat.Turn(300);
+  turn();
+  chat.Turn(100);
+  turn();
+  assert(pool.ReleaseIdleRewinds(std::chrono::hours(1)) == 0);
+  if (!covered) {
+    if (refuse_submission) {
+      // Metadata reservation fails before anything reaches the writer. The
+      // same idle period must still be able to submit on the next sweep.
+      runner->ledger->FailAfter(cache::LedgerStep::kReserve, 0);
+      assert(pool.ReleaseIdleRewinds(std::chrono::milliseconds(0)) == 0);
+      runner->ledger->ClearFaults();
+      assert(!pool.HostWritesPending());
+    }
+    WriterGate gate;
+    runner->background_stream = [hook = gate.Hook(), fail_write]() mutable {
+      hook();
+      if (std::exchange(fail_write, false))
+        throw std::runtime_error("injected rewind write failure");
+    };
+    assert(pool.ReleaseIdleRewinds(std::chrono::milliseconds(0)) == 0);
+    assert(gate.entered.try_acquire_for(std::chrono::seconds(10)));
+    // No active request: the writer alone keeps the point alive.
+    assert(pool.ReleaseIdleRewinds(std::chrono::milliseconds(0)) == 0);
+    gate.release.release();
+    assert(WaitWritten(pool));
+    runner->background_stream = {};
+    if (fail_write) {
+      // Failure consumes this turn's idle attempt. Neither maintenance
+      // path may enqueue it again, even though the writer is healthy now.
+      for (int i = 0; i < 10; ++i) {
+        assert(pool.ReleaseIdleRewinds(std::chrono::milliseconds(0)) == 0);
+        assert(pool.WriteBackIdle(std::chrono::milliseconds(1)) == 0);
+        assert(!pool.HostWritesPending());
+      }
+      // A new committed turn permits one more idle attempt.
+      turn();
+      assert(pool.ReleaseIdleRewinds(std::chrono::milliseconds(0)) == 0);
+      assert(WaitWritten(pool));
+    }
+  }
+  assert(
+      WaitCached(pool, std::span(chat.prompt).first(chat.stable), chat.stable));
+  {
+    auto active = pool.Acquire(std::vector<TextRunnerToken>(32, 777));
+    assert(pool.ReleaseIdleRewinds(std::chrono::milliseconds(0)) == 0);
+    active.Invalidate();
+  }
+  const auto invalidations = runner->adapter->Invalidations();
+  assert(pool.ReleaseIdleRewinds(std::chrono::milliseconds(0)) == 1);
+  assert(runner->adapter->Invalidations() == invalidations);
+  assert(pool.ReleaseIdleRewinds(std::chrono::milliseconds(0)) == 0);
+  const auto boundary = chat.stable;
+  chat.Turn(100);
+  auto next = ChatTurn(pool, chat);
+  assert(next.cache_disk_hit() && next.cached_prompt_tokens() == boundary);
+  Prefill(next);
+  std::vector<TextRunnerToken> expected;
+  for (int i = 0; i < 5; ++i)
+    expected.push_back(Generate(next));
+  next.Invalidate();
+  auto cold = pool.Acquire(chat.prompt, {}, {}, {}, false, chat.stable);
+  Prefill(cold);
+  for (const auto token : expected)
+    assert(Generate(cold) == token);
+  cold.Invalidate();
+}
+
+void ShutdownRetriesFailedIdleRewind() {
+  const TemporaryDirectory temp("gufo-component-rewind-shutdown-retry");
+  const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
+                                        .capacity_bytes = 1 << 24,
+                                        .min_checkpoint_step_tokens = 4096};
+  auto runner = std::make_shared<Runner>();
+  runner->retain_rows = true;
+  auto pool = std::make_unique<TextRunnerPool>(runner, 1, disk);
+  DroppingChat chat;
+  for (int turn = 0; turn < 2; ++turn) {
+    chat.Turn(turn == 0 ? 300 : 100);
+    auto request = ChatTurn(*pool, chat);
+    Prefill(request);
+    for (int i = 0; i < 5; ++i)
+      (void)Generate(request);
+    (void)request.Commit();
+    assert(WaitWritten(*pool));
+  }
+  std::atomic<bool> failed{false};
+  runner->background_stream = [&] {
+    failed = true;
+    throw std::runtime_error("injected idle write failure");
+  };
+  assert(pool->ReleaseIdleRewinds(std::chrono::milliseconds(0)) == 0);
+  assert(WaitWritten(*pool));
+  assert(failed);
+  runner->background_stream = {};
+  assert(pool->ReleaseIdleRewinds(std::chrono::milliseconds(0)) == 0);
+  assert(!pool->HostWritesPending());
+  pool.reset();  // Shutdown retries the consumed idle attempt and drains it.
+
+  auto restarted_runner = std::make_shared<Runner>();
+  TextRunnerPool restarted(restarted_runner, 1, disk);
+  auto request = ChatTurn(restarted, chat);
+  assert(request.cache_disk_hit());
+  assert(request.cached_prompt_tokens() == chat.stable);
+  request.Invalidate();
+}
+
+void ReleasedRewindDoesNotWriteDeadFrontier(bool cold_turn) {
+  const TemporaryDirectory temp("gufo-component-released-frontier");
+  auto runner = std::make_shared<Runner>();
+  runner->retain_rows = true;
+  auto pool = std::make_unique<TextRunnerPool>(
+      runner, 1,
+      TextRunnerDiskCacheOptions{.directory = temp.path().string(),
+                                 .capacity_bytes = 1 << 24,
+                                 .min_checkpoint_step_tokens = 4096});
+  DroppingChat chat;
+  for (int turn = 0; turn < 2; ++turn) {
+    chat.Turn(turn == 0 ? 300 : 100);
+    auto request = ChatTurn(*pool, chat);
+    Prefill(request);
+    // The dead reply exceeds the uncovered-frontier threshold.
+    for (int i = 0; i < 100; ++i)
+      (void)Generate(request);
+    (void)request.Commit();
+    assert(WaitWritten(*pool));
+  }
+  assert(pool->ReleaseIdleRewinds(std::chrono::milliseconds(0)) == 0);
+  assert(WaitWritten(*pool));
+  assert(pool->ReleaseIdleRewinds(std::chrono::milliseconds(0)) == 1);
+
+  const auto previous_level = Logger::Level();
+  Logger::SetLevel(LogLevel::kInfo);
+  std::ostringstream output;
+  auto* previous_sink = std::clog.rdbuf(output.rdbuf());
+  assert(pool->WriteBackIdle(std::chrono::milliseconds(0)) == 0);
+  assert(!pool->HostWritesPending());
+  if (cold_turn) {
+    const std::vector<TextRunnerToken> other(100, 777);
+    // SlotReady delegates to PrepareAdmission; no held write may delay it.
+    assert(pool->SlotReady(other));
+    assert(!pool->HostWritesPending());
+    auto request = pool->Acquire(other, {}, {}, {}, false, 0, true, 0, false);
+    assert(request.cached_prompt_tokens() == 0);
+    assert(!pool->HostWritesPending());
+    request.Invalidate();
+  }
+  pool.reset();  // Also exercise shutdown without a cold reassignment.
+  std::clog.rdbuf(previous_sink);
+  Logger::SetLevel(previous_level);
+  const auto log = output.str();
+  assert(log.find("event=rewind_persisted") == std::string::npos);
+  assert(log.find("event=live_frontier_") == std::string::npos);
+}
+
+void SchedulerReleasesIdleRewind(bool queued) {
+  const TemporaryDirectory temp("gufo-component-scheduler-rewind");
+  auto runner = std::make_shared<Runner>();
+  runner->retain_rows = true;
+  runner->snapshot_idle = std::chrono::milliseconds(20);
+  auto pool = std::make_shared<TextRunnerPool>(
+      runner, 1,
+      TextRunnerDiskCacheOptions{.directory = temp.path().string(),
+                                 .capacity_bytes = 1 << 24,
+                                 .min_checkpoint_step_tokens = 4096});
+  const auto staged = runner->staging_live->load();
+  DroppingChat chat;
+  for (int i = 0; i < 2; ++i) {
+    chat.Turn(i == 0 ? 300 : 100);
+    auto request = ChatTurn(*pool, chat);
+    Prefill(request);
+    for (int j = 0; j < 5; ++j)
+      (void)Generate(request);
+    (void)request.Commit();
+    assert(WaitWritten(*pool));
+  }
+  assert(runner->staging_live->load() > staged);
+  const auto boundary = chat.stable;
+  TextSchedulerPolicy policy{
+      .device_probe_interval = std::chrono::milliseconds(5),
+      .idle_write_back_delay = std::chrono::milliseconds(10),
+      .idle_rewind_release_delay = std::chrono::milliseconds(30)};
+  TextGenerationScheduler scheduler(pool, {}, policy);
+  std::binary_semaphore entered{0}, release{0};
+  std::future<void> task;
+  if (queued) {
+    task = scheduler.RunWhenIdle([&] {
+      entered.release();
+      release.acquire();
+    });
+    assert(entered.try_acquire_for(std::chrono::seconds(10)));
+  } else {
+    // Publication alone keeps the point's arenas. Wait for release and
+    // idle trim, observing the allocator's atomic count without a request.
+    assert(WaitForStaging(*runner, staged));
+  }
+  chat.Turn(100);
+  TextRequestMetadata metadata;
+  metadata.cache_prefix_tokens = chat.stable;
+  auto next = scheduler.Submit(chat.prompt, 2, 0.0F, {}, false, metadata);
+  if (queued) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    release.release();
+    task.get();
+  }
+  const auto result = next.Wait();
+  assert(result.cached_prompt_tokens == boundary);
+  assert(result.cache_disk_hit == !queued);
+}
+
 void FailedRewindFallsBackAndStaysExact() {
   // A rewind whose restore fails resets the slot and serves the request
   // from disk or cold; the output still equals a cold prefill's.
@@ -3649,6 +3879,12 @@ void RefusedReplacementKeepsTheOlderPoint() {
   a.Turn(100);
   const auto [cached, disk_hit] = turn(a);
   assert(cached == a_first && !disk_hit);
+  // A refused replacement leaves a point far behind the current stable
+  // boundary. Idle cleanup must publish and release that older point too.
+  assert(a.stable > a_first + 64);
+  assert(pool.ReleaseIdleRewinds(std::chrono::milliseconds(0)) == 0);
+  assert(WaitWritten(pool));
+  assert(pool.ReleaseIdleRewinds(std::chrono::milliseconds(0)) == 2);
 }
 void QueuedWriteKeepsTheOlderPointsArenasCharged() {
   // A replacement is credited only with arenas dropping the older point
@@ -3831,6 +4067,15 @@ int main(int argc, char** argv) {
       CASE(RetainedRowsWriteBackWithoutStaging()),
       CASE(ImageFrontierCapturesAfterPrefixCheckpoint()),
       CASE(DroppedReplyRewindsToTheStableBoundary()),
+      CASE(IdleRewindRelease(true, false)),
+      CASE(IdleRewindRelease(false, false)),
+      CASE(IdleRewindRelease(false, true)),
+      CASE(IdleRewindRelease(false, false, true)),
+      CASE(ShutdownRetriesFailedIdleRewind()),
+      CASE(ReleasedRewindDoesNotWriteDeadFrontier(false)),
+      CASE(ReleasedRewindDoesNotWriteDeadFrontier(true)),
+      CASE(SchedulerReleasesIdleRewind(false)),
+      CASE(SchedulerReleasesIdleRewind(true)),
       CASE(FailedRewindFallsBackAndStaysExact()),
       CASE(RewindArenasAreChargedWhole()),
       CASE(RefusedReplacementKeepsTheOlderPoint()),

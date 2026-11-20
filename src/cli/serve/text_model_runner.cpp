@@ -2267,6 +2267,13 @@ std::size_t TextRunnerPool::WriteBackIdle(
              : 0;
 }
 
+std::size_t TextRunnerPool::ReleaseIdleRewinds(
+    std::chrono::milliseconds idle_for) {
+  return impl_->component_cache
+             ? impl_->component_cache->ReleaseIdleRewinds(idle_for)
+             : 0;
+}
+
 bool TextRunnerPool::HostWritesPending() const {
   return impl_->component_cache && impl_->component_cache->HostWritesPending();
 }

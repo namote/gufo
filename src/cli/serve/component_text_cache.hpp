@@ -202,6 +202,10 @@ public:
   // slots queued. The destructor drains the queue and writes back every
   // uncovered frontier once more.
   std::size_t WriteBackIdle(std::chrono::milliseconds idle_for) noexcept;
+  // Release idle points only after exact disk publication and after writers
+  // drop their sources; queue uncovered points first. Call on the scheduler
+  // thread after observing no running or queued requests; admission must wait.
+  std::size_t ReleaseIdleRewinds(std::chrono::milliseconds idle_for);
   // Before admitting `prompt` (same arguments as Acquire). False while the
   // slot it would use, its live frontier's or the one cold assignment takes,
   // is held by a queued disk write: that request waits, the other slots keep

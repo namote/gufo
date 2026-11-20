@@ -956,6 +956,10 @@ public:
   /// with a disk cache only). Other sessions may be running; call from the
   /// scheduler thread.
   std::size_t WriteBackIdle(std::chrono::milliseconds idle_for) noexcept;
+  // Release idle points only after exact disk publication and after writers
+  // drop their sources; queue uncovered points first. Call on the scheduler
+  // thread after observing no running or queued requests; admission must wait.
+  std::size_t ReleaseIdleRewinds(std::chrono::milliseconds idle_for);
   /// The last WriteBackIdle left a frontier for its own pending write; call
   /// it again later.
   [[nodiscard]] bool WriteBackDeferred() const noexcept;

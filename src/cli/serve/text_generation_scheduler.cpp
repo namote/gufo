@@ -2875,7 +2875,22 @@ struct TextGenerationScheduler::Impl {
             loop_working.store(true, std::memory_order_relaxed);
             if (woken)
               break;
+            // This wait has no admitted requests. Take the idle decision
+            // under the submit lock, then do maintenance without holding it.
+            // New submissions wait for the next admission on this thread.
+            const bool release_idle = queued_count == 0;
             lock.unlock();
+            if (release_idle) {
+              try {
+                (void)runner_pool->ReleaseIdleRewinds(
+                    std::max(scheduler_policy.idle_rewind_release_delay,
+                             scheduler_policy.idle_write_back_delay));
+              } catch (const std::exception& error) {
+                Logger::Info("cache",
+                             std::string("event=rewind_release_failed error=") +
+                                 error.what());
+              }
+            }
             if (!written_back && Clock::now() >= write_back_at) {
               (void)runner_pool->WriteBackIdle(
                   scheduler_policy.idle_write_back_delay);

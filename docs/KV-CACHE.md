@@ -636,7 +636,29 @@ reassignment write a marked conversation's rewind point instead of its live
 frontier, which no later prompt continues. A boundary the disk step allows
 goes to disk at capture as well. A write that fails, is superseded, or is
 published and later evicted leaves the point to be written again: only a
-pending job or a checkpoint covering it counts. Logs: `event=rewind_captured`,
+pending job or a checkpoint covering it counts.
+
+After five minutes idle (and never before the idle write-back delay), a point
+is released once its exact boundary has a published disk checkpoint. A nearby
+checkpoint or queued write does not suffice: an uncovered boundary is queued
+for publication first, bypassing disk spacing if necessary. Idle write-back
+and release maintenance share one submitted write per point per committed turn.
+Refusals before submission leave that allowance available. Submitted writes
+that fail, become untracked or are immediately evicted consume the allowance;
+the point stays until a later turn enables another attempt. Shutdown bypasses
+this idle limit and retries an uncovered point. Release observes
+no active or queued requests under the submit lock, then does maintenance
+without that lock; newly arriving requests are admitted afterwards. It waits
+for writers to drop the point's arenas. Points with `persist=false` or on
+slots whose rows were reclaimed are not released by this sweep; their memory
+remains bounded by the rewind budget.
+Continuous traffic can therefore postpone release beyond five minutes;
+maintenance retries at the existing idle probe cadence (normally five seconds).
+Its host arenas return to the pool for the existing idle trim; the slot keeps
+its ordinary KV rows and live frontier. Releasing a current point marks its
+reply frontier as dead for persistence, so idle, reassignment and shutdown do
+not write that reply instead. A later turn can still continue the live frontier
+or restore from disk; committing a new turn clears the dead-frontier mark. Logs: `event=rewind_captured`,
 `event=rewind_refused` (`reason=host_cap`, `arena_budget` or a snapshot-arena
 refusal),
 `event=rewind_restored`, `event=restore_failed source=rewind`,
@@ -699,6 +721,7 @@ a top-level `cache_persist`; see [the server guide](SERVER.md).
 | `schema=component-cache-v1 event=published` | A checkpoint finished disk publication; `checkpoint_id` identifies the capture, `tokens` its boundary, and `purpose` is `prompt`, `generated`, `grid` or `learned`. Learned shared-prefix checkpoints bypass ordinary disk spacing and do not anchor it. Older logs without `purpose` are treated as non-learned by the spacing checker. |
 | `schema=component-cache-v1 event=capture_refused reason=min_step` | A planned capture was skipped before copying because a compatible published or queued checkpoint anchors the disk spacing; `tokens` identifies the requested boundary. Learned captures are exempt. |
 | `schema=component-cache-v1 event=rewind_captured` / `rewind_restored` / `rewind_persisted` | Qwen27B/Flash-Next: a request kept its stable boundary on its slot (`host_bytes`, `device_bytes`, `shared_pieces` reused from the slot's previous point), a rewritten reply's next turn restored it in place, or it was queued for disk before a reset (`reason`) |
+| `schema=component-cache-v1 event=rewind_released reason=idle` | an idle point has exact published disk coverage and no writer holding its arenas; `host_bytes` is its released host payload and `idle_s` the conversation's idle age. The arenas become eligible for the existing idle trim. |
 | `schema=component-cache-v1 event=rewind_refused` | the rewind point did not fit the rewind share of the snapshot arenas (`reason=host_cap` for its payload, `arena_budget` for the arenas all points and their queued writes occupy) or the arenas refused it; the boundary takes the ordinary disk capture |
 | `schema=component-cache-v1 event=persistence_refused reason=min_step` | A captured checkpoint is too close to an existing publication; includes `checkpoint_id` and `tokens` |
 | `event=snapshot action=removed reason=entry_capacity` | a retained prefix was evicted because every entry was taken |
