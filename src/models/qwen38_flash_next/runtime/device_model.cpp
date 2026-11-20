@@ -626,13 +626,18 @@ bool DeviceModel::SetDraftVocab(std::uint32_t prefix_rows,
   return true;
 }
 
-std::size_t DeviceModel::ReleaseDraftHeadCopy() noexcept {
+std::size_t DeviceModel::DraftHeadCopyBytes() const noexcept {
   if (draft_output_.type != core::GgmlType::kQ4_K || output_.exl3 == nullptr)
     return 0;
+  return std::size_t{draft_output_.rows} * (draft_output_.cols / 256) * 144 +
+         kTailMargin;
+}
+
+std::size_t DeviceModel::ReleaseDraftHeadCopy() noexcept {
+  const std::size_t bytes = DraftHeadCopyBytes();
+  if (bytes == 0)
+    return 0;
   void* copy = draft_output_.data;
-  const std::size_t bytes =
-      std::size_t{draft_output_.rows} * (draft_output_.cols / 256) * 144 +
-      kTailMargin;
   (void)hipDeviceSynchronize();
   (void)hipFree(copy);
   std::erase(allocations_, copy);

@@ -118,6 +118,8 @@ public:
   /// place, when the sessions would not fit beside it. Only before any
   /// executor pass or session uses it. Returns the bytes freed.
   std::size_t ReleaseDraftHeadCopy() noexcept;
+  /// Bytes ReleaseDraftHeadCopy would free, or 0 without a copy.
+  [[nodiscard]] std::size_t DraftHeadCopyBytes() const noexcept;
   const DeviceMixer& hc_head() const noexcept { return hc_head_; }
   const std::vector<DeviceLayer>& layers() const noexcept { return layers_; }
   [[nodiscard]] bool has_mtp() const noexcept { return has_mtp_; }

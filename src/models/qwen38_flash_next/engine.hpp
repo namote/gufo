@@ -2,6 +2,7 @@
 #define GUFO_MODELS_QWEN38_FLASH_NEXT_ENGINE_HPP_
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -213,6 +214,9 @@ private:
   std::unique_ptr<tokenization::QwenTokenizer> tokenizer_;
   std::unique_ptr<NgramTable> ngram_;
   std::unique_ptr<rocm::DeviceModel> device_;
+  // Set by the first CreateSession: session graphs may then hold the draft
+  // head copy, so ReleaseDraftHeadCopy refuses.
+  std::atomic<bool> sessions_created_{false};
   std::unique_ptr<rocm::Executor> executor_;
   std::shared_ptr<qwen::vision::Encoder> vision_;
   MtpBatchController batch_policy_;

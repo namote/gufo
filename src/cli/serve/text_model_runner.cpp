@@ -316,6 +316,14 @@ ValidatedRunner ValidateRunner(std::shared_ptr<TextModelRunner> runner,
   }
 
   auto resources = runner->ResourceClaim();
+  // Optional device copies (Flash-Next's 4-bit draft head) give way when
+  // they are what keeps the configured sessions from being admitted.
+  if (const auto reservation = PerStateReservationBytes(resources);
+      resources.state_capacity_bytes.has_value() && reservation.has_value() &&
+      *reservation != 0 &&
+      state_count > *resources.state_capacity_bytes / *reservation &&
+      runner->ReleaseOptionalDeviceMemory() != 0)
+    resources = runner->ResourceClaim();
   const auto per_state_reservation = PerStateReservationBytes(resources);
   if (resources.state_capacity_bytes.has_value() &&
       per_state_reservation.has_value()) {

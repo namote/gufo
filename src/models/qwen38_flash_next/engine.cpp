@@ -325,6 +325,7 @@ std::unique_ptr<Session> Model::CreateSession(
     AssignError(error_msg, "session context is outside the model limits");
     return nullptr;
   }
+  sessions_created_.store(true, std::memory_order_relaxed);
   auto native =
       executor_->CreateSession(mode, max_context, error_msg, std::move(pool));
   if (!native) {
@@ -446,6 +447,8 @@ std::size_t Model::DeferredScratchBytes() const {
 static_assert(Model::kWideCopyRows == rocm::Executor::kWideRows);
 
 std::size_t Model::ReleaseDraftHeadCopy() noexcept {
+  if (sessions_created_.load(std::memory_order_relaxed))
+    return 0;
   return device_->ReleaseDraftHeadCopy();
 }
 

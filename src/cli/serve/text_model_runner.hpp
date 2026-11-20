@@ -383,6 +383,10 @@ public:
 
   [[nodiscard]] virtual TextRunnerDescriptor Descriptor() const = 0;
   [[nodiscard]] virtual TextRunnerResourceClaim ResourceClaim() const = 0;
+  /// Frees optional device memory (not needed for correct output) when the
+  /// configured sessions would not otherwise be admitted. Called once before
+  /// any request state exists. Returns the bytes freed.
+  virtual std::size_t ReleaseOptionalDeviceMemory() { return 0; }
   [[nodiscard]] virtual std::vector<TextExecutionPlan> SupportedPlans()
       const = 0;
 

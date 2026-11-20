@@ -2961,6 +2961,15 @@ public:
     });
   }
 
+  std::size_t ReleaseOptionalDeviceMemory() override {
+    // Drafts then read the EXL3 head prefix in place.
+    const auto freed = model_->ReleaseDraftHeadCopy();
+    if (freed)
+      Logger::Info("loader", "event=draft_head_copy_released bytes=" +
+                                 std::to_string(freed));
+    return freed;
+  }
+
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
     std::size_t free_bytes = 0;
     std::size_t total_bytes = 0;
@@ -4020,16 +4029,6 @@ bool InferenceBackend::load(
                     model->DeferredScratchBytes() <=
                 free_bytes)
           break;
-      }
-      // The 4-bit draft head copy is optional: without room for the
-      // sessions, drafts read the EXL3 head prefix instead.
-      if (sessions * model->SessionBytes(core::SessionMode::kSpeculative,
-                                         max_context) +
-              model->DeferredScratchBytes() >
-          free_bytes) {
-        if (const auto freed = model->ReleaseDraftHeadCopy())
-          Logger::Info("loader", "event=draft_head_copy_released bytes=" +
-                                     std::to_string(freed));
       }
     }
     // Allocate the decode batch and wide verification scratch before any
