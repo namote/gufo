@@ -82,6 +82,7 @@
 
 | # | 출처 | 내용 | 비고 |
 |---|---|---|---|
+| V3-0 | 우리 (V2-F1) | 생각 과정을 빼고(drop/discard reasoning) 대화를 다시 보내는 클라이언트가 턴마다 최대 약 2K토큰을 다시 계산하는 문제 | 사용자 요청으로 3묶음 맨 앞에 둔다. `cache-growth` drop/discard 경우로 확인 |
 | V3-1 | 2e50748f (#1265), 425e3513 (#1274), #1251의 arena 부분 | 혼자 들어온 긴 입력을 14K 행 pass로, 넓은 scratch는 그 동안만 매핑 | upstream 28K~85K 입력 prefill +2~7%. 우리 16K 실험은 +2.8%였지만 +6.38 GiB 때문에 기각했는데, 이 설계가 그 문제를 없앤다 |
 | V3-2 | Kyojin 9f1b368, 2484e31 (+ 우리 da021c03) | typical acceptance 재도입. 복사 초안은 exact, 12-gram 반복 거부, 루프 신호 뒤 exact 창, `</think>` 뒤에만 완화하는 선택 | U5에서 sampled +2.5~27.6%. 11-10 반복 재현(숙소 후기)을 통과해야 하며 opt-in으로 시작 |
 | V3-3 | exllamav3 805caee, Kyojin loopguard | 반복 감지: 멈추거나 열린 think를 닫기 | 두 모델이 함께 쓰는 scheduler에 넣는다. 코드·JSON 오탐 때문에 opt-in |
