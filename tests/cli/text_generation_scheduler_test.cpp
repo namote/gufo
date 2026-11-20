@@ -244,6 +244,8 @@ struct FakeControl {
   std::optional<std::size_t> stop_after;
   std::optional<std::size_t> eos_after;
   std::function<void()> snapshot_callback;
+  // Optional gate after a prefill enters and before it updates state.
+  std::function<void(TextRunnerToken)> before_prefill;
   /// Nonzero: ScoreBatch shares passes of this many rows (ScoringPackRows).
   std::size_t scoring_pack_rows{0};
   std::vector<std::size_t> score_batches;  ///< requests per ScoreBatch call
@@ -546,6 +548,9 @@ public:
         control_->release_prefill = false;
       }
     }
+
+    if (control_->before_prefill)
+      control_->before_prefill(fake.label);
 
     fake.EnsureRows(fake.position + consumed);
     fake.position += consumed;
@@ -3402,6 +3407,93 @@ void TestCapturedDecoderResumesBeforeMorePrefill() {
       "a request leaving capture decodes before another peer chunk");
 }
 
+void TestCapturedPrefillResumesBeforeRepeatedPeerPrefill() {
+  const auto started = std::chrono::steady_clock::now();
+  for (const bool older_waiter : {false, true}) {
+    auto control = std::make_shared<FakeControl>();
+    control->max_context = 4096;
+    control->preview_first_token = true;
+    control->block_prefill_label = 2;
+    std::binary_semaphore entered(0), release(0), older_entered(0),
+        release_older(0);
+    unsigned older_calls = 0;
+    if (older_waiter) {
+      control->before_prefill = [&](TextRunnerToken label) {
+        if (label == 3 && older_calls++ == 0) {
+          older_entered.release();
+          release_older.acquire();
+        }
+      };
+    }
+    std::atomic<unsigned> captures{0};
+    control->snapshot_callback = [&] {
+      if (captures.fetch_add(1) == 0) {
+        entered.release();
+        release.acquire();
+      }
+    };
+    // Keep the production prompt unit and model profile. The peer is longer
+    // than that unit, so it has another turn after the held prefill.
+    auto scheduler = MakeScheduler(control, older_waiter ? 3 : 2);
+    auto first =
+        scheduler->Submit(std::vector<TextRunnerToken>(2200, 1), 3, 0.0F);
+    Expect(entered.try_acquire_for(kTestTimeout),
+           "partial prompt capture starts");
+    std::optional<TextGenerationScheduler::Request> older;
+    if (older_waiter) {
+      older.emplace(
+          scheduler->Submit(std::vector<TextRunnerToken>(3000, 3), 1, 0.0F));
+      Expect(older_entered.try_acquire_for(kTestTimeout),
+             "older prefill is resident before the peer is admitted");
+    }
+    auto second =
+        scheduler->Submit(std::vector<TextRunnerToken>(3000, 2), 1, 0.0F);
+    if (older_waiter)
+      release_older.release();
+    control->WaitForPrefill(2);
+    release.release();
+    // The scheduler stays inside the peer's held call while the actual
+    // snapshot future becomes ready; observing readiness cannot race its get().
+    const auto deadline = std::chrono::steady_clock::now() + kTestTimeout;
+    while (SnapshotPendingForTesting(first) &&
+           std::chrono::steady_clock::now() < deadline)
+      std::this_thread::yield();
+    const bool ready = !SnapshotPendingForTesting(first);
+    control->ReleasePrefill();
+    Expect(ready, "partial prompt capture is ready before the peer returns");
+    const auto first_result = first.Wait();
+    const auto second_result = second.Wait();
+    Expect(first_result.tokens == ExpectedTokens(1, 3) &&
+               first_result.prefill_tokens == 2200,
+           "captured prefill preserves output and exact prompt work");
+    Expect(second_result.tokens == ExpectedTokens(2, 1) &&
+               second_result.prefill_tokens == 3000,
+           "peer prefill preserves output and exact prompt work");
+    if (older) {
+      const auto result = older->Wait();
+      Expect(result.tokens == ExpectedTokens(3, 1) &&
+                 result.prefill_tokens == 3000,
+             "older waiting prefill preserves output and exact prompt work");
+    }
+    const auto events = control->Events();
+    const auto first_resume = EventIndex(events, EventKind::kPrefill, 1, 1);
+    const auto peer_repeat = EventIndex(events, EventKind::kPrefill, 2, 1);
+    Expect(first_resume != events.size() && peer_repeat != events.size(),
+           "both requests have a partial prefill continuation");
+    Expect(first_resume < peer_repeat,
+           "ready partial prefill resumes before its peer repeats");
+    if (older_waiter) {
+      Expect(EventIndex(events, EventKind::kPrefill, 3, 1) < first_resume,
+             "resumed capture preserves an older queued prefill's turn");
+    }
+  }
+  std::cout << "Captured prefill resume cases: "
+            << std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - started)
+                   .count()
+            << " ms\n";
+}
+
 void TestCapturesAtCapacityAllowQueuedProgress() {
   for (const auto [multi, history] :
        {std::pair{false, false}, {true, false}, {false, true}, {true, true}}) {
@@ -4265,6 +4357,7 @@ int main() {
     }
   }
   TestCapturedDecoderResumesBeforeMorePrefill();
+  TestCapturedPrefillResumesBeforeRepeatedPeerPrefill();
   TestCapturesAtCapacityAllowQueuedProgress();
   TestShutdownCancelsRunnerAcquisition();
   TestSnapshotDoesNotBlockOtherRequests();

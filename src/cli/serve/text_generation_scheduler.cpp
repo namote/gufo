@@ -2628,7 +2628,14 @@ struct TextGenerationScheduler::Impl {
             decoding.push_back(std::move(request));
             MarkAllDecodersDue(decoding);
           } else {
-            prefilling.push_back(std::move(request));
+            // A ready capture has already waited through its peer's turn.
+            // Preserve older waiters, but resume before the last peer repeats.
+            auto next = prefilling.end();
+            if (!prefilling.empty() &&
+                prefilling.back()->id == last_prefill_request_id) {
+              --next;
+            }
+            prefilling.insert(next, std::move(request));
           }
         }
       }
@@ -3059,6 +3066,13 @@ TextRequestPhase TextGenerationScheduler::Request::phase() const noexcept {
   return *this ? impl_->request->phase.load(std::memory_order_acquire)
                : TextRequestPhase::kTerminal;
 }
+
+#ifdef GUFO_CACHE_TESTING
+bool SnapshotPendingForTesting(
+    const TextGenerationScheduler::Request& request) {
+  return request && request.impl_->request->runner_request.SnapshotPending();
+}
+#endif
 
 TextGenerationScheduler::Result TextGenerationScheduler::Request::Wait(
     const TokenCallback& on_token, const ProgressCallback& on_progress,
