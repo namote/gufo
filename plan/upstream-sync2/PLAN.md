@@ -87,7 +87,6 @@
 | V3-2 | Kyojin 9f1b368, 2484e31 (+ 우리 da021c03) | typical acceptance 재도입. 복사 초안은 exact, 12-gram 반복 거부, 루프 신호 뒤 exact 창, `</think>` 뒤에만 완화하는 선택 | U5에서 sampled +2.5~27.6%. 11-10 반복 재현(숙소 후기)을 통과해야 하며 opt-in으로 시작 |
 | V3-3 | exllamav3 805caee, Kyojin loopguard | 반복 감지: 멈추거나 열린 think를 닫기 | 두 모델이 함께 쓰는 scheduler에 넣는다. 코드·JSON 오탐 때문에 opt-in |
 | V3-4 | exllamav3 0244652, Kyojin fce7501 | GDN 상태를 FP16으로 저장하고 FP32로 계산 | Kyojin 27B 8×16K decode +7.7%, KL 0.0004. 예전 BF16(#138)은 기각했으므로 27B에서 먼저 품질 확인. 캐시 형식이 바뀐다 |
-| V3-5 | 27B in-pass capture (a59df291, #1224) | 27B prefill 중 checkpoint | 600~1000줄, 지금은 효과 대비 비용이 낮음 |
 
 **V3-0 결과 (2026-11-21).** 슬롯 안에 되돌아갈 지점을 둔다. `cache-growth`의 네 경우가 모두 통과하고, 속도 손해는 없다. KNOWHOW "V3-0: in-place rewind point" 참고.
 

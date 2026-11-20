@@ -20,6 +20,7 @@ RAM checkpoint 층을 없앤 c597eed1(11-18) 뒤로는 효과가 없는 항목�
 | OpenCode 설정 자동 전환 | 모델이나 서버 상태에 맞춰 OpenCode 설정을 자동으로 바꾼다. |
 | OpenCode 이어 쓰기 저장 설정 | `tools/serving/opencode_resume.py`로 끊긴 OpenCode 세션을 이어 가도록 저장하고 캡처하는 설정이다(`plan/serving/CONTINUE-FINAL-MESSAGE-BRIEF.md` 5번). 도구는 이미 있고, 자동 연동만 하지 않았다. |
 | 27B 문맥 1M (YaRN) | Qwen3.8 27B 서버에 YaRN을 켜서 문맥을 1M까지 늘린다. |
+| V3-5 27B prefill 도중 저장 | upstream #1224 (a59df291): 27B가 prefill 단계 안에서 checkpoint를 잡는다. 600~1000줄이 들고 효과 대비 비용이 낮다(사용자 결정 2026-11-21). |
 
 ## upstream-sync2에서 빼기로 한 것 (2026-11-20 조사 보고서 "Rejected")
 
