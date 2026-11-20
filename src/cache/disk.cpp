@@ -14,10 +14,13 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
+#include <vector>
 
 #include "src/cache/page_cache.hpp"
 #include "src/core/platform/fs.hpp"
@@ -30,6 +33,9 @@ struct DiskAvailability {
 };
 }  // namespace detail
 namespace {
+// New payloads are synchronized in batches by concurrent threads.
+constexpr std::size_t kPayloadSyncBatch = 128;
+constexpr std::size_t kPayloadSyncThreads = 32;
 template<class F>
 struct Finally {
   F action;
@@ -235,6 +241,64 @@ private:
                           const std::error_code& ec) {
   throw std::runtime_error(message + ": " + ec.message());
 }
+// Synchronizes files on helper threads; Wait() helps finish them. File
+// systems commit concurrent synchronizations together, while one at a time
+// each small file waits for its own commit (upstream #1180).
+class ConcurrentSync {
+public:
+  ConcurrentSync(std::span<const platform::PlatformFile> files,
+                 std::size_t threads)
+      : files_(files), begin_(std::chrono::steady_clock::now()) {
+    // The caller works too, so one file needs no helper.
+    threads = std::min(threads, files.empty() ? 0 : files.size() - 1);
+    workers_.reserve(threads);
+    for (std::size_t i = 0; i < threads; ++i) {
+      try {
+        workers_.emplace_back([this] { Work(); });
+      } catch (const std::system_error&) {
+        break;  // Wait() completes the remaining files.
+      }
+    }
+  }
+  ConcurrentSync(const ConcurrentSync&) = delete;
+  ConcurrentSync& operator=(const ConcurrentSync&) = delete;
+  ~ConcurrentSync() { Stop(); }
+  // Returns the first failure once every file has been attempted.
+  std::error_code Wait() {
+    Work();
+    Stop();
+    return failure_;
+  }
+  [[nodiscard]] std::size_t Files() const { return files_.size(); }
+  [[nodiscard]] std::uint64_t ElapsedNs() const {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(end_ - begin_)
+            .count());
+  }
+
+private:
+  void Work() {
+    for (std::size_t i; (i = next_.fetch_add(1)) < files_.size();) {
+      std::error_code ec;
+      if (!platform::SyncFile(files_[i], ec)) {
+        std::lock_guard guard(failure_mutex_);
+        if (!failure_)
+          failure_ = ec ? ec : std::make_error_code(std::errc::io_error);
+      }
+    }
+  }
+  void Stop() {
+    // Joining also orders the workers' failure writes before Wait() reads.
+    workers_.clear();
+    end_ = std::chrono::steady_clock::now();
+  }
+  std::span<const platform::PlatformFile> files_;
+  std::chrono::steady_clock::time_point begin_, end_;
+  std::atomic<std::size_t> next_{};
+  std::mutex failure_mutex_;
+  std::error_code failure_;
+  std::vector<std::jthread> workers_;
+};
 void SyncDirectoryFd(const platform::Directory& directory) {
   std::error_code ec;
   if (!platform::SyncDirectory(directory, ec))
@@ -1429,27 +1493,50 @@ struct DiskStore::Impl {
             ec != std::errc::not_supported)
           IoError("sync cache filesystem", ec);
       }
-      for (const auto& [dir, name] : created) {
-        std::error_code ec;
-        platform::PlatformFile descriptor;
-        {
-          CostTimer timer(publication_stats.filesystem_ns);
-          descriptor = platform::OpenAt(temporary, name,
-                                        platform::FileMode::kWriteExisting, ec);
+      // Each payload is renamed into place only after its own sync. A batch
+      // of payloads syncs concurrently (bounding the open descriptors).
+      std::vector<Fd> batch;
+      std::vector<platform::PlatformFile> batch_files;
+      batch.reserve(std::min(created.size(), kPayloadSyncBatch));
+      batch_files.reserve(batch.capacity());
+      for (std::size_t first = 0; first < created.size();
+           first += kPayloadSyncBatch) {
+        const auto last = std::min(created.size(), first + kPayloadSyncBatch);
+        batch.clear();
+        batch_files.clear();
+        for (auto i = first; i < last; ++i) {
+          std::error_code ec;
+          platform::PlatformFile descriptor;
+          {
+            CostTimer timer(publication_stats.filesystem_ns);
+            descriptor =
+                platform::OpenAt(temporary, created[i].second,
+                                 platform::FileMode::kWriteExisting, ec);
+          }
+          batch.emplace_back(descriptor);
+          if (!platform::FileValid(batch.back().Get()))
+            IoError("reopen temporary cache file", ec);
+          batch_files.push_back(batch.back().Get());
         }
-        Fd fd(descriptor);
-        if (!platform::FileValid(fd.Get()))
-          IoError("reopen temporary cache file", ec);
-        Sync(fd.Get());
         {
-          // The payload is durable; drop its clean pages so multi-GB snapshots
-          // don't accumulate in the page cache.
-          CostTimer timer(publication_stats.filesystem_ns);
-          DropCleanPages(fd.Get(), 0, 0);
+          ConcurrentSync sync(batch_files, kPayloadSyncThreads);
+          const auto failure = sync.Wait();
+          publication_stats.fsync_calls += sync.Files();
+          publication_stats.fsync_ns += sync.ElapsedNs();
+          if (failure)
+            IoError("sync cache file/directory", failure);
         }
-        DISK_STEP(kPayloadSynced);
-        Rename(*dir, name);
-        DISK_STEP(kPayloadRenamed);
+        for (auto i = first; i < last; ++i) {
+          {
+            // The payload is durable; drop its clean pages so multi-GB
+            // snapshots don't accumulate in the page cache.
+            CostTimer timer(publication_stats.filesystem_ns);
+            DropCleanPages(batch[i - first].Get(), 0, 0);
+          }
+          DISK_STEP(kPayloadSynced);
+          Rename(*created[i].first, created[i].second);
+          DISK_STEP(kPayloadRenamed);
+        }
       }
       Sync(temporary);
       DISK_STEP(kTemporaryDirectorySynced);
