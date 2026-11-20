@@ -415,7 +415,11 @@ def check_sampling_defaults(client, model, checks, preset, overrides, vision=Fal
             **request, "extra_body": {**request["extra_body"], "cache_prompt": True}}, True)
         assert signature(cached) == signature(inherited), (cached, inherited)
         assert cached["usage"]["cached_tokens"] > 0, cached
-        assert cached["usage"]["gufo"]["prefill_tokens"] == 0, cached
+        # Without a RAM checkpoint tier the unchanged retry restores the
+        # stable boundary and re-prefills at most the mutable suffix (the
+        # final user turn and assistant opening), as check_unchanged_retry
+        # allows; the sampler check above is what this case is about.
+        assert cached["usage"]["gufo"]["prefill_tokens"] <= ASSISTANT_OPENING_TOKENS, cached
         record(f"sampling_cached_preset_thinking{thinking}", cached)
 
         # Distinct request-owned samplers must replay when admitted together.
