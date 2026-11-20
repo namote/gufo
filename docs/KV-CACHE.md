@@ -490,9 +490,10 @@ global least-recently-used, without conversation or rebuild-cost awareness.
 
 Qwen27B and Flash-Next keep no RAM checkpoint tier. There is no
 `--cache-ram-bytes` or `--cache-tail-checkpoints` option, no committed backing
-pool and no RAM restore (`reuse` is `live`, `disk` or `none`). Reuse order is:
+pool and no RAM restore (`reuse` is `live`, `rewind`, `disk` or `none`). Reuse order is:
 
-1. the session's live frontier, continued in place;
+1. the session's live frontier, continued in place, or its rewind point
+   (see [the disk tier](#the-disk-tier)), restored in place;
 2. a disk checkpoint, restored through the 1 MiB staging buffer;
 3. cold prefill.
 
@@ -595,6 +596,43 @@ the queue refused is retried at shutdown; a failed one keeps the frontier
 live in its slot. Logs: `event=live_frontier_written_back`,
 `event=live_frontier_write_back_failed`.
 
+**Rewind points keep a rewritten reply's turn reusable (Qwen27B and
+Flash-Next).** A client that drops or discards reasoning sends each reply
+back rendered differently from the tokens the model generated, so the next
+prompt leaves the live frontier inside that reply. The recurrent state
+cannot rewind, and the turn's stable boundary is usually within the disk step
+of an earlier checkpoint, so before this each turn restored an older disk
+checkpoint and prefilled up to one disk step again (plus a learned
+checkpoint written one turn late). Now a request whose prompt repeats an idle
+frontier through that frontier's stable boundary but not further, or that
+was served from a rewind point, or that continues a slot already marked so,
+stops prefill at its own aligned stable boundary and keeps that state on its
+slot: completed KV rows the adapter retains in device storage (the slot's own
+blocks, no copy), and host copies of private states, partial tails and rows
+it cannot retain, in the snapshot arenas (all slots' points together at most
+a quarter of them). Nothing is lent from the slot, so later execution leaves
+the point intact. The next prompt that diverges after it restores the point
+into the same slot (retained rows re-mapped, host pieces copied back): no
+disk read, and the bytes are those a disk checkpoint of that boundary holds.
+A rewind wins over an equally deep disk checkpoint and loses to a deeper live
+frontier. The slot then starts a new execution branch, so queued writes of
+the abandoned frontier never become its lineage. Clients that replay replies
+verbatim never take a point and pay nothing. A stable boundary within 64
+tokens of the reused one is still not a stop (`kNearbyStableTokens`), and
+the first rewritten turn of a conversation, which reveals the client, still
+restores from disk.
+
+The point goes to disk (not limited by the disk step, shared ancestor chunks
+reused) before its slot is reset: reassignment, row reclaim, a failed or
+cancelled request, a disk restore into the slot. Idle write-back and
+reassignment write a marked conversation's rewind point instead of its live
+frontier, which no later prompt continues. A boundary the disk step allows
+goes to disk at capture as well. Logs: `event=rewind_captured`,
+`event=rewind_refused` (`reason=host_cap` or a snapshot-arena refusal),
+`event=rewind_restored`, `event=restore_failed source=rewind`,
+`event=rewind_persisted`, `event=rewind_persist_failed`, and
+`event=acquire reuse=rewind`.
+
 Disk entries are evicted by global LRU on last access, so one active run whose
 checkpoints are all recent will displace every other conversation in age order
 **(measured)**. See #275.
@@ -616,7 +654,9 @@ Anything that changes the token prefix. In practice:
   boundary before the assistant opening, so the next turn can reuse the prior
   history and process the rewritten assistant plus new input. That boundary
   must be saved on warm hits too; retaining only the old resume point caused
-  cache reuse to stop advancing for the rest of the session. See #335.
+  cache reuse to stop advancing for the rest of the session. See #335. On
+  Qwen27B and Flash-Next that boundary is a rewind point on the slot (see
+  [the disk tier](#the-disk-tier)), so it is kept even within the disk step.
 
 These do **not** invalidate reuse **(measured)**: changing `temperature`,
 `top_p`, `seed`, `max_tokens`, penalties or `stop` between turns; streaming
@@ -648,6 +688,8 @@ a top-level `cache_persist`; see [the server guide](SERVER.md).
 | `schema=component-cache-v1 event=disk_over_budget` | Flash-Next: the directory still exceeds `--cache-disk-bytes` after startup reclamation and eviction; publication is refused until it fits |
 | `schema=component-cache-v1 event=published` | A checkpoint finished disk publication; `checkpoint_id` identifies the capture, `tokens` its boundary, and `purpose` is `prompt`, `generated`, `grid` or `learned`. Learned shared-prefix checkpoints bypass ordinary disk spacing and do not anchor it. Older logs without `purpose` are treated as non-learned by the spacing checker. |
 | `schema=component-cache-v1 event=capture_refused reason=min_step` | A planned capture was skipped before copying because a compatible published or queued checkpoint anchors the disk spacing; `tokens` identifies the requested boundary. Learned captures are exempt. |
+| `schema=component-cache-v1 event=rewind_captured` / `rewind_restored` / `rewind_persisted` | Qwen27B/Flash-Next: a request kept its stable boundary on its slot (`host_bytes`, `device_bytes`, `shared_pieces` reused from the slot's previous point), a rewritten reply's next turn restored it in place, or it was queued for disk before a reset (`reason`) |
+| `schema=component-cache-v1 event=rewind_refused` | the rewind point did not fit its share of the snapshot arenas (`reason=host_cap`) or the arenas refused it; the next turn restores from disk |
 | `schema=component-cache-v1 event=persistence_refused reason=min_step` | A captured checkpoint is too close to an existing publication; includes `checkpoint_id` and `tokens` |
 | `event=snapshot action=removed reason=entry_capacity` | a retained prefix was evicted because every entry was taken |
 | `event=snapshot action=skipped reason=entry_capacity` | no checkpoint record could be replaced safely for this capture |

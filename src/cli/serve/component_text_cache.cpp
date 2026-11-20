@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <numeric>
 #include <optional>
@@ -103,6 +104,45 @@ struct DurableCapture {
   // False when older jobs still read rows of the slot it holds, which its
   // release would let a reset retire.
   bool jump{true};
+  // A rewind point written to disk (PersistRewind): idle, reassignment and
+  // reset writes of it are not limited by the disk step.
+  bool step_exempt{};
+};
+// A stable boundary kept in memory on its slot, for a conversation whose
+// client sends its history back without the generated reply as the model
+// produced it (dropped or discarded reasoning). The next prompt then diverges
+// inside that reply, where the recurrent state cannot rewind, and the
+// boundary is usually within the disk step of an earlier checkpoint. The
+// point holds what a disk checkpoint of that boundary would: completed rows
+// the adapter retains in device storage (the slot's own KV blocks, no copy),
+// and host copies of the rest (private states, partial tails, rows it cannot
+// retain). Nothing is lent from the slot, so later execution, restores and
+// resets leave it intact. Restoring it into its slot re-maps the retained
+// rows and copies only the host pieces back.
+struct RewindPoint {
+  cache::ResourceCharge metadata;
+  std::vector<cache::Token> tokens;
+  // Input identity at the boundary, and with the image boundaries within.
+  cache::Identity input;
+  cache::InputIdentity inputs;
+  std::vector<cache::ComponentPosition> positions;
+  cache::LineageId lineage;
+  struct Piece {
+    cache::ComponentId component;
+    bool private_state{};
+    cache::Rows first{}, end{};
+    // Retained device rows (device) or a host arena.
+    std::shared_ptr<const void> owner;
+    std::span<const std::byte> bytes;
+    bool device{};
+  };
+  // In component order, rows ascending.
+  std::vector<Piece> pieces;
+  std::size_t host_bytes{}, device_bytes{};
+  // False for a request that keeps its prompt off the disk.
+  bool persist{true};
+  // Queued for the disk once (under the cache mutex).
+  bool persisted{};
 };
 // One piece a capture writes from a slot (inherited chunks excepted).
 struct SlotPiece {
@@ -263,7 +303,91 @@ struct ComponentTextCache::Impl {
     // False when the request that left the live frontier asked to keep its
     // prompt off the disk (cache_persist=false): it is never captured.
     bool live_persist{true};
+    // The rewind point of this slot's execution, a prefix of live_tokens;
+    // dropped (after a disk write) whenever the slot is reset or restored.
+    std::shared_ptr<RewindPoint> rewind;
+    // The stable boundary of the request that left the live frontier.
+    std::size_t live_stable{};
+    // Its conversation sent a generated reply back rewritten: its requests
+    // keep rewind points, and its idle and reassignment writes take the
+    // rewind point instead of the frontier no later prompt continues.
+    bool drops_reply{};
   };
+  // Under the mutex: the idle slot whose rewind point serves `prompt`
+  // deepest, beyond `live_floor` and at least at `floor`, with its boundary.
+  struct RewindChoice {
+    std::size_t index, boundary;
+  };
+  [[nodiscard]] std::optional<RewindChoice> FindRewind(
+      std::span<const cache::Token> prompt, const cache::InputIdentity& input,
+      std::size_t live_floor = 0, std::size_t floor = 0) const {
+    const std::size_t alignment = std::max<std::size_t>(
+        1, runner->Descriptor().capabilities.prefill_alignment);
+    std::optional<RewindChoice> best;
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+      const auto& e = *entries[i];
+      const auto* point = e.rewind.get();
+      if (!point || e.busy || !e.live || !e.holds_rows)
+        continue;
+      const auto n = point->tokens.size();
+      // Below the prompt end (the next token is decoded from it), aligned
+      // (prefill continues it exactly), and still the slot's own history.
+      if (!n || n >= prompt.size() || n % alignment != 0 || n <= live_floor ||
+          n < floor || (best && n <= best->boundary) ||
+          !Prefixes(point->tokens, prompt) ||
+          !Prefixes(point->tokens, e.live_tokens) ||
+          !std::ranges::equal(input.At(n), point->input))
+        continue;
+      best = RewindChoice{i, n};
+    }
+    return best;
+  }
+  // Under the mutex: FindRewind past what Acquire would otherwise reuse from
+  // `found`: deeper than a live frontier, and at least as deep as a
+  // checkpoint it could restore (no disk read).
+  [[nodiscard]] std::optional<RewindChoice> FindRewind(
+      const cache::PrefixLookup& found, std::span<const cache::Token> prompt,
+      const cache::InputIdentity& input,
+      const TextPromptContext* context) const {
+    const bool whole = runner->ReusesWholePrompt(context);
+    const std::size_t alignment = std::max<std::size_t>(
+        1, runner->Descriptor().capabilities.prefill_alignment);
+    std::size_t live_floor = 0, floor = 0;
+    for (const auto& candidate : found.candidates) {
+      if (candidate.boundary >= prompt.size() && !whole)
+        continue;
+      if (candidate.live)
+        live_floor = std::max<std::size_t>(live_floor, candidate.boundary);
+      else if (candidate.boundary % alignment == 0 ||
+               candidate.boundary >= prompt.size() || AnyPosition(candidate))
+        floor = std::max<std::size_t>(floor, candidate.boundary);
+    }
+    return FindRewind(prompt, input, live_floor, floor);
+  }
+  // Under the mutex: whether `point` is the stable boundary of the request
+  // that left the live frontier, so it, not the frontier, is what the
+  // conversation's next prompt continues. An older point (the newest capture
+  // was refused) leaves the frontier its own writes.
+  static bool RewindCurrent(const Entry& e, const RewindPoint& point) {
+    return e.live &&
+           point.tokens.size() + kUncoveredCaptureTokens >= e.live_stable &&
+           Prefixes(point.tokens, e.live_tokens);
+  }
+  // Under the mutex: whether `prompt` rewrites the generated reply of an
+  // idle live frontier: it repeats that frontier's prompt through its stable
+  // boundary but not the whole frontier.
+  [[nodiscard]] bool RewritesReply(std::span<const cache::Token> prompt,
+                                   const cache::InputIdentity& input) const {
+    return std::ranges::any_of(entries, [&](const auto& e) {
+      const auto n = e->live_stable;
+      return !e->busy && e->live && n && n < e->live_tokens.size() &&
+             n <= prompt.size() &&
+             std::equal(e->live_tokens.begin(), e->live_tokens.begin() + n,
+                        prompt.begin()) &&
+             !Prefixes(e->live_tokens, prompt) &&
+             std::ranges::equal(input.At(n), e->live_input.At(n));
+    });
+  }
   // A live frontier this many tokens or more past every checkpoint of its
   // prompt is captured before its slot is reset for another request.
   static constexpr std::size_t kUncoveredCaptureTokens = 64;
@@ -566,8 +690,11 @@ struct ComponentTextCache::Impl {
     // Settle immutable-source readers before slots/resources/index unwind.
     if (queue)
       queue->Drain();
-    for (auto& entry : entries)
+    for (auto& entry : entries) {
+      // Retained rows return to the backend before the slots unwind.
+      entry->rewind.reset();
       entry->slot->StopIdleSpill();
+    }
   }
   // Persistence completion of checkpoint `id` (queue worker).
   void Completed(cache::CheckpointId id, bool success,
@@ -794,7 +921,7 @@ struct ComponentTextCache::Impl {
   // a job it would refuse.
   bool CanQueue(const DurableCapture& capture) {
     const auto& manifest = capture.manifest;
-    if (!capture.write_back &&
+    if (!capture.write_back && !capture.step_exempt &&
         manifest.purpose != cache::CheckpointPurpose::kLearned &&
         WithinDiskStep(manifest.tokens, manifest.input))
       return false;
@@ -827,7 +954,7 @@ struct ComponentTextCache::Impl {
   std::size_t Persist(std::shared_ptr<DurableCapture> capture) {
     if (capture->sources.empty())
       return 0;
-    if (!capture->write_back &&
+    if (!capture->write_back && !capture->step_exempt &&
         WithinDiskStep(capture->manifest.tokens, capture->manifest.input) &&
         capture->manifest.purpose != cache::CheckpointPurpose::kLearned)
       return 0;
@@ -868,6 +995,173 @@ struct ComponentTextCache::Impl {
     }
     return PayloadBytes(capture->manifest);
   }
+  // Queues the rewind point `point` of `entry` for the disk once, unless a
+  // checkpoint already covers it within kUncoveredCaptureTokens. Its sources
+  // are the point's own pieces (host arenas, retained device rows), so the
+  // slot may be reset meanwhile; completed chunks of the entry's durable
+  // ancestor are shared. With `step_exempt` (idle, reassignment and reset
+  // writes) the disk step does not apply. Optional: returns the bytes
+  // queued, zero when refused or failed (logged).
+  std::size_t PersistRewind(Entry& entry,
+                            const std::shared_ptr<RewindPoint>& point,
+                            bool step_exempt,
+                            std::string_view reason) noexcept {
+    if (!point || !point->persist || !queue || !resources->copy_observed_rows)
+      return 0;
+    const auto n = point->tokens.size();
+    try {
+      std::shared_ptr<const cache::DiskDescription> ancestor;
+      std::shared_ptr<const void> branch;
+      {
+        const std::lock_guard lock(mutex);
+        if (point->persisted ||
+            index.HasCheckpoint(
+                {identity, point->tokens, point->inputs},
+                n > kUncoveredCaptureTokens ? n - kUncoveredCaptureTokens : 0))
+          return 0;
+        ancestor = entry.durable;
+        branch = entry.branch;
+      }
+      if (!step_exempt && WithinDiskStep(point->tokens, point->input))
+        return 0;
+      const auto descriptors = resources->adapter->Components();
+      auto durable = std::make_shared<DurableCapture>();
+      durable->metadata =
+          ledger
+              .Reserve(cache::ResourceCategory::kMetadata,
+                       sizeof(DurableCapture) + n * sizeof(cache::Token) +
+                           point->input.size() +
+                           descriptors.size() * sizeof(cache::DiskComponent) +
+                           point->pieces.size() *
+                               (sizeof(cache::DiskPayload) +
+                                sizeof(cache::PersistenceSource) + 256))
+              .Convert();
+      durable->branch = branch;
+      durable->step_exempt = step_exempt;
+      if (ancestor) {
+        const auto& previous = ancestor->Manifest();
+        if (previous.tokens.size() > n ||
+            !std::equal(previous.tokens.begin(), previous.tokens.end(),
+                        point->tokens.begin()) ||
+            !std::ranges::equal(previous.input,
+                                point->inputs.At(previous.tokens.size())))
+          ancestor.reset();
+        else {
+          durable->ancestor_pin = ancestor->Pin();
+          if (!durable->ancestor_pin)
+            ancestor.reset();
+        }
+      }
+      auto& manifest = durable->manifest;
+      manifest.checkpoint = cache::ExecutionHistory::AllocateCheckpointId();
+      manifest.lineage =
+          ancestor ? ancestor->Manifest().lineage : point->lineage;
+      manifest.compatibility = digest;
+      manifest.input = point->input;
+      manifest.tokens = point->tokens;
+      manifest.purpose = cache::CheckpointPurpose::kPrompt;
+      durable->sources.reserve(point->pieces.size());
+      auto piece = point->pieces.begin();
+      for (const auto& d : descriptors) {
+        const auto p = std::ranges::find(point->positions, d.id,
+                                         &cache::ComponentPosition::id);
+        if (p == point->positions.end())
+          throw std::logic_error("incomplete rewind point positions");
+        cache::DiskComponent component{.descriptor = d, .position = *p};
+        const auto completed =
+            d.kind == cache::ComponentKind::kAppendRows
+                ? p->valid_rows / d.rows_per_chunk * d.rows_per_chunk
+                : 0;
+        cache::Rows inherited = 0;
+        if (completed && ancestor) {
+          const auto& components = ancestor->Manifest().components;
+          const auto previous = std::ranges::find_if(
+              components,
+              [&](const auto& c) { return c.descriptor.id == d.id; });
+          if (previous != components.end()) {
+            const auto chunks = std::min<std::size_t>(
+                previous->chunks.size(), completed / d.rows_per_chunk);
+            component.chunks.assign(previous->chunks.begin(),
+                                    previous->chunks.begin() + chunks);
+            inherited = chunks * d.rows_per_chunk;
+          }
+        }
+        for (; piece != point->pieces.end() && piece->component == d.id;
+             ++piece) {
+          if (!piece->private_state && piece->end <= inherited)
+            continue;
+          const bool private_file =
+              piece->private_state || piece->first >= completed;
+          const auto bytes = piece->bytes.size();
+          const auto file =
+              File(0, cache::ExecutionHistory::AllocateCheckpointId().value);
+          const cache::DiskPayload payload{file, bytes, 0};
+          if (piece->private_state)
+            component.private_state = payload;
+          else if (private_file)
+            component.tail = payload;
+          else
+            component.chunks.push_back(payload);
+          const auto alignment =
+              piece->private_state ? std::size_t{1} : d.row_bytes;
+          if (piece->device) {
+            durable->device_rows = true;
+            durable->sources.emplace_back(
+                false, file, bytes, alignment, piece->owner,
+                [source = piece->bytes, copy = resources->copy_observed_rows](
+                    std::uint64_t offset, std::span<std::byte> destination,
+                    cache::Stream& stream) {
+                  return copy(source.subspan(offset, destination.size()),
+                              destination, stream);
+                });
+          } else {
+            durable->sources.emplace_back(private_file, file, bytes, alignment,
+                                          piece->owner, piece->bytes);
+          }
+        }
+        manifest.components.push_back(std::move(component));
+      }
+      if (piece != point->pieces.end())
+        throw std::logic_error("rewind point pieces out of component order");
+      if (!CanQueue(*durable))
+        return 0;
+      const auto queued = Persist(durable);
+      if (queued) {
+        const std::lock_guard lock(mutex);
+        point->persisted = true;
+      }
+      Logger::Info(
+          "cache",
+          "schema=component-cache-v1 event=rewind_persisted "
+          "reason=" +
+              std::string(reason) + " tokens=" + std::to_string(n) +
+              " checkpoint_id=" + std::to_string(manifest.checkpoint.value) +
+              " queued_bytes=" + std::to_string(queued));
+      return queued;
+    } catch (const std::exception& error) {
+      try {
+        Logger::Info("cache",
+                     "schema=component-cache-v1 event=rewind_persist_failed "
+                     "tokens=" +
+                         std::to_string(n) + " reason=\"" + error.what() +
+                         "\"");
+      } catch (...) {
+      }
+      return 0;
+    }
+  }
+  // Takes the rewind point of `entry` before its slot is reset or restored:
+  // written to disk first (unless covered), then dropped, so the retained
+  // rows return to the backend with the slot's.
+  void DropRewind(Entry& entry, std::string_view reason) noexcept {
+    std::shared_ptr<RewindPoint> point;
+    {
+      const std::lock_guard lock(mutex);
+      point = std::exchange(entry.rewind, {});
+    }
+    if (point)
+      (void)PersistRewind(entry, point, true, reason);
+  }
 };
 
 struct ComponentTextCache::Lease::Impl {
@@ -904,6 +1198,14 @@ struct ComponentTextCache::Lease::Impl {
   std::vector<cache::Token> capture_tokens;
   // Reply edges of the live frontier this lease continues.
   std::vector<std::size_t> reply_starts, reply_ends;
+  // The conversation rewrites generated replies (RewritesReply, or it was
+  // served from a rewind point, or its slot is marked): this request keeps a
+  // rewind point at its stable boundary.
+  bool rewind_wanted{};
+  // Served from its slot's rewind point.
+  bool rewound{};
+  // The rewind point this request captured, its slot's at Commit.
+  std::shared_ptr<RewindPoint> rewind_point;
   ContinuationLookup lookup_result;
   ComponentCacheMetrics metrics;
   Impl(ComponentTextCache::Impl* cache, ComponentTextCache::Impl::Entry* entry,
@@ -918,6 +1220,20 @@ struct ComponentTextCache::Lease::Impl {
         prompt(prompt.begin(), prompt.end()),
         stable(stable) {}
   std::unique_ptr<TextRunnerSnapshot> CaptureDurable();
+  // Whether a capture at `boundary` becomes this request's rewind point: a
+  // boundary past the reused one and before the prompt end.
+  [[nodiscard]] bool RewindEligible(std::size_t boundary) const {
+    return rewind_wanted && cache->snapshot_pool && !write_back &&
+           !live_frontier && !before_reset && boundary > cached &&
+           boundary < prompt.size();
+  }
+  // Keeps the slot's state at capture_tokens as this request's rewind point,
+  // and queues it for the disk too when the disk step allows. Returns null
+  // when refused (logged).
+  std::unique_ptr<TextRunnerSnapshot> CaptureRewind();
+  // Restores `point` into this lease's slot. Throws on failure; the caller
+  // resets the slot.
+  void Rewind(const RewindPoint& point);
   // Copies every piece from the slot into host arenas and adds them to
   // `durable` as host sources. Returns why it did not (the capture then
   // keeps the slot), or empty.
@@ -938,13 +1254,21 @@ struct ComponentTextCache::Lease::Impl {
   // slot's observed rows host copies, shared with those pieces where they
   // hold the same rows. Returns why it did not, or empty (also when there is
   // nothing to copy).
-  std::string HostCopy(std::span<const SlotPiece> pieces,
-                       DurableCapture* durable, SnapshotStats& stats,
-                       bool observed = true);
+  // `hosted`, when given, receives each piece's host copy (in `pieces`
+  // order), owning its arena.
+  std::string HostCopy(
+      std::span<const SlotPiece> pieces, DurableCapture* durable,
+      SnapshotStats& stats, bool observed = true,
+      std::vector<std::shared_ptr<const void>>* hosted = nullptr);
 };
 
 std::unique_ptr<TextRunnerSnapshot>
 ComponentTextCache::Lease::Impl::CaptureDurable() {
+  if (purpose != SnapshotPurpose::kBranchPoint &&
+      purpose != SnapshotPurpose::kHistory &&
+      RewindEligible(capture_tokens.size()) &&
+      std::equal(capture_tokens.begin(), capture_tokens.end(), prompt.begin()))
+    return CaptureRewind();
   if (!persist || !cache->queue || !cache->resources->copy_observed_rows ||
       purpose == SnapshotPurpose::kHistory)
     throw cache::ResourceExhausted();
@@ -1307,6 +1631,180 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
   return snapshot;
 }
 
+std::unique_ptr<TextRunnerSnapshot>
+ComponentTextCache::Lease::Impl::CaptureRewind() {
+  const auto started = Clock::now();
+  const auto n = capture_tokens.size();
+  auto& adapter = *cache->resources->adapter;
+  const auto positions = adapter.Positions(slot.Execution());
+  const auto descriptors = adapter.Components();
+  const auto refused = [&](std::string_view why, std::size_t bytes) {
+    Logger::Info("cache",
+                 "schema=component-cache-v1 event=rewind_refused reason=" +
+                     std::string(why) + " tokens=" + std::to_string(n) +
+                     " host_bytes=" + std::to_string(bytes));
+    return std::unique_ptr<TextRunnerSnapshot>{};
+  };
+  // Retained rows of an earlier point of this execution are the same device
+  // rows: share them instead of retaining each chunk again.
+  auto previous = rewind_point;
+  if (!previous) {
+    const std::lock_guard lock(cache->mutex);
+    previous = entry->rewind;
+  }
+  std::map<std::pair<std::uint32_t, cache::Rows>, const RewindPoint::Piece*>
+      shared;
+  if (previous && previous->tokens.size() <= n &&
+      std::equal(previous->tokens.begin(), previous->tokens.end(),
+                 capture_tokens.begin()))
+    for (const auto& piece : previous->pieces)
+      if (piece.device)
+        shared.emplace(std::pair(piece.component.value, piece.first), &piece);
+  auto point = std::make_shared<RewindPoint>();
+  point->tokens = capture_tokens;
+  point->input = At(input, n);
+  point->inputs = input.Through(n);
+  point->positions = positions;
+  point->lineage = entry->history->Lineage();
+  point->persist = persist;
+  // Host pieces, and the point's piece each fills.
+  std::vector<SlotPiece> staged;
+  std::vector<std::size_t> staged_at;
+  std::size_t reused = 0;
+  const auto host = [&](SlotPiece piece) {
+    staged_at.push_back(point->pieces.size());
+    point->pieces.push_back({piece.component,
+                             piece.private_state,
+                             piece.first,
+                             piece.end,
+                             {},
+                             {},
+                             false});
+    point->host_bytes += piece.bytes;
+    staged.push_back(piece);
+  };
+  for (const auto& d : descriptors) {
+    const auto p =
+        std::ranges::find(positions, d.id, &cache::ComponentPosition::id);
+    if (p == positions.end())
+      throw std::logic_error("incomplete rewind capture positions");
+    if (d.kind == cache::ComponentKind::kPrivateState) {
+      host({d.id, true, 0, 0, d.state_bytes, 1, {}, true});
+      continue;
+    }
+    const auto completed = p->valid_rows / d.rows_per_chunk * d.rows_per_chunk;
+    const bool retains = std::ranges::find(cache->device_components, d.id) !=
+                         cache->device_components.end();
+    for (cache::Rows first = 0; first < completed; first += d.rows_per_chunk) {
+      const auto end = first + d.rows_per_chunk;
+      const auto bytes = (end - first) * d.row_bytes;
+      if (const auto it = shared.find(std::pair(d.id.value, first));
+          it != shared.end() && it->second->end == end) {
+        point->pieces.push_back(*it->second);
+        point->device_bytes += bytes;
+        ++reused;
+        continue;
+      }
+      if (retains) {
+        auto retained = adapter.RetainRows(slot.Execution(), d.id, first, end);
+        if (retained.owner && retained.bytes >= bytes) {
+          const auto* data =
+              static_cast<const std::byte*>(retained.owner.get());
+          point->pieces.push_back(
+              {d.id, false, first, end, std::move(retained.owner),
+               std::span<const std::byte>(data, bytes), true});
+          point->device_bytes += bytes;
+          continue;
+        }
+      }
+      host({d.id, false, first, end, bytes, d.row_bytes, {}, false});
+    }
+    if (completed != p->valid_rows)
+      host({d.id,
+            false,
+            completed,
+            p->valid_rows,
+            (p->valid_rows - completed) * d.row_bytes,
+            d.row_bytes,
+            {},
+            true});
+  }
+  // Rewind points of all slots together take at most a quarter of the
+  // snapshot arenas, which reassignment snapshots and capture staging share.
+  const auto cap = cache->resources->reassignment_snapshot_bytes /
+                   (4 * std::max<std::size_t>(1, cache->entries.size()));
+  if (point->host_bytes > cap)
+    return refused("host_cap", point->host_bytes);
+  point->metadata =
+      cache->ledger
+          .Reserve(cache::ResourceCategory::kMetadata,
+                   sizeof(RewindPoint) + n * sizeof(cache::Token) +
+                       point->input.size() +
+                       positions.size() * sizeof(cache::ComponentPosition) +
+                       point->pieces.size() * sizeof(RewindPoint::Piece))
+          .Convert();
+  SnapshotStats stats;
+  std::vector<std::shared_ptr<const void>> hosted;
+  if (const auto reason = HostCopy(staged, nullptr, stats, false, &hosted);
+      !reason.empty())
+    return refused(reason, point->host_bytes);
+  for (std::size_t i = 0; i < staged.size(); ++i) {
+    auto& piece = point->pieces[staged_at[i]];
+    piece.bytes = {static_cast<const std::byte*>(hosted[i].get()),
+                   staged[i].bytes};
+    piece.owner = std::move(hosted[i]);
+  }
+  rewind_point = point;
+  metrics.captured_bytes += point->host_bytes;
+  metrics.copied_payload_bytes += point->host_bytes;
+  // Also on the disk when its step allows, from the same pieces.
+  const auto queued = persist && cache->queue
+                          ? cache->PersistRewind(*entry, point, false, "prompt")
+                          : 0;
+  metrics.disk_queued_bytes += queued;
+  Logger::Info("cache",
+               "schema=component-cache-v1 event=rewind_captured slot=" +
+                   std::to_string(slot.Location().slot.value) +
+                   " tokens=" + std::to_string(n) +
+                   " host_bytes=" + std::to_string(point->host_bytes) +
+                   " device_bytes=" + std::to_string(point->device_bytes) +
+                   " pieces=" + std::to_string(point->pieces.size()) +
+                   " shared_pieces=" + std::to_string(reused) +
+                   " copy_ms=" + std::to_string(stats.copy_ms) + " ms=" +
+                   std::to_string(std::chrono::duration<double, std::milli>(
+                                      Clock::now() - started)
+                                      .count()) +
+                   " disk_queued_bytes=" + std::to_string(queued));
+  auto snapshot = std::make_unique<ComponentSnapshot>();
+  snapshot->bytes = cache->CaptureCopyBytes(*entry->history, positions);
+  return snapshot;
+}
+
+void ComponentTextCache::Lease::Impl::Rewind(const RewindPoint& point) {
+  auto& resources = *cache->resources;
+  auto& adapter = *resources.adapter;
+  auto& execution = slot.Execution();
+  adapter.BeginRestore(execution, point.positions);
+  {
+    TransferBatch transfers(
+        std::clamp<std::size_t>(resources.transfer_batch_size, 1, 16));
+    for (const auto& piece : point.pieces)
+      transfers.Add([&] { return resources.stream(); },
+                    [&](cache::Stream& stream) {
+                      return piece.private_state
+                                 ? adapter.LoadPrivate(execution,
+                                                       piece.component,
+                                                       piece.bytes, stream)
+                                 : adapter.CopyRowsIn(
+                                       execution, piece.component, piece.first,
+                                       piece.end, piece.bytes, stream);
+                    });
+    transfers.Finish();
+  }
+  if (!adapter.Validate(execution, point.positions))
+    throw std::runtime_error("rewind validation failed");
+}
+
 std::string ComponentTextCache::Lease::Impl::SnapshotSlot(
     std::span<const SlotPiece> pieces, DurableCapture& durable,
     SnapshotStats& stats) {
@@ -1322,7 +1820,8 @@ std::string ComponentTextCache::Lease::Impl::SnapshotSlot(
 }
 std::string ComponentTextCache::Lease::Impl::HostCopy(
     std::span<const SlotPiece> pieces, DurableCapture* durable,
-    SnapshotStats& stats, bool with_observed) {
+    SnapshotStats& stats, bool with_observed,
+    std::vector<std::shared_ptr<const void>>* hosted) {
   auto& resources = *cache->resources;
   // Pack the pieces in the order the writer reads them (shared files before
   // private, by file ID), so each arena returns as early as it can. Each
@@ -1546,6 +2045,11 @@ std::string ComponentTextCache::Lease::Impl::HostCopy(
     stats.attach_ms = std::chrono::duration<double, std::milli>(
                           sources_started - attach_started)
                           .count();
+    if (hosted) {
+      hosted->clear();
+      for (std::size_t i = 0; i < pieces.size(); ++i)
+        hosted->push_back(owner(i));
+    }
     for (std::size_t i = 0; durable && i < pieces.size(); ++i) {
       const auto& piece = pieces[i];
       const auto* data = at(i);
@@ -1598,6 +2102,25 @@ bool ComponentTextCache::CaptureBeforeReset(std::size_t index,
   // rows it observes: without a durable checkpoint covering the frontier, the
   // capture goes to disk itself, as the write-back would have.
   bool write_back, persist;
+  {
+    std::shared_ptr<RewindPoint> point;
+    {
+      const std::lock_guard lock(impl_->mutex);
+      if (entry->drops_reply && entry->rewind &&
+          Impl::RewindCurrent(*entry, *entry->rewind))
+        point = entry->rewind;
+    }
+    // No later prompt of this conversation continues the frontier: its
+    // rewind point is what goes to disk.
+    if (point) {
+      (void)impl_->PersistRewind(*entry, point, true, reason);
+      if (held_out)
+        *held_out = false;
+      const std::lock_guard lock(impl_->mutex);
+      entry->busy = true;
+      return false;
+    }
+  }
   {
     const std::lock_guard lock(impl_->mutex);
     persist = entry->live_persist;
@@ -1722,6 +2245,10 @@ bool ComponentTextCache::PrepareAdmission(
     const auto found =
         impl_->Lookup({impl_->identity, prompt, Inputs(prompt.size(), context),
                        stable, reuse});
+    // Acquire continues an idle slot from its rewind point.
+    if (reuse && impl_->FindRewind(found, prompt,
+                                   Inputs(prompt.size(), context), context))
+      return true;
     if (found.selected && found.selected->live) {
       const auto& live =
           *impl_->entries.at(found.selected->live->slot.value - 1);
@@ -1785,6 +2312,22 @@ std::size_t ComponentTextCache::WriteBackIdle(
     cache::BorrowedLocation location;
     std::vector<cache::Token> tokens;
     cache::InputIdentity input;
+    {
+      // A conversation that rewrites its replies writes its rewind point
+      // instead of the frontier no later prompt continues.
+      std::shared_ptr<RewindPoint> point;
+      {
+        const std::lock_guard lock(impl_->mutex);
+        if (entry->drops_reply && entry->rewind && !entry->busy &&
+            now - entry->idle_since >= idle_for &&
+            Impl::RewindCurrent(*entry, *entry->rewind))
+          point = entry->rewind;
+      }
+      if (point) {
+        queued += impl_->PersistRewind(*entry, point, true, "idle") != 0;
+        continue;
+      }
+    }
     {
       const std::lock_guard lock(impl_->mutex);
       const auto size = entry->live_tokens.size();
@@ -1902,6 +2445,10 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
     // identity and stable boundary.
     if (found.selected)
       protected_live = found.selected->live;
+    if (reuse)
+      if (const auto choice = impl_->FindRewind(
+              found, prompt, Inputs(prompt.size(), context), context))
+        protected_live = impl_->entries[choice->index]->live_location;
   }
   while (!enough()) {
     Impl::Entry* entry = nullptr;
@@ -1997,6 +2544,9 @@ ComponentTextCache::RowReclaim ComponentTextCache::ReclaimRows(
       if (held)
         continue;
     }
+    // Its rewind point retains the slot's rows: written to disk unless
+    // covered, then dropped with them.
+    impl_->DropRewind(*entry, "row_capacity");
     {
       const std::lock_guard lock(impl_->mutex);
       entry->branch = std::make_shared<const std::uint8_t>(0);
@@ -2040,6 +2590,10 @@ ComponentTextCache::HeldRows ComponentTextCache::ContinuedTokens(
   const std::lock_guard lock(impl_->mutex);
   const auto found =
       impl_->Lookup({impl_->identity, prompt, input, stable, reuse});
+  // A rewind keeps the slot's blocks up to its point.
+  if (reuse)
+    if (const auto choice = impl_->FindRewind(found, prompt, input, context))
+      return {.tokens = choice->boundary, .live = true};
   if (!found.selected || found.selected->boundary >= prompt.size())
     return {};
   if (found.selected->live) {
@@ -2068,6 +2622,10 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
   std::optional<Impl::Uncovered> evicted;
   std::vector<std::size_t> reply_starts, reply_ends;
   std::size_t common = 0;
+  // The slot's rewind point this request is served from, and whether the
+  // request keeps one of its own.
+  std::shared_ptr<RewindPoint> rewind;
+  bool rewind_wanted = false;
   // Prefill continues a checkpoint exactly only from an aligned position.
   // The complete prompt stays off the alignment for an unchanged retry,
   // which continues it without prefill; a longer prompt takes an aligned
@@ -2089,12 +2647,22 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
         // Only reported (lookup_result): unknown agreement reads as none.
       }
     }
-    if (found.selected && found.selected->live) {
+    if (reuse) {
+      if (const auto choice =
+              impl_->FindRewind(found, prompt, input, context.get())) {
+        entry = impl_->entries[choice->index].get();
+        live = entry->live_location;
+        rewind = entry->rewind;
+      }
+      rewind_wanted = rewind || impl_->RewritesReply(prompt, input);
+    }
+    if (!entry && found.selected && found.selected->live) {
       const auto location = *found.selected->live;
       auto& selected_entry = *impl_->entries.at(location.slot.value - 1);
       if (!selected_entry.busy) {
         entry = &selected_entry;
         live = location;
+        rewind_wanted = rewind_wanted || entry->drops_reply;
       }
     }
     if (!entry)
@@ -2115,6 +2683,9 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     CaptureBeforeReset(evicted->index, evicted->location,
                        std::move(evicted->tokens), std::move(evicted->input),
                        "reassignment", false);
+  // Its rewind point goes too: written to disk unless covered.
+  if (!live)
+    impl_->DropRewind(*entry, "reassignment");
   // Disk jobs still queued may read rows this slot lent them (a prompt-end
   // capture): the cold reset would retire those rows and fail the jobs.
   // Give them host copies first; without room the jobs fail, uncached.
@@ -2127,6 +2698,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       entry->durable.reset();
       entry->written_back = 0;
       entry->write_back_tried = 0;
+      entry->drops_reply = false;
     }
     if (entry->live) {
       impl_->index.Erase(*entry->live);
@@ -2147,6 +2719,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
         impl_.get(), entry, std::move(slot), prompt, input, stable));
     auto& request = *lease->impl_;
     request.persist = persist;
+    request.rewind_wanted = rewind_wanted;
     request.state->SetCancellationCheck(cancelled);
     request.state->SetStopAtEos(stop_at_eos);
     impl_->runner->SetPromptContext(*request.state, context);
@@ -2163,7 +2736,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       return boundary < prompt.size() ||
              (whole_prompt && impl_->runner->HasDecodeFrontier(*request.state));
     };
-    if (live && !decodable(found.selected->boundary)) {
+    if (live && !rewind && !decodable(found.selected->boundary)) {
       // The restore or reset below overwrites the live rows: disk jobs still
       // reading rows it lent them get host copies first.
       try {
@@ -2172,15 +2745,83 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       } catch (...) {
       }
       live.reset();
+      impl_->DropRewind(*entry, "restore");
       const std::lock_guard lock(impl_->mutex);
       entry->branch = std::make_shared<const std::uint8_t>(0);
       entry->durable.reset();
       entry->written_back = 0;
       entry->write_back_tried = 0;
     }
+    if (rewind) {
+      // Rows of the frontier past the point are overwritten: disk jobs
+      // still reading rows it lent them get host copies first.
+      try {
+        Lease::Impl::SnapshotStats stats;
+        (void)request.HostCopy({}, nullptr, stats);
+      } catch (...) {
+      }
+      const auto n = rewind->tokens.size();
+      try {
+        request.Rewind(*rewind);
+        Logger::Info(
+            "cache",
+            "schema=component-cache-v1 event=rewind_restored slot=" +
+                std::to_string(slot_index + 1) +
+                " tokens=" + std::to_string(n) +
+                " host_bytes=" + std::to_string(rewind->host_bytes) +
+                " device_bytes=" + std::to_string(rewind->device_bytes) +
+                " ms=" +
+                std::to_string(std::chrono::duration<double, std::milli>(
+                                   Clock::now() - started)
+                                   .count()));
+        // A new execution from the point: the abandoned frontier's queued
+        // writes must not become its lineage. Its durable ancestor stays
+        // only when it lies within the point.
+        entry->history = std::make_unique<cache::ExecutionHistory>(
+            cache::ExecutionHistory::RestoredUnshared(
+                impl_->ledger, impl_->resources->adapter->Components(),
+                impl_->identity));
+        request.rewound = true;
+        request.restored = rewind->host_bytes;
+        const std::lock_guard lock(impl_->mutex);
+        entry->branch = std::make_shared<const std::uint8_t>(0);
+        if (entry->durable &&
+            (entry->durable->Manifest().tokens.size() > n ||
+             !Impl::Prefixes(entry->durable->Manifest().tokens, prompt)))
+          entry->durable.reset();
+        entry->written_back = 0;
+        entry->write_back_tried = 0;
+        // Reply edges past the point belong to the abandoned frontier.
+        std::erase_if(reply_starts, [&](std::size_t at) { return at >= n; });
+        std::erase_if(reply_ends, [&](std::size_t at) { return at > n; });
+      } catch (...) {
+        try {
+          Logger::Info("cache",
+                       std::string("schema=component-cache-v1 "
+                                   "event=restore_failed source=rewind") +
+                           " tokens=" + std::to_string(n) + " reason=\"" +
+                           CurrentExceptionReason() + "\"");
+        } catch (...) {
+        }
+        request.rewound = false;
+        request.restored = 0;
+        if (!impl_->resources->adapter->Invalidate(request.slot.Execution()))
+          throw;
+        clean = true;
+        live.reset();
+        rewind.reset();
+        impl_->DropRewind(*entry, "restore_failed");
+        const std::lock_guard lock(impl_->mutex);
+        entry->branch = std::make_shared<const std::uint8_t>(0);
+        entry->durable.reset();
+        entry->written_back = 0;
+        entry->write_back_tried = 0;
+      }
+    }
     bool restored = bool(live);
     if (live) {
-      request.cached = found.selected->boundary;
+      request.cached =
+          rewind ? rewind->tokens.size() : found.selected->boundary;
       request.reply_starts = std::move(reply_starts);
       request.reply_ends = std::move(reply_ends);
       // The disk catalog evicts least recently used first. A conversation
@@ -2287,7 +2928,10 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
             ? std::chrono::duration<double, std::milli>(Clock::now() - started)
                   .count()
             : 0;
-    request.metrics.reuse = live ? "live" : request.disk_hit ? "disk" : "none";
+    request.metrics.reuse = request.rewound    ? "rewind"
+                            : live             ? "live"
+                            : request.disk_hit ? "disk"
+                                               : "none";
     request.metrics.selection_reason = static_cast<std::uint32_t>(found.reason);
     request.metrics.selected = request.cached;
     request.metrics.restored_bytes = request.restored;
@@ -2307,9 +2951,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
                              request.cached ? request.cached : nearest};
     Logger::Info("cache",
                  "schema=component-cache-v1 event=acquire reuse=" +
-                     std::string(live               ? "live"
-                                 : request.disk_hit ? "disk"
-                                                    : "none") +
+                     request.metrics.reuse +
                      " selected_tokens=" + std::to_string(request.cached) +
                      " restored_bytes=" + std::to_string(request.restored));
     return lease;
@@ -2334,7 +2976,9 @@ std::optional<TextPendingPublication> ComponentTextCache::PendingPublication(
       1, impl_->runner->Descriptor().capabilities.prefill_alignment);
   const std::lock_guard lock(impl_->mutex);
   const auto found = impl_->Lookup({impl_->identity, prompt, input, 0, true});
-  const std::size_t best = found.selected ? found.selected->boundary : 0;
+  std::size_t best = found.selected ? found.selected->boundary : 0;
+  if (const auto choice = impl_->FindRewind(prompt, input))
+    best = std::max(best, choice->boundary);
   std::optional<TextPendingPublication> selected;
   for (const auto& capture : impl_->pending_durable) {
     if (!capture)
@@ -2404,7 +3048,9 @@ std::size_t ComponentTextCache::CachedPrefixTokensOrThrow(
     }
     return longest;
   }
-  const auto cached = impl_->index.CachedPrefixTokens(query);
+  auto cached = impl_->index.CachedPrefixTokens(query);
+  if (const auto choice = impl_->FindRewind(prompt, input))
+    cached = std::max<cache::Rows>(cached, choice->boundary);
   return cached >= prompt.size() && !impl_->runner->ReusesWholePrompt(context)
              ? prompt.size() - 1
              : cached;
@@ -2672,6 +3318,9 @@ ContinuationLookup ComponentTextCache::Lease::lookup() const noexcept {
 }
 bool ComponentTextCache::Lease::HasSnapshotFor(
     std::span<const ContinuationToken> tokens) const {
+  // The rewind point this request was served from is that state, immutable.
+  if (impl_->rewound && tokens.size() == impl_->cached)
+    return true;
   const std::lock_guard lock(impl_->cache->mutex);
   return impl_->cache->index.HasCheckpoint(
       {impl_->cache->identity, tokens,
@@ -2683,9 +3332,13 @@ bool ComponentTextCache::Lease::TryReserveSnapshot(
     SnapshotPurpose purpose, std::span<const ContinuationToken> tokens) {
   (void)bytes;
   (void)preserve;
-  // Every capture goes to disk; grid (history) points were RAM-only edits.
-  if (!boundary || boundary > impl_->prompt.size() || !impl_->persist ||
-      !impl_->cache->queue || purpose == SnapshotPurpose::kHistory)
+  // Every capture goes to disk, or becomes a rewind point; grid (history)
+  // points were RAM-only edits.
+  if (!boundary || boundary > impl_->prompt.size() ||
+      purpose == SnapshotPurpose::kHistory ||
+      ((!impl_->persist || !impl_->cache->queue) &&
+       (purpose == SnapshotPurpose::kBranchPoint ||
+        !impl_->RewindEligible(boundary))))
     return false;
   if (tokens.empty())
     tokens = std::span<const cache::Token>(impl_->prompt).first(boundary);
@@ -2709,6 +3362,9 @@ void ComponentTextCache::Lease::SkipSnapshot(SnapshotEventReason reason,
 bool ComponentTextCache::Lease::CaptureRefused(std::size_t boundary) const {
   auto& cache = *impl_->cache;
   if (!boundary || boundary > impl_->prompt.size())
+    return false;
+  // A rewind point is kept in memory whatever the disk would take.
+  if (impl_->RewindEligible(boundary))
     return false;
   // Every capture goes to disk (CaptureDurable), which refuses one without a
   // disk cache, for a request that keeps its prompt off the disk, or within
@@ -2789,6 +3445,7 @@ std::size_t ComponentTextCache::Lease::Commit(
       impl_->cache->resources->adapter->Positions(impl_->slot.Execution());
   const auto location = impl_->slot.Location();
   impl_->slot.Commit();
+  std::shared_ptr<RewindPoint> stale;
   {
     const std::lock_guard lock(impl_->cache->mutex);
     auto& starts = impl_->entry->reply_starts;
@@ -2805,6 +3462,17 @@ std::size_t ComponentTextCache::Lease::Commit(
     }
     impl_->entry->live_tokens = live;
     impl_->entry->live_persist = impl_->persist;
+    impl_->entry->live_stable = impl_->stable;
+    impl_->entry->drops_reply = impl_->rewind_wanted;
+    // An earlier point of this execution stays valid: the slot only appended
+    // after it.
+    if (impl_->rewind_point)
+      impl_->entry->rewind = std::move(impl_->rewind_point);
+    // A point the new frontier does not extend serves no prompt: its rows
+    // return now (released below, outside the lock).
+    if (impl_->entry->rewind &&
+        !ComponentTextCache::Impl::Prefixes(impl_->entry->rewind->tokens, live))
+      stale = std::exchange(impl_->entry->rewind, {});
     impl_->entry->live_input = impl_->input.Through(live.size());
     impl_->entry->live_location = location;
     impl_->entry->idle_since = Clock::now();
@@ -2847,6 +3515,19 @@ void ComponentTextCache::Lease::Invalidate() noexcept {
                          std::to_string(impl_->slot.Location().slot.value) +
                          " refused=" + reason);
     } catch (...) {
+    }
+    // The deepest rewind point goes to disk before the reset drops it.
+    {
+      std::shared_ptr<RewindPoint> point;
+      {
+        const std::lock_guard lock(impl_->cache->mutex);
+        point = std::exchange(impl_->entry->rewind, {});
+      }
+      if (impl_->rewind_point)
+        point = std::exchange(impl_->rewind_point, {});
+      if (point)
+        (void)impl_->cache->PersistRewind(*impl_->entry, point, true,
+                                          "invalidated");
     }
     impl_->slot = {};
     impl_->entry->history.reset();

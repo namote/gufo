@@ -3430,6 +3430,211 @@ void SiblingDoesNotAdoptAnotherExecutionsCheckpoint() {
 // A test case named by its call.
 #define CASE(call) \
   std::pair<std::string, std::function<void()>>(#call, [] { call; })
+// A chat turn of a conversation whose client drops the generated reply when
+// it sends the history back (dropped or discarded reasoning): the previous
+// prompt through its stable boundary, the reply as the client renders it,
+// a user turn and the assistant opening after the new stable boundary.
+struct DroppingChat {
+  static constexpr std::size_t kOpening = 8;
+  std::vector<TextRunnerToken> prompt;
+  std::size_t stable{};
+  TextRunnerToken next{20000};
+  std::vector<TextRunnerToken> Turn(std::size_t user_tokens) {
+    std::vector<TextRunnerToken> turn(prompt.begin(), prompt.begin() + stable);
+    if (!prompt.empty())
+      for (int i = 0; i < 6; ++i)
+        turn.push_back(next++);  // the rendered reply, without reasoning
+    for (std::size_t i = 0; i < user_tokens; ++i)
+      turn.push_back(next++);
+    stable = turn.size();
+    for (std::size_t i = 0; i < kOpening; ++i)
+      turn.push_back(900 + static_cast<TextRunnerToken>(i));
+    prompt = turn;
+    return turn;
+  }
+};
+TextRunnerPool::Request ChatTurn(TextRunnerPool& pool,
+                                 const DroppingChat& chat) {
+  return pool.Acquire(chat.prompt, sampling::SamplingConfig{}, {}, {}, true,
+                      chat.stable);
+}
+void DroppedReplyRewindsToTheStableBoundary() {
+  // The client re-renders each reply, so every prompt diverges inside the
+  // slot's generated tokens. Turns well within the disk step still reuse the
+  // previous prompt through its stable boundary, from the slot's rewind
+  // point (no disk restore), and the output equals a cold prefill's.
+  const TemporaryDirectory temp("gufo-component-rewind-test");
+  const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
+                                        .capacity_bytes = 1 << 24,
+                                        .min_checkpoint_step_tokens = 4096};
+  auto runner = std::make_shared<Runner>();
+  runner->retain_rows = true;
+  TextRunnerPool pool(runner, 2, disk);
+  DroppingChat chat;
+  chat.Turn(300);
+  {
+    auto first = ChatTurn(pool, chat);
+    Prefill(first);
+    for (int i = 0; i < 5; ++i)
+      (void)Generate(first);
+    (void)first.Commit();
+  }
+  // The first stable boundary reaches the disk (nothing precedes it).
+  assert(
+      WaitCached(pool, std::span(chat.prompt).first(chat.stable), chat.stable));
+  for (int turn = 1; turn < 5; ++turn) {
+    const auto previous_stable = chat.stable;
+    chat.Turn(100);
+    const auto passes = runner->pass_ends.size();
+    auto request = ChatTurn(pool, chat);
+    assert(request.cached_prompt_tokens() == previous_stable);
+    // The first dropped reply is found from the disk; later turns rewind.
+    assert(request.cache_disk_hit() == (turn == 1));
+    Prefill(request);
+    // Prefill stops at this turn's stable boundary for its rewind point.
+    assert(std::ranges::find(runner->pass_ends.begin() + passes,
+                             runner->pass_ends.end(),
+                             chat.stable) != runner->pass_ends.end());
+    const auto token = Generate(request);
+    for (int i = 0; i < 4; ++i)
+      (void)Generate(request);
+    (void)request.Commit();
+    auto cold = pool.Acquire(chat.prompt, sampling::SamplingConfig{}, {}, {},
+                             false, chat.stable);
+    Prefill(cold);
+    assert(Generate(cold) == token);
+    cold.Invalidate();
+  }
+  // An unchanged retry rewinds to the stable boundary of the same prompt
+  // and decodes the same first token.
+  auto retry = ChatTurn(pool, chat);
+  assert(retry.cached_prompt_tokens() == chat.stable &&
+         !retry.cache_disk_hit());
+  Prefill(retry);
+  const auto token = Generate(retry);
+  retry.Invalidate();
+  auto cold = pool.Acquire(chat.prompt, sampling::SamplingConfig{}, {}, {},
+                           false, chat.stable);
+  Prefill(cold);
+  assert(Generate(cold) == token);
+  cold.Invalidate();
+}
+void FailedRewindFallsBackAndStaysExact() {
+  // A rewind whose restore fails resets the slot and serves the request
+  // from disk or cold; the output still equals a cold prefill's.
+  const TemporaryDirectory temp("gufo-component-rewind-fail-test");
+  const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
+                                        .capacity_bytes = 1 << 24,
+                                        .min_checkpoint_step_tokens = 4096};
+  auto runner = std::make_shared<Runner>();
+  runner->retain_rows = true;
+  TextRunnerPool pool(runner, 1, disk);
+  DroppingChat chat;
+  chat.Turn(300);
+  for (int turn = 0; turn < 2; ++turn) {
+    if (turn)
+      chat.Turn(100);
+    auto request = ChatTurn(pool, chat);
+    Prefill(request);
+    for (int i = 0; i < 5; ++i)
+      (void)Generate(request);
+    (void)request.Commit();
+  }
+  assert(WaitWritten(pool));
+  const auto first_stable = 300;
+  chat.Turn(100);
+  runner->adapter->FailNextTransfer();
+  auto request = ChatTurn(pool, chat);
+  // Without the failure this turn rewinds to the previous stable boundary
+  // (406 tokens); the failed restore falls back to the disk checkpoint.
+  assert(request.cache_disk_hit() &&
+         request.cached_prompt_tokens() == std::size_t{first_stable});
+  Prefill(request);
+  const auto token = Generate(request);
+  request.Invalidate();
+  auto cold = pool.Acquire(chat.prompt, sampling::SamplingConfig{}, {}, {},
+                           false, chat.stable);
+  Prefill(cold);
+  assert(Generate(cold) == token);
+}
+void VerbatimReplayKeepsNoRewindPoint() {
+  // A client that sends the reply back as generated continues the live
+  // frontier: no stop at its stable boundary, no rewind point.
+  const TemporaryDirectory temp("gufo-component-no-rewind-test");
+  const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
+                                        .capacity_bytes = 1 << 24,
+                                        .min_checkpoint_step_tokens = 4096};
+  auto runner = std::make_shared<Runner>();
+  runner->retain_rows = true;
+  TextRunnerPool pool(runner, 1, disk);
+  std::vector<TextRunnerToken> prompt(300);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  std::size_t stable = prompt.size() - DroppingChat::kOpening, live = 0;
+  for (int turn = 0; turn < 3; ++turn) {
+    const auto passes = runner->pass_ends.size();
+    auto request =
+        pool.Acquire(prompt, sampling::SamplingConfig{}, {}, {}, true, stable);
+    if (turn)
+      assert(request.cached_prompt_tokens() == live);
+    Prefill(request);
+    if (turn)
+      assert(std::ranges::find(runner->pass_ends.begin() + passes,
+                               runner->pass_ends.end(),
+                               stable) == runner->pass_ends.end());
+    for (int i = 0; i < 3; ++i)
+      prompt.push_back(Generate(request));
+    live = prompt.size();
+    (void)request.Commit();
+    for (int i = 0; i < 100; ++i)
+      prompt.push_back(5000 + turn * 100 + i);
+    stable = prompt.size();
+    for (std::size_t i = 0; i < DroppingChat::kOpening; ++i)
+      prompt.push_back(900 + static_cast<TextRunnerToken>(i));
+  }
+}
+void ReassignedRewindPointReachesDisk() {
+  // A slot reassigned to another conversation writes its rewind point to
+  // disk first: the next turn restores that boundary from disk.
+  const TemporaryDirectory temp("gufo-component-rewind-disk-test");
+  const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
+                                        .capacity_bytes = 1 << 24,
+                                        .min_checkpoint_step_tokens = 4096};
+  auto runner = std::make_shared<Runner>();
+  runner->retain_rows = true;
+  TextRunnerPool pool(runner, 1, disk);
+  DroppingChat chat;
+  chat.Turn(300);
+  for (int turn = 0; turn < 2; ++turn) {
+    if (turn)
+      chat.Turn(100);
+    auto request = ChatTurn(pool, chat);
+    Prefill(request);
+    for (int i = 0; i < 5; ++i)
+      (void)Generate(request);
+    (void)request.Commit();
+    assert(WaitWritten(pool));
+  }
+  const auto rewind = chat.stable;
+  {
+    std::vector<TextRunnerToken> other(200);
+    std::iota(other.begin(), other.end(), 70000);
+    auto request = pool.Acquire(other);
+    Prefill(request);
+    (void)Generate(request);
+    (void)request.Commit();
+  }
+  chat.Turn(100);
+  assert(WaitCached(pool, std::span(chat.prompt).first(rewind), rewind));
+  auto request = ChatTurn(pool, chat);
+  assert(request.cache_disk_hit() && request.cached_prompt_tokens() == rewind);
+  Prefill(request);
+  const auto token = Generate(request);
+  request.Invalidate();
+  auto cold = pool.Acquire(chat.prompt, sampling::SamplingConfig{}, {}, {},
+                           false, chat.stable);
+  Prefill(cold);
+  assert(Generate(cold) == token);
+}
 int main(int argc, char** argv) {
   // Optional arguments select tests by name prefix.
   const std::vector<std::pair<std::string, std::function<void()>>> tests{
@@ -3489,6 +3694,10 @@ int main(int argc, char** argv) {
       CASE(SingleWriterEvictsBetweenQueuedWrites()),
       CASE(RetainedRowsWriteBackWithoutStaging()),
       CASE(ImageFrontierCapturesAfterPrefixCheckpoint()),
+      CASE(DroppedReplyRewindsToTheStableBoundary()),
+      CASE(FailedRewindFallsBackAndStaysExact()),
+      CASE(VerbatimReplayKeepsNoRewindPoint()),
+      CASE(ReassignedRewindPointReachesDisk()),
   };
   for (const auto& [name, test] : tests) {
     if (argc > 1 && std::none_of(argv + 1, argv + argc, [&](const char* arg) {
