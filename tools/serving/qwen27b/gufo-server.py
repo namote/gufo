@@ -26,8 +26,8 @@ IMAGE_ID = 'sha256:e7a761a40187efb13515a0275362ab09d084a129f4544aa4300ec5cccb8c7
 MODEL = '/home/m2on/projects/models/llm/qwen-3.8-27b-ud-q4-k-xl-gguf'
 DRAFT = '/home/m2on/projects/models/llm/qwen-3.8-27b-dflash2-gguf'
 MMPROJ = '/home/m2on/projects/models/llm/qwen-3.8-27b-mmproj-bf16-gguf'
-RUNTIME = '/home/m2on/.local/share/gufo/runtime-20261118c'
-GUFO_SHA256 = '351da7680e0293a80dc67f68e17d5116d9f47d0a435a66986229db57ad7b8b76'
+RUNTIME = '/home/m2on/.local/share/gufo/runtime-20261120a'
+GUFO_SHA256 = '8bf6c2aa3214b4a05bf64c727c3b308fd636f4616071c8cc44260d4e4d1040f8'
 # Abliteration profiles shipped in RUNTIME/abliteration (docs/SERVER.md, Dynamic
 # abliteration). fnx: refusal, writer, layer-36 direction, attention 2, mlp 0.5;
 # requests enable it per call. pol-avg: political, layer-19 direction, residual 1,
