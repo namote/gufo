@@ -48,6 +48,11 @@ if (ENGINE_ENABLE_HIP)
   # RQ R2 loader check: llama.cpp --kl-divergence-base files from gufo logits.
   add_executable(qwen27b_rq_kld_base EXCLUDE_FROM_ALL rq_kld_base.cpp)
   target_link_libraries(qwen27b_rq_kld_base PRIVATE gufo_core hip::host)
+  # V3-4 recurrent-state storage quality (fp32 vs fp16/bf16 state); needs a
+  # model and a long prompt file, so no CTest.
+  add_executable(qwen27b_state_compare EXCLUDE_FROM_ALL state_compare.cpp)
+  target_link_libraries(qwen27b_state_compare PRIVATE gufo_core
+    gufo_model_artifact hip::host)
   add_executable(qwen27b_continuation_adapter_test EXCLUDE_FROM_ALL
     continuation_adapter_test.cpp continuation_fault.cpp)
   target_link_libraries(qwen27b_continuation_adapter_test PRIVATE gufo_core ${CMAKE_DL_LIBS})

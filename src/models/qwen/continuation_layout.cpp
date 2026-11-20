@@ -103,8 +103,11 @@ ContinuationLayout::ContinuationLayout(const core::ModelConfig& c,
       add(ContinuationPart::kValue, kv_row, 0, layer, kv_version);
     } else {
       add(ContinuationPart::kConvolution, 0, conv, layer);
+      // Recurrent layout versions: FP32 1, BF16 2, FP16 3.
       add(ContinuationPart::kRecurrent, 0, recurrent, layer,
-          policy.UsesBf16RecurrentState() ? 2 : 1);
+          policy.UsesFp16RecurrentState()   ? 3
+          : policy.UsesBf16RecurrentState() ? 2
+                                            : 1);
     }
   }
   if (kvarn_bits != 0) {

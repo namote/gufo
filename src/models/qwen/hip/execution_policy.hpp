@@ -32,15 +32,34 @@ enum class QwenKvCacheStorage : std::uint8_t {
   return "invalid";
 }
 
+// DeltaNet state matrix storage. Updates and reductions stay FP32; compact
+// storage rounds once per pass when the state is stored. Values are
+// serialized in compact snapshots: append, never renumber.
 enum class QwenRecurrentStateStorage : std::uint8_t {
   kFp32,
   kBf16,
+  // FP16 saturated to +-65504 on store (exllamav3 0244652).
+  kFp16,
 };
 
 [[nodiscard]] constexpr std::size_t QwenRecurrentStateElementBytes(
     QwenRecurrentStateStorage storage) noexcept {
-  return storage == QwenRecurrentStateStorage::kBf16 ? sizeof(std::uint16_t)
-                                                     : sizeof(float);
+  return storage == QwenRecurrentStateStorage::kFp32 ? sizeof(float)
+                                                     : sizeof(std::uint16_t);
+}
+
+/// Canonical name: `--recurrent-state` values.
+[[nodiscard]] constexpr std::string_view QwenRecurrentStateStorageName(
+    QwenRecurrentStateStorage storage) noexcept {
+  switch (storage) {
+    case QwenRecurrentStateStorage::kFp32:
+      return "fp32";
+    case QwenRecurrentStateStorage::kBf16:
+      return "bf16";
+    case QwenRecurrentStateStorage::kFp16:
+      return "fp16";
+  }
+  return "invalid";
 }
 
 /// Immutable route policy for one Qwen GPU executor. Resolve this before HIP
@@ -68,6 +87,10 @@ struct QwenExecutionPolicy {
     return recurrent_state_storage == QwenRecurrentStateStorage::kBf16;
   }
 
+  [[nodiscard]] constexpr bool UsesFp16RecurrentState() const noexcept {
+    return recurrent_state_storage == QwenRecurrentStateStorage::kFp16;
+  }
+
   [[nodiscard]] constexpr bool UsesKvarnAttentionKv() const noexcept {
     return kv_cache_storage == QwenKvCacheStorage::kKvarnK4V2 ||
            kv_cache_storage == QwenKvCacheStorage::kKvarnK4V4;
@@ -81,12 +104,14 @@ struct QwenExecutionPolicy {
   }
 
   /// Stable bit fingerprint suitable for telemetry and graph-cache identity.
-  /// FP16 and FP32 keep their earlier values; KVarN adds bits 10-11.
+  /// FP16 and FP32 keep their earlier values; KVarN adds bits 10-11 and
+  /// FP16 recurrent state bit 12.
   [[nodiscard]] constexpr std::uint64_t Fingerprint() const noexcept {
     return (static_cast<std::uint64_t>(fuse_qk_norm_rope_kv) << 0U) |
            (static_cast<std::uint64_t>(UsesFp16AttentionKv()) << 8U) |
            (static_cast<std::uint64_t>(UsesBf16RecurrentState()) << 9U) |
-           (KvarnVariant() << 10U);
+           (KvarnVariant() << 10U) |
+           (static_cast<std::uint64_t>(UsesFp16RecurrentState()) << 12U);
   }
 };
 
@@ -96,8 +121,7 @@ struct QwenExecutionPolicy {
     const QwenExecutionPolicy& policy) noexcept {
   if (policy.kv_cache_storage > QwenKvCacheStorage::kKvarnK4V4)
     return "Qwen KV cache storage is invalid";
-  if (policy.recurrent_state_storage != QwenRecurrentStateStorage::kFp32 &&
-      policy.recurrent_state_storage != QwenRecurrentStateStorage::kBf16)
+  if (policy.recurrent_state_storage > QwenRecurrentStateStorage::kFp16)
     return "Qwen recurrent state storage is invalid";
   return {};
 }

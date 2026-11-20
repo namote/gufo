@@ -15,8 +15,8 @@
 
 #include "src/core/hip/detail/hadamard.hpp"
 #include "src/models/qwen/hip/detail/recurrent_state.hpp"
-#include "src/models/qwen/hip/ops/hadamard.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
+#include "src/models/qwen/hip/ops/hadamard.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
 
 namespace gufo::hip {
@@ -469,6 +469,8 @@ void LaunchBatchedSSMConvRecurrenceRowSplit(
     if (state_storage == QwenRecurrentStateStorage::kBf16)
       launch_diverge
           .template operator()<hip_bfloat16, kRowsPerLane, kPrefetch>();
+    else if (state_storage == QwenRecurrentStateStorage::kFp16)
+      launch_diverge.template operator()<__half, kRowsPerLane, kPrefetch>();
     else
       launch_diverge.template operator()<float, kRowsPerLane, kPrefetch>();
   };
@@ -492,8 +494,8 @@ void LaunchBatchedSSMConvRecurrenceRowSplit(
     if (out_signs != nullptr) {
       BatchedSSMPostNormGateFp16Kernel<true>
           <<<(ab_count + 7) / 8, 256, 0, stream>>>(
-              out_buf, ssm_norm, gate, static_cast<__half*>(fp16_out),
-              ab_count, num_heads, out_signs);
+              out_buf, ssm_norm, gate, static_cast<__half*>(fp16_out), ab_count,
+              num_heads, out_signs);
     } else {
       BatchedSSMPostNormGateFp16Kernel<<<(ab_count + 7) / 8, 256, 0, stream>>>(
           out_buf, ssm_norm, gate, static_cast<__half*>(fp16_out), ab_count,

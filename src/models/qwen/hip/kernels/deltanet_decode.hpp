@@ -57,7 +57,8 @@ __launch_bounds__(Resident ? 128 : 1024, 1) __global__
     if (out_buf)
       out_buf += offset * inner_row_stride;
   }
-  static_assert(!Resident || std::is_same_v<StateT, float>);
+  // BF16 keeps its per-token storage transitions (the rejected #138 route).
+  static_assert(!Resident || !std::is_same_v<StateT, hip_bfloat16>);
   const std::uint32_t key_dim = Resident ? 128 : key_dimension;
   const std::uint32_t val_dim = Resident ? 128 : value_dimension;
   const std::uint32_t h = blockIdx.x;
@@ -81,8 +82,9 @@ __launch_bounds__(Resident ? 128 : 1024, 1) __global__
   const StateT* s_matrix_in = state_in + head_offset;
   StateT* s_matrix = state_out + head_offset;
 
-  // Keep each FP32 state row across the verification/replay block. Generic
-  // shapes and BF16 storage retain their per-token storage transitions.
+  // Keep each state row in FP32 registers across the verification/replay
+  // block; FP16 storage therefore rounds once per pass. Generic shapes and
+  // BF16 storage retain their per-token storage transitions.
   float4 resident[Resident ? 32 : 1];
   if constexpr (Resident) {
 #pragma unroll

@@ -76,6 +76,7 @@ Text serving defaults match llama.cpp for context and generation length:
 | `--context` | `0`: native context from model metadata, per session |
 | `--enable-yarn` | Off; Flash-Next requires it for `--context` above 262144 |
 | `--kv-cache-type` | Model default: `kvarn-k4v2` on Qwen3.8-27B, `fp16` on Flash-Next, FP8 (not selectable) on DeepSeek |
+| `--recurrent-state` | `fp32`; Qwen3.8-27B also takes `fp16` and `bf16` |
 | `--hc-mode` | `fp16`; Flash-Next only |
 | `--max-tokens` | `-1`: until EOS or remaining context is exhausted |
 | `--sessions` | `1` |
@@ -92,6 +93,16 @@ DeepSeek V4 Flash keeps FP8 KV and refuses any value: `DeepSeek V4 Flash does
 not take --kv-cache-type (its KV cache is FP8)`. The type is part of the Qwen
 continuation identity (`kv_storage=` and the state ABI), so checkpoints made
 with one KV type are never restored into another.
+
+`--recurrent-state fp32|fp16|bf16` selects how the GDN/DeltaNet recurrent
+state is stored; the arithmetic stays FP32. `fp16` widens the state on load
+and rounds it once per pass on store, saturated to the finite FP16 range, and
+halves the state (96 MiB less per Qwen3.8-27B session). `bf16` is the rejected
+#138 route. The default stays `fp32` until the quality pass. The storage is part
+of the continuation identity (`recurrent_storage=`, the state ABI and the
+recurrent component's layout version: FP32 1, BF16 2, FP16 3), so a checkpoint
+of one storage is a cache miss for another. Qwen3.8-27B quality:
+`qwen27b_state_compare` (tests/models/qwen27b/state_compare.cpp).
 
 Qwen chat prompts are bounded by the session context, not a fixed size: the
 rendered template may use up to 128 bytes per context token (at least 1 MiB).

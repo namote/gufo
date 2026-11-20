@@ -627,6 +627,7 @@ void PrintServeHelp(std::string_view program_name,
     std::string abliteration_profiles;
     std::string logit_bias_profiles;
     std::optional<KvCacheType> kv_cache_type;
+    std::optional<hip::QwenRecurrentStateStorage> recurrent_state;
     std::optional<models::qwen38_flash_next::HcMode> hc_mode;
     std::string trace_path;
 
@@ -658,6 +659,7 @@ void PrintServeHelp(std::string_view program_name,
         "profiles (*.json) in DIR",
         "Model", &abliteration_profiles);
     RegisterKvCacheTypeOption(parser, &kv_cache_type, "Model");
+    RegisterRecurrentStateOption(parser, &recurrent_state, "Model");
     RegisterHcModeOption(parser, &hc_mode, "Model");
 
     // Sampling Defaults
@@ -1283,6 +1285,7 @@ int RunServe(std::span<const char* const> args) {
     std::string abliteration_profiles;
     std::string logit_bias_profiles;
     std::optional<KvCacheType> kv_cache_type;
+    std::optional<hip::QwenRecurrentStateStorage> recurrent_state;
     std::optional<models::qwen38_flash_next::HcMode> hc_mode;
     std::string trace_path;
 
@@ -1326,6 +1329,7 @@ int RunServe(std::span<const char* const> args) {
         "itself for requests that do not set 'abliteration'",
         "Model", &abliteration_profiles);
     RegisterKvCacheTypeOption(llm_parser, &kv_cache_type, "Model");
+    RegisterRecurrentStateOption(llm_parser, &recurrent_state, "Model");
     RegisterHcModeOption(llm_parser, &hc_mode, "Model");
     llm_parser.AddOption(
         "-n", "--max-tokens", "N",
@@ -1621,7 +1625,8 @@ int RunServe(std::span<const char* const> args) {
         },
         vision_model_path,
         server::TextRunnerCacheOptions{.kv_pool_bytes = kv_pool_bytes},
-        enable_yarn, kv_cache_type, abliteration_profiles, hc_mode);
+        enable_yarn, kv_cache_type, abliteration_profiles, hc_mode,
+        recurrent_state);
     loading.stop();
     if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";

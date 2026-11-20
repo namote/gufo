@@ -222,9 +222,15 @@ void LaunchSSMConvRecurrenceRows(
     else
       launch_diverge.template operator()<StateT, Resident, false>();
   };
+  const bool resident = key_dim == 128 && val_dim == 128;
   if (state_storage == QwenRecurrentStateStorage::kBf16) {
     launch_output.template operator()<hip_bfloat16, false>();
-  } else if (key_dim == 128 && val_dim == 128) {
+  } else if (state_storage == QwenRecurrentStateStorage::kFp16) {
+    if (resident)
+      launch_output.template operator()<__half, true>();
+    else
+      launch_output.template operator()<__half, false>();
+  } else if (resident) {
     launch_output.template operator()<float, true>();
   } else {
     launch_output.template operator()<float, false>();
@@ -297,9 +303,14 @@ void LaunchSSMConvRecurrenceBatch(
     else
       launch.template operator()<StateT, Resident, false>();
   };
+  const bool resident = key_dim == 128 && val_dim == 128;
   if (state_storage == QwenRecurrentStateStorage::kBf16)
     launch_output.template operator()<hip_bfloat16, false>();
-  else if (key_dim == 128 && val_dim == 128)
+  else if (state_storage == QwenRecurrentStateStorage::kFp16 && resident)
+    launch_output.template operator()<__half, true>();
+  else if (state_storage == QwenRecurrentStateStorage::kFp16)
+    launch_output.template operator()<__half, false>();
+  else if (resident)
     launch_output.template operator()<float, true>();
   else
     launch_output.template operator()<float, false>();

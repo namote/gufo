@@ -197,11 +197,77 @@ void TestPolicy() {
 
 }  // namespace
 
+// `--recurrent-state`: one spelling per storage, fp32 when absent, and only
+// the models with recurrent state take a value.
+void TestRecurrentState() {
+  using Storage = gufo::hip::QwenRecurrentStateStorage;
+  for (const auto storage : {Storage::kFp32, Storage::kFp16, Storage::kBf16})
+    Expect(gufo::cli::ParseRecurrentState(
+               gufo::hip::QwenRecurrentStateStorageName(storage)) == storage,
+           "recurrent state names round-trip");
+  for (const std::string_view alias : {"FP16", "half", "f16", "float", ""})
+    Expect(!gufo::cli::ParseRecurrentState(alias),
+           "recurrent state aliases are rejected");
+
+  std::optional<Storage> option;
+  gufo::cli::ArgParser parser("test", "test");
+  gufo::cli::RegisterRecurrentStateOption(parser, &option, "Model");
+  const std::array<const char*, 2> args = {"--recurrent-state", "fp16"};
+  std::string error;
+  Expect(parser.Parse(args, &error) && option == Storage::kFp16,
+         "--recurrent-state stores the parsed storage");
+  std::optional<Storage> bad;
+  gufo::cli::ArgParser invalid("test", "test");
+  gufo::cli::RegisterRecurrentStateOption(invalid, &bad, "Model");
+  const std::array<const char*, 2> bad_args = {"--recurrent-state", "fp8"};
+  Expect(!invalid.Parse(bad_args, &error) && !bad &&
+             error.find("fp32, fp16 or bf16") != std::string::npos,
+         "invalid recurrent state names the accepted set");
+
+  const auto resolve = [](std::string_view architecture,
+                          std::optional<Storage> requested, Storage* resolved,
+                          std::string* message) {
+    *resolved = Storage::kBf16;
+    message->clear();
+    return gufo::cli::ResolveRecurrentState(architecture, requested, resolved,
+                                            message);
+  };
+  Storage resolved{};
+  for (const std::string_view architecture :
+       {"qwen35", "qwen4exp", "deepseek4", "gemma4"})
+    Expect(resolve(architecture, std::nullopt, &resolved, &error) &&
+               resolved == Storage::kFp32 && error.empty(),
+           "an absent option stores fp32");
+  for (const auto storage : {Storage::kFp32, Storage::kFp16, Storage::kBf16})
+    Expect(resolve("qwen35", storage, &resolved, &error) && resolved == storage,
+           "Qwen3.8-27B takes every recurrent storage");
+  Expect(resolve("qwen4exp", Storage::kFp32, &resolved, &error) &&
+             resolved == Storage::kFp32,
+         "Flash-Next takes fp32");
+  Expect(!resolve("qwen4exp", Storage::kBf16, &resolved, &error) &&
+             error.find("Qwen3.8-Flash-Next") != std::string::npos,
+         "Flash-Next refuses bf16 by name");
+  Expect(!resolve("deepseek4", Storage::kFp32, &resolved, &error) &&
+             error ==
+                 "DeepSeek V4 Flash does not take --recurrent-state (it has "
+                 "no recurrent state)",
+         "models without recurrent state refuse every value");
+
+  const auto policy =
+      gufo::cli::QwenExecutionPolicyFor(KvCacheType::kFp16, Storage::kFp16);
+  Expect(policy.UsesFp16RecurrentState() && policy.UsesFp16AttentionKv(),
+         "the policy carries the recurrent storage");
+  Expect(gufo::cli::QwenExecutionPolicyFor(KvCacheType::kFp16).Fingerprint() ==
+             gufo::hip::QwenExecutionPolicy::Production().Fingerprint(),
+         "fp32 state stays the production policy");
+}
+
 int main() {
   TestParse();
   TestOption();
   TestDefaults();
   TestRefusals();
   TestPolicy();
+  TestRecurrentState();
   std::cout << "KV cache type checks passed.\n";
 }

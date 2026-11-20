@@ -526,17 +526,26 @@ constexpr std::uint32_t kQwenComponentPayloadVersion = 2;
 constexpr std::size_t kQwenMaxResumeTokens = 9;
 
 // FP16 and FP32 names are the earlier constants; KVarN differs by name.
+// Compact recurrent state appends its storage name; FP16 state has its own
+// state version, so a payload of another storage never matches.
 std::string QwenStateAbi(bool speculative, hip::QwenKvCacheStorage kv_storage,
-                         bool bf16_recurrent_state) {
-  std::string abi = bf16_recurrent_state
+                         hip::QwenRecurrentStateStorage recurrent_storage) {
+  using Storage = hip::QwenRecurrentStateStorage;
+  std::string abi = recurrent_storage == Storage::kFp16
+                        ? (speculative ? "qwen-gfx1151-dflash-state-v5-"
+                                       : "qwen-gfx1151-state-v4-")
+                    : recurrent_storage == Storage::kBf16
                         ? (speculative ? "qwen-gfx1151-dflash-state-v4-"
                                        : "qwen-gfx1151-state-v3-")
                         : (speculative ? "qwen-gfx1151-dflash-state-v3-"
                                        : "qwen-gfx1151-state-v2-");
   abi += hip::QwenKvCacheStorageName(kv_storage);
   abi += "-kv";
-  if (bf16_recurrent_state)
-    abi += "-bf16-recurrent";
+  if (recurrent_storage != Storage::kFp32) {
+    abi += '-';
+    abi += hip::QwenRecurrentStateStorageName(recurrent_storage);
+    abi += "-recurrent";
+  }
   return abi;
 }
 
@@ -592,7 +601,7 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
   }
   const std::string state_abi =
       QwenStateAbi(speculative, execution_policy.kv_cache_storage,
-                   execution_policy.UsesBf16RecurrentState());
+                   execution_policy.recurrent_state_storage);
   std::ostringstream identity;
   identity << "schema=gufo-text-continuation-v2\n"
            << "model_kind=qwen3.8\n"
@@ -618,7 +627,8 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
            << hip::QwenKvCacheStorageName(execution_policy.kv_cache_storage)
            << '\n'
            << "recurrent_storage="
-           << (execution_policy.UsesBf16RecurrentState() ? "bf16" : "fp32")
+           << hip::QwenRecurrentStateStorageName(
+                  execution_policy.recurrent_state_storage)
            << '\n'
            << "context_tokens=" << max_context << '\n'
            << "position_policy=absolute-v1\n"
@@ -1295,7 +1305,7 @@ public:
         .model_id = model_->GetConfig().model_name,
         .state_abi = QwenStateAbi(speculative_enabled,
                                   execution_policy_.kv_cache_storage,
-                                  execution_policy_.UsesBf16RecurrentState()) +
+                                  execution_policy_.recurrent_state_storage) +
                      "-component-v2",
         .max_context = max_context_,
         .kv_cache_type = std::string(
@@ -3832,7 +3842,8 @@ bool InferenceBackend::load(
     const std::string& vision_model_path, TextRunnerCacheOptions cache_config,
     bool enable_yarn, std::optional<cli::KvCacheType> kv_cache_type,
     const std::string& abliteration_profiles,
-    std::optional<models::qwen38_flash_next::HcMode> hc_mode) {
+    std::optional<models::qwen38_flash_next::HcMode> hc_mode,
+    std::optional<hip::QwenRecurrentStateStorage> recurrent_state) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
@@ -3884,6 +3895,12 @@ bool InferenceBackend::load(
   std::optional<cli::KvCacheType> resolved_kv_cache_type;
   if (!cli::ResolveKvCacheType(architecture, kv_cache_type,
                                &resolved_kv_cache_type, &load_error)) {
+    SetError(error, load_error);
+    return false;
+  }
+  auto resolved_recurrent_state = hip::QwenRecurrentStateStorage::kFp32;
+  if (!cli::ResolveRecurrentState(architecture, recurrent_state,
+                                  &resolved_recurrent_state, &load_error)) {
     SetError(error, load_error);
     return false;
   }
@@ -4104,8 +4121,8 @@ bool InferenceBackend::load(
   }
   // Refuse a storage the server's prefix cache cannot hold before mapping
   // 27B weights.
-  const auto execution_policy =
-      cli::QwenExecutionPolicyFor(resolved_kv_cache_type);
+  const auto execution_policy = cli::QwenExecutionPolicyFor(
+      resolved_kv_cache_type, resolved_recurrent_state);
   if (const auto unsupported =
           hip::QwenContinuationUnsupportedReason(execution_policy);
       !unsupported.empty()) {
@@ -4159,6 +4176,7 @@ bool InferenceBackend::load(
   (void)abliteration_profiles;
   (void)kv_cache_type;
   (void)hc_mode;
+  (void)recurrent_state;
   SetError(error, "HTTP inference requires the HIP backend");
   return false;
 #endif

@@ -250,6 +250,7 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
                  "generation exceeds the native 262144",
                  "Model", &opt.enable_yarn);
   RegisterKvCacheTypeOption(parser, &opt.kv_cache_type, "Model");
+  RegisterRecurrentStateOption(parser, &opt.recurrent_state, "Model");
   RegisterHcModeOption(parser, &opt.hc_mode, "Model");
   parser.AddFlag("-v", "--verbose",
                  "Print detailed timing, latency breakdown, and tok/s metrics",
@@ -1323,9 +1324,13 @@ int RunBench(std::span<const char* const> args) {
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
   std::optional<KvCacheType> kv_cache_type;
-  if (!ResolveKvCacheType(
-          reader->GetMetadataString("general.architecture").value_or(""),
-          opt.kv_cache_type, &kv_cache_type, &err)) {
+  auto recurrent_state = hip::QwenRecurrentStateStorage::kFp32;
+  const auto architecture =
+      reader->GetMetadataString("general.architecture").value_or("");
+  if (!ResolveKvCacheType(architecture, opt.kv_cache_type, &kv_cache_type,
+                          &err) ||
+      !ResolveRecurrentState(architecture, opt.recurrent_state,
+                             &recurrent_state, &err)) {
     std::cerr << "Error: " << err << '\n';
     PrintModelLoadTime(model_load_start, false);
     return 1;
@@ -1395,7 +1400,7 @@ int RunBench(std::span<const char* const> args) {
 
   auto gpu_exec = hip::QwenGpuExecutor::CreateFromGguf(
       reader, &err, static_cast<std::uint32_t>(required_context),
-      QwenExecutionPolicyFor(kv_cache_type));
+      QwenExecutionPolicyFor(kv_cache_type, recurrent_state));
   if (!gpu_exec) {
     std::cerr << "Error creating Qwen GPU executor: " << err << "\n";
     PrintModelLoadTime(model_load_start, false);
@@ -1405,6 +1410,8 @@ int RunBench(std::span<const char* const> args) {
   // The attention KV storage in effect: the model default or the option.
   if (kv_cache_type)
     std::cout << "KV cache: " << KvCacheTypeName(*kv_cache_type) << '\n';
+  std::cout << "Recurrent state: "
+            << hip::QwenRecurrentStateStorageName(recurrent_state) << '\n';
 
   const auto& config = gpu_exec->GetConfig();
   std::shared_ptr<const hip::QwenMtpGpuModel> mtp_gpu_model;

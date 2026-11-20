@@ -208,7 +208,7 @@ CompactSnapshotLayout ParseCompactSnapshotLayout(
   if (kv_storage_value >
           static_cast<std::uint32_t>(QwenKvCacheStorage::kKvarnK4V4) ||
       recurrent_storage_value >
-          static_cast<std::uint32_t>(QwenRecurrentStateStorage::kBf16)) {
+          static_cast<std::uint32_t>(QwenRecurrentStateStorage::kFp16)) {
     throw std::invalid_argument("Qwen compact snapshot precision is invalid");
   }
   // KVarN payloads are version 3 and only they are; offset 76 is their

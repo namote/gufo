@@ -154,11 +154,73 @@ hip::QwenKvCacheStorage QwenKvCacheStorageFor(KvCacheType type) {
   return hip::QwenKvCacheStorage::kFp16;
 }
 
+std::optional<hip::QwenRecurrentStateStorage> ParseRecurrentState(
+    std::string_view value) noexcept {
+  using Storage = hip::QwenRecurrentStateStorage;
+  for (const auto storage : {Storage::kFp32, Storage::kFp16, Storage::kBf16}) {
+    if (value == hip::QwenRecurrentStateStorageName(storage))
+      return storage;
+  }
+  return std::nullopt;
+}
+
+void RegisterRecurrentStateOption(
+    ArgParser& parser, std::optional<hip::QwenRecurrentStateStorage>* target,
+    std::string_view group) {
+  parser.AddCustomOption(
+      "", "--recurrent-state", "TYPE",
+      "Qwen3.8-27B DeltaNet recurrent state storage: fp32, fp16 (FP32 "
+      "arithmetic, rounded once per pass on store) or the rejected bf16 route "
+      "(default: fp32)",
+      group,
+      [target](std::string_view, std::string_view value, std::string* error) {
+        const auto storage = ParseRecurrentState(value);
+        if (!storage) {
+          if (error != nullptr)
+            *error = "--recurrent-state must be fp32, fp16 or bf16";
+          return false;
+        }
+        *target = storage;
+        return true;
+      });
+}
+
+bool ResolveRecurrentState(
+    std::string_view architecture,
+    std::optional<hip::QwenRecurrentStateStorage> requested,
+    hip::QwenRecurrentStateStorage* resolved, std::string* error) {
+  using Storage = hip::QwenRecurrentStateStorage;
+  *resolved = Storage::kFp32;
+  if (!requested)
+    return true;
+  const auto model = FindTextModel(architecture);
+  const bool accepted =
+      architecture == "qwen35" ||
+      (architecture == "qwen4exp" && *requested == Storage::kFp32);
+  if (accepted) {
+    *resolved = *requested;
+    return true;
+  }
+  if (error != nullptr) {
+    *error =
+        architecture == "qwen4exp"
+            ? "--recurrent-state " +
+                  std::string(hip::QwenRecurrentStateStorageName(*requested)) +
+                  " is not supported by Qwen3.8-Flash-Next; it accepts "
+                  "only fp32"
+            : TextModelName(model) +
+                  " does not take --recurrent-state (it has no "
+                  "recurrent state)";
+  }
+  return false;
+}
+
 hip::QwenExecutionPolicy QwenExecutionPolicyFor(
-    std::optional<KvCacheType> type) {
+    std::optional<KvCacheType> type, hip::QwenRecurrentStateStorage recurrent) {
   auto policy = hip::QwenExecutionPolicy::Production();
   if (type)
     policy.kv_cache_storage = QwenKvCacheStorageFor(*type);
+  policy.recurrent_state_storage = recurrent;
   return policy;
 }
 

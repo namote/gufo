@@ -49,10 +49,31 @@ void RegisterKvCacheTypeOption(ArgParser& parser,
 /// Qwen3.8-27B executor storage for a resolved type.
 [[nodiscard]] hip::QwenKvCacheStorage QwenKvCacheStorageFor(KvCacheType type);
 
-/// Production Qwen3.8-27B policy with the resolved KV storage; fp16 and an
-/// empty type are exactly QwenExecutionPolicy::Production().
+/// Parses a `--recurrent-state` value: fp32, fp16 or bf16.
+[[nodiscard]] std::optional<hip::QwenRecurrentStateStorage> ParseRecurrentState(
+    std::string_view value) noexcept;
+
+/// Registers `--recurrent-state` (GDN/DeltaNet state storage); an absent
+/// option leaves `*target` empty, which stores fp32.
+void RegisterRecurrentStateOption(
+    ArgParser& parser, std::optional<hip::QwenRecurrentStateStorage>* target,
+    std::string_view group);
+
+/// Resolves the recurrent state storage for a GGUF architecture into
+/// `*resolved` (fp32 when absent). Qwen3.8-27B takes fp32, fp16 and bf16;
+/// Flash-Next fp32 only. Other models refuse an explicit value: they
+/// have no recurrent state. There is no fallback.
+[[nodiscard]] bool ResolveRecurrentState(
+    std::string_view architecture,
+    std::optional<hip::QwenRecurrentStateStorage> requested,
+    hip::QwenRecurrentStateStorage* resolved, std::string* error);
+
+/// Production Qwen3.8-27B policy with the resolved KV and recurrent state
+/// storage; fp16 KV (or an empty type) with fp32 state is exactly
+/// QwenExecutionPolicy::Production().
 [[nodiscard]] hip::QwenExecutionPolicy QwenExecutionPolicyFor(
-    std::optional<KvCacheType> type);
+    std::optional<KvCacheType> type, hip::QwenRecurrentStateStorage recurrent =
+                                         hip::QwenRecurrentStateStorage::kFp32);
 
 }  // namespace gufo::cli
 

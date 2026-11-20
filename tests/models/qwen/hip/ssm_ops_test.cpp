@@ -88,13 +88,19 @@ void TestConcurrentSsmRecurrence() {
       throw std::runtime_error(
           "concurrent SSM changed output, state or replay");
   };
-  for (const auto storage : {Storage::kFp32, Storage::kBf16}) {
+  // FP16 runs the resident recurrence (one rounding per pass) in both
+  // launches, so they still agree bit for bit.
+  for (const auto storage : {Storage::kFp32, Storage::kBf16, Storage::kFp16}) {
     const std::size_t element_bytes =
         gufo::hip::QwenRecurrentStateElementBytes(storage);
     std::vector<std::uint8_t> state_bytes(initial_state.size() * element_bytes);
     for (std::size_t i = 0; i < initial_state.size(); ++i) {
       if (storage == Storage::kFp32) {
         std::memcpy(state_bytes.data() + i * element_bytes, &initial_state[i],
+                    element_bytes);
+      } else if (storage == Storage::kFp16) {
+        const auto half = static_cast<_Float16>(initial_state[i]);
+        std::memcpy(state_bytes.data() + i * element_bytes, &half,
                     element_bytes);
       } else {
         const auto bits = gufo::test::FloatToBf16Bits(initial_state[i]);
@@ -155,14 +161,15 @@ void TestConcurrentSsmRecurrence() {
       }
     }
   }
-  std::cout
-      << "Concurrent SSM: FP32/BF16 state, ragged rows and replay exact\n";
+  std::cout << "Concurrent SSM: FP32/BF16/FP16 state, ragged rows and replay "
+               "exact\n";
 }
 
 void TestRecurrentRollbackRows(bool large_state) {
   using gufo::hip::QwenRecurrentStateStorage;
   for (const auto storage :
-       {QwenRecurrentStateStorage::kFp32, QwenRecurrentStateStorage::kBf16}) {
+       {QwenRecurrentStateStorage::kFp32, QwenRecurrentStateStorage::kBf16,
+        QwenRecurrentStateStorage::kFp16}) {
     for (const auto [layers, interval] : {std::pair{4U, 4U},
                                           {7U, 4U},
                                           {3U, 4U},
@@ -614,6 +621,40 @@ void TestBf16RecurrentMemoryAndSnapshot() {
   if (!rejected) {
     throw std::runtime_error(
         "BF16 arena accepted an FP32 recurrent-state snapshot");
+  }
+
+  // FP16 stores the same two bytes per element as BF16, and its snapshots
+  // are refused by the other storages and vice versa.
+  auto fp16_policy = fp32_policy;
+  fp16_policy.recurrent_state_storage =
+      gufo::hip::QwenRecurrentStateStorage::kFp16;
+  const auto fp16_usage = gufo::hip::QwenGpuArena::EstimateMemoryUsage(
+      production, context, fp16_policy);
+  if (fp16_usage.request_state_bytes != bf16_usage.request_state_bytes ||
+      fp16_usage.temporary_scratch_bytes != fp32_usage.temporary_scratch_bytes)
+    throw std::runtime_error("FP16 recurrent accounting differs from BF16");
+  std::cout << "Qwen27B FP16 recurrent fp16_state_bytes="
+            << fp16_usage.request_state_bytes << "\n";
+  gufo::hip::QwenGpuArena fp16_arena(small, small_context, fp16_policy);
+  auto fp16_snapshot = fp16_arena.SaveSnapshot(7);
+  if (fp16_snapshot->RecurrentStateStorage() !=
+          gufo::hip::QwenRecurrentStateStorage::kFp16 ||
+      fp16_snapshot->PayloadBytes() != fp16_arena.SnapshotPayloadBytes(7))
+    throw std::runtime_error("FP16 snapshot storage or payload is wrong");
+  for (const auto& [arena, snapshot] :
+       {std::pair{&fp16_arena, fp32_snapshot.get()},
+        std::pair{&fp16_arena, bf16_snapshot.get()},
+        std::pair{&fp32_arena, fp16_snapshot.get()},
+        std::pair{&bf16_arena, fp16_snapshot.get()}}) {
+    bool refused = false;
+    try {
+      arena->RestoreSnapshot(*snapshot);
+    } catch (const std::invalid_argument&) {
+      refused = true;
+    }
+    if (!refused)
+      throw std::runtime_error(
+          "an arena accepted another recurrent storage's snapshot");
   }
 }
 

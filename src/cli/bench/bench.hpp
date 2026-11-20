@@ -36,6 +36,7 @@ struct BenchOptions {
   bool verbose{false};
   // Empty: the model default.
   std::optional<KvCacheType> kv_cache_type;
+  std::optional<hip::QwenRecurrentStateStorage> recurrent_state;
   // Flash-Next `--hc-mode`; empty: fp16. Other models reject a value.
   std::optional<models::qwen38_flash_next::HcMode> hc_mode;
 };

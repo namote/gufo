@@ -299,6 +299,8 @@ void LaunchBatchedSSMConvRecurrence(
   };
   if (state_storage == QwenRecurrentStateStorage::kBf16) {
     launch_diverge.template operator()<hip_bfloat16>();
+  } else if (state_storage == QwenRecurrentStateStorage::kFp16) {
+    launch_diverge.template operator()<__half>();
   } else {
     launch_diverge.template operator()<float>();
   }

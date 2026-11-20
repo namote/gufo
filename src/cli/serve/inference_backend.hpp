@@ -84,6 +84,7 @@ public:
   /// accepted with) a `max_context` above its native context. An empty
   /// `kv_cache_type` selects the model's default KV storage. `hc_mode` is
   /// Flash-Next's `--hc-mode` (empty: fp16); other models reject it.
+  /// `recurrent_state` is `--recurrent-state` (empty: fp32).
   bool load(
       const std::string& model_path, std::string* error,
       std::uint32_t max_context = 0, std::size_t session_count = 1,
@@ -95,7 +96,9 @@ public:
       TextRunnerCacheOptions cache_config = {}, bool enable_yarn = false,
       std::optional<cli::KvCacheType> kv_cache_type = std::nullopt,
       const std::string& abliteration_profiles = {},
-      std::optional<models::qwen38_flash_next::HcMode> hc_mode = std::nullopt);
+      std::optional<models::qwen38_flash_next::HcMode> hc_mode = std::nullopt,
+      std::optional<hip::QwenRecurrentStateStorage> recurrent_state =
+          std::nullopt);
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.

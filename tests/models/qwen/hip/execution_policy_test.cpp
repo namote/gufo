@@ -6,6 +6,18 @@
 #include <iostream>
 #include <string_view>
 
+// Compile-time copies of the FP16 recurrent checks: they hold under NDEBUG.
+static_assert(gufo::hip::QwenRecurrentStateElementBytes(
+                  gufo::hip::QwenRecurrentStateStorage::kFp16) == 2);
+static_assert(gufo::hip::QwenRecurrentStateStorageName(
+                  gufo::hip::QwenRecurrentStateStorage::kFp16) == "fp16");
+static_assert([] {
+  auto policy = gufo::hip::QwenExecutionPolicy::Production();
+  policy.recurrent_state_storage = gufo::hip::QwenRecurrentStateStorage::kFp16;
+  return policy.Fingerprint() == 0x1101U &&
+         gufo::hip::QwenExecutionPolicyUnsupportedReason(policy).empty();
+}());
+
 int main() {
   using namespace gufo::hip;
   const auto production = QwenExecutionPolicy::Production();
@@ -15,15 +27,30 @@ int main() {
          sizeof(float));
   assert(QwenRecurrentStateElementBytes(QwenRecurrentStateStorage::kBf16) ==
          sizeof(std::uint16_t));
+  assert(QwenRecurrentStateElementBytes(QwenRecurrentStateStorage::kFp16) ==
+         sizeof(std::uint16_t));
+  assert(QwenRecurrentStateStorageName(QwenRecurrentStateStorage::kFp32) ==
+         "fp32");
+  assert(QwenRecurrentStateStorageName(QwenRecurrentStateStorage::kBf16) ==
+         "bf16");
+  assert(QwenRecurrentStateStorageName(QwenRecurrentStateStorage::kFp16) ==
+         "fp16");
 
   auto fp32_kv = production;
   fp32_kv.kv_cache_storage = QwenKvCacheStorage::kFp32;
   auto bf16_recurrent = production;
   bf16_recurrent.recurrent_state_storage = QwenRecurrentStateStorage::kBf16;
+  auto fp16_recurrent = production;
+  fp16_recurrent.recurrent_state_storage = QwenRecurrentStateStorage::kFp16;
+  assert(fp16_recurrent.UsesFp16RecurrentState() &&
+         !fp16_recurrent.UsesBf16RecurrentState());
   auto separate_qk_norm = production;
   separate_qk_norm.fuse_qk_norm_rope_kv = false;
   assert(fp32_kv.Fingerprint() != production.Fingerprint());
   assert(bf16_recurrent.Fingerprint() != production.Fingerprint());
+  assert(fp16_recurrent.Fingerprint() != production.Fingerprint());
+  assert(fp16_recurrent.Fingerprint() != bf16_recurrent.Fingerprint());
+  assert(fp16_recurrent.Fingerprint() == 0x1101U);
   assert(separate_qk_norm.Fingerprint() != production.Fingerprint());
 
   // FP16 and FP32 keep the fingerprints captured graphs already use.
@@ -47,6 +74,12 @@ int main() {
   assert(QwenContinuationUnsupportedReason(fp32_kv).empty());
   assert(QwenExecutionPolicyUnsupportedReason(fp32_kv).empty());
   assert(QwenExecutionPolicyUnsupportedReason(bf16_recurrent).empty());
+  assert(QwenExecutionPolicyUnsupportedReason(fp16_recurrent).empty());
+  assert(QwenContinuationUnsupportedReason(fp16_recurrent).empty());
+  auto invalid_recurrent = production;
+  invalid_recurrent.recurrent_state_storage =
+      static_cast<QwenRecurrentStateStorage>(3);
+  assert(!QwenExecutionPolicyUnsupportedReason(invalid_recurrent).empty());
   auto invalid = production;
   invalid.kv_cache_storage = static_cast<QwenKvCacheStorage>(9);
   assert(!QwenExecutionPolicyUnsupportedReason(invalid).empty());

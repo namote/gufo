@@ -24,7 +24,7 @@ void Reject(F&& fn) {
   }
   Require(rejected, "invalid geometry/frontier was accepted");
 }
-void Check(bool fp16, bool bf16) {
+void Check(bool fp16, hip::QwenRecurrentStateStorage recurrent) {
   gufo::core::ModelConfig c;
   c.num_layers = 64;
   c.hidden_size = 5120;
@@ -36,15 +36,20 @@ void Check(bool fp16, bool bf16) {
   hip::QwenExecutionPolicy policy;
   policy.kv_cache_storage =
       fp16 ? hip::QwenKvCacheStorage::kFp16 : hip::QwenKvCacheStorage::kFp32;
-  policy.recurrent_state_storage = bf16 ? hip::QwenRecurrentStateStorage::kBf16
-                                        : hip::QwenRecurrentStateStorage::kFp32;
+  policy.recurrent_state_storage = recurrent;
+  const bool compact = recurrent != hip::QwenRecurrentStateStorage::kFp32;
+  // FP32 1, BF16 2, FP16 3: a compact state never restores into another.
+  const std::uint32_t recurrent_version =
+      recurrent == hip::QwenRecurrentStateStorage::kFp16   ? 3U
+      : recurrent == hip::QwenRecurrentStateStorage::kBf16 ? 2U
+                                                           : 1U;
   qwen::ContinuationLayout layout(c, policy, 100000);
   Require(layout.Components().size() == 131, "incomplete state inventory");
   // 48 independent recurrent layers: 10240 * 4 FP32 convolution elements,
   // plus 48 heads * 128 * 128 state elements. Logits and host metadata are
   // fixed.
   const std::size_t fixed =
-      48 * (163840 + 786432 * (bf16 ? 2 : 4)) + 2 * 993280 + 64 + 96;
+      48 * (163840 + 786432 * (compact ? 2 : 4)) + 2 * 993280 + 64 + 96;
   Require(layout.PrivateBytes() == fixed, "incorrect private state claim");
   Require(layout.BytesPerToken() == (fp16 ? 65536 : 131072),
           "incorrect KV stride");
@@ -55,6 +60,10 @@ void Check(bool fp16, bool bf16) {
       Require(part.descriptor.id.value == i + 1, "unstable component IDs");
       Require(frontiers[i].valid_rows == position,
               "component boundary differs");
+      if (part.part == qwen::ContinuationPart::kRecurrent)
+        Require(part.descriptor.layout_version == recurrent_version &&
+                    part.descriptor.state_bytes == 786432 * (compact ? 2 : 4),
+                "recurrent layouts alias");
       if (part.part == qwen::ContinuationPart::kKey ||
           part.part == qwen::ContinuationPart::kValue) {
         Require(
@@ -183,8 +192,10 @@ void CheckKvarnRows() {
 int main() {
   try {
     for (bool fp16 : {false, true})
-      for (bool bf16 : {false, true})
-        Check(fp16, bf16);
+      for (const auto recurrent : {hip::QwenRecurrentStateStorage::kFp32,
+                                   hip::QwenRecurrentStateStorage::kBf16,
+                                   hip::QwenRecurrentStateStorage::kFp16})
+        Check(fp16, recurrent);
     CheckKvarn();
     CheckKvarnRows();
     std::cout << "Qwen continuation geometry: PASS\n";
