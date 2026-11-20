@@ -1286,6 +1286,34 @@ void TestHistoricalTypedArgumentsUseTojson() {
       "Typed historical numbers keep their spelling");
 }
 
+// A small exponent the model spelled 1e-7 canonicalizes to 1e-07, which the
+// number grammar rejects; the check also reads the model's spelling.
+void TestSchemaCheckedSmallExponentKept() {
+  gufo::server::ChatRequest chat;
+  chat.reasoning.enabled = true;
+  Expect(
+      !gufo::server::ParseOpenAiResponseControls(
+          gufo::json::parse(
+              R"({"tools":[{"type":"function","name":"f","parameters":{"type":"object","properties":{"ratio":{"type":"number"}},"required":["ratio"],"additionalProperties":false}}]})"),
+          &chat),
+      "small exponent fixture has valid controls");
+  chat.constrained_tools = false;
+  FakeBackend backend;
+  backend.tool_format = gufo::sampling::JsonConstraint::ToolFormat::kQwen;
+  backend.pieces = {std::string("Check `foo then\n") +
+                    "<tool_call><function=f><parameter=ratio>1e-7"
+                    "</parameter></function></tool_call>"};
+  const auto response = gufo::server::CreateOpenAiResponse(
+      Request("{}"), backend, chat, 512, {}, false);
+  const auto output = gufo::json::parse(response.body);
+  std::vector<std::string> arguments;
+  for (const auto& part : output.find("output")->items())
+    if (part.member_str("type") == "function_call")
+      arguments.push_back(part.member_str("arguments"));
+  Expect(arguments.size() == 1 && arguments[0] == R"({"ratio":1e-7})",
+         "schema-checked call keeps a small exponent");
+}
+
 // The legacy schema check after an unfinished reasoning quote reads the
 // canonical spelling, which the native number grammar accepts. The client
 // still receives the model's spelling (#1141).
@@ -8079,6 +8107,7 @@ int main() {
   TestIncrementalToolArguments();
   TestHistoricalTypedArgumentsUseTojson();
   TestSchemaCheckedNumbersKeepSpelling();
+  TestSchemaCheckedSmallExponentKept();
   TestStreamingPromptProgress();
   TestResponsesPromptProgress();
   TestToolMarkersInsideConstrainedReasoning();

@@ -1517,8 +1517,8 @@ std::size_t FramingHold(std::string_view full, std::size_t end,
 
 // Numbers keep the spelling the model generated, as llama.cpp returns them:
 // above 2^53, and 1.0 or 1e5, a double would change the client's arguments
-// and the replayed turn. Schema checks pass kCanonical, which the native
-// number grammar reads.
+// and the replayed turn. Recovered-call schema checks read this spelling,
+// then kCanonical, which the native number grammar reads.
 std::string ArgumentsJson(
     std::span<const tokenization::ChatMessage::ToolArgument> arguments,
     json::Value::Numbers numbers = json::Value::Numbers::kAsParsed) {
@@ -1840,11 +1840,18 @@ void ParseQwenCalls(
         try {
           const auto grammar = sampling::JsonConstraint::Compile(
               json::parse(tool->parameters_json), false);
-          auto state = grammar->Start();
-          for (const unsigned char byte :
-               ArgumentsJson(call.arguments, json::Value::Numbers::kCanonical))
-            state = grammar->Advance(state, byte);
-          complete = grammar->Complete(state);
+          // The model's spelling first (1e-7; a canonical 1e-07 is not the
+          // grammar's exponent form), then the canonical one (1.0 for an
+          // integer). Either passing keeps the call.
+          const auto accepts = [&](json::Value::Numbers numbers) {
+            auto state = grammar->Start();
+            for (const unsigned char byte :
+                 ArgumentsJson(call.arguments, numbers))
+              state = grammar->Advance(state, byte);
+            return grammar->Complete(state);
+          };
+          complete = accepts(json::Value::Numbers::kAsParsed) ||
+                     accepts(json::Value::Numbers::kCanonical);
         } catch (const std::exception&) {
           complete = false;
         }
