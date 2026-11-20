@@ -25,6 +25,7 @@
 #include "src/core/hip/host_allocations.hpp"
 #include "src/core/hip/kv_block_pool.hpp"
 #include "src/core/hip/kvarn_layout.hpp"
+#include "src/core/hip/scratch_arena.hpp"
 #include "src/core/session_mode.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
 #include "src/models/qwen/vision/device_input.hpp"
@@ -401,7 +402,14 @@ struct PrefillCheckpoint {
 class Executor {
 public:
   struct Options {
+    /// Rows every pass may take: its scratch is allocated for the
+    /// executor's life. Wider passes need wide_batch.
     std::uint32_t max_batch{1};
+    /// Rows of a wide prompt pass (upstream #1265), whose second set of row
+    /// buffers is mapped only while AcquireWidePasses() holds it. Zero (or at
+    /// most max_batch), or a device without virtual memory management,
+    /// leaves every pass at max_batch rows.
+    std::uint32_t wide_batch{0};
     /// Rows of logits (and hidden states) a Forward call may return.
     std::uint32_t max_logit_rows{1};
     /// Longest speculative batch; bounds the recurrent snapshot storage.
@@ -770,6 +778,43 @@ public:
   [[nodiscard]] std::uint32_t max_batch() const noexcept {
     return options_.max_batch;
   }
+  /// Rows of a wide pass; zero when wide passes are unavailable
+  /// (wide_unavailable() says why).
+  [[nodiscard]] std::uint32_t wide_batch() const noexcept {
+    return wide_pass_rows_;
+  }
+  [[nodiscard]] const std::string& wide_unavailable() const noexcept {
+    return wide_unavailable_;
+  }
+  /// Rows one pass may take now: wide_batch while the wide scratch is
+  /// mapped, otherwise max_batch.
+  [[nodiscard]] std::uint32_t pass_rows() const noexcept {
+    return WidePassesMapped() ? wide_pass_rows_ : options_.max_batch;
+  }
+  [[nodiscard]] bool WidePassesMapped() const noexcept;
+  /// Bytes the wide scratch maps; zero when wide passes are unavailable.
+  [[nodiscard]] std::size_t WidePassBytes() const noexcept;
+  struct WideDecision {
+    bool mapped{false};
+    /// Empty when mapped or already mapped; otherwise why not.
+    std::string refused;
+    std::size_t bytes{0};
+    /// Device and host memory seen by the decision, and the mapping time.
+    std::size_t device_free{0};
+    std::uint64_t host_available{0};
+    double map_ms{0};
+    bool was_mapped{false};
+  };
+  /// Maps the wide pass scratch when the device heap and the host can spare
+  /// it beyond a fixed floor (`host_available`: the host's available bytes
+  /// now). Never evicts or waits for memory. `mapped` when wide passes may
+  /// run.
+  [[nodiscard]] WideDecision AcquireWidePasses(
+      std::uint64_t host_available) const;
+  /// Returns the wide scratch to the driver after the stream drains. A
+  /// no-op (zero) while a wide pass runs or nothing is mapped; otherwise the
+  /// bytes unmapped.
+  std::size_t ReleaseWidePasses() const;
   [[nodiscard]] std::uint32_t max_speculative() const noexcept {
     return options_.max_speculative;
   }
@@ -1339,6 +1384,46 @@ private:
   [[nodiscard]] Scratch RowScratch(const Scratch& base,
                                    std::uint32_t offset) const;
   void UseScratch(const Scratch& scratch) const;
+  /// Row buffers outside Scratch: one set per pass width.
+  struct RowExtras {
+    float* exl3_rotated{nullptr};
+    std::size_t exl3_rotated_elements{0};
+    float* exl3_slice{nullptr};
+    std::size_t exl3_slice_elements{0};
+    std::uint16_t* shared_input{nullptr};
+    std::size_t shared_elements{0};
+    Exl3PrefillScratch prefill{};
+    __half* kvarn_k{nullptr};
+    __half* kvarn_v{nullptr};
+  };
+  /// Carves every buffer with a row per pass token for `rows` rows with
+  /// `allocate` (null on failure) into the row fields of `scratch` and into
+  /// `extras`; other fields stay as they are. False when an allocation
+  /// failed.
+  [[nodiscard]] bool CarveRows(
+      Scratch& scratch, RowExtras& extras, std::uint32_t rows,
+      const std::function<void*(std::size_t)>& allocate,
+      std::string* error_msg) const;
+  /// Makes `scratch`, `extras` (sized for `rows`) the active set.
+  void UseRows(const Scratch& scratch, const RowExtras& extras,
+               std::uint32_t rows) const;
+  /// The narrow set (max_batch rows, allocated) and the wide set
+  /// (wide_pass_rows_, carved in scratch_arena_ and mapped only while
+  /// AcquireWidePasses() holds it). Non-row Scratch fields are shared.
+  Scratch narrow_s_{};
+  RowExtras narrow_extras_{};
+  Scratch wide_s_{};
+  RowExtras wide_extras_{};
+  std::unique_ptr<hip::ScratchArena> scratch_arena_;
+  std::uint32_t wide_pass_rows_{0};
+  std::string wide_unavailable_;
+  /// The widest pass: what pinned host staging, n-gram gathers, detector
+  /// rows and the sessions' raw indexer rings hold.
+  std::uint32_t max_pass_rows_{1};
+  /// Rows of the active set: wide_pass_rows_ during a wide pass.
+  mutable std::uint32_t scratch_rows_{1};
+  /// Set while a pass wider than max_batch is in flight.
+  mutable bool wide_pass_running_{false};
   bool DenseBatch(const DeviceTensor& w, const float* x, float* out,
                   std::uint32_t rows, std::string* error_msg) const;
   bool GatedDenseBatch(const DeviceTensor& up, const DeviceTensor& gate,

@@ -123,7 +123,7 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
   // F32 rows are read by nothing else): F16 rows for the F16 route, else
   // the tiled Q8 layout; the cache lets Dense skip its activation pass.
   if (down != nullptr && down->cols == up.rows && MatrixRows(n_tokens) &&
-      n_tokens <= options_.max_batch) {
+      n_tokens <= scratch_rows_) {
     if (DenseF16Route(*down, n_tokens)) {
       // A private F16 buffer: s_.x_half keeps the narrowed token rows the
       // router left there, which the routed experts read next.
@@ -240,7 +240,7 @@ bool Executor::Exl3DensePrefill(
       gemms = workspace->gemms;
     }
     const auto piece = static_cast<std::uint32_t>(
-        std::min<std::size_t>(options_.max_batch, capacity / (count * k)));
+        std::min<std::size_t>(scratch_rows_, capacity / (count * k)));
     if (rotated == nullptr || piece == 0 || rotations == nullptr ||
         gemms == nullptr)
       throw std::runtime_error("EXL3 dense prefill exceeds rotation scratch");
@@ -441,7 +441,7 @@ bool Executor::PlainDensePrefill(const DeviceTensor& w, const float* x,
     AssignError(error, "unsupported plain half prefill geometry/type");
     return false;
   }
-  const auto piece = std::max<std::uint32_t>(1, options_.max_batch);
+  const auto piece = std::max<std::uint32_t>(1, scratch_rows_);
   for (std::uint32_t first = 0; first < rows; first += piece) {
     const auto count = std::min(piece, rows - first);
     PrepareHalfInput(x + std::size_t{first} * w.cols, count, w.cols);
@@ -475,7 +475,7 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
           (w.type == GgmlType::kF16 || w.type == GgmlType::kBF16 ||
            w.type == GgmlType::kF32))
         return PlainDensePrefill(w, x, out, n_tokens, error_msg);
-      const auto piece = std::max<std::uint32_t>(1, options_.max_batch);
+      const auto piece = std::max<std::uint32_t>(1, scratch_rows_);
       const DeviceTensor* const consumer[] = {&w};
       // A side branch (ForkSide) never takes the main stream's hand-off.
       const auto* rotated = w.exl3 != nullptr && !prefill_phase &&
@@ -507,7 +507,7 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
     // GEMM. Both staging buffers hold max_batch rows; a wider call (the
     // draft block folds its streams into rows) runs in pieces.
     const bool f16 = DenseF16Route(w, n_tokens);
-    const std::uint32_t piece = static_cast<std::uint32_t>(options_.max_batch);
+    const std::uint32_t piece = static_cast<std::uint32_t>(scratch_rows_);
     for (std::uint32_t r0 = 0; r0 < n_tokens; r0 += piece) {
       const std::uint32_t rows = std::min(piece, n_tokens - r0);
       // The staging buffer may already hold this input (a producer wrote

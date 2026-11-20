@@ -200,7 +200,7 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   };
   const bool exl3_overlap = prefill_phase && !last_only && n_tokens >= 512 &&
                             exl3_shared_workspace_.input != nullptr &&
-                            n_tokens <= options_.max_batch &&
+                            n_tokens <= scratch_rows_ &&
                             full_exl3(l.shexp_gate) && full_exl3(l.shexp_up) &&
                             full_exl3(l.shexp_down);
   if (exl3_overlap) {

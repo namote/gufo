@@ -419,6 +419,18 @@ struct Executor::AbliterationPool {
 };
 
 namespace {
+/// Address space reserved per row of a wide pass for its scratch set
+/// (about 0.53 MiB per row measured on the EXL3 pack, B7).
+constexpr std::size_t kArenaRowBytes = std::size_t{1} << 20;
+/// Alignment of the wide set's buffers inside the arena (hipMalloc's).
+constexpr std::size_t kArenaAlignment = 256;
+/// Device memory a wide pass needs beyond its scratch set: its own K/V,
+/// indexer and checkpoint pages.
+constexpr std::size_t kWidePassSpare = std::size_t{1} << 30;
+/// Host memory left to the OS, the RAM cache and other processes after the
+/// wide set is mapped (kHostSnapshotHeadroomBytes in serve).
+constexpr std::uint64_t kWidePassHostFloor = std::uint64_t{4} << 30;
+
 /// One profile's rows and detector column; given back when the last table
 /// (or session) holding it lets go.
 struct AbliterationLease {
@@ -480,7 +492,7 @@ bool Executor::ReserveAbliteration(std::size_t profile_rows, bool unions,
     const auto direction_bytes =
         std::size_t{kDetectorColumns} * hidden * sizeof(float);
     const auto score_bytes =
-        std::size_t{options_.max_batch} * kDetectorColumns * sizeof(float);
+        std::size_t{max_pass_rows_} * kDetectorColumns * sizeof(float);
     if (!Check(hip::AllocateDevice(&directions, direction_bytes),
                "abliteration detectors", error))
       return false;
@@ -937,6 +949,31 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   e->ngram_ = ngram;
   e->options_ = options;
   e->options_.max_batch = std::max<std::uint32_t>(1, options.max_batch);
+  // Wide prompt passes run on a second set of the row buffers, reserved as
+  // address space now and mapped only while AcquireWidePasses() holds them
+  // (upstream #1265). Without virtual memory every pass is narrow.
+  if (options.wide_batch > e->options_.max_batch) {
+    int device = 0;
+    std::string reason;
+    if (hipGetDevice(&device) != hipSuccess) {
+      (void)hipGetLastError();
+      reason = "no_device";
+    } else if (auto pages = hip::VmmScratchPages(device, &reason)) {
+      e->scratch_arena_ = hip::ScratchArena::Reserve(
+          std::move(pages), std::size_t{options.wide_batch} * kArenaRowBytes,
+          &reason);
+    }
+    if (e->scratch_arena_)
+      e->wide_pass_rows_ = options.wide_batch;
+    else
+      e->wide_unavailable_ = reason.empty() ? "reservation_failed" : reason;
+  } else if (options.wide_batch != 0) {
+    e->wide_unavailable_ = "not_wider";
+  } else {
+    e->wide_unavailable_ = "disabled";
+  }
+  e->max_pass_rows_ = std::max(e->options_.max_batch, e->wide_pass_rows_);
+  e->scratch_rows_ = e->options_.max_batch;
   e->options_.max_logit_rows = std::clamp<std::uint32_t>(
       options.max_logit_rows, 1, e->options_.max_batch);
   e->options_.max_speculative = std::clamp<std::uint32_t>(
@@ -979,7 +1016,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   }
   e->context_capacity_ = std::max(c.context_length, options.max_context);
   e->yarn_ = MakeYarnRope(c.rope_scaling, c.rotary_dim, c.rope_theta);
+  // Pinned host staging serves both scratch sets: Tw is the widest pass.
   const std::size_t T = e->options_.max_batch;
+  const std::size_t Tw = e->max_pass_rows_;
   e->blaslt_ = BlasLt::Create(e->stream_, error_msg);
   if (e->blaslt_ == nullptr) {
     return nullptr;
@@ -1004,7 +1043,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   }
   const std::size_t hc_dim = c.HcDim();
   const std::size_t hidden = c.hidden_size;
-  const std::size_t slots = T * c.num_experts_used;
+  const std::size_t wide_slots = Tw * c.num_experts_used;
   auto& a = e->allocations_;
   Scratch& s = e->s_;
   auto f32 = [&](std::size_t n) { return Alloc<float>(a, n, error_msg); };
@@ -1013,8 +1052,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     auto& projection = ex.projection;
     const auto width = std::max(
         {c.hidden_size, c.SsmValueDim(), c.AttentionQDim(), c.expert_ff});
-    projection.rotated_elements = std::max(T, std::size_t{64}) * width;
-    projection.rotated = f32(projection.rotated_elements);
+    // projection.rotated and slice have a row per pass token (CarveRows).
     projection.weight_elements = std::size_t{128} * width;
     projection.weight = f32(projection.weight_elements);
     projection.fast_input_elements = std::size_t{3 * 8} * width;
@@ -1031,9 +1069,6 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     ex.rotated_input_elements = std::size_t{3 * 8} * width;
     ex.rotated_input =
         Alloc<std::uint16_t>(a, ex.rotated_input_elements, error_msg);
-    ex.slice_elements = std::max(T, std::size_t{64}) * (c.indexer_heads + 1) *
-                        c.indexer_head_dim;
-    ex.slice = f32(ex.slice_elements);
     // The decode side branch's projections (ForkSide): kVecBatch rows of
     // one hidden-width consumer.
     auto& side = e->exl3_side_;
@@ -1063,42 +1098,23 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     e->exl3_dense_rotations_ =
         Alloc<gufo::hip::Exl3RotateProblem>(a, 3, error_msg);
     e->exl3_dense_gemms_ = Alloc<gufo::hip::Exl3GemmProblem>(a, 3, error_msg);
-    if (e->options_.max_batch >= 512) {
+    if (e->max_pass_rows_ >= 512) {
       // Shared EXL3 projections may run beside routed prefill. Their rotated
-      // operands and descriptors must not borrow either routed or x_half space.
+      // operands (CarveRows) and descriptors must not borrow either routed or
+      // x_half space.
       auto& shared = e->exl3_shared_workspace_;
-      shared.elements = std::size_t{e->options_.max_batch} *
-                        std::max(std::size_t{2} * c.hidden_size,
-                                 std::size_t{c.shared_expert_ff});
-      shared.input = Alloc<std::uint16_t>(a, shared.elements, error_msg);
       shared.rotations = Alloc<gufo::hip::Exl3RotateProblem>(a, 3, error_msg);
       shared.gemms = Alloc<gufo::hip::Exl3GemmProblem>(a, 3, error_msg);
     }
     ex.head_segments =
         Alloc<std::uint32_t>(a, kMtpDraftExtraRows + 1, error_msg);
     ex.head_values = f32(c.vocab_size + std::size_t{kMtpDraftExtraRows} * 128);
+    // The bucket prefill's slabs (CarveRows) for the narrow width.
     Exl3PrefillLayout layout;
     if (!PlanExl3Prefill(c, e->options_.max_batch, &layout, error_msg))
       return nullptr;
-    auto& pp = e->exl3_prefill_;
-    pp.max_assignments = layout.assignments;
-    pp.max_buckets = layout.buckets;
-    const std::size_t A = layout.assignments;
-    pp.offsets =
-        Alloc<std::uint32_t>(a, std::size_t{c.num_experts} + 1, error_msg);
-    pp.slots = Alloc<std::int32_t>(a, A, error_msg);
-    pp.buckets = Alloc<Exl3ExpertBucket>(a, layout.buckets, error_msg);
-    pp.bucket_count = Alloc<std::uint32_t>(a, 1, error_msg);
-    pp.input = Alloc<std::uint16_t>(a, A * std::max(c.hidden_size, c.expert_ff),
-                                    error_msg);
-    // Gate/up borrow the current stage view at dispatch. Packed out must
-    // remain separate from stage down_e, which receives the scattered rows.
-    pp.out = f32(A * c.hidden_size);
-    pp.down_exponents = Alloc<std::int32_t>(a, A, error_msg);
-    pp.inverse = Alloc<std::int32_t>(a, A, error_msg);
     e->exl3_prefill_scratch_bytes_ = layout.bytes;
   }
-  s.tokens = Alloc<std::int32_t>(a, T, error_msg);
   // F32 plain weights do not contribute to max_half_cols during upload.
   // EXL3 prefill nevertheless narrows their inputs, including F32 HC/PLE.
   e->half_input_cols_ =
@@ -1109,7 +1125,6 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                  std::size_t{c.AttentionQDim()}, std::size_t{c.hc_low_rank},
                  std::size_t{c.expert_ff}, std::size_t{c.shared_expert_ff}})
           : model.max_half_cols();
-  s.x_half = Alloc<std::uint16_t>(a, T * e->half_input_cols_, error_msg);
   if (model.output().exl3 != nullptr) {
     e->hc_down_q8_ = !model.layers().empty();
     for (const auto& layer : model.layers())
@@ -1133,70 +1148,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   s.mixed_q8_1 = q8_1(hidden);
   s.gdn_q8_1 = q8_1(c.SsmValueDim());
   s.ctx_q8_1 = q8_1(c.AttentionQDim());
-  s.x_q8t =
-      Alloc<std::uint8_t>(a, Q8TiledBytes(T, model.max_q8_cols()), error_msg);
-  s.res = f32(T * hc_dim);
-  s.xn = f32(T * hc_dim);
-  s.xn_half = Alloc<__half>(a, T * hc_dim, error_msg);
-  s.xn_q8t = Alloc<std::uint8_t>(a, Q8TiledBytes(T, hc_dim), error_msg);
-  s.lo = f32(T * c.hc_low_rank);
-  s.mixed = f32(T * hidden);
-  s.inject = f32(T * c.hc_count * HcInjectParts(hidden));
-  s.block_out = f32(T * hidden);
-  s.hc_defer_w = f32(T * c.hc_count);
-  s.xn_scale = f32(T * c.hc_count);
   e->mask_words_ = c.SparseMaskWords(e->context_capacity_);
-  const std::size_t linear_projection = std::max<std::size_t>(
-      c.SsmConvChannels() + c.SsmValueDim(), c.ple_layer >= 0 ? hc_dim : 0);
-  const std::size_t linear_floats =
-      T * (linear_projection + 2 * c.ssm_num_v_heads + 2 * c.SsmKeyDim() +
-           2 * c.SsmValueDim()) +
-      (T + c.ssm_conv_kernel) * c.SsmConvChannels();
-  const std::size_t attention_floats =
-      T * (5 * c.AttentionQDim() + 4 * c.AttentionKvDim() +
-           c.indexer_heads * c.indexer_head_dim + c.indexer_head_dim +
-           e->mask_words_);
-  const std::size_t expert_floats = slots * (2 * c.expert_ff + hidden);
-  // Linear/full attention and routed experts run sequentially on stream_.
-  // Their intermediates die before the next stage, including batched rows,
-  // MTP catch-up and the deferred MoE epilogue consumed by Combine. Keep
-  // stable addresses for graph replay without reserving all three stages.
-  float* const stage =
-      f32(std::max({linear_floats, attention_floats, expert_floats,
-                    T * (linear_projection + hc_dim)}));
-  if (stage == nullptr) {
-    return nullptr;
-  }
-  // Mixer gates die before attention/experts start. PLE also uses this
-  // buffer as its key, so keep it beyond PLE's gated output at stage.
-  s.hc_gate = stage + T * linear_projection;
-  float* cursor = stage;
-  const auto take = [&](std::size_t count) {
-    float* result = cursor;
-    cursor += count;
-    return result;
-  };
-  // Stacked and separate SSM projections are mutually exclusive. MTP's
-  // projected embedding is consumed before attention and reuses this space.
-  s.qkvz = take(T * linear_projection);
-  s.qkv = s.qkvz;
-  s.z = s.qkvz != nullptr ? s.qkvz + T * c.SsmConvChannels() : nullptr;
-  s.alpha_beta = take(T * 2 * c.ssm_num_v_heads);
-  s.conv_scratch = take((T + c.ssm_conv_kernel) * c.SsmConvChannels());
-  s.qn = take(T * c.SsmKeyDim());
-  s.kn = take(T * c.SsmKeyDim());
-  s.gdn_raw = take(T * c.SsmValueDim());
-  s.gdn_out = take(T * c.SsmValueDim());
-  cursor = stage;
-  s.qg = take(T * (2 * c.AttentionQDim() + 2 * c.AttentionKvDim()));
-  s.q = take(T * c.AttentionQDim());
-  s.attn_gate = take(T * c.AttentionQDim());
-  s.k = take(T * c.AttentionKvDim());
-  s.v = take(T * c.AttentionKvDim());
-  s.iq = take(T * c.indexer_heads * c.indexer_head_dim);
-  s.ik = take(T * c.indexer_head_dim);
-  s.mask = reinterpret_cast<std::uint32_t*>(take(T * e->mask_words_));
-  s.ctx = take(T * c.AttentionQDim());
   // Keep score/selection traffic near the device cache size. Captured
   // verification still needs all its rows at the maximum context.
   const std::size_t score_stride = std::size_t{e->mask_words_} * 32;
@@ -1211,24 +1163,16 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       error_msg);
   s.attn_counts = Alloc<std::uint32_t>(a, kVecBatch, error_msg);
   if (c.ple_layer >= 0) {
-    // PLE finishes before this layer's mixer/SSM. Its gate consumes key
-    // and query before normalization/convolution reuse those two buffers.
-    // The gated input stays separate until PleInject consumes both outputs.
-    s.ple_key = s.hc_gate;
-    s.ple_value = s.block_out;
-    s.ple_query = s.xn;
-    s.ple_gated = s.qkvz;
-    s.ple_norm = s.hc_gate;
-    s.ple_conv = s.xn;
     s.ple_history_scratch =
         f32(static_cast<std::size_t>(c.PleConvHistory()) * hc_dim);
     // The quantizer reads each n-gram row once. On this UMA target it can
     // consume the coherent reader buffer directly, without another device
     // allocation or upload. Its address stays fixed for graph replay; the
     // next-chunk prefetch uses separate storage until this forward finishes.
+    // Both scratch sets share it, so it holds the widest pass.
     void* pinned = nullptr;
     if (!Check(e->host_allocations_.Allocate(
-                   &pinned, T * c.PleEmbeddingDim() * sizeof(float),
+                   &pinned, Tw * c.PleEmbeddingDim() * sizeof(float),
                    hipHostMallocMapped | hipHostMallocCoherent),
                "pinned n-gram buffer", error_msg)) {
       return nullptr;
@@ -1239,43 +1183,25 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                "mapped n-gram buffer", error_msg)) {
       return nullptr;
     }
-    e->host_rows_.resize(T * c.ple_heads);
+    e->host_rows_.resize(Tw * c.ple_heads);
     if (ngram)
-      ngram->ReserveGather(T * c.ple_heads);
+      ngram->ReserveGather(Tw * c.ple_heads);
   }
-  if (options.kvarn) {
-    if (c.head_dim != hip::kKvarnHeadDim) {
-      AssignError(error_msg, "KVarN needs 256-wide attention heads");
-      return nullptr;
-    }
-    const std::size_t staging =
-        hip::KvarnStagingRows(T) * std::size_t{c.AttentionKvDim()};
-    e->kvarn_staging_k_ = Alloc<__half>(a, staging, error_msg);
-    e->kvarn_staging_v_ = Alloc<__half>(a, staging, error_msg);
-    if (e->kvarn_staging_k_ == nullptr || e->kvarn_staging_v_ == nullptr)
-      return nullptr;
+  if (options.kvarn && c.head_dim != hip::kKvarnHeadDim) {
+    AssignError(error_msg, "KVarN needs 256-wide attention heads");
+    return nullptr;
   }
-  s.router = f32(T * (c.num_experts + 1));
-  s.ids = Alloc<std::int32_t>(a, slots, error_msg);
   s.expert_counts = Alloc<std::uint32_t>(a, c.num_experts, error_msg);
-  {
-    const std::size_t compact = RoutedCompactRows(slots, c.num_experts);
-    s.routed_bounds = Alloc<std::int32_t>(a, c.num_experts + 1, error_msg);
-    s.routed_cursors = Alloc<std::int32_t>(a, c.num_experts, error_msg);
-    s.rows_token = Alloc<std::int32_t>(a, compact, error_msg);
-    s.rows_slot = Alloc<std::int32_t>(a, compact, error_msg);
-    s.routed_tiles =
-        Alloc<std::int32_t>(a, 3 * RoutedTileCapacity(slots, c), error_msg);
-  }
-  s.weights = f32(slots);
-  cursor = stage;
-  s.gate_e = take(slots * c.expert_ff);
-  s.up_e = take(slots * c.expert_ff);
-  s.down_e = take(slots * hidden);
-  s.shexp_gate = f32(T * c.shared_expert_ff);
-  s.shexp_up = f32(T * c.shared_expert_ff);
-  s.shexp_out = f32(T * hidden);
-  s.shexp_half = Alloc<__half>(a, T * c.shared_expert_ff, error_msg);
+  s.routed_bounds = Alloc<std::int32_t>(a, c.num_experts + 1, error_msg);
+  s.routed_cursors = Alloc<std::int32_t>(a, c.num_experts, error_msg);
+  // Buffers with a row per pass token, whole at the narrow width.
+  if (!e->CarveRows(
+          s, e->narrow_extras_, static_cast<std::uint32_t>(T),
+          [&](std::size_t bytes) -> void* {
+            return Alloc<std::uint8_t>(a, bytes, error_msg);
+          },
+          error_msg))
+    return nullptr;
   s.logits =
       f32(static_cast<std::size_t>(e->options_.max_logit_rows) * c.vocab_size);
   {
@@ -1285,8 +1211,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     if (!Check(
             e->host_allocations_.Allocate(&control, sizeof(Session::Control)),
             "pinned control buffer", error_msg) ||
-        !Check(e->host_allocations_.Allocate(&tokens, T * sizeof(std::int32_t)),
-               "pinned token buffer", error_msg) ||
+        !Check(
+            e->host_allocations_.Allocate(&tokens, Tw * sizeof(std::int32_t)),
+            "pinned token buffer", error_msg) ||
         !Check(
             e->host_allocations_.Allocate(
                 &logits, static_cast<std::size_t>(e->options_.max_logit_rows) *
@@ -1303,8 +1230,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     e->counts_host_ = static_cast<std::uint32_t*>(counts);
     void* tiles = nullptr;
     if (!Check(e->host_allocations_.Allocate(
-                   &tiles,
-                   3 * RoutedTileCapacity(slots, c) * sizeof(std::int32_t)),
+                   &tiles, 3 * RoutedTileCapacity(wide_slots, c) *
+                               sizeof(std::int32_t)),
                "pinned routed tile map", error_msg)) {
       return nullptr;
     }
@@ -1320,13 +1247,6 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                    !model.layers().empty() &&
                    model.layers()[0].hc_ffn.down.type == GgmlType::kQ8_0;
   if (model.has_mtp()) {
-    // The trunk's kept rows are session-owned. Its transient residual and
-    // mixer buffers are free while MTP constructs its input. The split
-    // projections consume h/embd before the first mixer rewrites xn/mixed.
-    s.mtp_h = s.xn;
-    s.mtp_embd = s.mixed;
-    s.mtp_eproj = s.qkvz;
-    s.mtp_res = s.res;
     s.mtp_argmax = Alloc<ArgmaxCandidate>(a, kArgmaxParts, error_msg);
     s.mtp_token = Alloc<std::int32_t>(a, 1, error_msg);
     s.draft_head_ids = Alloc<std::int32_t>(a, 1, error_msg);
@@ -1377,7 +1297,298 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       return nullptr;
     }
   }
+  e->narrow_s_ = s;
+  e->UseRows(e->narrow_s_, e->narrow_extras_, e->options_.max_batch);
+  if (e->scratch_arena_) {
+    // The wide set shares every other buffer; its rows are carved densely
+    // from the reserved address space and take memory only when mapped.
+    e->wide_s_ = s;
+    std::string reason;
+    if (!e->CarveRows(
+            e->wide_s_, e->wide_extras_, e->wide_pass_rows_,
+            [&](std::size_t bytes) {
+              return e->scratch_arena_->Take(bytes, &reason, kArenaAlignment);
+            },
+            &reason)) {
+      e->scratch_arena_.reset();
+      e->wide_pass_rows_ = 0;
+      // Pinned staging keeps its wide size; sessions' rings need not.
+      e->max_pass_rows_ = e->options_.max_batch;
+      e->wide_unavailable_ = "carve_failed:" + reason;
+      e->wide_s_ = {};
+      e->wide_extras_ = {};
+    }
+  }
   return e;
+}
+
+bool Executor::CarveRows(Scratch& s, RowExtras& extras, std::uint32_t rows,
+                         const std::function<void*(std::size_t)>& allocate,
+                         std::string* error_msg) const {
+  const Config& c = config();
+  const DeviceModel& model = *model_;
+  const std::size_t T = rows;
+  const std::size_t hc_dim = c.HcDim();
+  const std::size_t hidden = c.hidden_size;
+  const std::size_t slots = T * c.num_experts_used;
+  bool ok = true;
+  const auto bytes = [&](std::size_t count) {
+    void* p = allocate(std::max<std::size_t>(1, count));
+    ok = ok && p != nullptr;
+    return p;
+  };
+  const auto f32 = [&](std::size_t n) {
+    return static_cast<float*>(bytes(n * sizeof(float)));
+  };
+  const auto i32 = [&](std::size_t n) {
+    return static_cast<std::int32_t*>(bytes(n * sizeof(std::int32_t)));
+  };
+  const auto u16 = [&](std::size_t n) {
+    return static_cast<std::uint16_t*>(bytes(n * sizeof(std::uint16_t)));
+  };
+  extras = {};
+  if (model.output().exl3 != nullptr) {
+    const auto width = std::max(
+        {c.hidden_size, c.SsmValueDim(), c.AttentionQDim(), c.expert_ff});
+    extras.exl3_rotated_elements = std::max(T, std::size_t{64}) * width;
+    extras.exl3_rotated = f32(extras.exl3_rotated_elements);
+    extras.exl3_slice_elements = std::max(T, std::size_t{64}) *
+                                 (c.indexer_heads + 1) * c.indexer_head_dim;
+    extras.exl3_slice = f32(extras.exl3_slice_elements);
+    if (T >= 512 && exl3_shared_workspace_.rotations != nullptr) {
+      extras.shared_elements = T * std::max(std::size_t{2} * c.hidden_size,
+                                            std::size_t{c.shared_expert_ff});
+      extras.shared_input = u16(extras.shared_elements);
+    }
+    Exl3PrefillLayout layout;
+    if (!PlanExl3Prefill(c, rows, &layout, error_msg))
+      return false;
+    auto& pp = extras.prefill;
+    pp.max_assignments = layout.assignments;
+    pp.max_buckets = layout.buckets;
+    const std::size_t A = layout.assignments;
+    pp.offsets = static_cast<std::uint32_t*>(
+        bytes((std::size_t{c.num_experts} + 1) * sizeof(std::uint32_t)));
+    pp.slots = i32(A);
+    pp.buckets = static_cast<Exl3ExpertBucket*>(
+        bytes(std::size_t{layout.buckets} * sizeof(Exl3ExpertBucket)));
+    pp.bucket_count = static_cast<std::uint32_t*>(bytes(sizeof(std::uint32_t)));
+    pp.input = u16(A * std::max(c.hidden_size, c.expert_ff));
+    // Gate/up borrow the current stage view at dispatch. Packed out must
+    // remain separate from stage down_e, which receives the scattered rows.
+    pp.out = f32(A * c.hidden_size);
+    pp.down_exponents = i32(A);
+    pp.inverse = i32(A);
+  }
+  s.tokens = i32(T);
+  s.x_half = u16(T * half_input_cols_);
+  s.x_q8t = bytes(Q8TiledBytes(T, model.max_q8_cols()));
+  s.res = f32(T * hc_dim);
+  s.xn = f32(T * hc_dim);
+  s.xn_half = static_cast<__half*>(bytes(T * hc_dim * sizeof(__half)));
+  s.xn_q8t = bytes(Q8TiledBytes(T, hc_dim));
+  s.lo = f32(T * c.hc_low_rank);
+  s.mixed = f32(T * hidden);
+  s.inject = f32(T * c.hc_count * HcInjectParts(hidden));
+  s.block_out = f32(T * hidden);
+  s.hc_defer_w = f32(T * c.hc_count);
+  s.xn_scale = f32(T * c.hc_count);
+  const std::size_t linear_projection = std::max<std::size_t>(
+      c.SsmConvChannels() + c.SsmValueDim(), c.ple_layer >= 0 ? hc_dim : 0);
+  const std::size_t linear_floats =
+      T * (linear_projection + 2 * c.ssm_num_v_heads + 2 * c.SsmKeyDim() +
+           2 * c.SsmValueDim()) +
+      (T + c.ssm_conv_kernel) * c.SsmConvChannels();
+  const std::size_t attention_floats =
+      T *
+      (5 * c.AttentionQDim() + 4 * c.AttentionKvDim() +
+       c.indexer_heads * c.indexer_head_dim + c.indexer_head_dim + mask_words_);
+  const std::size_t expert_floats = slots * (2 * c.expert_ff + hidden);
+  // Linear/full attention and routed experts run sequentially on stream_.
+  // Their intermediates die before the next stage, including batched rows,
+  // MTP catch-up and the deferred MoE epilogue consumed by Combine. Keep
+  // stable addresses for graph replay without reserving all three stages.
+  float* const stage =
+      f32(std::max({linear_floats, attention_floats, expert_floats,
+                    T * (linear_projection + hc_dim)}));
+  if (stage == nullptr)
+    return false;
+  // Mixer gates die before attention/experts start. PLE also uses this
+  // buffer as its key, so keep it beyond PLE's gated output at stage.
+  s.hc_gate = stage + T * linear_projection;
+  float* cursor = stage;
+  const auto take = [&](std::size_t count) {
+    float* result = cursor;
+    cursor += count;
+    return result;
+  };
+  // Stacked and separate SSM projections are mutually exclusive. MTP's
+  // projected embedding is consumed before attention and reuses this space.
+  s.qkvz = take(T * linear_projection);
+  s.qkv = s.qkvz;
+  s.z = s.qkvz + T * c.SsmConvChannels();
+  s.alpha_beta = take(T * 2 * c.ssm_num_v_heads);
+  s.conv_scratch = take((T + c.ssm_conv_kernel) * c.SsmConvChannels());
+  s.qn = take(T * c.SsmKeyDim());
+  s.kn = take(T * c.SsmKeyDim());
+  s.gdn_raw = take(T * c.SsmValueDim());
+  s.gdn_out = take(T * c.SsmValueDim());
+  cursor = stage;
+  s.qg = take(T * (2 * c.AttentionQDim() + 2 * c.AttentionKvDim()));
+  s.q = take(T * c.AttentionQDim());
+  s.attn_gate = take(T * c.AttentionQDim());
+  s.k = take(T * c.AttentionKvDim());
+  s.v = take(T * c.AttentionKvDim());
+  s.iq = take(T * c.indexer_heads * c.indexer_head_dim);
+  s.ik = take(T * c.indexer_head_dim);
+  s.mask = reinterpret_cast<std::uint32_t*>(take(T * mask_words_));
+  s.ctx = take(T * c.AttentionQDim());
+  if (c.ple_layer >= 0) {
+    // PLE finishes before this layer's mixer/SSM. Its gate consumes key
+    // and query before normalization/convolution reuse those two buffers.
+    // The gated input stays separate until PleInject consumes both outputs.
+    s.ple_key = s.hc_gate;
+    s.ple_value = s.block_out;
+    s.ple_query = s.xn;
+    s.ple_gated = s.qkvz;
+    s.ple_norm = s.hc_gate;
+    s.ple_conv = s.xn;
+  }
+  if (options_.kvarn) {
+    const std::size_t staging =
+        hip::KvarnStagingRows(T) * std::size_t{c.AttentionKvDim()};
+    extras.kvarn_k = static_cast<__half*>(bytes(staging * sizeof(__half)));
+    extras.kvarn_v = static_cast<__half*>(bytes(staging * sizeof(__half)));
+  }
+  s.router = f32(T * (c.num_experts + 1));
+  s.ids = i32(slots);
+  const std::size_t compact = RoutedCompactRows(slots, c.num_experts);
+  s.rows_token = i32(compact);
+  s.rows_slot = i32(compact);
+  s.routed_tiles = i32(3 * RoutedTileCapacity(slots, c));
+  s.weights = f32(slots);
+  cursor = stage;
+  s.gate_e = take(slots * c.expert_ff);
+  s.up_e = take(slots * c.expert_ff);
+  s.down_e = take(slots * hidden);
+  s.shexp_gate = f32(T * c.shared_expert_ff);
+  s.shexp_up = f32(T * c.shared_expert_ff);
+  s.shexp_out = f32(T * hidden);
+  s.shexp_half =
+      static_cast<__half*>(bytes(T * c.shared_expert_ff * sizeof(__half)));
+  if (model.has_mtp()) {
+    // The trunk's kept rows are session-owned. Its transient residual and
+    // mixer buffers are free while MTP constructs its input. The split
+    // projections consume h/embd before the first mixer rewrites xn/mixed.
+    s.mtp_h = s.xn;
+    s.mtp_embd = s.mixed;
+    s.mtp_eproj = s.qkvz;
+    s.mtp_res = s.res;
+  }
+  return ok;
+}
+
+void Executor::UseRows(const Scratch& scratch, const RowExtras& extras,
+                       std::uint32_t rows) const {
+  // exl3_ and the workspaces are read through const members by the dense
+  // routes; their row pointers change only between passes.
+  auto& self = const_cast<Executor&>(*this);
+  self.exl3_.projection.rotated = extras.exl3_rotated;
+  self.exl3_.projection.rotated_elements = extras.exl3_rotated_elements;
+  self.exl3_.slice = extras.exl3_slice;
+  self.exl3_.slice_elements = extras.exl3_slice_elements;
+  self.exl3_shared_workspace_.input = extras.shared_input;
+  self.exl3_shared_workspace_.elements = extras.shared_elements;
+  self.exl3_prefill_ = extras.prefill;
+  self.kvarn_staging_k_ = extras.kvarn_k;
+  self.kvarn_staging_v_ = extras.kvarn_v;
+  scratch_rows_ = rows;
+  UseScratch(scratch);
+  // Producer-readiness caches match by address. The wide set keeps its
+  // addresses across unmap and remap but not its contents, so a stale match
+  // would skip staging: forget them when the set changes.
+  exl3_rotated_ = {};
+  xn_q8_ready_ = {};
+  mixed_q8_ready_ = {};
+  shexp_half_ready_ = false;
+}
+
+bool Executor::WidePassesMapped() const noexcept {
+  return scratch_arena_ && scratch_arena_->transient_mapped();
+}
+
+std::size_t Executor::WidePassBytes() const noexcept {
+  return scratch_arena_ ? scratch_arena_->transient_bytes() : 0;
+}
+
+Executor::WideDecision Executor::AcquireWidePasses(
+    std::uint64_t host_available) const {
+  WideDecision decision;
+  decision.host_available = host_available;
+  if (!scratch_arena_) {
+    decision.refused = wide_unavailable_;
+    return decision;
+  }
+  decision.bytes = scratch_arena_->transient_bytes();
+  if (scratch_arena_->transient_mapped()) {
+    decision.mapped = decision.was_mapped = true;
+    return decision;
+  }
+  // The wide set plus room for what the pass maps itself (its K/V rows,
+  // checkpoint and pooled pages) must fit the device heap and leave the
+  // host its floor; mapping never evicts the RAM cache or waits.
+  const std::size_t need = decision.bytes + kWidePassSpare;
+  std::size_t total_bytes = 0;
+  if (hipMemGetInfo(&decision.device_free, &total_bytes) != hipSuccess) {
+    (void)hipGetLastError();
+    decision.refused = "device_query_failed";
+    return decision;
+  }
+  if (decision.device_free < need) {
+    decision.refused = "device_memory";
+    return decision;
+  }
+  if (host_available < kWidePassHostFloor + need) {
+    decision.refused = "host_memory";
+    return decision;
+  }
+  const auto started = std::chrono::steady_clock::now();
+  std::string error;
+  if (!scratch_arena_->MapTransient(&error)) {
+    decision.refused = "map_failed:" + error;
+    return decision;
+  }
+  // Fresh pages hold whatever the driver left there; the narrow set was
+  // zeroed once when allocated. Clear the wide set before its first pass.
+  if (hipMemsetAsync(scratch_arena_->base(), 0, scratch_arena_->carved_bytes(),
+                     stream_) != hipSuccess ||
+      hipStreamSynchronize(stream_) != hipSuccess) {
+    (void)hipGetLastError();
+    scratch_arena_->ReleaseTransient();
+    decision.refused = "clear_failed";
+    return decision;
+  }
+  decision.map_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - started)
+                        .count();
+  decision.mapped = true;
+  return decision;
+}
+
+std::size_t Executor::ReleaseWidePasses() const {
+  if (!scratch_arena_ || !scratch_arena_->transient_mapped() ||
+      wide_pass_running_)
+    return 0;
+  // Nothing reads the wide set once the pass that used it returned; only
+  // the shared pinned n-gram buffer outlives it, for the next prefetch.
+  // Unmapping waits for in-flight GPU work; drain this executor's streams
+  // first so no queued kernel of a failed pass touches an unmapped page.
+  (void)hipStreamSynchronize(stream_);
+  (void)hipStreamSynchronize(side_stream_);
+  (void)hipGetLastError();
+  const std::size_t bytes = scratch_arena_->transient_bytes();
+  scratch_arena_->ReleaseTransient();
+  return bytes;
 }
 
 hip::KvBlockGeometry Executor::KvGeometry(core::SessionMode mode,
@@ -1406,7 +1617,7 @@ std::unique_ptr<Session> Executor::CreateSession(
   // Before sparse attention starts, pooling can lag by indexer_top_k
   // rows. Afterwards only an incomplete block precedes the current batch.
   // Completed block keys remain in block_k; their raw rows are dead.
-  s->index_capacity_ = IndexerCapacity(c, options_.max_batch, max_context);
+  s->index_capacity_ = IndexerCapacity(c, max_pass_rows_, max_context);
   s->linear_.resize(c.num_layers);
   s->attention_.resize(c.num_layers);
   auto& a = s->allocations_;
@@ -1595,8 +1806,7 @@ bool Executor::PlanKvarn(Session& session, std::uint32_t start, std::uint32_t n,
     pass.staging_first = start < hip::kKvarnSinkTokens ? 0 : plan.target;
     pass.quant_end = plan.target;
     pass.flushed_end = plan.flushed_end;
-    if (start + n - pass.staging_first >
-        hip::KvarnStagingRows(options_.max_batch)) {
+    if (start + n - pass.staging_first > hip::KvarnStagingRows(scratch_rows_)) {
       AssignError(error_msg, "KVarN prompt chunk exceeds its staging rows");
       return false;
     }
@@ -1692,7 +1902,7 @@ std::size_t Executor::SessionBytes(
       std::size_t{kv_layout.geometry.blocks()} * sizeof(std::uint32_t) +
       (options_.kvarn ? KvarnFp16Elements(c) * sizeof(__half) : 0);
   const std::size_t index =
-      std::size_t{IndexerCapacity(c, options_.max_batch, max_context)} *
+      std::size_t{IndexerCapacity(c, max_pass_rows_, max_context)} *
       c.indexer_head_dim * sizeof(float);
   const auto rollback_state =
       rollback_depth == 0

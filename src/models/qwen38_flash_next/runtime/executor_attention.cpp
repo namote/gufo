@@ -31,7 +31,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
 
   const std::uint32_t kv_row = c.AttentionKvDim();
   const std::uint32_t index_capacity =
-      IndexerCapacity(c, options_.max_batch, max_context);
+      IndexerCapacity(c, max_pass_rows_, max_context);
   bool prepared = false;
   bool query_rows = false;
   // The WMMA prefill kernel reads its output gate from the packed [q | gate]
@@ -162,7 +162,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   if (!l.attn_qkv.empty()) {
     const bool fused_projection =
         !projections_ready && WidePrefill(n_tokens) &&
-        n_tokens <= options_.max_batch && DenseF16Route(l.attn_qkv, n_tokens) &&
+        n_tokens <= scratch_rows_ && DenseF16Route(l.attn_qkv, n_tokens) &&
         l.attn_qkv.rows == 13312 && l.attn_qkv.cols == 2560 &&
         c.num_heads == 24 && c.num_kv_heads == 2 && c.head_dim == 256 &&
         c.rotary_dim == 64;

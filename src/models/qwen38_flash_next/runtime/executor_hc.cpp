@@ -136,8 +136,7 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
   // The next mixer's plain down projection reads this norm as F16: the
   // combine stores that copy too instead of a separate narrowing pass
   // rereading the F32 row.
-  const bool half_norm = exl3 && prefill_phase &&
-                         n_tokens <= options_.max_batch &&
+  const bool half_norm = exl3 && prefill_phase && n_tokens <= scratch_rows_ &&
                          c.HcDim() <= half_input_cols_;
   // Its F32 copy is then left out as well: the mixer recomputes it from the
   // residual and these scales.
@@ -232,8 +231,8 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
     RmsNormRows(res, m.norm.f32(), s_.xn, n_tokens, c.HcDim(), c.hc_count,
                 c.rms_eps, stream_);
   }
-  const bool extras = n_tokens <= options_.max_batch &&
-                      c.hidden_size <= model_->max_half_cols();
+  const bool extras =
+      n_tokens <= scratch_rows_ && c.hidden_size <= model_->max_half_cols();
   const bool fused_projection =
       xn_half_ && n_tokens >= 96 && extras && c.hc_count == 4 &&
       c.hidden_size == 2560 && c.hc_low_rank == 320 &&

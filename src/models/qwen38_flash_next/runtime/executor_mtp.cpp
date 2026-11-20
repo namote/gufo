@@ -474,11 +474,11 @@ bool Executor::MtpForward(Session& session,
     return false;
   }
 
-  if (n == 0 || n > options_.max_batch || (hidden_row < 0 && n != 1) ||
+  if (n == 0 || n > scratch_rows_ || (hidden_row < 0 && n != 1) ||
       (hidden_row >= 0 &&
        static_cast<std::uint32_t>(hidden_row) + n >
            (hidden_source
-                ? options_.max_batch
+                ? scratch_rows_
                 : std::max(options_.max_speculative, max_copy_rows())))) {
     AssignError(error_msg, "MTP batch outside the kept hidden rows");
     return false;
@@ -665,7 +665,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
       return false;
     }
     const auto capacity =
-        IndexerCapacity(c, options_.max_batch, session.max_context_);
+        IndexerCapacity(c, max_pass_rows_, session.max_context_);
     if (!DenseBatch(l.indexer_k, s_.mixed, s_.ik, n, error_msg))
       return false;
     StoreRows(s_.ik, attn.index_k, n, c.indexer_head_dim,

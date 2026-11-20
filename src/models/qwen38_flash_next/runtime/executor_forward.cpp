@@ -475,8 +475,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     }
     // Both stacked SSM projections consume the same F16 input. Avoid writing
     // unused F32/Q8 copies when the wide mixer can supply that input directly.
-    const bool half_only = WidePrefill(n) && n <= options_.max_batch &&
-                           l.linear && DenseF16Route(l.ssm_in, n) &&
+    const bool half_only = WidePrefill(n) && n <= scratch_rows_ && l.linear &&
+                           DenseF16Route(l.ssm_in, n) &&
                            l.ssm_alpha_beta.type == GgmlType::kF16 &&
                            l.ssm_alpha_beta.cols == l.ssm_in.cols;
     // The mixer's EXL3 decode projections of `mixed`.
@@ -543,7 +543,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       // The wide FFN reads the mix only through its F16 rows (router, routed
       // experts) and tiled Q8 rows (shared expert).
       const bool no_f32 = prefill_phase && defer_residual_ &&
-                          rows <= options_.max_batch &&
+                          rows <= scratch_rows_ &&
                           l.router.type == GgmlType::kF16 &&
                           l.shexp_gate.type == GgmlType::kQ8_0 &&
                           l.shexp_up.type == GgmlType::kQ8_0;

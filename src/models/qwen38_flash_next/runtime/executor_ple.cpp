@@ -107,7 +107,7 @@ void Executor::PrefetchPle(const Session& session,
                            std::span<const std::int32_t> next) const {
   const Config& c = config();
   if (ple_pending_ || prefetch_.pending || next.empty() ||
-      next.size() > options_.max_batch) {
+      next.size() > max_pass_rows_) {
     return;
   }
   // Hashed from the history after this batch, which PleFetch already

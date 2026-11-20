@@ -229,7 +229,8 @@ add_subdirectory(src/cache)
 
 if (ENGINE_ENABLE_HIP)
   add_library(gufo_hip_host STATIC src/core/hip/host_allocations.cpp
-    src/core/hip/kv_block_pool.cpp)
+    src/core/hip/kv_block_pool.cpp src/core/hip/scratch_arena.cpp
+    src/core/hip/scratch_arena_vmm.cpp)
   target_link_libraries(gufo_hip_host PUBLIC hip::host gufo_platform)
   # HIP loads ROCr through libamdhip64's own RUNPATH, so a build tree runs
   # the unpatched runtime unless LD_LIBRARY_PATH names the patched one (the
@@ -653,6 +654,12 @@ if (BUILD_TESTING)
   target_include_directories(kvarn_layout_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   add_test(NAME kvarn_layout_test COMMAND kvarn_layout_test)
   set_tests_properties(kvarn_layout_test PROPERTIES LABELS "cpu;core;cache")
+
+  add_executable(scratch_arena_test tests/core/scratch_arena_test.cpp
+    src/core/hip/scratch_arena.cpp)
+  target_include_directories(scratch_arena_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME scratch_arena_test COMMAND scratch_arena_test)
+  set_tests_properties(scratch_arena_test PROPERTIES LABELS "cpu;core;memory")
 
   add_executable(heap_placement_test tests/core/heap_placement_test.cpp)
   target_link_libraries(heap_placement_test PRIVATE gufo_core)
@@ -1449,6 +1456,12 @@ if (BUILD_TESTING)
     set_tests_properties(hip_memory_visibility_driver_test PROPERTIES
       LABELS "gpu;hip;gfx1151"
       ENVIRONMENT "HSA_USERPTR_FOR_PAGED_MEM=0")
+
+    add_executable(scratch_arena_gpu_test tests/core/scratch_arena_gpu_test.hip)
+    target_link_libraries(scratch_arena_gpu_test PRIVATE gufo_hip_host hip::host)
+    add_test(NAME scratch_arena_gpu_test COMMAND scratch_arena_gpu_test)
+    set_tests_properties(scratch_arena_gpu_test PROPERTIES
+      LABELS "gpu;hip;gfx1151" TIMEOUT 120)
 
     add_executable(snapshot_copy_test tests/core/snapshot_copy_test.cpp)
     target_link_libraries(snapshot_copy_test PRIVATE gufo_core hip::host)

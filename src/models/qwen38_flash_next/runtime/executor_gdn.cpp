@@ -49,7 +49,7 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
     // Wide prefill convolves QKV in the projection's LDS tile. The raw
     // boundary rows remain available for the rolling history update.
     if (!projections_ready && !speculative && WidePrefill(n_tokens) &&
-        n_tokens <= options_.max_batch && DenseF16Route(l.ssm_in, n_tokens)) {
+        n_tokens <= scratch_rows_ && DenseF16Route(l.ssm_in, n_tokens)) {
       PrepareHalfInput(x, n_tokens, l.ssm_in.cols);
       // The Z rows feed only the output norm: the side stream computes them
       // beside the convolution boundary, the alpha/beta GEMM and the
@@ -101,7 +101,7 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   // projection to Q8 for a short tail changes every subsequent layer.
   const bool tiled = MatrixRows(n_tokens) &&
                      l.ssm_out.type == GgmlType::kQ8_0 &&
-                     n_tokens <= options_.max_batch;
+                     n_tokens <= scratch_rows_;
   const bool half_output =
       tiled && l.ssm_out.rows == 2560 && l.ssm_out.cols == 6144;
   auto* out_half =
