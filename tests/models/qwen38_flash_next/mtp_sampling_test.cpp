@@ -257,8 +257,11 @@ void CheckSampledSubsetCosts() {
   Require(single.Choose(7, 4096, 0, true) == single.Choose(7, 4096),
           "sampled prior widened the first cycle before any acceptance");
   auto state = single.State();
-  state.successes.fill(4.0F);
-  state.failures.fill(1.0F);
+  // Acceptance 0.7: on the 2026-11-20 tables the full head picks width 3 and
+  // the subset head width 5. At 0.8 both pick 5, so cheaper proposals need
+  // not move every discrete optimum.
+  state.successes.fill(7.0F);
+  state.failures.fill(3.0F);
   state.explored_depth = 7;
   state.failed_depths = 127;
   Require(single.Restore(state) && configured_8.Restore(state),

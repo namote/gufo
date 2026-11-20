@@ -8,50 +8,56 @@
 
 namespace gufo::models::qwen38_flash_next {
 
-// gfx1151, pinned Flash-Next Q4 target/Q8 MTP, 2026-09-20. Milliseconds per
-// cohort, including catch-up, recursive proposals and target verification.
-// Rows are widths 1..8 (width 1 is headless MTP catch-up plus ordinary decode).
-// Reproduce with qwen38_flash_next_gpu_probe --cost-audit 0. Allocation and C1
-// graph capture are warmed outside the measurement; each row is the median
-// of three complete cycles. Use --depth N to audit one depth. See benchmarks.
-// C1/d0 was remeasured with invariant MTP cache projections for issue #300.
+// gfx1151, serving Flash-Next EXL3 c03 pack (target and MTP), K4V4 trunk
+// cache, YaRN factor 4, 4224-row prefill capacity, 2026-11-20 (cells are 7-28%
+// cheaper than the 2026-09-20 GGUF Q4/Q8 MTP table, whose depth slope was too
+// steep: a 131072-token C1/C4 audit costs within 4% of 32768; the linear
+// extrapolation below still overprices C4 width 6-8 there by about 6%).
+// Milliseconds per cohort, including
+// catch-up, recursive proposals and target verification. Rows are widths 1..8
+// (width 1 is headless MTP catch-up plus ordinary decode). Reproduce with
+// qwen38_flash_next_gpu_probe --cost-audit 0 --kv-cache-type kvarn-k4v4
+// --yarn-factor 4 --context 1048576 --batch 4224. Allocation and C1 graph
+// capture are warmed outside the measurement; each row is the median of three
+// complete cycles. Use --depth N to audit one depth. See benchmarks.
 inline constexpr float kMtpCycleMilliseconds[3][5][8] = {
     {
         // Context 0
-        {38.5F, 47.3F, 56.1F, 65.7F, 74.1F, 82.2F, 89.7F, 96.8F},         // C1
-        {46.1F, 59.6F, 74.0F, 90.5F, 109.0F, 121.2F, 135.9F, 145.8F},     // C2
-        {57.6F, 80.6F, 108.6F, 131.4F, 161.9F, 183.5F, 213.5F, 234.3F},   // C4
-        {68.4F, 104.7F, 140.2F, 175.5F, 211.6F, 254.2F, 293.7F, 325.8F},  // C6
-        {78.7F, 121.9F, 167.4F, 215.7F, 264.7F, 311.2F, 364.1F, 411.1F},  // C8
+        {35.2F, 43.6F, 51.6F, 60.7F, 66.8F, 75.7F, 83.4F, 90.2F},         // C1
+        {42.1F, 55.3F, 65.2F, 79.3F, 98.6F, 109.7F, 122.8F, 133.4F},      // C2
+        {52.5F, 71.9F, 97.5F, 117.3F, 143.8F, 161.5F, 189.2F, 206.3F},    // C4
+        {60.5F, 97.2F, 127.5F, 154.1F, 180.3F, 212.7F, 248.6F, 272.8F},   // C6
+        {70.3F, 113.1F, 147.9F, 183.6F, 217.6F, 255.3F, 298.5F, 338.7F},  // C8
     },
     {
         // Context 4096
-        {39.7F, 49.3F, 59.8F, 69.7F, 79.1F, 89.1F, 98.6F, 108.8F},        // C1
-        {49.1F, 64.3F, 80.5F, 97.1F, 116.6F, 130.9F, 145.3F, 157.2F},     // C2
-        {62.3F, 87.7F, 118.6F, 142.4F, 173.0F, 197.9F, 228.4F, 255.4F},   // C4
-        {75.1F, 115.4F, 156.5F, 193.1F, 233.5F, 278.9F, 320.1F, 358.1F},  // C6
-        {87.9F, 134.3F, 189.7F, 238.6F, 296.0F, 342.8F, 402.1F, 456.0F},  // C8
+        {36.1F, 45.1F, 53.5F, 62.2F, 68.3F, 77.7F, 87.1F, 96.3F},         // C1
+        {44.5F, 59.9F, 70.3F, 84.0F, 104.6F, 117.8F, 134.2F, 145.6F},     // C2
+        {56.5F, 78.3F, 106.5F, 128.5F, 156.0F, 176.0F, 204.9F, 222.3F},   // C4
+        {66.5F, 108.1F, 140.7F, 171.1F, 201.5F, 233.7F, 275.5F, 299.0F},  // C6
+        {78.0F, 126.4F, 165.4F, 204.5F, 241.7F, 281.4F, 332.8F, 372.6F},  // C8
     },
     {
         // Context 32768
-        {42.5F, 51.9F, 61.5F, 71.1F, 82.5F, 92.5F, 103.6F, 112.6F},        // C1
-        {54.9F, 69.0F, 83.2F, 99.6F, 120.5F, 135.3F, 151.4F, 163.7F},      // C2
-        {73.6F, 96.9F, 125.9F, 150.1F, 185.3F, 212.3F, 243.9F, 266.5F},    // C4
-        {92.0F, 128.6F, 167.0F, 206.3F, 249.5F, 298.3F, 339.1F, 370.7F},   // C6
-        {110.1F, 152.5F, 201.8F, 256.0F, 321.9F, 376.1F, 432.0F, 490.9F},  // C8
+        {36.2F, 45.1F, 53.3F, 61.9F, 68.7F, 78.7F, 87.9F, 96.2F},         // C1
+        {44.7F, 59.3F, 69.3F, 84.3F, 104.7F, 117.7F, 132.9F, 143.9F},     // C2
+        {57.1F, 78.9F, 106.3F, 128.8F, 157.4F, 179.4F, 207.4F, 226.8F},   // C4
+        {67.0F, 108.6F, 140.8F, 172.3F, 200.7F, 234.0F, 275.9F, 303.1F},  // C6
+        {79.2F, 127.1F, 165.9F, 205.2F, 245.1F, 285.9F, 333.3F, 377.8F},  // C8
     },
 };
 
-// C1 sampled-prefix head, same weights, 2026-10-23. Fixed token histories at
-// depths 0/4096/32768, median of three warmed complete cycles on ROCm 7.2.3;
-// matched ROCm 10.1 cycles agree within 2%. Full-head and concurrent costs
+// C1 sampled-prefix head, same pack and settings, 2026-11-20 (--sampled-head
+// --cost-audit 1; within 7% of the 2026-10-23 GGUF table). Fixed token
+// histories at depths 0/4096/32768, median of three warmed complete cycles on
+// ROCm 10.1. Full-head and concurrent costs
 // above remain separate: pricing the smaller head as a full projection
 // unnecessarily shortens profitable draft chains. See the model's ROCM.md.
 // Full target-row transfers also retain the original curve in the engine.
 inline constexpr float kMtpSampledSubsetMilliseconds[3][8] = {
-    {34.4F, 42.3F, 47.1F, 53.1F, 59.3F, 64.5F, 72.0F, 78.9F},
-    {35.1F, 42.9F, 48.7F, 54.8F, 60.8F, 66.5F, 74.3F, 81.5F},
-    {35.2F, 42.9F, 48.9F, 55.1F, 60.9F, 66.5F, 74.4F, 81.5F},
+    {35.3F, 42.0F, 48.6F, 56.3F, 60.7F, 68.0F, 74.9F, 80.1F},
+    {36.0F, 43.5F, 50.3F, 57.4F, 62.3F, 70.5F, 78.4F, 84.4F},
+    {36.2F, 43.6F, 50.2F, 57.1F, 62.7F, 71.0F, 78.9F, 85.1F},
 };
 
 // Seeded sampled policy uses fixed configured capacity for reproducibility;

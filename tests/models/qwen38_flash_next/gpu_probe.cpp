@@ -11,6 +11,9 @@
 // Independent predictor oracle: --mtp-model MTP.gguf --mtp-audit
 // MTP cost calibration: --mtp-model MTP.gguf --cost-audit C (0 = all)
 //                      [--depth N] (default: 0, 4096, 32768)
+//                      [--kv-cache-type fp16|kvarn-k4v4] (default fp16;
+//                      kvarn-k4v4 prices the serving K4V4 trunk cache)
+//                      [--batch T] (default 2048; serving uses 4224)
 // Greedy MTP chain trace: --mtp-model MTP.gguf --mtp-trace SUITE.json
 //                         --out TRACE.jsonl [--context N] [--max-tokens N]
 //                         [--prefill-step N] (default 2048, the HTTP
@@ -115,11 +118,13 @@ int main(int argc, char** argv) {
   std::uint32_t batch = 512;
   std::uint32_t context = 4096;
   bool context_given = false;
+  bool batch_given = false;
   std::string trace_suite;
   std::string trace_out;
   std::uint32_t trace_max_tokens = 256;
   std::uint32_t trace_prefill_step = 2048;
   float yarn_factor = 1.0F;
+  bool kvarn = false;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     auto next = [&]() -> std::string {
@@ -211,6 +216,7 @@ int main(int argc, char** argv) {
       const auto value = next();
       auto& count = arg == "--batch" ? batch : context;
       context_given |= arg == "--context";
+      batch_given |= arg == "--batch";
       const auto [end, ec] =
           std::from_chars(value.data(), value.data() + value.size(), count);
       if (ec != std::errc{} || end != value.data() + value.size() ||
@@ -227,6 +233,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--yarn-factor requires a number >= 1\n");
         return 2;
       }
+    } else if (arg == "--kv-cache-type") {
+      const auto value = next();
+      if (value != "fp16" && value != "kvarn-k4v4") {
+        std::fprintf(stderr, "--kv-cache-type requires fp16 or kvarn-k4v4\n");
+        return 2;
+      }
+      kvarn = value == "kvarn-k4v4";
     } else if (arg == "--dump") {
       dump_path = next();
     } else if (arg == "--logit-rows") {
@@ -301,6 +314,16 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "--cost-audit cannot be combined with other probes\n");
     return 2;
   }
+  if (cost_audit && batch_given) {
+    // The 16-row suffix and every width-8 verification row must fit.
+    std::uint32_t widest = 8;
+    if (!cost_concurrencies.empty())
+      widest = *std::ranges::max_element(cost_concurrencies);
+    if (batch < std::max<std::uint32_t>(16, 8 * widest)) {
+      std::fprintf(stderr, "--batch is too small for --cost-audit\n");
+      return 2;
+    }
+  }
   if ((cost_depth || sampled_head) && !cost_audit) {
     std::fprintf(stderr, "--depth and --sampled-head require --cost-audit\n");
     return 2;
@@ -338,8 +361,9 @@ int main(int argc, char** argv) {
     weights->config.rope_scaling = scaling;
   }
   const auto& c = weights->config;
-  if (cost_depth &&
-      (c.context_length < 96 || *cost_depth > c.context_length - 96)) {
+  // Sessions may reach the YaRN-extended executor context.
+  const auto audit_context = std::max(c.context_length, context);
+  if (cost_depth && (audit_context < 96 || *cost_depth > audit_context - 96)) {
     std::fprintf(stderr, "--depth leaves no room for the cost-audit suffix\n");
     return 2;
   }
@@ -386,6 +410,7 @@ int main(int argc, char** argv) {
   q::rocm::Executor::Options options;
   options.max_batch = batch;
   options.max_context = context;
+  options.kvarn = kvarn;
   options.max_logit_rows =
       !nll_path.empty()
           ? batch
@@ -395,7 +420,9 @@ int main(int argc, char** argv) {
     options.max_speculative = 8;
 
   if (cost_audit) {
-    options.max_batch = 2048;
+    // --batch matches serving's prefill capacity (4224 for Flash-Next).
+    if (!batch_given)
+      options.max_batch = 2048;
     options.max_logit_rows = 8;
   }
   auto executor =
