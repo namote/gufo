@@ -18,7 +18,8 @@ namespace gufo::server {
 /// `hc_mode` is the loaded HyperConnection mode (`--hc-mode`); each mode
 /// computes different states, so none restores into another.
 /// `recurrent_state` is the recurrent state storage (`--recurrent-state`,
-/// fp32 or fp16): its payloads differ in size and value.
+/// fp32 or fp16): its payloads differ in size and value. fp32 adds nothing,
+/// keeping the identity of checkpoints written before the option.
 [[nodiscard]] std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
     std::string_view artifact_fingerprint, std::string_view mtp_fingerprint,
     bool has_mtp, std::uint32_t max_context, std::uint32_t max_draft_tokens,

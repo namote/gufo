@@ -415,6 +415,17 @@ constexpr std::array<char, 8> kSnapshotKvarn6Magic{'Q', 'F', 'N', 'S',
                                                    'N', 'A', 'K', '6'};
 constexpr std::array<char, 8> kSnapshotMagic{'Q', 'F', 'N', 'S',
                                              'N', 'A', 'P', '6'};
+/// FP16 recurrent state (GdnStateFormat::kFp16): the same three layouts with
+/// 'H' for 'A', and two bytes per recurrent state element. FP32 payloads keep
+/// the magics, header and bytes they had before the format existed.
+constexpr std::array<char, 8> HalfStateMagic(std::array<char, 8> magic) {
+  magic[5] = 'H';
+  return magic;
+}
+constexpr std::array<char, 8> kHalfSnapshotKvarnMagic =
+    HalfStateMagic(kSnapshotKvarnMagic);
+constexpr std::array<char, 8> kHalfSnapshotKvarn6Magic =
+    HalfStateMagic(kSnapshotKvarn6Magic);
 
 /// Fixed header ahead of the section bytes. It carries every geometry
 /// value the section sizes derive from, so a payload of another artifact
@@ -425,8 +436,6 @@ struct SnapshotHeader {
   std::uint32_t full_attention_interval;
   std::uint32_t conv_elems;
   std::uint32_t state_elems;
-  /// Bytes per recurrent state element: 4 (FP32) or 2 (FP16 storage).
-  std::uint32_t state_element_bytes;
   std::uint32_t kv_row;
   std::uint32_t indexer_head_dim;
   std::uint32_t compress_ratio;
@@ -446,12 +455,18 @@ struct SnapshotHeader {
   float rope_beta_fast;
   float rope_beta_slow;
   std::array<std::int32_t, Config::kMaxPleNgram - 1> ngram_prev;
-  std::uint32_t reserved;
   std::uint64_t payload_bytes;
 };
 static_assert(std::is_trivially_copyable_v<SnapshotHeader>);
-// No implicit padding: payload_bytes stays 8-byte aligned.
-static_assert(offsetof(SnapshotHeader, payload_bytes) == 112);
+// The four rope fields must not push payload_bytes off its 8-byte alignment.
+// The FP32 header is unchanged from payload version 19.
+static_assert(offsetof(SnapshotHeader, payload_bytes) == 104);
+static_assert(sizeof(SnapshotHeader) == 112);
+
+/// Bytes per recurrent state element the header's magic records.
+constexpr std::uint64_t SnapshotStateElementBytes(const SnapshotHeader& h) {
+  return h.magic[5] == 'H' ? 2 : 4;
+}
 
 namespace {
 
@@ -461,12 +476,12 @@ SnapshotHeader MakeSnapshotHeader(const Config& c, bool has_mtp,
   h.magic = session.kvarn() ? (session.kvarn_bits() == 6 ? kSnapshotKvarn6Magic
                                                          : kSnapshotKvarnMagic)
                             : kSnapshotMagic;
+  if (session.state_format() == GdnStateFormat::kFp16)
+    h.magic = HalfStateMagic(h.magic);
   h.num_layers = c.num_layers;
   h.full_attention_interval = c.full_attention_interval;
   h.conv_elems = (c.ssm_conv_kernel - 1) * c.SsmConvChannels();
   h.state_elems = c.ssm_num_v_heads * c.ssm_head_dim * c.ssm_head_dim;
-  h.state_element_bytes =
-      static_cast<std::uint32_t>(GdnStateElementBytes(session.state_format()));
   h.kv_row = c.AttentionKvDim();
   h.indexer_head_dim = c.indexer_head_dim;
   h.compress_ratio = c.compress_ratio;
@@ -496,7 +511,6 @@ bool SameGeometry(const SnapshotHeader& h, const SnapshotHeader& mine) {
   return h.magic == mine.magic && h.num_layers == mine.num_layers &&
          h.full_attention_interval == mine.full_attention_interval &&
          h.conv_elems == mine.conv_elems && h.state_elems == mine.state_elems &&
-         h.state_element_bytes == mine.state_element_bytes &&
          h.kv_row == mine.kv_row &&
          h.indexer_head_dim == mine.indexer_head_dim &&
          h.compress_ratio == mine.compress_ratio && h.hc_dim == mine.hc_dim &&
@@ -536,7 +550,7 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
       if (!region(l != nullptr ? l->conv_state : nullptr,
                   std::uint64_t{h.conv_elems} * sizeof(float), "conv state") ||
           !region(l != nullptr ? l->state : nullptr,
-                  std::uint64_t{h.state_elems} * h.state_element_bytes,
+                  std::uint64_t{h.state_elems} * SnapshotStateElementBytes(h),
                   "recurrent state")) {
         return 0;
       }
@@ -557,8 +571,13 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
   for (std::uint32_t il = 0; il < h.num_layers; ++il) {
     if (((il + 1) % h.full_attention_interval) == 0) {
       const auto* at = attention(il);
-      if (h.magic == kSnapshotKvarnMagic || h.magic == kSnapshotKvarn6Magic) {
-        const int bits = h.magic == kSnapshotKvarn6Magic ? 6 : 4;
+      if (h.magic == kSnapshotKvarnMagic || h.magic == kSnapshotKvarn6Magic ||
+          h.magic == kHalfSnapshotKvarnMagic ||
+          h.magic == kHalfSnapshotKvarn6Magic) {
+        const int bits = h.magic == kSnapshotKvarn6Magic ||
+                                 h.magic == kHalfSnapshotKvarn6Magic
+                             ? 6
+                             : 4;
         // The sink, the records of every group before the position's group
         // floor (FinishKvarn keeps them quantized) and the FP16 tail rows
         // after it, all copied when captured: a rewind can requantize a

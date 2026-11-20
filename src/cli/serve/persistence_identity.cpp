@@ -52,9 +52,12 @@ std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
            << device_code_sha256 << '\n'
            << "context_tokens=" << max_context << '\n'
            << "position_policy=" << position_policy << '\n'
-           << "hc_mode=" << hc_mode << '\n'
-           << "recurrent_state=" << recurrent_state << '\n'
-           << "adapters=none\n";
+           << "hc_mode=" << hc_mode << '\n';
+  // FP32 state keeps the earlier identity, so its retained states still
+  // match; another storage names itself.
+  if (recurrent_state != "fp32")
+    identity << "recurrent_state=" << recurrent_state << '\n';
+  identity << "adapters=none\n";
   if (has_mtp) {
     identity << "draft_backend=qfn-mtp-v1\n"
              << "draft_artifact_id=" << scheme << ':' << mtp_fingerprint << '\n'

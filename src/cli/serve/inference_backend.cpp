@@ -2802,13 +2802,15 @@ public:
               models::qwen38_flash_next::RopePositionPolicy(
                   model_->config().rope_scaling),
               model_->IsNativeExl3(),
-              models::qwen38_flash_next::Session::kSnapshotPayloadVersion,
+              models::qwen38_flash_next::Session::SnapshotPayloadVersion(
+                  model_->RecurrentState()),
               device_code,
               models::qwen38_flash_next::HcModeName(model_->hc_mode()),
               models::qwen38_flash_next::rocm::GdnStateFormatName(
                   model_->RecurrentState())),
           .payload_version =
-              models::qwen38_flash_next::Session::kSnapshotPayloadVersion,
+              models::qwen38_flash_next::Session::SnapshotPayloadVersion(
+                  model_->RecurrentState()),
       };
       component_identity_ = persistence_->compatibility_identity;
     } else {
@@ -2822,11 +2824,10 @@ public:
                << '\n'
                << "hc_mode="
                << models::qwen38_flash_next::HcModeName(model_->hc_mode())
-               << '\n'
-               << "recurrent_state="
-               << models::qwen38_flash_next::rocm::GdnStateFormatName(
-                      model_->RecurrentState())
                << '\n';
+      if (model_->RecurrentState() ==
+          models::qwen38_flash_next::rocm::GdnStateFormat::kFp16)
+        identity << "recurrent_state=fp16\n";
       const auto canonical = identity.str();
       component_identity_.assign(canonical.begin(), canonical.end());
     }

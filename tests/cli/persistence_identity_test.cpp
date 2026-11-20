@@ -11,7 +11,9 @@
 
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/device_code_identity.hpp"
+#include "src/core/gguf_identity.hpp"
 #include "src/core/platform/mapped_file.hpp"
+#include "src/models/qwen/chat_template.hpp"
 
 namespace {
 
@@ -23,7 +25,8 @@ std::string Identity(std::string_view device_code,
                      std::string_view recurrent_state = "fp32") {
   const auto bytes = QwenFlashNextCompatibilityIdentity(
       std::string(64, 'a'), std::string(64, 'b'), true, 8192, 7, 2,
-      "absolute-v1", true, 20, device_code, hc_mode, recurrent_state);
+      "absolute-v1", true, recurrent_state == "fp16" ? 20 : 19, device_code,
+      hc_mode, recurrent_state);
   return {bytes.begin(), bytes.end()};
 }
 
@@ -32,9 +35,41 @@ void RecurrentStateChangesTheIdentity() {
   const std::string code(64, '1');
   const auto fp32 = Identity(code, "fp16", "fp32");
   const auto fp16 = Identity(code, "fp16", "fp16");
-  if (fp32 == fp16 ||
-      fp32.find("recurrent_state=fp32\n") == std::string::npos ||
-      fp16.find("recurrent_state=fp16\n") == std::string::npos) {
+  // The FP32 identity is byte for byte the one written before
+  // --recurrent-state existed (c3b09033), so its retained states still match.
+  const std::string scheme(gufo::core::kNativeIdentityScheme);
+  const std::string expected_fp32 =
+      "schema=gufo-text-continuation-v2\n"
+      "model_kind=qwen38-flash-next\n"
+      "artifact_id=" +
+      scheme + ':' + std::string(64, 'a') +
+      "\n"
+      "tokenizer=embedded-in-artifact\n"
+      "chat_template=qwen38-reasoning-compiled-v3\n"
+      "chat_template_reference_sha256=" +
+      std::string(
+          gufo::tokenization::QwenChatTemplate::OfficialTemplateSha256()) +
+      "\n"
+      "state_abi=qwen38-flash-next-rocm-session-v1\n"
+      "payload_layout=qfn-rocm-session-snapshot-v19\n"
+      "device_code=sha256:" +
+      code +
+      "\n"
+      "context_tokens=8192\n"
+      "position_policy=absolute-v1\n"
+      "hc_mode=fp16\n"
+      "adapters=none\n"
+      "draft_backend=qfn-mtp-v1\n"
+      "draft_artifact_id=" +
+      scheme + ':' + std::string(64, 'b') +
+      "\n"
+      "draft_max_tokens=7\n"
+      "draft_cost_concurrency=2\n";
+  if (fp32 != expected_fp32 ||
+      fp16.find("hc_mode=fp16\nrecurrent_state=fp16\nadapters=none\n") ==
+          std::string::npos ||
+      fp16.find("payload_layout=qfn-rocm-session-snapshot-v20\n") ==
+          std::string::npos) {
     std::cerr << "recurrent state is not part of the identity\n";
     std::exit(1);
   }

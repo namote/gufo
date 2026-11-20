@@ -310,9 +310,9 @@ ContinuationAdapter::ContinuationAdapter(std::shared_ptr<Model> model,
   put(model_->Kvarn() ? model_->KvarnBits() : 16);
   put(model_->Kvarn() ? hip::kKvarnGroupTokens : 0);
   put(static_cast<std::uint32_t>(hip::KvarnValueOrder::kTokenMajor));
-  put(Session::kSnapshotPayloadVersion);
-  put(static_cast<std::uint32_t>(
-      rocm::GdnStateElementBytes(model_->RecurrentState())));
+  // FP16 recurrent state has its own payload version; FP32 keeps the
+  // earlier identity bytes.
+  put(Session::SnapshotPayloadVersion(model_->RecurrentState()));
   put(context);
   put(mode == core::SessionMode::kSpeculative);
   put(model_->executor_->max_speculative());

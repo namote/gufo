@@ -775,13 +775,22 @@ __global__ void GdnKernel(const float* conv_out, const float* qn,
   StateT* S = state + static_cast<std::size_t>(h) * d * d + j * d + i0;
   float row[slice];
   static_assert(slice % 4 == 0);
+  // FP32 keeps its scalar loads and stores (unchanged code); FP16 moves
+  // four halves per access.
+  if constexpr (std::is_same_v<StateT, float>) {
 #pragma unroll
-  for (std::uint32_t i = 0; i < slice; i += 4) {
-    const float4 v = GdnLoadState4(S, i / 4);
-    row[i] = v.x;
-    row[i + 1] = v.y;
-    row[i + 2] = v.z;
-    row[i + 3] = v.w;
+    for (std::uint32_t i = 0; i < slice; ++i) {
+      row[i] = S[i];
+    }
+  } else {
+#pragma unroll
+    for (std::uint32_t i = 0; i < slice; i += 4) {
+      const float4 v = GdnLoadState4(S, i / 4);
+      row[i] = v.x;
+      row[i + 1] = v.y;
+      row[i + 2] = v.z;
+      row[i + 3] = v.w;
+    }
   }
   const float q_scale = rsqrtf(static_cast<float>(d));
   const bool deferred = (kBatch ? batch[blockIdx.z].state_snapshots.rows[0]
@@ -833,10 +842,16 @@ __global__ void GdnKernel(const float* conv_out, const float* qn,
       if (checkpoint.state != nullptr && t + 1 == checkpoint.tokens) {
         StateT* target = static_cast<StateT*>(checkpoint.state) +
                          static_cast<std::size_t>(h) * d * d + j * d + i0;
+        if constexpr (std::is_same_v<StateT, float>) {
 #pragma unroll
-        for (std::uint32_t i = 0; i < slice; i += 4)
-          GdnStoreState4(target, i / 4,
-                         {row[i], row[i + 1], row[i + 2], row[i + 3]});
+          for (std::uint32_t i = 0; i < slice; ++i)
+            target[i] = row[i];
+        } else {
+#pragma unroll
+          for (std::uint32_t i = 0; i < slice; i += 4)
+            GdnStoreState4(target, i / 4,
+                           {row[i], row[i + 1], row[i + 2], row[i + 3]});
+        }
       }
     }
     if (deferred) {
@@ -861,9 +876,16 @@ __global__ void GdnKernel(const float* conv_out, const float* qn,
   // commits the accepted prefix from the records (no 3 MB/layer snapshot).
   if (deferred)
     return;
+  if constexpr (std::is_same_v<StateT, float>) {
 #pragma unroll
-  for (std::uint32_t i = 0; i < slice; i += 4) {
-    GdnStoreState4(S, i / 4, {row[i], row[i + 1], row[i + 2], row[i + 3]});
+    for (std::uint32_t i = 0; i < slice; ++i) {
+      S[i] = row[i];
+    }
+  } else {
+#pragma unroll
+    for (std::uint32_t i = 0; i < slice; i += 4) {
+      GdnStoreState4(S, i / 4, {row[i], row[i + 1], row[i + 2], row[i + 3]});
+    }
   }
 }
 

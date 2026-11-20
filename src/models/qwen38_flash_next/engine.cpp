@@ -782,7 +782,7 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshotImpl(
   std::uint8_t* out = snapshot->data_.get();
   const SessionSnapshotHeader header{
       .magic = kSessionSnapshotMagic,
-      .version = kSnapshotPayloadVersion,
+      .version = SnapshotPayloadVersion(model_->RecurrentState()),
       .vocab_size = model_->VocabSize(),
       .token_count = token_count,
       .hidden_rows = hidden_rows,
@@ -847,7 +847,7 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
   }
   std::memcpy(&header, payload.data(), sizeof(header));
   if (header.magic != kSessionSnapshotMagic ||
-      header.version != kSnapshotPayloadVersion) {
+      header.version != SnapshotPayloadVersion(model_->RecurrentState())) {
     AssignError(error_msg, "session snapshot format is not supported");
     return false;
   }

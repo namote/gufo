@@ -215,26 +215,29 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
           half_initial[i] = __float2half_rn(state[i]);
           widened[i] = __half2float(half_initial[i]);
         }
-        const auto run = [&](void* device_state, q::GdnStateFormat format) {
+        const auto run = [&](void* device_state, q::GdnStateFormat format,
+                             std::uint32_t count, q::GdnCheckpoint checkpoint) {
           Upload(&d_conv_state, conv_state);
           q::GatedDeltaNet(
               d_qkv.get(), kChannels, d_z.get(), kZ, d_alpha_beta.get(),
               d_conv_w.get(), d_a.get(), d_dt.get(), d_norm_w.get(),
               d_conv_state.get(), d_scratch.get(), d_qn.get(), d_kn.get(),
-              d_raw.get(), device_state, d_out.get(), nullptr, {}, {}, kTokens,
+              d_raw.get(), device_state, d_out.get(), nullptr, {}, {}, count,
               kKHeads, kVHeads, kDim, kKernel, route == 1, false, kEps, nullptr,
-              nullptr, {}, 0, nullptr, nullptr, false, nullptr, format);
+              nullptr, checkpoint, 0, nullptr, nullptr, false, nullptr, format);
           CheckHip(hipDeviceSynchronize(), "GDN FP16 state synchronization");
           return Download(&d_out, kOut);
         };
         Upload(&d_state, widened);
-        const auto fp32_out = run(d_state.get(), q::GdnStateFormat::kFp32);
+        const auto fp32_out =
+            run(d_state.get(), q::GdnStateFormat::kFp32, kTokens, {});
         const auto fp32_state = Download(&d_state, kStateCount);
         HipBuffer<__half> d_half_state(kStateCount);
         CheckHip(hipMemcpy(d_half_state.get(), half_initial.data(),
                            d_half_state.bytes(), hipMemcpyHostToDevice),
                  "FP16 state upload");
-        const auto fp16_out = run(d_half_state.get(), q::GdnStateFormat::kFp16);
+        const auto fp16_out =
+            run(d_half_state.get(), q::GdnStateFormat::kFp16, kTokens, {});
         std::vector<__half> fp16_state(kStateCount);
         CheckHip(hipMemcpy(fp16_state.data(), d_half_state.get(),
                            d_half_state.bytes(), hipMemcpyDeviceToHost),
@@ -250,6 +253,35 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
           if (std::memcmp(&expected, &fp16_state[i], sizeof(__half)) != 0)
             throw std::runtime_error("GDN FP16 state is not rounded once");
         }
+        // An FP16 in-pass checkpoint holds the state a prefix-only pass
+        // stores, and does not change the full pass.
+        const auto prefix = std::max(1U, kTokens / 2);
+        const auto upload_half = [&] {
+          CheckHip(hipMemcpy(d_half_state.get(), half_initial.data(),
+                             d_half_state.bytes(), hipMemcpyHostToDevice),
+                   "FP16 state upload");
+        };
+        const auto download_half = [](HipBuffer<__half>& buffer) {
+          std::vector<std::uint16_t> bits(buffer.bytes() / 2);
+          CheckHip(hipMemcpy(bits.data(), buffer.get(), buffer.bytes(),
+                             hipMemcpyDeviceToHost),
+                   "FP16 download");
+          return bits;
+        };
+        HipBuffer<__half> half_checkpoint(kStateCount);
+        HipBuffer<float> conv_checkpoint(kConvState);
+        upload_half();
+        (void)run(d_half_state.get(), q::GdnStateFormat::kFp16, kTokens,
+                  {half_checkpoint.get(), conv_checkpoint.get(), prefix});
+        const auto full = download_half(d_half_state);
+        const auto captured = download_half(half_checkpoint);
+        upload_half();
+        (void)run(d_half_state.get(), q::GdnStateFormat::kFp16, prefix, {});
+        std::vector<std::uint16_t> unchanged(kStateCount);
+        std::memcpy(unchanged.data(), fp16_state.data(),
+                    kStateCount * sizeof(std::uint16_t));
+        if (captured != download_half(d_half_state) || full != unchanged)
+          throw std::runtime_error("GDN FP16 checkpoint differs");
       }
       constexpr std::size_t kCheckpointGuard = 16;
       constexpr float kCheckpointSentinel = 12345.0F;
@@ -514,31 +546,67 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
           volatile float rounded = a * b;
           return rounded;
         };
-        for (std::size_t index = 0; index < kStateCount; ++index) {
-          const auto h = index / (kDim * kDim);
-          const auto j = (index / kDim) % kDim;
-          const auto k = index % kDim;
-          float value = state[index];
-          for (std::uint32_t t = 0; t < keep; ++t) {
-            const auto* update =
-                saved_states.data() +
-                (t + 1 == kTokens && t != 0
-                     ? state_offsets[0] +
-                           q::GdnRollbackRecordFloats(kKHeads, kVHeads, kDim)
-                     : state_offsets[t]);
-            const float key = update[(h % kKHeads) * kDim + k];
-            const float decay = update[kKHeads * kDim + h];
-            const float beta = update[kKHeads * kDim + kVHeads + h];
-            const float error =
-                update[kKHeads * kDim + 2 * kVHeads + h * kDim + j];
-            const float correction = product(error, key);
-            value = (k + 1) % 32 == 0
-                        ? std::fma(value, decay, product(beta, correction))
-                        : std::fma(beta, correction, product(value, decay));
+        const auto oracle = [&](const std::vector<float>& initial) {
+          std::vector<float> result(kStateCount);
+          for (std::size_t index = 0; index < kStateCount; ++index) {
+            const auto h = index / (kDim * kDim);
+            const auto j = (index / kDim) % kDim;
+            const auto k = index % kDim;
+            float value = initial[index];
+            for (std::uint32_t t = 0; t < keep; ++t) {
+              const auto* update =
+                  saved_states.data() +
+                  (t + 1 == kTokens && t != 0
+                       ? state_offsets[0] +
+                             q::GdnRollbackRecordFloats(kKHeads, kVHeads, kDim)
+                       : state_offsets[t]);
+              const float key = update[(h % kKHeads) * kDim + k];
+              const float decay = update[kKHeads * kDim + h];
+              const float beta = update[kKHeads * kDim + kVHeads + h];
+              const float error =
+                  update[kKHeads * kDim + 2 * kVHeads + h * kDim + j];
+              const float correction = product(error, key);
+              value = (k + 1) % 32 == 0
+                          ? std::fma(value, decay, product(beta, correction))
+                          : std::fma(beta, correction, product(value, decay));
+            }
+            result[index] = value;
           }
-          if (std::memcmp(&value, &expected_state[index], sizeof(float)))
-            throw std::runtime_error(
-                "GDN changed its rounded-product contract");
+          return result;
+        };
+        const auto expected = oracle(state);
+        if (std::memcmp(expected.data(), expected_state.data(),
+                        kStateCount * sizeof(float)))
+          throw std::runtime_error("GDN changed its rounded-product contract");
+        {
+          // FP16 state: the commit widens the stored state, replays the FP32
+          // records and rounds once (saturated, NaN kept).
+          std::vector<__half> half(kStateCount);
+          std::vector<float> widened(kStateCount);
+          for (std::size_t i = 0; i < kStateCount; ++i) {
+            half[i] = __float2half_rn(state[i]);
+            widened[i] = __half2float(half[i]);
+          }
+          const auto rounded = oracle(widened);
+          q::RollbackRows rows;
+          for (std::size_t i = 0; i < saved; ++i)
+            rows.rows[i] = state_snaps.get() + state_offsets[i];
+          HipBuffer<__half> d_half(kStateCount);
+          CheckHip(hipMemcpy(d_half.get(), half.data(), d_half.bytes(),
+                             hipMemcpyHostToDevice),
+                   "FP16 restore upload");
+          q::RestoreGdnState(d_half.get(), q::GdnStateFormat::kFp16, rows, keep,
+                             kTokens, kKHeads, kVHeads, nullptr);
+          CheckHip(hipMemcpy(half.data(), d_half.get(), d_half.bytes(),
+                             hipMemcpyDeviceToHost),
+                   "FP16 restore download");
+          for (std::size_t i = 0; i < kStateCount; ++i) {
+            const float x = rounded[i];
+            const __half want = __float2half_rn(
+                std::isnan(x) ? x : std::clamp(x, -65504.0F, 65504.0F));
+            if (std::memcmp(&want, &half[i], sizeof(__half)) != 0)
+              throw std::runtime_error("GDN FP16 commit is not rounded once");
+          }
         }
         q::RollbackRows replay;
         for (std::size_t i = 0; i < saved; ++i)

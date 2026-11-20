@@ -96,7 +96,8 @@ with one KV type are never restored into another.
 
 `--recurrent-state fp32|fp16|bf16` selects how the GDN/DeltaNet recurrent
 state is stored; the arithmetic stays FP32. `fp16` widens the state on load
-and rounds it once per pass on store, saturated to the finite FP16 range, and
+and rounds it once per pass on store (once per 8-row segment of a wide
+Flash-Next verification), saturated to the finite FP16 range, and
 halves the state (96 MiB less per Qwen3.8-27B session, 108 to 54 MiB per
 Flash-Next session; checkpoints and rewind points shrink the same way). `bf16`
 is the rejected #138 route and Qwen3.8-27B only. The default stays `fp32` until the quality pass. The storage is part
@@ -104,7 +105,10 @@ of the continuation identity (`recurrent_storage=`, the state ABI and the
 recurrent component's layout version: FP32 1, BF16 2, FP16 3), so a checkpoint
 of one storage is a cache miss for another. Flash-Next records it as
 `recurrent_state=` in the disk identity, a `+fp16-recurrent` state ABI,
-recurrent component layout version 2 and snapshot payload version 20. Quality
+recurrent component layout version 2 and snapshot payload version 20; FP32
+keeps payload version 19 and its earlier identity, so existing checkpoints
+stay valid. Because FP16 rounds per pass, a checkpoint restore plus suffix or
+an MTP verification is not bit-equal to a cold single pass. Quality
 tools: `qwen27b_state_compare` (tests/models/qwen27b/state_compare.cpp) and
 `qwen38_flash_next_gpu_probe --state-compare` (tests/models/qwen38_flash_next/gpu_probe.cpp).
 

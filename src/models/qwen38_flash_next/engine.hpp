@@ -458,8 +458,17 @@ public:
   [[nodiscard]] NgramTotals NgramRowTotals() const noexcept;
 
   /// Compatibility version; bump on payload or inference arithmetic changes.
-  /// 20: the executor header records the recurrent state element size.
-  static constexpr std::uint32_t kSnapshotPayloadVersion = 20;
+  static constexpr std::uint32_t kSnapshotPayloadVersion = 19;
+  /// FP16 recurrent state payloads (rocm::GdnStateFormat::kFp16): half the
+  /// recurrent bytes and their own executor header magic. FP32 payloads keep
+  /// kSnapshotPayloadVersion, so existing FP32 checkpoints stay valid.
+  static constexpr std::uint32_t kFp16StateSnapshotPayloadVersion = 20;
+  [[nodiscard]] static constexpr std::uint32_t SnapshotPayloadVersion(
+      rocm::GdnStateFormat format) noexcept {
+    return format == rocm::GdnStateFormat::kFp16
+               ? kFp16StateSnapshotPayloadVersion
+               : kSnapshotPayloadVersion;
+  }
   /// Bytes a snapshot of the current context occupies.
   [[nodiscard]] std::uint64_t SnapshotBytes() const;
   [[nodiscard]] std::uint64_t PrefillCheckpointBytes(

@@ -1315,6 +1315,9 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
               // verifications would have committed them. The live
               // convolution history already holds the earlier rows; keep
               // it for a rollback to this segment's first row.
+              // FP16 state rounds this start once per segment, so a wide
+              // verification rounds at every kWideSegmentRows boundary, not
+              // once per ForwardWide; RollbackWide replays the same chain.
               auto& seg = wide_segments_[s - 1];
               void* start = wide_state_[il];
               const auto& previous = s == 1 ? live.state_snapshots

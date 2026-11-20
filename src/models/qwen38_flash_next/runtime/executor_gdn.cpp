@@ -222,6 +222,7 @@ bool Executor::RollbackWide(Session& session, std::uint32_t keep,
       continue;
     // The live state holds its value before the pass. Replay the same
     // commits wide_state_ received, then the kept part of the last segment.
+    // With FP16 state each commit rounds once, as each segment start did.
     if (segment == last) {
       if (!Check(hipMemcpyAsync(l.state, wide_state_[il], state_bytes,
                                 hipMemcpyDeviceToDevice, stream_),
