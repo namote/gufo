@@ -76,7 +76,7 @@ Text serving defaults match llama.cpp for context and generation length:
 | `--context` | `0`: native context from model metadata, per session |
 | `--enable-yarn` | Off; Flash-Next requires it for `--context` above 262144 |
 | `--kv-cache-type` | Model default: `kvarn-k4v2` on Qwen3.8-27B, `fp16` on Flash-Next, FP8 (not selectable) on DeepSeek |
-| `--recurrent-state` | `fp32`; Qwen3.8-27B also takes `fp16` and `bf16` |
+| `--recurrent-state` | `fp32`; Qwen3.8-27B takes `fp16` and `bf16`, Flash-Next `fp16` |
 | `--hc-mode` | `fp16`; Flash-Next only |
 | `--max-tokens` | `-1`: until EOS or remaining context is exhausted |
 | `--sessions` | `1` |
@@ -97,12 +97,16 @@ with one KV type are never restored into another.
 `--recurrent-state fp32|fp16|bf16` selects how the GDN/DeltaNet recurrent
 state is stored; the arithmetic stays FP32. `fp16` widens the state on load
 and rounds it once per pass on store, saturated to the finite FP16 range, and
-halves the state (96 MiB less per Qwen3.8-27B session). `bf16` is the rejected
-#138 route. The default stays `fp32` until the quality pass. The storage is part
+halves the state (96 MiB less per Qwen3.8-27B session, 108 to 54 MiB per
+Flash-Next session; checkpoints and rewind points shrink the same way). `bf16`
+is the rejected #138 route and Qwen3.8-27B only. The default stays `fp32` until the quality pass. The storage is part
 of the continuation identity (`recurrent_storage=`, the state ABI and the
 recurrent component's layout version: FP32 1, BF16 2, FP16 3), so a checkpoint
-of one storage is a cache miss for another. Qwen3.8-27B quality:
-`qwen27b_state_compare` (tests/models/qwen27b/state_compare.cpp).
+of one storage is a cache miss for another. Flash-Next records it as
+`recurrent_state=` in the disk identity, a `+fp16-recurrent` state ABI,
+recurrent component layout version 2 and snapshot payload version 20. Quality
+tools: `qwen27b_state_compare` (tests/models/qwen27b/state_compare.cpp) and
+`qwen38_flash_next_gpu_probe --state-compare` (tests/models/qwen38_flash_next/gpu_probe.cpp).
 
 Qwen chat prompts are bounded by the session context, not a fixed size: the
 rendered template may use up to 128 bytes per context token (at least 1 MiB).

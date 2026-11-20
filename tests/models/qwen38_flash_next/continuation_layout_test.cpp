@@ -48,6 +48,38 @@ void Reject(F&& f) {
   Require(rejected, "invalid geometry or frontier accepted");
 }
 
+// FP16 recurrent state: half the recurrent bytes under layout version 2.
+void CheckFp16RecurrentState(bool mtp) {
+  const auto c = ProductionGeometry();
+  const qfn::ContinuationLayout fp32(c, mtp, 100000, 8);
+  const qfn::ContinuationLayout fp16(c, mtp, 100000, 8, false, 4,
+                                     qfn::rocm::GdnStateFormat::kFp16);
+  const std::size_t state =
+      std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
+  std::size_t layers = 0;
+  Require(fp32.Components().size() == fp16.Components().size(),
+          "FP16 state changed the inventory");
+  for (std::size_t i = 0; i < fp16.Components().size(); ++i) {
+    const auto& a = fp32.Components()[i];
+    const auto& b = fp16.Components()[i];
+    if (b.part == qfn::ContinuationPart::kRecurrent) {
+      ++layers;
+      Require(a.descriptor.state_bytes == state * 4 &&
+                  b.descriptor.state_bytes == state * 2 &&
+                  a.descriptor.layout_version == 1 &&
+                  b.descriptor.layout_version == 2,
+              "FP16 recurrent component bytes or version");
+    } else {
+      Require(a.descriptor.state_bytes == b.descriptor.state_bytes &&
+                  a.descriptor.layout_version == b.descriptor.layout_version,
+              "FP16 state changed another component");
+    }
+  }
+  Require(layers == 36 &&
+              fp32.PrivateBytes() - fp16.PrivateBytes() == layers * state * 2,
+          "FP16 private bytes");
+}
+
 void Check(bool mtp) {
   const auto c = ProductionGeometry();
   const qfn::ContinuationLayout layout(c, mtp, 100000, 8);
@@ -228,6 +260,7 @@ int main() {
     Check(false);
     Check(true);
     for (const auto mtp : {false, true}) {
+      CheckFp16RecurrentState(mtp);
       CheckKvarn(mtp);
       CheckKvarn(mtp, 6);
       CheckExtendedContext(mtp);

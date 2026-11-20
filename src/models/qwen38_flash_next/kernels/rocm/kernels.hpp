@@ -12,6 +12,7 @@
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/hip/ops/prefill_fp16.hpp"
 #include "src/models/qwen/vision/rope.hpp"
+#include "src/models/qwen38_flash_next/recurrent_state.hpp"
 #include "src/models/qwen38_flash_next/rope_scaling.hpp"
 
 /// Model-private HIP launchers for everything outside the quantized GEMM
@@ -241,10 +242,10 @@ constexpr std::size_t GdnRollbackRowFloats(std::uint32_t row,
   return (row == 0 ? 2 : 1) * GdnRollbackRecordFloats(k_heads, v_heads, dim);
 }
 /// Commits `keep` (1..n) tokens of a deferred n-token speculative batch to
-/// `state`, the arithmetic of the recurrence (bit for bit its final state
-/// for keep == n).
-void RestoreGdnState(float* state, RollbackRows snapshots, std::uint32_t keep,
-                     std::uint32_t n, std::uint32_t k_heads,
+/// `state` (stored as `format`), the arithmetic of the recurrence (bit for
+/// bit its final state for keep == n).
+void RestoreGdnState(void* state, GdnStateFormat format, RollbackRows snapshots,
+                     std::uint32_t keep, std::uint32_t n, std::uint32_t k_heads,
                      std::uint32_t v_heads, hipStream_t stream);
 
 /// GGUF type ids the runtime accepts for the small-matrix and lookup paths.
@@ -645,7 +646,7 @@ void HistoryPrefix(const float* in, std::uint32_t stride, const float* history,
                    hipStream_t stream);
 
 struct GdnCheckpoint {
-  float* state = nullptr;
+  void* state = nullptr;  ///< in the pass's GdnStateFormat
   float* history = nullptr;
   std::uint32_t tokens = 0;
 };
@@ -665,6 +666,7 @@ struct GdnCheckpoint {
 /// until RestoreGdnState commits the kept prefix.
 /// Scratch: `conv_scratch` ((n_tokens + kernel) * channels), `qn`/`kn`
 /// (n_tokens * k_heads * d), `raw` (n_tokens * v_heads * d).
+/// `state` and `checkpoint.state` are stored as `state_format`.
 /// `qkv` rows are `qkv_stride` floats apart and `z` rows `z_stride`, so a
 /// stacked [qkv|z] projection feeds both without unpacking. A non-null
 /// `out_q8` receives the rows quantized into the W8A8 tiled layout
@@ -682,7 +684,7 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    std::uint32_t z_stride, const float* alpha_beta,
                    const float* conv_w, const float* a, const float* dt,
                    const float* norm_w, float* conv_state, float* conv_scratch,
-                   float* qn, float* kn, float* raw, float* state, float* out,
+                   float* qn, float* kn, float* raw, void* state, float* out,
                    void* out_q8, RollbackRows state_snapshots,
                    RollbackRows conv_snapshots, std::uint32_t n_tokens,
                    std::uint32_t k_heads, std::uint32_t v_heads,
@@ -691,7 +693,8 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    __half* out_half = nullptr, GdnCheckpoint checkpoint = {},
                    std::uint32_t out_half_stride = 0, void* out_q8_1 = nullptr,
                    hipEvent_t z_ready = nullptr, bool stable_conv = false,
-                   Exl3InputSlabs* out_slabs = nullptr);
+                   Exl3InputSlabs* out_slabs = nullptr,
+                   GdnStateFormat state_format = GdnStateFormat::kFp32);
 
 /// Private rows for one request in a decode batch. Scratch regions and all
 /// recurrent/history/rollback buffers must be disjoint between requests.
@@ -704,7 +707,7 @@ struct GdnBatchItem {
   float* qn;
   float* kn;
   float* raw;
-  float* state;
+  void* state;  ///< in the batch's GdnStateFormat
   float* out;
   RollbackRows state_snapshots;
   RollbackRows conv_snapshots;
@@ -720,7 +723,8 @@ bool GatedDeltaNetBatch(const GdnBatchItem* items, std::uint32_t count,
                         const float* conv_w, const float* a, const float* dt,
                         const float* norm_w, std::uint32_t k_heads,
                         std::uint32_t v_heads, float eps, hipStream_t stream,
-                        bool stable_conv = false);
+                        bool stable_conv = false,
+                        GdnStateFormat state_format = GdnStateFormat::kFp32);
 
 /// Splits the interleaved [q|gate] projection (rows `qg_stride` apart) into
 /// q [t][heads][d] and gate [t][heads*d]. With non-null `k`, the row

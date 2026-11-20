@@ -61,7 +61,7 @@ void RegisterRecurrentStateOption(
 
 /// Resolves the recurrent state storage for a GGUF architecture into
 /// `*resolved` (fp32 when absent). Qwen3.8-27B takes fp32, fp16 and bf16;
-/// Flash-Next fp32 only. Other models refuse an explicit value: they
+/// Flash-Next fp32 and fp16. Other models refuse an explicit value: they
 /// have no recurrent state. There is no fallback.
 [[nodiscard]] bool ResolveRecurrentState(
     std::string_view architecture,

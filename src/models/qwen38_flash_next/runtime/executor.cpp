@@ -888,7 +888,8 @@ void Session::Reset(bool reuse_mtp) {
       zero(l.conv_state, static_cast<std::size_t>(c.ssm_conv_kernel - 1) *
                              c.SsmConvChannels() * sizeof(float));
       zero(l.state, static_cast<std::size_t>(c.ssm_num_v_heads) *
-                        c.ssm_head_dim * c.ssm_head_dim * sizeof(float));
+                        c.ssm_head_dim * c.ssm_head_dim *
+                        GdnStateElementBytes(state_format_));
     }
   }
   blocks_ = 0;
@@ -941,6 +942,12 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   if (options.kvarn_bits != 4 && options.kvarn_bits != 6) {
     if (error_msg)
       *error_msg = "KVarN bits must be 4 or 6";
+    return nullptr;
+  }
+  if (options.recurrent_state != GdnStateFormat::kFp32 &&
+      options.recurrent_state != GdnStateFormat::kFp16) {
+    if (error_msg)
+      *error_msg = "recurrent state must be fp32 or fp16";
     return nullptr;
   }
 
@@ -1667,6 +1674,7 @@ std::unique_ptr<Session> Executor::CreateSession(
       c.num_layers / c.full_attention_interval;
   const std::size_t fp16_layer =
       std::size_t{hip::kKvarnFp16Tokens} * c.AttentionKvDim();
+  s->state_format_ = options_.recurrent_state;
   if (options_.kvarn) {
     s->kvarn_ = true;
     s->kvarn_bits_ = options_.kvarn_bits;
@@ -1681,14 +1689,13 @@ std::unique_ptr<Session> Executor::CreateSession(
   std::uint32_t kv_slot = 0;
   const std::size_t conv_elems =
       static_cast<std::size_t>(c.ssm_conv_kernel - 1) * c.SsmConvChannels();
-  const std::size_t state_elems = static_cast<std::size_t>(c.ssm_num_v_heads) *
-                                  c.ssm_head_dim * c.ssm_head_dim;
   for (std::uint32_t il = 0; il < c.num_layers; ++il) {
     if (c.IsLinearLayer(il)) {
       auto& l = s->linear_[il];
       l.conv_state =
           Alloc<float>(a, conv_elems, error_msg, &s->allocated_bytes_);
-      l.state = Alloc<float>(a, state_elems, error_msg, &s->allocated_bytes_);
+      l.state = Alloc<std::uint8_t>(a, GdnStateBytes(), error_msg,
+                                    &s->allocated_bytes_);
     } else {
       auto& at = s->attention_[il];
       if (layout.fp16_trunk) {
@@ -1917,8 +1924,9 @@ std::size_t Executor::SessionBytes(
   const std::size_t hidden_rows =
       std::size_t{std::max(options_.max_speculative, max_copy_rows())} + 1;
   return ((linear * conv + ple) * (rollback_depth + 1) +
-          linear * (state + rollback_state)) *
+          linear * rollback_state) *
              sizeof(float) +
+         linear * state * GdnStateElementBytes(options_.recurrent_state) +
          kv_blocks + attention * index + sizeof(Session::Control) +
          (mode == core::SessionMode::kSpeculative
               ? index + hidden_rows * c.HcDim() * sizeof(float) +
@@ -1944,7 +1952,9 @@ std::size_t Executor::DeferredScratchBytes() const {
       std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
   const auto ple =
       c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
-  const auto mutable_bytes = (linear * (conv + state) + ple) * sizeof(float);
+  const auto mutable_bytes =
+      (linear * conv + ple) * sizeof(float) +
+      linear * state * GdnStateElementBytes(options_.recurrent_state);
   if (!checkpoint_storage_) {
     bytes +=
         mutable_bytes + (has_mtp() ? std::size_t{options_.max_speculative} *
@@ -1959,16 +1969,22 @@ std::size_t Executor::DeferredScratchBytes() const {
     bytes += (wide_segments - 1 - wide_segments_.size()) * WideSegmentFloats() *
              sizeof(float);
   if (wide_segments > 1 && wide_state_.empty())
-    bytes += WideStateFloats() * sizeof(float);
+    bytes += WideStateBytes();
   // Committed spare blocks for captures, whether or not they exist yet.
   return bytes + SnapshotAllocator::SpareBytes(mutable_bytes);
 }
 
-std::size_t Executor::WideStateFloats() const {
+std::size_t Executor::GdnStateBytes() const noexcept {
+  const auto& c = config();
+  return std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim *
+         GdnStateElementBytes(options_.recurrent_state);
+}
+
+std::size_t Executor::WideStateBytes() const {
   const auto& c = config();
   const std::size_t linear =
       c.num_layers - c.num_layers / c.full_attention_interval;
-  return linear * c.ssm_num_v_heads * c.ssm_head_dim * c.ssm_head_dim;
+  return linear * GdnStateBytes();
 }
 
 std::size_t Executor::WideSegmentFloats() const {
@@ -2003,19 +2019,17 @@ bool Executor::EnsureWideSegments(std::uint32_t segments,
     return false;
   if (wide_state_.empty()) {
     float* allocation = nullptr;
-    if (!Check(
-            hip::AllocateDevice(&allocation, WideStateFloats() * sizeof(float)),
-            "wide verification state", error_msg))
+    if (!Check(hip::AllocateDevice(&allocation, WideStateBytes()),
+               "wide verification state", error_msg))
       return false;
     wide_allocations_.push_back(allocation);
     wide_state_.assign(c.num_layers, nullptr);
-    const std::size_t state =
-        std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
+    auto* next = reinterpret_cast<std::uint8_t*>(allocation);
     for (std::uint32_t il = 0; il < c.num_layers; ++il) {
       if (!c.IsLinearLayer(il))
         continue;
-      wide_state_[il] = allocation;
-      allocation += state;
+      wide_state_[il] = next;
+      next += GdnStateBytes();
     }
   }
   const std::size_t conv =

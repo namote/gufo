@@ -19,6 +19,15 @@
 //                         [--prefill-step N] (default 2048, the HTTP
 //                         scheduler's single-session admission passes)
 //                         (mtp_trace.cpp; uses the production Session)
+// Recurrent-state quality (plan/upstream-sync2/V3-4-BRIEF.md):
+//   --prompt-file P --tokens N --state-compare G [--batch B] [--context C]
+//   [--kv-cache-type fp16|kvarn-k4v4] [--json OUT]
+//   runs the first N prompt tokens in B-token prefill passes and G greedy
+//   decode steps on FP32 recurrent state, then teacher-forces the same
+//   tokens on FP16 state, and prints full-vocabulary logit RMSE, KL and top-1
+//   agreement per pass end and decode step, plus the first diverging greedy
+//   step (tests/support/logit_drift.hpp). --recurrent-state fp16 runs every
+//   other probe on FP16 state.
 // Matched-token decode: --prompt-file P --decode-file C --dump rows.bin
 //                       [--decode-ids ids.bin] (prefill P, then feed C's
 //                       tokens one at a time; row i predicts the token
@@ -33,6 +42,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -49,6 +59,7 @@
 #include "src/models/qwen38_flash_next/runtime/executor.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
 #include "tests/models/qwen38_flash_next/mtp_trace.hpp"
+#include "tests/support/logit_drift.hpp"
 
 namespace q = gufo::models::qwen38_flash_next;
 
@@ -125,6 +136,10 @@ int main(int argc, char** argv) {
   std::uint32_t trace_prefill_step = 2048;
   float yarn_factor = 1.0F;
   bool kvarn = false;
+  auto recurrent_state = q::rocm::GdnStateFormat::kFp32;
+  std::uint32_t state_compare = 0;  ///< --state-compare: greedy steps
+  std::uint32_t prompt_tokens = 0;  ///< --tokens: prompt prefix (0: all)
+  std::string json_path;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     auto next = [&]() -> std::string {
@@ -255,6 +270,27 @@ int main(int argc, char** argv) {
       every_pass_rows = rows;
     } else if (arg == "--nll") {
       nll_path = next();
+    } else if (arg == "--recurrent-state") {
+      const auto value = next();
+      if (value != "fp32" && value != "fp16") {
+        std::fprintf(stderr, "--recurrent-state requires fp32 or fp16\n");
+        return 2;
+      }
+      recurrent_state = value == "fp16" ? q::rocm::GdnStateFormat::kFp16
+                                        : q::rocm::GdnStateFormat::kFp32;
+    } else if (arg == "--state-compare" || arg == "--tokens") {
+      const auto value = next();
+      std::uint32_t count = 0;
+      const auto [end, ec] =
+          std::from_chars(value.data(), value.data() + value.size(), count);
+      if (ec != std::errc{} || end != value.data() + value.size() ||
+          count == 0) {
+        std::fprintf(stderr, "%s requires a positive integer\n", arg.c_str());
+        return 2;
+      }
+      (arg == "--tokens" ? prompt_tokens : state_compare) = count;
+    } else if (arg == "--json") {
+      json_path = next();
     } else {
       std::fprintf(stderr, "unknown argument %s\n", arg.c_str());
       return 2;
@@ -294,6 +330,18 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "--decode-file requires a nonempty continuation and cannot "
                  "be combined with other probes; --decode-ids requires it\n");
+    return 2;
+  }
+  if (state_compare != 0 &&
+      (decode || reference || mtp_audit || cost_audit || !dump_path.empty() ||
+       !nll_path.empty() || every_pass_rows != 0 ||
+       recurrent_state != q::rocm::GdnStateFormat::kFp32)) {
+    std::fprintf(stderr,
+                 "--state-compare compares fp32 with fp16 state on its own\n");
+    return 2;
+  }
+  if ((prompt_tokens != 0 || !json_path.empty()) && state_compare == 0) {
+    std::fprintf(stderr, "--tokens and --json require --state-compare\n");
     return 2;
   }
   if ((mtp_audit || cost_audit) && mtp_path.empty()) {
@@ -411,6 +459,7 @@ int main(int argc, char** argv) {
   options.max_batch = batch;
   options.max_context = context;
   options.kvarn = kvarn;
+  options.recurrent_state = recurrent_state;
   options.max_logit_rows =
       !nll_path.empty()
           ? batch
@@ -424,6 +473,114 @@ int main(int argc, char** argv) {
     if (!batch_given)
       options.max_batch = 2048;
     options.max_logit_rows = 8;
+  }
+  if (state_compare != 0) {
+    std::vector<std::int32_t> ids;
+    for (auto id : tokenizer->Encode(prompt))
+      ids.push_back(static_cast<std::int32_t>(id));
+    if (prompt_tokens != 0) {
+      if (ids.size() < prompt_tokens) {
+        std::fprintf(stderr, "the prompt holds only %zu tokens\n", ids.size());
+        return 2;
+      }
+      ids.resize(prompt_tokens);
+    }
+    if (ids.empty() || ids.size() + state_compare > context) {
+      std::fprintf(stderr, "prompt and steps must fit in --context\n");
+      return 2;
+    }
+    options.max_logit_rows = 1;
+    // One route: each prefill pass's last row, then each decode step's row.
+    // Empty `forced` decodes greedily and records the tokens in `*greedy`.
+    const auto run = [&](q::rocm::GdnStateFormat format,
+                         std::span<const std::int32_t> forced,
+                         std::vector<std::int32_t>* greedy)
+        -> std::optional<std::vector<std::vector<float>>> {
+      auto route = options;
+      route.recurrent_state = format;
+      auto exec =
+          q::rocm::Executor::Create(*device, ngram.get(), route, &error);
+      auto session =
+          exec ? exec->CreateSession(gufo::core::SessionMode::kAutoregressive,
+                                     context, &error)
+               : nullptr;
+      if (!session) {
+        std::fprintf(stderr, "state compare setup failed: %s\n", error.c_str());
+        return std::nullopt;
+      }
+      std::vector<std::vector<float>> rows;
+      for (std::size_t off = 0; off < ids.size(); off += batch) {
+        const std::size_t n = std::min<std::size_t>(batch, ids.size() - off);
+        const std::size_t next =
+            std::min<std::size_t>(batch, ids.size() - off - n);
+        std::vector<float> row(c.vocab_size);
+        if (!exec->Forward(
+                *session, std::span<const std::int32_t>(ids.data() + off, n), 1,
+                row.data(), q::rocm::Executor::ForwardMode::kPrefill, &error,
+                nullptr,
+                std::span<const std::int32_t>(ids.data() + off + n, next))) {
+          std::fprintf(stderr, "prefill failed: %s\n", error.c_str());
+          return std::nullopt;
+        }
+        rows.push_back(std::move(row));
+      }
+      for (std::uint32_t step = 0; step < state_compare; ++step) {
+        const std::int32_t token =
+            forced.empty()
+                ? static_cast<std::int32_t>(gufo::test::ArgMax(rows.back()))
+                : forced[step];
+        if (greedy != nullptr)
+          greedy->push_back(token);
+        std::vector<float> row(c.vocab_size);
+        if (!exec->Forward(*session, std::span<const std::int32_t>(&token, 1),
+                           1, row.data(),
+                           q::rocm::Executor::ForwardMode::kDecode, &error)) {
+          std::fprintf(stderr, "decode failed: %s\n", error.c_str());
+          return std::nullopt;
+        }
+        rows.push_back(std::move(row));
+      }
+      return rows;
+    };
+    std::vector<std::int32_t> greedy;
+    const auto reference_rows =
+        run(q::rocm::GdnStateFormat::kFp32, {}, &greedy);
+    if (!reference_rows)
+      return 1;
+    const auto candidate_rows =
+        run(q::rocm::GdnStateFormat::kFp16, greedy, nullptr);
+    if (!candidate_rows)
+      return 1;
+    const std::size_t passes = reference_rows->size() - state_compare;
+    gufo::test::DriftSummary prefill_drift;
+    gufo::test::DriftSummary decode_drift;
+    for (std::size_t row = 0; row < reference_rows->size(); ++row) {
+      const auto drift = gufo::test::CompareLogits((*reference_rows)[row],
+                                                   (*candidate_rows)[row]);
+      (row < passes ? prefill_drift : decode_drift).Add(drift);
+    }
+    // Generated token s is the top-1 of row passes - 1 + s.
+    std::optional<std::size_t> divergence;
+    for (std::size_t row = passes - 1;
+         row < passes - 1 + state_compare && !divergence; ++row) {
+      if (gufo::test::ArgMax((*reference_rows)[row]) !=
+          gufo::test::ArgMax((*candidate_rows)[row]))
+        divergence = row + 1 - passes;
+    }
+    std::ostringstream report;
+    gufo::test::WriteStateComparison(report, "fp32", "fp16", ids.size(),
+                                     state_compare, prefill_drift, decode_drift,
+                                     divergence);
+    std::fputs(report.str().c_str(), stdout);
+    if (!json_path.empty()) {
+      std::ofstream out(json_path);
+      out << report.str();
+      if (!out) {
+        std::fprintf(stderr, "cannot write %s\n", json_path.c_str());
+        return 1;
+      }
+    }
+    return 0;
   }
   auto executor =
       q::rocm::Executor::Create(*device, ngram.get(), options, &error);

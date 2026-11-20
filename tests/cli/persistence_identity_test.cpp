@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -18,11 +19,25 @@ using gufo::core::FindElfSection;
 using gufo::server::QwenFlashNextCompatibilityIdentity;
 
 std::string Identity(std::string_view device_code,
-                     std::string_view hc_mode = "fp16") {
+                     std::string_view hc_mode = "fp16",
+                     std::string_view recurrent_state = "fp32") {
   const auto bytes = QwenFlashNextCompatibilityIdentity(
       std::string(64, 'a'), std::string(64, 'b'), true, 8192, 7, 2,
-      "absolute-v1", true, 19, device_code, hc_mode);
+      "absolute-v1", true, 20, device_code, hc_mode, recurrent_state);
   return {bytes.begin(), bytes.end()};
+}
+
+// FP16 recurrent state payloads never restore into an FP32 server and back.
+void RecurrentStateChangesTheIdentity() {
+  const std::string code(64, '1');
+  const auto fp32 = Identity(code, "fp16", "fp32");
+  const auto fp16 = Identity(code, "fp16", "fp16");
+  if (fp32 == fp16 ||
+      fp32.find("recurrent_state=fp32\n") == std::string::npos ||
+      fp16.find("recurrent_state=fp16\n") == std::string::npos) {
+    std::cerr << "recurrent state is not part of the identity\n";
+    std::exit(1);
+  }
 }
 
 // Each --hc-mode computes different states: none restores into another.
@@ -132,6 +147,7 @@ int main(int argc, char** argv) {
   }
   DeviceCodeHashChangesTheIdentity();
   HcModeChangesTheIdentity();
+  RecurrentStateChangesTheIdentity();
   FindsElfSections();
   ExecutableHashIsStable();
   std::cout << "persistence identity tests passed\n";

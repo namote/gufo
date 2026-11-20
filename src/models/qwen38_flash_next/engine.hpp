@@ -28,6 +28,7 @@
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
+#include "src/models/qwen38_flash_next/recurrent_state.hpp"
 
 namespace gufo::hip {
 class KvBlockPool;
@@ -73,6 +74,9 @@ struct ModelOptions {
   /// FP16.
   bool kvarn = false;
   int kvarn_bits = 4;
+  /// Recurrent state storage (`--recurrent-state`, kernels.hpp
+  /// GdnStateFormat); FP16 halves every session's recurrent state.
+  rocm::GdnStateFormat recurrent_state = rocm::GdnStateFormat::kFp32;
   /// Profile files (`--abliteration-profiles DIR`, listed by
   /// qwen::ListAbliterationProfiles). Empty loads none: nothing is discovered
   /// beside the model. Loading enables none; a profile with a `trigger`
@@ -168,6 +172,10 @@ public:
   /// Whether sessions keep trunk K/V as KVarN k4v4 (ModelOptions::kvarn).
   [[nodiscard]] bool Kvarn() const noexcept { return options_.kvarn; }
   [[nodiscard]] int KvarnBits() const noexcept { return options_.kvarn_bits; }
+  /// Recurrent state storage (ModelOptions::recurrent_state).
+  [[nodiscard]] rocm::GdnStateFormat RecurrentState() const noexcept {
+    return options_.recurrent_state;
+  }
   /// The mixers' compute mode (ModelOptions::hc_mode).
   [[nodiscard]] HcMode hc_mode() const noexcept { return options_.hc_mode; }
   [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {
@@ -450,7 +458,8 @@ public:
   [[nodiscard]] NgramTotals NgramRowTotals() const noexcept;
 
   /// Compatibility version; bump on payload or inference arithmetic changes.
-  static constexpr std::uint32_t kSnapshotPayloadVersion = 19;
+  /// 20: the executor header records the recurrent state element size.
+  static constexpr std::uint32_t kSnapshotPayloadVersion = 20;
   /// Bytes a snapshot of the current context occupies.
   [[nodiscard]] std::uint64_t SnapshotBytes() const;
   [[nodiscard]] std::uint64_t PrefillCheckpointBytes(

@@ -293,7 +293,8 @@ ContinuationAdapter::ContinuationAdapter(std::shared_ptr<Model> model,
       layout_(model_ ? model_->config() : Config{},
               mode == core::SessionMode::kSpeculative, context,
               model_ ? model_->executor_->max_speculative() : 0,
-              model_ && model_->Kvarn(), model_ ? model_->KvarnBits() : 4),
+              model_ && model_->Kvarn(), model_ ? model_->KvarnBits() : 4,
+              model_ ? model_->RecurrentState() : rocm::GdnStateFormat::kFp32),
       identity_(std::move(identity)) {
   if ((mode != core::SessionMode::kAutoregressive &&
        mode != core::SessionMode::kSpeculative) ||
@@ -310,6 +311,8 @@ ContinuationAdapter::ContinuationAdapter(std::shared_ptr<Model> model,
   put(model_->Kvarn() ? hip::kKvarnGroupTokens : 0);
   put(static_cast<std::uint32_t>(hip::KvarnValueOrder::kTokenMajor));
   put(Session::kSnapshotPayloadVersion);
+  put(static_cast<std::uint32_t>(
+      rocm::GdnStateElementBytes(model_->RecurrentState())));
   put(context);
   put(mode == core::SessionMode::kSpeculative);
   put(model_->executor_->max_speculative());

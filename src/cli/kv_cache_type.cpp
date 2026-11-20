@@ -169,9 +169,9 @@ void RegisterRecurrentStateOption(
     std::string_view group) {
   parser.AddCustomOption(
       "", "--recurrent-state", "TYPE",
-      "Qwen3.8-27B DeltaNet recurrent state storage: fp32, fp16 (FP32 "
-      "arithmetic, rounded once per pass on store) or the rejected bf16 route "
-      "(default: fp32)",
+      "GDN/DeltaNet recurrent state storage (Qwen3.8-27B, Flash-Next): fp32, "
+      "or fp16 (FP32 arithmetic, rounded once per pass on store); "
+      "Qwen3.8-27B also takes the rejected bf16 route (default: fp32)",
       group,
       [target](std::string_view, std::string_view value, std::string* error) {
         const auto storage = ParseRecurrentState(value);
@@ -196,7 +196,7 @@ bool ResolveRecurrentState(
   const auto model = FindTextModel(architecture);
   const bool accepted =
       architecture == "qwen35" ||
-      (architecture == "qwen4exp" && *requested == Storage::kFp32);
+      (architecture == "qwen4exp" && *requested != Storage::kBf16);
   if (accepted) {
     *resolved = *requested;
     return true;
@@ -207,7 +207,7 @@ bool ResolveRecurrentState(
             ? "--recurrent-state " +
                   std::string(hip::QwenRecurrentStateStorageName(*requested)) +
                   " is not supported by Qwen3.8-Flash-Next; it accepts "
-                  "only fp32"
+                  "fp32 and fp16"
             : TextModelName(model) +
                   " does not take --recurrent-state (it has no "
                   "recurrent state)";

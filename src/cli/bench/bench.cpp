@@ -951,6 +951,10 @@ int RunQwen38FlashNextBenchmark(
                    options.kv_cache_type == KvCacheType::kKvarnK6V6,
           .kvarn_bits =
               options.kv_cache_type == KvCacheType::kKvarnK6V6 ? 6 : 4,
+          .recurrent_state =
+              options.recurrent_state == hip::QwenRecurrentStateStorage::kFp16
+                  ? qfn::rocm::GdnStateFormat::kFp16
+                  : qfn::rocm::GdnStateFormat::kFp32,
           .hc_mode = options.hc_mode.value_or(qfn::kDefaultHcMode),
       },
       &error);

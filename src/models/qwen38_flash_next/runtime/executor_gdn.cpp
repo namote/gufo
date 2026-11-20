@@ -132,7 +132,8 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                      convolved, c.rms_eps, stream_, out_half, checkpoint,
                      half_stride, out_q8_1 ? s_.gdn_q8_1 : nullptr, z_ready,
                      model_->output().exl3 != nullptr,
-                     out_slabs.count != 0 ? &out_slabs : nullptr)) {
+                     out_slabs.count != 0 ? &out_slabs : nullptr,
+                     options_.recurrent_state)) {
     AssignError(error_msg, "DeltaNet launch failed");
     return false;
   }
@@ -176,8 +177,8 @@ bool Executor::CommitGdnStates(Session& session, std::uint32_t keep,
   for (auto& l : session.linear_) {
     if (l.state == nullptr)
       continue;
-    RestoreGdnState(l.state, l.state_snapshots, keep, n, c.ssm_num_k_heads,
-                    c.ssm_num_v_heads, stream_);
+    RestoreGdnState(l.state, options_.recurrent_state, l.state_snapshots, keep,
+                    n, c.ssm_num_k_heads, c.ssm_num_v_heads, stream_);
     if (!Check(hipGetLastError(), "state commit", error_msg))
       return false;
   }
@@ -205,9 +206,7 @@ bool Executor::RollbackWide(Session& session, std::uint32_t keep,
   const auto count = [&](std::uint32_t s) {
     return std::min(kRows, n - s * kRows);
   };
-  const std::size_t state_bytes = std::size_t{c.ssm_num_v_heads} *
-                                  c.ssm_head_dim * c.ssm_head_dim *
-                                  sizeof(float);
+  const std::size_t state_bytes = GdnStateBytes();
   const std::size_t conv_bytes =
       std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels() * sizeof(float);
   const auto records = [&](std::uint32_t s, std::size_t il) -> RollbackRows {
@@ -230,12 +229,14 @@ bool Executor::RollbackWide(Session& session, std::uint32_t keep,
         return false;
     } else {
       for (std::uint32_t s = 0; s < segment; ++s)
-        RestoreGdnState(l.state, records(s, il), kRows, kRows,
-                        c.ssm_num_k_heads, c.ssm_num_v_heads, stream_);
+        RestoreGdnState(l.state, options_.recurrent_state, records(s, il),
+                        kRows, kRows, c.ssm_num_k_heads, c.ssm_num_v_heads,
+                        stream_);
     }
     if (count(segment) > 1 || segment != last)
-      RestoreGdnState(l.state, records(segment, il), local, count(segment),
-                      c.ssm_num_k_heads, c.ssm_num_v_heads, stream_);
+      RestoreGdnState(l.state, options_.recurrent_state, records(segment, il),
+                      local, count(segment), c.ssm_num_k_heads,
+                      c.ssm_num_v_heads, stream_);
     if (!Check(hipGetLastError(), "wide state commit", error_msg))
       return false;
     const float* conv =

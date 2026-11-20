@@ -2804,7 +2804,9 @@ public:
               model_->IsNativeExl3(),
               models::qwen38_flash_next::Session::kSnapshotPayloadVersion,
               device_code,
-              models::qwen38_flash_next::HcModeName(model_->hc_mode())),
+              models::qwen38_flash_next::HcModeName(model_->hc_mode()),
+              models::qwen38_flash_next::rocm::GdnStateFormatName(
+                  model_->RecurrentState())),
           .payload_version =
               models::qwen38_flash_next::Session::kSnapshotPayloadVersion,
       };
@@ -2820,6 +2822,10 @@ public:
                << '\n'
                << "hc_mode="
                << models::qwen38_flash_next::HcModeName(model_->hc_mode())
+               << '\n'
+               << "recurrent_state="
+               << models::qwen38_flash_next::rocm::GdnStateFormatName(
+                      model_->RecurrentState())
                << '\n';
       const auto canonical = identity.str();
       component_identity_.assign(canonical.begin(), canonical.end());
@@ -2858,6 +2864,10 @@ public:
             std::string(kQwenFlashNextStateAbi) +
             (model_->Kvarn()
                  ? (model_->KvarnBits() == 6 ? "+kvarn-k6v6" : "+kvarn-k4v4")
+                 : "") +
+            (model_->RecurrentState() ==
+                     models::qwen38_flash_next::rocm::GdnStateFormat::kFp16
+                 ? "+fp16-recurrent"
                  : ""),
         .max_context = max_context_,
         .kv_cache_type =
@@ -4037,6 +4047,11 @@ bool InferenceBackend::load(
                      resolved_kv_cache_type == cli::KvCacheType::kKvarnK6V6,
             .kvarn_bits =
                 resolved_kv_cache_type == cli::KvCacheType::kKvarnK6V6 ? 6 : 4,
+            .recurrent_state =
+                resolved_recurrent_state ==
+                        hip::QwenRecurrentStateStorage::kFp16
+                    ? models::qwen38_flash_next::rocm::GdnStateFormat::kFp16
+                    : models::qwen38_flash_next::rocm::GdnStateFormat::kFp32,
             .abliteration_profiles = profile_files,
             .abliteration_updates = impl_->profile_updates,
             .hc_mode =

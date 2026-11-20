@@ -249,6 +249,56 @@ __device__ __forceinline__ void GdnRowReduce(float& u, float& p) {
   p = GdnXorAddDpp<2>(p);
 }
 
+// GDN state element access (GdnStateFormat). FP32 is the stored value;
+// FP16 widens on load and rounds to nearest on store, saturated to the
+// finite FP16 range so an outlier cannot become infinity. NaN stays NaN.
+__device__ __forceinline__ float GdnSaturateHalf(float x) {
+  constexpr float kMax = 65504.0F;
+  return __builtin_isnan(x) ? x : fminf(fmaxf(x, -kMax), kMax);
+}
+__device__ __forceinline__ __half2 GdnStateHalf2(float a, float b) {
+  return __floats2half2_rn(GdnSaturateHalf(a), GdnSaturateHalf(b));
+}
+__device__ __forceinline__ float4 GdnLoadState4(const float* row,
+                                                std::size_t vector_index) {
+  return reinterpret_cast<const float4*>(row)[vector_index];
+}
+__device__ __forceinline__ float4 GdnLoadState4(const __half* row,
+                                                std::size_t vector_index) {
+  const auto pair = reinterpret_cast<const uint2*>(row)[vector_index];
+  const float2 lo = __half22float2(__builtin_bit_cast(__half2, pair.x));
+  const float2 hi = __half22float2(__builtin_bit_cast(__half2, pair.y));
+  return {lo.x, lo.y, hi.x, hi.y};
+}
+__device__ __forceinline__ void GdnStoreState4(float* row,
+                                               std::size_t vector_index,
+                                               float4 value) {
+  reinterpret_cast<float4*>(row)[vector_index] = value;
+}
+__device__ __forceinline__ void GdnStoreState4(__half* row,
+                                               std::size_t vector_index,
+                                               float4 value) {
+  reinterpret_cast<uint2*>(row)[vector_index] = {
+      __builtin_bit_cast(unsigned int, GdnStateHalf2(value.x, value.y)),
+      __builtin_bit_cast(unsigned int, GdnStateHalf2(value.z, value.w))};
+}
+__device__ __forceinline__ float GdnLoadState(const float* state,
+                                              std::size_t i) {
+  return state[i];
+}
+__device__ __forceinline__ float GdnLoadState(const __half* state,
+                                              std::size_t i) {
+  return __half2float(state[i]);
+}
+__device__ __forceinline__ void GdnStoreState(float* state, std::size_t i,
+                                              float value) {
+  state[i] = value;
+}
+__device__ __forceinline__ void GdnStoreState(__half* state, std::size_t i,
+                                              float value) {
+  state[i] = __float2half_rn(GdnSaturateHalf(value));
+}
+
 // Two-row LDS reuse adapted from mikealanni/gufo f450218743bc (MIT).
 /// Qwen row-split recurrence specialized to the model's 128x128 state. Four
 /// lanes own the 32-key slices of a row, eight row groups share a wave and
@@ -284,10 +334,10 @@ __device__ __forceinline__ float GdnStableConv4(float4 taps, float w0, float w1,
 /// so neither the convolved rows nor the scales round-trip through memory.
 /// Every value keeps the separate kernels' arithmetic; conv_state is read
 /// only (the caller shifts history after this kernel).
-template<bool kConv>
+template<bool kConv, typename StateT = float>
 __launch_bounds__(kGdnWaves * 32) __global__
     void GdnRowSplitKernel(const float* conv_out, const float* scales,
-                           const float* ab, float* state, float* raw,
+                           const float* ab, StateT* state, float* raw,
                            std::uint32_t n_tokens, std::uint32_t k_heads,
                            std::uint32_t v_heads, GdnCheckpoint checkpoint,
                            const float* qkv, std::uint32_t qkv_stride,
@@ -339,11 +389,11 @@ __launch_bounds__(kGdnWaves * 32) __global__
 #pragma unroll
   for (int rr = 0; rr < kRows; ++rr) {
     const int row = blockIdx.x * kRowsPerBlock + row_local(rr);
-    const auto* state4 = reinterpret_cast<const float4*>(
-        state + (static_cast<std::size_t>(h) * d + row) * d);
+    const StateT* state_row =
+        state + (static_cast<std::size_t>(h) * d + row) * d;
 #pragma unroll
     for (int i = 0; i < kVec; ++i) {
-      s[rr][i] = state4[vec0 + i];
+      s[rr][i] = GdnLoadState4(state_row, vec0 + i);
     }
   }
 
@@ -622,11 +672,11 @@ __launch_bounds__(kGdnWaves * 32) __global__
         if (checkpoint.state != nullptr &&
             w * kW + tl + 1 == checkpoint.tokens) {
           const int row = blockIdx.x * kRowsPerBlock + row_local(rr);
-          auto* target = reinterpret_cast<float4*>(
-              checkpoint.state + (static_cast<std::size_t>(h) * d + row) * d);
+          StateT* target = static_cast<StateT*>(checkpoint.state) +
+                           (static_cast<std::size_t>(h) * d + row) * d;
 #pragma unroll
           for (int i = 0; i < kVec; ++i)
-            target[vec0 + i] = s[rr][i];
+            GdnStoreState4(target, vec0 + i, s[rr][i]);
         }
       }
       out_base += v_heads * d;
@@ -646,11 +696,10 @@ __launch_bounds__(kGdnWaves * 32) __global__
 #pragma unroll
   for (int rr = 0; rr < kRows; ++rr) {
     const int row = blockIdx.x * kRowsPerBlock + row_local(rr);
-    auto* state4 = reinterpret_cast<float4*>(
-        state + (static_cast<std::size_t>(h) * d + row) * d);
+    StateT* state_row = state + (static_cast<std::size_t>(h) * d + row) * d;
 #pragma unroll
     for (int i = 0; i < kVec; ++i) {
-      state4[vec0 + i] = s[rr][i];
+      GdnStoreState4(state_row, vec0 + i, s[rr][i]);
     }
   }
 }
@@ -692,10 +741,10 @@ __device__ __forceinline__ float GdnLastUpdate(float state, float decay,
   return value;
 }
 
-template<bool kBatch>
+template<bool kBatch, typename StateT = float>
 __global__ void GdnKernel(const float* conv_out, const float* qn,
                           const float* kn, const float* alpha_beta,
-                          const float* a, const float* dt, float* state,
+                          const float* a, const float* dt, StateT* state,
                           float* raw, RollbackRows snapshots,
                           std::uint32_t n_tokens, std::uint32_t k_heads,
                           std::uint32_t v_heads, const GdnBatchItem* batch,
@@ -708,7 +757,7 @@ __global__ void GdnKernel(const float* conv_out, const float* qn,
     qn = item.qn;
     kn = item.kn;
     alpha_beta = item.alpha_beta;
-    state = item.state;
+    state = static_cast<StateT*>(item.state);
     raw = item.raw;
     n_tokens = item.n_tokens;
   }
@@ -723,11 +772,16 @@ __global__ void GdnKernel(const float* conv_out, const float* qn,
   const std::uint32_t channels = 2 * k_heads * d + v_heads * d;
   const float a_h = a[h];
   const float dt_h = dt[h];
-  float* S = state + static_cast<std::size_t>(h) * d * d + j * d + i0;
+  StateT* S = state + static_cast<std::size_t>(h) * d * d + j * d + i0;
   float row[slice];
+  static_assert(slice % 4 == 0);
 #pragma unroll
-  for (std::uint32_t i = 0; i < slice; ++i) {
-    row[i] = S[i];
+  for (std::uint32_t i = 0; i < slice; i += 4) {
+    const float4 v = GdnLoadState4(S, i / 4);
+    row[i] = v.x;
+    row[i + 1] = v.y;
+    row[i + 2] = v.z;
+    row[i + 3] = v.w;
   }
   const float q_scale = rsqrtf(static_cast<float>(d));
   const bool deferred = (kBatch ? batch[blockIdx.z].state_snapshots.rows[0]
@@ -777,11 +831,12 @@ __global__ void GdnKernel(const float* conv_out, const float* qn,
     }
     if constexpr (!kBatch) {
       if (checkpoint.state != nullptr && t + 1 == checkpoint.tokens) {
-        float* target =
-            checkpoint.state + static_cast<std::size_t>(h) * d * d + j * d + i0;
+        StateT* target = static_cast<StateT*>(checkpoint.state) +
+                         static_cast<std::size_t>(h) * d * d + j * d + i0;
 #pragma unroll
-        for (std::uint32_t i = 0; i < slice; ++i)
-          target[i] = row[i];
+        for (std::uint32_t i = 0; i < slice; i += 4)
+          GdnStoreState4(target, i / 4,
+                         {row[i], row[i + 1], row[i + 2], row[i + 3]});
       }
     }
     if (deferred) {
@@ -807,12 +862,13 @@ __global__ void GdnKernel(const float* conv_out, const float* qn,
   if (deferred)
     return;
 #pragma unroll
-  for (std::uint32_t i = 0; i < slice; ++i) {
-    S[i] = row[i];
+  for (std::uint32_t i = 0; i < slice; i += 4) {
+    GdnStoreState4(S, i / 4, {row[i], row[i + 1], row[i + 2], row[i + 3]});
   }
 }
 
-__global__ void RestoreGdnStateKernel(float* state, RollbackRows snapshots,
+template<typename StateT>
+__global__ void RestoreGdnStateKernel(StateT* state, RollbackRows snapshots,
                                       std::uint32_t keep, std::uint32_t n,
                                       std::uint32_t k_heads,
                                       std::uint32_t v_heads) {
@@ -823,7 +879,7 @@ __global__ void RestoreGdnStateKernel(float* state, RollbackRows snapshots,
   const auto h = i / (d * d);
   const auto j = (i / d) % d;
   const auto k = i % d;
-  float value = state[i];
+  float value = GdnLoadState(state, i);
   for (std::uint32_t t = 0; t < keep; ++t) {
     const auto* update = GdnRecord(snapshots, t, n, k_heads, v_heads);
     const float key = update[(h % k_heads) * d + k];
@@ -835,7 +891,7 @@ __global__ void RestoreGdnStateKernel(float* state, RollbackRows snapshots,
                 ? GdnLastUpdate(value, decay, error, key, beta)
                 : __fmaf_rn(beta, correction, __fmul_rn(value, decay));
   }
-  state[i] = value;
+  GdnStoreState(state, i, value);
 }
 
 /// Per-head RMSNorm of the raw attention rows and the sigmoid output gate,
@@ -1129,12 +1185,17 @@ void PleInject(float* res, const float* gated, const float* conv,
                      stream, res, gated, conv, count);
 }
 
-void RestoreGdnState(float* state, RollbackRows snapshots, std::uint32_t keep,
-                     std::uint32_t n, std::uint32_t k_heads,
+void RestoreGdnState(void* state, GdnStateFormat format, RollbackRows snapshots,
+                     std::uint32_t keep, std::uint32_t n, std::uint32_t k_heads,
                      std::uint32_t v_heads, hipStream_t stream) {
   const auto count = std::size_t{v_heads} * kGdnDim * kGdnDim;
-  RestoreGdnStateKernel<<<(count + 255) / 256, 256, 0, stream>>>(
-      state, snapshots, keep, n, k_heads, v_heads);
+  const auto blocks = static_cast<unsigned>((count + 255) / 256);
+  if (format == GdnStateFormat::kFp16)
+    RestoreGdnStateKernel<<<blocks, 256, 0, stream>>>(
+        static_cast<__half*>(state), snapshots, keep, n, k_heads, v_heads);
+  else
+    RestoreGdnStateKernel<<<blocks, 256, 0, stream>>>(
+        static_cast<float*>(state), snapshots, keep, n, k_heads, v_heads);
 }
 
 void HistoryPrefix(const float* in, std::uint32_t stride, const float* history,
@@ -1151,7 +1212,7 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    std::uint32_t z_stride, const float* alpha_beta,
                    const float* conv_w, const float* a, const float* dt,
                    const float* norm_w, float* conv_state, float* conv_scratch,
-                   float* qn, float* kn, float* raw, float* state, float* out,
+                   float* qn, float* kn, float* raw, void* state, float* out,
                    void* out_q8, RollbackRows state_snapshots,
                    RollbackRows conv_snapshots, std::uint32_t n_tokens,
                    std::uint32_t k_heads, std::uint32_t v_heads,
@@ -1160,7 +1221,8 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    __half* out_half, GdnCheckpoint checkpoint,
                    std::uint32_t out_half_stride, void* out_q8_1,
                    hipEvent_t z_ready, bool stable_conv,
-                   Exl3InputSlabs* out_slabs) {
+                   Exl3InputSlabs* out_slabs, GdnStateFormat state_format) {
+  const bool half_state = state_format == GdnStateFormat::kFp16;
   const std::uint32_t channels = 2 * k_heads * d + v_heads * d;
   const std::size_t count = static_cast<std::size_t>(n_tokens) * channels;
   if (checkpoint.history != nullptr)
@@ -1230,11 +1292,18 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
         dim3(Blocks(static_cast<std::size_t>(n_tokens) * v_heads)),
         dim3(kThreads), 0, stream, alpha_beta, a, dt, kn,
         static_cast<std::size_t>(n_tokens) * v_heads, v_heads);
-    hipLaunchKernelGGL(GdnRowSplitKernel<true>,
-                       dim3(kGdnDim / kGdnRowSplitRowsPerBlock, v_heads),
-                       dim3(kGdnWaves * 32), 0, stream, conv_scratch, qn, kn,
-                       state, raw, n_tokens, k_heads, v_heads, checkpoint, qkv,
-                       qkv_stride, conv_w, conv_state, eps);
+    const auto launch = [&]<typename StateT>() {
+      hipLaunchKernelGGL((GdnRowSplitKernel<true, StateT>),
+                         dim3(kGdnDim / kGdnRowSplitRowsPerBlock, v_heads),
+                         dim3(kGdnWaves * 32), 0, stream, conv_scratch, qn, kn,
+                         static_cast<StateT*>(state), raw, n_tokens, k_heads,
+                         v_heads, checkpoint, qkv, qkv_stride, conv_w,
+                         conv_state, eps);
+    };
+    if (half_state)
+      launch.template operator()<__half>();
+    else
+      launch.template operator()<float>();
     shift_history();
   } else if (!saved_history) {
     if (conv_snapshots.rows[0] != nullptr && n_tokens > 1) {
@@ -1258,21 +1327,34 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
         dim3(Blocks(static_cast<std::size_t>(n_tokens) * v_heads)),
         dim3(kThreads), 0, stream, alpha_beta, a, dt, kn,
         static_cast<std::size_t>(n_tokens) * v_heads, v_heads);
-    hipLaunchKernelGGL(GdnRowSplitKernel<false>,
-                       dim3(kGdnDim / kGdnRowSplitRowsPerBlock, v_heads),
-                       dim3(kGdnWaves * 32), 0, stream, conv_scratch, qn, kn,
-                       state, raw, n_tokens, k_heads, v_heads, checkpoint,
-                       nullptr, 0U, nullptr, nullptr, eps);
+    const auto launch = [&]<typename StateT>() {
+      hipLaunchKernelGGL((GdnRowSplitKernel<false, StateT>),
+                         dim3(kGdnDim / kGdnRowSplitRowsPerBlock, v_heads),
+                         dim3(kGdnWaves * 32), 0, stream, conv_scratch, qn, kn,
+                         static_cast<StateT*>(state), raw, n_tokens, k_heads,
+                         v_heads, checkpoint, nullptr, 0U, nullptr, nullptr,
+                         eps);
+    };
+    if (half_state)
+      launch.template operator()<__half>();
+    else
+      launch.template operator()<float>();
   } else {
     hipLaunchKernelGGL(GdnPrepKernel<false>,
                        dim3((n_tokens * k_heads + waves - 1) / waves),
                        dim3(kThreads), 0, stream, conv_scratch, qn, kn,
                        n_tokens * k_heads, k_heads, channels, eps, nullptr, 0);
-    hipLaunchKernelGGL(
-        GdnKernel<false>, dim3(v_heads, kGdnDim / kGdnRowsPerBlock),
-        dim3(kGdnRowsPerBlock * kGdnLanes), 0, stream, conv_scratch, qn, kn,
-        alpha_beta, a, dt, state, raw, state_snapshots, n_tokens, k_heads,
-        v_heads, nullptr, 0, checkpoint);
+    const auto launch = [&]<typename StateT>() {
+      hipLaunchKernelGGL(
+          (GdnKernel<false, StateT>), dim3(v_heads, kGdnDim / kGdnRowsPerBlock),
+          dim3(kGdnRowsPerBlock * kGdnLanes), 0, stream, conv_scratch, qn, kn,
+          alpha_beta, a, dt, static_cast<StateT*>(state), raw, state_snapshots,
+          n_tokens, k_heads, v_heads, nullptr, 0, checkpoint);
+    };
+    if (half_state)
+      launch.template operator()<__half>();
+    else
+      launch.template operator()<float>();
   }
   if (z_ready != nullptr &&
       hipStreamWaitEvent(stream, z_ready, 0) != hipSuccess)
@@ -1299,7 +1381,7 @@ bool GatedDeltaNetBatch(const GdnBatchItem* items, std::uint32_t count,
                         const float* conv_w, const float* a, const float* dt,
                         const float* norm_w, std::uint32_t k_heads,
                         std::uint32_t v_heads, float eps, hipStream_t stream,
-                        bool stable_conv) {
+                        bool stable_conv, GdnStateFormat state_format) {
   if (items == nullptr || count == 0 || count > 8 || max_tokens == 0 ||
       max_tokens > kSsmConvTokensPerThread)
     return false;
@@ -1315,11 +1397,19 @@ bool GatedDeltaNetBatch(const GdnBatchItem* items, std::uint32_t count,
                      dim3(kThreads), 0, stream, nullptr, nullptr, nullptr,
                      max_tokens * k_heads, k_heads, channels, eps, items,
                      active);
-  hipLaunchKernelGGL(
-      GdnKernel<true>, dim3(v_heads, kGdnDim / kGdnRowsPerBlock, count),
-      dim3(kGdnRowsPerBlock * kGdnLanes), 0, stream, nullptr, nullptr, nullptr,
-      nullptr, a, dt, nullptr, nullptr, RollbackRows{}, max_tokens, k_heads,
-      v_heads, items, active, GdnCheckpoint{});
+  const auto launch = [&]<typename StateT>() {
+    hipLaunchKernelGGL((GdnKernel<true, StateT>),
+                       dim3(v_heads, kGdnDim / kGdnRowsPerBlock, count),
+                       dim3(kGdnRowsPerBlock * kGdnLanes), 0, stream, nullptr,
+                       nullptr, nullptr, nullptr, a, dt,
+                       static_cast<StateT*>(nullptr), nullptr, RollbackRows{},
+                       max_tokens, k_heads, v_heads, items, active,
+                       GdnCheckpoint{});
+  };
+  if (state_format == GdnStateFormat::kFp16)
+    launch.template operator()<__half>();
+  else
+    launch.template operator()<float>();
   hipLaunchKernelGGL(GdnEpilogueKernel<true>,
                      dim3((max_tokens * v_heads + waves - 1) / waves, 1, count),
                      dim3(kThreads), 0, stream, nullptr, nullptr, z_stride,

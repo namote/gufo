@@ -174,8 +174,9 @@ struct ExecutorTestAccess {
     return std::pair{
         Read<float>(state.conv_state,
                     std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels()),
-        Read<float>(state.state, std::size_t{c.ssm_num_v_heads} *
-                                     c.ssm_head_dim * c.ssm_head_dim)};
+        Read<float>(
+            static_cast<const float*>(state.state),
+            std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim)};
   }
   static State ReadState(const Session& session, const Config& config) {
     const auto& m = session.mtp_;
@@ -218,10 +219,10 @@ struct ExecutorTestAccess {
         Executor::kWideSegmentRows;
     return std::size_t{8} * std::min(8U, exec.options_.max_logit_rows) *
                exec.config().vocab_size * sizeof(float) +
-           (segments > 1 ? ((segments - 1) * exec.WideSegmentFloats() +
-                            exec.WideStateFloats()) *
-                               sizeof(float)
-                         : 0);
+           (segments > 1
+                ? (segments - 1) * exec.WideSegmentFloats() * sizeof(float) +
+                      exec.WideStateBytes()
+                : 0);
   }
   static void PoisonSelection(const Executor& exec) {
     Hip(hipMemsetAsync(exec.s_.mask, 0xFF,

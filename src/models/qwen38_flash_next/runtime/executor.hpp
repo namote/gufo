@@ -136,6 +136,11 @@ public:
   /// Trunk attention K/V are KVarN k4v4 records (Executor::Options::kvarn).
   [[nodiscard]] bool kvarn() const noexcept { return kvarn_; }
   [[nodiscard]] int kvarn_bits() const noexcept { return kvarn_bits_; }
+  /// Storage of every linear layer's recurrent state
+  /// (Executor::Options::recurrent_state).
+  [[nodiscard]] GdnStateFormat state_format() const noexcept {
+    return state_format_;
+  }
   [[nodiscard]] std::uint32_t position() const noexcept { return position_; }
   [[nodiscard]] std::uint32_t max_context() const noexcept {
     return max_context_;
@@ -247,7 +252,7 @@ private:
 
   struct LinearState {
     float* conv_state{nullptr};    ///< [kernel-1][channels]
-    float* state{nullptr};         ///< [v_heads][d][d]
+    void* state{nullptr};          ///< [v_heads][d][d], GdnStateFormat
     RollbackRows conv_snapshots;   ///< [max_spec-1][kernel-1][channels]
     RollbackRows state_snapshots;  ///< GdnRollbackRowFloats records
   };
@@ -344,6 +349,7 @@ private:
   /// ([K|V][attention layer][kKvarnFp16Tokens][kv row]).
   bool kvarn_{false};
   int kvarn_bits_{4};
+  GdnStateFormat state_format_{GdnStateFormat::kFp32};
   hip::KvarnTail kvarn_tail_{};
   KvarnPass kvarn_pass_{};
   __half* kvarn_fp16_{nullptr};
@@ -421,6 +427,10 @@ public:
     /// (plan/exl3/archive/F1-KVARN-DESIGN.md); the MTP layer stays FP16.
     bool kvarn{false};
     int kvarn_bits{4};
+    /// Recurrent state storage (`--recurrent-state`): FP32, or FP16 rounded
+    /// once per pass (kernels.hpp GdnStateFormat). Snapshots, rewind points
+    /// and continuation payloads carry the same format.
+    GdnStateFormat recurrent_state{GdnStateFormat::kFp32};
     /// Diagnostic chunk-policy hook for EXL3. Zero preserves the caller's
     /// existing policy; a nonzero limit is bounded by max_batch. The caller
     /// still supplies checkpoint/cancellation boundaries to PrefillChunkRows.
@@ -821,6 +831,11 @@ public:
   [[nodiscard]] bool has_mtp() const noexcept { return model_->has_mtp(); }
   /// Whether trunk K/V are KVarN k4v4 (Options::kvarn).
   [[nodiscard]] bool kvarn() const noexcept { return options_.kvarn; }
+  [[nodiscard]] GdnStateFormat state_format() const noexcept {
+    return options_.recurrent_state;
+  }
+  /// Bytes of one linear layer's recurrent state in state_format().
+  [[nodiscard]] std::size_t GdnStateBytes() const noexcept;
 
   [[nodiscard]] std::uint32_t PrefillChunkRows(
       std::uint32_t requested, std::uint32_t until_checkpoint) const noexcept;
@@ -1471,8 +1486,9 @@ private:
   /// every earlier segment committed, so the live state keeps its value
   /// before the pass as for an ordinary verification. For the production
   /// geometry (36 linear layers) that is 45.7 MiB per segment past the first
-  /// plus 108 MiB of wide_state_, 428 MiB at 64 rows (WideSegmentFloats,
-  /// WideStateFloats), allocated by ReserveDecodeScratch or else on first
+  /// plus 108 MiB of wide_state_ (54 MiB for FP16 state), 428 MiB at 64 rows
+  /// (WideSegmentFloats, WideStateBytes), allocated by ReserveDecodeScratch
+  /// or else on first
   /// use, and until then reserved with the other lazy scratch
   /// (DeferredScratchBytes).
   struct WideSegment {
@@ -1483,7 +1499,7 @@ private:
     float* ple_start{nullptr};
   };
   mutable std::vector<WideSegment> wide_segments_;
-  mutable std::vector<float*> wide_state_;  ///< per layer, linear layers only
+  mutable std::vector<void*> wide_state_;  ///< per layer, linear layers only
   mutable std::vector<float*> wide_allocations_;
   mutable Session::Control* wide_controls_{nullptr};
   /// Rows of the completed wide verification, or 0.
@@ -1495,7 +1511,7 @@ private:
   mutable std::vector<std::vector<sampling::LogitCandidate>> wide_candidates_;
   bool EnsureWideSegments(std::uint32_t segments, std::string* error) const;
   [[nodiscard]] std::size_t WideSegmentFloats() const;
-  [[nodiscard]] std::size_t WideStateFloats() const;
+  [[nodiscard]] std::size_t WideStateBytes() const;
   bool ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
                         std::string* error) const;
   /// Commits or cuts back the recurrent, convolution and PLE state of a

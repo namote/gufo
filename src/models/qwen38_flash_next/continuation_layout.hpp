@@ -7,6 +7,7 @@
 
 #include "src/cache/types.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
+#include "src/models/qwen38_flash_next/recurrent_state.hpp"
 
 namespace gufo::models::qwen38_flash_next {
 
@@ -52,9 +53,12 @@ struct ContinuationBackingClass {
 
 class ContinuationLayout {
 public:
-  ContinuationLayout(const Config&, bool mtp, std::uint32_t context,
-                     std::uint32_t kept_rows, bool kvarn = false,
-                     int kvarn_bits = 4);
+  /// FP16 recurrent state components hold half the bytes under layout
+  /// version 2 (FP32: 1), so neither restores into the other.
+  ContinuationLayout(
+      const Config&, bool mtp, std::uint32_t context, std::uint32_t kept_rows,
+      bool kvarn = false, int kvarn_bits = 4,
+      rocm::GdnStateFormat recurrent_state = rocm::GdnStateFormat::kFp32);
   [[nodiscard]] std::span<const ContinuationComponent> Components() const {
     return components_;
   }

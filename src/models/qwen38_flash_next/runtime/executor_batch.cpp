@@ -1303,9 +1303,7 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
           const auto [segs, count] = segments_of(i);
           const std::size_t conv_bytes = std::size_t{c.ssm_conv_kernel - 1} *
                                          c.SsmConvChannels() * sizeof(float);
-          const std::size_t state_bytes = std::size_t{c.ssm_num_v_heads} *
-                                          c.ssm_head_dim * c.ssm_head_dim *
-                                          sizeof(float);
+          const std::size_t state_bytes = GdnStateBytes();
           const auto& live = session.linear_[il];
           for (std::size_t s = 0; s < count; ++s) {
             UseScratch(RowScratch(base, segs[s].offset));
@@ -1318,7 +1316,7 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
               // convolution history already holds the earlier rows; keep
               // it for a rollback to this segment's first row.
               auto& seg = wide_segments_[s - 1];
-              float* start = wide_state_[il];
+              void* start = wide_state_[il];
               const auto& previous = s == 1 ? live.state_snapshots
                                             : wide_segments_[s - 2].state[il];
               if (!Check(hipMemcpyAsync(seg.conv_start[il], live.conv_state,
@@ -1330,9 +1328,9 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
                                          hipMemcpyDeviceToDevice, stream_),
                           error)))
                 return false;
-              RestoreGdnState(start, previous, segs[s - 1].count,
-                              segs[s - 1].count, c.ssm_num_k_heads,
-                              c.ssm_num_v_heads, stream_);
+              RestoreGdnState(start, options_.recurrent_state, previous,
+                              segs[s - 1].count, segs[s - 1].count,
+                              c.ssm_num_k_heads, c.ssm_num_v_heads, stream_);
               if (!Check(hipGetLastError(), error))
                 return false;
               state.state = start;
@@ -1415,7 +1413,8 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
                 l.ssm_in.empty() ? c.SsmValueDim() : l.ssm_in.rows,
                 l.ssm_conv1d.f32(), l.ssm_a.f32(), l.ssm_dt.f32(),
                 l.ssm_norm.f32(), c.ssm_num_k_heads, c.ssm_num_v_heads,
-                c.rms_eps, stream_, model_->output().exl3 != nullptr))
+                c.rms_eps, stream_, model_->output().exl3 != nullptr,
+                options_.recurrent_state))
           return Fail(error, "batched GatedDeltaNet launch failed");
       }
       UseScratch(base);

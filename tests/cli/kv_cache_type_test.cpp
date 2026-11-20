@@ -241,9 +241,10 @@ void TestRecurrentState() {
   for (const auto storage : {Storage::kFp32, Storage::kFp16, Storage::kBf16})
     Expect(resolve("qwen35", storage, &resolved, &error) && resolved == storage,
            "Qwen3.8-27B takes every recurrent storage");
-  Expect(resolve("qwen4exp", Storage::kFp32, &resolved, &error) &&
-             resolved == Storage::kFp32,
-         "Flash-Next takes fp32");
+  for (const auto storage : {Storage::kFp32, Storage::kFp16})
+    Expect(
+        resolve("qwen4exp", storage, &resolved, &error) && resolved == storage,
+        "Flash-Next takes fp32 and fp16");
   Expect(!resolve("qwen4exp", Storage::kBf16, &resolved, &error) &&
              error.find("Qwen3.8-Flash-Next") != std::string::npos,
          "Flash-Next refuses bf16 by name");

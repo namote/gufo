@@ -24,7 +24,8 @@ bool IsPool(ContinuationPart part) {
 ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
                                        std::uint32_t context,
                                        std::uint32_t kept_rows, bool kvarn,
-                                       int kvarn_bits)
+                                       int kvarn_bits,
+                                       rocm::GdnStateFormat recurrent_state)
     : context_(context), ratio_(c.compress_ratio), mtp_(mtp) {
   if ((kvarn_bits != 4 && kvarn_bits != 6) || !context ||
       context > c.MaxContextLength() || !ratio_ || !c.full_attention_interval ||
@@ -34,11 +35,12 @@ ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
     throw std::invalid_argument("invalid Flash-Next continuation geometry");
   raw_capacity_ = std::min(context, std::max(c.indexer_top_k, ratio_ - 1));
   const auto add = [&](ContinuationPart part, std::size_t row,
-                       std::size_t state, std::uint32_t layer = 0) {
+                       std::size_t state, std::uint32_t layer = 0,
+                       std::uint32_t version = 1) {
     const auto id = static_cast<std::uint32_t>(components_.size() + 1);
     components_.push_back(
         {{{id},
-          1,
+          version,
           row ? cache::ComponentKind::kAppendRows
               : cache::ComponentKind::kPrivateState,
           row,
@@ -61,8 +63,8 @@ ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
           layer);
       add(ContinuationPart::kRecurrent, 0,
           std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim *
-              sizeof(float),
-          layer);
+              rocm::GdnStateElementBytes(recurrent_state),
+          layer, recurrent_state == rocm::GdnStateFormat::kFp16 ? 2 : 1);
     } else {
       if (kvarn) {
         add(ContinuationPart::kKvarnRecords,

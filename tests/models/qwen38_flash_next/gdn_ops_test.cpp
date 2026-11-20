@@ -205,6 +205,52 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
       outs[route] = Download(&d_out, kOut);
       states[route] = Download(&d_state, kStateCount);
       raws[route] = Download(&d_raw, kRaw);
+      {
+        // FP16 state: widened on load, FP32 arithmetic, one rounding on
+        // store. It must equal the FP32 route started from the same widened
+        // state with its final state rounded once, bit for bit.
+        std::vector<__half> half_initial(kStateCount);
+        std::vector<float> widened(kStateCount);
+        for (std::size_t i = 0; i < kStateCount; ++i) {
+          half_initial[i] = __float2half_rn(state[i]);
+          widened[i] = __half2float(half_initial[i]);
+        }
+        const auto run = [&](void* device_state, q::GdnStateFormat format) {
+          Upload(&d_conv_state, conv_state);
+          q::GatedDeltaNet(
+              d_qkv.get(), kChannels, d_z.get(), kZ, d_alpha_beta.get(),
+              d_conv_w.get(), d_a.get(), d_dt.get(), d_norm_w.get(),
+              d_conv_state.get(), d_scratch.get(), d_qn.get(), d_kn.get(),
+              d_raw.get(), device_state, d_out.get(), nullptr, {}, {}, kTokens,
+              kKHeads, kVHeads, kDim, kKernel, route == 1, false, kEps, nullptr,
+              nullptr, {}, 0, nullptr, nullptr, false, nullptr, format);
+          CheckHip(hipDeviceSynchronize(), "GDN FP16 state synchronization");
+          return Download(&d_out, kOut);
+        };
+        Upload(&d_state, widened);
+        const auto fp32_out = run(d_state.get(), q::GdnStateFormat::kFp32);
+        const auto fp32_state = Download(&d_state, kStateCount);
+        HipBuffer<__half> d_half_state(kStateCount);
+        CheckHip(hipMemcpy(d_half_state.get(), half_initial.data(),
+                           d_half_state.bytes(), hipMemcpyHostToDevice),
+                 "FP16 state upload");
+        const auto fp16_out = run(d_half_state.get(), q::GdnStateFormat::kFp16);
+        std::vector<__half> fp16_state(kStateCount);
+        CheckHip(hipMemcpy(fp16_state.data(), d_half_state.get(),
+                           d_half_state.bytes(), hipMemcpyDeviceToHost),
+                 "FP16 state download");
+        if (std::memcmp(fp32_out.data(), fp16_out.data(),
+                        kOut * sizeof(float)) != 0)
+          throw std::runtime_error("GDN FP16 state changed the arithmetic");
+        for (std::size_t i = 0; i < kStateCount; ++i) {
+          // The store saturates to the finite range and keeps NaN.
+          const float x = fp32_state[i];
+          const __half expected = __float2half_rn(
+              std::isnan(x) ? x : std::clamp(x, -65504.0F, 65504.0F));
+          if (std::memcmp(&expected, &fp16_state[i], sizeof(__half)) != 0)
+            throw std::runtime_error("GDN FP16 state is not rounded once");
+        }
+      }
       constexpr std::size_t kCheckpointGuard = 16;
       constexpr float kCheckpointSentinel = 12345.0F;
       HipBuffer<float> checkpoint_state(kStateCount + kCheckpointGuard);
@@ -498,8 +544,8 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
         for (std::size_t i = 0; i < saved; ++i)
           replay.rows[i] = state_snaps.get() + state_offsets[i];
         Upload(&current_state, state);
-        q::RestoreGdnState(current_state.get(), replay, keep, kTokens, kKHeads,
-                           kVHeads, nullptr);
+        q::RestoreGdnState(current_state.get(), q::GdnStateFormat::kFp32,
+                           replay, keep, kTokens, kKHeads, kVHeads, nullptr);
         const auto restored_state = Download(&current_state, kStateCount);
         if (std::memcmp(expected_state.data(), restored_state.data(),
                         kStateCount * sizeof(float)) ||
@@ -944,8 +990,8 @@ int RunStableDecodeCase(std::uint32_t kTokens) {
     if (kTokens > 1) {
       if (!bytes_equal(Download(&d_state, kStateCount), state))
         throw std::runtime_error("stable decode verify wrote its state early");
-      q::RestoreGdnState(d_state.get(), states, kTokens, kTokens, kKHeads,
-                         kVHeads, nullptr);
+      q::RestoreGdnState(d_state.get(), q::GdnStateFormat::kFp32, states,
+                         kTokens, kTokens, kKHeads, kVHeads, nullptr);
     }
     CheckHip(hipDeviceSynchronize(), "stable decode GDN commit");
     const Result verified{Download(&d_out, kOut),

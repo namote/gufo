@@ -278,6 +278,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   exec.max_context = options.max_context;
   exec.kvarn = options.kvarn;
   exec.kvarn_bits = options.kvarn_bits;
+  exec.recurrent_state = options.recurrent_state;
   m->executor_ =
       rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);
   if (!m->executor_) {
