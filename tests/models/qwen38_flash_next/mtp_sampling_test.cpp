@@ -542,28 +542,56 @@ void CheckVerificationBoundaries() {
   }
 }
 
-// Sampled verification is the exact rule: a proposal is kept when the
-// uniform draw times q falls below its target probability p; otherwise the
-// residual is sampled. A rejection consumes exactly the uniform draw and the
-// residual sample.
-void CheckExactRejection() {
+// Typical acceptance keeps a rejected MTP draft whose target probability p
+// reaches min(eps, delta * exp(-H)); otherwise, always with the option off,
+// and always for a copied (prompt-lookup) proposal, verification is the exact
+// rule: a proposal is kept when the uniform draw times q falls below p, else
+// the residual is sampled, consuming exactly those draws.
+void CheckTypicalAcceptance() {
   const std::array<float, 5> logits{0.3F, -0.2F, 1.1F, 0.7F, -1.0F};
-  // top-k 3 gives tokens 1 and 4 p = 0; without top-k every token has p > 0.
+  // top-k 3 keeps tokens 2, 3 and 0 (1 and 4 have p = 0; every kept p is
+  // above eps). Without top-k at temperature 1, H is about 1.415, so the
+  // threshold is the delta side (about 0.073) and token 4 (p about 0.049)
+  // is atypical although p > 0.
   for (const auto& [temperature, top_k] :
        {std::pair{0.7F, 3}, std::pair{1.0F, 3}, std::pair{1.0F, 0}}) {
     sampling::SamplingConfig config{.temperature = temperature, .seed = 41};
     config.top_k = top_k;
+    config.typical_acceptance = false;  // the off path, stated explicitly
     sampling::SamplerState exact(config);
+    config.typical_acceptance = true;
+    sampling::SamplerState typical(config);
+    sampling::SamplerState copy_target(config);
     const auto target = exact.Distribution(logits);
-    for (sampling::TokenId copied = 0; copied < logits.size(); ++copied) {
+    double entropy = 0;
+    for (const auto& entry : target.entries())
+      entropy -= entry.value * std::log(entry.value);
+    const double threshold =
+        std::min(qfn::kTypicalEpsilon, qfn::kTypicalDelta * std::exp(-entropy));
+    for (sampling::TokenId token = 0; token < logits.size(); ++token) {
       qfn::MtpProposal proposal;
       proposal.size = 1;
-      proposal.ids[0] = proposal.token = copied;
+      proposal.ids[0] = proposal.token = token;
       proposal.probabilities[0] = proposal.probability = 1;
-      const double p = target.probability(copied);
+      auto copied = proposal;
+      copied.copied = true;
+      const double p = target.probability(token);
+      const bool keeps = p > 0 && p >= threshold;
+      Require(qfn::TypicalProposal(target, token) == keeps,
+              "typical rule threshold");
+      if (top_k == 0)
+        Require(threshold < qfn::kTypicalEpsilon && keeps == (token != 4),
+                "the entropy side of the typical threshold");
       for (unsigned draw = 0; draw < 256; ++draw) {
+        // Every sampler starts each draw from the same random state.
+        *typical.mutable_rng_state() = exact.rng_state();
+        *copy_target.mutable_rng_state() = exact.rng_state();
         auto reference = exact;
+        auto with_option = typical;
         const auto a = qfn::VerifyMtpProposal(logits, proposal, exact);
+        const auto b = qfn::VerifyMtpProposal(logits, proposal, typical);
+        const auto c = qfn::VerifyMtpProposal(logits, copied, copy_target);
+        // Without the option nothing changed: the exact rule, its draws.
         const bool accepted = reference.Uniform() < p;
         Require(a.accepted == accepted &&
                     (accepted ||
@@ -572,10 +600,151 @@ void CheckExactRejection() {
                                     std::span(proposal.probabilities).first(1),
                                     reference.mutable_rng_state())) &&
                     exact.rng_state() == reference.rng_state(),
-                "sampled verification must follow the exact rule");
+                "typical acceptance changed the exact rule when off");
+        Require(c.accepted == a.accepted && c.token == a.token &&
+                    copy_target.rng_state() == exact.rng_state(),
+                "a copied proposal keeps the exact rule and draws");
+        if (keeps) {
+          Require(b.accepted && b.token == token,
+                  "typical proposal must be kept");
+          Require(with_option.Uniform() >= 0 &&
+                      typical.rng_state() == with_option.rng_state(),
+                  "typical acceptance consumes exactly the uniform draw");
+        } else {
+          Require(b.accepted == accepted && b.token == a.token &&
+                      typical.rng_state() == exact.rng_state(),
+                  "an atypical proposal keeps the exact rule and draws");
+        }
       }
     }
   }
+}
+
+// Typical acceptance stays exact while the reply reasons, relaxes after the
+// reasoning end, and refuses a draft that completes a repeated 12-gram, which
+// starts an exact window that a speculative step publishes with its draws.
+void CheckTypicalGuards() {
+  // Token 0 is atypical for the exact test only through the draw: p(0) is
+  // about 0.18 at top-k 3, so a uniform above it rejects, and 0.18 > eps.
+  const std::array<float, 5> logits{0.3F, -0.2F, 1.1F, 0.7F, -1.0F};
+  auto phase = std::make_shared<sampling::ReasoningBudget>();
+  phase->tokens = sampling::ReasoningBudget::kUnlimited;
+  phase->forced = {3};
+  phase->ends = {3};
+  sampling::SamplingConfig config{.temperature = 1.0F, .seed = 7};
+  config.top_k = 3;
+  config.typical_acceptance = true;
+  config.reasoning_budget = phase;
+  qfn::MtpProposal proposal;
+  proposal.size = 1;
+  proposal.ids[0] = proposal.token = 0;
+  proposal.probabilities[0] = proposal.probability = 1;
+  const double p =
+      sampling::SamplerState(config).Distribution(logits).probability(0);
+  // Count the draws the exact test rejects and whether each was kept.
+  const auto kept_rejections = [&](sampling::SamplerState state) {
+    unsigned rejected = 0, kept = 0;
+    for (unsigned draw = 0; draw < 128; ++draw) {
+      auto probe = state;
+      if (probe.Uniform() < p)
+        continue;
+      ++rejected;
+      auto trial = state;
+      kept += qfn::VerifyMtpProposal(logits, proposal, trial).accepted;
+      *state.mutable_rng_state() = probe.rng_state();
+    }
+    Require(rejected > 0, "the guard check needs rejected draws");
+    return std::pair{rejected, kept};
+  };
+
+  sampling::SamplerState reasoning(config);
+  Require(reasoning.InReasoning(), "the request starts reasoning");
+  Require(!reasoning.AllowsTypicalAcceptance(0) &&
+              kept_rejections(reasoning).second == 0,
+          "typical acceptance is exact while reasoning");
+  auto answer = reasoning;
+  answer.Accept(3);  // the reasoning end
+  Require(!answer.InReasoning(), "the reasoning end closes reasoning");
+  const auto [rejected, kept] = kept_rejections(answer);
+  Require(kept == rejected, "typical acceptance relaxes after reasoning");
+
+  // A 12-gram ending in token 0, generated twice: completing it a third time
+  // is refused and starts the 512-token exact window.
+  const std::array<sampling::TokenId, 11> prefix{2, 3, 2, 2, 3, 2,
+                                                 2, 2, 3, 3, 2};
+  auto repeated = answer;
+  for (int i = 0; i < 2; ++i) {
+    repeated.Accept(prefix);
+    repeated.Accept(0);
+    repeated.Accept(2);  // a separator that breaks no 12-gram match below
+  }
+  repeated.Accept(prefix);
+  Require(repeated.typical_guard().Seen(0) == 2,
+          "the guard counts the repeated 12-gram");
+  auto signal = repeated;
+  Require(!signal.AllowsTypicalAcceptance(0),
+          "a repeated 12-gram refuses relaxed acceptance");
+  const auto cooldown = signal.typical_guard().cooldown();
+  Require(
+      cooldown.exact_until == signal.typical_guard().generated() +
+                                  sampling::TypicalGuard::kExactWindow &&
+          cooldown.next_window == 2 * sampling::TypicalGuard::kExactWindow &&
+          cooldown.signals == 1,
+      "a refusal starts the exact window");
+  Require(!signal.AllowsTypicalAcceptance(2),
+          "the exact window refuses every token");
+  // Verification itself refuses the relaxed rule on the repeated 12-gram.
+  Require(kept_rejections(repeated).second == 0,
+          "a repeated 12-gram keeps the exact rule in verification");
+  // Each later refusal doubles the window, up to its cap.
+  {
+    auto doubling = signal;
+    std::uint64_t window = 2 * sampling::TypicalGuard::kExactWindow;
+    for (int i = 0; i < 8; ++i) {
+      const auto until = doubling.typical_guard().cooldown().exact_until;
+      while (doubling.typical_guard().generated() < until)
+        doubling.Accept(2);
+      // The repeated 12-gram, twice within the last 2048 tokens again.
+      for (int copy = 0; copy < 2; ++copy) {
+        doubling.Accept(prefix);
+        doubling.Accept(0);
+        doubling.Accept(2);
+      }
+      doubling.Accept(prefix);
+      Require(!doubling.AllowsTypicalAcceptance(0) &&
+                  doubling.typical_guard().cooldown().exact_until ==
+                      doubling.typical_guard().generated() + window,
+              "a later refusal starts the doubled window");
+      window = std::min<std::uint64_t>(2 * window,
+                                       sampling::TypicalGuard::kMaxExactWindow);
+    }
+    Require(doubling.typical_guard().cooldown().next_window ==
+                sampling::TypicalGuard::kMaxExactWindow,
+            "the exact window is capped");
+  }
+  // The pool's sampler receives the window with the step's draws.
+  auto published = repeated;
+  published.CopyDrawStateFrom(signal);
+  Require(published.typical_guard().cooldown() == cooldown,
+          "a speculative step publishes the exact window");
+  auto restored = repeated;
+  restored.RestoreDrawState(signal.SaveDrawState());
+  Require(restored.typical_guard().cooldown() == cooldown,
+          "a saved draw state keeps the exact window");
+  for (std::size_t i = 0; i < sampling::TypicalGuard::kExactWindow; ++i)
+    signal.Accept(i % 2 == 0 ? 2 : 3);
+  Require(signal.AllowsTypicalAcceptance(0),
+          "relaxed acceptance resumes after the exact window");
+
+  // Off, or greedy, the guard follows nothing and never allows.
+  auto off_config = config;
+  off_config.typical_acceptance = false;
+  sampling::SamplerState off(off_config);
+  off.Accept(3);
+  off.Accept(prefix);
+  Require(
+      off.typical_guard().generated() == 0 && !off.AllowsTypicalAcceptance(0),
+      "typical acceptance off keeps no guard state");
 }
 
 // The Han scale's answer scope across an MTP chain whose drafts contain the
@@ -716,7 +885,8 @@ int main() {
     CheckCompactProposals();
     CheckSampledOutputFrequencies();
     CheckPointMassFrequencies();
-    CheckExactRejection();
+    CheckTypicalAcceptance();
+    CheckTypicalGuards();
     CheckScopedHanChain();
     const std::array<float, 5> logits{0.3F, -0.2F, 1.1F, 0.7F, -1.0F};
     const std::array<sampling::TokenId, 4> history{2, 3, 2, 0};

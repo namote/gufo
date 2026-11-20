@@ -23,6 +23,9 @@ kVisionEnd = "<|vision_end|>"
 kVisionPad = "<|vision_pad|>"
 kImagePad = "<|image_pad|>"
 kVideoPad = "<|video_pad|>"
+kThinkStart = "<think>"
+kThinkEnd = "</think>"
+kToolCallStart = "<tool_call>"
 
 # MiniMax H3 audio/video additions on top of the shared vocabulary, used by the
 # H3 source-manifest and quality checks. They are not declared in the C++ header

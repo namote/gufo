@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -235,6 +236,10 @@ public:
   }
   [[nodiscard]] bool supports_images() const override { return image_support; }
   bool image_support{true};
+  [[nodiscard]] bool supports_typical_acceptance() const override {
+    return typical_support;
+  }
+  bool typical_support{false};
   [[nodiscard]] bool supports_scoring() const override {
     return scoring_support;
   }
@@ -2021,14 +2026,68 @@ void TestModelSamplingDefaults() {
             response.body.find("invalid_han_scale_scope") != std::string::npos,
         "An unknown scope is rejected");
   }
+  // The library and serve default keep the exact rule; a server default on
+  // reaches requests through the backend defaults, as below.
+  Expect(!config.typical_acceptance,
+         "The default sampling keeps the exact rule");
   {
-    // The removed typical acceptance field is an unknown field: ignored.
+    // Only a generating request that explicitly asks for the rule on a
+    // backend that never applies it warns, once per process; the inherited
+    // default, an explicit false and token counting stay quiet.
+    const auto logged = [&](const auto& run) {
+      std::ostringstream log;
+      auto* previous = std::clog.rdbuf(log.rdbuf());
+      run();
+      std::clog.rdbuf(previous);
+      return log.str().find("event=typical_acceptance_unsupported") !=
+             std::string::npos;
+    };
+    const auto warns = [&](std::string fields) {
+      return logged([&] { send(std::move(fields)); });
+    };
+    backend.defaults.sampling.typical_acceptance = true;
+    Expect(!warns(""), "The inherited default does not warn");
+    Expect(!warns(R"(,"typical_acceptance":false)"),
+           "An explicit opt-out does not warn");
+    Expect(!logged([&] {
+      gufo::server::HandleOpenAiChatInputTokens(
+          Request(R"({"model":"test-model","messages":[{"role":)"
+                  R"("user","content":"hello"}],)"
+                  R"("typical_acceptance":true})"),
+          backend);
+    }),
+           "Token counting does not warn");
+    backend.typical_support = true;
+    Expect(!warns(R"(,"typical_acceptance":true)"),
+           "A supporting backend does not warn");
+    backend.typical_support = false;
+    Expect(warns(R"(,"typical_acceptance":true)"),
+           "An explicit request on an unsupported backend warns");
+    Expect(!warns(R"(,"typical_acceptance":true)"),
+           "The unsupported-backend warning is logged once per process");
+    backend.defaults.sampling.typical_acceptance = false;
+  }
+  config = send(R"(,"typical_acceptance":true)");
+  Expect(config.typical_acceptance, "Requests opt into typical acceptance");
+  backend.defaults.sampling.typical_acceptance = true;
+  config = send("");
+  Expect(config.typical_acceptance,
+         "Model presets keep the server's typical acceptance");
+  config = send(R"(,"typical_acceptance":false)");
+  Expect(!config.typical_acceptance,
+         "Requests opt out of the server's typical acceptance");
+  config = send(R"(,"typical_acceptance":null)");
+  Expect(config.typical_acceptance, "Null inherits typical acceptance");
+  backend.defaults.sampling.typical_acceptance = false;
+  {
     const auto response = gufo::server::HandleOpenAiChat(
         Request(R"({"model":"test-model","messages":[{"role":"user",)"
-                R"("content":"hello"}],"typical_acceptance":true})"),
+                R"("content":"hello"}],"typical_acceptance":1})"),
         backend);
-    Expect(response.status == 200,
-           "The removed typical_acceptance field is ignored");
+    Expect(response.status == 400 &&
+               response.body.find("invalid_typical_acceptance") !=
+                   std::string::npos,
+           "Non-boolean typical acceptance is rejected");
   }
   backend.defaults.model = TextModelPreset::kDeepSeekV4Flash;
   backend.defaults.supplied = {};

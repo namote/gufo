@@ -559,8 +559,12 @@ SamplerState::SamplerState(SamplingConfig config,
     constraint_state_ = *config_.constraint_initial_state;
   StartReasoning();
   TrimHistory();
-  if (config_.generated_prefix)
+  if (config_.generated_prefix) {
     CountGeneratedTokens(*config_.generated_prefix);
+    // A continued reply's own tokens are generated text for the loop guard.
+    if (config_.typical_acceptance && config_.uses_random_sampling())
+      typical_guard_.Observe(*config_.generated_prefix);
+  }
   RebuildPenaltyCounts();
 }
 
@@ -578,7 +582,8 @@ SamplerState::SamplerState(const SamplerState& other)
       pending_sample_(other.pending_sample_),
       reasoning_phase_(other.reasoning_phase_),
       reasoning_remaining_(other.reasoning_remaining_),
-      reasoning_forced_(other.reasoning_forced_) {}
+      reasoning_forced_(other.reasoning_forced_),
+      typical_guard_(other.typical_guard_) {}
 
 SamplerState& SamplerState::operator=(const SamplerState& other) {
   if (this == &other) {
@@ -599,6 +604,7 @@ SamplerState& SamplerState::operator=(const SamplerState& other) {
   reasoning_phase_ = other.reasoning_phase_;
   reasoning_remaining_ = other.reasoning_remaining_;
   reasoning_forced_ = other.reasoning_forced_;
+  typical_guard_ = other.typical_guard_;
   return *this;
 }
 
@@ -672,6 +678,16 @@ void SamplerState::SetRngState(std::uint64_t state) noexcept {
 void SamplerState::CopyDrawStateFrom(const SamplerState& other) noexcept {
   rng_state_ = other.rng_state_;
   pending_sample_ = other.pending_sample_;
+  typical_guard_.set_cooldown(other.typical_guard_.cooldown());
+}
+
+bool SamplerState::TypicalAcceptanceOpen() const noexcept {
+  return config_.typical_acceptance && config_.uses_random_sampling() &&
+         !InReasoning() && !typical_guard_.InExactWindow();
+}
+
+bool SamplerState::AllowsTypicalAcceptance(TokenId token) {
+  return TypicalAcceptanceOpen() && typical_guard_.Allows(token);
 }
 
 void SamplerState::ResetHistory(std::span<const TokenId> tokens) {
@@ -685,11 +701,16 @@ void SamplerState::ResetHistory(std::span<const TokenId> tokens) {
       (config_.constraint || reasoning_grammar_))
     constraint_state_ = *config_.constraint_initial_state;
   StartReasoning();
+  typical_guard_.Reset();
   penalty_counts_.clear();
   history_.assign(tokens.begin(), tokens.end());
   TrimHistory();
-  if (config_.generated_prefix)
+  if (config_.generated_prefix) {
     CountGeneratedTokens(*config_.generated_prefix);
+    // A continued reply's own tokens are generated text for the loop guard.
+    if (config_.typical_acceptance && config_.uses_random_sampling())
+      typical_guard_.Observe(*config_.generated_prefix);
+  }
   RebuildPenaltyCounts();
 }
 
@@ -807,6 +828,8 @@ void SamplerState::Accept(std::span<const TokenId> tokens) {
     constraint_mask_.reset();
   }
   CountGeneratedTokens(tokens);
+  if (config_.typical_acceptance && config_.uses_random_sampling())
+    typical_guard_.Observe(tokens);
   if (config_.repeat_last_n != 0) {
     history_.insert(history_.end(), tokens.begin(), tokens.end());
     TrimHistory();

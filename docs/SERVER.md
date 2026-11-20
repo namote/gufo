@@ -1572,6 +1572,35 @@ penalties `[-2, 2]`, `han_scale` `(0, 1]`. Top-p zero keeps the highest-probabil
 `min_keep` tokens). Setting temperature to zero retains configured penalties;
 omitted controls keep their model/CLI defaults.
 
+Typical acceptance speeds up speculative decoding of random-sampling
+requests on Qwen3.8-Flash-Next with MTP. It is off by default: start the
+server with `--typical-acceptance on` or send `typical_acceptance: true` (a
+Gufo extension; a boolean, `null` inherits). An MTP draft the exact rejection
+test turns down is then still kept when its probability p under the
+request's sampling distribution (after its filters, penalties and
+temperature) satisfies p >= min(0.09, 0.3 * exp(-H)), H being that
+distribution's entropy (Medusa's typical acceptance). Tokens the filters
+remove are never kept. Three guards keep the exact rule (after Kyojin
+`9f1b368` and `2484e31`):
+
+- copied drafts: prompt-lookup copies are always verified exactly;
+- thinking: while a request that starts in its reasoning phase is still
+  reasoning (until Qwen's `</think>` or `<tool_call>`, as for
+  `han_scale_scope: answer`), only the exact rule applies. Raw
+  `/completion` and `/v1/completions` prompts never track reasoning, so
+  there the whole output is answer;
+- repetition: a draft that would complete a 12-token sequence the reply
+  already generated (a continued reply's own text included) at least twice
+  in its last 2048 tokens is not relaxed.
+  That refusal also makes the next 512 generated tokens exact, a window that
+  doubles on each later refusal up to 16384.
+
+The output then no longer follows the sampling distribution exactly.
+Greedy requests never reach it; other models and Flash-Next without MTP
+ignore it, and only an explicit generating request (once per process) or the
+server option asking for it on them logs a warning. Traces record the
+applied value, as `/props` does: false for greedy sampling.
+
 The Han scale lowers the probability of CJK ideographs, for example Chinese
 characters in Korean replies. Start the server with `--han-scale X` or send
 `han_scale` (a Gufo extension; `null` inherits) with X in `(0, 1]`; 1 disables
@@ -1584,8 +1613,8 @@ probability at temperature `T` by `X^(1/T)`, and greedy requests take the argmax
 of the offset logits, so the effect is continuous down to greedy. Hangul, jamo,
 kana, CJK punctuation and fullwidth forms are never scaled. Speculative
 verification uses the scaled target, so outputs follow the scaled
-distribution exactly; Flash-Next MTP and Qwen 27B DFlash drafts are ranked
-with the same offset.
+distribution (exactly, unless typical acceptance is on); Flash-Next MTP and
+Qwen 27B DFlash drafts are ranked with the same offset.
 Returned logprobs stay the raw model log probabilities, as with penalties.
 Qwen 27B and Qwen3.8-Flash-Next apply it; other models ignore it, and the
 option logs a warning there. The loader logs `event=han_tokens_prepared` with
@@ -2275,6 +2304,9 @@ the version and revision `gufo --version` prints, `total_slots` the
 and `default_generation_settings.params` the sampling a request without
 sampling fields gets, with `n_predict` and `max_tokens` -1 when no default
 limit is set.
+Its Gufo `typical_acceptance` is what such a request gets: true only when
+the default is on, samples randomly and the backend applies it (Flash-Next
+with MTP).
 Its Gufo `han_scale` is the default Han scale, 1 on models that ignore it,
 and `han_scale_scope` its default scope, `all` on those models.
 Gufo's `logit_bias_profiles` lists the loaded

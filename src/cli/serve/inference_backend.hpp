@@ -141,6 +141,7 @@ public:
   [[nodiscard]] std::vector<AbliterationInfo> abliteration_profiles()
       const override;
   [[nodiscard]] bool supports_han_scale() const override;
+  [[nodiscard]] bool supports_typical_acceptance() const override;
   [[nodiscard]] std::shared_ptr<const sampling::LogitBiasCatalog>
   logit_bias_catalog() const override;
   /// Loads the logit-bias profiles (*.json) in `directory` against the

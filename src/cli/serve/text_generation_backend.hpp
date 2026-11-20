@@ -490,6 +490,11 @@ public:
   /// Whether requests apply SamplingConfig::han_scale (Qwen 27B and
   /// Flash-Next, whose runners build a Han token set).
   [[nodiscard]] virtual bool supports_han_scale() const { return false; }
+  /// Whether sampled speculative verification applies
+  /// SamplingConfig::typical_acceptance (Flash-Next with MTP loaded).
+  [[nodiscard]] virtual bool supports_typical_acceptance() const {
+    return false;
+  }
   /// The loaded logit-bias profiles (`--logit-bias-profiles`, possibly none)
   /// and the vocabulary that request logit biases index; null where the
   /// samplers cannot apply them (every runner without the Han scale).

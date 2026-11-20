@@ -466,6 +466,9 @@ GenerationTrace StartGenerationTrace(const ScheduledRequest& request,
   sampling["frequency_penalty"] =
       TraceFloat(request.sampling.frequency_penalty);
   sampling["presence_penalty"] = TraceFloat(request.sampling.presence_penalty);
+  // The applied rule: greedy requests never relax.
+  sampling["typical_acceptance"] = request.sampling.typical_acceptance &&
+                                   request.sampling.uses_random_sampling();
   // The applied scale: 1 when no Han set makes it active.
   sampling["han_scale"] = TraceFloat(
       request.sampling.han_bias() != 0 ? request.sampling.han_scale : 1.0F);

@@ -1693,6 +1693,7 @@ bool Session::AppendLookup(PendingDecode& pending, bool stop_at_eos,
       proposal.size = 1;
       proposal.token = proposal.ids[0];
       proposal.probability = 1.0F;
+      proposal.copied = true;
       pending.proposals.push_back(proposal);
     }
     if (stop_at_eos && model_->IsStopToken(token)) {

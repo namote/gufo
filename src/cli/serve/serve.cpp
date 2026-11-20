@@ -668,6 +668,8 @@ void PrintServeHelp(std::string_view program_name,
     RegisterSamplingOptions(parser, &sampling_config, "Sampling Defaults", true,
                             true);
     RegisterHanScaleOption(parser, &sampling_config, "Sampling Defaults");
+    RegisterTypicalAcceptanceOption(parser, &sampling_config,
+                                    "Sampling Defaults");
     parser.AddOption(
         "", "--logit-bias-profiles", "DIR",
         "Qwen 27B, Flash-Next: load the logit-bias profiles (*.json) in DIR, "
@@ -1331,6 +1333,8 @@ int RunServe(std::span<const char* const> args) {
     RegisterSamplingOptions(llm_parser, &sampling_config, "Sampling Defaults",
                             true, true);
     RegisterHanScaleOption(llm_parser, &sampling_config, "Sampling Defaults");
+    RegisterTypicalAcceptanceOption(llm_parser, &sampling_config,
+                                    "Sampling Defaults");
     llm_parser.AddOption(
         "", "--logit-bias-profiles", "DIR",
         "Qwen 27B, Flash-Next: load the logit-bias profiles (*.json) in DIR, "
@@ -1683,13 +1687,23 @@ int RunServe(std::span<const char* const> args) {
         << gufo::sampling::HanScaleScopeName(
                backend->supports_han_scale()
                    ? effective_sampling.han_scale_scope
-                   : gufo::sampling::HanScaleScope::kAll);
+                   : gufo::sampling::HanScaleScope::kAll)
+        << " typical_acceptance="
+        << (effective_sampling.typical_acceptance &&
+            backend->supports_typical_acceptance());
     server::Logger::Info("sampling", sampling_log.str());
     if (sampling_config.han_scale != 1.0F && !backend->supports_han_scale()) {
       server::Logger::Warn(
           "sampling",
           "event=han_scale_unsupported detail=--han-scale applies only to "
           "Qwen 27B and Flash-Next; ignored");
+    }
+    if (sampling_config.typical_acceptance &&
+        !backend->supports_typical_acceptance()) {
+      server::Logger::Warn(
+          "sampling",
+          "event=typical_acceptance_unsupported detail=--typical-acceptance "
+          "on applies only to Flash-Next MTP; ignored");
     }
     const char* speculation =
         speculative_config.backend == server::TextSpeculativeBackend::kDFlash

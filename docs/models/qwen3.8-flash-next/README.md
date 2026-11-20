@@ -106,7 +106,8 @@ head.
 
 The existing length controller and AR backoff apply to every request. The
 target always verifies with its full vocabulary, including
-exact sampled acceptance and residual correction. Sampled text can differ
+exact sampled acceptance and residual correction (opt-in typical acceptance
+also keeps typical rejected MTP drafts; see [server](../../SERVER.md)). Sampled text can differ
 across builds when proposals change. All-greedy C>1 batches retain their shared
 planner and may use measured cycle costs. Each request keeps private caches,
 rollback and RNG; snapshots preserve the learned acceptance history.
@@ -130,7 +131,8 @@ back into the prompt's chat wrapper; a common tool header alone must not
 qualify as a long matching answer. Copies
 are verified like any draft: greedy text is byte-identical, and sampled
 requests treat each copied token as a point-mass proposal under the same
-rejection sampling, so outputs keep the target distribution (a seeded
+rejection sampling (typical acceptance never relaxes a copy), so without
+typical acceptance outputs keep the target distribution (a seeded
 sampled stream differs from one without copies, because random draws are
 consumed at different points). Shorter matches
 propose nothing; at temperature 1 an ungated 3-token rule displaced accepted

@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "src/core/json_constraint.hpp"
+#include "src/core/typical_guard.hpp"
 
 namespace gufo::sampling {
 
@@ -116,6 +117,15 @@ struct SamplingConfig {
   /// budget, or an unlimited one (ReasoningBudget::kUnlimited) that only
   /// tracks the phase for han_scale_scope kAnswer.
   std::shared_ptr<const ReasoningBudget> reasoning_budget;
+  /// Speculative decoding of a random-sampling request also keeps a
+  /// rejected MTP draft whose target probability is typical (Medusa's rule;
+  /// serve --typical-acceptance, request typical_acceptance). Faster, but the
+  /// output no longer follows the target distribution exactly. Greedy
+  /// decoding ignores it; only Flash-Next MTP applies it. Its guards keep the
+  /// exact rule for copied (prompt-lookup) drafts, while the reply reasons
+  /// (tracked only with reasoning_budget), and around repetition
+  /// (TypicalGuard). Off by default.
+  bool typical_acceptance{false};
   /// Han-script probability scale in (0, 1] (serve --han-scale, request
   /// han_scale); 1 disables it. Every token in han_tokens has
   /// han_bias() = ln(han_scale) added to its logit after the penalties and
@@ -287,18 +297,33 @@ public:
   [[nodiscard]] std::uint64_t rng_state() const noexcept;
   [[nodiscard]] std::uint64_t* mutable_rng_state() noexcept;
   void SetRngState(std::uint64_t state) noexcept;
-  /// Publish RNG and any deferred draw without accepting tentative history.
+  /// Publish RNG, any deferred draw and the typical-acceptance exact window
+  /// without accepting tentative history.
   void CopyDrawStateFrom(const SamplerState& other) noexcept;
   struct DrawState {
     std::uint64_t rng;
     std::optional<TokenId> pending;
+    TypicalGuard::Cooldown typical;
   };
   [[nodiscard]] DrawState SaveDrawState() const noexcept {
-    return {rng_state_, pending_sample_};
+    return {rng_state_, pending_sample_, typical_guard_.cooldown()};
   }
   void RestoreDrawState(DrawState state) noexcept {
     rng_state_ = state.rng;
     pending_sample_ = state.pending;
+    typical_guard_.set_cooldown(state.typical);
+  }
+  /// Whether typical acceptance may keep `token`, an MTP draft the exact
+  /// test rejected, as the next generated token: the request asked for it,
+  /// samples randomly, is past its reasoning phase, and the token completes
+  /// no repeated 12-gram (TypicalGuard, whose refusal starts an exact
+  /// window). Copied drafts never ask.
+  [[nodiscard]] bool AllowsTypicalAcceptance(TokenId token);
+  /// The cheap part of AllowsTypicalAcceptance, without the repetition
+  /// check: on, random sampling, past reasoning and outside an exact window.
+  [[nodiscard]] bool TypicalAcceptanceOpen() const noexcept;
+  [[nodiscard]] const TypicalGuard& typical_guard() const noexcept {
+    return typical_guard_;
   }
 
   /// Starts a request: tokens initialize repetition only; generated counts
@@ -372,6 +397,9 @@ private:
   ReasoningPhase reasoning_phase_{ReasoningPhase::kOff};
   std::size_t reasoning_remaining_{0};
   std::size_t reasoning_forced_{0};
+  /// Follows generated tokens only while typical acceptance is on for a
+  /// random-sampling request; empty otherwise.
+  TypicalGuard typical_guard_;
 };
 
 [[nodiscard]] std::uint64_t NextRandom(std::uint64_t* state);

@@ -105,16 +105,39 @@ void TestUnexpectedPositionalsAndParserReuse() {
   assert(!parser.WasSupplied("--text"));
 }
 
-// Sampled speculative decoding has one acceptance rule, the exact one: the
-// shared sampling CLIs register no option to change it.
-void TestNoTypicalAcceptanceOption() {
-  gufo::cli::ArgParser parser("test_serve");
+// The shared sampling CLIs register no acceptance option; serve's one MODE
+// option turns typical acceptance on, off is the default, and nothing else
+// spells it.
+void TestTypicalAcceptanceOption() {
+  gufo::cli::ArgParser shared("test_prompt");
   gufo::sampling::SamplingConfig config;
-  gufo::cli::RegisterSamplingOptions(parser, &config, "Sampling", false, true);
+  gufo::cli::RegisterSamplingOptions(shared, &config, "Sampling", false, true);
   std::string error;
-  const char* removed[] = {"--typical-acceptance", "off"};
-  assert(!parser.Parse(removed, &error));
-  assert(parser.FormatHelp().find("typical") == std::string::npos);
+  const char* unknown[] = {"--typical-acceptance", "on"};
+  assert(!shared.Parse(unknown, &error));
+  assert(shared.FormatHelp().find("typical") == std::string::npos);
+
+  gufo::cli::ArgParser parser("test_serve");
+  gufo::cli::RegisterTypicalAcceptanceOption(parser, &config);
+  assert(!config.typical_acceptance);
+  const char* explicit_off[] = {"--typical-acceptance=off"};
+  assert(parser.Parse(explicit_off, &error));
+  assert(!config.typical_acceptance &&
+         parser.WasSupplied("--typical-acceptance"));
+  const char* on[] = {"--typical-acceptance", "on"};
+  assert(parser.Parse(on, &error));
+  assert(config.typical_acceptance);
+  const char* off[] = {"--typical-acceptance", "off"};
+  assert(parser.Parse(off, &error));
+  assert(!config.typical_acceptance);
+  const char* invalid[] = {"--typical-acceptance", "true"};
+  assert(!parser.Parse(invalid, &error));
+  assert(error.find("on or off") != std::string::npos);
+  const char* bare[] = {"--typical-acceptance"};
+  assert(!parser.Parse(bare, &error));
+  const char* alias[] = {"--no-typical-acceptance"};
+  assert(!parser.Parse(alias, &error));
+  assert(parser.FormatHelp().find("(default: off)") != std::string::npos);
 }
 
 // --han-scale-scope takes all or answer; all is the default.
@@ -144,7 +167,7 @@ int main() {
   TestPositionals();
   TestHelpFormatting();
   TestUnexpectedPositionalsAndParserReuse();
-  TestNoTypicalAcceptanceOption();
+  TestTypicalAcceptanceOption();
   TestHanScaleScopeOption();
   std::cout << "All ArgParser tests passed.\n";
   return 0;

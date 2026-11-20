@@ -28,6 +28,8 @@ Centralizing these constants does not change tokenization or EOS handling.
 | `kVisionPad` | Padding entry in the pinned MiniMax H3 vocabulary. |
 | `kImagePad` | One image-placeholder token, repeated once per visual token. |
 | `kVideoPad` | One video-placeholder token. |
+| `kThinkStart`, `kThinkEnd` | Open and close a reply's reasoning (thinking) block. |
+| `kToolCallStart` | Opens a native tool call; also ends reasoning. |
 
 ## Python
 

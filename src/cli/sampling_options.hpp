@@ -128,6 +128,31 @@ inline void RegisterHanScaleOption(ArgParser& parser,
       });
 }
 
+/// The serve-only typical acceptance of sampled Flash-Next MTP drafts
+/// (SamplingConfig::typical_acceptance). Off keeps the exact rule.
+inline void RegisterTypicalAcceptanceOption(
+    ArgParser& parser, sampling::SamplingConfig* config,
+    std::string_view group = "Sampling") {
+  if (config == nullptr) {
+    throw std::invalid_argument("sampling CLI config must not be null");
+  }
+  parser.AddCustomOption(
+      "", "--typical-acceptance", "MODE",
+      "Sampled speculative decoding also keeps typical rejected MTP drafts "
+      "after the reply's thinking: faster, but outputs no longer follow the "
+      "exact sampling distribution (Flash-Next MTP): on or off (default: off)",
+      group,
+      [config](std::string_view, std::string_view value, std::string* error) {
+        if (value == "on" || value == "off") {
+          config->typical_acceptance = value == "on";
+          return true;
+        }
+        if (error != nullptr)
+          *error = "--typical-acceptance must be on or off";
+        return false;
+      });
+}
+
 }  // namespace gufo::cli
 
 #endif  // GUFO_CLI_SAMPLING_OPTIONS_HPP_

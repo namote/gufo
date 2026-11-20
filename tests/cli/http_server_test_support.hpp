@@ -92,6 +92,10 @@ public:
   bool device_lost() const override { return lost.load(); }
   bool supports_images() const override { return image_support.load(); }
   std::atomic<bool> image_support{false};
+  bool supports_typical_acceptance() const override {
+    return typical_support.load();
+  }
+  std::atomic<bool> typical_support{false};
   std::vector<AbliterationInfo> abliteration_profiles() const override {
     std::vector<AbliterationInfo> result;
     if (abliteration)

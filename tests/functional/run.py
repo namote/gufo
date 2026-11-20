@@ -35,6 +35,14 @@ SUITES = ("discovery", "openai-count-tokens", "messages-count-tokens", "messages
           "long-context", "state-edges", "progress", "stream-start", "prefill-scheduling", "metrics", "cache-edits", "cache-growth", "cache-depth", "cache-rotation", "cache-concurrency", "cache-shared-prefix", "cache-bridge", "cache-compaction", "cache-transforms", "cache-pressure", "cache-messages-loop", "cache-stalls", "system-injection", "cache")
 # Suites that already run another suite's checks; selecting both repeats the work.
 INCLUDED_IN = {"auto-tools": "tools", "tool-native-types": "tool-native-schemas"}
+
+
+def on_off(mode):
+    if mode not in ("on", "off"):
+        raise ValueError(f"--typical-acceptance must be on or off, not {mode!r}")
+    return mode == "on"
+
+
 SAMPLING = {
     "--temperature": ("temperature", float), "--top-p": ("top_p", float),
     "--top-k": ("top_k", int), "--min-p": ("min_p", float),
@@ -43,6 +51,7 @@ SAMPLING = {
     "--frequency-penalty": ("frequency_penalty", float),
     "--repeat-penalty": ("repeat_penalty", float),
     "--repeat-last-n": ("repeat_last_n", int),
+    "--typical-acceptance": ("typical_acceptance", on_off),
 }
 COMPARISON_FIELDS = ("comparison_command", "sampling_preset", "sampling_overrides", "request_timeout", "tier",
                      "vision", "speculative", "environment", "harness_sha256", "build_inputs_sha256",

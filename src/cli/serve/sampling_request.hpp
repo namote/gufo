@@ -430,6 +430,17 @@ inline std::optional<SamplingRequestError> ParseSamplingConfig(
     }
     output->han_scale_scope = *parsed;
   }
+  // Gufo extension: typical acceptance of sampled MTP drafts; null inherits.
+  if (const auto* typical = body.find("typical_acceptance");
+      typical != nullptr && !typical->is_null()) {
+    if (!typical->is_bool()) {
+      return SamplingRequestError{
+          .message = "'typical_acceptance' must be a boolean",
+          .code = "invalid_typical_acceptance",
+      };
+    }
+    output->typical_acceptance = typical->as_bool();
+  }
   if (logit_bias != nullptr) {
     sampling::LogitBiasSelection selection;
     if (auto error =

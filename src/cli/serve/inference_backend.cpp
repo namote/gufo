@@ -85,6 +85,17 @@ void SetError(std::string* error, std::string message) {
 }
 
 #if defined(ENGINE_ENABLE_HIP)
+// llama.cpp's Qwen3-Coder format forces "\n</think>" and also ends
+// reasoning at a tool call.
+constexpr std::string_view kLineBreak = "\n";
+constexpr auto kQwenForcedThinkEnd =
+    tokenization::ConcatControlText<kLineBreak, tokenization::kThinkEnd>();
+TextModelRunner::ReasoningTags QwenReasoningTags() {
+  return {
+      tokenization::kThinkStart,
+      std::string_view(kQwenForcedThinkEnd.data(), kQwenForcedThinkEnd.size()),
+      {tokenization::kThinkEnd, tokenization::kToolCallStart}};
+}
 
 struct QwenImageContext : TextPromptContext {
   std::shared_ptr<const models::qwen::vision::Prompt> prompt;
@@ -445,9 +456,9 @@ std::shared_ptr<const sampling::TokenSet> PrepareHanTokens(
 }
 
 // The reasoning phase a request that starts reasoning tracks: its token
-// budget, or, when only the Han scale's answer scope or a phase-dependent
-// logit bias needs that phase, an unlimited budget that marks where
-// reasoning ends and never forces.
+// budget, or, when only the Han scale's answer scope, a phase-dependent
+// logit bias or typical acceptance (exact while reasoning) needs that phase,
+// an unlimited budget that marks where reasoning ends and never forces.
 std::shared_ptr<const sampling::ReasoningBudget> RequestReasoning(
     const ChatRequest& request, const sampling::SamplingConfig& sampling,
     const std::shared_ptr<const sampling::TokenSet>& han_tokens,
@@ -466,7 +477,8 @@ std::shared_ptr<const sampling::ReasoningBudget> RequestReasoning(
     return build(*request.reasoning.budget_tokens);
   if ((sampling.han_scale_scope == sampling::HanScaleScope::kAnswer &&
        sampling.han_scale != 1.0F && han_tokens && han_tokens->count != 0) ||
-      (sampling.logit_bias && sampling.logit_bias->phase_dependent()))
+      (sampling.logit_bias && sampling.logit_bias->phase_dependent()) ||
+      (sampling.typical_acceptance && sampling.uses_random_sampling()))
     return build(sampling::ReasoningBudget::kUnlimited);
   return nullptr;
 }
@@ -1412,10 +1424,8 @@ public:
     return static_cast<std::uint32_t>(model_->GetTokenizer().GetVocabSize());
   }
 
-  // llama.cpp's Qwen3-Coder format forces "\n</think>" and also ends
-  // reasoning at a tool call.
   [[nodiscard]] ReasoningTags ReasoningBudgetTags() const override {
-    return {"<think>", "\n</think>", {"</think>", "<tool_call>"}};
+    return QwenReasoningTags();
   }
 
   [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
@@ -3027,10 +3037,8 @@ public:
     return static_cast<std::uint32_t>(model_->tokenizer().GetVocabSize());
   }
 
-  // llama.cpp's Qwen3-Coder format forces "\n</think>" and also ends
-  // reasoning at a tool call.
   [[nodiscard]] ReasoningTags ReasoningBudgetTags() const override {
-    return {"<think>", "\n</think>", {"</think>", "<tool_call>"}};
+    return QwenReasoningTags();
   }
 
   [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
@@ -3638,6 +3646,8 @@ struct InferenceBackend::Impl {
     SamplingDefaults sampling_defaults;
     std::uint32_t max_context{0};
     bool supports_images{false};
+    /// Flash-Next with MTP: sampled verification applies typical acceptance.
+    bool supports_typical_acceptance{false};
     /// The loaded abliteration profiles; empty without one.
     std::vector<AbliterationInfo> abliteration;
     /// Flash-Next's HyperConnection mode name; empty for other models.
@@ -3654,9 +3664,12 @@ struct InferenceBackend::Impl {
     std::string model_path;
     std::string build_info;
 
-    /// The sampling the runner applies, so traces report what it uses.
+    /// The sampling the runner applies: typical acceptance stays on only
+    /// where verification uses it, so traces report what /props reports.
     [[nodiscard]] sampling::SamplingConfig Applied(
         sampling::SamplingConfig config) const {
+      config.typical_acceptance =
+          config.typical_acceptance && supports_typical_acceptance;
       // Without a set the scale stays inactive (SamplingConfig::han_bias).
       config.han_tokens = han_tokens;
       return config;
@@ -3674,8 +3687,8 @@ struct InferenceBackend::Impl {
           request_(std::move(scheduled_request)),
           tool_format_(tool_format) {
       if (initial == InitialOutputState::kReasoning)
-        reasoning_end_ =
-            state_->scheduler->runner().TokenizeControl("</think>");
+        reasoning_end_ = state_->scheduler->runner().TokenizeControl(
+            tokenization::kThinkEnd);
     }
 
     Result Wait(const TokenCallback& on_token,
@@ -4452,6 +4465,8 @@ bool InferenceBackend::load(
     new_state->abliteration =
         DescribeAbliteration(ListProfiles(model->AbliterationProfiles()));
     new_state->flash_next = model;
+    new_state->supports_typical_acceptance =
+        speculative_config.backend == TextSpeculativeBackend::kMtp;
     new_state->hc_mode =
         models::qwen38_flash_next::HcModeName(model->hc_mode());
     auto runner = std::make_shared<QwenFlashNextTextRunner>(
@@ -4561,6 +4576,15 @@ bool InferenceBackend::supports_han_scale() const {
 #if defined(ENGINE_ENABLE_HIP)
   const auto state = impl_->Snapshot();
   return state != nullptr && state->han_tokens != nullptr;
+#else
+  return false;
+#endif
+}
+
+bool InferenceBackend::supports_typical_acceptance() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state != nullptr && state->supports_typical_acceptance;
 #else
   return false;
 #endif
@@ -5282,6 +5306,10 @@ InferenceBackend::Result InferenceBackend::chat(
   effective_sampling.generated_prefix = prompt->generated_prefix;
   const auto initial =
       state->scheduler->runner().InitialOutputState(effective_request);
+  // Only a backend that applies typical acceptance tracks reasoning for it.
+  effective_sampling.typical_acceptance =
+      effective_sampling.typical_acceptance &&
+      state->supports_typical_acceptance;
   if (initial == TextGenerationBackend::InitialOutputState::kReasoning)
     effective_sampling.reasoning_budget =
         RequestReasoning(request, effective_sampling, state->han_tokens,
@@ -5383,6 +5411,10 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
   effective_sampling.generated_prefix = prompt->generated_prefix;
   const auto initial =
       state->scheduler->runner().InitialOutputState(effective_request);
+  // Only a backend that applies typical acceptance tracks reasoning for it.
+  effective_sampling.typical_acceptance =
+      effective_sampling.typical_acceptance &&
+      state->supports_typical_acceptance;
   if (initial == TextGenerationBackend::InitialOutputState::kReasoning)
     effective_sampling.reasoning_budget =
         RequestReasoning(request, effective_sampling, state->han_tokens,
