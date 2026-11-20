@@ -107,6 +107,10 @@ struct DurableCapture {
   // A rewind point written to disk (PersistRewind): idle, reassignment and
   // reset writes of it are not limited by the disk step.
   bool step_exempt{};
+  // Its sources are a rewind point's own pieces, which the point drops on a
+  // reset of its slot: like a host snapshot, the job may be that boundary's
+  // only copy, so it is kept under queue pressure.
+  bool rewind{};
 };
 // A stable boundary kept in memory on its slot, for a conversation whose
 // client sends its history back without the generated reply as the model
@@ -141,8 +145,10 @@ struct RewindPoint {
   std::size_t host_bytes{}, device_bytes{};
   // False for a request that keeps its prompt off the disk.
   bool persist{true};
-  // Queued for the disk once (under the cache mutex).
-  bool persisted{};
+  // The disk job last queued for it, while it is pending (under the cache
+  // mutex). Coverage is rechecked otherwise: a failed, superseded or
+  // evicted write leaves the point to be written again.
+  std::uint64_t pending_checkpoint{};
 };
 // One piece a capture writes from a slot (inherited chunks excepted).
 struct SlotPiece {
@@ -356,10 +362,12 @@ struct ComponentTextCache::Impl {
     for (const auto& candidate : found.candidates) {
       if (candidate.boundary >= prompt.size() && !whole)
         continue;
-      if (candidate.live)
-        live_floor = std::max<std::size_t>(live_floor, candidate.boundary);
-      else if (candidate.boundary % alignment == 0 ||
-               candidate.boundary >= prompt.size() || AnyPosition(candidate))
+      // Only an idle live frontier is one Acquire continues.
+      if (candidate.live) {
+        if (!entries.at(candidate.live->slot.value - 1)->busy)
+          live_floor = std::max<std::size_t>(live_floor, candidate.boundary);
+      } else if (candidate.boundary % alignment == 0 ||
+                 candidate.boundary >= prompt.size() || AnyPosition(candidate))
         floor = std::max<std::size_t>(floor, candidate.boundary);
     }
     return FindRewind(prompt, input, live_floor, floor);
@@ -470,6 +478,12 @@ struct ComponentTextCache::Impl {
   std::unique_ptr<cache::DiskStore> disk;
   cache::PrefixIndex index;
   mutable std::mutex mutex;
+  // Snapshot-arena bytes the host pieces of rewind points occupy, whole
+  // arenas, while a point or a disk job of one holds them (RewindArenas).
+  std::atomic<std::size_t> rewind_arena_bytes{};
+  [[nodiscard]] std::size_t RewindArenaBudget() const {
+    return resources->reassignment_snapshot_bytes / 4;
+  }
   std::vector<std::unique_ptr<Entry>> entries;
   std::uint64_t clock{};
   std::unique_ptr<cache::DiskCatalog> catalog;
@@ -961,7 +975,7 @@ struct ComponentTextCache::Impl {
     auto job = cache::PersistenceJob(
         ledger, File(1, capture->manifest.checkpoint.value), capture->manifest,
         std::move(capture->sources));
-    if (capture->holds_slot || capture->host_snapshot)
+    if (capture->holds_slot || capture->host_snapshot || capture->rewind)
       job.KeepUnderPressure(capture->jump);
     std::size_t pending_slot;
     // A write-back covers its frontier from before submission: the job may
@@ -1014,7 +1028,13 @@ struct ComponentTextCache::Impl {
       std::shared_ptr<const void> branch;
       {
         const std::lock_guard lock(mutex);
-        if (point->persisted ||
+        if ((point->pending_checkpoint &&
+             std::ranges::any_of(pending_durable,
+                                 [&](const auto& capture) {
+                                   return capture &&
+                                          capture->manifest.checkpoint.value ==
+                                              point->pending_checkpoint;
+                                 })) ||
             index.HasCheckpoint(
                 {identity, point->tokens, point->inputs},
                 n > kUncoveredCaptureTokens ? n - kUncoveredCaptureTokens : 0))
@@ -1038,6 +1058,7 @@ struct ComponentTextCache::Impl {
               .Convert();
       durable->branch = branch;
       durable->step_exempt = step_exempt;
+      durable->rewind = true;
       if (ancestor) {
         const auto& previous = ancestor->Manifest();
         if (previous.tokens.size() > n ||
@@ -1125,10 +1146,13 @@ struct ComponentTextCache::Impl {
         throw std::logic_error("rewind point pieces out of component order");
       if (!CanQueue(*durable))
         return 0;
+      const auto checkpoint = manifest.checkpoint.value;
       const auto queued = Persist(durable);
+      // A job that already completed is no longer pending: the next attempt
+      // rechecks the index instead.
       if (queued) {
         const std::lock_guard lock(mutex);
-        point->persisted = true;
+        point->pending_checkpoint = checkpoint;
       }
       Logger::Info(
           "cache",
@@ -1246,6 +1270,8 @@ struct ComponentTextCache::Lease::Impl {
     // The queue check, planning, and attaching host copies to observed rows.
     double queue_ms{}, plan_ms{}, attach_ms{}, sources_ms{};
     std::size_t pieces{};
+    // Bytes of the arenas taken, page and arena padding included.
+    std::size_t taken_bytes{};
   };
   std::string SnapshotSlot(std::span<const SlotPiece> pieces,
                            DurableCapture& durable, SnapshotStats& stats);
@@ -1268,7 +1294,10 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
       purpose != SnapshotPurpose::kHistory &&
       RewindEligible(capture_tokens.size()) &&
       std::equal(capture_tokens.begin(), capture_tokens.end(), prompt.begin()))
-    return CaptureRewind();
+    // An optional rewind point the arenas refused leaves the ordinary disk
+    // capture, as without one.
+    if (auto snapshot = CaptureRewind())
+      return snapshot;
   if (!persist || !cache->queue || !cache->resources->copy_observed_rows ||
       purpose == SnapshotPurpose::kHistory)
     throw cache::ResourceExhausted();
@@ -1729,11 +1758,11 @@ ComponentTextCache::Lease::Impl::CaptureRewind() {
             {},
             true});
   }
-  // Rewind points of all slots together take at most a quarter of the
-  // snapshot arenas, which reassignment snapshots and capture staging share.
-  const auto cap = cache->resources->reassignment_snapshot_bytes /
-                   (4 * std::max<std::size_t>(1, cache->entries.size()));
-  if (point->host_bytes > cap)
+  // Rewind points of all slots, and their queued disk writes, together
+  // occupy at most a quarter of the snapshot arenas, which reassignment
+  // snapshots and capture staging share.
+  const auto budget = cache->RewindArenaBudget();
+  if (point->host_bytes > budget)
     return refused("host_cap", point->host_bytes);
   point->metadata =
       cache->ledger
@@ -1743,17 +1772,61 @@ ComponentTextCache::Lease::Impl::CaptureRewind() {
                        positions.size() * sizeof(cache::ComponentPosition) +
                        point->pieces.size() * sizeof(RewindPoint::Piece))
           .Convert();
+  // This point supersedes the slot's older one (and an earlier one of this
+  // request), whose device rows it already shares: their arenas return
+  // before this one takes its own. Should this capture then be refused, the
+  // boundary goes to disk instead (CaptureDurable).
+  shared.clear();
+  previous.reset();
+  rewind_point.reset();
+  {
+    std::shared_ptr<RewindPoint> superseded;
+    {
+      const std::lock_guard lock(cache->mutex);
+      if (entry->rewind && ComponentTextCache::Impl::Prefixes(
+                               entry->rewind->tokens, capture_tokens))
+        superseded = std::exchange(entry->rewind, {});
+    }
+  }
   SnapshotStats stats;
   std::vector<std::shared_ptr<const void>> hosted;
   if (const auto reason = HostCopy(staged, nullptr, stats, false, &hosted);
       !reason.empty())
     return refused(reason, point->host_bytes);
+  // Charged for its whole arenas until the last holder (this point, its
+  // successor's shared pieces never include them, or a disk job) drops
+  // them.
+  struct RewindArenas {
+    std::vector<std::shared_ptr<const void>> arenas;
+    std::atomic<std::size_t>* charged{};
+    std::size_t bytes{};
+    ~RewindArenas() {
+      if (charged)
+        charged->fetch_sub(bytes);
+    }
+  };
+  if (cache->rewind_arena_bytes.fetch_add(stats.taken_bytes) +
+          stats.taken_bytes >
+      budget) {
+    cache->rewind_arena_bytes.fetch_sub(stats.taken_bytes);
+    return refused("arena_budget", stats.taken_bytes);
+  }
+  std::shared_ptr<RewindArenas> arenas;
+  try {
+    arenas = std::make_shared<RewindArenas>();
+  } catch (...) {
+    cache->rewind_arena_bytes.fetch_sub(stats.taken_bytes);
+    throw;
+  }
+  arenas->charged = &cache->rewind_arena_bytes;
+  arenas->bytes = stats.taken_bytes;
   for (std::size_t i = 0; i < staged.size(); ++i) {
     auto& piece = point->pieces[staged_at[i]];
-    piece.bytes = {static_cast<const std::byte*>(hosted[i].get()),
-                   staged[i].bytes};
-    piece.owner = std::move(hosted[i]);
+    const auto* data = static_cast<const std::byte*>(hosted[i].get());
+    piece.bytes = {data, staged[i].bytes};
+    piece.owner = std::shared_ptr<const void>(arenas, data);
   }
+  arenas->arenas = std::move(hosted);
   rewind_point = point;
   metrics.captured_bytes += point->host_bytes;
   metrics.copied_payload_bytes += point->host_bytes;
@@ -1960,6 +2033,8 @@ std::string ComponentTextCache::Lease::Impl::HostCopy(
     return taken.refused;
   }
   stats.reused_bytes = taken.reused;
+  stats.taken_bytes =
+      std::accumulate(sizes.begin(), sizes.end(), std::size_t{0});
   stats.allocated_bytes = taken.allocated;
   stats.arenas = sizes.size();
   const auto at = [&](std::size_t i) {

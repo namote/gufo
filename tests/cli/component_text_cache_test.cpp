@@ -3557,6 +3557,53 @@ void FailedRewindFallsBackAndStaysExact() {
   Prefill(cold);
   assert(Generate(cold) == token);
 }
+void RewindArenasAreChargedWhole() {
+  // Rewind points are charged for the whole snapshot arenas they occupy:
+  // with room for one point's arenas, a second conversation's point (a few
+  // KiB of payload) is refused, and that capture goes to disk as it would
+  // without rewind points. The first conversation still rewinds in place.
+  const TemporaryDirectory temp("gufo-component-rewind-arena-test");
+  const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
+                                        .capacity_bytes = 1 << 24,
+                                        .min_checkpoint_step_tokens = 64};
+  auto runner = std::make_shared<Runner>();
+  runner->retain_rows = true;
+  // Room for one point (~0.5 MiB of page-aligned 64 KiB arenas), not two.
+  runner->snapshot_bytes = 4 * (700 << 10);
+  TextRunnerPool pool(runner, 2, disk);
+  DroppingChat a, b;
+  b.next = 40000;
+  a.Turn(300);
+  b.Turn(300);
+  // Different systems: give b its own head so the chats share nothing.
+  for (auto& token : b.prompt)
+    if (token < 900)
+      token += 50000;
+  const auto turn = [&](DroppingChat& chat) {
+    auto request = ChatTurn(pool, chat);
+    const auto cached = request.cached_prompt_tokens();
+    const bool disk_hit = request.cache_disk_hit();
+    Prefill(request);
+    for (int i = 0; i < 5; ++i)
+      (void)Generate(request);
+    (void)request.Commit();
+    assert(WaitWritten(pool));
+    return std::pair(cached, disk_hit);
+  };
+  (void)turn(a);
+  (void)turn(b);
+  a.Turn(100);
+  (void)turn(a);  // keeps a's point: one arena
+  b.Turn(100);
+  (void)turn(b);  // b's point is refused: its boundary goes to disk
+  const auto a_stable = a.stable, b_stable = b.stable;
+  a.Turn(100);
+  const auto [a_cached, a_disk] = turn(a);
+  assert(a_cached == a_stable && !a_disk);
+  b.Turn(100);
+  const auto [b_cached, b_disk] = turn(b);
+  assert(b_cached == b_stable && b_disk);
+}
 void VerbatimReplayKeepsNoRewindPoint() {
   // A client that sends the reply back as generated continues the live
   // frontier: no stop at its stable boundary, no rewind point.
@@ -3696,6 +3743,7 @@ int main(int argc, char** argv) {
       CASE(ImageFrontierCapturesAfterPrefixCheckpoint()),
       CASE(DroppedReplyRewindsToTheStableBoundary()),
       CASE(FailedRewindFallsBackAndStaysExact()),
+      CASE(RewindArenasAreChargedWhole()),
       CASE(VerbatimReplayKeepsNoRewindPoint()),
       CASE(ReassignedRewindPointReachesDisk()),
   };
