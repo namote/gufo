@@ -53,6 +53,10 @@
 - 정수 `1.0`과 `1e-7`이 한 호출에 같이 있으면 두 철자 어느 쪽으로도 통과하지 못한다. canonical 철자에서 지수 앞 0을 빼면 해결된다.
 - 2^53을 넘는 정수는 canonical double로 바뀐 값으로 경계를 검사한다. 숫자 잎마다 십진값이 그대로일 때만 canonical로 대체하면 정확해진다.
 
+**V1 패스에서 새로 찾은 기존 문제 (2026-11-20, V1과 관계없음).** 운영 runtime-20261120a에서도 똑같이 실패한다.
+- 짧은 대화를 다시 보내면 캐시를 다시 쓰지 못한다(`cached_tokens` 0). 끊긴 대화를 이어 갈 때도 앞부분을 잃는다(functional `tools`, `structured*`, `tool-schema-edges`, `*-cancel`). 11-18 RAM 층 제거(c597eed1) 뒤부터인 것으로 보이며, 원인 조사가 필요하다.
+- `qwen38_flash_next_session_test` `CheckServingEos`는 캐시 없는 backend에서 prefill 0 재생을 기대한다. 시험을 디스크 캐시 기준으로 고치거나, 위 문제와 함께 다룬다.
+
 ## V2 속도 개선 (2묶음, 중간 크기)
 
 | # | 출처 | 내용 | 비고 |
